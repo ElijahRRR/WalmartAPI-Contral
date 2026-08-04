@@ -54,7 +54,7 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
 | 旧位置 | 内容 | 去处 |
 |---|---|---|
 | 沃尔玛问题商品清理/cache/*.json | 已提交 SKU(2日防重)、反补计数、品牌缓存 | ops.dedupe |
-| PostgreSQL walmart_cleanup 库 | 41.7 万行问题商品历史 | 并入 walmart_erp 相应表 |
+| PostgreSQL walmart_cleanup 库 | 41.7 万行问题商品历史 | 并入 walmart_data 相应表 |
 | 沃尔玛商品维护/maintenance.db | 维护任务与 feed 明细 | listing schema |
 | 沃尔玛UPC生成器/upc_history.db | 10 万+ UPC 去重池 | listing.upc_pool |
 | erpAPI/walmart_settlement.db | 结算快照 | orders.settlement |

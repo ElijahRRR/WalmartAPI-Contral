@@ -1,0 +1,188 @@
+API category	API name	Rate limit	Method	Endpoint
+Advertising	Catalog Item Recommendation	10/min	GET	/v3/advertising/sem/items/recommendation
+Advertising	Catalog Item Eligibility	10/min	POST	/v3/advertising/sem/items/eligibility
+Advertising	Create Campaign	5/min	POST	/v3/advertising/sem/campaigns
+Advertising	Update Campaign	5/min	PUT	/v3/advertising/sem/campaigns/{campaignId}
+Advertising	Stop Campaign	5/min	PUT	/v3/advertising/sem/campaigns/{campaignId}/st
+Advertising	Delete Campaign	5/min	DELETE	/v3/advertising/sem/campaigns/{campaignId}
+Advertising	Get Campaign Details	10/min	GET	/v3/advertising/sem/campaigns/{campaignId}
+Advertising	Campaigns Performance Report	10/min	POST	/v3/advertising/sem/campaigns/performance-summary
+Advertising	Items Performance Report	10/min	POST	/v3/advertising/sem/campaigns/{campaignId}/item-level-summary
+Advertising	Billing History	10/min	POST	/v3/advertising/sem/billing-history
+Assortment Recommendations	Get Recommendations	500/min	POST	/v3/growth/assortment/recommendations
+Assortment Recommendations	Get Variants	500/hour	GET	/v3/growth/assortment/recommendations/variants
+Assortment Recommendations	Get Recommendation Trends	500/hour	GET	/v3/growth/assortment/recommendations/trends
+Assortment Recommendations	Get Categorization	200/hour	POST	/v3/growth/assortment/recommendations/categorization/counts
+Assortment Recommendations	Reject Recommendations	20/hour	PUT	/v3/growth/assortment/recommendations/rejections
+Disputes Management	Dispute status	10/min	POST	/v3/items/dispute/duplicates/status
+Disputes Management	Dispute submission	10/min	POST	/v3/items/dispute/duplicates/contest
+Feed Management	All feed statuses	5000/min
+(Shared with Feed item status)	GET	/v3/feeds
+Feed Management	Feed item status	5000/min
+(Shared with All feed statuses)	GET	/v3/feeds/{feedId}
+Feed Management	Get feed error report	60/hour	GET	/v3/feeds/{feedId}/errorReport
+Fulfillment Management (WFS)	Hazmat Items On Hold	30/hour	POST	/v3/items/onhold/search
+Fulfillment Management (WFS)	Update Shipment Tracking	2/min	POST	/v3/fulfillment/shipment-tracking
+Fulfillment Management (WFS)	Create Inbound Shipment label	20/min	POST	/v3/fulfillment/shipment-label
+Fulfillment Management (WFS)	Get Customer Return Orders status	60/min	GET	/v3/fulfillment/return-orders
+Fulfillment Management (WFS)	Create Customer Return Order	60/min	POST	/v3/fulfillment/return-orders
+Fulfillment Management (WFS)	Cancel Customer Return Order	60/min	POST	/v3/fulfillment/return-orders/{orderId}/cancel
+Fulfillment Management (WFS)	Create Customer Order	600/min	POST	/v3/fulfillment/orders-fulfillments
+Fulfillment Management (WFS)	Fetch Delivery Promise Details	20/min	POST	/v3/fulfillment/orders-fulfillments/fetchOrderPromiseOptions
+Fulfillment Management (WFS)	Cancel Customer Order	600/min	POST	/v3/fulfillment/orders-fulfillments/cancel
+Fulfillment Management (WFS)	Get Shipments	32/min	GET	/v3/fulfillment/inbound-shipments
+Fulfillment Management (WFS)	Create Inbound Shipment	500/min	POST	/v3/fulfillment/inbound-shipments
+Fulfillment Management (WFS)	Fetch Inbound Preview	60/hour	POST	/v3/fulfillment/inbound-preview
+Fulfillment Management (WFS)	Get Carrier Rate Quote	150/min	GET	/v3/fulfillment/carrier-rate-quotes/{shipmentId}/{mode}
+Fulfillment Management (WFS)	Create Carrier Rate Quote	8/min	POST	/v3/fulfillment/carrier-rate-quotes
+Fulfillment Management (WFS)	Confirm Carrier Rate Quote	8/min	POST	/v3/fulfillment/carrier-rate-quote/confirm
+Fulfillment Management (WFS)	Print Carrier Label	30/min	POST	/v3/fulfillment/carrier-label/{shipmentId}
+Fulfillment Management (WFS)	Get WFS Inventory Health Report	5/min	GET	/v3/report/wfs/getInventoryHealthReport
+Fulfillment Management (WFS)	Get WFS Inventory Reconciliation Report	1/hour	GET	/v3/report/wfs/inventoryReconciliationReport
+Fulfillment Management (WFS)	Get fulfillment orders status	20/min	GET	/v3/fulfillment/orders-fulfillments/status
+Fulfillment Management (WFS)	Get Inventory Log for a WFS item	500/min	GET	/v3/fulfillment/inventory-log
+Fulfillment Management (WFS)	Get Inbound Shipment Items	300/min	GET	/v3/fulfillment/inbound-shipment-items
+Fulfillment Management (WFS)	Get Inbound Shipment errors	10/min	GET	/v3/fulfillment/inbound-shipment-errors
+Fulfillment Management (WFS)	Cancel Inbound Shipment	10/min	DELETE	/v3/fulfillment/inbound-shipments/{inboundOrderId}
+Fulfillment Management (WFS)	Create Carrier Rate Quote	10/min	POST	/v4/fulfillment/inbound-shipments-quote
+Fulfillment Management (WFS)	Get Carrier Rate Quote	150/min	GET	v4/fulfillment/inbound-shipments-quote/{quoteType}/{shipmentId}
+Fulfillment Management (WFS)	Create Booking	8/min	POST	/v4/fulfillment/inbound-shipments-booking
+Fulfillment Management (WFS)	Cancel Booking	10/min	DELETE	v4/fulfillment/inbound-shipments-booking/{shipmentId}/{mode}
+Fulfillment Management (WFS)	Generate Label	20/min	POST	/v4/fulfillment/generate-label
+Fulfillment Management (WFS)	Download Label	300/min	GET	/v4/fulfillment/download-label/{shipmentId}/{labelType}/{labelSize}
+Fulfillment Management (WFS)	Print Bill of Lading (BOL)	10/min	GET	/v4/fulfillment/inbound-shipments-bol/{shipmentId}/{mode}
+Insights Management	Item Listing Quality Details	1/min	POST	/v3/insights/items/listingQuality/items
+Insights Management	Pro Seller Tier and Rewards Status	1/min	GET	/v3/insights/sellerIncentives
+Insights Management	Pro Seller Badge Status	1/min	GET	/v3/insights/prosellerbadge
+Insights Management	Valid Tracking Rate Performance Metrics	1/min	GET	/v3/insights/performance/vtr/summary
+Insights Management	Get Valid tracking orders report in Microsoft xlsx format	1/min	GET	/v3/insights/performance/vtr/report
+Insights Management	Simplified Shipping Settings Metrics - Ship-from Location accuracies	1/min	GET	/v3/insights/performance/sss/sfla/summary
+Insights Management	Get the report of Simplified Shipping Settings Metrics - Ship-from location accury in Microsoft xlsx format	1/min	GET	/v3/insights/performance/sss/sfla/report
+Insights Management	Simplified Shipping Settings Metrics - On-time Shipment rate	1/min	GET	/v3/insights/performance/sss/ots/summary
+Insights Management	Get the report of Simplified Shipping Settings Metrics - On-time shipment rate in Microsoft xlsx format	1/min	GET	/v3/insights/performance/sss/ots/report
+Insights Management	Simplified Shipping Settings Metrics - Carrier Method Accuracy	1/min	GET	/v3/insights/performance/sss/cma/summary
+Insights Management	Get the report of Simplified Shipping Settings Metrics - Carrier Method Accuracy in Microsoft xlsx format	1/min	GET	/v3/insights/performance/sss/cma/report
+Insights Management	Seller Response Rate Performance Metrics	1/min	GET	/v3/insights/performance/srr/summary
+Insights Management	Get Seller Response Rate orders in Microsoft xlsx format	1/min	GET	/v3/insights/performance/srr/report
+Insights Management	Refund Performance Metrics	1/min	GET	/v3/insights/performance/refunds/summary
+Insights Management	Get refunded orders report in Microsoft xlsx format	1/min	GET	/v3/insights/performance/refunds/report
+Insights Management	On Time Delivery Performance Metrics	1/min	GET	/v3/insights/performance/otd/summary
+Insights Management	Get On Time Delivery Orders Report in Microsoft xlsx format	1/min	GET	/v3/insights/performance/otd/report
+Insights Management	Cancellations Performance Metrics	1/min	GET	/v3/insights/performance/cancellations/summary
+Insights Management	Get cancelled orders report in Microsoft xlsx format	1/min	GET	/v3/insights/performance/cancellations/report
+Insights Management	Unpublished Items	100/min	GET	/v3/insights/items/unpublished/items
+Insights Management	Unpublished Item Counts	100/min	GET	/v3/insights/items/unpublished/counts
+Insights Management	Seller Listing Quality Score	10/hour	GET	/v3/insights/items/listingQuality/score
+Inventory Management	Inventory (legacy)	200/min	GET	/v3/inventory
+Inventory Management	Inventory (New)	100/min	GET	/v3/wfs/inventory
+Inventory Management	Update Inventory	200/min	PUT	/v3/inventory
+Inventory Management	Single Item Inventory by Ship Node	200/min	GET	/v3/inventories/{sku}
+Inventory Management	Update Item Inventory per Ship Node	200/min	PUT	/v3/inventories/{sku}
+Inventory Management	Multiple Item Inventory for All Ship Nodes	200/min	GET	/v3/inventories
+Item Management	Get Spec	10/min	POST	/v3/items/spec
+Item Management	Catalog Search	200/min
+(Shared with Get Item Associations)	POST	/v3/items/catalog/search
+Item Management	Get Item Associations	200/min
+(Shared with Catalog Search)	POST	/v3/items/associations
+Item Management	GTIN Exemption Status	100/min	GET	/v3/items/gtin-exemption/status
+Item Management	All items	300/min
+(if used with query parameters 60/min)	GET	/v3/items
+Item Management	An item	900/min
+(if used with query parameters 60/min)	GET	/v3/items/{id}
+Item Management	Item Search	200/min	GET	/v3/items/walmart/search
+Item Management	Taxonomy	200/min
+(Shared with Get items count by status)	GET	/v3/items/taxonomy
+Item Management	Get item count by groups	100/min	GET	/v3/items/groups/count
+Item Management	Get items count by status	200/min
+(Shared with Taxonomy)	GET	/v3/items/count
+Item Management	Retire an item	900/min	DELETE	/v3/items/{sku}
+Lag Time	Lag Time	20/hour	GET	/v3/lagtime
+Notifications Management	Test Notification	10/min	POST	/v3/webhooks/test
+Notifications Management	All Subscriptions	50/min	GET	/v3/webhooks/subscriptions
+Notifications Management	Create Subscription	200/min	POST	/v3/webhooks/subscriptions
+Notifications Management	Delete Subscription	10/min	DELETE	/v3/webhooks/subscriptions/{subscriptionId}
+Notifications Management	Update Subscription	5/min	PATCH	/v3/webhooks/subscriptions/{subscriptionId}
+Notifications Management	Event Types	5/min	GET	/v3/webhooks/eventTypes
+On-Request Report Management	Get All Report Requests	200/min	GET	/v3/reports/reportRequests
+On-Request Report Management	Report Request Status	20/hour	GET	/v3/reports/reportRequests/{requestId}
+On-Request Report Management	Download Report URL	20/hour	GET	/v3/reports/downloadReport
+On-Request Report Management	Create Report Schedule	60/min	POST	/v3/reports/schedules
+On-Request Report Management	Get All Report Schedules	100/min	GET	/v3/reports/schedules
+On-Request Report Management	Get Single Report Schedules	100/min	GET	/v3/reports/schedules/{scheduleId}
+On-Request Report Management	Update Report Schedule	60/min	PUT	/v3/reports/schedules/{scheduleId}
+On-Request Report Management	Delete Report Schedule	60/min	DELETE	/v3/reports/schedules/{scheduleId}
+Order Management	Ship Order Lines	60/min	POST	/v3/orders/{purchaseOrderId}/shipping
+Order Management	Refund Order Lines	60/min	POST	/v3/orders/{purchaseOrderId}/refund
+Order Management	Cancel Order Lines	60/min	POST	/v3/orders/{purchaseOrderId}/cancel
+Order Management	Acknowledge Orders	60/min	POST	/v3/orders/{purchaseOrderId}/acknowledge
+Order Management	All orders	5000/min	GET	/v3/orders
+Order Management	An order	5000/min	GET	/v3/orders/{purchaseOrderId}
+Order Management	All released orders	60/min	GET	/v3/orders/released
+Payments	Entity Match	300/min	GET	/v3/settings/entitymatchprofile
+Payment Reports	Recon Report (Legacy)	100/min	GET	/v3/report/reconreport/reconFile
+Payment Reports	Payment Statement Report	15/min	GET	/v3/report/payment/statement
+Payment Reports	Performance Report	15/min	GET	/v3/report/payment/performance
+Price Management	Update pricing for multiple items in bulk (New)	6/day	POST	/v3/feeds?feedType=PRICE_AND_PROMOTION
+Price Management	Update pricing for a single item	100/hour	PUT	/v3/price
+Price Management	Create Repricer Strategy	20/hour	POST	/v3/repricer/strategy
+Price Management	Update Repricer Strategy	10/hour	PUT	/v3/repricer/strategy/{strategyCollectionId}
+Price Management	Delete Repricer Strategy	10/hour	DELETE	/v3/repricer/strategy/{strategyCollectionId}
+Price Management	Assign/Unassign items to/from Repricer Strategy	6/hour	POST	/v3/repricerFeeds
+Price Management	Update walmart-funded incentives enrollment for specific items	6/hour	POST	/v3/feeds?feedType=WALMART_FUNDED_INCENTIVES_ENROLLMENT
+Price Management	Update Walmart-funded incentives enrollment for all items	1/min	PUT	/v3/price/incentives/wfpreference
+Price Management	Update reduced referral fee incentives enrollment	6/hour	POST	/v3/feeds?feedType=INCENTIVE_ENROLLMENT
+Price Management	Get Pricing Insights	2/min	POST	/v3/price/getPricingInsights
+Price Management	Retrieve repricer strategy details	10/min	GET	/v3/repricer/strategies
+Price Management	Update bulk prices (Legacy)	10/hour	POST	/v3/feeds
+Price Management	Retrieve price incentives data	60/min	GET	/v3/price/incentives
+Price Management	Set up CAP SKU All	30/min	POST	/v3/cppreference
+Price Management	List of Repricer Strategies	50/hour	GET	/v3/repricer/strategies
+Price Management	List of Price Incentive Items	60/min	GET	/v3/price/incentives
+Promotion Management	Update a promotional price	100/hour	PUT	/v3/price
+Promotion Management	Promotional prices	1000/min	GET	/v3/promo/sku/{sku}
+Returns Management	Issue refund	60/min	POST	/v3/returns/{returnOrderId}/refund
+Returns Management	Returns	50/min	GET	/v3/returns
+Recommendations	Recommended Shipment Quantity	100/min	GET	/v3/wfs/recommendation/shipment-quantity
+Reviews Acceleration	Bulk Update Item Status	100/hour	PUT	/v3/growth/reviews-accelerator/items/status
+Reviews Acceleration	Get RAP Post-Purchase Items	20/min	POST	/v3/growth/reviews-accelerator/items
+Reviews Acceleration	Get Categories	100/hour	POST	/v3/growth/reviews-accelerator/categories
+Settings Management	Get Shipping Template Details	750/min	GET	/v3/settings/shipping/templates/{templateId}
+Settings Management	Update Shipping Templates	100/min	PUT	/v3/settings/shipping/templates/{templateId}
+Settings Management	Delete Shipping Template	100/min	DELETE	/v3/settings/shipping/templates/{templateId}
+Settings Management	Get all fulfillment centers	50/min	GET	/v3/settings/shipping/shipnodes
+Settings Management	Update fulfillment center	60/min	PUT	/v3/settings/shipping/shipnodes
+Settings Management	Create fulfillment center	10/min	POST	/v3/settings/shipping/shipnodes
+Settings Management	Get account level settings	50/min	GET	/v3/settings/shipping/account
+Settings Management	Update account level settings	100/min	PUT	/v3/settings/shipping/account
+Settings Management	Create account level settings	10/min	POST	/v3/settings/shipping/account
+Settings Management	Get All Shipping Templates	300/min	GET	/v3/settings/shipping/templates
+Settings Management	Create Shipping Templates	60/min	POST	/v3/settings/shipping/templates
+Settings Management	Third party fulfillment center association	10/min	POST	/v3/settings/shipping/3plshipnodes
+Settings Management	Get Shipping Configurations	100/min	GET	/v3/settings/shippingprofile
+Settings Management	Get Shipping Template Activation Status	10/min	GET	/v3/settings/shipping/templates/activationStatus
+Settings Management	Get coverage for fulfillment centers	100/min	GET	/v3/settings/shipping/shipnodes/coverage
+Settings Management	Get carrier methods	10/min	GET	/v3/settings/shipping/carriers
+Settings Management	Get all third party fulfillment providers	10/min	GET	/v3/settings/shipping/3plproviders
+Settings Management	Get Partner Configurations	50/min	GET	/v3/settings/partnerprofile
+Ship With Walmart	Create label	100/min	POST	/v3/shipping/labels
+Ship With Walmart	Shipping estimates	100/min	POST	/v3/shipping/labels/shipping-estimates
+Ship With Walmart	Labels detail by purchase order id	100/min	GET	/v3/shipping/labels/purchase-orders/{purchaseOrderId}
+Ship With Walmart	Supported carriers	100/min	GET	/v3/shipping/labels/carriers
+Ship With Walmart	Download label	100/min	GET	/v3/shipping/labels/carriers/{carrierShortName}/trackings/{trackingNo}
+Ship With Walmart	Discard label	100/min	DELETE	/v3/shipping/labels/carriers/{carrierShortName}/trackings/{trackingNo}
+Ship With Walmart	Supported carrier package types	100/min	GET	/v3/shipping/labels/carriers/{carrierShortName}/package-types
+Simplified Shipping Settings Management	Update FC Level Simplified Shipping Settings	25/min	PUT	/v3/settings/shipping/simplifiedshippingsettings/fulfillmentcenter
+Simplified Shipping Settings Management	Update Simplified Shipping Settings	25/min	PUT	/v3/settings/shipping/simplifiedshippingsettings/account
+Simplified Shipping Settings Management	Create Simplified Shipping Settings	5/min	POST	/v3/settings/shipping/simplifiedshippingsettings/account
+Simplified Shipping Settings Management	Get Simplified Shipping Settings	50/min	GET	/v3/settings/shipping/simplifiedshippingsettings
+Utilities Management	Taxonomy by Spec	20/min	GET	/v3/utilities/taxonomy
+Utilities Management	API Platform Status	100/min	GET	/v3/utilities/apiStatus
+# 以下 Insights Seller Performance 端点在 API Reference 文档中存在（已通过抓取 /us-marketplace/docs/retrieve-* 页面确认路径），
+# 但未列入官方 rate-limiting 速率限制表（2026-04-15 验证）。调用时建议按同类 1/min 保守节流，并监控 x-current-token-count 响应头。
+# 注：旧的 /v3/insights/performance/refunds/summary 在官方侧边栏已标注为 Deprecated，被新的 returns/summary 取代。
+Insights Management (undocumented)	Retrieve negative feedback performance summary	未列入文档	GET	/v3/insights/performance/negativeFeedback/summary
+Insights Management (undocumented)	Retrieve negative feedback report	未列入文档	GET	/v3/insights/performance/negativeFeedback/report
+Insights Management (undocumented)	Retrieve returns performance summary	未列入文档	GET	/v3/insights/performance/returns/summary
+Insights Management (undocumented)	Retrieve returns performance report	未列入文档	GET	/v3/insights/performance/returns/report
+Insights Management (undocumented)	Retrieve item not received performance summary	未列入文档	GET	/v3/insights/performance/itemNotReceived/summary
+Insights Management (undocumented)	Retrieve item not received report	未列入文档	GET	/v3/insights/performance/itemNotReceived/report

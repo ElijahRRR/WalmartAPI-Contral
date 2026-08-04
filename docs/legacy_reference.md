@@ -1,0 +1,72 @@
+# 旧仓库(erpAPI)事实清单
+
+> 重构是重写代码,不是重新踩坑。本文档汇总旧系统用事故换来的参数、语义和教训,
+> 执行 AI 实现对应工作流前必须读相关小节。旧仓库路径:`~/Projects/erpAPI`(生产 Mac)。
+
+## 必须原样保留的行为语义
+
+1. **每店铺固定出口代理**。凭证表里每个 ClientId 绑定固定 socks5/http 代理,
+   所有沃尔玛请求必须经该店代理发出。这是防店铺关联的生死线,没有例外。
+2. **token 900 秒内复用**,按 client_id 缓存,线程安全,401 时就地刷新重试一次。
+3. **429/5xx 自适应退避**:解析 `Retry-After` 与沃尔玛特有的
+   `X-Next-Replenishment-Time` 响应头;`x-current-token-count` 是剩余配额。
+4. **UPC 池"领取即标已领、永不释放"**。历史上因释放语义不一致出过重复使用事故。
+5. **DELETE_ITEM 只对 SFF 且不可恢复**;旧系统每店提交间隔 360s、单日上限从飞书表读取。
+6. **auto_listing 的 9 状态生命周期**与 reconcile(按 feed 结果回写)语义,
+   迁移 listing 时先读旧仓库 `auto_listing/README.md` 和 `docs/closed_loop.md`。
+
+## 飞书踩坑参数(api/feishu.py 必须内置)
+
+- 瞬时错误码 **90235 / 90217 / 50502** 需指数退避重试;其他错误码不重试。
+- 电子表格单次写入上限 5000 格;实际稳定值更低,旧系统按 ARG_MAX 教训降到过 1000 行/批。
+- 多维表格:批量增/改单次 ≤500 条,整批全成功或全失败;写 QPS 低(约 10/s),
+  **同一张表串行写**。
+- 旧系统三起数据事故(单日丢 6241 行)全部源于:分批写中断无补偿、重试语义不当、
+  超时误判成功。新实现:每批写完校验返回,失败批次记录到 ops 后重试,不静默跳过。
+
+## 沃尔玛 API 高危配额(refdata/walmart_rate_limits.tsv 全量,这里列高危)
+
+| 端点 | 配额 |
+|---|---|
+| PRICE_AND_PROMOTION feed | **6/天**(价格批量必须聚合,严禁高频提交) |
+| PUT /v3/price 单品 | 100/小时 |
+| GET /v3/items 带 query | 60/分钟(无 query 300/分钟) |
+| Insights 绩效类 22 个端点 | 全部 1/分钟 |
+| /v3/feeds 与 /v3/feeds/{id} | 共享 5000/分钟 |
+| WFS Inventory Reconciliation | 1/小时(必须缓存) |
+
+注意:`refunds/summary` 已废弃,用 `returns/*` 系列;negativeFeedback/returns/
+itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
+
+## 旧系统的结构性缺陷(新系统靠架构消灭,不要复刻)
+
+- 8 处绕过共享客户端的直连,根因是旧客户端三缺口:无 feed 提交接口、
+  无二进制响应支持、无 async。api 层第一天补齐(plan.md Phase 1)。
+- "遍历店铺并发执行"样板被复制 6 份 → services 写一次。
+- 飞书"查元信息→扩行→分批写"被复制 3 份 → api/feishu.py 写一次。
+- `DELETE_ITEM_VER = "5.0.20250919-16_45_47-api"` 之类版本常量被抄 3 份 → 只在 api/feeds.py。
+- 整表覆盖写飞书导致"新短旧长残留尾部旧行" → 多维表格按 record_id 更新,天然消灭。
+- 双重调度(订单同步同时被 launchd 每小时 + skill 13:30 触发)→ 新系统一条工作流
+  只允许一条调度,登记在 plan.md。
+
+## 状态数据迁移清单(切换对应工作流时从生产 Mac 搬)
+
+| 旧位置 | 内容 | 去处 |
+|---|---|---|
+| 沃尔玛问题商品清理/cache/*.json | 已提交 SKU(2日防重)、反补计数、品牌缓存 | ops.dedupe |
+| PostgreSQL walmart_cleanup 库 | 41.7 万行问题商品历史 | 并入 walmart_erp 相应表 |
+| 沃尔玛商品维护/maintenance.db | 维护任务与 feed 明细 | listing schema |
+| 沃尔玛UPC生成器/upc_history.db | 10 万+ UPC 去重池 | listing.upc_pool |
+| erpAPI/walmart_settlement.db | 结算快照 | orders.settlement |
+| auto_listing/state/ + logs/feed_*.json | feed 历史(reconcile 反查 SKU→UPC 的唯一凭据) | 迁 listing 时定方案,先原样归档 |
+| 订单审核 飞书 _meta sheet | 每店增量游标 | ops.cursors |
+
+## 环境事实
+
+- 生产机:macOS + launchd(不读 .zshrc,环境变量要么写进 plist 要么用 paths.py 默认值)。
+- 影刀 RPA 仅 macOS,产出店铺前台数据(日报 A-H 列唯一来源),新系统只改其数据落点。
+- lark-cli 二进制仍可用,但新系统统一直连 HTTP,不再依赖它。
+- 旧凭证 `店铺API.xlsx` 已进过 git 历史(公开仓库),**上多维表格时建议顺手轮换
+  可轮换的密钥**;新仓库永远不出现明文密钥。
+- erp-core 与旧 ERP 链路(erp_listing_server/erp_web/erp_worker)不在本次范围,
+  它们依赖旧仓库路径,旧仓库归档前保留原位。

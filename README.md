@@ -1,4 +1,4 @@
-# WalmartAPI-Contral · 沃尔玛卖家 ERP(重构版)
+# WalmartAPI-Contral · 沃尔玛 API 自动化工作流
 
 对旧仓库 `erpAPI` 的整体重构:按沃尔玛 API 域分层封装 + 统一接线盒(registry)+
 Postgres 中心库 + 飞书多维表格作为人机界面。旧项目仍在生产,本仓库逐条工作流对拍替换。

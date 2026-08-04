@@ -1,6 +1,6 @@
 # Postgres 数据库设计
 
-> 本机 PostgreSQL 17,库名 `walmart_erp`。四个 schema,职责互不越界。
+> 本机 PostgreSQL 17,库名 `walmart_data`。四个 schema,职责互不越界。
 > 本文档是唯一的表结构事实来源:任何 AI 建表/改表必须同步更新这里。
 > 连接只准通过 `registry/db.py`;Metabase/NocoDB/MCP 用只读角色 `readonly`。
 
@@ -15,7 +15,7 @@
 
 设计原则:
 - 同一业务域的表放同一 schema,跨域 JOIN 随便写,不再有跨库之苦。
-- 会给人看/未来 ERP 网页端会读的数据在 catalog/listing/orders;
+- 会给人看/未来网页端会读的数据在 catalog/listing/orders;
   只给脚本自己用的状态在 ops;可重建缓存不进数据库(放 DATA_ROOT/cache 的 SQLite)。
 - 核心业务表统一带:`store`(归属店铺)、`owner`(归属人,团队协作预埋)、
   `created_at` / `updated_at`。
@@ -178,7 +178,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops
     GRANT SELECT ON TABLES TO readonly;
 ```
 
-备份:`backup` 工作流每日 `pg_dump -Fc walmart_erp` 到 `<DATA_ROOT>/backups/`,
+备份:`backup` 工作流每日 `pg_dump -Fc walmart_data` 到 `<DATA_ROOT>/backups/`,
 保留 14 天,完成/失败均发飞书通知。
 
 > 注:`...` 处的列清单由执行 AI 在实现对应工作流时,按旧系统实际字段补全并回写本文档。

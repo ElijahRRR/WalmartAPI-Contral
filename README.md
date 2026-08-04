@@ -56,4 +56,5 @@ registry/    接线盒(全项目唯一允许出现 token/表ID/路径/地址的�
 | `docs/db_schema.md` | Postgres 四 schema 设计与 DDL 草案 |
 | `docs/feishu_tables.md` | 飞书多维表格清单、字段约定、读写规范 |
 | `docs/legacy_reference.md` | 旧仓库事实清单:魔数、事故教训、各工作流行为规格 |
+| `docs/legacy_survey.md` | 旧仓库全量摸底报告:14 模块逐一通读的证据级结论(带文件:行号) |
 | `docs/scraper_migration_brief.md` | 采集服务改造简报(给采集侧 AI) |

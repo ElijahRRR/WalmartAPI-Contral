@@ -115,7 +115,7 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
     name="在线产品总表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_ONLINE_SHEET_ID", ""),
-    columns=("store", "sku", "wpid", "upc", "gtin", "productName", "shelf",
+    columns=("store", "sku", "itemId", "upc", "gtin", "productName", "shelf",
              "productType", "price", "currency", "availToSellQty",
              "publishedStatus", "lifecycleStatus", "unpublishedReasons",
              "last_seen_at", "missing_since"),

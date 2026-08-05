@@ -68,9 +68,46 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
     with db.pg_conn() as conn:
         written = walmart_catalog.upsert_items(conn, rows)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
+
+    backfilled = _backfill_item_ids(store)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
-            "filled": filled, "inv": len(inventory)}
+            "filled": filled, "inv": len(inventory), "item_ids": backfilled}
+
+
+def _backfill_item_ids(store: dict) -> int:
+    """输入:店铺 → 输出:本次回填的 item_id 数量。
+
+    对在售且 item_id 为空的行,catalog/search 按 sku 逐个查数字商品ID
+    (GET /v3/items 不返回它)。itemId 平时不变,只有新品和"缺席后复现"
+    (upsert 时已重置为 NULL)的行会进这里,增量成本很小;首轮为全量回填。
+    单条失败只记日志跳过,不影响店铺同步结果。
+    """
+    name = store["name"]
+    with db.pg_conn() as conn:
+        todo = walmart_catalog.skus_missing_item_id(conn, name)
+    if not todo:
+        return 0
+    logger.info("店铺 %s 回填 item_id:%d 个 SKU 待查", name, len(todo))
+
+    def _one(sku: str) -> tuple[str, str | None]:
+        try:
+            hits = items.catalog_search(store, "sku", sku)
+            iid = hits[0].get("itemId") if hits else None
+            return sku, (str(iid) if iid else None)
+        except Exception as e:
+            logger.warning("item_id 回填失败 %s/%s: %s", name, sku, e)
+            return sku, None
+
+    found: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 线程跑满 180/min 桶
+        for f in as_completed([pool.submit(_one, s) for s in todo]):
+            sku, iid = f.result()
+            if iid:
+                found[sku] = iid
+    with db.pg_conn() as conn:
+        walmart_catalog.set_item_ids(conn, name, found)
+    return len(found)
 
 
 def run(params: dict) -> str:
@@ -107,9 +144,11 @@ def run(params: dict) -> str:
 
     total_written = sum(r["written"] for r in results)
     total_missing = sum(r["missing"] for r in results)
+    total_item_ids = sum(r.get("item_ids", 0) for r in results)
     truncated = [r["store"] for r in results if r["truncated"]]
     lines = [f"catalog_sync:{len(results)}/{len(store_list)} 店完成,"
-             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行"]
+             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行,"
+             f"回填 item_id {total_item_ids} 个"]
     if truncated:
         lines.append(f"offset 截断已补漏:{','.join(truncated)}")
     if dead:

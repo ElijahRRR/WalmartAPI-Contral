@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     store        text NOT NULL,
     sku          text NOT NULL,
     wpid         text,
+    item_id      text,               -- walmart.com 数字商品ID(邮件/工单定位用);
+                                     -- GET /v3/items 不返回,由 catalog/search 按 sku 回填;
+                                     -- 行缺席后复现时重置为 NULL 触发重查(下架重上可能换 ID)
     upc          text,               -- 必须 text:前导零(旧事故教训)
     gtin         text,
     product_name text,
@@ -73,6 +76,9 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     PRIMARY KEY (store, sku)
 );
 CREATE INDEX IF NOT EXISTS walmart_items_sku_idx ON catalog.walmart_items (sku);
+-- 已建库的存量表补列(幂等)
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS item_id text;
+CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (item_id);
 
 -- ── listing:上架域 ────────────────────────────────────────────────────────
 

@@ -25,6 +25,9 @@ ON CONFLICT (store, sku) DO UPDATE SET
     published_status = EXCLUDED.published_status,
     lifecycle_status = EXCLUDED.lifecycle_status,
     unpublished_reasons = EXCLUDED.unpublished_reasons,
+    -- 缺席后复现 = 可能经历下架重上,itemId 或已改变 → 重置触发回填重查
+    item_id = CASE WHEN catalog.walmart_items.missing_since IS NOT NULL
+                   THEN NULL ELSE catalog.walmart_items.item_id END,
     last_seen_at = EXCLUDED.last_seen_at, missing_since = NULL, updated_at = now()
 """
 
@@ -67,11 +70,12 @@ def mark_missing(conn, store_name: str, run_at) -> int:
 
 
 _PROJECTION_SQL = """
-SELECT store, sku, wpid, upc, gtin, product_name, shelf, product_type,
+SELECT store, sku, item_id, upc, gtin, product_name, shelf, product_type,
        price, currency, avail_qty, published_status, lifecycle_status,
        unpublished_reasons, last_seen_at, missing_since
 FROM catalog.walmart_items ORDER BY store, sku
 """  # 列序与 registry.resources.ONLINE_PRODUCTS_SHEET.columns 一一对应,改必同步
+# (wpid 不投影:用户明确不需要;PG 仍保留该列供 API 场景用)
 
 
 def projection_rows(conn) -> list[list]:
@@ -92,6 +96,27 @@ def projection_rows(conn) -> list[list]:
     with conn.cursor() as cur:
         cur.execute(_PROJECTION_SQL)
         return [[_cell(v) for v in row] for row in cur.fetchall()]
+
+
+def skus_missing_item_id(conn, store_name: str) -> list[str]:
+    """输入:连接 + 店铺 → 输出:在售(未缺席)且 item_id 为空、待回填的 SKU 列表。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku FROM catalog.walmart_items "
+                    "WHERE store = %s AND item_id IS NULL AND missing_since IS NULL "
+                    "ORDER BY sku", (store_name,))
+        return [r[0] for r in cur.fetchall()]
+
+
+def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:
+    """输入:连接 + 店铺 + {sku: item_id} → 输出:更新行数。"""
+    if not mapping:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE catalog.walmart_items SET item_id = %(item_id)s, updated_at = now() "
+            "WHERE store = %(store)s AND sku = %(sku)s",
+            [{"store": store_name, "sku": k, "item_id": v} for k, v in mapping.items()])
+    return len(mapping)
 
 
 def known_skus(conn, store_name: str) -> set[str]:

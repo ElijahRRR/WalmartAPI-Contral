@@ -250,6 +250,26 @@ def test_projection_rows_cell_conversion():
     assert rows[0][2] == "" and rows[0][15] == ""     # None → 空串
 
 
+def test_item_id_backfill_helpers():
+    conn = _FakeConn(rows=[("SKU_A",), ("SKU_B",)])
+    assert walmart_catalog.skus_missing_item_id(conn, "T1") == ["SKU_A", "SKU_B"]
+    assert walmart_catalog.set_item_ids(conn, "T1", {"SKU_A": "14901706450"}) == 1
+    assert walmart_catalog.set_item_ids(conn, "T1", {}) == 0
+
+
+def test_upsert_resets_item_id_on_reappearance():
+    # 缺席后复现的行 item_id 必须重置(下架重上可能换 ID),正常在售的行保留
+    assert "missing_since IS NOT NULL" in walmart_catalog._UPSERT_SQL
+    assert "THEN NULL ELSE catalog.walmart_items.item_id" in walmart_catalog._UPSERT_SQL
+
+
+def test_projection_columns_match_registry():
+    from registry import resources
+    select_part = walmart_catalog._PROJECTION_SQL.split("FROM")[0]
+    n_sql = select_part.replace("SELECT", "").count(",") + 1
+    assert n_sql == len(resources.ONLINE_PRODUCTS_SHEET.columns)
+
+
 # ── 飞书电子表格 ──────────────────────────────────────────────────────────────
 
 def test_col_letter():

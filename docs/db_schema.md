@@ -82,7 +82,11 @@ CREATE VIEW catalog.latest_snapshot AS
 -- (替代旧飞书「在线产品总表」的沃尔玛列;amz 数据在 products/snapshots,sku=asin JOIN)
 CREATE TABLE catalog.walmart_items (
     store text NOT NULL, sku text NOT NULL,
-    wpid text, upc text, gtin text,          -- upc/gtin 必须 text:前导零教训
+    wpid text,
+    item_id text,                            -- walmart.com 数字商品ID(邮件/工单定位);
+                                             -- GET /v3/items 不返回,catalog/search 按 sku 回填;
+                                             -- 行缺席后复现时重置 NULL 触发重查(下架重上可能换 ID)
+    upc text, gtin text,                     -- upc/gtin 必须 text:前导零教训
     product_name text, shelf text, product_type text,
     price numeric, currency text,
     avail_qty integer,                       -- GET /v3/inventories 合并

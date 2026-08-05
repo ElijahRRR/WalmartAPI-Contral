@@ -62,7 +62,14 @@ docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md 
 
 ## 写沃尔玛调用代码之前
 
-先查 `refdata/walmart_rate_limits.tsv` 确认端点配额。高危限制:
-PRICE_AND_PROMOTION feed = 6/天;单品价格 PUT = 100/小时;Insights 类全部 1/分钟;
+**先查 `docs/api_blueprint.md`**(端点/配额/分页模型/feed schema 的设计定稿,
+2026-08-05 官方核验)确认目标端点的函数是否已定义;配额明细以蓝图第 3 节三源
+对照表为准(`refdata/walmart_rate_limits.tsv` 是其来源之一,个别行已被官方核验
+修正)。高危限制速记:价格三件套 feed 共享桶(保守按 6/天配置);其余 feedType
+各自独立 10/hour;单品价格 PUT = 100/小时;Insights performance 类 1/分钟;
 `GET /v3/items` 带 query 参数 60/分钟。响应头 `x-current-token-count` 与
 `X-Next-Replenishment-Time` 用于自适应退避(api/_client.py 已内置,勿自行实现)。
+
+api 层收录规则:**只实现「工作流×端点矩阵」(蓝图第 2 节)出现过的端点**,
+一个端点一个函数,分页/切片/防重等机制藏在函数内;预留端点只登记不实现;
+新增函数前先对照蓝图第 7 节函数面,不自创签名。

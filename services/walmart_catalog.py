@@ -11,16 +11,22 @@ logger = logging.getLogger("services.walmart_catalog")
 _UPSERT_SQL = """
 INSERT INTO catalog.walmart_items
     (store, sku, wpid, upc, gtin, product_name, shelf, product_type,
+     variant_group_id, variant_group_info,
      price, currency, avail_qty, published_status, lifecycle_status,
      unpublished_reasons, last_seen_at, missing_since, updated_at)
 VALUES (%(store)s, %(sku)s, %(wpid)s, %(upc)s, %(gtin)s, %(product_name)s,
-        %(shelf)s, %(product_type)s, %(price)s, %(currency)s, %(avail_qty)s,
+        %(shelf)s, %(product_type)s,
+        %(variant_group_id)s, %(variant_group_info)s::jsonb,
+        %(price)s, %(currency)s, %(avail_qty)s,
         %(published_status)s, %(lifecycle_status)s, %(unpublished_reasons)s,
         %(seen_at)s, NULL, now())
 ON CONFLICT (store, sku) DO UPDATE SET
     wpid = EXCLUDED.wpid, upc = EXCLUDED.upc, gtin = EXCLUDED.gtin,
     product_name = EXCLUDED.product_name, shelf = EXCLUDED.shelf,
-    product_type = EXCLUDED.product_type, price = EXCLUDED.price,
+    product_type = EXCLUDED.product_type,
+    variant_group_id = EXCLUDED.variant_group_id,
+    variant_group_info = EXCLUDED.variant_group_info,
+    price = EXCLUDED.price,
     currency = EXCLUDED.currency, avail_qty = EXCLUDED.avail_qty,
     published_status = EXCLUDED.published_status,
     lifecycle_status = EXCLUDED.lifecycle_status,
@@ -71,6 +77,7 @@ def mark_missing(conn, store_name: str, run_at) -> int:
 
 _PROJECTION_SQL = """
 SELECT store, sku, item_id, upc, gtin, product_name, shelf, product_type,
+       variant_group_id, variant_group_info::text,
        price, currency, avail_qty, published_status, lifecycle_status,
        unpublished_reasons, last_seen_at, missing_since
 FROM catalog.walmart_items ORDER BY store, sku

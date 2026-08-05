@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     product_name text,
     shelf        text,               -- 已美化为 'A > B' 路径
     product_type text,
+    variant_group_id   text,         -- 变体组 ID(同组共享;listing 工作流复用)
+    variant_group_info jsonb,        -- 变体组详情(isPrimary/分组维度等,原样存)
     price        numeric,
     currency     text,
     avail_qty    integer,            -- GET /v3/inventories 合并进来
@@ -78,6 +80,8 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
 CREATE INDEX IF NOT EXISTS walmart_items_sku_idx ON catalog.walmart_items (sku);
 -- 已建库的存量表补列(幂等)
 ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS item_id text;
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_id text;
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_info jsonb;
 CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (item_id);
 
 -- ── listing:上架域 ────────────────────────────────────────────────────────

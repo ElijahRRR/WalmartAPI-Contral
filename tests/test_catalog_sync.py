@@ -164,6 +164,16 @@ def test_summarize_item_reasons_dict_and_list():
     assert s2["unpublished_reasons"] == "x"
 
 
+def test_summarize_item_variant_group():
+    s = items.summarize_item({"sku": "A", "variantGroupId": "VG1",
+                              "variantGroupInfo": {"isPrimary": True,
+                                                   "groupingAttributes": [{"name": "color"}]}})
+    assert s["variant_group_id"] == "VG1"
+    assert '"isPrimary": true' in s["variant_group_info"]
+    s2 = items.summarize_item({"sku": "B"})
+    assert s2["variant_group_id"] is None and s2["variant_group_info"] is None
+
+
 # ── GET /v3/inventories 分页模型 4 ───────────────────────────────────────────
 
 def test_list_inventories_terminates_on_cursor_not_page_length(monkeypatch):

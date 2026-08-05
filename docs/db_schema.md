@@ -88,6 +88,8 @@ CREATE TABLE catalog.walmart_items (
                                              -- 行缺席后复现时重置 NULL 触发重查(下架重上可能换 ID)
     upc text, gtin text,                     -- upc/gtin 必须 text:前导零教训
     product_name text, shelf text, product_type text,
+    variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)
+    variant_group_info jsonb,                -- 变体组详情(isPrimary/分组维度,原样存)
     price numeric, currency text,
     avail_qty integer,                       -- GET /v3/inventories 合并
     published_status text, lifecycle_status text, unpublished_reasons text,

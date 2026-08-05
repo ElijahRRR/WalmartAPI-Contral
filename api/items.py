@@ -209,6 +209,9 @@ def summarize_item(item: dict) -> dict:
         "product_name": clean_text(item.get("productName")),
         "shelf": fmt_shelf(item.get("shelf")),
         "product_type": item.get("productType"),
+        "variant_group_id": item.get("variantGroupId"),
+        "variant_group_info": (json.dumps(item["variantGroupInfo"], ensure_ascii=False)
+                               if item.get("variantGroupInfo") else None),
         "price": price.get("amount"),
         "currency": _pick(price, "currency", "unit"),
         "published_status": item.get("publishedStatus"),

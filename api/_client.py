@@ -200,7 +200,9 @@ def rate_acquire(bucket: str, client_id: str) -> float:
                 q.append(now)
                 return waited
             sleep_for = window - (now - q[0]) + 0.01
-        logger.info("限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
+        # 微等待(<1s)是贴着限速上限跑的正常状态,降为 DEBUG 防日志刷屏
+        logger.log(logging.INFO if sleep_for >= 1.0 else logging.DEBUG,
+                   "限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
         time.sleep(sleep_for)
         waited += sleep_for
 

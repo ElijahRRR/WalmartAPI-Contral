@@ -23,22 +23,30 @@
 
 ### Phase 0 — 地基(一次性)
 
-- [ ] 仓库骨架:cli.py / registry / api / services / workflows / refdata / docs
-- [ ] `<DATA_ROOT>` 目录初始化脚本(specs/ cache/ logs/ backups/,.env 模板,chmod 600)
-- [ ] registry/paths.py(默认 DATA_ROOT + 环境变量覆盖;launchd 不读 shell 配置,
+- [x] 仓库骨架:cli.py / registry / api / services / workflows / refdata / docs
+- [x] `<DATA_ROOT>` 目录初始化脚本(specs/ cache/ logs/ backups/,.env 模板,chmod 600)
+      → `python cli.py init_data_root`(已容器内冒烟)
+- [x] registry/paths.py(默认 DATA_ROOT + 环境变量覆盖;launchd 不读 shell 配置,
       所以默认值必须能独立工作)
-- [ ] Postgres:建四个 schema(见 db_schema.md)+ 只读角色 `readonly`
-- [ ] registry/db.py:唯一连接入口(业务连 PG;cache 连 SQLite 时内置 WAL+busy_timeout)
-- [ ] cli.py:分发 + flock 单实例锁 + ops.runs 运行记录 + 飞书成败通知 +
-      dangerous 工作流强制 dry-run(真跑需 `--execute`)
-- [ ] api/feishu.py:多维表格客户端(查询/批量写≤500/单表串行/重试),字段名走 registry 常量
-- [ ] api/_client.py:从旧 walmart_client.py 移植认证核心
+- [~] Postgres:建四个 schema(见 db_schema.md)+ 只读角色 `readonly`
+      → `refdata/schema.sql` + `python cli.py db_init`(幂等,已在容器内临时 PG16 上
+      验证 9 表+视图+readonly 权限;**生产机执行待用户**)
+- [x] registry/db.py:唯一连接入口(业务连 PG;cache 连 SQLite 时内置 WAL+busy_timeout)
+- [x] cli.py:分发 + flock 单实例锁 + ops.runs 运行记录 + 飞书成败通知 +
+      dangerous 工作流强制 dry-run(真跑需 `--execute`)(已容器内逐项冒烟)
+- [x] api/feishu.py:多维表格客户端(查询/批量写≤500/单表串行/重试),字段名走 registry 常量
+      (重试/退避/瞬时码参数照抄旧 lark_io 实测值;7 个单测覆盖)
+- [x] api/_client.py:从旧 walmart_client.py 移植认证核心
       (token 缓存 900s、每店固定代理、401 自愈、429/5xx 自适应退避、连接池)
       **移植而非重写——这 498 行是旧项目质量最高、事故最少的代码**
-- [ ] 店铺凭证多维表格(用户在飞书建)→ registry 登记 → stores 读取 + 本地快照兜底
+      (逐行移植,仅 print→logging、店铺读取剥离到 services/stores.py;6 个单测覆盖)
+- [~] 店铺凭证多维表格(用户在飞书建)→ registry 登记 → stores 读取 + 本地快照兜底
       (飞书故障时用最近一次快照,快照文件在 DATA_ROOT,不进 git)
-- [ ] 端到端验证:`python cli.py ping_stores` —— 读凭证表 → 每店经代理调一个只读
+      → services/stores.py 代码就绪(4 个单测);**待用户建表**后把 app_token/table_id
+      填入 .env(FEISHU_STORE_TABLE_APP_TOKEN / FEISHU_STORE_TABLE_ID)
+- [~] 端到端验证:`python cli.py ping_stores` —— 读凭证表 → 每店经代理调一个只读
       沃尔玛端点 → 结果写 ops.runs → 飞书发汇总。**此条通过 = 地基验收。**
+      → workflow 已实现(只读端点 GET /v3/token/detail);待生产机跑通后打勾
 
 ### Phase 1 — api 层补齐(按需推进,不求一次全量)
 

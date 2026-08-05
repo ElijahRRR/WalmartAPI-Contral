@@ -17,21 +17,25 @@
 ## registry 登记格式(约定)
 
 ```python
-# registry/resources.py
-店铺凭证表 = Bitable(
-    app_token="...", table_id="...",
-    fields=dict(store="店铺", client_id="ClientId", client_secret="ClientSecret",
-                proxy_type="代理类型", proxy_host="IP地址或域名", proxy_port="端口",
-                proxy_user="IP登录账号", proxy_pass="IP登录密码", enabled="启用"))
+# registry/resources.py(实际实现)
+STORE_CREDENTIALS = Bitable(
+    name="店铺凭证表",
+    app_token=os.environ.get("FEISHU_STORE_TABLE_APP_TOKEN", ""),
+    table_id=os.environ.get("FEISHU_STORE_TABLE_ID", ""),
+    fields=_fields(store="店铺", client_id="ClientId", client_secret="ClientSecret",
+                   proxy_type="代理类型", proxy_host="IP地址或域名", proxy_port="端口",
+                   proxy_user="IP登录账号", proxy_pass="IP登录密码", enabled="启用"))
 ```
 
-代码里永远 `店铺凭证表.fields.client_id`。飞书改表头 = registry 改一行。
+代码里永远 `STORE_CREDENTIALS.fields.client_id`。飞书改表头 = registry 改一行。
+app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值不进 git);
+未登记时 `Bitable.require()` 抛错并提示,不会静默空跑。
 
 ## 表格清单(随建随登记,执行 AI 维护)
 
 | 表 | 用途 | 权威方 | 状态 |
 |---|---|---|---|
-| 店铺凭证表 | 店铺 ClientId/Secret + 代理配置 | 飞书(人工维护)→ 程序读 + 本地快照兜底 | 待用户创建 |
+| 店铺凭证表 | 店铺 ClientId/Secret + 代理配置 | 飞书(人工维护)→ 程序读 + 本地快照兜底 | 代码就绪(services/stores.py);**待用户创建**,建好后 app_token/table_id 填 .env |
 | 上架登记表 | 人工登记待上架 ASIN | 飞书登记 → 同步进 listing.tasks → 结果回写 | 待创建 |
 | 下架登记表 | 人工登记待下架 ASIN+店铺 | 同上模式 | 待创建 |
 | 错误商品记录 | 问题商品每日汇总(展示) | Postgres 权威,飞书是展示投影 | 沿用旧表或新建 |

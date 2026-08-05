@@ -1,0 +1,21 @@
+[project]
+name = "walmartapi-contral"
+version = "0.1.0"
+description = "沃尔玛业务工作流(脚本+调度+数据库):对旧仓库 erpAPI 的重构迁移"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2,socks]>=0.27",
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+# 本项目是脚本集不是库:唯一入口 python cli.py <workflow>,不打包发布
+py-modules = []
+packages = []

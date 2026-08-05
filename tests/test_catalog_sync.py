@@ -212,7 +212,9 @@ class _FakeCursor:
         self.rowcount = 2
 
     def executemany(self, sql, seq):
-        self.executed.append((sql, list(seq)))
+        batch = list(seq)
+        self.executed.append((sql, batch))
+        self.rowcount = len(batch)     # 模拟 psycopg3:executemany 后 rowcount=累计影响行数
 
     def fetchall(self):
         return self.rows

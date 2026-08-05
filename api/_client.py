@@ -172,7 +172,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
-    "reports.request": (10, 3600.0),            # POST /v3/reports/reportRequests(官方未公布,保守)
+    "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
     "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
 }
 

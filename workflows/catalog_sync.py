@@ -36,7 +36,8 @@ logger = logging.getLogger("workflows.catalog_sync")
 _FILL_WORKERS = 8   # 补漏单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
 
 
-def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
+def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
+                    backfill_ids: bool) -> dict:
     """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
     name = store["name"]
     stats: dict = {}
@@ -77,7 +78,7 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
         written = walmart_catalog.upsert_items(conn, rows)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
-    backfilled = _backfill_item_ids(store)
+    backfilled = _backfill_item_ids(store) if backfill_ids else 0
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
             "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
@@ -136,11 +137,15 @@ def run(params: dict) -> str:
     mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):
         return f"rounds 参数只接受 full/fast,收到:{mode}"
+    # item_id 报表回填默认关闭(2026-08-05 决策:报表请求配额极低,单店当日个位数,
+    # 测试期即打到 429;功能保留,-p item_ids=1 显式开启,后续迭代再转正)
+    backfill_ids = str(params.get("item_ids", "")) in ("1", "true", "yes")
     run_at = datetime.now(timezone.utc)
 
     results, dead, failed = [], [], []
     with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory, mode): s["name"]
+        futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory, mode,
+                               backfill_ids): s["name"]
                    for s in store_list}
         for f in as_completed(futures):
             name = futures[f]

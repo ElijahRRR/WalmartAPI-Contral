@@ -139,6 +139,18 @@ def test_list_records_paginates():
     assert calls[1]["page_token"] == "PT2"
 
 
+def test_http_client_ignores_env_proxy(monkeypatch):
+    # 生产 Mac 挂着 Clash:HTTP(S)_PROXY 环境变量绝不能劫持飞书请求
+    # (旧系统 2026-05-07 事故:本机代理拒连 → 14,610 个单元格写回失败)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:7897")
+    feishu._client = None  # 强制走 _http() 真实构造路径
+    client = feishu._http()
+    assert client.trust_env is False
+    assert client._mounts == {}  # 无任何代理挂载
+
+
 def test_unregistered_table_rejected():
     empty = Bitable(name="未登记", app_token="", table_id="",
                     fields=SimpleNamespace())

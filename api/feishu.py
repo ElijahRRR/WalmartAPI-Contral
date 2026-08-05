@@ -56,13 +56,19 @@ class FeishuError(Exception):
 
 
 def _http() -> httpx.Client:
-    """进程内单例 httpx.Client(飞书不走沃尔玛店铺代理);测试替换 feishu._client。"""
+    """进程内单例 httpx.Client;测试替换 feishu._client。
+
+    trust_env=False 必须保留:飞书调用不走任何代理——既不走沃尔玛店铺代理,
+    也不准被 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 环境变量劫持(生产 Mac 挂着
+    Clash,旧系统 2026-05-07 事故即本机代理拒连导致 14,610 个单元格写回失败)。
+    """
     global _client
     if _client is not None and not _client.is_closed:
         return _client
     with _client_lock:
         if _client is None or _client.is_closed:
-            _client = httpx.Client(timeout=httpx.Timeout(30.0, connect=15.0))
+            _client = httpx.Client(trust_env=False,
+                                   timeout=httpx.Timeout(30.0, connect=15.0))
         return _client
 
 

@@ -20,6 +20,7 @@
 """
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -99,12 +100,28 @@ def _backfill_item_ids(store: dict) -> int:
         return 0
     logger.info("店铺 %s 回填 item_id:%d 个 SKU 待查", name, len(todo))
 
+    tally = {"ok": 0, "empty": 0, "no_id": 0, "err": 0}
+    sample_lock = threading.Lock()
+    sample: dict = {}
+
     def _one(sku: str) -> tuple[str, str | None]:
         try:
             hits = items.catalog_search(store, "sku", sku)
-            iid = hits[0].get("itemId") if hits else None
-            return sku, (str(iid) if iid else None)
+            if not hits:
+                tally["empty"] += 1
+                return sku, None
+            h = hits[0]
+            iid = h.get("itemId") or h.get("item_id")
+            if not iid:
+                tally["no_id"] += 1
+                with sample_lock:
+                    if not sample:      # 记第一条"有命中但没 itemId"的真实结构用于诊断
+                        sample["keys"] = sorted(h.keys())
+                return sku, None
+            tally["ok"] += 1
+            return sku, str(iid)
         except Exception as e:
+            tally["err"] += 1
             logger.warning("item_id 回填失败 %s/%s: %s", name, sku, e)
             return sku, None
 
@@ -116,6 +133,10 @@ def _backfill_item_ids(store: dict) -> int:
                 found[sku] = iid
     with db.pg_conn() as conn:
         walmart_catalog.set_item_ids(conn, name, found)
+    logger.info("店铺 %s item_id 回填结果:命中 %d / 空结果 %d / 响应无itemId %d / 异常 %d",
+                name, tally["ok"], tally["empty"], tally["no_id"], tally["err"])
+    if sample:
+        logger.info("店铺 %s catalog_search 无itemId样本的字段清单:%s", name, sample["keys"])
     return len(found)
 
 

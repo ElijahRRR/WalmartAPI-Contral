@@ -41,15 +41,41 @@ def test_search_walmart_default(monkeypatch):
         assert request.url.path == "/v3/items/walmart/search"
         assert request.url.params["upc"] == "036000291452"
         return httpx.Response(200, json={"items": [
-            {"itemId": 123, "title": "T", "brand": "B", "price": {"amount": 9.99, "currency": "USD"},
-             "properties": {"num_reviews": 7, "categories": ["Home", "Cups"]}}]})
+            {"itemId": 123, "title": "Steel <mark>Cup</mark> &amp; Lid", "brand": "B",
+             "price": {"amount": 9.99, "currency": "USD"},
+             "images": [{"url": "http://img/1.jpg"}, {"url": "http://img/2.jpg"}],
+             "properties": {"num_reviews": 7, "categories": ["Home", "Cups"],
+                            "variant_items_num": 4}}]})
 
     _use(monkeypatch, handler)
     hits = items.search_walmart(STORE, upc="036000291452")
     s = items.summarize_search_item(hits[0])
     assert s["item_id"] == 123 and s["price"] == 9.99
-    assert s["reviews"] == 7                      # snake_case 兜底命中
+    assert s["title"] == "Steel Cup & Lid"        # <mark> 去除 + &amp; 反转义
+    assert s["reviews"] == 7 and s["variants"] == 4   # snake_case 兜底命中
     assert s["categories"] == "Home > Cups"
+    assert s["main_image"] == "http://img/1.jpg"
+    assert s["all_images"] == "http://img/1.jpg | http://img/2.jpg"
+
+
+def test_summarize_catalog_item_quirks():
+    s = items.summarize_catalog_item({
+        "sku": "SKU1", "wpid": "W1", "gtin": "00036000291452",
+        "productName": "P", "shelf": '["Home","Kitchen","Cups"]',
+        "price": {"amount": 12.5, "unit": "USD"},   # 规格错写 unit,须兜底
+        "publishedStatus": "PUBLISHED", "unpublishedReasons": ["a", "b"]})
+    assert s["categories"] == "Home > Kitchen > Cups"
+    assert s["currency"] == "USD" and s["price"] == 12.5
+    assert s["upc_gtin"] == "00036000291452"
+    assert s["unpublished_reasons"] == "a; b"
+
+
+def test_data_root_defaults_to_repo_sibling(monkeypatch):
+    from registry import paths
+    monkeypatch.delenv("WALMART_DATA_ROOT", raising=False)
+    root = paths.data_root()
+    assert root.name == "WalmartAPI_data"
+    assert root.parent == paths.Path(paths.__file__).resolve().parent.parent.parent
 
 
 def test_search_walmart_requires_exactly_one_param():

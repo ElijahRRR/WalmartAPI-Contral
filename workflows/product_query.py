@@ -29,9 +29,18 @@ logger = logging.getLogger("workflows.product_query")
 
 _ASIN_RE = re.compile(r"^B0[A-Z0-9]{8}$")
 
-_CSV_COLS = ["input", "kind", "found", "item_id", "title", "brand", "product_type",
-             "price", "rating", "reviews", "marketplace", "spec_feed_type",
-             "spec_product_id", "spec_product_id_type", "spec_asin", "error"]
+_CSV_COLS = ["input", "kind", "found",
+             # 商品主体(global 与 catalog 共用)
+             "item_id", "sku", "wpid", "upc_gtin", "title", "brand", "product_type",
+             "categories", "price", "currency",
+             # 全站搜索特有
+             "rating", "reviews", "variants", "next_day_eligible", "marketplace",
+             "main_image", "all_images", "description",
+             # 自有目录特有
+             "published_status", "lifecycle_status", "unpublished_reasons",
+             # SPEC 跟卖路由
+             "spec_feed_type", "spec_product_id", "spec_product_id_type", "spec_asin",
+             "error"]
 
 
 def _classify(value: str) -> str:
@@ -126,11 +135,9 @@ def _query_one_catalog(store: dict, field: str, value: str) -> dict:
     try:
         hits = items.catalog_search(store, field, value)
         if hits:
-            h = hits[0]
-            price = h.get("price") or {}
-            row.update(found=True, item_id=h.get("itemId") or h.get("wpid"),
-                       title=h.get("productName"), brand=h.get("brand"),
-                       product_type=h.get("productType"), price=price.get("amount"))
+            row.update({k: v for k, v in items.summarize_catalog_item(hits[0]).items()
+                        if k in row})
+            row["found"] = True
     except Exception as e:
         row["error"] = str(e)
         logger.warning("目录查询失败 %s=%s: %s", field, value, e)

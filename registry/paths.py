@@ -12,8 +12,17 @@ _SUBDIRS = ("specs", "cache", "logs", "backups", "locks")
 
 
 def data_root() -> Path:
-    """输入:无 → 输出:DATA_ROOT 绝对路径(env WALMART_DATA_ROOT 覆盖,默认 ~/walmart_data)。"""
-    return Path(os.environ.get("WALMART_DATA_ROOT", str(Path.home() / "walmart_data"))).expanduser()
+    """输入:无 → 输出:DATA_ROOT 绝对路径(env WALMART_DATA_ROOT 覆盖)。
+
+    默认与仓库平级的 WalmartAPI_data:仓库在 ~/Projects/WalmartAPI-Contral
+    则数据在 ~/Projects/WalmartAPI_data。按本文件位置推导,不依赖 cwd,
+    换机器/换用户名不用改任何配置。
+    """
+    override = os.environ.get("WALMART_DATA_ROOT")
+    if override:
+        return Path(override).expanduser()
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root.parent / "WalmartAPI_data"
 
 
 def env_file() -> Path:

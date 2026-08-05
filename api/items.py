@@ -15,11 +15,16 @@
 - 这些是公开目录只读端点,与店铺无关,任一有效店铺 token 均可查
 """
 
+import html
+import json
 import logging
+import re
 
 from api import _client
 
 logger = logging.getLogger("api.items")
+
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _pick(d: dict, *keys, default=None):
@@ -28,6 +33,30 @@ def _pick(d: dict, *keys, default=None):
         if k in d:
             return d[k]
     return default
+
+
+def clean_text(s: str | None) -> str | None:
+    """输入:可能含 HTML 标签的文本 → 输出:去标签+反转义后的纯文本。
+
+    Item Search 的 title/description 实测带 <mark> 等标签(搜索词高亮)。
+    """
+    if not s:
+        return s
+    return html.unescape(_TAG_RE.sub("", s)).strip()
+
+
+def fmt_shelf(shelf) -> str | None:
+    """输入:catalog 的 shelf 字段(形如 '["A","B"]' 的 JSON 数组字符串)→ 输出:'A > B'。"""
+    if not shelf:
+        return None
+    if isinstance(shelf, str):
+        try:
+            shelf = json.loads(shelf)
+        except ValueError:
+            return shelf
+    if isinstance(shelf, list):
+        return " > ".join(str(p) for p in shelf) or None
+    return str(shelf)
 
 
 def search_walmart(store: dict, *, query: str | None = None,
@@ -134,19 +163,54 @@ def catalog_search(store: dict, field: str, value: str) -> list[dict]:
 
 
 def summarize_search_item(item: dict) -> dict:
-    """输入:walmart/search DEFAULT 的单个 item → 输出:扁平摘要 dict(处理双命名兜底)。"""
+    """输入:walmart/search DEFAULT 的单个 item → 输出:扁平摘要 dict。
+
+    坑点全内置:camelCase/snake_case 双兜底、title/description 去 <mark> 标签、
+    images 数组拆主图/全部图片。注意:关键词搜索结果的 price 常缺(官方行为,
+    价格只在 catalog 自有目录稳定有)。
+    """
     price = item.get("price") or {}
     props = item.get("properties") or {}
+    imgs = [i.get("url") for i in item.get("images") or [] if i.get("url")]
     return {
         "item_id": item.get("itemId"),
-        "title": item.get("title"),
+        "title": clean_text(item.get("title")),
         "brand": item.get("brand"),
         "product_type": item.get("productType"),
+        "categories": " > ".join(props.get("categories") or []) or None,
         "price": price.get("amount"),
         "currency": price.get("currency"),
         "rating": item.get("customerRating"),
         "reviews": _pick(props, "numReviews", "num_reviews"),
-        "marketplace": item.get("isMarketPlaceItem"),
         "variants": _pick(props, "variantItemsNum", "variant_items_num"),
-        "categories": " > ".join(props.get("categories") or []) or None,
+        "next_day_eligible": _pick(props, "nextDayEligible", "next_day_eligible"),
+        "marketplace": item.get("isMarketPlaceItem"),
+        "main_image": imgs[0] if imgs else None,
+        "all_images": " | ".join(imgs) or None,
+        "description": clean_text(item.get("description")),
+    }
+
+
+def summarize_catalog_item(h: dict) -> dict:
+    """输入:catalog/search payload 的单个条目 → 输出:扁平摘要 dict。
+
+    坑点内置:货币双兜底(线上 price.currency,规格写 price.unit 是错的)、
+    shelf JSON 数组字符串美化为 'A > B'。
+    """
+    price = h.get("price") or {}
+    reasons = _pick(h, "unpublishedReasons", "unpublished_reasons") or []
+    return {
+        "item_id": h.get("itemId") or h.get("wpid"),
+        "sku": h.get("sku"),
+        "wpid": h.get("wpid"),
+        "upc_gtin": h.get("gtin") or h.get("upc"),
+        "title": h.get("productName"),
+        "brand": h.get("brand"),
+        "product_type": h.get("productType"),
+        "categories": fmt_shelf(h.get("shelf")),
+        "price": price.get("amount"),
+        "currency": _pick(price, "currency", "unit"),
+        "published_status": h.get("publishedStatus"),
+        "lifecycle_status": h.get("lifecycleStatus"),
+        "unpublished_reasons": "; ".join(reasons) if isinstance(reasons, list) else reasons,
     }

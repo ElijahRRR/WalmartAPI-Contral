@@ -57,7 +57,7 @@ services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
 docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md /
-                scraper_migration_brief.md
+                legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md
 ```
 
 ## 写沃尔玛调用代码之前

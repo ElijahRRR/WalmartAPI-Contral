@@ -2,6 +2,7 @@
 
 > 本机 PostgreSQL 17,库名 `walmart_data`。四个 schema,职责互不越界。
 > 本文档是唯一的表结构事实来源:任何 AI 建表/改表必须同步更新这里。
+> 可执行同步产物是 `refdata/schema.sql`(幂等),执行走 `python cli.py db_init`。
 > 连接只准通过 `registry/db.py`;Metabase/NocoDB/MCP 用只读角色 `readonly`。
 
 ## Schema 总览

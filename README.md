@@ -39,6 +39,21 @@ registry/    接线盒(全项目唯一允许出现 token/表ID/路径/地址的�
 只读访问(Metabase / NocoDB / AI 的 MCP 连接)使用 Postgres 只读角色;
 写路径全世界只有 cli.py 一道门。
 
+## 部署步骤(生产机首次)
+
+```bash
+uv pip install -e . --group dev        # 或 pip install httpx[http2,socks] psycopg[binary] python-dotenv
+python cli.py init_data_root           # 建 <DATA_ROOT> 目录 + .env 模板(chmod 600)
+vi ~/walmart_data/.env                 # 填飞书凭据(APP_SECRET 必须先在后台轮换!)等
+createdb walmart_data                  # PostgreSQL 17 建库
+python cli.py db_init                  # 四 schema + 只读角色(幂等)
+# 飞书建「店铺凭证表」(字段名见 registry/resources.py),app_token/table_id 填入 .env
+python cli.py ping_stores              # 端到端验收:每店经代理连通沃尔玛 = 地基就绪
+```
+
+日常运行一律 `python cli.py <workflow> [-p key=value] [--execute]`;
+危险工作流缺省 dry-run,人眼确认输出后才加 `--execute`。
+
 ## 快速上手(给执行 AI)
 
 1. 先读 `CLAUDE.md`(铁律)。
@@ -56,4 +71,5 @@ registry/    接线盒(全项目唯一允许出现 token/表ID/路径/地址的�
 | `docs/db_schema.md` | Postgres 四 schema 设计与 DDL 草案 |
 | `docs/feishu_tables.md` | 飞书多维表格清单、字段约定、读写规范 |
 | `docs/legacy_reference.md` | 旧仓库事实清单:魔数、事故教训、各工作流行为规格 |
+| `docs/legacy_survey.md` | 旧仓库全量摸底报告:14 模块逐一通读的证据级结论(带文件:行号) |
 | `docs/scraper_migration_brief.md` | 采集服务改造简报(给采集侧 AI) |

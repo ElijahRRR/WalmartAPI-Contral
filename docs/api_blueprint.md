@@ -7,7 +7,7 @@
 > ④官方限速表 refdata/walmart_rate_limits.tsv(2026-04-15 抓取)。
 > 详细模块级证据见 docs/legacy_survey.md;本文件是 api 层视角的汇总与设计定稿。
 
-## 1. 全量端点清单(旧系统真实调用过的全部 24 个)
+## 1. 全量端点清单(旧系统真实调用过的全部 30 个)
 
 按新 api 层文件归属排列。"调用方式"标注旧系统是否已走公共层(safe_* 系),
 决定迁移时自愈能力是白得的还是要新补的。
@@ -69,8 +69,8 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
 | 7 daily_retire | 11, 17, (2) | DELETE_ITEM;防重走 ops.feed_log |
 | 8 daily_cleanup | 2, 11, 12, 10, 25, 17 | 反补(MP_MAINTENANCE 改 endDate)+删除+停用 |
-| 9 catalog_sync | 2(5 轮), 21, 22 | sync_online_products 的接口面 |
-| 10 listing | 7, 8, 9, 5(SPEC), 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
+| 9 catalog_sync | 2(5 轮), 3(offset 超限补漏), 21, 22 | sync_online_products 的接口面 |
+| 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -87,12 +87,12 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/items | 300/min;带 query 参数 60/min;**limit 上限 1000(默认 20)**;offset ≤10000;cursor 全程不变、2 分钟过期→400 | 一致;limit=1000 生产实证被官方背书 | 带参 55/min(页间 1.1s 沿用) |
 | GET /v3/items/{id} | 900/min(带参 60/min) | 一致 | 800/min,补漏单查 ≤8 并发 |
 | GET /v3/items/count | 200/min(与 taxonomy 共享);status 枚举 PUBLISHED/UNPUBLISHED/SYSTEM_PROBLEM/IN_PROGRESS/ALL(**无 STAGE**) | 一致 | 180/min 共享桶 |
-| GET /v3/items/walmart/search | 200/min;**SPEC 格式另有 1000/day**(新发现);DEFAULT 最多返回 40 条(旧记 20 过时);只返回 published 商品;asin 参数仅 SPEC | tsv 缺 1000/day | 180/min 桶 + SPEC 每日计数器 |
+| GET /v3/items/walmart/search | 200/min;**SPEC 格式另有 1000/day**(新发现);DEFAULT 最多返回 40 条(旧记 20 过时);只返回 published 商品;asin 参数仅 SPEC | tsv 原缺 1000/day,本次已补 | 180/min 桶 + SPEC 每日计数器 |
 | POST /v3/items/catalog/search | 200/min(与 associations 共享) | 一致 | 与 walmart/search 分桶,180/min |
 | POST /v3/items/spec | 限流表 10/min,但 Get Spec 指南写 **3 TPM/seller**(官方自相矛盾) | 旧代码 3/60s 恰与指南一致 | **3/min(保守)** |
 | GET /v3/feeds 与 /{feedId} | 5000/min 共享;列表 limit≤50;明细 includeDetails 时 limit 官方两页矛盾(参考页 ≤50/指南页 1000) | 一致 | 3000/min 共享桶;明细 limit=50(保守) |
 | GET /v3/feeds/{id}/errorReport | 60/hour;**官方仅支持 FITMENT 类 feed**;响应是 zip(内含 CSV);204=无错误 | 旧代码用在 MP_ITEM 上,官方现文不支持 | 50/hour;api 层限定 fitment |
-| GET /v3/inventories | 200/min;单店 cursor 强制串行 | 一致 | 180/min,串行翻页 |
+| GET /v3/inventories | 200/min | 一致;"单店 cursor 强制串行"是生产实证(2026-05-15 起),非官方文档结论 | 180/min,串行翻页 |
 | GET /v3/orders | 5000/min | 一致 | 3000/min |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
@@ -112,7 +112,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | MP_ITEM | 10/hour | 25MB;≤10000 条 | 一致(大小旧记 10MB 过时) | 8/hour |
 | MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour |
 | DELETE_ITEM | 10/hour("代码零依据"的 10/hour 现已获官方背书) | **0.4MB(400KB)**;条数未单列(按 ≤10000 推定) | 旧 100KB 字节上限过于保守但方向对 | 6/hour;单 feed ≤350KB 且 ≤2500 条 |
-| RETIRE_ITEM | **官方限流表无此行;guide 页已消失**,仅存于 itembulkuploads 的 feedType 枚举 | 未知 | 旧系统在用且实际零限速 | 10/day 保守 + **迁移前实测是否仍被接受** |
+| RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | 10/day 保守 + **迁移前实测是否仍被接受** |
 | MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour |
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | ≤10000 条;建议 1000 条/10MB | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | 6/day 保守沿用(官方页自相矛盾期间不放宽) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
@@ -130,7 +130,8 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 只拉了第 1 页)。新 api 层把 4 种模型分别封装,调用方不接触分页细节:
 
 1. **items 型(cursor 锚定 + offset 翻页)**:首页 nextCursor='*' 换真 token 后**全程不变**
-   (是快照会话 ID 不是游标),真翻页靠 offset 递增;offset 硬上限 10000(超返 400);
+   (是快照会话 ID 不是游标),真翻页靠 offset 递增;offset 硬上限 10000 为官方明文,
+   "超限返 400"是旧代码实证(官方未写明错误码);
    cursor 约 2 分钟过期(400→重置 '*' 重试一次);limit 生产实证 1000。
    超 10000 的部分用 GET /v3/items/{sku} 单查兜底。
    (sync_status_track.py:76-140 是唯一被生产验证的正确实现,已对拍 99,197 商品)
@@ -157,10 +158,10 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | DELETE_ITEM | ItemFeedHeader{locale,version,businessUnit}(官方示例同名,已核验) | 5.0.20250919-16_45_47-api(**仍是官方现值**) | Item[{Deletable:{sku}}] | 官方 400KB;定稿 350KB+2500 条双约束 |
 | RETIRE_ITEM | RetireItemHeader{feedDate,version} | 1.0(不是 1.5;feedDate 必须真 UTC)⚠官方 guide 已消失,仅存枚举,**迁移前实测** | RetireItem[{sku}] | — |
 | PRICE_AND_PROMOTION | MPItemFeedHeader | 2.0.20240126-12_25_52-api(独立版本线) | MPItem[{"Promo&Discount":{sku,price}}] | 10000 条 |
-| price(旧版) | PriceHeader{version} | 1.7 **无外层包装**(加 PriceFeed 包装→ERROR) | Price[{sku,pricing[]}] | 1000 条+25MB |
-| inventory | InventoryHeader{version} | 1.4 **Inventory 首字母大写**(小写→ERR_EXT_DATA_0503009) | Inventory[{sku,quantity}] | 4000 条+25MB |
+| price(旧版) | PriceHeader{version} | 1.7 **无外层包装**(加 PriceFeed 包装→ERROR) | Price[{sku,pricing[]}] | 1000 条+10MB(旧代码 25MB **超官方上限**,收紧) |
+| inventory | InventoryHeader{version} | 1.4 **Inventory 首字母大写**(小写→ERR_EXT_DATA_0503009) | Inventory[{sku,quantity}] | 4000 条+10MB(旧代码 25MB **超官方上限**,收紧) |
 
-version 字符串全部进 registry(不准散落硬编码),且**必须定期核对**:官方版本表约 4-6 周滚动一版,
+version 字符串全部进 registry(不准散落硬编码),且**必须定期核对**:官方版本表约 4-6 周滚动一版(观察值,官方无更新频率承诺),
 旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前推荐 5.0.20260608-18_15_07-api),
 仅 DELETE_ITEM 的 5.0.20250919 仍是现值。来源:官方 Item spec versioning and diff reporting 页。
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
@@ -200,8 +201,9 @@ Phase 0 已移植:token 缓存/每店代理/401 自愈/429 退避/连接池。�
 全部做在 _client 层,各域文件白得:
 
 1. **per-store 令牌桶**:键=(store, bucket),bucket 支持共享桶
-   (walmart/search+catalog/search+associations 同桶;feeds GET 全家同桶;
-   item 类 feed POST 是否同桶以官方核验为准)。未登记的 bucket **默认拒绝而非放行**
+   (catalog/search+associations 同桶,walmart/search **独立桶**;feeds GET 全家同桶;
+   item 类 feed POST **各 feedType 独立桶**——官方已核验,无共享)。
+   未登记的 bucket **默认拒绝而非放行**
    ——旧系统 rate_limiter 对未知键直接放行,RETIRE_ITEM 实际零限速就是这么漏的。
    自适应:消费 x-current-token-count / X-Next-Replenishment-Time
    (三格式:秒/epoch 毫秒/ISO,旧系统已踩全)。
@@ -269,7 +271,7 @@ api/settings.py
 
 1. **limit 上限 = 1000**(官方原文"cannot be more than 1000 entities per request",默认 20);
    旧 OpenAPI spec 的"≤50 仅 includeDetails"说法在现行官方文档中已消失(includeDetails 参数已除名)。
-2. **item 类 feed 各 feedType 独立配额**(官方 Feed type usage limits 表 26 行逐条给值),
+2. **item 类 feed 各 feedType 独立配额**(官方 Feed type usage limits 表 26-27 行逐条给值,两路核验计数差一行),
    MP_ITEM/MP_MAINTENANCE/DELETE_ITEM 各 10/hour、MP_ITEM_MATCH 20/hour;
    唯一共享桶是价格三件套 10/hour。"DELETE_ITEM 10/hour"从"零依据"变为官方背书。
 3. **feedStatus 无 COMPLETE**(官方四值枚举三处文档一致);itemIngestionStatus 官方五值(含 INPROGRESS)。

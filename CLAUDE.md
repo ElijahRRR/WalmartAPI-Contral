@@ -66,7 +66,8 @@ docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md 
 含 feed 类专表),配额语义与设计定稿见 `docs/api_blueprint.md`。高危限制:
 价格三件套 feed(PRICE_AND_PROMOTION/legacy price/promo)共享 10/小时且官方页自相矛盾,
 代码按 6/天保守;单品价格 PUT = 100/小时(⚠官方列 Price management Sunset 2026,动价格先核验);
-item 类 feed 各 feedType 独立 10/小时(DELETE_ITEM 单 feed ≤400KB);
+item 类 feed 各 feedType 独立配额(MP_ITEM/MP_MAINTENANCE/DELETE_ITEM 各 10/小时,
+MP_ITEM_MATCH 20/小时;DELETE_ITEM 单 feed ≤400KB);
 Insights performance 类 1/分钟(unpublished 类是 100/分钟,不是全部 1/分钟);
 `GET /v3/items` 带 query 参数 60/分钟(limit 上限 1000,offset ≤10000)。
 响应头 `x-current-token-count` 与 `X-Next-Replenishment-Time` 用于自适应退避

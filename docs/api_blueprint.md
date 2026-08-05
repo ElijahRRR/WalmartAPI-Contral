@@ -44,6 +44,7 @@
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
 | 30 | GET /v3/settings/partnerprofile | settings | Partner ID(上架注入 shipNode) | safe_get_ex | auto_listing |
+| 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
@@ -69,7 +70,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
 | 7 daily_retire | 11, 17, (2) | DELETE_ITEM;防重走 ops.feed_log |
 | 8 daily_cleanup | 2, 11, 12, 10, 25, 17 | 反补(MP_MAINTENANCE 改 endDate)+删除+停用 |
-| 9 catalog_sync | 2(5 轮), 3(offset 超限补漏), 21, 22 | sync_online_products 的接口面 |
+| 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
 | 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
 | backup | 无沃尔玛调用 | — |
 

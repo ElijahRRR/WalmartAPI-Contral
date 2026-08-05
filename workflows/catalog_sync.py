@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from api import _client, feishu, inventory as inv_api, items
+from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
 from services import stores as stores_svc, walmart_catalog
 
@@ -87,46 +87,42 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
 def _backfill_item_ids(store: dict) -> int:
     """输入:店铺 → 输出:本次回填的 item_id 数量。
 
-    walmart.com 数字 itemId 的唯一可行来源是全站搜索按 gtin/upc 查
-    (GET /v3/items 与 catalog/search 的响应都没有 itemId——后者 2026-08-05 实证)。
-    因此只回填 PUBLISHED 且带 gtin/upc 的行;itemId 平时不变,只有新品和
-    "缺席后复现"(upsert 已重置 NULL)的行会进这里,增量成本很小。
-    单条失败只记日志跳过,不影响店铺同步结果。
+    来源 = On-request ITEM 报表(一店一份,覆盖全部商品):从 Item ID 列或
+    Item Page URL 提取数字 itemId。其余候选路径全部实证排除——GET /v3/items
+    与 catalog/search 响应无此字段,全站搜索按 gtin/upc 召回率 3/131。
+    itemId 平时不变,只有新品和"缺席后复现"(upsert 已重置 NULL)的行触发报表拉取;
+    报表失败只记警告,下轮重试,不影响店铺同步结果。
     """
     name = store["name"]
     with db.pg_conn() as conn:
-        todo = walmart_catalog.rows_missing_item_id(conn, name)
+        todo = walmart_catalog.skus_missing_item_id(conn, name)
     if not todo:
         return 0
-    logger.info("店铺 %s 回填 item_id:%d 个 PUBLISHED SKU 待查", name, len(todo))
-
-    tally = {"ok": 0, "miss": 0, "err": 0}
-
-    def _one(row: tuple) -> tuple[str, str | None]:
-        sku, gtin, upc = row
-        try:
-            hits = items.search_walmart(store, gtin=gtin) if gtin else []
-            if not hits and upc:    # gtin 索引缺口时用 upc 补一枪(旧系统实证两者命中率不同)
-                hits = items.search_walmart(store, upc=upc)
-            iid = hits[0].get("itemId") if hits else None
-            tally["ok" if iid else "miss"] += 1
-            return sku, (str(iid) if iid else None)
-        except Exception as e:
-            tally["err"] += 1
-            logger.warning("item_id 回填失败 %s/%s: %s", name, sku, e)
-            return sku, None
+    try:
+        rows = reports.fetch_item_report(store)
+    except Exception as e:
+        logger.warning("店铺 %s ITEM 报表拉取失败,item_id 本轮不回填: %s", name, e)
+        return 0
 
     found: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 线程跑满 walmart_search 180/min 桶
-        for f in as_completed([pool.submit(_one, r) for r in todo]):
-            sku, iid = f.result()
-            if iid:
-                found[sku] = iid
+    no_id = 0
+    for row in rows:
+        sku = reports.report_row_sku(row)
+        if not sku or sku not in todo:
+            continue
+        iid = reports.extract_item_id(row)
+        if iid:
+            found[sku] = iid
+        else:
+            no_id += 1
+    if no_id and not found:     # 一个都提不出来 = 列名/URL 格式假设错了,打样本诊断
+        logger.warning("店铺 %s 报表 %d 行均提取不到 itemId,首行字段:%s",
+                       name, len(rows), sorted(rows[0].keys()) if rows else [])
     with db.pg_conn() as conn:
-        walmart_catalog.set_item_ids(conn, name, found)
-    logger.info("店铺 %s item_id 回填结果:命中 %d / 搜索未中 %d / 异常 %d",
-                name, tally["ok"], tally["miss"], tally["err"])
-    return len(found)
+        updated = walmart_catalog.set_item_ids(conn, name, found)
+    logger.info("店铺 %s item_id 报表回填:待补 %d / 报表行 %d / 提取成功 %d / 入库 %d",
+                name, len(todo), len(rows), len(found), updated)
+    return updated
 
 
 def run(params: dict) -> str:

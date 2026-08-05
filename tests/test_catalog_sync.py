@@ -263,15 +263,33 @@ def test_projection_rows_cell_conversion():
 
 
 def test_item_id_backfill_helpers():
-    conn = _FakeConn(rows=[("SKU_A", "00036000291452", None), ("SKU_B", None, "036000291452")])
-    rows = walmart_catalog.rows_missing_item_id(conn, "T1")
-    assert rows == [("SKU_A", "00036000291452", None), ("SKU_B", None, "036000291452")]
-    # 只回填 PUBLISHED 且带 gtin/upc 的行(itemId 走全站搜索,只覆盖已发布商品)
-    sql = conn.cur.executed[0][0]
-    assert "published_status = 'PUBLISHED'" in sql
-    assert "gtin IS NOT NULL OR upc IS NOT NULL" in sql
+    conn = _FakeConn(rows=[("SKU_A",), ("SKU_B",)])
+    assert walmart_catalog.skus_missing_item_id(conn, "T1") == {"SKU_A", "SKU_B"}
     assert walmart_catalog.set_item_ids(conn, "T1", {"SKU_A": "14901706450"}) == 1
     assert walmart_catalog.set_item_ids(conn, "T1", {}) == 0
+
+
+def test_report_parse_and_item_id_extraction():
+    from api import reports
+    import io as _io
+    import zipfile as _zip
+    csv_bytes = ("SKU,Product Name,Item Page URL\n"
+                 "B0AAA,Cup,https://www.walmart.com/ip/Steel-Cup/14901706450\n"
+                 "B0BBB,Lid,\n").encode("utf-8-sig")
+    rows = reports.parse_report_csv(csv_bytes)
+    assert reports.report_row_sku(rows[0]) == "B0AAA"
+    assert reports.extract_item_id(rows[0]) == "14901706450"   # 从 /ip/ URL 提取
+    assert reports.extract_item_id(rows[1]) is None
+
+    # 显式 Item ID 列优先
+    rows2 = reports.parse_report_csv(b"SKU,ITEM_ID\nB0CCC,592648041\n")
+    assert reports.extract_item_id(rows2[0]) == "592648041"
+
+    # zip 包装的 CSV
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as zf:
+        zf.writestr("report.csv", csv_bytes)
+    assert reports.parse_report_csv(buf.getvalue())[0]["SKU"] == "B0AAA"
 
 
 def test_upsert_resets_item_id_on_reappearance():

@@ -172,6 +172,8 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
+    "reports.request": (10, 3600.0),            # POST /v3/reports/reportRequests(官方未公布,保守)
+    "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
 }
 
 _rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]
@@ -205,6 +207,16 @@ def rate_acquire(bucket: str, client_id: str) -> float:
                    "限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
         time.sleep(sleep_for)
         waited += sleep_for
+
+
+def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:
+    """输入:URL(如报表预签名下载地址)+ 代理 → 输出:响应字节。
+
+    走店铺固定出口代理(与所有沃尔玛流量同链路,铁律),非 2xx 抛异常。
+    """
+    resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.content
 
 
 # ══════════════════════════════════════════════════════════════════════════════

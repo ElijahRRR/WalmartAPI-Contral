@@ -84,9 +84,9 @@ CREATE TABLE catalog.walmart_items (
     store text NOT NULL, sku text NOT NULL,
     wpid text,
     item_id text,                            -- walmart.com 数字商品ID(邮件/工单定位);
-                                             -- 唯一来源:全站搜索按 gtin/upc 回填(GET /v3/items
-                                             -- 与 catalog/search 均无此字段,2026-08-05 实证);
-                                             -- 仅 PUBLISHED 行可回填;缺席复现重置 NULL 触发重查
+                                             -- 来源:On-request ITEM 报表(Item ID 列/Page URL);
+                                             -- 其余路径实证排除(items/catalog_search 无此字段,
+                                             -- 搜索召回 3/131);缺席复现重置 NULL 触发重查
     upc text, gtin text,                     -- upc/gtin 必须 text:前导零教训
     product_name text, shelf text, product_type text,
     variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)

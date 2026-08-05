@@ -143,6 +143,51 @@ def _close_all_clients() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  per-store 令牌桶(设计定稿:docs/api_blueprint.md §3/§6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# bucket 登记表:{bucket 名: (次数上限, 窗口秒)}。取值为蓝图第 3 节"定稿"列(留官方余量)。
+# 共享桶用同一个 bucket 名(如 catalog/search 与 associations 同桶)。
+# 随工作流迁移逐个补充;⚠ 未登记的 bucket 一律拒绝——旧系统对未知键放行,
+# RETIRE_ITEM 实际零限速跑了数月,此处反其道设计。
+_RATE_BUCKETS: dict[str, tuple[int, float]] = {
+    "items.walmart_search": (180, 60.0),        # GET /v3/items/walmart/search(官方 200/min,独立桶)
+    "items.walmart_search_spec": (950, 86400.0),  # 同端点 SPEC 格式的每日附加额度(官方 1000/day)
+    "items.catalog_search": (180, 60.0),        # POST catalog/search 与 associations 共享(官方 200/min)
+}
+
+_rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]
+_rate_lock = threading.Lock()
+
+
+def rate_acquire(bucket: str, client_id: str) -> float:
+    """输入:bucket 名 + 店铺 client_id → 输出:本次实际等待秒数(限流按店铺维度)。
+
+    滑动窗口计数;窗口满时阻塞睡到最早一次调用滑出窗口。
+    bucket 未登记直接抛 KeyError(默认拒绝,不放行)。
+    """
+    from collections import deque
+
+    if bucket not in _RATE_BUCKETS:
+        raise KeyError(f"限速桶未登记: {bucket}(先在 api/_client._RATE_BUCKETS 按蓝图定稿登记)")
+    limit, window = _RATE_BUCKETS[bucket]
+    waited = 0.0
+    while True:
+        with _rate_lock:
+            q = _rate_state.setdefault((client_id, bucket), deque())
+            now = time.monotonic()
+            while q and now - q[0] >= window:
+                q.popleft()
+            if len(q) < limit:
+                q.append(now)
+                return waited
+            sleep_for = window - (now - q[0]) + 0.01
+        logger.info("限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
+        time.sleep(sleep_for)
+        waited += sleep_for
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  认证
 # ══════════════════════════════════════════════════════════════════════════════
 

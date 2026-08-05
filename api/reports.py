@@ -29,11 +29,11 @@ def _request_report(store: dict, report_type: str) -> str:
     """输入:店铺 + 报表类型 → 输出:requestId。"""
     _client.rate_acquire("reports.request", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    # reportType/reportVersion 必须走 query 参数(body 仅用于可选过滤器,放错→400,实证)
     status, _, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/reports/reportRequests",
         token, store["client_id"], store["proxy"],
-        params={"reportType": report_type},
-        json_body={"reportType": report_type, "reportVersion": "v1"},
+        params={"reportType": report_type, "reportVersion": "v1"},
         max_retries=3)
     if status != 200 or not data:
         raise RuntimeError(f"reportRequests 提交失败 {status}(店铺 {store['name']}): {data}")

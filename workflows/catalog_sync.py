@@ -3,7 +3,7 @@
 用法:
   python cli.py catalog_sync                    # 全部启用店铺
   python cli.py catalog_sync -p store=A085朱丽霖  # 单店
-  python cli.py catalog_sync -p workers=8       # 跨店并发(默认 4)
+  python cli.py catalog_sync -p workers=8       # 跨店并发(默认 24,生产实测)
   python cli.py catalog_sync -p skip_inventory=1  # 只同步商品目录,跳过库存合并
   python cli.py catalog_sync -p rounds=full     # 备用:旧式逐状态 5 轮显式扫
                                                 # (默认 fast 两轮已实证更快且更全,见 items.py)
@@ -132,7 +132,7 @@ def run(params: dict) -> str:
     store_list = stores_svc.load_stores(names)
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
-    workers = int(params.get("workers", 4))
+    workers = int(params.get("workers", 24))    # 2026-08-05 生产实测 24 并发无压力
     skip_inventory = str(params.get("skip_inventory", "")) in ("1", "true", "yes")
     mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):

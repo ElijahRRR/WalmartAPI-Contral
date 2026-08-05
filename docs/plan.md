@@ -28,9 +28,11 @@
       → `python cli.py init_data_root`(已容器内冒烟)
 - [x] registry/paths.py(默认 DATA_ROOT + 环境变量覆盖;launchd 不读 shell 配置,
       所以默认值必须能独立工作)
-- [~] Postgres:建四个 schema(见 db_schema.md)+ 只读角色 `readonly`
-      → `refdata/schema.sql` + `python cli.py db_init`(幂等,已在容器内临时 PG16 上
-      验证 9 表+视图+readonly 权限;**生产机执行待用户**)
+- [x] Postgres:建四个 schema(见 db_schema.md)+ 只读角色 `readonly`
+      → `refdata/schema.sql` + `python cli.py db_init`(幂等)。
+      生产机 PG17 验收通过(2026-08-05):4 schema / 9 表 / 1 视图,幂等回读正常。
+      ⚠️ 保留项:readonly 角色口令(READONLY_DB_PASSWORD)尚未配置,配置后重跑
+      db_init 即生效
 - [x] registry/db.py:唯一连接入口(业务连 PG;cache 连 SQLite 时内置 WAL+busy_timeout)
 - [x] cli.py:分发 + flock 单实例锁 + ops.runs 运行记录 + 飞书成败通知 +
       dangerous 工作流强制 dry-run(真跑需 `--execute`)(已容器内逐项冒烟)
@@ -40,21 +42,20 @@
       (token 缓存 900s、每店固定代理、401 自愈、429/5xx 自适应退避、连接池)
       **移植而非重写——这 498 行是旧项目质量最高、事故最少的代码**
       (逐行移植,仅 print→logging、店铺读取剥离到 services/stores.py;6 个单测覆盖)
-- [~] 店铺凭证多维表格(用户在飞书建)→ registry 登记 → stores 读取 + 本地快照兜底
+- [x] 店铺凭证多维表格(用户在飞书建)→ registry 登记 → stores 读取 + 本地快照兜底
       (飞书故障时用最近一次快照,快照文件在 DATA_ROOT,不进 git)。
-      → services/stores.py 代码就绪(4 个单测);**待用户建表**后把 app_token/table_id
-      填入 .env(FEISHU_STORE_TABLE_APP_TOKEN / FEISHU_STORE_TABLE_ID)。
-      注意:旧飞书 `X4vM…bh` workbook 下已有 `40383c:店铺API` sheet,先查看是否可
-      直接迁为多维表格;凭证以旧 xlsx **Sheet1 为权威**(Sheet2 是漂移的代理清单,
-      当前有效店铺 48 家,README 的 57 家已过时)
+      → 已建表接通:ping_stores 经该表读取 49 家店铺凭证(2026-08-05 生产验收)
 - [x] 核实 erp-core(外部工作区 `~/Projects/erp服务/erp-core`)的 celery beat
       是否在跑——它是唯一可能在新系统之外仍在写沃尔玛库存/feed 的进程
       (30s poll_pending_feeds、6h 推库存)。必须在 Phase 0 查清,不能拖到迁
       maintenance/listing 时
       → 用户已确认(2026-08-05):erp-core 未启用,亦不在迁移考虑范围。三方并跑风险解除
-- [~] 端到端验证:`python cli.py ping_stores` —— 读凭证表 → 每店经代理调一个只读
+- [x] 端到端验证:`python cli.py ping_stores` —— 读凭证表 → 每店经代理调一个只读
       沃尔玛端点 → 结果写 ops.runs → 飞书发汇总。**此条通过 = 地基验收。**
-      → workflow 已实现(只读端点 GET /v3/token/detail);待生产机跑通后打勾
+      → 生产机实跑 46/49 连通(2026-08-05),其余 3 家为已知异常,项目所有者确认
+      按此结果通过 Phase 0 验收。
+      ⚠️ 保留项:运行通知 webhook(FEISHU_WEBHOOK_URL)尚未配置,当前通知降级为
+      仅日志,填入 .env 即生效
 
 ### Phase 1 — api 层补齐(按需推进,不求一次全量)
 

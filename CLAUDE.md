@@ -62,13 +62,28 @@ docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md 
 
 ## 写沃尔玛调用代码之前
 
-先查 `refdata/walmart_rate_limits.tsv` 确认端点配额(2026-08-05 已对官方现值逐条核验,
-含 feed 类专表),配额语义与设计定稿见 `docs/api_blueprint.md`。高危限制:
-价格三件套 feed(PRICE_AND_PROMOTION/legacy price/promo)共享 10/小时且官方页自相矛盾,
-代码按 6/天保守;单品价格 PUT = 100/小时(⚠官方列 Price management Sunset 2026,动价格先核验);
-item 类 feed 各 feedType 独立配额(MP_ITEM/MP_MAINTENANCE/DELETE_ITEM 各 10/小时,
-MP_ITEM_MATCH 20/小时;DELETE_ITEM 单 feed ≤400KB);
-Insights performance 类 1/分钟(unpublished 类是 100/分钟,不是全部 1/分钟);
-`GET /v3/items` 带 query 参数 60/分钟(limit 上限 1000,offset ≤10000)。
-响应头 `x-current-token-count` 与 `X-Next-Replenishment-Time` 用于自适应退避
-(api/_client.py 已内置,勿自行实现)。
+**先查 `docs/api_blueprint.md`**(端点/配额/分页模型/feed schema 的设计定稿,
+2026-08-05 官方核验)确认目标端点的函数是否已定义;配额明细以蓝图第 3 节三源
+对照表为准(`refdata/walmart_rate_limits.tsv` 是其来源之一,个别行已被官方核验
+修正)。高危限制速记:价格三件套 feed 共享桶(保守按 6/天配置);其余 feedType
+各自独立 10/hour;单品价格 PUT = 100/小时;Insights performance 类 1/分钟;
+`GET /v3/items` 带 query 参数 60/分钟。响应头 `x-current-token-count` 与
+`X-Next-Replenishment-Time` 用于自适应退避(api/_client.py 已内置,勿自行实现)。
+
+api 层收录规则:**只实现「工作流×端点矩阵」(蓝图第 2 节)出现过的端点**,
+一个端点一个函数,分页/切片/防重等机制藏在函数内;预留端点只登记不实现;
+新增函数前先对照蓝图第 7 节函数面,不自创签名。
+
+## 同一目的多种方法的取舍(简化 vs 兜底)
+
+- **纯历史重复**(同端点多套写法)→ 只留蓝图选定的一种,其余不迁,零兜底。
+- **能力不同的两个端点**(如单品 PUT vs 批量 feed)→ 两个显式函数,由 services
+  层显式 if 路由;严禁"试 A 失败自动落 B"式隐式降级。
+- **真兜底**(外部 API 自身缺口,如 offset 截断补漏、飞书挂走快照)→ 藏在同一个
+  函数内、触发必须记日志计数(兜底静默常态化 = 主路径已坏没人知道)、触发条件
+  明确而非 catch-all。
+- **双轨过渡遗留**(旧 shim 开关式并存)→ 新系统一律禁止,每个能力只有一条实现路径。
+- **写操作永不自动兜底**:失败只走 ops.feed_log 反查三态 → 确认未达 → 同一方法补交。
+  换方法重试 = 重复提交制造机。
+
+口诀:兜底是补偿外部世界的缺陷,不是补偿自己的不确定。

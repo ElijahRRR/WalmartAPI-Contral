@@ -65,10 +65,11 @@
 - [ ] api/feeds.py:统一 feed 提交/状态查询/错误报告下载(含 CSV/二进制响应)
 - [ ] api/reports.py:报告类下载(xlsx 二进制,不强制解析 JSON)
 - [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
-- [ ] **每店 feed 共享令牌桶**:除 PRICE_AND_PROMOTION(6/天)等特例外,所有 feedType
-      共享每店 `POST /v3/feeds` 10/小时 的通用桶(限速表结构佐证,见 legacy_survey C6)。
-      令牌桶做在 api/feeds.py,跨 workflow 生效——否则 maintenance 和 daily_retire
-      会互相抢配额且互不知情
+- [ ] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,
+      官方 2026-08-05 核验):各 feedType **独立** 10/hour(MP_ITEM_MATCH 20/hour),
+      唯一共享桶是价格三件套;未登记的 bucket **默认拒绝而非放行**(旧系统 RETIRE_ITEM
+      零限速就是未知键放行漏的)。令牌桶做在 _client 层,跨 workflow 生效。
+      ※ 此条修正 legacy_survey C6 的"共享桶"推断——官方表为准
 
 ### Phase 2 — 工作流逐条迁移(核心阶段)
 

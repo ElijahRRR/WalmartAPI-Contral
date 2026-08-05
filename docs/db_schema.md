@@ -77,6 +77,33 @@ CREATE VIEW catalog.latest_snapshot AS
 使用约定:审核服务只关心 products(slow_hash 未变则不重审);
 价格库存维护读 latest_snapshot;上架 workflow 两层 JOIN 取完整输入。
 
+```sql
+-- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert
+-- (替代旧飞书「在线产品总表」的沃尔玛列;amz 数据在 products/snapshots,sku=asin JOIN)
+CREATE TABLE catalog.walmart_items (
+    store text NOT NULL, sku text NOT NULL,
+    wpid text,
+    item_id text,                            -- walmart.com 数字商品ID(邮件/工单定位);
+                                             -- 来源:On-request ITEM 报表(Item ID 列/Page URL);
+                                             -- 其余路径实证排除(items/catalog_search 无此字段,
+                                             -- 搜索召回 3/131);缺席复现重置 NULL 触发重查
+    upc text, gtin text,                     -- upc/gtin 必须 text:前导零教训
+    product_name text, shelf text, product_type text,
+    variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)
+    variant_group_info jsonb,                -- 变体组详情(isPrimary/分组维度,原样存)
+    price numeric, currency text,
+    avail_qty integer,                       -- GET /v3/inventories 合并
+    published_status text, lifecycle_status text, unpublished_reasons text,
+    last_seen_at timestamptz NOT NULL,       -- 最近一次全量扫描见到它的时间
+    missing_since timestamptz,               -- 连续缺席起点;NULL=最近一轮仍在
+    created_at / updated_at,
+    PRIMARY KEY (store, sku)
+);
+```
+
+"整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
+再把本轮未见的行标 missing_since(不删除,保历史;连续缺席多久后清理另议)。
+
 ## listing — 上架域
 
 ```sql

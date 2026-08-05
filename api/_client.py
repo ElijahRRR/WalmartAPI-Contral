@@ -45,6 +45,19 @@ socket.setdefaulttimeout(90)
 
 logger = logging.getLogger("api.walmart")
 
+
+class StoreDeadError(Exception):
+    """店铺凭证失效(401/403 经 401 自愈后仍失败)。
+
+    调用方语义:跳过该店铺的全部剩余调用,而不是逐页重试
+    (蓝图 §6.4;旧 sync_status_track 的正确做法标准化)。
+    """
+
+    def __init__(self, store_name: str, status: int):
+        self.store_name = store_name
+        self.status = status
+        super().__init__(f"店铺 {store_name} 凭证失效(HTTP {status}),跳过全店")
+
 # client_id → {"token": str, "expires_at": float, "secret": str, "proxy": str}
 # secret + proxy 保留是为了 401 时能就地刷新 token,不需要调用方再传一次。
 _token_cache: dict = {}
@@ -154,6 +167,13 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.walmart_search": (180, 60.0),        # GET /v3/items/walmart/search(官方 200/min,独立桶)
     "items.walmart_search_spec": (950, 86400.0),  # 同端点 SPEC 格式的每日附加额度(官方 1000/day)
     "items.catalog_search": (180, 60.0),        # POST catalog/search 与 associations 共享(官方 200/min)
+    "items.list": (55, 60.0),                   # GET /v3/items 带 query 参数(官方 60/min,页间≈1.1s)
+    "items.list_nofilter": (250, 60.0),         # GET /v3/items 无参数(官方 300/min)
+    "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
+    "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
+    "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
+    "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
+    "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
 }
 
 _rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]
@@ -182,9 +202,21 @@ def rate_acquire(bucket: str, client_id: str) -> float:
                 q.append(now)
                 return waited
             sleep_for = window - (now - q[0]) + 0.01
-        logger.info("限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
+        # 微等待(<1s)是贴着限速上限跑的正常状态,降为 DEBUG 防日志刷屏
+        logger.log(logging.INFO if sleep_for >= 1.0 else logging.DEBUG,
+                   "限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
         time.sleep(sleep_for)
         waited += sleep_for
+
+
+def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:
+    """输入:URL(如报表预签名下载地址)+ 代理 → 输出:响应字节。
+
+    走店铺固定出口代理(与所有沃尔玛流量同链路,铁律),非 2xx 抛异常。
+    """
+    resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.content
 
 
 # ══════════════════════════════════════════════════════════════════════════════

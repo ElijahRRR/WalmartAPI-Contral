@@ -44,6 +44,7 @@
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
 | 30 | GET /v3/settings/partnerprofile | settings | Partner ID(上架注入 shipNode) | safe_get_ex | auto_listing |
+| 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
@@ -69,7 +70,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
 | 7 daily_retire | 11, 17, (2) | DELETE_ITEM;防重走 ops.feed_log |
 | 8 daily_cleanup | 2, 11, 12, 10, 25, 17 | 反补(MP_MAINTENANCE 改 endDate)+删除+停用 |
-| 9 catalog_sync | 2(5 轮), 3(offset 超限补漏), 21, 22 | sync_online_products 的接口面 |
+| 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
 | 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
 | backup | 无沃尔玛调用 | — |
 
@@ -88,7 +89,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/items/{id} | 900/min(带参 60/min) | 一致 | 800/min,补漏单查 ≤8 并发 |
 | GET /v3/items/count | 200/min(与 taxonomy 共享);status 枚举 PUBLISHED/UNPUBLISHED/SYSTEM_PROBLEM/IN_PROGRESS/ALL(**无 STAGE**) | 一致 | 180/min 共享桶 |
 | GET /v3/items/walmart/search | 200/min;**SPEC 格式另有 1000/day**(新发现);DEFAULT 最多返回 40 条(旧记 20 过时);只返回 published 商品;asin 参数仅 SPEC | tsv 原缺 1000/day,本次已补 | 180/min 桶 + SPEC 每日计数器 |
-| POST /v3/items/catalog/search | 200/min(与 associations 共享) | 一致 | 与 walmart/search 分桶,180/min |
+| POST /v3/items/catalog/search | 200/min(与 associations 共享);⚠官方 schema 声明可选字段 itemId,**线上实测不返回**(2026-08-05 两店 195/195 含 PUBLISHED 全无;数字 itemId 唯一可靠来源=Item Search DEFAULT) | 一致 | 与 walmart/search 分桶,180/min |
 | POST /v3/items/spec | 限流表 10/min,但 Get Spec 指南写 **3 TPM/seller**(官方自相矛盾) | 旧代码 3/60s 恰与指南一致 | **3/min(保守)** |
 | GET /v3/feeds 与 /{feedId} | 5000/min 共享;列表 limit≤50;明细 includeDetails 时 limit 官方两页矛盾(参考页 ≤50/指南页 1000) | 一致 | 3000/min 共享桶;明细 limit=50(保守) |
 | GET /v3/feeds/{id}/errorReport | 60/hour;**官方仅支持 FITMENT 类 feed**;响应是 zip(内含 CSV);204=无错误 | 旧代码用在 MP_ITEM 上,官方现文不支持 | 50/hour;api 层限定 fitment |
@@ -135,6 +136,11 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
    cursor 约 2 分钟过期(400→重置 '*' 重试一次);limit 生产实证 1000。
    超 10000 的部分用 GET /v3/items/{sku} 单查兜底。
    (sync_status_track.py:76-140 是唯一被生产验证的正确实现,已对拍 99,197 商品)
+   **新系统生产实证(2026-08-05,两店对拍)**:① 某状态组合零商品时返回 **404 而非空列表**,
+   必须按空轮处理;② **无参数调用返回全部状态的并集**(含 RETIRED,甚至含逐状态 5 轮
+   组合覆盖不到的状态——实测多出 1 条,推断 IN_PROGRESS/ARCHIVED,即旧 5 轮配方有盲区),
+   且无参限速 300/min(带参仅 60/min)。**定稿:全量扫店默认"无参全量 + RETIRED 兜底轮"**,
+   逐状态 5 轮降级为对拍/回退用(api/items.py _SWEEP_MODES)。
 2. **orders 型(cursor 即 URL 后缀)**:meta.nextCursor 返回带 `?` 的完整 query 串,
    直接拼在 /v3/orders 后;单店内**必须串行**翻页。
 3. **returns 型(cursor 即 query 串,需解析)**:meta.nextCursor 形如

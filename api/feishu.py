@@ -26,7 +26,7 @@ from collections import defaultdict
 import httpx
 
 from registry import resources
-from registry.resources import Bitable
+from registry.resources import Bitable, Spreadsheet
 
 logger = logging.getLogger("api.feishu")
 
@@ -243,6 +243,95 @@ def batch_delete(table: Bitable, record_ids: list[str]) -> int:
             n += len(chunk)
             logger.info("飞书 batch_delete %s:第 %d 批 %d 条", t.name, i + 1, len(chunk))
     return n
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  电子表格(sheets)——仅用于行数超 bitable 套餐上限的大表(如在线产品总表)
+#  切块/节流参数照抄旧系统实测:4000 行/块(20 列约 4MB,5000 行撞 90227)、块间 0.3s
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SHEET_WRITE_BLOCK_ROWS = 4000
+_SHEET_WRITE_THROTTLE_SECS = 0.3
+_SHEET_DIMENSION_MAX = 5000     # dimension_range 增/删单次上限(90204 实证 2026-08-05)
+
+
+def _col_letter(n: int) -> str:
+    """输入:列数(1-based)→ 输出:列字母(1→A,26→Z,27→AA)。"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def sheet_row_count(sheet: Spreadsheet) -> int:
+    """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
+    s = sheet.require()
+    data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{s.token}/sheets/query")
+    for meta in data.get("sheets") or []:
+        if meta.get("sheet_id") == s.sheet_id:
+            return int((meta.get("grid_properties") or {}).get("row_count") or 0)
+    raise FeishuError(None, f"电子表格「{s.name}」中找不到 sheet_id={s.sheet_id}")
+
+
+def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
+    """输入:登记条目 + 需要的总行数 → 输出:本次扩充的行数(网格不足时 add-dimension)。"""
+    s = sheet.require()
+    current = sheet_row_count(s)
+    if current >= need_rows:
+        return 0
+    add = need_rows - current
+    remaining = add
+    while remaining > 0:      # 单次最多 5000 行(90204),分块扩
+        step = min(remaining, _SHEET_DIMENSION_MAX)
+        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
+              json_body={"dimension": {"sheetId": s.sheet_id,
+                                       "majorDimension": "ROWS", "length": step}})
+        remaining -= step
+        if remaining > 0:
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+    logger.info("电子表格「%s」扩行 %d(%d → %d)", s.name, add, current, need_rows)
+    return add
+
+
+def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
+    """输入:登记条目 + 全部数据行(含表头行)→ 输出:写入行数。整表重写语义。
+
+    分块 values_batch_update;写完后删除网格中多余的尾部行——
+    修掉旧系统"本次行数变少时残留旧行"的已知缺陷(plan.md #2 同款问题)。
+    """
+    s = sheet.require()
+    if not rows:
+        return 0
+    n_cols = max(len(r) for r in rows)
+    last_col = _col_letter(n_cols)
+    sheet_ensure_rows(s, len(rows))
+
+    written = 0
+    for i in range(0, len(rows), _SHEET_WRITE_BLOCK_ROWS):
+        block = rows[i:i + _SHEET_WRITE_BLOCK_ROWS]
+        rng = f"{s.sheet_id}!A{i + 1}:{last_col}{i + len(block)}"
+        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/values_batch_update",
+              json_body={"valueRanges": [{"range": rng, "values": block}]})
+        written += len(block)
+        logger.info("电子表格「%s」写入 %d/%d 行", s.name, written, len(rows))
+        if i + _SHEET_WRITE_BLOCK_ROWS < len(rows):
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+
+    surplus = sheet_row_count(s) - len(rows)
+    trimmed = surplus
+    while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
+        step = min(surplus, _SHEET_DIMENSION_MAX)
+        _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
+              json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
+                                       "startIndex": len(rows) + surplus - step + 1,
+                                       "endIndex": len(rows) + surplus}})
+        surplus -= step
+        if surplus > 0:
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+    if trimmed > 0:
+        logger.info("电子表格「%s」删除尾部残留 %d 行", s.name, trimmed)
+    return written
 
 
 # ══════════════════════════════════════════════════════════════════════════════

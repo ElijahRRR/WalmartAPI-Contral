@@ -78,7 +78,7 @@
 
 | # | 新 workflow | 替代旧模块 | 危险 | 备注 |
 |---|---|---|---|---|
-| 1 | product_query | 产品ID查询产品详情 | 否 | 零状态零调度,练手验证 api 层。**[~] 已实现**(api/items.py 三端点 + 限速桶 + 27 单测);待生产机实跑对拍 |
+| 1 | product_query | 产品ID查询产品详情 | 否 | 零状态零调度,练手验证 api 层。**[x] 完成**(2026-08-05 生产实跑通过,PR #3) |
 | 2 | returns_sync | 售后订单同步 | 否 | 单文件,写飞书;顺手修"整表覆盖残留旧行"缺陷(多维表格按 record_id 更新,天然解决) |
 | 3 | daily_report | 沃尔玛店铺日报 | 否 | 影刀 RPA 部分保持原样(仅 macOS),只改数据落点 |
 | 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务 |
@@ -86,7 +86,7 @@
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
 | 7 | daily_retire | 沃尔玛批量下架 | **是** | DELETE_ITEM 不可恢复;防重状态先行(ops.feed_log) |
 | 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
-| 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动 |
+| 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已实现**(items 5 轮+inventories 合并→catalog.walmart_items→电子表格投影);采集侧增量待契约定稿 |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |

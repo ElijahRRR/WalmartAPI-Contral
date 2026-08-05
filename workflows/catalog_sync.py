@@ -5,6 +5,8 @@
   python cli.py catalog_sync -p store=A085朱丽霖  # 单店
   python cli.py catalog_sync -p workers=8       # 跨店并发(默认 4)
   python cli.py catalog_sync -p skip_inventory=1  # 只同步商品目录,跳过库存合并
+  python cli.py catalog_sync -p rounds=fast     # 实验:无参全量(300/min)+RETIRED 两轮
+                                                # 需先与默认 full(5 轮)对拍数量一致再采用
 
 每店流程:GET /v3/items 5 轮全量扫店(去重)→ offset 截断时用 PG 已知 SKU 单查补漏
 → GET /v3/inventories 合并可售数量 → upsert catalog.walmart_items → 标记本轮缺席行。
@@ -32,11 +34,14 @@ logger = logging.getLogger("workflows.catalog_sync")
 _FILL_WORKERS = 8   # 补漏单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
 
 
-def _sync_one_store(store: dict, run_at, skip_inventory: bool) -> dict:
-    """输入:店铺 + 本轮时间 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
+def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
+    """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
     name = store["name"]
     stats: dict = {}
-    summaries = [items.summarize_item(it) for it in items.iter_all_items(store, stats)]
+    summaries = [items.summarize_item(it)
+                 for it in items.iter_all_items(store, stats, mode=mode)]
+    logger.info("店铺 %s 扫描(%s)各轮条数:%s,去重后 %d",
+                name, mode, stats.get("rounds"), stats.get("total", 0))
 
     filled = 0
     if stats.get("truncated"):
@@ -74,11 +79,14 @@ def run(params: dict) -> str:
         return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
     workers = int(params.get("workers", 4))
     skip_inventory = str(params.get("skip_inventory", "")) in ("1", "true", "yes")
+    mode = str(params.get("rounds", "full"))
+    if mode not in ("full", "fast"):
+        return f"rounds 参数只接受 full/fast,收到:{mode}"
     run_at = datetime.now(timezone.utc)
 
     results, dead, failed = [], [], []
     with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory): s["name"]
+        futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory, mode): s["name"]
                    for s in store_list}
         for f in as_completed(futures):
             name = futures[f]

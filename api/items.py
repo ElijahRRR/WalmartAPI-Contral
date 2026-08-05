@@ -62,15 +62,23 @@ def fmt_shelf(shelf) -> str | None:
     return str(shelf)
 
 
-# 5 轮全量扫店组合(镜像旧 sync_status_track,生产对拍过 99,197 商品):
-# 前 4 轮扫 ACTIVE 下的四种发布状态,第 5 轮扫 RETIRED 全量。
-_SWEEP_ROUNDS: list[tuple[str, str | None]] = [
-    ("ACTIVE", "PUBLISHED"),
-    ("ACTIVE", "UNPUBLISHED"),
-    ("ACTIVE", "SYSTEM_PROBLEM"),
-    ("ACTIVE", "STAGE"),
-    ("RETIRED", None),
-]
+# 全量扫店组合。full:镜像旧 sync_status_track(生产对拍过 99,197 商品),逐状态显式扫
+# ——最稳但带参限速 60/min。fast:无参全量(300/min)+ RETIRED 补充(无参时官方不返回
+# RETIRED;而无参是否含 UNPUBLISHED/SYSTEM_PROBLEM/STAGE 未经验证,故 fast 需先与
+# full 对拍数量一致才可作默认)。
+_SWEEP_MODES: dict[str, list[tuple[str | None, str | None]]] = {
+    "full": [
+        ("ACTIVE", "PUBLISHED"),
+        ("ACTIVE", "UNPUBLISHED"),
+        ("ACTIVE", "SYSTEM_PROBLEM"),
+        ("ACTIVE", "STAGE"),
+        ("RETIRED", None),
+    ],
+    "fast": [
+        (None, None),
+        ("RETIRED", None),
+    ],
+}
 
 
 def _guard_store_dead(status: int, store: dict) -> None:
@@ -100,7 +108,9 @@ def list_items(store: dict, *, published_status: str | None = None,
                 params["publishedStatus"] = published_status
             if lifecycle_status:
                 params["lifecycleStatus"] = lifecycle_status
-            _client.rate_acquire("items.list", store["client_id"])
+            # 官方限速分档:带状态参数 60/min,无参 300/min —— 按实际参数选桶
+            bucket = "items.list" if (published_status or lifecycle_status) else "items.list_nofilter"
+            _client.rate_acquire(bucket, store["client_id"])
             status, _, data = _client.safe_get_ex(
                 f"{_client.base_url()}/v3/items",
                 token, store["client_id"], store["proxy"], params=params, max_retries=3)
@@ -138,21 +148,21 @@ class _CursorExpired(Exception):
     pass
 
 
-def iter_all_items(store: dict, stats: dict | None = None):
-    """输入:店铺(可选 stats dict 收集统计)→ 输出:生成器,按 SKU 去重逐个产出商品。
+def iter_all_items(store: dict, stats: dict | None = None, mode: str = "full"):
+    """输入:店铺(可选 stats dict 收集统计;mode=full|fast)→ 输出:去重生成器。
 
-    5 轮组合全量扫店(_SWEEP_ROUNDS),跨轮按 sku 去重(以先出现的为准)。
+    按 _SWEEP_MODES[mode] 组合全量扫店,跨轮按 sku 去重(以先出现的为准)。
     stats 若传入,填充 {"truncated": bool, "total": int, "rounds": {轮标识: 条数}}
     ——truncated=True 时调用方须用 get_item() 对已知 SKU 单查补漏。
     """
     seen: set[str] = set()
     truncated_any = False
     rounds_stat: dict[str, int] = {}
-    for lifecycle, published in _SWEEP_ROUNDS:
+    for lifecycle, published in _SWEEP_MODES[mode]:
         items, truncated = list_items(store, lifecycle_status=lifecycle,
                                       published_status=published)
         truncated_any = truncated_any or truncated
-        key = f"{lifecycle}/{published or 'ALL'}"
+        key = f"{lifecycle or 'ALL'}/{published or 'ALL'}"
         rounds_stat[key] = len(items)
         for item in items:
             sku = item.get("sku")

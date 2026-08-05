@@ -128,6 +128,24 @@ def test_iter_all_items_five_rounds_dedupe(monkeypatch):
     assert len({r for r in seen_rounds}) == 5               # 5 轮组合都扫了
 
 
+def test_iter_all_items_fast_mode_two_rounds(monkeypatch):
+    seen_params = []
+
+    def handler(request):
+        p = request.url.params
+        seen_params.append((p.get("lifecycleStatus"), p.get("publishedStatus")))
+        page = [{"sku": "X"}] if p.get("lifecycleStatus") is None else [{"sku": "R"}]
+        return httpx.Response(200, json={
+            "ItemResponse": page, "totalItems": 1, "nextCursor": "C"})
+
+    _use(monkeypatch, handler)
+    stats = {}
+    got = list(items.iter_all_items(STORE, stats, mode="fast"))
+    assert [i["sku"] for i in got] == ["X", "R"]
+    assert seen_params == [(None, None), ("RETIRED", None)]   # 无参轮 + RETIRED 补充轮
+    assert stats["rounds"] == {"ALL/ALL": 1, "RETIRED/ALL": 1}
+
+
 def test_get_item_404_is_none_and_store_dead_raises(monkeypatch):
     _use(monkeypatch, lambda r: httpx.Response(404, json={}))
     assert items.get_item(STORE, "NOPE") is None

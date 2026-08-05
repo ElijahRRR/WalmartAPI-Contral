@@ -168,6 +168,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.walmart_search_spec": (950, 86400.0),  # 同端点 SPEC 格式的每日附加额度(官方 1000/day)
     "items.catalog_search": (180, 60.0),        # POST catalog/search 与 associations 共享(官方 200/min)
     "items.list": (55, 60.0),                   # GET /v3/items 带 query 参数(官方 60/min,页间≈1.1s)
+    "items.list_nofilter": (250, 60.0),         # GET /v3/items 无参数(官方 300/min)
     "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)

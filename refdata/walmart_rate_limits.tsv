@@ -89,7 +89,7 @@ Item Management	All items	300/min
 (if used with query parameters 60/min)	GET	/v3/items
 Item Management	An item	900/min
 (if used with query parameters 60/min)	GET	/v3/items/{id}
-Item Management	Item Search	200/min	GET	/v3/items/walmart/search
+Item Management	Item Search	200/min; responseFormat=SPEC 时另有 1000/day	GET	/v3/items/walmart/search
 Item Management	Taxonomy	200/min
 (Shared with Get items count by status)	GET	/v3/items/taxonomy
 Item Management	Get item count by groups	100/min	GET	/v3/items/groups/count
@@ -122,7 +122,7 @@ Payments	Entity Match	300/min	GET	/v3/settings/entitymatchprofile
 Payment Reports	Recon Report (Legacy)	100/min	GET	/v3/report/reconreport/reconFile
 Payment Reports	Payment Statement Report	15/min	GET	/v3/report/payment/statement
 Payment Reports	Performance Report	15/min	GET	/v3/report/payment/performance
-Price Management	Update pricing for multiple items in bulk (New)	6/day	POST	/v3/feeds?feedType=PRICE_AND_PROMOTION
+Price Management	Update pricing for multiple items in bulk (New)	10/hour (与 Legacy bulk price、bulk promo 三方共享;官方页内 promo* 行仍标 6/day 自相矛盾,代码按 6/day 保守配置)	POST	/v3/feeds?feedType=PRICE_AND_PROMOTION
 Price Management	Update pricing for a single item	100/hour	PUT	/v3/price
 Price Management	Create Repricer Strategy	20/hour	POST	/v3/repricer/strategy
 Price Management	Update Repricer Strategy	10/hour	PUT	/v3/repricer/strategy/{strategyCollectionId}
@@ -186,3 +186,18 @@ Insights Management (undocumented)	Retrieve returns performance summary	未列�
 Insights Management (undocumented)	Retrieve returns performance report	未列入文档	GET	/v3/insights/performance/returns/report
 Insights Management (undocumented)	Retrieve item not received performance summary	未列入文档	GET	/v3/insights/performance/itemNotReceived/summary
 Insights Management (undocumented)	Retrieve item not received report	未列入文档	GET	/v3/insights/performance/itemNotReceived/report
+# ── Feed type usage limits(官方 rate-limiting 页专表,2026-08-05 核验;按 seller 级、各 feedType 独立配额,官方无 item 类共享桶说法)──
+# 文档入口已迁移:https://developer.walmart.com/us-marketplace/docs/rate-limiting(旧 doc/us/us-mp/us-mp-ratelimits/ 已失效)
+Feed limits	MP_ITEM	10/hour; 25MB; ≤10000 条	POST	/v3/feeds?feedType=MP_ITEM
+Feed limits	MP_MAINTENANCE	10/hour; 25MB; ≤10000 条	POST	/v3/feeds?feedType=MP_MAINTENANCE
+Feed limits	DELETE_ITEM	10/hour; 0.4MB(400KB)	POST	/v3/feeds?feedType=DELETE_ITEM
+Feed limits	MP_ITEM_MATCH	20/hour; 25MB	POST	/v3/feeds?feedType=MP_ITEM_MATCH
+Feed limits	inventory	10/hour; 10MB; ≤10000 item/ship node	POST	/v3/feeds?feedType=inventory
+Feed limits	MP_INVENTORY (BETA)	50/hour; 1MB; 多 ship node JSON only	POST	/v3/feeds?feedType=MP_INVENTORY
+Feed limits	price (Legacy)	10/hour(价格三件套共享); 10MB	POST	/v3/feeds?feedType=price
+Feed limits	promo (Legacy)	6/day; 10MB	POST	/v3/feeds?feedType=promo
+Feed limits	RETIRE_ITEM	官方限流表无此行,guide 已消失,仅存 itembulkuploads 枚举;用前实测	POST	/v3/feeds?feedType=RETIRE_ITEM
+Feed limits	FITMENT_ACES / FITMENT_PIES	频率未列; 50MB	POST	/v3/feeds?feedType=FITMENT_*
+# 轮询建议(官方):INPROGRESS 时 15min → 1h → 2h → 每 4h;价格 feed 至少等 5min 再查(SLA 15min)
+# ⚠ 官方 Deprecation Guide(2026-03-11)列 "Price management – Sunset 2026" 未细化端点,动价格类前先核验
+# ⚠ GET /v3/items limit 官方上限 1000(默认 20);offset ≤10000;nextCursor 全程不变、2 分钟过期→400

@@ -41,9 +41,17 @@
       **移植而非重写——这 498 行是旧项目质量最高、事故最少的代码**
       (逐行移植,仅 print→logging、店铺读取剥离到 services/stores.py;6 个单测覆盖)
 - [~] 店铺凭证多维表格(用户在飞书建)→ registry 登记 → stores 读取 + 本地快照兜底
-      (飞书故障时用最近一次快照,快照文件在 DATA_ROOT,不进 git)
+      (飞书故障时用最近一次快照,快照文件在 DATA_ROOT,不进 git)。
       → services/stores.py 代码就绪(4 个单测);**待用户建表**后把 app_token/table_id
-      填入 .env(FEISHU_STORE_TABLE_APP_TOKEN / FEISHU_STORE_TABLE_ID)
+      填入 .env(FEISHU_STORE_TABLE_APP_TOKEN / FEISHU_STORE_TABLE_ID)。
+      注意:旧飞书 `X4vM…bh` workbook 下已有 `40383c:店铺API` sheet,先查看是否可
+      直接迁为多维表格;凭证以旧 xlsx **Sheet1 为权威**(Sheet2 是漂移的代理清单,
+      当前有效店铺 48 家,README 的 57 家已过时)
+- [x] 核实 erp-core(外部工作区 `~/Projects/erp服务/erp-core`)的 celery beat
+      是否在跑——它是唯一可能在新系统之外仍在写沃尔玛库存/feed 的进程
+      (30s poll_pending_feeds、6h 推库存)。必须在 Phase 0 查清,不能拖到迁
+      maintenance/listing 时
+      → 用户已确认(2026-08-05):erp-core 未启用,亦不在迁移考虑范围。三方并跑风险解除
 - [~] 端到端验证:`python cli.py ping_stores` —— 读凭证表 → 每店经代理调一个只读
       沃尔玛端点 → 结果写 ops.runs → 飞书发汇总。**此条通过 = 地基验收。**
       → workflow 已实现(只读端点 GET /v3/token/detail);待生产机跑通后打勾
@@ -56,6 +64,10 @@
 - [ ] api/feeds.py:统一 feed 提交/状态查询/错误报告下载(含 CSV/二进制响应)
 - [ ] api/reports.py:报告类下载(xlsx 二进制,不强制解析 JSON)
 - [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
+- [ ] **每店 feed 共享令牌桶**:除 PRICE_AND_PROMOTION(6/天)等特例外,所有 feedType
+      共享每店 `POST /v3/feeds` 10/小时 的通用桶(限速表结构佐证,见 legacy_survey C6)。
+      令牌桶做在 api/feeds.py,跨 workflow 生效——否则 maintenance 和 daily_retire
+      会互相抢配额且互不知情
 
 ### Phase 2 — 工作流逐条迁移(核心阶段)
 
@@ -77,7 +89,8 @@
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 
-旧仓库中**不迁移**:tools/ 的 10 个救场脚本、auto_listing 5 个 fix 脚本、
+旧仓库中**不迁移**:tools/ 的 10 个救场脚本(**不含 sync_online_products.py**,
+它是 #9 catalog_sync 的源文件,是活代码)、auto_listing 5 个 fix 脚本、
 recover_lark_writeback.py、审核服务.py、类目映射 legacy/ 与 intermediate/、
 walmart_client.py.bak、各种零引用大文件。类目映射的**产物**(映射表)作为数据导入
 catalog,pipeline 代码留在旧仓库归档。
@@ -90,8 +103,11 @@ catalog,pipeline 代码留在旧仓库归档。
 
 ## 2. 切换规程(每条工作流必须走完)
 
-1. **对拍**:新旧同时 dry-run(或新 dry-run vs 旧真跑的输出),比对结果集差异,
+1. **对拍**:新系统 dry-run vs 旧系统**真跑**的输出,比对结果集差异,
    连续 3 个周期无未解释差异才准切。
+   ⚠️ **严禁跑旧系统的 dry-run 来对拍**:已证实旧批量下架的 `--dry-run` 只挡
+   飞书写回,DELETE_ITEM 照提交不误且不留记录(legacy_survey C5)。旧系统其他
+   模块的 dry-run 同样不可信,一律当真跑对待。
 2. **切换窗口**:停旧调度 → 迁移该工作流的状态数据(防重记录、游标)→ 起新调度。
    危险工作流切换期间宁可空跑一轮,不许新旧并跑。
 3. **回滚预案**:新版连续失败 2 次即停新起旧;因此旧调度配置删除前先归档到

@@ -69,7 +69,46 @@
 6. 和沃尔玛侧对齐的接口契约(增量 API 的路径/参数/返回结构)确定后,写进你仓库的
    文档,并在本文件回填一份,两边各存一份契约。
 
-## 五、验收标准
+## 五、接口契约 v1(沃尔玛侧已拍板,2026-08-06)
+
+**端点范围**:你现有的全部端点(submit/upload、batches/{id}/status、results、
+export/{batch}、export/all、screenshot)**维持现状,不改不删**——旧系统和新系统的
+api/scraper.py 都在用。你只需要**新增一个增量导出端点**:
+
+```
+GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
+可选鉴权:请求头 X-Export-Token(建议加上,服务器是公网 IP)
+
+响应:
+{
+  "records": [ <record>, ... ],   // 按 cursor 升序
+  "next_cursor": 12345,           // 下次请求的 cursor(最后一条的游标值)
+  "has_more": true
+}
+```
+
+**record 结构**(一条 = 一次采集的完整结果):
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| source_id | ✅ | 全局唯一(如自增主键或 uuid),幂等去重键 |
+| cursor | ✅ | 单调递增整数,不回跳 |
+| marketplace | ✅ | 站点,当前恒为 "US"(products 主键已定为 (marketplace, asin) 复合) |
+| asin | ✅ | — |
+| scraped_at | ✅ | UTC ISO8601,精确到秒 |
+| scrape_params | ✅ | 对象:{"zipcode": "...", ...} 影响结果的全部采集参数 |
+| slow | ✅ | 慢变字段对象:title、brand、category_path、images[](首图=主图);
+可选:bullet_points[]、description、weight、dimensions、variant(parent_asin/theme) |
+| slow_hash | 建议 | slow 字段的稳定哈希(字段排序后 sha256 前 16 位) |
+| fast | ✅ | 快变字段对象:price、currency、stock_state;
+可选:buybox_seller、buybox_price、coupon、deal |
+| raw | 可选 | 裁剪后的原始载荷(沃尔玛侧存 jsonb 备查) |
+
+**边界语义**(验收会测):cursor 相同的多条记录不丢;`cursor=0` 从头拉;
+重复返回无害(source_id 兜底);删除/下架的产品不需要特殊事件,照常输出最新采集结果。
+双方各存一份本契约,变更需两侧同步改版本号(v1 → v2)。
+
+## 六、验收标准
 
 - 沃尔玛侧 catalog_sync 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
   无重复入库(source_id 冲突计数为 0)、products/snapshots 分层数据正确。

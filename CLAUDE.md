@@ -62,7 +62,12 @@ docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md 
 
 ## 写沃尔玛调用代码之前
 
-先查 `refdata/walmart_rate_limits.tsv` 确认端点配额。高危限制:
-PRICE_AND_PROMOTION feed = 6/天;单品价格 PUT = 100/小时;Insights 类全部 1/分钟;
-`GET /v3/items` 带 query 参数 60/分钟。响应头 `x-current-token-count` 与
-`X-Next-Replenishment-Time` 用于自适应退避(api/_client.py 已内置,勿自行实现)。
+先查 `refdata/walmart_rate_limits.tsv` 确认端点配额(2026-08-05 已对官方现值逐条核验,
+含 feed 类专表),配额语义与设计定稿见 `docs/api_blueprint.md`。高危限制:
+价格三件套 feed(PRICE_AND_PROMOTION/legacy price/promo)共享 10/小时且官方页自相矛盾,
+代码按 6/天保守;单品价格 PUT = 100/小时(⚠官方列 Price management Sunset 2026,动价格先核验);
+item 类 feed 各 feedType 独立 10/小时(DELETE_ITEM 单 feed ≤400KB);
+Insights performance 类 1/分钟(unpublished 类是 100/分钟,不是全部 1/分钟);
+`GET /v3/items` 带 query 参数 60/分钟(limit 上限 1000,offset ≤10000)。
+响应头 `x-current-token-count` 与 `X-Next-Replenishment-Time` 用于自适应退避
+(api/_client.py 已内置,勿自行实现)。

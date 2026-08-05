@@ -78,6 +78,13 @@ def test_data_root_defaults_to_repo_sibling(monkeypatch):
     assert root.parent == paths.Path(paths.__file__).resolve().parent.parent.parent
 
 
+def test_search_walmart_404_means_no_match(monkeypatch):
+    _use(monkeypatch, lambda r: httpx.Response(404, json={}))
+    assert items.search_walmart(STORE, gtin="00000000000000") == []
+    spec = items.search_walmart_spec(STORE, upc="000000000000")
+    assert spec["feed_type"] is None
+
+
 def test_search_walmart_requires_exactly_one_param():
     with pytest.raises(ValueError):
         items.search_walmart(STORE)

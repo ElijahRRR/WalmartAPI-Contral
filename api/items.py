@@ -242,6 +242,8 @@ def search_walmart(store: dict, *, query: str | None = None,
     status, _, data = _client.safe_get_ex(
         f"{_client.base_url()}/v3/items/walmart/search",
         token, store["client_id"], store["proxy"], params=params, max_retries=3)
+    if status == 404:       # 标识无匹配时返回 404 而非空列表(与 /v3/items 同款语义)
+        return []
     if status != 200:
         raise RuntimeError(f"walmart/search 返回 {status}: {data}")
     return (data or {}).get("items") or []
@@ -274,7 +276,7 @@ def search_walmart_spec(store: dict, *, upc: str | None = None,
     status, _, data = _client.safe_get_ex(
         f"{_client.base_url()}/v3/items/walmart/search",
         token, store["client_id"], store["proxy"], params=params, max_retries=3)
-    if status != 200:
+    if status not in (200, 404):    # 404 = 无匹配,走下方空结果分支
         raise RuntimeError(f"walmart/search SPEC 返回 {status}: {data}")
 
     items = (data or {}).get("items") or []

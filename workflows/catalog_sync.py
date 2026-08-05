@@ -105,9 +105,8 @@ def _backfill_item_ids(store: dict) -> int:
     def _one(row: tuple) -> tuple[str, str | None]:
         sku, gtin, upc = row
         try:
-            if gtin:
-                hits = items.search_walmart(store, gtin=gtin)
-            else:
+            hits = items.search_walmart(store, gtin=gtin) if gtin else []
+            if not hits and upc:    # gtin 索引缺口时用 upc 补一枪(旧系统实证两者命中率不同)
                 hits = items.search_walmart(store, upc=upc)
             iid = hits[0].get("itemId") if hits else None
             tally["ok" if iid else "miss"] += 1

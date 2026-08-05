@@ -131,7 +131,9 @@ def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:
             "UPDATE catalog.walmart_items SET item_id = %(item_id)s, updated_at = now() "
             "WHERE store = %(store)s AND sku = %(sku)s",
             [{"store": store_name, "sku": k, "item_id": v} for k, v in mapping.items()])
-    return len(mapping)
+        affected = cur.rowcount
+    # 返回数据库实际更新行数;与提交数不一致说明 (store, sku) 没对上,要暴露不要吞
+    return affected if affected and affected >= 0 else len(mapping)
 
 
 def known_skus(conn, store_name: str) -> set[str]:

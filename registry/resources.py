@@ -86,6 +86,42 @@ def _fields(**kw: str) -> SimpleNamespace:
 
 # ── 表格清单(随建随登记)──────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class Spreadsheet:
+    """一张飞书电子表格(非多维表格)的登记条目:spreadsheet_token + sheet_id + 列序。
+
+    电子表格按 range 坐标写,列序就是契约——columns 元组是唯一权威,
+    业务代码禁止自行数列号。用电子表格而非 bitable 的场景:行数 >5 万(套餐上限)。
+    """
+
+    name: str
+    token: str
+    sheet_id: str
+    columns: tuple[str, ...]
+
+    def require(self) -> "Spreadsheet":
+        if not self.token or not self.sheet_id:
+            raise LookupError(
+                f"电子表格「{self.name}」尚未登记:请把表格 URL 中的 token(/sheets/ 后段)"
+                f"与 sheet_id(?sheet= 参数)写入 <DATA_ROOT>/.env 对应变量"
+            )
+        return self
+
+
+# 在线产品总表(新):catalog_sync 写,PG 权威、此表是人看的投影,可随时整表重建。
+# 行数约 13 万,超 bitable 5 万行套餐上限,故用电子表格。
+# 列序 = catalog.walmart_items 的字段序,改列序必须两处同步。
+ONLINE_PRODUCTS_SHEET = Spreadsheet(
+    name="在线产品总表",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_ONLINE_SHEET_ID", ""),
+    columns=("store", "sku", "wpid", "upc", "gtin", "productName", "shelf",
+             "productType", "price", "currency", "availToSellQty",
+             "publishedStatus", "lifecycleStatus", "unpublishedReasons",
+             "last_seen_at", "missing_since"),
+)
+
+
 # 店铺凭证表:飞书人工维护 → 程序读 + 本地快照兜底。
 # 密钥类字段(ClientSecret/代理密码)只在此表,访问权限收紧到最小人群。
 STORE_CREDENTIALS = Bitable(

@@ -49,6 +49,31 @@ CREATE OR REPLACE VIEW catalog.latest_snapshot AS
   SELECT DISTINCT ON (asin, scrape_params) *
   FROM catalog.snapshots ORDER BY asin, scrape_params, scraped_at DESC;
 
+-- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert
+-- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,按 sku=asin JOIN)
+CREATE TABLE IF NOT EXISTS catalog.walmart_items (
+    store        text NOT NULL,
+    sku          text NOT NULL,
+    wpid         text,
+    upc          text,               -- 必须 text:前导零(旧事故教训)
+    gtin         text,
+    product_name text,
+    shelf        text,               -- 已美化为 'A > B' 路径
+    product_type text,
+    price        numeric,
+    currency     text,
+    avail_qty    integer,            -- GET /v3/inventories 合并进来
+    published_status    text,
+    lifecycle_status    text,
+    unpublished_reasons text,
+    last_seen_at  timestamptz NOT NULL,   -- 最近一次全量扫描见到它的时间
+    missing_since timestamptz,            -- 连续缺席起点;NULL=最近一轮仍在
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, sku)
+);
+CREATE INDEX IF NOT EXISTS walmart_items_sku_idx ON catalog.walmart_items (sku);
+
 -- ── listing:上架域 ────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS listing.tasks (

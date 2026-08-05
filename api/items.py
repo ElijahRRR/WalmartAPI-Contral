@@ -1,12 +1,15 @@
 """沃尔玛 Items 域接口(函数面与配额定稿见 docs/api_blueprint.md §3/§7)。
 
-本文件当前实现 product_query 工作流所需的三个端点(蓝图矩阵 #5/#6):
-  search_walmart()       GET /v3/items/walmart/search(DEFAULT)  全站目录搜索
-  search_walmart_spec()  同端点 responseFormat=SPEC             跟卖路由/标识互转
-  catalog_search()       POST /v3/items/catalog/search          本店目录精确查询
+已实现端点(按工作流迁移进度收录):
+  search_walmart()       GET /v3/items/walmart/search(DEFAULT)  全站目录搜索    [product_query]
+  search_walmart_spec()  同端点 responseFormat=SPEC             跟卖路由/标识互转 [product_query]
+  catalog_search()       POST /v3/items/catalog/search          本店目录精确查询  [product_query]
+  list_items()           GET /v3/items                          分页模型1        [catalog_sync]
+  iter_all_items()       5 轮组合全量扫店(去重生成器)                            [catalog_sync]
+  get_item()             GET /v3/items/{sku}                    单查补漏         [catalog_sync]
 
-其余函数(list_items / iter_all_items / get_item / count_items / get_spec)
-按蓝图 §7 签名预留,随对应工作流迁移时实现——不自创签名(CLAUDE.md api 层收录规则)。
+其余函数(count_items / get_spec)按蓝图 §7 签名预留,随对应工作流迁移时实现
+——不自创签名(CLAUDE.md api 层收录规则)。
 
 响应字段坑(旧系统实测,api 层统一兜底):
 - 线上返回 camelCase,本地 OpenAPI 规格是 snake_case(numReviews/num_reviews 等)→ _pick 双键
@@ -57,6 +60,144 @@ def fmt_shelf(shelf) -> str | None:
     if isinstance(shelf, list):
         return " > ".join(str(p) for p in shelf) or None
     return str(shelf)
+
+
+# 5 轮全量扫店组合(镜像旧 sync_status_track,生产对拍过 99,197 商品):
+# 前 4 轮扫 ACTIVE 下的四种发布状态,第 5 轮扫 RETIRED 全量。
+_SWEEP_ROUNDS: list[tuple[str, str | None]] = [
+    ("ACTIVE", "PUBLISHED"),
+    ("ACTIVE", "UNPUBLISHED"),
+    ("ACTIVE", "SYSTEM_PROBLEM"),
+    ("ACTIVE", "STAGE"),
+    ("RETIRED", None),
+]
+
+
+def _guard_store_dead(status: int, store: dict) -> None:
+    if status in (401, 403):
+        raise _client.StoreDeadError(store["name"], status)
+
+
+def list_items(store: dict, *, published_status: str | None = None,
+               lifecycle_status: str | None = None,
+               limit: int = 1000, max_offset: int = 10000) -> tuple[list[dict], bool]:
+    """输入:店铺 + 状态过滤 → 输出:(商品列表, 是否因 offset 上限被截断)。
+
+    GET /v3/items,分页模型 1(蓝图 §4):首页 nextCursor='*' 换取真 cursor 后
+    全程不变(快照会话 ID),真翻页靠 offset 递增;offset 硬上限 10000(超限 400);
+    cursor 约 2 分钟过期(400 → 重置 '*' 整轮重试一次)。截断部分调用方用
+    get_item() 单查补漏。
+    """
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+
+    def _sweep() -> tuple[list[dict], bool]:
+        collected: list[dict] = []
+        cursor = "*"
+        offset = 0
+        while True:
+            params: dict = {"limit": limit, "offset": offset, "nextCursor": cursor}
+            if published_status:
+                params["publishedStatus"] = published_status
+            if lifecycle_status:
+                params["lifecycleStatus"] = lifecycle_status
+            _client.rate_acquire("items.list", store["client_id"])
+            status, _, data = _client.safe_get_ex(
+                f"{_client.base_url()}/v3/items",
+                token, store["client_id"], store["proxy"], params=params, max_retries=3)
+            _guard_store_dead(status, store)
+            if status == 400 and cursor != "*":
+                raise _CursorExpired()          # cursor 过期,由外层整轮重来一次
+            if status != 200:
+                raise RuntimeError(f"GET /v3/items 返回 {status}(店铺 {store['name']}): {data}")
+            page = (data or {}).get("ItemResponse") or []
+            total = (data or {}).get("totalItems") or 0
+            if cursor == "*":
+                cursor = (data or {}).get("nextCursor") or cursor
+            collected.extend(page)
+            offset += len(page)
+            if not page or offset >= total:
+                return collected, False
+            if offset >= max_offset:
+                logger.warning("GET /v3/items 店铺 %s 达 offset 上限 %d(total=%d),截断待补漏",
+                               store["name"], max_offset, total)
+                return collected, True
+
+    try:
+        return _sweep()
+    except _CursorExpired:
+        logger.info("GET /v3/items cursor 过期(店铺 %s),重置整轮重试一次", store["name"])
+        return _sweep()
+
+
+class _CursorExpired(Exception):
+    pass
+
+
+def iter_all_items(store: dict, stats: dict | None = None):
+    """输入:店铺(可选 stats dict 收集统计)→ 输出:生成器,按 SKU 去重逐个产出商品。
+
+    5 轮组合全量扫店(_SWEEP_ROUNDS),跨轮按 sku 去重(以先出现的为准)。
+    stats 若传入,填充 {"truncated": bool, "total": int, "rounds": {轮标识: 条数}}
+    ——truncated=True 时调用方须用 get_item() 对已知 SKU 单查补漏。
+    """
+    seen: set[str] = set()
+    truncated_any = False
+    rounds_stat: dict[str, int] = {}
+    for lifecycle, published in _SWEEP_ROUNDS:
+        items, truncated = list_items(store, lifecycle_status=lifecycle,
+                                      published_status=published)
+        truncated_any = truncated_any or truncated
+        key = f"{lifecycle}/{published or 'ALL'}"
+        rounds_stat[key] = len(items)
+        for item in items:
+            sku = item.get("sku")
+            if sku and sku not in seen:
+                seen.add(sku)
+                yield item
+    if stats is not None:
+        stats.update(truncated=truncated_any, total=len(seen), rounds=rounds_stat)
+
+
+def get_item(store: dict, sku: str) -> dict | None:
+    """输入:店铺 + SKU → 输出:单品 dict,404 返回 None(真 NOT_FOUND 语义)。
+
+    只作补漏用,禁止用于批量拿数据(旧教训:454 SKU 单查 = 8 分钟)。
+    """
+    _client.rate_acquire("items.get", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    from urllib.parse import quote
+    status, _, data = _client.safe_get_ex(
+        f"{_client.base_url()}/v3/items/{quote(str(sku), safe='')}",
+        token, store["client_id"], store["proxy"], max_retries=3)
+    _guard_store_dead(status, store)
+    if status == 404:
+        return None
+    if status != 200:
+        raise RuntimeError(f"GET /v3/items/{sku} 返回 {status}: {data}")
+    payload = (data or {}).get("ItemResponse") or []
+    return payload[0] if payload else None
+
+
+def summarize_item(item: dict) -> dict:
+    """输入:GET /v3/items 的单个 ItemResponse → 输出:扁平摘要 dict(catalog_sync 落库用)。"""
+    price = item.get("price") or {}
+    reasons = _pick(item, "unpublishedReasons", "unpublished_reasons") or {}
+    if isinstance(reasons, dict):
+        reasons = reasons.get("reason") or []
+    return {
+        "sku": item.get("sku"),
+        "wpid": item.get("wpid"),
+        "upc": item.get("upc"),
+        "gtin": item.get("gtin"),
+        "product_name": clean_text(item.get("productName")),
+        "shelf": fmt_shelf(item.get("shelf")),
+        "product_type": item.get("productType"),
+        "price": price.get("amount"),
+        "currency": _pick(price, "currency", "unit"),
+        "published_status": item.get("publishedStatus"),
+        "lifecycle_status": item.get("lifecycleStatus"),
+        "unpublished_reasons": "; ".join(reasons) if isinstance(reasons, list) else str(reasons),
+    }
 
 
 def search_walmart(store: dict, *, query: str | None = None,

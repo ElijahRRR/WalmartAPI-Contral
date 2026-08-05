@@ -45,6 +45,19 @@ socket.setdefaulttimeout(90)
 
 logger = logging.getLogger("api.walmart")
 
+
+class StoreDeadError(Exception):
+    """店铺凭证失效(401/403 经 401 自愈后仍失败)。
+
+    调用方语义:跳过该店铺的全部剩余调用,而不是逐页重试
+    (蓝图 §6.4;旧 sync_status_track 的正确做法标准化)。
+    """
+
+    def __init__(self, store_name: str, status: int):
+        self.store_name = store_name
+        self.status = status
+        super().__init__(f"店铺 {store_name} 凭证失效(HTTP {status}),跳过全店")
+
 # client_id → {"token": str, "expires_at": float, "secret": str, "proxy": str}
 # secret + proxy 保留是为了 401 时能就地刷新 token,不需要调用方再传一次。
 _token_cache: dict = {}
@@ -154,6 +167,10 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.walmart_search": (180, 60.0),        # GET /v3/items/walmart/search(官方 200/min,独立桶)
     "items.walmart_search_spec": (950, 86400.0),  # 同端点 SPEC 格式的每日附加额度(官方 1000/day)
     "items.catalog_search": (180, 60.0),        # POST catalog/search 与 associations 共享(官方 200/min)
+    "items.list": (55, 60.0),                   # GET /v3/items 带 query 参数(官方 60/min,页间≈1.1s)
+    "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
+    "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
+    "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
 }
 
 _rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]

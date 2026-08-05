@@ -41,6 +41,7 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 错误商品记录 | 问题商品每日汇总(展示) | Postgres 权威,飞书是展示投影 | 沿用旧表或新建 |
 | 店铺日报 KPI | 每日 KPI 展示 | Postgres 权威,飞书展示 | 待创建 |
 | 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | 待创建 |
+| 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);用户已建,token/sheet_id 待填 .env(FEISHU_ONLINE_SHEET_TOKEN / FEISHU_ONLINE_SHEET_ID);列序登记在 registry ONLINE_PRODUCTS_SHEET |
 
 设计规则:
 1. **登记类表**(人写程序读):程序同步后回写状态列,永不删除人写的行。

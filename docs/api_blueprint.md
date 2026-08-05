@@ -135,6 +135,11 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
    cursor 约 2 分钟过期(400→重置 '*' 重试一次);limit 生产实证 1000。
    超 10000 的部分用 GET /v3/items/{sku} 单查兜底。
    (sync_status_track.py:76-140 是唯一被生产验证的正确实现,已对拍 99,197 商品)
+   **新系统生产实证(2026-08-05,两店对拍)**:① 某状态组合零商品时返回 **404 而非空列表**,
+   必须按空轮处理;② **无参数调用返回全部状态的并集**(含 RETIRED,甚至含逐状态 5 轮
+   组合覆盖不到的状态——实测多出 1 条,推断 IN_PROGRESS/ARCHIVED,即旧 5 轮配方有盲区),
+   且无参限速 300/min(带参仅 60/min)。**定稿:全量扫店默认"无参全量 + RETIRED 兜底轮"**,
+   逐状态 5 轮降级为对拍/回退用(api/items.py _SWEEP_MODES)。
 2. **orders 型(cursor 即 URL 后缀)**:meta.nextCursor 返回带 `?` 的完整 query 串,
    直接拼在 /v3/orders 后;单店内**必须串行**翻页。
 3. **returns 型(cursor 即 query 串,需解析)**:meta.nextCursor 形如

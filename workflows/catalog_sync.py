@@ -5,8 +5,8 @@
   python cli.py catalog_sync -p store=A085朱丽霖  # 单店
   python cli.py catalog_sync -p workers=8       # 跨店并发(默认 4)
   python cli.py catalog_sync -p skip_inventory=1  # 只同步商品目录,跳过库存合并
-  python cli.py catalog_sync -p rounds=fast     # 实验:无参全量(300/min)+RETIRED 两轮
-                                                # 需先与默认 full(5 轮)对拍数量一致再采用
+  python cli.py catalog_sync -p rounds=full     # 备用:旧式逐状态 5 轮显式扫
+                                                # (默认 fast 两轮已实证更快且更全,见 items.py)
 
 每店流程:GET /v3/items 5 轮全量扫店(去重)→ offset 截断时用 PG 已知 SKU 单查补漏
 → GET /v3/inventories 合并可售数量 → upsert catalog.walmart_items → 标记本轮缺席行。
@@ -79,7 +79,7 @@ def run(params: dict) -> str:
         return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
     workers = int(params.get("workers", 4))
     skip_inventory = str(params.get("skip_inventory", "")) in ("1", "true", "yes")
-    mode = str(params.get("rounds", "full"))
+    mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):
         return f"rounds 参数只接受 full/fast,收到:{mode}"
     run_at = datetime.now(timezone.utc)

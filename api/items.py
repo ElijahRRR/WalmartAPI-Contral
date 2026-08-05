@@ -62,10 +62,12 @@ def fmt_shelf(shelf) -> str | None:
     return str(shelf)
 
 
-# 全量扫店组合。full:镜像旧 sync_status_track(生产对拍过 99,197 商品),逐状态显式扫
-# ——最稳但带参限速 60/min。fast:无参全量(300/min)+ RETIRED 补充(无参时官方不返回
-# RETIRED;而无参是否含 UNPUBLISHED/SYSTEM_PROBLEM/STAGE 未经验证,故 fast 需先与
-# full 对拍数量一致才可作默认)。
+# 全量扫店组合(默认 fast,2026-08-05 生产实证——两店对拍):
+# fast = 无参全量(300/min)+ RETIRED 兜底轮。实测无参返回**全部**生命周期与发布状态
+# 的并集,含 RETIRED,甚至含 full 5 轮组合覆盖不到的状态(谭总7 店实测 fast 比 full
+# 多 1 条,推断为 IN_PROGRESS/ARCHIVED)——即旧系统的 5 轮配方存在状态盲区。
+# RETIRED 轮两店实测均为无参轮子集,保留它只花 1 个请求,作为官方默认过滤行为
+# 未来变化的保险。full = 旧式逐状态显式扫(带参 60/min),仅作对拍/回退用。
 _SWEEP_MODES: dict[str, list[tuple[str | None, str | None]]] = {
     "full": [
         ("ACTIVE", "PUBLISHED"),

@@ -174,7 +174,15 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
     "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
     "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
+    "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
+    "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
+    "orders.list": (3000, 60.0),                # GET /v3/orders(官方 5000/min)
 }
+# insights performance 类:官方 1/min/端点,summary 与 report 各自独立端点 → 逐个登记
+for _m in ("otd", "cancellations", "vtr", "srr", "refunds",
+           "negativeFeedback", "returns", "itemNotReceived"):
+    _RATE_BUCKETS[f"insights.summary.{_m}"] = (1, 60.0)
+    _RATE_BUCKETS[f"insights.report.{_m}"] = (1, 60.0)
 
 _rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]
 _rate_lock = threading.Lock()
@@ -207,6 +215,41 @@ def rate_acquire(bucket: str, client_id: str) -> float:
                    "限速桶 %s(店铺 %s)已满,等待 %.1fs", bucket, client_id[:8], sleep_for)
         time.sleep(sleep_for)
         waited += sleep_for
+
+
+def safe_get_raw(url, token, client_id, proxy, params=None, timeout=90,
+                 max_retries=3) -> tuple[int | None, dict, bytes | None]:
+    """输入:同 safe_get_ex → 输出:(status, headers, 原始字节)。二进制响应专用。
+
+    与 safe_get_ex 的区别只有一个:不解析 JSON(xlsx/zip/CSV 会被强解析破坏,
+    旧系统因此养出裸 httpx 直连点,蓝图 §6.2 定稿收归此处)。
+    429 按 Retry-After/X-Next-Replenishment-Time 退避,5xx/网络异常指数退避。
+    """
+    attempt = 0
+    while True:
+        try:
+            resp = _get_client(proxy).get(
+                url, headers=make_headers(token, client_id), params=params, timeout=timeout)
+        except (httpx.TransportError, httpx.ProxyError) as e:
+            _invalidate_client(proxy)
+            if attempt < max_retries:
+                wait = min(2 ** attempt, 10)
+                logger.warning("⚠ GET(raw) 网络异常 %s,%ds 后重试: %s", url, wait, e)
+                time.sleep(wait)
+                attempt += 1
+                continue
+            logger.warning("✗ GET(raw) 请求异常 %s: %s", url, e)
+            return None, {}, None
+        status = resp.status_code
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+        if attempt < max_retries and (status == 429 or status >= 500):
+            wait = _parse_retry_after(headers) if status == 429 else min(2 ** attempt, 10)
+            logger.warning("⚠ GET(raw) %d %s,%.1fs 后重试(第 %d/%d 次)",
+                           status, url, wait, attempt + 1, max_retries)
+            time.sleep(wait)
+            attempt += 1
+            continue
+        return status, headers, resp.content
 
 
 def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:

@@ -164,6 +164,59 @@ CREATE TABLE IF NOT EXISTS ops.cursors (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- 店铺日报 KPI:每 (店铺, 日期) 一行,32 列语义对齐旧飞书「店铺KPI」表
+CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
+    store            text NOT NULL,
+    data_date        date NOT NULL,
+    seller_name      text,           -- 影刀前台抓取(可 stale 补);无则空
+    partner_id       text,
+    seller_id        text,
+    store_status     text,
+    payment_status   text,
+    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)
+    items_online     integer,        -- 来自 catalog.walmart_items(PG 复用,不再调 API)
+    items_in_stock   integer,
+    items_out_stock  integer,
+    orders_count     integer,        -- 24h 窗口(中国时间 06:30 锚)
+    sales_amount     numeric,
+    otd_rate         numeric, cancel_rate numeric, vtr_rate numeric,
+    srr_rate         numeric, refund_rate numeric, negative_rate numeric,
+    return_rate      numeric, inr_rate numeric,
+    period_sales     numeric, commission numeric, refund_amount numeric,
+    closing_balance  numeric, reserve_to_date numeric,
+    payout           numeric,        -- 非 ACTIVE 强制 0;负归 0(业务规则)
+    payout_date      text,
+    payment_processor text, settle_cycle text,
+    no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
+    prev_payout      numeric,        -- 严格 -14 天账期,无则 0(业务规则)
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, data_date)
+);
+
+-- 绩效问题订单:永久累积,五字段唯一键,首次发现日期永不被覆盖(ON CONFLICT DO NOTHING)
+CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    first_seen_date date NOT NULL,
+    store           text NOT NULL,
+    sales_order_no  text NOT NULL DEFAULT '',
+    po_no           text,
+    order_date      text,
+    indicator       text NOT NULL DEFAULT '',   -- 带 emoji 前缀(下游匹配契约)
+    sub_category    text NOT NULL DEFAULT '',
+    accountable     text,                        -- "✅ 是" / "⚪ 否"
+    description     text,
+    item            text NOT NULL DEFAULT '',
+    carrier         text,
+    tracking_no     text NOT NULL DEFAULT '',
+    note            text,
+    raw             jsonb,                       -- xlsx 原始行(对拍校准用)
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (sales_order_no, indicator, sub_category, tracking_no, item)
+);
+CREATE INDEX IF NOT EXISTS perf_problem_orders_store_idx
+    ON ops.perf_problem_orders (store, first_seen_date DESC);
+
 CREATE TABLE IF NOT EXISTS ops.dedupe (
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'
     key         text NOT NULL,

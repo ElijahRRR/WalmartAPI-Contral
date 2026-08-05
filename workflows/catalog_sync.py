@@ -20,7 +20,6 @@
 """
 
 import logging
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -88,55 +87,46 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
 def _backfill_item_ids(store: dict) -> int:
     """输入:店铺 → 输出:本次回填的 item_id 数量。
 
-    对在售且 item_id 为空的行,catalog/search 按 sku 逐个查数字商品ID
-    (GET /v3/items 不返回它)。itemId 平时不变,只有新品和"缺席后复现"
-    (upsert 时已重置为 NULL)的行会进这里,增量成本很小;首轮为全量回填。
+    walmart.com 数字 itemId 的唯一可行来源是全站搜索按 gtin/upc 查
+    (GET /v3/items 与 catalog/search 的响应都没有 itemId——后者 2026-08-05 实证)。
+    因此只回填 PUBLISHED 且带 gtin/upc 的行;itemId 平时不变,只有新品和
+    "缺席后复现"(upsert 已重置 NULL)的行会进这里,增量成本很小。
     单条失败只记日志跳过,不影响店铺同步结果。
     """
     name = store["name"]
     with db.pg_conn() as conn:
-        todo = walmart_catalog.skus_missing_item_id(conn, name)
+        todo = walmart_catalog.rows_missing_item_id(conn, name)
     if not todo:
         return 0
-    logger.info("店铺 %s 回填 item_id:%d 个 SKU 待查", name, len(todo))
+    logger.info("店铺 %s 回填 item_id:%d 个 PUBLISHED SKU 待查", name, len(todo))
 
-    tally = {"ok": 0, "empty": 0, "no_id": 0, "err": 0}
-    sample_lock = threading.Lock()
-    sample: dict = {}
+    tally = {"ok": 0, "miss": 0, "err": 0}
 
-    def _one(sku: str) -> tuple[str, str | None]:
+    def _one(row: tuple) -> tuple[str, str | None]:
+        sku, gtin, upc = row
         try:
-            hits = items.catalog_search(store, "sku", sku)
-            if not hits:
-                tally["empty"] += 1
-                return sku, None
-            h = hits[0]
-            iid = h.get("itemId") or h.get("item_id")
-            if not iid:
-                tally["no_id"] += 1
-                with sample_lock:
-                    if not sample:      # 记第一条"有命中但没 itemId"的真实结构用于诊断
-                        sample["keys"] = sorted(h.keys())
-                return sku, None
-            tally["ok"] += 1
-            return sku, str(iid)
+            if gtin:
+                hits = items.search_walmart(store, gtin=gtin)
+            else:
+                hits = items.search_walmart(store, upc=upc)
+            iid = hits[0].get("itemId") if hits else None
+            tally["ok" if iid else "miss"] += 1
+            return sku, (str(iid) if iid else None)
         except Exception as e:
             tally["err"] += 1
             logger.warning("item_id 回填失败 %s/%s: %s", name, sku, e)
             return sku, None
 
     found: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 线程跑满 180/min 桶
-        for f in as_completed([pool.submit(_one, s) for s in todo]):
+    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 线程跑满 walmart_search 180/min 桶
+        for f in as_completed([pool.submit(_one, r) for r in todo]):
             sku, iid = f.result()
             if iid:
                 found[sku] = iid
     with db.pg_conn() as conn:
         walmart_catalog.set_item_ids(conn, name, found)
-    logger.info("店铺 %s item_id 回填结果:命中 %d / 空结果 %d / 响应无itemId %d / 异常 %d",
-                name, tally["ok"], tally["empty"], tally["no_id"], tally["err"])
-    if sample:
-        logger.info("店铺 %s catalog_search 无itemId样本的字段清单:%s", name, sample["keys"])
+    logger.info("店铺 %s item_id 回填结果:命中 %d / 搜索未中 %d / 异常 %d",
+                name, tally["ok"], tally["miss"], tally["err"])
     return len(found)
 
 

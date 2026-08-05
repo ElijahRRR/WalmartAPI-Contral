@@ -107,13 +107,19 @@ def projection_rows(conn) -> list[list]:
         return [[_cell(v) for v in row] for row in cur.fetchall()]
 
 
-def skus_missing_item_id(conn, store_name: str) -> list[str]:
-    """输入:连接 + 店铺 → 输出:在售(未缺席)且 item_id 为空、待回填的 SKU 列表。"""
+def rows_missing_item_id(conn, store_name: str) -> list[tuple[str, str | None, str | None]]:
+    """输入:连接 + 店铺 → 输出:待回填 item_id 的 (sku, gtin, upc) 列表。
+
+    只取 PUBLISHED 且带 gtin/upc 的行:itemId 走全站搜索回填(只返回已发布商品),
+    catalog/search 响应无 itemId 字段(2026-08-05 实证,字段清单见 catalog_sync 日志)。
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT sku FROM catalog.walmart_items "
+        cur.execute("SELECT sku, gtin, upc FROM catalog.walmart_items "
                     "WHERE store = %s AND item_id IS NULL AND missing_since IS NULL "
-                    "ORDER BY sku", (store_name,))
-        return [r[0] for r in cur.fetchall()]
+                    "AND published_status = 'PUBLISHED' "
+                    "AND (gtin IS NOT NULL OR upc IS NOT NULL) ORDER BY sku",
+                    (store_name,))
+        return [(r[0], r[1], r[2]) for r in cur.fetchall()]
 
 
 def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:

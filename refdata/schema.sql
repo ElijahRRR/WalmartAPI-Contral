@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     sku          text NOT NULL,
     wpid         text,
     item_id      text,               -- walmart.com 数字商品ID(邮件/工单定位用);
-                                     -- GET /v3/items 不返回,由 catalog/search 按 sku 回填;
+                                     -- 唯一来源:全站搜索按 gtin/upc(GET /v3/items 与
+                                     -- catalog/search 均无此字段,后者 2026-08-05 实证);
+                                     -- 仅 PUBLISHED 行可回填(公开搜索只返回已发布);
                                      -- 行缺席后复现时重置为 NULL 触发重查(下架重上可能换 ID)
     upc          text,               -- 必须 text:前导零(旧事故教训)
     gtin         text,

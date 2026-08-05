@@ -361,7 +361,8 @@ def summarize_catalog_item(h: dict) -> dict:
     price = h.get("price") or {}
     reasons = _pick(h, "unpublishedReasons", "unpublished_reasons") or []
     return {
-        "item_id": h.get("itemId") or h.get("wpid"),
+        # 实证(2026-08-05):payload 无 itemId 字段,此列几乎恒空;数字 itemId 要走全站搜索
+        "item_id": h.get("itemId"),
         "sku": h.get("sku"),
         "wpid": h.get("wpid"),
         "upc_gtin": h.get("gtin") or h.get("upc"),

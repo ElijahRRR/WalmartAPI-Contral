@@ -261,8 +261,13 @@ def test_projection_rows_cell_conversion():
 
 
 def test_item_id_backfill_helpers():
-    conn = _FakeConn(rows=[("SKU_A",), ("SKU_B",)])
-    assert walmart_catalog.skus_missing_item_id(conn, "T1") == ["SKU_A", "SKU_B"]
+    conn = _FakeConn(rows=[("SKU_A", "00036000291452", None), ("SKU_B", None, "036000291452")])
+    rows = walmart_catalog.rows_missing_item_id(conn, "T1")
+    assert rows == [("SKU_A", "00036000291452", None), ("SKU_B", None, "036000291452")]
+    # 只回填 PUBLISHED 且带 gtin/upc 的行(itemId 走全站搜索,只覆盖已发布商品)
+    sql = conn.cur.executed[0][0]
+    assert "published_status = 'PUBLISHED'" in sql
+    assert "gtin IS NOT NULL OR upc IS NOT NULL" in sql
     assert walmart_catalog.set_item_ids(conn, "T1", {"SKU_A": "14901706450"}) == 1
     assert walmart_catalog.set_item_ids(conn, "T1", {}) == 0
 

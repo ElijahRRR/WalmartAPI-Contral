@@ -101,8 +101,8 @@ def run(params: dict) -> str:
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
 
-    if str(params.get("skip_feishu", "")) not in ("1", "true", "yes"):
-        lines.append(_write_projection())
+    if results and str(params.get("skip_feishu", "")) not in ("1", "true", "yes"):
+        lines.append(_write_projection())   # 全部店铺失败时不动飞书表
 
     if failed:
         lines.append(f"失败:{'; '.join(failed)}")

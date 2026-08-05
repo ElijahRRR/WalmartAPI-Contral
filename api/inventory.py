@@ -52,6 +52,9 @@ def list_inventories(store: dict, expected_skus: set[str] | None = None) -> dict
             token, store["client_id"], store["proxy"], params=params, max_retries=3)
         if status in (401, 403):
             raise _client.StoreDeadError(store["name"], status)
+        if status == 404:       # 空库存店铺按零商品处理(与 items 的 404 语义对齐)
+            logger.info("GET /v3/inventories 404(店铺 %s),按空处理", store["name"])
+            break
         if status != 200:
             raise RuntimeError(f"GET /v3/inventories 返回 {status}(店铺 {store['name']}): {data}")
         elements = (data or {}).get("elements") or {}

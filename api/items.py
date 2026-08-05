@@ -105,6 +105,11 @@ def list_items(store: dict, *, published_status: str | None = None,
                 f"{_client.base_url()}/v3/items",
                 token, store["client_id"], store["proxy"], params=params, max_retries=3)
             _guard_store_dead(status, store)
+            if status == 404:
+                # 该状态组合下零商品时官方返回 404 而非空列表(生产实证 2026-08-05)
+                logger.info("GET /v3/items %s/%s 零商品(404),空轮跳过(店铺 %s)",
+                            lifecycle_status, published_status, store["name"])
+                return collected, False
             if status == 400 and cursor != "*":
                 raise _CursorExpired()          # cursor 过期,由外层整轮重来一次
             if status != 200:

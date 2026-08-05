@@ -93,6 +93,18 @@ def test_list_items_cursor_expiry_resets_and_retries(monkeypatch):
     assert [i["sku"] for i in got] == ["S0", "S1"]   # 整轮重来后拿全
 
 
+def test_list_items_404_means_empty_round(monkeypatch):
+    # 生产实证:某状态组合零商品时官方返回 404 而非空列表,必须按空轮处理
+    _use(monkeypatch, lambda r: httpx.Response(404, json={}))
+    got, truncated = items.list_items(STORE, published_status="UNPUBLISHED")
+    assert got == [] and truncated is False
+
+
+def test_list_inventories_404_means_empty(monkeypatch):
+    _use(monkeypatch, lambda r: httpx.Response(404, json={}))
+    assert inv_api.list_inventories(STORE) == {}
+
+
 def test_iter_all_items_five_rounds_dedupe(monkeypatch):
     seen_rounds = []
 

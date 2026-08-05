@@ -137,6 +137,13 @@ def test_rate_bucket_blocks_when_full(monkeypatch):
         _client._RATE_BUCKETS.pop("test.tiny", None)
 
 
+def test_workflow_catalog_mode_requires_explicit_store():
+    from workflows import product_query as pq
+    # catalog 查的是特定店铺自有目录,不指定 store 必须拒绝而非静默用第一家
+    out = pq.run({"ids": "SKU1", "mode": "catalog"})
+    assert "必须显式指定店铺" in out
+
+
 def test_workflow_classify_and_candidates():
     from workflows import product_query as pq
     assert pq._classify("B0ABCD1234") == "asin"

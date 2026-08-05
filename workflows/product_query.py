@@ -4,7 +4,8 @@
   python cli.py product_query -p ids="B0ABCD1234,036000291452,水杯"
   python cli.py product_query -p file=/path/to/ids.txt          # 每行一个
   python cli.py product_query -p ids=... -p store=A085          # 指定用哪家店的 token
-  python cli.py product_query -p mode=catalog -p field=sku -p ids=SKU1,SKU2   # 查本店目录
+  python cli.py product_query -p mode=catalog -p store=A085 -p field=sku -p ids=SKU1,SKU2
+      # 查店铺自有目录:catalog 模式查的是"哪家店"的目录,store 必填(不允许缺省第一家)
 
 零状态零调度,全部只读(蓝图矩阵 #5/#6)。输入 ID 自动分类:
   B0 开头 10 位 → ASIN(走 SPEC);8-14 位纯数字 → UPC/GTIN(DEFAULT+SPEC,
@@ -141,13 +142,18 @@ def run(params: dict) -> str:
     if not ids:
         return "无输入:用 -p ids=值1,值2 或 -p file=路径 提供查询值"
 
+    mode = params.get("mode", "global")
+    if mode == "catalog" and not params.get("store"):
+        return ("catalog 模式查询的是特定店铺的自有目录,必须显式指定店铺:"
+                "-p store=店铺名(全站 global 模式才允许缺省任一店铺 token)")
+
     names = [params["store"]] if params.get("store") else None
     store_list = stores_svc.load_stores(names)
     if not store_list:
-        return "无可用店铺凭证(公开目录查询也需要任一店铺的 token)"
+        target = params.get("store") or "(任一)"
+        return f"店铺凭证未找到:{target}(检查店铺凭证表登记名与「启用」列)"
     store = store_list[0]
 
-    mode = params.get("mode", "global")
     if mode == "catalog":
         field = params.get("field", "sku")
         rows = [_query_one_catalog(store, field, v) for v in ids]

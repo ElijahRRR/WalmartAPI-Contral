@@ -11,7 +11,8 @@ CREATE SCHEMA IF NOT EXISTS ops;
 -- ── catalog:产品主数据(身份与观测分离)─────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS catalog.products (
-    asin            text PRIMARY KEY,
+    marketplace     text NOT NULL DEFAULT 'US',
+    asin            text NOT NULL,
     title           text,
     brand           text,
     amazon_category text,
@@ -28,11 +29,13 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     store           text,
     owner           text,
     created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (marketplace, asin)
 );
 
 CREATE TABLE IF NOT EXISTS catalog.snapshots (
     id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    marketplace   text NOT NULL DEFAULT 'US',
     asin          text NOT NULL,
     scrape_params jsonb NOT NULL DEFAULT '{}',  -- 邮编等采集参数,参与"最新值"分组
     price         numeric,
@@ -43,11 +46,24 @@ CREATE TABLE IF NOT EXISTS catalog.snapshots (
     source_id     text            -- 采集器侧记录 ID,幂等去重用
 );
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_source_id_uidx ON catalog.snapshots (source_id);
-CREATE INDEX IF NOT EXISTS snapshots_asin_scraped_idx ON catalog.snapshots (asin, scraped_at DESC);
+CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
+
+-- 迁移块(2026-08-06 拍板:products 主键 asin → (marketplace, asin);对已部署空表幂等生效)
+ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM information_schema.key_column_usage
+      WHERE table_schema='catalog' AND table_name='products'
+        AND constraint_name='products_pkey') = 1 THEN
+    ALTER TABLE catalog.products DROP CONSTRAINT products_pkey;
+    ALTER TABLE catalog.products ADD PRIMARY KEY (marketplace, asin);
+  END IF;
+END $$;
 
 CREATE OR REPLACE VIEW catalog.latest_snapshot AS
-  SELECT DISTINCT ON (asin, scrape_params) *
-  FROM catalog.snapshots ORDER BY asin, scrape_params, scraped_at DESC;
+  SELECT DISTINCT ON (marketplace, asin, scrape_params) *
+  FROM catalog.snapshots ORDER BY marketplace, asin, scrape_params, scraped_at DESC;
 
 -- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert
 -- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,按 sku=asin JOIN)

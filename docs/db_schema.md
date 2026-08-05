@@ -30,7 +30,8 @@
 ```sql
 -- 产品身份:一个 ASIN 一行,终身唯一(慢变字段 + 审核结论 + 复用资产)
 CREATE TABLE catalog.products (
-    asin            text PRIMARY KEY,
+    marketplace     text NOT NULL DEFAULT 'US',  -- 站点;复合主键,加站点零迁移(2026-08-06 拍板)
+    asin            text NOT NULL,
     title           text,
     brand           text,
     amazon_category text,
@@ -50,12 +51,14 @@ CREATE TABLE catalog.products (
     store           text,
     owner           text,
     created_at      timestamptz NOT NULL DEFAULT now(),
-    updated_at      timestamptz NOT NULL DEFAULT now()
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (marketplace, asin)
 );
 
 -- 采集快照:追加不改,永不去重(快变字段)
 CREATE TABLE catalog.snapshots (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    marketplace  text NOT NULL DEFAULT 'US',
     asin         text NOT NULL,
     scrape_params jsonb NOT NULL DEFAULT '{}',  -- 邮编等采集参数,参与"最新值"分组
     price        numeric,
@@ -66,12 +69,12 @@ CREATE TABLE catalog.snapshots (
     source_id    text            -- 采集器侧记录 ID,幂等去重用
 );
 CREATE UNIQUE INDEX ON catalog.snapshots (source_id);
-CREATE INDEX ON catalog.snapshots (asin, scraped_at DESC);
+CREATE INDEX ON catalog.snapshots (marketplace, asin, scraped_at DESC);
 
--- 最新快照视图:每个 (asin, 参数组合) 取最新一条
+-- 最新快照视图:每个 (marketplace, asin, 参数组合) 取最新一条
 CREATE VIEW catalog.latest_snapshot AS
-  SELECT DISTINCT ON (asin, scrape_params) *
-  FROM catalog.snapshots ORDER BY asin, scrape_params, scraped_at DESC;
+  SELECT DISTINCT ON (marketplace, asin, scrape_params) *
+  FROM catalog.snapshots ORDER BY marketplace, asin, scrape_params, scraped_at DESC;
 ```
 
 使用约定:审核服务只关心 products(slow_hash 未变则不重审);

@@ -137,6 +137,13 @@ def test_rate_bucket_blocks_when_full(monkeypatch):
         _client._RATE_BUCKETS.pop("test.tiny", None)
 
 
+def test_workflow_ids_split_keeps_multiword_keywords():
+    from workflows import product_query as pq
+    ids = pq._read_ids({"ids": "B0DNMCC4PQ, 121678119648, Stainless Steel Grapefruit Spoons"})
+    assert ids == ["B0DNMCC4PQ", "121678119648", "Stainless Steel Grapefruit Spoons"]
+    assert pq._classify(ids[2]) == "keyword"
+
+
 def test_workflow_catalog_mode_requires_explicit_store():
     from workflows import product_query as pq
     # catalog 查的是特定店铺自有目录,不指定 store 必须拒绝而非静默用第一家

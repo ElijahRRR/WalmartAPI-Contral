@@ -62,7 +62,8 @@ def _read_ids(params: dict) -> list[str]:
         with open(params["file"], encoding="utf-8") as f:
             raw = [line.strip() for line in f]
     elif params.get("ids"):
-        raw = re.split(r"[,\s]+", str(params["ids"]))
+        # 只按逗号/换行切分——关键词可以含空格("Stainless Steel Spoons" 是一个查询)
+        raw = [v.strip() for v in re.split(r"[,\n]+", str(params["ids"]))]
     ids, seen = [], set()
     for v in raw:
         if v and v not in seen:

@@ -273,6 +273,12 @@ def test_upsert_resets_item_id_on_reappearance():
     assert "THEN NULL ELSE catalog.walmart_items.item_id" in walmart_catalog._UPSERT_SQL
 
 
+def test_upsert_preserves_avail_qty_when_absent():
+    # 库存失败/skip_inventory 时 EXCLUDED.avail_qty 为 NULL,必须保留旧值而非清空
+    assert "COALESCE(EXCLUDED.avail_qty, catalog.walmart_items.avail_qty)" \
+        in walmart_catalog._UPSERT_SQL
+
+
 def test_projection_columns_match_registry():
     from registry import resources
     select_part = walmart_catalog._PROJECTION_SQL.split("FROM")[0]

@@ -27,7 +27,9 @@ ON CONFLICT (store, sku) DO UPDATE SET
     variant_group_id = EXCLUDED.variant_group_id,
     variant_group_info = EXCLUDED.variant_group_info,
     price = EXCLUDED.price,
-    currency = EXCLUDED.currency, avail_qty = EXCLUDED.avail_qty,
+    currency = EXCLUDED.currency,
+    -- 本轮没拿到库存(接口失败/skip_inventory/该 SKU 缺席响应)时保留上一轮值,不刷成 NULL
+    avail_qty = COALESCE(EXCLUDED.avail_qty, catalog.walmart_items.avail_qty),
     published_status = EXCLUDED.published_status,
     lifecycle_status = EXCLUDED.lifecycle_status,
     unpublished_reasons = EXCLUDED.unpublished_reasons,

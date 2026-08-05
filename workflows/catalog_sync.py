@@ -61,8 +61,16 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
                     filled += 1
 
     inventory: dict[str, int] = {}
+    inv_failed = False
     if not skip_inventory:
-        inventory = inv_api.list_inventories(store)
+        try:
+            inventory = inv_api.list_inventories(store)
+        except _client.StoreDeadError:
+            raise                       # 凭证失效仍按跳店处理
+        except Exception as e:
+            # 库存失败不弃店:商品目录照常入库,avail_qty 由 COALESCE 保留上一轮值
+            logger.warning("店铺 %s 库存拉取失败,本轮沿用旧库存值: %s", name, e)
+            inv_failed = True
 
     rows = walmart_catalog.merge_rows(name, summaries, inventory, run_at)
     with db.pg_conn() as conn:
@@ -72,7 +80,8 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
     backfilled = _backfill_item_ids(store)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
-            "filled": filled, "inv": len(inventory), "item_ids": backfilled}
+            "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
+            "item_ids": backfilled}
 
 
 def _backfill_item_ids(store: dict) -> int:
@@ -151,6 +160,9 @@ def run(params: dict) -> str:
              f"回填 item_id {total_item_ids} 个"]
     if truncated:
         lines.append(f"offset 截断已补漏:{','.join(truncated)}")
+    inv_failed = [r["store"] for r in results if r.get("inv_failed")]
+    if inv_failed:
+        lines.append(f"库存拉取失败(沿用旧值,目录已更新):{','.join(inv_failed)}")
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
 

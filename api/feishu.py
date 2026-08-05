@@ -252,6 +252,7 @@ def batch_delete(table: Bitable, record_ids: list[str]) -> int:
 
 _SHEET_WRITE_BLOCK_ROWS = 4000
 _SHEET_WRITE_THROTTLE_SECS = 0.3
+_SHEET_DIMENSION_MAX = 5000     # dimension_range 增/删单次上限(90204 实证 2026-08-05)
 
 
 def _col_letter(n: int) -> str:
@@ -280,9 +281,15 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
     if current >= need_rows:
         return 0
     add = need_rows - current
-    _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
-          json_body={"dimension": {"sheetId": s.sheet_id,
-                                   "majorDimension": "ROWS", "length": add}})
+    remaining = add
+    while remaining > 0:      # 单次最多 5000 行(90204),分块扩
+        step = min(remaining, _SHEET_DIMENSION_MAX)
+        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
+              json_body={"dimension": {"sheetId": s.sheet_id,
+                                       "majorDimension": "ROWS", "length": step}})
+        remaining -= step
+        if remaining > 0:
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     logger.info("电子表格「%s」扩行 %d(%d → %d)", s.name, add, current, need_rows)
     return add
 
@@ -312,12 +319,18 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
             time.sleep(_SHEET_WRITE_THROTTLE_SECS)
 
     surplus = sheet_row_count(s) - len(rows)
-    if surplus > 0:
+    trimmed = surplus
+    while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
+        step = min(surplus, _SHEET_DIMENSION_MAX)
         _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
               json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
-                                       "startIndex": len(rows) + 1,
+                                       "startIndex": len(rows) + surplus - step + 1,
                                        "endIndex": len(rows) + surplus}})
-        logger.info("电子表格「%s」删除尾部残留 %d 行", s.name, surplus)
+        surplus -= step
+        if surplus > 0:
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+    if trimmed > 0:
+        logger.info("电子表格「%s」删除尾部残留 %d 行", s.name, trimmed)
     return written
 
 

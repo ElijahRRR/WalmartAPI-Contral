@@ -259,6 +259,23 @@ def test_col_letter():
     assert feishu._col_letter(27) == "AA"
 
 
+def test_sheet_ensure_rows_chunks_at_5000(monkeypatch):
+    # dimension_range 单次上限 5000(90204 实证):扩 12794 行须分 5000/5000/2794 三次
+    from registry.resources import Spreadsheet
+    sheet = Spreadsheet(name="测试表", token="TOK", sheet_id="SID", columns=("a",))
+    adds = []
+
+    def fake_call(method, path, *, json_body=None, params=None, timeout=60):
+        if path.endswith("/sheets/query"):
+            return {"sheets": [{"sheet_id": "SID", "grid_properties": {"row_count": 1}}]}
+        adds.append(json_body["dimension"]["length"])
+        return {}
+
+    monkeypatch.setattr(feishu, "_call", fake_call)
+    assert feishu.sheet_ensure_rows(sheet, 12795) == 12794
+    assert adds == [5000, 5000, 2794]
+
+
 def test_sheet_overwrite_blocks_and_trims(monkeypatch):
     from registry.resources import Spreadsheet
     sheet = Spreadsheet(name="测试表", token="TOK", sheet_id="SID", columns=("a", "b"))

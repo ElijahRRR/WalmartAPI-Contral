@@ -23,6 +23,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import httpx
+
 from api import _client, feishu, inventory as inv_api, items
 from registry import db, resources
 from services import stores as stores_svc, walmart_catalog
@@ -95,6 +97,10 @@ def run(params: dict) -> str:
             except _client.StoreDeadError as e:
                 logger.error("%s", e)
                 dead.append(name)
+            except httpx.ProxyError as e:
+                # 代理认证/连接失败与凭证失效同类:跳过全店,提示修凭证表,不拖垮整轮
+                logger.error("店铺 %s 代理失败(检查凭证表代理账号密码): %s", name, e)
+                dead.append(f"{name}(代理)")
             except Exception as e:
                 logger.exception("店铺 %s 同步失败: %s", name, e)
                 failed.append(f"{name}({e})")

@@ -488,6 +488,68 @@ def pick_new_periods(available: list[str], have: set[str], limit: int) -> list[s
     return sorted(todo, key=lambda d: d[4:] + d[:4])[-limit:]
 
 
+# ── 烂账治理(所有者决策 2026-08-06):订单不在库,关联数据不入库 ─────────────
+# 建库拉单窗口(90 天)之前的老订单永远无法匹配,其售后/绩效/对账行入库即烂账;
+# 且各源按滚动窗口每天重拉,只删一次会回流——必须在入库侧永久过滤。
+# 丢弃数一律返回给调用方记日志,过滤不许静默。
+
+
+def drop_unlinked(conn, rows: list[dict]) -> tuple[list[dict], int]:
+    """输入:连接 + 含 order_line_id 的行(售后/对账)→ 输出:(订单在库的行, 丢弃数)。"""
+    ids = sorted({r["order_line_id"] for r in rows if r.get("order_line_id")})
+    if not ids:
+        return [], len(rows)
+    with conn.cursor() as cur:
+        cur.execute("SELECT order_line_id FROM orders.order_lines "
+                    "WHERE order_line_id = ANY(%s)", (ids,))
+        have = {x for (x,) in cur.fetchall()}
+    kept = [r for r in rows if r.get("order_line_id") in have]
+    return kept, len(rows) - len(kept)
+
+
+def drop_unlinked_perf(conn, rows: list[dict]) -> tuple[list[dict], int]:
+    """输入:连接 + 绩效事件行 → 输出:(PO 在库的行, 丢弃数)。
+
+    绩效按 PO 而非行标识过滤:无 SKU 的老版报表行 order_line_id 为 NULL,
+    但只要 PO 在库,单行订单回填仍有机会,不能一刀切掉。
+    """
+    pos = sorted({r["po_id"] for r in rows if r.get("po_id")})
+    if not pos:
+        return [], len(rows)
+    with conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT po_id FROM orders.order_lines "
+                    "WHERE po_id = ANY(%s)", (pos,))
+        have = {x for (x,) in cur.fetchall()}
+    kept = [r for r in rows if r.get("po_id") in have]
+    return kept, len(rows) - len(kept)
+
+
+def recon_done_periods(conn, store: str) -> set:
+    """输入:连接 + 店铺 → 输出:已处理过的对账账期集合(ops.cursors 台账)。
+
+    台账存在的原因:入库过滤后某账期可能 0 行落库,若只看 settlement_lines
+    的 DISTINCT period,该期会被当"缺失账期"无限重拉。处理过就记账,不重拉。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM ops.cursors WHERE name = %s",
+                    (f"recon_done:{store}",))
+        row = cur.fetchone()
+    return set(row[0]) if row and row[0] else set()
+
+
+def mark_recon_done(conn, store: str, periods) -> None:
+    """输入:连接 + 店铺 + 本次处理的账期 → 输出:无(并入台账,幂等)。"""
+    periods = set(periods)
+    if not periods:
+        return
+    done = recon_done_periods(conn, store) | periods
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO ops.cursors (name, value) VALUES (%s, %s::jsonb) "
+                    "ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, "
+                    "updated_at = now()",
+                    (f"recon_done:{store}", json.dumps(sorted(done))))
+
+
 def backfill_perf_line_ids(conn) -> int:
     """输入:连接 → 输出:回填总行数。
 

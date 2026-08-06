@@ -234,9 +234,10 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
 
 
 def _phase_problems(store_list: list[dict], data_date) -> str:
-    total_new, total_rows, total_perf, total_no_po, failed = 0, 0, 0, 0, []
+    total_new, total_rows, total_perf, total_no_po = 0, 0, 0, 0
+    total_unlinked, failed = 0, []
 
-    def _one_store(store: dict) -> tuple[int, int, int, int]:
+    def _one_store(store: dict) -> tuple[int, int, int, int, int]:
         by_metric: list[tuple[str, list[dict]]] = []
         for m in insights.METRICS:
             try:
@@ -247,7 +248,7 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
             if blob:
                 by_metric.append((m, kpi.parse_problem_report(m, blob)))
 
-        inserted = perf_written = no_po = 0
+        inserted = perf_written = no_po = unlinked = 0
         rows_all = [r for _, rs in by_metric for r in rs]
         if rows_all:
             with db.pg_conn() as conn, conn.cursor() as cur:
@@ -260,27 +261,34 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
                                 {**r, "store": store["name"],
                                  "first_seen_date": data_date})
                     inserted += cur.rowcount
-                # 订单中心:逐周期累积进 orders.perf_events(period=拉取日)
+                # 订单中心:逐周期累积进 orders.perf_events(period=拉取日);
+                # 烂账治理:PO 不在库(早于建库窗口)的事件不入库
                 for m, rs in by_metric:
                     perf_rows, skipped = order_lines.perf_rows_from_problems(
                         store["name"], m, rs, str(data_date), sku_lookup)
+                    perf_rows, drop = order_lines.drop_unlinked_perf(
+                        conn, perf_rows)
+                    unlinked += drop
                     perf_written += order_lines.upsert_perf_events(conn, perf_rows)
                     no_po += skipped
         if no_po:
             logger.warning("店铺 %s 有 %d 行问题订单无 PO 号,perf_events 未建键",
                            store["name"], no_po)
-        return len(rows_all), inserted, perf_written, no_po
+        if unlinked:
+            logger.info("店铺 %s:%d 条绩效事件 PO 不在库,未入库", store["name"], unlinked)
+        return len(rows_all), inserted, perf_written, no_po, unlinked
 
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:
-                parsed, inserted, perf_written, no_po = f.result()
+                parsed, inserted, perf_written, no_po, unlinked = f.result()
                 total_rows += parsed
                 total_new += inserted
                 total_perf += perf_written
                 total_no_po += no_po
+                total_unlinked += unlinked
             except (_client.StoreDeadError, httpx.ProxyError) as e:
                 logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
                 failed.append(f"{name}(凭证)")
@@ -292,7 +300,8 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
         linked = order_lines.backfill_perf_line_ids(conn)
     line = (f"问题订单:{len(store_list) - len(failed)}/{len(store_list)} 店,"
             f"解析 {total_rows} 行,新增 {total_new} 条;"
-            f"绩效事件 {total_perf} 条(回填订单行 {linked},无 PO 跳过 {total_no_po})")
+            f"绩效事件 {total_perf} 条(回填订单行 {linked},无 PO 跳过 {total_no_po},"
+            f"订单不在库丢弃 {total_unlinked})")
     if failed:
         line += f",失败:{','.join(failed)}"
     return line
@@ -308,20 +317,29 @@ def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
             cur.execute("SELECT DISTINCT period FROM orders.settlement_lines "
                         "WHERE store = %s", (name,))
             have = {r[0] for r in cur.fetchall()}
+            # 台账并入:入库过滤后可能整期 0 行落库,只看 DISTINCT period
+            # 会把处理过的期当缺失无限重拉(services.order_lines 台账注释)
+            have |= order_lines.recon_done_periods(conn, name)
             # v3 身份 = PO+SKU:CSV 缺 SKU 列时按 (po,行号) 反查订单行补 SKU
             cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
                         "WHERE store = %s", (name,))
             sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
         todo = order_lines.pick_new_periods(
             reports.available_recon_dates(store), have, periods_limit)
-        written = no_sku = 0
+        written = no_sku = unlinked = 0
         for period in todo:
             rows = list(reports.iter_recon_records(store, period))
             recs, skipped = order_lines.aggregate_settlement_lines(
                 name, rows, period, sku_lookup)
             no_sku += skipped
             with db.pg_conn() as conn:
+                # 烂账治理:订单不在库(早于建库窗口)的对账行不入库
+                recs, drop = order_lines.drop_unlinked(conn, recs)
+                unlinked += drop
                 written += order_lines.upsert_settlement_lines(conn, recs)
+                order_lines.mark_recon_done(conn, name, [period])
+        if unlinked:
+            logger.info("店铺 %s:%d 组对账行订单不在库,未入库", name, unlinked)
         return len(todo), written, no_sku
 
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:

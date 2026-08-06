@@ -38,8 +38,13 @@ def _sync_one_store(store: dict, created_start: str) -> dict:
         n_orders += 1
         rows.extend(ol.flatten_return_lines(name, return_order))
     with db.pg_conn() as conn:
+        # 烂账治理:订单不在库(早于建库拉单窗口)的售后行不入库
+        rows, dropped = ol.drop_unlinked(conn, rows)
         written = ol.upsert_return_lines(conn, rows)
-    return {"store": name, "returns": n_orders, "lines": written}
+    if dropped:
+        logger.info("店铺 %s:%d 条售后行订单不在库,未入库", name, dropped)
+    return {"store": name, "returns": n_orders, "lines": written,
+            "dropped": dropped}
 
 
 def run(params: dict) -> str:
@@ -69,8 +74,11 @@ def run(params: dict) -> str:
                 failed.append(f"{name}({e})")
 
     total = sum(r["lines"] for r in results)
+    total_dropped = sum(r.get("dropped", 0) for r in results)
     lines = [f"returns_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),售后行入库 {total}"]
+    if total_dropped:
+        lines[0] += f",订单不在库丢弃 {total_dropped}"
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:

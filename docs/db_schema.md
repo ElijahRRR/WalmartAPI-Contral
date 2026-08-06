@@ -217,10 +217,12 @@ CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_
 -- 前提纪律:六表不删行、不复制行、键列不手改(打破由对账发现并告警)。
 
 CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧系统散落的 _meta sheet)
-    name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
+    name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'recon_done:A085朱丽霖'
     value       jsonb NOT NULL,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+-- recon_done:<店铺> = 已处理对账账期数组(台账):烂账入库过滤后某期可能
+-- 0 行落库,只看 settlement_lines DISTINCT period 会把它当缺失账期无限重拉
 
 -- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
 CREATE TABLE ops.store_kpi_daily (

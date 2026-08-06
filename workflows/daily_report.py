@@ -158,7 +158,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         try:
             if recon_date in reports.available_recon_dates(store):
                 prev_payout = kpi.payment_summary_total(
-                    reports.iter_recon_records(store, recon_date, page_size=5))
+                    reports.iter_recon_records(store, recon_date))
         except Exception as e:
             logger.warning("店铺 %s 上期回款查询失败(按 0 计): %s", name, e)
 

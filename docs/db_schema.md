@@ -135,26 +135,34 @@ CREATE TABLE listing.upc_pool (     -- UPC 池:领取即永不释放(旧系统�
 );
 ```
 
-## orders — 订单域
+## orders — 订单域(行级统一建模,2026-08-06 定稿)
 
-```sql
-CREATE TABLE orders.orders (
-    po_id       text PRIMARY KEY,
-    store       text NOT NULL,
-    order_date  timestamptz,
-    status      text,
-    total       numeric,
-    raw         jsonb,
-    -- 审核四道结论
-    audit_phishing  text, audit_purchaser text, audit_price text, audit_title text,
-    audit_final     text,
-    owner       text,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE orders.returns    ( ... 按旧售后同步的 27 列映射,主键 return_order_id );
-CREATE TABLE orders.settlement ( ... 从旧 walmart_settlement.db 迁入,增量拉取 );
+order_audit / returns_sync / 绩效问题订单 / 对账明细四条链路共用同一行级标识,
+与旧仓库「订单中心v1」(codex/order-center-v1)**完全同构**,两系统 ID 可直接互查:
+
 ```
+order_line_id = 'ol_' + sha256(store + '\x1f' + po_id + '\x1f' + line_number)[:24]
+```
+
+为什么用**行号**而不是 SKU 做行标识:orders / returns / recon 三个数据源都
+原生携带行号(官方的行级主键;returns 是 purchaseOrderLineNumber,recon 是
+`Purchase Order line #`),SKU 只存列 + 索引供业务查询。唯一例外是绩效报表
+xlsx **没有行号字段**(实证),因此 perf_events 按 (store, po_id, metric, period)
+建键,order_line_id 仅在可判定时回填(单行订单),不硬造假行号。
+生成函数唯一出处:`services/order_lines.py`。
+
+| 表 | 主键 | 内容 | 写入者 |
+|---|---|---|---|
+| `orders.order_lines` | order_line_id(UNIQUE store+po+行号) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail) | returns… 订单拉取工作流 + order_audit 回写审核 |
+| `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
+| `orders.perf_events` | (store, po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (store,po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
+| `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
+
+视图:
+- `orders.settlement_by_line` — 跨账期合并 + 入账状态推导(net>0 已入账 / net<0 已冲销 / net=0 且 gross>0 已退款 / 其余待入账;金额 round6 吸收浮点相消误差——实证 +52.68-52.68 = 4.44e-16 会误判);
+- `orders.order_center` — 订单中心主视图:销售行 LEFT JOIN 售后聚合/绩效指标聚合/入账状态(采购信息是人工域,留在飞书 bitable,不进 PG)。
+
+完整列清单见 `refdata/schema.sql`。旧 po 级表 `orders.orders`(空表)保留待确认后删除,新代码禁止写入。
 
 ## ops — 运行域(状态与业务同库,可同事务修改)
 

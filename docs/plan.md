@@ -89,6 +89,14 @@
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
+
+**订单域地基(2026-08-06,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/对账明细
+四链路统一行级建模——`order_line_id = ol_+sha256(店铺+PO+行号)[:24]`,与旧仓库
+codex/order-center-v1 同构可互查。已就绪:orders.order_lines/return_lines/perf_events
+/settlement_lines 四表 + settlement_by_line/order_center 视图;api/returns.py(时间窗
+成对+cursor 拼 URL 实证);recon 明细改走 CSV 端点(JSON 每期截断 1000 行实证弃用);
+services/order_lines.py 三源归一化积木。绩效跨周期:perf_events 按 (store,po,metric,period)
+逐周期累积,当期/累计口径由查询决定;绩效报表无行号,order_line_id 仅单行订单回填。
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 
 旧仓库中**不迁移**:tools/ 的 10 个救场脚本(**不含 sync_online_products.py**,

@@ -97,7 +97,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/orders | 5000/min | 一致 | 3000/min |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
-| reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min |
+| reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min;**明细只准走 CSV 端点 reconFile**(ZIP 包,Accept: application/octet-stream,text/csv 406)——reconFileJson 每账期硬截断 1000 行且 offset 只收 0,nextOffset 是字节偏移,超千行账期必丢数据(订单中心v1 2026-08-04 实证) |
 | insights performance summary/report | **1/min/端点**;unpublished items/counts **100/min**;listingQuality score 10/hour | CLAUDE.md"Insights 全部 1/分钟"**不准确** | 按端点分档登记 |
 | GET /v3/settings/partnerprofile | 50/min | 一致 | 40/min + lru_cache |
 | DELETE /v3/items/{sku}(单品 retire) | 900/min | 全仓未用过 | 预留登记 |
@@ -143,8 +143,11 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
    逐状态 5 轮降级为对拍/回退用(api/items.py _SWEEP_MODES)。
 2. **orders 型(cursor 即 URL 后缀)**:meta.nextCursor 返回带 `?` 的完整 query 串,
    直接拼在 /v3/orders 后;单店内**必须串行**翻页。
-3. **returns 型(cursor 即 query 串,需解析)**:meta.nextCursor 形如
-   `?sellerId=...&limit=200&offset=200`,用 parse_qs 解析后并入 params 重发。
+3. **returns 型(与 orders 同款,2026-08-06 实证修正)**:meta.nextCursor 形如
+   `?sellerId=...&limit=200&offset=200`,**直接拼 URL 重发**(parse_qs 拆参重发
+   会被服务端忽略未知参数、原样返回第一页——订单中心v1 实证,原"需解析"描述作废);
+   时间过滤可用但 returnCreationStartDate/EndDate **必须成对**,只传 start 返 400
+   (legacy_survey"不支持时间过滤"结论过时);同 cursor 重复出现=服务端未推进,立即停。
 4. **inventories 型(透明 cursor,严格串行)**:meta.nextCursor 透明 token;
    终止**只能看 cursor 是否为空,不能看页长**(某页可能 <limit 但仍有下页,历史 bug);
    2026-05-15 起单店 cursor 强制串行;limit 上限 50。

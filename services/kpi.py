@@ -86,10 +86,15 @@ def extract_settlement(statement: dict) -> dict:
     scheduledSettlementAmount > totalPayable > (期末余额-备用金) 的优先级取,
     首轮对拍若与旧表不一致,以旧表反推字段后修正此函数。
     """
-    acct = statement.get("accountSummary") or {}
-    seller_info = statement.get("sellerInfo") or {}
-    url = statement.get("storeFrontUrl") or ""
+    # 2026-08-06 对拍实证:固定顶层路径取不到(真实响应嵌套更深),partner_id/
+    # paymentStatus 靠递归搜索命中 → 所有字段统一改递归查找,不再假设层级
+    acct = _find_key(statement, "accountSummary") or {}
+    seller_info = _find_key(statement, "sellerInfo") or {}
+    url = str(_find_key(statement, "storeFrontUrl") or "")
     m = _SELLER_ID_RE.search(url)
+    if not acct:
+        logger.warning("payment/statement 找不到 accountSummary,顶层键:%s",
+                       sorted(statement.keys()) if isinstance(statement, dict) else type(statement))
 
     closing = _num(_find_key(acct, "closingBalance"))
     reserve_to_date = abs(_num(_find_key(acct, "reserveToDate")))
@@ -109,9 +114,8 @@ def extract_settlement(statement: dict) -> dict:
         payout = 0.0
     no_hold = bool(is_active and payout >= closing)
 
-    tx = statement.get("transactionDetails") or {}
-    sale_agg = tx.get("saleAggregate") or {}
-    refund = statement.get("refundDetails") or tx.get("refundDetails") or {}
+    sale_agg = _find_key(statement, "saleAggregate") or {}
+    refund = _find_key(statement, "refundDetails") or {}
 
     return {
         "partner_id": str(statement.get("partnerId")

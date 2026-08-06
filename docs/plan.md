@@ -122,6 +122,10 @@ catalog,pipeline 代码留在旧仓库归档。
 
 ### Phase 3 — 旧系统退役
 
+- [ ] **--execute 默认值切换**(所有者定稿 2026-08-06):迁移期间危险工作流
+      保持默认 dry-run(真跑需 --execute);全部工作流正式上线后统一评估
+      改为默认真执行(届时同步修订 CLAUDE.md 安全铁律条文与各调度命令)
+
 - [ ] 全部工作流切换完成后,旧仓库 launchd/scheduled-tasks 清空,旧仓库转只读归档
 - [ ] erp_listing_server / erp_web / erp_worker(旧 ERP 链路)不属于本次迁移,
       维持现状直至被替代

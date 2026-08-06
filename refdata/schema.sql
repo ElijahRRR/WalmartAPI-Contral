@@ -367,6 +367,23 @@ CREATE TABLE IF NOT EXISTS ops.feed_log (
 CREATE UNIQUE INDEX IF NOT EXISTS feed_log_dedupe_uidx ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
+CREATE TABLE IF NOT EXISTS ops.feed_items (
+    -- feed 的 SKU 级台账(所有 feed 操作共用):提交时落行,feed_poll 轮询落终态。
+    -- SKU 级状态的权威在此,飞书各驱动表的"结果"列只是投影(2026-05-07 教训)
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    workflow    text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    status      text NOT NULL,     -- submitted / success / failed / missing(明细里查无此 SKU)
+    error_code  text,
+    submitted_at timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    PRIMARY KEY (feed_id, sku)
+);
+CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
+CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
+
 CREATE TABLE IF NOT EXISTS ops.cursors (
     name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
     value       jsonb NOT NULL,

@@ -34,7 +34,7 @@ from datetime import datetime
 
 from api import feeds, feishu
 from registry import resources
-from services import kpi, stores as stores_svc
+from services import feed_track, kpi, stores as stores_svc
 
 DANGEROUS = True
 
@@ -96,26 +96,20 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
         store = stores_by_name.get(frows[0]["store"])
         if store is None:
             continue
+        if not execute:
+            # dry-run 连台账都不动:feed_items/feed_log 的落定交给 --execute
+            # 或 feed_poll;这里只报告在途数量
+            still += len(frows)
+            continue
         try:
-            head = feeds.get_feed_status(store, feed_id)
+            # 统一轮询积木:SKU 终态落 ops.feed_items 权威台账 + feed_log 落终态
+            sku_status = feed_track.poll_feed(store, feed_id)
         except Exception as e:
             logger.warning("feed %s 状态查询失败,本轮跳过: %s", feed_id, e)
             continue
-        if head.get("feedStatus") not in feeds.FEED_TERMINAL:
+        if sku_status is None:
             still += len(frows)
             continue
-        sku_status: dict[str, tuple[str, str]] = {}
-        for item in feeds.iter_feed_items(store, feed_id):
-            code = ""
-            errs = item.get("ingestionErrors") or {}
-            errlist = errs.get("ingestionError") or []
-            if errlist:
-                code = str(errlist[0].get("code") or errlist[0].get("type") or "")
-            sku_status[str(item.get("sku") or "")] = (
-                feeds.sku_outcome(item.get("ingestionStatus")), code)
-        ok_all = head.get("feedStatus") == "PROCESSED"
-        if execute:
-            feeds.mark_feed_done(feed_id, ok_all)
         for r in frows:
             outcome, code = sku_status.get(r["sku"], ("missing", ""))
             result = {"success": "成功", "failed": f"失败:{code}" if code else "失败",

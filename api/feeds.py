@@ -169,6 +169,24 @@ def mark_feed_done(feed_id: str, ok: bool) -> None:
                      "WHERE feed_id = %s", ("done" if ok else "failed", feed_id))
 
 
+def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
+    if feed_type == "MP_MAINTENANCE":
+        return [str(e.get("sku") or "") for e in chunk]
+    return [str(s) for s in chunk]
+
+
+def _items_record(feed_id: str, workflow: str, store_name: str,
+                  feed_type: str, skus: list[str]) -> None:
+    """提交成功即落 SKU 级台账(ops.feed_items,status=submitted);
+    终态由 services/feed_track 轮询回写。SKU 级状态权威在库,飞书只是投影。"""
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO ops.feed_items (feed_id, sku, workflow, store, feed_type, "
+            "status) VALUES (%s, %s, %s, %s, %s, 'submitted') "
+            "ON CONFLICT (feed_id, sku) DO NOTHING",
+            [(feed_id, s, workflow, store_name, feed_type) for s in skus if s])
+
+
 # ── 提交(唯一入口)────────────────────────────────────────────────────────────
 
 def submit_feed(store: dict, feed_type: str, entries: list, *,
@@ -192,7 +210,7 @@ def submit_feed(store: dict, feed_type: str, entries: list, *,
             results.append({"feed_id": prev["feed_id"], "count": len(chunk),
                             "outcome": "dedup"})
             continue
-        results.append(_submit_one(store, feed_type, chunk, log_id))
+        results.append(_submit_one(store, feed_type, chunk, log_id, workflow))
     return results
 
 
@@ -206,16 +224,23 @@ def _post(store: dict, feed_type: str, payload: dict):
         timeout=120)
 
 
-def _submit_one(store: dict, feed_type: str, chunk: list, log_id) -> dict:
+def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
+                workflow: str = "") -> dict:
     payload = build_payload(feed_type, chunk)
+    skus = _chunk_skus(feed_type, chunk)
+
+    def _ok(feed_id: str) -> dict:
+        _log_update(log_id, "submitted", feed_id)
+        _items_record(feed_id, workflow, store["name"], feed_type, skus)
+        return {"feed_id": feed_id, "count": len(chunk), "outcome": "submitted"}
+
     status, _, data = _post(store, feed_type, payload)
     n = len(chunk)
 
     if status == 200 and data and data.get("feedId"):
-        _log_update(log_id, "submitted", data["feedId"])
         logger.info("feed 提交成功:%s %s %d 条 feedId=%s",
                     store["name"], feed_type, n, data["feedId"])
-        return {"feed_id": data["feedId"], "count": n, "outcome": "submitted"}
+        return _ok(data["feedId"])
 
     if status is not None:
         # 服务端明确拒绝(4xx/5xx):没提交上,落 failed,绝不自动换姿势重试
@@ -227,17 +252,15 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id) -> dict:
     # 网络异常(status=None):不知道到没到 → 反查三态
     verdict, feed = find_recent_feed(store, feed_type, n)
     if verdict == "FOUND":
-        _log_update(log_id, "submitted", feed["feedId"])
         logger.warning("feed 网络异常但反查已达:%s %s feedId=%s(收编,不补交)",
                        store["name"], feed_type, feed["feedId"])
-        return {"feed_id": feed["feedId"], "count": n, "outcome": "submitted"}
+        return _ok(feed["feedId"])
     if verdict == "NOT_FOUND":
         logger.warning("feed 网络异常且双确认未达:%s %s,按同一载荷补交一次",
                        store["name"], feed_type)
         status2, _, data2 = _post(store, feed_type, payload)
         if status2 == 200 and data2 and data2.get("feedId"):
-            _log_update(log_id, "submitted", data2["feedId"])
-            return {"feed_id": data2["feedId"], "count": n, "outcome": "submitted"}
+            return _ok(data2["feedId"])
         _log_update(log_id, "failed")
         return {"feed_id": None, "count": n, "outcome": "failed"}
     # UNKNOWN:保持 pending,留给启动对账(query_pending),人不在环时宁停不重

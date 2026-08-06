@@ -3,6 +3,7 @@
 import pytest
 
 from api import feeds, feishu
+from services import feed_track
 from workflows import daily_retire as dr
 
 STORE = {"name": "T1", "client_id": "cid_r", "client_secret": "s", "proxy": None}
@@ -24,16 +25,12 @@ def _env(monkeypatch, sheet_rows, *, stores=(STORE,)):
                  "outcome": "submitted"}]
 
     monkeypatch.setattr(feeds, "submit_feed", fake_submit)
-    monkeypatch.setattr(feeds, "get_feed_status",
-                        lambda store, fid: (calls["polled"].append(fid),
-                                            {"feedStatus": "PROCESSED"})[1])
-    monkeypatch.setattr(feeds, "iter_feed_items", lambda store, fid: iter([
-        {"sku": "OK1", "ingestionStatus": "SUCCESS"},
-        {"sku": "BAD1", "ingestionStatus": "DATA_ERROR",
-         "ingestionErrors": {"ingestionError": [{"code": "ERR_X"}]}},
-    ]))
-    monkeypatch.setattr(feeds, "mark_feed_done",
-                        lambda fid, ok: calls["done"].append((fid, ok)))
+
+    def fake_poll(store, fid):
+        calls["polled"].append(fid)
+        return {"OK1": ("success", ""), "BAD1": ("failed", "ERR_X")}
+
+    monkeypatch.setattr(feed_track, "poll_feed", fake_poll)
     return calls
 
 
@@ -84,7 +81,6 @@ def test_poll_writes_terminal_results_and_skips_failed_rows(monkeypatch):
     assert results["E2:G2"] == "成功"
     assert results["E3:G3"] == "失败:ERR_X"
     assert results["E4:G4"] == "未查到"
-    assert calls["done"] == [("F1", True)]
 
 
 def test_slice_rows_get_matching_feed_ids(monkeypatch):

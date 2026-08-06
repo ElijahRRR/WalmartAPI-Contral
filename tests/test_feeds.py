@@ -53,6 +53,9 @@ class _LogDB:
         self.sqls.append((sql, args))
         self._last = sql
 
+    def executemany(self, sql, rows):
+        self.sqls.append((sql, list(rows)))
+
     def fetchone(self):
         if "INSERT INTO ops.feed_log" in self._last:
             return (1,) if self.claim else None

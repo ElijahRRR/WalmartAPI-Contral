@@ -204,6 +204,22 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
+CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
+    feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)
+    sku         text NOT NULL,
+    workflow    text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    status      text NOT NULL,      -- submitted / success / failed / missing
+    error_code  text,
+    submitted_at timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    PRIMARY KEY (feed_id, sku)
+);
+-- 终态由 services/feed_track 轮询回写(feed_poll 工作流全局扫,业务工作流也可
+-- 单 feed 轮询);SKU 级状态权威在此,飞书驱动表的"结果"列只是投影。
+-- 停用/删除/设置到期日期 + 未来的上架/改价/改库存/改标题 feed 全走这一套。
+
 CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
     table_id    text NOT NULL,      -- 飞书 table_id
     row_key     text NOT NULL,      -- 行去重键(order_line_id / 唯一键 / perf_key)

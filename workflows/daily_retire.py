@@ -17,7 +17,11 @@
                           即重新排队——feeds 层 failed 记录允许同载荷重占)
 
 动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复);
-删除 → DELETE_ITEM(永久,仅自发货)。提交走 api/feeds 唯一通道
+删除或 **C 列留空 → DELETE_ITEM**(永久,仅自发货)。提交走 api/feeds 唯一通道
+
+单店单日上限:优先读上下架限额表(registry.RETIRE_LIMITS,按店铺分行,
+「下架限制」列);店铺不在表内退 -p limit 默认值并**告警**(旧系统静默兜底
+300 无告警,店铺名拼错就漏放,已修);限额表未登记时全店统一 -p limit。
 (切片/三层防重/反查三态),状态权威在 ops.feed_log,飞书 E~G 只是展示
 ——旧系统"状态只存飞书三列"的结构性风险(2026-05-07 事故根源)就此消除。
 
@@ -36,7 +40,9 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.daily_retire")
 
-_ACTIONS = {"停用": "RETIRE_ITEM", "下架": "RETIRE_ITEM", "删除": "DELETE_ITEM"}
+# C 列留空默认删除(所有者定稿 2026-08-06)
+_ACTIONS = {"停用": "RETIRE_ITEM", "下架": "RETIRE_ITEM",
+            "删除": "DELETE_ITEM", "": "DELETE_ITEM"}
 _POLLABLE = ("", "处理中")          # G 列这些值才轮询;失败/未查到不自动重试
 _COL_WRITE_START = "E"             # 程序回写区 E:G
 
@@ -123,8 +129,32 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
     return updates, lines
 
 
-def _submit_new(rows: list[dict], stores_by_name: dict, limit: int,
-                execute: bool) -> tuple[list, list[str]]:
+def _load_limits(default: int) -> tuple[dict[str, int], str]:
+    """输入:默认上限 → 输出:({店铺: 单日下架上限}, 摘要说明)。
+
+    读上下架限额表「下架限制」列;未登记时返回空表(全店走默认)。
+    """
+    t = resources.RETIRE_LIMITS
+    f = t.fields
+    try:
+        recs = feishu.list_records(t, field_names=[f.store, f.max_daily_retire])
+    except LookupError:
+        return {}, f"限额表未登记,全店统一上限 {default}"
+    limits: dict[str, int] = {}
+    for rec in recs:
+        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        try:
+            v = int(float(feishu._plain_text(rec["fields"].get(f.max_daily_retire))
+                          or 0))
+        except ValueError:
+            v = 0
+        if name and v > 0:
+            limits[name] = v
+    return limits, f"限额表生效({len(limits)} 店)"
+
+
+def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
+                default_limit: int, execute: bool) -> tuple[list, list[str]]:
     """待提交行 → 按 店铺×动作 分组提交(受单店单日上限),回写 E~G。"""
     updates, lines = [], []
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
@@ -144,6 +174,12 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limit: int,
 
     submitted = deferred = 0
     for store_name, srows in by_store.items():
+        limit = limits.get(store_name)
+        if limit is None:
+            if limits:      # 限额表在用但查不到该店:旧系统在这里静默兜底,已改告警
+                logger.warning("店铺 %s 不在限额表,按默认上限 %d(请核对店铺名拼写)",
+                               store_name, default_limit)
+            limit = default_limit
         take, defer = srows[:limit], srows[limit:]
         deferred += len(defer)
         by_action: dict[str, list[dict]] = {}
@@ -183,7 +219,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limit: int,
 def run(params: dict) -> str:
     """输入:params(execute/limit/store)→ 输出:轮询+提交结果摘要。"""
     execute = bool(params.get("execute"))
-    limit = int(params.get("limit", 300))
+    default_limit = int(params.get("limit", 300))
 
     rows = _read_rows()
     if not rows:
@@ -194,13 +230,16 @@ def run(params: dict) -> str:
 
     names = sorted({r["store"] for r in rows})
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores(names)}
+    limits, limits_note = _load_limits(default_limit)
 
     updates_a, lines_a = _poll_feeds(rows, stores_by_name, execute)
-    updates_b, lines_b = _submit_new(rows, stores_by_name, limit, execute)
+    updates_b, lines_b = _submit_new(rows, stores_by_name, limits,
+                                     default_limit, execute)
     written = _writeback(updates_a + updates_b, execute)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
-    lines = [f"{mode}daily_retire:表内 {len(rows)} 行"] + lines_a + lines_b
+    lines = [f"{mode}daily_retire:表内 {len(rows)} 行({limits_note})"] \
+        + lines_a + lines_b
     if execute:
         lines.append(f"回写 {written} 行")
     return "\n".join(lines)

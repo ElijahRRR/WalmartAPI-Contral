@@ -244,18 +244,18 @@ RETIRE_SHEET = Spreadsheet(
     columns=("store", "sku", "action", "reason", "feed_id", "op_date", "result"),
 )
 
-# 上下架限额表(多维表格,按产品类型分行;daily_retire 读「单日最大下架数量」,
-# 未来 listing 读「单日最大上架数量」等)
+# 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
+# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
 RETIRE_LIMITS = Bitable(
     name="上下架限额表",
     app_token=os.environ.get("FEISHU_LIMITS_APP_TOKEN", ""),
     table_id=os.environ.get("FEISHU_LIMITS_TABLE_ID", ""),
     fields=_fields(
-        product_type="产品类型",
+        store="店铺",
         fba_range1="fba区间1", fba_range2="fba区间2",
         fbm_range1="FBM区间1", fbm_range2="FBM区间2",
-        max_daily_list="单日最大上架数量",
-        max_daily_retire="单日最大下架数量",
+        max_daily_list="上架限制",
+        max_daily_retire="下架限制",
         inventory_note="库存特殊要求",
     ),
 )

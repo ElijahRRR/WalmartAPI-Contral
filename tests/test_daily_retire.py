@@ -98,3 +98,28 @@ def test_slice_rows_get_matching_feed_ids(monkeypatch):
     dr.run({"execute": True})
     w = {rng: vals[0] for rng, vals in calls["write"]}
     assert w["E2:G2"][0] == "FA" and w["E3:G3"][0] == "FB"  # 行↔切片一一对应
+
+
+def test_empty_action_defaults_to_delete(monkeypatch):
+    # C 列留空默认删除(所有者定稿)
+    calls = _env(monkeypatch, [["T1", "S1", "", "清理"]])
+    dr.run({"execute": True})
+    assert calls["submit"] == [("T1", "DELETE_ITEM", ["S1"])]
+
+
+def test_limits_table_per_store_cap(monkeypatch, caplog):
+    import logging as _logging
+    rows = [["T1", f"S{i}", "删除", ""] for i in range(4)] + \
+           [["T2", "X1", "删除", ""]]
+    store2 = {"name": "T2", "client_id": "cid_r2", "client_secret": "s", "proxy": None}
+    calls = _env(monkeypatch, rows, stores=(STORE, store2))
+    monkeypatch.setattr(feishu, "list_records", lambda t, field_names=None: [
+        {"record_id": "r1", "fields": {"店铺": "T1", "下架限制": 2}},
+    ])
+    with caplog.at_level(_logging.WARNING, logger="workflows.daily_retire"):
+        out = dr.run({"execute": True})
+    subs = {(s, ft): skus for s, ft, skus in calls["submit"]}
+    assert subs[("T1", "DELETE_ITEM")] == ["S0", "S1"]      # 限额表 2 生效
+    assert subs[("T2", "DELETE_ITEM")] == ["X1"]            # 不在表内走默认
+    assert any("不在限额表" in m for m in caplog.messages)   # 兜底必须告警
+    assert "限额表生效" in out

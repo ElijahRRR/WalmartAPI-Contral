@@ -384,6 +384,38 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
     return len(rows)
 
 
+def perf_rows_from_problems(store_name: str, metric: str, rows: list[dict],
+                            period: str) -> tuple[list[dict], int]:
+    """输入:店铺+指标键+parse_problem_report 行+周期 → 输出:(perf_events 行, 无 PO 跳过数)。
+
+    period = 拉取日(报表是当时滚动窗口的快照,按日累积即可支撑 still_active 判定);
+    无 PO 号的行无法建键,跳过并计数(调用方记日志——兜底不许静默)。
+    """
+    out, skipped = [], 0
+    for r in rows:
+        po = str(r.get("po_no") or "").strip()
+        if not po:
+            skipped += 1
+            continue
+        accountable = str(r.get("accountable", "")).startswith("✅")
+        out.append({"store": store_name, "po_id": po, "metric": metric,
+                    "period": str(period),
+                    "sku": (str(r.get("sku") or "").strip() or None),
+                    "accountable": accountable,
+                    "status": "违规" if accountable else "不计入",
+                    "detail": r.get("raw")})
+    return out, skipped
+
+
+def pick_new_periods(available: list[str], have: set[str], limit: int) -> list[str]:
+    """输入:可用账期(MMDDYYYY)+已入库账期集合+上限 → 输出:待拉账期(旧→新,最近 limit 个)。
+
+    账期文件是关账快照(不可变),已入库的不重拉;MMDDYYYY 按 YYYY+MMDD 排序。
+    """
+    todo = [d for d in available if d not in have]
+    return sorted(todo, key=lambda d: d[4:] + d[:4])[-limit:]
+
+
 def backfill_perf_line_ids(conn) -> int:
     """输入:连接 → 输出:回填总行数。
 

@@ -178,6 +178,7 @@ _HEADER_MAP = (
     (("sales order",), "sales_order_no"),
     (("po #", "po#", "purchase order"), "po_no"),
     (("order date", "order placed"), "order_date"),
+    (("sku",), "sku"),          # 放 item 前:列名"Item SKU"应归 sku 而非商品名
     (("item", "product"), "item"),
     (("carrier",), "carrier"),
     (("tracking",), "tracking_no"),
@@ -220,7 +221,7 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
             row = {"indicator": label, "sub_category": sub_category,
                    "accountable": accountable,
                    "sales_order_no": "", "po_no": "", "order_date": "",
-                   "item": "", "carrier": "", "tracking_no": "",
+                   "sku": "", "item": "", "carrier": "", "tracking_no": "",
                    "description": "", "note": "",
                    "raw": json.dumps(rec, ensure_ascii=False)[:2000]}
             desc_parts = []

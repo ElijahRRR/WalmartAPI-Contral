@@ -1,11 +1,18 @@
 """daily_report — 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。
 
 用法:
-  python cli.py daily_report                       # 全部阶段(kpi → problems),不推送
+  python cli.py daily_report                       # 全部阶段(kpi → problems → settlement)
   python cli.py daily_report -p phase=kpi          # 只采集 KPI
-  python cli.py daily_report -p phase=problems     # 只拉问题订单
+  python cli.py daily_report -p phase=problems     # 问题订单(兼写订单中心 perf_events)
+  python cli.py daily_report -p phase=settlement   # 对账明细 → orders.settlement_lines
+  python cli.py daily_report -p phase=settlement -p periods=99   # 首次可放开账期上限(默认 6)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
-  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/problems 阶段)
+  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/problems/settlement 阶段)
+
+订单中心接线(2026-08-06):problems 阶段解析出的问题订单同时按
+(po, metric, period=拉取日) 累积进 orders.perf_events 并回填订单行;
+settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
+(关账快照不可变,已入库账期不重拉)。
 
 与旧系统的关键差异(设计决策见 docs/legacy_survey.md #daily_report 迁移建议):
 - PG 是权威(ops.store_kpi_daily / ops.perf_problem_orders),飞书降级为展示层
@@ -28,7 +35,7 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths
-from services import kpi, stores as stores_svc
+from services import kpi, order_lines, stores as stores_svc
 
 DANGEROUS = False
 
@@ -227,10 +234,10 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
 
 
 def _phase_problems(store_list: list[dict], data_date) -> str:
-    total_new, total_rows, failed = 0, 0, []
+    total_new, total_rows, total_perf, total_no_po, failed = 0, 0, 0, 0, []
 
-    def _one_store(store: dict) -> tuple[int, int]:
-        rows_all = []
+    def _one_store(store: dict) -> tuple[int, int, int, int]:
+        by_metric: list[tuple[str, list[dict]]] = []
         for m in insights.METRICS:
             try:
                 blob = insights.performance_report(store, m)
@@ -238,8 +245,10 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
                 logger.warning("店铺 %s %s report 拉取失败: %s", store["name"], m, e)
                 continue
             if blob:
-                rows_all.extend(kpi.parse_problem_report(m, blob))
-        inserted = 0
+                by_metric.append((m, kpi.parse_problem_report(m, blob)))
+
+        inserted = perf_written = no_po = 0
+        rows_all = [r for _, rs in by_metric for r in rs]
         if rows_all:
             with db.pg_conn() as conn, conn.cursor() as cur:
                 for r in rows_all:
@@ -247,24 +256,80 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
                                 {**r, "store": store["name"],
                                  "first_seen_date": data_date})
                     inserted += cur.rowcount
-        return len(rows_all), inserted
+                # 订单中心:逐周期累积进 orders.perf_events(period=拉取日)
+                for m, rs in by_metric:
+                    perf_rows, skipped = order_lines.perf_rows_from_problems(
+                        store["name"], m, rs, str(data_date))
+                    perf_written += order_lines.upsert_perf_events(conn, perf_rows)
+                    no_po += skipped
+        if no_po:
+            logger.warning("店铺 %s 有 %d 行问题订单无 PO 号,perf_events 未建键",
+                           store["name"], no_po)
+        return len(rows_all), inserted, perf_written, no_po
 
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:
-                parsed, inserted = f.result()
+                parsed, inserted, perf_written, no_po = f.result()
                 total_rows += parsed
                 total_new += inserted
+                total_perf += perf_written
+                total_no_po += no_po
             except (_client.StoreDeadError, httpx.ProxyError) as e:
                 logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
                 failed.append(f"{name}(凭证)")
             except Exception as e:
                 logger.exception("店铺 %s 问题订单失败: %s", name, e)
                 failed.append(name)
+
+    with db.pg_conn() as conn:
+        linked = order_lines.backfill_perf_line_ids(conn)
     line = (f"问题订单:{len(store_list) - len(failed)}/{len(store_list)} 店,"
-            f"解析 {total_rows} 行,新增 {total_new} 条(其余为历史已存在)")
+            f"解析 {total_rows} 行,新增 {total_new} 条;"
+            f"绩效事件 {total_perf} 条(回填订单行 {linked},无 PO 跳过 {total_no_po})")
+    if failed:
+        line += f",失败:{','.join(failed)}"
+    return line
+
+
+def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
+    """对账明细:按店拉取缺失账期(关账快照不可变,已入库不重拉)→ settlement_lines。"""
+    total_periods, total_lines, failed = 0, 0, []
+
+    def _one_store(store: dict) -> tuple[int, int]:
+        name = store["name"]
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT period FROM orders.settlement_lines "
+                        "WHERE store = %s", (name,))
+            have = {r[0] for r in cur.fetchall()}
+        todo = order_lines.pick_new_periods(
+            reports.available_recon_dates(store), have, periods_limit)
+        written = 0
+        for period in todo:
+            rows = list(reports.iter_recon_records(store, period))
+            recs = order_lines.aggregate_settlement_lines(name, rows, period)
+            with db.pg_conn() as conn:
+                written += order_lines.upsert_settlement_lines(conn, recs)
+        return len(todo), written
+
+    with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
+        futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
+        for f in as_completed(futs):
+            name = futs[f]
+            try:
+                periods, written = f.result()
+                total_periods += periods
+                total_lines += written
+            except (_client.StoreDeadError, httpx.ProxyError) as e:
+                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
+                failed.append(f"{name}(凭证)")
+            except Exception as e:
+                logger.exception("店铺 %s 对账明细失败: %s", name, e)
+                failed.append(name)
+    line = (f"对账明细:{len(store_list) - len(failed)}/{len(store_list)} 店,"
+            f"新账期 {total_periods} 个,入库 {total_lines} 行")
     if failed:
         line += f",失败:{','.join(failed)}"
     return line
@@ -310,12 +375,12 @@ def _phase_push(data_date, do_push: bool) -> str:
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "problems", "push"):
-        return f"phase 只接受 all/kpi/problems/push,收到:{phase}"
+    if phase not in ("all", "kpi", "problems", "settlement", "push"):
+        return f"phase 只接受 all/kpi/problems/settlement/push,收到:{phase}"
     data_date = datetime.now(kpi.CN_TZ).date()
 
     lines = []
-    if phase in ("all", "kpi", "problems"):
+    if phase in ("all", "kpi", "problems", "settlement"):
         names = [params["store"]] if params.get("store") else None
         store_list = stores_svc.load_stores(names)
         if not store_list:
@@ -324,6 +389,9 @@ def run(params: dict) -> str:
             lines.append(_phase_kpi(store_list, data_date))
         if phase in ("all", "problems"):
             lines.append(_phase_problems(store_list, data_date))
+        if phase in ("all", "settlement"):
+            lines.append(_phase_settlement(
+                store_list, int(params.get("periods", 6))))
     if phase == "push":
         do_push = str(params.get("push", "")) in ("1", "true", "yes")
         lines.append(_phase_push(data_date, do_push))

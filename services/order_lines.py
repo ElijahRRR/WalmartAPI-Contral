@@ -1,7 +1,11 @@
 """订单域行级积木:行标识生成 + 三源(orders/returns/recon)归一化 + PG 写入。
 
-行标识与旧仓库「订单中心v1」完全同构(哈希输入逐字节一致,两系统 ID 可互查):
-    order_line_id = 'ol_' + sha256(store + '\\x1f' + po + '\\x1f' + line)[:24]
+行标识(2026-08-06 定稿,v2):
+    order_line_id = 'ol_' + sha256(po + '\\x1f' + line)[:24]
+
+⚠ 与旧仓库订单中心v1 的差异——**店铺不参与哈希**:PO 号是沃尔玛发的、平台
+全局唯一,而店铺名是我们自己的标签(飞书凭证表),改名/换人是真实运营事件,
+参与哈希会让改名瞬间作废全部行标识。店铺仍存列+索引,只做归属不做身份。
 
 解析逻辑逐条移植自 订单中心v1 的 sync_sales / sync_aftersales / sync_finance
 (2026-08 生产实测),踩坑注释随代码保留。供 order_audit / returns_sync /
@@ -18,9 +22,9 @@ logger = logging.getLogger("services.order_lines")
 
 # ── 行标识 ────────────────────────────────────────────────────────────────────
 
-def make_order_line_id(store: str, po: str, line) -> str:
-    """输入:店铺名 + PO 号 + 行号 → 输出:稳定行标识(与订单中心v1 同构)。"""
-    raw = f"{store}\x1f{po}\x1f{norm_line(line)}"
+def make_order_line_id(po: str, line) -> str:
+    """输入:PO 号 + 行号 → 输出:稳定行标识(店铺不参与身份,见模块 docstring)。"""
+    raw = f"{po}\x1f{norm_line(line)}"
     return "ol_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -132,7 +136,7 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
         refund_amt, refund_note = _parse_refund(ol)
 
         rows.append({
-            "order_line_id": make_order_line_id(store_name, po, line_no),
+            "order_line_id": make_order_line_id(po, line_no),
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(order.get("customerOrderId") or ""),
             "sku": str((ol.get("item") or {}).get("sku") or ""),
@@ -207,7 +211,7 @@ def flatten_return_lines(store_name: str, return_order: dict) -> list[dict]:
             refunded = refunded.get("amount") or refunded.get("measurementValue")
         rows.append({
             "return_order_id": rma,
-            "order_line_id": make_order_line_id(store_name, po, line_no),
+            "order_line_id": make_order_line_id(po, line_no),
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(o.get("customerOrderId") or ""),
             "sku": str((line.get("item") or {}).get("sku") or ""),
@@ -270,7 +274,7 @@ def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str) -
                           for r in group
                           if str(r.get("Commission Incentive Program") or "").strip()), None)
         records.append({
-            "order_line_id": make_order_line_id(store_name, po, line),
+            "order_line_id": make_order_line_id(po, line),
             "period": period,
             "store": store_name, "po_id": po, "line_number": norm_line(line),
             "net_amount": _sum(lambda r: True),
@@ -367,7 +371,7 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
             (store, po_id, metric, period, order_line_id, sku, accountable, status, detail)
         VALUES (%(store)s, %(po_id)s, %(metric)s, %(period)s, %(order_line_id)s,
                 %(sku)s, %(accountable)s, %(status)s, %(detail)s::jsonb)
-        ON CONFLICT (store, po_id, metric, period) DO UPDATE SET
+        ON CONFLICT (po_id, metric, period) DO UPDATE SET
             order_line_id = COALESCE(EXCLUDED.order_line_id, orders.perf_events.order_line_id),
             sku = COALESCE(EXCLUDED.sku, orders.perf_events.sku),
             accountable = EXCLUDED.accountable, status = EXCLUDED.status,
@@ -384,28 +388,28 @@ def backfill_perf_line_ids(conn) -> int:
     """输入:连接 → 输出:回填总行数。
 
     绩效报表无行号但多数带商品列(实证),两段式回填,只在无歧义时落子:
-    ① 事件带 SKU → 按 (store, po_id, sku) 匹配,该 SKU 在此单恰好一行才回填
+    ① 事件带 SKU → 按 (po_id, sku) 匹配,该 SKU 在此单恰好一行才回填
        (多行订单也能关联上——这是 SKU 相对行号真正的价值点);
     ② 事件无 SKU → 该 PO 在 order_lines 恰好一行时回填。
-    两段都对不上的保持 NULL,宁缺毋错。
+    PO 全局唯一,店铺不参与匹配;两段都对不上的保持 NULL,宁缺毋错。
     """
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE orders.perf_events p
             SET order_line_id = l.order_line_id
-            FROM (SELECT store, po_id, sku, min(order_line_id) AS order_line_id
-                  FROM orders.order_lines GROUP BY store, po_id, sku
+            FROM (SELECT po_id, sku, min(order_line_id) AS order_line_id
+                  FROM orders.order_lines GROUP BY po_id, sku
                   HAVING count(*) = 1) l
             WHERE p.order_line_id IS NULL AND p.sku IS NOT NULL AND p.sku <> ''
-              AND p.store = l.store AND p.po_id = l.po_id AND p.sku = l.sku
+              AND p.po_id = l.po_id AND p.sku = l.sku
         """)
         by_sku = cur.rowcount
         cur.execute("""
             UPDATE orders.perf_events p
             SET order_line_id = l.order_line_id
-            FROM (SELECT store, po_id, min(order_line_id) AS order_line_id
-                  FROM orders.order_lines GROUP BY store, po_id HAVING count(*) = 1) l
+            FROM (SELECT po_id, min(order_line_id) AS order_line_id
+                  FROM orders.order_lines GROUP BY po_id HAVING count(*) = 1) l
             WHERE p.order_line_id IS NULL
-              AND p.store = l.store AND p.po_id = l.po_id
+              AND p.po_id = l.po_id
         """)
         return by_sku + cur.rowcount

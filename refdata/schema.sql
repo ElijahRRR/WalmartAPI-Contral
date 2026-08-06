@@ -131,11 +131,25 @@ CREATE TABLE IF NOT EXISTS listing.upc_pool (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- ── orders:订单域(行级统一建模,2026-08-06 定稿)────────────────────────────
--- 行标识与旧仓库 订单中心v1 完全同构,两系统 ID 可互查:
---   order_line_id = 'ol_' + sha256(store + \x1f + po_id + \x1f + line_number)[:24]
--- 用行号而非 SKU:orders/returns/recon 三源都原生带行号(官方行级主键),
--- SKU 存列并建索引供业务查询。生成函数唯一出处 services/order_lines.py。
+-- ── orders:订单域(行级统一建模,2026-08-06 v2 定稿)──────────────────────────
+--   order_line_id = 'ol_' + sha256(po_id + \x1f + line_number)[:24]
+-- 店铺不参与身份:PO 是沃尔玛发的、平台全局唯一;店铺名是我方标签,改名/换人
+-- 会作废含店铺的哈希(订单中心v1 的半成品决策,已弃)。店铺存列只做归属过滤。
+-- 用行号而非 SKU 做身份:三源原生带行号(官方行级主键);SKU 的价值在绩效关联
+-- (两段式回填)。生成函数唯一出处 services/order_lines.py。
+
+-- 一次性守卫:v1 试建形态(store 参与 UNIQUE)且尚无写入方 → 直接重建为 v2
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.constraint_column_usage
+             WHERE table_schema = 'orders' AND table_name = 'order_lines'
+               AND constraint_name = 'order_lines_store_po_id_line_number_key') THEN
+    DROP VIEW IF EXISTS orders.order_center, orders.perf_event_spans,
+                        orders.settlement_by_line;
+    DROP TABLE IF EXISTS orders.order_lines, orders.return_lines,
+                         orders.perf_events, orders.settlement_lines;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS orders.order_lines (   -- 销售明细(订单域锚点表)
     order_line_id  text PRIMARY KEY,
@@ -168,8 +182,9 @@ CREATE TABLE IF NOT EXISTS orders.order_lines (   -- 销售明细(订单域锚�
     raw            jsonb,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (store, po_id, line_number)
+    UNIQUE (po_id, line_number)        -- 真正的身份锚点(PO 全局唯一,店铺不参与)
 );
+CREATE INDEX IF NOT EXISTS order_lines_store_idx ON orders.order_lines (store);
 CREATE INDEX IF NOT EXISTS order_lines_po_idx    ON orders.order_lines (po_id);
 CREATE INDEX IF NOT EXISTS order_lines_sku_idx   ON orders.order_lines (sku);
 CREATE INDEX IF NOT EXISTS order_lines_date_idx  ON orders.order_lines (store, order_date DESC);
@@ -215,8 +230,9 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
     detail   jsonb,                    -- 报表原始行
     first_seen_at timestamptz NOT NULL DEFAULT now(),
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (store, po_id, metric, period)
+    PRIMARY KEY (po_id, metric, period)    -- PO 全局唯一,店铺只做归属
 );
+CREATE INDEX IF NOT EXISTS perf_events_store_idx ON orders.perf_events (store, metric, period);
 CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
 -- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (store,po_id,metric))
 

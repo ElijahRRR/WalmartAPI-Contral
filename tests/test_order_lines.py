@@ -41,21 +41,20 @@ def _use(monkeypatch, handler):
                         lambda proxy: httpx.MockTransport(full_handler))
 
 
-# ── 行标识:与订单中心v1 逐字节同构 ───────────────────────────────────────────
+# ── 行标识 v2:(PO, 行号),店铺不参与身份 ─────────────────────────────────────
 
-def test_order_line_id_matches_order_center_v1():
-    # 参照实现(旧仓库 订单中心v1/sync_sales.py:75-77 原样内联)
-    def reference(store, po, line):
-        raw = f"{store}\x1f{po}\x1f{line}"
+def test_order_line_id_v2_semantics():
+    # v2 定稿:身份 = (PO, 行号),店铺不参与——店铺是我方标签,改名不得作废行标识
+    def reference(po, line):
+        raw = f"{po}\x1f{line}"
         return "ol_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
-    assert ol.make_order_line_id("A085朱丽霖", "108888888888", 1) == \
-        reference("A085朱丽霖", "108888888888", "1")
+    assert ol.make_order_line_id("108888888888", 1) == reference("108888888888", "1")
     # int/str/float 形态归一到同一 ID(orders 给 int,returns 给 str,CSV 给 '1')
-    assert (ol.make_order_line_id("S", "PO1", 2)
-            == ol.make_order_line_id("S", "PO1", "2")
-            == ol.make_order_line_id("S", "PO1", "2.0"))
-    assert ol.make_order_line_id("S", "PO1", 1) != ol.make_order_line_id("S", "PO1", 2)
+    assert (ol.make_order_line_id("PO1", 2)
+            == ol.make_order_line_id("PO1", "2")
+            == ol.make_order_line_id("PO1", "2.0"))
+    assert ol.make_order_line_id("PO1", 1) != ol.make_order_line_id("PO1", 2)
 
 
 # ── 源1:订单展开 ─────────────────────────────────────────────────────────────
@@ -90,7 +89,7 @@ def test_extract_order_lines_full_parse():
     rows = ol.extract_order_lines("T1", _ORDER)
     assert len(rows) == 1
     r = rows[0]
-    assert r["order_line_id"] == ol.make_order_line_id("T1", "108000000001", "1")
+    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "1")
     assert r["qty"] == 2 and r["sale_status"] == "Shipped"
     assert r["product_amount"] == 19.99 and r["shipping_amount"] == 5.0
     assert r["refund_amount"] == -19.99 and r["refund_comments"] == "broken"
@@ -120,7 +119,7 @@ def test_flatten_return_lines_new_structure():
     }
     rows = ol.flatten_return_lines("T1", order)
     r = rows[0]
-    assert r["order_line_id"] == ol.make_order_line_id("T1", "108000000001", "1")
+    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "1")
     assert r["return_status"] == "INITIATED" and r["is_keep_it"] is True
     assert r["carrier"] == "FedEx" and r["tracking_no"] == "777"
     assert r["refund_total"] == 25.5 and r["customer_name"] == "Jo Doe"
@@ -282,7 +281,7 @@ def test_upserts_build_conflict_sql():
                                    "metric": "otd", "period": "2026-08-01",
                                    "detail": {"k": "v"}}])
     sql2, rows2 = conn2.cur.calls[0]
-    assert "ON CONFLICT (store, po_id, metric, period)" in sql2
+    assert "ON CONFLICT (po_id, metric, period)" in sql2
     assert "first_seen_at" not in sql2.split("DO UPDATE")[1]   # 首见时间不被覆盖
     assert isinstance(rows2[0]["detail"], str)                 # dict 已序列化
 
@@ -293,8 +292,9 @@ def test_backfill_perf_line_ids_two_stage_sku_first():
     assert total == 6                       # FakeCursor rowcount=3 × 两段
     sku_sql = conn.cur.calls[0][0]
     fallback_sql = conn.cur.calls[1][0]
-    # 第一段:按 (store, po_id, sku) 无歧义匹配(多行订单也能关联——SKU 的价值点)
+    # 第一段:按 (po_id, sku) 无歧义匹配,店铺不参与(PO 全局唯一)
     assert "p.sku = l.sku" in sku_sql and "HAVING count(*) = 1" in sku_sql
+    assert "p.store" not in sku_sql and "p.store" not in fallback_sql
     # 第二段:无 SKU 事件退"该 PO 仅一行"规则;两段都只回填 NULL 行
     assert "p.sku" not in fallback_sql.split("WHERE")[1]
     assert all("order_line_id IS NULL" in s for s in (sku_sql, fallback_sql))

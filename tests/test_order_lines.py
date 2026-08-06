@@ -41,20 +41,21 @@ def _use(monkeypatch, handler):
                         lambda proxy: httpx.MockTransport(full_handler))
 
 
-# ── 行标识 v2:(PO, 行号),店铺不参与身份 ─────────────────────────────────────
+# ── 行标识 v3:(PO, SKU),店铺/行号不参与身份 ─────────────────────────────────
 
-def test_order_line_id_v2_semantics():
-    # v2 定稿:身份 = (PO, 行号),店铺不参与——店铺是我方标签,改名不得作废行标识
-    def reference(po, line):
-        raw = f"{po}\x1f{line}"
+def test_order_line_id_v3_semantics():
+    # v3 定稿:身份 = (PO, SKU)——同一 PO 内同一 SKU 必合并为一行(所有者实证);
+    # 店铺不参与(我方标签,改名不得作废行标识);行号只存列做展示
+    def reference(po, sku):
+        raw = f"{po}\x1f{sku}"
         return "ol_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
-    assert ol.make_order_line_id("108888888888", 1) == reference("108888888888", "1")
-    # int/str/float 形态归一到同一 ID(orders 给 int,returns 给 str,CSV 给 '1')
-    assert (ol.make_order_line_id("PO1", 2)
-            == ol.make_order_line_id("PO1", "2")
-            == ol.make_order_line_id("PO1", "2.0"))
-    assert ol.make_order_line_id("PO1", 1) != ol.make_order_line_id("PO1", 2)
+    assert ol.make_order_line_id("108888888888", "B0X1") == reference("108888888888", "B0X1")
+    # 仅去首尾空白归一;SKU 大小写敏感,不动
+    assert ol.make_order_line_id("PO1", " B0X1 ") == ol.make_order_line_id("PO1", "B0X1")
+    assert ol.make_order_line_id("PO1", "b0x1") != ol.make_order_line_id("PO1", "B0X1")
+    assert ol.make_order_line_id("PO1", "A") != ol.make_order_line_id("PO1", "B")
+    assert ol.norm_line("2.0") == "2"          # 行号归一仍在(展示列用)
 
 
 # ── 源1:订单展开 ─────────────────────────────────────────────────────────────
@@ -90,7 +91,8 @@ def test_extract_order_lines_full_parse():
     rows = ol.extract_order_lines("T1", _ORDER)
     assert len(rows) == 1
     r = rows[0]
-    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "1")
+    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "B0AAAA1111")
+    assert r["line_number"] == "1"             # 行号仍存列做展示
     assert r["qty"] == 2 and r["sale_status"] == "Shipped"
     assert r["product_amount"] == 19.99 and r["shipping_amount"] == 5.0
     assert r["refund_amount"] == -19.99 and r["refund_comments"] == "broken"
@@ -123,7 +125,9 @@ def test_flatten_return_lines_new_structure():
     }
     rows = ol.flatten_return_lines("T1", order)
     r = rows[0]
-    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "1")
+    # 身份用 item.sku(售后行必有),与销售行同 (PO,SKU) → 同一 order_line_id
+    assert r["order_line_id"] == ol.make_order_line_id("108000000001", "B0AAAA1111")
+    assert r["line_number"] == "1"
     assert r["return_status"] == "INITIATED" and r["is_keep_it"] is True
     assert r["carrier"] == "FedEx" and r["tracking_no"] == "777"
     assert r["refund_total"] == 25.5 and r["customer_name"] == "Jo Doe"
@@ -223,6 +227,7 @@ def test_aggregate_settlement_skips_summary_and_rounds():
         {"Purchase Order #": "", "Purchase Order line #": "",       # 汇总行必须跳过
          "Amount": "9999", "Amount Type": ""},
         {"Purchase Order #": "PO1", "Purchase Order line #": "1",
+         "Partner Item Id": "B0X1",                                 # CSV 自带 SKU 列
          "Amount": "52.68", "Amount Type": "Product Price"},
         {"Purchase Order #": "PO1", "Purchase Order line #": "1",   # 全额退款相消
          "Amount": "-52.68", "Amount Type": "Product Price"},
@@ -232,9 +237,10 @@ def test_aggregate_settlement_skips_summary_and_rounds():
         {"Purchase Order #": "PO1", "Purchase Order line #": "1",
          "Amount": "7.9", "Amount Type": "Commission on Product"},
     ]
-    recs = ol.aggregate_settlement_lines("T1", rows, "07142026")
-    assert len(recs) == 1
+    recs, skipped = ol.aggregate_settlement_lines("T1", rows, "07142026")
+    assert len(recs) == 1 and skipped == 0
     r = recs[0]
+    assert r["order_line_id"] == ol.make_order_line_id("PO1", "B0X1")  # SKU 建键
     assert r["net_amount"] == 0.0          # round6 吸掉 4.44e-16 类浮点残渣
     assert r["gross_amount"] > 0
     assert r["commission_rate"] == 15.0
@@ -243,6 +249,21 @@ def test_aggregate_settlement_skips_summary_and_rounds():
     assert ol.settle_status(-1, 1) == "已冲销"
     assert ol.settle_status(0, 0) == "待入账"
     assert str(r["settle_date"]) == "2026-07-14"
+
+
+def test_aggregate_settlement_sku_lookup_fallback_and_skip():
+    # CSV 无 SKU 列:① sku_lookup 按 (po, 行号) 反查命中 → 建键;② 反查也没有 → 跳过计数
+    rows = [
+        {"Purchase Order #": "PO1", "Purchase Order line #": "1",
+         "Amount": "10", "Amount Type": "Product Price"},
+        {"Purchase Order #": "PO2", "Purchase Order line #": "3",
+         "Amount": "20", "Amount Type": "Product Price"},
+    ]
+    recs, skipped = ol.aggregate_settlement_lines(
+        "T1", rows, "07142026", sku_lookup={("PO1", "1"): "B0Y2"})
+    assert len(recs) == 1 and skipped == 1
+    assert recs[0]["order_line_id"] == ol.make_order_line_id("PO1", "B0Y2")
+    assert recs[0]["line_number"] == "1"
 
 
 # ── upsert SQL 形态 ──────────────────────────────────────────────────────────
@@ -296,9 +317,24 @@ def test_backfill_perf_line_ids_two_stage_sku_first():
     assert total == 6                       # FakeCursor rowcount=3 × 两段
     sku_sql = conn.cur.calls[0][0]
     fallback_sql = conn.cur.calls[1][0]
-    # 第一段:按 (po_id, sku) 无歧义匹配,店铺不参与(PO 全局唯一)
-    assert "p.sku = l.sku" in sku_sql and "HAVING count(*) = 1" in sku_sql
+    # 第一段:按 (po_id, sku) 等值连接(v3 下该组合在 order_lines 唯一,无需 HAVING),
+    # 店铺不参与(PO 全局唯一)
+    assert "p.sku = l.sku" in sku_sql and "HAVING" not in sku_sql
     assert "p.store" not in sku_sql and "p.store" not in fallback_sql
     # 第二段:无 SKU 事件退"该 PO 仅一行"规则;两段都只回填 NULL 行
+    assert "HAVING count(*) = 1" in fallback_sql
     assert "p.sku" not in fallback_sql.split("WHERE")[1]
     assert all("order_line_id IS NULL" in s for s in (sku_sql, fallback_sql))
+
+
+def test_extract_warns_on_duplicate_sku_in_one_po(caplog):
+    # 身份前提"同 PO 同 SKU 必合并"被打破时必须告警(兜底不许静默)
+    import logging as _logging
+    order = {"purchaseOrderId": "PO7", "orderLines": {"orderLine": [
+        {"lineNumber": "1", "item": {"sku": "S"}, "orderLineQuantity": {"amount": "1"}},
+        {"lineNumber": "2", "item": {"sku": "S"}, "orderLineQuantity": {"amount": "1"}},
+    ]}}
+    with caplog.at_level(_logging.WARNING, logger="services.order_lines"):
+        rows = ol.extract_order_lines("T1", order)
+    assert rows[0]["order_line_id"] == rows[1]["order_line_id"]
+    assert any("身份撞键" in m for m in caplog.messages)

@@ -131,23 +131,28 @@ CREATE TABLE IF NOT EXISTS listing.upc_pool (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- ── orders:订单域(行级统一建模,2026-08-06 v2 定稿)──────────────────────────
---   order_line_id = 'ol_' + sha256(po_id + \x1f + line_number)[:24]
+-- ── orders:订单域(行级统一建模,2026-08-06 v3 定稿)──────────────────────────
+--   order_line_id = 'ol_' + sha256(po_id + \x1f + sku)[:24]
 -- 店铺不参与身份:PO 是沃尔玛发的、平台全局唯一;店铺名是我方标签,改名/换人
 -- 会作废含店铺的哈希(订单中心v1 的半成品决策,已弃)。店铺存列只做归属过滤。
--- 用行号而非 SKU 做身份:三源原生带行号(官方行级主键);SKU 的价值在绩效关联
--- (两段式回填)。生成函数唯一出处 services/order_lines.py。
+-- 用 SKU 而非行号做身份(v3,项目所有者定稿):同一 PO 内同一 SKU 必合并为一行,
+-- (PO,SKU) 与 (PO,行号) 同样唯一;绩效报表只给 PO+SKU 不给行号,SKU 身份使绩效
+-- 事件可直接建键(订单不在库也成立)。行号存列做展示/对账。
+-- 生成函数唯一出处 services/order_lines.py。
 
--- 一次性守卫:v1 试建形态(store 参与 UNIQUE)且尚无写入方 → 直接重建为 v2
+-- 一次性守卫:v2 形态(UNIQUE (po_id, line_number),行号参与哈希)→ 重建为 v3。
+-- 订单/售后/对账数据窗口重拉即回(45d/90d/账期快照);perf_events 逐周期历史
+-- 不可重拉,故保表不删,仅置空旧哈希的 order_line_id,由 backfill 按 v3 重算
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.constraint_column_usage
              WHERE table_schema = 'orders' AND table_name = 'order_lines'
-               AND constraint_name = 'order_lines_store_po_id_line_number_key') THEN
+               AND constraint_name = 'order_lines_po_id_line_number_key') THEN
     DROP VIEW IF EXISTS orders.order_center, orders.perf_event_spans,
                         orders.settlement_by_line;
     DROP TABLE IF EXISTS orders.order_lines, orders.return_lines,
-                         orders.perf_events, orders.settlement_lines;
+                         orders.settlement_lines;
+    UPDATE orders.perf_events SET order_line_id = NULL;
   END IF;
 END $$;
 
@@ -182,7 +187,7 @@ CREATE TABLE IF NOT EXISTS orders.order_lines (   -- 销售明细(订单域锚�
     raw            jsonb,
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (po_id, line_number)        -- 真正的身份锚点(PO 全局唯一,店铺不参与)
+    UNIQUE (po_id, sku)                -- 真正的身份锚点(PO 全局唯一,店铺/行号不参与)
 );
 CREATE INDEX IF NOT EXISTS order_lines_store_idx ON orders.order_lines (store);
 CREATE INDEX IF NOT EXISTS order_lines_po_idx    ON orders.order_lines (po_id);
@@ -223,7 +228,8 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
     po_id    text NOT NULL,
     metric   text NOT NULL,            -- otd/vtr/cancellations/returns/negativeFeedback/refunds/itemNotReceived/srr
     period   text NOT NULL,            -- 报表统计周期(数据日期);同一违规多周期出现=多行,影响范围按周期查
-    order_line_id text,                -- 绩效报表无行号(实证):单行订单回填,多行订单 NULL
+    order_line_id text,                -- 带 SKU 的事件写入时直接按 PO+SKU 建键(v3);
+                                       -- 无 SKU 的老版报表行 NULL,单行订单可回填
     sku      text,
     accountable boolean,               -- 计入绩效
     status   text,                     -- 违规/达标

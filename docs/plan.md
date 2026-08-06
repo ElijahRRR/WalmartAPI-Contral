@@ -93,15 +93,18 @@
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 
-**订单域地基(2026-08-06 v2 定稿,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/
-对账明细四链路统一行级建模——`order_line_id = ol_+sha256(PO+行号)[:24]`,**店铺不参与
-身份**(PO 沃尔玛全局唯一;店铺名是我方标签,改名不得作废标识——弃订单中心v1 含店铺
-的哈希)。已就绪:orders.order_lines/return_lines/perf_events/settlement_lines 四表 +
-settlement_by_line/order_center/perf_event_spans 视图;api/returns.py(时间窗成对+cursor
-拼 URL 实证);recon 明细改走 CSV 端点(JSON 每期截断 1000 行实证弃用);
+**订单域地基(2026-08-06 v3 定稿,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/
+对账明细四链路统一行级建模——`order_line_id = ol_+sha256(PO+SKU)[:24]`,**店铺与行号
+都不参与身份**(PO 沃尔玛全局唯一,店铺名是我方标签;同 PO 同 SKU 必合并为一行——
+所有者实证规则,v3 由行号改 SKU,使绩效事件可直接建键)。已就绪:orders.order_lines/
+return_lines/perf_events/settlement_lines 四表 + settlement_by_line/order_center/
+perf_event_spans 视图;api/returns.py(时间窗成对+cursor 拼 URL 实证);recon 明细改走
+CSV 端点(JSON 每期截断 1000 行实证弃用),SKU 两级解析(自带列→订单行反查);
 services/order_lines.py 三源归一化积木。绩效:按 (po,metric,period) 逐周期累积,
-影响范围看 perf_event_spans.still_active;行关联两段式回填(先 (po,sku) 无歧义匹配,
-再单行订单),不硬造行号。
+影响范围看 perf_event_spans.still_active;带 SKU 直接建键,无 SKU 老报表行退单行订单
+回填,不硬造。⚠ v2→v3 迁移:db_init 守卫自动重建三表(订单/售后/对账窗口重拉即回),
+perf_events 保历史仅重算关联;生产机需重跑 db_init + order_sync/returns_sync +
+daily_report settlement(-p periods=99)。
 
 旧仓库中**不迁移**:tools/ 的 10 个救场脚本(**不含 sync_online_products.py**,
 它是 #9 catalog_sync 的源文件,是活代码)、auto_listing 5 个 fix 脚本、

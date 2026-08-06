@@ -296,32 +296,39 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
 
 def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
     """对账明细:按店拉取缺失账期(关账快照不可变,已入库不重拉)→ settlement_lines。"""
-    total_periods, total_lines, failed = 0, 0, []
+    total_periods, total_lines, total_no_sku, failed = 0, 0, 0, []
 
-    def _one_store(store: dict) -> tuple[int, int]:
+    def _one_store(store: dict) -> tuple[int, int, int]:
         name = store["name"]
         with db.pg_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT DISTINCT period FROM orders.settlement_lines "
                         "WHERE store = %s", (name,))
             have = {r[0] for r in cur.fetchall()}
+            # v3 身份 = PO+SKU:CSV 缺 SKU 列时按 (po,行号) 反查订单行补 SKU
+            cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
+                        "WHERE store = %s", (name,))
+            sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
         todo = order_lines.pick_new_periods(
             reports.available_recon_dates(store), have, periods_limit)
-        written = 0
+        written = no_sku = 0
         for period in todo:
             rows = list(reports.iter_recon_records(store, period))
-            recs = order_lines.aggregate_settlement_lines(name, rows, period)
+            recs, skipped = order_lines.aggregate_settlement_lines(
+                name, rows, period, sku_lookup)
+            no_sku += skipped
             with db.pg_conn() as conn:
                 written += order_lines.upsert_settlement_lines(conn, recs)
-        return len(todo), written
+        return len(todo), written, no_sku
 
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:
-                periods, written = f.result()
+                periods, written, no_sku = f.result()
                 total_periods += periods
                 total_lines += written
+                total_no_sku += no_sku
             except (_client.StoreDeadError, httpx.ProxyError) as e:
                 logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
                 failed.append(f"{name}(凭证)")
@@ -330,6 +337,8 @@ def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
                 failed.append(name)
     line = (f"对账明细:{len(store_list) - len(failed)}/{len(store_list)} 店,"
             f"新账期 {total_periods} 个,入库 {total_lines} 行")
+    if total_no_sku:
+        line += f",SKU 解析失败跳过 {total_no_sku} 组"
     if failed:
         line += f",失败:{','.join(failed)}"
     return line

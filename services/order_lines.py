@@ -1,11 +1,18 @@
 """订单域行级积木:行标识生成 + 三源(orders/returns/recon)归一化 + PG 写入。
 
-行标识(2026-08-06 定稿,v2):
-    order_line_id = 'ol_' + sha256(po + '\\x1f' + line)[:24]
+行标识(2026-08-06 定稿,v3):
+    order_line_id = 'ol_' + sha256(po + '\\x1f' + sku)[:24]
 
-⚠ 与旧仓库订单中心v1 的差异——**店铺不参与哈希**:PO 号是沃尔玛发的、平台
-全局唯一,而店铺名是我们自己的标签(飞书凭证表),改名/换人是真实运营事件,
-参与哈希会让改名瞬间作废全部行标识。店铺仍存列+索引,只做归属不做身份。
+⚠ 身份两次定稿的理由都要记住:
+- **店铺不参与哈希**(v2 起):PO 号是沃尔玛发的、平台全局唯一,而店铺名是
+  我们自己的标签(飞书凭证表),改名/换人是真实运营事件,参与哈希会让改名
+  瞬间作废全部行标识。店铺仍存列+索引,只做归属不做身份。
+- **SKU 而非行号参与哈希**(v3,项目所有者定稿):沃尔玛同一订单内同一 SKU
+  必合并为一行(qty 累加),(PO, SKU) 与 (PO, 行号) 同样唯一;而绩效报表只给
+  PO+SKU 不给行号,用 SKU 做身份后绩效事件可**直接算出行标识**(订单不在库里
+  也能建键),消掉了 v2 时代绩效关联的两段式回填缺口。行号仍存列做展示/对账。
+  若"同 SKU 合并"规则被线上数据打破(同 PO 同 SKU 两行),extract 会告警——
+  兜底不许静默。
 
 解析逻辑逐条移植自 订单中心v1 的 sync_sales / sync_aftersales / sync_finance
 (2026-08 生产实测),踩坑注释随代码保留。供 order_audit / returns_sync /
@@ -22,14 +29,19 @@ logger = logging.getLogger("services.order_lines")
 
 # ── 行标识 ────────────────────────────────────────────────────────────────────
 
-def make_order_line_id(po: str, line) -> str:
-    """输入:PO 号 + 行号 → 输出:稳定行标识(店铺不参与身份,见模块 docstring)。"""
-    raw = f"{po}\x1f{norm_line(line)}"
+def make_order_line_id(po: str, sku) -> str:
+    """输入:PO 号 + SKU → 输出:稳定行标识(店铺/行号不参与身份,见模块 docstring)。"""
+    raw = f"{po}\x1f{norm_sku(sku)}"
     return "ol_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
+def norm_sku(sku) -> str:
+    """输入:SKU(任意形态)→ 输出:规范字符串(仅去首尾空白;SKU 大小写敏感,不动)。"""
+    return str(sku or "").strip()
+
+
 def norm_line(line) -> str:
-    """输入:行号(int/str/float 形态不一)→ 输出:规范字符串('1',与哈希输入一致)。"""
+    """输入:行号(int/str/float 形态不一)→ 输出:规范字符串('1',仅作展示列)。"""
     try:
         return str(int(float(line)))
     except (TypeError, ValueError):
@@ -123,8 +135,17 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
     phone = (order.get("shippingInfo") or {}).get("phone") or ""
 
     rows = []
+    seen_skus: dict[str, str] = {}
     for ol in _aslist((order.get("orderLines") or {}).get("orderLine")):
         line_no = ol.get("lineNumber")
+        sku = norm_sku((ol.get("item") or {}).get("sku"))
+        # 身份前提校验:同一 PO 内同一 SKU 应合并为一行(项目所有者实证规则);
+        # 被打破时后一行覆盖前一行,必须告警——兜底不许静默
+        if sku in seen_skus:
+            logger.warning("订单 %s 内 SKU %r 出现在多行(行 %s 与 %s),"
+                           "(PO,SKU) 身份撞键,后行覆盖前行,请人工核查",
+                           po, sku, seen_skus[sku], line_no)
+        seen_skus[sku] = str(line_no)
         statuses = _aslist((ol.get("orderLineStatuses") or {}).get("orderLineStatus"))
         st = statuses[0] if statuses else {}
         ti = st.get("trackingInfo") or {}
@@ -136,10 +157,10 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
         refund_amt, refund_note = _parse_refund(ol)
 
         rows.append({
-            "order_line_id": make_order_line_id(po, line_no),
+            "order_line_id": make_order_line_id(po, sku),
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(order.get("customerOrderId") or ""),
-            "sku": str((ol.get("item") or {}).get("sku") or ""),
+            "sku": sku,
             "product_name": str((ol.get("item") or {}).get("productName") or ""),
             "qty": int(_num((ol.get("orderLineQuantity") or {}).get("amount"), 1) or 1),
             "sale_status": st.get("status", ""),
@@ -207,17 +228,20 @@ def flatten_return_lines(store_name: str, return_order: dict) -> list[dict]:
     rows = []
     for line in lines:
         po = str(line.get("purchaseOrderId") or "")
+        # 行号只做展示列(售后行给的是原订单行号引用);身份用 SKU——
+        # item.sku 在售后行永远存在,行号引用字段在旧数据中有过缺失记录
         line_no = line.get("purchaseOrderLineNumber") or line.get("salesOrderLineNumber", "")
+        sku = norm_sku((line.get("item") or {}).get("sku"))
         qty_obj = line.get("quantity") or {}
         refunded = line.get("refundedQty")
         if isinstance(refunded, dict):
             refunded = refunded.get("amount") or refunded.get("measurementValue")
         rows.append({
             "return_order_id": rma,
-            "order_line_id": make_order_line_id(po, line_no),
+            "order_line_id": make_order_line_id(po, sku),
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(o.get("customerOrderId") or ""),
-            "sku": str((line.get("item") or {}).get("sku") or ""),
+            "sku": sku,
             "return_status": line.get("status", ""),
             "refund_status": line.get("currentRefundStatus", ""),
             "return_method": line.get("returnMethod", ""),
@@ -241,13 +265,27 @@ def flatten_return_lines(store_name: str, return_order: dict) -> list[dict]:
 
 # ── 源 3:Recon CSV → settlement_lines 行 ─────────────────────────────────────
 
-def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str) -> list[dict]:
-    """输入:店铺名 + 某账期全部 Recon 行 + 账期(MMDDYYYY)→ 输出:按行聚合的记录列表。
+# Recon CSV 可能的 SKU 列名(官方叫 Partner Item Id;多写几个候选防版式差异,
+# 命中哪个记日志——首个非空即用)
+_RECON_SKU_COLS = ("Partner Item Id", "Partner Item ID", "Partner Item id",
+                   "SKU", "Sku", "Item Id", "Item ID")
+
+
+def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str,
+                               sku_lookup: dict | None = None
+                               ) -> tuple[list[dict], int]:
+    """输入:店铺名 + 某账期全部 Recon 行 + 账期(MMDDYYYY)+ 可选 {(po,行号)→sku}
+    → 输出:(按行聚合的记录列表, 因无法解析 SKU 而跳过的行组数)。
 
     实证规则(订单中心v1):
-    - 汇总行 PO/行号为空,必须跳过(否则聚出 sha256(店铺+空+空) 的垃圾行);
+    - 汇总行 PO/行号为空,必须跳过(否则聚出 sha256(店铺+空) 的垃圾行);
     - 金额必须 round6:Sale/Refund 相消的浮点和是 4.44e-16 而非 0,会误判入账状态;
     - gross(绝对值和)用于区分"净0=全额退款"与"净0=无金额"。
+
+    SKU 解析(v3 身份 = PO+SKU)两级,均计数记日志:
+    ① CSV 自带 SKU 列(_RECON_SKU_COLS 探测);
+    ② 缺列/空值时用 sku_lookup(调用方从 orders.order_lines 按 (po_id,line_number)
+      预查)。两级都解析不到的行组跳过并计数——绝不硬造键。
     """
     groups: dict[tuple, list[dict]] = {}
     for row in rows:
@@ -263,8 +301,23 @@ def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str) -
         logger.warning("账期无法解析: %r", period)
         settle_date = None
 
+    def _resolve_sku(po: str, line: str, group: list[dict]) -> str | None:
+        for r in group:
+            for col in _RECON_SKU_COLS:
+                v = norm_sku(r.get(col))
+                if v:
+                    return v
+        if sku_lookup:
+            return sku_lookup.get((po, norm_line(line)))
+        return None
+
+    skipped = 0
     records = []
     for (po, line), group in groups.items():
+        sku = _resolve_sku(po, line, group)
+        if not sku:
+            skipped += 1
+            continue
         def _sum(pred):
             return round(sum(_num(r.get("Amount"), 0.0) for r in group if pred(r)), 6)
         first_of = {}
@@ -277,7 +330,7 @@ def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str) -
                           for r in group
                           if str(r.get("Commission Incentive Program") or "").strip()), None)
         records.append({
-            "order_line_id": make_order_line_id(po, line),
+            "order_line_id": make_order_line_id(po, sku),
             "period": period,
             "store": store_name, "po_id": po, "line_number": norm_line(line),
             "net_amount": _sum(lambda r: True),
@@ -290,7 +343,11 @@ def aggregate_settlement_lines(store_name: str, rows: list[dict], period: str) -
             "settle_date": settle_date,
             "raw": None,    # 明细行量大,默认不存原文;需要时单独开
         })
-    return records
+    if skipped:
+        logger.warning("店铺 %s 账期 %s:%d 个行组解析不到 SKU(CSV 列+订单行反查均失败),"
+                       "已跳过——CSV 表头若含 SKU 列请告知列名补进 _RECON_SKU_COLS",
+                       store_name, period, skipped)
+    return records, skipped
 
 
 def settle_status(net: float, gross: float) -> str:
@@ -401,9 +458,13 @@ def perf_rows_from_problems(store_name: str, metric: str, rows: list[dict],
             skipped += 1
             continue
         accountable = str(r.get("accountable", "")).startswith("✅")
+        sku = norm_sku(r.get("sku")) or None
         out.append({"store": store_name, "po_id": po, "metric": metric,
                     "period": str(period),
-                    "sku": (str(r.get("sku") or "").strip() or None),
+                    "sku": sku,
+                    # v3 身份 = PO+SKU:报表带 SKU 即可直接建键,订单不在库里也成立;
+                    # 无 SKU 的老版报表留 NULL,由 backfill 的单行订单段兜
+                    "order_line_id": make_order_line_id(po, sku) if sku else None,
                     "accountable": accountable,
                     "status": "违规" if accountable else "不计入",
                     "detail": r.get("raw")})
@@ -422,19 +483,19 @@ def pick_new_periods(available: list[str], have: set[str], limit: int) -> list[s
 def backfill_perf_line_ids(conn) -> int:
     """输入:连接 → 输出:回填总行数。
 
-    绩效报表无行号但多数带商品列(实证),两段式回填,只在无歧义时落子:
-    ① 事件带 SKU → 按 (po_id, sku) 匹配,该 SKU 在此单恰好一行才回填
-       (多行订单也能关联上——这是 SKU 相对行号真正的价值点);
-    ② 事件无 SKU → 该 PO 在 order_lines 恰好一行时回填。
-    PO 全局唯一,店铺不参与匹配;两段都对不上的保持 NULL,宁缺毋错。
+    v3 身份 = PO+SKU 后,带 SKU 的事件在写入时就直接建键(见
+    perf_rows_from_problems),本函数只兜两类残留,均只在无歧义时落子:
+    ① 历史遗留:order_line_id 为 NULL 但 sku 非空(v2→v3 迁移置空的老行)
+       → 直接按哈希语义重算:与 orders.order_lines 按 (po_id, sku) 等值连接
+       (v3 下该组合唯一);
+    ② 事件无 SKU(老版报表缺商品列)→ 该 PO 在 order_lines 恰好一行时回填。
+    PO 全局唯一,店铺不参与匹配;对不上的保持 NULL,宁缺毋错。
     """
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE orders.perf_events p
             SET order_line_id = l.order_line_id
-            FROM (SELECT po_id, sku, min(order_line_id) AS order_line_id
-                  FROM orders.order_lines GROUP BY po_id, sku
-                  HAVING count(*) = 1) l
+            FROM orders.order_lines l
             WHERE p.order_line_id IS NULL AND p.sku IS NOT NULL AND p.sku <> ''
               AND p.po_id = l.po_id AND p.sku = l.sku
         """)

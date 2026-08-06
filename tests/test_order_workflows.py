@@ -153,9 +153,11 @@ def test_perf_rows_from_problems():
     assert len(out) == 2
     assert out[0] == {"store": "T1", "po_id": "PO1", "metric": "otd",
                       "period": "2026-08-06", "sku": "B0X", "accountable": True,
+                      # v3:带 SKU 的事件写入时直接建键,订单不在库里也成立
+                      "order_line_id": ol.make_order_line_id("PO1", "B0X"),
                       "status": "违规", "detail": "{}"}
     assert out[1]["accountable"] is False and out[1]["status"] == "不计入"
-    assert out[1]["sku"] is None
+    assert out[1]["sku"] is None and out[1]["order_line_id"] is None
 
 
 def test_pick_new_periods_sorts_across_years():

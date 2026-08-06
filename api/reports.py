@@ -137,29 +137,39 @@ def available_recon_dates(store: dict) -> list[str]:
     return list(data.get("availableApReportDates") or [])
 
 
-def iter_recon_records(store: dict, report_date: str, page_size: int = 200):
-    """输入:店铺 + 账期(MMDDYYYY)→ 输出:对账明细记录生成器(offset 分页内藏)。
+def iter_recon_records(store: dict, report_date: str):
+    """输入:店铺 + 账期(MMDDYYYY)→ 输出:对账明细行 dict 生成器(全量,无截断)。
 
+    实现走 **CSV 端点** /v3/report/reconreport/reconFile(ZIP 包裹完整报表)。
+    为什么不用 JSON 端点(订单中心v1 2026-08-04 实测,修正本文件旧实现):
+    reconFileJson 每账期硬截断 1000 行,offset 只接受 0(传 1/999/1000 一律
+    INVALID_OFFSET),nextOffset 是字节偏移不是行号——超 1000 行的账期在 JSON
+    路径下必然丢数据。CSV 无行数上限(同账期 JSON 失败/CSV 1211 行),字段名与
+    JSON 完全一致("Transaction Type"/"Total Payable"/"Purchase Order #" 等)。
+    必须 Accept: application/octet-stream(text/csv 返 406)。
     调用方按需 break(如只找 Transaction Type == 'PaymentSummary' 的行)。
     """
-    offset = 0
+    _client.rate_acquire("reports.recon", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
-    while True:
-        _client.rate_acquire("reports.recon", store["client_id"])
-        status, _, data = _client.safe_get_ex(
-            f"{_client.base_url()}/v3/report/reconreport/reconFileJson",
-            token, store["client_id"], store["proxy"],
-            params={"reportDate": report_date, "offset": offset,
-                    "noOfRecords": page_size},
-            max_retries=3)
-        if status != 200 or data is None:
-            raise RuntimeError(f"reconFileJson 返回 {status}"
-                               f"(店铺 {store['name']}, 账期 {report_date})")
-        records = data.get("reportData") or []
-        yield from records
-        if len(records) < page_size:
-            return
-        offset += len(records)
+    status, _, body = _client.safe_get_raw(
+        f"{_client.base_url()}/v3/report/reconreport/reconFile",
+        token, store["client_id"], store["proxy"],
+        params={"reportDate": report_date, "reportVersion": "v1"},
+        timeout=120, max_retries=3, accept="application/octet-stream")
+    if status in (401, 403):
+        raise _client.StoreDeadError(f"{store.get('name')} reconFile → {status}")
+    if status is None or not (200 <= status < 300) or not body:
+        raise RuntimeError(f"reconFile 返回 {status}"
+                           f"(店铺 {store['name']}, 账期 {report_date})")
+    if body[:2] != b"PK":   # 出错时可能 HTTP 200 但返回 JSON/XML 错误体
+        raise RuntimeError(f"reconFile 非 ZIP 响应(店铺 {store['name']},"
+                           f" 账期 {report_date}): {body[:160]!r}")
+    with zipfile.ZipFile(io.BytesIO(body)) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not names:
+            raise RuntimeError(f"reconFile ZIP 内无 CSV: {zf.namelist()}")
+        raw = zf.read(names[0])
+    yield from csv.DictReader(io.StringIO(raw.decode("utf-8-sig", errors="replace")))
 
 
 def fetch_item_report(store: dict, *, poll_interval: float = 20.0,

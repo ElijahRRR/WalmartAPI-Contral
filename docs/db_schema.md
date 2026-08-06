@@ -135,26 +135,43 @@ CREATE TABLE listing.upc_pool (     -- UPC 池:领取即永不释放(旧系统�
 );
 ```
 
-## orders — 订单域
+## orders — 订单域(行级统一建模,2026-08-06 定稿)
 
-```sql
-CREATE TABLE orders.orders (
-    po_id       text PRIMARY KEY,
-    store       text NOT NULL,
-    order_date  timestamptz,
-    status      text,
-    total       numeric,
-    raw         jsonb,
-    -- 审核四道结论
-    audit_phishing  text, audit_purchaser text, audit_price text, audit_title text,
-    audit_final     text,
-    owner       text,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE orders.returns    ( ... 按旧售后同步的 27 列映射,主键 return_order_id );
-CREATE TABLE orders.settlement ( ... 从旧 walmart_settlement.db 迁入,增量拉取 );
+order_audit / returns_sync / 绩效问题订单 / 对账明细四条链路共用同一行级标识:
+
 ```
+order_line_id = 'ol_' + sha256(po_id + '\x1f' + line_number)[:24]
+```
+
+身份设计(2026-08-06 v2 定稿,对订单中心v1 半成品决策逐条重审后的取舍):
+- **真正的身份锚点是自然键 `UNIQUE (po_id, line_number)`**;哈希 ID 是它的
+  派生物,价值只在四表单列 JOIN,可随时从自然键重算。
+- **店铺不参与身份**(v2 修订,弃订单中心v1 方案):PO 号是沃尔玛发的、平台
+  全局唯一;店铺名是我方标签(飞书凭证表),改名/换人是真实运营事件,参与
+  哈希会瞬间作废全部行标识。店铺存列+索引,只做归属与过滤。
+- **行号 vs SKU**:行号做物理身份(orders/returns/recon 三源原生带,官方行级
+  主键;SKU 理论可一单多行)。但 **SKU 的价值点在绩效关联**——绩效报表无行号
+  却多带商品列,perf_events 回填两段式:先按 (po_id, sku) 无歧义匹配(多行
+  订单也能关联上),再退"该 PO 仅一行"规则;都对不上留 NULL,不硬造。
+  ※ 拒绝订单中心v1 的"硬造行号 1"方案:假精度会把多行订单的绩效挂错行。
+- **绩效跨周期**:逐周期累积,主键 (po_id, metric, period)(拒绝订单中心v1 的
+  同键覆盖——丢历史后"影响范围"无法回答)。`perf_event_spans` 视图给出每条
+  违规的存续区间与 still_active(以最新报表是否仍包含该单为准,不自行推算
+  官方统计窗口)。
+生成函数唯一出处:`services/order_lines.py`。
+
+| 表 | 主键 | 内容 | 写入者 |
+|---|---|---|---|
+| `orders.order_lines` | order_line_id(UNIQUE po+行号) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail) | 订单拉取工作流 + order_audit 回写审核 |
+| `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
+| `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
+| `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
+
+视图:
+- `orders.settlement_by_line` — 跨账期合并 + 入账状态推导(net>0 已入账 / net<0 已冲销 / net=0 且 gross>0 已退款 / 其余待入账;金额 round6 吸收浮点相消误差——实证 +52.68-52.68 = 4.44e-16 会误判);
+- `orders.order_center` — 订单中心主视图:销售行 LEFT JOIN 售后聚合/绩效指标聚合/入账状态(采购信息是人工域,留在飞书 bitable,不进 PG)。
+
+完整列清单见 `refdata/schema.sql`。旧 po 级表 `orders.orders`(空表)保留待确认后删除,新代码禁止写入。
 
 ## ops — 运行域(状态与业务同库,可同事务修改)
 

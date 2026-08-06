@@ -178,6 +178,7 @@ _HEADER_MAP = (
     (("sales order",), "sales_order_no"),
     (("po #", "po#", "purchase order"), "po_no"),
     (("order date", "order placed"), "order_date"),
+    (("sku",), "sku"),          # 放 item 前:列名"Item SKU"应归 sku 而非商品名
     (("item", "product"), "item"),
     (("carrier",), "carrier"),
     (("tracking",), "tracking_no"),
@@ -196,10 +197,17 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
 
     label = METRIC_LABELS[metric]
     rows: list[dict] = []
+    sheet_stats: list = []
     wb = openpyxl.load_workbook(io.BytesIO(blob), read_only=True, data_only=True)
     for ws in wb.worksheets:
+        # 生产实证(2026-08-06):沃尔玛生成的 xlsx 把 dimension 声明成单格,
+        # read_only 模式按声明只读出 1 行 → 必须 reset_dimensions 重扫真实行
+        if hasattr(ws, "reset_dimensions"):
+            ws.reset_dimensions()
         data = [[("" if c is None else str(c)) for c in r]
                 for r in ws.iter_rows(values_only=True)]
+        sheet_stats.append((ws.title, len(data),
+                            [c for c in (data[0] if data else [])[:6] if c]))
         if not data:
             continue
         start = 0
@@ -211,16 +219,18 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
         accountable = "⚪ 否" if ws.title.strip().lower() == "not accountable" else "✅ 是"
         sub_category = "" if accountable == "⚪ 否" else ws.title.strip()
 
+        data_rows = kept = 0
         for raw in data[start + 1:]:
             if not any(c.strip() for c in raw):
                 continue
             if any(c.strip().startswith("=") for c in raw):
                 continue                                # Excel SUM 公式行
+            data_rows += 1
             rec = dict(zip(header, raw))
             row = {"indicator": label, "sub_category": sub_category,
                    "accountable": accountable,
                    "sales_order_no": "", "po_no": "", "order_date": "",
-                   "item": "", "carrier": "", "tracking_no": "",
+                   "sku": "", "item": "", "carrier": "", "tracking_no": "",
                    "description": "", "note": "",
                    "raw": json.dumps(rec, ensure_ascii=False)[:2000]}
             desc_parts = []
@@ -238,6 +248,17 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
             row["description"] = "; ".join(desc_parts)[:300]
             if row["sales_order_no"] or row["po_no"] or row["tracking_no"]:
                 rows.append(row)
+                kept += 1
+        # 单号列一个都没匹配上 = _HEADER_MAP 关键词与真实表头不符,
+        # 打出真实表头供校准——静默丢行就是"解析 0 行"事故的成因
+        if data_rows and not kept:
+            logger.warning("报表 %s sheet '%s':%d 行数据全被丢弃(未匹配到单号列),"
+                           "真实表头=%s,首行样本=%s",
+                           metric, ws.title, data_rows, header,
+                           data[start + 1][:8] if len(data) > start + 1 else [])
+    # 报表自述:每个 sheet 的(标题, 总行数, 首行前几格)——0 行产出时据此判断
+    # 是"报表本来就空"还是"版式假设错了"(2026-08-06 生产校准期,稳定后可降 debug)
+    logger.info("报表 %s 解析:%d 行产出,sheets=%s", metric, len(rows), sheet_stats)
     return rows
 
 

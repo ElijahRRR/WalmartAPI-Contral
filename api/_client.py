@@ -172,6 +172,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
+    "returns.list": (46, 60.0),                 # GET /v3/returns(官方 50/min,沿用旧 1.3s 节奏)
     "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
     "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
@@ -218,18 +219,23 @@ def rate_acquire(bucket: str, client_id: str) -> float:
 
 
 def safe_get_raw(url, token, client_id, proxy, params=None, timeout=90,
-                 max_retries=3) -> tuple[int | None, dict, bytes | None]:
-    """输入:同 safe_get_ex → 输出:(status, headers, 原始字节)。二进制响应专用。
+                 max_retries=3, accept: str | None = None) -> tuple[int | None, dict, bytes | None]:
+    """输入:同 safe_get_ex(可选 accept 覆盖)→ 输出:(status, headers, 原始字节)。
 
     与 safe_get_ex 的区别只有一个:不解析 JSON(xlsx/zip/CSV 会被强解析破坏,
     旧系统因此养出裸 httpx 直连点,蓝图 §6.2 定稿收归此处)。
+    accept:部分二进制端点强制要求特定 Accept(reconFile 需
+    application/octet-stream,text/csv 会 406——订单中心v1 实证)。
     429 按 Retry-After/X-Next-Replenishment-Time 退避,5xx/网络异常指数退避。
     """
     attempt = 0
     while True:
+        headers_out = make_headers(token, client_id)
+        if accept:
+            headers_out["Accept"] = accept
         try:
             resp = _get_client(proxy).get(
-                url, headers=make_headers(token, client_id), params=params, timeout=timeout)
+                url, headers=headers_out, params=params, timeout=timeout)
         except (httpx.TransportError, httpx.ProxyError) as e:
             _invalidate_client(proxy)
             if attempt < max_retries:

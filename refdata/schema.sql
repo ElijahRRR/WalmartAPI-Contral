@@ -131,8 +131,181 @@ CREATE TABLE IF NOT EXISTS listing.upc_pool (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
--- ── orders:订单域 ─────────────────────────────────────────────────────────
+-- ── orders:订单域(行级统一建模,2026-08-06 v2 定稿)──────────────────────────
+--   order_line_id = 'ol_' + sha256(po_id + \x1f + line_number)[:24]
+-- 店铺不参与身份:PO 是沃尔玛发的、平台全局唯一;店铺名是我方标签,改名/换人
+-- 会作废含店铺的哈希(订单中心v1 的半成品决策,已弃)。店铺存列只做归属过滤。
+-- 用行号而非 SKU 做身份:三源原生带行号(官方行级主键);SKU 的价值在绩效关联
+-- (两段式回填)。生成函数唯一出处 services/order_lines.py。
 
+-- 一次性守卫:v1 试建形态(store 参与 UNIQUE)且尚无写入方 → 直接重建为 v2
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.constraint_column_usage
+             WHERE table_schema = 'orders' AND table_name = 'order_lines'
+               AND constraint_name = 'order_lines_store_po_id_line_number_key') THEN
+    DROP VIEW IF EXISTS orders.order_center, orders.perf_event_spans,
+                        orders.settlement_by_line;
+    DROP TABLE IF EXISTS orders.order_lines, orders.return_lines,
+                         orders.perf_events, orders.settlement_lines;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS orders.order_lines (   -- 销售明细(订单域锚点表)
+    order_line_id  text PRIMARY KEY,
+    store          text NOT NULL,
+    po_id          text NOT NULL,      -- purchaseOrderId
+    line_number    text NOT NULL,      -- 官方行号,text 存(与哈希输入一致)
+    customer_order_id text,
+    sku            text,
+    product_name   text,
+    qty            integer,
+    sale_status    text,               -- Created/Acknowledged/Shipped/Delivered/Cancelled
+    status_date    timestamptz,
+    order_date     timestamptz,
+    est_ship_date  timestamptz,        -- 已发货订单回退取 trackingInfo.shipDateTime(实证)
+    est_delivery_date timestamptz,     -- 回退取 fulfillment.pickUpDateTime(实证)
+    product_amount numeric,
+    shipping_amount numeric,
+    cancel_reason  text,
+    refund_amount  numeric,
+    refund_comments text,
+    carrier        text,
+    tracking_no    text,
+    tracking_url   text,
+    ship_name      text, phone text, address1 text, address2 text,
+    city text, state text, postal_code text, country text,
+    -- 审核结论(order_audit 工作流写;四道审核明细进 audit_detail)
+    audit_status   text,               -- 通过/拒绝/钓鱼/待人工
+    audit_detail   jsonb,
+    audited_at     timestamptz,
+    raw            jsonb,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (po_id, line_number)        -- 真正的身份锚点(PO 全局唯一,店铺不参与)
+);
+CREATE INDEX IF NOT EXISTS order_lines_store_idx ON orders.order_lines (store);
+CREATE INDEX IF NOT EXISTS order_lines_po_idx    ON orders.order_lines (po_id);
+CREATE INDEX IF NOT EXISTS order_lines_sku_idx   ON orders.order_lines (sku);
+CREATE INDEX IF NOT EXISTS order_lines_date_idx  ON orders.order_lines (store, order_date DESC);
+CREATE INDEX IF NOT EXISTS order_lines_audit_idx ON orders.order_lines (audit_status);
+
+CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
+    return_order_id text NOT NULL,     -- RMA 号
+    order_line_id   text NOT NULL,
+    store text NOT NULL, po_id text NOT NULL, line_number text NOT NULL,
+    customer_order_id text,
+    sku            text,
+    return_status  text,               -- INITIATED/DELIVERED/CLOSED…(行级,实证不在顶层)
+    refund_status  text,               -- NOT_REFUNDED/REFUNDED
+    return_method  text,               -- SHIPPED_TO_RETURN_CENTER/KEEP_ITEM…
+    refund_mode    text,               -- FIRST_SCAN/POST_DELIVERY(订单级)
+    is_keep_it     boolean,
+    refund_total   numeric,            -- 订单级总退款金额
+    return_reason  text,
+    return_comment text,
+    return_by      timestamptz,
+    return_created timestamptz,
+    last_modified  timestamptz,
+    customer_name  text,
+    customer_email text,
+    qty integer, refunded_qty integer,
+    carrier text, tracking_no text,    -- 实证在 returnLineGroups[].labels[].carrierInfoList[]
+    raw jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (return_order_id, order_line_id)   -- 同行可多次售后,同 RMA 可多行
+);
+CREATE INDEX IF NOT EXISTS return_lines_line_idx ON orders.return_lines (order_line_id);
+
+CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周期累积)
+    store    text NOT NULL,
+    po_id    text NOT NULL,
+    metric   text NOT NULL,            -- otd/vtr/cancellations/returns/negativeFeedback/refunds/itemNotReceived/srr
+    period   text NOT NULL,            -- 报表统计周期(数据日期);同一违规多周期出现=多行,影响范围按周期查
+    order_line_id text,                -- 绩效报表无行号(实证):单行订单回填,多行订单 NULL
+    sku      text,
+    accountable boolean,               -- 计入绩效
+    status   text,                     -- 违规/达标
+    detail   jsonb,                    -- 报表原始行
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (po_id, metric, period)    -- PO 全局唯一,店铺只做归属
+);
+CREATE INDEX IF NOT EXISTS perf_events_store_idx ON orders.perf_events (store, metric, period);
+CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
+-- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (store,po_id,metric))
+
+-- 影响范围视图:每条违规的存续区间。still_active = 该违规出现在此(店铺,指标)
+-- 最近一次报表周期中,即"仍在拖当前绩效分";消失即代表滚出官方统计窗口——
+-- 各指标窗口长短官方未一一公开,以报表自身是否还包含该单为准,不自行推算窗口
+CREATE OR REPLACE VIEW orders.perf_event_spans AS
+  SELECT e.store, e.po_id, e.metric,
+         min(e.order_line_id) AS order_line_id,
+         min(e.period)  AS first_period,
+         max(e.period)  AS last_period,
+         count(*)       AS periods_seen,
+         bool_or(e.accountable) AS ever_accountable,
+         (max(e.period) = m.latest_period) AS still_active
+  FROM orders.perf_events e
+  JOIN (SELECT store, metric, max(period) AS latest_period
+        FROM orders.perf_events GROUP BY store, metric) m
+    USING (store, metric)
+  GROUP BY e.store, e.po_id, e.metric, m.latest_period;
+
+CREATE TABLE IF NOT EXISTS orders.settlement_lines (  -- 对账明细(行级×账期聚合)
+    order_line_id text NOT NULL,
+    period        text NOT NULL,       -- 账期 MMDDYYYY
+    store text NOT NULL, po_id text NOT NULL, line_number text NOT NULL,
+    net_amount     numeric,            -- 该账期该行全部类型金额合计(round6 吸浮点误差)
+    gross_amount   numeric,            -- 各行 |Amount| 之和:区分"净0=全额退款"与"净0=无金额"
+    product_amount numeric,            -- Amount Type = 'Product Price'
+    commission_amount numeric,         -- Amount Type = 'Commission on Product'(负值)
+    commission_rate numeric, original_commission numeric, commission_saving numeric,
+    incentive     text,
+    settle_date   date,
+    raw           jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (order_line_id, period)
+);
+CREATE INDEX IF NOT EXISTS settlement_lines_store_idx ON orders.settlement_lines (store, period);
+
+-- 跨账期合并视图:入账状态由净额+交易额判定(订单中心v1 实证规则:
+-- net>0 已入账;net<0 已冲销;net=0 且 gross>0 已退款(Sale/Refund 相消);其余待入账)
+CREATE OR REPLACE VIEW orders.settlement_by_line AS
+  SELECT order_line_id,
+         min(store) AS store, min(po_id) AS po_id, min(line_number) AS line_number,
+         round(sum(net_amount), 6)     AS net_amount,
+         round(sum(gross_amount), 6)   AS gross_amount,
+         round(sum(product_amount), 6) AS product_amount,
+         round(sum(commission_amount), 6) AS commission_amount,
+         count(*)          AS periods,
+         max(settle_date)  AS last_settle_date,
+         CASE WHEN sum(net_amount) > 0 THEN '已入账'
+              WHEN sum(net_amount) < 0 THEN '已冲销'
+              WHEN sum(gross_amount) > 0 THEN '已退款'
+              ELSE '待入账' END AS settle_status
+  FROM orders.settlement_lines GROUP BY order_line_id;
+
+-- 订单中心主视图:一行订单行 = 销售 + 售后 + 绩效 + 入账(采购在飞书,人工域不进 PG)
+CREATE OR REPLACE VIEW orders.order_center AS
+  SELECT l.*,
+         r.return_status, r.refund_status_agg AS refund_status, r.return_total,
+         p.metrics AS perf_metrics,
+         s.net_amount AS settled_net, s.settle_status
+  FROM orders.order_lines l
+  LEFT JOIN (SELECT order_line_id,
+                    string_agg(DISTINCT return_status, ';') AS return_status,
+                    string_agg(DISTINCT refund_status, ';') AS refund_status_agg,
+                    sum(refund_total) AS return_total
+             FROM orders.return_lines GROUP BY order_line_id) r USING (order_line_id)
+  LEFT JOIN (SELECT order_line_id, string_agg(DISTINCT metric, ';') AS metrics
+             FROM orders.perf_events WHERE order_line_id IS NOT NULL
+             GROUP BY order_line_id) p USING (order_line_id)
+  LEFT JOIN orders.settlement_by_line s USING (order_line_id);
+
+-- 旧表(po 级,空表,由 order_lines 取代):保留待确认后删除,新代码禁止写入
 CREATE TABLE IF NOT EXISTS orders.orders (
     po_id       text PRIMARY KEY,
     store       text NOT NULL,

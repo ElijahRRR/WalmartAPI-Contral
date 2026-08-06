@@ -74,9 +74,12 @@ def performance_report(store: dict, metric: str) -> bytes | None:
         raise ValueError(f"未知 insights 指标: {metric}(可选 {METRICS})")
     _client.rate_acquire(f"insights.report.{metric}", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    # 2026-08-06 生产实证:默认 Accept(application/json)返回 406,
+    # 二进制报表端点必须 octet-stream(与 reconFile 同一坑)
     status, _, blob = _client.safe_get_raw(
         f"{_client.base_url()}/v3/insights/performance/{metric}/report",
-        token, store["client_id"], store["proxy"], timeout=90)
+        token, store["client_id"], store["proxy"], timeout=90,
+        accept="application/octet-stream")
     if status == 204 or not blob:
         return None
     if status != 200:

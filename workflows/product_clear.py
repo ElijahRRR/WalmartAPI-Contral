@@ -160,6 +160,13 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         why = "动作不识别" if r["action"] not in _ACTIONS else "店铺不识别"
         if r["result"] != why:
             updates.append((r["rownum"], "", "", why))
+    unknown_stores = sorted({r["store"] for r in bad
+                             if r["store"] not in stores_by_name})
+    if unknown_stores:
+        logger.warning("店铺不识别 %d 个:表内样本=%s;凭证表样本=%s"
+                       "(店名必须与凭证表逐字一致)",
+                       len(unknown_stores), unknown_stores[:5],
+                       sorted(stores_by_name)[:5])
     good = [r for r in fresh if r not in bad]
 
     by_store: dict[str, list[dict]] = {}
@@ -222,8 +229,8 @@ def run(params: dict) -> str:
     if only:
         rows = [r for r in rows if r["store"] == only]
 
-    names = sorted({r["store"] for r in rows})
-    stores_by_name = {s["name"]: s for s in stores_svc.load_stores(names)}
+    # 全量加载凭证(49 店,量小):店名对不上时诊断需要完整对照样本
+    stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     limits, limits_note = _load_limits(default_limit)
 
     updates_a, lines_a = _poll_feeds(rows, stores_by_name, execute)

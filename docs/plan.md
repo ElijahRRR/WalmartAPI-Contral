@@ -79,9 +79,9 @@
 | # | 新 workflow | 替代旧模块 | 危险 | 备注 |
 |---|---|---|---|---|
 | 1 | product_query | 产品ID查询产品详情 | 否 | 零状态零调度,练手验证 api 层。**[x] 完成**(2026-08-05 生产实跑通过,PR #3) |
-| 2 | returns_sync | 售后订单同步 | 否 | **[~] 已实现**(2026-08-06,入 orders.return_lines,90 天窗口重拉;旧"整表覆盖残留旧行"缺陷在按键 upsert 下天然消失);待生产对拍 |
+| 2 | returns_sync | 售后订单同步 | 否 | **[~] 单店生产验证通过**(2026-08-06,10 售后行入库并挂上订单行);待全店跑+挂调度 |
 | 3 | daily_report | 沃尔玛店铺日报 | 否 | 影刀 RPA 部分保持原样(仅 macOS),只改数据落点。**[~] kpi 阶段单店对拍通过**(2026-08-06,A085,绩效/订单/结算全列对齐;结算解析改递归查找修复)。待:problems 列映射对拍校准、全店跑、影刀 FRONTEND_SCRAPE_JSON 接入、挂调度观察 |
-| 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务。**[~] 取数前半已实现**(order_sync 工作流,45 天窗口→orders.order_lines);审核规则待采集对接后补 |
+| 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务。**[~] 取数前半生产验证通过**(order_sync,2026-08-06 单店 38 行;statusDate/trackingURL 按线上实证修正);审核规则待采集对接后补 |
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
 | 7 | daily_retire | 沃尔玛批量下架 | **是** | DELETE_ITEM 不可恢复;防重状态先行(ops.feed_log) |

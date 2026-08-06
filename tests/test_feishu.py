@@ -279,3 +279,44 @@ def test_ensure_keys_creates_missing_only():
     # 只写键字段,且已有的 k1 与空键不建
     assert calls["create"] == [{"fields": {"字段A": "k2"}},
                                {"fields": {"字段A": "k3"}}]
+
+
+def test_sync_by_key_hash_field_skips_unchanged():
+    # 变更检测:指纹一致的行不发 batch_update,只写真正变化的行
+    import json as _json
+    calls: dict = {"update": None, "create": None}
+    same = {"字段A": "k1", "x": 1}
+    same_hash = feishu._row_hash({**same, "指纹": "旧值不参与"}, "指纹")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "tenant_access_token" in path:
+            return _token_ok()
+        body = _json.loads(request.content or b"{}")
+        if path.endswith("/records/search"):
+            assert set(body["field_names"]) == {"字段A", "指纹"}
+            return httpx.Response(200, json={"code": 0, "data": {"items": [
+                {"record_id": "rSame", "fields": {"字段A": "k1", "指纹": same_hash}},
+                {"record_id": "rChanged", "fields": {"字段A": "k2", "指纹": "stale"}},
+            ], "has_more": False}})
+        if path.endswith("/batch_update"):
+            calls["update"] = body["records"]
+            return httpx.Response(200, json={"code": 0, "data": {
+                "records": body["records"]}})
+        if path.endswith("/batch_create"):
+            calls["create"] = body["records"]
+            return httpx.Response(200, json={"code": 0, "data": {
+                "records": [{"record_id": "n1"}]}})
+        raise AssertionError(f"意外请求 {path}")
+
+    _use_handler(handler)
+    c, u, d = feishu.sync_by_key(TABLE, "字段A", {
+        "k1": dict(same),                       # 与飞书指纹一致 → 跳过
+        "k2": {"字段A": "k2", "x": 9},          # 指纹变了 → 更新
+        "k3": {"字段A": "k3"},                  # 新键 → 建
+    }, delete_stale=False, hash_field="指纹")
+    assert (c, u, d) == (1, 1, 0)
+    assert [r["record_id"] for r in calls["update"]] == ["rChanged"]
+    # 新建与更新的载荷都带指纹列
+    assert "指纹" in calls["create"][0]["fields"]
+    assert "指纹" in calls["update"][0]["fields"]

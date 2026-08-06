@@ -134,18 +134,24 @@ def _conv(ftype: int, v):
     return v                                # 未知类型原样试写
 
 
+_HASH_FIELD = "同步指纹"     # 程序自建的变更检测列,人工请勿改动
+
+
 def _adapt_rows(table, desired: dict[str, dict]) -> dict[str, dict]:
     """输入:表 + 规范载荷 → 输出:按表内**实际字段类型**转换后的载荷。
 
     先 list_fields 读真实类型再逐列适配(用户的表,类型不归我们定);
     表中不存在的列与计算/系统型列整列跳过并告警;键字段缺失直接报错
-    (同步对齐锚点,不能没有)。
+    (同步对齐锚点,不能没有)。「同步指纹」列缺失时自动创建
+    (变更检测:指纹一致的行跳过不写,万行级表的写放大治理)。
     """
     types = {f["field_name"]: f["type"] for f in feishu.list_fields(table)}
     key_field = table.fields.key
     if key_field not in types:
         raise feishu.FeishuError(
             None, f"表「{table.name}」缺少键字段「{key_field}」,请在飞书补建该文本字段后重跑")
+    if _HASH_FIELD not in types:
+        feishu.create_field(table, _HASH_FIELD)
     skipped: dict[str, str] = {}
     lost: dict[str, int] = {}
     out: dict[str, dict] = {}
@@ -235,7 +241,7 @@ def _push_sales(days: int) -> tuple[str, set[str]]:
             f.pulled_at: _cell(r["updated_at"]),
         }
     c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False)
+                                 delete_stale=False, hash_field=_HASH_FIELD)
     return (f"销售订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}",
             set(desired))
 
@@ -269,7 +275,7 @@ def _push_returns(days: int) -> str:
             f.is_keep_it: r["is_keep_it"],
         }
     c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False)
+                                 delete_stale=False, hash_field=_HASH_FIELD)
     return f"售后订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
 
 
@@ -300,7 +306,7 @@ def _push_perf() -> str:
             f.pulled_at: _cell(r["last_seen_at"]),
         }
     c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False)
+                                 delete_stale=False, hash_field=_HASH_FIELD)
     return f"绩效订单:{len(desired)} 行(全量),新建 {c} 更新 {u}"
 
 
@@ -326,7 +332,7 @@ def _push_settlement(days: int) -> str:
             f.pulled_at: _cell(r["updated_at"]),
         }
     c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False)
+                                 delete_stale=False, hash_field=_HASH_FIELD)
     return f"对账明细:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
 
 

@@ -36,15 +36,17 @@ def test_detail_desc():
 def _capture_sync(monkeypatch):
     captured = {}
 
-    def fake_sync(table, key_field, desired, *, delete_stale=True):
+    def fake_sync(table, key_field, desired, *, delete_stale=True, hash_field=None):
         captured[table.name] = {"key_field": key_field, "desired": desired,
-                                "delete_stale": delete_stale}
+                                "delete_stale": delete_stale,
+                                "hash_field": hash_field}
         return (len(desired), 0, 0)
 
     monkeypatch.setattr(feishu, "sync_by_key", fake_sync)
     # 类型适配层直通:全部字段给未知类型码 → _conv 原样放行,断言拿到规范值
     monkeypatch.setattr(feishu, "list_fields", lambda t: [
         {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
+    monkeypatch.setattr(feishu, "create_field", lambda *a, **k: None)
     return captured
 
 
@@ -188,7 +190,7 @@ def test_run_partial_failure_raises_after_all_tables(monkeypatch):
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [])
     seen = []
 
-    def fake_sync(table, key_field, desired, *, delete_stale=True):
+    def fake_sync(table, key_field, desired, *, delete_stale=True, hash_field=None):
         seen.append(table.name)
         if table is resources.ORDER_SALES:
             raise feishu.FeishuError(123, "boom")
@@ -198,6 +200,7 @@ def test_run_partial_failure_raises_after_all_tables(monkeypatch):
     monkeypatch.setattr(feishu, "ensure_keys", lambda t, k, keys: 0)
     monkeypatch.setattr(feishu, "list_fields", lambda t: [
         {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
+    monkeypatch.setattr(feishu, "create_field", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="部分表同步失败"):
         ocp.run({})
     # 销售表失败不挡后面的表(售后/绩效/对账仍同步)
@@ -227,6 +230,9 @@ def test_adapt_rows_types_and_guards(monkeypatch):
     from registry import resources as res
     t = res.ORDER_PERF
     f = t.fields
+    created = []
+    monkeypatch.setattr(feishu, "create_field",
+                        lambda table, name, ftype=1: created.append(name))
     monkeypatch.setattr(feishu, "list_fields", lambda table: [
         {"field_name": f.key, "type": 1},
         {"field_name": f.metric, "type": 3},          # 单选
@@ -242,6 +248,7 @@ def test_adapt_rows_types_and_guards(monkeypatch):
     assert row[f.accountable] == "是"
     assert row[f.pulled_at] == 1754300000000
     assert f.detail not in row and "不存在的列" not in row
+    assert created == [ocp._HASH_FIELD]      # 指纹列缺失时自动创建
 
 
 def test_adapt_rows_missing_key_field_raises(monkeypatch):

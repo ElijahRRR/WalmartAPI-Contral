@@ -171,7 +171,9 @@ def mark_feed_done(feed_id: str, ok: bool) -> None:
 
 def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
     if feed_type == "MP_MAINTENANCE":
-        return [str(e.get("sku") or "") for e in chunk]
+        # MPItem 的 sku 可能在顶层或嵌在 Orderable 里(反补载荷是后者)
+        return [str(e.get("sku") or (e.get("Orderable") or {}).get("sku") or "")
+                for e in chunk]
     return [str(s) for s in chunk]
 
 

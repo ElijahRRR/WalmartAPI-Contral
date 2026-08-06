@@ -90,6 +90,8 @@
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 
+| — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
+
 **订单域地基(2026-08-06 v2 定稿,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/
 对账明细四链路统一行级建模——`order_line_id = ol_+sha256(PO+行号)[:24]`,**店铺不参与
 身份**(PO 沃尔玛全局唯一;店铺名是我方标签,改名不得作废标识——弃订单中心v1 含店铺
@@ -99,7 +101,6 @@ settlement_by_line/order_center/perf_event_spans 视图;api/returns.py(时间窗
 services/order_lines.py 三源归一化积木。绩效:按 (po,metric,period) 逐周期累积,
 影响范围看 perf_event_spans.still_active;行关联两段式回填(先 (po,sku) 无歧义匹配,
 再单行订单),不硬造行号。
-| — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 
 旧仓库中**不迁移**:tools/ 的 10 个救场脚本(**不含 sync_online_products.py**,
 它是 #9 catalog_sync 的源文件,是活代码)、auto_listing 5 个 fix 脚本、

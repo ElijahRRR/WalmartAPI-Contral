@@ -220,6 +220,23 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
 CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
 -- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (store,po_id,metric))
 
+-- 影响范围视图:每条违规的存续区间。still_active = 该违规出现在此(店铺,指标)
+-- 最近一次报表周期中,即"仍在拖当前绩效分";消失即代表滚出官方统计窗口——
+-- 各指标窗口长短官方未一一公开,以报表自身是否还包含该单为准,不自行推算窗口
+CREATE OR REPLACE VIEW orders.perf_event_spans AS
+  SELECT e.store, e.po_id, e.metric,
+         min(e.order_line_id) AS order_line_id,
+         min(e.period)  AS first_period,
+         max(e.period)  AS last_period,
+         count(*)       AS periods_seen,
+         bool_or(e.accountable) AS ever_accountable,
+         (max(e.period) = m.latest_period) AS still_active
+  FROM orders.perf_events e
+  JOIN (SELECT store, metric, max(period) AS latest_period
+        FROM orders.perf_events GROUP BY store, metric) m
+    USING (store, metric)
+  GROUP BY e.store, e.po_id, e.metric, m.latest_period;
+
 CREATE TABLE IF NOT EXISTS orders.settlement_lines (  -- 对账明细(行级×账期聚合)
     order_line_id text NOT NULL,
     period        text NOT NULL,       -- 账期 MMDDYYYY

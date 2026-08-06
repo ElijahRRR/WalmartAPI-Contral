@@ -285,3 +285,16 @@ def test_upserts_build_conflict_sql():
     assert "ON CONFLICT (store, po_id, metric, period)" in sql2
     assert "first_seen_at" not in sql2.split("DO UPDATE")[1]   # 首见时间不被覆盖
     assert isinstance(rows2[0]["detail"], str)                 # dict 已序列化
+
+
+def test_backfill_perf_line_ids_two_stage_sku_first():
+    conn = _FakeConn()
+    total = ol.backfill_perf_line_ids(conn)
+    assert total == 6                       # FakeCursor rowcount=3 × 两段
+    sku_sql = conn.cur.calls[0][0]
+    fallback_sql = conn.cur.calls[1][0]
+    # 第一段:按 (store, po_id, sku) 无歧义匹配(多行订单也能关联——SKU 的价值点)
+    assert "p.sku = l.sku" in sku_sql and "HAVING count(*) = 1" in sku_sql
+    # 第二段:无 SKU 事件退"该 PO 仅一行"规则;两段都只回填 NULL 行
+    assert "p.sku" not in fallback_sql.split("WHERE")[1]
+    assert all("order_line_id IS NULL" in s for s in (sku_sql, fallback_sql))

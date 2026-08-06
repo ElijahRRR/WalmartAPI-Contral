@@ -381,12 +381,25 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
 
 
 def backfill_perf_line_ids(conn) -> int:
-    """输入:连接 → 输出:回填行数。
+    """输入:连接 → 输出:回填总行数。
 
-    绩效报表无行号(实证):只有当该 (store, po_id) 在 order_lines 中恰好一行时,
-    才能无歧义回填 order_line_id;多行订单保持 NULL,宁缺毋错。
+    绩效报表无行号但多数带商品列(实证),两段式回填,只在无歧义时落子:
+    ① 事件带 SKU → 按 (store, po_id, sku) 匹配,该 SKU 在此单恰好一行才回填
+       (多行订单也能关联上——这是 SKU 相对行号真正的价值点);
+    ② 事件无 SKU → 该 PO 在 order_lines 恰好一行时回填。
+    两段都对不上的保持 NULL,宁缺毋错。
     """
     with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE orders.perf_events p
+            SET order_line_id = l.order_line_id
+            FROM (SELECT store, po_id, sku, min(order_line_id) AS order_line_id
+                  FROM orders.order_lines GROUP BY store, po_id, sku
+                  HAVING count(*) = 1) l
+            WHERE p.order_line_id IS NULL AND p.sku IS NOT NULL AND p.sku <> ''
+              AND p.store = l.store AND p.po_id = l.po_id AND p.sku = l.sku
+        """)
+        by_sku = cur.rowcount
         cur.execute("""
             UPDATE orders.perf_events p
             SET order_line_id = l.order_line_id
@@ -395,4 +408,4 @@ def backfill_perf_line_ids(conn) -> int:
             WHERE p.order_line_id IS NULL
               AND p.store = l.store AND p.po_id = l.po_id
         """)
-        return cur.rowcount
+        return by_sku + cur.rowcount

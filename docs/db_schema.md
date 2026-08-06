@@ -144,11 +144,17 @@ order_audit / returns_sync / 绩效问题订单 / 对账明细四条链路共用
 order_line_id = 'ol_' + sha256(store + '\x1f' + po_id + '\x1f' + line_number)[:24]
 ```
 
-为什么用**行号**而不是 SKU 做行标识:orders / returns / recon 三个数据源都
-原生携带行号(官方的行级主键;returns 是 purchaseOrderLineNumber,recon 是
-`Purchase Order line #`),SKU 只存列 + 索引供业务查询。唯一例外是绩效报表
-xlsx **没有行号字段**(实证),因此 perf_events 按 (store, po_id, metric, period)
-建键,order_line_id 仅在可判定时回填(单行订单),不硬造假行号。
+身份设计(2026-08-06 重审定稿,含对订单中心v1 半成品决策的取舍):
+- **真正的身份锚点是自然键 `UNIQUE (store, po_id, line_number)`**;哈希 ID 是
+  它的派生物,价值在于四表单列 JOIN + 与旧系统互查,可随时从自然键重算。
+- **行号 vs SKU**:行号做物理身份(orders/returns/recon 三源原生带,官方行级
+  主键;SKU 理论可一单多行)。但 **SKU 的价值点在绩效关联**——绩效报表无行号
+  却多带商品列,perf_events 回填两段式:先按 (store, po_id, sku) 无歧义匹配
+  (多行订单也能关联上),再退"该 PO 仅一行"规则;都对不上留 NULL,不硬造。
+  ※ 拒绝订单中心v1 的"硬造行号 1"方案:假精度会把多行订单的绩效挂错行。
+- **绩效跨周期**:逐周期累积(拒绝订单中心v1 的同键覆盖——丢历史后"影响范围"
+  无法回答)。`perf_event_spans` 视图给出每条违规的存续区间与 still_active
+  (以最新报表是否仍包含该单为准,不自行推算官方统计窗口)。
 生成函数唯一出处:`services/order_lines.py`。
 
 | 表 | 主键 | 内容 | 写入者 |

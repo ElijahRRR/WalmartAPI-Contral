@@ -235,6 +235,32 @@ ORDER_SETTLE = Bitable(
 )
 
 
+# 商品停用/删除表(daily_retire 驱动表):电子表格,运营填 A~D,程序写 E~G。
+# 列序即契约(A=store B=sku C=停用/删除 D=操作原因 E=feedid F=操作日期 G=结果)
+RETIRE_SHEET = Spreadsheet(
+    name="商品停用删除表",
+    token=os.environ.get("FEISHU_RETIRE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_RETIRE_SHEET_ID", ""),
+    columns=("store", "sku", "action", "reason", "feed_id", "op_date", "result"),
+)
+
+# 上下架限额表(多维表格,按产品类型分行;daily_retire 读「单日最大下架数量」,
+# 未来 listing 读「单日最大上架数量」等)
+RETIRE_LIMITS = Bitable(
+    name="上下架限额表",
+    app_token=os.environ.get("FEISHU_LIMITS_APP_TOKEN", ""),
+    table_id=os.environ.get("FEISHU_LIMITS_TABLE_ID", ""),
+    fields=_fields(
+        product_type="产品类型",
+        fba_range1="fba区间1", fba_range2="fba区间2",
+        fbm_range1="FBM区间1", fbm_range2="FBM区间2",
+        max_daily_list="单日最大上架数量",
+        max_daily_retire="单日最大下架数量",
+        inventory_note="库存特殊要求",
+    ),
+)
+
+
 # 店铺凭证表:飞书人工维护 → 程序读 + 本地快照兜底。
 # 密钥类字段(ClientSecret/代理密码)只在此表,访问权限收紧到最小人群。
 STORE_CREDENTIALS = Bitable(

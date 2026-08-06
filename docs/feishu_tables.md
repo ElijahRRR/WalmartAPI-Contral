@@ -43,6 +43,8 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | 待创建 |
 | 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);用户已建,token/sheet_id 待填 .env(FEISHU_ONLINE_SHEET_TOKEN / FEISHU_ONLINE_SHEET_ID);列序登记在 registry ONLINE_PRODUCTS_SHEET |
 | 订单中心六表(订单中心V1 应用) | 主订单/销售/采购/售后/绩效/对账 | Postgres(orders schema)权威,order_center_push 键对齐同步;主订单表/采购信息为人工域,程序只补键 | 代码已对齐用户既有表头(2026-08-06);售后表需补「唯一键」字段;app_token + 6 个 table_id 填 .env |
+| 商品停用删除表 | daily_retire 驱动表 | 登记类:运营填 A~D(store/sku/停用或删除/操作原因),程序写 E~G(feedid/操作日期/结果);状态权威在 ops.feed_log | **电子表格**(列序契约);待用户创建,token/sheet_id 填 .env(FEISHU_RETIRE_SHEET_TOKEN / FEISHU_RETIRE_SHEET_ID) |
+| 上下架限额表 | 按产品类型的单日上/下架限额配置 | 飞书人工维护 → 程序读(daily_retire 读「单日最大下架数量」,未来 listing 读上架列) | 多维表格;待接入(FEISHU_LIMITS_APP_TOKEN / FEISHU_LIMITS_TABLE_ID),限额口径待定稿(按店铺总量 vs 按店铺×产品类型) |
 
 ## 订单中心六表同步契约(order_center_push ↔ 用户既有「订单中心V1」应用)
 

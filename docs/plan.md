@@ -89,7 +89,7 @@
 | 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务。**[~] 取数前半生产验证通过**(order_sync,2026-08-06 单店 38 行;statusDate/trackingURL 按线上实证修正);审核规则待采集对接后补 |
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
-| 7 | daily_retire | 沃尔玛批量下架 | **是** | DELETE_ITEM 不可恢复;防重状态先行(ops.feed_log) |
+| 7 | daily_retire | 沃尔玛批量下架 | **是** | **[~] 代码就绪**(2026-08-06):飞书停用/删除表驱动(A~D 运营填,E~G 程序写),动作列路由 停用/下架→RETIRE_ITEM、删除→DELETE_ITEM;状态权威改 ops.feed_log(旧"只存飞书三列"风险消除);失败行不自动重试(清 E 列重排队)。待:用户建表配 token、限额表口径定稿、dry-run 生产验证。⚠切换前停旧 15:00 cron |
 | 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |

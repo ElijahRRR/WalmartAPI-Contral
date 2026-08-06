@@ -113,7 +113,11 @@ def payload_key(feed_type: str, entries: list) -> str:
 # ── ops.feed_log(三层防重的第①层)──────────────────────────────────────────
 
 def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
-    """输入:防重四元组 → 输出:(log_id, None) 抢占成功 / (None, 既有行 dict)。"""
+    """输入:防重四元组 → 输出:(log_id, None) 抢占成功 / (None, 既有行 dict)。
+
+    既有行 status='failed'(已确认未达)允许重占回 pending——failed 是唯一
+    可安全重试的终态;pending/submitted/done 一律拒绝重复提交。
+    """
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO ops.feed_log (workflow, store, feed_type, payload_key, status) "
@@ -127,6 +131,12 @@ def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
                     "WHERE feed_type = %s AND store = %s AND payload_key = %s",
                     (feed_type, store_name, key))
         prev = cur.fetchone()
+        if prev and prev[1] == "failed":
+            cur.execute("UPDATE ops.feed_log SET status = 'pending', "
+                        "updated_at = now() WHERE id = %s", (prev[0],))
+            logger.info("feed 防重:failed 行重占为 pending(%s %s)",
+                        store_name, feed_type)
+            return prev[0], None
     return None, {"id": prev[0], "status": prev[1], "feed_id": prev[2]}
 
 

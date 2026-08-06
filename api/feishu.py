@@ -432,6 +432,40 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
     return add
 
 
+def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
+    """输入:登记条目 + A1 范围(如 'A2:G500',不带 sheet 前缀)→ 输出:值矩阵。
+
+    单元格统一 ToString 渲染(公式取结果,数字转文本),调用方拿到的都是 str/None。
+    """
+    s = sheet.require()
+    data = _call("GET",
+                 f"/open-apis/sheets/v2/spreadsheets/{s.token}/values/"
+                 f"{s.sheet_id}!{a1_range}",
+                 params={"valueRenderOption": "ToString"})
+    return ((data.get("valueRange") or {}).get("values")) or []
+
+
+def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
+    """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:写入的范围数。
+
+    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补;
+    按 100 范围/批切块 values_batch_update,批间节流。
+    """
+    s = sheet.require()
+    n = 0
+    for i in range(0, len(updates), 100):
+        chunk = updates[i:i + 100]
+        _call("POST",
+              f"/open-apis/sheets/v2/spreadsheets/{s.token}/values_batch_update",
+              json_body={"valueRanges": [
+                  {"range": f"{s.sheet_id}!{rng}", "values": vals}
+                  for rng, vals in chunk]})
+        n += len(chunk)
+        if i + 100 < len(updates):
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+    return n
+
+
 def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     """输入:登记条目 + 全部数据行(含表头行)→ 输出:写入行数。整表重写语义。
 

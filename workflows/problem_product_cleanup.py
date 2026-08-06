@@ -14,6 +14,7 @@ problem_products,规则逐字移植旧系统)→ 三路:
   Stage 待发布            → 排除不动
   A 过期(有 productId,30 天内反补 <2 次)→ MP_MAINTENANCE 设置商品到期日期(2049)救活
   其余(含 A 类落选/反补满 2 次转删)      → DELETE_ITEM 永久删除
+  删除未生效顽固 SKU(delete_not_effective)→ 绕过防重窗,停用+删除双 feed 齐发
 
 去重(全部查库,替代旧三个 cache JSON):
   ① 在途:ops.feed_items 有 submitted 未落定 → 跳过;
@@ -64,6 +65,12 @@ SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
 FROM catalog.product_events WHERE event = 'problem_categorized'
 ORDER BY store, sku, occurred_at DESC
 """
+_SQL_STUBBORN = """
+SELECT DISTINCT ON (store, sku) store, sku, event
+FROM catalog.product_events
+WHERE event IN ('delete_verified', 'delete_not_effective')
+ORDER BY store, sku, occurred_at DESC
+"""
 _SQL_STATUS = """
 SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
 ORDER BY store, data_date DESC
@@ -81,16 +88,20 @@ def _load_state():
         attempts = {(s, k): n for s, k, n in cur.fetchall()}
         cur.execute(_SQL_LAST_CAT)
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
+        cur.execute(_SQL_STUBBORN)
+        stubborn = {(st, k) for st, k, ev in cur.fetchall()
+                    if ev == 'delete_not_effective'}
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
     inflight = {(s, k) for s, k, _ft, st in recent if st == "submitted"}
     recent_del = {(s, k) for s, k, ft, st in recent
                   if ft == "DELETE_ITEM" and st in ("submitted", "success")}
-    return items, inflight, recent_del, attempts, last_cat, inactive
+    return items, inflight, recent_del, attempts, last_cat, inactive, stubborn
 
 
-def plan(items, inflight, recent_del, attempts, inactive):
+def plan(items, inflight, recent_del, attempts, inactive,
+         stubborn=frozenset()):
     """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
     计划形如 {店铺: {"relist": [item行], "delete": [item行]}};
@@ -98,7 +109,7 @@ def plan(items, inflight, recent_del, attempts, inactive):
     """
     out: dict[str, dict] = {}
     n = {"stage": 0, "inflight": 0, "recent": 0, "inactive": 0,
-         "relist": 0, "delete": 0, "fallback": 0}
+         "relist": 0, "delete": 0, "fallback": 0, "stubborn": 0}
     for it in items:
         key = (it["store"], it["sku"])
         if it["store"] in inactive:
@@ -112,7 +123,15 @@ def plan(items, inflight, recent_del, attempts, inactive):
             continue
         code, name = pp.categorize(it["reasons"])
         it["category"], it["cat_name"] = code, name
-        bucket = out.setdefault(it["store"], {"relist": [], "delete": []})
+        bucket = out.setdefault(it["store"],
+                                {"relist": [], "delete": [], "retire": []})
+        if key in stubborn:
+            # 删除未生效的顽固 SKU(所有者定稿):绕过 7 天防重窗,
+            # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
+            bucket["retire"].append(it)
+            bucket["delete"].append(it)
+            n["stubborn"] += 1
+            continue
         if code == "A":
             if attempts.get(key, 0) >= pp.MAX_ATTEMPTS:
                 n["fallback"] += 1          # 反补满 2 次仍过期 → 转删除兜底
@@ -157,19 +176,20 @@ def _record_categories(items: list[dict], last_cat: dict) -> int:
 def run(params: dict) -> str:
     """输入:params(execute/store)→ 输出:归类统计与提交结果摘要。"""
     execute = bool(params.get("execute"))
-    items, inflight, recent_del, attempts, last_cat, inactive = _load_state()
+    (items, inflight, recent_del, attempts, last_cat, inactive,
+     stubborn) = _load_state()
     only = params.get("store")
     if only:
         items = [i for i in items if i["store"] == only]
     if not items:
         return "无问题商品(UNPUBLISHED/SYSTEM_PROBLEM 且在架)"
 
-    plans, n = plan(items, inflight, recent_del, attempts, inactive)
+    plans, n = plan(items, inflight, recent_del, attempts, inactive, stubborn)
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}问题商品 {len(items)} 行:反补 {n['relist']},删除 {n['delete']}"
              f"(含反补满额转删 {n['fallback']}),Stage 排除 {n['stage']},"
              f"在途跳过 {n['inflight']},近 7 天已提交跳过 {n['recent']},"
-             f"非 ACTIVE 店跳过 {n['inactive']}"]
+             f"非 ACTIVE 店跳过 {n['inactive']},顽固双击 {n['stubborn']}"]
 
     if not execute:
         for store, b in sorted(plans.items()):
@@ -195,6 +215,14 @@ def run(params: dict) -> str:
                     _record(store_name, "maintenance_submitted",
                             b["relist"][:res["count"]], res["feed_id"])
             lines.append(f"  {store_name}:反补提交 {len(b['relist'])}")
+        if b["retire"]:
+            for res in feeds.submit_feed(store, "RETIRE_ITEM",
+                                         [r["sku"] for r in b["retire"]],
+                                         workflow="problem_product_cleanup"):
+                if res["feed_id"]:
+                    _record(store_name, "retire_submitted",
+                            b["retire"][:res["count"]], res["feed_id"])
+            lines.append(f"  {store_name}:顽固停用提交 {len(b['retire'])}")
         if b["delete"]:
             for res in feeds.submit_feed(store, "DELETE_ITEM",
                                          [r["sku"] for r in b["delete"]],

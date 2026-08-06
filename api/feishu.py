@@ -245,6 +245,59 @@ def batch_delete(table: Bitable, record_ids: list[str]) -> int:
     return n
 
 
+def _plain_text(v) -> str:
+    """输入:records/search 返回的字段值 → 输出:纯文本(文本字段可能是分段结构)。"""
+    if isinstance(v, list):
+        return "".join(str(seg.get("text", "")) if isinstance(seg, dict) else str(seg)
+                       for seg in v)
+    if v is None:
+        return ""
+    return str(v)
+
+
+def sync_by_key(table: Bitable, key_field: str,
+                desired: dict[str, dict]) -> tuple[int, int, int]:
+    """输入:表 + 去重键字段名 + {键: fields dict} → 输出:(新建, 更新, 删除) 计数。
+
+    展示投影同步(PG 权威,飞书可重建):键不存在则建,存在则整行覆盖更新
+    (desired 里为 None 的字段显式送 null 清空,不能省略——省略=保留飞书旧值),
+    飞书多出的键删除。**仅限程序独占的展示表**,登记类表(人工维护)禁用。
+    重复键(人工复制行等)保留最早一条,其余删除并记日志。
+
+    防错登记守卫:表里已有记录但没有任何一行能读出键字段 → 大概率 table_id
+    填错(指向了别的表),拒绝执行而不是把人家的表清空。
+    """
+    existing = list_records(table, field_names=[key_field])
+    by_key: dict[str, str] = {}
+    dupes: list[str] = []
+    for rec in existing:
+        k = _plain_text(rec["fields"].get(key_field)).strip()
+        if not k or k in by_key:
+            dupes.append(rec["record_id"])
+        else:
+            by_key[k] = rec["record_id"]
+    if existing and not by_key:
+        raise FeishuError(None,
+                          f"表「{table.name}」现有 {len(existing)} 行均无「{key_field}」字段值,"
+                          f"疑似 table_id 登记错表,拒绝同步(会清空对方数据)")
+    if dupes:
+        logger.warning("表「%s」发现 %d 行重复/无键记录,将删除", table.name, len(dupes))
+
+    creates = [f for k, f in desired.items() if k not in by_key]
+    updates = [{"record_id": by_key[k], "fields": f}
+               for k, f in desired.items() if k in by_key]
+    deletes = dupes + [rid for k, rid in by_key.items() if k not in desired]
+    if creates:
+        batch_create(table, creates)
+    if updates:
+        batch_update(table, updates)
+    if deletes:
+        batch_delete(table, deletes)
+    logger.info("表「%s」同步:新建 %d,更新 %d,删除 %d",
+                table.name, len(creates), len(updates), len(deletes))
+    return len(creates), len(updates), len(deletes)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  电子表格(sheets)——仅用于行数超 bitable 套餐上限的大表(如在线产品总表)
 #  切块/节流参数照抄旧系统实测:4000 行/块(20 列约 4MB,5000 行撞 90227)、块间 0.3s

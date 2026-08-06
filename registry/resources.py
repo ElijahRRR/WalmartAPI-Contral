@@ -123,6 +123,72 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
 )
 
 
+# ── 订单中心四表(order_center_push 写,程序独占展示投影,可随时重建)────────
+# 同一个多维表格应用(app_token 共用)下四张数据表;PG orders schema 是权威,
+# 飞书行数受窗口参数约束(销售/售后默认 90 天),远低于 5 万行套餐上限。
+# 每表第一列是去重键(sync_by_key 的对齐锚点),人工不得改动该列。
+
+_ORDER_APP = os.environ.get("FEISHU_ORDER_APP_TOKEN", "")
+
+ORDER_SALES = Bitable(
+    name="订单中心-销售订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_SALES_TABLE_ID", ""),
+    fields=_fields(
+        key="行ID", store="店铺", po_id="PO号", line_number="行号",
+        customer_order_id="客户单号", sku="SKU", product_name="商品名",
+        qty="数量", sale_status="订单状态", status_date="状态时间",
+        order_date="下单时间", product_amount="商品金额", shipping_amount="运费",
+        cancel_reason="取消原因", refund_amount="退款金额",
+        carrier="承运商", tracking_no="物流单号", tracking_url="物流链接",
+        return_status="售后状态", refund_status="售后退款状态",
+        return_total="售后金额", perf_metrics="绩效指标",
+        settled_net="入账净额", settle_status="入账状态", audit_status="审核结果",
+    ),
+)
+
+ORDER_RETURNS = Bitable(
+    name="订单中心-售后订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_RETURNS_TABLE_ID", ""),
+    fields=_fields(
+        key="唯一键", rma="RMA号", order_line_id="订单行ID", store="店铺",
+        po_id="PO号", sku="SKU", product_name="商品名",
+        return_status="售后状态", refund_status="退款状态",
+        return_method="退货方式", is_keep_it="免退回", refund_total="退款金额",
+        return_reason="退货原因", qty="数量", refunded_qty="已退数量",
+        carrier="承运商", tracking_no="物流单号",
+        return_created="发起时间", return_by="退回截止",
+    ),
+)
+
+ORDER_PERF = Bitable(
+    name="订单中心-绩效订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_PERF_TABLE_ID", ""),
+    fields=_fields(
+        key="唯一键", store="店铺", po_id="PO号", metric="指标",
+        sku="SKU", product_name="商品名",
+        first_period="首次周期", last_period="最近周期",
+        periods_seen="出现周期数", ever_accountable="计入绩效",
+        still_active="仍在影响",
+    ),
+)
+
+ORDER_SETTLE = Bitable(
+    name="订单中心-对账明细",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_SETTLE_TABLE_ID", ""),
+    fields=_fields(
+        key="行ID", store="店铺", po_id="PO号", line_number="行号",
+        sku="SKU", product_name="商品名",
+        net_amount="净额", gross_amount="交易额",
+        product_amount="商品金额", commission_amount="佣金",
+        periods="账期数", last_settle_date="最近入账日", settle_status="入账状态",
+    ),
+)
+
+
 # 店铺凭证表:飞书人工维护 → 程序读 + 本地快照兜底。
 # 密钥类字段(ClientSecret/代理密码)只在此表,访问权限收紧到最小人群。
 STORE_CREDENTIALS = Bitable(

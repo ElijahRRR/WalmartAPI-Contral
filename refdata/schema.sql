@@ -46,9 +46,10 @@ CREATE TABLE IF NOT EXISTS catalog.snapshots (
     source_id     text            -- 采集器侧记录 ID,幂等去重用
 );
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_source_id_uidx ON catalog.snapshots (source_id);
-CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
 
 -- 迁移块(2026-08-06 拍板:products 主键 asin → (marketplace, asin);对已部署空表幂等生效)
+-- ⚠ 必须先于下面依赖 marketplace 列的索引执行:旧库表已存在(CREATE IF NOT EXISTS 跳过),
+--   列要靠这里补;先建索引会 UndefinedColumn(2026-08-06 生产实证)
 ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
 DO $$
@@ -60,6 +61,8 @@ BEGIN
     ALTER TABLE catalog.products ADD PRIMARY KEY (marketplace, asin);
   END IF;
 END $$;
+
+CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
 
 CREATE OR REPLACE VIEW catalog.latest_snapshot AS
   SELECT DISTINCT ON (marketplace, asin, scrape_params) *

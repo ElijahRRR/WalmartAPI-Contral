@@ -124,7 +124,7 @@ def test_push_perf_shaping(monkeypatch):
     desired = captured["订单中心-绩效订单"]["desired"]
     assert set(desired) == {"PO1|otd", "PO2|自创指标"}
     d1 = desired["PO1|otd"]
-    assert d1[F_PERF.metric] == "🚚 OTD"          # emoji 展示名契约
+    assert d1[F_PERF.metric] == "OTD"    # 单选预设无 emoji(v1 init_bitable 实证)
     assert d1[F_PERF.status] == "影响中"
     assert d1[F_PERF.period_span] == "2026-08-01 ~ 2026-08-06(共 3 期)"
     assert "PO #:PO1" in d1[F_PERF.description]

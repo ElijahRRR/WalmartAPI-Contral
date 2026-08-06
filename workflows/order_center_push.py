@@ -285,8 +285,11 @@ def _push_perf() -> str:
             f.key: key, f.order_line_id: r["order_line_id"],
             f.order_date: _cell(r["order_date"]), f.store: r["store"],
             f.po_id: r["po_id"],
-            # 指标推 emoji 展示名(日报同款契约),未知指标原样
-            f.metric: kpi.METRIC_LABELS.get(r["metric"], r["metric"]),
+            # 指标类型单选的预设选项是无 emoji 纯文本(订单中心v1 init_bitable
+            # 实证:OTD/取消率/退货率…)——剥掉日报契约的 emoji 前缀再写,
+            # 否则飞书自动建出一套带 emoji 的重复选项;未知指标原样
+            f.metric: kpi.METRIC_LABELS.get(r["metric"], r["metric"])
+                         .split(" ", 1)[-1],
             f.accountable: r["ever_accountable"],
             f.description: _detail_desc(r["detail"]),
             # 仍出现在最近一期报表 = 仍拖当前绩效分;消失 = 滚出官方统计窗口

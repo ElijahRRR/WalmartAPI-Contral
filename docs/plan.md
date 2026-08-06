@@ -88,7 +88,7 @@
 | 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
-| — | order_center_push | (新增) | 否 | 订单中心投影到用户既有「订单中心V1」bitable 六表:销售/售后/绩效/对账程序写,主订单表/采购信息只补首列键(人工域);全表不删行(枢纽有关联字段);PG 权威。**[~] 代码就绪并已对齐用户表头**(2026-08-06);待:售后表补「唯一键」字段、.env 登记 app_token+6 个 table_id、清空旧数据行后生产验证 |
+| — | order_center_push | (新增) | 否 | 订单中心投影到用户既有「订单中心V1」bitable 六表:销售/售后/绩效/对账程序写(按表内真实字段类型自适应),主订单表/采购信息只补首列键(人工域);全表不删行(枢纽有关联字段);PG 权威。**[~] 单店生产验证通过**(2026-08-06,202/61/29/451 行 + 键补齐 202×2,增量幂等验证);待:全店跑+挂调度;Lookup 列(下单时间等)依赖主订单表关联字段接线,程序暂不写关联 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |

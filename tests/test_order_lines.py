@@ -66,12 +66,13 @@ _ORDER = {
         "name": "N", "address1": "A1", "city": "C", "state": "TX",
         "postalCode": "75001", "country": "USA"}},
     "orderLines": {"orderLine": [{
-        "lineNumber": "1",
+        "lineNumber": "1", "statusDate": 1785722223000,
         "item": {"sku": "B0AAAA1111", "productName": "P"},
         "orderLineQuantity": {"amount": "2"},
         "orderLineStatuses": {"orderLineStatus": {
             "status": "Shipped", "statusSetDate": 1754310000000,
             "trackingInfo": {"carrierName": {"carrier": "USPS"},
+                             "trackingURL": "https://www.walmart.com/tracking?tracking_id=9400",
                              "trackingNumber": "9400", "shipDateTime": 1754305000000}}},
         "fulfillment": {"pickUpDateTime": 1754400000000},
         "charges": {"charge": [
@@ -93,7 +94,10 @@ def test_extract_order_lines_full_parse():
     assert r["qty"] == 2 and r["sale_status"] == "Shipped"
     assert r["product_amount"] == 19.99 and r["shipping_amount"] == 5.0
     assert r["refund_amount"] == -19.99 and r["refund_comments"] == "broken"
-    assert r["carrier"] == "USPS" and "usps.com" in r["tracking_url"]
+    assert r["carrier"] == "USPS"
+    assert r["tracking_url"] == "https://www.walmart.com/tracking?tracking_id=9400"  # 官方优先
+    assert r["status_date"] is not None      # 实证:statusDate 在 orderLine 层
+    assert ol.tracking_url("USPS", "9400").startswith("https://tools.usps.com")  # 自拼回退仍在
     # 已发货订单无 estimated*:est_ship 回退 shipDateTime,est_delivery 回退 pickUpDateTime
     assert r["est_ship_date"] is not None and r["est_delivery_date"] is not None
     assert r["postal_code"] == "75001"

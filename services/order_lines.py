@@ -143,7 +143,9 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             "product_name": str((ol.get("item") or {}).get("productName") or ""),
             "qty": int(_num((ol.get("orderLineQuantity") or {}).get("amount"), 1) or 1),
             "sale_status": st.get("status", ""),
-            "status_date": _ts(st.get("statusSetDate")),
+            # 实证(2026-08-06 生产 raw):时间戳叫 statusDate 且在 orderLine 层,
+            # PLAN 文档写的 orderLineStatus.statusSetDate 线上不存在,留作回退
+            "status_date": _ts(ol.get("statusDate") or st.get("statusSetDate")),
             "order_date": _ts(order.get("orderDate")),
             "est_ship_date": _ts(fulfil.get("estimatedShipDate") or ti.get("shipDateTime")),
             "est_delivery_date": _ts(fulfil.get("estimatedDeliveryDate")
@@ -152,7 +154,8 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             "cancel_reason": str(ol.get("cancellationReason") or ""),
             "refund_amount": refund_amt, "refund_comments": refund_note,
             "carrier": carrier, "tracking_no": tracking,
-            "tracking_url": tracking_url(carrier, tracking),
+            # 官方自带 trackingURL(实证),缺失才自拼(UPS/FedEx/USPS 专链,其余 17track)
+            "tracking_url": ti.get("trackingURL") or tracking_url(carrier, tracking),
             "ship_name": str(addr.get("name") or ""), "phone": str(phone),
             "address1": str(addr.get("address1") or ""),
             "address2": str(addr.get("address2") or ""),

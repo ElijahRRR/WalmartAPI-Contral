@@ -204,6 +204,18 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
+CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
+    table_id    text NOT NULL,      -- 飞书 table_id
+    row_key     text NOT NULL,      -- 行去重键(order_line_id / 唯一键 / perf_key)
+    record_id   text NOT NULL,      -- 飞书行内部编号(更新按它定位)
+    pushed_hash text,               -- 上次写入飞书时的载荷指纹
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_id, row_key)
+);
+-- 日常同步零拉表:本地比指纹定位要写的行;状态为空(首轮)或任何写失败
+-- 自动清状态 → 下轮全量拉表重建映射(自愈);-p reconcile=1 强制对账。
+-- 前提纪律:六表不删行、不复制行、键列不手改(打破由对账发现并告警)。
+
 CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧系统散落的 _meta sheet)
     name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
     value       jsonb NOT NULL,

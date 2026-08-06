@@ -36,17 +36,12 @@ def test_detail_desc():
 def _capture_sync(monkeypatch):
     captured = {}
 
-    def fake_sync(table, key_field, desired, *, delete_stale=True, hash_field=None):
-        captured[table.name] = {"key_field": key_field, "desired": desired,
-                                "delete_stale": delete_stale,
-                                "hash_field": hash_field}
+    def fake_sync(table, desired, reconcile=False):
+        captured[table.name] = {"key_field": table.fields.key,
+                                "desired": desired, "reconcile": reconcile}
         return (len(desired), 0, 0)
 
-    monkeypatch.setattr(feishu, "sync_by_key", fake_sync)
-    # 类型适配层直通:全部字段给未知类型码 → _conv 原样放行,断言拿到规范值
-    monkeypatch.setattr(feishu, "list_fields", lambda t: [
-        {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
-    monkeypatch.setattr(feishu, "create_field", lambda *a, **k: None)
+    monkeypatch.setattr(ocp, "_sync_stateful", fake_sync)
     return captured
 
 
@@ -74,7 +69,6 @@ def test_push_sales_row_shape_and_no_delete(monkeypatch):
     assert "1 行" in line and keys == {"ol_abc"}
     cap = captured["订单中心-销售订单"]
     assert cap["key_field"] == F_SALES.key == "order_line_id"
-    assert cap["delete_stale"] is False     # 主订单表有关联,任何表不删行
     d = cap["desired"]["ol_abc"]
     assert d[F_SALES.po_id] == "PO1" and F_SALES.po_id == "采购订单号"
     assert d[F_SALES.order_date] == int(_SALES_ROW["order_date"].timestamp() * 1000)
@@ -160,19 +154,26 @@ def test_push_settlement_latest_period_fields(monkeypatch):
         datetime(2026, 7, 29, tzinfo=timezone.utc).timestamp() * 1000)
 
 
-def test_push_keys_creates_only(monkeypatch):
-    calls = []
-
-    def fake_ensure(table, key_field, keys):
-        calls.append((table.name, key_field, set(keys)))
-        return 2
-
-    monkeypatch.setattr(feishu, "ensure_keys", fake_ensure)
+def test_push_keys_creates_only_missing(monkeypatch):
+    import dataclasses
+    monkeypatch.setattr(resources, "ORDER_MAIN", dataclasses.replace(
+        resources.ORDER_MAIN, app_token="appT", table_id="tblMain"))
+    monkeypatch.setattr(resources, "ORDER_PURCHASE", dataclasses.replace(
+        resources.ORDER_PURCHASE, app_token="appT", table_id="tblPur"))
+    created, saved = [], []
+    monkeypatch.setattr(ocp, "_load_state",
+                        lambda t: {"ol_a": ("r1", None)})
+    monkeypatch.setattr(ocp, "_save_state",
+                        lambda t, entries: saved.append((t.name, entries)))
+    monkeypatch.setattr(feishu, "batch_create",
+                        lambda t, fl: (created.append((t.name, fl)),
+                                       [f"n{i}" for i in range(len(fl))])[1])
     lines = ocp._push_keys({"ol_a", "ol_b"})
-    assert len(lines) == 2 and all("键补齐 2 行" in x for x in lines)
-    assert calls[0][1] == "order_line_id" and calls[0][2] == {"ol_a", "ol_b"}
-    names = {c[0] for c in calls}
-    assert names == {"订单中心-主订单表", "订单中心-采购信息"}
+    # 状态里已有 ol_a → 只建 ol_b;record_id 回存本地状态
+    assert len(lines) == 2 and all("键补齐 1 行" in x for x in lines)
+    assert created[0][1] == [{"order_line_id": "ol_b"}]
+    assert saved[0][1] == [("ol_b", "n0", None)]
+    assert {c[0] for c in created} == {"订单中心-主订单表", "订单中心-采购信息"}
 
 
 def test_run_skips_unregistered_tables(monkeypatch):
@@ -190,17 +191,15 @@ def test_run_partial_failure_raises_after_all_tables(monkeypatch):
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [])
     seen = []
 
-    def fake_sync(table, key_field, desired, *, delete_stale=True, hash_field=None):
+    def fake_sync(table, desired, reconcile=False):
         seen.append(table.name)
         if table is resources.ORDER_SALES:
             raise feishu.FeishuError(123, "boom")
         return (0, 0, 0)
 
-    monkeypatch.setattr(feishu, "sync_by_key", fake_sync)
-    monkeypatch.setattr(feishu, "ensure_keys", lambda t, k, keys: 0)
-    monkeypatch.setattr(feishu, "list_fields", lambda t: [
-        {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
-    monkeypatch.setattr(feishu, "create_field", lambda *a, **k: None)
+    monkeypatch.setattr(ocp, "_sync_stateful", fake_sync)
+    monkeypatch.setattr(ocp, "_push_keys",
+                        lambda keys, reconcile=False: ["keys ok"])
     with pytest.raises(RuntimeError, match="部分表同步失败"):
         ocp.run({})
     # 销售表失败不挡后面的表(售后/绩效/对账仍同步)
@@ -257,3 +256,75 @@ def test_adapt_rows_missing_key_field_raises(monkeypatch):
                         lambda table: [{"field_name": "别的列", "type": 1}])
     with pytest.raises(feishu.FeishuError, match="缺少键字段"):
         ocp._adapt_rows(res.ORDER_RETURNS, {"k": {"唯一键": "k"}})
+
+
+# ── 本地状态驱动同步(日常零拉表)────────────────────────────────────────────
+
+
+def _state_env(monkeypatch, state: dict):
+    """搭 _sync_stateful 的假环境:内存状态 + 捕获的飞书写调用。"""
+    calls = {"create": None, "update": None, "saved": [], "dropped": []}
+    monkeypatch.setattr(ocp, "_adapt_rows",
+                        lambda t, d: {k: dict(v) for k, v in d.items()})
+    monkeypatch.setattr(ocp, "_load_state", lambda t: dict(state))
+    monkeypatch.setattr(ocp, "_save_state",
+                        lambda t, entries: calls["saved"].append(entries))
+    monkeypatch.setattr(ocp, "_drop_state",
+                        lambda t: calls["dropped"].append(t.name))
+    monkeypatch.setattr(feishu, "batch_create",
+                        lambda t, fl: (calls.__setitem__("create", fl),
+                                       [f"n{i}" for i in range(len(fl))])[1])
+    monkeypatch.setattr(feishu, "batch_update",
+                        lambda t, ups: (calls.__setitem__("update", ups),
+                                        len(ups))[1])
+    # 日常路径绝不许拉表
+    monkeypatch.setattr(feishu, "list_records",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("日常同步不应拉飞书表")))
+    return calls
+
+
+def test_sync_stateful_local_diff_no_pull(monkeypatch):
+    t = resources.ORDER_PERF
+    same = {"perf_key": "k1", "x": 1}
+    h_same = feishu._row_hash(same, ocp._HASH_FIELD)
+    calls = _state_env(monkeypatch, {
+        "k1": ("r1", h_same),      # 指纹一致 → 跳过
+        "k2": ("r2", "stale"),     # 指纹不同 → 按 record_id 更新
+    })
+    c, u, s = ocp._sync_stateful(t, {
+        "k1": dict(same),
+        "k2": {"perf_key": "k2", "x": 9},
+        "k3": {"perf_key": "k3"},  # 状态没有 → 新建
+    })
+    assert (c, u, s) == (1, 1, 1)
+    assert calls["update"][0]["record_id"] == "r2"
+    assert calls["create"][0]["perf_key"] == "k3"
+    # 新建行的 record_id 与指纹都回存本地状态
+    assert calls["saved"][0][0][0] == "k3" and calls["saved"][0][0][1] == "n0"
+
+
+def test_sync_stateful_bootstraps_when_state_empty(monkeypatch):
+    t = resources.ORDER_PERF
+    calls = _state_env(monkeypatch, {})
+    payload = {"perf_key": "k1", "x": 1}
+    h = feishu._row_hash(payload, ocp._HASH_FIELD)
+    monkeypatch.setattr(feishu, "list_records", lambda table, field_names: [
+        {"record_id": "rA", "fields": {"perf_key": "k1",
+                                       ocp._HASH_FIELD: h}}])
+    c, u, s = ocp._sync_stateful(t, {"k1": dict(payload)})
+    # 首轮:拉表重建映射 → k1 已存在且指纹一致 → 零写入
+    assert (c, u, s) == (0, 0, 1)
+    assert calls["create"] is None and calls["update"] is None
+
+
+def test_sync_stateful_write_failure_drops_state(monkeypatch):
+    t = resources.ORDER_PERF
+    calls = _state_env(monkeypatch, {"k1": ("r1", "stale")})
+
+    def boom(*a, **k):
+        raise feishu.FeishuError(500, "down")
+    monkeypatch.setattr(feishu, "batch_update", boom)
+    with pytest.raises(feishu.FeishuError):
+        ocp._sync_stateful(t, {"k1": {"perf_key": "k1"}})
+    assert calls["dropped"] == [t.name]      # 清状态,下轮全量对账自愈

@@ -331,6 +331,17 @@ CREATE TABLE IF NOT EXISTS orders.orders (
 
 -- ── ops:运行域(状态与业务同库,可同事务修改)────────────────────────────
 
+CREATE TABLE IF NOT EXISTS ops.feishu_sync_state (
+    -- 飞书投影同步状态:键 → record_id + 上次写入指纹(order_center_push)
+    -- 日常同步零拉表:本地比指纹定位要写的行;状态缺失/写失败时全量拉表重建
+    table_id    text NOT NULL,          -- 飞书 table_id
+    row_key     text NOT NULL,          -- 行去重键(order_line_id / 唯一键 / perf_key)
+    record_id   text NOT NULL,          -- 飞书行内部编号(更新按它定位)
+    pushed_hash text,                   -- 上次写入飞书时的载荷指纹
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_id, row_key)
+);
+
 CREATE TABLE IF NOT EXISTS ops.runs (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     workflow    text NOT NULL,

@@ -178,10 +178,112 @@ def _adapt_rows(table, desired: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
+# ── 本地同步状态(ops.feishu_sync_state):日常零拉表 ─────────────────────────
+# 键 → (record_id, 上次写入指纹)。推送时现算载荷指纹与存的比:一致跳过,
+# 不一致按 record_id 更新,新键建行并回存 record_id。
+# 自愈:状态为空(首轮/被清)→ 全量拉表重建映射(record_id 取自飞书,
+# 指纹取行内「同步指纹」列);任何写失败 → 清该表状态,下轮自动重建。
+# 前提纪律(所有者承诺):六表不删行、不复制行、键列不手改。
+
+
+def _load_state(table) -> dict[str, tuple[str, str | None]]:
+    """输入:表 → 输出:{键: (record_id, 上次写入指纹)}。"""
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT row_key, record_id, pushed_hash "
+                    "FROM ops.feishu_sync_state WHERE table_id = %s",
+                    (table.table_id,))
+        return {k: (rid, h) for k, rid, h in cur.fetchall()}
+
+
+def _save_state(table, entries: list[tuple[str, str, str | None]]) -> None:
+    """输入:表 + [(键, record_id, 指纹)] → 输出:无(upsert)。"""
+    if not entries:
+        return
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO ops.feishu_sync_state "
+            "(table_id, row_key, record_id, pushed_hash) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (table_id, row_key) DO UPDATE SET "
+            "record_id = EXCLUDED.record_id, pushed_hash = EXCLUDED.pushed_hash, "
+            "updated_at = now()",
+            [(table.table_id, k, rid, h) for k, rid, h in entries])
+
+
+def _drop_state(table) -> None:
+    with db.pg_conn() as conn:
+        conn.execute("DELETE FROM ops.feishu_sync_state WHERE table_id = %s",
+                     (table.table_id,))
+
+
+def _bootstrap_state(table, *, with_hash: bool = True) -> dict:
+    """全量拉表重建键→record_id 映射(首轮/自愈/对账),写回状态表。
+
+    with_hash=False 用于主订单表/采购信息(表内无「同步指纹」列)。
+    重复键(承诺不该出现)保留首条并告警,绝不静默。
+    """
+    key_field = table.fields.key
+    names = [key_field] + ([_HASH_FIELD] if with_hash else [])
+    state: dict[str, tuple[str, str | None]] = {}
+    dupes = 0
+    for rec in feishu.list_records(table, field_names=names):
+        k = feishu._plain_text(rec["fields"].get(key_field)).strip()
+        if not k:
+            continue
+        if k in state:
+            dupes += 1
+            continue
+        h = (feishu._plain_text(rec["fields"].get(_HASH_FIELD)).strip() or None) \
+            if with_hash else None
+        state[k] = (rec["record_id"], h)
+    if dupes:
+        logger.warning("表「%s」对账发现 %d 行重复键(纪律要求不复制行),"
+                       "已按首条对齐,请人工清理", table.name, dupes)
+    _save_state(table, [(k, rid, h) for k, (rid, h) in state.items()])
+    logger.info("表「%s」同步状态重建:%d 行", table.name, len(state))
+    return state
+
+
+def _sync_stateful(t, desired: dict[str, dict],
+                   reconcile: bool = False) -> tuple[int, int, int]:
+    """输入:表 + {键: 规范载荷} → 输出:(新建, 更新, 指纹一致跳过)。
+
+    本地状态驱动:日常不拉飞书表;reconcile=True 强制清状态走全量对账。
+    """
+    adapted = _adapt_rows(t, desired)
+    for f in adapted.values():
+        f[_HASH_FIELD] = feishu._row_hash(f, _HASH_FIELD)
+    if reconcile:
+        _drop_state(t)
+    state = _load_state(t) or _bootstrap_state(t)
+
+    creates = {k: f for k, f in adapted.items() if k not in state}
+    updates = {k: f for k, f in adapted.items()
+               if k in state and state[k][1] != f[_HASH_FIELD]}
+    skipped = len(adapted) - len(creates) - len(updates)
+    try:
+        if creates:
+            ids = feishu.batch_create(t, list(creates.values()))
+            _save_state(t, [(k, rid, creates[k][_HASH_FIELD])
+                            for k, rid in zip(creates, ids)])
+        if updates:
+            feishu.batch_update(t, [{"record_id": state[k][0], "fields": f}
+                                    for k, f in updates.items()])
+            _save_state(t, [(k, state[k][0], f[_HASH_FIELD])
+                            for k, f in updates.items()])
+    except feishu.FeishuError:
+        # 映射可能已与远端漂移(如行被手删):清状态,下轮全量对账自愈
+        _drop_state(t)
+        logger.warning("表「%s」写入失败,已清同步状态,下轮自动全量对账重建", t.name)
+        raise
+    logger.info("表「%s」同步:新建 %d,更新 %d,指纹一致跳过 %d",
+                t.name, len(creates), len(updates), skipped)
+    return len(creates), len(updates), skipped
+
+
 def _cell(v):
     """输入:PG 单元值 → 输出:bitable 可写值(日期→毫秒,Decimal→float,None 原样)。
 
-    None 必须保留并显式写入(sync_by_key 更新语义:省略字段=保留飞书旧值,
+    None 必须保留并显式写入(更新语义:省略字段=保留飞书旧值,
     送 null 才是清空)。
     """
     if v is None or isinstance(v, bool):
@@ -213,7 +315,7 @@ def _fetch(sql: str, args: tuple) -> list[dict]:
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
-def _push_sales(days: int) -> tuple[str, set[str]]:
+def _push_sales(days: int, reconcile: bool = False) -> tuple[str, set[str]]:
     """返回 (结果行, 本窗口键集合)——键集合供主订单表/采购信息补齐。"""
     t = resources.ORDER_SALES
     f = t.fields
@@ -240,13 +342,12 @@ def _push_sales(days: int) -> tuple[str, set[str]]:
             f.postal_code: r["postal_code"], f.country: r["country"],
             f.pulled_at: _cell(r["updated_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False, hash_field=_HASH_FIELD)
-    return (f"销售订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}",
+    c, u, s = _sync_stateful(t, desired, reconcile)
+    return (f"销售订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u} 跳过 {s}",
             set(desired))
 
 
-def _push_returns(days: int) -> str:
+def _push_returns(days: int, reconcile: bool = False) -> str:
     t = resources.ORDER_RETURNS
     f = t.fields
     desired = {}
@@ -274,12 +375,11 @@ def _push_returns(days: int) -> str:
             f.carrier: r["carrier"], f.tracking_no: r["tracking_no"],
             f.is_keep_it: r["is_keep_it"],
         }
-    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False, hash_field=_HASH_FIELD)
-    return f"售后订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
+    c, u, s = _sync_stateful(t, desired, reconcile)
+    return f"售后订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u} 跳过 {s}"
 
 
-def _push_perf() -> str:
+def _push_perf(reconcile: bool = False) -> str:
     t = resources.ORDER_PERF
     f = t.fields
     desired = {}
@@ -305,12 +405,11 @@ def _push_perf() -> str:
                        if r["detail"] is not None else None),
             f.pulled_at: _cell(r["last_seen_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False, hash_field=_HASH_FIELD)
-    return f"绩效订单:{len(desired)} 行(全量),新建 {c} 更新 {u}"
+    c, u, s = _sync_stateful(t, desired, reconcile)
+    return f"绩效订单:{len(desired)} 行(全量),新建 {c} 更新 {u} 跳过 {s}"
 
 
-def _push_settlement(days: int) -> str:
+def _push_settlement(days: int, reconcile: bool = False) -> str:
     t = resources.ORDER_SETTLE
     f = t.fields
     desired = {}
@@ -331,18 +430,35 @@ def _push_settlement(days: int) -> str:
             f.settle_date: _cell(r["last_settle_date"]),
             f.pulled_at: _cell(r["updated_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
-                                 delete_stale=False, hash_field=_HASH_FIELD)
-    return f"对账明细:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
+    c, u, s = _sync_stateful(t, desired, reconcile)
+    return f"对账明细:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u} 跳过 {s}"
 
 
-def _push_keys(sales_keys: set[str]) -> list[str]:
-    """主订单表/采购信息:补齐销售窗口内缺失的 order_line_id 行(只写键列)。"""
+def _push_keys(sales_keys: set[str], reconcile: bool = False) -> list[str]:
+    """主订单表/采购信息:补齐销售窗口内缺失的 order_line_id 行(只写键列)。
+
+    同样走本地状态:缺键按状态判断,不逐轮拉表;首轮/自愈时全量重建映射。
+    """
     lines = []
     for t in (resources.ORDER_MAIN, resources.ORDER_PURCHASE):
         try:
-            n = feishu.ensure_keys(t, t.fields.key, sales_keys)
-            lines.append(f"{t.name}:键补齐 {n} 行")
+            t.require()     # 未登记先跳过,别碰状态库
+            if reconcile:
+                _drop_state(t)
+            state = _load_state(t) or _bootstrap_state(t, with_hash=False)
+            missing = sorted(k for k in sales_keys if k and k not in state)
+            if missing:
+                try:
+                    ids = feishu.batch_create(
+                        t, [{t.fields.key: k} for k in missing])
+                    _save_state(t, [(k, rid, None)
+                                    for k, rid in zip(missing, ids)])
+                except feishu.FeishuError:
+                    _drop_state(t)
+                    logger.warning("表「%s」键补齐失败,已清同步状态,"
+                                   "下轮自动全量对账重建", t.name)
+                    raise
+            lines.append(f"{t.name}:键补齐 {len(missing)} 行")
         except LookupError as e:
             lines.append(f"{t.name}:跳过(未登记)— {e}")
     return lines
@@ -352,11 +468,16 @@ _TABLES = ("sales", "returns", "perf", "settlement", "keys")
 
 
 def run(params: dict) -> str:
-    """输入:params(可选 table/days)→ 输出:各表同步结果摘要。"""
+    """输入:params(可选 table/days/reconcile)→ 输出:各表同步结果摘要。
+
+    -p reconcile=1:强制全量对账——清本地同步状态,拉飞书表重建键→record_id
+    映射并核查重复键。日常不需要;建议每周跑一次,或怀疑表被手工动过时跑。
+    """
     only = str(params.get("table", "")).strip()
     if only and only not in _TABLES:
         return f"table 只接受 {'/'.join(_TABLES)},收到:{only}"
     days = int(params.get("days", 90))
+    reconcile = str(params.get("reconcile", "")) in ("1", "true", "yes")
 
     lines, failed = [], []
     sales_keys: set[str] = set()
@@ -364,20 +485,20 @@ def run(params: dict) -> str:
     for name in todo:
         try:
             if name == "sales":
-                line, sales_keys = _push_sales(days)
+                line, sales_keys = _push_sales(days, reconcile)
                 lines.append(line)
             elif name == "returns":
-                lines.append(_push_returns(days))
+                lines.append(_push_returns(days, reconcile))
             elif name == "perf":
-                lines.append(_push_perf())
+                lines.append(_push_perf(reconcile))
             elif name == "settlement":
-                lines.append(_push_settlement(days))
+                lines.append(_push_settlement(days, reconcile))
             elif name == "keys":
                 # 单独跑 keys 时销售未拉,现查窗口键集合
                 if not sales_keys:
                     sales_keys = {r["order_line_id"]
                                   for r in _fetch(_SALES_SQL, (days,))}
-                lines.extend(_push_keys(sales_keys))
+                lines.extend(_push_keys(sales_keys, reconcile))
         except LookupError as e:
             lines.append(f"{name}:跳过(未登记)— {e}")
         except feishu.FeishuError as e:

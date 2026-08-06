@@ -221,3 +221,61 @@ def test_sync_by_key_wrong_table_guard():
     _use_handler(handler)
     with pytest.raises(feishu.FeishuError, match="疑似 table_id 登记错表"):
         feishu.sync_by_key(TABLE, "字段A", {"k": {"字段A": "k"}})
+
+
+def test_sync_by_key_no_delete_mode():
+    # delete_stale=False:消失键/重复键/无键行一律不删(人工域共存表)
+    import json as _json
+    calls: dict = {"delete": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "tenant_access_token" in path:
+            return _token_ok()
+        body = _json.loads(request.content or b"{}")
+        if path.endswith("/records/search"):
+            return httpx.Response(200, json={"code": 0, "data": {"items": [
+                {"record_id": "rA", "fields": {"字段A": "k1"}},
+                {"record_id": "rA2", "fields": {"字段A": "k1"}},
+                {"record_id": "rGone", "fields": {"字段A": "gone"}},
+            ], "has_more": False}})
+        if path.endswith("/batch_update"):
+            return httpx.Response(200, json={"code": 0, "data": {
+                "records": body["records"]}})
+        if path.endswith("/batch_delete"):
+            calls["delete"].extend(body["records"])
+            return httpx.Response(200, json={"code": 0, "data": {}})
+        raise AssertionError(f"意外请求 {path}")
+
+    _use_handler(handler)
+    c, u, d = feishu.sync_by_key(TABLE, "字段A", {"k1": {"字段A": "k1"}},
+                                 delete_stale=False)
+    assert (c, u, d) == (0, 1, 0)
+    assert calls["delete"] == []
+
+
+def test_ensure_keys_creates_missing_only():
+    import json as _json
+    calls: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "tenant_access_token" in path:
+            return _token_ok()
+        body = _json.loads(request.content or b"{}")
+        if path.endswith("/records/search"):
+            return httpx.Response(200, json={"code": 0, "data": {"items": [
+                {"record_id": "r1", "fields": {"字段A": [{"text": "k1", "type": "text"}]}},
+            ], "has_more": False}})
+        if path.endswith("/batch_create"):
+            calls["create"] = body["records"]
+            return httpx.Response(200, json={"code": 0, "data": {
+                "records": [{"record_id": "n1"}, {"record_id": "n2"}]}})
+        raise AssertionError(f"意外请求 {path}(ensure_keys 不许更新/删除)")
+
+    _use_handler(handler)
+    n = feishu.ensure_keys(TABLE, "字段A", {"k1", "k2", "k3", ""})
+    assert n == 2
+    # 只写键字段,且已有的 k1 与空键不建
+    assert calls["create"] == [{"fields": {"字段A": "k2"}},
+                               {"fields": {"字段A": "k3"}}]

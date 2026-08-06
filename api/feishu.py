@@ -255,17 +255,20 @@ def _plain_text(v) -> str:
     return str(v)
 
 
-def sync_by_key(table: Bitable, key_field: str,
-                desired: dict[str, dict]) -> tuple[int, int, int]:
+def sync_by_key(table: Bitable, key_field: str, desired: dict[str, dict],
+                *, delete_stale: bool = True) -> tuple[int, int, int]:
     """输入:表 + 去重键字段名 + {键: fields dict} → 输出:(新建, 更新, 删除) 计数。
 
-    展示投影同步(PG 权威,飞书可重建):键不存在则建,存在则整行覆盖更新
-    (desired 里为 None 的字段显式送 null 清空,不能省略——省略=保留飞书旧值),
-    飞书多出的键删除。**仅限程序独占的展示表**,登记类表(人工维护)禁用。
-    重复键(人工复制行等)保留最早一条,其余删除并记日志。
+    投影同步(PG 权威):键不存在则建,存在则**只覆盖 fields 里给出的字段**
+    (desired 里为 None 的字段显式送 null 清空,不能省略——省略=保留飞书旧值;
+    因此人工/关联字段只要不出现在 fields 里就绝不会被碰)。
+
+    delete_stale=True:飞书多出的键删除,重复/无键行清理——仅限程序独占展示表。
+    delete_stale=False:任何行都不删(键消失只是停止刷新);用于与人工列/
+    关联字段共存的表(删行会断关联、丢人工数据),重复/无键行仅告警。
 
     防错登记守卫:表里已有记录但没有任何一行能读出键字段 → 大概率 table_id
-    填错(指向了别的表),拒绝执行而不是把人家的表清空。
+    填错(指向了别的表),拒绝执行而不是把人家的表写坏。
     """
     existing = list_records(table, field_names=[key_field])
     by_key: dict[str, str] = {}
@@ -279,14 +282,16 @@ def sync_by_key(table: Bitable, key_field: str,
     if existing and not by_key:
         raise FeishuError(None,
                           f"表「{table.name}」现有 {len(existing)} 行均无「{key_field}」字段值,"
-                          f"疑似 table_id 登记错表,拒绝同步(会清空对方数据)")
+                          f"疑似 table_id 登记错表,拒绝同步(会写坏对方数据)")
     if dupes:
-        logger.warning("表「%s」发现 %d 行重复/无键记录,将删除", table.name, len(dupes))
+        logger.warning("表「%s」发现 %d 行重复/无键记录%s", table.name, len(dupes),
+                       ",将删除" if delete_stale else "(不删,请人工核查)")
 
     creates = [f for k, f in desired.items() if k not in by_key]
     updates = [{"record_id": by_key[k], "fields": f}
                for k, f in desired.items() if k in by_key]
-    deletes = dupes + [rid for k, rid in by_key.items() if k not in desired]
+    deletes = (dupes + [rid for k, rid in by_key.items() if k not in desired]) \
+        if delete_stale else []
     if creates:
         batch_create(table, creates)
     if updates:
@@ -296,6 +301,22 @@ def sync_by_key(table: Bitable, key_field: str,
     logger.info("表「%s」同步:新建 %d,更新 %d,删除 %d",
                 table.name, len(creates), len(updates), len(deletes))
     return len(creates), len(updates), len(deletes)
+
+
+def ensure_keys(table: Bitable, key_field: str, keys: set[str]) -> int:
+    """输入:表 + 键字段名 + 应存在的键集合 → 输出:本次补建的行数。
+
+    人工域/枢纽表(如主订单表、采购表)的键补齐:缺键的建一行且**只写键字段**,
+    既有行永不更新、永不删除——其余列全部归人工与关联字段所有。
+    """
+    existing = {_plain_text(r["fields"].get(key_field)).strip()
+                for r in list_records(table, field_names=[key_field])}
+    missing = sorted(k for k in keys if k and k not in existing)
+    if missing:
+        batch_create(table, [{key_field: k} for k in missing])
+    logger.info("表「%s」键补齐:新建 %d 行(已有 %d)",
+                table.name, len(missing), len(existing))
+    return len(missing)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

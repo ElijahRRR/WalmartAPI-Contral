@@ -40,31 +40,29 @@ def test_plan_routing_and_dedup():
         _item("T1", "S_B", "prohibited product policy"),      # → 删除
         _item("T1", "S_STAGE", "stage status until you go live"),   # 排除
         _item("T1", "S_FLY", "intellectual property"),        # 在途 → 跳过
-        _item("T1", "S_RECENT", "intellectual property"),     # 近 7 天已删 → 跳过
         _item("T_OFF", "S_X", "prohibited product policy"),   # 非 ACTIVE 店 → 跳过
         _item("T1", "S_ZOMBIE", "prohibited product policy"),  # 删除未生效 → 双击
     ]
     plans, n = ppc.plan(items,
                         inflight={("T1", "S_FLY")},
-                        recent_del={("T1", "S_RECENT"), ("T1", "S_ZOMBIE")},
                         attempts={("T1", "S_AMAX"): 2},
                         inactive={"T_OFF"},
                         stubborn={("T1", "S_ZOMBIE")})
     assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_A"]
-    # 顽固 SKU 绕过 7 天防重窗,停用+删除双 feed
+    # 顽固 SKU 停用+删除双 feed
     assert {r["sku"] for r in plans["T1"]["delete"]} == \
         {"S_A2", "S_AMAX", "S_B", "S_ZOMBIE"}
     assert [r["sku"] for r in plans["T1"]["retire"]] == ["S_ZOMBIE"]
     assert n["stubborn"] == 1
     assert "T_OFF" not in plans
-    assert (n["stage"], n["inflight"], n["recent"], n["inactive"]) == (1, 1, 1, 1)
+    assert (n["stage"], n["inflight"], n["inactive"]) == (1, 1, 1)
     assert n["fallback"] == 1 and n["relist"] == 1 and n["delete"] == 3
 
 
 def test_dry_run_zero_submissions(monkeypatch):
     monkeypatch.setattr(ppc, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, {}, set(), set()))
+        set(), {}, {}, set(), set()))
     monkeypatch.setattr(ppc.feeds, "submit_feed",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("dry-run 不许提交")))

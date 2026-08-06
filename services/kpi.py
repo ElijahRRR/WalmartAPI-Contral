@@ -197,10 +197,13 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
 
     label = METRIC_LABELS[metric]
     rows: list[dict] = []
+    sheet_stats: list = []
     wb = openpyxl.load_workbook(io.BytesIO(blob), read_only=True, data_only=True)
     for ws in wb.worksheets:
         data = [[("" if c is None else str(c)) for c in r]
                 for r in ws.iter_rows(values_only=True)]
+        sheet_stats.append((ws.title, len(data),
+                            [c for c in (data[0] if data else [])[:6] if c]))
         if not data:
             continue
         start = 0
@@ -249,6 +252,9 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
                            "真实表头=%s,首行样本=%s",
                            metric, ws.title, data_rows, header,
                            data[start + 1][:8] if len(data) > start + 1 else [])
+    # 报表自述:每个 sheet 的(标题, 总行数, 首行前几格)——0 行产出时据此判断
+    # 是"报表本来就空"还是"版式假设错了"(2026-08-06 生产校准期,稳定后可降 debug)
+    logger.info("报表 %s 解析:%d 行产出,sheets=%s", metric, len(rows), sheet_stats)
     return rows
 
 

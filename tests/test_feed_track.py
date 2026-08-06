@@ -22,6 +22,9 @@ class _Conn:
     def executemany(self, sql, rows):
         self.sqls.append((sql, list(rows)))
 
+    def fetchall(self):
+        return []
+
     rowcount = 1
 
     def __enter__(self):

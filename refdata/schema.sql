@@ -105,6 +105,37 @@ ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_id text
 ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_info jsonb;
 CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (item_id);
 
+-- ── 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪)────────────────
+-- 一个 SKU(=ASIN,业务约定贯通)一生的病历:何时上架/何时下架及官方原因/
+-- 何时提交删除/删除是否真生效/报了什么错。只追加永不改;
+-- 事件码常量表在 services/product_events.py。
+CREATE TABLE IF NOT EXISTS catalog.product_events (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    sku         text NOT NULL,
+    store       text,               -- 平台级事件可空
+    event       text NOT NULL,      -- item_appeared/item_missing/item_reappeared/
+                                    -- status_changed/delete_submitted/retire_submitted/
+                                    -- {delete|retire|maintenance}_feed_{success|failed}/
+                                    -- delete_verified/delete_not_effective …
+    source      text NOT NULL,      -- 来源工作流
+    error_code  text,
+    detail      jsonb,
+    occurred_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS product_events_sku_idx ON catalog.product_events (sku, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_events (store, sku);
+
+-- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
+CREATE OR REPLACE VIEW catalog.product_risk AS
+  SELECT sku,
+         count(*) FILTER (WHERE event = 'item_appeared')         AS listed_times,
+         count(*) FILTER (WHERE event = 'delete_submitted')      AS delete_times,
+         count(*) FILTER (WHERE event = 'delete_not_effective')  AS delete_not_effective_times,
+         max(occurred_at) FILTER (WHERE event IN
+             ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         max(occurred_at) AS last_event_at
+  FROM catalog.product_events GROUP BY sku;
+
 -- ── listing:上架域 ────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS listing.tasks (

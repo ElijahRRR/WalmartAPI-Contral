@@ -6,6 +6,8 @@
 
 import logging
 
+from services import product_events
+
 logger = logging.getLogger("services.walmart_catalog")
 
 _UPSERT_SQL = """
@@ -43,6 +45,7 @@ _MARK_MISSING_SQL = """
 UPDATE catalog.walmart_items
 SET missing_since = %(run_at)s, updated_at = now()
 WHERE store = %(store)s AND last_seen_at < %(run_at)s AND missing_since IS NULL
+RETURNING sku
 """
 
 
@@ -59,11 +62,21 @@ def merge_rows(store_name: str, item_summaries: list[dict],
 
 
 def upsert_items(conn, rows: list[dict]) -> int:
-    """输入:连接 + merge_rows 产出的行 → 输出:写入行数(upsert,重复执行幂等)。"""
+    """输入:连接 + merge_rows 产出的行 → 输出:写入行数(upsert,重复执行幂等)。
+
+    顺手写产品事件账本:先取旧状态,对比出 上架/重现/状态变化 事件
+    (services/product_events.diff_catalog),与 upsert 同事务落账。
+    """
     if not rows:
         return 0
+    store = rows[0]["store"]
     with conn.cursor() as cur:
+        cur.execute("SELECT sku, published_status, missing_since "
+                    "FROM catalog.walmart_items WHERE store = %s", (store,))
+        old = {sku: (st, miss) for sku, st, miss in cur.fetchall()}
         cur.executemany(_UPSERT_SQL, rows)
+    product_events.record_many(
+        conn, product_events.diff_catalog(old, rows, store))
     return len(rows)
 
 
@@ -74,7 +87,11 @@ def mark_missing(conn, store_name: str, run_at) -> int:
     """
     with conn.cursor() as cur:
         cur.execute(_MARK_MISSING_SQL, {"store": store_name, "run_at": run_at})
-        return cur.rowcount
+        gone = [r[0] for r in (cur.fetchall() or [])]
+    product_events.record_many(conn, [
+        {"sku": sku, "store": store_name, "event": "item_missing",
+         "source": "catalog_sync"} for sku in gone])
+    return len(gone)
 
 
 _PROJECTION_SQL = """

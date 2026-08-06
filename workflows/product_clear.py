@@ -33,8 +33,8 @@ import logging
 from datetime import datetime
 
 from api import feeds, feishu
-from registry import resources
-from services import feed_track, kpi, stores as stores_svc
+from registry import db, resources
+from services import feed_track, kpi, product_events, stores as stores_svc
 
 DANGEROUS = True
 
@@ -204,6 +204,15 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                     submitted += len(slice_rows)
                     for r in slice_rows:
                         updates.append((r["rownum"], res["feed_id"], today, "处理中"))
+                    # 产品事件账本:提交事件(含操作原因,病历的"医嘱"部分)
+                    with db.pg_conn() as conn:
+                        product_events.record_many(conn, [
+                            {"sku": r["sku"], "store": store_name,
+                             "event": f"{product_events.feed_kind(feed_type)}_submitted",
+                             "source": "product_clear",
+                             "detail": {"feed_id": res["feed_id"],
+                                        "reason": r["reason"]}}
+                            for r in slice_rows])
                 elif res["outcome"] == "failed":
                     for r in slice_rows:
                         updates.append((r["rownum"], "", "", "提交被拒"))

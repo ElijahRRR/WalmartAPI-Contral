@@ -11,7 +11,14 @@ STORE = {"name": "T1", "client_id": "cid_r", "client_secret": "s", "proxy": None
 
 def _env(monkeypatch, sheet_rows, *, stores=(STORE,)):
     """搭假环境:表数据 + 店铺 + 捕获的 feed 提交与表格回写。"""
-    calls = {"submit": [], "write": [], "polled": [], "done": []}
+    import contextlib
+    from registry import db as _db
+    calls = {"submit": [], "write": [], "polled": [], "done": [], "events": []}
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(dr.product_events, "record_many",
+                        lambda conn, rows: (calls["events"].extend(rows),
+                                            len(rows))[1])
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
     monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
     monkeypatch.setattr(feishu, "sheet_write_ranges",

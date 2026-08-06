@@ -15,6 +15,7 @@ import logging
 
 from api import feeds
 from registry import db
+from services import product_events
 
 logger = logging.getLogger("services.feed_track")
 
@@ -58,6 +59,18 @@ def poll_feed(store: dict, feed_id: str) -> dict | None:
             "WHERE feed_id = %s AND status = 'submitted' AND NOT (sku = ANY(%s))",
             (feed_id, list(results) or [""]))
         n_missing = cur.rowcount
+        # 产品事件账本:逐 SKU 回执落账(success 是沃尔玛的一面之词,
+        # 删除的最终真相由 catalog_sync 观测核验)
+        cur.execute("SELECT sku, workflow, feed_type FROM ops.feed_items "
+                    "WHERE feed_id = %s", (feed_id,))
+        meta = {sku: (wf, ft) for sku, wf, ft in cur.fetchall()}
+        product_events.record_many(conn, [
+            {"sku": sku, "store": store["name"],
+             "event": f"{product_events.feed_kind(meta[sku][1])}_feed_{o}",
+             "source": meta[sku][0] or "feed_poll",
+             "error_code": code or None, "detail": {"feed_id": feed_id}}
+            for sku, (o, code) in results.items()
+            if sku in meta and o in ("success", "failed")])
     if n_missing:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)

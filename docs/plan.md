@@ -62,7 +62,12 @@
 每迁一条工作流,只补它需要的 api 域文件。必须一开始就做对的三件事
 (旧项目 8 处旁路代码的根因):
 
-- [ ] api/feeds.py:统一 feed 提交/状态查询/错误报告下载(含 CSV/二进制响应)
+- [~] api/feeds.py:统一 feed 提交/状态查询(蓝图 §5 定稿落地,2026-08-06):
+      header 分发(DELETE_ITEM/RETIRE_ITEM/MP_MAINTENANCE)+ 条数×字节双约束切片
+      + 三层防重(feed_log 抢占/反查三态/query_pending 启动对账)+ 明细 50/页翻页
+      + 未知状态告警;版本字符串唯一出处 registry.FEED_SPEC_VERSIONS;
+      feeds 限速桶登记(POST 各 feedType 独立,未登记默认拒绝)。
+      errorReport 下载与其余 feedType 随 listing 补
 - [ ] api/reports.py:报告类下载(xlsx 二进制,不强制解析 JSON)
 - [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
 - [ ] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,

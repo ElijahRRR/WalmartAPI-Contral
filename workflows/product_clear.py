@@ -103,7 +103,7 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
             continue
         try:
             # 统一轮询积木:SKU 终态落 ops.feed_items 权威台账 + feed_log 落终态
-            sku_status = feed_track.poll_feed(store, feed_id)
+            _head, sku_status = feed_track.poll_feed(store, feed_id)
         except Exception as e:
             logger.warning("feed %s 状态查询失败,本轮跳过: %s", feed_id, e)
             continue

@@ -35,7 +35,8 @@ def _env(monkeypatch, sheet_rows, *, stores=(STORE,)):
 
     def fake_poll(store, fid):
         calls["polled"].append(fid)
-        return {"OK1": ("success", ""), "BAD1": ("failed", "ERR_X")}
+        return ({"feedStatus": "PROCESSED"},
+                {"OK1": ("success", ""), "BAD1": ("failed", "ERR_X")})
 
     monkeypatch.setattr(feed_track, "poll_feed", fake_poll)
     return calls

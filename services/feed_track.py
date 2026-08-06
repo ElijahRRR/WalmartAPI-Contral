@@ -22,17 +22,34 @@ logger = logging.getLogger("services.feed_track")
 # 提交超过此小时数仍 pending(提交结局不确定)→ 告警升级(人工核对后清理)
 _PENDING_ALARM_HOURS = 6
 
+# feedType → 业务动作名(摘要展示;未登记的原样显示)
+_FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
+               "MP_MAINTENANCE": "维护", "MP_ITEM": "上架",
+               "PRICE_AND_PROMOTION": "改价", "price": "改价",
+               "inventory": "改库存"}
 
-def poll_feed(store: dict, feed_id: str) -> dict | None:
-    """输入:店铺 + feed_id → 输出:终态时 {sku: (outcome, error_code)},未终态 None。
 
-    终态时同步:ops.feed_items 逐 SKU 落 success/failed(+错误码),
+def _progress(head: dict) -> str:
+    """输入:feed 汇总 → 输出:进度串(feed 级 GET 自带计数,零明细翻页)。"""
+    recv = head.get("itemsReceived") or 0
+    ok = head.get("itemsSucceeded") or 0
+    bad = head.get("itemsFailed") or 0
+    pending = head.get("itemsProcessing")
+    if pending is None:
+        pending = max(recv - ok - bad, 0)
+    return f"已收 {recv},成功 {ok},失败 {bad},待处理 {pending}"
+
+
+def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
+    """输入:店铺 + feed_id → 输出:(feed 汇总 head, SKU 结果)。
+
+    未终态:结果为 None(head 自带 itemsReceived/Succeeded/Failed 进度计数,
+    不翻明细);终态:ops.feed_items 逐 SKU 落 success/failed(+错误码),
     台账里有而明细里查无的 SKU 落 missing;feed_log 落 done/failed。
-    outcome 取值:success / failed / processing / unknown(api/feeds.sku_outcome)。
     """
     head = feeds.get_feed_status(store, feed_id)
     if head.get("feedStatus") not in feeds.FEED_TERMINAL:
-        return None
+        return head, None
 
     results: dict[str, tuple[str, str]] = {}
     for item in feeds.iter_feed_items(store, feed_id):
@@ -75,7 +92,7 @@ def poll_feed(store: dict, feed_id: str) -> dict | None:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)
     feeds.mark_feed_done(feed_id, head.get("feedStatus") == "PROCESSED")
-    return results
+    return head, results
 
 
 def poll_all(stores_by_name: dict) -> str:
@@ -89,21 +106,32 @@ def poll_all(stores_by_name: dict) -> str:
     pendings = [r for r in rows if r["status"] == "pending"]
 
     done = still = skipped = 0
+    detail_lines: list[str] = []
     for r in submitted:
+        label = _FEED_LABEL.get(r["feed_type"], r["feed_type"])
+        fid_disp = (r["feed_id"][:18] + "…") if len(r["feed_id"]) > 19 else r["feed_id"]
+        who = f"{r['store']} {label}({r['workflow'] or '-'}) {fid_disp}"
         store = stores_by_name.get(r["store"])
         if store is None:
             skipped += 1
+            detail_lines.append(f"  {who}:店铺凭证缺失,跳过")
             continue
         try:
-            results = poll_feed(store, r["feed_id"])
+            head, results = poll_feed(store, r["feed_id"])
         except Exception as e:
             logger.warning("feed %s 轮询失败(下轮再试): %s", r["feed_id"], e)
             still += 1
+            detail_lines.append(f"  {who}:查询失败({e}),下轮再试")
             continue
         if results is None:
             still += 1
+            detail_lines.append(f"  {who}:{head.get('feedStatus')},{_progress(head)}")
         else:
             done += 1
+            n_ok = sum(1 for o, _ in results.values() if o == "success")
+            n_bad = sum(1 for o, _ in results.values() if o == "failed")
+            detail_lines.append(f"  {who}:已落定 {head.get('feedStatus')},"
+                                f"成功 {n_ok},失败 {n_bad}")
 
     if pendings:
         logger.warning("feed_log 有 %d 条 pending(提交结局不确定),"
@@ -115,7 +143,7 @@ def poll_all(stores_by_name: dict) -> str:
         line += f",店铺凭证缺失跳过 {skipped}"
     if pendings:
         line += f";⚠ pending 待人工核对 {len(pendings)}"
-    return line
+    return "\n".join([line] + detail_lines)
 
 
 def item_results(feed_id: str) -> dict[str, tuple[str, str]]:

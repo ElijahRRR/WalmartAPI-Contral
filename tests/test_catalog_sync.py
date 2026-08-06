@@ -210,6 +210,11 @@ class _FakeCursor:
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         self.rowcount = 2
+        # mark_missing 改 RETURNING sku 后按 fetchall 计数
+        if "RETURNING sku" in sql:
+            self.rows = [("S1",), ("S2",)]
+        elif "SELECT sku, published_status" in sql:
+            self.rows = []
 
     def executemany(self, sql, seq):
         batch = list(seq)

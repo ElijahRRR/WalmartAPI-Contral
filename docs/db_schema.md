@@ -107,6 +107,30 @@ CREATE TABLE catalog.walmart_items (
 "整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
 再把本轮未见的行标 missing_since(不删除,保历史;连续缺席多久后清理另议)。
 
+```sql
+-- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
+CREATE TABLE catalog.product_events (
+    id bigint IDENTITY PRIMARY KEY,
+    sku text NOT NULL,              -- 业务约定 sku=asin,贯通两侧身份
+    store text,                     -- 平台级事件可空
+    event text NOT NULL,            -- 事件码唯一出处 services/product_events.py:
+                                    -- item_appeared/item_missing/item_reappeared/
+                                    -- status_changed(含官方下架原因)/
+                                    -- {delete|retire|maintenance}_{submitted|feed_success|feed_failed}/
+                                    -- delete_verified/delete_not_effective
+    source text NOT NULL, error_code text, detail jsonb,
+    occurred_at timestamptz NOT NULL DEFAULT now()
+);
+-- 视图 catalog.product_risk:按 SKU 汇总(上架次数/删除次数/删除未生效次数/
+-- 最近移除时间)——未来 listing 上架前防呆的查询入口
+```
+
+事件账本三条纪律:只追加永不改;**回执与观测分开记**(feed 回执 success 是
+沃尔玛的一面之词,删除以 catalog_sync 观测核验为准——回执成功但宽限期后仍
+在架 → delete_not_effective 告警,所有者实证的真实故障模式);写入点分布:
+catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
+未来 listing·审核(入库/审核/上架)。
+
 ## listing — 上架域
 
 ```sql
@@ -203,6 +227,22 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+
+CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
+    feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)
+    sku         text NOT NULL,
+    workflow    text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    status      text NOT NULL,      -- submitted / success / failed / missing
+    error_code  text,
+    submitted_at timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    PRIMARY KEY (feed_id, sku)
+);
+-- 终态由 services/feed_track 轮询回写(feed_poll 工作流全局扫,业务工作流也可
+-- 单 feed 轮询);SKU 级状态权威在此,飞书驱动表的"结果"列只是投影。
+-- 停用/删除/设置到期日期 + 未来的上架/改价/改库存/改标题 feed 全走这一套。
 
 CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
     table_id    text NOT NULL,      -- 飞书 table_id

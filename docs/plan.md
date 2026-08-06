@@ -62,7 +62,12 @@
 每迁一条工作流,只补它需要的 api 域文件。必须一开始就做对的三件事
 (旧项目 8 处旁路代码的根因):
 
-- [ ] api/feeds.py:统一 feed 提交/状态查询/错误报告下载(含 CSV/二进制响应)
+- [~] api/feeds.py:统一 feed 提交/状态查询(蓝图 §5 定稿落地,2026-08-06):
+      header 分发(DELETE_ITEM/RETIRE_ITEM/MP_MAINTENANCE)+ 条数×字节双约束切片
+      + 三层防重(feed_log 抢占/反查三态/query_pending 启动对账)+ 明细 50/页翻页
+      + 未知状态告警;版本字符串唯一出处 registry.FEED_SPEC_VERSIONS;
+      feeds 限速桶登记(POST 各 feedType 独立,未登记默认拒绝)。
+      errorReport 下载与其余 feedType 随 listing 补
 - [ ] api/reports.py:报告类下载(xlsx 二进制,不强制解析 JSON)
 - [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
 - [ ] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,
@@ -84,12 +89,14 @@
 | 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务。**[~] 取数前半生产验证通过**(order_sync,2026-08-06 单店 38 行;statusDate/trackingURL 按线上实证修正);审核规则待采集对接后补 |
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
-| 7 | daily_retire | 沃尔玛批量下架 | **是** | DELETE_ITEM 不可恢复;防重状态先行(ops.feed_log) |
+| 7 | product_clear | 沃尔玛批量下架(旧 daily_retire) | **是** | **[~] 生产验收通过**(2026-08-06,所有者确认:A107 首测 5+放量 1221 个 DELETE_ITEM,识别/限额/防重/轮询/台账/事件账本全链路);待:切旧 15:00 cron、挂调度、停用(RETIRE_ITEM)动作实测。命名原则(所有者 2026-08-06):新工作流按功能命名,不继承旧系统名 |
 | 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
 | — | order_center_cleanup | (新增) | **是** | 建库一次性烂账清理:删除订单不在库的售后/绩效/对账行(dry-run 默认);配套**入库侧永久过滤**(returns_sync/daily_report 已内置,防每日回流)+ recon_done 账期台账(防整期清空后被当缺失重拉)。**[x] 全店建库已执行**(2026-08-06,用户确认) |
 | — | order_center_push | (新增) | 否 | 订单中心投影到用户既有「订单中心V1」bitable 六表:销售/售后/绩效/对账程序写(按表内真实字段类型自适应),主订单表/采购信息只补首列键(人工域);全表不删行(枢纽有关联字段);PG 权威。**[~] 全店建库完成**(2026-08-06,用户确认;含本地状态零拉表+烂账治理);待:挂调度进入日常增量;Lookup 列(下单时间等)依赖主订单表关联字段接线,程序暂不写关联 |
+| — | (产品事件账本) | (新增,非工作流) | 否 | catalog.product_events:产品全生命周期"病历"(上架/下架及官方原因/删除提交/回执/观测核验)+ product_risk 防呆视图;写入点 catalog_sync/feed_track/product_clear,listing 期补 入库/审核/上架前防呆。**[~] 地基就绪**(2026-08-06);待:cleanup 归类事件 + 旧库 41.7 万行历史导入 |
+| — | feed_poll | (新增) | 否 | 全局 feed 轮询(所有 feed 操作共用):feed_log submitted 行 → 终态 → SKU 级结果落 ops.feed_items 权威台账;逐 feed 展示店铺/动作/进度计数;pending 行告警待人工。**[~] 生产验收通过**(2026-08-06,双 feed 实时进度实证);待挂高频调度 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |

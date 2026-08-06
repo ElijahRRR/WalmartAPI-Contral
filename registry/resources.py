@@ -53,6 +53,25 @@ def feishu_webhook_url() -> str | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ⚠ 官方版本表约 4-6 周滚动一版,需定期核对(2026-08-05 核验):
+#   DELETE_ITEM 的 5.0.20250919 仍是官方现值;MP_MAINTENANCE 用官方当前推荐值
+#   (旧系统在用的 5.0.20260304 已过时);RETIRE_ITEM 官方 guide 已消失仅存枚举,
+#   版本 1.0 为旧系统实测值,迁移 daily_cleanup 前必须实测端点仍可用。
+FEED_SPEC_VERSIONS = {
+    "DELETE_ITEM": "5.0.20250919-16_45_47-api",
+    "RETIRE_ITEM": "1.0",
+    "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
+}
+
+# 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
+WALMART_ERR_SKU_LOCKED = "ERR_EXT_DATA_0101211"     # 解法:RETIRE→24h→新 UPC 重上
+WALMART_ERR_UPC_CONFLICT = "ERR_EXT_DATA_0101119"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  飞书多维表格清单
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -212,6 +231,32 @@ ORDER_SETTLE = Bitable(
         original_commission="原始佣金USD", commission_saving="佣金优惠USD",
         incentive="优惠计划", period="账期", settle_date="结算日期",
         pulled_at="拉取时间",
+    ),
+)
+
+
+# 商品停用/删除表(daily_retire 驱动表):电子表格,运营填 A~D,程序写 E~G。
+# 列序即契约(A=store B=sku C=停用/删除 D=操作原因 E=feedid F=操作日期 G=结果)
+RETIRE_SHEET = Spreadsheet(
+    name="商品停用删除表",
+    token=os.environ.get("FEISHU_RETIRE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_RETIRE_SHEET_ID", ""),
+    columns=("store", "sku", "action", "reason", "feed_id", "op_date", "result"),
+)
+
+# 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
+# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+RETIRE_LIMITS = Bitable(
+    name="上下架限额表",
+    app_token=os.environ.get("FEISHU_LIMITS_APP_TOKEN", ""),
+    table_id=os.environ.get("FEISHU_LIMITS_TABLE_ID", ""),
+    fields=_fields(
+        store="店铺",
+        fba_range1="fba区间1", fba_range2="fba区间2",
+        fbm_range1="FBM区间1", fbm_range2="FBM区间2",
+        max_daily_list="上架限制",
+        max_daily_retire="下架限制",
+        inventory_note="库存特殊要求",
     ),
 )
 

@@ -27,7 +27,7 @@ import httpx
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import stores as stores_svc, walmart_catalog
+from services import product_events, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 
@@ -176,6 +176,15 @@ def run(params: dict) -> str:
         lines.append(f"库存拉取失败(沿用旧值,目录已更新):{','.join(inv_failed)}")
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
+
+    if results:
+        # 删除核验(事件账本):回执成功的删除,以本轮观测定生效/未生效
+        with db.pg_conn() as conn:
+            verified, not_eff = product_events.verify_deletions(conn)
+        if verified or not_eff:
+            lines.append(f"删除核验:生效 {verified}"
+                         + (f",⚠ 未生效 {not_eff}(回执成功但仍在架,查日志)"
+                            if not_eff else ""))
 
     if results and str(params.get("skip_feishu", "")) not in ("1", "true", "yes"):
         lines.append(_write_projection())   # 全部店铺失败时不动飞书表

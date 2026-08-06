@@ -88,19 +88,24 @@
 | 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
+| — | order_center_cleanup | (新增) | **是** | 建库一次性烂账清理:删除订单不在库的售后/绩效/对账行(dry-run 默认);配套**入库侧永久过滤**(returns_sync/daily_report 已内置,防每日回流)+ recon_done 账期台账(防整期清空后被当缺失重拉)。**[x] 全店建库已执行**(2026-08-06,用户确认) |
+| — | order_center_push | (新增) | 否 | 订单中心投影到用户既有「订单中心V1」bitable 六表:销售/售后/绩效/对账程序写(按表内真实字段类型自适应),主订单表/采购信息只补首列键(人工域);全表不删行(枢纽有关联字段);PG 权威。**[~] 全店建库完成**(2026-08-06,用户确认;含本地状态零拉表+烂账治理);待:挂调度进入日常增量;Lookup 列(下单时间等)依赖主订单表关联字段接线,程序暂不写关联 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 
-**订单域地基(2026-08-06 v2 定稿,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/
-对账明细四链路统一行级建模——`order_line_id = ol_+sha256(PO+行号)[:24]`,**店铺不参与
-身份**(PO 沃尔玛全局唯一;店铺名是我方标签,改名不得作废标识——弃订单中心v1 含店铺
-的哈希)。已就绪:orders.order_lines/return_lines/perf_events/settlement_lines 四表 +
-settlement_by_line/order_center/perf_event_spans 视图;api/returns.py(时间窗成对+cursor
-拼 URL 实证);recon 明细改走 CSV 端点(JSON 每期截断 1000 行实证弃用);
+**订单域地基(2026-08-06 v3 定稿,先于 #2/#4 落地)**:order_audit/returns_sync/绩效订单/
+对账明细四链路统一行级建模——`order_line_id = ol_+sha256(PO+SKU)[:24]`,**店铺与行号
+都不参与身份**(PO 沃尔玛全局唯一,店铺名是我方标签;同 PO 同 SKU 必合并为一行——
+所有者实证规则,v3 由行号改 SKU,使绩效事件可直接建键)。已就绪:orders.order_lines/
+return_lines/perf_events/settlement_lines 四表 + settlement_by_line/order_center/
+perf_event_spans 视图;api/returns.py(时间窗成对+cursor 拼 URL 实证);recon 明细改走
+CSV 端点(JSON 每期截断 1000 行实证弃用),SKU 两级解析(自带列→订单行反查);
 services/order_lines.py 三源归一化积木。绩效:按 (po,metric,period) 逐周期累积,
-影响范围看 perf_event_spans.still_active;行关联两段式回填(先 (po,sku) 无歧义匹配,
-再单行订单),不硬造行号。
+影响范围看 perf_event_spans.still_active;带 SKU 直接建键,无 SKU 老报表行退单行订单
+回填,不硬造。⚠ v2→v3 迁移:db_init 守卫自动重建三表(订单/售后/对账窗口重拉即回),
+perf_events 保历史仅重算关联;生产机需重跑 db_init + order_sync/returns_sync +
+daily_report settlement(-p periods=99)。
 
 旧仓库中**不迁移**:tools/ 的 10 个救场脚本(**不含 sync_online_products.py**,
 它是 #9 catalog_sync 的源文件,是活代码)、auto_listing 5 个 fix 脚本、

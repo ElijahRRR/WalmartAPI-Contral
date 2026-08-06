@@ -123,6 +123,99 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
 )
 
 
+# ── 订单中心六表(order_center_push 写;用户既有「订单中心V1」应用,表头已定)──
+# 同一个多维表格应用(app_token 共用)。PG orders schema 是权威;
+# 每表键列是同步对齐锚点,人工不得改动。**只登记程序拥有的字段**——
+# 人工列/采集列/关联字段(主订单表、父记录、脚本审核、亚马逊单价等)
+# 一律不登记,同步时不出现在载荷里即绝不会被覆盖。
+# 任何表都不删行(delete_stale=False / ensure_keys):主订单表是永久枢纽,
+# 行间有关联字段,删行会断链;滑出窗口的行只是停止刷新。
+
+_ORDER_APP = os.environ.get("FEISHU_ORDER_APP_TOKEN", "")
+
+# 主订单表 / 采购信息:人工域枢纽表,程序只补齐首列 order_line_id(ensure_keys)
+ORDER_MAIN = Bitable(
+    name="订单中心-主订单表",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_MAIN_TABLE_ID", ""),
+    fields=_fields(key="order_line_id"),
+)
+
+ORDER_PURCHASE = Bitable(
+    name="订单中心-采购信息",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_PURCHASE_TABLE_ID", ""),
+    fields=_fields(key="order_line_id"),
+)
+
+ORDER_SALES = Bitable(
+    name="订单中心-销售订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_SALES_TABLE_ID", ""),
+    fields=_fields(
+        key="order_line_id", order_date="下单时间", store="店铺",
+        po_id="采购订单号", line_number="行号", sku="SKU",
+        product_name="商品名称", qty="数量", sale_status="销售状态",
+        audit_status="审核状态", status_date="状态更新时间",
+        est_ship_date="预计发货时间", est_delivery_date="预计送达时间",
+        product_amount="商品金额", shipping_amount="运费金额",
+        cancel_reason="取消原因", refund_amount="行内退款金额",
+        refund_comments="退款备注", carrier="承运商", tracking_no="物流单号",
+        tracking_url="物流链接", ship_name="收件人姓名", phone="电话",
+        address1="地址1", address2="地址2", city="城市", state="州",
+        postal_code="邮编", country="国家", pulled_at="拉取时间",
+    ),
+)
+
+ORDER_RETURNS = Bitable(
+    name="订单中心-售后订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_RETURNS_TABLE_ID", ""),
+    fields=_fields(
+        # 唯一键 = RMA号|order_line_id(同一行可多次售后,首列 order_line_id 不唯一,
+        # 需在表中新增该文本字段,与绩效表 perf_key 同理)
+        key="唯一键", order_line_id="order_line_id", order_date="下单时间",
+        store="店铺", rma="RMA号", customer_order_id="客户订单ID",
+        po_id="采购订单号", line_number="行号", sku="SKU",
+        return_status="售后状态", refund_status="退款状态",
+        return_method="退货方式", refund_mode="退款方式",
+        refund_total="总退款金额", return_reason="退货原因",
+        return_comment="退货描述", return_by="退货截止日期",
+        return_created="退货创建时间", last_modified="状态更新时间",
+        customer_name="客户姓名", customer_email="客户邮箱",
+        qty="数量", refunded_qty="已退款数量",
+        carrier="承运商", tracking_no="物流单号", is_keep_it="keep-it单",
+    ),
+)
+
+ORDER_PERF = Bitable(
+    name="订单中心-绩效订单",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_PERF_TABLE_ID", ""),
+    fields=_fields(
+        key="perf_key", order_line_id="order_line_id", order_date="下单时间",
+        store="店铺", po_id="采购订单号", metric="指标类型",
+        accountable="计入绩效", description="问题描述", status="绩效状态",
+        period_span="统计周期", detail="明细", pulled_at="拉取时间",
+    ),
+)
+
+ORDER_SETTLE = Bitable(
+    name="订单中心-对账明细",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_SETTLE_TABLE_ID", ""),
+    fields=_fields(
+        key="order_line_id", order_date="下单时间", store="店铺",
+        po_id="采购订单号", line_number="行号", settle_status="入账状态",
+        net_amount="结算净额USD", product_amount="商品销售额USD",
+        commission_amount="实扣佣金USD", commission_rate="佣金率",
+        original_commission="原始佣金USD", commission_saving="佣金优惠USD",
+        incentive="优惠计划", period="账期", settle_date="结算日期",
+        pulled_at="拉取时间",
+    ),
+)
+
+
 # 店铺凭证表:飞书人工维护 → 程序读 + 本地快照兜底。
 # 密钥类字段(ClientSecret/代理密码)只在此表,访问权限收紧到最小人群。
 STORE_CREDENTIALS = Bitable(

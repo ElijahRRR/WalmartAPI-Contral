@@ -75,11 +75,14 @@ def performance_report(store: dict, metric: str) -> bytes | None:
     _client.rate_acquire(f"insights.report.{metric}", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
     # 2026-08-06 生产实证:默认 Accept(application/json)返回 406,
-    # 二进制报表端点必须 octet-stream(与 reconFile 同一坑)
+    # 二进制报表端点必须 octet-stream(与 reconFile 同一坑)。
+    # 重试 6 次(1/2/4/8/10/10s):该端点现场生成 xlsx,是全 API 最脆的一族,
+    # 多店并发时沃尔玛边缘面状 520 抖动实证(2026-08-06 全店首跑),
+    # 默认 3 连快退避会整段打在同一个抖动窗口里
     status, _, blob = _client.safe_get_raw(
         f"{_client.base_url()}/v3/insights/performance/{metric}/report",
         token, store["client_id"], store["proxy"], timeout=90,
-        accept="application/octet-stream")
+        max_retries=6, accept="application/octet-stream")
     if status == 204 or not blob:
         return None
     if status != 200:

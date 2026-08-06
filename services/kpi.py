@@ -177,6 +177,7 @@ def payment_summary_total(records) -> float:
 _HEADER_MAP = (
     (("sales order",), "sales_order_no"),
     (("po #", "po#", "purchase order"), "po_no"),
+    (("order line",), "line_no"),   # returns/INR 版式带 Order Line # 无 SKU(2026-08-06 实证)
     (("order date", "order placed"), "order_date"),
     (("sku",), "sku"),          # 放 item 前:列名"Item SKU"应归 sku 而非商品名
     (("item", "product"), "item"),
@@ -229,7 +230,8 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
             rec = dict(zip(header, raw))
             row = {"indicator": label, "sub_category": sub_category,
                    "accountable": accountable,
-                   "sales_order_no": "", "po_no": "", "order_date": "",
+                   "sales_order_no": "", "po_no": "", "line_no": "",
+                   "order_date": "",
                    "sku": "", "item": "", "carrier": "", "tracking_no": "",
                    "description": "", "note": "",
                    "raw": json.dumps(rec, ensure_ascii=False)[:2000]}

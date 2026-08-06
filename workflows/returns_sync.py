@@ -1,15 +1,16 @@
 """returns_sync — 售后单同步入订单中心(plan #2,替代旧 售后订单同步)。
 
 用法:
-  python cli.py returns_sync                     # 全部启用店铺,近 90 天
+  python cli.py returns_sync                     # 全部启用店铺,近 45 天(增量)
   python cli.py returns_sync -p store=A085朱丽霖  # 单店
-  python cli.py returns_sync -p days=180         # 自定窗口
+  python cli.py returns_sync -p days=90          # 建库首拉用 90 天
   python cli.py returns_sync -p workers=8
 
 每店:GET /v3/returns(创建时间窗,Start/End 成对——实证只传 start 返 400)
 → 展开 returnOrderLine → upsert orders.return_lines(主键 RMA×订单行)。
 窗口全量重拉:售后状态(INITIATED→DELIVERED→CLOSED/退款)在创建后持续变化,
-按创建时间增量会漏老单状态迁移;90 天窗口 + 幂等 upsert 覆盖。
+按创建时间增量会漏老单状态迁移;45 天窗口 + 幂等 upsert 覆盖(所有者定稿:
+售后正常 2~4 周走到终态,二次售后是新 RMA 新记录;建库首拉才需要 90 天)。
 旧系统"整表覆盖残留旧行"缺陷在 PG 按键 upsert 下天然不存在(plan #2 备注)。
 """
 
@@ -38,8 +39,13 @@ def _sync_one_store(store: dict, created_start: str) -> dict:
         n_orders += 1
         rows.extend(ol.flatten_return_lines(name, return_order))
     with db.pg_conn() as conn:
+        # 烂账治理:订单不在库(早于建库拉单窗口)的售后行不入库
+        rows, dropped = ol.drop_unlinked(conn, rows)
         written = ol.upsert_return_lines(conn, rows)
-    return {"store": name, "returns": n_orders, "lines": written}
+    if dropped:
+        logger.info("店铺 %s:%d 条售后行订单不在库,未入库", name, dropped)
+    return {"store": name, "returns": n_orders, "lines": written,
+            "dropped": dropped}
 
 
 def run(params: dict) -> str:
@@ -48,7 +54,7 @@ def run(params: dict) -> str:
     store_list = stores_svc.load_stores(names)
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(全部)'}"
-    days = int(params.get("days", 90))
+    days = int(params.get("days", 45))
     workers = int(params.get("workers", 8))
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -69,8 +75,11 @@ def run(params: dict) -> str:
                 failed.append(f"{name}({e})")
 
     total = sum(r["lines"] for r in results)
+    total_dropped = sum(r.get("dropped", 0) for r in results)
     lines = [f"returns_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),售后行入库 {total}"]
+    if total_dropped:
+        lines[0] += f",订单不在库丢弃 {total_dropped}"
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:

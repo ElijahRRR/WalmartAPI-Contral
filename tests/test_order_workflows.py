@@ -42,15 +42,24 @@ def _use(monkeypatch, handler):
 class _FakeCursor:
     def __init__(self, store):
         self.store = store
+        self._last = ("", None)
 
     def executemany(self, sql, rows):
         self.store.append(("many", sql, list(rows)))
 
     def execute(self, sql, args=None):
         self.store.append(("one", sql, args))
+        self._last = (sql, args)
 
     def fetchall(self):
+        sql, args = self._last
+        # 烂账过滤的在库查询:假装全部在库(过滤行为有专门单测)
+        if "= ANY(" in sql and args:
+            return [(x,) for x in args[0]]
         return []
+
+    def fetchone(self):
+        return None
 
     rowcount = 0
 
@@ -135,7 +144,8 @@ def test_returns_sync_end_to_end(monkeypatch):
 
     out = returns_sync.run({})
     assert "1/1 店完成" in out and "售后行入库 1" in out
-    kind, sql, rows = calls[0]
+    # calls[0] 现在是烂账过滤的在库查询;取 upsert 那条
+    kind, sql, rows = next(c for c in calls if c[0] == "many")
     assert "orders.return_lines" in sql
     assert rows[0]["return_status"] == "INITIATED"
 
@@ -153,9 +163,24 @@ def test_perf_rows_from_problems():
     assert len(out) == 2
     assert out[0] == {"store": "T1", "po_id": "PO1", "metric": "otd",
                       "period": "2026-08-06", "sku": "B0X", "accountable": True,
+                      # v3:带 SKU 的事件写入时直接建键,订单不在库里也成立
+                      "order_line_id": ol.make_order_line_id("PO1", "B0X"),
                       "status": "违规", "detail": "{}"}
     assert out[1]["accountable"] is False and out[1]["status"] == "不计入"
-    assert out[1]["sku"] is None
+    assert out[1]["sku"] is None and out[1]["order_line_id"] is None
+
+
+def test_perf_rows_line_no_resolves_sku_via_lookup():
+    # returns/INR 版式:带 Order Line # 无 SKU(2026-08-06 实证)→ 反查订单行建键
+    rows = [
+        {"po_no": "PO5", "sku": "", "line_no": "2.0", "accountable": "✅ 是", "raw": "{}"},
+        {"po_no": "PO6", "sku": "", "line_no": "1", "accountable": "✅ 是", "raw": "{}"},
+    ]
+    out, _ = ol.perf_rows_from_problems("T1", "returns", rows, "2026-08-06",
+                                        sku_lookup={("PO5", "2"): "B0Z9"})
+    assert out[0]["sku"] == "B0Z9"            # 行号归一后命中反查
+    assert out[0]["order_line_id"] == ol.make_order_line_id("PO5", "B0Z9")
+    assert out[1]["sku"] is None and out[1]["order_line_id"] is None  # 查不到不硬造
 
 
 def test_pick_new_periods_sorts_across_years():
@@ -163,3 +188,95 @@ def test_pick_new_periods_sorts_across_years():
     todo = ol.pick_new_periods(available, have={"07142026"}, limit=2)
     # 跨年排序按 YYYY+MMDD:12212025 < 01042026 < 06302026;取最近 2 期
     assert todo == ["01042026", "06302026"]
+
+
+# ── 烂账治理:入库过滤 + 台账 + 一次性清理 ────────────────────────────────────
+
+
+class _QueryConn:
+    """可编程假连接:按 SQL 特征返回预置结果。"""
+
+    def __init__(self, have_ids=(), have_pos=(), fetchone_seq=(), vanish=()):
+        self.have_ids, self.have_pos = list(have_ids), list(have_pos)
+        self.fetchone_seq = list(fetchone_seq)
+        self.vanish = list(vanish)
+        self.sqls: list = []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sqls.append((sql, args))
+        self._last = sql
+
+    def fetchall(self):
+        if "order_line_id = ANY" in self._last:
+            return [(x,) for x in self.have_ids]
+        if "po_id = ANY" in self._last:
+            return [(x,) for x in self.have_pos]
+        if "GROUP BY" in self._last:
+            return self.vanish
+        return []
+
+    def fetchone(self):
+        return self.fetchone_seq.pop(0) if self.fetchone_seq else None
+
+    rowcount = 7
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_drop_unlinked_filters_by_order_line_id():
+    conn = _QueryConn(have_ids=["ol_in"])
+    rows = [{"order_line_id": "ol_in", "x": 1},
+            {"order_line_id": "ol_out", "x": 2}]
+    kept, dropped = ol.drop_unlinked(conn, rows)
+    assert [r["order_line_id"] for r in kept] == ["ol_in"] and dropped == 1
+
+
+def test_drop_unlinked_perf_filters_by_po_keeps_null_sku_rows():
+    conn = _QueryConn(have_pos=["PO_IN"])
+    rows = [{"po_id": "PO_IN", "order_line_id": None},   # 无 SKU 但 PO 在库 → 保留
+            {"po_id": "PO_OUT", "order_line_id": "ol_x"}]
+    kept, dropped = ol.drop_unlinked_perf(conn, rows)
+    assert [r["po_id"] for r in kept] == ["PO_IN"] and dropped == 1
+
+
+def test_recon_done_ledger_roundtrip():
+    conn = _QueryConn(fetchone_seq=[(["01012026"],)])
+    ol.mark_recon_done(conn, "T1", ["02022026"])
+    sql, args = conn.sqls[-1]
+    assert "ops.cursors" in sql and "ON CONFLICT (name)" in sql
+    assert args[0] == "recon_done:T1"
+    assert '"01012026"' in args[1] and '"02022026"' in args[1]  # 旧账期并入
+    assert ol.mark_recon_done(conn, "T1", []) is None           # 空集不写
+
+
+def test_cleanup_dry_run_counts_only(monkeypatch):
+    from workflows import order_center_cleanup as occ
+    conn = _QueryConn(fetchone_seq=[(3,), (5,), (9,)],
+                      vanish=[("T1", "05062025")])
+    _fake = contextlib.contextmanager(lambda: iter([conn]))
+    monkeypatch.setattr(occ.db, "pg_conn", _fake)
+
+    out = occ.run({"execute": False})
+    assert "DRY-RUN" in out and "售后 3" in out and "绩效 5" in out and "对账 9" in out
+    assert not any(s.startswith("DELETE") for s, _ in conn.sqls)
+
+
+def test_cleanup_execute_deletes_and_marks_ledger(monkeypatch):
+    from workflows import order_center_cleanup as occ
+    conn = _QueryConn(fetchone_seq=[(3,), (5,), (9,)],
+                      vanish=[("T1", "05062025")])
+    _fake = contextlib.contextmanager(lambda: iter([conn]))
+    monkeypatch.setattr(occ.db, "pg_conn", _fake)
+
+    out = occ.run({"execute": True})
+    deletes = [s for s, _ in conn.sqls if s.startswith("DELETE")]
+    assert len(deletes) == 3
+    assert any("recon_done:T1" in str(a) for _, a in conn.sqls if a)
+    assert "清理完成" in out

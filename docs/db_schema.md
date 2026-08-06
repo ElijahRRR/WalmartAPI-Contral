@@ -140,20 +140,23 @@ CREATE TABLE listing.upc_pool (     -- UPC 池:领取即永不释放(旧系统�
 order_audit / returns_sync / 绩效问题订单 / 对账明细四条链路共用同一行级标识:
 
 ```
-order_line_id = 'ol_' + sha256(po_id + '\x1f' + line_number)[:24]
+order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 ```
 
-身份设计(2026-08-06 v2 定稿,对订单中心v1 半成品决策逐条重审后的取舍):
-- **真正的身份锚点是自然键 `UNIQUE (po_id, line_number)`**;哈希 ID 是它的
+身份设计(2026-08-06 v3 定稿;v2 曾用行号,项目所有者按业务规则改定 SKU):
+- **真正的身份锚点是自然键 `UNIQUE (po_id, sku)`**;哈希 ID 是它的
   派生物,价值只在四表单列 JOIN,可随时从自然键重算。
-- **店铺不参与身份**(v2 修订,弃订单中心v1 方案):PO 号是沃尔玛发的、平台
+- **店铺不参与身份**(v2 起,弃订单中心v1 方案):PO 号是沃尔玛发的、平台
   全局唯一;店铺名是我方标签(飞书凭证表),改名/换人是真实运营事件,参与
   哈希会瞬间作废全部行标识。店铺存列+索引,只做归属与过滤。
-- **行号 vs SKU**:行号做物理身份(orders/returns/recon 三源原生带,官方行级
-  主键;SKU 理论可一单多行)。但 **SKU 的价值点在绩效关联**——绩效报表无行号
-  却多带商品列,perf_events 回填两段式:先按 (po_id, sku) 无歧义匹配(多行
-  订单也能关联上),再退"该 PO 仅一行"规则;都对不上留 NULL,不硬造。
-  ※ 拒绝订单中心v1 的"硬造行号 1"方案:假精度会把多行订单的绩效挂错行。
+- **SKU vs 行号**(v3 修订):同一 PO 内同一 SKU 必合并为一行(所有者实证
+  规则),(PO,SKU) 与 (PO,行号) 同样唯一;而绩效报表只给 PO+SKU 不给行号,
+  SKU 身份使绩效事件**写入时直接建键**(订单不在库也成立),消掉 v2 两段回填
+  的主缺口。行号存列做展示/对账。SKU 仅去首尾空白、大小写敏感。前提被打破
+  (同 PO 同 SKU 多行)时 extract 告警,后行覆盖前行——兜底不许静默。
+  售后行身份取 item.sku(必有;行号引用字段旧数据有缺失记录);对账 CSV 的
+  SKU 两级解析:自带列(Partner Item Id 等候选)→ 按 (po,行号) 反查订单行,
+  都无则跳过计数。无 SKU 的老版绩效报表行留 NULL,单行订单可回填,不硬造。
 - **绩效跨周期**:逐周期累积,主键 (po_id, metric, period)(拒绝订单中心v1 的
   同键覆盖——丢历史后"影响范围"无法回答)。`perf_event_spans` 视图给出每条
   违规的存续区间与 still_active(以最新报表是否仍包含该单为准,不自行推算
@@ -162,7 +165,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + line_number)[:24]
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
-| `orders.order_lines` | order_line_id(UNIQUE po+行号) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail) | 订单拉取工作流 + order_audit 回写审核 |
+| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
@@ -201,11 +204,25 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
+CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
+    table_id    text NOT NULL,      -- 飞书 table_id
+    row_key     text NOT NULL,      -- 行去重键(order_line_id / 唯一键 / perf_key)
+    record_id   text NOT NULL,      -- 飞书行内部编号(更新按它定位)
+    pushed_hash text,               -- 上次写入飞书时的载荷指纹
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_id, row_key)
+);
+-- 日常同步零拉表:本地比指纹定位要写的行;状态为空(首轮)或任何写失败
+-- 自动清状态 → 下轮全量拉表重建映射(自愈);-p reconcile=1 强制对账。
+-- 前提纪律:六表不删行、不复制行、键列不手改(打破由对账发现并告警)。
+
 CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧系统散落的 _meta sheet)
-    name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
+    name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'recon_done:A085朱丽霖'
     value       jsonb NOT NULL,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+-- recon_done:<店铺> = 已处理对账账期数组(台账):烂账入库过滤后某期可能
+-- 0 行落库,只看 settlement_lines DISTINCT period 会把它当缺失账期无限重拉
 
 -- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
 CREATE TABLE ops.store_kpi_daily (

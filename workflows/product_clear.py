@@ -1,10 +1,10 @@
-"""daily_retire — 飞书停用/删除表驱动的商品清理(plan #7,危险,默认 dry-run)。
+"""product_clear — 飞书停用/删除表驱动的商品清理(plan #7,替代旧 daily_retire/沃尔玛批量下架;危险,默认 dry-run)。
 
 用法:
-  python cli.py daily_retire                 # dry-run:打印将提交什么、将回写什么
-  python cli.py daily_retire --execute       # 真跑(提交 feed + 回写表格)
-  python cli.py daily_retire -p limit=100    # 单店单日上限覆盖(默认 300,限额表接入前)
-  python cli.py daily_retire -p store=A085朱丽霖
+  python cli.py product_clear                 # dry-run:打印将提交什么、将回写什么
+  python cli.py product_clear --execute       # 真跑(提交 feed + 回写表格)
+  python cli.py product_clear -p limit=100    # 单店单日上限覆盖(默认 300,限额表接入前)
+  python cli.py product_clear -p store=A085朱丽霖
 
 驱动表(registry.RETIRE_SHEET,电子表格,列序即契约):
   A=store  B=sku  C=停用/删除  D=操作原因 | E=feedid  F=操作日期  G=结果
@@ -25,7 +25,7 @@
 (切片/三层防重/反查三态),状态权威在 ops.feed_log,飞书 E~G 只是展示
 ——旧系统"状态只存飞书三列"的结构性风险(2026-05-07 事故根源)就此消除。
 
-⚠ 切换纪律:本工作流上生产调度前,必须先停旧系统 walmart-daily-retire
+⚠ 切换纪律:本工作流上生产调度前,必须先停旧系统 walmart-daily-retire(旧名)
 cron(每天 15:00),新旧并跑 = 重复删除。
 """
 
@@ -38,7 +38,7 @@ from services import feed_track, kpi, stores as stores_svc
 
 DANGEROUS = True
 
-logger = logging.getLogger("workflows.daily_retire")
+logger = logging.getLogger("workflows.product_clear")
 
 # C 列留空默认删除(所有者定稿 2026-08-06)
 _ACTIONS = {"停用": "RETIRE_ITEM", "下架": "RETIRE_ITEM",
@@ -188,7 +188,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 lines.append(f"[DRY-RUN] {store_name} {feed_type} 待提交 {len(skus)}")
                 continue
             results = feeds.submit_feed(stores_by_name[store_name], feed_type,
-                                        skus, workflow="daily_retire")
+                                        skus, workflow="product_clear")
             i = 0
             for res in results:
                 slice_rows = arows[i:i + res["count"]]
@@ -232,7 +232,7 @@ def run(params: dict) -> str:
     written = _writeback(updates_a + updates_b, execute)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
-    lines = [f"{mode}daily_retire:表内 {len(rows)} 行({limits_note})"] \
+    lines = [f"{mode}product_clear:表内 {len(rows)} 行({limits_note})"] \
         + lines_a + lines_b
     if execute:
         lines.append(f"回写 {written} 行")

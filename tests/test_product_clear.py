@@ -1,10 +1,10 @@
-"""daily_retire 回归:行状态机、动作路由、上限、dry-run 零写、轮询回写。"""
+"""product_clear 回归:行状态机、动作路由、上限、dry-run 零写、轮询回写。"""
 
 import pytest
 
 from api import feeds, feishu
 from services import feed_track
-from workflows import daily_retire as dr
+from workflows import product_clear as dr
 
 STORE = {"name": "T1", "client_id": "cid_r", "client_secret": "s", "proxy": None}
 
@@ -112,7 +112,7 @@ def test_limits_table_per_store_cap(monkeypatch, caplog):
     monkeypatch.setattr(feishu, "list_records", lambda t, field_names=None: [
         {"record_id": "r1", "fields": {"店铺": "T1", "下架限制": 2}},
     ])
-    with caplog.at_level(_logging.WARNING, logger="workflows.daily_retire"):
+    with caplog.at_level(_logging.WARNING, logger="workflows.product_clear"):
         out = dr.run({"execute": True})
     subs = {(s, ft): skus for s, ft, skus in calls["submit"]}
     assert subs[("T1", "DELETE_ITEM")] == ["S0", "S1"]      # 限额表 2 生效

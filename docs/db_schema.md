@@ -190,6 +190,25 @@ CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧�
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
+CREATE TABLE ops.store_kpi_daily (
+    store text, data_date date, PRIMARY KEY (store, data_date),
+    -- 身份/状态:seller_name+sales_status 来自影刀(空值不覆盖旧值,COALESCE);
+    -- 商品三列读 catalog.walmart_items(PG 复用,不调 API);
+    -- 绩效 8 率 / 结算字段 / 24h 订单窗口(中国时间 06:30 锚)/ prev_payout(-14 天规则)
+    ...  -- 完整 32 列见 refdata/schema.sql
+);
+
+CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不被覆盖
+    id bigint, first_seen_date date, store text,
+    sales_order_no / po_no / order_date / indicator(带 emoji 契约) /
+    sub_category / accountable / description / item / carrier / tracking_no / note,
+    raw jsonb,                           -- xlsx 原始行,对拍校准用
+    UNIQUE (sales_order_no, indicator, sub_category, tracking_no, item)
+);
+-- 写入一律 INSERT ... ON CONFLICT DO NOTHING:天然实现旧系统"永久累积+全局去重+
+-- 保留首次发现日期"语义,消掉旧系统清空飞书全表重写的丢数据风险
+
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'
     key         text NOT NULL,

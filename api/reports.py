@@ -8,7 +8,10 @@
 (实测 3/131)。ITEM 报表覆盖全部商品,`Item Page URL` 列(或 Item ID 列,版本而异)
 含数字 itemId——这也是市面 ERP 工具批量拿 itemId 的通用渠道。
 
-payment_statement / recon 系列按蓝图 §7 预留,随 daily_report 迁移时实现。
+daily_report 用(蓝图矩阵 #25/#26/#27):
+  payment_statement()     结算摘要(partnerId/sellerId/账期金额/回款计划)
+  available_recon_dates() 可下载对账账期列表(MMDDYYYY)
+  iter_recon_records()    对账明细逐条生成器(分页内藏)
 """
 
 import csv
@@ -103,6 +106,60 @@ def report_row_sku(row: dict) -> str | None:
         if key.strip().lower() == "sku" and val:
             return str(val).strip()
     return None
+
+
+def payment_statement(store: dict) -> dict:
+    """输入:店铺 → 输出:结算摘要原始 dict(含 partnerId/sellerInfo/accountSummary 等)。
+
+    sellerId 从 storeFrontUrl 正则 /seller/(\\d+) 提取是调用方(services)的事,
+    本层只负责把接口调对。官方 15/min。
+    """
+    _client.rate_acquire("reports.payment_statement", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    status, _, data = _client.safe_get_ex(
+        f"{_client.base_url()}/v3/report/payment/statement",
+        token, store["client_id"], store["proxy"], max_retries=3)
+    if status != 200 or data is None:
+        raise RuntimeError(f"payment/statement 返回 {status}(店铺 {store['name']})")
+    return data
+
+
+def available_recon_dates(store: dict) -> list[str]:
+    """输入:店铺 → 输出:可下载对账账期列表(MMDDYYYY 字符串)。"""
+    _client.rate_acquire("reports.recon", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    status, _, data = _client.safe_get_ex(
+        f"{_client.base_url()}/v3/report/reconreport/availableReconFiles",
+        token, store["client_id"], store["proxy"],
+        params={"reportVersion": "v1"}, max_retries=3)
+    if status != 200 or data is None:
+        raise RuntimeError(f"availableReconFiles 返回 {status}(店铺 {store['name']})")
+    return list(data.get("availableApReportDates") or [])
+
+
+def iter_recon_records(store: dict, report_date: str, page_size: int = 200):
+    """输入:店铺 + 账期(MMDDYYYY)→ 输出:对账明细记录生成器(offset 分页内藏)。
+
+    调用方按需 break(如只找 Transaction Type == 'PaymentSummary' 的行)。
+    """
+    offset = 0
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    while True:
+        _client.rate_acquire("reports.recon", store["client_id"])
+        status, _, data = _client.safe_get_ex(
+            f"{_client.base_url()}/v3/report/reconreport/reconFileJson",
+            token, store["client_id"], store["proxy"],
+            params={"reportDate": report_date, "offset": offset,
+                    "noOfRecords": page_size},
+            max_retries=3)
+        if status != 200 or data is None:
+            raise RuntimeError(f"reconFileJson 返回 {status}"
+                               f"(店铺 {store['name']}, 账期 {report_date})")
+        records = data.get("reportData") or []
+        yield from records
+        if len(records) < page_size:
+            return
+        offset += len(records)
 
 
 def fetch_item_report(store: dict, *, poll_interval: float = 20.0,

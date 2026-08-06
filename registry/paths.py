@@ -50,6 +50,19 @@ def locks_dir() -> Path:
     return data_root() / "locks"
 
 
+def frontend_scrape_file() -> Path:
+    """输入:无 → 输出:影刀 RPA 抓取结果 latest.json 路径。
+
+    env FRONTEND_SCRAPE_JSON 覆盖——并跑期指向旧项目的
+    <旧项目根>/data/frontend_scrape/latest.json(影刀应用内部写死该路径,
+    不跟脚本走;见 legacy_survey #daily_report 路径陷阱)。
+    """
+    override = os.environ.get("FRONTEND_SCRAPE_JSON", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return data_root() / "frontend_scrape" / "latest.json"
+
+
 def stores_snapshot_file() -> Path:
     """输入:无 → 输出:店铺凭证本地快照文件路径(含密钥,写入后 chmod 600,不进 git)。"""
     return cache_dir() / "stores_snapshot.json"

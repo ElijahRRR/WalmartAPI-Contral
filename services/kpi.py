@@ -200,6 +200,10 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
     sheet_stats: list = []
     wb = openpyxl.load_workbook(io.BytesIO(blob), read_only=True, data_only=True)
     for ws in wb.worksheets:
+        # 生产实证(2026-08-06):沃尔玛生成的 xlsx 把 dimension 声明成单格,
+        # read_only 模式按声明只读出 1 行 → 必须 reset_dimensions 重扫真实行
+        if hasattr(ws, "reset_dimensions"):
+            ws.reset_dimensions()
         data = [[("" if c is None else str(c)) for c in r]
                 for r in ws.iter_rows(values_only=True)]
         sheet_stats.append((ws.title, len(data),

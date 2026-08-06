@@ -57,6 +57,9 @@ WHERE r.return_created >= now() - make_interval(days => %s)
 """
 
 # 绩效表全量:行数按 (po, metric) 事件去重,增长缓慢,自身有界。
+# 只推挂上订单行的事件(所有者决策 2026-08-06):挂不上的 = PO 早于拉单窗口的
+# 老单,报表每天仍会重报它们(滚动窗口),不能删库只能推送侧过滤;
+# 滚出统计窗口后自然消失。PG 保留全量供统计。
 # 最近一期原始行(detail/status)经 LATERAL 取;period 为 ISO 日期串,字符序即时间序
 _PERF_SQL = """
 SELECT s.store, s.po_id, s.metric, s.order_line_id, s.first_period,
@@ -68,6 +71,7 @@ LEFT JOIN LATERAL (
     SELECT e.detail, e.status, e.last_seen_at FROM orders.perf_events e
     WHERE e.po_id = s.po_id AND e.metric = s.metric
     ORDER BY e.period DESC LIMIT 1) le ON true
+WHERE s.order_line_id IS NOT NULL
 """
 
 # 账期 MMDDYYYY:最近账期按 YYYY+MMDD 重排后取最大

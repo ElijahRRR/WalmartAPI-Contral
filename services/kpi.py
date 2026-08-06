@@ -212,11 +212,13 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
         accountable = "⚪ 否" if ws.title.strip().lower() == "not accountable" else "✅ 是"
         sub_category = "" if accountable == "⚪ 否" else ws.title.strip()
 
+        data_rows = kept = 0
         for raw in data[start + 1:]:
             if not any(c.strip() for c in raw):
                 continue
             if any(c.strip().startswith("=") for c in raw):
                 continue                                # Excel SUM 公式行
+            data_rows += 1
             rec = dict(zip(header, raw))
             row = {"indicator": label, "sub_category": sub_category,
                    "accountable": accountable,
@@ -239,6 +241,14 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
             row["description"] = "; ".join(desc_parts)[:300]
             if row["sales_order_no"] or row["po_no"] or row["tracking_no"]:
                 rows.append(row)
+                kept += 1
+        # 单号列一个都没匹配上 = _HEADER_MAP 关键词与真实表头不符,
+        # 打出真实表头供校准——静默丢行就是"解析 0 行"事故的成因
+        if data_rows and not kept:
+            logger.warning("报表 %s sheet '%s':%d 行数据全被丢弃(未匹配到单号列),"
+                           "真实表头=%s,首行样本=%s",
+                           metric, ws.title, data_rows, header,
+                           data[start + 1][:8] if len(data) > start + 1 else [])
     return rows
 
 

@@ -80,7 +80,7 @@
 |---|---|---|---|---|
 | 1 | product_query | 产品ID查询产品详情 | 否 | 零状态零调度,练手验证 api 层。**[x] 完成**(2026-08-05 生产实跑通过,PR #3) |
 | 2 | returns_sync | 售后订单同步 | 否 | 单文件,写飞书;顺手修"整表覆盖残留旧行"缺陷(多维表格按 record_id 更新,天然解决) |
-| 3 | daily_report | 沃尔玛店铺日报 | 否 | 影刀 RPA 部分保持原样(仅 macOS),只改数据落点。**[~] 已实现**(kpi/problems/push 三阶段→PG;影刀只读 latest.json 不 spawn;问题订单列映射待对拍校准) |
+| 3 | daily_report | 沃尔玛店铺日报 | 否 | 影刀 RPA 部分保持原样(仅 macOS),只改数据落点。**[~] kpi 阶段单店对拍通过**(2026-08-06,A085,绩效/订单/结算全列对齐;结算解析改递归查找修复)。待:problems 列映射对拍校准、全店跑、影刀 FRONTEND_SCRAPE_JSON 接入、挂调度观察 |
 | 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务 |
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |

@@ -42,6 +42,9 @@ def _capture_sync(monkeypatch):
         return (len(desired), 0, 0)
 
     monkeypatch.setattr(feishu, "sync_by_key", fake_sync)
+    # 类型适配层直通:全部字段给未知类型码 → _conv 原样放行,断言拿到规范值
+    monkeypatch.setattr(feishu, "list_fields", lambda t: [
+        {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
     return captured
 
 
@@ -193,7 +196,57 @@ def test_run_partial_failure_raises_after_all_tables(monkeypatch):
 
     monkeypatch.setattr(feishu, "sync_by_key", fake_sync)
     monkeypatch.setattr(feishu, "ensure_keys", lambda t, k, keys: 0)
+    monkeypatch.setattr(feishu, "list_fields", lambda t: [
+        {"field_name": n, "type": 9999} for n in vars(t.fields).values()])
     with pytest.raises(RuntimeError, match="部分表同步失败"):
         ocp.run({})
     # 销售表失败不挡后面的表(售后/绩效/对账仍同步)
     assert len(seen) == 4
+
+
+# ── 字段类型自适应(2026-08-06 首跑实证:整批原子,一列类型错=全表推不上)──────
+
+
+def test_conv_per_field_type():
+    assert ocp._conv(2, "07292026") == 7292026.0     # 数字列收字符串:能转就转
+    assert ocp._conv(2, "abc") is None               # 转不动置空,不炸整批
+    assert ocp._conv(2, True) == 1
+    assert ocp._conv(5, 1754300000000) == 1754300000000
+    assert ocp._conv(5, "2026-08-01") is None        # 日期列只收毫秒
+    assert ocp._conv(7, True) is True and ocp._conv(7, "yes") is None
+    assert ocp._conv(15, "https://t") == {"link": "https://t", "text": "https://t"}
+    assert ocp._conv(3, True) == "是" and ocp._conv(3, False) == "否"
+    assert ocp._conv(1, 123) == "123"
+    assert ocp._conv(4, "a") == ["a"]
+    assert ocp._conv(9999, {"x": 1}) == {"x": 1}     # 未知类型原样试写
+    for t in (1, 2, 5, 7, 15):
+        assert ocp._conv(t, None) is None            # null 清空语义全类型保留
+
+
+def test_adapt_rows_types_and_guards(monkeypatch):
+    from registry import resources as res
+    t = res.ORDER_PERF
+    f = t.fields
+    monkeypatch.setattr(feishu, "list_fields", lambda table: [
+        {"field_name": f.key, "type": 1},
+        {"field_name": f.metric, "type": 3},          # 单选
+        {"field_name": f.accountable, "type": 3},     # 单选收 bool → 是/否
+        {"field_name": f.pulled_at, "type": 5},
+        {"field_name": f.detail, "type": 20},         # 公式列 → 整列跳过
+    ])
+    desired = {"k1": {f.key: "k1", f.metric: "🚚 OTD", f.accountable: True,
+                      f.pulled_at: 1754300000000, f.detail: "{}",
+                      "不存在的列": "x"}}
+    out = ocp._adapt_rows(t, desired)
+    row = out["k1"]
+    assert row[f.accountable] == "是"
+    assert row[f.pulled_at] == 1754300000000
+    assert f.detail not in row and "不存在的列" not in row
+
+
+def test_adapt_rows_missing_key_field_raises(monkeypatch):
+    from registry import resources as res
+    monkeypatch.setattr(feishu, "list_fields",
+                        lambda table: [{"field_name": "别的列", "type": 1}])
+    with pytest.raises(feishu.FeishuError, match="缺少键字段"):
+        ocp._adapt_rows(res.ORDER_RETURNS, {"k": {"唯一键": "k"}})

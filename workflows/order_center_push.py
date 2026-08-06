@@ -95,6 +95,83 @@ WHERE b.last_settle_date IS NULL
 """
 
 
+# 程序不写的字段类型:人员/附件/关联/查找/公式/地理/群组/系统列——
+# 这些列即便被登记进 registry 也整列跳过(计算列由飞书自己算)
+_UNWRITABLE_TYPES = {11, 17, 18, 19, 20, 21, 22, 23,
+                     1001, 1002, 1003, 1004, 1005}
+
+
+def _conv(ftype: int, v):
+    """输入:飞书字段类型码 + 规范值(_cell 产物)→ 输出:该类型可写的值。
+
+    转不动时返回 None(调用方计数告警),绝不让整批 batch_create 因单列炸掉
+    (飞书批量写整批原子,一列类型错 = 全表推不上,2026-08-06 首跑实证)。
+    """
+    if v is None:
+        return None
+    if ftype == 2:                          # 数字
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, (int, float)):
+            return v
+        try:
+            return float(str(v).strip())
+        except ValueError:
+            return None
+    if ftype == 5:                          # 日期:只收毫秒时间戳
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if ftype == 7:                          # 复选框
+        return v if isinstance(v, bool) else None
+    if ftype == 15:                         # 超链接:要求 {link, text} 结构
+        s = str(v)
+        return {"link": s, "text": s}
+    if ftype == 4:                          # 多选
+        return v if isinstance(v, list) else [str(v)]
+    if ftype in (1, 3, 13):                 # 文本/单选/电话:一律字符串
+        if isinstance(v, bool):
+            return "是" if v else "否"
+        return str(v)
+    return v                                # 未知类型原样试写
+
+
+def _adapt_rows(table, desired: dict[str, dict]) -> dict[str, dict]:
+    """输入:表 + 规范载荷 → 输出:按表内**实际字段类型**转换后的载荷。
+
+    先 list_fields 读真实类型再逐列适配(用户的表,类型不归我们定);
+    表中不存在的列与计算/系统型列整列跳过并告警;键字段缺失直接报错
+    (同步对齐锚点,不能没有)。
+    """
+    types = {f["field_name"]: f["type"] for f in feishu.list_fields(table)}
+    key_field = table.fields.key
+    if key_field not in types:
+        raise feishu.FeishuError(
+            None, f"表「{table.name}」缺少键字段「{key_field}」,请在飞书补建该文本字段后重跑")
+    skipped: dict[str, str] = {}
+    lost: dict[str, int] = {}
+    out: dict[str, dict] = {}
+    for k, row in desired.items():
+        new = {}
+        for name, v in row.items():
+            ftype = types.get(name)
+            if ftype is None:
+                skipped.setdefault(name, "表中不存在")
+                continue
+            if ftype in _UNWRITABLE_TYPES:
+                skipped.setdefault(name, f"计算/系统型(type={ftype})")
+                continue
+            cv = _conv(ftype, v)
+            if cv is None and v is not None:
+                lost[name] = lost.get(name, 0) + 1
+            new[name] = cv
+        out[k] = new
+    if skipped:
+        logger.warning("表「%s」以下列不写入:%s", table.name, skipped)
+    if lost:
+        logger.warning("表「%s」以下列有值因类型不符被置空(建议核对字段类型):%s",
+                       table.name, lost)
+    return out
+
+
 def _cell(v):
     """输入:PG 单元值 → 输出:bitable 可写值(日期→毫秒,Decimal→float,None 原样)。
 
@@ -157,7 +234,8 @@ def _push_sales(days: int) -> tuple[str, set[str]]:
             f.postal_code: r["postal_code"], f.country: r["country"],
             f.pulled_at: _cell(r["updated_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, desired, delete_stale=False)
+    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
+                                 delete_stale=False)
     return (f"销售订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}",
             set(desired))
 
@@ -190,7 +268,8 @@ def _push_returns(days: int) -> str:
             f.carrier: r["carrier"], f.tracking_no: r["tracking_no"],
             f.is_keep_it: r["is_keep_it"],
         }
-    c, u, d = feishu.sync_by_key(t, f.key, desired, delete_stale=False)
+    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
+                                 delete_stale=False)
     return f"售后订单:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
 
 
@@ -217,7 +296,8 @@ def _push_perf() -> str:
                        if r["detail"] is not None else None),
             f.pulled_at: _cell(r["last_seen_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, desired, delete_stale=False)
+    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
+                                 delete_stale=False)
     return f"绩效订单:{len(desired)} 行(全量),新建 {c} 更新 {u}"
 
 
@@ -242,7 +322,8 @@ def _push_settlement(days: int) -> str:
             f.settle_date: _cell(r["last_settle_date"]),
             f.pulled_at: _cell(r["updated_at"]),
         }
-    c, u, d = feishu.sync_by_key(t, f.key, desired, delete_stale=False)
+    c, u, d = feishu.sync_by_key(t, f.key, _adapt_rows(t, desired),
+                                 delete_stale=False)
     return f"对账明细:{len(desired)} 行(窗口 {days} 天),新建 {c} 更新 {u}"
 
 

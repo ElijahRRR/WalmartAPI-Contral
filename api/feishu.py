@@ -245,6 +245,30 @@ def batch_delete(table: Bitable, record_ids: list[str]) -> int:
     return n
 
 
+def list_fields(table: Bitable) -> list[dict]:
+    """输入:Bitable → 输出:字段元数据列表 [{field_name, type, ui_type}](自动翻页)。
+
+    type 为飞书字段类型码(1文本/2数字/3单选/4多选/5日期/7复选框/15超链接…),
+    调用方据此做写入值的类型适配。
+    """
+    t = table.require()
+    out: list[dict] = []
+    page_token = None
+    while True:
+        params = {"page_size": 100}
+        if page_token:
+            params["page_token"] = page_token
+        data = _call("GET", f"/open-apis/bitable/v1/apps/{t.app_token}"
+                            f"/tables/{t.table_id}/fields", params=params)
+        for item in data.get("items") or []:
+            out.append({"field_name": item.get("field_name"),
+                        "type": item.get("type"),
+                        "ui_type": item.get("ui_type")})
+        if not data.get("has_more"):
+            return out
+        page_token = data.get("page_token")
+
+
 def _plain_text(v) -> str:
     """输入:records/search 返回的字段值 → 输出:纯文本(文本字段可能是分段结构)。"""
     if isinstance(v, list):

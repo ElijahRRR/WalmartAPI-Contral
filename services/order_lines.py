@@ -445,11 +445,17 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
 
 
 def perf_rows_from_problems(store_name: str, metric: str, rows: list[dict],
-                            period: str) -> tuple[list[dict], int]:
-    """输入:店铺+指标键+parse_problem_report 行+周期 → 输出:(perf_events 行, 无 PO 跳过数)。
+                            period: str, sku_lookup: dict | None = None
+                            ) -> tuple[list[dict], int]:
+    """输入:店铺+指标键+parse_problem_report 行+周期+可选 {(po,行号)→sku}
+    → 输出:(perf_events 行, 无 PO 跳过数)。
 
     period = 拉取日(报表是当时滚动窗口的快照,按日累积即可支撑 still_active 判定);
     无 PO 号的行无法建键,跳过并计数(调用方记日志——兜底不许静默)。
+
+    SKU 三级解析(2026-08-06 实证:returns/INR 报表版式带 Order Line # 无 SKU 列):
+    ① 报表自带 SKU 列;② 报表带行号 → sku_lookup 反查订单行拿 SKU;
+    ③ 都没有 → sku 留 NULL,order_line_id 由 backfill 的单行订单段兜。
     """
     out, skipped = [], 0
     for r in rows:
@@ -459,11 +465,13 @@ def perf_rows_from_problems(store_name: str, metric: str, rows: list[dict],
             continue
         accountable = str(r.get("accountable", "")).startswith("✅")
         sku = norm_sku(r.get("sku")) or None
+        line_no = norm_line(r.get("line_no"))
+        if not sku and line_no and sku_lookup:
+            sku = sku_lookup.get((po, line_no)) or None
         out.append({"store": store_name, "po_id": po, "metric": metric,
                     "period": str(period),
                     "sku": sku,
-                    # v3 身份 = PO+SKU:报表带 SKU 即可直接建键,订单不在库里也成立;
-                    # 无 SKU 的老版报表留 NULL,由 backfill 的单行订单段兜
+                    # v3 身份 = PO+SKU:解析到 SKU 即直接建键,订单不在库里也成立
                     "order_line_id": make_order_line_id(po, sku) if sku else None,
                     "accountable": accountable,
                     "status": "违规" if accountable else "不计入",

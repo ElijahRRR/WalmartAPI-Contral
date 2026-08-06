@@ -160,6 +160,19 @@ def test_perf_rows_from_problems():
     assert out[1]["sku"] is None and out[1]["order_line_id"] is None
 
 
+def test_perf_rows_line_no_resolves_sku_via_lookup():
+    # returns/INR 版式:带 Order Line # 无 SKU(2026-08-06 实证)→ 反查订单行建键
+    rows = [
+        {"po_no": "PO5", "sku": "", "line_no": "2.0", "accountable": "✅ 是", "raw": "{}"},
+        {"po_no": "PO6", "sku": "", "line_no": "1", "accountable": "✅ 是", "raw": "{}"},
+    ]
+    out, _ = ol.perf_rows_from_problems("T1", "returns", rows, "2026-08-06",
+                                        sku_lookup={("PO5", "2"): "B0Z9"})
+    assert out[0]["sku"] == "B0Z9"            # 行号归一后命中反查
+    assert out[0]["order_line_id"] == ol.make_order_line_id("PO5", "B0Z9")
+    assert out[1]["sku"] is None and out[1]["order_line_id"] is None  # 查不到不硬造
+
+
 def test_pick_new_periods_sorts_across_years():
     available = ["12212025", "01042026", "07142026", "06302026"]
     todo = ol.pick_new_periods(available, have={"07142026"}, limit=2)

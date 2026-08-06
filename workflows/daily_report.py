@@ -251,6 +251,10 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
         rows_all = [r for _, rs in by_metric for r in rs]
         if rows_all:
             with db.pg_conn() as conn, conn.cursor() as cur:
+                # returns/INR 报表带行号无 SKU(实证):预载 (po,行号)→sku 供反查建键
+                cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
+                            "WHERE store = %s", (store["name"],))
+                sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
                 for r in rows_all:
                     cur.execute(_PROBLEM_INSERT,
                                 {**r, "store": store["name"],
@@ -259,7 +263,7 @@ def _phase_problems(store_list: list[dict], data_date) -> str:
                 # 订单中心:逐周期累积进 orders.perf_events(period=拉取日)
                 for m, rs in by_metric:
                     perf_rows, skipped = order_lines.perf_rows_from_problems(
-                        store["name"], m, rs, str(data_date))
+                        store["name"], m, rs, str(data_date), sku_lookup)
                     perf_written += order_lines.upsert_perf_events(conn, perf_rows)
                     no_po += skipped
         if no_po:

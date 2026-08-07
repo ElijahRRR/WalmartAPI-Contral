@@ -64,6 +64,8 @@ FEED_SPEC_VERSIONS = {
     "DELETE_ITEM": "5.0.20250919-16_45_47-api",
     "RETIRE_ITEM": "1.0",
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
+    "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
+    "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)

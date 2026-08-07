@@ -1,10 +1,12 @@
 """沃尔玛 Inventory 域接口(函数面定稿见 docs/api_blueprint.md §7)。
 
-已实现端点(catalog_sync,蓝图矩阵 #21/#22):
+已实现端点(蓝图矩阵 #20/#21/#22):
   list_inventories()  GET /v3/inventories   全店库存分页(分页模型4)+ 单品兜底补漏内置
   get_inventory()     GET /v3/inventory?sku= 单品库存
+  put_inventory()     PUT /v3/inventory?sku= 单品改库存(同步快路径,maintenance 用)
 
-put_inventory() 按蓝图 §7 预留,随 maintenance 工作流迁移时实现。
+批量改库存走 feeds.submit_feed(feed_type="inventory");路由阈值由 services 层
+显式 if 决定(蓝图取舍规则:能力不同的两个端点,严禁隐式降级)。
 
 分页模型 4 的坑(蓝图 §4,历史 bug):终止只能看 nextCursor 是否为空,
 **不能看页长**——某页可能 <limit 但仍有下页;单店 cursor 强制串行(2026-05-15 生产实证)。
@@ -78,6 +80,29 @@ def list_inventories(store: dict, expected_skus: set[str] | None = None) -> dict
                 if qty is not None:
                     result[sku] = qty
     return result
+
+
+def put_inventory(store: dict, sku: str, qty: int) -> tuple[bool, str]:
+    """输入:店铺 + SKU + 新可售数量 → 输出:(是否成功, 失败原因串)。
+
+    同步接口,结果当场已知,不产生 feed_id 不进 feed 台账。
+    401/403 抛 StoreDeadError。
+    """
+    _client.rate_acquire("inventory.put", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"],
+                              store["proxy"])
+    body = {"sku": str(sku), "quantity": {"unit": "EACH", "amount": int(qty)}}
+    status, _, data = _client.safe_put_ex(
+        f"{_client.base_url()}/v3/inventory", token, store["client_id"],
+        store["proxy"], json_body=body, params={"sku": str(sku)}, timeout=60)
+    if status in (401, 403):
+        raise _client.StoreDeadError(store["name"], status)
+    if status == 200:
+        return True, ""
+    why = f"HTTP {status}: {str(data)[:200]}"
+    logger.warning("PUT /v3/inventory 失败(%s %s → %s): %s",
+                   store["name"], sku, qty, why)
+    return False, why
 
 
 def get_inventory(store: dict, sku: str) -> int | None:

@@ -165,6 +165,9 @@ def run(params: dict) -> str:
              f"(stockzero 店 {len(stockzero)} 家)"]
 
     if not execute:
+        if stockzero:
+            # 整店清零的人眼闸门:名单必须可见(不能只给个数)
+            lines.append(f"  stockzero 名单:{','.join(sorted(stockzero))}")
         for store_name, kinds in sorted(by_store.items()):
             for kind in _KIND_ORDER:
                 items = kinds.get(kind)

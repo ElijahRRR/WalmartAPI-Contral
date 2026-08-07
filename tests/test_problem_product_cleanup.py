@@ -197,6 +197,12 @@ def test_stubborn_sql_binds_to_listing_generation():
     assert "item_reappeared" in ppc._SQL_STUBBORN
 
 
+def test_attempts_sql_filters_by_source():
+    # 反补计数只认 problem_product_cleanup 来源:未来 maintenance 工作流
+    # 的 MP_MAINTENANCE 事件不得污染"反补满 2 次转删"计数
+    assert "source = 'problem_product_cleanup'" in ppc._SQL_ATTEMPTS
+
+
 def test_inflight_sql_blocks_unobserved_success():
     # 在途/待观测拦截:feed 落定 success 但 catalog_sync 未重新观测
     # (resolved_at > last_seen_at)必须继续拦——否则落定后、扫店前重跑

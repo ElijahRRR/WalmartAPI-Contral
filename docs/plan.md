@@ -87,8 +87,8 @@
 | 2 | returns_sync | 售后订单同步 | 否 | **[~] 单店生产验证通过**(2026-08-06,10 售后行入库并挂上订单行);待全店跑+挂调度 |
 | 3 | daily_report | 沃尔玛店铺日报 | 否 | 影刀 RPA 部分保持原样(仅 macOS),只改数据落点。**[~] kpi 阶段单店对拍通过**(2026-08-06,A085,绩效/订单/结算全列对齐;结算解析改递归查找修复)。待:problems 列映射对拍校准、全店跑、影刀 FRONTEND_SCRAPE_JSON 接入、挂调度观察 |
 | 4 | order_audit | 沃尔玛订单审核 | 否 | 收敛旧的双重调度(launchd 每小时 + skill 13:30 二选一);依赖采集服务。**[~] 取数前半生产验证通过**(order_sync,2026-08-06 单店 38 行;statusDate/trackingURL 按线上实证修正);审核规则待采集对接后补 |
-| 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
-| 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
+| 5 | upc_generator | 沃尔玛UPC生成器 | 否 | **[x] 不迁移**(所有者定稿 2026-08-07):旧版未上生产,不做迁移;新系统以后若需要此功能,按新架构新建脚本(UPC 池状态届时入 ops) |
+| 6 | maintenance | 沃尔玛商品维护 | **是** | **[~] 管道就绪,清零链路做实**(2026-08-07):单一 workflow(旧三段式的 sync/poll 分别被 PG 数据源与 feed_poll 反哺器替代);意图 provider 可插拔——清零(限额表「库存特殊要求」=0 整店清零,不设二次确认,所有者定稿)已做实,改价/改库存/改标题**预留接口**待采集(catalog.latest_snapshot)接入填实;路由 改价≤5/改库存≤10 走单品 PUT 否则 feed(标题恒 feed);维护记录=在线产品总表内「维护记录」工作表(只追加,反哺器回填)。**维护事件入账定稿**(所有者 2026-08-07):标题/价格/库存维护(含清库存)一律**不进** catalog.product_events——清库存是店铺维度运营操作,系统不设店铺维度病历;流水在 ops.feed_log/feed_items,状态后果由 status_changed 观测入账(配套闸:receipt_in_ledger 白名单 + 反补计数 source 过滤)。待:清零链路生产验证、涨跌幅闸(价格 provider 做实时)、maintenance.db 历史并入(历史数据迁移批次)。⚠切换前停旧 12:00 walmart-maintenance-all-stores 并先收干净旧在途 feed |
 | 7 | product_clear | 沃尔玛批量下架(旧 daily_retire) | **是** | **[~] 生产验收通过**(2026-08-06,所有者确认:A107 首测 5+放量 1221 个 DELETE_ITEM,识别/限额/防重/轮询/台账/事件账本全链路);待:切旧 15:00 cron、挂调度、停用(RETIRE_ITEM)动作实测。命名原则(所有者 2026-08-06):新工作流按功能命名,不继承旧系统名 |
 | 8 | problem_product_cleanup | 沃尔玛问题商品清理(旧 daily_cleanup) | **是** | **[~] 生产验收通过,PR #9 已合并**(2026-08-07,所有者确认):759 行首次全量真跑(21 店,27 反补 + 231 删除;dry-run 账目自洽对拍通过)。验收期修复:20 代理对抗审查 6 项(dedup 幽灵事件/防重只拦在途/反查排除已占用 feedId/顽固绑代际/轮询卡死/摘要分列)+ 单店隔离 + 网络波动二轮重试 + 在途/待观测拦截(均生产实证)。待:次日 catalog_sync 删除核验观测、停旧 0/6/12/18 点 cron、挂调度(catalog_sync 先行) |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |

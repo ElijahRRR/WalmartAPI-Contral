@@ -70,9 +70,12 @@ WHERE f.status = 'submitted'
 _SQL_ATTEMPTS = """
 SELECT store, sku, count(*) FROM catalog.product_events
 WHERE event = 'maintenance_submitted'
+  AND source = 'problem_product_cleanup'
   AND occurred_at > now() - make_interval(days => %s)
 GROUP BY store, sku
 """
+# source 过滤(2026-08-07):MP_MAINTENANCE 是通用部分更新 feed,未来
+# maintenance 工作流的标题/到期日期操作若记事件,不得污染反补转删计数
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
 FROM catalog.product_events WHERE event = 'problem_categorized'

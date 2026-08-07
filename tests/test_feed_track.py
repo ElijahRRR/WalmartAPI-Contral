@@ -91,6 +91,34 @@ def test_poll_feed_keeps_feed_open_when_sku_processing(monkeypatch, caplog):
     assert any("仍 processing/unknown" in m for m in caplog.messages)
 
 
+def test_poll_feed_maintenance_receipt_not_in_ledger_for_non_relist(monkeypatch):
+    # 维护类回执不进病历(所有者定稿 2026-08-07):同为 MP_MAINTENANCE,
+    # 反补来源(problem_product_cleanup)进,标题/到期日期维护来源不进;
+    # feed_items 台账两者照常落定
+    class _MetaConn(_Conn):
+        def fetchall(self):
+            if "SELECT sku, workflow, feed_type, status" in self._last:
+                return [("A", "maintenance", "MP_MAINTENANCE", "submitted"),
+                        ("B", "problem_product_cleanup", "MP_MAINTENANCE",
+                         "submitted")]
+            return []
+    conn = _MetaConn()
+    _fake_db(monkeypatch, conn)
+    recorded = []
+    monkeypatch.setattr(feed_track.product_events, "record_many",
+                        lambda c, rows: (recorded.extend(rows), len(rows))[1])
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "A", "ingestionStatus": "SUCCESS"},
+        {"sku": "B", "ingestionStatus": "SUCCESS"}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
+    feed_track.poll_feed(STORE, "F1")
+    assert [e["sku"] for e in recorded] == ["B"]        # 只有反补来源入账
+    many_sql, rows = conn.sqls[1]
+    assert ("success", None, "F1", "A") in rows          # 台账不受白名单影响
+
+
 def test_poll_feed_repoll_does_not_duplicate_events(monkeypatch):
     # 重轮询(上一轮已把 A 落定)只对本轮才落定的 SKU 记回执事件
     class _MetaConn(_Conn):

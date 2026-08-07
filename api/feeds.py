@@ -46,11 +46,14 @@ _DETAIL_PAGE = 50          # includeDetails 明细页大小(官方两页矛盾 5
 _PAGE_SLEEP = 0.2
 _RECHECK_SLEEP = 30        # 反查 NOT_FOUND 的二次确认间隔(防索引滞后)
 
-# 切片双约束:(最大条数, 最大字节)。RETIRE_ITEM 官方无现值,按 DELETE 同档保守
+# 切片双约束:(最大条数, 最大字节)。RETIRE_ITEM 官方无现值,按 DELETE 同档保守;
+# price/inventory 官方 10MB(旧代码 25MB 超官方上限,蓝图 §5.4 收紧)
 _SLICE_LIMITS = {
     "DELETE_ITEM": (2500, 350_000),
     "RETIRE_ITEM": (1000, 350_000),
     "MP_MAINTENANCE": (1000, 24_000_000),
+    "price": (1000, 9_500_000),
+    "inventory": (4000, 9_500_000),
 }
 
 
@@ -85,6 +88,24 @@ def build_payload(feed_type: str, entries: list) -> dict:
         return {"MPItemFeedHeader": {"businessUnit": "WALMART_US", "locale": "en",
                                      "version": ver},
                 "MPItem": [_sanitize(e) for e in entries]}
+    if feed_type == "price":
+        # PriceFeed v1.7:顶层**无外层包装**(加 {"PriceFeed":…} → feedStatus=ERROR,
+        # itemsReceived=0,旧系统实证);条目 {"sku", "price"}
+        return {"PriceHeader": {"version": ver},
+                "Price": [{"sku": str(e["sku"]),
+                           "pricing": [{"currentPrice": {
+                               "currency": "USD",
+                               "amount": _sanitize(float(e["price"]))},
+                               "currentPriceType": "BASE"}]}
+                          for e in entries]}
+    if feed_type == "inventory":
+        # InventoryFeed v1.4:Inventory 首字母**必须大写**(小写 →
+        # ERR_EXT_DATA_0503009,旧系统实证);条目 {"sku", "qty"}
+        return {"InventoryHeader": {"version": ver},
+                "Inventory": [{"sku": str(e["sku"]),
+                               "quantity": {"unit": "EACH",
+                                            "amount": int(e["qty"])}}
+                              for e in entries]}
     raise ValueError(f"feedType 未在 api/feeds.py 收录: {feed_type}"
                      f"(蓝图收录规则:预留端点只登记不实现)")
 
@@ -178,8 +199,8 @@ def mark_feed_done(feed_id: str, ok: bool) -> None:
 
 
 def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
-    if feed_type == "MP_MAINTENANCE":
-        # MPItem 的 sku 可能在顶层或嵌在 Orderable 里(反补载荷是后者)
+    if feed_type in ("MP_MAINTENANCE", "price", "inventory"):
+        # dict 条目:sku 在顶层或嵌在 Orderable 里(反补载荷是后者)
         return [str(e.get("sku") or (e.get("Orderable") or {}).get("sku") or "")
                 for e in chunk]
     return [str(s) for s in chunk]

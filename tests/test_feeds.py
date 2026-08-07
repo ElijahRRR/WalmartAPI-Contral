@@ -107,6 +107,53 @@ def test_build_payload_schemas():
         feeds.build_payload("MP_ITEM", [])
 
 
+def test_build_payload_price_and_inventory_schemas():
+    # PriceFeed v1.7:无外层包装(加 PriceFeed 包装→ERROR,旧实证);金额 round2
+    p = feeds.build_payload("price", [{"sku": "A", "price": 19.999}])
+    assert set(p.keys()) == {"PriceHeader", "Price"}          # 无 PriceFeed 外壳
+    assert p["PriceHeader"]["version"] == "1.7"
+    assert p["Price"][0]["pricing"][0]["currentPrice"]["amount"] == 20.0
+    assert p["Price"][0]["pricing"][0]["currentPriceType"] == "BASE"
+
+    # InventoryFeed v1.4:Inventory 首字母必须大写(小写→ERR_EXT_DATA_0503009)
+    inv = feeds.build_payload("inventory", [{"sku": "B", "qty": 7}])
+    assert set(inv.keys()) == {"InventoryHeader", "Inventory"}
+    assert inv["InventoryHeader"]["version"] == "1.4"
+    assert inv["Inventory"][0] == {"sku": "B",
+                                   "quantity": {"unit": "EACH", "amount": 7}}
+
+
+def test_price_inventory_chunk_skus_and_slices():
+    entries = [{"sku": f"S{i}", "qty": 0} for i in range(4001)]
+    assert len(feeds._slices("inventory", entries)) == 2       # 4000/片
+    assert feeds._chunk_skus("price", [{"sku": "X", "price": 1}]) == ["X"]
+    assert feeds._chunk_skus("inventory", [{"sku": "Y", "qty": 0}]) == ["Y"]
+
+
+def test_put_price_and_put_inventory(monkeypatch):
+    from api import inventory as inv_api, prices
+    seen = {}
+
+    def handler(request):
+        seen[request.url.path] = json.loads(request.content)
+        if request.url.path == "/v3/inventory":
+            assert request.url.params["sku"] == "S1"
+        return httpx.Response(200, json={"ok": True})
+
+    _use(monkeypatch, handler)
+    ok, why = prices.put_price(STORE, "S1", 19.999)
+    assert ok and why == ""
+    assert seen["/v3/price"]["pricing"][0]["currentPrice"]["amount"] == 20.0
+    ok2, _why = inv_api.put_inventory(STORE, "S1", 3)
+    assert ok2 and seen["/v3/inventory"]["quantity"] == {"unit": "EACH",
+                                                         "amount": 3}
+
+    _client._close_all_clients()
+    _use(monkeypatch, lambda r: httpx.Response(400, json={"error": "bad"}))
+    ok3, why3 = prices.put_price(STORE, "S1", 5)
+    assert not ok3 and "HTTP 400" in why3
+
+
 def test_slices_item_and_byte_caps(monkeypatch):
     assert len(feeds._slices("DELETE_ITEM", [f"S{i}" for i in range(2500)])) == 1
     assert len(feeds._slices("DELETE_ITEM", [f"S{i}" for i in range(2501)])) == 2

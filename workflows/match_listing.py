@@ -6,7 +6,8 @@
   python cli.py match_listing -p store=A085朱丽霖
 
 驱动表(registry.MATCH_SHEET「跟卖表」,所有者定稿 2026-08-07 单路飞书读,
-替代旧 xlsx 输入):运营填 A=UPC C=售价 D=重量 E=店铺;脚本填其余。
+替代旧 xlsx 输入):运营填 A=UPC C=售价 D=重量 E=店铺;B=SKU 人工优先
+(旧系统习惯:人工编号),留空则按同款格式自动生成;脚本填其余。
 
 流程:读表 → 待处理行 SPEC 预检(api/items.search_walmart_spec,按位数
 生成 upc/gtin 候选依次试)→ 三路:
@@ -95,6 +96,11 @@ def run(params: dict) -> str:
     spec_cache: dict = {}
     by_store: dict[str, list[tuple[dict, dict]]] = {}   # 店铺 → [(行, item)]
 
+    # SKU 自动编号起点(B 列留空的行用;人工填了 B 的行不占号)
+    date_str = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
+    with db.pg_conn() as conn:
+        serial = match_feed.next_serial_start(conn, date_str)
+
     for r in todo:
         store = stores_by_name.get(r["store"])
         if store is None:
@@ -109,11 +115,14 @@ def run(params: dict) -> str:
             continue
         spec = pre["spec"]
         r["gtin"] = spec["product_id"] or ""
-        sku = match_feed.match_sku(r["gtin"] or r["upc"])
-        r["sku"] = sku
+        if not r["sku"]:        # B 列人工优先,留空自动按旧格式续号
+            r["sku"] = match_feed.make_sku(date_str, serial)
+            serial += 1
         try:
-            item = match_feed.build_match_item(spec["raw"], sku,
-                                               r["price"], r["weight"])
+            item = match_feed.build_match_item(
+                spec["raw"], r["sku"], r["price"], r["weight"],
+                product_id=spec["product_id"],
+                product_id_type=spec["product_id_type"])
         except (TypeError, ValueError) as e:
             r["status"] = f"数据无效:{e}"     # 售价/重量填的不是数
             updates.append((r["rownum"], match_sheet.row_vals(r)))

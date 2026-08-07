@@ -22,19 +22,51 @@ def test_spec_candidates_by_length():
     assert match_feed.spec_candidates("123456789012345") == []  # >14 位
 
 
-def test_build_match_item_overlays_spec_template():
+def test_build_match_item_five_fields_per_verified_sample():
+    # 2026-08-07 对拍定稿:五字段,price/ShippingWeight 裸 number,
+    # condition 缺省补 New,productIdentifiers 模板缺失时用预检结果兜底
     spec_raw = {"itemSpecPayload": {"MPItem": [{"Item": {
-        "productIdentifiers": {"productId": "00012345678905",
-                               "productIdType": "GTIN"},
-        "condition": "New"}}]}}
-    item = match_feed.build_match_item(spec_raw, "SKU1", "19.999", "1.5")
-    assert item["productIdentifiers"]["productId"] == "00012345678905"
-    assert item["condition"] == "New"              # SPEC 模板字段保留
-    assert item["sku"] == "SKU1" and item["price"] == 20.0
-    assert item["ShippingWeight"] == 1.5
-    # SPEC 无模板时仍能构造(最小载荷)
-    bare = match_feed.build_match_item(None, "S", 1, 1)
-    assert bare["sku"] == "S"
+        "productIdentifiers": {"productId": "06432341052907",
+                               "productIdType": "GTIN"}}}]}}
+    item = match_feed.build_match_item(spec_raw, "PHUMWMT202608070001",
+                                       "14.759", "0.4")
+    assert item == {"sku": "PHUMWMT202608070001",
+                    "condition": "New",
+                    "productIdentifiers": {"productId": "06432341052907",
+                                           "productIdType": "GTIN"},
+                    "ShippingWeight": 0.4, "price": 14.76}
+    # SPEC 无模板时 productIdentifiers 兜底
+    bare = match_feed.build_match_item(None, "S", 1, 1,
+                                       product_id="00012345678905",
+                                       product_id_type="GTIN")
+    assert bare["productIdentifiers"]["productId"] == "00012345678905"
+
+
+def test_sku_autogen_format_and_serial_resume():
+    assert match_feed.make_sku("20260807", 1) == "PHUMWMT202608070001"
+    assert match_feed.make_sku("20260807", 123) == "PHUMWMT202608070123"
+
+    class _Conn:
+        def __init__(self, val):
+            self.val = val
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            assert "MP_ITEM_MATCH" in sql
+
+        def fetchone(self):
+            return (self.val,)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    assert match_feed.next_serial_start(_Conn("0007"), "20260807") == 8
+    assert match_feed.next_serial_start(_Conn(None), "20260807") == 1
 
 
 def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
@@ -53,6 +85,8 @@ def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
                                             len(rows))[1])
     monkeypatch.setattr(items_api, "search_walmart_spec",
                         lambda store, **kw: spec_results[next(iter(kw.values()))])
+    monkeypatch.setattr(ml.match_feed, "next_serial_start",
+                        lambda conn, d: 1)
 
     def fake_submit(store, ft, entries, *, workflow=""):
         calls["feeds"].append((store["name"], ft, len(entries)))
@@ -101,7 +135,8 @@ def test_execute_routes_and_terminal_states(monkeypatch):
     assert calls["feeds"] == [("T1", "MP_ITEM_MATCH", 1)]
     by_row = {r: vals for r, vals in calls["writes"]}
     assert by_row[2][7] == "F_M" and by_row[2][8] == "处理中"   # I=feedId J=处理中
-    assert by_row[2][0] == "00012345678905"        # B=SKU(暂定=productId)
+    # B 列留空 → 自动按旧格式续号(PHUMWMT+YYYYMMDD+0001)
+    assert by_row[2][0].startswith("PHUMWMT") and by_row[2][0].endswith("0001")
     assert by_row[3][4] == "码无效"
     assert by_row[4][4] == "需完整建品"
     assert by_row[5][4] == "店铺不识别"
@@ -109,6 +144,21 @@ def test_execute_routes_and_terminal_states(monkeypatch):
     ev = [e for e in calls["events"] if e["event"] == "match_submitted"]
     assert len(ev) == 1 and ev[0]["detail"]["feed_id"] == "F_M"
     assert "跟卖提交 1" in out
+
+
+def test_manual_sku_takes_priority(monkeypatch):
+    # B 列人工填号优先(旧系统习惯),不占自动序号
+    row_manual = _row(2, "012345678905")
+    row_manual["sku"] = "MY-OWN-001"
+    row_auto = _row(3, "012345678912")
+    spec2 = dict(_SPEC_OK, product_id="00012345678912")
+    calls = _wire(monkeypatch, [row_manual, row_auto],
+                  {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK,
+                   "012345678912": spec2, "00012345678912": spec2})
+    ml.run({"execute": True})
+    by_row = {r: vals for r, vals in calls["writes"]}
+    assert by_row[2][0] == "MY-OWN-001"
+    assert by_row[3][0].endswith("0001")            # 自动号从 1 起,人工行不占号
 
 
 def test_match_sheet_sync_from_ledger(monkeypatch):

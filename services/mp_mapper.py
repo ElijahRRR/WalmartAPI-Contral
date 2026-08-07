@@ -129,6 +129,40 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     return apply_images(attrs, images or [])
 
 
+def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
+    """输入:PT + 该 PT spec + 产品数据契约 → 输出:LLM 映射的 messages。
+
+    只送字段面(名称/enum/描述截断),产品侧送标题+attrs;产出要求纯 JSON
+    (Visible 字段对象)。红线不靠提示词,finalize_visible 兜底执行。
+    """
+    import json as _json
+    props = (spec or {}).get("properties") or {}
+    fields = {}
+    for name, meta in list(props.items())[:200]:
+        if not isinstance(meta, dict):
+            continue
+        f: dict = {}
+        if "enum" in meta:
+            f["enum"] = meta["enum"][:30]
+        if meta.get("description"):
+            f["desc"] = str(meta["description"])[:120]
+        fields[name] = f
+    sys = ("你是沃尔玛商品属性映射器。根据亚马逊产品资料,填写目标 Product Type"
+           " 的字段,输出一个 JSON 对象(字段名→值)。规则:只用给定字段名;"
+           "enum 字段必须取枚举值之一;不确定的字段不要输出;"
+           "productName 用英文、10~199 字符;不要输出任何认证/保修/文档类字段。")
+    user = _json.dumps({
+        "product_type": pt,
+        "fields": fields,
+        "product": {"title": product.get("title"),
+                    "brand": product.get("brand"),
+                    "category": product.get("category"),
+                    "attrs": product.get("attrs") or {}},
+    }, ensure_ascii=False)
+    return [{"role": "system", "content": sys},
+            {"role": "user", "content": user}]
+
+
 def build_orderable(sku: str, upc: str, price, qty: int,
                     partner_id: str) -> dict:
     """输入:sku/upc/沃尔玛价/库存/Partner ID → 输出:Orderable 段。

@@ -89,8 +89,17 @@
       (旧 462MB sqlite 的 PG 化,旧数据不迁——key 含 model 换模型即失效)
 - [x] MP_ITEM 进 feed 唯一通道:header 只收 3 字段 + version 完整时间戳
       (三个实证错误码注释在案);8/hour 桶;事件 kind=list 入生死类白名单
-- [ ] L2d:数据源 provider + 闸门链串联 + 变体 + mapper(零认证八项等
-      实证约束)+ list_new 主链 + 回执四集合反哺器(端到端验收待采集)
+- [x] L2d 代码就绪(2026-08-07):amz_source 数据契约(fetch_products 预留,
+      缺席行不写终态恢复自动续上)+ api/settings.partnerprofile + mapper
+      (orderable 三陷阱/零认证强制+文档字段清理+enum 降级/文案硬约束/
+      图片 minItems=5,逐条测试)+ list_new 主链(七道闸门链:店铺状态/
+      日配额/PT spec/风控/全局去重/product_risk 防呆/数据过滤+定价;
+      UPC 领号事务;LLM 映射走缓存;同店单 feed;三态结局 UPC 回收三类)
+      + 上架表回执反哺器(四集合+优先级,SKU_LOCKED>SUCCESS>ASYNC>失败,
+      错误码 strip \\t 实证)
+- [ ] L2d 端到端生产验收:**待采集服务可用**(现在可验:dry-run 闸门链、
+      风控拦截、去重防呆计数;数据行会停在"待数据源")
+- [ ] 变体分组:后置(依赖采集 variation 数据)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 

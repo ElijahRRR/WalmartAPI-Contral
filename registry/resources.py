@@ -75,6 +75,10 @@ FEED_SPEC_VERSIONS = {
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
 WALMART_ERR_SKU_LOCKED = "ERR_EXT_DATA_0101211"     # 解法:RETIRE→24h→新 UPC 重上
 WALMART_ERR_UPC_CONFLICT = "ERR_EXT_DATA_0101119"
+# 异步审核假错误(旧实证:'还在合规审核中',几小时~几天自然变 SUCCESS;
+# 绝不能当失败重发,否则 duplicate listing)
+WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
+                            "EXT_DATA_ERROR_66547201695750")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

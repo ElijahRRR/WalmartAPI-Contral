@@ -1,0 +1,318 @@
+"""list_new — 上架主链(listing L2d,替代旧 auto_listing/main.py;危险,默认 dry-run)。
+
+用法:
+  python cli.py list_new                     # dry-run:闸门链判定+逐行去向
+  python cli.py list_new --execute           # 真跑(领 UPC/LLM 映射/提交 feed)
+  python cli.py list_new -p store=A085朱丽霖
+
+驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
+且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 与 O=SKU_LOCKED 跳过
+(Unknown 也算已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
+
+闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
+  ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
+  ② 日配额(限额表「上架限制」- 今日已提交数(ops.feed_items MP_ITEM);
+    北京日界)
+  ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
+  ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
+    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦)
+  ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
+    数据恢复自动续上)
+  ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
+    定价出界(services/pricing,FBA/FBM 区间×倍率)淘汰
+  ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
+    硬约束 → 同店打包单个 MP_ITEM feed(10/hour 硬限)
+
+提交结局(旧三态生死语义,UPC 回收仅三类):
+  submitted → K=Yes L=feedid M=日期,UPC 标已用,listing_sources 登记(amz),
+              事件 list_submitted;O/P/Q 由 feed_poll 反哺器按回执四集合回填
+  failed(4xx 拒)→ N=提交被拒,UPC 回收(rejected)
+  unknown → K=Unknown(不重复提交),UPC **不回收**
+"""
+
+import logging
+from datetime import datetime
+
+from api import feeds, feishu, llm, settings as settings_api
+from registry import db, resources
+from services import amz_source, kpi, listing_sheet, listing_sources, \
+    llm_cache, mp_mapper, pricing, product_events, pt_spec, risk_gate, \
+    stores as stores_svc, upc_pool
+
+DANGEROUS = True
+
+logger = logging.getLogger("workflows.list_new")
+
+_SQL_INACTIVE = """
+SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
+ORDER BY store, data_date DESC
+"""
+_SQL_TODAY_LISTED = """
+SELECT store, count(DISTINCT sku) FROM ops.feed_items
+WHERE feed_type = 'MP_ITEM'
+  AND submitted_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai')
+      AT TIME ZONE 'Asia/Shanghai'
+GROUP BY store
+"""
+_SQL_LISTED_ASINS = """
+SELECT DISTINCT sku FROM catalog.walmart_items WHERE missing_since IS NULL
+"""
+_SQL_RISKY = """
+SELECT sku FROM catalog.product_risk
+WHERE delete_times > 0 OR delete_not_effective_times > 0
+"""
+
+
+def _load_gate_state():
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_INACTIVE)
+        inactive = {s for s, st in cur.fetchall()
+                    if st and st.upper() != "ACTIVE"}
+        cur.execute(_SQL_TODAY_LISTED)
+        today_used = {s: int(n) for s, n in cur.fetchall()}
+        cur.execute(_SQL_LISTED_ASINS)
+        listed = {r[0] for r in cur.fetchall()}
+        cur.execute(_SQL_RISKY)
+        risky = {r[0] for r in cur.fetchall()}
+        gate = risk_gate.load_gate(conn)
+    return inactive, today_used, listed, risky, gate
+
+
+def _load_quota(default: int = 999) -> dict[str, int]:
+    """限额表「上架限制」;未登记/读不到按旧语义默认 999(等于不限)。"""
+    t = resources.RETIRE_LIMITS
+    f = t.fields
+    try:
+        recs = feishu.list_records(t, field_names=[f.store, f.max_daily_list])
+    except LookupError:
+        return {}
+    out: dict[str, int] = {}
+    for rec in recs:
+        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        try:
+            v = int(float(feishu._plain_text(
+                rec["fields"].get(f.max_daily_list)) or 0))
+        except ValueError:
+            v = 0
+        if name and v > 0:
+            out[name] = v
+    return out
+
+
+def _load_multipliers() -> dict[str, dict]:
+    """限额表四个区间倍率列(services/pricing 消费)。"""
+    t = resources.RETIRE_LIMITS
+    f = t.fields
+    try:
+        recs = feishu.list_records(t, field_names=[
+            f.store, f.fba_range1, f.fba_range2, f.fbm_range1, f.fbm_range2])
+    except LookupError:
+        return {}
+    out: dict[str, dict] = {}
+    for rec in recs:
+        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        if name:
+            out[name] = {k: feishu._plain_text(rec["fields"].get(getattr(f, k)))
+                         for k in ("fba_range1", "fba_range2",
+                                   "fbm_range1", "fbm_range2")}
+    return out
+
+
+def _map_visible(conn, pt: str, spec, product: dict) -> dict:
+    """LLM 映射(缓存优先)→ mapper 硬约束清洗。"""
+    messages = mp_mapper.build_llm_messages(pt, spec, product)
+    key = llm_cache.cache_key(messages, 0.2, 4096)
+    raw = llm_cache.get(conn, key)
+    if raw is None:
+        raw = llm.chat_json(messages)
+        llm_cache.put(conn, key, raw)
+    return mp_mapper.finalize_visible(pt, raw, spec,
+                                      images=product.get("images"))
+
+
+def run(params: dict) -> str:
+    """输入:params(execute/store)→ 输出:闸门链与提交摘要。"""
+    execute = bool(params.get("execute"))
+    rows = listing_sheet.read_rows()
+    if params.get("store"):
+        rows = [r for r in rows if r["store"] == params["store"]]
+    pending = [r for r in rows
+               if r["audit_result"].lower() == "pass"
+               and r["listed"].lower() in ("", "no")
+               and not r["feed_id"]
+               and r["list_result"] != "SKU_LOCKED"]
+    mode = "" if execute else "🧪 [DRY-RUN] "
+    lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"]
+    if not pending:
+        return "\n".join(lines)
+
+    inactive, today_used, listed, risky, gate = _load_gate_state()
+    quota = _load_quota()
+    mults = _load_multipliers()
+    stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
+    n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
+         "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0}
+    reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
+    candidates: list[dict] = []
+
+    by_store: dict[str, list[dict]] = {}
+    for r in pending:
+        by_store.setdefault(r["store"], []).append(r)
+
+    for store_name, srows in sorted(by_store.items()):
+        if store_name not in stores_by_name:
+            lines.append(f"  {store_name}:凭证缺失,整店跳过")
+            continue
+        if store_name in inactive:
+            n["inactive"] += len(srows)
+            continue
+        allow = max(0, quota.get(store_name, 999)
+                    - today_used.get(store_name, 0))
+        take, over = srows[:allow], srows[allow:]
+        n["quota"] += len(over)
+        for r in take:
+            if pt_spec.load_pt(r["product_type"]) is None:
+                n["no_spec"] += 1
+                reasons.append((r["rownum"], f"PT无spec:{r['product_type']}"))
+                continue
+            why = risk_gate.check(gate, r["product_type"], None)
+            if why:
+                n["risk"] += 1
+                reasons.append((r["rownum"], why))
+                continue
+            if r["asin"] in listed:
+                n["dedup"] += 1
+                reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
+                continue
+            if r["asin"] in risky:
+                n["guard"] += 1
+                reasons.append((r["rownum"], "防呆:该ASIN有删除史(product_risk)"))
+                continue
+            candidates.append(r)
+
+    products = amz_source.fetch_products([r["asin"] for r in candidates])
+    ready: list[dict] = []
+    for r in candidates:
+        p = products.get(r["asin"])
+        if p is None:
+            n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
+            continue
+        if (p.get("stock") or 0) < amz_source.MIN_INVENTORY:
+            n["filtered"] += 1
+            reasons.append((r["rownum"], f"库存不足:{p.get('stock')}"))
+            continue
+        why = risk_gate.check(gate, None, p.get("brand"))
+        if why:
+            n["risk"] += 1
+            reasons.append((r["rownum"], why))
+            continue
+        w_price = pricing.walmart_price(p.get("channel") or "FBM",
+                                        p.get("price"),
+                                        mults.get(r["store"], {}))
+        if w_price is None:
+            n["filtered"] += 1
+            reasons.append((r["rownum"], f"价格出界/倍率未配置:{p.get('price')}"))
+            continue
+        qty = 0 if (p.get("lead_days") or 0) > amz_source.MAX_LEAD_DAYS \
+            else int(p.get("stock") or 0)
+        ready.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+
+    lines.append(f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
+                 f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
+                 f"去重 {n['dedup']},防呆 {n['guard']},"
+                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
+
+    if not execute:
+        for rownum, why in reasons[:15]:
+            lines.append(f"  第{rownum}行:{why}")
+        for r in ready[:10]:
+            lines.append(f"  [DRY-RUN] {r['store']} {r['asin']} "
+                         f"定价 {r['_price']} 库存 {r['_qty']} 待提交")
+        if ready:
+            lines.append(f"[DRY-RUN] 共 {len(ready)} 行将进入 领UPC→LLM→提交")
+        return "\n".join(lines)
+
+    for rownum, why in reasons:
+        listing_sheet.write_reason(rownum, why)
+    n_reasons_written = len(reasons)
+
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    by_store2: dict[str, list[dict]] = {}
+    for r in ready:
+        by_store2.setdefault(r["store"], []).append(r)
+
+    for store_name, srows in sorted(by_store2.items()):
+        store = stores_by_name[store_name]
+        try:
+            partner = settings_api.get_partner_id(store)
+            items, claimed = [], []
+            with db.pg_conn() as conn:
+                upcs = upc_pool.claim(conn, [{"store": store_name,
+                                              "asin": r["asin"]}
+                                             for r in srows])
+                for r, upc in zip(srows, upcs):
+                    if upc is None:
+                        n["no_upc"] += 1
+                        reasons.append((r["rownum"], "UPC池余量不足"))
+                        continue
+                    visible = _map_visible(conn, r["product_type"],
+                                           pt_spec.load_pt(r["product_type"]),
+                                           r["_p"])
+                    if len(visible.get("productName") or "") < 10:
+                        upc_pool.release(conn, [upc], "prep_failed")
+                        reasons.append((r["rownum"], "标题不足10字符"))
+                        continue
+                    orderable = mp_mapper.build_orderable(
+                        r["asin"], upc, r["_price"], r["_qty"], partner)
+                    items.append(mp_mapper.assemble_mp_item(
+                        orderable, r["product_type"], visible))
+                    claimed.append((r, upc))
+            if not items:
+                continue
+            updates = []
+            i = 0
+            for res in feeds.submit_feed(store, "MP_ITEM", items,
+                                         workflow="list_new"):
+                batch = claimed[i:i + res["count"]]
+                i += res["count"]
+                with db.pg_conn() as conn:
+                    if res["outcome"] == "submitted" and res["feed_id"]:
+                        upc_pool.mark_used(conn, [(u, r["asin"])
+                                                  for r, u in batch])
+                        listing_sources.register(conn, [
+                            {"store": store_name, "sku": r["asin"],
+                             "source_type": listing_sources.SOURCE_AMZ,
+                             "source_key": r["asin"], "workflow": "list_new"}
+                            for r, _ in batch])
+                        product_events.record_many(conn, [
+                            {"sku": r["asin"], "store": store_name,
+                             "event": "list_submitted", "source": "list_new",
+                             "detail": {"feed_id": res["feed_id"],
+                                        "price": r["_price"]}}
+                            for r, _ in batch])
+                        for r, u in batch:
+                            updates.append((r["rownum"], [
+                                (r["_p"].get("title") or "")[:190],
+                                r["_p"].get("price") or "",
+                                r["_p"].get("stock") or "",
+                                r["_price"], "Yes", res["feed_id"], today, ""]))
+                    elif res["outcome"] == "failed":
+                        upc_pool.release(conn, [u for _, u in batch], "rejected")
+                        for r, _ in batch:
+                            updates.append((r["rownum"], [
+                                "", "", "", "", "No", "", "", "提交被拒"]))
+                    else:   # unknown:UPC 不回收,K=Unknown 防重复提交
+                        for r, _ in batch:
+                            updates.append((r["rownum"], [
+                                "", "", "", "", "Unknown", "", today,
+                                "提交结局不确定,待对账"]))
+            listing_sheet.write_submit_cols(updates)
+            lines.append(f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条")
+        except Exception as e:
+            logger.exception("店铺 %s 上架异常,跳过继续其它店: %s", store_name, e)
+            lines.append(f"  ⚠ {store_name}:上架异常已跳过({e}),下轮重试")
+
+    for rownum, why in reasons[n_reasons_written:]:   # 提交期新增的理由(UPC/标题)
+        listing_sheet.write_reason(rownum, why)
+    lines.append("回执 O/P/Q 由 feed_poll 反哺器回填;结果轮询走 feed_poll")
+    return "\n".join(lines)

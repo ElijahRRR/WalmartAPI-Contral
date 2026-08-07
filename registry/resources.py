@@ -120,6 +120,8 @@ class Spreadsheet:
     token: str
     sheet_id: str
     columns: tuple[str, ...]
+    wiki: bool = False      # True=token 是知识库节点 token(wiki/ 链接),
+                            # api/feishu 会先解析成真实 spreadsheet_token
 
     def require(self) -> "Spreadsheet":
         if not self.token or not self.sheet_id:
@@ -282,6 +284,30 @@ MATCH_SHEET = Spreadsheet(
     columns=("upc", "sku", "price", "weight", "store", "match_status",
              "matched_gtin", "list_time", "feed_id", "feed_result",
              "feed_check_time"),
+)
+
+
+# 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
+# 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——
+# 所有者 2026-08-07:表格随时会停用)
+RISK_PT_SHEET = Spreadsheet(
+    name="沃尔玛类目表",
+    token=os.environ.get("FEISHU_RISK_PT_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_RISK_PT_SHEET_ID", ""),
+    columns=("category", "ptg", "product_type", "admit_status", "cn_seller",
+             "cert_required", "note", "field_total", "field_required",
+             "field_list"),
+    wiki=True,
+)
+
+# 风控·禁止品牌收集(wiki 承载;来源=产品清理报错扫描+商标库比对,
+# 名单语义=黑名单品牌,casefold 精确匹配)
+BRAND_BAN_SHEET = Spreadsheet(
+    name="禁止品牌收集",
+    token=os.environ.get("FEISHU_BRAND_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_BRAND_SHEET_ID", ""),
+    columns=("brand", "source", "added_date"),
+    wiki=True,
 )
 
 

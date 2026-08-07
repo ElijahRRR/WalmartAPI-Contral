@@ -168,6 +168,26 @@ CREATE TABLE IF NOT EXISTS catalog.upc_pool (
 );
 CREATE INDEX IF NOT EXISTS upc_pool_status_idx ON catalog.upc_pool (status);
 
+-- ── 风控库(L2b,2026-08-07 所有者定稿:两张飞书表镜像入 PG,闸门读库
+-- 不读表——表格随时会停用;同步只增改不删,未来产品中心黑名单增量以
+-- 脚本跑库,清理来源数据入库须清洗对应产品/店铺,归黑名单建设批次)──
+CREATE TABLE IF NOT EXISTS catalog.risk_product_types (
+    product_type text PRIMARY KEY,   -- Walmart Product Type
+    category text, ptg text,
+    admit_status text,               -- 准入状态('禁售' → 拦截)
+    cn_seller text,                  -- 中国卖家可做(以'否'开头 → 拦截)
+    cert_required text, note text,
+    field_total text, field_required text, field_list text,
+    synced_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
+    brand_key text PRIMARY KEY,      -- casefold 匹配键
+    brand text NOT NULL,             -- 品牌名原文
+    source text,                     -- 来源(产品清理报错扫描+商标库比对)
+    added_date text,                 -- 入库日期(表格原样)
+    synced_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS
   SELECT sku,

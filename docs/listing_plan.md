@@ -68,6 +68,17 @@
       + walmart_price 积木
 - [ ] 生产验证:注入一批 UPC → upc_sync → 核对状态列与池余量
 
+### L2b 实施状态(2026-08-07)
+
+- [x] 风控入库(所有者选 A:保留提交前否决闸,防审核→上架时间差):
+      catalog.risk_product_types / brand_blacklist + risk_sync 工作流
+      (wiki 表自动解析,只增改不删)+ services/risk_gate(拦截条件旧实证:
+      准入状态='禁售' 或 中国卖家可做 以'否'开头;品牌 casefold)
+- [ ] 生产验证:.env 两组 wiki token → risk_sync → 核对禁售/黑名单计数
+- 黑名单体系远景(所有者 2026-08-07):产品中心库建成后,新增黑名单
+  (沃尔玛类目/品牌/产品/amz 类目)以脚本增量跑库;清理来源数据入库须
+  **清洗走流程**(对应产品/店铺对上,该进黑名单的进)——归黑名单建设批次
+
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 
 - [ ] 输入 provider:xlsx 模式先行(DMIT 导出 47 列),采集 API 模式预留

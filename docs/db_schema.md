@@ -142,6 +142,17 @@ CREATE TABLE catalog.upc_pool (
 ```
 
 ```sql
+-- 风控库(L2b,2026-08-07):飞书两表镜像,闸门读库不读表(表格将停用)
+-- 同步只增改不删;拦截条件:准入状态='禁售' 或 中国卖家可做 以'否'开头;
+-- 品牌 casefold 精确匹配(brand_key)
+CREATE TABLE catalog.risk_product_types (product_type PK, category, ptg,
+    admit_status, cn_seller, cert_required, note,
+    field_total, field_required, field_list, synced_at);
+CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
+    added_date, synced_at);
+```
+
+```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
 CREATE TABLE catalog.product_events (
     id bigint IDENTITY PRIMARY KEY,

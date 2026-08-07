@@ -43,6 +43,7 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | 待创建 |
 | 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);用户已建,token/sheet_id 待填 .env(FEISHU_ONLINE_SHEET_TOKEN / FEISHU_ONLINE_SHEET_ID);列序登记在 registry ONLINE_PRODUCTS_SHEET;**只写在架行**(缺席商品不进表,2026-08-07 定稿),last_seen_at/missing_since 两列不投影(追踪在 PG + 事件账本) |
 | 订单中心六表(订单中心V1 应用) | 主订单/销售/采购/售后/绩效/对账 | Postgres(orders schema)权威,order_center_push 键对齐同步;主订单表/采购信息为人工域,程序只补键 | 代码已对齐用户既有表头(2026-08-06);售后表需补「唯一键」字段;app_token + 6 个 table_id 填 .env |
+| 维护记录 | maintenance 流水账(只追加) | 程序唯一写入方:提交时追加(feed 路径 F=feedid H=处理中;PUT 路径 F=sync H=当场落定),H/I 由 feed_poll 反哺器按 ops.feed_items 回填;水位在 ops.cursors('maint_sheet') | **电子表格**:「在线产品总表」spreadsheet 内的「维护记录」工作表(所有者已建 2026-08-07;bitable 5 万行上限装不下);表头 店铺/SKU/动作/旧值/新值/feedid/日期/结果/报错;sheet_id 填 .env FEISHU_MAINT_SHEET_ID |
 | 商品停用删除表 | product_clear 驱动表 | 登记类:运营填 A~D(store/sku/停用或删除/操作原因),程序写 E~H(feedid/操作日期/结果/报错);状态权威在 ops.feed_log,G/H 由 feed_poll 反哺器或 product_clear 回写(2026-08-07 定稿:feed 结果统一交轮询回填) | **电子表格**(列序契约);已建,token/sheet_id 在 .env(FEISHU_RETIRE_SHEET_TOKEN / FEISHU_RETIRE_SHEET_ID) |
 | 上下架限额表 | **按店铺分行**的单日上/下架限额(店铺/fba区间1/fba区间2/FBM区间1/FBM区间2/上架限制/下架限制/库存特殊要求) | 飞书人工维护 → 程序读(product_clear 读「下架限制」,店铺不在表内退默认值并告警;未来 listing 读「上架限制」) | 多维表格;代码已接入,token 待填 .env(FEISHU_LIMITS_APP_TOKEN / FEISHU_LIMITS_TABLE_ID) |
 

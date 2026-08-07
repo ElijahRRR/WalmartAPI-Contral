@@ -20,7 +20,8 @@ feed 上线时,各自的反哺器在 _REFLECTORS 登记一行即接入。
 
 import logging
 
-from services import clear_sheet, feed_track, stores as stores_svc
+from services import clear_sheet, feed_track, maint_sheet, \
+    stores as stores_svc
 
 DANGEROUS = False
 
@@ -30,6 +31,7 @@ logger = logging.getLogger("workflows.feed_poll")
 # 新 feed 工作流上线时在此追加,例:("上架表", listing_sheet.sync_from_ledger)
 _REFLECTORS: list[tuple[str, object]] = [
     ("停用/删除表", clear_sheet.sync_from_ledger),
+    ("维护记录", maint_sheet.sync_from_ledger),
 ]
 
 

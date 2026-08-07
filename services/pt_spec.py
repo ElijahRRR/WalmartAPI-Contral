@@ -25,11 +25,38 @@ def _spec_dir():
     return d
 
 
+def _sanitize_filename(pt: str) -> str:
+    """PT 名 → 拆分文件名候选(旧拆分工具对特殊字符的处理未入档,
+    按常见规则生成候选,load_pt 逐个探测存在性)。"""
+    return "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in pt)
+
+
 @lru_cache(maxsize=1)
 def pt_index() -> dict:
-    """输入:无 → 输出:_pt_index.json 内容(PT 名 → 拆分文件名)。"""
+    """输入:无 → 输出:{PT 名: 文件名或 None(None=按候选规则探测)}。
+
+    兼容 _pt_index.json 的多种形态(旧拆分工具产物,格式未入档):
+    dict{pt: 文件名} / list[str PT 名] / list[dict{pt/name…: 文件…}]。
+    """
     with open(_spec_dir() / "_pt_index.json", encoding="utf-8") as f:
-        return json.load(f)
+        raw = json.load(f)
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    out: dict = {}
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            out[item] = None
+        elif isinstance(item, dict):
+            pt = (item.get("pt") or item.get("product_type")
+                  or item.get("productType") or item.get("name"))
+            fn = (item.get("file") or item.get("filename")
+                  or item.get("path"))
+            if pt:
+                out[str(pt)] = str(fn) if fn else None
+    if not out:
+        raise ValueError(f"_pt_index.json 格式无法识别(既非 dict 也非可解析"
+                         f" list):{str(raw)[:200]}")
+    return out
 
 
 @lru_cache(maxsize=1)
@@ -41,21 +68,25 @@ def orderable_spec() -> dict:
 
 @lru_cache(maxsize=512)
 def load_pt(product_type: str) -> dict | None:
-    """输入:Product Type 名 → 输出:该 PT 的 Visible 段 schema;未收录 None。
+    """输入:Product Type 名 → 输出:该 PT 的 spec;未收录/文件缺失 None。
 
     未收录 PT 返回 None 而非抛错——调用方按"PT 无 spec"淘汰该行并落原因,
-    不炸整轮。
+    不炸整轮。索引未带文件名时按候选规则探测(原名/清洗名 + .json)。
     """
     idx = pt_index()
-    fname = idx.get(product_type)
-    if not fname:
+    if product_type not in idx:
         return None
-    fp = _spec_dir() / fname
-    if not fp.exists():
-        logger.warning("PT spec 索引有名但文件缺失:%s → %s", product_type, fname)
-        return None
-    with open(fp, encoding="utf-8") as f:
-        return json.load(f)
+    d = _spec_dir()
+    candidates = ([idx[product_type]] if idx[product_type] else []) + [
+        f"{product_type}.json", f"{_sanitize_filename(product_type)}.json"]
+    for fname in candidates:
+        fp = d / fname
+        if fp.exists():
+            with open(fp, encoding="utf-8") as f:
+                return json.load(f)
+    logger.warning("PT 在索引中但拆分文件未找到:%s(候选=%s)",
+                   product_type, candidates)
+    return None
 
 
 def known_pts() -> set[str]:

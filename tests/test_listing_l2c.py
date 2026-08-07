@@ -35,6 +35,19 @@ def test_pt_spec_loads_and_caches(spec_dir):
     assert pt_spec.orderable_spec()["properties"] == {"sku": {}}
 
 
+def test_pt_index_tolerates_list_forms(spec_dir):
+    # 生产实证 2026-08-07:旧拆分工具的 _pt_index.json 是 list 不是 dict
+    idx_file = spec_dir / "_pt_index.json"
+    idx_file.write_text(json.dumps(["Cups", "Other PT"]), "utf-8")
+    pt_spec.clear_caches()
+    assert pt_spec.known_pts() == {"Cups", "Other PT"}
+    assert pt_spec.load_pt("Cups")["properties"] == {"productName": {}}  # 探测 Cups.json
+
+    idx_file.write_text(json.dumps([{"pt": "Cups", "file": "Cups.json"}]), "utf-8")
+    pt_spec.clear_caches()
+    assert pt_spec.load_pt("Cups") is not None
+
+
 def test_pt_spec_missing_dir_gives_clear_error(tmp_path, monkeypatch):
     monkeypatch.setenv("WALMART_DATA_ROOT", str(tmp_path))
     pt_spec.clear_caches()

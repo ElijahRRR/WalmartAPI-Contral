@@ -17,7 +17,9 @@ problem_products,规则逐字移植旧系统)→ 三路:
   删除未生效顽固 SKU(delete_not_effective)→ 停用+删除双 feed 齐发
 
 去重(全部查库;所有者定稿:不设时间防重窗,重复删除无实害,真相以观测为准):
-  ① 在途:ops.feed_items 有 submitted 未落定 → 跳过(feed 处理中不叠发);
+  ① 在途/待观测:feed_items 有 submitted 未落定,或已落定 success 但
+     catalog_sync 尚未重新观测(resolved_at > last_seen_at)→ 跳过
+     (feed 处理中不叠发;动作结果未经观测确认前不重复动作);
   ② 反补计数:product_events 的 maintenance_submitted 30 天窗口计数(替代
      revived_skus.json);
   ③ 归类事件:同 (店铺,SKU) 类别未变不重复记(替代 seen_sku_categories.json)。
@@ -54,8 +56,17 @@ WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
   AND missing_since IS NULL
 """
 _SQL_INFLIGHT = """
-SELECT store, sku FROM ops.feed_items WHERE status = 'submitted'
+SELECT DISTINCT f.store, f.sku
+FROM ops.feed_items f
+JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
+WHERE f.status = 'submitted'
+   OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 """
+# 在途/待观测拦截(2026-08-07 生产实证修正):submitted=feed 处理中不叠发;
+# success 且 resolved_at 晚于该行 last_seen_at = 动作已生效但 catalog_sync
+# 还没重新扫到——结果未经观测确认前不重复动作("真相以观测为准"的闸门形态)。
+# 否则 feed 落定后、次日扫店前重跑本工作流,会把同一批 SKU 全量重发一遍。
+# 观测后自然解锁:扫到即 last_seen_at 前移;删成了即缺席出清单;failed 不拦(该重试)。
 _SQL_ATTEMPTS = """
 SELECT store, sku, count(*) FROM catalog.product_events
 WHERE event = 'maintenance_submitted'
@@ -187,7 +198,7 @@ def run(params: dict) -> str:
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}问题商品 {len(items)} 行:反补 {n['relist']},删除 {n['delete']}"
              f"(含反补满额转删 {n['fallback']}),Stage 排除 {n['stage']},"
-             f"在途跳过 {n['inflight']},非 ACTIVE 店跳过 {n['inactive']},"
+             f"在途/待观测跳过 {n['inflight']},非 ACTIVE 店跳过 {n['inactive']},"
              f"顽固双击 {n['stubborn']}"]
 
     if not execute:

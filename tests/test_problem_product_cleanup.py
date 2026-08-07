@@ -197,6 +197,15 @@ def test_stubborn_sql_binds_to_listing_generation():
     assert "item_reappeared" in ppc._SQL_STUBBORN
 
 
+def test_inflight_sql_blocks_unobserved_success():
+    # 在途/待观测拦截:feed 落定 success 但 catalog_sync 未重新观测
+    # (resolved_at > last_seen_at)必须继续拦——否则落定后、扫店前重跑
+    # 会把同一批 SKU 全量重发(2026-08-07 生产实证)
+    assert "f.status = 'submitted'" in ppc._SQL_INFLIGHT
+    assert "f.resolved_at > w.last_seen_at" in ppc._SQL_INFLIGHT
+    assert "JOIN catalog.walmart_items" in ppc._SQL_INFLIGHT
+
+
 def test_dry_run_zero_submissions(monkeypatch):
     monkeypatch.setattr(ppc, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],

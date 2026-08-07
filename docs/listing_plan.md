@@ -122,7 +122,7 @@
       做成 feed_poll 反哺器回写上架表
 - [ ] 产品事件账本接线:入库/审核/上架事件 + 上架前防呆闸(product_risk)
 
-### L3 自愈链(依赖 L2)
+### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 
 - [ ] SKU_LOCKED → RETIRE_ITEM → 24h 冷却 → 清列重上(retire_cooldown 表);
       RETIRE_ITEM schema 与 MP_ITEM 完全不同(已在 api/feeds)

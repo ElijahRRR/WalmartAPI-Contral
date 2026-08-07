@@ -128,6 +128,20 @@ CREATE TABLE catalog.listing_sources (
 ```
 
 ```sql
+-- UPC 池(L2a,2026-08-07 定稿):PG 权威,飞书「UPC池」表=注入口+投影
+-- 领号=单事务 FOR UPDATE SKIP LOCKED(旧三层并发补丁消灭);状态机:
+-- ''未用→claimed已领→used已用;回收仅三类(提交前失败/双确认未达/4xx),
+-- Unknown 永不回收;conflict/bad_prefix(首位非 016789)永久弃用
+CREATE TABLE catalog.upc_pool (
+    upc text PRIMARY KEY,            -- 规范化 12 位
+    status text NOT NULL DEFAULT '', -- ''/claimed/used/conflict/bad_prefix
+    asin text, store text, sku text,
+    put_date text,                   -- 运营注入日期(表格 B 列原样)
+    claimed_at / used_at / created_at timestamptz
+);
+```
+
+```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
 CREATE TABLE catalog.product_events (
     id bigint IDENTITY PRIMARY KEY,

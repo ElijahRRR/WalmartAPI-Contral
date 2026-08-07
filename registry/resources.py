@@ -285,6 +285,17 @@ MATCH_SHEET = Spreadsheet(
 )
 
 
+# UPC 池(L2a,所有者建表 2026-08-07,6 列 A~F):PG(catalog.upc_pool)权威,
+# 此表 = 运营注入口 + 投影。运营填 A=UPC B=放入日期;脚本填 C=状态
+# (已领/已用/冲突/非法前缀/空=未用)D=店铺 E=SKU F=上架日期。
+UPC_SHEET = Spreadsheet(
+    name="UPC池",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_UPC_SHEET_ID", ""),
+    columns=("upc", "put_date", "status", "store", "sku", "list_date"),
+)
+
+
 # 维护记录(maintenance 流水账):与「在线产品总表」同一 spreadsheet 的
 # 另一工作表(所有者已建,2026-08-07;多维表格 5 万行上限装不下故用电子表格)。
 # 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错

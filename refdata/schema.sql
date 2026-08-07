@@ -149,6 +149,25 @@ SELECT store, sku,
 FROM catalog.walmart_items
 ON CONFLICT (store, sku) DO NOTHING;
 
+-- ── UPC 池(L2a,2026-08-07 所有者定稿:PG 权威,飞书表=注入口+投影)────
+-- 领号并发安全靠单事务 FOR UPDATE SKIP LOCKED(旧系统文件锁/本地声明簿/
+-- server 集中分配三层补丁全部消灭)。状态机照搬旧实证语义:
+--   ''(未用)→ claimed(已领:分配未提交)→ used(已用:feed 已提交,永久消耗)
+--   回收仅三类(提交前失败/双确认未达/4xx 被拒)claimed→'';Unknown 永不回收
+--   conflict(全站已存在)/bad_prefix(首位非 016789 白名单)永久弃用
+CREATE TABLE IF NOT EXISTS catalog.upc_pool (
+    upc         text PRIMARY KEY,           -- 规范化 12 位(zfill 补前导零)
+    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix
+    asin        text,                       -- 领用归属
+    store       text,
+    sku         text,                       -- 已用时的沃尔玛 SKU
+    put_date    text,                       -- 运营注入日期(表格 B 列原样)
+    claimed_at  timestamptz,
+    used_at     timestamptz,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS upc_pool_status_idx ON catalog.upc_pool (status);
+
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS
   SELECT sku,

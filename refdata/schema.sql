@@ -149,6 +149,56 @@ SELECT store, sku,
 FROM catalog.walmart_items
 ON CONFLICT (store, sku) DO NOTHING;
 
+-- ── UPC 池(L2a,2026-08-07 所有者定稿:PG 权威,飞书表=注入口+投影)────
+-- 领号并发安全靠单事务 FOR UPDATE SKIP LOCKED(旧系统文件锁/本地声明簿/
+-- server 集中分配三层补丁全部消灭)。状态机照搬旧实证语义:
+--   ''(未用)→ claimed(已领:分配未提交)→ used(已用:feed 已提交,永久消耗)
+--   回收仅三类(提交前失败/双确认未达/4xx 被拒)claimed→'';Unknown 永不回收
+--   conflict(全站已存在)/bad_prefix(首位非 016789 白名单)永久弃用
+CREATE TABLE IF NOT EXISTS catalog.upc_pool (
+    upc         text PRIMARY KEY,           -- 规范化 12 位(zfill 补前导零)
+    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix
+    asin        text,                       -- 领用归属
+    store       text,
+    sku         text,                       -- 已用时的沃尔玛 SKU
+    put_date    text,                       -- 运营注入日期(表格 B 列原样)
+    claimed_at  timestamptz,
+    used_at     timestamptz,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS upc_pool_status_idx ON catalog.upc_pool (status);
+
+-- ── LLM 缓存(L2c;旧 llm_cache.sqlite 462MB 的 PG 化,旧数据不迁——
+-- key 含 model 名,换模型即失效)────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS catalog.llm_cache (
+    input_hash  text PRIMARY KEY,    -- sha256(model+messages+温度+tokens)[:32]
+    model       text NOT NULL,
+    response    jsonb NOT NULL,
+    hit_count   int NOT NULL DEFAULT 0,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    last_hit_at timestamptz
+);
+
+-- ── 风控库(L2b,2026-08-07 所有者定稿:两张飞书表镜像入 PG,闸门读库
+-- 不读表——表格随时会停用;同步只增改不删,未来产品中心黑名单增量以
+-- 脚本跑库,清理来源数据入库须清洗对应产品/店铺,归黑名单建设批次)──
+CREATE TABLE IF NOT EXISTS catalog.risk_product_types (
+    product_type text PRIMARY KEY,   -- Walmart Product Type
+    category text, ptg text,
+    admit_status text,               -- 准入状态('禁售' → 拦截)
+    cn_seller text,                  -- 中国卖家可做(以'否'开头 → 拦截)
+    cert_required text, note text,
+    field_total text, field_required text, field_list text,
+    synced_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
+    brand_key text PRIMARY KEY,      -- casefold 匹配键
+    brand text NOT NULL,             -- 品牌名原文
+    source text,                     -- 来源(产品清理报错扫描+商标库比对)
+    added_date text,                 -- 入库日期(表格原样)
+    synced_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS
   SELECT sku,

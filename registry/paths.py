@@ -34,6 +34,16 @@ def specs_dir() -> Path:
     return data_root() / "specs"
 
 
+def mp_item_spec_dir() -> Path:
+    """输入:无 → 输出:MP_ITEM 按 PT 拆分 spec 目录(listing L2)。
+
+    <DATA_ROOT>/specs/MP_ITEM/<版本串>/,版本串取 registry.FEED_SPEC_VERSIONS
+    的 MP_ITEM 现值——spec 换版 = 并排放新目录 + 改 registry 一个版本串。
+    """
+    from registry import resources
+    return specs_dir() / "MP_ITEM" / resources.FEED_SPEC_VERSIONS["MP_ITEM"]
+
+
 def cache_dir() -> Path:
     return data_root() / "cache"
 

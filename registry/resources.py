@@ -67,11 +67,18 @@ FEED_SPEC_VERSIONS = {
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
+    # 上架主链(L2;旧系统实测值,官方 4-6 周滚版,上线前需实测仍被接受;
+    # header version 必须完整时间戳,写 '5.0' 被拒 74597363510508 实证)
+    "MP_ITEM": "5.0.20260304-22_45_32-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
 WALMART_ERR_SKU_LOCKED = "ERR_EXT_DATA_0101211"     # 解法:RETIRE→24h→新 UPC 重上
 WALMART_ERR_UPC_CONFLICT = "ERR_EXT_DATA_0101119"
+# 异步审核假错误(旧实证:'还在合规审核中',几小时~几天自然变 SUCCESS;
+# 绝不能当失败重发,否则 duplicate listing)
+WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
+                            "EXT_DATA_ERROR_66547201695750")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -120,6 +127,8 @@ class Spreadsheet:
     token: str
     sheet_id: str
     columns: tuple[str, ...]
+    wiki: bool = False      # True=token 是知识库节点 token(wiki/ 链接),
+                            # api/feishu 会先解析成真实 spreadsheet_token
 
     def require(self) -> "Spreadsheet":
         if not self.token or not self.sheet_id:
@@ -282,6 +291,41 @@ MATCH_SHEET = Spreadsheet(
     columns=("upc", "sku", "price", "weight", "store", "match_status",
              "matched_gtin", "list_time", "feed_id", "feed_result",
              "feed_check_time"),
+)
+
+
+# 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
+# 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——
+# 所有者 2026-08-07:表格随时会停用)
+RISK_PT_SHEET = Spreadsheet(
+    name="沃尔玛类目表",
+    token=os.environ.get("FEISHU_RISK_PT_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_RISK_PT_SHEET_ID", ""),
+    columns=("category", "ptg", "product_type", "admit_status", "cn_seller",
+             "cert_required", "note", "field_total", "field_required",
+             "field_list"),
+    wiki=True,
+)
+
+# 风控·禁止品牌收集(wiki 承载;来源=产品清理报错扫描+商标库比对,
+# 名单语义=黑名单品牌,casefold 精确匹配)
+BRAND_BAN_SHEET = Spreadsheet(
+    name="禁止品牌收集",
+    token=os.environ.get("FEISHU_BRAND_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_BRAND_SHEET_ID", ""),
+    columns=("brand", "source", "added_date"),
+    wiki=True,
+)
+
+
+# UPC 池(L2a,所有者建表 2026-08-07,6 列 A~F):PG(catalog.upc_pool)权威,
+# 此表 = 运营注入口 + 投影。运营填 A=UPC B=放入日期;脚本填 C=状态
+# (已领/已用/冲突/非法前缀/空=未用)D=店铺 E=SKU F=上架日期。
+UPC_SHEET = Spreadsheet(
+    name="UPC池",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_UPC_SHEET_ID", ""),
+    columns=("upc", "put_date", "status", "store", "sku", "list_date"),
 )
 
 

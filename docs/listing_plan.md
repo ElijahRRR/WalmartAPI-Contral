@@ -47,6 +47,60 @@
       feed_poll 统一轮询 → 结果回写(跟卖结果表)
 - [ ] 新 offer 默认 0 库存是正常现象(spec 无库存字段),不当失败
 
+### L2 前置定稿(所有者六点答复 2026-08-07)
+
+1. UPC 池表 6 列定稿(UPC/放入日期|状态/店铺/SKU/上架日期);
+2. 领用状态机照搬旧实证语义,按新架构重写(领→用;回收仅三类,Unknown
+   永不回收;冲突/非法前缀永久弃用);
+3. **定价区间定稿**(表格不可见,口述定稿):FBA 区间1=0~30、区间2=30~75;
+   FBM 区间1=15~80、区间2=80~1000;amz 价 × 限额表对应倍率;
+   **重叠/边界向下兼容**(30 美金用 0-30 倍数);出界不上架;
+4. 风控表(类目映射/禁止品牌)仍在维护,**须入 PG**(表格随时会停用);
+5. LLM 映射继续 DeepSeek(key 入 .env);
+6. 产品数据源暂时不可用 → L2c/d 端到端验收顺延,先建地基。
+
+### L2a 实施状态(2026-08-07)
+
+- [x] catalog.upc_pool + services/upc_pool(FOR UPDATE SKIP LOCKED 领号,
+      旧三层并发补丁消灭;三类回收断言把关)+ upc_sync 工作流(注入
+      校验/状态投影/池余量摘要)+ UPC_SHEET registry
+- [x] services/pricing:区间常量 + '275%' 格式化值解析(2355 行事故防线)
+      + walmart_price 积木
+- [ ] 生产验证:注入一批 UPC → upc_sync → 核对状态列与池余量
+
+### L2b 实施状态(2026-08-07)
+
+- [x] 风控入库(所有者选 A:保留提交前否决闸,防审核→上架时间差):
+      catalog.risk_product_types / brand_blacklist + risk_sync 工作流
+      (wiki 表自动解析,只增改不删)+ services/risk_gate(拦截条件旧实证:
+      准入状态='禁售' 或 中国卖家可做 以'否'开头;品牌 casefold)
+- [ ] 生产验证:.env 两组 wiki token → risk_sync → 核对禁售/黑名单计数
+- 黑名单体系远景(所有者 2026-08-07):产品中心库建成后,新增黑名单
+  (沃尔玛类目/品牌/产品/amz 类目)以脚本增量跑库;清理来源数据入库须
+  **清洗走流程**(对应产品/店铺对上,该进黑名单的进)——归黑名单建设批次
+
+### L2c 实施状态(2026-08-07)
+
+- [x] spec 就位契约:`<DATA_ROOT>/specs/MP_ITEM/<版本串>/`(MPSetup_by_pt
+      拆分产物;451MB 原始单文件与 307MB pt_templates 不拷)+
+      services/pt_spec 加载器(lru_cache 512,未收录 PT 返 None 由调用方
+      淘汰,缺目录报中文修复指引)
+- [x] api/llm(DeepSeek,key 走 .env DEEPSEEK_API_KEY)+ catalog.llm_cache
+      (旧 462MB sqlite 的 PG 化,旧数据不迁——key 含 model 换模型即失效)
+- [x] MP_ITEM 进 feed 唯一通道:header 只收 3 字段 + version 完整时间戳
+      (三个实证错误码注释在案);8/hour 桶;事件 kind=list 入生死类白名单
+- [x] L2d 代码就绪(2026-08-07):amz_source 数据契约(fetch_products 预留,
+      缺席行不写终态恢复自动续上)+ api/settings.partnerprofile + mapper
+      (orderable 三陷阱/零认证强制+文档字段清理+enum 降级/文案硬约束/
+      图片 minItems=5,逐条测试)+ list_new 主链(七道闸门链:店铺状态/
+      日配额/PT spec/风控/全局去重/product_risk 防呆/数据过滤+定价;
+      UPC 领号事务;LLM 映射走缓存;同店单 feed;三态结局 UPC 回收三类)
+      + 上架表回执反哺器(四集合+优先级,SKU_LOCKED>SUCCESS>ASYNC>失败,
+      错误码 strip \\t 实证)
+- [ ] L2d 端到端生产验收:**待采集服务可用**(现在可验:dry-run 闸门链、
+      风控拦截、去重防呆计数;数据行会停在"待数据源")
+- [ ] 变体分组:后置(依赖采集 variation 数据)
+
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 
 - [ ] 输入 provider:xlsx 模式先行(DMIT 导出 47 列),采集 API 模式预留
@@ -68,7 +122,7 @@
       做成 feed_poll 反哺器回写上架表
 - [ ] 产品事件账本接线:入库/审核/上架事件 + 上架前防呆闸(product_risk)
 
-### L3 自愈链(依赖 L2)
+### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 
 - [ ] SKU_LOCKED → RETIRE_ITEM → 24h 冷却 → 清列重上(retire_cooldown 表);
       RETIRE_ITEM schema 与 MP_ITEM 完全不同(已在 api/feeds)

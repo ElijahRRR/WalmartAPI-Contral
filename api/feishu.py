@@ -402,10 +402,32 @@ def _col_letter(n: int) -> str:
     return s
 
 
+_wiki_token_cache: dict[str, str] = {}
+
+
+def _sheet_token(s: Spreadsheet) -> str:
+    """输入:登记条目 → 输出:真实 spreadsheet_token。
+
+    wiki 承载的表格(feishu.cn/wiki/ 链接)登记的是知识库节点 token,
+    须经 wiki API 解析成 obj_token 才能调 sheets 接口;进程内缓存。
+    """
+    if not getattr(s, "wiki", False):
+        return s.token
+    if s.token not in _wiki_token_cache:
+        data = _call("GET", "/open-apis/wiki/v2/spaces/get_node",
+                     params={"token": s.token})
+        obj = ((data.get("node") or {}).get("obj_token")) or ""
+        if not obj:
+            raise FeishuError(None, f"wiki 节点解析失败(「{s.name}」token={s.token}):"
+                                    f"确认链接是知识库表格且应用有权限")
+        _wiki_token_cache[s.token] = obj
+    return _wiki_token_cache[s.token]
+
+
 def sheet_row_count(sheet: Spreadsheet) -> int:
     """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
     s = sheet.require()
-    data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{s.token}/sheets/query")
+    data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{_sheet_token(s)}/sheets/query")
     for meta in data.get("sheets") or []:
         if meta.get("sheet_id") == s.sheet_id:
             return int((meta.get("grid_properties") or {}).get("row_count") or 0)
@@ -422,7 +444,7 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
     remaining = add
     while remaining > 0:      # 单次最多 5000 行(90204),分块扩
         step = min(remaining, _SHEET_DIMENSION_MAX)
-        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
+        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
               json_body={"dimension": {"sheetId": s.sheet_id,
                                        "majorDimension": "ROWS", "length": step}})
         remaining -= step
@@ -439,7 +461,7 @@ def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
     """
     s = sheet.require()
     data = _call("GET",
-                 f"/open-apis/sheets/v2/spreadsheets/{s.token}/values/"
+                 f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values/"
                  f"{s.sheet_id}!{a1_range}",
                  params={"valueRenderOption": "ToString"})
     return ((data.get("valueRange") or {}).get("values")) or []
@@ -456,7 +478,7 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
     for i in range(0, len(updates), 100):
         chunk = updates[i:i + 100]
         _call("POST",
-              f"/open-apis/sheets/v2/spreadsheets/{s.token}/values_batch_update",
+              f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
               json_body={"valueRanges": [
                   {"range": f"{s.sheet_id}!{rng}", "values": vals}
                   for rng, vals in chunk]})
@@ -483,7 +505,7 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     for i in range(0, len(rows), _SHEET_WRITE_BLOCK_ROWS):
         block = rows[i:i + _SHEET_WRITE_BLOCK_ROWS]
         rng = f"{s.sheet_id}!A{i + 1}:{last_col}{i + len(block)}"
-        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{s.token}/values_batch_update",
+        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
               json_body={"valueRanges": [{"range": rng, "values": block}]})
         written += len(block)
         logger.info("电子表格「%s」写入 %d/%d 行", s.name, written, len(rows))
@@ -494,7 +516,7 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     trimmed = surplus
     while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
         step = min(surplus, _SHEET_DIMENSION_MAX)
-        _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{s.token}/dimension_range",
+        _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
               json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
                                        "startIndex": len(rows) + surplus - step + 1,
                                        "endIndex": len(rows) + surplus}})

@@ -55,6 +55,7 @@ _SLICE_LIMITS = {
     "price": (1000, 9_500_000),
     "inventory": (4000, 9_500_000),
     "MP_ITEM_MATCH": (1000, 24_000_000),
+    "MP_ITEM": (2000, 24_000_000),
 }
 
 
@@ -99,6 +100,14 @@ def build_payload(feed_type: str, entries: list) -> dict:
                                "amount": _sanitize(float(e["price"]))},
                                "currentPriceType": "BASE"}]}
                           for e in entries]}
+    if feed_type == "MP_ITEM":
+        # 上架主链 v5:header **只收 3 字段**(照官方 sample 多传 subset →
+        # 60670554076755,漏 businessUnit → 72600149546850,version 写 '5.0'
+        # → 74597363510508,全是旧系统实证);条目为完整 MPItem dict
+        # (Orderable+Visible,services/mp_mapper 构造)
+        return {"MPItemFeedHeader": {"businessUnit": "WALMART_US",
+                                     "locale": "en", "version": ver},
+                "MPItem": [_sanitize(e) for e in entries]}
     if feed_type == "MP_ITEM_MATCH":
         # 跟卖 v4.2(蓝图 §5.4 定稿):sellingChannel 制 header,与 v5 的
         # businessUnit 制不同套;processMode 只有 REPLACE(同 sku 覆盖,幂等);
@@ -209,7 +218,8 @@ def mark_feed_done(feed_id: str, ok: bool) -> None:
 
 
 def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
-    if feed_type in ("MP_MAINTENANCE", "price", "inventory", "MP_ITEM_MATCH"):
+    if feed_type in ("MP_MAINTENANCE", "price", "inventory",
+                     "MP_ITEM_MATCH", "MP_ITEM"):
         # dict 条目:sku 在顶层或嵌在 Orderable 里(反补载荷是后者)
         return [str(e.get("sku") or (e.get("Orderable") or {}).get("sku") or "")
                 for e in chunk]

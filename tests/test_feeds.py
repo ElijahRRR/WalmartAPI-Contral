@@ -104,7 +104,7 @@ def test_build_payload_schemas():
     assert "MPItemFeedHeader" in m
 
     with pytest.raises(ValueError, match="未在 api/feeds.py 收录"):
-        feeds.build_payload("MP_ITEM", [])
+        feeds.build_payload("MP_INVENTORY", [])     # BETA 端点:登记不实现
 
 
 def test_build_payload_price_and_inventory_schemas():
@@ -368,4 +368,4 @@ def test_feed_rate_buckets_default_deny():
     _client.rate_acquire("feeds.post.DELETE_ITEM", "cid_bucket_test")
     _client.rate_acquire("feeds.get", "cid_bucket_test")
     with pytest.raises(KeyError, match="限速桶未登记"):
-        _client.rate_acquire("feeds.post.MP_ITEM", "cid_bucket_test")
+        _client.rate_acquire("feeds.post.MP_INVENTORY", "cid_bucket_test")

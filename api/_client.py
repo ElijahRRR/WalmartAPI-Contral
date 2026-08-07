@@ -185,8 +185,10 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "feeds.post.RETIRE_ITEM": (6, 3600.0),      # 官方无现值(guide 已消失),按 DELETE 同档保守
     "feeds.post.MP_MAINTENANCE": (8, 3600.0),   # 官方 10/hour
     "feeds.post.MP_ITEM_MATCH": (15, 3600.0),   # 官方 20/hour(蓝图定稿 15)
+    "feeds.post.MP_ITEM": (8, 3600.0),          # 官方 10/hour;同店打包单 feed
     "feeds.post.price": (6, 86400.0),           # 价格三件套共享桶,CLAUDE.md 保守 6/天
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
+    "settings.partnerprofile": (40, 60.0),      # 官方 60/min,lru 缓存后每店仅首次调
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
 }

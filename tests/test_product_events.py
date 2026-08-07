@@ -44,7 +44,7 @@ def test_record_many_serializes_detail():
 
 def test_diff_catalog_transitions():
     old = {"A": ("PUBLISHED", None),          # 状态将变化
-           "B": ("PUBLISHED", "2026-08-01"),  # 曾缺席将重现
+           "B": (None, "2026-08-01"),         # 曾缺席将重现(缺席行状态列已清空)
            "C": ("PUBLISHED", None)}          # 无变化
     new_rows = [
         {"sku": "A", "published_status": "UNPUBLISHED",
@@ -59,6 +59,8 @@ def test_diff_catalog_transitions():
     assert ("B", "item_reappeared") in by
     assert ("D", "item_appeared") in by
     assert not any(e["sku"] == "C" for e in evs)          # 无变化零事件
+    # 复现只记 reappeared,不叠记 status_changed(old=None 是噪音)
+    assert ("B", "status_changed") not in by
     changed = next(e for e in evs if e["event"] == "status_changed")
     assert changed["detail"] == {"old": "PUBLISHED", "new": "UNPUBLISHED",
                                  "reasons": "价格问题"}

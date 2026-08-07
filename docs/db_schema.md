@@ -99,13 +99,18 @@ CREATE TABLE catalog.walmart_items (
     published_status text, lifecycle_status text, unpublished_reasons text,
     last_seen_at timestamptz NOT NULL,       -- 最近一次全量扫描见到它的时间
     missing_since timestamptz,               -- 连续缺席起点;NULL=最近一轮仍在
+                                             -- 标缺席时 published/lifecycle_status
+                                             -- 同步清空(2026-08-07 定稿):旧观测
+                                             -- 不再展示,复现时 upsert 写回新状态
     created_at / updated_at,
     PRIMARY KEY (store, sku)
 );
 ```
 
 "整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
-再把本轮未见的行标 missing_since(不删除,保历史;连续缺席多久后清理另议)。
+再把本轮未见的行标 missing_since 并清空两个状态列(不删除,保历史;
+连续缺席多久后清理另议)。飞书「在线产品总表」投影只写在架行
+(missing_since IS NULL),缺席商品不进表。
 
 ```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")

@@ -125,6 +125,30 @@ CREATE TABLE IF NOT EXISTS catalog.product_events (
 CREATE INDEX IF NOT EXISTS product_events_sku_idx ON catalog.product_events (sku, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_events (store, sku);
 
+-- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
+-- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
+-- 各有身份。谁上架谁登记;自动化按出身路由(路由铁律:由"源数据缺失"驱动的
+-- 自动破坏动作必须限定 source_type 匹配,unknown 一律不自动动),
+-- 手动通道(product_clear 表等)不受限全格式通吃。调整=UPDATE 一行数据。
+CREATE TABLE IF NOT EXISTS catalog.listing_sources (
+    store       text NOT NULL,
+    sku         text NOT NULL,
+    source_type text NOT NULL,      -- amz / match(跟卖) / self(自建) / 1688 / unknown
+    source_key  text,               -- amz=asin;match=匹配 GTIN;1688=offer_id;…
+    workflow    text,               -- 登记来源工作流(backfill=格式回填)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, sku)
+);
+-- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
+-- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
+INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workflow)
+SELECT store, sku,
+       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN 'amz' ELSE 'unknown' END,
+       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN left(sku, 10) END,
+       'backfill'
+FROM catalog.walmart_items
+ON CONFLICT (store, sku) DO NOTHING;
+
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS
   SELECT sku,

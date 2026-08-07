@@ -31,8 +31,8 @@ from datetime import datetime
 
 from api import feeds, items as items_api
 from registry import db
-from services import kpi, match_feed, match_sheet, product_events, \
-    stores as stores_svc
+from services import kpi, listing_sources, match_feed, match_sheet, \
+    product_events, stores as stores_svc
 
 DANGEROUS = True
 
@@ -176,6 +176,14 @@ def run(params: dict) -> str:
                                  "detail": {"feed_id": res["feed_id"],
                                             "upc": r["upc"],
                                             "price": r["price"]}}
+                                for r, _ in batch])
+                            # 来源登记簿(所有者定稿):跟卖品 sku≠asin,
+                            # 登记出身后 amz 驱动的自动流程不会误伤它们
+                            listing_sources.register(conn, [
+                                {"store": store_name, "sku": r["sku"],
+                                 "source_type": listing_sources.SOURCE_MATCH,
+                                 "source_key": r["gtin"] or r["upc"],
+                                 "workflow": "match_listing"}
                                 for r, _ in batch])
                 elif res["outcome"] == "failed":
                     for r, _ in batch:

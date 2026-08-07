@@ -87,6 +87,10 @@ def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
                         lambda store, **kw: spec_results[next(iter(kw.values()))])
     monkeypatch.setattr(ml.match_feed, "next_serial_start",
                         lambda conn, d: 1)
+    calls["sources"] = []
+    monkeypatch.setattr(ml.listing_sources, "register",
+                        lambda conn, rows: (calls["sources"].extend(rows),
+                                            len(rows))[1])
 
     def fake_submit(store, ft, entries, *, workflow=""):
         calls["feeds"].append((store["name"], ft, len(entries)))
@@ -144,6 +148,40 @@ def test_execute_routes_and_terminal_states(monkeypatch):
     ev = [e for e in calls["events"] if e["event"] == "match_submitted"]
     assert len(ev) == 1 and ev[0]["detail"]["feed_id"] == "F_M"
     assert "跟卖提交 1" in out
+    # 来源登记簿:跟卖品登记出身(amz 驱动的自动流程按此路由,不误伤)
+    assert calls["sources"] == [{
+        "store": "T1", "sku": by_row[2][0], "source_type": "match",
+        "source_key": "00012345678905", "workflow": "match_listing"}]
+
+
+def test_listing_sources_register_first_wins():
+    from services import listing_sources
+
+    class _Conn:
+        def __init__(self):
+            self.sqls = []
+
+        def cursor(self):
+            return self
+
+        def executemany(self, sql, rows):
+            self.sqls.append((sql, list(rows)))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    conn = _Conn()
+    n = listing_sources.register(conn, [
+        {"store": "T1", "sku": "S1", "source_type": "match",
+         "source_key": "G1", "workflow": "match_listing"}])
+    assert n == 1
+    sql, rows = conn.sqls[0]
+    assert "ON CONFLICT (store, sku) DO NOTHING" in sql   # 首次登记优先
+    assert rows[0] == ("T1", "S1", "match", "G1", "match_listing")
+    assert listing_sources.register(conn, []) == 0
 
 
 def test_manual_sku_takes_priority(monkeypatch):

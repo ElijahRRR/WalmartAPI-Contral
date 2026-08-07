@@ -20,7 +20,7 @@ feed 上线时,各自的反哺器在 _REFLECTORS 登记一行即接入。
 
 import logging
 
-from services import clear_sheet, feed_track, maint_sheet, \
+from services import clear_sheet, feed_track, maint_sheet, match_sheet, \
     stores as stores_svc
 
 DANGEROUS = False
@@ -32,6 +32,7 @@ logger = logging.getLogger("workflows.feed_poll")
 _REFLECTORS: list[tuple[str, object]] = [
     ("停用/删除表", clear_sheet.sync_from_ledger),
     ("维护记录", maint_sheet.sync_from_ledger),
+    ("跟卖表", match_sheet.sync_from_ledger),
 ]
 
 

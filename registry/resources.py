@@ -66,6 +66,7 @@ FEED_SPEC_VERSIONS = {
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
+    "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
@@ -251,6 +252,39 @@ RETIRE_SHEET = Spreadsheet(
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
 # daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+# 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
+# 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
+# A=ASIN B=店铺 C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
+# G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
+# M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
+# R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
+# (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
+LISTING_SHEET = Spreadsheet(
+    name="上架表",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
+    columns=("asin", "store", "list_title", "product_type", "audit_result",
+             "audit_reason", "audit_date", "amz_price", "stock",
+             "walmart_price", "listed", "feed_id", "list_date",
+             "not_listed_reason", "list_result", "list_fail_reason",
+             "feed_check_date", "real_title", "real_pt", "real_upc",
+             "upc_match"),
+)
+
+# 跟卖表(match_listing 驱动表,替代旧 xlsx 输入,所有者定稿 2026-08-07
+# 单路飞书读;11 列 A~K):运营填 A=UPC C=售价 D=重量 E=店铺,
+# 脚本填 B=SKU F=跟卖状态 G=匹配GTIN H=上架时间 I=feedId J=feed结果
+# K=feed查询时间(J/K 由 feed_poll 反哺器回填)
+MATCH_SHEET = Spreadsheet(
+    name="跟卖表",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_MATCH_SHEET_ID", ""),
+    columns=("upc", "sku", "price", "weight", "store", "match_status",
+             "matched_gtin", "list_time", "feed_id", "feed_result",
+             "feed_check_time"),
+)
+
+
 # 维护记录(maintenance 流水账):与「在线产品总表」同一 spreadsheet 的
 # 另一工作表(所有者已建,2026-08-07;多维表格 5 万行上限装不下故用电子表格)。
 # 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错

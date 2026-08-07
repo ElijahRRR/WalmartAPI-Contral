@@ -1,0 +1,182 @@
+"""match_listing — 跟卖上架(listing 子计划 L1,替代旧 match_listing/;危险,默认 dry-run)。
+
+用法:
+  python cli.py match_listing                    # dry-run:预检+打印将提交什么
+  python cli.py match_listing --execute          # 真跑(提交 feed + 回写表格)
+  python cli.py match_listing -p store=A085朱丽霖
+
+驱动表(registry.MATCH_SHEET「跟卖表」,所有者定稿 2026-08-07 单路飞书读,
+替代旧 xlsx 输入):运营填 A=UPC C=售价 D=重量 E=店铺;脚本填其余。
+
+流程:读表 → 待处理行 SPEC 预检(api/items.search_walmart_spec,按位数
+生成 upc/gtin 候选依次试)→ 三路:
+  MP_ITEM_MATCH(已在售)→ 可跟卖:SPEC 预填模板 + sku/price/ShippingWeight
+                          → 按店打包 MP_ITEM_MATCH feed(REPLACE 幂等)
+  MP_ITEM(未在售)     → F=需完整建品,终态跳过(那是 L2 主链的活)
+  无匹配               → F=目录无,终态跳过
+结果:J/K 由 feed_poll 反哺器按 ops.feed_items 回填;跟卖新 offer 默认
+0 库存是正常现象(v4.2 spec 无库存字段),不当失败。
+
+与地基的融合:提交走 api/feeds 唯一通道(三层防重/切片/限速);轮询走
+全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,
+⚠ 跟卖商品无 amz 侧身份,sku≠asin 是账本约定的已登记例外)。
+
+⚠ --execute 前置(对拍未完成前只许 dry-run):Item 字段形态与 SKU 生成
+规则待旧 feed 备份对拍(services/match_feed.py 标注两处)。
+"""
+
+import logging
+from datetime import datetime
+
+from api import feeds, items as items_api
+from registry import db
+from services import kpi, match_feed, match_sheet, product_events, \
+    stores as stores_svc
+
+DANGEROUS = True
+
+logger = logging.getLogger("workflows.match_listing")
+
+# F 列终态(不重复预检/提交;运营清空 F 即重新排队)
+_TERMINAL = ("需完整建品", "目录无", "预检失败", "店铺不识别", "码无效")
+
+
+def _precheck(store: dict, code: str, cache: dict) -> dict:
+    """输入:店铺 + 商品码 → 输出:SPEC 预检结果(同码进程内缓存)。"""
+    cands = match_feed.spec_candidates(code)
+    if not cands:
+        return {"status": "码无效", "spec": None}
+    key = cands[0][1]
+    if key in cache:
+        return cache[key]
+    result = {"status": "预检失败", "spec": None}
+    for param, value in cands:
+        try:
+            spec = items_api.search_walmart_spec(store, **{param: value})
+        except Exception as e:
+            logger.warning("SPEC 预检异常(%s=%s): %s", param, value, e)
+            result = {"status": f"预检失败:{e}", "spec": None}
+            continue
+        if spec["feed_type"] == "MP_ITEM_MATCH":
+            result = {"status": "可跟卖", "spec": spec}
+            break
+        if spec["feed_type"] == "MP_ITEM":
+            result = {"status": "需完整建品", "spec": spec}
+            break
+        result = {"status": "目录无", "spec": None}
+    cache[key] = result
+    return result
+
+
+def run(params: dict) -> str:
+    """输入:params(execute/store)→ 输出:预检与提交摘要。"""
+    execute = bool(params.get("execute"))
+    rows = match_sheet.read_rows()
+    if not rows:
+        return "跟卖表无数据行"
+    if params.get("store"):
+        rows = [r for r in rows if r["store"] == params["store"]]
+
+    stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
+    now = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d %H:%M")
+    mode = "" if execute else "🧪 [DRY-RUN] "
+
+    # 行分拣:在途(反哺器管)/终态/待处理(F 空或=可跟卖 且 I 空)
+    inflight = [r for r in rows if r["feed_id"]]
+    todo = [r for r in rows if not r["feed_id"]
+            and r["status"] in ("", "可跟卖")]
+    lines = [f"{mode}跟卖表 {len(rows)} 行:待处理 {len(todo)},"
+             f"在途/已提交 {len(inflight)},终态 "
+             f"{len(rows) - len(todo) - len(inflight)}"]
+    if not todo:
+        return "\n".join(lines)
+
+    updates: list[tuple[int, list]] = []
+    spec_cache: dict = {}
+    by_store: dict[str, list[tuple[dict, dict]]] = {}   # 店铺 → [(行, item)]
+
+    for r in todo:
+        store = stores_by_name.get(r["store"])
+        if store is None:
+            r["status"] = "店铺不识别"
+            updates.append((r["rownum"], match_sheet.row_vals(r)))
+            continue
+        pre = _precheck(store, r["upc"], spec_cache)
+        r["status"] = pre["status"]
+        if pre["status"] != "可跟卖":
+            updates.append((r["rownum"], match_sheet.row_vals(r)))
+            lines.append(f"  第{r['rownum']}行 {r['upc']}:{pre['status']}")
+            continue
+        spec = pre["spec"]
+        r["gtin"] = spec["product_id"] or ""
+        sku = match_feed.match_sku(r["gtin"] or r["upc"])
+        r["sku"] = sku
+        try:
+            item = match_feed.build_match_item(spec["raw"], sku,
+                                               r["price"], r["weight"])
+        except (TypeError, ValueError) as e:
+            r["status"] = f"数据无效:{e}"     # 售价/重量填的不是数
+            updates.append((r["rownum"], match_sheet.row_vals(r)))
+            continue
+        by_store.setdefault(r["store"], []).append((r, item))
+
+    n_ok = sum(len(v) for v in by_store.values())
+    lines.append(f"预检通过可跟卖 {n_ok} 行,涉及 {len(by_store)} 店")
+
+    if not execute:
+        for store_name, pairs in sorted(by_store.items()):
+            sample = [(r["upc"], r["sku"], r["price"]) for r, _ in pairs[:5]]
+            lines.append(f"  [DRY-RUN] {store_name} 将提交 {len(pairs)} 条:{sample}")
+        if by_store:
+            # 对拍窗口:打印首条完整 Item,与旧系统 match_*.json 备份比对
+            first = next(iter(by_store.values()))[0][1]
+            lines.append(f"  [DRY-RUN] 首条 Item 载荷(对拍用):{first}")
+        match_sheet.write_rows(updates, execute=False)
+        return "\n".join(lines)
+
+    for store_name, pairs in sorted(by_store.items()):
+        store = stores_by_name[store_name]
+        try:    # 单店隔离(与 cleanup/maintenance 同款纪律)
+            i = 0
+            n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+            entries = [item for _, item in pairs]
+            for res in feeds.submit_feed(store, "MP_ITEM_MATCH", entries,
+                                         workflow="match_listing"):
+                batch = pairs[i:i + res["count"]]
+                i += res["count"]
+                n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
+                if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
+                    for r, _ in batch:
+                        r["feed_id"], r["list_time"] = res["feed_id"], now
+                        r["feed_result"] = "处理中"
+                        updates.append((r["rownum"], match_sheet.row_vals(r)))
+                    if res["outcome"] == "submitted":
+                        with db.pg_conn() as conn:
+                            product_events.record_many(conn, [
+                                {"sku": r["sku"], "store": store_name,
+                                 "event": "match_submitted",
+                                 "source": "match_listing",
+                                 "detail": {"feed_id": res["feed_id"],
+                                            "upc": r["upc"],
+                                            "price": r["price"]}}
+                                for r, _ in batch])
+                elif res["outcome"] == "failed":
+                    for r, _ in batch:
+                        r["feed_result"] = "提交被拒"
+                        updates.append((r["rownum"], match_sheet.row_vals(r)))
+            line = f"  {store_name}:跟卖提交 {n['submitted']}"
+            if n["dedup"]:
+                line += f",在途防重跳过 {n['dedup']}"
+            if n["failed"]:
+                line += f",⚠ 提交被拒 {n['failed']}(查日志)"
+            if n["unknown"]:
+                line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
+            lines.append(line)
+        except Exception as e:
+            logger.exception("店铺 %s 跟卖提交异常,跳过继续其它店: %s",
+                             store_name, e)
+            lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+
+    written = match_sheet.write_rows(updates)
+    lines.append(f"回写 {written} 行;feed 结果轮询走 feed_poll")
+    return "\n".join(lines)

@@ -84,10 +84,26 @@
 - [ ] 切换清单:停 launchd 4 条(morning/reconcile_hourly/retire_daily/
       health_4x)+ scheduled-tasks 的 dedup_sync(前端不迁,此任务作废)
 
-## 待所有者确认
+## 确认记录(所有者 2026-08-07)
 
-1. **上架表沿用现有飞书表**(26 列,运营界面不变,新系统接管机器列)?
-   还是趁迁移换新表?(建议沿用:未来功能进前端,现在不造新界面)
-2. 上架表 V 列语义:代码实际写的是"真实UPC"(W=一致性),config 旧注释
-   叫"标题相似度"——以代码行为为准登记 registry?
-3. L1(match_listing)先行的顺序是否认可(独立、见效快、验证 feed 新类型)?
+1. ✅ 上架表**新建**于在线产品表格,21 列 A~U(砍掉 状态跟踪/最近跟踪日期,
+   产品事件账本承接);已进 registry(LISTING_SHEET)。
+2. ✅ 「UPC是否一致」按代码实际行为登记 = 核验的 UPC 一致性。
+3. ✅ L1 match_listing 先行;跟卖表 = 驱动表(单路飞书读,替代旧 xlsx;
+   以后要 xlsx 再加)。UPC 池列初案(UPC/放入日期|状态/店铺/SKU/上架日期)
+   待 L2 做 UPC 读取使用逻辑时专题讨论定稿。
+
+## L1 实施状态(2026-08-07)
+
+- [x] registry:LISTING_SHEET(21 列)/MATCH_SHEET(11 列)
+- [x] api/feeds:MP_ITEM_MATCH v4.2(sellingChannel 制 header,REPLACE 幂等,
+      15/hour 桶);SPEC 预检复用 api/items.search_walmart_spec
+- [x] workflow match_listing:行状态机(待处理/可跟卖重排队/终态清 F 重试)
+      + SPEC 候选(位数路由+zfill+退化码拒查)+ 按店打包 + 单店隔离
+      + match_submitted/回执进事件账本(sku≠asin 登记例外)
+- [x] feed_poll 反哺器第三行:跟卖表 J/K 回填
+- [ ] ⚠ **--execute 前置:对拍**——Item 字段形态(price/ShippingWeight)与
+      SKU 生成规则需旧系统 feed 备份(match_listing/logs/match_*.json)
+      核对(services/match_feed.py 两处标注);dry-run 会打印首条完整
+      Item 载荷供比对
+- [ ] 生产验收:dry-run → 单店试点 → feed_poll 回填 → 验收

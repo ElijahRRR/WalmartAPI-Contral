@@ -7,6 +7,8 @@
   status_changed         published_status 变化(detail 含 old/new/官方原因)
   delete_submitted       product_clear 提交 DELETE_ITEM(detail 含 feed_id/操作原因)
   retire_submitted       product_clear 提交 RETIRE_ITEM
+  match_submitted        match_listing 提交跟卖 MP_ITEM_MATCH(上架类=生死事件;
+                         注意跟卖商品无 amz 侧身份,sku≠asin 是此类行的例外)
   {delete|retire|maintenance}_feed_{success|failed}
                          feed 终态的逐 SKU 回执(feed_track 写;success 是
                          沃尔玛的一面之词,删除以观测核验为准)
@@ -29,12 +31,12 @@ import logging
 logger = logging.getLogger("services.product_events")
 
 _FEED_KIND = {"DELETE_ITEM": "delete", "RETIRE_ITEM": "retire",
-              "MP_MAINTENANCE": "maintenance"}
+              "MP_MAINTENANCE": "maintenance", "MP_ITEM_MATCH": "match"}
 
-# 回执入账白名单:生死类恒记;MP_MAINTENANCE 是通用部分更新 feed,
-# 只有反补来源(登记制,未来 listing 反补在此登记)才记,
-# 标题/到期日期等常规维护走同一 feedType 但不入病历
-_RECEIPT_KINDS = {"delete", "retire"}
+# 回执入账白名单:生死类恒记(删除/停用/跟卖上架);MP_MAINTENANCE 是
+# 通用部分更新 feed,只有反补来源(登记制,未来 listing 反补在此登记)
+# 才记,标题/到期日期等常规维护走同一 feedType 但不入病历
+_RECEIPT_KINDS = {"delete", "retire", "match"}
 _MAINT_LEDGER_WORKFLOWS = {"problem_product_cleanup"}
 
 

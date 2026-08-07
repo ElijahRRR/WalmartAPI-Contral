@@ -7,6 +7,11 @@
   provider 做实时按「三缺一跳过」旧防线过滤后再产出)。
 清零是 inventory 的 new=0 特例,由 zero_intents 产出。
 
+路由铁律(所有者定稿 2026-08-07,provider 做实时必须遵守):意图产出必须
+JOIN catalog.listing_sources 按出身路由——amz 快照驱动的意图只作用于
+source_type='amz' 的行;"源数据查不到"绝不可对 match/unknown 行推导出
+清库存/删除等破坏动作(旧系统按 SKU 格式排除的补丁废止,以登记簿为准)。
+
 Provider 面(2026-08-07 预留接口定稿,采集侧改造中):
   zero_intents()       ✅ 做实:限额表「库存特殊要求」=0 的 stockzero 店整店清零,
                        源=catalog.walmart_items,不依赖采集

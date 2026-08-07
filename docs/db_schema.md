@@ -114,6 +114,20 @@ CREATE TABLE catalog.walmart_items (
 两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
 
 ```sql
+-- 产品来源登记簿(2026-08-07 所有者定稿):每个上架产品登记"出身"
+-- sku=asin 只对 amz 搬运品成立;跟卖/自建/1688 各有身份。谁上架谁登记,
+-- 自动化按出身路由(源数据缺失驱动的破坏动作必须限定 source_type;
+-- unknown 不自动动),手动通道全格式通吃。存量按 SKU 格式一次性回填。
+CREATE TABLE catalog.listing_sources (
+    store text, sku text,            -- PK (store, sku)
+    source_type text NOT NULL,       -- amz / match / self / 1688 / unknown
+    source_key  text,                -- amz=asin;match=匹配GTIN;1688=offer_id
+    workflow    text,                -- 登记来源(backfill=格式回填)
+    created_at  timestamptz
+);
+```
+
+```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
 CREATE TABLE catalog.product_events (
     id bigint IDENTITY PRIMARY KEY,

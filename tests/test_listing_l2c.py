@@ -48,6 +48,19 @@ def test_pt_index_tolerates_list_forms(spec_dir):
     assert pt_spec.load_pt("Cups") is not None
 
 
+def test_pt_filename_resolved_by_normalized_scan(spec_dir):
+    # 生产实证:'3-in-1 Shampoo, Conditioner & Body Washes' 的清洗规则猜不中
+    # → 不猜规则,按目录真实文件名规范化匹配(任何清洗规则都成立)
+    weird_pt = "3-in-1 Shampoo, Conditioner & Body Washes"
+    (spec_dir / "3-in-1 Shampoo- Conditioner - Body Washes.json").write_text(
+        json.dumps({"properties": {"x": {}}}), "utf-8")
+    (spec_dir / "_pt_index.json").write_text(json.dumps([weird_pt]), "utf-8")
+    pt_spec.clear_caches()
+    assert pt_spec.load_pt(weird_pt)["properties"] == {"x": {}}
+    total, ok = pt_spec.coverage()
+    assert (total, ok) == (1, 1)
+
+
 def test_pt_spec_missing_dir_gives_clear_error(tmp_path, monkeypatch):
     monkeypatch.setenv("WALMART_DATA_ROOT", str(tmp_path))
     pt_spec.clear_caches()

@@ -25,10 +25,26 @@ def _spec_dir():
     return d
 
 
-def _sanitize_filename(pt: str) -> str:
-    """PT 名 → 拆分文件名候选(旧拆分工具对特殊字符的处理未入档,
-    按常见规则生成候选,load_pt 逐个探测存在性)。"""
-    return "".join(ch if ch.isalnum() or ch in "-_ " else "_" for ch in pt)
+def _norm(s: str) -> str:
+    """规范化:去掉所有非字母数字 + casefold——旧拆分工具的文件名清洗规则
+    未入档(生产实证 '3-in-1 Shampoo, Conditioner & Body Washes' 按常见
+    规则猜不中),两边同归一后匹配,对任何清洗规则都成立。"""
+    return "".join(ch.casefold() for ch in s if ch.isalnum())
+
+
+@lru_cache(maxsize=1)
+def _file_map() -> dict[str, str]:
+    """输入:无 → 输出:{规范化文件名: 实际文件名}(目录一次扫描,7k 项廉价)。"""
+    m: dict[str, str] = {}
+    for p in _spec_dir().iterdir():
+        if p.suffix == ".json" and not p.name.startswith("_"):
+            key = _norm(p.stem)
+            if key in m and m[key] != p.name:
+                logger.warning("PT 拆分文件规范化名冲突:%s vs %s(取前者)",
+                               m[key], p.name)
+                continue
+            m[key] = p.name
+    return m
 
 
 @lru_cache(maxsize=1)
@@ -77,16 +93,16 @@ def load_pt(product_type: str) -> dict | None:
     if product_type not in idx:
         return None
     d = _spec_dir()
-    candidates = ([idx[product_type]] if idx[product_type] else []) + [
-        f"{product_type}.json", f"{_sanitize_filename(product_type)}.json"]
-    for fname in candidates:
-        fp = d / fname
-        if fp.exists():
-            with open(fp, encoding="utf-8") as f:
-                return json.load(f)
-    logger.warning("PT 在索引中但拆分文件未找到:%s(候选=%s)",
-                   product_type, candidates)
-    return None
+    fname = idx[product_type]
+    if not (fname and (d / fname).exists()):
+        # 索引没带文件名/带的不存在 → 按目录真实文件名规范化匹配
+        fname = _file_map().get(_norm(product_type))
+    if not fname:
+        logger.warning("PT 在索引中但拆分文件未找到:%s(规范化键=%s)",
+                       product_type, _norm(product_type))
+        return None
+    with open(d / fname, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def known_pts() -> set[str]:
@@ -94,8 +110,19 @@ def known_pts() -> set[str]:
     return set(pt_index().keys())
 
 
+def coverage() -> tuple[int, int]:
+    """输入:无 → 输出:(索引 PT 数, 可解析到拆分文件的 PT 数)。就位自检用。"""
+    fm = _file_map()
+    idx = pt_index()
+    d = _spec_dir()
+    ok = sum(1 for pt, fn in idx.items()
+             if (fn and (d / fn).exists()) or _norm(pt) in fm)
+    return len(idx), ok
+
+
 def clear_caches() -> None:
     """输入:无 → 输出:无(换版/测试时清缓存)。"""
     pt_index.cache_clear()
     orderable_spec.cache_clear()
     load_pt.cache_clear()
+    _file_map.cache_clear()

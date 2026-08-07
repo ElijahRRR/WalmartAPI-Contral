@@ -125,8 +125,9 @@ def test_execute_reports_rejected_and_unknown(monkeypatch):
                             {"feed_id": None, "count": 1, "outcome": "failed"},
                             {"feed_id": None, "count": 1, "outcome": "unknown"}])
     out = ppc.run({"execute": True})
-    assert "提交被拒 1" in out and "结局不确定留 pending 1" in out
+    assert "提交失败 1" in out and "结局不确定留 pending 1" in out
     assert "删除提交 0" in out
+    assert "二轮重试" not in out          # 4xx 被拒/unknown 不算网络波动
 
 
 def test_execute_isolates_store_failures(monkeypatch):
@@ -154,8 +155,40 @@ def test_execute_isolates_store_failures(monkeypatch):
 
     monkeypatch.setattr(ppc.feeds, "submit_feed", flaky)
     out = ppc.run({"execute": True})
-    assert submitted == [("T2", ["S2"])]
-    assert "⚠ T1:提交异常已跳过" in out and "T2:删除提交 1" in out
+    assert submitted == [("T2", ["S2"])]                     # T2 不被重复提交
+    assert "⚠ T1:提交异常" in out and "T2:删除提交 1" in out
+    assert "二轮重试 1 店:T1" in out and "⚠ T1:二轮仍失败" in out
+
+
+def test_second_round_retry_after_network_failure(monkeypatch):
+    # 二轮重试成功路径:第一轮 token 阶段确定未达(retryable)→
+    # 全部店跑完后整店重提,事件只落一次、挂二轮的真实 feed_id
+    import contextlib
+    from registry import db as _db
+    events = []
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(ppc.product_events, "record_many",
+                        lambda conn, rows: (events.extend(rows), len(rows))[1])
+    monkeypatch.setattr(ppc.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ppc, "_load_state", lambda: (
+        [_item("T1", "S1", "prohibited product policy")],
+        set(), {}, {}, set(), set()))
+    calls = {"n": 0}
+
+    def flaky_then_ok(store, ft, entries, *, workflow=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{"feed_id": None, "count": 1, "outcome": "failed",
+                     "retryable": True}]
+        return [{"feed_id": "F_RETRY", "count": 1, "outcome": "submitted"}]
+
+    monkeypatch.setattr(ppc.feeds, "submit_feed", flaky_then_ok)
+    out = ppc.run({"execute": True})
+    sub = [e for e in events if e["event"] == "delete_submitted"]
+    assert len(sub) == 1 and sub[0]["detail"]["feed_id"] == "F_RETRY"
+    assert "二轮重试 1 店:T1" in out and "二轮仍失败" not in out
 
 
 def test_stubborn_sql_binds_to_listing_generation():

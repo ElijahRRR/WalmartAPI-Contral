@@ -221,7 +221,8 @@ def test_submit_token_failure_is_definite_failed(monkeypatch):
     monkeypatch.setattr(_client, "_build_transport",
                         lambda proxy: httpx.MockTransport(handler))
     out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
-    assert out[0] == {"feed_id": None, "count": 1, "outcome": "failed"}
+    assert out[0] == {"feed_id": None, "count": 1, "outcome": "failed",
+                      "retryable": True}
     assert any(a and a[0] == "failed" for _, a in _updates(logdb))
 
 

@@ -25,6 +25,11 @@ problem_products,规则逐字移植旧系统)→ 三路:
 店铺闸:ops.store_kpi_daily 最新 store_status 非 ACTIVE 的店整体跳过
 (数据驱动,替代旧的逐店 payment/statement 查询;无 KPI 记录视为 ACTIVE)。
 
+容错(2026-08-07 所有者定稿):单店提交异常只跳过该店不炸整轮;第一轮全部
+店跑完后,对网络波动失败的店(token/代理阶段确定未达 retryable,或提交块
+抛异常)整店**二轮重提一次**——已成功切片被在途防重拦下,不重复不漏;
+二轮仍失败交下轮调度。凭证失效(StoreDeadError)与 4xx 被拒不触发重试。
+
 首版裁剪(所有者确认):砍邮件;监管合规定点删除由 product_clear 的
 停用/删除表承担;品牌采集/黑名单/飞书统计表后置;旧库 41.7 万行历史导入另做。
 
@@ -33,7 +38,7 @@ problem_products,规则逐字移植旧系统)→ 三路:
 
 import logging
 
-from api import feeds
+from api import _client, feeds
 from registry import db
 from services import problem_products as pp
 from services import product_events, stores as stores_svc
@@ -206,51 +211,84 @@ def run(params: dict) -> str:
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n_cat = _record_categories(items, last_cat)
+    retry_stores: list[str] = []
     for store_name, b in sorted(plans.items()):
         store = stores_by_name.get(store_name)
         if store is None:
             lines.append(f"  {store_name}:凭证缺失,跳过")
             continue
-        # 多切片时 submit_feed 按序返回逐片结果,记账必须滑窗对位
-        # (与 product_clear._submit_new 同款;[:count] 会把第一片重复记到后续 feed)
-        # 只有 outcome=submitted 才落账:dedup 携带旧 feed_id 但什么都没提交,
-        # 记了就是幽灵事件——反补计数被灌水会导致少一次真实反补就转永久删除
-        def _submit(feed_type: str, entries: list, rows: list[dict],
-                    event: str, label: str) -> None:
-            i = 0
-            n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
-            for res in feeds.submit_feed(store, feed_type, entries,
-                                         workflow="problem_product_cleanup"):
-                rows_slice = rows[i:i + res["count"]]
-                i += res["count"]
-                n[res["outcome"]] = n.get(res["outcome"], 0) + len(rows_slice)
-                if res["outcome"] == "submitted" and res["feed_id"]:
-                    _record(store_name, event, rows_slice, res["feed_id"])
-            line = f"  {store_name}:{label}提交 {n['submitted']}"
-            if n["dedup"]:
-                line += f",在途防重跳过 {n['dedup']}"
-            if n["failed"]:
-                line += f",⚠ 提交被拒 {n['failed']}(查日志,不自动重试)"
-            if n["unknown"]:
-                line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
-            lines.append(line)
+        if _submit_store(store_name, store, b, lines):
+            retry_stores.append(store_name)
 
-        # 单店隔离(2026-08-07 生产实证:单店代理 TLS 断线炸掉整轮,
-        # 后面的店全部没轮到):任何异常只跳过该店,其余店继续
-        try:
-            if b["relist"]:
-                _submit("MP_MAINTENANCE",
-                        [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
-                         for r in b["relist"]],
-                        b["relist"], "maintenance_submitted", "反补")
-            if b["retire"]:
-                _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
-                        b["retire"], "retire_submitted", "顽固停用")
-            if b["delete"]:
-                _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
-                        b["delete"], "delete_submitted", "删除")
-        except Exception as e:
-            logger.exception("店铺 %s 提交异常,跳过继续其它店: %s", store_name, e)
-            lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+    if retry_stores:
+        # 二轮重试(所有者定稿 2026-08-07):第一轮全部店跑完后,对网络波动
+        # 失败的店整店重提一次。衔接安全:第一轮已成功的切片仍在途,被
+        # feed_log 在途防重拦下(dedup 不落账不重发);token 阶段确定未达的
+        # 切片已落 failed 可重占,同载荷重提。二轮仍失败交下轮调度,不无限重试。
+        lines.append(f"二轮重试 {len(retry_stores)} 店:{','.join(retry_stores)}")
+        for store_name in retry_stores:
+            if _submit_store(store_name, stores_by_name[store_name],
+                             plans[store_name], lines):
+                lines.append(f"  ⚠ {store_name}:二轮仍失败,待下轮调度")
+
     lines.append(f"归类事件新记 {n_cat} 条;结果轮询走 feed_poll")
     return "\n".join(lines)
+
+
+def _submit_store(store_name: str, store: dict, b: dict,
+                  lines: list[str]) -> bool:
+    """输入:店铺 + 三桶计划 → 输出:是否需二轮重试(网络类失败)。
+
+    多切片滑窗对位记账(与 product_clear._submit_new 同款);只有
+    outcome=submitted 才落事件——dedup 携带旧 feed_id 但什么都没提交,
+    记了就是幽灵事件,反补计数被灌水会导致少一次真实反补就转永久删除。
+    retryable=token/代理阶段确定未达;凭证失效(StoreDeadError)不重试。
+    """
+    need_retry = False
+
+    def _submit(feed_type: str, entries: list, rows: list[dict],
+                event: str, label: str) -> None:
+        nonlocal need_retry
+        i = 0
+        n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+        for res in feeds.submit_feed(store, feed_type, entries,
+                                     workflow="problem_product_cleanup"):
+            rows_slice = rows[i:i + res["count"]]
+            i += res["count"]
+            n[res["outcome"]] = n.get(res["outcome"], 0) + len(rows_slice)
+            if res["outcome"] == "submitted" and res["feed_id"]:
+                _record(store_name, event, rows_slice, res["feed_id"])
+            elif res.get("retryable"):
+                need_retry = True
+        line = f"  {store_name}:{label}提交 {n['submitted']}"
+        if n["dedup"]:
+            line += f",在途防重跳过 {n['dedup']}"
+        if n["failed"]:
+            line += f",⚠ 提交失败 {n['failed']}(查日志)"
+        if n["unknown"]:
+            line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
+        lines.append(line)
+
+    # 单店隔离(2026-08-07 生产实证:单店代理 TLS 断线炸掉整轮,
+    # 后面的店全部没轮到):任何异常只跳过该店,其余店继续
+    try:
+        if b["relist"]:
+            _submit("MP_MAINTENANCE",
+                    [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
+                     for r in b["relist"]],
+                    b["relist"], "maintenance_submitted", "反补")
+        if b["retire"]:
+            _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
+                    b["retire"], "retire_submitted", "顽固停用")
+        if b["delete"]:
+            _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
+                    b["delete"], "delete_submitted", "删除")
+    except _client.StoreDeadError as e:
+        logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
+        lines.append(f"  {store_name}:凭证失效跳过")
+        return False
+    except Exception as e:
+        logger.exception("店铺 %s 提交异常: %s", store_name, e)
+        lines.append(f"  ⚠ {store_name}:提交异常({e}),转入二轮重试")
+        return True
+    return need_retry

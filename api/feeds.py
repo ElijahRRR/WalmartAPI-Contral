@@ -261,8 +261,11 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
     n = len(chunk)
 
     if status is _PRE_FAIL:
+        # retryable:请求未发出的确定性失败(区别于 4xx 被拒——那个重试也没用),
+        # 调用方可安全地对同一载荷做二轮重提(failed 行可重占)
         _log_update(log_id, "failed")
-        return {"feed_id": None, "count": n, "outcome": "failed"}
+        return {"feed_id": None, "count": n, "outcome": "failed",
+                "retryable": True}
 
     if status == 200 and data and data.get("feedId"):
         logger.info("feed 提交成功:%s %s %d 条 feedId=%s",

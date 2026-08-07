@@ -309,6 +309,17 @@ def test_upsert_preserves_avail_qty_when_absent():
         in walmart_catalog._UPSERT_SQL
 
 
+def test_mark_missing_clears_status_columns():
+    # 缺席行 published/lifecycle 清空(所有者定稿 2026-08-07):旧观测不再展示
+    assert "published_status = NULL" in walmart_catalog._MARK_MISSING_SQL
+    assert "lifecycle_status = NULL" in walmart_catalog._MARK_MISSING_SQL
+
+
+def test_projection_excludes_missing_rows():
+    # 飞书「在线产品总表」只写在架商品,缺席行不进表
+    assert "WHERE missing_since IS NULL" in walmart_catalog._PROJECTION_SQL
+
+
 def test_projection_columns_match_registry():
     from registry import resources
     select_part = walmart_catalog._PROJECTION_SQL.split("FROM")[0]

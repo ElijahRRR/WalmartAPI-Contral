@@ -99,13 +99,19 @@ CREATE TABLE catalog.walmart_items (
     published_status text, lifecycle_status text, unpublished_reasons text,
     last_seen_at timestamptz NOT NULL,       -- 最近一次全量扫描见到它的时间
     missing_since timestamptz,               -- 连续缺席起点;NULL=最近一轮仍在
+                                             -- 标缺席时 published/lifecycle_status
+                                             -- 同步清空(2026-08-07 定稿):旧观测
+                                             -- 不再展示,复现时 upsert 写回新状态
     created_at / updated_at,
     PRIMARY KEY (store, sku)
 );
 ```
 
 "整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
-再把本轮未见的行标 missing_since(不删除,保历史;连续缺席多久后清理另议)。
+再把本轮未见的行标 missing_since 并清空两个状态列(不删除,保历史;
+连续缺席多久后清理另议)。飞书「在线产品总表」投影只写在架行
+(missing_since IS NULL),缺席商品不进表;last_seen_at/missing_since
+两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
 
 ```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
@@ -227,6 +233,8 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+-- 防重语义(2026-08-07 定稿):唯一索引拦的是在途行(pending/submitted);
+-- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗)
 
 CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
     feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)

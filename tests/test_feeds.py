@@ -135,6 +135,43 @@ def test_submit_dedup_refuses_resubmission(monkeypatch):
     assert out == [{"feed_id": "F_OLD", "count": 2, "outcome": "dedup"}]
 
 
+def test_log_claim_reclaims_done_row(monkeypatch):
+    # 所有者定稿:防重只拦在途(pending/submitted);done=上一笔已完结,
+    # 同载荷重发是新一轮合法操作(顽固 SKU 每日重发/反补第 2 次依赖此语义)
+    logdb = _LogDB(claim=False, prev=(9, "done", "F_OLD"))
+    _fake_db(monkeypatch, logdb)
+    _use(monkeypatch, lambda r: httpx.Response(200, json={"feedId": "F_NEW"}))
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0]["outcome"] == "submitted" and out[0]["feed_id"] == "F_NEW"
+    assert any("'pending'" in s for s, _ in _updates(logdb))   # done 行重占回 pending
+
+
+def test_find_recent_feed_excludes_claimed_sibling(monkeypatch):
+    # 同尺寸兄弟切片:反查必须排除 feed_log 已占用的 feedId,防误收编整片丢失
+    class _DB(_LogDB):
+        def fetchall(self):
+            if "SELECT feed_id FROM ops.feed_log" in self._last:
+                return [("F_SIB",)]
+            return []
+    logdb = _DB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+    now_ms = int(time.time() * 1000)
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            if calls["post"] == 1:
+                raise httpx.ConnectError("boom")
+            return httpx.Response(200, json={"feedId": "F_NEW"})
+        return httpx.Response(200, json={"results": {"feed": [
+            {"feedId": "F_SIB", "itemsReceived": 1, "feedDate": now_ms}]}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0]["feed_id"] == "F_NEW" and calls["post"] == 2   # 排除→未达→补交
+
+
 def test_submit_success_marks_submitted(monkeypatch):
     logdb = _LogDB(claim=True)
     _fake_db(monkeypatch, logdb)
@@ -167,6 +204,25 @@ def test_submit_rejected_marks_failed_no_retry(monkeypatch):
     out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
     assert out[0]["outcome"] == "failed"
     assert calls["n"] == 1                       # 被拒绝不自动重试
+    assert any(a and a[0] == "failed" for _, a in _updates(logdb))
+
+
+def test_submit_token_failure_is_definite_failed(monkeypatch):
+    # token/代理阶段断线(2026-08-07 生产实证 SSL EOF):请求未发出=确定未达
+    # → failed 可重占,不走反查三态,不向上抛炸整轮
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+
+    def handler(request):
+        if request.url.path == "/v3/token":
+            raise httpx.ConnectError("SSL: UNEXPECTED_EOF_WHILE_READING")
+        raise AssertionError("token 失败后不应发出任何 feed 请求")
+
+    monkeypatch.setattr(_client, "_build_transport",
+                        lambda proxy: httpx.MockTransport(handler))
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0] == {"feed_id": None, "count": 1, "outcome": "failed",
+                      "retryable": True}
     assert any(a and a[0] == "failed" for _, a in _updates(logdb))
 
 

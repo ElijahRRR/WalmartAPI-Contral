@@ -3,7 +3,7 @@
 import pytest
 
 from api import feeds, feishu
-from services import feed_track
+from services import clear_sheet, feed_track
 from workflows import product_clear as dr
 
 STORE = {"name": "T1", "client_id": "cid_r", "client_secret": "s", "proxy": None}
@@ -54,9 +54,9 @@ def test_routes_actions_and_marks_invalid(monkeypatch):
     assert ("T1", "RETIRE_ITEM", ["S1", "S2"]) in calls["submit"]   # 停用+下架同路
     assert ("T1", "DELETE_ITEM", ["S3"]) in calls["submit"]
     results = {rng: vals[0][2] for rng, vals in calls["write"]}
-    assert results["E5:G5"] == "动作不识别"
-    assert results["E6:G6"] == "店铺不识别"
-    assert results["E2:G2"] == "处理中" and "F_RETIRE_ITEM" in str(calls["write"])
+    assert results["E5:H5"] == "动作不识别"
+    assert results["E6:H6"] == "店铺不识别"
+    assert results["E2:H2"] == "处理中" and "F_RETIRE_ITEM" in str(calls["write"])
     assert "回写" in out
 
 
@@ -85,10 +85,10 @@ def test_poll_writes_terminal_results_and_skips_failed_rows(monkeypatch):
     ])
     dr.run({"execute": True})
     assert calls["polled"] == ["F1"]                        # F2 不轮询
-    results = {rng: vals[0][2] for rng, vals in calls["write"]}
-    assert results["E2:G2"] == "成功"
-    assert results["E3:G3"] == "失败:ERR_X"
-    assert results["E4:G4"] == "未查到"
+    written = {rng: vals[0] for rng, vals in calls["write"]}
+    assert written["E2:H2"][2] == "成功"
+    assert written["E3:H3"][2:] == ["失败", "ERR_X"]         # G=结果,H=报错码分列
+    assert written["E4:H4"][2] == "未查到"
 
 
 def test_slice_rows_get_matching_feed_ids(monkeypatch):
@@ -101,7 +101,7 @@ def test_slice_rows_get_matching_feed_ids(monkeypatch):
 
     dr.run({"execute": True})
     w = {rng: vals[0] for rng, vals in calls["write"]}
-    assert w["E2:G2"][0] == "FA" and w["E3:G3"][0] == "FB"  # 行↔切片一一对应
+    assert w["E2:H2"][0] == "FA" and w["E3:H3"][0] == "FB"  # 行↔切片一一对应
 
 
 def test_empty_action_defaults_to_delete(monkeypatch):
@@ -109,6 +109,48 @@ def test_empty_action_defaults_to_delete(monkeypatch):
     calls = _env(monkeypatch, [["T1", "S1", "", "清理"]])
     dr.run({"execute": True})
     assert calls["submit"] == [("T1", "DELETE_ITEM", ["S1"])]
+
+
+def test_sync_from_ledger_backfills_without_walmart_calls(monkeypatch):
+    # feed_poll 路径:在途行按 ops.feed_items 台账落 G/H,未落定的不动
+    from registry import resources
+    from registry.resources import Spreadsheet
+    monkeypatch.setattr(resources, "RETIRE_SHEET",
+                        Spreadsheet(name="商品停用删除表", token="TOK",
+                                    sheet_id="SID",
+                                    columns=resources.RETIRE_SHEET.columns))
+    sheet_rows = [
+        ["T1", "OK1", "删除", "", "F1", "2026-08-07", "处理中", ""],
+        ["T1", "BAD1", "删除", "", "F1", "2026-08-07", "处理中", ""],
+        ["T1", "WAIT", "删除", "", "F2", "2026-08-07", "处理中", ""],
+        ["T1", "NEW", "删除", "", "", "", "", ""],           # 未提交行不动
+    ]
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
+    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    ledger = {"F1": {"OK1": ("success", ""), "BAD1": ("failed", "ERR_Y")},
+              "F2": {"WAIT": ("submitted", "")}}
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
+
+    out = clear_sheet.sync_from_ledger()
+    w = {rng: vals[0] for rng, vals in writes}
+    assert w["E2:H2"][2] == "成功"
+    assert w["E3:H3"][2:] == ["失败", "ERR_Y"]
+    assert "E4:H4" not in w                                  # 台账未落定不动
+    assert "回写 2 行" in out
+
+
+def test_sync_from_ledger_skips_when_sheet_unregistered(monkeypatch):
+    monkeypatch.delenv("FEISHU_RETIRE_SHEET_TOKEN", raising=False)
+    monkeypatch.delenv("FEISHU_RETIRE_SHEET_ID", raising=False)
+    from registry import resources
+    from registry.resources import Spreadsheet
+    monkeypatch.setattr(resources, "RETIRE_SHEET",
+                        Spreadsheet(name="商品停用删除表", token="", sheet_id="",
+                                    columns=resources.RETIRE_SHEET.columns))
+    assert clear_sheet.sync_from_ledger() is None
 
 
 def test_limits_table_per_store_cap(monkeypatch, caplog):

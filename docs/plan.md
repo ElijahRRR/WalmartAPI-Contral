@@ -90,7 +90,7 @@
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | 旧版未上生产,可直接按新架构实现;UPC 池状态入 ops |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | 含清库存;maintenance.db 数据并入 PG listing schema |
 | 7 | product_clear | 沃尔玛批量下架(旧 daily_retire) | **是** | **[~] 生产验收通过**(2026-08-06,所有者确认:A107 首测 5+放量 1221 个 DELETE_ITEM,识别/限额/防重/轮询/台账/事件账本全链路);待:切旧 15:00 cron、挂调度、停用(RETIRE_ITEM)动作实测。命名原则(所有者 2026-08-06):新工作流按功能命名,不继承旧系统名 |
-| 8 | daily_cleanup | 沃尔玛问题商品清理 | **是** | 旧 PG walmart_cleanup 库并入;cache JSON 状态迁入 ops |
+| 8 | problem_product_cleanup | 沃尔玛问题商品清理(旧 daily_cleanup) | **是** | **[~] 生产验收通过,PR #9 已合并**(2026-08-07,所有者确认):759 行首次全量真跑(21 店,27 反补 + 231 删除;dry-run 账目自洽对拍通过)。验收期修复:20 代理对抗审查 6 项(dedup 幽灵事件/防重只拦在途/反查排除已占用 feedId/顽固绑代际/轮询卡死/摘要分列)+ 单店隔离 + 网络波动二轮重试 + 在途/待观测拦截(均生产实证)。待:次日 catalog_sync 删除核验观测、停旧 0/6/12/18 点 cron、挂调度(catalog_sync 先行) |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;采集侧增量待契约定稿;item_id 报表回填封存(-p item_ids=1) |
 | 10 | listing | auto_listing + match_listing | **是** | 最大最后;spec 文件先入 `<DATA_ROOT>/specs/<版本>/`;分子阶段另立计划 |
 | — | order_center_cleanup | (新增) | **是** | 建库一次性烂账清理:删除订单不在库的售后/绩效/对账行(dry-run 默认);配套**入库侧永久过滤**(returns_sync/daily_report 已内置,防每日回流)+ recon_done 账期台账(防整期清空后被当缺失重拉)。**[x] 全店建库已执行**(2026-08-06,用户确认) |
@@ -121,6 +121,15 @@ walmart_client.py.bak、各种零引用大文件。类目映射的**产物**(映
 catalog,pipeline 代码留在旧仓库归档。
 
 ### Phase 3 — 旧系统退役
+
+- [ ] **--execute 默认值切换**(所有者定稿 2026-08-06):迁移期间危险工作流
+      保持默认 dry-run(真跑需 --execute);全部工作流正式上线后统一评估
+      改为默认真执行(届时同步修订 CLAUDE.md 安全铁律条文与各调度命令)
+
+- [ ] **历史数据迁移**(所有者定稿 2026-08-07):系统(工作流)迁移完成后,
+      还需迁移旧系统的历史数据——如以前的上架数据、错误商品记录等;
+      旧格式与新格式可能不一致,届时具体规划和操作。与产品事件账本的
+      旧库 41.7 万行历史导入同批统筹(格式映射、去重、时间线拼接)
 
 - [ ] 全部工作流切换完成后,旧仓库 launchd/scheduled-tasks 清空,旧仓库转只读归档
 - [ ] erp_listing_server / erp_web / erp_worker(旧 ERP 链路)不属于本次迁移,

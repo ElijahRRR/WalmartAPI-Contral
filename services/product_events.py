@@ -72,9 +72,12 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
             continue
         prev_st, prev_missing = prev
         if prev_missing is not None:
+            # 复现只记 reappeared(detail 已含新状态);缺席行状态列已被清空,
+            # 再比对必然"变化",叠记 status_changed(old=None)是噪音
             events.append({"sku": sku, "store": store,
                            "event": "item_reappeared", "source": source,
                            "detail": {"published_status": new_st}})
+            continue
         if new_st != prev_st:
             events.append({"sku": sku, "store": store,
                            "event": "status_changed", "source": source,

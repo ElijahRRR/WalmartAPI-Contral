@@ -101,6 +101,14 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         serial = match_feed.next_serial_start(conn, date_str)
 
+    unknown_stores = sorted({r["store"] for r in todo
+                             if r["store"] not in stores_by_name})
+    if unknown_stores:
+        logger.warning("店铺不识别 %d 个:表内样本=%s;凭证表样本=%s"
+                       "(店名须与凭证表逐字一致,且该店 启用=是、ClientId "
+                       "与代理三件套非空)", len(unknown_stores),
+                       unknown_stores[:5], sorted(stores_by_name)[:5])
+
     for r in todo:
         store = stores_by_name.get(r["store"])
         if store is None:

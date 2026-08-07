@@ -79,6 +79,19 @@
   (沃尔玛类目/品牌/产品/amz 类目)以脚本增量跑库;清理来源数据入库须
   **清洗走流程**(对应产品/店铺对上,该进黑名单的进)——归黑名单建设批次
 
+### L2c 实施状态(2026-08-07)
+
+- [x] spec 就位契约:`<DATA_ROOT>/specs/MP_ITEM/<版本串>/`(MPSetup_by_pt
+      拆分产物;451MB 原始单文件与 307MB pt_templates 不拷)+
+      services/pt_spec 加载器(lru_cache 512,未收录 PT 返 None 由调用方
+      淘汰,缺目录报中文修复指引)
+- [x] api/llm(DeepSeek,key 走 .env DEEPSEEK_API_KEY)+ catalog.llm_cache
+      (旧 462MB sqlite 的 PG 化,旧数据不迁——key 含 model 换模型即失效)
+- [x] MP_ITEM 进 feed 唯一通道:header 只收 3 字段 + version 完整时间戳
+      (三个实证错误码注释在案);8/hour 桶;事件 kind=list 入生死类白名单
+- [ ] L2d:数据源 provider + 闸门链串联 + 变体 + mapper(零认证八项等
+      实证约束)+ list_new 主链 + 回执四集合反哺器(端到端验收待采集)
+
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 
 - [ ] 输入 provider:xlsx 模式先行(DMIT 导出 47 列),采集 API 模式预留

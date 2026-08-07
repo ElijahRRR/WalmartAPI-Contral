@@ -67,6 +67,9 @@ FEED_SPEC_VERSIONS = {
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
+    # 上架主链(L2;旧系统实测值,官方 4-6 周滚版,上线前需实测仍被接受;
+    # header version 必须完整时间戳,写 '5.0' 被拒 74597363510508 实证)
+    "MP_ITEM": "5.0.20260304-22_45_32-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)

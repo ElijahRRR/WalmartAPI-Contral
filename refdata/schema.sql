@@ -168,6 +168,17 @@ CREATE TABLE IF NOT EXISTS catalog.upc_pool (
 );
 CREATE INDEX IF NOT EXISTS upc_pool_status_idx ON catalog.upc_pool (status);
 
+-- ── LLM 缓存(L2c;旧 llm_cache.sqlite 462MB 的 PG 化,旧数据不迁——
+-- key 含 model 名,换模型即失效)────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS catalog.llm_cache (
+    input_hash  text PRIMARY KEY,    -- sha256(model+messages+温度+tokens)[:32]
+    model       text NOT NULL,
+    response    jsonb NOT NULL,
+    hit_count   int NOT NULL DEFAULT 0,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    last_hit_at timestamptz
+);
+
 -- ── 风控库(L2b,2026-08-07 所有者定稿:两张飞书表镜像入 PG,闸门读库
 -- 不读表——表格随时会停用;同步只增改不删,未来产品中心黑名单增量以
 -- 脚本跑库,清理来源数据入库须清洗对应产品/店铺,归黑名单建设批次)──

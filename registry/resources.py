@@ -134,11 +134,12 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
     name="在线产品总表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_ONLINE_SHEET_ID", ""),
+    # last_seen_at/missing_since 不投影(所有者定稿 2026-08-07):
+    # 追踪在 PG(walmart_items 两列 + product_events 账本),表只展示在架行
     columns=("store", "sku", "itemId", "upc", "gtin", "productName", "shelf",
              "productType", "variantGroupId", "variantGroupInfo",
              "price", "currency", "availToSellQty",
-             "publishedStatus", "lifecycleStatus", "unpublishedReasons",
-             "last_seen_at", "missing_since"),
+             "publishedStatus", "lifecycleStatus", "unpublishedReasons"),
 )
 
 

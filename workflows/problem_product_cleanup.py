@@ -195,30 +195,29 @@ def run(params: dict) -> str:
         if store is None:
             lines.append(f"  {store_name}:凭证缺失,跳过")
             continue
+        # 多切片时 submit_feed 按序返回逐片结果,记账必须滑窗对位
+        # (与 product_clear._submit_new 同款;[:count] 会把第一片重复记到后续 feed)
+        def _submit(feed_type: str, entries: list, rows: list[dict],
+                    event: str, label: str) -> None:
+            i = 0
+            for res in feeds.submit_feed(store, feed_type, entries,
+                                         workflow="problem_product_cleanup"):
+                rows_slice = rows[i:i + res["count"]]
+                i += res["count"]
+                if res["feed_id"]:
+                    _record(store_name, event, rows_slice, res["feed_id"])
+            lines.append(f"  {store_name}:{label}提交 {len(rows)}")
+
         if b["relist"]:
-            payload = [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
-                       for r in b["relist"]]
-            for res in feeds.submit_feed(store, "MP_MAINTENANCE", payload,
-                                         workflow="problem_product_cleanup"):
-                if res["feed_id"]:
-                    _record(store_name, "maintenance_submitted",
-                            b["relist"][:res["count"]], res["feed_id"])
-            lines.append(f"  {store_name}:反补提交 {len(b['relist'])}")
+            _submit("MP_MAINTENANCE",
+                    [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
+                     for r in b["relist"]],
+                    b["relist"], "maintenance_submitted", "反补")
         if b["retire"]:
-            for res in feeds.submit_feed(store, "RETIRE_ITEM",
-                                         [r["sku"] for r in b["retire"]],
-                                         workflow="problem_product_cleanup"):
-                if res["feed_id"]:
-                    _record(store_name, "retire_submitted",
-                            b["retire"][:res["count"]], res["feed_id"])
-            lines.append(f"  {store_name}:顽固停用提交 {len(b['retire'])}")
+            _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
+                    b["retire"], "retire_submitted", "顽固停用")
         if b["delete"]:
-            for res in feeds.submit_feed(store, "DELETE_ITEM",
-                                         [r["sku"] for r in b["delete"]],
-                                         workflow="problem_product_cleanup"):
-                if res["feed_id"]:
-                    _record(store_name, "delete_submitted",
-                            b["delete"][:res["count"]], res["feed_id"])
-            lines.append(f"  {store_name}:删除提交 {len(b['delete'])}")
+            _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
+                    b["delete"], "delete_submitted", "删除")
     lines.append(f"归类事件新记 {n_cat} 条;结果轮询走 feed_poll")
     return "\n".join(lines)

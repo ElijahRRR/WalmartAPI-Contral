@@ -102,13 +102,14 @@ _PROJECTION_SQL = """
 SELECT store, sku, item_id, upc, gtin, product_name, shelf, product_type,
        variant_group_id, variant_group_info::text,
        price, currency, avail_qty, published_status, lifecycle_status,
-       unpublished_reasons, last_seen_at, missing_since
+       unpublished_reasons
 FROM catalog.walmart_items
 WHERE missing_since IS NULL
 ORDER BY store, sku
 """  # 列序与 registry.resources.ONLINE_PRODUCTS_SHEET.columns 一一对应,改必同步
 # (wpid 不投影:用户明确不需要;PG 仍保留该列供 API 场景用)
-# 缺席行不投影(所有者定稿 2026-08-07):飞书表只展示在架商品;历史在 PG + 事件账本
+# 缺席行不投影、last_seen_at/missing_since 两列不投影(所有者定稿 2026-08-07):
+# 飞书表只展示在架商品;追踪与历史在 PG(两列仍是缺席标记/删除核验的依据)+ 事件账本
 
 
 def projection_rows(conn) -> list[list]:

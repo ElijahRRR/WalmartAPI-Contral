@@ -59,6 +59,31 @@ def test_plan_routing_and_dedup():
     assert n["fallback"] == 1 and n["relist"] == 1 and n["delete"] == 3
 
 
+def test_execute_records_events_per_slice(monkeypatch):
+    # 多切片提交:事件账本必须滑窗对位([:count] 写法会把第一片重复记到 FB)
+    import contextlib
+    from registry import db as _db
+    events = []
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(ppc.product_events, "record_many",
+                        lambda conn, rows: (events.extend(rows), len(rows))[1])
+    monkeypatch.setattr(ppc.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    items = [_item("T1", f"S{i}", "prohibited product policy") for i in range(4)]
+    monkeypatch.setattr(ppc, "_load_state",
+                        lambda: (items, set(), {}, {}, set(), set()))
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, *, workflow="": [
+                            {"feed_id": "FA", "count": 2, "outcome": "submitted"},
+                            {"feed_id": "FB", "count": 2, "outcome": "submitted"}])
+
+    ppc.run({"execute": True})
+    sub = [(e["sku"], e["detail"]["feed_id"]) for e in events
+           if e["event"] == "delete_submitted"]
+    assert sub == [("S0", "FA"), ("S1", "FA"), ("S2", "FB"), ("S3", "FB")]
+
+
 def test_dry_run_zero_submissions(monkeypatch):
     monkeypatch.setattr(ppc, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],

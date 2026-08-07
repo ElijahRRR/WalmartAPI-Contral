@@ -42,6 +42,17 @@ def test_record_many_serializes_detail():
     assert pe.record_many(conn, []) == 0                  # 空集不发 SQL
 
 
+def test_receipt_in_ledger_whitelist():
+    # 入账定稿(所有者 2026-08-07):生死类恒进;maintenance 仅反补来源进;
+    # 改价/改库存/改标题/清库存不进(店铺维度操作,流水在 ops.feed_items)
+    assert pe.receipt_in_ledger("delete", "product_clear")
+    assert pe.receipt_in_ledger("retire", None)
+    assert pe.receipt_in_ledger("maintenance", "problem_product_cleanup")
+    assert not pe.receipt_in_ledger("maintenance", "maintenance")   # 标题/到期日期
+    assert not pe.receipt_in_ledger("price_and_promotion", "price_sync")
+    assert not pe.receipt_in_ledger("inventory", "maintenance")     # 清库存
+
+
 def test_diff_catalog_transitions():
     old = {"A": ("PUBLISHED", None),          # 状态将变化
            "B": (None, "2026-08-01"),         # 曾缺席将重现(缺席行状态列已清空)

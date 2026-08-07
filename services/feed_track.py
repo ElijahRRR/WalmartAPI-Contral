@@ -84,7 +84,9 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             (feed_id, list(results) or [""]))
         n_missing = cur.rowcount
         # 产品事件账本:逐 SKU 回执落账(success 是沃尔玛的一面之词,
-        # 删除的最终真相由 catalog_sync 观测核验)
+        # 删除的最终真相由 catalog_sync 观测核验)。
+        # 入账白名单(所有者定稿 2026-08-07):改价/改库存/改标题/清库存等
+        # 维护回执不进病历,流水已在 ops.feed_items——receipt_in_ledger 收口
         product_events.record_many(conn, [
             {"sku": sku, "store": store["name"],
              "event": f"{product_events.feed_kind(meta[sku][1])}_feed_{o}",
@@ -92,7 +94,9 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
              "error_code": code or None, "detail": {"feed_id": feed_id}}
             for sku, (o, code) in results.items()
             if sku in meta and o in ("success", "failed")
-            and meta[sku][2] == "submitted"])
+            and meta[sku][2] == "submitted"
+            and product_events.receipt_in_ledger(
+                product_events.feed_kind(meta[sku][1]), meta[sku][0])])
     if n_missing:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)

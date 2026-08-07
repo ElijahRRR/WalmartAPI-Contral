@@ -15,6 +15,12 @@
                          所有者实证)——告警,人工处置
 
 原则:只追加永不改;回执与观测分开记,互相印证;上架防呆查 product_risk 视图。
+
+入账边界(所有者定稿 2026-08-07):病历只记**产品生死**(删除/停用/反补)
+与观测事实。标题/价格/库存维护(含清库存)一律不进——清库存是店铺维度的
+运营操作,本系统不设店铺维度病历;此类操作的流水在 ops.feed_log/feed_items,
+现状在 catalog.walmart_items 快照,若引发平台下架等后果,由 catalog_sync
+的 status_changed 观测自动入账(动作不记,生死后果必记)。
 """
 
 import json
@@ -25,9 +31,27 @@ logger = logging.getLogger("services.product_events")
 _FEED_KIND = {"DELETE_ITEM": "delete", "RETIRE_ITEM": "retire",
               "MP_MAINTENANCE": "maintenance"}
 
+# 回执入账白名单:生死类恒记;MP_MAINTENANCE 是通用部分更新 feed,
+# 只有反补来源(登记制,未来 listing 反补在此登记)才记,
+# 标题/到期日期等常规维护走同一 feedType 但不入病历
+_RECEIPT_KINDS = {"delete", "retire"}
+_MAINT_LEDGER_WORKFLOWS = {"problem_product_cleanup"}
+
 
 def feed_kind(feed_type: str) -> str:
     return _FEED_KIND.get(feed_type, feed_type.lower())
+
+
+def receipt_in_ledger(kind: str, workflow: str | None) -> bool:
+    """输入:feed 业务类别 + 提交来源工作流 → 输出:该回执是否进病历。
+
+    维护事件入账定稿(所有者 2026-08-07):改价/改库存/改标题/清库存的
+    回执不进 product_events(流水已在 ops.feed_items);delete/retire 恒进;
+    maintenance 仅反补来源进(反补计数依赖其提交/回执链)。
+    """
+    if kind in _RECEIPT_KINDS:
+        return True
+    return kind == "maintenance" and (workflow or "") in _MAINT_LEDGER_WORKFLOWS
 
 
 def record_many(conn, rows: list[dict]) -> int:

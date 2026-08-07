@@ -235,13 +235,15 @@ ORDER_SETTLE = Bitable(
 )
 
 
-# 商品停用/删除表(daily_retire 驱动表):电子表格,运营填 A~D,程序写 E~G。
-# 列序即契约(A=store B=sku C=停用/删除 D=操作原因 E=feedid F=操作日期 G=结果)
+# 商品停用/删除表(product_clear 驱动表):电子表格,运营填 A~D,程序写 E~H。
+# 列序即契约(A=store B=sku C=停用/删除 D=操作原因
+#             E=feedid F=操作日期 G=结果 H=报错)
 RETIRE_SHEET = Spreadsheet(
     name="商品停用删除表",
     token=os.environ.get("FEISHU_RETIRE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_RETIRE_SHEET_ID", ""),
-    columns=("store", "sku", "action", "reason", "feed_id", "op_date", "result"),
+    columns=("store", "sku", "action", "reason",
+             "feed_id", "op_date", "result", "error"),
 )
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;

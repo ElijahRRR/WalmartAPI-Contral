@@ -7,12 +7,13 @@
   python cli.py product_clear -p store=A085朱丽霖
 
 驱动表(registry.RETIRE_SHEET,电子表格,列序即契约):
-  A=store  B=sku  C=停用/删除  D=操作原因 | E=feedid  F=操作日期  G=结果
-  A~D 运营填,E~G 程序写。
+  A=store  B=sku  C=停用/删除  D=操作原因 | E=feedid  F=操作日期  G=结果  H=报错
+  A~D 运营填,E~H 程序写(读写积木在 services/clear_sheet,feed_poll 共用:
+  全局轮询落台账后顺带反哺 G/H,不依赖本工作流再跑一次)。
 
 行状态机:
   E 空 + C 合法        → 待提交(受单店单日上限约束,超限行留到下一轮)
-  E 有 + G 空/处理中    → 轮询 feed 终态,逐 SKU 回写 成功 / 失败:错误码 / 未查到
+  E 有 + G 空/处理中    → 轮询 feed 终态,逐 SKU 回写 G=成功/失败/未查到,H=报错码
   G=失败/未查到 的行    → **不自动重试**(高危写操作;运营核对原因后清空 E 列
                           即重新排队——feeds 层 failed 记录允许同载荷重占)
 
@@ -34,7 +35,8 @@ from datetime import datetime
 
 from api import feeds, feishu
 from registry import db, resources
-from services import feed_track, kpi, product_events, stores as stores_svc
+from services import clear_sheet, feed_track, kpi, product_events, \
+    stores as stores_svc
 
 DANGEROUS = True
 
@@ -43,50 +45,14 @@ logger = logging.getLogger("workflows.product_clear")
 # C 列留空默认删除(所有者定稿 2026-08-06)
 _ACTIONS = {"停用": "RETIRE_ITEM", "下架": "RETIRE_ITEM",
             "删除": "DELETE_ITEM", "": "DELETE_ITEM"}
-_POLLABLE = ("", "处理中")          # G 列这些值才轮询;失败/未查到不自动重试
-_COL_WRITE_START = "E"             # 程序回写区 E:G
-
-
-def _read_rows() -> list[dict]:
-    """输入:无 → 输出:表内全部数据行(含 1 基行号,表头在第 1 行)。"""
-    sheet = resources.RETIRE_SHEET
-    total = feishu.sheet_row_count(sheet)
-    if total < 2:
-        return []
-    values = feishu.sheet_values(sheet, f"A2:G{total}")
-    rows = []
-    for i, raw in enumerate(values):
-        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 7
-        store, sku, action, reason, feed_id, op_date, result = cells[:7]
-        if not (store or sku):
-            continue
-        rows.append({"rownum": i + 2, "store": store, "sku": sku,
-                     "action": action, "reason": reason,
-                     "feed_id": feed_id, "op_date": op_date, "result": result})
-    return rows
-
-
-def _writeback(updates: list[tuple[int, str, str, str]], execute: bool) -> int:
-    """输入:[(行号, feedid, 日期, 结果)] → 输出:写入行数(dry-run 只打印)。"""
-    if not updates:
-        return 0
-    if not execute:
-        for rownum, fid, dt, res in updates[:20]:
-            logger.info("[DRY-RUN] 将回写 第%d行 E=%s F=%s G=%s", rownum, fid, dt, res)
-        if len(updates) > 20:
-            logger.info("[DRY-RUN] …另有 %d 行回写省略", len(updates) - 20)
-        return 0
-    return feishu.sheet_write_ranges(
-        resources.RETIRE_SHEET,
-        [(f"{_COL_WRITE_START}{r}:G{r}", [[fid, dt, res]])
-         for r, fid, dt, res in updates])
 
 
 def _poll_feeds(rows: list[dict], stores_by_name: dict,
                 execute: bool) -> tuple[list, list[str]]:
     """轮询已提交行的 feed 终态 → 逐 SKU 回写结果。"""
     updates, lines = [], []
-    pollable = [r for r in rows if r["feed_id"] and r["result"] in _POLLABLE]
+    pollable = [r for r in rows
+                if r["feed_id"] and r["result"] in clear_sheet.POLLABLE]
     by_feed: dict[str, list[dict]] = {}
     for r in pollable:
         by_feed.setdefault(r["feed_id"], []).append(r)
@@ -112,11 +78,11 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
             continue
         for r in frows:
             outcome, code = sku_status.get(r["sku"], ("missing", ""))
-            result = {"success": "成功", "failed": f"失败:{code}" if code else "失败",
-                      "processing": "处理中", "unknown": "处理中",
-                      "missing": "未查到"}[outcome]
-            if result != r["result"]:
-                updates.append((r["rownum"], r["feed_id"], r["op_date"], result))
+            result = clear_sheet.RESULT_TEXT[outcome]
+            err = code if result == "失败" else ""
+            if result != r["result"] or err != r["error"]:
+                updates.append((r["rownum"], r["feed_id"], r["op_date"],
+                                result, err))
             done += 1
     if by_feed:
         lines.append(f"轮询:{len(by_feed)} 个 feed,{done} 行落定,{still} 行仍处理中")
@@ -159,7 +125,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
     for r in bad:
         why = "动作不识别" if r["action"] not in _ACTIONS else "店铺不识别"
         if r["result"] != why:
-            updates.append((r["rownum"], "", "", why))
+            updates.append((r["rownum"], "", "", why, ""))
     unknown_stores = sorted({r["store"] for r in bad
                              if r["store"] not in stores_by_name})
     if unknown_stores:
@@ -203,7 +169,8 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                     submitted += len(slice_rows)
                     for r in slice_rows:
-                        updates.append((r["rownum"], res["feed_id"], today, "处理中"))
+                        updates.append((r["rownum"], res["feed_id"], today,
+                                        "处理中", ""))
                     # 产品事件账本:提交事件(含操作原因,病历的"医嘱"部分)
                     with db.pg_conn() as conn:
                         product_events.record_many(conn, [
@@ -215,7 +182,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                             for r in slice_rows])
                 elif res["outcome"] == "failed":
                     for r in slice_rows:
-                        updates.append((r["rownum"], "", "", "提交被拒"))
+                        updates.append((r["rownum"], "", "", "提交被拒", ""))
                 else:   # unknown:保持 pending 待启动对账,行不动
                     lines.append(f"⚠ {store_name} {feed_type} 一批 {res['count']} 条"
                                  f"提交结果不确定,已留 pending 待对账")
@@ -231,7 +198,7 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     default_limit = int(params.get("limit", 300))
 
-    rows = _read_rows()
+    rows = clear_sheet.read_rows()
     if not rows:
         return "停用/删除表无数据行"
     only = params.get("store")
@@ -245,7 +212,7 @@ def run(params: dict) -> str:
     updates_a, lines_a = _poll_feeds(rows, stores_by_name, execute)
     updates_b, lines_b = _submit_new(rows, stores_by_name, limits,
                                      default_limit, execute)
-    written = _writeback(updates_a + updates_b, execute)
+    written = clear_sheet.writeback(updates_a + updates_b, execute)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}product_clear:表内 {len(rows)} 行({limits_note})"] \

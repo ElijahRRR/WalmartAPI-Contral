@@ -235,16 +235,22 @@ def run(params: dict) -> str:
                 line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
             lines.append(line)
 
-        if b["relist"]:
-            _submit("MP_MAINTENANCE",
-                    [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
-                     for r in b["relist"]],
-                    b["relist"], "maintenance_submitted", "反补")
-        if b["retire"]:
-            _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
-                    b["retire"], "retire_submitted", "顽固停用")
-        if b["delete"]:
-            _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
-                    b["delete"], "delete_submitted", "删除")
+        # 单店隔离(2026-08-07 生产实证:单店代理 TLS 断线炸掉整轮,
+        # 后面的店全部没轮到):任何异常只跳过该店,其余店继续
+        try:
+            if b["relist"]:
+                _submit("MP_MAINTENANCE",
+                        [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
+                         for r in b["relist"]],
+                        b["relist"], "maintenance_submitted", "反补")
+            if b["retire"]:
+                _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
+                        b["retire"], "retire_submitted", "顽固停用")
+            if b["delete"]:
+                _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
+                        b["delete"], "delete_submitted", "删除")
+        except Exception as e:
+            logger.exception("店铺 %s 提交异常,跳过继续其它店: %s", store_name, e)
+            lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
     lines.append(f"归类事件新记 {n_cat} 条;结果轮询走 feed_poll")
     return "\n".join(lines)

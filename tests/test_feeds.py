@@ -207,6 +207,24 @@ def test_submit_rejected_marks_failed_no_retry(monkeypatch):
     assert any(a and a[0] == "failed" for _, a in _updates(logdb))
 
 
+def test_submit_token_failure_is_definite_failed(monkeypatch):
+    # token/代理阶段断线(2026-08-07 生产实证 SSL EOF):请求未发出=确定未达
+    # → failed 可重占,不走反查三态,不向上抛炸整轮
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+
+    def handler(request):
+        if request.url.path == "/v3/token":
+            raise httpx.ConnectError("SSL: UNEXPECTED_EOF_WHILE_READING")
+        raise AssertionError("token 失败后不应发出任何 feed 请求")
+
+    monkeypatch.setattr(_client, "_build_transport",
+                        lambda proxy: httpx.MockTransport(handler))
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0] == {"feed_id": None, "count": 1, "outcome": "failed"}
+    assert any(a and a[0] == "failed" for _, a in _updates(logdb))
+
+
 def test_submit_network_error_found_adopts_feed(monkeypatch):
     logdb = _LogDB(claim=True)
     _fake_db(monkeypatch, logdb)

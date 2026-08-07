@@ -129,6 +129,35 @@ def test_execute_reports_rejected_and_unknown(monkeypatch):
     assert "删除提交 0" in out
 
 
+def test_execute_isolates_store_failures(monkeypatch):
+    # 单店代理断线不炸整轮(2026-08-07 生产实证):异常店跳过,其余店照常
+    import contextlib
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(ppc.product_events, "record_many",
+                        lambda conn, rows: len(rows))
+    monkeypatch.setattr(ppc.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}, {"name": "T2"}])
+    items = [_item("T1", "S1", "prohibited product policy"),
+             _item("T2", "S2", "prohibited product policy")]
+    monkeypatch.setattr(ppc, "_load_state",
+                        lambda: (items, set(), {}, {}, set(), set()))
+    submitted = []
+
+    def flaky(store, ft, entries, *, workflow=""):
+        if store["name"] == "T1":
+            raise ConnectionError("proxy TLS EOF")
+        submitted.append((store["name"], list(entries)))
+        return [{"feed_id": "F_OK", "count": len(entries),
+                 "outcome": "submitted"}]
+
+    monkeypatch.setattr(ppc.feeds, "submit_feed", flaky)
+    out = ppc.run({"execute": True})
+    assert submitted == [("T2", ["S2"])]
+    assert "⚠ T1:提交异常已跳过" in out and "T2:删除提交 1" in out
+
+
 def test_stubborn_sql_binds_to_listing_generation():
     # 顽固标记绑定当前上架代际:最新事件是(重)上架 → 旧核验失效不再顽固
     assert "item_appeared" in ppc._SQL_STUBBORN

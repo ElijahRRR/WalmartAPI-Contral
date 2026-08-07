@@ -224,10 +224,23 @@ def submit_feed(store: dict, feed_type: str, entries: list, *,
     return results
 
 
+_PRE_FAIL = object()    # token/代理阶段失败的哨兵:feed 请求尚未发出,确定未达
+
+
 def _post(store: dict, feed_type: str, payload: dict):
     _client.rate_acquire(f"feeds.post.{feed_type}", store["client_id"])
-    token = _client.get_token(store["client_id"], store["client_secret"],
-                              store["proxy"])
+    try:
+        token = _client.get_token(store["client_id"], store["client_secret"],
+                                  store["proxy"])
+    except _client.StoreDeadError:
+        raise
+    except Exception as e:
+        # token/代理阶段异常(2026-08-07 生产实证:SOCKS 代理 TLS 握手断线):
+        # 与 POST 网络异常的"不知道到没到"本质不同——请求根本没发出,
+        # 无需反查三态,直接按确定未达处理(failed 可重占,下轮重试)
+        logger.error("feed 提交前置失败(token/代理,请求未发出):%s %s: %s",
+                     store["name"], feed_type, e)
+        return _PRE_FAIL, None, None
     return _client.safe_post_ex(
         f"{_client.base_url()}/v3/feeds", token, store["client_id"],
         store["proxy"], json_body=payload, params={"feedType": feed_type},
@@ -246,6 +259,10 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
 
     status, _, data = _post(store, feed_type, payload)
     n = len(chunk)
+
+    if status is _PRE_FAIL:
+        _log_update(log_id, "failed")
+        return {"feed_id": None, "count": n, "outcome": "failed"}
 
     if status == 200 and data and data.get("feedId"):
         logger.info("feed 提交成功:%s %s %d 条 feedId=%s",

@@ -233,6 +233,8 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+-- 防重语义(2026-08-07 定稿):唯一索引拦的是在途行(pending/submitted);
+-- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗)
 
 CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
     feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)

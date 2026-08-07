@@ -84,6 +84,57 @@ def test_execute_records_events_per_slice(monkeypatch):
     assert sub == [("S0", "FA"), ("S1", "FA"), ("S2", "FB"), ("S3", "FB")]
 
 
+def test_execute_skips_recording_on_dedup(monkeypatch):
+    # dedup=在途防重命中,什么都没提交:不许落 *_submitted 幽灵事件
+    # (反补计数被灌水会导致少一次真实反补就转永久删除),摘要单列跳过数
+    import contextlib
+    from registry import db as _db
+    events = []
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(ppc.product_events, "record_many",
+                        lambda conn, rows: (events.extend(rows), len(rows))[1])
+    monkeypatch.setattr(ppc.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ppc, "_load_state", lambda: (
+        [_item("T1", "S0", "prohibited product policy")],
+        set(), {}, {}, set(), set()))
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, *, workflow="": [
+                            {"feed_id": "F_OLD", "count": 1, "outcome": "dedup"}])
+    out = ppc.run({"execute": True})
+    assert not [e for e in events if e["event"] == "delete_submitted"]
+    assert "删除提交 0" in out and "在途防重跳过 1" in out
+
+
+def test_execute_reports_rejected_and_unknown(monkeypatch):
+    # 提交被拒/结局不确定必须在摘要中可见(危险工作流不许静默假成功)
+    import contextlib
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(ppc.product_events, "record_many",
+                        lambda conn, rows: len(rows))
+    monkeypatch.setattr(ppc.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    items = [_item("T1", f"S{i}", "prohibited product policy") for i in range(2)]
+    monkeypatch.setattr(ppc, "_load_state",
+                        lambda: (items, set(), {}, {}, set(), set()))
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, *, workflow="": [
+                            {"feed_id": None, "count": 1, "outcome": "failed"},
+                            {"feed_id": None, "count": 1, "outcome": "unknown"}])
+    out = ppc.run({"execute": True})
+    assert "提交被拒 1" in out and "结局不确定留 pending 1" in out
+    assert "删除提交 0" in out
+
+
+def test_stubborn_sql_binds_to_listing_generation():
+    # 顽固标记绑定当前上架代际:最新事件是(重)上架 → 旧核验失效不再顽固
+    assert "item_appeared" in ppc._SQL_STUBBORN
+    assert "item_reappeared" in ppc._SQL_STUBBORN
+
+
 def test_dry_run_zero_submissions(monkeypatch):
     monkeypatch.setattr(ppc, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
@@ -92,4 +143,5 @@ def test_dry_run_zero_submissions(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("dry-run 不许提交")))
     out = ppc.run({"execute": False})
-    assert "DRY-RUN" in out and "删除 1" in out and "('S_B', 'B')" in out
+    assert "DRY-RUN" in out and "删除 1" in out
+    assert "类别={B:1}" in out and "删除样本=[('S_B', 'B')]" in out

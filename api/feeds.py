@@ -10,10 +10,14 @@
 - header schema 按 feedType 分发,版本字符串唯一出处 registry.FEED_SPEC_VERSIONS;
 - 切片按「条数+字节」双约束(DELETE_ITEM 官方 400KB,定稿 350KB+2500 条);
 - **三层防重**(安全铁律):①提交前先写 ops.feed_log(status=pending),同
-  (feed_type, store, payload_key) 已存在即拒绝重复提交;②POST 网络异常后
-  find_recent_feed 反查三态,FOUND 收编、NOT_FOUND(30s 双确认)按同一方法
-  补交一次、UNKNOWN 保持 pending 留给启动对账;③工作流启动时对账 pending/
-  submitted 行(query_pending 供工作流用)。
+  (feed_type, store, payload_key) **在途行**(pending/submitted)拒绝重复提交;
+  终态行(done/failed)允许重占——防重拦的是并发/崩溃窗口内的双发,不是
+  时间窗(所有者定稿:不设时间防重窗,重复删除无实害;上一笔已完结后再次
+  提交同载荷是新一轮合法操作,顽固 SKU 每日双 feed 重发即依赖此语义);
+  ②POST 网络异常后 find_recent_feed 反查三态(候选排除 feed_log 已占用的
+  feedId,防同尺寸兄弟切片误收编),FOUND 收编、NOT_FOUND(30s 双确认)按
+  同一方法补交一次、UNKNOWN 保持 pending 留给启动对账;③工作流启动时对账
+  pending/submitted 行(query_pending 供工作流用)。
 - 写操作永不跨方法兜底(CLAUDE.md):补交只用同一 feedType 同一载荷。
 
 本层只做接口适配:哪些 SKU 该删该停是 services/workflows 的事。
@@ -115,8 +119,11 @@ def payload_key(feed_type: str, entries: list) -> str:
 def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
     """输入:防重四元组 → 输出:(log_id, None) 抢占成功 / (None, 既有行 dict)。
 
-    既有行 status='failed'(已确认未达)允许重占回 pending——failed 是唯一
-    可安全重试的终态;pending/submitted/done 一律拒绝重复提交。
+    防重只拦**在途行**:pending(结局不确定,宁停不重)/submitted(feed 处理中)
+    拒绝重复提交;终态行 failed(确认未达)与 done(上一笔已完结)允许重占回
+    pending——所有者定稿:不设时间防重窗,同载荷在上一笔完结后重发是合法新
+    操作(顽固 SKU 每日停用+删除重发、反补第 2 次尝试都依赖此语义;2026-08-07
+    审查修正:此前 done 永久拒绝,导致同载荷第二次反补/顽固重发永远发不出去)。
     """
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -131,11 +138,12 @@ def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
                     "WHERE feed_type = %s AND store = %s AND payload_key = %s",
                     (feed_type, store_name, key))
         prev = cur.fetchone()
-        if prev and prev[1] == "failed":
+        if prev and prev[1] in ("failed", "done"):
             cur.execute("UPDATE ops.feed_log SET status = 'pending', "
-                        "updated_at = now() WHERE id = %s", (prev[0],))
-            logger.info("feed 防重:failed 行重占为 pending(%s %s)",
-                        store_name, feed_type)
+                        "feed_id = NULL, workflow = %s, updated_at = now() "
+                        "WHERE id = %s", (workflow, prev[0]))
+            logger.info("feed 防重:%s 行重占为 pending(%s %s)",
+                        prev[1], store_name, feed_type)
             return prev[0], None
     return None, {"id": prev[0], "status": prev[1], "feed_id": prev[2]}
 
@@ -278,8 +286,29 @@ def find_recent_feed(store: dict, feed_type: str, items_received: int,
     """输入:店铺 + feedType + 精确条数 → 输出:(FOUND/NOT_FOUND/UNKNOWN, feed)。
 
     按 (feedType, itemsReceived 精确数, feedDate 时间窗) 匹配"刚才那笔";
+    **候选排除 ops.feed_log 已占用的 feedId**——同尺寸兄弟切片(如 5000 条
+    删除切成 2500+2500)会满足同样的 (feedType, 条数) 指纹,不排除会把片 2
+    误收编到片 1 的 feed 上,整片静默丢失(2026-08-07 审查修正)。
     NOT_FOUND 需 30s 后二次确认(防沃尔玛索引滞后)。查询自身失败 → UNKNOWN。
     """
+    def _claimed_ids() -> set:
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT feed_id FROM ops.feed_log WHERE store = %s "
+                        "AND feed_type = %s AND feed_id IS NOT NULL",
+                        (store["name"], feed_type))
+            return {r[0] for r in cur.fetchall()}
+
+    def _feed_date_ms(fd):
+        if isinstance(fd, (int, float)):
+            return fd
+        if isinstance(fd, str):
+            try:
+                return datetime.fromisoformat(
+                    fd.replace("Z", "+00:00")).timestamp() * 1000
+            except ValueError:
+                return None
+        return None
+
     def _probe():
         _client.rate_acquire("feeds.get", store["client_id"])
         token = _client.get_token(store["client_id"], store["client_secret"],
@@ -292,10 +321,12 @@ def find_recent_feed(store: dict, feed_type: str, items_received: int,
             return None
         feeds = ((data.get("results") or {}).get("feed")
                  or data.get("feed") or [])
+        claimed = _claimed_ids()
         cutoff = time.time() * 1000 - window_minutes * 60_000
         for f in feeds:
-            fd = f.get("feedDate")
-            fd_ms = fd if isinstance(fd, (int, float)) else None
+            if f.get("feedId") in claimed:
+                continue        # 已被本系统其他提交占用,不是"刚才那笔"
+            fd_ms = _feed_date_ms(f.get("feedDate"))
             if (f.get("itemsReceived") == items_received
                     and (fd_ms is None or fd_ms >= cutoff)):
                 return f

@@ -60,13 +60,58 @@ def test_poll_feed_terminal_writes_ledger(monkeypatch):
     head, out = feed_track.poll_feed(STORE, "F1")
     assert head["feedStatus"] == "PROCESSED"
     assert out == {"A": ("success", ""), "B": ("failed", "ERR_9")}
-    many_sql, rows = conn.sqls[0]
+    sel_sql, _ = conn.sqls[0]
+    assert "SELECT sku, workflow, feed_type, status" in sel_sql  # 先取更新前状态
+    many_sql, rows = conn.sqls[1]
     assert "UPDATE ops.feed_items" in many_sql
     assert ("success", None, "F1", "A") in rows
     assert ("failed", "ERR_9", "F1", "B") in rows
-    miss_sql, args = conn.sqls[1]
+    miss_sql, args = conn.sqls[2]
     assert "'missing'" in miss_sql and args[1] == ["A", "B"]   # 查无的标 missing
     assert done == [("F1", True)]
+
+
+def test_poll_feed_keeps_feed_open_when_sku_processing(monkeypatch, caplog):
+    # feed 终态但个别 SKU 仍 INPROGRESS:不 mark_feed_done,下轮重查
+    # (否则该 SKU 永久卡 submitted,cleanup 在途拦截会永远跳过它)
+    import logging as _logging
+    conn = _Conn()
+    _fake_db(monkeypatch, conn)
+    done = []
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "A", "ingestionStatus": "SUCCESS"},
+        {"sku": "B", "ingestionStatus": "INPROGRESS"}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: done.append(fid))
+    with caplog.at_level(_logging.WARNING, logger="services.feed_track"):
+        _head, out = feed_track.poll_feed(STORE, "F1")
+    assert out["B"] == ("processing", "")
+    assert done == []
+    assert any("仍 processing/unknown" in m for m in caplog.messages)
+
+
+def test_poll_feed_repoll_does_not_duplicate_events(monkeypatch):
+    # 重轮询(上一轮已把 A 落定)只对本轮才落定的 SKU 记回执事件
+    class _MetaConn(_Conn):
+        def fetchall(self):
+            if "SELECT sku, workflow, feed_type, status" in self._last:
+                return [("A", "wf", "DELETE_ITEM", "success"),
+                        ("B", "wf", "DELETE_ITEM", "submitted")]
+            return []
+    conn = _MetaConn()
+    _fake_db(monkeypatch, conn)
+    recorded = []
+    monkeypatch.setattr(feed_track.product_events, "record_many",
+                        lambda c, rows: (recorded.extend(rows), len(rows))[1])
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "A", "ingestionStatus": "SUCCESS"},
+        {"sku": "B", "ingestionStatus": "SUCCESS"}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
+    feed_track.poll_feed(STORE, "F1")
+    assert [e["sku"] for e in recorded] == ["B"]
 
 
 def test_poll_feed_not_terminal_returns_head_and_none(monkeypatch):

@@ -181,8 +181,13 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
 
 1. **先落库**:提交前写 ops.feed_log(status=pending, payload_key=SKU 集合哈希)——
    CLAUDE.md 安全铁律,旧系统三大事故(2026-05-07 写回丢失重删、feed 重复提交)的总解。
+   防重只拦**在途行**(pending/submitted);终态行(done/failed)允许重占再发
+   (2026-08-07 审查修正:所有者定稿"不设时间防重窗",同载荷在上一笔完结后
+   重发是合法新操作——顽固 SKU 每日双 feed 重发、反补第 2 次尝试依赖此语义)。
 2. **反查三态**:网络异常后 GET /v3/feeds 按 (feedType, itemsReceived 精确数, feedDate 时间窗)
    匹配"刚才那笔"→ FOUND/NOT_FOUND/UNKNOWN;NOT_FOUND 还要 30s 后二次确认(防索引滞后)。
+   候选**排除 ops.feed_log 已占用的 feedId**(2026-08-07 审查修正:同尺寸兄弟切片
+   会满足同一 (feedType, 条数) 指纹,不排除会把片 2 误收编到片 1 整片静默丢失)。
    此能力从 MP_ITEM 专用上提为全 feedType 通用。
 3. **启动对账**:进程启动时凡 feed_log 里 pending/submitted 的行,先查沃尔玛实际状态再决定补交。
 

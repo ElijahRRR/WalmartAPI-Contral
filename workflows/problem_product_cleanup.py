@@ -65,9 +65,14 @@ ORDER BY store, sku, occurred_at DESC
 _SQL_STUBBORN = """
 SELECT DISTINCT ON (store, sku) store, sku, event
 FROM catalog.product_events
-WHERE event IN ('delete_verified', 'delete_not_effective')
+WHERE event IN ('delete_verified', 'delete_not_effective',
+                'item_appeared', 'item_reappeared')
 ORDER BY store, sku, occurred_at DESC
 """
+# 顽固标记绑定当前上架代际(2026-08-07 审查修正):最新事件若是
+# item_appeared/item_reappeared,说明商品经历了消失→重上架,旧的
+# delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
+# (否则重上架的同 ASIN 首次出问题就被双 feed 直删,跳过反补机会)。
 _SQL_STATUS = """
 SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
 ORDER BY store, data_date DESC
@@ -181,11 +186,22 @@ def run(params: dict) -> str:
              f"顽固双击 {n['stubborn']}"]
 
     if not execute:
+        # 各店各类别统计 + 按动作分开的样本(人眼闸门的判断依据:
+        # 反补=救活方向,删除=不可逆方向,混排会误导)
         for store, b in sorted(plans.items()):
-            if b["relist"] or b["delete"]:
-                lines.append(f"  {store}:反补 {len(b['relist'])},"
-                             f"删除 {len(b['delete'])},样本="
-                             f"{[(r['sku'], r['category']) for r in (b['delete'] + b['relist'])[:5]]}")
+            if not (b["relist"] or b["delete"] or b["retire"]):
+                continue
+            cats: dict[str, int] = {}
+            for r in b["delete"] + b["relist"]:
+                cats[r["category"]] = cats.get(r["category"], 0) + 1
+            line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
+                    + (f",顽固双击 {len(b['retire'])}" if b["retire"] else "")
+                    + ",类别={" + ",".join(f"{c}:{n}" for c, n in sorted(cats.items())) + "}")
+            if b["delete"]:
+                line += f",删除样本={[(r['sku'], r['category']) for r in b['delete'][:5]]}"
+            if b["relist"]:
+                line += f",反补样本={[(r['sku'], r['category']) for r in b['relist'][:3]]}"
+            lines.append(line)
         return "\n".join(lines)
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
@@ -197,16 +213,27 @@ def run(params: dict) -> str:
             continue
         # 多切片时 submit_feed 按序返回逐片结果,记账必须滑窗对位
         # (与 product_clear._submit_new 同款;[:count] 会把第一片重复记到后续 feed)
+        # 只有 outcome=submitted 才落账:dedup 携带旧 feed_id 但什么都没提交,
+        # 记了就是幽灵事件——反补计数被灌水会导致少一次真实反补就转永久删除
         def _submit(feed_type: str, entries: list, rows: list[dict],
                     event: str, label: str) -> None:
             i = 0
+            n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
             for res in feeds.submit_feed(store, feed_type, entries,
                                          workflow="problem_product_cleanup"):
                 rows_slice = rows[i:i + res["count"]]
                 i += res["count"]
-                if res["feed_id"]:
+                n[res["outcome"]] = n.get(res["outcome"], 0) + len(rows_slice)
+                if res["outcome"] == "submitted" and res["feed_id"]:
                     _record(store_name, event, rows_slice, res["feed_id"])
-            lines.append(f"  {store_name}:{label}提交 {len(rows)}")
+            line = f"  {store_name}:{label}提交 {n['submitted']}"
+            if n["dedup"]:
+                line += f",在途防重跳过 {n['dedup']}"
+            if n["failed"]:
+                line += f",⚠ 提交被拒 {n['failed']}(查日志,不自动重试)"
+            if n["unknown"]:
+                line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
+            lines.append(line)
 
         if b["relist"]:
             _submit("MP_MAINTENANCE",

@@ -64,7 +64,14 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
 
     _STATUS = {"success": "success", "failed": "failed",
                "processing": "submitted", "unknown": "submitted"}
+    n_unresolved = sum(1 for o, _ in results.values()
+                       if o in ("processing", "unknown"))
     with db.pg_conn() as conn, conn.cursor() as cur:
+        # 先取更新前状态:残留 processing/unknown 时 feed 会被重轮询,
+        # 回执事件只对"本轮才落定"的 SKU 记,重轮询不得重复灌账
+        cur.execute("SELECT sku, workflow, feed_type, status FROM ops.feed_items "
+                    "WHERE feed_id = %s", (feed_id,))
+        meta = {sku: (wf, ft, st) for sku, wf, ft, st in cur.fetchall()}
         cur.executemany(
             "UPDATE ops.feed_items SET status = %s, error_code = %s, "
             "resolved_at = now() WHERE feed_id = %s AND sku = %s",
@@ -78,20 +85,24 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         n_missing = cur.rowcount
         # 产品事件账本:逐 SKU 回执落账(success 是沃尔玛的一面之词,
         # 删除的最终真相由 catalog_sync 观测核验)
-        cur.execute("SELECT sku, workflow, feed_type FROM ops.feed_items "
-                    "WHERE feed_id = %s", (feed_id,))
-        meta = {sku: (wf, ft) for sku, wf, ft in cur.fetchall()}
         product_events.record_many(conn, [
             {"sku": sku, "store": store["name"],
              "event": f"{product_events.feed_kind(meta[sku][1])}_feed_{o}",
              "source": meta[sku][0] or "feed_poll",
              "error_code": code or None, "detail": {"feed_id": feed_id}}
             for sku, (o, code) in results.items()
-            if sku in meta and o in ("success", "failed")])
+            if sku in meta and o in ("success", "failed")
+            and meta[sku][2] == "submitted"])
     if n_missing:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)
-    feeds.mark_feed_done(feed_id, head.get("feedStatus") == "PROCESSED")
+    if n_unresolved:
+        # feed 终态但个别 SKU 仍 INPROGRESS/未知:feed_log 保持 submitted,
+        # 下轮再查——否则这些行永久卡 submitted,cleanup 在途拦截会永远跳过它们
+        logger.warning("feed %s 已终态但 %d 个 SKU 仍 processing/unknown,"
+                       "保持在途下轮重查", feed_id, n_unresolved)
+    else:
+        feeds.mark_feed_done(feed_id, head.get("feedStatus") == "PROCESSED")
     return head, results
 
 

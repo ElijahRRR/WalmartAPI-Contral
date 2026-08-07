@@ -102,8 +102,8 @@
       + SPEC 候选(位数路由+zfill+退化码拒查)+ 按店打包 + 单店隔离
       + match_submitted/回执进事件账本(sku≠asin 登记例外)
 - [x] feed_poll 反哺器第三行:跟卖表 J/K 回填
-- [ ] ⚠ **--execute 前置:对拍**——Item 字段形态(price/ShippingWeight)与
-      SKU 生成规则需旧系统 feed 备份(match_listing/logs/match_*.json)
-      核对(services/match_feed.py 两处标注);dry-run 会打印首条完整
-      Item 载荷供比对
-- [ ] 生产验收:dry-run → 单店试点 → feed_poll 回填 → 验收
+- [x] **对拍定稿**(2026-08-07,所有者提供旧 feed 备份):header 与五字段
+      全部命中;condition 缺省补 New;SKU=旧系统人工编号(所有者澄清)→
+      新系统 B 列人工优先、留空按其格式 PHUMWMT+YYYYMMDD+序号 自动续号
+      (序号自 ops.feed_items 续,人工行不占号)
+- [ ] 生产验收:.env 两 sheet_id → dry-run → 单店试点 → feed_poll 回填 → 验收

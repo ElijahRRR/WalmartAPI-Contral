@@ -35,7 +35,7 @@ def put_price(store: dict, sku: str, amount: float) -> tuple[bool, str]:
         raise _client.StoreDeadError(store["name"], status)
     if status == 200:
         return True, ""
-    why = f"HTTP {status}: {str(data)[:200]}"
+    why = f"HTTP {status}" + (f": {str(data)[:200]}" if data else "")
     logger.warning("PUT /v3/price 失败(%s %s → %s): %s",
                    store["name"], sku, amount, why)
     return False, why

@@ -99,7 +99,7 @@ def put_inventory(store: dict, sku: str, qty: int) -> tuple[bool, str]:
         raise _client.StoreDeadError(store["name"], status)
     if status == 200:
         return True, ""
-    why = f"HTTP {status}: {str(data)[:200]}"
+    why = f"HTTP {status}" + (f": {str(data)[:200]}" if data else "")
     logger.warning("PUT /v3/inventory 失败(%s %s → %s): %s",
                    store["name"], sku, qty, why)
     return False, why

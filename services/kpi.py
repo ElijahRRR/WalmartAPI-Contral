@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -79,43 +80,94 @@ def _find_key(node, key):
     return None
 
 
+def _find_all(node, key, path="$"):
+    """输入:JSON 树 + 键名 → 输出:[(路径, 值)] 全部出现位置(诊断/多值择优用)。"""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}"
+            if k == key:
+                out.append((p, v))
+            out.extend(_find_all(v, key, p))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_find_all(v, key, f"{path}[{i}]"))
+    return out
+
+
+# 结算响应里要盯的键(settle_debug 全量打点;回款字段以旧表反推修正时看这里)
+_SETTLE_DEBUG_KEYS = (
+    "storeFrontUrl", "scheduledSettlementAmount", "totalPayable",
+    "payableAmount", "closingBalance", "reserve", "reserveToDate",
+    "holdAmount", "scheduledSettlementDate", "paymentStatus", "partnerId",
+    "sellerStatus", "paymentProcessor", "settleCycle")
+
+
+def settlement_debug(statement: dict) -> str:
+    """输入:payment/statement 原始响应 → 输出:关键键全部出现位置的报告。
+
+    诊断"递归找键命中错节点"类问题:同名键多次出现时,extract_settlement
+    的深度优先第一个可能是空值/非本期——本报告把每个键的所有 (路径, 值)
+    列出来,对着旧表值即可反推正确路径。
+    """
+    lines = [f"响应顶层: {type(statement).__name__}"
+             + (f" keys={sorted(statement.keys())}" if isinstance(statement, dict) else "")]
+    for key in _SETTLE_DEBUG_KEYS:
+        hits = _find_all(statement, key)
+        if not hits:
+            lines.append(f"  {key}: (无)")
+        else:
+            for p, v in hits[:6]:
+                sv = str(v)
+                lines.append(f"  {key} @ {p} = {sv[:120]}")
+            if len(hits) > 6:
+                lines.append(f"  {key}: …共 {len(hits)} 处")
+    return "\n".join(lines)
+
+
 def extract_settlement(statement: dict) -> dict:
     """输入:payment/statement 原始响应 → 输出:结算相关 KPI 字段 dict。
 
-    ⚠对拍校准点:『本期回款』的取值字段旧代码未在摸底文档留痕,此处按
-    scheduledSettlementAmount > totalPayable > (期末余额-备用金) 的优先级取,
-    首轮对拍若与旧表不一致,以旧表反推字段后修正此函数。
+    2026-08-08 旧代码实证定稿(fetch_walmart_performance.fetch_payment_statement,
+    弃用此前的字段猜测链):结构 = 顶层 partnerId + payload.{sellerInfo,
+    accountSummary, transactionDetails.{saleAggregate,refundDetails}};
+    sellerId = sellerInfo.storeFrontUrl **先 URL 解码**再正则 /seller/(\\d+)
+    (URL 是百分号编码的,不解码永远匹配不上——2026-08-08 全店空白事故);
+    **本期回款 = closingBalance − reserve − holdAmount**;
+    paymentStatus 在 sellerInfo 里。递归查找仅作路径兜底。
     """
-    # 2026-08-06 对拍实证:固定顶层路径取不到(真实响应嵌套更深),partner_id/
-    # paymentStatus 靠递归搜索命中 → 所有字段统一改递归查找,不再假设层级
-    acct = _find_key(statement, "accountSummary") or {}
-    seller_info = _find_key(statement, "sellerInfo") or {}
-    url = str(_find_key(statement, "storeFrontUrl") or "")
-    m = _SELLER_ID_RE.search(url)
+    payload = (statement.get("payload") if isinstance(statement, dict) else None) \
+        or _find_key(statement, "payload") or {}
+    seller_info = payload.get("sellerInfo") or _find_key(statement, "sellerInfo") or {}
+    acct = payload.get("accountSummary") or _find_key(statement, "accountSummary") or {}
+    td = payload.get("transactionDetails") \
+        or _find_key(statement, "transactionDetails") or {}
+    sale_agg = td.get("saleAggregate") or {}
+    refund = td.get("refundDetails") or {}
     if not acct:
         logger.warning("payment/statement 找不到 accountSummary,顶层键:%s",
                        sorted(statement.keys()) if isinstance(statement, dict) else type(statement))
 
-    closing = _num(_find_key(acct, "closingBalance"))
-    reserve_to_date = abs(_num(_find_key(acct, "reserveToDate")))
-    payout = None
-    for key in ("scheduledSettlementAmount", "totalPayable", "payableAmount"):
-        v = _find_key(statement, key)
-        if v is not None:
-            payout = _num(v)
-            break
-    if payout is None:
-        payout = closing - max(_num(_find_key(acct, "reserve")), 0.0)
+    url = urllib.parse.unquote(str(seller_info.get("storeFrontUrl") or ""))
+    m = _SELLER_ID_RE.search(url)
+    if not m:       # 路径兜底:扫全部 storeFrontUrl(同样先解码)
+        for _, u in _find_all(statement, "storeFrontUrl"):
+            m = _SELLER_ID_RE.search(urllib.parse.unquote(str(u or "")))
+            if m:
+                break
 
-    payment_status = str(statement.get("paymentStatus")
+    closing = _num(acct.get("closingBalance"))
+    reserve = _num(acct.get("reserve"))
+    hold = _num(acct.get("holdAmount"))
+    payout = closing - reserve - hold
+    reserve_to_date = abs(_num(acct.get("reserveToDate")))
+
+    payment_status = str(seller_info.get("paymentStatus")
                          or _find_key(statement, "paymentStatus") or "")
     is_active = payment_status.upper() == "ACTIVE"
     if not is_active or payout < 0:     # 非 ACTIVE 实际不会打款;负值归 0
         payout = 0.0
     no_hold = bool(is_active and payout >= closing)
-
-    sale_agg = _find_key(statement, "saleAggregate") or {}
-    refund = _find_key(statement, "refundDetails") or {}
 
     return {
         "partner_id": str(statement.get("partnerId")
@@ -129,9 +181,9 @@ def extract_settlement(statement: dict) -> dict:
         "closing_balance": closing,
         "reserve_to_date": reserve_to_date,
         "payout": round(payout, 2),
-        "payout_date": str(_find_key(acct, "scheduledSettlementDate") or ""),
-        "payment_processor": str(_find_key(acct, "paymentProcessor") or ""),
-        "settle_cycle": str(_find_key(acct, "settleCycle") or ""),
+        "payout_date": str(acct.get("scheduledSettlementDate") or ""),
+        "payment_processor": str(acct.get("paymentProcessor") or ""),
+        "settle_cycle": str(acct.get("settleCycle") or ""),
         "no_hold": no_hold,
     }
 
@@ -262,6 +314,139 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
     # 是"报表本来就空"还是"版式假设错了"(2026-08-06 生产校准期,稳定后可降 debug)
     logger.info("报表 %s 解析:%d 行产出,sheets=%s", metric, len(rows), sheet_stats)
     return rows
+
+
+# ── 旧「店铺KPI」历史 sheet → ops.store_kpi_daily(kpi_history_import 用)────
+# 表头关键词 → 目标字段,**顺序即优先级**(更具体的在前:上期回款 > 回款日期 >
+# 回款;退款率 > 退款金额)。真实表头对不上的列进 unmapped 报告,人眼校准。
+_HIST_HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # 具体在前,泛化在后:「上期回款」>「回款日期」>「回款」;「退款率」>「退款」;
+    # 「店铺状态」>「店铺」;「本期销售」>「销售额」;「回款日期」必须先于「日期」
+    ("prev_payout", ("上期回款",)),
+    ("payout_date", ("回款日期", "回款日")),
+    ("refund_rate", ("退款率",)),
+    ("store_status", ("店铺状态",)),
+    ("period_sales", ("本期销售", "账期销售")),
+    ("srr_rate", ("卖家回复", "srr")),      # 先于 seller_name:「卖家回复率」含「卖家」
+    ("data_date", ("日期",)),
+    ("store", ("店铺名", "店铺")),
+    ("seller_name", ("卖家名称", "卖家")),
+    ("partner_id", ("partner",)),
+    ("seller_id", ("seller",)),
+    ("payment_status", ("支付状态",)),
+    ("sales_status", ("销售状态",)),
+    ("items_online", ("在线商品", "在线")),
+    ("items_in_stock", ("有库存",)),
+    ("items_out_stock", ("无库存",)),
+    ("orders_count", ("昨日出单", "出单")),
+    ("sales_amount", ("昨日销售额", "销售额")),
+    ("otd_rate", ("准时送达", "otd")),
+    ("cancel_rate", ("取消",)),
+    ("vtr_rate", ("有效追踪", "vtr")),
+    ("negative_rate", ("差评",)),
+    ("return_rate", ("退货",)),
+    ("inr_rate", ("未收到", "inr")),
+    ("commission", ("佣金",)),
+    ("refund_amount", ("退款",)),
+    ("closing_balance", ("期末余额", "余额")),
+    ("reserve_to_date", ("备用金", "预留")),
+    ("payout", ("回款",)),
+    ("payment_processor", ("收款方", "支付处理", "processor")),
+    ("settle_cycle", ("结算周期",)),
+    ("no_hold", ("hold", "押款")),
+)
+
+_HIST_INT_FIELDS = {"items_online", "items_in_stock", "items_out_stock",
+                    "orders_count"}
+_HIST_NUM_FIELDS = {"sales_amount", "otd_rate", "cancel_rate", "vtr_rate",
+                    "srr_rate", "refund_rate", "negative_rate", "return_rate",
+                    "inr_rate", "period_sales", "commission", "refund_amount",
+                    "closing_balance", "reserve_to_date", "payout", "prev_payout"}
+
+_HIST_FIELDS = tuple(f for f, _ in _HIST_HEADER_MAP if f not in ("data_date", "store"))
+
+
+def map_history_header(header: list) -> tuple[dict[int, str], list[str]]:
+    """输入:表头行 → 输出:({列下标: 字段名}, 未映射表头列表)。
+
+    关键词包含匹配(casefold),每个字段只认第一个命中的列(重复表头进 unmapped)。
+    """
+    mapping: dict[int, str] = {}
+    taken: set[str] = set()
+    unmapped: list[str] = []
+    for i, h in enumerate(header):
+        text = str(h or "").strip().casefold()
+        if not text:
+            continue
+        for field, kws in _HIST_HEADER_MAP:
+            if field not in taken and any(k in text for k in kws):
+                mapping[i] = field
+                taken.add(field)
+                break
+        else:
+            unmapped.append(str(h).strip())
+    return mapping, unmapped
+
+
+def _hist_date(v) -> str | None:
+    """输入:单元格值 → 输出:'YYYY-MM-DD' 或 None(解析失败)。"""
+    s = str(v or "").strip().replace("/", "-").replace(".", "-")
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    except ValueError:
+        return None
+
+
+def _hist_value(field: str, v):
+    """输入:字段名 + 单元格值 → 输出:入库值(空串→None,$,%千分位清理)。"""
+    s = str(v if v is not None else "").strip()
+    if not s:
+        return None
+    if field == "no_hold":
+        if s in ("是", "true", "True", "TRUE", "Yes", "✓", "√", "不押款"):
+            return True     # 旧表该列实际取值:"不押款" / 空
+        if s in ("否", "false", "False", "FALSE", "No", "×"):
+            return False
+        return None
+    if field in _HIST_INT_FIELDS or field in _HIST_NUM_FIELDS:
+        cleaned = s.replace("$", "").replace(",", "").replace("%", "").strip()
+        try:
+            num = float(cleaned)
+        except ValueError:
+            return None
+        return int(num) if field in _HIST_INT_FIELDS else num
+    return s
+
+
+def parse_history_rows(store: str, header: list, rows: list[list]
+                       ) -> tuple[list[dict], int]:
+    """输入:店铺名(=sheet 标题,权威)+ 表头 + 数据行 → 输出:(入库行列表, 跳过数)。
+
+    店铺一律取 sheet 标题(店铺列若有只作参考不用);日期解析失败的行跳过计数。
+    """
+    mapping, _ = map_history_header(header)
+    out, skipped = [], 0
+    for raw in rows:
+        rec: dict = {f: None for f in _HIST_FIELDS}
+        rec["store"] = store
+        rec["data_date"] = None
+        for i, field in mapping.items():
+            v = raw[i] if i < len(raw) else None
+            if field == "data_date":
+                rec["data_date"] = _hist_date(v)
+            elif field == "store":
+                continue
+            else:
+                rec[field] = _hist_value(field, v)
+        if not rec["data_date"]:
+            skipped += 1
+            continue
+        out.append(rec)
+    return out, skipped
 
 
 def dedup_key(row: dict) -> tuple:

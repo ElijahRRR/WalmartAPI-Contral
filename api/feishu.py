@@ -424,6 +424,20 @@ def _sheet_token(s: Spreadsheet) -> str:
     return _wiki_token_cache[s.token]
 
 
+def sheet_list(sheet: Spreadsheet) -> list[tuple[str, str]]:
+    """输入:电子表格登记条目(用其 token)→ 输出:[(sheet_id, title)] 全部子表。
+
+    枚举 workbook 内所有 sheet(kpi_history_import 用它发现每店历史页;
+    店铺 sheet 的 sheet_id 运行时才可知,不进 registry)。
+    """
+    s = sheet  # 不 require():只需 token,sheet_id 允许为空
+    if not s.token:
+        raise LookupError(f"电子表格「{s.name}」尚未登记 token")
+    data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{_sheet_token(s)}/sheets/query")
+    return [(m.get("sheet_id") or "", m.get("title") or "")
+            for m in data.get("sheets") or []]
+
+
 def sheet_row_count(sheet: Spreadsheet) -> int:
     """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
     s = sheet.require()
@@ -531,6 +545,23 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 #  通知
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int:
+    """输入:登记条目 + [(A1范围, formatter)](如 ('A2:A500','yyyy/MM/dd'))→ 输出:范围数。
+
+    设置单元格数字/日期显示格式(styles_batch_update)。日期列须配合写入
+    日期序列值(1899-12-30 起算天数)才会显示为日期。
+    """
+    s = sheet.require()
+    if not items:
+        return 0
+    _call("PUT",
+          f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/styles_batch_update",
+          json_body={"data": [
+              {"ranges": [f"{s.sheet_id}!{rng}"], "style": {"formatter": fmt}}
+              for rng, fmt in items]})
+    return len(items)
 
 
 def notify(text: str) -> bool:

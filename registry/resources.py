@@ -248,6 +248,53 @@ ORDER_SETTLE = Bitable(
 )
 
 
+# 店铺KPI 电子表格(旧系统存量 workbook,两个用途,PG 权威不变):
+# ① 「总览」页(sheet_id 登记)= **影刀输入投影**:一店一行,影刀 RPA 读它
+#    决定抓哪些卖家页(E 列 sellerId 是其输入;空 sellerId 行会让整条 RPA
+#    崩溃——A147 事故,写入前必须过滤)。daily_report yingdao=1 时只写 A:H。
+# ② 每店一个 sheet(title=店铺名)= 旧系统 KPI 历史(按日期一行累积),
+#    kpi_history_import 的数据源;店铺页 sheet_id 运行时经 sheet_list 发现。
+# columns 前 8 列即总览 A~H 列序;历史导入按表头关键词映射,不按列位。
+KPI_SHEET = Spreadsheet(
+    name="店铺KPI",
+    token=os.environ.get("FEISHU_KPI_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_KPI_OVERVIEW_SHEET_ID", ""),
+    columns=("data_date", "store", "seller_name", "partner_id", "seller_id",
+             "store_status", "payment_status", "sales_status"),
+)
+
+
+# 店铺KPI看板(新表格,所有者 2026-08-08 定稿):人看的投影全在这里,
+# 旧「店铺KPI」表 72 张分页停更归档。两个工作表同一 workbook:
+# 「总览」= 每店最新一行(全 32 列)、「历史」= 全店合一近 N 天窗口。
+# 列序 = _KPI_BOARD_COLUMNS(与 ops.store_kpi_daily 字段一一对应,
+# 表头沿用旧表真实中文名,运营零学习成本)。整表重写,PG 权威可随时重建。
+_KPI_BOARD_TOKEN = os.environ.get("FEISHU_KPI_BOARD_TOKEN", "")
+_KPI_BOARD_COLUMNS = (
+    "data_date", "store", "seller_name", "partner_id", "seller_id",
+    "store_status", "payment_status", "sales_status", "items_online",
+    "items_in_stock", "items_out_stock", "orders_count", "sales_amount",
+    "otd_rate", "cancel_rate", "vtr_rate", "srr_rate", "refund_rate",
+    "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
+    "refund_amount", "closing_balance", "reserve_to_date", "payout",
+    "payout_date", "payment_processor", "settle_cycle", "no_hold",
+    "prev_payout")
+
+KPI_BOARD_OVERVIEW = Spreadsheet(
+    name="KPI看板-总览",
+    token=_KPI_BOARD_TOKEN,
+    sheet_id=os.environ.get("FEISHU_KPI_BOARD_OVERVIEW_ID", ""),
+    columns=_KPI_BOARD_COLUMNS,
+)
+
+KPI_BOARD_HISTORY = Spreadsheet(
+    name="KPI看板-历史",
+    token=_KPI_BOARD_TOKEN,
+    sheet_id=os.environ.get("FEISHU_KPI_BOARD_HISTORY_ID", ""),
+    columns=_KPI_BOARD_COLUMNS,
+)
+
+
 # 商品停用/删除表(product_clear 驱动表):电子表格,运营填 A~D,程序写 E~H。
 # 列序即契约(A=store B=sku C=停用/删除 D=操作原因
 #             E=feedid F=操作日期 G=结果 H=报错)

@@ -19,6 +19,9 @@ settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
   ——消掉旧系统「清空飞书全表再重写,中途崩溃=历史全丢」的最大风险
 - 在线商品/有库存/无库存 三列直接读 catalog.walmart_items(catalog_sync 的产出),
   不再翻页调 /v3/items——中央库复用,省 60/min 配额
+- 昨日出单/销售额两列改读 orders.order_lines(所有者认可 2026-08-08):当前为
+  双算对拍期——API 现拉仍是权威值,库算值只记日志差异;连续对平后摘除 API
+  拉取,order_sync 成为本工作流的调度前置
 - 影刀 RPA 本期不 spawn:只读旧系统产出的 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补——旧系统反直觉规则,原样保留);切换期由旧系统 8 点驱动影刀
 - 问题订单 xlsx 的逐指标列映射旧代码不可得,首版按表头关键词归一并保留原始行
@@ -139,6 +142,23 @@ def _pg_item_counts(store_name: str) -> tuple[int, int, int]:
     return int(row[0]), int(row[1]), int(row[2])
 
 
+def _pg_order_stats(store_name: str, win_start: str, win_end: str) -> tuple[int, float]:
+    """输入:店铺 + 24h 窗口(ISO UTC)→ 输出:(订单数, 销售额),读 orders.order_lines。
+
+    对拍影子:与 KPI 阶段 API 现拉的单量/销售额同窗口双算。口径对齐 API 侧:
+    订单数 = 窗口内下单的 PO 数(meta.totalCount 的库等价 = COUNT(DISTINCT po_id)),
+    销售额 = 行 PRODUCT 费用合计(order_lines.product_amount 同源)。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(DISTINCT po_id), coalesce(sum(product_amount), 0)"
+            " FROM orders.order_lines"
+            " WHERE store = %s AND order_date >= %s AND order_date < %s",
+            (store_name, win_start, win_end))
+        row = cur.fetchone()
+    return int(row[0]), round(float(row[1]), 2)
+
+
 def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
                        names: dict, statuses: dict) -> dict:
     """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map → 输出:一行 KPI dict。"""
@@ -180,8 +200,23 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         stats["total"] = 0
 
     online, in_stock, out_stock = _pg_item_counts(name)
+
+    # 订单列双算对拍(对平后此段与上面的 iter_orders 拉取一并摘除,改用库值)
+    orders_diff = None
+    try:
+        db_orders, db_sales = _pg_order_stats(name, win_start, win_end)
+        api_orders = stats.get("total", 0)
+        if db_orders != api_orders or abs(db_sales - sales) > 0.01:
+            orders_diff = (f"API {api_orders} 单/${sales:.2f}"
+                           f" vs 库 {db_orders} 单/${db_sales:.2f}")
+            logger.info("对拍[订单列] %s:%s", name, orders_diff)
+    except Exception as e:
+        orders_diff = f"库算失败:{e}"
+        logger.warning("对拍[订单列] %s 库算失败: %s", name, e)
+
     sid = settle["seller_id"]
     return {
+        "_orders_diff": orders_diff,
         "store": name, "data_date": data_date,
         "seller_name": names.get(sid) or None,
         "sales_status": statuses.get(sid) or None,
@@ -210,7 +245,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
 def _phase_kpi(store_list: list[dict], data_date) -> str:
     win_start, win_end = kpi.sales_window_utc()
     names, statuses = _load_frontend()
-    ok, failed = [], []
+    ok, failed, diffs = [], [], []
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
                             names, statuses): s["name"] for s in store_list}
@@ -218,6 +253,8 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
             name = futs[f]
             try:
                 row = f.result()
+                if row.pop("_orders_diff"):
+                    diffs.append(name)
                 with db.pg_conn() as conn:
                     conn.execute(_KPI_UPSERT, row)
                 ok.append(name)
@@ -228,6 +265,8 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
                 logger.exception("店铺 %s KPI 采集失败: %s", name, e)
                 failed.append(name)
     line = f"KPI:{len(ok)}/{len(store_list)} 店入库(窗口 {win_start}~{win_end})"
+    if diffs:
+        line += f",订单列对拍差异 {len(diffs)} 店(详见日志):{','.join(diffs)}"
     if failed:
         line += f",失败:{','.join(failed)}"
     return line

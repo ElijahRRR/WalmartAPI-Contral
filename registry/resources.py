@@ -264,6 +264,37 @@ KPI_SHEET = Spreadsheet(
 )
 
 
+# 店铺KPI看板(新表格,所有者 2026-08-08 定稿):人看的投影全在这里,
+# 旧「店铺KPI」表 72 张分页停更归档。两个工作表同一 workbook:
+# 「总览」= 每店最新一行(全 32 列)、「历史」= 全店合一近 N 天窗口。
+# 列序 = _KPI_BOARD_COLUMNS(与 ops.store_kpi_daily 字段一一对应,
+# 表头沿用旧表真实中文名,运营零学习成本)。整表重写,PG 权威可随时重建。
+_KPI_BOARD_TOKEN = os.environ.get("FEISHU_KPI_BOARD_TOKEN", "")
+_KPI_BOARD_COLUMNS = (
+    "data_date", "store", "seller_name", "partner_id", "seller_id",
+    "store_status", "payment_status", "sales_status", "items_online",
+    "items_in_stock", "items_out_stock", "orders_count", "sales_amount",
+    "otd_rate", "cancel_rate", "vtr_rate", "srr_rate", "refund_rate",
+    "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
+    "refund_amount", "closing_balance", "reserve_to_date", "payout",
+    "payout_date", "payment_processor", "settle_cycle", "no_hold",
+    "prev_payout")
+
+KPI_BOARD_OVERVIEW = Spreadsheet(
+    name="KPI看板-总览",
+    token=_KPI_BOARD_TOKEN,
+    sheet_id=os.environ.get("FEISHU_KPI_BOARD_OVERVIEW_ID", ""),
+    columns=_KPI_BOARD_COLUMNS,
+)
+
+KPI_BOARD_HISTORY = Spreadsheet(
+    name="KPI看板-历史",
+    token=_KPI_BOARD_TOKEN,
+    sheet_id=os.environ.get("FEISHU_KPI_BOARD_HISTORY_ID", ""),
+    columns=_KPI_BOARD_COLUMNS,
+)
+
+
 # 商品停用/删除表(product_clear 驱动表):电子表格,运营填 A~D,程序写 E~H。
 # 列序即契约(A=store B=sku C=停用/删除 D=操作原因
 #             E=feedid F=操作日期 G=结果 H=报错)

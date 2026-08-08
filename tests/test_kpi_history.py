@@ -65,6 +65,21 @@ def test_parse_history_rows():
     assert r2["data_date"] == "2026-08-02" and r2["orders_count"] is None
 
 
+def test_board_header_columns_aligned():
+    from registry import resources
+    from workflows import daily_report as dr
+    # 看板中文表头与 registry 列序一一对应(32 列),且与导入映射对称:
+    # 每个表头都能被 _HIST_HEADER_MAP 映射回同一个字段
+    assert len(dr._BOARD_HEADER) == len(resources.KPI_BOARD_OVERVIEW.columns) == 32
+    mapping, unmapped = kpi.map_history_header(dr._BOARD_HEADER)
+    assert unmapped == []
+    for i, field in mapping.items():
+        assert resources.KPI_BOARD_OVERVIEW.columns[i] == field
+    assert dr._board_cell(None) == ""
+    assert dr._board_cell(True) == "是" and dr._board_cell(False) == "否"
+    assert dr._board_cell(12.5) == "12.5"
+
+
 def test_yingdao_freshness():
     trigger = datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc)
     fresh = {"scraped_at": "2026-08-08T08:07:05+08:00"}     # 00:07 UTC > trigger

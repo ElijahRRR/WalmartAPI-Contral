@@ -7,6 +7,7 @@
   python cli.py daily_report -p phase=problems     # 问题订单(兼写订单中心 perf_events)
   python cli.py daily_report -p phase=settlement   # 对账明细 → orders.settlement_lines
   python cli.py daily_report -p phase=settlement -p periods=99   # 首次可放开账期上限(默认 6)
+  python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
   python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/problems/settlement 阶段)
 
@@ -18,6 +19,10 @@ settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
 与旧系统的关键差异(设计决策见 docs/legacy_survey.md #daily_report 迁移建议):
 - PG 是权威(ops.store_kpi_daily / ops.perf_problem_orders),飞书降级为展示层
   ——消掉旧系统「清空飞书全表再重写,中途崩溃=历史全丢」的最大风险
+- KPI 看板(所有者定稿 2026-08-08):新表格两页——总览(每店最新一行全 32 列)
+  + 历史(全店合一近 90 天),整表重写可随时重建;旧「店铺KPI」表 72 张
+  每店分页**停更归档**(仅剩两个角色:kpi_history_import 的只读导入源、
+  yingdao=1 的影刀输入 A:H——影刀 RPA 内部读旧表,切换需先改 RPA 再换 env)
 - 在线商品/有库存/无库存 三列直接读 catalog.walmart_items(catalog_sync 的产出),
   不再翻页调 /v3/items——中央库复用,省 60/min 配额
 - 昨日出单/销售额两列改读 orders.order_lines(所有者认可 2026-08-08):当前为
@@ -486,6 +491,49 @@ def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
     return line
 
 
+# 看板表头:沿用旧表真实中文列名(与 kpi._HIST_HEADER_MAP 对称,运营零学习成本)
+_BOARD_HEADER = ["日期", "店铺", "卖家名称", "partnerId", "sellerId", "店铺状态",
+                 "支付状态", "销售状态", "在线商品", "有库存", "无库存", "昨日出单",
+                 "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
+                 "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
+                 "账期销售额($)", "佣金", "退款金额", "期末余额", "迄今备用金($)",
+                 "回款", "回款日", "收款方", "结算周期", "无Hold", "上期回款"]
+
+
+def _board_cell(v) -> str:
+    """输入:PG 值 → 输出:看板单元格文本(None→空,bool→是/否)。"""
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    return str(v)
+
+
+def _phase_board(history_days: int) -> str:
+    """输入:历史窗口天数 → 输出:结果行。PG → 新 KPI 看板两页(整表重写)。
+
+    总览 = 每店最新一行;历史 = 全店合一近 N 天(日期降序)。旧「店铺KPI」
+    表 72 张分页停更归档(所有者定稿 2026-08-08),影刀输入除外(yingdao=1
+    仍写旧总览 A:H——影刀 RPA 内部读旧表,切换需改 RPA 后换 env)。
+    """
+    cols = ", ".join(resources.KPI_BOARD_OVERVIEW.columns)
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT DISTINCT ON (store) {cols} FROM ops.store_kpi_daily"
+                    " ORDER BY store, data_date DESC")
+        overview = cur.fetchall()
+        cur.execute(f"SELECT {cols} FROM ops.store_kpi_daily"
+                    " WHERE data_date >= current_date - %s"
+                    " ORDER BY data_date DESC, store", (history_days,))
+        history = cur.fetchall()
+    n1 = feishu.sheet_overwrite(
+        resources.KPI_BOARD_OVERVIEW,
+        [_BOARD_HEADER] + [[_board_cell(v) for v in r] for r in overview])
+    n2 = feishu.sheet_overwrite(
+        resources.KPI_BOARD_HISTORY,
+        [_BOARD_HEADER] + [[_board_cell(v) for v in r] for r in history])
+    return (f"看板:总览 {n1 - 1} 店,历史 {n2 - 1} 行(近 {history_days} 天)")
+
+
 def _phase_push(data_date, do_push: bool) -> str:
     """输入:日期 + 是否真发 → 输出:结果行。读 PG 生成日报 markdown。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -526,8 +574,8 @@ def _phase_push(data_date, do_push: bool) -> str:
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "problems", "settlement", "push"):
-        return f"phase 只接受 all/kpi/problems/settlement/push,收到:{phase}"
+    if phase not in ("all", "kpi", "problems", "settlement", "board", "push"):
+        return f"phase 只接受 all/kpi/problems/settlement/board/push,收到:{phase}"
     data_date = datetime.now(kpi.CN_TZ).date()
 
     lines = []
@@ -544,6 +592,11 @@ def run(params: dict) -> str:
         if phase in ("all", "settlement"):
             lines.append(_phase_settlement(
                 store_list, int(params.get("periods", 6))))
+    if phase in ("all", "board"):
+        try:
+            lines.append(_phase_board(int(params.get("days", 90))))
+        except LookupError as e:
+            lines.append(f"看板:未登记跳过({e})")
     if phase == "push":
         do_push = str(params.get("push", "")) in ("1", "true", "yes")
         lines.append(_phase_push(data_date, do_push))

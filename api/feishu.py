@@ -547,6 +547,23 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int:
+    """输入:登记条目 + [(A1范围, formatter)](如 ('A2:A500','yyyy/MM/dd'))→ 输出:范围数。
+
+    设置单元格数字/日期显示格式(styles_batch_update)。日期列须配合写入
+    日期序列值(1899-12-30 起算天数)才会显示为日期。
+    """
+    s = sheet.require()
+    if not items:
+        return 0
+    _call("PUT",
+          f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/styles_batch_update",
+          json_body={"data": [
+              {"ranges": [f"{s.sheet_id}!{rng}"], "style": {"formatter": fmt}}
+              for rng, fmt in items]})
+    return len(items)
+
+
 def notify(text: str) -> bool:
     """输入:通知文本 → 输出:是否真正发出。
 

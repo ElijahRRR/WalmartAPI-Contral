@@ -75,9 +75,20 @@ def test_board_header_columns_aligned():
     assert unmapped == []
     for i, field in mapping.items():
         assert resources.KPI_BOARD_OVERVIEW.columns[i] == field
-    assert dr._board_cell(None) == ""
-    assert dr._board_cell(True) == "是" and dr._board_cell(False) == "否"
-    assert dr._board_cell(12.5) == "12.5"
+    # 数字列写数字、日期列写序列值(所有者定稿 2026-08-08)
+    from datetime import date
+    from decimal import Decimal
+    assert dr._board_cell("payout", None) == ""
+    assert dr._board_cell("no_hold", True) == "是"
+    assert dr._board_cell("payout", Decimal("12.5")) == 12.5
+    assert dr._board_cell("items_online", 7) == 7
+    assert dr._board_cell("data_date", date(2026, 8, 8)) == 46242   # 序列值
+    assert dr._board_cell("payout_date", "2026-08-08") == 46242
+    assert dr._board_cell("payout_date", "怪值") == "怪值"           # 解析不了原样
+    assert dr._board_cell("store", "A085") == "A085"
+    fmts = dict(dr._board_formats(10))
+    assert fmts["A2:A11"] == "yyyy/MM/dd" and fmts["AB2:AB11"] == "yyyy/MM/dd"
+    assert fmts["I2:I11"] == "#,##0" and fmts["M2:M11"] == "#,##0.00"
 
 
 def test_extract_settlement_legacy_shape():

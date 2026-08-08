@@ -43,6 +43,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import httpx
 
@@ -500,13 +501,63 @@ _BOARD_HEADER = ["日期", "店铺", "卖家名称", "partnerId", "sellerId", "�
                  "回款", "回款日", "收款方", "结算周期", "无Hold", "上期回款"]
 
 
-def _board_cell(v) -> str:
-    """输入:PG 值 → 输出:看板单元格文本(None→空,bool→是/否)。"""
+_DATE_EPOCH = datetime(1899, 12, 30).date()     # 飞书/Excel 日期序列起点
+
+
+def _date_serial(v):
+    """输入:date/日期字符串 → 输出:日期序列 int(配合列 formatter 显示为日期);
+    解析不了原样返回字符串。"""
+    if hasattr(v, "toordinal") and not isinstance(v, datetime):
+        return (v - _DATE_EPOCH).days
+    s = str(v or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d"):
+        try:
+            return (datetime.strptime(s[:10], fmt).date() - _DATE_EPOCH).days
+        except ValueError:
+            continue
+    return s
+
+
+def _board_cell(field: str, v):
+    """输入:字段名 + PG 值 → 输出:看板单元格(数字列写数字、日期列写序列值,
+    None→空,bool→是/否)——所有者定稿 2026-08-08:数字/日期列用对应格式。"""
     if v is None:
         return ""
     if isinstance(v, bool):
         return "是" if v else "否"
+    if field in ("data_date", "payout_date"):
+        return _date_serial(v)
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, Decimal):
+        return float(v)
     return str(v)
+
+
+def _board_matrix(rows) -> list[list]:
+    cols = resources.KPI_BOARD_OVERVIEW.columns
+    return [[_board_cell(f, v) for f, v in zip(cols, r)] for r in rows]
+
+
+def _board_formats(n_rows: int) -> list[tuple[str, str]]:
+    """输入:数据行数 → 输出:[(范围, formatter)]:日期两列 + 数字列。"""
+    cols = resources.KPI_BOARD_OVERVIEW.columns
+    end = n_rows + 1        # 数据从第 2 行起
+    items = []
+    for i, f in enumerate(cols):
+        letter = feishu._col_letter(i + 1)
+        if f in ("data_date", "payout_date"):
+            items.append((f"{letter}2:{letter}{end}", "yyyy/MM/dd"))
+        elif f in ("items_online", "items_in_stock", "items_out_stock",
+                   "orders_count"):
+            items.append((f"{letter}2:{letter}{end}", "#,##0"))
+        elif f in ("sales_amount", "otd_rate", "cancel_rate", "vtr_rate",
+                   "srr_rate", "refund_rate", "negative_rate", "return_rate",
+                   "inr_rate", "period_sales", "commission", "refund_amount",
+                   "closing_balance", "reserve_to_date", "payout",
+                   "prev_payout"):
+            items.append((f"{letter}2:{letter}{end}", "#,##0.00"))
+    return items
 
 
 def _phase_board(history_days: int) -> str:
@@ -525,12 +576,14 @@ def _phase_board(history_days: int) -> str:
                     " WHERE data_date >= current_date - %s"
                     " ORDER BY data_date DESC, store", (history_days,))
         history = cur.fetchall()
-    n1 = feishu.sheet_overwrite(
-        resources.KPI_BOARD_OVERVIEW,
-        [_BOARD_HEADER] + [[_board_cell(v) for v in r] for r in overview])
-    n2 = feishu.sheet_overwrite(
-        resources.KPI_BOARD_HISTORY,
-        [_BOARD_HEADER] + [[_board_cell(v) for v in r] for r in history])
+    n1 = feishu.sheet_overwrite(resources.KPI_BOARD_OVERVIEW,
+                                [_BOARD_HEADER] + _board_matrix(overview))
+    n2 = feishu.sheet_overwrite(resources.KPI_BOARD_HISTORY,
+                                [_BOARD_HEADER] + _board_matrix(history))
+    feishu.sheet_set_formatter(resources.KPI_BOARD_OVERVIEW,
+                               _board_formats(len(overview)))
+    feishu.sheet_set_formatter(resources.KPI_BOARD_HISTORY,
+                               _board_formats(len(history)))
     return (f"看板:总览 {n1 - 1} 店,历史 {n2 - 1} 行(近 {history_days} 天)")
 
 

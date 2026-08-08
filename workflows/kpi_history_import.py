@@ -11,6 +11,8 @@
 
 防重语义:INSERT ... ON CONFLICT (store, data_date) DO NOTHING——
 **绝不覆盖任何已存在的行**(新系统已写的天数、重复导入,都原样保留)。
+apply 收尾会用每店最近非空卖家名称回填全部 NULL 行(导入不碰已有行,
+新系统先前写空的名字需要这一步才能补上;可重复执行,幂等)。
 预览模式必看两处再 apply:①未映射表头列表(有列名对不上就先校准映射)
 ②与 PG 重叠日期的样本对比(单量/销售额口径核对)。
 """
@@ -47,6 +49,19 @@ ON CONFLICT (store, data_date) DO NOTHING
 """
 
 _MAX_COL = "AF"      # 旧表 32 列 A~AF(读宽一点无害,窄了丢列)
+
+# 收尾回填:导入不覆盖已有行(DO NOTHING),新系统先前写下的空白卖家名称
+# 不会被历史行填上——用每店最近一次非空名称补全部 NULL 行。卖家名称是
+# 稳定资产,补历史无害;销售状态绝不做同款回填(旧事故规则)。
+_BACKFILL_NAMES = """
+UPDATE ops.store_kpi_daily t
+SET seller_name = s.seller_name, updated_at = now()
+FROM (SELECT DISTINCT ON (store) store, seller_name
+      FROM ops.store_kpi_daily
+      WHERE seller_name IS NOT NULL
+      ORDER BY store, data_date DESC) s
+WHERE t.store = s.store AND t.seller_name IS NULL
+"""
 
 
 def _existing_dates(store: str) -> set[str]:
@@ -122,6 +137,10 @@ def run(params: dict) -> str:
                  f"与 PG 重叠 {total_dup} 行不覆盖)")
     if apply:
         lines.append(f"实际入库 {total_new} 行(ON CONFLICT DO NOTHING)")
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute(_BACKFILL_NAMES)
+            lines.append(f"空白卖家名称回填 {cur.rowcount} 行"
+                         f"(取每店最近非空值;销售状态不回填)")
     if all_unmapped:
         lines.append(f"⚠ 未映射表头 {len(all_unmapped)} 个(这些列不导入,"
                      f"需要就先校准映射):{' | '.join(sorted(all_unmapped))}")

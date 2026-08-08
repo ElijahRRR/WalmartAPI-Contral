@@ -80,6 +80,35 @@ def test_board_header_columns_aligned():
     assert dr._board_cell(12.5) == "12.5"
 
 
+def test_extract_settlement_legacy_shape():
+    """旧代码实证结构(2026-08-08 定稿):payload 嵌套 + URL 编码 + 回款公式。"""
+    stmt = {
+        "partnerId": "P1",
+        "payload": {
+            "sellerInfo": {
+                "storeFrontUrl": "https%3A%2F%2Fwww.walmart.com%2Fseller%2F12345",
+                "sellerStatus": "ACTIVE", "paymentStatus": "ACTIVE"},
+            "accountSummary": {
+                "closingBalance": 100.0, "reserve": 20.0, "holdAmount": 5.0,
+                "reserveToDate": -10.5, "scheduledSettlementDate": "2026-08-19",
+                "paymentProcessor": "PAYONEER", "settleCycle": "14"},
+            "transactionDetails": {
+                "saleAggregate": {"productPrice": 500, "netComm": 50},
+                "refundDetails": {"productPrice": 30}}},
+    }
+    out = kpi.extract_settlement(stmt)
+    assert out["seller_id"] == "12345"          # URL 解码后才匹配得上
+    assert out["payout"] == 75.0                # closing − reserve − hold
+    assert out["no_hold"] is False              # 75 < 100
+    assert out["reserve_to_date"] == 10.5 and out["payment_status"] == "ACTIVE"
+    # 非 ACTIVE → 回款强制 0
+    stmt["payload"]["sellerInfo"]["paymentStatus"] = "HOLD"
+    assert kpi.extract_settlement(stmt)["payout"] == 0.0
+    # 旧表「无Hold」列取值是 "不押款"/空
+    assert kpi._hist_value("no_hold", "不押款") is True
+    assert kpi._hist_value("no_hold", "") is None
+
+
 def test_yingdao_freshness():
     trigger = datetime(2026, 8, 8, 0, 0, tzinfo=timezone.utc)
     fresh = {"scraped_at": "2026-08-08T08:07:05+08:00"}     # 00:07 UTC > trigger

@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -127,45 +128,46 @@ def settlement_debug(statement: dict) -> str:
 def extract_settlement(statement: dict) -> dict:
     """输入:payment/statement 原始响应 → 输出:结算相关 KPI 字段 dict。
 
-    ⚠对拍校准点:『本期回款』的取值字段旧代码未在摸底文档留痕,此处按
-    scheduledSettlementAmount > totalPayable > (期末余额-备用金) 的优先级取,
-    首轮对拍若与旧表不一致,以旧表反推字段后修正此函数。
+    2026-08-08 旧代码实证定稿(fetch_walmart_performance.fetch_payment_statement,
+    弃用此前的字段猜测链):结构 = 顶层 partnerId + payload.{sellerInfo,
+    accountSummary, transactionDetails.{saleAggregate,refundDetails}};
+    sellerId = sellerInfo.storeFrontUrl **先 URL 解码**再正则 /seller/(\\d+)
+    (URL 是百分号编码的,不解码永远匹配不上——2026-08-08 全店空白事故);
+    **本期回款 = closingBalance − reserve − holdAmount**;
+    paymentStatus 在 sellerInfo 里。递归查找仅作路径兜底。
     """
-    # 2026-08-06 对拍实证:固定顶层路径取不到(真实响应嵌套更深),partner_id/
-    # paymentStatus 靠递归搜索命中 → 所有字段统一改递归查找,不再假设层级
-    acct = _find_key(statement, "accountSummary") or {}
-    seller_info = _find_key(statement, "sellerInfo") or {}
-    # sellerId:扫**全部** storeFrontUrl 取第一个能匹配出数字的——递归第一个
-    # 命中可能是空节点(2026-08-08 全店实证:sellerId 大面积为空)
-    m = None
-    for _, url in _find_all(statement, "storeFrontUrl"):
-        m = _SELLER_ID_RE.search(str(url or ""))
-        if m:
-            break
+    payload = (statement.get("payload") if isinstance(statement, dict) else None) \
+        or _find_key(statement, "payload") or {}
+    seller_info = payload.get("sellerInfo") or _find_key(statement, "sellerInfo") or {}
+    acct = payload.get("accountSummary") or _find_key(statement, "accountSummary") or {}
+    td = payload.get("transactionDetails") \
+        or _find_key(statement, "transactionDetails") or {}
+    sale_agg = td.get("saleAggregate") or {}
+    refund = td.get("refundDetails") or {}
     if not acct:
         logger.warning("payment/statement 找不到 accountSummary,顶层键:%s",
                        sorted(statement.keys()) if isinstance(statement, dict) else type(statement))
 
-    closing = _num(_find_key(acct, "closingBalance"))
-    reserve_to_date = abs(_num(_find_key(acct, "reserveToDate")))
-    payout = None
-    for key in ("scheduledSettlementAmount", "totalPayable", "payableAmount"):
-        v = _find_key(statement, key)
-        if v is not None:
-            payout = _num(v)
-            break
-    if payout is None:
-        payout = closing - max(_num(_find_key(acct, "reserve")), 0.0)
+    url = urllib.parse.unquote(str(seller_info.get("storeFrontUrl") or ""))
+    m = _SELLER_ID_RE.search(url)
+    if not m:       # 路径兜底:扫全部 storeFrontUrl(同样先解码)
+        for _, u in _find_all(statement, "storeFrontUrl"):
+            m = _SELLER_ID_RE.search(urllib.parse.unquote(str(u or "")))
+            if m:
+                break
 
-    payment_status = str(statement.get("paymentStatus")
+    closing = _num(acct.get("closingBalance"))
+    reserve = _num(acct.get("reserve"))
+    hold = _num(acct.get("holdAmount"))
+    payout = closing - reserve - hold
+    reserve_to_date = abs(_num(acct.get("reserveToDate")))
+
+    payment_status = str(seller_info.get("paymentStatus")
                          or _find_key(statement, "paymentStatus") or "")
     is_active = payment_status.upper() == "ACTIVE"
     if not is_active or payout < 0:     # 非 ACTIVE 实际不会打款;负值归 0
         payout = 0.0
     no_hold = bool(is_active and payout >= closing)
-
-    sale_agg = _find_key(statement, "saleAggregate") or {}
-    refund = _find_key(statement, "refundDetails") or {}
 
     return {
         "partner_id": str(statement.get("partnerId")
@@ -179,9 +181,9 @@ def extract_settlement(statement: dict) -> dict:
         "closing_balance": closing,
         "reserve_to_date": reserve_to_date,
         "payout": round(payout, 2),
-        "payout_date": str(_find_key(acct, "scheduledSettlementDate") or ""),
-        "payment_processor": str(_find_key(acct, "paymentProcessor") or ""),
-        "settle_cycle": str(_find_key(acct, "settleCycle") or ""),
+        "payout_date": str(acct.get("scheduledSettlementDate") or ""),
+        "payment_processor": str(acct.get("paymentProcessor") or ""),
+        "settle_cycle": str(acct.get("settleCycle") or ""),
         "no_hold": no_hold,
     }
 
@@ -405,8 +407,8 @@ def _hist_value(field: str, v):
     if not s:
         return None
     if field == "no_hold":
-        if s in ("是", "true", "True", "TRUE", "Yes", "✓", "√"):
-            return True
+        if s in ("是", "true", "True", "TRUE", "Yes", "✓", "√", "不押款"):
+            return True     # 旧表该列实际取值:"不押款" / 空
         if s in ("否", "false", "False", "FALSE", "No", "×"):
             return False
         return None

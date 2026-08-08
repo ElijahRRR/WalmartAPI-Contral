@@ -574,9 +574,23 @@ def _phase_push(data_date, do_push: bool) -> str:
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "problems", "settlement", "board", "push"):
-        return f"phase 只接受 all/kpi/problems/settlement/board/push,收到:{phase}"
+    if phase not in ("all", "kpi", "problems", "settlement", "board", "push",
+                     "settle_debug"):
+        return ("phase 只接受 all/kpi/problems/settlement/board/push/"
+                f"settle_debug,收到:{phase}")
     data_date = datetime.now(kpi.CN_TZ).date()
+
+    if phase == "settle_debug":     # 结算解析诊断:单店打点关键键全部出现位置
+        if not params.get("store"):
+            return "settle_debug 需要 -p store=店铺名"
+        store_list = stores_svc.load_stores([params["store"]])
+        if not store_list:
+            return f"店铺凭证未找到:{params['store']}"
+        statement = reports.payment_statement(store_list[0])
+        extracted = kpi.extract_settlement(statement)
+        return (kpi.settlement_debug(statement)
+                + "\n当前 extract_settlement 结果:\n"
+                + "\n".join(f"  {k} = {v}" for k, v in extracted.items()))
 
     lines = []
     if phase in ("all", "kpi", "problems", "settlement"):

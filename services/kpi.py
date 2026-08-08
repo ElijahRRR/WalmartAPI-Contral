@@ -79,6 +79,51 @@ def _find_key(node, key):
     return None
 
 
+def _find_all(node, key, path="$"):
+    """输入:JSON 树 + 键名 → 输出:[(路径, 值)] 全部出现位置(诊断/多值择优用)。"""
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}"
+            if k == key:
+                out.append((p, v))
+            out.extend(_find_all(v, key, p))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_find_all(v, key, f"{path}[{i}]"))
+    return out
+
+
+# 结算响应里要盯的键(settle_debug 全量打点;回款字段以旧表反推修正时看这里)
+_SETTLE_DEBUG_KEYS = (
+    "storeFrontUrl", "scheduledSettlementAmount", "totalPayable",
+    "payableAmount", "closingBalance", "reserve", "reserveToDate",
+    "holdAmount", "scheduledSettlementDate", "paymentStatus", "partnerId",
+    "sellerStatus", "paymentProcessor", "settleCycle")
+
+
+def settlement_debug(statement: dict) -> str:
+    """输入:payment/statement 原始响应 → 输出:关键键全部出现位置的报告。
+
+    诊断"递归找键命中错节点"类问题:同名键多次出现时,extract_settlement
+    的深度优先第一个可能是空值/非本期——本报告把每个键的所有 (路径, 值)
+    列出来,对着旧表值即可反推正确路径。
+    """
+    lines = [f"响应顶层: {type(statement).__name__}"
+             + (f" keys={sorted(statement.keys())}" if isinstance(statement, dict) else "")]
+    for key in _SETTLE_DEBUG_KEYS:
+        hits = _find_all(statement, key)
+        if not hits:
+            lines.append(f"  {key}: (无)")
+        else:
+            for p, v in hits[:6]:
+                sv = str(v)
+                lines.append(f"  {key} @ {p} = {sv[:120]}")
+            if len(hits) > 6:
+                lines.append(f"  {key}: …共 {len(hits)} 处")
+    return "\n".join(lines)
+
+
 def extract_settlement(statement: dict) -> dict:
     """输入:payment/statement 原始响应 → 输出:结算相关 KPI 字段 dict。
 
@@ -90,8 +135,13 @@ def extract_settlement(statement: dict) -> dict:
     # paymentStatus 靠递归搜索命中 → 所有字段统一改递归查找,不再假设层级
     acct = _find_key(statement, "accountSummary") or {}
     seller_info = _find_key(statement, "sellerInfo") or {}
-    url = str(_find_key(statement, "storeFrontUrl") or "")
-    m = _SELLER_ID_RE.search(url)
+    # sellerId:扫**全部** storeFrontUrl 取第一个能匹配出数字的——递归第一个
+    # 命中可能是空节点(2026-08-08 全店实证:sellerId 大面积为空)
+    m = None
+    for _, url in _find_all(statement, "storeFrontUrl"):
+        m = _SELLER_ID_RE.search(str(url or ""))
+        if m:
+            break
     if not acct:
         logger.warning("payment/statement 找不到 accountSummary,顶层键:%s",
                        sorted(statement.keys()) if isinstance(statement, dict) else type(statement))

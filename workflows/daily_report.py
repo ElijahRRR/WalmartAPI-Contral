@@ -1,20 +1,22 @@
 """daily_report — 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。
 
 用法:
-  python cli.py daily_report                       # 全部阶段(kpi → problems → settlement)
+  python cli.py daily_report                       # 全部阶段(kpi → settlement → board)
   python cli.py daily_report -p phase=kpi          # 只采集 KPI
   python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
-  python cli.py daily_report -p phase=problems     # 问题订单(兼写订单中心 perf_events)
   python cli.py daily_report -p phase=settlement   # 对账明细 → orders.settlement_lines
   python cli.py daily_report -p phase=settlement -p periods=99   # 首次可放开账期上限(默认 6)
   python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
-  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/problems/settlement 阶段)
+  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/settlement 阶段)
 
-订单中心接线(2026-08-06):problems 阶段解析出的问题订单同时按
-(po, metric, period=拉取日) 累积进 orders.perf_events 并回填订单行;
-settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
-(关账快照不可变,已入库账期不重拉)。
+**问题订单已摘出**(所有者定稿 2026-08-08):绩效问题订单明细(insights
+report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
+由独立调度驱动;本工作流只取指标比率(insights summary 端点),不再等
+那条最脆的链。push 阶段的"问题订单 TOP"仍读 PG,数据由那条流写。
+
+订单中心接线:settlement 阶段把缺失账期的对账明细聚合进
+orders.settlement_lines(关账快照不可变,已入库账期不重拉)。
 
 与旧系统的关键差异(设计决策见 docs/legacy_survey.md #daily_report 迁移建议):
 - PG 是权威(ops.store_kpi_daily / ops.perf_problem_orders),飞书降级为展示层
@@ -34,8 +36,6 @@ settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
   **停旧 walmart-kpi-daily 之前严禁开启**(双 spawn 互抢,新鲜度校验会
   反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补 + 跨日延续)
-- 问题订单 xlsx 的逐指标列映射旧代码不可得,首版按表头关键词归一并保留原始行
-  (raw 列),对拍后校准
 - push 阶段默认只打印预览;-p push=1 才真发(并跑期不打扰运营)
 """
 
@@ -95,17 +95,6 @@ ON CONFLICT (store, data_date) DO UPDATE SET
     prev_payout = EXCLUDED.prev_payout, updated_at = now()
 """
 
-_PROBLEM_INSERT = """
-INSERT INTO ops.perf_problem_orders (
-    first_seen_date, store, sales_order_no, po_no, order_date, indicator,
-    sub_category, accountable, description, item, carrier, tracking_no, note, raw)
-VALUES (%(first_seen_date)s, %(store)s, %(sales_order_no)s, %(po_no)s,
-        %(order_date)s, %(indicator)s, %(sub_category)s, %(accountable)s,
-        %(description)s, %(item)s, %(carrier)s, %(tracking_no)s, %(note)s,
-        %(raw)s::jsonb)
-ON CONFLICT (sales_order_no, indicator, sub_category, tracking_no, item)
-DO NOTHING
-"""
 
 
 def _load_frontend(fresh_within_hours: int = 24) -> tuple[dict, dict]:
@@ -359,80 +348,6 @@ def _phase_kpi(store_list: list[dict], data_date, do_yingdao: bool = False) -> s
     return line
 
 
-def _phase_problems(store_list: list[dict], data_date) -> str:
-    total_new, total_rows, total_perf, total_no_po = 0, 0, 0, 0
-    total_unlinked, failed = 0, []
-
-    def _one_store(store: dict) -> tuple[int, int, int, int, int]:
-        by_metric: list[tuple[str, list[dict]]] = []
-        for m in insights.METRICS:
-            try:
-                blob = insights.performance_report(store, m)
-            except Exception as e:
-                logger.warning("店铺 %s %s report 拉取失败: %s", store["name"], m, e)
-                continue
-            if blob:
-                by_metric.append((m, kpi.parse_problem_report(m, blob)))
-
-        inserted = perf_written = no_po = unlinked = 0
-        rows_all = [r for _, rs in by_metric for r in rs]
-        if rows_all:
-            with db.pg_conn() as conn, conn.cursor() as cur:
-                # returns/INR 报表带行号无 SKU(实证):预载 (po,行号)→sku 供反查建键
-                cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
-                            "WHERE store = %s", (store["name"],))
-                sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
-                for r in rows_all:
-                    cur.execute(_PROBLEM_INSERT,
-                                {**r, "store": store["name"],
-                                 "first_seen_date": data_date})
-                    inserted += cur.rowcount
-                # 订单中心:逐周期累积进 orders.perf_events(period=拉取日);
-                # 烂账治理:PO 不在库(早于建库窗口)的事件不入库
-                for m, rs in by_metric:
-                    perf_rows, skipped = order_lines.perf_rows_from_problems(
-                        store["name"], m, rs, str(data_date), sku_lookup)
-                    perf_rows, drop = order_lines.drop_unlinked_perf(
-                        conn, perf_rows)
-                    unlinked += drop
-                    perf_written += order_lines.upsert_perf_events(conn, perf_rows)
-                    no_po += skipped
-        if no_po:
-            logger.warning("店铺 %s 有 %d 行问题订单无 PO 号,perf_events 未建键",
-                           store["name"], no_po)
-        if unlinked:
-            logger.info("店铺 %s:%d 条绩效事件 PO 不在库,未入库", store["name"], unlinked)
-        return len(rows_all), inserted, perf_written, no_po, unlinked
-
-    with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
-        futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
-        for f in as_completed(futs):
-            name = futs[f]
-            try:
-                parsed, inserted, perf_written, no_po, unlinked = f.result()
-                total_rows += parsed
-                total_new += inserted
-                total_perf += perf_written
-                total_no_po += no_po
-                total_unlinked += unlinked
-            except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                failed.append(f"{name}(凭证)")
-            except Exception as e:
-                logger.exception("店铺 %s 问题订单失败: %s", name, e)
-                failed.append(name)
-
-    with db.pg_conn() as conn:
-        linked = order_lines.backfill_perf_line_ids(conn)
-    line = (f"问题订单:{len(store_list) - len(failed)}/{len(store_list)} 店,"
-            f"解析 {total_rows} 行,新增 {total_new} 条;"
-            f"绩效事件 {total_perf} 条(回填订单行 {linked},无 PO 跳过 {total_no_po},"
-            f"订单不在库丢弃 {total_unlinked})")
-    if failed:
-        line += f",失败:{','.join(failed)}"
-    return line
-
-
 def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
     """对账明细:按店拉取缺失账期(关账快照不可变,已入库不重拉)→ settlement_lines。"""
     total_periods, total_lines, total_no_sku, failed = 0, 0, 0, []
@@ -627,9 +542,10 @@ def _phase_push(data_date, do_push: bool) -> str:
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "problems", "settlement", "board", "push",
-                     "settle_debug"):
-        return ("phase 只接受 all/kpi/problems/settlement/board/push/"
+    if phase not in ("all", "kpi", "settlement", "board", "push", "settle_debug"):
+        if phase == "problems":     # 已摘出为独立工作流(2026-08-08)
+            return "问题订单已独立:改跑 python cli.py perf_problems"
+        return ("phase 只接受 all/kpi/settlement/board/push/"
                 f"settle_debug,收到:{phase}")
     data_date = datetime.now(kpi.CN_TZ).date()
 
@@ -646,7 +562,7 @@ def run(params: dict) -> str:
                 + "\n".join(f"  {k} = {v}" for k, v in extracted.items()))
 
     lines = []
-    if phase in ("all", "kpi", "problems", "settlement"):
+    if phase in ("all", "kpi", "settlement"):
         names = [params["store"]] if params.get("store") else None
         store_list = stores_svc.load_stores(names)
         if not store_list:
@@ -654,8 +570,6 @@ def run(params: dict) -> str:
         if phase in ("all", "kpi"):
             do_yingdao = str(params.get("yingdao", "")) in ("1", "true", "yes")
             lines.append(_phase_kpi(store_list, data_date, do_yingdao))
-        if phase in ("all", "problems"):
-            lines.append(_phase_problems(store_list, data_date))
         if phase in ("all", "settlement"):
             lines.append(_phase_settlement(
                 store_list, int(params.get("periods", 6))))

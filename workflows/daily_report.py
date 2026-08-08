@@ -128,6 +128,20 @@ def _load_frontend(fresh_within_hours: int = 24) -> tuple[dict, dict]:
     return names, statuses
 
 
+def _last_seller_names() -> dict[str, str]:
+    """输入:无 → 输出:{store: 最近一次非空卖家名称},影刀缺席时跨日延续。
+
+    卖家名称允许 stale(旧系统规则),影刀当天没给就沿用库里最近值;
+    销售状态**不做**同款延续——旧值回填会把昨天的状态传染成今天(旧事故规则)。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT ON (store) store, seller_name"
+            " FROM ops.store_kpi_daily WHERE seller_name IS NOT NULL"
+            " ORDER BY store, data_date DESC")
+        return {s: n for s, n in cur.fetchall()}
+
+
 def _pg_item_counts(store_name: str) -> tuple[int, int, int]:
     """输入:店铺 → 输出:(在线商品, 有库存, 无库存),读 catalog.walmart_items。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -160,8 +174,8 @@ def _pg_order_stats(store_name: str, win_start: str, win_end: str) -> tuple[int,
 
 
 def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
-                       names: dict, statuses: dict) -> dict:
-    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map → 输出:一行 KPI dict。"""
+                       names: dict, statuses: dict, last_names: dict) -> dict:
+    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map + 历史名称 map → 输出:一行 KPI dict。"""
     name = store["name"]
 
     # 8 项绩效并发(端点桶互相独立,同店同端点才是 1/min)
@@ -218,7 +232,8 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
     return {
         "_orders_diff": orders_diff,
         "store": name, "data_date": data_date,
-        "seller_name": names.get(sid) or None,
+        # 影刀今日值优先(真改名能跟上),缺席才延续库里最近非空值
+        "seller_name": names.get(sid) or last_names.get(name) or None,
         "sales_status": statuses.get(sid) or None,
         "partner_id": settle["partner_id"], "seller_id": sid,
         "store_status": settle["store_status"],
@@ -245,10 +260,11 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
 def _phase_kpi(store_list: list[dict], data_date) -> str:
     win_start, win_end = kpi.sales_window_utc()
     names, statuses = _load_frontend()
+    last_names = _last_seller_names()
     ok, failed, diffs = [], [], []
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
-                            names, statuses): s["name"] for s in store_list}
+                            names, statuses, last_names): s["name"] for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:

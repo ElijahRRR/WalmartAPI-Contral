@@ -264,6 +264,139 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
     return rows
 
 
+# ── 旧「店铺KPI」历史 sheet → ops.store_kpi_daily(kpi_history_import 用)────
+# 表头关键词 → 目标字段,**顺序即优先级**(更具体的在前:上期回款 > 回款日期 >
+# 回款;退款率 > 退款金额)。真实表头对不上的列进 unmapped 报告,人眼校准。
+_HIST_HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # 具体在前,泛化在后:「上期回款」>「回款日期」>「回款」;「退款率」>「退款」;
+    # 「店铺状态」>「店铺」;「本期销售」>「销售额」;「回款日期」必须先于「日期」
+    ("prev_payout", ("上期回款",)),
+    ("payout_date", ("回款日期",)),
+    ("refund_rate", ("退款率",)),
+    ("store_status", ("店铺状态",)),
+    ("period_sales", ("本期销售",)),
+    ("data_date", ("日期",)),
+    ("store", ("店铺名", "店铺")),
+    ("seller_name", ("卖家名称", "卖家")),
+    ("partner_id", ("partner",)),
+    ("seller_id", ("seller",)),
+    ("payment_status", ("支付状态",)),
+    ("sales_status", ("销售状态",)),
+    ("items_online", ("在线商品", "在线")),
+    ("items_in_stock", ("有库存",)),
+    ("items_out_stock", ("无库存",)),
+    ("orders_count", ("昨日出单", "出单")),
+    ("sales_amount", ("昨日销售额", "销售额")),
+    ("otd_rate", ("otd",)),
+    ("cancel_rate", ("取消",)),
+    ("vtr_rate", ("vtr",)),
+    ("srr_rate", ("srr",)),
+    ("negative_rate", ("差评",)),
+    ("return_rate", ("退货",)),
+    ("inr_rate", ("未收到", "inr")),
+    ("commission", ("佣金",)),
+    ("refund_amount", ("退款",)),
+    ("closing_balance", ("期末余额", "余额")),
+    ("reserve_to_date", ("预留",)),
+    ("payout", ("回款",)),
+    ("payment_processor", ("支付处理", "processor")),
+    ("settle_cycle", ("结算周期",)),
+    ("no_hold", ("hold", "押款")),
+)
+
+_HIST_INT_FIELDS = {"items_online", "items_in_stock", "items_out_stock",
+                    "orders_count"}
+_HIST_NUM_FIELDS = {"sales_amount", "otd_rate", "cancel_rate", "vtr_rate",
+                    "srr_rate", "refund_rate", "negative_rate", "return_rate",
+                    "inr_rate", "period_sales", "commission", "refund_amount",
+                    "closing_balance", "reserve_to_date", "payout", "prev_payout"}
+
+_HIST_FIELDS = tuple(f for f, _ in _HIST_HEADER_MAP if f not in ("data_date", "store"))
+
+
+def map_history_header(header: list) -> tuple[dict[int, str], list[str]]:
+    """输入:表头行 → 输出:({列下标: 字段名}, 未映射表头列表)。
+
+    关键词包含匹配(casefold),每个字段只认第一个命中的列(重复表头进 unmapped)。
+    """
+    mapping: dict[int, str] = {}
+    taken: set[str] = set()
+    unmapped: list[str] = []
+    for i, h in enumerate(header):
+        text = str(h or "").strip().casefold()
+        if not text:
+            continue
+        for field, kws in _HIST_HEADER_MAP:
+            if field not in taken and any(k in text for k in kws):
+                mapping[i] = field
+                taken.add(field)
+                break
+        else:
+            unmapped.append(str(h).strip())
+    return mapping, unmapped
+
+
+def _hist_date(v) -> str | None:
+    """输入:单元格值 → 输出:'YYYY-MM-DD' 或 None(解析失败)。"""
+    s = str(v or "").strip().replace("/", "-").replace(".", "-")
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return f"{y:04d}-{mo:02d}-{d:02d}"
+    except ValueError:
+        return None
+
+
+def _hist_value(field: str, v):
+    """输入:字段名 + 单元格值 → 输出:入库值(空串→None,$,%千分位清理)。"""
+    s = str(v if v is not None else "").strip()
+    if not s:
+        return None
+    if field == "no_hold":
+        if s in ("是", "true", "True", "TRUE", "Yes", "✓", "√"):
+            return True
+        if s in ("否", "false", "False", "FALSE", "No", "×"):
+            return False
+        return None
+    if field in _HIST_INT_FIELDS or field in _HIST_NUM_FIELDS:
+        cleaned = s.replace("$", "").replace(",", "").replace("%", "").strip()
+        try:
+            num = float(cleaned)
+        except ValueError:
+            return None
+        return int(num) if field in _HIST_INT_FIELDS else num
+    return s
+
+
+def parse_history_rows(store: str, header: list, rows: list[list]
+                       ) -> tuple[list[dict], int]:
+    """输入:店铺名(=sheet 标题,权威)+ 表头 + 数据行 → 输出:(入库行列表, 跳过数)。
+
+    店铺一律取 sheet 标题(店铺列若有只作参考不用);日期解析失败的行跳过计数。
+    """
+    mapping, _ = map_history_header(header)
+    out, skipped = [], 0
+    for raw in rows:
+        rec: dict = {f: None for f in _HIST_FIELDS}
+        rec["store"] = store
+        rec["data_date"] = None
+        for i, field in mapping.items():
+            v = raw[i] if i < len(raw) else None
+            if field == "data_date":
+                rec["data_date"] = _hist_date(v)
+            elif field == "store":
+                continue
+            else:
+                rec[field] = _hist_value(field, v)
+        if not rec["data_date"]:
+            skipped += 1
+            continue
+        out.append(rec)
+    return out, skipped
+
+
 def dedup_key(row: dict) -> tuple:
     """输入:问题订单行 → 输出:五字段联合去重键(旧系统同款语义)。"""
     return (row.get("sales_order_no") or "", row.get("indicator") or "",

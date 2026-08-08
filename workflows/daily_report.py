@@ -3,6 +3,7 @@
 用法:
   python cli.py daily_report                       # 全部阶段(kpi → problems → settlement)
   python cli.py daily_report -p phase=kpi          # 只采集 KPI
+  python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
   python cli.py daily_report -p phase=problems     # 问题订单(兼写订单中心 perf_events)
   python cli.py daily_report -p phase=settlement   # 对账明细 → orders.settlement_lines
   python cli.py daily_report -p phase=settlement -p periods=99   # 首次可放开账期上限(默认 6)
@@ -22,8 +23,12 @@ settlement 阶段把缺失账期的对账明细聚合进 orders.settlement_lines
 - 昨日出单/销售额两列改读 orders.order_lines(所有者认可 2026-08-08):当前为
   双算对拍期——API 现拉仍是权威值,库算值只记日志差异;连续对平后摘除 API
   拉取,order_sync 成为本工作流的调度前置
-- 影刀 RPA 本期不 spawn:只读旧系统产出的 latest.json(新鲜才用销售状态;
-  卖家名称允许 stale 补——旧系统反直觉规则,原样保留);切换期由旧系统 8 点驱动影刀
+- 影刀接入(-p yingdao=1,2026-08-08):写「店铺KPI」总览 A:H 影刀输入投影
+  (过滤空 sellerId 行——A147 事故防线)→ spawn 影刀 → 等 latest.json 新鲜
+  → 回填当日卖家名称/销售状态。默认关:切换期仍由旧系统 8 点驱动影刀,
+  **停旧 walmart-kpi-daily 之前严禁开启**(双 spawn 互抢,新鲜度校验会
+  反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
+  卖家名称允许 stale 补 + 跨日延续)
 - 问题订单 xlsx 的逐指标列映射旧代码不可得,首版按表头关键词归一并保留原始行
   (raw 列),对拍后校准
 - push 阶段默认只打印预览;-p push=1 才真发(并跑期不打扰运营)
@@ -37,8 +42,8 @@ from datetime import datetime, timezone
 import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
-from registry import db, paths
-from services import kpi, order_lines, stores as stores_svc
+from registry import db, paths, resources
+from services import kpi, order_lines, stores as stores_svc, yingdao
 
 DANGEROUS = False
 
@@ -257,11 +262,64 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
     }
 
 
-def _phase_kpi(store_list: list[dict], data_date) -> str:
+def _yingdao_refresh(rows: list[dict], data_date) -> str:
+    """输入:当日已入库 KPI 行 → 输出:影刀链路结果行。
+
+    三步:①总览 A:H 影刀输入投影(店铺名 key 合并,本次没跑到的店保留旧行;
+    空 sellerId 行过滤——A147 事故:影刀打开 /seller//cp/shopall 会崩掉整条
+    RPA 循环)②spawn + 等 latest.json 新鲜 ③回填当日卖家名称/销售状态。
+    任一步失败只降级不报错:已入库值有跨日延续兜底。
+    """
+    sheet = resources.KPI_SHEET.require()
+    existing = feishu.sheet_values(sheet, "A2:H200")
+    merged: dict[str, list] = {}
+    for r in existing:
+        r = (list(r) + [""] * 8)[:8]
+        store = str(r[1] or "").strip()
+        if store:
+            merged[store] = [str(c or "") for c in r]
+    for row in rows:
+        merged[row["store"]] = [
+            str(data_date), row["store"], row["seller_name"] or "",
+            row["partner_id"] or "", row["seller_id"] or "",
+            row["store_status"] or "", row["payment_status"] or "",
+            row["sales_status"] or ""]
+    out = sorted((v for v in merged.values() if str(v[4]).strip()),
+                 key=lambda v: v[1])
+    dropped = len(merged) - len(out)
+    pad = [[""] * 8 for _ in range(max(0, 199 - len(out)))]     # 清窗口残留行
+    feishu.sheet_write_ranges(sheet, [("A2:H200", (out + pad)[:199])])
+    line = f"影刀:总览投影 {len(out)} 店(空 sellerId 过滤 {dropped})"
+
+    trigger = datetime.now(timezone.utc)
+    if not yingdao.spawn():
+        return line + ",spawn 失败/未配置,沿用旧值"
+    if not yingdao.wait_fresh(trigger):
+        return line + ",等待超时,沿用旧值(卖家名称跨日延续兜底)"
+
+    names, statuses = _load_frontend(fresh_within_hours=1)
+    updated = 0
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        for row in rows:
+            new_name = names.get(row["seller_id"] or "")
+            new_status = statuses.get(row["seller_id"] or "")
+            if not (new_name or new_status):
+                continue
+            cur.execute(
+                "UPDATE ops.store_kpi_daily SET"
+                " seller_name = COALESCE(%s, seller_name),"
+                " sales_status = COALESCE(%s, sales_status), updated_at = now()"
+                " WHERE store = %s AND data_date = %s",
+                (new_name, new_status, row["store"], data_date))
+            updated += cur.rowcount
+    return line + f",抓取新鲜,回填 {updated} 店"
+
+
+def _phase_kpi(store_list: list[dict], data_date, do_yingdao: bool = False) -> str:
     win_start, win_end = kpi.sales_window_utc()
     names, statuses = _load_frontend()
     last_names = _last_seller_names()
-    ok, failed, diffs = [], [], []
+    ok, failed, diffs, rows_ok = [], [], [], []
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
                             names, statuses, last_names): s["name"] for s in store_list}
@@ -273,6 +331,7 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
                     diffs.append(name)
                 with db.pg_conn() as conn:
                     conn.execute(_KPI_UPSERT, row)
+                rows_ok.append(row)
                 ok.append(name)
             except (_client.StoreDeadError, httpx.ProxyError) as e:
                 logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
@@ -285,6 +344,12 @@ def _phase_kpi(store_list: list[dict], data_date) -> str:
         line += f",订单列对拍差异 {len(diffs)} 店(详见日志):{','.join(diffs)}"
     if failed:
         line += f",失败:{','.join(failed)}"
+    if do_yingdao and rows_ok:
+        try:
+            line += "\n" + _yingdao_refresh(rows_ok, data_date)
+        except Exception as e:
+            logger.exception("影刀链路失败(已入库值不受影响): %s", e)
+            line += f"\n影刀:链路失败({e}),沿用旧值"
     return line
 
 
@@ -472,7 +537,8 @@ def run(params: dict) -> str:
         if not store_list:
             return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
         if phase in ("all", "kpi"):
-            lines.append(_phase_kpi(store_list, data_date))
+            do_yingdao = str(params.get("yingdao", "")) in ("1", "true", "yes")
+            lines.append(_phase_kpi(store_list, data_date, do_yingdao))
         if phase in ("all", "problems"):
             lines.append(_phase_problems(store_list, data_date))
         if phase in ("all", "settlement"):

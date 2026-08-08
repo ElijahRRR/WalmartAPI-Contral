@@ -248,6 +248,22 @@ ORDER_SETTLE = Bitable(
 )
 
 
+# 店铺KPI 电子表格(旧系统存量 workbook,两个用途,PG 权威不变):
+# ① 「总览」页(sheet_id 登记)= **影刀输入投影**:一店一行,影刀 RPA 读它
+#    决定抓哪些卖家页(E 列 sellerId 是其输入;空 sellerId 行会让整条 RPA
+#    崩溃——A147 事故,写入前必须过滤)。daily_report yingdao=1 时只写 A:H。
+# ② 每店一个 sheet(title=店铺名)= 旧系统 KPI 历史(按日期一行累积),
+#    kpi_history_import 的数据源;店铺页 sheet_id 运行时经 sheet_list 发现。
+# columns 前 8 列即总览 A~H 列序;历史导入按表头关键词映射,不按列位。
+KPI_SHEET = Spreadsheet(
+    name="店铺KPI",
+    token=os.environ.get("FEISHU_KPI_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_KPI_OVERVIEW_SHEET_ID", ""),
+    columns=("data_date", "store", "seller_name", "partner_id", "seller_id",
+             "store_status", "payment_status", "sales_status"),
+)
+
+
 # 商品停用/删除表(product_clear 驱动表):电子表格,运营填 A~D,程序写 E~H。
 # 列序即契约(A=store B=sku C=停用/删除 D=操作原因
 #             E=feedid F=操作日期 G=结果 H=报错)

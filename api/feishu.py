@@ -424,6 +424,20 @@ def _sheet_token(s: Spreadsheet) -> str:
     return _wiki_token_cache[s.token]
 
 
+def sheet_list(sheet: Spreadsheet) -> list[tuple[str, str]]:
+    """输入:电子表格登记条目(用其 token)→ 输出:[(sheet_id, title)] 全部子表。
+
+    枚举 workbook 内所有 sheet(kpi_history_import 用它发现每店历史页;
+    店铺 sheet 的 sheet_id 运行时才可知,不进 registry)。
+    """
+    s = sheet  # 不 require():只需 token,sheet_id 允许为空
+    if not s.token:
+        raise LookupError(f"电子表格「{s.name}」尚未登记 token")
+    data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{_sheet_token(s)}/sheets/query")
+    return [(m.get("sheet_id") or "", m.get("title") or "")
+            for m in data.get("sheets") or []]
+
+
 def sheet_row_count(sheet: Spreadsheet) -> int:
     """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
     s = sheet.require()

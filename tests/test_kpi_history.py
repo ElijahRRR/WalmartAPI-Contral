@@ -4,12 +4,13 @@ from datetime import datetime, timezone
 
 from services import kpi, yingdao
 
+# 生产真实表头(2026-08-08 预览实证:七个中文表头曾未映射,回归钉住)
 _HEADER = ["日期", "店铺", "卖家名称", "partnerId", "sellerId", "店铺状态",
            "支付状态", "销售状态", "在线商品", "有库存", "无库存", "昨日出单",
-           "昨日销售额($)", "OTD", "取消率", "VTR", "SRR", "退款率", "差评率",
-           "退货率", "未收到", "本期销售额", "佣金", "退款金额", "期末余额",
-           "累计预留", "回款", "回款日期", "支付处理方", "结算周期", "无Hold",
-           "上期回款"]
+           "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
+           "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
+           "账期销售额($)", "佣金", "退款金额", "期末余额", "迄今备用金($)",
+           "回款", "回款日", "收款方", "结算周期", "无Hold", "上期回款"]
 
 
 def test_header_map_full_and_traps():
@@ -17,7 +18,7 @@ def test_header_map_full_and_traps():
     assert unmapped == []
     by_field = {f: i for i, f in mapping.items()}
     # 包含关系陷阱:更具体的先占
-    assert by_field["data_date"] == 0          # 「回款日期」没抢走「日期」
+    assert by_field["data_date"] == 0          # 「回款日」没抢走「日期」
     assert by_field["payout_date"] == 27
     assert by_field["payout"] == 26
     assert by_field["prev_payout"] == 31
@@ -25,8 +26,14 @@ def test_header_map_full_and_traps():
     assert by_field["store_status"] == 5
     assert by_field["refund_rate"] == 17       # 「退款金额」没抢走「退款率」
     assert by_field["refund_amount"] == 23
-    assert by_field["period_sales"] == 21      # 「本期销售额」没被「销售额」抢走
+    assert by_field["period_sales"] == 21      # 「账期销售额」没被「销售额」抢走
     assert by_field["sales_amount"] == 12
+    assert by_field["otd_rate"] == 13          # 准时送达/有效追踪/卖家回复率(中文)
+    assert by_field["vtr_rate"] == 15
+    assert by_field["srr_rate"] == 16          # 「卖家回复率」没抢走「卖家名称」
+    assert by_field["seller_name"] == 2
+    assert by_field["reserve_to_date"] == 25   # 迄今备用金
+    assert by_field["payment_processor"] == 28  # 收款方
     assert by_field["no_hold"] == 30
     # 全部 32 列都有归属
     assert len(mapping) == 32
@@ -51,6 +58,8 @@ def test_parse_history_rows():
     assert r["otd_rate"] == 98.5               # % 剥离
     assert r["no_hold"] is True
     assert r["payout_date"] == "2026-08-05"
+    assert r["srr_rate"] == 100.0 and r["vtr_rate"] == 99.0
+    assert r["reserve_to_date"] == 0.0 and r["payment_processor"] == "PAYONEER"
     assert r["prev_payout"] == 800.0
     r2 = out[1]
     assert r2["data_date"] == "2026-08-02" and r2["orders_count"] is None

@@ -60,13 +60,16 @@ def test_poll_feed_terminal_writes_ledger(monkeypatch):
     head, out = feed_track.poll_feed(STORE, "F1")
     assert head["feedStatus"] == "PROCESSED"
     assert out == {"A": ("success", ""), "B": ("failed", "ERR_9")}
-    sel_sql, _ = conn.sqls[0]
+    def _find(frag):        # 按内容找,别按位置(加语句就错位)
+        return next(x for x in conn.sqls if frag in x[0])
+
+    sel_sql, _ = _find("SELECT sku, workflow")
     assert "SELECT sku, workflow, feed_type, status" in sel_sql  # 先取更新前状态
-    many_sql, rows = conn.sqls[1]
+    many_sql, rows = _find("SET status = %s")
     assert "UPDATE ops.feed_items" in many_sql
     assert ("success", None, None, "F1", "A") in rows
     assert ("failed", "ERR_9", None, "F1", "B") in rows
-    miss_sql, args = conn.sqls[2]
+    miss_sql, args = _find("'missing'")
     assert "'missing'" in miss_sql and args[1] == ["A", "B"]   # 查无的标 missing
     assert done == [("F1", True)]
 
@@ -115,7 +118,7 @@ def test_poll_feed_maintenance_receipt_not_in_ledger_for_non_relist(monkeypatch)
     monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
     feed_track.poll_feed(STORE, "F1")
     assert [e["sku"] for e in recorded] == ["B"]        # 只有反补来源入账
-    many_sql, rows = conn.sqls[1]
+    many_sql, rows = next(x for x in conn.sqls if "SET status = %s" in x[0])
     assert ("success", None, None, "F1", "A") in rows          # 台账不受白名单影响
 
 
@@ -173,3 +176,30 @@ def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
     assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
     assert "T_GONE 删除(-) F2:店铺凭证缺失,跳过" in out
     assert any("提交结局不确定" in m for m in caplog.messages)
+
+
+def test_save_errors_rows_shape():
+    """每条 ingestionError 一行,带 field/code——聚合分析的主维度。"""
+    from services.feed_track import _save_errors
+
+    captured = {}
+
+    class _Cur:
+        def executemany(self, sql, rows):
+            captured["sql"] = sql
+            captured["rows"] = rows
+
+    errs = {"SKU1": [{"type": "DATA_ERROR", "code": "C1", "field": "color",
+                      "description": "required"},
+                     {"type": "DATA_ERROR", "code": "C2", "field": "material",
+                      "description": "need JSONArray"}],
+            "SKU2": []}
+    n = _save_errors(_Cur(), "F1", "店A", errs,
+                     {"SKU1": ("list_new", "MP_ITEM", "submitted")})
+    assert n == 2
+    assert "ON CONFLICT (feed_id, sku, seq) DO NOTHING" in captured["sql"]
+    first = captured["rows"][0]
+    assert first[:6] == ("F1", "SKU1", 0, "DATA_ERROR", "C1", "color")
+    assert first[7:10] == ("MP_ITEM", "店A", "list_new")
+    assert captured["rows"][1][2] == 1                  # seq 递增
+    assert _save_errors(_Cur(), "F1", "店A", {"S": []}, {}) == 0

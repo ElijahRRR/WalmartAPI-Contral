@@ -46,6 +46,34 @@ def error_text(errs: list[dict]) -> str:
     return "; ".join(parts)[:900]
 
 
+def _save_errors(cur, feed_id: str, store: str, all_errs: dict[str, list[dict]],
+                 meta: dict) -> int:
+    """输入:游标 + feed + 每 SKU 报错列表 → 输出:落账条数(幂等重入不重复)。
+
+    一条 ingestionError 一行进 ops.feed_item_errors——**拉详情是标准动作**:
+    报错是系统自我优化的燃料,聚合看 ops.v_feed_error_stats。
+    """
+    rows = []
+    for sku, errs in all_errs.items():
+        wf, ft = (meta.get(sku) or ("", ""))[:2]
+        for i, e in enumerate(errs or []):
+            rows.append((feed_id, sku, i,
+                         str(e.get("type") or "") or None,
+                         str(e.get("code") or "") or None,
+                         str(e.get("field") or "") or None,
+                         str(e.get("description") or e.get("message") or "")[:2000]
+                         or None,
+                         ft or None, store, wf or None))
+    if not rows:
+        return 0
+    cur.executemany(
+        "INSERT INTO ops.feed_item_errors (feed_id, sku, seq, error_type, code,"
+        " field, description, feed_type, store, workflow)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        " ON CONFLICT (feed_id, sku, seq) DO NOTHING", rows)
+    return len(rows)
+
+
 def _progress(head: dict) -> str:
     """输入:feed 汇总 → 输出:进度串(feed 级 GET 自带计数,零明细翻页)。"""
     recv = head.get("itemsReceived") or 0
@@ -70,6 +98,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
 
     results: dict[str, tuple[str, str]] = {}
     descs: dict[str, str] = {}
+    all_errs: dict[str, list[dict]] = {}
     for item in feeds.iter_feed_items(store, feed_id):
         sku = str(item.get("sku") or "")
         if not sku:
@@ -77,6 +106,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
         code = str(errs[0].get("code") or errs[0].get("type") or "") if errs else ""
         descs[sku] = error_text(errs)
+        all_errs[sku] = errs
         results[sku] = (feeds.sku_outcome(item.get("ingestionStatus")), code)
 
     _STATUS = {"success": "success", "failed": "failed",
@@ -95,6 +125,8 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             "WHERE feed_id = %s AND sku = %s",
             [(_STATUS[o], code or None, descs.get(sku) or None, feed_id, sku)
              for sku, (o, code) in results.items()])
+        # 报错明细同步落账(标准动作,不是排障时才拉)
+        _save_errors(cur, feed_id, store["name"], all_errs, meta)
         # 台账里有、终态明细里查无 → missing(不装成功也不装失败)
         cur.execute(
             "UPDATE ops.feed_items SET status = 'missing', resolved_at = now() "

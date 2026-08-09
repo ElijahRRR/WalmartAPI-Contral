@@ -42,16 +42,18 @@ _REFLECTORS: list[tuple[str, object]] = [
 
 
 def _explain(store: dict, feed_id: str) -> str:
-    """输入:店铺 + feed_id → 输出:逐 SKU 的完整报错(只读,不改任何状态)。
+    """输入:店铺 + feed_id → 输出:逐 SKU 的完整报错,并补落 ops.feed_item_errors。
 
-    诊断口:终态 feed 不会被再轮询,但报错详情随时可查——码是数字、
-    description 才是能修的线索。
+    终态 feed 不会被再轮询,历史 feed 的报错靠这里补进明细表(幂等);
+    状态列不动(status/error_code 已是终态),只补分析用的明细。
     """
     lines = [f"feed {feed_id} 明细:"]
+    all_errs: dict[str, list[dict]] = {}
     for item in feeds.iter_feed_items(store, feed_id):
         sku = str(item.get("sku") or "?")
         status = item.get("ingestionStatus")
         errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
+        all_errs[sku] = errs
         lines.append(f"  {sku} [{status}]")
         for e in errs:
             lines.append(f"    - type={e.get('type')} code={e.get('code')} "
@@ -61,6 +63,18 @@ def _explain(store: dict, feed_id: str) -> str:
                 lines.append(f"      {desc}")
         if not errs:
             lines.append("    (无 ingestionErrors)")
+
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT sku, workflow, feed_type FROM ops.feed_items "
+                    "WHERE feed_id = %s", (feed_id,))
+        meta = {sku: (wf, ft) for sku, wf, ft in cur.fetchall()}
+        n = feed_track._save_errors(cur, feed_id, store["name"], all_errs, meta)
+        cur.executemany(
+            "UPDATE ops.feed_items SET error_desc = %s"
+            " WHERE feed_id = %s AND sku = %s AND error_desc IS NULL",
+            [(feed_track.error_text(e), feed_id, s)
+             for s, e in all_errs.items() if e])
+    lines.append(f"(报错明细已补落 {n} 条,聚合看 ops.v_feed_error_stats)")
     return "\n".join(lines)
 
 

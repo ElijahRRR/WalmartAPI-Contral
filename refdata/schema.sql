@@ -496,6 +496,40 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     PRIMARY KEY (feed_id, sku)
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
+
+-- feed 报错明细:一条 ingestionError 一行。**拉详情是标准动作,不是排障时才做**
+-- (所有者定稿 2026-08-09):报错是系统自我优化的燃料——哪个字段最常被拒、
+-- 哪个 PT 最难过、改完有没有变好,全靠这张表聚合;只存一个错误码等于把线索扔了。
+CREATE TABLE IF NOT EXISTS ops.feed_item_errors (
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    seq         integer NOT NULL,   -- 同一 SKU 的第几条报错(沃尔玛一次可给十几条)
+    error_type  text,               -- DATA_ERROR / SYSTEM_ERROR / TIMEOUT_ERROR
+    code        text,
+    field       text,               -- 出错字段名(聚合分析的主维度)
+    description text,
+    feed_type   text,
+    store       text,
+    workflow    text,
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku, seq)
+);
+CREATE INDEX IF NOT EXISTS feed_item_errors_field_idx
+    ON ops.feed_item_errors (field, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS feed_item_errors_code_idx
+    ON ops.feed_item_errors (code, occurred_at DESC);
+
+-- 报错排行:改哪个字段收益最大,一眼可见
+CREATE OR REPLACE VIEW ops.v_feed_error_stats AS
+  SELECT feed_type, field, code,
+         count(*)                      AS 次数,
+         count(DISTINCT sku)           AS 影响SKU数,
+         min(occurred_at)              AS 首次,
+         max(occurred_at)              AS 最近,
+         min(description)              AS 描述样本
+  FROM ops.feed_item_errors
+  GROUP BY feed_type, field, code
+  ORDER BY count(*) DESC;
 CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
 CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
 

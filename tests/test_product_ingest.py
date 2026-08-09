@@ -291,3 +291,48 @@ def test_slow_segment_stored_whole():
     assert stored["weight"]["package"] == 3.5
     assert stored["variant"]["parent_asin"] == "B0PARENT"
     assert ingest.product_params(_rec(slow={}))["slow"] is None
+
+
+# ── 采集推送(product_refresh)────────────────────────────────────────────
+
+def test_submit_batch_txt_and_conflict(monkeypatch):
+    """v4 语义:200=新建(inserted 无歧义);409=上次已成功,带既有 batch_id。"""
+    sent = {}
+
+    def fake_post(url, files=None, data=None, headers=None, timeout=None):
+        sent["url"] = url
+        sent["body"] = files["file"][1].decode()
+        sent["data"] = data
+        return httpx.Response(200, json={"batch_id": "B1", "inserted": 3},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    out = scraper.submit_batch("wm-refresh-1", ["B0A", "B0B", "B0C"])
+    assert out["batch_id"] == "B1" and out["inserted"] == 3
+    assert sent["body"] == "B0A\nB0B\nB0C"          # txt 每行一个
+    assert sent["data"]["needs_screenshot"] == "false"   # 不截图=最高吞吐
+    assert "zip_code" not in sent["data"]                # 不切邮编
+
+    def conflict(url, files=None, data=None, headers=None, timeout=None):
+        return httpx.Response(409, json={"detail": {"batch_id": "OLD",
+                                                    "batch_name": "wm-refresh-1"}},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", conflict)
+    with pytest.raises(scraper.BatchExistsError) as ei:
+        scraper.submit_batch("wm-refresh-1", ["B0A"])
+    assert ei.value.batch_id == "OLD"       # 拿既有批次接着轮询,不重复建批
+
+    with pytest.raises(ValueError):
+        scraper.submit_batch("x", [])
+
+
+def test_refresh_targets_sql_gates():
+    from workflows import product_refresh as pr
+    # 只推在线 + PUBLISHED + 店铺 ACTIVE(无 KPI 记录 fail-open);跨店去重
+    assert "missing_since IS NULL" in pr._SQL_TARGETS
+    assert "published_status = 'PUBLISHED'" in pr._SQL_TARGETS
+    assert "s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE'" in pr._SQL_TARGETS
+    assert "SELECT DISTINCT w.sku" in pr._SQL_TARGETS
+    assert pr.TIMEOUT_HOURS == 1 and pr.DANGEROUS is True

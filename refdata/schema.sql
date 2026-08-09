@@ -502,6 +502,22 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
 
+-- 采集推送批次台账(product_refresh 用;所有者定稿 2026-08-09):
+-- 全量重推在线产品前先落账,**确认推上去了(拿到 batch_id)才开始计时**;
+-- 批次名是取回的抓手(按批次查比整库查快得多),1 小时未采完视为超时。
+CREATE TABLE IF NOT EXISTS ops.scrape_batches (
+    batch_name  text PRIMARY KEY,
+    batch_id    text,               -- 采集侧 ID(200 新建 / 409 既有,都记)
+    asin_count  integer NOT NULL,
+    status      text NOT NULL,      -- pushed / running / completed / failed / timeout
+    done        integer, failed integer,   -- 采集侧 stats 快照
+    submitted_at timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz,
+    note        text
+);
+CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
+    ON ops.scrape_batches (status, submitted_at DESC);
+
 -- feed 报错明细:一条 ingestionError 一行。**拉详情是标准动作,不是排障时才做**
 -- (所有者定稿 2026-08-09):报错是系统自我优化的燃料——哪个字段最常被拒、
 -- 哪个 PT 最难过、改完有没有变好,全靠这张表聚合;只存一个错误码等于把线索扔了。

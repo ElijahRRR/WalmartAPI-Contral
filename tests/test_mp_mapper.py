@@ -8,10 +8,19 @@ def test_orderable_three_traps():
     assert isinstance(o["productIdentifiers"], dict)         # 单对象非数组
     assert o["price"] == 20.0 and isinstance(o["price"], float)  # 裸 number
     assert o["inventory"][0]["fulfillmentCenterID"] == "10001234"
-    assert o["inventory"][0]["quantity"] == {"unit": "EACH", "amount": 7}
+    # quantity 是**裸 int**(2026-08-09 实证:写成 {unit,amount} 被拒
+    # EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
+    assert o["inventory"][0]["quantity"] == 7
     assert "T" in o["endDate"]                               # ISO DateTime 含时间
     assert o["brand"] == "Unbranded"
     assert o["fulfillmentLagTime"] == 1 and o["MustShipAlone"] == "No"
+    # Orderable 必填三件(旧 force_overrides 同款,首跑因缺失被拒)
+    assert o["country_of_origin_substantial_transformation"] == "China"
+    assert o["ShippingWeight"] == m.DEFAULT_SHIPPING_WEIGHT   # 无重量数据时
+    assert "T" in o["startDate"] and "Z" in o["startDate"]
+    o2 = m.build_orderable("B0X", "0123", 10, 1, "P1", pt="Cups",
+                           product={"attrs": {"weight": {"package": "3.5 pounds"}}})
+    assert o2["specProductType"] == "Cups" and o2["ShippingWeight"] == 3.5
 
 
 def test_visible_cert_forces_and_doc_field_cleanup():
@@ -72,4 +81,4 @@ def test_assemble_mp_item_shape():
     # productName **不进 Orderable**(2026-08-09 生产实证 EXT_DATA_ERROR_60670554076755:
     # "'productName' is not a valid field"——此前照旧实证写的"两处同值"在 v5 spec 下是错的)
     assert "productName" not in item["Orderable"]
-    assert "ShippingWeight" not in item["Orderable"]          # None 值剔除
+    assert item["Orderable"]["ShippingWeight"] > 0            # 必填,总有值

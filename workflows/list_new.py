@@ -147,7 +147,8 @@ def _spec_precheck(ready: list[dict]) -> str:
                 lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
                 continue
             orderable = mp_mapper.build_orderable(
-                r["asin"], "000000000000", r["_price"], r["_qty"], "0")
+                r["asin"], "000000000000", r["_price"], r["_qty"], "0",
+                pt=r["product_type"], product=r["_p"])
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable)
             if missing:
@@ -321,7 +322,8 @@ def run(params: dict) -> str:
                         reasons.append((r["rownum"], "标题不足10字符"))
                         continue
                     orderable = mp_mapper.build_orderable(
-                        r["asin"], upc, r["_price"], r["_qty"], partner)
+                        r["asin"], upc, r["_price"], r["_qty"], partner,
+                        pt=r["product_type"], product=r["_p"])
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
                     visible, orderable, notes, missing = mp_conform.conform(

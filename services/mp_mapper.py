@@ -23,6 +23,8 @@ feed,任何字段级红线都在这里落地,不依赖提示词自觉。
 """
 
 import logging
+import re
+from datetime import datetime, timezone
 
 logger = logging.getLogger("services.mp_mapper")
 
@@ -163,27 +165,65 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
             {"role": "user", "content": user}]
 
 
-def build_orderable(sku: str, upc: str, price, qty: int,
-                    partner_id: str) -> dict:
-    """输入:sku/upc/沃尔玛价/库存/Partner ID → 输出:Orderable 段。
+DEFAULT_SHIPPING_WEIGHT = 1.0   # 采不到重量时的保守值(单位磅,旧 test_pipeline 同值)
 
-    三陷阱全部照实证:productIdentifiers 单对象;price 裸 number;
-    fulfillmentCenterID=Partner ID。endDate 必须 ISO DateTime。
+
+def shipping_weight(product: dict | None) -> float:
+    """输入:产品数据 → 输出:发货重量(磅);采不到按 DEFAULT_SHIPPING_WEIGHT。
+
+    采集契约:slow.weight = {package, item}(包装重与本体重,不合并)——
+    发货重量取包装重,退而取本体重。形态不定(数字 / {value,unit} / 带单位串),
+    这里只负责取出一个正数。
     """
-    return {
+    weight = ((product or {}).get("attrs") or {}).get("weight")
+    for key in ("package", "item"):
+        v = weight.get(key) if isinstance(weight, dict) else None
+        if isinstance(v, dict):
+            v = v.get("value") or v.get("measure") or v.get("amount")
+        if isinstance(v, (int, float)) and v > 0:
+            return round(float(v), 2)
+        if isinstance(v, str):
+            m = re.search(r"\d+(?:\.\d+)?", v)
+            if m and float(m.group()) > 0:
+                return round(float(m.group()), 2)
+    return DEFAULT_SHIPPING_WEIGHT
+
+
+def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
+                    pt: str = "", product: dict | None = None) -> dict:
+    """输入:sku/upc/沃尔玛价/库存/Partner ID/PT/产品数据 → 输出:Orderable 段。
+
+    字段面与取值逐条对齐旧 auto_listing/mapper.force_overrides 的 Orderable 段
+    (2026-08-09 首跑三条全拒后逐行比对补齐,四处差异都有实证代价):
+      · productIdentifiers 单对象、price 裸 number、fulfillmentCenterID=Partner ID
+      · **inventory[].quantity 是裸 int**——写成 {unit,amount} 会被拒
+        (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
+      · **country_of_origin_substantial_transformation 必填**
+        (EXT_DATA_ERROR_72600149546850,此前整个字段没给)
+      · specProductType / startDate 旧系统都写,此前漏
+      · endDate 必须 ISO DateTime(纯 yyyy-mm-dd 会被拒
+        EXT_DATA_ERROR_00030257670757)
+      · ShippingWeight 是 Orderable 必填:旧系统由 LLM 补,新系统从采集重量取
+    """
+    end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
+    o = {
         "sku": str(sku),
         "productIdentifiers": {"productId": str(upc), "productIdType": "UPC"},
-        "productName": None,        # 由调用方以 Visible.productName 同值回填
         "brand": FORCE_BRAND,
         "price": round(float(price), 2),
-        "ShippingWeight": None,     # 有实测重量才写,调用方决定
+        "ShippingWeight": shipping_weight(product),
         "MustShipAlone": DEFAULT_MUST_SHIP_ALONE,
         "fulfillmentLagTime": DEFAULT_FULFILLMENT_LAG_DAYS,
-        "endDate": SITE_END_DATE,
+        "startDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endDate": end_date,
+        "country_of_origin_substantial_transformation": DEFAULT_COUNTRY_OF_ORIGIN,
         "countryOfOriginAssembly": DEFAULT_COUNTRY_OF_ORIGIN,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
-                       "quantity": {"unit": "EACH", "amount": int(qty)}}],
+                       "quantity": int(qty)}],
     }
+    if pt:
+        o["specProductType"] = str(pt)
+    return o
 
 
 def assemble_mp_item(orderable: dict, pt: str, visible_attrs: dict) -> dict:

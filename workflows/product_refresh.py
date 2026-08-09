@@ -211,7 +211,12 @@ def _check_open() -> list[str]:
 def run(params: dict) -> str:
     """输入:params(execute/check/wait)→ 输出:推送与批次状态摘要。"""
     if params.get("check"):
-        return "\n".join(["在途采集批次:"] + _check_open())
+        # check 不受 dry-run 约束,且**确实写库**(批次落定 + 失败明细落台账)。
+        # 这不是破坏性动作(不推任务、不碰沃尔玛,只是把采集侧的既成事实抄回
+        # 本地台账),但 cli 的 DRY-RUN 横幅会说"只打印将做什么"——这里明说,
+        # 免得看输出的人以为台账没动。
+        return "\n".join(["在途采集批次(check:只读采集侧,结果同步进台账):"]
+                         + _check_open())
 
     asins = _targets()
     if not asins:

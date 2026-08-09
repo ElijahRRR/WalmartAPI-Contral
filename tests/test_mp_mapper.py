@@ -69,5 +69,7 @@ def test_assemble_mp_item_shape():
     item = m.assemble_mp_item(o, "Cups", v)
     assert set(item.keys()) == {"Orderable", "Visible"}      # 并列顶级,非 MPProduct
     assert item["Visible"]["Cups"]["productName"] == "Steel Cup 12oz"
-    assert item["Orderable"]["productName"] == "Steel Cup 12oz"   # 两处同值
+    # productName **不进 Orderable**(2026-08-09 生产实证 EXT_DATA_ERROR_60670554076755:
+    # "'productName' is not a valid field"——此前照旧实证写的"两处同值"在 v5 spec 下是错的)
+    assert "productName" not in item["Orderable"]
     assert "ShippingWeight" not in item["Orderable"]          # None 值剔除

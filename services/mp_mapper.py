@@ -190,10 +190,12 @@ def assemble_mp_item(orderable: dict, pt: str, visible_attrs: dict) -> dict:
     """输入:Orderable + PT + 清洗后 Visible → 输出:一条完整 MPItem。
 
     Orderable 与 Visible 是并列顶级对象(不是 MPProduct,旧按文档猜错过);
-    Visible 直接以 PT 名作命名空间(中间没有 productCategory 层)。
-    productName 两处同值;None 值字段剔除。
+    Visible 直接以 PT 名作命名空间(中间没有 productCategory 层)。None 值字段剔除。
+
+    ⚠ **不往 Orderable 塞 productName**(2026-08-09 生产实证):
+    EXT_DATA_ERROR_60670554076755 "'productName' is not a valid field.
+    Do not add or change the field names in the specification."
+    ——它只属于 Visible;Orderable 的字段面以 spec 为准(mp_conform.strip_unknown)。
     """
     o = {k: v for k, v in orderable.items() if v is not None}
-    if visible_attrs.get("productName"):
-        o["productName"] = visible_attrs["productName"]
     return {"Orderable": o, "Visible": {str(pt): visible_attrs}}

@@ -36,8 +36,8 @@ from datetime import datetime
 from api import feeds, feishu, llm, settings as settings_api
 from registry import db, resources
 from services import amz_source, kpi, listing_sheet, listing_sources, \
-    llm_cache, mp_mapper, pricing, product_events, pt_spec, risk_gate, \
-    stores as stores_svc, upc_pool
+    llm_cache, mp_conform, mp_mapper, pricing, product_events, pt_spec, \
+    risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -130,8 +130,38 @@ def _map_visible(conn, pt: str, spec, product: dict) -> dict:
                                       images=product.get("images"))
 
 
+def _spec_precheck(ready: list[dict]) -> str:
+    """输入:待提交行 → 输出:spec 一致化预检报告(不领 UPC、不提交)。
+
+    dry-run 里就能看到"哪些行会因为哪些必填过不了",不必靠回执试错烧 UPC。
+    LLM 走缓存,同一批重复预检不重复计费。
+    """
+    lines = ["  spec 预检(不领 UPC/不提交):"]
+    ok = 0
+    with db.pg_conn() as conn:
+        for r in ready[:20]:
+            spec = pt_spec.load_pt(r["product_type"])
+            try:
+                visible = _map_visible(conn, r["product_type"], spec, r["_p"])
+            except Exception as e:
+                lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
+                continue
+            orderable = mp_mapper.build_orderable(
+                r["asin"], "000000000000", r["_price"], r["_qty"], "0")
+            _v, _o, notes, missing = mp_conform.conform(
+                spec, pt_spec.orderable_spec(), visible, orderable)
+            if missing:
+                lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
+                             f"{','.join(missing[:8])}")
+            else:
+                ok += 1
+                lines.append(f"    ✓ {r['asin']} 通过(一致化 {len(notes)} 处)")
+    lines.append(f"  预检结论:{ok}/{min(len(ready), 20)} 行可提交")
+    return "\n".join(lines)
+
+
 def run(params: dict) -> str:
-    """输入:params(execute/store)→ 输出:闸门链与提交摘要。"""
+    """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
     rows = listing_sheet.read_rows()
     if params.get("store"):
@@ -152,7 +182,7 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
-         "stock_assumed": 0}
+         "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     candidates: list[dict] = []
 
@@ -253,6 +283,11 @@ def run(params: dict) -> str:
                          f"定价 {r['_price']} 库存 {r['_qty']} 待提交")
         if ready:
             lines.append(f"[DRY-RUN] 共 {len(ready)} 行将进入 领UPC→LLM→提交")
+            if str(params.get("check_spec", "")) in ("1", "true", "yes"):
+                lines.append(_spec_precheck(ready))
+            else:
+                lines.append("  (加 -p check_spec=1 可在提交前跑 spec 一致化"
+                             "预检:会真调 LLM,但不领 UPC 不提交)")
         return "\n".join(lines)
 
     for rownum, why in reasons:
@@ -287,6 +322,20 @@ def run(params: dict) -> str:
                         continue
                     orderable = mp_mapper.build_orderable(
                         r["asin"], upc, r["_price"], r["_qty"], partner)
+                    # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
+                    # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
+                    visible, orderable, notes, missing = mp_conform.conform(
+                        pt_spec.load_pt(r["product_type"]),
+                        pt_spec.orderable_spec(), visible, orderable)
+                    if notes:
+                        logger.info("%s spec 一致化 %d 处:%s", r["asin"],
+                                    len(notes), "; ".join(notes[:6]))
+                    if missing:
+                        upc_pool.release(conn, [upc], "prep_failed")
+                        n["invalid"] += 1
+                        reasons.append((r["rownum"],
+                                        f"必填缺失:{','.join(missing[:6])}"))
+                        continue
                     items.append(mp_mapper.assemble_mp_item(
                         orderable, r["product_type"], visible))
                     claimed.append((r, upc))

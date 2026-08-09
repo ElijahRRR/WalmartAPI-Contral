@@ -102,8 +102,17 @@
       **待数据源归零** → 3 行算出定价待提交(A107,$194.99/$82.48/$61.47,
       库存 = AMZ_IN_STOCK_QTY)。全链路证实:product_ingest → 中心库 →
       amz_source provider → 闸门链 → 定价
-- [ ] L2d --execute 首跑验收:领 UPC → LLM 映射 → MP_ITEM feed → feed_poll
-      回执 → 上架表 O/P/Q 回填(单店小批先行)
+- [x] **L2d --execute 首跑打通全链**(2026-08-09,A107 三条):领 UPC → LLM
+      映射(DeepSeek)→ MP_ITEM feed 提交 → feed_poll 回执 → 上架表 O/P/Q
+      回填,机制无一处出错;但**三条全被沃尔玛以 DATA_ERROR 拒**
+- [x] **spec 一致化流水线补迁**(2026-08-09,services/mp_conform):首跑暴露
+      迁移缺口——旧 auto_listing/mapper.py 有 13 道后处理工序,此前只迁了
+      强制覆盖/文案截断/图片三道,LLM 输出直接塞进载荷。补迁十道:条件必填
+      不动点迭代 + 顶层必填兜底 + 类型对齐(标量→array/object、字符串→数字)
+      + 枚举合法化 + 未知字段剔除(Orderable.productName 即因此被拒)+
+      stateRestrictions 清理 + 空值/minItems 裁剪 + 小数位 + **提交前必填校验
+      (不过就不提交,省 UPC 与配额)**;dry-run 加 -p check_spec=1 预检
+- [ ] 重跑验收:预检 → --execute → 回执 SUCCESS
 - [ ] 变体分组:后置(依赖采集 variation 数据)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)

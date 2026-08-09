@@ -6,6 +6,11 @@
   python cli.py product_refresh -p wait=1       # 真推后阻塞等采完(默认不等)
   python cli.py product_refresh -p check=1      # 只查在途批次状态(不推新的)
 
+批次落定(采完/超时)时**顺手拉失败明细落 ops.scrape_failures**:验证码/超时/
+封禁这类"根本没采到"的 ASIN 在增量流里压根不出现(没产出记录就没有可导出
+的行),不主动拉就永远答不上"这个 ASIN 为什么没有新数据"。
+降级采到的(outcome≠ok)则在 catalog.snapshots,两者互补,见 docs/db_schema.md。
+
 **这是旧工作流第 2 步的等价物**(所有者澄清 2026-08-09:旧维护三步 =
 获取在线产品 → 推送采集拿最新 amz 数据并自动计算 → 读决策并提交)。
 没有这一步,latest_snapshot 会越来越陈旧,而 maintenance 的三个 provider
@@ -95,6 +100,68 @@ def _finish(batch_name: str, status: str, done, failed, note: str = "") -> None:
             (status, done, failed, note or None, batch_name))
 
 
+_SQL_FAILURE = """
+INSERT INTO ops.scrape_failures (batch_name, asin, status, error_type,
+    error_detail, retry_count, occurred_at)
+VALUES (%s,%s,%s,%s,%s,%s,%s)
+ON CONFLICT (batch_name, asin) DO UPDATE SET
+    status = EXCLUDED.status, error_type = EXCLUDED.error_type,
+    error_detail = EXCLUDED.error_detail, retry_count = EXCLUDED.retry_count,
+    occurred_at = EXCLUDED.occurred_at, recorded_at = now()
+"""
+
+
+def _ts_utc(v):
+    """输入:采集侧 updated_at → 输出:带时区的 datetime(或 None)。
+
+    采集侧存的是 **UTC 裸串** `'YYYY-MM-DD HH:MM:SS'`(无时区标记)。
+    直接塞进 timestamptz 会按会话时区解释——本机 CN_TZ 下整整差 8 小时,
+    而且不会报错。所以这里显式补 UTC。
+    """
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("采集失败明细时间无法解析(按空处理): %r", v)
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
+def _pull_failures(batch_name: str, batch_id) -> str:
+    """输入:批次名 + batch_id → 输出:失败原因分布摘要(顺便落 ops.scrape_failures)。
+
+    **拉失败明细是批次落定时的标准动作**(与 feed 报错同款口径):
+    "这个 ASIN 为什么没有新数据" 是维护链遇到数据缺口时第一个要问的问题,
+    而增量流里根本不会出现这些 ASIN——它们压根没产出记录。
+    """
+    if not batch_id:
+        return "失败明细:该批次没记下 batch_id,查不了"
+    try:
+        rows = scraper.batch_failures(batch_id)
+    except Exception as e:
+        logger.warning("批次 %s 失败明细拉取失败:%s", batch_name, e)
+        return f"失败明细:拉取失败({e})"
+    if not rows:
+        return "失败明细:无失败任务"
+    dist: dict[str, int] = {}
+    params = []
+    for r in rows:
+        et = str(r.get("error_type") or "unknown")
+        dist[et] = dist.get(et, 0) + 1
+        params.append((batch_name, r.get("asin"), r.get("status"), et,
+                       (r.get("error_detail") or None), r.get("retry_count"),
+                       _ts_utc(r.get("updated_at"))))
+    params = [p for p in params if p[1]]        # 无 asin 的行没有落库价值
+    if not params:
+        return f"失败明细:{len(rows)} 行均无 asin,未落库(采集侧数据异常)"
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.executemany(_SQL_FAILURE, params)
+    top = ",".join(f"{k}×{v}" for k, v in
+                   sorted(dist.items(), key=lambda kv: -kv[1])[:5])
+    return f"失败明细:{len(params)} 个 ASIN 已落库({top})"
+
+
 def _check_open() -> list[str]:
     """输入:无 → 输出:在途批次的状态行(顺便按采集侧结果落定/标超时)。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -104,7 +171,7 @@ def _check_open() -> list[str]:
         return ["无在途采集批次"]
     out = []
     deadline = timedelta(hours=TIMEOUT_HOURS)
-    for name, _bid, n, status, submitted in rows:
+    for name, bid, n, status, submitted in rows:
         try:
             st = scraper.batch_status(name)
         except LookupError:
@@ -122,12 +189,15 @@ def _check_open() -> list[str]:
             _finish(name, "completed", done, failed)
             out.append(f"  {name}:✅ 采完 {done}/{total}(失败 {failed})"
                        f",耗时 {age.total_seconds() / 60:.0f} 分钟")
+            out.append(f"      {_pull_failures(name, bid)}")
         elif age > deadline:
             # 超时不代表数据没用:已采到的照常进增量流,只是这批不再等
             _finish(name, "timeout", done, failed,
                     f"超 {TIMEOUT_HOURS} 小时未采完")
             out.append(f"  {name}:⏰ 超时({done}/{total}),已标 timeout;"
                        f"已采到的部分照常进增量流")
+            # 超时批同样拉:此刻已判失败的那些,原因照样有价值
+            out.append(f"      {_pull_failures(name, bid)}")
         else:
             _record(name, None, n, "running")
             out.append(f"  {name}:采集中 {done}/{total}"

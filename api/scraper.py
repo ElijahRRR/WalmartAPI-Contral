@@ -6,7 +6,10 @@
 api 层只做接口适配:base_url/token 从 registry 取、超时、按状态码分流、退避。
 "够不够格进 products"这类判断在 services/product_ingest,不在这里。
 
-  export_incremental(cursor, limit) -> (records, next_cursor, has_more)
+  submit_batch(batch_name, asins)       -> {batch_id, inserted, ...}
+  batch_status(batch_name)              -> {status, stats:{...}}
+  batch_failures(batch_id)              -> [{asin, error_type, error_detail, ...}]
+  export_incremental(cursor, limit)     -> (records, next_cursor, has_more)
 
 状态码分流(契约 §5.1,每一条都有来历,别简化):
   200 → 正常(**空结果也是 200**:records=[] + next_cursor 原样不推进)
@@ -130,6 +133,37 @@ def batch_status(batch_name: str) -> dict:
         raise RuntimeError(f"批次状态查询失败 HTTP {resp.status_code}: "
                            f"{resp.text[:200]}")
     return resp.json()
+
+
+FAILURES_LIMIT_MAX = 100000     # 采集侧 Query(ge=1, le=100000),默认即"全要"
+
+
+def batch_failures(batch_id, *, error_type: str = "",
+                   limit: int = FAILURES_LIMIT_MAX) -> list[dict]:
+    """输入:batch_id(整数)→ 输出:失败任务明细行列表。
+
+    每行:{asin, status, error_type, error_detail, retry_count, worker_id,
+    updated_at}。**按 batch_id 而不是批次名**——采集侧另有一条按名字的旧接口
+    只返回最近 200 条(旧仓库踩过:失败超 200 就静默看不全),v4 已不提供,
+    本函数是唯一入口。
+
+    这里拿到的是「根本没采到」的原因(captcha/timeout/blocked/…);
+    「采到了但不完整」在 snapshots.outcome / completeness_ok,两者互补。
+    """
+    if batch_id in (None, ""):
+        raise ValueError("batch_failures:batch_id 为空(该批次没记下 id)")
+    params = {"limit": max(1, min(int(limit), FAILURES_LIMIT_MAX))}
+    if error_type:
+        params["error_type"] = error_type
+    resp = httpx.get(f"{base_url()}/api/batches/{int(batch_id)}/failures",
+                     params=params, headers=_headers(),
+                     timeout=httpx.Timeout(120, connect=10))
+    if resp.status_code == 404:
+        raise LookupError(f"批次不存在:batch_id={batch_id}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"失败明细查询失败 HTTP {resp.status_code}: "
+                           f"{resp.text[:200]}")
+    return (resp.json() or {}).get("failed_tasks") or []
 
 
 def export_incremental(cursor: int, limit: int = 500, *, max_retries: int = 4

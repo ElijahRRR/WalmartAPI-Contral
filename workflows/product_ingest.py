@@ -82,7 +82,7 @@ def run(params: dict) -> str:
             with db.pg_conn() as conn:
                 counts = ingest.ingest_batch(conn, records)
             for k, v in counts.items():
-                total[k] += v
+                total[k] = total.get(k, 0) + v      # outcome_* 键是动态的
 
         # 空页不推进(next_cursor 原样返回);有数据才落游标
         if next_cursor != cursor:
@@ -99,7 +99,10 @@ def run(params: dict) -> str:
             f"观测入库 {total['snapshots']}(重复跳过 {total['dup']}),"
             f"身份更新 {total['products']};游标 {start_cursor} → {cursor}")
     if total["skipped_outcome"]:
-        line += f",非 ok 采集只落观测 {total['skipped_outcome']}"
+        dist = ",".join(f"{k[len('outcome_'):]}×{v}"
+                        for k, v in sorted(total.items())
+                        if k.startswith("outcome_"))
+        line += f",非 ok 采集只落观测 {total['skipped_outcome']}({dist})"
     if total["incomplete"]:
         line += f",completeness_ok=false {total['incomplete']}(空值未覆盖旧值)"
     if total["invalid"]:

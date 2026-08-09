@@ -62,11 +62,15 @@ CREATE TABLE catalog.snapshots (
     asin         text NOT NULL,
     scrape_params jsonb NOT NULL DEFAULT '{}',  -- 邮编等采集参数,参与"最新值"分组
     price        numeric,
-    stock_state  text,
+    stock_state  text,           -- in_stock / out_of_stock / unknown(封闭集)
+    stock_count  integer,        -- ⚠ NULL=没采到,0=确实是 0(下游禁止 or 0)
+    delivery_days integer,       -- 同上
     buybox       jsonb,
     raw          jsonb,          -- 采集器原始载荷(裁剪后)
     scraped_at   timestamptz NOT NULL,
-    source_id    text            -- 采集器侧记录 ID,幂等去重用
+    source_id    text,           -- 采集器侧记录 ID,幂等去重用
+    outcome      text,           -- ok/not_found/blocked/parse_failed/stale
+    completeness_ok boolean      -- 采到了但不完整(空值不覆盖旧值)
 );
 CREATE UNIQUE INDEX ON catalog.snapshots (source_id);
 CREATE INDEX ON catalog.snapshots (marketplace, asin, scraped_at DESC);
@@ -79,6 +83,17 @@ CREATE VIEW catalog.latest_snapshot AS
 
 使用约定:审核服务只关心 products(slow_hash 未变则不重审);
 价格库存维护读 latest_snapshot;上架 workflow 两层 JOIN 取完整输入。
+
+**"这个 ASIN 为什么没有新数据"的两条查法**(2026-08-09 补齐,互补不重叠):
+
+| 情形 | 落在哪 | 怎么查 |
+|---|---|---|
+| 采到了但降级/不完整 | `catalog.snapshots.outcome ≠ 'ok'` / `completeness_ok=false` | 该 ASIN **有**快照行,看 outcome |
+| 根本没采到(验证码/超时/404/封禁) | `ops.scrape_failures` | 该 ASIN **没有**快照行,按 batch_name 或 asin 查 |
+
+第二种在增量流里完全不出现(没产出记录就没有可导出的行),必须由
+`product_refresh` 在批次落定时主动拉 `/api/batches/{batch_id}/failures` 落库
+——与 feed 报错同款口径:**拉详情是标准动作,不是排障时才做**。
 
 ```sql
 -- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert

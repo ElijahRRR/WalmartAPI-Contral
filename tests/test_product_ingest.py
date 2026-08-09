@@ -328,6 +328,97 @@ def test_submit_batch_txt_and_conflict(monkeypatch):
         scraper.submit_batch("x", [])
 
 
+def test_snapshot_carries_outcome_and_completeness():
+    """采集结局随观测落库:没有它,'这个 ASIN 为什么没数据'查不了。"""
+    s = ingest.snapshot_params(_rec(outcome="blocked", completeness_ok=False))
+    assert s["outcome"] == "blocked" and s["completeness_ok"] is False
+    assert ingest.snapshot_params(_rec())["outcome"] == "ok"
+    # 缺字段的老记录按 ok(契约默认),不能落成 NULL 与"没采过"混淆
+    assert ingest.snapshot_params(_rec(outcome=None))["outcome"] == "ok"
+    for col in ("outcome", "completeness_ok"):
+        assert col in ingest._SNAPSHOT_SQL
+
+
+def test_ingest_reports_outcome_distribution():
+    conn = _FakeConn()
+    counts = ingest.ingest_batch(conn, [
+        _rec(source_id="s1", outcome="blocked"),
+        _rec(source_id="s2", outcome="blocked"),
+        _rec(source_id="s3", outcome="not_found"),
+    ])
+    assert counts["outcome_blocked"] == 2 and counts["outcome_not_found"] == 1
+
+
+def test_batch_failures_pulls_detail_not_just_a_count(monkeypatch):
+    """失败明细按 batch_id 拉(按批次名的旧接口只给最近 200 条,v4 已废)。"""
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen["url"], seen["params"] = url, params
+        return httpx.Response(200, json={
+            "batch_id": 7, "count": 1,
+            "failed_tasks": [{"asin": "B0A", "status": "failed",
+                              "error_type": "captcha", "error_detail": "boom",
+                              "retry_count": 3,
+                              "updated_at": "2026-08-09 02:00:00"}]},
+            request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    rows = scraper.batch_failures("7", limit=999999)
+    assert rows[0]["error_type"] == "captcha"
+    assert seen["url"].endswith("/api/batches/7/failures")
+    assert seen["params"]["limit"] == scraper.FAILURES_LIMIT_MAX   # 上限夹住
+
+    _patch_http(monkeypatch, [(404, {"detail": "批次不存在"})])
+    with pytest.raises(LookupError):
+        scraper.batch_failures(7)
+    with pytest.raises(ValueError):
+        scraper.batch_failures(None)        # 没记下 batch_id 就查不了,别瞎猜
+
+
+def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
+    from datetime import timezone
+    from workflows import product_refresh as pr
+
+    saved = []
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, params): saved.extend(params)
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(pr.scraper, "batch_failures", lambda bid: [
+        {"asin": "B0A", "status": "failed", "error_type": "captcha",
+         "error_detail": "d", "retry_count": 3,
+         "updated_at": "2026-08-09 02:00:00"},
+        {"asin": "B0B", "status": "failed", "error_type": "captcha",
+         "error_detail": None, "retry_count": 1, "updated_at": None},
+        {"asin": None, "error_type": "timeout"},        # 无 asin:落库没价值
+    ])
+    line = pr._pull_failures("wm-refresh-x", "7")
+    assert "2 个 ASIN 已落库" in line and "captcha×2" in line
+    assert [p[1] for p in saved] == ["B0A", "B0B"]
+    # 采集侧给的是 UTC 裸串:必须显式补 UTC,否则按会话时区解释会差 8 小时
+    assert saved[0][6].tzinfo is not None
+    assert saved[0][6].astimezone(timezone.utc).hour == 2
+    assert saved[1][6] is None
+
+    # 拉不到不该毁掉整轮状态检查(批次已落定,失败明细是附加信息)
+    def boom(bid):
+        raise RuntimeError("网络炸了")
+
+    monkeypatch.setattr(pr.scraper, "batch_failures", boom)
+    assert "拉取失败" in pr._pull_failures("wm-refresh-x", "7")
+    assert "查不了" in pr._pull_failures("wm-refresh-x", None)
+
+
 def test_refresh_targets_sql_gates():
     from workflows import product_refresh as pr
     # 只推在线 + PUBLISHED + 店铺 ACTIVE(无 KPI 记录 fail-open);跨店去重

@@ -179,6 +179,55 @@ def _rows(conn, stockzero_stores: list[str]) -> list[tuple]:
         return cur.fetchall()
 
 
+_DEDUPE_SCOPE = "maintenance:submitted"
+SUPPRESS_HOURS = 20     # 同 (店铺,SKU,类型,新值) 多久内不重复提交
+
+
+def _suppress_key(it: dict) -> str:
+    return f"{it['store']}|{it['sku']}|{it['kind']}|{it.get('new')}"
+
+
+def drop_recent(conn, intents: list[dict],
+                hours: int = SUPPRESS_HOURS) -> tuple[list[dict], int]:
+    """输入:连接 + 意图 → 输出:(去掉近期已提交过的, 被压掉的条数)。
+
+    **为什么必须有这道闸**(2026-08-09 生产实证:208 条 ERR_EXT_DATA_0101198
+    "stale update request"):provider 比的是 amz 值 vs `catalog.walmart_items`
+    的**上次扫店快照**。提交成功后本地快照不变(要等 catalog_sync 再扫一遍),
+    下一轮同样的差异又算出来 → 重发一模一样的载荷 → 烧配额且被沃尔玛判重。
+
+    键含**新值**:值真变了(amz 又调价了)照样能提交,压的只是"同一件事
+    再做一遍"。窗口 20 小时(维护日跑一轮,留 4 小时余量)。
+    """
+    if not intents:
+        return intents, 0
+    keys = [_suppress_key(i) for i in intents]
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT key FROM ops.dedupe WHERE scope = %s AND key = ANY(%s)"
+            " AND created_at > now() - make_interval(hours => %s)",
+            (_DEDUPE_SCOPE, keys, int(hours)))
+        recent = {r[0] for r in cur.fetchall()}
+    if not recent:
+        return intents, 0
+    kept = [i for i, k in zip(intents, keys) if k not in recent]
+    logger.info("近 %d 小时内已提交过的意图压掉 %d 条(防 stale update)",
+                hours, len(intents) - len(kept))
+    return kept, len(intents) - len(kept)
+
+
+def record_submitted(conn, intents: list[dict]) -> int:
+    """输入:连接 + 已提交的意图 → 输出:记账条数(供 drop_recent 抑制)。"""
+    if not intents:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO ops.dedupe (scope, key, meta) VALUES (%s,%s,%s::jsonb)"
+            " ON CONFLICT (scope, key) DO UPDATE SET created_at = now()",
+            [(_DEDUPE_SCOPE, _suppress_key(i), None) for i in intents])
+    return len(intents)
+
+
 def _cap(intents: list[dict], kind: str) -> list[dict]:
     """输入:意图列表 → 输出:截到单轮上限(超出只告警,下轮继续)。"""
     if len(intents) <= MAX_INTENTS_PER_KIND:

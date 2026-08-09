@@ -33,6 +33,12 @@
          (同日从旧值 12 收紧,与 list_new 共用 amz_source.MAX_LEAD_DAYS)
   改标题 amz 标题过与上架同一套文案处理(去品牌/截 199)vs 沃尔玛现标题;
          占位符跳过、productType/UPC/标题三缺一跳过(旧防线)
+  **重复提交抑制**(2026-08-09 生产实证 208 条 ERR_EXT_DATA_0101198
+  "stale update request"):provider 比的是 amz 值 vs walmart_items 的**上次
+  扫店快照**,提交成功后本地快照要等 catalog_sync 再扫才更新——不压就会一轮轮
+  重发同样的载荷。ops.dedupe 记 (店铺,SKU,类型,新值),20 小时内不重发;
+  值真变了照样提交。⚠ **调度上 catalog_sync 必须排在 maintenance 之前**,
+  否则还会对已下架的 SKU 提交(实证:38 条改库存 + 30 条改价 not found)。
   三个自动 provider 都只作用于 source_type='amz' 的行(路由铁律),
   且**整店排除 stockzero 店**——否则"跟随 amz 库存"会把刚清零的货顶回去。
   ⚠ 与旧系统的驱动方式不同:旧的读飞书运营决策列(是否更新价格/新价…),
@@ -164,6 +170,9 @@ def collect_intents(conn, stockzero: list[str],
         # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上
         if (it["store"], it["sku"]) not in doomed:
             intents.append(it)
+    # 近期已提交过同一件事的压掉:提交成功后本地快照要等 catalog_sync 才更新,
+    # 不压就会一轮轮重发同样的载荷(生产实证 208 条 stale update)
+    intents, _n = mi.drop_recent(conn, intents)
     return intents
 
 
@@ -181,6 +190,12 @@ def _record_deletes(store: str, rows: list[dict], feed_id) -> None:
             for r in rows])
 
 
+def _record_submitted(items: list[dict]) -> None:
+    """已提交的意图记账(ops.dedupe),供下轮 drop_recent 抑制重复提交。"""
+    with db.pg_conn() as conn:
+        mi.record_submitted(conn, items)
+
+
 def _submit_kind(store: dict, kind: str, items: list[dict],
                  today: str, lines: list[str]) -> list[tuple]:
     """输入:店铺 + 类型 + 意图 → 输出:维护记录表行。路由 PUT/feed(显式 if)。"""
@@ -196,6 +211,8 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
                 ok, why = inv_api.put_inventory(store, it["sku"], it["new"])
             records.append((name, it["sku"], label, it["old"], it["new"],
                             "sync", today, "成功" if ok else "失败", why))
+            if ok:
+                _record_submitted([it])
         n_ok = sum(1 for r in records if r[7] == "成功")
         lines.append(f"  {name}:{label} 同步 PUT {len(items)},成功 {n_ok}")
         return records
@@ -227,6 +244,8 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
         if (kind == "delete" and res["outcome"] == "submitted"
                 and res["feed_id"]):
             _record_deletes(name, batch, res["feed_id"])
+        if res["outcome"] == "submitted":
+            _record_submitted(batch)
         if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
             for it in batch:
                 # 删除类的 C 列带原因(variant_offset / 商品不存在),便于

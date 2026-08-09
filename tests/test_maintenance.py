@@ -13,8 +13,12 @@ STORE = {"name": "T1", "client_id": "c", "client_secret": "s", "proxy": None}
 
 def _fake_db(monkeypatch, conn):
     from registry import db
-    monkeypatch.setattr(db, "pg_conn",
-                        contextlib.contextmanager(lambda: iter([conn])))
+
+    @contextlib.contextmanager
+    def _open():            # 可重复进入:一轮维护会开好几次连接
+        yield conn
+
+    monkeypatch.setattr(db, "pg_conn", _open)
 
 
 class _Conn:
@@ -28,6 +32,10 @@ class _Conn:
 
     def execute(self, sql, args=None):
         self.sqls.append((sql, args))
+        self._last = sql
+
+    def executemany(self, sql, seq):
+        self.sqls.append((sql, list(seq)))
         self._last = sql
 
     def fetchall(self):
@@ -225,6 +233,35 @@ def test_long_oos_intents_carry_reason(monkeypatch):
     out = mi.delete_intents(_TwoQueries(), oos_days=15)
     assert [(i["sku"], i["reason"], i["label"]) for i in out] == [
         ("B0DEAD", "连续无货15天", "删除(连续无货15天)")]
+
+
+def test_drop_recent_suppresses_same_intent_within_window(monkeypatch):
+    """208 条 stale update 的解药:同 (店铺,SKU,类型,新值) 20 小时内不重发。"""
+    intents = [
+        {"store": "T1", "sku": "B0A", "kind": "price", "new": 30.0},
+        {"store": "T1", "sku": "B0B", "kind": "price", "new": 31.0},
+    ]
+
+    class _Recent(_Conn):
+        def fetchall(self):
+            return [("T1|B0A|price|30.0",)]
+
+    kept, n = mi.drop_recent(_Recent(), intents)
+    assert n == 1 and [i["sku"] for i in kept] == ["B0B"]
+    # 值真变了照样能提交(键含新值,压的只是"同一件事再做一遍")
+    kept2, n2 = mi.drop_recent(_Recent(), [
+        {"store": "T1", "sku": "B0A", "kind": "price", "new": 33.0}])
+    assert n2 == 0 and len(kept2) == 1
+    assert mi.drop_recent(_Conn(), []) == ([], 0)
+
+
+def test_record_submitted_keys_include_new_value():
+    conn = _Conn()
+    n = mi.record_submitted(conn, [
+        {"store": "T1", "sku": "B0A", "kind": "inventory", "new": 0}])
+    assert n == 1
+    sql, params = conn.sqls[-1]
+    assert "ops.dedupe" in sql and params[0][1] == "T1|B0A|inventory|0"
 
 
 def test_build_title_item_shape():

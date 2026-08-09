@@ -135,13 +135,15 @@ def test_price_ok_boundary():
 # ══════════════════════════════════════════════════════════════════════════════
 
 LINE = {"order_line_id": "PO1|SKU1", "sku": "B001", "qty": 1,
-        "product_amount": 100, "postal_code": "10001"}
+        "product_amount": 100, "postal_code": "10001",
+        "product_name": "Acme Widget Pro 12 inch Blue"}
 
 
 def _snap(**kw):
     base = {"asin": "B001", "zip": "10001", "amz_price": 50, "shipping": 0,
             "stock_qty": 10, "ship_method": "FBA", "ship_days": 3,
             "seller": "Amazon.com", "screenshot_url": None, "outcome": "ok",
+            "amz_title": "Acme Widget Pro 12 inch Blue",
             "scraped_at": "2026-08-09T00:00:00Z"}
     base.update(kw)
     return base
@@ -226,21 +228,112 @@ def test_judge_qty_multiplies_cost():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  商品一致性(标题相似度)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_title_similarity_normalizes():
+    """大小写/标点/多余空白不该拉低相似度。"""
+    assert rules.title_similarity("Acme Widget, 12-inch (Blue)",
+                                  "acme  widget 12 inch blue") == 1.0
+
+
+def test_title_similarity_none_when_missing():
+    """None(算不了)与 0.0(都在但完全不像)是两回事。"""
+    assert rules.title_similarity("", "Acme") is None
+    assert rules.title_similarity("Acme", None) is None
+    assert rules.title_similarity("aaaa", "zzzz") == 0.0
+
+
+def test_judge_title_mismatch_is_manual():
+    """标题差太远 = 疑似采错商品,拿它算的限价无意义 → 待人工。"""
+    res = rules.judge(LINE, _snap(amz_title="Completely Different Thing"),
+                      SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "标题相似度" in res.note
+    assert res.detail["title_similarity"] < rules.TITLE_SIMILARITY_MIN
+
+
+def test_judge_title_similarity_recorded_on_pass():
+    """通过的行也要留下相似度数值——「标题相似度」列要展示它。"""
+    res = rules.judge(LINE, _snap(), SUPPLIERS, set())
+    assert res.status == rules.PASS
+    assert res.detail["title_similarity"] == 1.0
+
+
+def test_judge_title_missing_is_manual():
+    res = rules.judge(LINE, _snap(amz_title=None), SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "标题取不到" in res.note
+
+
+def test_judge_title_checked_before_price():
+    """一致性排在限价前:标题不符时不该先蹦出限价结论。"""
+    res = rules.judge(LINE, _snap(amz_price=999, amz_title="Different Thing"),
+                      SUPPLIERS, set())
+    assert res.status == rules.MANUAL and "限价" not in res.note
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  按邮编采集的轮次编排(同一 ASIN 不同邮编严禁同批)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_plan_round_one_zip_per_asin():
+    """同一 ASIN 本轮只放行一个邮编——同批混邮编会互相覆盖丢数据。"""
+    todo = rules.plan_round([("B1", "10001"), ("B1", "90210"),
+                             ("B2", "10001")], set())
+    assert len(todo) == 2
+    assert {a for a, _ in todo} == {"B1", "B2"}
+    assert len([z for a, z in todo if a == "B1"]) == 1
+
+
+def test_plan_round_skips_inflight_asin():
+    """该 ASIN 有邮编在途 → 整个 ASIN 本轮让开(在途批次正在采它)。"""
+    todo = rules.plan_round([("B1", "90210"), ("B2", "10001")],
+                            {("B1", "10001")})
+    assert todo == [("B2", "10001")]
+
+
+def test_plan_round_is_stable_and_progresses():
+    """邮编按序取,多轮之间稳定推进,不会两轮都挑中同一个。"""
+    pairs = [("B1", "90210"), ("B1", "10001")]
+    first = rules.plan_round(pairs, set())
+    assert first == [("B1", "10001")]
+    # 第一个落定后(不再在途、也不再是待采),下一轮轮到另一个邮编
+    assert rules.plan_round([("B1", "90210")], set()) == [("B1", "90210")]
+
+
+def test_plan_round_drops_incomplete_pairs():
+    assert rules.plan_round([("B1", ""), ("", "10001")], set()) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  采集接入缝
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_from_snapshot_unpacks_buybox():
+def test_from_snapshot_uses_contract_fields():
+    """字段位置按契约 v1:邮编 scrape_params.zipcode、配送方式 raw.is_fba、
+    卖家 buybox.buybox_seller —— 按名字猜会全取空。"""
     snap = rules.from_snapshot({
         "asin": "B001", "price": 12.5, "stock_count": 3, "delivery_days": 4,
-        "buybox": {"fulfillment": "FBA", "seller_name": "Acme",
-                   "shipping_fee": 2.5, "screenshot_url": "http://x/a.jpg"},
-        "scrape_params": {"zip": "10001-2222"}, "outcome": "ok",
-        "scraped_at": "2026-08-09T00:00:00Z"})
+        "buybox": {"buybox_seller": "Acme", "shipping_fee": 2.5},
+        "raw": {"is_fba": "FBA", "screenshot_url": "http://x/a.jpg"},
+        "scrape_params": {"zipcode": "10001-2222"}, "outcome": "ok",
+        "title": " Acme Widget ", "scraped_at": "2026-08-09T00:00:00Z"})
     assert snap["zip"] == "10001"            # 快照侧邮编也走同一标准化
     assert snap["ship_method"] == "FBA"
     assert snap["seller"] == "Acme"
     assert snap["shipping"] == 2.5
+    assert snap["amz_title"] == "Acme Widget"
     assert snap["screenshot_url"] == "http://x/a.jpg"
+
+
+def test_from_snapshot_discards_zip_mismatch():
+    """zip_verify=mismatch:切邮编失败拿回的是默认地区价格,必须判废。"""
+    snap = rules.from_snapshot({
+        "asin": "B001", "price": 12.5, "buybox": {}, "raw": {},
+        "scrape_params": {"zipcode": "10001", "zip_verify": "mismatch",
+                          "zip_observed": "94105"}})
+    assert snap["zip"] == ""                 # 匹配不上任何订单行 → 视同没采到
 
 
 def test_from_snapshot_tolerates_missing_buybox():
@@ -281,6 +374,10 @@ class FakeCursor:
 
     def executemany(self, sql, seq):
         self.conn.executed.append((sql, list(seq)))
+
+    @property
+    def rowcount(self):
+        return len(self._rows)
 
     def fetchall(self):
         return self._rows
@@ -324,6 +421,14 @@ def wired(monkeypatch):
         return len(desired), []
     monkeypatch.setattr(wf.feishu, "update_by_key", fake_update)
 
+    # 采集器一律不真连:记录每次提交的 (批次名, ASIN 列表, 邮编, 是否要截图)
+    calls["batches"] = []
+
+    def fake_submit(name, asins, *, zip_code="", needs_screenshot=False):
+        calls["batches"].append((name, list(asins), zip_code, needs_screenshot))
+        return {"batch_id": "b1", "inserted": len(asins)}
+    monkeypatch.setattr(wf.scraper, "submit_batch", fake_submit)
+
     # registry 未登记也能跑:require() 直接返回自身
     for res in (wf.resources.ZIP_BLACKLIST_SHEET, wf.resources.SUPPLIER_TABLE,
                 wf.resources.ORDER_SALES_AUDIT):
@@ -331,8 +436,9 @@ def wired(monkeypatch):
     return wf, calls
 
 
-PICK_COLS = ["order_line_id", "store", "sku", "qty", "product_amount",
-             "shipping_amount", "postal_code", "sale_status", "audit_status"]
+PICK_COLS = ["order_line_id", "store", "sku", "product_name", "qty",
+             "product_amount", "shipping_amount", "postal_code",
+             "sale_status", "audit_status"]
 
 
 def test_run_end_to_end_pass(wired, monkeypatch):
@@ -340,13 +446,14 @@ def test_run_end_to_end_pass(wired, monkeypatch):
     conn = FakeConn({
         "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
 
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
-                         "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget Pro 12 inch Blue",
+                         1, 100, 0, "10001", "Shipped", None)]),
         "FROM catalog.latest_snapshot": (
             ["asin", "price", "stock_count", "delivery_days", "buybox",
-             "scrape_params", "outcome", "scraped_at"],
-            [("B001", 50, 5, 3, {"fulfillment": "FBA", "seller_name": "Acme"},
-              {"zip": "10001"}, "ok", None)]),
+             "scrape_params", "raw", "outcome", "scraped_at", "title"],
+            [("B001", 50, 5, 3, {"buybox_seller": "Acme"},
+              {"zipcode": "10001"}, {"is_fba": "FBA"}, "ok", None,
+              "Acme Widget Pro 12 inch Blue")]),
         "audit_status IS NOT NULL": (
             ["order_line_id", "audit_status", "audit_detail"],
             [("PO1|SKU1", rules.PASS,
@@ -373,10 +480,11 @@ def test_run_skips_phishing_marked_rows(wired, monkeypatch):
     conn = FakeConn({
         "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
 
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
-                         "Shipped", f"{rules.REJECT}"),
-                        ("PO2|SKU2", "店A", "B002", 1, 100, 0, "10001",
-                         "Shipped", f"{rules.PHISHING_MARK}邮编:10001")]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
+                         "10001", "Shipped", f"{rules.REJECT}"),
+                        ("PO2|SKU2", "店A", "B002", "Acme Widget", 1, 100, 0,
+                         "10001", "Shipped",
+                         f"{rules.PHISHING_MARK}邮编:10001")]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -390,8 +498,8 @@ def test_run_no_snapshot_reports_pending_scrape(wired, monkeypatch):
     conn = FakeConn({
         "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
 
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
-                         "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget Pro 12 inch Blue",
+                         1, 100, 0, "10001", "Shipped", None)]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -413,6 +521,49 @@ def test_run_requeues_manual_rows(wired, monkeypatch):
     wf.run({"recheck": "1"})
     recheck_sql = [s for s, _ in conn.executed if "ORDER BY order_date DESC" in s][-1]
     assert "audit_status IS NULL" not in recheck_sql
+
+
+def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
+    """缺快照的行 → 按收件邮编推采集,且**先落 pending 再调接口**。"""
+    wf, calls = wired
+    conn = FakeConn({
+        "ORDER BY order_date DESC": (
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
+                         "10001-2222", "Shipped", None)]),
+        "audit_status IS NOT NULL": (["order_line_id", "audit_status",
+                                      "audit_detail"], []),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    summary = wf.run({})
+
+    assert len(calls["batches"]) == 1
+    name, asins, zip_code, shot = calls["batches"][0]
+    assert asins == ["B001"]
+    assert zip_code == "10001"          # zip+4 收敛后再推
+    assert shot is True                 # 审核要截图做佐证
+    assert "推采集:1 个 ASIN" in summary
+
+    # 提交前必须已经写过 pending(顺序反了就会"推上去了但库里没记录")
+    sqls = [s for s, _ in conn.executed]
+    pending_at = next(i for i, s in enumerate(sqls)
+                      if "INSERT INTO ops.audit_scrape" in s)
+    assert conn.executed[pending_at][1] == [("B001", "10001", name)]
+    # 台账对账必须发生在写 pending 之前(重启安全的前提)
+    assert any("state = 'done'" in s for s in sqls[:pending_at])
+
+
+def test_run_scrape_can_be_disabled(wired, monkeypatch):
+    wf, calls = wired
+    conn = FakeConn({
+        "ORDER BY order_date DESC": (
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
+                         "10001", "Shipped", None)]),
+        "audit_status IS NOT NULL": (["order_line_id", "audit_status",
+                                      "audit_detail"], []),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    wf.run({"scrape": "0"})
+    assert calls["batches"] == []
 
 
 def test_run_config_missing_suppliers_refuses(wired, monkeypatch):

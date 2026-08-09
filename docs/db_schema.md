@@ -260,8 +260,10 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
     "scraped_at": "...",
     "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
     "price_cap": 75.0, "cost": 54.0,
+    "title_similarity": 0.9673,                   // →「标题相似度」列
     "rules": {                                    // 各道审核的过程值,事后可复盘
       "phishing": {"hit": false},
+      "title":    {"similarity": 0.9673, "min": 0.9},
       "delivery": {"days": 3, "max": 9},
       "supplier": {"hit": true, "name": "甲", "rate": 1.0},
       "price":    {"cap": 75.0, "cost": 54.0}
@@ -371,6 +373,19 @@ CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不�
 );
 -- 写入一律 INSERT ... ON CONFLICT DO NOTHING:天然实现旧系统"永久累积+全局去重+
 -- 保留首次发现日期"语义,消掉旧系统清空飞书全表重写的丢数据风险
+
+CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一个 ASIN×邮编一行)
+    asin text, zip text,            -- zip = 5 位标准邮编
+    batch_name text, state text,    -- pending / done / failed
+    reason text, requested_at timestamptz, settled_at timestamptz,
+    PRIMARY KEY (asin, zip)
+);
+-- 三个作用:① **先落 pending 再调接口**(铁律)——旧系统没有任何防重记录,
+-- 提交中途一断就丢,重启后无从对账;② **同一 ASIN 不同邮编严禁同批提交**
+-- (所有者定稿 2026-08-09:会漏数据,采集侧按 ASIN 唯一存结果),在途集合
+-- 就是"该 ASIN 本轮已占用一个邮编"的依据;③ 落定判据看**快照是否真出现**
+-- (requested_at 之后该 ASIN×邮编有新快照才算 done),而不是看批次状态——
+-- 批次说成功但数据没落地的情况照样能抓出来。超 3 小时无快照判 failed 重推。
 
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'

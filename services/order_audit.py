@@ -8,10 +8,13 @@
 | 限价 | 商品金额 × 0.75,成本用写死汇率 6.8 | 限价公式不变;汇率改**按采购方取** |
 | 成本 | 单价×数量×汇率(+运费另计) | (单价×数量×采购方汇率 + 运费) × 1.08 |
 | 配送时长 | ≥12 天建议拒绝 | **≥9 天**建议拒绝 |
+| 商品一致性 | 标题相似度 0.9 | 阈值不变;相似度数值另出一列给人看 |
 | 输出 | 单列 AN 文本 | 审核状态(结论)+ 脚本审核(明细)两列 |
 
-四道审核的顺序即优先级(见 judge):钓鱼 → 采集完整性 → 配送时长 →
+审核顺序即优先级(见 judge):钓鱼 → 采集完整性 → **商品一致性** → 配送时长 →
 采购方 → 限价。任何一道给不出确定答案,结论都是"待人工",**绝不当作通过**。
+一致性排在配送时长与限价之前:采到的若不是同一个商品,拿它算出来的限价
+和货期全无意义,不该产出确定结论。
 
 null-0 铁律:采集侧 stock_count / delivery_days 的 NULL 表示"没采到",
 0 表示"确实是 0"。本模块只在值 is not None 时判定,None 一律走待人工——
@@ -21,6 +24,7 @@ null-0 铁律:采集侧 stock_count / delivery_days 的 NULL 表示"没采到",
 import logging
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 logger = logging.getLogger("services.order_audit")
 
@@ -28,6 +32,7 @@ logger = logging.getLogger("services.order_audit")
 PROFIT_SAFETY_RATIO = 0.75   # 限价 = 沃尔玛商品金额 × 该比例
 TAX_RATE = 1.08              # 采购成本税费系数(乘在汇率换算之后)
 DELIVERY_DAYS_MAX = 9        # 配送时长 ≥ 该天数即建议拒绝
+TITLE_SIMILARITY_MIN = 0.9   # 标题相似度低于此值 = 疑似采错商品,转待人工
 
 # ── 结论文案(下游人工筛选与重采正则都依赖它,改字符串前先查引用)──────────────
 PASS = "✓ 通过"
@@ -160,6 +165,29 @@ def pick_supplier(suppliers: list[Supplier], ship_method, unit_price):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  商品一致性(标题相似度)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _norm_title(v) -> str:
+    """输入:标题 → 输出:比对用归一化文本(小写、去标点、折叠空白)。"""
+    s = _text(v).casefold()
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def title_similarity(walmart_title, amazon_title):
+    """输入:沃尔玛商品名 + 亚马逊标题 → 输出:相似度 0~1(任一为空返回 None)。
+
+    None 与 0.0 是两回事:None = 有一边根本没有标题(算不了),
+    0.0 = 两个标题都在、但完全不像。前者走待人工,后者是明确的不一致。
+    """
+    a, b = _norm_title(walmart_title), _norm_title(amazon_title)
+    if not a or not b:
+        return None
+    return round(SequenceMatcher(None, a, b).ratio(), 4)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  限价
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -225,8 +253,9 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     if not snap:
         return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照", detail)
     detail.update({k: snap.get(k) for k in
-                   ("asin", "zip", "amz_price", "stock_qty", "ship_method",
-                    "ship_days", "seller", "screenshot_url", "scraped_at")})
+                   ("asin", "zip", "amz_price", "shipping", "stock_qty",
+                    "ship_method", "ship_days", "seller", "amz_title",
+                    "screenshot_url", "scraped_at")})
     if snap.get("outcome") and snap["outcome"] != "ok":
         return AuditResult(MANUAL, f"采集未成功({snap['outcome']}),待人工", detail)
 
@@ -238,7 +267,20 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
         return AuditResult(MANUAL, "采集缺字段:" + "、".join(missing) + ",待人工",
                            detail)
 
-    # ③ 配送时长闸(≥9 天建议拒绝)
+    # ③ 商品一致性:采到的得是同一个商品,否则后面拿它算的限价全无意义,
+    #    所以排在配送时长与限价**之前**——垃圾输入不该产出确定结论
+    sim = title_similarity(line.get("product_name"), snap.get("amz_title"))
+    detail["title_similarity"] = sim
+    detail["rules"]["title"] = {"similarity": sim, "min": TITLE_SIMILARITY_MIN}
+    if sim is None:
+        return AuditResult(MANUAL, "标题取不到(沃尔玛或亚马逊一侧为空),待人工",
+                           detail)
+    if sim < TITLE_SIMILARITY_MIN:
+        return AuditResult(MANUAL,
+                           f"商品可能不一致:标题相似度 {sim} < {TITLE_SIMILARITY_MIN},"
+                           f"待人工", detail)
+
+    # ④ 配送时长闸(≥9 天建议拒绝)
     days = _num(snap.get("ship_days"))
     detail["rules"]["delivery"] = {"days": days, "max": DELIVERY_DAYS_MAX}
     if days is not None and days >= DELIVERY_DAYS_MAX:
@@ -246,7 +288,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                            f"配送时长 {int(days)} 天 ≥ {DELIVERY_DAYS_MAX} 天",
                            detail)
 
-    # ④ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
+    # ⑤ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
     sup = pick_supplier(suppliers, snap.get("ship_method"), snap.get("amz_price"))
     if sup is None:
         detail["rules"]["supplier"] = {"hit": False}
@@ -257,7 +299,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail["rate"] = sup.rate
     detail["rules"]["supplier"] = {"hit": True, "name": sup.name, "rate": sup.rate}
 
-    # ⑤ 限价
+    # ⑥ 限价
     cap = price_cap(line.get("product_amount"))
     cost = purchase_cost(snap.get("amz_price"), line.get("qty"), sup.rate,
                          snap.get("shipping"))
@@ -273,18 +315,57 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  采集接入缝(采集器端点改造完成后,只改这一个函数)
+#  按邮编采集的轮次编排
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plan_round(pairs, inflight) -> list[tuple[str, str]]:
+    """输入:待采 [(asin, 邮编)] + 在途 {(asin, 邮编)} → 输出:本轮可提交的 pair。
+
+    两条硬约束(所有者定稿 2026-08-09):
+
+    1. **同一 ASIN 不同邮编不可以同批提交**——采集侧按 ASIN 唯一存储结果,
+       同批并发采同一 ASIN 的两个邮编会互相覆盖,**会漏数据**。故本轮每个
+       ASIN 只放行**一个**邮编,同 ASIN 的其余邮编等下一轮。
+    2. 在途(pending)的 pair 不重复提交——已经推过一次的等它落定。
+       同一 ASIN 只要有任一邮编在途,该 ASIN 本轮整个让开(理由同 1:
+       在途那个批次正在采它)。
+
+    邮编按字典序取,保证多轮之间稳定推进、不会两轮都挑中同一个。
+    """
+    busy_asins = {a for a, _ in inflight}
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for asin, zip5 in sorted(set(pairs)):
+        if not asin or not zip5:
+            continue
+        if asin in busy_asins or asin in seen:
+            continue
+        seen.add(asin)
+        out.append((asin, zip5))
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  采集接入缝(采集契约字段变了,只改这一个函数)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def from_snapshot(row: dict | None) -> dict | None:
     """输入:catalog.latest_snapshot 一行 → 输出:审核用统一形状(无行返回 None)。
 
-    这是全项目**唯一**把采集快照翻译成审核输入的地方。采集器端点改造后
-    字段位置变了,只改本函数,judge/限价/采购方匹配全部不动。
+    这是全项目**唯一**把采集快照翻译成审核输入的地方。采集契约字段位置变了
+    只改本函数,judge/限价/采购方匹配全部不动。
 
-    形状:asin/zip/amz_price/shipping/stock_qty/ship_method/ship_days/seller/
-    screenshot_url/outcome/scraped_at。配送方式、卖家、运费、截图 URL 现藏在
-    buybox jsonb 里(采集器契约 v1);snapshots 没有独立列,故在此解包。
+    字段来历(契约 v1 + §5.1,逐个有据,别按名字猜):
+    - 邮编:`scrape_params.zipcode`(**不是 zip/zip_code**)。
+    - **`zip_verify == "mismatch"` 的记录直接判废**(契约:不应进入该邮编的
+      价格序列)——采集侧切邮编失败时拿到的是默认地区价格,拿它审单等于
+      拿错地区的价格算限价。返回 zip="" 使其匹配不上任何订单行。
+    - 配送方式:`raw->>'is_fba'`(采集侧 parser 读 buybox 的 Ships from 行;
+      契约 fast 段未列为一等字段,但 raw 未裁剪它)。与 maintenance/list_new
+      取的是同一处,三处口径必须一致。
+    - 卖家:`buybox.buybox_seller`(product_ingest 只把 buybox_* 三个键塞进
+      buybox jsonb)。
+    - 运费:契约 fast 段**没有**运费字段;取不到即 None,由 judge 决定怎么办。
     """
     if not row:
         return None
@@ -294,16 +375,29 @@ def from_snapshot(row: dict | None) -> dict | None:
     params = row.get("scrape_params") or {}
     if not isinstance(params, dict):
         params = {}
+    raw = row.get("raw") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    zip5 = norm_zip(params.get("zipcode"))
+    if str(params.get("zip_verify") or "").strip().lower() == "mismatch":
+        logger.warning("ASIN %s 快照 zip_verify=mismatch(请求 %s / 实到 %s),"
+                       "判废不参与审核", row.get("asin"), zip5,
+                       params.get("zip_observed"))
+        zip5 = ""
+
     return {
         "asin": row.get("asin"),
-        "zip": norm_zip(params.get("zip") or params.get("zip_code")),
+        "zip": zip5,
         "amz_price": row.get("price"),
-        "shipping": bb.get("shipping_fee") or bb.get("shipping"),
+        "shipping": bb.get("shipping_fee"),
         "stock_qty": row.get("stock_count"),
-        "ship_method": bb.get("fulfillment") or bb.get("ship_method"),
+        "ship_method": (str(raw.get("is_fba")).strip().upper()
+                        if raw.get("is_fba") is not None else None),
         "ship_days": row.get("delivery_days"),
-        "seller": bb.get("seller_name") or bb.get("seller"),
-        "screenshot_url": bb.get("screenshot_url") or bb.get("screenshot"),
+        "seller": bb.get("buybox_seller"),
+        "amz_title": (row.get("title") or "").strip() or None,
+        "screenshot_url": raw.get("screenshot_url") or raw.get("screenshot"),
         "outcome": row.get("outcome"),
         "scraped_at": row.get("scraped_at"),
     }

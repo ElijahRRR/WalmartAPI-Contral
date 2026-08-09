@@ -526,6 +526,27 @@ CREATE TABLE IF NOT EXISTS ops.scrape_batches (
 CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
     ON ops.scrape_batches (status, submitted_at DESC);
 
+-- 订单审核的按邮编采集台账(order_audit 用;一个 (ASIN, 邮编) 一行)。
+-- 存在的三个理由:
+-- ① **先落 pending 再调接口**(CLAUDE.md 铁律)——旧系统完全没有防重记录,
+--    提交/回填中途一断就丢,重启后没有 pending 可对账(legacy_survey 明列此洞);
+-- ② **同一 ASIN 不同邮编严禁同批提交**(所有者定稿 2026-08-09:会漏数据)——
+--    在途集合就是"这个 ASIN 这轮已经占用了一个邮编"的依据,下个邮编等下一轮;
+-- ③ 落定判据不看批次状态而看**快照是否真出现**(requested_at 之后该 (ASIN,邮编)
+--    有新快照才算 done),批次说成功但数据没落地的情况照样能被抓出来。
+CREATE TABLE IF NOT EXISTS ops.audit_scrape (
+    asin        text NOT NULL,
+    zip         text NOT NULL,      -- 5 位标准邮编
+    batch_name  text,
+    state       text NOT NULL,      -- pending / done / failed
+    reason      text,
+    requested_at timestamptz NOT NULL DEFAULT now(),
+    settled_at  timestamptz,
+    PRIMARY KEY (asin, zip)
+);
+CREATE INDEX IF NOT EXISTS audit_scrape_state_idx
+    ON ops.audit_scrape (state, requested_at);
+
 -- 采集失败明细(product_refresh 批次落定时拉;与 feed_item_errors 同款思路:
 -- **拉详情是标准动作**)。采集侧 /api/batches/{id}/failures 的落库形态:
 -- 真失败(captcha/404/timeout/blocked)在这里,降级采集(outcome≠ok)在

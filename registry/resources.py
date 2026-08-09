@@ -212,7 +212,7 @@ ORDER_SALES_AUDIT = Bitable(
         key="order_line_id", audit_status="审核状态", script_audit="脚本审核",
         amz_price="亚马逊单价", stock_qty="库存数量", ship_method="配送方式",
         ship_days="配送时长", seller="卖家店铺名", screenshot="产品截图",
-        supplier="采购方", price_cap="限价",
+        supplier="采购方", price_cap="限价", title_similarity="标题相似度",
     ),
 )
 

@@ -76,10 +76,17 @@ class BatchExistsError(RuntimeError):
 
 
 def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
-                 max_retries: int = 3) -> dict:
-    """输入:批次名 + ASIN 列表(+邮编)→ 输出:{batch_id, inserted, ...}。
+                 needs_screenshot: bool = False, max_retries: int = 3) -> dict:
+    """输入:批次名 + ASIN 列表(+邮编/是否要截图)→ 输出:{batch_id, inserted, ...}。
 
-    txt 上传(每行一个 ASIN),不切邮编、不截图——吞吐最高的形态。
+    txt 上传(每行一个 ASIN)。两个可选开关都会拖慢吞吐,默认都关——
+    维护链全量重推走最快形态(不切邮编不截图,2000~3000/分钟),
+    订单审核按收件邮编采、且要截图做佐证,两项都开。
+
+    ⚠ 调用方约束(采集侧语义,api 层不替你做):**同一 ASIN 的不同邮编
+    不可以放进同一批次**,采集侧按 ASIN 唯一存结果,同批会互相覆盖丢数据。
+    编排见 services.order_audit.plan_round。
+
     **200 恒等于新建了批次**(v4 语义),inserted 无歧义;撞名抛
     BatchExistsError(带既有 batch_id),由调用方决定是接着轮询还是换名。
     """
@@ -88,7 +95,8 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     url = f"{base_url()}/api/upload"
     body = ("\n".join(str(a).strip() for a in asins if a)).encode("utf-8")
     files = {"file": (f"{batch_name}.txt", body, "text/plain")}
-    data = {"batch_name": batch_name, "needs_screenshot": "false"}
+    data = {"batch_name": batch_name,
+            "needs_screenshot": "true" if needs_screenshot else "false"}
     if zip_code:
         data["zip_code"] = str(zip_code)
     last: Exception | None = None

@@ -25,28 +25,39 @@
 - 配置(黑名单邮编 / 采购方表)每次运行现读飞书,读不到直接失败——
   拿旧配置继续算钱比不出结论危险得多。
 
-采集依赖:审核输入来自 catalog.latest_snapshot 里**该订单收件邮编那一组**快照
-(services.order_audit.from_snapshot 是唯一翻译点)。没有对应邮编的快照 → 该行
-结论为「待人工(待采集)」,并计入待采清单摘要;**推送采集尚未接线**
-(采集器端点改造中),接上后由 product_refresh 带邮编推批次,本工作流不直连采集器。
+采集接入(2026-08-09 接线):
+- 审核输入来自 catalog.latest_snapshot 里**该订单收件邮编那一组**快照,两层
+  JOIN 取标题(services.order_audit.from_snapshot 是唯一翻译点)。缺快照 →
+  该行「待人工(待采集)」并进入本轮待采清单。
+- **同一 ASIN 的不同邮编严禁同批提交**(所有者定稿:采集侧按 ASIN 唯一存结果,
+  同批会互相覆盖丢数据)。故每轮每个 ASIN 只放行一个邮编、一个邮编一个批次,
+  同 ASIN 的其余邮编等下一轮——本工作流按小时跑,多邮编的单几轮内收敛。
+- **先落 pending 再调接口**(CLAUDE.md 铁律):台账 ops.audit_scrape 一个
+  (ASIN,邮编) 一行。每轮开工先对账——requested_at 之后该组合真出现了新快照
+  才算 done(不看批次状态:批次说成功但数据没落地照样要抓出来);超 3 小时
+  仍无快照判失败,下轮重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
+- 采集侧 `zip_verify == "mismatch"` 的快照直接判废(切邮编失败拿回的是默认
+  地区价格,拿它算限价等于按错地区审单)。
 """
 
 import hashlib
 import json
 import logging
+from datetime import datetime
 from decimal import Decimal
 
 import httpx
 
-from api import feishu
+from api import feishu, scraper
 from registry import db, resources
-from services import order_audit as rules
+from services import kpi, order_audit as rules
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.order_audit")
 
 _DEFAULT_DAYS = 3
+_SCRAPE_TIMEOUT_HOURS = 3      # 在途超此时长仍无快照 → 判失败,下轮重推
 _SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe 作用域:URL → file_token
 
 # 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
@@ -78,11 +89,47 @@ WHERE order_date >= now() - make_interval(days => %(days)s)
 
 # 按 (asin, 邮编) 取最新快照:scrape_params 里的邮编参与"最新值"分组,
 # 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷)。
+# 标题在身份层(products),两层 JOIN 才拿得到——商品一致性要用它。
 _SNAP_SQL = """
-SELECT asin, price, stock_count, delivery_days, buybox, scrape_params,
-       outcome, scraped_at
-FROM catalog.latest_snapshot
-WHERE marketplace = 'US' AND asin = ANY(%(asins)s)
+SELECT s.asin, s.price, s.stock_count, s.delivery_days, s.buybox,
+       s.scrape_params, s.raw, s.outcome, s.scraped_at, p.title
+FROM catalog.latest_snapshot s
+LEFT JOIN catalog.products p
+       ON p.marketplace = s.marketplace AND p.asin = s.asin
+WHERE s.marketplace = 'US' AND s.asin = ANY(%(asins)s)
+"""
+
+# ── 采集台账 ──────────────────────────────────────────────────────────────────
+_INFLIGHT_SQL = """
+SELECT asin, zip, batch_name, requested_at
+FROM ops.audit_scrape WHERE state = 'pending'
+"""
+
+# 落定判据:requested_at 之后该 (ASIN, 邮编) 真的出现了新快照。
+# 不看批次状态——批次说成功但数据没落地的情况照样要被抓出来。
+_SETTLE_SQL = """
+UPDATE ops.audit_scrape a
+SET state = 'done', settled_at = now()
+WHERE a.state = 'pending' AND EXISTS (
+    SELECT 1 FROM catalog.snapshots s
+    WHERE s.marketplace = 'US' AND s.asin = a.asin
+      AND s.scrape_params ->> 'zipcode' = a.zip
+      AND s.scraped_at >= a.requested_at)
+"""
+
+_TIMEOUT_SQL = """
+UPDATE ops.audit_scrape
+SET state = 'failed', reason = '超时未见快照', settled_at = now()
+WHERE state = 'pending'
+  AND requested_at < now() - make_interval(hours => %(hours)s)
+"""
+
+_MARK_PENDING_SQL = """
+INSERT INTO ops.audit_scrape (asin, zip, batch_name, state, requested_at)
+VALUES (%s, %s, %s, 'pending', now())
+ON CONFLICT (asin, zip) DO UPDATE SET
+    batch_name = EXCLUDED.batch_name, state = 'pending', reason = NULL,
+    requested_at = now(), settled_at = NULL
 """
 
 
@@ -127,19 +174,94 @@ def _snapshots(conn, lines: list[dict]) -> dict[tuple[str, str], dict]:
     return out
 
 
-def _judge_all(conn, lines: list[dict], blacklist, suppliers) -> tuple[list, int]:
-    """输入:连接 + 待审行 + 配置 → 输出:([(行, 结论)], 待采集行数)。"""
+def _judge_all(conn, lines: list[dict], blacklist, suppliers):
+    """输入:连接 + 待审行 + 配置 → 输出:([(行, 结论)], 待采 [(asin, 邮编)])。"""
     snaps = _snapshots(conn, lines)
-    results, pending_scrape = [], 0
+    results: list = []
+    want: list = []
     for line in lines:
         asin = (line.get("sku") or "").strip().upper()
         zip5 = rules.norm_zip(line.get("postal_code"))
         snap = snaps.get((asin, zip5)) if zip5 else None
         res = rules.judge(line, snap, suppliers, blacklist)
-        if snap is None and res.status == rules.MANUAL:
-            pending_scrape += 1
+        # 缺快照才需要采;钓鱼行连采都不用采(已经终局了,省一次请求)
+        if snap is None and res.status == rules.MANUAL and asin and zip5:
+            want.append((asin, zip5))
         results.append((line, res))
-    return results, pending_scrape
+    return results, want
+
+
+def _settle_ledger(conn) -> tuple[int, int, set]:
+    """输入:连接 → 输出:(本轮落定数, 判超时数, 仍在途的 {(asin, 邮编)})。
+
+    每轮开工先对账——这就是"重启后先查实际状态再决定是否补交"(CLAUDE.md
+    铁律)的落地:进程死了没关系,pending 记录还在,下轮照样能判断该不该重推。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SETTLE_SQL)
+        settled = cur.rowcount or 0
+        cur.execute(_TIMEOUT_SQL, {"hours": _SCRAPE_TIMEOUT_HOURS})
+        timed_out = cur.rowcount or 0
+        cur.execute(_INFLIGHT_SQL)
+        inflight = {(r[0], r[1]) for r in cur.fetchall()}
+    conn.commit()
+    if timed_out:
+        logger.warning("采集台账:%d 个 (ASIN,邮编) 超 %d 小时未见快照,判失败"
+                       "(下轮会重推)", timed_out, _SCRAPE_TIMEOUT_HOURS)
+    return settled, timed_out, inflight
+
+
+def _push_scrape(conn, want: list, inflight: set) -> str:
+    """输入:连接 + 待采 pair + 在途 pair → 输出:推送结果摘要(一行)。
+
+    **先落 pending 再调接口**:批次名先写进台账,再 POST。反过来的话
+    (先推后记)网络一断就成了"推上去了但库里没记录",下轮重复推同一批。
+    """
+    todo = rules.plan_round(want, inflight)
+    if not todo:
+        waiting = len({a for a, _ in want} & {a for a, _ in inflight})
+        return (f"推采集:0(在途 {len(inflight)},其中 {waiting} 个 ASIN 的"
+                f"其余邮编排队中)" if inflight else "推采集:0(无待采)")
+
+    stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
+    # 一个邮编一个批次:同批只能有一个邮编(采集侧按 ASIN 唯一存结果,
+    # 同批混邮编会互相覆盖丢数据——所有者定稿 2026-08-09)
+    by_zip: dict[str, list[str]] = {}
+    for asin, zip5 in todo:
+        by_zip.setdefault(zip5, []).append(asin)
+
+    pushed, failed, notes = 0, 0, []
+    for zip5, asins in sorted(by_zip.items()):
+        name = f"wm-audit-{zip5}-{stamp}"
+        with conn.cursor() as cur:
+            cur.executemany(_MARK_PENDING_SQL,
+                            [(a, zip5, name) for a in asins])
+        conn.commit()
+        try:
+            res = scraper.submit_batch(name, asins, zip_code=zip5,
+                                       needs_screenshot=True)
+            pushed += len(asins)
+            notes.append(f"{zip5}×{len(asins)}")
+            logger.info("推采集批次 %s:%d 个 ASIN(inserted=%s)",
+                        name, len(asins), res.get("inserted"))
+        except scraper.BatchExistsError as e:
+            # 撞名 = 上次其实推成功了(v4 绝不静默合并):台账保持 pending 即可
+            pushed += len(asins)
+            notes.append(f"{zip5}×{len(asins)}(沿用既有批次 {e.batch_id})")
+        except Exception as e:
+            failed += len(asins)
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE ops.audit_scrape SET state = 'failed', "
+                    "reason = %s, settled_at = now() "
+                    "WHERE asin = %s AND zip = %s AND state = 'pending'",
+                    [(str(e)[:200], a, zip5) for a in asins])
+            conn.commit()
+            logger.exception("推采集批次 %s 失败", name)
+    out = f"推采集:{pushed} 个 ASIN({'、'.join(notes)})" if pushed else ""
+    if failed:
+        out += f";失败 {failed}"
+    return out or f"推采集:全部失败({failed})"
 
 
 def _save(conn, results: list) -> int:
@@ -219,6 +341,7 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
             f.seller: d.get("seller"),
             f.supplier: d.get("supplier"),
             f.price_cap: _num(d.get("price_cap")),
+            f.title_similarity: _num(d.get("title_similarity")),
         }
         token = _screenshot_token(conn, d.get("screenshot_url"))
         if token:
@@ -234,6 +357,7 @@ def run(params: dict) -> str:
     line_id = str(params.get("line", "")).strip()
     recheck = str(params.get("recheck", "")).lower() in {"1", "true", "yes"}
     do_push = str(params.get("push", "1")).lower() not in {"0", "false", "no"}
+    do_scrape = str(params.get("scrape", "1")).lower() not in {"0", "false", "no"}
 
     blacklist, suppliers = _load_config()
     store_filter = "AND store = ANY(%(stores)s)" if stores else ""
@@ -262,13 +386,21 @@ def run(params: dict) -> str:
         lines = [r for r in lines
                  if rules.PHISHING_MARK not in (r.get("audit_status") or "")]
 
-        results, pending_scrape = _judge_all(conn, lines, blacklist, suppliers)
+        # ② 采集台账先对账(重启安全:pending 还在,能判断该不该重推)
+        settled, timed_out, inflight = _settle_ledger(conn)
+
+        results, want = _judge_all(conn, lines, blacklist, suppliers)
         saved = _save(conn, results)
         tally: dict[str, int] = {}
         for _, res in results:
             tally[res.status] = tally.get(res.status, 0) + 1
 
-        # ② 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
+        # ③ 推采集:每轮每个 ASIN 只放行一个邮编(同批混邮编会漏数据)
+        scrape_note = ""
+        if do_scrape:
+            scrape_note = _push_scrape(conn, want, inflight)
+
+        # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
         pushed = missing = 0
         if do_push:
             push_sql = _PUSH_SQL.format(store_filter=store_filter)
@@ -291,8 +423,13 @@ def run(params: dict) -> str:
     parts = [f"{audit_note}待审 {len(lines)} 行,落库 {saved}"]
     if tally:
         parts.append("结论:" + " / ".join(f"{k} {v}" for k, v in sorted(tally.items())))
-    if pending_scrape:
-        parts.append(f"待采集 {pending_scrape} 行(该邮编下无快照)")
+    if want:
+        parts.append(f"待采集 {len(want)} 行(该邮编下无快照)")
+    if settled or timed_out:
+        parts.append(f"采集落定 {settled}"
+                     + (f",超时判失败 {timed_out}" if timed_out else ""))
+    if scrape_note:
+        parts.append(scrape_note)
     if do_push:
         parts.append(f"飞书回写 {pushed} 行"
                      + (f",{missing} 行尚未建出(等 order_center_push)" if missing else ""))

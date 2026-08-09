@@ -36,9 +36,9 @@ ON CONFLICT (source_id) DO NOTHING
 _PRODUCT_SQL = """
 INSERT INTO catalog.products (
     marketplace, asin, title, brand, amazon_category, image_url, slow_hash,
-    updated_at)
+    slow, updated_at)
 VALUES (%(marketplace)s, %(asin)s, %(title)s, %(brand)s, %(amazon_category)s,
-        %(image_url)s, %(slow_hash)s, now())
+        %(image_url)s, %(slow_hash)s, %(slow)s::jsonb, now())
 ON CONFLICT (marketplace, asin) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, catalog.products.title),
     brand = COALESCE(EXCLUDED.brand, catalog.products.brand),
@@ -46,6 +46,7 @@ ON CONFLICT (marketplace, asin) DO UPDATE SET
                                catalog.products.amazon_category),
     image_url = COALESCE(EXCLUDED.image_url, catalog.products.image_url),
     slow_hash = COALESCE(EXCLUDED.slow_hash, catalog.products.slow_hash),
+    slow = COALESCE(EXCLUDED.slow, catalog.products.slow),
     updated_at = now()
 """
 
@@ -128,6 +129,8 @@ def product_params(rec: dict) -> dict:
         "amazon_category": _category(slow),
         "image_url": _main_image(slow),
         "slow_hash": _blank_to_none(rec.get("slow_hash")),
+        # slow 段全量留存:卖点/描述/重量/尺寸/变体都在这里,契约的 raw 已裁剪
+        "slow": json.dumps(slow, ensure_ascii=False) if slow else None,
     }
 
 

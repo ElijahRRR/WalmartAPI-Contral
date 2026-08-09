@@ -60,13 +60,16 @@ def test_poll_feed_terminal_writes_ledger(monkeypatch):
     head, out = feed_track.poll_feed(STORE, "F1")
     assert head["feedStatus"] == "PROCESSED"
     assert out == {"A": ("success", ""), "B": ("failed", "ERR_9")}
-    sel_sql, _ = conn.sqls[0]
+    def _find(frag):        # 按内容找,别按位置(加语句就错位)
+        return next(x for x in conn.sqls if frag in x[0])
+
+    sel_sql, _ = _find("SELECT sku, workflow")
     assert "SELECT sku, workflow, feed_type, status" in sel_sql  # 先取更新前状态
-    many_sql, rows = conn.sqls[1]
+    many_sql, rows = _find("SET status = %s")
     assert "UPDATE ops.feed_items" in many_sql
-    assert ("success", None, "F1", "A") in rows
-    assert ("failed", "ERR_9", "F1", "B") in rows
-    miss_sql, args = conn.sqls[2]
+    assert ("success", None, None, "F1", "A") in rows
+    assert ("failed", "ERR_9", None, "F1", "B") in rows
+    miss_sql, args = _find("'missing'")
     assert "'missing'" in miss_sql and args[1] == ["A", "B"]   # 查无的标 missing
     assert done == [("F1", True)]
 
@@ -115,8 +118,8 @@ def test_poll_feed_maintenance_receipt_not_in_ledger_for_non_relist(monkeypatch)
     monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
     feed_track.poll_feed(STORE, "F1")
     assert [e["sku"] for e in recorded] == ["B"]        # 只有反补来源入账
-    many_sql, rows = conn.sqls[1]
-    assert ("success", None, "F1", "A") in rows          # 台账不受白名单影响
+    many_sql, rows = next(x for x in conn.sqls if "SET status = %s" in x[0])
+    assert ("success", None, None, "F1", "A") in rows          # 台账不受白名单影响
 
 
 def test_poll_feed_repoll_does_not_duplicate_events(monkeypatch):
@@ -173,3 +176,81 @@ def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
     assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
     assert "T_GONE 删除(-) F2:店铺凭证缺失,跳过" in out
     assert any("提交结局不确定" in m for m in caplog.messages)
+
+
+def test_save_errors_rows_shape():
+    """每条 ingestionError 一行,带 field/code——聚合分析的主维度。"""
+    from services.feed_track import _save_errors
+
+    captured = {}
+
+    class _Cur:
+        def executemany(self, sql, rows):
+            captured["sql"] = sql
+            captured["rows"] = rows
+
+    errs = {"SKU1": [{"type": "DATA_ERROR", "code": "C1", "field": "color",
+                      "description": "required"},
+                     {"type": "DATA_ERROR", "code": "C2", "field": "material",
+                      "description": "need JSONArray"}],
+            "SKU2": []}
+    n = _save_errors(_Cur(), "F1", "店A", errs,
+                     {"SKU1": ("list_new", "MP_ITEM", "submitted")})
+    assert n == 2
+    assert "ON CONFLICT (feed_id, sku, seq) DO NOTHING" in captured["sql"]
+    first = captured["rows"][0]
+    assert first[:6] == ("F1", "SKU1", 0, "DATA_ERROR", "C1", "color")
+    assert first[7:10] == ("MP_ITEM", "店A", "list_new")
+    assert captured["rows"][1][2] == 1                  # seq 递增
+    assert _save_errors(_Cur(), "F1", "店A", {"S": []}, {}) == 0
+
+
+def test_merge_error_shapes():
+    m = feed_track.merge_error
+    assert m("C1", "坏了") == "C1 | 坏了"
+    assert m("C1", "") == "C1"                 # 只有码
+    assert m("", "坏了") == "坏了"              # 只有描述
+    assert m(None, None) == ""
+    assert len(m("C1", "x" * 2000)) == 900     # 截断
+
+
+def test_all_reflectors_write_code_plus_desc(monkeypatch):
+    """停用/删除、维护记录、跟卖三张表的报错列都要带人话(不只上架表)。"""
+    from api import feishu
+    from registry import resources
+    from registry.resources import Spreadsheet
+    from services import clear_sheet, match_sheet
+
+    def _live(sheet):        # 登记条目是 frozen dataclass:换整个对象,别改字段
+        return Spreadsheet(name=sheet.name, token="TOK", sheet_id="SID",
+                           columns=sheet.columns)
+
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {"SKU1": ("failed", "EXT_ERR_1")})
+    monkeypatch.setattr(feed_track, "item_errors",
+                        lambda fid: {"SKU1": "[color] required"})
+    want = "EXT_ERR_1 | [color] required"
+
+    # 停用/删除表:H 报错列
+    monkeypatch.setattr(clear_sheet, "read_rows", lambda: [
+        {"rownum": 2, "sku": "SKU1", "feed_id": "F1", "op_date": "d",
+         "result": "处理中", "error": ""}])
+    captured = {}
+    monkeypatch.setattr(clear_sheet, "writeback",
+                        lambda ups: (captured.update(clear=ups), len(ups))[1])
+    monkeypatch.setattr(resources, "RETIRE_SHEET",
+                        _live(resources.RETIRE_SHEET))
+    clear_sheet.sync_from_ledger()
+    assert captured["clear"][0][4] == want
+
+    # 跟卖表:J feed结果
+    monkeypatch.setattr(match_sheet, "read_rows", lambda: [
+        {"rownum": 2, "sku": "SKU1", "feed_id": "F1", "feed_result": "",
+         "check_time": ""}])
+    monkeypatch.setattr(match_sheet, "row_vals", lambda r: [r["feed_result"]])
+    monkeypatch.setattr(resources, "MATCH_SHEET",
+                        _live(resources.MATCH_SHEET))
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (captured.update(match=ups), len(ups))[1])
+    match_sheet.sync_from_ledger()
+    assert captured["match"][0][1][0][0] == f"失败:{want}"

@@ -89,15 +89,17 @@ def sync_from_ledger() -> str | None:
     if not pollable:
         return None
     now = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d %H:%M")
-    updates, cache = [], {}
+    updates, cache, descs = [], {}, {}
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
             cache[fid] = feed_track.item_results(fid)
+            descs[fid] = feed_track.item_errors(fid)
         st = cache[fid].get(r["sku"])
         if st is None or st[0] == "submitted":
             continue
-        text = {"success": "成功", "failed": f"失败:{st[1]}" if st[1] else "失败",
+        why = feed_track.merge_error(st[1], descs.get(fid, {}).get(r["sku"]))
+        text = {"success": "成功", "failed": f"失败:{why}" if why else "失败",
                 "missing": "未查到"}.get(st[0], "处理中")
         if text in PENDING:
             continue

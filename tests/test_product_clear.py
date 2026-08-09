@@ -133,6 +133,7 @@ def test_sync_from_ledger_backfills_without_walmart_calls(monkeypatch):
     ledger = {"F1": {"OK1": ("success", ""), "BAD1": ("failed", "ERR_Y")},
               "F2": {"WAIT": ("submitted", "")}}
     monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
 
     out = clear_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}

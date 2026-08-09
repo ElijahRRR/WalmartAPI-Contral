@@ -36,8 +36,8 @@ from datetime import datetime
 from api import feeds, feishu, llm, settings as settings_api
 from registry import db, resources
 from services import amz_source, kpi, listing_sheet, listing_sources, \
-    llm_cache, mp_mapper, pricing, product_events, pt_spec, risk_gate, \
-    stores as stores_svc, upc_pool
+    llm_cache, mp_conform, mp_mapper, pricing, product_events, pt_spec, \
+    risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -127,22 +127,104 @@ def _map_visible(conn, pt: str, spec, product: dict) -> dict:
         raw = llm.chat_json(messages)
         llm_cache.put(conn, key, raw)
     return mp_mapper.finalize_visible(pt, raw, spec,
-                                      images=product.get("images"))
+                                      images=product.get("images"),
+                                      product=product)
+
+
+MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
+
+# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对
+_SQL_ATTEMPTS = """
+SELECT f.store, f.sku, count(*)
+FROM ops.feed_items f
+JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
+  ON f.store = t.store AND f.sku = t.sku
+WHERE f.feed_type = 'MP_ITEM'
+GROUP BY f.store, f.sku
+"""
+
+
+def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+    """输入:上架表全部行 → 输出:(可重试行, 已达上限行)。
+
+    O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
+    字段问题改完 mapper 即可),旧系统靠 main 看 N=DATA_ERROR 接回重试。
+    但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
+    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
+
+    ⚠ SKU_LOCKED 永不重试(SKU 已被旧 UPC 绑死);ASYNC_PENDING 不是失败。
+    """
+    cand = [r for r in rows
+            if r["audit_result"].lower() == "pass"
+            and r["list_result"] == "FAILED"
+            and r["list_result"] != "SKU_LOCKED"]
+    if not cand:
+        return [], []
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_ATTEMPTS, ([r["store"] for r in cand],
+                                    [r["asin"] for r in cand]))
+        tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
+    retry, exhausted = [], []
+    for r in cand:
+        if tried.get((r["store"], r["asin"]), 0) >= MAX_LIST_ATTEMPTS:
+            exhausted.append((r["store"], r["asin"]))
+            continue
+        # 重新排队:清掉上一轮的 feedid/结果,让主链当新行处理
+        retry.append({**r, "feed_id": "", "listed": "", "list_result": ""})
+    return retry, exhausted
+
+
+def _spec_precheck(ready: list[dict]) -> str:
+    """输入:待提交行 → 输出:spec 一致化预检报告(不领 UPC、不提交)。
+
+    dry-run 里就能看到"哪些行会因为哪些必填过不了",不必靠回执试错烧 UPC。
+    LLM 走缓存,同一批重复预检不重复计费。
+    """
+    lines = ["  spec 预检(不领 UPC/不提交):"]
+    ok = 0
+    with db.pg_conn() as conn:
+        for r in ready[:20]:
+            spec = pt_spec.load_pt(r["product_type"])
+            try:
+                visible = _map_visible(conn, r["product_type"], spec, r["_p"])
+            except Exception as e:
+                lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
+                continue
+            orderable = mp_mapper.build_orderable(
+                r["asin"], "000000000000", r["_price"], r["_qty"], "0",
+                pt=r["product_type"], product=r["_p"])
+            _v, _o, notes, missing = mp_conform.conform(
+                spec, pt_spec.orderable_spec(), visible, orderable,
+                sku=r["asin"])
+            if missing:
+                lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
+                             f"{','.join(missing[:8])}")
+            else:
+                ok += 1
+                lines.append(f"    ✓ {r['asin']} 通过(一致化 {len(notes)} 处)")
+    lines.append(f"  预检结论:{ok}/{min(len(ready), 20)} 行可提交")
+    return "\n".join(lines)
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store)→ 输出:闸门链与提交摘要。"""
+    """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    pending = [r for r in rows
-               if r["audit_result"].lower() == "pass"
-               and r["listed"].lower() in ("", "no")
-               and not r["feed_id"]
-               and r["list_result"] != "SKU_LOCKED"]
+    fresh = [r for r in rows
+             if r["audit_result"].lower() == "pass"
+             and r["listed"].lower() in ("", "no")
+             and not r["feed_id"]
+             and r["list_result"] != "SKU_LOCKED"]
+    retry, exhausted = _retry_rows(rows)
+    pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
-    lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"]
+    lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
+             + (f"(其中重试 {len(retry)})" if retry else "")]
+    if exhausted:
+        lines.append(f"  ⚠ 重试已达上限({MAX_LIST_ATTEMPTS} 次)不再自动重试:"
+                     + ",".join(a for _, a in exhausted[:10]))
     if not pending:
         return "\n".join(lines)
 
@@ -152,7 +234,7 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
-         "stock_assumed": 0}
+         "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     candidates: list[dict] = []
 
@@ -253,6 +335,11 @@ def run(params: dict) -> str:
                          f"定价 {r['_price']} 库存 {r['_qty']} 待提交")
         if ready:
             lines.append(f"[DRY-RUN] 共 {len(ready)} 行将进入 领UPC→LLM→提交")
+            if str(params.get("check_spec", "")) in ("1", "true", "yes"):
+                lines.append(_spec_precheck(ready))
+            else:
+                lines.append("  (加 -p check_spec=1 可在提交前跑 spec 一致化"
+                             "预检:会真调 LLM,但不领 UPC 不提交)")
         return "\n".join(lines)
 
     for rownum, why in reasons:
@@ -286,7 +373,23 @@ def run(params: dict) -> str:
                         reasons.append((r["rownum"], "标题不足10字符"))
                         continue
                     orderable = mp_mapper.build_orderable(
-                        r["asin"], upc, r["_price"], r["_qty"], partner)
+                        r["asin"], upc, r["_price"], r["_qty"], partner,
+                        pt=r["product_type"], product=r["_p"])
+                    # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
+                    # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
+                    visible, orderable, notes, missing = mp_conform.conform(
+                        pt_spec.load_pt(r["product_type"]),
+                        pt_spec.orderable_spec(), visible, orderable,
+                        sku=r["asin"])
+                    if notes:
+                        logger.info("%s spec 一致化 %d 处:%s", r["asin"],
+                                    len(notes), "; ".join(notes[:6]))
+                    if missing:
+                        upc_pool.release(conn, [upc], "prep_failed")
+                        n["invalid"] += 1
+                        reasons.append((r["rownum"],
+                                        f"必填缺失:{','.join(missing[:6])}"))
+                        continue
                     items.append(mp_mapper.assemble_mp_item(
                         orderable, r["product_type"], visible))
                     claimed.append((r, upc))

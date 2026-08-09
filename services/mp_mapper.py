@@ -23,6 +23,8 @@ feed,任何字段级红线都在这里落地,不依赖提示词自觉。
 """
 
 import logging
+import re
+from datetime import datetime, timezone
 
 logger = logging.getLogger("services.mp_mapper")
 
@@ -75,6 +77,124 @@ def apply_images(attrs: dict, urls: list) -> dict:
     return attrs
 
 
+# LLM **不该输出**的系统后处理字段(旧提示词规则 1a):文案由 Amazon 原文强制,
+# 图片/品牌/UPC/价格/库存由系统填。不靠提示词自觉——这里主动删。
+# swatchImages/swatchImageUrl 尤其:LLM 瞎填会撞
+# EXT_DATA_ERROR_50716566635066(要 JSONObject)。
+SYSTEM_OWNED_FIELDS = (
+    "brand", "productName", "shortDescription", "keyFeatures",
+    "mainImageUrl", "productSecondaryImageURL", "swatchImageUrl",
+    "swatchImages",
+)
+
+_BRAND_NOISE = ("unbranded", "n/a", "unknown", "generic", "")
+
+
+def scrub_brand(text: str, brands: list[str]) -> str:
+    """输入:文本 + 要去掉的品牌名 → 输出:去品牌后的文本(全词匹配,空格整洁)。"""
+    if not text or not brands:
+        return text
+    out = str(text)
+    for b in brands:
+        if not b or str(b).strip().lower() in _BRAND_NOISE:
+            continue
+        out = re.sub(rf"\b{re.escape(str(b))}\b", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,;-")
+    return re.sub(r"\s+([,.;:])", r"\1", out)
+
+
+def _clean_copy(value, brands: list[str]) -> str:
+    """输入:原始文案 → 输出:去品牌 + 去项目符号 + 折叠空白后的单行文本。"""
+    if value is None:
+        return ""
+    text = scrub_brand(str(value), brands).strip()
+    text = re.sub(r"[•·▪▫]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _sentences(text: str, brands: list[str]) -> list[str]:
+    """输入:长文本 → 输出:可当卖点用的句子(≥25 字符;句号切不动就按长度切)。"""
+    text = _clean_copy(text, brands)
+    if not text:
+        return []
+    # 英文标点要求后随空白(防 "12.5 in" 被切开);中日文标点自带停顿,不要求
+    parts = [p.strip() for p in re.split(r"(?:\n+|[.;!?]\s+|[。;!?、])", text)
+             if len(p.strip()) >= 25]
+    if parts:
+        return parts
+    words = text.split()
+    if len(words) >= 24:
+        chunks, cur = [], []
+        for w in words:
+            cur.append(w)
+            if len(" ".join(cur)) >= 120:
+                chunks.append(" ".join(cur))
+                cur = []
+                if len(chunks) >= 4:
+                    break
+        if cur and len(chunks) < 4:
+            chunks.append(" ".join(cur))
+        if chunks:
+            return chunks
+    return [text] if len(text) >= 10 else []
+
+
+def force_amazon_copy(attrs: dict, product: dict) -> dict:
+    """输入:Visible 属性 + 产品数据 → 输出:文案强制用亚马逊原文的属性。
+
+    移植自旧 auto_listing/mapper.force_amazon_copy(2026-08-09 补迁):
+    **LLM 不重写文案,只做结构化字段映射**——文案与亚马逊保持一致,仅去品牌名
+    与截长度。品牌名来自采集数据(Unbranded/Generic 之类噪声词不参与)。
+
+    productName ← title;keyFeatures ← bullet_points;shortDescription ← 卖点拼接。
+    ⚠ keyFeatures 部分 PT 的 minItems 已从 3 提到 4~6
+    (EXT_DATA_ERROR_55506974520167):不足时从描述/标题拆句补齐,
+    **宁可凑短句也不能少于 minItems**。
+    """
+    a = (product or {}).get("attrs") or {}
+    brands = [b for b in (product.get("brand"), a.get("brand"),
+                          a.get("manufacturer")) if b]
+    attrs = dict(attrs)
+
+    title = _clean_copy(product.get("title") or a.get("title"), brands)
+    long_text = (a.get("description") or a.get("long_description")
+                 or a.get("product_description") or "")
+    if title:
+        attrs["productName"] = title[:199]
+    else:
+        for s in _sentences(long_text, brands):
+            attrs["productName"] = s[:199]
+            break
+
+    bullets = a.get("bullet_points") or []
+    if isinstance(bullets, str):
+        bullets = [b.strip() for b in bullets.split("\n") if b.strip()]
+    cleaned = []
+    for b in bullets if isinstance(bullets, list) else []:
+        c = _clean_copy(b, brands) if isinstance(b, str) else ""
+        if c:
+            cleaned.append(c[:500])
+    if len(cleaned) < 4:        # 拆句补齐(卖点不够是常态,少于 minItems 会被拒)
+        for text in cleaned + [long_text, title]:
+            for p in _sentences(text, brands):
+                if p not in cleaned:
+                    cleaned.append(p[:500])
+                if len(cleaned) >= 4:
+                    break
+            if len(cleaned) >= 4:
+                break
+    if cleaned:
+        attrs["keyFeatures"] = cleaned[:7]      # maxItems=7
+
+    paragraph = " ".join(c for c in cleaned) if cleaned else \
+        _clean_copy(long_text, brands)
+    if len(paragraph.split()) < 60 and title:
+        paragraph = f"{title}. {paragraph}".strip(". ") if paragraph else title
+    if paragraph:
+        attrs["shortDescription"] = paragraph[:4000]
+    return attrs
+
+
 def _enum_of(spec: dict | None, field: str) -> list | None:
     props = (spec or {}).get("properties") or {}
     f = props.get(field)
@@ -92,10 +212,12 @@ def _force_value(enum: list | None, wanted: str):
 
 
 def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
-                     images: list | None = None) -> dict:
-    """输入:PT + LLM 映射产出 + 该 PT spec + 图片 → 输出:清洗后的 Visible 段。
+                     images: list | None = None,
+                     product: dict | None = None) -> dict:
+    """输入:PT + LLM 映射产出 + spec + 图片 + 产品数据 → 输出:清洗后 Visible。
 
-    LLM 产出不可信,红线全在这里执行(见模块 docstring 清单)。
+    LLM 产出不可信,红线全在这里执行(见模块 docstring 清单);
+    文案与图片是**系统的地盘**——LLM 写了也一律覆盖/删除。
     """
     attrs = dict(llm_attrs or {})
 
@@ -103,6 +225,12 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     for k in list(attrs):
         if k in DANGEROUS_DOC_FIELDS or k.endswith(_DOC_SUFFIX):
             del attrs[k]
+    # 系统后处理字段:LLM 输出一律丢弃(swatchImages 这类 LLM 给标量会被拒)
+    for k in SYSTEM_OWNED_FIELDS:
+        attrs.pop(k, None)
+    # 文案强制用亚马逊原文(去品牌名);无产品数据时保持旧行为
+    if product:
+        attrs = force_amazon_copy(attrs, product)
     # 零认证强制覆盖(字段在 spec 里才写,带 enum 降级)
     props = (spec or {}).get("properties") or {}
     for field, wanted in NO_CERT_FORCES.items():
@@ -147,10 +275,21 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
         if meta.get("description"):
             f["desc"] = str(meta["description"])[:120]
         fields[name] = f
-    sys = ("你是沃尔玛商品属性映射器。根据亚马逊产品资料,填写目标 Product Type"
-           " 的字段,输出一个 JSON 对象(字段名→值)。规则:只用给定字段名;"
-           "enum 字段必须取枚举值之一;不确定的字段不要输出;"
-           "productName 用英文、10~199 字符;不要输出任何认证/保修/文档类字段。")
+    # 提示词规则逐条移植自旧系统(硬约束仍由 finalize_visible/mp_conform 兜底,
+    # 提示词只是让 LLM 少犯错、少烧一轮修正)
+    sys = (
+        "你是沃尔玛商品属性映射器。根据亚马逊产品资料,填写目标 Product Type "
+        "的字段,只输出一个 JSON 对象(字段名→值),不要 markdown 不要注释。\n"
+        "1. 只用给定字段名,不要造字段。\n"
+        "2. **不要输出系统后处理字段**:" + "/".join(SYSTEM_OWNED_FIELDS) +
+        "——文案、图片、品牌由系统用亚马逊原文填,你只做结构化字段。\n"
+        "3. enum 字段必须**原样**取给定枚举值之一;语义最近的也行,宁可取第一个"
+        "也绝不输出枚举外的值。\n"
+        "4. **spec 里 type=array 的字段必须给数组**,不能给裸字符串"
+        "(pattern/color/material/shape 这类看着是单值的往往也是 array)。\n"
+        "5. 数组字段宁缺勿空:没有真实数据就**不输出该字段**,不要写 []、\"\"、"
+        "null、\"No\"、\"Not Available\" 之类占位。\n"
+        "6. 不要输出任何认证/保修/文档类字段。")
     user = _json.dumps({
         "product_type": pt,
         "fields": fields,
@@ -163,37 +302,77 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
             {"role": "user", "content": user}]
 
 
-def build_orderable(sku: str, upc: str, price, qty: int,
-                    partner_id: str) -> dict:
-    """输入:sku/upc/沃尔玛价/库存/Partner ID → 输出:Orderable 段。
+DEFAULT_SHIPPING_WEIGHT = 1.0   # 采不到重量时的保守值(单位磅,旧 test_pipeline 同值)
 
-    三陷阱全部照实证:productIdentifiers 单对象;price 裸 number;
-    fulfillmentCenterID=Partner ID。endDate 必须 ISO DateTime。
+
+def shipping_weight(product: dict | None) -> float:
+    """输入:产品数据 → 输出:发货重量(磅);采不到按 DEFAULT_SHIPPING_WEIGHT。
+
+    采集契约:slow.weight = {package, item}(包装重与本体重,不合并)——
+    发货重量取包装重,退而取本体重。形态不定(数字 / {value,unit} / 带单位串),
+    这里只负责取出一个正数。
     """
-    return {
+    weight = ((product or {}).get("attrs") or {}).get("weight")
+    for key in ("package", "item"):
+        v = weight.get(key) if isinstance(weight, dict) else None
+        if isinstance(v, dict):
+            v = v.get("value") or v.get("measure") or v.get("amount")
+        if isinstance(v, (int, float)) and v > 0:
+            return round(float(v), 2)
+        if isinstance(v, str):
+            m = re.search(r"\d+(?:\.\d+)?", v)
+            if m and float(m.group()) > 0:
+                return round(float(m.group()), 2)
+    return DEFAULT_SHIPPING_WEIGHT
+
+
+def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
+                    pt: str = "", product: dict | None = None) -> dict:
+    """输入:sku/upc/沃尔玛价/库存/Partner ID/PT/产品数据 → 输出:Orderable 段。
+
+    字段面与取值逐条对齐旧 auto_listing/mapper.force_overrides 的 Orderable 段
+    (2026-08-09 首跑三条全拒后逐行比对补齐,四处差异都有实证代价):
+      · productIdentifiers 单对象、price 裸 number、fulfillmentCenterID=Partner ID
+      · **inventory[].quantity 是裸 int**——写成 {unit,amount} 会被拒
+        (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
+      · **country_of_origin_substantial_transformation 必填**
+        (EXT_DATA_ERROR_72600149546850,此前整个字段没给)
+      · specProductType / startDate 旧系统都写,此前漏
+      · endDate 必须 ISO DateTime(纯 yyyy-mm-dd 会被拒
+        EXT_DATA_ERROR_00030257670757)
+      · ShippingWeight 是 Orderable 必填:旧系统由 LLM 补,新系统从采集重量取
+    """
+    end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
+    o = {
         "sku": str(sku),
         "productIdentifiers": {"productId": str(upc), "productIdType": "UPC"},
-        "productName": None,        # 由调用方以 Visible.productName 同值回填
         "brand": FORCE_BRAND,
         "price": round(float(price), 2),
-        "ShippingWeight": None,     # 有实测重量才写,调用方决定
+        "ShippingWeight": shipping_weight(product),
         "MustShipAlone": DEFAULT_MUST_SHIP_ALONE,
         "fulfillmentLagTime": DEFAULT_FULFILLMENT_LAG_DAYS,
-        "endDate": SITE_END_DATE,
+        "startDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endDate": end_date,
+        "country_of_origin_substantial_transformation": DEFAULT_COUNTRY_OF_ORIGIN,
         "countryOfOriginAssembly": DEFAULT_COUNTRY_OF_ORIGIN,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
-                       "quantity": {"unit": "EACH", "amount": int(qty)}}],
+                       "quantity": int(qty)}],
     }
+    if pt:
+        o["specProductType"] = str(pt)
+    return o
 
 
 def assemble_mp_item(orderable: dict, pt: str, visible_attrs: dict) -> dict:
     """输入:Orderable + PT + 清洗后 Visible → 输出:一条完整 MPItem。
 
     Orderable 与 Visible 是并列顶级对象(不是 MPProduct,旧按文档猜错过);
-    Visible 直接以 PT 名作命名空间(中间没有 productCategory 层)。
-    productName 两处同值;None 值字段剔除。
+    Visible 直接以 PT 名作命名空间(中间没有 productCategory 层)。None 值字段剔除。
+
+    ⚠ **不往 Orderable 塞 productName**(2026-08-09 生产实证):
+    EXT_DATA_ERROR_60670554076755 "'productName' is not a valid field.
+    Do not add or change the field names in the specification."
+    ——它只属于 Visible;Orderable 的字段面以 spec 为准(mp_conform.strip_unknown)。
     """
     o = {k: v for k, v in orderable.items() if v is not None}
-    if visible_attrs.get("productName"):
-        o["productName"] = visible_attrs["productName"]
     return {"Orderable": o, "Visible": {str(pt): visible_attrs}}

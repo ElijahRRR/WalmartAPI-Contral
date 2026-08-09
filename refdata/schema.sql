@@ -51,6 +51,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS snapshots_source_id_uidx ON catalog.snapshots 
 -- ⚠ 必须先于下面依赖 marketplace 列的索引执行:旧库表已存在(CREATE IF NOT EXISTS 跳过),
 --   列要靠这里补;先建索引会 UndefinedColumn(2026-08-06 生产实证)
 ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
+-- 采集 slow 段全量留存(2026-08-09):bullet_points/description/weight/
+-- dimensions/variant 都在这里。契约的 raw 是**裁剪过的**(去掉已在 slow 给过的
+-- 大文本),只存 raw 会丢卖点与重量 —— 上架文案(keyFeatures minItems)与
+-- ShippingWeight 都指着它。
+ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS slow jsonb;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
 DO $$
 BEGIN
@@ -489,10 +494,47 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     feed_type   text NOT NULL,
     status      text NOT NULL,     -- submitted / success / failed / missing(明细里查无此 SKU)
     error_code  text,
+    error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
+                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
     submitted_at timestamptz NOT NULL DEFAULT now(),
     resolved_at  timestamptz,
     PRIMARY KEY (feed_id, sku)
 );
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
+
+-- feed 报错明细:一条 ingestionError 一行。**拉详情是标准动作,不是排障时才做**
+-- (所有者定稿 2026-08-09):报错是系统自我优化的燃料——哪个字段最常被拒、
+-- 哪个 PT 最难过、改完有没有变好,全靠这张表聚合;只存一个错误码等于把线索扔了。
+CREATE TABLE IF NOT EXISTS ops.feed_item_errors (
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    seq         integer NOT NULL,   -- 同一 SKU 的第几条报错(沃尔玛一次可给十几条)
+    error_type  text,               -- DATA_ERROR / SYSTEM_ERROR / TIMEOUT_ERROR
+    code        text,
+    field       text,               -- 出错字段名(聚合分析的主维度)
+    description text,
+    feed_type   text,
+    store       text,
+    workflow    text,
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku, seq)
+);
+CREATE INDEX IF NOT EXISTS feed_item_errors_field_idx
+    ON ops.feed_item_errors (field, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS feed_item_errors_code_idx
+    ON ops.feed_item_errors (code, occurred_at DESC);
+
+-- 报错排行:改哪个字段收益最大,一眼可见
+CREATE OR REPLACE VIEW ops.v_feed_error_stats AS
+  SELECT feed_type, field, code,
+         count(*)                      AS 次数,
+         count(DISTINCT sku)           AS 影响SKU数,
+         min(occurred_at)              AS 首次,
+         max(occurred_at)              AS 最近,
+         min(description)              AS 描述样本
+  FROM ops.feed_item_errors
+  GROUP BY feed_type, field, code
+  ORDER BY count(*) DESC;
 CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
 CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
 

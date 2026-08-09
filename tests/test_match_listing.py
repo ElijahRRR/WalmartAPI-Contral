@@ -219,6 +219,7 @@ def test_match_sheet_sync_from_ledger(monkeypatch):
     ledger = {"F1": {"SKU_A": ("success", ""), "SKU_B": ("failed", "ERR_M")},
               "F2": {"SKU_C": ("submitted", "")}}
     monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
 
     out = match_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}

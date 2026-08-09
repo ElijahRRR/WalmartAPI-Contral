@@ -9,6 +9,7 @@
   2 fill_missing_required 顶层必填兜底(闭枚举优先 No/None/Not Applicable)
   3 fix_type_mismatches   类型不匹配(标量包成 array / object 子 enum 纠正)
   4 fix_invalid_enums     非法枚举值(必填换 enum[0],非必填直接删)
+  4b ensure_variant_bag   变体三件套自洽(给一半会被拒;单品 isPrimary=Yes)
   5 strip_unknown         剔除 spec 外字段(additionalProperties=false 会拒)
   6 clean_state_restrictions  清 LLM 幻觉的 stateRestrictions
   7 drop_empty_optional   删非必填空值
@@ -23,6 +24,8 @@
   EXT_DATA_ERROR_74086950555651  必填且最小长度 1(如 color)
   EXT_DATA_ERROR_49505365506868  URL 数组被填了 'No' 之类占位
   EXT_DATA_ERROR_68050064665065  小数位 > 2
+  EXT_DATA_ERROR_55506974520167  必填数组不足 minItems(如 keyFeatures ≥3)
+  EXT_DATA_ERROR_05570905585050  变体三件套不完整
   IB.VALIDATION.DATA.001         object 子字段 enum 非法(如 unit='ft')
 """
 
@@ -402,6 +405,56 @@ def fix_invalid_enums(spec: dict, visible: dict) -> tuple[dict, list[str]]:
     return visible, fixed
 
 
+_VARIANT_BAG = ("variantGroupId", "variantAttributeNames", "isPrimaryVariant")
+
+
+def ensure_variant_bag(spec: dict, visible: dict, sku: str = ""
+                       ) -> tuple[dict, list[str]]:
+    """输入:spec + visible + SKU → 输出:(变体三件套自洽的 visible, 说明)。
+
+    EXT_DATA_ERROR_05570905585050 "Variant metadata bag is missing or empty":
+    三件套(变体组 ID / 变体属性名 / 是否主变体)要么都给要么都不给,
+    给一半会被拒——我们此前必填兜底填了 variantAttributeNames 却没配套。
+
+    **单品口径**(变体分组尚未实现,当前全是单品):沃尔玛报错原文即指引——
+    "If you only have 1 item in a variant group, select 'Yes' in Is Primary
+    Variant";变体组 ID 用 SKU 占位(旧设计文档同款:本批只有 1 个变体产品时
+    也带 groupId 上架,后续兄弟按同 ID 自动归组)。
+    真正的多变体分组等采集侧 variation 数据到位后再做,届时改这一个函数。
+    """
+    props = _props(spec)
+    in_spec = [k for k in _VARIANT_BAG if k in props]
+    if not in_spec:
+        return visible, []
+    touched = any(visible.get(k) not in _EMPTY for k in in_spec)
+    if not touched and not (_required(spec) & set(in_spec)):
+        return visible, []          # 三件套一个都没碰且都不必填 → 不主动引入
+
+    notes = []
+    if "variantGroupId" in props and visible.get("variantGroupId") in _EMPTY:
+        if not sku:
+            # 没有 SKU 就凑不出稳定的组 ID:整套拆掉比给半套安全
+            for k in in_spec:
+                visible.pop(k, None)
+            return visible, ["变体三件套缺组 ID,整套移除(给一半会被拒)"]
+        visible["variantGroupId"] = str(sku)[:300]
+        notes.append(f"variantGroupId={sku}(单品占位)")
+    if "variantAttributeNames" in props and \
+            visible.get("variantAttributeNames") in _EMPTY:
+        enum = _enum_of(props["variantAttributeNames"])
+        # 优先挑我们真有值的属性,保证"说有 color 就真有 color"
+        pick = next((n for n in (enum or []) if visible.get(n) not in _EMPTY),
+                    (enum or [None])[0])
+        if pick:
+            visible["variantAttributeNames"] = [pick]
+            notes.append(f"variantAttributeNames=[{pick}]")
+    if "isPrimaryVariant" in props and visible.get("isPrimaryVariant") in _EMPTY:
+        enum = _enum_of(props["isPrimaryVariant"]) or ["Yes", "No"]
+        visible["isPrimaryVariant"] = "Yes" if "Yes" in enum else enum[0]
+        notes.append("isPrimaryVariant=Yes(单品即主变体)")
+    return visible, notes
+
+
 def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
                   ) -> tuple[dict, dict, list[str]]:
     """输入:两 spec + 两段 → 输出:(裁剪后 visible, orderable, 说明)。
@@ -553,7 +606,8 @@ def validate(spec: dict, ospec: dict, visible: dict, orderable: dict
 
 
 def conform(spec: dict | None, ospec: dict | None, visible: dict,
-            orderable: dict) -> tuple[dict, dict, list[str], list[str]]:
+            orderable: dict, sku: str = ""
+            ) -> tuple[dict, dict, list[str], list[str]]:
     """输入:PT spec + Orderable spec + 两段 → 输出:(visible, orderable, 说明, 缺失)。
 
     十道工序按旧 main.py 的顺序执行;缺失非空 = **不该提交**(调用方回收 UPC)。
@@ -569,6 +623,7 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
     visible, n = fill_missing_required(spec, visible);      notes += n
     visible, n = fix_type_mismatches(spec, visible);        notes += n
     visible, n = fix_invalid_enums(spec, visible);          notes += n
+    visible, n = ensure_variant_bag(spec, visible, sku);    notes += n
     visible, orderable, n = strip_unknown(spec, ospec, visible, orderable)
     notes += n
     orderable, n = clean_state_restrictions(orderable);     notes += n

@@ -190,7 +190,8 @@ def _spec_precheck(ready: list[dict]) -> str:
                 r["asin"], "000000000000", r["_price"], r["_qty"], "0",
                 pt=r["product_type"], product=r["_p"])
             _v, _o, notes, missing = mp_conform.conform(
-                spec, pt_spec.orderable_spec(), visible, orderable)
+                spec, pt_spec.orderable_spec(), visible, orderable,
+                sku=r["asin"])
             if missing:
                 lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
                              f"{','.join(missing[:8])}")
@@ -374,7 +375,8 @@ def run(params: dict) -> str:
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
-                        pt_spec.orderable_spec(), visible, orderable)
+                        pt_spec.orderable_spec(), visible, orderable,
+                        sku=r["asin"])
                     if notes:
                         logger.info("%s spec 一致化 %d 处:%s", r["asin"],
                                     len(notes), "; ".join(notes[:6]))

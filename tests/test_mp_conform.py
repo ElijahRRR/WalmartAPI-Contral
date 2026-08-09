@@ -163,3 +163,43 @@ def test_array_unwrapped_when_spec_wants_scalar():
     # 数字字段给了字符串数组 → 取首元素后仍转数字
     v3, _ = mc.fix_type_mismatches(_SPEC, {"count": ["12"]})
     assert v3["count"] == 12
+
+
+_VSPEC = {
+    "required": ["productName"],
+    "properties": {
+        "productName": {"type": "string"},
+        "color": {"type": "string"},
+        "variantGroupId": {"type": "string"},
+        "variantAttributeNames": {"type": "array",
+                                  "items": {"enum": ["color", "size"]}},
+        "isPrimaryVariant": {"type": "string", "enum": ["Yes", "No"]},
+    },
+}
+
+
+def test_variant_bag_completed_for_single_item():
+    """EXT_DATA_ERROR_05570905585050:三件套给一半会被拒;单品 isPrimary=Yes。"""
+    v, notes = mc.ensure_variant_bag(
+        _VSPEC, {"variantAttributeNames": ["color"], "color": "Red"}, "B0X")
+    assert v["variantGroupId"] == "B0X"          # 单品用 SKU 占位
+    assert v["isPrimaryVariant"] == "Yes"
+    assert v["variantAttributeNames"] == ["color"]
+    assert len(notes) == 2
+
+
+def test_variant_bag_untouched_when_absent():
+    """三件套一个都没碰且都不必填 → 不主动引入(别给自己找麻烦)。"""
+    v, notes = mc.ensure_variant_bag(_VSPEC, {"color": "Red"}, "B0X")
+    assert "variantGroupId" not in v and notes == []
+    # spec 里压根没这些字段的 PT:原样返回
+    v2, n2 = mc.ensure_variant_bag({"properties": {"color": {}}},
+                                   {"variantGroupId": "x"}, "B0X")
+    assert n2 == []
+
+
+def test_variant_bag_picks_attribute_we_actually_have():
+    """variantAttributeNames 说有 color 就得真有 color。"""
+    v, _ = mc.ensure_variant_bag(_VSPEC, {"variantGroupId": "G1",
+                                          "size": "L"}, "B0X")
+    assert v["variantAttributeNames"] == ["size"]     # 有值的那个优先

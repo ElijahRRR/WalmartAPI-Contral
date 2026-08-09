@@ -79,16 +79,19 @@ def sync_from_ledger() -> str | None:
     pollable = [r for r in rows if r["feed_id"] and r["result"] in POLLABLE]
     if not pollable:
         return None
-    updates, cache = [], {}
+    updates, cache, descs = [], {}, {}
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
             cache[fid] = feed_track.item_results(fid)
+            descs[fid] = feed_track.item_errors(fid)
         st = cache[fid].get(r["sku"])
         if st is None:
             continue        # 台账查无此 (feed, sku):不是本系统提交的,不动
         result = RESULT_TEXT.get(st[0], "处理中")
-        code = st[1] if result == "失败" else ""
+        # 报错列写「码 | 人话」:数字码本身不含可修的信息
+        code = feed_track.merge_error(
+            st[1], descs.get(fid, {}).get(r["sku"])) if result == "失败" else ""
         if result in POLLABLE:
             continue        # feed 未落定,下轮再看
         if result != r["result"] or code != r["error"]:

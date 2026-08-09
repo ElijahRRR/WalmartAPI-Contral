@@ -203,3 +203,54 @@ def test_save_errors_rows_shape():
     assert first[7:10] == ("MP_ITEM", "店A", "list_new")
     assert captured["rows"][1][2] == 1                  # seq 递增
     assert _save_errors(_Cur(), "F1", "店A", {"S": []}, {}) == 0
+
+
+def test_merge_error_shapes():
+    m = feed_track.merge_error
+    assert m("C1", "坏了") == "C1 | 坏了"
+    assert m("C1", "") == "C1"                 # 只有码
+    assert m("", "坏了") == "坏了"              # 只有描述
+    assert m(None, None) == ""
+    assert len(m("C1", "x" * 2000)) == 900     # 截断
+
+
+def test_all_reflectors_write_code_plus_desc(monkeypatch):
+    """停用/删除、维护记录、跟卖三张表的报错列都要带人话(不只上架表)。"""
+    from api import feishu
+    from registry import resources
+    from registry.resources import Spreadsheet
+    from services import clear_sheet, match_sheet
+
+    def _live(sheet):        # 登记条目是 frozen dataclass:换整个对象,别改字段
+        return Spreadsheet(name=sheet.name, token="TOK", sheet_id="SID",
+                           columns=sheet.columns)
+
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {"SKU1": ("failed", "EXT_ERR_1")})
+    monkeypatch.setattr(feed_track, "item_errors",
+                        lambda fid: {"SKU1": "[color] required"})
+    want = "EXT_ERR_1 | [color] required"
+
+    # 停用/删除表:H 报错列
+    monkeypatch.setattr(clear_sheet, "read_rows", lambda: [
+        {"rownum": 2, "sku": "SKU1", "feed_id": "F1", "op_date": "d",
+         "result": "处理中", "error": ""}])
+    captured = {}
+    monkeypatch.setattr(clear_sheet, "writeback",
+                        lambda ups: (captured.update(clear=ups), len(ups))[1])
+    monkeypatch.setattr(resources, "RETIRE_SHEET",
+                        _live(resources.RETIRE_SHEET))
+    clear_sheet.sync_from_ledger()
+    assert captured["clear"][0][4] == want
+
+    # 跟卖表:J feed结果
+    monkeypatch.setattr(match_sheet, "read_rows", lambda: [
+        {"rownum": 2, "sku": "SKU1", "feed_id": "F1", "feed_result": "",
+         "check_time": ""}])
+    monkeypatch.setattr(match_sheet, "row_vals", lambda r: [r["feed_result"]])
+    monkeypatch.setattr(resources, "MATCH_SHEET",
+                        _live(resources.MATCH_SHEET))
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (captured.update(match=ups), len(ups))[1])
+    match_sheet.sync_from_ledger()
+    assert captured["match"][0][1][0][0] == f"失败:{want}"

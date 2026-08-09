@@ -96,7 +96,7 @@ def sync_from_ledger() -> str | None:
     if lo >= hi:
         return None
     values = feishu.sheet_values(resources.MAINT_SHEET, f"A{lo}:I{hi - 1}")
-    updates, cache = [], {}
+    updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
     for i, raw in enumerate(values):
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
@@ -109,6 +109,7 @@ def sync_from_ledger() -> str | None:
             continue
         if fid not in cache:
             cache[fid] = feed_track.item_results(fid)
+            descs[fid] = feed_track.item_errors(fid)
         st = cache[fid].get(sku)
         if st is None:
             # 台账查无此 (feed, sku):不该发生(程序是唯一写入方),
@@ -123,7 +124,9 @@ def sync_from_ledger() -> str | None:
             continue
         text = {"success": "成功", "failed": "失败",
                 "missing": "未查到"}.get(st[0], "处理中")
-        err = st[1] if text == "失败" else ""
+        # 报错列写「码 | 人话」(改价/改库存/改标题/清库存共用这一列)
+        err = feed_track.merge_error(
+            st[1], descs.get(fid, {}).get(sku)) if text == "失败" else ""
         updates.append((f"H{rownum}:I{rownum}", [[text, err]]))
         if prefix_done:
             new_lo = rownum + 1

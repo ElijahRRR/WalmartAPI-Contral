@@ -4,6 +4,13 @@
   python cli.py feed_poll                 # 轮询 ops.feed_log 全部在途 feed
   python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
                                           # (只读,不改台账、不跑反哺器)
+  python cli.py feed_poll -p stats=1      # 报错排行(默认近 30 天,全 feed 类型)
+  python cli.py feed_poll -p stats=1 -p days=7 -p feed_type=MP_ITEM
+
+报错明细是**标准动作**(所有者定稿 2026-08-09):轮询时逐条落
+ops.feed_item_errors(type/code/**field**/description),各业务表的报错列
+统一写「码 | 人话」。上架/删除/停用/改价/改库存/改标题一视同仁——
+数字错误码本身不含任何可修的信息,description 才是改进线索。
 
 职责:扫 feed_log 的 submitted 行 → 查沃尔玛终态 → SKU 级结果落
 ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
@@ -78,8 +85,40 @@ def _explain(store: dict, feed_id: str) -> str:
     return "\n".join(lines)
 
 
+def _error_stats(days: int, feed_type: str = "") -> str:
+    """输入:天数(+可选 feedType)→ 输出:报错排行(改哪个字段收益最大)。
+
+    读 ops.feed_item_errors——所有 feed 类型通用(上架/删除/停用/改价/
+    改库存/改标题),报错是系统自我优化的燃料。
+    """
+    sql = ("SELECT feed_type, field, code, count(*) n,"
+           " count(DISTINCT sku) skus, min(description) sample"
+           " FROM ops.feed_item_errors"
+           " WHERE occurred_at >= now() - make_interval(days => %s)")
+    args: list = [days]
+    if feed_type:
+        sql += " AND feed_type = %s"
+        args.append(feed_type)
+    sql += " GROUP BY 1,2,3 ORDER BY n DESC LIMIT 25"
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    if not rows:
+        return f"近 {days} 天无 feed 报错记录"
+    lines = [f"近 {days} 天 feed 报错排行(共 {len(rows)} 组):"]
+    for ft, field, code, n, skus, sample in rows:
+        lines.append(f"  {n:>4}次/{skus:>3}SKU  [{ft or '-'}] {field or '-'}"
+                     f"  {code or '-'}")
+        if sample:
+            lines.append(f"        {str(sample)[:150]}")
+    return "\n".join(lines)
+
+
 def run(params: dict) -> str:
-    """输入:params(store / feed_id 诊断)→ 输出:轮询摘要(含反哺结果)。"""
+    """输入:params(store / feed_id 诊断 / stats 排行)→ 输出:摘要。"""
+    if params.get("stats"):
+        return _error_stats(int(params.get("days", 30)),
+                            str(params.get("feed_type", "")))
     names = [params["store"]] if params.get("store") else None
     store_list = stores_svc.load_stores(names)
     stores_by_name = {s["name"]: s for s in store_list}

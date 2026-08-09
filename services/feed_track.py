@@ -219,6 +219,18 @@ def item_results(feed_id: str) -> dict[str, tuple[str, str]]:
         return {sku: (status, code or "") for sku, status, code in cur.fetchall()}
 
 
+def merge_error(code: str | None, desc: str | None, limit: int = 900) -> str:
+    """输入:错误码 + 人话描述 → 输出:回写业务表用的「码 | 人话」。
+
+    各业务表(停用/删除、维护记录、跟卖、上架)的报错列统一用本函数拼——
+    光有 EXT_DATA_ERROR_507165… 这种数字码,运营和我们都无从下手。
+    """
+    code, desc = (code or "").strip(), (desc or "").strip()
+    if code and desc:
+        return f"{code} | {desc}"[:limit]
+    return (code or desc)[:limit]
+
+
 def item_errors(feed_id: str) -> dict[str, str]:
     """输入:feed_id → 输出:{sku: 人话报错描述}(空描述的 SKU 不出现)。"""
     with db.pg_conn() as conn, conn.cursor() as cur:

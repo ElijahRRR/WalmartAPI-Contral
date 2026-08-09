@@ -465,32 +465,36 @@ def test_variant_offset_candidates_sql_gates():
     assert "COALESCE(sn.outcome, 'ok') = 'ok'" in q
     assert "sn.scraped_at > vo.last_seen" in q
     assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
-    assert vo.DANGEROUS is True and vo.MIN_BATCHES == 2
+    # 所有者定稿:偏移了就不会恢复,出现一次即删(不设观察期)
+    assert vo.DANGEROUS is True and vo.MIN_BATCHES == 1
 
 
 def test_variant_offset_dry_run_shows_names_and_threshold(monkeypatch):
     from workflows import variant_offset_cleanup as vo
 
+    def _row(store, sku, batches):
+        return {"store": store, "sku": sku, "batches": batches,
+                "first_seen": None, "last_seen": None}
+
     rows = {
-        2: [{"store": "A085", "sku": "B0A", "batches": 2,
-             "first_seen": None, "last_seen": None},
-            {"store": "A085", "sku": "B0B", "batches": 3,
-             "first_seen": None, "last_seen": None},
-            {"store": "A090", "sku": "B0A", "batches": 2,
-             "first_seen": None, "last_seen": None}],
-        1: [1] * 9,        # 只用长度
+        2: [_row("A085", "B0A", 2), _row("A085", "B0B", 3),
+            _row("A090", "B0A", 2)],
+        1: [_row("A085", f"B0X{i}", 1) for i in range(9)],
     }
     monkeypatch.setattr(vo, "_candidates", lambda mb: rows[mb])
-    out = vo.run({"execute": False})
+    out = vo.run({"execute": False, "min_batches": 2})
     assert "3 行(2 个 ASIN × 2 店" in out
-    assert "≥1 个批次 9 行" in out          # 门槛对比必须给出,便于所有者选
+    assert "≥1 个批次 9 行" in out          # 收紧门槛时给出对比,免得漏删不自知
     assert "B0A" in out and "不可逆" in out
+    # 默认门槛 1:出现一次就在名单里,不再打门槛对比
+    out1 = vo.run({"execute": False})
+    assert "门槛 ≥1 个批次" in out1 and "门槛对比" not in out1
 
 
 def test_variant_offset_nothing_to_delete_hints_looser_threshold(monkeypatch):
     from workflows import variant_offset_cleanup as vo
-    monkeypatch.setattr(vo, "_candidates", lambda mb: [] if mb > 1 else [1] * 7)
-    out = vo.run({"execute": False})
+    monkeypatch.setattr(vo, "_candidates", lambda mb: [] if mb > 1 else [{}] * 7)
+    out = vo.run({"execute": False, "min_batches": 3})
     assert "无 variant_offset 待删行" in out and "7 行" in out
 
 

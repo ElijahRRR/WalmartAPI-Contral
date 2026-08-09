@@ -3,7 +3,7 @@
 用法:
   python cli.py variant_offset_cleanup                    # dry-run:列出将删什么
   python cli.py variant_offset_cleanup --execute          # 真删(DELETE_ITEM,永久)
-  python cli.py variant_offset_cleanup -p min_batches=1   # 一次偏移就删(默认 2)
+  python cli.py variant_offset_cleanup -p min_batches=2   # 收紧到 2 个批次才删
   python cli.py variant_offset_cleanup -p limit=100       # 单店单轮上限(默认 300)
   python cli.py variant_offset_cleanup -p store=A085朱丽霖
 
@@ -14,11 +14,10 @@ parser 比对页面 ASIN 与任务 ASIN 不一致 → 拒绝写入(宁可判失�
 后果:这些 SKU 的价格/库存**永远拿不到新数据**,维护链会一直拿陈旧快照跟价
 跟库存——比缺数据更危险。既然采不到就没法维护,直接删。
 
-两道保守闸(删除不可逆,宁可晚一轮):
-  1. `min_batches`(默认 2):至少在 2 个不同采集批次里都偏移过才删。
-     偏移是页面级的偶发现象,一次不足以判死刑;-p min_batches=1 可覆盖。
-  2. **后来采到了就不删**:最后一次偏移之后若有 outcome=ok 的快照,说明
-     它又能采了,自动移出名单(不需要人工清账)。
+门槛(所有者定稿 2026-08-09:**偏移了就不会恢复,不需要观察期**):
+  1. `min_batches` 默认 **1** —— 出现一次就够。想收紧用 -p min_batches=N。
+  2. **后来采到了就不删**:最后一次偏移之后若有 outcome=ok 的快照,自动
+     移出名单。这条不是观察期,是防呆——真出现就说明它还能采,删了会误杀。
 
 只作用于在线(PUBLISHED + 未缺席)且店铺 ACTIVE 的行;一个 ASIN 在多店在线
 就每店各删一次(占用是店铺维度的)。
@@ -34,7 +33,7 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.variant_offset_cleanup")
 
-MIN_BATCHES = 2         # 默认门槛:偏移出现在 ≥2 个批次才删
+MIN_BATCHES = 1         # 出现一次即删(所有者定稿:偏移了就不会恢复)
 STORE_LIMIT = 300       # 单店单轮上限(与 product_clear 同款防呆)
 
 # 候选:偏移过的 ASIN × 在线行。
@@ -145,11 +144,12 @@ def run(params: dict) -> str:
 
     if not execute:
         # 人眼闸门:DELETE_ITEM 不可逆,名单必须看得见(不能只给个数)
-        loose = len(_candidates(1))
-        if loose != len(rows):
-            lines.append(f"  门槛对比:≥1 个批次 {loose} 行,"
-                         f"≥{min_batches} 个批次 {len(rows)} 行"
-                         f"(差额是只偏移过一次的,本轮不动)")
+        if min_batches > 1:
+            loose = len(_candidates(1))
+            if loose != len(rows):
+                lines.append(f"  门槛对比:≥1 个批次 {loose} 行,"
+                             f"≥{min_batches} 个批次 {len(rows)} 行"
+                             f"(差额是只偏移过一次的,本轮不动)")
         for store_name, items in sorted(capped.items()):
             sample = [(r["sku"], f"{r['batches']}批") for r in items[:5]]
             lines.append(f"  {store_name}:删除 {len(items)} 行,样本={sample}"

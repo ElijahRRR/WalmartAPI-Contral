@@ -74,6 +74,14 @@ END $$;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS stock_count integer;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS delivery_days integer;
 
+-- 采集结局(契约扩展字段;2026-08-09 补存):outcome ∈ ok/not_found/blocked/
+-- parse_failed/stale。此前只在摄取时计数不落库,导致"这个产品为什么没数据"
+-- 查不了——而这正是维护/上架链遇到数据缺口时第一个要问的问题。
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS outcome text;
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS completeness_ok boolean;
+CREATE INDEX IF NOT EXISTS snapshots_outcome_idx
+    ON catalog.snapshots (outcome, scraped_at DESC) WHERE outcome <> 'ok';
+
 CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
 
 CREATE OR REPLACE VIEW catalog.latest_snapshot AS
@@ -501,6 +509,49 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     PRIMARY KEY (feed_id, sku)
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
+
+-- 采集推送批次台账(product_refresh 用;所有者定稿 2026-08-09):
+-- 全量重推在线产品前先落账,**确认推上去了(拿到 batch_id)才开始计时**;
+-- 批次名是取回的抓手(按批次查比整库查快得多),1 小时未采完视为超时。
+CREATE TABLE IF NOT EXISTS ops.scrape_batches (
+    batch_name  text PRIMARY KEY,
+    batch_id    text,               -- 采集侧 ID(200 新建 / 409 既有,都记)
+    asin_count  integer NOT NULL,
+    status      text NOT NULL,      -- pushed / running / completed / failed / timeout
+    done        integer, failed integer,   -- 采集侧 stats 快照
+    submitted_at timestamptz NOT NULL DEFAULT now(),
+    finished_at  timestamptz,
+    note        text
+);
+CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
+    ON ops.scrape_batches (status, submitted_at DESC);
+
+-- 采集失败明细(product_refresh 批次落定时拉;与 feed_item_errors 同款思路:
+-- **拉详情是标准动作**)。采集侧 /api/batches/{id}/failures 的落库形态:
+-- 真失败(captcha/404/timeout/blocked)在这里,降级采集(outcome≠ok)在
+-- snapshots.outcome —— 两者互补,前者"根本没采到",后者"采到了但不完整"。
+CREATE TABLE IF NOT EXISTS ops.scrape_failures (
+    batch_name  text NOT NULL,
+    asin        text NOT NULL,
+    status      text,
+    error_type  text,               -- captcha / not_found / timeout / blocked …
+    error_detail text,
+    retry_count integer,
+    occurred_at timestamptz,
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (batch_name, asin)
+);
+CREATE INDEX IF NOT EXISTS scrape_failures_asin_idx
+    ON ops.scrape_failures (asin, recorded_at DESC);
+CREATE INDEX IF NOT EXISTS scrape_failures_type_idx
+    ON ops.scrape_failures (error_type, recorded_at DESC);
+
+-- 采集失败排行 + 顽固失败(连续多批采不到的 ASIN = 该下架或人工看的信号)
+CREATE OR REPLACE VIEW ops.v_scrape_failure_stats AS
+  SELECT error_type,
+         count(*) AS 次数, count(DISTINCT asin) AS 影响ASIN数,
+         max(recorded_at) AS 最近, min(error_detail) AS 明细样本
+  FROM ops.scrape_failures GROUP BY error_type ORDER BY count(*) DESC;
 
 -- feed 报错明细:一条 ingestionError 一行。**拉详情是标准动作,不是排障时才做**
 -- (所有者定稿 2026-08-09):报错是系统自我优化的燃料——哪个字段最常被拒、

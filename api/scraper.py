@@ -6,7 +6,10 @@
 api 层只做接口适配:base_url/token 从 registry 取、超时、按状态码分流、退避。
 "够不够格进 products"这类判断在 services/product_ingest,不在这里。
 
-  export_incremental(cursor, limit) -> (records, next_cursor, has_more)
+  submit_batch(batch_name, asins)       -> {batch_id, inserted, ...}
+  batch_status(batch_name)              -> {status, stats:{...}}
+  batch_failures(batch_id)              -> [{asin, error_type, error_detail, ...}]
+  export_incremental(cursor, limit)     -> (records, next_cursor, has_more)
 
 状态码分流(契约 §5.1,每一条都有来历,别简化):
   200 → 正常(**空结果也是 200**:records=[] + next_cursor 原样不推进)
@@ -56,6 +59,111 @@ def _headers() -> dict:
         logger.warning("SCRAPER_EXPORT_TOKEN 未配置,导出请求不带鉴权头")
         return {}
     return {"X-Export-Token": token}
+
+
+class BatchExistsError(RuntimeError):
+    """批次名已存在(409)。**不是失败**——上一次其实推成功了。
+
+    v4 实证语义:撞名绝不静默合并进既有批次,409 响应体带既有 batch_id,
+    调用方直接拿去轮询即可。因此 POST /api/upload **可以安全重试**:
+    网络超时后重发,若上次成功则拿到 409 + 那个 batch_id,不会重复建批。
+    """
+
+    def __init__(self, batch_id, batch_name: str):
+        super().__init__(f"批次已存在:{batch_name}(batch_id={batch_id})")
+        self.batch_id = batch_id
+        self.batch_name = batch_name
+
+
+def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
+                 max_retries: int = 3) -> dict:
+    """输入:批次名 + ASIN 列表(+邮编)→ 输出:{batch_id, inserted, ...}。
+
+    txt 上传(每行一个 ASIN),不切邮编、不截图——吞吐最高的形态。
+    **200 恒等于新建了批次**(v4 语义),inserted 无歧义;撞名抛
+    BatchExistsError(带既有 batch_id),由调用方决定是接着轮询还是换名。
+    """
+    if not asins:
+        raise ValueError("submit_batch:ASIN 列表为空")
+    url = f"{base_url()}/api/upload"
+    body = ("\n".join(str(a).strip() for a in asins if a)).encode("utf-8")
+    files = {"file": (f"{batch_name}.txt", body, "text/plain")}
+    data = {"batch_name": batch_name, "needs_screenshot": "false"}
+    if zip_code:
+        data["zip_code"] = str(zip_code)
+    last: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.post(url, files=files, data=data, headers=_headers(),
+                              timeout=httpx.Timeout(300, connect=10))
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 409:
+                d = (resp.json() or {}).get("detail") or {}
+                raise BatchExistsError(d.get("batch_id"),
+                                       d.get("batch_name") or batch_name)
+            if resp.status_code in (413, 422):
+                raise ValueError(f"上传被拒 HTTP {resp.status_code}: "
+                                 f"{resp.text[:200]}")
+            raise RuntimeError(f"上传失败 HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        except (BatchExistsError, ValueError):
+            raise               # 终态:重试无意义
+        except (httpx.HTTPError, RuntimeError) as e:
+            last = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("推送批次失败(%s),%ds 后重试(撞名会返 409,"
+                               "不会重复建批)", e, wait)
+                time.sleep(wait)
+    raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
+
+
+def batch_status(batch_name: str) -> dict:
+    """输入:批次名 → 输出:{status, stats:{total,done,failed,...}}。
+
+    status ∈ running / completed / failed;stats.done+failed 达到 total 即采完。
+    """
+    resp = httpx.get(f"{base_url()}/api/batches/{batch_name}/status",
+                     headers=_headers(), timeout=httpx.Timeout(60, connect=10))
+    if resp.status_code == 404:
+        raise LookupError(f"批次不存在:{batch_name}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"批次状态查询失败 HTTP {resp.status_code}: "
+                           f"{resp.text[:200]}")
+    return resp.json()
+
+
+FAILURES_LIMIT_MAX = 100000     # 采集侧 Query(ge=1, le=100000),默认即"全要"
+
+
+def batch_failures(batch_id, *, error_type: str = "",
+                   limit: int = FAILURES_LIMIT_MAX) -> list[dict]:
+    """输入:batch_id(整数)→ 输出:失败任务明细行列表。
+
+    每行:{asin, status, error_type, error_detail, retry_count, worker_id,
+    updated_at}。**按 batch_id 而不是批次名**——采集侧另有一条按名字的旧接口
+    只返回最近 200 条(旧仓库踩过:失败超 200 就静默看不全),v4 已不提供,
+    本函数是唯一入口。
+
+    这里拿到的是「根本没采到」的原因(captcha/timeout/blocked/…);
+    「采到了但不完整」在 snapshots.outcome / completeness_ok,两者互补。
+    """
+    if batch_id in (None, ""):
+        raise ValueError("batch_failures:batch_id 为空(该批次没记下 id)")
+    params = {"limit": max(1, min(int(limit), FAILURES_LIMIT_MAX))}
+    if error_type:
+        params["error_type"] = error_type
+    resp = httpx.get(f"{base_url()}/api/batches/{int(batch_id)}/failures",
+                     params=params, headers=_headers(),
+                     timeout=httpx.Timeout(120, connect=10))
+    if resp.status_code == 404:
+        raise LookupError(f"批次不存在:batch_id={batch_id}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"失败明细查询失败 HTTP {resp.status_code}: "
+                           f"{resp.text[:200]}")
+    return (resp.json() or {}).get("failed_tasks") or []
 
 
 def export_incremental(cursor: int, limit: int = 500, *, max_retries: int = 4

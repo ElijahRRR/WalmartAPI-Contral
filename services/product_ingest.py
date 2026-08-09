@@ -24,10 +24,12 @@ OUTCOME_OK = "ok"
 _SNAPSHOT_SQL = """
 INSERT INTO catalog.snapshots (
     marketplace, asin, scrape_params, price, stock_state, stock_count,
-    delivery_days, buybox, raw, scraped_at, source_id)
+    delivery_days, buybox, raw, scraped_at, source_id,
+    outcome, completeness_ok)
 VALUES (%(marketplace)s, %(asin)s, %(scrape_params)s::jsonb, %(price)s,
         %(stock_state)s, %(stock_count)s, %(delivery_days)s,
-        %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s, %(source_id)s)
+        %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s, %(source_id)s,
+        %(outcome)s, %(completeness_ok)s)
 ON CONFLICT (source_id) DO NOTHING
 """
 
@@ -115,6 +117,11 @@ def snapshot_params(rec: dict) -> dict:
                if rec.get("raw") is not None else None,
         "scraped_at": rec.get("scraped_at"),
         "source_id": rec.get("source_id"),
+        # 采集结局随观测一起落库(2026-08-09 补):此前只在摄取时计数,
+        # 事后没人答得上"这个 ASIN 为什么没有新数据"。ok 也存,不然
+        # "从来没采过"和"采过但被降级"在库里长得一模一样。
+        "outcome": _blank_to_none(rec.get("outcome")) or OUTCOME_OK,
+        "completeness_ok": rec.get("completeness_ok"),
     }
 
 
@@ -138,7 +145,9 @@ def ingest_batch(conn, records: list[dict]) -> dict:
     """输入:连接 + record 列表 → 输出:计数 dict。
 
     计数项:snapshots 新增/重复(source_id 已在库)、products 更新、
-    非 ok 跳过身份层、completeness_ok=false(只告警不拦)、缺 asin/source_id 丢弃。
+    非 ok 跳过身份层、completeness_ok=false(只告警不拦)、缺 asin/source_id 丢弃,
+    外加每种非 ok 结局一个 `outcome_<结局>` 键(摘要里给分布,库里查明细看
+    snapshots.outcome)。
     """
     counts = {"snapshots": 0, "dup": 0, "products": 0, "skipped_outcome": 0,
               "incomplete": 0, "invalid": 0}
@@ -159,6 +168,8 @@ def ingest_batch(conn, records: list[dict]) -> dict:
             if outcome != OUTCOME_OK:
                 # 规则 1:失败/降级采集是合法观测,但不刷新产品身份
                 counts["skipped_outcome"] += 1
+                key = f"outcome_{outcome}"
+                counts[key] = counts.get(key, 0) + 1
                 continue
             if rec.get("completeness_ok") is False:
                 counts["incomplete"] += 1   # COALESCE 已防覆盖,这里只计数

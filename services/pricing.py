@@ -2,8 +2,8 @@
 
 规则:amz 价格落在哪个区间,乘该区间在限额表(registry.RETIRE_LIMITS,
 按店铺分行)里的倍率得沃尔玛价;**区间重叠部分向下兼容**(边界/重叠取
-低区间,如 30 美金用 FBA 0-30 的倍数)。价格不落任何区间 → 不上架
-(返回 None,调用方按"价格出界"淘汰)。
+低区间,如 30 美金用 FBA 0-30 的倍数)。**价格不落任何区间 → 按
+OUT_OF_BAND_MULTIPLIER(300%)定价**(所有者定稿 2026-08-09,此前是淘汰)。
 
 区间定稿(表格中不可见,所有者口述定稿,勿改):
   FBA:区间1 = 0~30,区间2 = 30~75
@@ -13,6 +13,11 @@
 import logging
 
 logger = logging.getLogger("services.pricing")
+
+# 价格落在所有区间之外时的默认倍率(所有者定稿 2026-08-09:出界按 300% 定价,
+# 不再淘汰)。它是**兜底口径不是配置项**——某个价格段要走别的倍率,
+# 应该在限额表里给它开一段区间,而不是改这个常量。
+OUT_OF_BAND_MULTIPLIER = 3.0
 
 # (下界, 上界, 限额表字段名);顺序即优先级——重叠/边界向下兼容取先命中的低区间
 PRICE_BANDS = {
@@ -50,14 +55,23 @@ def pick_band(channel: str, amz_price: float) -> str | None:
 
 def walmart_price(channel: str, amz_price, multipliers: dict) -> float | None:
     """输入:渠道 + amz 价格 + {字段名: 倍率原值}(该店限额表行)
-    → 输出:沃尔玛价(round2)或 None(出界/倍率未配置)。"""
+    → 输出:沃尔玛价(round2)或 None(倍率未配置/价格不可解析)。
+
+    **价格出界不再淘汰**(所有者定稿 2026-08-09):落在任何区间之外的一律按
+    OUT_OF_BAND_MULTIPLIER(300%)定价。区间只是"运营给过明确倍率的价格段",
+    出界不代表这个货不能卖。
+
+    仍返 None 的两种:该区间在限额表里没配倍率(配置缺失,不该拿默认值蒙混)、
+    amz 价格解析不出来(没有定价输入)。
+    """
     try:
         p = float(amz_price)
     except (TypeError, ValueError):
         return None
     field = pick_band(channel, p)
     if field is None:
-        return None
+        # 出界:走默认倍率,不查表(表里本来就没有对应这段价格的列)
+        return round(p * OUT_OF_BAND_MULTIPLIER, 2)
     mult = parse_multiplier(multipliers.get(field))
     if mult is None or mult <= 0:
         return None

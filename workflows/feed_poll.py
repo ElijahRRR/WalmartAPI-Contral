@@ -135,7 +135,11 @@ def run(params: dict) -> str:
                 return (f"feed {feed_id} 不在台账中或店铺未加载:"
                         f"请补 -p store=<店铺名>")
             store = stores_by_name[row[0]]
-        return _explain(store, feed_id)
+        # 明说这一模式不写任何东西:所有者 2026-08-09 用它查了维护 feed,
+        # 看到结果却发现飞书没变——两条路径长得太像,不说就会被当成故障
+        return (_explain(store, feed_id)
+                + "\n(诊断模式:不动 ops.feed_items 台账、不回写飞书;"
+                  "要落定并回写请跑不带 -p feed_id 的 python cli.py feed_poll)")
     lines = [feed_track.poll_all(stores_by_name)]
     for label, sync in _REFLECTORS:
         try:

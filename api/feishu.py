@@ -19,6 +19,7 @@ bitable 为全新实现,但重试/退避/切块参数照抄旧系统的实测值
 """
 
 import logging
+import re
 import threading
 import time
 from collections import defaultdict
@@ -389,6 +390,7 @@ def ensure_keys(table: Bitable, key_field: str, keys: set[str]) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SHEET_WRITE_BLOCK_ROWS = 4000
+_SHEET_CELL_MAX_CHARS = 20000   # 飞书单元格上限 5 万,留余量(超长必是脏数据)
 _SHEET_WRITE_THROTTLE_SECS = 0.3
 _SHEET_DIMENSION_MAX = 5000     # dimension_range 增/删单次上限(90204 实证 2026-08-05)
 
@@ -481,23 +483,70 @@ def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
     return ((data.get("valueRange") or {}).get("values")) or []
 
 
+_CTRL_CHARS = {c: None for c in range(32) if c not in (9, 10, 13)}
+
+
+def _scrub(v):
+    """输入:单元格值 → 输出:飞书能收的字符串(控制字符剔除,超长截断)。
+
+    采集来的标题/描述偶尔带 \\x00 一类控制字符,飞书直接返 90202
+    validate RangeVal fail——报错里不会告诉你是哪个单元格。这里剔掉,
+    **剔到了就记日志**(静默清洗 = 下次同样的坑没人知道)。
+    """
+    s = "" if v is None else str(v)
+    if len(s) > _SHEET_CELL_MAX_CHARS:
+        logger.warning("单元格超 %d 字符已截断(原长 %d)",
+                       _SHEET_CELL_MAX_CHARS, len(s))
+        s = s[:_SHEET_CELL_MAX_CHARS]
+    if any(ord(c) < 32 and c not in "\t\n\r" for c in s):
+        logger.warning("单元格含控制字符,已剔除:%r", s[:80])
+        s = s.translate(_CTRL_CHARS)
+    return s
+
+
+def _split_rows(rng: str, values: list[list]) -> list[tuple[str, list[list]]]:
+    """输入:A1 范围 + 值矩阵 → 输出:按 _SHEET_WRITE_BLOCK_ROWS 切开的子范围。
+
+    单个范围裹着上千行会被飞书拒(90202);sheet_overwrite 早就按块切,
+    这条定点回写路径此前漏了(所有者 2026-08-09 实遇:1000+ 行维护流水
+    一次写,整轮 failed)。范围形如 A11:I1037,只切行不动列。
+    """
+    m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.strip().upper())
+    if not m or len(values) <= _SHEET_WRITE_BLOCK_ROWS:
+        return [(rng, values)]
+    c1, r1, c2, _r2 = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+    out = []
+    for i in range(0, len(values), _SHEET_WRITE_BLOCK_ROWS):
+        block = values[i:i + _SHEET_WRITE_BLOCK_ROWS]
+        out.append((f"{c1}{r1 + i}:{c2}{r1 + i + len(block) - 1}", block))
+    return out
+
+
 def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
     """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:写入的范围数。
 
     定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补;
-    按 100 范围/批切块 values_batch_update,批间节流。
+    **先按行切开过大的范围**,再按 100 范围/批切块 values_batch_update,批间节流。
     """
     s = sheet.require()
+    split: list[tuple[str, list[list]]] = []
+    for rng, vals in updates:
+        split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
     n = 0
-    for i in range(0, len(updates), 100):
-        chunk = updates[i:i + 100]
-        _call("POST",
-              f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
-              json_body={"valueRanges": [
-                  {"range": f"{s.sheet_id}!{rng}", "values": vals}
-                  for rng, vals in chunk]})
+    for i in range(0, len(split), 100):
+        chunk = split[i:i + 100]
+        try:
+            _call("POST",
+                  f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
+                  json_body={"valueRanges": [
+                      {"range": f"{s.sheet_id}!{rng}", "values": vals}
+                      for rng, vals in chunk]})
+        except FeishuError as e:
+            # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
+            raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
+                                      f"{sum(len(v) for _r, v in chunk)} 行)") from None
         n += len(chunk)
-        if i + 100 < len(updates):
+        if i + 100 < len(split):
             time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     return n
 

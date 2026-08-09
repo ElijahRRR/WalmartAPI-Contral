@@ -181,16 +181,17 @@ def test_stock_count_null_and_zero_are_different():
 def test_fetch_products_carries_true_values(monkeypatch):
     """provider 只搬运真值:stock/lead_days 的 None 原样透出,不 or 0。"""
     rows = [
-        # asin, title, brand, category, image, slow, price, state, count, days, raw
+        # asin, title, brand, category, image, slow, price, state, count,
+        # days, raw, fulfillment
         ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg",
          {"images": ["https://x/2.jpg", "https://x/1.jpg"],
           "bullet_points": ["a"]},                      # 身份层 slow 全量段
-         19.99, "in_stock", 37, 8, None),
+         19.99, "in_stock", 37, 8, None, "FBA"),
         ("B0B", "标题B", None, None, None, None, 8.0, "out_of_stock", 0,
-         None, None),
+         None, None, "fbm"),
         ("B0C", "标题C", None, None, None, None, 8.0, "in_stock", None,
-         None, None),
-        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None),
+         None, None, None),
+        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None, None),
     ]
 
     class _C:
@@ -214,6 +215,9 @@ def test_fetch_products_carries_true_values(monkeypatch):
     assert out["B0C"]["stock"] is None                # 没采到,不是 0
     assert out["B0C"]["stock_state"] == "in_stock"    # 状态给调用方兜底判断
     assert out["B0A"]["price"] == 19.99
+    # 配送方式来自 raw.is_fba,归一化大写;采不到就是 None(调用方不许猜)
+    assert out["B0A"]["channel"] == "FBA" and out["B0B"]["channel"] == "FBM"
+    assert out["B0C"]["channel"] is None
     assert amz_source.fetch_products([]) == {}
 
 
@@ -226,17 +230,23 @@ def test_list_new_stock_three_way(monkeypatch):
             _sheet_row(6, asin="B0NULLUNK"), _sheet_row(7, asin="B0SLOW")]
     products = {
         "B0REAL":    {"asin": "B0REAL", "title": "T", "price": 20.0,
-                      "stock": 37, "stock_state": "in_stock", "lead_days": 8},
+                      "stock": 37, "stock_state": "in_stock", "lead_days": 8,
+                      "channel": "FBM"},
         "B0LOW":     {"asin": "B0LOW", "title": "T", "price": 20.0,
-                      "stock": 3, "stock_state": "in_stock", "lead_days": 2},
+                      "stock": 3, "stock_state": "in_stock", "lead_days": 2,
+                      "channel": "FBM"},
         "B0ZERO":    {"asin": "B0ZERO", "title": "T", "price": 20.0,
-                      "stock": 0, "stock_state": "out_of_stock", "lead_days": 2},
+                      "stock": 0, "stock_state": "out_of_stock", "lead_days": 2,
+                      "channel": "FBM"},
         "B0NULLOK":  {"asin": "B0NULLOK", "title": "T", "price": 20.0,
-                      "stock": None, "stock_state": "in_stock", "lead_days": None},
+                      "stock": None, "stock_state": "in_stock",
+                      "lead_days": None, "channel": "FBA"},
         "B0NULLUNK": {"asin": "B0NULLUNK", "title": "T", "price": 20.0,
-                      "stock": None, "stock_state": "unknown", "lead_days": None},
+                      "stock": None, "stock_state": "unknown",
+                      "lead_days": None, "channel": "FBM"},
         "B0SLOW":    {"asin": "B0SLOW", "title": "T", "price": 20.0,
-                      "stock": 50, "stock_state": "in_stock", "lead_days": 30},
+                      "stock": 50, "stock_state": "in_stock", "lead_days": 30,
+                      "channel": "FBM"},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
@@ -291,3 +301,163 @@ def test_slow_segment_stored_whole():
     assert stored["weight"]["package"] == 3.5
     assert stored["variant"]["parent_asin"] == "B0PARENT"
     assert ingest.product_params(_rec(slow={}))["slow"] is None
+
+
+# ── 采集推送(product_refresh)────────────────────────────────────────────
+
+def test_submit_batch_txt_and_conflict(monkeypatch):
+    """v4 语义:200=新建(inserted 无歧义);409=上次已成功,带既有 batch_id。"""
+    sent = {}
+
+    def fake_post(url, files=None, data=None, headers=None, timeout=None):
+        sent["url"] = url
+        sent["body"] = files["file"][1].decode()
+        sent["data"] = data
+        return httpx.Response(200, json={"batch_id": "B1", "inserted": 3},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    out = scraper.submit_batch("wm-refresh-1", ["B0A", "B0B", "B0C"])
+    assert out["batch_id"] == "B1" and out["inserted"] == 3
+    assert sent["body"] == "B0A\nB0B\nB0C"          # txt 每行一个
+    assert sent["data"]["needs_screenshot"] == "false"   # 不截图=最高吞吐
+    assert "zip_code" not in sent["data"]                # 不切邮编
+
+    def conflict(url, files=None, data=None, headers=None, timeout=None):
+        return httpx.Response(409, json={"detail": {"batch_id": "OLD",
+                                                    "batch_name": "wm-refresh-1"}},
+                              request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", conflict)
+    with pytest.raises(scraper.BatchExistsError) as ei:
+        scraper.submit_batch("wm-refresh-1", ["B0A"])
+    assert ei.value.batch_id == "OLD"       # 拿既有批次接着轮询,不重复建批
+
+    with pytest.raises(ValueError):
+        scraper.submit_batch("x", [])
+
+
+def test_snapshot_carries_outcome_and_completeness():
+    """采集结局随观测落库:没有它,'这个 ASIN 为什么没数据'查不了。"""
+    s = ingest.snapshot_params(_rec(outcome="blocked", completeness_ok=False))
+    assert s["outcome"] == "blocked" and s["completeness_ok"] is False
+    assert ingest.snapshot_params(_rec())["outcome"] == "ok"
+    # 缺字段的老记录按 ok(契约默认),不能落成 NULL 与"没采过"混淆
+    assert ingest.snapshot_params(_rec(outcome=None))["outcome"] == "ok"
+    for col in ("outcome", "completeness_ok"):
+        assert col in ingest._SNAPSHOT_SQL
+
+
+def test_ingest_reports_outcome_distribution():
+    conn = _FakeConn()
+    counts = ingest.ingest_batch(conn, [
+        _rec(source_id="s1", outcome="blocked"),
+        _rec(source_id="s2", outcome="blocked"),
+        _rec(source_id="s3", outcome="not_found"),
+    ])
+    assert counts["outcome_blocked"] == 2 and counts["outcome_not_found"] == 1
+
+
+def test_batch_failures_pulls_detail_not_just_a_count(monkeypatch):
+    """失败明细按 batch_id 拉(按批次名的旧接口只给最近 200 条,v4 已废)。"""
+    seen = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        seen["url"], seen["params"] = url, params
+        return httpx.Response(200, json={
+            "batch_id": 7, "count": 1,
+            "failed_tasks": [{"asin": "B0A", "status": "failed",
+                              "error_type": "captcha", "error_detail": "boom",
+                              "retry_count": 3,
+                              "updated_at": "2026-08-09 02:00:00"}]},
+            request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    rows = scraper.batch_failures("7", limit=999999)
+    assert rows[0]["error_type"] == "captcha"
+    assert seen["url"].endswith("/api/batches/7/failures")
+    assert seen["params"]["limit"] == scraper.FAILURES_LIMIT_MAX   # 上限夹住
+
+    _patch_http(monkeypatch, [(404, {"detail": "批次不存在"})])
+    with pytest.raises(LookupError):
+        scraper.batch_failures(7)
+    with pytest.raises(ValueError):
+        scraper.batch_failures(None)        # 没记下 batch_id 就查不了,别瞎猜
+
+
+def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
+    from datetime import timezone
+    from workflows import product_refresh as pr
+
+    saved = []
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, params): saved.extend(params)
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(pr.scraper, "batch_failures", lambda bid: [
+        {"asin": "B0A", "status": "failed", "error_type": "captcha",
+         "error_detail": "d", "retry_count": 3,
+         "updated_at": "2026-08-09 02:00:00"},
+        {"asin": "B0B", "status": "failed", "error_type": "captcha",
+         "error_detail": None, "retry_count": 1, "updated_at": None},
+        {"asin": None, "error_type": "timeout"},        # 无 asin:落库没价值
+    ])
+    line = pr._pull_failures("wm-refresh-x", "7")
+    assert "2 个 ASIN 已落库" in line and "captcha×2" in line
+    assert [p[1] for p in saved] == ["B0A", "B0B"]
+    # 采集侧给的是 UTC 裸串:必须显式补 UTC,否则按会话时区解释会差 8 小时
+    assert saved[0][6].tzinfo is not None
+    assert saved[0][6].astimezone(timezone.utc).hour == 2
+    assert saved[1][6] is None
+
+    # 拉不到不该毁掉整轮状态检查(批次已落定,失败明细是附加信息)
+    def boom(bid):
+        raise RuntimeError("网络炸了")
+
+    monkeypatch.setattr(pr.scraper, "batch_failures", boom)
+    assert "拉取失败" in pr._pull_failures("wm-refresh-x", "7")
+    assert "查不了" in pr._pull_failures("wm-refresh-x", None)
+
+
+def test_refresh_targets_sql_gates():
+    from workflows import product_refresh as pr
+    # 只推在线 + PUBLISHED + 店铺 ACTIVE(无 KPI 记录 fail-open);跨店去重
+    assert "missing_since IS NULL" in pr._SQL_TARGETS
+    assert "published_status = 'PUBLISHED'" in pr._SQL_TARGETS
+    assert "s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE'" in pr._SQL_TARGETS
+    assert "SELECT DISTINCT w.sku" in pr._SQL_TARGETS
+    assert pr.TIMEOUT_HOURS == 1 and pr.DANGEROUS is True
+
+
+def test_refresh_filters_non_asin_skus(monkeypatch):
+    """历史遗留的非 ASIN 形态 SKU 推了也建不成任务(所有者定稿:直接过滤)。"""
+    from workflows import product_refresh as pr
+
+    skus = ["B0ABCDEFGH", "B0123456789", "WM-CUSTOM-01", "b0abcdefgh", "",
+            "B0Z9Y8X7W6"]
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return [(s,) for s in skus]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    ok, dropped = pr._targets()
+    # 11 位、小写、自定义编码、空串全过滤掉
+    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4

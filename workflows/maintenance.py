@@ -12,18 +12,21 @@
   维护记录反哺器(poll_yesterday 消失)。
 
 意图来源(services/maintenance_intents,可插拔 provider;2026-08-09 全部做实):
-  删除   **variant_offset**:采集永久偏移(亚马逊把 /dp/<ASIN> 返回成兄弟
-         变体页面,parser 拒绝写入,采集侧列为不自动重试)⇒ 价格/库存永远
-         拿不到新数据,留着只会被前三个 provider 拿陈旧快照一轮轮跟。
-         所有者定稿 2026-08-09:**删掉,且就放在本工作流里**(一个工作流)。
-         DELETE_ITEM 不可逆:dry-run 单独列名单;单店单轮封顶 300;
+  删除   两个原因(所有者定稿 2026-08-09),都是"亚马逊侧已经没法维护了":
+         · **variant_offset**:采集永久偏移(亚马逊把 /dp/<ASIN> 返回成兄弟
+           变体页面,parser 拒绝写入,采集侧列为不自动重试)⇒ 价格/库存永远
+           拿不到新数据,留着只会被前三个 provider 拿陈旧快照一轮轮跟;
+         · **商品不存在**:amz 标题是占位符(旧系统只跳过标题维护,现改为删)。
+         DELETE_ITEM 不可逆:dry-run 单独列名单与原因分布;单店单轮上限取
+         限额表「下架限制」(与 product_clear 同一列,缺则退 300 并告警);
          **删除名单从其余三类里剔除**(将死的行不值得再烧一轮配额)。
   清零   限额表「库存特殊要求」=0 的 stockzero 店整店清零(不依赖采集;
          所有者定稿:不设清零二次确认)
   改价   amz 现价 × 该店区间倍率(与上架同一套 services/pricing 规则)
          vs 沃尔玛现价,差异 ≥1 分且 ≥1% 才提交;出界/倍率未配置 → 不动
-  改库存 amz stock_count vs 沃尔玛 avail_qty;**没采到(NULL)不动**,
-         确实缺货(0)才清零;配送 >12 天写 0(旧规则)
+  改库存 amz stock_count vs 沃尔玛 avail_qty;**没采到(NULL)也写 0**
+         (所有者定稿 2026-08-09:采不到就不卖);配送 **>8 天**写 0
+         (同日从旧值 12 收紧,与 list_new 共用 amz_source.MAX_LEAD_DAYS)
   改标题 amz 标题过与上架同一套文案处理(去品牌/截 199)vs 沃尔玛现标题;
          占位符跳过、productType/UPC/标题三缺一跳过(旧防线)
   三个自动 provider 都只作用于 source_type='amz' 的行(路由铁律),
@@ -110,6 +113,33 @@ def _load_multipliers() -> dict[str, dict]:
     return out
 
 
+def _load_delete_caps() -> dict[str, int]:
+    """限额表「下架限制」列 → {店铺: 单轮删除上限}(与 product_clear 同一列)。
+
+    删除上限不该由代码拍脑袋(所有者问 2026-08-09「300 这个上限是从哪来的」):
+    这张表就是运营给每家店定的下架配额,删除走同一个配额口径。
+    店铺不在表内退 mi.DELETE_PER_STORE(provider 内告警)。
+    """
+    t = resources.RETIRE_LIMITS
+    f = t.fields
+    try:
+        recs = feishu.list_records(t, field_names=[f.store, f.max_daily_retire])
+    except LookupError:
+        logger.warning("限额表未登记,删除上限全店退 %d", mi.DELETE_PER_STORE)
+        return {}
+    caps: dict[str, int] = {}
+    for rec in recs:
+        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        try:
+            v = int(float(feishu._plain_text(
+                rec["fields"].get(f.max_daily_retire)) or 0))
+        except ValueError:
+            v = 0
+        if name and v > 0:
+            caps[name] = v
+    return caps
+
+
 def collect_intents(conn, stockzero: list[str]) -> list[dict]:
     """输入:连接 + stockzero 名单 → 输出:全部维护意图(各 provider 汇总)。
 
@@ -117,7 +147,7 @@ def collect_intents(conn, stockzero: list[str]) -> list[dict]:
     否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
     """
     mults = _load_multipliers()
-    deletes = mi.variant_offset_intents(conn)
+    deletes = mi.delete_intents(conn, stockzero, _load_delete_caps())
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)
     for it in (mi.title_intents(conn, stockzero)
@@ -137,7 +167,8 @@ def _record_deletes(store: str, rows: list[dict], feed_id) -> None:
         product_events.record_many(conn, [
             {"sku": r["sku"], "store": store, "event": "delete_submitted",
              "source": "maintenance",
-             "detail": {"feed_id": feed_id, "reason": "variant_offset",
+             "detail": {"feed_id": feed_id,
+                        "reason": r.get("reason") or "variant_offset",
                         "batches": r.get("batches"),
                         "first_seen": r.get("first_seen"),
                         "last_seen": r.get("last_seen")}}
@@ -192,11 +223,15 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
             _record_deletes(name, batch, res["feed_id"])
         if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
             for it in batch:
-                records.append((name, it["sku"], label, it["old"], it["new"],
+                # 删除类的 C 列带原因(variant_offset / 商品不存在),便于
+                # 事后按原因统计;其余三类沿用类型标签
+                records.append((name, it["sku"], it.get("label") or label,
+                                it["old"], it["new"],
                                 res["feed_id"], today, "处理中", ""))
         elif res["outcome"] == "failed":
             for it in batch:
-                records.append((name, it["sku"], label, it["old"], it["new"],
+                records.append((name, it["sku"], it.get("label") or label,
+                                it["old"], it["new"],
                                 "", today, "提交被拒", ""))
     line = f"  {name}:{label} feed 提交 {n['submitted']}"
     if n["dedup"]:
@@ -241,11 +276,14 @@ def run(params: dict) -> str:
         # 删除不可逆:名单必须看得见,且要与其余三类分开说(混在一起会误读)
         dels = [i for i in intents if i["kind"] == "delete"]
         if dels:
-            by = {}
+            by, why = {}, {}
             for d in dels:
                 by[d["store"]] = by.get(d["store"], 0) + 1
+                r = d.get("reason") or "?"
+                why[r] = why.get(r, 0) + 1
             lines.append(
-                f"  ⚠ 永久删除 {len(dels)} 行(采集永久偏移,数据再也拿不到):"
+                f"  ⚠ 永久删除 {len(dels)} 行(原因:"
+                + ",".join(f"{r}×{n}" for r, n in sorted(why.items())) + "):"
                 + ",".join(f"{s}×{n}" for s, n in sorted(by.items())))
             lines.append(f"    样本={[d['sku'] for d in dels[:8]]}"
                          + (" …" if len(dels) > 8 else ""))

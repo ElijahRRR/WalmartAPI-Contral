@@ -47,9 +47,9 @@ PRICE_MIN_RATIO = 0.01          # 1%
 # 单轮每类意图上限(防某天采集侧大面积变动 → 一次几万条 feed)
 MAX_INTENTS_PER_KIND = 5000
 
-# 删除类(variant_offset)专属:批次数门槛与单店单轮上限
+# 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
-DELETE_PER_STORE = 300          # 不可逆动作的单店防呆
+DELETE_PER_STORE = 300          # 限额表「下架限制」缺该店时的退路(会告警)
 
 _SQL_ZERO = """
 SELECT store, sku, avail_qty FROM catalog.walmart_items
@@ -187,16 +187,22 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
                       ) -> list[dict]:
     """输入:连接 + stockzero 名单 → 输出:改库存意图。
 
-    ⚠ **stock_count 的 None 与 0 是两回事**(采集契约 3b):None = 本次没采到
-    → **不动**(不能把"不知道"当成缺货去清零);0 = 确实缺货 → 同步为 0。
-    配送 > MAX_LEAD_DAYS 天 → 库存写 0(旧规则,货期太长先下架式清零)。
+    库存决策(所有者定稿 2026-08-09):
+      · stock_count 有值 → 同步该值(0 就是 0)
+      · **stock_count 为 NULL(没采到)→ 也写 0**。采不到就不卖,是运营口径;
+        库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在决策这一层
+        把"不知道"当成"别卖"。
+      · 配送 > MAX_LEAD_DAYS(8 天,所有者 2026-08-09 从 12 改)→ 写 0
+    ⚠ 血量提醒:采集服务中断一整轮会让大批行的 stock_count 变 NULL,
+    按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
+    真跑前务必看 dry-run 的清零条数。
     """
     from services import amz_source
     out = []
     for (store, sku, _name, _pt, _upc, _wp, avail_qty,
          _ap, stock_count, delivery_days, _slow) in _rows(conn, stockzero_stores):
         if stock_count is None:
-            continue                    # 没采到 ≠ 缺货
+            stock_count = 0             # 没采到 → 不卖(所有者定稿)
         new_qty = 0 if (delivery_days is not None
                         and delivery_days > amz_source.MAX_LEAD_DAYS) \
             else int(stock_count)
@@ -244,34 +250,59 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
     return _cap(out, "title")
 
 
-def variant_offset_intents(conn, min_batches: int = MIN_OFFSET_BATCHES
-                           ) -> list[dict]:
-    """输入:连接(+批次数门槛)→ 输出:采集永久偏移的删除意图(kind='delete')。
+def delete_intents(conn, stockzero_stores: list[str] | None = None,
+                   caps: dict[str, int] | None = None,
+                   min_batches: int = MIN_OFFSET_BATCHES) -> list[dict]:
+    """输入:连接(+单店上限表/批次数门槛)→ 输出:删除意图(kind='delete')。
 
-    `variant_offset` = 亚马逊把 /dp/<ASIN> 返回成兄弟变体页面,parser 比对
-    页面 ASIN 不一致后**拒绝写入**(宁可判失败也不写错数据),采集侧列为
-    **不自动重试**类型 ⇒ 这些 SKU 的价格/库存**永远拿不到新数据**,前三个
-    provider 只会拿着陈旧快照一轮轮跟价跟库存。所有者定稿 2026-08-09:删掉。
+    两个原因(所有者定稿 2026-08-09),都是"这个产品在亚马逊侧已经没法维护了":
 
-    门槛 min_batches 默认 1(所有者:"偏移了就不会恢复",不设观察期)。
-    唯一防呆:最后一次偏移之后若有 outcome=ok 快照则移出名单——真能采就
-    不该删。单店单轮封顶 DELETE_PER_STORE(不可逆动作的防呆)。
+    variant_offset —— 亚马逊把 /dp/<ASIN> 返回成兄弟变体页面,parser 比对
+      页面 ASIN 不一致后**拒绝写入**,采集侧列为**不自动重试** ⇒ 价格/库存
+      **永远拿不到新数据**。门槛 min_batches 默认 1(所有者:偏移了就不会
+      恢复,不设观察期);唯一防呆:最后一次偏移之后若有 outcome=ok 快照
+      则移出名单——真能采就不该删。
+
+    商品不存在 —— amz 标题是占位符(TITLE_PLACEHOLDERS)。旧系统在这里只是
+      跳过标题维护,所有者 2026-08-09 改为**删除该产品**:亚马逊页面都没了,
+      留在沃尔玛就是个卖不出去的死链。
+
+    单店单轮上限取限额表「下架限制」(caps,与 product_clear 同一列同一口径),
+    店铺不在表内退 DELETE_PER_STORE 并告警。
     """
+    caps = caps or {}
+    seen, out, per_store = set(), [], {}
+
+    def _take(store, sku, reason, extra=None):
+        if (store, sku) in seen:
+            return          # 两个原因都命中只删一次
+        cap = int(caps.get(store, DELETE_PER_STORE))
+        per_store[store] = per_store.get(store, 0) + 1
+        if per_store[store] > cap:
+            return          # 超单店上限的留到下轮(下面统一告警)
+        seen.add((store, sku))
+        out.append({"store": store, "sku": sku, "kind": "delete",
+                    "old": "在线", "new": "删除", "reason": reason,
+                    "label": f"删除({reason})", **(extra or {})})
+
     with conn.cursor() as cur:
         cur.execute(_SQL_VARIANT_OFFSET, {"min_batches": int(min_batches)})
-        rows = cur.fetchall()
-    out, per_store = [], {}
-    for store, sku, batches, first_seen, last_seen in rows:
-        per_store[store] = per_store.get(store, 0) + 1
-        if per_store[store] > DELETE_PER_STORE:
-            continue        # 超单店上限的留到下轮(下面统一告警)
-        out.append({"store": store, "sku": sku, "kind": "delete",
-                    "old": "在线", "new": "删除", "batches": batches,
-                    "first_seen": first_seen, "last_seen": last_seen})
-    over = {s: n - DELETE_PER_STORE for s, n in per_store.items()
-            if n > DELETE_PER_STORE}
+        for store, sku, batches, first_seen, last_seen in cur.fetchall():
+            _take(store, sku, "variant_offset",
+                  {"batches": batches, "first_seen": first_seen,
+                   "last_seen": last_seen})
+
+    for (store, sku, _name, _pt, _upc, _wp, _qty,
+         _ap, _sc, _dd, slow) in _rows(conn, stockzero_stores):
+        title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
+        if str(title or "").strip() in TITLE_PLACEHOLDERS and title:
+            _take(store, sku, "商品不存在")
+
+    over = {s: n - int(caps.get(s, DELETE_PER_STORE))
+            for s, n in per_store.items()
+            if n > int(caps.get(s, DELETE_PER_STORE))}
     if over:
-        logger.warning("删除超单店上限 %d,本轮留下:%s", DELETE_PER_STORE, over)
+        logger.warning("删除超单店上限,本轮留下:%s", over)
     return _cap(out, "delete")
 
 

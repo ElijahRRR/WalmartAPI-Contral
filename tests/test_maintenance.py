@@ -84,18 +84,23 @@ def test_price_intents_threshold_and_no_rule(monkeypatch):
     assert out[0]["old"] == 20.0 and out[0]["new"] == 30.0
 
 
-def test_inventory_intents_null_is_not_zero(monkeypatch):
+def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
+    """所有者定稿 2026-08-09:没采到也写 0(采不到就不卖);货期闸收紧到 8 天。"""
     rows = [
         _row(sku="B0SYNC", avail_qty=10, stock_count=7),        # 7≠10 → 改
         _row(sku="B0SAME", avail_qty=7, stock_count=7),         # 相同 → 不动
         _row(sku="B0OOS", avail_qty=5, stock_count=0),          # 确实缺货 → 改 0
-        _row(sku="B0UNKNOWN", avail_qty=5, stock_count=None),   # 没采到 → **不动**
-        _row(sku="B0SLOW", avail_qty=9, stock_count=50,
-             delivery_days=30),                                 # 货期超限 → 清零
+        _row(sku="B0UNKNOWN", avail_qty=5, stock_count=None),   # 没采到 → **也 0**
+        _row(sku="B0ZEROED", avail_qty=0, stock_count=None),    # 已经是 0 → 不动
+        _row(sku="B0LEAD9", avail_qty=9, stock_count=50,
+             delivery_days=9),                                  # 9>8 → 清零
+        _row(sku="B0LEAD8", avail_qty=9, stock_count=50,
+             delivery_days=8),                                  # 8 不超 → 同步 50
     ]
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
     out = {i["sku"]: i["new"] for i in mi.inventory_intents(_Conn(), [])}
-    assert out == {"B0SYNC": 7, "B0OOS": 0, "B0SLOW": 0}
+    assert out == {"B0SYNC": 7, "B0OOS": 0, "B0UNKNOWN": 0, "B0LEAD9": 0,
+                   "B0LEAD8": 50}
 
 
 def test_title_intents_reuses_listing_copy_rules(monkeypatch):
@@ -137,18 +142,35 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
     assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
     assert mi.MIN_OFFSET_BATCHES == 1
 
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
     conn = _Conn(rows=[("T1", "B0A", 1, None, None),
                        ("T1", "B0B", 2, None, None)])
-    out = mi.variant_offset_intents(conn)
-    assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"])
-            for i in out] == [("T1", "B0A", "delete", "在线", "删除"),
-                              ("T1", "B0B", "delete", "在线", "删除")]
+    out = mi.delete_intents(conn)
+    assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"], i["reason"])
+            for i in out] == [
+        ("T1", "B0A", "delete", "在线", "删除", "variant_offset"),
+        ("T1", "B0B", "delete", "在线", "删除", "variant_offset")]
 
-    # 单店单轮上限:不可逆动作的防呆,超出的留到下轮
+    # 单店上限取限额表「下架限制」;不在表内退 DELETE_PER_STORE(所有者问来源)
+    rows3 = [("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
+             ("T2", "B0C", 1, None, None)]
+    assert len(mi.delete_intents(_Conn(rows=rows3), caps={"T1": 1})) == 2
     monkeypatch.setattr(mi, "DELETE_PER_STORE", 1)
-    assert len(mi.variant_offset_intents(_Conn(rows=[
-        ("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
-        ("T2", "B0C", 1, None, None)]))) == 2       # 每店各留 1
+    assert len(mi.delete_intents(_Conn(rows=rows3))) == 2    # 每店各留 1
+
+
+def test_delete_intents_also_take_title_placeholder(monkeypatch):
+    """占位符[商品不存在]:旧系统只是跳过标题,所有者 2026-08-09 改为删除。"""
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
+        _row(sku="B0GONE", slow={"title": "[商品不存在]"}),
+        _row(sku="B0OK", slow={"title": "正常标题"}),
+        _row(sku="B0DUP", slow={"title": "[商品不存在]"}),
+    ])
+    # B0DUP 同时是偏移件:两个原因命中只删一次
+    out = mi.delete_intents(_Conn(rows=[("T1", "B0DUP", 1, None, None)]))
+    got = {i["sku"]: i["reason"] for i in out}
+    assert got == {"B0DUP": "variant_offset", "B0GONE": "商品不存在"}
+    assert [i["label"] for i in out if i["sku"] == "B0GONE"] == ["删除(商品不存在)"]
 
 
 def test_build_title_item_shape():
@@ -282,9 +304,10 @@ def test_dry_run_lists_delete_names_separately(monkeypatch):
 def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
     conn = _Conn()
-    monkeypatch.setattr(mi, "variant_offset_intents", lambda c: [
+    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps: [
         {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
-         "new": "删除", "batches": 1}])
+         "new": "删除", "reason": "variant_offset"}])
+    monkeypatch.setattr(mw, "_load_delete_caps", lambda: {})
     monkeypatch.setattr(mi, "title_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
         {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},

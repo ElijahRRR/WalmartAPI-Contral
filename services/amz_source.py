@@ -25,7 +25,9 @@ from registry import db
 logger = logging.getLogger("services.amz_source")
 
 MIN_INVENTORY = 5           # 库存 <5 不上架(旧 MIN_INVENTORY_THRESHOLD)
-MAX_LEAD_DAYS = 12          # 配送 >12 天仍上架但库存写 0(旧值)
+MAX_LEAD_DAYS = 8           # 配送 >8 天:上架但库存写 0 / 维护时清零
+                            # (所有者定稿 2026-08-09 从旧值 12 收紧到 8;
+                            #  list_new 与 maintenance 共用这一个口径)
 
 MARKETPLACE = "US"          # 上架目的地(契约:与 (marketplace,asin) 主键对齐)
 

@@ -19,7 +19,8 @@
   ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
     数据恢复自动续上)
   ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
-    定价出界(services/pricing,FBA/FBM 区间×倍率)淘汰
+    定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
+    只有区间内倍率未配置才淘汰)
   ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
     硬约束 → 同店打包单个 MP_ITEM feed(10/hour 硬限)
 
@@ -315,7 +316,8 @@ def run(params: dict) -> str:
                                         mults.get(r["store"], {}))
         if w_price is None:
             n["filtered"] += 1
-            reasons.append((r["rownum"], f"价格出界/倍率未配置:{p.get('price')}"))
+            reasons.append((r["rownum"],
+                            f"该区间倍率未配置:{p.get('price')}"))
             continue
         # 配送时长同样三态:采到且 >12 天 → 上架但库存写 0(旧规则);
         # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了

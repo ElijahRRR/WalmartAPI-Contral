@@ -209,7 +209,8 @@ def price_intents(conn, multipliers: dict[str, dict],
     区间按**配送方式**分两套(FBA 0-30/30-75、FBM 15-80/80-1000),配送方式
     取 latest_snapshot 的 raw.is_fba(采集侧 parser 读 buybox 的 Ships from);
     **未知则不改价**——猜错一档就是拿错倍率改线上价。
-    出界/倍率未配置 → 不产出(不是改成 0,是不动)。
+    出界按 300% 兜底(所有者定稿 2026-08-09);只有**区间内倍率未配置**
+    才不产出(不是改成 0,是不动)。
     差异需同时满足 PRICE_MIN_DELTA 与 PRICE_MIN_RATIO 才提交。
     """
     out = []
@@ -238,7 +239,7 @@ def price_intents(conn, multipliers: dict[str, dict],
         out.append({"store": store, "sku": sku, "kind": "price",
                     "old": old, "new": new_price})
     if skipped_no_rule:
-        logger.info("改价:%d 行因定价出界/倍率未配置跳过(不动,非改 0)",
+        logger.info("改价:%d 行因该区间倍率未配置跳过(不动,非改 0)",
                     skipped_no_rule)
     if skipped_no_channel:
         logger.warning("改价:%d 行配送方式(FBA/FBM)未知,本轮不改价"

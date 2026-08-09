@@ -125,7 +125,7 @@ def test_price_bands_overlap_prefers_lower():
     # 所有者定稿:FBA 0-30/30-75,FBM 15-80/80-1000;边界/重叠向下兼容
     assert pricing.pick_band("FBA", 30) == "fba_range1"      # 30 用低区间
     assert pricing.pick_band("FBA", 30.01) == "fba_range2"
-    assert pricing.pick_band("FBA", 76) is None              # 出界不上架
+    assert pricing.pick_band("FBA", 76) is None              # 出界(走默认倍率)
     assert pricing.pick_band("FBM", 80) == "fbm_range1"
     assert pricing.pick_band("FBM", 14) is None
     assert pricing.pick_band("FBM", 999) == "fbm_range2"
@@ -148,5 +148,18 @@ def test_walmart_price_end_to_end():
     assert pricing.walmart_price("FBA", 10, mults) == 27.5
     assert pricing.walmart_price("FBA", 30, mults) == 82.5   # 边界走低区间倍率
     assert pricing.walmart_price("FBA", 50, mults) == 110.0
-    assert pricing.walmart_price("FBM", 20, mults) is None   # 倍率未配置
+    assert pricing.walmart_price("FBM", 20, mults) is None   # 倍率未配置 → 仍不动
     assert pricing.walmart_price("FBA", "bad", mults) is None
+
+
+def test_out_of_band_falls_back_to_default_multiplier():
+    """所有者定稿 2026-08-09:价格出界按 300% 定价,不再淘汰。"""
+    mults = {"fba_range1": "275%", "fbm_range1": "200%"}
+    assert pricing.OUT_OF_BAND_MULTIPLIER == 3.0
+    assert pricing.walmart_price("FBA", 200, mults) == 600.0   # FBA 上界 75 外
+    assert pricing.walmart_price("FBM", 10, mults) == 30.0     # FBM 下界 15 外
+    assert pricing.walmart_price("FBM", 2000, mults) == 6000.0
+    # 出界不查表:该店一个倍率都没配也照样出价
+    assert pricing.walmart_price("FBA", 200, {}) == 600.0
+    # 在区间内但倍率没配 → 仍返 None(配置缺失不该拿默认值蒙混)
+    assert pricing.walmart_price("FBA", 10, {}) is None

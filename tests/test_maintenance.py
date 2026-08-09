@@ -72,17 +72,20 @@ _MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
 
 
 def test_price_intents_threshold_and_no_rule(monkeypatch):
+    # _MULTS 只配了 FBM 两段;FBM 区间 15-80 / 80-1000,倍率 200%
     rows = [
-        _row(sku="B0CHANGE", wm_price=20.0, amz_price=15.0),   # 新价 30 → 改
-        _row(sku="B0SAME", wm_price=20.0, amz_price=10.0),     # 新价 20 → 不动
-        _row(sku="B0TINY", wm_price=20.10, amz_price=10.0),    # 差 0.5% → 不动
+        _row(sku="B0CHANGE", wm_price=20.0, amz_price=20.0),   # 新价 40 → 改
+        _row(sku="B0SAME", wm_price=40.0, amz_price=20.0),     # 新价 40 → 不动
+        _row(sku="B0TINY", wm_price=40.10, amz_price=20.0),    # 差 0.25% → 不动
         _row(sku="B0NOAMZ", amz_price=None),                   # 缺 amz 现价 → 不动
-        _row(sku="B0OUT", amz_price=5000.0),                   # 出界 → 不动(非改 0)
+        # 出界:所有者定稿 2026-08-09 改为按 300% 定价(此前是不动)
+        _row(sku="B0OUTBAND", wm_price=20.0, amz_price=5000.0),
+        # 在区间内但该渠道倍率没配 → 仍不动(配置缺失不拿默认值蒙混)
+        _row(sku="B0NORULE", wm_price=20.0, amz_price=10.0, fulfillment="FBA"),
     ]
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
-    out = mi.price_intents(_Conn(), _MULTS, [])
-    assert [i["sku"] for i in out] == ["B0CHANGE"]
-    assert out[0]["old"] == 20.0 and out[0]["new"] == 30.0
+    out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), _MULTS, [])}
+    assert out == {"B0CHANGE": 40.0, "B0OUTBAND": 15000.0}
 
 
 def test_price_intents_skip_when_fulfillment_unknown(monkeypatch):

@@ -49,6 +49,8 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 禁止品牌收集 | 风控·品牌黑名单(产品清理报错扫描+商标库比对) | risk_sync 镜像入 PG(catalog.brand_blacklist,casefold 键);同上读库不读表 | **wiki 承载电子表格**;.env FEISHU_BRAND_WIKI_TOKEN / FEISHU_BRAND_SHEET_ID;3 列 品牌名/来源/入库日期 |
 | UPC池(新) | UPC 号段注入与领用展示 | 运营填 A=UPC B=放入日期注入;upc_sync 校验(首位白名单 016789)入库并回写 C=状态(已领/已用/冲突/非法前缀)D=店铺 E=SKU F=上架日期;**PG(catalog.upc_pool)权威**,领用/回收由上架主链在事务内操作 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_UPC_SHEET_ID |
 | 维护记录 | maintenance 流水账(只追加) | 程序唯一写入方:提交时追加(feed 路径 F=feedid H=处理中;PUT 路径 F=sync H=当场落定),H/I 由 feed_poll 反哺器按 ops.feed_items 回填;水位在 ops.cursors('maint_sheet') | **电子表格**:「在线产品总表」spreadsheet 内的「维护记录」工作表(所有者已建 2026-08-07;bitable 5 万行上限装不下);表头 店铺/SKU/动作/旧值/新值/feedid/日期/结果/报错;sheet_id 填 .env FEISHU_MAINT_SHEET_ID |
+| 黑名单邮编 | 订单审核·钓鱼检测(所有者定稿 2026-08-09:**只匹配邮编**,旧系统的黑名单地址/街道双向 substring 整套不迁) | 每次运行现读,不入库;A 列邮编、无表头,zip+4 自动收敛到前 5 位;范围按实际行数取(旧系统写死 A1:A500,超出静默截断→漏放行) | **wiki 承载电子表格**;.env FEISHU_ZIP_BLACKLIST_WIKI_TOKEN / FEISHU_ZIP_BLACKLIST_SHEET_ID |
+| 采购方 | 订单审核·按 配送方式 + 亚马逊单价区间 选采购方与汇率 | 每次运行现读,不入库;**一行都没启用就直接失败**(拿旧配置继续算钱比不出结论危险);每行实际套用的采购方/汇率落 audit_detail 可追溯 | 多维表格;.env FEISHU_SUPPLIER_APP_TOKEN / FEISHU_SUPPLIER_TABLE_ID;6 列 采购方/配送方式/价格区间起/价格区间止/汇率/是否启用(配送方式填 FBA\|FBM;是否启用支持复选框或「是」;区间只填一端=以上/以下;多个候选取**最低汇率**) |
 | 商品停用删除表 | product_clear 驱动表 | 登记类:运营填 A~D(store/sku/停用或删除/操作原因),程序写 E~H(feedid/操作日期/结果/报错);状态权威在 ops.feed_log,G/H 由 feed_poll 反哺器或 product_clear 回写(2026-08-07 定稿:feed 结果统一交轮询回填) | **电子表格**(列序契约);已建,token/sheet_id 在 .env(FEISHU_RETIRE_SHEET_TOKEN / FEISHU_RETIRE_SHEET_ID) |
 | 上下架限额表 | **按店铺分行**的单日上/下架限额(店铺/fba区间1/fba区间2/FBM区间1/FBM区间2/上架限制/下架限制/库存特殊要求) | 飞书人工维护 → 程序读(product_clear 读「下架限制」,店铺不在表内退默认值并告警;未来 listing 读「上架限制」) | 多维表格;代码已接入,token 待填 .env(FEISHU_LIMITS_APP_TOKEN / FEISHU_LIMITS_TABLE_ID) |
 
@@ -81,8 +83,23 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
   数量、销售状态、审核状态、状态更新时间、预计发货时间、预计送达时间、商品金额、
   运费金额、取消原因、行内退款金额、退款备注、承运商、物流单号、物流链接、
   收件人姓名、电话、地址1、地址2、城市、州、邮编、国家、拉取时间(=order_sync
-  最后写库时间)。**不碰**:脚本审核、亚马逊单价、采购数量、库存数量、配送方式、
-  配送时长、建议采购日期、卖家店铺名、产品截图、采购方、限价、币种、主订单表、父记录。
+  最后写库时间)。**不碰**:采购数量、币种、主订单表、父记录。
+- **销售订单(审核列)**:同一张表的第二个登记条目 `ORDER_SALES_AUDIT`,
+  由 **order_audit** 独占写:脚本审核、亚马逊单价、库存数量、配送方式、配送时长、
+  卖家店铺名、产品截图、采购方、限价。**不碰**:建议采购日期(人工域,
+  所有者定稿 2026-08-09 明确排除)。
+  - 分成两个条目是为了分家所有权:同步只覆盖载荷里出现的列,
+    order_center_push 的载荷没有审核列 → 拉单冲不掉审核结论,反之亦然。
+  - 「审核状态」是两条工作流都会写的**唯一一列**,但两边取的都是
+    `orders.order_lines.audit_status` 同一个值,不会打架。
+  - order_audit **只更新不新建行**(`feishu.update_by_key`):建行是
+    order_center_push 的职责,否则会造出只有审核列、没有订单本体的半截行。
+    尚未建出的行不报错,下一轮自然补上。
+  - **类型要求**:亚马逊单价/库存数量/配送时长/限价为**数字**,
+    产品截图为**附件**(值 `[{"file_token": ...}]`,token 由
+    `feishu.upload_media` 上传换取,与 app_token 绑定不能跨表复用),其余文本。
+    「审核状态」若是**单选**字段,选项须含「✓ 通过 / 建议拒绝 / 待人工」三值,
+    否则写入报错(见 services/order_audit.py 的结论常量)。
 - **售后订单**:唯一键、order_line_id、下单时间、店铺、RMA号、客户订单ID、
   采购订单号、行号、SKU、售后状态、退款状态、退货方式、退款方式、总退款金额、
   退货原因、退货描述、退货截止日期、退货创建时间、状态更新时间、客户姓名、

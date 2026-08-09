@@ -1,0 +1,435 @@
+"""order_audit 单测:规则引擎逐条钉死 + 工作流串接(全程不连飞书/PG/采集器)。
+
+规则常量是钱的判定(限价 0.75、税费 1.08、配送时长 9 天),这里的断言
+就是它们的回归护栏——改常量必然红,红了就得所有者确认。
+"""
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from services import order_audit as rules
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  邮编标准化与钓鱼检测
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("raw,want", [
+    ("60606", "60606"),
+    ("60606-6771", "60606"),      # zip+4 必须收敛到前 5 位
+    (" 60606 ", "60606"),
+    ("606066771", "60606"),
+    (60606, "60606"),
+    ("1234", ""),                 # 不足 5 位:取不出,不参与匹配
+    (None, ""),
+    ("", ""),
+])
+def test_norm_zip(raw, want):
+    assert rules.norm_zip(raw) == want
+
+
+def test_zip_blacklist_and_hit():
+    bl = rules.zip_blacklist([["60606"], ["  90210-1234 "], [""], []])
+    assert bl == {"60606", "90210"}
+    assert rules.is_phishing("60606-9999", bl) is True
+    assert rules.is_phishing("90210", bl) is True
+    assert rules.is_phishing("10001", bl) is False
+    assert rules.is_phishing(None, bl) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  采购方匹配
+# ══════════════════════════════════════════════════════════════════════════════
+
+FIELDS = SimpleNamespace(supplier="采购方", ship_method="配送方式",
+                         band_from="价格区间起", band_to="价格区间止",
+                         rate="汇率", enabled="是否启用")
+
+
+def _rec(**kw):
+    return {"fields": {FIELDS.supplier: kw.get("name", "甲"),
+                       FIELDS.ship_method: kw.get("m", "FBA"),
+                       FIELDS.band_from: kw.get("lo", 0),
+                       FIELDS.band_to: kw.get("hi", 100),
+                       FIELDS.rate: kw.get("rate", 1.0),
+                       FIELDS.enabled: kw.get("on", "是")}}
+
+
+def test_parse_suppliers_filters():
+    recs = [
+        _rec(name="甲", on="是"),
+        _rec(name="乙", on="否"),          # 未启用
+        _rec(name="", on=True),            # 无名
+        _rec(name="丁", rate=None),        # 无汇率
+        _rec(name="戊", lo=200, hi=100),   # 区间非法
+    ]
+    out = rules.parse_suppliers(recs, FIELDS)
+    assert [s.name for s in out] == ["甲"]
+
+
+def test_parse_suppliers_open_band():
+    """区间只填一端 = 以上/以下,不能整行丢掉。"""
+    out = rules.parse_suppliers([_rec(name="甲", lo=50, hi="")], FIELDS)
+    assert out[0].band_from == 50 and out[0].band_to == float("inf")
+    assert rules.pick_supplier(out, "FBA", 9999).name == "甲"
+
+
+def test_parse_suppliers_checkbox_enabled():
+    """「是否启用」是复选框时值是 bool,不是文本。"""
+    assert rules.parse_suppliers([_rec(on=True)], FIELDS)
+    assert not rules.parse_suppliers([_rec(on=False)], FIELDS)
+
+
+def test_pick_supplier_by_method_and_band():
+    sup = rules.parse_suppliers([
+        _rec(name="甲", m="FBA", lo=0, hi=50, rate=1.10),
+        _rec(name="乙", m="FBM", lo=0, hi=50, rate=1.01),
+        _rec(name="丙", m="FBA", lo=50, hi=100, rate=1.20),
+    ], FIELDS)
+    assert rules.pick_supplier(sup, "fba", 30).name == "甲"      # 大小写无关
+    assert rules.pick_supplier(sup, "FBM", 30).name == "乙"
+    assert rules.pick_supplier(sup, "FBA", 50).name == "甲"      # 闭区间,边界归先命中者
+    assert rules.pick_supplier(sup, "FBA", 80).name == "丙"
+    assert rules.pick_supplier(sup, "FBA", 500) is None
+    assert rules.pick_supplier(sup, "", 30) is None
+
+
+def test_pick_supplier_lowest_rate_wins():
+    """多候选取最低汇率(旧系统语义,逐字保留)。"""
+    sup = rules.parse_suppliers([
+        _rec(name="贵", m="FBA", lo=0, hi=100, rate=1.30),
+        _rec(name="便宜", m="FBA", lo=0, hi=100, rate=1.05),
+    ], FIELDS)
+    assert rules.pick_supplier(sup, "FBA", 30).name == "便宜"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  限价
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_price_cap():
+    assert rules.price_cap(100) == 75.0
+    assert rules.price_cap("39.99") == 29.99
+    assert rules.price_cap(None) is None
+
+
+def test_purchase_cost_formula():
+    """(单价 × 数量 × 汇率 + 运费) × 1.08;运费不乘汇率。"""
+    assert rules.purchase_cost(10, 2, 1.0, 5) == round((10 * 2 * 1.0 + 5) * 1.08, 2)
+    assert rules.purchase_cost(10, 2, 1.0, 0) == 21.6
+    assert rules.purchase_cost(10, 2, 1.0) == 21.6          # 运费缺省按 0
+    assert rules.purchase_cost(None, 2, 1.0) is None
+    assert rules.purchase_cost(10, 2, None) is None
+
+
+def test_price_ok_boundary():
+    assert rules.price_ok(75.0, 75.0) is True               # 相等算通过
+    assert rules.price_ok(75.01, 75.0) is False
+    assert rules.price_ok(None, 75.0) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  决策链
+# ══════════════════════════════════════════════════════════════════════════════
+
+LINE = {"order_line_id": "PO1|SKU1", "sku": "B001", "qty": 1,
+        "product_amount": 100, "postal_code": "10001"}
+
+
+def _snap(**kw):
+    base = {"asin": "B001", "zip": "10001", "amz_price": 50, "shipping": 0,
+            "stock_qty": 10, "ship_method": "FBA", "ship_days": 3,
+            "seller": "Amazon.com", "screenshot_url": None, "outcome": "ok",
+            "scraped_at": "2026-08-09T00:00:00Z"}
+    base.update(kw)
+    return base
+
+
+SUPPLIERS = rules.parse_suppliers([_rec(name="甲", m="FBA", lo=0, hi=1000,
+                                        rate=1.0)], FIELDS)
+
+
+def test_judge_pass():
+    res = rules.judge(LINE, _snap(), SUPPLIERS, set())
+    assert res.status == rules.PASS
+    assert res.detail["price_cap"] == 75.0
+    assert res.detail["cost"] == 54.0        # 50×1×1.0×1.08
+    assert res.detail["supplier"] == "甲"
+
+
+def test_judge_phishing_wins_over_everything():
+    """钓鱼是终局:不看采集、不算限价,连快照都不需要。"""
+    res = rules.judge(LINE, None, SUPPLIERS, {"10001"})
+    assert res.status == rules.REJECT
+    assert rules.PHISHING_MARK in res.note
+    assert res.is_phishing is True
+    assert res.detail["rules"]["phishing"]["hit"] is True
+
+
+def test_judge_no_snapshot_is_manual_not_pass():
+    res = rules.judge(LINE, None, SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "待采集" in res.note
+
+
+def test_judge_bad_outcome_is_manual():
+    res = rules.judge(LINE, _snap(outcome="blocked"), SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "blocked" in res.note
+
+
+def test_judge_missing_fields_is_manual():
+    res = rules.judge(LINE, _snap(ship_days=None), SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "配送时长" in res.note
+
+
+def test_judge_delivery_days_gate():
+    """≥9 天建议拒绝;8 天放行(闸口值改动必须让本用例红)。"""
+    assert rules.judge(LINE, _snap(ship_days=9), SUPPLIERS, set()).status == rules.REJECT
+    assert rules.judge(LINE, _snap(ship_days=8), SUPPLIERS, set()).status == rules.PASS
+
+
+def test_judge_delivery_zero_days_is_not_missing():
+    """0 天是"确实是 0",不能当没采到(null-0 铁律)。"""
+    assert rules.judge(LINE, _snap(ship_days=0), SUPPLIERS, set()).status == rules.PASS
+
+
+def test_judge_no_supplier_is_manual():
+    res = rules.judge(LINE, _snap(ship_method="FBM"), SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "无匹配采购方" in res.note
+
+
+def test_judge_price_cap_reject():
+    # 单价 80 → 成本 86.4 > 限价 75
+    res = rules.judge(LINE, _snap(amz_price=80), SUPPLIERS, set())
+    assert res.status == rules.REJECT
+    assert "限价不通过" in res.note
+    assert res.detail["cost"] == 86.4
+
+
+def test_judge_shipping_counts_into_cost():
+    """运费进成本:含运费后越线即拒绝。"""
+    assert rules.judge(LINE, _snap(amz_price=69), SUPPLIERS, set()).status == rules.PASS
+    res = rules.judge(LINE, _snap(amz_price=69, shipping=5), SUPPLIERS, set())
+    assert res.status == rules.REJECT
+
+
+def test_judge_qty_multiplies_cost():
+    """同一单价,数量翻倍即越线——数量必须进成本(限价不随数量放大)。"""
+    assert rules.judge(LINE, _snap(amz_price=40), SUPPLIERS, set()).status == rules.PASS
+    line = dict(LINE, qty=2)
+    assert rules.judge(line, _snap(amz_price=40), SUPPLIERS, set()).status == rules.REJECT
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  采集接入缝
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_from_snapshot_unpacks_buybox():
+    snap = rules.from_snapshot({
+        "asin": "B001", "price": 12.5, "stock_count": 3, "delivery_days": 4,
+        "buybox": {"fulfillment": "FBA", "seller_name": "Acme",
+                   "shipping_fee": 2.5, "screenshot_url": "http://x/a.jpg"},
+        "scrape_params": {"zip": "10001-2222"}, "outcome": "ok",
+        "scraped_at": "2026-08-09T00:00:00Z"})
+    assert snap["zip"] == "10001"            # 快照侧邮编也走同一标准化
+    assert snap["ship_method"] == "FBA"
+    assert snap["seller"] == "Acme"
+    assert snap["shipping"] == 2.5
+    assert snap["screenshot_url"] == "http://x/a.jpg"
+
+
+def test_from_snapshot_tolerates_missing_buybox():
+    snap = rules.from_snapshot({"asin": "B001", "price": 1, "buybox": None,
+                                "scrape_params": None})
+    assert snap["ship_method"] is None and snap["zip"] == ""
+
+
+def test_from_snapshot_none():
+    assert rules.from_snapshot(None) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  工作流串接(假 PG / 假飞书)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self.description = None
+        self._rows: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=None):
+        self.conn.executed.append((sql, args))
+        for pattern, (cols, rows) in self.conn.responses.items():
+            if pattern in sql:
+                self.description = [(c,) for c in cols]
+                self._rows = rows
+                return
+        self.description = []      # 未登记的查询一律"查不到",与真库空结果同形
+        self._rows = []
+
+    def executemany(self, sql, seq):
+        self.conn.executed.append((sql, list(seq)))
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class FakeConn:
+    def __init__(self, responses):
+        self.responses = responses
+        self.executed = []
+
+    def cursor(self):
+        return FakeCursor(self)
+
+    def commit(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.fixture
+def wired(monkeypatch):
+    """把 order_audit 的外部依赖(飞书四个调用 + PG)全换成假的。"""
+    from workflows import order_audit as wf
+
+    calls = {"updates": None, "uploaded": []}
+
+    monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 10)
+    monkeypatch.setattr(wf.feishu, "sheet_values", lambda s, r: [["60606"]])
+    monkeypatch.setattr(wf.feishu, "list_records",
+                        lambda t: [_rec(name="甲", m="FBA", lo=0, hi=1000, rate=1.0)])
+
+    def fake_update(table, key, desired):
+        calls["updates"] = desired
+        return len(desired), []
+    monkeypatch.setattr(wf.feishu, "update_by_key", fake_update)
+
+    # registry 未登记也能跑:require() 直接返回自身
+    for res in (wf.resources.ZIP_BLACKLIST_SHEET, wf.resources.SUPPLIER_TABLE,
+                wf.resources.ORDER_SALES_AUDIT):
+        monkeypatch.setattr(type(res), "require", lambda self: self, raising=False)
+    return wf, calls
+
+
+PICK_COLS = ["order_line_id", "store", "sku", "qty", "product_amount",
+             "shipping_amount", "postal_code", "sale_status", "audit_status"]
+
+
+def test_run_end_to_end_pass(wired, monkeypatch):
+    wf, calls = wired
+    conn = FakeConn({
+        "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
+
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
+                         "Shipped", None)]),
+        "FROM catalog.latest_snapshot": (
+            ["asin", "price", "stock_count", "delivery_days", "buybox",
+             "scrape_params", "outcome", "scraped_at"],
+            [("B001", 50, 5, 3, {"fulfillment": "FBA", "seller_name": "Acme"},
+              {"zip": "10001"}, "ok", None)]),
+        "audit_status IS NOT NULL": (
+            ["order_line_id", "audit_status", "audit_detail"],
+            [("PO1|SKU1", rules.PASS,
+              {"note": "ok", "amz_price": 50, "supplier": "甲",
+               "price_cap": 75.0})]),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+
+    summary = wf.run({})
+    assert rules.PASS in summary
+    assert "飞书回写 1 行" in summary
+    payload = calls["updates"]["PO1|SKU1"]
+    f = wf.resources.ORDER_SALES_AUDIT.fields
+    assert payload[f.audit_status] == rules.PASS
+    assert payload[f.supplier] == "甲"
+    assert payload[f.price_cap] == 75.0
+    # 「建议采购日期」属人工域,载荷里绝不能出现
+    assert "建议采购日期" not in payload
+
+
+def test_run_skips_phishing_marked_rows(wired, monkeypatch):
+    """已标钓鱼的行任何轮次都不再改写(旧系统不可覆盖语义)。"""
+    wf, calls = wired
+    conn = FakeConn({
+        "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
+
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
+                         "Shipped", f"{rules.REJECT}"),
+                        ("PO2|SKU2", "店A", "B002", 1, 100, 0, "10001",
+                         "Shipped", f"{rules.PHISHING_MARK}邮编:10001")]),
+        "audit_status IS NOT NULL": (["order_line_id", "audit_status",
+                                      "audit_detail"], []),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    summary = wf.run({"recheck": "1"})
+    assert "待审 1 行" in summary          # 钓鱼那行被剔除,只剩一行进判定
+
+
+def test_run_no_snapshot_reports_pending_scrape(wired, monkeypatch):
+    wf, _ = wired
+    conn = FakeConn({
+        "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
+
+            PICK_COLS, [("PO1|SKU1", "店A", "B001", 1, 100, 0, "10001",
+                         "Shipped", None)]),
+        "audit_status IS NOT NULL": (["order_line_id", "audit_status",
+                                      "audit_detail"], []),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    summary = wf.run({})
+    assert "待采集 1 行" in summary
+    assert rules.MANUAL in summary
+
+
+def test_run_requeues_manual_rows(wired, monkeypatch):
+    """「待人工」每轮都要重判——否则采集回来了这行永远不会被再看一眼。"""
+    wf, _ = wired
+    conn = FakeConn({"ORDER BY order_date DESC": (PICK_COLS, [])})
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    wf.run({})
+    pick_sql = next(s for s, _ in conn.executed if "ORDER BY order_date DESC" in s)
+    assert "audit_status IS NULL OR audit_status = %(manual)s" in pick_sql
+    # 终局结论不重判(除非 recheck)
+    wf.run({"recheck": "1"})
+    recheck_sql = [s for s, _ in conn.executed if "ORDER BY order_date DESC" in s][-1]
+    assert "audit_status IS NULL" not in recheck_sql
+
+
+def test_run_config_missing_suppliers_refuses(wired, monkeypatch):
+    """采购方表一行都没启用 → 直接失败,不出结论(不拿旧配置算钱)。"""
+    wf, _ = wired
+    monkeypatch.setattr(wf.feishu, "list_records", lambda t: [])
+    with pytest.raises(RuntimeError, match="采购方"):
+        wf.run({})
+
+
+def test_save_writes_detail_json(wired, monkeypatch):
+    wf, _ = wired
+    conn = FakeConn({})
+    res = rules.judge(LINE, _snap(), SUPPLIERS, set())
+    assert wf._save(conn, [(LINE, res)]) == 1
+    sql, payload = conn.executed[-1]
+    assert "UPDATE orders.order_lines" in sql
+    status, detail_json, key = payload[0]
+    assert status == rules.PASS and key == "PO1|SKU1"
+    assert json.loads(detail_json)["note"] == res.note

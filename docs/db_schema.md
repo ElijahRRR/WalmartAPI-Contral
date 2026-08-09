@@ -245,7 +245,34 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
   同键覆盖——丢历史后"影响范围"无法回答)。`perf_event_spans` 视图给出每条
   违规的存续区间与 still_active(以最新报表是否仍包含该单为准,不自行推算
   官方统计窗口)。
-生成函数唯一出处:`services/order_lines.py`。
+- **审核结论落在 order_lines 自身**(2026-08-09 定稿,不另建表):
+  `audit_status`(✓ 通过 / 建议拒绝 / 待人工)+ `audit_detail` jsonb + `audited_at`。
+  安全前提已核:`order_sync` 的 upsert 只覆盖它自己给出的列,拉单永远冲不掉
+  审核结论;反之 order_audit 的 UPDATE 也只碰这三列。
+  `audit_detail` 结构(order_audit 写,飞书审核列由它投影):
+
+  ```jsonc
+  {
+    "note": "成本 54.0 ≤ 限价 75.0;采购方 甲",   // →「脚本审核」列
+    "asin": "B001", "zip": "10001",              // 判定用的是哪个邮编的快照
+    "amz_price": 50, "stock_qty": 5, "ship_method": "FBA",
+    "ship_days": 3, "seller": "Acme", "screenshot_url": "...",
+    "scraped_at": "...",
+    "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
+    "price_cap": 75.0, "cost": 54.0,
+    "rules": {                                    // 各道审核的过程值,事后可复盘
+      "phishing": {"hit": false},
+      "delivery": {"days": 3, "max": 9},
+      "supplier": {"hit": true, "name": "甲", "rate": 1.0},
+      "price":    {"cap": 75.0, "cost": 54.0}
+    }
+  }
+  ```
+
+  配置(黑名单邮编/采购方表)不入库,每次运行现读飞书;**每行实际套用的
+  采购方与汇率写进 audit_detail**,所以"当时按什么算的"事后仍可追溯。
+
+生成函数唯一出处:`services/order_lines.py`;审核规则唯一出处:`services/order_audit.py`。
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|

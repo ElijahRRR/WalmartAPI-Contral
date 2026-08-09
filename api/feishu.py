@@ -368,6 +368,33 @@ def sync_by_key(table: Bitable, key_field: str, desired: dict[str, dict],
     return len(creates), len(updates), len(deletes)
 
 
+def update_by_key(table: Bitable, key_field: str,
+                  desired: dict[str, dict]) -> tuple[int, list[str]]:
+    """输入:表 + 键字段名 + {键: fields dict} → 输出:(更新行数, 表中不存在的键)。
+
+    **只更新,不新建、不删除**。用于"给别人已建好的行补几列"的场景
+    (order_audit 往销售订单表写审核列):建行是 order_center_push 的职责,
+    这里若也建行会造出只有审核列、没有订单本体的半截行。
+    键不在表里不是错误——调用方通常在下一轮(等对方建完行)自然补上,
+    返回缺键清单供调用方计数与告警。
+
+    与 sync_by_key 一样:只覆盖 fields 里给出的列,人工列绝不会被碰。
+    """
+    existing: dict[str, str] = {}
+    for rec in list_records(table, field_names=[key_field]):
+        k = _plain_text(rec["fields"].get(key_field)).strip()
+        if k and k not in existing:
+            existing[k] = rec["record_id"]
+    updates = [{"record_id": existing[k], "fields": f}
+               for k, f in desired.items() if k in existing]
+    missing = sorted(k for k in desired if k not in existing)
+    if updates:
+        batch_update(table, updates)
+    logger.info("表「%s」定向更新:%d 行%s", table.name, len(updates),
+                f",{len(missing)} 个键不在表中(待建行方补齐)" if missing else "")
+    return len(updates), missing
+
+
 def ensure_keys(table: Bitable, key_field: str, keys: set[str]) -> int:
     """输入:表 + 键字段名 + 应存在的键集合 → 输出:本次补建的行数。
 
@@ -382,6 +409,64 @@ def ensure_keys(table: Bitable, key_field: str, keys: set[str]) -> int:
     logger.info("表「%s」键补齐:新建 %d 行(已有 %d)",
                 table.name, len(missing), len(existing))
     return len(missing)
+
+
+def _call_multipart(path: str, *, data: dict, files: dict, timeout=120) -> dict:
+    """输入:open-apis 路径 + 表单字段 + 文件 → 输出:envelope 的 data(dict)。
+
+    _call 的 multipart 孪生(上传接口不收 JSON):同一套 token 注入、瞬时退避、
+    token 失效换新。files 的值形如 (文件名, bytes, MIME)。
+    """
+    url = f"{resources.feishu_base_url()}{path}"
+    last_err: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = _http().post(
+                url, headers={"Authorization": f"Bearer {_tenant_token()}"},
+                data=data, files=files, timeout=timeout,
+            )
+            env = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            last_err = e
+            logger.warning("飞书上传 %s 网络/解析异常(第 %d/%d 次): %s",
+                           path, attempt + 1, _MAX_ATTEMPTS, e)
+            if attempt < _MAX_ATTEMPTS - 1:
+                time.sleep(_BACKOFF[attempt])
+                continue
+            raise FeishuError(None, f"upload network error: {e}") from e
+        code = env.get("code")
+        if code == 0:
+            return env.get("data") or {}
+        msg = env.get("msg", "")
+        if code in _TOKEN_INVALID_CODES:
+            _tenant_token(force_refresh=True)
+            continue
+        if _is_transient(code, msg) and attempt < _MAX_ATTEMPTS - 1:
+            time.sleep(_BACKOFF[attempt])
+            continue
+        raise FeishuError(code, msg)
+    raise FeishuError(None, f"upload exhausted retries: {last_err}")
+
+
+def upload_media(table: Bitable, file_name: str, content: bytes,
+                 *, mime: str = "image/jpeg") -> str:
+    """输入:目标多维表格 + 文件名 + 字节内容 → 输出:file_token(填附件字段用)。
+
+    附件字段的值形如 [{"file_token": "..."}];file_token 与 app_token 绑定
+    (parent_type=bitable_image),不能跨表复用。上传本身不幂等——同一张图
+    上传两次得两个 token,调用方须自行防重(order_audit 用内容哈希查 ops.dedupe)。
+    """
+    t = table.require()
+    data = _call_multipart(
+        "/open-apis/drive/v1/medias/upload_all",
+        data={"file_name": file_name, "parent_type": "bitable_image",
+              "parent_node": t.app_token, "size": str(len(content))},
+        files={"file": (file_name, content, mime)},
+    )
+    token = data.get("file_token")
+    if not token:
+        raise FeishuError(None, f"上传「{file_name}」未返回 file_token")
+    return token
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -255,3 +255,23 @@ def test_list_new_stock_three_way(monkeypatch):
     assert "库存未知(状态 unknown)" in out
     assert "库存 0 待提交" in out          # B0SLOW:配送超时,上架但清零
     assert "共 3 行将进入" in out
+
+
+def test_partner_id_reads_nested_shape(monkeypatch):
+    """partnerprofile 真实结构是 partner.partnerId(2026-08-09 生产实证);
+    绝不能取成 partnerStoreId——它不是 fulfillmentCenterID。"""
+    from api import settings as settings_api
+
+    real = {"partner": {"partnerId": "10002782678",
+                        "partnerDisplayName": "ZenithNode",
+                        "partnerStoreId": "102763209"},
+            "configurations": [{"configurationName": "ACCOUNT",
+                                "configuration": {"status": "ACTIVE"}}]}
+    monkeypatch.setattr(settings_api._client, "rate_acquire", lambda *a: None)
+    monkeypatch.setattr(settings_api._client, "get_token", lambda *a: "tok")
+    monkeypatch.setattr(settings_api._client, "base_url", lambda: "https://x")
+    monkeypatch.setattr(settings_api._client, "safe_get_ex",
+                        lambda *a, **k: (200, {}, real))
+    settings_api._cached_partner_id.cache_clear()
+    assert settings_api.get_partner_id(
+        {"client_id": "c1", "client_secret": "s", "proxy": None}) == "10002782678"

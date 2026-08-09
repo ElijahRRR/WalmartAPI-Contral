@@ -24,7 +24,13 @@ def _cached_partner_id(client_id: str, client_secret: str, proxy) -> str:
         token, client_id, proxy, max_retries=3)
     if status != 200 or not isinstance(data, dict):
         raise RuntimeError(f"partnerprofile 查询失败 HTTP {status}: {data}")
-    pid = (data.get("partnerId") or data.get("partner_id")
+    # 实证结构(旧 auto_listing/store_info.py + 2026-08-09 生产响应):
+    #   {"partner": {"partnerId": "...", "partnerDisplayName": "...",
+    #                "partnerStoreId": "..."}, "configurations": [...]}
+    # ⚠ 取 partnerId,**不是 partnerStoreId**——无实体仓的卖家用 Virtual Node,
+    # 它等于 Partner ID;取错这个 ID 会让 MP_ITEM 的 fulfillmentCenterID 失效。
+    pid = ((data.get("partner") or {}).get("partnerId")
+           or data.get("partnerId")
            or (data.get("payload") or {}).get("partnerId") or "")
     if not pid:
         raise RuntimeError(f"partnerprofile 响应中无 partnerId: {str(data)[:200]}")

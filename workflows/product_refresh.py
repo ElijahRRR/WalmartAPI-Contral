@@ -13,7 +13,8 @@
 
 口径(所有者定稿 2026-08-09):
   · 每次改价前**全量重推**在线产品(PUBLISHED + 店铺 ACTIVE),不做优先级
-  · 采集器吞吐 2000~3000/分钟(不切邮编、不截图),13 万 ASIN 约 45~65 分钟
+  · 采集器吞吐 2000~3000/分钟(不切邮编、不截图)
+  · **一次性提交一个批次**(上传上限 50MB,几十万 ASIN 也只有几 MB)
   · **必须确认推上去了才开始计时**;超时 1 小时
   · 批次命名:取回按批次比整库查快得多
 
@@ -33,7 +34,12 @@ DANGEROUS = True        # 会给采集器压十几万个任务,默认 dry-run
 
 logger = logging.getLogger("workflows.product_refresh")
 
-BATCH_SIZE = 20000          # 单批 ASIN 数(一次上传的文件大小与可观测性折中)
+# **默认一次性全量提交一个批次**(所有者质疑 2026-08-09,复核后改):
+# 采集侧上传上限 50MB,txt 每个 ASIN 约 11 字节 —— 27722 个才 ~300KB(0.6%),
+# 百万级也只有 ~11MB。分批不省任何资源,反而把"按批次取回"拆成多次聚合、
+# 台账多行、查进度要合并。BATCH_SIZE 因此只是**安全阀**(远超当前规模),
+# 不是常规切分:真到那个量级再考虑分批的可观测性。
+BATCH_SIZE = 200000
 TIMEOUT_HOURS = 1           # 推上去后多久没采完算超时(所有者定稿)
 
 # 在线且店铺 ACTIVE 的 ASIN。同一 ASIN 多店只推一次(采集结果按 ASIN 共享)。
@@ -142,15 +148,18 @@ def run(params: dict) -> str:
                for i in range(0, len(asins), BATCH_SIZE)]
     est_min = len(asins) / 2500        # 所有者口径:2000~3000/分钟
     if not params.get("execute"):
+        split = "一个批次" if len(batches) == 1 else f"{len(batches)} 个批次"
         return (f"🧪 [DRY-RUN] 将全量重推 {len(asins)} 个在线 ASIN"
-                f"(PUBLISHED + 店铺 ACTIVE,跨店去重),分 {len(batches)} 批;"
+                f"(PUBLISHED + 店铺 ACTIVE,跨店去重),{split};"
                 f"按 2500/分钟估算约 {est_min:.0f} 分钟采完\n"
                 + "\n".join(["在途批次:"] + _check_open()))
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
     pushed, lines = 0, []
     for i, chunk in enumerate(batches, 1):
-        name = f"wm-refresh-{stamp}-{i:02d}"
+        # 单批(常态)不带序号:批次名就是取回的抓手,越简单越好
+        name = (f"wm-refresh-{stamp}" if len(batches) == 1
+                else f"wm-refresh-{stamp}-{i:02d}")
         try:
             res = scraper.submit_batch(name, chunk)
             # 200 恒等于新建批次:拿到 batch_id 才算"确认推上去了",此刻起计时
@@ -170,7 +179,7 @@ def run(params: dict) -> str:
             logger.exception("批次 %s 推送失败", name)
 
     head = (f"全量重推:{pushed}/{len(asins)} 个 ASIN 已确认推上"
-            f"(分 {len(batches)} 批),预计约 {est_min:.0f} 分钟采完;"
+            f"({len(batches)} 个批次),预计约 {est_min:.0f} 分钟采完;"
             f"超时阈值 {TIMEOUT_HOURS} 小时")
     tail = ["", "查进度:python cli.py product_refresh -p check=1",
             "采完后拉数据:python cli.py product_ingest"]

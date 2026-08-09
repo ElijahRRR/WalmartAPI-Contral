@@ -28,6 +28,7 @@ logger = logging.getLogger("services.maint_sheet")
 _SYNC_MARK = "sync"     # PUT 同步路径的 F 列伪标记(旧系统 'sync:200' 语义的收敛)
 _PENDING = ("", "处理中")
 _CURSOR = "maint_sheet"
+_APPEND_BLOCK = 500     # 单次写飞书的行数上限(一次裹上千行会被 90202 拒)
 
 
 def _load_cursor(conn) -> dict:
@@ -72,14 +73,31 @@ def append_records(rows: list[tuple]) -> int:
         cur_state = _load_cursor(conn)
     start = _find_next_empty(int(cur_state.get("next_row", 2)))
     feishu.sheet_ensure_rows(sheet, start + len(rows))
-    feishu.sheet_write_ranges(sheet, [
-        (f"A{start}:I{start + len(rows) - 1}",
-         [[str(c) if c is not None else "" for c in r] for r in rows])])
-    cur_state["next_row"] = start + len(rows)
     cur_state.setdefault("unresolved_from", 2)
+
+    # 分块写 + **每块成功就落水位**:中途失败时已写的部分不会被下次
+    # 重复追加(所有者 2026-08-09 实遇:1000+ 行一次写被飞书拒,整轮 failed)
+    written = 0
+    for i in range(0, len(rows), _APPEND_BLOCK):
+        block = rows[i:i + _APPEND_BLOCK]
+        row0 = start + i
+        try:
+            feishu.sheet_write_ranges(sheet, [
+                (f"A{row0}:I{row0 + len(block) - 1}",
+                 [[str(c) if c is not None else "" for c in r] for r in block])])
+        except Exception:
+            if written:
+                cur_state["next_row"] = start + written
+                with db.pg_conn() as conn:
+                    _save_cursor(conn, cur_state)
+            logger.error("维护记录写到第 %d 行时失败,已写 %d 行入账(补写用 "
+                         "maintenance -p resync_sheet=1)", row0, written)
+            raise
+        written += len(block)
+    cur_state["next_row"] = start + written
     with db.pg_conn() as conn:
         _save_cursor(conn, cur_state)
-    return len(rows)
+    return written
 
 
 _LABEL_BY_FEED = {"MP_MAINTENANCE": "标题", "price": "价格",

@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from api import feishu
-from registry.resources import Bitable
+from registry.resources import Bitable, Spreadsheet
 
 TABLE = Bitable(name="测试表", app_token="appX", table_id="tblY",
                 fields=SimpleNamespace(a="字段A"))
@@ -320,3 +320,19 @@ def test_sync_by_key_hash_field_skips_unchanged():
     # 新建与更新的载荷都带指纹列
     assert "指纹" in calls["create"][0]["fields"]
     assert "指纹" in calls["update"][0]["fields"]
+
+def test_sheet_write_ranges_splits_big_range_and_scrubs(monkeypatch):
+    """单个范围裹上千行会被飞书 90202 拒(所有者 2026-08-09 实遇);按行切。"""
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID",
+                        columns=("a", "b"))
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_BLOCK_ROWS", 2)
+    rows = [["v%d" % i, "x\x00y"] for i in range(5)]
+    n = feishu.sheet_write_ranges(sheet, [("A11:B15", rows)])
+    ranges = [vr["range"] for body in sent for vr in body["valueRanges"]]
+    assert ranges == ["SID!A11:B12", "SID!A13:B14", "SID!A15:B15"]
+    assert n == 3
+    # 控制字符会让飞书整批拒收,先剔掉(剔到了记日志,不静默)
+    assert sent[0]["valueRanges"][0]["values"][0][1] == "xy"

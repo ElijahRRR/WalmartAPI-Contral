@@ -7,8 +7,8 @@
   status_changed         published_status 变化(detail 含 old/new/官方原因)
   delete_submitted       提交 DELETE_ITEM(detail 含 feed_id/操作原因);来源
                          product_clear(飞书驱动)、problem_product_cleanup、
-                         variant_offset_cleanup(采集永久偏移,detail.reason
-                         = variant_offset)——按 source 字段区分
+                         maintenance(采集永久偏移,detail.reason=variant_offset
+                         ——维护类不入病历的唯一例外)——按 source 字段区分
   retire_submitted       product_clear 提交 RETIRE_ITEM
   match_submitted        match_listing 提交跟卖 MP_ITEM_MATCH(上架类=生死事件;
                          注意跟卖商品无 amz 侧身份,sku≠asin 是此类行的例外)

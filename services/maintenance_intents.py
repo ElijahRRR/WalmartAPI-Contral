@@ -1,11 +1,13 @@
 """维护意图 provider(maintenance 工作流的可插拔数据源)。
 
 意图 dict 统一形态(管道契约,provider 只管产出):
-  {"store": 店铺名, "sku": SKU, "kind": "title"|"price"|"inventory",
+  {"store": 店铺名, "sku": SKU, "kind": "title"|"price"|"inventory"|"delete",
    "old": 旧值, "new": 新值}
   title 意图额外携带 product_type / product_id(UPC)两键(feed 载荷必需;
   按「三缺一跳过」旧防线过滤后再产出)。
 清零是 inventory 的 new=0 特例,由 zero_intents 产出。
+delete 是唯一的**不可逆**类(variant_offset:采集永久偏移,数据再也拿不到),
+由 variant_offset_intents 产出,old/new = 在线/删除。
 
 **驱动方式的变化(2026-08-09,采集接入后)**:旧系统读飞书「在线产品总表」
 的运营决策列(是否更新价格+新价 / 是否更新库存+新库存 / amz标题+相似度);
@@ -45,6 +47,10 @@ PRICE_MIN_RATIO = 0.01          # 1%
 # 单轮每类意图上限(防某天采集侧大面积变动 → 一次几万条 feed)
 MAX_INTENTS_PER_KIND = 5000
 
+# 删除类(variant_offset)专属:批次数门槛与单店单轮上限
+MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
+DELETE_PER_STORE = 300          # 不可逆动作的单店防呆
+
 _SQL_ZERO = """
 SELECT store, sku, avail_qty FROM catalog.walmart_items
 WHERE store = ANY(%s) AND missing_since IS NULL AND avail_qty > 0
@@ -77,6 +83,43 @@ LEFT JOIN LATERAL (
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
   AND NOT (w.store = ANY(%s))
+"""
+
+
+# 采集永久偏移(variant_offset)的在线行 → 删除意图。
+# · 同样守路由铁律:只删 source_type='amz' 的行(破坏动作绝不碰 match/unknown)
+# · 店铺 ACTIVE 才删(无 KPI 记录 fail-open,与其他闸同口径)
+# · snapshots.outcome 在补列之前的历史行是 NULL,那些都是成功采集,按 ok 处理
+#   ——否则老 SKU 会因为"查不到 ok 快照"被误判该删
+_SQL_VARIANT_OFFSET = """
+WITH vo AS (
+    SELECT asin,
+           count(DISTINCT batch_name) AS batches,
+           min(recorded_at) AS first_seen,
+           max(recorded_at) AS last_seen
+    FROM ops.scrape_failures
+    WHERE error_type = 'variant_offset'
+    GROUP BY asin
+), latest_status AS (
+    SELECT DISTINCT ON (store) store, store_status
+    FROM ops.store_kpi_daily ORDER BY store, data_date DESC
+)
+SELECT w.store, w.sku, vo.batches, vo.first_seen, vo.last_seen
+FROM vo
+JOIN catalog.walmart_items w ON w.sku = vo.asin
+JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+LEFT JOIN latest_status s ON s.store = w.store
+WHERE w.missing_since IS NULL
+  AND w.published_status = 'PUBLISHED'
+  AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
+  AND vo.batches >= %(min_batches)s
+  AND NOT EXISTS (
+        SELECT 1 FROM catalog.snapshots sn
+        WHERE sn.asin = vo.asin
+          AND COALESCE(sn.outcome, 'ok') = 'ok'
+          AND sn.scraped_at > vo.last_seen)
+ORDER BY w.store, w.sku
 """
 
 
@@ -199,6 +242,37 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         logger.info("标题:%d 行缺 productType/UPC 跳过(三缺一防线)",
                     skipped_incomplete)
     return _cap(out, "title")
+
+
+def variant_offset_intents(conn, min_batches: int = MIN_OFFSET_BATCHES
+                           ) -> list[dict]:
+    """输入:连接(+批次数门槛)→ 输出:采集永久偏移的删除意图(kind='delete')。
+
+    `variant_offset` = 亚马逊把 /dp/<ASIN> 返回成兄弟变体页面,parser 比对
+    页面 ASIN 不一致后**拒绝写入**(宁可判失败也不写错数据),采集侧列为
+    **不自动重试**类型 ⇒ 这些 SKU 的价格/库存**永远拿不到新数据**,前三个
+    provider 只会拿着陈旧快照一轮轮跟价跟库存。所有者定稿 2026-08-09:删掉。
+
+    门槛 min_batches 默认 1(所有者:"偏移了就不会恢复",不设观察期)。
+    唯一防呆:最后一次偏移之后若有 outcome=ok 快照则移出名单——真能采就
+    不该删。单店单轮封顶 DELETE_PER_STORE(不可逆动作的防呆)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_VARIANT_OFFSET, {"min_batches": int(min_batches)})
+        rows = cur.fetchall()
+    out, per_store = [], {}
+    for store, sku, batches, first_seen, last_seen in rows:
+        per_store[store] = per_store.get(store, 0) + 1
+        if per_store[store] > DELETE_PER_STORE:
+            continue        # 超单店上限的留到下轮(下面统一告警)
+        out.append({"store": store, "sku": sku, "kind": "delete",
+                    "old": "在线", "new": "删除", "batches": batches,
+                    "first_seen": first_seen, "last_seen": last_seen})
+    over = {s: n - DELETE_PER_STORE for s, n in per_store.items()
+            if n > DELETE_PER_STORE}
+    if over:
+        logger.warning("删除超单店上限 %d,本轮留下:%s", DELETE_PER_STORE, over)
+    return _cap(out, "delete")
 
 
 def build_title_item(sku: str, product_type: str, product_id: str,

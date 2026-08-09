@@ -4,13 +4,20 @@
   python cli.py maintenance                      # dry-run:逐店逐类计数+逐 SKU 样本
   python cli.py maintenance --execute            # 真跑(提交 + 写维护记录表)
   python cli.py maintenance -p store=A085朱丽霖
-  python cli.py maintenance -p only=inventory    # 只跑某一类(title/price/inventory)
+  python cli.py maintenance -p only=inventory    # 只跑某一类(delete/title/price/inventory)
+  python cli.py maintenance -p only=delete       # 只处理采集永久偏移的删除
 
 架构(2026-08-07 所有者定稿,对比旧三段式 sync_lark/submit/poll_yesterday):
   单一 workflow——数据源已在 PG(sync 消失),结果轮询走全局 feed_poll +
   维护记录反哺器(poll_yesterday 消失)。
 
 意图来源(services/maintenance_intents,可插拔 provider;2026-08-09 全部做实):
+  删除   **variant_offset**:采集永久偏移(亚马逊把 /dp/<ASIN> 返回成兄弟
+         变体页面,parser 拒绝写入,采集侧列为不自动重试)⇒ 价格/库存永远
+         拿不到新数据,留着只会被前三个 provider 拿陈旧快照一轮轮跟。
+         所有者定稿 2026-08-09:**删掉,且就放在本工作流里**(一个工作流)。
+         DELETE_ITEM 不可逆:dry-run 单独列名单;单店单轮封顶 300;
+         **删除名单从其余三类里剔除**(将死的行不值得再烧一轮配额)。
   清零   限额表「库存特殊要求」=0 的 stockzero 店整店清零(不依赖采集;
          所有者定稿:不设清零二次确认)
   改价   amz 现价 × 该店区间倍率(与上架同一套 services/pricing 规则)
@@ -35,7 +42,8 @@
 
 维护事件不进 catalog.product_events(所有者定稿 2026-08-07):流水在
 ops.feed_log/feed_items,现状在 catalog.walmart_items,状态后果由
-catalog_sync 观测入账。
+catalog_sync 观测入账。**唯一例外是删除**——生死类事件恒记
+(delete_submitted,source=maintenance,detail.reason=variant_offset)。
 
 ⚠ 切换纪律:上调度前必须停旧 12:00 walmart-maintenance-all-stores(AI 调度
 任务,非 cron);停旧前先收干净旧系统在途 feed(见 legacy_survey 切换清单)。
@@ -47,14 +55,18 @@ from datetime import datetime
 from api import feeds, feishu, inventory as inv_api, prices
 from registry import db, resources
 from services import kpi, maint_sheet, maintenance_intents as mi, \
-    stores as stores_svc
+    product_events, stores as stores_svc
 
 DANGEROUS = True
 
 logger = logging.getLogger("workflows.maintenance")
 
-_KIND_LABEL = {"title": "标题", "price": "价格", "inventory": "库存"}
-_KIND_ORDER = ("title", "price", "inventory")   # 单店内串行顺序(旧系统纪律)
+_KIND_LABEL = {"delete": "删除(variant_offset)", "title": "标题",
+               "price": "价格", "inventory": "库存"}
+# 单店内串行顺序(旧系统纪律);**删除排最前**:同一 SKU 既要删又要改价时,
+# 先删掉就不必再为它烧改价/改库存的 feed 配额(collect_intents 已把删除名单
+# 从其余三类里剔掉,这里的顺序是双保险)
+_KIND_ORDER = ("delete", "title", "price", "inventory")
 
 
 def _load_stockzero() -> list[str]:
@@ -105,12 +117,31 @@ def collect_intents(conn, stockzero: list[str]) -> list[dict]:
     否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
     """
     mults = _load_multipliers()
-    intents = []
-    intents += mi.title_intents(conn, stockzero)
-    intents += mi.price_intents(conn, mults, stockzero)
-    intents += mi.inventory_intents(conn, stockzero)
-    intents += mi.zero_intents(conn, stockzero)
+    deletes = mi.variant_offset_intents(conn)
+    doomed = {(d["store"], d["sku"]) for d in deletes}
+    intents = list(deletes)
+    for it in (mi.title_intents(conn, stockzero)
+               + mi.price_intents(conn, mults, stockzero)
+               + mi.inventory_intents(conn, stockzero)
+               + mi.zero_intents(conn, stockzero)):
+        # 将被删除的行不再改价/改库存/改标题:它们的 amz 数据本来就是陈旧的
+        # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上
+        if (it["store"], it["sku"]) not in doomed:
+            intents.append(it)
     return intents
+
+
+def _record_deletes(store: str, rows: list[dict], feed_id) -> None:
+    """删除提交入病历(catalog.product_events;回执由 feed_track 另记)。"""
+    with db.pg_conn() as conn:
+        product_events.record_many(conn, [
+            {"sku": r["sku"], "store": store, "event": "delete_submitted",
+             "source": "maintenance",
+             "detail": {"feed_id": feed_id, "reason": "variant_offset",
+                        "batches": r.get("batches"),
+                        "first_seen": r.get("first_seen"),
+                        "last_seen": r.get("last_seen")}}
+            for r in rows])
 
 
 def _submit_kind(store: dict, kind: str, items: list[dict],
@@ -132,7 +163,10 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
         lines.append(f"  {name}:{label} 同步 PUT {len(items)},成功 {n_ok}")
         return records
 
-    if kind == "title":
+    if kind == "delete":
+        entries = [it["sku"] for it in items]
+        feed_type = "DELETE_ITEM"
+    elif kind == "title":
         entries = [mi.build_title_item(it["sku"], it["product_type"],
                                        it["product_id"], it["new"])
                    for it in items]
@@ -151,6 +185,11 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
         batch = items[i:i + res["count"]]
         i += res["count"]
         n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
+        # 删除是生死类:提交入病历(维护类不入,见模块 docstring)。
+        # 只记 submitted——dedup 挂的是旧 feed_id 但什么都没提交,记了是幽灵事件
+        if (kind == "delete" and res["outcome"] == "submitted"
+                and res["feed_id"]):
+            _record_deletes(name, batch, res["feed_id"])
         if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
             for it in batch:
                 records.append((name, it["sku"], label, it["old"], it["new"],
@@ -175,7 +214,7 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     only = params.get("only")
     if only and only not in _KIND_ORDER:
-        return f"only 参数只接受 title/price/inventory,收到:{only}"
+        return f"only 参数只接受 delete/title/price/inventory,收到:{only}"
 
     stockzero = _load_stockzero()
     with db.pg_conn() as conn:
@@ -194,11 +233,22 @@ def run(params: dict) -> str:
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
-    lines = [f"{mode}维护意图 {len(intents)} 条:标题 {n_kind['title']},"
-             f"价格 {n_kind['price']},库存 {n_kind['inventory']}"
-             f"(stockzero 店 {len(stockzero)} 家)"]
+    lines = [f"{mode}维护意图 {len(intents)} 条:删除 {n_kind['delete']},"
+             f"标题 {n_kind['title']},价格 {n_kind['price']},"
+             f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
 
     if not execute:
+        # 删除不可逆:名单必须看得见,且要与其余三类分开说(混在一起会误读)
+        dels = [i for i in intents if i["kind"] == "delete"]
+        if dels:
+            by = {}
+            for d in dels:
+                by[d["store"]] = by.get(d["store"], 0) + 1
+            lines.append(
+                f"  ⚠ 永久删除 {len(dels)} 行(采集永久偏移,数据再也拿不到):"
+                + ",".join(f"{s}×{n}" for s, n in sorted(by.items())))
+            lines.append(f"    样本={[d['sku'] for d in dels[:8]]}"
+                         + (" …" if len(dels) > 8 else ""))
         if stockzero:
             # 整店清零的人眼闸门:名单必须可见(不能只给个数)
             lines.append(f"  stockzero 名单:{','.join(sorted(stockzero))}")

@@ -123,6 +123,34 @@ def test_amz_join_honors_routing_and_stockzero():
     assert "zip_verify" in mi._SQL_AMZ_JOIN
 
 
+def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
+    """采集永久偏移 → 删除意图。门槛 1(所有者:偏移了就不会恢复)。"""
+    q = mi._SQL_VARIANT_OFFSET
+    assert "error_type = 'variant_offset'" in q
+    assert "count(DISTINCT batch_name)" in q      # 门槛按批次数,不是失败行数
+    assert "vo.batches >= %(min_batches)s" in q
+    # 后来又采到了就不该删;历史行 outcome 为 NULL 时按 ok(否则老 SKU 被误判)
+    assert "COALESCE(sn.outcome, 'ok') = 'ok'" in q
+    assert "sn.scraped_at > vo.last_seen" in q
+    # 破坏动作守路由铁律:只删 amz 出身的行
+    assert "ls.source_type = 'amz'" in q
+    assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
+    assert mi.MIN_OFFSET_BATCHES == 1
+
+    conn = _Conn(rows=[("T1", "B0A", 1, None, None),
+                       ("T1", "B0B", 2, None, None)])
+    out = mi.variant_offset_intents(conn)
+    assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"])
+            for i in out] == [("T1", "B0A", "delete", "在线", "删除"),
+                              ("T1", "B0B", "delete", "在线", "删除")]
+
+    # 单店单轮上限:不可逆动作的防呆,超出的留到下轮
+    monkeypatch.setattr(mi, "DELETE_PER_STORE", 1)
+    assert len(mi.variant_offset_intents(_Conn(rows=[
+        ("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
+        ("T2", "B0C", 1, None, None)]))) == 2       # 每店各留 1
+
+
 def test_build_title_item_shape():
     item = mi.build_title_item("SKU1", "Furniture", "012345678905", "新标题")
     assert item["Orderable"]["productIdentifiers"]["productIdType"] == "UPC"
@@ -217,6 +245,57 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
     out = mw.run({"execute": True})
     assert "⚠ T1:提交异常已跳过" in out          # 标题 feed 炸了只跳过 T1
     assert calls["put_inv"] == [("T2", "B", 0)]   # T2 照常(1 条走 PUT)
+
+
+def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
+    """删除走 DELETE_ITEM;只有 submitted 落病历(dedup 记了是幽灵事件)。"""
+    intents = [{"store": "T1", "sku": s, "kind": "delete", "old": "在线",
+                "new": "删除", "batches": 1, "first_seen": None,
+                "last_seen": None} for s in ("B0A", "B0B", "B0C")]
+    calls = _wire(monkeypatch, intents)
+    events = []
+    monkeypatch.setattr(mw, "_record_deletes",
+                        lambda store, rows, fid: events.append(
+                            (store, [r["sku"] for r in rows], fid)))
+    monkeypatch.setattr(feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": [
+                            {"feed_id": "F1", "count": 2, "outcome": "submitted"},
+                            {"feed_id": "OLD", "count": 1, "outcome": "dedup"}])
+    out = mw.run({"execute": True})
+    assert events == [("T1", ["B0A", "B0B"], "F1")]
+    assert "删除(variant_offset) feed 提交 2" in out
+    # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
+    assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
+    assert all(r[2] == "删除(variant_offset)" and r[7] == "处理中"
+               for r in calls["sheet"])
+
+
+def test_dry_run_lists_delete_names_separately(monkeypatch):
+    """删除不可逆:名单必须看得见,且与其余三类分开说。"""
+    intents = ([{"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
+                 "new": "删除", "batches": 1}] + _zero(2))
+    _wire(monkeypatch, intents)
+    out = mw.run({"execute": False})
+    assert "删除 1" in out and "永久删除 1 行" in out and "B0A" in out
+
+
+def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
+    """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
+    conn = _Conn()
+    monkeypatch.setattr(mi, "variant_offset_intents", lambda c: [
+        {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
+         "new": "删除", "batches": 1}])
+    monkeypatch.setattr(mi, "title_intents", lambda c, sz: [])
+    monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
+        {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
+        {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
+    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz: [
+        {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 5, "new": 0}])
+    monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
+    monkeypatch.setattr(mw, "_load_multipliers", lambda: {})
+    out = mw.collect_intents(conn, [])
+    assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
+                                                    ("B0B", "price")]
 
 
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────

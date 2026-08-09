@@ -132,8 +132,10 @@ def sync_from_ledger() -> str | None:
     """feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。"""
     try:
         resources.LISTING_SHEET.require()
-    except LookupError:
-        return None
+    except LookupError as e:
+        # 未登记时**说出来**:静默返 None 会让 feed_poll 什么都不打印,
+        # 看起来像"回写过了但飞书没变"(所有者 2026-08-09 实遇)
+        return f"上架表:表未登记,跳过回写({e})"
     rows = read_rows()
     pollable = [r for r in rows if r["feed_id"] and r["list_result"] in PENDING_O]
     if not pollable:

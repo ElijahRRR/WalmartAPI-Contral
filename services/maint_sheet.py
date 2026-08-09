@@ -83,7 +83,10 @@ def append_records(rows: list[tuple]) -> int:
 
 
 def sync_from_ledger() -> str | None:
-    """输入:无 → 输出:回写摘要一行;表未配置或无未落定行返回 None。
+    """输入:无 → 输出:回写摘要一行(无待回填区间才返 None)。
+
+    ⚠ 只有 append_records 写过行、水位推进过,这里才有区间可扫。
+    maintenance 走 PUT 路由的行 F="sync"、H 当场落定,不参与回填。
 
     feed_poll 反哺器:扫 [unresolved_from, next_row) 区间内 F=真 feedid 且
     H 空/处理中的行,按 ops.feed_items 台账落 H(结果)/I(报错);
@@ -91,8 +94,10 @@ def sync_from_ledger() -> str | None:
     """
     try:
         resources.MAINT_SHEET.require()
-    except LookupError:
-        return None
+    except LookupError as e:
+        # 未登记时**说出来**:静默返 None 会让 feed_poll 什么都不打印,
+        # 看起来像"回写过了但飞书没变"(所有者 2026-08-09 实遇)
+        return f"维护记录:表未登记,跳过回写({e})"
     with db.pg_conn() as conn:
         cur_state = _load_cursor(conn)
     lo, hi = int(cur_state.get("unresolved_from", 2)), int(cur_state.get("next_row", 2))

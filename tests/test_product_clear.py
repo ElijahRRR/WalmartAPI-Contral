@@ -151,7 +151,10 @@ def test_sync_from_ledger_skips_when_sheet_unregistered(monkeypatch):
     monkeypatch.setattr(resources, "RETIRE_SHEET",
                         Spreadsheet(name="商品停用删除表", token="", sheet_id="",
                                     columns=resources.RETIRE_SHEET.columns))
-    assert clear_sheet.sync_from_ledger() is None
+    # 未登记不再静默:必须说出来,否则 feed_poll 一行不打印,
+    # 看起来像"回写过了但飞书没变"(所有者 2026-08-09 实遇)
+    out = clear_sheet.sync_from_ledger()
+    assert out and "未登记" in out
 
 
 def test_limits_table_per_store_cap(monkeypatch, caplog):

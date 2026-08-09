@@ -1,6 +1,7 @@
 """maintenance 回归:stockzero 名单/清零意图/路由/dry-run 零提交/维护记录/反哺器。"""
 
 import contextlib
+from datetime import date as _date
 
 from api import feeds, feishu, inventory as inv_api, prices
 from registry import resources
@@ -442,6 +443,59 @@ def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
     assert appended[0][5] == "F2" and appended[0][7] == "失败"
     # 旧值/新值补不回来(PG 只记 SKU 级状态,不存当时的新旧值)
     assert appended[0][3] == "" and appended[0][4] == ""
+
+
+def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
+    """超 3 天未落定判「未查到」并推进水位:一行悬着会让每轮重读整段。"""
+    from registry.resources import Spreadsheet
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 4, "unresolved_from": 2}
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
+        ["T1", "B0OLD", "价格", "", "", "F1", "2026-08-01", "处理中", ""],
+        ["T1", "B0NEW", "价格", "", "", "F2", "2026-08-09", "处理中", ""],
+    ])
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: {"B0NEW": ("submitted", "")})
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+    written = []
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges",
+                        lambda sheet, ups: (written.extend(ups), len(ups))[1])
+    out = maint_sheet.sync_from_ledger()
+    assert "超 3 天判未查到 1 行" in out
+    assert written[0][1][0][0] == "未查到"
+    # 老行放行后水位推进到第 3 行(新行仍未落定,停在它身上)
+    saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
+    assert '"unresolved_from": 3' in saved[1]
+
+
+def test_prune_keeps_recent_days_only(monkeypatch):
+    """飞书只留近 7 天(一天几千行);历史在 PG,不在表里。"""
+    from registry.resources import Spreadsheet
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 5, "unresolved_from": 5}
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
+        ["T1", "B0OLD", "价格", "", "", "F1", "2026-07-01", "成功", ""],
+        ["T1", "B0KEEP", "价格", "", "", "F2", "2026-08-08", "成功", ""],
+        ["T1", "B0NODATE", "价格", "", "", "F3", "", "成功", ""],
+    ])
+    rewritten = []
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_overwrite",
+                        lambda sheet, rows: (rewritten.extend(rows), len(rows))[1])
+    out = maint_sheet.prune(7)
+    assert "删 1 行" in out and "留 2 行" in out
+    assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE"]  # 表头 + 保留
+    # 行号整体上移 → 水位必须重置,否则反哺器扫到错行
+    saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
+    assert '"next_row": 4' in saved[1] and '"unresolved_from": 2' in saved[1]
 
 
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────

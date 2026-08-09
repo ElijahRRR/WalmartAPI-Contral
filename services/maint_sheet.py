@@ -12,16 +12,22 @@
   feed 路径结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 H/I。
 
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":
-最早未落定行}。表会长年累积(多维表格 5 万行上限装不下才用电子表格),
-反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
+最早未落定行}。反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
+
+保留期(所有者定稿 2026-08-09:「一天几千条,要不了多久飞书就很难存了」——
+旧系统靠"一天一个表格"绕开):**飞书只留近 RETAIN_DAYS 天**,每轮维护提交后
+自动 prune();**删的只是展示面板**,全部流水永久在 ops.feed_items/feed_log。
+配套 STALE_DAYS 兜底:超 3 天仍未落定的行判「未查到」并推进水位,免得一行
+悬着把水位钉死、每轮重读整段(裁剪也裁不掉它)。
 """
 
 import json
 import logging
+from datetime import datetime, timedelta
 
 from api import feishu
 from registry import db, resources
-from services import feed_track
+from services import feed_track, kpi
 
 logger = logging.getLogger("services.maint_sheet")
 
@@ -29,6 +35,22 @@ _SYNC_MARK = "sync"     # PUT 同步路径的 F 列伪标记(旧系统 'sync:200
 _PENDING = ("", "处理中")
 _CURSOR = "maint_sheet"
 _APPEND_BLOCK = 500     # 单次写飞书的行数上限(一次裹上千行会被 90202 拒)
+
+# 未落定行的兜底与表格保留期(所有者定稿 2026-08-09)
+STALE_DAYS = 3          # 超过这么多天还没终态 → 判「未查到」并推进水位
+RETAIN_DAYS = 7         # 飞书只留近这么多天(一天几千行,不裁很快装不下)
+
+
+def _row_date(text: str):
+    """输入:G 列日期串 → 输出:date(解析不了返 None,当作"没日期不裁不判")。"""
+    try:
+        return datetime.strptime(str(text).strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _today():
+    return datetime.now(kpi.CN_TZ).date()
 
 
 def _load_cursor(conn) -> dict:
@@ -177,10 +199,23 @@ def sync_from_ledger() -> str | None:
     values = feishu.sheet_values(resources.MAINT_SHEET, f"A{lo}:I{hi - 1}")
     updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
+    stale_cut, n_stale = _today() - timedelta(days=STALE_DAYS), 0
     for i, raw in enumerate(values):
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
         sku, fid, result = cells[1], cells[5], cells[7]
         rownum = lo + i
+        # 超期兜底(所有者定稿 2026-08-09):一行永远悬着会把水位钉死,
+        # 每轮 feed_poll 都要重读整段。超 STALE_DAYS 天判「未查到」放行——
+        # **状态权威在 ops.feed_items,这里只是展示面板不再等它**。
+        row_date = _row_date(cells[6])
+        if (cells[5] and result in _PENDING and row_date
+                and row_date < stale_cut):
+            updates.append((f"H{rownum}:I{rownum}",
+                            [["未查到", f"超 {STALE_DAYS} 天未落定,不再等"]]))
+            n_stale += 1
+            if prefix_done:
+                new_lo = rownum + 1
+            continue
         pending = fid and fid != _SYNC_MARK and result in _PENDING
         if not pending:
             if prefix_done:
@@ -214,6 +249,47 @@ def sync_from_ledger() -> str | None:
         cur_state["unresolved_from"] = new_lo
         with db.pg_conn() as conn:
             _save_cursor(conn, cur_state)
+    tail = f",其中超 {STALE_DAYS} 天判未查到 {n_stale} 行" if n_stale else ""
     if not updates:
         return f"维护记录:未落定 {hi - lo} 行,台账尚无新终态" if hi > lo else None
-    return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1})"
+    return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1}){tail}"
+
+
+_HEADER = ("店铺", "SKU", "动作", "旧值", "新值", "feedid", "日期", "结果", "报错")
+
+
+def prune(days: int = RETAIN_DAYS) -> str:
+    """输入:保留天数 → 输出:裁剪摘要。飞书只留近 N 天,老行整表重写抹掉。
+
+    所有者定稿 2026-08-09:「维护的 feed 一天几千条记录,要不了多久飞书就很
+    难存了……只保存近 7 天」。旧系统是靠"一天一个表格"绕开这个问题的。
+
+    **删的只是展示面板**:全部流水永久在 ops.feed_items / ops.feed_log,
+    要查历史查 PG,不查飞书。裁完水位重置(行号整体上移,老水位失效)。
+    没有日期的行一律保留(宁可留着也不误删)。
+    """
+    resources.MAINT_SHEET.require()
+    with db.pg_conn() as conn:
+        cur_state = _load_cursor(conn)
+    hi = int(cur_state.get("next_row", 2))
+    if hi <= 2:
+        return "维护记录:表内无数据行,无需裁剪"
+    values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:I{hi - 1}")
+    cut = _today() - timedelta(days=days)
+    kept = []
+    for raw in values:
+        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
+        if not any(cells[:9]):
+            continue                    # 空行不留
+        d = _row_date(cells[6])
+        if d is None or d >= cut:       # 没日期的保留(宁可留着也不误删)
+            kept.append(cells[:9])
+    dropped = (hi - 2) - len(kept)
+    if dropped <= 0:
+        return f"维护记录:{len(kept)} 行都在近 {days} 天内,无需裁剪"
+    feishu.sheet_overwrite(resources.MAINT_SHEET, [list(_HEADER)] + kept)
+    # 行号整体上移:水位必须重置,否则反哺器会扫到错行
+    with db.pg_conn() as conn:
+        _save_cursor(conn, {"next_row": len(kept) + 2, "unresolved_from": 2})
+    return (f"维护记录裁剪:删 {dropped} 行(早于 {cut}),留 {len(kept)} 行;"
+            f"历史流水在 ops.feed_items 未动")

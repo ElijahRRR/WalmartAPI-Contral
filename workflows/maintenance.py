@@ -8,6 +8,7 @@
   python cli.py maintenance -p only=delete       # 只处理删除类
   python cli.py maintenance -p oos_days=30       # 连续无货多少天算该删(默认 15)
   python cli.py maintenance -p resync_sheet=1    # 只补维护记录表(写表炸过之后)
+  python cli.py maintenance -p prune_sheet=1     # 只裁维护记录表(默认留 7 天)
 
 架构(2026-08-07 所有者定稿,对比旧三段式 sync_lark/submit/poll_yesterday):
   单一 workflow——数据源已在 PG(sync 消失),结果轮询走全局 feed_poll +
@@ -274,6 +275,9 @@ def run(params: dict) -> str:
     if params.get("resync_sheet"):
         # 只补表,不算维护动作:提交成功但写表炸了之后的恢复路径
         return maint_sheet.resync_from_ledger()
+    if params.get("prune_sheet"):
+        return maint_sheet.prune(int(params.get("days", 0))
+                                 or maint_sheet.RETAIN_DAYS)
     execute = bool(params.get("execute"))
     only = params.get("only")
     if only and only not in _KIND_ORDER:
@@ -372,6 +376,12 @@ def run(params: dict) -> str:
     try:
         written = maint_sheet.append_records(all_records)
         lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
+        # 一天几千行,不裁飞书很快装不下(所有者定稿 2026-08-09:只留 7 天)。
+        # 裁的只是展示面板,流水永久在 ops.feed_items
+        try:
+            lines.append(maint_sheet.prune())
+        except Exception as e:            # 裁剪失败不影响本轮维护结果
+            logger.warning("维护记录裁剪失败(不影响提交): %s", e)
     except LookupError as e:
         lines.append(f"⚠ 维护记录表未登记,流水未写表(台账已在 PG):{e}")
     except Exception as e:

@@ -131,6 +131,45 @@ def _map_visible(conn, pt: str, spec, product: dict) -> dict:
                                       product=product)
 
 
+MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
+
+_SQL_ATTEMPTS = """
+SELECT store, sku, count(*) FROM ops.feed_items
+WHERE feed_type = 'MP_ITEM' AND (store, sku) IN %s
+GROUP BY store, sku
+"""
+
+
+def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+    """输入:上架表全部行 → 输出:(可重试行, 已达上限行)。
+
+    O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
+    字段问题改完 mapper 即可),旧系统靠 main 看 N=DATA_ERROR 接回重试。
+    但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
+    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
+
+    ⚠ SKU_LOCKED 永不重试(SKU 已被旧 UPC 绑死);ASYNC_PENDING 不是失败。
+    """
+    cand = [r for r in rows
+            if r["audit_result"].lower() == "pass"
+            and r["list_result"] == "FAILED"
+            and r["list_result"] != "SKU_LOCKED"]
+    if not cand:
+        return [], []
+    keys = tuple((r["store"], r["asin"]) for r in cand)
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_ATTEMPTS, (keys,))
+        tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
+    retry, exhausted = [], []
+    for r in cand:
+        if tried.get((r["store"], r["asin"]), 0) >= MAX_LIST_ATTEMPTS:
+            exhausted.append((r["store"], r["asin"]))
+            continue
+        # 重新排队:清掉上一轮的 feedid/结果,让主链当新行处理
+        retry.append({**r, "feed_id": "", "listed": "", "list_result": ""})
+    return retry, exhausted
+
+
 def _spec_precheck(ready: list[dict]) -> str:
     """输入:待提交行 → 输出:spec 一致化预检报告(不领 UPC、不提交)。
 
@@ -168,13 +207,19 @@ def run(params: dict) -> str:
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    pending = [r for r in rows
-               if r["audit_result"].lower() == "pass"
-               and r["listed"].lower() in ("", "no")
-               and not r["feed_id"]
-               and r["list_result"] != "SKU_LOCKED"]
+    fresh = [r for r in rows
+             if r["audit_result"].lower() == "pass"
+             and r["listed"].lower() in ("", "no")
+             and not r["feed_id"]
+             and r["list_result"] != "SKU_LOCKED"]
+    retry, exhausted = _retry_rows(rows)
+    pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
-    lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"]
+    lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
+             + (f"(其中重试 {len(retry)})" if retry else "")]
+    if exhausted:
+        lines.append(f"  ⚠ 重试已达上限({MAX_LIST_ATTEMPTS} 次)不再自动重试:"
+                     + ",".join(a for _, a in exhausted[:10]))
     if not pending:
         return "\n".join(lines)
 

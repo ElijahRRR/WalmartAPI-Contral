@@ -103,8 +103,12 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
 def _mark_upc_conflicts(asins: list[str]) -> int:
     """输入:撞库的 ASIN 列表 → 输出:标记数。
 
-    ERR_EXT_DATA_0101119:该 UPC 在沃尔玛全站已被他人占用且详情对不上——
-    **UPC 永久弃用**(旧 upc_pool 实证),重上时领新号。按 sku 反查池中的 UPC。
+    ERR_EXT_DATA_0101119:该 UPC 号在沃尔玛目录里已被占用——**UPC 永久弃用**
+    (旧 upc_pool 实证),重上时领新号。按 sku 反查池中的 UPC。
+
+    ⚠ 所有者澄清 2026-08-09:撞库**只说明这个 UPC 号被占了**,与"我们的产品
+    是否已在沃尔玛上架"无关(UPC 被他人用掉是常态)。连撞多次只是运气差,
+    照常领新号重试,不得据此推断该走跟卖。
     """
     if not asins:
         return 0

@@ -138,3 +138,37 @@ def test_upc_conflict_marked_orthogonally(monkeypatch):
     out = listing_sheet.sync_from_ledger()
     assert marked == [asin]
     assert "UPC 撞库 1 个已标冲突" in out
+
+
+def test_failed_rows_requeue_until_cap(monkeypatch):
+    """FAILED 行要重新排队(UPC 撞库领新号即可修);超上限则停手。"""
+    rows = [
+        _sheet_row(2, asin="B0RETRY01", list_result="FAILED",
+                   feed_id="F1", listed="Yes"),          # 试过 1 次 → 重试
+        _sheet_row(3, asin="B0CAPPED01", list_result="FAILED",
+                   feed_id="F2", listed="Yes"),          # 试过 3 次 → 停手
+        _sheet_row(4, asin="B0LOCKED01", list_result="SKU_LOCKED",
+                   feed_id="F3", listed="Yes"),          # 永不重试
+        _sheet_row(5, asin="B0ASYNC001", list_result="ASYNC_PENDING",
+                   feed_id="F4", listed="Yes"),          # 不是失败
+    ]
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args): self.args = args
+        def fetchall(self):
+            return [("T1", "B0RETRY01", 1), ("T1", "B0CAPPED01", 3)]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+
+    monkeypatch.setattr(ln.db, "pg_conn", lambda: _Conn())
+    retry, exhausted = ln._retry_rows(rows)
+    assert [r["asin"] for r in retry] == ["B0RETRY01"]
+    assert exhausted == [("T1", "B0CAPPED01")]
+    # 重新排队的行要看起来像新行(主链才会走领 UPC → 提交)
+    assert retry[0]["feed_id"] == "" and retry[0]["list_result"] == ""
+    assert ln._retry_rows([_sheet_row(2)]) == ([], [])

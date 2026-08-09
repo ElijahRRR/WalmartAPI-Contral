@@ -101,8 +101,11 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
             "lead_days": None, "channel": None,
             "images": images, "attrs": _attrs(raw),
         }
-    missing = len(asins) - len(out)
-    if missing:
-        logger.info("产品中心缺 %d/%d 个 ASIN 的可用数据(本轮跳过,"
-                    "product_ingest 摄取后自动续上)", missing, len(asins))
+    absent = [a for a in asins if a not in out]
+    if absent:
+        # 列出具体 ASIN:这批就是要推给采集服务补采的清单(接线期人工推,
+        # 将来由选品/审核链保证"进上架表前必已采集")
+        shown = ",".join(absent[:20]) + ("…" if len(absent) > 20 else "")
+        logger.info("产品中心缺 %d/%d 个 ASIN 的可用数据(本轮跳过,采集后自动"
+                    "续上):%s", len(absent), len(asins), shown)
     return out

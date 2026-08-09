@@ -427,3 +427,87 @@ def test_refresh_targets_sql_gates():
     assert "s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE'" in pr._SQL_TARGETS
     assert "SELECT DISTINCT w.sku" in pr._SQL_TARGETS
     assert pr.TIMEOUT_HOURS == 1 and pr.DANGEROUS is True
+
+
+def test_refresh_filters_non_asin_skus(monkeypatch):
+    """历史遗留的非 ASIN 形态 SKU 推了也建不成任务(所有者定稿:直接过滤)。"""
+    from workflows import product_refresh as pr
+
+    skus = ["B0ABCDEFGH", "B0123456789", "WM-CUSTOM-01", "b0abcdefgh", "",
+            "B0Z9Y8X7W6"]
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self): return [(s,) for s in skus]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    ok, dropped = pr._targets()
+    # 11 位、小写、自定义编码、空串全过滤掉
+    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4
+
+
+# ── variant_offset 删除 ─────────────────────────────────────────────────
+
+def test_variant_offset_candidates_sql_gates():
+    from workflows import variant_offset_cleanup as vo
+    q = vo._SQL_CANDIDATES
+    assert "error_type = 'variant_offset'" in q
+    assert "count(DISTINCT batch_name)" in q          # 门槛按批次数,不是行数
+    assert "vo.batches >= %(min_batches)s" in q
+    # 后来又采到了就不该删;历史行 outcome 为 NULL 时按 ok(否则老 SKU 被误判)
+    assert "COALESCE(sn.outcome, 'ok') = 'ok'" in q
+    assert "sn.scraped_at > vo.last_seen" in q
+    assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
+    assert vo.DANGEROUS is True and vo.MIN_BATCHES == 2
+
+
+def test_variant_offset_dry_run_shows_names_and_threshold(monkeypatch):
+    from workflows import variant_offset_cleanup as vo
+
+    rows = {
+        2: [{"store": "A085", "sku": "B0A", "batches": 2,
+             "first_seen": None, "last_seen": None},
+            {"store": "A085", "sku": "B0B", "batches": 3,
+             "first_seen": None, "last_seen": None},
+            {"store": "A090", "sku": "B0A", "batches": 2,
+             "first_seen": None, "last_seen": None}],
+        1: [1] * 9,        # 只用长度
+    }
+    monkeypatch.setattr(vo, "_candidates", lambda mb: rows[mb])
+    out = vo.run({"execute": False})
+    assert "3 行(2 个 ASIN × 2 店" in out
+    assert "≥1 个批次 9 行" in out          # 门槛对比必须给出,便于所有者选
+    assert "B0A" in out and "不可逆" in out
+
+
+def test_variant_offset_nothing_to_delete_hints_looser_threshold(monkeypatch):
+    from workflows import variant_offset_cleanup as vo
+    monkeypatch.setattr(vo, "_candidates", lambda mb: [] if mb > 1 else [1] * 7)
+    out = vo.run({"execute": False})
+    assert "无 variant_offset 待删行" in out and "7 行" in out
+
+
+def test_variant_offset_only_submitted_lands_events(monkeypatch):
+    """dedup 带着旧 feed_id 但什么都没提交:记了就是幽灵事件。"""
+    from workflows import variant_offset_cleanup as vo
+
+    recorded = []
+    monkeypatch.setattr(vo, "_record",
+                        lambda store, rows, fid: recorded.append((store, [r["sku"] for r in rows], fid)))
+    monkeypatch.setattr(vo.feeds, "submit_feed", lambda store, ft, entries, workflow="": [
+        {"feed_id": "F1", "count": 2, "outcome": "submitted"},
+        {"feed_id": "OLD", "count": 1, "outcome": "dedup"},
+    ])
+    lines = []
+    items = [{"store": "A085", "sku": s, "batches": 2, "first_seen": None,
+              "last_seen": None} for s in ("B0A", "B0B", "B0C")]
+    vo._submit_store({"name": "A085"}, items, lines)
+    assert recorded == [("A085", ["B0A", "B0B"], "F1")]
+    assert "删除提交 2" in lines[0] and "在途防重跳过 1" in lines[0]

@@ -29,6 +29,7 @@ inserted 无歧义。所以不需要 v3 那套毫秒精度躲合并的把戏。
 """
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from api import scraper
@@ -46,6 +47,9 @@ logger = logging.getLogger("workflows.product_refresh")
 # 不是常规切分:真到那个量级再考虑分批的可观测性。
 BATCH_SIZE = 200000
 TIMEOUT_HOURS = 1           # 推上去后多久没采完算超时(所有者定稿)
+
+# 合法 ASIN 形态(与采集侧 common/core/idents.ASIN_RE 同口径):B + 9 位大写字母数字
+_ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
 # 在线且店铺 ACTIVE 的 ASIN。同一 ASIN 多店只推一次(采集结果按 ASIN 共享)。
 # 店铺状态取 ops.store_kpi_daily 每店最新一行;无 KPI 记录的店视为 ACTIVE
@@ -72,10 +76,19 @@ ORDER BY submitted_at
 """
 
 
-def _targets() -> list[str]:
+def _targets() -> tuple[list[str], int]:
+    """输入:无 → 输出:(合法 ASIN 形态的在线 SKU, 被过滤掉的行数)。
+
+    历史遗留:一部分在线 SKU 根本不是 ASIN 形态(旧系统留下的自定义编码)。
+    采集侧建任务时就把它们丢掉(2026-08-09 实证:推 27722,采集侧只建了
+    27170 个任务),所以推了也是白推。所有者定稿:**不在维护范围内,直接
+    过滤**——它们也永远不会有 amz 数据,维护链本来就碰不到。
+    """
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_TARGETS)
-        return [r[0] for r in cur.fetchall()]
+        skus = [r[0] for r in cur.fetchall()]
+    ok = [s for s in skus if _ASIN_RE.fullmatch(s or "")]
+    return ok, len(skus) - len(ok)
 
 
 def _record(batch_name: str, batch_id, n: int, status: str,
@@ -218,17 +231,18 @@ def run(params: dict) -> str:
         return "\n".join(["在途采集批次(check:只读采集侧,结果同步进台账):"]
                          + _check_open())
 
-    asins = _targets()
+    asins, dropped = _targets()
     if not asins:
         return "无在线产品可推(catalog_sync 是否跑过?)"
 
     batches = [asins[i:i + BATCH_SIZE]
                for i in range(0, len(asins), BATCH_SIZE)]
     est_min = len(asins) / 2500        # 所有者口径:2000~3000/分钟
+    skip = f",非 ASIN 形态 SKU 已过滤 {dropped} 个" if dropped else ""
     if not params.get("execute"):
         split = "一个批次" if len(batches) == 1 else f"{len(batches)} 个批次"
         return (f"🧪 [DRY-RUN] 将全量重推 {len(asins)} 个在线 ASIN"
-                f"(PUBLISHED + 店铺 ACTIVE,跨店去重),{split};"
+                f"(PUBLISHED + 店铺 ACTIVE,跨店去重){skip},{split};"
                 f"按 2500/分钟估算约 {est_min:.0f} 分钟采完\n"
                 + "\n".join(["在途批次:"] + _check_open()))
 
@@ -257,7 +271,7 @@ def run(params: dict) -> str:
             logger.exception("批次 %s 推送失败", name)
 
     head = (f"全量重推:{pushed}/{len(asins)} 个 ASIN 已确认推上"
-            f"({len(batches)} 个批次),预计约 {est_min:.0f} 分钟采完;"
+            f"({len(batches)} 个批次){skip},预计约 {est_min:.0f} 分钟采完;"
             f"超时阈值 {TIMEOUT_HOURS} 小时")
     tail = ["", "查进度:python cli.py product_refresh -p check=1",
             "采完后拉数据:python cli.py product_ingest"]

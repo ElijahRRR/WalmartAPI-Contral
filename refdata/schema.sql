@@ -51,6 +51,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS snapshots_source_id_uidx ON catalog.snapshots 
 -- ⚠ 必须先于下面依赖 marketplace 列的索引执行:旧库表已存在(CREATE IF NOT EXISTS 跳过),
 --   列要靠这里补;先建索引会 UndefinedColumn(2026-08-06 生产实证)
 ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
+-- 采集 slow 段全量留存(2026-08-09):bullet_points/description/weight/
+-- dimensions/variant 都在这里。契约的 raw 是**裁剪过的**(去掉已在 slow 给过的
+-- 大文本),只存 raw 会丢卖点与重量 —— 上架文案(keyFeatures minItems)与
+-- ShippingWeight 都指着它。
+ALTER TABLE catalog.products  ADD COLUMN IF NOT EXISTS slow jsonb;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS marketplace text NOT NULL DEFAULT 'US';
 DO $$
 BEGIN

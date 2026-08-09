@@ -32,7 +32,7 @@ MARKETPLACE = "US"          # 上架目的地(契约:与 (marketplace,asin) 主�
 # 同 ASIN 多邮编组取"最近一次采集"那组:价格/库存以最新观测为准。
 # zip_verify == 'mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)。
 _SQL = """
-SELECT p.asin, p.title, p.brand, p.amazon_category, p.image_url,
+SELECT p.asin, p.title, p.brand, p.amazon_category, p.image_url, p.slow,
        s.price, s.stock_state, s.stock_count, s.delivery_days, s.raw
 FROM catalog.products p
 LEFT JOIN LATERAL (
@@ -86,11 +86,15 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         rows = cur.fetchall()
 
     out: dict[str, dict] = {}
-    for (asin, title, brand, category, image_url, price, stock_state,
+    for (asin, title, brand, category, image_url, slow, price, stock_state,
          stock_count, delivery_days, raw) in rows:
         if not title:           # 身份层还没拿到标题 = 这条不够格喂上架链
             continue
-        images = _images(raw) or ([image_url] if image_url else [])
+        # attrs 首选身份层的 slow 全量段(卖点/描述/重量/尺寸/变体都在这里);
+        # raw 是契约裁剪过的载荷,只是老行的兜底
+        attrs = dict(slow) if isinstance(slow, dict) else _attrs(raw)
+        images = (sorted(str(u) for u in (attrs.get("images") or []) if u)
+                  or _images(raw) or ([image_url] if image_url else []))
         out[asin] = {
             "asin": asin, "title": title, "brand": brand, "category": category,
             "price": float(price) if price is not None else None,
@@ -98,7 +102,7 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
             "stock_state": str(stock_state) if stock_state else None,
             "lead_days": delivery_days,         # int | None(None ≠ 0)
             "channel": None,
-            "images": images, "attrs": _attrs(raw),
+            "images": images, "attrs": attrs,
         }
     absent = [a for a in asins if a not in out]
     if absent:

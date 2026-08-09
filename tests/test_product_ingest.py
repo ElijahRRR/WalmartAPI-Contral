@@ -181,14 +181,16 @@ def test_stock_count_null_and_zero_are_different():
 def test_fetch_products_carries_true_values(monkeypatch):
     """provider 只搬运真值:stock/lead_days 的 None 原样透出,不 or 0。"""
     rows = [
-        # asin, title, brand, category, image, price, state, count, days, raw
-        ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg", 19.99,
-         "in_stock", 37, 8,
-         {"slow": {"images": ["https://x/2.jpg", "https://x/1.jpg"],
-                   "bullet_points": ["a"]}}),
-        ("B0B", "标题B", None, None, None, 8.0, "out_of_stock", 0, None, None),
-        ("B0C", "标题C", None, None, None, 8.0, "in_stock", None, None, None),
-        ("B0D", None, None, None, None, 8.0, "in_stock", 5, 3, None),  # 无标题不够格
+        # asin, title, brand, category, image, slow, price, state, count, days, raw
+        ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg",
+         {"images": ["https://x/2.jpg", "https://x/1.jpg"],
+          "bullet_points": ["a"]},                      # 身份层 slow 全量段
+         19.99, "in_stock", 37, 8, None),
+        ("B0B", "标题B", None, None, None, None, 8.0, "out_of_stock", 0,
+         None, None),
+        ("B0C", "标题C", None, None, None, None, 8.0, "in_stock", None,
+         None, None),
+        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None),
     ]
 
     class _C:
@@ -207,7 +209,7 @@ def test_fetch_products_carries_true_values(monkeypatch):
     assert set(out) == {"B0A", "B0B", "B0C"}          # 无标题的被剔除
     assert out["B0A"]["stock"] == 37 and out["B0A"]["lead_days"] == 8
     assert out["B0A"]["images"] == ["https://x/1.jpg", "https://x/2.jpg"]  # 字典序
-    assert out["B0A"]["attrs"]["bullet_points"] == ["a"]
+    assert out["B0A"]["attrs"]["bullet_points"] == ["a"]   # 来自 products.slow
     assert out["B0B"]["stock"] == 0                   # 确实缺货,不是 None
     assert out["B0C"]["stock"] is None                # 没采到,不是 0
     assert out["B0C"]["stock_state"] == "in_stock"    # 状态给调用方兜底判断
@@ -275,3 +277,17 @@ def test_partner_id_reads_nested_shape(monkeypatch):
     settings_api._cached_partner_id.cache_clear()
     assert settings_api.get_partner_id(
         {"client_id": "c1", "client_secret": "s", "proxy": None}) == "10002782678"
+
+
+def test_slow_segment_stored_whole():
+    """slow 段全量留存:契约的 raw 是裁剪过的,卖点/重量只在 slow 里。"""
+    p = ingest.product_params(_rec(slow={
+        "title": "T", "brand": "B", "images": ["u1"],
+        "bullet_points": ["卖点一", "卖点二"],
+        "weight": {"package": 3.5, "item": 3.0},
+        "variant": {"parent_asin": "B0PARENT"}}))
+    stored = json.loads(p["slow"])
+    assert stored["bullet_points"] == ["卖点一", "卖点二"]
+    assert stored["weight"]["package"] == 3.5
+    assert stored["variant"]["parent_asin"] == "B0PARENT"
+    assert ingest.product_params(_rec(slow={}))["slow"] is None

@@ -1,4 +1,5 @@
-"""维护记录工作表(registry.MAINT_SHEET)读写积木(maintenance 与 feed_poll 共用)。
+"""维护记录工作表(registry.MAINT_SHEET)读写积木(maintenance / variant_offset_cleanup
+与 feed_poll 共用)。
 
 列契约(A~I,列序即契约,所有者建表 2026-08-07):
   A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
@@ -6,6 +7,8 @@
 流水账语义(区别于 clear_sheet 的运营驱动表):只追加不改行,程序是唯一写入方。
   提交时 append:feed 路径 F=真 feedid、H=处理中;PUT 同步路径 F="sync"、
   H=成功/失败 当场落定。
+  C 列取值:标题/价格/库存(maintenance)、删除(variant_offset)
+  ——删除类走同一张表同一个反哺器,不另建表(所有者问 2026-08-09)。
   feed 路径结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 H/I。
 
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":

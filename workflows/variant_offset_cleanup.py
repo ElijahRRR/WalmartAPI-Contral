@@ -21,13 +21,18 @@ parser 比对页面 ASIN 与任务 ASIN 不一致 → 拒绝写入(宁可判失�
 
 只作用于在线(PUBLISHED + 未缺席)且店铺 ACTIVE 的行;一个 ASIN 在多店在线
 就每店各删一次(占用是店铺维度的)。
+
+飞书投影:提交时往「维护记录」追加行(C=删除(variant_offset),F=真 feedid,
+H=处理中),结果由 feed_poll 的 maint_sheet 反哺器按 ops.feed_items 回填
+H/I——删除不需要自己的反哺器。状态权威始终在 PG,飞书只是展示面板。
 """
 
 import logging
+from datetime import datetime
 
 from api import feeds
 from registry import db
-from services import product_events, stores as stores_svc
+from services import kpi, maint_sheet, product_events, stores as stores_svc
 
 DANGEROUS = True
 
@@ -35,6 +40,8 @@ logger = logging.getLogger("workflows.variant_offset_cleanup")
 
 MIN_BATCHES = 1         # 出现一次即删(所有者定稿:偏移了就不会恢复)
 STORE_LIMIT = 300       # 单店单轮上限(与 product_clear 同款防呆)
+# 维护记录 C 列:动作里带上原因,一眼能和改价/改库存/改标题区分开
+MAINT_ACTION = "删除(variant_offset)"
 
 # 候选:偏移过的 ASIN × 在线行。
 # snapshots.outcome 在补列之前的历史行是 NULL,那些行都是成功采集,
@@ -90,11 +97,17 @@ def _record(store: str, rows: list[dict], feed_id) -> None:
             for r in rows])
 
 
-def _submit_store(store: dict, rows: list[dict], lines: list[str]) -> None:
-    """单店提交 DELETE_ITEM;多切片滑窗对位记账(与 cleanup 同款)。"""
+def _submit_store(store: dict, rows: list[dict], today: str,
+                  lines: list[str]) -> list[tuple]:
+    """单店提交 DELETE_ITEM;多切片滑窗对位记账(与 cleanup 同款)。
+
+    返回维护记录表行:F=真 feedid + H=处理中,交给 feed_poll 的 maint_sheet
+    反哺器按台账回填 H/I——不需要为删除单独写反哺器。
+    """
     name = store["name"]
     i = 0
     n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+    records: list[tuple] = []
     for res in feeds.submit_feed(store, "DELETE_ITEM",
                                  [r["sku"] for r in rows],
                                  workflow="variant_offset_cleanup"):
@@ -102,9 +115,17 @@ def _submit_store(store: dict, rows: list[dict], lines: list[str]) -> None:
         i += res["count"]
         n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
         # 只有 submitted 才落事件:dedup 带着旧 feed_id 但什么都没提交,
-        # 记了就是幽灵事件
+        # 记了就是幽灵事件(病历不灌水)
         if res["outcome"] == "submitted" and res["feed_id"]:
             _record(name, batch, res["feed_id"])
+        # 表格是展示面板,口径与 maintenance 一致:submitted/dedup 都出行
+        # (dedup 挂的是旧 feedid,反哺器照样能把它落定)
+        if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
+            records += [(name, r["sku"], MAINT_ACTION, "在线", "删除",
+                         res["feed_id"], today, "处理中", "") for r in batch]
+        elif res["outcome"] == "failed":
+            records += [(name, r["sku"], MAINT_ACTION, "在线", "删除",
+                         "", today, "提交被拒", "") for r in batch]
     line = f"  {name}:删除提交 {n['submitted']}"
     if n["dedup"]:
         line += f",在途防重跳过 {n['dedup']}"
@@ -113,6 +134,7 @@ def _submit_store(store: dict, rows: list[dict], lines: list[str]) -> None:
     if n["unknown"]:
         line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
     lines.append(line)
+    return records
 
 
 def run(params: dict) -> str:
@@ -158,17 +180,24 @@ def run(params: dict) -> str:
         return "\n".join(lines)
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    all_records: list[tuple] = []
     for store_name, items in sorted(capped.items()):
         store = stores_by_name.get(store_name)
         if store is None:
             lines.append(f"  {store_name}:凭证缺失,跳过")
             continue
         try:    # 单店隔离:单店代理/网络异常不炸整轮
-            _submit_store(store, items, lines)
+            all_records += _submit_store(store, items, today, lines)
         except Exception as e:
             logger.exception("店铺 %s 删除提交异常,跳过继续其它店: %s",
                              store_name, e)
             lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
 
+    try:
+        written = maint_sheet.append_records(all_records)
+        lines.append(f"维护记录追加 {written} 行(H/I 由 feed_poll 反哺器回填)")
+    except LookupError as e:
+        lines.append(f"⚠ 维护记录表未登记,流水未写表(台账已在 PG):{e}")
     lines.append("结果轮询走 feed_poll;删除是否真生效以 catalog_sync 观测为准")
     return "\n".join(lines)

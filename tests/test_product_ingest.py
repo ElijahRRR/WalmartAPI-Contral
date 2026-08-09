@@ -512,6 +512,11 @@ def test_variant_offset_only_submitted_lands_events(monkeypatch):
     lines = []
     items = [{"store": "A085", "sku": s, "batches": 2, "first_seen": None,
               "last_seen": None} for s in ("B0A", "B0B", "B0C")]
-    vo._submit_store({"name": "A085"}, items, lines)
+    recs = vo._submit_store({"name": "A085"}, items, "2026-08-09", lines)
     assert recorded == [("A085", ["B0A", "B0B"], "F1")]
     assert "删除提交 2" in lines[0] and "在途防重跳过 1" in lines[0]
+    # 维护记录:三行都出(dedup 挂旧 feedid 照样能被反哺器落定),H=处理中
+    assert [r[1] for r in recs] == ["B0A", "B0B", "B0C"]
+    assert [r[5] for r in recs] == ["F1", "F1", "OLD"]
+    assert all(r[2] == vo.MAINT_ACTION and r[7] == "处理中" for r in recs)
+    assert all(len(r) == 9 for r in recs)          # A~I 列契约

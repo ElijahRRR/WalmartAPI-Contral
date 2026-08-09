@@ -133,10 +133,14 @@ def _map_visible(conn, pt: str, spec, product: dict) -> dict:
 
 MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
 
+# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对
 _SQL_ATTEMPTS = """
-SELECT store, sku, count(*) FROM ops.feed_items
-WHERE feed_type = 'MP_ITEM' AND (store, sku) IN %s
-GROUP BY store, sku
+SELECT f.store, f.sku, count(*)
+FROM ops.feed_items f
+JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
+  ON f.store = t.store AND f.sku = t.sku
+WHERE f.feed_type = 'MP_ITEM'
+GROUP BY f.store, f.sku
 """
 
 
@@ -156,9 +160,9 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
             and r["list_result"] != "SKU_LOCKED"]
     if not cand:
         return [], []
-    keys = tuple((r["store"], r["asin"]) for r in cand)
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_ATTEMPTS, (keys,))
+        cur.execute(_SQL_ATTEMPTS, ([r["store"] for r in cand],
+                                    [r["asin"] for r in cand]))
         tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
     retry, exhausted = [], []
     for r in cand:

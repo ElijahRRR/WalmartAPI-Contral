@@ -156,7 +156,15 @@ def test_failed_rows_requeue_until_cap(monkeypatch):
     class _Cur:
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def execute(self, sql, args): self.args = args
+
+        def execute(self, sql, args):
+            # 假游标抓不到 SQL 语法错(2026-08-09 踩过:psycopg3 不支持
+            # `(a,b) IN %s`),至少钉住参数形状是两个等长数组
+            assert "IN %s" not in sql, "psycopg3 不支持元组序列 IN"
+            assert isinstance(args, tuple) and len(args) == 2
+            assert isinstance(args[0], list) and len(args[0]) == len(args[1])
+            self.args = args
+
         def fetchall(self):
             return [("T1", "B0RETRY01", 1), ("T1", "B0CAPPED01", 3)]
 

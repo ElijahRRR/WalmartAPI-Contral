@@ -113,6 +113,51 @@
       stateRestrictions 清理 + 空值/minItems 裁剪 + 小数位 + **提交前必填校验
       (不过就不提交,省 UPC 与配额)**;dry-run 加 -p check_spec=1 预检
 - [ ] 重跑验收:预检 → --execute → 回执 SUCCESS
+
+### ⏸ L2d 攻坚暂停(所有者定稿 2026-08-09)
+
+**状态:代码全部保留,不回退。** 四轮真跑把载荷问题从 30 个错收敛到只剩
+UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先做别的",
+本阶段暂停;续做时从「下次续做怎么走」直接接上。
+
+#### 四轮错误账(每条都已修,注释与测试留档)
+
+| 轮次 | 报错数 | 错误码 / 现象 | 根因 | 修法 |
+|---|---|---|---|---|
+| 1 | 30 | `50716566635066` 要 JSONArray/JSONObject(occasion/pattern/keyFeatures/material/尺寸类共 20+ 条) | **spec 一致化层整层没迁**——LLM 吐什么类型就塞什么 | 补迁 `mp_conform` 十道工序 |
+| 1 | — | `72600149546850` 条件必填缺失(`country_of_origin_substantial_transformation` 三条全中、`seat_back_height_descriptor`) | 同上 + Orderable 段没给该字段 | 条件必填不动点迭代 + `build_orderable` 补齐 |
+| 1 | — | `60670554076755` `Orderable.productName` 非法字段 | **旧实证在 v5 spec 下失效**(我照抄了"productName 两处同值") | `assemble_mp_item` 不再塞;`strip_unknown` 兜底 |
+| 1 | — | `50716566635066` `quantity` 要 Number | `inventory[].quantity` 写成 `{unit,amount}` | 改裸 int(旧 `force_overrides` 原文) |
+| 2 | 4 | `55506974520167` keyFeatures 需 ≥3 条(三条全中) | **`force_amazon_copy` 没迁**——文案本该用亚马逊原文,我们让 LLM 写 | 补迁:keyFeatures←bullet_points,不足拆句补齐 |
+| 2 | — | `50716566635066` `swatchImages` 要 JSONObject | 缺"LLM 不该输出的系统后处理字段"清单 | `SYSTEM_OWNED_FIELDS` 主动丢弃 |
+| 2 | — | (预检拦下)`ShippingWeight` / 卖点全空 | **`slow` 段没入库**——契约的 `raw` 是裁剪过的 | `catalog.products.slow` jsonb 全量留存 |
+| 3 | 3 | `50716566635066` `[color]` 要 **String** 却给了数组 | **上一轮提示词改动的副作用**(LLM 过度套用"数组字段包数组") | 反向类型强制:标量字段收到数组取首元素 |
+| 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标) |
+| 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位 |
+| 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
+
+#### 攻坚期沉淀下来的通用设施(已惠及全部 feed 类型)
+
+- `ops.feed_item_errors`(一条报错一行,含 **field**)+ `ops.v_feed_error_stats`
+  排行视图;**拉详情升为标准动作**(所有者定稿),六类 feed 的报错列统一写
+  「码 \| 人话」;`feed_poll -p stats=1` 看排行、`-p feed_id=X` 看单 feed 详情
+- 提交前 spec 预检(`list_new -p check_spec=1`):不领 UPC 不提交,
+  **本地就知道哪行过不了**——攻坚后三轮全靠它,没再烧过 UPC
+- FAILED 行自动重新排队 + 重试上限(旧 retry_state 阈值淘汰的等价物)
+
+#### 下次续做怎么走
+
+1. `python cli.py list_new -p check_spec=1` → 全 ✓ 再 `--execute`;
+2. 回执有错:`feed_poll -p feed_id=X` 看 description(**不是看数字码**),
+   按上表的模式定位是哪一层没对齐;
+3. 新错误码进 `mp_conform` 对应工序 + 一条回归测试 + 本表追加一行;
+4. 只剩 `0101119` 撞库 = **已经通了**,那是运气不是缺陷。
+
+#### 已知未做(续做时的清单)
+
+- 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)
+- `channel`(FBA/FBM)采集侧未产出 → 定价一律走 FBM 区间
+- `AMZ_IN_STOCK_QTY`:仅在 `stock_count` 采不到时用,所有者未定终值
 - [ ] 变体分组:后置(依赖采集 variation 数据)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)

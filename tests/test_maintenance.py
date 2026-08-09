@@ -378,6 +378,35 @@ def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
                                                     ("B0B", "price")]
 
 
+def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
+    """提交成功但写表炸了之后的恢复路径:按 (feedid, sku) 只补缺的行。"""
+    from registry.resources import Spreadsheet
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK",
+                                    sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    import datetime as _dt
+    when = _dt.datetime(2026, 8, 9, 12, 0)
+    conn = _Conn(rows=[("T1", "B0A", "price", "F1", "success", None, None, when),
+                       ("T1", "B0B", "inventory", "F2", "failed", "E1", "没库存",
+                        when)])
+    conn.cursor_value = {"next_row": 3, "unresolved_from": 3}
+    _fake_db(monkeypatch, conn)
+    # 表里已有 (F1,B0A) 那一行,只该补 B0B
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
+                        lambda sheet, rng: [["T1", "B0A", "价格", "", "",
+                                             "F1", "2026-08-09", "成功", ""]])
+    appended = []
+    monkeypatch.setattr(maint_sheet, "append_records",
+                        lambda rows: (appended.extend(rows), len(rows))[1])
+    out = maint_sheet.resync_from_ledger()
+    assert "补写 1 行" in out
+    assert appended[0][1] == "B0B" and appended[0][2] == "库存"
+    assert appended[0][5] == "F2" and appended[0][7] == "失败"
+    # 旧值/新值补不回来(PG 只记 SKU 级状态,不存当时的新旧值)
+    assert appended[0][3] == "" and appended[0][4] == ""
+
+
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────
 
 def test_maint_sheet_sync_from_ledger(monkeypatch):

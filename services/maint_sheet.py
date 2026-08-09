@@ -82,6 +82,59 @@ def append_records(rows: list[tuple]) -> int:
     return len(rows)
 
 
+_LABEL_BY_FEED = {"MP_MAINTENANCE": "标题", "price": "价格",
+                  "inventory": "库存", "DELETE_ITEM": "删除"}
+_RESULT_BY_STATUS = {"success": "成功", "failed": "失败",
+                     "missing": "未查到", "submitted": "处理中"}
+
+_SQL_LEDGER = """
+SELECT store, sku, feed_type, feed_id, status, error_code, error_desc,
+       submitted_at
+FROM ops.feed_items
+WHERE workflow = 'maintenance'
+ORDER BY submitted_at, feed_id, sku
+"""
+
+
+def resync_from_ledger() -> str:
+    """输入:无 → 输出:补写摘要。把台账里有、表里没有的维护流水补进表格。
+
+    用途:提交成功但写表那一步炸了(飞书超时/限流)——feed 已经发出去了,
+    流水却只在 PG。本函数按 (feedid, sku) 对齐,只补缺的行,可重复跑。
+
+    ⚠ **D/E(旧值/新值)补不回来**:PG 的 ops.feed_items 只记 SKU 级状态,
+    不存当时的新旧值(那是意图层的东西,提交后就没再留)。补出来的行这两列
+    为空,其余列齐全——表是展示面板,状态权威始终在 PG。
+    """
+    resources.MAINT_SHEET.require()
+    with db.pg_conn() as conn:
+        cur_state = _load_cursor(conn)
+        with conn.cursor() as cur:
+            cur.execute(_SQL_LEDGER)
+            ledger = cur.fetchall()
+    hi = int(cur_state.get("next_row", 2))
+    have: set[tuple[str, str]] = set()
+    if hi > 2:
+        for raw in feishu.sheet_values(resources.MAINT_SHEET, f"A2:I{hi - 1}"):
+            cells = [(str(c).strip() if c is not None else "") for c in raw] \
+                + [""] * 9
+            have.add((cells[5], cells[1]))          # (feedid, sku)
+    rows = []
+    for store, sku, ftype, fid, status, code, desc, submitted in ledger:
+        if (str(fid or ""), str(sku)) in have:
+            continue
+        result = _RESULT_BY_STATUS.get(status, status)
+        err = feed_track.merge_error(code, desc) if status == "failed" else ""
+        rows.append((store, sku, _LABEL_BY_FEED.get(ftype, ftype), "", "",
+                     fid, submitted.strftime("%Y-%m-%d") if submitted else "",
+                     result, err))
+    if not rows:
+        return "维护记录:表与台账已一致,无需补写"
+    written = append_records(rows)
+    return (f"维护记录补写 {written} 行(台账有、表里没有的流水;"
+            f"旧值/新值两列补不回来,PG 里没存)")
+
+
 def sync_from_ledger() -> str | None:
     """输入:无 → 输出:回写摘要一行(无待回填区间才返 None)。
 

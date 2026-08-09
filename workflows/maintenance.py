@@ -7,6 +7,7 @@
   python cli.py maintenance -p only=inventory    # 只跑某一类(delete/title/price/inventory)
   python cli.py maintenance -p only=delete       # 只处理删除类
   python cli.py maintenance -p oos_days=30       # 连续无货多少天算该删(默认 15)
+  python cli.py maintenance -p resync_sheet=1    # 只补维护记录表(写表炸过之后)
 
 架构(2026-08-07 所有者定稿,对比旧三段式 sync_lark/submit/poll_yesterday):
   单一 workflow——数据源已在 PG(sync 消失),结果轮询走全局 feed_poll +
@@ -250,7 +251,10 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store/only)→ 输出:维护提交摘要。"""
+    """输入:params(execute/store/only/resync_sheet)→ 输出:维护提交摘要。"""
+    if params.get("resync_sheet"):
+        # 只补表,不算维护动作:提交成功但写表炸了之后的恢复路径
+        return maint_sheet.resync_from_ledger()
     execute = bool(params.get("execute"))
     only = params.get("only")
     if only and only not in _KIND_ORDER:
@@ -351,4 +355,13 @@ def run(params: dict) -> str:
         lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
     except LookupError as e:
         lines.append(f"⚠ 维护记录表未登记,流水未写表(台账已在 PG):{e}")
+    except Exception as e:
+        # 飞书只是展示面板:写表失败绝不能把"feed 已经提交出去了"这件事
+        # 埋进一个异常里(所有者 2026-08-09 实遇:提交成功但表格一行没写,
+        # 事后只能靠 ops.cursors 的时间戳反推)。台账在 PG,补写靠
+        # -p resync_sheet=1。
+        logger.exception("维护记录写表失败(feed 已提交,台账在 PG): %s", e)
+        lines.append(f"⚠ 维护记录写表失败:{e}"
+                     f"(feed 已提交,{len(all_records)} 行流水只在 PG;"
+                     f"补写:python cli.py maintenance -p resync_sheet=1)")
     return "\n".join(lines)

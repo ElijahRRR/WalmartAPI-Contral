@@ -4,27 +4,29 @@
   {"store": 店铺名, "sku": SKU, "kind": "title"|"price"|"inventory",
    "old": 旧值, "new": 新值}
   title 意图额外携带 product_type / product_id(UPC)两键(feed 载荷必需;
-  provider 做实时按「三缺一跳过」旧防线过滤后再产出)。
+  按「三缺一跳过」旧防线过滤后再产出)。
 清零是 inventory 的 new=0 特例,由 zero_intents 产出。
 
-路由铁律(所有者定稿 2026-08-07,provider 做实时必须遵守):意图产出必须
-JOIN catalog.listing_sources 按出身路由——amz 快照驱动的意图只作用于
-source_type='amz' 的行;"源数据查不到"绝不可对 match/unknown 行推导出
-清库存/删除等破坏动作(旧系统按 SKU 格式排除的补丁废止,以登记簿为准)。
+**驱动方式的变化(2026-08-09,采集接入后)**:旧系统读飞书「在线产品总表」
+的运营决策列(是否更新价格+新价 / 是否更新库存+新库存 / amz标题+相似度);
+新系统的在线产品总表是程序写的投影,没有那些列——改为**从产品中心自动算**:
+  amz 最新观测(catalog.latest_snapshot / products.slow)
+    × 沃尔玛在线现值(catalog.walmart_items)
+    × 定价规则(限额表倍率,services/pricing)
+  → 差异超阈值才产出意图。人工要临时改某个 SKU 走 product_clear 同款的
+  驱动表(尚未建;需要时再说),自动链不承担一次性人工指令。
 
-Provider 面(2026-08-07 预留接口定稿,采集侧改造中):
-  zero_intents()       ✅ 做实:限额表「库存特殊要求」=0 的 stockzero 店整店清零,
-                       源=catalog.walmart_items,不依赖采集
-  price_intents()      ⏳ 预留:catalog.latest_snapshot(amz 快变)× walmart_items
-                       × 定价规则(规则届时与所有者定稿;涨跌幅闸位也留在此)
-  inventory_intents()  ⏳ 预留:amz stock_state → 沃尔玛库存
-  title_intents()      ⏳ 预留:处理后 amz 标题(采集+LLM 链路)
-采集接入后只填预留函数体(SQL+规则),workflow 管道零改动。
+路由铁律(所有者定稿 2026-08-07):意图产出必须 JOIN catalog.listing_sources
+按出身路由——amz 快照驱动的意图只作用于 source_type='amz' 的行;
+"源数据查不到"绝不可对 match/unknown 行推导出清库存/删除等破坏动作
+(旧系统按 SKU 格式排除的补丁废止,以登记簿为准)。
 
 路由阈值与标题载荷结构逐字移植旧系统(erpAPI 沃尔玛商品维护,实证勿改)。
 """
 
 import logging
+
+from services import mp_mapper, pricing
 
 logger = logging.getLogger("services.maintenance_intents")
 
@@ -35,12 +37,63 @@ SYNC_THRESHOLDS = {"price": 5, "inventory": 10}
 # M 列占位符:命中则跳过标题维护(否则 Walmart 退回;旧系统原值)
 TITLE_PLACEHOLDERS = {"[商品不存在]"}
 
+# 改价触发阈值:差额绝对值 ≥ 1 分且相对变化 ≥ 该比例才提交
+# (亚马逊价格日内小幅抖动很常见,逐分钱跟会把 feed 配额烧光)
+PRICE_MIN_DELTA = 0.01
+PRICE_MIN_RATIO = 0.01          # 1%
+
+# 单轮每类意图上限(防某天采集侧大面积变动 → 一次几万条 feed)
+MAX_INTENTS_PER_KIND = 5000
+
 _SQL_ZERO = """
 SELECT store, sku, avail_qty FROM catalog.walmart_items
 WHERE store = ANY(%s) AND missing_since IS NULL AND avail_qty > 0
 """
 # avail_qty > 0 是显式条件:旧系统 `None != 0` 也触发清零是坑(库存未知的行
 # 被盲清)——新规矩:未知库存不动,只清确知有货的行。
+
+# amz 侧最新观测 × 沃尔玛在线现值。三个 provider 共用一条取数(一次 JOIN,
+# 各自挑字段),避免同一张大表扫三遍。
+#   · 只取 source_type='amz'(路由铁律)
+#   · 只取在架行(missing_since IS NULL)
+#   · zip_verify='mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)
+#   · stockzero 店整店排除(它们归 zero_intents,不能被自动同步顶回去)
+_SQL_AMZ_JOIN = """
+SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
+       w.price AS wm_price, w.avail_qty,
+       s.price AS amz_price, s.stock_count, s.delivery_days,
+       p.slow
+FROM catalog.walmart_items w
+JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = w.sku
+LEFT JOIN LATERAL (
+    SELECT price, stock_count, delivery_days
+    FROM catalog.latest_snapshot l
+    WHERE l.marketplace = 'US' AND l.asin = w.sku
+      AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
+    ORDER BY l.scraped_at DESC LIMIT 1
+) s ON true
+WHERE w.missing_since IS NULL
+  AND w.published_status = 'PUBLISHED'
+  AND NOT (w.store = ANY(%s))
+"""
+
+
+def _rows(conn, stockzero_stores: list[str]) -> list[tuple]:
+    with conn.cursor() as cur:
+        cur.execute(_SQL_AMZ_JOIN, (list(stockzero_stores or []),))
+        return cur.fetchall()
+
+
+def _cap(intents: list[dict], kind: str) -> list[dict]:
+    """输入:意图列表 → 输出:截到单轮上限(超出只告警,下轮继续)。"""
+    if len(intents) <= MAX_INTENTS_PER_KIND:
+        return intents
+    logger.warning("%s 意图 %d 条超单轮上限 %d,本轮只提交前 %d 条(其余下轮)",
+                   kind, len(intents), MAX_INTENTS_PER_KIND,
+                   MAX_INTENTS_PER_KIND)
+    return intents[:MAX_INTENTS_PER_KIND]
 
 
 def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
@@ -54,31 +107,98 @@ def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
             for s, k, q in rows]
 
 
-def price_intents(conn) -> list[dict]:
-    """⏳ 预留(采集侧改造中):amz 最新快照 × 定价规则 → 改价意图。
+def price_intents(conn, multipliers: dict[str, dict],
+                  stockzero_stores: list[str] | None = None) -> list[dict]:
+    """输入:连接 + {店铺: 限额表倍率行} + stockzero 名单 → 输出:改价意图。
 
-    接入点:catalog.latest_snapshot(scraper_migration_brief 契约 v1)
-    JOIN catalog.walmart_items(sku=asin)+ 限额表 fba/FBM 区间定价规则。
-    做实时同步补涨跌幅闸(所有者 2026-08-07:暂不需要,闸位留此)。
+    新价 = services.pricing.walmart_price(amz 现价 × 该店对应区间倍率),
+    与上架用的是**同一套定价规则**(避免上架价与维护价两套口径)。
+    出界/倍率未配置 → 不产出(不是改成 0,是不动)。
+    差异需同时满足 PRICE_MIN_DELTA 与 PRICE_MIN_RATIO 才提交。
     """
-    logger.info("price_intents:采集源未接(采集服务改造中),本轮无改价意图")
-    return []
+    out = []
+    skipped_no_rule = 0
+    for (store, sku, _name, _pt, _upc, wm_price, _qty,
+         amz_price, _sc, _dd, _slow) in _rows(conn, stockzero_stores):
+        if amz_price is None or wm_price is None:
+            continue                    # 缺任一侧现值:没有可比基准,不动
+        # channel 采集侧未产出,一律按 FBM 区间(与 list_new 同口径)
+        new_price = pricing.walmart_price("FBM", amz_price,
+                                          multipliers.get(store, {}))
+        if new_price is None:
+            skipped_no_rule += 1
+            continue
+        old = float(wm_price)
+        delta = abs(new_price - old)
+        if delta < PRICE_MIN_DELTA or (old > 0 and delta / old < PRICE_MIN_RATIO):
+            continue
+        out.append({"store": store, "sku": sku, "kind": "price",
+                    "old": old, "new": new_price})
+    if skipped_no_rule:
+        logger.info("改价:%d 行因定价出界/倍率未配置跳过(不动,非改 0)",
+                    skipped_no_rule)
+    return _cap(out, "price")
 
 
-def inventory_intents(conn) -> list[dict]:
-    """⏳ 预留(采集侧改造中):amz stock_state → 沃尔玛库存意图。"""
-    logger.info("inventory_intents:采集源未接(采集服务改造中),本轮无改库存意图")
-    return []
+def inventory_intents(conn, stockzero_stores: list[str] | None = None
+                      ) -> list[dict]:
+    """输入:连接 + stockzero 名单 → 输出:改库存意图。
 
-
-def title_intents(conn) -> list[dict]:
-    """⏳ 预留(采集侧改造中):处理后 amz 标题 → 标题维护意图。
-
-    产出时须过 TITLE_PLACEHOLDERS 与「productType/upc/title 三缺一跳过」
-    (旧系统防线,做实时移植)。
+    ⚠ **stock_count 的 None 与 0 是两回事**(采集契约 3b):None = 本次没采到
+    → **不动**(不能把"不知道"当成缺货去清零);0 = 确实缺货 → 同步为 0。
+    配送 > MAX_LEAD_DAYS 天 → 库存写 0(旧规则,货期太长先下架式清零)。
     """
-    logger.info("title_intents:采集源未接(采集服务改造中),本轮无标题意图")
-    return []
+    from services import amz_source
+    out = []
+    for (store, sku, _name, _pt, _upc, _wp, avail_qty,
+         _ap, stock_count, delivery_days, _slow) in _rows(conn, stockzero_stores):
+        if stock_count is None:
+            continue                    # 没采到 ≠ 缺货
+        new_qty = 0 if (delivery_days is not None
+                        and delivery_days > amz_source.MAX_LEAD_DAYS) \
+            else int(stock_count)
+        if avail_qty is not None and int(avail_qty) == new_qty:
+            continue
+        out.append({"store": store, "sku": sku, "kind": "inventory",
+                    "old": avail_qty, "new": new_qty})
+    return _cap(out, "inventory")
+
+
+def title_intents(conn, stockzero_stores: list[str] | None = None
+                  ) -> list[dict]:
+    """输入:连接 + stockzero 名单 → 输出:标题维护意图。
+
+    新标题 = 亚马逊标题过**与上架同一套文案处理**(force_amazon_copy:
+    去品牌名、去项目符号、折叠空白、截 199)——两处口径必须一致,
+    否则上架写一个标题、维护又改成另一个,自己跟自己打架。
+
+    旧防线原样保留:占位符跳过;**productType / UPC / 标题三缺一跳过**
+    (缺任一沃尔玛必退回)。标题相同则不产出。
+    """
+    out = []
+    skipped_incomplete = 0
+    for (store, sku, product_name, product_type, upc, _wp, _qty,
+         _ap, _sc, _dd, slow) in _rows(conn, stockzero_stores):
+        amz_title = ((slow or {}).get("title") if isinstance(slow, dict)
+                     else None)
+        if not amz_title or str(amz_title).strip() in TITLE_PLACEHOLDERS:
+            continue
+        # 与上架同款处理(brand 从 slow 取,和 force_amazon_copy 的入参一致)
+        new_title = mp_mapper.force_amazon_copy(
+            {}, {"title": amz_title, "brand": (slow or {}).get("brand"),
+                 "attrs": slow or {}}).get("productName") or ""
+        if not new_title or new_title == (product_name or ""):
+            continue
+        if not product_type or not upc:
+            skipped_incomplete += 1     # 三缺一跳过(旧防线)
+            continue
+        out.append({"store": store, "sku": sku, "kind": "title",
+                    "old": product_name, "new": new_title,
+                    "product_type": product_type, "product_id": upc})
+    if skipped_incomplete:
+        logger.info("标题:%d 行缺 productType/UPC 跳过(三缺一防线)",
+                    skipped_incomplete)
+    return _cap(out, "title")
 
 
 def build_title_item(sku: str, product_type: str, product_id: str,

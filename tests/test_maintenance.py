@@ -58,12 +58,69 @@ def test_zero_intents_only_positive_known_qty():
     assert mi.zero_intents(conn, []) == []          # 无 stockzero 店零查询
 
 
-def test_reserved_providers_return_empty():
-    # 预留接口(采集侧改造中):签名固定,返回空,接入时只填函数体
-    conn = _Conn()
-    assert mi.price_intents(conn) == []
-    assert mi.inventory_intents(conn) == []
-    assert mi.title_intents(conn) == []
+# amz 侧 × 沃尔玛侧联表的一行(顺序 = _SQL_AMZ_JOIN 的 SELECT 列)
+def _row(store="T1", sku="B0A", name="旧标题", pt="Cups", upc="012345678905",
+         wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
+         delivery_days=3, slow=None):
+    return (store, sku, name, pt, upc, wm_price, avail_qty,
+            amz_price, stock_count, delivery_days,
+            slow if slow is not None else {"title": "Amz 标题", "brand": None})
+
+
+_MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
+
+
+def test_price_intents_threshold_and_no_rule(monkeypatch):
+    rows = [
+        _row(sku="B0CHANGE", wm_price=20.0, amz_price=15.0),   # 新价 30 → 改
+        _row(sku="B0SAME", wm_price=20.0, amz_price=10.0),     # 新价 20 → 不动
+        _row(sku="B0TINY", wm_price=20.10, amz_price=10.0),    # 差 0.5% → 不动
+        _row(sku="B0NOAMZ", amz_price=None),                   # 缺 amz 现价 → 不动
+        _row(sku="B0OUT", amz_price=5000.0),                   # 出界 → 不动(非改 0)
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = mi.price_intents(_Conn(), _MULTS, [])
+    assert [i["sku"] for i in out] == ["B0CHANGE"]
+    assert out[0]["old"] == 20.0 and out[0]["new"] == 30.0
+
+
+def test_inventory_intents_null_is_not_zero(monkeypatch):
+    rows = [
+        _row(sku="B0SYNC", avail_qty=10, stock_count=7),        # 7≠10 → 改
+        _row(sku="B0SAME", avail_qty=7, stock_count=7),         # 相同 → 不动
+        _row(sku="B0OOS", avail_qty=5, stock_count=0),          # 确实缺货 → 改 0
+        _row(sku="B0UNKNOWN", avail_qty=5, stock_count=None),   # 没采到 → **不动**
+        _row(sku="B0SLOW", avail_qty=9, stock_count=50,
+             delivery_days=30),                                 # 货期超限 → 清零
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = {i["sku"]: i["new"] for i in mi.inventory_intents(_Conn(), [])}
+    assert out == {"B0SYNC": 7, "B0OOS": 0, "B0SLOW": 0}
+
+
+def test_title_intents_reuses_listing_copy_rules(monkeypatch):
+    rows = [
+        _row(sku="B0NEW", name="旧标题",
+             slow={"title": "ACME Steel Cup", "brand": "ACME"}),   # 去品牌后不同 → 改
+        _row(sku="B0SAME", name="Steel Cup",
+             slow={"title": "ACME Steel Cup", "brand": "ACME"}),   # 处理后相同 → 不动
+        _row(sku="B0NOPT", pt="", slow={"title": "X Cup"}),        # 缺 PT → 三缺一跳过
+        _row(sku="B0NOUPC", upc="", slow={"title": "X Cup"}),      # 缺 UPC → 跳过
+        _row(sku="B0PLACE", slow={"title": "[商品不存在]"}),        # 占位符 → 跳过
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = mi.title_intents(_Conn(), [])
+    assert [i["sku"] for i in out] == ["B0NEW"]
+    assert out[0]["new"] == "Steel Cup"          # 与上架同一套文案处理(去品牌)
+    assert out[0]["product_type"] == "Cups" and out[0]["product_id"]
+
+
+def test_amz_join_honors_routing_and_stockzero():
+    # 路由铁律:只作用于 source_type='amz';stockzero 店整店排除(归 zero_intents)
+    assert "source_type = 'amz'" in mi._SQL_AMZ_JOIN
+    assert "NOT (w.store = ANY(%s))" in mi._SQL_AMZ_JOIN
+    assert "missing_since IS NULL" in mi._SQL_AMZ_JOIN
+    assert "zip_verify" in mi._SQL_AMZ_JOIN
 
 
 def test_build_title_item_shape():

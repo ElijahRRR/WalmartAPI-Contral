@@ -35,10 +35,12 @@ MARKETPLACE = "US"          # 上架目的地(契约:与 (marketplace,asin) 主�
 # zip_verify == 'mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)。
 _SQL = """
 SELECT p.asin, p.title, p.brand, p.amazon_category, p.image_url, p.slow,
-       s.price, s.stock_state, s.stock_count, s.delivery_days, s.raw
+       s.price, s.stock_state, s.stock_count, s.delivery_days, s.raw,
+       s.fulfillment
 FROM catalog.products p
 LEFT JOIN LATERAL (
-    SELECT price, stock_state, stock_count, delivery_days, raw
+    SELECT price, stock_state, stock_count, delivery_days, raw,
+           raw ->> 'is_fba' AS fulfillment
     FROM catalog.latest_snapshot ls
     WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
       AND coalesce(ls.scrape_params ->> 'zip_verify', '') <> 'mismatch'
@@ -89,7 +91,7 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for (asin, title, brand, category, image_url, slow, price, stock_state,
-         stock_count, delivery_days, raw) in rows:
+         stock_count, delivery_days, raw, fulfillment) in rows:
         if not title:           # 身份层还没拿到标题 = 这条不够格喂上架链
             continue
         # attrs 首选身份层的 slow 全量段(卖点/描述/重量/尺寸/变体都在这里);
@@ -103,7 +105,10 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
             "stock": stock_count,               # int | None(None ≠ 0)
             "stock_state": str(stock_state) if stock_state else None,
             "lead_days": delivery_days,         # int | None(None ≠ 0)
-            "channel": None,
+            # 配送方式(定价区间路由):采集侧 raw.is_fba,拿不到就是 None
+            # ——调用方按"未知不定价"处理,绝不猜(猜错一档 = 拿错倍率)
+            "channel": (str(fulfillment).strip().upper()
+                        if fulfillment else None),
             "images": images, "attrs": attrs,
         }
     absent = [a for a in asins if a not in out]

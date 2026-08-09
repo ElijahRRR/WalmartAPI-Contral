@@ -181,16 +181,17 @@ def test_stock_count_null_and_zero_are_different():
 def test_fetch_products_carries_true_values(monkeypatch):
     """provider 只搬运真值:stock/lead_days 的 None 原样透出,不 or 0。"""
     rows = [
-        # asin, title, brand, category, image, slow, price, state, count, days, raw
+        # asin, title, brand, category, image, slow, price, state, count,
+        # days, raw, fulfillment
         ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg",
          {"images": ["https://x/2.jpg", "https://x/1.jpg"],
           "bullet_points": ["a"]},                      # 身份层 slow 全量段
-         19.99, "in_stock", 37, 8, None),
+         19.99, "in_stock", 37, 8, None, "FBA"),
         ("B0B", "标题B", None, None, None, None, 8.0, "out_of_stock", 0,
-         None, None),
+         None, None, "fbm"),
         ("B0C", "标题C", None, None, None, None, 8.0, "in_stock", None,
-         None, None),
-        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None),
+         None, None, None),
+        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None, None),
     ]
 
     class _C:
@@ -214,6 +215,9 @@ def test_fetch_products_carries_true_values(monkeypatch):
     assert out["B0C"]["stock"] is None                # 没采到,不是 0
     assert out["B0C"]["stock_state"] == "in_stock"    # 状态给调用方兜底判断
     assert out["B0A"]["price"] == 19.99
+    # 配送方式来自 raw.is_fba,归一化大写;采不到就是 None(调用方不许猜)
+    assert out["B0A"]["channel"] == "FBA" and out["B0B"]["channel"] == "FBM"
+    assert out["B0C"]["channel"] is None
     assert amz_source.fetch_products([]) == {}
 
 
@@ -226,17 +230,23 @@ def test_list_new_stock_three_way(monkeypatch):
             _sheet_row(6, asin="B0NULLUNK"), _sheet_row(7, asin="B0SLOW")]
     products = {
         "B0REAL":    {"asin": "B0REAL", "title": "T", "price": 20.0,
-                      "stock": 37, "stock_state": "in_stock", "lead_days": 8},
+                      "stock": 37, "stock_state": "in_stock", "lead_days": 8,
+                      "channel": "FBM"},
         "B0LOW":     {"asin": "B0LOW", "title": "T", "price": 20.0,
-                      "stock": 3, "stock_state": "in_stock", "lead_days": 2},
+                      "stock": 3, "stock_state": "in_stock", "lead_days": 2,
+                      "channel": "FBM"},
         "B0ZERO":    {"asin": "B0ZERO", "title": "T", "price": 20.0,
-                      "stock": 0, "stock_state": "out_of_stock", "lead_days": 2},
+                      "stock": 0, "stock_state": "out_of_stock", "lead_days": 2,
+                      "channel": "FBM"},
         "B0NULLOK":  {"asin": "B0NULLOK", "title": "T", "price": 20.0,
-                      "stock": None, "stock_state": "in_stock", "lead_days": None},
+                      "stock": None, "stock_state": "in_stock",
+                      "lead_days": None, "channel": "FBA"},
         "B0NULLUNK": {"asin": "B0NULLUNK", "title": "T", "price": 20.0,
-                      "stock": None, "stock_state": "unknown", "lead_days": None},
+                      "stock": None, "stock_state": "unknown",
+                      "lead_days": None, "channel": "FBM"},
         "B0SLOW":    {"asin": "B0SLOW", "title": "T", "price": 20.0,
-                      "stock": 50, "stock_state": "in_stock", "lead_days": 30},
+                      "stock": 50, "stock_state": "in_stock", "lead_days": 30,
+                      "channel": "FBM"},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (

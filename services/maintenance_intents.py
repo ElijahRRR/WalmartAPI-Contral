@@ -6,8 +6,8 @@
   title 意图额外携带 product_type / product_id(UPC)两键(feed 载荷必需;
   按「三缺一跳过」旧防线过滤后再产出)。
 清零是 inventory 的 new=0 特例,由 zero_intents 产出。
-delete 是唯一的**不可逆**类(variant_offset:采集永久偏移,数据再也拿不到),
-由 variant_offset_intents 产出,old/new = 在线/删除。
+delete 是唯一的**不可逆**类(采集永久偏移 / 商品不存在),由 delete_intents
+产出,old/new = 在线/删除,并带 reason 与 label(维护记录 C 列)。
 
 **驱动方式的变化(2026-08-09,采集接入后)**:旧系统读飞书「在线产品总表」
 的运营决策列(是否更新价格+新价 / 是否更新库存+新库存 / amz标题+相似度);
@@ -68,13 +68,16 @@ _SQL_AMZ_JOIN = """
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        w.price AS wm_price, w.avail_qty,
        s.price AS amz_price, s.stock_count, s.delivery_days,
-       p.slow
+       p.slow, s.fulfillment
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = w.sku
 LEFT JOIN LATERAL (
-    SELECT price, stock_count, delivery_days
+    -- 配送方式(FBA/FBM)决定用哪套定价区间。采集契约的 fast 段没把它列成
+    -- 一等字段,但 raw 是"裁剪后的原样载荷",is_fba 就在里面(采集侧
+    -- worker/parser._parse_fulfillment 读 buybox 的 Ships from 行)。
+    SELECT price, stock_count, delivery_days, raw ->> 'is_fba' AS fulfillment
     FROM catalog.latest_snapshot l
     WHERE l.marketplace = 'US' AND l.asin = w.sku
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
@@ -156,17 +159,27 @@ def price_intents(conn, multipliers: dict[str, dict],
 
     新价 = services.pricing.walmart_price(amz 现价 × 该店对应区间倍率),
     与上架用的是**同一套定价规则**(避免上架价与维护价两套口径)。
+    区间按**配送方式**分两套(FBA 0-30/30-75、FBM 15-80/80-1000),配送方式
+    取 latest_snapshot 的 raw.is_fba(采集侧 parser 读 buybox 的 Ships from);
+    **未知则不改价**——猜错一档就是拿错倍率改线上价。
     出界/倍率未配置 → 不产出(不是改成 0,是不动)。
     差异需同时满足 PRICE_MIN_DELTA 与 PRICE_MIN_RATIO 才提交。
     """
     out = []
-    skipped_no_rule = 0
+    skipped_no_rule = skipped_no_channel = 0
     for (store, sku, _name, _pt, _upc, wm_price, _qty,
-         amz_price, _sc, _dd, _slow) in _rows(conn, stockzero_stores):
+         amz_price, _sc, _dd, _slow, fulfillment) in _rows(conn,
+                                                           stockzero_stores):
         if amz_price is None or wm_price is None:
             continue                    # 缺任一侧现值:没有可比基准,不动
-        # channel 采集侧未产出,一律按 FBM 区间(与 list_new 同口径)
-        new_price = pricing.walmart_price("FBM", amz_price,
+        channel = str(fulfillment or "").strip().upper()
+        if channel not in pricing.PRICE_BANDS:
+            # 配送方式未知 → **不改价**(所有者 2026-08-09:这是必须要获取的
+            # 信息)。FBA/FBM 两套区间边界不同,猜错一档就是拿错倍率改线上价,
+            # 比不改危险得多。
+            skipped_no_channel += 1
+            continue
+        new_price = pricing.walmart_price(channel, amz_price,
                                           multipliers.get(store, {}))
         if new_price is None:
             skipped_no_rule += 1
@@ -180,6 +193,10 @@ def price_intents(conn, multipliers: dict[str, dict],
     if skipped_no_rule:
         logger.info("改价:%d 行因定价出界/倍率未配置跳过(不动,非改 0)",
                     skipped_no_rule)
+    if skipped_no_channel:
+        logger.warning("改价:%d 行配送方式(FBA/FBM)未知,本轮不改价"
+                       "——采集侧 raw.is_fba 缺失或该 ASIN 尚未重采",
+                       skipped_no_channel)
     return _cap(out, "price")
 
 
@@ -200,7 +217,8 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
     from services import amz_source
     out = []
     for (store, sku, _name, _pt, _upc, _wp, avail_qty,
-         _ap, stock_count, delivery_days, _slow) in _rows(conn, stockzero_stores):
+         _ap, stock_count, delivery_days, _slow, _fm) in _rows(conn,
+                                                            stockzero_stores):
         if stock_count is None:
             stock_count = 0             # 没采到 → 不卖(所有者定稿)
         new_qty = 0 if (delivery_days is not None
@@ -227,7 +245,7 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
     out = []
     skipped_incomplete = 0
     for (store, sku, product_name, product_type, upc, _wp, _qty,
-         _ap, _sc, _dd, slow) in _rows(conn, stockzero_stores):
+         _ap, _sc, _dd, slow, _fm) in _rows(conn, stockzero_stores):
         amz_title = ((slow or {}).get("title") if isinstance(slow, dict)
                      else None)
         if not amz_title or str(amz_title).strip() in TITLE_PLACEHOLDERS:
@@ -293,7 +311,7 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
                    "last_seen": last_seen})
 
     for (store, sku, _name, _pt, _upc, _wp, _qty,
-         _ap, _sc, _dd, slow) in _rows(conn, stockzero_stores):
+         _ap, _sc, _dd, slow, _fm) in _rows(conn, stockzero_stores):
         title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
         if str(title or "").strip() in TITLE_PLACEHOLDERS and title:
             _take(store, sku, "商品不存在")

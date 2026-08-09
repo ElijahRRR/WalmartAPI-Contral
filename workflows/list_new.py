@@ -303,8 +303,15 @@ def run(params: dict) -> str:
             n["risk"] += 1
             reasons.append((r["rownum"], why))
             continue
-        w_price = pricing.walmart_price(p.get("channel") or "FBM",
-                                        p.get("price"),
+        # 配送方式决定用哪套区间(FBA 0-30/30-75 vs FBM 15-80/80-1000)。
+        # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档
+        # 就是拿错倍率定价;宁可这行等下一轮采到 is_fba 再上。
+        channel = p.get("channel")
+        if channel not in pricing.PRICE_BANDS:
+            n["filtered"] += 1
+            reasons.append((r["rownum"], "配送方式(FBA/FBM)未采到,不定价"))
+            continue
+        w_price = pricing.walmart_price(channel, p.get("price"),
                                         mults.get(r["store"], {}))
         if w_price is None:
             n["filtered"] += 1

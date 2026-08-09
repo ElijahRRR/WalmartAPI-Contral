@@ -61,10 +61,11 @@ def test_zero_intents_only_positive_known_qty():
 # amz 侧 × 沃尔玛侧联表的一行(顺序 = _SQL_AMZ_JOIN 的 SELECT 列)
 def _row(store="T1", sku="B0A", name="旧标题", pt="Cups", upc="012345678905",
          wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
-         delivery_days=3, slow=None):
+         delivery_days=3, slow=None, fulfillment="FBM"):
     return (store, sku, name, pt, upc, wm_price, avail_qty,
             amz_price, stock_count, delivery_days,
-            slow if slow is not None else {"title": "Amz 标题", "brand": None})
+            slow if slow is not None else {"title": "Amz 标题", "brand": None},
+            fulfillment)
 
 
 _MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
@@ -82,6 +83,23 @@ def test_price_intents_threshold_and_no_rule(monkeypatch):
     out = mi.price_intents(_Conn(), _MULTS, [])
     assert [i["sku"] for i in out] == ["B0CHANGE"]
     assert out[0]["old"] == 20.0 and out[0]["new"] == 30.0
+
+
+def test_price_intents_skip_when_fulfillment_unknown(monkeypatch):
+    """FBA/FBM 决定用哪套区间;未知**不猜**(所有者 2026-08-09:必须获取)。"""
+    rows = [
+        _row(sku="B0FBM", wm_price=20.0, amz_price=15.0, fulfillment="FBM"),
+        _row(sku="B0FBA", wm_price=20.0, amz_price=15.0, fulfillment="FBA"),
+        _row(sku="B0UNK", wm_price=20.0, amz_price=15.0, fulfillment=None),
+        _row(sku="B0JUNK", wm_price=20.0, amz_price=15.0, fulfillment="???"),
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    mults = {"T1": {"fbm_range1": "200%", "fba_range1": "300%"}}
+    out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), mults, [])}
+    # 同一个 15 美金:FBM 落区间1(×2=30),FBA 落区间1(×3=45)——区间不同套
+    assert out == {"B0FBM": 30.0, "B0FBA": 45.0}
+    # 配送方式来自 latest_snapshot 的 raw.is_fba
+    assert "raw ->> 'is_fba'" in mi._SQL_AMZ_JOIN
 
 
 def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):

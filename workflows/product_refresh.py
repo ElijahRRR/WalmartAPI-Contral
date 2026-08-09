@@ -181,6 +181,9 @@ def _check_open() -> list[str]:
         except Exception as e:
             out.append(f"  {name}:状态查询失败 {e}(保持在途,下轮再查)")
             continue
+        # 台账没记下 batch_id 时(老行/推送时响应异常)从状态响应补:
+        # 失败明细端点只认 batch_id,缺了就查不了
+        bid = bid or st.get("batch_id")
         stats = st.get("stats") or {}
         done, failed = stats.get("done") or 0, stats.get("failed") or 0
         total = stats.get("total") or n

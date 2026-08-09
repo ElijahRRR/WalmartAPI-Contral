@@ -97,8 +97,13 @@
       UPC 领号事务;LLM 映射走缓存;同店单 feed;三态结局 UPC 回收三类)
       + 上架表回执反哺器(四集合+优先级,SKU_LOCKED>SUCCESS>ASYNC>失败,
       错误码 strip \\t 实证)
-- [ ] L2d 端到端生产验收:**待采集服务可用**(现在可验:dry-run 闸门链、
-      风控拦截、去重防呆计数;数据行会停在"待数据源")
+- [x] **L2d 端到端 dry-run 打通**(2026-08-09,本机采集服务接线后):
+      上架表 6 行 → 去重拦 2 + 库存不足拦 1(out_of_stock 正确识别)+
+      **待数据源归零** → 3 行算出定价待提交(A107,$194.99/$82.48/$61.47,
+      库存 = AMZ_IN_STOCK_QTY)。全链路证实:product_ingest → 中心库 →
+      amz_source provider → 闸门链 → 定价
+- [ ] L2d --execute 首跑验收:领 UPC → LLM 映射 → MP_ITEM feed → feed_poll
+      回执 → 上架表 O/P/Q 回填(单店小批先行)
 - [ ] 变体分组:后置(依赖采集 variation 数据)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)

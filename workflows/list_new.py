@@ -151,7 +151,8 @@ def run(params: dict) -> str:
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
-         "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0}
+         "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
+         "stock_assumed": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     candidates: list[dict] = []
 
@@ -197,9 +198,23 @@ def run(params: dict) -> str:
         if p is None:
             n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
             continue
-        if (p.get("stock") or 0) < amz_source.MIN_INVENTORY:
+        # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
+        #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
+        #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
+        #   无真值 + 其余状态 → 不知道有没有货,不上架
+        stock = p.get("stock")
+        if stock is None:
+            if p.get("stock_state") == "in_stock":
+                stock = amz_source.IN_STOCK_QTY
+                n["stock_assumed"] += 1
+            else:
+                n["filtered"] += 1
+                reasons.append((r["rownum"],
+                                f"库存未知(状态 {p.get('stock_state') or '缺失'})"))
+                continue
+        if stock < amz_source.MIN_INVENTORY:
             n["filtered"] += 1
-            reasons.append((r["rownum"], f"库存不足:{p.get('stock')}"))
+            reasons.append((r["rownum"], f"库存不足:{stock}"))
             continue
         why = risk_gate.check(gate, None, p.get("brand"))
         if why:
@@ -213,14 +228,22 @@ def run(params: dict) -> str:
             n["filtered"] += 1
             reasons.append((r["rownum"], f"价格出界/倍率未配置:{p.get('price')}"))
             continue
-        qty = 0 if (p.get("lead_days") or 0) > amz_source.MAX_LEAD_DAYS \
-            else int(p.get("stock") or 0)
+        # 配送时长同样三态:采到且 >12 天 → 上架但库存写 0(旧规则);
+        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了
+        lead = p.get("lead_days")
+        qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
+            else int(stock)
         ready.append({**r, "_p": p, "_price": w_price, "_qty": qty})
 
-    lines.append(f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
+    gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
                  f"去重 {n['dedup']},防呆 {n['guard']},"
                  f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
+    if n["stock_assumed"]:
+        # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
+        gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
+                      f" {n['stock_assumed']} 行")
+    lines.append(gate_line)
 
     if not execute:
         for rownum, why in reasons[:15]:
@@ -294,7 +317,7 @@ def run(params: dict) -> str:
                             updates.append((r["rownum"], [
                                 (r["_p"].get("title") or "")[:190],
                                 r["_p"].get("price") or "",
-                                r["_p"].get("stock") or "",
+                                r["_qty"],      # 实际提交的库存(0 也照写)
                                 r["_price"], "Yes", res["feed_id"], today, ""]))
                     elif res["outcome"] == "failed":
                         upc_pool.release(conn, [u for _, u in batch], "rejected")

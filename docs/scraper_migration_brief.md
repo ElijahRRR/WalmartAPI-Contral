@@ -99,7 +99,7 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 | scrape_params | ✅ | 对象:{"zipcode": "...", ...} 影响结果的全部采集参数 |
 | slow | ✅ | 慢变字段对象:title、brand、category_path、images[](首图=主图);
 可选:bullet_points[]、description、weight、dimensions、variant(parent_asin/theme) |
-| slow_hash | 建议 | slow 字段的稳定哈希(字段排序后 sha256 前 16 位) |
+| slow_hash | 建议 | slow 字段的稳定哈希,16 位十六进制。**当不透明值用**(见下 §5.1) |
 | fast | ✅ | 快变字段对象:price、currency、stock_state;
 可选:buybox_seller、buybox_price、coupon、deal |
 | raw | 可选 | 裁剪后的原始载荷(沃尔玛侧存 jsonb 备查) |
@@ -107,6 +107,47 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 **边界语义**(验收会测):cursor 相同的多条记录不丢;`cursor=0` 从头拉;
 重复返回无害(source_id 兜底);删除/下架的产品不需要特殊事件,照常输出最新采集结果。
 双方各存一份本契约,变更需两侧同步改版本号(v1 → v2)。
+
+### 5.1 行为补遗(2026-08-08 两侧对账后补;仍是 v1)
+
+采集侧副本(`docs/incremental_export_contract.md`)在实现期确认了三条原文
+未定义的行为。三条都是**填补空白、不改已定行为**(按 v1 写的消费者不会失效),
+故不升版本号,但必须写进本文档——两份副本内容漂移正是"各存一份"要防的事。
+
+1. **`409 cursor_below_retention`(原文没有的状态码,最要紧的一条)**:
+   要的下一条已被采集侧保留期裁掉。消费侧动作 = **告警 + 停止推进游标 +
+   转全量对账**,绝不当普通错误重试。
+   完整状态码表:200(含空结果,`records: []` + `next_cursor` 原样不推进)/
+   401 `invalid_export_token`(修 token,不重试)/ 409(硬停)/
+   422 `invalid_parameter`(修请求,不重试)/ 503(退避重试 + 告警)。
+2. **`fast.stock_state` 是三值封闭集**:`in_stock` / `out_of_stock` / `unknown`。
+   **`fast.stock_count` / `fast.delivery_days`**(采集侧 2026-08-09 纯追加,
+   `contract_version` 仍是 1;存量事件也带,不需回填重采):均 int 或 null,
+   **`null` 与 `0` 不是一回事**——`null` = 本次没采到,`0` = 采到了确实是 0
+   (`stock_count=0` 即缺货)。与 `price` 同一条原则:**下游一律不得 `or 0` 兜底**。
+   本侧落地:snapshots 两列同名存放;provider 只搬运真值;
+   list_new 三态判断(真值走 <5 闸 / null+in_stock 按 `AMZ_IN_STOCK_QTY` 铺货
+   并在摘要亮出行数 / 其余不上架);配送 null **不当超时**(方向反了会误清零)。
+3. **`slow_hash` 是不透明值**:采集侧算法(NFKC + 空白折叠 + 哨兵归一 +
+   列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256 取前 16 位)
+   与本文档第五节的文字描述不是同一套。**消费侧不得按收到的 `slow` 自行重算
+   比对——两边必然不等**;它保证的只是"慢变字段真变了才变"。
+
+**另有两条实现语义,消费侧必须遵守**:
+
+- **`null` / `[]` 一律表示"本次采集没取到",不表示"该商品没有这个属性"**
+  (软降级页会整块剥掉面包屑/详情表)。**绝不能拿空值覆盖已有值**;
+  用扩展字段 `outcome`(`ok`/`not_found`/`blocked`/`parse_failed`/`stale`)与
+  `completeness_ok` 判断这条够不够格进 products——本侧定稿:
+  **`outcome != "ok"` 只进 snapshots,绝不 upsert products**。
+- **`404` 且响应体含「批次不存在」= 请求打歪或采集侧路由退化,不是没有数据**
+  (`/api/export/incremental` 落在采集侧 `GET /api/export/{batch_name}`
+  catch-all 的前缀里)。按 5xx 处理并告警,**绝不推进游标**。
+
+采集侧还提供契约外的扩展字段(收着无害):`outcome`、`completeness_ok`、
+`review_hash`、`recorded_at`,以及 `scrape_params` 里的 `zip_observed` /
+`zip_verify` / `source_marketplace` / `parse_engine`。其中 `zip_verify ==
+"mismatch"` 的记录不应进入该邮编的价格序列。
 
 ## 六、验收标准
 

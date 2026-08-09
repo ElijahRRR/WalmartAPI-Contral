@@ -50,6 +50,7 @@ MAX_INTENTS_PER_KIND = 5000
 # 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
 DELETE_PER_STORE = 300          # 限额表「下架限制」缺该店时的退路(会告警)
+LONG_OOS_DAYS = 15              # 连续这么多天没有库存 → 删除(所有者定稿)
 
 _SQL_ZERO = """
 SELECT store, sku, avail_qty FROM catalog.walmart_items
@@ -122,6 +123,52 @@ WHERE w.missing_since IS NULL
         WHERE sn.asin = vo.asin
           AND COALESCE(sn.outcome, 'ok') = 'ok'
           AND sn.scraped_at > vo.last_seen)
+ORDER BY w.store, w.sku
+"""
+
+
+# 连续 N 天没有库存 → 删除(所有者定稿 2026-08-09)。
+# 三道判据,缺一个都会误删:
+#   1. 窗口内**没有任何一条"有货"观测**(stock_count>0 或 stock_state='in_stock')
+#   2. **至少有一条明确的缺货观测**——防"这 15 天页面一直采不全、全是 unknown"
+#      被读成"一直缺货"(采不到 ≠ 没货,这是删除,不是清零,不能含糊)
+#   3. 窗口**两端都有观测**(最早一条在窗口起点 36 小时内、最新一条在近 3 天内)
+#      ——防"15 天前采过一次、昨天采过一次,中间断 13 天"被当成连续观测
+# 只看 outcome=ok 的观测(降级采集的 fast 段基本是空的,拿它判缺货是冤案)。
+_SQL_LONG_OOS = """
+WITH win AS (
+    SELECT asin,
+           min(scraped_at) AS first_seen,
+           max(scraped_at) AS last_seen,
+           count(*) AS obs,
+           count(*) FILTER (WHERE stock_count > 0
+                               OR stock_state = 'in_stock') AS in_stock_obs,
+           count(*) FILTER (WHERE stock_state = 'out_of_stock'
+                               OR stock_count = 0) AS oos_obs
+    FROM catalog.snapshots
+    WHERE scraped_at > now() - make_interval(days => %(days)s)
+      AND COALESCE(outcome, 'ok') = 'ok'
+    GROUP BY asin
+    HAVING count(*) FILTER (WHERE stock_count > 0
+                               OR stock_state = 'in_stock') = 0
+       AND count(*) FILTER (WHERE stock_state = 'out_of_stock'
+                               OR stock_count = 0) > 0
+       AND min(scraped_at) <= now() - make_interval(days => %(days)s)
+                            + interval '36 hours'
+       AND max(scraped_at) >= now() - interval '3 days'
+), latest_status AS (
+    SELECT DISTINCT ON (store) store, store_status
+    FROM ops.store_kpi_daily ORDER BY store, data_date DESC
+)
+SELECT w.store, w.sku, win.obs, win.first_seen, win.last_seen
+FROM win
+JOIN catalog.walmart_items w ON w.sku = win.asin
+JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+LEFT JOIN latest_status s ON s.store = w.store
+WHERE w.missing_since IS NULL
+  AND w.published_status = 'PUBLISHED'
+  AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
 ORDER BY w.store, w.sku
 """
 
@@ -270,10 +317,11 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
 
 def delete_intents(conn, stockzero_stores: list[str] | None = None,
                    caps: dict[str, int] | None = None,
-                   min_batches: int = MIN_OFFSET_BATCHES) -> list[dict]:
-    """输入:连接(+单店上限表/批次数门槛)→ 输出:删除意图(kind='delete')。
+                   min_batches: int = MIN_OFFSET_BATCHES,
+                   oos_days: int = LONG_OOS_DAYS) -> list[dict]:
+    """输入:连接(+单店上限表/批次数门槛/无货天数)→ 输出:删除意图(kind='delete')。
 
-    两个原因(所有者定稿 2026-08-09),都是"这个产品在亚马逊侧已经没法维护了":
+    三个原因(所有者定稿 2026-08-09),都是"这个产品已经不值得留在架上了":
 
     variant_offset —— 亚马逊把 /dp/<ASIN> 返回成兄弟变体页面,parser 比对
       页面 ASIN 不一致后**拒绝写入**,采集侧列为**不自动重试** ⇒ 价格/库存
@@ -284,6 +332,10 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     商品不存在 —— amz 标题是占位符(TITLE_PLACEHOLDERS)。旧系统在这里只是
       跳过标题维护,所有者 2026-08-09 改为**删除该产品**:亚马逊页面都没了,
       留在沃尔玛就是个卖不出去的死链。
+
+    连续无货 N 天 —— 窗口内一条"有货"观测都没有(判据三条见 _SQL_LONG_OOS)。
+      库存 provider 早就把它清零了,清零后还这么久不回货 = 这个货源没了。
+      ⚠ 采集接线于 2026-08-08,历史攒够 15 天之前这条恒返空,不是坏了。
 
     单店单轮上限取限额表「下架限制」(caps,与 product_clear 同一列同一口径),
     店铺不在表内退 DELETE_PER_STORE 并告警。
@@ -315,6 +367,17 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
         if str(title or "").strip() in TITLE_PLACEHOLDERS and title:
             _take(store, sku, "商品不存在")
+
+    with conn.cursor() as cur:
+        cur.execute(_SQL_LONG_OOS, {"days": int(oos_days)})
+        rows = cur.fetchall()
+    for store, sku, obs, first_seen, last_seen in rows:
+        _take(store, sku, f"连续无货{oos_days}天",
+              {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+    if not rows:
+        # 采集历史不足窗口长度时这条恒空——说出来,免得被读成"没有长期缺货的"
+        logger.info("连续无货 %d 天:本轮 0 个候选(采集历史不足 %d 天时属正常)",
+                    oos_days, oos_days)
 
     over = {s: n - int(caps.get(s, DELETE_PER_STORE))
             for s, n in per_store.items()

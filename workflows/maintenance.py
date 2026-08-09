@@ -5,18 +5,21 @@
   python cli.py maintenance --execute            # 真跑(提交 + 写维护记录表)
   python cli.py maintenance -p store=A085朱丽霖
   python cli.py maintenance -p only=inventory    # 只跑某一类(delete/title/price/inventory)
-  python cli.py maintenance -p only=delete       # 只处理采集永久偏移的删除
+  python cli.py maintenance -p only=delete       # 只处理删除类
+  python cli.py maintenance -p oos_days=30       # 连续无货多少天算该删(默认 15)
 
 架构(2026-08-07 所有者定稿,对比旧三段式 sync_lark/submit/poll_yesterday):
   单一 workflow——数据源已在 PG(sync 消失),结果轮询走全局 feed_poll +
   维护记录反哺器(poll_yesterday 消失)。
 
 意图来源(services/maintenance_intents,可插拔 provider;2026-08-09 全部做实):
-  删除   两个原因(所有者定稿 2026-08-09),都是"亚马逊侧已经没法维护了":
+  删除   三个原因(所有者定稿 2026-08-09),都是"这产品不值得留在架上了":
          · **variant_offset**:采集永久偏移(亚马逊把 /dp/<ASIN> 返回成兄弟
            变体页面,parser 拒绝写入,采集侧列为不自动重试)⇒ 价格/库存永远
            拿不到新数据,留着只会被前三个 provider 拿陈旧快照一轮轮跟;
-         · **商品不存在**:amz 标题是占位符(旧系统只跳过标题维护,现改为删)。
+         · **商品不存在**:amz 标题是占位符(旧系统只跳过标题维护,现改为删);
+         · **连续无货 15 天**(-p oos_days=N 可调):清零后这么久不回货 =
+           货源没了。⚠ 采集接线于 2026-08-08,历史攒够之前这条恒空。
          DELETE_ITEM 不可逆:dry-run 单独列名单与原因分布;单店单轮上限取
          限额表「下架限制」(与 product_clear 同一列,缺则退 300 并告警);
          **删除名单从其余三类里剔除**(将死的行不值得再烧一轮配额)。
@@ -46,7 +49,7 @@
 维护事件不进 catalog.product_events(所有者定稿 2026-08-07):流水在
 ops.feed_log/feed_items,现状在 catalog.walmart_items,状态后果由
 catalog_sync 观测入账。**唯一例外是删除**——生死类事件恒记
-(delete_submitted,source=maintenance,detail.reason=variant_offset)。
+(delete_submitted,source=maintenance,detail.reason 记删除原因)。
 
 ⚠ 切换纪律:上调度前必须停旧 12:00 walmart-maintenance-all-stores(AI 调度
 任务,非 cron);停旧前先收干净旧系统在途 feed(见 legacy_survey 切换清单)。
@@ -64,7 +67,7 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.maintenance")
 
-_KIND_LABEL = {"delete": "删除(variant_offset)", "title": "标题",
+_KIND_LABEL = {"delete": "删除", "title": "标题",
                "price": "价格", "inventory": "库存"}
 # 单店内串行顺序(旧系统纪律);**删除排最前**:同一 SKU 既要删又要改价时,
 # 先删掉就不必再为它烧改价/改库存的 feed 配额(collect_intents 已把删除名单
@@ -140,14 +143,16 @@ def _load_delete_caps() -> dict[str, int]:
     return caps
 
 
-def collect_intents(conn, stockzero: list[str]) -> list[dict]:
+def collect_intents(conn, stockzero: list[str],
+                    oos_days: int = 0) -> list[dict]:
     """输入:连接 + stockzero 名单 → 输出:全部维护意图(各 provider 汇总)。
 
     stockzero 店整店排除在三个自动 provider 之外——它们归 zero_intents,
     否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
     """
     mults = _load_multipliers()
-    deletes = mi.delete_intents(conn, stockzero, _load_delete_caps())
+    deletes = mi.delete_intents(conn, stockzero, _load_delete_caps(),
+                                oos_days=oos_days or mi.LONG_OOS_DAYS)
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)
     for it in (mi.title_intents(conn, stockzero)
@@ -253,7 +258,8 @@ def run(params: dict) -> str:
 
     stockzero = _load_stockzero()
     with db.pg_conn() as conn:
-        intents = collect_intents(conn, stockzero)
+        intents = collect_intents(conn, stockzero,
+                                  int(params.get("oos_days", 0) or 0))
     if params.get("store"):
         intents = [i for i in intents if i["store"] == params["store"]]
     if only:

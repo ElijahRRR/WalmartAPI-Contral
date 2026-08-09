@@ -191,6 +191,39 @@ def test_delete_intents_also_take_title_placeholder(monkeypatch):
     assert [i["label"] for i in out if i["sku"] == "B0GONE"] == ["删除(商品不存在)"]
 
 
+def test_long_oos_delete_sql_guards():
+    """连续无货 N 天 → 删除。三道判据缺一个都会误删(所有者定稿 2026-08-09)。"""
+    q = mi._SQL_LONG_OOS
+    # 1. 窗口内一条"有货"观测都没有
+    assert "stock_count > 0" in q and "stock_state = 'in_stock'" in q
+    # 2. 至少一条明确缺货观测——防"15 天全是 unknown(采不全)"被当成缺货
+    assert "stock_state = 'out_of_stock'" in q
+    # 3. 窗口两端都有观测——防"两头各采一次、中间断 13 天"被当连续
+    assert "interval '36 hours'" in q and "max(scraped_at) >= now()" in q
+    # 降级采集的 fast 段基本是空的,拿它判缺货是冤案
+    assert "COALESCE(outcome, 'ok') = 'ok'" in q
+    # 破坏动作守路由铁律 + 在架 + 店铺 ACTIVE
+    assert "ls.source_type = 'amz'" in q
+    assert "published_status = 'PUBLISHED'" in q
+    assert "upper(s.store_status) = 'ACTIVE'" in q
+    assert mi.LONG_OOS_DAYS == 15
+
+
+def test_long_oos_intents_carry_reason(monkeypatch):
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
+
+    class _TwoQueries(_Conn):
+        """第一条 SQL(偏移)无结果,第二条(连续无货)返回一行。"""
+
+        def fetchall(self):
+            return [] if "variant_offset" in self._last else [
+                ("T1", "B0DEAD", 15, None, None)]
+
+    out = mi.delete_intents(_TwoQueries(), oos_days=15)
+    assert [(i["sku"], i["reason"], i["label"]) for i in out] == [
+        ("B0DEAD", "连续无货15天", "删除(连续无货15天)")]
+
+
 def test_build_title_item_shape():
     item = mi.build_title_item("SKU1", "Furniture", "012345678905", "新标题")
     assert item["Orderable"]["productIdentifiers"]["productIdType"] == "UPC"
@@ -214,7 +247,8 @@ def test_load_stockzero_survives_integer_zero(monkeypatch):
 def _wire(monkeypatch, intents, stores=(STORE,)):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": []}
     monkeypatch.setattr(mw, "_load_stockzero", lambda: ["T1"])
-    monkeypatch.setattr(mw, "collect_intents", lambda conn, sz: list(intents))
+    monkeypatch.setattr(mw, "collect_intents",
+                        lambda conn, sz, oos=0: list(intents))
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
@@ -290,8 +324,10 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
 def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
     """删除走 DELETE_ITEM;只有 submitted 落病历(dedup 记了是幽灵事件)。"""
     intents = [{"store": "T1", "sku": s, "kind": "delete", "old": "在线",
-                "new": "删除", "batches": 1, "first_seen": None,
-                "last_seen": None} for s in ("B0A", "B0B", "B0C")]
+                "new": "删除", "reason": "variant_offset",
+                "label": "删除(variant_offset)", "batches": 1,
+                "first_seen": None, "last_seen": None}
+               for s in ("B0A", "B0B", "B0C")]
     calls = _wire(monkeypatch, intents)
     events = []
     monkeypatch.setattr(mw, "_record_deletes",
@@ -303,7 +339,7 @@ def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
                             {"feed_id": "OLD", "count": 1, "outcome": "dedup"}])
     out = mw.run({"execute": True})
     assert events == [("T1", ["B0A", "B0B"], "F1")]
-    assert "删除(variant_offset) feed 提交 2" in out
+    assert "删除 feed 提交 2" in out
     # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
     assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
     assert all(r[2] == "删除(variant_offset)" and r[7] == "处理中"
@@ -322,7 +358,7 @@ def test_dry_run_lists_delete_names_separately(monkeypatch):
 def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
     conn = _Conn()
-    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps: [
+    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps, oos_days=0: [
         {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
          "new": "删除", "reason": "variant_offset"}])
     monkeypatch.setattr(mw, "_load_delete_caps", lambda: {})

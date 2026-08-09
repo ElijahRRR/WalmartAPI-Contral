@@ -29,6 +29,23 @@ _FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
                "inventory": "改库存"}
 
 
+def error_text(errs: list[dict]) -> str:
+    """输入:ingestionError 列表 → 输出:人话描述串(带字段名,多条以 ; 连接)。
+
+    只存数字错误码无法诊断(2026-08-09 上架首跑教训:EXT_DATA_ERROR_507165…
+    这种码本身不含任何信息),description/field 才是能修的线索。
+    """
+    parts = []
+    for e in errs or []:
+        desc = str(e.get("description") or e.get("message") or "").strip()
+        field = str(e.get("field") or "").strip()
+        if field and desc:
+            parts.append(f"[{field}] {desc}")
+        elif desc or field:
+            parts.append(desc or f"[{field}]")
+    return "; ".join(parts)[:900]
+
+
 def _progress(head: dict) -> str:
     """输入:feed 汇总 → 输出:进度串(feed 级 GET 自带计数,零明细翻页)。"""
     recv = head.get("itemsReceived") or 0
@@ -52,14 +69,14 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         return head, None
 
     results: dict[str, tuple[str, str]] = {}
+    descs: dict[str, str] = {}
     for item in feeds.iter_feed_items(store, feed_id):
         sku = str(item.get("sku") or "")
         if not sku:
             continue
-        code = ""
         errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
-        if errs:
-            code = str(errs[0].get("code") or errs[0].get("type") or "")
+        code = str(errs[0].get("code") or errs[0].get("type") or "") if errs else ""
+        descs[sku] = error_text(errs)
         results[sku] = (feeds.sku_outcome(item.get("ingestionStatus")), code)
 
     _STATUS = {"success": "success", "failed": "failed",
@@ -74,8 +91,9 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         meta = {sku: (wf, ft, st) for sku, wf, ft, st in cur.fetchall()}
         cur.executemany(
             "UPDATE ops.feed_items SET status = %s, error_code = %s, "
-            "resolved_at = now() WHERE feed_id = %s AND sku = %s",
-            [(_STATUS[o], code or None, feed_id, sku)
+            "error_desc = %s, resolved_at = now() "
+            "WHERE feed_id = %s AND sku = %s",
+            [(_STATUS[o], code or None, descs.get(sku) or None, feed_id, sku)
              for sku, (o, code) in results.items()])
         # 台账里有、终态明细里查无 → missing(不装成功也不装失败)
         cur.execute(
@@ -167,3 +185,11 @@ def item_results(feed_id: str) -> dict[str, tuple[str, str]]:
         cur.execute("SELECT sku, status, error_code FROM ops.feed_items "
                     "WHERE feed_id = %s", (feed_id,))
         return {sku: (status, code or "") for sku, status, code in cur.fetchall()}
+
+
+def item_errors(feed_id: str) -> dict[str, str]:
+    """输入:feed_id → 输出:{sku: 人话报错描述}(空描述的 SKU 不出现)。"""
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT sku, error_desc FROM ops.feed_items "
+                    "WHERE feed_id = %s AND error_desc IS NOT NULL", (feed_id,))
+        return {sku: desc for sku, desc in cur.fetchall()}

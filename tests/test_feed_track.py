@@ -64,8 +64,8 @@ def test_poll_feed_terminal_writes_ledger(monkeypatch):
     assert "SELECT sku, workflow, feed_type, status" in sel_sql  # 先取更新前状态
     many_sql, rows = conn.sqls[1]
     assert "UPDATE ops.feed_items" in many_sql
-    assert ("success", None, "F1", "A") in rows
-    assert ("failed", "ERR_9", "F1", "B") in rows
+    assert ("success", None, None, "F1", "A") in rows
+    assert ("failed", "ERR_9", None, "F1", "B") in rows
     miss_sql, args = conn.sqls[2]
     assert "'missing'" in miss_sql and args[1] == ["A", "B"]   # 查无的标 missing
     assert done == [("F1", True)]
@@ -116,7 +116,7 @@ def test_poll_feed_maintenance_receipt_not_in_ledger_for_non_relist(monkeypatch)
     feed_track.poll_feed(STORE, "F1")
     assert [e["sku"] for e in recorded] == ["B"]        # 只有反补来源入账
     many_sql, rows = conn.sqls[1]
-    assert ("success", None, "F1", "A") in rows          # 台账不受白名单影响
+    assert ("success", None, None, "F1", "A") in rows          # 台账不受白名单影响
 
 
 def test_poll_feed_repoll_does_not_duplicate_events(monkeypatch):

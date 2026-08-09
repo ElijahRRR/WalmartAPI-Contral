@@ -43,6 +43,7 @@ def test_listing_reflector_writes_opq(monkeypatch):
     ledger = {"F1": {rows[0]["asin"]: ("success", ""),
                      rows[1]["asin"]: ("success", "")}}
     monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
     out = listing_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
     assert w["O2:Q2"][0] == "SUCCESS"
@@ -84,3 +85,31 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     assert "去重 1" in out and "防呆 1" in out and "PT无spec 1" in out
     assert "待数据源 1" in out
     assert fetched["asins"] == [rows[0]["asin"]]   # 只有过全闸的行才拉数据
+
+
+def test_error_desc_joined_into_p_column(monkeypatch):
+    """P 列写「码 | 人话」——数字错误码本身不含任何可修的信息。"""
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns))
+    rows = [_sheet_row(2, feed_id="F9", listed="Yes", list_result="处理中")]
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {rows[0]["asin"]: ("failed", "EXT_DATA_ERROR_1")})
+    monkeypatch.setattr(feed_track, "item_errors",
+                        lambda fid: {rows[0]["asin"]: "[price] must be > 0"})
+    listing_sheet.sync_from_ledger()
+    o, p, _ = writes[0][1][0]
+    assert o == "FAILED"
+    assert p == "EXT_DATA_ERROR_1 | [price] must be > 0"
+
+
+def test_feed_track_error_text_shape():
+    from services.feed_track import error_text
+    assert error_text([{"field": "price", "description": "bad"}]) == "[price] bad"
+    assert error_text([{"description": "x"}, {"description": "y"}]) == "x; y"
+    assert error_text([{"code": "C1"}]) == ""       # 没描述就是空,不塞码
+    assert error_text([]) == ""

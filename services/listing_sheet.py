@@ -112,14 +112,20 @@ def sync_from_ledger() -> str | None:
         return None
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     updates, cache = [], {}
+    descs: dict[str, dict[str, str]] = {}
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
             cache[fid] = feed_track.item_results(fid)
+            descs[fid] = feed_track.item_errors(fid)
         st = cache[fid].get(r["asin"])      # 上架 sku=asin 约定
         if st is None or st[0] == "submitted":
             continue
         o, p = classify_receipt(st[0], st[1])
+        # P 列写「码 + 人话」:光有 EXT_DATA_ERROR_507165… 这种数字码没法修
+        desc = descs.get(fid, {}).get(r["asin"])
+        if p and desc:
+            p = f"{p} | {desc}"[:900]
         if o in ("处理中",) or (o == r["list_result"] and o != "ASYNC_PENDING"):
             continue
         updates.append((f"O{r['rownum']}:Q{r['rownum']}", [[o, p, today]]))

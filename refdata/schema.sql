@@ -489,10 +489,13 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     feed_type   text NOT NULL,
     status      text NOT NULL,     -- submitted / success / failed / missing(明细里查无此 SKU)
     error_code  text,
+    error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
+                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
     submitted_at timestamptz NOT NULL DEFAULT now(),
     resolved_at  timestamptz,
     PRIMARY KEY (feed_id, sku)
 );
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
 CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
 CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
 

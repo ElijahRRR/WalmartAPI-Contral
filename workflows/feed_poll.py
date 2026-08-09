@@ -2,6 +2,8 @@
 
 用法:
   python cli.py feed_poll                 # 轮询 ops.feed_log 全部在途 feed
+  python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
+                                          # (只读,不改台账、不跑反哺器)
 
 职责:扫 feed_log 的 submitted 行 → 查沃尔玛终态 → SKU 级结果落
 ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
@@ -20,6 +22,8 @@ feed 上线时,各自的反哺器在 _REFLECTORS 登记一行即接入。
 
 import logging
 
+from api import feeds
+from registry import db
 from services import clear_sheet, feed_track, listing_sheet, maint_sheet, \
     match_sheet, stores as stores_svc
 
@@ -37,11 +41,48 @@ _REFLECTORS: list[tuple[str, object]] = [
 ]
 
 
+def _explain(store: dict, feed_id: str) -> str:
+    """输入:店铺 + feed_id → 输出:逐 SKU 的完整报错(只读,不改任何状态)。
+
+    诊断口:终态 feed 不会被再轮询,但报错详情随时可查——码是数字、
+    description 才是能修的线索。
+    """
+    lines = [f"feed {feed_id} 明细:"]
+    for item in feeds.iter_feed_items(store, feed_id):
+        sku = str(item.get("sku") or "?")
+        status = item.get("ingestionStatus")
+        errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
+        lines.append(f"  {sku} [{status}]")
+        for e in errs:
+            lines.append(f"    - type={e.get('type')} code={e.get('code')} "
+                         f"field={e.get('field')}")
+            desc = str(e.get("description") or e.get("message") or "").strip()
+            if desc:
+                lines.append(f"      {desc}")
+        if not errs:
+            lines.append("    (无 ingestionErrors)")
+    return "\n".join(lines)
+
+
 def run(params: dict) -> str:
-    """输入:params(可选 store)→ 输出:轮询摘要(含各业务表反哺结果)。"""
+    """输入:params(store / feed_id 诊断)→ 输出:轮询摘要(含反哺结果)。"""
     names = [params["store"]] if params.get("store") else None
     store_list = stores_svc.load_stores(names)
     stores_by_name = {s["name"]: s for s in store_list}
+
+    if params.get("feed_id"):       # 诊断模式:只打印详情,不动台账不跑反哺器
+        feed_id = str(params["feed_id"])
+        store = stores_by_name.get(str(params.get("store") or ""))
+        if store is None:
+            with db.pg_conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT store FROM ops.feed_log WHERE feed_id = %s",
+                            (feed_id,))
+                row = cur.fetchone()
+            if not row or row[0] not in stores_by_name:
+                return (f"feed {feed_id} 不在台账中或店铺未加载:"
+                        f"请补 -p store=<店铺名>")
+            store = stores_by_name[row[0]]
+        return _explain(store, feed_id)
     lines = [feed_track.poll_all(stores_by_name)]
     for label, sync in _REFLECTORS:
         try:

@@ -46,15 +46,16 @@ def test_visible_cert_forces_and_doc_field_cleanup():
 
 
 def test_visible_text_clamps():
+    # 文案是系统的地盘:LLM 写的一律丢弃,改用亚马逊原文(force_amazon_copy)
     out = m.finalize_visible("Cups", {
-        "productName": "N" * 300,
-        "shortDescription": "D" * 5000,
-        "keyFeatures": [f"F{i}" * 300 for i in range(9)],
+        "productName": "LLM 写的会被丢掉",
         "manufacturer": "M" * 100,
-    }, spec=None)
+    }, spec=None, product={
+        "title": "N" * 300, "brand": None,
+        "attrs": {"bullet_points": [f"F{i}" * 300 for i in range(9)],
+                  "description": "D" * 5000}})
     assert len(out["productName"]) == 199
-    assert len(out["shortDescription"]) == 4000
-    assert out["shortDescription"].endswith("...")
+    assert len(out["shortDescription"]) == 4000   # 亚马逊原文硬截,不加省略号
     assert len(out["keyFeatures"]) == 7
     assert all(len(f) <= 500 for f in out["keyFeatures"])
     assert len(out["manufacturer"]) == 60
@@ -74,7 +75,8 @@ def test_images_sorted_and_min_five_secondary():
 
 def test_assemble_mp_item_shape():
     o = m.build_orderable("B0X", "012345678905", 10, 3, "P1")
-    v = m.finalize_visible("Cups", {"productName": "Steel Cup 12oz"}, None)
+    v = m.finalize_visible("Cups", {}, None,
+                           product={"title": "Steel Cup 12oz", "attrs": {}})
     item = m.assemble_mp_item(o, "Cups", v)
     assert set(item.keys()) == {"Orderable", "Visible"}      # 并列顶级,非 MPProduct
     assert item["Visible"]["Cups"]["productName"] == "Steel Cup 12oz"
@@ -82,3 +84,42 @@ def test_assemble_mp_item_shape():
     # "'productName' is not a valid field"——此前照旧实证写的"两处同值"在 v5 spec 下是错的)
     assert "productName" not in item["Orderable"]
     assert item["Orderable"]["ShippingWeight"] > 0            # 必填,总有值
+
+
+def test_force_amazon_copy_from_bullets():
+    """文案强制用亚马逊原文;keyFeatures 从卖点来(minItems 靠它满足)。"""
+    product = {"title": "ACME Steel Cup 12oz", "brand": "ACME",
+               "attrs": {"bullet_points": ["• ACME 不锈钢材质", "保温 6 小时",
+                                           "可洗碗机清洗", "附赠杯盖"],
+                         "description": "ACME 出品的耐用水杯。"}}
+    out = m.finalize_visible("Cups", {"swatchImages": "乱填的",
+                                      "keyFeatures": ["LLM 编的"],
+                                      "color": "Silver"}, None, product=product)
+    assert out["productName"] == "Steel Cup 12oz"        # 品牌名被去掉
+    assert len(out["keyFeatures"]) == 4                  # 来自卖点,不是 LLM 的
+    assert out["keyFeatures"][0] == "不锈钢材质"          # 去品牌 + 去项目符号
+    assert "swatchImages" not in out                     # 系统后处理字段丢弃
+    assert out["color"] == "Silver"                      # 结构化字段留给 LLM
+    assert out["brand"] == "Unbranded"
+
+
+def test_force_copy_pads_key_features_from_sentences():
+    """卖点不足 4 条:从描述拆句补齐(EXT_DATA_ERROR_55506974520167)。
+
+    句子门槛 25 字符是按英文亚马逊文案调的(真实数据形态)。
+    """
+    product = {"title": "Garden Seeder Bulb Transplanter Tool", "brand": None,
+               "attrs": {"bullet_points": ["Manual seed dispenser"],
+                         "description": (
+                             "Precisely sows beans peanuts and other seeds. "
+                             "Stainless steel body resists rust and bending. "
+                             "Ninety-one centimeters long so no bending over.")}}
+    out = m.finalize_visible("Tools", {}, None, product=product)
+    assert len(out["keyFeatures"]) >= 4
+
+
+def test_system_owned_fields_in_prompt():
+    msgs = m.build_llm_messages("Cups", {"properties": {}}, {"title": "x"})
+    sys_prompt = msgs[0]["content"]
+    assert "swatchImages" in sys_prompt and "keyFeatures" in sys_prompt
+    assert "type=array" in sys_prompt          # 数组必须给数组

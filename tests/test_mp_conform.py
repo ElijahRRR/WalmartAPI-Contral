@@ -89,7 +89,11 @@ def test_conditional_required_fixpoint():
 def test_fill_missing_required_and_validate():
     v, _ = mc.fill_missing_required(_SPEC, {"productName": "T"})
     assert v["color"] == "Not Available"
+    # 自由文本数组不拿占位灌够 minItems:validate 要如实报出来
     assert v["keyFeatures"] == ["Not Available"]
+    assert mc.validate(_SPEC, _OSPEC, v, {"sku": "S1", "price": 9.9}) == [
+        "visible.keyFeatures(需≥3条,现1条)"]
+    v["keyFeatures"] = ["a", "b", "c"]
     assert mc.validate(_SPEC, _OSPEC, v, {"sku": "S1", "price": 9.9}) == []
     # 缺 orderable 必填 → 报出来
     assert mc.validate(_SPEC, _OSPEC, v, {"sku": "S1"}) == ["orderable.price"]
@@ -127,6 +131,8 @@ def test_round_decimals():
 def test_conform_pipeline_end_to_end():
     """整条流水线:LLM 原始输出 → 可提交载荷。"""
     llm_out = {"productName": "Bar Stool", "pattern": "Solid",
+               # keyFeatures 由 force_amazon_copy 从亚马逊卖点填(minItems=3)
+               "keyFeatures": ["轻便", "稳固", "易安装"],
                "assembledProductWeight": 5.5, "condition": "Refurbished",
                "bogus": "x"}
     orderable = {"sku": "S1", "price": 61.47, "productName": "Bar Stool"}

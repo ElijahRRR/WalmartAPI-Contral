@@ -243,9 +243,22 @@ def fill_missing_required(spec: dict, visible: dict) -> tuple[dict, list[str]]:
         default = safe_default_for(prop)
         if default is None:
             default = _type_fallback(_type_of(prop))
-        if default is not None:
-            visible[name] = default
-            notes.append(f"{name}={default!r}")
+        if default is None:
+            continue
+        # minItems 补齐:只从 enum 取更多值(EXT_DATA_ERROR_55506974520167)。
+        # 自由文本数组不拿占位灌数——凑出来的假卖点毫无意义,
+        # 宁可让 validate 报出来、由人看到"这个产品资料太薄不该上"。
+        mi = prop.get("minItems")
+        if mi and isinstance(default, list) and len(default) < mi:
+            enum = _enum_of(prop)
+            if isinstance(enum, list):
+                for v in enum:
+                    if len(default) >= mi:
+                        break
+                    if v not in default:
+                        default.append(v)
+        visible[name] = default
+        notes.append(f"{name}={default!r}")
     return visible, notes
 
 
@@ -500,15 +513,28 @@ def round_decimals(visible: dict, orderable: dict) -> tuple[dict, dict, list[str
 
 def validate(spec: dict, ospec: dict, visible: dict, orderable: dict
              ) -> list[str]:
-    """输入:两 spec + 两段 → 输出:缺失的必填字段列表(空 = 通过)。"""
-    missing = []
-    for name in sorted(_required(spec)):
-        if visible.get(name) in (None, "", []):
-            missing.append(f"visible.{name}")
-    for name in sorted(_required(ospec)):
-        if orderable.get(name) in (None, "", []):
-            missing.append(f"orderable.{name}")
-    return missing
+    """输入:两 spec + 两段 → 输出:不合格的必填字段列表(空 = 通过)。
+
+    两类:①必填为空 ②**必填数组不足 minItems**——后者是
+    EXT_DATA_ERROR_55506974520167(如 keyFeatures 要 ≥3 条),
+    只查"非空"会让它一路蒙混到沃尔玛才被拒。
+    """
+    bad = []
+
+    def _check(payload: dict, sp: dict, prefix: str):
+        props = _props(sp)
+        for name in sorted(_required(sp)):
+            v = payload.get(name)
+            if v in (None, "", []):
+                bad.append(f"{prefix}.{name}")
+                continue
+            mi = (props.get(name) or {}).get("minItems")
+            if mi and isinstance(v, list) and len(v) < mi:
+                bad.append(f"{prefix}.{name}(需≥{mi}条,现{len(v)}条)")
+
+    _check(visible, spec, "visible")
+    _check(orderable, ospec, "orderable")
+    return bad
 
 
 def conform(spec: dict | None, ospec: dict | None, visible: dict,

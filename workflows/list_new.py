@@ -127,7 +127,8 @@ def _map_visible(conn, pt: str, spec, product: dict) -> dict:
         raw = llm.chat_json(messages)
         llm_cache.put(conn, key, raw)
     return mp_mapper.finalize_visible(pt, raw, spec,
-                                      images=product.get("images"))
+                                      images=product.get("images"),
+                                      product=product)
 
 
 def _spec_precheck(ready: list[dict]) -> str:

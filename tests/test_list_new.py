@@ -44,6 +44,7 @@ def test_listing_reflector_writes_opq(monkeypatch):
                      rows[1]["asin"]: ("success", "")}}
     monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
     monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+    monkeypatch.setattr(feed_track, "item_codes", lambda fid: {})
     out = listing_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
     assert w["O2:Q2"][0] == "SUCCESS"
@@ -101,6 +102,7 @@ def test_error_desc_joined_into_p_column(monkeypatch):
                         lambda fid: {rows[0]["asin"]: ("failed", "EXT_DATA_ERROR_1")})
     monkeypatch.setattr(feed_track, "item_errors",
                         lambda fid: {rows[0]["asin"]: "[price] must be > 0"})
+    monkeypatch.setattr(feed_track, "item_codes", lambda fid: {})
     listing_sheet.sync_from_ledger()
     o, p, _ = writes[0][1][0]
     assert o == "FAILED"
@@ -113,3 +115,26 @@ def test_feed_track_error_text_shape():
     assert error_text([{"description": "x"}, {"description": "y"}]) == "x; y"
     assert error_text([{"code": "C1"}]) == ""       # 没描述就是空,不塞码
     assert error_text([]) == ""
+
+
+def test_upc_conflict_marked_orthogonally(monkeypatch):
+    """ERR_EXT_DATA_0101119:UPC 全站撞库 → 池标冲突永久弃用(与主分类正交)。"""
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns))
+    rows = [_sheet_row(2, feed_id="F1", listed="Yes", list_result="处理中")]
+    asin = rows[0]["asin"]
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(feishu, "sheet_write_ranges", lambda s, ups: len(ups))
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {asin: ("failed", "ERR_EXT_DATA_0101119")})
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {asin: "[QARTH] 已存在"})
+    # 一个 SKU 可能多码并存:必须看全集,不能只看 error_code 里的第一个
+    monkeypatch.setattr(feed_track, "item_codes",
+                        lambda fid: {asin: {"EXT_DATA_ERROR_9", "ERR_EXT_DATA_0101119"}})
+    marked = []
+    monkeypatch.setattr(listing_sheet, "_mark_upc_conflicts",
+                        lambda a: (marked.extend(a), len(a))[1])
+    out = listing_sheet.sync_from_ledger()
+    assert marked == [asin]
+    assert "UPC 撞库 1 个已标冲突" in out

@@ -333,7 +333,22 @@ def fix_type_mismatches(spec: dict, visible: dict) -> tuple[dict, list[str]]:
                 del visible[name]
                 fixes.append(f"{name}: 标量无法转 object,删除")
 
-        elif ftype in ("number", "integer") and isinstance(val, str):
+        elif ftype in ("string", "number", "integer") and isinstance(val, list):
+            # 反向:spec 要标量却给了数组(LLM 过度套用"数组字段包数组"规则)。
+            # EXT_DATA_ERROR_50716566635066 "'Color' … Enter a 'String'"
+            items = [x for x in val if x not in (None, "")]
+            if not items:
+                del visible[name]
+                fixes.append(f"{name}: 空数组删除(spec 要 {ftype})")
+            else:
+                visible[name] = items[0]
+                fixes.append(f"{name}: 数组取首元素 {items[0]!r}(spec 要 {ftype})")
+                if ftype in ("number", "integer") and isinstance(items[0], str):
+                    val = items[0]      # 落到下面的字符串转数字分支
+                else:
+                    continue
+
+        if ftype in ("number", "integer") and isinstance(val, str):
             try:
                 num = float(val.replace(",", "").strip())
                 visible[name] = int(num) if ftype == "integer" else num

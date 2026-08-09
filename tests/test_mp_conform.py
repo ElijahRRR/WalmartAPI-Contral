@@ -150,3 +150,16 @@ def test_conform_pipeline_end_to_end():
 def test_conform_without_spec_reports_missing():
     v, o, notes, missing = mc.conform(None, None, {"a": 1}, {"sku": "S"})
     assert missing == ["spec 缺失,无法校验"] and v == {"a": 1}
+
+
+def test_array_unwrapped_when_spec_wants_scalar():
+    """反向类型错(2026-08-09 三轮实证):'Color' 要 String,LLM 给了数组。"""
+    v, notes = mc.fix_type_mismatches(_SPEC, {"color": ["Silver", "Gray"]})
+    assert v["color"] == "Silver"                 # 取首元素
+    assert any("取首元素" in n for n in notes)
+    # 空数组喂给标量字段 → 删(留给必填兜底重填)
+    v2, _ = mc.fix_type_mismatches(_SPEC, {"color": []})
+    assert "color" not in v2
+    # 数字字段给了字符串数组 → 取首元素后仍转数字
+    v3, _ = mc.fix_type_mismatches(_SPEC, {"count": ["12"]})
+    assert v3["count"] == 12

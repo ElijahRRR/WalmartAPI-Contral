@@ -21,8 +21,8 @@ import logging
 from datetime import datetime
 
 from api import feishu
-from registry import resources
-from services import feed_track, kpi
+from registry import db, resources
+from services import feed_track, kpi, upc_pool
 
 logger = logging.getLogger("services.listing_sheet")
 
@@ -100,6 +100,30 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     return "处理中", ""
 
 
+def _mark_upc_conflicts(asins: list[str]) -> int:
+    """输入:撞库的 ASIN 列表 → 输出:标记数。
+
+    ERR_EXT_DATA_0101119:该 UPC 在沃尔玛全站已被他人占用且详情对不上——
+    **UPC 永久弃用**(旧 upc_pool 实证),重上时领新号。按 sku 反查池中的 UPC。
+    """
+    if not asins:
+        return 0
+    n = 0
+    with db.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT upc, sku FROM catalog.upc_pool "
+                        "WHERE sku = ANY(%s) AND status <> 'conflict'",
+                        (list(set(asins)),))
+            found = cur.fetchall()
+        for upc, sku in found:
+            upc_pool.mark_conflict(conn, upc, sku)
+            n += 1
+    missing = len(set(asins)) - n
+    if missing:
+        logger.warning("UPC 撞库 %d 个在池中找不到对应 UPC(无法标冲突)", missing)
+    return n
+
+
 def sync_from_ledger() -> str | None:
     """feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。"""
     try:
@@ -113,11 +137,14 @@ def sync_from_ledger() -> str | None:
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     updates, cache = [], {}
     descs: dict[str, dict[str, str]] = {}
+    codes: dict[str, dict[str, set]] = {}
+    conflicts: list[tuple[str, str]] = []       # (asin, 全部码) → 正交标 UPC 池
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
             cache[fid] = feed_track.item_results(fid)
             descs[fid] = feed_track.item_errors(fid)
+            codes[fid] = feed_track.item_codes(fid)
         st = cache[fid].get(r["asin"])      # 上架 sku=asin 约定
         if st is None or st[0] == "submitted":
             continue
@@ -128,8 +155,17 @@ def sync_from_ledger() -> str | None:
             p = f"{p} | {desc}"[:900]
         if o in ("处理中",) or (o == r["list_result"] and o != "ASYNC_PENDING"):
             continue
+        # UPC 撞库**正交处置**(旧 reconcile 实证:与主分类独立,多错并存也要标)
+        if resources.WALMART_ERR_UPC_CONFLICT in codes.get(fid, {}).get(
+                r["asin"], set()):
+            conflicts.append(r["asin"])
         updates.append((f"O{r['rownum']}:Q{r['rownum']}", [[o, p, today]]))
+    n_conflict = _mark_upc_conflicts(conflicts)
     if not updates:
-        return f"上架表:在途 {len(pollable)} 行,台账尚无新终态"
+        line = f"上架表:在途 {len(pollable)} 行,台账尚无新终态"
+        return line + (f";UPC 撞库标记 {n_conflict}" if n_conflict else "")
     n = feishu.sheet_write_ranges(resources.LISTING_SHEET, updates)
-    return f"上架表回填 {n} 行(在途 {len(pollable)})"
+    line = f"上架表回填 {n} 行(在途 {len(pollable)})"
+    if n_conflict:
+        line += f";⚠ UPC 撞库 {n_conflict} 个已标冲突(永久弃用,重上会领新号)"
+    return line

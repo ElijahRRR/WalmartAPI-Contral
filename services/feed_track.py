@@ -231,6 +231,22 @@ def merge_error(code: str | None, desc: str | None, limit: int = 900) -> str:
     return (code or desc)[:limit]
 
 
+def item_codes(feed_id: str) -> dict[str, set[str]]:
+    """输入:feed_id → 输出:{sku: 全部错误码集合}(读 ops.feed_item_errors)。
+
+    ops.feed_items.error_code 只留了第一个码;而一个 SKU 可能同时返回
+    合规审核 + UPC 冲突 + 字段校验多个码,**正交处置**(如 UPC 冲突要标池)
+    必须看全集,不能只看第一个。
+    """
+    out: dict[str, set[str]] = {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT sku, code FROM ops.feed_item_errors "
+                    "WHERE feed_id = %s AND code IS NOT NULL", (feed_id,))
+        for sku, code in cur.fetchall():
+            out.setdefault(sku, set()).add(code.strip())
+    return out
+
+
 def item_errors(feed_id: str) -> dict[str, str]:
     """输入:feed_id → 输出:{sku: 人话报错描述}(空描述的 SKU 不出现)。"""
     with db.pg_conn() as conn, conn.cursor() as cur:

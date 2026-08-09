@@ -7,6 +7,7 @@ import pytest
 
 from api import scraper
 from services import amz_source, product_ingest as ingest
+from tests.test_list_new import _sheet_row
 
 
 def _rec(**kw):
@@ -158,16 +159,36 @@ def test_snapshot_params_shape():
     assert json.loads(s["scrape_params"])["zipcode"] == "10001"
 
 
+def test_stock_count_null_and_zero_are_different():
+    """契约 3b:null=没采到,0=确实缺货。两者绝不可互相折叠。"""
+    absent = ingest.snapshot_params(_rec(fast={"price": 1, "stock_state": "unknown"}))
+    assert absent["stock_count"] is None and absent["delivery_days"] is None
+
+    zero = ingest.snapshot_params(_rec(fast={"price": 1, "stock_state": "out_of_stock",
+                                             "stock_count": 0, "delivery_days": 0}))
+    assert zero["stock_count"] == 0 and zero["delivery_days"] == 0
+
+    real = ingest.snapshot_params(_rec(fast={"price": 1, "stock_state": "in_stock",
+                                             "stock_count": 37, "delivery_days": 8}))
+    assert real["stock_count"] == 37 and real["delivery_days"] == 8
+    # 脏值按"没采到"处理,绝不当 0
+    dirty = ingest.snapshot_params(_rec(fast={"stock_count": "N/A"}))
+    assert dirty["stock_count"] is None
+
+
 # ── services/amz_source:读中心库(不直连采集器)──────────────────────────
 
-def test_fetch_products_maps_state_to_qty(monkeypatch):
+def test_fetch_products_carries_true_values(monkeypatch):
+    """provider 只搬运真值:stock/lead_days 的 None 原样透出,不 or 0。"""
     rows = [
+        # asin, title, brand, category, image, price, state, count, days, raw
         ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg", 19.99,
-         "in_stock", {"slow": {"images": ["https://x/2.jpg", "https://x/1.jpg"],
-                               "bullet_points": ["a"]}}),
-        ("B0B", "标题B", None, None, None, 8.0, "out_of_stock", None),
-        ("B0C", "标题C", None, None, None, 8.0, "unknown", None),
-        ("B0D", None, None, None, None, 8.0, "in_stock", None),   # 无标题不够格
+         "in_stock", 37, 8,
+         {"slow": {"images": ["https://x/2.jpg", "https://x/1.jpg"],
+                   "bullet_points": ["a"]}}),
+        ("B0B", "标题B", None, None, None, 8.0, "out_of_stock", 0, None, None),
+        ("B0C", "标题C", None, None, None, 8.0, "in_stock", None, None, None),
+        ("B0D", None, None, None, None, 8.0, "in_stock", 5, 3, None),  # 无标题不够格
     ]
 
     class _C:
@@ -184,10 +205,53 @@ def test_fetch_products_maps_state_to_qty(monkeypatch):
     monkeypatch.setattr(amz_source.db, "pg_conn", lambda: _Conn())
     out = amz_source.fetch_products(["B0A", "B0B", "B0C", "B0D"])
     assert set(out) == {"B0A", "B0B", "B0C"}          # 无标题的被剔除
-    assert out["B0A"]["stock"] == amz_source.IN_STOCK_QTY
+    assert out["B0A"]["stock"] == 37 and out["B0A"]["lead_days"] == 8
     assert out["B0A"]["images"] == ["https://x/1.jpg", "https://x/2.jpg"]  # 字典序
     assert out["B0A"]["attrs"]["bullet_points"] == ["a"]
-    assert out["B0B"]["stock"] == 0                   # 无货 → 主链按库存不足拦
-    assert out["B0C"]["stock"] is None                # 未知 → 同样拦
+    assert out["B0B"]["stock"] == 0                   # 确实缺货,不是 None
+    assert out["B0C"]["stock"] is None                # 没采到,不是 0
+    assert out["B0C"]["stock_state"] == "in_stock"    # 状态给调用方兜底判断
     assert out["B0A"]["price"] == 19.99
     assert amz_source.fetch_products([]) == {}
+
+
+def test_list_new_stock_three_way(monkeypatch):
+    """list_new 的三态处理:真值走闸 / 没采到+有货按常量 / 其余不上架。"""
+    from workflows import list_new as ln
+
+    rows = [_sheet_row(2, asin="B0REAL"), _sheet_row(3, asin="B0LOW"),
+            _sheet_row(4, asin="B0ZERO"), _sheet_row(5, asin="B0NULLOK"),
+            _sheet_row(6, asin="B0NULLUNK"), _sheet_row(7, asin="B0SLOW")]
+    products = {
+        "B0REAL":    {"asin": "B0REAL", "title": "T", "price": 20.0,
+                      "stock": 37, "stock_state": "in_stock", "lead_days": 8},
+        "B0LOW":     {"asin": "B0LOW", "title": "T", "price": 20.0,
+                      "stock": 3, "stock_state": "in_stock", "lead_days": 2},
+        "B0ZERO":    {"asin": "B0ZERO", "title": "T", "price": 20.0,
+                      "stock": 0, "stock_state": "out_of_stock", "lead_days": 2},
+        "B0NULLOK":  {"asin": "B0NULLOK", "title": "T", "price": 20.0,
+                      "stock": None, "stock_state": "in_stock", "lead_days": None},
+        "B0NULLUNK": {"asin": "B0NULLUNK", "title": "T", "price": 20.0,
+                      "stock": None, "stock_state": "unknown", "lead_days": None},
+        "B0SLOW":    {"asin": "B0SLOW", "title": "T", "price": 20.0,
+                      "stock": 50, "stock_state": "in_stock", "lead_days": 30},
+    }
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), set(), {"banned_pts": set(), "brands": set()}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    monkeypatch.setattr(ln.pricing, "walmart_price", lambda ch, price, m: 99.0)
+
+    out = ln.run({"execute": False})
+    # 真值 37 过闸;3 <5 拦;0 拦(确实缺货);None+in_stock 按常量铺货;
+    # None+unknown 拦(不知道有没有货);50 但 30 天 → 上架但库存 0
+    assert "数据过滤 3" in out
+    assert f"库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货 1 行" in out
+    assert "库存不足:3" in out and "库存不足:0" in out
+    assert "库存未知(状态 unknown)" in out
+    assert "库存 0 待提交" in out          # B0SLOW:配送超时,上架但清零
+    assert "共 3 行将进入" in out

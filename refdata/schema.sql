@@ -62,6 +62,13 @@ BEGIN
   END IF;
 END $$;
 
+-- 契约 v1 纯追加(采集侧 2026-08-09;contract_version 仍是 1):fast 段新增
+-- stock_count / delivery_days。⚠ 两列的 NULL 与 0 **不是一回事**:
+-- NULL = 本次没采到;0 = 采到了且确实是 0(stock_count=0 即缺货)。
+-- 下游一律不得 `or 0` 兜底(与 price 同一条原则)。
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS stock_count integer;
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS delivery_days integer;
+
 CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
 
 CREATE OR REPLACE VIEW catalog.latest_snapshot AS

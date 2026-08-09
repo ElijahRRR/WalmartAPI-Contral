@@ -23,11 +23,11 @@ OUTCOME_OK = "ok"
 
 _SNAPSHOT_SQL = """
 INSERT INTO catalog.snapshots (
-    marketplace, asin, scrape_params, price, stock_state, buybox, raw,
-    scraped_at, source_id)
+    marketplace, asin, scrape_params, price, stock_state, stock_count,
+    delivery_days, buybox, raw, scraped_at, source_id)
 VALUES (%(marketplace)s, %(asin)s, %(scrape_params)s::jsonb, %(price)s,
-        %(stock_state)s, %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s,
-        %(source_id)s)
+        %(stock_state)s, %(stock_count)s, %(delivery_days)s,
+        %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s, %(source_id)s)
 ON CONFLICT (source_id) DO NOTHING
 """
 
@@ -79,6 +79,21 @@ def _main_image(slow: dict) -> str | None:
     return str(imgs[0]) if isinstance(imgs, (list, tuple)) else str(imgs)
 
 
+def _opt_int(v):
+    """输入:契约里的 int|null 字段 → 输出:int 或 None。
+
+    ⚠ **None 与 0 是两回事**(契约 3b):None = 本次没采到,0 = 采到了确实是 0。
+    这里绝不把 None 折成 0——折了下游就再也分不出"缺货"和"不知道"。
+    """
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        logger.warning("数值字段无法解析(按未采到处理): %r", v)
+        return None
+
+
 def snapshot_params(rec: dict) -> dict:
     """输入:record → 输出:snapshots 行参数。"""
     fast = rec.get("fast") or {}
@@ -92,6 +107,8 @@ def snapshot_params(rec: dict) -> dict:
                                     sort_keys=True, ensure_ascii=False),
         "price": fast.get("price"),
         "stock_state": _blank_to_none(fast.get("stock_state")),
+        "stock_count": _opt_int(fast.get("stock_count")),
+        "delivery_days": _opt_int(fast.get("delivery_days")),
         "buybox": json.dumps(buybox, ensure_ascii=False) if buybox else None,
         "raw": json.dumps(rec.get("raw"), ensure_ascii=False)
                if rec.get("raw") is not None else None,

@@ -121,6 +121,13 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    401 `invalid_export_token`(修 token,不重试)/ 409(硬停)/
    422 `invalid_parameter`(修请求,不重试)/ 503(退避重试 + 告警)。
 2. **`fast.stock_state` 是三值封闭集**:`in_stock` / `out_of_stock` / `unknown`。
+   **`fast.stock_count` / `fast.delivery_days`**(采集侧 2026-08-09 纯追加,
+   `contract_version` 仍是 1;存量事件也带,不需回填重采):均 int 或 null,
+   **`null` 与 `0` 不是一回事**——`null` = 本次没采到,`0` = 采到了确实是 0
+   (`stock_count=0` 即缺货)。与 `price` 同一条原则:**下游一律不得 `or 0` 兜底**。
+   本侧落地:snapshots 两列同名存放;provider 只搬运真值;
+   list_new 三态判断(真值走 <5 闸 / null+in_stock 按 `AMZ_IN_STOCK_QTY` 铺货
+   并在摘要亮出行数 / 其余不上架);配送 null **不当超时**(方向反了会误清零)。
 3. **`slow_hash` 是不透明值**:采集侧算法(NFKC + 空白折叠 + 哨兵归一 +
    列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256 取前 16 位)
    与本文档第五节的文字描述不是同一套。**消费侧不得按收到的 `slow` 自行重算

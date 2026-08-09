@@ -33,10 +33,10 @@ MARKETPLACE = "US"          # 上架目的地(契约:与 (marketplace,asin) 主�
 # zip_verify == 'mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)。
 _SQL = """
 SELECT p.asin, p.title, p.brand, p.amazon_category, p.image_url,
-       s.price, s.stock_state, s.raw
+       s.price, s.stock_state, s.stock_count, s.delivery_days, s.raw
 FROM catalog.products p
 LEFT JOIN LATERAL (
-    SELECT price, stock_state, raw
+    SELECT price, stock_state, stock_count, delivery_days, raw
     FROM catalog.latest_snapshot ls
     WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
       AND coalesce(ls.scrape_params ->> 'zip_verify', '') <> 'mismatch'
@@ -46,14 +46,10 @@ LEFT JOIN LATERAL (
 WHERE p.marketplace = %s AND p.asin = ANY(%s)
 """
 
-# ⚠ 契约 v1 **没有数值库存**,只有 stock_state 三值封闭集(§5.1)。
-# 旧系统的「库存 <5 淘汰」防的是亚马逊只剩三两件时上架导致超卖——这条信号
-# 在新数据源下**不存在了**。此处不臆造大数字(直接进 feed 的 quantity.amount,
-# 编大了就是超卖事故),而是:有货 → 一个保守固定值,后续由 maintenance 的
-# inventory provider 按最新观测同步;无货/未知 → 不上架。
-# 要恢复旧粒度,需采集侧在契约里补数值库存字段(届时删掉本常量改读真值)。
+# 有货但**数量没采到**时的保守铺货量(亚马逊高库存时不显示具体数)。
+# 只在 stock_count IS NULL 且 stock_state='in_stock' 时才用得上——
+# 采到了真值就用真值,**绝不用它覆盖 stock_count=0**(那是确实缺货)。
 IN_STOCK_QTY = int(os.environ.get("AMZ_IN_STOCK_QTY", "10"))
-_STOCK_BY_STATE = {"in_stock": IN_STOCK_QTY, "out_of_stock": 0}
 
 
 def _images(raw) -> list[str]:
@@ -79,8 +75,9 @@ def _attrs(raw) -> dict:
 def fetch_products(asins: list[str]) -> dict[str, dict]:
     """输入:ASIN 列表 → 输出:{asin: 产品数据契约 dict}(缺席的不出现)。
 
-    lead_days / channel 采集侧当前不产出(契约无此字段):留 None,
-    主链按"未知"处理(不触发 >12 天清零规则);采集侧补齐后在此接上即可。
+    ⚠ **stock / lead_days 的 None 与 0 是两回事**(契约 3b):None = 本次没采到,
+    0 = 采到了确实是 0。本函数**只搬运真值,不做 or 0 兜底**;"数量未知怎么办"
+    是业务判断,归调用方(list_new)——见 stock_state 字段。
     """
     if not asins:
         return {}
@@ -90,15 +87,17 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for (asin, title, brand, category, image_url, price, stock_state,
-         raw) in rows:
+         stock_count, delivery_days, raw) in rows:
         if not title:           # 身份层还没拿到标题 = 这条不够格喂上架链
             continue
         images = _images(raw) or ([image_url] if image_url else [])
         out[asin] = {
             "asin": asin, "title": title, "brand": brand, "category": category,
             "price": float(price) if price is not None else None,
-            "stock": _STOCK_BY_STATE.get(str(stock_state or ""), None),
-            "lead_days": None, "channel": None,
+            "stock": stock_count,               # int | None(None ≠ 0)
+            "stock_state": str(stock_state) if stock_state else None,
+            "lead_days": delivery_days,         # int | None(None ≠ 0)
+            "channel": None,
             "images": images, "attrs": _attrs(raw),
         }
     absent = [a for a in asins if a not in out]

@@ -8,15 +8,20 @@
   python cli.py order_audit -p recheck=1       # 连终局结论的行一起重审(钓鱼行除外)
   python cli.py order_audit -p scrape=0        # 不推采集(只对账 + 判定)
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
-  python cli.py order_audit -p wait=1          # 等这批采完 + 就地摄取 + 重判
+  python cli.py order_audit -p wait=0          # 不等采集(推完就回写,结论滞后一轮)
   python cli.py order_audit -p refill_shots=1  # 为台账无批次记录的行重采一次(只为补图)
 
-`-p wait=1`(所有者定稿 2026-08-10)——**一条命令出真结论**:
+**轮询默认开**(所有者定稿 2026-08-10)——一条命令出真结论:
 推采集 → 轮询批次到落定(20 分钟兜底)→ 就地跑增量摄取 → 重新对账重判 →
-回写飞书。默认关:调度里每小时跑一轮,结论滞后一轮无所谓,而阻塞 20 分钟
-的一次运行会把那一小时的位置占掉。手动排查、以及想立刻看到结论时开。
+回写飞书。默认开是因为**忘了加开关就只能看到上一轮的结论,而且不报错**;
+这种"忘了就静默降级"的默认值不该留着。
+代价:一次运行可能阻塞到 20 分钟。挂调度后若不想让它占住那一小时的位置,
+在 plist 里显式写 `-p wait=0`(参数本来就要逐条写,不会漏)。
+注意 cli.py 有 flock:阻塞期间再手动跑一次会直接退出(退出码 3),不排队。
 就地摄取**借 product_ingest 的 flock**——游标独占推进,两个进程同推会静默
 丢掉中间一段(详见 services/runlock 与 services/product_ingest.pump)。
+⚠ `product_ingest` **仍要单独挂调度**:就地摄取只覆盖本工作流推的那批,
+product_refresh 那条链(维护/上架用的快照)还是靠它摄。
 
 设计(PG 权威,飞书是人机界面):
 - 判定与推送**两段解耦**:判定只挑"这轮该判的行",推送则把窗口内**所有已判定行**
@@ -1062,7 +1067,10 @@ def run(params: dict) -> str:
     recheck = _yes(params.get("recheck", ""))
     do_push = str(params.get("push", "1")).lower() not in {"0", "false", "no"}
     do_scrape = str(params.get("scrape", "1")).lower() not in {"0", "false", "no"}
-    do_wait = _yes(params.get("wait", ""))
+    # **默认开**(所有者定稿 2026-08-10):手工跑时忘了加 -p wait=1 就只能看到
+    # 上一轮的结论,而且不报错——"忘了就静默降级"的默认值不该留着。
+    # 挂调度那天在 plist 里显式写 -p wait=0 是很自然的一步(参数本来就要逐条写)。
+    do_wait = str(params.get("wait", "1")).lower() not in {"0", "false", "no"}
     refill_shots = _yes(params.get("refill_shots", ""))
 
     blacklist, suppliers = _load_config()

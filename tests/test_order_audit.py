@@ -502,6 +502,23 @@ def wired(monkeypatch):
                 "per_asin_zip_count": len(items), "invalid_zip_rows": 0}
     monkeypatch.setattr(wf.scraper, "submit_json", fake_submit)
 
+    # 轮询默认开(2026-08-10 起),但 run() 的用例关心的是判定与推送,不是等待。
+    # 这里把等待与就地摄取打成空转:不打的话每个 run() 用例都要去连采集器,
+    # 还要真 sleep —— 一次改默认值让整套用例慢了 10 秒就是这么来的。
+    # 专门测等待/摄取的用例在下面直接调 _wait_for_batches / _ingest_now。
+    calls["waited"] = []
+    calls["ingested"] = 0
+
+    def fake_wait(names, timeout_min):
+        calls["waited"].append(list(names))
+        return f"等采集:{len(names)} 批全部落定(假)", 0
+    monkeypatch.setattr(wf, "_wait_for_batches", fake_wait)
+
+    def fake_ingest():
+        calls["ingested"] += 1
+        return "就地增量摄取:(假)"
+    monkeypatch.setattr(wf, "_ingest_now", fake_ingest)
+
     # 批次台账走 services.scrape_batches(自己开连接),测试里不落库
     monkeypatch.setattr(wf.batches, "record",
                         lambda *a, **k: calls.setdefault("recorded", []).append(a))
@@ -1185,14 +1202,14 @@ def test_wait_with_no_batches_is_a_noop(nosleep):
     assert nosleep._wait_for_batches([], 20) == ("", 0)
 
 
-def test_ingest_now_skips_when_product_ingest_holds_the_lock(wired, monkeypatch):
+def test_ingest_now_skips_when_product_ingest_holds_the_lock(monkeypatch):
     """拿不到 product_ingest 的锁 = 它正在跑:跳过,别和它抢游标。
 
     两个进程同推游标,后写的会盖掉先写的,中间那段记录永远不会再被拉一次
     —— 两侧都不报错,只是产品中心少了一批数据。
     """
-    wf, _ = wired
     import contextlib
+    from workflows import order_audit as wf        # 要真的 _ingest_now,不用 wired 的桩
     monkeypatch.setattr(wf.runlock, "hold",
                         lambda name: contextlib.nullcontext(False))
     monkeypatch.setattr(wf.ingest, "pump",
@@ -1201,9 +1218,9 @@ def test_ingest_now_skips_when_product_ingest_holds_the_lock(wired, monkeypatch)
     assert "跳过" in note and "product_ingest" in note
 
 
-def test_ingest_now_pumps_under_the_lock(wired, monkeypatch):
-    wf, _ = wired
+def test_ingest_now_pumps_under_the_lock(monkeypatch):
     import contextlib
+    from workflows import order_audit as wf        # 同上
     taken = []
     monkeypatch.setattr(wf.runlock, "hold",
                         lambda name: taken.append(name) or
@@ -1609,3 +1626,47 @@ def test_vanished_batch_is_not_polled_again(clock, monkeypatch):
     monkeypatch.setattr(wf.scraper, "batch_status", status)
     note, stuck = wf._wait_for_batches(["b1", "b2"], 20)
     assert stuck == 0 and polls.count("b1") == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  轮询默认开(所有者定稿 2026-08-10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _needs_scrape_conn():
+    """一行缺快照的待审行 —— 跑到"推采集"那一步,后面才有东西可等。"""
+    return FakeConn({
+        "ORDER BY order_date DESC": (
+            PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget",
+                         1, 100, 0, "10001", "Shipped", None, None)]),
+        "audit_status IS NOT NULL": (["order_line_id", "audit_status",
+                                      "audit_detail"], []),
+    })
+
+
+def test_wait_is_on_by_default(wired, monkeypatch):
+    """不加任何参数就该等采集 + 就地摄取。
+
+    忘了加开关只会看到上一轮的结论,**而且不报错** —— 这种"忘了就静默降级"
+    的默认值不该留着(所有者定稿 2026-08-10)。
+    """
+    wf, calls = wired
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: _needs_scrape_conn())
+    wf.run({})
+    assert calls["waited"] and calls["ingested"] == 1
+
+
+@pytest.mark.parametrize("off", ["0", "false", "no", "NO", "False"])
+def test_wait_can_be_turned_off(wired, monkeypatch, off):
+    """挂调度时用 -p wait=0 关掉,免得一次运行占住那一小时的位置。"""
+    wf, calls = wired
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: _needs_scrape_conn())
+    wf.run({"wait": off})
+    assert calls["waited"] == [] and calls["ingested"] == 0
+
+
+def test_wait_skipped_when_nothing_was_pushed(wired, monkeypatch):
+    """没推出去任何批次就没什么可等的,别白等一轮退避。"""
+    wf, calls = wired
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: _needs_scrape_conn())
+    wf.run({"scrape": "0"})
+    assert calls["waited"] == [] and calls["ingested"] == 0

@@ -357,37 +357,30 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 #  按邮编采集的波次编排
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plan_waves(pairs, blocked) -> list[list[tuple[str, str]]]:
-    """输入:待采 [(asin, 邮编)] + 不可推的 {(asin, 邮编)} → 输出:按波次分组的 pair。
+def plan_zip_batches(pairs, blocked) -> dict[str, list[str]]:
+    """输入:待采 [(asin, 邮编)] + 不可推的 {(asin, 邮编)} → 输出:{邮编: [ASIN]}。
 
-    编排口径(所有者定稿 2026-08-10,放宽自初版):
+    **一个邮编一个批次**(所有者定稿 2026-08-10;初版如此,中途误放宽成"一批
+    混多个邮编",经所有者纠正回来)。这不是性能取舍,是**取数与取图的正确性**:
 
-    - **不同 ASIN 的不同邮编可以同批**——采集侧切邮编的性能瓶颈已优化,
-      不再需要一个邮编一个批次。批内逐 ASIN 带自己的邮编
-      (`POST /api/batches` 的 `items[].zip_code`)。
-    - **同一 ASIN 的多个邮编仍须拆批**——这不是性能取舍而是库结构:采集侧
-      `tasks` 上有 `UNIQUE(batch_id, asin)`,同批放两个邮编会被 400
-      `conflicting_zip_for_asin` 拒掉(以前是静默只采第一个,更糟)。
-      故拆成波次:第 1 波每个 ASIN 一个邮编,第 2 波是有第二个邮编的那些,
-      依此类推。**所有波次在同一轮内推完**,不再跨轮等待。
-    - blocked 里的 pair 直接跳过:在途的(等它落定)+ 重试窗口已耗尽的
-      (再推也是白烧配额)。判定见 workflows/order_audit 的台账查询。
+    - **截图**落盘是 `<批次名>/<asin>.png`。批次名带邮编,同一 ASIN 的不同邮编
+      才各有各的图;混在一批里,同 ASIN 只会有一张。
+    - **快照类端点**(`/api/results?batch_id=`、`/api/export/{批次名}`)对同一
+      ASIN **全库只有一行**,两个邮编的批次返回**完全相同的行且不报错**。
+      逐邮编准确的只有 `/api/export/incremental` 按 `scrape_params.zipcode` 分组
+      (本项目取数只走这一条,由 product_ingest 负责)。
+    - 采集侧 `tasks` 有 `UNIQUE(batch_id, asin)`:同批同 ASIN 两个邮编直接 400。
+      按邮编分批天然不可能触发它。
 
-    邮编按字典序进波,保证波次划分稳定可复现。
+    blocked 里的 pair 跳过:在途的(等它落定)+ 重试窗口已耗尽的(再推白烧配额)。
+    邮编与 ASIN 都按字典序,保证分批可复现——排障时"上轮到底推了什么"说得清。
     """
-    by_asin: dict[str, list[str]] = {}
+    out: dict[str, list[str]] = {}
     for asin, zip5 in sorted(set(pairs)):
         if not asin or not zip5 or (asin, zip5) in blocked:
             continue
-        by_asin.setdefault(asin, []).append(zip5)
-    if not by_asin:
-        return []
-    waves: list[list[tuple[str, str]]] = [
-        [] for _ in range(max(len(z) for z in by_asin.values()))]
-    for asin, zips in sorted(by_asin.items()):
-        for i, zip5 in enumerate(zips):
-            waves[i].append((asin, zip5))
-    return [w for w in waves if w]
+        out.setdefault(zip5, []).append(asin)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════

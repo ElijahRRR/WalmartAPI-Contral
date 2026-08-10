@@ -283,47 +283,45 @@ def test_judge_title_checked_before_price():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  按邮编采集的波次编排(2026-08-10 放宽:不再一个邮编一个批次)
+#  按邮编分批(2026-08-10 定稿:一个邮编一个批次,批次名带邮编)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_plan_waves_mixes_zips_in_one_batch():
-    """不同 ASIN 的不同邮编可以同批——采集侧切邮编性能已优化。"""
-    waves = rules.plan_waves([("B1", "10001"), ("B2", "90210")], set())
-    assert waves == [[("B1", "10001"), ("B2", "90210")]]
+def test_plan_zip_batches_groups_by_zip():
+    """一个邮编一个批次——批次名是取数与取图唯一的邮编隔离键。"""
+    plan = rules.plan_zip_batches(
+        [("B1", "10001"), ("B2", "90210"), ("B2", "10001")], set())
+    assert plan == {"10001": ["B1", "B2"], "90210": ["B2"]}
 
 
-def test_plan_waves_splits_same_asin_across_batches():
-    """同一 ASIN 的多个邮编必须拆批(采集侧 UNIQUE(batch_id, asin) 会 400),
-    但**同一轮内全部推完**,不再跨轮等待。"""
-    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210"),
-                              ("B2", "10001")], set())
-    assert len(waves) == 2
-    assert waves[0] == [("B1", "10001"), ("B2", "10001")]
-    assert waves[1] == [("B1", "90210")]
-    # 每一波内 ASIN 不重复 —— 这正是采集侧那条 400 的触发条件
-    for w in waves:
-        assert len({a for a, _ in w}) == len(w)
+def test_plan_zip_batches_same_asin_lands_in_different_batches():
+    """同一 ASIN 的两个邮编分到两个批次:混在一批里采集侧只存一行,
+    两个邮编会拿到完全相同的数据且不报错(而且截图也只会有一张)。"""
+    plan = rules.plan_zip_batches([("B1", "10001"), ("B1", "90210")], set())
+    assert plan == {"10001": ["B1"], "90210": ["B1"]}
+    # 任何一批内 ASIN 都不重复 —— 采集侧 UNIQUE(batch_id, asin) 的触发条件
+    for asins in plan.values():
+        assert len(set(asins)) == len(asins)
 
 
-def test_plan_waves_skips_blocked():
-    """在途/重试窗口耗尽的组合直接跳过,不占波次。"""
-    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210")],
-                             {("B1", "10001")})
-    assert waves == [[("B1", "90210")]]
+def test_plan_zip_batches_skips_blocked():
+    """在途/重试窗口耗尽的组合直接跳过,不占批次。"""
+    plan = rules.plan_zip_batches([("B1", "10001"), ("B1", "90210")],
+                                  {("B1", "10001")})
+    assert plan == {"90210": ["B1"]}
 
 
-def test_plan_waves_all_blocked_gives_nothing():
-    assert rules.plan_waves([("B1", "10001")], {("B1", "10001")}) == []
+def test_plan_zip_batches_all_blocked_gives_nothing():
+    assert rules.plan_zip_batches([("B1", "10001")], {("B1", "10001")}) == {}
 
 
-def test_plan_waves_drops_incomplete_pairs():
-    assert rules.plan_waves([("B1", ""), ("", "10001")], set()) == []
+def test_plan_zip_batches_drops_incomplete_pairs():
+    assert rules.plan_zip_batches([("B1", ""), ("", "10001")], set()) == {}
 
 
-def test_plan_waves_is_deterministic():
-    """波次划分必须可复现,否则排障时"上轮到底推了什么"说不清。"""
+def test_plan_zip_batches_is_deterministic():
+    """分批必须可复现,否则排障时"上轮到底推了什么"说不清。"""
     pairs = [("B2", "90210"), ("B1", "90210"), ("B1", "10001")]
-    assert rules.plan_waves(pairs, set()) == rules.plan_waves(
+    assert rules.plan_zip_batches(pairs, set()) == rules.plan_zip_batches(
         list(reversed(pairs)), set())
 
 
@@ -445,10 +443,17 @@ def wired(monkeypatch):
     # 采集器一律不真连:记录每次提交的 (批次名, ASIN 列表, 邮编, 是否要截图)
     calls["batches"] = []
 
-    def fake_submit(name, items, *, needs_screenshot=False):
-        calls["batches"].append((name, list(items), needs_screenshot))
-        return {"batch_id": "b1", "inserted": len(items)}
-    monkeypatch.setattr(wf.scraper, "submit_items", fake_submit)
+    def fake_submit(name, asins, *, zip_code, needs_screenshot=False):
+        calls["batches"].append((name, list(asins), zip_code, needs_screenshot))
+        return {"batch_id": "b1", "inserted": len(asins)}
+    monkeypatch.setattr(wf.scraper, "submit_json", fake_submit)
+
+    # 批次台账走 services.scrape_batches(自己开连接),测试里不落库
+    monkeypatch.setattr(wf.batches, "record",
+                        lambda *a, **k: calls.setdefault("recorded", []).append(a))
+    monkeypatch.setattr(wf.batches, "finish", lambda *a, **k: None)
+    # 截图清单默认"这批还没有图":要测取图的用例各自覆盖
+    monkeypatch.setattr(wf.scraper, "screenshot_list", lambda name: [])
 
     # registry 未登记也能跑:require() 直接返回自身
     for res in (wf.resources.ZIP_BLACKLIST_SHEET, wf.resources.SUPPLIER_TABLE,
@@ -587,8 +592,10 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
     summary = wf.run({})
 
     assert len(calls["batches"]) == 1
-    name, items, shot = calls["batches"][0]
-    assert items == [{"asin": "B0TEST0001", "zip_code": "10001"}]   # zip+4 收敛后再推
+    name, asins, zip_code, shot = calls["batches"][0]
+    assert asins == ["B0TEST0001"]
+    assert zip_code == "10001"          # zip+4 收敛后再推
+    assert "10001" in name              # 批次名带邮编:取数与取图的隔离键
     assert shot is True                 # 审核要截图做佐证
     assert "推采集:1 个" in summary
 
@@ -617,36 +624,60 @@ def test_run_scrape_can_be_disabled(wired, monkeypatch):
     assert calls["batches"] == []
 
 
-def test_screenshot_pending_writes_nothing_and_leaves_no_tombstone(wired,
-                                                                   monkeypatch):
-    """409 未就绪:本轮不写这一列,也不记墓碑——下轮还要再来取。"""
+def test_screenshot_not_ready_writes_nothing_and_leaves_no_tombstone(wired,
+                                                                     monkeypatch):
+    """清单里还没 done:本轮不写这一列,也不记墓碑——下轮还要再来取。
+    连图都不该去取(那张图根本不存在,取只会撞 404)。"""
     wf, _ = wired
     conn = FakeConn({})
-    calls = []
+    calls, fetched = [], []
     monkeypatch.setattr(wf.scraper, "fetch_screenshot",
-                        lambda b, a: (_ for _ in ()).throw(
-                            wf.scraper.ScreenshotPending("still working")))
+                        lambda b, a: fetched.append((b, a)) or b"x")
     monkeypatch.setattr(wf, "_remember", lambda *a: calls.append(a))
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") is None
+    for status in ("pending", "running", ""):
+        assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001",
+                                    status) is None
+    assert calls == [] and fetched == []
+
+
+def test_screenshot_unknown_status_is_retried_not_buried(wired, monkeypatch):
+    """采集侧冒出没见过的状态 → 当"还没好"(下轮再问),**不记墓碑**。
+    反过来把未知当终态,一次改名就永久放弃一批本来能拿到的图。"""
+    wf, _ = wired
+    calls = []
+    monkeypatch.setattr(wf, "_remember", lambda *a: calls.append(a))
+    assert wf._screenshot_token(FakeConn({}), "wm-audit-10001-x", "B0TEST0001",
+                               "queued_v2") is None
     assert calls == []
 
 
-def test_screenshot_gone_writes_tombstone(wired, monkeypatch):
-    """404/410 不会再有:记墓碑,以后不再为这张图发请求。"""
+def test_screenshot_failed_status_writes_tombstone(wired, monkeypatch):
+    """终态失败:记墓碑,以后不再为这张图发请求。"""
     wf, _ = wired
-    conn = FakeConn({})
+    remembered = {}
+    monkeypatch.setattr(wf, "_remember",
+                        lambda c, k, m: remembered.update({k: m}))
+    assert wf._screenshot_token(FakeConn({}), "wm-audit-10001-x",
+                               "B0TEST0001", "failed") is None
+    assert remembered["wm-audit-10001-x|B0TEST0001"]["gone"] is True
+
+
+def test_screenshot_gone_on_fetch_writes_tombstone(wired, monkeypatch):
+    """清单说 done 但取图返 404/410(图被清理了):同样记墓碑。"""
+    wf, _ = wired
     remembered = {}
     monkeypatch.setattr(wf.scraper, "fetch_screenshot",
                         lambda b, a: (_ for _ in ()).throw(
                             wf.scraper.ScreenshotGone("captcha")))
     monkeypatch.setattr(wf, "_remember",
                         lambda c, k, m: remembered.update({k: m}))
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") is None
+    assert wf._screenshot_token(FakeConn({}), "wm-audit-10001-x",
+                               "B0TEST0001", "done") is None
     assert remembered["wm-audit-10001-x|B0TEST0001"]["gone"] is True
 
 
 def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
-    """200:上传换 file_token 并记账;已记账的不再上传(上传接口不幂等)。"""
+    """done:上传换 file_token 并记账;已记账的不再上传(上传接口不幂等)。"""
     wf, _ = wired
     uploads = []
     monkeypatch.setattr(wf.scraper, "fetch_screenshot", lambda b, a: b"\x89PNG")
@@ -655,14 +686,43 @@ def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
                         uploads.append((name, mime)) or "ft_1")
     monkeypatch.setattr(wf, "_remember", lambda *a: None)
     conn = FakeConn({})
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") == "ft_1"
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001",
+                               "done") == "ft_1"
     assert uploads == [("B0TEST0001.png", "image/png")]
 
     # 账上已有 → 直接复用,不再取图也不再上传
     hit = FakeConn({"FROM ops.dedupe": (["file_token", "gone"],
                                         [("ft_cached", None)])})
-    assert wf._screenshot_token(hit, "wm-audit-10001-x", "B0TEST0001") == "ft_cached"
+    assert wf._screenshot_token(hit, "wm-audit-10001-x", "B0TEST0001",
+                               "done") == "ft_cached"
     assert len(uploads) == 1
+
+
+def test_shot_index_keys_by_batch_and_asin(wired, monkeypatch):
+    """按批次一次拿清单(不逐 ASIN 试探),键含批次名——同一 ASIN 的两个邮编
+    批次各有各的图,少了批次名就会互相顶掉。"""
+    wf, _ = wired
+    asked = []
+
+    def fake_list(name):
+        asked.append(name)
+        return [{"asin": "b0test0001", "status": "DONE"},
+                {"asin": "B0TEST0002", "status": "pending"},
+                {"asin": "", "status": "done"}]        # 无 asin:丢掉
+    monkeypatch.setattr(wf.scraper, "screenshot_list", fake_list)
+    idx = wf._shot_index({"wm-audit-10001-x", "wm-audit-90210-x", None})
+    assert asked == ["wm-audit-10001-x", "wm-audit-90210-x"]
+    assert idx[("wm-audit-10001-x", "B0TEST0001")] == "done"    # 大小写归一
+    assert idx[("wm-audit-90210-x", "B0TEST0002")] == "pending"
+    assert len(idx) == 4
+
+
+def test_shot_index_survives_scraper_outage(wired, monkeypatch):
+    """清单查不到只当"这批本轮没有图"——截图是佐证材料,永不阻断审核结论。"""
+    wf, _ = wired
+    monkeypatch.setattr(wf.scraper, "screenshot_list",
+                        lambda n: (_ for _ in ()).throw(RuntimeError("502")))
+    assert wf._shot_index({"wm-audit-10001-x"}) == {}
 
 
 @pytest.mark.parametrize("snap_kw,why", [
@@ -744,6 +804,157 @@ def test_sql_selects_every_column_the_rules_read():
                 "shipping_raw", "buybox", "scrape_params", "raw",
                 "outcome", "title"):
         assert col in wf._SNAP_SQL, f"快照查询漏了 {col}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  批次生命周期(完成度判据 = tasks.open == 0 且 screenshots.open == 0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001"))):
+    return FakeConn({
+        "FROM ops.scrape_batches": (["batch_name", "batch_id", "asin_count"],
+                                    [("wm-audit-10001-x", "7", 2)]),
+        "state = 'pending' AND batch_name": (["asin", "zip"], list(pending)),
+    })
+
+
+def test_reap_batches_blames_the_real_reason(wired, monkeypatch):
+    """批次采完了、这些组合却没快照 ⇒ 真失败,原因去 /failures 拿真值。
+
+    一律记"超时未见快照"是不行的:验证码(换时段可重试)和 variant_offset
+    (重试多少次都一样,该去人工看)的处置完全不同。
+    """
+    wf, _ = wired
+    conn = _reap_conn()
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 1, "failed": 1},
+                                   "screenshots": {"open": 0, "done": 1}})
+    monkeypatch.setattr(wf.batches, "pull_failures",
+                        lambda n, bid: ("失败明细:1 个 ASIN 已落库(captcha×1)",
+                                        {"B0A": "captcha"}))
+    reaped, failed_pairs, notes = wf._reap_batches(conn)
+    assert (reaped, failed_pairs) == (1, 2)
+    reasons = [a["reason"] for s, a in conn.executed
+               if isinstance(a, dict) and "reason" in a]
+    assert "采集失败:captcha" in reasons          # 有真实原因就写真实原因
+    assert any("无快照" in r for r in reasons)     # 没原因的也得有个交代
+    assert notes and "captcha" in notes[0]
+
+
+def test_reap_batches_leaves_inflight_alone(wired, monkeypatch):
+    """批次还在跑(open > 0)→ 不判失败、不重推,只更新台账状态。
+    盲超时重推 = 采集侧正干着我们又推一遍,白烧一批配额。"""
+    wf, calls = wired
+    conn = _reap_conn()
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 2}, "screenshots": {"open": 0}})
+    monkeypatch.setattr(wf.batches, "pull_failures",
+                        lambda n, bid: pytest.fail("在途批次不该去拉失败明细"))
+    assert wf._reap_batches(conn) == (0, 0, [])
+    assert [a[3] for a in calls.get("recorded", [])] == ["running"]
+    assert not [a for s, a in conn.executed
+                if isinstance(a, dict) and "reason" in a]
+
+
+def test_reap_batches_waits_for_screenshots(wired, monkeypatch):
+    """任务采完了但截图还没截完 → 批次未落定。截图也是这批的产出,
+    这时认账失败会把一批本来马上就有图的组合判死。"""
+    wf, _ = wired
+    conn = _reap_conn()
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 2},
+                                   "screenshots": {"open": 2, "done": 0}})
+    assert wf._reap_batches(conn) == (0, 0, [])
+
+
+def test_reap_batches_marks_vanished_batch_failed(wired, monkeypatch):
+    """采集侧查不到这个批次了 → 台账落 failed,组合交给兜底超时收尾。"""
+    wf, _ = wired
+    finished = []
+    conn = _reap_conn()
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: (_ for _ in ()).throw(LookupError("没有")))
+    monkeypatch.setattr(wf.batches, "finish",
+                        lambda *a, **k: finished.append(a))
+    reaped, failed_pairs, notes = wf._reap_batches(conn)
+    assert (reaped, failed_pairs) == (0, 0)
+    assert finished[0][1] == "failed"
+    assert "查不到" in notes[0]
+
+
+def test_reap_batches_survives_status_outage(wired, monkeypatch):
+    """状态查询炸了 → 保持在途,下轮再查。**绝不当成落定去认账失败**。"""
+    wf, _ = wired
+    conn = _reap_conn()
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: (_ for _ in ()).throw(RuntimeError("502")))
+    monkeypatch.setattr(wf.batches, "finish",
+                        lambda *a, **k: pytest.fail("查不动就别落定"))
+    assert wf._reap_batches(conn) == (0, 0, [])
+
+
+def test_timeout_backstop_spares_inflight_batches():
+    """兜底超时只打在**批次已不在途**的组合上——SQL 文本直接断言。
+
+    夹具喂什么假数据都盖不住 SQL 本身:少了这个 NOT EXISTS,20 分钟一到
+    就会把采集侧正在跑的批次里的组合全判失败并重推一遍。
+    """
+    from workflows import order_audit as wf
+    assert "NOT EXISTS" in wf._TIMEOUT_SQL
+    assert "ops.scrape_batches" in wf._TIMEOUT_SQL
+    assert "('pushed', 'running')" in wf._TIMEOUT_SQL
+
+
+def test_audit_batches_are_prefix_isolated():
+    """两条工作流共用 ops.scrape_batches,查在途必须按前缀圈自己的。
+    否则 product_refresh 的 1 小时超时口径会把订单审核的批次标成 timeout。"""
+    from workflows import order_audit as wf, product_refresh as pr
+    assert wf._BATCH_PREFIX != pr.BATCH_PREFIX
+    assert "batch_name LIKE" in wf._OPEN_BATCHES_SQL
+    assert "batch_name LIKE" in pr._SQL_OPEN
+
+
+def test_push_scrape_records_batch_id_for_failures(wired, monkeypatch):
+    """推送响应里的 batch_id 必须当场记进台账:`/failures` 只认 id 不认名字,
+    漏记了就永远答不上"这个 ASIN 为什么没采到"。"""
+    wf, calls = wired
+    conn = FakeConn({})
+    note = wf._push_scrape(conn, [("B0A", "10001"), ("B0B", "90210")], {})
+    assert "2 个 ASIN×邮编,2 个邮编批次" in note
+    # 一个邮编一个批次,批次名带邮编
+    names = [n for n, _, _, _ in calls["batches"]]
+    assert sorted(z for _, _, z, _ in calls["batches"]) == ["10001", "90210"]
+    assert all(z in n for n, _, z, _ in calls["batches"])
+    recorded = {a[0]: a for a in calls["recorded"]}
+    assert set(recorded) == set(names)
+    assert all(a[1] == "b1" and a[3] == "pushed" for a in recorded.values())
+
+
+def test_push_scrape_marks_pending_before_calling(wired, monkeypatch):
+    """先落 pending 再调接口(CLAUDE.md 铁律):反过来网络一断就成了
+    "推上去了但库里没记录",下轮重复推同一批。"""
+    wf, _ = wired
+    conn = FakeConn({})
+    seen = []
+    monkeypatch.setattr(wf.scraper, "submit_json",
+                        lambda *a, **k: seen.append(len(conn.executed))
+                        or {"batch_id": "b1", "inserted": 1})
+    wf._push_scrape(conn, [("B0A", "10001")], {})
+    assert seen[0] > 0                    # 调接口时台账里已经写过东西了
+    sql, params = conn.executed[0]
+    assert "INSERT INTO ops.audit_scrape" in sql and params[0]["asin"] == "B0A"
+
+
+def test_push_scrape_failure_settles_the_pairs(wired, monkeypatch):
+    """推送失败 → 这些组合当场判 failed,不能永远挂在 pending 上等超时。"""
+    wf, calls = wired
+    conn = FakeConn({})
+    monkeypatch.setattr(wf.scraper, "submit_json",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("炸")))
+    note = wf._push_scrape(conn, [("B0A", "10001")], {})
+    assert "失败 1" in note
+    assert any("state = 'failed'" in s for s, _ in conn.executed)
+    assert calls["recorded"][-1][3] == "failed"
 
 
 def test_run_config_missing_suppliers_refuses(wired, monkeypatch):

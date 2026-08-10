@@ -167,25 +167,55 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    旧的 `/static/screenshots/{批次名}/{asin}.png` 保留不变,但那条路上后三种
    全是同一个 404,分不出来。本侧走新端点:`api/scraper.fetch_screenshot`
    把 409 与 404/410 抛成两个不同异常,order_audit 据此决定"下轮再来"还是
-   "记墓碑不再请求"。
+   "记墓碑不再请求"。**但常规路径不逐 ASIN 试探**:先用
+   `GET /api/screenshots?batch_name=`(`api/scraper.screenshot_list`)拿整批
+   清单,只对 `status == "done"` 的去取图——一批 50 个 ASIN 只有 10 张图好了,
+   逐个试要发 50 次(40 次收 409),拿清单只要 1 + 10 次。逐 ASIN 端点退居
+   兜底(清单说 done 而图已被清理时,仍靠它区分该不该记墓碑)。
 
 3. **`POST /api/batches`(JSON 推送)**——与 `POST /api/upload` 共用同一个
    核心函数,撞名 409、回调注册、回显读回值逐字一致。**order_audit 已改用**
-   (`api/scraper.submit_items`):所有者定稿 2026-08-10 取消"一个邮编一个
-   批次"(采集侧切邮编的性能瓶颈已优化),而**一批混多个邮编**正需要
-   `items[].zip_code` 逐 ASIN 带邮编这个能力。维护链的全量重推仍走
+   (`api/scraper.submit_json`),取的是不必把 ASIN 列表拼 txt 再 multipart
+   上传这点方便;邮编按**批次级** `zip_code` 传。维护链的全量重推仍走
    `/api/upload`(不切邮编,形态最简,没有换的理由)。
 
-4. **同一 ASIN 多邮编同批:从静默丢失改成明确失败**——`tasks` 上有
-   `UNIQUE(batch_id, asin)`,以前静默取第一个(200、少采一个邮编、响应里
-   看不出来),现在回 `400 conflicting_zip_for_asin`。本侧 `plan_waves`
-   把同一 ASIN 的多个邮编拆到不同波次,每波内 ASIN 不重复,这道服务端闸
-   是双保险。**注意这条约束与"一个邮编一个批次"无关**:它是库结构
-   (`UNIQUE(batch_id, asin)`)决定的,不随采集性能优化而消失。
-   ⚠ 连带的坑(采集侧已钉住):多邮编拆批后,**只有 `/api/export/incremental`
-   按 `scrape_params.zipcode` 分得清**;`/api/results?batch_id=` 与
-   `/api/export/{批次名}` 对两个批次返回**完全相同的行**且不报错
-   (`asin_data.asin` 全局唯一,batch_id 只用来挑 ASIN)。本侧取数只走增量导出。
+4. **一个邮编一个批次(批次名带邮编)——所有者定稿 2026-08-10,必须**。
+   中途曾按"采集侧切邮编已优化 ⇒ 可以一批混多个邮编"放宽,经所有者纠正
+   收回:**这条约束的理由不是性能,是取数与取图的正确性**,性能优化消不掉它。
+   - `/api/results?batch_id=` 与 `/api/export/{批次名}` 对同一 ASIN
+     **全库只有一行**,两个邮编的批次返回**完全相同的行且不报错**
+     (`asin_data.asin` 全局唯一,batch_id 只用来挑 ASIN)。**逐邮编准确的
+     只有 `/api/export/incremental` 按 `scrape_params.zipcode` 分组**,
+     同键取 cursor 最大的那条 —— 本侧取数只走这一条。
+   - 截图落盘是 `<批次名>/<asin>.png`,**批次名带邮编**才能让同一 ASIN 的
+     不同邮编各有各的图;混在一批里同 ASIN 只会有一张。
+   - `tasks` 上的 `UNIQUE(batch_id, asin)` 是第三道闸:以前同批两个邮编静默
+     取第一个(200、少采一个、响应里看不出来),现在明确回
+     `400 conflicting_zip_for_asin`。按邮编分批天然不可能触发它。
+
+   本侧编排是 `services/order_audit.plan_zip_batches`(按邮编分组),批次名
+   `wm-audit-<邮编>-<时间戳>`,**所有邮编同一轮内推完**,不跨轮等待。
+
+5. **批次完成度判据(采集侧 2026-08-10 实测确认)**——
+   `GET /api/batches/{批次名}/status`:
+
+   ```
+   completed  ⇔  tasks.open == 0  AND  screenshots.open == 0
+   ```
+
+   `open` = 既不是 done 也不是 failed 的数量。**failed 算终态**,所以一张永远
+   截不出来的图不会把批次卡死(实测 1 done + 1 failed → completed)。
+   本侧实现在 `services/scrape_batches.is_settled`,product_refresh 与
+   order_audit 共用同一份判据。
+
+   ⚠ **批次 completed 不等于我们库里有数据**:中间还隔着增量导出 →
+   product_ingest 两跳。所以批次状态只用来判"还要不要等"和"失败原因是什么",
+   "这条数据到没到"必须另看快照是否真出现。
+
+   失败原因走 `GET /api/batches/{batch_id}/failures`(**认 batch_id 不认名字**),
+   `error_type` 是 11 类 + `unknown` 的封闭集,登记在
+   `services/scrape_batches.ERROR_TYPES`——采集侧新增类型而本侧不知道时会告警,
+   不会被静默当成普通失败。
 
 **另有两条实现语义,消费侧必须遵守**:
 

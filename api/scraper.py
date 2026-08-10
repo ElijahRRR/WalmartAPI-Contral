@@ -128,28 +128,30 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
 
 
-def submit_items(batch_name: str, items: list[dict], *,
-                 needs_screenshot: bool = False, max_retries: int = 3) -> dict:
-    """输入:批次名 + [{asin, zip_code}] → 输出:{batch_id, inserted, ...}。
+def submit_json(batch_name: str, asins: list[str], *, zip_code: str,
+                needs_screenshot: bool = False, max_retries: int = 3) -> dict:
+    """输入:批次名 + ASIN 列表 + **整批邮编** → 输出:{batch_id, inserted, ...}。
 
-    走 `POST /api/batches`(JSON,采集侧 2026-08-10 新增),与 submit_batch 的
-    `/api/upload` **共用同一个核心函数**:撞名 409、回调注册、回显读回值逐字
-    一致。用它而不用 upload 的唯一理由是**逐 ASIN 带邮编**——一批里可以混
-    不同 ASIN 的不同邮编,不必按邮编切批。
+    走 `POST /api/batches`(JSON),与 submit_batch 的 `/api/upload` 共用同一个
+    核心函数:撞名 409、回调注册、回显读回值逐字一致。用它的理由是不必把
+    ASIN 列表拼成 txt 再 multipart 上传。
 
-    ⚠ 仍然成立的调用方约束:**同一 ASIN 在同一批里只能有一个邮编**
-    (采集侧 `tasks` 有 `UNIQUE(batch_id, asin)`),否则 400
-    `conflicting_zip_for_asin`。多邮编拆波次见 services.order_audit.plan_waves。
-
-    邮编优先级(采集侧语义):`items[].zip_code` > 顶层 `zip_code` > 服务端默认。
-    本函数只用逐 ASIN 那一档,不传顶层 zip_code——省得两处邮编来源打架。
+    ⚠ **一个邮编一个批次**(所有者定稿 2026-08-10)。批次级邮编而不是逐 ASIN
+    邮编,理由不是接口限制而是**取数与取图的正确性**:
+    - 截图落盘是 `<批次名>/<asin>.png`,**批次名带邮编**才能让同一 ASIN 的
+      不同邮编各有各的图;
+    - 快照类端点(`/api/results?batch_id=`、`/api/export/{批次名}`)对同一 ASIN
+      **只有一行全局记录**,两个邮编的批次会返回**完全相同的行且不报错**——
+      逐邮编准确的只有 `/api/export/incremental` 按 `scrape_params.zipcode` 分组。
+    调用方编排见 services.order_audit.plan_zip_batches。
     """
-    if not items:
-        raise ValueError("submit_items:条目为空")
+    if not asins:
+        raise ValueError("submit_json:ASIN 列表为空")
+    if not str(zip_code or "").strip():
+        raise ValueError("submit_json:必须指定邮编(一个邮编一个批次)")
     body = {"batch_name": batch_name,
-            "items": [{"asin": str(i["asin"]).strip(),
-                       "zip_code": str(i.get("zip_code") or "").strip()}
-                      for i in items if i.get("asin")],
+            "asins": [str(a).strip() for a in asins if a],
+            "zip_code": str(zip_code).strip(),
             "needs_screenshot": bool(needs_screenshot)}
     last: Exception | None = None
     for attempt in range(max_retries):
@@ -169,8 +171,7 @@ def submit_items(batch_name: str, items: list[dict], *,
                 raise BatchExistsError(d.get("batch_id"),
                                        d.get("batch_name") or batch_name)
             if resp.status_code in (400, 413, 422):
-                # 400 conflicting_zip_for_asin 是调用方编排错了(同批混了同一
-                # ASIN 的两个邮编),重试一万次也一样——直接抛,别吞
+                # 400 conflicting_zip_for_asin 是调用方编排错了,重试一万次也一样
                 raise ValueError(f"推送被拒 HTTP {resp.status_code}: "
                                  f"{resp.text[:300]}")
             raise RuntimeError(f"推送失败 HTTP {resp.status_code}: "
@@ -185,6 +186,38 @@ def submit_items(batch_name: str, items: list[dict], *,
                                "不会重复建批)", e, wait)
                 time.sleep(wait)
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
+
+
+def screenshot_list(batch_name: str) -> list[dict]:
+    """输入:批次名 → 输出:该批次逐 ASIN 的截图状态 [{asin, status, url, ...}]。
+
+    `GET /api/screenshots?batch_name=`(采集侧 2026-08-10 新增)。
+    **`url` 仅在 `status == "done"` 时非 null** —— 别的状态那张图不存在,
+    拿 URL 去取只会撞 404。
+
+    一次拿全比逐 ASIN 试探省得多:一批 50 个 ASIN、只有 10 张图好了,
+    逐个试要发 50 次(40 次收 409),这里 1 次拿清单 + 10 次取图。
+    自动翻页(next_cursor 为 null 即到底)。
+    """
+    out: list[dict] = []
+    cursor = None
+    while True:
+        params = {"batch_name": batch_name, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = httpx.get(f"{base_url()}/api/screenshots", params=params,
+                         headers=_headers(),
+                         timeout=httpx.Timeout(60, connect=10))
+        if resp.status_code == 404:
+            raise LookupError(f"批次不存在:{batch_name}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"截图清单查询失败 HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        data = resp.json() or {}
+        out.extend(data.get("items") or [])
+        cursor = data.get("next_cursor")
+        if not cursor:
+            return out
 
 
 class ScreenshotPending(RuntimeError):

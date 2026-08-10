@@ -391,7 +391,7 @@ def test_batch_failures_pulls_detail_not_just_a_count(monkeypatch):
 
 def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
     from datetime import timezone
-    from workflows import product_refresh as pr
+    from services import scrape_batches as sb
 
     saved = []
 
@@ -405,8 +405,8 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
         def __exit__(self, *a): return False
         def cursor(self): return _C()
 
-    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
-    monkeypatch.setattr(pr.scraper, "batch_failures", lambda bid: [
+    monkeypatch.setattr(sb.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(sb.scraper, "batch_failures", lambda bid: [
         {"asin": "B0A", "status": "failed", "error_type": "captcha",
          "error_detail": "d", "retry_count": 3,
          "updated_at": "2026-08-09 02:00:00"},
@@ -414,9 +414,12 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
          "error_detail": None, "retry_count": 1, "updated_at": None},
         {"asin": None, "error_type": "timeout"},        # 无 asin:落库没价值
     ])
-    line = pr._pull_failures("wm-refresh-x", "7")
+    line, by_asin = sb.pull_failures("wm-refresh-x", "7")
     assert "2 个 ASIN 已落库" in line and "captcha×2" in line
     assert [p[1] for p in saved] == ["B0A", "B0B"]
+    # {asin: error_type} 是给调用方写自己台账用的:验证码(可重试)和
+    # variant_offset(重试也一样)的处置完全不同,不能一律记成"超时"
+    assert by_asin == {"B0A": "captcha", "B0B": "captcha"}
     # 采集侧给的是 UTC 裸串:必须显式补 UTC,否则按会话时区解释会差 8 小时
     assert saved[0][6].tzinfo is not None
     assert saved[0][6].astimezone(timezone.utc).hour == 2
@@ -426,9 +429,47 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
     def boom(bid):
         raise RuntimeError("网络炸了")
 
-    monkeypatch.setattr(pr.scraper, "batch_failures", boom)
-    assert "拉取失败" in pr._pull_failures("wm-refresh-x", "7")
-    assert "查不了" in pr._pull_failures("wm-refresh-x", None)
+    monkeypatch.setattr(sb.scraper, "batch_failures", boom)
+    assert "拉取失败" in sb.pull_failures("wm-refresh-x", "7")[0]
+    assert "查不了" in sb.pull_failures("wm-refresh-x", None)[0]
+
+
+def test_pull_failures_flags_unregistered_error_type(monkeypatch, caplog):
+    """采集侧加了新 error_type 而本侧封闭集没更新 → 必须告警。
+    静默当普通失败的话,一整类新故障就永远没人知道。"""
+    from services import scrape_batches as sb
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, params): pass
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(sb.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(sb.scraper, "batch_failures", lambda bid: [
+        {"asin": "B0A", "error_type": "brand_new_failure"}])
+    with caplog.at_level("WARNING"):
+        _, by_asin = sb.pull_failures("wm-refresh-x", "7")
+    assert by_asin == {"B0A": "brand_new_failure"}
+    assert "未登记的 error_type" in caplog.text
+
+
+@pytest.mark.parametrize("body,settled", [
+    ({"stats": {"open": 0}, "screenshots": {"open": 0}}, True),
+    ({"stats": {"open": 0}, "screenshots": {"open": 3}}, False),   # 图还没截完
+    ({"stats": {"open": 2}, "screenshots": {"open": 0}}, False),
+    ({"stats": {"open": 0, "failed": 5}, "screenshots": {}}, True),  # 失败算终态
+    ({"status": "completed"}, True),          # 无 open 字段的旧响应体
+    ({"status": "running"}, False),
+    ({}, False),                              # 未知一律当"还在跑",宁可多等一轮
+])
+def test_is_settled(body, settled):
+    from services import scrape_batches as sb
+    assert sb.is_settled(body) is settled
 
 
 def test_refresh_targets_sql_gates():

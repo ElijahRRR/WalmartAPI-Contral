@@ -26,7 +26,7 @@
 - 配置(黑名单邮编 / 采购方表)每次运行现读飞书,读不到直接失败——
   拿旧配置继续算钱比不出结论危险得多。
 
-采集接入(2026-08-09 接线,2026-08-10 按所有者定稿放宽):
+采集接入(2026-08-09 接线,2026-08-10 按所有者实测定稿):
 - 审核输入来自 catalog.latest_snapshot 里**该订单收件邮编那一组**快照,两层
   JOIN 取标题(services.order_audit.from_snapshot 是唯一翻译点)。
 - **快照超 24 小时视同没有**:审单看的是价格/库存/货期,这几个字段变得快;
@@ -34,23 +34,29 @@
 - **什么会进待采清单**:由 judge 显式标记 `rescrape` 的四种——没快照 /
   outcome≠ok / 缺配送方式或配送时长 / 运费没采到。**无匹配采购方、标题不符
   不进**(重采解决不了,只是白烧配额)。钓鱼行是终局,连采都不用采。
-- **一批可以混不同 ASIN 的不同邮编**(逐 ASIN 带邮编,`POST /api/batches`);
-  但**同一 ASIN 的多个邮编仍须拆批**——这不是性能取舍而是库结构:采集侧
-  `tasks` 有 `UNIQUE(batch_id, asin)`,同批放两个邮编会被 400 拒掉。
-  故拆成波次,**所有波次同一轮内推完**,不再跨轮等待。
+- **一个邮编一个批次,批次名带邮编**(`wm-audit-<邮编>-<时间戳>`)。这是硬约束
+  而非性能取舍:采集侧对同一 ASIN 只存一行全局记录,`/api/results`、
+  `/api/export/{批次名}` 这类按批次取数的端点会把两个邮编的批次返回成**完全
+  相同的行且不报错**;截图也只按 `<批次名>/<asin>.png` 落盘。批次名带邮编才
+  能让两者各归各。**所有邮编同一轮内推完**,不跨轮等待。
+  (取数本身只走 `/api/export/incremental` 按 `scrape_params.zipcode` 分组,
+   由 product_ingest 负责——批次只用来判完成度和取图。)
 - **先落 pending 再调接口**(CLAUDE.md 铁律):台账 ops.audit_scrape 一个
-  (ASIN,邮编) 一行。每轮开工先对账——requested_at 之后该组合真出现了新快照
-  才算 done(不看批次状态:批次说成功但数据没落地照样要抓出来);超 3 小时
-  仍无快照判失败,下轮重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
+  (ASIN,邮编) 一行。每轮开工先对账,三层判据各管一段:
+  ① 快照真出现 → done(只有它能证明数据到了**我们**库里);
+  ② 批次已落定(`tasks.open == 0 且 screenshots.open == 0`)仍无快照 → 认账
+     失败,原因去 `/api/batches/{batch_id}/failures` 拿真值写进台账;
+  ③ 兜底超时 20 分钟 → 只打在**批次已查不到**的组合上,防台账永远挂着。
+  在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
 - **重试一天封顶**:同一组合首次请求超 24 小时仍拿不到可用数据就不再推,
   免得一个采不出来的 ASIN 每小时白烧一次配额;上次推送已过期则视为新需求,
   窗口重置(见 _BLOCKED_SQL 与 _MARK_PENDING_SQL)。
 - 采集侧 `zip_verify == "mismatch"` 的快照直接判废(切邮编失败拿回的是默认
   地区价格,拿它算限价等于按错地区审单)。
-- **截图**走 `GET /api/screenshots/{批次名}/{asin}`(采集侧 2026-08-10 新增),
-  抓手是台账里的 batch_name(落盘即 `<批次名>/<asin>.png`,批次名就是隔离键)。
-  三种结局分别处置:409 未就绪→本轮不写这一列、下轮再来;404/410 不会再有→
-  记墓碑不再请求;200→上传飞书换 file_token。**截图从不阻断审核结论**。
+- **截图**先用 `GET /api/screenshots?batch_name=` 拿整批清单,只对
+  `status == "done"` 的去取图(其余状态那张图根本不存在,取只会撞 404)。
+  三种结局分别处置:未就绪→本轮不写这一列、下轮再来;失败→记墓碑不再请求;
+  done→取图上传飞书换 file_token。**截图从不阻断审核结论**。
 - **运费**取 `fast.shipping`(采集侧同日追加,落 snapshots.shipping 列):
   FREE→0.0 是"确认免运费",N/A→NULL 是"这次没采到"⇒ **成本算不出来,转待人工**。
   绝不 `or 0`——当 0 的话成本偏小,本该拒的单被放行,而两侧都不报错。
@@ -65,14 +71,16 @@ import httpx
 
 from api import feishu, scraper
 from registry import db, resources
-from services import kpi, order_audit as rules
+from services import kpi, order_audit as rules, scrape_batches as batches
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.order_audit")
 
 _DEFAULT_DAYS = 3
-_SCRAPE_TIMEOUT_HOURS = 3      # 在途超此时长仍无快照 → 判失败,下轮重推
+_SCRAPE_TIMEOUT_MIN = 20       # 兜底超时(所有者定稿 2026-08-10:切邮编+截图
+                               # 几分钟就跑完)。**主判据是批次 open==0**,
+                               # 这个只在批次查不到时兜底,防台账永远挂着
 _SNAPSHOT_FRESH_HOURS = 24     # 快照超此时长即视同没有(所有者定稿 2026-08-10)
 _RESCRAPE_WINDOW_HOURS = 24    # 同一组合的重采窗口:超此时长仍拿不到可用数据就放弃
 _SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe:批次名|ASIN → file_token
@@ -152,11 +160,40 @@ WHERE a.state = 'pending' AND EXISTS (
       AND coalesce(s.scrape_params ->> 'zip_verify', '') <> 'mismatch')
 """
 
+# 兜底超时:**只打在批次已不在途的组合上**。批次还在跑(pushed/running)时
+# 判它失败会导致"采集侧正干着,我们这边已经重推一遍"——白烧一批配额。
+# 批次能查到时,落定与失败原因都由 _reap_batches 按采集侧真实状态处理;
+# 这条只兜"批次在采集侧查不到了 / 台账里压根没这个批次"的漏。
 _TIMEOUT_SQL = """
-UPDATE ops.audit_scrape
-SET state = 'failed', reason = '超时未见快照', settled_at = now()
-WHERE state = 'pending'
-  AND requested_at < now() - make_interval(hours => %(hours)s)
+UPDATE ops.audit_scrape a
+SET state = 'failed', reason = '兜底超时(批次已不在途且始终无快照)',
+    settled_at = now()
+WHERE a.state = 'pending'
+  AND a.requested_at < now() - make_interval(mins => %(mins)s)
+  AND NOT EXISTS (SELECT 1 FROM ops.scrape_batches b
+                  WHERE b.batch_name = a.batch_name
+                    AND b.status IN ('pushed', 'running'))
+"""
+
+# 本工作流推的批次:批次名前缀区分,不碰 product_refresh 的 wm-refresh-*
+_BATCH_PREFIX = "wm-audit-"
+
+_OPEN_BATCHES_SQL = """
+SELECT batch_name, batch_id, asin_count FROM ops.scrape_batches
+WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
+ORDER BY submitted_at
+"""
+
+# 批次落定后仍没拿到快照的组合 → 认账失败(原因由 /failures 给)
+_STILL_PENDING_SQL = """
+SELECT asin, zip FROM ops.audit_scrape
+WHERE state = 'pending' AND batch_name = %(batch)s
+"""
+
+_FAIL_PAIR_SQL = """
+UPDATE ops.audit_scrape SET state = 'failed', reason = %(reason)s,
+       settled_at = now()
+WHERE asin = %(asin)s AND zip = %(zip)s AND state = 'pending'
 """
 
 _MARK_PENDING_SQL = """
@@ -287,38 +324,124 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     return results, want
 
 
-def _settle_ledger(conn) -> tuple[int, int, dict]:
-    """输入:连接 → 输出:(本轮落定数, 判超时数, {(asin,邮编): 'inflight'|'gaveup'})。
+def _reap_batches(conn) -> tuple[int, int, list[str]]:
+    """输入:连接 → 输出:(落定批次数, 认账失败的组合数, 摘要行)。
+
+    **批次生命周期由采集侧说了算**(所有者 2026-08-10 实测确认):
+
+        completed ⇔ tasks.open == 0 AND screenshots.open == 0
+
+    `open` = 既不是 done 也不是 failed 的数量。failed 算终态,所以一张永远
+    截不出来的图不会把批次卡死(实测 1 done + 1 failed → completed)。
+
+    在途批次(open > 0)**不判超时、不重推**——它还在干活,盲超时会误判重推、
+    白烧一批(所以兜底超时那条 SQL 显式排除了在途批次的组合)。
+    批次落定后仍没拿到快照的组合才是真失败,这时拉
+    `/api/batches/{batch_id}/failures` 把**真实原因**(captcha / variant_offset /
+    zip_switch_failed …)写进台账,而不是一律记"超时未见快照"——验证码
+    (换时段可重试)和 404(该去删链接)的处置完全不同。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_OPEN_BATCHES_SQL, {"prefix": _BATCH_PREFIX + "%"})
+        open_batches = cur.fetchall()
+    settled_batches, failed_pairs, notes = 0, 0, []
+
+    for name, batch_id, n in open_batches:
+        try:
+            st = scraper.batch_status(name)
+        except LookupError:
+            # 批次在采集侧查不到了(被清理/名字丢了)——交给兜底超时收尾
+            batches.finish(name, "failed", None, None, "采集侧查不到该批次")
+            notes.append(f"{name}:采集侧查不到")
+            continue
+        except Exception as e:
+            logger.warning("批次 %s 状态查询失败(本轮跳过):%s", name, e)
+            continue
+        # 台账没记下 batch_id 时(推送时响应异常)从状态响应补:失败明细端点
+        # 只认 batch_id,缺了这批的失败原因就永远问不出来
+        batch_id = batch_id or st.get("batch_id")
+        if not batches.is_settled(st):
+            stats = st.get("stats") or {}
+            shots = st.get("screenshots") or {}
+            batches.record(name, batch_id, n, "running",
+                           f"open={stats.get('open')} shots_open={shots.get('open')}")
+            continue
+
+        stats = st.get("stats") or {}
+        batches.finish(name, "completed", stats.get("done"), stats.get("failed"),
+                       f"screenshots={(st.get('screenshots') or {}).get('done')}")
+        settled_batches += 1
+
+        with conn.cursor() as cur:
+            cur.execute(_STILL_PENDING_SQL, {"batch": name})
+            stuck = cur.fetchall()
+        if not stuck:
+            continue
+        # 批次采完了这些组合却没快照 ⇒ 真失败,去问原因
+        summary, by_asin = batches.pull_failures(name, batch_id)
+        for asin, zip5 in stuck:
+            et = by_asin.get(asin)
+            reason = (f"采集失败:{et}" if et
+                      else "批次已采完但无快照(增量导出里没有这条)")
+            with conn.cursor() as cur:
+                cur.execute(_FAIL_PAIR_SQL,
+                            {"asin": asin, "zip": zip5, "reason": reason})
+            failed_pairs += 1
+        notes.append(f"{name}:{len(stuck)} 个组合无快照({summary})")
+    conn.commit()
+    return settled_batches, failed_pairs, notes
+
+
+def _settle_ledger(conn) -> tuple[int, int, dict, list[str]]:
+    """输入:连接 → 输出:(落定数, 判失败数, {(asin,邮编): 'inflight'|'gaveup'}, 摘要)。
 
     每轮开工先对账——这就是"重启后先查实际状态再决定是否补交"(CLAUDE.md
     铁律)的落地:进程死了没关系,pending 记录还在,下轮照样能判断该不该重推。
+
+    三层判据各管一段,**谁也替代不了谁**:
+      快照真出现   → done(只有它能证明数据到了**我们**库里;批次 completed
+                     不等于落库,中间还隔着增量导出 + product_ingest 两跳)
+      批次已落定   → 该认账的失败(原因来自 /failures)
+      兜底超时     → 批次查不到时防台账永远挂着
     """
     with conn.cursor() as cur:
         cur.execute(_SETTLE_SQL)
         settled = cur.rowcount or 0
-        cur.execute(_TIMEOUT_SQL, {"hours": _SCRAPE_TIMEOUT_HOURS})
-        timed_out = cur.rowcount or 0
+    conn.commit()
+
+    reaped, failed_pairs, notes = _reap_batches(conn)
+
+    with conn.cursor() as cur:
+        cur.execute(_TIMEOUT_SQL, {"mins": _SCRAPE_TIMEOUT_MIN})
+        timed_out = (cur.rowcount or 0)
         cur.execute(_BLOCKED_SQL, {"retry": _RESCRAPE_WINDOW_HOURS,
                                    "fresh": _SNAPSHOT_FRESH_HOURS})
         blocked = {(r[0], r[1]): r[2] for r in cur.fetchall()}
     conn.commit()
+
     if timed_out:
-        logger.warning("采集台账:%d 个 (ASIN,邮编) 超 %d 小时未见快照,判失败"
-                       "(下轮会重推)", timed_out, _SCRAPE_TIMEOUT_HOURS)
-    return settled, timed_out, blocked
+        logger.warning("采集台账:%d 个 (ASIN,邮编) 超 %d 分钟兜底超时"
+                       "(批次状态查不到),下轮会重推",
+                       timed_out, _SCRAPE_TIMEOUT_MIN)
+    if reaped:
+        notes.insert(0, f"批次落定 {reaped} 个,认账失败 {failed_pairs} 个组合")
+    return settled, timed_out + failed_pairs, blocked, notes
 
 
-def _push_scrape(conn, want: list, blocked: set) -> str:
+def _push_scrape(conn, want: list, blocked: dict) -> str:
     """输入:连接 + 待采 pair + 本轮不可推的 pair → 输出:推送结果摘要(一行)。
 
-    **先落 pending 再调接口**:批次名先写进台账,再 POST。反过来的话
-    (先推后记)网络一断就成了"推上去了但库里没记录",下轮重复推同一批。
+    **一个邮编一个批次,批次名带邮编**(`wm-audit-<邮编>-<时间戳>`)——
+    理由见 services.order_audit.plan_zip_batches:采集侧对同一 ASIN 只存一行
+    全局记录,按批次取数/取图的端点分不出邮编,批次名是唯一的隔离键。
+    **所有邮编同一轮内推完**,不跨轮等待。
 
-    波次:一批里可以混不同 ASIN 的不同邮编(逐 ASIN 带邮编),但同一 ASIN
-    的多个邮编必须分到不同批次(采集侧 UNIQUE(batch_id, asin))。
-    **所有波次同一轮内推完**,不再跨轮等待。
+    **先落 pending 再调接口**(CLAUDE.md 铁律):批次名先写进 ops.audit_scrape,
+    再 POST。反过来的话(先推后记)网络一断就成了"推上去了但库里没记录",
+    下轮重复推同一批。批次本身也要记 ops.scrape_batches——**batch_id 只有推送
+    响应里有**,不当场记下来,以后就没法拉 `/failures` 问失败原因了。
     """
-    waves = rules.plan_waves(want, set(blocked))
+    plan = rules.plan_zip_batches(want, set(blocked))
     held = [blocked[p] for p in {(a, z) for a, z in want} if p in blocked]
     inflight = held.count("inflight")
     gaveup = held.count("gaveup")
@@ -328,7 +451,7 @@ def _push_scrape(conn, want: list, blocked: set) -> str:
         logger.warning("采集台账:%d 个 (ASIN,邮编) 已超 %d 小时重试窗口,"
                        "本轮起不再重推,需人工处理",
                        gaveup, _RESCRAPE_WINDOW_HOURS)
-    if not waves:
+    if not plan:
         if not want:
             return "推采集:0(无待采)"
         return (f"推采集:0(待采 {len(want)} 行"
@@ -338,39 +461,43 @@ def _push_scrape(conn, want: list, blocked: set) -> str:
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
     pushed, failed, notes = 0, 0, []
-    for i, wave in enumerate(waves, 1):
-        # 单波(常态)不带序号:批次名是取图与排障的抓手,越简单越好
-        name = f"wm-audit-{stamp}" if len(waves) == 1 else f"wm-audit-{stamp}-{i:02d}"
+    for zip5, asins in sorted(plan.items()):
+        name = f"{_BATCH_PREFIX}{zip5}-{stamp}"
         with conn.cursor() as cur:
             cur.executemany(_MARK_PENDING_SQL,
-                            [{"asin": a, "zip": z, "batch": name,
-                              "fresh": _SNAPSHOT_FRESH_HOURS} for a, z in wave])
+                            [{"asin": a, "zip": zip5, "batch": name,
+                              "fresh": _SNAPSHOT_FRESH_HOURS} for a in asins])
         conn.commit()
-        items = [{"asin": a, "zip_code": z} for a, z in wave]
         try:
-            res = scraper.submit_items(name, items, needs_screenshot=True)
-            pushed += len(wave)
-            notes.append(f"{len(wave)} 个"
-                         f"({len({z for _, z in wave})} 个邮编)")
-            logger.info("推采集批次 %s:%d 个 ASIN(inserted=%s)",
-                        name, len(wave), res.get("inserted"))
+            res = scraper.submit_json(name, asins, zip_code=zip5,
+                                      needs_screenshot=True)
+            batches.record(name, res.get("batch_id"), len(asins), "pushed",
+                           f"inserted={res.get('inserted')}")
+            pushed += len(asins)
+            notes.append(f"{zip5}×{len(asins)}")
+            logger.info("推采集批次 %s:%d 个 ASIN(batch_id=%s inserted=%s)",
+                        name, len(asins), res.get("batch_id"),
+                        res.get("inserted"))
         except scraper.BatchExistsError as e:
-            # 撞名 = 上次其实推成功了(v4 绝不静默合并):台账保持 pending 即可
-            pushed += len(wave)
-            notes.append(f"{len(wave)} 个(沿用既有批次 {e.batch_id})")
+            # 撞名 = 上次其实推成功了(v4 绝不静默合并):台账保持 pending,
+            # 顺手把既有 batch_id 记下来,不然这批的失败明细就查不了
+            batches.record(name, e.batch_id, len(asins), "pushed",
+                           "撞名沿用既有批次")
+            pushed += len(asins)
+            notes.append(f"{zip5}×{len(asins)}(沿用既有批次)")
         except Exception as e:
-            failed += len(wave)
+            failed += len(asins)
+            batches.record(name, None, len(asins), "failed", str(e)[:200])
             with conn.cursor() as cur:
                 cur.executemany(
                     "UPDATE ops.audit_scrape SET state = 'failed', "
                     "reason = %s, settled_at = now() "
                     "WHERE asin = %s AND zip = %s AND state = 'pending'",
-                    [(str(e)[:200], a, z) for a, z in wave])
+                    [(str(e)[:200], a, zip5) for a in asins])
             conn.commit()
             logger.exception("推采集批次 %s 失败", name)
-    wave_note = f",{len(waves)} 波" if len(waves) > 1 else ""
-    out = (f"推采集:{pushed} 个 ASIN×邮编{wave_note}({'、'.join(notes)})"
-           if pushed else "")
+    out = (f"推采集:{pushed} 个 ASIN×邮编,{len(plan)} 个邮编批次"
+           f"({'、'.join(notes)})" if pushed else "")
     if inflight:
         out += f";在途 {inflight} 未重推"
     if gaveup:
@@ -399,17 +526,44 @@ def _save(conn, results: list) -> int:
     return len(payload)
 
 
-def _screenshot_token(conn, batch_name: str, asin: str) -> str | None:
-    """输入:连接 + 批次名 + ASIN → 输出:飞书 file_token(拿不到返回 None)。
+# 截图终态:这张图不会再有了,记墓碑别再问。**其余状态一律当"还没好"**
+# ——未知状态按可重试处理,最多下轮再问一次;反过来把未知当终态,一次网络
+# 抖动就永久放弃一张本来能拿到的图。
+_SHOT_DEAD = {"failed", "gone", "expired", "cancelled", "canceled"}
 
-    取图走采集侧 `GET /api/screenshots/{批次名}/{asin}`,**批次名是隔离键**
-    (落盘即 `<批次名>/<asin>.png`),所以同一 ASIN 的不同邮编批次各有各的图。
 
-    三种结局分别处置(采集侧把它们分成三个状态码就是为了让调用方能分):
-    - 409 未就绪 → 本轮不写这一列,下轮再来(审核结论照出,不等图)
-    - 404/410 不会再有 → 记墓碑,以后不再为这张图发请求
-    - 200 → 上传飞书换 file_token,记 ops.dedupe(上传接口不幂等,
+def _shot_index(batch_names) -> dict[tuple[str, str], str]:
+    """输入:批次名集合 → 输出:{(批次名, ASIN): 截图状态}。
+
+    **按批次一次拿清单**(`GET /api/screenshots?batch_name=`),不逐 ASIN 试探:
+    一批 50 个 ASIN 只有 10 张图好了,逐个试要发 50 次(40 次收 409),
+    这里 1 次清单 + 10 次取图。批次名同时是隔离键(落盘 `<批次名>/<asin>.png`),
+    所以同一 ASIN 的不同邮编批次各有各的图。
+
+    查不到清单只当"这批本轮没有图"——截图是佐证材料,永不阻断审核结论。
+    """
+    out: dict[tuple[str, str], str] = {}
+    for name in sorted(n for n in batch_names if n):
+        try:
+            items = scraper.screenshot_list(name)
+        except (LookupError, RuntimeError, httpx.HTTPError) as e:
+            logger.warning("截图清单查询失败(批次 %s,本轮跳过取图):%s", name, e)
+            continue
+        for it in items:
+            asin = str(it.get("asin") or "").strip().upper()
+            if asin:
+                out[(name, asin)] = str(it.get("status") or "").strip().lower()
+    return out
+
+
+def _screenshot_token(conn, batch_name: str, asin: str, status: str) -> str | None:
+    """输入:连接 + 批次名 + ASIN + 清单里的状态 → 输出:飞书 file_token(无则 None)。
+
+    三种结局分别处置:
+    - done → 取图上传飞书换 file_token,记 ops.dedupe(上传接口不幂等,
       重复上传会在飞书网盘堆垃圾)
+    - 终态失败 → 记墓碑,以后不再为这张图发请求
+    - 其余(还没好 / 清单里根本没这条)→ 本轮不写这一列,下轮再来
 
     截图是佐证材料:任何一步失败都只告警,绝不让整行审核失败。
     """
@@ -422,10 +576,16 @@ def _screenshot_token(conn, batch_name: str, asin: str) -> str | None:
         hit = cur.fetchone()
     if hit:
         return hit[0] or None           # 已上传过,或已记墓碑(不再重试)
+    if status in _SHOT_DEAD:
+        logger.info("截图不会再有,记墓碑不再重试:%s(status=%s)", key, status)
+        _remember(conn, key, {"gone": True, "reason": f"status={status}"})
+        return None
+    if status != "done":
+        return None                     # 还没好 / 没这条:下轮再来,不记墓碑
     try:
         png = scraper.fetch_screenshot(batch_name, asin)
     except scraper.ScreenshotPending:
-        return None                     # 稍后再来,不记墓碑
+        return None                     # 清单说好了但取图说没好:下轮再来
     except scraper.ScreenshotGone as e:
         logger.info("截图不会再有,记墓碑不再重试:%s", e)
         _remember(conn, key, {"gone": True, "reason": str(e)[:200]})
@@ -478,7 +638,8 @@ def _batch_names(conn, rows: list[dict]) -> dict[tuple, str]:
 def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     """输入:连接 + 已判定行 → 输出:{order_line_id: 飞书审核列载荷}。"""
     f = resources.ORDER_SALES_AUDIT.fields
-    batches = _batch_names(conn, rows)
+    batch_of = _batch_names(conn, rows)
+    shots = _shot_index(set(batch_of.values()))
     out: dict[str, dict] = {}
     for r in rows:
         d = _detail(r)
@@ -494,8 +655,11 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
             f.price_cap: _num(d.get("price_cap")),
             f.title_similarity: _num(d.get("title_similarity")),
         }
-        batch = batches.get((d.get("asin"), d.get("zip")))
-        token = _screenshot_token(conn, batch, d.get("asin")) if batch else None
+        asin = (d.get("asin") or "").upper()
+        batch = batch_of.get((d.get("asin"), d.get("zip")))
+        token = (_screenshot_token(conn, batch, asin,
+                                   shots.get((batch, asin), ""))
+                 if batch and asin else None)
         if token:
             fields[f.screenshot] = [{"file_token": token}]
         out[r["order_line_id"]] = fields
@@ -538,7 +702,7 @@ def run(params: dict) -> str:
         lines = [r for r in lines if not _marked_phishing(r)]
 
         # ② 采集台账先对账(重启安全:pending 还在,能判断该不该重推)
-        settled, timed_out, blocked = _settle_ledger(conn)
+        settled, gone, blocked, batch_notes = _settle_ledger(conn)
 
         results, want = _judge_all(conn, lines, blacklist, suppliers)
         saved = _save(conn, results)
@@ -546,7 +710,7 @@ def run(params: dict) -> str:
         for _, res in results:
             tally[res.status] = tally.get(res.status, 0) + 1
 
-        # ③ 推采集:每轮每个 ASIN 只放行一个邮编(同批混邮编会漏数据)
+        # ③ 推采集:一个邮编一个批次(批次名带邮编,取数取图靠它隔离)
         scrape_note = ""
         if do_scrape:
             scrape_note = _push_scrape(conn, want, blocked)
@@ -576,9 +740,10 @@ def run(params: dict) -> str:
         parts.append("结论:" + " / ".join(f"{k} {v}" for k, v in sorted(tally.items())))
     if want:
         parts.append(f"待采集 {len(want)} 行(该邮编下无快照)")
-    if settled or timed_out:
+    if settled or gone:
         parts.append(f"采集落定 {settled}"
-                     + (f",超时判失败 {timed_out}" if timed_out else ""))
+                     + (f",判失败 {gone}" if gone else ""))
+    parts.extend(batch_notes)
     if scrape_note:
         parts.append(scrape_note)
     if do_push:

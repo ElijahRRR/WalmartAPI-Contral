@@ -533,9 +533,16 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
 
--- 采集推送批次台账(product_refresh 用;所有者定稿 2026-08-09):
--- 全量重推在线产品前先落账,**确认推上去了(拿到 batch_id)才开始计时**;
--- 批次名是取回的抓手(按批次查比整库查快得多),1 小时未采完视为超时。
+-- 采集推送批次台账(所有者定稿 2026-08-09)。**两条工作流共用一张表**:
+-- product_refresh 的全量重推批次(`wm-refresh-*`)与 order_audit 的按邮编
+-- 批次(`wm-audit-<邮编>-*`)。两边超时口径不同(1 小时 vs 20 分钟),
+-- 所以**查在途必须按批次名前缀圈自己的**——不过滤的话,维护链的 check
+-- 会拿 1 小时口径把订单审核那些还在跑的批次标成 timeout。
+-- 推送前先落账,**确认推上去了(拿到 batch_id)才开始计时**;batch_id 必须
+-- 当场记下:/api/batches/{id}/failures 只认 id 不认名字,漏记就再也查不出
+-- "这个 ASIN 为什么没采到"。
+-- 落定判据统一在 services/scrape_batches.is_settled(采集侧 2026-08-10 实测):
+--     completed ⇔ tasks.open == 0 AND screenshots.open == 0   (failed 算终态)
 CREATE TABLE IF NOT EXISTS ops.scrape_batches (
     batch_name  text PRIMARY KEY,
     batch_id    text,               -- 采集侧 ID(200 新建 / 409 既有,都记)
@@ -553,10 +560,17 @@ CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
 -- 存在的三个理由:
 -- ① **先落 pending 再调接口**(CLAUDE.md 铁律)——旧系统完全没有防重记录,
 --    提交/回填中途一断就丢,重启后没有 pending 可对账(legacy_survey 明列此洞);
--- ② **同一 ASIN 不同邮编严禁同批提交**(所有者定稿 2026-08-09:会漏数据)——
---    在途集合就是"这个 ASIN 这轮已经占用了一个邮编"的依据,下个邮编等下一轮;
--- ③ 落定判据不看批次状态而看**快照是否真出现**(requested_at 之后该 (ASIN,邮编)
---    有新快照才算 done),批次说成功但数据没落地的情况照样能被抓出来。
+-- ② **一个邮编一个批次**(所有者定稿 2026-08-10),batch_name 里带邮编。
+--    理由不是性能而是正确性:采集侧对同一 ASIN 只存一行全局记录,按批次取数
+--    的端点分不出邮编(两个批次返回完全相同的行且不报错),截图也只按
+--    `<批次名>/<asin>.png` 落盘。取数因此只走 /api/export/incremental 按
+--    scrape_params.zipcode 分组;batch_name 则是取图与排障的抓手。
+-- ③ 落定三层判据(见 workflows/order_audit._settle_ledger):快照真出现 → done;
+--    批次已落定仍无快照 → 认账 failed 并去 /failures 拿真实原因;
+--    兜底超时 20 分钟只打在批次已不在途的组合上(在途批次不判超时,
+--    否则采集侧正干着我们又重推一遍 = 白烧一批配额)。
+--    **批次 completed 不等于我们库里有数据**:中间隔着增量导出 + product_ingest
+--    两跳,所以"这条到没到"只能看快照,批次状态只回答"还要不要等"。
 CREATE TABLE IF NOT EXISTS ops.audit_scrape (
     asin        text NOT NULL,
     zip         text NOT NULL,      -- 5 位标准邮编

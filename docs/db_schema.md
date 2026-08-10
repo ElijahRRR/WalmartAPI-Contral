@@ -280,6 +280,20 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 生成函数唯一出处:`services/order_lines.py`;审核规则唯一出处:`services/order_audit.py`。
 
+**两条 upsert 语义**(2026-08-10 生产实证后定稿,`services/order_lines._upsert`):
+
+- **内容没变就整行不写**(`ON CONFLICT ... DO UPDATE ... WHERE 旧值 IS DISTINCT FROM 新值`)。
+  原先无条件 `updated_at = now()`,而 order_sync 每轮**全量重拉 45 天窗口**
+  ⇒ 窗口内每行 updated_at 都被刷新 ⇒ order_center_push 把它当「拉取时间」写进
+  飞书载荷、载荷参与指纹 ⇒ **指纹必变 ⇒ 每轮重推窗口内全部行**
+  (实证:销售订单 7100 行更新 3122,正是 45 天窗口行数;售后表没有「拉取时间」
+  列,同一轮只更新真变化的 7 行——天然对照组)。改完 `updated_at` 才真正表示
+  "这行什么时候变的",飞书指纹这道写放大治理也随之恢复效力。
+- **电话全 0 不覆盖真电话**:沃尔玛常态把买家电话打码成 `0000000000`
+  (实证 45 天窗口 2964/3542 = 84%),原样覆盖会把库里真值冲掉且**找不回**
+  (`raw` 也是每次一起被覆盖的)。旧系统的「电话全 0 保护」,legacy_survey
+  明列必须照搬。反向不设防:真电话覆盖全 0 是正常修复。
+
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
 | `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 |

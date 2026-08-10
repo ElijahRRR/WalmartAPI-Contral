@@ -311,6 +311,41 @@ def test_upserts_build_conflict_sql():
     assert isinstance(rows2[0]["detail"], str)                 # dict 已序列化
 
 
+def test_upsert_skips_write_when_nothing_changed():
+    """内容没变就整行不写——updated_at 才能表示"这行什么时候变的"。
+
+    原先是无条件 `DO UPDATE SET ..., updated_at = now()`,而 order_sync 每轮
+    全量重拉 45 天窗口 ⇒ 窗口内每行的 updated_at 都被刷新 ⇒ order_center_push
+    的指纹(含「拉取时间」)必变 ⇒ 每轮把窗口内全部行重推飞书。
+    2026-08-10 生产实证:7100 行更新 3122,正是 45 天窗口的行数。
+    """
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
+    sql, _ = conn.cur.calls[0]
+    body = sql.split("DO UPDATE")[1]
+    assert "IS DISTINCT FROM" in body, "没有变更检测 = 每轮全窗口重写"
+    # 变更检测比的是**生效后的值**,不是 EXCLUDED——否则被 guard 挡下的
+    # 假变化照样会让整行重写、updated_at 空跳
+    where = body.split("WHERE")[1]
+    assert "CASE WHEN" in where and "t.phone" in where
+
+
+def test_upsert_phone_all_zero_never_overwrites_real_number():
+    """沃尔玛常态把电话打码成全 0(实证 84%),原样覆盖会把真电话冲掉且找不回。
+
+    旧系统的「电话全 0 保护」,legacy_survey 明列必须照搬。
+    反向不设防:真电话覆盖全 0 是正常修复。
+    """
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
+    sql, _ = conn.cur.calls[0]
+    guard = [seg for seg in sql.split(",") if "phone =" in seg]
+    assert guard, "phone 列必须走保护表达式而不是裸 EXCLUDED"
+    assert "^0*$" in sql and "THEN t.phone" in sql
+    # 其余列不受影响,仍是直接覆盖
+    assert "ship_name = EXCLUDED.ship_name" in sql
+
+
 def test_backfill_perf_line_ids_two_stage_sku_first():
     conn = _FakeConn()
     total = ol.backfill_perf_line_ids(conn)

@@ -275,11 +275,48 @@ def test_judge_title_missing_is_manual():
     assert "标题取不到" in res.note
 
 
-def test_judge_title_checked_before_price():
-    """一致性排在限价前:标题不符时不该先蹦出限价结论。"""
+def test_judge_title_mismatch_never_yields_a_final_verdict():
+    """商品一致性存疑 ⇒ 结论**一定是待人工**,绝不给通过/建议拒绝。
+
+    商品都可能不是同一个,拿它算出来的结论不作数 —— 这条不变量不变。
+    """
     res = rules.judge(LINE, _snap(amz_price=999, amz_title="Different Thing"),
                       SUPPLIERS, set())
-    assert res.status == rules.MANUAL and "限价" not in res.note
+    assert res.status == rules.MANUAL
+    assert "商品可能不一致" in res.note
+
+
+def test_judge_title_mismatch_still_assigns_supplier_and_cost():
+    """标题不符的行**也要把采购方/限价/成本算出来填上**(所有者定稿 2026-08-10)。
+
+    人工复核时得看到"如果这真是同一个商品,该找谁采、成本多少、过不过限价";
+    只给一句"可能不一致"什么都判断不了。原先在标题这道就 return 了,
+    飞书上采购方、成本全是空的。
+    """
+    res = rules.judge(LINE, _snap(amz_price=40, shipping=0,
+                                  amz_title="Different Thing"),
+                      SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert res.detail["supplier"] == "甲"          # 档位照选
+    assert res.detail["price_cap"] == 75.0         # 限价照算
+    assert res.detail["cost"] == 43.2              # 40 × 1 × 1.0 × 1.08
+    assert res.detail["landed_price"] == 40.0
+    assert "供参考" in res.note                     # 但明确标注不作数
+
+
+def test_judge_title_missing_also_keeps_computing():
+    """标题取不到与标题不符同一处理:降级为待人工,后面照算。"""
+    res = rules.judge(LINE, _snap(amz_price=40, shipping=0, amz_title=None),
+                      SUPPLIERS, set())
+    assert res.status == rules.MANUAL and "标题取不到" in res.note
+    assert res.detail["supplier"] == "甲" and res.detail["cost"] == 43.2
+
+
+def test_judge_title_mismatch_keeps_rescrape_flag():
+    """降级不能把重采标记吃掉:运费没采到仍要进待采清单。"""
+    res = rules.judge(LINE, _snap(shipping=None, amz_title="Different Thing"),
+                      SUPPLIERS, set())
+    assert res.status == rules.MANUAL and res.rescrape is True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -852,7 +889,7 @@ def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001")),
     增量流里,**这时认账失败就是冤枉**(2026-08-10 实测 127 个组合全军覆没)。
     """
     return FakeConn({
-        "status IN ('pushed', 'running')":
+        "ORDER BY b.submitted_at":
             (["batch_name", "batch_id", "asin_count"],
              [("wm-audit-10001-x", "7", 2)]),
         "ingest_caught_up":
@@ -1435,3 +1472,50 @@ def test_scrape_failure_ignored_once_snapshot_arrives():
     """台账里有历史失败,但这次快照回来了 ⇒ 正常判,不受旧失败影响。"""
     res = rules.judge(LINE, _snap(), SUPPLIERS, set(), scrape_fail="variant_offset")
     assert res.status == rules.PASS
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  批次"落定"不是最终:server 会把失败任务推回 worker 再循环两轮
+#  (所有者 2026-08-10 澄清采集侧机制)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_settled_batch_is_repolled_while_pairs_pending(wired, monkeypatch):
+    """已记 completed 的批次**照样要复查状态** —— 它可能被 server 推回重采。
+
+    原先只查 status IN ('pushed','running'),批次一旦记成 completed 就再也不会
+    被看一眼:重新入队完全看不见,而我们已经按"它结束了"去认账失败了。
+    """
+    wf, calls = wired
+    conn = _reap_conn(reapable=False)
+    asked = []
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: asked.append(n) or {"stats": {"open": 2},
+                                                      "screenshots": {"open": 0}})
+    wf._reap_batches(conn)
+    assert asked == ["wm-audit-10001-x"]      # 查了(夹具里它有 pending 组合)
+    assert [a[3] for a in calls.get("recorded", [])] == ["running"]
+
+
+def test_reopened_batch_clears_the_stability_clock():
+    """批次弹回在途时 record() 必须把 finished_at 清空。
+
+    不清的话:第一次 open 归零记下的 finished_at 会让"稳住 15 分钟"提前满足,
+    而那批数据其实正在重采路上,我们却已经认账失败了 —— 且 failed 不挡重推,
+    下一轮还会把它们再采一遍,白烧配额。
+    这条只能断言 SQL 文本:夹具喂什么假数据都盖不住少一句 CASE。
+    """
+    import inspect
+    from services import scrape_batches as sb
+    src = inspect.getsource(sb.record)
+    assert "finished_at = CASE WHEN EXCLUDED.status IN ('pushed','running')" in src
+    assert "THEN NULL" in src
+
+
+def test_reap_waits_for_the_stability_window():
+    """认账失败的 SQL 必须带"落定已稳住 N 分钟"这一条。
+
+    同样只能断言 SQL 文本 —— 时间条件在 PG 侧求值,假连接盖不住。
+    """
+    from workflows import order_audit as wf
+    assert "b.finished_at < now() - make_interval(mins => %(stable)s)" in wf._REAPABLE_SQL
+    assert wf._AUTO_RETRY_SETTLE_MIN >= 15      # server 自动重试 2 轮 × 5 分钟

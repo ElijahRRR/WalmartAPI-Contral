@@ -63,10 +63,20 @@
      就把这 127 条原样摄了进来——采集全成功,是我们问早了。且 failed 不挡
      重推,下一轮会把它们再采一遍,每小时白烧一轮,两侧都不报错;
   ③ 兜底超时 20 分钟 → 只打在**批次已查不到**的组合上,防台账永远挂着。
+  **且落定要稳住 15 分钟才认账**(所有者 2026-08-10 澄清采集侧机制):server 会
+  把失败任务推回 worker 再循环两轮(每轮间隔 5 分钟),`tasks.open` 归零**不代表
+  最终**,归零后还可能重新入队。所以 ① 复查状态的范围是"**所有还有 pending 组合
+  的批次**"而不只是在途的(否则记成 completed 之后就再没人看它一眼,重新入队
+  完全看不见);② 批次弹回在途时 `record()` 清空 finished_at,稳定窗口从零重计。
   在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
   **落定判据不含 `screenshots.open`**(2026-08-10 所有者实测后改):失败任务
   的截图槽位不会再有人去截,shots_open 永久 >0,带上它就永远落不定。
   `-p wait=1` 在数据齐了之后另给截图 60 秒宽限,到点照常出结论,图下轮补贴。
+- **`outcome` 是粗粒度的,真实原因看 `error_type`**(所有者 2026-08-10 澄清):
+  增量导出里一条 `outcome="parse_failed"` 底下可能是 network / timeout /
+  parse_error 任意一种,只有 `/api/batches/{id}/failures` 的 error_type 说得准。
+  拿 outcome 当原因去决定"要不要再采",等于把可重试的和不可重试的混成一桶——
+  前者放弃得太早,后者每轮白烧一次配额。判定链两处都按 error_type 分流。
 - **重采无效的采集失败给终局结论**:`error_type` 落 ops.audit_scrape 单独一列,
   命中 `services.scrape_batches.TERMINAL`(采集侧 NO_AUTO_RETRY_ERROR_TYPES 的
   镜像:variant_offset / parse_error / server_reject …)⇒ **建议拒绝且不再重推**。
@@ -93,6 +103,10 @@
 - **限价一进门就算**(商品金额 × 0.75),不等采集也不等采购方:它只跟沃尔玛
   这一侧有关。原先放在采购方命中之后,导致「无匹配采购方」「待采集」的行在
   飞书上连限价列都是空的,人工复核连参照都没有。
+- **商品一致性存疑的行也要分配采购方**(所有者定稿 2026-08-10):标题不符时
+  结论**降级**为待人工而不是就地 return,后面的落地价/选档/成本照算完填进
+  detail——人工要看到"如果这真是同一个商品,该找谁采、成本多少、过不过限价"。
+  原不变量仍守住:商品可能不是同一个,所以绝不给通过/建议拒绝,原因里两条都写。
 """
 
 import json
@@ -120,6 +134,11 @@ _SCRAPE_TIMEOUT_MIN = 20       # 兜底超时(所有者定稿 2026-08-10:切邮�
 _SNAPSHOT_FRESH_HOURS = 24     # 快照超此时长即视同没有(所有者定稿 2026-08-10)
 _RESCRAPE_WINDOW_HOURS = 24    # 同一组合的重采窗口:超此时长仍拿不到可用数据就放弃
 _SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe:批次名|ASIN → file_token
+_AUTO_RETRY_SETTLE_MIN = 15    # 批次 tasks.open 归零后还要稳住这么久才认账失败。
+                               # 采集侧 server 会把失败任务推回 worker 再循环两轮
+                               # (每轮间隔 5 分钟),归零**不代表最终**——所有者
+                               # 2026-08-10 澄清。这道闸只管"认账失败",不影响
+                               # 快照到了就 done,也不影响 -p wait=1 何时收工
 _SHOT_GRACE_SEC = 60           # 数据采完后额外等截图的上限。**截图不是落定条件**
                                # (任务失败后它那张图永远不会好,当闸会永久卡住),
                                # 只是"顺手多等一会儿能这轮就贴上"
@@ -230,10 +249,19 @@ WHERE a.state = 'pending'
 # 本工作流推的批次:批次名前缀区分,不碰 product_refresh 的 wm-refresh-*
 _BATCH_PREFIX = "wm-audit-"
 
+# 要复查状态的批次:**只要还有 pending 组合就复查,不管台账记的是什么状态**。
+#
+# 不能只查 pushed/running(2026-08-10 所有者澄清后改):采集侧的 server 会把
+# 失败任务推回 worker 再循环两轮,`tasks.open` 归零**不代表最终** —— 归零之后
+# 还可能重新入队。只查在途批次的话,一个批次被我们记成 completed 之后就再也
+# 不会被看一眼,重新入队完全看不见,而我们已经按"它结束了"去认账失败了。
 _OPEN_BATCHES_SQL = """
-SELECT batch_name, batch_id, asin_count FROM ops.scrape_batches
-WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
-ORDER BY submitted_at
+SELECT b.batch_name, b.batch_id, b.asin_count
+FROM ops.scrape_batches b
+WHERE b.batch_name LIKE %(prefix)s
+  AND EXISTS (SELECT 1 FROM ops.audit_scrape a
+              WHERE a.batch_name = b.batch_name AND a.state = 'pending')
+ORDER BY b.submitted_at
 """
 
 # 可以认账的批次:已落定、还有 pending 组合、**且摄取水位线已越过它的落定时刻**。
@@ -254,6 +282,12 @@ FROM ops.scrape_batches b
 WHERE b.batch_name LIKE %(prefix)s
   AND b.status NOT IN ('pushed', 'running')
   AND b.finished_at IS NOT NULL
+  -- 落定得**稳住**这么久才算数:采集侧 server 把失败任务推回 worker 再循环
+  -- 两轮(每轮间隔 5 分钟),期间 tasks.open 会从 0 弹回 >0。第一次归零就认账
+  -- 失败,等于在数据正要回来的路上判它死刑 —— 而 failed 不挡重推,下一轮还会
+  -- 再采一遍,白烧配额。窗口内批次若真的重新入途,record() 会把 finished_at
+  -- 清空,这张表从零重计。
+  AND b.finished_at < now() - make_interval(mins => %(stable)s)
   AND EXISTS (SELECT 1 FROM ops.audit_scrape a
               WHERE a.batch_name = b.batch_name AND a.state = 'pending')
 ORDER BY b.finished_at
@@ -465,6 +499,8 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
         # 只认 batch_id,缺了这批的失败原因就永远问不出来
         batch_id = batch_id or st.get("batch_id")
         if not batches.is_settled(st):
+            # 可能是首次在途,也可能是**已落定后又被 server 推回重采**——
+            # 后者靠 record() 把 finished_at 清空,稳定窗口从零重计。
             stats = st.get("stats") or {}
             shots = st.get("screenshots") or {}
             batches.record(name, batch_id, n, "running",
@@ -480,7 +516,8 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
     conn.commit()          # 让 ① 写的 finished_at 对下面这条查询可见
     with conn.cursor() as cur:
         cur.execute(_REAPABLE_SQL, {"prefix": _BATCH_PREFIX + "%",
-                                    "watermark": ingest.WATERMARK_NAME})
+                                    "watermark": ingest.WATERMARK_NAME,
+                                    "stable": _AUTO_RETRY_SETTLE_MIN})
         candidates = cur.fetchall()
 
     waiting = 0

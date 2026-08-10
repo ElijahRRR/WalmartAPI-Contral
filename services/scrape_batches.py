@@ -83,7 +83,14 @@ def record(batch_name: str, batch_id, n: int, status: str,
             " status, note) VALUES (%s,%s,%s,%s,%s)"
             " ON CONFLICT (batch_name) DO UPDATE SET"
             " batch_id = COALESCE(EXCLUDED.batch_id, ops.scrape_batches.batch_id),"
-            " status = EXCLUDED.status, note = EXCLUDED.note",
+            " status = EXCLUDED.status, note = EXCLUDED.note,"
+            # 重新回到在途 ⇒ 清掉 finished_at,让"稳定多久"的表从零重新计。
+            # 采集侧会把失败任务从 server 推回 worker 再循环两轮,tasks.open
+            # 归零**不代表最终**(所有者 2026-08-10 澄清)。不清的话:第一次
+            # 归零时记下的 finished_at 会让稳定窗口提前满足,而那批数据其实
+            # 正在重采路上,我们却已经认账失败了。
+            " finished_at = CASE WHEN EXCLUDED.status IN ('pushed','running')"
+            "                    THEN NULL ELSE ops.scrape_batches.finished_at END",
             (batch_name, str(batch_id) if batch_id else None, n, status,
              note or None))
 

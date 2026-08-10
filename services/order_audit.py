@@ -328,7 +328,22 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                     "stock_qty", "ship_method", "ship_days", "seller",
                     "amz_title", "scraped_at")})
     if snap.get("outcome") and snap["outcome"] != "ok":
-        return AuditResult(MANUAL, f"采集未成功({snap['outcome']}),已排重采",
+        # 契约的 outcome 是**粗粒度**的(所有者 2026-08-10 澄清):一条
+        # `parse_failed` 底下可能是 network / timeout / parse_error 任意一种,
+        # 真实原因只有 `/api/batches/{id}/failures` 的 error_type 说得准 ——
+        # 台账已把它落在 ops.audit_scrape.error_type,这里直接用。
+        # 拿 outcome 当原因去决定"要不要再采",等于把可重试的和不可重试的
+        # 混成一桶:前者放弃得太早,后者每轮白烧一次配额。
+        detail["rules"]["scrape"] = {"outcome": snap["outcome"],
+                                     "error_type": scrape_fail}
+        if scrape_fail in TERMINAL:
+            return AuditResult(REJECT,
+                               f"采集未成功({snap['outcome']} → 实际 {scrape_fail}:"
+                               f"{ERROR_TYPES[scrape_fail]}),重采无效,建议拒绝",
+                               detail)
+        why = (f"{snap['outcome']} → 实际 {scrape_fail}" if scrape_fail
+               else snap["outcome"])
+        return AuditResult(MANUAL, f"采集未成功({why}),已排重采",
                            detail, rescrape=True)
 
     missing = [n for n, v in (("亚马逊单价", snap.get("amz_price")),
@@ -345,20 +360,35 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail["title_similarity"] = sim
     detail["rules"]["title"] = {"similarity": sim, "min": TITLE_SIMILARITY_MIN}
     if sim is None:
-        return AuditResult(MANUAL, "标题取不到(沃尔玛或亚马逊一侧为空),待人工",
-                           detail)
-    if sim < TITLE_SIMILARITY_MIN:
-        return AuditResult(MANUAL,
-                           f"商品可能不一致:标题相似度 {sim} < {TITLE_SIMILARITY_MIN},"
-                           f"待人工", detail)
+        held = "标题取不到(沃尔玛或亚马逊一侧为空)"
+    elif sim < TITLE_SIMILARITY_MIN:
+        held = f"商品可能不一致:标题相似度 {sim} < {TITLE_SIMILARITY_MIN}"
+    else:
+        held = None
+
+    def out(status: str, note: str, **kw) -> AuditResult:
+        """商品一致性存疑时把结论**降级为待人工**,但后面的判定照跑完。
+
+        所有者定稿 2026-08-10:标题不符的行也要分配采购方 —— 人工复核时
+        得看到"如果这真是同一个商品,该找谁采、成本多少、过不过限价",
+        否则只有一句"可能不一致",什么都判断不了。
+
+        降级而不是直接 return,是为了同时守住原来那条不变量:**垃圾输入
+        不该产出确定结论**。商品都可能不是同一个,拿它算出来的"通过"或
+        "建议拒绝"都不作数,所以状态一律回到待人工,原因里两条都写上。
+        """
+        if held and status != MANUAL:
+            return AuditResult(MANUAL, f"{held},待人工(供参考:{note})",
+                               detail, **kw)
+        if held:
+            return AuditResult(MANUAL, f"{held};{note}", detail, **kw)
+        return AuditResult(status, note, detail, **kw)
 
     # ⑤ 配送时长闸(≥9 天建议拒绝)
     days = _num(snap.get("ship_days"))
     detail["rules"]["delivery"] = {"days": days, "max": DELIVERY_DAYS_MAX}
     if days is not None and days >= DELIVERY_DAYS_MAX:
-        return AuditResult(REJECT,
-                           f"配送时长 {int(days)} 天 ≥ {DELIVERY_DAYS_MAX} 天",
-                           detail)
+        return out(REJECT, f"配送时长 {int(days)} 天 ≥ {DELIVERY_DAYS_MAX} 天")
 
     # ⑥ 落地价 = 亚马逊单价 + 亚马逊运费。**采购区间按它匹配**,不是按单价,
     #    更不是按沃尔玛的销售金额(所有者定稿 2026-08-10)。
@@ -368,18 +398,17 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     landed = landed_price(snap.get("amz_price"), snap.get("shipping"))
     detail["landed_price"] = landed
     if landed is None:
-        return AuditResult(MANUAL, "运费没采到,亚马逊落地价算不出来"
-                                   "(选不了采购方档位),已排重采",
-                           detail, rescrape=True)
+        return out(MANUAL, "运费没采到,亚马逊落地价算不出来"
+                           "(选不了采购方档位),已排重采", rescrape=True)
 
     # ⑦ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
     sup = pick_supplier(suppliers, snap.get("ship_method"), landed)
     if sup is None:
         detail["rules"]["supplier"] = {"hit": False, "landed": landed}
-        return AuditResult(MANUAL,
-                           f"无匹配采购方({_text(snap.get('ship_method')).upper()} / "
-                           f"落地价 {landed} = 单价 {snap.get('amz_price')}"
-                           f" + 运费 {snap.get('shipping')}),待人工", detail)
+        return out(MANUAL,
+                   f"无匹配采购方({_text(snap.get('ship_method')).upper()} / "
+                   f"落地价 {landed} = 单价 {snap.get('amz_price')}"
+                   f" + 运费 {snap.get('shipping')}),待人工")
     detail["supplier"] = sup.name
     detail["rate"] = sup.rate
     detail["rules"]["supplier"] = {"hit": True, "name": sup.name, "rate": sup.rate,
@@ -392,11 +421,11 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail["cost"] = cost
     detail["rules"]["price"] = {"cap": cap, "cost": cost}
     if cap is None or cost is None:
-        return AuditResult(MANUAL, "商品金额或采购成本算不出,待人工", detail)
+        return out(MANUAL, "商品金额或采购成本算不出,待人工")
     if not price_ok(cost, cap):
-        return AuditResult(REJECT, f"限价不通过:成本 {cost} > 限价 {cap}", detail)
+        return out(REJECT, f"限价不通过:成本 {cost} > 限价 {cap}")
 
-    return AuditResult(PASS, f"成本 {cost} ≤ 限价 {cap};采购方 {sup.name}", detail)
+    return out(PASS, f"成本 {cost} ≤ 限价 {cap};采购方 {sup.name}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

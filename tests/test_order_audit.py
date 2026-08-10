@@ -118,10 +118,18 @@ def test_price_cap():
 def test_purchase_cost_formula():
     """(单价 × 数量 × 汇率 + 运费) × 1.08;运费不乘汇率。"""
     assert rules.purchase_cost(10, 2, 1.0, 5) == round((10 * 2 * 1.0 + 5) * 1.08, 2)
-    assert rules.purchase_cost(10, 2, 1.0, 0) == 21.6
-    assert rules.purchase_cost(10, 2, 1.0) == 21.6          # 运费缺省按 0
-    assert rules.purchase_cost(None, 2, 1.0) is None
-    assert rules.purchase_cost(10, 2, None) is None
+    assert rules.purchase_cost(10, 2, 1.0, 0) == 21.6       # 0 = 确认免运费
+    assert rules.purchase_cost(None, 2, 1.0, 0) is None
+    assert rules.purchase_cost(10, 2, None, 0) is None
+
+
+def test_purchase_cost_refuses_missing_shipping():
+    """运费没采到(None)≠ 免运费(0):算不出成本,绝不当 0 蒙混过关。
+
+    当 0 的话成本照样算得出来、看着正常,只是偏小 —— 本该拒的单被放行,
+    而两侧都不会报错。这是采集契约不变量 3b 在本项目的落点。
+    """
+    assert rules.purchase_cost(10, 2, 1.0, None) is None
 
 
 def test_price_ok_boundary():
@@ -315,16 +323,16 @@ def test_from_snapshot_uses_contract_fields():
     卖家 buybox.buybox_seller —— 按名字猜会全取空。"""
     snap = rules.from_snapshot({
         "asin": "B001", "price": 12.5, "stock_count": 3, "delivery_days": 4,
-        "buybox": {"buybox_seller": "Acme", "shipping_fee": 2.5},
-        "raw": {"is_fba": "FBA", "screenshot_url": "http://x/a.jpg"},
+        "buybox": {"buybox_seller": "Acme"}, "shipping": 2.5,
+        "shipping_raw": "$2.50", "raw": {"is_fba": "FBA"},
         "scrape_params": {"zipcode": "10001-2222"}, "outcome": "ok",
         "title": " Acme Widget ", "scraped_at": "2026-08-09T00:00:00Z"})
     assert snap["zip"] == "10001"            # 快照侧邮编也走同一标准化
     assert snap["ship_method"] == "FBA"
     assert snap["seller"] == "Acme"
     assert snap["shipping"] == 2.5
+    assert snap["shipping_raw"] == "$2.50"
     assert snap["amz_title"] == "Acme Widget"
-    assert snap["screenshot_url"] == "http://x/a.jpg"
 
 
 def test_from_snapshot_discards_zip_mismatch():
@@ -449,9 +457,10 @@ def test_run_end_to_end_pass(wired, monkeypatch):
             PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget Pro 12 inch Blue",
                          1, 100, 0, "10001", "Shipped", None)]),
         "FROM catalog.latest_snapshot": (
-            ["asin", "price", "stock_count", "delivery_days", "buybox",
-             "scrape_params", "raw", "outcome", "scraped_at", "title"],
-            [("B001", 50, 5, 3, {"buybox_seller": "Acme"},
+            ["asin", "price", "stock_count", "delivery_days", "shipping",
+             "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
+             "scraped_at", "title"],
+            [("B001", 50, 5, 3, 0.0, "FREE", {"buybox_seller": "Acme"},
               {"zipcode": "10001"}, {"is_fba": "FBA"}, "ok", None,
               "Acme Widget Pro 12 inch Blue")]),
         "audit_status IS NOT NULL": (
@@ -564,6 +573,72 @@ def test_run_scrape_can_be_disabled(wired, monkeypatch):
     monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
     wf.run({"scrape": "0"})
     assert calls["batches"] == []
+
+
+def test_screenshot_pending_writes_nothing_and_leaves_no_tombstone(wired,
+                                                                   monkeypatch):
+    """409 未就绪:本轮不写这一列,也不记墓碑——下轮还要再来取。"""
+    wf, _ = wired
+    conn = FakeConn({})
+    calls = []
+    monkeypatch.setattr(wf.scraper, "fetch_screenshot",
+                        lambda b, a: (_ for _ in ()).throw(
+                            wf.scraper.ScreenshotPending("still working")))
+    monkeypatch.setattr(wf, "_remember", lambda *a: calls.append(a))
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") is None
+    assert calls == []
+
+
+def test_screenshot_gone_writes_tombstone(wired, monkeypatch):
+    """404/410 不会再有:记墓碑,以后不再为这张图发请求。"""
+    wf, _ = wired
+    conn = FakeConn({})
+    remembered = {}
+    monkeypatch.setattr(wf.scraper, "fetch_screenshot",
+                        lambda b, a: (_ for _ in ()).throw(
+                            wf.scraper.ScreenshotGone("captcha")))
+    monkeypatch.setattr(wf, "_remember",
+                        lambda c, k, m: remembered.update({k: m}))
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") is None
+    assert remembered["wm-audit-10001-x|B001"]["gone"] is True
+
+
+def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
+    """200:上传换 file_token 并记账;已记账的不再上传(上传接口不幂等)。"""
+    wf, _ = wired
+    uploads = []
+    monkeypatch.setattr(wf.scraper, "fetch_screenshot", lambda b, a: b"\x89PNG")
+    monkeypatch.setattr(wf.feishu, "upload_media",
+                        lambda t, name, content, mime="image/jpeg":
+                        uploads.append((name, mime)) or "ft_1")
+    monkeypatch.setattr(wf, "_remember", lambda *a: None)
+    conn = FakeConn({})
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") == "ft_1"
+    assert uploads == [("B001.png", "image/png")]
+
+    # 账上已有 → 直接复用,不再取图也不再上传
+    hit = FakeConn({"FROM ops.dedupe": (["file_token", "gone"],
+                                        [("ft_cached", None)])})
+    assert wf._screenshot_token(hit, "wm-audit-10001-x", "B001") == "ft_cached"
+    assert len(uploads) == 1
+
+
+def test_sql_selects_every_column_the_rules_read():
+    """守卫:判定用到的列,取数 SQL 必须真的选出来。
+
+    这条是补票——`product_name` 曾漏在待审查询之外,而单测的假游标按夹具
+    列名喂数据,漏列一路绿灯;上线后每一行都会因"标题取不到"变待人工。
+    假数据永远盖不住真 SQL,只能直接断言 SQL 文本。
+    """
+    from workflows import order_audit as wf
+    for sql in (wf._PICK_SQL, wf._ONE_SQL):
+        for col in ("order_line_id", "sku", "product_name", "qty",
+                    "product_amount", "postal_code", "audit_status"):
+            assert col in sql, f"待审查询漏了 {col}"
+    for col in ("price", "stock_count", "delivery_days", "shipping",
+                "shipping_raw", "buybox", "scrape_params", "raw",
+                "outcome", "title"):
+        assert col in wf._SNAP_SQL, f"快照查询漏了 {col}"
 
 
 def test_run_config_missing_suppliers_refuses(wired, monkeypatch):

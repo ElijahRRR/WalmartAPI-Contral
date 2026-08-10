@@ -133,6 +133,57 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    与本文档第五节的文字描述不是同一套。**消费侧不得按收到的 `slow` 自行重算
    比对——两边必然不等**;它保证的只是"慢变字段真变了才变"。
 
+### 5.2 本轮追加(采集侧 2026-08-10,PR amazon-scraper-v4#7;仍是 v1)
+
+**只增不改**:既有端点一个字节没动,现有接入无需改动。
+
+1. **`fast.shipping` / `fast.shipping_raw`(运费)**——纯追加,值本来就在
+   `raw.buybox_shipping` 里,**存量事件也拿得到,不需要回填**:
+
+   | 采集侧 | `shipping` | `shipping_raw` | 含义 |
+   |---|---|---|---|
+   | `"FREE"` | `0.0` | `"FREE"` | **确认免运费**,落地价 = price + 0 |
+   | `"$5.99"` | `5.99` | `"$5.99"` | 确认运费 |
+   | `"N/A"` / 空 | `null` | `null` | **这次没采到**,落地价算不出来 |
+
+   与 `stock_count` 同一条不变量(3b):`null ≠ 0`,**下游禁止 `or 0`**。
+   本侧落地:`snapshots.shipping / shipping_raw` 两列;order_audit 运费为
+   NULL 即成本算不出 → **转待人工**(当 0 的话成本偏小,本该拒的单被放行,
+   而两侧都不报错)。
+   ⚠ 采集侧 UI 导出的「总价」列**把 N/A 当 0**(`server/api/export.py`),
+   与本端点口径不同;本侧只认增量导出这一路,不复制那个行为。
+
+2. **`GET /api/screenshots`**(列批次截图状态,游标分页,`url` 仅在
+   `status == "done"` 时非 null)与 **`GET /api/screenshots/{批次名}/{asin}`**
+   (取 PNG)。取图**四种结局是四个状态码**,据此决定要不要重试:
+
+   | 码 | 含义 | 该怎么办 |
+   |---|---|---|
+   | 200 | 图在这儿(`image/png`) | — |
+   | 404 | 没有记录 / 批次不存在 / 已清理 | **别重试** |
+   | 409 | 有记录但还没截好(带 `Retry-After: 10`) | **稍后再来** |
+   | 410 | 截图失败,不会再有 | **别重试** |
+
+   旧的 `/static/screenshots/{批次名}/{asin}.png` 保留不变,但那条路上后三种
+   全是同一个 404,分不出来。本侧走新端点:`api/scraper.fetch_screenshot`
+   把 409 与 404/410 抛成两个不同异常,order_audit 据此决定"下轮再来"还是
+   "记墓碑不再请求"。
+
+3. **`POST /api/batches`(JSON 推送)**——与 `POST /api/upload` 共用同一个
+   核心函数,撞名 409、回调注册、回显读回值逐字一致。**本侧暂不改用**:
+   order_audit 本就一个邮编一个批次,JSON 端点的 `items[].zip_code` 逐 ASIN
+   邮编能力用不上(同批混邮编本来就被禁),换端点没有能力增量,只多一条路径。
+   这是**有意不采用**,不是漏了。
+
+4. **同一 ASIN 多邮编同批:从静默丢失改成明确失败**——`tasks` 上有
+   `UNIQUE(batch_id, asin)`,以前静默取第一个(200、少采一个邮编、响应里
+   看不出来),现在回 `400 conflicting_zip_for_asin`。本侧 `plan_round`
+   本就保证每批每 ASIN 一个邮编,这道服务端闸是双保险。
+   ⚠ 连带的坑(采集侧已钉住):多邮编拆批后,**只有 `/api/export/incremental`
+   按 `scrape_params.zipcode` 分得清**;`/api/results?batch_id=` 与
+   `/api/export/{批次名}` 对两个批次返回**完全相同的行**且不报错
+   (`asin_data.asin` 全局唯一,batch_id 只用来挑 ASIN)。本侧取数只走增量导出。
+
 **另有两条实现语义,消费侧必须遵守**:
 
 - **`null` / `[]` 一律表示"本次采集没取到",不表示"该商品没有这个属性"**

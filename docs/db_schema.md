@@ -65,6 +65,9 @@ CREATE TABLE catalog.snapshots (
     stock_state  text,           -- in_stock / out_of_stock / unknown(封闭集)
     stock_count  integer,        -- ⚠ NULL=没采到,0=确实是 0(下游禁止 or 0)
     delivery_days integer,       -- 同上
+    shipping     numeric,        -- 运费:⚠ 同上 NULL≠0。0.0=确认免运费(FREE),
+    shipping_raw text,           --   NULL=没采到(N/A)⇒ 落地价算不出来;
+                                 --   raw 存原始串,出现新形态不必等契约改版
     buybox       jsonb,
     raw          jsonb,          -- 采集器原始载荷(裁剪后)
     scraped_at   timestamptz NOT NULL,
@@ -256,7 +259,8 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
     "note": "成本 54.0 ≤ 限价 75.0;采购方 甲",   // →「脚本审核」列
     "asin": "B001", "zip": "10001",              // 判定用的是哪个邮编的快照
     "amz_price": 50, "stock_qty": 5, "ship_method": "FBA",
-    "ship_days": 3, "seller": "Acme", "screenshot_url": "...",
+    "ship_days": 3, "seller": "Acme", "amz_title": "...",
+    "shipping": 0.0, "shipping_raw": "FREE",      // NULL 表示没采到,不是免运费
     "scraped_at": "...",
     "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
     "price_cap": 75.0, "cost": 54.0,

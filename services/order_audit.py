@@ -197,17 +197,21 @@ def price_cap(product_amount):
     return None if amt is None else round(amt * PROFIT_SAFETY_RATIO, 2)
 
 
-def purchase_cost(unit_price, qty, rate, shipping=0.0):
-    """输入:亚马逊单价/数量/采购方汇率/运费 → 输出:含税采购成本。
+def purchase_cost(unit_price, qty, rate, shipping):
+    """输入:亚马逊单价/数量/采购方汇率/运费 → 输出:含税采购成本(算不出返回 None)。
 
     公式(所有者定稿 2026-08-09):(单价 × 数量 × 汇率 + 运费) × 1.08。
     注意运费**不乘汇率**——按所有者给定的写法原样实现。
+
+    ⚠ **运费 None 时返回 None,绝不当 0**(采集契约不变量 3b,与 stock_count
+    同一条):采集侧 `FREE → 0.0` 是"确认免运费"这条真信息,`N/A → null` 是
+    "这次没采到"。把没采到当 0,成本照样算得出来、看着也正常,只是**偏小**,
+    于是本该拒的单被放行,而两侧都不会报错。宁可转待人工。
     """
-    p, q, r = _num(unit_price), _num(qty), _num(rate)
-    if p is None or q is None or r is None:
+    p, q, r, s = _num(unit_price), _num(qty), _num(rate), _num(shipping)
+    if p is None or q is None or r is None or s is None:
         return None
-    ship = _num(shipping, 0.0) or 0.0
-    return round((p * q * r + ship) * TAX_RATE, 2)
+    return round((p * q * r + s) * TAX_RATE, 2)
 
 
 def price_ok(cost, cap) -> bool:
@@ -253,9 +257,9 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     if not snap:
         return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照", detail)
     detail.update({k: snap.get(k) for k in
-                   ("asin", "zip", "amz_price", "shipping", "stock_qty",
-                    "ship_method", "ship_days", "seller", "amz_title",
-                    "screenshot_url", "scraped_at")})
+                   ("asin", "zip", "amz_price", "shipping", "shipping_raw",
+                    "stock_qty", "ship_method", "ship_days", "seller",
+                    "amz_title", "scraped_at")})
     if snap.get("outcome") and snap["outcome"] != "ok":
         return AuditResult(MANUAL, f"采集未成功({snap['outcome']}),待人工", detail)
 
@@ -306,6 +310,10 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail["price_cap"] = cap
     detail["cost"] = cost
     detail["rules"]["price"] = {"cap": cap, "cost": cost}
+    if cost is None and snap.get("shipping") is None:
+        # 运费没采到(采集侧 N/A)→ 落地价算不出来。这一条单独报,不然运维
+        # 只看到"算不出"三个字,查不到是哪个输入缺了
+        return AuditResult(MANUAL, "运费没采到,采购成本算不出来,待人工", detail)
     if cap is None or cost is None:
         return AuditResult(MANUAL, "商品金额或采购成本算不出,待人工", detail)
     if not price_ok(cost, cap):
@@ -365,7 +373,10 @@ def from_snapshot(row: dict | None) -> dict | None:
       取的是同一处,三处口径必须一致。
     - 卖家:`buybox.buybox_seller`(product_ingest 只把 buybox_* 三个键塞进
       buybox jsonb)。
-    - 运费:契约 fast 段**没有**运费字段;取不到即 None,由 judge 决定怎么办。
+    - 运费:`fast.shipping`(采集侧 2026-08-10 追加,落到 snapshots.shipping 列)。
+      **None 不是 0**:FREE→0.0 是"确认免运费",N/A→None 是"这次没采到"。
+    - 截图:**不在快照里**。取图走 api/scraper.fetch_screenshot(批次名, ASIN),
+      抓手是 ops.audit_scrape 台账里记的 batch_name。
     """
     if not row:
         return None
@@ -390,14 +401,14 @@ def from_snapshot(row: dict | None) -> dict | None:
         "asin": row.get("asin"),
         "zip": zip5,
         "amz_price": row.get("price"),
-        "shipping": bb.get("shipping_fee"),
+        "shipping": row.get("shipping"),
+        "shipping_raw": row.get("shipping_raw"),
         "stock_qty": row.get("stock_count"),
         "ship_method": (str(raw.get("is_fba")).strip().upper()
                         if raw.get("is_fba") is not None else None),
         "ship_days": row.get("delivery_days"),
         "seller": bb.get("buybox_seller"),
         "amz_title": (row.get("title") or "").strip() or None,
-        "screenshot_url": raw.get("screenshot_url") or raw.get("screenshot"),
         "outcome": row.get("outcome"),
         "scraped_at": row.get("scraped_at"),
     }

@@ -1,11 +1,12 @@
-"""order_audit — 沃尔玛订单审核(四道审核出结论,只建议不真拒单)。
+"""order_audit — 沃尔玛订单审核(五道审核出结论,只建议不真拒单)。
 
 用法:
-  python cli.py order_audit                    # 审最近 3 天未出结论的行
+  python cli.py order_audit                    # 审最近 3 天该判的行 + 推本轮采集
   python cli.py order_audit -p days=7
   python cli.py order_audit -p stores=店铺A,店铺B
   python cli.py order_audit -p line=<order_line_id>   # 单行重审(忽略窗口)
-  python cli.py order_audit -p recheck=1       # 连已有结论的行一起重审(钓鱼行除外)
+  python cli.py order_audit -p recheck=1       # 连终局结论的行一起重审(钓鱼行除外)
+  python cli.py order_audit -p scrape=0        # 不推采集(只判定)
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
 
 设计(PG 权威,飞书是人机界面):
@@ -38,9 +39,15 @@
   仍无快照判失败,下轮重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
 - 采集侧 `zip_verify == "mismatch"` 的快照直接判废(切邮编失败拿回的是默认
   地区价格,拿它算限价等于按错地区审单)。
+- **截图**走 `GET /api/screenshots/{批次名}/{asin}`(采集侧 2026-08-10 新增),
+  抓手是台账里的 batch_name(落盘即 `<批次名>/<asin>.png`,批次名就是隔离键)。
+  三种结局分别处置:409 未就绪→本轮不写这一列、下轮再来;404/410 不会再有→
+  记墓碑不再请求;200→上传飞书换 file_token。**截图从不阻断审核结论**。
+- **运费**取 `fast.shipping`(采集侧同日追加,落 snapshots.shipping 列):
+  FREE→0.0 是"确认免运费",N/A→NULL 是"这次没采到"⇒ **成本算不出来,转待人工**。
+  绝不 `or 0`——当 0 的话成本偏小,本该拒的单被放行,而两侧都不报错。
 """
 
-import hashlib
 import json
 import logging
 from datetime import datetime
@@ -58,12 +65,12 @@ logger = logging.getLogger("workflows.order_audit")
 
 _DEFAULT_DAYS = 3
 _SCRAPE_TIMEOUT_HOURS = 3      # 在途超此时长仍无快照 → 判失败,下轮重推
-_SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe 作用域:URL → file_token
+_SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe:批次名|ASIN → file_token
 
 # 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
 _PICK_SQL = """
-SELECT order_line_id, store, sku, qty, product_amount, shipping_amount,
-       postal_code, sale_status, audit_status
+SELECT order_line_id, store, sku, product_name, qty, product_amount,
+       shipping_amount, postal_code, sale_status, audit_status
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %(days)s)
   AND coalesce(sale_status, '') <> 'Cancelled'
@@ -73,8 +80,8 @@ ORDER BY order_date DESC
 """
 
 _ONE_SQL = """
-SELECT order_line_id, store, sku, qty, product_amount, shipping_amount,
-       postal_code, sale_status, audit_status
+SELECT order_line_id, store, sku, product_name, qty, product_amount,
+       shipping_amount, postal_code, sale_status, audit_status
 FROM orders.order_lines WHERE order_line_id = %(line)s
 """
 
@@ -91,7 +98,8 @@ WHERE order_date >= now() - make_interval(days => %(days)s)
 # 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷)。
 # 标题在身份层(products),两层 JOIN 才拿得到——商品一致性要用它。
 _SNAP_SQL = """
-SELECT s.asin, s.price, s.stock_count, s.delivery_days, s.buybox,
+SELECT s.asin, s.price, s.stock_count, s.delivery_days,
+       s.shipping, s.shipping_raw, s.buybox,
        s.scrape_params, s.raw, s.outcome, s.scraped_at, p.title
 FROM catalog.latest_snapshot s
 LEFT JOIN catalog.products p
@@ -282,40 +290,58 @@ def _save(conn, results: list) -> int:
     return len(payload)
 
 
-def _screenshot_token(conn, url: str) -> str | None:
-    """输入:连接 + 截图 URL → 输出:飞书 file_token(失败返回 None,不阻断审核)。
+def _screenshot_token(conn, batch_name: str, asin: str) -> str | None:
+    """输入:连接 + 批次名 + ASIN → 输出:飞书 file_token(拿不到返回 None)。
 
-    防重:URL → file_token 记 ops.dedupe,同一张图只上传一次(上传接口本身
-    不幂等,重复上传会在飞书网盘堆垃圾)。下载/上传任一步失败只告警——
-    截图是佐证材料,不该因为它拿不到就让整行审核失败。
+    取图走采集侧 `GET /api/screenshots/{批次名}/{asin}`,**批次名是隔离键**
+    (落盘即 `<批次名>/<asin>.png`),所以同一 ASIN 的不同邮编批次各有各的图。
 
-    ⚠ 采集接线待办:现在按裸 URL 直取。若采集器改造后截图端点需要鉴权
-    (X-Export-Token 之类),取图应改走 api/scraper 的带头请求,改这一处即可。
+    三种结局分别处置(采集侧把它们分成三个状态码就是为了让调用方能分):
+    - 409 未就绪 → 本轮不写这一列,下轮再来(审核结论照出,不等图)
+    - 404/410 不会再有 → 记墓碑,以后不再为这张图发请求
+    - 200 → 上传飞书换 file_token,记 ops.dedupe(上传接口不幂等,
+      重复上传会在飞书网盘堆垃圾)
+
+    截图是佐证材料:任何一步失败都只告警,绝不让整行审核失败。
     """
-    if not url:
+    if not batch_name or not asin:
         return None
-    key = hashlib.sha256(url.encode()).hexdigest()[:32]
+    key = f"{batch_name}|{asin}"
     with conn.cursor() as cur:
-        cur.execute("SELECT meta->>'file_token' FROM ops.dedupe "
+        cur.execute("SELECT meta->>'file_token', meta->>'gone' FROM ops.dedupe "
                     "WHERE scope = %s AND key = %s", (_SCREENSHOT_SCOPE, key))
         hit = cur.fetchone()
-    if hit and hit[0]:
-        return hit[0]
+    if hit:
+        return hit[0] or None           # 已上传过,或已记墓碑(不再重试)
     try:
-        resp = httpx.get(url, timeout=30.0, trust_env=False, follow_redirects=True)
-        resp.raise_for_status()
-        token = feishu.upload_media(resources.ORDER_SALES_AUDIT,
-                                    f"{key}.jpg", resp.content)
-    except (httpx.HTTPError, feishu.FeishuError, LookupError) as e:
-        logger.warning("截图取回/上传失败(%s):%s", url, e)
+        png = scraper.fetch_screenshot(batch_name, asin)
+    except scraper.ScreenshotPending:
+        return None                     # 稍后再来,不记墓碑
+    except scraper.ScreenshotGone as e:
+        logger.info("截图不会再有,记墓碑不再重试:%s", e)
+        _remember(conn, key, {"gone": True, "reason": str(e)[:200]})
         return None
+    except (LookupError, RuntimeError, httpx.HTTPError) as e:
+        logger.warning("取截图失败(%s):%s", key, e)
+        return None
+    try:
+        token = feishu.upload_media(resources.ORDER_SALES_AUDIT,
+                                    f"{asin}.png", png, mime="image/png")
+    except (feishu.FeishuError, LookupError) as e:
+        logger.warning("截图上传飞书失败(%s):%s", key, e)
+        return None
+    _remember(conn, key, {"file_token": token, "batch_name": batch_name,
+                          "asin": asin})
+    return token
+
+
+def _remember(conn, key: str, meta: dict) -> None:
+    """输入:连接 + 防重键 + 元信息 → 输出:无(写 ops.dedupe,已存在则不动)。"""
     with conn.cursor() as cur:
         cur.execute("INSERT INTO ops.dedupe (scope, key, meta) "
                     "VALUES (%s, %s, %s::jsonb) ON CONFLICT DO NOTHING",
-                    (_SCREENSHOT_SCOPE, key,
-                     json.dumps({"file_token": token, "url": url})))
+                    (_SCREENSHOT_SCOPE, key, json.dumps(meta, ensure_ascii=False)))
     conn.commit()
-    return token
 
 
 def _num(v):
@@ -323,9 +349,29 @@ def _num(v):
     return float(v) if isinstance(v, Decimal) else v
 
 
+_BATCH_OF_SQL = """
+SELECT asin, zip, batch_name FROM ops.audit_scrape
+WHERE batch_name IS NOT NULL AND (asin, zip) = ANY(%(pairs)s)
+"""
+
+
+def _batch_names(conn, rows: list[dict]) -> dict[tuple, str]:
+    """输入:连接 + 已判定行 → 输出:{(asin, 邮编): batch_name}(取图的抓手)。"""
+    pairs = [(d.get("asin"), d.get("zip")) for d in
+             ((r.get("audit_detail") if isinstance(r.get("audit_detail"), dict)
+               else json.loads(r.get("audit_detail") or "{}")) for r in rows)
+             if d.get("asin") and d.get("zip")]
+    if not pairs:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(_BATCH_OF_SQL, {"pairs": pairs})
+        return {(a, z): b for a, z, b in cur.fetchall()}
+
+
 def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     """输入:连接 + 已判定行 → 输出:{order_line_id: 飞书审核列载荷}。"""
     f = resources.ORDER_SALES_AUDIT.fields
+    batches = _batch_names(conn, rows)
     out: dict[str, dict] = {}
     for r in rows:
         d = r.get("audit_detail") or {}
@@ -343,7 +389,8 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
             f.price_cap: _num(d.get("price_cap")),
             f.title_similarity: _num(d.get("title_similarity")),
         }
-        token = _screenshot_token(conn, d.get("screenshot_url"))
+        batch = batches.get((d.get("asin"), d.get("zip")))
+        token = _screenshot_token(conn, batch, d.get("asin")) if batch else None
         if token:
             fields[f.screenshot] = [{"file_token": token}]
         out[r["order_line_id"]] = fields

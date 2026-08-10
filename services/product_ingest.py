@@ -24,10 +24,11 @@ OUTCOME_OK = "ok"
 _SNAPSHOT_SQL = """
 INSERT INTO catalog.snapshots (
     marketplace, asin, scrape_params, price, stock_state, stock_count,
-    delivery_days, buybox, raw, scraped_at, source_id,
+    delivery_days, shipping, shipping_raw, buybox, raw, scraped_at, source_id,
     outcome, completeness_ok)
 VALUES (%(marketplace)s, %(asin)s, %(scrape_params)s::jsonb, %(price)s,
         %(stock_state)s, %(stock_count)s, %(delivery_days)s,
+        %(shipping)s, %(shipping_raw)s,
         %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s, %(source_id)s,
         %(outcome)s, %(completeness_ok)s)
 ON CONFLICT (source_id) DO NOTHING
@@ -97,6 +98,17 @@ def _opt_int(v):
         return None
 
 
+def _opt_float(v):
+    """输入:契约里的 float|null 字段 → 输出:float 或 None(**0.0 不折成 None**)。"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        logger.warning("数值字段无法解析(按未采到处理): %r", v)
+        return None
+
+
 def snapshot_params(rec: dict) -> dict:
     """输入:record → 输出:snapshots 行参数。"""
     fast = rec.get("fast") or {}
@@ -112,6 +124,13 @@ def snapshot_params(rec: dict) -> dict:
         "stock_state": _blank_to_none(fast.get("stock_state")),
         "stock_count": _opt_int(fast.get("stock_count")),
         "delivery_days": _opt_int(fast.get("delivery_days")),
+        # 运费(采集侧 2026-08-10 纯追加,contract_version 仍是 1):
+        # FREE→0.0(确认免运费)/ N/A→None(这次没采到,落地价算不出来)/ $5.99→5.99。
+        # 与 stock_count 同一条不变量:**null ≠ 0,下游禁止 or 0**——把没采到
+        # 当免运费,落地价照样算得出来、看着正常,只是偏小,两侧都不报错。
+        # shipping_raw 原样留存:出现新形态(如满额免邮门槛)时不必等契约改版。
+        "shipping": _opt_float(fast.get("shipping")),
+        "shipping_raw": _blank_to_none(fast.get("shipping_raw")),
         "buybox": json.dumps(buybox, ensure_ascii=False) if buybox else None,
         "raw": json.dumps(rec.get("raw"), ensure_ascii=False)
                if rec.get("raw") is not None else None,

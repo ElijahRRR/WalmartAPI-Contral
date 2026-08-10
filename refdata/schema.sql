@@ -73,6 +73,13 @@ END $$;
 -- 下游一律不得 `or 0` 兜底(与 price 同一条原则)。
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS stock_count integer;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS delivery_days integer;
+-- 运费(采集侧 2026-08-10 纯追加,contract_version 仍是 1;存量事件也拿得到,
+-- 不需要回填)。FREE→0.0 是"确认免运费"这条真信息,N/A→NULL 是"这次没采到"
+-- ⇒ **落地价算不出来**。与 stock_count 同一条不变量:NULL ≠ 0,下游禁止 or 0
+-- (把没采到当免运费,落地价照样算得出来、看着正常,只是偏小,两侧都不报错)。
+-- shipping_raw 存原始串:出现新形态(如满额免邮门槛)时不必等契约改版。
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping numeric;
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping_raw text;
 
 -- 采集结局(契约扩展字段;2026-08-09 补存):outcome ∈ ok/not_found/blocked/
 -- parse_failed/stale。此前只在摄取时计数不落库,导致"这个产品为什么没数据"

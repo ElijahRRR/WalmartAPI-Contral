@@ -128,6 +128,48 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
 
 
+class ScreenshotPending(RuntimeError):
+    """截图还没截好(409)——**稍后再来**,不是失败。响应头带 Retry-After。"""
+
+
+class ScreenshotGone(RuntimeError):
+    """截图不会再有了(404 没记录/已清理 或 410 截图失败)——**别重试**。
+
+    采集侧把这两种与"还没好"分成三个状态码,正是为了让调用方有"该不该重试"
+    的判据(旧的 /static/screenshots 路径上后三种全是同一个 404,分不出来)。
+    """
+
+
+def fetch_screenshot(batch_name: str, asin: str) -> bytes:
+    """输入:批次名 + ASIN → 输出:PNG 字节;未就绪抛 ScreenshotPending,
+    不会再有抛 ScreenshotGone。
+
+    走 `GET /api/screenshots/{batch_name}/{asin}`(采集侧 2026-08-10 新增)。
+    批次名是隔离键——截图落盘就是 `<批次名>/<asin>.png`,所以同一 ASIN 的
+    不同邮编批次各有各的图,不会互相覆盖。
+    """
+    resp = httpx.get(f"{base_url()}/api/screenshots/{batch_name}/{asin}",
+                     headers=_headers(), timeout=httpx.Timeout(60, connect=10))
+    if resp.status_code == 200:
+        return resp.content
+    detail = {}
+    try:
+        detail = (resp.json() or {}).get("detail") or {}
+    except ValueError:
+        pass
+    if not isinstance(detail, dict):
+        detail = {"message": str(detail)}
+    if resp.status_code == 409:
+        raise ScreenshotPending(f"{asin}@{batch_name} 截图未就绪"
+                                f"(status={detail.get('status')})")
+    if resp.status_code in (404, 410):
+        raise ScreenshotGone(f"{asin}@{batch_name} 截图不会再有"
+                             f"(HTTP {resp.status_code} "
+                             f"{detail.get('error') or detail.get('message') or ''}"
+                             f"{' ' + str(detail.get('error_detail')) if detail.get('error_detail') else ''})")
+    raise RuntimeError(f"取截图失败 HTTP {resp.status_code}: {resp.text[:200]}")
+
+
 def batch_status(batch_name: str) -> dict:
     """输入:批次名 → 输出:{status, stats:{total,done,failed,...}}。
 

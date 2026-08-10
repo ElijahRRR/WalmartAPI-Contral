@@ -461,3 +461,28 @@ def test_refresh_filters_non_asin_skus(monkeypatch):
     ok, dropped = pr._targets()
     # 11 位、小写、自定义编码、空串全过滤掉
     assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4
+
+
+def test_snapshot_carries_shipping_null_is_not_zero():
+    """运费三态照搬采集契约:FREE→0.0 / N/A→None / $5.99→5.99。
+
+    **None 不能折成 0**:0 是"确认免运费"这条真信息,None 是"这次没采到"。
+    折了的话下游算出的落地价照样看着正常,只是偏小,两侧都不报错
+    (契约不变量 3b,与 stock_count 同一条)。
+    """
+    free = ingest.snapshot_params(_rec(fast={"shipping": 0.0,
+                                             "shipping_raw": "FREE"}))
+    assert free["shipping"] == 0.0 and free["shipping_raw"] == "FREE"
+
+    missing = ingest.snapshot_params(_rec(fast={"shipping": None,
+                                                "shipping_raw": None}))
+    assert missing["shipping"] is None          # 绝不是 0
+
+    paid = ingest.snapshot_params(_rec(fast={"shipping": 5.99,
+                                             "shipping_raw": "$5.99"}))
+    assert paid["shipping"] == 5.99 and paid["shipping_raw"] == "$5.99"
+
+    # 老记录没有这两个键:按未采到,不是 0
+    assert ingest.snapshot_params(_rec(fast={"price": 1}))["shipping"] is None
+    for col in ("shipping", "shipping_raw"):
+        assert col in ingest._SNAPSHOT_SQL

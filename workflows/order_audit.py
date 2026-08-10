@@ -79,6 +79,7 @@
 
 import json
 import logging
+import math
 import time
 from datetime import datetime
 from decimal import Decimal
@@ -657,7 +658,8 @@ def _save(conn, results: list) -> int:
     if not results:
         return 0
     payload = [(res.status, json.dumps({**res.detail, "note": res.note},
-                                       ensure_ascii=False, default=str),
+                                       ensure_ascii=False,
+                                       default=_json_default),
                 line["order_line_id"])
                for line, res in results]
     with conn.cursor() as cur:
@@ -757,9 +759,45 @@ def _remember(conn, key: str, meta: dict) -> None:
     conn.commit()
 
 
-def _num(v):
-    """输入:PG 数值 → 输出:float(飞书数字字段不吃 Decimal);None 原样。"""
-    return float(v) if isinstance(v, Decimal) else v
+def _json_default(o):
+    """输入:json.dumps 不认识的对象 → 输出:Decimal 转 float,其余转字符串。
+
+    ⚠ **别图省事写成 `default=str`**:PG 的 numeric 列取出来是 Decimal,
+    被 str 掉之后 audit_detail 里的「亚马逊单价」就成了 `"25.99"` 这个**字符串**,
+    回写飞书数字列时 `NumberFieldConvFail`——而落库、判定、日志全程正常,
+    只有推送那一步炸,且飞书的报错不告诉你是哪行哪列。
+    (2026-08-10 生产实测:前几轮没行拿到过价格,这个字段一直是空的,
+     直到 102 行判通过才第一次撞上。)
+    datetime 等仍旧转字符串,那是想要的。
+    """
+    return float(o) if isinstance(o, Decimal) else str(o)
+
+
+def _num(v, field: str = "", key: str = ""):
+    """输入:detail 里的数值 → 输出:数字或 None(飞书数字列只吃数字)。
+
+    容忍数字字符串:**历史行**的 audit_detail 里价格已经是 `"25.99"` 形态
+    (见 _json_default),那些行要等下次重判才会被改写,这轮照样得推得出去。
+
+    非数字一律降成 None 并告警,不让它飞到飞书:一个坏值会让整批
+    batch_update 全失败,而 `NumberFieldConvFail` 里既没有行号也没有列名,
+    排障只能靠猜。宁可这一格空着,也不要 152 行一起推不上去。
+    """
+    if v is None or isinstance(v, bool):     # bool 是 int 的子类,别当 0/1 推
+        return None
+    if isinstance(v, Decimal):
+        v = float(v)
+    if isinstance(v, int):
+        return v
+    if not isinstance(v, float):
+        try:
+            v = float(str(v).strip())
+        except (TypeError, ValueError):
+            logger.warning("飞书数字列「%s」拿到非数字 %r(行 %s),本次写空",
+                           field or "?", v, key or "?")
+            return None
+    # NaN/Inf:json.dumps 会吐出 JSON 规范里没有的 NaN/Infinity,飞书直接拒
+    return v if math.isfinite(v) else None
 
 
 # ⚠ 别写成 `(asin, zip) = ANY(%(pairs)s)` 传元组列表:PG 认不出匿名 record 的
@@ -811,17 +849,19 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for r in rows:
         d = _detail(r)
+        key = r["order_line_id"]
         fields = {
             f.audit_status: r["audit_status"],
             f.script_audit: d.get("note"),
-            f.amz_price: _num(d.get("amz_price")),
-            f.stock_qty: _num(d.get("stock_qty")),
+            f.amz_price: _num(d.get("amz_price"), f.amz_price, key),
+            f.stock_qty: _num(d.get("stock_qty"), f.stock_qty, key),
             f.ship_method: d.get("ship_method"),
-            f.ship_days: _num(d.get("ship_days")),
+            f.ship_days: _num(d.get("ship_days"), f.ship_days, key),
             f.seller: d.get("seller"),
             f.supplier: d.get("supplier"),
-            f.price_cap: _num(d.get("price_cap")),
-            f.title_similarity: _num(d.get("title_similarity")),
+            f.price_cap: _num(d.get("price_cap"), f.price_cap, key),
+            f.title_similarity: _num(d.get("title_similarity"),
+                                     f.title_similarity, key),
         }
         asin = (d.get("asin") or "").upper()
         batch = batch_of.get((d.get("asin"), d.get("zip")))
@@ -830,7 +870,7 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
                  if batch and asin else None)
         if token:
             fields[f.screenshot] = [{"file_token": token}]
-        out[r["order_line_id"]] = fields
+        out[key] = fields
     return out
 
 

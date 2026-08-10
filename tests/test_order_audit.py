@@ -1243,3 +1243,48 @@ def test_judge_every_branch_returns_a_verdict():
         assert res.status in (rules.PASS, rules.REJECT, rules.MANUAL)
         assert res.note, "每种情况都得给出人能读的原因"
         assert isinstance(res.detail, dict)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  飞书数字列:落库形态 + 推送前的兜底
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_detail_keeps_numbers_as_numbers(wired):
+    """Decimal 落 audit_detail 必须还是数字,**不能被 default=str 变成 "25.99"**。
+
+    2026-08-10 生产实测:`json.dumps(default=str)` 把价格存成了字符串,回写
+    飞书「亚马逊单价」数字列时 NumberFieldConvFail。落库、判定、日志全程
+    正常,只有推送那一步炸,而飞书的报错里既没有行号也没有列名。
+    前几轮没有行真的拿到过价格,这个字段一直是空的,直到 102 行判通过才撞上。
+    """
+    from decimal import Decimal
+    wf, _ = wired
+    conn = FakeConn({})
+    res = SimpleNamespace(status="✓ 通过", note="ok",
+                          detail={"amz_price": Decimal("25.99"),
+                                  "scraped_at": datetime(2026, 8, 10,
+                                                         tzinfo=timezone.utc)})
+    wf._save(conn, [({"order_line_id": "PO1|SKU1"}, res)])
+    stored = json.loads([a for s_, a in conn.executed if s_.startswith("UPDATE")][0][0][1])
+    assert stored["amz_price"] == 25.99
+    assert isinstance(stored["amz_price"], float)      # 不是 "25.99"
+    assert isinstance(stored["scraped_at"], str)       # datetime 仍转字符串
+
+
+@pytest.mark.parametrize("raw,want", [
+    (25.99, 25.99),
+    (7, 7),
+    ("25.99", 25.99),        # 历史行的老形状:得推得出去,不能炸整批
+    ("  3 ", 3.0),
+    (None, None),
+    ("", None),
+    ("N/A", None),           # 非数字降成空,而不是让 152 行一起推不上去
+    ("免费", None),
+    (True, None),            # bool 是 int 的子类,别当 1 推进数字列
+    (float("nan"), None),    # json.dumps 会吐 NaN —— JSON 规范里没有,飞书拒
+    (float("inf"), None),
+])
+def test_num_coerces_or_drops(wired, raw, want):
+    wf, _ = wired
+    got = wf._num(raw, "亚马逊单价", "PO1|SKU1")
+    assert got == want or (got is None and want is None)

@@ -357,30 +357,44 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 #  按邮编采集的波次编排
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plan_zip_batches(pairs, blocked) -> dict[str, list[str]]:
-    """输入:待采 [(asin, 邮编)] + 不可推的 {(asin, 邮编)} → 输出:{邮编: [ASIN]}。
+def plan_waves(pairs, blocked) -> list[list[tuple[str, str]]]:
+    """输入:待采 [(asin, 邮编)] + 不可推的 {(asin, 邮编)} → 输出:波次列表。
 
-    **一个邮编一个批次**(所有者定稿 2026-08-10;初版如此,中途误放宽成"一批
-    混多个邮编",经所有者纠正回来)。这不是性能取舍,是**取数与取图的正确性**:
+    **一批可以混不同 ASIN 的不同邮编;只有同一 ASIN 的多个邮编才必须拆批。**
+    (所有者定稿 2026-08-10;中途我按"一个邮编一个批次"收紧过,理由查证有误,
+    已纠正回来——见下方两条实证。)
 
-    - **截图**落盘是 `<批次名>/<asin>.png`。批次名带邮编,同一 ASIN 的不同邮编
-      才各有各的图;混在一批里,同 ASIN 只会有一张。
-    - **快照类端点**(`/api/results?batch_id=`、`/api/export/{批次名}`)对同一
-      ASIN **全库只有一行**,两个邮编的批次返回**完全相同的行且不报错**。
-      逐邮编准确的只有 `/api/export/incremental` 按 `scrape_params.zipcode` 分组
-      (本项目取数只走这一条,由 product_ingest 负责)。
-    - 采集侧 `tasks` 有 `UNIQUE(batch_id, asin)`:同批同 ASIN 两个邮编直接 400。
-      按邮编分批天然不可能触发它。
+    采集侧 `POST /api/batches` 的邮编是**三档独立**的(server/api/batches.py
+    文档串):`items[].zip_code`(这一个 ASIN)> 顶层 `zip_code`(这一批)>
+    服务端默认。所以逐 ASIN 带邮编是接口一等能力,不是变通。
+
+    唯一的硬约束来自库结构:`tasks` 上有 `UNIQUE(batch_id, asin)`,一个批次里
+    一个 ASIN 只能有一个邮编。同批给同一 ASIN 两个不同邮编 ⇒
+    `400 conflicting_zip_for_asin`(采集侧明确拒绝,不静默取第一个)。
+    故按"同一 ASIN 的第 k 个邮编进第 k 波"分批,每波内 ASIN 不重复。
+
+    ⚠ 两条曾被我当成"必须一个邮编一个批次"的理由,都不成立:
+    - **截图不会串**:批次内一个 ASIN 只可能有一个邮编(上面那条 400 保证),
+      所以 `(批次名, asin)` 本来就唯一定位一个 (ASIN,邮编),落盘的
+      `<批次名>/<asin>.png` 天然不冲突,批次名不必带邮编。
+    - **取数不受分批影响**:本项目取数只走 `/api/export/incremental` 按
+      `scrape_params.zipcode` 分组,与批次怎么切无关。(按批次取数的
+      `/api/results?batch_id=` 确实分不出邮编,但我们根本不用它。)
 
     blocked 里的 pair 跳过:在途的(等它落定)+ 重试窗口已耗尽的(再推白烧配额)。
-    邮编与 ASIN 都按字典序,保证分批可复现——排障时"上轮到底推了什么"说得清。
+    排序固定,保证分波可复现——排障时"上轮到底推了什么"说得清。
     """
-    out: dict[str, list[str]] = {}
+    waves: list[list[tuple[str, str]]] = []
+    seen: dict[str, int] = {}           # asin → 已占用几个波次
     for asin, zip5 in sorted(set(pairs)):
         if not asin or not zip5 or (asin, zip5) in blocked:
             continue
-        out.setdefault(zip5, []).append(asin)
-    return out
+        i = seen.get(asin, 0)
+        seen[asin] = i + 1
+        while len(waves) <= i:
+            waves.append([])
+        waves[i].append((asin, zip5))
+    return waves
 
 
 # ══════════════════════════════════════════════════════════════════════════════

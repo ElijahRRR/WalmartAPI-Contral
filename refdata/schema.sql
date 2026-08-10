@@ -560,11 +560,12 @@ CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
 -- 存在的三个理由:
 -- ① **先落 pending 再调接口**(CLAUDE.md 铁律)——旧系统完全没有防重记录,
 --    提交/回填中途一断就丢,重启后没有 pending 可对账(legacy_survey 明列此洞);
--- ② **一个邮编一个批次**(所有者定稿 2026-08-10),batch_name 里带邮编。
---    理由不是性能而是正确性:采集侧对同一 ASIN 只存一行全局记录,按批次取数
---    的端点分不出邮编(两个批次返回完全相同的行且不报错),截图也只按
---    `<批次名>/<asin>.png` 落盘。取数因此只走 /api/export/incremental 按
---    scrape_params.zipcode 分组;batch_name 则是取图与排障的抓手。
+-- ② **一批可以混不同 ASIN 的不同邮编**(采集侧 items[].zip_code 逐 ASIN 带),
+--    只有**同一 ASIN 的多个邮编**必须拆批(tasks 是 UNIQUE(batch_id, asin),
+--    同批会回 400 conflicting_zip_for_asin)。所以批次内一个 ASIN 只可能有
+--    一个邮编,(batch_name, asin) 已唯一定位一个 (ASIN,邮编)——batch_name
+--    因此既是取图的抓手(落盘 <批次名>/<asin>.png)也是排障的抓手。
+--    取数与批次无关,只走 /api/export/incremental 按 scrape_params.zipcode 分组。
 -- ③ 落定三层判据(见 workflows/order_audit._settle_ledger):快照真出现 → done;
 --    批次已落定仍无快照 → 认账 failed 并去 /failures 拿真实原因;
 --    兜底超时 20 分钟只打在批次已不在途的组合上(在途批次不判超时,

@@ -283,45 +283,60 @@ def test_judge_title_checked_before_price():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  按邮编分批(2026-08-10 定稿:一个邮编一个批次,批次名带邮编)
+#  波次编排(2026-08-10 定稿:一批混邮编,只有同一 ASIN 的多邮编才拆批)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_plan_zip_batches_groups_by_zip():
-    """一个邮编一个批次——批次名是取数与取图唯一的邮编隔离键。"""
-    plan = rules.plan_zip_batches(
-        [("B1", "10001"), ("B2", "90210"), ("B2", "10001")], set())
-    assert plan == {"10001": ["B1", "B2"], "90210": ["B2"]}
+def test_plan_waves_mixes_zips_in_one_batch():
+    """不同 ASIN 的不同邮编同批 —— 采集侧 items[].zip_code 是一等能力
+    (邮编三档:逐 ASIN > 批次级 > 服务端默认)。
+
+    这条守的是一次真实的过度收紧:曾按"一个邮编一个批次"改过,结果 134 行
+    订单推出 127 个批次(收件邮编几乎两两不同),而那个收紧的两条理由
+    (截图会串、按批次取数分不出邮编)查证后都不成立。
+    """
+    waves = rules.plan_waves([("B1", "10001"), ("B2", "90210")], set())
+    assert waves == [[("B1", "10001"), ("B2", "90210")]]
 
 
-def test_plan_zip_batches_same_asin_lands_in_different_batches():
-    """同一 ASIN 的两个邮编分到两个批次:混在一批里采集侧只存一行,
-    两个邮编会拿到完全相同的数据且不报错(而且截图也只会有一张)。"""
-    plan = rules.plan_zip_batches([("B1", "10001"), ("B1", "90210")], set())
-    assert plan == {"10001": ["B1"], "90210": ["B1"]}
-    # 任何一批内 ASIN 都不重复 —— 采集侧 UNIQUE(batch_id, asin) 的触发条件
-    for asins in plan.values():
-        assert len(set(asins)) == len(asins)
+def test_plan_waves_splits_same_asin_across_batches():
+    """同一 ASIN 的多个邮编必须拆批:采集侧 tasks 是 UNIQUE(batch_id, asin),
+    同批两个邮编回 400 conflicting_zip_for_asin(明确拒绝,不静默取第一个)。
+    但**同一轮内全部推完**,不跨轮等待。"""
+    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210"),
+                              ("B2", "10001")], set())
+    assert len(waves) == 2
+    assert waves[0] == [("B1", "10001"), ("B2", "10001")]
+    assert waves[1] == [("B1", "90210")]
+    # 每一波内 ASIN 不重复 —— 这正是采集侧那条 400 的触发条件
+    for w in waves:
+        assert len({a for a, _ in w}) == len(w)
 
 
-def test_plan_zip_batches_skips_blocked():
-    """在途/重试窗口耗尽的组合直接跳过,不占批次。"""
-    plan = rules.plan_zip_batches([("B1", "10001"), ("B1", "90210")],
-                                  {("B1", "10001")})
-    assert plan == {"90210": ["B1"]}
+def test_plan_waves_three_zips_same_asin_makes_three_waves():
+    waves = rules.plan_waves(
+        [("B1", "10001"), ("B1", "20002"), ("B1", "30003")], set())
+    assert [len(w) for w in waves] == [1, 1, 1]
 
 
-def test_plan_zip_batches_all_blocked_gives_nothing():
-    assert rules.plan_zip_batches([("B1", "10001")], {("B1", "10001")}) == {}
+def test_plan_waves_skips_blocked():
+    """在途/重试窗口耗尽的组合直接跳过,不占波次。"""
+    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210")],
+                             {("B1", "10001")})
+    assert waves == [[("B1", "90210")]]
 
 
-def test_plan_zip_batches_drops_incomplete_pairs():
-    assert rules.plan_zip_batches([("B1", ""), ("", "10001")], set()) == {}
+def test_plan_waves_all_blocked_gives_nothing():
+    assert rules.plan_waves([("B1", "10001")], {("B1", "10001")}) == []
 
 
-def test_plan_zip_batches_is_deterministic():
-    """分批必须可复现,否则排障时"上轮到底推了什么"说不清。"""
+def test_plan_waves_drops_incomplete_pairs():
+    assert rules.plan_waves([("B1", ""), ("", "10001")], set()) == []
+
+
+def test_plan_waves_is_deterministic():
+    """分波必须可复现,否则排障时"上轮到底推了什么"说不清。"""
     pairs = [("B2", "90210"), ("B1", "90210"), ("B1", "10001")]
-    assert rules.plan_zip_batches(pairs, set()) == rules.plan_zip_batches(
+    assert rules.plan_waves(pairs, set()) == rules.plan_waves(
         list(reversed(pairs)), set())
 
 
@@ -440,12 +455,14 @@ def wired(monkeypatch):
         return len(desired), []
     monkeypatch.setattr(wf.feishu, "update_by_key", fake_update)
 
-    # 采集器一律不真连:记录每次提交的 (批次名, ASIN 列表, 邮编, 是否要截图)
+    # 采集器一律不真连:记录每次提交的 (批次名, [(asin, 邮编)], 是否要截图)
     calls["batches"] = []
 
-    def fake_submit(name, asins, *, zip_code, needs_screenshot=False):
-        calls["batches"].append((name, list(asins), zip_code, needs_screenshot))
-        return {"batch_id": "b1", "inserted": len(asins)}
+    def fake_submit(name, items, *, needs_screenshot=False):
+        items = list(items)
+        calls["batches"].append((name, items, needs_screenshot))
+        return {"batch_id": "b1", "inserted": len(items),
+                "per_asin_zip_count": len(items), "invalid_zip_rows": 0}
     monkeypatch.setattr(wf.scraper, "submit_json", fake_submit)
 
     # 批次台账走 services.scrape_batches(自己开连接),测试里不落库
@@ -592,10 +609,8 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
     summary = wf.run({})
 
     assert len(calls["batches"]) == 1
-    name, asins, zip_code, shot = calls["batches"][0]
-    assert asins == ["B0TEST0001"]
-    assert zip_code == "10001"          # zip+4 收敛后再推
-    assert "10001" in name              # 批次名带邮编:取数与取图的隔离键
+    name, items, shot = calls["batches"][0]
+    assert items == [("B0TEST0001", "10001")]      # zip+4 收敛后再推
     assert shot is True                 # 审核要截图做佐证
     assert "推采集:1 个" in summary
 
@@ -938,14 +953,39 @@ def test_push_scrape_records_batch_id_for_failures(wired, monkeypatch):
     wf, calls = wired
     conn = FakeConn({})
     note = wf._push_scrape(conn, [("B0A", "10001"), ("B0B", "90210")], {})
-    assert "2 个 ASIN×邮编,2 个邮编批次" in note
-    # 一个邮编一个批次,批次名带邮编
-    names = [n for n, _, _, _ in calls["batches"]]
-    assert sorted(z for _, _, z, _ in calls["batches"]) == ["10001", "90210"]
-    assert all(z in n for n, _, z, _ in calls["batches"])
+    assert "推采集:2 个 ASIN×邮编" in note
+    # 两个不同 ASIN 的不同邮编进同一批(不再一个邮编一个批次)
+    assert len(calls["batches"]) == 1
+    name, items, shot = calls["batches"][0]
+    assert sorted(items) == [("B0A", "10001"), ("B0B", "90210")]
+    assert shot is True
     recorded = {a[0]: a for a in calls["recorded"]}
-    assert set(recorded) == set(names)
+    assert set(recorded) == {name}
     assert all(a[1] == "b1" and a[3] == "pushed" for a in recorded.values())
+
+
+def test_push_scrape_splits_same_asin_into_waves(wired):
+    """同一 ASIN 的两个邮编 → 两个批次(否则采集侧 400)。"""
+    wf, calls = wired
+    wf._push_scrape(FakeConn({}), [("B0A", "10001"), ("B0A", "90210")], {})
+    assert len(calls["batches"]) == 2
+    assert {z for _, items, _ in calls["batches"] for _, z in items} == {
+        "10001", "90210"}
+    names = [n for n, _, _ in calls["batches"]]
+    assert len(set(names)) == 2       # 批次名必须互不相同,否则第二波撞 409
+
+
+def test_push_scrape_warns_when_zips_not_all_accepted(wired, monkeypatch, caplog):
+    """采集侧只认了一部分逐 ASIN 邮编 ⇒ 没认的按**服务端默认邮编**采,
+    拿回来的价格是别的地区的,而两侧都不报错。必须喊出来。"""
+    wf, _ = wired
+    monkeypatch.setattr(wf.scraper, "submit_json",
+                        lambda *a, **k: {"batch_id": "b1", "inserted": 2,
+                                         "per_asin_zip_count": 1,
+                                         "invalid_zip_rows": 1})
+    with caplog.at_level("WARNING"):
+        wf._push_scrape(FakeConn({}), [("B0A", "10001"), ("B0B", "90210")], {})
+    assert "只认了 1/2" in caplog.text
 
 
 def test_push_scrape_marks_pending_before_calling(wired, monkeypatch):

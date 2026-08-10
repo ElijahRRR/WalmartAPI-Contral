@@ -137,30 +137,35 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
 
 
-def submit_json(batch_name: str, asins: list[str], *, zip_code: str,
-                needs_screenshot: bool = False, max_retries: int = 3) -> dict:
-    """输入:批次名 + ASIN 列表 + **整批邮编** → 输出:{batch_id, inserted, ...}。
+def submit_json(batch_name: str, items: list, *, needs_screenshot: bool = False,
+                max_retries: int = 3) -> dict:
+    """输入:批次名 + [(asin, 邮编)] → 输出:{batch_id, inserted, per_asin_zip_count}。
 
     走 `POST /api/batches`(JSON),与 submit_batch 的 `/api/upload` 共用同一个
-    核心函数:撞名 409、回调注册、回显读回值逐字一致。用它的理由是不必把
-    ASIN 列表拼成 txt 再 multipart 上传。
+    核心函数:撞名 409、回调注册、回显读回值逐字一致。用它的理由有两个——
+    不必把 ASIN 列表拼成 txt 再 multipart 上传,以及**逐 ASIN 带邮编**
+    (`items[].zip_code`,采集侧一等能力,邮编三档:逐 ASIN > 批次级 > 服务端默认)。
 
-    ⚠ **一个邮编一个批次**(所有者定稿 2026-08-10)。批次级邮编而不是逐 ASIN
-    邮编,理由不是接口限制而是**取数与取图的正确性**:
-    - 截图落盘是 `<批次名>/<asin>.png`,**批次名带邮编**才能让同一 ASIN 的
-      不同邮编各有各的图;
-    - 快照类端点(`/api/results?batch_id=`、`/api/export/{批次名}`)对同一 ASIN
-      **只有一行全局记录**,两个邮编的批次会返回**完全相同的行且不报错**——
-      逐邮编准确的只有 `/api/export/incremental` 按 `scrape_params.zipcode` 分组。
-    调用方编排见 services.order_audit.plan_zip_batches。
+    ⚠ 调用方约束(api 层不替你做):**同一批里同一个 ASIN 不能出现两个不同
+    邮编** —— 采集侧 `tasks` 是 `UNIQUE(batch_id, asin)`,会回
+    `400 conflicting_zip_for_asin`(明确拒绝,不静默取第一个)。
+    不同 ASIN 的不同邮编同批则完全正常。编排见
+    services.order_audit.plan_waves。
+
+    响应里的 `per_asin_zip_count` 应等于带了邮编的 ASIN 数:对不上说明邮编
+    没被采纳(比如格式不合法被退回批次邮编),**那会按错地区采回价格**。
     """
-    if not asins:
+    pairs = [(str(a).strip(), str(z).strip()) for a, z in items if a]
+    if not pairs:
         raise ValueError("submit_json:ASIN 列表为空")
-    if not str(zip_code or "").strip():
-        raise ValueError("submit_json:必须指定邮编(一个邮编一个批次)")
+    dup = {a for a, _ in pairs if len({z for b, z in pairs if b == a}) > 1}
+    if dup:
+        # 本地先拦一道:采集侧会 400,但那时批次已经建出来了(撞名占位),
+        # 下一轮同名重推还得再撞一次 409
+        raise ValueError(f"submit_json:同批内这些 ASIN 有多个邮编,必须拆批"
+                         f"(见 plan_waves):{sorted(dup)[:5]}")
     body = {"batch_name": batch_name,
-            "asins": [str(a).strip() for a in asins if a],
-            "zip_code": str(zip_code).strip(),
+            "items": [{"asin": a, "zip_code": z} for a, z in pairs],
             "needs_screenshot": bool(needs_screenshot)}
     last: Exception | None = None
     for attempt in range(max_retries):

@@ -98,42 +98,51 @@ def test_screenshot_list_404_is_lookup_error(monkeypatch):
         scraper.screenshot_list("wm-audit-10001-x")
 
 
-# ── JSON 推送(一个邮编一个批次)───────────────────────────────────────────────
+# ── JSON 推送(逐 ASIN 带邮编)─────────────────────────────────────────────────
 
-def test_submit_json_requires_a_zip(monkeypatch):
-    """邮编是批次级参数且必填:漏了就等于按默认地区采,拿回来的价格
-    审的是别的地区的单,而接口不会报错。"""
-    with pytest.raises(ValueError):
-        scraper.submit_json("wm-audit-x", ["B001"], zip_code="")
-    with pytest.raises(ValueError):
-        scraper.submit_json("wm-audit-x", [], zip_code="10001")
-
-
-def test_submit_json_posts_batch_level_zip(monkeypatch):
+def test_submit_json_posts_per_asin_zips(monkeypatch):
+    """邮编走 items[].zip_code:采集侧邮编三档(逐 ASIN > 批次级 > 服务端默认),
+    逐 ASIN 是一等能力,所以一批能混不同 ASIN 的不同邮编。"""
     sent = {}
 
     def fake_post(url, **kw):
         sent.update(url=url, json=kw.get("json"))
-        return httpx.Response(200, json={"batch_id": 7, "inserted": 1},
+        return httpx.Response(200, json={"batch_id": 7, "inserted": 2},
                               request=httpx.Request("POST", url))
     monkeypatch.setattr(httpx, "post", fake_post)
 
-    res = scraper.submit_json("wm-audit-10001-x", ["B001"], zip_code="10001",
+    res = scraper.submit_json("wm-audit-x", [("B001", "10001"), ("B002", "90210")],
                               needs_screenshot=True)
     assert res["batch_id"] == 7
     assert sent["url"].endswith("/api/batches")
-    assert sent["json"] == {"batch_name": "wm-audit-10001-x", "asins": ["B001"],
-                            "zip_code": "10001", "needs_screenshot": True}
+    assert sent["json"] == {
+        "batch_name": "wm-audit-x", "needs_screenshot": True,
+        "items": [{"asin": "B001", "zip_code": "10001"},
+                  {"asin": "B002", "zip_code": "90210"}]}
+
+
+def test_submit_json_rejects_same_asin_two_zips_locally(monkeypatch):
+    """同批同 ASIN 两个邮编 → 本地就拦。采集侧会回 400,但那时批次已经建出来,
+    下轮同名重推还得再撞一次 409。"""
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: pytest.fail("不该发出去"))
+    with pytest.raises(ValueError) as e:
+        scraper.submit_json("wm-audit-x", [("B001", "10001"), ("B001", "90210")])
+    assert "B001" in str(e.value)
+
+
+def test_submit_json_empty_is_rejected(monkeypatch):
+    with pytest.raises(ValueError):
+        scraper.submit_json("wm-audit-x", [])
 
 
 def test_submit_json_409_carries_existing_batch_id(monkeypatch):
     """撞名 = 上次其实推成功了(v4 绝不静默合并):拿既有 batch_id 接着轮询,
     别重推。这也是本端点可以安全重试的前提。"""
     monkeypatch.setattr(httpx, "post", lambda url, **kw: httpx.Response(
-        409, json={"detail": {"batch_id": 42, "batch_name": "wm-audit-10001-x"}},
+        409, json={"detail": {"batch_id": 42, "batch_name": "wm-audit-x"}},
         request=httpx.Request("POST", url)))
     with pytest.raises(scraper.BatchExistsError) as e:
-        scraper.submit_json("wm-audit-10001-x", ["B001"], zip_code="10001")
+        scraper.submit_json("wm-audit-x", [("B001", "10001")])
     assert e.value.batch_id == 42
 
 
@@ -144,5 +153,5 @@ def test_submit_json_400_is_terminal_not_retried(monkeypatch):
                         httpx.Response(400, json={"detail": "conflicting_zip_for_asin"},
                                        request=httpx.Request("POST", url)))
     with pytest.raises(ValueError):
-        scraper.submit_json("wm-audit-x", ["B001"], zip_code="10001")
+        scraper.submit_json("wm-audit-x", [("B001", "10001")])
     assert len(calls) == 1

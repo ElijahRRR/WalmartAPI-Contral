@@ -952,13 +952,14 @@ def test_push_scrape_records_batch_id_for_failures(wired, monkeypatch):
     漏记了就永远答不上"这个 ASIN 为什么没采到"。"""
     wf, calls = wired
     conn = FakeConn({})
-    note = wf._push_scrape(conn, [("B0A", "10001"), ("B0B", "90210")], {})
+    note, sent = wf._push_scrape(conn, [("B0A", "10001"), ("B0B", "90210")], {})
     assert "推采集:2 个 ASIN×邮编" in note
     # 两个不同 ASIN 的不同邮编进同一批(不再一个邮编一个批次)
     assert len(calls["batches"]) == 1
     name, items, shot = calls["batches"][0]
     assert sorted(items) == [("B0A", "10001"), ("B0B", "90210")]
     assert shot is True
+    assert sent == [name]     # 等待名单就是本轮真推出去的批次
     recorded = {a[0]: a for a in calls["recorded"]}
     assert set(recorded) == {name}
     assert all(a[1] == "b1" and a[3] == "pushed" for a in recorded.values())
@@ -1009,10 +1010,118 @@ def test_push_scrape_failure_settles_the_pairs(wired, monkeypatch):
     conn = FakeConn({})
     monkeypatch.setattr(wf.scraper, "submit_json",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("炸")))
-    note = wf._push_scrape(conn, [("B0A", "10001")], {})
+    note, sent = wf._push_scrape(conn, [("B0A", "10001")], {})
     assert "失败 1" in note
+    assert sent == []        # 推失败的批次不进等待名单
     assert any("state = 'failed'" in s for s, _ in conn.executed)
     assert calls["recorded"][-1][3] == "failed"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  wait=1:等采完 → 就地摄取 → 重判(一条命令出结论)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def nosleep(monkeypatch):
+    from workflows import order_audit as wf
+    monkeypatch.setattr(wf.time, "sleep", lambda s: None)
+    return wf
+
+
+def test_wait_returns_when_all_batches_settle(nosleep, monkeypatch):
+    wf = nosleep
+    seen = []
+
+    def status(name):
+        seen.append(name)
+        return {"stats": {"open": 0}, "screenshots": {"open": 0}}
+    monkeypatch.setattr(wf.scraper, "batch_status", status)
+    note, stuck = wf._wait_for_batches(["b1", "b2"], 20)
+    assert stuck == 0 and "2 批全部落定" in note
+    assert set(seen) == {"b1", "b2"}
+
+
+def test_wait_keeps_waiting_while_screenshots_open(nosleep, monkeypatch):
+    """任务采完了但截图还在跑 → 还没落定。这轮就摄取的话,截图列会整批空。"""
+    wf = nosleep
+    calls = {"n": 0}
+
+    def status(name):
+        calls["n"] += 1
+        open_shots = 1 if calls["n"] < 3 else 0
+        return {"stats": {"open": 0}, "screenshots": {"open": open_shots}}
+    monkeypatch.setattr(wf.scraper, "batch_status", status)
+    note, stuck = wf._wait_for_batches(["b1"], 20)
+    assert stuck == 0 and calls["n"] >= 3
+
+
+def test_wait_gives_up_at_deadline_without_failing(nosleep, monkeypatch):
+    """超时不是失败:已采到的照常进增量流,没采到的下轮由台账三层判据处置。"""
+    wf = nosleep
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 5}, "screenshots": {"open": 0}})
+    note, stuck = wf._wait_for_batches(["b1"], 0)      # 0 分钟 = 立刻到点
+    assert stuck == 1 and "仍在跑" in note
+
+
+def test_wait_stops_waiting_on_vanished_batch(nosleep, monkeypatch):
+    """采集侧查不到这个批次了 → 再等也没意义,交给对账那层认账。"""
+    wf = nosleep
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: (_ for _ in ()).throw(LookupError("没有")))
+    note, stuck = wf._wait_for_batches(["b1"], 20)
+    assert stuck == 0
+
+
+def test_wait_survives_status_outage(nosleep, monkeypatch):
+    """状态查询炸了不能当落定(那会让下一步的对账把整批判成没数据),
+    继续等到超时为止。"""
+    wf = nosleep
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: (_ for _ in ()).throw(RuntimeError("502")))
+    note, stuck = wf._wait_for_batches(["b1"], 0)
+    assert stuck == 1
+
+
+def test_wait_with_no_batches_is_a_noop(nosleep):
+    assert nosleep._wait_for_batches([], 20) == ("", 0)
+
+
+def test_ingest_now_skips_when_product_ingest_holds_the_lock(wired, monkeypatch):
+    """拿不到 product_ingest 的锁 = 它正在跑:跳过,别和它抢游标。
+
+    两个进程同推游标,后写的会盖掉先写的,中间那段记录永远不会再被拉一次
+    —— 两侧都不报错,只是产品中心少了一批数据。
+    """
+    wf, _ = wired
+    import contextlib
+    monkeypatch.setattr(wf.runlock, "hold",
+                        lambda name: contextlib.nullcontext(False))
+    monkeypatch.setattr(wf.ingest, "pump",
+                        lambda *a, **k: pytest.fail("没拿到锁就不该摄取"))
+    note = wf._ingest_now()
+    assert "跳过" in note and "product_ingest" in note
+
+
+def test_ingest_now_pumps_under_the_lock(wired, monkeypatch):
+    wf, _ = wired
+    import contextlib
+    taken = []
+    monkeypatch.setattr(wf.runlock, "hold",
+                        lambda name: taken.append(name) or
+                        contextlib.nullcontext(True))
+    monkeypatch.setattr(wf.ingest, "pump",
+                        lambda sc, d, **k: {"ok": True, "pages": 1, "fetched": 2,
+                                            "cursor_from": 0, "cursor_to": 9,
+                                            "totals": {"snapshots": 2, "dup": 0,
+                                                       "products": 2,
+                                                       "skipped_outcome": 0,
+                                                       "incomplete": 0,
+                                                       "invalid": 0},
+                                            "error": None})
+    note = wf._ingest_now()
+    assert taken == ["product_ingest"]     # 借的是它的锁,不是自己开一把
+    assert "就地增量摄取" in note and "游标 0 → 9" in note
 
 
 def test_run_config_missing_suppliers_refuses(wired, monkeypatch):

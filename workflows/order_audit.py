@@ -6,8 +6,16 @@
   python cli.py order_audit -p stores=店铺A,店铺B
   python cli.py order_audit -p line=<order_line_id>   # 单行重审(忽略窗口)
   python cli.py order_audit -p recheck=1       # 连终局结论的行一起重审(钓鱼行除外)
-  python cli.py order_audit -p scrape=0        # 不推采集(只判定)
+  python cli.py order_audit -p scrape=0        # 不推采集(只对账 + 判定)
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
+  python cli.py order_audit -p wait=1          # 等这批采完 + 就地摄取 + 重判
+
+`-p wait=1`(所有者定稿 2026-08-10)——**一条命令出真结论**:
+推采集 → 轮询批次到落定(20 分钟兜底)→ 就地跑增量摄取 → 重新对账重判 →
+回写飞书。默认关:调度里每小时跑一轮,结论滞后一轮无所谓,而阻塞 20 分钟
+的一次运行会把那一小时的位置占掉。手动排查、以及想立刻看到结论时开。
+就地摄取**借 product_ingest 的 flock**——游标独占推进,两个进程同推会静默
+丢掉中间一段(详见 services/runlock 与 services/product_ingest.pump)。
 
 设计(PG 权威,飞书是人机界面):
 - 判定与推送**两段解耦**:判定只挑"这轮该判的行",推送则把窗口内**所有已判定行**
@@ -65,6 +73,7 @@
 
 import json
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -72,7 +81,8 @@ import httpx
 
 from api import feishu, scraper
 from registry import db, resources
-from services import kpi, order_audit as rules, scrape_batches as batches
+from services import (kpi, order_audit as rules, product_ingest as ingest,
+                      runlock, scrape_batches as batches)
 
 DANGEROUS = False
 
@@ -429,8 +439,8 @@ def _settle_ledger(conn) -> tuple[int, int, dict, list[str]]:
     return settled, timed_out + failed_pairs, blocked, notes
 
 
-def _push_scrape(conn, want: list, blocked: dict) -> str:
-    """输入:连接 + 待采 pair + 本轮不可推的 pair → 输出:推送结果摘要(一行)。
+def _push_scrape(conn, want: list, blocked: dict) -> tuple[str, list]:
+    """输入:连接 + 待采 pair + 本轮不可推的 pair → 输出:(摘要, 本轮推出的批次名)。
 
     **一批混不同 ASIN 的不同邮编**(逐 ASIN 带 `items[].zip_code`);只有同一
     ASIN 的多个邮编才拆到不同波次——库结构决定(`UNIQUE(batch_id, asin)`),
@@ -453,14 +463,14 @@ def _push_scrape(conn, want: list, blocked: dict) -> str:
                        gaveup, _RESCRAPE_WINDOW_HOURS)
     if not waves:
         if not want:
-            return "推采集:0(无待采)"
-        return (f"推采集:0(待采 {len(want)} 行"
-                + (f",在途 {inflight}" if inflight else "")
-                + (f",**已放弃 {gaveup}**(超 {_RESCRAPE_WINDOW_HOURS}h 重试窗口,"
-                   f"需人工)" if gaveup else "") + ")")
+            return "推采集:0(无待采)", []
+        return ((f"推采集:0(待采 {len(want)} 行"
+                 + (f",在途 {inflight}" if inflight else "")
+                 + (f",**已放弃 {gaveup}**(超 {_RESCRAPE_WINDOW_HOURS}h 重试窗口,"
+                    f"需人工)" if gaveup else "") + ")"), [])
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
-    pushed, failed, notes = 0, 0, []
+    pushed, failed, notes, sent = 0, 0, [], []
     for i, wave in enumerate(waves, 1):
         # 单波(常态)不带序号:批次名是取图与排障的抓手,越简单越好
         name = (f"{_BATCH_PREFIX}{stamp}" if len(waves) == 1
@@ -476,6 +486,7 @@ def _push_scrape(conn, want: list, blocked: dict) -> str:
             batches.record(name, res.get("batch_id"), len(wave), "pushed",
                            f"inserted={res.get('inserted')}")
             pushed += len(wave)
+            sent.append(name)
             notes.append(f"{len(wave)} 个/{zips} 邮编")
             got = res.get("per_asin_zip_count")
             if got is not None and int(got) != len(wave):
@@ -494,6 +505,7 @@ def _push_scrape(conn, want: list, blocked: dict) -> str:
             batches.record(name, e.batch_id, len(wave), "pushed",
                            "撞名沿用既有批次")
             pushed += len(wave)
+            sent.append(name)          # 撞名 = 上次真推成功了,照样要等它
             notes.append(f"{len(wave)} 个(沿用既有批次)")
         except Exception as e:
             failed += len(wave)
@@ -516,7 +528,72 @@ def _push_scrape(conn, want: list, blocked: dict) -> str:
                 f"需人工)")
     if failed:
         out += f";失败 {failed}"
-    return out or f"推采集:全部失败({failed})"
+    return (out or f"推采集:全部失败({failed})"), sent
+
+
+def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
+    """输入:本轮推出的批次名 + 超时分钟 → 输出:(摘要, 仍未落定的批次数)。
+
+    只轮询 `GET /api/batches/{名}/status`,**不碰台账**——这一步的唯一问题是
+    "采集侧还在跑吗"。台账对账必须等**摄取之后**再做:批次 completed 只说明
+    采集侧干完了,数据还在增量流里,这时去对账会把每一条都判成"批次已采完
+    但无快照",一轮全军覆没。
+
+    退避从 3 秒涨到 30 秒:本地采集器几秒就完,别为了一个小批次死等 30 秒;
+    真慢的批次也不该每 3 秒问一次。超时不是失败——已采到的照常进增量流,
+    没采到的下一轮由台账三层判据处置。
+    """
+    if not names:
+        return "", 0
+    started = time.monotonic()
+    deadline = started + timeout_min * 60
+    pending = set(names)
+    delay = 3.0
+    while pending and time.monotonic() < deadline:
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 30.0)
+        for name in sorted(pending):
+            try:
+                st = scraper.batch_status(name)
+            except LookupError:
+                # 采集侧查不到了:再等也没意义,交给对账那层认账
+                pending.discard(name)
+                continue
+            except Exception as e:                  # 查不动:下一轮再问
+                logger.warning("等批次 %s:状态查询失败(继续等):%s", name, e)
+                continue
+            if batches.is_settled(st):
+                pending.discard(name)
+        if pending:
+            logger.info("等采集:%d/%d 批已落定,继续等(已 %.0f 秒)",
+                        len(names) - len(pending), len(names),
+                        time.monotonic() - started)
+    mins = (time.monotonic() - started) / 60
+    if pending:
+        return (f"等采集:{len(names) - len(pending)}/{len(names)} 批落定,"
+                f"**{len(pending)} 批超 {timeout_min} 分钟仍在跑**"
+                f"(已采到的照常进增量流,其余下轮处置)"), len(pending)
+    return f"等采集:{len(names)} 批全部落定(耗时 {mins:.1f} 分钟)", 0
+
+
+def _ingest_now() -> str:
+    """输入:无 → 输出:就地增量摄取的摘要(拿不到锁则说明原因)。
+
+    **借的是 product_ingest 的活,就得借它的锁**:增量游标
+    (`ops.cursors` name='product_ingest')是独占推进的,两个进程同时拉
+    `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉先写的,
+    中间那段记录**永远不会再被拉一次**(游标只前进不回头)——两侧都不报错,
+    只是产品中心少了一批数据。
+
+    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
+    只是本轮看不到,下轮再判。
+    """
+    with runlock.hold(ingest.CURSOR_NAME) as got:
+        if not got:
+            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
+                    "数据仍会由它摄入,下轮再判")
+        res = ingest.pump(scraper, db)
+    return "就地" + ingest.pump_summary(res)
 
 
 def _save(conn, results: list) -> int:
@@ -696,14 +773,19 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _yes(v) -> bool:
+    return str(v).lower() in {"1", "true", "yes"}
+
+
 def run(params: dict) -> str:
-    """输入:params(days/stores/line/recheck/push)→ 输出:审核结果摘要。"""
+    """输入:params(days/stores/line/recheck/scrape/wait/push)→ 输出:审核摘要。"""
     days = int(params.get("days", _DEFAULT_DAYS))
     stores = [s.strip() for s in str(params.get("stores", "")).split(",") if s.strip()]
     line_id = str(params.get("line", "")).strip()
-    recheck = str(params.get("recheck", "")).lower() in {"1", "true", "yes"}
+    recheck = _yes(params.get("recheck", ""))
     do_push = str(params.get("push", "1")).lower() not in {"0", "false", "no"}
     do_scrape = str(params.get("scrape", "1")).lower() not in {"0", "false", "no"}
+    do_wait = _yes(params.get("wait", ""))
 
     blacklist, suppliers = _load_config()
     store_filter = "AND store = ANY(%(stores)s)" if stores else ""
@@ -741,9 +823,31 @@ def run(params: dict) -> str:
             tally[res.status] = tally.get(res.status, 0) + 1
 
         # ③ 推采集:一批混邮编,同一 ASIN 的多邮编拆波次
-        scrape_note = ""
+        scrape_note, sent = "", []
         if do_scrape:
-            scrape_note = _push_scrape(conn, want, blocked)
+            scrape_note, sent = _push_scrape(conn, want, blocked)
+
+        # ③′ wait=1:等这批采完 → 就地摄取 → 重新对账重判(一条命令出结论)
+        #
+        # 顺序不能换。批次 completed 只说明**采集侧**干完了,数据还在增量流里;
+        # 不先摄取就去对账,每一条都会被判成"批次已采完但无快照",一轮全军覆没。
+        #     等批次落定 → 摄取(拿 product_ingest 的锁)→ 对账 → 重判
+        wait_notes: list[str] = []
+        if do_wait and sent:
+            note, _stuck = _wait_for_batches(sent, _SCRAPE_TIMEOUT_MIN)
+            wait_notes.append(note)
+            wait_notes.append(_ingest_now())
+            settled2, gone2, _blocked2, notes2 = _settle_ledger(conn)
+            settled += settled2
+            gone += gone2
+            batch_notes.extend(notes2)
+            # 重判的是**同一批行**:第一遍它们多半是"待采集/待人工",这遍才
+            # 拿到真数据。已出终局结论的行 judge 会照常重算,不受影响。
+            results, _want2 = _judge_all(conn, lines, blacklist, suppliers)
+            saved = _save(conn, results)
+            tally = {}
+            for _, res in results:
+                tally[res.status] = tally.get(res.status, 0) + 1
 
         # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
         pushed = missing = 0
@@ -776,6 +880,7 @@ def run(params: dict) -> str:
     parts.extend(batch_notes)
     if scrape_note:
         parts.append(scrape_note)
+    parts.extend(n for n in wait_notes if n)
     if do_push:
         parts.append(f"飞书回写 {pushed} 行"
                      + (f",{missing} 行尚未建出(等 order_center_push)" if missing else ""))

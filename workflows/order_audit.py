@@ -80,7 +80,7 @@ _SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe:批次名|ASIN → f
 # 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
 _PICK_SQL = """
 SELECT order_line_id, store, sku, product_name, qty, product_amount,
-       shipping_amount, postal_code, sale_status, audit_status
+       shipping_amount, postal_code, sale_status, audit_status, audit_detail
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %(days)s)
   AND coalesce(sale_status, '') <> 'Cancelled'
@@ -91,7 +91,7 @@ ORDER BY order_date DESC
 
 _ONE_SQL = """
 SELECT order_line_id, store, sku, product_name, qty, product_amount,
-       shipping_amount, postal_code, sale_status, audit_status
+       shipping_amount, postal_code, sale_status, audit_status, audit_detail
 FROM orders.order_lines WHERE order_line_id = %(line)s
 """
 
@@ -125,15 +125,15 @@ WHERE s.marketplace = 'US' AND s.asin = ANY(%(asins)s)
 #    一轮死磕(采不出来就是采不出来),再推只是每小时白烧一次配额。
 #    反之若最近 24 小时都没推过,那是**新需求**(比如同邮编来了新订单),
 #    窗口重置,允许再推。
+# 两类分开标记:摘要要能区分"在等"和"已放弃"——混成一个数的话,
+# 一个采不出来的 ASIN 堆了几百个就只显示"在途 N",没人看得出该去人工处理了。
 _BLOCKED_SQL = """
-SELECT asin, zip FROM ops.audit_scrape
+SELECT asin, zip,
+       CASE WHEN state = 'pending' THEN 'inflight' ELSE 'gaveup' END AS why
+FROM ops.audit_scrape
 WHERE state = 'pending'
    OR (first_requested_at < now() - make_interval(hours => %(retry)s)
        AND requested_at   >= now() - make_interval(hours => %(fresh)s))
-"""
-
-_INFLIGHT_SQL = """
-SELECT count(*) FROM ops.audit_scrape WHERE state = 'pending'
 """
 
 # 落定判据:requested_at 之后该 (ASIN, 邮编) 真的出现了新快照。
@@ -145,7 +145,11 @@ WHERE a.state = 'pending' AND EXISTS (
     SELECT 1 FROM catalog.snapshots s
     WHERE s.marketplace = 'US' AND s.asin = a.asin
       AND s.scrape_params ->> 'zipcode' = a.zip
-      AND s.scraped_at >= a.requested_at)
+      AND s.scraped_at >= a.requested_at
+      -- 与判定侧同口径:切邮编失败(zip_verify=mismatch)的快照在
+      -- from_snapshot 里被整条判废,等于这次采集没回来,不能算落定,
+      -- 否则台账显示 done 而行仍卡在待采集,排障时对不上
+      AND coalesce(s.scrape_params ->> 'zip_verify', '') <> 'mismatch')
 """
 
 _TIMEOUT_SQL = """
@@ -170,6 +174,31 @@ ON CONFLICT (asin, zip) DO UPDATE SET
              < now() - make_interval(hours => %(fresh)s) THEN now()
         ELSE ops.audit_scrape.first_requested_at END
 """
+
+
+def _detail(row: dict) -> dict:
+    """输入:带 audit_detail 的行 → 输出:解析后的 detail dict(缺失给空 dict)。"""
+    d = row.get("audit_detail")
+    if isinstance(d, str):
+        try:
+            d = json.loads(d or "{}")
+        except ValueError:
+            return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _marked_phishing(row: dict) -> bool:
+    """输入:订单行 → 输出:是否已被标过钓鱼(不可覆盖)。
+
+    ⚠ 标记落在 **audit_detail.note**,不在 audit_status——status 是
+    「✓ 通过 / 建议拒绝 / 待人工」三值封闭集(飞书单选字段要固定选项),
+    钓鱼行的 status 就是「建议拒绝」,里面根本没有"钓鱼"二字。
+    (查 status 是本函数存在前的写法,那样这道不可覆盖闸等于没有:
+    黑名单里删掉一个邮编,历史钓鱼结论会被下一轮 recheck 悄悄抹掉——
+    正是旧系统明列的坑。)status 也一并查:人工在库里手写过标记时仍然算数。
+    """
+    return (rules.PHISHING_MARK in (row.get("audit_status") or "")
+            or rules.PHISHING_MARK in str(_detail(row).get("note") or ""))
 
 
 def _load_config() -> tuple[set[str], list[rules.Supplier]]:
@@ -258,8 +287,8 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     return results, want
 
 
-def _settle_ledger(conn) -> tuple[int, int, set]:
-    """输入:连接 → 输出:(本轮落定数, 判超时数, 本轮不可推的 {(asin, 邮编)})。
+def _settle_ledger(conn) -> tuple[int, int, dict]:
+    """输入:连接 → 输出:(本轮落定数, 判超时数, {(asin,邮编): 'inflight'|'gaveup'})。
 
     每轮开工先对账——这就是"重启后先查实际状态再决定是否补交"(CLAUDE.md
     铁律)的落地:进程死了没关系,pending 记录还在,下轮照样能判断该不该重推。
@@ -271,7 +300,7 @@ def _settle_ledger(conn) -> tuple[int, int, set]:
         timed_out = cur.rowcount or 0
         cur.execute(_BLOCKED_SQL, {"retry": _RESCRAPE_WINDOW_HOURS,
                                    "fresh": _SNAPSHOT_FRESH_HOURS})
-        blocked = {(r[0], r[1]) for r in cur.fetchall()}
+        blocked = {(r[0], r[1]): r[2] for r in cur.fetchall()}
     conn.commit()
     if timed_out:
         logger.warning("采集台账:%d 个 (ASIN,邮编) 超 %d 小时未见快照,判失败"
@@ -289,11 +318,23 @@ def _push_scrape(conn, want: list, blocked: set) -> str:
     的多个邮编必须分到不同批次(采集侧 UNIQUE(batch_id, asin))。
     **所有波次同一轮内推完**,不再跨轮等待。
     """
-    waves = rules.plan_waves(want, blocked)
+    waves = rules.plan_waves(want, set(blocked))
+    held = [blocked[p] for p in {(a, z) for a, z in want} if p in blocked]
+    inflight = held.count("inflight")
+    gaveup = held.count("gaveup")
+    if gaveup:
+        # 单独喊出来:这些是"采了一天还是采不出来"的,系统不会再管,
+        # 只能人工看。混在"在途"里就等于没人知道
+        logger.warning("采集台账:%d 个 (ASIN,邮编) 已超 %d 小时重试窗口,"
+                       "本轮起不再重推,需人工处理",
+                       gaveup, _RESCRAPE_WINDOW_HOURS)
     if not waves:
-        held = len({(a, z) for a, z in want} & blocked)
-        return (f"推采集:0(待采 {len(want)},其中 {held} 个组合在途或已过重试窗口)"
-                if want else "推采集:0(无待采)")
+        if not want:
+            return "推采集:0(无待采)"
+        return (f"推采集:0(待采 {len(want)} 行"
+                + (f",在途 {inflight}" if inflight else "")
+                + (f",**已放弃 {gaveup}**(超 {_RESCRAPE_WINDOW_HOURS}h 重试窗口,"
+                   f"需人工)" if gaveup else "") + ")")
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
     pushed, failed, notes = 0, 0, []
@@ -330,6 +371,11 @@ def _push_scrape(conn, want: list, blocked: set) -> str:
     wave_note = f",{len(waves)} 波" if len(waves) > 1 else ""
     out = (f"推采集:{pushed} 个 ASIN×邮编{wave_note}({'、'.join(notes)})"
            if pushed else "")
+    if inflight:
+        out += f";在途 {inflight} 未重推"
+    if gaveup:
+        out += (f";**已放弃 {gaveup}**(超 {_RESCRAPE_WINDOW_HOURS}h 重试窗口,"
+                f"需人工)")
     if failed:
         out += f";失败 {failed}"
     return out or f"推采集:全部失败({failed})"
@@ -420,9 +466,7 @@ WHERE batch_name IS NOT NULL AND (asin, zip) = ANY(%(pairs)s)
 
 def _batch_names(conn, rows: list[dict]) -> dict[tuple, str]:
     """输入:连接 + 已判定行 → 输出:{(asin, 邮编): batch_name}(取图的抓手)。"""
-    pairs = [(d.get("asin"), d.get("zip")) for d in
-             ((r.get("audit_detail") if isinstance(r.get("audit_detail"), dict)
-               else json.loads(r.get("audit_detail") or "{}")) for r in rows)
+    pairs = [(d.get("asin"), d.get("zip")) for d in map(_detail, rows)
              if d.get("asin") and d.get("zip")]
     if not pairs:
         return {}
@@ -437,9 +481,7 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     batches = _batch_names(conn, rows)
     out: dict[str, dict] = {}
     for r in rows:
-        d = r.get("audit_detail") or {}
-        if isinstance(d, str):
-            d = json.loads(d)
+        d = _detail(r)
         fields = {
             f.audit_status: r["audit_status"],
             f.script_audit: d.get("note"),
@@ -492,9 +534,8 @@ def run(params: dict) -> str:
             cols = [d[0] for d in cur.description]
             lines = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-        # 钓鱼行不可覆盖:已标钓鱼的行任何情况下都不再改写
-        lines = [r for r in lines
-                 if rules.PHISHING_MARK not in (r.get("audit_status") or "")]
+        # 钓鱼行不可覆盖:已标钓鱼的行任何情况下都不再改写(复审须人工清空)
+        lines = [r for r in lines if not _marked_phishing(r)]
 
         # ② 采集台账先对账(重启安全:pending 还在,能判断该不该重推)
         settled, timed_out, blocked = _settle_ledger(conn)

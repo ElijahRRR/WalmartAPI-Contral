@@ -11,10 +11,15 @@
 | 商品一致性 | 标题相似度 0.9 | 阈值不变;相似度数值另出一列给人看 |
 | 输出 | 单列 AN 文本 | 审核状态(结论)+ 脚本审核(明细)两列 |
 
-审核顺序即优先级(见 judge):钓鱼 → 采集完整性 → **商品一致性** → 配送时长 →
-采购方 → 限价。任何一道给不出确定答案,结论都是"待人工",**绝不当作通过**。
+审核顺序即优先级(见 judge):钓鱼 → **采不了的**(邮编/SKU 不合法)→
+采集完整性 → **商品一致性** → 配送时长 → 采购方 → 限价。
+任何一道给不出确定答案,结论都是"待人工",**绝不当作通过**。
 一致性排在配送时长与限价之前:采到的若不是同一个商品,拿它算出来的限价
 和货期全无意义,不该产出确定结论。
+
+**闭环要求**:每条分支都得回一个三值结论 + 一句人能读的原因,并显式标出
+`rescrape`(重采能不能解决)。"采不了的"必须与"待采集"用**不同文案**——
+否则那些行会永远挂着等一个不会到来的快照,而摘要里的待采数还不含它们。
 
 null-0 铁律:采集侧 stock_count / delivery_days 的 NULL 表示"没采到",
 0 表示"确实是 0"。本模块只在值 is not None 时判定,None 一律走待人工——
@@ -42,6 +47,12 @@ MANUAL = "待人工"
 # 钓鱼标记不可覆盖(旧系统 审核决策.是钓鱼标记):一旦某行结论含此二字,
 # 后续轮次不再改写该行,复审须人工清空审核状态。
 PHISHING_MARK = "钓鱼"
+
+# 合法 ASIN 形态(与采集侧 common/core/idents.ASIN_RE 同口径):B + 9 位大写字母数字。
+# 订单行的 SKU 里混着旧系统留下的自定义编码,采集侧建任务时就把它们丢掉,
+# 推了也是白推——这类行必须给出**与"待采集"不同的结论**,否则会永远挂着等
+# 一个不会到来的快照。
+ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -258,7 +269,19 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
         return AuditResult(REJECT, f"{PHISHING_MARK}邮编:{z}", detail)
     detail["rules"]["phishing"] = {"hit": False}
 
-    # ② 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
+    # ② 采不了的两种:说"待采集"就是骗人,得让人一眼看出要人工处理。
+    #    (不标 rescrape:推了也白推,而且行会一直挂着"待采集"等一个永远不来的
+    #     快照——这正是"静默卡死"的典型形状)
+    zip5 = norm_zip(line.get("postal_code"))
+    if not zip5:
+        return AuditResult(MANUAL, "收件邮编缺失或不足 5 位,无法按邮编采集,"
+                                   "需人工核对地址", detail)
+    asin = str(line.get("sku") or "").strip().upper()
+    if not ASIN_RE.fullmatch(asin):
+        return AuditResult(MANUAL, f"SKU「{asin or '空'}」不是 ASIN 形态,"
+                                   f"采集器不受理,需人工核对", detail)
+
+    # ③ 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
     if not snap:
         return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照",
                            detail, rescrape=True)
@@ -278,7 +301,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
         return AuditResult(MANUAL, "采集缺字段:" + "、".join(missing) + ",已排重采",
                            detail, rescrape=True)
 
-    # ③ 商品一致性:采到的得是同一个商品,否则后面拿它算的限价全无意义,
+    # ④ 商品一致性:采到的得是同一个商品,否则后面拿它算的限价全无意义,
     #    所以排在配送时长与限价**之前**——垃圾输入不该产出确定结论
     sim = title_similarity(line.get("product_name"), snap.get("amz_title"))
     detail["title_similarity"] = sim
@@ -291,7 +314,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                            f"商品可能不一致:标题相似度 {sim} < {TITLE_SIMILARITY_MIN},"
                            f"待人工", detail)
 
-    # ④ 配送时长闸(≥9 天建议拒绝)
+    # ⑤ 配送时长闸(≥9 天建议拒绝)
     days = _num(snap.get("ship_days"))
     detail["rules"]["delivery"] = {"days": days, "max": DELIVERY_DAYS_MAX}
     if days is not None and days >= DELIVERY_DAYS_MAX:
@@ -299,7 +322,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                            f"配送时长 {int(days)} 天 ≥ {DELIVERY_DAYS_MAX} 天",
                            detail)
 
-    # ⑤ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
+    # ⑥ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
     sup = pick_supplier(suppliers, snap.get("ship_method"), snap.get("amz_price"))
     if sup is None:
         detail["rules"]["supplier"] = {"hit": False}
@@ -310,7 +333,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail["rate"] = sup.rate
     detail["rules"]["supplier"] = {"hit": True, "name": sup.name, "rate": sup.rate}
 
-    # ⑥ 限价
+    # ⑦ 限价
     cap = price_cap(line.get("product_amount"))
     cost = purchase_cost(snap.get("amz_price"), line.get("qty"), sup.rate,
                          snap.get("shipping"))

@@ -143,13 +143,13 @@ def test_price_ok_boundary():
 #  决策链
 # ══════════════════════════════════════════════════════════════════════════════
 
-LINE = {"order_line_id": "PO1|SKU1", "sku": "B001", "qty": 1,
+LINE = {"order_line_id": "PO1|SKU1", "sku": "B0TEST0001", "qty": 1,
         "product_amount": 100, "postal_code": "10001",
         "product_name": "Acme Widget Pro 12 inch Blue"}
 
 
 def _snap(**kw):
-    base = {"asin": "B001", "zip": "10001", "amz_price": 50, "shipping": 0,
+    base = {"asin": "B0TEST0001", "zip": "10001", "amz_price": 50, "shipping": 0,
             "stock_qty": 10, "ship_method": "FBA", "ship_days": 3,
             "seller": "Amazon.com", "screenshot_url": None, "outcome": "ok",
             "amz_title": "Acme Widget Pro 12 inch Blue",
@@ -335,7 +335,7 @@ def test_from_snapshot_uses_contract_fields():
     """字段位置按契约 v1:邮编 scrape_params.zipcode、配送方式 raw.is_fba、
     卖家 buybox.buybox_seller —— 按名字猜会全取空。"""
     snap = rules.from_snapshot({
-        "asin": "B001", "price": 12.5, "stock_count": 3, "delivery_days": 4,
+        "asin": "B0TEST0001", "price": 12.5, "stock_count": 3, "delivery_days": 4,
         "buybox": {"buybox_seller": "Acme"}, "shipping": 2.5,
         "shipping_raw": "$2.50", "raw": {"is_fba": "FBA"},
         "scrape_params": {"zipcode": "10001-2222"}, "outcome": "ok",
@@ -351,14 +351,14 @@ def test_from_snapshot_uses_contract_fields():
 def test_from_snapshot_discards_zip_mismatch():
     """zip_verify=mismatch:切邮编失败拿回的是默认地区价格,必须判废。"""
     snap = rules.from_snapshot({
-        "asin": "B001", "price": 12.5, "buybox": {}, "raw": {},
+        "asin": "B0TEST0001", "price": 12.5, "buybox": {}, "raw": {},
         "scrape_params": {"zipcode": "10001", "zip_verify": "mismatch",
                           "zip_observed": "94105"}})
     assert snap["zip"] == ""                 # 匹配不上任何订单行 → 视同没采到
 
 
 def test_from_snapshot_tolerates_missing_buybox():
-    snap = rules.from_snapshot({"asin": "B001", "price": 1, "buybox": None,
+    snap = rules.from_snapshot({"asin": "B0TEST0001", "price": 1, "buybox": None,
                                 "scrape_params": None})
     assert snap["ship_method"] is None and snap["zip"] == ""
 
@@ -459,7 +459,7 @@ def wired(monkeypatch):
 
 PICK_COLS = ["order_line_id", "store", "sku", "product_name", "qty",
              "product_amount", "shipping_amount", "postal_code",
-             "sale_status", "audit_status"]
+             "sale_status", "audit_status", "audit_detail"]
 
 
 def test_run_end_to_end_pass(wired, monkeypatch):
@@ -467,13 +467,13 @@ def test_run_end_to_end_pass(wired, monkeypatch):
     conn = FakeConn({
         "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
 
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget Pro 12 inch Blue",
-                         1, 100, 0, "10001", "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget Pro 12 inch Blue",
+                         1, 100, 0, "10001", "Shipped", None, None)]),
         "FROM catalog.latest_snapshot": (
             ["asin", "price", "stock_count", "delivery_days", "shipping",
              "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
              "scraped_at", "title"],
-            [("B001", 50, 5, 3, 0.0, "FREE", {"buybox_seller": "Acme"},
+            [("B0TEST0001", 50, 5, 3, 0.0, "FREE", {"buybox_seller": "Acme"},
               {"zipcode": "10001"}, {"is_fba": "FBA"}, "ok", None,
               "Acme Widget Pro 12 inch Blue")]),
         "audit_status IS NOT NULL": (
@@ -497,16 +497,26 @@ def test_run_end_to_end_pass(wired, monkeypatch):
 
 
 def test_run_skips_phishing_marked_rows(wired, monkeypatch):
-    """已标钓鱼的行任何轮次都不再改写(旧系统不可覆盖语义)。"""
+    """已标钓鱼的行任何轮次都不再改写(旧系统不可覆盖语义)。
+
+    ⚠ 标记在 **audit_detail.note**,不在 audit_status——status 只会是
+    「✓ 通过/建议拒绝/待人工」三值之一,钓鱼行就是「建议拒绝」。本用例
+    喂的是**真实形状**:之前那版喂了个 judge 永远不会产出的 status 值,
+    于是这道闸整个失效了却一路绿灯。
+    """
     wf, calls = wired
     conn = FakeConn({
-        "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
-
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
-                         "10001", "Shipped", f"{rules.REJECT}"),
-                        ("PO2|SKU2", "店A", "B002", "Acme Widget", 1, 100, 0,
-                         "10001", "Shipped",
-                         f"{rules.PHISHING_MARK}邮编:10001")]),
+        "ORDER BY order_date DESC": (
+            PICK_COLS, [
+                # 普通拒绝行:recheck 时照样重判
+                ("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget", 1, 100, 0,
+                 "10001", "Shipped", rules.REJECT,
+                 {"note": "限价不通过:成本 90 > 限价 75"}),
+                # 钓鱼行:status 同样是「建议拒绝」,区别只在 note
+                ("PO2|SKU2", "店A", "B0TEST0002", "Acme Widget", 1, 100, 0,
+                 "10001", "Shipped", rules.REJECT,
+                 {"note": f"{rules.PHISHING_MARK}邮编:10001"}),
+            ]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -515,13 +525,31 @@ def test_run_skips_phishing_marked_rows(wired, monkeypatch):
     assert "待审 1 行" in summary          # 钓鱼那行被剔除,只剩一行进判定
 
 
+def test_marked_phishing_reads_note_not_status():
+    """直接钉住判据本身:光看 status 是看不出钓鱼的。"""
+    from workflows import order_audit as wf
+    phishing = {"audit_status": rules.REJECT,
+                "audit_detail": {"note": f"{rules.PHISHING_MARK}邮编:10001"}}
+    normal = {"audit_status": rules.REJECT,
+              "audit_detail": {"note": "限价不通过:成本 90 > 限价 75"}}
+    assert wf._marked_phishing(phishing) is True
+    assert wf._marked_phishing(normal) is False
+    # detail 以 JSON 串形式回来(psycopg 配置不同可能如此)也要认得出
+    assert wf._marked_phishing(
+        {"audit_status": rules.REJECT,
+         "audit_detail": json.dumps(phishing["audit_detail"],
+                                    ensure_ascii=False)}) is True
+    # 脏 detail 不能让整轮炸掉
+    assert wf._marked_phishing({"audit_detail": "{坏 JSON"}) is False
+
+
 def test_run_no_snapshot_reports_pending_scrape(wired, monkeypatch):
     wf, _ = wired
     conn = FakeConn({
         "ORDER BY order_date DESC": (      # 只有待审查询有,推送查询没有
 
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget Pro 12 inch Blue",
-                         1, 100, 0, "10001", "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget Pro 12 inch Blue",
+                         1, 100, 0, "10001", "Shipped", None, None)]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -550,8 +578,8 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
     wf, calls = wired
     conn = FakeConn({
         "ORDER BY order_date DESC": (
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
-                         "10001-2222", "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget",
+                         1, 100, 0, "10001-2222", "Shipped", None, None)]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -560,7 +588,7 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
 
     assert len(calls["batches"]) == 1
     name, items, shot = calls["batches"][0]
-    assert items == [{"asin": "B001", "zip_code": "10001"}]   # zip+4 收敛后再推
+    assert items == [{"asin": "B0TEST0001", "zip_code": "10001"}]   # zip+4 收敛后再推
     assert shot is True                 # 审核要截图做佐证
     assert "推采集:1 个" in summary
 
@@ -569,7 +597,7 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
     pending_at = next(i for i, s in enumerate(sqls)
                       if "INSERT INTO ops.audit_scrape" in s)
     marked = conn.executed[pending_at][1]
-    assert marked[0]["asin"] == "B001" and marked[0]["zip"] == "10001"
+    assert marked[0]["asin"] == "B0TEST0001" and marked[0]["zip"] == "10001"
     assert marked[0]["batch"] == name
     # 台账对账必须发生在写 pending 之前(重启安全的前提)
     assert any("state = 'done'" in s for s in sqls[:pending_at])
@@ -579,8 +607,8 @@ def test_run_scrape_can_be_disabled(wired, monkeypatch):
     wf, calls = wired
     conn = FakeConn({
         "ORDER BY order_date DESC": (
-            PICK_COLS, [("PO1|SKU1", "店A", "B001", "Acme Widget", 1, 100, 0,
-                         "10001", "Shipped", None)]),
+            PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget",
+                         1, 100, 0, "10001", "Shipped", None, None)]),
         "audit_status IS NOT NULL": (["order_line_id", "audit_status",
                                       "audit_detail"], []),
     })
@@ -599,7 +627,7 @@ def test_screenshot_pending_writes_nothing_and_leaves_no_tombstone(wired,
                         lambda b, a: (_ for _ in ()).throw(
                             wf.scraper.ScreenshotPending("still working")))
     monkeypatch.setattr(wf, "_remember", lambda *a: calls.append(a))
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") is None
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") is None
     assert calls == []
 
 
@@ -613,8 +641,8 @@ def test_screenshot_gone_writes_tombstone(wired, monkeypatch):
                             wf.scraper.ScreenshotGone("captcha")))
     monkeypatch.setattr(wf, "_remember",
                         lambda c, k, m: remembered.update({k: m}))
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") is None
-    assert remembered["wm-audit-10001-x|B001"]["gone"] is True
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") is None
+    assert remembered["wm-audit-10001-x|B0TEST0001"]["gone"] is True
 
 
 def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
@@ -627,13 +655,13 @@ def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
                         uploads.append((name, mime)) or "ft_1")
     monkeypatch.setattr(wf, "_remember", lambda *a: None)
     conn = FakeConn({})
-    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B001") == "ft_1"
-    assert uploads == [("B001.png", "image/png")]
+    assert wf._screenshot_token(conn, "wm-audit-10001-x", "B0TEST0001") == "ft_1"
+    assert uploads == [("B0TEST0001.png", "image/png")]
 
     # 账上已有 → 直接复用,不再取图也不再上传
     hit = FakeConn({"FROM ops.dedupe": (["file_token", "gone"],
                                         [("ft_cached", None)])})
-    assert wf._screenshot_token(hit, "wm-audit-10001-x", "B001") == "ft_cached"
+    assert wf._screenshot_token(hit, "wm-audit-10001-x", "B0TEST0001") == "ft_cached"
     assert len(uploads) == 1
 
 
@@ -688,16 +716,16 @@ def test_snapshots_picks_newest_when_params_differ(wired, monkeypatch):
     cols = ["asin", "price", "stock_count", "delivery_days", "shipping",
             "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
             "scraped_at", "title"]
-    old = ("B001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
+    old = ("B0TEST0001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
            "parse_engine": "lxml"}, {"is_fba": "FBA"}, "ok",
            datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc), "T")
-    new = ("B001", 99, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
+    new = ("B0TEST0001", 99, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
            "parse_engine": "selectolax"}, {"is_fba": "FBA"}, "ok",
            datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc), "T")
     for order in ([old, new], [new, old]):        # 两种返回顺序结果必须一致
         conn = FakeConn({"FROM catalog.latest_snapshot": (cols, order)})
-        snaps = wf._snapshots(conn, [{"sku": "B001"}])
-        assert snaps[("B001", "10001")]["amz_price"] == 99
+        snaps = wf._snapshots(conn, [{"sku": "B0TEST0001"}])
+        assert snaps[("B0TEST0001", "10001")]["amz_price"] == 99
 
 
 def test_sql_selects_every_column_the_rules_read():
@@ -736,3 +764,51 @@ def test_save_writes_detail_json(wired, monkeypatch):
     status, detail_json, key = payload[0]
     assert status == rules.PASS and key == "PO1|SKU1"
     assert json.loads(detail_json)["note"] == res.note
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  闭环:每种情况都要有处置,不能"说在等采集"却永远不采
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_judge_unusable_zip_is_not_called_pending_scrape():
+    """邮编取不出来 ⇒ 按邮编采集根本发不出去。
+
+    这类行若沿用"待采集"文案,就会永远挂在那儿等一个不会到来的快照,
+    而摘要里的待采数又不含它 —— 静默卡死的典型形状。
+    """
+    for bad in (None, "", "123", "abc"):
+        res = rules.judge(dict(LINE, postal_code=bad), None, SUPPLIERS, set())
+        assert res.status == rules.MANUAL
+        assert res.rescrape is False, "推了也发不出去,别进待采清单"
+        assert "邮编" in res.note and "待采集" not in res.note
+
+
+def test_judge_non_asin_sku_is_not_called_pending_scrape():
+    """SKU 不是 ASIN 形态 ⇒ 采集侧建任务时就丢弃,推了也白推。"""
+    res = rules.judge(dict(LINE, sku="OLD-CUSTOM-001"), None, SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert res.rescrape is False
+    assert "ASIN 形态" in res.note and "待采集" not in res.note
+
+
+def test_judge_every_branch_returns_a_verdict():
+    """穷举:各种残缺输入下,judge 必须给出三值之一,不能返回 None 或抛异常。"""
+    cases = [
+        ({}, None),                                        # 空行 + 无快照
+        (LINE, None),
+        (LINE, _snap(outcome="blocked")),
+        (LINE, _snap(amz_price=None)),
+        (LINE, _snap(ship_method=None)),
+        (LINE, _snap(ship_days=None)),
+        (LINE, _snap(shipping=None)),
+        (LINE, _snap(amz_title=None)),
+        (LINE, _snap(ship_method="FBM")),                  # 无匹配采购方
+        (dict(LINE, product_amount=None), _snap()),        # 限价算不出
+        (dict(LINE, qty=None), _snap()),                   # 成本算不出
+        (dict(LINE, product_name=None), _snap()),          # 沃尔玛标题空
+    ]
+    for line, snap in cases:
+        res = rules.judge(line, snap, SUPPLIERS, set())
+        assert res.status in (rules.PASS, rules.REJECT, rules.MANUAL)
+        assert res.note, "每种情况都得给出人能读的原因"
+        assert isinstance(res.detail, dict)

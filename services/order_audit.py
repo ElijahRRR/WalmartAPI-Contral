@@ -35,6 +35,7 @@ from difflib import SequenceMatcher
 # list_new 上架定价,三处都吃「单价 + 运费」。各写各的迟早漂 —— 一处漏运费
 # 就是选错档 / 定价偏低,而全程不报错。
 from services.pricing import landed_price
+from services.scrape_batches import ERROR_TYPES, RETRYABLE, TERMINAL
 
 logger = logging.getLogger("services.order_audit")
 
@@ -269,8 +270,9 @@ class AuditResult:
 
 
 def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
-          blacklist: set[str]) -> AuditResult:
+          blacklist: set[str], scrape_fail: str | None = None) -> AuditResult:
     """输入:订单行 + 该行邮编下的亚马逊快照 + 采购方配置 + 邮编黑名单
+    (+ 该 (ASIN,邮编) 上次采集的失败 error_type)
     → 输出:AuditResult(审核状态 + 脚本审核明细 + 落库 detail)。
 
     line 用 orders.order_lines 的列名;snap 用 services.order_audit.from_snapshot
@@ -304,6 +306,21 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 
     # ③ 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
     if not snap:
+        # 上次采集是**重采也没用**的那类失败(variant_offset / parse_error /
+        # server_reject …)⇒ 这个 ASIN 的数据永远拿不到,给终局结论。
+        # 所有者定稿 2026-08-10:直接建议拒绝,后续不再重采。
+        # 挂"待采集"才是害人的——行会一直等一个永远不来的快照,而每轮
+        # 还要为它烧一次配额,两侧都不报错(典型的静默卡死)。
+        if scrape_fail in TERMINAL:
+            detail["rules"]["scrape"] = {"error_type": scrape_fail,
+                                         "retryable": False}
+            return AuditResult(REJECT,
+                               f"采集失败且重采无效({scrape_fail}:"
+                               f"{ERROR_TYPES.get(scrape_fail, '未登记类型')}),"
+                               f"拿不到亚马逊数据,建议拒绝", detail)
+        if scrape_fail:
+            detail["rules"]["scrape"] = {"error_type": scrape_fail,
+                                         "retryable": True}
         return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照",
                            detail, rescrape=True)
     detail.update({k: snap.get(k) for k in

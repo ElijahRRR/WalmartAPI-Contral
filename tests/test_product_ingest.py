@@ -460,7 +460,11 @@ def test_pull_failures_flags_unregistered_error_type(monkeypatch, caplog):
 
 @pytest.mark.parametrize("body,settled", [
     ({"stats": {"open": 0}, "screenshots": {"open": 0}}, True),
-    ({"stats": {"open": 0}, "screenshots": {"open": 3}}, False),   # 图还没截完
+    # 截图没截完**不再算在途**:任务失败(如 variant_offset)之后它那张图
+        # 永远不会好,shots_open 永久停在 >0 ⇒ 批次永远落不定,-p wait=1
+        # 干等满 20 分钟(所有者 2026-08-10 实测)。截图从不阻断结论,
+        # 更不该阻断数据侧的落定判断。
+        ({"stats": {"open": 0}, "screenshots": {"open": 3}}, True),   # 图还没截完
     ({"stats": {"open": 2}, "screenshots": {"open": 0}}, False),
     ({"stats": {"open": 0, "failed": 5}, "screenshots": {}}, True),  # 失败算终态
     ({"status": "completed"}, True),          # 无 open 字段的旧响应体

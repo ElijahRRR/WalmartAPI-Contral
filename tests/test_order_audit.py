@@ -900,15 +900,23 @@ def test_reap_batches_leaves_inflight_alone(wired, monkeypatch):
                 if isinstance(a, dict) and "reason" in a]
 
 
-def test_reap_batches_waits_for_screenshots(wired, monkeypatch):
-    """任务采完了但截图还没截完 → 批次未落定。截图也是这批的产出,
-    这时认账失败会把一批本来马上就有图的组合判死。"""
+def test_reap_batches_settles_even_with_screenshots_open(wired, monkeypatch):
+    """任务采完、截图还没截完 → **照样算落定**(2026-08-10 实测后改)。
+
+    原先拿 screenshots.open 当落定条件,结果一个 variant_offset 失败的任务
+    之后它那张图永远不会被截出来,shots_open 永久停在 >0,批次永远落不定
+    —— `-p wait=1` 明明数据都采完了却干等满 20 分钟。
+
+    截图是佐证材料,"从不阻断审核结论",更不该阻断数据侧的落定判断。
+    早点认落定反而让图更快贴上:_settled_batches 只对已落定的批次去拿清单。
+    """
     wf, _ = wired
     conn = _reap_conn(reapable=False)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 0, "done": 2},
                                    "screenshots": {"open": 2, "done": 0}})
-    assert wf._reap_batches(conn) == (0, 0, [])
+    settled, failed_pairs, _notes = wf._reap_batches(conn)
+    assert (settled, failed_pairs) == (1, 0)   # 落定了,但认账仍等摄取水位线
 
 
 def test_reap_batches_marks_vanished_batch_failed(wired, monkeypatch):
@@ -1373,3 +1381,57 @@ def test_price_cap_filled_regardless_of_supplier(snap, why):
     res = rules.judge(LINE, snap, SUPPLIERS, set())
     assert res.status == rules.MANUAL, why
     assert res.detail["price_cap"] == 75.0        # 100 × 0.75
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  重采无效的采集失败 → 终局结论(所有者定稿 2026-08-10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_unretryable_scrape_failure_is_terminal_reject():
+    """variant_offset 这类重采也没用的失败 ⇒ 建议拒绝,**不再重采**。
+
+    重定向到兄弟变体页意味着这个 ASIN 的页面根本取不到目标商品,换时段、
+    换 worker 都一样。挂"待采集"是害人的:行会一直等一个永远不来的快照,
+    而每轮还要为它烧一次配额,两侧都不报错 —— 典型的静默卡死。
+    """
+    res = rules.judge(LINE, None, SUPPLIERS, set(), scrape_fail="variant_offset")
+    assert res.status == rules.REJECT
+    assert res.rescrape is False
+    assert "variant_offset" in res.note and "建议拒绝" in res.note
+    assert "兄弟变体页" in res.note           # 把封闭集里的人话带出来
+    assert res.detail["rules"]["scrape"]["retryable"] is False
+
+
+@pytest.mark.parametrize("et", sorted(rules.RETRYABLE))
+def test_retryable_scrape_failure_still_waits(et):
+    """验证码、超时、切邮编失败这类换个时段可能就好了 ⇒ 照旧待人工 + 重采。"""
+    res = rules.judge(LINE, None, SUPPLIERS, set(), scrape_fail=et)
+    assert res.status == rules.MANUAL and res.rescrape is True
+    assert res.detail["rules"]["scrape"]["retryable"] is True
+
+
+@pytest.mark.parametrize("et", sorted(rules.TERMINAL))
+def test_every_unretryable_type_is_terminal(et):
+    """封闭集里所有不可重采的类型都走终局,别只照顾 variant_offset 一个。
+
+    采集侧新增一个不可重采类型时,这条会自动覆盖到 —— 而不是等它在生产上
+    挂成"待采集"堆几百行才有人发现。
+    """
+    res = rules.judge(LINE, None, SUPPLIERS, set(), scrape_fail=et)
+    assert res.status == rules.REJECT and res.rescrape is False
+
+
+def test_unknown_error_type_stays_manual():
+    """兜底桶 unknown 不当终局:拿不准就别替人下终局结论。
+
+    (services.scrape_batches.pull_failures 那边已经会为未登记类型告警,
+     这里只保证判定链不擅自替它做决定。)
+    """
+    res = rules.judge(LINE, None, SUPPLIERS, set(), scrape_fail="unknown")
+    assert res.status == rules.MANUAL and res.rescrape is True
+
+
+def test_scrape_failure_ignored_once_snapshot_arrives():
+    """台账里有历史失败,但这次快照回来了 ⇒ 正常判,不受旧失败影响。"""
+    res = rules.judge(LINE, _snap(), SUPPLIERS, set(), scrape_fail="variant_offset")
+    assert res.status == rules.PASS

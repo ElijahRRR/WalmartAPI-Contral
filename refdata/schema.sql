@@ -582,6 +582,12 @@ CREATE TABLE IF NOT EXISTS ops.audit_scrape (
     settled_at  timestamptz,
     PRIMARY KEY (asin, zip)
 );
+-- error_type 单独成列(不埋在 reason 文本里):判定链要按它分流——
+-- RETRYABLE 的换时段重采可能就好了;variant_offset / parse_error /
+-- server_reject 这类重采多少次都一样,这个 ASIN 的数据**永远拿不到**,
+-- 该给终局结论(建议拒绝)并且不再重推。靠 LIKE '%variant_offset%' 去猜
+-- 文本迟早对不上,而对不上的后果是每轮为一个采不出来的 ASIN 白烧一次配额。
+ALTER TABLE ops.audit_scrape ADD COLUMN IF NOT EXISTS error_type text;
 CREATE INDEX IF NOT EXISTS audit_scrape_state_idx
     ON ops.audit_scrape (state, requested_at);
 -- 重试窗口(所有者定稿 2026-08-10「可重试一天」):有快照但缺关键信息的组合

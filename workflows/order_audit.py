@@ -54,7 +54,7 @@
 - **先落 pending 再调接口**(CLAUDE.md 铁律):台账 ops.audit_scrape 一个
   (ASIN,邮编) 一行。每轮开工先对账,三层判据各管一段:
   ① 快照真出现 → done(只有它能证明数据到了**我们**库里);
-  ② 批次已落定(`tasks.open == 0 且 screenshots.open == 0`)**且摄取水位线
+  ② 批次已落定(**只看 `tasks.open == 0`**)**且摄取水位线
      已越过其落定时刻**仍无快照 → 认账失败,原因去
      `/api/batches/{batch_id}/failures` 拿真值写进台账。
      水位线这道闸是 2026-08-10 实测踩出来的:批次 completed 只说明**采集侧**
@@ -64,6 +64,15 @@
      重推,下一轮会把它们再采一遍,每小时白烧一轮,两侧都不报错;
   ③ 兜底超时 20 分钟 → 只打在**批次已查不到**的组合上,防台账永远挂着。
   在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
+  **落定判据不含 `screenshots.open`**(2026-08-10 所有者实测后改):失败任务
+  的截图槽位不会再有人去截,shots_open 永久 >0,带上它就永远落不定。
+  `-p wait=1` 在数据齐了之后另给截图 60 秒宽限,到点照常出结论,图下轮补贴。
+- **重采无效的采集失败给终局结论**:`error_type` 落 ops.audit_scrape 单独一列,
+  命中 `services.scrape_batches.TERMINAL`(采集侧 NO_AUTO_RETRY_ERROR_TYPES 的
+  镜像:variant_offset / parse_error / server_reject …)⇒ **建议拒绝且不再重推**。
+  这类失败 cap=1 首次即终态、自动与手动重试都跳过,重采一百次是同一个结果;
+  挂"待采集"等于让行永远等一个不来的快照,每轮还白烧一次配额。
+  `unknown` 故意不算终局——兜底桶,拿不准就转人工。
 - **重试一天封顶**:同一组合首次请求超 24 小时仍拿不到可用数据就不再推,
   免得一个采不出来的 ASIN 每小时白烧一次配额;上次推送已过期则视为新需求,
   窗口重置(见 _BLOCKED_SQL 与 _MARK_PENDING_SQL)。
@@ -111,6 +120,9 @@ _SCRAPE_TIMEOUT_MIN = 20       # 兜底超时(所有者定稿 2026-08-10:切邮�
 _SNAPSHOT_FRESH_HOURS = 24     # 快照超此时长即视同没有(所有者定稿 2026-08-10)
 _RESCRAPE_WINDOW_HOURS = 24    # 同一组合的重采窗口:超此时长仍拿不到可用数据就放弃
 _SCREENSHOT_SCOPE = "order_audit:screenshot"   # ops.dedupe:批次名|ASIN → file_token
+_SHOT_GRACE_SEC = 60           # 数据采完后额外等截图的上限。**截图不是落定条件**
+                               # (任务失败后它那张图永远不会好,当闸会永久卡住),
+                               # 只是"顺手多等一会儿能这轮就贴上"
 
 # 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
 _PICK_SQL = """
@@ -164,11 +176,24 @@ WHERE s.marketplace = 'US' AND s.asin = ANY(%(asins)s)
 # 一个采不出来的 ASIN 堆了几百个就只显示"在途 N",没人看得出该去人工处理了。
 _BLOCKED_SQL = """
 SELECT asin, zip,
-       CASE WHEN state = 'pending' THEN 'inflight' ELSE 'gaveup' END AS why
+       CASE WHEN state = 'pending' THEN 'inflight'
+            WHEN state = 'failed' AND error_type IS NOT NULL
+                 AND NOT (error_type = ANY(%(retryable)s)) THEN 'dead'
+            ELSE 'gaveup' END AS why
 FROM ops.audit_scrape
 WHERE state = 'pending'
+   OR (state = 'failed' AND error_type IS NOT NULL
+       AND NOT (error_type = ANY(%(retryable)s)))
    OR (first_requested_at < now() - make_interval(hours => %(retry)s)
        AND requested_at   >= now() - make_interval(hours => %(fresh)s))
+"""
+
+# 该 (ASIN,邮编) 上次采集失败的类型 —— 判定链据此分流:
+# 不可重采的给终局结论(建议拒绝),可重采的照旧挂"待采集"。
+_SCRAPE_FAIL_SQL = """
+SELECT asin, zip, error_type FROM ops.audit_scrape
+WHERE state = 'failed' AND error_type IS NOT NULL
+  AND (asin, zip) IN (SELECT * FROM unnest(%(asins)s::text[], %(zips)s::text[]))
 """
 
 # 落定判据:requested_at 之后该 (ASIN, 邮编) 真的出现了新快照。
@@ -242,7 +267,7 @@ WHERE state = 'pending' AND batch_name = %(batch)s
 
 _FAIL_PAIR_SQL = """
 UPDATE ops.audit_scrape SET state = 'failed', reason = %(reason)s,
-       settled_at = now()
+       error_type = %(error_type)s, settled_at = now()
 WHERE asin = %(asin)s AND zip = %(zip)s AND state = 'pending'
 """
 
@@ -354,16 +379,35 @@ def _newer(a, b) -> bool:
         return False
 
 
+def _scrape_fails(conn, lines: list[dict]) -> dict[tuple, str]:
+    """输入:连接 + 待审行 → 输出:{(ASIN, 邮编): error_type}(只含 failed 的)。
+
+    判定链要按 error_type 分流:重采也没用的那类(variant_offset 等)该给
+    终局结论,而不是永远挂"待采集"等一个不会来的快照。
+    """
+    pairs = {((r.get("sku") or "").strip().upper(),
+              rules.norm_zip(r.get("postal_code"))) for r in lines}
+    pairs = {(a, z) for a, z in pairs if a and z}
+    if not pairs:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(_SCRAPE_FAIL_SQL, {"asins": [a for a, _ in pairs],
+                                       "zips": [z for _, z in pairs]})
+        return {(a, z): et for a, z, et in cur.fetchall()}
+
+
 def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     """输入:连接 + 待审行 + 配置 → 输出:([(行, 结论)], 待采 [(asin, 邮编)])。"""
     snaps = _snapshots(conn, lines)
+    fails = _scrape_fails(conn, lines)
     results: list = []
     want: list = []
     for line in lines:
         asin = (line.get("sku") or "").strip().upper()
         zip5 = rules.norm_zip(line.get("postal_code"))
         snap = snaps.get((asin, zip5)) if zip5 else None
-        res = rules.judge(line, snap, suppliers, blacklist)
+        res = rules.judge(line, snap, suppliers, blacklist,
+                          scrape_fail=fails.get((asin, zip5)))
         # 该不该重采由 judge 显式标记(res.rescrape):没快照、outcome≠ok、
         # 缺配送方式/时长、运费没采到——这四种重采能解决。无匹配采购方、
         # 标题不符那类重采也一样,不进清单(白烧配额)。
@@ -457,7 +501,8 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
                       else "批次已采完且摄取已追上,仍无快照(增量导出里没有这条)")
             with conn.cursor() as cur:
                 cur.execute(_FAIL_PAIR_SQL,
-                            {"asin": asin, "zip": zip5, "reason": reason})
+                            {"asin": asin, "zip": zip5, "reason": reason,
+                             "error_type": et})
             failed_pairs += 1
         notes.append(f"{name}:{len(stuck)} 个组合无快照({summary})")
     if waiting:
@@ -492,7 +537,8 @@ def _settle_ledger(conn) -> tuple[int, int, dict, list[str]]:
         cur.execute(_TIMEOUT_SQL, {"mins": _SCRAPE_TIMEOUT_MIN})
         timed_out = (cur.rowcount or 0)
         cur.execute(_BLOCKED_SQL, {"retry": _RESCRAPE_WINDOW_HOURS,
-                                   "fresh": _SNAPSHOT_FRESH_HOURS})
+                                   "fresh": _SNAPSHOT_FRESH_HOURS,
+                                   "retryable": sorted(batches.RETRYABLE)})
         blocked = {(r[0], r[1]): r[2] for r in cur.fetchall()}
     conn.commit()
 
@@ -614,10 +660,12 @@ def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
     started = time.monotonic()
     deadline = started + timeout_min * 60
     pending = set(names)
+    shots_deadline = None
     delay = 3.0
-    while pending and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 1.5, 30.0)
+        open_shots = 0
         for name in sorted(pending):
             try:
                 st = scraper.batch_status(name)
@@ -629,11 +677,29 @@ def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
                 logger.warning("等批次 %s:状态查询失败(继续等):%s", name, e)
                 continue
             if batches.is_settled(st):
+                open_shots += batches.shots_open(st)
                 pending.discard(name)
         if pending:
             logger.info("等采集:%d/%d 批已落定,继续等(已 %.0f 秒)",
                         len(names) - len(pending), len(names),
                         time.monotonic() - started)
+            continue
+        # 数据都齐了。截图**只给一小段宽限**,绝不当落定条件。
+        # 2026-08-10 实测:一个 variant_offset 的**任务**其实是最快到终态的
+        # (cap=1,首次上报即 failed,tasks.open 立刻减一,不拖慢批次);
+        # 卡住的是**它那个截图槽位**——任务都失败了,那张图不会再有人去截,
+        # shots_open 就永久停在 >0。拿它当闸 = 干等满 20 分钟兜底超时。
+        if not open_shots:
+            break
+        if shots_deadline is None:
+            shots_deadline = time.monotonic() + _SHOT_GRACE_SEC
+            logger.info("数据已采完,再给截图 %d 秒宽限(%d 张未完成)",
+                        _SHOT_GRACE_SEC, open_shots)
+        if time.monotonic() >= shots_deadline:
+            logger.info("截图宽限用尽(%d 张仍未完成),先出结论;"
+                        "图后来好了下轮补贴", open_shots)
+            break
+        pending = set(names)          # 宽限期内继续问,好了就早点收工
     mins = (time.monotonic() - started) / 60
     if pending:
         return (f"等采集:{len(names) - len(pending)}/{len(names)} 批落定,"

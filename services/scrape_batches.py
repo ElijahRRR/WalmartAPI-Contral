@@ -43,10 +43,25 @@ ERROR_TYPES = {
 }
 
 # 重试有意义的类型:换个时段/换个 worker 可能就好了。
-# 其余(variant_offset / parse_error / server_reject 等)重试多少次都一样,
-# 由调用方决定是放弃还是转人工。
+# 采集侧对这些走 cap=3(MAX_RETRIES)+ 最多 2 轮自动重试(间隔 5 分钟),
+# 总尝试上限约 9 次 —— **一个批次收敛得多慢,由它们决定**,
+# 这也是本侧等待兜底取 20 分钟的由来。
 RETRYABLE = {"network", "timeout", "blocked", "captcha",
              "zip_switch_failed", "zip_not_effective", "session_not_ready"}
+
+# 重采一百次也是同一个结果的类型 —— 采集侧 NO_AUTO_RETRY_ERROR_TYPES 的镜像
+# (2026-08-10 所有者实测口径):失败上限 cap=1,**首次上报即终态**,
+# 自动重试排除,手动 POST /{name}/retry 跳过,连 ?force=true 也不越过。
+# 因为它们描述的是产品/页面层的稳定事实(如 variant_offset:Amazon 把请求
+# 重定向到了兄弟变体页),不是瞬时抖动。
+#
+# ⚠ 所以这类**任务反而是最快到终态的**,`tasks.open` 立刻减一,不拖慢批次。
+# 本侧据此给终局结论(建议拒绝)而不是永远挂"待采集"——挂着的话行会等一个
+# 永远不来的快照,每轮还为它烧一次配额,两侧都不报错。
+#
+# `unknown` **故意不在此列**:它是兜底桶,拿不准就别替人下终局结论,
+# 照旧转人工。采集侧新增类型时 pull_failures 会告警,人来决定归哪边。
+TERMINAL = set(ERROR_TYPES) - RETRYABLE - {"unknown"}
 
 _SQL_FAILURE = """
 INSERT INTO ops.scrape_failures (batch_name, asin, status, error_type,
@@ -148,15 +163,35 @@ def pull_failures(batch_name: str, batch_id) -> tuple[str, dict]:
 
 
 def is_settled(status_body: dict) -> bool:
-    """输入:batch_status 响应体 → 输出:批次是否已落定(采不出新东西了)。
+    """输入:batch_status 响应体 → 输出:**数据**是否已落定(采不出新东西了)。
 
-    判据 = `tasks.open == 0 AND screenshots.open == 0`(采集侧
-    get_batch_completion_status 同一份口径,两个后端一致)。
+    判据 = `tasks.open == 0`(`open` = 既不是 done 也不是 failed 的数量;
+    failed 算终态,所以一个采不出来的 ASIN 不会把批次卡死)。
+
+    ⚠ **不看 screenshots.open**(所有者 2026-08-10 实测后改):一个任务失败
+    (如 `variant_offset`)之后它那张图永远不会被截出来,`screenshots.open`
+    就永久停在 >0,批次于是**永远落不定**——实测表现为 `-p wait=1` 明明数据
+    都采完了却干等满 20 分钟。
+    截图是佐证材料,本来就"从不阻断审核结论",更不该阻断数据侧的落定判断。
+    早点认落定反而让截图更快贴上:`_settled_batches` 只对已落定的批次去拿
+    清单,图后来好了下一轮照样补得上。
+
     没有 open 字段的旧响应体退回看顶层 status——**未知一律当"还在跑"**,
     宁可多等一轮也不要把在途批次误判成落定后重推(重推 = 重复烧配额)。
     """
     stats = status_body.get("stats") or {}
-    shots = status_body.get("screenshots") or {}
     if "open" in stats:
-        return int(stats.get("open") or 0) == 0 and int(shots.get("open") or 0) == 0
+        return int(stats.get("open") or 0) == 0
     return str(status_body.get("status") or "").lower() in ("completed", "failed")
+
+
+def shots_open(status_body: dict) -> int:
+    """输入:batch_status 响应体 → 输出:还有几张图没截完(拿不到则 0)。
+
+    只用来决定"要不要再多等一小会儿把图等出来",**不参与落定判断**——
+    见 is_settled 里那条:任务失败后它那张图永远不会好,拿它当闸会永久卡住。
+    """
+    try:
+        return int((status_body.get("screenshots") or {}).get("open") or 0)
+    except (TypeError, ValueError):
+        return 0

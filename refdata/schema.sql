@@ -547,12 +547,23 @@ CREATE TABLE IF NOT EXISTS ops.audit_scrape (
     batch_name  text,
     state       text NOT NULL,      -- pending / done / failed
     reason      text,
-    requested_at timestamptz NOT NULL DEFAULT now(),
+    requested_at timestamptz NOT NULL DEFAULT now(),   -- 最近一次推送
     settled_at  timestamptz,
     PRIMARY KEY (asin, zip)
 );
 CREATE INDEX IF NOT EXISTS audit_scrape_state_idx
     ON ops.audit_scrape (state, requested_at);
+-- 重试窗口(所有者定稿 2026-08-10「可重试一天」):有快照但缺关键信息的组合
+-- 会被反复重采,得有个头——first_requested_at 记这一轮重试**从什么时候开始**
+-- (重推时不刷新),超一天仍拿不到可用数据就放弃,免得一个采不出来的 ASIN
+-- 每小时白烧一次配额。**新需求会开新一轮**:上次推送已过期(超新鲜度窗口)
+-- 说明不是同一轮死磕,窗口重置。attempts 只作运维观察用。
+ALTER TABLE ops.audit_scrape
+    ADD COLUMN IF NOT EXISTS first_requested_at timestamptz;
+ALTER TABLE ops.audit_scrape
+    ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+UPDATE ops.audit_scrape SET first_requested_at = requested_at
+    WHERE first_requested_at IS NULL;
 
 -- 采集失败明细(product_refresh 批次落定时拉;与 feed_item_errors 同款思路:
 -- **拉详情是标准动作**)。采集侧 /api/batches/{id}/failures 的落库形态:

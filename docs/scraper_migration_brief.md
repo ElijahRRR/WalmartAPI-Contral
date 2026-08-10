@@ -170,15 +170,18 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    "记墓碑不再请求"。
 
 3. **`POST /api/batches`(JSON 推送)**——与 `POST /api/upload` 共用同一个
-   核心函数,撞名 409、回调注册、回显读回值逐字一致。**本侧暂不改用**:
-   order_audit 本就一个邮编一个批次,JSON 端点的 `items[].zip_code` 逐 ASIN
-   邮编能力用不上(同批混邮编本来就被禁),换端点没有能力增量,只多一条路径。
-   这是**有意不采用**,不是漏了。
+   核心函数,撞名 409、回调注册、回显读回值逐字一致。**order_audit 已改用**
+   (`api/scraper.submit_items`):所有者定稿 2026-08-10 取消"一个邮编一个
+   批次"(采集侧切邮编的性能瓶颈已优化),而**一批混多个邮编**正需要
+   `items[].zip_code` 逐 ASIN 带邮编这个能力。维护链的全量重推仍走
+   `/api/upload`(不切邮编,形态最简,没有换的理由)。
 
 4. **同一 ASIN 多邮编同批:从静默丢失改成明确失败**——`tasks` 上有
    `UNIQUE(batch_id, asin)`,以前静默取第一个(200、少采一个邮编、响应里
-   看不出来),现在回 `400 conflicting_zip_for_asin`。本侧 `plan_round`
-   本就保证每批每 ASIN 一个邮编,这道服务端闸是双保险。
+   看不出来),现在回 `400 conflicting_zip_for_asin`。本侧 `plan_waves`
+   把同一 ASIN 的多个邮编拆到不同波次,每波内 ASIN 不重复,这道服务端闸
+   是双保险。**注意这条约束与"一个邮编一个批次"无关**:它是库结构
+   (`UNIQUE(batch_id, asin)`)决定的,不随采集性能优化而消失。
    ⚠ 连带的坑(采集侧已钉住):多邮编拆批后,**只有 `/api/export/incremental`
    按 `scrape_params.zipcode` 分得清**;`/api/results?batch_id=` 与
    `/api/export/{批次名}` 对两个批次返回**完全相同的行**且不报错

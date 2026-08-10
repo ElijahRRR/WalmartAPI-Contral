@@ -5,6 +5,7 @@
 """
 
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -282,36 +283,48 @@ def test_judge_title_checked_before_price():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  按邮编采集的轮次编排(同一 ASIN 不同邮编严禁同批)
+#  按邮编采集的波次编排(2026-08-10 放宽:不再一个邮编一个批次)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_plan_round_one_zip_per_asin():
-    """同一 ASIN 本轮只放行一个邮编——同批混邮编会互相覆盖丢数据。"""
-    todo = rules.plan_round([("B1", "10001"), ("B1", "90210"),
-                             ("B2", "10001")], set())
-    assert len(todo) == 2
-    assert {a for a, _ in todo} == {"B1", "B2"}
-    assert len([z for a, z in todo if a == "B1"]) == 1
+def test_plan_waves_mixes_zips_in_one_batch():
+    """不同 ASIN 的不同邮编可以同批——采集侧切邮编性能已优化。"""
+    waves = rules.plan_waves([("B1", "10001"), ("B2", "90210")], set())
+    assert waves == [[("B1", "10001"), ("B2", "90210")]]
 
 
-def test_plan_round_skips_inflight_asin():
-    """该 ASIN 有邮编在途 → 整个 ASIN 本轮让开(在途批次正在采它)。"""
-    todo = rules.plan_round([("B1", "90210"), ("B2", "10001")],
-                            {("B1", "10001")})
-    assert todo == [("B2", "10001")]
+def test_plan_waves_splits_same_asin_across_batches():
+    """同一 ASIN 的多个邮编必须拆批(采集侧 UNIQUE(batch_id, asin) 会 400),
+    但**同一轮内全部推完**,不再跨轮等待。"""
+    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210"),
+                              ("B2", "10001")], set())
+    assert len(waves) == 2
+    assert waves[0] == [("B1", "10001"), ("B2", "10001")]
+    assert waves[1] == [("B1", "90210")]
+    # 每一波内 ASIN 不重复 —— 这正是采集侧那条 400 的触发条件
+    for w in waves:
+        assert len({a for a, _ in w}) == len(w)
 
 
-def test_plan_round_is_stable_and_progresses():
-    """邮编按序取,多轮之间稳定推进,不会两轮都挑中同一个。"""
-    pairs = [("B1", "90210"), ("B1", "10001")]
-    first = rules.plan_round(pairs, set())
-    assert first == [("B1", "10001")]
-    # 第一个落定后(不再在途、也不再是待采),下一轮轮到另一个邮编
-    assert rules.plan_round([("B1", "90210")], set()) == [("B1", "90210")]
+def test_plan_waves_skips_blocked():
+    """在途/重试窗口耗尽的组合直接跳过,不占波次。"""
+    waves = rules.plan_waves([("B1", "10001"), ("B1", "90210")],
+                             {("B1", "10001")})
+    assert waves == [[("B1", "90210")]]
 
 
-def test_plan_round_drops_incomplete_pairs():
-    assert rules.plan_round([("B1", ""), ("", "10001")], set()) == []
+def test_plan_waves_all_blocked_gives_nothing():
+    assert rules.plan_waves([("B1", "10001")], {("B1", "10001")}) == []
+
+
+def test_plan_waves_drops_incomplete_pairs():
+    assert rules.plan_waves([("B1", ""), ("", "10001")], set()) == []
+
+
+def test_plan_waves_is_deterministic():
+    """波次划分必须可复现,否则排障时"上轮到底推了什么"说不清。"""
+    pairs = [("B2", "90210"), ("B1", "90210"), ("B1", "10001")]
+    assert rules.plan_waves(pairs, set()) == rules.plan_waves(
+        list(reversed(pairs)), set())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,10 +445,10 @@ def wired(monkeypatch):
     # 采集器一律不真连:记录每次提交的 (批次名, ASIN 列表, 邮编, 是否要截图)
     calls["batches"] = []
 
-    def fake_submit(name, asins, *, zip_code="", needs_screenshot=False):
-        calls["batches"].append((name, list(asins), zip_code, needs_screenshot))
-        return {"batch_id": "b1", "inserted": len(asins)}
-    monkeypatch.setattr(wf.scraper, "submit_batch", fake_submit)
+    def fake_submit(name, items, *, needs_screenshot=False):
+        calls["batches"].append((name, list(items), needs_screenshot))
+        return {"batch_id": "b1", "inserted": len(items)}
+    monkeypatch.setattr(wf.scraper, "submit_items", fake_submit)
 
     # registry 未登记也能跑:require() 直接返回自身
     for res in (wf.resources.ZIP_BLACKLIST_SHEET, wf.resources.SUPPLIER_TABLE,
@@ -546,17 +559,18 @@ def test_run_pushes_scrape_for_missing_snapshot(wired, monkeypatch):
     summary = wf.run({})
 
     assert len(calls["batches"]) == 1
-    name, asins, zip_code, shot = calls["batches"][0]
-    assert asins == ["B001"]
-    assert zip_code == "10001"          # zip+4 收敛后再推
+    name, items, shot = calls["batches"][0]
+    assert items == [{"asin": "B001", "zip_code": "10001"}]   # zip+4 收敛后再推
     assert shot is True                 # 审核要截图做佐证
-    assert "推采集:1 个 ASIN" in summary
+    assert "推采集:1 个" in summary
 
     # 提交前必须已经写过 pending(顺序反了就会"推上去了但库里没记录")
     sqls = [s for s, _ in conn.executed]
     pending_at = next(i for i, s in enumerate(sqls)
                       if "INSERT INTO ops.audit_scrape" in s)
-    assert conn.executed[pending_at][1] == [("B001", "10001", name)]
+    marked = conn.executed[pending_at][1]
+    assert marked[0]["asin"] == "B001" and marked[0]["zip"] == "10001"
+    assert marked[0]["batch"] == name
     # 台账对账必须发生在写 pending 之前(重启安全的前提)
     assert any("state = 'done'" in s for s in sqls[:pending_at])
 
@@ -621,6 +635,69 @@ def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
                                         [("ft_cached", None)])})
     assert wf._screenshot_token(hit, "wm-audit-10001-x", "B001") == "ft_cached"
     assert len(uploads) == 1
+
+
+@pytest.mark.parametrize("snap_kw,why", [
+    ({"outcome": "blocked"}, "采集失败"),
+    ({"ship_days": None}, "缺配送时长"),
+    ({"ship_method": None}, "缺配送方式"),
+    ({"shipping": None}, "运费没采到"),
+])
+def test_unusable_snapshot_is_marked_for_rescrape(snap_kw, why):
+    """有快照但关键信息缺失 → 标记重采(所有者定稿 2026-08-10)。
+
+    这四种的共同点是"这条数据没法用",而重采正是解药;此前它们因为
+    `snap is not None` 进不了待采清单,只能干等维护链全量重推顺带刷新。
+    """
+    res = rules.judge(LINE, _snap(**snap_kw), SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert res.rescrape is True, why
+
+
+@pytest.mark.parametrize("snap_kw", [
+    {"ship_method": "FBM"},                        # 无匹配采购方:配置问题
+    {"amz_title": "Completely Different Thing"},   # 标题不符:重采还是同一个
+])
+def test_non_data_problems_are_not_rescraped(snap_kw):
+    """重采解决不了的,别进待采清单——那只是每小时白烧一次采集配额。"""
+    res = rules.judge(LINE, _snap(**snap_kw), SUPPLIERS, set())
+    assert res.status == rules.MANUAL and res.rescrape is False
+
+
+def test_phishing_is_never_rescraped():
+    """钓鱼是终局,连采都不用采。"""
+    res = rules.judge(LINE, None, SUPPLIERS, {"10001"})
+    assert res.rescrape is False
+
+
+def test_pass_is_never_rescraped():
+    assert rules.judge(LINE, _snap(), SUPPLIERS, set()).rescrape is False
+
+
+def test_snapshot_query_gates_on_freshness():
+    """超 24 小时的快照视同没有——审单看的价格/库存/货期变得快。"""
+    from workflows import order_audit as wf
+    assert "s.scraped_at >= now() - make_interval(hours => %(fresh)s)" in wf._SNAP_SQL
+    assert wf._SNAPSHOT_FRESH_HOURS == 24
+
+
+def test_snapshots_picks_newest_when_params_differ(wired, monkeypatch):
+    """同一 (ASIN,邮编) 有多组 scrape_params(zip_observed/parse_engine 不同)
+    时必须取最新那条,不能让字典后写覆盖先写(那等于随机挑,无法复现)。"""
+    wf, _ = wired
+    cols = ["asin", "price", "stock_count", "delivery_days", "shipping",
+            "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
+            "scraped_at", "title"]
+    old = ("B001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
+           "parse_engine": "lxml"}, {"is_fba": "FBA"}, "ok",
+           datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc), "T")
+    new = ("B001", 99, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001",
+           "parse_engine": "selectolax"}, {"is_fba": "FBA"}, "ok",
+           datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc), "T")
+    for order in ([old, new], [new, old]):        # 两种返回顺序结果必须一致
+        conn = FakeConn({"FROM catalog.latest_snapshot": (cols, order)})
+        snaps = wf._snapshots(conn, [{"sku": "B001"}])
+        assert snaps[("B001", "10001")]["amz_price"] == 99
 
 
 def test_sql_selects_every_column_the_rules_read():

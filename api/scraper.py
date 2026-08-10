@@ -128,6 +128,65 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
 
 
+def submit_items(batch_name: str, items: list[dict], *,
+                 needs_screenshot: bool = False, max_retries: int = 3) -> dict:
+    """输入:批次名 + [{asin, zip_code}] → 输出:{batch_id, inserted, ...}。
+
+    走 `POST /api/batches`(JSON,采集侧 2026-08-10 新增),与 submit_batch 的
+    `/api/upload` **共用同一个核心函数**:撞名 409、回调注册、回显读回值逐字
+    一致。用它而不用 upload 的唯一理由是**逐 ASIN 带邮编**——一批里可以混
+    不同 ASIN 的不同邮编,不必按邮编切批。
+
+    ⚠ 仍然成立的调用方约束:**同一 ASIN 在同一批里只能有一个邮编**
+    (采集侧 `tasks` 有 `UNIQUE(batch_id, asin)`),否则 400
+    `conflicting_zip_for_asin`。多邮编拆波次见 services.order_audit.plan_waves。
+
+    邮编优先级(采集侧语义):`items[].zip_code` > 顶层 `zip_code` > 服务端默认。
+    本函数只用逐 ASIN 那一档,不传顶层 zip_code——省得两处邮编来源打架。
+    """
+    if not items:
+        raise ValueError("submit_items:条目为空")
+    body = {"batch_name": batch_name,
+            "items": [{"asin": str(i["asin"]).strip(),
+                       "zip_code": str(i.get("zip_code") or "").strip()}
+                      for i in items if i.get("asin")],
+            "needs_screenshot": bool(needs_screenshot)}
+    last: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.post(f"{base_url()}/api/batches", json=body,
+                              headers=_headers(),
+                              timeout=httpx.Timeout(300, connect=10))
+            if resp.status_code == 200:
+                return resp.json()
+            detail = {}
+            try:
+                detail = (resp.json() or {}).get("detail") or {}
+            except ValueError:
+                pass
+            if resp.status_code == 409:
+                d = detail if isinstance(detail, dict) else {}
+                raise BatchExistsError(d.get("batch_id"),
+                                       d.get("batch_name") or batch_name)
+            if resp.status_code in (400, 413, 422):
+                # 400 conflicting_zip_for_asin 是调用方编排错了(同批混了同一
+                # ASIN 的两个邮编),重试一万次也一样——直接抛,别吞
+                raise ValueError(f"推送被拒 HTTP {resp.status_code}: "
+                                 f"{resp.text[:300]}")
+            raise RuntimeError(f"推送失败 HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        except (BatchExistsError, ValueError):
+            raise               # 终态:重试无意义
+        except (httpx.HTTPError, RuntimeError) as e:
+            last = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("推送批次失败(%s),%ds 后重试(撞名会返 409,"
+                               "不会重复建批)", e, wait)
+                time.sleep(wait)
+    raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
+
+
 class ScreenshotPending(RuntimeError):
     """截图还没截好(409)——**稍后再来**,不是失败。响应头带 Retry-After。"""
 

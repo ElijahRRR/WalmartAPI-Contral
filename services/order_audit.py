@@ -230,6 +230,11 @@ class AuditResult:
     status: str                 # PASS / REJECT / MANUAL
     note: str                   # 「脚本审核」列文本(明细原因)
     detail: dict                # 落 orders.order_lines.audit_detail
+    # 重采能不能解决它。True 只给"数据本身不可用"的四种:没快照 / outcome≠ok /
+    # 缺配送方式或配送时长 / 运费没采到。**不给**无匹配采购方(配置问题)、
+    # 标题不符(重采还是同一个商品)、商品金额缺失(沃尔玛侧的事)——
+    # 对这些重采只是白烧采集配额,行还是卡在待人工。
+    rescrape: bool = False
 
     @property
     def is_phishing(self) -> bool:
@@ -255,21 +260,23 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 
     # ② 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
     if not snap:
-        return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照", detail)
+        return AuditResult(MANUAL, "待采集:该 ASIN 在本单邮编下无亚马逊快照",
+                           detail, rescrape=True)
     detail.update({k: snap.get(k) for k in
                    ("asin", "zip", "amz_price", "shipping", "shipping_raw",
                     "stock_qty", "ship_method", "ship_days", "seller",
                     "amz_title", "scraped_at")})
     if snap.get("outcome") and snap["outcome"] != "ok":
-        return AuditResult(MANUAL, f"采集未成功({snap['outcome']}),待人工", detail)
+        return AuditResult(MANUAL, f"采集未成功({snap['outcome']}),已排重采",
+                           detail, rescrape=True)
 
     missing = [n for n, v in (("亚马逊单价", snap.get("amz_price")),
                               ("配送方式", snap.get("ship_method")),
                               ("配送时长", snap.get("ship_days")))
                if v is None or v == ""]
     if missing:
-        return AuditResult(MANUAL, "采集缺字段:" + "、".join(missing) + ",待人工",
-                           detail)
+        return AuditResult(MANUAL, "采集缺字段:" + "、".join(missing) + ",已排重采",
+                           detail, rescrape=True)
 
     # ③ 商品一致性:采到的得是同一个商品,否则后面拿它算的限价全无意义,
     #    所以排在配送时长与限价**之前**——垃圾输入不该产出确定结论
@@ -313,7 +320,8 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     if cost is None and snap.get("shipping") is None:
         # 运费没采到(采集侧 N/A)→ 落地价算不出来。这一条单独报,不然运维
         # 只看到"算不出"三个字,查不到是哪个输入缺了
-        return AuditResult(MANUAL, "运费没采到,采购成本算不出来,待人工", detail)
+        return AuditResult(MANUAL, "运费没采到,采购成本算不出来,已排重采",
+                           detail, rescrape=True)
     if cap is None or cost is None:
         return AuditResult(MANUAL, "商品金额或采购成本算不出,待人工", detail)
     if not price_ok(cost, cap):
@@ -323,34 +331,40 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  按邮编采集的轮次编排
+#  按邮编采集的波次编排
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plan_round(pairs, inflight) -> list[tuple[str, str]]:
-    """输入:待采 [(asin, 邮编)] + 在途 {(asin, 邮编)} → 输出:本轮可提交的 pair。
+def plan_waves(pairs, blocked) -> list[list[tuple[str, str]]]:
+    """输入:待采 [(asin, 邮编)] + 不可推的 {(asin, 邮编)} → 输出:按波次分组的 pair。
 
-    两条硬约束(所有者定稿 2026-08-09):
+    编排口径(所有者定稿 2026-08-10,放宽自初版):
 
-    1. **同一 ASIN 不同邮编不可以同批提交**——采集侧按 ASIN 唯一存储结果,
-       同批并发采同一 ASIN 的两个邮编会互相覆盖,**会漏数据**。故本轮每个
-       ASIN 只放行**一个**邮编,同 ASIN 的其余邮编等下一轮。
-    2. 在途(pending)的 pair 不重复提交——已经推过一次的等它落定。
-       同一 ASIN 只要有任一邮编在途,该 ASIN 本轮整个让开(理由同 1:
-       在途那个批次正在采它)。
+    - **不同 ASIN 的不同邮编可以同批**——采集侧切邮编的性能瓶颈已优化,
+      不再需要一个邮编一个批次。批内逐 ASIN 带自己的邮编
+      (`POST /api/batches` 的 `items[].zip_code`)。
+    - **同一 ASIN 的多个邮编仍须拆批**——这不是性能取舍而是库结构:采集侧
+      `tasks` 上有 `UNIQUE(batch_id, asin)`,同批放两个邮编会被 400
+      `conflicting_zip_for_asin` 拒掉(以前是静默只采第一个,更糟)。
+      故拆成波次:第 1 波每个 ASIN 一个邮编,第 2 波是有第二个邮编的那些,
+      依此类推。**所有波次在同一轮内推完**,不再跨轮等待。
+    - blocked 里的 pair 直接跳过:在途的(等它落定)+ 重试窗口已耗尽的
+      (再推也是白烧配额)。判定见 workflows/order_audit 的台账查询。
 
-    邮编按字典序取,保证多轮之间稳定推进、不会两轮都挑中同一个。
+    邮编按字典序进波,保证波次划分稳定可复现。
     """
-    busy_asins = {a for a, _ in inflight}
-    seen: set[str] = set()
-    out: list[tuple[str, str]] = []
+    by_asin: dict[str, list[str]] = {}
     for asin, zip5 in sorted(set(pairs)):
-        if not asin or not zip5:
+        if not asin or not zip5 or (asin, zip5) in blocked:
             continue
-        if asin in busy_asins or asin in seen:
-            continue
-        seen.add(asin)
-        out.append((asin, zip5))
-    return out
+        by_asin.setdefault(asin, []).append(zip5)
+    if not by_asin:
+        return []
+    waves: list[list[tuple[str, str]]] = [
+        [] for _ in range(max(len(z) for z in by_asin.values()))]
+    for asin, zips in sorted(by_asin.items()):
+        for i, zip5 in enumerate(zips):
+            waves[i].append((asin, zip5))
+    return [w for w in waves if w]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import scraper
 from registry import db
-from services import kpi
+from services import kpi, scrape_batches as batches
 
 DANGEROUS = True        # 会给采集器压十几万个任务,默认 dry-run
 
@@ -47,6 +47,11 @@ logger = logging.getLogger("workflows.product_refresh")
 # 不是常规切分:真到那个量级再考虑分批的可观测性。
 BATCH_SIZE = 200000
 TIMEOUT_HOURS = 1           # 推上去后多久没采完算超时(所有者定稿)
+
+# 本工作流的批次名前缀。ops.scrape_batches 是全项目共用台账(order_audit 的
+# 按邮编批次也在里面),**查在途必须按前缀圈自己的**——否则 check 会拿
+# 维护链的 1 小时超时口径去把订单审核的批次标成 timeout,而那边正等着它。
+BATCH_PREFIX = "wm-refresh-"
 
 # 合法 ASIN 形态(与采集侧 common/core/idents.ASIN_RE 同口径):B + 9 位大写字母数字
 _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
@@ -71,7 +76,7 @@ ORDER BY w.sku
 _SQL_OPEN = """
 SELECT batch_name, batch_id, asin_count, status, submitted_at
 FROM ops.scrape_batches
-WHERE status IN ('pushed', 'running')
+WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
 ORDER BY submitted_at
 """
 
@@ -91,94 +96,15 @@ def _targets() -> tuple[list[str], int]:
     return ok, len(skus) - len(ok)
 
 
-def _record(batch_name: str, batch_id, n: int, status: str,
-            note: str = "") -> None:
-    with db.pg_conn() as conn:
-        conn.execute(
-            "INSERT INTO ops.scrape_batches (batch_name, batch_id, asin_count,"
-            " status, note) VALUES (%s,%s,%s,%s,%s)"
-            " ON CONFLICT (batch_name) DO UPDATE SET"
-            " batch_id = COALESCE(EXCLUDED.batch_id, ops.scrape_batches.batch_id),"
-            " status = EXCLUDED.status, note = EXCLUDED.note",
-            (batch_name, str(batch_id) if batch_id else None, n, status,
-             note or None))
-
-
-def _finish(batch_name: str, status: str, done, failed, note: str = "") -> None:
-    with db.pg_conn() as conn:
-        conn.execute(
-            "UPDATE ops.scrape_batches SET status = %s, done = %s,"
-            " failed = %s, finished_at = now(), note = COALESCE(%s, note)"
-            " WHERE batch_name = %s",
-            (status, done, failed, note or None, batch_name))
-
-
-_SQL_FAILURE = """
-INSERT INTO ops.scrape_failures (batch_name, asin, status, error_type,
-    error_detail, retry_count, occurred_at)
-VALUES (%s,%s,%s,%s,%s,%s,%s)
-ON CONFLICT (batch_name, asin) DO UPDATE SET
-    status = EXCLUDED.status, error_type = EXCLUDED.error_type,
-    error_detail = EXCLUDED.error_detail, retry_count = EXCLUDED.retry_count,
-    occurred_at = EXCLUDED.occurred_at, recorded_at = now()
-"""
-
-
-def _ts_utc(v):
-    """输入:采集侧 updated_at → 输出:带时区的 datetime(或 None)。
-
-    采集侧存的是 **UTC 裸串** `'YYYY-MM-DD HH:MM:SS'`(无时区标记)。
-    直接塞进 timestamptz 会按会话时区解释——本机 CN_TZ 下整整差 8 小时,
-    而且不会报错。所以这里显式补 UTC。
-    """
-    if not v:
-        return None
-    try:
-        dt = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00"))
-    except ValueError:
-        logger.warning("采集失败明细时间无法解析(按空处理): %r", v)
-        return None
-    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
-
-
-def _pull_failures(batch_name: str, batch_id) -> str:
-    """输入:批次名 + batch_id → 输出:失败原因分布摘要(顺便落 ops.scrape_failures)。
-
-    **拉失败明细是批次落定时的标准动作**(与 feed 报错同款口径):
-    "这个 ASIN 为什么没有新数据" 是维护链遇到数据缺口时第一个要问的问题,
-    而增量流里根本不会出现这些 ASIN——它们压根没产出记录。
-    """
-    if not batch_id:
-        return "失败明细:该批次没记下 batch_id,查不了"
-    try:
-        rows = scraper.batch_failures(batch_id)
-    except Exception as e:
-        logger.warning("批次 %s 失败明细拉取失败:%s", batch_name, e)
-        return f"失败明细:拉取失败({e})"
-    if not rows:
-        return "失败明细:无失败任务"
-    dist: dict[str, int] = {}
-    params = []
-    for r in rows:
-        et = str(r.get("error_type") or "unknown")
-        dist[et] = dist.get(et, 0) + 1
-        params.append((batch_name, r.get("asin"), r.get("status"), et,
-                       (r.get("error_detail") or None), r.get("retry_count"),
-                       _ts_utc(r.get("updated_at"))))
-    params = [p for p in params if p[1]]        # 无 asin 的行没有落库价值
-    if not params:
-        return f"失败明细:{len(rows)} 行均无 asin,未落库(采集侧数据异常)"
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.executemany(_SQL_FAILURE, params)
-    top = ",".join(f"{k}×{v}" for k, v in
-                   sorted(dist.items(), key=lambda kv: -kv[1])[:5])
-    return f"失败明细:{len(params)} 个 ASIN 已落库({top})"
+# 批次台账三件套(record / finish / pull_failures)住在 services/scrape_batches:
+# order_audit 的按邮编批次要用同一套语义,工作流之间不准互相 import(铁律 1),
+# 抄第二份则两边迟早漂。
 
 
 def _check_open() -> list[str]:
     """输入:无 → 输出:在途批次的状态行(顺便按采集侧结果落定/标超时)。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_OPEN)
+        cur.execute(_SQL_OPEN, {"prefix": BATCH_PREFIX + "%"})
         rows = cur.fetchall()
     if not rows:
         return ["无在途采集批次"]
@@ -188,7 +114,7 @@ def _check_open() -> list[str]:
         try:
             st = scraper.batch_status(name)
         except LookupError:
-            _finish(name, "failed", None, None, "采集侧查无此批次")
+            batches.finish(name, "failed", None, None, "采集侧查无此批次")
             out.append(f"  {name}:⚠ 采集侧查无此批次(已标 failed)")
             continue
         except Exception as e:
@@ -201,21 +127,23 @@ def _check_open() -> list[str]:
         done, failed = stats.get("done") or 0, stats.get("failed") or 0
         total = stats.get("total") or n
         age = datetime.now(timezone.utc) - submitted.astimezone(timezone.utc)
-        if str(st.get("status")) in ("completed", "failed") or done + failed >= total:
-            _finish(name, "completed", done, failed)
+        # 落定判据与 order_audit 同一份(services.scrape_batches.is_settled):
+        # open == 0 即采完,failed 算终态
+        if batches.is_settled(st):
+            batches.finish(name, "completed", done, failed)
             out.append(f"  {name}:✅ 采完 {done}/{total}(失败 {failed})"
                        f",耗时 {age.total_seconds() / 60:.0f} 分钟")
-            out.append(f"      {_pull_failures(name, bid)}")
+            out.append(f"      {batches.pull_failures(name, bid)[0]}")
         elif age > deadline:
             # 超时不代表数据没用:已采到的照常进增量流,只是这批不再等
-            _finish(name, "timeout", done, failed,
-                    f"超 {TIMEOUT_HOURS} 小时未采完")
+            batches.finish(name, "timeout", done, failed,
+                           f"超 {TIMEOUT_HOURS} 小时未采完")
             out.append(f"  {name}:⏰ 超时({done}/{total}),已标 timeout;"
                        f"已采到的部分照常进增量流")
             # 超时批同样拉:此刻已判失败的那些,原因照样有价值
-            out.append(f"      {_pull_failures(name, bid)}")
+            out.append(f"      {batches.pull_failures(name, bid)[0]}")
         else:
-            _record(name, None, n, "running")
+            batches.record(name, None, n, "running")
             out.append(f"  {name}:采集中 {done}/{total}"
                        f"(已 {age.total_seconds() / 60:.0f} 分钟)")
     return out
@@ -235,12 +163,12 @@ def run(params: dict) -> str:
     if not asins:
         return "无在线产品可推(catalog_sync 是否跑过?)"
 
-    batches = [asins[i:i + BATCH_SIZE]
-               for i in range(0, len(asins), BATCH_SIZE)]
+    chunks = [asins[i:i + BATCH_SIZE]
+              for i in range(0, len(asins), BATCH_SIZE)]
     est_min = len(asins) / 2500        # 所有者口径:2000~3000/分钟
     skip = f",非 ASIN 形态 SKU 已过滤 {dropped} 个" if dropped else ""
     if not params.get("execute"):
-        split = "一个批次" if len(batches) == 1 else f"{len(batches)} 个批次"
+        split = "一个批次" if len(chunks) == 1 else f"{len(chunks)} 个批次"
         return (f"🧪 [DRY-RUN] 将全量重推 {len(asins)} 个在线 ASIN"
                 f"(PUBLISHED + 店铺 ACTIVE,跨店去重){skip},{split};"
                 f"按 2500/分钟估算约 {est_min:.0f} 分钟采完\n"
@@ -248,30 +176,31 @@ def run(params: dict) -> str:
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
     pushed, lines = 0, []
-    for i, chunk in enumerate(batches, 1):
+    for i, chunk in enumerate(chunks, 1):
         # 单批(常态)不带序号:批次名就是取回的抓手,越简单越好
-        name = (f"wm-refresh-{stamp}" if len(batches) == 1
-                else f"wm-refresh-{stamp}-{i:02d}")
+        name = (f"{BATCH_PREFIX}{stamp}" if len(chunks) == 1
+                else f"{BATCH_PREFIX}{stamp}-{i:02d}")
         try:
             res = scraper.submit_batch(name, chunk)
             # 200 恒等于新建批次:拿到 batch_id 才算"确认推上去了",此刻起计时
-            _record(name, res.get("batch_id"), len(chunk), "pushed",
-                    f"inserted={res.get('inserted')}")
+            batches.record(name, res.get("batch_id"), len(chunk), "pushed",
+                           f"inserted={res.get('inserted')}")
             pushed += len(chunk)
             lines.append(f"  {name}:推送 {len(chunk)} 个"
                          f"(inserted={res.get('inserted')})")
         except scraper.BatchExistsError as e:
             # 撞名 = 上一次其实推成功了(v4 绝不静默合并):接着用既有批次
-            _record(name, e.batch_id, len(chunk), "pushed", "撞名沿用既有批次")
+            batches.record(name, e.batch_id, len(chunk), "pushed",
+                           "撞名沿用既有批次")
             pushed += len(chunk)
             lines.append(f"  {name}:已存在,沿用既有批次 {e.batch_id}")
         except Exception as e:
-            _record(name, None, len(chunk), "failed", str(e)[:200])
+            batches.record(name, None, len(chunk), "failed", str(e)[:200])
             lines.append(f"  {name}:❌ 推送失败 {e}")
             logger.exception("批次 %s 推送失败", name)
 
     head = (f"全量重推:{pushed}/{len(asins)} 个 ASIN 已确认推上"
-            f"({len(batches)} 个批次){skip},预计约 {est_min:.0f} 分钟采完;"
+            f"({len(chunks)} 个批次){skip},预计约 {est_min:.0f} 分钟采完;"
             f"超时阈值 {TIMEOUT_HOURS} 小时")
     tail = ["", "查进度:python cli.py product_refresh -p check=1",
             "采完后拉数据:python cli.py product_ingest"]

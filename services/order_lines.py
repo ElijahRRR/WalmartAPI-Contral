@@ -361,16 +361,48 @@ def settle_status(net: float, gross: float) -> str:
 
 # ── PG 写入(upsert,全部幂等)──────────────────────────────────────────────────
 
+# 沃尔玛常态性把买家电话打码成全 0(2026-08-10 实证:45 天窗口 2964/3542 = 84%)。
+# **全 0 不覆盖已有的真电话**——旧系统的「电话全 0 保护」,legacy_survey 明列为
+# 必须照搬的防线,此前漏了。覆盖掉就找不回来:raw 也是每次一起被覆盖的。
+# 反向不设防:真电话覆盖全 0 是正常修复。
+_PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
+                "AND coalesce(t.phone, '') !~ '^0*$' "
+                "THEN t.phone ELSE EXCLUDED.phone END")
+
+
 def _upsert(conn, table: str, cols: list[str], key_cols: list[str], rows: list[dict],
-            skip_update: tuple = ()) -> int:
+            skip_update: tuple = (), guards: dict | None = None) -> int:
+    """输入:连接 + 表 + 列 + 键 + 行 → 输出:提交的行数(不等于真正改动的行数)。
+
+    两条与"写放大"直接相关的语义,改之前先读:
+
+    1. **内容没变就整行不写**(`WHERE ... IS DISTINCT FROM`)。
+       原先是无条件 `DO UPDATE SET ..., updated_at = now()`,于是 order_sync
+       每轮全量重拉 45 天窗口 ⇒ 窗口内每一行的 updated_at 都被刷新,哪怕一个
+       字段都没变。而 order_center_push 把 updated_at 当「拉取时间」写进飞书
+       载荷、载荷又参与指纹 ⇒ **指纹必变 ⇒ 每轮重推窗口内全部行**
+       (2026-08-10 实证:7100 行里更新 3122,正是 45 天窗口的行数;
+       售后表因为没有「拉取时间」列,同一轮只更新了真变化的 7 行——天然对照组)。
+       改完 `updated_at` 才真正表示"这行什么时候变的"。
+
+    2. **guards**:{列名: SQL 表达式} 给个别列换掉默认的 `EXCLUDED.列`
+       (如电话全 0 保护)。表达式里 `t` 是目标表别名。
+       ⚠ 变更检测用的是**生效后的值**而不是 EXCLUDED,否则被 guard 挡下的
+       "假变化"照样会让整行重写、updated_at 空跳。
+    """
     if not rows:
         return 0
+    guards = guards or {}
     collist = ", ".join(cols)
     placeholders = ", ".join(f"%({c})s" for c in cols)
-    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols
-                        if c not in key_cols and c not in skip_update)
-    sql = (f"INSERT INTO {table} ({collist}) VALUES ({placeholders}) "
-           f"ON CONFLICT ({', '.join(key_cols)}) DO UPDATE SET {updates}, updated_at = now()")
+    upd_cols = [c for c in cols if c not in key_cols and c not in skip_update]
+    exprs = {c: guards.get(c, f"EXCLUDED.{c}") for c in upd_cols}
+    updates = ", ".join(f"{c} = {exprs[c]}" for c in upd_cols)
+    changed = (f"({', '.join('t.' + c for c in upd_cols)}) IS DISTINCT FROM "
+               f"({', '.join(exprs[c] for c in upd_cols)})")
+    sql = (f"INSERT INTO {table} AS t ({collist}) VALUES ({placeholders}) "
+           f"ON CONFLICT ({', '.join(key_cols)}) DO UPDATE SET "
+           f"{updates}, updated_at = now() WHERE {changed}")
     with conn.cursor() as cur:
         cur.executemany(sql, [{c: r.get(c) for c in cols} for r in rows])
     return len(rows)
@@ -403,7 +435,7 @@ def upsert_order_lines(conn, rows: list[dict]) -> int:
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)
     return _upsert(conn, "orders.order_lines", _ORDER_LINE_COLS,
-                   ["order_line_id"], rows)
+                   ["order_line_id"], rows, guards={"phone": _PHONE_GUARD})
 
 
 def upsert_return_lines(conn, rows: list[dict]) -> int:

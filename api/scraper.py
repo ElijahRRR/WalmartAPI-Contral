@@ -52,11 +52,20 @@ def base_url() -> str:
     return v
 
 
+_warned_no_token = False
+
+
 def _headers() -> dict:
+    global _warned_no_token
     token = os.environ.get("SCRAPER_EXPORT_TOKEN", "").strip()
     if not token:
         # 契约:鉴权可选,采集侧没配 EXPORT_TOKEN 时放行。公网部署必须配。
-        logger.warning("SCRAPER_EXPORT_TOKEN 未配置,导出请求不带鉴权头")
+        # **每进程只喊一次**:订单审核一轮要推上百个按邮编的批次,每请求一行
+        # 告警会把真正该看的日志(推了哪些批次、哪些失败)整个淹掉。
+        if not _warned_no_token:
+            logger.warning("SCRAPER_EXPORT_TOKEN 未配置,本进程所有采集请求"
+                           "都不带鉴权头(公网部署必须配)")
+            _warned_no_token = True
         return {}
     return {"X-Export-Token": token}
 
@@ -76,10 +85,17 @@ class BatchExistsError(RuntimeError):
 
 
 def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
-                 max_retries: int = 3) -> dict:
-    """输入:批次名 + ASIN 列表(+邮编)→ 输出:{batch_id, inserted, ...}。
+                 needs_screenshot: bool = False, max_retries: int = 3) -> dict:
+    """输入:批次名 + ASIN 列表(+邮编/是否要截图)→ 输出:{batch_id, inserted, ...}。
 
-    txt 上传(每行一个 ASIN),不切邮编、不截图——吞吐最高的形态。
+    txt 上传(每行一个 ASIN)。两个可选开关都会拖慢吞吐,默认都关——
+    维护链全量重推走最快形态(不切邮编不截图,2000~3000/分钟),
+    订单审核按收件邮编采、且要截图做佐证,两项都开。
+
+    ⚠ 调用方约束(采集侧语义,api 层不替你做):**同一 ASIN 的不同邮编
+    不可以放进同一批次**,采集侧按 ASIN 唯一存结果,同批会互相覆盖丢数据。
+    编排见 services.order_audit.plan_round。
+
     **200 恒等于新建了批次**(v4 语义),inserted 无歧义;撞名抛
     BatchExistsError(带既有 batch_id),由调用方决定是接着轮询还是换名。
     """
@@ -88,7 +104,8 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
     url = f"{base_url()}/api/upload"
     body = ("\n".join(str(a).strip() for a in asins if a)).encode("utf-8")
     files = {"file": (f"{batch_name}.txt", body, "text/plain")}
-    data = {"batch_name": batch_name, "needs_screenshot": "false"}
+    data = {"batch_name": batch_name,
+            "needs_screenshot": "true" if needs_screenshot else "false"}
     if zip_code:
         data["zip_code"] = str(zip_code)
     last: Exception | None = None
@@ -118,6 +135,145 @@ def submit_batch(batch_name: str, asins: list[str], *, zip_code: str = "",
                                "不会重复建批)", e, wait)
                 time.sleep(wait)
     raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
+
+
+def submit_json(batch_name: str, items: list, *, needs_screenshot: bool = False,
+                max_retries: int = 3) -> dict:
+    """输入:批次名 + [(asin, 邮编)] → 输出:{batch_id, inserted, per_asin_zip_count}。
+
+    走 `POST /api/batches`(JSON),与 submit_batch 的 `/api/upload` 共用同一个
+    核心函数:撞名 409、回调注册、回显读回值逐字一致。用它的理由有两个——
+    不必把 ASIN 列表拼成 txt 再 multipart 上传,以及**逐 ASIN 带邮编**
+    (`items[].zip_code`,采集侧一等能力,邮编三档:逐 ASIN > 批次级 > 服务端默认)。
+
+    ⚠ 调用方约束(api 层不替你做):**同一批里同一个 ASIN 不能出现两个不同
+    邮编** —— 采集侧 `tasks` 是 `UNIQUE(batch_id, asin)`,会回
+    `400 conflicting_zip_for_asin`(明确拒绝,不静默取第一个)。
+    不同 ASIN 的不同邮编同批则完全正常。编排见
+    services.order_audit.plan_waves。
+
+    响应里的 `per_asin_zip_count` 应等于带了邮编的 ASIN 数:对不上说明邮编
+    没被采纳(比如格式不合法被退回批次邮编),**那会按错地区采回价格**。
+    """
+    pairs = [(str(a).strip(), str(z).strip()) for a, z in items if a]
+    if not pairs:
+        raise ValueError("submit_json:ASIN 列表为空")
+    dup = {a for a, _ in pairs if len({z for b, z in pairs if b == a}) > 1}
+    if dup:
+        # 本地先拦一道:采集侧会 400,但那时批次已经建出来了(撞名占位),
+        # 下一轮同名重推还得再撞一次 409
+        raise ValueError(f"submit_json:同批内这些 ASIN 有多个邮编,必须拆批"
+                         f"(见 plan_waves):{sorted(dup)[:5]}")
+    body = {"batch_name": batch_name,
+            "items": [{"asin": a, "zip_code": z} for a, z in pairs],
+            "needs_screenshot": bool(needs_screenshot)}
+    last: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.post(f"{base_url()}/api/batches", json=body,
+                              headers=_headers(),
+                              timeout=httpx.Timeout(300, connect=10))
+            if resp.status_code == 200:
+                return resp.json()
+            detail = {}
+            try:
+                detail = (resp.json() or {}).get("detail") or {}
+            except ValueError:
+                pass
+            if resp.status_code == 409:
+                d = detail if isinstance(detail, dict) else {}
+                raise BatchExistsError(d.get("batch_id"),
+                                       d.get("batch_name") or batch_name)
+            if resp.status_code in (400, 413, 422):
+                # 400 conflicting_zip_for_asin 是调用方编排错了,重试一万次也一样
+                raise ValueError(f"推送被拒 HTTP {resp.status_code}: "
+                                 f"{resp.text[:300]}")
+            raise RuntimeError(f"推送失败 HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        except (BatchExistsError, ValueError):
+            raise               # 终态:重试无意义
+        except (httpx.HTTPError, RuntimeError) as e:
+            last = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("推送批次失败(%s),%ds 后重试(撞名会返 409,"
+                               "不会重复建批)", e, wait)
+                time.sleep(wait)
+    raise RuntimeError(f"推送批次连续 {max_retries} 次失败:{last}")
+
+
+def screenshot_list(batch_name: str) -> list[dict]:
+    """输入:批次名 → 输出:该批次逐 ASIN 的截图状态 [{asin, status, url, ...}]。
+
+    `GET /api/screenshots?batch_name=`(采集侧 2026-08-10 新增)。
+    **`url` 仅在 `status == "done"` 时非 null** —— 别的状态那张图不存在,
+    拿 URL 去取只会撞 404。
+
+    一次拿全比逐 ASIN 试探省得多:一批 50 个 ASIN、只有 10 张图好了,
+    逐个试要发 50 次(40 次收 409),这里 1 次拿清单 + 10 次取图。
+    自动翻页(next_cursor 为 null 即到底)。
+    """
+    out: list[dict] = []
+    cursor = None
+    while True:
+        params = {"batch_name": batch_name, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = httpx.get(f"{base_url()}/api/screenshots", params=params,
+                         headers=_headers(),
+                         timeout=httpx.Timeout(60, connect=10))
+        if resp.status_code == 404:
+            raise LookupError(f"批次不存在:{batch_name}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"截图清单查询失败 HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
+        data = resp.json() or {}
+        out.extend(data.get("items") or [])
+        cursor = data.get("next_cursor")
+        if not cursor:
+            return out
+
+
+class ScreenshotPending(RuntimeError):
+    """截图还没截好(409)——**稍后再来**,不是失败。响应头带 Retry-After。"""
+
+
+class ScreenshotGone(RuntimeError):
+    """截图不会再有了(404 没记录/已清理 或 410 截图失败)——**别重试**。
+
+    采集侧把这两种与"还没好"分成三个状态码,正是为了让调用方有"该不该重试"
+    的判据(旧的 /static/screenshots 路径上后三种全是同一个 404,分不出来)。
+    """
+
+
+def fetch_screenshot(batch_name: str, asin: str) -> bytes:
+    """输入:批次名 + ASIN → 输出:PNG 字节;未就绪抛 ScreenshotPending,
+    不会再有抛 ScreenshotGone。
+
+    走 `GET /api/screenshots/{batch_name}/{asin}`(采集侧 2026-08-10 新增)。
+    批次名是隔离键——截图落盘就是 `<批次名>/<asin>.png`,所以同一 ASIN 的
+    不同邮编批次各有各的图,不会互相覆盖。
+    """
+    resp = httpx.get(f"{base_url()}/api/screenshots/{batch_name}/{asin}",
+                     headers=_headers(), timeout=httpx.Timeout(60, connect=10))
+    if resp.status_code == 200:
+        return resp.content
+    detail = {}
+    try:
+        detail = (resp.json() or {}).get("detail") or {}
+    except ValueError:
+        pass
+    if not isinstance(detail, dict):
+        detail = {"message": str(detail)}
+    if resp.status_code == 409:
+        raise ScreenshotPending(f"{asin}@{batch_name} 截图未就绪"
+                                f"(status={detail.get('status')})")
+    if resp.status_code in (404, 410):
+        raise ScreenshotGone(f"{asin}@{batch_name} 截图不会再有"
+                             f"(HTTP {resp.status_code} "
+                             f"{detail.get('error') or detail.get('message') or ''}"
+                             f"{' ' + str(detail.get('error_detail')) if detail.get('error_detail') else ''})")
+    raise RuntimeError(f"取截图失败 HTTP {resp.status_code}: {resp.text[:200]}")
 
 
 def batch_status(batch_name: str) -> dict:

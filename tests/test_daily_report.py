@@ -188,3 +188,18 @@ def test_orders_404_is_empty_window(monkeypatch):
     stats = {}
     assert list(orders_api.iter_orders(STORE, created_start="x", stats=stats)) == []
     assert stats["total"] == 0
+
+
+def test_settlement_moved_out_tells_you_where(monkeypatch):
+    """对账摘出后,老命令不能静默变成"什么也没做"——要指路。
+
+    daily_report -p phase=settlement 曾经是有效用法,拆走后若只返回"phase 只
+    接受 ...",挂着旧调度的人会以为参数写错,而不是知道它搬家了(problems
+    2026-08-08 摘出时就是这么处理的,这里照同一口径)。
+    """
+    from workflows import daily_report as dr
+    out = dr.run({"phase": "settlement"})
+    assert "settlement_sync" in out
+
+    from workflows import settlement_sync as ss
+    assert hasattr(ss, "run") and ss.DANGEROUS is False

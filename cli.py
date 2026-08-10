@@ -16,7 +16,6 @@ launchd 定时、手动触发、未来的网页按钮和 MCP 工具,全部走这
 """
 
 import argparse
-import fcntl
 import importlib
 import logging
 import sys
@@ -57,19 +56,6 @@ def _setup_logging(workflow: str, logs_dir: Path) -> None:
         handlers=[logging.FileHandler(logfile, encoding="utf-8"),
                   logging.StreamHandler(sys.stderr)],
     )
-
-
-def _acquire_lock(workflow: str, locks_dir: Path):
-    """flock 单实例锁:同一 workflow 并跑直接退出(返回句柄防 GC 释放锁)。"""
-    locks_dir.mkdir(parents=True, exist_ok=True)
-    fh = open(locks_dir / f"{workflow}.lock", "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return None
-    fh.write(f"pid={__import__('os').getpid()} at={datetime.now(timezone.utc).isoformat()}\n")
-    fh.flush()
-    return fh
 
 
 def _record_start(workflow: str, params: dict, operator: str):
@@ -125,7 +111,8 @@ def main(argv: list[str] | None = None) -> int:
     # cli 只自建它直接需要的 logs/locks;完整 DATA_ROOT 初始化走 init_data_root 工作流
     _setup_logging(args.workflow, paths.logs_dir())
 
-    lock = _acquire_lock(args.workflow, paths.locks_dir())
+    from services import runlock
+    lock = runlock.acquire(args.workflow)     # 句柄必须留着:GC 掉即释放锁
     if lock is None:
         print(f"⚠ {args.workflow} 已有实例在运行(flock 占用),本次退出", file=sys.stderr)
         return 3

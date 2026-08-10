@@ -70,11 +70,11 @@ def test_zero_intents_only_positive_known_qty():
 # amz 侧 × 沃尔玛侧联表的一行(顺序 = _SQL_AMZ_JOIN 的 SELECT 列)
 def _row(store="T1", sku="B0A", name="旧标题", pt="Cups", upc="012345678905",
          wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
-         delivery_days=3, slow=None, fulfillment="FBM"):
+         delivery_days=3, slow=None, fulfillment="FBM", shipping=0.0):
     return (store, sku, name, pt, upc, wm_price, avail_qty,
             amz_price, stock_count, delivery_days,
             slow if slow is not None else {"title": "Amz 标题", "brand": None},
-            fulfillment)
+            fulfillment, shipping)
 
 
 _MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
@@ -530,3 +530,22 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     # 水位推进到第一个未落定行(第 5 行的 F2):unresolved_from=5
     saved = [a for s, a in conn.sqls if "INSERT INTO ops.cursors" in s]
     assert saved and '"unresolved_from": 5' in saved[-1][1]
+
+
+def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
+    """定价输入是落地价(单价 + 运费);运费没采到一律不改价。
+
+    漏运费 = 按比成本低的数乘倍率,越贵的运费亏得越多;当 0 更糟——
+    价照样定得出来、看着正常,两侧都不报错。
+    """
+    rows = [
+        # 落地价 20+5=25 → ×200% = 50(漏运费的话会算成 40)
+        _row(sku="B0SHIP", wm_price=20.0, amz_price=20.0, shipping=5.0),
+        # 确认免运费:照常定价
+        _row(sku="B0FREE", wm_price=20.0, amz_price=20.0, shipping=0.0),
+        # 运费没采到:不改价
+        _row(sku="B0NOSHIP", wm_price=20.0, amz_price=20.0, shipping=None),
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), _MULTS, [])}
+    assert out == {"B0SHIP": 50.0, "B0FREE": 40.0}

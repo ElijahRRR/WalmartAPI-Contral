@@ -312,12 +312,21 @@ def run(params: dict) -> str:
             n["filtered"] += 1
             reasons.append((r["rownum"], "配送方式(FBA/FBM)未采到,不定价"))
             continue
+        # 定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10):采购真正
+        # 付的是单价加运费。运费没采到(采集侧 N/A)一律不上架——与"配送方式
+        # 未知不定价"同一个道理,当 0 定出来的价偏低,越贵的运费亏得越多
+        if p.get("shipping") is None:
+            n["filtered"] += 1
+            reasons.append((r["rownum"], "运费未采到,落地价算不出来,不定价"))
+            continue
         w_price = pricing.walmart_price(channel, p.get("price"),
-                                        mults.get(r["store"], {}))
+                                        mults.get(r["store"], {}),
+                                        p.get("shipping"))
         if w_price is None:
             n["filtered"] += 1
             reasons.append((r["rownum"],
-                            f"该区间倍率未配置:{p.get('price')}"))
+                            f"该区间倍率未配置:落地价 "
+                            f"{pricing.landed_price(p.get('price'), p.get('shipping'))}"))
             continue
         # 配送时长同样三态:采到且 >12 天 → 上架但库存写 0(旧规则);
         # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了

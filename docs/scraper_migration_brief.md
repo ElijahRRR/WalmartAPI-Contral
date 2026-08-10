@@ -133,6 +133,99 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    与本文档第五节的文字描述不是同一套。**消费侧不得按收到的 `slow` 自行重算
    比对——两边必然不等**;它保证的只是"慢变字段真变了才变"。
 
+### 5.2 本轮追加(采集侧 2026-08-10,PR amazon-scraper-v4#7;仍是 v1)
+
+**只增不改**:既有端点一个字节没动,现有接入无需改动。
+
+1. **`fast.shipping` / `fast.shipping_raw`(运费)**——纯追加,值本来就在
+   `raw.buybox_shipping` 里,**存量事件也拿得到,不需要回填**:
+
+   | 采集侧 | `shipping` | `shipping_raw` | 含义 |
+   |---|---|---|---|
+   | `"FREE"` | `0.0` | `"FREE"` | **确认免运费**,落地价 = price + 0 |
+   | `"$5.99"` | `5.99` | `"$5.99"` | 确认运费 |
+   | `"N/A"` / 空 | `null` | `null` | **这次没采到**,落地价算不出来 |
+
+   与 `stock_count` 同一条不变量(3b):`null ≠ 0`,**下游禁止 `or 0`**。
+   本侧落地:`snapshots.shipping / shipping_raw` 两列;order_audit 运费为
+   NULL 即成本算不出 → **转待人工**(当 0 的话成本偏小,本该拒的单被放行,
+   而两侧都不报错)。
+   ⚠ 采集侧 UI 导出的「总价」列**把 N/A 当 0**(`server/api/export.py`),
+   与本端点口径不同;本侧只认增量导出这一路,不复制那个行为。
+
+2. **`GET /api/screenshots`**(列批次截图状态,游标分页,`url` 仅在
+   `status == "done"` 时非 null)与 **`GET /api/screenshots/{批次名}/{asin}`**
+   (取 PNG)。取图**四种结局是四个状态码**,据此决定要不要重试:
+
+   | 码 | 含义 | 该怎么办 |
+   |---|---|---|
+   | 200 | 图在这儿(`image/png`) | — |
+   | 404 | 没有记录 / 批次不存在 / 已清理 | **别重试** |
+   | 409 | 有记录但还没截好(带 `Retry-After: 10`) | **稍后再来** |
+   | 410 | 截图失败,不会再有 | **别重试** |
+
+   旧的 `/static/screenshots/{批次名}/{asin}.png` 保留不变,但那条路上后三种
+   全是同一个 404,分不出来。本侧走新端点:`api/scraper.fetch_screenshot`
+   把 409 与 404/410 抛成两个不同异常,order_audit 据此决定"下轮再来"还是
+   "记墓碑不再请求"。**但常规路径不逐 ASIN 试探**:先用
+   `GET /api/screenshots?batch_name=`(`api/scraper.screenshot_list`)拿整批
+   清单,只对 `status == "done"` 的去取图——一批 50 个 ASIN 只有 10 张图好了,
+   逐个试要发 50 次(40 次收 409),拿清单只要 1 + 10 次。逐 ASIN 端点退居
+   兜底(清单说 done 而图已被清理时,仍靠它区分该不该记墓碑)。
+
+3. **`POST /api/batches`(JSON 推送)**——与 `POST /api/upload` 共用同一个
+   核心函数,撞名 409、回调注册、回显读回值逐字一致。**order_audit 已改用**
+   (`api/scraper.submit_json`),取的是不必把 ASIN 列表拼 txt 再 multipart
+   上传这点方便;邮编按**批次级** `zip_code` 传。维护链的全量重推仍走
+   `/api/upload`(不切邮编,形态最简,没有换的理由)。
+
+4. **邮编是逐 ASIN 的(`items[].zip_code`),一批可以混多个邮编**。
+   采集侧 `server/api/batches.py` 文档串写死了三档优先级:
+   `items[].zip_code`(这一个 ASIN)> 顶层 `zip_code`(这一批)> 服务端默认。
+   响应回显 `per_asin_zip_count` / `invalid_zip_rows`——**两者对不上说明有
+   ASIN 的邮编没被采纳,那些会按服务端默认邮编采回价格**,拿它审单就是按错
+   地区审,而两侧都不报错。本侧推送后校验这个数并告警。
+
+   **唯一要拆批的是同一 ASIN 的多个邮编**:`tasks` 上有
+   `UNIQUE(batch_id, asin)`,以前同批两个邮编静默取第一个(200、少采一个、
+   响应里看不出来),现在明确回 `400 conflicting_zip_for_asin`。
+   本侧编排 `services/order_audit.plan_waves` 把同一 ASIN 的第 k 个邮编放进
+   第 k 波,每波内 ASIN 不重复;**所有波次同一轮内推完**,不跨轮等待。
+
+   > ⚠ 本文档 2026-08-10 一度写成"必须一个邮编一个批次",是我读错接口后的
+   > 收紧,已按采集侧源码纠正。当时给的两条理由都不成立,记在这里免得再犯:
+   > - **"截图会串"**——不成立。批次内一个 ASIN 只可能有一个邮编(就是上面
+   >   那条 400 保证的),所以 `(批次名, asin)` 已唯一定位一个 (ASIN,邮编),
+   >   落盘的 `<批次名>/<asin>.png` 天然不冲突,批次名不必带邮编。
+   > - **"按批次取数分不出邮编"**——属实但不相干。`/api/results?batch_id=`
+   >   与 `/api/export/{批次名}` 确实对同一 ASIN 全库只有一行(两个批次返回
+   >   完全相同的行且不报错),但**本侧取数只走 `/api/export/incremental`**
+   >   按 `scrape_params.zipcode` 分组,与批次怎么切无关。
+   >
+   > 实际代价:订单收件邮编几乎两两不同,收紧后 134 行订单推出了 **127 个
+   > 批次**,每轮对账要发 127 次状态查询。
+
+5. **批次完成度判据(采集侧 2026-08-10 实测确认)**——
+   `GET /api/batches/{批次名}/status`:
+
+   ```
+   completed  ⇔  tasks.open == 0  AND  screenshots.open == 0
+   ```
+
+   `open` = 既不是 done 也不是 failed 的数量。**failed 算终态**,所以一张永远
+   截不出来的图不会把批次卡死(实测 1 done + 1 failed → completed)。
+   本侧实现在 `services/scrape_batches.is_settled`,product_refresh 与
+   order_audit 共用同一份判据。
+
+   ⚠ **批次 completed 不等于我们库里有数据**:中间还隔着增量导出 →
+   product_ingest 两跳。所以批次状态只用来判"还要不要等"和"失败原因是什么",
+   "这条数据到没到"必须另看快照是否真出现。
+
+   失败原因走 `GET /api/batches/{batch_id}/failures`(**认 batch_id 不认名字**),
+   `error_type` 是 11 类 + `unknown` 的封闭集,登记在
+   `services/scrape_batches.ERROR_TYPES`——采集侧新增类型而本侧不知道时会告警,
+   不会被静默当成普通失败。
+
 **另有两条实现语义,消费侧必须遵守**:
 
 - **`null` / `[]` 一律表示"本次采集没取到",不表示"该商品没有这个属性"**

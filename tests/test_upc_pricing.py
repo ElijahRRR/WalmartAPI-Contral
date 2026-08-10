@@ -145,21 +145,44 @@ def test_parse_multiplier_handles_percent_display(caplog):
 
 def test_walmart_price_end_to_end():
     mults = {"fba_range1": "275%", "fba_range2": 2.2, "fbm_range1": ""}
-    assert pricing.walmart_price("FBA", 10, mults) == 27.5
-    assert pricing.walmart_price("FBA", 30, mults) == 82.5   # 边界走低区间倍率
-    assert pricing.walmart_price("FBA", 50, mults) == 110.0
-    assert pricing.walmart_price("FBM", 20, mults) is None   # 倍率未配置 → 仍不动
-    assert pricing.walmart_price("FBA", "bad", mults) is None
+    assert pricing.walmart_price("FBA", 10, mults, 0) == 27.5
+    assert pricing.walmart_price("FBA", 30, mults, 0) == 82.5  # 边界走低区间倍率
+    assert pricing.walmart_price("FBA", 50, mults, 0) == 110.0
+    assert pricing.walmart_price("FBM", 20, mults, 0) is None  # 倍率未配置 → 不动
+    assert pricing.walmart_price("FBA", "bad", mults, 0) is None
+
+
+def test_walmart_price_includes_shipping():
+    """定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10)。
+
+    漏掉运费 = 按比成本低的数去乘倍率,越贵的运费亏得越多。
+    """
+    mults = {"fba_range1": "200%", "fba_range2": "200%"}
+    assert pricing.landed_price(10, 2.5) == 12.5
+    assert pricing.walmart_price("FBA", 10, mults, 2.5) == 25.0   # (10+2.5)×2
+    # 运费把落地价顶进了下一档:28 + 5 = 33 → fba_range2
+    assert pricing.pick_band("FBA", 28) == "fba_range1"
+    assert pricing.pick_band("FBA", 33) == "fba_range2"
+
+
+def test_walmart_price_refuses_missing_shipping():
+    """运费没采到 ⇒ 落地价算不出来 ⇒ 不定价。**绝不当免运费**——
+    当 0 定出来的价偏低,看着还挺正常,两侧都不报错。"""
+    mults = {"fba_range1": "275%"}
+    assert pricing.landed_price(10, None) is None
+    assert pricing.walmart_price("FBA", 10, mults, None) is None
+    # 0 是"确认免运费"这条真信息,照常定价
+    assert pricing.walmart_price("FBA", 10, mults, 0.0) == 27.5
 
 
 def test_out_of_band_falls_back_to_default_multiplier():
     """所有者定稿 2026-08-09:价格出界按 300% 定价,不再淘汰。"""
     mults = {"fba_range1": "275%", "fbm_range1": "200%"}
     assert pricing.OUT_OF_BAND_MULTIPLIER == 3.0
-    assert pricing.walmart_price("FBA", 200, mults) == 600.0   # FBA 上界 75 外
-    assert pricing.walmart_price("FBM", 10, mults) == 30.0     # FBM 下界 15 外
-    assert pricing.walmart_price("FBM", 2000, mults) == 6000.0
+    assert pricing.walmart_price("FBA", 200, mults, 0) == 600.0  # FBA 上界 75 外
+    assert pricing.walmart_price("FBM", 10, mults, 0) == 30.0     # FBM 下界 15 外
+    assert pricing.walmart_price("FBM", 2000, mults, 0) == 6000.0
     # 出界不查表:该店一个倍率都没配也照样出价
-    assert pricing.walmart_price("FBA", 200, {}) == 600.0
+    assert pricing.walmart_price("FBA", 200, {}, 0) == 600.0
     # 在区间内但倍率没配 → 仍返 None(配置缺失不该拿默认值蒙混)
-    assert pricing.walmart_price("FBA", 10, {}) is None
+    assert pricing.walmart_price("FBA", 10, {}, 0) is None

@@ -29,6 +29,14 @@ FEISHU_WEBHOOK_URL=
 FEISHU_STORE_TABLE_APP_TOKEN=
 FEISHU_STORE_TABLE_ID=
 
+# 订单审核两张配置表
+# 黑名单邮编(wiki 电子表格:token=/wiki/ 后段,sheet_id=?sheet= 参数)
+FEISHU_ZIP_BLACKLIST_WIKI_TOKEN=
+FEISHU_ZIP_BLACKLIST_SHEET_ID=
+# 采购方(多维表格)
+FEISHU_SUPPLIER_APP_TOKEN=
+FEISHU_SUPPLIER_TABLE_ID=
+
 # 沃尔玛 API(默认 production;沙箱测试才需要设)
 #WALMART_BASE_URL=https://sandbox.walmartapis.com
 

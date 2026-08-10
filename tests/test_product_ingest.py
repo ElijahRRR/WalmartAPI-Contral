@@ -182,16 +182,17 @@ def test_fetch_products_carries_true_values(monkeypatch):
     """provider 只搬运真值:stock/lead_days 的 None 原样透出,不 or 0。"""
     rows = [
         # asin, title, brand, category, image, slow, price, state, count,
-        # days, raw, fulfillment
+        # days, raw, fulfillment, shipping
         ("B0A", "标题A", "BrandA", "Home > Tools", "https://x/1.jpg",
          {"images": ["https://x/2.jpg", "https://x/1.jpg"],
           "bullet_points": ["a"]},                      # 身份层 slow 全量段
-         19.99, "in_stock", 37, 8, None, "FBA"),
+         19.99, "in_stock", 37, 8, None, "FBA", 0.0),
         ("B0B", "标题B", None, None, None, None, 8.0, "out_of_stock", 0,
-         None, None, "fbm"),
+         None, None, "fbm", 2.5),
         ("B0C", "标题C", None, None, None, None, 8.0, "in_stock", None,
-         None, None, None),
-        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None, None),
+         None, None, None, None),
+        ("B0D", None, None, None, None, None, 8.0, "in_stock", 5, 3, None,
+         None, None),
     ]
 
     class _C:
@@ -231,22 +232,22 @@ def test_list_new_stock_three_way(monkeypatch):
     products = {
         "B0REAL":    {"asin": "B0REAL", "title": "T", "price": 20.0,
                       "stock": 37, "stock_state": "in_stock", "lead_days": 8,
-                      "channel": "FBM"},
+                      "channel": "FBM", "shipping": 0.0},
         "B0LOW":     {"asin": "B0LOW", "title": "T", "price": 20.0,
                       "stock": 3, "stock_state": "in_stock", "lead_days": 2,
-                      "channel": "FBM"},
+                      "channel": "FBM", "shipping": 0.0},
         "B0ZERO":    {"asin": "B0ZERO", "title": "T", "price": 20.0,
                       "stock": 0, "stock_state": "out_of_stock", "lead_days": 2,
-                      "channel": "FBM"},
+                      "channel": "FBM", "shipping": 0.0},
         "B0NULLOK":  {"asin": "B0NULLOK", "title": "T", "price": 20.0,
                       "stock": None, "stock_state": "in_stock",
-                      "lead_days": None, "channel": "FBA"},
+                      "lead_days": None, "channel": "FBA", "shipping": 0.0},
         "B0NULLUNK": {"asin": "B0NULLUNK", "title": "T", "price": 20.0,
                       "stock": None, "stock_state": "unknown",
-                      "lead_days": None, "channel": "FBM"},
+                      "lead_days": None, "channel": "FBM", "shipping": 0.0},
         "B0SLOW":    {"asin": "B0SLOW", "title": "T", "price": 20.0,
                       "stock": 50, "stock_state": "in_stock", "lead_days": 30,
-                      "channel": "FBM"},
+                      "channel": "FBM", "shipping": 0.0},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
@@ -256,7 +257,8 @@ def test_list_new_stock_three_way(monkeypatch):
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
-    monkeypatch.setattr(ln.pricing, "walmart_price", lambda ch, price, m: 99.0)
+    monkeypatch.setattr(ln.pricing, "walmart_price",
+                        lambda ch, price, m, ship: 99.0)
 
     out = ln.run({"execute": False})
     # 真值 37 过闸;3 <5 拦;0 拦(确实缺货);None+in_stock 按常量铺货;
@@ -389,7 +391,7 @@ def test_batch_failures_pulls_detail_not_just_a_count(monkeypatch):
 
 def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
     from datetime import timezone
-    from workflows import product_refresh as pr
+    from services import scrape_batches as sb
 
     saved = []
 
@@ -403,8 +405,8 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
         def __exit__(self, *a): return False
         def cursor(self): return _C()
 
-    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
-    monkeypatch.setattr(pr.scraper, "batch_failures", lambda bid: [
+    monkeypatch.setattr(sb.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(sb.scraper, "batch_failures", lambda bid: [
         {"asin": "B0A", "status": "failed", "error_type": "captcha",
          "error_detail": "d", "retry_count": 3,
          "updated_at": "2026-08-09 02:00:00"},
@@ -412,9 +414,12 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
          "error_detail": None, "retry_count": 1, "updated_at": None},
         {"asin": None, "error_type": "timeout"},        # 无 asin:落库没价值
     ])
-    line = pr._pull_failures("wm-refresh-x", "7")
+    line, by_asin = sb.pull_failures("wm-refresh-x", "7")
     assert "2 个 ASIN 已落库" in line and "captcha×2" in line
     assert [p[1] for p in saved] == ["B0A", "B0B"]
+    # {asin: error_type} 是给调用方写自己台账用的:验证码(可重试)和
+    # variant_offset(重试也一样)的处置完全不同,不能一律记成"超时"
+    assert by_asin == {"B0A": "captcha", "B0B": "captcha"}
     # 采集侧给的是 UTC 裸串:必须显式补 UTC,否则按会话时区解释会差 8 小时
     assert saved[0][6].tzinfo is not None
     assert saved[0][6].astimezone(timezone.utc).hour == 2
@@ -424,9 +429,51 @@ def test_pull_failures_lands_rows_with_utc_time(monkeypatch):
     def boom(bid):
         raise RuntimeError("网络炸了")
 
-    monkeypatch.setattr(pr.scraper, "batch_failures", boom)
-    assert "拉取失败" in pr._pull_failures("wm-refresh-x", "7")
-    assert "查不了" in pr._pull_failures("wm-refresh-x", None)
+    monkeypatch.setattr(sb.scraper, "batch_failures", boom)
+    assert "拉取失败" in sb.pull_failures("wm-refresh-x", "7")[0]
+    assert "查不了" in sb.pull_failures("wm-refresh-x", None)[0]
+
+
+def test_pull_failures_flags_unregistered_error_type(monkeypatch, caplog):
+    """采集侧加了新 error_type 而本侧封闭集没更新 → 必须告警。
+    静默当普通失败的话,一整类新故障就永远没人知道。"""
+    from services import scrape_batches as sb
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, params): pass
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(sb.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(sb.scraper, "batch_failures", lambda bid: [
+        {"asin": "B0A", "error_type": "brand_new_failure"}])
+    with caplog.at_level("WARNING"):
+        _, by_asin = sb.pull_failures("wm-refresh-x", "7")
+    assert by_asin == {"B0A": "brand_new_failure"}
+    assert "未登记的 error_type" in caplog.text
+
+
+@pytest.mark.parametrize("body,settled", [
+    ({"stats": {"open": 0}, "screenshots": {"open": 0}}, True),
+    # 截图没截完**不再算在途**:任务失败(如 variant_offset)之后它那张图
+        # 永远不会好,shots_open 永久停在 >0 ⇒ 批次永远落不定,-p wait=1
+        # 干等满 20 分钟(所有者 2026-08-10 实测)。截图从不阻断结论,
+        # 更不该阻断数据侧的落定判断。
+        ({"stats": {"open": 0}, "screenshots": {"open": 3}}, True),   # 图还没截完
+    ({"stats": {"open": 2}, "screenshots": {"open": 0}}, False),
+    ({"stats": {"open": 0, "failed": 5}, "screenshots": {}}, True),  # 失败算终态
+    ({"status": "completed"}, True),          # 无 open 字段的旧响应体
+    ({"status": "running"}, False),
+    ({}, False),                              # 未知一律当"还在跑",宁可多等一轮
+])
+def test_is_settled(body, settled):
+    from services import scrape_batches as sb
+    assert sb.is_settled(body) is settled
 
 
 def test_refresh_targets_sql_gates():
@@ -461,3 +508,28 @@ def test_refresh_filters_non_asin_skus(monkeypatch):
     ok, dropped = pr._targets()
     # 11 位、小写、自定义编码、空串全过滤掉
     assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4
+
+
+def test_snapshot_carries_shipping_null_is_not_zero():
+    """运费三态照搬采集契约:FREE→0.0 / N/A→None / $5.99→5.99。
+
+    **None 不能折成 0**:0 是"确认免运费"这条真信息,None 是"这次没采到"。
+    折了的话下游算出的落地价照样看着正常,只是偏小,两侧都不报错
+    (契约不变量 3b,与 stock_count 同一条)。
+    """
+    free = ingest.snapshot_params(_rec(fast={"shipping": 0.0,
+                                             "shipping_raw": "FREE"}))
+    assert free["shipping"] == 0.0 and free["shipping_raw"] == "FREE"
+
+    missing = ingest.snapshot_params(_rec(fast={"shipping": None,
+                                                "shipping_raw": None}))
+    assert missing["shipping"] is None          # 绝不是 0
+
+    paid = ingest.snapshot_params(_rec(fast={"shipping": 5.99,
+                                             "shipping_raw": "$5.99"}))
+    assert paid["shipping"] == 5.99 and paid["shipping_raw"] == "$5.99"
+
+    # 老记录没有这两个键:按未采到,不是 0
+    assert ingest.snapshot_params(_rec(fast={"price": 1}))["shipping"] is None
+    for col in ("shipping", "shipping_raw"):
+        assert col in ingest._SNAPSHOT_SQL

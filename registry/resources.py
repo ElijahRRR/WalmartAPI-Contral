@@ -199,6 +199,23 @@ ORDER_SALES = Bitable(
     ),
 )
 
+# 销售订单表的**审核列**(order_audit 独占;与上面 ORDER_SALES 同一张表,
+# 分成两个条目是为了分家所有权:sync_by_key 只覆盖 fields 里给出的列,
+# order_center_push 的载荷里没有审核列 → 拉单永远冲不掉审核结论,反之亦然)。
+# 「建议采购日期」属人工域,故意不登记。「产品截图」是附件字段,
+# 值形如 [{"file_token": ...}],file_token 由 api/feishu.upload_media 换取。
+ORDER_SALES_AUDIT = Bitable(
+    name="订单中心-销售订单(审核列)",
+    app_token=_ORDER_APP,
+    table_id=os.environ.get("FEISHU_ORDER_SALES_TABLE_ID", ""),
+    fields=_fields(
+        key="order_line_id", audit_status="审核状态", script_audit="脚本审核",
+        amz_price="亚马逊单价", stock_qty="库存数量", ship_method="配送方式",
+        ship_days="配送时长", seller="卖家店铺名", screenshot="产品截图",
+        supplier="采购方", price_cap="限价", title_similarity="标题相似度",
+    ),
+)
+
 ORDER_RETURNS = Bitable(
     name="订单中心-售后订单",
     app_token=_ORDER_APP,
@@ -244,6 +261,35 @@ ORDER_SETTLE = Bitable(
         original_commission="原始佣金USD", commission_saving="佣金优惠USD",
         incentive="优惠计划", period="账期", settle_date="结算日期",
         pulled_at="拉取时间",
+    ),
+)
+
+
+# ── 订单审核两张配置表(order_audit 每次运行现读,不镜像入 PG)────────────────
+# 不入库的理由:配置量小、改动即时生效是运营预期;且"读不到就不出结论"比
+# "拿上次的旧配置继续算钱"安全(见 services/order_audit 的 require 语义)。
+# 每行实际套用的采购方/汇率/限价会写进 orders.order_audit,事后可追溯用了什么。
+
+# 黑名单邮编(钓鱼检测;所有者定稿 2026-08-09:只匹配邮编,旧系统的地址/街道
+# 双向 substring 匹配整套不迁)。wiki 承载电子表格,A 列邮编,无表头。
+ZIP_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单邮编",
+    token=os.environ.get("FEISHU_ZIP_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_ZIP_BLACKLIST_SHEET_ID", ""),
+    columns=("zip",),
+    wiki=True,
+)
+
+# 采购方表(多维表格,人工维护):按 配送方式 + 亚马逊单价区间 选采购方,
+# 多个候选取汇率最低者(旧系统 采购方匹配.py:80-87 语义,逐字保留)。
+SUPPLIER_TABLE = Bitable(
+    name="采购方",
+    app_token=os.environ.get("FEISHU_SUPPLIER_APP_TOKEN", ""),
+    table_id=os.environ.get("FEISHU_SUPPLIER_TABLE_ID", ""),
+    fields=_fields(
+        supplier="采购方", ship_method="配送方式",
+        band_from="价格区间起", band_to="价格区间止",
+        rate="汇率", enabled="是否启用",
     ),
 )
 

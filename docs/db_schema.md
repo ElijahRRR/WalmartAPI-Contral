@@ -65,6 +65,9 @@ CREATE TABLE catalog.snapshots (
     stock_state  text,           -- in_stock / out_of_stock / unknown(封闭集)
     stock_count  integer,        -- ⚠ NULL=没采到,0=确实是 0(下游禁止 or 0)
     delivery_days integer,       -- 同上
+    shipping     numeric,        -- 运费:⚠ 同上 NULL≠0。0.0=确认免运费(FREE),
+    shipping_raw text,           --   NULL=没采到(N/A)⇒ 落地价算不出来;
+                                 --   raw 存原始串,出现新形态不必等契约改版
     buybox       jsonb,
     raw          jsonb,          -- 采集器原始载荷(裁剪后)
     scraped_at   timestamptz NOT NULL,
@@ -245,7 +248,51 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
   同键覆盖——丢历史后"影响范围"无法回答)。`perf_event_spans` 视图给出每条
   违规的存续区间与 still_active(以最新报表是否仍包含该单为准,不自行推算
   官方统计窗口)。
-生成函数唯一出处:`services/order_lines.py`。
+- **审核结论落在 order_lines 自身**(2026-08-09 定稿,不另建表):
+  `audit_status`(✓ 通过 / 建议拒绝 / 待人工)+ `audit_detail` jsonb + `audited_at`。
+  安全前提已核:`order_sync` 的 upsert 只覆盖它自己给出的列,拉单永远冲不掉
+  审核结论;反之 order_audit 的 UPDATE 也只碰这三列。
+  `audit_detail` 结构(order_audit 写,飞书审核列由它投影):
+
+  ```jsonc
+  {
+    "note": "成本 54.0 ≤ 限价 75.0;采购方 甲",   // →「脚本审核」列
+    "asin": "B001", "zip": "10001",              // 判定用的是哪个邮编的快照
+    "amz_price": 50, "stock_qty": 5, "ship_method": "FBA",
+    "ship_days": 3, "seller": "Acme", "amz_title": "...",
+    "shipping": 0.0, "shipping_raw": "FREE",      // NULL 表示没采到,不是免运费
+    "scraped_at": "...",
+    "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
+    "price_cap": 75.0, "cost": 54.0,
+    "title_similarity": 0.9673,                   // →「标题相似度」列
+    "rules": {                                    // 各道审核的过程值,事后可复盘
+      "phishing": {"hit": false},
+      "title":    {"similarity": 0.9673, "min": 0.9},
+      "delivery": {"days": 3, "max": 9},
+      "supplier": {"hit": true, "name": "甲", "rate": 1.0},
+      "price":    {"cap": 75.0, "cost": 54.0}
+    }
+  }
+  ```
+
+  配置(黑名单邮编/采购方表)不入库,每次运行现读飞书;**每行实际套用的
+  采购方与汇率写进 audit_detail**,所以"当时按什么算的"事后仍可追溯。
+
+生成函数唯一出处:`services/order_lines.py`;审核规则唯一出处:`services/order_audit.py`。
+
+**两条 upsert 语义**(2026-08-10 生产实证后定稿,`services/order_lines._upsert`):
+
+- **内容没变就整行不写**(`ON CONFLICT ... DO UPDATE ... WHERE 旧值 IS DISTINCT FROM 新值`)。
+  原先无条件 `updated_at = now()`,而 order_sync 每轮**全量重拉 45 天窗口**
+  ⇒ 窗口内每行 updated_at 都被刷新 ⇒ order_center_push 把它当「拉取时间」写进
+  飞书载荷、载荷参与指纹 ⇒ **指纹必变 ⇒ 每轮重推窗口内全部行**
+  (实证:销售订单 7100 行更新 3122,正是 45 天窗口行数;售后表没有「拉取时间」
+  列,同一轮只更新真变化的 7 行——天然对照组)。改完 `updated_at` 才真正表示
+  "这行什么时候变的",飞书指纹这道写放大治理也随之恢复效力。
+- **电话全 0 不覆盖真电话**:沃尔玛常态把买家电话打码成 `0000000000`
+  (实证 45 天窗口 2964/3542 = 84%),原样覆盖会把库里真值冲掉且**找不回**
+  (`raw` 也是每次一起被覆盖的)。旧系统的「电话全 0 保护」,legacy_survey
+  明列必须照搬。反向不设防:真电话覆盖全 0 是正常修复。
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
@@ -344,6 +391,28 @@ CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不�
 );
 -- 写入一律 INSERT ... ON CONFLICT DO NOTHING:天然实现旧系统"永久累积+全局去重+
 -- 保留首次发现日期"语义,消掉旧系统清空飞书全表重写的丢数据风险
+
+CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一个 ASIN×邮编一行)
+    asin text, zip text,            -- zip = 5 位标准邮编
+    batch_name text, state text,    -- pending / done / failed
+    reason text, requested_at timestamptz, settled_at timestamptz,
+    first_requested_at timestamptz, -- 这一轮重试从什么时候开始(重推不刷新)
+    attempts integer,               -- 只作运维观察
+    PRIMARY KEY (asin, zip)
+);
+-- 三个作用:① **先落 pending 再调接口**(铁律)——旧系统没有任何防重记录,
+-- 提交中途一断就丢,重启后无从对账;② **一批混邮编,同一 ASIN 的多邮编拆批**
+-- (采集侧 tasks 是 UNIQUE(batch_id, asin)):批次内一个 ASIN 只可能有一个邮编,
+-- 所以 batch_name 同时是取图的隔离键(落盘 `<批次名>/<asin>.png`)和排障抓手;
+-- ③ 落定三层判据,谁也替代不了谁:
+--    快照真出现 → done。**只有它能证明数据到了我们库里** —— 批次 completed
+--                 不等于落库,中间还隔着增量导出 + product_ingest 两跳。
+--    批次已落定(tasks.open==0 且 screenshots.open==0)仍无快照 → 认账 failed,
+--                 原因去 /api/batches/{batch_id}/failures 拿真值写进 reason
+--                 (验证码可换时段重试,variant_offset 重试也没用,处置不同)。
+--    兜底超时 20 分钟 → 只打在**批次已不在途**的组合上。在途批次不判超时:
+--                 采集侧正干着我们又重推一遍 = 白烧一批配额。
+-- 重试窗口见 refdata/schema.sql 里 first_requested_at 那段注释(可重试一天)。
 
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'

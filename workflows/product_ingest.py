@@ -27,84 +27,20 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.product_ingest")
 
-_CURSOR_NAME = "product_ingest"
-
-
-def _load_cursor() -> int:
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT value FROM ops.cursors WHERE name = %s",
-                    (_CURSOR_NAME,))
-        row = cur.fetchone()
-    if not row:
-        return 0
-    return int((row[0] or {}).get("cursor", 0))
-
-
-def _save_cursor(value: int) -> None:
-    with db.pg_conn() as conn:
-        conn.execute(
-            "INSERT INTO ops.cursors (name, value, updated_at)"
-            " VALUES (%s, jsonb_build_object('cursor', %s::bigint), now())"
-            " ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value,"
-            " updated_at = now()", (_CURSOR_NAME, value))
+# 游标/翻页/落库的实现在 services/product_ingest.pump —— order_audit 的
+# `-p wait=1` 要就地跑同一件事,而工作流之间不准互相 import(铁律 1)。
+# 本工作流仍是**全项目唯一直连采集服务取数的调度入口**;order_audit 借这条
+# 泵时必须先拿本工作流的 flock(见 services/runlock),两个进程同推游标会
+# 静默丢一段数据。
 
 
 def run(params: dict) -> str:
     """输入:params(limit/max_pages/cursor)→ 输出:摄取摘要。"""
-    limit = int(params.get("limit", 500))
-    max_pages = int(params.get("max_pages", 0)) or None
-    if params.get("cursor") is not None:
-        cursor = int(params["cursor"])
-        logger.warning("游标被显式重置为 %d(全量对账场景)", cursor)
-    else:
-        cursor = _load_cursor()
-    start_cursor = cursor
-
-    total = {"snapshots": 0, "dup": 0, "products": 0, "skipped_outcome": 0,
-             "incomplete": 0, "invalid": 0}
-    pages = fetched = 0
-    while True:
-        try:
-            records, next_cursor, has_more = scraper.export_incremental(
-                cursor, limit)
-        except scraper.RetentionGapError as e:
-            # 游标停在原地:重置由人工在全量对账后显式做(-p cursor=N)
-            return (f"⛔ 保留期缺口,已停止(游标仍为 {cursor},未推进):{e}\n"
-                    f"本轮已入库:观测 {total['snapshots']} 条 / "
-                    f"身份 {total['products']} 条;需全量对账后 "
-                    f"-p cursor=<新起点> 重启")
-        except scraper.ExportAuthError as e:
-            return f"⛔ 导出鉴权失败(游标未推进):{e}"
-
-        pages += 1
-        fetched += len(records)
-        if records:
-            with db.pg_conn() as conn:
-                counts = ingest.ingest_batch(conn, records)
-            for k, v in counts.items():
-                total[k] = total.get(k, 0) + v      # outcome_* 键是动态的
-
-        # 空页不推进(next_cursor 原样返回);有数据才落游标
-        if next_cursor != cursor:
-            _save_cursor(next_cursor)
-            cursor = next_cursor
-        if not has_more or not records:
-            break
-        if max_pages and pages >= max_pages:
-            logger.info("达到 max_pages=%d,本轮提前收尾(游标已落 %d)",
-                        max_pages, cursor)
-            break
-
-    line = (f"增量摄取:{pages} 页 / 拉取 {fetched} 条;"
-            f"观测入库 {total['snapshots']}(重复跳过 {total['dup']}),"
-            f"身份更新 {total['products']};游标 {start_cursor} → {cursor}")
-    if total["skipped_outcome"]:
-        dist = ",".join(f"{k[len('outcome_'):]}×{v}"
-                        for k, v in sorted(total.items())
-                        if k.startswith("outcome_"))
-        line += f",非 ok 采集只落观测 {total['skipped_outcome']}({dist})"
-    if total["incomplete"]:
-        line += f",completeness_ok=false {total['incomplete']}(空值未覆盖旧值)"
-    if total["invalid"]:
-        line += f",⚠ 缺 asin/source_id 丢弃 {total['invalid']}"
-    return line
+    cursor = params.get("cursor")
+    if cursor is not None:
+        logger.warning("游标被显式重置为 %s(全量对账场景)", cursor)
+    res = ingest.pump(scraper, db,
+                      limit=int(params.get("limit", 500)),
+                      max_pages=int(params.get("max_pages", 0)) or None,
+                      cursor=cursor)
+    return ingest.pump_summary(res)

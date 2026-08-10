@@ -2,7 +2,8 @@
 
 产品数据契约(provider 产出的统一形态,mapper/主链只认这个,来源无关):
   {"asin": str, "title": str, "brand": str|None, "category": str|None,
-   "price": float|None,          # amz 现价(定价输入)
+   "price": float|None,          # amz 单价
+   "shipping": float|None,       # 运费(定价输入 = 单价 + 运费;None≠0)
    "stock": int|None,            # amz 可见库存(<5 淘汰,MIN_INVENTORY)
    "lead_days": int|None,        # 配送时长(>12 天上架但库存写 0)
    "channel": "FBA"|"FBM"|None,  # 定价区间路由
@@ -36,10 +37,10 @@ MARKETPLACE = "US"          # 上架目的地(契约:与 (marketplace,asin) 主�
 _SQL = """
 SELECT p.asin, p.title, p.brand, p.amazon_category, p.image_url, p.slow,
        s.price, s.stock_state, s.stock_count, s.delivery_days, s.raw,
-       s.fulfillment
+       s.fulfillment, s.shipping
 FROM catalog.products p
 LEFT JOIN LATERAL (
-    SELECT price, stock_state, stock_count, delivery_days, raw,
+    SELECT price, stock_state, stock_count, delivery_days, raw, shipping,
            raw ->> 'is_fba' AS fulfillment
     FROM catalog.latest_snapshot ls
     WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
@@ -91,7 +92,7 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for (asin, title, brand, category, image_url, slow, price, stock_state,
-         stock_count, delivery_days, raw, fulfillment) in rows:
+         stock_count, delivery_days, raw, fulfillment, shipping) in rows:
         if not title:           # 身份层还没拿到标题 = 这条不够格喂上架链
             continue
         # attrs 首选身份层的 slow 全量段(卖点/描述/重量/尺寸/变体都在这里);
@@ -102,6 +103,10 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         out[asin] = {
             "asin": asin, "title": title, "brand": brand, "category": category,
             "price": float(price) if price is not None else None,
+            # 运费:定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10)。
+            # None ≠ 0——None 是"这次没采到"(落地价算不出来,调用方不定价),
+            # 0.0 是采集侧确认的 FREE
+            "shipping": float(shipping) if shipping is not None else None,
             "stock": stock_count,               # int | None(None ≠ 0)
             "stock_state": str(stock_state) if stock_state else None,
             "lead_days": delivery_days,         # int | None(None ≠ 0)

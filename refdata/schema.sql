@@ -73,6 +73,29 @@ END $$;
 -- 下游一律不得 `or 0` 兜底(与 price 同一条原则)。
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS stock_count integer;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS delivery_days integer;
+-- 运费(采集侧 2026-08-10 纯追加,contract_version 仍是 1;存量事件也拿得到,
+-- 不需要回填)。FREE→0.0 是"确认免运费"这条真信息,N/A→NULL 是"这次没采到"
+-- ⇒ **落地价算不出来**。与 stock_count 同一条不变量:NULL ≠ 0,下游禁止 or 0
+-- (把没采到当免运费,落地价照样算得出来、看着正常,只是偏小,两侧都不报错)。
+-- shipping_raw 存原始串:出现新形态(如满额免邮门槛)时不必等契约改版。
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping numeric;
+ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping_raw text;
+-- 存量行回填:两列是新加的,历史快照全是 NULL,而定价链已改成"运费没采到
+-- 就不定价"⇒ 不回填的话上线当天全线停改价、停上架,直到下一轮全量重采完。
+-- 值本来就在 raw.buybox_shipping 里(采集侧 _RAW_DROP 没裁它),所以能就地补。
+-- 映射与采集侧 export_incremental._shipping **逐条对齐**:
+--   FREE(大小写不敏感)→ 0.0 确认免运费;$5.99 → 5.99;其余(N/A/空)→ 保持
+--   NULL = 没采到。**只认 'free' 这一个词**——想再认 'free shipping'/'$0.00'
+--   得先去采集侧确认它真会产出,放宽的代价是把没采到的算成 0。
+UPDATE catalog.snapshots SET
+    shipping_raw = btrim(raw ->> 'buybox_shipping'),
+    shipping = CASE
+        WHEN lower(btrim(raw ->> 'buybox_shipping')) = 'free' THEN 0
+        WHEN btrim(raw ->> 'buybox_shipping') ~ '^\$?[0-9]+(\.[0-9]+)?$'
+            THEN replace(btrim(raw ->> 'buybox_shipping'), '$', '')::numeric
+        ELSE NULL END
+WHERE shipping IS NULL AND shipping_raw IS NULL
+  AND raw ? 'buybox_shipping';
 
 -- 采集结局(契约扩展字段;2026-08-09 补存):outcome ∈ ok/not_found/blocked/
 -- parse_failed/stale。此前只在摄取时计数不落库,导致"这个产品为什么没数据"
@@ -510,9 +533,16 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
 
--- 采集推送批次台账(product_refresh 用;所有者定稿 2026-08-09):
--- 全量重推在线产品前先落账,**确认推上去了(拿到 batch_id)才开始计时**;
--- 批次名是取回的抓手(按批次查比整库查快得多),1 小时未采完视为超时。
+-- 采集推送批次台账(所有者定稿 2026-08-09)。**两条工作流共用一张表**:
+-- product_refresh 的全量重推批次(`wm-refresh-*`)与 order_audit 的按邮编
+-- 批次(`wm-audit-<邮编>-*`)。两边超时口径不同(1 小时 vs 20 分钟),
+-- 所以**查在途必须按批次名前缀圈自己的**——不过滤的话,维护链的 check
+-- 会拿 1 小时口径把订单审核那些还在跑的批次标成 timeout。
+-- 推送前先落账,**确认推上去了(拿到 batch_id)才开始计时**;batch_id 必须
+-- 当场记下:/api/batches/{id}/failures 只认 id 不认名字,漏记就再也查不出
+-- "这个 ASIN 为什么没采到"。
+-- 落定判据统一在 services/scrape_batches.is_settled(采集侧 2026-08-10 实测):
+--     completed ⇔ tasks.open == 0 AND screenshots.open == 0   (failed 算终态)
 CREATE TABLE IF NOT EXISTS ops.scrape_batches (
     batch_name  text PRIMARY KEY,
     batch_id    text,               -- 采集侧 ID(200 新建 / 409 既有,都记)
@@ -525,6 +555,52 @@ CREATE TABLE IF NOT EXISTS ops.scrape_batches (
 );
 CREATE INDEX IF NOT EXISTS scrape_batches_status_idx
     ON ops.scrape_batches (status, submitted_at DESC);
+
+-- 订单审核的按邮编采集台账(order_audit 用;一个 (ASIN, 邮编) 一行)。
+-- 存在的三个理由:
+-- ① **先落 pending 再调接口**(CLAUDE.md 铁律)——旧系统完全没有防重记录,
+--    提交/回填中途一断就丢,重启后没有 pending 可对账(legacy_survey 明列此洞);
+-- ② **一批可以混不同 ASIN 的不同邮编**(采集侧 items[].zip_code 逐 ASIN 带),
+--    只有**同一 ASIN 的多个邮编**必须拆批(tasks 是 UNIQUE(batch_id, asin),
+--    同批会回 400 conflicting_zip_for_asin)。所以批次内一个 ASIN 只可能有
+--    一个邮编,(batch_name, asin) 已唯一定位一个 (ASIN,邮编)——batch_name
+--    因此既是取图的抓手(落盘 <批次名>/<asin>.png)也是排障的抓手。
+--    取数与批次无关,只走 /api/export/incremental 按 scrape_params.zipcode 分组。
+-- ③ 落定三层判据(见 workflows/order_audit._settle_ledger):快照真出现 → done;
+--    批次已落定仍无快照 → 认账 failed 并去 /failures 拿真实原因;
+--    兜底超时 20 分钟只打在批次已不在途的组合上(在途批次不判超时,
+--    否则采集侧正干着我们又重推一遍 = 白烧一批配额)。
+--    **批次 completed 不等于我们库里有数据**:中间隔着增量导出 + product_ingest
+--    两跳,所以"这条到没到"只能看快照,批次状态只回答"还要不要等"。
+CREATE TABLE IF NOT EXISTS ops.audit_scrape (
+    asin        text NOT NULL,
+    zip         text NOT NULL,      -- 5 位标准邮编
+    batch_name  text,
+    state       text NOT NULL,      -- pending / done / failed
+    reason      text,
+    requested_at timestamptz NOT NULL DEFAULT now(),   -- 最近一次推送
+    settled_at  timestamptz,
+    PRIMARY KEY (asin, zip)
+);
+-- error_type 单独成列(不埋在 reason 文本里):判定链要按它分流——
+-- RETRYABLE 的换时段重采可能就好了;variant_offset / parse_error /
+-- server_reject 这类重采多少次都一样,这个 ASIN 的数据**永远拿不到**,
+-- 该给终局结论(建议拒绝)并且不再重推。靠 LIKE '%variant_offset%' 去猜
+-- 文本迟早对不上,而对不上的后果是每轮为一个采不出来的 ASIN 白烧一次配额。
+ALTER TABLE ops.audit_scrape ADD COLUMN IF NOT EXISTS error_type text;
+CREATE INDEX IF NOT EXISTS audit_scrape_state_idx
+    ON ops.audit_scrape (state, requested_at);
+-- 重试窗口(所有者定稿 2026-08-10「可重试一天」):有快照但缺关键信息的组合
+-- 会被反复重采,得有个头——first_requested_at 记这一轮重试**从什么时候开始**
+-- (重推时不刷新),超一天仍拿不到可用数据就放弃,免得一个采不出来的 ASIN
+-- 每小时白烧一次配额。**新需求会开新一轮**:上次推送已过期(超新鲜度窗口)
+-- 说明不是同一轮死磕,窗口重置。attempts 只作运维观察用。
+ALTER TABLE ops.audit_scrape
+    ADD COLUMN IF NOT EXISTS first_requested_at timestamptz;
+ALTER TABLE ops.audit_scrape
+    ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+UPDATE ops.audit_scrape SET first_requested_at = requested_at
+    WHERE first_requested_at IS NULL;
 
 -- 采集失败明细(product_refresh 批次落定时拉;与 feed_item_errors 同款思路:
 -- **拉详情是标准动作**)。采集侧 /api/batches/{id}/failures 的落库形态:
@@ -589,6 +665,14 @@ CREATE OR REPLACE VIEW ops.v_feed_error_stats AS
 CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
 CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
 
+-- 两类行,别混:
+--   'product_ingest'          增量导出游标(只在有新数据时前进)
+--   'product_ingest:last_run' 摄取水位线(**每轮跑完都刷,哪怕 0 条**)
+-- 分开是因为 order_audit 要问的不是"取到第几条",而是
+-- **"我有没有资格说'这条数据没到'"**:采集侧批次 completed 只说明它干完了,
+-- 数据还在增量流里。摄取没追上就断言"无快照 ⇒ 采集失败",会把采成功的整批
+-- 冤枉掉(2026-08-10 实测:127 个组合全判失败,紧接着一次 product_ingest
+-- 就把这 127 条全摄了进来),而 failed 不挡重推 ⇒ 下一轮再采一遍,每小时白烧。
 CREATE TABLE IF NOT EXISTS ops.cursors (
     name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
     value       jsonb NOT NULL,

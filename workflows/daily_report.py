@@ -1,22 +1,20 @@
 """daily_report — 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。
 
 用法:
-  python cli.py daily_report                       # 全部阶段(kpi → settlement → board)
+  python cli.py daily_report                       # 全部阶段(kpi → board)
   python cli.py daily_report -p phase=kpi          # 只采集 KPI
   python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
-  python cli.py daily_report -p phase=settlement   # 对账明细 → orders.settlement_lines
-  python cli.py daily_report -p phase=settlement -p periods=99   # 首次可放开账期上限(默认 6)
   python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
-  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi/settlement 阶段)
+  python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi 阶段)
 
 **问题订单已摘出**(所有者定稿 2026-08-08):绩效问题订单明细(insights
 report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
 由独立调度驱动;本工作流只取指标比率(insights summary 端点),不再等
 那条最脆的链。push 阶段的"问题订单 TOP"仍读 PG,数据由那条流写。
 
-订单中心接线:settlement 阶段把缺失账期的对账明细聚合进
-orders.settlement_lines(关账快照不可变,已入库账期不重拉)。
+**对账明细也已摘出**(所有者定稿 2026-08-10):账期是**双周**节奏,KPI 是**每日**,
+绑在一起等于每天为一件十四天才变一次的事扫全店 ⇒ `workflows/settlement_sync.py`。
 
 与旧系统的关键差异(设计决策见 docs/legacy_survey.md #daily_report 迁移建议):
 - PG 是权威(ops.store_kpi_daily / ops.perf_problem_orders),飞书降级为展示层
@@ -348,65 +346,6 @@ def _phase_kpi(store_list: list[dict], data_date, do_yingdao: bool = False) -> s
     return line
 
 
-def _phase_settlement(store_list: list[dict], periods_limit: int) -> str:
-    """对账明细:按店拉取缺失账期(关账快照不可变,已入库不重拉)→ settlement_lines。"""
-    total_periods, total_lines, total_no_sku, failed = 0, 0, 0, []
-
-    def _one_store(store: dict) -> tuple[int, int, int]:
-        name = store["name"]
-        with db.pg_conn() as conn, conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT period FROM orders.settlement_lines "
-                        "WHERE store = %s", (name,))
-            have = {r[0] for r in cur.fetchall()}
-            # 台账并入:入库过滤后可能整期 0 行落库,只看 DISTINCT period
-            # 会把处理过的期当缺失无限重拉(services.order_lines 台账注释)
-            have |= order_lines.recon_done_periods(conn, name)
-            # v3 身份 = PO+SKU:CSV 缺 SKU 列时按 (po,行号) 反查订单行补 SKU
-            cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
-                        "WHERE store = %s", (name,))
-            sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
-        todo = order_lines.pick_new_periods(
-            reports.available_recon_dates(store), have, periods_limit)
-        written = no_sku = unlinked = 0
-        for period in todo:
-            rows = list(reports.iter_recon_records(store, period))
-            recs, skipped = order_lines.aggregate_settlement_lines(
-                name, rows, period, sku_lookup)
-            no_sku += skipped
-            with db.pg_conn() as conn:
-                # 烂账治理:订单不在库(早于建库窗口)的对账行不入库
-                recs, drop = order_lines.drop_unlinked(conn, recs)
-                unlinked += drop
-                written += order_lines.upsert_settlement_lines(conn, recs)
-                order_lines.mark_recon_done(conn, name, [period])
-        if unlinked:
-            logger.info("店铺 %s:%d 组对账行订单不在库,未入库", name, unlinked)
-        return len(todo), written, no_sku
-
-    with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
-        futs = {pool.submit(_one_store, s): s["name"] for s in store_list}
-        for f in as_completed(futs):
-            name = futs[f]
-            try:
-                periods, written, no_sku = f.result()
-                total_periods += periods
-                total_lines += written
-                total_no_sku += no_sku
-            except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                failed.append(f"{name}(凭证)")
-            except Exception as e:
-                logger.exception("店铺 %s 对账明细失败: %s", name, e)
-                failed.append(name)
-    line = (f"对账明细:{len(store_list) - len(failed)}/{len(store_list)} 店,"
-            f"新账期 {total_periods} 个,入库 {total_lines} 行")
-    if total_no_sku:
-        line += f",SKU 解析失败跳过 {total_no_sku} 组"
-    if failed:
-        line += f",失败:{','.join(failed)}"
-    return line
-
-
 # 看板表头:沿用旧表真实中文列名(与 kpi._HIST_HEADER_MAP 对称,运营零学习成本)
 _BOARD_HEADER = ["日期", "店铺", "卖家名称", "partnerId", "sellerId", "店铺状态",
                  "支付状态", "销售状态", "在线商品", "有库存", "无库存", "昨日出单",
@@ -542,10 +481,12 @@ def _phase_push(data_date, do_push: bool) -> str:
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "settlement", "board", "push", "settle_debug"):
+    if phase not in ("all", "kpi", "board", "push", "settle_debug"):
         if phase == "problems":     # 已摘出为独立工作流(2026-08-08)
             return "问题订单已独立:改跑 python cli.py perf_problems"
-        return ("phase 只接受 all/kpi/settlement/board/push/"
+        if phase == "settlement":   # 已摘出为独立工作流(2026-08-10)
+            return "对账明细已独立:改跑 python cli.py settlement_sync"
+        return ("phase 只接受 all/kpi/board/push/"
                 f"settle_debug,收到:{phase}")
     data_date = datetime.now(kpi.CN_TZ).date()
 
@@ -562,17 +503,13 @@ def run(params: dict) -> str:
                 + "\n".join(f"  {k} = {v}" for k, v in extracted.items()))
 
     lines = []
-    if phase in ("all", "kpi", "settlement"):
+    if phase in ("all", "kpi"):
         names = [params["store"]] if params.get("store") else None
         store_list = stores_svc.load_stores(names)
         if not store_list:
             return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
-        if phase in ("all", "kpi"):
-            do_yingdao = str(params.get("yingdao", "")) in ("1", "true", "yes")
-            lines.append(_phase_kpi(store_list, data_date, do_yingdao))
-        if phase in ("all", "settlement"):
-            lines.append(_phase_settlement(
-                store_list, int(params.get("periods", 6))))
+        do_yingdao = str(params.get("yingdao", "")) in ("1", "true", "yes")
+        lines.append(_phase_kpi(store_list, data_date, do_yingdao))
     if phase in ("all", "board"):
         try:
             lines.append(_phase_board(int(params.get("days", 90))))

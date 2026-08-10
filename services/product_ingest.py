@@ -24,10 +24,11 @@ OUTCOME_OK = "ok"
 _SNAPSHOT_SQL = """
 INSERT INTO catalog.snapshots (
     marketplace, asin, scrape_params, price, stock_state, stock_count,
-    delivery_days, buybox, raw, scraped_at, source_id,
+    delivery_days, shipping, shipping_raw, buybox, raw, scraped_at, source_id,
     outcome, completeness_ok)
 VALUES (%(marketplace)s, %(asin)s, %(scrape_params)s::jsonb, %(price)s,
         %(stock_state)s, %(stock_count)s, %(delivery_days)s,
+        %(shipping)s, %(shipping_raw)s,
         %(buybox)s::jsonb, %(raw)s::jsonb, %(scraped_at)s, %(source_id)s,
         %(outcome)s, %(completeness_ok)s)
 ON CONFLICT (source_id) DO NOTHING
@@ -97,6 +98,17 @@ def _opt_int(v):
         return None
 
 
+def _opt_float(v):
+    """输入:契约里的 float|null 字段 → 输出:float 或 None(**0.0 不折成 None**)。"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        logger.warning("数值字段无法解析(按未采到处理): %r", v)
+        return None
+
+
 def snapshot_params(rec: dict) -> dict:
     """输入:record → 输出:snapshots 行参数。"""
     fast = rec.get("fast") or {}
@@ -112,6 +124,13 @@ def snapshot_params(rec: dict) -> dict:
         "stock_state": _blank_to_none(fast.get("stock_state")),
         "stock_count": _opt_int(fast.get("stock_count")),
         "delivery_days": _opt_int(fast.get("delivery_days")),
+        # 运费(采集侧 2026-08-10 纯追加,contract_version 仍是 1):
+        # FREE→0.0(确认免运费)/ N/A→None(这次没采到,落地价算不出来)/ $5.99→5.99。
+        # 与 stock_count 同一条不变量:**null ≠ 0,下游禁止 or 0**——把没采到
+        # 当免运费,落地价照样算得出来、看着正常,只是偏小,两侧都不报错。
+        # shipping_raw 原样留存:出现新形态(如满额免邮门槛)时不必等契约改版。
+        "shipping": _opt_float(fast.get("shipping")),
+        "shipping_raw": _blank_to_none(fast.get("shipping_raw")),
         "buybox": json.dumps(buybox, ensure_ascii=False) if buybox else None,
         "raw": json.dumps(rec.get("raw"), ensure_ascii=False)
                if rec.get("raw") is not None else None,
@@ -181,3 +200,148 @@ def ingest_batch(conn, records: list[dict]) -> dict:
         logger.info("非 ok 采集 %d 条只落观测层(%s)",
                     counts["skipped_outcome"], detail)
     return counts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  增量泵(游标 + 翻页 + 落库)—— workflows/product_ingest 与 order_audit 共用
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# 提到 services 是因为 order_audit 的 `-p wait=1` 要**就地**跑一次摄取
+# (推完采集等批次落定后,不等下一轮调度就把数据拉进来出结论),
+# 而工作流之间不准互相 import(铁律 1)。抄第二份的代价具体而致命:
+# 游标推进规则(空页不推进、只认 next_cursor、409 停在原地)抄漏一条就是
+# **静默丢一段数据**,两侧都不报错。
+
+CURSOR_NAME = "product_ingest"
+
+# 「摄取跑到哪儿了」的水位线。**和游标是两件事**:游标只在有新数据时前进,
+# 水位线每次跑完都刷。分开是因为下游要问的问题不是"取到第几条",而是
+# **"我有没有资格说'这条数据没到'"**——
+# 采集侧批次 completed 只说明它干完了,数据还在增量流里;摄取没追上就断言
+# "无快照 ⇒ 采集失败",会把采成功的整批冤枉掉(2026-08-10 实测:127 个组合
+# 全被判失败,紧接着一次 product_ingest 就把这 127 条全摄进来了)。
+# 有了水位线,order_audit 才能只在"摄取确实跑过这个时间点之后"才认账失败。
+WATERMARK_NAME = "product_ingest:last_run"
+
+
+def load_cursor(conn) -> int:
+    """输入:连接 → 输出:当前游标(没有记录则 0)。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM ops.cursors WHERE name = %s",
+                    (CURSOR_NAME,))
+        row = cur.fetchone()
+    return int((row[0] or {}).get("cursor", 0)) if row else 0
+
+
+def save_cursor(conn, value: int) -> None:
+    """输入:连接 + 游标 → 输出:无(写 ops.cursors)。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ops.cursors (name, value, updated_at)"
+            " VALUES (%s, jsonb_build_object('cursor', %s::bigint), now())"
+            " ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value,"
+            " updated_at = now()", (CURSOR_NAME, value))
+    conn.commit()
+
+
+def pump(scraper, db, *, limit: int = 500, max_pages=None, cursor=None) -> dict:
+    """输入:api.scraper + registry.db(+分页参数)→ 输出:本轮摄取结果 dict。
+
+    返回 {ok, cursor_from, cursor_to, pages, fetched, totals, error}:
+    - `ok=False` 时 `error` 是给人看的一句话,**游标一定没推进**;
+    - `totals` 是 ingest_batch 计数的累加(含动态的 outcome_* 键)。
+
+    游标纪律(契约边界语义,三条都别改):
+    - 只认响应返回的 `next_cursor`,不自己算 max(seq) 或 cursor+count;
+    - **空页不推进**——这是唯一不丢数据的方向;
+    - 409 保留期缺口:停在原地并要求人工全量对账后 `-p cursor=N` 重置,
+      **绝不当普通错误重试**(那会一路跳过被裁掉的区间,静默丢数据)。
+
+    ⚠ 调用方必须先拿到 `product_ingest` 的 flock(见 services/runlock):
+    两个进程同时推游标,后写的会盖掉先写的,中间那段记录永远不会再被拉一次。
+    """
+    with db.pg_conn() as conn:
+        cur_pos = load_cursor(conn) if cursor is None else int(cursor)
+    start = cur_pos
+    totals: dict = {"snapshots": 0, "dup": 0, "products": 0,
+                    "skipped_outcome": 0, "incomplete": 0, "invalid": 0}
+    pages = fetched = 0
+
+    while True:
+        try:
+            records, next_cursor, has_more = scraper.export_incremental(
+                cur_pos, limit)
+        except scraper.RetentionGapError as e:
+            return {"ok": False, "cursor_from": start, "cursor_to": cur_pos,
+                    "pages": pages, "fetched": fetched, "totals": totals,
+                    "error": f"保留期缺口,已停止(游标仍为 {cur_pos},未推进):"
+                             f"{e};需全量对账后 -p cursor=<新起点> 重启"}
+        except scraper.ExportAuthError as e:
+            return {"ok": False, "cursor_from": start, "cursor_to": cur_pos,
+                    "pages": pages, "fetched": fetched, "totals": totals,
+                    "error": f"导出鉴权失败(游标未推进):{e}"}
+
+        pages += 1
+        fetched += len(records)
+        if records:
+            with db.pg_conn() as conn:
+                counts = ingest_batch(conn, records)
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v     # outcome_* 键是动态的
+
+        if next_cursor != cur_pos:
+            with db.pg_conn() as conn:
+                save_cursor(conn, next_cursor)
+            cur_pos = next_cursor
+        if not has_more or not records:
+            break
+        if max_pages and pages >= max_pages:
+            logger.info("达到 max_pages=%d,本轮提前收尾(游标已落 %d)",
+                        max_pages, cur_pos)
+            break
+
+    # 只有**跑完整轮**才刷水位线:中途出错(上面两个 return)不刷,
+    # 否则下游会以为"摄取已追上"而去认账失败——那正是水位线要防的事。
+    with db.pg_conn() as conn:
+        touch_watermark(conn, cur_pos)
+    return {"ok": True, "cursor_from": start, "cursor_to": cur_pos,
+            "pages": pages, "fetched": fetched, "totals": totals, "error": None}
+
+
+def touch_watermark(conn, cursor_value: int) -> None:
+    """输入:连接 + 当前游标 → 输出:无(刷 ops.cursors 的摄取水位线)。
+
+    **每轮跑完都刷,哪怕 0 条新数据**——这正是它和游标的区别:
+    "这一轮我确实把增量流拉到底了" 与 "游标动没动" 是两个事实,
+    下游要的是前者。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ops.cursors (name, value, updated_at)"
+            " VALUES (%s, jsonb_build_object('cursor', %s::bigint), now())"
+            " ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value,"
+            " updated_at = now()", (WATERMARK_NAME, cursor_value))
+    conn.commit()
+
+
+def pump_summary(res: dict) -> str:
+    """输入:pump 的返回 → 输出:一行人读摘要。"""
+    if not res["ok"]:
+        t = res["totals"]
+        return (f"⛔ {res['error']}\n本轮已入库:观测 {t['snapshots']} 条 / "
+                f"身份 {t['products']} 条")
+    t = res["totals"]
+    line = (f"增量摄取:{res['pages']} 页 / 拉取 {res['fetched']} 条;"
+            f"观测入库 {t['snapshots']}(重复跳过 {t['dup']}),"
+            f"身份更新 {t['products']};"
+            f"游标 {res['cursor_from']} → {res['cursor_to']}")
+    if t["skipped_outcome"]:
+        dist = ",".join(f"{k[len('outcome_'):]}×{v}"
+                        for k, v in sorted(t.items())
+                        if k.startswith("outcome_"))
+        line += f",非 ok 采集只落观测 {t['skipped_outcome']}({dist})"
+    if t["incomplete"]:
+        line += f",completeness_ok=false {t['incomplete']}(空值未覆盖旧值)"
+    if t["invalid"]:
+        line += f",⚠ 缺 asin/source_id 丢弃 {t['invalid']}"
+    return line

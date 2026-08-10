@@ -60,6 +60,9 @@ def wired(monkeypatch):
                                             "products": len(recs),
                                             "skipped_outcome": 0,
                                             "incomplete": 0, "invalid": 0})
+    db.watermark = []
+    monkeypatch.setattr(ingest, "touch_watermark",
+                        lambda conn, v: conn.watermark.append(v))
     return db
 
 
@@ -138,6 +141,31 @@ def test_pump_summary_surfaces_non_ok_outcomes(wired):
     line = ingest.pump_summary(res)
     assert "blocked×2" in line and "stale×1" in line
     assert "completeness_ok=false 1" in line and "丢弃 2" in line
+
+
+# ── 摄取水位线 ────────────────────────────────────────────────────────────────
+#
+# 水位线回答的不是"取到第几条",而是**"我有没有资格说'这条数据没到'"**。
+# order_audit 靠它决定能不能认账采集失败;刷早了 = 把采成功的整批冤枉掉。
+
+def test_pump_touches_watermark_even_with_no_new_data(wired):
+    """0 条新数据也要刷:游标没动 ≠ 这轮没跑。
+
+    下游问的是"摄取追上了吗",不是"游标动了吗"。不刷的话,一个真失败的
+    批次会因为"水位线永远不前进"而永远认不了账。
+    """
+    sc = FakeScraper([([], 0, False)])
+    res = ingest.pump(sc, wired)
+    assert res["ok"] and wired.saved == []      # 游标没动
+    assert wired.watermark == [0]               # 水位线照刷
+
+
+def test_pump_does_not_touch_watermark_on_failure(wired):
+    """中途出错不刷水位线 —— 否则下游以为"摄取已追上"而去认账失败,
+    正是水位线要防的那件事。"""
+    sc = FakeScraper([FakeScraper.RetentionGapError("cursor_below_retention")])
+    res = ingest.pump(sc, wired)
+    assert res["ok"] is False and wired.watermark == []
 
 
 # ── 借锁 ──────────────────────────────────────────────────────────────────────

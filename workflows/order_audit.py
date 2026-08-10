@@ -53,8 +53,14 @@
 - **先落 pending 再调接口**(CLAUDE.md 铁律):台账 ops.audit_scrape 一个
   (ASIN,邮编) 一行。每轮开工先对账,三层判据各管一段:
   ① 快照真出现 → done(只有它能证明数据到了**我们**库里);
-  ② 批次已落定(`tasks.open == 0 且 screenshots.open == 0`)仍无快照 → 认账
-     失败,原因去 `/api/batches/{batch_id}/failures` 拿真值写进台账;
+  ② 批次已落定(`tasks.open == 0 且 screenshots.open == 0`)**且摄取水位线
+     已越过其落定时刻**仍无快照 → 认账失败,原因去
+     `/api/batches/{batch_id}/failures` 拿真值写进台账。
+     水位线这道闸是 2026-08-10 实测踩出来的:批次 completed 只说明**采集侧**
+     干完了,数据还在增量导出流里,中间隔着 product_ingest 一跳。少了它,
+     127 个组合全被判「批次已采完但无快照」,而紧接着一次 product_ingest
+     就把这 127 条原样摄了进来——采集全成功,是我们问早了。且 failed 不挡
+     重推,下一轮会把它们再采一遍,每小时白烧一轮,两侧都不报错;
   ③ 兜底超时 20 分钟 → 只打在**批次已查不到**的组合上,防台账永远挂着。
   在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
 - **重试一天封顶**:同一组合首次请求超 24 小时仍拿不到可用数据就不再推,
@@ -193,6 +199,29 @@ _OPEN_BATCHES_SQL = """
 SELECT batch_name, batch_id, asin_count FROM ops.scrape_batches
 WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
 ORDER BY submitted_at
+"""
+
+# 可以认账的批次:已落定、还有 pending 组合、**且摄取水位线已越过它的落定时刻**。
+#
+# 最后一个条件是 2026-08-10 实测踩出来的:批次 completed 只说明采集侧干完了,
+# 数据还在增量导出流里,中间隔着 product_ingest 一跳。当时 127 个组合全被判
+# 「批次已采完但无快照」,紧接着一次 product_ingest 就把这 127 条原样摄了进来
+# ——采集全成功,是我们问早了。代价不只是台账写错:failed 不挡重推,下一轮
+# 会把这 127 个组合再采一遍,每小时白烧一轮。
+#
+# 反过来,真失败的批次水位线迟早会越过(product_ingest 每轮都刷水位线,
+# 哪怕 0 条新数据),所以只是晚一轮认账,不会漏。真卡住了还有兜底超时兜底。
+_REAPABLE_SQL = """
+SELECT b.batch_name, b.batch_id,
+       (SELECT c.updated_at > b.finished_at FROM ops.cursors c
+        WHERE c.name = %(watermark)s) AS ingest_caught_up
+FROM ops.scrape_batches b
+WHERE b.batch_name LIKE %(prefix)s
+  AND b.status NOT IN ('pushed', 'running')
+  AND b.finished_at IS NOT NULL
+  AND EXISTS (SELECT 1 FROM ops.audit_scrape a
+              WHERE a.batch_name = b.batch_name AND a.state = 'pending')
+ORDER BY b.finished_at
 """
 
 # 批次落定后仍没拿到快照的组合 → 认账失败(原因由 /failures 给)
@@ -347,16 +376,26 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
 
     在途批次(open > 0)**不判超时、不重推**——它还在干活,盲超时会误判重推、
     白烧一批(所以兜底超时那条 SQL 显式排除了在途批次的组合)。
-    批次落定后仍没拿到快照的组合才是真失败,这时拉
-    `/api/batches/{batch_id}/failures` 把**真实原因**(captcha / variant_offset /
-    zip_switch_failed …)写进台账,而不是一律记"超时未见快照"——验证码
-    (换时段可重试)和 404(该去删链接)的处置完全不同。
+
+    两段分开(2026-08-10 实测后改):
+    ① 轮询在途批次的状态,落定的记 completed;
+    ② **只对「已落定 且 摄取水位线已越过其落定时刻」的批次认账失败**,
+       这时才拉 `/api/batches/{batch_id}/failures` 把**真实原因**
+       (captcha / variant_offset / zip_switch_failed …)写进台账,而不是一律
+       记"超时未见快照"——验证码(换时段可重试)和 404(该去删链接)的处置
+       完全不同。
+
+    为什么必须分两段:批次 completed **不等于我们库里有数据**,中间隔着增量
+    导出 + product_ingest 一跳。合在一起写(落定即认账)会把采成功的整批冤枉
+    成失败——实测 127 个组合全军覆没,而紧接着一次 product_ingest 就把这 127
+    条原样摄了进来。且 failed 不挡重推,下一轮会把它们再采一遍,每小时白烧。
     """
     with conn.cursor() as cur:
         cur.execute(_OPEN_BATCHES_SQL, {"prefix": _BATCH_PREFIX + "%"})
         open_batches = cur.fetchall()
     settled_batches, failed_pairs, notes = 0, 0, []
 
+    # ① 在途批次:问状态,落定的记账(**本轮不认账失败**,等摄取追上)
     for name, batch_id, n in open_batches:
         try:
             st = scraper.batch_status(name)
@@ -383,22 +422,39 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
                        f"screenshots={(st.get('screenshots') or {}).get('done')}")
         settled_batches += 1
 
+    # ② 已落定的批次:摄取追上了才认账,否则原样挂着等下轮
+    conn.commit()          # 让 ① 写的 finished_at 对下面这条查询可见
+    with conn.cursor() as cur:
+        cur.execute(_REAPABLE_SQL, {"prefix": _BATCH_PREFIX + "%",
+                                    "watermark": ingest.WATERMARK_NAME})
+        candidates = cur.fetchall()
+
+    waiting = 0
+    for name, batch_id, caught_up in candidates:
+        if not caught_up:
+            waiting += 1        # 数据可能正在增量流里,还没资格说它失败
+            continue
         with conn.cursor() as cur:
             cur.execute(_STILL_PENDING_SQL, {"batch": name})
             stuck = cur.fetchall()
         if not stuck:
             continue
-        # 批次采完了这些组合却没快照 ⇒ 真失败,去问原因
+        # 摄取已越过这批的落定时刻却仍无快照 ⇒ 真失败,去问原因
         summary, by_asin = batches.pull_failures(name, batch_id)
         for asin, zip5 in stuck:
             et = by_asin.get(asin)
             reason = (f"采集失败:{et}" if et
-                      else "批次已采完但无快照(增量导出里没有这条)")
+                      else "批次已采完且摄取已追上,仍无快照(增量导出里没有这条)")
             with conn.cursor() as cur:
                 cur.execute(_FAIL_PAIR_SQL,
                             {"asin": asin, "zip": zip5, "reason": reason})
             failed_pairs += 1
         notes.append(f"{name}:{len(stuck)} 个组合无快照({summary})")
+    if waiting:
+        # 正常态(摄取还没跑);但一直不降就是 product_ingest 停了,得有人看见
+        logger.info("采集台账:%d 个已落定批次在等 product_ingest 摄取后再认账",
+                    waiting)
+        notes.append(f"{waiting} 个批次已采完,等摄取后认账")
     conn.commit()
     return settled_batches, failed_pairs, notes
 
@@ -706,9 +762,13 @@ def _num(v):
     return float(v) if isinstance(v, Decimal) else v
 
 
+# ⚠ 别写成 `(asin, zip) = ANY(%(pairs)s)` 传元组列表:PG 认不出匿名 record 的
+# 类型,直接 FeatureNotSupported(input of anonymous composite types)。
+# 两个平行数组 unnest 是唯一稳的写法。
 _BATCH_OF_SQL = """
 SELECT asin, zip, batch_name FROM ops.audit_scrape
-WHERE batch_name IS NOT NULL AND (asin, zip) = ANY(%(pairs)s)
+WHERE batch_name IS NOT NULL
+  AND (asin, zip) IN (SELECT * FROM unnest(%(asins)s::text[], %(zips)s::text[]))
 """
 
 
@@ -719,7 +779,8 @@ def _batch_names(conn, rows: list[dict]) -> dict[tuple, str]:
     if not pairs:
         return {}
     with conn.cursor() as cur:
-        cur.execute(_BATCH_OF_SQL, {"pairs": pairs})
+        cur.execute(_BATCH_OF_SQL, {"asins": [a for a, _ in pairs],
+                                    "zips": [z for _, z in pairs]})
         return {(a, z): b for a, z, b in cur.fetchall()}
 
 
@@ -836,6 +897,9 @@ def run(params: dict) -> str:
         if do_wait and sent:
             note, _stuck = _wait_for_batches(sent, _SCRAPE_TIMEOUT_MIN)
             wait_notes.append(note)
+            # 先记落定(写 finished_at),再摄取 —— 这样水位线必晚于落定时刻,
+            # 本轮就能认账。反过来的话这批要白等一轮才判得了失败。
+            _settle_ledger(conn)
             wait_notes.append(_ingest_now())
             settled2, gone2, _blocked2, notes2 = _settle_ledger(conn)
             settled += settled2

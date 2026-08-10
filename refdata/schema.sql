@@ -659,6 +659,14 @@ CREATE OR REPLACE VIEW ops.v_feed_error_stats AS
 CREATE INDEX IF NOT EXISTS feed_items_store_sku_idx ON ops.feed_items (store, sku);
 CREATE INDEX IF NOT EXISTS feed_items_status_idx ON ops.feed_items (status);
 
+-- 两类行,别混:
+--   'product_ingest'          增量导出游标(只在有新数据时前进)
+--   'product_ingest:last_run' 摄取水位线(**每轮跑完都刷,哪怕 0 条**)
+-- 分开是因为 order_audit 要问的不是"取到第几条",而是
+-- **"我有没有资格说'这条数据没到'"**:采集侧批次 completed 只说明它干完了,
+-- 数据还在增量流里。摄取没追上就断言"无快照 ⇒ 采集失败",会把采成功的整批
+-- 冤枉掉(2026-08-10 实测:127 个组合全判失败,紧接着一次 product_ingest
+-- 就把这 127 条全摄了进来),而 failed 不挡重推 ⇒ 下一轮再采一遍,每小时白烧。
 CREATE TABLE IF NOT EXISTS ops.cursors (
     name        text PRIMARY KEY,   -- 如 'order_sync:A085' / 'catalog_sync'
     value       jsonb NOT NULL,

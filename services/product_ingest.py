@@ -214,6 +214,15 @@ def ingest_batch(conn, records: list[dict]) -> dict:
 
 CURSOR_NAME = "product_ingest"
 
+# 「摄取跑到哪儿了」的水位线。**和游标是两件事**:游标只在有新数据时前进,
+# 水位线每次跑完都刷。分开是因为下游要问的问题不是"取到第几条",而是
+# **"我有没有资格说'这条数据没到'"**——
+# 采集侧批次 completed 只说明它干完了,数据还在增量流里;摄取没追上就断言
+# "无快照 ⇒ 采集失败",会把采成功的整批冤枉掉(2026-08-10 实测:127 个组合
+# 全被判失败,紧接着一次 product_ingest 就把这 127 条全摄进来了)。
+# 有了水位线,order_audit 才能只在"摄取确实跑过这个时间点之后"才认账失败。
+WATERMARK_NAME = "product_ingest:last_run"
+
 
 def load_cursor(conn) -> int:
     """输入:连接 → 输出:当前游标(没有记录则 0)。"""
@@ -291,8 +300,28 @@ def pump(scraper, db, *, limit: int = 500, max_pages=None, cursor=None) -> dict:
                         max_pages, cur_pos)
             break
 
+    # 只有**跑完整轮**才刷水位线:中途出错(上面两个 return)不刷,
+    # 否则下游会以为"摄取已追上"而去认账失败——那正是水位线要防的事。
+    with db.pg_conn() as conn:
+        touch_watermark(conn, cur_pos)
     return {"ok": True, "cursor_from": start, "cursor_to": cur_pos,
             "pages": pages, "fetched": fetched, "totals": totals, "error": None}
+
+
+def touch_watermark(conn, cursor_value: int) -> None:
+    """输入:连接 + 当前游标 → 输出:无(刷 ops.cursors 的摄取水位线)。
+
+    **每轮跑完都刷,哪怕 0 条新数据**——这正是它和游标的区别:
+    "这一轮我确实把增量流拉到底了" 与 "游标动没动" 是两个事实,
+    下游要的是前者。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ops.cursors (name, value, updated_at)"
+            " VALUES (%s, jsonb_build_object('cursor', %s::bigint), now())"
+            " ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value,"
+            " updated_at = now()", (WATERMARK_NAME, cursor_value))
+    conn.commit()
 
 
 def pump_summary(res: dict) -> str:

@@ -843,10 +843,21 @@ def test_sql_selects_every_column_the_rules_read():
 #  批次生命周期(完成度判据 = tasks.open == 0 且 screenshots.open == 0)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001"))):
+def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001")),
+               *, reapable=True, caught_up=True):
+    """在途批次 + 可认账批次两段分开喂。
+
+    `reapable=False` = 这批还没落定(或刚落定),不在可认账集合里;
+    `caught_up=False` = 已落定但 product_ingest 还没跑过 —— 数据可能正在
+    增量流里,**这时认账失败就是冤枉**(2026-08-10 实测 127 个组合全军覆没)。
+    """
     return FakeConn({
-        "FROM ops.scrape_batches": (["batch_name", "batch_id", "asin_count"],
-                                    [("wm-audit-10001-x", "7", 2)]),
+        "status IN ('pushed', 'running')":
+            (["batch_name", "batch_id", "asin_count"],
+             [("wm-audit-10001-x", "7", 2)]),
+        "ingest_caught_up":
+            (["batch_name", "batch_id", "ingest_caught_up"],
+             [("wm-audit-10001-x", "7", caught_up)] if reapable else []),
         "state = 'pending' AND batch_name": (["asin", "zip"], list(pending)),
     })
 
@@ -878,7 +889,7 @@ def test_reap_batches_leaves_inflight_alone(wired, monkeypatch):
     """批次还在跑(open > 0)→ 不判失败、不重推,只更新台账状态。
     盲超时重推 = 采集侧正干着我们又推一遍,白烧一批配额。"""
     wf, calls = wired
-    conn = _reap_conn()
+    conn = _reap_conn(reapable=False)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 2}, "screenshots": {"open": 0}})
     monkeypatch.setattr(wf.batches, "pull_failures",
@@ -893,7 +904,7 @@ def test_reap_batches_waits_for_screenshots(wired, monkeypatch):
     """任务采完了但截图还没截完 → 批次未落定。截图也是这批的产出,
     这时认账失败会把一批本来马上就有图的组合判死。"""
     wf, _ = wired
-    conn = _reap_conn()
+    conn = _reap_conn(reapable=False)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 0, "done": 2},
                                    "screenshots": {"open": 2, "done": 0}})
@@ -904,7 +915,7 @@ def test_reap_batches_marks_vanished_batch_failed(wired, monkeypatch):
     """采集侧查不到这个批次了 → 台账落 failed,组合交给兜底超时收尾。"""
     wf, _ = wired
     finished = []
-    conn = _reap_conn()
+    conn = _reap_conn(reapable=False)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: (_ for _ in ()).throw(LookupError("没有")))
     monkeypatch.setattr(wf.batches, "finish",
@@ -918,12 +929,54 @@ def test_reap_batches_marks_vanished_batch_failed(wired, monkeypatch):
 def test_reap_batches_survives_status_outage(wired, monkeypatch):
     """状态查询炸了 → 保持在途,下轮再查。**绝不当成落定去认账失败**。"""
     wf, _ = wired
-    conn = _reap_conn()
+    conn = _reap_conn(reapable=False)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: (_ for _ in ()).throw(RuntimeError("502")))
     monkeypatch.setattr(wf.batches, "finish",
                         lambda *a, **k: pytest.fail("查不动就别落定"))
     assert wf._reap_batches(conn) == (0, 0, [])
+
+
+def test_reap_batches_waits_for_ingest_before_blaming(wired, monkeypatch):
+    """批次已落定但 product_ingest 还没跑过 → **一个组合都不许判失败**。
+
+    2026-08-10 实测的原样重现:127 个组合被判「批次已采完但无快照」,
+    紧接着一次 product_ingest 就把这 127 条原样摄了进来——采集全成功,
+    是我们问早了。批次 completed 只说明采集侧干完了,数据还在增量导出流里。
+
+    代价不止台账写错:failed 不挡重推,下一轮会把这些组合再采一遍,
+    每小时白烧一轮配额,而两侧都不报错。
+    """
+    wf, _ = wired
+    conn = _reap_conn(reapable=True, caught_up=False)
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 2},
+                                   "screenshots": {"open": 0, "done": 2}})
+    monkeypatch.setattr(wf.batches, "pull_failures",
+                        lambda n, bid: pytest.fail("摄取没追上就别去问失败原因"))
+    settled, failed_pairs, notes = wf._reap_batches(conn)
+    assert failed_pairs == 0
+    assert any("等摄取" in n for n in notes)     # 摘要要能看出在等什么
+    assert not [a for s_, a in conn.executed
+                if isinstance(a, dict) and "reason" in a]
+
+
+def test_reap_batches_blames_once_ingest_caught_up(wired, monkeypatch):
+    """摄取水位线越过落定时刻后仍无快照 → 这才是真失败,带真实原因认账。"""
+    wf, _ = wired
+    conn = _reap_conn(reapable=True, caught_up=True)
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 2},
+                                   "screenshots": {"open": 0, "done": 2}})
+    monkeypatch.setattr(wf.batches, "pull_failures",
+                        lambda n, bid: ("captcha×2", {"B0A": "captcha"}))
+    _settled, failed_pairs, _notes = wf._reap_batches(conn)
+    assert failed_pairs == 2
+    reasons = [a["reason"] for s_, a in conn.executed
+               if isinstance(a, dict) and "reason" in a]
+    assert "采集失败:captcha" in reasons          # 有明细的按明细
+    assert any("摄取已追上" in r for r in reasons)  # 没明细的说清是问过之后才判的
+
 
 
 def test_timeout_backstop_spares_inflight_batches():

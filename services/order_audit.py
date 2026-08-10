@@ -31,6 +31,11 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+# 落地价只此一处定义(services/pricing):审核选采购方档位、maintenance 改价、
+# list_new 上架定价,三处都吃「单价 + 运费」。各写各的迟早漂 —— 一处漏运费
+# 就是选错档 / 定价偏低,而全程不报错。
+from services.pricing import landed_price
+
 logger = logging.getLogger("services.order_audit")
 
 # ── 业务常量(所有者定稿 2026-08-09;改这里等于改钱,须所有者确认)──────────────
@@ -159,15 +164,26 @@ def parse_suppliers(records: list[dict], fields) -> list[Supplier]:
     return out
 
 
-def pick_supplier(suppliers: list[Supplier], ship_method, unit_price):
-    """输入:采购方列表 + 亚马逊配送方式 + 亚马逊单价 → 输出:命中的 Supplier(无则 None)。
+def pick_supplier(suppliers: list[Supplier], ship_method, landed_price):
+    """输入:采购方列表 + 亚马逊配送方式 + **亚马逊落地价** → 命中的 Supplier(无则 None)。
 
-    命中条件:配送方式相同(大小写无关)且 单价 落在 [区间起, 区间止] 闭区间内。
-    多个候选取**汇率最低**者(旧系统 采购方匹配.py:80-87 语义,逐字保留:
-    汇率越低采购成本越低,对限价最有利)。
+    命中条件:配送方式相同(大小写无关)且**落地价**落在 [区间起, 区间止]
+    闭区间内。多个候选取**汇率最低**者(旧系统 采购方匹配.py:80-87 语义,
+    逐字保留:汇率越低采购成本越低,对限价最有利)。
+
+    ⚠ 落地价 = **亚马逊单价 + 亚马逊运费**(所有者定稿 2026-08-10),三点澄清:
+    - **不是沃尔玛那边的销售金额**——区间说的是"我们要花多少钱买",
+      跟卖多少钱无关;
+    - **不是单看单价**——25.99 + 12 运费的东西该落进 30+ 那一档,按 25.99
+      去匹配会挑到错的采购方,进而用错汇率,成本算小、本该拒的单被放行;
+    - 与 `walmart_price` 的定价口径同源(那边也是「单价 + 运费」再乘倍率),
+      两处必须一致,否则同一件商品选档和定价各说各话。
+
+    运费没采到(None)时调用方就不该走到这儿:落地价算不出来 ⇒ 匹配不了,
+    绝不 `or 0` 拿单价顶替(那会稳定挑到偏低的一档)。
     """
     m = _text(ship_method).upper()
-    price = _num(unit_price)
+    price = _num(landed_price)
     if not m or price is None:
         return None
     hit = [s for s in suppliers
@@ -262,6 +278,11 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     """
     detail: dict = {"rules": {}}
 
+    # 限价只跟沃尔玛这一侧的商品金额有关(× 0.75),**跟采不采得到、
+    # 有没有匹配到采购方都无关**。所以一进门就算出来落进 detail:
+    # 「无匹配采购方」那些行原先连限价列都是空的,人工复核时连个参照都没有。
+    detail["price_cap"] = price_cap(line.get("product_amount"))
+
     # ① 钓鱼:命中即终局,不看采集、不算限价(采都不用采,省一次请求)
     if is_phishing(line.get("postal_code"), blacklist):
         z = norm_zip(line.get("postal_code"))
@@ -322,29 +343,37 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                            f"配送时长 {int(days)} 天 ≥ {DELIVERY_DAYS_MAX} 天",
                            detail)
 
-    # ⑥ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
-    sup = pick_supplier(suppliers, snap.get("ship_method"), snap.get("amz_price"))
+    # ⑥ 落地价 = 亚马逊单价 + 亚马逊运费。**采购区间按它匹配**,不是按单价,
+    #    更不是按沃尔玛的销售金额(所有者定稿 2026-08-10)。
+    #    运费没采到就停在这儿:落地价算不出来 ⇒ 选不了档也算不出成本。
+    #    绝不 `or 0` —— 那会稳定挑到偏低的一档 + 成本偏小,本该拒的单被放行,
+    #    而改价、下单、飞书全程不报错。
+    landed = landed_price(snap.get("amz_price"), snap.get("shipping"))
+    detail["landed_price"] = landed
+    if landed is None:
+        return AuditResult(MANUAL, "运费没采到,亚马逊落地价算不出来"
+                                   "(选不了采购方档位),已排重采",
+                           detail, rescrape=True)
+
+    # ⑦ 采购方匹配(无命中 → 待人工:没有汇率就算不出成本,不能猜)
+    sup = pick_supplier(suppliers, snap.get("ship_method"), landed)
     if sup is None:
-        detail["rules"]["supplier"] = {"hit": False}
+        detail["rules"]["supplier"] = {"hit": False, "landed": landed}
         return AuditResult(MANUAL,
                            f"无匹配采购方({_text(snap.get('ship_method')).upper()} / "
-                           f"单价 {snap.get('amz_price')}),待人工", detail)
+                           f"落地价 {landed} = 单价 {snap.get('amz_price')}"
+                           f" + 运费 {snap.get('shipping')}),待人工", detail)
     detail["supplier"] = sup.name
     detail["rate"] = sup.rate
-    detail["rules"]["supplier"] = {"hit": True, "name": sup.name, "rate": sup.rate}
+    detail["rules"]["supplier"] = {"hit": True, "name": sup.name, "rate": sup.rate,
+                                   "landed": landed}
 
-    # ⑦ 限价
-    cap = price_cap(line.get("product_amount"))
+    # ⑧ 限价(cap 一进门就算过了,这里只算成本)
+    cap = detail["price_cap"]
     cost = purchase_cost(snap.get("amz_price"), line.get("qty"), sup.rate,
                          snap.get("shipping"))
-    detail["price_cap"] = cap
     detail["cost"] = cost
     detail["rules"]["price"] = {"cap": cap, "cost": cost}
-    if cost is None and snap.get("shipping") is None:
-        # 运费没采到(采集侧 N/A)→ 落地价算不出来。这一条单独报,不然运维
-        # 只看到"算不出"三个字,查不到是哪个输入缺了
-        return AuditResult(MANUAL, "运费没采到,采购成本算不出来,已排重采",
-                           detail, rescrape=True)
     if cap is None or cost is None:
         return AuditResult(MANUAL, "商品金额或采购成本算不出,待人工", detail)
     if not price_ok(cost, cap):

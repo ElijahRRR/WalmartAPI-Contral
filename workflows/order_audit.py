@@ -9,6 +9,7 @@
   python cli.py order_audit -p scrape=0        # 不推采集(只对账 + 判定)
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
   python cli.py order_audit -p wait=1          # 等这批采完 + 就地摄取 + 重判
+  python cli.py order_audit -p refill_shots=1  # 为台账无批次记录的行重采一次(只为补图)
 
 `-p wait=1`(所有者定稿 2026-08-10)——**一条命令出真结论**:
 推采集 → 轮询批次到落定(20 分钟兜底)→ 就地跑增量摄取 → 重新对账重判 →
@@ -73,8 +74,16 @@
   三种结局分别处置:未就绪→本轮不写这一列、下轮再来;失败→记墓碑不再请求;
   done→取图上传飞书换 file_token。**截图从不阻断审核结论**。
 - **运费**取 `fast.shipping`(采集侧同日追加,落 snapshots.shipping 列):
-  FREE→0.0 是"确认免运费",N/A→NULL 是"这次没采到"⇒ **成本算不出来,转待人工**。
-  绝不 `or 0`——当 0 的话成本偏小,本该拒的单被放行,而两侧都不报错。
+  FREE→0.0 是"确认免运费",N/A→NULL 是"这次没采到"⇒ **落地价算不出来,
+  转待人工**。绝不 `or 0`——当 0 的话选到偏低的档、成本偏小,本该拒的单被
+  放行,而两侧都不报错。
+- **采购区间按亚马逊落地价(单价 + 运费)选档**(所有者定稿 2026-08-10):
+  不是裸单价,更不是沃尔玛那边的销售金额——区间说的是"我们要花多少钱买"。
+  与 `walmart_price` 同源(共用 `services.pricing.landed_price`),两处口径
+  必须一致,否则同一件商品选档和定价各说各话。
+- **限价一进门就算**(商品金额 × 0.75),不等采集也不等采购方:它只跟沃尔玛
+  这一侧有关。原先放在采购方命中之后,导致「无匹配采购方」「待采集」的行在
+  飞书上连限价列都是空的,人工复核连参照都没有。
 """
 
 import json
@@ -841,11 +850,57 @@ def _settled_batches(conn, names: set) -> set:
         return {r[0] for r in cur.fetchall()}
 
 
-def _payload(conn, rows: list[dict]) -> dict[str, dict]:
-    """输入:连接 + 已判定行 → 输出:{order_line_id: 飞书审核列载荷}。"""
+
+# 有结论、有 (ASIN,邮编)、但台账里没有对应批次记录的组合 —— 这些行的截图
+# **永远取不回来**:增量导出的记录不带批次名(契约字段表没这一项),
+# 台账 batch_name 是唯一抓手,行没了就只能重采一次重新生成。
+# 只在 -p refill_shots=1 时用:每个组合要烧一次采集配额,不该默认发生。
+_ORPHAN_SHOTS_SQL = """
+SELECT DISTINCT l.audit_detail ->> 'asin' AS asin,
+                l.audit_detail ->> 'zip'  AS zip
+FROM orders.order_lines l
+WHERE l.order_date >= now() - make_interval(days => %(days)s)
+  AND l.audit_status IS NOT NULL
+  AND coalesce(l.audit_detail ->> 'asin', '') <> ''
+  AND coalesce(l.audit_detail ->> 'zip', '')  <> ''
+  {store_filter}
+  AND NOT EXISTS (SELECT 1 FROM ops.audit_scrape a
+                  WHERE a.asin = l.audit_detail ->> 'asin'
+                    AND a.zip  = l.audit_detail ->> 'zip')
+"""
+
+
+def _orphan_pairs(conn, args: dict, store_filter: str) -> list:
+    """输入:连接 + 查询参数 → 输出:[(ASIN, 邮编)] 台账里没有批次记录的组合。
+
+    这些行判定是好的(快照在),缺的只是取图的抓手。**不会自愈** ——
+    judge 只在缺价格/货期/运费时标 rescrape,缺图不标(重采一次只为一张
+    佐证图,不该默认烧配额)。所以要人显式说一声。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_ORPHAN_SHOTS_SQL.format(store_filter=store_filter), args)
+        return [(a, z) for a, z in cur.fetchall() if a and z]
+
+def _payload(conn, rows: list[dict]) -> tuple[dict[str, dict], dict]:
+    """输入:连接 + 已判定行 → 输出:({order_line_id: 飞书审核列载荷}, 截图分布)。
+
+    **截图分布必须回到摘要里**:取不到图这件事以前是一声不吭的
+    (`batch_of.get(...)` 拿到 None 就静默不写这一列),缺一半图只能靠人
+    盯着飞书发现。四个桶各是不同的病,处置也不同:
+
+    - `no_batch` —— 台账里没有这个 (ASIN,邮编) 的批次记录 ⇒ **这张图永远
+      取不回来**。增量导出的记录里不带批次名(契约字段表没有这一项),
+      台账是唯一抓手;台账行被删掉/从未写过,就只能靠重采重新生成。
+      **它不会自愈**:judge 只在缺价格/货期/运费时标 rescrape,缺图不标。
+    - `not_settled` —— 批次还在跑,或 ops.scrape_batches 里没这批的行。下轮再来。
+    - `waiting` —— 图还没截好 / 已记墓碑。下轮再来或就这样了。
+    - `ok` —— 拿到 file_token 写进去了。
+    """
     f = resources.ORDER_SALES_AUDIT.fields
     batch_of = _batch_names(conn, rows)
-    shots = _shot_index(_settled_batches(conn, set(batch_of.values())))
+    settled = _settled_batches(conn, set(batch_of.values()))
+    shots = _shot_index(settled)
+    tally = {"ok": 0, "no_batch": 0, "not_settled": 0, "waiting": 0}
     out: dict[str, dict] = {}
     for r in rows:
         d = _detail(r)
@@ -864,14 +919,21 @@ def _payload(conn, rows: list[dict]) -> dict[str, dict]:
                                      f.title_similarity, key),
         }
         asin = (d.get("asin") or "").upper()
-        batch = batch_of.get((d.get("asin"), d.get("zip")))
-        token = (_screenshot_token(conn, batch, asin,
-                                   shots.get((batch, asin), ""))
-                 if batch and asin else None)
+        token = None
+        if asin and d.get("zip"):
+            batch = batch_of.get((d.get("asin"), d.get("zip")))
+            if not batch:
+                tally["no_batch"] += 1
+            elif batch not in settled:
+                tally["not_settled"] += 1
+            else:
+                token = _screenshot_token(conn, batch, asin,
+                                          shots.get((batch, asin), ""))
+                tally["ok" if token else "waiting"] += 1
         if token:
             fields[f.screenshot] = [{"file_token": token}]
         out[key] = fields
-    return out
+    return out, tally
 
 
 def _yes(v) -> bool:
@@ -887,6 +949,7 @@ def run(params: dict) -> str:
     do_push = str(params.get("push", "1")).lower() not in {"0", "false", "no"}
     do_scrape = str(params.get("scrape", "1")).lower() not in {"0", "false", "no"}
     do_wait = _yes(params.get("wait", ""))
+    refill_shots = _yes(params.get("refill_shots", ""))
 
     blacklist, suppliers = _load_config()
     store_filter = "AND store = ANY(%(stores)s)" if stores else ""
@@ -925,6 +988,13 @@ def run(params: dict) -> str:
 
         # ③ 推采集:一批混邮编,同一 ASIN 的多邮编拆波次
         scrape_note, sent = "", []
+        if do_scrape and refill_shots:
+            # 只为补图而重采:判定本身不需要它们,所以默认关
+            orphans = [p for p in _orphan_pairs(conn, args, store_filter)
+                       if p not in set(want)]
+            if orphans:
+                logger.info("补图重采:%d 个组合台账无批次记录", len(orphans))
+                want = list(want) + orphans
         if do_scrape:
             scrape_note, sent = _push_scrape(conn, want, blocked)
 
@@ -955,6 +1025,7 @@ def run(params: dict) -> str:
 
         # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
         pushed = missing = 0
+        shot_tally: dict[str, int] = {}
         if do_push:
             push_sql = _PUSH_SQL.format(store_filter=store_filter)
             if line_id:
@@ -967,10 +1038,10 @@ def run(params: dict) -> str:
                 cols = [d[0] for d in cur.description]
                 done = [dict(zip(cols, r)) for r in cur.fetchall()]
             if done:
+                fields_by_key, shot_tally = _payload(conn, done)
                 pushed, miss_keys = feishu.update_by_key(
                     resources.ORDER_SALES_AUDIT,
-                    resources.ORDER_SALES_AUDIT.fields.key,
-                    _payload(conn, done))
+                    resources.ORDER_SALES_AUDIT.fields.key, fields_by_key)
                 missing = len(miss_keys)
 
     parts = [f"{audit_note}待审 {len(lines)} 行,落库 {saved}"]
@@ -988,4 +1059,16 @@ def run(params: dict) -> str:
     if do_push:
         parts.append(f"飞书回写 {pushed} 行"
                      + (f",{missing} 行尚未建出(等 order_center_push)" if missing else ""))
+        if shot_tally:
+            bits = [f"已贴 {shot_tally['ok']}"]
+            if shot_tally["not_settled"]:
+                bits.append(f"批次未落定 {shot_tally['not_settled']}")
+            if shot_tally["waiting"]:
+                bits.append(f"等图/已放弃 {shot_tally['waiting']}")
+            if shot_tally["no_batch"]:
+                # 唯一一个不会自愈的桶:台账没批次记录 = 抓手没了,
+                # 只能 -p refill_shots=1 重采一次重新生成
+                bits.append(f"**无批次记录 {shot_tally['no_batch']}**"
+                            f"(取不回来,需 -p refill_shots=1 重采)")
+            parts.append("截图:" + ",".join(bits))
     return ";".join(parts)

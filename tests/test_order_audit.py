@@ -1288,3 +1288,88 @@ def test_num_coerces_or_drops(wired, raw, want):
     wf, _ = wired
     got = wf._num(raw, "亚马逊单价", "PO1|SKU1")
     assert got == want or (got is None and want is None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  采购区间按**亚马逊落地价**(单价 + 运费)选档(所有者定稿 2026-08-10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_BANDED = rules.parse_suppliers([
+    _rec(name="低档", m="FBA", lo=0, hi=50, rate=1.30),
+    _rec(name="高档", m="FBA", lo=50, hi=200, rate=1.05),
+], FIELDS)
+
+
+def test_supplier_band_uses_landed_price_not_unit_price():
+    """单价 45 + 运费 10 = 落地价 55 ⇒ 该进 [50,200] 那档,不是 [0,50]。
+
+    按裸单价选档会挑到「低档」,于是用错汇率(1.30 而不是 1.05),
+    成本算出来偏大或偏小都可能,而选档、定价、飞书全程不报错。
+    """
+    res = rules.judge(LINE, _snap(amz_price=45, shipping=10), _BANDED, set())
+    assert res.detail["landed_price"] == 55.0
+    assert res.detail["supplier"] == "高档"
+    assert res.detail["rate"] == 1.05
+
+
+def test_supplier_band_ignores_walmart_sale_amount():
+    """区间说的是"我们要花多少钱买",跟沃尔玛卖多少钱无关。
+
+    沃尔玛售价 999 而亚马逊落地价 30 ⇒ 仍选低档。拿销售金额选档
+    等于把利润高的单一律推到高价档,选到错的汇率。
+    """
+    line = {**LINE, "product_amount": 999}
+    res = rules.judge(line, _snap(amz_price=20, shipping=10), _BANDED, set())
+    assert res.detail["landed_price"] == 30.0
+    assert res.detail["supplier"] == "低档"
+
+
+def test_supplier_band_boundary_is_closed_on_landed():
+    """区间是**闭**区间,落地价压在端点上时两档都命中 → 按既有规则取汇率最低者。
+
+    这里 50.0 同时落在 [0,50] 和 [50,200],1.05 < 1.30 ⇒ 高档。
+    换成落地价选档并没有动这条消歧规则,只是换了拿去比的那个数。
+    """
+    res = rules.judge(LINE, _snap(amz_price=40, shipping=10), _BANDED, set())
+    assert res.detail["landed_price"] == 50.0
+    assert res.detail["supplier"] == "高档"     # 汇率最低者胜,不是"先命中者"
+
+
+def test_missing_shipping_blocks_supplier_pick():
+    """运费没采到 ⇒ 落地价算不出来 ⇒ **选不了档**,待人工 + 重采。
+
+    绝不 `or 0` 拿单价顶替:那会稳定挑到偏低的一档,汇率错、成本偏小,
+    本该拒的单被放行,而全程不报错(采集契约不变量 3b)。
+    """
+    res = rules.judge(LINE, _snap(shipping=None), _BANDED, set())
+    assert res.status == rules.MANUAL and res.rescrape is True
+    assert "落地价" in res.note and "运费" in res.note
+    assert res.detail["landed_price"] is None
+    assert "supplier" not in res.detail          # 没瞎猜一个档位出来
+
+
+def test_free_shipping_is_zero_not_missing():
+    """FREE → 0.0 是"确认免运费"这条真信息,落地价 = 单价,照常选档。"""
+    res = rules.judge(LINE, _snap(amz_price=30, shipping=0), _BANDED, set())
+    assert res.detail["landed_price"] == 30.0 and res.detail["supplier"] == "低档"
+
+
+# ── 限价与采购方解耦 ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("snap,why", [
+    (None, "没快照"),
+    ({"asin": "B0TEST0001", "zip": "10001", "amz_price": 9999, "shipping": 0,
+      "stock_qty": 1, "ship_method": "FBM", "ship_days": 3, "seller": "x",
+      "outcome": "ok", "amz_title": LINE["product_name"],
+      "scraped_at": "2026-08-09T00:00:00Z"}, "无匹配采购方"),
+])
+def test_price_cap_filled_regardless_of_supplier(snap, why):
+    """限价只跟沃尔玛这侧的商品金额有关(× 0.75),**跟有没有采购方无关**。
+
+    原先限价是在采购方命中之后才算的,于是「无匹配采购方」「待采集」这些行
+    在飞书上连限价列都是空的 —— 人工复核时连个参照都没有,而这个数根本不
+    需要等采集。
+    """
+    res = rules.judge(LINE, snap, SUPPLIERS, set())
+    assert res.status == rules.MANUAL, why
+    assert res.detail["price_cap"] == 75.0        # 100 × 0.75

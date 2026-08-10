@@ -71,7 +71,7 @@
   在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
   **落定判据不含 `screenshots.open`**(2026-08-10 所有者实测后改):失败任务
   的截图槽位不会再有人去截,shots_open 永久 >0,带上它就永远落不定。
-  `-p wait=1` 在数据齐了之后另给截图 60 秒宽限,到点照常出结论,图下轮补贴。
+  `-p wait=1` 在数据齐了之后另给截图 180 秒宽限,到点照常出结论,图下轮补贴。
 - **`outcome` 是粗粒度的,真实原因看 `error_type`**(所有者 2026-08-10 澄清):
   增量导出里一条 `outcome="parse_failed"` 底下可能是 network / timeout /
   parse_error 任意一种,只有 `/api/batches/{id}/failures` 的 error_type 说得准。
@@ -139,9 +139,10 @@ _AUTO_RETRY_SETTLE_MIN = 15    # 批次 tasks.open 归零后还要稳住这么�
                                # (每轮间隔 5 分钟),归零**不代表最终**——所有者
                                # 2026-08-10 澄清。这道闸只管"认账失败",不影响
                                # 快照到了就 done,也不影响 -p wait=1 何时收工
-_SHOT_GRACE_SEC = 60           # 数据采完后额外等截图的上限。**截图不是落定条件**
-                               # (任务失败后它那张图永远不会好,当闸会永久卡住),
-                               # 只是"顺手多等一会儿能这轮就贴上"
+_SHOT_GRACE_SEC = 180          # 数据采完后额外等截图的上限(所有者定稿 2026-08-10)。
+                               # **截图不是落定条件**(任务失败后它那张图永远不会
+                               # 好,当闸会永久卡住),只是"顺手多等一会儿能这轮
+                               # 就贴上"。到点照常出结论,图下轮补
 
 # 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
 _PICK_SQL = """
@@ -696,31 +697,41 @@ def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
         return "", 0
     started = time.monotonic()
     deadline = started + timeout_min * 60
-    pending = set(names)
+    pending = set(names)        # 数据还没落定的
+    gone: set = set()           # 采集侧查不到的:别再问
+    shots: dict = {}            # 批次名 → 该批还有几张图没截完(问到就刷新)
     shots_deadline = None
     delay = 3.0
     while time.monotonic() < deadline:
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 1.5, 30.0)
-        open_shots = 0
-        for name in sorted(pending):
+        # 数据没齐:只问没落定的(省请求)。
+        # 数据齐了:**把所有批次再问一遍**——shots 要的是"此刻还剩几张",
+        # 而先落定那些批次的计数还停在它落定那一刻,早就过期了。
+        # (原先只累加"本轮新落定的",于是 A 先落定带着 2 张图没好、B 后落定
+        #  带 0 张,总数就算成 0 直接收工,A 那 2 张白白错过一轮。)
+        targets = pending or (set(names) - gone)
+        for name in sorted(targets):
             try:
                 st = scraper.batch_status(name)
             except LookupError:
                 # 采集侧查不到了:再等也没意义,交给对账那层认账
                 pending.discard(name)
+                gone.add(name)
+                shots.pop(name, None)
                 continue
             except Exception as e:                  # 查不动:下一轮再问
                 logger.warning("等批次 %s:状态查询失败(继续等):%s", name, e)
                 continue
+            shots[name] = batches.shots_open(st)
             if batches.is_settled(st):
-                open_shots += batches.shots_open(st)
                 pending.discard(name)
         if pending:
             logger.info("等采集:%d/%d 批已落定,继续等(已 %.0f 秒)",
                         len(names) - len(pending), len(names),
                         time.monotonic() - started)
             continue
+        open_shots = sum(shots.values())
         # 数据都齐了。截图**只给一小段宽限**,绝不当落定条件。
         # 2026-08-10 实测:一个 variant_offset 的**任务**其实是最快到终态的
         # (cap=1,首次上报即 failed,tasks.open 立刻减一,不拖慢批次);
@@ -736,7 +747,7 @@ def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
             logger.info("截图宽限用尽(%d 张仍未完成),先出结论;"
                         "图后来好了下轮补贴", open_shots)
             break
-        pending = set(names)          # 宽限期内继续问,好了就早点收工
+        # 宽限期内继续问(targets 已经会覆盖所有未 gone 的批次),好了就早收工
     mins = (time.monotonic() - started) / 60
     if pending:
         return (f"等采集:{len(names) - len(pending)}/{len(names)} 批落定,"

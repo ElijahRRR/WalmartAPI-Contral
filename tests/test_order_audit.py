@@ -1519,3 +1519,93 @@ def test_reap_waits_for_the_stability_window():
     from workflows import order_audit as wf
     assert "b.finished_at < now() - make_interval(mins => %(stable)s)" in wf._REAPABLE_SQL
     assert wf._AUTO_RETRY_SETTLE_MIN >= 15      # server 自动重试 2 轮 × 5 分钟
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  等待循环的截图宽限(所有者定稿 2026-08-10:180 秒)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _FakeTime:
+    """假时钟:sleep 只推进虚拟时间。真时钟下 180 秒宽限没法测。"""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    from workflows import order_audit as wf
+    c = _FakeTime()
+    monkeypatch.setattr(wf, "time", c)      # 只换 workflow 里的 time 名字
+    return wf, c
+
+
+def test_grace_counts_all_batches_not_just_newly_settled(clock, monkeypatch):
+    """先落定批次遗留的未截图**必须还算数**。
+
+    原先只累加"本轮新落定的":A 先落定带着 2 张图没好、B 后落定带 0 张,
+    总数就算成 0 直接收工,A 那 2 张白白错过一轮。修法是给每批记当前值,
+    数据一齐就把所有批次再问一遍刷新 —— 这时数字才准,也正是要用它的时候。
+    """
+    wf, c = clock
+    polls = {"b1": 0, "b2": 0}
+
+    def status(name):
+        polls[name] += 1
+        if name == "b1":
+            # 立刻落定,但头两次问它时还有 2 张图没截完
+            return {"stats": {"open": 0},
+                    "screenshots": {"open": 2 if polls["b1"] <= 2 else 0}}
+        # b2 第 2 次才落定,且没有待截的图
+        return {"stats": {"open": 0 if polls["b2"] >= 2 else 1},
+                "screenshots": {"open": 0}}
+
+    monkeypatch.setattr(wf.scraper, "batch_status", status)
+    note, stuck = wf._wait_for_batches(["b1", "b2"], 20)
+    assert stuck == 0 and "全部落定" in note
+    # 关键:b2 落定之后 b1 被重新问过 —— 没有它就会算成 0 张直接收工
+    assert polls["b1"] >= 3
+    assert c.t < wf._SHOT_GRACE_SEC + 60      # 图好了就早收工,没耗满宽限
+
+
+def test_grace_expires_and_stops_waiting(clock, monkeypatch):
+    """图一直好不了 ⇒ 宽限到点就出结论,不拖到 20 分钟兜底。
+
+    任务失败后它那张图永远不会好(shots_open 永久 >0),这条就是防它把
+    -p wait=1 拖满的。
+    """
+    wf, c = clock
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0},
+                                   "screenshots": {"open": 1}})
+    note, stuck = wf._wait_for_batches(["b1"], 20)
+    assert stuck == 0 and "全部落定" in note
+    assert wf._SHOT_GRACE_SEC <= c.t < 20 * 60      # 用满宽限,但远没到兜底
+
+
+def test_grace_is_180_seconds(clock):
+    """宽限时长是所有者定的数,改它必须让本用例红。"""
+    wf, _ = clock
+    assert wf._SHOT_GRACE_SEC == 180
+
+
+def test_vanished_batch_is_not_polled_again(clock, monkeypatch):
+    """采集侧查不到的批次不再问 —— 否则宽限期每轮都为它撞一次 404。"""
+    wf, c = clock
+    polls = []
+
+    def status(name):
+        polls.append(name)
+        if name == "b1":
+            raise LookupError("没有")
+        return {"stats": {"open": 0}, "screenshots": {"open": 0}}
+
+    monkeypatch.setattr(wf.scraper, "batch_status", status)
+    note, stuck = wf._wait_for_batches(["b1", "b2"], 20)
+    assert stuck == 0 and polls.count("b1") == 1

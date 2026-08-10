@@ -80,6 +80,22 @@ ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS delivery_days integer;
 -- shipping_raw 存原始串:出现新形态(如满额免邮门槛)时不必等契约改版。
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping numeric;
 ALTER TABLE catalog.snapshots ADD COLUMN IF NOT EXISTS shipping_raw text;
+-- 存量行回填:两列是新加的,历史快照全是 NULL,而定价链已改成"运费没采到
+-- 就不定价"⇒ 不回填的话上线当天全线停改价、停上架,直到下一轮全量重采完。
+-- 值本来就在 raw.buybox_shipping 里(采集侧 _RAW_DROP 没裁它),所以能就地补。
+-- 映射与采集侧 export_incremental._shipping **逐条对齐**:
+--   FREE(大小写不敏感)→ 0.0 确认免运费;$5.99 → 5.99;其余(N/A/空)→ 保持
+--   NULL = 没采到。**只认 'free' 这一个词**——想再认 'free shipping'/'$0.00'
+--   得先去采集侧确认它真会产出,放宽的代价是把没采到的算成 0。
+UPDATE catalog.snapshots SET
+    shipping_raw = btrim(raw ->> 'buybox_shipping'),
+    shipping = CASE
+        WHEN lower(btrim(raw ->> 'buybox_shipping')) = 'free' THEN 0
+        WHEN btrim(raw ->> 'buybox_shipping') ~ '^\$?[0-9]+(\.[0-9]+)?$'
+            THEN replace(btrim(raw ->> 'buybox_shipping'), '$', '')::numeric
+        ELSE NULL END
+WHERE shipping IS NULL AND shipping_raw IS NULL
+  AND raw ? 'buybox_shipping';
 
 -- 采集结局(契约扩展字段;2026-08-09 补存):outcome ∈ ok/not_found/blocked/
 -- parse_failed/stale。此前只在摄取时计数不落库,导致"这个产品为什么没数据"

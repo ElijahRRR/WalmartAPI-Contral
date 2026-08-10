@@ -180,3 +180,33 @@ def test_failed_rows_requeue_until_cap(monkeypatch):
     # 重新排队的行要看起来像新行(主链才会走领 UPC → 提交)
     assert retry[0]["feed_id"] == "" and retry[0]["list_result"] == ""
     assert ln._retry_rows([_sheet_row(2)]) == ([], [])
+
+
+def test_list_new_skips_when_shipping_missing(monkeypatch):
+    """运费没采到 ⇒ 落地价算不出来 ⇒ 不上架(所有者定稿 2026-08-10)。
+
+    与"配送方式未知不定价"同一个道理:当 0 定出来的价偏低,越贵的运费亏得
+    越多,而上架成功、价格看着也正常,两侧都不会报错。
+    """
+    rows = [_sheet_row(rownum=2, store="T1", asin="B0HASSHIP"),
+            _sheet_row(rownum=3, store="T1", asin="B0NOSHIP")]
+    base = {"title": "T", "price": 20.0, "stock": 50,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
+    products = {
+        "B0HASSHIP": {**base, "asin": "B0HASSHIP", "shipping": 3.0},
+        "B0NOSHIP": {**base, "asin": "B0NOSHIP", "shipping": None},
+    }
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), set(), {"banned_pts": set(), "brands": set()}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "运费未采到" in out
+    assert "共 1 行将进入" in out        # 只有带运费那行进得去

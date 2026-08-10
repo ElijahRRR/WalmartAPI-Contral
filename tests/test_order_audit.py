@@ -717,6 +717,24 @@ def test_shot_index_keys_by_batch_and_asin(wired, monkeypatch):
     assert len(idx) == 4
 
 
+def test_settled_batches_skips_inflight(wired, monkeypatch):
+    """在途批次不去问截图:一轮上百个按邮编的批次,少了这道过滤就是每轮
+    多发上百个必然空手而归的清单请求。"""
+    wf, _ = wired
+    conn = FakeConn({"FROM ops.scrape_batches": (["batch_name"],
+                                                 [("wm-audit-10001-x",)])})
+    assert wf._settled_batches(conn, {"wm-audit-10001-x",
+                                      "wm-audit-90210-y", None}) == {
+        "wm-audit-10001-x"}
+    sql, args = conn.executed[0]
+    assert "NOT IN ('pushed', 'running')" in sql
+    assert None not in args["names"]
+    # 一个批次名都没有时不该白发一次查询
+    empty = FakeConn({})
+    assert wf._settled_batches(empty, {None}) == set()
+    assert empty.executed == []
+
+
 def test_shot_index_survives_scraper_outage(wired, monkeypatch):
     """清单查不到只当"这批本轮没有图"——截图是佐证材料,永不阻断审核结论。"""
     wf, _ = wired

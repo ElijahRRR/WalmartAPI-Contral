@@ -52,11 +52,20 @@ def base_url() -> str:
     return v
 
 
+_warned_no_token = False
+
+
 def _headers() -> dict:
+    global _warned_no_token
     token = os.environ.get("SCRAPER_EXPORT_TOKEN", "").strip()
     if not token:
         # 契约:鉴权可选,采集侧没配 EXPORT_TOKEN 时放行。公网部署必须配。
-        logger.warning("SCRAPER_EXPORT_TOKEN 未配置,导出请求不带鉴权头")
+        # **每进程只喊一次**:订单审核一轮要推上百个按邮编的批次,每请求一行
+        # 告警会把真正该看的日志(推了哪些批次、哪些失败)整个淹掉。
+        if not _warned_no_token:
+            logger.warning("SCRAPER_EXPORT_TOKEN 未配置,本进程所有采集请求"
+                           "都不带鉴权头(公网部署必须配)")
+            _warned_no_token = True
         return {}
     return {"X-Export-Token": token}
 

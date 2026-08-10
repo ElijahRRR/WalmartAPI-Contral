@@ -635,11 +635,30 @@ def _batch_names(conn, rows: list[dict]) -> dict[tuple, str]:
         return {(a, z): b for a, z, b in cur.fetchall()}
 
 
+# 在途批次里没有图可拿(截图和任务一起在跑),问了也是白问。
+# **一个邮编一个批次意味着一轮能有上百个批次**,少了这道过滤就是每轮多发
+# 上百个必然空手而归的清单请求。
+_SETTLED_BATCH_SQL = """
+SELECT batch_name FROM ops.scrape_batches
+WHERE batch_name = ANY(%(names)s) AND status NOT IN ('pushed', 'running')
+"""
+
+
+def _settled_batches(conn, names: set) -> set:
+    """输入:连接 + 批次名集合 → 输出:其中已不在途的那些(值得去问截图的)。"""
+    real = [n for n in names if n]
+    if not real:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(_SETTLED_BATCH_SQL, {"names": real})
+        return {r[0] for r in cur.fetchall()}
+
+
 def _payload(conn, rows: list[dict]) -> dict[str, dict]:
     """输入:连接 + 已判定行 → 输出:{order_line_id: 飞书审核列载荷}。"""
     f = resources.ORDER_SALES_AUDIT.fields
     batch_of = _batch_names(conn, rows)
-    shots = _shot_index(set(batch_of.values()))
+    shots = _shot_index(_settled_batches(conn, set(batch_of.values())))
     out: dict[str, dict] = {}
     for r in rows:
         d = _detail(r)

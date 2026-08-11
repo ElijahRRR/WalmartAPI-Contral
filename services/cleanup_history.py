@@ -92,11 +92,15 @@ def timeline(rows: list[dict]) -> tuple[list[dict], dict]:
 def parse_seen(obj) -> list[tuple[str, str]]:
     """输入:seen_sku_categories.json 反序列化结果 → 输出:[(sku, 类别码)]。
 
-    旧文件形态待生产机实证,先兼容两种最可能的:
+    真实形态(legacy_survey.md:1350,2026-08-11 生产实证):
+      {"seen": [[SKU, 归类代码], ...]}    平铺对外包一层 "seen" 键
+    另兼容两种退化形态(防旧脚本中途改版):
       {"SKU1": ["C", "E"], ...}          sku → 类别列表
-      [["SKU1", "C"], ["SKU1", "E"], ...] 平铺对
+      [["SKU1", "C"], ...]               裸平铺对
     其余形态直接抛错报出真实形状——猜错静默丢对,累计数就永远对不上了。
     """
+    if isinstance(obj, dict) and isinstance(obj.get("seen"), list):
+        return parse_seen(obj["seen"])
     if isinstance(obj, dict) and ("processed_asins" in obj
                                   or "pending_batches" in obj):
         # 2026-08-11 生产实操差点踩到:seen/brand 两个 -p 参数传反时,

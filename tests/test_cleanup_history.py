@@ -94,6 +94,17 @@ def test_code_name_maps_stay_in_sync_with_rules():
 
 # ── 两个 JSON 的解析(形态待生产机实证,认不出抛错不猜)───────────────────────
 
+def test_parse_seen_real_shape_wrapped_in_seen_key():
+    """真实形状(legacy_survey.md:1350):{"seen": [[SKU, 码], ...]}。
+
+    2026-08-11 生产实证:预设的两种形态都不是真的,第一版把 "seen" 当 SKU、
+    整个对列表当类别,解析出 0 对——幸好有非空零解析的护栏拦住。
+    教训:摸底文档里明明写了形状,写解析器前先 grep legacy_survey。
+    """
+    obj = {"seen": [["B0A", "C"], ["B0A", "E"], ["B0B", "K"]]}
+    assert ch.parse_seen(obj) == [("B0A", "C"), ("B0A", "E"), ("B0B", "K")]
+
+
 def test_parse_seen_both_shapes():
     assert sorted(ch.parse_seen({"B0A": ["C", "E"], "B0B": "品牌"})) == \
         [("B0A", "C"), ("B0A", "E"), ("B0B", "C")]

@@ -215,17 +215,17 @@ def _rebuild_brand(do_apply: bool) -> str:
         c = blacklist.channel_counts(conn)
         if not do_apply:
             filled = _next_empty(sheet) - 2
-            return (f"品牌渠道重建预览:时间线 C/E 最新类 ASIN "
-                    f"{c['with_brand'] + c['no_brand']} 个,可解析品牌 "
-                    f"{c['brands']} 个(缺品牌 ASIN {c['no_brand']} 个,"
-                    f"等 product_ingest 补齐后由日常链路自然入账);"
-                    f"beyKyi 现有 {filled} 行将被整表重写为 {c['brands']} 行;"
+            return (f"品牌渠道重建预览:①总表认领——沃尔玛来源品牌 "
+                    f"{c['master']} 个(旧系统后台收集的历史,日期原样);"
+                    f"②时间线推导——C/E 最新类 ASIN "
+                    f"{c['with_brand'] + c['no_brand']} 个,采集库可解析品牌 "
+                    f"{c['brands']} 个;beyKyi 现有 {filled} 行将整表重写为"
+                    f"两腿去重后的行数(≤{c['master'] + c['brands']});"
                     f"加 -p apply=1 执行")
         st = blacklist.rebuild_brand_channel(conn)
     n = _rewrite_sheet(sheet, _CHANNEL_ALL, _CHANNEL_MARK_ALL)
-    return (f"品牌渠道重建:渠道表擦净 {st['wiped']} 行 → 重灌 "
-            f"{st['brands']} 个品牌;beyKyi 整表重写 {n} 行"
-            f"(缺品牌 ASIN {c['no_brand']} 个等补齐后自然入账)")
+    return (f"品牌渠道重建:擦净 {st['wiped']} 行 → 总表认领 {st['seeded']} 个"
+            f" + 时间线推导 {st['derived']} 个;beyKyi 整表重写 {n} 行")
 
 
 def _rebuild_asin(do_apply: bool) -> str:

@@ -240,12 +240,31 @@ def rebuild_asin_blacklist(conn) -> dict:
 
 # ── 品牌渠道重建(blacklist_push -p rebuild_brand=1,一次性)───────────────────
 #
-# 渠道表从时间线整体重灌:C/E 最新类 ASIN × catalog.products.brand,
-# 每品牌取**最早**报错日当 added_date(渠道账是"何时首次发现")。
-# 绕过 ops.dedupe——那本账管"这个 ASIN 别重复采集",不管"渠道该不该记账";
-# 历史 2,573 个已处理 ASIN 的品牌正是被它挡在渠道外的(建模缺陷,已修)。
+# 两条腿,先认领后推导,同键 DO NOTHING(认领的历史日期优先):
+#
+# ① **从总表认领**:旧系统后台收集的品牌当年写进旧「禁止品牌收集」表,
+#   来源列固定「沃尔玛-品牌限制/沃尔玛-侵权/沃尔玛后台」(legacy_survey:1360),
+#   经所有者归拢进总表、risk_sync 镜像进 brand_blacklist——来源以「沃尔玛」
+#   开头的镜像行**就是**历史沃尔玛渠道,零成本直接认领。不这么做的话只能
+#   为 2,701 个历史 ASIN 补采(采集侧保留期早裁掉了,2026-08-11 实证
+#   catalog.products 只命中 1 个)。
+# ② **从时间线推导**:C/E 最新类 ASIN × catalog.products.brand,每品牌取
+#   最早报错日当 added_date。绕过 ops.dedupe——那本账管"这个 ASIN 别重复
+#   采集",不管"渠道该不该记账"。
 
 _CHANNEL_WIPE_SQL = "DELETE FROM catalog.brand_err_hits"
+
+_CHANNEL_SEED_SQL = """
+INSERT INTO catalog.brand_err_hits (brand_key, brand, source, added_date)
+SELECT brand_key, brand, source, added_date
+FROM catalog.brand_blacklist
+WHERE source LIKE '沃尔玛%%'
+ON CONFLICT (brand_key) DO NOTHING
+"""
+
+_MASTER_WM_COUNT_SQL = """
+SELECT count(*) FROM catalog.brand_blacklist WHERE source LIKE '沃尔玛%%'
+"""
 
 _CHANNEL_COUNT_SQL = _LATEST_CTE + """
 SELECT count(*) FILTER (WHERE coalesce(btrim(p.brand), '') <> ''),
@@ -279,14 +298,19 @@ def channel_counts(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute(_CHANNEL_COUNT_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
         with_brand, no_brand, brands = cur.fetchone()
-    return {"with_brand": with_brand, "no_brand": no_brand, "brands": brands}
+        cur.execute(_MASTER_WM_COUNT_SQL)
+        master = cur.fetchone()[0]
+    return {"with_brand": with_brand, "no_brand": no_brand,
+            "brands": brands, "master": master}
 
 
 def rebuild_brand_channel(conn) -> dict:
-    """输入:连接 → 输出:{wiped, brands}。擦净重灌(渠道表是时间线的投影,
-    投影可以重投——与 cleanup_history_import 事件侧同一权衡)。"""
+    """输入:连接 → 输出:{wiped, seeded, derived}。擦净重灌(渠道表是
+    历史的投影,投影可以重投);先认领(真历史日期)后推导(补漏)。"""
     with conn.cursor() as cur:
         cur.execute(_CHANNEL_WIPE_SQL)
         wiped = cur.rowcount or 0
+        cur.execute(_CHANNEL_SEED_SQL)
+        seeded = cur.rowcount or 0
         cur.execute(_CHANNEL_REBUILD_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
-        return {"wiped": wiped, "brands": cur.rowcount or 0}
+        return {"wiped": wiped, "seeded": seeded, "derived": cur.rowcount or 0}

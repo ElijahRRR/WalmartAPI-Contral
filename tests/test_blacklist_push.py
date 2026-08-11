@@ -216,33 +216,44 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
 # ── 品牌渠道重建(一次性:清错版内容 + 从时间线重灌)──────────────────────────
 
 def test_rebuild_brand_preview_does_not_write(wired, monkeypatch):
-    """预览只报数:渠道规模 + beyKyi 现有行数 + 将重写成多少行,零写入。"""
+    """预览只报数:总表认领腿 + 时间线推导腿 + beyKyi 现有行数,零写入。"""
     calls, cells = wired
     cells["brand"] = ["a", "b", "c"]
     monkeypatch.setattr(wf.blacklist, "channel_counts",
                         lambda conn: {"with_brand": 2573, "no_brand": 129,
-                                      "brands": 1800})
+                                      "brands": 1800, "master": 2609})
     out = wf.run({"rebuild_brand": "1"})
-    assert "可解析品牌 1800 个" in out and "现有 3 行" in out
-    assert "整表重写为 1800 行" in out and "apply=1" in out
+    assert "沃尔玛来源品牌 2609 个" in out and "可解析品牌 1800 个" in out
+    assert "现有 3 行" in out and "≤4409" in out and "apply=1" in out
     assert calls["writes"] == [] and calls["marked"] == []
 
 
+def test_channel_seed_claims_only_walmart_sourced_master_rows():
+    """认领腿 SQL 钉死:只认来源「沃尔玛…」的总表镜像行(旧后台收集的
+    历史渠道),DO NOTHING 不覆盖;条件放宽 = 把别的渠道也复制进来,
+    又回到②号错版。"""
+    from services import blacklist as bl
+    assert "LIKE '沃尔玛%%'" in bl._CHANNEL_SEED_SQL
+    assert "ON CONFLICT (brand_key) DO NOTHING" in bl._CHANNEL_SEED_SQL
+    assert "INSERT INTO catalog.brand_err_hits" in bl._CHANNEL_SEED_SQL
+
+
 def test_rebuild_brand_apply_overwrites_and_marks_all(wired, monkeypatch):
-    """apply:渠道表重灌 → beyKyi 整表重写(表头 + 全量数据行,错版残留
+    """apply:认领+推导重灌 → beyKyi 整表重写(表头 + 全量数据行,错版残留
     由 sheet_overwrite 的尾部裁剪清掉)→ 全表打水位。"""
     calls, cells = wired
     overwritten = []
     monkeypatch.setattr(wf.blacklist, "channel_counts",
-                        lambda conn: {"with_brand": 3, "no_brand": 1, "brands": 2})
+                        lambda conn: {"with_brand": 3, "no_brand": 1,
+                                      "brands": 2, "master": 0})
     monkeypatch.setattr(wf.blacklist, "rebuild_brand_channel",
-                        lambda conn: {"wiped": 42064, "brands": 2})
+                        lambda conn: {"wiped": 42064, "seeded": 0, "derived": 2})
     monkeypatch.setattr(wf.feishu, "sheet_overwrite",
                         lambda s, rows: overwritten.append(rows) or len(rows))
     calls["channel_rows"] = [("Nike", "沃尔玛-品牌", "2026-04-20", "B0A"),
                              ("Sony", "沃尔玛-知产", "2026-05-01", None)]
     out = wf.run({"rebuild_brand": "1", "apply": "1"})
-    assert "重灌 2 个品牌" in out and "整表重写 2 行" in out
+    assert "时间线推导 2 个" in out and "整表重写 2 行" in out
     rows = overwritten[0]
     assert len(rows) == 3               # 表头 + 2 数据行
     assert rows[1] == ["Nike", "沃尔玛-品牌", "2026-04-20", "B0A"]

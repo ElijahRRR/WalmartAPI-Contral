@@ -80,16 +80,17 @@ def test_push_appends_after_existing_rows(wired):
     assert ups[0][1] == [["B0NEW", "沃尔玛-禁售", "2026-08-11"]]
 
 
-def test_push_marks_watermark_per_block(wired):
-    """每块写成功当场打 pushed_at——250 行 3 块就打 3 次,攒最后一起提交
+def test_push_marks_watermark_per_block(wired, monkeypatch):
+    """每块写成功当场打 pushed_at——8500 行 3 块就打 3 次,攒最后一起提交
     的话中途崩 = 全部重推。"""
     calls, _ = wired
+    monkeypatch.setattr(wf.time, "sleep", lambda s: None)
     calls["asin_pending"] = [(f"B{i:04d}", "沃尔玛-禁售", "2026-08-11")
-                             for i in range(1250)]
+                             for i in range(8500)]
     out = wf.run({})
-    assert "ASIN 表 +1250 行(3 块)" in out
+    assert "ASIN 表 +8500 行(3 块)" in out
     asin_marks = [k for w, k in calls["marked"] if w == "asin"]
-    assert [len(k) for k in asin_marks] == [500, 500, 250]
+    assert [len(k) for k in asin_marks] == [4000, 4000, 500]
     assert asin_marks[0][0] == "B0000"
 
 
@@ -202,7 +203,9 @@ def test_probe_warns_on_watermark_mismatch(wired):
 
 
 def test_block_size_stays_within_feishu_limit():
-    """单请求 ≤500 行是飞书实测硬限(90202,maint_sheet._APPEND_BLOCK 同源)。
-    谁把 _BLOCK 调大都必须先过这条。"""
-    from services.maint_sheet import _APPEND_BLOCK
-    assert wf._BLOCK <= _APPEND_BLOCK == 500
+    """块大小与 api 层同源:sheet_write_ranges 内部按 4000 行自动切
+    (_SHEET_WRITE_BLOCK_ROWS,在线产品总表 13 万行实证;真硬限是单请求
+    载荷 ~4MB,20 列×5000 行撞 90227)。_BLOCK 超过 4000 只是白切——
+    水位块会被 api 层拆成多个请求,"每块成功即打水位"的粒度就虚了。"""
+    from api.feishu import _SHEET_WRITE_BLOCK_ROWS
+    assert wf._BLOCK <= _SHEET_WRITE_BLOCK_ROWS == 4000

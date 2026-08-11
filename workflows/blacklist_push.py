@@ -5,8 +5,8 @@
   python cli.py blacklist_push -p probe=1   # 只读体检:接线/子表身份/已填行数/
                                             # 水位对账。换表格、怀疑"写了看不见"
                                             # 时先跑这个——它回读飞书 API 真值
-  python cli.py blacklist_push -p limit=500 # 单轮上限(默认不限——限制来自
-                                            # 飞书单请求 500 行,分块自动切)
+  python cli.py blacklist_push -p limit=500 # 单轮总量上限(默认不限;
+                                            # 单请求 4000 行分块自动切)
 
 方向只有一个:PG → 飞书(PG 权威,表是人机界面;所有者建表时明说
 "用于数据库的映射")。**人不直接编辑这两张表**,人工登记走旧「禁止品牌
@@ -40,8 +40,11 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.blacklist_push")
 
-_BLOCK = 500          # 单块行数 = 飞书单请求实测上限(更大会被 90202 拒,
-                      # maint_sheet._APPEND_BLOCK 同源实证);块间 0.2s 节流
+_BLOCK = 4000         # 单块行数,与 api 层 sheet_overwrite 同源(13 万行在线
+                      # 产品总表实证):真硬限是单请求载荷 ~4MB(20 列×5000 行
+                      # 撞 90227),本表 3-4 列短字段远不到。曾误设 500——那是
+                      # maint_sheet 在 90202 事故(真凶是控制字符,_scrub 已修)
+                      # 当天的应急值,不是接口上限。块间 0.2s 节流
 
 _ASIN_PENDING = """
 SELECT asin, source, created_at::date::text
@@ -145,7 +148,7 @@ def _append(sheet, rows: list[list], mark, keys: list) -> tuple[int, int]:
         written += len(block)
         blocks += 1
         if i + _BLOCK < len(rows):
-            time.sleep(0.2)             # 5.6 万行 ≈ 114 个请求,别打成突刺
+            time.sleep(0.2)             # 5.6 万行 ≈ 15 个请求,别打成突刺
     return written, blocks
 
 

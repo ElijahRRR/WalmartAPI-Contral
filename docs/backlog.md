@@ -60,9 +60,9 @@
 
 | 旧 Step | 状态 | 说明 |
 |---|---|---|
-| Step 0 监管合规删除(飞书 eGjQRX) | ⬜ | 完全缺失。plan 称由 product_clear 的停用删除表承担,但旧表 F 列幂等锚点无人继承;旧逻辑 dry-run 下整段跳过,需重写成可预览(`docs/legacy_survey.md:1361,1447,1474`) |
+| Step 0 监管合规删除(飞书 eGjQRX) | ✅ | **不迁**(所有者拍板 2026-08-11:与 product_clear 是同一能力,不再另做——删除/停用登记走「商品停用删除表」一条通道;旧表 eGjQRX 与其 F 列幂等锚点随旧系统退役) |
 | Step 1/1.5/1.6/2 识别/反补/停用/删除 | ✅ | `problem_product_cleanup`,2026-08-07 生产验收 |
-| Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ⬜🔴 | 未迁;"累计语义保不保留"未决,历史口径会跳变(`legacy_survey.md:1358-1362,1472`) |
+| Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ✅ | **不迁**(所有者拍板 2026-08-11:以后需要数据让 AI 直接读库,不再维护飞书报表)。"累计语义保不保留"之争随之消解——且事实上口径早已动过:BIZ-CN 已独立成维度,旧口径本就没被逐字沿用 |
 | Step 6 品牌采集 | ✅ | 2026-08-11 生产验收:brand_err_hits 渠道表 + beyKyi 2,012 行;缺口补采走 brand_scrape(预览→推采→摄取→入账闭环) |
 | Step 7 黑名单同步 | ✅ | 2026-08-11 生产验收:ASIN 表按标准 asin 整表重写 56,812 行 |
 
@@ -103,6 +103,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ `catalog.products` 十列死列:audit_* 五列 + assigned_upc/listing_attrs/last_feed_id/store/owner——职责被飞书上架表、catalog.upc_pool、catalog.llm_cache 三处各自顶掉
 - ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
 - ⬜ 只写不读的列:`ops.perf_problem_orders` 14 个业务列(唯一读方只 count)、`ops.scrape_failures` 的 status/error_detail/retry_count、`catalog.snapshots.completeness_ok`、`catalog.llm_cache.hit_count/last_hit_at`(说好的低频清理器未写)
+- ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)

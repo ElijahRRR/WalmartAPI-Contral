@@ -33,6 +33,13 @@ def extract_asin(sku) -> str | None:
     return m.group(1) if m else None
 
 
+def is_standard_asin(v) -> bool:
+    """输入:候选码 → 输出:是否标准 ASIN(10 位含字母)。推送采集前的
+    过滤闸:非标准码(纯数字 item id / 11 位源头码 / 原文兜底)推去采集
+    只会永远采不到 → 永远缺品牌 → 永远再推,无限循环。"""
+    return bool(_PLAIN.fullmatch(str(v or "").strip().upper()))
+
+
 def classify(sku) -> str:
     """输入:sku → 输出:形态桶 'asin'/'wrapped'/'numeric'/'other'(清洗预览用)。"""
     s = str(sku or "").strip().upper()

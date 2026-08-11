@@ -286,10 +286,12 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
     source     text,                         -- 沃尔玛-品牌 / 沃尔玛-知产
     added_date text,                         -- 报错发生日 YYYY-MM-DD
     src_sku    text,                         -- 溯源:来自哪个 SKU
+    src_store  text,                         -- 溯源:该报错发生在哪个店铺
     biz_cn     boolean NOT NULL DEFAULT false,
     pushed_at  timestamptz,                  -- 飞书投影水位(NULL=待推)
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS

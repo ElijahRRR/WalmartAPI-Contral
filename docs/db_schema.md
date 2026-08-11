@@ -177,7 +177,9 @@ CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
 -- 2026-08-11)。历史重建走 blacklist_push -p rebuild_brand=1(擦净重灌 +
 -- beyKyi 整表重写),日常由 problem_product_cleanup 尾段实时入账。
 CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
-    added_date, src_sku, biz_cn, pushed_at, created_at);
+    added_date, src_sku, src_store, biz_cn, pushed_at, created_at);
+-- 采集库缺品牌的候选走 brand_scrape 工作流补货(推采集→摄取→入账;
+-- 防循环:非标准 asin 过滤 + ops.dedupe('cleanup:brand_scrape') 尝试台账)
 ```
 
 ```sql

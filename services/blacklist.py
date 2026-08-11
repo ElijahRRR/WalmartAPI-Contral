@@ -104,8 +104,8 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 
 _CHANNEL_SQL = """
 INSERT INTO catalog.brand_err_hits
-    (brand_key, brand, source, added_date, src_sku, biz_cn)
-VALUES (%s, %s, %s, CURRENT_DATE::text, %s, %s)
+    (brand_key, brand, source, added_date, src_sku, src_store, biz_cn)
+VALUES (%s, %s, %s, CURRENT_DATE::text, %s, %s, %s)
 ON CONFLICT (brand_key) DO NOTHING
 """
 
@@ -154,7 +154,7 @@ def collect_brands(conn, items: list[dict]) -> dict:
             label = source_label(it["category"])
             cur.execute(_CHANNEL_SQL, (
                 brand.casefold(), brand, label,
-                sku, is_biz_cn(it.get("reasons"))))
+                sku, it.get("store"), is_biz_cn(it.get("reasons"))))
             if cur.rowcount:
                 stats["brand_new"] += 1
             else:
@@ -278,11 +278,11 @@ WHERE l.cat = ANY(%(brandcats)s)
 
 _CHANNEL_REBUILD_SQL = _LATEST_CTE + """
 INSERT INTO catalog.brand_err_hits
-    (brand_key, brand, source, added_date, src_sku, biz_cn)
+    (brand_key, brand, source, added_date, src_sku, src_store, biz_cn)
 SELECT DISTINCT ON (lower(btrim(p.brand)))
        lower(btrim(p.brand)), btrim(p.brand),
        '沃尔玛-' || CASE l.cat WHEN 'C' THEN '品牌' WHEN 'E' THEN '知产' END,
-       l.occurred_at::date::text, l.sku,
+       l.occurred_at::date::text, l.sku, l.store,
        (lower(coalesce(l.reason, '')) LIKE '%%biz-cn%%'
         OR lower(coalesce(l.reason, '')) LIKE '%%reference code biz%%')
 FROM latest l
@@ -302,6 +302,53 @@ def channel_counts(conn) -> dict:
         master = cur.fetchone()[0]
     return {"with_brand": with_brand, "no_brand": no_brand,
             "brands": brands, "master": master}
+
+
+# ── 缺品牌候选(brand_scrape 工作流用:推采集补品牌)──────────────────────────
+
+BRAND_SCRAPE_SCOPE = "cleanup:brand_scrape"     # ops.dedupe:已推过采集的 ASIN
+
+_MISSING_BRAND_SQL = _LATEST_CTE + """
+SELECT l.asin, l.sku, l.store, l.cat, l.reason
+FROM latest l
+LEFT JOIN catalog.products p
+    ON p.marketplace = 'US' AND p.asin = l.asin
+   AND coalesce(btrim(p.brand), '') <> ''
+WHERE l.cat = ANY(%(brandcats)s) AND p.asin IS NULL
+  AND NOT EXISTS (SELECT 1 FROM ops.dedupe d
+                  WHERE d.scope = %(done_scope)s AND d.key = l.sku)
+ORDER BY l.occurred_at
+"""
+
+
+def missing_brand_items(conn) -> list[dict]:
+    """输入:连接 → 输出:C/E 最新类中**采集库查无品牌**且未做过品牌收集的
+    候选 [{asin, sku, store, category, reasons}](brand_scrape 的进货清单)。"""
+    with conn.cursor() as cur:
+        cur.execute(_MISSING_BRAND_SQL,
+                    {"brandcats": sorted(BRAND_CATEGORIES),
+                     "done_scope": BRAND_ASIN_SCOPE})
+        return [{"asin": a, "sku": sku, "store": store,
+                 "category": cat, "reasons": reason}
+                for a, sku, store, cat, reason in cur.fetchall()]
+
+
+def scrape_attempted(conn, asins: list[str]) -> set:
+    """输入:连接 + ASIN 列表 → 输出:已推过采集的子集(防无限循环的账)。"""
+    if not asins:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(_PROCESSED_SQL, (BRAND_SCRAPE_SCOPE, asins))
+        return {r[0] for r in cur.fetchall()}
+
+
+def mark_scrape_attempted(conn, asins: list[str], batch_name: str) -> None:
+    """输入:连接 + 本次推送的 ASIN + 批次名 → 输出:无(记台账)。"""
+    with conn.cursor() as cur:
+        for a in asins:
+            cur.execute(_MARK_SQL, (BRAND_SCRAPE_SCOPE, a,
+                                    json.dumps({"batch": batch_name},
+                                               ensure_ascii=False)))
 
 
 def rebuild_brand_channel(conn) -> dict:

@@ -35,13 +35,13 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 
 | 表 | 用途 | 权威方 | 状态 |
 |---|---|---|---|
-| 店铺凭证表 | 店铺 ClientId/Secret + 代理配置 | 飞书(人工维护)→ 程序读 + 本地快照兜底 | 代码就绪(services/stores.py);**待用户创建**,建好后 app_token/table_id 填 .env |
-| 上架登记表 | 人工登记待上架 ASIN | 飞书登记 → 同步进 listing.tasks → 结果回写 | 待创建 |
-| 下架登记表 | 人工登记待下架 ASIN+店铺 | 同上模式 | 待创建 |
+| 店铺凭证表 | 店铺 ClientId/Secret + 代理配置 | 飞书(人工维护)→ 程序读 + 本地快照兜底 | **已建成接通**(2026-08-05 生产验收,ping_stores 经此读 49 家凭证) |
+| 上架登记表 | 人工登记待上架 ASIN | —— | **已作废**:由「上架表(新)」承接(下方);listing.tasks 表同期废弃(见 docs/backlog.md 第四节) |
+| 下架登记表 | 人工登记待下架 ASIN+店铺 | —— | **已作废**:由「商品停用删除表」承接(product_clear 在用) |
 | 错误商品记录 | 问题商品每日汇总(展示) | Postgres 权威,飞书是展示投影 | 沿用旧表或新建 |
-| 店铺日报 KPI | 每日 KPI 展示 | Postgres 权威,飞书展示 | 待创建 |
-| 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | 待创建 |
-| 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);用户已建,token/sheet_id 待填 .env(FEISHU_ONLINE_SHEET_TOKEN / FEISHU_ONLINE_SHEET_ID);列序登记在 registry ONLINE_PRODUCTS_SHEET;**只写在架行**(缺席商品不进表,2026-08-07 定稿),last_seen_at/missing_since 两列不投影(追踪在 PG + 事件账本) |
+| 店铺日报 KPI | 每日 KPI 展示 | Postgres 权威,飞书展示 | 方案已定稿(2026-08-08):看板两页(总览/历史),registry 已登记 KPI_BOARD_OVERVIEW/HISTORY;**待建表 + 填 .env + 首刷** |
+| 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | **已由订单中心销售订单表的审核列承接**(ORDER_SALES_AUDIT,只更新不新建行;2026-08-10 生产回写 151 行) |
+| 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);**已接通**(catalog_sync 47 店全量验证;token/sheet_id 在 .env);列序登记在 registry ONLINE_PRODUCTS_SHEET;**只写在架行**(缺席商品不进表,2026-08-07 定稿),last_seen_at/missing_since 两列不投影(追踪在 PG + 事件账本) |
 | 订单中心六表(订单中心V1 应用) | 主订单/销售/采购/售后/绩效/对账 | Postgres(orders schema)权威,order_center_push 键对齐同步;主订单表/采购信息为人工域,程序只补键 | 代码已对齐用户既有表头(2026-08-06);售后表需补「唯一键」字段;app_token + 6 个 table_id 填 .env |
 | 上架表(新) | listing 主驱动表(L2) | 运营填 A/B/D~G 人工域,机器列由 list_new/反哺器写;21 列 A~U(较旧 26 列砍 状态跟踪/最近跟踪日期,产品事件账本承接;U=核验 UPC 一致性) | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_LISTING_SHEET_ID |
 | 跟卖表(新) | match_listing 驱动表(替代旧 xlsx 输入,单路飞书读) | 运营填 A=UPC C=售价 D=重量 E=店铺;脚本填 B=SKU F=跟卖状态 G=匹配GTIN H=上架时间 I=feedId;J/K 由 feed_poll 反哺器回填 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_MATCH_SHEET_ID |

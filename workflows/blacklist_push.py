@@ -12,12 +12,16 @@
 "用于数据库的映射")。**人不直接编辑这两张表**,人工登记走旧「禁止品牌
 收集」那张(risk_sync 镜像回 PG),两条通道不交叉。
 
-推送范围:
-  catalog.asin_blacklist   pushed_at IS NULL 的全部行(全是自产)
-  catalog.brand_blacklist  pushed_at IS NULL **且 src_sku IS NOT NULL**——
-                           src_sku 是自产行的指纹;risk_sync 镜像来的行
-                           本来就在飞书上(人工登记的),回推一遍等于把
-                           别的表的内容复制进收集表,还会随镜像反复重推
+推送范围(所有者拍板 2026-08-11:两张表都是**数据库的全量映射**,
+防重只发生在落库,投影层照单全推):
+  catalog.asin_blacklist   pushed_at IS NULL 的全部行
+  catalog.brand_blacklist  pushed_at IS NULL 的全部行——含 risk_sync 从旧
+                           「禁止品牌收集」镜像来的行(src_sku 为空,SKU 列
+                           写空串)。第一版曾把镜像行排除在投影外,是把
+                           防重错放到了投影层。两条安全性已核实:
+                           ① 不循环——risk_sync 只读旧表,本表不是它的来源;
+                           ② 不反复重推——risk_gate.sync_brands 的 upsert
+                             不碰 pushed_at,镜像行推一次水位永久有效
 
 水位语义:每块写成功后当场把该块行的 pushed_at 打上。写表与打水位之间
 崩掉的话,那一块下次会**重推(表里出现重复行)而不是丢行**——收集表是
@@ -59,7 +63,7 @@ UPDATE catalog.asin_blacklist SET pushed_at = now() WHERE asin = ANY(%s)
 _BRAND_PENDING = """
 SELECT brand_key, brand, source, added_date, src_sku
 FROM catalog.brand_blacklist
-WHERE pushed_at IS NULL AND src_sku IS NOT NULL
+WHERE pushed_at IS NULL
 ORDER BY synced_at LIMIT %s
 """
 
@@ -74,7 +78,7 @@ FROM catalog.asin_blacklist
 
 _BRAND_STATS = """
 SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
-FROM catalog.brand_blacklist WHERE src_sku IS NOT NULL
+FROM catalog.brand_blacklist
 """
 
 

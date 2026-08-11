@@ -411,6 +411,14 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 --                 采集侧正干着我们又重推一遍 = 白烧一批配额。
 -- 重试窗口见 refdata/schema.sql 里 first_requested_at 那段注释(可重试一天)。
 
+### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
+
+旧 `seen_sku_categories.json`(20.1 万对)的落点,「错误统计」报表累计数的
+唯一真值来源——报表(旧 Step 3/4/5)迁移前必须先导入,否则累计口径当场跳变。
+写入方:`cleanup_history_import`(历史)+ 未来 cleanup 报表尾段(增量);
+`category` 是 A~L/Z 类别码。主键 (sku, category),ON CONFLICT DO NOTHING。
+
+
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'
     key         text NOT NULL,

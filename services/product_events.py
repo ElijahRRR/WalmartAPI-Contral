@@ -99,8 +99,12 @@ def receipt_in_ledger(kind: str, workflow: str | None) -> bool:
 
 
 def record_many(conn, rows: list[dict]) -> int:
-    """输入:连接 + 事件行 [{sku, store, event, source, error_code?, detail?}]
-    → 输出:写入数。detail 自动 JSON 序列化。"""
+    """输入:连接 + 事件行 [{sku, store, event, source, error_code?, detail?,
+    occurred_at?}] → 输出:写入数。detail 自动 JSON 序列化。
+
+    occurred_at 只给**历史导入**用(把旧库的 run_ts 原样带进时间线);
+    实时链路一律不传,吃列默认值 now()——实时事件自带发生时刻,倒填时间戳
+    只会让"账本只追加"的时序性变得不可信。"""
     if not rows:
         return 0
     # 未登记的码直接拒收:账本只追加、消费方按精确字符串过滤,拼错的码
@@ -112,12 +116,13 @@ def record_many(conn, rows: list[dict]) -> int:
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.product_events "
-            "(sku, store, event, source, error_code, detail) "
-            "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+            "(sku, store, event, source, error_code, detail, occurred_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
             [(r["sku"], r.get("store"), r["event"], r["source"],
               r.get("error_code"),
               json.dumps(r["detail"], ensure_ascii=False, default=str)
-              if r.get("detail") is not None else None)
+              if r.get("detail") is not None else None,
+              r.get("occurred_at"))
              for r in rows])
     return len(rows)
 

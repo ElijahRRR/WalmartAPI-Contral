@@ -731,6 +731,17 @@ CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (
 CREATE INDEX IF NOT EXISTS perf_problem_orders_store_idx
     ON ops.perf_problem_orders (store, first_seen_date DESC);
 
+-- 问题商品历史:(sku, 类别) 唯一对 —— 旧 seen_sku_categories.json(20.1 万对)
+-- 的落点,是「错误统计」报表累计数的唯一真值来源。报表(旧 Step 3/4/5)迁移
+-- 前必须先导入,否则累计口径当场跳变。写入方 cleanup_history_import(历史)
+-- + 未来 problem_product_cleanup 的报表尾段(增量);category 是 A~L/Z 类别码。
+CREATE TABLE IF NOT EXISTS ops.cleanup_seen_categories (
+    sku         text NOT NULL,
+    category    text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (sku, category)
+);
+
 CREATE TABLE IF NOT EXISTS ops.dedupe (
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'
     key         text NOT NULL,

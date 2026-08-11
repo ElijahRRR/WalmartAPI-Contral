@@ -37,6 +37,33 @@ def pg_conn():
         conn.close()
 
 
+def legacy_cleanup_dsn() -> str:
+    """输入:无 → 输出:旧问题商品库 walmart_cleanup 的 DSN。
+
+    历史导入(cleanup_history_import)专用。旧库是生产 Mac 上 peer 认证的
+    本机库(legacy_survey C11);两库若不同实例,用 LEGACY_CLEANUP_DSN 覆盖。
+    地址只准从这里取(铁律 3),工作流不许自带 DSN 参数。
+    """
+    return os.environ.get("LEGACY_CLEANUP_DSN", "dbname=walmart_cleanup")
+
+
+@contextlib.contextmanager
+def legacy_cleanup_conn():
+    """输入:无 → 输出:旧清理库**只读**连接上下文。
+
+    历史导入的读取端。显式 read-only 事务:导入器对旧库只有读的权利——
+    它是待归档的历史真值,写坏了没有第二份。
+    """
+    import psycopg
+
+    conn = psycopg.connect(legacy_cleanup_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
 def sqlite_cache(name: str) -> sqlite3.Connection:
     """输入:缓存库文件名(不含路径,如 'scraper_cache.db')→ 输出:sqlite3 连接。
 

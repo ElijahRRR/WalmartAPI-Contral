@@ -233,6 +233,24 @@ CREATE TABLE IF NOT EXISTS catalog.risk_product_types (
     field_total text, field_required text, field_list text,
     synced_at timestamptz NOT NULL DEFAULT now()
 );
+-- ASIN 黑名单(收集侧,2026-08-11 所有者拍板"收"):**只收永久禁止类**
+-- B/C/E/F/G/K(services/blacklist.PERMANENT),可修复类(A/D/H/I/J/L/Z)进了
+-- 会误杀重上架拦截——13 类词表只是「来源」列的格式约定,不是入选范围。
+-- 写入方 problem_product_cleanup 尾段(按**当轮=最新**类别入选,历史里类别
+-- 翻动频繁,"曾经命中过"不能作数);消费方:上架拦截(黑名单建设批次接)。
+-- pushed_at 是飞书投影水位:NULL=待推(投影到「黑名单ASIN」表,PG 权威)。
+CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
+    asin        text PRIMARY KEY,
+    category    text NOT NULL,       -- 入选时的类别码(B/C/E/F/G/K)
+    source      text NOT NULL,       -- 「沃尔玛-<类名>」,与飞书来源列同款
+    reason      text,                -- 命中原因样本(截 200)
+    src_store   text,                -- 溯源:在哪个店铺撞的
+    biz_cn      boolean NOT NULL DEFAULT false,  -- BIZ-CN 独立维度(中国卖家
+                                     -- 专属禁售,legacy_survey:2077 要求单列)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    pushed_at   timestamptz
+);
+
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
     brand text NOT NULL,             -- 品牌名原文
@@ -240,6 +258,12 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     added_date text,                 -- 入库日期(表格原样)
     synced_at timestamptz NOT NULL DEFAULT now()
 );
+-- 收集侧补列(2026-08-11,自产回路接通):src_sku 溯源(该品牌从哪个 SKU 来,
+-- 所有者定稿:溯源列,**去重仍按品牌**);pushed_at 飞书投影水位(NULL=待推,
+-- 只有 cleanup 自产的行才推——risk_sync 镜像来的行本来就在飞书上,不回推)。
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
 
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS

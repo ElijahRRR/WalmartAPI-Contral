@@ -280,6 +280,30 @@ ZIP_BLACKLIST_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# 黑名单两张收集表(所有者建 2026-08-11,与黑名单邮编同一个 wiki 承载;
+# **PG 权威,这两张是数据库的投影**——写入方向只有 PG → 飞书,人不直接编辑)。
+# ASIN 表来源列格式 = 「沃尔玛-〈13 类之一〉」;但**入选只限永久禁止类**
+# B/C/E/F/G/K(见 services/blacklist.PERMANENT),词表≠入选范围。
+ASIN_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单ASIN",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_ASIN_BLACKLIST_SHEET_ID", ""),
+    columns=("asin", "source", "added_date"),
+    wiki=True,
+)
+
+# 品牌黑名单(后台报错集成):cleanup 自产品牌的投影落点。D 列 SKU 是**溯源**
+# (该品牌从哪个 SKU 来),去重按品牌(所有者澄清 2026-08-11)。
+# 与旧「禁止品牌收集」(BRAND_BAN_SHEET,risk_sync 只读镜像源)是两张表:
+# 旧表继续做人工登记入口,这张只承接程序自产。
+BRAND_ERR_SHEET = Spreadsheet(
+    name="黑名单品牌(后台报错集成)",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_BRAND_ERR_SHEET_ID", ""),
+    columns=("brand", "source", "added_date", "sku"),
+    wiki=True,
+)
+
 # 采购方表(多维表格,人工维护):按 配送方式 + 亚马逊单价区间 选采购方,
 # 多个候选取汇率最低者(旧系统 采购方匹配.py:80-87 语义,逐字保留)。
 SUPPLIER_TABLE = Bitable(
@@ -406,7 +430,8 @@ BRAND_BAN_SHEET = Spreadsheet(
     name="禁止品牌收集",
     token=os.environ.get("FEISHU_BRAND_WIKI_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_BRAND_SHEET_ID", ""),
-    columns=("brand", "source", "added_date"),
+    # D 列 sku 为溯源列(旧表实际 4 列,legacy_survey:1360;此前漏登记)
+    columns=("brand", "source", "added_date", "sku"),
     wiki=True,
 )
 

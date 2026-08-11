@@ -42,6 +42,7 @@ import logging
 
 from api import _client, feeds
 from registry import db
+from services import blacklist
 from services import problem_products as pp
 from services import product_events, stores as stores_svc
 
@@ -175,6 +176,37 @@ def _record(store: str, event: str, rows: list[dict], feed_id) -> None:
             for r in rows])
 
 
+def _collect_blacklists(items: list[dict]) -> str:
+    """输入:当轮已归类 item → 输出:黑名单收集摘要(一行)。
+
+    归因收集尾段(plan.md「品牌限制/侵权类问题产品 → 品牌黑名单」的落地,
+    2026-08-11 接通自产回路):当轮 B/C/E/F/G/K 入 ASIN 黑名单,C/E 的品牌
+    从 catalog.products.brand 取、按品牌去重入 brand_blacklist。
+    **任何失败只告警不阻断**——黑名单是清理的副产品,收集炸了不该把
+    删除/反补主链拖下水;漏一轮下一轮照样补(入选条件不变)。
+    飞书投影由 blacklist_push 按 pushed_at 水位另推,这里只写 PG。
+    """
+    cand = [it for it in items if "category" in it]
+    if not cand:
+        return ""
+    try:
+        with db.pg_conn() as conn:
+            asin_new = blacklist.record_asins(conn, cand)
+            st = blacklist.collect_brands(conn, cand)
+    except Exception as e:                              # noqa: BLE001
+        logger.error("黑名单收集失败(主链不受影响,下轮重收): %s", e)
+        return f"黑名单收集失败:{e}"
+    bits = [f"ASIN 黑名单 +{asin_new}", f"品牌 +{st['brand_new']}"]
+    if st["brand_known"]:
+        bits.append(f"品牌已知 {st['brand_known']}")
+    if st["no_brand"]:
+        # 不是错误:产品中心还没这些 ASIN 的品牌,标已处理才是错(永远漏)
+        bits.append(f"待品牌 {st['no_brand']}(产品中心缺 brand,下轮重试)")
+    if st["skipped"]:
+        bits.append(f"已处理跳过 {st['skipped']}")
+    return "黑名单收集:" + ",".join(bits)
+
+
 def _record_categories(items: list[dict], last_cat: dict) -> int:
     """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
     fresh = [it for it in items if "category" in it
@@ -228,6 +260,7 @@ def run(params: dict) -> str:
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n_cat = _record_categories(items, last_cat)
+    bl_note = _collect_blacklists(items)
     retry_stores: list[str] = []
     for store_name, b in sorted(plans.items()):
         store = stores_by_name.get(store_name)
@@ -249,6 +282,8 @@ def run(params: dict) -> str:
                 lines.append(f"  ⚠ {store_name}:二轮仍失败,待下轮调度")
 
     lines.append(f"归类事件新记 {n_cat} 条;结果轮询走 feed_poll")
+    if bl_note:
+        lines.append(bl_note)
     return "\n".join(lines)
 
 

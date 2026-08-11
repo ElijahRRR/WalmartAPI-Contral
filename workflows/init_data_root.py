@@ -37,6 +37,18 @@ FEISHU_ZIP_BLACKLIST_SHEET_ID=
 FEISHU_SUPPLIER_APP_TOKEN=
 FEISHU_SUPPLIER_TABLE_ID=
 
+# 黑名单两张收集表(与黑名单邮编同一个 wiki;所有者建 2026-08-11)
+# ASIN 表 sheet=mPwUBu,品牌表 sheet=beyKyi(以表格 URL 实际参数为准)
+FEISHU_BLACKLIST_WIKI_TOKEN=
+FEISHU_ASIN_BLACKLIST_SHEET_ID=
+FEISHU_BRAND_ERR_SHEET_ID=
+
+# listing 风控两张只读源(risk_sync 镜像入库用)
+FEISHU_RISK_PT_WIKI_TOKEN=
+FEISHU_RISK_PT_SHEET_ID=
+FEISHU_BRAND_WIKI_TOKEN=
+FEISHU_BRAND_SHEET_ID=
+
 # 沃尔玛 API(默认 production;沙箱测试才需要设)
 #WALMART_BASE_URL=https://sandbox.walmartapis.com
 

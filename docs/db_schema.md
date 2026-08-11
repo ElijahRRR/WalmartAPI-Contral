@@ -411,6 +411,15 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 --                 采集侧正干着我们又重推一遍 = 白烧一批配额。
 -- 重试窗口见 refdata/schema.sql 里 first_requested_at 那段注释(可重试一天)。
 
+### catalog.asin_blacklist(ASIN 黑名单,收集侧)
+
+**只收永久禁止类 B/C/E/F/G/K**(`services/blacklist.PERMANENT`;13 类词表只是
+飞书来源列的格式约定,不是入选范围——所有者拍板 2026-08-11)。入选按**当轮
+=最新**类别(历史实证类别翻动频繁,"曾命中过"不能作数)。一次入选不更新
+(DO NOTHING)。`biz_cn` 是独立维度(中国卖家专属禁售);`pushed_at` 是飞书
+投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
+写入方 problem_product_cleanup 尾段;消费方:上架拦截(黑名单建设批次接)。
+
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
 
 旧 `seen_sku_categories.json`(20.1 万对)的落点,「错误统计」报表累计数的

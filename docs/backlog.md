@@ -14,9 +14,9 @@
 
 | 状态 | 缺口 | 出处/关键事实 |
 |---|---|---|
-| 🟡 | **清理→品牌黑名单自产回路:PG 侧已接通**(2026-08-11,services/blacklist + cleanup 尾段:C/E 品牌自 catalog.products.brand、按品牌去重、不覆盖镜像行、缺品牌不标已处理等重试;失败只告警不阻断主链)。**余:生产验收**(blacklist_push 已就绪 2026-08-11) | `services/blacklist.py` |
-| ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;两张新收集表 ASIN_BLACKLIST_SHEET / BRAND_ERR_SHEET 同步登记,env 已进 init_data_root 模板) | — |
-| 🟡 | **ASIN 黑名单:PG 侧已接通**(catalog.asin_blacklist 新表,cleanup 尾段按当轮类别入选,B/C/E/F/G/K,一次入选不更新)。**余:上架拦截消费方**(黑名单建设批次;投影 blacklist_push 已就绪) | `services/blacklist.py` |
+| ✅ | ~~清理→品牌黑名单自产回路~~(2026-08-11 生产验收:渠道独立表 brand_err_hits(不与总清单去重,修掉"总表已有品牌进不了渠道"的建模缺陷)→ beyKyi 整表重写 2,012 行(总表认领 2,011 + 时间线推导 1);缺品牌候选走 brand_scrape 推采集闭环(非标准过滤 + 尝试台账防循环);实时链路 cleanup 尾段双落库:渠道表 + 否决闸) | `services/blacklist.py` / `workflows/brand_scrape.py` |
+| ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;risk_sync 现把 D 列 ASIN 镜像进 src_sku,空不覆盖) | — |
+| 🟡 | **ASIN 黑名单:PG 侧+投影已生产验收**(2026-08-11:sku 清洗后按标准 asin 重灌 56,812 行、整表重写,日期=报错发生日;numeric 1,739 键无解暂留原文兜底)。**余:上架拦截消费方**(黑名单建设批次) | `services/blacklist.py` |
 | 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合(随预警批次) | `services/blacklist.py:45` |
 | 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
 | ⬜ | **match_listing 不过风控闸与防呆**——跟卖同样是新增在售 offer,只有 list_new 有闸 | `workflows/match_listing.py`(不查 risk_gate / product_risk) |
@@ -46,6 +46,15 @@
 6. **DELETE 防重口径**:旧的自然日防重是"一天跑 4 次"的产物,现按日执行,
    改**滚动 48h**,且**仅限 feed 无终态的**;有终态但商品又被扫到(= 提交成功、
    沃尔玛给了结果、实际没删掉)⇒ **直接再执行,不等 48h**。
+8. **两张品牌表角色**(2026-08-11 厘清,曾混过一次):「黑名单品牌总表」
+   (jF8dOw,FEISHU_BRAND_*)= 各渠道人工归拢的总清单,飞书→PG(risk_sync);
+   「黑名单品牌(后台报错集成)」(beyKyi)= 沃尔玛后台渠道,PG→飞书
+   (blacklist_push,源=brand_err_hits),**渠道不与总清单去重**。
+9. **sku≠asin 两列口径**(2026-08-11):sku=沃尔玛侧订货号原文,asin=源头
+   标准码(services/sku_asin 唯一规则出处,record_many 自动清洗,存量走
+   sku_normalize);黑名单身份 = coalesce(asin, sku)。
+10. **采集库缺 asin 走推送采集**(2026-08-11):不设邮编不截图;非标准 asin
+   过滤 + 尝试台账,防无限循环(workflows/brand_scrape)。
 
 ## 二、问题商品清理链 —— 旧 7 个 Step 只迁了中间一段
 
@@ -54,8 +63,8 @@
 | Step 0 监管合规删除(飞书 eGjQRX) | ⬜ | 完全缺失。plan 称由 product_clear 的停用删除表承担,但旧表 F 列幂等锚点无人继承;旧逻辑 dry-run 下整段跳过,需重写成可预览(`docs/legacy_survey.md:1361,1447,1474`) |
 | Step 1/1.5/1.6/2 识别/反补/停用/删除 | ✅ | `problem_product_cleanup`,2026-08-07 生产验收 |
 | Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ⬜🔴 | 未迁;"累计语义保不保留"未决,历史口径会跳变(`legacy_survey.md:1358-1362,1472`) |
-| Step 6 品牌采集 | 🟡 | **PG 侧 + 投影已就绪**(2026-08-11);余:生产验收 |
-| Step 7 黑名单同步 | 🟡 | **PG 侧 + 投影已就绪**;余:生产验收 |
+| Step 6 品牌采集 | ✅ | 2026-08-11 生产验收:brand_err_hits 渠道表 + beyKyi 2,012 行;缺口补采走 brand_scrape(预览→推采→摄取→入账闭环) |
+| Step 7 黑名单同步 | ✅ | 2026-08-11 生产验收:ASIN 表按标准 asin 整表重写 56,812 行 |
 
 旧数据入库:✅ **三笔全部完成**(2026-08-11 生产实跑,cleanup_history_import):
 - error_items 485,345 行 → 变迁事件 239,253 条(时间线折叠;擦净重灌数与首跑
@@ -79,6 +88,9 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ 只有 `delete_*` 一支有消费者:`status_changed`/`match_submitted`/`list_submitted`/全部 `*_feed_failed`/`retire_feed_*` 只写不读——账本在长,读的人没跟上
 - ⬜ `product_risk` 视图只按 sku 聚合无 store 维度、单读者(list_new);`listed_times/last_removed_at/last_event_at` 三列无人读
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
+- ✅ ~~sku≠asin~~(2026-08-11:product_events 加 asin 列,record_many 自动清洗
+  + sku_normalize 存量补填;残余 numeric 1,739 个 item id 键倒查零命中,
+  原文兜底,等 walmart_items.item_id 覆盖扩大后重洗)
 
 > ✅ 已核实非缺口(防止再被误报):`maintenance_submitted` **有生产者**——
 > `problem_product_cleanup.py:293` 反补路径在发,"反补满 2 次转删"计数是通的。

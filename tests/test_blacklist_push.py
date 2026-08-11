@@ -32,6 +32,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 2000)
     monkeypatch.setattr(wf.feishu, "sheet_ensure_rows",
                         lambda s, n: calls["ensured"].append(n) or 0)
+    monkeypatch.setattr(wf.feishu, "sheet_list",
+                        lambda s: [("mPwUBu", "黑名单ASIN"), ("beyKyi", "品牌收集")])
 
     def values(sheet, rng):
         # 行 2 起的列 A:表里已有 len(cells) 行旧数据
@@ -46,9 +48,13 @@ def wired(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, args=None):
+            self._sql = sql
             self._rows = (calls.get("asin_pending", []) if "asin_blacklist" in sql
                           else calls.get("brand_pending", []))
         def fetchall(self): return self._rows
+        def fetchone(self):
+            key = "asin_stats" if "asin_blacklist" in self._sql else "brand_stats"
+            return calls.get(key, (0, 0))
 
     class _Conn:
         def __enter__(self): return self
@@ -161,6 +167,38 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     out = wf.run({"backfill": "1"})
     assert "永久禁止 10 个" in out and "apply=1" in out
     assert wrote == []
+
+
+# ── 只读探针(换表格 / "写了看不见"时的第一诊断)──────────────────────────────
+
+def test_probe_reads_back_and_never_writes(wired):
+    """探针回读 API 真值(已填行数 + 行 2 内容 + 水位对账),绝不写表、
+    绝不打水位——它就是用来在不敢推之前看清现场的。"""
+    calls, cells = wired
+    cells["asin"] = [f"B{i:04d}" for i in range(500)]
+    calls["asin_stats"] = (500, 56821)
+    out = wf.run({"probe": "1"})
+    assert "已填 500 行" in out and "已推 500 / 自产共 56821" in out
+    assert "行 2 回读" in out
+    assert calls["writes"] == [] and calls["marked"] == [] and calls["ensured"] == []
+
+
+def test_probe_flags_missing_sheet_id(wired, monkeypatch):
+    """env 指向的文档里没有登记的 sheet_id(换表格后最典型的接线错)——
+    必须点名报出来,而不是等推送时写进错的表。"""
+    monkeypatch.setattr(wf.feishu, "sheet_list", lambda s: [("zzz", "别的表")])
+    out = wf.run({"probe": "1"})
+    assert "找不到 sheet_id=mPwUBu" in out and "找不到 sheet_id=beyKyi" in out
+
+
+def test_probe_warns_on_watermark_mismatch(wired):
+    """表行数≠已推水位要亮牌(崩溃重推的重复行 / 表被手动动过),
+    但只是提示不拦路——重复行人眼可辨可删。"""
+    calls, cells = wired
+    cells["asin"] = ["B0001", "B0002", "B0003"]
+    calls["asin_stats"] = (2, 10)
+    out = wf.run({"probe": "1"})
+    assert "表行数≠已推水位" in out
 
 
 def test_block_size_stays_within_feishu_limit():

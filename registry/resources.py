@@ -298,7 +298,10 @@ ASIN_BLACKLIST_SHEET = Spreadsheet(
 # 旧表继续做人工登记入口,这张只承接程序自产。
 BRAND_ERR_SHEET = Spreadsheet(
     name="黑名单品牌(后台报错集成)",
-    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    # 品牌表 2026-08-11 由所有者换过一次表格——token 独立成变量,不设时
+    # 回落到与 ASIN 表共用的 wiki token(两表同文档的原始布局)
+    token=(os.environ.get("FEISHU_BRAND_ERR_WIKI_TOKEN")
+           or os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", "")),
     sheet_id=os.environ.get("FEISHU_BRAND_ERR_SHEET_ID", ""),
     columns=("brand", "source", "added_date", "sku"),
     wiki=True,

@@ -2,6 +2,9 @@
 
 用法:
   python cli.py blacklist_push              # 推全部待推行(pushed_at IS NULL)
+  python cli.py blacklist_push -p probe=1   # 只读体检:接线/子表身份/已填行数/
+                                            # 水位对账。换表格、怀疑"写了看不见"
+                                            # 时先跑这个——它回读飞书 API 真值
   python cli.py blacklist_push -p limit=500 # 单轮上限(默认不限——限制来自
                                             # 飞书单请求 500 行,分块自动切)
 
@@ -61,6 +64,51 @@ _BRAND_MARK = """
 UPDATE catalog.brand_blacklist SET pushed_at = now() WHERE brand_key = ANY(%s)
 """
 
+_ASIN_STATS = """
+SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
+FROM catalog.asin_blacklist
+"""
+
+_BRAND_STATS = """
+SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
+FROM catalog.brand_blacklist WHERE src_sku IS NOT NULL
+"""
+
+
+def _probe() -> str:
+    """输入:无 → 输出:两张表的只读体检报告,不写任何东西。
+
+    每张表四件事:①sheet_id 在 env 指向的文档里存不存在(不存在 = token/
+    sheet_id 指错了,这正是换表格后最容易错的地方);②子表标题(人眼核对
+    身份);③列 A 已填行数 + 行 2 回读(API 侧真值,不受前端刷新影响);
+    ④与库侧 pushed_at 水位对账(不一致多半是崩溃重推的重复行,人眼可辨)。
+    """
+    with db.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_ASIN_STATS)
+            asin_stats = cur.fetchone()
+            cur.execute(_BRAND_STATS)
+            brand_stats = cur.fetchone()
+    lines = []
+    for sheet, (pushed, total) in ((resources.ASIN_BLACKLIST_SHEET, asin_stats),
+                                   (resources.BRAND_ERR_SHEET, brand_stats)):
+        s = sheet.require()
+        titles = dict(feishu.sheet_list(s))
+        if s.sheet_id not in titles:
+            lines.append(f"「{s.name}」⛔ 文档里找不到 sheet_id={s.sheet_id},"
+                         f"实有子表 {[f'{t}({i})' for i, t in titles.items()]}"
+                         f"——env 的 wiki token 或 sheet_id 指错了")
+            continue
+        filled = _next_empty(s) - 2
+        width = chr(ord("A") + len(s.columns) - 1)
+        head = feishu.sheet_values(s, f"A2:{width}2") if filled else []
+        lines.append(f"「{s.name}」→ 子表「{titles[s.sheet_id]}」已填 {filled} 行"
+                     + (f",行 2 回读 {head[0]}" if head else "")
+                     + f";库侧已推 {pushed} / 自产共 {total}"
+                     + ("" if filled == pushed
+                        else ",⚠ 表行数≠已推水位(崩溃重推的重复行或表被手动增删)"))
+    return "黑名单投影探针(只读):" + ";".join(lines)
+
 
 def _next_empty(sheet, start: int = 2) -> int:
     """输入:登记条目 + 起扫行 → 输出:列 A 首个空行行号(1 行是表头)。"""
@@ -108,6 +156,9 @@ def run(params: dict) -> str:
     加 -p apply=1 真写,写完顺路照常投影。一次性动作,重复跑无害
     (DO NOTHING/防重台账都幂等)。
     """
+    if str(params.get("probe", "")).lower() in {"1", "true", "yes"}:
+        return _probe()
+
     limit = int(params.get("limit", 1_000_000))
     lines = []
 

@@ -37,10 +37,12 @@ FEISHU_ZIP_BLACKLIST_SHEET_ID=
 FEISHU_SUPPLIER_APP_TOKEN=
 FEISHU_SUPPLIER_TABLE_ID=
 
-# 黑名单两张收集表(与黑名单邮编同一个 wiki;所有者建 2026-08-11)
-# ASIN 表 sheet=mPwUBu,品牌表 sheet=beyKyi(以表格 URL 实际参数为准)
+# 黑名单两张收集表(所有者建 2026-08-11;以表格 URL 实际参数为准)
+# 品牌表若在另一份 wiki 文档,填 FEISHU_BRAND_ERR_WIKI_TOKEN;
+# 留空则回落到与 ASIN 表共用的 FEISHU_BLACKLIST_WIKI_TOKEN
 FEISHU_BLACKLIST_WIKI_TOKEN=
 FEISHU_ASIN_BLACKLIST_SHEET_ID=
+FEISHU_BRAND_ERR_WIKI_TOKEN=
 FEISHU_BRAND_ERR_SHEET_ID=
 
 # listing 风控两张只读源(risk_sync 镜像入库用)

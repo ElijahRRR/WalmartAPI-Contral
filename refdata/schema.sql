@@ -328,7 +328,7 @@ CREATE TABLE IF NOT EXISTS orders.order_lines (   -- 销售明细(订单域锚�
     tracking_url   text,
     ship_name      text, phone text, address1 text, address2 text,
     city text, state text, postal_code text, country text,
-    -- 审核结论(order_audit 工作流写;四道审核明细进 audit_detail)
+    -- 审核结论(order_audit 工作流写;判定链明细进 audit_detail)
     audit_status   text,               -- 通过/拒绝/钓鱼/待人工
     audit_detail   jsonb,
     audited_at     timestamptz,

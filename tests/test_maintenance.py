@@ -507,11 +507,15 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     conn = _Conn()
     conn.cursor_value = {"next_row": 6, "unresolved_from": 2}
     _fake_db(monkeypatch, conn)
+    # 日期必须动态生成:反哺器有"超 STALE_DAYS 天判未查到"的墙钟规则,
+    # 写死日期的夹具会在三天后悄悄变成在测另一条分支(2026-08-11 实爆:
+    # 写死的 08-07 过期,四行全走了未查到,断言在测根本不该触发的兜底)。
+    today = maint_sheet._today().isoformat()
     sheet_rows = [
-        ["T1", "S1", "库存", "5", "0", "F1", "2026-08-07", "处理中", ""],
-        ["T1", "S2", "库存", "3", "0", "F1", "2026-08-07", "处理中", ""],
-        ["T1", "S3", "价格", "9", "8", "sync", "2026-08-07", "成功", ""],
-        ["T1", "S4", "库存", "7", "0", "F2", "2026-08-07", "处理中", ""],
+        ["T1", "S1", "库存", "5", "0", "F1", today, "处理中", ""],
+        ["T1", "S2", "库存", "3", "0", "F1", today, "处理中", ""],
+        ["T1", "S3", "价格", "9", "8", "sync", today, "成功", ""],
+        ["T1", "S4", "库存", "7", "0", "F2", today, "处理中", ""],
     ]
     writes = []
     monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)

@@ -268,7 +268,7 @@ ORDER_SETTLE = Bitable(
 # ── 订单审核两张配置表(order_audit 每次运行现读,不镜像入 PG)────────────────
 # 不入库的理由:配置量小、改动即时生效是运营预期;且"读不到就不出结论"比
 # "拿上次的旧配置继续算钱"安全(见 services/order_audit 的 require 语义)。
-# 每行实际套用的采购方/汇率/限价会写进 orders.order_audit,事后可追溯用了什么。
+# 每行实际套用的采购方/汇率/限价会写进 orders.order_lines.audit_detail,事后可追溯。
 
 # 黑名单邮编(钓鱼检测;所有者定稿 2026-08-09:只匹配邮编,旧系统的地址/街道
 # 双向 substring 匹配整套不迁)。wiki 承载电子表格,A 列邮编,无表头。

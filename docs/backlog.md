@@ -57,11 +57,15 @@
 | Step 6 品牌采集 | ⬜ | = 第一大类的回路断点。前置条件(catalog.products.brand + services/amz_source)**已全部就位**,plan.md:93 "随产品中心接入后实施"已到期未兑现 |
 | Step 7 黑名单同步 | ⬜🔴 | 卡在 B/C/E/F/G/K 决策 |
 
-旧数据入库(**导入骨架已就绪 2026-08-11**:cleanup_history_import,三笔一条命令;
-待生产 Mac 实跑——预览探测列名/JSON 形态 → 校准 → apply):
-- 🟡 **41.7 万行 error_items** → product_events 时间线(折叠后不膨胀;2026-05-14 前 category 为空的行照样入账,码记 NULL)
-- 🟡 **seen_sku_categories 20.1 万对** → ops.cleanup_seen_categories(新表)
-- 🟡 **brand_cache 2544 + pending batches** → ops.dedupe('cleanup:brand_asin' / 'cleanup:brand_pending')
+旧数据入库:✅ **三笔全部完成**(2026-08-11 生产实跑,cleanup_history_import):
+- error_items 485,345 行 → 变迁事件 239,253 条(时间线折叠;擦净重灌数与首跑
+  完全一致,折叠确定性有实证)
+- seen 207,355 对 → ops.cleanup_seen_categories
+- brand_cache 2,609 个 ASIN → ops.dedupe('cleanup:brand_asin');
+  **pending_batches 实为 0 条**——「在途批次结果永久丢失」的担忧自动消解
+实操沉淀:seen 真实形状 {"seen": [[SKU, 码], ...]} 其实一直记在
+legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传反已有
+形状指纹护栏,文件检查已前置到重活之前。
 
 待确认:
 - ✅ ~~DELETE 防重口径~~(2026-08-11 拍板:滚动 48h 仅限无终态,有终态又扫到直接重发——见「已拍板」第 6 条;cleanup 完善时落实)
@@ -74,7 +78,7 @@
 - ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`)
 - ⬜ 只有 `delete_*` 一支有消费者:`status_changed`/`match_submitted`/`list_submitted`/全部 `*_feed_failed`/`retire_feed_*` 只写不读——账本在长,读的人没跟上
 - ⬜ `product_risk` 视图只按 sku 聚合无 store 维度、单读者(list_new);`listed_times/last_removed_at/last_event_at` 三列无人读
-- ⬜ **旧库 41.7 万行历史导入零代码**(与第二类同批统筹,plan.md:137)
+- ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
 
 > ✅ 已核实非缺口(防止再被误报):`maintenance_submitted` **有生产者**——
 > `problem_product_cleanup.py:293` 反补路径在发,"反补满 2 次转删"计数是通的。

@@ -79,11 +79,11 @@ def test_push_marks_watermark_per_block(wired):
     的话中途崩 = 全部重推。"""
     calls, _ = wired
     calls["asin_pending"] = [(f"B{i:04d}", "沃尔玛-禁售", "2026-08-11")
-                             for i in range(250)]
+                             for i in range(1250)]
     out = wf.run({})
-    assert "ASIN 表 +250 行(3 块)" in out
+    assert "ASIN 表 +1250 行(3 块)" in out
     asin_marks = [k for w, k in calls["marked"] if w == "asin"]
-    assert [len(k) for k in asin_marks] == [100, 100, 50]
+    assert [len(k) for k in asin_marks] == [500, 500, 250]
     assert asin_marks[0][0] == "B0000"
 
 
@@ -161,3 +161,10 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     out = wf.run({"backfill": "1"})
     assert "永久禁止 10 个" in out and "apply=1" in out
     assert wrote == []
+
+
+def test_block_size_stays_within_feishu_limit():
+    """单请求 ≤500 行是飞书实测硬限(90202,maint_sheet._APPEND_BLOCK 同源)。
+    谁把 _BLOCK 调大都必须先过这条。"""
+    from services.maint_sheet import _APPEND_BLOCK
+    assert wf._BLOCK <= _APPEND_BLOCK == 500

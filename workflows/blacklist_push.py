@@ -2,7 +2,8 @@
 
 用法:
   python cli.py blacklist_push              # 推全部待推行(pushed_at IS NULL)
-  python cli.py blacklist_push -p limit=200 # 单轮上限(默认 500,防首推撑爆)
+  python cli.py blacklist_push -p limit=500 # 单轮上限(默认不限——限制来自
+                                            # 飞书单请求 500 行,分块自动切)
 
 方向只有一个:PG → 飞书(PG 权威,表是人机界面;所有者建表时明说
 "用于数据库的映射")。**人不直接编辑这两张表**,人工登记走旧「禁止品牌
@@ -26,6 +27,7 @@
 """
 
 import logging
+import time
 
 from api import feishu
 from registry import db, resources
@@ -35,7 +37,8 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.blacklist_push")
 
-_BLOCK = 100          # 单块行数(飞书单次写入的稳妥上限,maint_sheet 同款量级)
+_BLOCK = 500          # 单块行数 = 飞书单请求实测上限(更大会被 90202 拒,
+                      # maint_sheet._APPEND_BLOCK 同源实证);块间 0.2s 节流
 
 _ASIN_PENDING = """
 SELECT asin, source, created_at::date::text
@@ -93,6 +96,8 @@ def _append(sheet, rows: list[list], mark, keys: list) -> tuple[int, int]:
         mark(keys[i:i + len(block)])
         written += len(block)
         blocks += 1
+        if i + _BLOCK < len(rows):
+            time.sleep(0.2)             # 5.6 万行 ≈ 114 个请求,别打成突刺
     return written, blocks
 
 
@@ -103,7 +108,7 @@ def run(params: dict) -> str:
     加 -p apply=1 真写,写完顺路照常投影。一次性动作,重复跑无害
     (DO NOTHING/防重台账都幂等)。
     """
-    limit = int(params.get("limit", 500))
+    limit = int(params.get("limit", 1_000_000))
     lines = []
 
     if str(params.get("backfill", "")).lower() in {"1", "true", "yes"}:

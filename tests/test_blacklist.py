@@ -170,3 +170,24 @@ def test_cleanup_tail_skips_uncategorized_items(monkeypatch):
                         lambda: pytest.fail("没归类的行不该碰库"))
     assert wf._collect_blacklists([{"sku": "B0A", "store": "S",
                                     "reasons": "x"}]) == ""
+
+
+# ── DELETE 防重口径(所有者拍板 2026-08-11:滚动 48h,仅限无终态)────────────
+
+def test_inflight_sql_caps_submitted_at_48h():
+    """三个半条,只能断言 SQL 文本(时间条件在 PG 侧求值,夹具盖不住):
+
+    ① submitted 拦但 48h 封顶——超时 = feed 丢了,继续拦是永久漏删;
+    ② success 待观测拦到重扫为止,重扫仍在 = 删除没生效,直接重发不等 48h
+       (条件里**不许**出现对 success 的时间限制);
+    ③ failed 不拦(WHERE 里根本不出现)。
+    """
+    from workflows import problem_product_cleanup as wf
+    sql = wf._SQL_INFLIGHT
+    assert "f.status = 'submitted'" in sql
+    assert "interval '48 hours'" in sql
+    # ② success 那一支不带时间窗:它的解除条件是"被重扫",不是"过了多久"
+    success_leg = sql[sql.index("'success'"):]
+    assert "interval" not in success_leg
+    assert "resolved_at > w.last_seen_at" in success_leg
+    assert "'failed'" not in sql

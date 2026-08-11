@@ -17,7 +17,9 @@ problem_products,规则逐字移植旧系统)→ 三路:
   删除未生效顽固 SKU(delete_not_effective)→ 停用+删除双 feed 齐发
 
 去重(全部查库;所有者定稿:不设时间防重窗,重复删除无实害,真相以观测为准):
-  ① 在途/待观测:feed_items 有 submitted 未落定,或已落定 success 但
+  ① 在途/待观测:feed_items 有 submitted 未落定(**滚动 48h 封顶**,超时
+     视为 feed 丢失放行重发——所有者拍板 2026-08-11,替代旧"同一自然日"),
+     或已落定 success 但
      catalog_sync 尚未重新观测(resolved_at > last_seen_at)→ 跳过
      (feed 处理中不叠发;动作结果未经观测确认前不重复动作);
   ② 反补计数:product_events 的 maintenance_submitted 30 天窗口计数(替代
@@ -56,11 +58,22 @@ FROM catalog.walmart_items
 WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
   AND missing_since IS NULL
 """
+# 防重口径(所有者拍板 2026-08-11,替代旧系统的"同一自然日"——那是一天
+# 跑 4 次的产物,现按日执行):
+# ① submitted 无终态 → 拦,但**滚动 48h 封顶**:超 48h 还没终态,这个 feed
+#    大概率丢了(feed_poll 的 pending 告警早该响了),继续拦等于让该商品
+#    永久漏删。48h 内照拦——feed 还在沃尔玛队列里,叠发 = 重复提交制造机。
+# ② success 且 resolved_at > last_seen_at(待观测)→ 拦到 catalog_sync 重扫
+#    为止;重扫后商品**还在**问题清单里 = 沃尔玛说删成了实际没删掉 ⇒
+#    本条不再命中,直接重发,不等 48h(所有者原话:"有终态但又扫到了,
+#    说明提交成功、给了结果、事实上没操作成功,直接再次执行")。
+# ③ failed 不拦(该重试)。
 _SQL_INFLIGHT = """
 SELECT DISTINCT f.store, f.sku
 FROM ops.feed_items f
 JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
-WHERE f.status = 'submitted'
+WHERE (f.status = 'submitted'
+       AND f.submitted_at > now() - interval '48 hours')
    OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 """
 # 在途/待观测拦截(2026-08-07 生产实证修正):submitted=feed 处理中不叠发;

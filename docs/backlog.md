@@ -15,14 +15,31 @@
 | 状态 | 缺口 | 出处/关键事实 |
 |---|---|---|
 | ⬜ | **清理→品牌黑名单的自产回路**:cleanup 的 C(品牌)/E(知产)归类只进 `product_events.detail`,不写 brand_blacklist、不回写飞书「禁止品牌收集」。飞书表停用当天闸门冻结 | `services/risk_gate.py:3-9` 自述上游是"产品清理报错扫描";`workflows/problem_product_cleanup.py:36` 自认"品牌采集/黑名单/飞书统计表后置" |
-| ⬜ | registry 的 `BRAND_BAN_SHEET` 缺 **D 列(SKU/ASIN)**——旧表 4 列,这列是跨系统幂等锚点,回写没有它会重复追加 | `registry/resources.py:409`(仅 3 列)vs `docs/legacy_survey.md:1360,1447` |
-| 🔴 | **B/C/E/F/G/K 六类 ASIN 黑名单**:表未建、未登记、零代码;且旧调查已查明旧链路可能没有读者——先拍板还收不收 | `docs/plan.md:93`;`docs/legacy_survey.md:2244`(找不到消费方)、`:1435`(入选集合)、`:1451`(建议 services/blacklist.py,不存在) |
+| ⬜ | registry 的 `BRAND_BAN_SHEET` 缺 **D 列(SKU/ASIN)**,需补登记。**语义已澄清(所有者 2026-08-11)**:D 列是溯源(该品牌从哪个 SKU 来),**去重按品牌**,不按 SKU——此前『D 列是幂等锚点』的说法作废 | `registry/resources.py:409`;新表见下方「已拍板」 |
+| ⬜ | **ASIN 黑名单:已拍板收,所有者已建表**(2026-08-11,见下方「已拍板」;待登记 registry + 接写入)。⚠ 一个口径待确认:来源词表含全部 13 类,**入选是否仍限永久禁止类**(旧规则只收 B/C/E/F/G/K,可修复类进了会误杀重上架拦截)| 原始出处 `docs/legacy_survey.md:1435,2244` |
 | ⬜ | **BIZ-CN 独立维度**:被 `problem_products.py:20` 的关键词并进 C 品牌类,旧调查明确它是"唯一中国卖家专属禁售",必须单独处理 | `docs/legacy_survey.md:2077` |
 | 🟡⚙ | `risk_sync` 无调度、生产验证未做;`FEISHU_RISK_PT_WIKI_TOKEN`/`FEISHU_BRAND_WIKI_TOKEN` 不在 init_data_root 的 .env 模板 | `docs/listing_plan.md:79`;`workflows/init_data_root.py`(已核实无此两项) |
 | ⬜ | **match_listing 不过风控闸与防呆**——跟卖同样是新增在售 offer,只有 list_new 有闸 | `workflows/match_listing.py`(不查 risk_gate / product_risk) |
 | ⬜ | UPC `gs1_restricted_prefix` **6,665 条**历史黑名单未导入(upc_generator 定稿不迁,但这批黑名单号的处置没有交代) | `docs/legacy_survey.md:998,1026,2251` |
 | 🔴 | PT 5 维度风险表 / 禁售政策知识库 / TRO·商标黑名单 / 新审核系统三表(~25k 行):跨仓,迁移边界未定 | `docs/legacy_survey.md:2000-2001,1806,1915,1954,1963` |
 | ⬜ | "飞书表停用后的接班者"——产品中心黑名单增量脚本,四处文档承诺零代码 | `services/risk_gate.py:9` / `workflows/risk_sync.py:11` / `docs/listing_plan.md:80-82` / `refdata/schema.sql:225-227` |
+
+## 已拍板(2026-08-11,所有者六条)
+
+1. **品牌名来源**:从采集库读 `catalog.products.brand`(前置早已就位)。
+2. **「禁止品牌收集」D 列语义**:溯源列(该品牌来自哪个 SKU);**去重按品牌**。
+3. **ASIN 黑名单表已建**(收):wiki `UhZJw3EtsiFN9skbG0Ac24Dgn4b` / sheet `mPwUBu`,
+   列 = 黑名单ASIN / 来源 / 日期;来源格式 = 「沃尔玛-〈13 类之一〉」
+   (过期/禁售/品牌/价格/知产/限类/药品/信息/内容/特殊/审查/系统/其他),
+   日期 = 入库日期。与邮编黑名单同一个 wiki 承载。
+4. **品牌黑名单表已建**:同 wiki / sheet `beyKyi`,
+   列 = 黑名单品牌(后台报错集成) / 来源 / 入库日期 / SKU。
+5. **41.7 万行建模方向**:按 ASIN 去重后远小于 41.7 万;同一 ASIN 的多次报错
+   保留**时间线**形态(⇒ 事件表,不是 per-run 快照平移);报错要能挂到产品,
+   但产品库缺行的 ASIN 怎么办(建 stub 行 vs 只进事件表)**待定**。
+6. **DELETE 防重口径**:旧的自然日防重是"一天跑 4 次"的产物,现按日执行,
+   改**滚动 48h**,且**仅限 feed 无终态的**;有终态但商品又被扫到(= 提交成功、
+   沃尔玛给了结果、实际没删掉)⇒ **直接再执行,不等 48h**。
 
 ## 二、问题商品清理链 —— 旧 7 个 Step 只迁了中间一段
 
@@ -46,8 +63,7 @@
 
 ## 三、产品事件账本(catalog.product_events)
 
-- 📄 **事件码三处清单互不一致**(`refdata/schema.sql:159` / `docs/db_schema.md:179` / `services/product_events.py:3-22`);`maintenance_submitted`、`problem_categorized` 发了但没登记进"唯一出处"
-- ⬜ **事件码无代码常量**——全是字符串字面量,拼错不报错(schema.sql:154 说"常量表在 product_events.py",实际只有 docstring)
+- ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
 - ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`)
 - ⬜ 只有 `delete_*` 一支有消费者:`status_changed`/`match_submitted`/`list_submitted`/全部 `*_feed_failed`/`retire_feed_*` 只写不读——账本在长,读的人没跟上
 - ⬜ `product_risk` 视图只按 sku 聚合无 store 维度、单读者(list_new);`listed_times/last_removed_at/last_event_at` 三列无人读

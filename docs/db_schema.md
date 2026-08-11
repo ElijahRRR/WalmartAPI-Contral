@@ -177,10 +177,7 @@ CREATE TABLE catalog.product_events (
     sku text NOT NULL,              -- 业务约定 sku=asin,贯通两侧身份
     store text,                     -- 平台级事件可空
     event text NOT NULL,            -- 事件码唯一出处 services/product_events.py:
-                                    -- item_appeared/item_missing/item_reappeared/
-                                    -- status_changed(含官方下架原因)/
-                                    -- {delete|retire|maintenance}_{submitted|feed_success|feed_failed}/
-                                    -- delete_verified/delete_not_effective
+事件码唯一出处 = `services/product_events.py` 的常量与 `EVENTS` 集合(`record_many` 对未登记码抛错);本文档不再复述清单——三处清单曾各漂各的,`maintenance_submitted`/`problem_categorized` 发了大半个月没登记就是这么漏的。
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );

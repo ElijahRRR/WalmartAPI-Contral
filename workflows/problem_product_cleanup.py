@@ -67,9 +67,11 @@ WHERE f.status = 'submitted'
 # 还没重新扫到——结果未经观测确认前不重复动作("真相以观测为准"的闸门形态)。
 # 否则 feed 落定后、次日扫店前重跑本工作流,会把同一批 SKU 全量重发一遍。
 # 观测后自然解锁:扫到即 last_seen_at 前移;删成了即缺席出清单;failed 不拦(该重试)。
+# 事件名一律绑参传常量,不写字面量:读侧拼错 = 静默查空(计数恒 0,
+# "反补满 2 次转删"永不触发),和写侧拼错是同一类病,但更难发现。
 _SQL_ATTEMPTS = """
 SELECT store, sku, count(*) FROM catalog.product_events
-WHERE event = 'maintenance_submitted'
+WHERE event = %s
   AND source = 'problem_product_cleanup'
   AND occurred_at > now() - make_interval(days => %s)
 GROUP BY store, sku
@@ -78,7 +80,7 @@ GROUP BY store, sku
 # maintenance 工作流的标题/到期日期操作若记事件,不得污染反补转删计数
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
-FROM catalog.product_events WHERE event = 'problem_categorized'
+FROM catalog.product_events WHERE event = %s
 ORDER BY store, sku, occurred_at DESC
 """
 _SQL_STUBBORN = """
@@ -105,9 +107,10 @@ def _load_state():
                  for r in cur.fetchall()]
         cur.execute(_SQL_INFLIGHT)
         inflight = set(cur.fetchall())
-        cur.execute(_SQL_ATTEMPTS, (pp.ATTEMPT_RESET_DAYS,))
+        cur.execute(_SQL_ATTEMPTS, (product_events.MAINTENANCE_SUBMITTED,
+                                    pp.ATTEMPT_RESET_DAYS))
         attempts = {(s, k): n for s, k, n in cur.fetchall()}
-        cur.execute(_SQL_LAST_CAT)
+        cur.execute(_SQL_LAST_CAT, (product_events.PROBLEM_CATEGORIZED,))
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
         cur.execute(_SQL_STUBBORN)
         stubborn = {(st, k) for st, k, ev in cur.fetchall()
@@ -179,7 +182,7 @@ def _record_categories(items: list[dict], last_cat: dict) -> int:
     with db.pg_conn() as conn:
         product_events.record_many(conn, [
             {"sku": it["sku"], "store": it["store"],
-             "event": "problem_categorized",
+             "event": product_events.PROBLEM_CATEGORIZED,
              "source": "problem_product_cleanup",
              "detail": {"category": it["category"], "name": it["cat_name"],
                         "reason": (it["reasons"] or "")[:200]}}
@@ -290,13 +293,13 @@ def _submit_store(store_name: str, store: dict, b: dict,
             _submit("MP_MAINTENANCE",
                     [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
                      for r in b["relist"]],
-                    b["relist"], "maintenance_submitted", "反补")
+                    b["relist"], product_events.MAINTENANCE_SUBMITTED, "反补")
         if b["retire"]:
             _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
-                    b["retire"], "retire_submitted", "顽固停用")
+                    b["retire"], product_events.RETIRE_SUBMITTED, "顽固停用")
         if b["delete"]:
             _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
-                    b["delete"], "delete_submitted", "删除")
+                    b["delete"], product_events.DELETE_SUBMITTED, "删除")
     except _client.StoreDeadError as e:
         logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
         lines.append(f"  {store_name}:凭证失效跳过")

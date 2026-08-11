@@ -150,16 +150,15 @@ CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (i
 
 -- ── 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪)────────────────
 -- 一个 SKU(=ASIN,业务约定贯通)一生的病历:何时上架/何时下架及官方原因/
--- 何时提交删除/删除是否真生效/报了什么错。只追加永不改;
--- 事件码常量表在 services/product_events.py。
+-- 何时提交删除/删除是否真生效/报了什么错。只追加永不改。
+-- 事件码唯一出处 = services/product_events.py 的常量与 EVENTS 集合
+-- (record_many 对未登记码抛错)。**本文件不再维护事件码清单**——
+-- 三处清单曾各漂各的,导览请直接看那份代码。
 CREATE TABLE IF NOT EXISTS catalog.product_events (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sku         text NOT NULL,
     store       text,               -- 平台级事件可空
-    event       text NOT NULL,      -- item_appeared/item_missing/item_reappeared/
-                                    -- status_changed/delete_submitted/retire_submitted/
-                                    -- {delete|retire|maintenance}_feed_{success|failed}/
-                                    -- delete_verified/delete_not_effective …
+    event       text NOT NULL,      -- 合法值见 services/product_events.EVENTS
     source      text NOT NULL,      -- 来源工作流
     error_code  text,
     detail      jsonb,

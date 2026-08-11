@@ -34,6 +34,11 @@ class _Cur:
             self.rowcount = 0 if asin in self.conn.asin_rows else 1
             if self.rowcount:
                 self.conn.asin_rows[asin] = args
+        elif "INSERT INTO catalog.brand_err_hits" in sql:
+            key = args[0]
+            self.rowcount = 0 if key in self.conn.channel_rows else 1
+            if self.rowcount:
+                self.conn.channel_rows[key] = args
         elif "INSERT INTO catalog.brand_blacklist" in sql:
             key = args[0]
             self.rowcount = 0 if key in self.conn.brand_rows else 1
@@ -47,11 +52,13 @@ class _Cur:
 
 
 class _Conn:
-    def __init__(self, processed=(), brands=None, brand_rows=None):
+    def __init__(self, processed=(), brands=None, brand_rows=None,
+                 channel_rows=None):
         self.processed = set(processed)
         self.brands = brands or {}
         self.asin_rows: dict = {}
-        self.brand_rows: dict = dict(brand_rows or {})
+        self.brand_rows: dict = dict(brand_rows or {})     # 总清单镜像/闸门表
+        self.channel_rows: dict = dict(channel_rows or {})  # 后台报错渠道表
         self.marked: list = []
         self.executed: list = []
 
@@ -109,10 +116,12 @@ def test_biz_cn_is_flagged_independently():
 # ── 品牌收集 ──────────────────────────────────────────────────────────────────
 
 def test_collect_brands_only_c_and_e():
-    """品牌收集只看 C(品牌)/E(知产)——B 禁售是产品级问题,不牵连品牌。"""
+    """品牌收集只看 C(品牌)/E(知产)——B 禁售是产品级问题,不牵连品牌。
+    落两张表:渠道表(beyKyi 投影源)+ 否决闸(立刻挡重上架)。"""
     conn = _Conn(brands={"B0C": "Nike", "B0B": "Sony"})
     st = bl.collect_brands(conn, [_it("B0C", "C"), _it("B0B", "B")])
     assert st["brand_new"] == 1
+    assert list(conn.channel_rows) == ["nike"]
     assert list(conn.brand_rows) == ["nike"]
 
 
@@ -123,7 +132,7 @@ def test_collect_brands_dedupes_by_brand_not_sku():
     st = bl.collect_brands(conn, [_it("B0A", "C"), _it("B0B", "C")])
     assert st["brand_new"] == 1 and st["brand_known"] == 1
     assert sorted(conn.marked) == ["B0A", "B0B"]
-    assert conn.brand_rows["nike"][1] in ("Nike", "NIKE")   # casefold 键去重
+    assert conn.channel_rows["nike"][1] in ("Nike", "NIKE")  # casefold 键去重
 
 
 def test_collect_brands_skips_processed_asins():
@@ -131,7 +140,7 @@ def test_collect_brands_skips_processed_asins():
     conn = _Conn(processed={"B0OLD"}, brands={"B0OLD": "Nike"})
     st = bl.collect_brands(conn, [_it("B0OLD", "C")])
     assert st == {"brand_new": 0, "brand_known": 0, "no_brand": 0, "skipped": 1}
-    assert conn.brand_rows == {} and conn.marked == []
+    assert conn.channel_rows == {} and conn.brand_rows == {} and conn.marked == []
 
 
 def test_collect_brands_missing_brand_stays_unmarked():
@@ -140,17 +149,28 @@ def test_collect_brands_missing_brand_stays_unmarked():
     conn = _Conn(brands={})            # 产品中心查无此 ASIN
     st = bl.collect_brands(conn, [_it("B0NEW", "E")])
     assert st["no_brand"] == 1
-    assert conn.marked == [] and conn.brand_rows == {}
+    assert conn.marked == [] and conn.channel_rows == {}
 
 
-def test_collect_brands_does_not_overwrite_mirror_rows():
-    """risk_sync 镜像来的行不覆盖(DO NOTHING)——镜像行是飞书人工登记的
-    真值,自产行只补空白。"""
+def test_master_mirror_neither_blocks_channel_nor_gets_overwritten():
+    """品牌已在总清单(镜像行)≠ 渠道不记账(所有者厘清 2026-08-11:
+    渠道表完整记录沃尔玛渠道的发现,不与总清单去重——第一版挤在一张表里
+    按品牌冲突,总表已有的品牌永远进不了渠道)。同时总清单真值不覆盖。"""
     conn = _Conn(brands={"B0A": "Nike"}, brand_rows={"nike": ("镜像行",)})
     st = bl.collect_brands(conn, [_it("B0A", "C")])
+    assert st["brand_new"] == 1        # 渠道照记
+    assert "nike" in conn.channel_rows
+    assert conn.brand_rows["nike"] == ("镜像行",)   # 总清单镜像分毫不动
+    assert conn.marked == ["B0A"]
+
+
+def test_channel_known_brand_counts_known():
+    """渠道里已有的品牌,第二个 SKU 撞见 → brand_known,不重复入渠道。"""
+    conn = _Conn(brands={"B0B": "Nike"}, channel_rows={"nike": ("已在渠道",)})
+    st = bl.collect_brands(conn, [_it("B0B", "C")])
     assert st["brand_new"] == 0 and st["brand_known"] == 1
-    assert conn.brand_rows["nike"] == ("镜像行",)
-    assert conn.marked == ["B0A"]      # 品牌已在名单,ASIN 该标已处理
+    assert conn.channel_rows["nike"] == ("已在渠道",)
+    assert conn.marked == ["B0B"]
 
 
 # ── 尾段隔离(cleanup 主链不受收集失败影响)──────────────────────────────────

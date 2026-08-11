@@ -49,8 +49,12 @@ def wired(monkeypatch):
         def __exit__(self, *a): return False
         def execute(self, sql, args=None):
             self._sql = sql
-            self._rows = (calls.get("asin_pending", []) if "asin_blacklist" in sql
-                          else calls.get("brand_pending", []))
+            if "asin_blacklist" in sql:
+                self._rows = calls.get("asin_pending", [])
+            elif "ORDER BY added_date" in sql:          # 渠道全量(rebuild 用)
+                self._rows = calls.get("channel_rows", [])
+            else:
+                self._rows = calls.get("brand_pending", [])
         def fetchall(self): return self._rows
         def fetchone(self):
             key = "asin_stats" if "asin_blacklist" in self._sql else "brand_stats"
@@ -62,7 +66,7 @@ def wired(monkeypatch):
         def cursor(self): return _Cur()
         def execute(self, sql, args):
             calls["marked"].append(("asin" if "asin_blacklist" in sql else "brand",
-                                    list(args[0])))
+                                    list(args[0]) if args else "ALL"))
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     return calls, sheet_cells
 
@@ -119,15 +123,17 @@ def test_push_warns_at_limit(wired):
     assert "达单轮上限 5" in out
 
 
-def test_brand_pending_excludes_master_mirror_rows():
-    """beyKyi 只承接沃尔玛后台自产品牌(所有者厘清 2026-08-11:它是归拢
-    「黑名单品牌总表」的一条**增量渠道**,总表镜像行回推 = 把总清单整个
-    复制进渠道表)。只能断言 SQL 文本:夹具喂什么都盖不住 WHERE 少条件。
-    探针对账口径必须与推送范围同宽,两处一起钉。"""
-    assert "src_sku IS NOT NULL" in wf._BRAND_PENDING
+def test_brand_projection_reads_channel_table_only():
+    """beyKyi 的数据源是渠道表 brand_err_hits,**绝不**碰总清单镜像表
+    brand_blacklist(历史上两次走错:只推镜像表自产行→总表已有的品牌
+    永远进不了渠道;整表全推→总清单被复制进渠道表)。SQL 文本钉死,
+    探针对账口径与推送范围同表。"""
+    for sql in (wf._BRAND_PENDING, wf._BRAND_STATS, wf._BRAND_MARK,
+                wf._CHANNEL_ALL, wf._CHANNEL_MARK_ALL):
+        assert "brand_err_hits" in sql
+        assert "brand_blacklist" not in sql
     assert "pushed_at IS NULL" in wf._BRAND_PENDING
     assert "pushed_at IS NULL" in wf._ASIN_PENDING
-    assert "src_sku IS NOT NULL" in wf._BRAND_STATS
 
 
 # ── 历史回填 ──────────────────────────────────────────────────────────────────
@@ -170,6 +176,43 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     out = wf.run({"backfill": "1"})
     assert "永久禁止 10 个" in out and "apply=1" in out
     assert wrote == []
+
+
+# ── 品牌渠道重建(一次性:清错版内容 + 从时间线重灌)──────────────────────────
+
+def test_rebuild_brand_preview_does_not_write(wired, monkeypatch):
+    """预览只报数:渠道规模 + beyKyi 现有行数 + 将重写成多少行,零写入。"""
+    calls, cells = wired
+    cells["brand"] = ["a", "b", "c"]
+    monkeypatch.setattr(wf.blacklist, "channel_counts",
+                        lambda conn: {"with_brand": 2573, "no_brand": 129,
+                                      "brands": 1800})
+    out = wf.run({"rebuild_brand": "1"})
+    assert "可解析品牌 1800 个" in out and "现有 3 行" in out
+    assert "整表重写为 1800 行" in out and "apply=1" in out
+    assert calls["writes"] == [] and calls["marked"] == []
+
+
+def test_rebuild_brand_apply_overwrites_and_marks_all(wired, monkeypatch):
+    """apply:渠道表重灌 → beyKyi 整表重写(表头 + 全量数据行,错版残留
+    由 sheet_overwrite 的尾部裁剪清掉)→ 全表打水位。"""
+    calls, cells = wired
+    overwritten = []
+    monkeypatch.setattr(wf.blacklist, "channel_counts",
+                        lambda conn: {"with_brand": 3, "no_brand": 1, "brands": 2})
+    monkeypatch.setattr(wf.blacklist, "rebuild_brand_channel",
+                        lambda conn: {"wiped": 42064, "brands": 2})
+    monkeypatch.setattr(wf.feishu, "sheet_overwrite",
+                        lambda s, rows: overwritten.append(rows) or len(rows))
+    calls["channel_rows"] = [("Nike", "沃尔玛-品牌", "2026-04-20", "B0A"),
+                             ("Sony", "沃尔玛-知产", "2026-05-01", None)]
+    out = wf.run({"rebuild_brand": "1", "apply": "1"})
+    assert "重灌 2 个品牌" in out and "整表重写 2 行" in out
+    rows = overwritten[0]
+    assert len(rows) == 3               # 表头 + 2 数据行
+    assert rows[1] == ["Nike", "沃尔玛-品牌", "2026-04-20", "B0A"]
+    assert rows[2] == ["Sony", "沃尔玛-知产", "2026-05-01", ""]   # 溯源空串
+    assert ("brand", "ALL") in calls["marked"]      # 全表打水位
 
 
 # ── 只读探针(换表格 / "写了看不见"时的第一诊断)──────────────────────────────

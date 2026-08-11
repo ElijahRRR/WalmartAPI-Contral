@@ -168,6 +168,16 @@ CREATE TABLE catalog.risk_product_types (product_type PK, category, ptg,
     field_total, field_required, field_list, synced_at);
 CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
     added_date, synced_at);
+-- ↑ 黑名单品牌**总清单**镜像(risk_sync 飞书→PG)+ 否决闸数据源;
+--   cleanup 自产品牌 DO NOTHING 补进闸门。src_sku/biz_cn/pushed_at 三列为
+--   2026-08-11 过渡遗留,不再被消费(投影改走 brand_err_hits)。
+
+-- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
+-- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清
+-- 2026-08-11)。历史重建走 blacklist_push -p rebuild_brand=1(擦净重灌 +
+-- beyKyi 整表重写),日常由 problem_product_cleanup 尾段实时入账。
+CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
+    added_date, src_sku, biz_cn, pushed_at, created_at);
 ```
 
 ```sql

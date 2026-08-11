@@ -258,13 +258,30 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     added_date text,                 -- 入库日期(表格原样)
     synced_at timestamptz NOT NULL DEFAULT now()
 );
--- 收集侧补列(2026-08-11,自产回路接通):src_sku 溯源(该品牌从哪个 SKU 来,
--- 所有者定稿:溯源列,**去重仍按品牌**);pushed_at 飞书投影水位(NULL=待推,
--- 只推自产行 src_sku IS NOT NULL——beyKyi 是归拢总表的增量渠道,只报沃尔玛
--- 后台新发现的品牌;总表镜像行(risk_sync 从 jF8dOw 进来的)不回推)。
+-- 收集侧补列(2026-08-11 过渡遗留):src_sku/biz_cn/pushed_at 当天曾用于
+-- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
+-- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
+-- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
+
+-- 品牌·后台报错渠道表(beyKyi 投影的数据源,PG 权威):完整记录"沃尔玛
+-- 后台问题商品拿到过哪些品牌"。渠道内按品牌去重(brand_key PK),
+-- **不与总清单去重**——品牌已在总表不挡渠道入账(所有者厘清 2026-08-11:
+-- 渠道表是归拢总表的原料,挤在 brand_blacklist 里按品牌冲突会让"总表已有
+-- 的品牌"永远进不了渠道)。added_date 存报错发生日(历史重建取时间线
+-- occurred_at,实时取当天)。
+CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
+    brand_key  text PRIMARY KEY,             -- casefold/lower 品牌键
+    brand      text NOT NULL,                -- 品牌名原文
+    source     text,                         -- 沃尔玛-品牌 / 沃尔玛-知产
+    added_date text,                         -- 报错发生日 YYYY-MM-DD
+    src_sku    text,                         -- 溯源:来自哪个 SKU
+    biz_cn     boolean NOT NULL DEFAULT false,
+    pushed_at  timestamptz,                  -- 飞书投影水位(NULL=待推)
+    created_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS

@@ -20,13 +20,18 @@
 
 推送范围:
   catalog.asin_blacklist   pushed_at IS NULL 的全部行(ASIN 表 = 库的全量映射)
-  catalog.brand_blacklist  pushed_at IS NULL **且 src_sku IS NOT NULL**——
-                           src_sku 是自产行(沃尔玛后台报错来的)的指纹;
-                           总表经 risk_sync 镜像进库的行不回推,推了 =
-                           把总清单整个复制进增量渠道表,归拢当场乱套。
-                           已在总表里的品牌 cleanup 再撞见也不重复报
-                           (落库 DO NOTHING,自然不产生待推行)——渠道表
-                           只报**新发现**,这正是归拢要的增量语义
+  catalog.brand_err_hits   pushed_at IS NULL 的全部行(beyKyi = 渠道表的
+                           全量映射)。渠道表**不与总清单去重**——品牌已在
+                           总表不挡渠道入账;总清单镜像(brand_blacklist)
+                           与渠道表各管各的,永不混写。曾有两版走错:
+                           ①只推 brand_blacklist 自产行(总表已有的品牌
+                           永远进不了渠道);②整表全推(把总清单复制进了
+                           渠道表)。现行口径为所有者终版。
+
+一次性命令:
+  -p rebuild_brand=1 [-p apply=1]  品牌渠道重建:从时间线重灌渠道表
+      (每品牌取最早报错日),beyKyi **整表重写**——同时清掉 ②号错版
+      复制进去的 42,064 行总清单内容。预览先行,apply 才动。
 
 水位语义:每块写成功后当场把该块行的 pushed_at 打上。写表与打水位之间
 崩掉的话,那一块下次会**重推(表里出现重复行)而不是丢行**——收集表是
@@ -67,13 +72,13 @@ UPDATE catalog.asin_blacklist SET pushed_at = now() WHERE asin = ANY(%s)
 
 _BRAND_PENDING = """
 SELECT brand_key, brand, source, added_date, src_sku
-FROM catalog.brand_blacklist
-WHERE pushed_at IS NULL AND src_sku IS NOT NULL
-ORDER BY synced_at LIMIT %s
+FROM catalog.brand_err_hits
+WHERE pushed_at IS NULL
+ORDER BY created_at LIMIT %s
 """
 
 _BRAND_MARK = """
-UPDATE catalog.brand_blacklist SET pushed_at = now() WHERE brand_key = ANY(%s)
+UPDATE catalog.brand_err_hits SET pushed_at = now() WHERE brand_key = ANY(%s)
 """
 
 _ASIN_STATS = """
@@ -83,8 +88,15 @@ FROM catalog.asin_blacklist
 
 _BRAND_STATS = """
 SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
-FROM catalog.brand_blacklist WHERE src_sku IS NOT NULL
+FROM catalog.brand_err_hits
 """
+
+_CHANNEL_ALL = """
+SELECT brand, source, added_date, src_sku
+FROM catalog.brand_err_hits ORDER BY added_date, brand_key
+"""
+
+_CHANNEL_MARK_ALL = "UPDATE catalog.brand_err_hits SET pushed_at = now()"
 
 
 def _probe() -> str:
@@ -161,33 +173,71 @@ def _append(sheet, rows: list[list], mark, keys: list) -> tuple[int, int]:
     return written, blocks
 
 
-def run(params: dict) -> str:
-    """输入:params(limit/backfill/apply)→ 输出:推送摘要。
+def _rebuild_brand(do_apply: bool) -> str:
+    """输入:是否 apply → 输出:品牌渠道重建摘要(见模块头「一次性命令」)。
 
-    -p backfill=1:从历史时间线按「每 ASIN 最新类别」推导入选(预览计数);
-    加 -p apply=1 真写,写完顺路照常投影。一次性动作,重复跑无害
-    (DO NOTHING/防重台账都幂等)。
+    apply 三步:①渠道表擦净重灌;②beyKyi **整表重写**(表头行回读原样
+    保留,数据行全量替换,sheet_overwrite 会删掉尾部残留——错版复制进去
+    的总清单内容就是这样清掉的);③全表打 pushed_at 水位。
+    """
+    sheet = resources.BRAND_ERR_SHEET
+    with db.pg_conn() as conn:
+        c = blacklist.channel_counts(conn)
+        if not do_apply:
+            filled = _next_empty(sheet) - 2
+            return (f"品牌渠道重建预览:时间线 C/E 最新类 ASIN "
+                    f"{c['with_brand'] + c['no_brand']} 个,可解析品牌 "
+                    f"{c['brands']} 个(缺品牌 ASIN {c['no_brand']} 个,"
+                    f"等 product_ingest 补齐后由日常链路自然入账);"
+                    f"beyKyi 现有 {filled} 行将被整表重写为 {c['brands']} 行;"
+                    f"加 -p apply=1 执行")
+        st = blacklist.rebuild_brand_channel(conn)
+
+    s = sheet.require()
+    hdr = feishu.sheet_values(s, "A1:D1")
+    header = ((hdr[0] if hdr else []) + [""] * 4)[:4]
+    if not any(str(h or "").strip() for h in header):
+        header = list(s.columns)        # 表头意外为空才用登记列名兜底
+    with db.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_CHANNEL_ALL)
+            rows = [[b, src or "", day or "", sku or ""]
+                    for b, src, day, sku in cur.fetchall()]
+    feishu.sheet_overwrite(s, [header] + rows)
+    with db.pg_conn() as conn:
+        conn.execute(_CHANNEL_MARK_ALL, ())
+    return (f"品牌渠道重建:渠道表擦净 {st['wiped']} 行 → 重灌 "
+            f"{st['brands']} 个品牌;beyKyi 整表重写 {len(rows)} 行"
+            f"(缺品牌 ASIN {c['no_brand']} 个等补齐后自然入账)")
+
+
+def run(params: dict) -> str:
+    """输入:params(limit/probe/backfill/rebuild_brand/apply)→ 输出:推送摘要。
+
+    -p backfill=1:ASIN 历史回填(预览计数;加 -p apply=1 真写后顺路投影)。
+    -p rebuild_brand=1:品牌渠道重建(见 _rebuild_brand)。
+    两者都是一次性动作,重复跑无害(DO NOTHING/擦净重灌都幂等)。
     """
     if str(params.get("probe", "")).lower() in {"1", "true", "yes"}:
         return _probe()
+
+    do_apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
+    if str(params.get("rebuild_brand", "")).lower() in {"1", "true", "yes"}:
+        return _rebuild_brand(do_apply)
 
     limit = int(params.get("limit", 1_000_000))
     lines = []
 
     if str(params.get("backfill", "")).lower() in {"1", "true", "yes"}:
-        do_apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
         with db.pg_conn() as conn:
             c = blacklist.backfill_counts(conn)
             if not do_apply:
                 return (f"历史回填预览:时间线共 {c['total']} 个 ASIN,"
-                        f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单),"
-                        f"C/E 品牌候选 {c['brand_cand']} 个"
-                        f"(已处理/缺品牌的落库时再分流);"
+                        f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单);"
+                        f"品牌渠道的历史重建走 -p rebuild_brand=1;"
                         f"加 -p apply=1 真写并顺路投影")
             st = blacklist.backfill_from_events(conn)
-        lines.append(f"历史回填:ASIN +{st['asin_new']},品牌 +{st['brand_new']}"
-                     f"(已知 {st['brand_known']},缺品牌 {st['no_brand']},"
-                     f"已处理跳过 {st['skipped']})")
+        lines.append(f"历史回填:ASIN +{st['asin_new']}")
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:

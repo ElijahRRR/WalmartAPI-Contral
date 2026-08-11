@@ -17,6 +17,16 @@
   ('cleanup:brand_asin',历史 2,609 个已导入)——品牌还没采到的 ASIN
   **不标已处理**,等产品中心补上品牌后自然重试。
 
+  品牌落**两张表**(所有者厘清 2026-08-11):
+    catalog.brand_err_hits   渠道表(beyKyi 投影源):完整记录沃尔玛后台
+                             拿到过哪些品牌,渠道内按品牌去重,**不与总
+                             清单去重**——挤在 brand_blacklist 里按品牌
+                             冲突,总表已有的品牌就永远进不了渠道(第一版
+                             的建模缺陷,当天修正)。brand_new/known 按
+                             渠道表算。
+    catalog.brand_blacklist  总清单镜像 + 否决闸:自产品牌 DO NOTHING
+                             补进闸门,立刻挡住重上架;总表真值不覆盖。
+
   BIZ-CN 独立成维度(legacy_survey:2077:唯一明确标注中国卖家专属禁售的
   错误码,不能被 C 品牌类的关键词匹配吸收)——两张表都带 biz_cn 布尔列。
 
@@ -86,10 +96,16 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
   AND coalesce(btrim(brand), '') <> ''
 """
 
-_BRAND_SQL = """
-INSERT INTO catalog.brand_blacklist
+_CHANNEL_SQL = """
+INSERT INTO catalog.brand_err_hits
     (brand_key, brand, source, added_date, src_sku, biz_cn)
 VALUES (%s, %s, %s, CURRENT_DATE::text, %s, %s)
+ON CONFLICT (brand_key) DO NOTHING
+"""
+
+_GATE_SQL = """
+INSERT INTO catalog.brand_blacklist (brand_key, brand, source, added_date)
+VALUES (%s, %s, %s, CURRENT_DATE::text)
 ON CONFLICT (brand_key) DO NOTHING
 """
 
@@ -102,10 +118,10 @@ VALUES (%s, %s, %s::jsonb) ON CONFLICT DO NOTHING
 def collect_brands(conn, items: list[dict]) -> dict:
     """输入:连接 + 当轮已归类 item → 输出:统计 dict。
 
-    C/E 类 → 查品牌 → 新品牌入 brand_blacklist(**DO NOTHING**:risk_sync
-    镜像来的行不覆盖——镜像行是飞书人工登记的真值,自产行只补空白)→
-    标 ASIN 已处理。**品牌缺失的 ASIN 不标已处理**:产品中心还没这行或
-    brand 为空,等 product_ingest 补上后下一轮自然重试,标了就永远漏了。
+    C/E 类 → 查品牌 → 入渠道表 brand_err_hits(brand_new/known 按渠道算)
+    + DO NOTHING 补进否决闸 brand_blacklist(总表真值不覆盖)→ 标 ASIN
+    已处理。**品牌缺失的 ASIN 不标已处理**:产品中心还没这行或 brand 为空,
+    等 product_ingest 补上后下一轮自然重试,标了就永远漏了。
     """
     stats = {"brand_new": 0, "brand_known": 0, "no_brand": 0, "skipped": 0}
     cands = {it["sku"]: it for it in items
@@ -126,20 +142,22 @@ def collect_brands(conn, items: list[dict]) -> dict:
             if not brand:
                 stats["no_brand"] += 1      # 不标已处理:等品牌到位重试
                 continue
-            cur.execute(_BRAND_SQL, (
-                brand.casefold(), brand, source_label(it["category"]),
+            label = source_label(it["category"])
+            cur.execute(_CHANNEL_SQL, (
+                brand.casefold(), brand, label,
                 asin, is_biz_cn(it.get("reasons"))))
             if cur.rowcount:
                 stats["brand_new"] += 1
             else:
                 stats["brand_known"] += 1
+            cur.execute(_GATE_SQL, (brand.casefold(), brand, label))
             cur.execute(_MARK_SQL, (BRAND_ASIN_SCOPE, asin,
                                     json.dumps({"brand": brand.casefold()},
                                                ensure_ascii=False)))
     return stats
 
 
-# ── 历史回填(blacklist_push -p backfill=1 用,一次性)──────────────────────────
+# ── 历史回填(blacklist_push -p backfill=1 / rebuild_brand=1 用,一次性)────────
 #
 # 从 product_events 的归类时间线按「每个 ASIN 的**最新**类别」推导入选——
 # 与实时链路同一条原则(最新类别命中才算,"曾命中过"不作数)。跨店取全局
@@ -148,7 +166,7 @@ def collect_brands(conn, items: list[dict]) -> dict:
 
 _LATEST_CTE = """
 WITH latest AS (
-    SELECT DISTINCT ON (sku) sku, store,
+    SELECT DISTINCT ON (sku) sku, store, occurred_at,
            detail->>'category' AS cat, detail->>'reason' AS reason
     FROM catalog.product_events
     WHERE event = 'problem_categorized'
@@ -175,11 +193,6 @@ FROM latest WHERE cat = ANY(%(perm)s)
 ON CONFLICT (asin) DO NOTHING
 """
 
-_BACKFILL_BRAND_ROWS_SQL = _LATEST_CTE + """
-SELECT sku, store, cat, reason FROM latest WHERE cat = ANY(%(brandcats)s)
-"""
-
-
 def backfill_counts(conn) -> dict:
     """输入:连接 → 输出:回填预览计数(不写任何东西)。"""
     with conn.cursor() as cur:
@@ -190,14 +203,62 @@ def backfill_counts(conn) -> dict:
 
 
 def backfill_from_events(conn) -> dict:
-    """输入:连接 → 输出:回填统计。ASIN 集合级 INSERT(万级量,逐行太慢);
-    品牌复用 collect_brands(同一套去重/防重/缺品牌不标记语义,量小)。"""
+    """输入:连接 → 输出:ASIN 回填统计(集合级 INSERT,万级量逐行太慢)。
+    品牌渠道的历史重建走 rebuild_brand_channel(单独命令,含清表重灌)。"""
     with conn.cursor() as cur:
         cur.execute(_BACKFILL_ASIN_SQL, {"perm": sorted(PERMANENT)})
-        asin_new = cur.rowcount or 0
-        cur.execute(_BACKFILL_BRAND_ROWS_SQL,
-                    {"brandcats": sorted(BRAND_CATEGORIES)})
-        items = [{"sku": sku, "store": store, "category": cat, "reasons": reason}
-                 for sku, store, cat, reason in cur.fetchall()]
-    brand_stats = collect_brands(conn, items)
-    return {"asin_new": asin_new, **brand_stats}
+        return {"asin_new": cur.rowcount or 0}
+
+
+# ── 品牌渠道重建(blacklist_push -p rebuild_brand=1,一次性)───────────────────
+#
+# 渠道表从时间线整体重灌:C/E 最新类 ASIN × catalog.products.brand,
+# 每品牌取**最早**报错日当 added_date(渠道账是"何时首次发现")。
+# 绕过 ops.dedupe——那本账管"这个 ASIN 别重复采集",不管"渠道该不该记账";
+# 历史 2,573 个已处理 ASIN 的品牌正是被它挡在渠道外的(建模缺陷,已修)。
+
+_CHANNEL_WIPE_SQL = "DELETE FROM catalog.brand_err_hits"
+
+_CHANNEL_COUNT_SQL = _LATEST_CTE + """
+SELECT count(*) FILTER (WHERE coalesce(btrim(p.brand), '') <> ''),
+       count(*) FILTER (WHERE coalesce(btrim(p.brand), '') = ''),
+       count(DISTINCT lower(btrim(p.brand)))
+           FILTER (WHERE coalesce(btrim(p.brand), '') <> '')
+FROM latest l
+LEFT JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.sku
+WHERE l.cat = ANY(%(brandcats)s)
+"""
+
+_CHANNEL_REBUILD_SQL = _LATEST_CTE + """
+INSERT INTO catalog.brand_err_hits
+    (brand_key, brand, source, added_date, src_sku, biz_cn)
+SELECT DISTINCT ON (lower(btrim(p.brand)))
+       lower(btrim(p.brand)), btrim(p.brand),
+       '沃尔玛-' || CASE l.cat WHEN 'C' THEN '品牌' WHEN 'E' THEN '知产' END,
+       l.occurred_at::date::text, l.sku,
+       (lower(coalesce(l.reason, '')) LIKE '%%biz-cn%%'
+        OR lower(coalesce(l.reason, '')) LIKE '%%reference code biz%%')
+FROM latest l
+JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.sku
+WHERE l.cat = ANY(%(brandcats)s) AND coalesce(btrim(p.brand), '') <> ''
+ORDER BY lower(btrim(p.brand)), l.occurred_at
+ON CONFLICT (brand_key) DO NOTHING
+"""
+
+
+def channel_counts(conn) -> dict:
+    """输入:连接 → 输出:渠道重建预览计数(不写任何东西)。"""
+    with conn.cursor() as cur:
+        cur.execute(_CHANNEL_COUNT_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
+        with_brand, no_brand, brands = cur.fetchone()
+    return {"with_brand": with_brand, "no_brand": no_brand, "brands": brands}
+
+
+def rebuild_brand_channel(conn) -> dict:
+    """输入:连接 → 输出:{wiped, brands}。擦净重灌(渠道表是时间线的投影,
+    投影可以重投——与 cleanup_history_import 事件侧同一权衡)。"""
+    with conn.cursor() as cur:
+        cur.execute(_CHANNEL_WIPE_SQL)
+        wiped = cur.rowcount or 0
+        cur.execute(_CHANNEL_REBUILD_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
+        return {"wiped": wiped, "brands": cur.rowcount or 0}

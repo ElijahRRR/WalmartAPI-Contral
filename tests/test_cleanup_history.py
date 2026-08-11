@@ -110,7 +110,36 @@ def test_parse_brand_cache():
     processed, pending = ch.parse_brand_cache(
         {"processed_asins": ["B0A", "B0B"], "pending_batches": [{"id": 7}]})
     assert processed == ["B0A", "B0B"] and pending == [{"id": 7}]
-    assert ch.parse_brand_cache({}) == ([], [])
+    assert ch.parse_brand_cache({}) == ([], [])          # 真空文件:合法
+
+
+def test_swapped_files_are_rejected_not_silently_empty():
+    """seen/brand 两个 -p 参数传反必须当场炸(2026-08-11 生产实操差点踩到)。
+
+    不炸的话两个解析器都会"成功"导入 0 条——累计数缺一笔、品牌防重缺一笔,
+    摘要看着正常,没人知道。按形状指纹互相拒绝。
+    """
+    brand_shape = {"processed_asins": ["B0A"], "pending_batches": []}
+    seen_shape = {"B0A": ["C"]}
+    with pytest.raises(ValueError, match="传反"):
+        ch.parse_seen(brand_shape)
+    with pytest.raises(ValueError, match="传反"):
+        ch.parse_brand_cache(seen_shape)
+
+
+def test_seen_all_unrecognized_raises():
+    """非空文件解析出 0 对 = 类别全认不出,报错别静默。"""
+    with pytest.raises(ValueError, match="0 对"):
+        ch.parse_seen({"B0A": ["不存在的类"]})
+
+
+def test_run_rejects_missing_file_before_heavy_work(monkeypatch):
+    """文件不存在要在**事件导入之前**拦住——实操中路径打错,48.5 万行
+    导完才炸在 JSON 上,摘要全丢。早失败 = 不浪费一轮重活。"""
+    monkeypatch.setattr(wf.db, "legacy_cleanup_conn",
+                        lambda: pytest.fail("文件检查必须在连旧库之前"))
+    out = wf.run({"seen": "/no/such/file.json"})
+    assert out.startswith("⛔") and "/no/such/file.json" in out
 
 
 # ── 导入器纪律 ────────────────────────────────────────────────────────────────

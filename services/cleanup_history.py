@@ -97,6 +97,13 @@ def parse_seen(obj) -> list[tuple[str, str]]:
       [["SKU1", "C"], ["SKU1", "E"], ...] 平铺对
     其余形态直接抛错报出真实形状——猜错静默丢对,累计数就永远对不上了。
     """
+    if isinstance(obj, dict) and ("processed_asins" in obj
+                                  or "pending_batches" in obj):
+        # 2026-08-11 生产实操差点踩到:seen/brand 两个 -p 参数传反时,
+        # brand_cache 的形状在这里会被"成功"解析成 0 对——静默空导比报错
+        # 危险得多(累计数缺一笔且无人知道)。按形状指纹当场拒绝。
+        raise ValueError("这是 brand_cache.json 的形状(含 processed_asins/"
+                         "pending_batches 键)——-p seen 与 -p brand 传反了?")
     pairs: list[tuple[str, str]] = []
     if isinstance(obj, dict):
         for sku, cats in obj.items():
@@ -104,6 +111,9 @@ def parse_seen(obj) -> list[tuple[str, str]]:
                 code = norm_category(c)
                 if sku and code:
                     pairs.append((str(sku), code))
+        if obj and not pairs:
+            raise ValueError("seen 文件非空却解析出 0 对——类别值全认不出,"
+                             "多半是文件传错或格式变了,先人工看一眼")
         return pairs
     if isinstance(obj, list) and all(isinstance(x, (list, tuple)) and len(x) == 2
                                      for x in obj):
@@ -126,6 +136,11 @@ def parse_brand_cache(obj) -> tuple[list[str], list[dict]]:
     """
     if not isinstance(obj, dict):
         raise ValueError(f"brand_cache 形态未识别:顶层是 {type(obj).__name__}")
+    if obj and "processed_asins" not in obj and "pending_batches" not in obj:
+        # 同上的反向:seen 的形状喂进来会"成功"解析成 (0 个 ASIN, 0 批次)
+        raise ValueError(f"brand_cache 缺 processed_asins/pending_batches 键,"
+                         f"顶层键样本:{sorted(obj)[:5]}"
+                         f"——-p seen 与 -p brand 传反了?")
     processed = [str(a) for a in (obj.get("processed_asins") or []) if a]
     pending = obj.get("pending_batches") or []
     if not isinstance(pending, list):

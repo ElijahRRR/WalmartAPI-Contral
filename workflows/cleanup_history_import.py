@@ -118,15 +118,14 @@ def _import_events(legacy) -> dict:
     return {**folder.stats, "wiped": wiped}
 
 
-def _import_seen(path: str) -> str:
-    pairs = ch.parse_seen(json.loads(Path(path).read_text()))
+def _import_seen(pairs: list) -> str:
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.executemany(_SEEN_SQL, pairs)
     return f"seen 对 {len(pairs)} 条入 ops.cleanup_seen_categories(已存在跳过)"
 
-def _import_brand(path: str) -> str:
-    processed, pending = ch.parse_brand_cache(json.loads(Path(path).read_text()))
+def _import_brand(parsed: tuple) -> str:
+    processed, pending = parsed
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.executemany(_DEDUPE_SQL,
@@ -146,6 +145,21 @@ def run(params: dict) -> str:
     brand_path = str(params.get("brand", "")).strip()
     lines = []
 
+    # 文件检查放在一切重活之前(2026-08-11 实操教训:路径打错时事件导入
+    # 已经跑完才炸在 JSON 上,摘要全丢,人对着 traceback 猜发生了什么)。
+    # 顺带在这里就解析——形状指纹校验(seen/brand 传反)也要趁早炸。
+    payloads: dict = {}
+    for label, path in (("seen", seen_path), ("brand", brand_path)):
+        if not path:
+            continue
+        f = Path(path)
+        if not f.is_file():
+            return (f"⛔ {label} 文件不存在:{path}"
+                    f"(路径要从 /Users/… 起,别带示例里的 /path 前缀)")
+        obj = json.loads(f.read_text())
+        payloads[label] = (ch.parse_seen(obj) if label == "seen"
+                           else ch.parse_brand_cache(obj))
+
     with db.legacy_cleanup_conn() as legacy:
         cols, total = _probe(legacy)
         missing = _NEED_COLS - cols
@@ -163,12 +177,10 @@ def run(params: dict) -> str:
                 dist = cur.fetchall()
             lines.append("类别分布(前 20):" + ", ".join(
                 f"{c}×{n}" for c, n in dist))
-            for label, path in (("seen", seen_path), ("brand", brand_path)):
-                if path:
-                    obj = json.loads(Path(path).read_text())
-                    n = (len(ch.parse_seen(obj)) if label == "seen"
-                         else len(ch.parse_brand_cache(obj)[0]))
-                    lines.append(f"{label} 文件可解析:{n} 条")
+            if "seen" in payloads:
+                lines.append(f"seen 文件可解析:{len(payloads['seen'])} 对")
+            if "brand" in payloads:
+                lines.append(f"brand 文件可解析:{len(payloads['brand'][0])} 个 ASIN")
             lines.append("预览完毕;-p apply=1 真正入库(事件侧擦净重灌,"
                          "seen/brand 侧 DO NOTHING)")
             return ";".join(lines)
@@ -178,10 +190,10 @@ def run(params: dict) -> str:
                      f"(擦净旧导入 {st['wiped']} 条"
                      + (f",类别未识别 {st['unknown_category']} 行(原文已随行入库)"
                         if st['unknown_category'] else "") + ")")
-    if seen_path:
-        lines.append(_import_seen(seen_path))
-    if brand_path:
-        lines.append(_import_brand(brand_path))
+    if "seen" in payloads:
+        lines.append(_import_seen(payloads["seen"]))
+    if "brand" in payloads:
+        lines.append(_import_brand(payloads["brand"]))
     if not seen_path or not brand_path:
         lines.append("⚠ seen/brand 未全给:报表累计数与品牌防重各缺一笔,"
                      "补齐路径重跑即可(DO NOTHING 幂等)")

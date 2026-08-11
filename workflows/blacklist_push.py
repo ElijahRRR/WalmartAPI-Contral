@@ -8,20 +8,25 @@
   python cli.py blacklist_push -p limit=500 # 单轮总量上限(默认不限;
                                             # 单请求 4000 行分块自动切)
 
-方向只有一个:PG → 飞书(PG 权威,表是人机界面;所有者建表时明说
-"用于数据库的映射")。**人不直接编辑这两张表**,人工登记走旧「禁止品牌
-收集」那张(risk_sync 镜像回 PG),两条通道不交叉。
+方向只有一个:PG → 飞书(PG 权威,表是人机界面)。品牌有**两张**飞书表,
+角色相反,别混(所有者厘清 2026-08-11,此前混过一次):
 
-推送范围(所有者拍板 2026-08-11:两张表都是**数据库的全量映射**,
-防重只发生在落库,投影层照单全推):
-  catalog.asin_blacklist   pushed_at IS NULL 的全部行
-  catalog.brand_blacklist  pushed_at IS NULL 的全部行——含 risk_sync 从旧
-                           「禁止品牌收集」镜像来的行(src_sku 为空,SKU 列
-                           写空串)。第一版曾把镜像行排除在投影外,是把
-                           防重错放到了投影层。两条安全性已核实:
-                           ① 不循环——risk_sync 只读旧表,本表不是它的来源;
-                           ② 不反复重推——risk_gate.sync_brands 的 upsert
-                             不碰 pushed_at,镜像行推一次水位永久有效
+  「黑名单品牌总表」(BRAND_BAN_SHEET,jF8dOw)——各渠道黑名单品牌由
+  所有者人工归拢的总清单,方向**飞书→PG**,risk_sync 负责,与本工作流无关。
+
+  「黑名单品牌(后台报错集成)」(BRAND_ERR_SHEET,beyKyi)——方向
+  **PG→飞书**,只承接沃尔玛后台问题商品拿到的品牌,是所有者归拢总表时
+  的一条**增量渠道**。
+
+推送范围:
+  catalog.asin_blacklist   pushed_at IS NULL 的全部行(ASIN 表 = 库的全量映射)
+  catalog.brand_blacklist  pushed_at IS NULL **且 src_sku IS NOT NULL**——
+                           src_sku 是自产行(沃尔玛后台报错来的)的指纹;
+                           总表经 risk_sync 镜像进库的行不回推,推了 =
+                           把总清单整个复制进增量渠道表,归拢当场乱套。
+                           已在总表里的品牌 cleanup 再撞见也不重复报
+                           (落库 DO NOTHING,自然不产生待推行)——渠道表
+                           只报**新发现**,这正是归拢要的增量语义
 
 水位语义:每块写成功后当场把该块行的 pushed_at 打上。写表与打水位之间
 崩掉的话,那一块下次会**重推(表里出现重复行)而不是丢行**——收集表是
@@ -63,7 +68,7 @@ UPDATE catalog.asin_blacklist SET pushed_at = now() WHERE asin = ANY(%s)
 _BRAND_PENDING = """
 SELECT brand_key, brand, source, added_date, src_sku
 FROM catalog.brand_blacklist
-WHERE pushed_at IS NULL
+WHERE pushed_at IS NULL AND src_sku IS NOT NULL
 ORDER BY synced_at LIMIT %s
 """
 
@@ -78,7 +83,7 @@ FROM catalog.asin_blacklist
 
 _BRAND_STATS = """
 SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
-FROM catalog.brand_blacklist
+FROM catalog.brand_blacklist WHERE src_sku IS NOT NULL
 """
 
 

@@ -37,15 +37,18 @@ FEISHU_ZIP_BLACKLIST_SHEET_ID=
 FEISHU_SUPPLIER_APP_TOKEN=
 FEISHU_SUPPLIER_TABLE_ID=
 
-# 黑名单两张收集表(所有者建 2026-08-11;以表格 URL 实际参数为准)
-# 品牌表若在另一份 wiki 文档,填 FEISHU_BRAND_ERR_WIKI_TOKEN;
-# 留空则回落到与 ASIN 表共用的 FEISHU_BLACKLIST_WIKI_TOKEN
+# 黑名单两张投影表(PG→飞书,blacklist_push 写;所有者建 2026-08-11)
+# ASIN 表=库的全量映射;BRAND_ERR=只承接沃尔玛后台问题商品拿到的品牌
+# (归拢总表的增量渠道)。BRAND_ERR 若在另一份 wiki 文档,
+# 填 FEISHU_BRAND_ERR_WIKI_TOKEN;留空回落到 FEISHU_BLACKLIST_WIKI_TOKEN
 FEISHU_BLACKLIST_WIKI_TOKEN=
 FEISHU_ASIN_BLACKLIST_SHEET_ID=
 FEISHU_BRAND_ERR_WIKI_TOKEN=
 FEISHU_BRAND_ERR_SHEET_ID=
 
-# listing 风控两张只读源(risk_sync 镜像入库用)
+# listing 风控两张只读源(飞书→PG,risk_sync 镜像入库)
+# FEISHU_BRAND_* = 黑名单品牌总表(各渠道人工归拢的总清单,方向与
+# BRAND_ERR 相反,别混;2026-08-11 换新表)
 FEISHU_RISK_PT_WIKI_TOKEN=
 FEISHU_RISK_PT_SHEET_ID=
 FEISHU_BRAND_WIKI_TOKEN=

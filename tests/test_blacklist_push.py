@@ -119,28 +119,15 @@ def test_push_warns_at_limit(wired):
     assert "达单轮上限 5" in out
 
 
-def test_brand_pending_includes_mirror_rows():
-    """投影表是数据库的**全量映射**(所有者拍板 2026-08-11:防重只发生在
-    落库,投影层照单全推)——镜像行必须在推送范围内,WHERE 里不许再出现
-    src_sku 过滤。第一版曾排除镜像行,是把防重错放到了投影层。"""
-    assert "src_sku IS NOT NULL" not in wf._BRAND_PENDING
+def test_brand_pending_excludes_master_mirror_rows():
+    """beyKyi 只承接沃尔玛后台自产品牌(所有者厘清 2026-08-11:它是归拢
+    「黑名单品牌总表」的一条**增量渠道**,总表镜像行回推 = 把总清单整个
+    复制进渠道表)。只能断言 SQL 文本:夹具喂什么都盖不住 WHERE 少条件。
+    探针对账口径必须与推送范围同宽,两处一起钉。"""
+    assert "src_sku IS NOT NULL" in wf._BRAND_PENDING
     assert "pushed_at IS NULL" in wf._BRAND_PENDING
     assert "pushed_at IS NULL" in wf._ASIN_PENDING
-    # 探针的对账口径必须与推送范围同宽,否则水位对账天然不平
-    assert "src_sku" not in wf._BRAND_STATS
-
-
-def test_push_mirror_row_sku_cell_is_empty(wired):
-    """镜像行没有 src_sku(人工登记的品牌不来自某个 SKU)——SKU 列写空串,
-    照常推送、照常打水位。"""
-    calls, _ = wired
-    calls["brand_pending"] = [("sony", "Sony", "商标库比对", "2026-05-01", None)]
-    out = wf.run({})
-    assert "品牌表 +1 行" in out
-    which, ups = calls["writes"][0]
-    assert which == "brand"
-    assert ups[0][1] == [["Sony", "商标库比对", "2026-05-01", ""]]
-    assert [k for w, k in calls["marked"] if w == "brand"] == [["sony"]]
+    assert "src_sku IS NOT NULL" in wf._BRAND_STATS
 
 
 # ── 历史回填 ──────────────────────────────────────────────────────────────────

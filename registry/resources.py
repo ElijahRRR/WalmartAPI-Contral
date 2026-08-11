@@ -292,14 +292,13 @@ ASIN_BLACKLIST_SHEET = Spreadsheet(
     wiki=True,
 )
 
-# 品牌黑名单(后台报错集成):cleanup 自产品牌的投影落点。D 列 SKU 是**溯源**
-# (该品牌从哪个 SKU 来),去重按品牌(所有者澄清 2026-08-11)。
-# 与旧「禁止品牌收集」(BRAND_BAN_SHEET,risk_sync 只读镜像源)是两张表:
-# 旧表继续做人工登记入口,这张只承接程序自产。
+# 品牌黑名单(后台报错集成):方向 PG→飞书(blacklist_push),**只承接沃尔玛
+# 后台问题商品拿到的品牌**(自产行 src_sku IS NOT NULL)。D 列 SKU 是溯源,
+# 去重按品牌(所有者澄清 2026-08-11)。与「黑名单品牌总表」(BRAND_BAN_SHEET,
+# 飞书→PG,所有者人工归拢各渠道)方向相反,这张是归拢的一条增量渠道,别混。
 BRAND_ERR_SHEET = Spreadsheet(
     name="黑名单品牌(后台报错集成)",
-    # 品牌表 2026-08-11 由所有者换过一次表格——token 独立成变量,不设时
-    # 回落到与 ASIN 表共用的 wiki token(两表同文档的原始布局)
+    # token 独立成变量,不设时回落到与 ASIN 表共用的 wiki token(同文档布局)
     token=(os.environ.get("FEISHU_BRAND_ERR_WIKI_TOKEN")
            or os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", "")),
     sheet_id=os.environ.get("FEISHU_BRAND_ERR_SHEET_ID", ""),
@@ -427,13 +426,16 @@ RISK_PT_SHEET = Spreadsheet(
     wiki=True,
 )
 
-# 风控·禁止品牌收集(wiki 承载;来源=产品清理报错扫描+商标库比对,
-# 名单语义=黑名单品牌,casefold 精确匹配)
+# 黑名单品牌总表(wiki 承载):各渠道黑名单品牌由**所有者人工归拢**的总清单
+# (2026-08-11 换成新表 jF8dOw,旧「禁止品牌收集」退役),方向飞书→PG
+# (risk_sync),名单语义=黑名单品牌,casefold 精确匹配。
+# 归拢的增量渠道之一是 BRAND_ERR_SHEET(方向相反,PG→飞书),别混。
 BRAND_BAN_SHEET = Spreadsheet(
-    name="禁止品牌收集",
+    name="黑名单品牌总表",
     token=os.environ.get("FEISHU_BRAND_WIKI_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_BRAND_SHEET_ID", ""),
-    # D 列 sku 为溯源列(旧表实际 4 列,legacy_survey:1360;此前漏登记)
+    # D 列 sku 为溯源列(旧表 4 列,legacy_survey:1360;新总表若只有 3 列,
+    # 第 4 列读空无害——risk_gate.sync_brands 本就不消费 sku)
     columns=("brand", "source", "added_date", "sku"),
     wiki=True,
 )

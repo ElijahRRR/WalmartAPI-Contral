@@ -260,8 +260,8 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
 );
 -- 收集侧补列(2026-08-11,自产回路接通):src_sku 溯源(该品牌从哪个 SKU 来,
 -- 所有者定稿:溯源列,**去重仍按品牌**);pushed_at 飞书投影水位(NULL=待推,
--- 全部行都推——所有者拍板:投影表是数据库的全量映射,含 risk_sync 镜像行;
--- sync_brands 的 upsert 不碰 pushed_at,镜像行不会被反复重推)。
+-- 只推自产行 src_sku IS NOT NULL——beyKyi 是归拢总表的增量渠道,只报沃尔玛
+-- 后台新发现的品牌;总表镜像行(risk_sync 从 jF8dOw 进来的)不回推)。
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;

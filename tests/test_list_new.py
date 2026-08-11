@@ -65,7 +65,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        {"T_OFF"}, {}, {"B0LISTED01"}, {"B0RISKY001"},
+        {"T_OFF"}, {}, {"B0LISTED01"}, {"B0RISKY001": (2, 1, 3, None)},
         {"banned_pts": {"BannedPT"}, "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
@@ -86,6 +86,16 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     assert "去重 1" in out and "防呆 1" in out and "PT无spec 1" in out
     assert "待数据源 1" in out
     assert fetched["asins"] == [rows[0]["asin"]]   # 只有过全闸的行才拉数据
+
+
+def test_risk_reason_carries_evidence():
+    """防呆理由带证据(计数/最近移除时间),不再只写"有删除史"四个字。"""
+    from datetime import datetime
+    r = ln._risk_reason(2, 1, 3, datetime(2026, 7, 30))
+    assert "提交删除2次" in r and "删除未生效1次" in r
+    assert "历史上架3次" in r and "最近移除2026-07-30" in r
+    # 空缺列不硬凑:没有未生效/上架史/时间就不出现对应片段
+    assert ln._risk_reason(1, 0, 0, None) == "防呆:该ASIN有删除史(提交删除1次)"
 
 
 def test_error_desc_joined_into_p_column(monkeypatch):
@@ -198,7 +208,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        set(), {}, set(), set(), {"banned_pts": set(), "brands": set()}))
+        set(), {}, set(), {}, {"banned_pts": set(), "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})

@@ -59,9 +59,27 @@ _SQL_LISTED_ASINS = """
 SELECT DISTINCT sku FROM catalog.walmart_items WHERE missing_since IS NULL
 """
 _SQL_RISKY = """
-SELECT sku FROM catalog.product_risk
+SELECT asin, delete_times, delete_not_effective_times, listed_times,
+       last_removed_at
+FROM catalog.product_risk
 WHERE delete_times > 0 OR delete_not_effective_times > 0
 """
+
+
+def _risk_reason(deletes: int, not_effective: int, listed: int,
+                 last_removed) -> str:
+    """输入:product_risk 一行的计数与最近移除时间 → 输出:N 列防呆理由。
+
+    此前只写"有删除史"四个字,人工复核还得手查账本;计数和时间本来就在
+    视图里,直接带出来当证据。"""
+    bits = [f"提交删除{deletes}次"]
+    if not_effective:
+        bits.append(f"删除未生效{not_effective}次")
+    if listed:
+        bits.append(f"历史上架{listed}次")
+    if last_removed:
+        bits.append(f"最近移除{last_removed:%Y-%m-%d}")
+    return f"防呆:该ASIN有删除史({','.join(bits)})"
 
 
 def _load_gate_state():
@@ -74,7 +92,9 @@ def _load_gate_state():
         cur.execute(_SQL_LISTED_ASINS)
         listed = {r[0] for r in cur.fetchall()}
         cur.execute(_SQL_RISKY)
-        risky = {r[0] for r in cur.fetchall()}
+        # 键是 coalesce(asin, sku)——视图身份键 2026-08-11 从订货号原文改成
+        # 产品码,否则三段式 sku 名下的删除史拦不住同 ASIN 换号重上
+        risky = {r[0]: r[1:] for r in cur.fetchall()}
         gate = risk_gate.load_gate(conn)
     return inactive, today_used, listed, risky, gate
 
@@ -268,9 +288,10 @@ def run(params: dict) -> str:
                 n["dedup"] += 1
                 reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
                 continue
-            if r["asin"] in risky:
+            risk = risky.get(r["asin"])
+            if risk:
                 n["guard"] += 1
-                reasons.append((r["rownum"], "防呆:该ASIN有删除史(product_risk)"))
+                reasons.append((r["rownum"], _risk_reason(*risk)))
                 continue
             candidates.append(r)
 

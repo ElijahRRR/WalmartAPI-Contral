@@ -84,9 +84,9 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 ## 三、产品事件账本(catalog.product_events)
 
 - ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
-- ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`)
-- ⬜ 只有 `delete_*` 一支有消费者:`status_changed`/`match_submitted`/`list_submitted`/全部 `*_feed_failed`/`retire_feed_*` 只写不读——账本在长,读的人没跟上
-- ⬜ `product_risk` 视图只按 sku 聚合无 store 维度、单读者(list_new);`listed_times/last_removed_at/last_event_at` 三列无人读
+- ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`;接缝已在 `services/product_events.py` docstring 登记——届时补常量,休眠码不预进 EVENTS)
+- ✅ ~~只写不读~~(2026-08-11:`status_changes` / `feed_failures` 两个读侧视图平铺 jsonb,AI/人工直接 SELECT;`list/match_submitted` 计入 risk 视图 submit_times;`retire_feed_success` 属回执流水,读侧走 feed_failures 之外的 ops.feed_items,不另建)
+- ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件未扩**:retire/missing 史要不要拦,牵涉 RETIRE 职责边界(第二节 🔴),等拍板)
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
 - ✅ ~~sku≠asin~~(2026-08-11:product_events 加 asin 列,record_many 自动清洗
   + sku_normalize 存量补填;残余 numeric 1,739 个 item id 键倒查零命中,

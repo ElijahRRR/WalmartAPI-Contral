@@ -199,8 +199,16 @@ CREATE TABLE catalog.product_events (
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
--- 视图 catalog.product_risk:按 SKU 汇总(上架次数/删除次数/删除未生效次数/
--- 最近移除时间)——未来 listing 上架前防呆的查询入口
+-- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
+-- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
+--   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
+--                       最近移除时间)——list_new 防呆消费,拦截条件仍只看
+--                       delete_times / delete_not_effective_times
+--   product_risk_store  同口径按 (asin, store) 聚合:"这个产品在哪些店被删过
+--                       几次";store 为空的事件只出现在全局视图
+--   status_changes      status_changed 平铺(old/new/官方 reasons)——查"谁被
+--                       平台下架、为什么":WHERE new_status <> 'PUBLISHED'
+--   feed_failures       五类 feed 的逐 SKU 失败回执(kind/error_code/detail)
 ```
 
 事件账本三条纪律:只追加永不改;**回执与观测分开记**(feed 回执 success 是

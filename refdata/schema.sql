@@ -293,16 +293,57 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
 );
 ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
--- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
-CREATE OR REPLACE VIEW catalog.product_risk AS
-  SELECT sku,
+-- 风险档案:上架前防呆的查询入口(list_new 消费;人工/AI SELECT 也方便)。
+-- 2026-08-11 sku≠asin 定稿后身份键改 coalesce(asin, sku):删除史必须按产品
+-- (ASIN)聚合——按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN
+-- 换号重上,而 list_new 恰恰是拿 ASIN 来查的。列名 sku→asin 属列改名,
+-- PG 的 REPLACE 不允许,须 DROP 重建(幂等:每次 db_init 重建同一定义)。
+DROP VIEW IF EXISTS catalog.product_risk;
+CREATE VIEW catalog.product_risk AS
+  SELECT coalesce(asin, sku) AS asin,
          count(*) FILTER (WHERE event = 'item_appeared')         AS listed_times,
+         count(*) FILTER (WHERE event IN
+             ('list_submitted', 'match_submitted'))              AS submit_times,
          count(*) FILTER (WHERE event = 'delete_submitted')      AS delete_times,
+         count(*) FILTER (WHERE event = 'retire_submitted')      AS retire_times,
+         count(*) FILTER (WHERE event = 'item_missing')          AS missing_times,
          count(*) FILTER (WHERE event = 'delete_not_effective')  AS delete_not_effective_times,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
          max(occurred_at) AS last_event_at
-  FROM catalog.product_events GROUP BY sku;
+  FROM catalog.product_events GROUP BY 1;
+
+-- 店铺维度风险档案:"这个产品在哪些店被删过几次"(2026-08-11 所有者要求
+-- 能答)。store 为空的平台级/部分历史导入事件挂不到店,只出现在全局视图。
+CREATE OR REPLACE VIEW catalog.product_risk_store AS
+  SELECT coalesce(asin, sku) AS asin, store,
+         count(*) FILTER (WHERE event = 'item_appeared')         AS listed_times,
+         count(*) FILTER (WHERE event IN
+             ('list_submitted', 'match_submitted'))              AS submit_times,
+         count(*) FILTER (WHERE event = 'delete_submitted')      AS delete_times,
+         count(*) FILTER (WHERE event = 'retire_submitted')      AS retire_times,
+         count(*) FILTER (WHERE event = 'item_missing')          AS missing_times,
+         count(*) FILTER (WHERE event = 'delete_not_effective')  AS delete_not_effective_times,
+         max(occurred_at) FILTER (WHERE event IN
+             ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         max(occurred_at) AS last_event_at
+  FROM catalog.product_events WHERE store IS NOT NULL GROUP BY 1, 2;
+
+-- status_changed 的读侧(此前只写不读):平台状态迁移平铺成列,官方下架
+-- 原因不必再拆 jsonb。查"谁被平台下架、为什么":WHERE new_status <> 'PUBLISHED'
+CREATE OR REPLACE VIEW catalog.status_changes AS
+  SELECT store, coalesce(asin, sku) AS asin, sku,
+         detail->>'old' AS old_status, detail->>'new' AS new_status,
+         detail->'reasons' AS reasons, occurred_at
+  FROM catalog.product_events WHERE event = 'status_changed';
+
+-- *_feed_failed 的读侧(此前只写不读):五类 feed 的逐 SKU 失败回执,
+-- kind ∈ delete/retire/maintenance/match/list
+CREATE OR REPLACE VIEW catalog.feed_failures AS
+  SELECT store, coalesce(asin, sku) AS asin, sku,
+         split_part(event, '_feed_', 1) AS kind,
+         source, error_code, detail, occurred_at
+  FROM catalog.product_events WHERE event LIKE '%_feed_failed';
 
 -- ── listing:上架域 ────────────────────────────────────────────────────────
 

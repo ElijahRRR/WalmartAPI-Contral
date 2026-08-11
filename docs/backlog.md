@@ -14,9 +14,9 @@
 
 | 状态 | 缺口 | 出处/关键事实 |
 |---|---|---|
-| 🟡 | **清理→品牌黑名单自产回路:PG 侧已接通**(2026-08-11,services/blacklist + cleanup 尾段:C/E 品牌自 catalog.products.brand、按品牌去重、不覆盖镜像行、缺品牌不标已处理等重试;失败只告警不阻断主链)。**余:飞书投影 blacklist_push**(按 pushed_at 水位推两张新表)+ 生产验收 | `services/blacklist.py` |
+| 🟡 | **清理→品牌黑名单自产回路:PG 侧已接通**(2026-08-11,services/blacklist + cleanup 尾段:C/E 品牌自 catalog.products.brand、按品牌去重、不覆盖镜像行、缺品牌不标已处理等重试;失败只告警不阻断主链)。**余:生产验收**(blacklist_push 已就绪 2026-08-11) | `services/blacklist.py` |
 | ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;两张新收集表 ASIN_BLACKLIST_SHEET / BRAND_ERR_SHEET 同步登记,env 已进 init_data_root 模板) | — |
-| 🟡 | **ASIN 黑名单:PG 侧已接通**(catalog.asin_blacklist 新表,cleanup 尾段按当轮类别入选,B/C/E/F/G/K,一次入选不更新)。**余:飞书投影 + 上架拦截消费方**(黑名单建设批次) | `services/blacklist.py` |
+| 🟡 | **ASIN 黑名单:PG 侧已接通**(catalog.asin_blacklist 新表,cleanup 尾段按当轮类别入选,B/C/E/F/G/K,一次入选不更新)。**余:上架拦截消费方**(黑名单建设批次;投影 blacklist_push 已就绪) | `services/blacklist.py` |
 | 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合(随预警批次) | `services/blacklist.py:45` |
 | 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
 | ⬜ | **match_listing 不过风控闸与防呆**——跟卖同样是新增在售 offer,只有 list_new 有闸 | `workflows/match_listing.py`(不查 risk_gate / product_risk) |
@@ -54,8 +54,8 @@
 | Step 0 监管合规删除(飞书 eGjQRX) | ⬜ | 完全缺失。plan 称由 product_clear 的停用删除表承担,但旧表 F 列幂等锚点无人继承;旧逻辑 dry-run 下整段跳过,需重写成可预览(`docs/legacy_survey.md:1361,1447,1474`) |
 | Step 1/1.5/1.6/2 识别/反补/停用/删除 | ✅ | `problem_product_cleanup`,2026-08-07 生产验收 |
 | Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ⬜🔴 | 未迁;"累计语义保不保留"未决,历史口径会跳变(`legacy_survey.md:1358-1362,1472`) |
-| Step 6 品牌采集 | 🟡 | **PG 侧已接通**(2026-08-11,cleanup 尾段 ← services/blacklist);余:飞书投影 |
-| Step 7 黑名单同步 | 🟡 | **PG 侧已接通**(决策已拍:只收 B/C/E/F/G/K);余:飞书投影 blacklist_push |
+| Step 6 品牌采集 | 🟡 | **PG 侧 + 投影已就绪**(2026-08-11);余:生产验收 |
+| Step 7 黑名单同步 | 🟡 | **PG 侧 + 投影已就绪**;余:生产验收 |
 
 旧数据入库:✅ **三笔全部完成**(2026-08-11 生产实跑,cleanup_history_import):
 - error_items 485,345 行 → 变迁事件 239,253 条(时间线折叠;擦净重灌数与首跑

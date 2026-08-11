@@ -28,10 +28,13 @@
                            永远进不了渠道);②整表全推(把总清单复制进了
                            渠道表)。现行口径为所有者终版。
 
-一次性命令:
+一次性命令(都可反复跑,预览先行,apply 才动):
+  -p rebuild_asin=1 [-p apply=1]   ASIN 黑名单重建:SKU 清洗(sku_normalize)
+      之后跑——按标准 asin 擦净重灌(多店订货号归并、日期=报错发生日),
+      ASIN 表**整表重写**。
   -p rebuild_brand=1 [-p apply=1]  品牌渠道重建:从时间线重灌渠道表
       (每品牌取最早报错日),beyKyi **整表重写**——同时清掉 ②号错版
-      复制进去的 42,064 行总清单内容。预览先行,apply 才动。
+      复制进去的 42,064 行总清单内容。
 
 水位语义:每块写成功后当场把该块行的 pushed_at 打上。写表与打水位之间
 崩掉的话,那一块下次会**重推(表里出现重复行)而不是丢行**——收集表是
@@ -97,6 +100,13 @@ FROM catalog.brand_err_hits ORDER BY added_date, brand_key
 """
 
 _CHANNEL_MARK_ALL = "UPDATE catalog.brand_err_hits SET pushed_at = now()"
+
+_ASIN_ALL = """
+SELECT asin, source, created_at::date::text
+FROM catalog.asin_blacklist ORDER BY created_at, asin
+"""
+
+_ASIN_MARK_ALL = "UPDATE catalog.asin_blacklist SET pushed_at = now()"
 
 
 def _probe() -> str:
@@ -173,13 +183,33 @@ def _append(sheet, rows: list[list], mark, keys: list) -> tuple[int, int]:
     return written, blocks
 
 
-def _rebuild_brand(do_apply: bool) -> str:
-    """输入:是否 apply → 输出:品牌渠道重建摘要(见模块头「一次性命令」)。
+def _rewrite_sheet(sheet, all_sql: str, mark_sql: str) -> int:
+    """输入:登记条目 + 全量行 SQL + 打水位 SQL → 输出:重写的数据行数。
 
-    apply 三步:①渠道表擦净重灌;②beyKyi **整表重写**(表头行回读原样
-    保留,数据行全量替换,sheet_overwrite 会删掉尾部残留——错版复制进去
-    的总清单内容就是这样清掉的);③全表打 pushed_at 水位。
+    整表重写三步:①表头行回读原样保留(读不到才用登记列名兜底);
+    ②sheet_overwrite 全量替换(尾部残留自动删——错版内容就是这样清掉的);
+    ③全表打 pushed_at 水位。
     """
+    s = sheet.require()
+    ncols = len(s.columns)
+    width = chr(ord("A") + ncols - 1)
+    hdr = feishu.sheet_values(s, f"A1:{width}1")
+    header = ((hdr[0] if hdr else []) + [""] * ncols)[:ncols]
+    if not any(str(h or "").strip() for h in header):
+        header = list(s.columns)
+    with db.pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(all_sql)
+            rows = [[c if c is not None else "" for c in r]
+                    for r in cur.fetchall()]
+    feishu.sheet_overwrite(s, [header] + rows)
+    with db.pg_conn() as conn:
+        conn.execute(mark_sql, ())
+    return len(rows)
+
+
+def _rebuild_brand(do_apply: bool) -> str:
+    """输入:是否 apply → 输出:品牌渠道重建摘要(见模块头「一次性命令」)。"""
     sheet = resources.BRAND_ERR_SHEET
     with db.pg_conn() as conn:
         c = blacklist.channel_counts(conn)
@@ -192,31 +222,37 @@ def _rebuild_brand(do_apply: bool) -> str:
                     f"beyKyi 现有 {filled} 行将被整表重写为 {c['brands']} 行;"
                     f"加 -p apply=1 执行")
         st = blacklist.rebuild_brand_channel(conn)
-
-    s = sheet.require()
-    hdr = feishu.sheet_values(s, "A1:D1")
-    header = ((hdr[0] if hdr else []) + [""] * 4)[:4]
-    if not any(str(h or "").strip() for h in header):
-        header = list(s.columns)        # 表头意外为空才用登记列名兜底
-    with db.pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(_CHANNEL_ALL)
-            rows = [[b, src or "", day or "", sku or ""]
-                    for b, src, day, sku in cur.fetchall()]
-    feishu.sheet_overwrite(s, [header] + rows)
-    with db.pg_conn() as conn:
-        conn.execute(_CHANNEL_MARK_ALL, ())
+    n = _rewrite_sheet(sheet, _CHANNEL_ALL, _CHANNEL_MARK_ALL)
     return (f"品牌渠道重建:渠道表擦净 {st['wiped']} 行 → 重灌 "
-            f"{st['brands']} 个品牌;beyKyi 整表重写 {len(rows)} 行"
+            f"{st['brands']} 个品牌;beyKyi 整表重写 {n} 行"
             f"(缺品牌 ASIN {c['no_brand']} 个等补齐后自然入账)")
 
 
+def _rebuild_asin(do_apply: bool) -> str:
+    """输入:是否 apply → 输出:ASIN 黑名单重建摘要。先跑 sku_normalize
+    清洗事件账本,再来重建——否则重灌出来的键还是订货号原文。"""
+    sheet = resources.ASIN_BLACKLIST_SHEET
+    with db.pg_conn() as conn:
+        c = blacklist.backfill_counts(conn)
+        if not do_apply:
+            filled = _next_empty(sheet) - 2
+            return (f"ASIN 黑名单重建预览:时间线按标准 asin 归并后共 "
+                    f"{c['total']} 个,永久禁止 {c['permanent']} 个;"
+                    f"ASIN 表现有 {filled} 行将被整表重写为 {c['permanent']} 行"
+                    f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行")
+        st = blacklist.rebuild_asin_blacklist(conn)
+    n = _rewrite_sheet(sheet, _ASIN_ALL, _ASIN_MARK_ALL)
+    return (f"ASIN 黑名单重建:擦净 {st['wiped']} 行 → 按标准 asin 重灌 "
+            f"{st['inserted']} 行;ASIN 表整表重写 {n} 行")
+
+
 def run(params: dict) -> str:
-    """输入:params(limit/probe/backfill/rebuild_brand/apply)→ 输出:推送摘要。
+    """输入:params(limit/probe/backfill/rebuild_asin/rebuild_brand/apply)
+    → 输出:推送摘要。
 
     -p backfill=1:ASIN 历史回填(预览计数;加 -p apply=1 真写后顺路投影)。
-    -p rebuild_brand=1:品牌渠道重建(见 _rebuild_brand)。
-    两者都是一次性动作,重复跑无害(DO NOTHING/擦净重灌都幂等)。
+    -p rebuild_asin=1 / rebuild_brand=1:两侧重建(见各自函数)。
+    都是一次性动作,重复跑无害(DO NOTHING/擦净重灌都幂等)。
     """
     if str(params.get("probe", "")).lower() in {"1", "true", "yes"}:
         return _probe()
@@ -224,6 +260,8 @@ def run(params: dict) -> str:
     do_apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
     if str(params.get("rebuild_brand", "")).lower() in {"1", "true", "yes"}:
         return _rebuild_brand(do_apply)
+    if str(params.get("rebuild_asin", "")).lower() in {"1", "true", "yes"}:
+        return _rebuild_asin(do_apply)
 
     limit = int(params.get("limit", 1_000_000))
     lines = []

@@ -49,10 +49,12 @@ def wired(monkeypatch):
         def __exit__(self, *a): return False
         def execute(self, sql, args=None):
             self._sql = sql
-            if "asin_blacklist" in sql:
-                self._rows = calls.get("asin_pending", [])
-            elif "ORDER BY added_date" in sql:          # 渠道全量(rebuild 用)
+            if "ORDER BY added_date" in sql:            # 渠道全量(rebuild 用)
                 self._rows = calls.get("channel_rows", [])
+            elif "ORDER BY created_at, asin" in sql:    # ASIN 全量(rebuild 用)
+                self._rows = calls.get("asin_all", [])
+            elif "asin_blacklist" in sql:
+                self._rows = calls.get("asin_pending", [])
             else:
                 self._rows = calls.get("brand_pending", [])
         def fetchall(self): return self._rows
@@ -148,11 +150,44 @@ def test_backfill_case_labels_match_source_label():
 
 def test_backfill_selects_latest_category_only():
     """入选按**最新**类别(DISTINCT ON + occurred_at DESC)——历史里类别
-    翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。SQL 文本钉死。"""
+    翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。身份 =
+    coalesce(asin, sku):清洗出的标准码优先、订货号原文兜底(2026-08-11
+    实证 sku≠asin,多店订货号须归并到产品级)。SQL 文本钉死。"""
     from services import blacklist as bl
-    assert "DISTINCT ON (sku)" in bl._LATEST_CTE
-    assert "ORDER BY sku, occurred_at DESC" in bl._LATEST_CTE
+    assert "DISTINCT ON (coalesce(asin, sku))" in bl._LATEST_CTE
+    assert "ORDER BY coalesce(asin, sku), occurred_at DESC" in bl._LATEST_CTE
     assert "ON CONFLICT (asin) DO NOTHING" in bl._BACKFILL_ASIN_SQL
+
+
+def test_rebuild_asin_apply_overwrites_and_marks_all(wired, monkeypatch):
+    """rebuild_asin:擦净按标准 asin 重灌 → ASIN 表整表重写 → 全表打水位。"""
+    calls, _ = wired
+    overwritten = []
+    monkeypatch.setattr(wf.blacklist, "backfill_counts",
+                        lambda conn: {"total": 3, "permanent": 2, "brand_cand": 1})
+    monkeypatch.setattr(wf.blacklist, "rebuild_asin_blacklist",
+                        lambda conn: {"wiped": 56821, "inserted": 2})
+    monkeypatch.setattr(wf.feishu, "sheet_overwrite",
+                        lambda s, rows: overwritten.append(rows) or len(rows))
+    calls["asin_all"] = [("B0GXX75JN5", "沃尔玛-知产", "2026-04-20"),
+                        ("D01027HVK3W", "沃尔玛-禁售", "2026-05-01")]
+    out = wf.run({"rebuild_asin": "1", "apply": "1"})
+    assert "重灌 2 行" in out and "整表重写 2 行" in out
+    rows = overwritten[0]
+    assert len(rows) == 3               # 表头 + 2 数据行
+    assert rows[1] == ["B0GXX75JN5", "沃尔玛-知产", "2026-04-20"]
+    assert ("asin", "ALL") in calls["marked"]
+
+
+def test_rebuild_asin_preview_does_not_write(wired, monkeypatch):
+    calls, cells = wired
+    cells["asin"] = ["x"] * 4
+    monkeypatch.setattr(wf.blacklist, "backfill_counts",
+                        lambda conn: {"total": 50000, "permanent": 48000,
+                                      "brand_cand": 2702})
+    out = wf.run({"rebuild_asin": "1"})
+    assert "现有 4 行" in out and "整表重写为 48000 行" in out and "apply=1" in out
+    assert calls["writes"] == [] and calls["marked"] == []
 
 
 def test_backfill_preview_does_not_write(wired, monkeypatch):

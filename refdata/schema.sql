@@ -166,6 +166,11 @@ CREATE TABLE IF NOT EXISTS catalog.product_events (
 );
 CREATE INDEX IF NOT EXISTS product_events_sku_idx ON catalog.product_events (sku, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_events (store, sku);
+-- 2026-08-11 所有者定稿:sku=沃尔玛侧订货号原文,asin=产品源头侧标准码
+-- (sku≠asin 是常态:三段式订货号/纯数字 item id 实证)。asin 由
+-- services/sku_asin 规则清洗得出,提不出存 NULL;消费方 coalesce(asin, sku);
+-- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
+ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
@@ -250,6 +255,9 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
     created_at  timestamptz NOT NULL DEFAULT now(),
     pushed_at   timestamptz
 );
+-- 2026-08-11:asin 列改存清洗后的标准码(sku_normalize + rebuild_asin 重建),
+-- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键

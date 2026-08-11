@@ -45,6 +45,8 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
 import json
 import logging
 
+from services.sku_asin import extract_asin
+
 logger = logging.getLogger("services.product_events")
 
 _FEED_KIND = {"DELETE_ITEM": "delete", "RETIRE_ITEM": "retire",
@@ -116,10 +118,12 @@ def record_many(conn, rows: list[dict]) -> int:
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.product_events "
-            "(sku, store, event, source, error_code, detail, occurred_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
-            [(r["sku"], r.get("store"), r["event"], r["source"],
-              r.get("error_code"),
+            "(sku, asin, store, event, source, error_code, detail, occurred_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
+            # asin 由 sku 清洗得出(services/sku_asin 唯一规则出处);提不出
+            # 存 NULL——消费方用 coalesce(asin, sku),等规则扩了跑 sku_normalize 补
+            [(r["sku"], extract_asin(r["sku"]), r.get("store"), r["event"],
+              r["source"], r.get("error_code"),
               json.dumps(r["detail"], ensure_ascii=False, default=str)
               if r.get("detail") is not None else None,
               r.get("occurred_at"))

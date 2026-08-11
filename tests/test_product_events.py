@@ -37,7 +37,8 @@ def test_record_many_serializes_detail():
     assert n == 2
     sql, rows = conn.sqls[0]
     assert "INSERT INTO catalog.product_events" in sql
-    assert rows[0][0] == "S1" and '"feed_id"' in rows[0][5]
+    assert rows[0][0] == "S1" and '"feed_id"' in rows[0][6]
+    assert rows[0][1] is None          # 'S1' 提不出标准码 → asin 存 NULL
     assert rows[1][1] is None and rows[1][5] is None      # store/detail 可空
     assert pe.record_many(conn, []) == 0                  # 空集不发 SQL
 
@@ -86,7 +87,7 @@ def test_verify_deletions_verdicts(caplog):
         gone, still = pe.verify_deletions(conn)
     assert (gone, still) == (1, 1)
     ins_sql, rows = conn.sqls[-1]
-    events = {(r[0], r[2]) for r in rows}
+    events = {(r[0], r[3]) for r in rows}
     assert ("S_GONE", "delete_verified") in events
     assert ("S_STILL", "delete_not_effective") in events
     assert not any(r[0] == "S_WAIT" for r in rows)        # 未到期不落判

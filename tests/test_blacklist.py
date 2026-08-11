@@ -113,6 +113,16 @@ def test_biz_cn_is_flagged_independently():
     assert conn.asin_rows["B0X"][5] is False
 
 
+def test_record_asins_key_is_cleaned_asin():
+    """黑名单键 = 清洗后的标准 asin,订货号原文进 src_sku 溯源——
+    2026-08-11 实证 sku≠asin(三段式订货号),原文当键 = 同一产品在
+    不同店入选多行、重上架拦截按 asin 查全部落空。"""
+    conn = _Conn()
+    bl.record_asins(conn, [_it("XKJ-B0GXX75JN5-39.98", "B")])
+    assert "B0GXX75JN5" in conn.asin_rows
+    assert conn.asin_rows["B0GXX75JN5"][6] == "XKJ-B0GXX75JN5-39.98"
+
+
 # ── 品牌收集 ──────────────────────────────────────────────────────────────────
 
 def test_collect_brands_only_c_and_e():
@@ -162,6 +172,15 @@ def test_master_mirror_neither_blocks_channel_nor_gets_overwritten():
     assert "nike" in conn.channel_rows
     assert conn.brand_rows["nike"] == ("镜像行",)   # 总清单镜像分毫不动
     assert conn.marked == ["B0A"]
+
+
+def test_collect_brands_looks_up_products_by_cleaned_asin():
+    """采集库按清洗后的标准 asin 查品牌——订货号原文直查必然全空
+    (2026-08-11 生产实证:2,702 个 C/E 候选 0 命中)。溯源列存原文。"""
+    conn = _Conn(brands={"B0GXX75JN5": "Nike"})
+    st = bl.collect_brands(conn, [_it("XKJ-B0GXX75JN5-39.98", "C")])
+    assert st["brand_new"] == 1
+    assert conn.channel_rows["nike"][3] == "XKJ-B0GXX75JN5-39.98"
 
 
 def test_channel_known_brand_counts_known():

@@ -37,6 +37,8 @@ pushed_at 水位推)。PG 权威,飞书只是人机界面。
 import json
 import logging
 
+from services.sku_asin import extract_asin
+
 logger = logging.getLogger("services.blacklist")
 
 # 永久产品级禁止(入选集合);排除理由见模块头。改这个集合 = 改业务口径,
@@ -65,25 +67,29 @@ def source_label(code: str) -> str:
 
 _ASIN_SQL = """
 INSERT INTO catalog.asin_blacklist
-    (asin, category, source, reason, src_store, biz_cn)
-VALUES (%s, %s, %s, %s, %s, %s)
+    (asin, category, source, reason, src_store, biz_cn, src_sku)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (asin) DO NOTHING
 """
 
 
 def record_asins(conn, items: list[dict]) -> int:
     """输入:连接 + 当轮已归类 item(store/sku/category/reasons)
-    → 输出:新入选数。永久禁止 = 一次入选,已在名单的不更新(DO NOTHING)。"""
+    → 输出:新入选数。永久禁止 = 一次入选,已在名单的不更新(DO NOTHING)。
+
+    黑名单键 = 清洗后的标准 asin(sku_asin 规则;提不出用订货号原文兜底,
+    宁可键不标准也不丢行),订货号原文存 src_sku 溯源。"""
     added = 0
     with conn.cursor() as cur:
         for it in items:
             code = it.get("category")
             if code not in PERMANENT:
                 continue
+            asin = extract_asin(it["sku"]) or it["sku"]
             cur.execute(_ASIN_SQL, (
-                it["sku"], code, source_label(code),
+                asin, code, source_label(code),
                 (it.get("reasons") or "")[:200] or None,
-                it.get("store"), is_biz_cn(it.get("reasons"))))
+                it.get("store"), is_biz_cn(it.get("reasons")), it["sku"]))
             added += cur.rowcount or 0
     return added
 
@@ -135,23 +141,26 @@ def collect_brands(conn, items: list[dict]) -> dict:
         todo = {a: it for a, it in cands.items() if a not in done}
         if not todo:
             return stats
-        cur.execute(_BRAND_OF_SQL, (list(todo),))
+        # 采集库按**清洗后的标准 asin** 查(订货号原文直接查必然全空——
+        # 2026-08-11 生产实证:2,702 个 C/E 品牌 0 命中,教训在此)
+        asin_of = {sku: (extract_asin(sku) or sku) for sku in todo}
+        cur.execute(_BRAND_OF_SQL, (list(set(asin_of.values())),))
         brand_of = {a: b for a, b in cur.fetchall()}
-        for asin, it in todo.items():
-            brand = (brand_of.get(asin) or "").strip()
+        for sku, it in todo.items():
+            brand = (brand_of.get(asin_of[sku]) or "").strip()
             if not brand:
                 stats["no_brand"] += 1      # 不标已处理:等品牌到位重试
                 continue
             label = source_label(it["category"])
             cur.execute(_CHANNEL_SQL, (
                 brand.casefold(), brand, label,
-                asin, is_biz_cn(it.get("reasons"))))
+                sku, is_biz_cn(it.get("reasons"))))
             if cur.rowcount:
                 stats["brand_new"] += 1
             else:
                 stats["brand_known"] += 1
             cur.execute(_GATE_SQL, (brand.casefold(), brand, label))
-            cur.execute(_MARK_SQL, (BRAND_ASIN_SCOPE, asin,
+            cur.execute(_MARK_SQL, (BRAND_ASIN_SCOPE, sku,
                                     json.dumps({"brand": brand.casefold()},
                                                ensure_ascii=False)))
     return stats
@@ -164,13 +173,16 @@ def collect_brands(conn, items: list[dict]) -> dict:
 # 最新:同一 ASIN 在 A 店旧类别 B、B 店新类别 A(过期)⇒ 最新是可修复类,
 # 不入选。来源标签的 CASE 必须与 source_label 同表(有测试钉住,别漂)。
 
+# 身份 = coalesce(asin, sku):清洗出的标准码优先,提不出用订货号原文兜底。
+# 多个订货号(不同店同一产品)归并到同一 asin,最新类别看**产品级**全局最新。
 _LATEST_CTE = """
 WITH latest AS (
-    SELECT DISTINCT ON (sku) sku, store, occurred_at,
+    SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku) AS asin,
+           sku, store, occurred_at,
            detail->>'category' AS cat, detail->>'reason' AS reason
     FROM catalog.product_events
     WHERE event = 'problem_categorized'
-    ORDER BY sku, occurred_at DESC)
+    ORDER BY coalesce(asin, sku), occurred_at DESC)
 """
 
 _BACKFILL_COUNT_SQL = _LATEST_CTE + """
@@ -181,17 +193,23 @@ FROM latest
 """
 
 _BACKFILL_ASIN_SQL = _LATEST_CTE + """
-INSERT INTO catalog.asin_blacklist (asin, category, source, reason, src_store, biz_cn)
-SELECT sku, cat,
+INSERT INTO catalog.asin_blacklist
+    (asin, category, source, reason, src_store, biz_cn, src_sku, created_at)
+SELECT asin, cat,
        '沃尔玛-' || CASE cat WHEN 'B' THEN '禁售' WHEN 'C' THEN '品牌'
                              WHEN 'E' THEN '知产' WHEN 'F' THEN '限类'
                              WHEN 'G' THEN '药品' WHEN 'K' THEN '审查' END,
        left(reason, 200), store,
        (lower(coalesce(reason, '')) LIKE '%%biz-cn%%'
-        OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%')
+        OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%'),
+       sku, occurred_at
 FROM latest WHERE cat = ANY(%(perm)s)
 ON CONFLICT (asin) DO NOTHING
 """
+
+# ASIN 黑名单重建(rebuild_asin):SKU 清洗后表内键还是订货号原文/多店重复,
+# 擦净按标准 asin 重灌(created_at=报错发生时刻,表格日期列因此有意义)。
+_ASIN_WIPE_SQL = "DELETE FROM catalog.asin_blacklist"
 
 def backfill_counts(conn) -> dict:
     """输入:连接 → 输出:回填预览计数(不写任何东西)。"""
@@ -210,6 +228,16 @@ def backfill_from_events(conn) -> dict:
         return {"asin_new": cur.rowcount or 0}
 
 
+def rebuild_asin_blacklist(conn) -> dict:
+    """输入:连接 → 输出:{wiped, inserted}。擦净按标准 asin 重灌
+    (黑名单是时间线的投影,投影可以重投——与品牌渠道重建同一权衡)。"""
+    with conn.cursor() as cur:
+        cur.execute(_ASIN_WIPE_SQL)
+        wiped = cur.rowcount or 0
+        cur.execute(_BACKFILL_ASIN_SQL, {"perm": sorted(PERMANENT)})
+        return {"wiped": wiped, "inserted": cur.rowcount or 0}
+
+
 # ── 品牌渠道重建(blacklist_push -p rebuild_brand=1,一次性)───────────────────
 #
 # 渠道表从时间线整体重灌:C/E 最新类 ASIN × catalog.products.brand,
@@ -225,7 +253,7 @@ SELECT count(*) FILTER (WHERE coalesce(btrim(p.brand), '') <> ''),
        count(DISTINCT lower(btrim(p.brand)))
            FILTER (WHERE coalesce(btrim(p.brand), '') <> '')
 FROM latest l
-LEFT JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.sku
+LEFT JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.asin
 WHERE l.cat = ANY(%(brandcats)s)
 """
 
@@ -239,7 +267,7 @@ SELECT DISTINCT ON (lower(btrim(p.brand)))
        (lower(coalesce(l.reason, '')) LIKE '%%biz-cn%%'
         OR lower(coalesce(l.reason, '')) LIKE '%%reference code biz%%')
 FROM latest l
-JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.sku
+JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.asin
 WHERE l.cat = ANY(%(brandcats)s) AND coalesce(btrim(p.brand), '') <> ''
 ORDER BY lower(btrim(p.brand)), l.occurred_at
 ON CONFLICT (brand_key) DO NOTHING

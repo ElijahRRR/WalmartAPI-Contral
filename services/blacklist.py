@@ -137,3 +137,67 @@ def collect_brands(conn, items: list[dict]) -> dict:
                                     json.dumps({"brand": brand.casefold()},
                                                ensure_ascii=False)))
     return stats
+
+
+# ── 历史回填(blacklist_push -p backfill=1 用,一次性)──────────────────────────
+#
+# 从 product_events 的归类时间线按「每个 ASIN 的**最新**类别」推导入选——
+# 与实时链路同一条原则(最新类别命中才算,"曾命中过"不作数)。跨店取全局
+# 最新:同一 ASIN 在 A 店旧类别 B、B 店新类别 A(过期)⇒ 最新是可修复类,
+# 不入选。来源标签的 CASE 必须与 source_label 同表(有测试钉住,别漂)。
+
+_LATEST_CTE = """
+WITH latest AS (
+    SELECT DISTINCT ON (sku) sku, store,
+           detail->>'category' AS cat, detail->>'reason' AS reason
+    FROM catalog.product_events
+    WHERE event = 'problem_categorized'
+    ORDER BY sku, occurred_at DESC)
+"""
+
+_BACKFILL_COUNT_SQL = _LATEST_CTE + """
+SELECT count(*) FILTER (WHERE cat = ANY(%(perm)s)) AS permanent,
+       count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
+       count(*) AS total
+FROM latest
+"""
+
+_BACKFILL_ASIN_SQL = _LATEST_CTE + """
+INSERT INTO catalog.asin_blacklist (asin, category, source, reason, src_store, biz_cn)
+SELECT sku, cat,
+       '沃尔玛-' || CASE cat WHEN 'B' THEN '禁售' WHEN 'C' THEN '品牌'
+                             WHEN 'E' THEN '知产' WHEN 'F' THEN '限类'
+                             WHEN 'G' THEN '药品' WHEN 'K' THEN '审查' END,
+       left(reason, 200), store,
+       (lower(coalesce(reason, '')) LIKE '%%biz-cn%%'
+        OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%')
+FROM latest WHERE cat = ANY(%(perm)s)
+ON CONFLICT (asin) DO NOTHING
+"""
+
+_BACKFILL_BRAND_ROWS_SQL = _LATEST_CTE + """
+SELECT sku, store, cat, reason FROM latest WHERE cat = ANY(%(brandcats)s)
+"""
+
+
+def backfill_counts(conn) -> dict:
+    """输入:连接 → 输出:回填预览计数(不写任何东西)。"""
+    with conn.cursor() as cur:
+        cur.execute(_BACKFILL_COUNT_SQL,
+                    {"perm": sorted(PERMANENT), "brandcats": sorted(BRAND_CATEGORIES)})
+        permanent, brand_cand, total = cur.fetchone()
+    return {"permanent": permanent, "brand_cand": brand_cand, "total": total}
+
+
+def backfill_from_events(conn) -> dict:
+    """输入:连接 → 输出:回填统计。ASIN 集合级 INSERT(万级量,逐行太慢);
+    品牌复用 collect_brands(同一套去重/防重/缺品牌不标记语义,量小)。"""
+    with conn.cursor() as cur:
+        cur.execute(_BACKFILL_ASIN_SQL, {"perm": sorted(PERMANENT)})
+        asin_new = cur.rowcount or 0
+        cur.execute(_BACKFILL_BRAND_ROWS_SQL,
+                    {"brandcats": sorted(BRAND_CATEGORIES)})
+        items = [{"sku": sku, "store": store, "category": cat, "reasons": reason}
+                 for sku, store, cat, reason in cur.fetchall()]
+    brand_stats = collect_brands(conn, items)
+    return {"asin_new": asin_new, **brand_stats}

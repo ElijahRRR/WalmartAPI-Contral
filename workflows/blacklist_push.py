@@ -29,6 +29,7 @@ import logging
 
 from api import feishu
 from registry import db, resources
+from services import blacklist
 
 DANGEROUS = False
 
@@ -96,9 +97,29 @@ def _append(sheet, rows: list[list], mark, keys: list) -> tuple[int, int]:
 
 
 def run(params: dict) -> str:
-    """输入:params(limit)→ 输出:推送摘要。"""
+    """输入:params(limit/backfill/apply)→ 输出:推送摘要。
+
+    -p backfill=1:从历史时间线按「每 ASIN 最新类别」推导入选(预览计数);
+    加 -p apply=1 真写,写完顺路照常投影。一次性动作,重复跑无害
+    (DO NOTHING/防重台账都幂等)。
+    """
     limit = int(params.get("limit", 500))
     lines = []
+
+    if str(params.get("backfill", "")).lower() in {"1", "true", "yes"}:
+        do_apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
+        with db.pg_conn() as conn:
+            c = blacklist.backfill_counts(conn)
+            if not do_apply:
+                return (f"历史回填预览:时间线共 {c['total']} 个 ASIN,"
+                        f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单),"
+                        f"C/E 品牌候选 {c['brand_cand']} 个"
+                        f"(已处理/缺品牌的落库时再分流);"
+                        f"加 -p apply=1 真写并顺路投影")
+            st = blacklist.backfill_from_events(conn)
+        lines.append(f"历史回填:ASIN +{st['asin_new']},品牌 +{st['brand_new']}"
+                     f"(已知 {st['brand_known']},缺品牌 {st['no_brand']},"
+                     f"已处理跳过 {st['skipped']})")
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:

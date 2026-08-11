@@ -119,3 +119,45 @@ def test_brand_pending_sql_excludes_mirror_rows():
     assert "src_sku IS NOT NULL" in wf._BRAND_PENDING
     assert "pushed_at IS NULL" in wf._BRAND_PENDING
     assert "pushed_at IS NULL" in wf._ASIN_PENDING
+
+
+# ── 历史回填 ──────────────────────────────────────────────────────────────────
+
+def test_backfill_case_labels_match_source_label():
+    """回填 SQL 的 CASE 标签必须与 source_label 逐码一致——两处各写一份
+    迟早漂,漂了 = 同一类别历史行和实时行在飞书来源列长得不一样。"""
+    from services import blacklist as bl
+    for code in sorted(bl.PERMANENT):
+        assert f"WHEN '{code}' THEN '{bl.source_label(code)[len('沃尔玛-'):]}'"             in bl._BACKFILL_ASIN_SQL, code
+
+
+def test_backfill_selects_latest_category_only():
+    """入选按**最新**类别(DISTINCT ON + occurred_at DESC)——历史里类别
+    翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。SQL 文本钉死。"""
+    from services import blacklist as bl
+    assert "DISTINCT ON (sku)" in bl._LATEST_CTE
+    assert "ORDER BY sku, occurred_at DESC" in bl._LATEST_CTE
+    assert "ON CONFLICT (asin) DO NOTHING" in bl._BACKFILL_ASIN_SQL
+
+
+def test_backfill_preview_does_not_write(wired, monkeypatch):
+    from services import blacklist as bl
+    wrote = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args=None):
+            if "INSERT" in sql:
+                wrote.append(sql)
+        def fetchone(self): return (10, 3, 20)
+        def fetchall(self): return []
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
+    out = wf.run({"backfill": "1"})
+    assert "永久禁止 10 个" in out and "apply=1" in out
+    assert wrote == []

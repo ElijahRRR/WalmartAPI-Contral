@@ -45,20 +45,28 @@ def sync_product_types(conn, rows: list[dict]) -> int:
 
 
 def sync_brands(conn, rows: list[dict]) -> int:
-    """输入:连接 + 品牌表行({brand, source, added_date})→ 输出:upsert 数。"""
+    """输入:连接 + 品牌表行({brand, source, added_date, sku})→ 输出:upsert 数。
+
+    D 列 ASIN 一并镜像进 src_sku(总表/旧收集表都有这列,legacy_survey:1360;
+    2026-08-11 之前漏存,导致 beyKyi 认领腿 D 列全空)。表格 D 列偶有空值,
+    **空不覆盖已有**(coalesce 保旧)——总表整理时清掉一格不应抹掉库里的溯源。
+    """
     rows = [r for r in rows if (r.get("brand") or "").strip()]
     if not rows:
         return 0
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.brand_blacklist "
-            "(brand_key, brand, source, added_date, synced_at) "
-            "VALUES (%s, %s, %s, %s, now()) "
+            "(brand_key, brand, source, added_date, src_sku, synced_at) "
+            "VALUES (%s, %s, %s, %s, %s, now()) "
             "ON CONFLICT (brand_key) DO UPDATE SET brand = EXCLUDED.brand, "
             "source = EXCLUDED.source, added_date = EXCLUDED.added_date, "
+            "src_sku = coalesce(nullif(btrim(EXCLUDED.src_sku), ''), "
+            "                   brand_blacklist.src_sku), "
             "synced_at = now()",
             [(r["brand"].strip().casefold(), r["brand"].strip(),
-              r.get("source"), r.get("added_date")) for r in rows])
+              r.get("source"), r.get("added_date"),
+              (r.get("sku") or "").strip() or None) for r in rows])
     return len(rows)
 
 

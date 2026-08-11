@@ -17,7 +17,9 @@ problem_products,规则逐字移植旧系统)→ 三路:
   删除未生效顽固 SKU(delete_not_effective)→ 停用+删除双 feed 齐发
 
 去重(全部查库;所有者定稿:不设时间防重窗,重复删除无实害,真相以观测为准):
-  ① 在途/待观测:feed_items 有 submitted 未落定,或已落定 success 但
+  ① 在途/待观测:feed_items 有 submitted 未落定(**滚动 48h 封顶**,超时
+     视为 feed 丢失放行重发——所有者拍板 2026-08-11,替代旧"同一自然日"),
+     或已落定 success 但
      catalog_sync 尚未重新观测(resolved_at > last_seen_at)→ 跳过
      (feed 处理中不叠发;动作结果未经观测确认前不重复动作);
   ② 反补计数:product_events 的 maintenance_submitted 30 天窗口计数(替代
@@ -42,6 +44,7 @@ import logging
 
 from api import _client, feeds
 from registry import db
+from services import blacklist
 from services import problem_products as pp
 from services import product_events, stores as stores_svc
 
@@ -55,11 +58,22 @@ FROM catalog.walmart_items
 WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
   AND missing_since IS NULL
 """
+# 防重口径(所有者拍板 2026-08-11,替代旧系统的"同一自然日"——那是一天
+# 跑 4 次的产物,现按日执行):
+# ① submitted 无终态 → 拦,但**滚动 48h 封顶**:超 48h 还没终态,这个 feed
+#    大概率丢了(feed_poll 的 pending 告警早该响了),继续拦等于让该商品
+#    永久漏删。48h 内照拦——feed 还在沃尔玛队列里,叠发 = 重复提交制造机。
+# ② success 且 resolved_at > last_seen_at(待观测)→ 拦到 catalog_sync 重扫
+#    为止;重扫后商品**还在**问题清单里 = 沃尔玛说删成了实际没删掉 ⇒
+#    本条不再命中,直接重发,不等 48h(所有者原话:"有终态但又扫到了,
+#    说明提交成功、给了结果、事实上没操作成功,直接再次执行")。
+# ③ failed 不拦(该重试)。
 _SQL_INFLIGHT = """
 SELECT DISTINCT f.store, f.sku
 FROM ops.feed_items f
 JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
-WHERE f.status = 'submitted'
+WHERE (f.status = 'submitted'
+       AND f.submitted_at > now() - interval '48 hours')
    OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 """
 # 在途/待观测拦截(2026-08-07 生产实证修正):submitted=feed 处理中不叠发;
@@ -67,9 +81,11 @@ WHERE f.status = 'submitted'
 # 还没重新扫到——结果未经观测确认前不重复动作("真相以观测为准"的闸门形态)。
 # 否则 feed 落定后、次日扫店前重跑本工作流,会把同一批 SKU 全量重发一遍。
 # 观测后自然解锁:扫到即 last_seen_at 前移;删成了即缺席出清单;failed 不拦(该重试)。
+# 事件名一律绑参传常量,不写字面量:读侧拼错 = 静默查空(计数恒 0,
+# "反补满 2 次转删"永不触发),和写侧拼错是同一类病,但更难发现。
 _SQL_ATTEMPTS = """
 SELECT store, sku, count(*) FROM catalog.product_events
-WHERE event = 'maintenance_submitted'
+WHERE event = %s
   AND source = 'problem_product_cleanup'
   AND occurred_at > now() - make_interval(days => %s)
 GROUP BY store, sku
@@ -78,7 +94,7 @@ GROUP BY store, sku
 # maintenance 工作流的标题/到期日期操作若记事件,不得污染反补转删计数
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
-FROM catalog.product_events WHERE event = 'problem_categorized'
+FROM catalog.product_events WHERE event = %s
 ORDER BY store, sku, occurred_at DESC
 """
 _SQL_STUBBORN = """
@@ -105,9 +121,10 @@ def _load_state():
                  for r in cur.fetchall()]
         cur.execute(_SQL_INFLIGHT)
         inflight = set(cur.fetchall())
-        cur.execute(_SQL_ATTEMPTS, (pp.ATTEMPT_RESET_DAYS,))
+        cur.execute(_SQL_ATTEMPTS, (product_events.MAINTENANCE_SUBMITTED,
+                                    pp.ATTEMPT_RESET_DAYS))
         attempts = {(s, k): n for s, k, n in cur.fetchall()}
-        cur.execute(_SQL_LAST_CAT)
+        cur.execute(_SQL_LAST_CAT, (product_events.PROBLEM_CATEGORIZED,))
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
         cur.execute(_SQL_STUBBORN)
         stubborn = {(st, k) for st, k, ev in cur.fetchall()
@@ -172,6 +189,37 @@ def _record(store: str, event: str, rows: list[dict], feed_id) -> None:
             for r in rows])
 
 
+def _collect_blacklists(items: list[dict]) -> str:
+    """输入:当轮已归类 item → 输出:黑名单收集摘要(一行)。
+
+    归因收集尾段(plan.md「品牌限制/侵权类问题产品 → 品牌黑名单」的落地,
+    2026-08-11 接通自产回路):当轮 B/C/E/F/G/K 入 ASIN 黑名单,C/E 的品牌
+    从 catalog.products.brand 取、按品牌去重入 brand_blacklist。
+    **任何失败只告警不阻断**——黑名单是清理的副产品,收集炸了不该把
+    删除/反补主链拖下水;漏一轮下一轮照样补(入选条件不变)。
+    飞书投影由 blacklist_push 按 pushed_at 水位另推,这里只写 PG。
+    """
+    cand = [it for it in items if "category" in it]
+    if not cand:
+        return ""
+    try:
+        with db.pg_conn() as conn:
+            asin_new = blacklist.record_asins(conn, cand)
+            st = blacklist.collect_brands(conn, cand)
+    except Exception as e:                              # noqa: BLE001
+        logger.error("黑名单收集失败(主链不受影响,下轮重收): %s", e)
+        return f"黑名单收集失败:{e}"
+    bits = [f"ASIN 黑名单 +{asin_new}", f"品牌 +{st['brand_new']}"]
+    if st["brand_known"]:
+        bits.append(f"品牌已知 {st['brand_known']}")
+    if st["no_brand"]:
+        # 不是错误:产品中心还没这些 ASIN 的品牌,标已处理才是错(永远漏)
+        bits.append(f"待品牌 {st['no_brand']}(产品中心缺 brand,下轮重试)")
+    if st["skipped"]:
+        bits.append(f"已处理跳过 {st['skipped']}")
+    return "黑名单收集:" + ",".join(bits)
+
+
 def _record_categories(items: list[dict], last_cat: dict) -> int:
     """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
     fresh = [it for it in items if "category" in it
@@ -179,7 +227,7 @@ def _record_categories(items: list[dict], last_cat: dict) -> int:
     with db.pg_conn() as conn:
         product_events.record_many(conn, [
             {"sku": it["sku"], "store": it["store"],
-             "event": "problem_categorized",
+             "event": product_events.PROBLEM_CATEGORIZED,
              "source": "problem_product_cleanup",
              "detail": {"category": it["category"], "name": it["cat_name"],
                         "reason": (it["reasons"] or "")[:200]}}
@@ -225,6 +273,7 @@ def run(params: dict) -> str:
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n_cat = _record_categories(items, last_cat)
+    bl_note = _collect_blacklists(items)
     retry_stores: list[str] = []
     for store_name, b in sorted(plans.items()):
         store = stores_by_name.get(store_name)
@@ -246,6 +295,8 @@ def run(params: dict) -> str:
                 lines.append(f"  ⚠ {store_name}:二轮仍失败,待下轮调度")
 
     lines.append(f"归类事件新记 {n_cat} 条;结果轮询走 feed_poll")
+    if bl_note:
+        lines.append(bl_note)
     return "\n".join(lines)
 
 
@@ -290,13 +341,13 @@ def _submit_store(store_name: str, store: dict, b: dict,
             _submit("MP_MAINTENANCE",
                     [pp.build_relist_item(r["sku"], r["gtin"], r["upc"])
                      for r in b["relist"]],
-                    b["relist"], "maintenance_submitted", "反补")
+                    b["relist"], product_events.MAINTENANCE_SUBMITTED, "反补")
         if b["retire"]:
             _submit("RETIRE_ITEM", [r["sku"] for r in b["retire"]],
-                    b["retire"], "retire_submitted", "顽固停用")
+                    b["retire"], product_events.RETIRE_SUBMITTED, "顽固停用")
         if b["delete"]:
             _submit("DELETE_ITEM", [r["sku"] for r in b["delete"]],
-                    b["delete"], "delete_submitted", "删除")
+                    b["delete"], product_events.DELETE_SUBMITTED, "删除")
     except _client.StoreDeadError as e:
         logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
         lines.append(f"  {store_name}:凭证失效跳过")

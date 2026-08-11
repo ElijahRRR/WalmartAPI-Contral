@@ -5,11 +5,14 @@
 
 来源(wiki 承载,api/feishu 自动解析节点 token):
   「沃尔玛类目表」(registry.RISK_PT_SHEET,10 列)→ catalog.risk_product_types
-  「禁止品牌收集」(registry.BRAND_BAN_SHEET,3 列)→ catalog.brand_blacklist
+  「黑名单品牌总表」(registry.BRAND_BAN_SHEET)→ catalog.brand_blacklist
+    ——各渠道黑名单品牌由所有者人工归拢的总清单(2026-08-11 换新表,
+    旧「禁止品牌收集」退役)。方向只有飞书→PG;程序自产品牌的**反向**
+    投影走 blacklist_push → BRAND_ERR_SHEET(归拢的增量渠道),别混。
 
-同步语义:**只增改不删**(upsert)。所有者定稿 2026-08-07:表格随时会停用,
-停用后 PG 是唯一权威,新增黑名单走产品中心增量脚本(黑名单建设批次);
-上架主链的提交前否决闸(services/risk_gate)只读 PG。
+同步语义:**只增改不删**(upsert,不碰 pushed_at 列)。所有者定稿
+2026-08-07:表格随时会停用,停用后 PG 是唯一权威;上架主链的提交前
+否决闸(services/risk_gate)只读 PG。
 
 调度建议:每日一次(上架主链跑前);表格停用后本工作流随之停用。
 """

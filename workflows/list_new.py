@@ -430,7 +430,7 @@ def run(params: dict) -> str:
                             for r, _ in batch])
                         product_events.record_many(conn, [
                             {"sku": r["asin"], "store": store_name,
-                             "event": "list_submitted", "source": "list_new",
+                             "event": product_events.LIST_SUBMITTED, "source": "list_new",
                              "detail": {"feed_id": res["feed_id"],
                                         "price": r["_price"]}}
                             for r, _ in batch])

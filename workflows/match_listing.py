@@ -171,7 +171,7 @@ def run(params: dict) -> str:
                         with db.pg_conn() as conn:
                             product_events.record_many(conn, [
                                 {"sku": r["sku"], "store": store_name,
-                                 "event": "match_submitted",
+                                 "event": product_events.MATCH_SUBMITTED,
                                  "source": "match_listing",
                                  "detail": {"feed_id": res["feed_id"],
                                             "upc": r["upc"],

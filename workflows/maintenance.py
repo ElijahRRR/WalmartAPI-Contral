@@ -181,7 +181,7 @@ def _record_deletes(store: str, rows: list[dict], feed_id) -> None:
     """删除提交入病历(catalog.product_events;回执由 feed_track 另记)。"""
     with db.pg_conn() as conn:
         product_events.record_many(conn, [
-            {"sku": r["sku"], "store": store, "event": "delete_submitted",
+            {"sku": r["sku"], "store": store, "event": product_events.DELETE_SUBMITTED,
              "source": "maintenance",
              "detail": {"feed_id": feed_id,
                         "reason": r.get("reason") or "variant_offset",

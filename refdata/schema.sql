@@ -150,16 +150,15 @@ CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (i
 
 -- ── 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪)────────────────
 -- 一个 SKU(=ASIN,业务约定贯通)一生的病历:何时上架/何时下架及官方原因/
--- 何时提交删除/删除是否真生效/报了什么错。只追加永不改;
--- 事件码常量表在 services/product_events.py。
+-- 何时提交删除/删除是否真生效/报了什么错。只追加永不改。
+-- 事件码唯一出处 = services/product_events.py 的常量与 EVENTS 集合
+-- (record_many 对未登记码抛错)。**本文件不再维护事件码清单**——
+-- 三处清单曾各漂各的,导览请直接看那份代码。
 CREATE TABLE IF NOT EXISTS catalog.product_events (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     sku         text NOT NULL,
     store       text,               -- 平台级事件可空
-    event       text NOT NULL,      -- item_appeared/item_missing/item_reappeared/
-                                    -- status_changed/delete_submitted/retire_submitted/
-                                    -- {delete|retire|maintenance}_feed_{success|failed}/
-                                    -- delete_verified/delete_not_effective …
+    event       text NOT NULL,      -- 合法值见 services/product_events.EVENTS
     source      text NOT NULL,      -- 来源工作流
     error_code  text,
     detail      jsonb,
@@ -167,6 +166,11 @@ CREATE TABLE IF NOT EXISTS catalog.product_events (
 );
 CREATE INDEX IF NOT EXISTS product_events_sku_idx ON catalog.product_events (sku, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_events (store, sku);
+-- 2026-08-11 所有者定稿:sku=沃尔玛侧订货号原文,asin=产品源头侧标准码
+-- (sku≠asin 是常态:三段式订货号/纯数字 item id 实证)。asin 由
+-- services/sku_asin 规则清洗得出,提不出存 NULL;消费方 coalesce(asin, sku);
+-- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
+ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
@@ -234,6 +238,27 @@ CREATE TABLE IF NOT EXISTS catalog.risk_product_types (
     field_total text, field_required text, field_list text,
     synced_at timestamptz NOT NULL DEFAULT now()
 );
+-- ASIN 黑名单(收集侧,2026-08-11 所有者拍板"收"):**只收永久禁止类**
+-- B/C/E/F/G/K(services/blacklist.PERMANENT),可修复类(A/D/H/I/J/L/Z)进了
+-- 会误杀重上架拦截——13 类词表只是「来源」列的格式约定,不是入选范围。
+-- 写入方 problem_product_cleanup 尾段(按**当轮=最新**类别入选,历史里类别
+-- 翻动频繁,"曾经命中过"不能作数);消费方:上架拦截(黑名单建设批次接)。
+-- pushed_at 是飞书投影水位:NULL=待推(投影到「黑名单ASIN」表,PG 权威)。
+CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
+    asin        text PRIMARY KEY,
+    category    text NOT NULL,       -- 入选时的类别码(B/C/E/F/G/K)
+    source      text NOT NULL,       -- 「沃尔玛-<类名>」,与飞书来源列同款
+    reason      text,                -- 命中原因样本(截 200)
+    src_store   text,                -- 溯源:在哪个店铺撞的
+    biz_cn      boolean NOT NULL DEFAULT false,  -- BIZ-CN 独立维度(中国卖家
+                                     -- 专属禁售,legacy_survey:2077 要求单列)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    pushed_at   timestamptz
+);
+-- 2026-08-11:asin 列改存清洗后的标准码(sku_normalize + rebuild_asin 重建),
+-- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
     brand text NOT NULL,             -- 品牌名原文
@@ -241,6 +266,32 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     added_date text,                 -- 入库日期(表格原样)
     synced_at timestamptz NOT NULL DEFAULT now()
 );
+-- 收集侧补列(2026-08-11 过渡遗留):src_sku/biz_cn/pushed_at 当天曾用于
+-- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
+-- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
+-- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
+ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
+
+-- 品牌·后台报错渠道表(beyKyi 投影的数据源,PG 权威):完整记录"沃尔玛
+-- 后台问题商品拿到过哪些品牌"。渠道内按品牌去重(brand_key PK),
+-- **不与总清单去重**——品牌已在总表不挡渠道入账(所有者厘清 2026-08-11:
+-- 渠道表是归拢总表的原料,挤在 brand_blacklist 里按品牌冲突会让"总表已有
+-- 的品牌"永远进不了渠道)。added_date 存报错发生日(历史重建取时间线
+-- occurred_at,实时取当天)。
+CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
+    brand_key  text PRIMARY KEY,             -- casefold/lower 品牌键
+    brand      text NOT NULL,                -- 品牌名原文
+    source     text,                         -- 沃尔玛-品牌 / 沃尔玛-知产
+    added_date text,                         -- 报错发生日 YYYY-MM-DD
+    src_sku    text,                         -- 溯源:来自哪个 SKU
+    src_store  text,                         -- 溯源:该报错发生在哪个店铺
+    biz_cn     boolean NOT NULL DEFAULT false,
+    pushed_at  timestamptz,                  -- 飞书投影水位(NULL=待推)
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
 -- 风险档案:上架前防呆的查询入口(listing 工作流用;人工 SELECT 也方便)
 CREATE OR REPLACE VIEW catalog.product_risk AS
@@ -731,6 +782,17 @@ CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (
 );
 CREATE INDEX IF NOT EXISTS perf_problem_orders_store_idx
     ON ops.perf_problem_orders (store, first_seen_date DESC);
+
+-- 问题商品历史:(sku, 类别) 唯一对 —— 旧 seen_sku_categories.json(20.1 万对)
+-- 的落点,是「错误统计」报表累计数的唯一真值来源。报表(旧 Step 3/4/5)迁移
+-- 前必须先导入,否则累计口径当场跳变。写入方 cleanup_history_import(历史)
+-- + 未来 problem_product_cleanup 的报表尾段(增量);category 是 A~L/Z 类别码。
+CREATE TABLE IF NOT EXISTS ops.cleanup_seen_categories (
+    sku         text NOT NULL,
+    category    text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (sku, category)
+);
 
 CREATE TABLE IF NOT EXISTS ops.dedupe (
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'

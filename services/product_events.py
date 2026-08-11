@@ -1,6 +1,13 @@
 """产品事件账本积木(catalog.product_events):SKU(=ASIN)一生的病历。
 
-事件码(唯一出处,新增先登记在此):
+事件码唯一出处 = **本文件下方的常量与 EVENTS 集合**(2026-08-11 起是代码级
+约束,不再只是 docstring 约定):record_many 对未登记的码直接抛错。
+此前全仓散着字符串字面量,拼错不报错——账本是只追加的,消费方按精确字符串
+过滤,一个拼错的码意味着那些事件**永远查不到**,而写入时一声不吭。
+schema.sql / db_schema.md 里的清单只是导览,以这里为准(三处清单曾各漂各的:
+maintenance_submitted、problem_categorized 发了大半个月都没登记)。
+
+事件码(新增先在下方登记常量,再使用):
   item_appeared          catalog_sync 观测到新上架(店铺目录里首次/重新出现为新行)
   item_reappeared        曾标缺席(missing_since)后又被扫到
   item_missing           本轮全量扫未见(被删/被平台移除的观测事实)
@@ -10,6 +17,11 @@
                          maintenance(采集永久偏移,detail.reason=variant_offset
                          ——维护类不入病历的唯一例外)——按 source 字段区分
   retire_submitted       product_clear 提交 RETIRE_ITEM
+  maintenance_submitted  problem_product_cleanup 的**反补**提交(MP_MAINTENANCE
+                         仅此来源入病历,见 receipt_in_ledger;"反补满 2 次
+                         转删"的计数就数它,漏发 = 过期商品被无限反补)
+  problem_categorized    problem_product_cleanup 的问题归类快照(13 类之一,
+                         detail 含 category/name/reason;类别未变不重复记)
   match_submitted        match_listing 提交跟卖 MP_ITEM_MATCH(上架类=生死事件;
                          注意跟卖商品无 amz 侧身份,sku≠asin 是此类行的例外)
   list_submitted         list_new 提交上架 MP_ITEM(L2d 接线;回执
@@ -33,11 +45,37 @@
 import json
 import logging
 
+from services.sku_asin import extract_asin
+
 logger = logging.getLogger("services.product_events")
 
 _FEED_KIND = {"DELETE_ITEM": "delete", "RETIRE_ITEM": "retire",
               "MP_MAINTENANCE": "maintenance", "MP_ITEM_MATCH": "match",
               "MP_ITEM": "list"}
+
+# ── 事件码常量(唯一出处;新增先在此登记)──────────────────────────────────────
+ITEM_APPEARED = "item_appeared"
+ITEM_REAPPEARED = "item_reappeared"
+ITEM_MISSING = "item_missing"
+STATUS_CHANGED = "status_changed"
+DELETE_SUBMITTED = "delete_submitted"
+RETIRE_SUBMITTED = "retire_submitted"
+MAINTENANCE_SUBMITTED = "maintenance_submitted"
+MATCH_SUBMITTED = "match_submitted"
+LIST_SUBMITTED = "list_submitted"
+PROBLEM_CATEGORIZED = "problem_categorized"
+DELETE_VERIFIED = "delete_verified"
+DELETE_NOT_EFFECTIVE = "delete_not_effective"
+
+# 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
+# record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。
+EVENTS = frozenset({
+    ITEM_APPEARED, ITEM_REAPPEARED, ITEM_MISSING, STATUS_CHANGED,
+    DELETE_SUBMITTED, RETIRE_SUBMITTED, MAINTENANCE_SUBMITTED,
+    MATCH_SUBMITTED, LIST_SUBMITTED, PROBLEM_CATEGORIZED,
+    DELETE_VERIFIED, DELETE_NOT_EFFECTIVE,
+} | {f"{k}_feed_{st}" for k in _FEED_KIND.values()
+     for st in ("success", "failed")})
 
 # 回执入账白名单:生死类恒记(删除/停用/跟卖上架);MP_MAINTENANCE 是
 # 通用部分更新 feed,只有反补来源(登记制,未来 listing 反补在此登记)
@@ -63,19 +101,32 @@ def receipt_in_ledger(kind: str, workflow: str | None) -> bool:
 
 
 def record_many(conn, rows: list[dict]) -> int:
-    """输入:连接 + 事件行 [{sku, store, event, source, error_code?, detail?}]
-    → 输出:写入数。detail 自动 JSON 序列化。"""
+    """输入:连接 + 事件行 [{sku, store, event, source, error_code?, detail?,
+    occurred_at?}] → 输出:写入数。detail 自动 JSON 序列化。
+
+    occurred_at 只给**历史导入**用(把旧库的 run_ts 原样带进时间线);
+    实时链路一律不传,吃列默认值 now()——实时事件自带发生时刻,倒填时间戳
+    只会让"账本只追加"的时序性变得不可信。"""
     if not rows:
         return 0
+    # 未登记的码直接拒收:账本只追加、消费方按精确字符串过滤,拼错的码
+    # 写进去就是一支永远没人查的分叉,而且不报错。fail loud 是唯一解。
+    bad = sorted({r["event"] for r in rows} - EVENTS)
+    if bad:
+        raise ValueError(f"未登记的事件码 {bad}:先在 services/product_events.py "
+                         f"的常量与 EVENTS 登记,再使用(唯一出处纪律)")
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.product_events "
-            "(sku, store, event, source, error_code, detail) "
-            "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-            [(r["sku"], r.get("store"), r["event"], r["source"],
-              r.get("error_code"),
+            "(sku, asin, store, event, source, error_code, detail, occurred_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
+            # asin 由 sku 清洗得出(services/sku_asin 唯一规则出处);提不出
+            # 存 NULL——消费方用 coalesce(asin, sku),等规则扩了跑 sku_normalize 补
+            [(r["sku"], extract_asin(r["sku"]), r.get("store"), r["event"],
+              r["source"], r.get("error_code"),
               json.dumps(r["detail"], ensure_ascii=False, default=str)
-              if r.get("detail") is not None else None)
+              if r.get("detail") is not None else None,
+              r.get("occurred_at"))
              for r in rows])
     return len(rows)
 
@@ -98,7 +149,7 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
         prev = old.get(sku)
         new_st = r.get("published_status")
         if prev is None:
-            events.append({"sku": sku, "store": store, "event": "item_appeared",
+            events.append({"sku": sku, "store": store, "event": ITEM_APPEARED,
                            "source": source,
                            "detail": {"published_status": new_st}})
             continue
@@ -107,12 +158,12 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
             # 复现只记 reappeared(detail 已含新状态);缺席行状态列已被清空,
             # 再比对必然"变化",叠记 status_changed(old=None)是噪音
             events.append({"sku": sku, "store": store,
-                           "event": "item_reappeared", "source": source,
+                           "event": ITEM_REAPPEARED, "source": source,
                            "detail": {"published_status": new_st}})
             continue
         if new_st != prev_st:
             events.append({"sku": sku, "store": store,
-                           "event": "status_changed", "source": source,
+                           "event": STATUS_CHANGED, "source": source,
                            "detail": {"old": prev_st, "new": new_st,
                                       "reasons": r.get("unpublished_reasons")}})
     return events
@@ -159,12 +210,12 @@ def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
     for store, sku, verdict in rows:
         if verdict == "gone":
             gone += 1
-            events.append({"sku": sku, "store": store, "event": "delete_verified",
+            events.append({"sku": sku, "store": store, "event": DELETE_VERIFIED,
                            "source": "catalog_sync"})
         elif verdict == "still":
             still += 1
             events.append({"sku": sku, "store": store,
-                           "event": "delete_not_effective",
+                           "event": DELETE_NOT_EFFECTIVE,
                            "source": "catalog_sync"})
     if still:
         logger.warning("删除核验:%d 个 SKU 回执成功但仍在架(delete_not_effective),"

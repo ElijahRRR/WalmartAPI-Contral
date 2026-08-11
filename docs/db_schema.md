@@ -168,19 +168,34 @@ CREATE TABLE catalog.risk_product_types (product_type PK, category, ptg,
     field_total, field_required, field_list, synced_at);
 CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
     added_date, synced_at);
+-- ↑ 黑名单品牌**总清单**镜像(risk_sync 飞书→PG)+ 否决闸数据源;
+--   cleanup 自产品牌 DO NOTHING 补进闸门。src_sku/biz_cn/pushed_at 三列为
+--   2026-08-11 过渡遗留,不再被消费(投影改走 brand_err_hits)。
+
+-- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
+-- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清
+-- 2026-08-11)。历史重建走 blacklist_push -p rebuild_brand=1(擦净重灌 +
+-- beyKyi 整表重写),日常由 problem_product_cleanup 尾段实时入账。
+CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
+    added_date, src_sku, src_store, biz_cn, pushed_at, created_at);
+-- 采集库缺品牌的候选走 brand_scrape 工作流补货(推采集→摄取→入账;
+-- 防循环:非标准 asin 过滤 + ops.dedupe('cleanup:brand_scrape') 尝试台账)
 ```
 
 ```sql
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
 CREATE TABLE catalog.product_events (
     id bigint IDENTITY PRIMARY KEY,
-    sku text NOT NULL,              -- 业务约定 sku=asin,贯通两侧身份
+    sku text NOT NULL,              -- 沃尔玛侧订货号**原文**(2026-08-11 推翻
+                                    -- 旧约定 sku=asin:三段式订货号/纯数字
+                                    -- item id 实证)
+    asin text,                      -- 产品源头侧标准码,record_many 按
+                                    -- services/sku_asin 规则自动清洗;提不出
+                                    -- 存 NULL,消费方 coalesce(asin, sku);
+                                    -- 存量补洗走 sku_normalize 工作流
     store text,                     -- 平台级事件可空
     event text NOT NULL,            -- 事件码唯一出处 services/product_events.py:
-                                    -- item_appeared/item_missing/item_reappeared/
-                                    -- status_changed(含官方下架原因)/
-                                    -- {delete|retire|maintenance}_{submitted|feed_success|feed_failed}/
-                                    -- delete_verified/delete_not_effective
+事件码唯一出处 = `services/product_events.py` 的常量与 `EVENTS` 集合(`record_many` 对未登记码抛错);本文档不再复述清单——三处清单曾各漂各的,`maintenance_submitted`/`problem_categorized` 发了大半个月没登记就是这么漏的。
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
@@ -413,6 +428,23 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 --    兜底超时 20 分钟 → 只打在**批次已不在途**的组合上。在途批次不判超时:
 --                 采集侧正干着我们又重推一遍 = 白烧一批配额。
 -- 重试窗口见 refdata/schema.sql 里 first_requested_at 那段注释(可重试一天)。
+
+### catalog.asin_blacklist(ASIN 黑名单,收集侧)
+
+**只收永久禁止类 B/C/E/F/G/K**(`services/blacklist.PERMANENT`;13 类词表只是
+飞书来源列的格式约定,不是入选范围——所有者拍板 2026-08-11)。入选按**当轮
+=最新**类别(历史实证类别翻动频繁,"曾命中过"不能作数)。一次入选不更新
+(DO NOTHING)。`biz_cn` 是独立维度(中国卖家专属禁售);`pushed_at` 是飞书
+投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
+写入方 problem_product_cleanup 尾段;消费方:上架拦截(黑名单建设批次接)。
+
+### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
+
+旧 `seen_sku_categories.json`(20.1 万对)的落点,「错误统计」报表累计数的
+唯一真值来源——报表(旧 Step 3/4/5)迁移前必须先导入,否则累计口径当场跳变。
+写入方:`cleanup_history_import`(历史)+ 未来 cleanup 报表尾段(增量);
+`category` 是 A~L/Z 类别码。主键 (sku, category),ON CONFLICT DO NOTHING。
+
 
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'

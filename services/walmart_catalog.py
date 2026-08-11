@@ -93,7 +93,7 @@ def mark_missing(conn, store_name: str, run_at) -> int:
         cur.execute(_MARK_MISSING_SQL, {"store": store_name, "run_at": run_at})
         gone = [r[0] for r in (cur.fetchall() or [])]
     product_events.record_many(conn, [
-        {"sku": sku, "store": store_name, "event": "item_missing",
+        {"sku": sku, "store": store_name, "event": product_events.ITEM_MISSING,
          "source": "catalog_sync"} for sku in gone])
     return len(gone)
 

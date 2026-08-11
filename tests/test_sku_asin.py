@@ -13,6 +13,8 @@ def test_owner_samples_extract_exactly():
     assert sa.extract_asin("JTZW-D01027HVK3W-38") == "D01027HVK3W"
     assert sa.extract_asin("XKJ-B0GXX75JN5-39.98") == "B0GXX75JN5"
     assert sa.extract_asin("YP-B09TDMGVRW-188.88") == "B09TDMGVRW"
+    # 前缀含数字 + 价格前导零(2026-08-11 生产实证的第 4 形态,208 个)
+    assert sa.extract_asin("A109-B08QF9XLMH-02") == "B08QF9XLMH"
 
 
 def test_plain_asin_passes_through():

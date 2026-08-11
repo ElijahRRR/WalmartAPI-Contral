@@ -176,11 +176,12 @@ def test_master_mirror_neither_blocks_channel_nor_gets_overwritten():
 
 def test_collect_brands_looks_up_products_by_cleaned_asin():
     """采集库按清洗后的标准 asin 查品牌——订货号原文直查必然全空
-    (2026-08-11 生产实证:2,702 个 C/E 候选 0 命中)。溯源列存原文。"""
+    (2026-08-11 生产实证:2,702 个 C/E 候选 0 命中)。溯源列也存
+    标准 asin(beyKyi D 列表头就叫 ASIN,所有者 2026-08-11)。"""
     conn = _Conn(brands={"B0GXX75JN5": "Nike"})
     st = bl.collect_brands(conn, [_it("XKJ-B0GXX75JN5-39.98", "C")])
     assert st["brand_new"] == 1
-    assert conn.channel_rows["nike"][3] == "XKJ-B0GXX75JN5-39.98"
+    assert conn.channel_rows["nike"][3] == "B0GXX75JN5"
 
 
 def test_channel_known_brand_counts_known():

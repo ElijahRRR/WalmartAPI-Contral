@@ -79,29 +79,33 @@ def run(params: dict) -> str:
     timeout_min = int(params.get("timeout_min", _DEFAULT_TIMEOUT_MIN))
     lines = []
 
-    # 先摄取再看缺口:上一轮推的采集也许已经出数了,先收账少推一批
+    # 先摄取再看清单:上一轮推的采集也许已经出数了,先收账少推一批
     if apply:
         lines.append(_pump())
 
     with db.pg_conn() as conn:
-        items = blacklist.missing_brand_items(conn)
-        standard = [it for it in items if sku_asin.is_standard_asin(it["asin"])]
-        nonstd = len(items) - len(standard)
+        items = blacklist.uncollected_brand_items(conn)
+        ready = [it for it in items if it["has_brand"]]
+        missing = [it for it in items if not it["has_brand"]]
+        standard = [it for it in missing
+                    if sku_asin.is_standard_asin(it["asin"])]
+        nonstd = len(missing) - len(standard)
         attempted = blacklist.scrape_attempted(
             conn, [it["asin"] for it in standard])
     todo = [it for it in standard if it["asin"] not in attempted]
 
-    if apply and standard:
-        # 上一轮推过的先入账(摄取刚追平,新到货的品牌在这里落袋)
-        st = _collect([it for it in standard if it["asin"] in attempted])
-        if st["brand_new"] or st["brand_known"]:
-            lines.append(f"上轮已采的入账:新品牌 {st['brand_new']},"
-                         f"已知 {st['brand_known']}")
+    if apply and ready:
+        # 采集库已有品牌、只差入账的先落袋(含上轮推采后到货的——
+        # 2026-08-11 实测:只收"缺品牌"清单会把这批永远漏掉)
+        st = _collect(ready)
+        lines.append(f"已到货入账:新品牌 {st['brand_new']},"
+                     f"已知 {st['brand_known']}")
 
     if not apply:
-        return (f"品牌补采预览:缺品牌候选 {len(items)} 个,其中标准 ASIN "
-                f"{len(standard)} 个(非标准过滤 {nonstd} 个,防循环闸①),"
-                f"已推过采集 {len(attempted)} 个(闸②,不再推),"
+        return (f"品牌补采预览:未入账候选 {len(items)} 个——已到货待入账 "
+                f"{len(ready)} 个(apply 即入账);缺品牌 {len(missing)} 个,"
+                f"其中标准 ASIN {len(standard)} 个(非标准过滤 {nonstd} 个,"
+                f"防循环闸①),已推过采集 {len(attempted)} 个(闸②,不再推),"
                 f"本轮将推 {min(len(todo), limit)} 个(单批上限 {limit});"
                 f"加 -p apply=1 执行(不设邮编不截图,最快形态)")
 

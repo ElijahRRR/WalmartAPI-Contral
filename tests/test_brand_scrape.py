@@ -16,7 +16,7 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(wf.db, "pg_conn",
                         lambda: contextlib.nullcontext(object()))
-    monkeypatch.setattr(wf.blacklist, "missing_brand_items",
+    monkeypatch.setattr(wf.blacklist, "uncollected_brand_items",
                         lambda conn: list(state["items"]))
     monkeypatch.setattr(wf.blacklist, "scrape_attempted",
                         lambda conn, asins: state["attempted"] & set(asins))
@@ -40,17 +40,33 @@ def wired(monkeypatch):
     return calls, state
 
 
-def _it(asin, sku=None):
+def _it(asin, sku=None, has_brand=False):
     return {"asin": asin, "sku": sku or asin, "store": "店A",
-            "category": "C", "reasons": "brand issue"}
+            "category": "C", "reasons": "brand issue", "has_brand": has_brand}
 
 
 def test_preview_pushes_nothing(wired):
     calls, state = wired
-    state["items"] = [_it("B0AAAAAAA1"), _it("102460018738")]
+    state["items"] = [_it("B0AAAAAAA1"), _it("102460018738"),
+                      _it("B0CCCCCCC3", has_brand=True)]
     out = wf.run({})
-    assert "候选 2 个" in out and "标准 ASIN 1 个" in out and "非标准过滤 1 个" in out
+    assert "候选 3 个" in out and "已到货待入账 1 个" in out
+    assert "标准 ASIN 1 个" in out and "非标准过滤 1 个" in out
     assert calls["submitted"] == [] and calls["marked"] == []
+    assert calls["collected"] == []          # 预览连入账都不做
+
+
+def test_apply_collects_arrived_brands_not_only_missing(wired):
+    """2026-08-11 实测 bug 的回归钉:摄取补到货的品牌(has_brand=True)
+    必须入账——只收"缺品牌"清单的话,这批既不在缺口里又没人收,
+    两侧都不报错地永远漏掉(当时 99 个)。"""
+    calls, state = wired
+    state["items"] = [_it("B0CCCCCCC3", has_brand=True),
+                      _it("B0DDDDDDD4", has_brand=True)]
+    out = wf.run({"apply": "1"})
+    assert calls["collected"] == [["B0CCCCCCC3", "B0DDDDDDD4"]]
+    assert calls["submitted"] == []          # 有品牌的不推采集
+    assert "已到货入账" in out
 
 
 def test_apply_filters_nonstandard_and_attempted(wired):
@@ -68,14 +84,14 @@ def test_apply_filters_nonstandard_and_attempted(wired):
     assert "入账" in out
 
 
-def test_apply_collects_previous_round_first(wired):
-    """上一轮推过的 ASIN:本轮先摄取再入账(到货的品牌落袋),不重推。"""
+def test_apply_attempted_but_still_missing_is_normal_loss(wired):
+    """推过采集但仍缺品牌的(页面已下架采不回来):不重推、也不空转入账,
+    报"无可推候选"当正常损耗。"""
     calls, state = wired
     state["items"] = [_it("B0BBBBBBB2")]
     state["attempted"] = {"B0BBBBBBB2"}
     out = wf.run({"apply": "1"})
-    assert calls["submitted"] == []                       # 没有新推
-    assert calls["collected"] == [["B0BBBBBBB2"]]          # 但入账跑了
+    assert calls["submitted"] == [] and calls["collected"] == []
     assert "无可推候选" in out
 
 

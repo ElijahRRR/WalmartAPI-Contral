@@ -15,7 +15,10 @@
     北京日界)
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦)
+    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦;
+    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截——所有者口径
+    2026-08-12,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE
+    职责边界拍板)
   ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
     数据恢复自动续上)
   ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
@@ -64,6 +67,9 @@ SELECT asin, delete_times, delete_not_effective_times, listed_times,
 FROM catalog.product_risk
 WHERE delete_times > 0 OR delete_not_effective_times > 0
 """
+_SQL_UNEXPLAINED = """
+SELECT asin FROM catalog.product_risk WHERE unexplained_missing
+"""
 
 
 def _risk_reason(deletes: int, not_effective: int, listed: int,
@@ -95,8 +101,10 @@ def _load_gate_state():
         # 键是 coalesce(asin, sku)——视图身份键 2026-08-11 从订货号原文改成
         # 产品码,否则三段式 sku 名下的删除史拦不住同 ASIN 换号重上
         risky = {r[0]: r[1:] for r in cur.fetchall()}
+        cur.execute(_SQL_UNEXPLAINED)
+        unexplained = {r[0] for r in cur.fetchall()}
         gate = risk_gate.load_gate(conn)
-    return inactive, today_used, listed, risky, gate
+    return inactive, today_used, listed, risky, unexplained, gate
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -249,7 +257,7 @@ def run(params: dict) -> str:
     if not pending:
         return "\n".join(lines)
 
-    inactive, today_used, listed, risky, gate = _load_gate_state()
+    inactive, today_used, listed, risky, unexplained, gate = _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
@@ -257,6 +265,7 @@ def run(params: dict) -> str:
          "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
          "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
+    missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
 
     by_store: dict[str, list[dict]] = {}
@@ -293,6 +302,10 @@ def run(params: dict) -> str:
                 n["guard"] += 1
                 reasons.append((r["rownum"], _risk_reason(*risk)))
                 continue
+            if r["asin"] in unexplained:
+                # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
+                # 没提交过删/停 = 疑似平台强制下架,放行但必须在摘要里亮出来
+                missing_warn.append(r["asin"])
             candidates.append(r)
 
     products = amz_source.fetch_products([r["asin"] for r in candidates])
@@ -365,6 +378,10 @@ def run(params: dict) -> str:
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
     lines.append(gate_line)
+    if missing_warn:
+        lines.append(f"  ⚠ {len(missing_warn)} 行有\"不明原因消失\"史"
+                     f"(疑似平台下架)仍放行:{','.join(missing_warn[:8])}"
+                     f"——暂只提示不拦截(2026-08-12 口径)")
 
     if not execute:
         for rownum, why in reasons[:15]:

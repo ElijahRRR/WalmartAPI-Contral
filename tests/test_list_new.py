@@ -66,6 +66,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         {"T_OFF"}, {}, {"B0LISTED01"}, {"B0RISKY001": (2, 1, 3, None)},
+        {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
@@ -86,6 +87,9 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     assert "去重 1" in out and "防呆 1" in out and "PT无spec 1" in out
     assert "待数据源 1" in out
     assert fetched["asins"] == [rows[0]["asin"]]   # 只有过全闸的行才拉数据
+    # 不明消失史(疑似平台下架)只提示不拦截:该行照样走到"待数据源",
+    # 但摘要必须报警亮出来(所有者口径 2026-08-12)
+    assert "不明原因消失" in out and "B0ASIN0002" in out
 
 
 def test_risk_reason_carries_evidence():
@@ -208,7 +212,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        set(), {}, set(), {}, {"banned_pts": set(), "brands": set()}))
+        set(), {}, set(), {}, set(), {"banned_pts": set(), "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})

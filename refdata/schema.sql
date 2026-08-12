@@ -308,6 +308,11 @@ CREATE VIEW catalog.product_risk AS
          count(*) FILTER (WHERE event = 'retire_submitted')      AS retire_times,
          count(*) FILTER (WHERE event = 'item_missing')          AS missing_times,
          count(*) FILTER (WHERE event = 'delete_not_effective')  AS delete_not_effective_times,
+         -- 不明原因消失:从目录消失过、且我们从没提交过删/停 = 疑似平台强制
+         -- 下架。所有者口径 2026-08-12:list_new 只提示不拦截(积累观察后再定)
+         (count(*) FILTER (WHERE event = 'item_missing') > 0
+          AND count(*) FILTER (WHERE event IN
+              ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
          max(occurred_at) AS last_event_at
@@ -324,6 +329,9 @@ CREATE OR REPLACE VIEW catalog.product_risk_store AS
          count(*) FILTER (WHERE event = 'retire_submitted')      AS retire_times,
          count(*) FILTER (WHERE event = 'item_missing')          AS missing_times,
          count(*) FILTER (WHERE event = 'delete_not_effective')  AS delete_not_effective_times,
+         (count(*) FILTER (WHERE event = 'item_missing') > 0
+          AND count(*) FILTER (WHERE event IN
+              ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
          max(occurred_at) AS last_event_at

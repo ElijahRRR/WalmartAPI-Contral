@@ -181,7 +181,7 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       SKU_LOCKED)+ 优先级(SKU_LOCKED > 真SUCCESS > INPROGRESS > 全ASYNC >
       SUCCESS_WITH_WARNING > DATA_ERROR)+ 异步审核假错误绝不当失败重发;
       做成 feed_poll 反哺器回写上架表
-- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted)、上架前防呆闸已接(list_new 查 product_risk);**入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
+- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted)、上架前防呆闸已接(list_new 与 match_listing 双链查 product_risk,2026-08-12 跟卖补齐;同日 ASIN 黑名单拦截双链接通);**入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
 
 ### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 

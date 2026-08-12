@@ -26,6 +26,26 @@ SOURCE_1688 = "1688"        # 1688 货源(预留)
 SOURCE_UNKNOWN = "unknown"  # 存量格式回填未能归类;不参与任何自动破坏动作
 
 
+_RISKY_KEYS_SQL = """
+SELECT DISTINCT ls.source_key
+FROM catalog.listing_sources ls
+JOIN catalog.product_risk pr ON pr.asin = ls.sku
+WHERE ls.source_type = %s AND ls.source_key IS NOT NULL
+  AND (pr.delete_times > 0 OR pr.delete_not_effective_times > 0)
+"""
+
+
+def risky_source_keys(conn, source_type: str) -> set:
+    """输入:连接 + 来源类型 → 输出:名下 SKU 有删除史的 source_key 集合。
+
+    跟卖防呆用:跟卖品 sku 是自编号,病历以 sku 记账,product_risk 的
+    产品码身份对它退化为 sku 原文——同一 GTIN 换个新编号重跟,按 ASIN
+    查必然漏。本函数经登记簿把"GTIN → 历史 sku → 删除史"接回来。"""
+    with conn.cursor() as cur:
+        cur.execute(_RISKY_KEYS_SQL, (source_type,))
+        return {r[0] for r in cur.fetchall()}
+
+
 def register(conn, rows: list[dict]) -> int:
     """输入:连接 + [{store, sku, source_type, source_key?, workflow}]
     → 输出:写入数。首次登记优先(ON CONFLICT 不覆盖);改归类走人工 UPDATE。"""

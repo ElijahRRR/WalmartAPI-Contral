@@ -62,10 +62,13 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         _sheet_row(7, store="T_OFF"),                     # 非 ACTIVE 店
         _sheet_row(8, listed="Yes"),                      # 已上架不领任务
         _sheet_row(9, list_result="SKU_LOCKED"),          # sku_locked_heal 处理
+        _sheet_row(10, asin="B0BANNED01"),                # ASIN 黑名单
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        {"T_OFF"}, {}, {"B0LISTED01"}, {"B0RISKY001": (2, 1, 3, None)},
+        {"T_OFF"}, {}, {"B0LISTED01"},
+        {"B0BANNED01": ("E", "沃尔玛-知产")},
+        {"B0RISKY001": (2, 1, 3, None)},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
@@ -82,10 +85,13 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
                             AssertionError("dry-run 不许提交")))
 
     out = ln.run({"execute": False})
-    assert "待上架 6" in out    # 8 行中 K=Yes 不领,SKU_LOCKED 归自愈链不归本链
+    assert "待上架 7" in out    # 9 行中 K=Yes 不领,SKU_LOCKED 归自愈链不归本链
     assert "非ACTIVE店 1" in out and "风控拦截 1" in out
     assert "去重 1" in out and "防呆 1" in out and "PT无spec 1" in out
-    assert "待数据源 1" in out
+    assert "黑名单 1" in out and "待数据源 1" in out
+    # 黑名单理由带来源与类别(收集侧建好,拦截侧在此接通)
+    assert any("ASIN黑名单:沃尔玛-知产(E类)" in why for _, why in
+               [(0, w) for w in out.splitlines()])
     assert fetched["asins"] == [rows[0]["asin"]]   # 只有过全闸的行才拉数据
     # 不明消失史(疑似平台下架)只提示不拦截:该行照样走到"待数据源",
     # 但摘要必须报警亮出来(所有者口径 2026-08-12)
@@ -93,13 +99,18 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
 
 
 def test_risk_reason_carries_evidence():
-    """防呆理由带证据(计数/最近移除时间),不再只写"有删除史"四个字。"""
+    """防呆理由带证据(计数/最近移除时间),不再只写"有删除史"四个字。
+
+    积木 2026-08-12 下沉 services/product_events(list_new 与 match_listing
+    两条上架链共用)。"""
     from datetime import datetime
-    r = ln._risk_reason(2, 1, 3, datetime(2026, 7, 30))
+
+    from services import product_events as pe
+    r = pe.risk_reason(2, 1, 3, datetime(2026, 7, 30))
     assert "提交删除2次" in r and "删除未生效1次" in r
     assert "历史上架3次" in r and "最近移除2026-07-30" in r
     # 空缺列不硬凑:没有未生效/上架史/时间就不出现对应片段
-    assert ln._risk_reason(1, 0, 0, None) == "防呆:该ASIN有删除史(提交删除1次)"
+    assert pe.risk_reason(1, 0, 0, None) == "防呆:该ASIN有删除史(提交删除1次)"
 
 
 def test_error_desc_joined_into_p_column(monkeypatch):
@@ -216,7 +227,8 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        set(), {}, set(), {}, set(), {"banned_pts": set(), "brands": set()}))
+        set(), {}, set(), {}, {}, set(),
+        {"banned_pts": set(), "brands": set()}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})

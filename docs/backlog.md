@@ -16,10 +16,10 @@
 |---|---|---|
 | ✅ | ~~清理→品牌黑名单自产回路~~(2026-08-11 生产验收:渠道独立表 brand_err_hits(不与总清单去重,修掉"总表已有品牌进不了渠道"的建模缺陷)→ beyKyi 整表重写 2,012 行(总表认领 2,011 + 时间线推导 1);缺品牌候选走 brand_scrape 推采集闭环(非标准过滤 + 尝试台账防循环);实时链路 cleanup 尾段双落库:渠道表 + 否决闸) | `services/blacklist.py` / `workflows/brand_scrape.py` |
 | ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;risk_sync 现把 D 列 ASIN 镜像进 src_sku,空不覆盖) | — |
-| 🟡 | **ASIN 黑名单:PG 侧+投影已生产验收**(2026-08-11:sku 清洗后按标准 asin 重灌 56,812 行、整表重写,日期=报错发生日;numeric 1,739 键无解暂留原文兜底)。**余:上架拦截消费方**(黑名单建设批次) | `services/blacklist.py` |
+| ✅ | ~~ASIN 黑名单~~(2026-08-11 PG 侧+投影生产验收:按标准 asin 重灌 56,812 行;numeric 1,739 键原文兜底。**2026-08-12 上架拦截消费方接通**:blacklist.load_banned_asins → list_new 闸门链(去重后、防呆前)+ match_listing 三道闸,N/F 列写来源与类别) | `services/blacklist.py` |
 | 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合(随预警批次) | `services/blacklist.py:45` |
 | 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
-| ⬜ | **match_listing 不过风控闸与防呆**——跟卖同样是新增在售 offer,只有 list_new 有闸 | `workflows/match_listing.py`(不查 risk_gate / product_risk) |
+| ✅ | ~~match_listing 不过风控闸与防呆~~(2026-08-12 接通三道闸:SPEC 交叉字段过 risk_gate(PT/品牌)+ asin_blacklist(交叉 ASIN)+ product_risk 防呆(交叉 ASIN 删除史 / 同 GTIN 旧跟卖 offer 删除史,后者经 listing_sources 把 GTIN→历史 sku→病历接回);交叉不出的字段跳过该道闸;命中写 F 终态,清 F 重排队) | `workflows/match_listing.py:_gate_reason` |
 | ⬜ | UPC `gs1_restricted_prefix` **6,665 条**历史黑名单未导入(upc_generator 定稿不迁,但这批黑名单号的处置没有交代) | `docs/legacy_survey.md:998,1026,2251` |
 | 🔴 | PT 5 维度风险表 / 禁售政策知识库 / TRO·商标黑名单 / 新审核系统三表(~25k 行):跨仓,迁移边界未定 | `docs/legacy_survey.md:2000-2001,1806,1915,1954,1963` |
 | ⬜ | "飞书表停用后的接班者"——产品中心黑名单增量脚本,四处文档承诺零代码 | `services/risk_gate.py:9` / `workflows/risk_sync.py:11` / `docs/listing_plan.md:80-82` / `refdata/schema.sql:225-227` |

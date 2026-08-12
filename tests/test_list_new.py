@@ -226,3 +226,118 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     out = ln.run({"execute": False})
     assert "运费未采到" in out
     assert "共 1 行将进入" in out        # 只有带运费那行进得去
+
+
+def test_quota_slices_after_filters(monkeypatch):
+    """配额以能成功提交的行计(所有者批复 2026-08-12):先过滤后切片。
+
+    旧写法 srows[:allow] 先切片再过闸,被淘汰行白占名额——配额 1 时第 1 行
+    被库存闸淘汰,当天就一行都上不了;新写法幸存者切片,后面的行顶上。
+    """
+    rows = [_sheet_row(2, asin="B0LOWSTOCK"),
+            _sheet_row(3, asin="B0GOODONE1"),
+            _sheet_row(4, asin="B0GOODONE2")]
+    base = {"title": "T", "price": 20.0, "stock_state": "in_stock",
+            "lead_days": 2, "channel": "FBM", "shipping": 3.0}
+    products = {"B0LOWSTOCK": {**base, "asin": "B0LOWSTOCK", "stock": 1},
+                "B0GOODONE1": {**base, "asin": "B0GOODONE1", "stock": 50},
+                "B0GOODONE2": {**base, "asin": "B0GOODONE2", "stock": 50}}
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "库存不足:1" in out
+    assert "共 1 行将进入" in out
+    assert "B0GOODONE1" in out           # 幸存者顶上配额位(旧写法这里是 0 行)
+    assert "超配额 1" in out             # 超额的是第二个幸存者,不是被淘汰行
+
+
+def test_push_scrape_daily_dedup(monkeypatch):
+    """缺数据自动推采集(所有者批复 2026-08-12):日界批次名撞名即防重。"""
+    calls = []
+    monkeypatch.setattr(ln.scraper, "submit_batch",
+                        lambda name, asins: (calls.append((name, asins)),
+                                             {"inserted": len(asins)})[1])
+    note = ln._push_scrape(["B1", "B2"], execute=True)
+    assert "已推采集" in note and calls[0][1] == ["B1", "B2"]
+    assert calls[0][0].startswith("listing_gap_")
+
+    def boom(name, asins):
+        raise ln.scraper.BatchExistsError(7, name)
+    monkeypatch.setattr(ln.scraper, "submit_batch", boom)
+    assert "已推过" in ln._push_scrape(["B3"], execute=True)
+    assert "DRY-RUN" in ln._push_scrape(["B4"], execute=False)   # dry-run 不推
+    assert ln._push_scrape([], True) is None
+
+
+def test_heal_unknown_three_paths(monkeypatch):
+    """K=Unknown 自愈(所有者批复 2026-08-12):台账终态双向 + 目录在线。"""
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns))
+    rows = [_sheet_row(2, listed="Unknown", list_date="2026-08-10"),  # 台账 success
+            _sheet_row(3, listed="Unknown"),                          # 台账 failed
+            _sheet_row(4, listed="Unknown"),                          # 目录在线
+            _sheet_row(5, listed="Unknown"),                          # 无依据,保持
+            _sheet_row(6, listed="Yes")]                              # 不碰
+    a2, a3, a4 = rows[0]["asin"], rows[1]["asin"], rows[2]["asin"]
+
+    class _C:
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            self.sql = sql
+
+        def fetchone(self):
+            return (1,)                          # 目录非空,源② 启用
+
+        def fetchall(self):
+            if "ops.feed_items" in self.sql:
+                return [("T1", a2, "F1", "success", "", None),
+                        ("T1", a3, "F2", "failed", "ERR_X", "字段坏了")]
+            if "walmart_items" in self.sql:
+                return [("T1", a4)]
+            if "upc_pool" in self.sql:
+                return [("T1", a2, "0011"), ("T1", a3, "0022")]
+            return []
+
+    conn = _C()
+    monkeypatch.setattr(listing_sheet.db, "pg_conn",
+                        lambda: contextlib.nullcontext(conn))
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    used, released = [], []
+    monkeypatch.setattr(listing_sheet.upc_pool, "mark_used",
+                        lambda c, pairs: used.extend(pairs))
+    monkeypatch.setattr(listing_sheet.upc_pool, "release",
+                        lambda c, upcs, reason: released.extend(upcs))
+
+    out = listing_sheet.heal_unknown()
+    w = {rng: vals[0] for rng, vals in writes}
+    assert w["K2:Q2"][0] == "Yes" and w["K2:Q2"][1] == "F1"
+    assert w["K2:Q2"][2] == "2026-08-10"          # 原上架日期不被覆盖
+    assert w["K3:Q3"][0] == "No" and w["K3:Q3"][4] == "FAILED"
+    assert "ERR_X | 字段坏了" in w["K3:Q3"][5]     # P 列码+人话
+    assert w["K4:N4"][0] == "Yes"                 # 目录在线只写 K~N,不碰 O/P/Q
+    assert "K5:Q5" not in w and "K5:N5" not in w  # 无依据绝不负向写
+    assert "K6:Q6" not in w and "K6:N6" not in w  # 非 Unknown 不碰
+    assert used == [("0011", a2)] and released == ["0022"]
+    assert "确认在线 2" in out and "确认失败重排 1" in out and "继续观察 1" in out

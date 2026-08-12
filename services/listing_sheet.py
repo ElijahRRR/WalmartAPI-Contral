@@ -8,7 +8,9 @@
 
 列权责(旧系统纪律,跨界写就是 bug):A/B/D/E/F/G 人工域;list_new 写
 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
-L3 状态跟踪写 R~U。K 三态语义:Yes(已提交)/Unknown(结局不确定,
+L3 状态跟踪写 R~U。**唯一例外**:heal_unknown 自愈反哺器对 K=Unknown
+的行可写 K~Q(所有者批复 2026-08-12——Unknown 是 list_new 自己写的
+中间态,自愈是同一职责的收尾,不算跨界)。K 三态语义:Yes(已提交)/Unknown(结局不确定,
 也算已上架不重复提交)/空或 No(待上架);O=SKU_LOCKED 由 sku_locked_heal
 自愈链处理(RETIRE→24h→清列重上新 UPC;所有者纠正 2026-08-12:不是
 永久跳过——但旧实证不先退役直接换 UPC 重发也失败,legacy_survey.md:1667)。
@@ -147,6 +149,147 @@ def _mark_upc_conflicts(asins: list[str]) -> int:
     if missing:
         logger.warning("UPC 撞库 %d 个在池中找不到对应 UPC(无法标冲突)", missing)
     return n
+
+
+# Unknown 自愈的两个判定源(所有者批复 2026-08-12,替代旧 sync_status_track
+# 的 K 自愈半边;"反查真实状态"半边已由 catalog_sync 承接):
+#   源① feed 回执台账:unknown 行多半没拿到 feedId(网络断在提交半途),但
+#     ops.feed_log 的 pending 防重与后续轮询可能已把同 (店铺,SKU) 的提交落成
+#     终态——按 (store, sku) 反查 MP_ITEM 最新台账行
+#   源② 沃尔玛目录:catalog.walmart_items 在架(catalog_sync 每日全量;
+#     product_events 的 list_submitted→item_appeared 时间线与之同源)
+# 三层防误写(2026-06-09 全表误写事故语义,按新形态映射):
+#   · 目录读空 → 源② 整体停用本轮(等价旧"空索引硬中止")
+#   · **"查无"永不产生负向写**——K=No 只允许来自源① 的 feed 终态 FAILED,
+#     目录里查不到只保持 Unknown(旧"单店 80% 熔断"与"48h 审核窗豁免"
+#     防的就是负向误写,新形态下负向写根本不走目录源,天然满足)
+_SQL_HEAL_RECEIPT = """
+SELECT DISTINCT ON (f.store, f.sku) f.store, f.sku, f.feed_id, f.status,
+       f.error_code, f.error_desc
+FROM ops.feed_items f
+JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
+  ON f.store = t.store AND f.sku = t.sku
+WHERE f.feed_type = 'MP_ITEM'
+ORDER BY f.store, f.sku, f.submitted_at DESC
+"""
+_SQL_HEAL_ONLINE = """
+SELECT w.store, w.sku
+FROM catalog.walmart_items w
+JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
+  ON w.store = t.store AND w.sku = t.sku
+WHERE w.missing_since IS NULL
+"""
+
+
+def heal_unknown() -> str | None:
+    """feed_poll 反哺器:K=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
+
+    Unknown 是"提交结局不确定"的防重态(不重复提交防双上架),但没人收尾
+    就永久卡死 + UPC 永久占用(claimed 不释放)。收尾三条路:
+      台账终态 success/审核中 → K=Yes L=feedid O/P/Q 回填,UPC 标已用
+      台账终态 failed        → K=No O=FAILED(进 list_new 限次重试通道),
+                               UPC 回收(rejected 路径)
+      目录在架(无台账终态)→ K=Yes(L 保持原样),UPC 标已用
+    其余保持 Unknown 等下一轮(摘要里报数,长期不愈人工看)。
+    """
+    try:
+        resources.LISTING_SHEET.require()
+    except LookupError as e:
+        return f"上架表自愈:表未登记,跳过({e})"
+    rows = read_rows()
+    unknown = [r for r in rows if r["listed"].strip().lower() == "unknown"]
+    if not unknown:
+        return None
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    stores = [r["store"] for r in unknown]
+    skus = [r["asin"] for r in unknown]
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_HEAL_RECEIPT, (stores, skus))
+        receipts = {(s, k): (fid, st, code, desc)
+                    for s, k, fid, st, code, desc in cur.fetchall()}
+        cur.execute("SELECT 1 FROM catalog.walmart_items LIMIT 1")
+        catalog_ok = cur.fetchone() is not None
+        online: set[tuple[str, str]] = set()
+        if catalog_ok:
+            cur.execute(_SQL_HEAL_ONLINE, (stores, skus))
+            online = set(cur.fetchall())
+        cur.execute("SELECT store, asin, upc FROM catalog.upc_pool "
+                    "WHERE status = 'claimed' AND asin = ANY(%s)",
+                    (list(set(skus)),))
+        claimed = {(s, a): u for s, a, u in cur.fetchall()}
+
+    ranges = []
+    n_yes = n_no = n_locked = n_stay = 0
+    upc_used: list[tuple[str, str]] = []
+    upc_release: list[str] = []
+    for r in unknown:
+        key, rn = (r["store"], r["asin"]), r["rownum"]
+        rec = receipts.get(key)
+        if rec and rec[1] in ("success", "failed", "missing"):
+            fid, st, code, desc = rec
+            o, p = classify_receipt(st, code)
+            if p and desc:
+                p = f"{p} | {desc}"[:900]
+            if o == "SKU_LOCKED":
+                # 只落 O,K 保持 Unknown:行交给 sku_locked_heal 自愈链
+                ranges.append((f"O{rn}:Q{rn}", [[o, p, today]]))
+                n_locked += 1
+                continue
+            if o == "FAILED":
+                ranges.append((f"K{rn}:Q{rn}", [[
+                    "No", "", r["list_date"],
+                    "自愈:feed回执FAILED,重新排队", o, p, today]]))
+                if key in claimed:
+                    upc_release.append(claimed[key])
+                n_no += 1
+                continue
+            # SUCCESS / SUCCESS_WITH_WARNING / ASYNC_PENDING / MISSING?
+            # MISSING(feed 终态但明细查无此 SKU)= 高置信未达:按旧
+            # RolledBack 语义当"没提交过"——K=No 且 O 留 MISSING 供追查
+            if o == "MISSING":
+                ranges.append((f"K{rn}:Q{rn}", [[
+                    "No", "", r["list_date"],
+                    "自愈:feed终态但明细无此SKU,按未达重排", o, p, today]]))
+                if key in claimed:
+                    upc_release.append(claimed[key])
+                n_no += 1
+                continue
+            ranges.append((f"K{rn}:Q{rn}", [[
+                "Yes", fid, r["list_date"] or today,
+                f"自愈:feed回执{o}", o, p, today]]))
+            if key in claimed:
+                upc_used.append((claimed[key], r["asin"]))
+            n_yes += 1
+            continue
+        if key in online:
+            ranges.append((f"K{rn}:N{rn}", [[
+                "Yes", r["feed_id"], r["list_date"] or today,
+                "自愈:沃尔玛目录在线(catalog_sync)"]]))
+            if key in claimed:
+                upc_used.append((claimed[key], r["asin"]))
+            n_yes += 1
+            continue
+        n_stay += 1
+
+    if upc_used or upc_release:
+        with db.pg_conn() as conn:
+            if upc_used:
+                upc_pool.mark_used(conn, upc_used)
+            if upc_release:
+                upc_pool.release(conn, upc_release, "rejected")
+    if not ranges:
+        note = "" if catalog_ok else "(⚠ 目录为空,在线判定本轮停用)"
+        return f"上架表自愈:Unknown {len(unknown)} 行暂无可判定依据{note}"
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
+    line = (f"上架表自愈:Unknown {len(unknown)} 行 → 确认在线 {n_yes},"
+            f"确认失败重排 {n_no}")
+    if n_locked:
+        line += f",SKU_LOCKED 移交自愈链 {n_locked}"
+    if n_stay:
+        line += f",继续观察 {n_stay}"
+    if not catalog_ok:
+        line += "(⚠ 目录为空,在线判定本轮停用)"
+    return line
 
 
 def sync_from_ledger() -> str | None:

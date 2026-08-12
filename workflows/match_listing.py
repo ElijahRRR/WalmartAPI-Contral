@@ -28,7 +28,10 @@
 修好重上是正常经营;曾按 product_risk 删除史/GTIN 删除史一刀切拦过,
 当日拆除)。
 结果:J/K 由 feed_poll 反哺器按 ops.feed_items 回填;跟卖新 offer 默认
-0 库存是正常现象(v4.2 spec 无库存字段),不当失败。
+0 库存是正常现象(v4.2 spec 无库存字段),不当失败——库存由 maintenance
+的 match_inventory provider 铺(offer 进目录后自动补到保守值;所有者批复
+2026-08-12,补"建成即 0 库存永远没人补"的结构洞,旧 inventory_push
+因 --no-poll 从未真跑)。
 
 与地基的融合:提交走 api/feeds 唯一通道(三层防重/切片/限速);轮询走
 全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,

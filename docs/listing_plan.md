@@ -155,6 +155,40 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 3. 新错误码进 `mp_conform` 对应工序 + 一条回归测试 + 本表追加一行;
 4. 只剩 `0101119` 撞库 = **已经通了**,那是运气不是缺陷。
 
+#### 续迁调研定稿(2026-08-12,旧仓 erpAPI 三路全量对照)
+
+完整缺口清单(P0~P3 分级)在 **docs/backlog.md 第八节**,此处只记结论:
+
+- **旧 auto_listing 40+ 模块逐一定性完毕**:主链/映射/定价/回执/UPC 池/风控/
+  自愈/限速全部已被新系统承接(多数更强);死代码与一次性脚本共 8 个不迁;
+  真缺口 6 个 P0(K=Unknown 自愈、跟卖库存、闸门前淘汰计次、缺数据推采集、
+  配额增量补齐、manufacturer 双字段风控),回归/能力项见总账。
+- **旧生产有两条调度链**:launchd 5 条 + AI skill 平台 erp-online-products-track
+  (07:30,也写上架表 O/P/Q 与 R~W)。切换清单必须两条都停。
+- **26→21 列**:旧 V/W 左移至新 T/U,迁移/对照一律**按列名**;旧读侧键名与
+  config.py 列表早已过期,以 feishu_io.py docstring + 写侧函数为准。
+- **变体分组评估**:核心 ~190 行纯函数,可做;跨店重定向(与人工域/配额
+  口径冲突)与 LLM remap 建议砍;先决条件 = 采集契约顶层暴露
+  parent_asin / variation_asins / variation_attributes。
+- **旧 Excel/DMIT 47 列输入模式不迁**;excel_row_to_amazon_dict(120 行)是
+  唯一完整的字段映射基准,已用于契约对照——结论:仅 manufacturer 需提顶层,
+  其余都在 attrs 里;attrs.weight 形态需生产核实(否则 ShippingWeight 全量
+  兜底 1.0 磅)。
+
+#### 续迁批次一实施状态(2026-08-12,所有者六点批复当日落地)
+
+- [x] K=Unknown 自愈:`listing_sheet.heal_unknown`(feed_poll 第五反哺器;
+      feed 台账终态双向收尾 + 目录在线判定;"查无"永不负向写;UPC 随判定
+      标已用/回收;SKU_LOCKED 移交自愈链)
+- [x] 跟卖库存:`maintenance_intents.match_inventory_intents`(唯一路径,
+      默认铺 10;stockzero 解除自动回补)
+- [x] 配额切片后置(淘汰放切片前,配额以成功提交为准)
+- [x] 缺数据自动推采集(`list_new._push_scrape`,日界批次名防重)
+- [x] manufacturer 提顶层 + risk_gate 双字段
+- [x] 闸门前淘汰计次:**否决不做**(所有者:数据每轮会变,不该永久淘汰;
+      贵步骤已在切片后,无浪费)
+- 批复原文与实现细节:docs/backlog.md 第八节
+
 #### 已知未做(续做时的清单)
 
 - 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)

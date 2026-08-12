@@ -15,8 +15,10 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
 闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
-  ② 日配额(限额表「上架限制」- 今日已提交数(ops.feed_items MP_ITEM);
-    北京日界)
+  ② 日配额**在全部过滤之后切**(所有者批复 2026-08-12:配额以成功提交为准,
+    淘汰放切片前——先切片再过滤会让被淘汰行白占名额,淘汰率 40% 时实际
+    只能上到配额的 60%)。额度 = 限额表「上架限制」- 今日已提交数
+    (ops.feed_items MP_ITEM,北京日界);超配额行不写终态,次日自动续上
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
     cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist 永久禁止
@@ -24,9 +26,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     2026-08-12:拦"出现过侵权/审查等拉黑类别"的,不拦"因产品问题删过"
     的——可修复类删除后重上是正常经营,曾按删除史一刀切拦过,当日拆除);
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
-  ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
-    数据恢复自动续上)
-  ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
+  ⑤ 数据源(services/amz_source,缺席:该行本轮跳过**不写终态**,并把
+    缺数据 ASIN **自动推给采集服务**补采(所有者批复 2026-08-12 接上闭环;
+    日界批次名防重,当天已推不重推),采集落库后自动续上
+  ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
+    (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
     只有区间内倍率未配置才淘汰)
   ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
@@ -42,7 +46,7 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 import logging
 from datetime import datetime
 
-from api import feeds, feishu, llm, settings as settings_api
+from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, resources
 from services import amz_source, blacklist, kpi, listing_sheet, \
     listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
@@ -125,6 +129,34 @@ def _load_multipliers() -> dict[str, dict]:
                          for k in ("fba_range1", "fba_range2",
                                    "fbm_range1", "fbm_range2")}
     return out
+
+
+def _push_scrape(absent: list[str], execute: bool) -> str | None:
+    """输入:缺数据 ASIN 列表 + 是否真跑 → 输出:摘要行(None=无缺数据)。
+
+    采集闭环(所有者批复 2026-08-12):数据源缺席的 ASIN 自动推给采集服务,
+    替代"接线期人工推"。批次名带北京日界,天然防重——当天第二轮撞名
+    (BatchExistsError)直接跳过,增量 ASIN 次日随新批次推,不追当天。
+    最快形态(不切邮编不截图);采集落库(product_ingest)后主链自动续上。
+    推送失败只告警不阻塞上架:缺数据行本来就是跳过不写终态。
+    """
+    if not absent:
+        return None
+    day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
+    name = f"listing_gap_{day}"
+    if not execute:
+        return (f"  [DRY-RUN] 缺数据 {len(absent)} 个 ASIN,"
+                f"--execute 时将推采集批次 {name}")
+    try:
+        r = scraper.submit_batch(name, absent)
+        return (f"  缺数据 {len(absent)} 个 ASIN 已推采集"
+                f"(批次 {name},入库 {r.get('inserted')})")
+    except scraper.BatchExistsError:
+        return (f"  缺数据 {len(absent)} 个 ASIN:今日批次 {name} 已推过,"
+                f"不重推(增量明日随新批次)")
+    except Exception as e:
+        logger.warning("推采集失败(不阻塞上架,缺数据行本轮跳过): %s", e)
+        return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}"
 
 
 def _map_visible(conn, pt: str, spec, product: dict) -> dict:
@@ -253,6 +285,9 @@ def run(params: dict) -> str:
     for r in pending:
         by_store.setdefault(r["store"], []).append(r)
 
+    # 配额**不在这里切**(所有者批复 2026-08-12):先过全部闸门与数据过滤,
+    # 幸存者再按店切片——被淘汰行不占名额,配额以能成功提交的行计
+    allow_by_store: dict[str, int] = {}
     for store_name, srows in sorted(by_store.items()):
         if store_name not in stores_by_name:
             lines.append(f"  {store_name}:凭证缺失,整店跳过")
@@ -260,11 +295,9 @@ def run(params: dict) -> str:
         if store_name in inactive:
             n["inactive"] += len(srows)
             continue
-        allow = max(0, quota.get(store_name, 999)
-                    - today_used.get(store_name, 0))
-        take, over = srows[:allow], srows[allow:]
-        n["quota"] += len(over)
-        for r in take:
+        allow_by_store[store_name] = max(0, quota.get(store_name, 999)
+                                         - today_used.get(store_name, 0))
+        for r in srows:
             if pt_spec.load_pt(r["product_type"]) is None:
                 n["no_spec"] += 1
                 reasons.append((r["rownum"], f"PT无spec:{r['product_type']}"))
@@ -294,7 +327,12 @@ def run(params: dict) -> str:
             candidates.append(r)
 
     products = amz_source.fetch_products([r["asin"] for r in candidates])
-    ready: list[dict] = []
+    # 缺数据 ASIN 自动推采集(所有者批复 2026-08-12 接上闭环,替代"接线期
+    # 人工推")。日界批次名天然防重:当天已推过撞名即跳过,增量次日再推
+    absent = sorted({r["asin"] for r in candidates
+                     if products.get(r["asin"]) is None})
+    scrape_note = _push_scrape(absent, execute)
+    survivors: list[dict] = []
     for r in candidates:
         p = products.get(r["asin"])
         if p is None:
@@ -318,7 +356,9 @@ def run(params: dict) -> str:
             n["filtered"] += 1
             reasons.append((r["rownum"], f"库存不足:{stock}"))
             continue
-        why = risk_gate.check(gate, None, p.get("brand"))
+        # 品牌与制造商两个字段都查(所有者批复 2026-08-12):brand=Generic
+        # 而真品牌在 manufacturer 是亚马逊常态,只查 brand 黑名单必漏
+        why = risk_gate.check(gate, None, p.get("brand"), p.get("manufacturer"))
         if why:
             n["risk"] += 1
             reasons.append((r["rownum"], why))
@@ -352,7 +392,18 @@ def run(params: dict) -> str:
         lead = p.get("lead_days")
         qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
             else int(stock)
-        ready.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+        survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+
+    # 配额切片(在全部过滤**之后**):幸存者按店取额度内前 N 行;
+    # 超额行不写终态、不算失败,次日配额刷新自动续上
+    ready: list[dict] = []
+    sv_by_store: dict[str, list[dict]] = {}
+    for r in survivors:
+        sv_by_store.setdefault(r["store"], []).append(r)
+    for store_name, srows in sorted(sv_by_store.items()):
+        allow = allow_by_store.get(store_name, 0)
+        ready.extend(srows[:allow])
+        n["quota"] += max(0, len(srows) - allow)
 
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
@@ -363,6 +414,8 @@ def run(params: dict) -> str:
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
     lines.append(gate_line)
+    if scrape_note:
+        lines.append(scrape_note)
     if missing_warn:
         lines.append(f"  ⚠ {len(missing_warn)} 行有\"不明原因消失\"史"
                      f"(疑似平台下架)仍放行:{','.join(missing_warn[:8])}"

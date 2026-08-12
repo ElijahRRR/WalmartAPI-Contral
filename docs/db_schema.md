@@ -222,6 +222,18 @@ catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
 ## listing — 上架域
 
 ```sql
+CREATE TABLE listing.retire_cooldown (  -- SKU_LOCKED 自愈链状态(sku_locked_heal)
+    id bigint IDENTITY PRIMARY KEY,
+    store text NOT NULL, sku text NOT NULL,
+    feed_id text NOT NULL,              -- RETIRE_ITEM 的 feed
+    retired_at timestamptz DEFAULT now(),
+    status text DEFAULT 'pending',      -- pending 冷却中 / cleared 已清列重上 /
+                                        -- failed RETIRE 回执失败,人工处置
+    cleared_at timestamptz
+);  -- 部分唯一索引 (store, sku) WHERE pending:同对只许一条在途冷却,防重复退役
+-- 链路(旧实证:SKU 绑死旧 UPC,不先退役换 UPC 重发也失败):
+-- RETIRE_ITEM → 24h 冷却 → 回执成功才清列(K~M/O~Q)→ list_new 领新 UPC 重上
+
 CREATE TABLE listing.tasks (        -- 上架任务(来自飞书登记表,同步进来)
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asin        text NOT NULL,

@@ -9,8 +9,9 @@
 列权责(旧系统纪律,跨界写就是 bug):A/B/D/E/F/G 人工域;list_new 写
 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
 L3 状态跟踪写 R~U。K 三态语义:Yes(已提交)/Unknown(结局不确定,
-也算已上架不重复提交)/空或 No(待上架);O=SKU_LOCKED 永久跳过
-(L3 自愈链处理)。
+也算已上架不重复提交)/空或 No(待上架);O=SKU_LOCKED 由 sku_locked_heal
+自愈链处理(RETIRE→24h→清列重上新 UPC;所有者纠正 2026-08-12:不是
+永久跳过——但旧实证不先退役直接换 UPC 重发也失败,legacy_survey.md:1667)。
 
 回执分类(旧 reconcile 实证,"四集合+优先级"):
   优先级 SKU_LOCKED > 真SUCCESS(无码) > ASYNC(审核中假错误,绝不当失败
@@ -80,6 +81,26 @@ def write_reason(rownum: int, reason: str, execute: bool = True) -> None:
                               [(f"N{rownum}:N{rownum}", [[reason]])])
 
 
+def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
+    """输入:行号列表 → 输出:清列行数(K~M 与 O~Q 清空,N 写自愈标记)。
+
+    sku_locked_heal 专用:RETIRE 回执成功 + 24h 冷却后把行恢复成"新行",
+    下一轮 list_new 按正常闸门链领**新 UPC** 重上。N 列留一句人话,
+    运营看得出这行为什么 K/L 突然空了。
+    """
+    if not rownums:
+        return 0
+    if not execute:
+        logger.info("[DRY-RUN] 将清列重上 %d 行:%s", len(rownums), rownums[:20])
+        return 0
+    mark = "SKU_LOCKED已退役,冷却完毕待重上(自愈链)"
+    ranges = []
+    for r in rownums:
+        ranges.append((f"K{r}:Q{r}", [["", "", "", mark, "", "", ""]]))
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
+    return len(rownums)
+
+
 def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     """输入:feed_items 的 (status, error_code) → 输出:(O 上架结果, P 失败理由)。
 
@@ -88,7 +109,7 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     """
     code = (error_code or "").strip()       # 尾部 \t 实证
     if code == resources.WALMART_ERR_SKU_LOCKED:
-        return "SKU_LOCKED", code           # L3:RETIRE→24h→新 UPC 重上
+        return "SKU_LOCKED", code           # sku_locked_heal:RETIRE→24h→重上
     if code in resources.WALMART_ERR_ASYNC_REVIEW:
         return "ASYNC_PENDING", ""          # 审核中假错误,绝不当失败重发
     if status == "success":

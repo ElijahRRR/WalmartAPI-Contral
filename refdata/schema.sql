@@ -355,6 +355,24 @@ CREATE OR REPLACE VIEW catalog.feed_failures AS
 
 -- ── listing:上架域 ────────────────────────────────────────────────────────
 
+-- SKU_LOCKED 自愈链状态(sku_locked_heal 工作流;旧 retire_and_relist 等价物)。
+-- 旧实证:ERR_EXT_DATA_0101211 = SKU 绑死旧 UPC,不先 RETIRE 换 UPC 重发也失败;
+-- 链路 = RETIRE_ITEM → 24h 冷却 → 清列 → list_new 当新行领新 UPC 重上。
+-- 状态权威在库(先落库再清列),飞书列只是展示。status:pending(冷却中)/
+-- cleared(已清列重上)/ failed(RETIRE 回执失败,人工处置)
+CREATE TABLE IF NOT EXISTS listing.retire_cooldown (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store      text NOT NULL,
+    sku        text NOT NULL,
+    feed_id    text NOT NULL,           -- RETIRE_ITEM 的 feed
+    retired_at timestamptz NOT NULL DEFAULT now(),
+    status     text NOT NULL DEFAULT 'pending',
+    cleared_at timestamptz
+);
+-- 同 (店铺,SKU) 只允许一条在途冷却,防重复退役
+CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
+    ON listing.retire_cooldown (store, sku) WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS listing.tasks (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asin        text NOT NULL,

@@ -6,8 +6,12 @@
   python cli.py list_new -p store=A085朱丽霖
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
-且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 与 O=SKU_LOCKED 跳过
-(Unknown 也算已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
+且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
+已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
+O=FAILED 走重试通道(≤3 次);O=SKU_LOCKED 本工作流不碰——由
+sku_locked_heal 自愈链处理(RETIRE→24h 冷却→清列,行变新行后回到
+本链领**新 UPC** 重上)。旧实证:SKU 已绑死旧 UPC,不先退役直接换
+UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
 闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
@@ -181,12 +185,12 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
     但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
     卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
 
-    ⚠ SKU_LOCKED 永不重试(SKU 已被旧 UPC 绑死);ASYNC_PENDING 不是失败。
+    ⚠ SKU_LOCKED 不进本通道:不先 RETIRE 换 UPC 重发也会失败(旧实证),
+    走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
     """
     cand = [r for r in rows
             if r["audit_result"].lower() == "pass"
-            and r["list_result"] == "FAILED"
-            and r["list_result"] != "SKU_LOCKED"]
+            and r["list_result"] == "FAILED"]
     if not cand:
         return [], []
     with db.pg_conn() as conn, conn.cursor() as cur:

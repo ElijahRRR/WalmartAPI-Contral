@@ -61,7 +61,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         _sheet_row(6, product_type="NoSpecPT"),           # PT 无 spec
         _sheet_row(7, store="T_OFF"),                     # 非 ACTIVE 店
         _sheet_row(8, listed="Yes"),                      # 已上架不领任务
-        _sheet_row(9, list_result="SKU_LOCKED"),          # 永久跳过
+        _sheet_row(9, list_result="SKU_LOCKED"),          # sku_locked_heal 处理
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
@@ -82,7 +82,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
                             AssertionError("dry-run 不许提交")))
 
     out = ln.run({"execute": False})
-    assert "待上架 6" in out          # 8 行中 K=Yes 与 SKU_LOCKED 不领任务
+    assert "待上架 6" in out    # 8 行中 K=Yes 不领,SKU_LOCKED 归自愈链不归本链
     assert "非ACTIVE店 1" in out and "风控拦截 1" in out
     assert "去重 1" in out and "防呆 1" in out and "PT无spec 1" in out
     assert "待数据源 1" in out
@@ -155,14 +155,18 @@ def test_upc_conflict_marked_orthogonally(monkeypatch):
 
 
 def test_failed_rows_requeue_until_cap(monkeypatch):
-    """FAILED 行要重新排队(UPC 撞库领新号即可修);超上限则停手。"""
+    """FAILED 行要重新排队(UPC 撞库领新号即可修);超上限则停手。
+
+    SKU_LOCKED 不进本通道:旧实证不先 RETIRE 换 UPC 重发也失败,
+    归 sku_locked_heal 自愈链(RETIRE→24h→清列后以新行身份回来)。
+    """
     rows = [
         _sheet_row(2, asin="B0RETRY01", list_result="FAILED",
                    feed_id="F1", listed="Yes"),          # 试过 1 次 → 重试
         _sheet_row(3, asin="B0CAPPED01", list_result="FAILED",
                    feed_id="F2", listed="Yes"),          # 试过 3 次 → 停手
         _sheet_row(4, asin="B0LOCKED01", list_result="SKU_LOCKED",
-                   feed_id="F3", listed="Yes"),          # 永不重试
+                   feed_id="F3", listed="Yes"),          # 归自愈链,不进重试
         _sheet_row(5, asin="B0ASYNC001", list_result="ASYNC_PENDING",
                    feed_id="F4", listed="Yes"),          # 不是失败
     ]

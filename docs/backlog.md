@@ -171,7 +171,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ update_listed 五个维护字段集(images/attributes/shipping/origin/dates)→ maintenance_intents 新 provider(顺带摆脱 307MB pt_templates_full.json)
 - ⬜ 只读健康视图(旧 scheduler.cmd_health_report:待上架分布/UPC 池四态/在途 feed/错误分布,运营日看四次)→ cli.py health
 - ✅ LLM 校验失败 payload 落盘诊断(2026-08-12:必填缺失行落 `<DATA_ROOT>/logs/llm_raw_*.json`,含 missing/notes/两段载荷)
-- ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径归 L4 历史迁移批次待用
+- ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
 - ⬜ 变体分组(核心 ~190 行纯函数:full_variant_group_set 并集分组/PT 一致性/inject_variant_fields/标题差异化;**跨店重定向与 LLM remap 建议砍**;先决条件=采集契约顶层暴露 parent_asin/variation_asins/variation_attributes)
 
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
@@ -181,11 +181,20 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ 三件生产验证:L1 跟卖单店试点;L2a UPC 注入→upc_sync 核对;L2b risk_sync 计数核对
 - ⬜ 调度挂载(验收后):upc_sync/catalog_sync(早)→ maintenance → list_new(每日)、feed_poll(每 30 分钟)、sku_locked_heal(每日)、risk_sync(每日);**顺序硬约束 catalog_sync → maintenance/list_new**
 - ⬜ 切换清单执行:停旧 launchd 5 条 + AI skill 链 erp-online-products-track(**两条同停**,新旧并跑=重复领号重复上架);旧在途 pending feed 先收干净
-- ⬜ L4:历史数据迁移批次(上架表 26 列全量、UPC 池 12 万行、retry_state 永久淘汰名单——丢了会重拉几万个已死 ASIN)、upc_audit
+- ⬜ L4:仅剩 upc_audit(全站 UPC 冲突审计,只读)。~~历史数据迁移批次~~已整批关闭(所有者 2026-08-12 逐项拍板,含 retry_state 淘汰名单视为已完成——防重拉已死 ASIN 由黑名单/product_risk 承担)
 - ⬜ FEISHU_WEBHOOK_URL 未配置(生产日志反复出现):配上后 cli 成功/失败通知才真发飞书
 
 **切换清单增补(归第六节后置,但必须记)**:旧系统有**第二条调度链**——AI skill 平台 erp-online-products-track(07:30,reconcile→sync_online_products→sync_status_track,写上架表 O/P/Q 与 R~W)。停旧时 launchd 5 条之外必须一起停,否则新旧双写同列
 **26→21 列迁移口径**:旧 V/W(真实UPC/UPC一致)左移至新 T/U——**按列名对齐,严禁按位对齐**;真丢语义仅旧 T/U(状态跟踪,已由 catalog.walmart_items+product_events 升级承接)与 AA(变体组,随变体后置)
+
+## 十、旧仓全量普查新发现(2026-08-12 晚;停旧权威清单见 docs/legacy_schedules.md)
+
+- ⬜ **UPC 造号能力真空**:旧「沃尔玛UPC生成器」(生成→SQLite 去重→全站校验→append 池)从未上生产但是唯一造号工具;新系统只有池注入(upc_sync),**池耗尽时无退路**(当前未用仅 28 个)——需迁一个 upc_generate 工作流或明确外购号段
+- ⬜ **settlement 前端依赖**:erp-core 订单页佣金真值硬编码只读旧 fetch_walmart_settlement 的 SQLite——旧脚本不能停,直至前端重构或改读 PG(settlement_sync 已承接数据面)
+- ⬜ **spec 拆分产物取证**:`<DATA_ROOT>/specs/MP_ITEM/` 的源头 MPSetup_by_pt(458MB)不在 git,权威副本只在生产 Mac——备份策略必须涵盖
+- 🔴 **类目映射链**:active/extract_pt_templates.py 被 erp-core sync_pt_specs 硬依赖;`.git-archive` 内嵌仓 7 个未推送 commit;"映射表产物导入 catalog"(plan.md 承诺)未见执行记录——归档前一并处理
+- 🟡 **lark_io sheets_registry 漏登记** Amazon 选品黑名单 sheet(QNIp…Bb/8280e8)——确认新系统是否需要这张表
+- ⚪ 已核实降级:erp-core Celery(所有者 2026-08-05 确认未启用,切换日 ps 复核即可);walmart-kpi-afternoon(参数 bug 从未成功写入,直接停);tools/ 10 个救场脚本与顶层一次性脚本全部可弃
 
 ## 九、文档失真待回写
 

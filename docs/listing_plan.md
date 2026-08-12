@@ -42,6 +42,10 @@
 
 ## 阶段划分
 
+> ⚠ 勘误说明(2026-08-12):L0/L1 规划段的复选框是**立案时原文**,一直没勾
+> ——实况以各「实施状态」节与上方「当前状态」为准(L0/L1 均已完成;
+> listing.tasks/retry_state 两表后来判定不建,见 backlog 第四节)。
+
 ### L0 地基(无沃尔玛写操作,可随时动工)
 
 - [ ] PG listing schema:`listing.tasks`(上架任务,映射上架表 26 列语义)、
@@ -290,15 +294,15 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
       跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
       工作流默认 dry-run;回执失败标 failed 人工处置不自动重试;需每日调度
-- [ ] 状态跟踪:旧 sync_status_track 的"反查真实状态 + Unknown 自愈"由
-      catalog_sync(已上线)+ product_events 观测地基承接,只补
-      "上架表 K=Unknown 而目录已在线 → 自愈回写"这一条
+- [x] 状态跟踪:旧 sync_status_track 的"反查真实状态"由 catalog_sync 承接;
+      "K=Unknown 自愈"已由 listing_sheet.heal_unknown 落地(2026-08-12,
+      feed 台账终态双向 + 目录在线双源,挂 feed_poll 反哺器)
 
 ### L4 收尾
 
 - [ ] upc_audit(全站 UPC 冲突审计,只读)
-- [ ] 历史数据迁移批次:上架表 26 列全量、UPC 池 12 万行、pending_feeds
-      在途收干净、retry_state 永久淘汰名单(丢了会重拉几万个已死 ASIN)
+- ~~历史数据迁移批次~~(2026-08-12 所有者整批关闭:26 列/UPC 池 12 万行/
+      pending_feeds/retry_state 全部不迁;防重拉已死 ASIN 由黑名单承担)
 - [ ] 切换清单:停 launchd 4 条(morning/reconcile_hourly/retire_daily/
       health_4x)+ scheduled-tasks 的 dedup_sync(前端不迁,此任务作废)
 

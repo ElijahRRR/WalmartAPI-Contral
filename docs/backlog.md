@@ -152,6 +152,33 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   **视为已完成**;maintenance.db 旧维护记录**不迁**;settlement 账期对账明细
   旧系统本就没有(只有总对账单),**无需迁移**
 
-## 八、文档失真待回写
+## 八、上架续迁缺口(2026-08-12 旧仓 erpAPI 全量对照,三路并行调研,证据在 listing_plan.md 续迁节)
+
+**P0 — 真实业务缺口(不补有损失)**
+- ⬜ **K=Unknown 自愈**:list_new 持续制造 Unknown 行且一律跳过,没人把"目录已在线"的行改回 Yes——Unknown 永久卡死 + UPC 永久占用。旧 sync_status_track 承担;新版数据源直接用 catalog.walmart_items。**必须连带**:三层 NOT_FOUND 防护(数据源空硬中止/单店>80% 熔断/上架<48h 审核窗豁免——2026-06-09 全表误写事故产物)+ 自愈伪 feedId 不得被 sync_from_ledger 拿去查 feed(旧 healed: 前缀契约)
+- ⬜ **跟卖库存无人负责**(旧系统同病,新系统结构性固化):match offer 建成即 0 库存;maintenance 库存意图硬条件 source_type='amz' 永远排除跟卖品。旧 inventory_push.py 因 --no-poll 从未真跑(死代码);新系统 feed_poll 恰好具备"PROCESSED 后推库存"的条件。**连带**:stockzero 清零 _SQL_ZERO 无 source_type 过滤——跟卖品会被清零却永远补不回(不对称)
+- ⬜ **闸门前淘汰行不计次数**:旧 retry_state 8 类失败各自阈值、达标写 E=fail 永久淘汰;新 _retry_rows 只管 O=FAILED——库存低/PT 无 spec/定价出界的行每轮全量重跑,白烧 LLM 与飞书读
+- ⬜ **数据源缺失不自动推采集**:旧 DMIT_NOT_FOUND 第 1 次即 submit_scrape_task;新 amz_source 只打日志"接线期人工推",闭环断
+- ⬜ **配额"增量补齐"语义**:旧=过滤通过数累到配额才停(一批取剩余×2);新=先切 srows[:allow] 再过滤,被淘汰行白占名额——淘汰率 40% 时实际上架量只有配额 60%
+- ⬜ **manufacturer 双字段风控**:旧黑名单查 brand+manufacturer 两字段、去品牌词两个都洗;新只查 brand(Amazon 大量 brand=Generic 而 manufacturer 是真品牌)——黑名单漏网。需采集契约把 manufacturer 提到顶层
+
+**P1 — 回归/契约类**
+- ⬜ 跟卖:重量留空旧默认 1 磅不淘汰,新直接淘汰且"数据无效"行卡死(不在终态清单也不再入 todo);"预检失败"(网络抖动)被当终态,旧系统天然重试
+- ⬜ 淘汰行不再回写 C/H/I/J(旧对淘汰行也写标题与价库,运营在表上直接看数字;新只写 N 文字,失败行还把 C/H/I/J 清成空串)
+- ⬜ 核实采集 attrs.weight 形态(mp_mapper.shipping_weight 读 attrs.weight.{package,item},形态不符则全量兜底 1.0 磅)
+
+**P2 — 能力补齐**
+- ⬜ update_listed 五个维护字段集(images/attributes/shipping/origin/dates)→ maintenance_intents 新 provider(顺带摆脱 307MB pt_templates_full.json)
+- ⬜ 只读健康视图(旧 scheduler.cmd_health_report:待上架分布/UPC 池四态/在途 feed/错误分布,运营日看四次)→ cli.py health
+- ⬜ LLM 校验失败 payload 落盘诊断(旧 llm_raw_*.json;新只有 N 列文字)
+- ⬜ 三条实证抢救:endDate 必须 yyyy-mm-dd(→mp_conform 硬约束);PROHIBITED_CODES 三违禁码(→风控);"UPC 领过永久不再用"口径
+- ⬜ 变体分组(核心 ~190 行纯函数:full_variant_group_set 并集分组/PT 一致性/inject_variant_fields/标题差异化;**跨店重定向与 LLM remap 建议砍**;先决条件=采集契约顶层暴露 parent_asin/variation_asins/variation_attributes)
+
+**P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
+
+**切换清单增补(归第六节后置,但必须记)**:旧系统有**第二条调度链**——AI skill 平台 erp-online-products-track(07:30,reconcile→sync_online_products→sync_status_track,写上架表 O/P/Q 与 R~W)。停旧时 launchd 5 条之外必须一起停,否则新旧双写同列
+**26→21 列迁移口径**:旧 V/W(真实UPC/UPC一致)左移至新 T/U——**按列名对齐,严禁按位对齐**;真丢语义仅旧 T/U(状态跟踪,已由 catalog.walmart_items+product_events 升级承接)与 AA(变体组,随变体后置)
+
+## 九、文档失真待回写
 
 ✅ **2026-08-12 全部回写完成**:legacy_reference 状态迁移清单补 3 项且逐行更新拍板结果;db_schema 的 store_kpi_daily 32 列补全;feishu_tables 修 4 处(错误商品记录裁撤、补登 KPI_SHEET 旧 workbook、订单中心六表状态、STORE_CREDENTIALS 示例先前已含 enabled);scraper_migration_brief "127 个批次"遗留文字改为过去时收口;resources.py:271 / schema.sql:331 更早已修。

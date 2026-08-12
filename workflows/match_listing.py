@@ -11,10 +11,22 @@
 
 流程:读表 → 待处理行 SPEC 预检(api/items.search_walmart_spec,按位数
 生成 upc/gtin 候选依次试)→ 三路:
-  MP_ITEM_MATCH(已在售)→ 可跟卖:SPEC 预填模板 + sku/price/ShippingWeight
+  MP_ITEM_MATCH(已在售)→ 可跟卖 → **两道闸**(2026-08-12 接入,补齐
+                          "只有 list_new 有闸"的洞)→ 过闸才提交:
+                          SPEC 预填模板 + sku/price/ShippingWeight
                           → 按店打包 MP_ITEM_MATCH feed(REPLACE 幂等)
   MP_ITEM(未在售)     → F=需完整建品,终态跳过(那是 L2 主链的活)
   无匹配               → F=目录无,终态跳过
+
+两道闸(跟卖无 amz 侧身份,全靠 SPEC 交叉字段;交叉不出的字段跳过
+该道闸,不是放行整行;命中写 F=终态,运营核对后清 F 重新排队):
+  ① 风控闸 risk_gate:SPEC 的 product_type 禁售 / brand 黑名单品牌
+  ② ASIN 黑名单:SPEC 交叉出的 ASIN 命中 catalog.asin_blacklist(永久
+    产品级禁止六类——出现过侵权/审查等拉黑类别的产品想换跟卖通道回来,
+    拦的就是这个)
+防呆=黑名单,不看删除史(所有者口径 2026-08-12:因产品问题删过的
+修好重上是正常经营;曾按 product_risk 删除史/GTIN 删除史一刀切拦过,
+当日拆除)。
 结果:J/K 由 feed_poll 反哺器按 ops.feed_items 回填;跟卖新 offer 默认
 0 库存是正常现象(v4.2 spec 无库存字段),不当失败。
 
@@ -31,15 +43,31 @@ from datetime import datetime
 
 from api import feeds, items as items_api
 from registry import db
-from services import kpi, listing_sources, match_feed, match_sheet, \
-    product_events, stores as stores_svc
+from services import blacklist, kpi, listing_sources, match_feed, \
+    match_sheet, product_events, risk_gate, stores as stores_svc
 
 DANGEROUS = True
 
 logger = logging.getLogger("workflows.match_listing")
 
 # F 列终态(不重复预检/提交;运营清空 F 即重新排队)
-_TERMINAL = ("需完整建品", "目录无", "预检失败", "店铺不识别", "码无效")
+_TERMINAL = ("需完整建品", "目录无", "预检失败", "店铺不识别", "码无效",
+             "风控拦截", "ASIN黑名单")     # 后两类为前缀
+
+
+def _gate_reason(spec: dict, gate: dict, banned: dict) -> str | None:
+    """输入:SPEC 预检结果 + 两道闸数据 → 输出:拦截原因(None=放行)。
+
+    纯函数便于测试;字段缺失(SPEC 交叉不出 ASIN/品牌)跳过该道闸。
+    只按拉黑类别拦(黑名单),不按删除史拦(所有者口径 2026-08-12)。"""
+    why = risk_gate.check(gate, spec.get("product_type"), spec.get("brand"))
+    if why:
+        return f"风控拦截:{why}"
+    asin = spec.get("asin")
+    if asin and asin in banned:
+        cat, src = banned[asin]
+        return f"ASIN黑名单:{src}({cat}类)"
+    return None
 
 
 def _precheck(store: dict, code: str, cache: dict) -> dict:
@@ -97,9 +125,12 @@ def run(params: dict) -> str:
     by_store: dict[str, list[tuple[dict, dict]]] = {}   # 店铺 → [(行, item)]
 
     # SKU 自动编号起点(B 列留空的行用;人工填了 B 的行不占号)
+    # + 两道闸数据每轮加载一次,逐行零查询(与 list_new 同款)
     date_str = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
     with db.pg_conn() as conn:
         serial = match_feed.next_serial_start(conn, date_str)
+        gate = risk_gate.load_gate(conn)
+        banned = blacklist.load_banned_asins(conn)
 
     unknown_stores = sorted({r["store"] for r in todo
                              if r["store"] not in stores_by_name})
@@ -122,6 +153,12 @@ def run(params: dict) -> str:
             lines.append(f"  第{r['rownum']}行 {r['upc']}:{pre['status']}")
             continue
         spec = pre["spec"]
+        why = _gate_reason(spec, gate, banned)
+        if why:
+            r["status"] = why[:60]      # F 列终态,运营核对后清 F 重排队
+            updates.append((r["rownum"], match_sheet.row_vals(r)))
+            lines.append(f"  第{r['rownum']}行 {r['upc']}:{why}")
+            continue
         r["gtin"] = spec["product_id"] or ""
         if not r["sku"]:        # B 列人工优先,留空自动按旧格式续号
             r["sku"] = match_feed.make_sku(date_str, serial)

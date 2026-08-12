@@ -54,6 +54,7 @@ WHERE p.marketplace = %s AND p.asin = ANY(%s)
 # 有货但**数量没采到**时的保守铺货量(亚马逊高库存时不显示具体数)。
 # 只在 stock_count IS NULL 且 stock_state='in_stock' 时才用得上——
 # 采到了真值就用真值,**绝不用它覆盖 stock_count=0**(那是确实缺货)。
+# 终值 = 10(所有者拍板 2026-08-12:保守防超卖,维护链每天按最新采集纠正)
 IN_STOCK_QTY = int(os.environ.get("AMZ_IN_STOCK_QTY", "10"))
 
 

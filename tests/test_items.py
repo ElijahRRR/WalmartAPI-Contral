@@ -100,7 +100,8 @@ def test_spec_match_extracts_from_item_position(monkeypatch):
             "itemSpecPayload": {"MPItem": [{
                 "Item": {"productIdentifiers": {"productId": "00036000291452",
                                                 "productIdType": "GTIN"}},
-                "Visible": {"Cups": {"productName": "Great Cup"}}}]},
+                "Visible": {"Cups": {"productName": "Great Cup",
+                                     "brand": "ACME"}}}]},
             "externalProductIdentifier": [
                 {"externalProductIdType": "ASIN", "externalProductId": "B0AAAAAAAA"}]}]})
 
@@ -109,6 +110,7 @@ def test_spec_match_extracts_from_item_position(monkeypatch):
     assert spec["feed_type"] == "MP_ITEM_MATCH"
     assert spec["product_id"] == "00036000291452" and spec["product_id_type"] == "GTIN"
     assert spec["asin"] == "B0AAAAAAAA" and spec["title"] == "Great Cup"
+    assert spec["brand"] == "ACME"          # 跟卖风控闸用
 
 
 def test_spec_mp_item_extracts_from_orderable_position(monkeypatch):

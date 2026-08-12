@@ -33,10 +33,17 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
   delete_not_effective   观测核验:回执成功但宽限期后商品仍在架(真实案例,
                          所有者实证)——告警,人工处置
 
-原则:只追加永不改;回执与观测分开记,互相印证;上架防呆查 product_risk 视图。
+原则:只追加永不改;回执与观测分开记,互相印证。
 
-读侧视图(schema.sql 定义,消费方 + 人工/AI SELECT 入口,身份键一律
-coalesce(asin, sku)):product_risk(全局风险档案,list_new 防呆)/
+上架拦截口径(所有者 2026-08-12):**防呆=黑名单,不看删除史**——拦
+"出现过侵权/审查等拉黑类别"的(catalog.asin_blacklist / brand_blacklist,
+由 problem_categorized 时间线按最新类别投影),不拦"因产品问题删过"的
+(可修复类删除后重上是正常经营)。product_risk 视图因此只是**风险档案
+查询入口**(人工/AI SELECT),不是拦截条件;list_new 仅用其
+unexplained_missing 标志做"疑似平台下架"的报警(不拦截)。
+
+读侧视图(schema.sql 定义,人工/AI SELECT 入口,身份键一律
+coalesce(asin, sku)):product_risk(全局风险档案)/
 product_risk_store(店铺维度:"这个产品在哪些店被删过几次")/
 status_changes(平台状态迁移与官方下架原因)/ feed_failures(五类 feed
 的逐 SKU 失败回执)。

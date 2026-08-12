@@ -191,6 +191,15 @@ def test_judge_bad_outcome_is_manual():
     assert "blocked" in res.note
 
 
+def test_judge_not_found_rejects_directly():
+    """outcome=not_found = 亚马逊页面 404,货源没了——比照 TERMINAL 直接
+    建议拒绝,不再白烧一天重采配额(所有者拍板 2026-08-12)。"""
+    res = rules.judge(LINE, _snap(outcome="not_found"), SUPPLIERS, set())
+    assert res.status == rules.REJECT
+    assert "not_found" in res.note and "建议拒绝" in res.note
+    assert not res.rescrape                 # 不排重采
+
+
 def test_judge_missing_fields_is_manual():
     res = rules.judge(LINE, _snap(ship_days=None), SUPPLIERS, set())
     assert res.status == rules.MANUAL

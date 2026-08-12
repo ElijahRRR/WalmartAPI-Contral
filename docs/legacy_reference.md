@@ -68,13 +68,16 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
 
 | 旧位置 | 内容 | 去处 |
 |---|---|---|
-| 沃尔玛问题商品清理/cache/*.json | 已提交 SKU(2日防重)、反补计数、品牌缓存 | ops.dedupe |
-| PostgreSQL walmart_cleanup 库 | 41.7 万行问题商品历史 | 并入 walmart_data 相应表 |
-| 沃尔玛商品维护/maintenance.db | 维护任务与 feed 明细 | listing schema |
-| 沃尔玛UPC生成器/upc_history.db | 10 万+ UPC 去重池 | listing.upc_pool |
-| erpAPI/walmart_settlement.db | 结算快照 | orders.settlement |
-| auto_listing/state/ + logs/feed_*.json | feed 历史(reconcile 反查 SKU→UPC 的唯一凭据) | 迁 listing 时定方案,先原样归档 |
+| 沃尔玛问题商品清理/cache/*.json | 已提交 SKU(2日防重)、反补计数、品牌缓存 | ✅ ops.dedupe(2026-08-11 导入完成) |
+| PostgreSQL walmart_cleanup 库 | 41.7 万行问题商品历史 | ✅ catalog.product_events 时间线(2026-08-11 导入完成) |
+| 沃尔玛商品维护/maintenance.db | 维护任务与 feed 明细 | **不迁**(所有者拍板 2026-08-12:旧维护记录不要;新流水在 ops.feed_*) |
+| 沃尔玛UPC生成器/upc_history.db | 10 万+ UPC 去重池 | **不迁**(所有者拍板 2026-08-12:有用的 UPC 手动写入 catalog.upc_pool;死表 listing.upc_pool 已删) |
+| erpAPI/walmart_settlement.db | 结算快照 | **不迁**(所有者拍板 2026-08-12:旧系统只有总对账单,无账期明细) |
+| auto_listing/state/ + logs/feed_*.json | feed 历史(reconcile 反查 SKU→UPC 的唯一凭据) | 原样归档即可(上架表 26 列已拍板不迁,2026-08-12) |
 | 订单审核 飞书 _meta sheet | 每店增量游标 | ops.cursors |
+| 飞书 QNIp…Bb/8280e8 黑名单 ASIN 表(blacklist_sync 写入,本仓找不到读者) | 历史黑名单 ASIN | ✅ catalog.asin_blacklist(只收永久类 B/C/E/F/G/K 过滤导入)→ blacklist_push 投影新「黑名单ASIN」wiki 表 |
+| auto_listing/state/risk_gate_cache.json | 风控两表 24h TTL 读缓存 | 不搬(纯派生):risk_sync 已镜像入 catalog.risk_product_types / brand_blacklist,闸门读库;开 listing 前跑一次 risk_sync 即可 |
+| <旧项目根>/data/frontend_scrape/latest.json(影刀应用内部写死此路径) | 影刀前台抓取结果(卖家名称/销售状态,日报降级源) | <DATA_ROOT>/frontend_scrape/latest.json(paths.frontend_scrape_file;并跑期 env FRONTEND_SCRAPE_JSON 指旧路径,切换需改影刀 RPA 输出) |
 
 ## 环境事实
 

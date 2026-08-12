@@ -30,8 +30,49 @@
 """
 
 import logging
+import re
+from datetime import datetime, timezone
 
 logger = logging.getLogger("services.mp_conform")
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _date_kind(name: str, prop: dict) -> str | None:
+    """输入:字段名 + schema → 输出:'date'/'date-time'/None(非日期字段)。
+
+    EXT_DATA_ERROR_00030257670757(第 5 轮,2026-08-12):releaseDate 被
+    条件必填兜底填了 'Not Available' → "Enter a valid value in the format
+    YYYY-MM-DD"。日期字段**绝不能拿普通字符串兜底**。识别两路:schema 的
+    format=date/date-time,或字段名以 date 结尾(releaseDate 这类 spec
+    往往不带 format 键);带 enum 的字段不算(那是枚举不是日期)。
+    """
+    if _type_of(prop) != "string" or _enum_of(prop):
+        return None
+    fmt = str(prop.get("format") or "").lower()
+    if fmt in ("date", "date-time"):
+        return fmt                  # spec 显式声明:严格按它
+    if name.lower().endswith("date"):
+        # 名字推断(spec 没写 format):**两种格式都算合法**——同一个错误码
+        # 两个方向的实证:endDate 必须 DateTime(纯日期被拒),releaseDate
+        # 要纯日期。只拦"根本不是日期"的垃圾值,兜底默认给纯日期
+        return "any-date"
+    return None
+
+
+def _date_ok(kind: str, val: str) -> bool:
+    if kind == "date":
+        return bool(_DATE_RE.match(val))
+    if kind == "date-time":
+        return bool(_DATETIME_RE.match(val))
+    return bool(_DATE_RE.match(val) or _DATETIME_RE.match(val))
+
+
+def _date_default(kind: str) -> str:
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ") if kind == "date-time" \
+        else now.strftime("%Y-%m-%d")
 
 # 沃尔玛实际拒收、但 spec 顶层 required[] 没标的字段(conditional/allOf 链触发)。
 # 来源:旧系统实战 EXT_DATA_ERROR_72600149546850 统计。字段名 → (类型, 兜底值)。
@@ -215,7 +256,8 @@ def fill_known_required(spec: dict, visible: dict) -> tuple[dict, list[str]]:
             prop = props.get(fname)
             if prop is None or visible.get(fname) not in _EMPTY:
                 continue
-            default = safe_default_for(prop)
+            kind = _date_kind(fname, prop)
+            default = _date_default(kind) if kind else safe_default_for(prop)
             if default is None:
                 default = _type_fallback(_type_of(prop))
             if default is not None:
@@ -250,7 +292,8 @@ def fill_missing_required(spec: dict, visible: dict) -> tuple[dict, list[str]]:
         if visible.get(name) not in _EMPTY:
             continue
         prop = props.get(name) or {}
-        default = safe_default_for(prop)
+        kind = _date_kind(name, prop)
+        default = _date_default(kind) if kind else safe_default_for(prop)
         if default is None:
             default = _type_fallback(_type_of(prop))
         if default is None:
@@ -279,11 +322,25 @@ def fix_type_mismatches(spec: dict, visible: dict) -> tuple[dict, list[str]]:
     EXT_DATA_ERROR_49505365506868(URL 数组填占位)、IB.VALIDATION.DATA.001。
     """
     props = _props(spec)
+    required = _required(spec)
     visible = dict(visible)
     fixes = []
     for name, val in list(visible.items()):
         prop = props.get(name) or {}
         ftype = _type_of(prop) if prop else None
+
+        # 日期字段格式硬闸(第 5 轮 EXT_DATA_ERROR_00030257670757):
+        # 'Not Available'/'No' 这类字符串塞进日期字段直达沃尔玛必拒。
+        # 必填→换合法默认;非必填→删(垃圾日期没有保留价值)
+        kind = _date_kind(name, prop) if prop else None
+        if kind and isinstance(val, str) and not _date_ok(kind, val):
+            if name in required:
+                visible[name] = _date_default(kind)
+                fixes.append(f"{name}: {val!r} 非法日期→{visible[name]}")
+            else:
+                del visible[name]
+                fixes.append(f"{name}: {val!r} 非法日期,删除")
+            continue
 
         if ftype == "array" and not isinstance(val, list):
             if val in (None, ""):

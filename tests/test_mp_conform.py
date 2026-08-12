@@ -258,3 +258,37 @@ def test_conform_keeps_orderable_when_ospec_missing():
         spec, {}, {"productName": "Steel Cup"},
         {"sku": "S1", "price": 9.99})
     assert o == {"sku": "S1", "price": 9.99}
+
+
+def test_date_fields_never_get_junk_defaults():
+    """第 5 轮 EXT_DATA_ERROR_00030257670757(2026-08-12 首个生产回执):
+    releaseDate 被条件必填兜底填了 'Not Available' → 沃尔玛要 YYYY-MM-DD。
+    日期字段兜底必须给合法日期;垃圾日期值必填换默认、非必填删。"""
+    import re as _re
+    ospec = {"required": [], "properties": {
+        "sku": {"type": "string"},
+        "releaseDate": {"type": "string"},      # spec 没写 format,靠名字识别
+    }, "allOf": [{"if": {"required": ["sku"]},
+                  "then": {"required": ["releaseDate"]}}]}
+    o, notes = mc.fill_known_required(ospec, {"sku": "S1"})
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}$", o["releaseDate"])
+
+    # 垃圾值进日期字段:必填→合法默认,非必填→删
+    spec = {"required": ["availableDate"], "properties": {
+        "availableDate": {"type": "string", "format": "date"},
+        "discontinueDate": {"type": "string"}}}
+    v, fixes = mc.fix_type_mismatches(spec, {
+        "availableDate": "Not Available", "discontinueDate": "No"})
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}$", v["availableDate"])
+    assert "discontinueDate" not in v
+
+    # 同码反向实证不被误伤:endDate 必须 ISO DateTime(名字推断=两种都合法)
+    spec2 = {"required": ["endDate"], "properties": {
+        "endDate": {"type": "string"}}}
+    v2, fixes2 = mc.fix_type_mismatches(spec2, {"endDate": "2028-12-31T00:00:00Z"})
+    assert v2["endDate"] == "2028-12-31T00:00:00Z" and not fixes2
+    # 带 enum 的字段不算日期(isDateSensitive 这类枚举不受影响)
+    spec3 = {"properties": {"promoDate": {"type": "string",
+                                          "enum": ["Yes", "No"]}}}
+    v3, _ = mc.fix_type_mismatches(spec3, {"promoDate": "No"})
+    assert v3["promoDate"] == "No"

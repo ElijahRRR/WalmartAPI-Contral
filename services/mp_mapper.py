@@ -283,6 +283,8 @@ def _field_block(name: str, meta: dict, required: bool) -> dict:
     f: dict = {"type": meta.get("type") or "string"}
     if required:
         f["required"] = True
+    if meta.get("format"):
+        f["format"] = meta["format"]    # date/date-time/uri:格式错=必拒
     if "enum" in meta:
         f["enum"] = meta["enum"][:30]
     if meta.get("description"):

@@ -137,6 +137,7 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 | 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标) |
 | 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位 |
 | 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
+| 5 | 3 | `00030257670757` `[releaseDate]` 要 YYYY-MM-DD(批次二重跑,2026-08-12) | **批次二自伤**:新加的 Orderable 条件必填兜底把日期字段当普通字符串填了 'Not Available' | 日期字段感知(`_date_kind`:format 显式严格/名字推断两格式都认——endDate 要 DateTime 是同码反向实证)+ fix_type_mismatches 日期硬闸 + 提示词送 format |
 
 #### 攻坚期沉淀下来的通用设施(已惠及全部 feed 类型)
 

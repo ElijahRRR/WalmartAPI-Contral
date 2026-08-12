@@ -74,6 +74,25 @@ def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> 
     return len(updates)
 
 
+def write_data_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
+    """输入:[(行号, [C 标题, H amz价, I 库存, J walmart价])] → 输出:写入行数。
+
+    淘汰行数据回显(2026-08-12 旧仓对照接线):旧系统对拉到过数据的淘汰行
+    也写标题与价库,运营在表上直接看到"为什么这行没上"的数字;
+    只动 C 与 H:J,不碰 K~N(提交结果域)。
+    """
+    if not updates:
+        return 0
+    if not execute:
+        return 0
+    ranges = []
+    for r, vals in updates:
+        ranges.append((f"C{r}:C{r}", [[vals[0]]]))
+        ranges.append((f"H{r}:J{r}", [vals[1:4]]))
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
+    return len(updates)
+
+
 def write_reason(rownum: int, reason: str, execute: bool = True) -> None:
     """输入:行号 + 未上架理由 → 输出:无(只写 N 列)。"""
     if not execute:
@@ -114,6 +133,10 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
         return "SKU_LOCKED", code           # sku_locked_heal:RETIRE→24h→重上
     if code in resources.WALMART_ERR_ASYNC_REVIEW:
         return "ASYNC_PENDING", ""          # 审核中假错误,绝不当失败重发
+    if code in resources.WALMART_ERR_PROHIBITED:
+        # 政策违禁(旧 O 列第五类,2026-08-12 抢救接线):永远不能上架,
+        # 不进 FAILED 重试通道——重发也永远是拒,白烧 UPC 与配额
+        return "PROHIBITED", code
     if status == "success":
         return ("SUCCESS", "") if not code else ("SUCCESS_WITH_WARNING", code)
     if status == "failed":
@@ -239,6 +262,15 @@ def heal_unknown() -> str | None:
                 ranges.append((f"K{rn}:Q{rn}", [[
                     "No", "", r["list_date"],
                     "自愈:feed回执FAILED,重新排队", o, p, today]]))
+                if key in claimed:
+                    upc_release.append(claimed[key])
+                n_no += 1
+                continue
+            if o == "PROHIBITED":
+                # 政策违禁:K=No 但 O=PROHIBITED 让 list_new 永不再领
+                ranges.append((f"K{rn}:Q{rn}", [[
+                    "No", "", r["list_date"],
+                    "自愈:政策违禁,永不重试", o, p, today]]))
                 if key in claimed:
                     upc_release.append(claimed[key])
                 n_no += 1

@@ -77,6 +77,13 @@ WALMART_ERR_SKU_LOCKED = "ERR_EXT_DATA_0101211"     # SKU 绑死旧 UPC。解法
 # RETIRE→24h 冷却→清列→新 UPC 重上(sku_locked_heal 自愈链;旧实证:不先
 # 退役直接换 UPC 重发同一 SKU 也失败。不是永久跳过,所有者纠正 2026-08-12)
 WALMART_ERR_UPC_CONFLICT = "ERR_EXT_DATA_0101119"
+# 政策违禁(旧 sync_listing_state.PROHIBITED_CODES 实证,2026-08-12 抢救):
+# 永远不能上架——回执标 PROHIBITED,不进重试通道(重发也永远是拒)
+WALMART_ERR_PROHIBITED = frozenset({
+    "EXT_DATA_ERROR_71666506605865",    # Military/Law Enforcement
+    "EXT_DATA_ERROR_61696573580701",    # Firearm Accessories
+    "EXT_DATA_ERROR_61020366035308",    # General Prohibited Product
+})
 # 异步审核假错误(旧实证:'还在合规审核中',几小时~几天自然变 SUCCESS;
 # 绝不能当失败重发,否则 duplicate listing)
 WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",

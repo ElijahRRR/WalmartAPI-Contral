@@ -272,3 +272,13 @@ def test_match_sheet_sync_from_ledger(monkeypatch):
     assert w["B3:K3"][8] == "失败:ERR_M"
     assert "B4:K4" not in w                                     # F2 未落定不动
     assert "回填 2 行" in out
+
+
+def test_match_weight_defaults_to_one_pound():
+    """旧 DEFAULT_WEIGHT 实证(2026-08-12 补回):重量留空默认 1 磅,
+    不再抛异常把行打成'数据无效'卡死。"""
+    from services import match_feed
+    item = match_feed.build_match_item({}, "SKU1", "9.99", "")
+    assert item["ShippingWeight"] == 1.0
+    item2 = match_feed.build_match_item({}, "SKU1", "9.99", "2.5")
+    assert item2["ShippingWeight"] == 2.5

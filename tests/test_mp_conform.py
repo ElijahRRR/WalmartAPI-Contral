@@ -178,14 +178,31 @@ _VSPEC = {
 }
 
 
-def test_variant_bag_completed_for_single_item():
-    """EXT_DATA_ERROR_05570905585050:三件套给一半会被拒;单品 isPrimary=Yes。"""
+_VSPEC_REQ = {**_VSPEC, "required": ["productName", "variantAttributeNames"]}
+
+
+def test_variant_bag_completed_when_required():
+    """spec 逼着给(第 4 轮实证 PT)才补全:单品 isPrimary=Yes、SKU 占位组 ID。"""
     v, notes = mc.ensure_variant_bag(
-        _VSPEC, {"variantAttributeNames": ["color"], "color": "Red"}, "B0X")
+        _VSPEC_REQ, {"variantAttributeNames": ["color"], "color": "Red"}, "B0X")
     assert v["variantGroupId"] == "B0X"          # 单品用 SKU 占位
     assert v["isPrimaryVariant"] == "Yes"
     assert v["variantAttributeNames"] == ["color"]
     assert len(notes) == 2
+
+
+def test_variant_bag_half_bag_stripped_when_optional():
+    """单品口径(2026-08-12 旧仓对照):非必填时旧系统从不发变体字段——
+    半套(LLM 零星幻觉)整套剔除,而不是替它凑全(凑全无旧实证)。"""
+    v, notes = mc.ensure_variant_bag(
+        _VSPEC, {"variantAttributeNames": ["color"], "color": "Red"}, "B0X")
+    assert "variantAttributeNames" not in v and "variantGroupId" not in v
+    assert v["color"] == "Red" and len(notes) == 1
+    # 三件俱全 = 真变体注入 → 放行不动
+    full = {"variantGroupId": "G1", "variantAttributeNames": ["color"],
+            "isPrimaryVariant": "Yes", "color": "Red"}
+    v2, n2 = mc.ensure_variant_bag(_VSPEC, dict(full), "B0X")
+    assert v2 == full and n2 == []
 
 
 def test_variant_bag_untouched_when_absent():
@@ -199,7 +216,79 @@ def test_variant_bag_untouched_when_absent():
 
 
 def test_variant_bag_picks_attribute_we_actually_have():
-    """variantAttributeNames 说有 color 就得真有 color。"""
-    v, _ = mc.ensure_variant_bag(_VSPEC, {"variantGroupId": "G1",
-                                          "size": "L"}, "B0X")
+    """(必填补全路径)variantAttributeNames 说有 color 就得真有 color。"""
+    v, _ = mc.ensure_variant_bag(_VSPEC_REQ, {"variantGroupId": "G1",
+                                              "size": "L"}, "B0X")
     assert v["variantAttributeNames"] == ["size"]     # 有值的那个优先
+
+
+def test_safe_default_array_prefers_no():
+    """2026-08-12 旧仓对照:array 型 enum 兜底先选 No/None/Not Applicable,
+    此前直接 [enum[0]] 会把 ["Yes","No"] 类字段兜成 Yes,方向反了。"""
+    assert mc.safe_default_for(
+        {"type": "array", "items": {"enum": ["Yes", "No"]}}) == ["No"]
+    # 原有 "0 - No warning applicable" 优选不受影响
+    assert mc.safe_default_for({"type": "array", "items": {
+        "enum": ["A", "0 - No warning applicable"]}}) \
+        == ["0 - No warning applicable"]
+
+
+def test_conform_runs_enum_and_type_fixes_on_orderable():
+    """Orderable 交还 LLM 后,一致化同样要兜 Orderable 段。"""
+    spec = {"required": [], "properties": {"productName": {"type": "string"}}}
+    ospec = {"required": [], "properties": {
+        "sku": {"type": "string"},
+        "fulfillmentLagTime": {"type": "integer"},
+        "shipsInOriginalPackaging": {"type": "string",
+                                     "enum": ["Yes", "No"]}}}
+    v, o, notes, missing = mc.conform(
+        spec, ospec, {"productName": "Steel Cup"},
+        {"sku": "S1", "fulfillmentLagTime": "1",
+         "shipsInOriginalPackaging": "maybe"})
+    assert o["fulfillmentLagTime"] == 1                 # 字符串转 integer
+    assert o["shipsInOriginalPackaging"] == "No"        # 非法枚举换安全默认
+    assert not missing
+
+
+def test_conform_keeps_orderable_when_ospec_missing():
+    """ospec 空保护(2026-08-12):此前 strip_unknown 会把整个 Orderable
+    清空——_orderable.json 没就位就是必拒;现改为原样保留。"""
+    spec = {"required": [], "properties": {"productName": {"type": "string"}}}
+    v, o, notes, missing = mc.conform(
+        spec, {}, {"productName": "Steel Cup"},
+        {"sku": "S1", "price": 9.99})
+    assert o == {"sku": "S1", "price": 9.99}
+
+
+def test_date_fields_never_get_junk_defaults():
+    """第 5 轮 EXT_DATA_ERROR_00030257670757(2026-08-12 首个生产回执):
+    releaseDate 被条件必填兜底填了 'Not Available' → 沃尔玛要 YYYY-MM-DD。
+    日期字段兜底必须给合法日期;垃圾日期值必填换默认、非必填删。"""
+    import re as _re
+    ospec = {"required": [], "properties": {
+        "sku": {"type": "string"},
+        "releaseDate": {"type": "string"},      # spec 没写 format,靠名字识别
+    }, "allOf": [{"if": {"required": ["sku"]},
+                  "then": {"required": ["releaseDate"]}}]}
+    o, notes = mc.fill_known_required(ospec, {"sku": "S1"})
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}$", o["releaseDate"])
+
+    # 垃圾值进日期字段:必填→合法默认,非必填→删
+    spec = {"required": ["availableDate"], "properties": {
+        "availableDate": {"type": "string", "format": "date"},
+        "discontinueDate": {"type": "string"}}}
+    v, fixes = mc.fix_type_mismatches(spec, {
+        "availableDate": "Not Available", "discontinueDate": "No"})
+    assert _re.match(r"^\d{4}-\d{2}-\d{2}$", v["availableDate"])
+    assert "discontinueDate" not in v
+
+    # 同码反向实证不被误伤:endDate 必须 ISO DateTime(名字推断=两种都合法)
+    spec2 = {"required": ["endDate"], "properties": {
+        "endDate": {"type": "string"}}}
+    v2, fixes2 = mc.fix_type_mismatches(spec2, {"endDate": "2028-12-31T00:00:00Z"})
+    assert v2["endDate"] == "2028-12-31T00:00:00Z" and not fixes2
+    # 带 enum 的字段不算日期(isDateSensitive 这类枚举不受影响)
+    spec3 = {"properties": {"promoDate": {"type": "string",
+                                          "enum": ["Yes", "No"]}}}
+    v3, _ = mc.fix_type_mismatches(spec3, {"promoDate": "No"})
+    assert v3["promoDate"] == "No"

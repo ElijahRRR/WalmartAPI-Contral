@@ -137,6 +137,7 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 | 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标) |
 | 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位 |
 | 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
+| 5 | 3 | `00030257670757` `[releaseDate]` 要 YYYY-MM-DD(批次二重跑,2026-08-12) | **批次二自伤**:新加的 Orderable 条件必填兜底把日期字段当普通字符串填了 'Not Available' | 日期字段感知(`_date_kind`:format 显式严格/名字推断两格式都认——endDate 要 DateTime 是同码反向实证)+ fix_type_mismatches 日期硬闸 + 提示词送 format |
 
 #### 攻坚期沉淀下来的通用设施(已惠及全部 feed 类型)
 
@@ -189,6 +190,41 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       贵步骤已在切片后,无浪费)
 - 批复原文与实现细节:docs/backlog.md 第八节
 
+#### 续迁批次二:载荷构造漏迁补齐(2026-08-12,所有者"始终上不成"追查)
+
+两路深比对(旧 mapper 全工序逐字段 / feed 信封逐键 + LLM 提示对照)结论:
+**信封与三大陷阱形态逐键一致,洗清嫌疑;漏迁集中在 LLM 输入面与 Orderable**:
+
+- [x] **LLM 提示词恢复旧富元数据**(最大嫌疑):此前只送 enum+desc——
+      type 不送,模型只能猜数组还是标量(第 1/3 轮"要 JSONArray 给标量"
+      "要 String 给数组"就是两种猜错方向);[:200] 硬截断会永久截掉排后面
+      的必填字段。现恢复 type/required/minItems/items/object 结构、必填
+      全量+可选截断(Visible 20/Orderable 10)、allOf 条件必填翻译块
+- [x] **Orderable 交还 LLM**:旧结构=LLM 按 spec 填+force_overrides 覆盖
+      10 项;此前写死 14 键,Orderable 条件必填永远给不出。LLM 输出改两段
+      {"visible","orderable"}(旧缓存平铺形态兼容);**删掉旧金样从未发过
+      的 Orderable.brand / countryOfOriginAssembly**(与 productName 同血统
+      60670554076755);Orderable 段同过条件必填/类型/枚举一致化;
+      ospec 空时不再把整个 Orderable 清空(改为保留+告警)
+- [x] 零认证降级序列补回第四档 **"None"**(enum 只有 None 时旧选 None,
+      漏这档掉到 enum[0]='Yes - Warranty Text' → 触发 warrantyText 必填)
+- [x] 文档字段清单补 **suggested_number_of_people_for_assembly**(旧八项
+      之一,留着与 isAssemblyRequired=No 自相矛盾)
+- [x] safe_default array 分支优选 No/None/Not Applicable(此前 ["Yes","No"]
+      兜成 Yes,方向反,还级联触发条件必填)
+- [x] **keyFeatures 按 per-PT minItems 凑句**(旧 enforce_copy_limits;
+      写死 4 会让 minItems=5/6 的 PT 被本地 validate 卡死**永远进不了 feed**
+      ——"始终无法上架"的另一半可能是这个:不是被拒,是根本没提交)
+- [x] 变体三件套改必填驱动:非必填半套整套剔除(旧系统单品从不发变体字段,
+      SKU 占位组 ID 无实证),spec 必填才补全(第 4 轮实证 PT)
+- [x] 图片保序去重(主图=亚马逊原序第一张;此前字典序把主图换掉)
+- [x] DEEPSEEK_MODEL 可经 .env 切换(旧生产 deepseek-v4-flash),
+      llm_cache 键与请求模型同源
+
+**验收路径不变**:`list_new -p check_spec=1` 全 ✓ → `--execute` →
+`feed_poll -p feed_id=X` 看 description。新错误码继续进 mp_conform+回归
+测试+四轮错误账追加。
+
 #### 已知未做(续做时的清单)
 
 - 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)
@@ -217,7 +253,16 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       SKU_LOCKED)+ 优先级(SKU_LOCKED > 真SUCCESS > INPROGRESS > 全ASYNC >
       SUCCESS_WITH_WARNING > DATA_ERROR)+ 异步审核假错误绝不当失败重发;
       做成 feed_poll 反哺器回写上架表
-- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted);上架拦截 2026-08-12 定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看删除史,product_risk 只是查询档案 + unexplained_missing 报警);**入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
+- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted;
+      回执 list_feed_{success|failed} 带错误码由 feed_track 落账,读侧
+      catalog.feed_failures / ops.v_feed_error_stats);上架拦截 2026-08-12
+      定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看
+      删除史,product_risk 只是查询档案 + unexplained_missing 报警);
+      **失败反哺拦截闭环**(所有者 2026-08-12):上架回执命中三违禁码 →
+      自动入 asin_blacklist B=禁售(feed_track 收口,幂等)→ 黑名单闸
+      上架前拦截,同一产品不再烧 UPC/配额;其余 DATA_ERROR 只入事件
+      不入黑名单(可修复类,入了会误杀重上架——与"防呆不看删除史"同源);
+      **入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
 
 ### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 

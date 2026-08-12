@@ -18,7 +18,9 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-_MODEL = "deepseek-chat"
+# 旧生产用 deepseek-v4-flash(thinking disabled);模型名可经 .env 切换,
+# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)
+_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 
 def _api_key() -> str:

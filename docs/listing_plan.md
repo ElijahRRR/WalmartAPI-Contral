@@ -158,8 +158,10 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 #### 已知未做(续做时的清单)
 
 - 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)
-- `channel`(FBA/FBM)采集侧未产出 → 定价一律走 FBM 区间
-- `AMZ_IN_STOCK_QTY`:仅在 `stock_count` 采不到时用,所有者未定终值
+- ~~channel 一律走 FBM~~(已过时勘误:采集侧后来产出 `raw->>'is_fba'`,
+  list_new 现行=读 is_fba 分 FBA/FBM 两套区间、**采不到不定价不上架**——
+  所有者 2026-08-12 确认现行代码口径为定稿,与 maintenance"未知不猜"同源)
+- `AMZ_IN_STOCK_QTY`:仅在 `stock_count` 采不到时用;**终值=10**(所有者拍板 2026-08-12)
 - [ ] 变体分组:后置(依赖采集 variation 数据)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)

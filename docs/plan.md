@@ -70,11 +70,17 @@
       errorReport 下载与其余 feedType 随 listing 补
 - [x] api/reports.py:报告类下载(daily_report/perf_problems 在用:请求/轮询/下载三段 + CSV 解析)
 - [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
-- [ ] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,
+- [x] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,
       官方 2026-08-05 核验):各 feedType **独立** 10/hour(MP_ITEM_MATCH 20/hour),
       唯一共享桶是价格三件套;未登记的 bucket **默认拒绝而非放行**(旧系统 RETIRE_ITEM
       零限速就是未知键放行漏的)。令牌桶做在 _client 层,跨 workflow 生效。
       ※ 此条修正 legacy_survey C6 的"共享桶"推断——官方表为准
+      **2026-08-12 完成"跨进程"这一半**:稀缺桶(window≥600s 或 limit≤10:
+      全部 feeds.post.*/prices.put/reports.request/insights/SPEC 日额度)限速
+      状态落 ops.rate_events(advisory 事务锁 + PG now() 单一时钟),跨
+      workflow 进程共享且跨运行不失忆;高频大配额桶留进程内(分钟窗自然
+      重置)。**PG 不可达稀缺桶 fail hard 不降级**(所有者拍板;静默降级 =
+      旧事故换马甲)。调用方零改动(rate_acquire 签名不变,内部分档路由)
 
 ### Phase 2 — 工作流逐条迁移(核心阶段)
 

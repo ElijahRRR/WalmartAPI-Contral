@@ -122,8 +122,9 @@ CREATE TABLE catalog.walmart_items (
 ```
 
 "整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
-再把本轮未见的行标 missing_since 并清空两个状态列(不删除,保历史;
-连续缺席多久后清理另议)。飞书「在线产品总表」投影只写在架行
+再把本轮未见的行标 missing_since 并清空两个状态列(**不删除,永不清理**
+——所有者拍板 2026-08-12;技术上事件在 product_events 独立账本、删主表行
+不丢病历,但拍板保守留行,13 万行 PG 无压力)。飞书「在线产品总表」投影只写在架行
 (missing_since IS NULL),缺席商品不进表;last_seen_at/missing_since
 两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
 
@@ -388,6 +389,14 @@ CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧�
 -- 0 行落库,只看 settlement_lines DISTINCT period 会把它当缺失账期无限重拉
 
 -- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
+CREATE TABLE ops.rate_events (           -- 跨进程限速事件(api/_client 稀缺桶)
+    client_id  text NOT NULL,            -- 店铺维度
+    bucket     text NOT NULL,            -- 桶名(唯一出处 _client._RATE_BUCKETS)
+    called_at  timestamptz NOT NULL DEFAULT now()
+);  -- 判据 window≥600s 或 limit≤10 的桶才落库(feeds.post.*/prices.put/
+    -- reports.request/insights/SPEC 日额度);插入顺手清 2 天前旧行;
+    -- PG 不可达稀缺桶 fail hard(所有者拍板 2026-08-12,写操作永不自动兜底)
+
 CREATE TABLE ops.store_kpi_daily (
     store            text NOT NULL,
     data_date        date NOT NULL,

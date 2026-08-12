@@ -563,6 +563,19 @@ CREATE OR REPLACE VIEW orders.settlement_by_line AS
 
 -- ── ops:运行域(状态与业务同库,可同事务修改)────────────────────────────
 
+-- 跨进程限速事件(api/_client 稀缺桶专用,2026-08-12;判据 window≥600s 或
+-- limit≤10:feeds.post.* / prices.put / reports.request / insights 等)。
+-- 事件表=真滑动窗口(与进程内 deque 同构);插入时顺手清 2 天前旧行,自清理。
+-- 高频大配额桶不落库(进程内窗口 + 429 退避足够)。PG 不可达时稀缺桶
+-- fail hard 不降级(所有者拍板 2026-08-12,写操作永不自动兜底)。
+CREATE TABLE IF NOT EXISTS ops.rate_events (
+    client_id  text        NOT NULL,
+    bucket     text        NOT NULL,
+    called_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS rate_events_key_idx
+    ON ops.rate_events (client_id, bucket, called_at);
+
 CREATE TABLE IF NOT EXISTS ops.feishu_sync_state (
     -- 飞书投影同步状态:键 → record_id + 上次写入指纹(order_center_push)
     -- 日常同步零拉表:本地比指纹定位要写的行;状态缺失/写失败时全量拉表重建

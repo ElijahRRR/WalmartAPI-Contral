@@ -341,6 +341,13 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                                f"采集未成功({snap['outcome']} → 实际 {scrape_fail}:"
                                f"{ERROR_TYPES[scrape_fail]}),重采无效,建议拒绝",
                                detail)
+        if snap["outcome"] == "not_found":
+            # 所有者拍板 2026-08-12:页面 404 = 产品已从亚马逊下架,货源没了,
+            # 与 TERMINAL 同性质(页面层稳定事实,重采一百次也一样);此前
+            # 白烧一天重采配额再堆待人工。审核只出建议,人工仍是最后一道。
+            return AuditResult(REJECT,
+                               "采集未成功(not_found:亚马逊页面不存在/已下架,"
+                               "货源缺失),重采无效,建议拒绝", detail)
         why = (f"{snap['outcome']} → 实际 {scrape_fail}" if scrape_fail
                else snap["outcome"])
         return AuditResult(MANUAL, f"采集未成功({why}),已排重采",

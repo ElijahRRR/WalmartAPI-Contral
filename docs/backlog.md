@@ -108,15 +108,15 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)
 
-3. `AMZ_IN_STOCK_QTY` 终值(`docs/listing_plan.md:162` / `docs/plan.md:95` 两处挂着)
-5. **listing 的 channel 口径分叉**:采集侧已有 `raw->>'is_fba'`(maintenance 在用),listing 定价仍"一律 FBM 区间"(`docs/listing_plan.md:162`)——该跟进
-6. `outcome=not_found` 是否比照 error_type 终局直接建议拒绝(order_audit,2026-08-10 提出)
-7. TRO/商标/新审核系统三条跨仓黑名单链的边界
-8. 退款能力(POST /returns/{id}/refund)纳入还是显式排除(`legacy_survey.md:608`)
+3. ✅ ~~AMZ_IN_STOCK_QTY 终值~~(所有者拍板 2026-08-12:**定 10**,文档已划待定)
+5. ✅ ~~listing 的 channel 口径分叉~~(所有者确认 2026-08-12:现行代码为定稿——读 `raw->>'is_fba'` 分两套区间,采不到不定价不上架;listing_plan 过时行已勘误)
+6. ✅ ~~outcome=not_found~~(所有者拍板 2026-08-12:比照 TERMINAL **直接建议拒绝**,不再重采;已落代码 services/order_audit.py + 用例)
+7. 🔴 TRO/商标/新审核系统三条跨仓黑名单链的边界(**暂放**,所有者 2026-08-12;已备边界建议:数据快照现收/审核功能二期建/TRO 采集链不进本仓)
+8. 退款能力(POST /returns/{id}/refund)纳入还是显式排除(**暂放**,所有者 2026-08-12;现状=事实排除,蓝图列预留)
 9. ✅ ~~密钥轮换~~(所有者拍板 2026-08-12:**忽略**,不处理)
-10. KPI 32 列表头里 8 个阈值要不要做成真告警(`legacy_survey.md:751`);日报单人 open_id 要不要改群发(`:754`)
-11. 飞书「AK 图片单元格」历史截图迁移还是清空重采(`legacy_survey.md:889`)
-12. `walmart_items.missing_since` 连续缺席多久后清理(`docs/db_schema.md:130`,表单调增长)
+10. KPI 8 个阈值真告警 + 日报群发(**暂放**,所有者 2026-08-12;方案已备:daily_report 尾段扫 ops.store_kpi_daily 阈值,webhook 配好即生效)
+11. ✅ ~~AK 图片历史截图~~(所有者拍板 2026-08-12:**不迁**,留旧表归档备查;新链路截图已在正常跑)
+12. ✅ ~~missing_since 清理~~(所有者拍板 2026-08-12:**永不删**——技术上事件在 product_events 独立账本不受主表影响,但保守留行;db_schema.md 已回写)
 
 ## 六、配置与安全(便宜,但都在裸奔)
 
@@ -144,7 +144,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)
 - 采集侧一周连续验收(scraper_migration_brief.md:245)未开始;两侧契约副本的定期对账机制未建(:113-116)
 - 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),届时复查(maintenance.py:24)
-- Phase 1:**令牌桶已提上日程**(所有者 2026-08-12;plan.md:73,并发调度前必须补——旧 RETIRE_ITEM 事故根因)、async 订单拉取、feeds errorReport 随 listing
+- Phase 1:✅ ~~令牌桶~~(2026-08-12 完成:稀缺桶落 ops.rate_events 跨进程共享,PG 不可达 fail hard——所有者拍板;详见 plan.md Phase 1)、async 订单拉取、feeds errorReport 随 listing
 - ✅ ~~历史数据迁移总批次~~(所有者逐项拍板 2026-08-12,**整批关闭**):
   上架表 26 列**不迁**;UPC 池 12 万行**不迁**(还有用的 UPC 所有者手动写入
   现 catalog.upc_pool);旧 pending_feeds **不处理**(所有者自己在旧系统看);

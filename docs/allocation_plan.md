@@ -4,6 +4,10 @@
 > 等产品中心库(catalog.products/snapshots 采集侧)真实建成、审核链接通、
 > 能看到实际结构与真实数据后再动工,届时先按真实数据校准本文档再写代码。
 > 本文档只做设计定稿与决策留痕,防止讨论结论丢失。
+>
+> **2026-08-12 更新:约定的"校准"已完成**(§十~十四,四外部仓库摸底 +
+> 前置条件核对 + 引擎细化 + 待拍板问题清单)。暂缓是否解除等所有者
+> 答复 §十四 的 Q1~Q8 后定;Q 清单答完即可按 §十三 批次动工。
 
 ## 一、需求(所有者 2026-08-07 原述要点)
 
@@ -135,3 +139,227 @@ ACTIVE 不分、容量已满不分(上架上限 − 已在线 ≤ 0)。
 2. 审核链接通(类目产出落库);
 3. 店铺三态状态字段经 KPI 链路落库;
 4. 满足后:先出存量冲突审计报告 → 校准本文档 → A1 动工。
+
+---
+
+# 2026-08-12 校准(执行 AI 全面摸底后追加;§一~九原文不动)
+
+> 摸底范围:本仓库 + 四个外部仓库(amazon-scraper-v3 / amazon-scraper-v4 /
+> walmart-audit-system / amazon-walmart-category-mapping),6 路并行调查,
+> 关键结论均有 文件:行号 证据(调查报告全文在会话记录,要点收录于此)。
+> 触发背景:所有者 2026-08-12 重提本需求,补充了分配算法细节诉求
+> (5000 新品 × 12 店怎么分、目标销售额/订单参考、产品好坏筛选)与
+> 数据资产清单(v3 存量 100 万、审核库、两年订单 excel、类目映射表)。
+
+## 十、前置条件进度核对(对照 §九)
+
+| 前置 | 2026-08-07 | 2026-08-12 实况 |
+|---|---|---|
+| ① 采集侧真实运转 | 未建成 | **机制全链建成 + 生产实跑**:product_ingest 2026-08-09 接线验收(88 条→44 ASIN 两层落库、二次拉取游标不动的幂等实证,plan.md:95);order_audit 2026-08-10 生产实跑 127 组合摄入。余欠:挂调度、SCRAPER_EXPORT_TOKEN 配置、一周连续验收(backlog 第六/七节) |
+| ② 审核链接通 | 零实现 | 本侧仍零实现(products.audit_* 五列零触及,backlog 第三节),**但落地路径已探明**:审核系统是独立 PG 库,直连读即可(§十一.3)→ 新增 audit_sync 工作流即接通,不被"二期审核服务"卡死 |
+| ③ 店铺三态经 KPI 落库 | 未落库 | 列与写入链已建成:ops.store_kpi_daily.store_status ← payment/statement 的 sellerStatus(daily_report.py:59),另有影刀链 sales_status 列;4 处消费方统一"非 ACTIVE 拦、无记录 fail-open"。**未闭环**:代码只做二分判断,SUSPENDED/TERMINATED 字面量零出现;sellerStatus 会不会产出 TERMINATED 无实证——旧系统三态实际出自人工维护的飞书店铺状态表(legacy_survey.md:1548,未迁移)→ **Q1** |
+
+结论:"全线暂缓"的事实基础已大半消解,建议按 §十三 修订批次复议动工。
+
+## 十一、外部数据资产盘点
+
+### 1. 采集器 v3 vs v4:v4 就是 v3 的 PostgreSQL 迁移版
+
+- v4 仓库即「v3 → PostgreSQL + 事件流」迁移产物(v4/.agent/pg_migration_plan.md);
+  `/api/export/incremental`(brief §5 契约)的实现在 v4;v3 仓库已把该次迁移整体
+  revert 回纯 SQLite,无增量导出。**本侧对接的"采集服务"以 v4 为准。**
+- **「v3 存量要不要导进 v4」——不要。** 三条理由均有实证:
+  ① v4 迁移计划明文拍板"数据迁移:不需要,切换后重新采集几小时即可";
+  ② v4 事件流只由结果写入路径的写钩子发射,**绕过 API 直灌 asin_data 不产生
+  事件 ⇒ 增量导出看不见 ⇒ 本侧 catalog 也看不见**,灌了等于白灌;
+  ③ v4 主表 asin UNIQUE 覆盖式,旧数据会被新采覆盖,不承担历史候选库职责。
+- **v3 存量的正确用途 = 选品候选池**:v3 有 `GET /api/export/all`(csv/xlsx
+  流式,百万级不 OOM)可一次性导出 title/brand/类目三列/rating/review_count/
+  价格/FBA 等 45+ 字段 → 导入本侧新表 `catalog.candidate_pool`(§十三 A0.4)。
+  入选分配批次的 ASIN 在分配前推 v4 重采保鲜(POST /api/batches)+ 走审核,
+  旧数据只用于粗筛,不用于定价与上架。规模口径:v3 README 实测 29 万 ASIN
+  (tasks 表 113 万行);所有者口径 100 万,以导出实际行数为准。→ **Q2**
+
+### 2. 产品分的评分/评论数数据源已经有,不需要改采集契约
+
+契约 slow/fast 结构化字段没有 rating/review_count,但 v4 的 raw 裁剪名单
+`_RAW_DROP`(export_incremental.py:246)不含它们 ⇒ 两值随 raw 原样落进本侧
+`catalog.snapshots.raw`。产品打分直接 `raw->>'rating'` / `raw->>'review_count'`
+(text 型,读侧解析,解析失败按"没采到",禁止 or 0)。
+
+### 3. 审核系统(walmart-audit-system)对接事实
+
+- 独立 PG 库 `walmart_audit`;审核记录 = `audit_runs`(asin / walmart_product_type
+  =PT 小类 / verdict pass·reject·pending / score_final / created_at)+
+  `audit_hits`(逐规则命中)。**产品标识是 ASIN**,与本侧 products 主键同口径。
+- **大类不落列**:audit_runs 只存 PT;PT→Walmart Category(27 大类)在其字典表
+  walmart_pt_meta——与本侧 `catalog.risk_product_types.category` **同源**(都
+  镜像自飞书「沃尔玛类目」表)⇒ 本侧按 PT JOIN risk_product_types 即得大类,
+  零新依赖,§三.1 的口径定稿原样成立。
+- **无 JSON API**(其 api/ 目录只有 pydantic schema,无路由);现行机器对接方式
+  就是直连库(其 cli/get_problem_images.py 明写"上架脚本用法")⇒ 本侧新增
+  `audit_sync` 工作流直连 walmart_audit 只读拉取(凭证进 .env、registry 登记),
+  写 products.audit_status/audit_reason/walmart_pt/audited_at/audit_version
+  (五列死列复活,backlog 第三/四节两条缺口同时清账)。
+- 取数语义三条(照搬其仓库自身写法):每 ASIN 取最新行 `DISTINCT ON (asin)
+  … ORDER BY asin, run_id DESC`;stage_stopped_at='SHORTCUT' 行的 verdict/PT
+  复制自历史真实审核,可直接用;pass 有 45 天 TTL 到期重审可能翻案 ⇒
+  audit_sync 每轮全量对齐,不做只增量。
+
+### 4. 类目映射表(amazon-walmart-category-mapping)
+
+v5.5 主表 15,770 行(Amazon 叶子→PT,高置信 81.9%),已发布飞书。它是**审核系统
+L1 的输入**,分配链不直接依赖(分配用类目一律取审核产出的 PT)。可选增强:导入
+`catalog.amazon_to_walmart_pt`(legacy_survey.md:2098 早有此议)供候选池按店铺
+大类目预筛(未审核产品只有 Amazon 类目时的粗过滤)。非阻塞。
+
+### 5. 历史后台报错库:已导入完毕,零新工作
+
+2026-08-11 三笔入库:error_items 48.5 万行 → product_events 23.9 万条时间线、
+asin_blacklist 5.68 万、品牌黑名单渠道表 2,012。产品分的"黑历史"信号直接读
+product_risk 视图与三张黑名单表。
+
+### 6. 订单:库里只有 45 天窗口,两年 excel 需一次性导入
+
+order_sync 每轮全量重拉 45 天窗口 ⇒ order_lines 只有接线以来的数据。店铺适配分
+要"该店该大类近 30/90 天销量份额",冷启动需要更长历史 → 新增一次性
+`order_history_import`(excel → order_lines,自然键 po+sku 幂等 DO NOTHING)。
+类目归属:order_lines.sku ⋈ walmart_items.product_type,缺行走
+products.walmart_pt 兜底(经 sku_asin 清洗)。**需所有者给文件 → Q3**
+
+### 7. 两个信号完全没有数据源(必须新建)
+
+- **店铺目标**(目标月销售额/目标月订单):任何表里都没有 → 新建飞书「店铺目标表」
+  + 镜像 `ops.store_targets`(store PK / target_gmv / target_orders /
+  max_online / 手工终止标记(见 Q1)/ synced_at)。**需所有者给数 → Q4**
+- **单店总容量上限**(最多在线多少个):现有飞书限额表「上架限制」列是**日配额**
+  不是总上限,剩余容量比的分母缺权威源 → 并入店铺目标表 max_online 列。
+
+## 十二、分配引擎校准(细化 §七;三层框架与"透明打分不用 ML"定稿不变)
+
+### 1. 分配单元 = 品牌组,不是单品
+
+品牌排他 ⇒ 同品牌所有产品必须同店 ⇒ 逐 SKU 分配会把同品牌拆到多店,天然违宪。
+预处理按 brand_key(casefold+strip)分组:
+- 品牌组整组定店;组过大时可只分组内产品分 top-N,其余不占 product claim——
+  品牌已占用,后批这些品自动定向同店,排他不破;
+- 品牌 ∈ 噪声词表(unbranded/n·a/unknown/generic/空,与 mp_mapper._BRAND_NOISE
+  同源)= 无品牌:**不做品牌占用**,逐 ASIN 为单元,只占 product。
+
+### 2. 两条流水:定向流与自由流
+
+- **定向流**(品牌已被占用):只能去占用店;过该店硬闸(状态/类目/容量/黑名单)
+  → 过不了**整组淘汰**(§五.1 原则),淘汰行进方案表并注明被哪道闸拦下,
+  所有者可选择先点名释放品牌再重分。
+- **自由流**(品牌未占用/无品牌):走打分匹配(下 §4)。
+
+### 3. 店铺配额:目标缺口驱动
+
+每家 ACTIVE 店先算本批期望接货量 quota,匹配循环再消耗:
+
+```
+gap_i    = clamp01((target_gmv_i − gmv_30d_i) / target_gmv_i)     # 目标缺口
+room_i   = max(0, max_online_i − online_i)                        # 容量余量
+health_i = KPI 8 率全达标=1,单项越线按权重扣,低于红线=0(整店出局)
+need_i   = w_gap·gap_i + w_room·min(1, room_i/批量) + w_health·health_i
+quota_i  = min(room_i, ceil(批量 × need_i / Σ need))
+```
+
+数据源全部已在库:gmv_30d ← ops.store_kpi_daily.sales_amount(或 order_lines
+聚合);online_i ← walmart_items(missing_since IS NULL);target/max_online ←
+store_targets(新);health ← store_kpi_daily 8 率。
+权重初值 w_gap=0.5 / w_room=0.3 / w_health=0.2,进配置文件,供砍(Q6)。
+
+### 4. 店铺-产品匹配(自由流;§七第 3 层贪心的具体化)
+
+品牌组按组内最高产品分降序排队;对每组:
+1. 候选店 = 过全部硬闸的 ACTIVE 店。类目闸:组主大类 ∈ 店已有类目;店类目<2
+   时"开新大类"也算候选但适配分吃惩罚项,方案表高亮「将为店 X 开辟第 2 大类 Y」;
+   一批内一家店最多开 1 个新大类(→ Q5);
+2. 店铺适配分 = w1·类目份额(该店该大类近 90 天销量/全店销量)+ w2·gap_i +
+   w3·剩余容量比 + w4·health_i − w5·(本批已接量/quota_i)(超配惩罚,
+   好货不堆一店);
+3. 取分最高店,**事务内**占品牌 + 逐 ASIN 占产品 + 核类目(占不到 = 并发被抢,
+   顺延次优店);打平 → 剩余容量比 → 轮转(§七原语义);
+4. 每分配一组即时更新该店 quota 消耗,后续组看到更新后的世界。
+5. 全店 quota/容量耗尽后剩余产品标「本批未分」留池等下批——与产品分不及格的
+   「淘汰」分开计数,方案表两个口径都可见。
+
+### 5. 产品分数据源落位(§七第 2 层的"待采集契约"已解除)
+
+| 信号 | 来源 | 备注 |
+|---|---|---|
+| 价格带命中 | latest_snapshot price+shipping × services/pricing 区间 | 运费 NULL 不定价=淘汰(既有口径) |
+| 库存深度 | stock_count | NULL≠0 铁律 |
+| 配送时效 | delivery_days | NULL 不当超时 |
+| 评分/评论数 | snapshots.raw->>'rating' / 'review_count' | §十一.2;text 解析失败=没采到 |
+| 黑历史 | product_risk 计数列 | 黑名单三表在硬闸,视图计数进减分项 |
+| 类目饱和度 | 第一版不做 | A3 再议 |
+
+淘汰线初值 40/100(Q6)。
+
+### 6. "要不要模型"的回答(维持 §三.4,补落地钩子)
+
+学习型模型的前提是标签——"分下去之后卖得怎么样",今天一条都没有。所以 A2 从
+第一天起把**每次分配的完整信号快照**落库:`catalog.allocation_runs`(一批一行:
+参数/权重版本/池规模)+ `catalog.allocation_items`(一品一行:产品→店→逐信号
+得分→去向:assigned/directed/eliminated/unassigned + 原因)。跑 2-3 个月自然攒出
+「分配决策 → 30/60/90 天销量」回路,A3 先离线回归校准权重,再谈学习排序。
+不落快照,A3 永远没有起点。
+
+### 7. 数字演示(所有者原题:5000 新品 × 12 店)
+
+- 审核过滤:5000 → 设 4,600 pass 进池;
+- 定向流:1,200 个品的品牌已被占用 → 其中设 950 过占用店闸,定向落店;
+  250 被类目/容量/店状态拦下 → 整组淘汰进报告(附拦截原因);
+- 自由流 3,400:设 2,100 个有品牌 → 约 400 个品牌组;1,300 无品牌逐 ASIN;
+- 店侧:12 店中 2 家非 ACTIVE 出局;10 家按 §3 算 quota——缺口大健康好的店
+  可能分到 600,已接近目标的店只分 150;
+- 匹配循环按 §4 消耗 quota;耗尽即止,剩余标「本批未分」留池;
+- 产出 dry-run 方案表:产品|品牌组|产品分|去向店|逐信号得分|开新类目标记|
+  淘汰/未分原因 → 所有者审完 `--execute` 才落占用、写上架表。
+
+### 8. 结果落地与既有链路的接缝
+
+execute 之后:claims 落占用(§五.1)→ 分配结果写飞书上架表行(店铺+ASIN+PT,
+E 列审核结果由 audit_sync 的结论投影)→ list_new 照常领任务;list_new 闸门链的
+全局 ASIN 去重按 §六 改为**占用闸优先、在线快照辅助**,品牌占用检查同轮加入。
+分配是计划层,不受 list_new 日配额闸影响(配额只约束执行节奏)。
+
+### 9. 释放语义补一条(救不回的 SUSPENDED 店)
+
+§五.3 的 `store_release --store X` 不限定 TERMINATED:所有者判死的 SUSPENDED 店
+同样用它整店释放(dangerous + 默认 dry-run,本来就是人工确认流)。TERMINATED
+审计告警只是"可释放资格"提示器,释放动作永远是人跑的同一个 workflow。
+
+## 十三、修订批次(动工顺序;§八原文保留作历史)
+
+- **A0 数据接线**(全部只读/幂等,零沃尔玛写操作,可立即动工):
+  1. `audit_sync`:直连 walmart_audit 拉审核结论 → products.audit_* 五列(§十一.3);
+  2. 店铺目标表:飞书建表 + registry 登记 + 镜像 ops.store_targets(Q4 给数后);
+  3. `order_history_import`:两年订单 excel 一次性入库(Q3 给文件后);
+  4. `candidate_import`:v3 导出 → catalog.candidate_pool(Q2 拍板后);
+  5. 复用既有待办:daily_report 全店化 + 挂调度、product_ingest 挂调度
+     (plan.md/backlog 已列;分配依赖这两条链保鲜)。
+- **A0.5 存量冲突审计**(只读报告,不写 claims;A0.1 后即可跑):
+  ① 同 ASIN 跨店在线 ② 同品牌跨店在线(walmart_items ⋈ sku_asin ⋈
+  products.brand)③ 每店大类分布(walmart_items.product_type →
+  risk_product_types.category)+ 超 2 类目店清单 ④ 处置建议列。
+  产出同时是 store_categories 与 claims 的**初始回填清单**(所有者审后灌,Q8)。
+- **A1 占用台账地基**(§八 A1 原样:claims + store_categories + services/claims
+  + list_new 占用闸 + store_release + 审计对拍)。
+- **A2 分配引擎**(§十二;依赖 A0 全部到位)。
+- **A3 学习型**(远景不变;allocation_runs/items 快照从 A2 第一天就落)。
+
+## 十四、待所有者拍板(2026-08-12)
+
+| # | 问题 | 建议 |
+|---|---|---|
+| Q1 | **店铺三态权威源**:store_status(API sellerStatus)与 sales_status(影刀)谁说了算?sellerStatus 能否产出 TERMINATED 无实证;且"终止运营"本质是我方决策不是平台观测 | 影刀 sales_status 优先、sellerStatus 兜底;「终止」同时允许所有者在店铺目标表手工登记,不等平台字面量 |
+| Q2 | **v3 存量用途**:(a) 导出入 candidate_pool (b) 只当 ASIN 名单 (c) 灌进 v4 | a(c 有 §十一.1 三条反对理由) |
+| Q3 | **两年订单 excel**:给文件路径 + 列头样例 | — |
+| Q4 | **12 店目标**:目标月销售额/目标月订单/单店最大在线数,逐店给数;店铺目标表列结构随之定稿 | — |
+| Q5 | 分配引擎可否在方案表内**提议开新大类**(dry-run 高亮,execute 即落 store_categories),还是开新类目必须人工单独登记 | 方案表提议制(反正有人审) |
+| Q6 | 产品分权重/淘汰线(草案 40)与配额权重初值(§十二.3/5) | 按草案试跑,首批 dry-run 对着方案表砍 |
+| Q7 | **品牌归一化口径**:第一版 casefold+strip+噪声词表;要不要别名表(SAMSUNG vs Samsung Electronics) | 先跑 A0.5 审计看疑似变体规模再定 |
+| Q8 | **存量冲突处置原则**(同品牌/同 ASIN 已跨店):留销量大的店、其余店只维护不新增?还是逐条人工 | 报告出来后议 |

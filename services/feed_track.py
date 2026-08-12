@@ -14,8 +14,8 @@ SKU 级状态权威在 ops.feed_items;停用/删除/设置到期日期/未来的
 import logging
 
 from api import feeds
-from registry import db
-from services import product_events
+from registry import db, resources
+from services import blacklist, product_events
 
 logger = logging.getLogger("services.feed_track")
 
@@ -147,6 +147,26 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             and meta[sku][2] == "submitted"
             and product_events.receipt_in_ledger(
                 product_events.feed_kind(meta[sku][1]), meta[sku][0])])
+        # 违禁回执自动进 ASIN 黑名单(所有者 2026-08-12:上架失败事件要能
+        # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁,归既有
+        # B=禁售类(PERMANENT,DO NOTHING 幂等)——list_new/match_listing
+        # 的黑名单闸下次自动拦,同一产品不再烧 UPC 与配额。
+        # 只收 kind=list(sku=asin 约定);跟卖 sku 是自编号提不出 ASIN,
+        # 其行内终态由跟卖表 F/J 列承担
+        prohibited = [
+            {"store": store["name"], "sku": sku, "category": "B",
+             "reasons": f"上架回执违禁 {(code or '').strip()}|"
+                        f"{(descs.get(sku) or '')[:150]}"}
+            for sku, (o, code) in results.items()
+            if o == "failed" and sku in meta
+            and product_events.feed_kind(meta[sku][1]) == "list"
+            and (code or "").strip() in resources.WALMART_ERR_PROHIBITED]
+        if prohibited:
+            n_bl = blacklist.record_asins(conn, prohibited)
+            logger.warning("上架回执命中政策违禁 %d 个,新入 ASIN 黑名单 %d 个"
+                           "(B=禁售,上架前拦截自此生效):%s",
+                           len(prohibited), n_bl,
+                           ",".join(p["sku"] for p in prohibited[:10]))
     if n_missing:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)

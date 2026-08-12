@@ -253,7 +253,16 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       SKU_LOCKED)+ 优先级(SKU_LOCKED > 真SUCCESS > INPROGRESS > 全ASYNC >
       SUCCESS_WITH_WARNING > DATA_ERROR)+ 异步审核假错误绝不当失败重发;
       做成 feed_poll 反哺器回写上架表
-- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted);上架拦截 2026-08-12 定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看删除史,product_risk 只是查询档案 + unexplained_missing 报警);**入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
+- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted;
+      回执 list_feed_{success|failed} 带错误码由 feed_track 落账,读侧
+      catalog.feed_failures / ops.v_feed_error_stats);上架拦截 2026-08-12
+      定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看
+      删除史,product_risk 只是查询档案 + unexplained_missing 报警);
+      **失败反哺拦截闭环**(所有者 2026-08-12):上架回执命中三违禁码 →
+      自动入 asin_blacklist B=禁售(feed_track 收口,幂等)→ 黑名单闸
+      上架前拦截,同一产品不再烧 UPC/配额;其余 DATA_ERROR 只入事件
+      不入黑名单(可修复类,入了会误杀重上架——与"防呆不看删除史"同源);
+      **入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
 
 ### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 

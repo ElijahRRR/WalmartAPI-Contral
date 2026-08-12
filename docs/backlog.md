@@ -162,16 +162,16 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ **配额切片后置**(批复:配额以成功提交为准,淘汰放切片前):list_new 重排——先过全部闸门+数据过滤+定价,幸存者按店切配额;超额行不写终态,次日配额刷新自动续上
 - ✅ **manufacturer 双字段风控**(批复:接受):amz_source 契约顶层加 manufacturer(取 slow 段);risk_gate.check 增第四参,品牌+制造商都查(文案去品牌词 force_amazon_copy 早已两字段都洗,无需改)
 
-**P1 — 回归/契约类**
-- ⬜ 跟卖:重量留空旧默认 1 磅不淘汰,新直接淘汰且"数据无效"行卡死(不在终态清单也不再入 todo);"预检失败"(网络抖动)被当终态,旧系统天然重试
-- ⬜ 淘汰行不再回写 C/H/I/J(旧对淘汰行也写标题与价库,运营在表上直接看数字;新只写 N 文字,失败行还把 C/H/I/J 清成空串)
-- ⬜ 核实采集 attrs.weight 形态(mp_mapper.shipping_weight 读 attrs.weight.{package,item},形态不符则全量兜底 1.0 磅)
+**P1 — 回归/契约类(2026-08-12 接线批次三,全部落地)**
+- ✅ 跟卖:重量留空默认 1 磅(match_feed 补回旧 DEFAULT_WEIGHT);"预检失败"移出终态、每轮自动重新预检(网络抖动不再永久停摆)
+- ✅ 淘汰行回显 C/H/I/J(listing_sheet.write_data_cols:拉到数据的淘汰行写标题与价库,算出定价的连 J 一起;待提交行仍由 write_submit_cols 写全套不重复)
+- ✅ attrs.weight 形态可见性:ShippingWeight 兜 1.0 磅的行数进 list_new 摘要(持续大面积出现 = 采集契约 weight 形态对不上,凭摘要触发核实)
 
 **P2 — 能力补齐**
 - ⬜ update_listed 五个维护字段集(images/attributes/shipping/origin/dates)→ maintenance_intents 新 provider(顺带摆脱 307MB pt_templates_full.json)
 - ⬜ 只读健康视图(旧 scheduler.cmd_health_report:待上架分布/UPC 池四态/在途 feed/错误分布,运营日看四次)→ cli.py health
-- ⬜ LLM 校验失败 payload 落盘诊断(旧 llm_raw_*.json;新只有 N 列文字)
-- ⬜ 三条实证抢救:endDate 必须 yyyy-mm-dd(→mp_conform 硬约束);PROHIBITED_CODES 三违禁码(→风控);"UPC 领过永久不再用"口径
+- ✅ LLM 校验失败 payload 落盘诊断(2026-08-12:必填缺失行落 `<DATA_ROOT>/logs/llm_raw_*.json`,含 missing/notes/两段载荷)
+- ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径归 L4 历史迁移批次待用
 - ⬜ 变体分组(核心 ~190 行纯函数:full_variant_group_set 并集分组/PT 一致性/inject_variant_fields/标题差异化;**跨店重定向与 LLM remap 建议砍**;先决条件=采集契约顶层暴露 parent_asin/variation_asins/variation_attributes)
 
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载

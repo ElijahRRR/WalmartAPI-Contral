@@ -47,7 +47,7 @@ import logging
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
-from registry import db, resources
+from registry import db, paths, resources
 from services import amz_source, blacklist, kpi, listing_sheet, \
     listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
     product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
@@ -129,6 +129,25 @@ def _load_multipliers() -> dict[str, dict]:
                          for k in ("fba_range1", "fba_range2",
                                    "fbm_range1", "fbm_range2")}
     return out
+
+
+def _dump_llm_debug(asin: str, visible: dict, orderable: dict,
+                    missing: list, notes: list) -> None:
+    """必填缺失的载荷落盘(旧 llm_raw_*.json 语义,2026-08-12 接线):
+    排障直接看文件,不必重跑 LLM;失败只告警不影响主链。"""
+    try:
+        import json
+        d = paths.logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(kpi.CN_TZ).strftime("%Y%m%d_%H%M%S")
+        f = d / f"llm_raw_{asin}_{ts}.json"
+        f.write_text(json.dumps(
+            {"asin": asin, "missing": missing, "notes": notes,
+             "visible": visible, "orderable": orderable},
+            ensure_ascii=False, indent=2))
+        logger.info("必填缺失载荷已落盘:%s", f)
+    except Exception as e:
+        logger.warning("载荷落盘失败(不影响主链): %s", e)
 
 
 def _push_scrape(absent: list[str], execute: bool) -> str | None:
@@ -266,7 +285,9 @@ def run(params: dict) -> str:
              if r["audit_result"].lower() == "pass"
              and r["listed"].lower() in ("", "no")
              and not r["feed_id"]
-             and r["list_result"] != "SKU_LOCKED"]
+             # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
+             # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
+             and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
     retry, exhausted = _retry_rows(rows)
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
@@ -285,7 +306,7 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "no_data": 0, "filtered": 0,
-         "no_upc": 0, "stock_assumed": 0, "invalid": 0}
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
@@ -342,11 +363,17 @@ def run(params: dict) -> str:
                      if products.get(r["asin"]) is None})
     scrape_note = _push_scrape(absent, execute)
     survivors: list[dict] = []
+    data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
     for r in candidates:
         p = products.get(r["asin"])
         if p is None:
             n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
             continue
+        # 拉到数据的行,无论最终去向都回显标题与价库——运营在表上直接
+        # 看到"为什么这行没上"的数字(旧系统对 prep_fails 同款)
+        echo = [(p.get("title") or "")[:190], p.get("price") or "",
+                p.get("stock") if p.get("stock") is not None else "", ""]
+        data_echo.append((r["rownum"], echo))
         # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
         #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
         #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
@@ -401,6 +428,9 @@ def run(params: dict) -> str:
         lead = p.get("lead_days")
         qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
             else int(stock)
+        echo[3] = w_price               # 算出定价的行回显 J 列
+        if not ((p.get("attrs") or {}).get("weight")):
+            n["no_weight"] += 1         # ShippingWeight 将按 1.0 磅兜底,亮出来
         survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
 
     # 配额切片(在全部过滤**之后**):幸存者按店取额度内前 N 行;
@@ -422,6 +452,10 @@ def run(params: dict) -> str:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
+    if n["no_weight"]:
+        # 采集侧没给 attrs.weight → ShippingWeight 兜 1.0 磅。持续大面积
+        # 出现 = 采集契约的 weight 形态可能对不上(backlog P1 核实项)
+        gate_line += f";无重量数据按 1.0 磅 {n['no_weight']} 行"
     lines.append(gate_line)
     if scrape_note:
         lines.append(scrape_note)
@@ -448,6 +482,10 @@ def run(params: dict) -> str:
     for rownum, why in reasons:
         listing_sheet.write_reason(rownum, why)
     n_reasons_written = len(reasons)
+    # 淘汰行数据回显(待提交行随后由 write_submit_cols 写全套,不重复写)
+    ready_rownums = {r["rownum"] for r in ready}
+    listing_sheet.write_data_cols(
+        [(rn, v) for rn, v in data_echo if rn not in ready_rownums])
 
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     by_store2: dict[str, list[dict]] = {}
@@ -493,6 +531,8 @@ def run(params: dict) -> str:
                         n["invalid"] += 1
                         reasons.append((r["rownum"],
                                         f"必填缺失:{','.join(missing[:6])}"))
+                        _dump_llm_debug(r["asin"], visible, orderable,
+                                        missing, notes)
                         continue
                     items.append(mp_mapper.assemble_mp_item(
                         orderable, r["product_type"], visible))

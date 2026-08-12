@@ -341,3 +341,30 @@ def test_heal_unknown_three_paths(monkeypatch):
     assert "K6:Q6" not in w and "K6:N6" not in w  # 非 Unknown 不碰
     assert used == [("0011", a2)] and released == ["0022"]
     assert "确认在线 2" in out and "确认失败重排 1" in out and "继续观察 1" in out
+
+
+def test_prohibited_receipt_never_requeues():
+    """政策违禁(旧 O 列第五类,2026-08-12 接线):三违禁码 → O=PROHIBITED,
+    不进 FAILED 重试通道——重发也永远是拒。"""
+    c = listing_sheet.classify_receipt
+    assert c("failed", "EXT_DATA_ERROR_71666506605865") == \
+        ("PROHIBITED", "EXT_DATA_ERROR_71666506605865")
+    assert c("failed", "EXT_DATA_ERROR_61020366035308")[0] == "PROHIBITED"
+    # SKU_LOCKED/ASYNC 优先级不受影响
+    assert c("failed", "ERR_EXT_DATA_0101211")[0] == "SKU_LOCKED"
+
+
+def test_fresh_filter_excludes_prohibited(monkeypatch):
+    rows = [_sheet_row(2, list_result="PROHIBITED", listed="No"),
+            _sheet_row(3)]
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(), {"banned_pts": set(), "brands": set()}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: {})
+    out = ln.run({"execute": False})
+    assert "待上架 1" in out          # PROHIBITED 行不领任务

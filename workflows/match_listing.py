@@ -53,9 +53,12 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.match_listing")
 
-# F 列终态(不重复预检/提交;运营清空 F 即重新排队)
-_TERMINAL = ("需完整建品", "目录无", "预检失败", "店铺不识别", "码无效",
-             "风控拦截", "ASIN黑名单")     # 后两类为前缀
+# F 列终态(不重复预检/提交;运营清空 F 即重新排队)。
+# "预检失败"**不是终态**(2026-08-12 旧仓对照纠正:那多半是 SPEC 接口网络
+# 抖动,旧系统每次跑批全新 xlsx 自然重试;当终态会把行永久停摆)——
+# 每轮自动重新预检,持续失败的行留在表上反复出现即是信号
+_TERMINAL = ("需完整建品", "目录无", "店铺不识别", "码无效",
+             "风控拦截", "ASIN黑名单", "数据无效")     # 后三类为前缀
 
 
 def _gate_reason(spec: dict, gate: dict, banned: dict) -> str | None:
@@ -116,7 +119,8 @@ def run(params: dict) -> str:
     # 行分拣:在途(反哺器管)/终态/待处理(F 空或=可跟卖 且 I 空)
     inflight = [r for r in rows if r["feed_id"]]
     todo = [r for r in rows if not r["feed_id"]
-            and r["status"] in ("", "可跟卖")]
+            and (r["status"] in ("", "可跟卖")
+                 or r["status"].startswith("预检失败"))]
     lines = [f"{mode}跟卖表 {len(rows)} 行:待处理 {len(todo)},"
              f"在途/已提交 {len(inflight)},终态 "
              f"{len(rows) - len(todo) - len(inflight)}"]

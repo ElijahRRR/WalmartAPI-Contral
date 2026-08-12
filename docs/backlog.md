@@ -105,6 +105,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列=永久明细档案,是"档案(如 ops.runs)"还是该裁,**待所有者拍板**;`ops.scrape_failures.error_detail` **有读者**(v_scrape_failure_stats 视图,先前记录有误),status/retry_count 零读方但为采集契约镜像,随上一条一并拍;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**(旧库同款缓存曾膨胀 462MB,清理器落地时要靠它,正确动作是补写低频清理器而非删列)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
+- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置已定稿归分配 A1:store_release 整店释放时同步标 missing_since(校正观测;`docs/allocation_plan.md` §十二.11);存量清单随 A0.5 审计出
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)
 
@@ -139,6 +140,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 > 在线产品拉取(catalog_sync)、几种订单拉取、日报拉取**。
 
 - 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
+- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §十二.10)
 - **涨跌幅闸**(maintenance.py:47,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议
 - 挂调度:全部工作流一条没挂;顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance`;feed_poll 高频
 - 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)

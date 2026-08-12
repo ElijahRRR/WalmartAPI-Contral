@@ -18,11 +18,14 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     amazon_category text,
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
-    audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
-    walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    audit_status    text,        -- pass / reject / pending(审核系统 verdict 原文;
+                                 --   audit_sync 回流,2026-08-12 接通)
+    audit_reason    text,        -- 拒绝理由摘要(37 政策类目/规则码,pass 恒 NULL)
+    walmart_pt      text,        -- 审核产出的沃尔玛 Product Type(小类;
+                                 --   大类按 PT JOIN risk_product_types.category)
     audited_at      timestamptz,
-    audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
+    audit_version   text,        -- 审核系统 audit_runs.run_id(可溯源;
+                                 --   audit_sync 按它比对"没变就不写")
     assigned_upc    text,
     listing_attrs   jsonb,       -- LLM 映射过的属性,按 PT 版本缓存
     last_feed_id    text,
@@ -292,6 +295,31 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
+
+-- 选品候选池(Q2 拍板 2026-08-12,docs/allocation_plan.md §十一.1):
+-- 旧采集器 v3 存量导出的一次性落点,只承担「候选名单 + 粗筛字段」;
+-- 保鲜/定价一律走 v4 增量(products/snapshots),本表数据不做任何业务判定输入。
+-- 幂等:candidate_import ON CONFLICT DO NOTHING;不更新不删除,可整表重灌。
+CREATE TABLE IF NOT EXISTS catalog.candidate_pool (
+    asin          text PRIMARY KEY,
+    title         text,
+    brand         text,
+    category_tree text,           -- Amazon 面包屑全路径(' > ' 分隔,v3 原文)
+    category_root text,           -- 面包屑首段(导入时计算,大类粗筛用)
+    rating        numeric,        -- 解析失败=NULL(N/A 等);下游禁止 or 0
+    review_count  integer,
+    current_price numeric,
+    buybox_price  numeric,
+    channel       text,           -- FBA / FBM / NULL(=没采到)
+    stock_status  text,
+    seller_name   text,
+    crawl_time    text,           -- v3 侧采集时间原文(时区口径不明,仅参考,
+                                  -- 不当保鲜依据——保鲜一律看 snapshots)
+    source        text NOT NULL DEFAULT 'v3',
+    imported_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS candidate_pool_brand_idx ON catalog.candidate_pool (brand);
+CREATE INDEX IF NOT EXISTS candidate_pool_root_idx  ON catalog.candidate_pool (category_root);
 
 -- 风险档案:上架前防呆的查询入口(list_new 消费;人工/AI SELECT 也方便)。
 -- 2026-08-11 sku≠asin 定稿后身份键改 coalesce(asin, sku):删除史必须按产品

@@ -64,6 +64,33 @@ def legacy_cleanup_conn():
         conn.close()
 
 
+def audit_dsn() -> str:
+    """输入:无 → 输出:审核系统库 walmart_audit 的 DSN(env WALMART_AUDIT_DSN 覆盖)。
+
+    审核系统(walmart-audit-system 仓库)无 JSON API,其现行下游对接方式就是
+    直连库(该仓库 cli/get_problem_images.py 明写"上架脚本用法")。
+    地址只准从这里取(铁律 3),工作流不许自带 DSN 参数。
+    """
+    return os.environ.get("WALMART_AUDIT_DSN", "dbname=walmart_audit")
+
+
+@contextlib.contextmanager
+def audit_conn():
+    """输入:无 → 输出:审核库**只读**连接上下文(audit_sync 的读取端)。
+
+    审核结论的权威永远在审核系统的库里,本侧只有读的权利——回流落点是
+    catalog.products 的 audit_* 五列(写走 pg_conn,与这里无关)。
+    """
+    import psycopg
+
+    conn = psycopg.connect(audit_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
 def sqlite_cache(name: str) -> sqlite3.Connection:
     """输入:缓存库文件名(不含路径,如 'scraper_cache.db')→ 输出:sqlite3 连接。
 

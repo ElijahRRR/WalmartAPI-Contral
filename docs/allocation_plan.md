@@ -6,8 +6,9 @@
 > 本文档只做设计定稿与决策留痕,防止讨论结论丢失。
 >
 > **2026-08-12 更新:约定的"校准"已完成**(§十~十四,四外部仓库摸底 +
-> 前置条件核对 + 引擎细化 + 待拍板问题清单)。暂缓是否解除等所有者
-> 答复 §十四 的 Q1~Q8 后定;Q 清单答完即可按 §十三 批次动工。
+> 前置条件核对 + 引擎细化 + 待拍板问题清单)。
+> **同日所有者八条全部拍板(§十四)——A0 数据接线批次解除暂缓,动工。**
+> A1/A2 仍按 §十三 顺序推进,每批独立验收。
 
 ## 一、需求(所有者 2026-08-07 原述要点)
 
@@ -235,6 +236,12 @@ products.walmart_pt 兜底(经 sku_asin 清洗)。**需所有者给文件 → Q3
 - **单店总容量上限**(最多在线多少个):现有飞书限额表「上架限制」列是**日配额**
   不是总上限,剩余容量比的分母缺权威源 → 并入店铺目标表 max_online 列。
 
+> **Q4 拍板后修正(2026-08-12)**:不建新表。所有者已在订单中心多维表格
+> 「定价及上下架限制」数据表**新增三列:目标销售额、目标订单、单店最大在线数**
+> (销售额与订单均为**日目标**)。落地方式:registry 的该表登记补三个字段常量,
+> 运行时直读(与 list_new 日配额同款读法),**不建 PG 镜像表**;
+> 手工终止标记列也不需要(Q1 拍板:三态取值域已实证,直接读库)。
+
 ## 十二、分配引擎校准(细化 §七;三层框架与"透明打分不用 ML"定稿不变)
 
 ### 1. 分配单元 = 品牌组,不是单品
@@ -258,17 +265,20 @@ products.walmart_pt 兜底(经 sku_asin 清洗)。**需所有者给文件 → Q3
 每家 ACTIVE 店先算本批期望接货量 quota,匹配循环再消耗:
 
 ```
-gap_i    = clamp01((target_gmv_i − gmv_30d_i) / target_gmv_i)     # 目标缺口
+gap_i    = clamp01((target_gmv_daily_i − avg_daily_gmv_30d_i) / target_gmv_daily_i)
+                                                                  # 目标缺口(日口径,Q4 拍板目标为日目标)
 room_i   = max(0, max_online_i − online_i)                        # 容量余量
 health_i = KPI 8 率全达标=1,单项越线按权重扣,低于红线=0(整店出局)
 need_i   = w_gap·gap_i + w_room·min(1, room_i/批量) + w_health·health_i
 quota_i  = min(room_i, ceil(批量 × need_i / Σ need))
 ```
 
-数据源全部已在库:gmv_30d ← ops.store_kpi_daily.sales_amount(或 order_lines
-聚合);online_i ← walmart_items(missing_since IS NULL);target/max_online ←
-store_targets(新);health ← store_kpi_daily 8 率。
-权重初值 w_gap=0.5 / w_room=0.3 / w_health=0.2,进配置文件,供砍(Q6)。
+数据源全部已在库:avg_daily_gmv_30d ← ops.store_kpi_daily.sales_amount 近 30 天
+均值(或 order_lines 聚合);online_i ← walmart_items(missing_since IS NULL);
+target_gmv_daily/max_online ← 「定价及上下架限制」表三个新列(Q4 拍板,直读);
+health ← store_kpi_daily 8 率。
+权重初值 w_gap=0.5 / w_room=0.3 / w_health=0.2,进配置文件,供砍(Q6 拍板:
+按草案跑首批 dry-run 对着方案表砍)。
 
 ### 4. 店铺-产品匹配(自由流;§七第 3 层贪心的具体化)
 
@@ -334,32 +344,47 @@ E 列审核结果由 audit_sync 的结论投影)→ list_new 照常领任务;lis
 
 ## 十三、修订批次(动工顺序;§八原文保留作历史)
 
-- **A0 数据接线**(全部只读/幂等,零沃尔玛写操作,可立即动工):
-  1. `audit_sync`:直连 walmart_audit 拉审核结论 → products.audit_* 五列(§十一.3);
-  2. 店铺目标表:飞书建表 + registry 登记 + 镜像 ops.store_targets(Q4 给数后);
-  3. `order_history_import`:两年订单 excel 一次性入库(Q3 给文件后);
-  4. `candidate_import`:v3 导出 → catalog.candidate_pool(Q2 拍板后);
-  5. 复用既有待办:daily_report 全店化 + 挂调度、product_ingest 挂调度
+- **A0 数据接线**(全部只读/幂等,零沃尔玛写操作,2026-08-12 拍板后动工;
+  **[x] 1~4 代码就绪 2026-08-12(561 测试全过),待生产验收**):
+  1. [x] `audit_sync`:直连 walmart_audit 拉审核结论 → products.audit_* 五列
+     (§十一.3)。验收:.env 配 `WALMART_AUDIT_DSN` → `-p limit=100` 冒烟 →
+     全量跑 → 抽查五列与缺行数;
+  2. [x] 店铺目标三列:RETIRE_LIMITS 登记 target_gmv_daily/target_orders_daily/
+     max_online 字段常量(读取积木随 A2 引擎实现,避免只写不读的僵尸);
+  3. [x] `order_history_import`:两年订单 excel 一次性入库(Q3 文件表头当日
+     已提供,精确匹配实现:合并键=PO+SKU 拼接拆回 PO、销售额USD→
+     product_amount、退款原因→refund_comments、统计状态/采购成本/利润
+     只进 raw)。验收:预览看店名分布(旧命名"1杨宜凡"式与现凭证表
+     对不上时先定改名映射)→ apply;
+  4. [x] `candidate_import`:v3 csv 导出 → catalog.candidate_pool(Q2 拍板:
+     选 a;所有者另行把全量 ASIN 新采进 v4,候选池只做名单与粗筛,
+     保鲜一律走 v4)。验收:v3 按 docstring 的 fields 参数导 csv → 预览 →
+     apply → 行数对账;
+  5. [ ] 复用既有待办:daily_report 全店化 + 挂调度、product_ingest 挂调度
      (plan.md/backlog 已列;分配依赖这两条链保鲜)。
-- **A0.5 存量冲突审计**(只读报告,不写 claims;A0.1 后即可跑):
+- **A0.5 存量冲突审计 + 过渡方案**(只读报告,不写 claims;A0.1 后即可跑):
   ① 同 ASIN 跨店在线 ② 同品牌跨店在线(walmart_items ⋈ sku_asin ⋈
   products.brand)③ 每店大类分布(walmart_items.product_type →
   risk_product_types.category)+ 超 2 类目店清单 ④ 处置建议列。
   产出同时是 store_categories 与 claims 的**初始回填清单**(所有者审后灌,Q8)。
+  **Q5 拍板追加**:所有者将按报告为每家在营店**确定保留类目与保留产品**,
+  不合规存量走**下架过渡**——下架清单分批执行,复用既有 product_clear 通道
+  (dangerous/dry-run/防重全套既有纪律),节奏放缓让店铺平稳过渡;
+  过渡执行不新造工作流,A0.5 报告输出直接兼容 product_clear 的输入格式。
 - **A1 占用台账地基**(§八 A1 原样:claims + store_categories + services/claims
   + list_new 占用闸 + store_release + 审计对拍)。
 - **A2 分配引擎**(§十二;依赖 A0 全部到位)。
 - **A3 学习型**(远景不变;allocation_runs/items 快照从 A2 第一天就落)。
 
-## 十四、待所有者拍板(2026-08-12)
+## 十四、已拍板(2026-08-12 所有者八条答复,当日问当日决)
 
-| # | 问题 | 建议 |
+| # | 问题 | 拍板 |
 |---|---|---|
-| Q1 | **店铺三态权威源**:store_status(API sellerStatus)与 sales_status(影刀)谁说了算?sellerStatus 能否产出 TERMINATED 无实证;且"终止运营"本质是我方决策不是平台观测 | 影刀 sales_status 优先、sellerStatus 兜底;「终止」同时允许所有者在店铺目标表手工登记,不等平台字面量 |
-| Q2 | **v3 存量用途**:(a) 导出入 candidate_pool (b) 只当 ASIN 名单 (c) 灌进 v4 | a(c 有 §十一.1 三条反对理由) |
-| Q3 | **两年订单 excel**:给文件路径 + 列头样例 | — |
-| Q4 | **12 店目标**:目标月销售额/目标月订单/单店最大在线数,逐店给数;店铺目标表列结构随之定稿 | — |
-| Q5 | 分配引擎可否在方案表内**提议开新大类**(dry-run 高亮,execute 即落 store_categories),还是开新类目必须人工单独登记 | 方案表提议制(反正有人审) |
-| Q6 | 产品分权重/淘汰线(草案 40)与配额权重初值(§十二.3/5) | 按草案试跑,首批 dry-run 对着方案表砍 |
-| Q7 | **品牌归一化口径**:第一版 casefold+strip+噪声词表;要不要别名表(SAMSUNG vs Samsung Electronics) | 先跑 A0.5 审计看疑似变体规模再定 |
-| Q8 | **存量冲突处置原则**(同品牌/同 ASIN 已跨店):留销量大的店、其余店只维护不新增?还是逐条人工 | 报告出来后议 |
+| Q1 | 店铺三态权威源 | **直接读数据库状态字段(ops.store_kpi_daily.store_status,三态取值域所有者已实证)**;"释放某店全部品牌与产品"允许手工操作(store_release --store,含救不回的 SUSPENDED 店)。不引入手工终止登记列 |
+| Q2 | v3 存量用途 | **a:导出入 candidate_pool**;所有者另行把全量数据**新采集进 v4**(候选池只承担名单+粗筛,保鲜数据一律来自 v4 重采) |
+| Q3 | 两年订单 excel | 文件在生产 Mac:`~/Downloads/采购分配合并总表.xlsx`(路径不进代码,运行时 -p file= 传入;先预览探列再 apply) |
+| Q4 | 店铺目标 | 已在订单中心多维表格「定价及上下架限制」数据表**新增三列:目标销售额、目标订单、单店最大在线数;销售额与订单为日目标**。registry 补字段常量直读,不建新表不建镜像 |
+| Q5 | 开新大类 | **方案表提议制可接受**(dry-run 高亮、execute 即落)。追加:在营店存量要按数据确定保留类目与产品,不合规存量做**下架过渡**,平稳节奏(→ §十三 A0.5) |
+| Q6 | 权重/淘汰线 | 按草案(淘汰线 40、配额权重 0.5/0.3/0.2)跑首批 dry-run,对着方案表砍 |
+| Q7 | 品牌归一化 | **第一版 casefold+去噪声词;不要别名表**(定稿,不再以审计结果复议别名表) |
+| Q8 | 存量冲突处置 | 接受"审计报告出来后议"——A0.5 报告先行,处置原则见报告再定 |

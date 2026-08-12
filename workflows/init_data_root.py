@@ -18,6 +18,9 @@ _ENV_TEMPLATE = """\
 # PostgreSQL(默认本机 socket 连 walmart_data,通常无需改)
 #WALMART_PG_DSN=dbname=walmart_data
 
+# 审核系统库(audit_sync 只读回流审核结论;同机默认值即可,异机填完整 DSN)
+#WALMART_AUDIT_DSN=dbname=walmart_audit
+
 # 飞书自建应用凭据(注意:旧系统的 APP_SECRET 已进 git 历史,必须在飞书后台轮换后再填)
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=

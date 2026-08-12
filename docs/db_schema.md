@@ -37,12 +37,13 @@ CREATE TABLE catalog.products (
     amazon_category text,
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
-    -- 审核结论(由审核服务产出)
-    audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
-    walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    -- 审核结论(audit_sync 从审核系统库 walmart_audit 回流,2026-08-12 接通)
+    audit_status    text,        -- pass / reject / pending(审核系统 verdict 原文)
+    audit_reason    text,        -- 拒绝理由摘要(pass 恒 NULL)
+    walmart_pt      text,        -- 审核产出的 Product Type 小类
+                                 -- (大类按 PT JOIN risk_product_types.category)
     audited_at      timestamptz,
-    audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
+    audit_version   text,        -- 审核系统 audit_runs.run_id(溯源+幂等比对键)
     -- 复用资产(上架过程中生成,避免重复劳动/重复消耗)
     assigned_upc    text,
     listing_attrs   jsonb,       -- LLM 映射过的属性,按 PT 版本缓存
@@ -86,6 +87,12 @@ CREATE VIEW catalog.latest_snapshot AS
 
 使用约定:审核服务只关心 products(slow_hash 未变则不重审);
 价格库存维护读 latest_snapshot;上架 workflow 两层 JOIN 取完整输入。
+
+审核结论回流:`audit_sync` 工作流直连审核系统库(walmart_audit,
+`registry/db.audit_conn` 只读)取每 ASIN 最新 audit_runs 写五列;
+每轮全量对齐(pass 有 45 天 TTL 可能翻案),audit_version 比对保证
+"内容没变就不写"。products 缺行的 ASIN 只计数报告(身份行由
+product_ingest 建,重采落库后下轮自动补上)。
 
 **"这个 ASIN 为什么没有新数据"的两条查法**(2026-08-09 补齐,互补不重叠):
 
@@ -219,6 +226,23 @@ CREATE TABLE catalog.product_events (
 catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
 未来 listing·审核(入库/审核/上架)。
 
+```sql
+-- 选品候选池(Q2 拍板 2026-08-12,allocation_plan §十一.1):旧采集器 v3 存量
+-- 导出的一次性落点,只承担「候选名单 + 粗筛字段」——保鲜/定价一律走 v4 增量
+-- (products/snapshots),本表任何字段不做业务判定输入。
+-- 写入方 candidate_import(csv 流式,ON CONFLICT DO NOTHING 幂等);不更新不删除。
+CREATE TABLE catalog.candidate_pool (
+    asin text PRIMARY KEY,
+    title / brand / category_tree(' > ' 面包屑原文)/ category_root(首段,粗筛用),
+    rating numeric / review_count int,     -- 解析失败=NULL,禁止 or 0
+    current_price / buybox_price numeric,
+    channel text,                          -- FBA / FBM / NULL(=没采到)
+    stock_status / seller_name text,
+    crawl_time text,                       -- v3 时间原文(时区口径不明,仅参考)
+    source text DEFAULT 'v3', imported_at timestamptz
+);
+```
+
 ## listing — 上架域
 
 ```sql
@@ -333,7 +357,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
-| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 |
+| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 + order_history_import(两年历史 excel 一次性,DO NOTHING 永不覆盖 API 行;采购域字段只进 raw) |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |

@@ -479,6 +479,11 @@ RETIRE_LIMITS = Bitable(
         max_daily_list="上架限制",
         max_daily_retire="下架限制",
         inventory_note="库存特殊要求",
+        # 店铺目标三列(所有者建列 2026-08-12,Q4 拍板;分配引擎 A2 消费):
+        # 销售额与订单均为**日目标**;最大在线数是总容量上限(≠上架限制的日配额)
+        target_gmv_daily="目标销售额",
+        target_orders_daily="目标订单",
+        max_online="单店最大在线数",
     ),
 )
 

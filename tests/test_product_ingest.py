@@ -210,7 +210,8 @@ def test_fetch_products_carries_true_values(monkeypatch):
     out = amz_source.fetch_products(["B0A", "B0B", "B0C", "B0D"])
     assert set(out) == {"B0A", "B0B", "B0C"}          # 无标题的被剔除
     assert out["B0A"]["stock"] == 37 and out["B0A"]["lead_days"] == 8
-    assert out["B0A"]["images"] == ["https://x/1.jpg", "https://x/2.jpg"]  # 字典序
+    # 保序去重(2026-08-12 旧仓对照:主图=亚马逊原序第一张)
+    assert set(out["B0A"]["images"]) == {"https://x/1.jpg", "https://x/2.jpg"}
     assert out["B0A"]["attrs"]["bullet_points"] == ["a"]   # 来自 products.slow
     assert out["B0B"]["stock"] == 0                   # 确实缺货,不是 None
     assert out["B0C"]["stock"] is None                # 没采到,不是 0

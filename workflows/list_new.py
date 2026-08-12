@@ -159,17 +159,25 @@ def _push_scrape(absent: list[str], execute: bool) -> str | None:
         return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}"
 
 
-def _map_visible(conn, pt: str, spec, product: dict) -> dict:
-    """LLM 映射(缓存优先)→ mapper 硬约束清洗。"""
-    messages = mp_mapper.build_llm_messages(pt, spec, product)
+def _map_llm(conn, pt: str, spec, product: dict) -> tuple[dict, dict]:
+    """LLM 映射(缓存优先)→ (清洗后 Visible, LLM 填的 Orderable 字段)。
+
+    2026-08-12 旧仓对照恢复两段式:Orderable 的非系统字段(条件必填等)
+    交还 LLM 填,系统强制项在 build_orderable 里覆盖;Visible 照旧过
+    finalize_visible 硬约束清洗。
+    """
+    messages = mp_mapper.build_llm_messages(pt, spec, product,
+                                            ospec=pt_spec.orderable_spec())
     key = llm_cache.cache_key(messages, 0.2, 4096)
     raw = llm_cache.get(conn, key)
     if raw is None:
         raw = llm.chat_json(messages)
         llm_cache.put(conn, key, raw)
-    return mp_mapper.finalize_visible(pt, raw, spec,
-                                      images=product.get("images"),
-                                      product=product)
+    raw_v, raw_o = mp_mapper.split_llm_output(raw)
+    visible = mp_mapper.finalize_visible(pt, raw_v, spec,
+                                         images=product.get("images"),
+                                         product=product)
+    return visible, raw_o
 
 
 MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
@@ -227,13 +235,14 @@ def _spec_precheck(ready: list[dict]) -> str:
         for r in ready[:20]:
             spec = pt_spec.load_pt(r["product_type"])
             try:
-                visible = _map_visible(conn, r["product_type"], spec, r["_p"])
+                visible, llm_o = _map_llm(conn, r["product_type"], spec,
+                                          r["_p"])
             except Exception as e:
                 lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
                 continue
             orderable = mp_mapper.build_orderable(
                 r["asin"], "000000000000", r["_price"], r["_qty"], "0",
-                pt=r["product_type"], product=r["_p"])
+                pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
                 sku=r["asin"])
@@ -459,16 +468,17 @@ def run(params: dict) -> str:
                         n["no_upc"] += 1
                         reasons.append((r["rownum"], "UPC池余量不足"))
                         continue
-                    visible = _map_visible(conn, r["product_type"],
-                                           pt_spec.load_pt(r["product_type"]),
-                                           r["_p"])
+                    visible, llm_o = _map_llm(
+                        conn, r["product_type"],
+                        pt_spec.load_pt(r["product_type"]), r["_p"])
                     if len(visible.get("productName") or "") < 10:
                         upc_pool.release(conn, [upc], "prep_failed")
                         reasons.append((r["rownum"], "标题不足10字符"))
                         continue
                     orderable = mp_mapper.build_orderable(
                         r["asin"], upc, r["_price"], r["_qty"], partner,
-                        pt=r["product_type"], product=r["_p"])
+                        pt=r["product_type"], product=r["_p"],
+                        llm_fields=llm_o)
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
                     visible, orderable, notes, missing = mp_conform.conform(

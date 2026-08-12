@@ -60,14 +60,18 @@ IN_STOCK_QTY = int(os.environ.get("AMZ_IN_STOCK_QTY", "10"))
 
 
 def _images(raw) -> list[str]:
-    """输入:snapshot.raw → 输出:图片 URL 列表(字典序,防采集侧 set() 乱序)。"""
+    """输入:snapshot.raw → 输出:图片 URL 列表(**保序去重**)。
+
+    2026-08-12 旧仓对照纠正:旧系统保持亚马逊原序(mainImageUrl=第一张=
+    亚马逊主图),此前的字典序排序会把主图换掉;来源真被 set() 打乱时
+    保序也不比排序差。"""
     if not isinstance(raw, dict):
         return []
     imgs = ((raw.get("slow") or {}).get("images")
             if isinstance(raw.get("slow"), dict) else None) or raw.get("images")
     if not isinstance(imgs, (list, tuple)):
         return []
-    return sorted(str(u) for u in imgs if u)
+    return list(dict.fromkeys(str(u) for u in imgs if u))
 
 
 def _attrs(raw) -> dict:
@@ -100,7 +104,8 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         # attrs 首选身份层的 slow 全量段(卖点/描述/重量/尺寸/变体都在这里);
         # raw 是契约裁剪过的载荷,只是老行的兜底
         attrs = dict(slow) if isinstance(slow, dict) else _attrs(raw)
-        images = (sorted(str(u) for u in (attrs.get("images") or []) if u)
+        images = (list(dict.fromkeys(
+                      str(u) for u in (attrs.get("images") or []) if u))
                   or _images(raw) or ([image_url] if image_url else []))
         # manufacturer 提为一等字段(所有者批复 2026-08-12):亚马逊大量商品
         # brand=Generic 而真品牌在 manufacturer,黑名单必须两个字段都查

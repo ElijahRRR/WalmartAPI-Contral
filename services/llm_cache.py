@@ -9,9 +9,13 @@ import hashlib
 import json
 import logging
 
+from api import llm as _llm_api
+
 logger = logging.getLogger("services.llm_cache")
 
-_MODEL = "deepseek-chat"
+# 与 api/llm 实际请求的模型保持同源(DEEPSEEK_MODEL 可经 .env 切换):
+# 键里的 model 与请求的 model 不一致会造成"换了模型还命中旧缓存"的静默错
+_MODEL = _llm_api._MODEL
 
 
 def cache_key(messages: list[dict], temperature: float, max_tokens: int) -> str:

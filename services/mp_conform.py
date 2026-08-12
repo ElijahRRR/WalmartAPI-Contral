@@ -101,6 +101,13 @@ def safe_default_for(prop: dict):
                 s = str(v).lower()
                 if "no" in s and ("applicable" in s or "warning" in s):
                     return [v]
+            # 2026-08-12 旧仓对照补回:旧 _safe_default_for 对所有类型先跑
+            # No/None/Not Applicable 优选。此前 array 直接 [enum[0]]——
+            # ["Yes","No"] 这类"是否有 X"字段兜底方向反了(填 Yes 又级联
+            # 触发 allOf 条件必填)
+            for safe in ("No", "None", "Not Applicable"):
+                if safe in enum:
+                    return [safe]
             return [enum[0]]
         for safe in ("No", "None", "Not Applicable", "Unbranded"):
             if safe in enum:
@@ -426,10 +433,23 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = ""
     in_spec = [k for k in _VARIANT_BAG if k in props]
     if not in_spec:
         return visible, []
-    touched = any(visible.get(k) not in _EMPTY for k in in_spec)
-    if not touched and not (_required(spec) & set(in_spec)):
-        return visible, []          # 三件套一个都没碰且都不必填 → 不主动引入
-
+    required = _required(spec) & set(in_spec)
+    present = [k for k in in_spec if visible.get(k) not in _EMPTY]
+    if not required:
+        # 单品口径修正(2026-08-12 旧仓对照):旧系统单品**从不发**变体字段
+        # (inject_variant_fields 只对真变体组注入,SKU 占位组 ID 无实证)。
+        # 非必填时:三件俱全 = 真变体注入 → 放行;半套/LLM 零星幻觉 →
+        # 整套剔除(半套必拒 05570905585050,凑全反而是无实证行为)
+        if present and len(present) < len(in_spec):
+            visible = dict(visible)
+            for k in present:
+                visible.pop(k, None)
+            return visible, [f"变体字段不完整({','.join(present)}),"
+                             f"单品口径整套剔除"]
+        return visible, []
+    # spec 把三件套列为必填 → 必须补全(第 4 轮实证 PT:沃尔玛报错原文
+    # "If you only have 1 item in a variant group, select 'Yes' in Is
+    # Primary Variant";组 ID 用 SKU 占位)
     notes = []
     if "variantGroupId" in props and visible.get("variantGroupId") in _EMPTY:
         if not sku:
@@ -623,8 +643,28 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
     visible, n = fill_missing_required(spec, visible);      notes += n
     visible, n = fix_type_mismatches(spec, visible);        notes += n
     visible, n = fix_invalid_enums(spec, visible);          notes += n
+    if _props(ospec):
+        # Orderable 段同样过条件必填/类型/枚举一致化(2026-08-12 旧仓对照:
+        # 旧系统 Orderable 由 LLM 按 spec 填,新系统交还 LLM 后这层同样要兜;
+        # 此前 Orderable 完全不过一致化,LLM 一个非法枚举直达沃尔玛)
+        orderable, n = fill_known_required(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
+        orderable, n = fix_type_mismatches(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
+        orderable, n = fix_invalid_enums(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
     visible, n = ensure_variant_bag(spec, visible, sku);    notes += n
-    visible, orderable, n = strip_unknown(spec, ospec, visible, orderable)
+    if _props(ospec):
+        visible, orderable, n = strip_unknown(spec, ospec, visible, orderable)
+    else:
+        # Orderable spec 缺失保护(2026-08-12 旧仓对照):此前 ospec 为空时
+        # strip_unknown 会把**整个 Orderable 清空**——_orderable.json 没就位
+        # 就是必拒。改为只裁 visible,orderable 原样保留并记日志
+        logger.warning("Orderable spec 缺失(_orderable.json 未就位?),"
+                       "跳过 Orderable 段裁剪与校验")
+        visible, orderable, n = strip_unknown(
+            spec, {"properties": {k: {} for k in orderable}},
+            visible, orderable)
     notes += n
     orderable, n = clean_state_restrictions(orderable);     notes += n
     visible, orderable, n = drop_empty_optional(spec, ospec, visible, orderable)

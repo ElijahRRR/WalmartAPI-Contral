@@ -185,8 +185,10 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 
 ### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 
-- [ ] SKU_LOCKED → RETIRE_ITEM → 24h 冷却 → 清列重上(retire_cooldown 表);
-      RETIRE_ITEM schema 与 MP_ITEM 完全不同(已在 api/feeds)
+- [x] SKU_LOCKED → RETIRE_ITEM → 24h 冷却 → 清列重上(listing.retire_cooldown 表)
+      ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
+      跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
+      工作流默认 dry-run;回执失败标 failed 人工处置不自动重试;需每日调度
 - [ ] 状态跟踪:旧 sync_status_track 的"反查真实状态 + Unknown 自愈"由
       catalog_sync(已上线)+ product_events 观测地基承接,只补
       "上架表 K=Unknown 而目录已在线 → 自愈回写"这一条

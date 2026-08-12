@@ -199,8 +199,18 @@ CREATE TABLE catalog.product_events (
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
--- 视图 catalog.product_risk:按 SKU 汇总(上架次数/删除次数/删除未生效次数/
--- 最近移除时间)——未来 listing 上架前防呆的查询入口
+-- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
+-- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
+--   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
+--                       最近移除时间)——list_new 防呆消费,拦截条件只看
+--                       delete_times / delete_not_effective_times;
+--                       unexplained_missing(消失过且从未提交删/停 = 疑似
+--                       平台下架)只提示不拦截(所有者口径 2026-08-12)
+--   product_risk_store  同口径按 (asin, store) 聚合:"这个产品在哪些店被删过
+--                       几次";store 为空的事件只出现在全局视图
+--   status_changes      status_changed 平铺(old/new/官方 reasons)——查"谁被
+--                       平台下架、为什么":WHERE new_status <> 'PUBLISHED'
+--   feed_failures       五类 feed 的逐 SKU 失败回执(kind/error_code/detail)
 ```
 
 事件账本三条纪律:只追加永不改;**回执与观测分开记**(feed 回执 success 是
@@ -212,6 +222,18 @@ catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
 ## listing — 上架域
 
 ```sql
+CREATE TABLE listing.retire_cooldown (  -- SKU_LOCKED 自愈链状态(sku_locked_heal)
+    id bigint IDENTITY PRIMARY KEY,
+    store text NOT NULL, sku text NOT NULL,
+    feed_id text NOT NULL,              -- RETIRE_ITEM 的 feed
+    retired_at timestamptz DEFAULT now(),
+    status text DEFAULT 'pending',      -- pending 冷却中 / cleared 已清列重上 /
+                                        -- failed RETIRE 回执失败,人工处置
+    cleared_at timestamptz
+);  -- 部分唯一索引 (store, sku) WHERE pending:同对只许一条在途冷却,防重复退役
+-- 链路(旧实证:SKU 绑死旧 UPC,不先退役换 UPC 重发也失败):
+-- RETIRE_ITEM → 24h 冷却 → 回执成功才清列(K~M/O~Q)→ list_new 领新 UPC 重上
+
 CREATE TABLE listing.tasks (        -- 上架任务(来自飞书登记表,同步进来)
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     asin        text NOT NULL,

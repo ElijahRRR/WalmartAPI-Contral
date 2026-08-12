@@ -6,8 +6,12 @@
   python cli.py list_new -p store=A085朱丽霖
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
-且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 与 O=SKU_LOCKED 跳过
-(Unknown 也算已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
+且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
+已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
+O=FAILED 走重试通道(≤3 次);O=SKU_LOCKED 本工作流不碰——由
+sku_locked_heal 自愈链处理(RETIRE→24h 冷却→清列,行变新行后回到
+本链领**新 UPC** 重上)。旧实证:SKU 已绑死旧 UPC,不先退役直接换
+UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
 闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
@@ -15,7 +19,10 @@
     北京日界)
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦)
+    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦;
+    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截——所有者口径
+    2026-08-12,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE
+    职责边界拍板)
   ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
     数据恢复自动续上)
   ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
@@ -59,9 +66,30 @@ _SQL_LISTED_ASINS = """
 SELECT DISTINCT sku FROM catalog.walmart_items WHERE missing_since IS NULL
 """
 _SQL_RISKY = """
-SELECT sku FROM catalog.product_risk
+SELECT asin, delete_times, delete_not_effective_times, listed_times,
+       last_removed_at
+FROM catalog.product_risk
 WHERE delete_times > 0 OR delete_not_effective_times > 0
 """
+_SQL_UNEXPLAINED = """
+SELECT asin FROM catalog.product_risk WHERE unexplained_missing
+"""
+
+
+def _risk_reason(deletes: int, not_effective: int, listed: int,
+                 last_removed) -> str:
+    """输入:product_risk 一行的计数与最近移除时间 → 输出:N 列防呆理由。
+
+    此前只写"有删除史"四个字,人工复核还得手查账本;计数和时间本来就在
+    视图里,直接带出来当证据。"""
+    bits = [f"提交删除{deletes}次"]
+    if not_effective:
+        bits.append(f"删除未生效{not_effective}次")
+    if listed:
+        bits.append(f"历史上架{listed}次")
+    if last_removed:
+        bits.append(f"最近移除{last_removed:%Y-%m-%d}")
+    return f"防呆:该ASIN有删除史({','.join(bits)})"
 
 
 def _load_gate_state():
@@ -74,9 +102,13 @@ def _load_gate_state():
         cur.execute(_SQL_LISTED_ASINS)
         listed = {r[0] for r in cur.fetchall()}
         cur.execute(_SQL_RISKY)
-        risky = {r[0] for r in cur.fetchall()}
+        # 键是 coalesce(asin, sku)——视图身份键 2026-08-11 从订货号原文改成
+        # 产品码,否则三段式 sku 名下的删除史拦不住同 ASIN 换号重上
+        risky = {r[0]: r[1:] for r in cur.fetchall()}
+        cur.execute(_SQL_UNEXPLAINED)
+        unexplained = {r[0] for r in cur.fetchall()}
         gate = risk_gate.load_gate(conn)
-    return inactive, today_used, listed, risky, gate
+    return inactive, today_used, listed, risky, unexplained, gate
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -153,12 +185,12 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
     但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
     卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
 
-    ⚠ SKU_LOCKED 永不重试(SKU 已被旧 UPC 绑死);ASYNC_PENDING 不是失败。
+    ⚠ SKU_LOCKED 不进本通道:不先 RETIRE 换 UPC 重发也会失败(旧实证),
+    走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
     """
     cand = [r for r in rows
             if r["audit_result"].lower() == "pass"
-            and r["list_result"] == "FAILED"
-            and r["list_result"] != "SKU_LOCKED"]
+            and r["list_result"] == "FAILED"]
     if not cand:
         return [], []
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -229,7 +261,7 @@ def run(params: dict) -> str:
     if not pending:
         return "\n".join(lines)
 
-    inactive, today_used, listed, risky, gate = _load_gate_state()
+    inactive, today_used, listed, risky, unexplained, gate = _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
@@ -237,6 +269,7 @@ def run(params: dict) -> str:
          "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
          "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
+    missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
 
     by_store: dict[str, list[dict]] = {}
@@ -268,10 +301,15 @@ def run(params: dict) -> str:
                 n["dedup"] += 1
                 reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
                 continue
-            if r["asin"] in risky:
+            risk = risky.get(r["asin"])
+            if risk:
                 n["guard"] += 1
-                reasons.append((r["rownum"], "防呆:该ASIN有删除史(product_risk)"))
+                reasons.append((r["rownum"], _risk_reason(*risk)))
                 continue
+            if r["asin"] in unexplained:
+                # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
+                # 没提交过删/停 = 疑似平台强制下架,放行但必须在摘要里亮出来
+                missing_warn.append(r["asin"])
             candidates.append(r)
 
     products = amz_source.fetch_products([r["asin"] for r in candidates])
@@ -344,6 +382,10 @@ def run(params: dict) -> str:
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
     lines.append(gate_line)
+    if missing_warn:
+        lines.append(f"  ⚠ {len(missing_warn)} 行有\"不明原因消失\"史"
+                     f"(疑似平台下架)仍放行:{','.join(missing_warn[:8])}"
+                     f"——暂只提示不拦截(2026-08-12 口径)")
 
     if not execute:
         for rownum, why in reasons[:15]:

@@ -60,9 +60,9 @@
 
 | 旧 Step | 状态 | 说明 |
 |---|---|---|
-| Step 0 监管合规删除(飞书 eGjQRX) | ⬜ | 完全缺失。plan 称由 product_clear 的停用删除表承担,但旧表 F 列幂等锚点无人继承;旧逻辑 dry-run 下整段跳过,需重写成可预览(`docs/legacy_survey.md:1361,1447,1474`) |
+| Step 0 监管合规删除(飞书 eGjQRX) | ✅ | **不迁**(所有者拍板 2026-08-11:与 product_clear 是同一能力,不再另做——删除/停用登记走「商品停用删除表」一条通道;旧表 eGjQRX 与其 F 列幂等锚点随旧系统退役) |
 | Step 1/1.5/1.6/2 识别/反补/停用/删除 | ✅ | `problem_product_cleanup`,2026-08-07 生产验收 |
-| Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ⬜🔴 | 未迁;"累计语义保不保留"未决,历史口径会跳变(`legacy_survey.md:1358-1362,1472`) |
+| Step 3/4/5 报表(错误统计/店铺汇总/每日问题商品) | ✅ | **不迁**(所有者拍板 2026-08-11:以后需要数据让 AI 直接读库,不再维护飞书报表)。"累计语义保不保留"之争随之消解——且事实上口径早已动过:BIZ-CN 已独立成维度,旧口径本就没被逐字沿用 |
 | Step 6 品牌采集 | ✅ | 2026-08-11 生产验收:brand_err_hits 渠道表 + beyKyi 2,012 行;缺口补采走 brand_scrape(预览→推采→摄取→入账闭环) |
 | Step 7 黑名单同步 | ✅ | 2026-08-11 生产验收:ASIN 表按标准 asin 整表重写 56,812 行 |
 
@@ -84,9 +84,9 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 ## 三、产品事件账本(catalog.product_events)
 
 - ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
-- ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`)
-- ⬜ 只有 `delete_*` 一支有消费者:`status_changed`/`match_submitted`/`list_submitted`/全部 `*_feed_failed`/`retire_feed_*` 只写不读——账本在长,读的人没跟上
-- ⬜ `product_risk` 视图只按 sku 聚合无 store 维度、单读者(list_new);`listed_times/last_removed_at/last_event_at` 三列无人读
+- ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`;接缝已在 `services/product_events.py` docstring 登记——届时补常量,休眠码不预进 EVENTS)
+- ✅ ~~只写不读~~(2026-08-11:`status_changes` / `feed_failures` 两个读侧视图平铺 jsonb,AI/人工直接 SELECT;`list/match_submitted` 计入 risk 视图 submit_times;`retire_feed_success` 属回执流水,读侧走 feed_failures 之外的 ops.feed_items,不另建)
+- ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件口径**(所有者拍板 2026-08-12):"不明原因消失"史(item_missing 且从未提交删/停 = 疑似平台下架)**只提示不拦截**——视图加 unexplained_missing 标志,list_new 放行但在摘要报警,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE 职责边界(第二节 🔴))
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
 - ✅ ~~sku≠asin~~(2026-08-11:product_events 加 asin 列,record_many 自动清洗
   + sku_normalize 存量补填;残余 numeric 1,739 个 item id 键倒查零命中,
@@ -103,6 +103,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ `catalog.products` 十列死列:audit_* 五列 + assigned_upc/listing_attrs/last_feed_id/store/owner——职责被飞书上架表、catalog.upc_pool、catalog.llm_cache 三处各自顶掉
 - ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
 - ⬜ 只写不读的列:`ops.perf_problem_orders` 14 个业务列(唯一读方只 count)、`ops.scrape_failures` 的 status/error_detail/retry_count、`catalog.snapshots.completeness_ok`、`catalog.llm_cache.hit_count/last_hit_at`(说好的低频清理器未写)
+- ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)

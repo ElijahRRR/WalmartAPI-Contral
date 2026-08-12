@@ -35,6 +35,16 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
 
 原则:只追加永不改;回执与观测分开记,互相印证;上架防呆查 product_risk 视图。
 
+读侧视图(schema.sql 定义,消费方 + 人工/AI SELECT 入口,身份键一律
+coalesce(asin, sku)):product_risk(全局风险档案,list_new 防呆)/
+product_risk_store(店铺维度:"这个产品在哪些店被删过几次")/
+status_changes(平台状态迁移与官方下架原因)/ feed_failures(五类 feed
+的逐 SKU 失败回执)。
+
+二期接缝(只登记意图,不预留事件码):入库(product_ingest 写账本)与
+审核(catalog.products 的 audit_* 五列)两类事件,等审核服务落地时再来
+此登记常量——休眠码不进 EVENTS,免得恰好吞掉一个拼错的真实码。
+
 入账边界(所有者定稿 2026-08-07):病历只记**产品生死**(删除/停用/反补)
 与观测事实。标题/价格/库存维护(含清库存)一律不进——清库存是店铺维度的
 运营操作,本系统不设店铺维度病历;此类操作的流水在 ops.feed_log/feed_items,

@@ -553,3 +553,17 @@ def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
     out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), _MULTS, [])}
     assert out == {"B0SHIP": 50.0, "B0FREE": 40.0}
+
+
+def test_match_inventory_intents_fills_zero_stock():
+    """跟卖品铺货(所有者批复 2026-08-12):唯一给 source_type='match' 行
+    补库存的路径;stockzero 店排除(解除后自动回补,修清零/回补不对称)。"""
+    conn = _Conn(rows=[("T1", "PHUMWMT001", 0), ("T2", "PHUMWMT002", None)])
+    out = mi.match_inventory_intents(conn, ["Z店"])
+    assert [(i["store"], i["sku"], i["kind"], i["new"]) for i in out] == [
+        ("T1", "PHUMWMT001", "inventory", mi.MATCH_INVENTORY_QTY),
+        ("T2", "PHUMWMT002", "inventory", mi.MATCH_INVENTORY_QTY)]
+    sql, args = conn.sqls[0]
+    assert "source_type = 'match'" in sql       # 路由铁律:只碰跟卖出身
+    assert "missing_since IS NULL" in sql       # 只补在架行
+    assert args == (["Z店"],)                   # stockzero 店整店排除

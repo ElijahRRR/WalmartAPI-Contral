@@ -1,7 +1,8 @@
 """上架数据源 provider(listing L2d;读产品中心库,不直连采集服务)。
 
 产品数据契约(provider 产出的统一形态,mapper/主链只认这个,来源无关):
-  {"asin": str, "title": str, "brand": str|None, "category": str|None,
+  {"asin": str, "title": str, "brand": str|None, "manufacturer": str|None,
+   "category": str|None,
    "price": float|None,          # amz 单价
    "shipping": float|None,       # 运费(定价输入 = 单价 + 运费;None≠0)
    "stock": int|None,            # amz 可见库存(<5 淘汰,MIN_INVENTORY)
@@ -101,8 +102,16 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         attrs = dict(slow) if isinstance(slow, dict) else _attrs(raw)
         images = (sorted(str(u) for u in (attrs.get("images") or []) if u)
                   or _images(raw) or ([image_url] if image_url else []))
+        # manufacturer 提为一等字段(所有者批复 2026-08-12):亚马逊大量商品
+        # brand=Generic 而真品牌在 manufacturer,黑名单必须两个字段都查
+        # (旧 check_brand(brand, manufacturer) 双字段实证);文案去品牌词
+        # force_amazon_copy 已经从 attrs 里取,这里是给风控闸用的
+        manufacturer = attrs.get("manufacturer")
         out[asin] = {
-            "asin": asin, "title": title, "brand": brand, "category": category,
+            "asin": asin, "title": title, "brand": brand,
+            "manufacturer": (str(manufacturer).strip() or None)
+            if manufacturer else None,
+            "category": category,
             "price": float(price) if price is not None else None,
             # 运费:定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10)。
             # None ≠ 0——None 是"这次没采到"(落地价算不出来,调用方不定价),
@@ -119,8 +128,9 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         }
     absent = [a for a in asins if a not in out]
     if absent:
-        # 列出具体 ASIN:这批就是要推给采集服务补采的清单(接线期人工推,
-        # 将来由选品/审核链保证"进上架表前必已采集")
+        # 列出具体 ASIN:这批就是要补采的清单——list_new 会把它们自动推给
+        # 采集服务(_push_scrape,所有者批复 2026-08-12 闭环接通;本积木
+        # 守漏斗铁律仍然只读,不碰采集器)
         shown = ",".join(absent[:20]) + ("…" if len(absent) > 20 else "")
         logger.info("产品中心缺 %d/%d 个 ASIN 的可用数据(本轮跳过,采集后自动"
                     "续上):%s", len(absent), len(asins), shown)

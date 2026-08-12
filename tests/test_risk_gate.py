@@ -117,3 +117,14 @@ def test_risk_sync_workflow(monkeypatch):
     assert "类目表:读 1 行,入库 1" in out
     assert "品牌表:读 1 行,入库 1" in out
     assert "禁售类目 1 个,黑名单品牌 1 个" in out
+
+
+def test_check_brand_and_manufacturer(monkeypatch):
+    """黑名单双字段查(所有者批复 2026-08-12):brand=Generic 真品牌在
+    manufacturer 是亚马逊常态,只查 brand 必漏。"""
+    gate = {"banned_pts": set(), "brands": {"acme"}}
+    assert risk_gate.check(gate, None, "Acme", None) == "黑名单品牌:Acme"
+    assert risk_gate.check(gate, None, "Generic", "ACME") \
+        == "黑名单制造商:ACME"
+    assert risk_gate.check(gate, None, "Generic", "Other") is None
+    assert risk_gate.check(gate, None, None, None) is None

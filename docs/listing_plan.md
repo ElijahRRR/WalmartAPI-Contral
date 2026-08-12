@@ -175,6 +175,20 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
   其余都在 attrs 里;attrs.weight 形态需生产核实(否则 ShippingWeight 全量
   兜底 1.0 磅)。
 
+#### 续迁批次一实施状态(2026-08-12,所有者六点批复当日落地)
+
+- [x] K=Unknown 自愈:`listing_sheet.heal_unknown`(feed_poll 第五反哺器;
+      feed 台账终态双向收尾 + 目录在线判定;"查无"永不负向写;UPC 随判定
+      标已用/回收;SKU_LOCKED 移交自愈链)
+- [x] 跟卖库存:`maintenance_intents.match_inventory_intents`(唯一路径,
+      默认铺 10;stockzero 解除自动回补)
+- [x] 配额切片后置(淘汰放切片前,配额以成功提交为准)
+- [x] 缺数据自动推采集(`list_new._push_scrape`,日界批次名防重)
+- [x] manufacturer 提顶层 + risk_gate 双字段
+- [x] 闸门前淘汰计次:**否决不做**(所有者:数据每轮会变,不该永久淘汰;
+      贵步骤已在切片后,无浪费)
+- 批复原文与实现细节:docs/backlog.md 第八节
+
 #### 已知未做(续做时的清单)
 
 - 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)

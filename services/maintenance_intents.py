@@ -27,6 +27,7 @@ delete 是唯一的**不可逆**类(采集永久偏移 / 商品不存在),由 de
 """
 
 import logging
+import os
 
 from services import mp_mapper, pricing
 
@@ -248,6 +249,45 @@ def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
         rows = cur.fetchall()
     return [{"store": s, "sku": k, "kind": "inventory", "old": q, "new": 0}
             for s, k, q in rows]
+
+
+# 跟卖品铺货量:跟卖无 amz 侧库存可跟,固定保守值(与 AMZ_IN_STOCK_QTY
+# 同源口径,所有者拍板 2026-08-12 终值 10)
+MATCH_INVENTORY_QTY = int(os.environ.get("MATCH_INVENTORY_QTY", "10"))
+
+# 跟卖品在架且库存为 0/未知 → 铺货。不要求 published_status='PUBLISHED':
+# 0 库存本身就可能导致 UNPUBLISHED(reason=Inventory),要求已发布会死锁
+# (没库存→不发布→不给库存)。RETIRED/ARCHIVED 不碰。
+_SQL_MATCH_INV = """
+SELECT w.store, w.sku, w.avail_qty
+FROM catalog.walmart_items w
+JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'match'
+WHERE w.missing_since IS NULL
+  AND coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'
+  AND coalesce(w.avail_qty, 0) = 0
+  AND NOT (w.store = ANY(%s))
+"""
+
+
+def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
+                            ) -> list[dict]:
+    """输入:连接 + stockzero 名单 → 输出:跟卖品铺货意图(0/未知 → 保守值)。
+
+    补结构洞(所有者批复 2026-08-12):跟卖 offer 建成即 0 库存不可售,
+    而 amz 驱动的 inventory_intents 按路由铁律永远排除 source_type='match'
+    ——旧系统同病(inventory_push 因 --no-poll 从未真跑)。本 provider 是
+    跟卖库存的**唯一**实现路径:新 offer 进目录(catalog_sync)后自动铺货,
+    stockzero 店解除后也自动回补(修清零/回补不对称)。
+    ⚠ 手动把个别跟卖品清零会被本 provider 回填——单品停售走停用/删除流程,
+    整店停售走 stockzero,清零不是停售手段。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_MATCH_INV, (list(stockzero_stores or []),))
+        rows = cur.fetchall()
+    return _cap([{"store": s, "sku": k, "kind": "inventory",
+                  "old": q, "new": MATCH_INVENTORY_QTY}
+                 for s, k, q in rows], "inventory")
 
 
 def price_intents(conn, multipliers: dict[str, dict],

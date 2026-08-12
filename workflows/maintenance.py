@@ -34,6 +34,11 @@
          (同日从旧值 12 收紧,与 list_new 共用 amz_source.MAX_LEAD_DAYS)
   改标题 amz 标题过与上架同一套文案处理(去品牌/截 199)vs 沃尔玛现标题;
          占位符跳过、productType/UPC/标题三缺一跳过(旧防线)
+  跟卖铺货 source_type='match' 且在架且库存 0/未知 → 补到保守值
+         (MATCH_INVENTORY_QTY=10;所有者批复 2026-08-12)。跟卖 offer
+         建成即 0 库存,amz 三 provider 按路由铁律永远不碰它——这是跟卖
+         库存的**唯一**路径;stockzero 店排除,解除后自动回补(修
+         清零/回补不对称)。⚠ 单品停售走停用/删除,手动清零会被回填
   **重复提交抑制**(2026-08-09 生产实证 208 条 ERR_EXT_DATA_0101198
   "stale update request"):provider 比的是 amz 值 vs walmart_items 的**上次
   扫店快照**,提交成功后本地快照要等 catalog_sync 再扫才更新——不压就会一轮轮
@@ -166,6 +171,9 @@ def collect_intents(conn, stockzero: list[str],
     for it in (mi.title_intents(conn, stockzero)
                + mi.price_intents(conn, mults, stockzero)
                + mi.inventory_intents(conn, stockzero)
+               # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
+               # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责
+               + mi.match_inventory_intents(conn, stockzero)
                + mi.zero_intents(conn, stockzero)):
         # 将被删除的行不再改价/改库存/改标题:它们的 amz 数据本来就是陈旧的
         # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上

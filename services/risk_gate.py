@@ -86,12 +86,19 @@ def load_gate(conn) -> dict:
     return {"banned_pts": banned, "brands": brands}
 
 
-def check(gate: dict, product_type: str | None, brand: str | None) -> str | None:
-    """输入:闸门数据 + 类目 + 品牌 → 输出:拦截原因(None=放行)。"""
+def check(gate: dict, product_type: str | None, brand: str | None,
+          manufacturer: str | None = None) -> str | None:
+    """输入:闸门数据 + 类目 + 品牌(+制造商)→ 输出:拦截原因(None=放行)。
+
+    品牌与制造商**两个字段都查**(旧 check_brand 双字段实证,所有者批复
+    2026-08-12):亚马逊大量商品 brand=Generic/空,真品牌在 manufacturer,
+    只查 brand 黑名单必漏。
+    """
     pt = (product_type or "").strip()
     if pt and pt in gate["banned_pts"]:
         return f"禁售类目:{pt}"
-    b = (brand or "").strip()
-    if b and b.casefold() in gate["brands"]:
-        return f"黑名单品牌:{b}"
+    for label, v in (("黑名单品牌", brand), ("黑名单制造商", manufacturer)):
+        b = (v or "").strip()
+        if b and b.casefold() in gate["brands"]:
+            return f"{label}:{b}"
     return None

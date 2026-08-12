@@ -154,13 +154,13 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 八、上架续迁缺口(2026-08-12 旧仓 erpAPI 全量对照,三路并行调研,证据在 listing_plan.md 续迁节)
 
-**P0 — 真实业务缺口(不补有损失)**
-- ⬜ **K=Unknown 自愈**:list_new 持续制造 Unknown 行且一律跳过,没人把"目录已在线"的行改回 Yes——Unknown 永久卡死 + UPC 永久占用。旧 sync_status_track 承担;新版数据源直接用 catalog.walmart_items。**必须连带**:三层 NOT_FOUND 防护(数据源空硬中止/单店>80% 熔断/上架<48h 审核窗豁免——2026-06-09 全表误写事故产物)+ 自愈伪 feedId 不得被 sync_from_ledger 拿去查 feed(旧 healed: 前缀契约)
-- ⬜ **跟卖库存无人负责**(旧系统同病,新系统结构性固化):match offer 建成即 0 库存;maintenance 库存意图硬条件 source_type='amz' 永远排除跟卖品。旧 inventory_push.py 因 --no-poll 从未真跑(死代码);新系统 feed_poll 恰好具备"PROCESSED 后推库存"的条件。**连带**:stockzero 清零 _SQL_ZERO 无 source_type 过滤——跟卖品会被清零却永远补不回(不对称)
-- ⬜ **闸门前淘汰行不计次数**:旧 retry_state 8 类失败各自阈值、达标写 E=fail 永久淘汰;新 _retry_rows 只管 O=FAILED——库存低/PT 无 spec/定价出界的行每轮全量重跑,白烧 LLM 与飞书读
-- ⬜ **数据源缺失不自动推采集**:旧 DMIT_NOT_FOUND 第 1 次即 submit_scrape_task;新 amz_source 只打日志"接线期人工推",闭环断
-- ⬜ **配额"增量补齐"语义**:旧=过滤通过数累到配额才停(一批取剩余×2);新=先切 srows[:allow] 再过滤,被淘汰行白占名额——淘汰率 40% 时实际上架量只有配额 60%
-- ⬜ **manufacturer 双字段风控**:旧黑名单查 brand+manufacturer 两字段、去品牌词两个都洗;新只查 brand(Amazon 大量 brand=Generic 而 manufacturer 是真品牌)——黑名单漏网。需采集契约把 manufacturer 提到顶层
+**P0 — 真实业务缺口(所有者批复 2026-08-12,同日实现)**
+- ✅ **K=Unknown 自愈**(批复:接受,判据加 feed 轮询结果与产品事件时间线):`listing_sheet.heal_unknown` 反哺器(feed_poll 挂载)——源① ops.feed_items 按 (店铺,SKU) 反查 MP_ITEM 最新终态:success/审核中→K=Yes+L=feedid+O/P/Q 回填,UPC 标已用;failed→K=No+O=FAILED 进限次重试通道,UPC 回收;SKU_LOCKED→只落 O 移交自愈链;源② catalog.walmart_items 在架→K=Yes(L 保持原样,**不造伪 feedId**,旧 healed: 前缀契约整个消掉)。三层防护按新形态映射:目录读空→源② 本轮停用;**"查无"永不负向写**(K=No 只来自 feed 终态)——旧 80% 熔断与 48h 豁免所防的负向误写路径在新形态下不存在
+- ✅ **跟卖库存**(批复:同意):`maintenance_intents.match_inventory_intents`——source_type='match' 在架且库存 0/未知 → 补到 MATCH_INVENTORY_QTY(默认 10)。走 maintenance 唯一库存写路径(不在 feed_poll 推:反哺器"只读沃尔玛"契约不破);stockzero 店排除,解除后自动回补=清零/回补不对称一并修掉。⚠ 手动清零单个跟卖品会被回填,单品停售走停用/删除
+- ❌ **闸门前淘汰计次**(批复:**否决**——每次都有新价格/库存数据,这次不在下次就可能在;怕烧 LLM 把便宜过滤放前面即可)。现行顺序已满足:全部闸门与数据过滤在前,LLM/领 UPC 只对配额切片后的幸存行执行
+- ✅ **缺数据自动推采集**(批复:接上闭环):`list_new._push_scrape`——数据源缺席 ASIN 推采集批次 `listing_gap_<北京日>`,撞名(BatchExistsError)=当天已推不重推,增量次日随新批次;dry-run 只报数不推;推送失败不阻塞上架
+- ✅ **配额切片后置**(批复:配额以成功提交为准,淘汰放切片前):list_new 重排——先过全部闸门+数据过滤+定价,幸存者按店切配额;超额行不写终态,次日配额刷新自动续上
+- ✅ **manufacturer 双字段风控**(批复:接受):amz_source 契约顶层加 manufacturer(取 slow 段);risk_gate.check 增第四参,品牌+制造商都查(文案去品牌词 force_amazon_copy 早已两字段都洗,无需改)
 
 **P1 — 回归/契约类**
 - ⬜ 跟卖:重量留空旧默认 1 磅不淘汰,新直接淘汰且"数据无效"行卡死(不在终态清单也不再入 todo);"预检失败"(网络抖动)被当终态,旧系统天然重试

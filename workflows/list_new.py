@@ -19,10 +19,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     北京日界)
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ product_risk 防呆(有删除史/删除未生效史即拦;
-    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截——所有者口径
-    2026-08-12,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE
-    职责边界拍板)
+    cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist 永久禁止
+    六类 + 黑名单品牌,见③)。**防呆=黑名单,不看删除史**(所有者口径
+    2026-08-12:拦"出现过侵权/审查等拉黑类别"的,不拦"因产品问题删过"
+    的——可修复类删除后重上是正常经营,曾按删除史一刀切拦过,当日拆除);
+    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
   ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
     数据恢复自动续上)
   ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
@@ -43,9 +44,9 @@ from datetime import datetime
 
 from api import feeds, feishu, llm, settings as settings_api
 from registry import db, resources
-from services import amz_source, kpi, listing_sheet, listing_sources, \
-    llm_cache, mp_conform, mp_mapper, pricing, product_events, pt_spec, \
-    risk_gate, stores as stores_svc, upc_pool
+from services import amz_source, blacklist, kpi, listing_sheet, \
+    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
+    product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -65,31 +66,9 @@ GROUP BY store
 _SQL_LISTED_ASINS = """
 SELECT DISTINCT sku FROM catalog.walmart_items WHERE missing_since IS NULL
 """
-_SQL_RISKY = """
-SELECT asin, delete_times, delete_not_effective_times, listed_times,
-       last_removed_at
-FROM catalog.product_risk
-WHERE delete_times > 0 OR delete_not_effective_times > 0
-"""
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
 """
-
-
-def _risk_reason(deletes: int, not_effective: int, listed: int,
-                 last_removed) -> str:
-    """输入:product_risk 一行的计数与最近移除时间 → 输出:N 列防呆理由。
-
-    此前只写"有删除史"四个字,人工复核还得手查账本;计数和时间本来就在
-    视图里,直接带出来当证据。"""
-    bits = [f"提交删除{deletes}次"]
-    if not_effective:
-        bits.append(f"删除未生效{not_effective}次")
-    if listed:
-        bits.append(f"历史上架{listed}次")
-    if last_removed:
-        bits.append(f"最近移除{last_removed:%Y-%m-%d}")
-    return f"防呆:该ASIN有删除史({','.join(bits)})"
 
 
 def _load_gate_state():
@@ -101,14 +80,11 @@ def _load_gate_state():
         today_used = {s: int(n) for s, n in cur.fetchall()}
         cur.execute(_SQL_LISTED_ASINS)
         listed = {r[0] for r in cur.fetchall()}
-        cur.execute(_SQL_RISKY)
-        # 键是 coalesce(asin, sku)——视图身份键 2026-08-11 从订货号原文改成
-        # 产品码,否则三段式 sku 名下的删除史拦不住同 ASIN 换号重上
-        risky = {r[0]: r[1:] for r in cur.fetchall()}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
+        banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
-    return inactive, today_used, listed, risky, unexplained, gate
+    return inactive, today_used, listed, banned, unexplained, gate
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -261,13 +237,14 @@ def run(params: dict) -> str:
     if not pending:
         return "\n".join(lines)
 
-    inactive, today_used, listed, risky, unexplained, gate = _load_gate_state()
+    inactive, today_used, listed, banned, unexplained, gate = \
+        _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
-         "guard": 0, "no_data": 0, "filtered": 0, "no_upc": 0,
-         "stock_assumed": 0, "invalid": 0}
+         "blacklist": 0, "no_data": 0, "filtered": 0,
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
@@ -301,10 +278,14 @@ def run(params: dict) -> str:
                 n["dedup"] += 1
                 reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
                 continue
-            risk = risky.get(r["asin"])
-            if risk:
-                n["guard"] += 1
-                reasons.append((r["rownum"], _risk_reason(*risk)))
+            bl = banned.get(r["asin"])
+            if bl:
+                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
+                # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
+                # 2026-08-12:因产品问题删过的修好重上是正常经营)
+                n["blacklist"] += 1
+                reasons.append((r["rownum"],
+                                f"ASIN黑名单:{bl[1]}({bl[0]}类)"))
                 continue
             if r["asin"] in unexplained:
                 # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
@@ -375,7 +356,7 @@ def run(params: dict) -> str:
 
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
-                 f"去重 {n['dedup']},防呆 {n['guard']},"
+                 f"去重 {n['dedup']},黑名单 {n['blacklist']},"
                  f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)

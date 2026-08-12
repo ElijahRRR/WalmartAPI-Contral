@@ -257,7 +257,8 @@ def search_walmart_spec(store: dict, *, upc: str | None = None,
     返回:
       {"feed_type": "MP_ITEM_MATCH"(已在售可跟卖) | "MP_ITEM"(未在售需完整建品) | None(目录无),
        "product_id": 规范化 GTIN/UPC 或 None, "product_id_type": ..., "product_type": ...,
-       "title": ..., "asin": 交叉出的 ASIN 或 None, "raw": 原始 item 或 None}
+       "title": ..., "brand": SPEC 模板里的品牌或 None(风控闸用),
+       "asin": 交叉出的 ASIN 或 None, "raw": 原始 item 或 None}
     硬约束(实测):SPEC 不能带 query 参数;asin 参数仅 SPEC 格式支持。
     """
     if sum(v is not None for v in (upc, gtin, asin)) != 1:
@@ -282,7 +283,8 @@ def search_walmart_spec(store: dict, *, upc: str | None = None,
     items = (data or {}).get("items") or []
     if not items:
         return {"feed_type": None, "product_id": None, "product_id_type": None,
-                "product_type": None, "title": None, "asin": None, "raw": None}
+                "product_type": None, "title": None, "brand": None,
+                "asin": None, "raw": None}
     item = items[0]
     feed_type = item.get("feedType")
     mp0 = ((item.get("itemSpecPayload") or {}).get("MPItem") or [{}])[0]
@@ -293,14 +295,15 @@ def search_walmart_spec(store: dict, *, upc: str | None = None,
     for ext in item.get("externalProductIdentifier") or []:
         if ext.get("externalProductIdType") == "ASIN":
             ext_asin = ext.get("externalProductId")
-    title = None
+    title = brand = None
     for pt_attrs in (mp0.get("Visible") or {}).values():
         title = pt_attrs.get("productName") or title
+        brand = pt_attrs.get("brand") or brand
     return {"feed_type": feed_type,
             "product_id": ids.get("productId"),
             "product_id_type": ids.get("productIdType"),
             "product_type": item.get("productType") or item.get("specProductType"),
-            "title": title, "asin": ext_asin, "raw": item}
+            "title": title, "brand": brand, "asin": ext_asin, "raw": item}
 
 
 def catalog_search(store: dict, field: str, value: str) -> list[dict]:

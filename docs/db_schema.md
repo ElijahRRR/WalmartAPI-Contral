@@ -43,13 +43,9 @@ CREATE TABLE catalog.products (
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     audited_at      timestamptz,
     audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
-    -- 复用资产(上架过程中生成,避免重复劳动/重复消耗)
-    assigned_upc    text,
-    listing_attrs   jsonb,       -- LLM 映射过的属性,按 PT 版本缓存
-    last_feed_id    text,
-    -- 归属
-    store           text,
-    owner           text,
+    -- (原"复用资产/归属"五列 assigned_upc/listing_attrs/last_feed_id/store/owner
+    --  已于 2026-08-12 退役:零读写,职责被 catalog.upc_pool / catalog.llm_cache /
+    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留 = 二期审核服务接缝)
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (marketplace, asin)
@@ -126,8 +122,9 @@ CREATE TABLE catalog.walmart_items (
 ```
 
 "整表重写"语义的 PG 等价:每轮扫完 upsert 所见行(清 missing_since),
-再把本轮未见的行标 missing_since 并清空两个状态列(不删除,保历史;
-连续缺席多久后清理另议)。飞书「在线产品总表」投影只写在架行
+再把本轮未见的行标 missing_since 并清空两个状态列(**不删除,永不清理**
+——所有者拍板 2026-08-12;技术上事件在 product_events 独立账本、删主表行
+不丢病历,但拍板保守留行,13 万行 PG 无压力)。飞书「在线产品总表」投影只写在架行
 (missing_since IS NULL),缺席商品不进表;last_seen_at/missing_since
 两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
 
@@ -202,10 +199,10 @@ CREATE TABLE catalog.product_events (
 -- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
 -- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
 --   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
---                       最近移除时间)——list_new 防呆消费,拦截条件只看
---                       delete_times / delete_not_effective_times;
---                       unexplained_missing(消失过且从未提交删/停 = 疑似
---                       平台下架)只提示不拦截(所有者口径 2026-08-12)
+--                       最近移除时间)——**只是查询档案,不是拦截条件**
+--                       (所有者口径 2026-08-12:防呆=黑名单,按拉黑类别拦,
+--                       不按删除史拦);list_new 仅消费 unexplained_missing
+--                       (消失过且从未提交删/停=疑似平台下架)做报警,不拦截
 --   product_risk_store  同口径按 (asin, store) 聚合:"这个产品在哪些店被删过
 --                       几次";store 为空的事件只出现在全局视图
 --   status_changes      status_changed 平铺(old/new/官方 reasons)——查"谁被
@@ -234,29 +231,10 @@ CREATE TABLE listing.retire_cooldown (  -- SKU_LOCKED 自愈链状态(sku_locked
 -- 链路(旧实证:SKU 绑死旧 UPC,不先退役换 UPC 重发也失败):
 -- RETIRE_ITEM → 24h 冷却 → 回执成功才清列(K~M/O~Q)→ list_new 领新 UPC 重上
 
-CREATE TABLE listing.tasks (        -- 上架任务(来自飞书登记表,同步进来)
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    asin        text NOT NULL,
-    store       text NOT NULL,
-    status      text NOT NULL,      -- 生命周期状态机,沿用旧 auto_listing 的 9 状态语义
-    sku         text,
-    upc         text,
-    feed_id     text,
-    error       text,
-    owner       text,
-    feishu_record_id text,          -- 回写飞书用
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (asin, store)
-);
-
-CREATE TABLE listing.upc_pool (     -- UPC 池:领取即永不释放(旧系统语义,必须保留)
-    upc         text PRIMARY KEY,
-    status      text NOT NULL,      -- available / claimed / used
-    claimed_by  text,               -- store or task ref
-    claimed_at  timestamptz,
-    created_at  timestamptz NOT NULL DEFAULT now()
-);
+-- (listing.tasks 与 listing.upc_pool 已于 2026-08-12 退役删除:全仓零代码
+--  引用——上架状态权威 = 飞书上架表 + catalog.upc_pool + retire_cooldown,
+--  从未经过 listing.tasks;在用的 UPC 池是 catalog.upc_pool,两者状态机定义
+--  冲突;UPC 历史池已拍板不迁,有用号所有者手动写入 catalog.upc_pool)
 ```
 
 ## orders — 订单域(行级统一建模,2026-08-06 定稿)
@@ -340,9 +318,9 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 视图:
 - `orders.settlement_by_line` — 跨账期合并 + 入账状态推导(net>0 已入账 / net<0 已冲销 / net=0 且 gross>0 已退款 / 其余待入账;金额 round6 吸收浮点相消误差——实证 +52.68-52.68 = 4.44e-16 会误判);
-- `orders.order_center` — 订单中心主视图:销售行 LEFT JOIN 售后聚合/绩效指标聚合/入账状态(采购信息是人工域,留在飞书 bitable,不进 PG)。
+- ~~`orders.order_center` 主视图~~(2026-08-12 退役删除:order_center_push 直连三张明细表与两个在用视图,主视图零读者)。
 
-完整列清单见 `refdata/schema.sql`。旧 po 级表 `orders.orders`(空表)保留待确认后删除,新代码禁止写入。
+完整列清单见 `refdata/schema.sql`。旧 po 级表 `orders.orders` 已于 2026-08-12 退役(schema.sql 的退役清理节:确认为空表才 DROP,防手滑)。
 
 ## ops — 运行域(状态与业务同库,可同事务修改)
 
@@ -411,12 +389,41 @@ CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧�
 -- 0 行落库,只看 settlement_lines DISTINCT period 会把它当缺失账期无限重拉
 
 -- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
+CREATE TABLE ops.rate_events (           -- 跨进程限速事件(api/_client 稀缺桶)
+    client_id  text NOT NULL,            -- 店铺维度
+    bucket     text NOT NULL,            -- 桶名(唯一出处 _client._RATE_BUCKETS)
+    called_at  timestamptz NOT NULL DEFAULT now()
+);  -- 判据 window≥600s 或 limit≤10 的桶才落库(feeds.post.*/prices.put/
+    -- reports.request/insights/SPEC 日额度);插入顺手清 2 天前旧行;
+    -- PG 不可达稀缺桶 fail hard(所有者拍板 2026-08-12,写操作永不自动兜底)
+
 CREATE TABLE ops.store_kpi_daily (
-    store text, data_date date, PRIMARY KEY (store, data_date),
-    -- 身份/状态:seller_name+sales_status 来自影刀(空值不覆盖旧值,COALESCE);
-    -- 商品三列读 catalog.walmart_items(PG 复用,不调 API);
-    -- 绩效 8 率 / 结算字段 / 24h 订单窗口(中国时间 06:30 锚)/ prev_payout(-14 天规则)
-    ...  -- 完整 32 列见 refdata/schema.sql
+    store            text NOT NULL,
+    data_date        date NOT NULL,
+    seller_name      text,           -- 影刀前台抓取(可 stale 补);无则空
+    partner_id       text,
+    seller_id        text,
+    store_status     text,
+    payment_status   text,
+    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)
+    items_online     integer,        -- 来自 catalog.walmart_items(PG 复用,不再调 API)
+    items_in_stock   integer,
+    items_out_stock  integer,
+    orders_count     integer,        -- 24h 窗口(中国时间 06:30 锚)
+    sales_amount     numeric,
+    otd_rate         numeric, cancel_rate numeric, vtr_rate numeric,
+    srr_rate         numeric, refund_rate numeric, negative_rate numeric,
+    return_rate      numeric, inr_rate numeric,
+    period_sales     numeric, commission numeric, refund_amount numeric,
+    closing_balance  numeric, reserve_to_date numeric,
+    payout           numeric,        -- 非 ACTIVE 强制 0;负归 0(业务规则)
+    payout_date      text,
+    payment_processor text, settle_cycle text,
+    no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
+    prev_payout      numeric,        -- 严格 -14 天账期,无则 0(业务规则)
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, data_date)
 );
 
 CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不被覆盖

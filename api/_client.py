@@ -202,17 +202,82 @@ _rate_state: dict = {}   # (client_id, bucket) → deque[单调时间戳]
 _rate_lock = threading.Lock()
 
 
+def _is_persistent(bucket: str) -> bool:
+    """输入:bucket 名 → 输出:是否"稀缺桶"(限速状态落 PG 跨进程共享)。
+
+    判据(2026-08-12 定稿):窗口 ≥ 600s 或上限 ≤ 10。命中的是全部
+    feeds.post.*、prices.put、reports.request、insights 全家、SPEC 日额度
+    ——它们是小时/天级窗口或个位数配额,进程内计数在"多 workflow 并发 +
+    进程退出即失忆"下形同虚设(cli 的 flock 只锁同名 workflow,不同
+    workflow 是不同进程;DELETE_ITEM 就有三个提交来源)。高频大配额桶
+    (orders/feeds.get 3000/min 等)留在进程内:每次调用打一趟 PG 既慢
+    又没必要,分钟级窗口自然重置,429 退避兜得住。
+    """
+    limit, window = _RATE_BUCKETS[bucket]
+    return window >= 600.0 or limit <= 10
+
+
+_PG_COUNT_SQL = """
+SELECT count(*), min(called_at), now()
+FROM ops.rate_events
+WHERE client_id = %s AND bucket = %s
+  AND called_at > now() - make_interval(secs => %s)
+"""
+
+
+def _acquire_pg(bucket: str, client_id: str, limit: int, window: float) -> float:
+    """稀缺桶的跨进程滑动窗口:事件表 ops.rate_events + advisory 事务锁。
+
+    时间一律用 PG 的 now()(单一时钟源;monotonic 跨进程无意义)。
+    锁在事务结束(with 退出)即释放,睡眠在事务外,不会拿着锁睡。
+    ⚠ PG 不可达时**直接抛错停手,不降级进程内**(所有者拍板 2026-08-12):
+    稀缺桶全是写操作/低配额端点,限速器坏了就不该继续提交——静默降级
+    等于旧 RETIRE_ITEM 零限速事故换个马甲(写操作永不自动兜底)。
+    """
+    from registry import db
+
+    waited = 0.0
+    while True:
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            # 同 (店铺,桶) 跨进程互斥:计数与占位在同一事务里原子完成
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (f"{client_id}|{bucket}",))
+            cur.execute(_PG_COUNT_SQL, (client_id, bucket, window))
+            n, oldest, db_now = cur.fetchone()
+            if n < limit:
+                cur.execute("INSERT INTO ops.rate_events (client_id, bucket) "
+                            "VALUES (%s, %s)", (client_id, bucket))
+                # 顺手清两天前的旧事件:稀缺桶一天几千行,不需要独立清理器
+                cur.execute("DELETE FROM ops.rate_events "
+                            "WHERE called_at < now() - interval '2 days'")
+                return waited
+            sleep_for = max(window - (db_now - oldest).total_seconds() + 0.05,
+                            0.05)
+        logger.log(logging.INFO if sleep_for >= 1.0 else logging.DEBUG,
+                   "限速桶 %s(店铺 %s)已满(跨进程计数),等待 %.1fs",
+                   bucket, client_id[:8], sleep_for)
+        time.sleep(sleep_for)
+        waited += sleep_for
+
+
 def rate_acquire(bucket: str, client_id: str) -> float:
     """输入:bucket 名 + 店铺 client_id → 输出:本次实际等待秒数(限流按店铺维度)。
 
     滑动窗口计数;窗口满时阻塞睡到最早一次调用滑出窗口。
     bucket 未登记直接抛 KeyError(默认拒绝,不放行)。
+    稀缺桶(_is_persistent)状态落 PG 跨进程共享,其余进程内。
     """
-    from collections import deque
-
     if bucket not in _RATE_BUCKETS:
         raise KeyError(f"限速桶未登记: {bucket}(先在 api/_client._RATE_BUCKETS 按蓝图定稿登记)")
     limit, window = _RATE_BUCKETS[bucket]
+    if _is_persistent(bucket):
+        return _acquire_pg(bucket, client_id, limit, window)
+    return _acquire_mem(bucket, client_id, limit, window)
+
+
+def _acquire_mem(bucket: str, client_id: str, limit: int, window: float) -> float:
+    from collections import deque
+
     waited = 0.0
     while True:
         with _rate_lock:

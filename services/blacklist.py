@@ -168,6 +168,22 @@ def collect_brands(conn, items: list[dict]) -> dict:
     return stats
 
 
+# ── 上架拦截消费方(2026-08-12 接入:黑名单建好不接消费方 = 白建)─────────────
+
+_GATE_ASINS_SQL = "SELECT asin, category, source FROM catalog.asin_blacklist"
+
+
+def load_banned_asins(conn) -> dict:
+    """输入:连接 → 输出:{asin: (category, source)}。
+
+    list_new / match_listing 上架前逐行查的拦截集合(每轮加载一次,
+    逐行零查询——与 risk_gate.load_gate 同款用法)。键是清洗后的标准
+    asin(重灌后个别 numeric 键是订货号原文兜底,拦不着也不误拦)。"""
+    with conn.cursor() as cur:
+        cur.execute(_GATE_ASINS_SQL)
+        return {a: (c, s) for a, c, s in cur.fetchall()}
+
+
 # ── 历史回填(blacklist_push -p backfill=1 / rebuild_brand=1 用,一次性)────────
 #
 # 从 product_events 的归类时间线按「每个 ASIN 的**最新**类别」推导入选——

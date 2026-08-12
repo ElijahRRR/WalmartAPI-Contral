@@ -17,10 +17,10 @@
 | ✅ | ~~清理→品牌黑名单自产回路~~(2026-08-11 生产验收:渠道独立表 brand_err_hits(不与总清单去重,修掉"总表已有品牌进不了渠道"的建模缺陷)→ beyKyi 整表重写 2,012 行(总表认领 2,011 + 时间线推导 1);缺品牌候选走 brand_scrape 推采集闭环(非标准过滤 + 尝试台账防循环);实时链路 cleanup 尾段双落库:渠道表 + 否决闸) | `services/blacklist.py` / `workflows/brand_scrape.py` |
 | ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;risk_sync 现把 D 列 ASIN 镜像进 src_sku,空不覆盖) | — |
 | ✅ | ~~ASIN 黑名单~~(2026-08-11 PG 侧+投影生产验收:按标准 asin 重灌 56,812 行;numeric 1,739 键原文兜底。**2026-08-12 上架拦截消费方接通**:blacklist.load_banned_asins → list_new 闸门链(去重后、防呆前)+ match_listing 三道闸,N/F 列写来源与类别) | `services/blacklist.py` |
-| 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合(随预警批次) | `services/blacklist.py:45` |
+| 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合——**后置**(所有者 2026-08-12:等给出具体数据再考虑处理) | `services/blacklist.py:45` |
 | 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
 | ✅ | ~~match_listing 不过风控闸与防呆~~(2026-08-12 接通三道闸:SPEC 交叉字段过 risk_gate(PT/品牌)+ asin_blacklist(交叉 ASIN)+ product_risk 防呆(交叉 ASIN 删除史 / 同 GTIN 旧跟卖 offer 删除史,后者经 listing_sources 把 GTIN→历史 sku→病历接回);交叉不出的字段跳过该道闸;命中写 F 终态,清 F 重排队) | `workflows/match_listing.py:_gate_reason` |
-| ⬜ | UPC `gs1_restricted_prefix` **6,665 条**历史黑名单未导入(upc_generator 定稿不迁,但这批黑名单号的处置没有交代) | `docs/legacy_survey.md:998,1026,2251` |
+| ✅ | ~~UPC `gs1_restricted_prefix` 6,665 条历史黑名单~~(所有者拍板 2026-08-12:**不需要管**,不导入) | — |
 | 🔴 | PT 5 维度风险表 / 禁售政策知识库 / TRO·商标黑名单 / 新审核系统三表(~25k 行):跨仓,迁移边界未定 | `docs/legacy_survey.md:2000-2001,1806,1915,1954,1963` |
 | ⬜ | "飞书表停用后的接班者"——产品中心黑名单增量脚本,四处文档承诺零代码 | `services/risk_gate.py:9` / `workflows/risk_sync.py:11` / `docs/listing_plan.md:80-82` / `refdata/schema.sql:225-227` |
 
@@ -78,7 +78,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 待确认:
 - ✅ ~~DELETE 防重口径~~(2026-08-11 拍板:滚动 48h 仅限无终态,有终态又扫到直接重发——见「已拍板」第 6 条;cleanup 完善时落实)
-- 🔴 存量 feedId 是否做一次历史回查(`legacy_survey.md:1476`)
+- ✅ ~~存量 feedId 历史回查~~(所有者拍板 2026-08-12:**不做**——feed 要完全有结果后才算完成,三态防重已覆盖,无需回查)
 - 🔴 RETIRE_ITEM 与常规 DELETE 的职责边界(旧系统只在合规路径调 RETIRE,刻意还是遗漏?`legacy_survey.md:1475`)
 
 ## 三、产品事件账本(catalog.product_events)
@@ -113,12 +113,15 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 6. `outcome=not_found` 是否比照 error_type 终局直接建议拒绝(order_audit,2026-08-10 提出)
 7. TRO/商标/新审核系统三条跨仓黑名单链的边界
 8. 退款能力(POST /returns/{id}/refund)纳入还是显式排除(`legacy_survey.md:608`)
-9. **密钥轮换**:旧仓库 git 历史至今明文(48 ClientSecret + socks5 密码),无人认领(`legacy_survey.md:122,2198`;`legacy_reference.md:84-85`)
+9. ✅ ~~密钥轮换~~(所有者拍板 2026-08-12:**忽略**,不处理)
 10. KPI 32 列表头里 8 个阈值要不要做成真告警(`legacy_survey.md:751`);日报单人 open_id 要不要改群发(`:754`)
 11. 飞书「AK 图片单元格」历史截图迁移还是清空重采(`legacy_survey.md:889`)
 12. `walmart_items.missing_since` 连续缺席多久后清理(`docs/db_schema.md:130`,表单调增长)
 
 ## 六、配置与安全(便宜,但都在裸奔)
+
+> **整节后置**(所有者拍板 2026-08-12):生产运维动作(盘旧调度/备份/配 env/挂调度)
+> 全部等迁移完成——功能做完、数据库到位、飞书表对接无缺失后再考虑。本节只留账不动工。
 
 | 状态 | 项 | 后果 |
 |---|---|---|
@@ -132,14 +135,22 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 七、就绪未验收 / 调度 / 切换(概览,细节在 plan.md 各行)
 
-- 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍、daily_report 双算对拍收口
+> 调度/切换整体后置(见第六节批注)。验收进行中:**所有者 2026-08-12 起每日实测
+> 在线产品拉取(catalog_sync)、几种订单拉取、日报拉取**。
+
+- 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
 - **涨跌幅闸**(maintenance.py:47,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议
 - 挂调度:全部工作流一条没挂;顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance`;feed_poll 高频
 - 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)
 - 采集侧一周连续验收(scraper_migration_brief.md:245)未开始;两侧契约副本的定期对账机制未建(:113-116)
 - 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),届时复查(maintenance.py:24)
-- Phase 1:令牌桶(plan.md:73,**并发调度前必须补**——旧 RETIRE_ITEM 事故根因)、async 订单拉取、feeds errorReport 随 listing
-- 历史数据迁移总批次(plan.md:134):上架表 26 列、UPC 池 12 万行、pending_feeds 收干净、retry_state 永久淘汰名单(丢了会重拉几万个已死 ASIN)、maintenance.db(落点需重定——legacy_reference.md:73 写 listing schema,实际流水在 ops.feed_*)、walmart_settlement.db(落点名已过时)、settlement_snapshots 历史是否全迁待确认
+- Phase 1:**令牌桶已提上日程**(所有者 2026-08-12;plan.md:73,并发调度前必须补——旧 RETIRE_ITEM 事故根因)、async 订单拉取、feeds errorReport 随 listing
+- ✅ ~~历史数据迁移总批次~~(所有者逐项拍板 2026-08-12,**整批关闭**):
+  上架表 26 列**不迁**;UPC 池 12 万行**不迁**(还有用的 UPC 所有者手动写入
+  现 catalog.upc_pool);旧 pending_feeds **不处理**(所有者自己在旧系统看);
+  retry_state 永久淘汰名单——历史报错已导入 product_events 且黑名单库已建,
+  **视为已完成**;maintenance.db 旧维护记录**不迁**;settlement 账期对账明细
+  旧系统本就没有(只有总对账单),**无需迁移**
 
 ## 八、文档失真待回写(除本次已修正的)
 

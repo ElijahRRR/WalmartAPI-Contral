@@ -19,12 +19,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     北京日界)
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist,永久产品级
-    禁止六类,2026-08-12 接通消费侧)+ product_risk 防呆(有删除史/
-    删除未生效史即拦;
-    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截——所有者口径
-    2026-08-12,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE
-    职责边界拍板)
+    cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist 永久禁止
+    六类 + 黑名单品牌,见③)。**防呆=黑名单,不看删除史**(所有者口径
+    2026-08-12:拦"出现过侵权/审查等拉黑类别"的,不拦"因产品问题删过"
+    的——可修复类删除后重上是正常经营,曾按删除史一刀切拦过,当日拆除);
+    "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
   ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
     数据恢复自动续上)
   ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
@@ -83,10 +82,9 @@ def _load_gate_state():
         listed = {r[0] for r in cur.fetchall()}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
-        risky = product_events.risky_asins(conn)
         banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
-    return inactive, today_used, listed, banned, risky, unexplained, gate
+    return inactive, today_used, listed, banned, unexplained, gate
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -239,13 +237,13 @@ def run(params: dict) -> str:
     if not pending:
         return "\n".join(lines)
 
-    inactive, today_used, listed, banned, risky, unexplained, gate = \
+    inactive, today_used, listed, banned, unexplained, gate = \
         _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
-         "blacklist": 0, "guard": 0, "no_data": 0, "filtered": 0,
+         "blacklist": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
@@ -282,17 +280,12 @@ def run(params: dict) -> str:
                 continue
             bl = banned.get(r["asin"])
             if bl:
-                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦——
-                # 收集侧 2026-08-11 验收,拦截侧 2026-08-12 在此接通
+                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
+                # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
+                # 2026-08-12:因产品问题删过的修好重上是正常经营)
                 n["blacklist"] += 1
                 reasons.append((r["rownum"],
                                 f"ASIN黑名单:{bl[1]}({bl[0]}类)"))
-                continue
-            risk = risky.get(r["asin"])
-            if risk:
-                n["guard"] += 1
-                reasons.append((r["rownum"],
-                                product_events.risk_reason(*risk)))
                 continue
             if r["asin"] in unexplained:
                 # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
@@ -364,7 +357,6 @@ def run(params: dict) -> str:
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
                  f"去重 {n['dedup']},黑名单 {n['blacklist']},"
-                 f"防呆 {n['guard']},"
                  f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)

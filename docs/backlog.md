@@ -19,7 +19,7 @@
 | ✅ | ~~ASIN 黑名单~~(2026-08-11 PG 侧+投影生产验收:按标准 asin 重灌 56,812 行;numeric 1,739 键原文兜底。**2026-08-12 上架拦截消费方接通**:blacklist.load_banned_asins → list_new 闸门链(去重后、防呆前)+ match_listing 三道闸,N/F 列写来源与类别) | `services/blacklist.py` |
 | 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合——**后置**(所有者 2026-08-12:等给出具体数据再考虑处理) | `services/blacklist.py:45` |
 | 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
-| ✅ | ~~match_listing 不过风控闸与防呆~~(2026-08-12 接通三道闸:SPEC 交叉字段过 risk_gate(PT/品牌)+ asin_blacklist(交叉 ASIN)+ product_risk 防呆(交叉 ASIN 删除史 / 同 GTIN 旧跟卖 offer 删除史,后者经 listing_sources 把 GTIN→历史 sku→病历接回);交叉不出的字段跳过该道闸;命中写 F 终态,清 F 重排队) | `workflows/match_listing.py:_gate_reason` |
+| ✅ | ~~match_listing 不过风控闸与防呆~~(2026-08-12 接通两道闸:SPEC 交叉字段过 risk_gate(PT/品牌)+ asin_blacklist(交叉 ASIN);交叉不出的字段跳过该道闸;命中写 F 终态,清 F 重排队。同日曾附加"删除史/GTIN 删除史"拦截,**当日按所有者口径拆除**——防呆=黑名单,不看删除史) | `workflows/match_listing.py:_gate_reason` |
 | ✅ | ~~UPC `gs1_restricted_prefix` 6,665 条历史黑名单~~(所有者拍板 2026-08-12:**不需要管**,不导入) | — |
 | 🔴 | PT 5 维度风险表 / 禁售政策知识库 / TRO·商标黑名单 / 新审核系统三表(~25k 行):跨仓,迁移边界未定 | `docs/legacy_survey.md:2000-2001,1806,1915,1954,1963` |
 | ⬜ | "飞书表停用后的接班者"——产品中心黑名单增量脚本,四处文档承诺零代码 | `services/risk_gate.py:9` / `workflows/risk_sync.py:11` / `docs/listing_plan.md:80-82` / `refdata/schema.sql:225-227` |
@@ -86,7 +86,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
 - ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`;接缝已在 `services/product_events.py` docstring 登记——届时补常量,休眠码不预进 EVENTS)
 - ✅ ~~只写不读~~(2026-08-11:`status_changes` / `feed_failures` 两个读侧视图平铺 jsonb,AI/人工直接 SELECT;`list/match_submitted` 计入 risk 视图 submit_times;`retire_feed_success` 属回执流水,读侧走 feed_failures 之外的 ops.feed_items,不另建)
-- ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件口径**(所有者拍板 2026-08-12):"不明原因消失"史(item_missing 且从未提交删/停 = 疑似平台下架)**只提示不拦截**——视图加 unexplained_missing 标志,list_new 放行但在摘要报警,积累观察后再定要不要升级成拦截;停用史不拦,等 RETIRE 职责边界(第二节 🔴))
+- ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件口径**(所有者两次拍板 2026-08-12,后者为准):**防呆=黑名单,不看删除史**——拦"出现过侵权/审查等拉黑类别"的(asin_blacklist/brand_blacklist),不拦"因产品问题删过"的(可修复类删除后重上是正常经营)。product_risk 视图降级为纯查询档案;曾短暂上过"有删除史即拦",当日拆除。"不明原因消失"史(item_missing 且从未提交删/停=疑似平台下架)只提示不拦截(unexplained_missing 标志,list_new 摘要报警)。"要不要拦停用史"之争随之消解——停用同样看拉黑类别,不看动作)
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
 - ✅ ~~sku≠asin~~(2026-08-11:product_events 加 asin 列,record_many 自动清洗
   + sku_normalize 存量补填;残余 numeric 1,739 个 item id 键倒查零命中,
@@ -98,11 +98,11 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 四、死表 / 死列 / 僵尸登记
 
-- ⬜ **`listing` schema 整体架空**:`listing.tasks`、`listing.upc_pool` 全仓零引用(已核实);后者与在用的 `catalog.upc_pool` 状态机定义冲突(available/claimed/used vs ''/claimed/used/conflict/bad_prefix)。**历史 10 万 UPC 迁移动工前必须删一张**(`refdata/schema.sql:258-280`,`docs/legacy_reference.md:74` 的迁移落点还指向死表)
-- ⬜ `orders.orders` 空表待确认后删(schema.sql:462 "新代码禁止写入");`orders.order_center` 视图无读者(push 走三张明细表)
-- ⬜ `catalog.products` 十列死列:audit_* 五列 + assigned_upc/listing_attrs/last_feed_id/store/owner——职责被飞书上架表、catalog.upc_pool、catalog.llm_cache 三处各自顶掉
+- ✅ ~~`listing` schema 架空双表~~(2026-08-12 workflow 逐一核证零代码引用后清理:`listing.tasks`/`listing.upc_pool` DROP,schema.sql 退役清理节;legacy_reference.md:74 落点同步改正——UPC 池已拍板不迁)
+- ✅ ~~orders.orders / order_center 视图~~(2026-08-12 清理:视图零读者直接 DROP;旧表带"仅空表才删"守卫防手滑)
+- ✅ ~~catalog.products 十列死列~~(2026-08-12 判定:**assigned_upc/listing_attrs/last_feed_id/store/owner 五列删除**(零读写,职责被 catalog.upc_pool/llm_cache/ops.feed_log/飞书上架表接管);**audit_* 五列保留**=二期审核接缝,三处登记一致,非遗忘死列)
 - ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
-- ⬜ 只写不读的列:`ops.perf_problem_orders` 14 个业务列(唯一读方只 count)、`ops.scrape_failures` 的 status/error_detail/retry_count、`catalog.snapshots.completeness_ok`、`catalog.llm_cache.hit_count/last_hit_at`(说好的低频清理器未写)
+- 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列=永久明细档案,是"档案(如 ops.runs)"还是该裁,**待所有者拍板**;`ops.scrape_failures.error_detail` **有读者**(v_scrape_failure_stats 视图,先前记录有误),status/retry_count 零读方但为采集契约镜像,随上一条一并拍;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**(旧库同款缓存曾膨胀 462MB,清理器落地时要靠它,正确动作是补写低频清理器而非删列)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
 
@@ -152,11 +152,6 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   **视为已完成**;maintenance.db 旧维护记录**不迁**;settlement 账期对账明细
   旧系统本就没有(只有总对账单),**无需迁移**
 
-## 八、文档失真待回写(除本次已修正的)
+## 八、文档失真待回写
 
-- `docs/legacy_reference.md:67-78` 状态迁移清单漏 3 项(黑名单 ASIN 表 / risk_gate_cache.json / 影刀 latest.json,legacy_survey.md:2216 点名至今未补)
-- `docs/db_schema.md:439` "列清单由执行 AI 补全并回写本文档"未执行(store_kpi_daily 仍是 `...`)
-- `docs/feishu_tables.md` 若干条目已过时(本次修正一批,"错误商品记录:沿用旧表或新建"仍未决)
-- `docs/scraper_migration_brief.md:203-206` 仍留着"一个邮编一个批次"收紧版遗留文字,与 :182-193 并存易误读
-- `registry/resources.py:271` 注释指向不存在的 `orders.order_audit` 表(本次修正)
-- `refdata/schema.sql:331` "四道审核" vs 实际五道(本次修正);`:4` "orders.returns/settlement 留待补全"是陈迹(实表为 return_lines/settlement_lines)
+✅ **2026-08-12 全部回写完成**:legacy_reference 状态迁移清单补 3 项且逐行更新拍板结果;db_schema 的 store_kpi_daily 32 列补全;feishu_tables 修 4 处(错误商品记录裁撤、补登 KPI_SHEET 旧 workbook、订单中心六表状态、STORE_CREDENTIALS 示例先前已含 enabled);scraper_migration_brief "127 个批次"遗留文字改为过去时收口;resources.py:271 / schema.sql:331 更早已修。

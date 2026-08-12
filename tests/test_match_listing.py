@@ -87,13 +87,10 @@ def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
                         lambda store, **kw: spec_results[next(iter(kw.values()))])
     monkeypatch.setattr(ml.match_feed, "next_serial_start",
                         lambda conn, d: 1)
-    # 三道闸数据(2026-08-12 接入):默认全空=全放行,gate 专测单独喂
+    # 两道闸数据(2026-08-12 接入):默认全空=全放行,gate 专测单独喂
     monkeypatch.setattr(ml.risk_gate, "load_gate",
                         lambda conn: {"banned_pts": set(), "brands": set()})
     monkeypatch.setattr(ml.blacklist, "load_banned_asins", lambda conn: {})
-    monkeypatch.setattr(ml.product_events, "risky_asins", lambda conn: {})
-    monkeypatch.setattr(ml.listing_sources, "risky_source_keys",
-                        lambda conn, st: set())
     calls["sources"] = []
     monkeypatch.setattr(ml.listing_sources, "register",
                         lambda conn, rows: (calls["sources"].extend(rows),
@@ -206,29 +203,26 @@ def test_manual_sku_takes_priority(monkeypatch):
     assert by_row[3][0].endswith("0001")            # 自动号从 1 起,人工行不占号
 
 
-def test_gate_reason_three_gates():
-    """跟卖三道闸纯函数:风控 > 黑名单 > 防呆;字段缺失跳过该道闸。"""
+def test_gate_reason_two_gates():
+    """跟卖两道闸纯函数:风控 > ASIN 黑名单;字段缺失跳过该道闸。
+
+    防呆=黑名单,不看删除史(所有者口径 2026-08-12:按拉黑类别拦,
+    因产品问题删过的重上是正常经营)。"""
     gate = {"banned_pts": {"BannedPT"}, "brands": {"badbrand"}}
     banned = {"B0BANNED01": ("E", "沃尔玛-知产")}
-    risky = {"B0RISKY001": (2, 0, 0, None)}
-    keys = {"00012345678905"}
     g = ml._gate_reason
     spec = lambda **kw: {"feed_type": "MP_ITEM_MATCH", "product_id": None,
                          "product_type": None, "brand": None, "asin": None,
                          **kw}
-    assert g(spec(product_type="BannedPT"), gate, {}, {}, set()) \
+    assert g(spec(product_type="BannedPT"), gate, {}) \
         == "风控拦截:禁售类目:BannedPT"
-    assert g(spec(brand="BadBrand"), gate, {}, {}, set()) \
+    assert g(spec(brand="BadBrand"), gate, {}) \
         == "风控拦截:黑名单品牌:BadBrand"
-    assert g(spec(asin="B0BANNED01"), gate, banned, {}, set()) \
+    assert g(spec(asin="B0BANNED01"), gate, banned) \
         == "ASIN黑名单:沃尔玛-知产(E类)"
-    assert "防呆:该ASIN有删除史" in g(spec(asin="B0RISKY001"),
-                                       gate, {}, risky, set())
-    # 同 GTIN 旧跟卖 offer 被删过:换新编号重跟也拦(经 listing_sources 接回)
-    assert g(spec(product_id="00012345678905"), gate, {}, {}, keys) \
-        == "防呆:该GTIN的旧跟卖offer有删除史"
-    # 交叉不出 ASIN/品牌 → 跳过对应闸,放行
-    assert g(spec(), gate, banned, risky, keys - {"00012345678905"}) is None
+    # 交叉不出 ASIN/品牌 → 跳过对应闸,放行;不在黑名单的 ASIN 照常放行
+    assert g(spec(), gate, banned) is None
+    assert g(spec(asin="B0CLEAN001"), gate, banned) is None
 
 
 def test_gated_row_terminal_not_submitted(monkeypatch):

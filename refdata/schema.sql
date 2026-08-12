@@ -23,11 +23,9 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     audited_at      timestamptz,
     audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
-    assigned_upc    text,
-    listing_attrs   jsonb,       -- LLM 映射过的属性,按 PT 版本缓存
-    last_feed_id    text,
-    store           text,
-    owner           text,
+    -- (assigned_upc/listing_attrs/last_feed_id/store/owner 五列 2026-08-12
+    --  退役:零读写,职责已被 catalog.upc_pool / catalog.llm_cache /
+    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留 = 二期审核接缝)
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (marketplace, asin)
@@ -293,10 +291,11 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
 );
 ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
--- 风险档案:上架前防呆的查询入口(list_new 消费;人工/AI SELECT 也方便)。
--- 2026-08-11 sku≠asin 定稿后身份键改 coalesce(asin, sku):删除史必须按产品
--- (ASIN)聚合——按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN
--- 换号重上,而 list_new 恰恰是拿 ASIN 来查的。列名 sku→asin 属列改名,
+-- 风险档案:人工/AI SELECT 查询入口。**不是拦截条件**(所有者口径
+-- 2026-08-12:防呆=黑名单,按拉黑类别拦,不按删除史拦——因产品问题删过
+-- 的重上是正常经营);list_new 仅消费 unexplained_missing 做报警(不拦截)。
+-- 2026-08-11 sku≠asin 定稿后身份键 = coalesce(asin, sku)(按产品聚合,
+-- 订货号原文聚合会把同一产品拆散)。列名 sku→asin 属列改名,
 -- PG 的 REPLACE 不允许,须 DROP 重建(幂等:每次 db_init 重建同一定义)。
 DROP VIEW IF EXISTS catalog.product_risk;
 CREATE VIEW catalog.product_risk AS
@@ -373,29 +372,29 @@ CREATE TABLE IF NOT EXISTS listing.retire_cooldown (
 CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
     ON listing.retire_cooldown (store, sku) WHERE status = 'pending';
 
-CREATE TABLE IF NOT EXISTS listing.tasks (
-    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    asin        text NOT NULL,
-    store       text NOT NULL,
-    status      text NOT NULL,      -- 生命周期状态机,沿用旧 auto_listing 的 9 状态语义
-    sku         text,
-    upc         text,
-    feed_id     text,
-    error       text,
-    owner       text,
-    feishu_record_id text,          -- 回写飞书用
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (asin, store)
-);
-
-CREATE TABLE IF NOT EXISTS listing.upc_pool (
-    upc         text PRIMARY KEY,
-    status      text NOT NULL,      -- available / claimed / used
-    claimed_by  text,               -- store or task ref
-    claimed_at  timestamptz,
-    created_at  timestamptz NOT NULL DEFAULT now()
-);
+-- ── 退役清理(2026-08-12 所有者批准:确认无用即清;证据=全仓零代码引用)──
+-- listing.tasks:上架状态权威在飞书上架表 + catalog.upc_pool + retire_cooldown,
+--   从未经过此表。listing.upc_pool:在用的是 catalog.upc_pool,两者状态机定义
+--   冲突,留着会误导(UPC 池已拍板不迁,有用号所有者手动写入)。
+-- orders.order_center 视图:push 直连明细表,零读者(视图无数据,删除零风险)。
+-- orders.orders:po 级旧表,由 order_lines 取代,DDL 注释本就写"待确认后删";
+--   防手滑:仅确认为空表才删。
+-- catalog.products 五死列:见 products 表注释。
+DROP TABLE IF EXISTS listing.tasks;
+DROP TABLE IF EXISTS listing.upc_pool;
+DROP VIEW IF EXISTS orders.order_center;
+DO $$
+BEGIN
+  IF to_regclass('orders.orders') IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM orders.orders) THEN
+    DROP TABLE orders.orders;
+  END IF;
+END $$;
+ALTER TABLE catalog.products DROP COLUMN IF EXISTS assigned_upc;
+ALTER TABLE catalog.products DROP COLUMN IF EXISTS listing_attrs;
+ALTER TABLE catalog.products DROP COLUMN IF EXISTS last_feed_id;
+ALTER TABLE catalog.products DROP COLUMN IF EXISTS store;
+ALTER TABLE catalog.products DROP COLUMN IF EXISTS owner;
 
 -- ── orders:订单域(行级统一建模,2026-08-06 v3 定稿)──────────────────────────
 --   order_line_id = 'ol_' + sha256(po_id + \x1f + sku)[:24]
@@ -414,8 +413,7 @@ BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.constraint_column_usage
              WHERE table_schema = 'orders' AND table_name = 'order_lines'
                AND constraint_name = 'order_lines_po_id_line_number_key') THEN
-    DROP VIEW IF EXISTS orders.order_center, orders.perf_event_spans,
-                        orders.settlement_by_line;
+    DROP VIEW IF EXISTS orders.perf_event_spans, orders.settlement_by_line;
     DROP TABLE IF EXISTS orders.order_lines, orders.return_lines,
                          orders.settlement_lines;
     UPDATE orders.perf_events SET order_line_id = NULL;
@@ -560,40 +558,8 @@ CREATE OR REPLACE VIEW orders.settlement_by_line AS
               ELSE '待入账' END AS settle_status
   FROM orders.settlement_lines GROUP BY order_line_id;
 
--- 订单中心主视图:一行订单行 = 销售 + 售后 + 绩效 + 入账(采购在飞书,人工域不进 PG)
-CREATE OR REPLACE VIEW orders.order_center AS
-  SELECT l.*,
-         r.return_status, r.refund_status_agg AS refund_status, r.return_total,
-         p.metrics AS perf_metrics,
-         s.net_amount AS settled_net, s.settle_status
-  FROM orders.order_lines l
-  LEFT JOIN (SELECT order_line_id,
-                    string_agg(DISTINCT return_status, ';') AS return_status,
-                    string_agg(DISTINCT refund_status, ';') AS refund_status_agg,
-                    sum(refund_total) AS return_total
-             FROM orders.return_lines GROUP BY order_line_id) r USING (order_line_id)
-  LEFT JOIN (SELECT order_line_id, string_agg(DISTINCT metric, ';') AS metrics
-             FROM orders.perf_events WHERE order_line_id IS NOT NULL
-             GROUP BY order_line_id) p USING (order_line_id)
-  LEFT JOIN orders.settlement_by_line s USING (order_line_id);
-
--- 旧表(po 级,空表,由 order_lines 取代):保留待确认后删除,新代码禁止写入
-CREATE TABLE IF NOT EXISTS orders.orders (
-    po_id       text PRIMARY KEY,
-    store       text NOT NULL,
-    order_date  timestamptz,
-    status      text,
-    total       numeric,
-    raw         jsonb,
-    audit_phishing  text,
-    audit_purchaser text,
-    audit_price     text,
-    audit_title     text,
-    audit_final     text,
-    owner       text,
-    created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
+-- (orders.order_center 主视图与 po 级旧表 orders.orders 已于 2026-08-12 退役,
+--  见「退役清理」节——push 直连三张明细表 + 两个在用视图,主视图零读者)
 
 -- ── ops:运行域(状态与业务同库,可同事务修改)────────────────────────────
 

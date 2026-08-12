@@ -33,10 +33,17 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
   delete_not_effective   观测核验:回执成功但宽限期后商品仍在架(真实案例,
                          所有者实证)——告警,人工处置
 
-原则:只追加永不改;回执与观测分开记,互相印证;上架防呆查 product_risk 视图。
+原则:只追加永不改;回执与观测分开记,互相印证。
 
-读侧视图(schema.sql 定义,消费方 + 人工/AI SELECT 入口,身份键一律
-coalesce(asin, sku)):product_risk(全局风险档案,list_new 防呆)/
+上架拦截口径(所有者 2026-08-12):**防呆=黑名单,不看删除史**——拦
+"出现过侵权/审查等拉黑类别"的(catalog.asin_blacklist / brand_blacklist,
+由 problem_categorized 时间线按最新类别投影),不拦"因产品问题删过"的
+(可修复类删除后重上是正常经营)。product_risk 视图因此只是**风险档案
+查询入口**(人工/AI SELECT),不是拦截条件;list_new 仅用其
+unexplained_missing 标志做"疑似平台下架"的报警(不拦截)。
+
+读侧视图(schema.sql 定义,人工/AI SELECT 入口,身份键一律
+coalesce(asin, sku)):product_risk(全局风险档案)/
 product_risk_store(店铺维度:"这个产品在哪些店被删过几次")/
 status_changes(平台状态迁移与官方下架原因)/ feed_failures(五类 feed
 的逐 SKU 失败回执)。
@@ -177,42 +184,6 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
                            "detail": {"old": prev_st, "new": new_st,
                                       "reasons": r.get("unpublished_reasons")}})
     return events
-
-
-# ── 上架防呆读侧(list_new / match_listing 共用;查 product_risk 视图)────────
-
-_RISKY_SQL = """
-SELECT asin, delete_times, delete_not_effective_times, listed_times,
-       last_removed_at
-FROM catalog.product_risk
-WHERE delete_times > 0 OR delete_not_effective_times > 0
-"""
-
-
-def risky_asins(conn) -> dict:
-    """输入:连接 → 输出:{asin: (删除次数, 未生效次数, 上架次数, 最近移除)}。
-
-    键是 coalesce(asin, sku)——视图身份键 2026-08-11 从订货号原文改成
-    产品码,否则三段式 sku 名下的删除史拦不住同 ASIN 换号重上。"""
-    with conn.cursor() as cur:
-        cur.execute(_RISKY_SQL)
-        return {r[0]: r[1:] for r in cur.fetchall()}
-
-
-def risk_reason(deletes: int, not_effective: int, listed: int,
-                last_removed) -> str:
-    """输入:product_risk 一行的计数与最近移除时间 → 输出:防呆拦截理由。
-
-    只写"有删除史"四个字人工复核还得手查账本;计数和时间本来就在视图里,
-    直接带出来当证据。"""
-    bits = [f"提交删除{deletes}次"]
-    if not_effective:
-        bits.append(f"删除未生效{not_effective}次")
-    if listed:
-        bits.append(f"历史上架{listed}次")
-    if last_removed:
-        bits.append(f"最近移除{last_removed:%Y-%m-%d}")
-    return f"防呆:该ASIN有删除史({','.join(bits)})"
 
 
 _VERIFY_SQL = """

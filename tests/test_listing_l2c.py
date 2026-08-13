@@ -87,6 +87,18 @@ def test_llm_cache_key_stable_and_order_independent():
     assert llm_cache.cache_key(m, 0.3, 4096) != k1      # 温度参与键
 
 
+def test_llm_thinking_disable_gated_by_flash_family(monkeypatch):
+    """v4-flash 官方默认开 thinking,旧仓铁律显式关闭(所有者确认生产
+    模型 2026-08-13);非 flash 家族不发该字段(未知字段可能被拒)。"""
+    m = [{"role": "user", "content": "x"}]
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-v4-flash")
+    body = llm._request_body(m, 0.2, 1500, "audit_l3")
+    assert body["thinking"] == {"type": "disabled"}
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-chat")
+    assert "thinking" not in llm._request_body(m, 0.2, 1500, "audit_l3")
+    assert body["response_format"] == {"type": "json_object"}
+
+
 def test_llm_model_for_purpose(monkeypatch):
     """批复 #1:env 逐用途覆盖,未配置回落默认;未登记用途 fail loud。"""
     monkeypatch.delenv("DEEPSEEK_MODEL_AUDIT_L1", raising=False)

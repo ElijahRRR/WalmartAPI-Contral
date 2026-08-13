@@ -59,6 +59,25 @@ def _extract_json(text: str) -> dict:
     return json.loads(s[start:end + 1])
 
 
+def _request_body(messages: list[dict], temperature: float,
+                  max_tokens: int, purpose: str) -> dict:
+    """输入:请求要素 → 输出:DeepSeek chat 请求体(纯函数,便于测试)。
+
+    v4-flash 家族官方**默认开 thinking**,旧仓铁律"必须永远显式下发
+    disable"(llm_routes.py:91-93/701;所有者确认生产 DEEPSEEK_MODEL=
+    deepseek-v4-flash,2026-08-13)——按模型名门控,非 flash 家族不发
+    该字段(未知字段可能被拒)。开关无条件生效、不存在两种变体并存,
+    故 llm_cache 键不含它(既有缓存零失效)。
+    """
+    model = model_for(purpose)
+    body = {"model": model, "messages": messages,
+            "temperature": temperature, "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"}}
+    if "flash" in model:
+        body["thinking"] = {"type": "disabled"}
+    return body
+
+
 def chat_json(messages: list[dict], *, temperature: float = 0.2,
               max_tokens: int = 4096, max_retries: int = 3,
               purpose: str = "default") -> dict:
@@ -68,9 +87,7 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
     降级——失败同链重试,重试尽抛异常,由调用方决定 pending,绝不默认放行。
     读操作可安全重试:超时/5xx/429 指数退避(1/2/4s);4xx 直接抛。
     """
-    body = {"model": model_for(purpose), "messages": messages,
-            "temperature": temperature, "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"}}
+    body = _request_body(messages, temperature, max_tokens, purpose)
     headers = {"Authorization": f"Bearer {_api_key()}"}
     last: Exception | None = None
     for attempt in range(max_retries):

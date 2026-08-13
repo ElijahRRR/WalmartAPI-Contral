@@ -1,6 +1,6 @@
 """数据库连接唯一入口(工程规范:禁止在其他任何文件自行 psycopg.connect / sqlite3.connect)。
 
-- 业务数据连本机 PostgreSQL 17 库 walmart_data(四 schema 见 docs/db_schema.md)。
+- 业务数据连本机 PostgreSQL 17 库 walmart_data(五 schema 见 docs/db_schema.md)。
 - 可重建缓存用 <DATA_ROOT>/cache 下的 SQLite(内置 WAL + busy_timeout)。
 """
 
@@ -57,6 +57,54 @@ def legacy_cleanup_conn():
     import psycopg
 
     conn = psycopg.connect(legacy_cleanup_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
+def legacy_audit_dsn() -> str:
+    """输入:无 → 输出:旧审核库 walmart_audit 的 DSN。
+
+    审核迁入批次 A(audit_import)与批次 B 双跑校准专用。旧库与中心库在
+    同一台生产 Mac 同一 PG 实例(调研定稿 docs/audit_migration_plan.md);
+    若不同实例用 LEGACY_AUDIT_DSN 覆盖。地址只准从这里取(铁律 3)。
+    """
+    return os.environ.get("LEGACY_AUDIT_DSN", "dbname=walmart_audit")
+
+
+@contextlib.contextmanager
+def legacy_audit_conn():
+    """输入:无 → 输出:旧审核库**只读**连接上下文。
+
+    搬迁与校准的读取端。旧库是待归档真值,本仓对它只有读的权利。
+    """
+    import psycopg
+
+    conn = psycopg.connect(legacy_audit_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
+def uspto_dsn() -> str:
+    """输入:无 → 输出:USPTO 商标库 DSN(env USPTO_DSN 覆盖,默认本机 uspto 库)。
+
+    批复 #3(2026-08-13):R5 商标反查继续跨库连它;灌库链路在外部仓,
+    本仓永远只读。
+    """
+    return os.environ.get("USPTO_DSN", "dbname=uspto")
+
+
+@contextlib.contextmanager
+def uspto_conn():
+    """输入:无 → 输出:USPTO 库**只读**连接上下文(1400 万行 trademarks)。"""
+    import psycopg
+
+    conn = psycopg.connect(uspto_dsn())
     try:
         conn.read_only = True
         yield conn

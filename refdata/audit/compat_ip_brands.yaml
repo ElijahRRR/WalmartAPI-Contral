@@ -1,0 +1,112 @@
+# L2 R6 "适用于 + 品牌" 硬拦规则配置
+#
+# 逻辑: title 或 description 同时满足
+#   (a) 含任一 compat_triggers 触发词
+#   (b) 含任一 hard_brands 品牌 (与触发词任意位置共现)
+# → -100 拒
+#
+# 为什么只用小白名单 hard_brands, 不用 18k blacklist_brands?
+# 数据验证 (9 天 walmart_error_records 97k 条):
+#   compatible + Dyson  → 27/27 = 100% E 知产
+#   compatible + IKEA   → 5/5   = 100% E 知产
+#   compatible + Shark  → 0/39  = 0%  (Walmart 允许第三方配件)
+#   compatible + iRobot → 0/20  = 0%
+#   compatible + Nest   → 0/12  = 0%
+#   compatible + Honeywell → 0/23
+#   compatible + Nespresso → 0/8
+#
+# 所以只收 "已验证 precision ≥ 90% + 样本 ≥ 5" 的品牌.
+# 未达标的品牌继续走 R4 软标记 (-15) + L3 LLM 语境判.
+
+version: 1
+updated: 2026-04-21
+
+# 触发词 (word-boundary 匹配, 大小写不敏感)
+# 注: "for" 本身是通用词, 但严格模式下只有"for 后 60 字符内有 hard 品牌"才命中,
+#     "for Kids/Men/daily use" 等常见组合不会误伤 (窗口里没 hard 品牌).
+#     加入 for 后, 能抓到 "Filter for Dyson" / "Pack for IKEA" / "Cover for CAMELBAK" 这类 SEO 冒用.
+compat_triggers:
+  # 英文常见
+  - "compatible with"
+  - "compatible for"
+  - "replacement for"
+  - "replacement parts for"
+  - "replacement kit for"
+  - "made to fit"
+  - "made for"
+  - "for use with"
+  - "fits most"
+  - "aftermarket for"
+  - "aftermarket replacement"
+  - "OEM for"
+  - "for"           # 兜底: 覆盖 "Filter for Dyson" / "Cover for IKEA" SEO 冒用
+                   # 安全依据: 严格窗口扫, "for" 后 60 字符有 hard 品牌才命中
+  # 中文 (少数标题)
+  - "适用于"
+  - "兼容"
+  - "替换装"
+
+# 硬拦品牌 - 手工补充列表 (补 blacklist_brand_ip_stats 之外的)
+# 主要来源 = blacklist_brand_ip_stats WHERE severity IN ('hard', 'c_hard') (自动筛)
+# 这个 yaml 列表是辅助, 用于:
+#   - 数据未覆盖的品牌 (不在 blacklist_brands)
+#   - 噪声大但 C 绝对命中 ≥ 5 的真品牌 (Fender 179: 143A+20C, 比例低但 20 C 明确)
+#   - L3 实测抓到过的真品牌冒用 (证实 precision 高)
+#   - 员工根据业务直觉认定的强 IP / Restricted Sellers 品牌
+# 两份列表取并集使用.
+#
+# 新增要求: 满足以下任一
+#   (a) L3 eval 中抓到 ≥ 2 次, 全为真违规 且不在 blacklist_brands
+#   (b) Walmart error_records 里 C hits ≥ 5 但精度低 (被 A/B 噪声稀释, Fender/Strat 典型)
+#   (c) 用户/员工手工指定 (飞书 TRO 或业务强知名品牌)
+additional_hard_brands:
+  # === IP (知产侵权) 类 ===
+  - "IKEA"          # 5/5 = 100% E
+  - "Zildjian"      # L3 抓过 (镲片, 鼓配件高频冒用)
+  - "Wilkinson"     # L3 抓过 (吉他配件, 常与 Fender Strat 共现)
+  - "ToneShaper"    # L3 抓过 (吉他旋钮, Genuine Fender Knob 冒用)
+  - "Ernie Ball"    # L3 抓过 (吉他弦品牌)
+  - "Rolex"         # L3 抓过 2 次 (手表替换件高发)
+  - "Titleist"      # L3 抓过 (高尔夫品牌冒用)
+  - "Smead"         # L3 抓过 (办公用品品牌冒用)
+
+  # === Restricted Sellers 类 (从 eval_ce200 miss 分析推出) ===
+  # 这些品牌在 walmart_error_records 里 C hits 绝对数高, 但精度被 A 类过期/B 类禁售稀释
+  # 数据验证: blacklist_brand_ip_stats 查 c_hits
+  - "Fender"        # 179 总命中 20 C (11%) — 低比例但 C 数多, 典型 Restricted Sellers
+  - "Stratocaster"  # Fender 产品型号, 常见冒用
+  - "Telecaster"    # Fender 产品型号
+  - "Squier"        # Fender 入门线, "for Squier" 冒用 (B081CDZ4KT)
+  - "PRS"           # 吉他品牌 (Paul Reed Smith), eval miss
+  - "Seiko"         # 11/4 = 36% C — "Genuine Seiko TMI" 手表机芯冒用
+  - "Nexgrill"      # Walmart 烤炉品牌, 不在飞书黑名单但 eval 反复冒用
+  - "Ryobi"         # 87/5 E/1 C — 电动工具, Restricted 但噪声大
+  - "Dremel"        # 旋转工具, eval miss
+  - "Wen"           # 电动工具
+  - "PK Grills"     # 烤炉 boutique 品牌
+  - "Drum Workshop" # 架子鼓品牌, 不在黑名单
+  - "Mike Balter"   # 打击乐棒品牌, 不在黑名单
+  - "Baerenreiter"  # 乐谱出版社, IP 侵权 (Baerenreiter Verlag)
+
+  # === 样本 < 5 但精度 ≥ 80% 的品牌 (从 DB 数据补, 避免 e≥5 卡死) ===
+  - "Wilson"        # 5/4 = 80% E, 高尔夫球冒用 (e<5 所以 DB 未列入 hard)
+  - "Baldwin"       # 5/4 = 80% E, 钢琴品牌
+
+  # === eval_ce200 第二轮分析新增 (眼看 miss 标题里确认的真品牌) ===
+  - "Polaroid"      # 照相机/经典相机, "Polaroid Guest Book" 冒用 (B07JP7HS35)
+  - "Instax"        # Fujifilm 拍立得商标
+  - "Dreame"        # 小米系吸尘器, "for Dreame H14" (B0DFWH4296)
+  - "PDP"           # Pacific Drums (DW 子线, "PDP by DW Hoop Snare" B0BCWWT6LZ)
+  - "Pacific Drums" # 同上
+  - "Alcoholics Anonymous"  # AA 商标, "AA Big Book & 12 Steps" 系列 IP
+  - "Stamperia"     # 意大利手工纸品品牌
+  - "Riley Blake"   # 布料品牌
+  - "Riley Blake Designs"
+  - "Hercules"      # 乐器架品牌 (B07N6KQJM3)
+
+# 豁免词 (即使命中触发词+品牌, 这些场景放行)
+# 例: "compatible with most 7/16 inch" → 没具体品牌, 是规格描述, 不应拦
+exempt:
+  - "universal"       # 通用适配, 非具体品牌
+  - "most brands"     # 多品牌适配
+  - "various brands"

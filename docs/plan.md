@@ -22,9 +22,10 @@
 ## 迁移进度总览(2026-08-13 定格;明细以 Phase 2 矩阵行为准)
 
 > 一句话:**功能侧基本收官**——全部业务工作流代码完成且绝大多数已生产验收;
-> 唯一的业务功能余项是**多变体上架**(等采集侧 variation 三字段提顶层),
-> 唯一的零代码基础设施是 **backup**。剩下的是运维战役(挂调度/停旧切换)
-> 与少量增强项。
+> 唯一的业务功能余项是**多变体上架**(等采集侧 variation 三字段提顶层);
+> backup 已落地(2026-08-13 审核迁入批次 A,待生产首跑+挂每日调度)。
+> 剩下的是运维战役(挂调度/停旧切换)与少量增强项;审核迁入按
+> docs/audit_migration_plan.md 五批推进中(批次 A 代码完成)。
 
 | 工作流 | 生产验收 | 剩余 |
 |---|---|---|
@@ -45,11 +46,12 @@
 | feed_poll / 反哺器×5 | ✅ 生产在用 | 挂高频调度(30 分钟) |
 | sku_locked_heal / heal_unknown | 代码完+测试 | 等首个真实场景;随调度上线 |
 | risk_sync / upc_sync / blacklist_push / brand_scrape | ✅ 均已生产验证 | 挂调度 |
-| **backup** | ⬜ **零代码** | 写代码(生产库当前零备份) |
+| **backup** | ✅ **生产首跑完成**(2026-08-13,1554.5 MB 过校验——生产库第一份备份) | 挂每日调度 |
 
-**功能侧代码余项**(全部非阻塞):变体分组(唯一业务大项)/ backup /
-async 订单拉取(优化)/ 产品中心黑名单增量脚本(飞书表停用后才需要)/
-llm_cache 清理器(暂不做,上量后再议)。
+**功能侧代码余项**(全部非阻塞):变体分组(唯一业务大项)/
+产品中心黑名单增量脚本(飞书表停用后才需要)/
+llm_cache 清理器(暂不做,上量后再议;审核批次 C 上量时按约重议)/
+审核迁入批次 B~E(docs/audit_migration_plan.md 第十一节)。
 **已明确不做**(所有者拍板 2026-08-13 增补):update_listed 五字段集、
 upc_audit、cli.py health、UPC 造号、退款、涨跌幅闸(暂)、erp-core 相关、
 历史数据迁移(整批关闭)。**等外部**:二期审核服务(入库/审核事件接缝)、
@@ -67,7 +69,7 @@ maintenance/list_new)→ 按域停旧切换。
       → `python cli.py init_data_root`(已容器内冒烟)
 - [x] registry/paths.py(默认 DATA_ROOT + 环境变量覆盖;launchd 不读 shell 配置,
       所以默认值必须能独立工作)
-- [x] Postgres:建四个 schema(见 db_schema.md)+ 只读角色 `readonly`
+- [x] Postgres:建五个 schema(见 db_schema.md;audit 为 2026-08-13 审核迁入批次 A 新增)+ 只读角色 `readonly`
       → `refdata/schema.sql` + `python cli.py db_init`(幂等)。
       生产机 PG17 验收通过(2026-08-05):4 schema / 9 表 / 1 视图,幂等回读正常。
       ⚠️ 保留项:readonly 角色口令(READONLY_DB_PASSWORD)尚未配置,配置后重跑
@@ -149,13 +151,14 @@ maintenance/list_new)→ 按域停旧切换。
 | — | order_center_cleanup | (新增) | **是** | 建库一次性烂账清理:删除订单不在库的售后/绩效/对账行(dry-run 默认);配套**入库侧永久过滤**(returns_sync/daily_report 已内置,防每日回流)+ recon_done 账期台账(防整期清空后被当缺失重拉)。**[x] 全店建库已执行**(2026-08-06,用户确认) |
 | — | settlement_sync | (新增,原 daily_report settlement 阶段) | 否 | **[x] 摘出**(所有者定稿 2026-08-10):账期是**双周**节奏(实证 06/02→06/16→06/30→07/14→07/28),KPI 是**每日**,绑一起等于每天为一件十四天才变一次的事扫全店 48 家;与 perf_problems 同一处理方式。关账快照不可变(DISTINCT period + recon_done 台账双判据)、v3 身份 PO+SKU、烂账治理三条语义原样搬。`daily_report -p phase=settlement` 保留指路提示,不静默变成空跑 |
 | — | order_center_push | (新增) | 否 | 订单中心投影到用户既有「订单中心V1」bitable 六表:销售/售后/绩效/对账程序写(按表内真实字段类型自适应),主订单表/采购信息只补首列键(人工域);全表不删行(枢纽有关联字段);PG 权威。**[~] 全店建库完成**(2026-08-06,用户确认;含本地状态零拉表+烂账治理);待:挂调度进入日常增量;Lookup 列(下单时间等)依赖主订单表关联字段接线,程序暂不写关联 |
-| — | (产品事件账本) | (新增,非工作流) | 否 | catalog.product_events:产品全生命周期"病历"(上架/下架及官方原因/删除提交/回执/观测核验)+ product_risk 防呆视图;写入点 catalog_sync/feed_track/product_clear,listing 期补 入库/审核/上架前防呆。**[~] 地基就绪**(2026-08-06);cleanup 归类事件**已接**(problem_categorized,problem_product_cleanup._record_categories,类别未变不重复记);旧库 41.7 万行历史导入**已完成**(2026-08-11,cleanup_history_import);上架回执 list_feed_* 已接且违禁自动入黑名单(2026-08-12);余:入库/审核两类事件等二期审核服务 |
+| — | (产品事件账本) | (新增,非工作流) | 否 | catalog.product_events:产品全生命周期"病历"(上架/下架及官方原因/删除提交/回执/观测核验)+ product_risk 防呆视图;写入点 catalog_sync/feed_track/product_clear,listing 期补 入库/审核/上架前防呆。**[~] 地基就绪**(2026-08-06);cleanup 归类事件**已接**(problem_categorized,problem_product_cleanup._record_categories,类别未变不重复记);旧库 41.7 万行历史导入**已完成**(2026-08-11,cleanup_history_import);上架回执 list_feed_* 已接且违禁自动入黑名单(2026-08-12);入库/审核三事件码已登记(2026-08-13 批次 A:product_ingested/audit_passed/audit_rejected),写入方批次 B 接线 |
 | — | feed_poll | (新增) | 否 | 全局 feed 轮询(所有 feed 操作共用):feed_log submitted 行 → 终态 → SKU 级结果落 ops.feed_items 权威台账;逐 feed 展示店铺/动作/进度计数;pending 行告警待人工。**[~] 生产验收通过**(2026-08-06,双 feed 实时进度实证);待挂高频调度 |
 | — | perf_problems | (拆自 daily_report) | 否 | 绩效问题订单明细(insights report xlsx)→ ops.perf_problem_orders + 订单中心 orders.perf_events。**[~] 代码就绪**(2026-08-08 拆出,逻辑与拆分前一致):所有者定稿由独立调度驱动,日报不再管;待挂独立调度 |
 | — | product_refresh | (新增) | **是** | 在线产品全量重推采集(**旧维护三步的第 2 步**,所有者澄清 2026-08-09:旧流程 = 获取在线产品 → 推送采集拿最新 amz 数据并自动计算 → 读决策并提交)。没有它 latest_snapshot 会越来越陈旧,而 maintenance 三 provider 照样拿陈旧数据提交。口径:每次改价前全量重推 PUBLISHED + 店铺 ACTIVE(跨店去重),不做优先级;采集器吞吐 2000~3000/分钟(不切邮编不截图);**确认推上去(拿到 batch_id)才开始计时**,超时 1 小时;命名批次便于按批次取回。v4 撞名返 409 不静默合并 ⇒ 推送可安全重试。**非 ASIN 形态的历史 SKU 直接过滤**(所有者定稿 2026-08-09:采集侧建任务时本来就丢弃——推 27722 只建了 27170——且它们永远不会有 amz 数据,不在维护范围内)。批次落定时拉 `/api/batches/{batch_id}/failures` 落 `ops.scrape_failures`(所有者问 2026-08-09「取回时会拿到某个产品没采成功的原因吗」:增量流里只有 `outcome≠ok` 的降级采集,**根本没采到的 ASIN 压根不产出记录**,必须主动拉)。**[~] 生产已实跑**(所有者确认 2026-08-13);待挂调度 |
 | — | cleanup_history_import | (新增,一次性) | 否 | 旧问题商品三笔历史(error_items 41.7 万行时间线折叠 → product_events;seen 20.1 万对 → ops.cleanup_seen_categories;brand_cache → ops.dedupe)。**[x] 生产实跑完成**(2026-08-11):error_items 485,345 行 → 变迁事件 239,253 条(时间线折叠;重灌数与首跑一致,确定性实证)、seen 207,355 对、brand 2,609 ASIN(pending 实为 0)。实操修了三处:文件检查前置到重活前、seen/brand 传反按形状指纹拒绝、seen 真实形状 {"seen": [...]} 补分支(形状一直记在 legacy_survey:1350,教训:写解析器前先 grep 摸底文档) |
 | — | blacklist_push | (新增) | 否 | PG 黑名单自产行 → 飞书两张收集表(投影只追加;镜像行按 src_sku 指纹排除,绝不回推;水位 pushed_at 每块落,崩了重推不丢行;追加定位先读列 A 找真空行,防 +append 富文本误判)。**[~] 生产首推已完成**(所有者确认 2026-08-13);待挂调度 |
-| — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
+| — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警(cli 统一发)。**[~] 代码完成**(2026-08-13 批次 A:-Fc 先写 .part → pg_restore --list 校验 → 原子换名;保留期清理只碰自家命名且永不删当轮产物;days≥1 硬闸)。待生产首跑 + 挂每日调度。异机恢复注意:readonly 角色不在单库 dump 里 |
+| — | audit_import | (新增,一次性) | **是** | 旧审核库 walmart_audit(同实例隔壁 database)13 表 → audit schema。dry-run 逐表体检(pg_attribute/format_type 含精度列对照;源独有列/类型不符/清单表缺失=致命拒迁;replace 的 TRUNCATE 必预告);--execute 单事务 COPY + 行数校验 + 标识列 setval;源连接 REPEATABLE READ 只读。**[x] 生产实跑完成**(2026-08-13:dry-run 13 表全绿后 --execute 单事务约 614 万行全 ✓,含 audit_runs 204 万 / audit_hits 388 万;blacklist_brands 实测 42,726 行) |
 | — | allocation(占用与分配) | (新增) | **是** | 品牌/产品/类目三重排他占用台账(catalog.claims,与在线快照解耦,释放只走显式动作)+ 分配引擎(硬约束闸→产品分→店铺-产品贪心匹配,第一版规则打分不用 ML/LLM)。**[ ] 立案,全线暂缓**(所有者定稿 2026-08-07:含 A1 地基,等产品中心库建成、审核链接通、可见真实结构与数据后校准再动工)。子计划 docs/allocation_plan.md |
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |

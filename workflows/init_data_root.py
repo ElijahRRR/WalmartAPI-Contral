@@ -58,6 +58,18 @@ FEISHU_RISK_PT_SHEET_ID=
 FEISHU_BRAND_WIKI_TOKEN=
 FEISHU_BRAND_SHEET_ID=
 
+# LLM(DeepSeek 单链;api/llm.py)。分用途覆盖模型可选(批复 #1,
+# 未配置回落 DEEPSEEK_MODEL 默认;registry.LLM_PURPOSE_ENV 登记)
+DEEPSEEK_API_KEY=
+#DEEPSEEK_MODEL=deepseek-chat
+#DEEPSEEK_MODEL_AUDIT_L1=
+#DEEPSEEK_MODEL_AUDIT_L3=
+# L4 视觉(豆包/火山方舟;api/llm_vision.py;默认关,-p l4=on 才用)
+# base_url/model 不填用旧生产默认值
+ARK_API_KEY=
+#ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+#ARK_VISION_MODEL=doubao-seed-1-6-flash-250615
+
 # 沃尔玛 API(默认 production;沙箱测试才需要设)
 #WALMART_BASE_URL=https://sandbox.walmartapis.com
 

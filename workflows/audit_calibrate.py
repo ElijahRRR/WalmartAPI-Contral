@@ -28,12 +28,14 @@ logger = logging.getLogger("workflows.audit_calibrate")
 
 _PAIR_SQL = """
 WITH new_runs AS (
-    SELECT DISTINCT ON (asin) asin, run_id, verdict, stage_stopped_at
+    SELECT DISTINCT ON (asin) asin, run_id, verdict, stage_stopped_at,
+           walmart_product_type, l3_verdict
     FROM audit.audit_runs
     WHERE created_at >= %(since)s
     ORDER BY asin, created_at DESC
 ), old_runs AS (
-    SELECT DISTINCT ON (asin) asin, run_id, verdict, stage_stopped_at
+    SELECT DISTINCT ON (asin) asin, run_id, verdict, stage_stopped_at,
+           walmart_product_type, l3_verdict
     FROM audit.audit_runs
     WHERE created_at < %(since)s
       AND verdict IN ('pass', 'reject')
@@ -41,10 +43,15 @@ WITH new_runs AS (
     ORDER BY asin, (verdict = 'reject') DESC, created_at DESC
 )
 SELECT n.asin, n.run_id AS new_run, n.verdict AS new_verdict,
+       n.stage_stopped_at AS new_stage,
+       n.walmart_product_type AS new_pt, n.l3_verdict AS new_l3,
        o.run_id AS old_run, o.verdict AS old_verdict,
-       o.stage_stopped_at AS old_stage
+       o.stage_stopped_at AS old_stage,
+       o.walmart_product_type AS old_pt, o.l3_verdict AS old_l3
 FROM new_runs n LEFT JOIN old_runs o USING (asin)
 """
+
+_STUB_PTS = {"", "unknown", "(phase0_blocked)"}   # PT 一致率不比占位值
 
 _HITS_SQL = """
 SELECT run_id, array_agg(DISTINCT rule_code) FROM audit.audit_hits
@@ -69,10 +76,11 @@ def _default_since(conn) -> str | None:
 
 
 def old_intermediate(stage: str | None, verdict: str) -> str:
-    """输入:旧 run 的 stage_stopped_at + verdict → 输出:旧 L0+L2 中间判决。
+    """输入:run 的 stage_stopped_at + verdict → 输出:L0+L2 硬规则层中间判决。
 
-    纯函数(便于测试)。L3/L4 拒 = 旧硬规则层放行后被 LLM 层拦——批次 B
-    没有那两层,算 pass 才公平;NULL = 全流程通过。
+    纯函数(便于测试)。L3/L4 拒 = 硬规则层放行后被 LLM 层拦,算 pass;
+    NULL = 全流程通过。批次 C 起**两侧对称套用**(新侧也有 L3 了:新 L3 拒
+    若按最终判决计,会把"旧 L3 拒/新 L3 拒"的一致案例误记成新拦旧放)。
     """
     if verdict == "reject" and stage in ("L0", "L2"):
         return "reject"
@@ -108,23 +116,42 @@ def run(params: dict) -> str:
 
         agree = new_only = old_only = 0
         new_pending, no_old = 0, 0
+        pt_pairs = pt_agree = 0
+        l3_pairs = l3_agree = l3_new_only = l3_old_only = 0
         bucket_new_only, bucket_old_only = [], []
-        for _asin, new_run, new_v, old_run, old_v, old_stage in rows:
-            if new_v == "pending":
-                new_pending += 1
+        for (_asin, new_run, new_v, new_stage, new_pt, new_l3,
+             old_run, old_v, old_stage, old_pt, old_l3) in rows:
+            if new_v == "pending" and new_stage != "L3":
+                new_pending += 1     # PT 解不出(L1);L3 pending=硬层已放行,照比
                 continue
             if old_run is None:
                 no_old += 1          # 旧系统没审过,无从比对(分母外,必须亮出)
                 continue
+            # 硬规则层:两侧对称取 L0+L2 中间判决(批次 C 口径)
+            new_mid = old_intermediate(new_stage, new_v)
             old_mid = old_intermediate(old_stage, old_v)
-            if new_v == old_mid:
+            if new_mid == old_mid:
                 agree += 1
-            elif new_v == "reject":
+            elif new_mid == "reject":
                 new_only += 1
                 bucket_new_only.append(new_run)
             else:
                 old_only += 1
                 bucket_old_only.append(old_run)
+            # L1 层:PT 字符串等值(占位值不计入;计划 C 验收"L1 结论一致率")
+            if (new_pt and old_pt and new_pt not in _STUB_PTS
+                    and old_pt not in _STUB_PTS):
+                pt_pairs += 1
+                pt_agree += int(new_pt == old_pt)
+            # L3 层:两侧都真跑到 L3 的才可比
+            if new_l3 in ("pass", "reject") and old_l3 in ("pass", "reject"):
+                l3_pairs += 1
+                if new_l3 == old_l3:
+                    l3_agree += 1
+                elif new_l3 == "reject":
+                    l3_new_only += 1
+                else:
+                    l3_old_only += 1
 
         top_new = _top_rules(conn, bucket_new_only)
         top_old = _top_rules(conn, bucket_old_only)
@@ -133,12 +160,19 @@ def run(params: dict) -> str:
     rate = f"{agree / compared * 100:.1f}%" if compared else "n/a"
     lines = [
         f"audit_calibrate(切点 {since}):新侧 runs {len(rows)}",
-        f"分母明细:可比 {compared} / 新 pending {new_pending}(不计入)"
-        f" / 旧系统未审过 {no_old}(不计入)",
-        f"硬规则层一致率:{rate}(一致 {agree})",
+        f"分母明细:可比 {compared} / 新 pending(L1 类目解不出) {new_pending}"
+        f"(不计入) / 旧系统未审过 {no_old}(不计入)",
+        f"硬规则层一致率:{rate}(一致 {agree};两侧对称按 L0+L2 中间判决)",
         f"分歧|新拦旧放 {new_only}" + (f":{'; '.join(top_new)}" if top_new else ""),
         f"分歧|旧拦新放 {old_only}" + (f":{'; '.join(top_old)}" if top_old else ""),
     ]
+    if pt_pairs:
+        lines.append(f"L1 PT 一致率:{pt_agree / pt_pairs * 100:.1f}%"
+                     f"({pt_agree}/{pt_pairs},两侧均真 PT 才计)")
+    if l3_pairs:
+        lines.append(f"L3 一致率:{l3_agree / l3_pairs * 100:.1f}%"
+                     f"({l3_agree}/{l3_pairs};新拦旧放 {l3_new_only}/"
+                     f"旧拦新放 {l3_old_only};两侧均跑到 L3 才计)")
     if old_only:
         lines.append("(旧拦新放需逐条核:大概率是 PT 来源不同——旧 L1 LLM 判的"
                      " PT vs 新实证/映射 PT——先看 rule_code 是不是 R0/R1/R2/R3)")

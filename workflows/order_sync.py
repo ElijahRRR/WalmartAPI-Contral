@@ -11,17 +11,17 @@ orders.order_lines。窗口全量重拉而非游标增量:订单状态在创建�
 (Created→Shipped→Delivered/Cancelled),按创建时间增量会漏老订单的状态迁移,
 窗口重拉 + 幂等 upsert 天然覆盖(旧系统同样按日全刷 45 天)。
 
+并发形态(2026-08-13,蓝图 §6.3 async 变体落地):跨店并发由
+api/orders.fetch_orders_bulk 承担(asyncio 藏在 api 层内部,默认 12 店
+同时拉,网络与入库在线程池重叠);本文件只提供持久化回调,保持同步世界。
+
 审核列(audit_status/audit_detail/audited_at)不在本工作流的 upsert 列内,
 重拉不会冲掉审核结论——审核规则与采集对接后由 order_audit 补全。
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-import httpx
-
-from api import _client
 from api import orders as orders_api
 from registry import db
 from services import order_lines as ol
@@ -32,15 +32,13 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.order_sync")
 
 
-def _sync_one_store(store: dict, created_start: str) -> dict:
-    name = store["name"]
+def _persist(store: dict, orders: list[dict]) -> int:
+    """输入:店铺 + 该店全部订单 → 输出:入库行数(fetch_orders_bulk 回调)。"""
     rows: list[dict] = []
-    stats: dict = {}
-    for order in orders_api.iter_orders(store, created_start=created_start, stats=stats):
-        rows.extend(ol.extract_order_lines(name, order))
+    for order in orders:
+        rows.extend(ol.extract_order_lines(store["name"], order))
     with db.pg_conn() as conn:
-        written = ol.upsert_order_lines(conn, rows)
-    return {"store": name, "orders": stats.get("total", 0), "lines": written}
+        return ol.upsert_order_lines(conn, rows)
 
 
 def run(params: dict) -> str:
@@ -50,24 +48,13 @@ def run(params: dict) -> str:
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(全部)'}"
     days = int(params.get("days", 45))
-    workers = int(params.get("workers", 8))
+    workers = int(params.get("workers", 12))
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    results, dead, failed = [], [], []
-    with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futs = {pool.submit(_sync_one_store, s, created_start): s["name"]
-                for s in store_list}
-        for f in as_completed(futs):
-            name = futs[f]
-            try:
-                results.append(f.result())
-            except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                dead.append(name)
-            except Exception as e:
-                logger.exception("店铺 %s 订单拉取失败: %s", name, e)
-                failed.append(f"{name}({e})")
+    results, dead, failed = orders_api.fetch_orders_bulk(
+        store_list, created_start=created_start, concurrency=workers,
+        handler=_persist)
 
     total_lines = sum(r["lines"] for r in results)
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"

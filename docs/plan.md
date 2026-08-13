@@ -108,7 +108,14 @@ maintenance/list_new)→ 按域停旧切换。
       feeds 限速桶登记(POST 各 feedType 独立,未登记默认拒绝)。
       errorReport 下载与其余 feedType 随 listing 补
 - [x] api/reports.py:报告类下载(daily_report/perf_problems 在用:请求/轮询/下载三段 + CSV 解析)
-- [ ] async 支持:仅订单拉取需要,做在 api/orders.py 内部,不另起体系
+- [x] async 支持(2026-08-13):`api/orders.fetch_orders_bulk` 同步门面,
+      内部 asyncio + httpx.AsyncClient 跨店并发(默认 12,单店内翻页仍串行
+      ——cursor 语义);`_get_async` 镜像 `_request_ex` 重试口径(429 按
+      Retry-After / 5xx 与网络指数退避 / 401 刷 token 一次);持久化经
+      handler 回调注入(api 不 import services);**测试缝与同步世界共用**
+      `_build_transport`(MockTransport 双栈,async 路径绝不绕出桩真打
+      沃尔玛——首版测试实测绕出去吃了真 401,已堵);order_sync 已接线,
+      ThreadPoolExecutor 退役
 - [x] **每店 per-(store, bucket) 令牌桶**(设计定稿见 docs/api_blueprint.md 第 3/6 节,
       官方 2026-08-05 核验):各 feedType **独立** 10/hour(MP_ITEM_MATCH 20/hour),
       唯一共享桶是价格三件套;未登记的 bucket **默认拒绝而非放行**(旧系统 RETIRE_ITEM

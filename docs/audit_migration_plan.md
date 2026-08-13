@@ -335,7 +335,7 @@ pg_dump 留档。**这是硬前置**:97k 错误日报、25k 三表、audit_runs 
 | A1 | audit schema DDL:规则字典 9 表(blacklist_brands、phase0 三表、walmart_category_map、pt_meta、pt_spec、prohibited_policy、blacklist_brand_ip_stats)+ 证据 2 表(violation_groundtruth、walmart_error_records)+ 结论 2 表(audit_runs、audit_hits);三张无 DDL 表先 `pg_dump -s walmart_audit` 反推 | `refdata/schema.sql`、`workflows/db_init.py` 幂等块、`docs/db_schema.md` 审核章节 |
 | A2 | 数据搬迁(同实例跨库):`pg_dump walmart_audit --data-only -t <表>` 管道灌入 audit schema;搬迁脚本带两侧行数对比校验;blacklist_brands 顺手实测真实量级(三处注释 18k/36k/41k 之谜落定) | 一次性脚本(scripts/ 或 workflow 形态,dry-run 打印行数) |
 | A3 | 5 个 seed yaml 进 `refdata/audit/`(原样拷贝,含 precision 验证注释) | `refdata/audit/*.yaml` |
-| A4 | registry 登记:uspto 只读连接函数;飞书 8280e8 三列表;audit 表名常量;LLM 用途→模型映射(AUDIT_L1/AUDIT_L3/VISION,env 逐用途覆盖回落 DEEPSEEK_MODEL);事件码常量登记(product_ingested / audit_passed / audit_rejected) | `registry/db.py`、`registry/resources.py`、`services/product_events.py`(仅登记常量) |
+| A4 | registry 登记:uspto 只读连接函数;飞书 8280e8 三列表;LLM 用途→模型映射(AUDIT_L1/AUDIT_L3,env 逐用途覆盖回落 DEEPSEEK_MODEL;视觉不进映射表——走 api/llm_vision.py 的 ARK env,见 10.2);事件码常量登记(product_ingested / audit_passed / audit_rejected)。audit 表名常量随批次 B 首个消费方登记(PG 内部表名仓内惯例为 SQL 内联,非铁律 3 的外部资源) | `registry/db.py`、`registry/resources.py`、`services/product_events.py`(仅登记常量) |
 | A5 | 文档回销:backlog 第十节 8280e8 条、db_schema.md | docs |
 
 **验收**:db_init 幂等重跑通过;逐表行数两侧对齐;测试全绿(零行为变更)。

@@ -3,19 +3,32 @@
 用法:
   python cli.py audit_import                    # dry-run:逐表体检报告,不写一行
   python cli.py audit_import --execute          # 真搬(整轮单事务,失败全回滚)
-  python cli.py audit_import -p table=audit_runs --execute   # 只搬指定表
+  python cli.py audit_import -p table=audit_runs --execute   # 只搬指定表(外键对成对)
   python cli.py audit_import -p replace=yes --execute        # 目标非空时清掉重灌
 
-dry-run 报告逐表给出:源行数 / 目标行数 / 列对照(源独有列=致命——照搬会丢数据;
-目标独有列=吃默认值,警告;同名列类型不一致=致命)。三张"反推表"
-(pt_meta/pt_spec/prohibited_policy)旧仓无 DDL,本仓 DDL 是按 sync 脚本推定的,
-**必须先看 dry-run 的列对照,全绿才 --execute**;有致命项时 --execute 拒绝执行。
+dry-run 报告逐表给出:源行数 / 目标行数 / 列对照 / **将要执行的动作**——
+含 replace=yes 时的 TRUNCATE 预告(dry-run 必须把最危险的动作说出来,
+安全铁律)。列对照走 pg_attribute + format_type(含长度/精度)口径:
+  源独有列   = 致命(照搬会静默丢数据);
+  类型不一致 = 致命(先改 refdata/schema.sql 再来);
+  目标独有列 = 警告(导入吃默认值);
+  清单里的表在旧库不存在 = 致命(清单与旧库对不上,绝不静默少搬)。
+有致命项时 --execute 拒绝执行;execute 摘要含完整体检行,不吞警告。
 
-防重:目标表非空默认跳过该表;-p replace=yes 才 TRUNCATE 重灌(audit schema
-是我们的副本,清掉无损旧库;audit_runs 与 audit_hits 有外键,成对处理,
-TRUNCATE runs 用 CASCADE 并在报告中注明)。标识列(run_id/hit_id/id)按原值
-搬入,导入后 setval 续接自增。每表拷贝后源/目标行数必须相等,不等即抛错
-(整轮事务回滚)。旧库全程只读连接(registry.db.legacy_audit_conn)。
+三张"反推表"(pt_meta/pt_spec/prohibited_policy)旧仓无权威 DDL,
+**生产实表(pg_dump -s walmart_audit)才是最终基准**——执行前先核对一遍,
+dry-run 是最后一道网,不是设计手段(评审教训 2026-08-13)。
+
+前置纪律:搬迁窗口内旧审核系统的写入方必须先停(黑名单双调度 + worker,
+清单见 audit_migration_plan.md 批次 D)。源连接用 REPEATABLE READ 单快照
+(体检/计数/COPY 读同一份数据,自我一致),但快照外的新写入不会进来,
+停写才能保证"搬完即全量";行数不符时报错也会提示这个方向。
+
+防重:目标表非空默认跳过该表;-p replace=yes(也认 true/1,其余值报错)
+才 TRUNCATE 重灌(audit schema 是我们的副本,清掉无损旧库;audit_runs 用
+CASCADE 连清 audit_hits 后两表都重灌)。标识列(run_id/hit_id/id)按原值
+搬入,导入后 setval 续接(找不到序列即报错,不静默)。每表拷贝后源/目标
+行数必须相等,不等即抛错整轮回滚。旧库全程只读连接(registry.db)。
 
 不搬清单(docstring 即契约):products(catalog.products 取代)、
 llm_cache(catalog.llm_cache 已有)、sync_runs(ops.runs 取代)、
@@ -56,17 +69,19 @@ _IDENTITY = {"audit_runs": "run_id", "audit_hits": "hit_id",
              "walmart_error_records": "id"}
 
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+_TRUTHY = {"yes", "true", "1"}
 
 
 def diff_columns(src: list[tuple[str, str]],
                  tgt: list[tuple[str, str]]) -> tuple[list[str], list[str], list[str]]:
-    """输入:源/目标 (列名, 类型) 列表 → 输出:(致命问题, 警告, 可拷贝列序)。
+    """输入:源/目标 (列名, 完整类型) 列表 → 输出:(致命问题, 警告, 可拷贝列序)。
 
-    纯函数(便于测试)。判定口径:
+    纯函数(便于测试)。类型串来自 format_type,含长度/精度
+    (numeric(5,2) / character(1) 等),精度不符同样判致命。
       源独有列   → 致命(照搬会静默丢这列数据)
       类型不一致 → 致命(COPY 文本装载可能坏值,先改 DDL 再来)
       目标独有列 → 警告(导入后吃默认值/NULL,人眼确认即可)
-    可拷贝列序 = 源列顺序中双方共有的列。
+    可拷贝列序 = 源列顺序中双方同名同型的列。
     """
     src_map, tgt_map = dict(src), dict(tgt)
     fatal, warn = [], []
@@ -82,12 +97,27 @@ def diff_columns(src: list[tuple[str, str]],
     return fatal, warn, common
 
 
-def _columns(conn, schema: str, table: str) -> list[tuple[str, str]]:
+def _exists(conn, qualified: str) -> bool:
+    """to_regclass 判表存在——列查询返回空分不清"无表"与"无权限",这里分得清。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (qualified,))
+        return bool(cur.fetchone()[0])
+
+
+def _columns(conn, qualified: str) -> list[tuple[str, str]]:
+    """输入:连接 + schema.表名 → 输出:[(列名, format_type 完整类型)]。
+
+    走 pg_catalog 而非 information_schema:format_type 渲染含精度/长度
+    (numeric(5,2)、character(1)),且 pg_attribute 对所有角色可读,
+    不会因缺 SELECT 权限静默返回空列表。
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
-            (schema, table))
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_catalog.pg_attribute a "
+            "WHERE a.attrelid = to_regclass(%s) AND a.attnum > 0 "
+            "  AND NOT a.attisdropped ORDER BY a.attnum",
+            (qualified,))
         return [(r[0], r[1]) for r in cur.fetchall()]
 
 
@@ -120,49 +150,72 @@ def _pick_tables(params: dict) -> list[str]:
     return [want]
 
 
+def _parse_replace(params: dict) -> bool:
+    raw = str(params.get("replace", "")).strip().lower()
+    if not raw:
+        return False
+    if raw not in _TRUTHY:
+        raise ValueError(f"replace={raw!r} 无法识别(认 yes/true/1)——"
+                         f"宁可报错,不静默当没说")
+    return True
+
+
 def run(params: dict) -> str:
-    """输入:params(execute/table/replace)→ 输出:逐表体检或搬迁摘要。"""
+    """输入:params(execute/table/replace)→ 输出:逐表体检 + 搬迁摘要。"""
     execute = bool(params.get("execute"))
-    replace = str(params.get("replace", "")).lower() == "yes"
+    replace = _parse_replace(params)
     tables = _pick_tables(params)
 
-    lines, fatal_any = [], False
+    lines, plans, fatal_any = [], [], False
     with db.legacy_audit_conn() as src, db.pg_conn() as tgt:
-        plans = []
+        # 单快照:体检/计数/COPY 全程读同一份数据(防旧系统并发写导致
+        # "体检行数"与"实拷行数"错位;彻底的解法是先停旧写入方,见 docstring)
+        try:
+            from psycopg import IsolationLevel
+            src.isolation_level = IsolationLevel.REPEATABLE_READ
+        except ImportError:     # 测试假连接环境无 psycopg,隔离级别无语义
+            pass
         for t in tables:
-            src_cols = _columns(src, "public", t)
-            tgt_cols = _columns(tgt, "audit", t)
-            if not src_cols:
-                lines.append(f"✗ {t}: 旧库无此表(源列为空)——跳过")
+            q_src, q_tgt = f"public.{t}", f"audit.{t}"
+            if not _exists(src, q_src):
+                lines.append(f"✗ {t}: 旧库无此表——清单与旧库对不上,绝不静默少搬")
+                fatal_any = True
                 continue
-            if not tgt_cols:
+            if not _exists(tgt, q_tgt):
                 lines.append(f"✗ {t}: 目标 audit.{t} 不存在——先跑 db_init")
                 fatal_any = True
                 continue
-            fatal, warn, common = diff_columns(src_cols, tgt_cols)
-            n_src = _count(src, f"public.{t}")
-            n_tgt = _count(tgt, f"audit.{t}")
-            mark = "✗" if fatal else "✓"
+            fatal, warn, common = diff_columns(
+                _columns(src, q_src), _columns(tgt, q_tgt))
+            n_src, n_tgt = _count(src, q_src), _count(tgt, q_tgt)
             note = []
             if fatal:
                 fatal_any = True
                 note += [f"致命:{x}" for x in fatal]
             note += [f"警告:{x}" for x in warn]
-            if n_tgt and not replace:
+            if n_tgt and replace:
+                casc = "(CASCADE 连清 audit_hits 后两表重灌)" \
+                    if t == "audit_runs" else ""
+                note.append(f"动作:TRUNCATE {n_tgt} 行{casc}后重灌 {n_src} 行")
+            elif n_tgt:
                 note.append(f"目标已有 {n_tgt} 行——将跳过(要重灌加 -p replace=yes)")
-            lines.append(f"{mark} {t}: 源 {n_src} 行 / 目标 {n_tgt} 行"
-                         + (";" + ";".join(note) if note else ";列全对齐"))
-            plans.append((t, common, n_src, n_tgt, bool(fatal)))
+            else:
+                note.append(f"动作:导入 {n_src} 行")
+            mark = "✗" if fatal else "✓"
+            lines.append(f"{mark} {t}: 源 {n_src} 行 / 目标 {n_tgt} 行;"
+                         + ";".join(note))
+            plans.append((t, common, n_src, n_tgt))
 
         if not execute:
-            head = "audit_import dry-run 体检(不写一行;全绿后 --execute):"
-            return "\n".join([head, *lines])
+            return "\n".join(
+                ["audit_import dry-run 体检(不写一行;全绿后 --execute):", *lines])
         if fatal_any:
-            raise RuntimeError("存在致命列差异,拒绝搬迁——先按 dry-run 报告修 "
-                               "refdata/schema.sql 的 audit DDL:\n" + "\n".join(lines))
+            raise RuntimeError("存在致命项,拒绝搬迁——先按体检报告处置"
+                               "(改 refdata/schema.sql 或核对旧库):\n"
+                               + "\n".join(lines))
 
         done = []
-        for t, common, n_src, n_tgt, _ in plans:
+        for t, common, n_src, n_tgt in plans:
             if n_tgt and not replace:
                 done.append(f"跳过 {t}(目标非空)")
                 continue
@@ -174,11 +227,18 @@ def run(params: dict) -> str:
             _copy_table(src, tgt, t, common)
             n_new = _count(tgt, f"audit.{t}")
             if n_new != n_src:
-                raise RuntimeError(f"{t} 行数不符:源 {n_src} / 导入后 {n_new},整轮回滚")
+                raise RuntimeError(
+                    f"{t} 行数不符:源 {n_src} / 导入后 {n_new}——源库仍在被写入?"
+                    f"(前置纪律:先停旧调度与 worker)整轮回滚")
             if t in _IDENTITY:
                 col = _IDENTITY[t]
-                tgt.execute(
+                cur = tgt.execute(
                     f"SELECT setval(pg_get_serial_sequence('audit.{t}', '{col}'), "
                     f"coalesce((SELECT max({col}) FROM audit.{t}), 0) + 1, false)")
+                if cur.fetchone()[0] is None:
+                    raise RuntimeError(
+                        f"{t}.{col} 找不到自增序列——identity 定义丢失,整轮回滚")
             done.append(f"{t}: {n_src} 行 ✓")
-        return "audit_import 完成(单事务):\n" + "\n".join(done)
+        # 体检行随摘要一并返回:警告(目标独有列等)不因 execute 而被吞掉
+        return "\n".join(["audit_import 完成(单事务)。体检:", *lines,
+                          "── 执行:", *done])

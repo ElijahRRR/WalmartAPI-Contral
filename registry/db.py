@@ -1,6 +1,6 @@
 """数据库连接唯一入口(工程规范:禁止在其他任何文件自行 psycopg.connect / sqlite3.connect)。
 
-- 业务数据连本机 PostgreSQL 17 库 walmart_data(四 schema 见 docs/db_schema.md)。
+- 业务数据连本机 PostgreSQL 17 库 walmart_data(五 schema 见 docs/db_schema.md)。
 - 可重建缓存用 <DATA_ROOT>/cache 下的 SQLite(内置 WAL + busy_timeout)。
 """
 

@@ -197,3 +197,14 @@ def test_product_info_from_row_bullet_shapes():
     assert p3.bullet_points == ["line1", "line2"]
     p4 = audit_rules.product_info_from_row({**base, "bullet_points": None})
     assert p4.bullet_points == [] and p4.brand == ""
+
+
+# ── audit_calibrate:旧中间判决口径(spec_vectors §4.3)───────────────────────
+
+def test_old_intermediate_mapping():
+    from workflows.audit_calibrate import old_intermediate
+    assert old_intermediate("L0", "reject") == "reject"
+    assert old_intermediate("L2", "reject") == "reject"
+    assert old_intermediate("L3", "reject") == "pass"   # LLM 层拦的,批次 B 没有
+    assert old_intermediate("L4", "reject") == "pass"
+    assert old_intermediate(None, "pass") == "pass"

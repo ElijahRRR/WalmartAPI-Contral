@@ -308,10 +308,11 @@ def test_judge_requires_images_or_conn():
 
 
 class _Cur:
-    def __init__(self, row):
-        self.row = row
-        self.sql = None
+    def __init__(self, rows):
+        self.rows = list(rows)       # 每次 execute 消费一个结果
+        self.sqls = []
         self.args = None
+        self.row = None
 
     def __enter__(self):
         return self
@@ -320,32 +321,46 @@ class _Cur:
         return False
 
     def execute(self, sql, args):
-        self.sql, self.args = sql, args
+        self.sqls.append(sql)
+        self.args = args
+        self.row = self.rows.pop(0) if self.rows else None
 
     def fetchone(self):
         return self.row
 
 
 class _Conn:
-    def __init__(self, row):
-        self.cur = _Cur(row)
+    def __init__(self, *rows):
+        self.cur = _Cur(rows)
 
     def cursor(self):
         return self.cur
 
 
-def test_load_product_images_reads_latest_snapshot_with_images():
+def test_load_product_images_primary_products_slow():
+    """评审 P0 修正:主源 = products.slow->'images'(契约 v1 顶层必填段);
+    命中主源就不再查快照兜底。"""
     conn = _Conn((["http://img/a.jpg", "http://img/b.jpg"],))
     assert audit_l4.load_product_images(conn, "B0X") == [
         "http://img/a.jpg", "http://img/b.jpg"]
     assert conn.cur.args == ("US", "B0X")
-    assert "ORDER BY s.scraped_at DESC" in conn.cur.sql
-    assert "jsonb_array_length" in conn.cur.sql
+    assert len(conn.cur.sqls) == 1
+    assert "catalog.products" in conn.cur.sqls[0]
+    assert "jsonb_array_length" in conn.cur.sqls[0]
+
+
+def test_load_product_images_snapshot_fallback():
+    """products.slow 无图 → 回落最新含图快照(真兜底:同函数内、记日志)。"""
+    conn = _Conn(None, (["http://img/c.jpg"],))
+    assert audit_l4.load_product_images(conn, "B0X") == ["http://img/c.jpg"]
+    assert len(conn.cur.sqls) == 2
+    assert "catalog.snapshots" in conn.cur.sqls[1]
+    assert "ORDER BY s.scraped_at DESC" in conn.cur.sqls[1]
 
 
 def test_load_product_images_absent():
-    assert audit_l4.load_product_images(_Conn(None), "B0X") == []
-    assert audit_l4.load_product_images(_Conn((None,)), "B0X") == []
+    assert audit_l4.load_product_images(_Conn(None, None), "B0X") == []
+    assert audit_l4.load_product_images(_Conn((None,), (None,)), "B0X") == []
 
 
 # ---------------------------------------------------------------- api/llm_vision

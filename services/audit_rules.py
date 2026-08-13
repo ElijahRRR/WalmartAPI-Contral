@@ -184,10 +184,13 @@ def load_context(conn, *, uspto=None) -> AuditContext:
                                      "WHERE category_en IS NOT NULL"),
         # 批次 C:①b 报错日报实证(批复 #10)与 Layer 0 哨兵路径集
         error_confirmed=audit_l1_llm.error_confirmed_map(conn, pt_meta),
+        # btrim 与 catmap 的 cat.strip() 对称(评审 P2:带尾空白的哨兵行漏拦,
+        # 同路径另一行高置信 PT 反而 strip 后进 catmap → 硬拒变直出)
         unmapped_paths=_frozen(
-            conn, "SELECT DISTINCT amazon_category FROM "
+            conn, "SELECT DISTINCT btrim(amazon_category) FROM "
                   "audit.walmart_category_map "
-                  f"WHERE walmart_product_type = '{_UNMAPPED_SENTINEL}'"),
+                  f"WHERE walmart_product_type = '{_UNMAPPED_SENTINEL}' "
+                  "AND btrim(amazon_category) <> ''"),
     )
 
 
@@ -239,6 +242,7 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     if pt:
         seed = audit_l1_llm.check_seed_excluded(product, pt)
         if seed:
+            audit_l1_llm.STATS["seed_excluded_direct"] += 1   # 直出级单独键
             l1.excluded_category_reason = seed
             l1.hits.append(RuleHit(
                 stage="L1", rule_code="excluded_category", penalty=-100,
@@ -279,13 +283,21 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
         # L1 第三级:候选召回 + rerank(哨兵命中带 -100 hit 者不进——已判死)。
         # 空候选由 rerank 自己短路(合同 L1-5:不调 LLM 直接解不出)
         cands = audit_l1_llm.candidates(conn, product)
-        pt_dict = ctx.pt_meta.keys() | ctx.pt_spec.keys()
-        l1_llm = audit_l1_llm.rerank(product, cands, pt_dict)
+        # 字典收窄为 pt_meta(评审 P0 修正:旧仓 pt_meta∪pt_spec,但 L2 四硬闸
+        # 全部只查 pt_meta——spec-only PT 直出会四闸失明产假 pass,还经 real_pt
+        # 把 meta 表没有的 PT 写进身份层;候选 SQL 本就 JOIN pt_meta,零召回损失)
+        l1_llm = audit_l1_llm.rerank(product, cands, ctx.pt_meta.keys())
         if l1_llm is not None:
-            l1 = l1_llm
-            meta = ctx.pt_meta.get(l1.walmart_product_type)
-            if meta:
-                l1.walmart_category = meta.get("walmart_category")
+            pt3 = l1_llm.walmart_product_type
+            if pt3 and pt3 != "unknown" and pt3 not in ctx.pt_meta \
+                    and not l1_llm.hits:
+                logger.warning("L1 第三级产出 pt_meta 外 PT %r,转 pending "
+                               "(asin=%s)", pt3, product.asin)   # 防御,与 resolve_pt 同款
+            else:
+                l1 = l1_llm
+                meta = ctx.pt_meta.get(l1.walmart_product_type)
+                if meta:
+                    l1.walmart_category = meta.get("walmart_category")
     if not l1.walmart_product_type and not l1.hits:
         # PT 解不出(rerank unknown/LLM 失败/坏 JSON/无候选)→ pending,
         # 绝不默认放行(10.2)。哨兵/excluded 命中(有 -100 hit)不走此路

@@ -55,6 +55,7 @@ _STATS_KEYS = (
     "llm_called", "llm_failed", "bad_json", "dict_fallback",
     "unknown", "no_candidate", "seed_excluded", "llm_excluded",
     "publication_forbidden", "conf_low",
+    "seed_excluded_direct",   # 接线层:①②直出级 seed 命中(与 rerank 级分开)
 )
 
 

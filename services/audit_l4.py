@@ -62,10 +62,21 @@ MAX_RAW_SNIPPET = 200
 # 图片取数(合同 L4-2)
 # =============================================================
 
-# 取**最新一条含图快照**:纯价格刷新的快照没有 slow 段,若死认"最新一条快照"
-# 会让绝大多数产品恒无图(L4 名存实亡)。不设新鲜度门槛 —— 合同原文
-# "不套 24h 新鲜度门槛(图不像价格易变),取最新快照即可"。
+# 主源 = catalog.products.slow->'images'(评审 P0 修正:采集契约 v1 里 slow
+# 是 record 顶层必填段,由 product_ingest 落进 products.slow;snapshots.raw
+# 是"可选、裁剪后的原始载荷"**不保证内嵌 slow**——按 raw 取会让 L4 恒无图、
+# 整层静默空转,listing_plan.md:162 记过同款事故)。amz_source._images 同源。
 _IMAGES_SQL = """
+SELECT p.slow -> 'images'
+FROM catalog.products p
+WHERE p.marketplace = %s AND p.asin = %s
+  AND jsonb_typeof(p.slow -> 'images') = 'array'
+  AND jsonb_array_length(p.slow -> 'images') > 0
+"""
+
+# 兜底 = 最新一条 raw 内嵌 slow.images 的快照(老行/契约外形态)。真兜底
+# 三要件(CLAUDE.md):藏在同一函数内、触发记日志计数、条件封闭非 catch-all
+_IMAGES_FALLBACK_SQL = """
 SELECT s.raw -> 'slow' -> 'images'
 FROM catalog.snapshots s
 WHERE s.marketplace = %s AND s.asin = %s
@@ -77,13 +88,20 @@ LIMIT 1
 
 
 def load_product_images(conn, asin: str, marketplace: str = "US") -> list[str]:
-    """输入:连接 + ASIN → 输出:该 ASIN 最新含图快照的图片 URL 列表(原序,首图=主图)。
+    """输入:连接 + ASIN → 输出:产品图片 URL 列表(原序,首图=主图)。
 
-    没有任何含图快照 → 返回 []('无图'走 F1 路径:维持 pass + 告警 hit)。
+    主源 products.slow.images;缺席时回落最新含图快照(计数告警)。
+    两处都没有 → 返回 []('无图'走 F1 路径:维持 pass + 告警 hit)。
     """
     with conn.cursor() as cur:
         cur.execute(_IMAGES_SQL, (marketplace, asin))
         row = cur.fetchone()
+        if not row or not row[0]:
+            cur.execute(_IMAGES_FALLBACK_SQL, (marketplace, asin))
+            row = cur.fetchone()
+            if row and row[0]:
+                logger.warning("L4 取图走快照兜底(products.slow 无图):asin=%s",
+                               asin)
     if not row or not row[0]:
         return []
     return [str(u) for u in row[0] if u]

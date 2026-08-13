@@ -63,10 +63,18 @@ LEFT JOIN LATERAL (
       AND s.outcome = 'ok'
     ORDER BY s.scraped_at DESC LIMIT 1
 ) sn ON true
-WHERE p.marketplace = %(marketplace)s AND ({where})
+WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
 ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
 """
+
+# dry-run 复烧护栏(评审 P1-1):dry-run 不动 audited_at,同一批候选会被
+# 连续 dry-run 反复领走——L1 rerank/L4 不缓存,每轮全额重付 LLM 费用。
+# runs 是 dry-run 也落的,拿它做 24h 排除;asins= 强审除外(点名就要审)
+_RECENT_RUN_GUARD = """
+ AND NOT EXISTS (
+    SELECT 1 FROM audit.audit_runs r
+    WHERE r.asin = p.asin AND r.created_at > now() - interval '24 hours')"""
 # 排序契约:从未审过的(audited_at NULL)永远先于重试的 pending——
 # 否则 pending 存量 ≥ limit 时新入库产品会被饿死(评审 P1-3)
 
@@ -185,8 +193,14 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn, uspto_cm as uspto:
         ctx = audit_rules.load_context(conn, uspto=uspto)
         query_params = {"marketplace": "US", "limit": limit, **extra}
+        # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
+        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
+        guard = (_RECENT_RUN_GUARD
+                 if (not execute and "asins" not in extra) else "")
         with conn.cursor() as cur:
-            cur.execute(_CANDIDATE_SQL.format(where=where), query_params)
+            cur.execute(_CANDIDATE_SQL.format(where=where,
+                                              recent_guard=guard),
+                        query_params)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -199,8 +213,10 @@ def run(params: dict) -> str:
         no_title = seller_missing = policy_unknown = 0
         stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
                        "L4_ran": 0, "L4_reject": 0}
+        l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         events = []
+        row_errors, consec_errors = 0, 0
         for row in rows:
             if row["asin"] in adopted:
                 continue
@@ -210,8 +226,29 @@ def run(params: dict) -> str:
             if not row.get("seller_id"):
                 seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
             product = audit_rules.product_info_from_row(row)
-            outcome = audit_rules.audit_one(product, ctx, conn,
-                                            run_l3=run_l3, run_l4=run_l4)
+            try:
+                # 每行 savepoint(评审 P2:批次 C 单行 SQL 面变大,一行报错
+                # 不许炸掉整批已付费的 runs/hits);连错 ≥5 = 系统性故障,炸停
+                with conn.transaction():
+                    outcome = audit_rules.audit_one(product, ctx, conn,
+                                                    run_l3=run_l3,
+                                                    run_l4=run_l4)
+                    run_id = audit_store.persist_run(conn, outcome)
+                    if execute:
+                        audit_store.write_conclusion(conn, outcome)
+                        ev = audit_store.event_row(outcome, run_id)
+                        if ev:
+                            events.append(ev)
+            except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
+                row_errors += 1
+                consec_errors += 1
+                logger.error("单行审核失败 asin=%s:%s", row["asin"], e)
+                if consec_errors >= 5:
+                    raise RuntimeError(
+                        f"连续 {consec_errors} 行失败(共 {row_errors}),"
+                        f"疑似系统性故障,停批。最后错误:{e}") from e
+                continue
+            consec_errors = 0
             if outcome.l3 is not None:
                 stage_stats["L3_ran"] += 1
                 if outcome.l3.verdict == "reject":
@@ -222,17 +259,14 @@ def run(params: dict) -> str:
                 stage_stats["L4_ran"] += 1
                 if outcome.l4.verdict == "reject":
                     stage_stats["L4_reject"] += 1
+                for h in outcome.l4.hits:
+                    if h.penalty == 0 and h.rule_code.startswith("l4_"):
+                        l4_fail[h.rule_code] = l4_fail.get(h.rule_code, 0) + 1
             counts[outcome.verdict] += 1
             if (outcome.verdict == "reject" and ctx.known_policies
                     and not audit_reason.known_policies_check(
                         outcome.final_reason_category, ctx.known_policies)):
                 policy_unknown += 1
-            run_id = audit_store.persist_run(conn, outcome)
-            if execute:
-                audit_store.write_conclusion(conn, outcome)
-                ev = audit_store.event_row(outcome, run_id)
-                if ev:
-                    events.append(ev)
         if execute and events:
             product_events.record_many(conn, events)
 
@@ -258,6 +292,14 @@ def run(params: dict) -> str:
                      f"字典回落 {l1s.get('dict_fallback', 0)},"
                      f"无候选→待定 {l1s.get('no_candidate', 0)},"
                      f"低置信采纳 {l1s.get('conf_low', 0)}")
+    l1_blocked = (l1s.get("seed_excluded_direct", 0)
+                  + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
+                  + l1s.get("publication_forbidden", 0))
+    if l1_blocked:
+        lines.append(f"L1 硬拦:直出级 seed {l1s.get('seed_excluded_direct', 0)}"
+                     f" / rerank 级 excluded {l1s.get('llm_excluded', 0)}"
+                     f"(seed 补位 {l1s.get('seed_excluded', 0)})"
+                     f" / 出版物 {l1s.get('publication_forbidden', 0)}")
     if stage_stats["L3_ran"]:
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"
@@ -265,6 +307,13 @@ def run(params: dict) -> str:
     if stage_stats["L4_ran"]:
         lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
                      f"(拒 {stage_stats['L4_reject']})")
+    if l4_fail:
+        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
+        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
+        lines.append(f"⚠ L4 故障回落 pass:{detail}"
+                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
+    if row_errors:
+        lines.append(f"⚠ 单行失败跳过 {row_errors}(savepoint 隔离,详见日志)")
     if "asins" in extra and len(rows) < len(extra["asins"]):
         lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
                      f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")

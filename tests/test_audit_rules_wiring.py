@@ -426,6 +426,51 @@ def test_pick_where_accepts_l3_l4_params():
     assert "IS NULL OR" in w      # 白名单收编,不炸
 
 
+def test_rerank_exit_pt_meta_gate(monkeypatch):
+    """评审 P0:rerank 出口过 pt_meta 闸——spec-only PT 直出会让 L2 四闸失明
+    产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。"""
+    from services import audit_l1_llm
+    ctx = _ctx(pt_meta=META, pt_spec={"SpecOnlyPT": {}})
+    p = ProductInfo(asin="B0Z", title="widget", amazon_category_path="X > Y")
+    seen = {}
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "SpecOnlyPT", "confidence": "高"}])
+
+    def fake_rerank(pr, cands, ptd, **k):
+        seen["dict"] = set(ptd)
+        return audit_rules.L1Info(walmart_product_type="SpecOnlyPT",
+                                  pt_confidence="高", pt_source="map_verified")
+    monkeypatch.setattr(audit_l1_llm, "rerank", fake_rerank)
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert seen["dict"] == {"GoodPT"}          # 字典收窄为 pt_meta
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_reason_mapper_l4_medium_falls_to_general_use():
+    """已知缺陷照迁钉住(评审 P2-4):reason 步(3)只认 confidence=='high',
+    aggressive 模式下仅由 offensive medium 触发的 L4 reject 落不到 L4 分支,
+    一路兜到 General-Use Products。改它=行为变更,须双跑出数据后由所有者批。"""
+    from services.audit_l4 import L4Result
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                     stage_stopped_at="L4",
+                     l1=L1Info(walmart_product_type="GoodPT"))
+    o.l4 = L4Result(verdict="reject", image_issues=[
+        {"image_index": 0, "issue": "offensive gesture",
+         "confidence": "medium"}])
+    from services.audit_reason import compute_final_reason
+    assert compute_final_reason(o, ProductInfo(asin="B0", title="t")) \
+        == "General-Use Products"
+
+
+def test_candidate_sql_recent_guard_shape():
+    """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
+    sql = product_audit._CANDIDATE_SQL.format(
+        where="x", recent_guard=product_audit._RECENT_RUN_GUARD)
+    assert "NOT EXISTS" in sql and "interval '24 hours'" in sql
+    plain = product_audit._CANDIDATE_SQL.format(where="x", recent_guard="")
+    assert "NOT EXISTS" not in plain
+
+
 # ── 行适配 ───────────────────────────────────────────────────────────────────
 
 def test_product_info_from_row_bullet_shapes():

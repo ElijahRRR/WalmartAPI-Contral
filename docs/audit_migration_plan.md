@@ -240,6 +240,13 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
   `asin_blacklist_import` 工作流去重导入 `catalog.asin_blacklist`
   (category='LEGACY',source='历史继承',已有键 DO NOTHING 不覆盖)。
 
+**病历回填(2026-08-13 所有者需求)**:病历里要一眼看到历史审核结论。
+沿用 cleanup_history_import 先例(时间线折叠),`audit_history_fold`
+一次性把历史 audit_runs(SHORTCUT 排除、product_audit 首跑前)折叠成
+每 ASIN 的结论**变迁点**事件(audit_passed/audit_rejected,
+source=audit_history_fold,occurred_at=原时间戳);幂等=按 source
+擦净重灌。204 万 runs 预计折到十几万事件,预览模式先报体量。
+
 ## 十、审核域架构定稿(2026-08-13 草案;所有者确认后再出细化迁移计划)
 
 ### 10.1 总结论:现有五层架构完全适用,零破例

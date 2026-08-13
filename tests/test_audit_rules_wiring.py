@@ -281,3 +281,17 @@ def test_calibrate_default_since_from_ops_runs():
     t = datetime(2026, 8, 13, 8, 6, 0, tzinfo=timezone.utc)
     assert _default_since(_Conn(t)) == t.isoformat()
     assert _default_since(_Conn(None)) is None
+
+
+# ── audit_history_fold:折叠口径钉子(SQL 在库内执行,钉不变量)────────────────
+
+def test_history_fold_sql_invariants():
+    from workflows import audit_history_fold as f
+    for sql in (f._PREVIEW_SQL, f._INSERT_SQL):
+        assert "IS DISTINCT FROM 'SHORTCUT'" in sql      # 影子行必须排除
+        assert "verdict IN ('pass', 'reject')" in sql    # pending 不进病历
+        assert "created_at < coalesce(%(cutoff)s" in sql  # 新系统 runs 不双记
+    assert "verdict IS DISTINCT FROM prev" in f._INSERT_SQL  # 只投变迁点
+    assert "occurred_at" in f._INSERT_SQL                # 带原始时间戳
+    # 擦净重灌只许删自己 source 的行(账本只追加的唯一例外,范围必须钉死)
+    assert f.SOURCE == "audit_history_fold"

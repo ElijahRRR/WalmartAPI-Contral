@@ -144,7 +144,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)
 - 采集侧一周连续验收(scraper_migration_brief.md:245)未开始;两侧契约副本的定期对账机制未建(:113-116)
 - 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),届时复查(maintenance.py:24)
-- Phase 1:✅ ~~令牌桶~~(2026-08-12 完成:稀缺桶落 ops.rate_events 跨进程共享,PG 不可达 fail hard——所有者拍板;详见 plan.md Phase 1)、async 订单拉取、feeds errorReport 随 listing
+- Phase 1:✅ ~~令牌桶~~(2026-08-12 完成:稀缺桶落 ops.rate_events 跨进程共享,PG 不可达 fail hard——所有者拍板;详见 plan.md Phase 1)、✅ ~~async 订单拉取~~(2026-08-13 完成:fetch_orders_bulk 跨店并发,order_sync 已接线)、feeds errorReport 下载(P3 可选)
 - ✅ ~~历史数据迁移总批次~~(所有者逐项拍板 2026-08-12,**整批关闭**):
   上架表 26 列**不迁**;UPC 池 12 万行**不迁**(还有用的 UPC 所有者手动写入
   现 catalog.upc_pool);旧 pending_feeds **不处理**(所有者自己在旧系统看);

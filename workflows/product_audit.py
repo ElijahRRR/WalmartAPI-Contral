@@ -49,6 +49,7 @@ _CANDIDATE_SQL = """
 SELECT p.asin,
        p.title,
        p.brand,
+       p.walmart_pt,
        p.amazon_category AS amazon_category_path,
        p.slow -> 'bullet_points' AS bullet_points,
        coalesce(p.slow ->> 'description',
@@ -64,9 +65,14 @@ LEFT JOIN LATERAL (
     ORDER BY s.scraped_at DESC LIMIT 1
 ) sn ON true
 WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
+  AND p.title IS NOT NULL AND p.title <> ''
 ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
 """
+# ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
+#   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
+#   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,
+#   会体现在"库中命中 N"的缺口提示里(空壳行没有可审内容,过滤是对的)
 
 # dry-run 复烧护栏(评审 P1-1):dry-run 不动 audited_at,同一批候选会被
 # 连续 dry-run 反复领走——L1 rerank/L4 不缓存,每轮全额重付 LLM 费用。

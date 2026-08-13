@@ -10,7 +10,6 @@
   rerank(product, cands, pt_dict)      → L1Info(判出来了) 或 None(解不出 → 调用方转 pending)
   check_seed_excluded(product, pt)     → seed yaml 禁售品类 reason 或 None(L1 三级共用)
   check_publication_ban(pt, reason)    → 出版物类 PT 硬禁 RuleHit 或 None(L1 三级共用)
-  error_confirmed_map(conn, pt_meta)   → asin → PT(第①级第二数据源:历史报错日报实证 PT)
 
 失败语义(合同全局节 / 计划 10.2:单链无自动降级):LLM 抛异常、坏 JSON、
 LLM 输出 unknown、字典外 PT 且候选全不可用、无候选——一律返回 None 由调用方
@@ -171,48 +170,6 @@ def check_publication_ban(pt: str | None,
                      "/ Comics 100% / Sheet Music 100% / Autographed 100%",
         },
     )
-
-
-# =============================================================
-# 第①级第二数据源:历史报错日报里的实证 PT
-# =============================================================
-
-
-def error_confirmed_map(conn, pt_meta) -> dict[str, str]:
-    """输入:中心库连接 + pt_meta 字典 → 输出:asin → PT(报错/删除历史实证 PT)。
-
-    合同 L1-8 / 批复 #10("历史报错数据里有沃尔玛认定的真实类目")。两个同性质
-    实证源按时间戳合并、每 ASIN 取最新:
-      · 报错日报 audit.walmart_error_records(recorded_at;'default' 剔除,
-        口径照抄旧仓 evals/l1_accuracy_eval.py:44-53);
-      · 删除历史 audit.deleted_items_pt(run_ts;deleted_pt_import 灌入,
-        所有者提议 2026-08-13——后台删除快照同样是沃尔玛认定的 PT)。
-    再过 pt_meta 闸(与 walmart_items 同款:废弃 PT 直出会让 L2 四闸集体失明)。
-
-    与 walmart_items 冲突时**以在架优先**——由调用方(load_context/resolve_pt)
-    保证顺序,本函数只出数据,pt_source 建议 'walmart_error_confirmed'。
-    """
-    out: dict[str, str] = {}
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT DISTINCT ON (asin) asin, pt FROM (
-                SELECT asin, walmart_pt AS pt, recorded_at AS t
-                FROM audit.walmart_error_records
-                WHERE walmart_pt IS NOT NULL AND walmart_pt != 'default'
-                UNION ALL
-                SELECT asin, product_type, run_ts
-                FROM audit.deleted_items_pt
-            ) u
-            WHERE asin IS NOT NULL
-            ORDER BY asin, t DESC NULLS LAST
-            """
-        )
-        for asin, pt in cur.fetchall():
-            if asin and pt and pt in pt_meta:
-                out[asin] = pt
-    logger.info("报错/删除历史实证 PT:%d 个 ASIN(已过 pt_meta 闸)", len(out))
-    return out
 
 
 # =============================================================
@@ -748,5 +705,4 @@ __all__ = [
     "build_user_prompt",
     "check_seed_excluded",
     "check_publication_ban",
-    "error_confirmed_map",
 ]

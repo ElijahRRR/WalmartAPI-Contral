@@ -229,16 +229,20 @@ _META_C = {**META,
                      "requirements": "", "notes": ""}}
 
 
-def test_resolve_pt_error_confirmed_second_source():
-    """①b 报错日报实证(批复 #10):在架实证优先,报错实证次之。"""
-    ctx = _ctx(pt_meta=META, error_confirmed={"B0X": "GoodPT"})
-    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X"), ctx)
+def test_resolve_pt_known_pt_second_source():
+    """①b 产品行已知 PT(pt_backfill 回填的历史实证;所有者定稿:PT 长在
+    产品主档不查边表):在架实证优先,行 PT 次之,废弃 PT 过闸。"""
+    ctx = _ctx(pt_meta=META)
+    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X", known_pt="GoodPT"), ctx)
     assert l1.walmart_product_type == "GoodPT"
-    assert l1.pt_source == "walmart_error_confirmed"
-    both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"},
-                error_confirmed={"B0X": "GoodPT"})
-    assert audit_rules.resolve_pt(ProductInfo(asin="B0X"),
-                                  both).pt_source == "walmart_confirmed"
+    assert l1.pt_source == "historical_confirmed"
+    both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0X", known_pt="GoodPT"),
+        both).pt_source == "walmart_confirmed"
+    dead = audit_rules.resolve_pt(
+        ProductInfo(asin="B0Y", known_pt="DeadPT"), ctx)
+    assert dead.walmart_product_type is None      # 行 PT 不在 pt_meta → 不采
 
 
 def test_resolve_pt_sentinel_hard_reject_after_evidence():
@@ -426,17 +430,21 @@ def test_pick_where_accepts_l3_l4_params():
     assert "IS NULL OR" in w      # 白名单收编,不炸
 
 
-def test_deleted_pt_fold_rows():
-    """删除历史实证折叠:extract_asin 归一、同 ASIN 多店取 run_ts 新者。"""
+def test_pt_backfill_fold_rows():
+    """历史实证折叠:extract_asin 归一、同 ASIN 多行取时间新者、None ts 最旧。"""
     from datetime import datetime
-    from workflows.deleted_pt_import import fold_rows
+    from workflows.pt_backfill import _UPSERT_SQL, fold_rows
     t1, t2 = datetime(2026, 5, 1), datetime(2026, 6, 1)
     rows = [("XKJ-B0ABCDEFGH-39.98", "OldPT", t1),
             ("B0ABCDEFGH", "NewPT", t2),           # 同 ASIN 更新的一条胜
+            ("B1ABCDEFGH", "TsPT", None),          # None ts 视为最旧
+            ("B1ABCDEFGH", "NewerPT", t1),
             ("102460026733", "AnyPT", t1)]          # 纯数字提不出 ASIN → 剔
     folded, no_asin = fold_rows(rows)
-    assert folded == {"B0ABCDEFGH": ("NewPT", t2)}
+    assert folded == {"B0ABCDEFGH": ("NewPT", t2), "B1ABCDEFGH": ("NewerPT", t1)}
     assert no_asin == 1
+    # 只填空语义钉死:回填绝不覆盖审核结论/既有值
+    assert "WHERE catalog.products.walmart_pt IS NULL" in _UPSERT_SQL
 
 
 def test_rerank_exit_pt_meta_gate(monkeypatch):

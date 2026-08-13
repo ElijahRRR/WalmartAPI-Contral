@@ -48,7 +48,6 @@ class AuditContext:
     catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
     known_policies: frozenset = frozenset()                  # 37 政策 category_en 集合
     uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
-    error_confirmed: dict = field(default_factory=dict)      # asin → PT(报错日报实证,已 pt_meta 闸;批次 C)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
 
 
@@ -182,8 +181,8 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         known_policies=_frozen(conn, "SELECT category_en FROM "
                                      "audit.walmart_prohibited_policy "
                                      "WHERE category_en IS NOT NULL"),
-        # 批次 C:①b 报错日报实证(批复 #10)与 Layer 0 哨兵路径集
-        error_confirmed=audit_l1_llm.error_confirmed_map(conn, pt_meta),
+        # 批次 C:Layer 0 哨兵路径集(①b 历史实证改读产品行 walmart_pt,
+        # 经 pt_backfill 回填,不再装配证据 map——所有者定稿 2026-08-13)
         # btrim 与 catmap 的 cat.strip() 对称(评审 P2:带尾空白的哨兵行漏拦,
         # 同路径另一行高置信 PT 反而 strip 后进 catmap → 硬拒变直出)
         unmapped_paths=_frozen(
@@ -213,10 +212,10 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     source, conf = None, None
     if pt:
         source, conf = "walmart_confirmed", "高"
-    else:
-        pt = ctx.error_confirmed.get(product.asin)
-        if pt:
-            source, conf = "walmart_error_confirmed", "高"
+    elif product.known_pt and product.known_pt in ctx.pt_meta:
+        # ①b 产品行已知 PT(pt_backfill 回填的历史实证/先前结论;所有者
+        # 定稿 2026-08-13:PT 长在产品主档,不查证据边表)
+        pt, source, conf = product.known_pt, "historical_confirmed", "高"
     path = (product.amazon_category_path or "").strip()
     if not pt and path and path in ctx.unmapped_paths:
         # Layer 0 哨兵(l1_category.py:779-797 字面量逐字:unknown/低/none 三件
@@ -372,4 +371,5 @@ def product_info_from_row(row: dict):
         amazon_category_path=row.get("amazon_category_path") or "",
         seller_id=row.get("seller_id") or "",
         seller_name=row.get("seller_name") or "",
+        known_pt=row.get("walmart_pt") or None,
     )

@@ -1002,17 +1002,6 @@ CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(repo
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
 
--- 删除历史实证 PT(所有者提议 2026-08-13:walmart_cleanup.error_items 41.7 万行
--- 后台删除快照带 product_type = 沃尔玛认定 PT,报错日报之外的第二实证源)。
--- deleted_pt_import 一次性灌入(每 ASIN 只留最新 run_ts 一条,upsert 可重跑);
--- 消费方 audit_l1_llm.error_confirmed_map 与报错日报按时间戳合并取最新
-CREATE TABLE IF NOT EXISTS audit.deleted_items_pt (
-    asin         text PRIMARY KEY,     -- extract_asin(sku) 归一;提不出的行不进
-    product_type text NOT NULL,
-    run_ts       timestamptz NOT NULL, -- 该 ASIN 最新一次出现在删除快照的时刻
-    imported_at  timestamptz NOT NULL DEFAULT now()
-);
-
 -- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
 CREATE TABLE IF NOT EXISTS audit.walmart_pt_meta (

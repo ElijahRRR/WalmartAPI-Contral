@@ -434,17 +434,6 @@ def test_publication_ban_applies_to_rerank_output():
     assert l1.STATS["publication_forbidden"] == 1
 
 
-# ── 6. 第①级第二数据源:历史报错日报实证 PT ───────────────────────────────
-
-def test_error_confirmed_map_sql_and_pt_meta_gate():
-    cur = FakeCursor({"walmart_error_records": (
-        ["asin", "walmart_pt"],
-        [("B01", "GoodPT"), ("B02", "DeadPT"), ("B03", None), ("", "GoodPT")])})
-    out = l1.error_confirmed_map(FakeConn(cur), {"GoodPT": {}})
-    assert out == {"B01": "GoodPT"}          # 废弃 PT / 空值 / 空 ASIN 全过闸
-    sql = cur.executed[0][0]
-    assert "DISTINCT ON (asin)" in sql
-    assert "walmart_pt != 'default'" in sql
-    assert "ORDER BY asin, t DESC NULLS LAST" in sql   # 双源按时间戳合并取最新
-    assert "audit.walmart_error_records" in sql
-    assert "audit.deleted_items_pt" in sql             # 删除历史实证(第二源)
+# (原第①级第二数据源 error_confirmed_map 已随所有者定稿移除:历史实证 PT
+#  经 pt_backfill 直接回填 products.walmart_pt,resolve_pt ①b 读产品行——
+#  测试见 test_audit_rules_wiring.test_resolve_pt_known_pt_second_source)

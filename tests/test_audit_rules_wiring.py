@@ -247,3 +247,37 @@ def test_old_intermediate_mapping():
     assert old_intermediate("L3", "reject") == "pass"   # LLM 层拦的,批次 B 没有
     assert old_intermediate("L4", "reject") == "pass"
     assert old_intermediate(None, "pass") == "pass"
+
+
+def test_calibrate_default_since_from_ops_runs():
+    """切点不写死(UTC+8 生产机上 16:00Z 硬编码把当天新侧整批切没,实测事故):
+    取 ops.runs 里 product_audit 的 min(started_at),没跑过 → None。"""
+    from datetime import datetime, timezone
+    from workflows.audit_calibrate import _default_since
+
+    class _Cur:
+        def __init__(self, val):
+            self._val = val
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            assert "product_audit" in sql
+
+        def fetchone(self):
+            return (self._val,)
+
+    class _Conn:
+        def __init__(self, val):
+            self._val = val
+
+        def cursor(self):
+            return _Cur(self._val)
+
+    t = datetime(2026, 8, 13, 8, 6, 0, tzinfo=timezone.utc)
+    assert _default_since(_Conn(t)) == t.isoformat()
+    assert _default_since(_Conn(None)) is None

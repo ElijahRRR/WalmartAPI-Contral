@@ -1,8 +1,8 @@
 """audit_calibrate — 双跑校准报告(批次 B 验收闸门;只读,非危险)。
 
 用法:
-  python cli.py audit_calibrate                          # 默认切点 = 今天 00:00
-  python cli.py audit_calibrate -p since=2026-08-13T16:00:00Z
+  python cli.py audit_calibrate            # 切点自动 = product_audit 首跑时刻
+  python cli.py audit_calibrate -p since=2026-08-13T08:00:00Z   # 显式覆盖
 
 口径(spec_vectors §4.3,零 LLM 批次的唯一公平比法):
   新侧 = since 之后本系统写的 audit_runs(每 ASIN 取最新一条);
@@ -52,6 +52,22 @@ WHERE run_id = ANY(%s) GROUP BY run_id
 """
 
 
+def _default_since(conn) -> str | None:
+    """输入:连接 → 输出:新旧分界 = 本系统 product_audit 首跑时刻(ISO 串)。
+
+    不写死时间(首版硬编码 16:00Z 在 UTC+8 生产机上把当天新侧整批切没了,
+    2026-08-13 实测事故):cli 每次运行都落 ops.runs,product_audit 的
+    min(started_at) 必然早于它写的第一条 audit_runs、晚于批次 A 搬入的全部
+    历史行(搬入保留旧库原始 created_at),天然就是无歧义分界。
+    从未跑过 → None(报告直接说明,不瞎比)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT min(started_at) FROM ops.runs "
+                    "WHERE workflow = 'product_audit'")
+        (t,) = cur.fetchone()
+    return t.isoformat() if t else None
+
+
 def old_intermediate(stage: str | None, verdict: str) -> str:
     """输入:旧 run 的 stage_stopped_at + verdict → 输出:旧 L0+L2 中间判决。
 
@@ -78,9 +94,14 @@ def _top_rules(conn, run_ids: list[int], cap: int = 10) -> list[str]:
 
 def run(params: dict) -> str:
     """输入:params(可选 since=ISO 时间)→ 输出:四桶一致率报告。"""
-    since = str(params.get("since", "")).strip() or "2026-08-13T16:00:00Z"
+    since = str(params.get("since", "")).strip() or None
 
     with db.pg_conn() as conn:
+        if since is None:
+            since = _default_since(conn)
+            if since is None:
+                return ("audit_calibrate:ops.runs 里没有 product_audit 运行"
+                        "记录,新侧为空无从校准——先跑 product_audit")
         with conn.cursor() as cur:
             cur.execute(_PAIR_SQL, {"since": since})
             rows = cur.fetchall()

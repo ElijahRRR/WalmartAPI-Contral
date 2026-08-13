@@ -75,20 +75,28 @@ SET suggested_pt = EXCLUDED.suggested_pt,
     created_at   = now()
 """
 
-# 第 0 层|兄弟继承(免 LLM;需 taxonomy_import 已灌 audit.amazon_taxonomy):
-# 缺口路径的同父兄弟里,已有 ≥2 条高置信映射指向**同一个** PT 且无其他 PT
-# 分流(含哨兵在内一票否决)→ 直接继承。SQL 返回该父节点下兄弟映射的
-# PT 分布,继承判定在 sibling_verdict 纯函数里
+# 第 0 层|兄弟继承(免 LLM):父子/兄弟关系**直接从面包屑路径的字符串
+# 结构推导**(按 ' > ' 切段,去末段=父路径)——映射表与产品库的路径本就
+# 同一套商品页面包屑词汇,天然可 JOIN。⚠ 曾试过用外部抓取的 Best Sellers
+# 类目树做骨架,所有者实测两套词汇表对不上(zgbs 排行榜树 vs 详情页
+# 面包屑是同一批 browse node 的不同投影),已撤(2026-08-13)。
+# 兄弟 = 同父前缀 + 同段数的映射行;继承判定在 sibling_verdict 纯函数
 _SIBLING_SQL = """
-SELECT m.walmart_product_type, count(DISTINCT t.path)
-FROM audit.amazon_taxonomy g
-JOIN audit.amazon_taxonomy t
-  ON t.parent_path = g.parent_path AND t.path <> g.path
-JOIN audit.walmart_category_map m
-  ON btrim(m.amazon_category) = t.path AND m.confidence = '高'
-WHERE g.path = %s AND g.parent_path IS NOT NULL
+SELECT m.walmart_product_type, count(DISTINCT btrim(m.amazon_category))
+FROM audit.walmart_category_map m
+WHERE m.confidence = '高'
+  AND btrim(m.amazon_category) <> %(path)s
+  AND left(btrim(m.amazon_category), length(%(prefix)s)) = %(prefix)s
+  AND array_length(string_to_array(btrim(m.amazon_category), ' > '), 1)
+      = %(depth)s
 GROUP BY m.walmart_product_type
 """
+
+
+def path_parent(path: str) -> str | None:
+    """输入:面包屑路径 → 输出:父路径(单段路径无父 → None)。纯函数。"""
+    segs = [s for s in path.split(" > ") if s]
+    return " > ".join(segs[:-1]) if len(segs) > 1 else None
 
 
 def sibling_verdict(dist: list[tuple]) -> str | None:
@@ -136,10 +144,16 @@ def run(params: dict) -> str:
                   "no_candidate": 0, "llm_failed": 0}
         lines = []
         for path, n, sample_asin in gaps:
-            # 第 0 层|兄弟继承(免 LLM;taxonomy 未灌时 SQL 返回空,自然跳过)
-            with conn.cursor() as cur:
-                cur.execute(_SIBLING_SQL, (path,))
-                inherited = sibling_verdict(cur.fetchall())
+            # 第 0 层|兄弟继承(免 LLM;父路径从面包屑字符串结构推导)
+            inherited = None
+            parent = path_parent(path.strip())
+            if parent:
+                with conn.cursor() as cur:
+                    cur.execute(_SIBLING_SQL, {
+                        "path": path.strip(),
+                        "prefix": parent + " > ",
+                        "depth": len(path.strip().split(" > "))})
+                    inherited = sibling_verdict(cur.fetchall())
             if inherited:
                 counts["inherited"] += 1
                 with conn.cursor() as cur:

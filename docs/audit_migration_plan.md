@@ -159,7 +159,7 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 4. **文档滞后陷阱**:采集侧 local_macos_setup.md 还说默认 SQLite,实际 dbfactory
    默认已是 postgres——按文档操作会误判生产后端。
 
-## 七、待所有者拍板的决策项
+## 七、待所有者拍板的决策项(2026-08-13 已批复,记录见第九节;本节保留原问题供对照)
 
 1. **LLM 供应商面**(批次 C 前必须定):旧审核主链是第三方 Claude 网关
    (kiro-claude@zz.211b.site)+ 备链 DeepSeek + 豆包视觉 + DashScope embedding;
@@ -199,3 +199,106 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 - `docs/scraper_migration_brief.md:66-68` 二期审核对接("审核服务将读 catalog.products
   待审行、写回结论")→ 本文即其落地方案;brief 第四节第 3 条(不直写中心库)继续有效。
 - `docs/plan.md` 迁移进度总览 → 待所有者批准本方案后,增补 product_audit 工作流行。
+
+## 九、所有者批复记录(2026-08-13)
+
+| # | 决策项 | 批复 |
+|---|---|---|
+| 1 | LLM 供应商 | **DeepSeek,分用途选模型**;视觉 DeepSeek 无能力,暂用豆包(设计落地见 10.2) |
+| 2 | L4 视觉 | **保留**,仅 pass 产品才跑,**默认关闭**(参数显式开启) |
+| 3 | uspto/外部仓 | 商标继续连 uspto 库;品牌黑名单直接连本库(已有);tro-scraper-matrix 是 TRO 法院禁令案件的采集仓(黑名单的上游之一,非黑名单本身),采集链不进本仓 |
+| 4 | E/F/G 权责 | 待确认——E/F/G = 飞书新品上架表第 5/6/7 列(审核结果/原因/日期),现为人工域,list_new 只领 E=pass 行。建议方案见本节后注 |
+| 5 | 存量首刷 | 历史导入时产品事件已带审核记录,**只补刷**(无结论的才审) |
+| 6 | 调度密度 | ingest 5 分钟级 / audit 每小时,按原建议执行(所有者未提异议;有异议再调) |
+| 7 | 阿里云去留 | 所有者正式切换时一并处理(归批次 D) |
+| 8 | 在架 reject 处置 | **建议与执行分离**:审核对在架产品只产处置建议+事件,绝不直接改在线状态;建议接问题商品清理链执行,以 feed 回执+真实在线观测确认生效后才改状态;并且"拉在线→扫描问题→建议→执行"整条链要拆开(架构见 10.4) |
+| 9 | 45 天 TTL | **废除**;hash 驱动重审——slow_hash 变更时 pass 翻 pending,**reject 永不自动重审**(force_rerun 手动通道保留) |
+| 10 | 实证类目反哺 | 海量在线产品与历史报错数据里有沃尔玛认定的真实类目,重审/重上架**最优先直接用它**(设计见 10.3) |
+
+**#4 后注(建议方案,待确认)**:切换日起 E/F/G 三列归审核服务;G 列日期早于
+切换日的存量行视为人工结论,机器不覆盖;人工改判走**新增 override 列**(机器
+永不碰,list_new 闸门优先读它)——独立列而非混写 E 列,沿用旧系统
+blacklist_brand_ip_stats"override 单列存放、重算不覆盖"的正面先例。
+
+## 十、审核域架构定稿(2026-08-13 草案;所有者确认后再出细化迁移计划)
+
+### 10.1 总结论:现有五层架构完全适用,零破例
+
+审核 = 规则+数据+判定,与本仓"脚本+调度+数据库"同型。逐层归位:
+
+```
+cli.py       product_audit(标 DANGEROUS,dry-run 强制)
+workflows/   product_audit.py  增量主流程:领 pending → 判定 → 落库+事件
+             problem_scan 与执行件分离(10.4;risk_sync 扩展 phase0 三表)
+services/    audit_rules.py    纯规则积木:实证类目短路→历史短路→Phase0→L2→理由映射
+             audit_llm.py      L1 rerank / L3 语义的提示词构建与解析(复用 llm_cache)
+api/         llm.py 扩 purpose 选模型(仍只 DeepSeek 一家、一条链)
+             llm_vision.py 新增(豆包,仅 L4)——符合"api 按外部系统分文件"规范
+registry/    resources.py 登记审核表族/飞书 8280e8/用途→模型映射
+             db.py 增 uspto 只读连接(数据库连接唯一入口)
+数据         catalog.products.audit_* 五列 = 结论权威
+             audit schema:audit_runs/audit_hits 明细 + 规则字典表
+             product_events:入库/审核事件码(登记制)
+```
+
+依赖方向、dry-run 铁律、registry 取物、事件登记制全部沿用。唯一的新形态
+"处置建议"不是破例,恰是仓内既有**意图模式**(maintenance_intents:provider
+产意图 → maintenance 消费执行)向问题商品域的推广。
+
+### 10.2 LLM 设计(批复 #1/#2 落地)
+
+- registry 登记"用途→模型"映射,env 逐用途覆盖:`DEEPSEEK_MODEL`(默认,
+  现有 mapper 沿用)、`DEEPSEEK_MODEL_AUDIT_L1`、`DEEPSEEK_MODEL_AUDIT_L3`…
+  未配置的用途回落默认模型。api/llm.py 的 chat_json 增 `purpose` 参数按
+  登记选模型;llm_cache 键已含 model,不同用途天然分缓存。
+- 视觉:api/llm_vision.py(豆包/火山方舟)仅 L4 用;L4 默认关闭,
+  workflow 参数显式开启,且仅对 pass 产品跑(批复 #2)。
+- **单链无自动降级**:DeepSeek 失败 = 同链重试,重试尽 → pending 待人工
+  (顺带修正旧系统"坏 JSON→pass"的事故面);跨供应商 failover 不迁。
+
+### 10.3 L1 类目判定:实证类目最优先(批复 #10)
+
+判定顺序,前一级命中即出:
+1. **沃尔玛实证 PT**:catalog.walmart_items.product_type(在架同 ASIN,
+   catalog_sync 每日写,schema.sql:127 已有)或历史成功上架记录
+   → 直接采用,pt_source='walmart_confirmed'。沃尔玛自己认过的类目就是
+   标准答案,重审与重上架同吃这一级。
+2. 映射表精确命中(walmart_category_map 唯一高置信直出,免 LLM)。
+3. 关键词/前缀 SQL 候选 → DeepSeek rerank(purpose=audit_l1)。
+旧系统的 embedding 召回层**裁掉**:上面三级已覆盖其功能,为一层召回引入
+DashScope 整个外部依赖不值;精度不够再议。
+
+### 10.4 在架商品链路:拉取/扫描/建议/执行四段分离(批复 #8)
+
+```
+catalog_sync(拉在线,已有,不动)
+  ↓
+扫描件 problem_scan:归类问题商品(现 problem_product_cleanup 的归类段
+  + 审核 reject 的在架产品 + 未来 TRO 命中)→ 写产品事件 + 落处置建议
+  ——不改任何状态、不提交任何 feed
+  ↓
+执行件(cleanup 家族):消费建议 → dry-run/--execute → 提交 feed
+  ↓
+生效追踪(复用既有纪律):feed 回执落定 + 下轮 catalog_sync 真实在线观测
+  (resolved_at vs last_seen_at)确认后,才更新状态 + 记事件
+```
+
+审核对在架产品**只产建议不动状态**。建议表形态与 problem_product_cleanup
+的拆分幅度进迁移计划定稿——它已具备"读库决策+观测确认"纪律,拆分是重排
+不是重写。
+
+### 10.5 重审触发(批复 #9 落地)
+
+- ingest 一行 SQL:slow_hash 变更 → **仅 approved 翻 pending**;rejected
+  永不自动重审(force_rerun 手动通道保留)。
+- "改参数不改产品"的顾虑已被采集契约消化:slow_hash 只覆盖标题/品牌/类目/
+  图片等慢变字段(brief §5.1,不透明值),价格/库存/邮编等参数变化不动它,
+  不会误触发重审。
+- 45 天 TTL 随批量形态退役,不迁。
+
+### 10.6 架构层面明确不进本仓的清单
+
+阿里云 SQLite 队列与 worker 体系(cli.py+ops.runs 取代;补刷量小无需分布式)、
+审核前端(飞书为界面)、lark-cli 子进程(api/feishu 取代)、llm_router
+多供应商路由 1029 行(单链化后无用武之地)、embedding 召回(10.3)、
+L2 商标符号死代码、"坏 JSON→pass"行为。

@@ -87,6 +87,29 @@ def test_llm_cache_key_stable_and_order_independent():
     assert llm_cache.cache_key(m, 0.3, 4096) != k1      # 温度参与键
 
 
+def test_llm_model_for_purpose(monkeypatch):
+    """批复 #1:env 逐用途覆盖,未配置回落默认;未登记用途 fail loud。"""
+    monkeypatch.delenv("DEEPSEEK_MODEL_AUDIT_L1", raising=False)
+    assert llm.model_for("audit_l1") == llm._MODEL          # 未配置回落
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L1", "deepseek-reasoner")
+    assert llm.model_for("audit_l1") == "deepseek-reasoner"
+    assert llm.model_for("default") == llm._MODEL
+    with pytest.raises(ValueError, match="未登记的 LLM 用途"):
+        llm.model_for("audit_l9")
+
+
+def test_llm_cache_key_purpose_splits_keyspace(monkeypatch):
+    """键内 model 经 model_for(purpose) 解析,与实际请求按构造同源;
+    用途配了不同模型 → 键空间自动分离,配同模型 → 键相同(共享缓存)。"""
+    m = [{"role": "user", "content": "审"}]
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-reasoner")
+    assert llm_cache.cache_key(m, 0.2, 4096, purpose="audit_l3") \
+        != llm_cache.cache_key(m, 0.2, 4096)
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", llm._MODEL)
+    assert llm_cache.cache_key(m, 0.2, 4096, purpose="audit_l3") \
+        == llm_cache.cache_key(m, 0.2, 4096)
+
+
 # ── MP_ITEM feed 收录 ─────────────────────────────────────────────────────────
 
 def test_mp_item_payload_header_exactly_three_fields():

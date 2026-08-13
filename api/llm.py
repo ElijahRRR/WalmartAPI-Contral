@@ -23,6 +23,22 @@ _BASE_URL = "https://api.deepseek.com/chat/completions"
 _MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 
+def model_for(purpose: str) -> str:
+    """输入:用途名(registry.LLM_PURPOSE_ENV 的键)→ 输出:该用途的模型名。
+
+    批复 #1(2026-08-13):DeepSeek 分用途选模型,env 逐用途覆盖
+    (如 DEEPSEEK_MODEL_AUDIT_L1),未配置回落 DEEPSEEK_MODEL 默认。
+    未登记的用途直接抛错(fail loud:拼错用途名静默吃默认模型,成本/
+    效果偏差没人会发现)。
+    """
+    from registry import resources
+    env = resources.LLM_PURPOSE_ENV.get(purpose)
+    if env is None:
+        raise ValueError(f"未登记的 LLM 用途 {purpose!r}:先在 "
+                         f"registry.LLM_PURPOSE_ENV 登记再使用")
+    return os.environ.get(env, "").strip() or _MODEL
+
+
 def _api_key() -> str:
     v = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not v:
@@ -44,12 +60,15 @@ def _extract_json(text: str) -> dict:
 
 
 def chat_json(messages: list[dict], *, temperature: float = 0.2,
-              max_tokens: int = 4096, max_retries: int = 3) -> dict:
-    """输入:messages → 输出:模型回复中解析出的 JSON dict。
+              max_tokens: int = 4096, max_retries: int = 3,
+              purpose: str = "default") -> dict:
+    """输入:messages(+用途)→ 输出:模型回复中解析出的 JSON dict。
 
+    purpose 按 registry.LLM_PURPOSE_ENV 选模型(10.2 定稿);单链无自动
+    降级——失败同链重试,重试尽抛异常,由调用方决定 pending,绝不默认放行。
     读操作可安全重试:超时/5xx/429 指数退避(1/2/4s);4xx 直接抛。
     """
-    body = {"model": _MODEL, "messages": messages,
+    body = {"model": model_for(purpose), "messages": messages,
             "temperature": temperature, "max_tokens": max_tokens,
             "response_format": {"type": "json_object"}}
     headers = {"Authorization": f"Bearer {_api_key()}"}

@@ -5,6 +5,7 @@ _pick_where 四态与参数白名单、黑名单中心镜像空读/骤缩护栏�
 ASIN 历史导入解析、行适配。
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -218,6 +219,211 @@ def test_parse_asin_lines_keeps_raw_case():
     """键以原文为准,不做 upper——与黑名单中心既有键口径一致。"""
     asins, _, nonstd = parse_asin_lines("b0abcdefgh\n")
     assert asins == ["b0abcdefgh"] and nonstd == 1   # 小写不匹配标准式
+
+
+# ── 批次 C 接线:L1 三级扩展 / L3 / L4 流转(orchestrator.py:378-398 口径)────
+
+_META_C = {**META,
+           "Books": {"walmart_category": "Media", "walmart_ptg": None,
+                     "access_state": "普通商品", "zh_can_do": "是",
+                     "requirements": "", "notes": ""}}
+
+
+def test_resolve_pt_error_confirmed_second_source():
+    """①b 报错日报实证(批复 #10):在架实证优先,报错实证次之。"""
+    ctx = _ctx(pt_meta=META, error_confirmed={"B0X": "GoodPT"})
+    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X"), ctx)
+    assert l1.walmart_product_type == "GoodPT"
+    assert l1.pt_source == "walmart_error_confirmed"
+    both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"},
+                error_confirmed={"B0X": "GoodPT"})
+    assert audit_rules.resolve_pt(ProductInfo(asin="B0X"),
+                                  both).pt_source == "walmart_confirmed"
+
+
+def test_resolve_pt_sentinel_hard_reject_after_evidence():
+    """Layer 0 哨兵:旧仓字面量三件(unknown/低/none)+ -100 hit;
+    实证命中时哨兵不生效(批复 #10 实证最优先,与旧仓'哨兵最前'有意不同)。"""
+    ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}))
+    p = ProductInfo(asin="B0S", title="w", amazon_category_path="Dead > Path")
+    l1 = audit_rules.resolve_pt(p, ctx)
+    assert l1.walmart_product_type == "unknown"
+    assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].penalty == -100
+    out = audit_rules.audit_one(p, ctx)
+    assert out.verdict == "reject" and out.score_final == 0
+    # 实证在场 → 哨兵让位
+    ev = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}),
+              walmart_confirmed={"B0S": "GoodPT"})
+    assert audit_rules.resolve_pt(p, ev).walmart_product_type == "GoodPT"
+
+
+def test_resolve_pt_publication_ban_covers_direct_levels():
+    """合同 L1-6:出版物硬禁盖全三级(批次 B 漏迁归还)——实证直出 Books 也拦。"""
+    ctx = _ctx(pt_meta=_META_C, walmart_confirmed={"B0P": "Books"})
+    p = ProductInfo(asin="B0P", title="novel")
+    l1 = audit_rules.resolve_pt(p, ctx)
+    assert any(h.rule_code == "publication_pt_forbidden" for h in l1.hits)
+    out = audit_rules.audit_one(p, ctx)
+    assert out.verdict == "reject"
+    assert out.final_reason_category == "Intellectual Property"
+
+
+def _l3_result(verdict, **kw):
+    from services.audit_l3 import L3Result
+    return L3Result(verdict=verdict, **kw)
+
+
+def test_audit_one_l3_flow(monkeypatch):
+    """L3 流转逐字迁 orchestrator.py:378-389:l2 pass 才进;reject/pending
+    改判 + stage='L3',分数保留 L2 值(L3 不动分)。"""
+    from services import audit_l3
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"})
+    p = ProductInfo(asin="B0A", title="widget")
+    calls = []
+
+    def fake_judge(product, l1, l2, c, conn):
+        calls.append(product.asin)
+        return _l3_result("reject", reason_category="offensive content")
+    monkeypatch.setattr(audit_l3, "judge_l3", fake_judge)
+    out = audit_rules.audit_one(p, ctx, conn=object())
+    assert calls == ["B0A"]
+    assert out.verdict == "reject" and out.stage_stopped_at == "L3"
+    assert out.score_final == 100          # L3 不动分:reject 而分数保持
+    assert out.l3.verdict == "reject"
+
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a: _l3_result("pending"))
+    out2 = audit_rules.audit_one(p, ctx, conn=object())
+    assert out2.verdict == "pending" and out2.stage_stopped_at == "L3"
+    assert out2.score_final == 100         # 合同 L3-8:L3 pending 保留 L2 分
+
+    out3 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out3.l3 is None and out3.verdict == "pass"
+
+    out4 = audit_rules.audit_one(p, ctx)   # conn=None:批次 B 形态,零 LLM
+    assert out4.l3 is None and out4.verdict == "pass"
+
+
+def test_audit_one_l2_reject_skips_l3(monkeypatch):
+    from services import audit_l3
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a: pytest.fail("L2 reject 不得进 L3"))
+    ctx = _ctx(pt_meta=_META_C, walmart_confirmed={"B0P": "Books"})
+    out = audit_rules.audit_one(ProductInfo(asin="B0P", title="n"), ctx,
+                                conn=object())
+    assert out.verdict == "reject" and out.l3 is None
+
+
+def test_audit_one_l4_flow(monkeypatch):
+    """L4 流转(orchestrator.py:392-398):仅 outcome pass 且 l4 开;只认 reject。"""
+    from services import audit_l3, audit_l4
+    from services.audit_l4 import L4Result
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"})
+    p = ProductInfo(asin="B0A", title="widget")
+    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("pass"))
+    monkeypatch.setattr(audit_l4, "judge_l4",
+                        lambda *a, **k: L4Result(verdict="reject"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
+    assert out.verdict == "reject" and out.stage_stopped_at == "L4"
+    # 默认关(批复 #2)
+    out2 = audit_rules.audit_one(p, ctx, conn=object())
+    assert out2.l4 is None and out2.verdict == "pass"
+    # L3 已拒 → L4 不跑
+    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("reject"))
+    monkeypatch.setattr(audit_l4, "judge_l4",
+                        lambda *a, **k: pytest.fail("非 pass 不得进 L4"))
+    out3 = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
+    assert out3.stage_stopped_at == "L3"
+
+
+def test_audit_one_rerank_wiring(monkeypatch):
+    """PT 前两级解不出且有 conn → 走候选+rerank;rerank None → pending。"""
+    from services import audit_l1_llm
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0R", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    monkeypatch.setattr(
+        audit_l1_llm, "rerank",
+        lambda pr, cands, ptd, **k: audit_rules.L1Info(
+            walmart_product_type="GoodPT", pt_confidence="高",
+            pt_source="map_verified"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pass"
+    assert out.l1.walmart_category == "Home"   # 接线补 walmart_category
+    monkeypatch.setattr(audit_l1_llm, "rerank", lambda *a, **k: None)
+    out2 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out2.verdict == "pending" and out2.stage_stopped_at == "L1"
+
+
+def test_persist_run_l3_l4_columns():
+    """audit_runs 的 l3/l4 槽位:未跑 'skip'/NULL/'[]',跑了写实际值。"""
+    from services.audit_l4 import L4Result
+    captured = []
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            captured.append(params)
+
+        def executemany(self, sql, rows):
+            pass
+
+        def fetchone(self):
+            return (7,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    base = dict(asin="B0", verdict="pass", score_final=100,
+                stage_stopped_at=None,
+                l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.persist_run(_Conn(), AuditOutcome(**base))
+    assert captured[0][7:] == ("skip", None, None, "skip", "[]")
+    o = AuditOutcome(**{**base, "verdict": "reject", "stage_stopped_at": "L3"})
+    o.l3 = _l3_result("reject", reason_category="offensive content",
+                      reason_text="bad")
+    o.l4 = L4Result(verdict="pass", image_issues=[{"image_index": 1}])
+    audit_store.persist_run(_Conn(), o)
+    assert captured[1][7:11] == ("reject", "offensive content", "bad", "pass")
+    assert json.loads(captured[1][11]) == [{"image_index": 1}]
+
+
+def test_write_conclusion_pending_reason_by_stage():
+    """两种 pending 来源 reason 分开:L1=类目解不出,L3=LLM 故障(旧仓字面量)。"""
+    captured = {}
+
+    class _Conn:
+        def execute(self, sql, params):
+            captured.update(params)
+    o = AuditOutcome(asin="B0", verdict="pending", score_final=None,
+                     stage_stopped_at="L1", l1=L1Info())
+    audit_store.write_conclusion(_Conn(), o)
+    assert "待类目判定" in captured["reason"]
+    o2 = AuditOutcome(asin="B0", verdict="pending", score_final=100,
+                      stage_stopped_at="L3",
+                      l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.write_conclusion(_Conn(), o2)
+    assert captured["reason"] == "LLM 全链路故障, 待人工复核"
+
+
+def test_real_pt_excludes_unknown():
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                     stage_stopped_at="L2",
+                     l1=L1Info(walmart_product_type="unknown"))
+    assert audit_store.real_pt(o) is None
+
+
+def test_pick_where_accepts_l3_l4_params():
+    w, _ = product_audit._pick_where({"l3": "off", "l4": "on"})
+    assert "IS NULL OR" in w      # 白名单收编,不炸
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────

@@ -21,8 +21,8 @@ import logging
 from dataclasses import dataclass, field
 
 from registry import paths
-from services import audit_l2, audit_phase0, audit_reason
-from services.audit_models import AuditOutcome, L1Info
+from services import audit_l1_llm, audit_l2, audit_phase0, audit_reason
+from services.audit_models import AuditOutcome, L1Info, RuleHit
 from services.audit_stopwords import is_stopword
 
 logger = logging.getLogger("services.audit_rules")
@@ -48,6 +48,8 @@ class AuditContext:
     catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
     known_policies: frozenset = frozenset()                  # 37 政策 category_en 集合
     uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
+    error_confirmed: dict = field(default_factory=dict)      # asin → PT(报错日报实证,已 pt_meta 闸;批次 C)
+    unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
 
 
 def _brand_map(conn) -> tuple[dict, set]:
@@ -180,36 +182,85 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         known_policies=_frozen(conn, "SELECT category_en FROM "
                                      "audit.walmart_prohibited_policy "
                                      "WHERE category_en IS NOT NULL"),
+        # 批次 C:①b 报错日报实证(批复 #10)与 Layer 0 哨兵路径集
+        error_confirmed=audit_l1_llm.error_confirmed_map(conn, pt_meta),
+        unmapped_paths=_frozen(
+            conn, "SELECT DISTINCT amazon_category FROM "
+                  "audit.walmart_category_map "
+                  f"WHERE walmart_product_type = '{_UNMAPPED_SENTINEL}'"),
     )
 
 
 def resolve_pt(product, ctx: AuditContext) -> L1Info:
-    """输入:产品 + 上下文 → 输出:L1Info(批次 B 两级 PT 解析;解不出 PT=None)。
+    """输入:产品 + 上下文 → 输出:L1Info(免 LLM 的 PT 解析;解不出 PT=None)。
 
-    两级数据在 load_context 已过三道闸(pt_meta 存在/剔哨兵/高置信唯一),
-    此处再兜一道防御(闸的唯一出处在装配期,这里只是断言式保护)。
-    批次 B 裁剪项(批次 C 归还):①级只用 walmart_items,计划 10.3① 的
-    "历史成功上架记录"(audit.walmart_error_records 反哺)未消费;
-    旧仓对映射到哨兵'无对应Walmart PT'的类目是 -100 硬拒,本批落 pending
-    (保守方向,批次 C 接 L1 后按旧语义处置)。
+    批次 C 定稿的级序(合同 L1-8/L1-10):
+      ① 沃尔玛在架实证(walmart_items,跨店唯一)         pt_source='walmart_confirmed'
+      ①b 历史报错日报实证(walmart_error_records 最新条)  pt_source='walmart_error_confirmed'
+      ⓪ 哨兵硬拒(映射表明确标记'无对应Walmart PT')——批复 #10 实证最优先,
+        故哨兵从旧仓的最前挪到实证之后、映射之前(差异会进双跑校准报告)
+      ② 映射表精确(catmap 高置信唯一)                   pt_source='map_direct'
+    直出各级统一过 seed 硬拦(带 PT 调,旧 Layer1 快速通道 :804 同款)与
+    出版物硬禁(合同 L1-6:旧仓对全部三级生效,批次 B 漏接本批归还)。
+    命中硬拦时返回的 L1Info 带 -100 hit——audit_l2.evaluate 会累加 l1.hits,
+    分数自然判死,stage 落 'L2' 与旧库口径一致,无需特判。
+    数据在 load_context 已过三道闸,此处 pt_meta 再兜一道防御。
     """
     pt = ctx.walmart_confirmed.get(product.asin)
     source, conf = None, None
     if pt:
         source, conf = "walmart_confirmed", "高"
     else:
-        pt = ctx.catmap.get((product.amazon_category_path or "").strip())
+        pt = ctx.error_confirmed.get(product.asin)
+        if pt:
+            source, conf = "walmart_error_confirmed", "高"
+    path = (product.amazon_category_path or "").strip()
+    if not pt and path and path in ctx.unmapped_paths:
+        # Layer 0 哨兵(l1_category.py:779-797 字面量逐字:unknown/低/none 三件
+        # + detail.amazon_path 用原文不 strip)
+        l1 = L1Info(walmart_product_type="unknown", pt_confidence="低",
+                    pt_source="none",
+                    excluded_category_reason="无对应 Walmart PT (映射表明确标记)")
+        l1.hits.append(RuleHit(
+            stage="L1", rule_code="unmapped_amazon_path", penalty=-100,
+            detail={"reason": "Amazon 路径在映射表被标记为 '无对应Walmart PT', "
+                              "上架 Walmart 会失败",
+                    "amazon_path": product.amazon_category_path}))
+        return l1
+    if not pt:
+        pt = ctx.catmap.get(path)
         if pt:
             source, conf = "map_direct", "高"
     if pt and pt not in ctx.pt_meta:      # 防御:废弃 PT 宁 pending 不假 pass
         pt, source, conf = None, None, None
     meta = ctx.pt_meta.get(pt) if pt else None
-    return L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
-                  walmart_category=(meta or {}).get("walmart_category"))
+    l1 = L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
+                walmart_category=(meta or {}).get("walmart_category"))
+    if pt:
+        seed = audit_l1_llm.check_seed_excluded(product, pt)
+        if seed:
+            l1.excluded_category_reason = seed
+            l1.hits.append(RuleHit(
+                stage="L1", rule_code="excluded_category", penalty=-100,
+                detail={"reason": seed, "pt": pt, "from_seed_yaml": True}))
+        ban = audit_l1_llm.check_publication_ban(
+            pt, l1.excluded_category_reason)
+        if ban is not None:
+            l1.excluded_category_reason = ban.detail["reason"]
+            l1.hits.append(ban)
+    return l1
 
 
-def audit_one(product, ctx: AuditContext) -> AuditOutcome:
-    """输入:ProductInfo + 上下文 → 输出:AuditOutcome(不落库,纯判定)。"""
+def audit_one(product, ctx: AuditContext, conn=None, *,
+              run_l3: bool = True, run_l4: bool = False) -> AuditOutcome:
+    """输入:ProductInfo + 上下文(+连接与层开关)→ 输出:AuditOutcome。
+
+    批次 C 全链:phase0 → L1(实证→哨兵→映射→候选+rerank)→ L2 → [L3 → L4]。
+    conn=None 时退化为批次 B 形态(L1 第三级与 L3/L4 需要查库/调 LLM,全跳过,
+    PT 解不出照旧 pending)——测试与离线路径复用。流转语义逐字迁自
+    orchestrator.py:378-398:进 L3 条件 = l2 pass;L3 reject/pending 改判不动分;
+    L4 仅 outcome pass 且开关开,只认 reject(默认关,批复 #2)。
+    """
     p0 = audit_phase0.check(product, ctx)
     if p0.blocked:
         # 旧仓字面量三件套照迁(orchestrator.py:340-343):score_final 硬写 0
@@ -224,9 +275,20 @@ def audit_one(product, ctx: AuditContext) -> AuditOutcome:
         return outcome
 
     l1 = resolve_pt(product, ctx)
-    if not l1.walmart_product_type:
-        # 批次 B 自定义:PT 解不出 → pending 等批次 C(不放行——旧仓此处有
-        # L1 LLM 保底,零 LLM 形态下四条硬规则会整体失明,approve 等于裸奔)
+    if not l1.walmart_product_type and not l1.hits and conn is not None:
+        # L1 第三级:候选召回 + rerank(哨兵命中带 -100 hit 者不进——已判死)。
+        # 空候选由 rerank 自己短路(合同 L1-5:不调 LLM 直接解不出)
+        cands = audit_l1_llm.candidates(conn, product)
+        pt_dict = ctx.pt_meta.keys() | ctx.pt_spec.keys()
+        l1_llm = audit_l1_llm.rerank(product, cands, pt_dict)
+        if l1_llm is not None:
+            l1 = l1_llm
+            meta = ctx.pt_meta.get(l1.walmart_product_type)
+            if meta:
+                l1.walmart_category = meta.get("walmart_category")
+    if not l1.walmart_product_type and not l1.hits:
+        # PT 解不出(rerank unknown/LLM 失败/坏 JSON/无候选)→ pending,
+        # 绝不默认放行(10.2)。哨兵/excluded 命中(有 -100 hit)不走此路
         return AuditOutcome(asin=product.asin, verdict="pending",
                             score_final=None, stage_stopped_at="L1",
                             l1=l1, phase0=p0)
@@ -237,7 +299,31 @@ def audit_one(product, ctx: AuditContext) -> AuditOutcome:
         asin=product.asin, verdict=verdict, score_final=l2.score_final,
         stage_stopped_at="L2" if verdict == "reject" else None,
         l1=l1, phase0=p0, l2=l2)
-    if verdict == "reject":
+
+    # L3 语义(orchestrator.py:378-389):唯一条件 = l2 pass 且开关开;
+    # reject/pending 改判 + stage='L3',分数保留 L2 值(L3 不动分)
+    if verdict == "pass" and run_l3 and conn is not None:
+        from services import audit_l3
+        l3 = audit_l3.judge_l3(product, l1, l2, ctx, conn)
+        outcome.l3 = l3
+        if l3.verdict == "reject":
+            outcome.verdict = "reject"
+            outcome.stage_stopped_at = "L3"
+        elif l3.verdict == "pending":
+            outcome.verdict = "pending"
+            outcome.stage_stopped_at = "L3"
+
+    # L4 视觉(orchestrator.py:392-398):条件 = outcome pass(非 l3 pass)
+    # 且开关开;只认 reject;默认关(批复 #2),故障→pass 由 audit_l4 内保证
+    if outcome.verdict == "pass" and run_l4 and conn is not None:
+        from services import audit_l4
+        l4 = audit_l4.judge_l4(product, l1, l3=outcome.l3, conn=conn)
+        outcome.l4 = l4
+        if l4.verdict == "reject":
+            outcome.verdict = "reject"
+            outcome.stage_stopped_at = "L4"
+
+    if outcome.verdict == "reject":
         outcome.final_reason_category = audit_reason.compute_final_reason(
             outcome, product)
         if ctx.known_policies and not audit_reason.known_policies_check(

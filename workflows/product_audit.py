@@ -1,4 +1,4 @@
-"""product_audit — 产品审核主流程(批次 B:零 LLM 纯规则层;危险,默认 dry-run)。
+"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,默认 dry-run)。
 
 用法:
   python cli.py product_audit                       # dry-run:判定 + 落 runs/hits,不写结论
@@ -7,16 +7,18 @@
   python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
+  python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
+  python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
 
-链路:领 catalog.products 待审行(audit_status IS NULL / 'pending')→
-Phase0 四件套 → PT 解析(实证→映射表)→ L2 硬规则 → 37 政策理由映射 →
-落 audit.audit_runs/audit_hits;--execute 才写 products.audit_* 五列与
-audit_passed/audit_rejected 事件。**批次 B 只落库不投影飞书**(并跑期纪律,
-E/D 列投影在批次 D 切换日开闸;上架链此时仍按旧口径走,库内结论仅供校准)。
+链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
+L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
+L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;--execute 才写
+products.audit_* 五列与审核事件。**只落库不投影飞书**(并跑期纪律,
+E/D 列投影在批次 D 切换日开闸)。
 
-dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落(它们是只追加的
-明细账,dry-run 的判定同样是真判定),但**不碰 products 五列、不发事件、
-不投影**——消费端(未来的 list_new 查库)看不到任何变化。
+dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
+五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
+(L1 rerank / L3;L4 需显式 l4=on)——验收抽样时用 limit 控制成本。
 
 补刷(mode=backfill,批复 #5"只补刷"):候选限 audit_status IS NULL;先查
 audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
@@ -24,8 +26,8 @@ audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
 实现旧 reject 粘性),有历史者**直接采用**写五列+事件(detail 带
 referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者进正常判定。
 
-PT 解不出 → pending(reason=待类目判定;批次 C 接 L1 后自动重审)——
-批次 B 的自定义保守行为,旧仓此处有 L1 LLM 保底。
+pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
+L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日退避重试。
 无标题产品跳过不审(采集降级,不够格判定;amz_source:103 先例)并计数。
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
@@ -90,7 +92,8 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun"}
+_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
+                 "l3", "l4"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -169,6 +172,9 @@ def run(params: dict) -> str:
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
     r5_on = str(params.get("r5", "")).strip().lower() == "on"
+    # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
+    run_l3 = str(params.get("l3", "")).strip().lower() != "off"
+    run_l4 = str(params.get("l4", "")).strip().lower() == "on"
     where, extra = _pick_where(params)
     if "asins" in extra:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
@@ -191,6 +197,9 @@ def run(params: dict) -> str:
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0
+        stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
+                       "L4_ran": 0, "L4_reject": 0}
+        audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         events = []
         for row in rows:
             if row["asin"] in adopted:
@@ -201,7 +210,18 @@ def run(params: dict) -> str:
             if not row.get("seller_id"):
                 seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
             product = audit_rules.product_info_from_row(row)
-            outcome = audit_rules.audit_one(product, ctx)
+            outcome = audit_rules.audit_one(product, ctx, conn,
+                                            run_l3=run_l3, run_l4=run_l4)
+            if outcome.l3 is not None:
+                stage_stats["L3_ran"] += 1
+                if outcome.l3.verdict == "reject":
+                    stage_stats["L3_reject"] += 1
+                elif outcome.l3.verdict == "pending":
+                    stage_stats["L3_pending"] += 1
+            if outcome.l4 is not None:
+                stage_stats["L4_ran"] += 1
+                if outcome.l4.verdict == "reject":
+                    stage_stats["L4_reject"] += 1
             counts[outcome.verdict] += 1
             if (outcome.verdict == "reject" and ctx.known_policies
                     and not audit_reason.known_policies_check(
@@ -226,9 +246,25 @@ def run(params: dict) -> str:
 
     judged = sum(counts.values())
     lines = [f"product_audit({resources.AUDIT_RULES_VERSION}"
-             f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}):"
+             f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
+             f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
              f"候选 {len(rows)},判定 {judged}"
              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
+    l1s = audit_rules.audit_l1_llm.STATS
+    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
+        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
+                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
+                     f"unknown→待定 {l1s.get('unknown', 0)},"
+                     f"字典回落 {l1s.get('dict_fallback', 0)},"
+                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
+                     f"低置信采纳 {l1s.get('conf_low', 0)}")
+    if stage_stats["L3_ran"]:
+        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
+                     f"(拒 {stage_stats['L3_reject']}/"
+                     f"LLM 故障待定 {stage_stats['L3_pending']})")
+    if stage_stats["L4_ran"]:
+        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
+                     f"(拒 {stage_stats['L4_reject']})")
     if "asins" in extra and len(rows) < len(extra["asins"]):
         lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
                      f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")

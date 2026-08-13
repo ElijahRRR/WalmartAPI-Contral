@@ -101,11 +101,17 @@ def uspto_dsn() -> str:
 
 @contextlib.contextmanager
 def uspto_conn():
-    """输入:无 → 输出:USPTO 库**只读**连接上下文(1400 万行 trademarks)。"""
+    """输入:无 → 输出:USPTO 库**只读、autocommit**连接上下文(1400 万行)。
+
+    autocommit 是批量消费的关键:整批共用一个连接,若开事务,第一条报错后
+    事务进 aborted 态,后续每条查询都 InFailedSqlTransaction——"fail-soft"
+    变成整轮静默失效(审核 R5 评审实证 2026-08-13)。只读查询无需事务语义。
+    """
     import psycopg
 
     conn = psycopg.connect(uspto_dsn())
     try:
+        conn.autocommit = True
         conn.read_only = True
         yield conn
     finally:

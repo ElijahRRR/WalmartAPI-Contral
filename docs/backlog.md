@@ -193,7 +193,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~settlement 前端依赖~~(所有者口径 2026-08-13:erp-core 不在迁移范围,不考虑其功能与脚本;settlement_sync 数据面已承接并首跑)
 - ⬜ **spec 拆分产物取证**:`<DATA_ROOT>/specs/MP_ITEM/` 的源头 MPSetup_by_pt(458MB)不在 git,权威副本只在生产 Mac——备份策略必须涵盖
 - 🟡 **类目映射链**(erp-core 依赖项已按所有者口径 2026-08-13 剔除):余两件——`.git-archive` 内嵌仓 7 个未推送 commit 归档前处理;"映射表产物导入 catalog"(plan.md 承诺)未见执行记录
-- ✅ **lark_io sheets_registry 漏登记** Amazon 选品黑名单 sheet(QNIp…Bb/8280e8)——已定:新系统需要(审核 Phase0 三表源),批次 A 已登记 `registry.PHASE0_BLACKLIST_SHEET`(2026-08-13,镜像归 risk_sync 批次 B5)
+- ✅ **lark_io sheets_registry 漏登记** Amazon 选品黑名单 sheet(QNIp…Bb/8280e8)——已定后**又被三次批复取代**(2026-08-13 黑名单中心统一):旧审核系统独立三列表不再是数据源,登记项撤销;审核四闸改直读 catalog 黑名单中心,卖家/类目两张新表从黑名单中心 wiki(UhZJ…4b sheet=B19LKn/twjmql)镜像,见 `registry.SELLER_BLACKLIST_SHEET` / `AMZCAT_BLACKLIST_SHEET`
 - ⚪ 已核实降级:erp-core Celery(所有者 2026-08-05 确认未启用,切换日 ps 复核即可);walmart-kpi-afternoon(参数 bug 从未成功写入,直接停);tools/ 10 个救场脚本与顶层一次性脚本全部可弃
 
 ## 九、文档失真待回写

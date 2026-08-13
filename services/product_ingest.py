@@ -17,6 +17,8 @@
 import json
 import logging
 
+from services import product_events
+
 logger = logging.getLogger("services.product_ingest")
 
 OUTCOME_OK = "ok"
@@ -50,7 +52,18 @@ ON CONFLICT (marketplace, asin) DO UPDATE SET
     image_url = COALESCE(EXCLUDED.image_url, catalog.products.image_url),
     slow_hash = COALESCE(EXCLUDED.slow_hash, catalog.products.slow_hash),
     slow = COALESCE(EXCLUDED.slow, catalog.products.slow),
+    -- 审核重审触发(批次 B1,批复 #9):慢变字段真变了才把 approved 翻回
+    -- pending;rejected 永不自动重审(force_rerun 手动通道在 product_audit)。
+    -- EXCLUDED.slow_hash 为 NULL(本次没采到 hash)不触发——上面 COALESCE
+    -- 保旧值,身份未变。不能用 updated_at 当触发(它无条件刷新)。
+    audit_status = CASE
+        WHEN EXCLUDED.slow_hash IS NOT NULL
+             AND catalog.products.slow_hash IS DISTINCT FROM EXCLUDED.slow_hash
+             AND catalog.products.audit_status = 'approved'
+        THEN 'pending'
+        ELSE catalog.products.audit_status END,
     updated_at = now()
+RETURNING (xmax = 0) AS inserted
 """
 
 
@@ -171,6 +184,7 @@ def ingest_batch(conn, records: list[dict]) -> dict:
     counts = {"snapshots": 0, "dup": 0, "products": 0, "skipped_outcome": 0,
               "incomplete": 0, "invalid": 0}
     outcomes: dict[str, int] = {}
+    new_events: list[dict] = []
     with conn.cursor() as cur:
         for rec in records:
             if not rec.get("asin") or not rec.get("source_id"):
@@ -194,6 +208,17 @@ def ingest_batch(conn, records: list[dict]) -> dict:
                 counts["incomplete"] += 1   # COALESCE 已防覆盖,这里只计数
             cur.execute(_PRODUCT_SQL, product_params(rec))
             counts["products"] += 1
+            # xmax=0 = 本条是全新插入(非 upsert 更新)→ 入库事件(批次 B1)
+            row = cur.fetchone()
+            if row and row[0]:
+                counts["new_products"] = counts.get("new_products", 0) + 1
+                new_events.append({
+                    "sku": rec["asin"], "event": product_events.PRODUCT_INGESTED,
+                    "source": "product_ingest",
+                    "detail": {"source_id": rec.get("source_id"),
+                               "slow_hash": rec.get("slow_hash")}})
+    if new_events:
+        product_events.record_many(conn, new_events)
     if counts["skipped_outcome"]:
         detail = ",".join(f"{k}:{v}" for k, v in sorted(outcomes.items())
                           if k != OUTCOME_OK)

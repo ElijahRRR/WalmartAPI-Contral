@@ -222,6 +222,31 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 
 **架构整体确认**:所有者 2026-08-13 二次批复确认第十节架构按计划所定。
 
+**三次批复(2026-08-13,黑名单中心统一)**:Phase0 从旧审核系统的独立三列表
+读黑名单"逻辑不对,直接使用黑名单数据中心,只维护一份数据库"。落地:
+
+- **四道闸全部直读 catalog 黑名单中心**:ASIN 闸 ← `catalog.asin_blacklist`;
+  品牌闸 ← `catalog.brand_blacklist`(飞书黑名单品牌总表 wiki
+  `UhZJw3EtsiFN9skbG0Ac24Dgn4b` sheet=jF8dOw,risk_sync 既有同步);
+  卖家闸 ← `catalog.seller_blacklist`(**新表**,同 wiki sheet=B19LKn 镜像);
+  类目闸 ← `catalog.amazon_cat_blacklist`(**新表**,同 wiki sheet=twjmql 镜像,
+  存归一化值)。两张新表由 risk_sync 以 TRUNCATE 全量重灌镜像
+  (空读绝不重灌 + 骤缩超 50% 拒绝两道护栏,独立事务)。
+- **audit.phase0_sellers / phase0_asins / phase0_categories / blacklist_brands
+  四表退役**,降级为批次 A 历史快照,不再被任何代码读取。
+  兼容 yaml(additional_hard_brands,34 个品牌)一并废除——品牌单一来源
+  是飞书总表,需要保留的品牌由所有者加进总表。
+- **历史继承 ASIN 导入**:所有者提供 ~19,831 行黑名单 ASIN 文件,经
+  `asin_blacklist_import` 工作流去重导入 `catalog.asin_blacklist`
+  (category='LEGACY',source='历史继承',已有键 DO NOTHING 不覆盖)。
+
+**病历回填(2026-08-13 所有者需求)**:病历里要一眼看到历史审核结论。
+沿用 cleanup_history_import 先例(时间线折叠),`audit_history_fold`
+一次性把历史 audit_runs(SHORTCUT 排除、product_audit 首跑前)折叠成
+每 ASIN 的结论**变迁点**事件(audit_passed/audit_rejected,
+source=audit_history_fold,occurred_at=原时间戳);幂等=按 source
+擦净重灌。204 万 runs 预计折到十几万事件,预览模式先报体量。
+
 ## 十、审核域架构定稿(2026-08-13 草案;所有者确认后再出细化迁移计划)
 
 ### 10.1 总结论:现有五层架构完全适用,零破例
@@ -231,12 +256,13 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 ```
 cli.py       product_audit(标 DANGEROUS,dry-run 强制)
 workflows/   product_audit.py  增量主流程:领 pending → 判定 → 落库+事件
-             problem_scan 与执行件分离(10.4;risk_sync 扩展 phase0 三表)
+             problem_scan 与执行件分离(10.4;risk_sync 扩展黑名单中心
+             卖家/类目两张镜像表——三次批复后取代原 phase0 三表方案)
 services/    audit_rules.py    纯规则积木:实证类目短路→历史短路→Phase0→L2→理由映射
              audit_llm.py      L1 rerank / L3 语义的提示词构建与解析(复用 llm_cache)
 api/         llm.py 扩 purpose 选模型(仍只 DeepSeek 一家、一条链)
              llm_vision.py 新增(豆包,仅 L4)——符合"api 按外部系统分文件"规范
-registry/    resources.py 登记审核表族/飞书 8280e8/用途→模型映射
+registry/    resources.py 登记审核表族/黑名单中心 wiki 两 sheet/用途→模型映射
              db.py 增 uspto 只读连接(数据库连接唯一入口)
 数据         catalog.products.audit_* 五列 = 结论权威
              audit schema:audit_runs/audit_hits 明细 + 规则字典表
@@ -358,10 +384,10 @@ pg_dump 留档。**这是硬前置**:97k 错误日报、25k 三表、audit_runs 
 | # | 任务 | 文件 |
 |---|---|---|
 | B1 | ingest 触发:`_PRODUCT_SQL` ON CONFLICT 加 slow_hash IS DISTINCT FROM → **仅 approved 翻 pending**;新 ASIN 首次入库打 product_ingested 事件 | `services/product_ingest.py` + 单测 |
-| B2 | 纯规则积木:实证类目短路(walmart_items.product_type / 历史认定)→ Phase0 四件套(audit.phase0 三表等值 / 8 类目 / ®™ 正则 / 品牌等值+seed yaml)→ L2 硬规则(R0/R1/R2/R3a,软证据仅收集留给 L3)→ reason_mapper(37 政策)。全部纯函数 | `services/audit_rules.py` |
+| B2 | 纯规则积木:实证类目短路(walmart_items.product_type / 历史认定)→ Phase0 四件套(黑名单中心 catalog 四表等值——原 audit.phase0 三表+seed yaml 方案被三次批复取代 / 8 类目 / ®™ 正则 / 品牌等值)→ L2 硬规则(R0/R1/R2/R3a,软证据仅收集留给 L3)→ reason_mapper(37 政策)。全部纯函数 | `services/audit_rules.py` |
 | B3 | 落库积木:写 audit_runs/audit_hits、写 products.audit_* 五列(approved/rejected/pending + reason + walmart_pt + audited_at + audit_version)、审核事件打点 | 随 audit_rules 或独立 `services/audit_store.py` |
 | B4 | 主工作流:领 `audit_status IS NULL OR 'pending'` → B2→B3;params:asins= / limit= / force_rerun= / mode=backfill(补刷=只审无结论,批复 #5);**DANGEROUS=True**,dry-run=只打统计+落 audit_runs,不写五列不投影;run 摘要带 pending 计数与最老龄期 | `workflows/product_audit.py` |
-| B5 | risk_sync 扩展:phase0 三表镜像(**单事务 TRUNCATE 全量重灌**,注释说明与家族"只增改不删"语义不同的原因);blacklist_brands 与 catalog.brand_blacklist 并轨对账(同源飞书品牌总表,audit 域读 audit 表、上架闸继续读 catalog 表,双表同源单向同步) | `workflows/risk_sync.py`、`services/risk_gate.py`(如需) |
+| B5 | ~~phase0 三表镜像 + blacklist_brands 并轨对账~~ **已被三次批复取代**(见第九节):risk_sync 改镜像黑名单中心卖家/类目两张新表(TRUNCATE 全量重灌+双护栏,独立事务);四闸直读 catalog;audit 四表退役;历史 ASIN 经 asin_blacklist_import 导入 | `workflows/risk_sync.py`、`workflows/asin_blacklist_import.py` |
 | B6 | 测试:audit_rules 纯函数单测 + violation_groundtruth 黄金集回归夹具(离线不打网) | `tests/test_audit_rules*.py` |
 | B7 | audit_version 定稿实现:规则集常量版本号(registry 登记,规则/seed 变更时手动递增);force_rerun 支持按版本批量重审 | registry + audit_rules |
 

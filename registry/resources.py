@@ -484,6 +484,9 @@ RETIRE_LIMITS = Bitable(
         target_gmv_daily="目标销售额",
         target_orders_daily="目标订单",
         max_online="单店最大在线数",
+        # 一店一配送方式的权威列(所有者建列 2026-08-13):填 fba/fbm,
+        # 填什么就只给该店分配该渠道的产品;未填=不接自由流分配(引擎报告提示)
+        channel_limit="配送限制",
     ),
 )
 

@@ -110,7 +110,7 @@
 | — | cleanup_history_import | (新增,一次性) | 否 | 旧问题商品三笔历史(error_items 41.7 万行时间线折叠 → product_events;seen 20.1 万对 → ops.cleanup_seen_categories;brand_cache → ops.dedupe)。**[x] 生产实跑完成**(2026-08-11):error_items 485,345 行 → 变迁事件 239,253 条(时间线折叠;重灌数与首跑一致,确定性实证)、seen 207,355 对、brand 2,609 ASIN(pending 实为 0)。实操修了三处:文件检查前置到重活前、seen/brand 传反按形状指纹拒绝、seen 真实形状 {"seen": [...]} 补分支(形状一直记在 legacy_survey:1350,教训:写解析器前先 grep 摸底文档) |
 | — | blacklist_push | (新增) | 否 | PG 黑名单自产行 → 飞书两张收集表(投影只追加;镜像行按 src_sku 指纹排除,绝不回推;水位 pushed_at 每块落,崩了重推不丢行;追加定位先读列 A 找真空行,防 +append 富文本误判)。**[~] 代码就绪**(2026-08-11):待生产首推验收 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警,Phase 0 后尽早上线 |
-| — | allocation(占用与分配) | (新增) | **是** | 品牌/产品/类目三重排他占用台账(catalog.claims,与在线快照解耦,释放只走显式动作)+ 分配引擎(硬约束闸→产品分→店铺-产品贪心匹配,第一版规则打分不用 ML/LLM)。**[~] A0 数据接线动工**(2026-08-12 校准 + 所有者拍板,暂缓解除:audit_sync / order_history_import 两工作流代码就绪待生产验收,限额表三目标列已登记;candidate_import 当晚作废——全量已重采进 v4,候选宇宙=catalog.products 走 product_ingest 泵干;同晚追加硬约束「一店一配送方式」(store_channel,A1);后续 A0.5 存量审计 → A1 占用台账 → A2 分配引擎)。子计划 docs/allocation_plan.md |
+| — | allocation(占用与分配) | (新增) | **是** | 品牌/产品/类目三重排他占用台账(catalog.claims,与在线快照解耦,释放只走显式动作)+ 分配引擎(硬约束闸→产品分→店铺-产品贪心匹配,第一版规则打分不用 ML/LLM)。**[~] A0 数据接线动工**(2026-08-12 校准 + 所有者拍板,暂缓解除:audit_sync / order_history_import 两工作流代码就绪待生产验收,限额表三目标列已登记;candidate_import 当晚作废——全量已重采进 v4,候选宇宙=catalog.products 走 product_ingest 泵干;同晚追加硬约束「一店一配送方式」(权威=限额表「配送限制」列直读,2026-08-13 定稿)+ 两梯队优先(有在线产品的 ACTIVE 店先分)+ 无订单史产品打分不减分;后续 A0.5 存量审计 → A1 占用台账 → A2 分配引擎)。子计划 docs/allocation_plan.md |
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 

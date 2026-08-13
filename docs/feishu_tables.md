@@ -55,7 +55,7 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 黑名单邮编 | 订单审核·钓鱼检测(所有者定稿 2026-08-09:**只匹配邮编**,旧系统的黑名单地址/街道双向 substring 整套不迁) | 每次运行现读,不入库;A 列邮编、无表头,zip+4 自动收敛到前 5 位;范围按实际行数取(旧系统写死 A1:A500,超出静默截断→漏放行) | **wiki 承载电子表格**;.env FEISHU_ZIP_BLACKLIST_WIKI_TOKEN / FEISHU_ZIP_BLACKLIST_SHEET_ID |
 | 采购方 | 订单审核·按 配送方式 + 亚马逊单价区间 选采购方与汇率 | 每次运行现读,不入库;**一行都没启用就直接失败**(拿旧配置继续算钱比不出结论危险);每行实际套用的采购方/汇率落 audit_detail 可追溯 | 多维表格;.env FEISHU_SUPPLIER_APP_TOKEN / FEISHU_SUPPLIER_TABLE_ID;6 列 采购方/配送方式/价格区间起/价格区间止/汇率/是否启用(配送方式填 FBA\|FBM;是否启用支持复选框或「是」;区间只填一端=以上/以下;多个候选取**最低汇率**) |
 | 商品停用删除表 | product_clear 驱动表 | 登记类:运营填 A~D(store/sku/停用或删除/操作原因),程序写 E~H(feedid/操作日期/结果/报错);状态权威在 ops.feed_log,G/H 由 feed_poll 反哺器或 product_clear 回写(2026-08-07 定稿:feed 结果统一交轮询回填) | **电子表格**(列序契约);已建,token/sheet_id 在 .env(FEISHU_RETIRE_SHEET_TOKEN / FEISHU_RETIRE_SHEET_ID) |
-| 上下架限额表 | **按店铺分行**的单日上/下架限额 + 店铺目标(店铺/fba区间1/fba区间2/FBM区间1/FBM区间2/上架限制/下架限制/库存特殊要求/**目标销售额/目标订单/单店最大在线数**——后三列 2026-08-12 所有者建列,销售额与订单为**日目标**,最大在线数是总容量上限,分配引擎 A2 消费) | 飞书人工维护 → 程序读(product_clear 读「下架限制」,店铺不在表内退默认值并告警;list_new 读「上架限制」;分配引擎读目标三列) | 多维表格;代码已接入,token 待填 .env(FEISHU_LIMITS_APP_TOKEN / FEISHU_LIMITS_TABLE_ID) |
+| 上下架限额表 | **按店铺分行**的单日上/下架限额 + 店铺目标 + 渠道限制(店铺/fba区间1/fba区间2/FBM区间1/FBM区间2/上架限制/下架限制/库存特殊要求/**目标销售额/目标订单/单店最大在线数**(2026-08-12 建列,销售额与订单为**日目标**,最大在线数是总容量上限)/**配送限制**(2026-08-13 建列,填 fba/fbm,一店一渠道的权威,未填=不接自由流分配)) | 飞书人工维护 → 程序读(product_clear 读「下架限制」;list_new 读「上架限制」;分配引擎读目标三列与配送限制) | 多维表格;代码已接入,token 待填 .env(FEISHU_LIMITS_APP_TOKEN / FEISHU_LIMITS_TABLE_ID) |
 
 ## 订单中心六表同步契约(order_center_push ↔ 用户既有「订单中心V1」应用)
 

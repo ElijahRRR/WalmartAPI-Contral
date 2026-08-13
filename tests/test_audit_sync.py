@@ -118,8 +118,9 @@ def test_limit_appends_to_sql(monkeypatch):
 
 
 def test_registry_store_target_fields_registered():
-    """Q4 拍板(2026-08-12):限额表三个目标列的字段常量必须在 registry。"""
+    """限额表四个分配用新列的字段常量必须在 registry(Q4 拍板 + 配送限制)。"""
     f = resources.RETIRE_LIMITS.fields
     assert f.target_gmv_daily == "目标销售额"
     assert f.target_orders_daily == "目标订单"
     assert f.max_online == "单店最大在线数"
+    assert f.channel_limit == "配送限制"

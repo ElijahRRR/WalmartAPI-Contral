@@ -443,7 +443,7 @@ AMZCAT_BLACKLIST_SHEET = Spreadsheet(
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "b.2026-08-13.1"
+AUDIT_RULES_VERSION = "b.2026-08-13.2"   # .2 = 黑名单中心统一(四闸换源)
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
 # 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose

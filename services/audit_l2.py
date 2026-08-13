@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,8 @@ if TYPE_CHECKING:  # 仅供阅读/类型工具;运行期不依赖,避免与 audi
     from services.audit_models import L1Info, ProductInfo
 
 logger = logging.getLogger("services.audit_l2")
+
+_AC_LOCK = threading.Lock()   # R4 自动机扫描锁(product_audit workers>1 共享 ctx)
 
 
 # =============================================================
@@ -832,8 +835,12 @@ def _rule_title_desc_blacklist(product: ProductInfo, ctx: Any) -> list[RuleHit]:
     matches: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    # AC iter 返回 (end_index, value), end_index 是命中末字符的位置 (inclusive)
-    for end_idx, brand in A.iter(hay_lower):
+    # AC iter 返回 (end_index, value), end_index 是命中末字符的位置 (inclusive)。
+    # workers>1 时共享一个自动机:pyahocorasick 只读迭代的线程安全没有官方
+    # 保证,锁住扫描段(µs 级,相对秒级 LLM 调用零成本)
+    with _AC_LOCK:
+        ac_matches = list(A.iter(hay_lower))
+    for end_idx, brand in ac_matches:
         if brand in seen or brand == own_brand:
             continue
         start_idx = end_idx - len(brand) + 1

@@ -242,7 +242,7 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     if pt:
         seed = audit_l1_llm.check_seed_excluded(product, pt)
         if seed:
-            audit_l1_llm.STATS["seed_excluded_direct"] += 1   # 直出级单独键
+            audit_l1_llm.bump("seed_excluded_direct")   # 直出级单独键(线程安全)
             l1.excluded_category_reason = seed
             l1.hits.append(RuleHit(
                 stage="L1", rule_code="excluded_category", penalty=-100,

@@ -101,7 +101,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 
 _KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
-                 "l3", "l4"}
+                 "l3", "l4", "workers"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -183,6 +183,12 @@ def run(params: dict) -> str:
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
     run_l4 = str(params.get("l4", "")).strip().lower() == "on"
+    # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
+    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
+    # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
+    workers = max(1, min(int(params.get("workers", 4)), 16))
+    if r5_on:
+        workers = 1
     where, extra = _pick_where(params)
     if "asins" in extra:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
@@ -217,6 +223,7 @@ def run(params: dict) -> str:
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         events = []
         row_errors, consec_errors = 0, 0
+        todo = []
         for row in rows:
             if row["asin"] in adopted:
                 continue
@@ -225,48 +232,75 @@ def run(params: dict) -> str:
                 continue
             if not row.get("seller_id"):
                 seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
-            product = audit_rules.product_info_from_row(row)
-            try:
-                # 每行 savepoint(评审 P2:批次 C 单行 SQL 面变大,一行报错
-                # 不许炸掉整批已付费的 runs/hits);连错 ≥5 = 系统性故障,炸停
-                with conn.transaction():
-                    outcome = audit_rules.audit_one(product, ctx, conn,
-                                                    run_l3=run_l3,
-                                                    run_l4=run_l4)
-                    run_id = audit_store.persist_run(conn, outcome)
-                    if execute:
-                        audit_store.write_conclusion(conn, outcome)
-                        ev = audit_store.event_row(outcome, run_id)
-                        if ev:
-                            events.append(ev)
-            except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
-                row_errors += 1
-                consec_errors += 1
-                logger.error("单行审核失败 asin=%s:%s", row["asin"], e)
-                if consec_errors >= 5:
-                    raise RuntimeError(
-                        f"连续 {consec_errors} 行失败(共 {row_errors}),"
-                        f"疑似系统性故障,停批。最后错误:{e}") from e
-                continue
-            consec_errors = 0
-            if outcome.l3 is not None:
-                stage_stats["L3_ran"] += 1
-                if outcome.l3.verdict == "reject":
-                    stage_stats["L3_reject"] += 1
-                elif outcome.l3.verdict == "pending":
-                    stage_stats["L3_pending"] += 1
-            if outcome.l4 is not None:
-                stage_stats["L4_ran"] += 1
-                if outcome.l4.verdict == "reject":
-                    stage_stats["L4_reject"] += 1
-                for h in outcome.l4.hits:
-                    if h.penalty == 0 and h.rule_code.startswith("l4_"):
-                        l4_fail[h.rule_code] = l4_fail.get(h.rule_code, 0) + 1
-            counts[outcome.verdict] += 1
-            if (outcome.verdict == "reject" and ctx.known_policies
-                    and not audit_reason.known_policies_check(
-                        outcome.final_reason_category, ctx.known_policies)):
-                policy_unknown += 1
+            todo.append((row["asin"], audit_rules.product_info_from_row(row)))
+
+        # 判定并发:worker 各领一条 autocommit 连接跑 audit_one(LLM 秒级,
+        # 是墙钟大头);结果按完成序回主线程,落库/计数全在主线程单连接上
+        # (savepoint 语义与串行版完全一致)。连错 ≥5 = 系统性故障,炸停
+        import queue as _queue
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            pool: _queue.SimpleQueue = _queue.SimpleQueue()
+            for _ in range(workers):
+                pool.put(stack.enter_context(db.pg_conn(autocommit=True)))
+
+            def _judge(product):
+                c = pool.get()
+                try:
+                    return audit_rules.audit_one(product, ctx, c,
+                                                 run_l3=run_l3, run_l4=run_l4)
+                finally:
+                    pool.put(c)
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                for fut in as_completed(futs):
+                    asin = futs[fut]
+                    try:
+                        outcome = fut.result()
+                        # 每行 savepoint(评审 P2):一行落库报错不炸整批
+                        # 已付费的 runs/hits
+                        with conn.transaction():
+                            run_id = audit_store.persist_run(conn, outcome)
+                            if execute:
+                                audit_store.write_conclusion(conn, outcome)
+                                ev = audit_store.event_row(outcome, run_id)
+                                if ev:
+                                    events.append(ev)
+                    except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
+                        row_errors += 1
+                        consec_errors += 1
+                        logger.error("单行审核失败 asin=%s:%s", asin, e)
+                        if consec_errors >= 5:
+                            for f in futs:
+                                f.cancel()
+                            raise RuntimeError(
+                                f"连续 {consec_errors} 行失败(共 {row_errors}),"
+                                f"疑似系统性故障,停批。最后错误:{e}") from e
+                        continue
+                    consec_errors = 0
+                    if outcome.l3 is not None:
+                        stage_stats["L3_ran"] += 1
+                        if outcome.l3.verdict == "reject":
+                            stage_stats["L3_reject"] += 1
+                        elif outcome.l3.verdict == "pending":
+                            stage_stats["L3_pending"] += 1
+                    if outcome.l4 is not None:
+                        stage_stats["L4_ran"] += 1
+                        if outcome.l4.verdict == "reject":
+                            stage_stats["L4_reject"] += 1
+                        for h in outcome.l4.hits:
+                            if h.penalty == 0 and h.rule_code.startswith("l4_"):
+                                l4_fail[h.rule_code] = \
+                                    l4_fail.get(h.rule_code, 0) + 1
+                    counts[outcome.verdict] += 1
+                    if (outcome.verdict == "reject" and ctx.known_policies
+                            and not audit_reason.known_policies_check(
+                                outcome.final_reason_category,
+                                ctx.known_policies)):
+                        policy_unknown += 1
         if execute and events:
             product_events.record_many(conn, events)
 

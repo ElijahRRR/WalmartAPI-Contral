@@ -23,6 +23,7 @@ LLM 输出 unknown、字典外 PT 且候选全不可用、无候选——一律�
 from __future__ import annotations
 
 import logging
+import threading
 from collections import Counter
 from functools import lru_cache
 from typing import Any
@@ -59,10 +60,20 @@ _STATS_KEYS = (
 )
 
 
+_STATS_LOCK = threading.Lock()
+
+
+def bump(key: str) -> None:
+    """输入:计数键 → 输出:无(线程安全 +1;workers>1 时裸 += 会丢计数)。"""
+    with _STATS_LOCK:
+        STATS[key] += 1
+
+
 def reset_stats() -> None:
     """输入:无 → 输出:无(把 STATS 清零并把全部键补 0,便于摘要直接取)。"""
-    STATS.clear()
-    STATS.update({k: 0 for k in _STATS_KEYS})
+    with _STATS_LOCK:
+        STATS.clear()
+        STATS.update({k: 0 for k in _STATS_KEYS})
 
 
 reset_stats()
@@ -148,7 +159,7 @@ def check_publication_ban(pt: str | None,
     """
     if pt not in PUBLICATION_HARD_FORBID or existing_reason:
         return None
-    STATS["publication_forbidden"] += 1
+    bump("publication_forbidden")
     return RuleHit(
         stage="L1",
         rule_code="publication_pt_forbidden",
@@ -168,11 +179,14 @@ def check_publication_ban(pt: str | None,
 
 
 def error_confirmed_map(conn, pt_meta) -> dict[str, str]:
-    """输入:中心库连接 + pt_meta 字典 → 输出:asin → PT(历史报错日报最新实证 PT)。
+    """输入:中心库连接 + pt_meta 字典 → 输出:asin → PT(报错/删除历史实证 PT)。
 
-    合同 L1-8 / 批复 #10("历史报错数据里有沃尔玛认定的真实类目"):取数口径照抄
-    旧仓 evals/l1_accuracy_eval.py:44-53 的实证写法——每 ASIN 取 recorded_at
-    最新一条,`walmart_pt != 'default'`('default' 表示日报未识别,不能当真值)。
+    合同 L1-8 / 批复 #10("历史报错数据里有沃尔玛认定的真实类目")。两个同性质
+    实证源按时间戳合并、每 ASIN 取最新:
+      · 报错日报 audit.walmart_error_records(recorded_at;'default' 剔除,
+        口径照抄旧仓 evals/l1_accuracy_eval.py:44-53);
+      · 删除历史 audit.deleted_items_pt(run_ts;deleted_pt_import 灌入,
+        所有者提议 2026-08-13——后台删除快照同样是沃尔玛认定的 PT)。
     再过 pt_meta 闸(与 walmart_items 同款:废弃 PT 直出会让 L2 四闸集体失明)。
 
     与 walmart_items 冲突时**以在架优先**——由调用方(load_context/resolve_pt)
@@ -182,16 +196,22 @@ def error_confirmed_map(conn, pt_meta) -> dict[str, str]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT DISTINCT ON (asin) asin, walmart_pt
-            FROM audit.walmart_error_records
-            WHERE walmart_pt IS NOT NULL AND walmart_pt != 'default'
-            ORDER BY asin, recorded_at DESC
+            SELECT DISTINCT ON (asin) asin, pt FROM (
+                SELECT asin, walmart_pt AS pt, recorded_at AS t
+                FROM audit.walmart_error_records
+                WHERE walmart_pt IS NOT NULL AND walmart_pt != 'default'
+                UNION ALL
+                SELECT asin, product_type, run_ts
+                FROM audit.deleted_items_pt
+            ) u
+            WHERE asin IS NOT NULL
+            ORDER BY asin, t DESC NULLS LAST
             """
         )
         for asin, pt in cur.fetchall():
             if asin and pt and pt in pt_meta:
                 out[asin] = pt
-    logger.info("历史报错实证 PT:%d 个 ASIN(已过 pt_meta 闸)", len(out))
+    logger.info("报错/删除历史实证 PT:%d 个 ASIN(已过 pt_meta 闸)", len(out))
     return out
 
 
@@ -596,12 +616,12 @@ def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
     # 不补跑)。后果:LLM 选出来的 PT 永远不过 seed 的 walmart_pt scope 9 条规则。
     seed_reason = check_seed_excluded(product)
     if seed_reason:
-        STATS["seed_excluded"] += 1
+        bump("seed_excluded")
 
     if not cands:
         # 合同 L1-5:旧仓照调 LLM 且几乎必然产 unknown(自由判的 PT 过不了字典校验),
         # 终点同为 pending,省一次调用。
-        STATS["no_candidate"] += 1
+        bump("no_candidate")
         logger.info("L1 rerank 无候选,直接 pending:asin=%s", product.asin)
         return None
 
@@ -609,15 +629,15 @@ def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
         {"role": "system", "content": L1_SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(product, cands)},
     ]
-    STATS["llm_called"] += 1
+    bump("llm_called")
     try:
         raw = (chat_fn or _default_chat)(messages)
     except Exception as e:  # noqa: BLE001 —— 单链重试尽,任何异常都转 pending
-        STATS["llm_failed"] += 1
+        bump("llm_failed")
         logger.warning("L1 rerank LLM 失败 asin=%s: %s → pending", product.asin, e)
         return None
     if not isinstance(raw, dict) or not raw:
-        STATS["bad_json"] += 1
+        bump("bad_json")
         logger.warning("L1 rerank 回复非法 asin=%s: %r → pending", product.asin, raw)
         return None
 
@@ -654,7 +674,7 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
             pt = str(chosen["walmart_product_type"])
             source = "map_fallback"
             conf = str(chosen.get("confidence") or "低")
-            STATS["dict_fallback"] += 1
+            bump("dict_fallback")
             logger.warning("L1 字典外 PT 回落 asin=%s: %r → %r",
                            product.asin, fallback_from, pt)
         else:
@@ -673,7 +693,7 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
         # 且 -100 已让 L2 直接判死,不存在 F6 的"硬规则失明→假 pass"风险,
         # 故不并入 unknown→pending(reject 比 pending 更贴近旧仓结论)。
         if llm_excluded:
-            STATS["llm_excluded"] += 1
+            bump("llm_excluded")
         l1 = L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
                     excluded_category_reason=excluded_reason)
         l1.hits.append(RuleHit(
@@ -690,7 +710,7 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
     if pt == "unknown":
         # F4/F5:LLM 主动输出 unknown,或字典外 PT 且候选全不可用 → pending。
         # 提示词自己写着"这种产品会后续人工处理",旧系统没兑现(§7 F5/F6)。
-        STATS["unknown"] += 1
+        bump("unknown")
         logger.info("L1 rerank 输出 unknown,转 pending:asin=%s", product.asin)
         return None
 
@@ -706,7 +726,7 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
                 "source": source,
             }))
     if conf == "低":
-        STATS["conf_low"] += 1
+        bump("conf_low")
 
     # 出版物硬禁(旧仓 _apply_spec_override 第 3 段,第三级出口必经)。
     # 与接线层对①②级的调用天然幂等:此处已写 reason 后再调返回 None。

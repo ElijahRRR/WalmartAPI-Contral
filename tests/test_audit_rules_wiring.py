@@ -422,8 +422,21 @@ def test_real_pt_excludes_unknown():
 
 
 def test_pick_where_accepts_l3_l4_params():
-    w, _ = product_audit._pick_where({"l3": "off", "l4": "on"})
+    w, _ = product_audit._pick_where({"l3": "off", "l4": "on", "workers": "8"})
     assert "IS NULL OR" in w      # 白名单收编,不炸
+
+
+def test_deleted_pt_fold_rows():
+    """删除历史实证折叠:extract_asin 归一、同 ASIN 多店取 run_ts 新者。"""
+    from datetime import datetime
+    from workflows.deleted_pt_import import fold_rows
+    t1, t2 = datetime(2026, 5, 1), datetime(2026, 6, 1)
+    rows = [("XKJ-B0ABCDEFGH-39.98", "OldPT", t1),
+            ("B0ABCDEFGH", "NewPT", t2),           # 同 ASIN 更新的一条胜
+            ("102460026733", "AnyPT", t1)]          # 纯数字提不出 ASIN → 剔
+    folded, no_asin = fold_rows(rows)
+    assert folded == {"B0ABCDEFGH": ("NewPT", t2)}
+    assert no_asin == 1
 
 
 def test_rerank_exit_pt_meta_gate(monkeypatch):

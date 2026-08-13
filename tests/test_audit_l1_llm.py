@@ -445,5 +445,6 @@ def test_error_confirmed_map_sql_and_pt_meta_gate():
     sql = cur.executed[0][0]
     assert "DISTINCT ON (asin)" in sql
     assert "walmart_pt != 'default'" in sql
-    assert "ORDER BY asin, recorded_at DESC" in sql
+    assert "ORDER BY asin, t DESC NULLS LAST" in sql   # 双源按时间戳合并取最新
     assert "audit.walmart_error_records" in sql
+    assert "audit.deleted_items_pt" in sql             # 删除历史实证(第二源)

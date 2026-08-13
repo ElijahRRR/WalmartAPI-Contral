@@ -342,6 +342,17 @@ pg_dump 留档。**这是硬前置**:97k 错误日报、25k 三表、audit_runs 
 **所有者侧**:提供生产 `walmart_audit` 库访问确认(同实例,无需网络配置);
 批准 backup 上线。
 
+> ✅ **批次 A 生产验收通过(2026-08-13)**:db_init 五 schema 幂等就绪;
+> backup 首跑 1554.5 MB 并通过 pg_restore 校验(生产库第一份备份);
+> audit_import dry-run 13 表全绿(三张反推表列对照零红)→ --execute
+> 单事务搬迁全 ✓:blacklist_brands **42,726**(三处注释之谜落定)、
+> category_map 15,987、phase0 三表 1,314/19,798/11,810、ip_stats 3,724、
+> groundtruth 18,602、error_records 97,002、pt_meta 7,008、pt_spec 6,942、
+> prohibited 37、**audit_runs 2,040,425、audit_hits 3,876,594**(合计约
+> 614 万行,历史短路的本钱比预期厚得多)。
+> 途中生产实证两修:db_init 退役清理块重跑幂等(嵌套 IF)、
+> backup 支持 PG_BIN_DIR(Homebrew 双版本 16/17 共存)。
+
 ### 批次 B|纯规则 MVP(零 LLM,只落库不投影)
 
 | # | 任务 | 文件 |

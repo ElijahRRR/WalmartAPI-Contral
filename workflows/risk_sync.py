@@ -1,7 +1,7 @@
-"""risk_sync — 风控两表镜像入库(listing L2b;只读飞书,非危险)。
+"""risk_sync — 风控/黑名单中心四表镜像入库(只读飞书,非危险)。
 
 用法:
-  python cli.py risk_sync         # 类目表 + 禁止品牌表 → PG,报禁售/黑名单计数
+  python cli.py risk_sync   # 类目表+品牌总表+黑名单卖家+黑名单亚马逊类目 → PG
 
 来源(wiki 承载,api/feishu 自动解析节点 token):
   「沃尔玛类目表」(registry.RISK_PT_SHEET,10 列)→ catalog.risk_product_types
@@ -9,10 +9,16 @@
     ——各渠道黑名单品牌由所有者人工归拢的总清单(2026-08-11 换新表,
     旧「禁止品牌收集」退役)。方向只有飞书→PG;程序自产品牌的**反向**
     投影走 blacklist_push → BRAND_ERR_SHEET(归拢的增量渠道),别混。
+  「黑名单卖家店铺ID」(registry.SELLER_BLACKLIST_SHEET,sheet=B19LKn)
+    → catalog.seller_blacklist(审核 Phase0 卖家闸;定稿 2026-08-13)
+  「黑名单亚马逊类目」(registry.AMZCAT_BLACKLIST_SHEET,sheet=twjmql)
+    → catalog.amazon_cat_blacklist(审核 Phase0 类目闸,入库即归一化)
 
-同步语义:**只增改不删**(upsert,不碰 pushed_at 列)。所有者定稿
-2026-08-07:表格随时会停用,停用后 PG 是唯一权威;上架主链的提交前
-否决闸(services/risk_gate)只读 PG。
+同步语义分两族:前两表**只增改不删**(upsert,不碰 pushed_at 列);
+黑名单中心两张单列表 **TRUNCATE 全量重灌**(飞书删行必须跟着消失,
+详见 _sync_column_blacklist)。所有者定稿 2026-08-07:表格随时会停用,
+停用后 PG 是唯一权威;上架否决闸(services/risk_gate)与审核四闸
+(services/audit_rules)都只读 PG。
 
 调度建议:每日一次(上架主链跑前);表格停用后本工作流随之停用。
 """

@@ -63,16 +63,18 @@ LEFT JOIN LATERAL (
     ORDER BY s.scraped_at DESC LIMIT 1
 ) sn ON true
 WHERE p.marketplace = %(marketplace)s AND ({where})
-ORDER BY p.updated_at
+ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
 """
+# 排序契约:从未审过的(audited_at NULL)永远先于重试的 pending——
+# 否则 pending 存量 ≥ limit 时新入库产品会被饿死(评审 P1-3)
 
 # 历史结论(补刷用):SHORTCUT 排除 + reject 粘性排序键——
 # (verdict='reject') DESC 把旧 history_shortcut 的"reject 查询先跑"压成一个
 # 排序键,语义等价(spec_shortcut §3.4C),别当成可随手删的排序
 _HISTORY_SQL = """
 SELECT DISTINCT ON (asin) asin, run_id, verdict, score_final,
-       walmart_product_type, l3_reason_category, created_at
+       walmart_product_type, l3_reason_category, stage_stopped_at, created_at
 FROM audit.audit_runs
 WHERE asin = ANY(%s)
   AND verdict IN ('reject', 'pass')
@@ -89,16 +91,32 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
+_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun"}
+
+
 def _pick_where(params: dict) -> tuple[str, dict]:
+    unknown = set(params) - _KNOWN_PARAMS
+    if unknown:
+        # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
+        raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
     asins = [a.strip() for a in str(params.get("asins", "")).split(",")
              if a.strip()]
     if asins:
-        # 指定 ASIN = 无视现有结论强审(force_rerun 语义:与旧仓不同,
-        # 这里没有运行时短路可绕,绕的是 audit_status 候选谓词)
+        # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
+        # 运行时短路可绕,绕的是 audit_status 候选谓词)
         return "p.asin = ANY(%(asins)s)", {"asins": asins}
+    fr = str(params.get("force_rerun", "")).strip()
+    if fr:
+        # 按版本批量重审(B7):audit_version 不等于目标版本的全部重审,
+        # 含已 approved/rejected 的存量
+        return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
+            {"force_rerun": fr}
     if str(params.get("mode", "")).strip() == "backfill":
         return "p.audit_status IS NULL", {}
-    return "(p.audit_status IS NULL OR p.audit_status = 'pending')", {}
+    # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
+    # 每小时重判只会无界追加 audit_runs,评审 P1-3)
+    return ("(p.audit_status IS NULL OR (p.audit_status = 'pending' "
+            "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))"), {}
 
 
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
@@ -115,14 +133,20 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
         rows = cur.fetchall()
     adopted = set()
     events = []
-    for asin, run_id, verdict, _score, pt, reason_cat, created in rows:
+    for asin, run_id, verdict, _score, pt, reason_cat, stage, created in rows:
         adopted.add(asin)
         if not execute:
             continue
         status = "approved" if verdict == "pass" else "rejected"
+        if verdict == "reject":
+            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——不留空
+            # (rejected 说不出理由 = 排查断线),也不迁旧'history_shortcut'字面量
+            reason = reason_cat or f"历史结论(阶段 {stage or '未知'},理由未留存)"
+        else:
+            reason = None
         conn.execute(_ADOPT_SQL, {
             "status": status,
-            "reason": reason_cat if verdict == "reject" else None,
+            "reason": reason,
             "pt": (pt if pt and not pt.startswith("(") else None),
             "version": resources.AUDIT_RULES_VERSION,
             "marketplace": "US", "asin": asin,
@@ -146,12 +170,15 @@ def run(params: dict) -> str:
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
     r5_on = str(params.get("r5", "")).strip().lower() == "on"
+    where, extra = _pick_where(params)
+    if "asins" in extra:
+        # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
+        limit = max(limit, len(extra["asins"]))
 
     import contextlib
     uspto_cm = db.uspto_conn() if r5_on else contextlib.nullcontext()
     with db.pg_conn() as conn, uspto_cm as uspto:
         ctx = audit_rules.load_context(conn, uspto=uspto)
-        where, extra = _pick_where(params)
         query_params = {"marketplace": "US", "limit": limit, **extra}
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where), query_params)
@@ -190,21 +217,22 @@ def run(params: dict) -> str:
         if execute and events:
             product_events.record_many(conn, events)
 
-        # pending 可见性(一致性审查 3.5):总量 + 最老龄期
+        # pending 可见性(一致性审查 3.5):只报总量——audited_at 是"审核动作
+        # 时刻"不是"进入 pending 时刻",拿它算龄期两种来源口径相反(评审 P1-3/
+        # I-3);诚实的龄期需要 pending_since 列,批次 C 随 L1 一并定
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*), min(audited_at) FROM catalog.products "
+            cur.execute("SELECT count(*) FROM catalog.products "
                         "WHERE marketplace = 'US' AND audit_status = 'pending'")
-            pending_total, pending_oldest = cur.fetchone()
+            (pending_total,) = cur.fetchone()
 
     judged = sum(counts.values())
-    age = ""
-    if pending_oldest:
-        days = (datetime.now(timezone.utc) - pending_oldest).days
-        age = f",最老 {days} 天"
     lines = [f"product_audit({resources.AUDIT_RULES_VERSION}"
              f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}):"
              f"候选 {len(rows)},判定 {judged}"
              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
+    if "asins" in extra and len(rows) < len(extra["asins"]):
+        lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
+                     f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")
     if adopted_n:
         lines.append(f"历史结论采用 {adopted_n}(不写新 run,detail 指回原 run_id)")
     if no_title:
@@ -214,6 +242,9 @@ def run(params: dict) -> str:
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
     if policy_unknown:
         lines.append(f"⚠ 理由映射落 37 政策外 {policy_unknown} 条(详见日志,只记不改判)")
+    if r5_on and getattr(ctx, "uspto_failures", 0):
+        lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
+                     f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
     lines.append(f"全库 pending 存量 {pending_total}{age}")
     if not execute:
         lines.append("(dry-run:runs/hits 已落,products 五列与事件未写)")

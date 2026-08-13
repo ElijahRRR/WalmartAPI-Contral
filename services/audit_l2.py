@@ -902,6 +902,20 @@ def _extract_candidate_tokens(text: str, top_k: int = 40) -> list[str]:
     return seen
 
 
+def _r5_failure(ctx: Any) -> None:
+    """输入:上下文 → 输出:无(R5 连续失败计数,≥5 次自动关停本轮 R5)。
+
+    兜底触发必须记日志计数(铁律):没有这道闸,uspto 一次报错后整轮每个
+    产品都静默落 except——"R5 开着"与"R5 一条没查"在摘要里长得一样
+    (评审 P2-6)。关停后由 workflow 摘要亮出失败计数。
+    """
+    ctx.uspto_failures = getattr(ctx, "uspto_failures", 0) + 1
+    if ctx.uspto_failures >= 5 and ctx.uspto is not None:
+        logger.error("R5 连续失败 %d 次,本轮自动关停(uspto 置 None)",
+                     ctx.uspto_failures)
+        ctx.uspto = None
+
+
 def _rule_trademark_live(product: ProductInfo, l1: L1Info, ctx: Any) -> list[RuleHit]:
     """输入:产品 + L1 结果 + ctx(用 ctx.uspto / ctx.nice_*) → 输出:0 或 1 条 hit(penalty 0)。
 
@@ -943,9 +957,11 @@ def _rule_trademark_live(product: ProductInfo, l1: L1Info, ctx: Any) -> list[Rul
             hits_rows = cur.fetchall()
     except psycopg.OperationalError as e:
         logger.warning("uspto DB 不可达, R5 跳过: %s", e)
+        _r5_failure(ctx)
         return []
     except Exception as e:  # noqa: BLE001
         logger.warning("R5 查询失败, 跳过: %s", e)
+        _r5_failure(ctx)
         return []
 
     if not hits_rows:

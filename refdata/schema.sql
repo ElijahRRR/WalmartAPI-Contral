@@ -111,7 +111,9 @@ CREATE OR REPLACE VIEW catalog.latest_snapshot AS
   FROM catalog.snapshots ORDER BY marketplace, asin, scrape_params, scraped_at DESC;
 
 -- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert
--- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,按 sku=asin JOIN)
+-- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,
+--  按 extract_asin(sku) 归一后关联——sku=asin 全局约定已废 2026-08-11,
+--  规则唯一出处 services/sku_asin)
 CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     store        text NOT NULL,
     sku          text NOT NULL,

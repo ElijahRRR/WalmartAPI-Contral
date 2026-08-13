@@ -44,27 +44,33 @@ class AuditContext:
     nice_mapping: dict
     nice_default: list
     uspto: object = None           # psycopg 连接或 None(R5 开关)
-    walmart_confirmed: dict = field(default_factory=dict)   # asin → PT(跨店唯一)
-    catmap: dict = field(default_factory=dict)               # amazon_category → [(pt, confidence)]
+    walmart_confirmed: dict = field(default_factory=dict)   # asin → PT(跨店唯一,已 pt_meta 闸)
+    catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
     known_policies: frozenset = frozenset()                  # 37 政策 category_en 集合
+    uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
 
 
-def _brand_map(conn) -> dict:
-    """输入:连接 → 输出:品牌黑名单 dict(规整小写→原文;DB first-wins,yaml 补)。
+def _brand_map(conn) -> tuple[dict, set]:
+    """输入:连接 → 输出:(Phase0 品牌 dict, R4 词集)——两套口径,旧仓本就不同源。
 
-    规整算法与 audit_phase0 品牌规则同款:strip → lower → 空白压单空格。
-    yaml 只消费 additional_hard_brands(spec_phase0 §7:其余键是 R6 死配置)。
+    Phase0 dict(规整小写→原文):strip → lower → 空白压单空格;DB first-wins,
+    yaml additional_hard_brands 补(spec_phase0 §7:其余键是 R6 死配置)。
+    R4 词集:**只取 DB**(旧 l2 加载器不含 yaml),且只 strip+lower(保留词内
+    空白)——评审 2026-08-13:两口径混用会让 R4 多命中 yaml 34 牌,把本该落
+    General-Use 的 reject 经理由映射改写成 Intellectual Property。
     """
-    out: dict = {}
+    phase0: dict = {}
+    r4: set = set()
     with conn.cursor() as cur:
         cur.execute("SELECT brand FROM audit.blacklist_brands")
         for (brand,) in cur.fetchall():
             raw = (brand or "").strip()
             if not raw:
                 continue
+            r4.add(raw.lower())
             norm = " ".join(raw.lower().split())
-            if norm and norm not in out:
-                out[norm] = raw
+            if norm and norm not in phase0:
+                phase0[norm] = raw
     yaml_path = paths.audit_seed_file("compat_ip_brands.yaml")
     if yaml_path.exists():
         import yaml as _yaml
@@ -74,10 +80,11 @@ def _brand_map(conn) -> dict:
             if not raw:
                 continue
             norm = " ".join(raw.lower().split())
-            if norm and norm not in out:
-                out[norm] = raw
-    logger.info("品牌黑名单加载 %d 键(DB + yaml additional)", len(out))
-    return out
+            if norm and norm not in phase0:
+                phase0[norm] = raw
+    logger.info("品牌黑名单加载:Phase0 %d 键(DB+yaml)/ R4 %d 键(仅 DB)",
+                len(phase0), len(r4))
+    return phase0, r4
 
 
 def _frozen(conn, sql: str) -> frozenset:
@@ -117,39 +124,61 @@ def _build_automaton(brand_keys) -> object:
     return a
 
 
+_UNMAPPED_SENTINEL = "无对应Walmart PT"   # 映射表哨兵值(675 行),不是真 PT
+
+
 def load_context(conn, *, uspto=None) -> AuditContext:
-    """输入:中心库连接(+可选 uspto 只读连接)→ 输出:装配完成的 AuditContext。"""
-    brand = _brand_map(conn)
+    """输入:中心库连接(+可选 uspto 只读连接)→ 输出:装配完成的 AuditContext。
+
+    实证/映射两级 PT 源在装配期就过 pt_meta 闸(评审 P0-1:废弃 PT——如
+    'Office Chairs' 已改名 'Desk Chairs'——直出会让 R0/R1/R2/R3 四闸集体失明
+    产出假 pass;旧仓 l1_category.py:605-620 用 INNER JOIN pt_meta 防的正是它)。
+    """
+    brand, r4_keys = _brand_map(conn)
     nice_mapping, nice_default = audit_l2.load_nice_mapping()
     nrtl_small, nrtl_whole = audit_l2.load_nrtl_keywords()
+    pt_meta = _rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
+                               "walmart_ptg, access_state, zh_can_do, requirements, "
+                               "notes FROM audit.walmart_pt_meta",
+                         "walmart_product_type")
     with conn.cursor() as cur:
-        # 实证 PT:跨店同 SKU(=ASIN)只认唯一口径,多 PT 并存的少数行不采信
+        # 实证 PT:SKU 先归一成 ASIN(所有者 2026-08-11 推翻 sku=asin 全局约定,
+        # 生产 SKU 形如 XKJ-B0XXX-39.98,唯一规则出处 services/sku_asin)——
+        # 直接拿 sku 当键会让实证级对三段式 SKU 全部失明(评审 I-1);
+        # 归一后仍保持"同一 ASIN 跨店多 PT 不采信"
+        from services.sku_asin import extract_asin
+        cur.execute("SELECT sku, product_type FROM catalog.walmart_items "
+                    "WHERE product_type IS NOT NULL AND product_type <> ''")
+        by_asin: dict = {}
+        for sku, pt in cur.fetchall():
+            asin = extract_asin(sku) or sku
+            by_asin.setdefault(asin, set()).add(pt)
+        confirmed = {a: next(iter(pts)) for a, pts in by_asin.items()
+                     if len(pts) == 1 and next(iter(pts)) in pt_meta}
+        # 映射表:先筛 confidence='高' 再数 DISTINCT PT(旧仓快速通道同款,
+        # l1_category.py:605-620),剔哨兵、过 pt_meta 闸,装配期直接压成 str
         cur.execute(
-            "SELECT sku, min(product_type) FROM catalog.walmart_items "
-            "WHERE product_type IS NOT NULL AND product_type <> '' "
-            "GROUP BY sku HAVING count(DISTINCT product_type) = 1")
-        confirmed = dict(cur.fetchall())
-        cur.execute(
-            "SELECT amazon_category, walmart_product_type, confidence "
-            "FROM audit.walmart_category_map")
-        catmap: dict = {}
-        for cat, pt, conf in cur.fetchall():
+            "SELECT amazon_category, walmart_product_type "
+            "FROM audit.walmart_category_map "
+            "WHERE confidence = '高' AND walmart_product_type <> %s",
+            (_UNMAPPED_SENTINEL,))
+        cat_pts: dict = {}
+        for cat, pt in cur.fetchall():
             if cat and pt:
-                catmap.setdefault(cat, []).append((pt, conf))
+                cat_pts.setdefault(cat.strip(), set()).add(pt)
+        catmap = {cat: next(iter(pts)) for cat, pts in cat_pts.items()
+                  if len(pts) == 1 and next(iter(pts)) in pt_meta}
     return AuditContext(
         phase0_sellers=_frozen(conn, "SELECT seller_id FROM audit.phase0_blacklist_sellers"),
         phase0_asins=_frozen(conn, "SELECT asin FROM audit.phase0_blacklist_asins"),
         phase0_cats=_frozen(conn, "SELECT category_norm FROM audit.phase0_blacklist_amazon_cats"),
         brand_blacklist=brand,
-        pt_meta=_rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
-                                 "walmart_ptg, access_state, zh_can_do, requirements, "
-                                 "notes FROM audit.walmart_pt_meta",
-                           "walmart_product_type"),
+        pt_meta=pt_meta,
         pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "
                                  "real_cert_fields, has_soft_cert, soft_cert_fields "
                                  "FROM audit.walmart_pt_spec",
                            "walmart_product_type"),
-        ac_automaton=_build_automaton(brand.keys()),
+        ac_automaton=_build_automaton(r4_keys),
         mega=audit_l2.load_mega_categories(),
         nrtl_small=nrtl_small, nrtl_whole=nrtl_whole,
         nice_mapping=nice_mapping, nice_default=nice_default,
@@ -163,18 +192,25 @@ def load_context(conn, *, uspto=None) -> AuditContext:
 
 
 def resolve_pt(product, ctx: AuditContext) -> L1Info:
-    """输入:产品 + 上下文 → 输出:L1Info(批次 B 两级 PT 解析;解不出 PT=None)。"""
+    """输入:产品 + 上下文 → 输出:L1Info(批次 B 两级 PT 解析;解不出 PT=None)。
+
+    两级数据在 load_context 已过三道闸(pt_meta 存在/剔哨兵/高置信唯一),
+    此处再兜一道防御(闸的唯一出处在装配期,这里只是断言式保护)。
+    批次 B 裁剪项(批次 C 归还):①级只用 walmart_items,计划 10.3① 的
+    "历史成功上架记录"(audit.walmart_error_records 反哺)未消费;
+    旧仓对映射到哨兵'无对应Walmart PT'的类目是 -100 硬拒,本批落 pending
+    (保守方向,批次 C 接 L1 后按旧语义处置)。
+    """
     pt = ctx.walmart_confirmed.get(product.asin)
     source, conf = None, None
     if pt:
         source, conf = "walmart_confirmed", "高"
     else:
-        rows = ctx.catmap.get(product.amazon_category_path or "") or []
-        pts = {p for p, _ in rows}
-        if len(pts) == 1:
-            only_pt, only_conf = rows[0][0], rows[0][1]
-            if all(c == "高" for _, c in rows):
-                pt, source, conf = only_pt, "map_direct", only_conf
+        pt = ctx.catmap.get((product.amazon_category_path or "").strip())
+        if pt:
+            source, conf = "map_direct", "高"
+    if pt and pt not in ctx.pt_meta:      # 防御:废弃 PT 宁 pending 不假 pass
+        pt, source, conf = None, None, None
     meta = ctx.pt_meta.get(pt) if pt else None
     return L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
                   walmart_category=(meta or {}).get("walmart_category"))

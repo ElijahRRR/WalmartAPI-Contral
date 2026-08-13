@@ -1,0 +1,199 @@
+"""审核接线层测试(评审 I-8 补钉:P0/P1 发现全在这些零测试文件里)。
+
+覆盖:resolve_pt 的 pt_meta 闸与优先级、audit_store 词表/桩值、
+_pick_where 四态与参数白名单、_sync_phase0 空读/骤缩护栏、行适配。
+"""
+
+import pytest
+
+from services import audit_rules, audit_store
+from services.audit_models import AuditOutcome, L1Info, ProductInfo
+from workflows import product_audit
+from workflows.risk_sync import _sync_phase0
+
+
+def _ctx(**kw):
+    base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                phase0_cats=frozenset(), brand_blacklist={},
+                pt_meta={}, pt_spec={}, ac_automaton=None, mega=[],
+                nrtl_small=[], nrtl_whole=[], nice_mapping={},
+                nice_default=[], uspto=None)
+    base.update(kw)
+    return audit_rules.AuditContext(**base)
+
+
+META = {"GoodPT": {"walmart_category": "Home", "walmart_ptg": None,
+                   "access_state": "普通商品", "zh_can_do": "是",
+                   "requirements": "", "notes": ""}}
+
+
+# ── resolve_pt:pt_meta 闸与两级优先级(评审 P0-1)────────────────────────────
+
+def test_resolve_pt_confirmed_wins_and_fills_category():
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"},
+               catmap={"Cat > Path": "GoodPT"})
+    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0A"), ctx)
+    assert l1.walmart_product_type == "GoodPT"
+    assert l1.pt_source == "walmart_confirmed"
+    assert l1.walmart_category == "Home"
+
+
+def test_resolve_pt_dead_pt_falls_to_pending_not_pass():
+    """废弃 PT(不在 pt_meta)绝不直出——四条硬规则会集体失明产出假 pass。"""
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0B": "Office Chairs"})
+    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0B"), ctx)
+    assert l1.walmart_product_type is None and l1.pt_source is None
+
+
+def test_resolve_pt_catmap_strips_and_misses():
+    ctx = _ctx(pt_meta=META, catmap={"Cat > Path": "GoodPT"})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0C", amazon_category_path="  Cat > Path  "), ctx)
+    assert l1.walmart_product_type == "GoodPT" and l1.pt_source == "map_direct"
+    miss = audit_rules.resolve_pt(
+        ProductInfo(asin="B0D", amazon_category_path="Other > Path"), ctx)
+    assert miss.walmart_product_type is None
+
+
+def test_audit_one_pending_when_pt_unresolved():
+    ctx = _ctx(pt_meta=META)
+    out = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx)
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_audit_one_phase0_blocked_stub():
+    ctx = _ctx(pt_meta=META, phase0_asins=frozenset({"B0F"}))
+    out = audit_rules.audit_one(ProductInfo(asin="B0F", title="w"), ctx)
+    assert out.verdict == "reject" and out.stage_stopped_at == "L0"
+    assert out.score_final == 0
+    assert out.l1.walmart_product_type == "(phase0_blocked)"
+
+
+# ── audit_store:词表映射与桩值(spec_shortcut §4)─────────────────────────────
+
+def test_real_pt_excludes_stub():
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                     stage_stopped_at="L0",
+                     l1=L1Info(walmart_product_type="(phase0_blocked)"))
+    assert audit_store.real_pt(o) is None
+
+
+def test_event_row_mapping():
+    def _o(v):
+        return AuditOutcome(asin="B0", verdict=v, score_final=100,
+                            stage_stopped_at=None,
+                            l1=L1Info(walmart_product_type="GoodPT"))
+    assert audit_store.event_row(_o("pass"), 1)["event"] == "audit_passed"
+    assert audit_store.event_row(_o("reject"), 1)["event"] == "audit_rejected"
+    assert audit_store.event_row(_o("pending"), 1) is None   # 过渡态不进病历
+
+
+def test_write_conclusion_status_words(monkeypatch):
+    captured = {}
+
+    class _Conn:
+        def execute(self, sql, params):
+            captured.update(params)
+    o = AuditOutcome(asin="B0", verdict="pass", score_final=100,
+                     stage_stopped_at=None,
+                     l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.write_conclusion(_Conn(), o)
+    assert captured["status"] == "approved"       # 两套词表显式映射
+    assert captured["walmart_pt"] == "GoodPT"
+    assert captured["reason"] is None
+
+
+# ── _pick_where 四态与参数白名单(评审 P1-4/I-6)──────────────────────────────
+
+def test_pick_where_four_states():
+    w, e = product_audit._pick_where({})
+    assert "IS NULL OR" in w and "interval '1 day'" in w   # pending 退避
+    w, e = product_audit._pick_where({"asins": "B0A, B0B"})
+    assert e["asins"] == ["B0A", "B0B"]
+    w, e = product_audit._pick_where({"force_rerun": "b.2026-08-13.1"})
+    assert "audit_version IS DISTINCT FROM" in w
+    w, _ = product_audit._pick_where({"mode": "backfill"})
+    assert w == "p.audit_status IS NULL"
+
+
+def test_pick_where_rejects_unknown_params():
+    """静默吞参数 = '全量重审跑完了'的假象,宁炸不吞。"""
+    with pytest.raises(ValueError, match="未识别参数"):
+        product_audit._pick_where({"force_rurn": "x"})     # 手滑拼错
+
+
+# ── _sync_phase0 护栏(评审 P0-2)─────────────────────────────────────────────
+
+class _P0Cur:
+    def __init__(self, conn):
+        self._c = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self._c.sql.append(sql)
+
+    def executemany(self, sql, rows):
+        self._c.sql.append(sql)
+        self._c.inserted += len(rows)
+
+    def fetchone(self):
+        return self._c.counts
+
+
+class _P0Conn:
+    def __init__(self, counts=(0, 0, 0)):
+        self.counts = counts
+        self.sql = []
+        self.inserted = 0
+
+    def cursor(self):
+        return _P0Cur(self)
+
+
+def test_sync_phase0_empty_read_never_truncates():
+    conn = _P0Conn(counts=(1314, 19798, 11810))
+    msg = _sync_phase0(conn, [])
+    assert "不重灌" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql)
+
+
+def test_sync_phase0_shrink_guard():
+    """骤缩超 50% 拒绝重灌——接口异常与运营删行是两回事。"""
+    conn = _P0Conn(counts=(1314, 19798, 11810))
+    rows = [{"seller_id": "S1", "asin": "B0A", "category": "Toys"}]
+    with pytest.raises(RuntimeError, match="骤缩"):
+        _sync_phase0(conn, rows)
+    assert not any("TRUNCATE" in s for s in conn.sql)
+
+
+def test_sync_phase0_normal_refill():
+    conn = _P0Conn(counts=(1, 1, 1))
+    rows = [{"seller_id": "S1", "asin": "B0A", "category": "Toys > Games"},
+            {"seller_id": "S2", "asin": "", "category": ""}]
+    msg = _sync_phase0(conn, rows)
+    assert "卖家 2 / ASIN 1 / 类目 1" in msg
+    assert sum("TRUNCATE" in s for s in conn.sql) == 3
+    assert conn.inserted == 4          # 2 卖家 + 1 ASIN + 1 类目(已归一化)
+
+
+# ── 行适配 ───────────────────────────────────────────────────────────────────
+
+def test_product_info_from_row_bullet_shapes():
+    base = {"asin": "B0A", "title": "t", "brand": None,
+            "long_description": None, "amazon_category_path": None,
+            "seller_id": None, "seller_name": None}
+    p1 = audit_rules.product_info_from_row({**base, "bullet_points": ["a", "b"]})
+    assert p1.bullet_points == ["a", "b"]
+    p2 = audit_rules.product_info_from_row(
+        {**base, "bullet_points": '["x", "y"]'})       # jsonb 以串到达
+    assert p2.bullet_points == ["x", "y"]
+    p3 = audit_rules.product_info_from_row(
+        {**base, "bullet_points": "line1\nline2"})     # 换行分隔兼容
+    assert p3.bullet_points == ["line1", "line2"]
+    p4 = audit_rules.product_info_from_row({**base, "bullet_points": None})
+    assert p4.bullet_points == [] and p4.brand == ""

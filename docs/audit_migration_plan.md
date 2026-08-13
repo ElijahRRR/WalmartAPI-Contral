@@ -104,7 +104,7 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 (漏斗铁律:取回只有 product_ingest 一条路);待审行缺数据(如 L4 缺图)走既有
 推采集闭环——推送合规,取回仍等 ingest 落库,下一轮审核自然消化。
 
-## 五、批次分解
+## 五、批次分解(粗版;细化定稿见第十一节,以十一节为准)
 
 - **批次 A|数据地基**(纯搬运,零行为变更)。**前置:backup 工作流先上线**,或至少
   迁移当日两侧手动 pg_dump 留档——97k 错误日报、25k 三表、audit_runs 全史要灌进
@@ -207,7 +207,7 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 | 1 | LLM 供应商 | **DeepSeek,分用途选模型**;视觉 DeepSeek 无能力,暂用豆包(设计落地见 10.2) |
 | 2 | L4 视觉 | **保留**,仅 pass 产品才跑,**默认关闭**(参数显式开启) |
 | 3 | uspto/外部仓 | 商标继续连 uspto 库;品牌黑名单直接连本库(已有);tro-scraper-matrix 是 TRO 法院禁令案件的采集仓(黑名单的上游之一,非黑名单本身),采集链不进本仓 |
-| 4 | E/F/G 权责 | 待确认——E/F/G = 飞书新品上架表第 5/6/7 列(审核结果/原因/日期),现为人工域,list_new 只领 E=pass 行。建议方案见本节后注 |
+| 4 | D/E/F/G 权责 | **已定稿(2026-08-13 二次批复)**:所有者往上架表填 ASIN 后,D/E/F/G 四列全部由审核链映射投影,**表只是给所有者看的展示面**;上架链拿 ASIN **直接查库**读结论,不再以 E 列为判定依据(见 10.7) |
 | 5 | 存量首刷 | 历史导入时产品事件已带审核记录,**只补刷**(无结论的才审) |
 | 6 | 调度密度 | ingest 5 分钟级 / audit 每小时,按原建议执行(所有者未提异议;有异议再调) |
 | 7 | 阿里云去留 | 所有者正式切换时一并处理(归批次 D) |
@@ -215,10 +215,12 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 | 9 | 45 天 TTL | **废除**;hash 驱动重审——slow_hash 变更时 pass 翻 pending,**reject 永不自动重审**(force_rerun 手动通道保留) |
 | 10 | 实证类目反哺 | 海量在线产品与历史报错数据里有沃尔玛认定的真实类目,重审/重上架**最优先直接用它**(设计见 10.3) |
 
-**#4 后注(建议方案,待确认)**:切换日起 E/F/G 三列归审核服务;G 列日期早于
-切换日的存量行视为人工结论,机器不覆盖;人工改判走**新增 override 列**(机器
-永不碰,list_new 闸门优先读它)——独立列而非混写 E 列,沿用旧系统
-blacklist_brand_ip_stats"override 单列存放、重算不覆盖"的正面先例。
+**#4 原后注(存量豁免/override 列方案)已被二次批复取代**:表降级为纯展示后,
+"人工与机器双写同列"的冲突不复存在,override 列不需要建。人工改判今后不经表
+——如需人工强制通过/拒绝,后续加 cli 通道或驱动表(与 maintenance 人工驱动表
+同款"需要时再建"惯例)。
+
+**架构整体确认**:所有者 2026-08-13 二次批复确认第十节架构按计划所定。
 
 ## 十、审核域架构定稿(2026-08-13 草案;所有者确认后再出细化迁移计划)
 
@@ -296,9 +298,115 @@ catalog_sync(拉在线,已有,不动)
   不会误触发重审。
 - 45 天 TTL 随批量形态退役,不迁。
 
+### 10.7 消费端定稿(批复 #4 二次批复落地)
+
+- **PG 是唯一判定权威**:上架链(list_new,将来 match_listing 同理)拿 ASIN
+  直接查 `catalog.products.audit_status='approved'` 领任务,`walmart_pt`
+  一并从库取——不再读表 E 列。
+- **上架表 = 展示投影**:所有者往表里填 ASIN 即选品入口;审核链自动审
+  (产品不在库则走既有推采集闭环补数),完成后把 D(=walmart_pt)/E(=结论)/
+  F(=理由)/G(=审核日期)回填表中对应行,纯粹给人看。投影实现与
+  heal_unknown/write_data_cols 同款形态(读表 ASIN 列→查库→批量回写)。
+- **并跑期风险消解**:切换前旧流程照旧(人工填 E、list_new 读 E);切换日
+  一次性完成"上架链改查库 + 投影开闸 + 表口径注释改",不存在双写同列窗口。
+
 ### 10.6 架构层面明确不进本仓的清单
 
 阿里云 SQLite 队列与 worker 体系(cli.py+ops.runs 取代;补刷量小无需分布式)、
 审核前端(飞书为界面)、lark-cli 子进程(api/feishu 取代)、llm_router
 多供应商路由 1029 行(单链化后无用武之地)、embedding 召回(10.3)、
 L2 商标符号死代码、"坏 JSON→pass"行为。
+
+## 十一、细化迁移计划(2026-08-13,待所有者确认后开工)
+
+五个批次,顺序 **A → B → C → E → D**(E=问题商品链四段分离,须在总切换 D
+之前完成,使切换日审核→建议→执行链完整)。每批一个 PR、576+ 测试全绿、
+所有者验收后进下一批。
+
+### 批次 A|数据地基(纯搬运,零行为变更)
+
+**前置 A0**:backup 上线——`workflows/backup.py`(pg_dump walmart_data 全库
+→ DATA_ROOT/backups/,保留 N 天,cli 调度日跑);至少也要迁移当日两侧手动
+pg_dump 留档。**这是硬前置**:97k 错误日报、25k 三表、audit_runs 全史进的是
+至今零备份的库。
+
+| # | 任务 | 文件 |
+|---|---|---|
+| A1 | audit schema DDL:规则字典 9 表(blacklist_brands、phase0 三表、walmart_category_map、pt_meta、pt_spec、prohibited_policy、blacklist_brand_ip_stats)+ 证据 2 表(violation_groundtruth、walmart_error_records)+ 结论 2 表(audit_runs、audit_hits);三张无 DDL 表先 `pg_dump -s walmart_audit` 反推 | `refdata/schema.sql`、`workflows/db_init.py` 幂等块、`docs/db_schema.md` 审核章节 |
+| A2 | 数据搬迁(同实例跨库):`pg_dump walmart_audit --data-only -t <表>` 管道灌入 audit schema;搬迁脚本带两侧行数对比校验;blacklist_brands 顺手实测真实量级(三处注释 18k/36k/41k 之谜落定) | 一次性脚本(scripts/ 或 workflow 形态,dry-run 打印行数) |
+| A3 | 5 个 seed yaml 进 `refdata/audit/`(原样拷贝,含 precision 验证注释) | `refdata/audit/*.yaml` |
+| A4 | registry 登记:uspto 只读连接函数;飞书 8280e8 三列表;audit 表名常量;LLM 用途→模型映射(AUDIT_L1/AUDIT_L3/VISION,env 逐用途覆盖回落 DEEPSEEK_MODEL);事件码常量登记(product_ingested / audit_passed / audit_rejected) | `registry/db.py`、`registry/resources.py`、`services/product_events.py`(仅登记常量) |
+| A5 | 文档回销:backlog 第十节 8280e8 条、db_schema.md | docs |
+
+**验收**:db_init 幂等重跑通过;逐表行数两侧对齐;测试全绿(零行为变更)。
+**所有者侧**:提供生产 `walmart_audit` 库访问确认(同实例,无需网络配置);
+批准 backup 上线。
+
+### 批次 B|纯规则 MVP(零 LLM,只落库不投影)
+
+| # | 任务 | 文件 |
+|---|---|---|
+| B1 | ingest 触发:`_PRODUCT_SQL` ON CONFLICT 加 slow_hash IS DISTINCT FROM → **仅 approved 翻 pending**;新 ASIN 首次入库打 product_ingested 事件 | `services/product_ingest.py` + 单测 |
+| B2 | 纯规则积木:实证类目短路(walmart_items.product_type / 历史认定)→ Phase0 四件套(audit.phase0 三表等值 / 8 类目 / ®™ 正则 / 品牌等值+seed yaml)→ L2 硬规则(R0/R1/R2/R3a,软证据仅收集留给 L3)→ reason_mapper(37 政策)。全部纯函数 | `services/audit_rules.py` |
+| B3 | 落库积木:写 audit_runs/audit_hits、写 products.audit_* 五列(approved/rejected/pending + reason + walmart_pt + audited_at + audit_version)、审核事件打点 | 随 audit_rules 或独立 `services/audit_store.py` |
+| B4 | 主工作流:领 `audit_status IS NULL OR 'pending'` → B2→B3;params:asins= / limit= / force_rerun= / mode=backfill(补刷=只审无结论,批复 #5);**DANGEROUS=True**,dry-run=只打统计+落 audit_runs,不写五列不投影;run 摘要带 pending 计数与最老龄期 | `workflows/product_audit.py` |
+| B5 | risk_sync 扩展:phase0 三表镜像(**单事务 TRUNCATE 全量重灌**,注释说明与家族"只增改不删"语义不同的原因);blacklist_brands 与 catalog.brand_blacklist 并轨对账(同源飞书品牌总表,audit 域读 audit 表、上架闸继续读 catalog 表,双表同源单向同步) | `workflows/risk_sync.py`、`services/risk_gate.py`(如需) |
+| B6 | 测试:audit_rules 纯函数单测 + violation_groundtruth 黄金集回归夹具(离线不打网) | `tests/test_audit_rules*.py` |
+| B7 | audit_version 定稿实现:规则集常量版本号(registry 登记,规则/seed 变更时手动递增);force_rerun 支持按版本批量重审 | registry + audit_rules |
+
+**验收**:双跑校准——同批 ASIN 新规则结论 vs 旧库 audit_runs 结论,硬规则层
+一致率报告给所有者;dry-run 输出人工抽检。**旧系统不停**,新系统只落库,
+E 列仍由人工/旧流程管。
+**所有者侧**:无需操作(校准数据同实例直读)。
+
+### 批次 C|LLM 层(逐层验收)
+
+| # | 任务 | 文件 |
+|---|---|---|
+| C1 | chat_json 加 purpose 参数,按 registry 映射选模型(单链,失败重试尽→pending,绝不默认放行) | `api/llm.py`、`services/llm_cache.py`(兼容确认) |
+| C2 | 豆包视觉客户端(ARK env 三件:key/base_url/model) | `api/llm_vision.py` |
+| C3 | L1 三级判定(实证→映射表→SQL 候选+rerank,purpose=audit_l1)、L3 语义(37 政策 prompt,静态段吃 DeepSeek 前缀缓存;purpose=audit_l3)、L4 视觉(默认关,参数 l4=on,仅 pass 产品,≤5 图) | `services/audit_llm.py` |
+| C4 | product_audit 接入三层;L4 结果落 audit_runs.l4 明细(问题图索引供上架选图,对齐旧 get_problem_images 能力) | `workflows/product_audit.py` |
+| C5 | (可选,所有者到时定)llm_usage 简版成本记录 | ops 表 |
+
+**验收**:抽样 vs 旧系统 L1/L3 结论一致率;每千产品成本实测;llm_cache
+命中率。**所有者侧**:配 env——ARK_API_KEY(豆包);可选 DEEPSEEK_MODEL_AUDIT_*。
+llm_cache 清理器按原拍板"上量后再议",本批验收时带数据重议。
+
+### 批次 E|问题商品链四段分离(批复 #8)
+
+| # | 任务 | 文件 |
+|---|---|---|
+| E1 | 建议表 `ops.dispositions`(store/sku/asin、source(scan/audit/tro 预留)、建议动作、依据、状态 suggested→executing→confirmed/ineffective、时间戳);DDL+db_init | `refdata/schema.sql` |
+| E2 | 扫描件:从 problem_product_cleanup 抽出"查库归类"段 → 写产品事件 + 落建议行;审核 reject 的在架产品(product_audit 发现 audit_status=rejected 且 walmart_items 在线)同样落建议行——**只建议,不动状态不发 feed** | `workflows/problem_scan.py`(新)、`services/problem_products.py`(既有归类规则不动) |
+| E3 | 执行件:problem_product_cleanup 改为消费 dispositions(suggested→executing),全部既有防重/观测确认纪律原样保留;生效确认(feed 落定 + 下轮 catalog_sync 观测)后置 confirmed 并记事件,未生效置 ineffective 待下轮 | `workflows/problem_product_cleanup.py` |
+| E4 | 调度顺序更新:catalog_sync → problem_scan → cleanup(execute) | docs/plan.md 调度约束 |
+
+**验收**:分离后 dry-run 输出与分离前一致(重排不改行为);建议表状态机
+走一轮真实生效追踪。⚠ 本批动的是危险工作流,切换纪律:上新调度前停旧
+cleanup 调度,不并跑。
+
+### 批次 D|总切换日(一天内按序执行)
+
+1. **补刷收官**:`product_audit -p mode=backfill` 跑完存量无结论产品(批复 #5);
+2. **双跑对比收官**:库内一致率报告,所有者放行;
+3. **停旧**:黑名单双调度(07:05 cron + 7:00 launchd plist)、stop_workers、
+   阿里云队列 server 停(机器去留随所有者正式切换一并处理,批复 #7);
+4. **上架链改查库**(批复 #4 二次批复):list_new 领任务判定
+   E=pass → `audit_status='approved'`(walmart_pt 同步从库取,替代 LLM 现猜 PT
+   的入口逻辑归 C 已就位);listing_sheet 口径注释改(D/E/F/G=审核链投影,仅展示);
+   match_listing 的 D 列判定随 L1 跟卖试点时同步定;
+5. **开投影**:product_audit 尾部回填上架表 D/E/F/G(读表 ASIN→查库→批量回写);
+6. **挂新调度**:product_ingest 5 分钟级、product_audit 每小时(批复 #6),
+   顺序约束 catalog_sync → product_refresh → product_ingest → product_audit
+   → problem_scan → list_new/maintenance;
+7. **文档收官**:plan.md 总览增行、legacy_schedules.md 停旧清单增审核条目、
+   backlog 回销、旧仓归档标记。
+
+**所有者侧**:切换日到场拍板放行(第 2 步)、执行停旧(第 3 步,生产 Mac 操作)。
+
+### 跨批次纪律
+
+- 每批一个 PR,所有者验收合并后才进下一批;
+- 全程旧审核系统照常运行直到批次 D 第 3 步;
+- 任何批次发现与本计划冲突的实底,先改计划文档再动代码。

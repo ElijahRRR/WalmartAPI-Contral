@@ -488,6 +488,22 @@ def test_reason_mapper_l4_medium_falls_to_general_use():
         == "General-Use Products"
 
 
+def test_catmap_mine_classify_path():
+    """挖掘分桶(所有者三段式 2026-08-13):多产品同 PT=可信;少量支持=待核;
+    分流=人工;与旧映射相左=冲突只报;单证不立;与旧映射一致=无事。"""
+    from workflows.catmap_mine import classify_path
+    assert classify_path({"A": 6}, None) == ("mined_trusted", "A", 6)
+    assert classify_path({"A": 3}, None) == ("mined_review", "A", 3)
+    assert classify_path({"A": 9, "B": 2}, None) == ("mined_mixed", "A", 9)
+    assert classify_path({"A": 1}, None) is None            # 单证不立
+    assert classify_path({"A": 6}, "A") is None             # 与旧映射一致
+    assert classify_path({"A": 6}, "B") == ("map_conflict", "A", 6)
+    assert classify_path({"A": 3}, "B") is None             # 冲突也要够票
+    assert classify_path({"A": 6, "C": 1}, "B") is None     # 冲突须自身无分流
+    assert classify_path({}, None) is None
+    assert classify_path({"A": 5}, None, min_support=8) == ("mined_review", "A", 5)
+
+
 def test_catmap_sibling_verdict_and_parent():
     """兄弟继承:恰一 PT 且 ≥2 兄弟支持才继承;任何分流(含哨兵)不传播;
     父路径从面包屑字符串推导(外部 zgbs 树词汇表对不上,已撤——所有者

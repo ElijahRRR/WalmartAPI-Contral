@@ -1017,6 +1017,12 @@ CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
     product_count   integer,
     created_at      timestamptz NOT NULL DEFAULT now()
 );
+-- 挖掘家族补列(catmap_mine,2026-08-13):support=支持该 PT 的产品数,
+-- distribution=该路径下全部 PT 分布(分流时人工核对的依据)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS support_count integer;
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS pt_distribution jsonb;
 
 -- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照

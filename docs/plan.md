@@ -49,8 +49,9 @@
 
 **功能侧代码余项**(全部非阻塞):变体分组(唯一业务大项)/ backup /
 async 订单拉取(优化)/ 产品中心黑名单增量脚本(飞书表停用后才需要)/
-update_listed 五字段集(维护增强)/ llm_cache 清理器 / upc_audit(只读审计)。
-**已明确不做**:cli.py health、UPC 造号、退款、涨跌幅闸(暂)、erp-core 相关、
+llm_cache 清理器(暂不做,上量后再议)。
+**已明确不做**(所有者拍板 2026-08-13 增补):update_listed 五字段集、
+upc_audit、cli.py health、UPC 造号、退款、涨跌幅闸(暂)、erp-core 相关、
 历史数据迁移(整批关闭)。**等外部**:二期审核服务(入库/审核事件接缝)、
 TRO 跨仓边界(暂放)。
 **运维战役**(见 backlog 第六/八节与 docs/legacy_schedules.md):生产取证 →

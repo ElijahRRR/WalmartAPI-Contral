@@ -224,23 +224,6 @@ CREATE TABLE catalog.product_events (
 catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
 未来 listing·审核(入库/审核/上架)。
 
-```sql
--- 选品候选池(Q2 拍板 2026-08-12,allocation_plan §十一.1):旧采集器 v3 存量
--- 导出的一次性落点,只承担「候选名单 + 粗筛字段」——保鲜/定价一律走 v4 增量
--- (products/snapshots),本表任何字段不做业务判定输入。
--- 写入方 candidate_import(csv 流式,ON CONFLICT DO NOTHING 幂等);不更新不删除。
-CREATE TABLE catalog.candidate_pool (
-    asin text PRIMARY KEY,
-    title / brand / category_tree(' > ' 面包屑原文)/ category_root(首段,粗筛用),
-    rating numeric / review_count int,     -- 解析失败=NULL,禁止 or 0
-    current_price / buybox_price numeric,
-    channel text,                          -- FBA / FBM / NULL(=没采到)
-    stock_status / seller_name text,
-    crawl_time text,                       -- v3 时间原文(时区口径不明,仅参考)
-    source text DEFAULT 'v3', imported_at timestamptz
-);
-```
-
 ## listing — 上架域
 
 ```sql

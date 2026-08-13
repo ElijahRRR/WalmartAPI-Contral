@@ -295,31 +295,6 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
 );
 ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
--- 选品候选池(Q2 拍板 2026-08-12,docs/allocation_plan.md §十一.1):
--- 旧采集器 v3 存量导出的一次性落点,只承担「候选名单 + 粗筛字段」;
--- 保鲜/定价一律走 v4 增量(products/snapshots),本表数据不做任何业务判定输入。
--- 幂等:candidate_import ON CONFLICT DO NOTHING;不更新不删除,可整表重灌。
-CREATE TABLE IF NOT EXISTS catalog.candidate_pool (
-    asin          text PRIMARY KEY,
-    title         text,
-    brand         text,
-    category_tree text,           -- Amazon 面包屑全路径(' > ' 分隔,v3 原文)
-    category_root text,           -- 面包屑首段(导入时计算,大类粗筛用)
-    rating        numeric,        -- 解析失败=NULL(N/A 等);下游禁止 or 0
-    review_count  integer,
-    current_price numeric,
-    buybox_price  numeric,
-    channel       text,           -- FBA / FBM / NULL(=没采到)
-    stock_status  text,
-    seller_name   text,
-    crawl_time    text,           -- v3 侧采集时间原文(时区口径不明,仅参考,
-                                  -- 不当保鲜依据——保鲜一律看 snapshots)
-    source        text NOT NULL DEFAULT 'v3',
-    imported_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS candidate_pool_brand_idx ON catalog.candidate_pool (brand);
-CREATE INDEX IF NOT EXISTS candidate_pool_root_idx  ON catalog.candidate_pool (category_root);
-
 -- 风险档案:人工/AI SELECT 查询入口。**不是拦截条件**(所有者口径
 -- 2026-08-12:防呆=黑名单,按拉黑类别拦,不按删除史拦——因产品问题删过
 -- 的重上是正常经营);list_new 仅消费 unexplained_missing 做报警(不拦截)。

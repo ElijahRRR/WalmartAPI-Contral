@@ -79,7 +79,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 待确认:
 - ✅ ~~DELETE 防重口径~~(2026-08-11 拍板:滚动 48h 仅限无终态,有终态又扫到直接重发——见「已拍板」第 6 条;cleanup 完善时落实)
 - ✅ ~~存量 feedId 历史回查~~(所有者拍板 2026-08-12:**不做**——feed 要完全有结果后才算完成,三态防重已覆盖,无需回查)
-- 🔴 RETIRE_ITEM 与常规 DELETE 的职责边界(旧系统只在合规路径调 RETIRE,刻意还是遗漏?`legacy_survey.md:1475`)
+- ✅ ~~RETIRE_ITEM 与 DELETE 职责边界~~(所有者拍板 2026-08-13:旧脚本重复实现,product_clear 已覆盖相关功能,不再纠结)
 
 ## 三、产品事件账本(catalog.product_events)
 
@@ -112,7 +112,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 5. ✅ ~~listing 的 channel 口径分叉~~(所有者确认 2026-08-12:现行代码为定稿——读 `raw->>'is_fba'` 分两套区间,采不到不定价不上架;listing_plan 过时行已勘误)
 6. ✅ ~~outcome=not_found~~(所有者拍板 2026-08-12:比照 TERMINAL **直接建议拒绝**,不再重采;已落代码 services/order_audit.py + 用例)
 7. 🔴 TRO/商标/新审核系统三条跨仓黑名单链的边界(**暂放**,所有者 2026-08-12;已备边界建议:数据快照现收/审核功能二期建/TRO 采集链不进本仓)
-8. 退款能力(POST /returns/{id}/refund)纳入还是显式排除(**暂放**,所有者 2026-08-12;现状=事实排除,蓝图列预留)
+8. ✅ ~~退款能力~~(所有者拍板 2026-08-13:**不纳入**,显式排除;蓝图预留位保留不实现)
 9. ✅ ~~密钥轮换~~(所有者拍板 2026-08-12:**忽略**,不处理)
 10. KPI 8 个阈值真告警 + 日报群发(**暂放**,所有者 2026-08-12;方案已备:daily_report 尾段扫 ops.store_kpi_daily 阈值,webhook 配好即生效)
 11. ✅ ~~AK 图片历史截图~~(所有者拍板 2026-08-12:**不迁**,留旧表归档备查;新链路截图已在正常跑)
@@ -177,8 +177,8 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
 
 **上架验收与收尾待办(2026-08-12 晚定格;代码迁移已收官,以下全是验收/运维/后置)**
-- ⬜ **L2d 端到端验收**:在途 feed 回执 SUCCESS(或只剩 0101119 撞库)→ 所有者确认后补验收报告
-- ⬜ 三件生产验证:L1 跟卖单店试点;L2a UPC 注入→upc_sync 核对;L2b risk_sync 计数核对
+- ✅ ~~L2d 端到端验收~~(2026-08-13:3/3 SUCCESS,六轮错误账 30 错→0 错收官;报告在 listing_plan「重跑验收通过」)
+- ✅ 三件生产验证:L2a/L2b 已验(2026-08-12);L1 跟卖试点后置(所有者:暂时用不上,启用前再验)
 - ⬜ 调度挂载(验收后):upc_sync/catalog_sync(早)→ maintenance → list_new(每日)、feed_poll(每 30 分钟)、sku_locked_heal(每日)、risk_sync(每日);**顺序硬约束 catalog_sync → maintenance/list_new**
 - ⬜ 切换清单执行:停旧 launchd 5 条 + AI skill 链 erp-online-products-track(**两条同停**,新旧并跑=重复领号重复上架);旧在途 pending feed 先收干净
 - ⬜ L4:仅剩 upc_audit(全站 UPC 冲突审计,只读)。~~历史数据迁移批次~~已整批关闭(所有者 2026-08-12 逐项拍板,含 retry_state 淘汰名单视为已完成——防重拉已死 ASIN 由黑名单/product_risk 承担)
@@ -189,10 +189,10 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 十、旧仓全量普查新发现(2026-08-12 晚;停旧权威清单见 docs/legacy_schedules.md)
 
-- ⬜ **UPC 造号能力真空**:旧「沃尔玛UPC生成器」(生成→SQLite 去重→全站校验→append 池)从未上生产但是唯一造号工具;新系统只有池注入(upc_sync),**池耗尽时无退路**(当前未用仅 28 个)——需迁一个 upc_generate 工作流或明确外购号段
-- ⬜ **settlement 前端依赖**:erp-core 订单页佣金真值硬编码只读旧 fetch_walmart_settlement 的 SQLite——旧脚本不能停,直至前端重构或改读 PG(settlement_sync 已承接数据面)
+- ✅ ~~UPC 造号能力~~(所有者拍板 2026-08-13:**不需要**——号段外购,人工注入池即可)
+- ✅ ~~settlement 前端依赖~~(所有者口径 2026-08-13:erp-core 不在迁移范围,不考虑其功能与脚本;settlement_sync 数据面已承接并首跑)
 - ⬜ **spec 拆分产物取证**:`<DATA_ROOT>/specs/MP_ITEM/` 的源头 MPSetup_by_pt(458MB)不在 git,权威副本只在生产 Mac——备份策略必须涵盖
-- 🔴 **类目映射链**:active/extract_pt_templates.py 被 erp-core sync_pt_specs 硬依赖;`.git-archive` 内嵌仓 7 个未推送 commit;"映射表产物导入 catalog"(plan.md 承诺)未见执行记录——归档前一并处理
+- 🟡 **类目映射链**(erp-core 依赖项已按所有者口径 2026-08-13 剔除):余两件——`.git-archive` 内嵌仓 7 个未推送 commit 归档前处理;"映射表产物导入 catalog"(plan.md 承诺)未见执行记录
 - 🟡 **lark_io sheets_registry 漏登记** Amazon 选品黑名单 sheet(QNIp…Bb/8280e8)——确认新系统是否需要这张表
 - ⚪ 已核实降级:erp-core Celery(所有者 2026-08-05 确认未启用,切换日 ps 复核即可);walmart-kpi-afternoon(参数 bug 从未成功写入,直接停);tools/ 10 个救场脚本与顶层一次性脚本全部可弃
 

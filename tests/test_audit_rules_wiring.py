@@ -431,17 +431,22 @@ def test_pick_where_accepts_l3_l4_params():
 
 
 def test_pt_backfill_fold_rows():
-    """历史实证折叠:extract_asin 归一、同 ASIN 多行取时间新者、None ts 最旧。"""
-    from datetime import datetime
+    """历史实证折叠:extract_asin 归一、同 ASIN 多行取时间新者、None ts 最旧;
+    naive/aware 时间戳跨源可比(2026-08-13 生产 TypeError 回归钉)。"""
+    from datetime import datetime, timezone
     from workflows.pt_backfill import _UPSERT_SQL, fold_rows
     t1, t2 = datetime(2026, 5, 1), datetime(2026, 6, 1)
+    aware = datetime(2026, 7, 1, tzinfo=timezone.utc)   # 报错日报侧 timestamptz
     rows = [("XKJ-B0ABCDEFGH-39.98", "OldPT", t1),
             ("B0ABCDEFGH", "NewPT", t2),           # 同 ASIN 更新的一条胜
+            ("B0ABCDEFGH", "AwarePT", aware),      # aware 归一后可比且更新
             ("B1ABCDEFGH", "TsPT", None),          # None ts 视为最旧
             ("B1ABCDEFGH", "NewerPT", t1),
             ("102460026733", "AnyPT", t1)]          # 纯数字提不出 ASIN → 剔
     folded, no_asin = fold_rows(rows)
-    assert folded == {"B0ABCDEFGH": ("NewPT", t2), "B1ABCDEFGH": ("NewerPT", t1)}
+    assert folded["B0ABCDEFGH"][0] == "AwarePT"
+    assert folded["B0ABCDEFGH"][1].tzinfo is None       # 归一为 naive
+    assert folded["B1ABCDEFGH"] == ("NewerPT", t1)
     assert no_asin == 1
     # 只填空语义钉死:回填绝不覆盖审核结论/既有值
     assert "WHERE catalog.products.walmart_pt IS NULL" in _UPSERT_SQL

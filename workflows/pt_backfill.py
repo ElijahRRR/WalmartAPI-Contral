@@ -62,11 +62,24 @@ WHERE catalog.products.walmart_pt IS NULL
 """
 
 
+def _norm_ts(ts):
+    """输入:naive 或 aware 时间戳 → 输出:本机时区的 naive(可跨源比较)。
+
+    旧库 error_items.run_ts 是 timestamp(naive,旧系统按本机时间写);
+    报错日报 recorded_at 是 timestamptz——直接比会 TypeError(2026-08-13
+    生产实测)。统一折到本机本地时间比较;小时级偏差对"每 ASIN 取最新"
+    的语义无实质影响(跨源同 ASIN 冲突本就罕见)。
+    """
+    if ts is not None and ts.tzinfo is not None:
+        return ts.astimezone().replace(tzinfo=None)
+    return ts
+
+
 def fold_rows(rows) -> tuple[dict, int]:
     """输入:(sku或asin, pt, ts) 行 → 输出:({asin: (pt, ts)}, 提不出 ASIN 数)。
 
-    纯函数(便于测试)。键经 extract_asin 归一;同 ASIN 多行 → ts 新者胜
-    (ts 为 None 视为最旧)。
+    纯函数(便于测试)。键经 extract_asin 归一;时间戳先 _norm_ts 归一;
+    同 ASIN 多行 → ts 新者胜(ts 为 None 视为最旧)。
     """
     out: dict = {}
     no_asin = 0
@@ -75,6 +88,7 @@ def fold_rows(rows) -> tuple[dict, int]:
         if not asin:
             no_asin += 1
             continue
+        ts = _norm_ts(ts)
         cur = out.get(asin)
         if cur is None or (ts is not None and (cur[1] is None or ts > cur[1])):
             out[asin] = (pt, ts)

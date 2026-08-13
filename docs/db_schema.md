@@ -169,6 +169,18 @@ CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
 -- ↑ 黑名单品牌**总清单**镜像(risk_sync 飞书→PG)+ 否决闸数据源;
 --   cleanup 自产品牌 DO NOTHING 补进闸门。src_sku/biz_cn/pushed_at 三列为
 --   2026-08-11 过渡遗留,不再被消费(投影改走 brand_err_hits)。
+--   2026-08-13 起同时是审核 Phase0 品牌闸的数据源(黑名单中心统一)。
+
+-- 黑名单中心两张单列镜像表(所有者定稿 2026-08-13:审核四闸直读黑名单
+-- 中心,不再维护旧审核系统的独立三列表)。同 wiki(黑名单品牌总表所在
+-- 文档)sheet=B19LKn / sheet=twjmql;risk_sync 以 TRUNCATE 全量重灌镜像
+-- (与"只增改不删"家族不同:飞书删行必须跟着消失),两道护栏:空读绝不
+-- 重灌 + 骤缩超 50% 拒绝;各走独立事务
+CREATE TABLE catalog.seller_blacklist (seller_id PK, synced_at);
+CREATE TABLE catalog.amazon_cat_blacklist (
+    category_norm PK,   -- 归一化路径(audit_phase0.normalize_amazon_category,
+                        -- 入库/查询两侧共用同一函数,读取端不再二次归一化)
+    category_raw, synced_at);
 
 -- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
 -- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清
@@ -466,7 +478,10 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 =最新**类别(历史实证类别翻动频繁,"曾命中过"不能作数)。一次入选不更新
 (DO NOTHING)。`biz_cn` 是独立维度(中国卖家专属禁售);`pushed_at` 是飞书
 投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
-写入方 problem_product_cleanup 尾段;消费方:上架拦截(黑名单建设批次接)。
+另收 **category='LEGACY'**(source='历史继承'):旧审核系统随迁的历史黑名单
+ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统一)。
+写入方 problem_product_cleanup 尾段 + asin_blacklist_import(一次性);
+消费方:上架拦截 + 审核 Phase0 ASIN 闸(全表,不分类别)。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
 
@@ -492,9 +507,9 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 
 | 表 | 用途 | 数据来源/维护方 |
 |---|---|---|
-| `blacklist_brands` | 品牌黑名单(旧仓注释 18k~41k 不一,导入实测为准) | audit_import 首灌;与 catalog.brand_blacklist 并轨对账在批次 B5 |
+| `blacklist_brands` | ⚠ **退役历史快照**(2026-08-13 黑名单中心统一):品牌闸改读 catalog.brand_blacklist,本表不再被读取,留档不删 | audit_import 首灌(终态) |
 | `walmart_category_map` | Amazon 类目 → Walmart PT 映射(L1 快速通道) | audit_import 首灌;后续同步链批次 B 定 |
-| `phase0_blacklist_sellers/asins/amazon_cats` | Phase0 三列黑名单(~25k) | 飞书 PHASE0_BLACKLIST_SHEET;批次 B5 起 risk_sync 单事务 TRUNCATE 全量重灌 |
+| `phase0_blacklist_sellers/asins/amazon_cats` | ⚠ **退役历史快照**(2026-08-13):卖家/ASIN/类目三闸改读 catalog.{seller_blacklist, asin_blacklist, amazon_cat_blacklist},留档不删 | audit_import 首灌(终态) |
 | `blacklist_brand_ip_stats` | 品牌 IP precision 分层(**含人工 override 三列,重算永不覆盖**) | audit_import 搬入(不可重算) |
 | `violation_groundtruth` | 打标真值(批次 B 双跑校准黄金集) | audit_import 搬入 |
 | `walmart_error_records` | 错误商品日报 97k 行(precision 证据 + 实证类目反哺源) | audit_import 搬入;增量同步链批次 B 定 |

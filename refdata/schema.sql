@@ -271,6 +271,23 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
 -- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
 -- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
 -- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
+
+-- 黑名单中心补全两维(所有者定稿 2026-08-13:黑名单只维护一份——审核的
+-- 卖家/类目/ASIN/品牌四闸全部直读本中心,旧审核系统那张独立三列表退出
+-- 本仓链路;audit schema 的 phase0_* 三表与 blacklist_brands 退役为历史快照)
+-- 卖家店铺黑名单:飞书黑名单 wiki 子表(registry.SELLER_BLACKLIST_SHEET)
+-- → risk_sync 全量重灌(空读/骤缩护栏)
+CREATE TABLE IF NOT EXISTS catalog.seller_blacklist (
+    seller_id  text PRIMARY KEY,     -- Amazon 卖家店铺 ID
+    synced_at  timestamptz NOT NULL DEFAULT now()
+);
+-- 亚马逊类目黑名单:同 wiki 子表(registry.AMZCAT_BLACKLIST_SHEET)
+-- → risk_sync 全量重灌;存归一化键(audit_phase0.normalize_amazon_category)
+CREATE TABLE IF NOT EXISTS catalog.amazon_cat_blacklist (
+    category_norm text PRIMARY KEY,  -- 归一化:去空白 + '>'/'->'/'/' → '->'
+    category_raw  text,              -- 飞书原文(调试用)
+    synced_at     timestamptz NOT NULL DEFAULT now()
+);
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
@@ -871,8 +888,10 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
 --   已有)、sync_runs(ops.runs 取代)、llm_usage / llm_route_events(批次 C
 --   可选重建)。
 
--- 品牌黑名单(旧仓注释三处量级 18k/36k/~41k 不一,以 audit_import 实测为准;
--- 与 catalog.brand_blacklist 同源飞书品牌总表,并轨对账在批次 B5)
+-- ⚠ 退役为历史快照(所有者定稿 2026-08-13 黑名单中心统一):本表与下方
+-- phase0_* 三表是批次 A 从旧审核库搬来的快照,审核四闸已改读 catalog 黑名单
+-- 中心(brand_blacklist / asin_blacklist / seller_blacklist /
+-- amazon_cat_blacklist),本表零消费、不再同步,保留仅作迁移对账。
 CREATE TABLE IF NOT EXISTS audit.blacklist_brands (
     brand    text PRIMARY KEY,
     source   text,               -- '飞书' / 'TRO' / 'USPTO'
@@ -905,9 +924,8 @@ CREATE INDEX IF NOT EXISTS idx_catmap_pt ON audit.walmart_category_map(walmart_p
 CREATE INDEX IF NOT EXISTS idx_catmap_forbidden ON audit.walmart_category_map(zh_seller_forbidden) WHERE zh_seller_forbidden = TRUE;
 CREATE INDEX IF NOT EXISTS idx_catmap_cert ON audit.walmart_category_map(requires_certificate) WHERE requires_certificate = TRUE;
 
--- Phase0 飞书黑名单三表(源 = registry.PHASE0_BLACKLIST_SHEET 三列;
--- 镜像语义 = 单事务 TRUNCATE 全量重灌(批次 B5 归 risk_sync),与家族
--- "只增改不删"不同——飞书删行必须跟着消失,残留即幽灵拦截)
+-- ⚠ Phase0 三表退役为历史快照(2026-08-13,同上注):消费与同步均已迁到
+-- catalog.seller_blacklist / asin_blacklist / amazon_cat_blacklist
 CREATE TABLE IF NOT EXISTS audit.phase0_blacklist_sellers (
     seller_id text PRIMARY KEY,
     synced_at timestamptz DEFAULT now()

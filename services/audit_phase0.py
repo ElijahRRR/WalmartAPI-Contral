@@ -89,7 +89,7 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                     detail={
                         "seller_id": seller,
                         "seller_name": product.seller_name or None,   # 空串转 None
-                        "source": "feishu_blacklist",
+                        "source": "blacklist_center",
                     },
                 )],
             )
@@ -106,7 +106,7 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                     penalty=-100,
                     detail={
                         "asin": asin,
-                        "source": "feishu_blacklist",
+                        "source": "blacklist_center",
                     },
                 )],
             )
@@ -125,7 +125,7 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                     detail={
                         "amazon_category_path": product.amazon_category_path,
                         "normalized": cat_norm,
-                        "source": "feishu_blacklist",
+                        "source": "blacklist_center",
                     },
                 )],
             )
@@ -355,11 +355,9 @@ def _check_brand(product: ProductInfo, ctx: Any) -> Phase0Result:
         penalty=-100,
         detail={
             "brand": product.brand,          # 原值(未 strip 未规整)
-            "matched_brand": matched,        # 黑名单原文(DB/yaml first-wins)
+            "matched_brand": matched,        # 黑名单原文(first-wins)
             "match_type": "exact",
-            # 硬编码字面量:命中 yaml additional_hard_brands 时也写这个,
-            # 来源不可区分(已知缺陷,照迁 —— 改了双跑 diff 会全红)
-            "source": "blacklist_brands",
+            "source": "blacklist_center",    # 单源:catalog.brand_blacklist
         },
     )
     return Phase0Result(blocked=True, matched_brand=matched, hits=[hit])

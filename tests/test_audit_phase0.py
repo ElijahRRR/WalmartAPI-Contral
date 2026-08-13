@@ -51,7 +51,7 @@ def test_brand_blacklist_vectors(brand, blocked):
     if blocked:
         h = r.hits[0]
         assert h.rule_code == "phase0_brand_blacklist" and h.penalty == -100
-        assert h.detail["source"] == "blacklist_brands"
+        assert h.detail["source"] == "blacklist_center"
         assert h.detail["match_type"] == "exact"
 
 
@@ -164,7 +164,7 @@ def test_lark_seller_asin_cat_priority():
         _p(asin="B0BLACK0001", seller_id="A327G0VM18EU0N"), ctx)
     assert r.hits[0].rule_code == "phase0_lark_blacklist_seller"   # B4-11 短路
     assert len(r.hits) == 1
-    assert r.hits[0].detail["source"] == "feishu_blacklist"
+    assert r.hits[0].detail["source"] == "blacklist_center"
     assert r.hits[0].detail["seller_name"] is None                 # 空串→None
 
     r2 = audit_phase0.check(_p(asin="B0BLACK0001"), ctx)

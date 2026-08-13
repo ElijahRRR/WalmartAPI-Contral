@@ -422,16 +422,21 @@ MATCH_SHEET = Spreadsheet(
 )
 
 
-# Amazon 选品黑名单三列表(wiki 承载;旧审核系统 Phase0 源,一张 sheet
-# 三列拆三张 PG 表:A=卖家ID B=ASIN C=Amazon类目。批次 B5 由 risk_sync
-# 接管镜像——**单事务 TRUNCATE 全量重灌**,与家族"只增改不删"语义不同:
-# 飞书删行必须跟着消失,残留即幽灵拦截(docs/audit_migration_plan.md 批次 B)。
-# token/sheet_id 值 = 旧系统 LARK_PHASE0_BLACKLIST_*,配进 <DATA_ROOT>/.env)
-PHASE0_BLACKLIST_SHEET = Spreadsheet(
-    name="Amazon选品黑名单",
-    token=os.environ.get("FEISHU_PHASE0_WIKI_TOKEN", ""),
-    sheet_id=os.environ.get("FEISHU_PHASE0_SHEET_ID", ""),
-    columns=("seller_id", "asin", "category"),
+# 黑名单中心两张新表(所有者定稿 2026-08-13:黑名单只维护一份,与品牌总表
+# 同一个黑名单 wiki 承载;取代旧审核系统的独立三列表)。镜像语义 = 单事务
+# TRUNCATE 全量重灌 + 空读/骤缩护栏(飞书删行必须跟着消失,残留即幽灵拦截)。
+SELLER_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单卖家店铺ID",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_SELLER_BLACKLIST_SHEET_ID", ""),
+    columns=("seller_id",),
+    wiki=True,
+)
+AMZCAT_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单亚马逊类目",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_AMZCAT_BLACKLIST_SHEET_ID", ""),
+    columns=("category",),
     wiki=True,
 )
 

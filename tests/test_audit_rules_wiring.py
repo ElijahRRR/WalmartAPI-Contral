@@ -1,15 +1,19 @@
 """审核接线层测试(评审 I-8 补钉:P0/P1 发现全在这些零测试文件里)。
 
 覆盖:resolve_pt 的 pt_meta 闸与优先级、audit_store 词表/桩值、
-_pick_where 四态与参数白名单、_sync_phase0 空读/骤缩护栏、行适配。
+_pick_where 四态与参数白名单、黑名单中心镜像空读/骤缩护栏、
+ASIN 历史导入解析、行适配。
 """
+
+from types import SimpleNamespace
 
 import pytest
 
 from services import audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
-from workflows.risk_sync import _sync_phase0
+from workflows.asin_blacklist_import import parse_asin_lines
+from workflows.risk_sync import _sync_column_blacklist
 
 
 def _ctx(**kw):
@@ -122,9 +126,9 @@ def test_pick_where_rejects_unknown_params():
         product_audit._pick_where({"force_rurn": "x"})     # 手滑拼错
 
 
-# ── _sync_phase0 护栏(评审 P0-2)─────────────────────────────────────────────
+# ── _sync_column_blacklist 护栏(评审 P0-2;黑名单中心定稿 2026-08-13)────────
 
-class _P0Cur:
+class _BLCur:
     def __init__(self, conn):
         self._c = conn
 
@@ -139,46 +143,81 @@ class _P0Cur:
 
     def executemany(self, sql, rows):
         self._c.sql.append(sql)
-        self._c.inserted += len(rows)
+        self._c.inserted.extend(rows)
 
     def fetchone(self):
-        return self._c.counts
+        return (self._c.old_n,)
 
 
-class _P0Conn:
-    def __init__(self, counts=(0, 0, 0)):
-        self.counts = counts
+class _BLConn:
+    def __init__(self, old_n=0):
+        self.old_n = old_n
         self.sql = []
-        self.inserted = 0
+        self.inserted = []
 
     def cursor(self):
-        return _P0Cur(self)
+        return _BLCur(self)
 
 
-def test_sync_phase0_empty_read_never_truncates():
-    conn = _P0Conn(counts=(1314, 19798, 11810))
-    msg = _sync_phase0(conn, [])
+_SELLER_SHEET = SimpleNamespace(name="黑名单卖家店铺ID", columns=("seller_id",))
+_CAT_SHEET = SimpleNamespace(name="黑名单亚马逊类目", columns=("category",))
+
+
+def test_sync_blacklist_empty_read_never_truncates():
+    conn = _BLConn(old_n=1314)
+    msg = _sync_column_blacklist(conn, _SELLER_SHEET,
+                                 "catalog.seller_blacklist", [], False)
     assert "不重灌" in msg
     assert not any("TRUNCATE" in s for s in conn.sql)
 
 
-def test_sync_phase0_shrink_guard():
+def test_sync_blacklist_shrink_guard():
     """骤缩超 50% 拒绝重灌——接口异常与运营删行是两回事。"""
-    conn = _P0Conn(counts=(1314, 19798, 11810))
-    rows = [{"seller_id": "S1", "asin": "B0A", "category": "Toys"}]
+    conn = _BLConn(old_n=1314)
+    rows = [{"seller_id": "S1"}]
     with pytest.raises(RuntimeError, match="骤缩"):
-        _sync_phase0(conn, rows)
+        _sync_column_blacklist(conn, _SELLER_SHEET,
+                               "catalog.seller_blacklist", rows, False)
     assert not any("TRUNCATE" in s for s in conn.sql)
 
 
-def test_sync_phase0_normal_refill():
-    conn = _P0Conn(counts=(1, 1, 1))
-    rows = [{"seller_id": "S1", "asin": "B0A", "category": "Toys > Games"},
-            {"seller_id": "S2", "asin": "", "category": ""}]
-    msg = _sync_phase0(conn, rows)
-    assert "卖家 2 / ASIN 1 / 类目 1" in msg
-    assert sum("TRUNCATE" in s for s in conn.sql) == 3
-    assert conn.inserted == 4          # 2 卖家 + 1 ASIN + 1 类目(已归一化)
+def test_sync_blacklist_seller_refill_dedupes():
+    conn = _BLConn(old_n=2)
+    rows = [{"seller_id": "S1"}, {"seller_id": "S2"},
+            {"seller_id": "S1"}, {"seller_id": ""}]
+    msg = _sync_column_blacklist(conn, _SELLER_SHEET,
+                                 "catalog.seller_blacklist", rows, False)
+    assert "全量重灌 2 条" in msg
+    assert sum("TRUNCATE" in s for s in conn.sql) == 1
+    assert conn.inserted == [("S1",), ("S2",)]
+
+
+def test_sync_blacklist_cat_refill_normalizes():
+    """类目存归一化值(与查询侧共用 normalize_amazon_category),原文留档。"""
+    conn = _BLConn(old_n=1)
+    rows = [{"category": "Toys > Games"},
+            {"category": "Toys>Games"},        # 归一化后与上一行同键 → 去重
+            {"category": ""}]
+    msg = _sync_column_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows, True)
+    assert "全量重灌 1 条" in msg
+    assert conn.inserted == [("Toys->Games", "Toys > Games")]  # 首见原文为准
+
+
+# ── parse_asin_lines(历史继承 ASIN 导入)────────────────────────────────────
+
+def test_parse_asin_lines_dedupe_and_nonstd():
+    text = "B0ABCDEFGH\n\nB0ABCDEFGH\n  B1ABCDEFGH \nB0BTXNF10MX\n\n"
+    asins, dups, nonstd = parse_asin_lines(text)
+    assert asins == ["B0ABCDEFGH", "B1ABCDEFGH", "B0BTXNF10MX"]
+    assert dups == 1
+    assert nonstd == 1          # 11 位:照灌不丢行,单独计数
+
+
+def test_parse_asin_lines_keeps_raw_case():
+    """键以原文为准,不做 upper——与黑名单中心既有键口径一致。"""
+    asins, _, nonstd = parse_asin_lines("b0abcdefgh\n")
+    assert asins == ["b0abcdefgh"] and nonstd == 1   # 小写不匹配标准式
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────

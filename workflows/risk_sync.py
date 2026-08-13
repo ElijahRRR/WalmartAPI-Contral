@@ -45,74 +45,59 @@ def _read_sheet(sheet) -> list[dict]:
     return rows
 
 
-def _phase0_first_row(sheet) -> list[dict]:
+def _first_row(sheet) -> list[dict]:
     """输入:登记条目 → 输出:A1 行(非表头时)包装成行 dict,表头则 []。
 
-    旧仓对这张表的表头是条件式判定(任一单元格含「黑名单」才算表头)——
-    _read_sheet 从 A2 起读,若首行其实是数据,会每天漏拦同一条(评审 I-7)。
+    黑名单单列表的表头是条件式判定(单元格含「黑名单」才算表头)——
+    _read_sheet 从 A2 起读,若首行其实是数据,会每天漏拦同一条。
     """
-    cells = (feishu.sheet_values(sheet, "A1:C1") or [[]])[0]
-    vals = [(str(c).strip() if c is not None else "") for c in cells] + ["", "", ""]
-    if any("黑名单" in v for v in vals[:3]):
+    cells = (feishu.sheet_values(sheet, "A1:A1") or [[]])[0]
+    vals = [(str(c).strip() if c is not None else "") for c in cells] + [""]
+    if "黑名单" in vals[0]:
         return []
     d = dict(zip(sheet.columns, vals))
     return [d] if any(d.values()) else []
 
 
-def _sync_phase0(conn, rows: list[dict]) -> str:
-    """输入:连接 + Phase0 表行 → 输出:三表重灌计数摘要(审核批次 B5)。
+def _sync_column_blacklist(conn, sheet, table: str, rows: list[dict],
+                           normalize: bool) -> str:
+    """输入:连接 + 登记条目 + 目标表 + 行 → 输出:重灌计数摘要。
 
-    「Amazon 选品黑名单」是**三条独立列**(A=卖家ID B=ASIN C=Amazon 类目),
-    不是行级记录——同一行的三个格子互不相关,逐列收集非空值。
-    镜像语义 = **TRUNCATE + 全量重灌**(与旧审核系统同款;risk_sync 家族的
-    "只增改不删"在此不适用:飞书删行必须跟着消失,残留即幽灵拦截)。
-    与本工作流其余同步共享同一事务:中途失败整体回滚,旧数据继续生效
-    (fail-soft,与旧仓 sync_phase0_blacklist 单事务语义一致)。
-    类目归一化与查询侧共用 audit_phase0.normalize_amazon_category,
-    存的就是归一化值,审核读取端不再二次归一化。
+    黑名单中心单列表镜像(卖家/亚马逊类目;所有者定稿 2026-08-13)。
+    镜像语义 = **TRUNCATE + 全量重灌**(risk_sync 家族的"只增改不删"在此
+    不适用:飞书删行必须跟着消失,残留即幽灵拦截)。两道护栏:空读绝不重灌;
+    骤缩超 50% 拒绝(接口/配置异常与运营删几行是两回事)。
+    类目归一化与审核查询侧共用 audit_phase0.normalize_amazon_category,
+    存的就是归一化值,读取端不再二次归一化。
     """
     from services.audit_phase0 import normalize_amazon_category
-    sellers = {r["seller_id"] for r in rows if r.get("seller_id")}
-    asins = {r["asin"] for r in rows if r.get("asin")}
-    cats = {}
-    for r in rows:
-        raw = r.get("category")
-        if raw:
-            norm = normalize_amazon_category(raw)
-            if norm and norm not in cats:
-                cats[norm] = raw
-    # 两道护栏(评审 P0-2:空读/骤缩即重灌 = 3.3 万行黑名单静默蒸发,当轮
-    # 审核全放行)。空读绝不重灌;骤缩(>50%)大概率是接口/配置异常而非运营
-    # 真删了半张表——删几行和腰斩是两回事,与"飞书删行必须跟着消失"不冲突。
-    if not (sellers or asins or cats):
-        return ("⚠ Phase0 三列表:本轮读到 0 条(疑似接口/配置异常),"
-                "不重灌,库内旧数据保留生效")
+    col = sheet.columns[0]
+    if normalize:
+        vals = {}
+        for r in rows:
+            raw = r.get(col)
+            if raw:
+                norm = normalize_amazon_category(raw)
+                if norm and norm not in vals:
+                    vals[norm] = raw
+        payload = sorted(vals.items())
+    else:
+        payload = [(v,) for v in sorted({r[col] for r in rows if r.get(col)})]
+    if not payload:
+        return (f"⚠ 「{sheet.name}」:本轮读到 0 条(疑似接口/配置异常),"
+                f"不重灌,库内旧数据保留生效")
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT (SELECT count(*) FROM audit.phase0_blacklist_sellers),"
-            "       (SELECT count(*) FROM audit.phase0_blacklist_asins),"
-            "       (SELECT count(*) FROM audit.phase0_blacklist_amazon_cats)")
-        old_s, old_a, old_c = cur.fetchone()
-    for name, new_n, old_n in (("卖家", len(sellers), old_s),
-                               ("ASIN", len(asins), old_a),
-                               ("类目", len(cats), old_c)):
-        if old_n >= 20 and new_n < old_n * 0.5:
-            raise RuntimeError(
-                f"Phase0 {name}列骤缩 {old_n}→{new_n}(超 50%),拒绝重灌"
-                f"——人工核实飞书表后再跑")
+        cur.execute(f"SELECT count(*) FROM {table}")
+        (old_n,) = cur.fetchone()
+    if old_n >= 20 and len(payload) < old_n * 0.5:
+        raise RuntimeError(f"「{sheet.name}」骤缩 {old_n}→{len(payload)}"
+                           f"(超 50%),拒绝重灌——人工核实飞书表后再跑")
+    cols = "(category_norm, category_raw)" if normalize else "(seller_id)"
+    ph = "(%s, %s)" if normalize else "(%s)"
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE audit.phase0_blacklist_sellers")
-        cur.execute("TRUNCATE audit.phase0_blacklist_asins")
-        cur.execute("TRUNCATE audit.phase0_blacklist_amazon_cats")
-        cur.executemany("INSERT INTO audit.phase0_blacklist_sellers (seller_id) "
-                        "VALUES (%s)", [(s,) for s in sorted(sellers)])
-        cur.executemany("INSERT INTO audit.phase0_blacklist_asins (asin) "
-                        "VALUES (%s)", [(a,) for a in sorted(asins)])
-        cur.executemany("INSERT INTO audit.phase0_blacklist_amazon_cats "
-                        "(category_norm, category_raw) VALUES (%s, %s)",
-                        sorted(cats.items()))
-    return (f"Phase0 三列表:全量重灌 卖家 {len(sellers)} / ASIN {len(asins)} "
-            f"/ 类目 {len(cats)}")
+        cur.execute(f"TRUNCATE {table}")
+        cur.executemany(f"INSERT INTO {table} {cols} VALUES {ph}", payload)
+    return f"「{sheet.name}」:全量重灌 {len(payload)} 条"
 
 
 def run(params: dict) -> str:
@@ -131,17 +116,25 @@ def run(params: dict) -> str:
             lines.append(f"品牌表:读 {len(brand_rows)} 行,入库 {n_b}")
         except LookupError as e:
             lines.append(f"品牌表跳过:{e}")
-        try:
-            p0_sheet = resources.PHASE0_BLACKLIST_SHEET.require()
-            p0_rows = _phase0_first_row(p0_sheet) + _read_sheet(p0_sheet)
-            # 独立事务:本表是 TRUNCATE 重灌,失败绝不能连累前两表已完成的同步
-            with db.pg_conn() as c2:
-                lines.append(_sync_phase0(c2, p0_rows))
-        except LookupError as e:
-            lines.append(f"Phase0 三列表跳过:{e}")
-        except Exception as e:
-            logger.warning("Phase0 三列表同步失败(库内旧数据保留生效):%s", e)
-            lines.append(f"⚠ Phase0 三列表同步失败(旧数据保留):{e}")
+        # 黑名单中心两张单列表(卖家/亚马逊类目;所有者定稿 2026-08-13):
+        # TRUNCATE 重灌各走独立事务,失败绝不连累其他表已完成的同步
+        for sheet_ref, table, norm in (
+                (resources.SELLER_BLACKLIST_SHEET,
+                 "catalog.seller_blacklist", False),
+                (resources.AMZCAT_BLACKLIST_SHEET,
+                 "catalog.amazon_cat_blacklist", True)):
+            try:
+                sheet = sheet_ref.require()
+                rows = _first_row(sheet) + _read_sheet(sheet)
+                with db.pg_conn() as c2:
+                    lines.append(_sync_column_blacklist(c2, sheet, table,
+                                                        rows, norm))
+            except LookupError as e:
+                lines.append(f"「{sheet_ref.name}」跳过:{e}")
+            except Exception as e:
+                logger.warning("「%s」同步失败(库内旧数据保留生效):%s",
+                               sheet_ref.name, e)
+                lines.append(f"⚠ 「{sheet_ref.name}」同步失败(旧数据保留):{e}")
         gate = risk_gate.load_gate(conn)
         banned_asins = blacklist.load_banned_asins(conn)
     lines.append(f"闸门现状:禁售类目 {len(gate['banned_pts'])} 个,"

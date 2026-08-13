@@ -34,7 +34,7 @@ class AuditContext:
     phase0_sellers: frozenset
     phase0_asins: frozenset
     phase0_cats: frozenset
-    brand_blacklist: dict          # 规整小写 → 原文(DB first-wins + yaml 补)
+    brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
     pt_spec: dict                  # PT → row dict
     ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
@@ -51,18 +51,18 @@ class AuditContext:
 
 
 def _brand_map(conn) -> tuple[dict, set]:
-    """输入:连接 → 输出:(Phase0 品牌 dict, R4 词集)——两套口径,旧仓本就不同源。
+    """输入:连接 → 输出:(Phase0 品牌 dict, R4 词集)——同源黑名单中心,两套口径。
 
-    Phase0 dict(规整小写→原文):strip → lower → 空白压单空格;DB first-wins,
-    yaml additional_hard_brands 补(spec_phase0 §7:其余键是 R6 死配置)。
-    R4 词集:**只取 DB**(旧 l2 加载器不含 yaml),且只 strip+lower(保留词内
-    空白)——评审 2026-08-13:两口径混用会让 R4 多命中 yaml 34 牌,把本该落
-    General-Use 的 reject 经理由映射改写成 Intellectual Property。
+    源 = **catalog.brand_blacklist**(黑名单中心品牌总表镜像;所有者定稿
+    2026-08-13:黑名单只维护一份,不再读 audit.blacklist_brands 快照,也不再
+    合并 compat yaml 的 34 个手补牌子——要补进飞书品牌总表,单源)。
+    Phase0 dict(规整小写→原文):strip → lower → 空白压单空格。
+    R4 词集:只 strip+lower(保留词内空白,旧 l2 加载器口径)。
     """
     phase0: dict = {}
     r4: set = set()
     with conn.cursor() as cur:
-        cur.execute("SELECT brand FROM audit.blacklist_brands")
+        cur.execute("SELECT brand FROM catalog.brand_blacklist")
         for (brand,) in cur.fetchall():
             raw = (brand or "").strip()
             if not raw:
@@ -71,18 +71,7 @@ def _brand_map(conn) -> tuple[dict, set]:
             norm = " ".join(raw.lower().split())
             if norm and norm not in phase0:
                 phase0[norm] = raw
-    yaml_path = paths.audit_seed_file("compat_ip_brands.yaml")
-    if yaml_path.exists():
-        import yaml as _yaml
-        data = _yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-        for item in data.get("additional_hard_brands") or []:
-            raw = (str(item) or "").strip()
-            if not raw:
-                continue
-            norm = " ".join(raw.lower().split())
-            if norm and norm not in phase0:
-                phase0[norm] = raw
-    logger.info("品牌黑名单加载:Phase0 %d 键(DB+yaml)/ R4 %d 键(仅 DB)",
+    logger.info("品牌黑名单加载(黑名单中心):Phase0 %d 键 / R4 %d 键",
                 len(phase0), len(r4))
     return phase0, r4
 
@@ -168,10 +157,13 @@ def load_context(conn, *, uspto=None) -> AuditContext:
                 cat_pts.setdefault(cat.strip(), set()).add(pt)
         catmap = {cat: next(iter(pts)) for cat, pts in cat_pts.items()
                   if len(pts) == 1 and next(iter(pts)) in pt_meta}
+    # 四闸全部直读黑名单中心(所有者定稿 2026-08-13,一份数据):
+    # 卖家/类目 = risk_sync 镜像的两张新表;ASIN = 自产黑名单(问题商品清理
+    # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
     return AuditContext(
-        phase0_sellers=_frozen(conn, "SELECT seller_id FROM audit.phase0_blacklist_sellers"),
-        phase0_asins=_frozen(conn, "SELECT asin FROM audit.phase0_blacklist_asins"),
-        phase0_cats=_frozen(conn, "SELECT category_norm FROM audit.phase0_blacklist_amazon_cats"),
+        phase0_sellers=_frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist"),
+        phase0_asins=_frozen(conn, "SELECT asin FROM catalog.asin_blacklist"),
+        phase0_cats=_frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"),
         brand_blacklist=brand,
         pt_meta=pt_meta,
         pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "

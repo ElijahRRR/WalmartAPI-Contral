@@ -73,6 +73,16 @@ def frontend_scrape_file() -> Path:
     return data_root() / "frontend_scrape" / "latest.json"
 
 
+def audit_seed_file(name: str) -> Path:
+    """输入:审核规则种子文件名(如 'forbidden_categories_zh_seller.yaml')
+    → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。
+
+    审核规则代码取 yaml 一律经此函数(铁律 3:路径不散落在 services)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "audit" / name
+
+
 def pg_tool(name: str) -> str:
     """输入:PostgreSQL 客户端工具名(pg_dump/pg_restore)→ 输出:可执行路径。
 

@@ -45,6 +45,43 @@ def _read_sheet(sheet) -> list[dict]:
     return rows
 
 
+def _sync_phase0(conn, rows: list[dict]) -> str:
+    """输入:连接 + Phase0 表行 → 输出:三表重灌计数摘要(审核批次 B5)。
+
+    「Amazon 选品黑名单」是**三条独立列**(A=卖家ID B=ASIN C=Amazon 类目),
+    不是行级记录——同一行的三个格子互不相关,逐列收集非空值。
+    镜像语义 = **TRUNCATE + 全量重灌**(与旧审核系统同款;risk_sync 家族的
+    "只增改不删"在此不适用:飞书删行必须跟着消失,残留即幽灵拦截)。
+    与本工作流其余同步共享同一事务:中途失败整体回滚,旧数据继续生效
+    (fail-soft,与旧仓 sync_phase0_blacklist 单事务语义一致)。
+    类目归一化与查询侧共用 audit_phase0.normalize_amazon_category,
+    存的就是归一化值,审核读取端不再二次归一化。
+    """
+    from services.audit_phase0 import normalize_amazon_category
+    sellers = {r["seller_id"] for r in rows if r.get("seller_id")}
+    asins = {r["asin"] for r in rows if r.get("asin")}
+    cats = {}
+    for r in rows:
+        raw = r.get("category")
+        if raw:
+            norm = normalize_amazon_category(raw)
+            if norm and norm not in cats:
+                cats[norm] = raw
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE audit.phase0_blacklist_sellers")
+        cur.execute("TRUNCATE audit.phase0_blacklist_asins")
+        cur.execute("TRUNCATE audit.phase0_blacklist_amazon_cats")
+        cur.executemany("INSERT INTO audit.phase0_blacklist_sellers (seller_id) "
+                        "VALUES (%s)", [(s,) for s in sorted(sellers)])
+        cur.executemany("INSERT INTO audit.phase0_blacklist_asins (asin) "
+                        "VALUES (%s)", [(a,) for a in sorted(asins)])
+        cur.executemany("INSERT INTO audit.phase0_blacklist_amazon_cats "
+                        "(category_norm, category_raw) VALUES (%s, %s)",
+                        sorted(cats.items()))
+    return (f"Phase0 三列表:全量重灌 卖家 {len(sellers)} / ASIN {len(asins)} "
+            f"/ 类目 {len(cats)}")
+
+
 def run(params: dict) -> str:
     """输入:params(无参)→ 输出:两表同步计数与禁售/黑名单摘要。"""
     lines = []
@@ -61,6 +98,11 @@ def run(params: dict) -> str:
             lines.append(f"品牌表:读 {len(brand_rows)} 行,入库 {n_b}")
         except LookupError as e:
             lines.append(f"品牌表跳过:{e}")
+        try:
+            p0_rows = _read_sheet(resources.PHASE0_BLACKLIST_SHEET.require())
+            lines.append(_sync_phase0(conn, p0_rows))
+        except LookupError as e:
+            lines.append(f"Phase0 三列表跳过:{e}")
         gate = risk_gate.load_gate(conn)
         banned_asins = blacklist.load_banned_asins(conn)
     lines.append(f"闸门现状:禁售类目 {len(gate['banned_pts'])} 个,"

@@ -96,12 +96,22 @@ class _FakeCur:
     def __exit__(self, *a):
         return False
 
-    def execute(self, sql, params):
+    def fetchone(self):
+        # _PRODUCT_SQL 的 RETURNING (xmax=0):假实现按"首见 ASIN=新插入"模拟
+        return (self._last_inserted,)
+
+    def executemany(self, sql, rows):
+        # product_ingested 事件批量写(product_events.record_many)
+        self.store.setdefault("events", []).extend(rows)
+
+    def execute(self, sql, params=None):
         if "catalog.snapshots" in sql:
             sid = params["source_id"]
             self.rowcount = 0 if sid in self.store["snap"] else 1
             self.store["snap"].add(sid)
         else:
+            seen = {p["asin"] for p in self.store["prod"]}
+            self._last_inserted = params["asin"] not in seen
             self.store["prod"].append(params)
             self.rowcount = 1
 

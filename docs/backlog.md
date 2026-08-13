@@ -102,7 +102,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~orders.orders / order_center 视图~~(2026-08-12 清理:视图零读者直接 DROP;旧表带"仅空表才删"守卫防手滑)
 - ✅ ~~catalog.products 十列死列~~(2026-08-12 判定:**assigned_upc/listing_attrs/last_feed_id/store/owner 五列删除**(零读写,职责被 catalog.upc_pool/llm_cache/ops.feed_log/飞书上架表接管);**audit_* 五列保留**=二期审核接缝,三处登记一致,非遗忘死列)
 - ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
-- 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列=永久明细档案,是"档案(如 ops.runs)"还是该裁,**待所有者拍板**;`ops.scrape_failures.error_detail` **有读者**(v_scrape_failure_stats 视图,先前记录有误),status/retry_count 零读方但为采集契约镜像,随上一条一并拍;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**(旧库同款缓存曾膨胀 462MB,清理器落地时要靠它,正确动作是补写低频清理器而非删列)
+- 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列**留着**(所有者拍板 2026-08-13:已映射到飞书多维表格,是运营参考数据);`ops.scrape_failures.error_detail` **有读者**(v_scrape_failure_stats 视图,先前记录有误),status/retry_count 零读方但为采集契约镜像,随上一条一并保留;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**(旧库同款缓存曾膨胀 462MB,清理器落地时要靠它,正确动作是补写低频清理器而非删列)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
 
@@ -169,7 +169,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 **P2 — 能力补齐**
 - ⬜ update_listed 五个维护字段集(images/attributes/shipping/origin/dates)→ maintenance_intents 新 provider(顺带摆脱 307MB pt_templates_full.json)
-- ⬜ 只读健康视图(旧 scheduler.cmd_health_report:待上架分布/UPC 池四态/在途 feed/错误分布,运营日看四次)→ cli.py health
+- ✅ ~~只读健康视图 cli.py health~~(所有者拍板 2026-08-13:**不要**)
 - ✅ LLM 校验失败 payload 落盘诊断(2026-08-12:必填缺失行落 `<DATA_ROOT>/logs/llm_raw_*.json`,含 missing/notes/两段载荷)
 - ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
 - ⬜ 变体分组(核心 ~190 行纯函数:full_variant_group_set 并集分组/PT 一致性/inject_variant_fields/标题差异化;**跨店重定向与 LLM remap 建议砍**;先决条件=采集契约顶层暴露 parent_asin/variation_asins/variation_attributes)

@@ -35,7 +35,6 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 """
 
 import logging
-from datetime import datetime, timezone
 
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, product_events
@@ -245,7 +244,7 @@ def run(params: dict) -> str:
     if r5_on and getattr(ctx, "uspto_failures", 0):
         lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
                      f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
-    lines.append(f"全库 pending 存量 {pending_total}{age}")
+    lines.append(f"全库 pending 存量 {pending_total}")
     if not execute:
         lines.append("(dry-run:runs/hits 已落,products 五列与事件未写)")
     return "\n".join(lines)

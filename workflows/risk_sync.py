@@ -21,7 +21,7 @@ import logging
 
 from api import feishu
 from registry import db, resources
-from services import risk_gate
+from services import blacklist, risk_gate
 
 DANGEROUS = False
 
@@ -62,6 +62,11 @@ def run(params: dict) -> str:
         except LookupError as e:
             lines.append(f"品牌表跳过:{e}")
         gate = risk_gate.load_gate(conn)
+        banned_asins = blacklist.load_banned_asins(conn)
     lines.append(f"闸门现状:禁售类目 {len(gate['banned_pts'])} 个,"
-                 f"黑名单品牌 {len(gate['brands'])} 个")
+                 f"黑名单品牌 {len(gate['brands'])} 个,"
+                 f"ASIN 黑名单 {len(banned_asins)} 个")
+    # ASIN 黑名单**不由本工作流同步**(所有者问询 2026-08-12 补可见性):
+    # 它是自产回路——问题产品清理每日归类(B/C/E/F/G/K 六类)+ 上架违禁
+    # 回执自动入库;PG 权威,blacklist_push 反向推飞书投影。此处只报数
     return "\n".join(lines)

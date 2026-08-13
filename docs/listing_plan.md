@@ -21,7 +21,30 @@
 - LLM(DeepSeek/Qwen)API key、采集地址等全部进 `<DATA_ROOT>/.env`,
   经 registry 引用;spec 文件入 `<DATA_ROOT>/specs/<版本>/`。
 
+## 当前状态(2026-08-12 晚,代码迁移收官)
+
+- **代码面:迁移完成**。L0~L2d 全部就绪;2026-08-12 四批收官:六点批复
+  (批次一)+ 载荷漏迁补齐(批次二,旧仓逐字段对照)+ 接线(批次三)+
+  违禁反哺黑名单闭环;两重自愈(SKU_LOCKED / K=Unknown)、跟卖库存
+  provider、缺数据推采集闭环全部接通;第 5 轮错误(releaseDate 日期格式)
+  已修,576 测试全绿。
+- **验收面:✅ L2d 端到端验收通过**(2026-08-13:feed 18CB051E… 回执
+  PROCESSED **成功 3 失败 0**,所有者确认)。**L2a 已验**(注入 47 →
+  四态 28/0/10/9);**L2b 已验**(825 禁售 + 42102 品牌 + ASIN 黑名单
+  5.6 万自产回路在库);**L1 跟卖试点后置**(所有者:功能暂时用不上,
+  启用前再验)。
+- **运维面(验收后)**:调度挂载(catalog_sync→maintenance→list_new 顺序
+  硬约束;feed_poll 高频)→ 切换清单(**旧 launchd 5 条 + AI skill 链
+  两条调度必须同停**,新旧并跑=重复领号重复上架)→ L4 收尾(历史数据
+  迁移批次/upc_audit)。
+- **刻意后置**:变体分组(等采集 variation 三字段提顶层)、update_listed
+  五字段集(归 maintenance)、健康仪表盘。
+
 ## 阶段划分
+
+> ⚠ 勘误说明(2026-08-12):L0/L1 规划段的复选框是**立案时原文**,一直没勾
+> ——实况以各「实施状态」节与上方「当前状态」为准(L0/L1 均已完成;
+> listing.tasks/retry_state 两表后来判定不建,见 backlog 第四节)。
 
 ### L0 地基(无沃尔玛写操作,可随时动工)
 
@@ -114,11 +137,15 @@
       + 枚举合法化 + 未知字段剔除(Orderable.productName 即因此被拒)+
       stateRestrictions 清理 + 空值/minItems 裁剪 + 小数位 + **提交前必填校验
       (不过就不提交,省 UPC 与配额)**;dry-run 加 -p check_spec=1 预检
-- [ ] 重跑验收:预检 → --execute → 回执 SUCCESS
+- [x] **重跑验收通过**(2026-08-13,feed 18CB051E…):A121许家蕴 3 条
+      (Bar Stools $194.99 / Bulb Planter Tools $82.48 / Fence Screens $61.47)
+      **PROCESSED 成功 3 失败 0**,O/P/Q 反哺回填正常。六轮错误账收官:
+      30 错 → 0 错。L2d 端到端验收 ✅
 
-### ⏸ L2d 攻坚暂停(所有者定稿 2026-08-09)
+### L2d 攻坚(2026-08-09 暂停 → 2026-08-12 续做收官)
 
-**状态:代码全部保留,不回退。** 四轮真跑把载荷问题从 30 个错收敛到只剩
+**状态:✅ 验收通过(2026-08-13,3/3 SUCCESS)**(续做内容见上方
+「续迁批次一/二/三」与「续迁调研定稿」各节)。以下为暂停期存档。 四轮真跑把载荷问题从 30 个错收敛到只剩
 UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先做别的",
 本阶段暂停;续做时从「下次续做怎么走」直接接上。
 
@@ -270,15 +297,15 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
       跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
       工作流默认 dry-run;回执失败标 failed 人工处置不自动重试;需每日调度
-- [ ] 状态跟踪:旧 sync_status_track 的"反查真实状态 + Unknown 自愈"由
-      catalog_sync(已上线)+ product_events 观测地基承接,只补
-      "上架表 K=Unknown 而目录已在线 → 自愈回写"这一条
+- [x] 状态跟踪:旧 sync_status_track 的"反查真实状态"由 catalog_sync 承接;
+      "K=Unknown 自愈"已由 listing_sheet.heal_unknown 落地(2026-08-12,
+      feed 台账终态双向 + 目录在线双源,挂 feed_poll 反哺器)
 
 ### L4 收尾
 
 - [ ] upc_audit(全站 UPC 冲突审计,只读)
-- [ ] 历史数据迁移批次:上架表 26 列全量、UPC 池 12 万行、pending_feeds
-      在途收干净、retry_state 永久淘汰名单(丢了会重拉几万个已死 ASIN)
+- ~~历史数据迁移批次~~(2026-08-12 所有者整批关闭:26 列/UPC 池 12 万行/
+      pending_feeds/retry_state 全部不迁;防重拉已死 ASIN 由黑名单承担)
 - [ ] 切换清单:停 launchd 4 条(morning/reconcile_hourly/retire_daily/
       health_4x)+ scheduled-tasks 的 dedup_sync(前端不迁,此任务作废)
 

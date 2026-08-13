@@ -1005,7 +1005,21 @@ CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(stat
 -- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
 -- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
 -- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
--- 进映射表才生效。status:ok/unknown/excluded/no_candidate/llm_failed
+-- 进映射表才生效。status:inherited(兄弟继承,免 LLM)/ok/unknown/excluded/no_candidate/llm_failed
+-- 亚马逊官方类目树(所有者抓取,taxonomy_import 灌入;2026-08-13)。
+-- 32,140 节点/26,955 叶。角色 = 映射维护的骨架:已有映射沿树传播
+-- (兄弟继承)、脏路径校验归一、node_id 对齐映射表 browse_node_id
+CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
+    path        text PRIMARY KEY,    -- 'A > B > C'(与 products.amazon_category 同分隔)
+    name        text NOT NULL,       -- 节点名(路径末段)
+    node_id     text,                -- Amazon browse node id(根级可空)
+    depth       integer NOT NULL,
+    parent_path text,                -- 父节点 path(L1 为 NULL)
+    is_leaf     boolean NOT NULL,
+    imported_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_amztax_parent ON audit.amazon_taxonomy(parent_path);
+
 CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
     amazon_category text PRIMARY KEY,
     suggested_pt    text,

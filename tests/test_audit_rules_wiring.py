@@ -488,6 +488,32 @@ def test_reason_mapper_l4_medium_falls_to_general_use():
         == "General-Use Products"
 
 
+def test_taxonomy_flatten_tree():
+    """树打平:path 拼接、先序、叶判定、同 path 先到先得。"""
+    from workflows.taxonomy_import import flatten_tree
+    tree = [{"name": "A", "node_id": None, "depth": 1, "children": [
+        {"name": "B", "node_id": "1", "depth": 2, "children": [
+            {"name": "C", "node_id": "2", "depth": 3, "children": []}]},
+        {"name": "B", "node_id": "9", "depth": 2, "children": []},  # 重复 path
+    ]}]
+    rows = flatten_tree(tree)
+    assert [(r[0], r[5]) for r in rows] == [
+        ("A", False), ("A > B", False), ("A > B > C", True)]
+    assert rows[1][2] == "1"                    # 先到先得,node_id=1 保留
+    assert rows[2][4] == "A > B"                # parent_path
+
+
+def test_catmap_sibling_verdict():
+    """兄弟继承:恰一 PT 且 ≥2 兄弟支持才继承;任何分流(含哨兵)不传播。"""
+    from workflows.catmap_suggest import sibling_verdict
+    assert sibling_verdict([("GoodPT", 3)]) == "GoodPT"
+    assert sibling_verdict([("GoodPT", 1)]) is None            # 单证不立
+    assert sibling_verdict([("GoodPT", 5), ("OtherPT", 1)]) is None   # 分流
+    assert sibling_verdict([("GoodPT", 5),
+                            ("无对应Walmart PT", 2)]) is None   # 哨兵一票否决
+    assert sibling_verdict([]) is None
+
+
 def test_catmap_suggestion_from_l1():
     """建议三态:ok(挑出 PT)/ excluded(-100 hit,PT 仍留档)/ unknown。"""
     from workflows.catmap_suggest import suggestion_from_l1

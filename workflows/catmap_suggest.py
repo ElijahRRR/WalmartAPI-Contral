@@ -75,6 +75,33 @@ SET suggested_pt = EXCLUDED.suggested_pt,
     created_at   = now()
 """
 
+# 第 0 层|兄弟继承(免 LLM;需 taxonomy_import 已灌 audit.amazon_taxonomy):
+# 缺口路径的同父兄弟里,已有 ≥2 条高置信映射指向**同一个** PT 且无其他 PT
+# 分流(含哨兵在内一票否决)→ 直接继承。SQL 返回该父节点下兄弟映射的
+# PT 分布,继承判定在 sibling_verdict 纯函数里
+_SIBLING_SQL = """
+SELECT m.walmart_product_type, count(DISTINCT t.path)
+FROM audit.amazon_taxonomy g
+JOIN audit.amazon_taxonomy t
+  ON t.parent_path = g.parent_path AND t.path <> g.path
+JOIN audit.walmart_category_map m
+  ON btrim(m.amazon_category) = t.path AND m.confidence = '高'
+WHERE g.path = %s AND g.parent_path IS NOT NULL
+GROUP BY m.walmart_product_type
+"""
+
+
+def sibling_verdict(dist: list[tuple]) -> str | None:
+    """输入:兄弟映射 PT 分布 [(pt, n)] → 输出:可继承的 PT 或 None。
+
+    纯函数。恰一个 PT 且 ≥2 个兄弟支持才继承;出现任何第二个 PT(含哨兵
+    '无对应Walmart PT')= 该父节点下类目分流,不传播——宁可交给 LLM/人工。
+    """
+    if len(dist) != 1:
+        return None
+    pt, n = dist[0]
+    return pt if n >= 2 else None
+
 
 def suggestion_from_l1(l1) -> tuple[str | None, str | None, str]:
     """输入:rerank 返回(L1Info 或 None)→ 输出:(pt, confidence, status)。
@@ -105,10 +132,22 @@ def run(params: dict) -> str:
                    "refresh=1 可重跑)"
 
         pt_dict = None
-        counts = {"ok": 0, "unknown": 0, "excluded": 0,
+        counts = {"ok": 0, "inherited": 0, "unknown": 0, "excluded": 0,
                   "no_candidate": 0, "llm_failed": 0}
         lines = []
         for path, n, sample_asin in gaps:
+            # 第 0 层|兄弟继承(免 LLM;taxonomy 未灌时 SQL 返回空,自然跳过)
+            with conn.cursor() as cur:
+                cur.execute(_SIBLING_SQL, (path,))
+                inherited = sibling_verdict(cur.fetchall())
+            if inherited:
+                counts["inherited"] += 1
+                with conn.cursor() as cur:
+                    cur.execute(_UPSERT_SQL, (path, inherited, "高",
+                                              "inherited", sample_asin,
+                                              None, n))
+                lines.append(f"  {n:>5} 件|{path[:70]} → {inherited}(兄弟继承)")
+                continue
             with conn.cursor() as cur:
                 cur.execute(_SAMPLE_SQL, (sample_asin,))
                 cols = [d[0] for d in cur.description]
@@ -139,12 +178,13 @@ def run(params: dict) -> str:
                 lines.append(f"  {n:>5} 件|{path[:70]} → {pt}({conf})")
 
     head = [f"catmap_suggest:本轮 {len(gaps)} 条路径 → "
-            f"建议 {counts['ok']} / unknown {counts['unknown']} / "
+            f"兄弟继承 {counts['inherited']}(免 LLM) / "
+            f"LLM 建议 {counts['ok']} / unknown {counts['unknown']} / "
             f"禁售 {counts['excluded']} / 无候选 {counts['no_candidate']} / "
             f"失败 {counts['llm_failed']}",
             "复核 SQL:SELECT * FROM audit.category_map_suggestions "
             "ORDER BY product_count DESC;",
             "确认后的升级通道待定(飞书「映射明细」vs PG 直写,所有者定)"]
     return "\n".join(head + lines[:20]
-                     + ([f"  …共 {counts['ok']} 条建议,余见复核 SQL"]
-                        if counts["ok"] > 20 else []))
+                     + ([f"  …共 {len(lines)} 条建议,余见复核 SQL"]
+                        if len(lines) > 20 else []))

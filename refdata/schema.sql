@@ -386,9 +386,13 @@ DROP TABLE IF EXISTS listing.upc_pool;
 DROP VIEW IF EXISTS orders.order_center;
 DO $$
 BEGIN
-  IF to_regclass('orders.orders') IS NOT NULL
-     AND NOT EXISTS (SELECT 1 FROM orders.orders) THEN
-    DROP TABLE orders.orders;
+  -- 嵌套 IF 是幂等的关键:PL/pgSQL 逐语句惰性计划,表已删时外层判空跳过,
+  -- 内层的表引用永不进计划;平铺 AND 会在计划期解析表名——首跑删表成功、
+  -- 重跑必炸 UndefinedTable(2026-08-13 生产实证,db_init 重跑被它卡死)
+  IF to_regclass('orders.orders') IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM orders.orders) THEN
+      DROP TABLE orders.orders;
+    END IF;
   END IF;
 END $$;
 ALTER TABLE catalog.products DROP COLUMN IF EXISTS assigned_upc;

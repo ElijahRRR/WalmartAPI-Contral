@@ -73,6 +73,19 @@ def frontend_scrape_file() -> Path:
     return data_root() / "frontend_scrape" / "latest.json"
 
 
+def pg_tool(name: str) -> str:
+    """输入:PostgreSQL 客户端工具名(pg_dump/pg_restore)→ 输出:可执行路径。
+
+    env PG_BIN_DIR 指定目录:Homebrew 多版本共存时 PATH 里的 pg_dump 可能是
+    旧大版本(生产实证 2026-08-13:PATH 是 16、服务器是 17,pg_dump 拒绝
+    version mismatch);未设则用 PATH 裸名。
+    """
+    bin_dir = os.environ.get("PG_BIN_DIR", "").strip()
+    if bin_dir:
+        return str(Path(bin_dir).expanduser() / name)
+    return name
+
+
 def stores_snapshot_file() -> Path:
     """输入:无 → 输出:店铺凭证本地快照文件路径(含密钥,写入后 chmod 600,不进 git)。"""
     return cache_dir() / "stores_snapshot.json"

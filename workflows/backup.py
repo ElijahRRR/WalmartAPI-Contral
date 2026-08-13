@@ -16,6 +16,8 @@
   `createuser readonly`,或 `pg_restore --no-acl`。
 - WALMART_PG_DSN 若配了口令,DSN 会出现在进程列表——请改用 ~/.pgpass;
   已带 --no-password,凭证缺失会快速失败而不是挂住等交互输入。
+- Homebrew 多版本:PATH 里的 pg_dump 与服务器大版本不匹配会拒绝 dump,
+  在 <DATA_ROOT>/.env 配 PG_BIN_DIR=<PG17 的 bin 目录>(registry.paths.pg_tool)。
 """
 
 import logging
@@ -66,13 +68,13 @@ def run(params: dict) -> str:
     part = target.with_name(target.name + ".part")
     try:
         proc = subprocess.run(
-            ["pg_dump", "--format=custom", "--no-password",
+            [paths.pg_tool("pg_dump"), "--format=custom", "--no-password",
              "--file", str(part), db.pg_dsn()],
             capture_output=True, text=True, timeout=3600)
         if proc.returncode != 0 or not part.exists() or part.stat().st_size == 0:
             raise RuntimeError(
                 f"pg_dump 失败(exit={proc.returncode}):{proc.stderr.strip()[-500:]}")
-        check = subprocess.run(["pg_restore", "--list", str(part)],
+        check = subprocess.run([paths.pg_tool("pg_restore"), "--list", str(part)],
                                capture_output=True, text=True, timeout=600)
         if check.returncode != 0:
             raise RuntimeError(

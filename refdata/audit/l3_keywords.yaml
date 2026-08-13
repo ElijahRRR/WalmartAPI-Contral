@@ -1,0 +1,207 @@
+# L3 LLM prompt 使用的关键词配置 (原本硬编码在 l3_llm.py, 迁到 yaml 便于维护)
+#
+# 这些词不是"命中即拒"的硬规则, 而是给 LLM 的判定提示
+# L3 仍然按语境判 pass/reject, yaml 只是让 prompt 可维护
+
+version: 1
+updated: 2026-04-21
+
+# =======================================================
+# B.1 贴纸/海报/补丁/徽章/旗帜/T恤/装饰画/卡套/杯贴 敏感主题
+# =======================================================
+# 这类产品的"违规"藏在具体图案/文字里, 文本只是暗示
+# LLM 按以下词表扫产品文本, 命中倾向 reject (offensive)
+sticker_sensitive_themes:
+  adult_content:      # 成人内容
+    - "adult"
+    - "adult content"
+    - "adult stickers"
+    - "sexual"
+    - "nsfw"
+    - "xxx"
+    - "erotic"
+
+  intolerance_symbols:  # 不容忍象征
+    - "Confederate"
+    - "Confederate flag"
+    - "Nazi"
+    - "Swastika"
+    - "SS bolts"
+    - "KKK"
+
+  political_mockery:  # 政治讽刺 (需与 funny/parody/mock 组合)
+    - "Trump"
+    - "Biden"
+    - "MAGA"
+    - "political candidate"
+
+  crude_humor_modifiers:  # 需与 funny/pranks 等组合
+    - "inappropriate"
+    - "offensive"
+    - "crude humor"
+    - "raunchy"
+
+  hateful:  # 明显歧视
+    - "hateful"
+    - "racist"
+    - "discrimination"
+    - "racial slur"
+
+# =======================================================
+# B.2 仿真武器 / 仿真枪 / 军警装备玩具
+# =======================================================
+# 沃尔玛 Military & Law Enforcement 政策 + 美联邦 15 U.S.C. § 5001
+#
+# 判定逻辑 (由 LLM 按 prompt 执行):
+#   1. 先扫 exempt, 任一命中 → 直接 pass
+#      (例外: 若描述仍强调 "firearm enthusiasts / weapon collectors" 仍 reject)
+#   2. 否则扫 standalone_block, 单独命中 → reject
+#   3. 否则扫 weapon + realistic 共现 → reject
+
+replica_weapons:
+  # 触发词: 武器类 + 仿真类 共现 → reject
+  weapon_terms:
+    # 枪械
+    - "firearm"
+    - "handgun"
+    - "pistol"
+    - "revolver"
+    - "rifle"
+    - "shotgun"
+    - "gun"              # 需组合仿真词才拦, 走豁免保护 water gun/bubble gun
+    - "bullet"
+    - "cartridge"
+    - "ammo"
+    - "ammunition"
+    - "magazine clip"
+    - "grenade"
+    - "mortar"
+    # 军警管制
+    - "bb gun"
+    - "pellet gun"
+    - "airsoft"
+    - "paintball gun"
+    - "stun gun"
+    - "taser"
+    - "pepper spray"
+    - "brass knuckles"
+    - "knuckle duster"
+    - "switchblade"
+    - "butterfly knife"
+    - "tactical knife"
+    - "combat knife"
+    - "throwing star"
+    - "shuriken"
+    - "nunchaku"
+
+  realistic_terms:
+    - "replica"
+    - "realistic"
+    - "imitation"
+    - "lookalike"
+    - "1:1 scale"
+    - "1:2 scale"
+    - "1:3 scale"
+    - "1:4 scale"
+    - "full scale"
+    - "life-size"
+    - "life size"
+    - "real-looking"
+    - "authentic looking"
+    - "detailed replica"
+    - "prop gun"
+    - "movie prop"
+    - "non-firing"
+    - "display gun"
+    - "miniature firearm"
+    - "miniature gun"
+    - "miniature pistol"
+
+  # 单独命中就拒 (强违规标识)
+  standalone_block:
+    - "replica firearm"
+    - "replica gun"
+    - "replica pistol"
+    - "replica revolver"
+    - "replica rifle"
+    - "replica shotgun"
+    - "replica handgun"
+    - "imitation firearm"
+    - "prop firearm"
+    - "non-firing replica"
+    - "gun-shaped keychain"
+    - "gun shape keychain"
+    - "mini gun keychain"
+    - "miniature firearm"
+
+  # 豁免 (最高优先级, 命中直接 pass)
+  exempt:
+    # 功能型: 产品功能不是武器
+    functional_kitchen:
+      - "cookie cutter"
+      - "bake mold"
+      - "baking mold"
+      - "cake pan"
+      - "ice cube tray"
+      - "jello mold"
+      - "chocolate mold"
+      - "silicone mold"
+      - "cake topper"
+
+    functional_jewelry:   # 需在 jewelry/necklace/bracelet 上下文
+      - "pendant"
+      - "necklace pendant"
+      - "charm"
+      - "bracelet charm"
+      - "earring"
+      - "brooch"
+      - "pin"
+      - "lapel pin"
+
+    functional_decoration:
+      - "ornament"
+      - "decoration"
+      - "figurine"
+      - "statue"
+      - "sculpture"
+      - "wall decor"
+      - "paperweight"
+      - "desk decor"
+      - "mini figure"
+      - "collectible figurine"
+
+    brand:
+      - "NERF"
+      - "Hasbro"
+      - "foam dart"
+      - "foam blaster"
+      - "foam bullet"
+
+    toy_liquid:
+      - "water gun"
+      - "water pistol"
+      - "squirt gun"
+      - "water blaster"
+      - "bubble gun"
+      - "soap gun"
+
+    compliance_markers:
+      - "bright orange tip"
+      - "orange muzzle"
+      - "orange tip"
+      - "transparent body"
+      - "clear plastic body"
+
+    other:
+      - "infrared laser tag"
+      - "laser tag toy"
+      - "gun holster only"
+      - "holster without gun"
+
+    # 豁免的例外: 命中豁免词但描述仍强调"武器收藏/仿真爱好者", 仍 reject
+    # (LLM 按 prompt 执行, 这里只是提示模式)
+    revocation_patterns:
+      - "realistic detailing for firearm enthusiasts"
+      - "military fans collectible replica"
+      - "weapon collectors"
+      - "for gun enthusiasts"

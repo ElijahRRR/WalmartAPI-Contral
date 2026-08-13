@@ -422,6 +422,28 @@ MATCH_SHEET = Spreadsheet(
 )
 
 
+# Amazon 选品黑名单三列表(wiki 承载;旧审核系统 Phase0 源,一张 sheet
+# 三列拆三张 PG 表:A=卖家ID B=ASIN C=Amazon类目。批次 B5 由 risk_sync
+# 接管镜像——**单事务 TRUNCATE 全量重灌**,与家族"只增改不删"语义不同:
+# 飞书删行必须跟着消失,残留即幽灵拦截(docs/audit_migration_plan.md 批次 B)。
+# token/sheet_id 值 = 旧系统 LARK_PHASE0_BLACKLIST_*,配进 <DATA_ROOT>/.env)
+PHASE0_BLACKLIST_SHEET = Spreadsheet(
+    name="Amazon选品黑名单",
+    token=os.environ.get("FEISHU_PHASE0_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_PHASE0_SHEET_ID", ""),
+    columns=("seller_id", "asin", "category"),
+    wiki=True,
+)
+
+# LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
+# 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose
+# 参数;视觉走豆包 api/llm_vision.py,不在此表)
+LLM_PURPOSE_ENV = {
+    "default": "DEEPSEEK_MODEL",
+    "audit_l1": "DEEPSEEK_MODEL_AUDIT_L1",
+    "audit_l3": "DEEPSEEK_MODEL_AUDIT_L3",
+}
+
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
 # 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——
 # 所有者 2026-08-07:表格随时会停用)

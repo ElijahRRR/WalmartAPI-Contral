@@ -64,6 +64,54 @@ def legacy_cleanup_conn():
         conn.close()
 
 
+def legacy_audit_dsn() -> str:
+    """输入:无 → 输出:旧审核库 walmart_audit 的 DSN。
+
+    审核迁入批次 A(audit_import)与批次 B 双跑校准专用。旧库与中心库在
+    同一台生产 Mac 同一 PG 实例(调研定稿 docs/audit_migration_plan.md);
+    若不同实例用 LEGACY_AUDIT_DSN 覆盖。地址只准从这里取(铁律 3)。
+    """
+    return os.environ.get("LEGACY_AUDIT_DSN", "dbname=walmart_audit")
+
+
+@contextlib.contextmanager
+def legacy_audit_conn():
+    """输入:无 → 输出:旧审核库**只读**连接上下文。
+
+    搬迁与校准的读取端。旧库是待归档真值,本仓对它只有读的权利。
+    """
+    import psycopg
+
+    conn = psycopg.connect(legacy_audit_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
+def uspto_dsn() -> str:
+    """输入:无 → 输出:USPTO 商标库 DSN(env USPTO_DSN 覆盖,默认本机 uspto 库)。
+
+    批复 #3(2026-08-13):R5 商标反查继续跨库连它;灌库链路在外部仓,
+    本仓永远只读。
+    """
+    return os.environ.get("USPTO_DSN", "dbname=uspto")
+
+
+@contextlib.contextmanager
+def uspto_conn():
+    """输入:无 → 输出:USPTO 库**只读**连接上下文(1400 万行 trademarks)。"""
+    import psycopg
+
+    conn = psycopg.connect(uspto_dsn())
+    try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
 def sqlite_cache(name: str) -> sqlite3.Connection:
     """输入:缓存库文件名(不含路径,如 'scraper_cache.db')→ 输出:sqlite3 连接。
 

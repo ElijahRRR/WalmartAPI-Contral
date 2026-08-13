@@ -1002,6 +1002,21 @@ CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(repo
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
 
+-- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
+-- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
+-- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
+-- 进映射表才生效。status:ok/unknown/excluded/no_candidate/llm_failed
+CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
+    amazon_category text PRIMARY KEY,
+    suggested_pt    text,
+    confidence      text,
+    status          text NOT NULL,
+    sample_asin     text,
+    sample_title    text,
+    product_count   integer,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+
 -- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
 CREATE TABLE IF NOT EXISTS audit.walmart_pt_meta (

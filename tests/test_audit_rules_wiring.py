@@ -488,6 +488,18 @@ def test_reason_mapper_l4_medium_falls_to_general_use():
         == "General-Use Products"
 
 
+def test_catmap_suggestion_from_l1():
+    """建议三态:ok(挑出 PT)/ excluded(-100 hit,PT 仍留档)/ unknown。"""
+    from workflows.catmap_suggest import suggestion_from_l1
+    ok = audit_rules.L1Info(walmart_product_type="GoodPT", pt_confidence="高")
+    assert suggestion_from_l1(ok) == ("GoodPT", "高", "ok")
+    exc = audit_rules.L1Info(walmart_product_type="unknown", pt_confidence="低")
+    exc.hits.append(audit_rules.RuleHit(stage="L1", rule_code="excluded_category",
+                                        penalty=-100, detail={}))
+    assert suggestion_from_l1(exc) == ("unknown", "低", "excluded")
+    assert suggestion_from_l1(None) == (None, None, "unknown")
+
+
 def test_candidate_sql_recent_guard_shape():
     """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
     sql = product_audit._CANDIDATE_SQL.format(

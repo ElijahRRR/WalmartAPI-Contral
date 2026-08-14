@@ -173,6 +173,17 @@ CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_event
 -- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
 ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
 
+-- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
+-- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
+-- **类目名会漂,ID 不会**:Amazon 的 URL slug / 面包屑 / Best Sellers 导航
+-- 三套名称不一致,按路径字符串匹配会把同一类目误判成缺口;ID 链最后一段
+-- = 当前最细类目,直查 walmart_category_map.browse_node_id 精确命中。
+-- 审核 L1 ②级优先用它,字符串路径与 category_path_alias 降级为无 ID 老行兜底
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_chain text;
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_id text;
+CREATE INDEX IF NOT EXISTS products_browse_node_idx
+    ON catalog.products (browse_node_id);
+
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
 -- 各有身份。谁上架谁登记;自动化按出身路由(路由铁律:由"源数据缺失"驱动的

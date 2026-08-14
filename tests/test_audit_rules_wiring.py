@@ -488,6 +488,47 @@ def test_reason_mapper_l4_medium_falls_to_general_use():
         == "General-Use Products"
 
 
+def test_resolve_pt_browse_node_first():
+    """②a browse_node_id 直查(所有者定稿 2026-08-14:名称会漂 ID 不会)。
+    映射表 ID 覆盖率实测 100%(15,987/15,987),故 ID 在场时优先于路径。"""
+    ctx = _ctx(pt_meta=META, node_map={"14083111": "GoodPT"},
+               catmap={"Some > Path": "GoodPT"})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111",
+                    amazon_category_path="漂移的 > 名称 > 谁也对不上"), ctx)
+    assert l1.walmart_product_type == "GoodPT" and l1.pt_source == "map_node"
+    # 实证仍优先于 ID(批复 #10)
+    ev = _ctx(pt_meta=META, node_map={"14083111": "GoodPT"},
+              walmart_confirmed={"B0N": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111"),
+        ev).pt_source == "walmart_confirmed"
+    # ID 不在映射表 → 落回字符串路径(无 ID 老行同此)
+    fallback = _ctx(pt_meta=META, node_map={"999": "GoodPT"},
+                    catmap={"Some > Path": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111",
+                    amazon_category_path="Some > Path"),
+        fallback).pt_source == "map_direct"
+
+
+def test_ingest_category_nodes():
+    """契约 v1 追加 slow.category_id_chain:逗号串/数组两形态,末段=最细类目。"""
+    from services.product_ingest import category_nodes, product_params
+    assert category_nodes({"category_id_chain": "2972638011,553788,14083111"}) \
+        == ("2972638011,553788,14083111", "14083111")
+    assert category_nodes({"category_id_chain": [228013, "551238", " 553220 "]}) \
+        == ("228013,551238,553220", "553220")
+    assert category_nodes({}) == (None, None)           # 缺失 → 退回字符串路径
+    assert category_nodes({"category_id_chain": " , "}) == (None, None)
+    row = product_params({"asin": "B0A", "slow": {
+        "title": "t", "category_path": ["A", "B"],
+        "category_id_chain": "1,2,3"}})
+    assert row["browse_node_id"] == "3"
+    assert row["browse_node_chain"] == "1,2,3"
+    assert product_params({"asin": "B0A", "slow": {}})["browse_node_id"] is None
+
+
 def test_resolve_pt_path_alias_folding():
     """②级查表前折别名(catmap_align):中间层名漂移的路径也能命中映射;
     别名表空 → 退化回纯精确匹配(零行为变化)。"""

@@ -50,6 +50,8 @@ class ProductInfo:
     seller_name: str = ""            # 仅写进 detail,不参与判定
     known_pt: str | None = None      # 产品行已知 PT(历史实证回填/先前结论;
                                      # 批次 C 新增,resolve_pt ①b 级消费)
+    browse_node_id: str = ""         # 类目 ID 链末段(当前最细类目;名称会漂
+                                     # ID 不会,resolve_pt ②a 级直查映射表)
 
     @property
     def searchable_text(self) -> str:

@@ -50,6 +50,7 @@ class AuditContext:
     uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
+    node_map: dict = field(default_factory=dict)              # browse_node_id → PT(高置信唯一,已 pt_meta 闸)
 
 
 def _brand_map(conn) -> tuple[dict, set]:
@@ -166,6 +167,22 @@ def load_context(conn, *, uspto=None) -> AuditContext:
                 cat_pts.setdefault(cat.strip(), set()).add(pt)
         catmap = {cat: next(iter(pts)) for cat, pts in cat_pts.items()
                   if len(pts) == 1 and next(iter(pts)) in pt_meta}
+        # browse_node_id → PT(所有者定稿 2026-08-14:名称会漂 ID 不会)。
+        # 同款三闸:高置信 + 剔哨兵 + 该 ID 恰一个 PT + pt_meta 存在
+        cur.execute(
+            "SELECT browse_node_id, walmart_product_type "
+            "FROM audit.walmart_category_map "
+            "WHERE confidence = '高' AND walmart_product_type <> %s "
+            "  AND browse_node_id IS NOT NULL AND btrim(browse_node_id) <> ''",
+            (_UNMAPPED_SENTINEL,))
+        node_pts: dict = {}
+        for node, pt in cur.fetchall():
+            if node and pt:
+                node_pts.setdefault(node.strip(), set()).add(pt)
+        node_map = {n: next(iter(pts)) for n, pts in node_pts.items()
+                    if len(pts) == 1 and next(iter(pts)) in pt_meta}
+        logger.info("类目锚:browse_node %d 个 / 路径 %d 条", len(node_map),
+                    len(catmap))
     # 四闸全部直读黑名单中心(所有者定稿 2026-08-13,一份数据):
     # 卖家/类目 = risk_sync 镜像的两张新表;ASIN = 自产黑名单(问题商品清理
     # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
@@ -202,6 +219,7 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         # 未命中时折一次再查;表不存在/空则为空 dict,行为退化回纯精确匹配
         path_alias=_pairs(conn, "SELECT path, canonical_path "
                                 "FROM audit.category_path_alias"),
+        node_map=node_map,
     )
 
 
@@ -213,9 +231,10 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
       ①b 历史报错日报实证(walmart_error_records 最新条)  pt_source='walmart_error_confirmed'
       ⓪ 哨兵硬拒(映射表明确标记'无对应Walmart PT')——批复 #10 实证最优先,
         故哨兵从旧仓的最前挪到实证之后、映射之前(差异会进双跑校准报告)
-      ② 映射表精确(catmap 高置信唯一)                   pt_source='map_direct'
+      ②a browse_node_id 直查(名称会漂 ID 不会)          pt_source='map_node'
+      ②b 映射表路径精确(catmap 高置信唯一)              pt_source='map_direct'
         ——查表前先过路径别名折叠(catmap_align:Amazon 三套名称的中间层
-        漂移,精确等值会把已映射路径当缺口)
+        漂移,精确等值会把已映射路径当缺口);无 ID 的老行只有这一条路
     直出各级统一过 seed 硬拦(带 PT 调,旧 Layer1 快速通道 :804 同款)与
     出版物硬禁(合同 L1-6:旧仓对全部三级生效,批次 B 漏接本批归还)。
     命中硬拦时返回的 L1Info 带 -100 hit——audit_l2.evaluate 会累加 l1.hits,
@@ -230,9 +249,17 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
         # ①b 产品行已知 PT(pt_backfill 回填的历史实证/先前结论;所有者
         # 定稿 2026-08-13:PT 长在产品主档,不查证据边表)
         pt, source, conf = product.known_pt, "historical_confirmed", "高"
+    # ②a browse_node_id 直查(所有者定稿 2026-08-14:名称会漂 ID 不会)——
+    # 采集侧 category_id_chain 的最后一段 = 当前最细类目,与映射表的
+    # browse_node_id 列精确等值,不受三套名称不一致影响。无 ID 的老行
+    # (契约追加前入库)自动落到下面的字符串路径
+    if not pt and product.browse_node_id:
+        pt = ctx.node_map.get(product.browse_node_id)
+        if pt:
+            source, conf = "map_node", "高"
     path = (product.amazon_category_path or "").strip()
-    # 路径别名折叠(catmap_align):产品侧面包屑与映射表的中间层名可能漂移
-    # ('Home Décor Products' vs 'Home Décor'),精确等值会误判成缺口。
+    # ②b 路径别名折叠(catmap_align):产品侧面包屑与映射表的中间层名可能
+    # 漂移('Home Décor Products' vs 'Home Décor'),精确等值会误判成缺口。
     # 折叠只影响"查得到查不到",不改任何判定语义;别名表空则退化回精确匹配
     if path and path not in ctx.catmap and path not in ctx.unmapped_paths:
         path = ctx.path_alias.get(path, path)
@@ -391,4 +418,5 @@ def product_info_from_row(row: dict):
         seller_id=row.get("seller_id") or "",
         seller_name=row.get("seller_name") or "",
         known_pt=row.get("walmart_pt") or None,
+        browse_node_id=row.get("browse_node_id") or "",
     )

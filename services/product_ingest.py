@@ -41,9 +41,10 @@ ON CONFLICT (source_id) DO NOTHING
 _PRODUCT_SQL = """
 INSERT INTO catalog.products (
     marketplace, asin, title, brand, amazon_category, image_url, slow_hash,
-    slow, updated_at)
+    slow, browse_node_chain, browse_node_id, updated_at)
 VALUES (%(marketplace)s, %(asin)s, %(title)s, %(brand)s, %(amazon_category)s,
-        %(image_url)s, %(slow_hash)s, %(slow)s::jsonb, now())
+        %(image_url)s, %(slow_hash)s, %(slow)s::jsonb,
+        %(browse_node_chain)s, %(browse_node_id)s, now())
 ON CONFLICT (marketplace, asin) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, catalog.products.title),
     brand = COALESCE(EXCLUDED.brand, catalog.products.brand),
@@ -52,6 +53,11 @@ ON CONFLICT (marketplace, asin) DO UPDATE SET
     image_url = COALESCE(EXCLUDED.image_url, catalog.products.image_url),
     slow_hash = COALESCE(EXCLUDED.slow_hash, catalog.products.slow_hash),
     slow = COALESCE(EXCLUDED.slow, catalog.products.slow),
+    -- 类目 ID 链(契约 v1 追加):名称会漂 ID 不会,是 L1 最精确的类目锚
+    browse_node_chain = COALESCE(EXCLUDED.browse_node_chain,
+                                 catalog.products.browse_node_chain),
+    browse_node_id = COALESCE(EXCLUDED.browse_node_id,
+                              catalog.products.browse_node_id),
     -- 审核重审触发(批次 B1,批复 #9):慢变字段真变了才把 approved 翻回
     -- pending;rejected 永不自动重审(force_rerun 手动通道在 product_audit)。
     -- EXCLUDED.slow_hash 为 NULL(本次没采到 hash)不触发——上面 COALESCE
@@ -86,6 +92,31 @@ def _category(slow: dict) -> str | None:
     if isinstance(path, str):
         return path
     return " > ".join(str(p) for p in path if p)
+
+
+def category_nodes(slow: dict) -> tuple[str | None, str | None]:
+    """输入:slow → 输出:(browse_node 链原文, 叶子 node_id)。
+
+    所有者定稿 2026-08-14:**类目名会漂,browse_node_id 不会**——Amazon 的
+    URL slug / 面包屑 / Best Sellers 导航三套名称不一致,按路径字符串匹配
+    会把同一类目误判成缺口;ID 链的**最后一段 = 当前最细类目**,拿它直查
+    映射表的 browse_node_id 列即可精确命中(catmap_align 的字符串对齐降级
+    为无 ID 老行的兜底)。
+
+    契约 v1 纯追加字段(与 stock_count/delivery_days 同款先例,不升版本号):
+      slow.category_id_chain —— 逗号串 '2972638011,553788,14083111' 或
+      数组 [...];根→叶有序。缺失 → (None, None),行为退回字符串路径。
+    """
+    chain = _blank_to_none(slow.get("category_id_chain"))
+    if not chain:
+        return None, None
+    if isinstance(chain, (list, tuple)):
+        ids = [str(x).strip() for x in chain if str(x).strip()]
+    else:
+        ids = [x.strip() for x in str(chain).split(",") if x.strip()]
+    if not ids:
+        return None, None
+    return ",".join(ids), ids[-1]
 
 
 def _main_image(slow: dict) -> str | None:
@@ -160,12 +191,15 @@ def snapshot_params(rec: dict) -> dict:
 def product_params(rec: dict) -> dict:
     """输入:record → 输出:products 行参数(慢变字段,空值已归一为 None)。"""
     slow = rec.get("slow") or {}
+    chain, node_id = category_nodes(slow)
     return {
         "marketplace": rec.get("marketplace") or "US",
         "asin": rec.get("asin"),
         "title": _blank_to_none(slow.get("title")),
         "brand": _blank_to_none(slow.get("brand")),
         "amazon_category": _category(slow),
+        "browse_node_chain": chain,
+        "browse_node_id": node_id,
         "image_url": _main_image(slow),
         "slow_hash": _blank_to_none(rec.get("slow_hash")),
         # slow 段全量留存:卖点/描述/重量/尺寸/变体都在这里,契约的 raw 已裁剪

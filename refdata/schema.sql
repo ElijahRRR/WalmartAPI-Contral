@@ -1024,6 +1024,19 @@ CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(stat
 -- (2026-08-13 撤掉的那棵 Best Sellers 名称树正因只有名字才对不上)。
 -- 用途:①缺口工作面(树 3.2 万 node vs 映射 1.57 万,差集即未映射类目)
 -- ②规范名(人工复核/LLM 提示词用它,不用产品侧漂移面包屑)③祖先回退
+-- 迁移:2026-08-13 那版名称树(主键 path、有 parent_path 列)与本表结构
+-- 不兼容,且它**从未被填充过**(预览即撤,库内 0 行)——检出旧形态直接
+-- 丢弃重建。判据用 information_schema 精确到列,不误伤新表(生产实测:
+-- CREATE TABLE IF NOT EXISTS 遇旧表静默跳过,后面建索引才炸)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'audit' AND table_name = 'amazon_taxonomy'
+                 AND column_name = 'parent_path') THEN
+        DROP TABLE audit.amazon_taxonomy;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
     node_id         text PRIMARY KEY,
     name            text NOT NULL,     -- 类目名(路径末段)

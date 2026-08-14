@@ -185,7 +185,8 @@ CREATE TABLE catalog.amazon_cat_blacklist (
 -- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
 -- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清
 -- 2026-08-11)。历史重建走 blacklist_push -p rebuild_brand=1(擦净重灌 +
--- beyKyi 整表重写),日常由 problem_product_cleanup 尾段实时入账。
+-- beyKyi 整表重写),日常由 problem_scan 尾段实时入账
+-- (2026-08-14 批次 E:归类跟着决策搬到扫描件,黑名单收集是归类的副产品)。
 CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
     added_date, src_sku, src_store, biz_cn, pushed_at, created_at);
 -- 采集库缺品牌的候选走 brand_scrape 工作流补货(推采集→摄取→入账;
@@ -480,7 +481,7 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
 另收 **category='LEGACY'**(source='历史继承'):旧审核系统随迁的历史黑名单
 ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统一)。
-写入方 problem_product_cleanup 尾段 + asin_blacklist_import(一次性);
+写入方 problem_scan 尾段(2026-08-14 批次 E 前是 problem_product_cleanup) + asin_blacklist_import(一次性);
 消费方:上架拦截 + 审核 Phase0 ASIN 闸(全表,不分类别)。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)

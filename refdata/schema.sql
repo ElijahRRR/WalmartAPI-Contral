@@ -910,6 +910,49 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
     PRIMARY KEY (scope, key)
 );
 
+-- ── 处置建议(批次 E,批复 #8:问题商品链"建议"与"执行"分离)────────────
+-- 为什么要这张表:原来 problem_product_cleanup 一个工作流里既做"查库归类决定
+-- 该怎么处置",又做"发 feed 真删真补"。两件事的风险等级差着数量级——前者只读
+-- 可以随便跑,后者 DELETE_ITEM 不可逆。合在一起的后果是:想看看该删哪些,就得
+-- 跑一个 DANGEROUS 工作流;而建议本身没有留痕,事后无从追"当初为什么删它"。
+--
+-- 拆开后:problem_scan(只读,随时可跑)产出 suggested 行;
+--         problem_product_cleanup(危险,--execute)只消费 suggested,不自己决策。
+--
+-- 状态机 suggested → executing → confirmed / ineffective:
+--   suggested    扫描件给出的建议,还没动手
+--   executing    执行件已提交 feed(feed_id 落在本行),等观测
+--   confirmed    观测确认生效(delete_verified / 反补后重新 PUBLISHED)
+--   ineffective  观测确认**没**生效(delete_not_effective:回执说成了但商品还在架
+--                ——所有者实证过的真实故障模式),下轮重新建议
+-- 生效判定**不自己实现**:直接读 catalog.product_events 里 catalog_sync 经
+-- services/product_events.verify_deletions 落的 delete_verified /
+-- delete_not_effective ——"不信回执信观测"那套已经在跑,再写一份只会两份漂移。
+CREATE TABLE IF NOT EXISTS ops.dispositions (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store        text NOT NULL,
+    sku          text NOT NULL,
+    asin         text,                  -- 有则记,便于与产品中心/黑名单对齐
+    source       text NOT NULL,         -- scan / audit / tro(预留)
+    action       text NOT NULL,         -- relist / delete / retire
+    category     text,                  -- services/problem_products 归类码
+    reason       text,                  -- 依据(人读:沃尔玛给的 unpublished_reasons 等)
+    status       text NOT NULL DEFAULT 'suggested',
+    feed_id      text,                  -- executing 起有值
+    suggested_at timestamptz NOT NULL DEFAULT now(),
+    executed_at  timestamptz,
+    settled_at   timestamptz,
+    detail       jsonb NOT NULL DEFAULT '{}'
+);
+-- 同一 (店铺,SKU,动作) **同时只能有一条未落定的建议**:扫描件每轮重跑要幂等,
+-- 不能每跑一次就堆一行;而已落定(confirmed/ineffective)的行是病历,必须留着,
+-- 所以用**部分**唯一索引只约束未落定态。
+CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
+    ON ops.dispositions (store, sku, action)
+    WHERE status IN ('suggested', 'executing');
+CREATE INDEX IF NOT EXISTS dispositions_status_idx
+    ON ops.dispositions (status, suggested_at);
+
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──
 -- 与旧仓的有意差异:① audit_runs 去掉对 products(asin) 的外键——本仓身份表

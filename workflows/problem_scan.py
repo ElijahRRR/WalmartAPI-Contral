@@ -1,0 +1,332 @@
+"""problem_scan — 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。
+
+用法:
+  python cli.py problem_scan                  # 扫描 + 落建议行(可随时跑)
+  python cli.py problem_scan -p store=A085朱丽霖
+  python cli.py problem_scan -p preview=1     # 只打印不落建议行
+
+本工作流是问题商品链拆分后的**建议半边**。原来 problem_product_cleanup 一个
+文件里既做"查库归类决定该怎么处置",又做"发 feed 真删真补"。两件事的风险等级
+差着数量级:前者纯只读、随时可跑;后者 DELETE_ITEM 不可逆。合在一起的后果是
+想看看该删哪些就得跑一个 DANGEROUS 工作流,而且建议本身不留痕,事后无从追
+"当初为什么删它"。
+
+拆开后:
+  problem_scan(本文件,DANGEROUS=False)  查库 → 归类 → 写事件 + 落建议行
+  problem_product_cleanup(DANGEROUS=True) 只消费建议行,自己不做任何决策
+
+两个来源(source 列):
+  scan   catalog.walmart_items 里 UNPUBLISHED/SYSTEM_PROBLEM 且未缺席的行
+         —— 归类规则逐字沿用 services/problem_products,一个字没改
+  audit  审核链判 reject 但**还在架**的产品 —— 审核说不该卖、沃尔玛后台还挂着,
+         这个缺口原来没有任何工作流盯着(批复 #8 要求补上)
+
+⚠ **只建议,不动状态、不发 feed。** 本工作流写库的只有两处:产品事件(归类)
+与 ops.dispositions 建议行,都是可重跑的幂等写。
+
+去重口径全部沿用原实现(逐字迁移,注释一并搬来——它们记的是生产事故的教训):
+  ① 在途/待观测:feed_items 有 submitted 未落定(滚动 48h 封顶),或已落定
+     success 但 catalog_sync 尚未重新观测 → 不建议
+  ② 反补计数:product_events 的 maintenance_submitted 30 天窗口计数
+  ③ 归类事件:同 (店铺,SKU) 类别未变不重复记
+注:①在这里是**预筛**,不是最终闸门——真正的在途防重在 api/feeds.submit_feed
+的 ops.feed_log 里(提交时判,返回 outcome=dedup)。预筛只是省得把注定被拦下的
+行也建成建议。
+
+店铺闸:ops.store_kpi_daily 最新 store_status 非 ACTIVE 的店整体跳过。
+
+调度顺序:catalog_sync → problem_scan → problem_product_cleanup --execute。
+"""
+
+import logging
+
+from registry import db
+from services import blacklist, dispositions
+from services import problem_products as pp
+from services import product_events
+
+DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
+
+logger = logging.getLogger("workflows.problem_scan")
+
+_SQL_ITEMS = """
+SELECT store, sku, gtin, upc, unpublished_reasons
+FROM catalog.walmart_items
+WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
+  AND missing_since IS NULL
+"""
+# 防重口径(所有者拍板 2026-08-11,替代旧系统的"同一自然日"——那是一天
+# 跑 4 次的产物,现按日执行):
+# ① submitted 无终态 → 拦,但**滚动 48h 封顶**:超 48h 还没终态,这个 feed
+#    大概率丢了(feed_poll 的 pending 告警早该响了),继续拦等于让该商品
+#    永久漏删。48h 内照拦——feed 还在沃尔玛队列里,叠发 = 重复提交制造机。
+# ② success 且 resolved_at > last_seen_at(待观测)→ 拦到 catalog_sync 重扫
+#    为止;重扫后商品**还在**问题清单里 = 沃尔玛说删成了实际没删掉 ⇒
+#    本条不再命中,直接重发,不等 48h(所有者原话:"有终态但又扫到了,
+#    说明提交成功、给了结果、事实上没操作成功,直接再次执行")。
+# ③ failed 不拦(该重试)。
+_SQL_INFLIGHT = """
+SELECT DISTINCT f.store, f.sku
+FROM ops.feed_items f
+JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
+WHERE (f.status = 'submitted'
+       AND f.submitted_at > now() - interval '48 hours')
+   OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
+"""
+# 事件名一律绑参传常量,不写字面量:读侧拼错 = 静默查空(计数恒 0,
+# "反补满 2 次转删"永不触发),和写侧拼错是同一类病,但更难发现。
+_SQL_ATTEMPTS = """
+SELECT store, sku, count(*) FROM catalog.product_events
+WHERE event = %s
+  AND source = ANY(%s)
+  AND occurred_at > now() - make_interval(days => %s)
+GROUP BY store, sku
+"""
+# source 过滤(2026-08-07):MP_MAINTENANCE 是通用部分更新 feed,未来
+# maintenance 工作流的标题/到期日期操作若记事件,不得污染反补转删计数。
+# ⚠ 批次 E 拆分后这里必须**同时认两个 source**:历史事件的 source 是
+# 'problem_product_cleanup'(拆分前),拆分后执行件仍用同一个 source 写事件
+# ——但万一将来改名,漏掉旧值会让 30 天窗口内的历史反补次数归零,
+# "反补满 2 次转删"重新从 0 数起,商品被无限反补。
+_ATTEMPT_SOURCES = ["problem_product_cleanup", "problem_scan"]
+
+_SQL_LAST_CAT = """
+SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
+FROM catalog.product_events WHERE event = %s
+ORDER BY store, sku, occurred_at DESC
+"""
+_SQL_STUBBORN = """
+SELECT DISTINCT ON (store, sku) store, sku, event
+FROM catalog.product_events
+WHERE event IN ('delete_verified', 'delete_not_effective',
+                'item_appeared', 'item_reappeared')
+ORDER BY store, sku, occurred_at DESC
+"""
+# 顽固标记绑定当前上架代际(2026-08-07 审查修正):最新事件若是
+# item_appeared/item_reappeared,说明商品经历了消失→重上架,旧的
+# delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
+# (否则重上架的同 ASIN 首次出问题就被双 feed 直删,跳过反补机会)。
+_SQL_STATUS = """
+SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
+ORDER BY store, data_date DESC
+"""
+
+# 审核判拒但还在架(批复 #8 要的第二个来源)。审核链说这个产品不该卖、
+# 沃尔玛后台却还挂着 —— 拆分前没有任何工作流盯着这个缺口。
+# 只取有实打实结论的:audit_status='rejected';在架 = 未缺席。
+# ⚠ 不看 published_status:审核拒的产品**正常在架**(PUBLISHED)才是最该
+# 下架的那批,恰恰不会出现在问题商品清单里。
+_SQL_AUDIT_REJECTED = """
+SELECT w.store, w.sku, p.asin, p.audit_reason
+FROM catalog.walmart_items w
+JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
+WHERE p.audit_status = 'rejected' AND w.missing_since IS NULL
+"""
+
+
+def _load_state():
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_ITEMS)
+        items = [dict(zip(("store", "sku", "gtin", "upc", "reasons"), r))
+                 for r in cur.fetchall()]
+        cur.execute(_SQL_INFLIGHT)
+        inflight = set(cur.fetchall())
+        cur.execute(_SQL_ATTEMPTS, (product_events.MAINTENANCE_SUBMITTED,
+                                    _ATTEMPT_SOURCES, pp.ATTEMPT_RESET_DAYS))
+        attempts = {(s, k): n for s, k, n in cur.fetchall()}
+        cur.execute(_SQL_LAST_CAT, (product_events.PROBLEM_CATEGORIZED,))
+        last_cat = {(s, k): c for s, k, c in cur.fetchall()}
+        cur.execute(_SQL_STUBBORN)
+        stubborn = {(st, k) for st, k, ev in cur.fetchall()
+                    if ev == 'delete_not_effective'}
+        cur.execute(_SQL_STATUS)
+        inactive = {s for s, st in cur.fetchall()
+                    if st and st.upper() != "ACTIVE"}
+    return items, inflight, attempts, last_cat, inactive, stubborn
+
+
+def plan(items, inflight, attempts, inactive, stubborn=frozenset()):
+    """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
+
+    计划形如 {店铺: {"relist": [item行], "delete": [item行], "retire": [...]}}
+    每行附 category/cat_name。**逐字迁自 problem_product_cleanup(批次 E 拆分)**
+    ——行为一个字没改,只是换了个住处:决策归扫描件,执行件不再自己决策。
+    """
+    out: dict[str, dict] = {}
+    n = {"stage": 0, "inflight": 0, "inactive": 0,
+         "relist": 0, "delete": 0, "fallback": 0, "stubborn": 0}
+    for it in items:
+        key = (it["store"], it["sku"])
+        if it["store"] in inactive:
+            n["inactive"] += 1
+            continue
+        if pp.is_stage_pending(it["reasons"]):
+            n["stage"] += 1
+            continue
+        if key in inflight:
+            n["inflight"] += 1
+            continue
+        code, name = pp.categorize(it["reasons"])
+        it["category"], it["cat_name"] = code, name
+        bucket = out.setdefault(it["store"],
+                                {"relist": [], "delete": [], "retire": []})
+        if key in stubborn:
+            # 删除未生效的顽固 SKU(所有者定稿):
+            # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
+            bucket["retire"].append(it)
+            bucket["delete"].append(it)
+            n["stubborn"] += 1
+            continue
+        if code == "A":
+            if attempts.get(key, 0) >= pp.MAX_ATTEMPTS:
+                n["fallback"] += 1          # 反补满 2 次仍过期 → 转删除兜底
+            elif pp.build_relist_item(it["sku"], it["gtin"], it["upc"]):
+                bucket["relist"].append(it)
+                n["relist"] += 1
+                continue
+            # A 类无 productId 同样落到删除(旧规则)
+        bucket["delete"].append(it)
+        n["delete"] += 1
+    return out, n
+
+
+def to_dispositions(plans: dict) -> list[dict]:
+    """输入:plan() 的计划 dict → 输出:建议行列表。纯函数,可测。
+
+    一个 (店铺,SKU) 可能同时进 retire 与 delete 桶(顽固双击),那是**两条**
+    建议行——它们是两个 feed、两次独立的生效判定,合成一行会让其中一个的
+    落定结果覆盖另一个。
+    """
+    rows = []
+    for store, b in sorted(plans.items()):
+        for action in ("relist", "delete", "retire"):
+            for it in b.get(action, []):
+                rows.append({
+                    "store": store, "sku": it["sku"], "source": "scan",
+                    "action": action, "category": it.get("category"),
+                    "reason": it.get("reasons") or "",
+                    "detail": {"cat_name": it.get("cat_name"),
+                               "gtin": it.get("gtin"), "upc": it.get("upc")},
+                })
+    return rows
+
+
+def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
+    """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
+    fresh = [it for it in items if "category" in it
+             and last_cat.get((it["store"], it["sku"])) != it["category"]]
+    product_events.record_many(conn, [
+        {"sku": it["sku"], "store": it["store"],
+         "event": product_events.PROBLEM_CATEGORIZED,
+         "source": "problem_scan",
+         "detail": {"category": it["category"], "name": it["cat_name"],
+                    "reason": (it["reasons"] or "")[:200]}}
+        for it in fresh])
+    return len(fresh)
+
+
+def _collect_blacklists(conn, items: list[dict]) -> str:
+    """输入:当轮已归类 item → 输出:黑名单收集摘要(一行)。
+
+    归因收集尾段(plan.md「品牌限制/侵权类问题产品 → 品牌黑名单」的落地):
+    当轮 B/C/E/F/G/K 入 ASIN 黑名单,C/E 的品牌从 catalog.products.brand 取、
+    按品牌去重入 brand_blacklist。
+    **任何失败只告警不阻断**——黑名单是扫描的副产品,收集炸了不该把建议
+    产出拖下水;漏一轮下一轮照样补(入选条件不变)。
+    飞书投影由 blacklist_push 按 pushed_at 水位另推,这里只写 PG。
+    """
+    cand = [it for it in items if "category" in it]
+    if not cand:
+        return ""
+    try:
+        asin_new = blacklist.record_asins(conn, cand)
+        st = blacklist.collect_brands(conn, cand)
+    except Exception as e:                              # noqa: BLE001
+        logger.error("黑名单收集失败(建议产出不受影响,下轮重收): %s", e)
+        return f"黑名单收集失败:{e}"
+    bits = [f"ASIN 黑名单 +{asin_new}", f"品牌 +{st['brand_new']}"]
+    if st["brand_known"]:
+        bits.append(f"品牌已知 {st['brand_known']}")
+    if st["no_brand"]:
+        # 不是错误:产品中心还没这些 ASIN 的品牌,标已处理才是错(永远漏)
+        bits.append(f"待品牌 {st['no_brand']}(产品中心缺 brand,下轮重试)")
+    if st["skipped"]:
+        bits.append(f"已处理跳过 {st['skipped']}")
+    return "黑名单收集:" + ",".join(bits)
+
+
+def _audit_rejected_rows(conn, inflight: set, inactive: set,
+                         only: str | None) -> list[dict]:
+    """输入:连接 + 去重状态 → 输出:审核判拒但仍在架的建议行。
+
+    与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
+    ——审核已经给出结论了,这里不需要再猜沃尔玛为什么不高兴。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_AUDIT_REJECTED)
+        rows = cur.fetchall()
+    out = []
+    for store, sku, asin, reason in rows:
+        if only and store != only:
+            continue
+        if store in inactive or (store, sku) in inflight:
+            continue
+        out.append({
+            "store": store, "sku": sku, "asin": asin, "source": "audit",
+            "action": "delete", "category": None,
+            "reason": f"审核判拒仍在架:{reason or '(理由未留存)'}",
+            "detail": {"audit_reason": reason},
+        })
+    return out
+
+
+def run(params: dict) -> str:
+    """输入:params(store/preview)→ 输出:归类统计 + 建议行落账摘要。"""
+    preview = str(params.get("preview", "")).strip() == "1"
+    only = params.get("store")
+    items, inflight, attempts, last_cat, inactive, stubborn = _load_state()
+    if only:
+        items = [i for i in items if i["store"] == only]
+
+    plans, n = plan(items, inflight, attempts, inactive, stubborn)
+    rows = to_dispositions(plans)
+    lines = [
+        f"problem_scan:问题商品 {len(items)} 行 → 建议 反补 {n['relist']},"
+        f"删除 {n['delete']}(含反补满额转删 {n['fallback']}),"
+        f"Stage 排除 {n['stage']},在途/待观测跳过 {n['inflight']},"
+        f"非 ACTIVE 店跳过 {n['inactive']},顽固双击 {n['stubborn']}"]
+    for store, b in sorted(plans.items()):
+        if not (b["relist"] or b["delete"] or b["retire"]):
+            continue
+        cats: dict[str, int] = {}
+        for r in b["delete"] + b["relist"]:
+            cats[r["category"]] = cats.get(r["category"], 0) + 1
+        line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
+                + (f",顽固双击 {len(b['retire'])}" if b["retire"] else "")
+                + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
+                + "}")
+        if b["delete"]:
+            line += f",删除样本={[(r['sku'], r['category']) for r in b['delete'][:5]]}"
+        if b["relist"]:
+            line += f",反补样本={[(r['sku'], r['category']) for r in b['relist'][:3]]}"
+        lines.append(line)
+
+    with db.pg_conn() as conn:
+        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        if audit_rows:
+            lines.append(
+                f"审核判拒但仍在架 {len(audit_rows)} 个 SKU → 建议删除"
+                f"(样本={[r['sku'] for r in audit_rows[:5]]})")
+        if preview:
+            lines.append(f"(preview:未落建议行;本轮将写 {len(rows) + len(audit_rows)} 条)")
+            return "\n".join(lines)
+        n_cat = _record_categories(conn, items, last_cat)
+        bl_note = _collect_blacklists(conn, items)
+        n_sug = dispositions.suggest_many(conn, rows + audit_rows)
+    lines.append(f"建议行落账 {n_sug} 条(ops.dispositions,status=suggested);"
+                 f"归类事件新记 {n_cat} 条")
+    if bl_note:
+        lines.append(bl_note)
+    lines.append("执行走 `python cli.py problem_product_cleanup --execute`"
+                 "(本工作流不发任何 feed)")
+    return "\n".join(lines)

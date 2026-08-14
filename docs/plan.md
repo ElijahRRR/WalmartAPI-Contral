@@ -37,7 +37,8 @@
 | perf_problems | ✅ 明细已映射飞书(运营在用) | 挂独立调度 |
 | maintenance | 🟡 三 provider 实跑过;**清零链路未生产验证** | 清零验证(需 FEISHU_LIMITS_* env);涨跌幅闸暂不做;挂调度 |
 | product_clear | ✅ 2026-08-07 | RETIRE_ITEM 动作实测;切旧 15:00 cron;挂调度 |
-| problem_product_cleanup | ✅ 2026-08-07(21 店真跑) | 停旧每 6h cron;挂调度 |
+| problem_scan | ✅ 2026-08-14(批次 E 拆出) | 只读定性,产 ops.dispositions 建议行 |
+| problem_product_cleanup | ✅ 2026-08-07(21 店真跑) | 停旧每 6h cron;挂调度。⚠ 批次 E 后改为**纯执行件**:只消费建议行,自己不做决策 |
 | catalog_sync | ✅ 47 店全量 | 每日并跑对拍;挂调度 |
 | product_ingest / product_refresh | ✅ 生产实跑(2026-08-13 所有者确认) | VPS 后配 EXPORT_TOKEN;挂调度 |
 | settlement_sync | ✅ 首跑 | 挂调度(双周账期) |

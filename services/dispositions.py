@@ -1,0 +1,173 @@
+"""处置建议台账(ops.dispositions)的读写积木 —— 批次 E 的"建议/执行"分界面。
+
+problem_scan(只读,产建议)与 problem_product_cleanup(危险,消费建议)两个
+工作流共用本模块。**必须落在 services**:铁律 1 规定任何层不准 import
+workflows,两个工作流之间不能互相取用。
+
+状态机(与 refdata/schema.sql 的 ops.dispositions 头注一致):
+    suggested → executing → confirmed / ineffective
+
+四个函数各管一段,谁也不越界:
+    suggest_many()   扫描件写建议(幂等:同 (店铺,SKU,动作) 已有未落定行则刷新)
+    claim()          执行件领取待执行建议(只读,不改状态——提交成功才改)
+    mark_executing() 提交成功后落 feed_id 并转 executing
+    settle()         按观测事件把 executing 判成 confirmed / ineffective
+
+⚠ **生效判定不在本模块实现**。settle() 读的是 catalog.product_events 里
+catalog_sync 经 services/product_events.verify_deletions 落的
+delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 48h
+宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
+真相。本模块只做"把已有判决登记到建议行上"。
+"""
+
+import logging
+
+logger = logging.getLogger("services.dispositions")
+
+# 动作取值(与 problem_product_cleanup 的三桶一一对应)
+ACTIONS = ("relist", "delete", "retire")
+# 来源(tro 是预留:侵权投诉链将来也走同一张建议表)
+SOURCES = ("scan", "audit", "tro")
+OPEN_STATUSES = ("suggested", "executing")
+
+# 幂等写:同 (店铺,SKU,动作) 已有未落定行 → 刷新依据与时间,不新增
+# (扫描件按调度反复跑,每轮堆一行会让建议表变成流水账)。
+# ⚠ 只更新 suggested 行:**executing 行绝不能被覆盖**——它已经提交了 feed,
+# 把它的 suggested_at 刷新会让"等观测多久了"失真,更严重的是若同轮把
+# feed_id 洗掉,这条提交就永远等不到落定判决了。
+_UPSERT_SQL = """
+INSERT INTO ops.dispositions
+    (store, sku, asin, source, action, category, reason, detail)
+VALUES (%(store)s, %(sku)s, %(asin)s, %(source)s, %(action)s,
+        %(category)s, %(reason)s, %(detail)s::jsonb)
+ON CONFLICT (store, sku, action) WHERE status IN ('suggested', 'executing')
+DO UPDATE SET category = EXCLUDED.category,
+              reason = EXCLUDED.reason,
+              asin = COALESCE(EXCLUDED.asin, ops.dispositions.asin),
+              detail = EXCLUDED.detail,
+              suggested_at = now()
+WHERE ops.dispositions.status = 'suggested'
+"""
+
+_CLAIM_SQL = """
+SELECT id, store, sku, asin, action, category, reason, detail
+FROM ops.dispositions
+WHERE status = 'suggested'
+ORDER BY store, action, suggested_at
+"""
+
+_MARK_SQL = """
+UPDATE ops.dispositions
+SET status = 'executing', feed_id = %(feed_id)s, executed_at = now()
+WHERE id = ANY(%(ids)s) AND status = 'suggested'
+"""
+
+# 观测判决登记:executing 行 × 提交之后落的核验事件。
+# gone 侧(delete_verified)= 生效;still 侧(delete_not_effective)= 没生效。
+# 反补(relist)的生效信号不同:商品重新 PUBLISHED —— 直接看 walmart_items
+# 现状,不看事件(反补没有对应的核验事件流)。
+_SETTLE_DELETE_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE WHEN e.event = 'delete_verified'
+                  THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object('settled_by', e.event)
+FROM (
+    SELECT DISTINCT ON (store, sku) store, sku, event, occurred_at
+    FROM catalog.product_events
+    WHERE event IN ('delete_verified', 'delete_not_effective')
+    ORDER BY store, sku, occurred_at DESC
+) e
+WHERE d.status = 'executing' AND d.action IN ('delete', 'retire')
+  AND d.store = e.store AND d.sku = e.sku
+  AND e.occurred_at > d.executed_at
+RETURNING d.status
+"""
+
+# 反补生效 = 该 SKU 已不在问题清单里(published_status 回到正常或已缺席);
+# 仍在问题清单 = 没生效。**必须等 catalog_sync 重新观测过**
+# (last_seen_at > executed_at),否则拿提交前的旧快照判,永远判成"没生效"。
+_SETTLE_RELIST_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE
+        WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
+             OR w.published_status NOT IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
+        THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object(
+        'settled_by', coalesce(w.published_status, 'absent'))
+FROM catalog.walmart_items w
+WHERE d.status = 'executing' AND d.action = 'relist'
+  AND w.store = d.store AND w.sku = d.sku
+  AND w.last_seen_at > d.executed_at
+RETURNING d.status
+"""
+
+
+def suggest_many(conn, rows: list[dict]) -> int:
+    """输入:连接 + 建议行(store/sku/action 必填)→ 输出:写入行数。幂等。
+
+    detail 传 dict,本函数负责序列化;asin/category/reason 可缺省。
+    非法 action/source 直接抛 —— 拼错一个字符串会静默落一批永远没人领的
+    建议行(执行件按 action 分桶,不认识的桶不会被消费),宁炸不吞。
+    """
+    import json
+    if not rows:
+        return 0
+    payload = []
+    for r in rows:
+        if r["action"] not in ACTIONS:
+            raise ValueError(f"未知 action={r['action']!r}(可用:{ACTIONS})")
+        src = r.get("source", "scan")
+        if src not in SOURCES:
+            raise ValueError(f"未知 source={src!r}(可用:{SOURCES})")
+        payload.append({
+            "store": r["store"], "sku": r["sku"], "asin": r.get("asin"),
+            "source": src, "action": r["action"],
+            "category": r.get("category"), "reason": (r.get("reason") or "")[:500],
+            "detail": json.dumps(r.get("detail") or {}, ensure_ascii=False),
+        })
+    with conn.cursor() as cur:
+        cur.executemany(_UPSERT_SQL, payload)
+    return len(payload)
+
+
+def claim(conn) -> list[dict]:
+    """输入:连接 → 输出:全部 suggested 建议行(dict 列表)。**只读,不改状态**。
+
+    领取与转态分开是有意的:提交 feed 可能失败、可能被在途防重拦下,只有
+    真提交成功(拿到 feed_id)才该转 executing。先转态再提交 = 提交失败的行
+    卡在 executing 永远等不到判决,而下轮扫描因部分唯一索引还建不出新建议。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_CLAIM_SQL)
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def mark_executing(conn, ids: list[int], feed_id) -> int:
+    """输入:连接 + 建议行 id 列表 + feed_id → 输出:转态行数。"""
+    if not ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(_MARK_SQL, {"ids": list(ids), "feed_id": str(feed_id or "")})
+        return cur.rowcount
+
+
+def settle(conn) -> dict:
+    """输入:连接 → 输出:{confirmed: n, ineffective: n}(本轮落定的建议行)。
+
+    只登记**已有**的观测判决,不自己判生效(见模块头注)。还没等到
+    catalog_sync 重新观测的行保持 executing,不落判 —— 与
+    product_events.verify_deletions 的 'wait' 语义对齐。
+    """
+    out = {"confirmed": 0, "ineffective": 0}
+    with conn.cursor() as cur:
+        for sql in (_SETTLE_DELETE_SQL, _SETTLE_RELIST_SQL):
+            cur.execute(sql)
+            for (st,) in cur.fetchall():
+                out[st] = out.get(st, 0) + 1
+    if out["ineffective"]:
+        logger.warning("处置建议落定:%d 条**未生效**(回执成功但观测显示没动)"
+                       "——下轮扫描会重新建议", out["ineffective"])
+    return out

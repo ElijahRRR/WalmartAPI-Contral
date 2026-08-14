@@ -486,14 +486,35 @@ def test_pt_dict_words_take_leaf_then_title():
     assert "Seat" in l1._dict_words(p)
 
 
+def test_dict_words_reach_above_the_leaf():
+    """只取叶子会漏掉最有用的词(生产实测 2026-08-14):
+    `... > Cookware > Pots` 的叶子是 Pots,而 PT 字典里那条叫 `Cookware Sets`
+    ——不取上一段就永远搜不到它。叶子仍排在前(近的更具体)。"""
+    p = _product(title="3-Piece Hard Anodized 5-Quart Saute Pan Set",
+                 amazon_category_path=
+                 "Home & Kitchen > Kitchen & Dining > Cookware > Pots")
+    words = l1._dict_words(p)
+    assert "Cookware" in words
+    assert words.index("Pots") < words.index("Cookware")   # 叶子优先占名额
+    # Amazon 一级大类不取:`Home`/`Kitchen` 泛到能命中上百个 PT,只会摊平信号
+    assert "Home" not in words
+
+
+def test_dict_words_single_segment_path_still_works():
+    """路径只有一段时不能因为"跳过第一段"而取空。"""
+    p = _product(title="w", amazon_category_path="Cookware")
+    assert l1._dict_words(p) == ["Cookware"]
+
+
 def test_open_candidates_two_stage():
     """七路全空时的兜底:先让 LLM 选大类,再把该大类全部 PT 当候选。"""
     cur = FakeCursor({
         "SELECT DISTINCT walmart_category": (["walmart_category"],
                                              [("Home",), ("Garden",)]),
         "walmart_category = ANY": (
-            ["walmart_product_type", "walmart_category", "walmart_ptg"],
-            [("PTa", "Home", "G1"), ("PTb", "Home", "G2")]),
+            ["walmart_product_type", "walmart_category", "walmart_ptg",
+             "score"],
+            [("PTa", "Home", "G1", 2), ("PTb", "Home", "G2", 0)]),
     })
     out = l1.open_candidates(FakeConn(cur), _product(title="w"),
                              chat_fn=lambda m: {"categories": ["Home"]})
@@ -525,6 +546,41 @@ def test_picked_route_attribution():
     l1.rerank(_product(title="w"), cands, {"AncPT", "OtherPT"},
               chat_fn=lambda m: {"walmart_product_type": "OtherPT"})
     assert l1.STATS["picked_off_candidates"] == 1
+
+
+def test_open_stage2_orders_by_relevance_not_alphabet():
+    """⚠ 生产 bug 的锁(2026-08-14):二阶段原按 PT 名字母序取,而提示词只喂
+    前 20 条 ⇒ Home 大类 891 个 PT 只有 A 开头的能进提示词,`Cookware Sets`
+    这种 C 开头的永远见不到 LLM(那批"LLM 说都不合适"其实是没给它看)。
+    钉三件:按相关度评分排序、把产品的词传进去当评分依据、条数与提示词截断对齐。
+    """
+    cur = FakeCursor({
+        "SELECT DISTINCT walmart_category": (["walmart_category"],
+                                             [("Home",)]),
+        "walmart_category = ANY": (
+            ["walmart_product_type", "walmart_category", "walmart_ptg",
+             "score"], [("Cookware Sets", "Home", "Kitchen", 2)]),
+    })
+    p = _product(title="3-Piece Saute Pan Set",
+                 amazon_category_path="Home & Kitchen > Cookware > Pots")
+    l1.reset_stats()
+    out = l1.open_candidates(FakeConn(cur), p,
+                             chat_fn=lambda m: {"categories": ["Home"]})
+    sql, params = cur.executed[-1]
+    assert "ORDER BY score DESC" in sql            # 不是字母序
+    assert "%Cookware%" in params["pats"]          # 产品的词真的用上了
+    assert params["limit"] == l1._PROMPT_CAND_CUT  # 取的条数 = 提示词吃的条数
+    assert out[0]["walmart_product_type"] == "Cookware Sets"
+    assert l1.STATS["open_stage2_scored"] == 1     # 有词命中 = 选出来的不是碰上的
+
+
+def test_prompt_cut_is_the_same_constant_open_stage2_fetches():
+    """两个数字必须同源:取多了白查,取少了白白缩窄候选面。"""
+    cands = [{"walmart_product_type": f"PT{i}", "confidence": "高"}
+             for i in range(l1._PROMPT_CAND_CUT + 5)]
+    txt = l1.build_user_prompt(_product(title="w"), cands)
+    assert f"{l1._PROMPT_CAND_CUT}. PT{l1._PROMPT_CAND_CUT - 1}" in txt
+    assert f"PT{l1._PROMPT_CAND_CUT}" not in txt
 
 
 def test_open_stage1_puts_mega_list_in_system_for_cache():

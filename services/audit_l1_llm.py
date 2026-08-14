@@ -58,7 +58,7 @@ _STATS_KEYS = (
     "publication_forbidden", "conf_low",
     # 两阶段开放判定(七路候选全空时;所有者定稿 2026-08-14)
     "open_stage1_called", "open_stage1_failed", "open_stage1_empty",
-    "open_stage2_candidates",
+    "open_stage2_candidates", "open_stage2_scored",
     # 候选都不合适时的二次机会(所有者定稿 2026-08-14:"真的都不合适,那也不行")
     "unknown_retry_called", "unknown_retry_saved",
     "seed_excluded_direct",   # 接线层:①②直出级 seed 命中(与 rerank 级分开)
@@ -412,9 +412,30 @@ ORDER BY score DESC, length(walmart_product_type)
 LIMIT %(limit)s
 """
 
+# 两阶段开放判定的第二阶段:在 LLM 选中的大类里按**与本产品的相关度**排序。
+# ⚠ 这里必须排序不能裸取(2026-08-14 生产 bug):原实现 ORDER BY 名字母序,
+# 而提示词只喂前 _PROMPT_CAND_CUT 条 ⇒ Home 大类 891 个 PT 只有 A 开头的
+# 20 个能进提示词,`Cookware Sets` 这种 C 开头的永远见不到 LLM。评分口径与
+# 第七路同款(PT 名命中 ×2,PTG 名命中 ×1),但**不加 WHERE 过滤**:一个词
+# 都不命中的 PT 也要留在候选里(大类已经由 LLM 选定,这是兜底面不是搜索面)
+_OPEN_SCORE_SQL = """
+SELECT walmart_product_type, walmart_category, walmart_ptg,
+       (SELECT count(*) FROM unnest(%(pats)s::text[]) AS w
+         WHERE walmart_product_type ILIKE w) * 2
+     + (SELECT count(*) FROM unnest(%(pats)s::text[]) AS w
+         WHERE coalesce(walmart_ptg, '') ILIKE w) AS score
+FROM audit.walmart_pt_meta
+WHERE walmart_category = ANY(%(cats)s)
+ORDER BY score DESC, length(walmart_product_type), walmart_product_type
+LIMIT %(limit)s
+"""
+
 _MAX_UP = 6          # 上溯层数上限(纯防环/防深链,不是语义门槛)
 _ANCESTOR_LIMIT = 6
 _PT_DICT_LIMIT = 10
+# 提示词实际喂给 LLM 的候选条数上限。**开放判定取多少必须与它一致**——
+# 取多了是白查(超出部分构建提示词时就被切掉),取少了是白白缩窄候选面
+_PROMPT_CAND_CUT = 20
 
 
 def _fetch_ancestor(cur, product: ProductInfo) -> list[dict[str, Any]]:
@@ -432,14 +453,29 @@ def _fetch_ancestor(cur, product: ProductInfo) -> list[dict[str, Any]]:
 
 
 def _dict_words(product: ProductInfo) -> list[str]:
-    """输入:产品 → 输出:搜 PT 字典用的词(叶子类目名的词 + 标题关键词)。"""
+    """输入:产品 → 输出:搜 PT 字典用的词(类目路径中下段的词 + 标题关键词)。
+
+    **不只取叶子**(2026-08-14 修):`Home & Kitchen > Kitchen & Dining >
+    Cookware > Pots` 的叶子是 `Pots`,而 PT 字典里那条叫 `Cookware Sets`
+    ——最有用的词恰好在倒数第二段,只取叶子就永远搜不到它。
+    从叶子往回走,近的先占名额(叶子最具体);**第一段(Amazon 一级大类)
+    不取**:`Home & Kitchen` / `Tools & Home Improvement` 这类词泛到能命中
+    上百个 PT,进了评分只会把信号摊平。
+    """
     path = (product.amazon_category_path or "").strip()
-    leaf = path.split(">")[-1].strip() if path else ""
-    words = [w.strip(" ,&/()") for w in leaf.split()]
-    out = [w for w in words if len(w) >= 4 and w.lower() not in _STOP]
+    segs = [s.strip() for s in path.split(">")] if path else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for seg in reversed(segs[1:] if len(segs) > 1 else segs):
+        for w in seg.split():
+            w = w.strip(" ,&/()")
+            if len(w) >= 4 and w.lower() not in _STOP and w.lower() not in seen:
+                out.append(w)
+                seen.add(w.lower())
     for kw in _title_keywords(product.title or ""):
-        if kw.lower() not in {w.lower() for w in out}:
+        if kw.lower() not in seen:
             out.append(kw)
+            seen.add(kw.lower())
     return out[:8]
 
 
@@ -470,7 +506,11 @@ def candidates(conn, product: ProductInfo, *, limit: int = _KW_LIMIT) -> list[di
          依赖映射表有这个类目,映射表没有 ⇒ 候选池空 ⇒ LLM 连挑的机会都没有
          (所有者指出:"没有直接拿到映射类目的,其实都是拿候选然后让 LLM 输出")
     每条候选:walmart_product_type / confidence / amazon_category / match_type。
-    hybrid 无总量截断——截断只发生在提示词构建时的 candidates[:20](§4.2)。
+    hybrid 无总量截断——截断只发生在提示词构建时的 `[:_PROMPT_CAND_CUT]`(§4.2)。
+    ⚠ **本函数的返回顺序即优先级**,那个截断砍的是尾巴。任何别的候选来源
+    (如 open_candidates)交给 rerank 之前必须自己排好序,否则截断退化成
+    "按查询顺序发盲牌"(2026-08-14 生产 bug:开放判定按 PT 名字母序取,
+    Home 大类 891 个 PT 只有 A 开头的能进提示词)。
     """
     with conn.cursor() as cur:
         kw = _fetch_candidates(cur, product, limit)
@@ -610,7 +650,7 @@ def build_user_prompt(product: ProductInfo, cands: list[dict[str, Any]]) -> str:
 
     if cands:
         cand_lines = []
-        for i, c in enumerate(cands[:20], 1):
+        for i, c in enumerate(cands[:_PROMPT_CAND_CUT], 1):
             conf = c.get("confidence") or ""
             tag = f" conf={conf}" if conf else ""
             cand_lines.append(f"  {i}. {c['walmart_product_type']}{tag}")
@@ -711,15 +751,20 @@ def open_candidates(conn, product: ProductInfo, *,
     if not picked:
         bump("open_stage1_empty")
         return []
+    # ⚠ 排序不是可选项(见 _OPEN_SCORE_SQL 头注):大类下动辄几百个 PT,
+    # 提示词只喂前 _PROMPT_CAND_CUT 条,不按相关度排就是按字母序发盲牌
+    words = _dict_words(product)
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT walmart_product_type, walmart_category, walmart_ptg "
-            "FROM audit.walmart_pt_meta WHERE walmart_category = ANY(%s) "
-            "ORDER BY walmart_product_type", (picked,))
+        cur.execute(_OPEN_SCORE_SQL, {"pats": [f"%{w}%" for w in words],
+                                      "cats": picked,
+                                      "limit": _PROMPT_CAND_CUT})
         rows = _rows(cur)
     bump("open_stage2_candidates")
-    logger.info("L1 开放判定:大类 %s → 候选 %d(asin=%s)",
-                picked, len(rows), product.asin)
+    if any(r.get("score") for r in rows):
+        bump("open_stage2_scored")   # 有词命中 = 这 20 条是选出来的,不是碰上的
+    logger.info("L1 开放判定:大类 %s → 候选 %d(首条 %s score=%s,asin=%s)",
+                picked, len(rows), rows[0]["walmart_product_type"] if rows
+                else "-", rows[0].get("score") if rows else "-", product.asin)
     return [{"walmart_product_type": r["walmart_product_type"],
              "confidence": None,
              "amazon_category": r.get("walmart_ptg") or "",

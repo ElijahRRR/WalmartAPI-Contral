@@ -488,6 +488,40 @@ def test_reason_mapper_l4_medium_falls_to_general_use():
         == "General-Use Products"
 
 
+def test_resolve_pt_path_alias_folding():
+    """②级查表前折别名(catmap_align):中间层名漂移的路径也能命中映射;
+    别名表空 → 退化回纯精确匹配(零行为变化)。"""
+    drift = ("Home & Kitchen > Home Décor Products > Picture Frames")
+    canon = ("Home & Kitchen > Home Décor > Picture Frames")
+    ctx = _ctx(pt_meta=META, catmap={canon: "GoodPT"},
+               path_alias={drift: canon})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift), ctx)
+    assert l1.walmart_product_type == "GoodPT" and l1.pt_source == "map_direct"
+    # 无别名表:同一产品解不出(证明命中确实来自折叠)
+    bare = _ctx(pt_meta=META, catmap={canon: "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift),
+        bare).walmart_product_type is None
+    # 精确命中优先:别名不得改写已能直接命中的路径
+    both = _ctx(pt_meta=META, catmap={canon: "GoodPT", drift: "GoodPT"},
+                path_alias={drift: "Other > Path"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift),
+        both).walmart_product_type == "GoodPT"
+
+
+def test_resolve_pt_alias_folds_into_sentinel():
+    """别名折到哨兵路径 → 照样 -100 硬拒(折叠只改查得到查不到)。"""
+    drift, canon = "A > B Products > Leaf", "A > B > Leaf"
+    ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({canon}),
+               path_alias={drift: canon})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0G", amazon_category_path=drift), ctx)
+    assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].detail["amazon_path"] == drift   # detail 记原文不记折后
+
+
 def test_catmap_mine_classify_path():
     """挖掘分桶(所有者三段式 2026-08-13):多产品同 PT=可信;少量支持=待核;
     分流=人工;与旧映射相左=冲突只报;单证不立;与旧映射一致=无事。"""

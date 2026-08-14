@@ -1007,6 +1007,19 @@ CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(stat
 -- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
 -- 进映射表才生效。status:inherited(兄弟继承,免 LLM)/ok/unknown/excluded/no_candidate/llm_failed
 
+-- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
+-- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移
+-- 'Home Décor Products' vs 'Home Décor'、'Outdoor Power Tools' vs
+-- 'Mowers & Outdoor Power Tools'——按完整路径精确等值会把已映射路径误判
+-- 成缺口)。对齐三闸:叶子相等 + 顶级相等 + 段集重叠且唯一(services/catpath)。
+-- 消费:audit_rules ②级映射精确匹配未命中时,经本表折到 canonical 再查
+CREATE TABLE IF NOT EXISTS audit.category_path_alias (
+    path           text PRIMARY KEY,   -- 产品侧面包屑原文(btrim)
+    canonical_path text NOT NULL,      -- 映射表里的等价路径
+    score          numeric NOT NULL,   -- 段集重叠分(≥0.5 才落)
+    aligned_at     timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
     amazon_category text PRIMARY KEY,
     suggested_pt    text,

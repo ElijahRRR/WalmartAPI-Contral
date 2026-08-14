@@ -120,6 +120,13 @@ def run(params: dict) -> str:
                 votes.setdefault(path, {})[pt] = n
             cur.execute(_IN_MAP_SQL)
             in_map = dict(cur.fetchall())
+            # 别名路径视同已在映射表(catmap_align:中间层名漂移的假缺口),
+            # 否则会被当新映射挖出来、还可能与 canonical 行冲突刷屏
+            cur.execute("SELECT path, canonical_path "
+                        "FROM audit.category_path_alias")
+            for alias_path, canonical in cur.fetchall():
+                if canonical in in_map:
+                    in_map.setdefault(alias_path, in_map[canonical])
 
         counts = {"mined_trusted": 0, "mined_review": 0,
                   "mined_mixed": 0, "map_conflict": 0}

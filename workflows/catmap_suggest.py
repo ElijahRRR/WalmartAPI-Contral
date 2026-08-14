@@ -41,6 +41,9 @@ WHERE p.marketplace = 'US'
   AND p.amazon_category IS NOT NULL AND p.amazon_category <> ''
   AND NOT EXISTS (SELECT 1 FROM audit.walmart_category_map m
                   WHERE btrim(m.amazon_category) = btrim(p.amazon_category))
+  -- 别名折得到的不是真缺口(catmap_align):不再花 LLM 钱重判
+  AND NOT EXISTS (SELECT 1 FROM audit.category_path_alias a
+                  WHERE a.path = btrim(p.amazon_category))
   AND ({skip_suggested})
 GROUP BY p.amazon_category
 HAVING max(p.asin) FILTER (WHERE p.title IS NOT NULL AND p.title <> '') IS NOT NULL

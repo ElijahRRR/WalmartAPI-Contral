@@ -49,6 +49,7 @@ class AuditContext:
     known_policies: frozenset = frozenset()                  # 37 政策 category_en 集合
     uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
+    path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
 
 
 def _brand_map(conn) -> tuple[dict, set]:
@@ -81,6 +82,13 @@ def _frozen(conn, sql: str) -> frozenset:
     with conn.cursor() as cur:
         cur.execute(sql)
         return frozenset(r[0] for r in cur.fetchall() if r[0])
+
+
+def _pairs(conn, sql: str) -> dict:
+    """输入:连接 + 两列 SQL → 输出:{第一列: 第二列}(两侧非空才收)。"""
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return {k: v for k, v in cur.fetchall() if k and v}
 
 
 def _rows_dict(conn, sql: str, key: str) -> dict:
@@ -190,6 +198,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
                   "audit.walmart_category_map "
                   f"WHERE walmart_product_type = '{_UNMAPPED_SENTINEL}' "
                   "AND btrim(amazon_category) <> ''"),
+        # 路径别名(catmap_align:三套 Amazon 名称的中间层漂移)——②级精确
+        # 未命中时折一次再查;表不存在/空则为空 dict,行为退化回纯精确匹配
+        path_alias=_pairs(conn, "SELECT path, canonical_path "
+                                "FROM audit.category_path_alias"),
     )
 
 
@@ -202,6 +214,8 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
       ⓪ 哨兵硬拒(映射表明确标记'无对应Walmart PT')——批复 #10 实证最优先,
         故哨兵从旧仓的最前挪到实证之后、映射之前(差异会进双跑校准报告)
       ② 映射表精确(catmap 高置信唯一)                   pt_source='map_direct'
+        ——查表前先过路径别名折叠(catmap_align:Amazon 三套名称的中间层
+        漂移,精确等值会把已映射路径当缺口)
     直出各级统一过 seed 硬拦(带 PT 调,旧 Layer1 快速通道 :804 同款)与
     出版物硬禁(合同 L1-6:旧仓对全部三级生效,批次 B 漏接本批归还)。
     命中硬拦时返回的 L1Info 带 -100 hit——audit_l2.evaluate 会累加 l1.hits,
@@ -217,6 +231,11 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
         # 定稿 2026-08-13:PT 长在产品主档,不查证据边表)
         pt, source, conf = product.known_pt, "historical_confirmed", "高"
     path = (product.amazon_category_path or "").strip()
+    # 路径别名折叠(catmap_align):产品侧面包屑与映射表的中间层名可能漂移
+    # ('Home Décor Products' vs 'Home Décor'),精确等值会误判成缺口。
+    # 折叠只影响"查得到查不到",不改任何判定语义;别名表空则退化回精确匹配
+    if path and path not in ctx.catmap and path not in ctx.unmapped_paths:
+        path = ctx.path_alias.get(path, path)
     if not pt and path and path in ctx.unmapped_paths:
         # Layer 0 哨兵(l1_category.py:779-797 字面量逐字:unknown/低/none 三件
         # + detail.amazon_path 用原文不 strip)

@@ -90,8 +90,8 @@ ORDER BY btrim(amazon_category)
 _UPSERT_SQL = """
 INSERT INTO audit.category_map_suggestions
     (amazon_category, suggested_pt, confidence, status,
-     product_count, support_count, pt_distribution)
-VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+     product_count, support_count, pt_distribution, browse_node_id)
+VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
 ON CONFLICT (amazon_category) DO UPDATE
 SET suggested_pt = EXCLUDED.suggested_pt,
     confidence   = EXCLUDED.confidence,
@@ -99,6 +99,8 @@ SET suggested_pt = EXCLUDED.suggested_pt,
     product_count = EXCLUDED.product_count,
     support_count = EXCLUDED.support_count,
     pt_distribution = EXCLUDED.pt_distribution,
+    browse_node_id = COALESCE(EXCLUDED.browse_node_id,
+                              audit.category_map_suggestions.browse_node_id),
     created_at   = now()
 """
 
@@ -213,7 +215,8 @@ def run(params: dict) -> str:
             label = (rep_path.get(k) or f"node:{k}") if by_node else k
             rows.append((label, pt, "高" if status == "mined_trusted" else None,
                          status, sum(dist.values()), support,
-                         json.dumps(dist, ensure_ascii=False)))
+                         json.dumps(dist, ensure_ascii=False),
+                         k if by_node else None))
             if by_node and status == "mined_trusted" and rep_path.get(k):
                 promote_rows.append((rep_path[k], pt, k))
         with conn.cursor() as cur:
@@ -225,9 +228,10 @@ def run(params: dict) -> str:
                  f"可信 {counts['mined_trusted']} / 待核(少量支持)"
                  f" {counts['mined_review']} / 分流 {counts['mined_mixed']} / "
                  f"与旧映射冲突 {counts['map_conflict']}",
-                 "复核 SQL:SELECT * FROM audit.category_map_suggestions "
-                 "WHERE status LIKE 'mined%' OR status='map_conflict' "
-                 "ORDER BY status, support_count DESC;"]
+                 "复核 SQL:SELECT browse_node_id, suggested_pt, "
+                 "support_count, product_count, amazon_category "
+                 "FROM audit.category_map_suggestions "
+                 "WHERE status='map_conflict' ORDER BY support_count DESC;"]
         if counts["mined_mixed"]:
             lines.append("分流桶按优势度分档(降门槛能救回多少):"
                          + " / ".join(f"{b} {n}" for b, n in dom_bands.items()))

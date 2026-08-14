@@ -1081,6 +1081,10 @@ ALTER TABLE audit.category_map_suggestions
     ADD COLUMN IF NOT EXISTS support_count integer;
 ALTER TABLE audit.category_map_suggestions
     ADD COLUMN IF NOT EXISTS pt_distribution jsonb;
+-- node 键挖掘(2026-08-14)必须留 ID:建议表主键是代表路径,不存 ID 的话
+-- 复核清单看不到 node、catmap_fix 也无从圈定(生产实测所有者反馈)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS browse_node_id text;
 
 -- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照

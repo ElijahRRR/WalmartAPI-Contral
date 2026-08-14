@@ -32,38 +32,20 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.catmap_fix")
 
-_PICK_SQL = """
-SELECT s.amazon_category, s.suggested_pt, s.support_count, s.product_count,
-       m.walmart_product_type AS old_pt, m.browse_node_id
+
+# 建议表自带 browse_node_id(catmap_mine node 键模式写入),直接按 ID 连接
+_PICK_BY_NODE_SQL = """
+SELECT s.browse_node_id, m.walmart_product_type,
+       s.amazon_category, s.suggested_pt, s.support_count, s.product_count
 FROM audit.category_map_suggestions s
 JOIN audit.walmart_category_map m
-  ON m.browse_node_id = ANY(%(nodes)s) AND m.confidence = '高'
- AND btrim(m.amazon_category) = s.amazon_category
-WHERE s.status = 'map_conflict'
-"""
-
-# node 圈定改走建议表 + 映射表两侧同 node:建议表的 amazon_category 是
-# 代表路径,映射表可能挂在别的路径上,故以 browse_node_id 为准做连接
-_PICK_BY_NODE_SQL = """
-SELECT m.browse_node_id, btrim(m.amazon_category), m.walmart_product_type,
-       s.amazon_category, s.suggested_pt, s.support_count, s.product_count
-FROM audit.walmart_category_map m
-JOIN audit.category_map_suggestions s ON s.status = 'map_conflict'
- AND s.amazon_category IN (
-     SELECT btrim(amazon_category) FROM catalog.products
-     WHERE marketplace = 'US' AND browse_node_id = m.browse_node_id
- )
-WHERE m.confidence = '高' AND m.browse_node_id = ANY(%(nodes)s)
+  ON m.browse_node_id = s.browse_node_id AND m.confidence = '高'
+WHERE s.status = 'map_conflict' AND s.browse_node_id = ANY(%(nodes)s)
 """
 
 _ALL_CONFLICT_NODES_SQL = """
-SELECT DISTINCT m.browse_node_id
-FROM audit.walmart_category_map m
-JOIN catalog.products p ON p.marketplace = 'US'
- AND p.browse_node_id = m.browse_node_id
-JOIN audit.category_map_suggestions s
-  ON s.amazon_category = btrim(p.amazon_category) AND s.status = 'map_conflict'
-WHERE m.confidence = '高' AND m.browse_node_id IS NOT NULL
+SELECT DISTINCT browse_node_id FROM audit.category_map_suggestions
+WHERE status = 'map_conflict' AND browse_node_id IS NOT NULL
 """
 
 _DEMOTE_SQL = """
@@ -117,10 +99,10 @@ def run(params: dict) -> str:
                     f"但在冲突清单里找不到对应行(先跑 catmap_mine)")
 
         seen: dict = {}
-        for node, map_path, old_pt, sug_path, new_pt, sup, tot in rows:
+        for node, old_pt, sug_path, new_pt, sup, tot in rows:
             if node in seen or old_pt == new_pt:
                 continue
-            seen[node] = (sug_path or map_path, old_pt, new_pt, sup, tot)
+            seen[node] = (sug_path, old_pt, new_pt, sup, tot)
 
         lines = [f"catmap_fix:圈定 {len(nodes)} node → 待改 {len(seen)} 条"]
         for node, (path, old_pt, new_pt, sup, tot) in list(seen.items())[:30]:

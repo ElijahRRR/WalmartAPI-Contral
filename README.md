@@ -72,4 +72,8 @@ python cli.py ping_stores              # 端到端验收:每店经代理连通�
 | `docs/feishu_tables.md` | 飞书多维表格清单、字段约定、读写规范 |
 | `docs/legacy_reference.md` | 旧仓库事实清单:魔数、事故教训、各工作流行为规格 |
 | `docs/legacy_survey.md` | 旧仓库全量摸底报告:14 模块逐一通读的证据级结论(带文件:行号) |
-| `docs/scraper_migration_brief.md` | 采集服务改造简报(给采集侧 AI) |
+| `docs/scraper_migration_brief.md` | 采集服务改造简报(给采集侧 AI);采集失败三档语义 |
+| `docs/api_blueprint.md` | 沃尔玛端点/配额/分页/feed schema 定稿(写调用代码前必查) |
+| `docs/audit_migration_plan.md` | 审核链迁入计划:批次 A~E、切换规程 |
+| `docs/audit_batch_c_decisions.md` | 审核链 LLM 层裁决 + L1 候选面收口的实证结论 |
+| `docs/category_mapping.md` | 类目映射链(catmap/taxonomy 九条工作流)的唯一文档 |

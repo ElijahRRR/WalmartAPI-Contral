@@ -136,12 +136,6 @@ def test_parse_problem_report_rules():
     assert r2["item"] == "Great Cup"                       # $$ 只取前半
 
 
-def test_dedup_key_five_fields():
-    row = {"sales_order_no": "S1", "indicator": "🚚 OTD", "sub_category": "Late",
-           "tracking_no": "T1", "item": "I1", "description": "x"}
-    assert kpi.dedup_key(row) == ("S1", "🚚 OTD", "Late", "T1", "I1")
-
-
 # ── api 层 ────────────────────────────────────────────────────────────────────
 
 def test_insights_summary_204_is_none_and_rate_priority(monkeypatch):

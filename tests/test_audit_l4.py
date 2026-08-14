@@ -250,8 +250,11 @@ def test_at_most_five_images_sent(vision):
 
 def _assert_pass_alert(out, rule_code):
     """合同 L4-8:失败一律 pass + penalty=0 告警 hit,**绝无 pending**。"""
+    # 合同 L4-8 的取值域断言:verdict 只能是 pass。原来这里还跟着一条
+    # `assert out.verdict != "pending"`,被上一行完全蕴含、永不可能单独失败,
+    # 而这个 helper 被 6 条用例复用 ⇒ 一条恒真式在测试报告里出现 6 次
+    # (2026-08-14 删)。要表达"绝无 pending"就靠取值域,不靠恒真式。
     assert out.verdict == "pass"
-    assert out.verdict != "pending"
     assert out.image_issues == []
     codes = [h.rule_code for h in out.hits]
     assert rule_code in codes

@@ -588,14 +588,20 @@ def test_catmap_mine_classify_path():
     from workflows.catmap_mine import classify_path
     assert classify_path({"A": 6}, None) == ("mined_trusted", "A", 6)
     assert classify_path({"A": 3}, None) == ("mined_review", "A", 3)
-    assert classify_path({"A": 9, "B": 2}, None) == ("mined_mixed", "A", 9)
     assert classify_path({"A": 1}, None) is None            # 单证不立
     assert classify_path({"A": 6}, "A") is None             # 与旧映射一致
     assert classify_path({"A": 6}, "B") == ("map_conflict", "A", 6)
     assert classify_path({"A": 3}, "B") is None             # 冲突也要够票
-    assert classify_path({"A": 6, "C": 1}, "B") is None     # 冲突须自身无分流
     assert classify_path({}, None) is None
     assert classify_path({"A": 5}, None, min_support=8) == ("mined_review", "A", 5)
+    # 优势度而非全票(首跑实测:要求 100% 一致 → 1321 个类目全打成分流)
+    assert classify_path({"A": 9, "B": 1}, None) == ("mined_trusted", "A", 9)
+    assert classify_path({"A": 6, "B": 4}, None) == ("mined_mixed", "A", 6)
+    assert classify_path({"A": 9, "B": 1}, None,
+                         min_dominance=0.95) == ("mined_mixed", "A", 9)
+    # 冲突同样看优势度:少数派噪声不该掩盖"旧映射与实证相左"
+    assert classify_path({"A": 9, "B": 1}, "B") == ("map_conflict", "A", 9)
+    assert classify_path({"A": 6, "C": 4}, "B") is None     # 自身分流不算冲突
 
 
 def test_catmap_sibling_verdict_and_parent():

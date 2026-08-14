@@ -3,7 +3,8 @@
 用法:
   python cli.py catmap_mine                    # 按类目 ID 挖掘(默认,推荐)
   python cli.py catmap_mine -p key=path        # 按类目路径挖掘(无 ID 老行)
-  python cli.py catmap_mine -p min_support=8   # 收紧可信门槛(默认 5)
+  python cli.py catmap_mine -p min_support=8   # 收紧票数门槛(默认 5)
+  python cli.py catmap_mine -p min_dominance=0.9  # 收紧优势度(默认 0.8)
   python cli.py catmap_mine -p promote=1       # 把 mined_trusted 升级进映射表
 
 **键 = browse_node_id(所有者定稿 2026-08-14)**:类目名会漂 ID 不会,按
@@ -112,21 +113,36 @@ ON CONFLICT (amazon_category, walmart_product_type) DO NOTHING
 """
 
 
-def classify_path(dist: dict, in_map_pt: str | None,
-                  min_support: int = 5) -> tuple[str, str, int] | None:
-    """输入:{pt: 支持数} + 该路径映射表现值 → 输出:(status, pt, support) 或 None。
+MIN_DOMINANCE = 0.8   # 首选 PT 的占比门槛(首跑实测:要求 100% 一致 → 1321 分流)
 
-    纯函数。分桶规则见模块头;支持数 1 且无分流 → None(单证不立);
-    已在映射表且共识与之一致 → None(无事可报)。
+
+def classify_path(dist: dict, in_map_pt: str | None,
+                  min_support: int = 5,
+                  min_dominance: float = MIN_DOMINANCE
+                  ) -> tuple[str, str, int] | None:
+    """输入:{pt: 支持数} + 该键映射表现值 → 输出:(status, pt, support) 或 None。
+
+    纯函数。**判据是优势度不是全票**(首跑实测修正 2026-08-14):回填的 PT
+    来自删除历史+报错日报,同一类目下历史被挂过几个不同 PT 很正常(不同
+    店铺挂法/早期挂错),要求 100% 一致会把 1,321 个类目全打成"分流";
+    真实信号是"压倒性多数指向同一 PT",少数派是噪声。
+      dominance = 首选 PT 支持数 / 该键总票数
+      dominance ≥ min_dominance 且 支持数 ≥ min_support → mined_trusted
+      dominance 达标但支持 2~(min_support-1)            → mined_review
+      dominance 不达标(真分流)                          → mined_mixed(人工)
+    支持数 1 → None(单证不立);已在映射表且共识与之一致 → None(无事可报)。
     """
     if not dist:
         return None
+    total = sum(dist.values())
     top_pt, top_n = max(dist.items(), key=lambda kv: kv[1])
+    dominance = top_n / total if total else 0.0
     if in_map_pt is not None:
-        if top_pt != in_map_pt and top_n >= min_support and len(dist) == 1:
-            return ("map_conflict", top_pt, top_n)   # 实证一致却与旧映射相左
+        if (top_pt != in_map_pt and top_n >= min_support
+                and dominance >= min_dominance):
+            return ("map_conflict", top_pt, top_n)   # 实证压倒性却与旧映射相左
         return None
-    if len(dist) > 1:
+    if dominance < min_dominance:
         return ("mined_mixed", top_pt, top_n)
     if top_n >= min_support:
         return ("mined_trusted", top_pt, top_n)
@@ -138,6 +154,7 @@ def classify_path(dist: dict, in_map_pt: str | None,
 def run(params: dict) -> str:
     """输入:params(key=node|path / min_support / promote=1)→ 输出:分桶摘要。"""
     min_support = int(params.get("min_support", 5))
+    min_dominance = float(params.get("min_dominance", MIN_DOMINANCE))
     promote = str(params.get("promote", "")).strip() == "1"
     by_node = str(params.get("key", "node")).strip().lower() != "path"
     key_sql = "p.browse_node_id" if by_node else "btrim(p.amazon_category)"
@@ -167,13 +184,30 @@ def run(params: dict) -> str:
 
         counts = {"mined_trusted": 0, "mined_review": 0,
                   "mined_mixed": 0, "map_conflict": 0}
+        # 分流桶按优势度分档:让所有者拿数据挑阈值,而不是拍脑袋
+        dom_bands = {"0.7~0.8": 0, "0.6~0.7": 0, "0.5~0.6": 0, "<0.5": 0}
+        samples: dict = {"mined_trusted": [], "map_conflict": [],
+                         "mined_mixed": []}
         rows, promote_rows = [], []
         for k, dist in votes.items():
-            got = classify_path(dist, in_map.get(k), min_support)
+            got = classify_path(dist, in_map.get(k), min_support,
+                                min_dominance)
             if got is None:
                 continue
             status, pt, support = got
             counts[status] += 1
+            total_votes = sum(dist.values())
+            dom = support / total_votes if total_votes else 0
+            if status == "mined_mixed":
+                band = ("0.7~0.8" if dom >= 0.7 else "0.6~0.7" if dom >= 0.6
+                        else "0.5~0.6" if dom >= 0.5 else "<0.5")
+                dom_bands[band] += 1
+            if status in samples and len(samples[status]) < 5:
+                extra = (f" ←旧映射 {in_map.get(k)}"
+                         if status == "map_conflict" else "")
+                samples[status].append(
+                    f"  node {k}|{pt}(票 {support}/{total_votes},"
+                    f"优势 {dom:.0%}){extra}")
             # 建议表主键是 amazon_category:node 键模式下用代表路径当展示键,
             # 没有代表路径的 node 用 'node:<id>' 兜底(不会与真路径撞)
             label = (rep_path.get(k) or f"node:{k}") if by_node else k
@@ -186,7 +220,7 @@ def run(params: dict) -> str:
             cur.executemany(_UPSERT_SQL, rows)
 
         kind = "类目 ID" if by_node else "类目路径"
-        lines = [f"catmap_mine(键={kind},门槛 {min_support}):"
+        lines = [f"catmap_mine(键={kind},票数≥{min_support},优势≥{min_dominance:.0%}):"
                  f"{kind} {len(votes)} 个(有实证 PT 投票)→ "
                  f"可信 {counts['mined_trusted']} / 待核(少量支持)"
                  f" {counts['mined_review']} / 分流 {counts['mined_mixed']} / "
@@ -194,9 +228,15 @@ def run(params: dict) -> str:
                  "复核 SQL:SELECT * FROM audit.category_map_suggestions "
                  "WHERE status LIKE 'mined%' OR status='map_conflict' "
                  "ORDER BY status, support_count DESC;"]
-        if counts["map_conflict"]:
-            lines.append(f"⚠ 冲突 {counts['map_conflict']} 条最值得人看:实证"
-                         f"一致却与旧映射相左——旧表可能有错行")
+        if counts["mined_mixed"]:
+            lines.append("分流桶按优势度分档(降门槛能救回多少):"
+                         + " / ".join(f"{b} {n}" for b, n in dom_bands.items()))
+        for tag, title in (("mined_trusted", "可信样例(将升级)"),
+                           ("map_conflict", "⚠ 与旧映射冲突(只报不改)"),
+                           ("mined_mixed", "分流样例(人工看)")):
+            if samples.get(tag):
+                lines.append(f"{title}:")
+                lines += samples[tag]
         if not promote:
             if counts["mined_trusted"]:
                 lines.append(f"(可信 {counts['mined_trusted']} 条未升级;"

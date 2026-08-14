@@ -565,13 +565,14 @@ def test_resolve_pt_path_alias_folding():
 
 
 def test_resolve_pt_alias_folds_into_sentinel():
-    """别名折到哨兵路径 → 照样 -100 硬拒(折叠只改查得到查不到)。"""
+    """别名折到哨兵路径 → 照样只留痕不判死(折叠只改查得到查不到)。"""
     drift, canon = "A > B Products > Leaf", "A > B > Leaf"
     ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({canon}),
                path_alias={drift: canon})
     l1 = audit_rules.resolve_pt(
         ProductInfo(asin="B0G", amazon_category_path=drift), ctx)
     assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].penalty == 0 and not audit_rules._blocked(l1)
     assert l1.hits[0].detail["amazon_path"] == drift   # detail 记原文不记折后
 
 

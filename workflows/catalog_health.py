@@ -47,6 +47,9 @@ SELECT count(*)                                               AS total,
                                                              AS n_pt_evid,
        count(*) FILTER (WHERE has_pt AND pt_source IS DISTINCT FROM
                               'walmart_confirmed')            AS n_pt_infer,
+       -- 真·挖掘燃料:catmap_mine 按 node 投票,三者缺一不可
+       count(*) FILTER (WHERE has_pt AND has_node
+                          AND pt_source = 'walmart_confirmed') AS n_fuel,
        count(*) FILTER (WHERE has_path AND NOT has_pt)        AS n_path_only,
        count(*) FILTER (WHERE has_pt AND NOT has_path)        AS n_pt_only,
        count(*) FILTER (WHERE NOT has_pt AND NOT has_path)    AS n_neither,
@@ -114,11 +117,15 @@ def run(params: dict) -> str:
            f"——挖掘/LLM 的真实工作面" if nodes else ""),
         f"  快照里还能补 ID 的产品 {snap_fillable}"
         + ("(跑 node_backfill -p apply=1)" if snap_fillable else ""),
-        f"C PT×类目交叉:有PT有类目 {r['n_pt_path']}(其中实证 "
-        f"{r['n_pt_evid']} = 挖掘燃料 / 推断 {r['n_pt_infer']} 不参与投票)/ "
+        f"C PT×类目交叉:有PT有类目 {r['n_pt_path']} / "
         f"有类目无PT {r['n_path_only']}(待判定)/ "
         f"有PT无类目 {r['n_pt_only']}(反哺不了映射)/ "
         f"两者皆无 {r['n_neither']}(先补采集)",
+        f"  PT 来源(全部有PT行 {r['n_pt_evid'] + r['n_pt_infer']}):实证 "
+        f"{r['n_pt_evid']} / 推断 {r['n_pt_infer']}——推断不参与挖掘投票"
+        f"(猜测被当实证会自我印证并放大到整个类目)",
+        f"  **挖掘燃料 {r['n_fuel']}**:有PT + 有类目ID + 实证,三者缺一"
+        f"不可(catmap_mine 按 node 投票的实际口径)",
         f"D 审核结论:过 {r['n_approved']} / 拒 {r['n_rejected']} / "
         f"待定 {r['n_pending']} / 未审 {r['n_unaudited']}",
     ]

@@ -237,10 +237,54 @@ def test_taxonomy_survey_reports_shape_of_unparsed_sections():
         "notes": ["纯文本"],
     }))
     assert "leaves: 2 行(解析" in out
-    assert "internal_nodes: 1 行 ⚠" in out and "行键:cat_id / label" in out
+    # 键必须全列且带条数(截断不声明 = 照着不全的键列写错解析预期)
+    assert "internal_nodes: 1 行 ⚠" in out and "行键(2):cat_id / label" in out
     assert "notes: 1 行 ⚠" in out and "元素不是 dict(是 str)" in out
     assert "meta 自报:reconciled_tree_rows=5" in out
     assert "解析到去重 node 2" in out and "差 3" in out
+
+
+def test_reconciled_file_fixture_end_to_end():
+    """照**真实文件结构**的样例过一遍(段名/行键/首行空 ID/缺路径段全复刻)。
+
+    2026-08-14 所有者指出:样例在手就该照结构写,不该让他在部署机上试三轮。
+    这份 fixture 就是那三个坑的回归位——段名陌生、首行 ID 为空、段间字段缺省。
+    """
+    import json
+    from pathlib import Path
+    from workflows.taxonomy_import import data_sections, parse_rows, survey_file
+
+    data = json.loads((Path(__file__).parent / "fixtures"
+                       / "taxonomy_reconciled_sample.json").read_text("utf-8"))
+    assert data_sections(data) == ["leaves", "verified_added_paths",
+                                   "unverified_new_nodes", "nodes"]
+    rows, paths, stat = parse_rows(data)
+    by_node = {r[0]: r for r in rows}
+    assert stat["skipped"] == 1                      # 首行 browse_node_id 为空
+    # 中间层只在 nodes 段里,必须收进来(原来整段被丢 = 父链断)
+    assert by_node["1063278"][1] == "Home Décor" and by_node["1063278"][5] is False
+    # 叶子的节点级属性以 leaves 段为准(is_leaf 只有那段是权威)
+    assert by_node["3736081"][5] is True and by_node["3736081"][8] == "leaves"
+    # 只有 ID+名字的段在前,路径由后面的段补(此例 nodes 段无此 node → 仍为空)
+    assert by_node["999000111"][2] is None
+    # DAG:同名同 ID 的 Belts 挂在两个父下 → 节点一行、路径两行
+    belts = [p for p in paths if p[0] == "2474937011"]
+    assert len(belts) == 2 and {p[1] for p in belts} == {"2474936011", "15709631"}
+    assert len([r for r in rows if r[0] == "2474937011"]) == 1
+
+
+def test_later_section_backfills_missing_fields():
+    """先到先得只管冲突不管缺省:只有 ID+名字的段在前,后面带路径的段要能
+    把路径/父/深度补上(否则段序一变结果就变)。"""
+    from workflows.taxonomy_import import parse_rows
+    rows, _p, _s = parse_rows({
+        "unverified_new_nodes": [{"browse_node_id": "9", "类目名": "新 node"}],
+        "nodes": [{"browse_node_id": "9", "类目名": "新 node",
+                   "完整路径": "A > B", "父节点ID": "8", "深度": "2",
+                   "L1 根类目": "A"}],
+    })
+    assert rows[0][2] == "A > B" and rows[0][3] == 2 and rows[0][4] == "8"
+    assert rows[0][8] == "unverified_new_nodes"      # 归属段仍是先到的那个
 
 
 def test_section_sniff_looks_past_an_idless_first_row():

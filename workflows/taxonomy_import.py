@@ -126,7 +126,7 @@ def _shape(val) -> str:
     """输入:一个段 → 输出:形状速写(类型 + 首行字段名),给未解析段定位用。"""
     if isinstance(val, dict):
         head = next(iter(val.values()), None)
-        kind, keys = "dict{键: 值}", (list(head)[:8] if isinstance(head, dict)
+        kind, keys = "dict{键: 值}", (list(head) if isinstance(head, dict)
                                      else [])
         if not keys:
             return f"{kind};值不是 dict(是 {type(head).__name__})"
@@ -135,10 +135,12 @@ def _shape(val) -> str:
         if head is None:
             first = val[0] if val else None
             return f"list;元素不是 dict(是 {type(first).__name__})"
-        kind, keys = "list[dict]", list(head)[:8]
+        kind, keys = "list[dict]", list(head)
     else:
         return type(val).__name__
-    return f"{kind};行键:{' / '.join(map(str, keys))}"
+    # 键**全列不截断**:上一版截前 8 个还不声明,害我照着不全的键列写错了
+    # 解析预期(真实 leaves 行第 9 个键就是「是否叶子」)。体检行长一点无妨。
+    return f"{kind};行键({len(keys)}):{' / '.join(map(str, keys))}"
 
 
 def survey_file(data: dict) -> list[str]:
@@ -196,12 +198,16 @@ def parse_rows(data: dict) -> tuple[list[tuple], list[tuple], dict]:
                同一 node 挂在多个父下就是多行,按 ID 去重会丢掉多路径关系,
                父链回退就会退到错误的祖先。
 
+    先到先得**只管冲突,不管缺省**:后面的段能补前面缺的字段(路径/父/
+    深度/L1)。否则段序一变结果就变——`unverified_new_nodes` 段只有
+    ID 和名字,若它排在带路径的段前面,那些 node 的路径就永远是空。
+
     父节点 ID 形如 'L1_amazon-devices' 的是根级占位:节点行存 NULL,
     路径行存 ''(PK 不收 NULL)。
     """
-    node_rows: list[tuple] = []
+    node_rows: list[list] = []
     path_rows: list[tuple] = []
-    seen: set = set()
+    seen: dict = {}                    # node → node_rows 下标(便于回填)
     seen_path: set = set()
     sections = data_sections(data)
     stat = {s: 0 for s in sections}
@@ -225,15 +231,20 @@ def parse_rows(data: dict) -> tuple[list[tuple], list[tuple], dict]:
                     seen_path.add(key)
                     path_rows.append((node, parent, path, depth, root, sec))
                     stat["paths"] += 1
-            if node in seen:
+            if node in seen:                       # 只回填先前缺的字段
+                prev = node_rows[seen[node]]
+                for i, v in ((2, path or None), (3, depth), (4, parent or None),
+                             (6, root), (7, _int(_get(r, _K_SAMPLES)))):
+                    if not prev[i] and v:
+                        prev[i] = v
                 continue
-            seen.add(node)
-            node_rows.append((
+            seen[node] = len(node_rows)
+            node_rows.append([
                 node, name, path or None, depth, parent or None,
                 _get(r, _K_LEAF).casefold() in _TRUE, root,
-                _int(_get(r, _K_SAMPLES)), sec))
+                _int(_get(r, _K_SAMPLES)), sec])
             stat[sec] += 1
-    return node_rows, path_rows, stat
+    return [tuple(r) for r in node_rows], path_rows, stat
 
 
 # 文件行是权威:同 node 若已有反推补层(taxonomy_derive),文件覆盖它

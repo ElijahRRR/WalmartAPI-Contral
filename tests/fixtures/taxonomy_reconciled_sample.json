@@ -1,0 +1,114 @@
+{
+  "meta": {
+    "legacy_tree_rows": 32140,
+    "legacy_unique_node_ids": 32101,
+    "crawl_unique_node_ids": 33609,
+    "unverified_new_node_ids": 1545,
+    "verified_added_paths": 7,
+    "reconciled_tree_rows": 32147,
+    "reconciled_leaf_rows": 26956
+  },
+  "verified_added_paths": [
+    {
+      "L1 根类目": "Tools & Home Improvement",
+      "完整路径": "Tools & Home Improvement > Power & Hand Tools > Hand Tools > Saws > Handsaws",
+      "类目名": "Handsaws",
+      "深度": "5",
+      "browse_node_id": "553220",
+      "父节点ID": "551238",
+      "产品样本数": "12",
+      "URL": "https://www.amazon.com/b?node=553220",
+      "是否叶子": "否"
+    }
+  ],
+  "unverified_new_nodes": [
+    {
+      "browse_node_id": "999000111",
+      "类目名": "只有 ID 和名字的新 node",
+      "root_slug": "home-garden",
+      "URL": "https://www.amazon.com/b?node=999000111",
+      "处理状态": "待核"
+    }
+  ],
+  "leaves": [
+    {
+      "L1 根类目": "Home & Kitchen",
+      "完整路径": "Home & Kitchen > Home Décor > Photo Albums, Frames & Accessories > Picture Frames > Wall & Tabletop Frames",
+      "类目名": "Wall & Tabletop Frames",
+      "深度": "5",
+      "browse_node_id": "3736081",
+      "父节点ID": "3736071",
+      "产品样本数": "120",
+      "URL": "https://www.amazon.com/b?node=3736081",
+      "是否叶子": "是"
+    }
+  ],
+  "nodes": [
+    {
+      "L1 根类目": "Home & Kitchen",
+      "完整路径": "Home & Kitchen",
+      "类目名": "Home & Kitchen",
+      "深度": "1",
+      "browse_node_id": "",
+      "父节点ID": "L1_home-kitchen",
+      "产品样本数": "0",
+      "URL": "https://www.amazon.com/b?node=1055398",
+      "是否叶子": "否"
+    },
+    {
+      "L1 根类目": "Home & Kitchen",
+      "完整路径": "Home & Kitchen > Home Décor",
+      "类目名": "Home Décor",
+      "深度": "2",
+      "browse_node_id": "1063278",
+      "父节点ID": "1055398",
+      "产品样本数": "0",
+      "URL": "https://www.amazon.com/b?node=1063278",
+      "是否叶子": "否"
+    },
+    {
+      "L1 根类目": "Home & Kitchen",
+      "完整路径": "Home & Kitchen > Home Décor > Photo Albums, Frames & Accessories > Picture Frames",
+      "类目名": "Picture Frames",
+      "深度": "4",
+      "browse_node_id": "3736071",
+      "父节点ID": "3736061",
+      "产品样本数": "0",
+      "URL": "https://www.amazon.com/b?node=3736071",
+      "是否叶子": "否"
+    },
+    {
+      "L1 根类目": "Home & Kitchen",
+      "完整路径": "Home & Kitchen > Home Décor > Photo Albums, Frames & Accessories > Picture Frames > Wall & Tabletop Frames",
+      "类目名": "Wall & Tabletop Frames",
+      "深度": "5",
+      "browse_node_id": "3736081",
+      "父节点ID": "3736071",
+      "产品样本数": "120",
+      "URL": "https://www.amazon.com/b?node=3736081",
+      "是否叶子": "是"
+    },
+    {
+      "L1 根类目": "Clothing, Shoes & Jewelry",
+      "完整路径": "Clothing, Shoes & Jewelry > Men > Accessories > Belts",
+      "类目名": "Belts",
+      "深度": "4",
+      "browse_node_id": "2474937011",
+      "父节点ID": "2474936011",
+      "产品样本数": "88",
+      "URL": "https://www.amazon.com/b?node=2474937011",
+      "是否叶子": "是"
+    },
+    {
+      "L1 根类目": "Automotive",
+      "完整路径": "Automotive > Replacement Parts > Belts, Hoses & Pulleys > Belts",
+      "类目名": "Belts",
+      "深度": "4",
+      "browse_node_id": "2474937011",
+      "父节点ID": "15709631",
+      "产品样本数": "41",
+      "URL": "https://www.amazon.com/b?node=2474937011",
+      "是否叶子": "是"
+    }
+  ]
+}

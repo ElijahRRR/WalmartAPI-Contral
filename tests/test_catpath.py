@@ -261,9 +261,12 @@ def test_reconciled_file_fixture_end_to_end():
                                    "unverified_new_nodes", "nodes"]
     rows, paths, stat = parse_rows(data)
     by_node = {r[0]: r for r in rows}
-    # 根类目行 browse_node_id 为空,但 URL 带 node= → 兜回,不再丢
-    assert stat["skipped"] == 0 and stat["url_recovered"] == 1
-    assert by_node["1055398"][1] == "Home & Kitchen"
+    # 根类目行 browse_node_id 为空:URL 带 node= 的兜回,不带的照实跳过
+    assert stat["skipped"] == 1 and stat["url_recovered"] == 1
+    assert by_node["228013"][1] == "Tools & Home Improvement"
+    # 跳过的行必须原样打样本(猜它们长什么样已经错过两次)
+    survey = "\n".join(survey_file(data))
+    assert "↳ 被跳过样例:" in survey and "L1_home-kitchen" in survey
     # 中间层只在 nodes 段里,必须收进来(原来整段被丢 = 父链断)
     assert by_node["1063278"][1] == "Home Décor" and by_node["1063278"][5] is False
     # 叶子的节点级属性以 leaves 段为准(is_leaf 只有那段是权威)

@@ -187,6 +187,16 @@ def survey_file(data: dict) -> list[str]:
                        + (f";**{back} 行 ID 为空从 URL 兜回**" if back else "")
                        + (f";**{miss} 行无 node 值将跳过**" if miss else "")
                        + ")")
+            # 跳过的行**原样打样本**:猜它们长什么样已经错过两次(先猜"文件
+            # 只发叶子",再猜 URL 带 ?node=)。看不到就别推断。
+            shown = 0
+            for r, (node, _u) in zip(rows, got):
+                if node or shown >= 2:
+                    continue
+                shown += 1
+                out.append("    ↳ 被跳过样例:" + " | ".join(
+                    f"{k}={str(v)[:40]}"
+                    for k, v in r.items() if v not in (None, "")))
         else:
             out.append(f"  {key}: {n} 行 ⚠ **未解析**({_shape(val)})"
                        f"——认得的 node 字段名:{' / '.join(_K_NODE)}")

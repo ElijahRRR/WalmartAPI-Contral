@@ -52,7 +52,7 @@
       "browse_node_id": "",
       "父节点ID": "L1_home-kitchen",
       "产品样本数": "0",
-      "URL": "https://www.amazon.com/b?node=1055398",
+      "URL": "https://www.amazon.com/home-garden/b/ref=dp_bc_1",
       "是否叶子": "否"
     },
     {
@@ -109,6 +109,17 @@
       "产品样本数": "41",
       "URL": "https://www.amazon.com/b?node=2474937011",
       "是否叶子": "是"
+    },
+    {
+      "L1 根类目": "Tools & Home Improvement",
+      "完整路径": "Tools & Home Improvement",
+      "类目名": "Tools & Home Improvement",
+      "深度": "1",
+      "browse_node_id": "",
+      "父节点ID": "L1_tools",
+      "产品样本数": "0",
+      "URL": "https://www.amazon.com/b?node=228013",
+      "是否叶子": "否"
     }
   ]
 }

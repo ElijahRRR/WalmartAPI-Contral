@@ -670,6 +670,50 @@ def test_catmap_mine_classify_path():
     assert classify_path({"A": 6, "C": 4}, "B") is None     # 自身分流不算冲突
 
 
+def test_catmap_map_ambiguous_never_written():
+    """⚠ 潜伏 bug 的锁:映射表**自己**挂着多条 PT 不同的高置信行时,
+    ②级直出对该 key 已经失明(闸要求恰好一个高置信 PT)。原实现把这种 key
+    的 in_map 值取成 NULL,调用方当成"没映射过" ⇒ 会被当新映射挖出来、
+    promote 时再插第三条。现在单列一桶,只报不写。"""
+    from workflows.catmap_mine import _TIER_BY_STATUS, classify_path
+    got = classify_path({"A": 9}, None, in_map_ambiguous=True)
+    assert got == ("map_ambiguous", "A", 9)
+    assert "map_ambiguous" not in _TIER_BY_STATUS   # 无档位 ⇒ 不进 promote_rows
+
+
+def test_catmap_tier_by_status():
+    """分桶 → 置信档:高才直出,中/低只进候选交 LLM(所有者定稿 2026-08-14)。"""
+    from workflows.catmap_mine import _TIER_BY_STATUS
+    assert _TIER_BY_STATUS["mined_trusted"] == "高"
+    assert _TIER_BY_STATUS["mined_review"] == "中"    # 有真实 ASIN,票不多
+    assert _TIER_BY_STATUS["map_conflict"] == "中"    # 两条都留,LLM 挑
+    assert _TIER_BY_STATUS["mined_mixed"] == "低"     # 首选 PT 是多数派非共识
+
+
+def test_catmap_promotions_only_go_up():
+    """升档自动、降档不自动。证据可能只是**暂时**变薄(pt_source 回填没跑完、
+    本轮只挖了子集),据此自动降档会让 ②级直出对整个类目静默失效;高置信行
+    也可能是人工定的,机器不该拿一轮统计推翻人的判断。"""
+    from workflows.catmap_mine import plan_promotions
+    rows = [
+        ("A > B", "PT1", "n1", "高", "mined_trusted"),   # 新增
+        ("C > D", "PT2", "n2", "高", "mined_trusted"),   # 中 → 高:升档
+        ("E > F", "PT3", "n3", "中", "mined_review"),    # 已是高:跳过(不降)
+        ("G > H", "PT4", "n4", "中", "mined_review"),    # 同档:跳过(幂等)
+    ]
+    existing = {("C > D", "PT2"): "中", ("E > F", "PT3"): "高",
+                ("G > H", "PT4"): "中"}
+    planned, stat = plan_promotions(rows, existing)
+    assert stat == {"新增": 1, "升档": 1, "跳过(档位未提升)": 2}
+    assert [(r[0], r[3]) for r in planned] == [("A > B", "高"), ("C > D", "高")]
+    # 血统标记保持存量值:改名只会把同一来源的行分成两批,没有任何好处
+    assert planned[0][4] == "mined_products"
+    # 重跑幂等:把上一轮的结果当现状,应该一条都不写
+    again, stat2 = plan_promotions(rows, {**existing, ("A > B", "PT1"): "高",
+                                          ("C > D", "PT2"): "高"})
+    assert again == [] and stat2["跳过(档位未提升)"] == 4
+
+
 def test_catmap_sibling_verdict_and_parent():
     """兄弟继承:恰一 PT 且 ≥2 兄弟支持才继承;任何分流(含哨兵)不传播;
     父路径从面包屑字符串推导(外部 zgbs 树词汇表对不上,已撤——所有者

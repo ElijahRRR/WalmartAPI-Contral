@@ -687,10 +687,15 @@ def open_candidates(conn, product: ProductInfo, *,
         megas = _mega_categories(cur)
     if not megas:
         return []
+    # **大类清单放 system 不放 user**(2026-08-14 生产实测:清单每次调用完全
+    # 一样,放在 user 段的产品信息之后 ⇒ 一个字节都进不了 DeepSeek 前缀缓存,
+    # 可缓存占比只有 188/(188+清单+产品) ≈ 9%,等于每次全价重发)。挪进
+    # system 后前缀字节稳定,与 L1/L3 同享缓存红利。
+    system = (_MEGA_SYSTEM_PROMPT + "\n\n# 沃尔玛一级大类清单\n"
+              + "\n".join(f"  - {m}" for m in megas))
     messages = [
-        {"role": "system", "content": _MEGA_SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_prompt(product, []) +
-         "\n# 沃尔玛一级大类清单\n" + "\n".join(f"  - {m}" for m in megas)},
+        {"role": "system", "content": system},
+        {"role": "user", "content": build_user_prompt(product, [])},
     ]
     bump("open_stage1_called")
     try:

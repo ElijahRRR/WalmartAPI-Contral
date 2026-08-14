@@ -525,3 +525,22 @@ def test_picked_route_attribution():
     l1.rerank(_product(title="w"), cands, {"AncPT", "OtherPT"},
               chat_fn=lambda m: {"walmart_product_type": "OtherPT"})
     assert l1.STATS["picked_off_candidates"] == 1
+
+
+def test_open_stage1_puts_mega_list_in_system_for_cache():
+    """大类清单必须在 system 段:它每次调用完全一样,放 user 段(产品信息之后)
+    一个字节都进不了 DeepSeek 前缀缓存 —— 生产实测可缓存占比只剩 ~9%。"""
+    seen = {}
+
+    def _spy(messages):
+        seen["system"] = messages[0]["content"]
+        seen["user"] = messages[1]["content"]
+        return {"categories": []}
+
+    cur = FakeCursor({"SELECT DISTINCT walmart_category": (
+        ["walmart_category"], [("Home",), ("Garden",)])})
+    l1.open_candidates(FakeConn(cur), _product(title="w"), chat_fn=_spy)
+    assert "- Home" in seen["system"] and "- Garden" in seen["system"]
+    assert "Home" not in seen["user"].replace("Home & Kitchen", "")
+    # system 必须比 user 长:可缓存的那半边才该是大头
+    assert len(seen["system"]) > len(seen["user"]) * 0.5

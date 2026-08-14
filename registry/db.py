@@ -17,8 +17,12 @@ def pg_dsn() -> str:
 
 
 @contextlib.contextmanager
-def pg_conn():
-    """输入:无 → 输出:psycopg 连接上下文;正常退出 commit,异常 rollback,总是 close。
+def pg_conn(autocommit: bool = False):
+    """输入:(可选 autocommit)→ 输出:psycopg 连接上下文;总是 close。
+
+    默认事务模式:正常退出 commit,异常 rollback。autocommit=True 给并发
+    worker 的只读+幂等缓存写用(product_audit workers>1:每 worker 一条
+    连接,写路径仍归主线程的事务连接)。
 
     用法:
         with db.pg_conn() as conn:
@@ -26,12 +30,14 @@ def pg_conn():
     """
     import psycopg  # 惰性导入:让不碰 PG 的 workflow 在缺 psycopg 的环境也能运行
 
-    conn = psycopg.connect(pg_dsn())
+    conn = psycopg.connect(pg_dsn(), autocommit=autocommit)
     try:
         yield conn
-        conn.commit()
+        if not autocommit:
+            conn.commit()
     except BaseException:
-        conn.rollback()
+        if not autocommit:
+            conn.rollback()
         raise
     finally:
         conn.close()

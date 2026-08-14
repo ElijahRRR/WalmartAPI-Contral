@@ -173,6 +173,17 @@ CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_event
 -- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
 ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
 
+-- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
+-- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
+-- **类目名会漂,ID 不会**:Amazon 的 URL slug / 面包屑 / Best Sellers 导航
+-- 三套名称不一致,按路径字符串匹配会把同一类目误判成缺口;ID 链最后一段
+-- = 当前最细类目,直查 walmart_category_map.browse_node_id 精确命中。
+-- 审核 L1 ②级优先用它,字符串路径与 category_path_alias 降级为无 ID 老行兜底
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_chain text;
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_id text;
+CREATE INDEX IF NOT EXISTS products_browse_node_idx
+    ON catalog.products (browse_node_id);
+
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
 -- 各有身份。谁上架谁登记;自动化按出身路由(路由铁律:由"源数据缺失"驱动的
@@ -1001,6 +1012,79 @@ CREATE INDEX IF NOT EXISTS idx_werror_pt     ON audit.walmart_error_records(walm
 CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(report_date);
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
+
+-- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
+-- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
+-- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
+-- 进映射表才生效。status:inherited(兄弟继承,免 LLM)/ok/unknown/excluded/no_candidate/llm_failed
+
+-- 亚马逊类目树(所有者对账版 2026-08-14;taxonomy_import 灌入)。
+-- **以 browse_node_id 为主键**——与产品侧 products.browse_node_id、映射表
+-- walmart_category_map.browse_node_id 三方 JOIN,名称漂移在此不成问题
+-- (2026-08-13 撤掉的那棵 Best Sellers 名称树正因只有名字才对不上)。
+-- 用途:①缺口工作面(树 3.2 万 node vs 映射 1.57 万,差集即未映射类目)
+-- ②规范名(人工复核/LLM 提示词用它,不用产品侧漂移面包屑)③祖先回退
+-- 迁移:2026-08-13 那版名称树(主键 path、有 parent_path 列)与本表结构
+-- 不兼容,且它**从未被填充过**(预览即撤,库内 0 行)——检出旧形态直接
+-- 丢弃重建。判据用 information_schema 精确到列,不误伤新表(生产实测:
+-- CREATE TABLE IF NOT EXISTS 遇旧表静默跳过,后面建索引才炸)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'audit' AND table_name = 'amazon_taxonomy'
+                 AND column_name = 'parent_path') THEN
+        DROP TABLE audit.amazon_taxonomy;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
+    node_id         text PRIMARY KEY,
+    name            text NOT NULL,     -- 类目名(路径末段)
+    path            text,              -- 完整路径(官方口径)
+    depth           integer,
+    parent_node_id  text,              -- 父 node;根级为 NULL
+    is_leaf         boolean,
+    root_name       text,              -- L1 根类目名
+    product_samples integer,           -- 树自带的样本数(采集侧统计,仅参考)
+    source          text,              -- leaves / verified_added_paths /
+                                       -- unverified_new_nodes(未验证新 node)
+    imported_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);
+
+-- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
+-- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移
+-- 'Home Décor Products' vs 'Home Décor'、'Outdoor Power Tools' vs
+-- 'Mowers & Outdoor Power Tools'——按完整路径精确等值会把已映射路径误判
+-- 成缺口)。对齐三闸:叶子相等 + 顶级相等 + 段集重叠且唯一(services/catpath)。
+-- 消费:audit_rules ②级映射精确匹配未命中时,经本表折到 canonical 再查
+CREATE TABLE IF NOT EXISTS audit.category_path_alias (
+    path           text PRIMARY KEY,   -- 产品侧面包屑原文(btrim)
+    canonical_path text NOT NULL,      -- 映射表里的等价路径
+    score          numeric NOT NULL,   -- 段集重叠分(≥0.5 才落)
+    aligned_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
+    amazon_category text PRIMARY KEY,
+    suggested_pt    text,
+    confidence      text,
+    status          text NOT NULL,
+    sample_asin     text,
+    sample_title    text,
+    product_count   integer,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+-- 挖掘家族补列(catmap_mine,2026-08-13):support=支持该 PT 的产品数,
+-- distribution=该路径下全部 PT 分布(分流时人工核对的依据)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS support_count integer;
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS pt_distribution jsonb;
+-- node 键挖掘(2026-08-14)必须留 ID:建议表主键是代表路径,不存 ID 的话
+-- 复核清单看不到 node、catmap_fix 也无从圈定(生产实测所有者反馈)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS browse_node_id text;
 
 -- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照

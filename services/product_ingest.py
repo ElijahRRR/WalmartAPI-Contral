@@ -41,9 +41,10 @@ ON CONFLICT (source_id) DO NOTHING
 _PRODUCT_SQL = """
 INSERT INTO catalog.products (
     marketplace, asin, title, brand, amazon_category, image_url, slow_hash,
-    slow, updated_at)
+    slow, browse_node_chain, browse_node_id, updated_at)
 VALUES (%(marketplace)s, %(asin)s, %(title)s, %(brand)s, %(amazon_category)s,
-        %(image_url)s, %(slow_hash)s, %(slow)s::jsonb, now())
+        %(image_url)s, %(slow_hash)s, %(slow)s::jsonb,
+        %(browse_node_chain)s, %(browse_node_id)s, now())
 ON CONFLICT (marketplace, asin) DO UPDATE SET
     title = COALESCE(EXCLUDED.title, catalog.products.title),
     brand = COALESCE(EXCLUDED.brand, catalog.products.brand),
@@ -52,6 +53,11 @@ ON CONFLICT (marketplace, asin) DO UPDATE SET
     image_url = COALESCE(EXCLUDED.image_url, catalog.products.image_url),
     slow_hash = COALESCE(EXCLUDED.slow_hash, catalog.products.slow_hash),
     slow = COALESCE(EXCLUDED.slow, catalog.products.slow),
+    -- 类目 ID 链(契约 v1 追加):名称会漂 ID 不会,是 L1 最精确的类目锚
+    browse_node_chain = COALESCE(EXCLUDED.browse_node_chain,
+                                 catalog.products.browse_node_chain),
+    browse_node_id = COALESCE(EXCLUDED.browse_node_id,
+                              catalog.products.browse_node_id),
     -- 审核重审触发(批次 B1,批复 #9):慢变字段真变了才把 approved 翻回
     -- pending;rejected 永不自动重审(force_rerun 手动通道在 product_audit)。
     -- EXCLUDED.slow_hash 为 NULL(本次没采到 hash)不触发——上面 COALESCE
@@ -86,6 +92,47 @@ def _category(slow: dict) -> str | None:
     if isinstance(path, str):
         return path
     return " > ".join(str(p) for p in path if p)
+
+
+_NODE_SENTINELS = {"", "n/a", "none", "null", "-"}   # 采集侧空值哨兵(root_category_id="N/A")
+
+
+def category_nodes(slow: dict, raw: dict | None = None) -> tuple[str | None, str | None]:
+    """输入:slow(+可选 raw)→ 输出:(browse_node 链原文, 叶子 node_id)。
+
+    所有者定稿 2026-08-14:**类目名会漂,browse_node_id 不会**——Amazon 的
+    URL slug / 面包屑 / Best Sellers 导航三套名称不一致,按路径字符串匹配
+    会把同一类目误判成缺口;ID 链的**最后一段 = 当前最细类目**,拿它直查
+    映射表的 browse_node_id 列即可精确命中(该表 ID 覆盖率实测 100%)。
+
+    取值口径(采集器源码核实 2026-08-14):采集侧解析面包屑时 ID 与名字树
+    **同一处产出**(worker/parser.py:2532-2545 正则 `node=(\\d+)`),落库三列
+    root_category_id / category_ids / category_tree;但增量导出的 slow 段
+    只挑了名字树(server/api/export_incremental.py:235)——**ID 未进 slow,
+    却在 raw 里幸存**(不在 _RAW_DROP 剔除清单内)。故取值顺序:
+      1. raw.category_ids —— 现役真实键名(逗号串,root→leaf 有序);
+      2. slow.category_id_chain —— 若采集侧后续把它提进 slow(契约追加)。
+    两处都没有 → (None, None),行为退回字符串路径匹配。
+
+    ⚠ 已知口径(采集侧 common/slowhash.py:136-137):category_ids **被有意
+    排除在 slow_hash 之外**,故"只有 ID 链变了"不会推动 slow_hash、不会触发
+    重审——ID 是补锚用的,不当变更信号。
+    """
+    chain = None
+    if raw:
+        chain = _blank_to_none(raw.get("category_ids"))
+    if not chain:
+        chain = _blank_to_none(slow.get("category_id_chain"))
+    if not chain:
+        return None, None
+    if isinstance(chain, (list, tuple)):
+        ids = [str(x).strip() for x in chain]
+    else:
+        ids = [x.strip() for x in str(chain).split(",")]
+    ids = [i for i in ids if i and i.lower() not in _NODE_SENTINELS]
+    if not ids:
+        return None, None
+    return ",".join(ids), ids[-1]
 
 
 def _main_image(slow: dict) -> str | None:
@@ -160,12 +207,16 @@ def snapshot_params(rec: dict) -> dict:
 def product_params(rec: dict) -> dict:
     """输入:record → 输出:products 行参数(慢变字段,空值已归一为 None)。"""
     slow = rec.get("slow") or {}
+    # raw 也要看:类目 ID 链现役只在 raw 里(见 category_nodes 取值口径)
+    chain, node_id = category_nodes(slow, rec.get("raw") or {})
     return {
         "marketplace": rec.get("marketplace") or "US",
         "asin": rec.get("asin"),
         "title": _blank_to_none(slow.get("title")),
         "brand": _blank_to_none(slow.get("brand")),
         "amazon_category": _category(slow),
+        "browse_node_chain": chain,
+        "browse_node_id": node_id,
         "image_url": _main_image(slow),
         "slow_hash": _blank_to_none(rec.get("slow_hash")),
         # slow 段全量留存:卖点/描述/重量/尺寸/变体都在这里,契约的 raw 已裁剪

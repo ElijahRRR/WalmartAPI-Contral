@@ -23,6 +23,22 @@ _BASE_URL = "https://api.deepseek.com/chat/completions"
 _MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 
+def model_for(purpose: str) -> str:
+    """输入:用途名(registry.LLM_PURPOSE_ENV 的键)→ 输出:该用途的模型名。
+
+    批复 #1(2026-08-13):DeepSeek 分用途选模型,env 逐用途覆盖
+    (如 DEEPSEEK_MODEL_AUDIT_L1),未配置回落 DEEPSEEK_MODEL 默认。
+    未登记的用途直接抛错(fail loud:拼错用途名静默吃默认模型,成本/
+    效果偏差没人会发现)。
+    """
+    from registry import resources
+    env = resources.LLM_PURPOSE_ENV.get(purpose)
+    if env is None:
+        raise ValueError(f"未登记的 LLM 用途 {purpose!r}:先在 "
+                         f"registry.LLM_PURPOSE_ENV 登记再使用")
+    return os.environ.get(env, "").strip() or _MODEL
+
+
 def _api_key() -> str:
     v = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not v:
@@ -43,15 +59,35 @@ def _extract_json(text: str) -> dict:
     return json.loads(s[start:end + 1])
 
 
-def chat_json(messages: list[dict], *, temperature: float = 0.2,
-              max_tokens: int = 4096, max_retries: int = 3) -> dict:
-    """输入:messages → 输出:模型回复中解析出的 JSON dict。
+def _request_body(messages: list[dict], temperature: float,
+                  max_tokens: int, purpose: str) -> dict:
+    """输入:请求要素 → 输出:DeepSeek chat 请求体(纯函数,便于测试)。
 
-    读操作可安全重试:超时/5xx/429 指数退避(1/2/4s);4xx 直接抛。
+    v4-flash 家族官方**默认开 thinking**,旧仓铁律"必须永远显式下发
+    disable"(llm_routes.py:91-93/701;所有者确认生产 DEEPSEEK_MODEL=
+    deepseek-v4-flash,2026-08-13)——按模型名门控,非 flash 家族不发
+    该字段(未知字段可能被拒)。开关无条件生效、不存在两种变体并存,
+    故 llm_cache 键不含它(既有缓存零失效)。
     """
-    body = {"model": _MODEL, "messages": messages,
+    model = model_for(purpose)
+    body = {"model": model, "messages": messages,
             "temperature": temperature, "max_tokens": max_tokens,
             "response_format": {"type": "json_object"}}
+    if "flash" in model:
+        body["thinking"] = {"type": "disabled"}
+    return body
+
+
+def chat_json(messages: list[dict], *, temperature: float = 0.2,
+              max_tokens: int = 4096, max_retries: int = 3,
+              purpose: str = "default") -> dict:
+    """输入:messages(+用途)→ 输出:模型回复中解析出的 JSON dict。
+
+    purpose 按 registry.LLM_PURPOSE_ENV 选模型(10.2 定稿);单链无自动
+    降级——失败同链重试,重试尽抛异常,由调用方决定 pending,绝不默认放行。
+    读操作可安全重试:超时/5xx/429 指数退避(1/2/4s);4xx 直接抛。
+    """
+    body = _request_body(messages, temperature, max_tokens, purpose)
     headers = {"Authorization": f"Bearer {_api_key()}"}
     last: Exception | None = None
     for attempt in range(max_retries):

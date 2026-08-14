@@ -1,4 +1,4 @@
-"""product_audit — 产品审核主流程(批次 B:零 LLM 纯规则层;危险,默认 dry-run)。
+"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,默认 dry-run)。
 
 用法:
   python cli.py product_audit                       # dry-run:判定 + 落 runs/hits,不写结论
@@ -7,16 +7,18 @@
   python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
+  python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
+  python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
 
-链路:领 catalog.products 待审行(audit_status IS NULL / 'pending')→
-Phase0 四件套 → PT 解析(实证→映射表)→ L2 硬规则 → 37 政策理由映射 →
-落 audit.audit_runs/audit_hits;--execute 才写 products.audit_* 五列与
-audit_passed/audit_rejected 事件。**批次 B 只落库不投影飞书**(并跑期纪律,
-E/D 列投影在批次 D 切换日开闸;上架链此时仍按旧口径走,库内结论仅供校准)。
+链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
+L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
+L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;--execute 才写
+products.audit_* 五列与审核事件。**只落库不投影飞书**(并跑期纪律,
+E/D 列投影在批次 D 切换日开闸)。
 
-dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落(它们是只追加的
-明细账,dry-run 的判定同样是真判定),但**不碰 products 五列、不发事件、
-不投影**——消费端(未来的 list_new 查库)看不到任何变化。
+dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
+五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
+(L1 rerank / L3;L4 需显式 l4=on)——验收抽样时用 limit 控制成本。
 
 补刷(mode=backfill,批复 #5"只补刷"):候选限 audit_status IS NULL;先查
 audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
@@ -24,8 +26,8 @@ audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
 实现旧 reject 粘性),有历史者**直接采用**写五列+事件(detail 带
 referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者进正常判定。
 
-PT 解不出 → pending(reason=待类目判定;批次 C 接 L1 后自动重审)——
-批次 B 的自定义保守行为,旧仓此处有 L1 LLM 保底。
+pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
+L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日退避重试。
 无标题产品跳过不审(采集降级,不够格判定;amz_source:103 先例)并计数。
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
@@ -47,6 +49,8 @@ _CANDIDATE_SQL = """
 SELECT p.asin,
        p.title,
        p.brand,
+       p.walmart_pt,
+       p.browse_node_id,
        p.amazon_category AS amazon_category_path,
        p.slow -> 'bullet_points' AS bullet_points,
        coalesce(p.slow ->> 'description',
@@ -61,10 +65,23 @@ LEFT JOIN LATERAL (
       AND s.outcome = 'ok'
     ORDER BY s.scraped_at DESC LIMIT 1
 ) sn ON true
-WHERE p.marketplace = %(marketplace)s AND ({where})
+WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
+  AND p.title IS NOT NULL AND p.title <> ''
 ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
 """
+# ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
+#   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
+#   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,
+#   会体现在"库中命中 N"的缺口提示里(空壳行没有可审内容,过滤是对的)
+
+# dry-run 复烧护栏(评审 P1-1):dry-run 不动 audited_at,同一批候选会被
+# 连续 dry-run 反复领走——L1 rerank/L4 不缓存,每轮全额重付 LLM 费用。
+# runs 是 dry-run 也落的,拿它做 24h 排除;asins= 强审除外(点名就要审)
+_RECENT_RUN_GUARD = """
+ AND NOT EXISTS (
+    SELECT 1 FROM audit.audit_runs r
+    WHERE r.asin = p.asin AND r.created_at > now() - interval '24 hours')"""
 # 排序契约:从未审过的(audited_at NULL)永远先于重试的 pending——
 # 否则 pending 存量 ≥ limit 时新入库产品会被饿死(评审 P1-3)
 
@@ -90,7 +107,8 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun"}
+_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
+                 "l3", "l4", "workers"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -169,6 +187,15 @@ def run(params: dict) -> str:
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
     r5_on = str(params.get("r5", "")).strip().lower() == "on"
+    # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
+    run_l3 = str(params.get("l3", "")).strip().lower() != "off"
+    run_l4 = str(params.get("l4", "")).strip().lower() == "on"
+    # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
+    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
+    # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
+    workers = max(1, min(int(params.get("workers", 4)), 16))
+    if r5_on:
+        workers = 1
     where, extra = _pick_where(params)
     if "asins" in extra:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
@@ -179,8 +206,14 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn, uspto_cm as uspto:
         ctx = audit_rules.load_context(conn, uspto=uspto)
         query_params = {"marketplace": "US", "limit": limit, **extra}
+        # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
+        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
+        guard = (_RECENT_RUN_GUARD
+                 if (not execute and "asins" not in extra) else "")
         with conn.cursor() as cur:
-            cur.execute(_CANDIDATE_SQL.format(where=where), query_params)
+            cur.execute(_CANDIDATE_SQL.format(where=where,
+                                              recent_guard=guard),
+                        query_params)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -191,7 +224,13 @@ def run(params: dict) -> str:
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0
+        stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
+                       "L4_ran": 0, "L4_reject": 0}
+        l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
+        audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         events = []
+        row_errors, consec_errors = 0, 0
+        todo = []
         for row in rows:
             if row["asin"] in adopted:
                 continue
@@ -200,19 +239,75 @@ def run(params: dict) -> str:
                 continue
             if not row.get("seller_id"):
                 seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
-            product = audit_rules.product_info_from_row(row)
-            outcome = audit_rules.audit_one(product, ctx)
-            counts[outcome.verdict] += 1
-            if (outcome.verdict == "reject" and ctx.known_policies
-                    and not audit_reason.known_policies_check(
-                        outcome.final_reason_category, ctx.known_policies)):
-                policy_unknown += 1
-            run_id = audit_store.persist_run(conn, outcome)
-            if execute:
-                audit_store.write_conclusion(conn, outcome)
-                ev = audit_store.event_row(outcome, run_id)
-                if ev:
-                    events.append(ev)
+            todo.append((row["asin"], audit_rules.product_info_from_row(row)))
+
+        # 判定并发:worker 各领一条 autocommit 连接跑 audit_one(LLM 秒级,
+        # 是墙钟大头);结果按完成序回主线程,落库/计数全在主线程单连接上
+        # (savepoint 语义与串行版完全一致)。连错 ≥5 = 系统性故障,炸停
+        import queue as _queue
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            pool: _queue.SimpleQueue = _queue.SimpleQueue()
+            for _ in range(workers):
+                pool.put(stack.enter_context(db.pg_conn(autocommit=True)))
+
+            def _judge(product):
+                c = pool.get()
+                try:
+                    return audit_rules.audit_one(product, ctx, c,
+                                                 run_l3=run_l3, run_l4=run_l4)
+                finally:
+                    pool.put(c)
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                for fut in as_completed(futs):
+                    asin = futs[fut]
+                    try:
+                        outcome = fut.result()
+                        # 每行 savepoint(评审 P2):一行落库报错不炸整批
+                        # 已付费的 runs/hits
+                        with conn.transaction():
+                            run_id = audit_store.persist_run(conn, outcome)
+                            if execute:
+                                audit_store.write_conclusion(conn, outcome)
+                                ev = audit_store.event_row(outcome, run_id)
+                                if ev:
+                                    events.append(ev)
+                    except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
+                        row_errors += 1
+                        consec_errors += 1
+                        logger.error("单行审核失败 asin=%s:%s", asin, e)
+                        if consec_errors >= 5:
+                            for f in futs:
+                                f.cancel()
+                            raise RuntimeError(
+                                f"连续 {consec_errors} 行失败(共 {row_errors}),"
+                                f"疑似系统性故障,停批。最后错误:{e}") from e
+                        continue
+                    consec_errors = 0
+                    if outcome.l3 is not None:
+                        stage_stats["L3_ran"] += 1
+                        if outcome.l3.verdict == "reject":
+                            stage_stats["L3_reject"] += 1
+                        elif outcome.l3.verdict == "pending":
+                            stage_stats["L3_pending"] += 1
+                    if outcome.l4 is not None:
+                        stage_stats["L4_ran"] += 1
+                        if outcome.l4.verdict == "reject":
+                            stage_stats["L4_reject"] += 1
+                        for h in outcome.l4.hits:
+                            if h.penalty == 0 and h.rule_code.startswith("l4_"):
+                                l4_fail[h.rule_code] = \
+                                    l4_fail.get(h.rule_code, 0) + 1
+                    counts[outcome.verdict] += 1
+                    if (outcome.verdict == "reject" and ctx.known_policies
+                            and not audit_reason.known_policies_check(
+                                outcome.final_reason_category,
+                                ctx.known_policies)):
+                        policy_unknown += 1
         if execute and events:
             product_events.record_many(conn, events)
 
@@ -226,9 +321,40 @@ def run(params: dict) -> str:
 
     judged = sum(counts.values())
     lines = [f"product_audit({resources.AUDIT_RULES_VERSION}"
-             f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}):"
+             f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
+             f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
              f"候选 {len(rows)},判定 {judged}"
              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
+    l1s = audit_rules.audit_l1_llm.STATS
+    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
+        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
+                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
+                     f"unknown→待定 {l1s.get('unknown', 0)},"
+                     f"字典回落 {l1s.get('dict_fallback', 0)},"
+                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
+                     f"低置信采纳 {l1s.get('conf_low', 0)}")
+    l1_blocked = (l1s.get("seed_excluded_direct", 0)
+                  + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
+                  + l1s.get("publication_forbidden", 0))
+    if l1_blocked:
+        lines.append(f"L1 硬拦:直出级 seed {l1s.get('seed_excluded_direct', 0)}"
+                     f" / rerank 级 excluded {l1s.get('llm_excluded', 0)}"
+                     f"(seed 补位 {l1s.get('seed_excluded', 0)})"
+                     f" / 出版物 {l1s.get('publication_forbidden', 0)}")
+    if stage_stats["L3_ran"]:
+        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
+                     f"(拒 {stage_stats['L3_reject']}/"
+                     f"LLM 故障待定 {stage_stats['L3_pending']})")
+    if stage_stats["L4_ran"]:
+        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
+                     f"(拒 {stage_stats['L4_reject']})")
+    if l4_fail:
+        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
+        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
+        lines.append(f"⚠ L4 故障回落 pass:{detail}"
+                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
+    if row_errors:
+        lines.append(f"⚠ 单行失败跳过 {row_errors}(savepoint 隔离,详见日志)")
     if "asins" in extra and len(rows) < len(extra["asins"]):
         lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
                      f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")

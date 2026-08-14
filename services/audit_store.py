@@ -19,14 +19,15 @@ from services.audit_models import AuditOutcome
 _VERDICT_TO_STATUS = {"pass": "approved", "reject": "rejected",
                       "pending": "pending"}
 
-_PENDING_REASON = "待类目判定(批次 C L1 接线后自动重审)"
+_PENDING_REASON = "待类目判定(候选/rerank 均解不出,每日退避重试)"
+_PENDING_REASON_L3 = "LLM 全链路故障, 待人工复核"   # 旧仓字面量(l3_llm.py F1)
 
 _RUN_SQL = """
 INSERT INTO audit.audit_runs
   (asin, walmart_product_type, pt_confidence, pt_source,
    score_start, score_final, verdict, stage_stopped_at,
    l3_verdict, l3_reason_category, l3_reason_text, l4_verdict, l4_issues)
-VALUES (%s, %s, %s, %s, 100, %s, %s, %s, 'skip', NULL, NULL, 'skip', '[]'::jsonb)
+VALUES (%s, %s, %s, %s, 100, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
 RETURNING run_id
 """
 
@@ -49,6 +50,8 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 def persist_run(conn, outcome: AuditOutcome) -> int:
     """输入:连接 + 判定结果 → 输出:run_id(runs 一行 + hits 逐条)。"""
     with conn.cursor() as cur:
+        # l3/l4 槽位口径逐字迁 orchestrator.py:36-58:未跑 = 'skip'/NULL/'[]'
+        l3, l4 = outcome.l3, outcome.l4
         cur.execute(_RUN_SQL, (
             outcome.asin,
             outcome.l1.walmart_product_type,
@@ -57,6 +60,12 @@ def persist_run(conn, outcome: AuditOutcome) -> int:
             outcome.score_final,
             outcome.verdict,
             outcome.stage_stopped_at,
+            l3.verdict if l3 else "skip",
+            l3.reason_category if l3 else None,
+            l3.reason_text if l3 else None,
+            l4.verdict if l4 else "skip",
+            json.dumps(l4.image_issues, ensure_ascii=False, default=str)
+            if l4 else "[]",
         ))
         run_id = cur.fetchone()[0]
         hits = outcome.all_hits
@@ -73,6 +82,8 @@ def real_pt(outcome: AuditOutcome) -> str | None:
     pt = outcome.l1.walmart_product_type
     if not pt or pt.startswith("("):     # "(phase0_blocked)" 等桩值不进身份层
         return None
+    if pt == "unknown":                  # 批次 C:哨兵/excluded 路径的旧仓字面量
+        return None                      # (runs 里留档,身份层不收占位值)
     return pt
 
 
@@ -83,7 +94,9 @@ def write_conclusion(conn, outcome: AuditOutcome,
     if outcome.verdict == "reject":
         reason = outcome.final_reason_category
     elif outcome.verdict == "pending":
-        reason = _PENDING_REASON
+        # 两种 pending 来源分开留痕:L1=类目解不出,L3=LLM 故障(重试口径不同)
+        reason = (_PENDING_REASON_L3 if outcome.stage_stopped_at == "L3"
+                  else _PENDING_REASON)
     else:
         reason = None
     conn.execute(_PRODUCT_SQL, {

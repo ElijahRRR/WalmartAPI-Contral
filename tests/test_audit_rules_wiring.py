@@ -5,6 +5,7 @@ _pick_where 四态与参数白名单、黑名单中心镜像空读/骤缩护栏�
 ASIN 历史导入解析、行适配。
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -218,6 +219,425 @@ def test_parse_asin_lines_keeps_raw_case():
     """键以原文为准,不做 upper——与黑名单中心既有键口径一致。"""
     asins, _, nonstd = parse_asin_lines("b0abcdefgh\n")
     assert asins == ["b0abcdefgh"] and nonstd == 1   # 小写不匹配标准式
+
+
+# ── 批次 C 接线:L1 三级扩展 / L3 / L4 流转(orchestrator.py:378-398 口径)────
+
+_META_C = {**META,
+           "Books": {"walmart_category": "Media", "walmart_ptg": None,
+                     "access_state": "普通商品", "zh_can_do": "是",
+                     "requirements": "", "notes": ""}}
+
+
+def test_resolve_pt_known_pt_second_source():
+    """①b 产品行已知 PT(pt_backfill 回填的历史实证;所有者定稿:PT 长在
+    产品主档不查边表):在架实证优先,行 PT 次之,废弃 PT 过闸。"""
+    ctx = _ctx(pt_meta=META)
+    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X", known_pt="GoodPT"), ctx)
+    assert l1.walmart_product_type == "GoodPT"
+    assert l1.pt_source == "historical_confirmed"
+    both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0X", known_pt="GoodPT"),
+        both).pt_source == "walmart_confirmed"
+    dead = audit_rules.resolve_pt(
+        ProductInfo(asin="B0Y", known_pt="DeadPT"), ctx)
+    assert dead.walmart_product_type is None      # 行 PT 不在 pt_meta → 不采
+
+
+def test_resolve_pt_sentinel_hard_reject_after_evidence():
+    """Layer 0 哨兵:旧仓字面量三件(unknown/低/none)+ -100 hit;
+    实证命中时哨兵不生效(批复 #10 实证最优先,与旧仓'哨兵最前'有意不同)。"""
+    ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}))
+    p = ProductInfo(asin="B0S", title="w", amazon_category_path="Dead > Path")
+    l1 = audit_rules.resolve_pt(p, ctx)
+    assert l1.walmart_product_type == "unknown"
+    assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].penalty == -100
+    out = audit_rules.audit_one(p, ctx)
+    assert out.verdict == "reject" and out.score_final == 0
+    # 实证在场 → 哨兵让位
+    ev = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}),
+              walmart_confirmed={"B0S": "GoodPT"})
+    assert audit_rules.resolve_pt(p, ev).walmart_product_type == "GoodPT"
+
+
+def test_resolve_pt_publication_ban_covers_direct_levels():
+    """合同 L1-6:出版物硬禁盖全三级(批次 B 漏迁归还)——实证直出 Books 也拦。"""
+    ctx = _ctx(pt_meta=_META_C, walmart_confirmed={"B0P": "Books"})
+    p = ProductInfo(asin="B0P", title="novel")
+    l1 = audit_rules.resolve_pt(p, ctx)
+    assert any(h.rule_code == "publication_pt_forbidden" for h in l1.hits)
+    out = audit_rules.audit_one(p, ctx)
+    assert out.verdict == "reject"
+    assert out.final_reason_category == "Intellectual Property"
+
+
+def _l3_result(verdict, **kw):
+    from services.audit_l3 import L3Result
+    return L3Result(verdict=verdict, **kw)
+
+
+def test_audit_one_l3_flow(monkeypatch):
+    """L3 流转逐字迁 orchestrator.py:378-389:l2 pass 才进;reject/pending
+    改判 + stage='L3',分数保留 L2 值(L3 不动分)。"""
+    from services import audit_l3
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"})
+    p = ProductInfo(asin="B0A", title="widget")
+    calls = []
+
+    def fake_judge(product, l1, l2, c, conn):
+        calls.append(product.asin)
+        return _l3_result("reject", reason_category="offensive content")
+    monkeypatch.setattr(audit_l3, "judge_l3", fake_judge)
+    out = audit_rules.audit_one(p, ctx, conn=object())
+    assert calls == ["B0A"]
+    assert out.verdict == "reject" and out.stage_stopped_at == "L3"
+    assert out.score_final == 100          # L3 不动分:reject 而分数保持
+    assert out.l3.verdict == "reject"
+
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a: _l3_result("pending"))
+    out2 = audit_rules.audit_one(p, ctx, conn=object())
+    assert out2.verdict == "pending" and out2.stage_stopped_at == "L3"
+    assert out2.score_final == 100         # 合同 L3-8:L3 pending 保留 L2 分
+
+    out3 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out3.l3 is None and out3.verdict == "pass"
+
+    out4 = audit_rules.audit_one(p, ctx)   # conn=None:批次 B 形态,零 LLM
+    assert out4.l3 is None and out4.verdict == "pass"
+
+
+def test_audit_one_l2_reject_skips_l3(monkeypatch):
+    from services import audit_l3
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a: pytest.fail("L2 reject 不得进 L3"))
+    ctx = _ctx(pt_meta=_META_C, walmart_confirmed={"B0P": "Books"})
+    out = audit_rules.audit_one(ProductInfo(asin="B0P", title="n"), ctx,
+                                conn=object())
+    assert out.verdict == "reject" and out.l3 is None
+
+
+def test_audit_one_l4_flow(monkeypatch):
+    """L4 流转(orchestrator.py:392-398):仅 outcome pass 且 l4 开;只认 reject。"""
+    from services import audit_l3, audit_l4
+    from services.audit_l4 import L4Result
+    ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"})
+    p = ProductInfo(asin="B0A", title="widget")
+    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("pass"))
+    monkeypatch.setattr(audit_l4, "judge_l4",
+                        lambda *a, **k: L4Result(verdict="reject"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
+    assert out.verdict == "reject" and out.stage_stopped_at == "L4"
+    # 默认关(批复 #2)
+    out2 = audit_rules.audit_one(p, ctx, conn=object())
+    assert out2.l4 is None and out2.verdict == "pass"
+    # L3 已拒 → L4 不跑
+    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("reject"))
+    monkeypatch.setattr(audit_l4, "judge_l4",
+                        lambda *a, **k: pytest.fail("非 pass 不得进 L4"))
+    out3 = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
+    assert out3.stage_stopped_at == "L3"
+
+
+def test_audit_one_rerank_wiring(monkeypatch):
+    """PT 前两级解不出且有 conn → 走候选+rerank;rerank None → pending。"""
+    from services import audit_l1_llm
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0R", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    monkeypatch.setattr(
+        audit_l1_llm, "rerank",
+        lambda pr, cands, ptd, **k: audit_rules.L1Info(
+            walmart_product_type="GoodPT", pt_confidence="高",
+            pt_source="map_verified"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pass"
+    assert out.l1.walmart_category == "Home"   # 接线补 walmart_category
+    monkeypatch.setattr(audit_l1_llm, "rerank", lambda *a, **k: None)
+    out2 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out2.verdict == "pending" and out2.stage_stopped_at == "L1"
+
+
+def test_persist_run_l3_l4_columns():
+    """audit_runs 的 l3/l4 槽位:未跑 'skip'/NULL/'[]',跑了写实际值。"""
+    from services.audit_l4 import L4Result
+    captured = []
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            captured.append(params)
+
+        def executemany(self, sql, rows):
+            pass
+
+        def fetchone(self):
+            return (7,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    base = dict(asin="B0", verdict="pass", score_final=100,
+                stage_stopped_at=None,
+                l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.persist_run(_Conn(), AuditOutcome(**base))
+    assert captured[0][7:] == ("skip", None, None, "skip", "[]")
+    o = AuditOutcome(**{**base, "verdict": "reject", "stage_stopped_at": "L3"})
+    o.l3 = _l3_result("reject", reason_category="offensive content",
+                      reason_text="bad")
+    o.l4 = L4Result(verdict="pass", image_issues=[{"image_index": 1}])
+    audit_store.persist_run(_Conn(), o)
+    assert captured[1][7:11] == ("reject", "offensive content", "bad", "pass")
+    assert json.loads(captured[1][11]) == [{"image_index": 1}]
+
+
+def test_write_conclusion_pending_reason_by_stage():
+    """两种 pending 来源 reason 分开:L1=类目解不出,L3=LLM 故障(旧仓字面量)。"""
+    captured = {}
+
+    class _Conn:
+        def execute(self, sql, params):
+            captured.update(params)
+    o = AuditOutcome(asin="B0", verdict="pending", score_final=None,
+                     stage_stopped_at="L1", l1=L1Info())
+    audit_store.write_conclusion(_Conn(), o)
+    assert "待类目判定" in captured["reason"]
+    o2 = AuditOutcome(asin="B0", verdict="pending", score_final=100,
+                      stage_stopped_at="L3",
+                      l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.write_conclusion(_Conn(), o2)
+    assert captured["reason"] == "LLM 全链路故障, 待人工复核"
+
+
+def test_real_pt_excludes_unknown():
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                     stage_stopped_at="L2",
+                     l1=L1Info(walmart_product_type="unknown"))
+    assert audit_store.real_pt(o) is None
+
+
+def test_pick_where_accepts_l3_l4_params():
+    w, _ = product_audit._pick_where({"l3": "off", "l4": "on", "workers": "8"})
+    assert "IS NULL OR" in w      # 白名单收编,不炸
+
+
+def test_pt_backfill_fold_rows():
+    """历史实证折叠:extract_asin 归一、同 ASIN 多行取时间新者、None ts 最旧;
+    naive/aware 时间戳跨源可比(2026-08-13 生产 TypeError 回归钉)。"""
+    from datetime import datetime, timezone
+    from workflows.pt_backfill import _UPSERT_SQL, fold_rows
+    t1, t2 = datetime(2026, 5, 1), datetime(2026, 6, 1)
+    aware = datetime(2026, 7, 1, tzinfo=timezone.utc)   # 报错日报侧 timestamptz
+    rows = [("XKJ-B0ABCDEFGH-39.98", "OldPT", t1),
+            ("B0ABCDEFGH", "NewPT", t2),           # 同 ASIN 更新的一条胜
+            ("B0ABCDEFGH", "AwarePT", aware),      # aware 归一后可比且更新
+            ("B1ABCDEFGH", "TsPT", None),          # None ts 视为最旧
+            ("B1ABCDEFGH", "NewerPT", t1),
+            ("102460026733", "AnyPT", t1)]          # 纯数字提不出 ASIN → 剔
+    folded, no_asin = fold_rows(rows)
+    assert folded["B0ABCDEFGH"][0] == "AwarePT"
+    assert folded["B0ABCDEFGH"][1].tzinfo is None       # 归一为 naive
+    assert folded["B1ABCDEFGH"] == ("NewerPT", t1)
+    assert no_asin == 1
+    # 只填空语义钉死:回填绝不覆盖审核结论/既有值
+    assert "WHERE catalog.products.walmart_pt IS NULL" in _UPSERT_SQL
+
+
+def test_rerank_exit_pt_meta_gate(monkeypatch):
+    """评审 P0:rerank 出口过 pt_meta 闸——spec-only PT 直出会让 L2 四闸失明
+    产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。"""
+    from services import audit_l1_llm
+    ctx = _ctx(pt_meta=META, pt_spec={"SpecOnlyPT": {}})
+    p = ProductInfo(asin="B0Z", title="widget", amazon_category_path="X > Y")
+    seen = {}
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "SpecOnlyPT", "confidence": "高"}])
+
+    def fake_rerank(pr, cands, ptd, **k):
+        seen["dict"] = set(ptd)
+        return audit_rules.L1Info(walmart_product_type="SpecOnlyPT",
+                                  pt_confidence="高", pt_source="map_verified")
+    monkeypatch.setattr(audit_l1_llm, "rerank", fake_rerank)
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert seen["dict"] == {"GoodPT"}          # 字典收窄为 pt_meta
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_reason_mapper_l4_medium_falls_to_general_use():
+    """已知缺陷照迁钉住(评审 P2-4):reason 步(3)只认 confidence=='high',
+    aggressive 模式下仅由 offensive medium 触发的 L4 reject 落不到 L4 分支,
+    一路兜到 General-Use Products。改它=行为变更,须双跑出数据后由所有者批。"""
+    from services.audit_l4 import L4Result
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                     stage_stopped_at="L4",
+                     l1=L1Info(walmart_product_type="GoodPT"))
+    o.l4 = L4Result(verdict="reject", image_issues=[
+        {"image_index": 0, "issue": "offensive gesture",
+         "confidence": "medium"}])
+    from services.audit_reason import compute_final_reason
+    assert compute_final_reason(o, ProductInfo(asin="B0", title="t")) \
+        == "General-Use Products"
+
+
+def test_resolve_pt_browse_node_first():
+    """②a browse_node_id 直查(所有者定稿 2026-08-14:名称会漂 ID 不会)。
+    映射表 ID 覆盖率实测 100%(15,987/15,987),故 ID 在场时优先于路径。"""
+    ctx = _ctx(pt_meta=META, node_map={"14083111": "GoodPT"},
+               catmap={"Some > Path": "GoodPT"})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111",
+                    amazon_category_path="漂移的 > 名称 > 谁也对不上"), ctx)
+    assert l1.walmart_product_type == "GoodPT" and l1.pt_source == "map_node"
+    # 实证仍优先于 ID(批复 #10)
+    ev = _ctx(pt_meta=META, node_map={"14083111": "GoodPT"},
+              walmart_confirmed={"B0N": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111"),
+        ev).pt_source == "walmart_confirmed"
+    # ID 不在映射表 → 落回字符串路径(无 ID 老行同此)
+    fallback = _ctx(pt_meta=META, node_map={"999": "GoodPT"},
+                    catmap={"Some > Path": "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0N", browse_node_id="14083111",
+                    amazon_category_path="Some > Path"),
+        fallback).pt_source == "map_direct"
+
+
+def test_ingest_category_nodes():
+    """契约 v1 追加 slow.category_id_chain:逗号串/数组两形态,末段=最细类目。"""
+    from services.product_ingest import category_nodes, product_params
+    # 现役键名:raw.category_ids(采集器源码核实——ID 未进 slow,在 raw 幸存)
+    assert category_nodes({}, {"category_ids": "2972638011,553788,14083111"}) \
+        == ("2972638011,553788,14083111", "14083111")
+    # 前向兼容:采集侧若把它提进 slow(契约追加)也认
+    assert category_nodes({"category_id_chain": [228013, "551238", " 553220 "]}) \
+        == ("228013,551238,553220", "553220")
+    # 采集侧空值哨兵 "N/A" 不当 ID(root_category_id 缺省即此值)
+    assert category_nodes({}, {"category_ids": "N/A"}) == (None, None)
+    assert category_nodes({}, {"category_ids": "1055398,N/A"}) \
+        == ("1055398", "1055398")
+    assert category_nodes({}, {}) == (None, None)        # 缺失 → 退回字符串路径
+    assert category_nodes({"category_id_chain": " , "}) == (None, None)
+    row = product_params({"asin": "B0A", "slow": {"title": "t"},
+                          "raw": {"category_ids": "1,2,3"}})
+    assert row["browse_node_id"] == "3"
+    assert row["browse_node_chain"] == "1,2,3"
+    assert product_params({"asin": "B0A", "slow": {}})["browse_node_id"] is None
+
+
+def test_resolve_pt_path_alias_folding():
+    """②级查表前折别名(catmap_align):中间层名漂移的路径也能命中映射;
+    别名表空 → 退化回纯精确匹配(零行为变化)。"""
+    drift = ("Home & Kitchen > Home Décor Products > Picture Frames")
+    canon = ("Home & Kitchen > Home Décor > Picture Frames")
+    ctx = _ctx(pt_meta=META, catmap={canon: "GoodPT"},
+               path_alias={drift: canon})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift), ctx)
+    assert l1.walmart_product_type == "GoodPT" and l1.pt_source == "map_direct"
+    # 无别名表:同一产品解不出(证明命中确实来自折叠)
+    bare = _ctx(pt_meta=META, catmap={canon: "GoodPT"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift),
+        bare).walmart_product_type is None
+    # 精确命中优先:别名不得改写已能直接命中的路径
+    both = _ctx(pt_meta=META, catmap={canon: "GoodPT", drift: "GoodPT"},
+                path_alias={drift: "Other > Path"})
+    assert audit_rules.resolve_pt(
+        ProductInfo(asin="B0F", amazon_category_path=drift),
+        both).walmart_product_type == "GoodPT"
+
+
+def test_resolve_pt_alias_folds_into_sentinel():
+    """别名折到哨兵路径 → 照样 -100 硬拒(折叠只改查得到查不到)。"""
+    drift, canon = "A > B Products > Leaf", "A > B > Leaf"
+    ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({canon}),
+               path_alias={drift: canon})
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0G", amazon_category_path=drift), ctx)
+    assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].detail["amazon_path"] == drift   # detail 记原文不记折后
+
+
+def test_catalog_health_aliases_ascii_and_used():
+    """PG 把未加引号标识符折小写(中文不折、ASCII 折):'有类目ID' → '有类目id',
+    按原文取键必 KeyError(生产实测 2026-08-14)。别名一律 ASCII,且
+    run() 用到的键必须都在 SQL 别名里。"""
+    import re
+    from workflows import catalog_health as ch
+    aliases = set(re.findall(r"\bAS ([a-zA-Z_][a-zA-Z0-9_]*)\b", ch._SQL))
+    assert aliases, "SQL 里应有 AS 别名"
+    assert all(a.islower() or "_" in a for a in aliases)   # 无大小写歧义
+    src = open(ch.__file__, encoding="utf-8").read()
+    used = set(re.findall(r"r\['([a-z_0-9]+)'\]", src))
+    assert used and used <= aliases, f"取了 SQL 里没有的键:{used - aliases}"
+
+
+def test_catmap_mine_classify_path():
+    """挖掘分桶(所有者三段式 2026-08-13):多产品同 PT=可信;少量支持=待核;
+    分流=人工;与旧映射相左=冲突只报;单证不立;与旧映射一致=无事。"""
+    from workflows.catmap_mine import classify_path
+    assert classify_path({"A": 6}, None) == ("mined_trusted", "A", 6)
+    assert classify_path({"A": 3}, None) == ("mined_review", "A", 3)
+    assert classify_path({"A": 1}, None) is None            # 单证不立
+    assert classify_path({"A": 6}, "A") is None             # 与旧映射一致
+    assert classify_path({"A": 6}, "B") == ("map_conflict", "A", 6)
+    assert classify_path({"A": 3}, "B") is None             # 冲突也要够票
+    assert classify_path({}, None) is None
+    assert classify_path({"A": 5}, None, min_support=8) == ("mined_review", "A", 5)
+    # 优势度而非全票(首跑实测:要求 100% 一致 → 1321 个类目全打成分流)
+    assert classify_path({"A": 9, "B": 1}, None) == ("mined_trusted", "A", 9)
+    assert classify_path({"A": 6, "B": 4}, None) == ("mined_mixed", "A", 6)
+    assert classify_path({"A": 9, "B": 1}, None,
+                         min_dominance=0.95) == ("mined_mixed", "A", 9)
+    # 冲突同样看优势度:少数派噪声不该掩盖"旧映射与实证相左"
+    assert classify_path({"A": 9, "B": 1}, "B") == ("map_conflict", "A", 9)
+    assert classify_path({"A": 6, "C": 4}, "B") is None     # 自身分流不算冲突
+
+
+def test_catmap_sibling_verdict_and_parent():
+    """兄弟继承:恰一 PT 且 ≥2 兄弟支持才继承;任何分流(含哨兵)不传播;
+    父路径从面包屑字符串推导(外部 zgbs 树词汇表对不上,已撤——所有者
+    实测 2026-08-13)。"""
+    from workflows.catmap_suggest import path_parent, sibling_verdict
+    assert path_parent("A > B > C") == "A > B"
+    assert path_parent("A") is None
+    assert sibling_verdict([("GoodPT", 3)]) == "GoodPT"
+    assert sibling_verdict([("GoodPT", 1)]) is None            # 单证不立
+    assert sibling_verdict([("GoodPT", 5), ("OtherPT", 1)]) is None   # 分流
+    assert sibling_verdict([("GoodPT", 5),
+                            ("无对应Walmart PT", 2)]) is None   # 哨兵一票否决
+    assert sibling_verdict([]) is None
+
+
+def test_catmap_suggestion_from_l1():
+    """建议三态:ok(挑出 PT)/ excluded(-100 hit,PT 仍留档)/ unknown。"""
+    from workflows.catmap_suggest import suggestion_from_l1
+    ok = audit_rules.L1Info(walmart_product_type="GoodPT", pt_confidence="高")
+    assert suggestion_from_l1(ok) == ("GoodPT", "高", "ok")
+    exc = audit_rules.L1Info(walmart_product_type="unknown", pt_confidence="低")
+    exc.hits.append(audit_rules.RuleHit(stage="L1", rule_code="excluded_category",
+                                        penalty=-100, detail={}))
+    assert suggestion_from_l1(exc) == ("unknown", "低", "excluded")
+    assert suggestion_from_l1(None) == (None, None, "unknown")
+
+
+def test_candidate_sql_recent_guard_shape():
+    """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
+    sql = product_audit._CANDIDATE_SQL.format(
+        where="x", recent_guard=product_audit._RECENT_RUN_GUARD)
+    assert "NOT EXISTS" in sql and "interval '24 hours'" in sql
+    plain = product_audit._CANDIDATE_SQL.format(where="x", recent_guard="")
+    assert "NOT EXISTS" not in plain
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────

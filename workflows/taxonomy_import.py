@@ -39,7 +39,6 @@ Best Sellers 名称树的**本质区别:这棵以 browse_node_id 为主键**,能
 
 import json
 import logging
-import re
 from pathlib import Path
 
 from registry import db
@@ -61,9 +60,7 @@ _K_LEAF = ("是否叶子", "is_leaf", "leaf")
 _K_ROOT = ("L1 根类目", "root_name", "l1_root")
 _K_SAMPLES = ("产品样本数", "product_samples")
 
-_K_URL = ("URL", "url")
 _TRUE = {"是", "true", "yes", "y", "1", "t"}
-_URL_NODE_RE = re.compile(r"[?&]node=(\d+)")
 
 
 def _get(row: dict, keys: tuple, default: str = "") -> str:
@@ -75,20 +72,17 @@ def _get(row: dict, keys: tuple, default: str = "") -> str:
     return default
 
 
-def row_node(row: dict) -> tuple[str, bool]:
-    """输入:一行 → 输出:(node_id, 是否从 URL 兜回)。
+def row_node(row: dict) -> str:
+    """输入:一行 → 输出:node_id(取不到就空串)。
 
-    **兜底**(外部数据自身的缺口,非我方不确定):对账版里 L1 根类目行的
-    `browse_node_id` 是空的(实测 39 行),但同行 URL 就带着 `?node=1055398`。
-    根节点是父链回退的终点,丢了等于每条链断头——所以按明确条件兜一次:
-    **仅当 ID 为空且 URL 里有 node=数字**,且兜回条数在体检里必报计数
-    (兜底静默常态化 = 主路径已坏没人知道)。
+    **不做兜底**:对账版里 L1 根类目行(39 行)既无 `browse_node_id` 也无
+    `父节点ID`,URL 是 Best Sellers 的 slug 链接不带 node=,文件用
+    `L1_<slug>` 当根标识——根的真实数字 ID 在文件里任何地方都取不到。
+    曾按猜测加过"从 URL 抠 node="的兜底,对真实文件永不触发,已删:
+    兜底是补偿外部世界的缺陷,不是补偿自己的不确定。
+    根 ID 由 taxonomy_derive 从产品的 browse_node_chain 反推(那里有实证)。
     """
-    node = _get(row, _K_NODE)
-    if node:
-        return node, False
-    m = _URL_NODE_RE.search(_get(row, _K_URL))
-    return (m.group(1) if m else ""), bool(m)
+    return _get(row, _K_NODE)
 
 
 def section_rows(val) -> list[dict]:
@@ -125,7 +119,7 @@ def is_data_section(val) -> bool:
     一模一样,却被判成非数据段——因为只嗅第一行,而那行的 browse_node_id
     是空的(根类目占位)。拿首行代表整段 = 又一种"写死"。
     """
-    return any(row_node(r)[0] for r in section_rows(val))
+    return any(row_node(r) for r in section_rows(val))
 
 
 def data_sections(data: dict) -> list[str]:
@@ -179,18 +173,16 @@ def survey_file(data: dict) -> list[str]:
         if key in sections:
             rows = section_rows(val)
             got = [row_node(r) for r in rows]
-            back = sum(1 for node, from_url in got if node and from_url)
-            miss = sum(1 for node, _u in got if not node)
-            parsed |= {node for node, _u in got if node}
+            miss = sum(1 for node in got if not node)
+            parsed |= {node for node in got if node}
             tag = "解析" if key in _SECTIONS else "解析·段名陌生但认得出 node"
             out.append(f"  {key}: {n} 行({tag};{_shape(val)}"
-                       + (f";**{back} 行 ID 为空从 URL 兜回**" if back else "")
                        + (f";**{miss} 行无 node 值将跳过**" if miss else "")
                        + ")")
             # 跳过的行**原样打样本**:猜它们长什么样已经错过两次(先猜"文件
             # 只发叶子",再猜 URL 带 ?node=)。看不到就别推断。
             shown = 0
-            for r, (node, _u) in zip(rows, got):
+            for r, node in zip(rows, got):
                 if node or shown >= 2:
                     continue
                 shown += 1
@@ -244,15 +236,12 @@ def parse_rows(data: dict) -> tuple[list[tuple], list[tuple], dict]:
     stat = {s: 0 for s in sections}
     stat["skipped"] = 0
     stat["paths"] = 0
-    stat["url_recovered"] = 0
     for sec in sections:
         for r in section_rows(data.get(sec)):
-            node, from_url = row_node(r)
-            name = _get(r, _K_NAME)
+            node, name = row_node(r), _get(r, _K_NAME)
             if not node or not name:
                 stat["skipped"] += 1
                 continue
-            stat["url_recovered"] += from_url
             parent = _get(r, _K_PARENT)
             if not parent.isdigit():      # 'L1_xxx' 根级占位
                 parent = ""

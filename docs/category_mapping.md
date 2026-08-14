@@ -85,6 +85,13 @@ python cli.py taxonomy_derive -p apply=1
 | `amazon_leaf_nodes` | `browse_node_id` | 叶子集。逻辑上可由 `all_nodes.is_leaf` 推出,单独下发当**对账校验位**用 |
 | `amazon_to_walmart_mapping` | — | 映射快照 |
 
+⚠ **L1 根类目必须给真实 `browse_node_id`**。现在对账版里 39 个根类目行既无
+`browse_node_id` 也无 `父节点ID`,URL 是 Best Sellers 的 slug 链接(不带
+`node=`),文件用 `L1_<slug>` 当根标识——**根的数字 ID 在文件里任何地方都取不到**,
+父链走到倒数第二层就断。产品侧的 `browse_node_chain` 里有真实根 ID
+(Home & Kitchen=1055398、Tools & Home Improvement=228013…),现由
+`taxonomy_derive` 反推补入;正式下发应由文件直接给。
+
 ⚠ 映射这一项要先定**方向**再下发:现在 `catmap_mine -p promote=1` 直接写 PG,
 PG 是事实上的权威;若映射随类目树一起下发并重灌,挖出来的行会被文件冲掉。
 这就是「映射编辑权威(飞书 vs PG)」那条未决——下发前必须先定。

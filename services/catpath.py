@@ -55,6 +55,41 @@ def overlap_score(a_segs: list[str], b_segs: list[str]) -> float:
     return len(a & b) / max(len(a), len(b))
 
 
+def diff_profile(a_segs: list[str], b_segs: list[str]) -> tuple[int, bool]:
+    """输入:两条路径的段列表 → 输出:(最大未匹配段数, 父节点是否相同)。
+
+    纯函数。比例分对**浅路径不公平**(3 段路径差 1 段就掉到 0.67,而 6 段
+    差 1 段有 0.83),但浅路径的一段之差往往正是合法改名
+    ('Event & Party Supplies' → 'Party Supplies')。改数"差几段"更贴事实。
+
+    父节点(倒数第二段)是否相同是**危险信号的分水岭**(所有者首跑实测):
+      `Team Sports > Soccer   > Training…` vs
+      `Team Sports > Lacrosse > Training…`  只差一段却是完全不同的运动,
+    差异恰在叶子的直接父节点上;而合法漂移的差异段通常在更上层
+    (`Home Décor Products` vs `Home Décor`,父节点 `Picture Frames` 不变)。
+    """
+    a = [norm_seg(s) for s in a_segs]
+    b = [norm_seg(s) for s in b_segs]
+    sa, sb = set(a), set(b)
+    unmatched = max(len(sa - sb), len(sb - sa))
+    parent_same = (len(a) >= 2 and len(b) >= 2 and a[-2] == b[-2])
+    return unmatched, parent_same
+
+
+def align_tier(a_segs: list[str], b_segs: list[str]) -> str:
+    """输入:两条路径的段列表 → 输出:结构信任层 strong / medium / weak。
+
+    纯函数。strong = 只差一段**且**差异在上层(父节点未变)→ 结构上就是
+    "某一层改名",可自动折;medium = 只差一段但父节点也变了(浅路径改名
+    或父节点被换成同级的另一个类目)→ **必须有实证 PT 背书**才折;
+    weak = 差两段以上 → 一律交人工。
+    """
+    unmatched, parent_same = diff_profile(a_segs, b_segs)
+    if unmatched > 1:
+        return "weak"
+    return "strong" if parent_same else "medium"
+
+
 def align_path(path: str, candidates: list[str], *,
                min_score: float = MIN_SCORE,
                margin: float = MARGIN) -> tuple[str | None, float, str]:

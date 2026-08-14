@@ -87,19 +87,44 @@ def test_single_segment_path_never_aligns():
     assert best is None and status == "no_match"
 
 
-def test_decide_alias_evidence_beats_score():
-    """实证 PT 优先于字符串相似度(所有者首跑实测:0.60 分把装饰牌匾折进
-    '季节装饰>花环挂钩',单靠调阈值会误伤 0.67 的合法浅路径)。"""
+def test_align_tier_structure():
+    """结构层:差一段且父节点未变=strong;父节点也变=medium;差两段=weak。
+    比例分对浅路径不公平(3 段差 1 段只有 0.67),但那正是合法改名。"""
+    seg = catpath.segments
+    # 所有者两条真实漂移:差异在上层,父节点未变 → strong
+    for breadcrumb, canonical in OWNER_CASES:
+        assert catpath.align_tier(seg(breadcrumb), seg(canonical)) == "strong"
+    # 浅路径改名(Party Packs / Vases):父节点即被改名段 → medium
+    assert catpath.align_tier(
+        seg("Home & Kitchen > Event & Party Supplies > Party Packs"),
+        seg("Home & Kitchen > Party Supplies > Party Packs")) == "medium"
+    # 危险:只差一段,但差在叶子的直接父节点(足球 vs 长曲棍球)→ medium
+    assert catpath.align_tier(
+        seg("Sports > Team Sports > Soccer > Training Equipment"),
+        seg("Sports > Team Sports > Lacrosse > Training Equipment")) == "medium"
+    # 差两段以上(装饰牌匾串进季节装饰/花环挂钩)→ weak
+    assert catpath.align_tier(
+        seg("H & K > Home Décor Products > Home Décor Accents > "
+            "Decorative Accessories > Signs"),
+        seg("H & K > Seasonal Décor > Wreath Hangers > "
+            "Decorative Accessories > Signs")) == "weak"
+
+
+def test_decide_alias_evidence_beats_structure():
+    """实证 PT 优先于结构形态(所有者首跑实测:0.83 分的 Soccer→Lacrosse
+    靠实证拦下;0.67 分的 Party Packs/Vases 靠实证救回)。"""
     from workflows.catmap_align import decide_alias
-    # 实证一致 → 低分也收
-    assert decide_alias(0.55, "GoodPT", "GoodPT") == "verified"
-    # 实证相左 → 高分也拒
-    assert decide_alias(0.95, "GoodPT", "OtherPT") == "pt_conflict"
-    # 无实证 → 看分数
-    assert decide_alias(0.80, None, "GoodPT") == "aligned"
-    assert decide_alias(0.60, None, "GoodPT") == "low_score"
-    # canonical 侧 PT 不唯一(映射表分流)→ 无从背书,退回看分数
-    assert decide_alias(0.60, "GoodPT", None) == "low_score"
+    # 实证一致 → 任何结构层都收(别名的目的是拿到正确 PT,数据已证明正确)
+    assert decide_alias("medium", "GoodPT", "GoodPT") == "verified"
+    assert decide_alias("weak", "GoodPT", "GoodPT") == "verified"
+    # 实证相左 → 结构再像也拒
+    assert decide_alias("strong", "GoodPT", "OtherPT") == "pt_conflict"
+    # 无实证 → 只信 strong
+    assert decide_alias("strong", None, "GoodPT") == "aligned"
+    assert decide_alias("medium", None, "GoodPT") == "needs_review"
+    assert decide_alias("weak", None, "GoodPT") == "needs_review"
+    # canonical 侧 PT 不唯一(映射表分流)→ 无从背书,退回看结构
+    assert decide_alias("medium", "GoodPT", None) == "needs_review"
 
 
 def test_consensus_pt_requires_unanimity_and_support():

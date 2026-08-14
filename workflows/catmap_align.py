@@ -89,7 +89,6 @@ SET canonical_path = EXCLUDED.canonical_path,
 """
 
 
-MIN_SCORE_AUTO = 0.75    # 无实证背书时的自动折叠下限(两条真实漂移 0.80/0.83)
 MIN_EVIDENCE = 2         # 实证背书需要的最少产品数(单证不立)
 
 
@@ -105,17 +104,23 @@ def consensus_pt(dist: dict, min_n: int = MIN_EVIDENCE) -> str | None:
     return pt if n >= min_n else None
 
 
-def decide_alias(score: float, evidence_pt: str | None,
-                 canonical_pt: str | None,
-                 min_score: float = MIN_SCORE_AUTO) -> str:
-    """输入:对齐分 + 实证共识 PT + canonical 映射 PT → 输出:落库状态。
+def decide_alias(tier: str, evidence_pt: str | None,
+                 canonical_pt: str | None) -> str:
+    """输入:结构信任层 + 实证共识 PT + canonical 映射 PT → 输出:落库状态。
 
-    纯函数。实证优先于分数(数据 > 字符串相似度):一致即 verified(低分
-    也收),相左即 pt_conflict(高分也拒);无实证可查才退回看分数。
+    纯函数。两条判据,实证优先于结构(数据 > 字符串形态):
+
+      实证 PT 与 canonical 一致 → **verified**(任何结构层都收)。别名的
+        目的不是证明两条路径语义等价,而是**拿到正确的 PT**——产品实证
+        说的 PT 与折过去拿到的 PT 相同,结果就是对的;
+      实证 PT 与 canonical 相左 → **pt_conflict**(结构再像也拒)。所有者
+        首跑实测拦下 `Team Sports > Soccer > …` → `… > Lacrosse > …`;
+      无实证可查 → 只信 strong 层(仅上层一段改名,叶子的父归属未变);
+        medium(父节点也变)与 weak(差两段以上)一律交人工。
     """
     if evidence_pt and canonical_pt:
         return "verified" if evidence_pt == canonical_pt else "pt_conflict"
-    return "aligned" if score >= min_score else "low_score"
+    return "aligned" if tier == "strong" else "needs_review"
 
 
 def build_leaf_index(canonical_paths) -> dict:
@@ -132,15 +137,14 @@ def build_leaf_index(canonical_paths) -> dict:
     return idx
 
 
-_STATUSES = ("verified", "aligned", "low_score", "pt_conflict",
+_STATUSES = ("verified", "aligned", "needs_review", "pt_conflict",
              "ambiguous", "no_match")
 _FOLDABLE = ("verified", "aligned")
 
 
 def run(params: dict) -> str:
-    """输入:params(apply=1 写库;min_score 调无实证时的分数下限)→ 输出:分布摘要。"""
+    """输入:params(apply=1 写库)→ 输出:分布摘要。"""
     apply = str(params.get("apply", "")).strip() == "1"
-    min_score = float(params.get("min_score", MIN_SCORE_AUTO))
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
@@ -158,12 +162,17 @@ def run(params: dict) -> str:
         samples: dict = {s: [] for s in _STATUSES}
         stat = {s: 0 for s in _STATUSES}
         prod = {s: 0 for s in _STATUSES}
+        tiers = {"strong": 0, "medium": 0, "weak": 0}
         for path, n in gaps:
             cands = idx.get(catpath.leaf_key(path) or "", [])
             best, score, status = catpath.align_path(path, cands)
-            if status == "aligned":     # 再过实证背书/分数两道
-                status = decide_alias(score, consensus_pt(votes.get(path, {})),
-                                      canon_pt.get(best), min_score)
+            tier = ""
+            if status == "aligned":     # 再过结构层 + 实证背书两道
+                tier = catpath.align_tier(catpath.segments(path),
+                                          catpath.segments(best))
+                tiers[tier] += 1
+                status = decide_alias(tier, consensus_pt(votes.get(path, {})),
+                                      canon_pt.get(best))
             stat[status] += 1
             prod[status] += n
             if status in _FOLDABLE:
@@ -171,23 +180,28 @@ def run(params: dict) -> str:
             if best and len(samples[status]) < 5:
                 samples[status].append(
                     f"  {n:>5} 件|{path[:58]}…\n"
-                    f"        ↳ {best[:58]}…(分 {score:.2f})")
+                    f"        ↳ {best[:58]}…({tier},差异分 {score:.2f})")
 
         foldable = sum(stat[s] for s in _FOLDABLE)
         lines = [
-            f"catmap_align(无实证时分数门槛 {min_score}):精确匹配缺口 "
-            f"{len(gaps)} 条路径 →",
+            f"catmap_align:精确匹配缺口 {len(gaps)} 条路径 →",
             f"  可折 {foldable} 条 / {prod['verified'] + prod['aligned']} 件"
-            f"(实证背书 {stat['verified']} + 分数达标 {stat['aligned']})",
-            f"  待人工 {stat['low_score'] + stat['pt_conflict'] + stat['ambiguous']}"
-            f" 条(分数不足 {stat['low_score']} / **PT 相左 "
+            f"(实证 PT 背书 {stat['verified']} + 结构 strong 层 "
+            f"{stat['aligned']})",
+            f"  待人工 {stat['needs_review'] + stat['pt_conflict'] + stat['ambiguous']}"
+            f" 条 / {prod['needs_review'] + prod['pt_conflict'] + prod['ambiguous']}"
+            f" 件(无实证且结构存疑 {stat['needs_review']} / **PT 相左 "
             f"{stat['pt_conflict']}** / 并列歧义 {stat['ambiguous']})",
             f"  真缺口 {stat['no_match']} 条 / {prod['no_match']} 件"
             f"(归 catmap_mine / catmap_suggest)",
+            f"  结构层分布:strong(仅上层改名){tiers['strong']} / "
+            f"medium(父节点也变){tiers['medium']} / "
+            f"weak(差两段以上){tiers['weak']}",
         ]
-        for tag, title in (("verified", "实证背书样例"),
+        for tag, title in (("verified", "实证 PT 背书样例(数据说话,已折)"),
+                           ("aligned", "结构 strong 层样例(仅上层一段改名,已折)"),
                            ("pt_conflict", "⚠ PT 相左(疑似串子树,已拒折)"),
-                           ("low_score", "分数不足(待人工)")):
+                           ("needs_review", "待人工(无实证 + 结构存疑)")):
             if samples[tag]:
                 lines.append(f"{title}:")
                 lines += samples[tag]

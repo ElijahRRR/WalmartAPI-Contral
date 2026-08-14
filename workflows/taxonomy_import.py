@@ -100,9 +100,13 @@ _IGNORED_KEYS = ("meta",)      # 已知的非数据段
 
 
 def is_data_section(val) -> bool:
-    """输入:一个顶层段 → 输出:它是不是"带 node 的行清单"。"""
-    head = next(iter(section_rows(val)), None)
-    return bool(head and _get(head, _K_NODE))
+    """输入:一个顶层段 → 输出:它是不是"带 node 的行清单"。
+
+    **看全段不看首行**(2026-08-14 第三轮教训):`nodes` 段行键与 leaves
+    一模一样,却被判成非数据段——因为只嗅第一行,而那行的 browse_node_id
+    是空的(根类目占位)。拿首行代表整段 = 又一种"写死"。
+    """
+    return any(_get(r, _K_NODE) for r in section_rows(val))
 
 
 def data_sections(data: dict) -> list[str]:
@@ -153,9 +157,13 @@ def survey_file(data: dict) -> list[str]:
         n = len(val) if isinstance(val, (list, dict)) else 1
         if key in sections:
             rows = section_rows(val)
-            parsed |= {_get(r, _K_NODE) for r in rows}
+            ids = {_get(r, _K_NODE) for r in rows}
+            miss = sum(1 for r in rows if not _get(r, _K_NODE))
+            parsed |= ids - {""}
             tag = "解析" if key in _SECTIONS else "解析·段名陌生但认得出 node"
-            out.append(f"  {key}: {n} 行({tag};{_shape(val)})")
+            out.append(f"  {key}: {n} 行({tag};{_shape(val)}"
+                       + (f";**{miss} 行无 node 值将跳过**" if miss else "")
+                       + ")")
         else:
             out.append(f"  {key}: {n} 行 ⚠ **未解析**({_shape(val)})"
                        f"——认得的 node 字段名:{' / '.join(_K_NODE)}")

@@ -243,6 +243,22 @@ def test_taxonomy_survey_reports_shape_of_unparsed_sections():
     assert "解析到去重 node 2" in out and "差 3" in out
 
 
+def test_section_sniff_looks_past_an_idless_first_row():
+    """段的判定要看全段:首行 node 值为空(根类目占位)不代表整段不是数据段
+    ——所有者第三轮实测,nodes 段就是这样被漏掉的。"""
+    from workflows.taxonomy_import import (data_sections, parse_rows,
+                                           survey_file)
+    data = {"nodes": [
+        {"browse_node_id": "", "类目名": "根占位", "完整路径": "Root"},
+        {"browse_node_id": "553220", "类目名": "Handsaws",
+         "完整路径": "Tools > Handsaws", "父节点ID": "551238"},
+    ]}
+    assert data_sections(data) == ["nodes"]
+    rows, _paths, stat = parse_rows(data)
+    assert [r[0] for r in rows] == ["553220"] and stat["skipped"] == 1
+    assert "**1 行无 node 值将跳过**" in "\n".join(survey_file(data))
+
+
 def test_taxonomy_reads_dict_shaped_and_english_keys():
     """段可以是 dict{node_id: {…}};字段名认正式下发规格的英文列名。"""
     from workflows.taxonomy_import import data_sections, parse_rows

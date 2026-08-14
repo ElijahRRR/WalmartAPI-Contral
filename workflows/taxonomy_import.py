@@ -22,7 +22,13 @@ Best Sellers 名称树的**本质区别:这棵以 browse_node_id 为主键**,能
 ⚠ 上次教训(2026-08-13):接外部数据源前**先验 JOIN 能不能对上**。本
 工作流的预览模式强制先报三方交叉命中率,对不上就别 apply。
 
-幂等 = TRUNCATE 全量重灌(树是整体快照)+ 空读/骤缩护栏。
+⚠ 文件只发了**叶子层**(2026-08-14 实测:入库 28,495 vs meta 自报 32,147),
+中间层非叶节点不在文件里 ⇒ 祖先回退用 `taxonomy_derive` 从我们自有的
+(ID 链 × 面包屑)反推补齐。预览的「文件构造体检」会把未解析的段也报出来,
+免得下次再分不清"文件没给"还是"解析器没读"。
+
+幂等 = 全量重灌(树是整体快照)+ 空读/骤缩护栏。**重灌只删文件段的行**,
+`source='derived_products'` 的反推补层留着(同 node 由文件行覆盖)。
 """
 
 import json
@@ -30,6 +36,7 @@ import logging
 from pathlib import Path
 
 from registry import db
+from registry.resources import TAXONOMY_SOURCE_DERIVED
 
 DANGEROUS = False
 
@@ -41,6 +48,33 @@ _K_PARENT, _K_DEPTH, _K_LEAF = "父节点ID", "深度", "是否叶子"
 _K_ROOT, _K_SAMPLES = "L1 根类目", "产品样本数"
 
 _SECTIONS = ("leaves", "verified_added_paths", "unverified_new_nodes")
+_IGNORED_KEYS = ("meta",)      # 已知的非数据段(不报警)
+
+
+def survey_file(data: dict) -> list[str]:
+    """输入:整份 JSON → 输出:文件构造体检行(段名 × 行数,含未解析段)。
+
+    **不解析的段必须报出来**:2026-08-14 所有者问"中间层是文件缺还是没读到",
+    当时答不上——因为解析器只认三个段名,别的段静默丢弃。现在预览先把
+    文件的顶层结构原样摊开,再对上 meta 里的自报行数,差多少一眼可见。
+    """
+    out, parsed = [], 0
+    for key, val in data.items():
+        if key in _IGNORED_KEYS:
+            continue
+        n = len(val) if isinstance(val, (list, dict)) else 1
+        if key in _SECTIONS:
+            parsed += n if isinstance(val, list) else 0
+            out.append(f"  {key}: {n} 行(解析)")
+        else:
+            out.append(f"  {key}: {n} 行 ⚠ **未解析**(解析器只认 "
+                       f"{'/'.join(_SECTIONS)};若这里有节点需扩段)")
+    meta = data.get("meta") or {}
+    for k, v in meta.items():
+        if isinstance(v, int) and v and v != parsed:
+            out.append(f"  meta.{k} = {v}(文件自报;实际可解析 {parsed},"
+                       f"差 {v - parsed})")
+    return out
 
 
 def _int(v, default=0):
@@ -84,11 +118,18 @@ def parse_rows(data: dict) -> tuple[list[tuple], dict]:
     return rows, stat
 
 
+# 文件行是权威:同 node 若已有反推补层(taxonomy_derive),文件覆盖它
 _INSERT_SQL = """
 INSERT INTO audit.amazon_taxonomy
     (node_id, name, path, depth, parent_node_id, is_leaf, root_name,
      product_samples, source)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (node_id) DO UPDATE
+SET name = EXCLUDED.name, path = EXCLUDED.path, depth = EXCLUDED.depth,
+    parent_node_id = EXCLUDED.parent_node_id, is_leaf = EXCLUDED.is_leaf,
+    root_name = EXCLUDED.root_name,
+    product_samples = EXCLUDED.product_samples, source = EXCLUDED.source,
+    imported_at = now()
 """
 
 # 三方交叉体检(上次教训:先验 JOIN 再落库)
@@ -125,14 +166,21 @@ def run(params: dict) -> str:
         with conn.cursor() as cur:
             cur.execute(_CROSS_SQL, {"nodes": nodes})
             prod_hit, prod_total, map_hit, map_total = cur.fetchone()
-            cur.execute("SELECT count(*) FROM audit.amazon_taxonomy")
+            cur.execute("SELECT count(*) FROM audit.amazon_taxonomy "
+                        "WHERE source IS NULL OR source = ANY(%s)",
+                        (list(_SECTIONS),))
             (old_n,) = cur.fetchone()
+            cur.execute("SELECT count(*) FROM audit.amazon_taxonomy "
+                        "WHERE source = %s", (TAXONOMY_SOURCE_DERIVED,))
+            (derived_n,) = cur.fetchone()
 
         lines = [
             f"taxonomy_import:{path.name} → node {len(rows)}"
             f"(叶 {sum(1 for r in rows if r[5])};"
             + " / ".join(f"{s} {stat[s]}" for s in _SECTIONS)
             + (f";跳过 {stat['skipped']}" if stat["skipped"] else "") + ")",
+            "⚑ 文件构造体检(段名 × 行数;未解析段会报警):",
+            *survey_file(data),
             f"⚑ 三方交叉体检(先验 JOIN 再落库):",
             f"  产品侧 node {prod_total} → 树里有 {prod_hit}"
             + (f"({prod_hit / prod_total * 100:.1f}%)" if prod_total else ""),
@@ -144,14 +192,22 @@ def run(params: dict) -> str:
         if prod_total and prod_hit / prod_total < 0.5:
             lines.append("⚠ 产品侧命中率 <50%:树与生产数据对不上,"
                          "**先别 apply**,核实文件是否完整/同源")
-        lines.append(f"库内现有 {old_n}(重灌语义:树是整体快照)")
+        lines.append(f"库内现有文件段 {old_n}(重灌语义:树是整体快照)"
+                     + (f",另有反推补层 {derived_n} 条(不冲掉)"
+                        if derived_n else ""))
         if not apply:
             lines.append("(预览:未写库;确认无误加 -p apply=1)")
             return "\n".join(lines)
         if old_n >= 1000 and len(rows) < old_n * 0.5:
             raise RuntimeError(f"骤缩 {old_n}→{len(rows)}(超 50%),拒绝重灌")
         with conn.cursor() as cur:
-            cur.execute("TRUNCATE audit.amazon_taxonomy")
+            # 只删文件段的行:taxonomy_derive 补的中间层是我们自有数据反推的,
+            # 换一份文件不该把它清空(文件行仍压过反推行——见 ON CONFLICT)
+            cur.execute("DELETE FROM audit.amazon_taxonomy "
+                        "WHERE source IS NULL OR source = ANY(%s)",
+                        (list(_SECTIONS),))
             cur.executemany(_INSERT_SQL, rows)
-    lines.append(f"全量重灌 {len(rows)} 条 ✓")
+    lines.append(f"全量重灌 {len(rows)} 条 ✓"
+                 + (f"(反推补层 {derived_n} 条保留;同 node 已被文件行覆盖)"
+                    if derived_n else ""))
     return "\n".join(lines)

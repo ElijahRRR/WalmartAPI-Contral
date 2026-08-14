@@ -1048,6 +1048,10 @@ CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
     product_samples integer,           -- 树自带的样本数(采集侧统计,仅参考)
     source          text,              -- leaves / verified_added_paths /
                                        -- unverified_new_nodes(未验证新 node)
+                                       -- derived_products = taxonomy_derive 从
+                                       -- (ID 链 × 面包屑)反推的中间层补层:
+                                       -- 文件只发叶子,父链靠它才走得通。
+                                       -- taxonomy_import 重灌只删文件段的行
     imported_at     timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);

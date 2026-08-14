@@ -141,6 +141,55 @@ def test_taxonomy_parse_rows():
     assert by_node["999"][8] == "unverified_new_nodes"   # source 分段留痕
 
 
+def test_derive_nodes_zips_chain_with_breadcrumb():
+    """ID 链 × 面包屑右对齐还原中间层:node/名/父/深度/路径/是否叶。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    acc, stat = derive_nodes([("1,2,3", "A > B > C", 7)])
+    assert stat == {"链-段=+0": 7}
+    assert resolve("2", acc["2"]) == ("2", "B", "A > B", 2, "1", False, "A", 7)
+    assert resolve("3", acc["3"])[5] is True          # 末段=叶
+    assert resolve("1", acc["1"])[4] is None          # 根级无父
+
+
+def test_derive_nodes_right_anchors_on_length_gap():
+    """长度不等按叶子右对齐:链多出的头段不采信,但可当最顶层的父 ID。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    # 链多一段(带了不出现在面包屑里的根 node)
+    acc, stat = derive_nodes([("0,1,2", "A > B", 3)])
+    assert stat == {"链-段=+1": 3}
+    assert "0" not in acc                              # 没名字的段不入库
+    assert resolve("1", acc["1"])[4] == "0"            # 但仍当父 ID 用
+    # 面包屑多一段(促销层/多余的头) → 只取后 k 段,不错位
+    acc2, stat2 = derive_nodes([("1,2", "X > A > B", 3)])
+    assert stat2 == {"链-段=-1": 3}
+    assert resolve("1", acc2["1"])[1] == "A"
+    assert resolve("2", acc2["2"])[2] == "X > A > B"   # 路径仍用完整面包屑
+
+
+def test_derive_nodes_majority_vote_on_drifting_names():
+    """同 node 名称漂移 → 按产品数取多数票(catpath 的漂移在这里收敛)。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    acc, _s = derive_nodes([
+        ("1,2", "H & K > Home Décor Products", 30),
+        ("1,2", "H & K > Home Décor", 100),
+    ])
+    assert resolve("2", acc["2"])[1] == "Home Décor"
+    assert resolve("2", acc["2"])[7] == 130            # 产品数累加
+
+
+def test_taxonomy_survey_flags_unparsed_sections():
+    """未解析的顶层段必须报警(否则'文件缺'与'解析器没读'分不清)。"""
+    from workflows.taxonomy_import import survey_file
+    out = "\n".join(survey_file({
+        "meta": {"reconciled_tree_rows": 5},
+        "leaves": [{}, {}],
+        "internal_nodes": [{}],
+    }))
+    assert "leaves: 2 行(解析)" in out
+    assert "internal_nodes: 1 行 ⚠" in out
+    assert "meta.reconciled_tree_rows = 5" in out and "差 3" in out
+
+
 def test_sibling_swap_distinguishes_rename_from_category_change():
     """改名 vs 换类目在字符串上分不开,在数据上可分(所有者第三轮实测:
     Soccer→Lacrosse 差一段、父节点还相同,被判 strong 却是两种运动)。"""

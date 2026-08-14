@@ -1,9 +1,15 @@
 """catmap_mine — 从产品实证数据挖类目映射(纯 SQL 零 LLM;可反复跑)。
 
 用法:
-  python cli.py catmap_mine                    # 挖掘 + 落建议表(不动映射表)
+  python cli.py catmap_mine                    # 按类目 ID 挖掘(默认,推荐)
+  python cli.py catmap_mine -p key=path        # 按类目路径挖掘(无 ID 老行)
   python cli.py catmap_mine -p min_support=8   # 收紧可信门槛(默认 5)
   python cli.py catmap_mine -p promote=1       # 把 mined_trusted 升级进映射表
+
+**键 = browse_node_id(所有者定稿 2026-08-14)**:类目名会漂 ID 不会,按
+ID 投票天然绕开三套名称不一致;挖出来的映射自带 ID,补进映射表正好填上
+ID 缺口(实测产品侧 15,538 个 node 只有 61.5% 在映射表里)。`key=path`
+是无 ID 老行的兜底口径(与 2026-08-13 首版一致)。
 
 所有者定稿 2026-08-13 的三段式映射维护顺序,本工作流是第一段:
   ① **数据挖掘(本工作流)**:products 里既有亚马逊类目路径、又有实证
@@ -37,20 +43,42 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.catmap_mine")
 
-# 路径 × PT 投票(pt_meta 闸内联:废 PT 不参与;'unknown' 防御性剔除)
+# 键 × PT 投票(pt_meta 闸内联:废 PT 不参与;'unknown' 防御性剔除)。
+# {key} = p.browse_node_id(默认)或 btrim(p.amazon_category)
 _MINE_SQL = """
-SELECT btrim(p.amazon_category) AS path,
-       p.walmart_pt,
-       count(*) AS n
+SELECT {key} AS k, p.walmart_pt, count(*) AS n
 FROM catalog.products p
 JOIN audit.walmart_pt_meta m ON m.walmart_product_type = p.walmart_pt
 WHERE p.marketplace = 'US'
-  AND p.amazon_category IS NOT NULL AND btrim(p.amazon_category) <> ''
+  AND {key} IS NOT NULL AND btrim({key}) <> ''
   AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> 'unknown'
 GROUP BY 1, 2
 """
 
-_IN_MAP_SQL = """
+# 每个 node 的代表路径(产品数最多的那条;升级进映射表时当 amazon_category
+# 主键用——映射表 PK 是 (amazon_category, walmart_product_type))
+_REP_PATH_SQL = """
+SELECT DISTINCT ON (browse_node_id) browse_node_id, btrim(amazon_category)
+FROM (
+    SELECT browse_node_id, amazon_category, count(*) AS n
+    FROM catalog.products
+    WHERE marketplace = 'US' AND browse_node_id IS NOT NULL
+      AND amazon_category IS NOT NULL AND btrim(amazon_category) <> ''
+    GROUP BY 1, 2
+) t ORDER BY browse_node_id, n DESC
+"""
+
+_IN_MAP_NODE_SQL = """
+SELECT browse_node_id,
+       CASE WHEN count(DISTINCT walmart_product_type) = 1
+            THEN min(walmart_product_type) END
+FROM audit.walmart_category_map
+WHERE confidence = '高' AND browse_node_id IS NOT NULL
+  AND btrim(browse_node_id) <> ''
+GROUP BY 1
+"""
+
+_IN_MAP_PATH_SQL = """
 SELECT DISTINCT ON (btrim(amazon_category))
        btrim(amazon_category), walmart_product_type
 FROM audit.walmart_category_map
@@ -73,14 +101,14 @@ SET suggested_pt = EXCLUDED.suggested_pt,
     created_at   = now()
 """
 
-_PROMOTE_SQL = """
+# 升级:node 键挖出来的行**带 browse_node_id 一起写**——正是映射表 ID
+# 缺口的填补物;amazon_category 用代表路径(PK 需要)。ON CONFLICT 跳过
+_PROMOTE_NODE_SQL = """
 INSERT INTO audit.walmart_category_map
-    (amazon_category, walmart_product_type, confidence, match_type)
-SELECT s.amazon_category, s.suggested_pt, '高', 'mined_products'
-FROM audit.category_map_suggestions s
-WHERE s.status = 'mined_trusted'
-  AND NOT EXISTS (SELECT 1 FROM audit.walmart_category_map m
-                  WHERE btrim(m.amazon_category) = s.amazon_category)
+    (amazon_category, walmart_product_type, browse_node_id, confidence,
+     match_type)
+VALUES (%s, %s, %s, '高', 'mined_products')
+ON CONFLICT (amazon_category, walmart_product_type) DO NOTHING
 """
 
 
@@ -108,43 +136,59 @@ def classify_path(dist: dict, in_map_pt: str | None,
 
 
 def run(params: dict) -> str:
-    """输入:params(min_support / promote=1)→ 输出:挖掘分桶摘要。"""
+    """输入:params(key=node|path / min_support / promote=1)→ 输出:分桶摘要。"""
     min_support = int(params.get("min_support", 5))
     promote = str(params.get("promote", "")).strip() == "1"
+    by_node = str(params.get("key", "node")).strip().lower() != "path"
+    key_sql = "p.browse_node_id" if by_node else "btrim(p.amazon_category)"
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(_MINE_SQL)
+            cur.execute(_MINE_SQL.format(key=key_sql))
             votes: dict = {}
-            for path, pt, n in cur.fetchall():
-                votes.setdefault(path, {})[pt] = n
-            cur.execute(_IN_MAP_SQL)
-            in_map = dict(cur.fetchall())
-            # 别名路径视同已在映射表(catmap_align:中间层名漂移的假缺口),
-            # 否则会被当新映射挖出来、还可能与 canonical 行冲突刷屏
-            cur.execute("SELECT path, canonical_path "
-                        "FROM audit.category_path_alias")
-            for alias_path, canonical in cur.fetchall():
-                if canonical in in_map:
-                    in_map.setdefault(alias_path, in_map[canonical])
+            for k, pt, n in cur.fetchall():
+                votes.setdefault(k, {})[pt] = n
+            rep_path: dict = {}
+            if by_node:
+                cur.execute(_IN_MAP_NODE_SQL)
+                in_map = {k: v for k, v in cur.fetchall() if k}
+                cur.execute(_REP_PATH_SQL)
+                rep_path = dict(cur.fetchall())
+            else:
+                cur.execute(_IN_MAP_PATH_SQL)
+                in_map = dict(cur.fetchall())
+                # 别名路径视同已在映射表(catmap_align:中间层名漂移的假缺口),
+                # 否则会被当新映射挖出来、还可能与 canonical 行冲突刷屏
+                cur.execute("SELECT path, canonical_path "
+                            "FROM audit.category_path_alias")
+                for alias_path, canonical in cur.fetchall():
+                    if canonical in in_map:
+                        in_map.setdefault(alias_path, in_map[canonical])
 
         counts = {"mined_trusted": 0, "mined_review": 0,
                   "mined_mixed": 0, "map_conflict": 0}
-        rows = []
-        for path, dist in votes.items():
-            got = classify_path(dist, in_map.get(path), min_support)
+        rows, promote_rows = [], []
+        for k, dist in votes.items():
+            got = classify_path(dist, in_map.get(k), min_support)
             if got is None:
                 continue
             status, pt, support = got
             counts[status] += 1
-            rows.append((path, pt, "高" if status == "mined_trusted" else None,
+            # 建议表主键是 amazon_category:node 键模式下用代表路径当展示键,
+            # 没有代表路径的 node 用 'node:<id>' 兜底(不会与真路径撞)
+            label = (rep_path.get(k) or f"node:{k}") if by_node else k
+            rows.append((label, pt, "高" if status == "mined_trusted" else None,
                          status, sum(dist.values()), support,
                          json.dumps(dist, ensure_ascii=False)))
+            if by_node and status == "mined_trusted" and rep_path.get(k):
+                promote_rows.append((rep_path[k], pt, k))
         with conn.cursor() as cur:
             cur.executemany(_UPSERT_SQL, rows)
 
-        lines = [f"catmap_mine(门槛 {min_support}):路径 {len(votes)}(有实证"
-                 f" PT 投票)→ 可信 {counts['mined_trusted']} / 待核(少量支持)"
+        kind = "类目 ID" if by_node else "类目路径"
+        lines = [f"catmap_mine(键={kind},门槛 {min_support}):"
+                 f"{kind} {len(votes)} 个(有实证 PT 投票)→ "
+                 f"可信 {counts['mined_trusted']} / 待核(少量支持)"
                  f" {counts['mined_review']} / 分流 {counts['mined_mixed']} / "
                  f"与旧映射冲突 {counts['map_conflict']}",
                  "复核 SQL:SELECT * FROM audit.category_map_suggestions "
@@ -158,9 +202,13 @@ def run(params: dict) -> str:
                 lines.append(f"(可信 {counts['mined_trusted']} 条未升级;"
                              f"确认后 -p promote=1 写进映射表)")
             return "\n".join(lines)
+        if not by_node:
+            return "\n".join(lines + [
+                "⚠ key=path 模式不支持 promote(升级行必须带 browse_node_id"
+                "——那才是映射表的 ID 缺口填补物);去掉 key=path 重跑"])
         with conn.cursor() as cur:
-            cur.execute(_PROMOTE_SQL)
-            lines.append(f"升级完成:{cur.rowcount} 条 mined_trusted → "
-                         f"walmart_category_map(confidence=高,"
-                         f"match_type=mined_products)✓ 审核②级即刻生效")
+            cur.executemany(_PROMOTE_NODE_SQL, promote_rows)
+        lines.append(f"升级完成:{len(promote_rows)} 条 mined_trusted → "
+                     f"walmart_category_map(带 browse_node_id,confidence=高,"
+                     f"match_type=mined_products)✓ 审核 ②a 级即刻生效")
     return "\n".join(lines)

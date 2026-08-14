@@ -225,17 +225,35 @@ def test_derive_path_rows_keep_every_mount():
     assert resolve("9", acc["9"])[4] == "11"         # 代表路径 = 票多的那条
 
 
-def test_taxonomy_survey_flags_unparsed_sections():
-    """未解析的顶层段必须报警(否则'文件缺'与'解析器没读'分不清)。"""
+def test_taxonomy_survey_reports_shape_of_unparsed_sections():
+    """未解析的段要连**形状**一起报:只说"不是带 node 的清单"定位不到原因
+    (所有者第二轮实测:nodes 段仍未解析,但看不出是字段名不同还是别的)。"""
     from workflows.taxonomy_import import survey_file
     out = "\n".join(survey_file({
         "meta": {"reconciled_tree_rows": 5},
-        "leaves": [{}, {}],
-        "internal_nodes": [{}],
+        "leaves": [{"browse_node_id": "1", "类目名": "A"},
+                   {"browse_node_id": "2", "类目名": "B"}],
+        "internal_nodes": [{"cat_id": "9", "label": "X"}],
+        "notes": ["纯文本"],
     }))
-    assert "leaves: 2 行(解析)" in out
-    assert "internal_nodes: 1 行 ⚠" in out
-    assert "meta.reconciled_tree_rows = 5" in out and "差 3" in out
+    assert "leaves: 2 行(解析" in out
+    assert "internal_nodes: 1 行 ⚠" in out and "行键:cat_id / label" in out
+    assert "notes: 1 行 ⚠" in out and "元素不是 dict(是 str)" in out
+    assert "meta 自报:reconciled_tree_rows=5" in out
+    assert "解析到去重 node 2" in out and "差 3" in out
+
+
+def test_taxonomy_reads_dict_shaped_and_english_keys():
+    """段可以是 dict{node_id: {…}};字段名认正式下发规格的英文列名。"""
+    from workflows.taxonomy_import import data_sections, parse_rows
+    data = {"amazon_all_nodes": {
+        "553220": {"name": "Handsaws", "full_path": "Tools > Handsaws",
+                   "parent_node_id": "551238", "depth": 2, "is_leaf": True}}}
+    assert data_sections(data) == ["amazon_all_nodes"]
+    rows, paths, _stat = parse_rows(data)
+    assert rows[0][:2] == ("553220", "Handsaws")     # 字典键补成 node_id
+    assert rows[0][5] is True                        # is_leaf 布尔真也认
+    assert paths[0][:3] == ("553220", "551238", "Tools > Handsaws")
 
 
 def test_sibling_swap_distinguishes_rename_from_category_change():

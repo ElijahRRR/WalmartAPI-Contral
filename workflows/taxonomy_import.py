@@ -48,10 +48,49 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.taxonomy_import")
 
-# 树行的中文键(所有者对账版原样;缺任一必填键的行跳过并计数)
-_K_NODE, _K_NAME, _K_PATH = "browse_node_id", "类目名", "完整路径"
-_K_PARENT, _K_DEPTH, _K_LEAF = "父节点ID", "深度", "是否叶子"
-_K_ROOT, _K_SAMPLES = "L1 根类目", "产品样本数"
+# 树行的字段名:中文=所有者对账版原样,英文=正式下发规格(2026-08-14 定稿
+# 的 amazon_all_nodes / amazon_node_paths 列名)。**同一段里先匹配到哪个用
+# 哪个,并在体检里报出用了哪个键**——兼容不等于猜:认不出来就报未解析。
+_K_NODE = ("browse_node_id", "node_id", "browseNodeId", "id")
+_K_NAME = ("类目名", "name", "node_name", "category_name")
+_K_PATH = ("完整路径", "full_path", "path")
+_K_PARENT = ("父节点ID", "parent_node_id", "parentId")
+_K_DEPTH = ("深度", "depth")
+_K_LEAF = ("是否叶子", "is_leaf", "leaf")
+_K_ROOT = ("L1 根类目", "root_name", "l1_root")
+_K_SAMPLES = ("产品样本数", "product_samples")
+
+_TRUE = {"是", "true", "yes", "y", "1", "t"}
+
+
+def _get(row: dict, keys: tuple, default: str = "") -> str:
+    """输入:行 + 字段名候选 → 输出:第一个非空值的字符串形态。"""
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return str(v).strip()
+    return default
+
+
+def section_rows(val) -> list[dict]:
+    """输入:一个顶层段 → 输出:统一成 [dict] 的行。
+
+    两种形态都收:list[dict],或 **dict{node_id: {…}}**(以 ID 为键的字典
+    树,行内往往就不再重复 ID)——后者把字典键补进行里当 node_id。
+    """
+    if isinstance(val, list):
+        return [r for r in val if isinstance(r, dict)]
+    if isinstance(val, dict):
+        out = []
+        for k, v in val.items():
+            if not isinstance(v, dict):
+                continue
+            row = dict(v)
+            if not _get(row, _K_NODE):
+                row[_K_NODE[0]] = k
+            out.append(row)
+        return out
+    return []
 
 # 节点级属性的取值优先段(先到先得);**不在这个名单里的段照收不误**,
 # 只是排在后面——2026-08-14 教训:写死段名 = 文件多给的东西静默丢掉
@@ -60,48 +99,75 @@ _SECTIONS = ("leaves", "verified_added_paths", "unverified_new_nodes")
 _IGNORED_KEYS = ("meta",)      # 已知的非数据段
 
 
-def data_sections(data: dict) -> list[str]:
-    """输入:整份 JSON → 输出:按优先序排列的**数据段名**(带 node 的 list)。
+def is_data_section(val) -> bool:
+    """输入:一个顶层段 → 输出:它是不是"带 node 的行清单"。"""
+    head = next(iter(section_rows(val)), None)
+    return bool(head and _get(head, _K_NODE))
 
-    判据是内容不是段名:顶层任何 list、其首个 dict 行带 `browse_node_id`,
-    就是数据段。已知段排前(节点级属性先到先得),陌生段按出现顺序排后。
+
+def data_sections(data: dict) -> list[str]:
+    """输入:整份 JSON → 输出:按优先序排列的**数据段名**。
+
+    判据是内容不是段名:任何 list[dict] 或 dict{id: {…}},首行认得出
+    node id,就是数据段。已知段排前(节点级属性先到先得),陌生段按出现
+    顺序排后。
     """
-    known = [s for s in _SECTIONS if isinstance(data.get(s), list)]
-    extra = []
-    for key, val in data.items():
-        if key in _IGNORED_KEYS or key in known or not isinstance(val, list):
-            continue
-        head = next((r for r in val if isinstance(r, dict)), None)
-        if head and str(head.get(_K_NODE) or "").strip():
-            extra.append(key)
+    known = [s for s in _SECTIONS if is_data_section(data.get(s))]
+    extra = [k for k, v in data.items()
+             if k not in _IGNORED_KEYS and k not in known and is_data_section(v)]
     return known + extra
 
 
-def survey_file(data: dict) -> list[str]:
-    """输入:整份 JSON → 输出:文件构造体检行(段名 × 行数 × 是否解析)。
+def _shape(val) -> str:
+    """输入:一个段 → 输出:形状速写(类型 + 首行字段名),给未解析段定位用。"""
+    if isinstance(val, dict):
+        head = next(iter(val.values()), None)
+        kind, keys = "dict{键: 值}", (list(head)[:8] if isinstance(head, dict)
+                                     else [])
+        if not keys:
+            return f"{kind};值不是 dict(是 {type(head).__name__})"
+    elif isinstance(val, list):
+        head = next((r for r in val if isinstance(r, dict)), None)
+        if head is None:
+            first = val[0] if val else None
+            return f"list;元素不是 dict(是 {type(first).__name__})"
+        kind, keys = "list[dict]", list(head)[:8]
+    else:
+        return type(val).__name__
+    return f"{kind};行键:{' / '.join(map(str, keys))}"
 
-    **不解析的段必须报出来**:2026-08-14 所有者问"中间层是文件缺还是没读到",
-    当时答不上——因为解析器只认三个段名,别的段静默丢弃。现在预览先把
-    文件的顶层结构原样摊开,再对上 meta 里的自报行数,差多少一眼可见。
+
+def survey_file(data: dict) -> list[str]:
+    """输入:整份 JSON → 输出:文件构造体检行(段名 × 行数 × 形状)。
+
+    **不解析的段必须连形状一起报出来**:2026-08-14 两轮教训——先是解析器
+    只认三个写死的段名,把 `nodes` 段静默丢了;改成按内容认段后它仍未解析,
+    但只报"不是带 node 的清单",还是定位不到原因。现在直接打印类型和首行
+    字段名,一眼看出是字段名不同、还是根本不是行清单。
     """
     sections = data_sections(data)
-    out, parsed = [], 0
+    out, parsed = [], set()
     for key, val in data.items():
         if key in _IGNORED_KEYS:
             continue
         n = len(val) if isinstance(val, (list, dict)) else 1
         if key in sections:
-            parsed += n
-            tag = "解析" if key in _SECTIONS else "解析·段名陌生但带 node"
-            out.append(f"  {key}: {n} 行({tag})")
+            rows = section_rows(val)
+            parsed |= {_get(r, _K_NODE) for r in rows}
+            tag = "解析" if key in _SECTIONS else "解析·段名陌生但认得出 node"
+            out.append(f"  {key}: {n} 行({tag};{_shape(val)})")
         else:
-            out.append(f"  {key}: {n} 行 ⚠ **未解析**"
-                       f"(不是带 browse_node_id 的行清单)")
-    meta = data.get("meta") or {}
-    for k, v in meta.items():
-        if isinstance(v, int) and v and v != parsed:
-            out.append(f"  meta.{k} = {v}(文件自报;实际可解析 {parsed},"
-                       f"差 {v - parsed})")
+            out.append(f"  {key}: {n} 行 ⚠ **未解析**({_shape(val)})"
+                       f"——认得的 node 字段名:{' / '.join(_K_NODE)}")
+    meta = {k: v for k, v in (data.get("meta") or {}).items()
+            if isinstance(v, int)}
+    if meta:
+        out.append("  meta 自报:"
+                   + " / ".join(f"{k}={v}" for k, v in meta.items()))
+        top = max(meta.values())
+        out.append(f"  → 解析到去重 node {len(parsed)},meta 最大自报 {top}"
+                   + (f",**差 {top - len(parsed)}**(有段没读进来?)"
+                      if top > len(parsed) else "(已全收)"))
     return out
 
 
@@ -134,21 +200,17 @@ def parse_rows(data: dict) -> tuple[list[tuple], list[tuple], dict]:
     stat["skipped"] = 0
     stat["paths"] = 0
     for sec in sections:
-        for r in data.get(sec) or []:
-            if not isinstance(r, dict):
-                stat["skipped"] += 1
-                continue
-            node = str(r.get(_K_NODE) or "").strip()
-            name = str(r.get(_K_NAME) or "").strip()
+        for r in section_rows(data.get(sec)):
+            node, name = _get(r, _K_NODE), _get(r, _K_NAME)
             if not node or not name:
                 stat["skipped"] += 1
                 continue
-            parent = str(r.get(_K_PARENT) or "").strip()
+            parent = _get(r, _K_PARENT)
             if not parent.isdigit():      # 'L1_xxx' 根级占位
                 parent = ""
-            path = str(r.get(_K_PATH) or "").strip()
-            depth = _int(r.get(_K_DEPTH))
-            root = str(r.get(_K_ROOT) or "").strip() or None
+            path = _get(r, _K_PATH)
+            depth = _int(_get(r, _K_DEPTH))
+            root = _get(r, _K_ROOT) or None
             if path:                       # 无路径的行不进路径表(没关系可存)
                 key = (node, parent, path)
                 if key not in seen_path:
@@ -160,8 +222,8 @@ def parse_rows(data: dict) -> tuple[list[tuple], list[tuple], dict]:
             seen.add(node)
             node_rows.append((
                 node, name, path or None, depth, parent or None,
-                str(r.get(_K_LEAF) or "").strip() == "是", root,
-                _int(r.get(_K_SAMPLES)), sec))
+                _get(r, _K_LEAF).casefold() in _TRUE, root,
+                _int(_get(r, _K_SAMPLES)), sec))
             stat[sec] += 1
     return node_rows, path_rows, stat
 

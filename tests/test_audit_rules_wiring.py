@@ -769,3 +769,19 @@ def test_known_pt_splits_evidence_from_cached_inference():
                        l1=L1Info(walmart_product_type="GoodPT",
                                  pt_source="audit_cached"))
     assert audit_store.pt_provenance(out) == "audit_llm"
+
+
+def test_adopt_only_requires_backfill_and_skips_judging():
+    """adopt_only:只采用历史结论、零 LLM(所有者 2026-08-14:86 万可采用
+    vs 33 万要真判,混在一起跑等于为了采用顺带付 33 万次 LLM)。"""
+    with pytest.raises(ValueError, match="只在 mode=backfill"):
+        product_audit.run({"adopt_only": "1"})
+    assert "adopt_only" in product_audit._KNOWN_PARAMS
+
+
+def test_adopt_history_batches_updates():
+    """采用走 executemany:86 万条逐行往返要几十分钟。"""
+    import inspect
+    src = inspect.getsource(product_audit._adopt_history)
+    assert "adopt_rows.append" in src and "executemany(_ADOPT_SQL" in src
+    assert "conn.execute(_ADOPT_SQL" not in src      # 逐行版必须已移除

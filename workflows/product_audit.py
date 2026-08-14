@@ -111,7 +111,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 
 _KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
-                 "l3", "l4", "workers"}
+                 "l3", "l4", "workers", "adopt_only"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -153,6 +153,7 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
         rows = cur.fetchall()
     adopted = set()
     events = []
+    adopt_rows = []
     for (asin, run_id, verdict, _score, pt, reason_cat, stage, created,
          src) in rows:
         adopted.add(asin)
@@ -165,7 +166,7 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             reason = reason_cat or f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
             reason = None
-        conn.execute(_ADOPT_SQL, {
+        adopt_rows.append({
             "status": status,
             "reason": reason,
             "pt": (pt if pt and not pt.startswith("(") else None),
@@ -186,6 +187,10 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
                                       created.isoformat() if created else "",
                                   "audit_version":
                                       resources.AUDIT_RULES_VERSION}})
+    if execute and adopt_rows:
+        # 批量:86 万条采用逐行往返要几十分钟,executemany 一次搞定
+        with conn.cursor() as cur:
+            cur.executemany(_ADOPT_SQL, adopt_rows)
     if execute and events:
         product_events.record_many(conn, events)
     return len(adopted), adopted
@@ -196,6 +201,10 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
+    adopt_only = str(params.get("adopt_only", "")).strip() == "1"
+    if adopt_only and not backfill:
+        raise ValueError("adopt_only=1 只在 mode=backfill 下有意义"
+                         "(它采用的是 audit_runs 里的历史结论)")
     r5_on = str(params.get("r5", "")).strip().lower() == "on"
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
@@ -231,6 +240,14 @@ def run(params: dict) -> str:
         if backfill:
             adopted_n, adopted = _adopt_history(
                 conn, [r["asin"] for r in rows], execute)
+        if adopt_only:
+            # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
+            # 再单独安排要真判的那批)。86 万可采用 vs 33 万要真判,混在
+            # 一起跑等于为了采用而顺带付 33 万次 LLM
+            return (f"product_audit(仅采用历史,零 LLM):候选 {len(rows)} → "
+                    f"采用 {adopted_n}"
+                    + ("" if execute else "(dry-run:未写库)")
+                    + f";其余 {len(rows) - adopted_n} 条无历史,需另跑判定")
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0

@@ -12,10 +12,24 @@
 的产品路径,按 services/catpath 的三闸对齐(叶子相等 + 顶级相等 + 段集
 重叠唯一最佳)折回映射表里的等价路径,落 audit.category_path_alias。
 
-产出三态(报告分列,只有 aligned 落库):
-  aligned    唯一最佳且分数达标 → 假缺口,别名落库,②级立即能命中
-  ambiguous  多个候选并列 → 交人工(**不猜**)
-  no_match   叶子/顶级对不上 → 真缺口,归 catmap_mine / catmap_suggest 处理
+**顶级闸挡得住跨大类串类,挡不住同一大类内的不同子树**(所有者首跑
+实测:`Home Décor Accents > … > Decorative Signs & Plaques` 被 0.60 分
+折到 `Seasonal Décor > Wreath Hangers > …`)。故收口靠两条,而不是单纯
+调阈值(合法浅路径 `… > Vases`、`… > Party Packs` 只有 0.67,一刀切会误伤):
+
+  1. **实证背书**:缺口路径下的产品带实证 walmart_pt(pt_backfill 回填),
+     与候选 canonical 路径的映射 PT 一比即知真假——**PT 一致 = verified**
+     (任何分数都收,数据说话);**PT 相左 = pt_conflict**(高分也不折);
+  2. 无实证可查时才看分数:≥ min_score(默认 0.75,两条真实漂移实测
+     0.80/0.83)才折;0.5~0.75 落 low_score 报告,交人工。
+
+产出六态(只有 verified / aligned 落库):
+  verified    实证 PT 与 canonical 映射 PT 一致 → 最硬的证据,直接折
+  aligned     无实证可查、分数 ≥ min_score → 折
+  low_score   无实证、分数不足 → 报告待人工(不折)
+  pt_conflict 实证 PT 与 canonical 相左 → **不折**,报告(疑似串子树)
+  ambiguous   多个候选并列 → 交人工(**不猜**)
+  no_match    叶子/顶级对不上 → 真缺口,归 catmap_mine / catmap_suggest
 
 幂等:ON CONFLICT 覆盖(阈值调整或映射表新增后重跑即刷新)。别名只是
 **查询侧折叠**,不改写映射表一行——映射表编辑权威(飞书 vs PG)未定,
@@ -43,11 +57,26 @@ GROUP BY 1
 ORDER BY n DESC
 """
 
-# 映射表侧候选路径(高置信;哨兵行也要——'无对应Walmart PT' 是有效结论)
+# 映射表侧候选路径 + 其 PT(高置信;哨兵行也要——'无对应Walmart PT'
+# 是有效结论。同路径多 PT 的取 NULL:PT 不唯一时无从做实证背书)
 _CANON_SQL = """
-SELECT DISTINCT btrim(amazon_category)
+SELECT btrim(amazon_category),
+       CASE WHEN count(DISTINCT walmart_product_type) = 1
+            THEN min(walmart_product_type) END AS pt
 FROM audit.walmart_category_map
 WHERE confidence = '高' AND btrim(amazon_category) <> ''
+GROUP BY 1
+"""
+
+# 缺口路径的产品实证 PT 分布(pt_backfill 回填 + 审核结论;过 pt_meta 闸)
+_EVIDENCE_SQL = """
+SELECT btrim(p.amazon_category), p.walmart_pt, count(*)
+FROM catalog.products p
+JOIN audit.walmart_pt_meta m ON m.walmart_product_type = p.walmart_pt
+WHERE p.marketplace = 'US'
+  AND p.amazon_category IS NOT NULL AND btrim(p.amazon_category) <> ''
+  AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> 'unknown'
+GROUP BY 1, 2
 """
 
 _UPSERT_SQL = """
@@ -58,6 +87,35 @@ SET canonical_path = EXCLUDED.canonical_path,
     score          = EXCLUDED.score,
     aligned_at     = now()
 """
+
+
+MIN_SCORE_AUTO = 0.75    # 无实证背书时的自动折叠下限(两条真实漂移 0.80/0.83)
+MIN_EVIDENCE = 2         # 实证背书需要的最少产品数(单证不立)
+
+
+def consensus_pt(dist: dict, min_n: int = MIN_EVIDENCE) -> str | None:
+    """输入:{pt: 产品数} → 输出:共识 PT(单一 PT 且票数达标)或 None。
+
+    纯函数。有分流(多个 PT)就没有共识——那种路径本身就该交人工,
+    不配给别名做背书。
+    """
+    if len(dist) != 1:
+        return None
+    pt, n = next(iter(dist.items()))
+    return pt if n >= min_n else None
+
+
+def decide_alias(score: float, evidence_pt: str | None,
+                 canonical_pt: str | None,
+                 min_score: float = MIN_SCORE_AUTO) -> str:
+    """输入:对齐分 + 实证共识 PT + canonical 映射 PT → 输出:落库状态。
+
+    纯函数。实证优先于分数(数据 > 字符串相似度):一致即 verified(低分
+    也收),相左即 pt_conflict(高分也拒);无实证可查才退回看分数。
+    """
+    if evidence_pt and canonical_pt:
+        return "verified" if evidence_pt == canonical_pt else "pt_conflict"
+    return "aligned" if score >= min_score else "low_score"
 
 
 def build_leaf_index(canonical_paths) -> dict:
@@ -74,41 +132,65 @@ def build_leaf_index(canonical_paths) -> dict:
     return idx
 
 
+_STATUSES = ("verified", "aligned", "low_score", "pt_conflict",
+             "ambiguous", "no_match")
+_FOLDABLE = ("verified", "aligned")
+
+
 def run(params: dict) -> str:
-    """输入:params(apply=1 才写库)→ 输出:真/假缺口分布摘要。"""
+    """输入:params(apply=1 写库;min_score 调无实证时的分数下限)→ 输出:分布摘要。"""
     apply = str(params.get("apply", "")).strip() == "1"
+    min_score = float(params.get("min_score", MIN_SCORE_AUTO))
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_CANON_SQL)
-            canon = [r[0] for r in cur.fetchall()]
+            canon_pt = dict(cur.fetchall())
+            cur.execute(_EVIDENCE_SQL)
+            votes: dict = {}
+            for path, pt, n in cur.fetchall():
+                votes.setdefault(path, {})[pt] = n
             cur.execute(_GAP_SQL)
             gaps = cur.fetchall()
-        idx = build_leaf_index(canon)
+        idx = build_leaf_index(canon_pt.keys())
 
-        rows, samples = [], []
-        stat = {"aligned": 0, "ambiguous": 0, "no_match": 0}
-        prod = {"aligned": 0, "ambiguous": 0, "no_match": 0}
+        rows = []
+        samples: dict = {s: [] for s in _STATUSES}
+        stat = {s: 0 for s in _STATUSES}
+        prod = {s: 0 for s in _STATUSES}
         for path, n in gaps:
             cands = idx.get(catpath.leaf_key(path) or "", [])
             best, score, status = catpath.align_path(path, cands)
+            if status == "aligned":     # 再过实证背书/分数两道
+                status = decide_alias(score, consensus_pt(votes.get(path, {})),
+                                      canon_pt.get(best), min_score)
             stat[status] += 1
             prod[status] += n
-            if status == "aligned":
+            if status in _FOLDABLE:
                 rows.append((path, best, round(score, 3)))
-                if len(samples) < 10:
-                    samples.append(f"  {n:>5} 件|{path[:60]}…\n"
-                                   f"        ↳ {best[:60]}…(分 {score:.2f})")
+            if best and len(samples[status]) < 5:
+                samples[status].append(
+                    f"  {n:>5} 件|{path[:58]}…\n"
+                    f"        ↳ {best[:58]}…(分 {score:.2f})")
 
+        foldable = sum(stat[s] for s in _FOLDABLE)
         lines = [
-            f"catmap_align:精确匹配缺口 {len(gaps)} 条路径 → "
-            f"别名可折 {stat['aligned']}(覆盖 {prod['aligned']} 件产品)/ "
-            f"歧义待人工 {stat['ambiguous']}({prod['ambiguous']} 件)/ "
-            f"真缺口 {stat['no_match']}({prod['no_match']} 件)",
-            f"⇒ 假缺口占比 {stat['aligned'] / len(gaps) * 100:.1f}%"
-            if gaps else "⇒ 无缺口",
+            f"catmap_align(无实证时分数门槛 {min_score}):精确匹配缺口 "
+            f"{len(gaps)} 条路径 →",
+            f"  可折 {foldable} 条 / {prod['verified'] + prod['aligned']} 件"
+            f"(实证背书 {stat['verified']} + 分数达标 {stat['aligned']})",
+            f"  待人工 {stat['low_score'] + stat['pt_conflict'] + stat['ambiguous']}"
+            f" 条(分数不足 {stat['low_score']} / **PT 相左 "
+            f"{stat['pt_conflict']}** / 并列歧义 {stat['ambiguous']})",
+            f"  真缺口 {stat['no_match']} 条 / {prod['no_match']} 件"
+            f"(归 catmap_mine / catmap_suggest)",
         ]
-        lines += samples
+        for tag, title in (("verified", "实证背书样例"),
+                           ("pt_conflict", "⚠ PT 相左(疑似串子树,已拒折)"),
+                           ("low_score", "分数不足(待人工)")):
+            if samples[tag]:
+                lines.append(f"{title}:")
+                lines += samples[tag]
         if not apply:
             lines.append("(预览:未写库;确认无误加 -p apply=1)")
             return "\n".join(lines)

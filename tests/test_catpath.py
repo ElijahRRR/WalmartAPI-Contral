@@ -87,6 +87,29 @@ def test_single_segment_path_never_aligns():
     assert best is None and status == "no_match"
 
 
+def test_decide_alias_evidence_beats_score():
+    """实证 PT 优先于字符串相似度(所有者首跑实测:0.60 分把装饰牌匾折进
+    '季节装饰>花环挂钩',单靠调阈值会误伤 0.67 的合法浅路径)。"""
+    from workflows.catmap_align import decide_alias
+    # 实证一致 → 低分也收
+    assert decide_alias(0.55, "GoodPT", "GoodPT") == "verified"
+    # 实证相左 → 高分也拒
+    assert decide_alias(0.95, "GoodPT", "OtherPT") == "pt_conflict"
+    # 无实证 → 看分数
+    assert decide_alias(0.80, None, "GoodPT") == "aligned"
+    assert decide_alias(0.60, None, "GoodPT") == "low_score"
+    # canonical 侧 PT 不唯一(映射表分流)→ 无从背书,退回看分数
+    assert decide_alias(0.60, "GoodPT", None) == "low_score"
+
+
+def test_consensus_pt_requires_unanimity_and_support():
+    from workflows.catmap_align import consensus_pt
+    assert consensus_pt({"A": 5}) == "A"
+    assert consensus_pt({"A": 1}) is None            # 单证不立
+    assert consensus_pt({"A": 9, "B": 1}) is None    # 分流无共识
+    assert consensus_pt({}) is None
+
+
 def test_build_leaf_index_groups_by_leaf():
     idx = build_leaf_index([c for _b, c in OWNER_CASES] + BELT_DECOYS)
     assert len(idx["belts"]) == 5          # 1 正确 + 4 诱饵

@@ -426,11 +426,21 @@ def run(params: dict) -> str:
     # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
     from api import llm as _llm2
     retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
-    lines.append(f"并发 {workers}"
-                 + (f",LLM 退避重试 " + " / ".join(f"{k} {v}" for k, v
-                                                  in sorted(retries.items()))
-                    + "(有 429 说明已撞限流,再加并发只会更慢)"
-                    if retries else ",LLM 零退避(未撞限流,可继续加并发)"))
+    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
+    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
+    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
+    if retries.get("http_429"):
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + " ⚠ **已撞限流**,再加并发只会更慢")
+    elif retries:
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
+                  "降并发解决不了)")
+    else:
+        tail = ",LLM 零退避(未撞限流,可继续加并发)"
+    lines.append(f"并发 {workers}{tail}")
     l1_blocked = (l1s.get("seed_excluded_direct", 0)
                   + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
                   + l1s.get("publication_forbidden", 0))

@@ -844,3 +844,12 @@ def test_run_commits_in_segments_with_progress():
     assert "_COMMIT_EVERY" in src and "conn.commit()" in src
     assert "进度 %d/%d" in src                     # 日志可见,不必查库
     assert 0 < product_audit._COMMIT_EVERY <= 2000  # 段太大就退化回老问题
+
+
+def test_retry_summary_only_calls_429_ratelimit():
+    """只有 http_429 才叫撞限流(生产实测:19 次 other 被说成"已撞限流",
+    把所有者引向降并发 —— 而网络抖动降并发毫无用处)。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert 'retries.get("http_429")' in src
+    assert "降并发解决不了" in src

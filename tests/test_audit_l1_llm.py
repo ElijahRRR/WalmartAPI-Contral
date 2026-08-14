@@ -134,6 +134,10 @@ def _five_route_script(**over):
         "DISTINCT ON (m.walmart_product_type)": (
             ["walmart_product_type", "confidence"], [("LiteralPT", "高")]),
     }
+    # 第七路(PT 字典直搜)默认返回空:多数用例只钉映射表那五路
+    script = {"coalesce(walmart_ptg, '')": (
+        ["walmart_product_type", "walmart_category", "walmart_ptg", "score"],
+        []), **script}
     script.update(over)
     return script
 
@@ -164,7 +168,8 @@ def test_candidates_sql_pins_schema_and_raw_leaf_and_dead_columns():
     cur = FakeCursor(_five_route_script())
     l1.candidates(FakeConn(cur), _product(title="Garden Hose Nozzle"))
     sqls = [s for s, _ in cur.executed]
-    assert len(sqls) == 5
+    # 五路映射表 + 第七路 PT 字典直搜(产品无 browse_node_id ⇒ 第六路跳过)
+    assert len(sqls) == 6
     joined = "\n".join(sqls)
     # 合同 L1-2:照抄 raw->>'amazon_leaf'(不改用 amazon_leaf 列)
     assert "m.raw->>'amazon_leaf' ILIKE %s" in joined
@@ -193,7 +198,8 @@ def test_candidates_skips_path_routes_when_no_path():
     sqls = [s for s, _ in cur.executed]
     assert not any("m.amazon_category = %s" in s for s in sqls)
     assert not any("amazon_leaf" in s for s in sqls)
-    assert any("unnest(" in s for s in sqls)     # title 路仍走
+    assert any("unnest(" in s and "walmart_category_map" in s
+               for s in sqls)                   # title 路仍走
 
 
 def test_candidates_short_circuits_when_limit_reached():
@@ -205,7 +211,8 @@ def test_candidates_short_circuits_when_limit_reached():
     out = l1.candidates(FakeConn(cur), _product(title="Garden Hose Nozzle"))
     sqls = [s for s, _ in cur.executed]
     assert not any("%s LIKE m.amazon_category" in s for s in sqls)
-    assert not any("unnest(" in s for s in sqls)
+    # 短路只管映射表那四路;第七路直搜 PT 字典与 limit 无关(它也用 unnest)
+    assert not any("unnest(" in s and "walmart_category_map" in s for s in sqls)
     # 第五路 title_literal 独立于 limit,照常查
     assert any("DISTINCT ON (m.walmart_product_type)" in s for s in sqls)
     assert len(out) == 16      # 15 条 kw(截到 limit)+ 1 条 literal
@@ -437,3 +444,66 @@ def test_publication_ban_applies_to_rerank_output():
 # (原第①级第二数据源 error_confirmed_map 已随所有者定稿移除:历史实证 PT
 #  经 pt_backfill 直接回填 products.walmart_pt,resolve_pt ①b 读产品行——
 #  测试见 test_audit_rules_wiring.test_resolve_pt_known_pt_second_source)
+
+
+# ── 第六/七路 + 两阶段开放判定(所有者定稿 2026-08-14)───────────────────────
+
+def _seven_route_script(**over):
+    # 派发按 dict 顺序取首个匹配片段:第六路 SQL 里也有 "DISTINCT ON
+    # (m.walmart_product_type)",必须排在第五路那条键之前才不会被它截走
+    script = {"FROM audit.amazon_node_paths": (
+        ["amazon_category", "walmart_product_type", "confidence", "dist"],
+        [("A > B", "AncPT2", "高", 2), ("A", "AncPT1", "中", 1)])}
+    script.update(_five_route_script())
+    script["coalesce(walmart_ptg, '')"] = (
+        ["walmart_product_type", "walmart_category", "walmart_ptg", "score"],
+        [("DictPT", "Home", "Garden", 3)])
+    script.update(over)
+    return script
+
+
+def test_ancestor_and_pt_dict_routes_append_after_map_routes():
+    """六/七路只补候选池,顺序排在映射表五路之后(映射证据强于祖先/字典)。"""
+    cur = FakeCursor(_seven_route_script())
+    out = l1.candidates(FakeConn(cur),
+                        _product(title="Garden Hose Nozzle", browse_node_id="9"))
+    assert [c["match_type"] for c in out] == [
+        "exact", "prefix", "leaf", "title_keyword", "title_literal",
+        "ancestor_1", "ancestor_2", "pt_dict"]      # 祖先按层距近的在前
+
+
+def test_ancestor_route_skipped_without_node_id():
+    cur = FakeCursor(_seven_route_script())
+    l1.candidates(FakeConn(cur), _product(title="Garden Hose", browse_node_id=""))
+    assert not any("amazon_node_paths" in s for s, _ in cur.executed)
+
+
+def test_pt_dict_words_take_leaf_then_title():
+    """第七路的词:先 Amazon 叶子类目名,再补标题关键词(去重、≤8)。"""
+    p = _product(title="Golf Cart Seat Cover Beige",
+                 amazon_category_path="Sports > Golf > Golf Cart Accessories")
+    assert l1._dict_words(p)[:3] == ["Golf", "Cart", "Accessories"]
+    assert "Seat" in l1._dict_words(p)
+
+
+def test_open_candidates_two_stage():
+    """七路全空时的兜底:先让 LLM 选大类,再把该大类全部 PT 当候选。"""
+    cur = FakeCursor({
+        "SELECT DISTINCT walmart_category": (["walmart_category"],
+                                             [("Home",), ("Garden",)]),
+        "walmart_category = ANY": (
+            ["walmart_product_type", "walmart_category", "walmart_ptg"],
+            [("PTa", "Home", "G1"), ("PTb", "Home", "G2")]),
+    })
+    out = l1.open_candidates(FakeConn(cur), _product(title="w"),
+                             chat_fn=lambda m: {"categories": ["Home"]})
+    assert [c["walmart_product_type"] for c in out] == ["PTa", "PTb"]
+    assert all(c["match_type"] == "open_mega" for c in out)
+    # 一阶段选了清单外的大类 → 不认,返回空(绝不放大到全字典)
+    assert l1.open_candidates(FakeConn(cur), _product(title="w"),
+                              chat_fn=lambda m: {"categories": ["瞎编"]}) == []
+    # 一阶段调用失败 → 空(调用方照旧 pending)
+    def _boom(_m):
+        raise RuntimeError("down")
+    assert l1.open_candidates(FakeConn(cur), _product(title="w"),
+                              chat_fn=_boom) == []

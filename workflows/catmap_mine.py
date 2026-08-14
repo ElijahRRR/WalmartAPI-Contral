@@ -27,6 +27,13 @@ ID 缺口(实测产品侧 15,538 个 node 只有 61.5% 在映射表里)。`key=p
                  这是对旧映射表的实证体检,冲突行最值得人看)
   支持数 1 的路径不入桶(单证不立,留给 ③ 段)
 
+**只数实证票**(所有者定稿 2026-08-14):`products.walmart_pt` 这一列同时装
+沃尔玛回执实证与审核链 LLM 推断,`pt_source` 分道后本工作流只认
+`walmart_confirmed`。否则闭环会自我印证:LLM 猜一个 PT → 写进产品行 →
+被当实证票挖进映射表 → 该类目全部产品按这个猜测直出,一次猜错永久固化。
+⚠ 存量行 pt_source 为 NULL(无从追认来历),按保守口径**不参与投票**,
+所以换上这条闸之后票数会明显变少,要等审核重跑把来源补齐才回升。
+
 产品侧 PT 先过 pt_meta 闸(废 PT 不参与投票);写入
 audit.category_map_suggestions(与 catmap_suggest 同一张复核面)。
 promote=1:仅 mined_trusted 且仍不在映射表的行,以 confidence='高'、
@@ -53,6 +60,7 @@ JOIN audit.walmart_pt_meta m ON m.walmart_product_type = p.walmart_pt
 WHERE p.marketplace = 'US'
   AND {key} IS NOT NULL AND btrim({key}) <> ''
   AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> 'unknown'
+  AND p.pt_source = 'walmart_confirmed'
 GROUP BY 1, 2
 """
 

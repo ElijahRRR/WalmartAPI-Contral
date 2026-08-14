@@ -53,12 +53,21 @@ ORDER BY asin, recorded_at DESC NULLS LAST
 
 # 一条语句同时覆盖"占位新行"与"已有行填空":walmart_pt 已有值的行 WHERE
 # 不满足 → 跳过(审核结论优先,回填绝不覆盖)
+# 来源标记(2026-08-14):本工作流的源是沃尔玛自己的删除历史与报错日报
+# ——**定义上就是实证**,写的同时把 pt_source 盖成 walmart_confirmed。
+# 两种情况都要盖:① 本轮填空的行;② 早先已填了同一个 PT、但那时还没有
+# pt_source 列的存量行(否则 catmap_mine 换上实证闸后票数会凭空塌掉)。
+# PT 与库里现值不一致时**不动**——那是另一条证据链,交审核去裁。
 _UPSERT_SQL = """
-INSERT INTO catalog.products (marketplace, asin, walmart_pt)
-VALUES ('US', %s, %s)
+INSERT INTO catalog.products (marketplace, asin, walmart_pt, pt_source)
+VALUES ('US', %s, %s, 'walmart_confirmed')
 ON CONFLICT (marketplace, asin) DO UPDATE
-SET walmart_pt = EXCLUDED.walmart_pt, updated_at = now()
+SET walmart_pt = COALESCE(catalog.products.walmart_pt, EXCLUDED.walmart_pt),
+    pt_source = 'walmart_confirmed',
+    updated_at = now()
 WHERE catalog.products.walmart_pt IS NULL
+   OR (catalog.products.walmart_pt = EXCLUDED.walmart_pt
+       AND catalog.products.pt_source IS DISTINCT FROM 'walmart_confirmed')
 """
 
 

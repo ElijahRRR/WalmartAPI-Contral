@@ -245,18 +245,23 @@ def test_resolve_pt_known_pt_second_source():
     assert dead.walmart_product_type is None      # 行 PT 不在 pt_meta → 不采
 
 
-def test_resolve_pt_sentinel_hard_reject_after_evidence():
-    """Layer 0 哨兵:旧仓字面量三件(unknown/低/none)+ -100 hit;
-    实证命中时哨兵不生效(批复 #10 实证最优先,与旧仓'哨兵最前'有意不同)。"""
+def test_sentinel_no_longer_rejects_and_does_not_block_llm():
+    """所有者定稿 2026-08-14:映射表标注"无对应Walmart PT"**不再判死**。
+
+    那条标注是当年没数据时人工打的,不代表今天判不出来——判不出来才该
+    pending,不该拒。改为 0 分留痕,继续走候选+LLM。
+    """
     ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}))
     p = ProductInfo(asin="B0S", title="w", amazon_category_path="Dead > Path")
     l1 = audit_rules.resolve_pt(p, ctx)
-    assert l1.walmart_product_type == "unknown"
+    assert l1.walmart_product_type is None            # 不再写 'unknown' 桩值
     assert l1.hits[0].rule_code == "unmapped_amazon_path"
-    assert l1.hits[0].penalty == -100
+    assert l1.hits[0].penalty == 0                    # 只留痕
+    assert not audit_rules._blocked(l1)                # 不算判死 → 放行进第三级
+    # 无 conn(离线)⇒ 第三级跑不了 ⇒ pending,**绝不是 reject**
     out = audit_rules.audit_one(p, ctx)
-    assert out.verdict == "reject" and out.score_final == 0
-    # 实证在场 → 哨兵让位
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+    # 实证在场 → 连留痕都不打(哨兵只在解不出 PT 时才谈)
     ev = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}),
               walmart_confirmed={"B0S": "GoodPT"})
     assert audit_rules.resolve_pt(p, ev).walmart_product_type == "GoodPT"
@@ -715,3 +720,25 @@ def test_history_fold_sql_invariants():
     assert "occurred_at" in f._INSERT_SQL                # 带原始时间戳
     # 擦净重灌只许删自己 source 的行(账本只追加的唯一例外,范围必须钉死)
     assert f.SOURCE == "audit_history_fold"
+
+
+def test_pt_provenance_splits_evidence_from_inference():
+    """PT 来源两分道(所有者定稿 2026-08-14):只有沃尔玛真接受过的算实证。
+
+    映射直查/LLM rerank 都是推断——把推断当实证写回产品行,catmap_mine
+    会拿它投票挖进映射表,一次猜错永久固化(A 推出 B、B 又去证明 A)。
+    """
+    def _o(src):
+        return AuditOutcome(asin="B0", verdict="pass", score_final=100,
+                            stage_stopped_at=None,
+                            l1=L1Info(walmart_product_type="GoodPT",
+                                      pt_source=src))
+    assert audit_store.pt_provenance(_o("walmart_confirmed")) == "walmart_confirmed"
+    assert audit_store.pt_provenance(_o("historical_confirmed")) == "walmart_confirmed"
+    for inferred in ("map_node", "map_direct", "llm", None):
+        assert audit_store.pt_provenance(_o(inferred)) == "audit_llm"
+    # 没有真 PT 可写 → 不动 pt_source(桩值/unknown)
+    stub = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                        stage_stopped_at="L0",
+                        l1=L1Info(walmart_product_type="(phase0_blocked)"))
+    assert audit_store.pt_provenance(stub) is None

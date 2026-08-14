@@ -90,7 +90,8 @@ _RECENT_RUN_GUARD = """
 # 排序键,语义等价(spec_shortcut §3.4C),别当成可随手删的排序
 _HISTORY_SQL = """
 SELECT DISTINCT ON (asin) asin, run_id, verdict, score_final,
-       walmart_product_type, l3_reason_category, stage_stopped_at, created_at
+       walmart_product_type, l3_reason_category, stage_stopped_at, created_at,
+       pt_source
 FROM audit.audit_runs
 WHERE asin = ANY(%s)
   AND verdict IN ('reject', 'pass')
@@ -102,6 +103,7 @@ _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
     walmart_pt = COALESCE(%(pt)s, walmart_pt),
+    pt_source = CASE WHEN %(pt)s IS NULL THEN pt_source ELSE %(pt_source)s END,
     audited_at = now(), audit_version = %(version)s
 WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
@@ -150,7 +152,8 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
         rows = cur.fetchall()
     adopted = set()
     events = []
-    for asin, run_id, verdict, _score, pt, reason_cat, stage, created in rows:
+    for (asin, run_id, verdict, _score, pt, reason_cat, stage, created,
+         src) in rows:
         adopted.add(asin)
         if not execute:
             continue
@@ -165,6 +168,12 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             "status": status,
             "reason": reason,
             "pt": (pt if pt and not pt.startswith("(") else None),
+            # 旧结论的 PT 来源照搬 runs 记录;非实证一律记 audit_llm
+            # (来历不明的 PT 不当实证——它会被 catmap_mine 投票放大)
+            "pt_source": ("walmart_confirmed"
+                          if src in ("walmart_confirmed",
+                                     "historical_confirmed")
+                          else "audit_llm"),
             "version": resources.AUDIT_RULES_VERSION,
             "marketplace": "US", "asin": asin,
         })

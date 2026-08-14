@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     audit_status    text,        -- pending / approved / rejected
     audit_reason    text,
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
+    --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
+    --   audit_llm         = 审核链第三级 LLM 推断出来的
+    -- 混在一起会洗白:LLM 猜一个 → 下轮当"高置信历史实证"直出 → catmap_mine
+    -- 当实证票投进映射表 → 整个类目按这个猜测直出。分开后 catmap_mine
+    -- 只数 walmart_confirmed,回路在造成伤害的那一环被切断。
+    pt_source       text,
     audited_at      timestamptz,
     audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
     -- (assigned_upc/listing_attrs/last_feed_id/store/owner 五列 2026-08-12
@@ -183,6 +190,12 @@ ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_chain text;
 ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_id text;
 CREATE INDEX IF NOT EXISTS products_browse_node_idx
     ON catalog.products (browse_node_id);
+
+-- PT 来源分道(2026-08-14):存量行按证据反推——pt_backfill 写过的(在
+-- walmart_cleanup/审核报错两源里出现过的 ASIN)是实证,其余审核写的算推断。
+-- 存量无从区分的一律留 NULL,由下一轮审核按新口径补写(NULL 视同推断,
+-- 保守:不把来历不明的 PT 当实证喂给挖掘)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688

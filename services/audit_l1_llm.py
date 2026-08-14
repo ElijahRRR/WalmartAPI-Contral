@@ -6,7 +6,8 @@
 
 本模块只提供积木,不接线(接线在 services/audit_rules.py 与 workflows/product_audit.py):
 
-  candidates(conn, product)            → 五路候选(exact/prefix/leaf/title_keyword/title_literal)
+  candidates(conn, product)            → 七路候选(exact/prefix/leaf/title_keyword/
+                                         title_literal/ancestor_N/pt_dict)
   rerank(product, cands, pt_dict)      → L1Info(判出来了) 或 None(解不出 → 调用方转 pending)
   check_seed_excluded(product, pt)     → seed yaml 禁售品类 reason 或 None(L1 三级共用)
   check_publication_ban(pt, reason)    → 出版物类 PT 硬禁 RuleHit 或 None(L1 三级共用)
@@ -55,6 +56,9 @@ _STATS_KEYS = (
     "llm_called", "llm_failed", "bad_json", "dict_fallback",
     "unknown", "no_candidate", "seed_excluded", "llm_excluded",
     "publication_forbidden", "conf_low",
+    # 两阶段开放判定(七路候选全空时;所有者定稿 2026-08-14)
+    "open_stage1_called", "open_stage1_failed", "open_stage1_empty",
+    "open_stage2_candidates",
     "seed_excluded_direct",   # 接线层:①②直出级 seed 命中(与 rerank 级分开)
 )
 
@@ -192,6 +196,10 @@ _STOP_LITERAL = {"with", "from", "your", "this", "that",
 # (l1_category.py:283-286 实证注释:B0FDW1J3NZ "Gate Openers" 的 exact match
 #  被挤到第 41 位,提示词 [:20] 截断后 LLM 看不到 → 输 unknown)。
 _HIGH_PRIORITY_TYPES = {"exact", "prefix", "leaf"}
+
+# 映射表哨兵值(675 行),不是真 PT。定义在此而非 audit_rules:两处都要用,
+# 而 audit_rules 已 import 本模块,反向 import 会成环。
+UNMAPPED_SENTINEL = "无对应Walmart PT"
 
 # 候选只取这三列:旧仓 SELECT 里的 requires_certificate / zh_seller_forbidden /
 # requirements 是 sync_category_map.py:94-98 硬编码的 False/False/None 占位,
@@ -360,6 +368,92 @@ def _fetch_title_literal(cur, product: ProductInfo) -> list[dict[str, Any]]:
             for row in _rows(cur)]
 
 
+# 第六路 祖先映射:沿 amazon_node_paths 父链上溯,取最近的已映射祖先的 PT。
+# **只当候选不直出**——祖先必然比商品粗一级(Golf Cart Accessories 的父是
+# Golf),粗对不对由 LLM 拿标题判;正因为不直出,不必纠结"退到第几级为止"
+# (直出才需要那条线)。DAG 多父 = 多条上溯支路,递归天然覆盖。
+_ANCESTOR_SQL = """
+WITH RECURSIVE up AS (
+    SELECT parent_node_id AS node, 1 AS dist
+    FROM audit.amazon_node_paths
+    WHERE node_id = %(node)s AND parent_node_id <> ''
+  UNION ALL
+    SELECT p.parent_node_id, up.dist + 1
+    FROM audit.amazon_node_paths p
+    JOIN up ON p.node_id = up.node
+    WHERE p.parent_node_id <> '' AND up.dist < %(max_up)s
+)
+SELECT DISTINCT ON (m.walmart_product_type)
+       m.amazon_category, m.walmart_product_type, m.confidence, up.dist
+FROM up
+JOIN audit.walmart_category_map m ON m.browse_node_id = up.node
+INNER JOIN audit.walmart_pt_meta meta
+        ON meta.walmart_product_type = m.walmart_product_type
+WHERE m.walmart_product_type <> %(sentinel)s
+ORDER BY m.walmart_product_type, up.dist
+"""
+
+# 第七路 PT 字典直搜:前六路的候选**全部来自映射表**——映射表没有的类目
+# 就等于候选池空,LLM 连挑的机会都没有(所有者指出 2026-08-14)。这一路
+# 直接搜 PT 字典本身(pt_meta 的 PT 名 / PTG 名),用 Amazon 叶子类目名 +
+# 标题关键词。"Golf Cart Accessories" 拿 golf 去搜就有候选。零 LLM。
+_PT_DICT_SQL = """
+SELECT walmart_product_type, walmart_category, walmart_ptg,
+       (SELECT count(*) FROM unnest(%(pats)s::text[]) AS w
+         WHERE walmart_product_type ILIKE w) * 2
+     + (SELECT count(*) FROM unnest(%(pats)s::text[]) AS w
+         WHERE coalesce(walmart_ptg, '') ILIKE w) AS score
+FROM audit.walmart_pt_meta
+WHERE walmart_product_type ILIKE ANY(%(pats)s)
+   OR coalesce(walmart_ptg, '') ILIKE ANY(%(pats)s)
+ORDER BY score DESC, length(walmart_product_type)
+LIMIT %(limit)s
+"""
+
+_MAX_UP = 6          # 上溯层数上限(纯防环/防深链,不是语义门槛)
+_ANCESTOR_LIMIT = 6
+_PT_DICT_LIMIT = 10
+
+
+def _fetch_ancestor(cur, product: ProductInfo) -> list[dict[str, Any]]:
+    """输入:游标 + 产品 → 输出:第六路候选(最近已映射祖先的 PT,带层距)。"""
+    if not product.browse_node_id:
+        return []
+    cur.execute(_ANCESTOR_SQL, {"node": product.browse_node_id,
+                                "max_up": _MAX_UP,
+                                "sentinel": UNMAPPED_SENTINEL})
+    rows = sorted(_rows(cur), key=lambda r: r["dist"])[:_ANCESTOR_LIMIT]
+    return [{"walmart_product_type": r["walmart_product_type"],
+             "confidence": r["confidence"],
+             "amazon_category": r["amazon_category"],
+             "match_type": f"ancestor_{r['dist']}"} for r in rows]
+
+
+def _dict_words(product: ProductInfo) -> list[str]:
+    """输入:产品 → 输出:搜 PT 字典用的词(叶子类目名的词 + 标题关键词)。"""
+    path = (product.amazon_category_path or "").strip()
+    leaf = path.split(">")[-1].strip() if path else ""
+    words = [w.strip(" ,&/()") for w in leaf.split()]
+    out = [w for w in words if len(w) >= 4 and w.lower() not in _STOP]
+    for kw in _title_keywords(product.title or ""):
+        if kw.lower() not in {w.lower() for w in out}:
+            out.append(kw)
+    return out[:8]
+
+
+def _fetch_pt_dict(cur, product: ProductInfo) -> list[dict[str, Any]]:
+    """输入:游标 + 产品 → 输出:第七路候选(直接搜 PT 字典,不经映射表)。"""
+    words = _dict_words(product)
+    if not words:
+        return []
+    cur.execute(_PT_DICT_SQL, {"pats": [f"%{w}%" for w in words],
+                               "limit": _PT_DICT_LIMIT})
+    return [{"walmart_product_type": r["walmart_product_type"],
+             "confidence": None,
+             "amazon_category": r.get("walmart_ptg") or "",
+             "match_type": "pt_dict"} for r in _rows(cur)]
+
+
 def candidates(conn, product: ProductInfo, *, limit: int = _KW_LIMIT) -> list[dict[str, Any]]:
     """输入:中心库连接 + 产品 → 输出:候选 PT 列表(五路合并去重,顺序即优先级)。
 
@@ -368,12 +462,19 @@ def candidates(conn, product: ProductInfo, *, limit: int = _KW_LIMIT) -> list[di
       1. exact / prefix / leaf(walmart_category_map 精确匹配,必须最前)
       2. title_keyword(关键词补充)
       3. title_literal(标题字面词反查,第五路)
+      4. **ancestor_N**(第六路,2026-08-14 新增):沿类目树父链上溯,最近的
+         已映射祖先的 PT;排在字面反查之后——祖先粗但方向对,字面词准但易串类
+      5. **pt_dict**(第七路,同上):直接搜 PT 字典,不经映射表。前六路全部
+         依赖映射表有这个类目,映射表没有 ⇒ 候选池空 ⇒ LLM 连挑的机会都没有
+         (所有者指出:"没有直接拿到映射类目的,其实都是拿候选然后让 LLM 输出")
     每条候选:walmart_product_type / confidence / amazon_category / match_type。
     hybrid 无总量截断——截断只发生在提示词构建时的 candidates[:20](§4.2)。
     """
     with conn.cursor() as cur:
         kw = _fetch_candidates(cur, product, limit)
         literal = _fetch_title_literal(cur, product)
+        ancestor = _fetch_ancestor(cur, product)
+        pt_dict = _fetch_pt_dict(cur, product)
 
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -381,6 +482,8 @@ def candidates(conn, product: ProductInfo, *, limit: int = _KW_LIMIT) -> list[di
         [c for c in kw if c.get("match_type") in _HIGH_PRIORITY_TYPES],
         [c for c in kw if c.get("match_type") not in _HIGH_PRIORITY_TYPES],
         literal,
+        ancestor,
+        pt_dict,
     ):
         for c in group:
             key = c["walmart_product_type"]
@@ -545,6 +648,75 @@ def _default_chat(messages: list[dict]) -> dict:
     from api import llm
     return llm.chat_json(messages, temperature=_TEMPERATURE,
                          max_tokens=_MAX_TOKENS, purpose=_PURPOSE)
+
+
+_MEGA_SYSTEM_PROMPT = (
+    "你是沃尔玛 Marketplace 类目判定专家。给你一个 Amazon 商品和沃尔玛的"
+    "**一级大类清单**,请判断它最可能属于哪 1~3 个大类。\n"
+    "只依据标题、五点、描述、Amazon 类目路径推断;**只能从清单里选**,"
+    "不要发明新名称。\n"
+    '返回 JSON:{"categories": ["大类1", "大类2"]};完全判不了返回 '
+    '{"categories": []}。'
+)
+
+
+def _mega_categories(cur) -> list[str]:
+    """输入:游标 → 输出:PT 字典里的沃尔玛一级大类清单(去重排序)。"""
+    cur.execute("SELECT DISTINCT walmart_category FROM audit.walmart_pt_meta "
+                "WHERE walmart_category IS NOT NULL "
+                "  AND btrim(walmart_category) <> '' ORDER BY 1")
+    return [r[0] for r in cur.fetchall()]
+
+
+def open_candidates(conn, product: ProductInfo, *,
+                    chat_fn=None) -> list[dict[str, Any]]:
+    """输入:连接 + 产品 → 输出:两阶段 LLM 兜出来的候选(七路全空时才调)。
+
+    所有者定稿 2026-08-14:**没有任何映射参考时也要让 LLM 判**,不能因为
+    候选池空就直接 pending("达不到我让 LLM 抉择产品类目的目的")。
+
+    做法是两阶段,始终不脱离 PT 字典:
+      ① 把沃尔玛**一级大类清单**(量小,可整份进提示词)+ 标题/五点/描述/
+         Amazon 路径给 LLM,让它选 1~3 个大类;
+      ② 取这些大类下的**全部 PT** 当候选,交给标准 rerank 挑。
+    为什么不让 LLM 直接说 PT:PT 字典几千条塞不进提示词,自由生成的 PT
+    过不了 pt_meta 校验,等于白调——旧仓正是这么产 unknown 的。
+    失败(异常/坏 JSON/一个大类都没选中)→ 返回空,调用方照旧 pending。
+    """
+    with conn.cursor() as cur:
+        megas = _mega_categories(cur)
+    if not megas:
+        return []
+    messages = [
+        {"role": "system", "content": _MEGA_SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(product, []) +
+         "\n# 沃尔玛一级大类清单\n" + "\n".join(f"  - {m}" for m in megas)},
+    ]
+    bump("open_stage1_called")
+    try:
+        raw = (chat_fn or _default_chat)(messages)
+    except Exception as e:  # noqa: BLE001 —— 同 rerank:重试尽即转 pending
+        bump("open_stage1_failed")
+        logger.warning("L1 开放判定一阶段失败 asin=%s: %s", product.asin, e)
+        return []
+    picked = [c for c in ((raw or {}).get("categories") or [])
+              if isinstance(c, str) and c in set(megas)]
+    if not picked:
+        bump("open_stage1_empty")
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT walmart_product_type, walmart_category, walmart_ptg "
+            "FROM audit.walmart_pt_meta WHERE walmart_category = ANY(%s) "
+            "ORDER BY walmart_product_type", (picked,))
+        rows = _rows(cur)
+    bump("open_stage2_candidates")
+    logger.info("L1 开放判定:大类 %s → 候选 %d(asin=%s)",
+                picked, len(rows), product.asin)
+    return [{"walmart_product_type": r["walmart_product_type"],
+             "confidence": None,
+             "amazon_category": r.get("walmart_ptg") or "",
+             "match_type": "open_mega"} for r in rows]
 
 
 def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,

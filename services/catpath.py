@@ -76,6 +76,27 @@ def diff_profile(a_segs: list[str], b_segs: list[str]) -> tuple[int, bool]:
     return unmatched, parent_same
 
 
+def substitution_index(a_segs: list[str], b_segs: list[str]) -> int | None:
+    """输入:两条等长路径的段列表 → 输出:唯一差异段的下标;非"等长且恰一段
+    不同"则 None(增删层不算替换)。纯函数。
+
+    有了这个下标才能做**同级兄弟判别**——改名与换类目在字符串上无法区分
+    (`Home Décor Products`→`Home Décor` 是改名;`Soccer`→`Lacrosse` 是换
+    运动),但在数据上可分:**改名的新旧名不会同时存在,同级兄弟会**。
+    """
+    if len(a_segs) != len(b_segs):
+        return None
+    diffs = [i for i, (x, y) in enumerate(zip(a_segs, b_segs))
+             if norm_seg(x) != norm_seg(y)]
+    return diffs[0] if len(diffs) == 1 else None
+
+
+def prefix_keys(path: str) -> list[tuple]:
+    """输入:路径 → 输出:其所有归一化前缀元组(建"某前缀下存在某段"索引用)。"""
+    segs = [norm_seg(s) for s in segments(path)]
+    return [tuple(segs[:i + 1]) for i in range(len(segs))]
+
+
 def align_tier(a_segs: list[str], b_segs: list[str]) -> str:
     """输入:两条路径的段列表 → 输出:结构信任层 strong / medium / weak。
 

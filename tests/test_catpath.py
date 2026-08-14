@@ -110,6 +110,40 @@ def test_align_tier_structure():
             "Decorative Accessories > Signs")) == "weak"
 
 
+def test_sibling_swap_distinguishes_rename_from_category_change():
+    """改名 vs 换类目在字符串上分不开,在数据上可分(所有者第三轮实测:
+    Soccer→Lacrosse 差一段、父节点还相同,被判 strong 却是两种运动)。"""
+    from services.catpath import prefix_keys
+    from workflows.catmap_align import is_sibling_swap
+
+    soccer = ("Sports & Outdoors > Sports > Team Sports > Soccer > "
+              "Training Equipment > Cones")
+    lacrosse = ("Sports & Outdoors > Sports > Team Sports > Lacrosse > "
+                "Training Equipment > Cones")
+    # 产品语料里 Lacrosse 自成子树 ⇒ 与 Soccer 是并存的兄弟,不是改名
+    prods = {k for p in [soccer, lacrosse] for k in prefix_keys(p)}
+    assert is_sibling_swap(soccer, lacrosse, prods, set()) is True
+    # 映射表里 Soccer 也有自己的行 ⇒ 同样判兄弟
+    assert is_sibling_swap(soccer, lacrosse, set(),
+                           set(prefix_keys(soccer))) is True
+
+    # 纯改名:产品侧只有新名、映射表只有旧名 → 两边都查不到对方 → 非兄弟
+    new, old = OWNER_CASES[0]
+    assert is_sibling_swap(new, old, set(prefix_keys(new)),
+                           set(prefix_keys(old))) is False
+    # 增删层(不等长)不算替换,无兄弟可言
+    assert is_sibling_swap("A > B > C > Leaf", "A > C > Leaf",
+                           set(), set()) is False
+
+
+def test_substitution_index():
+    seg = catpath.segments
+    assert catpath.substitution_index(seg("A > B > C"), seg("A > X > C")) == 1
+    assert catpath.substitution_index(seg("A > B > C"), seg("A > X > Y")) is None
+    assert catpath.substitution_index(seg("A > B"), seg("A > B > C")) is None
+    assert catpath.prefix_keys("A > B") == [("a",), ("a", "b")]
+
+
 def test_decide_alias_evidence_beats_structure():
     """实证 PT 优先于结构形态(所有者首跑实测:0.83 分的 Soccer→Lacrosse
     靠实证拦下;0.67 分的 Party Packs/Vases 靠实证救回)。"""
@@ -119,10 +153,15 @@ def test_decide_alias_evidence_beats_structure():
     assert decide_alias("weak", "GoodPT", "GoodPT") == "verified"
     # 实证相左 → 结构再像也拒
     assert decide_alias("strong", "GoodPT", "OtherPT") == "pt_conflict"
-    # 无实证 → 只信 strong
+    # 无实证 → 只信 strong,且必须非同级兄弟
     assert decide_alias("strong", None, "GoodPT") == "aligned"
+    assert decide_alias("strong", None, "GoodPT",
+                        sibling=True) == "sibling_swap"
     assert decide_alias("medium", None, "GoodPT") == "needs_review"
     assert decide_alias("weak", None, "GoodPT") == "needs_review"
+    # 实证仍压过兄弟判别(数据直接证明结果 PT 对)
+    assert decide_alias("strong", "GoodPT", "GoodPT",
+                        sibling=True) == "verified"
     # canonical 侧 PT 不唯一(映射表分流)→ 无从背书,退回看结构
     assert decide_alias("medium", "GoodPT", None) == "needs_review"
 

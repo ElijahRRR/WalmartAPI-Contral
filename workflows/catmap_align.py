@@ -68,6 +68,13 @@ WHERE confidence = '高' AND btrim(amazon_category) <> ''
 GROUP BY 1
 """
 
+# 产品侧全部去重路径(建"某前缀下存在某段"索引,供同级兄弟判别)
+_ALL_PRODUCT_PATHS_SQL = """
+SELECT DISTINCT btrim(amazon_category) FROM catalog.products
+WHERE marketplace = 'US'
+  AND amazon_category IS NOT NULL AND btrim(amazon_category) <> ''
+"""
+
 # 缺口路径的产品实证 PT 分布(pt_backfill 回填 + 审核结论;过 pt_meta 闸)
 _EVIDENCE_SQL = """
 SELECT btrim(p.amazon_category), p.walmart_pt, count(*)
@@ -104,8 +111,33 @@ def consensus_pt(dist: dict, min_n: int = MIN_EVIDENCE) -> str | None:
     return pt if n >= min_n else None
 
 
+def is_sibling_swap(path: str, canonical: str,
+                    product_prefixes: set, map_prefixes: set) -> bool:
+    """输入:两条路径 + 两侧语料的前缀集 → 输出:差异段是否为"同级兄弟"。
+
+    改名与换类目在字符串上无法区分,在数据上可分(所有者第三轮实测:
+    `Team Sports > Soccer > Training Equipment > …` 与 `… > Lacrosse > …`
+    差一段、父节点还相同,判成 strong 却是两种运动):
+
+      **改名**:新旧名不会同时存在——产品语料里只有新名,映射表里只有旧名;
+      **兄弟**:两个名字各自都有自己的子树,在同一语料里并存。
+
+    故:若 canonical 的差异段名在**产品语料**的同一前缀下也存在,或 gap 的
+    差异段名在**映射表语料**的同一前缀下也存在 → 判兄弟,拒折。
+    仅对"等长且恰一段不同"生效(增删层不是替换,无兄弟可言)。
+    """
+    a, b = catpath.segments(path), catpath.segments(canonical)
+    i = catpath.substitution_index(a, b)
+    if i is None:
+        return False
+    prefix = tuple(catpath.norm_seg(s) for s in a[:i])
+    alt_in_products = prefix + (catpath.norm_seg(b[i]),) in product_prefixes
+    own_in_map = prefix + (catpath.norm_seg(a[i]),) in map_prefixes
+    return alt_in_products or own_in_map
+
+
 def decide_alias(tier: str, evidence_pt: str | None,
-                 canonical_pt: str | None) -> str:
+                 canonical_pt: str | None, sibling: bool = False) -> str:
     """输入:结构信任层 + 实证共识 PT + canonical 映射 PT → 输出:落库状态。
 
     纯函数。两条判据,实证优先于结构(数据 > 字符串形态):
@@ -115,11 +147,14 @@ def decide_alias(tier: str, evidence_pt: str | None,
         说的 PT 与折过去拿到的 PT 相同,结果就是对的;
       实证 PT 与 canonical 相左 → **pt_conflict**(结构再像也拒)。所有者
         首跑实测拦下 `Team Sports > Soccer > …` → `… > Lacrosse > …`;
-      无实证可查 → 只信 strong 层(仅上层一段改名,叶子的父归属未变);
-        medium(父节点也变)与 weak(差两段以上)一律交人工。
+      无实证可查 → 只信 strong 层(仅上层一段改名,叶子的父归属未变)**且
+        非同级兄弟**(is_sibling_swap:两个名字在同一语料里并存 = 换类目
+        不是改名);medium / weak / 兄弟 一律交人工。
     """
     if evidence_pt and canonical_pt:
         return "verified" if evidence_pt == canonical_pt else "pt_conflict"
+    if sibling:
+        return "sibling_swap"
     return "aligned" if tier == "strong" else "needs_review"
 
 
@@ -137,8 +172,8 @@ def build_leaf_index(canonical_paths) -> dict:
     return idx
 
 
-_STATUSES = ("verified", "aligned", "needs_review", "pt_conflict",
-             "ambiguous", "no_match")
+_STATUSES = ("verified", "aligned", "needs_review", "sibling_swap",
+             "pt_conflict", "ambiguous", "no_match")
 _FOLDABLE = ("verified", "aligned")
 
 
@@ -154,8 +189,12 @@ def run(params: dict) -> str:
             votes: dict = {}
             for path, pt, n in cur.fetchall():
                 votes.setdefault(path, {})[pt] = n
+            cur.execute(_ALL_PRODUCT_PATHS_SQL)
+            product_prefixes = {k for (p,) in cur.fetchall()
+                                for k in catpath.prefix_keys(p)}
             cur.execute(_GAP_SQL)
             gaps = cur.fetchall()
+        map_prefixes = {k for p in canon_pt for k in catpath.prefix_keys(p)}
         idx = build_leaf_index(canon_pt.keys())
 
         rows = []
@@ -171,8 +210,11 @@ def run(params: dict) -> str:
                 tier = catpath.align_tier(catpath.segments(path),
                                           catpath.segments(best))
                 tiers[tier] += 1
-                status = decide_alias(tier, consensus_pt(votes.get(path, {})),
-                                      canon_pt.get(best))
+                status = decide_alias(
+                    tier, consensus_pt(votes.get(path, {})),
+                    canon_pt.get(best),
+                    sibling=is_sibling_swap(path, best, product_prefixes,
+                                            map_prefixes))
             stat[status] += 1
             prod[status] += n
             if status in _FOLDABLE:
@@ -188,10 +230,11 @@ def run(params: dict) -> str:
             f"  可折 {foldable} 条 / {prod['verified'] + prod['aligned']} 件"
             f"(实证 PT 背书 {stat['verified']} + 结构 strong 层 "
             f"{stat['aligned']})",
-            f"  待人工 {stat['needs_review'] + stat['pt_conflict'] + stat['ambiguous']}"
-            f" 条 / {prod['needs_review'] + prod['pt_conflict'] + prod['ambiguous']}"
-            f" 件(无实证且结构存疑 {stat['needs_review']} / **PT 相左 "
-            f"{stat['pt_conflict']}** / 并列歧义 {stat['ambiguous']})",
+            f"  待人工 {stat['needs_review'] + stat['sibling_swap'] + stat['pt_conflict'] + stat['ambiguous']}"
+            f" 条 / {prod['needs_review'] + prod['sibling_swap'] + prod['pt_conflict'] + prod['ambiguous']}"
+            f" 件(结构存疑 {stat['needs_review']} / **同级兄弟 "
+            f"{stat['sibling_swap']}** / **PT 相左 {stat['pt_conflict']}** / "
+            f"并列歧义 {stat['ambiguous']})",
             f"  真缺口 {stat['no_match']} 条 / {prod['no_match']} 件"
             f"(归 catmap_mine / catmap_suggest)",
             f"  结构层分布:strong(仅上层改名){tiers['strong']} / "
@@ -200,6 +243,7 @@ def run(params: dict) -> str:
         ]
         for tag, title in (("verified", "实证 PT 背书样例(数据说话,已折)"),
                            ("aligned", "结构 strong 层样例(仅上层一段改名,已折)"),
+                           ("sibling_swap", "⚠ 同级兄弟(换类目非改名,已拒折)"),
                            ("pt_conflict", "⚠ PT 相左(疑似串子树,已拒折)"),
                            ("needs_review", "待人工(无实证 + 结构存疑)")):
             if samples[tag]:

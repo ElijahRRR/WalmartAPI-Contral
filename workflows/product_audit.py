@@ -343,6 +343,18 @@ def run(params: dict) -> str:
                      f"字典回落 {l1s.get('dict_fallback', 0)},"
                      f"无候选→待定 {l1s.get('no_candidate', 0)},"
                      f"低置信采纳 {l1s.get('conf_low', 0)}")
+        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
+        picked = {k[len("picked_"):]: v for k, v in l1s.items()
+                  if k.startswith("picked_") and v}
+        if picked:
+            lines.append("  选中候选来自:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(picked.items(),
+                                              key=lambda kv: -kv[1])))
+        opened = {k: v for k, v in l1s.items()
+                  if k.startswith("open_") and v}
+        if opened:
+            lines.append("  零参考两阶段:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(opened.items())))
     l1_blocked = (l1s.get("seed_excluded_direct", 0)
                   + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
                   + l1s.get("publication_forbidden", 0))

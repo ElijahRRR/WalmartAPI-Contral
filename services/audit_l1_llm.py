@@ -844,6 +844,14 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
         return None
 
     l1 = L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source)
+    # 归因:LLM 最终选中的这个 PT 是哪一路召回来的。没有这个计数就说不清
+    # 新加的第六/七路到底出没出力(no_candidate 归零可能是它们的功劳,也可能
+    # 本来就是 0)——铁律:兜底/新路径触发必须可计数。
+    picked = next((c for c in cands
+                   if str(c.get("walmart_product_type") or "").strip() == pt),
+                  None)
+    bump(f"picked_{picked.get('match_type') or 'unknown'}" if picked
+         else "picked_off_candidates")
     if fallback_from:
         # penalty=0 的记账型 hit(不影响分数),便于双跑对账 F3 回落率
         l1.hits.append(RuleHit(

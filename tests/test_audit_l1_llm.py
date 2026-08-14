@@ -507,3 +507,21 @@ def test_open_candidates_two_stage():
         raise RuntimeError("down")
     assert l1.open_candidates(FakeConn(cur), _product(title="w"),
                               chat_fn=_boom) == []
+
+
+def test_picked_route_attribution():
+    """归因计数:LLM 选中的 PT 是哪一路召回的——没有它就说不清六七两路
+    到底出没出力(no_candidate 归零可能是它们的功劳,也可能本来就是 0)。"""
+    l1.reset_stats()
+    cands = [{"walmart_product_type": "AncPT", "confidence": "高",
+              "match_type": "ancestor_2"}]
+    got = l1.rerank(_product(title="w"), cands, {"AncPT"},
+                    chat_fn=lambda m: {"walmart_product_type": "AncPT",
+                                       "pt_confidence": "高"})
+    assert got.walmart_product_type == "AncPT"
+    assert l1.STATS["picked_ancestor_2"] == 1
+    # LLM 挑了个不在候选里但在字典内的 PT → 单独计一类,不冒充某一路的功劳
+    l1.reset_stats()
+    l1.rerank(_product(title="w"), cands, {"AncPT", "OtherPT"},
+              chat_fn=lambda m: {"walmart_product_type": "OtherPT"})
+    assert l1.STATS["picked_off_candidates"] == 1

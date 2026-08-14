@@ -5,7 +5,9 @@
   python cli.py catmap_mine -p key=path        # 按类目路径挖掘(无 ID 老行)
   python cli.py catmap_mine -p min_support=8   # 收紧票数门槛(默认 5)
   python cli.py catmap_mine -p min_dominance=0.9  # 收紧优势度(默认 0.8)
-  python cli.py catmap_mine -p promote=1       # 把 mined_trusted 升级进映射表
+  python cli.py catmap_mine -p promote=1       # 按各自档位写进映射表
+  python cli.py catmap_mine -p min_write_dominance=0.5 -p promote=1
+                                               # 低档只写优势度 ≥50% 的(见下)
 
 **键 = browse_node_id(所有者定稿 2026-08-14)**:类目名会漂 ID 不会,按
 ID 投票天然绕开三套名称不一致;挖出来的映射自带 ID,补进映射表正好填上
@@ -269,6 +271,10 @@ def run(params: dict) -> str:
     """输入:params(key=node|path / min_support / promote=1)→ 输出:分桶摘要。"""
     min_support = int(params.get("min_support", 5))
     min_dominance = float(params.get("min_dominance", MIN_DOMINANCE))
+    # 低档行写不写映射表的优势度闸(默认 0 = 全写,即所有者 2026-08-14 批准的
+    # 口径)。开它的理由见 promote_rows 那处注释:低档行会占掉候选第一位置
+    min_write_dom = float(params.get("min_write_dominance", 0))
+    low_skipped = 0
     promote = str(params.get("promote", "")).strip() == "1"
     by_node = str(params.get("key", "node")).strip().lower() != "path"
     key_sql = "p.browse_node_id" if by_node else "btrim(p.amazon_category)"
@@ -349,6 +355,16 @@ def run(params: dict) -> str:
                          k if by_node else None))
             # 写映射表要真路径当主键;`node:<id>` 兜底标签只能进建议表
             if by_node and tier and rep_path.get(k):
+                if tier == "低" and dom < min_write_dom:
+                    # ⚠ 优势度太低的分流行**不写映射表**(闸,默认关)。
+                    # 不是怕 LLM 被带偏——LLM 照样判;是因为候选**跨组顺序**
+                    # 不看置信度:映射表来的候选(exact/prefix/leaf)整体排在
+                    # 最前,而第七路 pt_dict 在最后。写一条 41% 正确的低置信
+                    # 映射行,等于让它占掉候选第 1 位、把实测选中率最高的
+                    # pt_dict 挤后面。这些 node 本来就没有映射,走的正是
+                    # pt_dict/open_mega —— 写了反而可能倒退。
+                    low_skipped += 1
+                    continue
                 promote_rows.append((rep_path[k], pt, k, tier, status))
         with conn.cursor() as cur:
             cur.executemany(_UPSERT_SQL, rows)
@@ -384,6 +400,11 @@ def run(params: dict) -> str:
                 lines.append(f"{title}:")
                 lines += samples[tag]
 
+        if low_skipped:
+            lines.append(f"低档闸:优势度 < {min_write_dom:.0%} 的分流行 "
+                         f"{low_skipped} 条不写映射表"
+                         f"(它们会占掉候选第一位置,把实测最有效的 pt_dict "
+                         f"挤后面;去掉 -p min_write_dominance 可全写)")
         planned, plan_stat = plan_promotions(promote_rows, existing_map)
         by_tier: dict = {}
         for _cat, _pt, _node, tier, _mt in planned:

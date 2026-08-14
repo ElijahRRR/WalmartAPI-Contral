@@ -100,6 +100,12 @@ WHERE asin = ANY(%s)
 ORDER BY asin, (verdict = 'reject') DESC, created_at DESC
 """
 
+# 有历史结论可采用(与 _HISTORY_SQL 同谓词:排除 SHORTCUT 影子行)
+_HAS_HISTORY_SQL = """EXISTS (
+    SELECT 1 FROM audit.audit_runs r
+    WHERE r.asin = p.asin AND r.verdict IN ('reject', 'pass')
+      AND r.stage_stopped_at IS DISTINCT FROM 'SHORTCUT')"""
+
 _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
@@ -216,6 +222,12 @@ def run(params: dict) -> str:
     if r5_on:
         workers = 1
     where, extra = _pick_where(params)
+    if adopt_only:
+        # 只采用模式下**只挑有历史结论的行**:否则候选按 audited_at NULLS
+        # FIRST 取前 N,没历史的那批不会被消耗、每轮都排在前面重复捞
+        # (生产实测 2026-08-14:采用率 122k→88k→65k→47k→34k→25k 一路塌,
+        #  第 6 轮 20 万候选里 17.5 万是上轮已确认无历史的行)
+        where = f"({where}) AND {_HAS_HISTORY_SQL}"
     if "asins" in extra:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
         limit = max(limit, len(extra["asins"]))

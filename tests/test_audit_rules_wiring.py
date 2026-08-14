@@ -785,3 +785,14 @@ def test_adopt_history_batches_updates():
     src = inspect.getsource(product_audit._adopt_history)
     assert "adopt_rows.append" in src and "executemany(_ADOPT_SQL" in src
     assert "conn.execute(_ADOPT_SQL" not in src      # 逐行版必须已移除
+
+
+def test_adopt_only_narrows_candidates_to_rows_with_history():
+    """只采用模式必须只挑有历史的行:否则没历史的那批每轮都排在前面重复捞
+    (生产实测采用率 122k→25k 一路塌)。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_HAS_HISTORY_SQL" in src
+    has = product_audit._HAS_HISTORY_SQL
+    assert "audit.audit_runs" in has and "r.asin = p.asin" in has
+    assert "IS DISTINCT FROM 'SHORTCUT'" in has     # 影子行不算历史结论

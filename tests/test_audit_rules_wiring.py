@@ -119,12 +119,21 @@ def test_pick_where_four_states():
     assert "audit_version IS DISTINCT FROM" in w
     w, _ = product_audit._pick_where({"mode": "backfill"})
     assert w == "p.audit_status IS NULL"
+    w, _ = product_audit._pick_where({"mode": "pending"})
+    # 待定专刷:只圈 pending,且**不带 1 天退避**(改完判定要立刻验证)
+    assert w == "p.audit_status = 'pending'" and "interval" not in w
 
 
 def test_pick_where_rejects_unknown_params():
     """静默吞参数 = '全量重审跑完了'的假象,宁炸不吞。"""
     with pytest.raises(ValueError, match="未识别参数"):
         product_audit._pick_where({"force_rurn": "x"})     # 手滑拼错
+
+
+def test_pick_where_rejects_unknown_mode():
+    """mode 拼错静默落回默认 = 以为在补刷、实际在跑默认候选,同样宁炸不吞。"""
+    with pytest.raises(ValueError, match="未识别 mode"):
+        product_audit._pick_where({"mode": "backfil"})     # 手滑拼错
 
 
 # ── _sync_column_blacklist 护栏(评审 P0-2;黑名单中心定稿 2026-08-13)────────

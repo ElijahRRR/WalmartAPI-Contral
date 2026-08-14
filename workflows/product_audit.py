@@ -6,6 +6,7 @@
   python cli.py product_audit -p limit=2000
   python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
+  python cli.py product_audit -p mode=pending --execute    # 待定专刷:只重判 pending,无退避
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
@@ -28,6 +29,9 @@ referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者�
 
 pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
 L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日退避重试。
+`mode=pending` 是这条退避的人工旁路:判定逻辑刚改过时要立刻拿存量 pending
+验证效果,等一天等的是自己。**不采用历史结论**(backfill=False)——pending
+行要的是重判,拿旧 run 顶上等于把这次改动的效果盖掉。只手动跑,不进调度。
 无标题产品跳过不审(采集降级,不够格判定;amz_source:103 先例)并计数。
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
@@ -136,6 +140,8 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 _KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
                  "l3", "l4", "workers", "adopt_only"}
+# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
+_MODES = {"backfill", "pending"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -155,8 +161,16 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
-    if str(params.get("mode", "")).strip() == "backfill":
+    mode = str(params.get("mode", "")).strip()
+    if mode and mode not in _MODES:
+        # 与未识别参数同理:静默落回默认 = "补刷跑完了"的假象,宁炸不吞
+        raise ValueError(f"未识别 mode={mode!r}(可用:{sorted(_MODES)})")
+    if mode == "backfill":
         return "p.audit_status IS NULL", {}
+    if mode == "pending":
+        # 待定专刷:**无 1 天退避**——判定逻辑刚改过时要立刻拿存量 pending
+        # 验证效果,等一天等的是自己。人工显式动作,不进任何定时调度
+        return "p.audit_status = 'pending'", {}
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return ("(p.audit_status IS NULL OR (p.audit_status = 'pending' "

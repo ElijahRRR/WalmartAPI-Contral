@@ -120,17 +120,28 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    完整状态码表:200(含空结果,`records: []` + `next_cursor` 原样不推进)/
    401 `invalid_export_token`(修 token,不重试)/ 409(硬停)/
    422 `invalid_parameter`(修请求,不重试)/ 503(退避重试 + 告警)。
-0. **`slow.category_id_chain`(2026-08-14 纯追加,`contract_version` 仍是 1)**:
-   Amazon browse node ID 链,根→叶有序,逗号串 `"2972638011,553788,14083111"`
-   或数组均可;**末段 = 当前最细类目**。理由:Amazon 的 URL slug / 商品
-   面包屑 / Best Sellers 导航**三套名称不一致**(实测 `Home Décor Products`
-   vs `Home Décor`、`Outdoor Power Tools` vs `Mowers & Outdoor Power Tools`),
-   按 `category_path` 字符串精确匹配会把同一类目误判成"映射缺口"(实测
-   7,512 条缺口里 ~30% 是这种假缺口);**名称会漂,ID 不会**。
+0. **类目 browse node ID:`raw.category_ids`(现役,无需改采集侧)**。
+   动因:Amazon 的 URL slug / 商品面包屑 / Best Sellers 导航**三套名称不
+   一致**(实测 `Home Décor Products` vs `Home Décor`、`Outdoor Power Tools`
+   vs `Mowers & Outdoor Power Tools`),按 `category_path` 字符串精确匹配会把
+   同一类目误判成"映射缺口"(实测 7,512 条缺口里 ~30% 是假缺口);
+   **名称会漂,ID 不会**。
+   采集侧源码核实(2026-08-14):ID 与名字树**同一处产出**——
+   `worker/parser.py:2532-2545` 从面包屑 `<a href>` 正则 `node=(\d+)`,落库
+   三列 `root_category_id` / `category_ids`(逗号串 root→leaf)/
+   `category_tree`;但增量导出的 `slow` 段只挑了名字树
+   (`server/api/export_incremental.py:235`),**ID 未进 slow,却在 `raw` 段
+   幸存**(不在 `_RAW_DROP` 剔除清单)。故本侧从 `record.raw.category_ids`
+   取,**采集侧无需任何改动**;若将来它把 ID 提进 slow(键名建议
+   `category_id_chain`),本侧同样兼容。
    本侧落地:`catalog.products.browse_node_chain` / `browse_node_id` 两列
-   (COALESCE 语义同其他慢变字段),审核 L1 ②a 级拿末段直查
+   (COALESCE 语义同其他慢变字段);审核 L1 ②a 级拿末段直查
    `walmart_category_map.browse_node_id`(该表 ID 覆盖率实测 100%);
-   缺失时自动退回字符串路径匹配,**不是必填,老行不需回填重采**。
+   缺失时自动退回字符串路径匹配。存量产品由 `node_backfill` 从已存
+   `snapshots.raw` 就地提取,**零重采**。
+   ⚠ 采集侧 `common/slowhash.py:136-137` 有意把 `category_ids` 排除在
+   `slow_hash` 之外 ⇒ **只有 ID 链变化不会推动 slow_hash、不触发重审**
+   (ID 是补锚用的,不当变更信号)。空值哨兵是字符串 `"N/A"` 不是 null。
 
 2. **`fast.stock_state` 是三值封闭集**:`in_stock` / `out_of_stock` / `unknown`。
    **`fast.stock_count` / `fast.delivery_days`**(采集侧 2026-08-09 纯追加,

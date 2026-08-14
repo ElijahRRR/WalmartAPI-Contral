@@ -515,15 +515,20 @@ def test_resolve_pt_browse_node_first():
 def test_ingest_category_nodes():
     """契约 v1 追加 slow.category_id_chain:逗号串/数组两形态,末段=最细类目。"""
     from services.product_ingest import category_nodes, product_params
-    assert category_nodes({"category_id_chain": "2972638011,553788,14083111"}) \
+    # 现役键名:raw.category_ids(采集器源码核实——ID 未进 slow,在 raw 幸存)
+    assert category_nodes({}, {"category_ids": "2972638011,553788,14083111"}) \
         == ("2972638011,553788,14083111", "14083111")
+    # 前向兼容:采集侧若把它提进 slow(契约追加)也认
     assert category_nodes({"category_id_chain": [228013, "551238", " 553220 "]}) \
         == ("228013,551238,553220", "553220")
-    assert category_nodes({}) == (None, None)           # 缺失 → 退回字符串路径
+    # 采集侧空值哨兵 "N/A" 不当 ID(root_category_id 缺省即此值)
+    assert category_nodes({}, {"category_ids": "N/A"}) == (None, None)
+    assert category_nodes({}, {"category_ids": "1055398,N/A"}) \
+        == ("1055398", "1055398")
+    assert category_nodes({}, {}) == (None, None)        # 缺失 → 退回字符串路径
     assert category_nodes({"category_id_chain": " , "}) == (None, None)
-    row = product_params({"asin": "B0A", "slow": {
-        "title": "t", "category_path": ["A", "B"],
-        "category_id_chain": "1,2,3"}})
+    row = product_params({"asin": "B0A", "slow": {"title": "t"},
+                          "raw": {"category_ids": "1,2,3"}})
     assert row["browse_node_id"] == "3"
     assert row["browse_node_chain"] == "1,2,3"
     assert product_params({"asin": "B0A", "slow": {}})["browse_node_id"] is None

@@ -568,6 +568,20 @@ def test_resolve_pt_alias_folds_into_sentinel():
     assert l1.hits[0].detail["amazon_path"] == drift   # detail 记原文不记折后
 
 
+def test_catalog_health_aliases_ascii_and_used():
+    """PG 把未加引号标识符折小写(中文不折、ASCII 折):'有类目ID' → '有类目id',
+    按原文取键必 KeyError(生产实测 2026-08-14)。别名一律 ASCII,且
+    run() 用到的键必须都在 SQL 别名里。"""
+    import re
+    from workflows import catalog_health as ch
+    aliases = set(re.findall(r"\bAS ([a-zA-Z_][a-zA-Z0-9_]*)\b", ch._SQL))
+    assert aliases, "SQL 里应有 AS 别名"
+    assert all(a.islower() or "_" in a for a in aliases)   # 无大小写歧义
+    src = open(ch.__file__, encoding="utf-8").read()
+    used = set(re.findall(r"r\['([a-z_0-9]+)'\]", src))
+    assert used and used <= aliases, f"取了 SQL 里没有的键:{used - aliases}"
+
+
 def test_catmap_mine_classify_path():
     """挖掘分桶(所有者三段式 2026-08-13):多产品同 PT=可信;少量支持=待核;
     分流=人工;与旧映射相左=冲突只报;单证不立;与旧映射一致=无事。"""

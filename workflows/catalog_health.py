@@ -35,22 +35,25 @@ WITH p AS (
         audit_status
     FROM catalog.products WHERE marketplace = 'US'
 )
-SELECT count(*)                                                   AS 总行,
-       count(*) FILTER (WHERE has_title)                          AS 有标题,
-       count(*) FILTER (WHERE has_path)                           AS 有类目路径,
-       count(*) FILTER (WHERE has_node)                           AS 有类目ID,
-       count(*) FILTER (WHERE has_img)                            AS 有图,
-       count(*) FILTER (WHERE NOT has_title AND NOT has_path)     AS 空壳行,
-       count(*) FILTER (WHERE has_pt AND has_path)                AS 有PT有类目,
-       count(*) FILTER (WHERE has_path AND NOT has_pt)            AS 有类目无PT,
-       count(*) FILTER (WHERE has_pt AND NOT has_path)            AS 有PT无类目,
-       count(*) FILTER (WHERE NOT has_pt AND NOT has_path)        AS 两者皆无,
-       count(*) FILTER (WHERE audit_status = 'approved')          AS 已过,
-       count(*) FILTER (WHERE audit_status = 'rejected')          AS 已拒,
-       count(*) FILTER (WHERE audit_status = 'pending')           AS 待定,
-       count(*) FILTER (WHERE audit_status IS NULL)               AS 未审
+SELECT count(*)                                               AS total,
+       count(*) FILTER (WHERE has_title)                      AS n_title,
+       count(*) FILTER (WHERE has_path)                       AS n_path,
+       count(*) FILTER (WHERE has_node)                       AS n_node,
+       count(*) FILTER (WHERE has_img)                        AS n_img,
+       count(*) FILTER (WHERE NOT has_title AND NOT has_path) AS n_stub,
+       count(*) FILTER (WHERE has_pt AND has_path)            AS n_pt_path,
+       count(*) FILTER (WHERE has_path AND NOT has_pt)        AS n_path_only,
+       count(*) FILTER (WHERE has_pt AND NOT has_path)        AS n_pt_only,
+       count(*) FILTER (WHERE NOT has_pt AND NOT has_path)    AS n_neither,
+       count(*) FILTER (WHERE audit_status = 'approved')      AS n_approved,
+       count(*) FILTER (WHERE audit_status = 'rejected')      AS n_rejected,
+       count(*) FILTER (WHERE audit_status = 'pending')       AS n_pending,
+       count(*) FILTER (WHERE audit_status IS NULL)           AS n_unaudited
 FROM p
 """
+# ↑ 别名一律 ASCII:PG 把未加引号的标识符折成小写,'有类目ID' 会变
+#   '有类目id'(中文不折、ASCII 折),按原文取键必 KeyError(生产实测
+#   2026-08-14)。展示中文名在 Python 侧给
 
 # 类目锚命中率:产品侧 node 去重后,有多少能在映射表高置信行直出 PT
 _NODE_SQL = """
@@ -89,27 +92,28 @@ def run(params: dict) -> str:
             cur.execute(_SNAP_SQL)
             (snap_fillable,) = cur.fetchone()
 
-    n = r["总行"] or 1
+    n = r["total"] or 1
+
     def pct(x):
         return f"{x / n * 100:.1f}%"
 
     lines = [
-        f"catalog_health(catalog.products US {r['总行']} 行)",
-        f"A 采集完备度:标题 {r['有标题']}({pct(r['有标题'])})/ "
-        f"类目路径 {r['有类目路径']}({pct(r['有类目路径'])})/ "
-        f"类目 ID {r['有类目ID']}({pct(r['有类目ID'])})/ 图 {r['有图']}",
-        f"  空壳行(无标题无类目){r['空壳行']}"
+        f"catalog_health(catalog.products US {r['total']} 行)",
+        f"A 采集完备度:标题 {r['n_title']}({pct(r['n_title'])})/ "
+        f"类目路径 {r['n_path']}({pct(r['n_path'])})/ "
+        f"类目 ID {r['n_node']}({pct(r['n_node'])})/ 图 {r['n_img']}",
+        f"  空壳行(无标题无类目){r['n_stub']}"
         f"——pt_backfill 占位 + 采集降级,不进审核候选",
         f"B 类目锚:产品侧去重 node {nodes},映射表能直出 PT {node_hit}"
         + (f"({node_hit / nodes * 100:.1f}%);缺口 {nodes - node_hit} 个 node"
            f"——挖掘/LLM 的真实工作面" if nodes else ""),
         f"  快照里还能补 ID 的产品 {snap_fillable}"
         + ("(跑 node_backfill -p apply=1)" if snap_fillable else ""),
-        f"C PT×类目交叉:有PT有类目 {r['有PT有类目']}(挖掘燃料)/ "
-        f"有类目无PT {r['有类目无PT']}(待判定)/ "
-        f"有PT无类目 {r['有PT无类目']}(反哺不了映射)/ "
-        f"两者皆无 {r['两者皆无']}(先补采集)",
-        f"D 审核结论:过 {r['已过']} / 拒 {r['已拒']} / 待定 {r['待定']} / "
-        f"未审 {r['未审']}",
+        f"C PT×类目交叉:有PT有类目 {r['n_pt_path']}(挖掘燃料)/ "
+        f"有类目无PT {r['n_path_only']}(待判定)/ "
+        f"有PT无类目 {r['n_pt_only']}(反哺不了映射)/ "
+        f"两者皆无 {r['n_neither']}(先补采集)",
+        f"D 审核结论:过 {r['n_approved']} / 拒 {r['n_rejected']} / "
+        f"待定 {r['n_pending']} / 未审 {r['n_unaudited']}",
     ]
     return "\n".join(lines)

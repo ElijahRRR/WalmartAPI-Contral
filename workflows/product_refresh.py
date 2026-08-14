@@ -73,13 +73,6 @@ WHERE w.missing_since IS NULL
 ORDER BY w.sku
 """
 
-_SQL_OPEN = """
-SELECT batch_name, batch_id, asin_count, status, submitted_at
-FROM ops.scrape_batches
-WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
-ORDER BY submitted_at
-"""
-
 
 def _targets() -> tuple[list[str], int]:
     """输入:无 → 输出:(合法 ASIN 形态的在线 SKU, 被过滤掉的行数)。
@@ -102,51 +95,9 @@ def _targets() -> tuple[list[str], int]:
 
 
 def _check_open() -> list[str]:
-    """输入:无 → 输出:在途批次的状态行(顺便按采集侧结果落定/标超时)。"""
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_OPEN, {"prefix": BATCH_PREFIX + "%"})
-        rows = cur.fetchall()
-    if not rows:
-        return ["无在途采集批次"]
-    out = []
-    deadline = timedelta(hours=TIMEOUT_HOURS)
-    for name, bid, n, status, submitted in rows:
-        try:
-            st = scraper.batch_status(name)
-        except LookupError:
-            batches.finish(name, "failed", None, None, "采集侧查无此批次")
-            out.append(f"  {name}:⚠ 采集侧查无此批次(已标 failed)")
-            continue
-        except Exception as e:
-            out.append(f"  {name}:状态查询失败 {e}(保持在途,下轮再查)")
-            continue
-        # 台账没记下 batch_id 时(老行/推送时响应异常)从状态响应补:
-        # 失败明细端点只认 batch_id,缺了就查不了
-        bid = bid or st.get("batch_id")
-        stats = st.get("stats") or {}
-        done, failed = stats.get("done") or 0, stats.get("failed") or 0
-        total = stats.get("total") or n
-        age = datetime.now(timezone.utc) - submitted.astimezone(timezone.utc)
-        # 落定判据与 order_audit 同一份(services.scrape_batches.is_settled):
-        # open == 0 即采完,failed 算终态
-        if batches.is_settled(st):
-            batches.finish(name, "completed", done, failed)
-            out.append(f"  {name}:✅ 采完 {done}/{total}(失败 {failed})"
-                       f",耗时 {age.total_seconds() / 60:.0f} 分钟")
-            out.append(f"      {batches.pull_failures(name, bid)[0]}")
-        elif age > deadline:
-            # 超时不代表数据没用:已采到的照常进增量流,只是这批不再等
-            batches.finish(name, "timeout", done, failed,
-                           f"超 {TIMEOUT_HOURS} 小时未采完")
-            out.append(f"  {name}:⏰ 超时({done}/{total}),已标 timeout;"
-                       f"已采到的部分照常进增量流")
-            # 超时批同样拉:此刻已判失败的那些,原因照样有价值
-            out.append(f"      {batches.pull_failures(name, bid)[0]}")
-        else:
-            batches.record(name, None, n, "running")
-            out.append(f"  {name}:采集中 {done}/{total}"
-                       f"(已 {age.total_seconds() / 60:.0f} 分钟)")
-    return out
+    """输入:无 → 输出:本链在途批次的状态行(落定语义在 services 共用一份)。"""
+    return batches.check_open(BATCH_PREFIX, TIMEOUT_HOURS)
+
 
 
 def run(params: dict) -> str:

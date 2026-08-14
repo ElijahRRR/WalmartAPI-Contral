@@ -17,7 +17,7 @@
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from api import scraper
 from registry import db
@@ -202,3 +202,66 @@ def shots_open(status_body: dict) -> int:
         return int((status_body.get("screenshots") or {}).get("open") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+_SQL_OPEN = """
+SELECT batch_name, batch_id, asin_count, status, submitted_at
+FROM ops.scrape_batches
+WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
+ORDER BY submitted_at
+"""
+
+
+def check_open(prefix: str, timeout_hours: int) -> list[str]:
+    """输入:批次名前缀 + 超时小时 → 输出:在途批次状态行(顺手落定/标超时)。
+
+    ops.scrape_batches 是全项目共用台账(维护链/订单审核/补采各有前缀),
+    **查在途必须按前缀圈自己的**——否则会拿自己的超时口径去把别人的批次
+    标成 timeout,而那边正等着它。落定判据 is_settled 与拉失败明细同源。
+    住在 services 而不是某个 workflow:两条推采集链都要用,而工作流之间
+    不准互相 import(铁律 1)。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_OPEN, {"prefix": prefix + "%"})
+        rows = cur.fetchall()
+    if not rows:
+        return ["无在途采集批次"]
+    out = []
+    deadline = timedelta(hours=timeout_hours)
+    for name, bid, n, status, submitted in rows:
+        try:
+            st = scraper.batch_status(name)
+        except LookupError:
+            finish(name, "failed", None, None, "采集侧查无此批次")
+            out.append(f"  {name}:⚠ 采集侧查无此批次(已标 failed)")
+            continue
+        except Exception as e:
+            out.append(f"  {name}:状态查询失败 {e}(保持在途,下轮再查)")
+            continue
+        # 台账没记下 batch_id 时(老行/推送时响应异常)从状态响应补:
+        # 失败明细端点只认 batch_id,缺了就查不了
+        bid = bid or st.get("batch_id")
+        stats = st.get("stats") or {}
+        done, failed = stats.get("done") or 0, stats.get("failed") or 0
+        total = stats.get("total") or n
+        age = datetime.now(timezone.utc) - submitted.astimezone(timezone.utc)
+        # 落定判据与 order_audit 同一份(services.scrape_batches.is_settled):
+        # open == 0 即采完,failed 算终态
+        if is_settled(st):
+            finish(name, "completed", done, failed)
+            out.append(f"  {name}:✅ 采完 {done}/{total}(失败 {failed})"
+                       f",耗时 {age.total_seconds() / 60:.0f} 分钟")
+            out.append(f"      {pull_failures(name, bid)[0]}")
+        elif age > deadline:
+            # 超时不代表数据没用:已采到的照常进增量流,只是这批不再等
+            finish(name, "timeout", done, failed,
+                           f"超 {timeout_hours} 小时未采完")
+            out.append(f"  {name}:⏰ 超时({done}/{total}),已标 timeout;"
+                       f"已采到的部分照常进增量流")
+            # 超时批同样拉:此刻已判失败的那些,原因照样有价值
+            out.append(f"      {pull_failures(name, bid)[0]}")
+        else:
+            record(name, None, n, "running")
+            out.append(f"  {name}:采集中 {done}/{total}"
+                       f"(已 {age.total_seconds() / 60:.0f} 分钟)")
+    return out

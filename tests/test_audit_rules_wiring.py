@@ -356,16 +356,64 @@ def test_audit_one_rerank_wiring(monkeypatch):
     monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
         {"walmart_product_type": "GoodPT", "confidence": "高"}])
     monkeypatch.setattr(
-        audit_l1_llm, "rerank",
-        lambda pr, cands, ptd, **k: audit_rules.L1Info(
+        audit_l1_llm, "rerank_ex",
+        lambda pr, cands, ptd, **k: (audit_rules.L1Info(
             walmart_product_type="GoodPT", pt_confidence="高",
-            pt_source="map_verified"))
+            pt_source="map_verified"), "ok"))
     out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert out.verdict == "pass"
     assert out.l1.walmart_category == "Home"   # 接线补 walmart_category
-    monkeypatch.setattr(audit_l1_llm, "rerank", lambda *a, **k: None)
+    # llm_failed 不重试(换候选面治不了链路故障),直接 pending
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex",
+                        lambda *a, **k: (None, "llm_failed"))
     out2 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert out2.verdict == "pending" and out2.stage_stopped_at == "L1"
+
+
+def test_audit_one_unknown_retries_open_candidates(monkeypatch):
+    """所有者定稿:七路候选都被 LLM 否掉(unknown)→ 换开放候选面再判一次。"""
+    from services import audit_l1_llm
+    audit_l1_llm.reset_stats()
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0U", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "OtherPT", "confidence": "低"}])
+    monkeypatch.setattr(audit_l1_llm, "open_candidates", lambda conn, pr, **k: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    calls: list[list] = []
+
+    def fake_rerank_ex(pr, cands, ptd, **k):
+        calls.append(cands)
+        if len(calls) == 1:
+            return None, "unknown"          # 七路候选:LLM 全否
+        return audit_rules.L1Info(walmart_product_type="GoodPT",
+                                  pt_confidence="高",
+                                  pt_source="map_verified"), "ok"
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex", fake_rerank_ex)
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pass" and out.l1.walmart_product_type == "GoodPT"
+    assert len(calls) == 2                  # 第二次判的是开放候选面
+    assert calls[1][0]["walmart_product_type"] == "GoodPT"
+    assert audit_l1_llm.STATS["unknown_retry_called"] == 1
+    assert audit_l1_llm.STATS["unknown_retry_saved"] == 1
+
+
+def test_audit_one_unknown_retry_still_unknown(monkeypatch):
+    """二次机会也解不出 → 照旧 pending,绝不默认放行(10.2)。"""
+    from services import audit_l1_llm
+    audit_l1_llm.reset_stats()
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0V", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "OtherPT", "confidence": "低"}])
+    monkeypatch.setattr(audit_l1_llm, "open_candidates", lambda conn, pr, **k: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex",
+                        lambda *a, **k: (None, "unknown"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+    assert audit_l1_llm.STATS["unknown_retry_called"] == 1
+    assert audit_l1_llm.STATS["unknown_retry_saved"] == 0
 
 
 def test_persist_run_l3_l4_columns():
@@ -472,8 +520,9 @@ def test_rerank_exit_pt_meta_gate(monkeypatch):
     def fake_rerank(pr, cands, ptd, **k):
         seen["dict"] = set(ptd)
         return audit_rules.L1Info(walmart_product_type="SpecOnlyPT",
-                                  pt_confidence="高", pt_source="map_verified")
-    monkeypatch.setattr(audit_l1_llm, "rerank", fake_rerank)
+                                  pt_confidence="高",
+                                  pt_source="map_verified"), "ok"
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex", fake_rerank)
     out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert seen["dict"] == {"GoodPT"}          # 字典收窄为 pt_meta
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"

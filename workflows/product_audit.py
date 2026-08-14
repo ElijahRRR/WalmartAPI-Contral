@@ -423,6 +423,11 @@ def run(params: dict) -> str:
         if opened:
             lines.append("  零参考两阶段:" + " / ".join(
                 f"{k} {v}" for k, v in sorted(opened.items())))
+        if l1s.get("unknown_retry_called", 0):
+            called = l1s["unknown_retry_called"]
+            saved = l1s.get("unknown_retry_saved", 0)
+            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
+                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
     # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
     from api import llm as _llm2
     retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}

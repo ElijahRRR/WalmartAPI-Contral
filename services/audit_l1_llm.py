@@ -59,6 +59,8 @@ _STATS_KEYS = (
     # 两阶段开放判定(七路候选全空时;所有者定稿 2026-08-14)
     "open_stage1_called", "open_stage1_failed", "open_stage1_empty",
     "open_stage2_candidates",
+    # 候选都不合适时的二次机会(所有者定稿 2026-08-14:"真的都不合适,那也不行")
+    "unknown_retry_called", "unknown_retry_saved",
     "seed_excluded_direct",   # 接线层:①②直出级 seed 命中(与 rerank 级分开)
 )
 
@@ -726,6 +728,12 @@ def open_candidates(conn, product: ProductInfo, *,
 
 def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
            chat_fn=None) -> L1Info | None:
+    """薄壳:只要结果不要原因(旧调用点与测试沿用)。"""
+    return rerank_ex(product, cands, pt_dict, chat_fn=chat_fn)[0]
+
+
+def rerank_ex(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
+              chat_fn=None) -> tuple[L1Info | None, str]:
     """输入:产品 + 候选 + PT 字典 → 输出:L1Info(判出来了)或 None(解不出 → pending)。
 
     pt_dict 是任何支持 `in` 的 PT 容器,调用方传 `ctx.pt_meta.keys() | ctx.pt_spec.keys()`。
@@ -757,7 +765,7 @@ def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
         # 终点同为 pending,省一次调用。
         bump("no_candidate")
         logger.info("L1 rerank 无候选,直接 pending:asin=%s", product.asin)
-        return None
+        return None, "no_candidate"
 
     messages = [
         {"role": "system", "content": L1_SYSTEM_PROMPT},
@@ -769,13 +777,14 @@ def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
     except Exception as e:  # noqa: BLE001 —— 单链重试尽,任何异常都转 pending
         bump("llm_failed")
         logger.warning("L1 rerank LLM 失败 asin=%s: %s → pending", product.asin, e)
-        return None
+        return None, "llm_failed"
     if not isinstance(raw, dict) or not raw:
         bump("bad_json")
         logger.warning("L1 rerank 回复非法 asin=%s: %r → pending", product.asin, raw)
-        return None
+        return None, "bad_json"
 
-    return _coerce(product, raw, seed_reason, cands, pt_dict)
+    got = _coerce(product, raw, seed_reason, cands, pt_dict)
+    return got, ("ok" if got is not None else "unknown")
 
 
 def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,

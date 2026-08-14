@@ -356,7 +356,21 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
         # 字典收窄为 pt_meta(评审 P0 修正:旧仓 pt_meta∪pt_spec,但 L2 四硬闸
         # 全部只查 pt_meta——spec-only PT 直出会四闸失明产假 pass,还经 real_pt
         # 把 meta 表没有的 PT 写进身份层;候选 SQL 本就 JOIN pt_meta,零召回损失)
-        l1_llm = audit_l1_llm.rerank(product, cands, ctx.pt_meta.keys())
+        l1_llm, why = audit_l1_llm.rerank_ex(product, cands, ctx.pt_meta.keys())
+        if l1_llm is None and why == "unknown" and cands:
+            # 二次机会(所有者定稿 2026-08-14:"真的都不合适,那也不行")。
+            # 七路候选**不空**但 LLM 全否掉了——多半是七路召回的方向本就偏,
+            # 不是"这产品没类目"。这时把候选面换成两阶段开放判定(先选大类、
+            # 再在该大类全部 PT 里挑)再判一次;还 unknown 才真 pending。
+            # 只在 unknown 分支重试:LLM 失败/坏 JSON 是链路故障,换候选面
+            # 治不了,重试只是白烧一次调用(兜底不补偿自己的不确定)。
+            audit_l1_llm.bump("unknown_retry_called")
+            wide = audit_l1_llm.open_candidates(conn, product)
+            if wide:
+                l1_llm, why = audit_l1_llm.rerank_ex(
+                    product, wide, ctx.pt_meta.keys())
+                if l1_llm is not None:
+                    audit_l1_llm.bump("unknown_retry_saved")
         if l1_llm is not None:
             pt3 = l1_llm.walmart_product_type
             if pt3 and pt3 != "unknown" and pt3 not in ctx.pt_meta \

@@ -37,6 +37,7 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 """
 
 import logging
+import time
 
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, product_events
@@ -44,6 +45,11 @@ from services import audit_reason, audit_rules, audit_store, product_events
 DANGEROUS = True
 
 logger = logging.getLogger("workflows.product_audit")
+
+# 分段提交与进度播报的粒度(生产事故 2026-08-14:34 万行跑在同一个未提交
+# 事务里 —— 外部查不到任何进度、Ctrl-C 全部回滚、长事务还挡住 vacuum)。
+# 每 N 行提交一次 + 打一行进度,判定结果就变成"跑到哪算到哪"。
+_COMMIT_EVERY = 500
 
 # 判定并发上限:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的
 # 天花板在 LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)
@@ -289,6 +295,8 @@ def run(params: dict) -> str:
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
+        done_n = 0
+        t0 = time.monotonic()
         todo = []
         for row in rows:
             if row["asin"] in adopted:
@@ -347,6 +355,17 @@ def run(params: dict) -> str:
                                 f"疑似系统性故障,停批。最后错误:{e}") from e
                         continue
                     consec_errors = 0
+                    done_n += 1
+                    if done_n % _COMMIT_EVERY == 0:
+                        # 分段落定:此刻之前判的都已持久,中断只丢最后一段
+                        conn.commit()
+                        if events:
+                            product_events.record_many(conn, events)
+                            conn.commit()
+                            events = []
+                        rate = done_n / max(time.monotonic() - t0, 1e-6)
+                        logger.info("进度 %d/%d(%.0f 条/秒,已提交)",
+                                    done_n, len(todo), rate)
                     if outcome.l3 is not None:
                         stage_stats["L3_ran"] += 1
                         if outcome.l3.verdict == "reject":

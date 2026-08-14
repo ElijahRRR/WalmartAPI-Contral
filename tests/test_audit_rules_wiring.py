@@ -834,3 +834,13 @@ def test_pt_backfill_evidence_overwrites_inference():
     sql = pt_backfill._UPSERT_SQL
     assert "pt_source = 'walmart_confirmed'" in sql
     assert "pt_source IS DISTINCT FROM 'walmart_confirmed'" in sql
+
+
+def test_run_commits_in_segments_with_progress():
+    """生产事故 2026-08-14:34 万行判在同一个未提交事务里 —— 外部查不到任何
+    进度、Ctrl-C 全部回滚(半小时 LLM 费用打水漂)、长事务还挡住 vacuum。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_COMMIT_EVERY" in src and "conn.commit()" in src
+    assert "进度 %d/%d" in src                     # 日志可见,不必查库
+    assert 0 < product_audit._COMMIT_EVERY <= 2000  # 段太大就退化回老问题

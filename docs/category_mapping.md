@@ -19,45 +19,75 @@ Amazon 的 URL slug、商品面包屑、Best Sellers 导航是**三套不完全�
 
 | 表 | 是什么 | 现量 |
 |---|---|---|
-| `audit.amazon_taxonomy` | 亚马逊类目全集(规范名/父子/是否叶子) | 28,495 node |
+| `audit.amazon_taxonomy` | 亚马逊类目节点主档(规范名/是否叶子) | 28,495 node(重导后应达 32,147) |
+| `audit.amazon_node_paths` | 父子路径关系(DAG,多路径各一行) | 待重导 |
 | `catalog.products` | 我们实际有货的类目(`browse_node_id` + 产品数) | 15,538 node |
 | `audit.walmart_category_map` | 已有映射(高置信行) | 13,349 node |
 
 三方 JOIN 命中率实测(`taxonomy_import` 预览**强制**先给这个数,不看命中率
 就导入=重蹈 Best Sellers 那次覆辙):产品侧 82.2%,映射表侧 99.9%。
 
-### 中间层节点缺失与补法
+### 中间层节点:文件本来就有,是解析器漏读(2026-08-14 更正)
 
-对账版 JSON 的 `meta.reconciled_tree_rows` 是 32,147,实际入库 28,495
-(leaves 26,956 + unverified_new_nodes 1,539,verified_added_paths 0 条)。
-当前用法只按叶子 node 查,不影响 ②a 直查;但**父链兜底做不了**
-("叶子无映射就退一级找父类目的映射"这种)。
+对账版 JSON 里 `leaves` 26,956 行、`nodes` **32,147 行(全量树)**。首版导入器
+写死了三个段名(`leaves` / `verified_added_paths` / `unverified_new_nodes`),
+`nodes` 段**被静默丢弃**,入库只剩 28,495——当时误判成"文件只发了叶子"。
 
-**先分清是文件缺还是解析器没读**:导入器只认 `leaves` /
-`verified_added_paths` / `unverified_new_nodes` 三个段名,别的段以前会静默丢弃。
-现在 `taxonomy_import` 预览会打印**文件构造体检**——顶层每个段的行数,
-未解析的段直接标 ⚠,并把 `meta` 里的自报行数与实际可解析数对差:
+两处改:
 
-```
-python cli.py taxonomy_import -p file=~/Downloads/amazon_taxonomy_reconciled_20260814.json
-```
+1. **按内容认段,不按段名**:顶层任何 list、行里带 `browse_node_id` 就解析,
+   段名陌生也收,并在预览的「文件构造体检」里标出来(每段行数 + 是否解析 +
+   `meta` 自报数与实际可解析数的差)。写死段名 = 上游多给的东西静默丢掉。
+2. 重跑一次导入即可把中间层收进来:
+   ```
+   python cli.py taxonomy_import -p file=<对账版 JSON>          # 先看体检
+   python cli.py taxonomy_import -p file=<对账版 JSON> -p apply=1
+   ```
 
-**补法(零采集,推荐)**:中间层的 ID 和名字我们手里已经有,只是分在两列——
-`products.browse_node_chain`(根→叶的 ID 链)与 `products.amazon_category`
-(同一路径的名称串)。按叶子右对齐 zip 即可还原每一层的 node/名/父/路径:
+### browse tree 是 DAG,不是树
+
+同一个 node 可以挂在**多个父**下、有**多条完整路径**(`Belts` 同时在男装配件 /
+汽车皮带 / 工业传动下)。按 `browse_node_id` 简单去重会静默丢掉多路径关系,
+父链回退就会退到错误的祖先。所以落**两张表**:
+
+| 表 | 键 | 存什么 |
+|---|---|---|
+| `audit.amazon_taxonomy` | `node_id` | **节点级**属性:名称、是否叶子。路径/父/深度列是**代表路径**的取值,给展示和 1:1 JOIN 用,**不是唯一真相** |
+| `audit.amazon_node_paths` | `(node_id, parent_node_id, full_path)` | **路径级**关系:每个挂载点一行,一条都不合并。`parent_node_id=''` 表示根级(PK 不收 NULL) |
+
+要走父链一律查 `amazon_node_paths`。导入与反推两侧都按这个口径写:
+`taxonomy_import` 的路径行不去重,`taxonomy_derive` 的 (父, 完整路径) **成对**
+计票(拆成两个 Counter 各取多数票会拼出一条从没出现过的父路径组合)。
+
+### 树外 node 的补法(`taxonomy_derive`,零采集)
+
+中间层归文件管之后,反推只剩一个职责:补**任何一版类目树里都没有的 node**
+(C 桶,产品带着这个 ID)。数据我们手里已经有,只是分在两列——
+`products.browse_node_chain`(根→叶 ID 链)与 `products.amazon_category`
+(同一路径的名称串),按叶子右对齐 zip 即可还原 node/名/父/路径:
 
 ```
 python cli.py taxonomy_derive            # 预览:长度差分布 + 与已知树对拍
 python cli.py taxonomy_derive -p apply=1
 ```
 
-判据是**与已知树对拍的一致率**(叶位/中间位分开报);中间位低于 `min_agree`
-(默认 0.9)直接拒绝写入——对不齐就是串位,写进去会污染类目树。补入行
-`source='derived_products'`,只补树里没有的 node;`taxonomy_import` 重灌
-**只删文件段的行**,反推补层留着(同 node 文件行覆盖它)。
+判据是**与已知树对拍的名称一致率**(叶位/中间位分开报);中间位低于
+`min_agree`(默认 0.9)拒绝写入——对不齐就是串位。补入行标
+`source='derived_products'`;`taxonomy_import` 重灌**只删文件来源的行**,
+反推层留着(同 node 由文件行覆盖)。
 
-覆盖面 = 我们有货的类目——正好是唯一需要走父链的那部分。要全树中间层,
-仍需你的抓取脚本把非叶行也一并导出(`父节点ID`/`深度`/`L1~L8` 说明它本来就有)。
+### 正式下发数据规格(所有者定稿 2026-08-14)
+
+| 数据集 | 键 | 用途 |
+|---|---|---|
+| `amazon_all_nodes` | `browse_node_id` | 节点主档:名称、是否叶子。**只有这里按 ID 唯一** |
+| `amazon_node_paths` | `browse_node_id + parent_node_id + full_path` | 父子路径关系,多路径各一行 |
+| `amazon_leaf_nodes` | `browse_node_id` | 叶子集。逻辑上可由 `all_nodes.is_leaf` 推出,单独下发当**对账校验位**用 |
+| `amazon_to_walmart_mapping` | — | 映射快照 |
+
+⚠ 映射这一项要先定**方向**再下发:现在 `catmap_mine -p promote=1` 直接写 PG,
+PG 是事实上的权威;若映射随类目树一起下发并重灌,挖出来的行会被文件冲掉。
+这就是「映射编辑权威(飞书 vs PG)」那条未决——下发前必须先定。
 
 ## 2. 三段式维护顺序(所有者规划)
 
@@ -111,7 +141,7 @@ python cli.py catmap_mine -p min_support=3 -p min_dominance=0.7
 python cli.py catmap_mine -p promote=1            # 把 mined_trusted 写进映射表
 python cli.py catmap_fix -p nodes=all_conflicts   # 冲突定点修正(危险,需 --execute)
 python cli.py taxonomy_import -p file=<路径>      # 导类目树(预览强制先验 JOIN)
-python cli.py taxonomy_derive                     # 反推中间层节点(零采集)
+python cli.py taxonomy_derive                     # 反推树外 node(零采集)
 python cli.py node_backfill                       # 从存量快照回填 browse_node_id
 python cli.py pt_backfill                         # 历史实证 PT 回填产品主档
 ```

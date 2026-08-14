@@ -1056,6 +1056,30 @@ CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
 );
 CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);
 
+-- 类目**路径**关系(所有者定稿 2026-08-14):Amazon 的 browse tree 是 DAG
+-- 不是树——同一个 node 可以挂在多个父下、有多条完整路径(Belts 挂在男装
+-- 配件、汽车皮带、工业传动…)。按 browse_node_id 简单去重会**静默丢掉
+-- 多路径关系**,父链回退就只剩其中一条,回退到错误的祖先。
+-- 分工:节点级属性(名称/是否叶子)在 amazon_taxonomy 按 ID 一行;
+--       路径级属性(父/完整路径/深度/L1 根)在本表,键是**三元组**。
+-- amazon_taxonomy.parent_node_id / path / depth / root_name 保留为「代表路径」
+-- 的取值(展示与 1:1 JOIN 用,**不是唯一真相**);要走父链一律查本表。
+-- parent_node_id 用 '' 表示根级(PK 不收 NULL),读的时候 NULLIF(parent,'')。
+CREATE TABLE IF NOT EXISTS audit.amazon_node_paths (
+    node_id        text NOT NULL,
+    parent_node_id text NOT NULL,     -- '' = 根级
+    full_path      text NOT NULL,
+    depth          integer,
+    root_name      text,
+    source         text,              -- 与 amazon_taxonomy.source 同口径
+    imported_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, parent_node_id, full_path)
+);
+CREATE INDEX IF NOT EXISTS amzpath_parent_idx
+    ON audit.amazon_node_paths (parent_node_id);
+CREATE INDEX IF NOT EXISTS amzpath_path_idx
+    ON audit.amazon_node_paths (full_path);
+
 -- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
 -- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移
 -- 'Home Décor Products' vs 'Home Décor'、'Outdoor Power Tools' vs

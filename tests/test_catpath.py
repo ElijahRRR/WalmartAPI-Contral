@@ -130,9 +130,10 @@ def test_taxonomy_parse_rows():
             {"browse_node_id": "", "类目名": "无 ID 应跳过"},
             {"browse_node_id": "999", "类目名": "新 node", "父节点ID": "553220"}],
     }
-    rows, stat = parse_rows(data)
+    rows, paths, stat = parse_rows(data)
     assert stat == {"leaves": 1, "verified_added_paths": 1,
-                    "unverified_new_nodes": 1, "skipped": 1}
+                    "unverified_new_nodes": 1, "skipped": 1, "paths": 2}
+    assert len(paths) == 2                         # 无「完整路径」的行不进路径表
     by_node = {r[0]: r for r in rows}
     assert by_node["121475272011"][1] == "Amazon Device Subscriptions"  # 先到先得
     assert by_node["121475272011"][4] is None      # 'L1_xxx' 占位 → NULL
@@ -175,6 +176,53 @@ def test_derive_nodes_majority_vote_on_drifting_names():
     ])
     assert resolve("2", acc["2"])[1] == "Home Décor"
     assert resolve("2", acc["2"])[7] == 130            # 产品数累加
+
+
+def test_taxonomy_keeps_multi_parent_paths():
+    """DAG 不是树:同一 node 挂在多个父下 → 节点行一条、路径行各一条。
+
+    所有者定稿 2026-08-14:按 browse_node_id 简单去重会丢掉多路径关系,
+    父链回退就会退到错误的祖先。
+    """
+    from workflows.taxonomy_import import parse_rows
+    row = lambda p, path: {                          # noqa: E731
+        "browse_node_id": "553220", "类目名": "Belts", "完整路径": path,
+        "深度": "3", "父节点ID": p, "是否叶子": "是", "L1 根类目": path[:4]}
+    rows, paths, stat = parse_rows({"nodes": [
+        row("11", "Clothing > Men > Belts"),
+        row("22", "Automotive > Belts, Hoses & Pulleys > Belts"),
+        row("22", "Automotive > Belts, Hoses & Pulleys > Belts"),   # 重复行
+    ]})
+    assert len(rows) == 1 and stat["nodes"] == 1     # 节点级属性一行
+    assert stat["paths"] == 2 and len(paths) == 2    # 两个挂载点各一行
+    assert {p[1] for p in paths} == {"11", "22"}
+    assert rows[0][4] == "11"                        # 代表路径取先到的那条
+
+
+def test_taxonomy_parses_unknown_section_with_nodes():
+    """段名陌生但行里带 browse_node_id → 照收(写死段名漏过 32,147 行的教训)。"""
+    from workflows.taxonomy_import import data_sections, parse_rows
+    data = {"meta": {"x": 1}, "leaves": [{"browse_node_id": "1", "类目名": "A"}],
+            "nodes": [{"browse_node_id": "2", "类目名": "B"}],
+            "notes": ["纯文本段不算数据段"]}
+    assert data_sections(data) == ["leaves", "nodes"]
+    rows, _paths, stat = parse_rows(data)
+    assert {r[0] for r in rows} == {"1", "2"} and stat["nodes"] == 1
+
+
+def test_derive_path_rows_keep_every_mount():
+    """反推侧同理:(父, 路径) 成对计票,每个挂载点各出一行。"""
+    from workflows.taxonomy_derive import derive_nodes, path_rows, resolve
+    acc, _s = derive_nodes([
+        ("11,9", "Clothing > Belts", 50),
+        ("22,9", "Automotive > Belts", 20),
+    ])
+    got = path_rows("9", acc["9"])
+    assert len(got) == 2
+    assert {(p[1], p[2]) for p in got} == {
+        ("11", "Clothing > Belts"), ("22", "Automotive > Belts")}
+    assert all(p[3] == 2 for p in got)               # 深度逐条自算
+    assert resolve("9", acc["9"])[4] == "11"         # 代表路径 = 票多的那条
 
 
 def test_taxonomy_survey_flags_unparsed_sections():

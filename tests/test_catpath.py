@@ -110,6 +110,37 @@ def test_align_tier_structure():
             "Decorative Accessories > Signs")) == "weak"
 
 
+def test_taxonomy_parse_rows():
+    """对账版类目树三段全收;'L1_xxx' 根级占位父存 NULL;同 node 先到先得
+    (leaves 段权威);'是否叶子'=='是' 才算叶。"""
+    from workflows.taxonomy_import import parse_rows
+    data = {
+        "leaves": [{
+            "browse_node_id": "121475272011", "类目名": "Amazon Device Subscriptions",
+            "完整路径": "Amazon Devices & Accessories > Amazon Device Subscriptions",
+            "深度": "2", "父节点ID": "L1_amazon-devices", "是否叶子": "是",
+            "L1 根类目": "Amazon Devices & Accessories", "产品样本数": "0"}],
+        "verified_added_paths": [{
+            "browse_node_id": "553220", "类目名": "Handsaws",
+            "完整路径": "Tools & Home Improvement > … > Handsaws",
+            "深度": "4", "父节点ID": "551238", "是否叶子": "否",
+            "L1 根类目": "Tools & Home Improvement", "产品样本数": "12"}],
+        "unverified_new_nodes": [
+            {"browse_node_id": "121475272011", "类目名": "重复应被丢弃"},
+            {"browse_node_id": "", "类目名": "无 ID 应跳过"},
+            {"browse_node_id": "999", "类目名": "新 node", "父节点ID": "553220"}],
+    }
+    rows, stat = parse_rows(data)
+    assert stat == {"leaves": 1, "verified_added_paths": 1,
+                    "unverified_new_nodes": 1, "skipped": 1}
+    by_node = {r[0]: r for r in rows}
+    assert by_node["121475272011"][1] == "Amazon Device Subscriptions"  # 先到先得
+    assert by_node["121475272011"][4] is None      # 'L1_xxx' 占位 → NULL
+    assert by_node["121475272011"][5] is True      # 是否叶子='是'
+    assert by_node["553220"][4] == "551238" and by_node["553220"][5] is False
+    assert by_node["999"][8] == "unverified_new_nodes"   # source 分段留痕
+
+
 def test_sibling_swap_distinguishes_rename_from_category_change():
     """改名 vs 换类目在字符串上分不开,在数据上可分(所有者第三轮实测:
     Soccer→Lacrosse 差一段、父节点还相同,被判 strong 却是两种运动)。"""

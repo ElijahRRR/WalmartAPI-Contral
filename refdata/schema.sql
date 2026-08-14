@@ -1018,6 +1018,27 @@ CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(stat
 -- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
 -- 进映射表才生效。status:inherited(兄弟继承,免 LLM)/ok/unknown/excluded/no_candidate/llm_failed
 
+-- 亚马逊类目树(所有者对账版 2026-08-14;taxonomy_import 灌入)。
+-- **以 browse_node_id 为主键**——与产品侧 products.browse_node_id、映射表
+-- walmart_category_map.browse_node_id 三方 JOIN,名称漂移在此不成问题
+-- (2026-08-13 撤掉的那棵 Best Sellers 名称树正因只有名字才对不上)。
+-- 用途:①缺口工作面(树 3.2 万 node vs 映射 1.57 万,差集即未映射类目)
+-- ②规范名(人工复核/LLM 提示词用它,不用产品侧漂移面包屑)③祖先回退
+CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
+    node_id         text PRIMARY KEY,
+    name            text NOT NULL,     -- 类目名(路径末段)
+    path            text,              -- 完整路径(官方口径)
+    depth           integer,
+    parent_node_id  text,              -- 父 node;根级为 NULL
+    is_leaf         boolean,
+    root_name       text,              -- L1 根类目名
+    product_samples integer,           -- 树自带的样本数(采集侧统计,仅参考)
+    source          text,              -- leaves / verified_added_paths /
+                                       -- unverified_new_nodes(未验证新 node)
+    imported_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);
+
 -- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
 -- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移
 -- 'Home Décor Products' vs 'Home Décor'、'Outdoor Power Tools' vs

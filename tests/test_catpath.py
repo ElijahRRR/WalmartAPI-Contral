@@ -132,7 +132,8 @@ def test_taxonomy_parse_rows():
     }
     rows, paths, stat = parse_rows(data)
     assert stat == {"leaves": 1, "verified_added_paths": 1,
-                    "unverified_new_nodes": 1, "skipped": 1, "paths": 2}
+                    "unverified_new_nodes": 1, "skipped": 1, "paths": 2,
+                    "url_recovered": 0}
     assert len(paths) == 2                         # 无「完整路径」的行不进路径表
     by_node = {r[0]: r for r in rows}
     assert by_node["121475272011"][1] == "Amazon Device Subscriptions"  # 先到先得
@@ -260,7 +261,9 @@ def test_reconciled_file_fixture_end_to_end():
                                    "unverified_new_nodes", "nodes"]
     rows, paths, stat = parse_rows(data)
     by_node = {r[0]: r for r in rows}
-    assert stat["skipped"] == 1                      # 首行 browse_node_id 为空
+    # 根类目行 browse_node_id 为空,但 URL 带 node= → 兜回,不再丢
+    assert stat["skipped"] == 0 and stat["url_recovered"] == 1
+    assert by_node["1055398"][1] == "Home & Kitchen"
     # 中间层只在 nodes 段里,必须收进来(原来整段被丢 = 父链断)
     assert by_node["1063278"][1] == "Home Décor" and by_node["1063278"][5] is False
     # 叶子的节点级属性以 leaves 段为准(is_leaf 只有那段是权威)

@@ -10,14 +10,20 @@
   B 类目锚:有 ID 且能在映射表直出 PT 的比例(ID 缺口 = 待挖掘面);
   C PT 与类目的交叉:有 PT 有类目(挖掘燃料)/ 有类目无 PT(待判定)/
     有 PT 无类目(反哺不了映射)/ 两者皆无(先补采集);
-  D 审核结论分布。
+  D 审核结论分布;
+  E PT 拆分文件就位度(services/pt_spec.coverage)。
 
 只读不写,不调 LLM。
+
+E 段是 2026-08-14 盘点补的接线:`pt_spec.coverage()` 的 docstring 自述"就位自检用",
+但当时**没有任何工作流调它**——PT spec 文件缺失/损坏在那之前没有任何发现渠道,
+只会在 list_new 真去组 feed 时才炸。它反映的是一个没接线的意图,不是死代码。
 """
 
 import logging
 
 from registry import db
+from services import pt_spec
 
 DANGEROUS = False
 
@@ -129,4 +135,16 @@ def run(params: dict) -> str:
         f"D 审核结论:过 {r['n_approved']} / 拒 {r['n_rejected']} / "
         f"待定 {r['n_pending']} / 未审 {r['n_unaudited']}",
     ]
+    # E PT 拆分文件就位自检:读不到 DATA_ROOT / spec 目录不该让整份体检失败
+    # ——体检工具自己炸掉是最没道理的失败方式
+    try:
+        total_pt, ok_pt = pt_spec.coverage()
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"E PT 拆分文件:自检跳过({type(e).__name__}: {e})")
+    else:
+        miss = total_pt - ok_pt
+        lines.append(
+            f"E PT 拆分文件:索引 {total_pt} 个 PT,能解析到拆分文件 {ok_pt}"
+            + (f";⚠ 缺 {miss} 个 —— 这些 PT 组不出 feed,list_new 到那一步才会炸"
+               if miss else "(全部就位 ✓)"))
     return "\n".join(lines)

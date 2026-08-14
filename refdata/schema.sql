@@ -292,8 +292,17 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     synced_at timestamptz NOT NULL DEFAULT now()
 );
 -- 收集侧补列(2026-08-11 过渡遗留):src_sku/biz_cn/pushed_at 当天曾用于
--- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
--- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
+-- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下)。
+-- ⚠ 2026-08-14 逐列复核订正:原注释说"三列不再被任何代码消费"——**src_sku 是活的**,
+--    在 services/risk_gate.py:59-65 的 INSERT 列清单里。真正零消费的只有两列:
+--      biz_cn    —— 全仓命中都在 catalog.asin_blacklist / brand_err_hits,没一处触及本表
+--      pushed_at —— 真实读写全在 workflows/blacklist_push.py 的另两张表
+--    这两列**未删**:DROP COLUMN 不可回滚,而它们的存在成本近乎零
+--    (一个恒 false 的 boolean + 一个恒 NULL 的 timestamp)。要删先连库自证:
+--      SELECT count(*) FILTER (WHERE biz_cn IS TRUE),
+--             count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
+--      FROM catalog.brand_blacklist;   -- 前两个为 0 才谈删
+-- 本表回归单一职责:
 -- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
 
 -- 黑名单中心补全两维(所有者定稿 2026-08-13:黑名单只维护一份——审核的
@@ -768,6 +777,11 @@ CREATE INDEX IF NOT EXISTS scrape_failures_type_idx
     ON ops.scrape_failures (error_type, recorded_at DESC);
 
 -- 采集失败排行 + 顽固失败(连续多批采不到的 ASIN = 该下架或人工看的信号)
+-- ⚠ **零程序读者是设计如此**(2026-08-14 盘点登记,防下次被判死):与
+-- catalog.product_risk_store / status_changes / feed_failures、ops.v_feed_error_stats
+-- 同性质——留给人工与 AI 排查用的聚合面,不是给代码 SELECT 的。
+-- 判它死之前先连库:SELECT query, calls FROM pg_stat_statements
+--   WHERE query ILIKE '%v_scrape_failure_stats%';  "代码不读" ≠ "没人 SELECT"。
 CREATE OR REPLACE VIEW ops.v_scrape_failure_stats AS
   SELECT error_type,
          count(*) AS 次数, count(DISTINCT asin) AS 影响ASIN数,

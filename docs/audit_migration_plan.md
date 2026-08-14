@@ -463,6 +463,17 @@ cleanup 调度,不并跑。
    → problem_scan → list_new/maintenance;
 7. **文档收官**:plan.md 总览增行、legacy_schedules.md 停旧清单增审核条目、
    backlog 回销、旧仓归档标记。
+8. **退役快照四表清理(切换日**之后**才谈,2026-08-14 盘点登记)**:
+   `audit.phase0_blacklist_sellers` / `phase0_blacklist_asins` /
+   `phase0_blacklist_amazon_cats` / `blacklist_brands` —— 读侧全部为零,
+   消费方已全改道 `catalog.*` 黑名单中心。**前三张所有者已定「留档不删」**,
+   只有 `blacklist_brands` 无裁决、是唯一待定项。
+   🚫 **在第 3b 步之前绝对不能删**:它们的唯一写入方 `workflows/audit_import.py`
+   的 `TABLES` 元组切换日还要再跑一次,而该工作流对「清单里的表在目标库不存在」
+   判致命 —— **先删表 = 切换日搬迁直接报错**。
+   删除三前置(全满足才谈):① 第 3b 步增量重搬已完成;
+   ② `audit_import.py` 的 `TABLES` 元组同步删对应行;
+   ③ `refdata/schema.sql` 与 `docs/db_schema.md` 同步更新。
 
 **所有者侧**:切换日到场拍板放行(第 2 步)、执行停旧(第 3 步,生产 Mac 操作)。
 

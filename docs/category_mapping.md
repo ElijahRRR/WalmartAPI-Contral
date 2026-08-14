@@ -125,12 +125,29 @@ PG 是事实上的权威;若映射随类目树一起下发并重灌,挖出来的
 ### ③ 从无到有(零实证)
 
 - **B 桶** 3,787 node / 44,781 件:有产品、无映射、无任何实证 PT → LLM
-  (`catmap_suggest`,**未实现**)或人工;
+  (`catmap_suggest`,已实现但**仍按路径为键**,尚未跟着锚线改成 node 键;
+  产出是建议表里的死数据,升级通道等编辑权威定稿)或人工;
 - **C 桶** 2,759 node:产品带着这个 node,但类目树里根本没有 → 采集侧补抓
   (`python cli.py catmap_gap -p only=not_in_tree`);
 - **D 桶** 12,386 node:亚马逊有、我们没货 → **不处理**(别浪费 LLM)。
 
-## 3. 常用命令
+## 3. 重导类目树的执行顺序
+
+```bash
+git pull
+python cli.py db_init                        # 建 amazon_node_paths(幂等)
+python cli.py taxonomy_import -p file=<对账版 JSON>            # 先看体检
+python cli.py taxonomy_import -p file=<对账版 JSON> -p apply=1
+python cli.py taxonomy_derive                # 预览:只补树外 node
+python cli.py taxonomy_derive -p apply=1
+python cli.py catmap_gap                     # 验收:树 node 数 / C 桶是否缩小
+```
+
+预览要盯三处:① `nodes` 段有没有被解析(体检行里应出现,行数 32,147);
+② 路径关系条数与其中的多父挂载数;③ 产品侧/映射表侧 JOIN 命中率不低于上次
+(82.2% / 99.9%)。`taxonomy_derive` 要盯**中间位对拍一致率**,低于 90% 会拒绝写入。
+
+## 4. 常用命令
 
 ```bash
 python cli.py catalog_health                      # 体检:类目/ID/PT 覆盖面
@@ -146,7 +163,7 @@ python cli.py node_backfill                       # 从存量快照回填 browse
 python cli.py pt_backfill                         # 历史实证 PT 回填产品主档
 ```
 
-## 4. 未决
+## 5. 未决
 
 - **映射编辑权威(飞书 vs PG)**:`catmap_mine -p promote=1` 直接写 PG;若最终
   定飞书为权威,已升级行需回补进「映射明细」表。所有者待类目树补抓后再定。

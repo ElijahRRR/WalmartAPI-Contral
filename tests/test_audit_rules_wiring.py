@@ -233,7 +233,9 @@ def test_resolve_pt_known_pt_second_source():
     """①b 产品行已知 PT(pt_backfill 回填的历史实证;所有者定稿:PT 长在
     产品主档不查边表):在架实证优先,行 PT 次之,废弃 PT 过闸。"""
     ctx = _ctx(pt_meta=META)
-    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X", known_pt="GoodPT"), ctx)
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0X", known_pt="GoodPT",
+                    known_pt_source="walmart_confirmed"), ctx)
     assert l1.walmart_product_type == "GoodPT"
     assert l1.pt_source == "historical_confirmed"
     both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"})
@@ -742,3 +744,27 @@ def test_pt_provenance_splits_evidence_from_inference():
                         stage_stopped_at="L0",
                         l1=L1Info(walmart_product_type="(phase0_blocked)"))
     assert audit_store.pt_provenance(stub) is None
+
+
+def test_known_pt_splits_evidence_from_cached_inference():
+    """①b 级按 pt_source 分道:沃尔玛回执才算实证,上一轮 LLM 结论只是缓存。
+
+    不分道 = "LLM 猜一个 → 下轮以高置信实证复述",猜错会被自己反复确认,
+    而且从 runs 里看不出来(所有者 2026-08-14 追问)。
+    """
+    ctx = _ctx(pt_meta=META)
+    ev = audit_rules.resolve_pt(
+        ProductInfo(asin="B0K", known_pt="GoodPT",
+                    known_pt_source="walmart_confirmed"), ctx)
+    assert ev.pt_source == "historical_confirmed" and ev.pt_confidence == "高"
+    for src in ("audit_llm", None, ""):
+        cached = audit_rules.resolve_pt(
+            ProductInfo(asin="B0K", known_pt="GoodPT", known_pt_source=src), ctx)
+        assert cached.walmart_product_type == "GoodPT"   # 仍直出(不重付 LLM)
+        assert cached.pt_source == "audit_cached" and cached.pt_confidence == "中"
+    # 缓存推断写回时仍记 audit_llm——不会因为"存过一轮"就升格成实证
+    out = AuditOutcome(asin="B0K", verdict="pass", score_final=100,
+                       stage_stopped_at=None,
+                       l1=L1Info(walmart_product_type="GoodPT",
+                                 pt_source="audit_cached"))
+    assert audit_store.pt_provenance(out) == "audit_llm"

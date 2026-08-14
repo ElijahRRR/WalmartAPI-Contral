@@ -32,7 +32,8 @@ WITH p AS (
         browse_node_id IS NOT NULL                          AS has_node,
         image_url IS NOT NULL                               AS has_img,
         walmart_pt IS NOT NULL AND walmart_pt <> 'unknown'  AS has_pt,
-        audit_status
+        audit_status,
+        pt_source
     FROM catalog.products WHERE marketplace = 'US'
 )
 SELECT count(*)                                               AS total,
@@ -42,6 +43,10 @@ SELECT count(*)                                               AS total,
        count(*) FILTER (WHERE has_img)                        AS n_img,
        count(*) FILTER (WHERE NOT has_title AND NOT has_path) AS n_stub,
        count(*) FILTER (WHERE has_pt AND has_path)            AS n_pt_path,
+       count(*) FILTER (WHERE has_pt AND pt_source = 'walmart_confirmed')
+                                                             AS n_pt_evid,
+       count(*) FILTER (WHERE has_pt AND pt_source IS DISTINCT FROM
+                              'walmart_confirmed')            AS n_pt_infer,
        count(*) FILTER (WHERE has_path AND NOT has_pt)        AS n_path_only,
        count(*) FILTER (WHERE has_pt AND NOT has_path)        AS n_pt_only,
        count(*) FILTER (WHERE NOT has_pt AND NOT has_path)    AS n_neither,
@@ -109,7 +114,8 @@ def run(params: dict) -> str:
            f"——挖掘/LLM 的真实工作面" if nodes else ""),
         f"  快照里还能补 ID 的产品 {snap_fillable}"
         + ("(跑 node_backfill -p apply=1)" if snap_fillable else ""),
-        f"C PT×类目交叉:有PT有类目 {r['n_pt_path']}(挖掘燃料)/ "
+        f"C PT×类目交叉:有PT有类目 {r['n_pt_path']}(其中实证 "
+        f"{r['n_pt_evid']} = 挖掘燃料 / 推断 {r['n_pt_infer']} 不参与投票)/ "
         f"有类目无PT {r['n_path_only']}(待判定)/ "
         f"有PT无类目 {r['n_pt_only']}(反哺不了映射)/ "
         f"两者皆无 {r['n_neither']}(先补采集)",

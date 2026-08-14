@@ -45,6 +45,10 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.product_audit")
 
+# 判定并发上限:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的
+# 天花板在 LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)
+_MAX_WORKERS = 64
+
 _CANDIDATE_SQL = """
 SELECT p.asin,
        p.title,
@@ -218,7 +222,13 @@ def run(params: dict) -> str:
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
-    workers = max(1, min(int(params.get("workers", 4)), 16))
+    want_workers = max(1, int(params.get("workers", 4)))
+    workers = min(want_workers, _MAX_WORKERS)
+    if workers != want_workers:
+        # 静默钳制 = 拿着错的数做并发决策(生产实测 2026-08-14:所有者用
+        # workers=32 测吞吐,实际跑的是 16 而输出只字未提)
+        logger.warning("workers=%d 超上限,实际用 %d(I/O 密集,上限由 LLM "
+                       "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
     where, extra = _pick_where(params)
@@ -267,6 +277,8 @@ def run(params: dict) -> str:
                        "L4_ran": 0, "L4_reject": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
+        from api import llm as _llm
+        _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
         todo = []
@@ -384,6 +396,14 @@ def run(params: dict) -> str:
         if opened:
             lines.append("  零参考两阶段:" + " / ".join(
                 f"{k} {v}" for k, v in sorted(opened.items())))
+    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
+    from api import llm as _llm2
+    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
+    lines.append(f"并发 {workers}"
+                 + (f",LLM 退避重试 " + " / ".join(f"{k} {v}" for k, v
+                                                  in sorted(retries.items()))
+                    + "(有 429 说明已撞限流,再加并发只会更慢)"
+                    if retries else ",LLM 零退避(未撞限流,可继续加并发)"))
     l1_blocked = (l1s.get("seed_excluded_direct", 0)
                   + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
                   + l1s.get("publication_forbidden", 0))

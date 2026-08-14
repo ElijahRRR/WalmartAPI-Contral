@@ -796,3 +796,22 @@ def test_adopt_only_narrows_candidates_to_rows_with_history():
     has = product_audit._HAS_HISTORY_SQL
     assert "audit.audit_runs" in has and "r.asin = p.asin" in has
     assert "IS DISTINCT FROM 'SHORTCUT'" in has     # 影子行不算历史结论
+
+
+def test_worker_cap_warns_instead_of_silently_clamping(caplog):
+    """超上限必须告警:静默钳制 = 拿着错的数做并发决策(生产实测:所有者
+    用 workers=32 测吞吐,实际跑 16 而输出只字未提)。"""
+    import logging
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_MAX_WORKERS" in src and "超上限,实际用" in src
+    assert product_audit._MAX_WORKERS >= 32     # I/O 密集,远超核数是正常的
+
+
+def test_llm_retry_stats_are_counted():
+    """退避不能静默:撞限流只表现为变慢,不计数就看不出来。"""
+    from api import llm
+    llm.reset_retry_stats()
+    assert llm.RETRY_STATS == {"http_429": 0, "http_5xx": 0, "other": 0}
+    llm._bump_retry("http_429")
+    assert llm.RETRY_STATS["http_429"] == 1

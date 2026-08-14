@@ -66,41 +66,80 @@ WITH miss AS (
 ), cand AS (
     SELECT * FROM miss WHERE no_title OR no_path OR no_node
 ), snap AS (
-    SELECT DISTINCT ON (s.asin) s.asin, s.outcome
+    SELECT DISTINCT ON (s.asin) s.asin, s.outcome, s.scraped_at
     FROM catalog.snapshots s
     JOIN cand ON cand.asin = s.asin
     WHERE s.marketplace = 'US'
     ORDER BY s.asin, s.scraped_at DESC
 ), fail AS (
-    SELECT DISTINCT ON (f.asin) f.asin, f.error_type
+    SELECT DISTINCT ON (f.asin) f.asin, f.error_type, f.recorded_at
     FROM ops.scrape_failures f
     JOIN cand ON cand.asin = f.asin
     ORDER BY f.asin, f.recorded_at DESC
 )
 SELECT c.asin, c.no_title, c.no_path, c.no_node,
-       s.outcome, f.error_type
+       s.outcome, f.error_type,
+       -- 冷却期判据取"这条证据本身有多旧",失败台账优先(与 classify 同序)
+       EXTRACT(day FROM now() - coalesce(f.recorded_at, s.scraped_at))::int
 FROM cand c
 LEFT JOIN snap s ON s.asin = c.asin
 LEFT JOIN fail f ON f.asin = c.asin
 """
 
-_CLASSES = ("never_tried", "had_snapshot", "retryable", "hard_failed",
-            "ok_but_thin")
-# 默认推哪几类:命中率高的优先,终局失败与"采到过但字段薄"不推
-_DEFAULT_PUSH = ("never_tried", "had_snapshot", "retryable")
+# 冷却天数(所有者定稿 2026-08-14 + 采集侧证据)。variant_offset / not_found
+# 的成因是非确定性的(A/B 分桶、地域缓存、库存差异、卖家重新上架),隔一段时间
+# 才会重新掷骰子;采集侧实测"立刻 rotate 重试结果一样",所以不设冷却 = 每轮
+# 全额重推、烧配额且命中率约等于 0。14 天是保守起点,看回收率再调。
+COOLDOWN_DAYS = 14
+
+_CLASSES = ("never_tried", "had_snapshot", "retryable", "retry_later",
+            "cooling", "hard_failed", "ok_but_thin")
+# 默认推哪几类:命中率高的优先,终局失败与"采到过但字段薄"不推。
+# retry_later 进默认集(所有者定稿 2026-08-14:"这种都可以再重采,全局适用"),
+# 但只有过了冷却期的才在这一档,没过的落 cooling 不推
+_DEFAULT_PUSH = ("never_tried", "had_snapshot", "retryable", "retry_later")
 
 
-def classify(outcome: str | None, error_type: str | None) -> str:
-    """输入:最新快照 outcome + 最新失败类型 → 输出:采集履历分类。纯函数。
+def classify(outcome: str | None, error_type: str | None,
+             age_days: int | None = None,
+             cooldown: int = COOLDOWN_DAYS) -> str:
+    """输入:最新快照 outcome + 最新失败类型 + 该证据的天龄 → 输出:采集履历分类。纯函数。
 
     顺序有讲究:**失败台账优先于快照**——采集失败的 ASIN 压根不产出快照行
     (没采到就没有可导出的记录),有快照又有失败台账时,失败是更新的证据。
+
+    ⚠ `variant_offset` 与 `not_found` 归 retry_later 而不是终局(2026-08-14
+    按采集仓库源码订正,详见 services/scrape_batches.RETRY_LATER):
+      · variant_offset —— 成因是 Amazon A/B test / 地域缓存 / 库存差异,
+        非确定性;采集侧 cap=1 不重试是配额保护+防数据中毒的策略,不是
+        "重试也没用"。它自己永远不会再试(force=true 也不越过),**只有本侧
+        提交新批次这一条出路**。
+      · not_found —— 采集侧**不是** error_type,是 outcome='not_found' 走
+        成功路径(worker/engine.py:1418-1434,success=True、任务状态 done);
+        其注释明写"下一轮定时采集自动纠正"。商品下架后又上架是常事。
+    两者都要过 cooldown 才推,没过的落 `cooling`(计数但不推)——立刻重推
+    与非确定性成因的重掷周期不匹配,纯烧配额。
     """
+    def _cooled(cls: str) -> str:
+        # 天龄取不到(证据没时间戳)时按"已冷却"放行:宁可多推一次,
+        # 也不要因为缺个时间戳把一整类永久卡死在 cooling 里
+        if age_days is None or age_days >= cooldown:
+            return cls
+        return "cooling"
+
     if error_type:
-        return "retryable" if error_type in batches.RETRYABLE else "hard_failed"
+        if error_type in batches.RETRYABLE:
+            return "retryable"
+        if error_type in batches.RETRY_LATER:
+            return _cooled("retry_later")
+        return "hard_failed"
     if outcome is None:
         return "never_tried"
-    return "ok_but_thin" if outcome == "ok" else "had_snapshot"
+    if outcome == "ok":
+        return "ok_but_thin"
+    if outcome == "not_found":
+        return _cooled("retry_later")
+    return "had_snapshot"
 
 
 def run(params: dict) -> str:
@@ -123,8 +162,8 @@ def run(params: dict) -> str:
 
     by_class: dict = {c: [] for c in _CLASSES}
     lack = {"no_title": 0, "no_path": 0, "no_node": 0}
-    for asin, no_title, no_path, no_node, outcome, err in rows:
-        by_class[classify(outcome, err)].append(asin)
+    for asin, no_title, no_path, no_node, outcome, err, age in rows:
+        by_class[classify(outcome, err, age)].append(asin)
         lack["no_title"] += bool(no_title)
         lack["no_path"] += bool(no_path)
         lack["no_node"] += bool(no_node)
@@ -153,6 +192,10 @@ def run(params: dict) -> str:
     if by_class["hard_failed"] and not only:
         lines.append(f"  ⚠ 终局失败 {len(by_class['hard_failed'])} 个默认不推"
                      f"(多为已下架的历史 ASIN;要试加 -p only=hard_failed)")
+    if by_class["cooling"]:
+        lines.append(f"  ⏳ 冷却中 {len(by_class['cooling'])} 个不推"
+                     f"(variant 偏移/已下架,上次证据不足 {COOLDOWN_DAYS} 天;"
+                     f"成因非确定性,太早重推命中率约等于 0)")
     if by_class["ok_but_thin"]:
         lines.append(f"  ⚠ 采到过但字段仍缺 {len(by_class['ok_but_thin'])} 个"
                      f"默认不推——重采大概率还是这样,先查采集侧字段契约")

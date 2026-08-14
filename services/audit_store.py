@@ -40,8 +40,15 @@ _PRODUCT_SQL = """
 UPDATE catalog.products
 SET audit_status  = %(status)s,
     audit_reason  = %(reason)s,
-    walmart_pt    = COALESCE(%(walmart_pt)s, walmart_pt),
-    pt_source     = CASE WHEN %(walmart_pt)s IS NULL THEN pt_source
+    -- 实证行不许被推断覆盖(与 product_audit._ADOPT_SQL 同一条不变量)
+    walmart_pt    = CASE WHEN pt_source = 'walmart_confirmed'
+                              AND %(pt_source)s <> 'walmart_confirmed'
+                         THEN walmart_pt
+                         ELSE COALESCE(%(walmart_pt)s, walmart_pt) END,
+    pt_source     = CASE WHEN pt_source = 'walmart_confirmed'
+                              AND %(pt_source)s <> 'walmart_confirmed'
+                         THEN pt_source
+                         WHEN %(walmart_pt)s IS NULL THEN pt_source
                          ELSE %(pt_source)s END,
     audited_at    = now(),
     audit_version = %(version)s

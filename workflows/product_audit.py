@@ -110,11 +110,19 @@ _HAS_HISTORY_SQL = """EXISTS (
     WHERE r.asin = p.asin AND r.verdict IN ('reject', 'pass')
       AND r.stage_stopped_at IS DISTINCT FROM 'SHORTCUT')"""
 
+# ⚠ **实证行的 PT 一个字都不许动**(生产事故 2026-08-14:首版用
+# COALESCE(新PT, 旧值) 覆盖,把 pt_backfill 回填的 9 万条沃尔玛回执实证
+# 换成了旧系统的判定结论,来源一并降级成 audit_llm,挖掘燃料从 16.8 万
+# 腰斩到 7.7 万)。采用的是**我们自己旧系统的推断**,它压不过沃尔玛回执。
+# 审核结论(status/reason)照写——那与 PT 来源无关。
 _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
-    walmart_pt = COALESCE(%(pt)s, walmart_pt),
-    pt_source = CASE WHEN %(pt)s IS NULL THEN pt_source ELSE %(pt_source)s END,
+    walmart_pt = CASE WHEN pt_source = 'walmart_confirmed' THEN walmart_pt
+                      ELSE COALESCE(%(pt)s, walmart_pt) END,
+    pt_source = CASE WHEN pt_source = 'walmart_confirmed' THEN pt_source
+                     WHEN %(pt)s IS NULL THEN pt_source
+                     ELSE %(pt_source)s END,
     audited_at = now(), audit_version = %(version)s
 WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """

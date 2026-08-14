@@ -815,3 +815,22 @@ def test_llm_retry_stats_are_counted():
     assert llm.RETRY_STATS == {"http_429": 0, "http_5xx": 0, "other": 0}
     llm._bump_retry("http_429")
     assert llm.RETRY_STATS["http_429"] == 1
+
+
+def test_adopt_never_overwrites_walmart_confirmed_pt():
+    """生产事故 2026-08-14:采用历史结论把 pt_backfill 回填的 9 万条沃尔玛
+    回执实证覆盖成旧系统推断,来源一并降级,挖掘燃料 16.8 万腰斩到 7.7 万。
+    采用的是我们自己旧系统的推断,压不过沃尔玛回执。"""
+    sql = product_audit._ADOPT_SQL
+    assert "WHEN pt_source = 'walmart_confirmed' THEN walmart_pt" in sql
+    assert "WHEN pt_source = 'walmart_confirmed' THEN pt_source" in sql
+    # 审核结论回写同一条不变量
+    assert "pt_source = 'walmart_confirmed'" in audit_store._PRODUCT_SQL
+
+
+def test_pt_backfill_evidence_overwrites_inference():
+    """实证优先于推断:回执可以覆盖 audit_llm 行(也是上面那次事故的修复通道)。"""
+    from workflows import pt_backfill
+    sql = pt_backfill._UPSERT_SQL
+    assert "pt_source = 'walmart_confirmed'" in sql
+    assert "pt_source IS DISTINCT FROM 'walmart_confirmed'" in sql

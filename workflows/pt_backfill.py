@@ -2,7 +2,7 @@
 
 用法:
   python cli.py pt_backfill              # 预览:体量/已有行/占位行
-  python cli.py pt_backfill -p apply=1   # 真正写库(只填空,不覆盖)
+  python cli.py pt_backfill -p apply=1   # 真正写库(填空 + 覆盖推断行)
 
 所有者定稿 2026-08-13:PT 是产品属性,直接长在 catalog.products.walmart_pt
 列上,**不另建证据边表**(原 deleted_items_pt 方案废弃)。产品表一 ASIN
@@ -15,8 +15,10 @@ product_ingest 的 COALESCE upsert 自动填充其余列(walmart_pt 不在 inges
     沃尔玛认定 PT;registry.db.legacy_cleanup_conn 只读)
   · audit.walmart_error_records(9.7 万行报错日报,walmart_pt;'default' 剔)
 
-写入语义:**只填空**——`ON CONFLICT ... WHERE walmart_pt IS NULL`,已有值
-(审核结论写的或上一轮回填的)绝不覆盖;可随时重跑吸收旧库新增行。
+写入语义(2026-08-14 修正):**填空 + 覆盖推断行**。沃尔玛回执是最硬的
+证据,压过我们任何一层推断——所以 `pt_source` 不是 `walmart_confirmed`
+的行一律用实证覆盖;已是实证的行不动(同值)。这同时是"采用历史结论把
+9 万条实证冲掉"那次事故的修复通道:重跑一次即可复原。
 sku 经 services/sku_asin.extract_asin 归一,提不出 ASIN 的行剔除计数。
 **不过 pt_meta 闸**:闸的唯一出处在消费端(resolve_pt 判定时校验),
 导入端过闸会让"pt_meta 后来补了该 PT"的行永远进不来。
@@ -51,23 +53,21 @@ WHERE asin IS NOT NULL AND asin <> ''
 ORDER BY asin, recorded_at DESC NULLS LAST
 """
 
-# 一条语句同时覆盖"占位新行"与"已有行填空":walmart_pt 已有值的行 WHERE
-# 不满足 → 跳过(审核结论优先,回填绝不覆盖)
-# 来源标记(2026-08-14):本工作流的源是沃尔玛自己的删除历史与报错日报
+# 一条语句同时覆盖"占位新行"与"已有行":源是沃尔玛的删除历史与报错日报
 # ——**定义上就是实证**,写的同时把 pt_source 盖成 walmart_confirmed。
-# 两种情况都要盖:① 本轮填空的行;② 早先已填了同一个 PT、但那时还没有
-# pt_source 列的存量行(否则 catmap_mine 换上实证闸后票数会凭空塌掉)。
-# PT 与库里现值不一致时**不动**——那是另一条证据链,交审核去裁。
+# **实证覆盖推断**(2026-08-14 修正):本工作流的源是沃尔玛自己的回执,
+# 优先级高于我们任何一层推断。所以推断行(pt_source≠walmart_confirmed)
+# 一律用实证覆盖——这也是修复"采用历史结论把 9 万条实证冲掉"的通道。
+# 已是 walmart_confirmed 的行不动(同值,写了也是空转)。
 _UPSERT_SQL = """
 INSERT INTO catalog.products (marketplace, asin, walmart_pt, pt_source)
 VALUES ('US', %s, %s, 'walmart_confirmed')
 ON CONFLICT (marketplace, asin) DO UPDATE
-SET walmart_pt = COALESCE(catalog.products.walmart_pt, EXCLUDED.walmart_pt),
+SET walmart_pt = EXCLUDED.walmart_pt,
     pt_source = 'walmart_confirmed',
     updated_at = now()
 WHERE catalog.products.walmart_pt IS NULL
-   OR (catalog.products.walmart_pt = EXCLUDED.walmart_pt
-       AND catalog.products.pt_source IS DISTINCT FROM 'walmart_confirmed')
+   OR catalog.products.pt_source IS DISTINCT FROM 'walmart_confirmed'
 """
 
 
@@ -126,15 +126,17 @@ def run(params: dict) -> str:
 
         asins = list(folded.keys())
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*),"
-                        " count(*) FILTER (WHERE walmart_pt IS NOT NULL) "
-                        "FROM catalog.products "
-                        "WHERE marketplace = 'US' AND asin = ANY(%s)",
-                        (asins,))
-            in_lib, has_pt = cur.fetchone()
+            cur.execute(
+                "SELECT count(*),"
+                " count(*) FILTER (WHERE walmart_pt IS NOT NULL),"
+                " count(*) FILTER (WHERE pt_source = 'walmart_confirmed') "
+                "FROM catalog.products "
+                "WHERE marketplace = 'US' AND asin = ANY(%s)", (asins,))
+            in_lib, has_pt, confirmed = cur.fetchone()
         stubs = len(folded) - in_lib
-        lines.append(f"库内已有 {in_lib}(其中 {has_pt} 已有 PT 不覆盖,"
-                     f"{in_lib - has_pt} 将填空)+ 占位新行 {stubs}"
+        lines.append(f"库内已有 {in_lib}(已是实证 {confirmed} 不动 / "
+                     f"推断行 {has_pt - confirmed} 将被实证覆盖 / "
+                     f"空 PT {in_lib - has_pt} 将填空)+ 占位新行 {stubs}"
                      f"(title 空,不进审核候选,待采集填充)")
         if not apply:
             lines.append("(预览:未写库;确认无误加 -p apply=1)")
@@ -143,6 +145,7 @@ def run(params: dict) -> str:
         with conn.cursor() as cur:
             cur.executemany(_UPSERT_SQL, [
                 (asin, pt) for asin, (pt, _ts) in folded.items()])
-    lines.append(f"回填完成 ✓(填空 {in_lib - has_pt} + 占位 {stubs};"
+    lines.append(f"回填完成 ✓(填空 {in_lib - has_pt} + 覆盖推断 "
+                 f"{has_pt - confirmed} + 占位 {stubs};"
                  f"下一轮 product_audit ①b 级直接受益)")
     return "\n".join(lines)

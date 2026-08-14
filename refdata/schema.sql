@@ -22,6 +22,13 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     audit_status    text,        -- pending / approved / rejected
     audit_reason    text,
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
+    --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
+    --   audit_llm         = 审核链第三级 LLM 推断出来的
+    -- 混在一起会洗白:LLM 猜一个 → 下轮当"高置信历史实证"直出 → catmap_mine
+    -- 当实证票投进映射表 → 整个类目按这个猜测直出。分开后 catmap_mine
+    -- 只数 walmart_confirmed,回路在造成伤害的那一环被切断。
+    pt_source       text,
     audited_at      timestamptz,
     audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
     -- (assigned_upc/listing_attrs/last_feed_id/store/owner 五列 2026-08-12
@@ -183,6 +190,12 @@ ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_chain text;
 ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_id text;
 CREATE INDEX IF NOT EXISTS products_browse_node_idx
     ON catalog.products (browse_node_id);
+
+-- PT 来源分道(2026-08-14):存量行按证据反推——pt_backfill 写过的(在
+-- walmart_cleanup/审核报错两源里出现过的 ASIN)是实证,其余审核写的算推断。
+-- 存量无从区分的一律留 NULL,由下一轮审核按新口径补写(NULL 视同推断,
+-- 保守:不把来历不明的 PT 当实证喂给挖掘)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
@@ -1048,9 +1061,37 @@ CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
     product_samples integer,           -- 树自带的样本数(采集侧统计,仅参考)
     source          text,              -- leaves / verified_added_paths /
                                        -- unverified_new_nodes(未验证新 node)
+                                       -- derived_products = taxonomy_derive 从
+                                       -- (ID 链 × 面包屑)反推的中间层补层:
+                                       -- 文件只发叶子,父链靠它才走得通。
+                                       -- taxonomy_import 重灌只删文件段的行
     imported_at     timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);
+
+-- 类目**路径**关系(所有者定稿 2026-08-14):Amazon 的 browse tree 是 DAG
+-- 不是树——同一个 node 可以挂在多个父下、有多条完整路径(Belts 挂在男装
+-- 配件、汽车皮带、工业传动…)。按 browse_node_id 简单去重会**静默丢掉
+-- 多路径关系**,父链回退就只剩其中一条,回退到错误的祖先。
+-- 分工:节点级属性(名称/是否叶子)在 amazon_taxonomy 按 ID 一行;
+--       路径级属性(父/完整路径/深度/L1 根)在本表,键是**三元组**。
+-- amazon_taxonomy.parent_node_id / path / depth / root_name 保留为「代表路径」
+-- 的取值(展示与 1:1 JOIN 用,**不是唯一真相**);要走父链一律查本表。
+-- parent_node_id 用 '' 表示根级(PK 不收 NULL),读的时候 NULLIF(parent,'')。
+CREATE TABLE IF NOT EXISTS audit.amazon_node_paths (
+    node_id        text NOT NULL,
+    parent_node_id text NOT NULL,     -- '' = 根级
+    full_path      text NOT NULL,
+    depth          integer,
+    root_name      text,
+    source         text,              -- 与 amazon_taxonomy.source 同口径
+    imported_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, parent_node_id, full_path)
+);
+CREATE INDEX IF NOT EXISTS amzpath_parent_idx
+    ON audit.amazon_node_paths (parent_node_id);
+CREATE INDEX IF NOT EXISTS amzpath_path_idx
+    ON audit.amazon_node_paths (full_path);
 
 -- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
 -- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移

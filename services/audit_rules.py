@@ -123,7 +123,7 @@ def _build_automaton(brand_keys) -> object:
     return a
 
 
-_UNMAPPED_SENTINEL = "无对应Walmart PT"   # 映射表哨兵值(675 行),不是真 PT
+_UNMAPPED_SENTINEL = audit_l1_llm.UNMAPPED_SENTINEL   # 单一出处
 
 
 def load_context(conn, *, uspto=None) -> AuditContext:
@@ -223,12 +223,24 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     )
 
 
+def _blocked(l1: L1Info) -> bool:
+    """输入:L1Info → 输出:是否已被硬拦判死(有扣分 hit)。
+
+    判据是 **penalty<0 而不是"有没有 hit"**:哨兵改成 0 分留痕后仍会往
+    hits 里放一条,若照旧按"有 hit"判,那条留痕会把产品挡在第三级门外
+    ——恰好抵消所有者"标注不该终结判定"的定稿。
+    """
+    return any(h.penalty < 0 for h in l1.hits)
+
+
 def resolve_pt(product, ctx: AuditContext) -> L1Info:
     """输入:产品 + 上下文 → 输出:L1Info(免 LLM 的 PT 解析;解不出 PT=None)。
 
     批次 C 定稿的级序(合同 L1-8/L1-10):
       ① 沃尔玛在架实证(walmart_items,跨店唯一)         pt_source='walmart_confirmed'
-      ①b 历史报错日报实证(walmart_error_records 最新条)  pt_source='walmart_error_confirmed'
+      ①b 产品行已知 PT(products.walmart_pt);**按 pt_source 分道**——
+        沃尔玛回执实证 → 'historical_confirmed'/高;我们自己推断的(含上一轮
+        LLM 结论)→ 'audit_cached'/中,直出但不冒充实证(2026-08-14)
       ⓪ 哨兵硬拒(映射表明确标记'无对应Walmart PT')——批复 #10 实证最优先,
         故哨兵从旧仓的最前挪到实证之后、映射之前(差异会进双跑校准报告)
       ②a browse_node_id 直查(名称会漂 ID 不会)          pt_source='map_node'
@@ -246,9 +258,18 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     if pt:
         source, conf = "walmart_confirmed", "高"
     elif product.known_pt and product.known_pt in ctx.pt_meta:
-        # ①b 产品行已知 PT(pt_backfill 回填的历史实证/先前结论;所有者
-        # 定稿 2026-08-13:PT 长在产品主档,不查证据边表)
-        pt, source, conf = product.known_pt, "historical_confirmed", "高"
+        # ①b 产品行已知 PT(pt_backfill 回填的历史实证 / 先前审核结论;
+        # 所有者定稿 2026-08-13:PT 长在产品主档,不查证据边表)。
+        # **按来源分道**(2026-08-14):这一列同时装沃尔玛回执实证与我们
+        # 自己的推断,不分道就等于"LLM 猜一个 → 下轮以高置信实证复述",
+        # 猜错会被自己反复确认,而且外面看不出来。
+        # 推断行仍然直出(不分道地重付 LLM,百万级产品成本不可接受),
+        # 但记独立来源 + 置信'中',让校准/报表能把它单独拎出来看。
+        pt = product.known_pt
+        if product.known_pt_source == "walmart_confirmed":
+            source, conf = "historical_confirmed", "高"
+        else:
+            source, conf = "audit_cached", "中"
     # ②a browse_node_id 直查(所有者定稿 2026-08-14:名称会漂 ID 不会)——
     # 采集侧 category_id_chain 的最后一段 = 当前最细类目,与映射表的
     # browse_node_id 列精确等值,不受三套名称不一致影响。无 ID 的老行
@@ -263,18 +284,7 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     # 折叠只影响"查得到查不到",不改任何判定语义;别名表空则退化回精确匹配
     if path and path not in ctx.catmap and path not in ctx.unmapped_paths:
         path = ctx.path_alias.get(path, path)
-    if not pt and path and path in ctx.unmapped_paths:
-        # Layer 0 哨兵(l1_category.py:779-797 字面量逐字:unknown/低/none 三件
-        # + detail.amazon_path 用原文不 strip)
-        l1 = L1Info(walmart_product_type="unknown", pt_confidence="低",
-                    pt_source="none",
-                    excluded_category_reason="无对应 Walmart PT (映射表明确标记)")
-        l1.hits.append(RuleHit(
-            stage="L1", rule_code="unmapped_amazon_path", penalty=-100,
-            detail={"reason": "Amazon 路径在映射表被标记为 '无对应Walmart PT', "
-                              "上架 Walmart 会失败",
-                    "amazon_path": product.amazon_category_path}))
-        return l1
+    sentinel = bool(not pt and path and path in ctx.unmapped_paths)
     if not pt:
         pt = ctx.catmap.get(path)
         if pt:
@@ -284,6 +294,16 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
     meta = ctx.pt_meta.get(pt) if pt else None
     l1 = L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
                 walmart_category=(meta or {}).get("walmart_category"))
+    if sentinel:
+        # 所有者定稿 2026-08-14:**标注"无对应 Walmart PT"不再判死**。
+        # 旧仓在此硬拒 -100,理由是"上架必失败";但那条标注是当年没数据时
+        # 人工打的,不代表今天判不出来——判不出来才该 pending,不该拒。
+        # 改为 0 分留痕,继续走候选+LLM;信息一并进提示词供 LLM 参考。
+        l1.hits.append(RuleHit(
+            stage="L1", rule_code="unmapped_amazon_path", penalty=0,
+            detail={"reason": "映射表曾标注 '无对应Walmart PT'(仅留痕,"
+                              "不判死;交 L1 第三级候选+LLM 判定)",
+                    "amazon_path": product.amazon_category_path}))
     if pt:
         seed = audit_l1_llm.check_seed_excluded(product, pt)
         if seed:
@@ -324,18 +344,37 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
         return outcome
 
     l1 = resolve_pt(product, ctx)
-    if not l1.walmart_product_type and not l1.hits and conn is not None:
+    if not l1.walmart_product_type and not _blocked(l1) and conn is not None:
         # L1 第三级:候选召回 + rerank(哨兵命中带 -100 hit 者不进——已判死)。
         # 空候选由 rerank 自己短路(合同 L1-5:不调 LLM 直接解不出)
         cands = audit_l1_llm.candidates(conn, product)
+        if not cands:
+            # 七路全空 = 映射表和标题都给不出参考。所有者定稿 2026-08-14:
+            # 这时**仍要让 LLM 判**,走两阶段(先选沃尔玛大类,再在该大类
+            # 的全部 PT 里挑),而不是直接 pending
+            cands = audit_l1_llm.open_candidates(conn, product)
         # 字典收窄为 pt_meta(评审 P0 修正:旧仓 pt_meta∪pt_spec,但 L2 四硬闸
         # 全部只查 pt_meta——spec-only PT 直出会四闸失明产假 pass,还经 real_pt
         # 把 meta 表没有的 PT 写进身份层;候选 SQL 本就 JOIN pt_meta,零召回损失)
-        l1_llm = audit_l1_llm.rerank(product, cands, ctx.pt_meta.keys())
+        l1_llm, why = audit_l1_llm.rerank_ex(product, cands, ctx.pt_meta.keys())
+        if l1_llm is None and why == "unknown" and cands:
+            # 二次机会(所有者定稿 2026-08-14:"真的都不合适,那也不行")。
+            # 七路候选**不空**但 LLM 全否掉了——多半是七路召回的方向本就偏,
+            # 不是"这产品没类目"。这时把候选面换成两阶段开放判定(先选大类、
+            # 再在该大类全部 PT 里挑)再判一次;还 unknown 才真 pending。
+            # 只在 unknown 分支重试:LLM 失败/坏 JSON 是链路故障,换候选面
+            # 治不了,重试只是白烧一次调用(兜底不补偿自己的不确定)。
+            audit_l1_llm.bump("unknown_retry_called")
+            wide = audit_l1_llm.open_candidates(conn, product)
+            if wide:
+                l1_llm, why = audit_l1_llm.rerank_ex(
+                    product, wide, ctx.pt_meta.keys())
+                if l1_llm is not None:
+                    audit_l1_llm.bump("unknown_retry_saved")
         if l1_llm is not None:
             pt3 = l1_llm.walmart_product_type
             if pt3 and pt3 != "unknown" and pt3 not in ctx.pt_meta \
-                    and not l1_llm.hits:
+                    and not _blocked(l1_llm):
                 logger.warning("L1 第三级产出 pt_meta 外 PT %r,转 pending "
                                "(asin=%s)", pt3, product.asin)   # 防御,与 resolve_pt 同款
             else:
@@ -343,9 +382,9 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
                 meta = ctx.pt_meta.get(l1.walmart_product_type)
                 if meta:
                     l1.walmart_category = meta.get("walmart_category")
-    if not l1.walmart_product_type and not l1.hits:
+    if not l1.walmart_product_type and not _blocked(l1):
         # PT 解不出(rerank unknown/LLM 失败/坏 JSON/无候选)→ pending,
-        # 绝不默认放行(10.2)。哨兵/excluded 命中(有 -100 hit)不走此路
+        # 绝不默认放行(10.2)。excluded 命中(有扣分 hit)不走此路
         return AuditOutcome(asin=product.asin, verdict="pending",
                             score_final=None, stage_stopped_at="L1",
                             l1=l1, phase0=p0)
@@ -418,5 +457,6 @@ def product_info_from_row(row: dict):
         seller_id=row.get("seller_id") or "",
         seller_name=row.get("seller_name") or "",
         known_pt=row.get("walmart_pt") or None,
+        known_pt_source=row.get("pt_source") or None,
         browse_node_id=row.get("browse_node_id") or "",
     )

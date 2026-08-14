@@ -40,7 +40,16 @@ _PRODUCT_SQL = """
 UPDATE catalog.products
 SET audit_status  = %(status)s,
     audit_reason  = %(reason)s,
-    walmart_pt    = COALESCE(%(walmart_pt)s, walmart_pt),
+    -- 实证行不许被推断覆盖(与 product_audit._ADOPT_SQL 同一条不变量)
+    walmart_pt    = CASE WHEN pt_source = 'walmart_confirmed'
+                              AND %(pt_source)s <> 'walmart_confirmed'
+                         THEN walmart_pt
+                         ELSE COALESCE(%(walmart_pt)s, walmart_pt) END,
+    pt_source     = CASE WHEN pt_source = 'walmart_confirmed'
+                              AND %(pt_source)s <> 'walmart_confirmed'
+                         THEN pt_source
+                         WHEN %(walmart_pt)s IS NULL THEN pt_source
+                         ELSE %(pt_source)s END,
     audited_at    = now(),
     audit_version = %(version)s
 WHERE marketplace = %(marketplace)s AND asin = %(asin)s
@@ -77,6 +86,21 @@ def persist_run(conn, outcome: AuditOutcome) -> int:
     return run_id
 
 
+# L1 各级来源 → 产品主档的两分道(所有者定稿 2026-08-14):只有沃尔玛真
+# 接受过的才算实证,其余(含 LLM 推断、映射表推出来的)一律记 audit_llm。
+# 映射本身也是人/挖掘给的推断,不是沃尔玛的回执——**别把它当实证再喂回挖掘**,
+# 否则 A 推出 B、B 又去证明 A。
+_CONFIRMED_SOURCES = frozenset({"walmart_confirmed", "historical_confirmed"})
+
+
+def pt_provenance(outcome: AuditOutcome) -> str | None:
+    """输入:判定结果 → 输出:PT 来源标记('walmart_confirmed'/'audit_llm')。"""
+    if real_pt(outcome) is None:
+        return None
+    return ("walmart_confirmed"
+            if outcome.l1.pt_source in _CONFIRMED_SOURCES else "audit_llm")
+
+
 def real_pt(outcome: AuditOutcome) -> str | None:
     """输入:判定结果 → 输出:可写入 products.walmart_pt 的真实 PT(桩值不算)。"""
     pt = outcome.l1.walmart_product_type
@@ -101,6 +125,7 @@ def write_conclusion(conn, outcome: AuditOutcome,
         reason = None
     conn.execute(_PRODUCT_SQL, {
         "status": status, "reason": reason, "walmart_pt": real_pt(outcome),
+        "pt_source": pt_provenance(outcome),
         "version": resources.AUDIT_RULES_VERSION,
         "marketplace": marketplace, "asin": outcome.asin,
     })

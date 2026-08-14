@@ -6,6 +6,7 @@
   python cli.py product_audit -p limit=2000
   python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
+  python cli.py product_audit -p mode=pending --execute    # 待定专刷:只重判 pending,无退避
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
@@ -28,6 +29,9 @@ referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者�
 
 pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
 L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日退避重试。
+`mode=pending` 是这条退避的人工旁路:判定逻辑刚改过时要立刻拿存量 pending
+验证效果,等一天等的是自己。**不采用历史结论**(backfill=False)——pending
+行要的是重判,拿旧 run 顶上等于把这次改动的效果盖掉。只手动跑,不进调度。
 无标题产品跳过不审(采集降级,不够格判定;amz_source:103 先例)并计数。
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
@@ -37,6 +41,7 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 """
 
 import logging
+import time
 
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, product_events
@@ -45,11 +50,21 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.product_audit")
 
+# 分段提交与进度播报的粒度(生产事故 2026-08-14:34 万行跑在同一个未提交
+# 事务里 —— 外部查不到任何进度、Ctrl-C 全部回滚、长事务还挡住 vacuum)。
+# 每 N 行提交一次 + 打一行进度,判定结果就变成"跑到哪算到哪"。
+_COMMIT_EVERY = 500
+
+# 判定并发上限:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的
+# 天花板在 LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)
+_MAX_WORKERS = 64
+
 _CANDIDATE_SQL = """
 SELECT p.asin,
        p.title,
        p.brand,
        p.walmart_pt,
+       p.pt_source,
        p.browse_node_id,
        p.amazon_category AS amazon_category_path,
        p.slow -> 'bullet_points' AS bullet_points,
@@ -90,7 +105,8 @@ _RECENT_RUN_GUARD = """
 # 排序键,语义等价(spec_shortcut §3.4C),别当成可随手删的排序
 _HISTORY_SQL = """
 SELECT DISTINCT ON (asin) asin, run_id, verdict, score_final,
-       walmart_product_type, l3_reason_category, stage_stopped_at, created_at
+       walmart_product_type, l3_reason_category, stage_stopped_at, created_at,
+       pt_source
 FROM audit.audit_runs
 WHERE asin = ANY(%s)
   AND verdict IN ('reject', 'pass')
@@ -98,17 +114,34 @@ WHERE asin = ANY(%s)
 ORDER BY asin, (verdict = 'reject') DESC, created_at DESC
 """
 
+# 有历史结论可采用(与 _HISTORY_SQL 同谓词:排除 SHORTCUT 影子行)
+_HAS_HISTORY_SQL = """EXISTS (
+    SELECT 1 FROM audit.audit_runs r
+    WHERE r.asin = p.asin AND r.verdict IN ('reject', 'pass')
+      AND r.stage_stopped_at IS DISTINCT FROM 'SHORTCUT')"""
+
+# ⚠ **实证行的 PT 一个字都不许动**(生产事故 2026-08-14:首版用
+# COALESCE(新PT, 旧值) 覆盖,把 pt_backfill 回填的 9 万条沃尔玛回执实证
+# 换成了旧系统的判定结论,来源一并降级成 audit_llm,挖掘燃料从 16.8 万
+# 腰斩到 7.7 万)。采用的是**我们自己旧系统的推断**,它压不过沃尔玛回执。
+# 审核结论(status/reason)照写——那与 PT 来源无关。
 _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
-    walmart_pt = COALESCE(%(pt)s, walmart_pt),
+    walmart_pt = CASE WHEN pt_source = 'walmart_confirmed' THEN walmart_pt
+                      ELSE COALESCE(%(pt)s, walmart_pt) END,
+    pt_source = CASE WHEN pt_source = 'walmart_confirmed' THEN pt_source
+                     WHEN %(pt)s IS NULL THEN pt_source
+                     ELSE %(pt_source)s END,
     audited_at = now(), audit_version = %(version)s
 WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
 _KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
-                 "l3", "l4", "workers"}
+                 "l3", "l4", "workers", "adopt_only"}
+# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
+_MODES = {"backfill", "pending"}
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -128,8 +161,16 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
-    if str(params.get("mode", "")).strip() == "backfill":
+    mode = str(params.get("mode", "")).strip()
+    if mode and mode not in _MODES:
+        # 与未识别参数同理:静默落回默认 = "补刷跑完了"的假象,宁炸不吞
+        raise ValueError(f"未识别 mode={mode!r}(可用:{sorted(_MODES)})")
+    if mode == "backfill":
         return "p.audit_status IS NULL", {}
+    if mode == "pending":
+        # 待定专刷:**无 1 天退避**——判定逻辑刚改过时要立刻拿存量 pending
+        # 验证效果,等一天等的是自己。人工显式动作,不进任何定时调度
+        return "p.audit_status = 'pending'", {}
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return ("(p.audit_status IS NULL OR (p.audit_status = 'pending' "
@@ -150,7 +191,9 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
         rows = cur.fetchall()
     adopted = set()
     events = []
-    for asin, run_id, verdict, _score, pt, reason_cat, stage, created in rows:
+    adopt_rows = []
+    for (asin, run_id, verdict, _score, pt, reason_cat, stage, created,
+         src) in rows:
         adopted.add(asin)
         if not execute:
             continue
@@ -161,10 +204,16 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             reason = reason_cat or f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
             reason = None
-        conn.execute(_ADOPT_SQL, {
+        adopt_rows.append({
             "status": status,
             "reason": reason,
             "pt": (pt if pt and not pt.startswith("(") else None),
+            # 旧结论的 PT 来源照搬 runs 记录;非实证一律记 audit_llm
+            # (来历不明的 PT 不当实证——它会被 catmap_mine 投票放大)
+            "pt_source": ("walmart_confirmed"
+                          if src in ("walmart_confirmed",
+                                     "historical_confirmed")
+                          else "audit_llm"),
             "version": resources.AUDIT_RULES_VERSION,
             "marketplace": "US", "asin": asin,
         })
@@ -176,6 +225,10 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
                                       created.isoformat() if created else "",
                                   "audit_version":
                                       resources.AUDIT_RULES_VERSION}})
+    if execute and adopt_rows:
+        # 批量:86 万条采用逐行往返要几十分钟,executemany 一次搞定
+        with conn.cursor() as cur:
+            cur.executemany(_ADOPT_SQL, adopt_rows)
     if execute and events:
         product_events.record_many(conn, events)
     return len(adopted), adopted
@@ -186,6 +239,10 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
+    adopt_only = str(params.get("adopt_only", "")).strip() == "1"
+    if adopt_only and not backfill:
+        raise ValueError("adopt_only=1 只在 mode=backfill 下有意义"
+                         "(它采用的是 audit_runs 里的历史结论)")
     r5_on = str(params.get("r5", "")).strip().lower() == "on"
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
@@ -193,10 +250,22 @@ def run(params: dict) -> str:
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
-    workers = max(1, min(int(params.get("workers", 4)), 16))
+    want_workers = max(1, int(params.get("workers", 4)))
+    workers = min(want_workers, _MAX_WORKERS)
+    if workers != want_workers:
+        # 静默钳制 = 拿着错的数做并发决策(生产实测 2026-08-14:所有者用
+        # workers=32 测吞吐,实际跑的是 16 而输出只字未提)
+        logger.warning("workers=%d 超上限,实际用 %d(I/O 密集,上限由 LLM "
+                       "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
     where, extra = _pick_where(params)
+    if adopt_only:
+        # 只采用模式下**只挑有历史结论的行**:否则候选按 audited_at NULLS
+        # FIRST 取前 N,没历史的那批不会被消耗、每轮都排在前面重复捞
+        # (生产实测 2026-08-14:采用率 122k→88k→65k→47k→34k→25k 一路塌,
+        #  第 6 轮 20 万候选里 17.5 万是上轮已确认无历史的行)
+        where = f"({where}) AND {_HAS_HISTORY_SQL}"
     if "asins" in extra:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
         limit = max(limit, len(extra["asins"]))
@@ -221,6 +290,14 @@ def run(params: dict) -> str:
         if backfill:
             adopted_n, adopted = _adopt_history(
                 conn, [r["asin"] for r in rows], execute)
+        if adopt_only:
+            # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
+            # 再单独安排要真判的那批)。86 万可采用 vs 33 万要真判,混在
+            # 一起跑等于为了采用而顺带付 33 万次 LLM
+            return (f"product_audit(仅采用历史,零 LLM):候选 {len(rows)} → "
+                    f"采用 {adopted_n}"
+                    + ("" if execute else "(dry-run:未写库)")
+                    + f";其余 {len(rows) - adopted_n} 条无历史,需另跑判定")
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0
@@ -228,8 +305,12 @@ def run(params: dict) -> str:
                        "L4_ran": 0, "L4_reject": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
+        from api import llm as _llm
+        _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
+        done_n = 0
+        t0 = time.monotonic()
         todo = []
         for row in rows:
             if row["asin"] in adopted:
@@ -288,6 +369,17 @@ def run(params: dict) -> str:
                                 f"疑似系统性故障,停批。最后错误:{e}") from e
                         continue
                     consec_errors = 0
+                    done_n += 1
+                    if done_n % _COMMIT_EVERY == 0:
+                        # 分段落定:此刻之前判的都已持久,中断只丢最后一段
+                        conn.commit()
+                        if events:
+                            product_events.record_many(conn, events)
+                            conn.commit()
+                            events = []
+                        rate = done_n / max(time.monotonic() - t0, 1e-6)
+                        logger.info("进度 %d/%d(%.0f 条/秒,已提交)",
+                                    done_n, len(todo), rate)
                     if outcome.l3 is not None:
                         stage_stats["L3_ran"] += 1
                         if outcome.l3.verdict == "reject":
@@ -333,6 +425,41 @@ def run(params: dict) -> str:
                      f"字典回落 {l1s.get('dict_fallback', 0)},"
                      f"无候选→待定 {l1s.get('no_candidate', 0)},"
                      f"低置信采纳 {l1s.get('conf_low', 0)}")
+        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
+        picked = {k[len("picked_"):]: v for k, v in l1s.items()
+                  if k.startswith("picked_") and v}
+        if picked:
+            lines.append("  选中候选来自:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(picked.items(),
+                                              key=lambda kv: -kv[1])))
+        opened = {k: v for k, v in l1s.items()
+                  if k.startswith("open_") and v}
+        if opened:
+            lines.append("  零参考两阶段:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(opened.items())))
+        if l1s.get("unknown_retry_called", 0):
+            called = l1s["unknown_retry_called"]
+            saved = l1s.get("unknown_retry_saved", 0)
+            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
+                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
+    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
+    from api import llm as _llm2
+    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
+    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
+    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
+    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
+    if retries.get("http_429"):
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + " ⚠ **已撞限流**,再加并发只会更慢")
+    elif retries:
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
+                  "降并发解决不了)")
+    else:
+        tail = ",LLM 零退避(未撞限流,可继续加并发)"
+    lines.append(f"并发 {workers}{tail}")
     l1_blocked = (l1s.get("seed_excluded_direct", 0)
                   + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
                   + l1s.get("publication_forbidden", 0))

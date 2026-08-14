@@ -272,3 +272,54 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 - 沃尔玛侧 catalog_sync 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
   无重复入库(source_id 冲突计数为 0)、products/snapshots 分层数据正确。
 - 现有旧系统(erpAPI)链路零感知、零故障。
+
+## 采集失败语义:三档而非两档(2026-08-14 按采集仓库源码订正)
+
+原来只有 `RETRYABLE` / `TERMINAL` 两档,`variant_offset` 归 TERMINAL 且注释
+写着"描述的是产品/页面层的稳定事实,不是瞬时抖动"——**这句是错的**。
+`ElijahRRR/amazon-scraper-v4` 的 `worker/engine.py:1501-1508` 复盘注释:
+
+> variant 偏移通常不是 session/cookie 状态引起的,多由 Amazon A/B test、
+> 地域缓存、库存差异引起,rotate 后重试**结果一样**;大量 rotation 会瞬间
+> 打爆隧道代理 5 QPS 限额
+
+成因是**非确定性**的;采集侧 cap=1 不重试是「配额保护 + 防数据中毒」的策略
+决定(把兄弟变体的标题写到目标 ASIN 行上,采集侧叫"数据中毒"),不是
+"重试也没用"的事实判断。它是 `NO_AUTO_RETRY_ERROR_TYPES` 的唯一成员,
+`POST /api/batches/{name}/retry?force=true` 也不越过 ⇒ **唯一出路是本侧提交
+新批次**。所以拆出第三档 `RETRY_LATER`(所有者定稿 2026-08-14:"这种都可以
+再重采,全局适用")。
+
+三档口径(`services/scrape_batches`):
+
+| 档 | 含义 | 成员 |
+|---|---|---|
+| `RETRYABLE` | 采集侧自己会重试(cap=3 × 2 轮) | network/timeout/blocked/captcha/zip_*/session_not_ready |
+| `RETRY_LATER` | 采集侧永不再试,但过冷却期重提批次有意义 | variant_offset(+ outcome `not_found`) |
+| `TERMINAL` | 重采一百次也一样 | parse_error / discover_failed / server_reject |
+
+`unknown` 三档都不进——兜底桶,拿不准别替人下终局结论。
+
+### 两个必须记住的坑
+
+1. **`not_found` 不是 error_type**。采集侧 12 个 error_type 里没有它;404 走
+   **成功**路径(`worker/engine.py:1418-1434`,`success=True`、任务状态 `done`),
+   只体现在 `outcome='not_found'`。其注释明写"下一轮定时采集自动纠正",
+   加上下架后重新上架是常事 ⇒ 与 variant_offset 同档。
+2. **`variant_offset` 的 outcome 是 `parse_failed`**。它不在采集侧
+   `_OUTCOME_BY_ERROR_TYPE` 映射里,落默认值。**两列按设计就不一致**,
+   只能靠 `error_type` 认。本侧 `classify()` 是失败台账优先,正好避开。
+
+### ⚠ 冷却期不是可选项
+
+`COOLDOWN_DAYS = 14`(`workflows/scrape_missing`)。采集侧实测"立刻 rotate
+重试结果一样"——非确定性成因(A/B 分桶、地域缓存)要隔一段时间才重新掷骰子。
+不设冷却 = 每轮全额重推、烧配额且命中率约等于 0。没过冷却的落 `cooling` 类,
+计数但不推。
+
+### ⚠ 订单链的"终局"比产品库宽一档
+
+判据是**决策窗口**,不是错误类型的物理性质:产品库补采的尺度是**周**(可以等
+冷却),订单链的尺度是**小时**(一张单等着发货,冷却两周再给答案等于没答案)。
+所以 `order_audit._TERMINAL_FOR_ORDER = TERMINAL | RETRY_LATER`。
+**合并不是"顺手统一口径",拆开也不是**——谁改都得先问"决策窗口多长"。

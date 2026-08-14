@@ -9,6 +9,7 @@ api 层只做接口适配:认证(key 从环境变量,旧系统明文写 config.p
 """
 
 import json
+import threading
 import logging
 import os
 import time
@@ -78,6 +79,23 @@ def _request_body(messages: list[dict], temperature: float,
     return body
 
 
+# 退避观测(线程安全):撞限流时只表现为"变慢",不计数就只能靠耗时反推。
+# 纯计数不含业务判断——调用方(product_audit 摘要)读它决定要不要降并发。
+_RETRY_LOCK = threading.Lock()
+RETRY_STATS: dict = {"http_429": 0, "http_5xx": 0, "other": 0}
+
+
+def reset_retry_stats() -> None:
+    with _RETRY_LOCK:
+        for k in RETRY_STATS:
+            RETRY_STATS[k] = 0
+
+
+def _bump_retry(key: str) -> None:
+    with _RETRY_LOCK:
+        RETRY_STATS[key] = RETRY_STATS.get(key, 0) + 1
+
+
 def chat_json(messages: list[dict], *, temperature: float = 0.2,
               max_tokens: int = 4096, max_retries: int = 3,
               purpose: str = "default") -> dict:
@@ -98,12 +116,16 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
                 content = (resp.json()["choices"][0]["message"]["content"])
                 return _extract_json(content)
             if resp.status_code in (429, 500, 502, 503, 504):
+                _bump_retry("http_429" if resp.status_code == 429
+                            else "http_5xx")
                 raise RuntimeError(f"LLM HTTP {resp.status_code}")
             raise ValueError(f"LLM 请求被拒 HTTP {resp.status_code}: "
                              f"{resp.text[:200]}")
         except (httpx.HTTPError, RuntimeError, json.JSONDecodeError,
                 KeyError) as e:
             last = e
+            if not isinstance(e, RuntimeError):   # 网络/解析类,非状态码类
+                _bump_retry("other")
             if attempt < max_retries - 1:
                 wait = 2 ** attempt
                 logger.warning("LLM 调用失败(%s),%ds 后重试", e, wait)

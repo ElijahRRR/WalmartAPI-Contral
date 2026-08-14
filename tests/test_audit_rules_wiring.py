@@ -119,12 +119,21 @@ def test_pick_where_four_states():
     assert "audit_version IS DISTINCT FROM" in w
     w, _ = product_audit._pick_where({"mode": "backfill"})
     assert w == "p.audit_status IS NULL"
+    w, _ = product_audit._pick_where({"mode": "pending"})
+    # 待定专刷:只圈 pending,且**不带 1 天退避**(改完判定要立刻验证)
+    assert w == "p.audit_status = 'pending'" and "interval" not in w
 
 
 def test_pick_where_rejects_unknown_params():
     """静默吞参数 = '全量重审跑完了'的假象,宁炸不吞。"""
     with pytest.raises(ValueError, match="未识别参数"):
         product_audit._pick_where({"force_rurn": "x"})     # 手滑拼错
+
+
+def test_pick_where_rejects_unknown_mode():
+    """mode 拼错静默落回默认 = 以为在补刷、实际在跑默认候选,同样宁炸不吞。"""
+    with pytest.raises(ValueError, match="未识别 mode"):
+        product_audit._pick_where({"mode": "backfil"})     # 手滑拼错
 
 
 # ── _sync_column_blacklist 护栏(评审 P0-2;黑名单中心定稿 2026-08-13)────────
@@ -233,7 +242,9 @@ def test_resolve_pt_known_pt_second_source():
     """①b 产品行已知 PT(pt_backfill 回填的历史实证;所有者定稿:PT 长在
     产品主档不查边表):在架实证优先,行 PT 次之,废弃 PT 过闸。"""
     ctx = _ctx(pt_meta=META)
-    l1 = audit_rules.resolve_pt(ProductInfo(asin="B0X", known_pt="GoodPT"), ctx)
+    l1 = audit_rules.resolve_pt(
+        ProductInfo(asin="B0X", known_pt="GoodPT",
+                    known_pt_source="walmart_confirmed"), ctx)
     assert l1.walmart_product_type == "GoodPT"
     assert l1.pt_source == "historical_confirmed"
     both = _ctx(pt_meta=META, walmart_confirmed={"B0X": "GoodPT"})
@@ -245,18 +256,23 @@ def test_resolve_pt_known_pt_second_source():
     assert dead.walmart_product_type is None      # 行 PT 不在 pt_meta → 不采
 
 
-def test_resolve_pt_sentinel_hard_reject_after_evidence():
-    """Layer 0 哨兵:旧仓字面量三件(unknown/低/none)+ -100 hit;
-    实证命中时哨兵不生效(批复 #10 实证最优先,与旧仓'哨兵最前'有意不同)。"""
+def test_sentinel_no_longer_rejects_and_does_not_block_llm():
+    """所有者定稿 2026-08-14:映射表标注"无对应Walmart PT"**不再判死**。
+
+    那条标注是当年没数据时人工打的,不代表今天判不出来——判不出来才该
+    pending,不该拒。改为 0 分留痕,继续走候选+LLM。
+    """
     ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}))
     p = ProductInfo(asin="B0S", title="w", amazon_category_path="Dead > Path")
     l1 = audit_rules.resolve_pt(p, ctx)
-    assert l1.walmart_product_type == "unknown"
+    assert l1.walmart_product_type is None            # 不再写 'unknown' 桩值
     assert l1.hits[0].rule_code == "unmapped_amazon_path"
-    assert l1.hits[0].penalty == -100
+    assert l1.hits[0].penalty == 0                    # 只留痕
+    assert not audit_rules._blocked(l1)                # 不算判死 → 放行进第三级
+    # 无 conn(离线)⇒ 第三级跑不了 ⇒ pending,**绝不是 reject**
     out = audit_rules.audit_one(p, ctx)
-    assert out.verdict == "reject" and out.score_final == 0
-    # 实证在场 → 哨兵让位
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+    # 实证在场 → 连留痕都不打(哨兵只在解不出 PT 时才谈)
     ev = _ctx(pt_meta=META, unmapped_paths=frozenset({"Dead > Path"}),
               walmart_confirmed={"B0S": "GoodPT"})
     assert audit_rules.resolve_pt(p, ev).walmart_product_type == "GoodPT"
@@ -349,16 +365,64 @@ def test_audit_one_rerank_wiring(monkeypatch):
     monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
         {"walmart_product_type": "GoodPT", "confidence": "高"}])
     monkeypatch.setattr(
-        audit_l1_llm, "rerank",
-        lambda pr, cands, ptd, **k: audit_rules.L1Info(
+        audit_l1_llm, "rerank_ex",
+        lambda pr, cands, ptd, **k: (audit_rules.L1Info(
             walmart_product_type="GoodPT", pt_confidence="高",
-            pt_source="map_verified"))
+            pt_source="map_verified"), "ok"))
     out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert out.verdict == "pass"
     assert out.l1.walmart_category == "Home"   # 接线补 walmart_category
-    monkeypatch.setattr(audit_l1_llm, "rerank", lambda *a, **k: None)
+    # llm_failed 不重试(换候选面治不了链路故障),直接 pending
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex",
+                        lambda *a, **k: (None, "llm_failed"))
     out2 = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert out2.verdict == "pending" and out2.stage_stopped_at == "L1"
+
+
+def test_audit_one_unknown_retries_open_candidates(monkeypatch):
+    """所有者定稿:七路候选都被 LLM 否掉(unknown)→ 换开放候选面再判一次。"""
+    from services import audit_l1_llm
+    audit_l1_llm.reset_stats()
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0U", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "OtherPT", "confidence": "低"}])
+    monkeypatch.setattr(audit_l1_llm, "open_candidates", lambda conn, pr, **k: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    calls: list[list] = []
+
+    def fake_rerank_ex(pr, cands, ptd, **k):
+        calls.append(cands)
+        if len(calls) == 1:
+            return None, "unknown"          # 七路候选:LLM 全否
+        return audit_rules.L1Info(walmart_product_type="GoodPT",
+                                  pt_confidence="高",
+                                  pt_source="map_verified"), "ok"
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex", fake_rerank_ex)
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pass" and out.l1.walmart_product_type == "GoodPT"
+    assert len(calls) == 2                  # 第二次判的是开放候选面
+    assert calls[1][0]["walmart_product_type"] == "GoodPT"
+    assert audit_l1_llm.STATS["unknown_retry_called"] == 1
+    assert audit_l1_llm.STATS["unknown_retry_saved"] == 1
+
+
+def test_audit_one_unknown_retry_still_unknown(monkeypatch):
+    """二次机会也解不出 → 照旧 pending,绝不默认放行(10.2)。"""
+    from services import audit_l1_llm
+    audit_l1_llm.reset_stats()
+    ctx = _ctx(pt_meta=META)
+    p = ProductInfo(asin="B0V", title="widget", amazon_category_path="X > Y")
+    monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
+        {"walmart_product_type": "OtherPT", "confidence": "低"}])
+    monkeypatch.setattr(audit_l1_llm, "open_candidates", lambda conn, pr, **k: [
+        {"walmart_product_type": "GoodPT", "confidence": "高"}])
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex",
+                        lambda *a, **k: (None, "unknown"))
+    out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
+    assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+    assert audit_l1_llm.STATS["unknown_retry_called"] == 1
+    assert audit_l1_llm.STATS["unknown_retry_saved"] == 0
 
 
 def test_persist_run_l3_l4_columns():
@@ -465,8 +529,9 @@ def test_rerank_exit_pt_meta_gate(monkeypatch):
     def fake_rerank(pr, cands, ptd, **k):
         seen["dict"] = set(ptd)
         return audit_rules.L1Info(walmart_product_type="SpecOnlyPT",
-                                  pt_confidence="高", pt_source="map_verified")
-    monkeypatch.setattr(audit_l1_llm, "rerank", fake_rerank)
+                                  pt_confidence="高",
+                                  pt_source="map_verified"), "ok"
+    monkeypatch.setattr(audit_l1_llm, "rerank_ex", fake_rerank)
     out = audit_rules.audit_one(p, ctx, conn=object(), run_l3=False)
     assert seen["dict"] == {"GoodPT"}          # 字典收窄为 pt_meta
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"
@@ -558,13 +623,14 @@ def test_resolve_pt_path_alias_folding():
 
 
 def test_resolve_pt_alias_folds_into_sentinel():
-    """别名折到哨兵路径 → 照样 -100 硬拒(折叠只改查得到查不到)。"""
+    """别名折到哨兵路径 → 照样只留痕不判死(折叠只改查得到查不到)。"""
     drift, canon = "A > B Products > Leaf", "A > B > Leaf"
     ctx = _ctx(pt_meta=META, unmapped_paths=frozenset({canon}),
                path_alias={drift: canon})
     l1 = audit_rules.resolve_pt(
         ProductInfo(asin="B0G", amazon_category_path=drift), ctx)
     assert l1.hits[0].rule_code == "unmapped_amazon_path"
+    assert l1.hits[0].penalty == 0 and not audit_rules._blocked(l1)
     assert l1.hits[0].detail["amazon_path"] == drift   # detail 记原文不记折后
 
 
@@ -602,6 +668,50 @@ def test_catmap_mine_classify_path():
     # 冲突同样看优势度:少数派噪声不该掩盖"旧映射与实证相左"
     assert classify_path({"A": 9, "B": 1}, "B") == ("map_conflict", "A", 9)
     assert classify_path({"A": 6, "C": 4}, "B") is None     # 自身分流不算冲突
+
+
+def test_catmap_map_ambiguous_never_written():
+    """⚠ 潜伏 bug 的锁:映射表**自己**挂着多条 PT 不同的高置信行时,
+    ②级直出对该 key 已经失明(闸要求恰好一个高置信 PT)。原实现把这种 key
+    的 in_map 值取成 NULL,调用方当成"没映射过" ⇒ 会被当新映射挖出来、
+    promote 时再插第三条。现在单列一桶,只报不写。"""
+    from workflows.catmap_mine import _TIER_BY_STATUS, classify_path
+    got = classify_path({"A": 9}, None, in_map_ambiguous=True)
+    assert got == ("map_ambiguous", "A", 9)
+    assert "map_ambiguous" not in _TIER_BY_STATUS   # 无档位 ⇒ 不进 promote_rows
+
+
+def test_catmap_tier_by_status():
+    """分桶 → 置信档:高才直出,中/低只进候选交 LLM(所有者定稿 2026-08-14)。"""
+    from workflows.catmap_mine import _TIER_BY_STATUS
+    assert _TIER_BY_STATUS["mined_trusted"] == "高"
+    assert _TIER_BY_STATUS["mined_review"] == "中"    # 有真实 ASIN,票不多
+    assert _TIER_BY_STATUS["map_conflict"] == "中"    # 两条都留,LLM 挑
+    assert _TIER_BY_STATUS["mined_mixed"] == "低"     # 首选 PT 是多数派非共识
+
+
+def test_catmap_promotions_only_go_up():
+    """升档自动、降档不自动。证据可能只是**暂时**变薄(pt_source 回填没跑完、
+    本轮只挖了子集),据此自动降档会让 ②级直出对整个类目静默失效;高置信行
+    也可能是人工定的,机器不该拿一轮统计推翻人的判断。"""
+    from workflows.catmap_mine import plan_promotions
+    rows = [
+        ("A > B", "PT1", "n1", "高", "mined_trusted"),   # 新增
+        ("C > D", "PT2", "n2", "高", "mined_trusted"),   # 中 → 高:升档
+        ("E > F", "PT3", "n3", "中", "mined_review"),    # 已是高:跳过(不降)
+        ("G > H", "PT4", "n4", "中", "mined_review"),    # 同档:跳过(幂等)
+    ]
+    existing = {("C > D", "PT2"): "中", ("E > F", "PT3"): "高",
+                ("G > H", "PT4"): "中"}
+    planned, stat = plan_promotions(rows, existing)
+    assert stat == {"新增": 1, "升档": 1, "跳过(档位未提升)": 2}
+    assert [(r[0], r[3]) for r in planned] == [("A > B", "高"), ("C > D", "高")]
+    # 血统标记保持存量值:改名只会把同一来源的行分成两批,没有任何好处
+    assert planned[0][4] == "mined_products"
+    # 重跑幂等:把上一轮的结果当现状,应该一条都不写
+    again, stat2 = plan_promotions(rows, {**existing, ("A > B", "PT1"): "高",
+                                          ("C > D", "PT2"): "高"})
+    assert again == [] and stat2["跳过(档位未提升)"] == 4
 
 
 def test_catmap_sibling_verdict_and_parent():
@@ -715,3 +825,133 @@ def test_history_fold_sql_invariants():
     assert "occurred_at" in f._INSERT_SQL                # 带原始时间戳
     # 擦净重灌只许删自己 source 的行(账本只追加的唯一例外,范围必须钉死)
     assert f.SOURCE == "audit_history_fold"
+
+
+def test_pt_provenance_splits_evidence_from_inference():
+    """PT 来源两分道(所有者定稿 2026-08-14):只有沃尔玛真接受过的算实证。
+
+    映射直查/LLM rerank 都是推断——把推断当实证写回产品行,catmap_mine
+    会拿它投票挖进映射表,一次猜错永久固化(A 推出 B、B 又去证明 A)。
+    """
+    def _o(src):
+        return AuditOutcome(asin="B0", verdict="pass", score_final=100,
+                            stage_stopped_at=None,
+                            l1=L1Info(walmart_product_type="GoodPT",
+                                      pt_source=src))
+    assert audit_store.pt_provenance(_o("walmart_confirmed")) == "walmart_confirmed"
+    assert audit_store.pt_provenance(_o("historical_confirmed")) == "walmart_confirmed"
+    for inferred in ("map_node", "map_direct", "llm", None):
+        assert audit_store.pt_provenance(_o(inferred)) == "audit_llm"
+    # 没有真 PT 可写 → 不动 pt_source(桩值/unknown)
+    stub = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                        stage_stopped_at="L0",
+                        l1=L1Info(walmart_product_type="(phase0_blocked)"))
+    assert audit_store.pt_provenance(stub) is None
+
+
+def test_known_pt_splits_evidence_from_cached_inference():
+    """①b 级按 pt_source 分道:沃尔玛回执才算实证,上一轮 LLM 结论只是缓存。
+
+    不分道 = "LLM 猜一个 → 下轮以高置信实证复述",猜错会被自己反复确认,
+    而且从 runs 里看不出来(所有者 2026-08-14 追问)。
+    """
+    ctx = _ctx(pt_meta=META)
+    ev = audit_rules.resolve_pt(
+        ProductInfo(asin="B0K", known_pt="GoodPT",
+                    known_pt_source="walmart_confirmed"), ctx)
+    assert ev.pt_source == "historical_confirmed" and ev.pt_confidence == "高"
+    for src in ("audit_llm", None, ""):
+        cached = audit_rules.resolve_pt(
+            ProductInfo(asin="B0K", known_pt="GoodPT", known_pt_source=src), ctx)
+        assert cached.walmart_product_type == "GoodPT"   # 仍直出(不重付 LLM)
+        assert cached.pt_source == "audit_cached" and cached.pt_confidence == "中"
+    # 缓存推断写回时仍记 audit_llm——不会因为"存过一轮"就升格成实证
+    out = AuditOutcome(asin="B0K", verdict="pass", score_final=100,
+                       stage_stopped_at=None,
+                       l1=L1Info(walmart_product_type="GoodPT",
+                                 pt_source="audit_cached"))
+    assert audit_store.pt_provenance(out) == "audit_llm"
+
+
+def test_adopt_only_requires_backfill_and_skips_judging():
+    """adopt_only:只采用历史结论、零 LLM(所有者 2026-08-14:86 万可采用
+    vs 33 万要真判,混在一起跑等于为了采用顺带付 33 万次 LLM)。"""
+    with pytest.raises(ValueError, match="只在 mode=backfill"):
+        product_audit.run({"adopt_only": "1"})
+    assert "adopt_only" in product_audit._KNOWN_PARAMS
+
+
+def test_adopt_history_batches_updates():
+    """采用走 executemany:86 万条逐行往返要几十分钟。"""
+    import inspect
+    src = inspect.getsource(product_audit._adopt_history)
+    assert "adopt_rows.append" in src and "executemany(_ADOPT_SQL" in src
+    assert "conn.execute(_ADOPT_SQL" not in src      # 逐行版必须已移除
+
+
+def test_adopt_only_narrows_candidates_to_rows_with_history():
+    """只采用模式必须只挑有历史的行:否则没历史的那批每轮都排在前面重复捞
+    (生产实测采用率 122k→25k 一路塌)。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_HAS_HISTORY_SQL" in src
+    has = product_audit._HAS_HISTORY_SQL
+    assert "audit.audit_runs" in has and "r.asin = p.asin" in has
+    assert "IS DISTINCT FROM 'SHORTCUT'" in has     # 影子行不算历史结论
+
+
+def test_worker_cap_warns_instead_of_silently_clamping(caplog):
+    """超上限必须告警:静默钳制 = 拿着错的数做并发决策(生产实测:所有者
+    用 workers=32 测吞吐,实际跑 16 而输出只字未提)。"""
+    import logging
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_MAX_WORKERS" in src and "超上限,实际用" in src
+    assert product_audit._MAX_WORKERS >= 32     # I/O 密集,远超核数是正常的
+
+
+def test_llm_retry_stats_are_counted():
+    """退避不能静默:撞限流只表现为变慢,不计数就看不出来。"""
+    from api import llm
+    llm.reset_retry_stats()
+    assert llm.RETRY_STATS == {"http_429": 0, "http_5xx": 0, "other": 0}
+    llm._bump_retry("http_429")
+    assert llm.RETRY_STATS["http_429"] == 1
+
+
+def test_adopt_never_overwrites_walmart_confirmed_pt():
+    """生产事故 2026-08-14:采用历史结论把 pt_backfill 回填的 9 万条沃尔玛
+    回执实证覆盖成旧系统推断,来源一并降级,挖掘燃料 16.8 万腰斩到 7.7 万。
+    采用的是我们自己旧系统的推断,压不过沃尔玛回执。"""
+    sql = product_audit._ADOPT_SQL
+    assert "WHEN pt_source = 'walmart_confirmed' THEN walmart_pt" in sql
+    assert "WHEN pt_source = 'walmart_confirmed' THEN pt_source" in sql
+    # 审核结论回写同一条不变量
+    assert "pt_source = 'walmart_confirmed'" in audit_store._PRODUCT_SQL
+
+
+def test_pt_backfill_evidence_overwrites_inference():
+    """实证优先于推断:回执可以覆盖 audit_llm 行(也是上面那次事故的修复通道)。"""
+    from workflows import pt_backfill
+    sql = pt_backfill._UPSERT_SQL
+    assert "pt_source = 'walmart_confirmed'" in sql
+    assert "pt_source IS DISTINCT FROM 'walmart_confirmed'" in sql
+
+
+def test_run_commits_in_segments_with_progress():
+    """生产事故 2026-08-14:34 万行判在同一个未提交事务里 —— 外部查不到任何
+    进度、Ctrl-C 全部回滚(半小时 LLM 费用打水漂)、长事务还挡住 vacuum。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "_COMMIT_EVERY" in src and "conn.commit()" in src
+    assert "进度 %d/%d" in src                     # 日志可见,不必查库
+    assert 0 < product_audit._COMMIT_EVERY <= 2000  # 段太大就退化回老问题
+
+
+def test_retry_summary_only_calls_429_ratelimit():
+    """只有 http_429 才叫撞限流(生产实测:19 次 other 被说成"已撞限流",
+    把所有者引向降并发 —— 而网络抖动降并发毫无用处)。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert 'retries.get("http_429")' in src
+    assert "降并发解决不了" in src

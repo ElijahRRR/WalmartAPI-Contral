@@ -130,15 +130,194 @@ def test_taxonomy_parse_rows():
             {"browse_node_id": "", "类目名": "无 ID 应跳过"},
             {"browse_node_id": "999", "类目名": "新 node", "父节点ID": "553220"}],
     }
-    rows, stat = parse_rows(data)
+    rows, paths, stat = parse_rows(data)
     assert stat == {"leaves": 1, "verified_added_paths": 1,
-                    "unverified_new_nodes": 1, "skipped": 1}
+                    "unverified_new_nodes": 1, "skipped": 1, "paths": 2}
+    assert len(paths) == 2                         # 无「完整路径」的行不进路径表
     by_node = {r[0]: r for r in rows}
     assert by_node["121475272011"][1] == "Amazon Device Subscriptions"  # 先到先得
     assert by_node["121475272011"][4] is None      # 'L1_xxx' 占位 → NULL
     assert by_node["121475272011"][5] is True      # 是否叶子='是'
     assert by_node["553220"][4] == "551238" and by_node["553220"][5] is False
     assert by_node["999"][8] == "unverified_new_nodes"   # source 分段留痕
+
+
+def test_derive_nodes_zips_chain_with_breadcrumb():
+    """ID 链 × 面包屑右对齐还原中间层:node/名/父/深度/路径/是否叶。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    acc, stat = derive_nodes([("1,2,3", "A > B > C", 7)])
+    assert stat == {"链-段=+0": 7}
+    assert resolve("2", acc["2"]) == ("2", "B", "A > B", 2, "1", False, "A", 7)
+    assert resolve("3", acc["3"])[5] is True          # 末段=叶
+    assert resolve("1", acc["1"])[4] is None          # 根级无父
+
+
+def test_derive_nodes_right_anchors_on_length_gap():
+    """长度不等按叶子右对齐:链多出的头段不采信,但可当最顶层的父 ID。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    # 链多一段(带了不出现在面包屑里的根 node)
+    acc, stat = derive_nodes([("0,1,2", "A > B", 3)])
+    assert stat == {"链-段=+1": 3}
+    assert "0" not in acc                              # 没名字的段不入库
+    assert resolve("1", acc["1"])[4] == "0"            # 但仍当父 ID 用
+    # 面包屑多一段(促销层/多余的头) → 只取后 k 段,不错位
+    acc2, stat2 = derive_nodes([("1,2", "X > A > B", 3)])
+    assert stat2 == {"链-段=-1": 3}
+    assert resolve("1", acc2["1"])[1] == "A"
+    assert resolve("2", acc2["2"])[2] == "X > A > B"   # 路径仍用完整面包屑
+
+
+def test_derive_nodes_majority_vote_on_drifting_names():
+    """同 node 名称漂移 → 按产品数取多数票(catpath 的漂移在这里收敛)。"""
+    from workflows.taxonomy_derive import derive_nodes, resolve
+    acc, _s = derive_nodes([
+        ("1,2", "H & K > Home Décor Products", 30),
+        ("1,2", "H & K > Home Décor", 100),
+    ])
+    assert resolve("2", acc["2"])[1] == "Home Décor"
+    assert resolve("2", acc["2"])[7] == 130            # 产品数累加
+
+
+def test_taxonomy_keeps_multi_parent_paths():
+    """DAG 不是树:同一 node 挂在多个父下 → 节点行一条、路径行各一条。
+
+    所有者定稿 2026-08-14:按 browse_node_id 简单去重会丢掉多路径关系,
+    父链回退就会退到错误的祖先。
+    """
+    from workflows.taxonomy_import import parse_rows
+    row = lambda p, path: {                          # noqa: E731
+        "browse_node_id": "553220", "类目名": "Belts", "完整路径": path,
+        "深度": "3", "父节点ID": p, "是否叶子": "是", "L1 根类目": path[:4]}
+    rows, paths, stat = parse_rows({"nodes": [
+        row("11", "Clothing > Men > Belts"),
+        row("22", "Automotive > Belts, Hoses & Pulleys > Belts"),
+        row("22", "Automotive > Belts, Hoses & Pulleys > Belts"),   # 重复行
+    ]})
+    assert len(rows) == 1 and stat["nodes"] == 1     # 节点级属性一行
+    assert stat["paths"] == 2 and len(paths) == 2    # 两个挂载点各一行
+    assert {p[1] for p in paths} == {"11", "22"}
+    assert rows[0][4] == "11"                        # 代表路径取先到的那条
+
+
+def test_taxonomy_parses_unknown_section_with_nodes():
+    """段名陌生但行里带 browse_node_id → 照收(写死段名漏过 32,147 行的教训)。"""
+    from workflows.taxonomy_import import data_sections, parse_rows
+    data = {"meta": {"x": 1}, "leaves": [{"browse_node_id": "1", "类目名": "A"}],
+            "nodes": [{"browse_node_id": "2", "类目名": "B"}],
+            "notes": ["纯文本段不算数据段"]}
+    assert data_sections(data) == ["leaves", "nodes"]
+    rows, _paths, stat = parse_rows(data)
+    assert {r[0] for r in rows} == {"1", "2"} and stat["nodes"] == 1
+
+
+def test_derive_path_rows_keep_every_mount():
+    """反推侧同理:(父, 路径) 成对计票,每个挂载点各出一行。"""
+    from workflows.taxonomy_derive import derive_nodes, path_rows, resolve
+    acc, _s = derive_nodes([
+        ("11,9", "Clothing > Belts", 50),
+        ("22,9", "Automotive > Belts", 20),
+    ])
+    got = path_rows("9", acc["9"])
+    assert len(got) == 2
+    assert {(p[1], p[2]) for p in got} == {
+        ("11", "Clothing > Belts"), ("22", "Automotive > Belts")}
+    assert all(p[3] == 2 for p in got)               # 深度逐条自算
+    assert resolve("9", acc["9"])[4] == "11"         # 代表路径 = 票多的那条
+
+
+def test_taxonomy_survey_reports_shape_of_unparsed_sections():
+    """未解析的段要连**形状**一起报:只说"不是带 node 的清单"定位不到原因
+    (所有者第二轮实测:nodes 段仍未解析,但看不出是字段名不同还是别的)。"""
+    from workflows.taxonomy_import import survey_file
+    out = "\n".join(survey_file({
+        "meta": {"reconciled_tree_rows": 5},
+        "leaves": [{"browse_node_id": "1", "类目名": "A"},
+                   {"browse_node_id": "2", "类目名": "B"}],
+        "internal_nodes": [{"cat_id": "9", "label": "X"}],
+        "notes": ["纯文本"],
+    }))
+    assert "leaves: 2 行(解析" in out
+    # 键必须全列且带条数(截断不声明 = 照着不全的键列写错解析预期)
+    assert "internal_nodes: 1 行 ⚠" in out and "行键(2):cat_id / label" in out
+    assert "notes: 1 行 ⚠" in out and "元素不是 dict(是 str)" in out
+    assert "meta 自报:reconciled_tree_rows=5" in out
+    assert "解析到去重 node 2" in out and "差 3" in out
+
+
+def test_reconciled_file_fixture_end_to_end():
+    """照**真实文件结构**的样例过一遍(段名/行键/首行空 ID/缺路径段全复刻)。
+
+    2026-08-14 所有者指出:样例在手就该照结构写,不该让他在部署机上试三轮。
+    这份 fixture 就是那三个坑的回归位——段名陌生、首行 ID 为空、段间字段缺省。
+    """
+    import json
+    from pathlib import Path
+    from workflows.taxonomy_import import data_sections, parse_rows, survey_file
+
+    data = json.loads((Path(__file__).parent / "fixtures"
+                       / "taxonomy_reconciled_sample.json").read_text("utf-8"))
+    assert data_sections(data) == ["leaves", "verified_added_paths",
+                                   "unverified_new_nodes", "nodes"]
+    rows, paths, stat = parse_rows(data)
+    by_node = {r[0]: r for r in rows}
+    # L1 根类目行既无 ID 也无父(文件用 L1_<slug> 占位)→ 照实跳过,不猜
+    assert stat["skipped"] == 1 and "1055398" not in by_node
+    # 跳过的行必须原样打样本(猜它们长什么样已经错过两次)
+    survey = "\n".join(survey_file(data))
+    assert "↳ 被跳过样例:" in survey and "类目名=Home & Kitchen" in survey
+    # 中间层只在 nodes 段里,必须收进来(原来整段被丢 = 父链断)
+    assert by_node["1063278"][1] == "Home Décor" and by_node["1063278"][5] is False
+    # 叶子的节点级属性以 leaves 段为准(is_leaf 只有那段是权威)
+    assert by_node["3736081"][5] is True and by_node["3736081"][8] == "leaves"
+    # 只有 ID+名字的段在前,路径由后面的段补(此例 nodes 段无此 node → 仍为空)
+    assert by_node["999000111"][2] is None
+    # DAG:同名同 ID 的 Belts 挂在两个父下 → 节点一行、路径两行
+    belts = [p for p in paths if p[0] == "2474937011"]
+    assert len(belts) == 2 and {p[1] for p in belts} == {"2474936011", "15709631"}
+    assert len([r for r in rows if r[0] == "2474937011"]) == 1
+
+
+def test_later_section_backfills_missing_fields():
+    """先到先得只管冲突不管缺省:只有 ID+名字的段在前,后面带路径的段要能
+    把路径/父/深度补上(否则段序一变结果就变)。"""
+    from workflows.taxonomy_import import parse_rows
+    rows, _p, _s = parse_rows({
+        "unverified_new_nodes": [{"browse_node_id": "9", "类目名": "新 node"}],
+        "nodes": [{"browse_node_id": "9", "类目名": "新 node",
+                   "完整路径": "A > B", "父节点ID": "8", "深度": "2",
+                   "L1 根类目": "A"}],
+    })
+    assert rows[0][2] == "A > B" and rows[0][3] == 2 and rows[0][4] == "8"
+    assert rows[0][8] == "unverified_new_nodes"      # 归属段仍是先到的那个
+
+
+def test_section_sniff_looks_past_an_idless_first_row():
+    """段的判定要看全段:首行 node 值为空(根类目占位)不代表整段不是数据段
+    ——所有者第三轮实测,nodes 段就是这样被漏掉的。"""
+    from workflows.taxonomy_import import (data_sections, parse_rows,
+                                           survey_file)
+    data = {"nodes": [
+        {"browse_node_id": "", "类目名": "根占位", "完整路径": "Root"},
+        {"browse_node_id": "553220", "类目名": "Handsaws",
+         "完整路径": "Tools > Handsaws", "父节点ID": "551238"},
+    ]}
+    assert data_sections(data) == ["nodes"]
+    rows, _paths, stat = parse_rows(data)
+    assert [r[0] for r in rows] == ["553220"] and stat["skipped"] == 1
+    assert "**1 行无 node 值将跳过**" in "\n".join(survey_file(data))
+
+
+def test_taxonomy_reads_dict_shaped_and_english_keys():
+    """段可以是 dict{node_id: {…}};字段名认正式下发规格的英文列名。"""
+    from workflows.taxonomy_import import data_sections, parse_rows
+    data = {"amazon_all_nodes": {
+        "553220": {"name": "Handsaws", "full_path": "Tools > Handsaws",
+                   "parent_node_id": "551238", "depth": 2, "is_leaf": True}}}
+    assert data_sections(data) == ["amazon_all_nodes"]
+    rows, paths, _stat = parse_rows(data)
+    assert rows[0][:2] == ("553220", "Handsaws")     # 字典键补成 node_id
+    assert rows[0][5] is True                        # is_leaf 布尔真也认
+    assert paths[0][:3] == ("553220", "551238", "Tools > Handsaws")
 
 
 def test_sibling_swap_distinguishes_rename_from_category_change():

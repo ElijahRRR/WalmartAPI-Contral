@@ -12,7 +12,7 @@
   (金额=合计,佣金率/优惠/账期=最近账期值;逐账期明细留在 PG)。
 - 键补齐两张:主订单表、采购信息只建缺失的 order_line_id 行(只写键列),
   其余列全归人工与关联字段,永不更新。
-- **任何表都不删行**(sync_by_key delete_stale=False):主订单表是永久枢纽,
+- **任何表都不删行**(_sync_stateful 压根不实现删除):主订单表是永久枢纽,
   行间有关联字段,删行断链;滑出窗口的行只是停止刷新。
 - 只覆盖 registry 登记的程序字段;人工列/采集列/关联字段不出现在载荷里,
   绝不会被碰。售后表键 = RMA号|order_line_id(需在表中补「唯一键」字段)。
@@ -179,6 +179,17 @@ def _adapt_rows(table, desired: dict[str, dict]) -> dict[str, dict]:
 
 
 # ── 本地同步状态(ops.feishu_sync_state):日常零拉表 ─────────────────────────
+# **这是飞书投影同步的唯一实现路径**(所有者定稿 2026-08-14)。
+# 曾经并存过一份通用版 `api/feishu.sync_by_key` / `ensure_keys`(与本文件同一个
+# 提交落地,零生产调用),违反 CLAUDE.md「每个能力只有一条实现路径」,已删除。
+# 两者不是抄了两份,是两种策略:通用版**每轮全量拉飞书表**现建键→record_id 映射,
+# 本地版拿一张 PG 状态表把这个开销换掉——订单中心六表是万行级高频推送,
+# 每轮拉全表要走飞书分页并吃速率限制。代价是要维护状态一致性,所以配了自愈
+# (写失败即清状态,下轮全量对账重建)。
+# 通用版唯一值得留的是「登记错表守卫」,已移植进 _bootstrap_state。
+# **将来若第二张表也要这套同步**:那时才把本文件的私有实现上收进 `services/`
+# (状态表读写属持久化编排,不属 api 层职责),而不是重新写一份通用版。
+# 只有一个消费方时先建积木 = 投机性抽象,等第二个消费方出现才知道该抽什么。
 # 键 → (record_id, 上次写入指纹)。推送时现算载荷指纹与存的比:一致跳过,
 # 不一致按 record_id 更新,新键建行并回存 record_id。
 # 自愈:状态为空(首轮/被清)→ 全量拉表重建映射(record_id 取自飞书,
@@ -225,7 +236,9 @@ def _bootstrap_state(table, *, with_hash: bool = True) -> dict:
     names = [key_field] + ([_HASH_FIELD] if with_hash else [])
     state: dict[str, tuple[str, str | None]] = {}
     dupes = 0
+    seen = 0
     for rec in feishu.list_records(table, field_names=names):
+        seen += 1
         k = feishu._plain_text(rec["fields"].get(key_field)).strip()
         if not k:
             continue
@@ -235,6 +248,14 @@ def _bootstrap_state(table, *, with_hash: bool = True) -> dict:
         h = (feishu._plain_text(rec["fields"].get(_HASH_FIELD)).strip() or None) \
             if with_hash else None
         state[k] = (rec["record_id"], h)
+    if seen and not state:
+        # 登记错表守卫(2026-08-14 从已删除的 feishu.sync_by_key 移植过来):
+        # 表里明明有行,却**一行都读不出键字段** ⇒ 大概率 .env 里 table_id 填错、
+        # 指向了别人的表。此时状态是空的,下一步会把窗口内全部行当"缺失"新建
+        # ——把人家的表写坏,而且不可逆。宁可炸也不要写。
+        raise feishu.FeishuError(
+            None, f"表「{table.name}」现有 {seen} 行均无「{key_field}」字段值,"
+                  f"疑似 table_id 登记错表,拒绝同步(会写坏对方数据)")
     if dupes:
         logger.warning("表「%s」对账发现 %d 行重复键(纪律要求不复制行),"
                        "已按首条对齐,请人工清理", table.name, dupes)

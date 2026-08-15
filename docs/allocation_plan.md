@@ -472,13 +472,104 @@ fba/fbm——填什么就只给该店分配该渠道的产品。落地:registry 
 矛盾。有订单史的产品:销量/退款率正常参与加减分。类目需求基线/季节性同理,
 只用已有订单聚合,稀疏类目自动回退全局均值。
 
+### 14. 实现校准(2026-08-15;main 迁入审核+类目映射后的七路调研)
+
+> 背景:main 把**审核系统整库迁进本仓**(audit schema 16 表,audit_import 已
+> 生产实跑 614 万行)并落地整套类目映射(catmap_*)。本节逐条修订被冲掉的
+> 设计,证据均为 文件:行号。**与本节冲突的前文一律以本节为准。**
+
+**① audit_sync 撤销**(§十一.3 / §十三 A0.1 作废)。审核结论不再跨库拉取:
+本仓 `workflows/product_audit.py` + `services/audit_store.write_conclusion`
+直接写 `catalog.products` 审核列。工作流与 `WALMART_AUDIT_DSN` 已随合并
+`5786035` 移除;`registry/db.legacy_audit_conn` 只用于搬迁对账。
+
+**② 结论词表三套,按落点分别用**(§十一.3 "verdict pass/reject/pending" 失准):
+`audit.audit_runs.verdict` = pass/reject/pending;
+**`catalog.products.audit_status` = approved/rejected/pending**(候选池按这套,
+`services/audit_store.py:19-20`);飞书上架表 E 列 = `pass`(`list_new.py:285`)。
+
+**③ 候选池谓词补两道**(§十二.12① "全齐" 失准):除 `audit_status='approved'`
+外必须加 `title` 非空(排 `pt_backfill` 造的占位行,`product_audit.py:84,88-92`)
+与 `walmart_pt <> 'unknown'`(旧系统量产字面量,`catalog_health.py:34` 同款);
+另建议加 `PT ∈ services/pt_spec.known_pts()`——否则分配写进上架表的行会被
+list_new 第一道闸淘汰(飞书 PT 字典 ⊇ Walmart spec)。
+
+**④ 45 天 TTL 已废除**(§十一.3③ 失准):改 hash 驱动重审
+(`docs/audit_migration_plan.md:215`),`rejected` 永不自动重审;重采致
+`slow_hash` 变更会把 approved 自动翻 pending(`services/product_ingest.py:62-71`)
+⇒ **落 claims 必须快照 `audit_version`/`audited_at`**(占用无自动释放)。
+
+**⑤ 类目权威二选一 + 必须对拍**(§三.1 "零新依赖" 失准):设计稿指定的
+`catalog.risk_product_types.category` 是**唯一有日更通道**的(risk_sync),
+沿用;但 main 搬进来的 `audit.walmart_pt_meta.walmart_category` 才是审核链
+在读的那本(`services/audit_rules.py:139-142`),两本入库通道不同、漂移无人
+监控 ⇒ A0.5 报告加对拍项。**"27 个大类"在仓内不存在**,取值域以报告实测为准
+(`store_categories.walmart_category` 因此不加 CHECK 约束)。
+
+**⑥ pt_source:推断 PT 可用于"进已有类目",不可用于"开新类目"**(最要紧的一条)。
+`catalog.products.pt_source` 只有 `walmart_confirmed`/`audit_llm`/NULL
+(`services/audit_store.py:96-101` 把 L1 五级来源压平成两值)——**"映射表 node
+三闸精确命中"与"LLM 裸猜"在这一层同值**,细粒度只在 `audit.audit_runs.pt_source`。
+判定:
+- a) 分配的类目约束 = `products.walmart_pt` → `risk_product_types.category`,
+  **不分 pt_source**(该 PT 本就是 list_new 要提交给沃尔玛的那个,分配没有
+  额外制造风险);
+- b) **唯独"开新大类"这一个动作**(store_categories 1→2)要求触发组主 PT 为
+  `walmart_confirmed`,或 runs 最新一条 ∈ {walmart_confirmed, historical_confirmed,
+  map_node}——理由:错上架只是一条 feed 失败,错开类目会**永久烧掉**一家店
+  两个类目槽之一(占用无自动释放);
+- c) `claims` 与 `allocation_items` 必须快照 PT + pt_source + audit_version
+  (映射表是活表,`catmap_mine/catmap_fix` 在写,同一 ASIN 跨批可能拿到不同 PT);
+- d) **绝不反向**:分配结果不得回写 `pt_source`、不得作为 catmap_mine 票源
+  (`workflows/product_audit.py:122-127` 的自我印证事故先例)。
+
+**⑦ 评分/评论数在本仓零证据**(§十一.2 / §十二.5 失准):采集契约 v1 字段表
+无此二字段(`docs/scraper_migration_brief.md:95-105`),全仓无代码读它们。
+`alloc_audit` 的 P2 探针实测决定这两项进不进 v1 权重——**探针为 0 就删掉,
+禁止 `or 0`**。
+
+**⑧ 价格带不是产品分信号**,是**店×产品闸**(倍率按店配置,
+`services/pricing.py:31-33`);且出界已不淘汰(按 300% 记)。产品分里能用的
+只有"落地价算不算得出来"(price 与 shipping 双非空)。
+
+**⑨ health_i 无可用输入**(§十二.3 "数据源全部已在库" 失准):KPI 8 率的列在库
+但**阈值零实现**(`docs/backlog.md:118` 暂放),且 NULL 有两义(无合规数据 vs
+拉取失败)代码不区分 ⇒ v1 把 `health_i` 降级为二值(ACTIVE=1),8 率只进方案表
+展示列,`need_i` 改 `w_gap/w_room` 二项归一。
+
+**⑩ 店铺状态闸拦不住死店**:`store_kpi_daily` 只有活店在写,凭证表已删的店
+状态永远停在最后一次 ACTIVE ⇒ 状态闸必须再 AND `store ∈ stores.load_stores()`。
+
+**⑪ 全局销量维度差一个前置**(§十二.10 的产品/品牌/类目三视图):
+`orders.order_lines` **无 asin 列**,而 sku→asin 只有 Python 实现
+(`services/sku_asin.py` 唯一出处,SQL 侧重写=复制规则)⇒ **A2 前必须先给
+order_lines 加 asin 列 + 一个 `order_asin_normalize` 工作流**(照
+`workflows/sku_normalize.py` 先例:只补 NULL、numeric 走 item_id 倒查、
+查不到留 NULL 不猜)。这是独立一批,不塞进 A2。店×类目视图不受影响(走
+walmart_items 主路)。
+
+**⑫ 上架表写入两处硬约束**:①五个现成写函数全部按 rownum 定点写,**无一能
+新建行**——追加新行要照 `services/maint_sheet.append_records` 的水位模式另写
+(`ops.cursors` 水位 + 逐 50 行验空 + 500 行/块 + 每块落水位);②分配要写的
+A/B/D/E 四列**正是审核批次 D 投影的目标列**(`product_audit.py:16-18` 明写
+"投影在批次 D 切换日开闸")⇒ **写列权责必须与批次 D 同一次拍板**,否则
+投影器与分配器互相覆盖。③事件账本无分配语义码,留痕前先登记
+(`services/product_events.py` `record_many` 对未登记码抛错)。
+
+**⑬ 品牌占用键定稿**(Q7 落地):`services/brand_key`(2026-08-15 新建,唯一
+出处)= `" ".join(raw.lower().split())`(与 `audit_phase0._normalize_brand`
+同算法,占用键与黑名单键必须同串)+ **占位符表取并集**(phase0 的 20 项 ∪
+mp_mapper 的 `unknown`)+ brand 占位符时用 manufacturer 兜底(真品牌常在那,
+`risk_gate.check` 双字段实证同源);两者皆占位符 = 真·无品牌,**不占品牌**
+只占产品。方向性理由:漏合并只是排他失效一次,误合并会把上万无关产品永久
+锁进一家店。
+
 ## 十三、修订批次(动工顺序;§八原文保留作历史)
 
-- **A0 数据接线**(全部只读/幂等,零沃尔玛写操作,2026-08-12 拍板后动工;
-  **[x] 1~4 代码就绪 2026-08-12(561 测试全过),待生产验收**):
-  1. [x] `audit_sync`:直连 walmart_audit 拉审核结论 → products.audit_* 五列
-     (§十一.3)。验收:.env 配 `WALMART_AUDIT_DSN` → `-p limit=100` 冒烟 →
-     全量跑 → 抽查五列与缺行数;
+- **A0 数据接线**(全部只读/幂等,零沃尔玛写操作,2026-08-12 拍板后动工):
+  1. ~~audit_sync~~ **已撤销**(2026-08-15,§十二.14①):main 把审核系统整库
+     迁入本仓,审核结论由 `product_audit` 直接写 `catalog.products`,跨库
+     回流工作流失去意义,已随合并 `5786035` 删除;
   2. [x] 店铺目标三列:RETIRE_LIMITS 登记 target_gmv_daily/target_orders_daily/
      max_online 字段常量(读取积木随 A2 引擎实现,避免只写不读的僵尸);
   3. [x] `order_history_import`:两年订单 excel 一次性入库(Q3 文件表头当日
@@ -492,7 +583,10 @@ fba/fbm——填什么就只给该店分配该渠道的产品。落地:registry 
      ASIN 数一致(注意 30 天保留期,尽快泵);
   5. [ ] 复用既有待办:daily_report 全店化 + 挂调度、product_ingest 挂调度
      (plan.md/backlog 已列;分配依赖这两条链保鲜)。
-- **A0.5 存量冲突审计 + 过渡方案**(只读报告,不写 claims;A0.1 后即可跑):
+- **A0.5 存量冲突审计 + 过渡方案** —— **[x] 代码就绪 2026-08-15:
+  `python cli.py alloc_audit`**(只读;P 探针四项把设计稿假设换成实测 +
+  A 审计七项;`-p sample=N` 调样例条数、`-p channel=0` 跳过最慢的渠道探测)。
+  报告内容(只读报告,不写 claims;产品/审核数据就位后即可跑):
   ① 同 ASIN 跨店在线 ② 同品牌跨店在线(walmart_items ⋈ sku_asin ⋈
   products.brand)③ 每店大类分布(walmart_items.product_type →
   risk_product_types.category)+ 超 2 类目店清单 ④ 处置建议列
@@ -505,10 +599,18 @@ fba/fbm——填什么就只给该店分配该渠道的产品。落地:registry 
   (dangerous/dry-run/防重全套既有纪律),节奏放缓让店铺平稳过渡;
   过渡执行不新造工作流,A0.5 报告输出直接兼容 product_clear 的输入格式。
 - **A1 占用台账地基**(§八 A1 + 追加:claims + store_categories +
-  services/claims + list_new 占用闸 + store_release(整店释放同步标
-  walmart_items missing_since,§十二.11;渠道是飞书配置不归它管)+
-  审计对拍)。
-- **A2 分配引擎**(§十二;依赖 A0 全部到位)。
+  services/claims(品牌键复用 2026-08-15 已建的 `services/brand_key`)+
+  list_new 占用闸 + store_release(整店释放同步标 walmart_items
+  missing_since,§十二.11;渠道是飞书配置不归它管)+ 审计对拍;
+  claims 行须快照 PT/pt_source/audit_version,§十二.14⑥c)。
+- **A1.5 订单 ASIN 归一**(§十二.14⑪,A2 的硬前置):`orders.order_lines`
+  加 asin 列 + `order_asin_normalize` 工作流(照 `workflows/sku_normalize.py`
+  先例:只补 NULL、numeric 走 walmart_items.item_id 倒查、查不到留 NULL 不猜)
+  ——否则产品/品牌/类目三个全局销量维度一个都建不出来(店×类目维度不受影响,
+  它走 walmart_items 主路)。
+- **A2 分配引擎**(§十二 + §十二.14 的全部修订;依赖 A0/A1/A1.5 到位。
+  引擎前置读取件已就绪:`services/store_targets`(目标四列 loader)、
+  `services/brand_key`(占用键))。
 - **A3 学习型**(远景不变;allocation_runs/items 快照从 A2 第一天就落)。
 
 ## 十四、已拍板(2026-08-12 所有者八条答复,当日问当日决)

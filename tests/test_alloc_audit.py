@@ -320,6 +320,8 @@ class _FakeCur:
             self._rows = list(ITEMS)
         elif "store_kpi_daily" in sql:
             self._rows = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE")]
+        elif "GROUP BY store ORDER BY n DESC" in sql:      # A8 订单店名对账
+            self._rows = [("A085", 30, 30), ("旧名店", 5, 5)]
         elif "FROM orders.order_lines" in sql:
             # A085 的那件卖过,A107 的同款没卖过 → 冲突留 A085
             self._rows = [] if self._no_sales else [("A085", "B0AAAA0001", 3, 120.0)]
@@ -393,7 +395,8 @@ def test_run_end_to_end_report(monkeypatch):
     # 七节都在
     for tag in ("P1 候选池", "P2 打分信号", "P3 PT 字典对拍", "P4 品牌占用键",
                 "A0 在线行", "A1 同 ASIN", "A2 同品牌", "A3 每店大类",
-                "A4 不在册店冻结行", "A5 渠道对拍", "A6 店铺配置", "A7 店铺状态"):
+                "A4 不在册店冻结行", "A5 渠道对拍", "A6 店铺配置", "A7 店铺状态",
+                "A8 订单店名对账"):
         assert tag in out, tag
     # 评分/评论探针为 0 → 必须点名删权重(禁止 or 0)
     assert "禁止 or 0" in out
@@ -402,6 +405,8 @@ def test_run_end_to_end_report(monkeypatch):
     assert "DEAD1×1" in out
     # A7:A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
     assert "非 ACTIVE 的 0 家" in out
+    # A8:订单里的"旧名店"不在凭证表 → 点名(它的销量进不了店×类目维度)
+    assert "对不上 1 家、5 行" in out and "旧名店×5" in out
 
 
 def test_run_degrades_when_pt_dict_fails(monkeypatch):
@@ -475,3 +480,13 @@ def test_run_warns_when_credential_table_unreadable(monkeypatch):
     out = wf.run({})
     assert "本轮未排除已不在册店的冻结行" in out
     assert "A4 不在册店冻结行:跳过" in out
+
+
+def test_sales_sql_excludes_cancelled_not_missing_raw_key():
+    """销量口径按 #35 的落库事实校准:历史行没有 raw,按 raw 过滤等于没写。
+
+    历史导入行 sale_status 一律 'Delivered',API 行才有真实状态 ——
+    所以排除条件只能落在 sale_status 上。
+    """
+    assert "sale_status" in sv._SQL_SALES and "Cancelled" in sv._SQL_SALES
+    assert "统计状态" not in sv._SQL_SALES      # 该列根本没被导入

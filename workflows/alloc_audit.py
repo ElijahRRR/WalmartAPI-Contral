@@ -108,6 +108,8 @@ def run(params: dict) -> str:
         status = {s: (st or "").strip().upper() for s, st in cur.fetchall()}
         cur.execute(sv._SQL_SALES, (sales_days,))
         sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
+        cur.execute(sv._SQL_ORDER_STORES, (sales_days,))
+        order_stores = cur.fetchall()
 
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
                                     for it in items) if a})
@@ -261,6 +263,20 @@ def run(params: dict) -> str:
                 if non_active else "")
              + f"(无 KPI 记录或状态为空、按 fail-open 视同 ACTIVE 的 {no_status} 家)"
              + "——SUSPENDED 店的占用按设计保持,其在线行仍计入 A1/A2 冲突")
+
+    # A8 订单店名对账:对不上的店,其销量进不了"店×类目"维度
+    if registered is None:
+        L.append("A8 订单店名对账:跳过(凭证表读取失败)")
+    else:
+        miss = [(s, n, h) for s, n, h in order_stores if s not in registered]
+        L.append(f"A8 订单店名对账(近 {sales_days} 天):订单里 {len(order_stores)} 家店,"
+                 f"与凭证表对不上 {len(miss)} 家、{sum(n for _, n, _ in miss)} 行"
+                 + (";" + ", ".join(f"{s}×{n}" for s, n, _ in miss[:sample])
+                    if miss else "(全部对得上)")
+                 + ("——这些行照样在库里(事实表永存原文),只是销量只进产品/品牌/"
+                    "类目三个全局维度,不进店×类目维度;若其中有**还在营只是改过名**"
+                    "的店,它的近期信号会凭空少一截,需要一张改名映射表"
+                    if miss else ""))
 
     # ── C 处置清单(落盘 csv,给人照着做)──
     if not export:

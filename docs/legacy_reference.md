@@ -10,7 +10,11 @@
 2. **token 900 秒内复用**,按 client_id 缓存,线程安全,401 时就地刷新重试一次。
 3. **429/5xx 自适应退避**:解析 `Retry-After` 与沃尔玛特有的
    `X-Next-Replenishment-Time` 响应头;`x-current-token-count` 是剩余配额。
-4. **UPC 池"领取即标已领、永不释放"**。历史上因释放语义不一致出过重复使用事故。
+4. **UPC 池"领用即 claimed"**;回收**仅限三类**:提交前失败(prep_failed)、
+   反查双确认未达(not_found)、4xx 被拒(rejected);**Unknown 永不回收**,
+   conflict/bad_prefix 永久弃用。历史上因释放语义不一致出过重复使用事故。
+   ⚠ 2026-08-14 勘误:原写「永不释放」并列在"必须原样保留"清单里——照它做会
+   把 `services/upc_pool.py:107 release()` 当违规实现删掉,**造成 UPC 池只出不进**。
 5. **DELETE_ITEM 只对 SFF 且不可恢复**;旧系统每店提交间隔 360s、单日上限从飞书表读取。
 6. **auto_listing 的 9 状态生命周期**与 reconcile(按 feed 结果回写)语义,
    迁移 listing 时先读旧仓库 `auto_listing/README.md` 和 `docs/closed_loop.md`。
@@ -57,9 +61,17 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
   行主键 (returnOrderId, returnOrderLineNumber)。
 - 凭证以 店铺API.xlsx **Sheet1 为权威**(48 家有效店铺,全 socks5,出口 IP 两两不同);
   Sheet2 是漂移的第二张代理清单,勿混用。README 各处"57 家"已过时。
-- 除特例 feedType 外,所有 feed 共享每店 `POST /v3/feeds` 10/小时 通用桶;
-  `errorReport` 下载另有 60/小时 独立限制。
-- `DELETE_ITEM_VER = "5.0.20250919-16_45_47-api"` 之类版本常量被抄 3 份 → 只在 api/feeds.py。
+- **各 feedType 各自独立 10/hour**(MP_ITEM_MATCH 20/hour);唯一的共享桶是
+  **价格三件套**。`errorReport` 下载另有 60/小时 独立限制。
+  ⚠ 2026-08-14 勘误:原写「除特例外所有 feed 共享一个通用桶」——那是旧仓推断,
+  已于 2026-08-05 官方核验作废(见 api_blueprint §3.2)。代码侧反证:
+  `api/_client.py:178-183` 逐 feedType 独立登记(DELETE_ITEM 6/3600、
+  MP_MAINTENANCE 8/3600、MP_ITEM_MATCH 15/3600、MP_ITEM 8/3600、inventory 8/3600),
+  只有 `feeds.post.price` 是共享桶。**按错的那条排期会把 5 个独立桶当成 1 个,
+  严重低估 feed 吞吐。**
+- `DELETE_ITEM_VER = "5.0.20250919-16_45_47-api"` 之类版本常量被抄 3 份 →
+  唯一出处是 `registry/resources.py` 的 `FEED_SPEC_VERSIONS`,`api/feeds.py:79` 只取用
+  (2026-08-14 勘误:原写"只在 api/feeds.py",与铁律 3「一切表 ID/常量只准从 registry 取」相悖)。
 - 整表覆盖写飞书导致"新短旧长残留尾部旧行" → 多维表格按 record_id 更新,天然消灭。
 - 双重调度(订单同步同时被 launchd 每小时 + skill 13:30 触发)→ 新系统一条工作流
   只允许一条调度,登记在 plan.md。
@@ -78,6 +90,7 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
 | 飞书 QNIp…Bb/8280e8 黑名单 ASIN 表(blacklist_sync 写入,本仓找不到读者) | 历史黑名单 ASIN | ✅ catalog.asin_blacklist(只收永久类 B/C/E/F/G/K 过滤导入)→ blacklist_push 投影新「黑名单ASIN」wiki 表 |
 | auto_listing/state/risk_gate_cache.json | 风控两表 24h TTL 读缓存 | 不搬(纯派生):risk_sync 已镜像入 catalog.risk_product_types / brand_blacklist,闸门读库;开 listing 前跑一次 risk_sync 即可 |
 | <旧项目根>/data/frontend_scrape/latest.json(影刀应用内部写死此路径) | 影刀前台抓取结果(卖家名称/销售状态,日报降级源) | <DATA_ROOT>/frontend_scrape/latest.json(paths.frontend_scrape_file;并跑期 env FRONTEND_SCRAPE_JSON 指旧路径,切换需改影刀 RPA 输出) |
+| 飞书「店铺KPI」总览页(旧影刀的**输入**来源) | 影刀读它拿 sellerId 决定抓哪些卖家页 | <DATA_ROOT>/frontend_scrape/input.json(paths.yingdao_input_file;env YINGDAO_INPUT_JSON 覆盖)。所有者定稿 2026-08-15:新影刀应用改读本地文件,不再经飞书中转 |
 
 ## 环境事实
 

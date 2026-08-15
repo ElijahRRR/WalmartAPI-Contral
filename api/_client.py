@@ -4,9 +4,7 @@
   get_token()      获取 access_token(线程安全 + 进程内 900s 缓存)
   make_headers()   构造标准请求头
   base_url()       API base(registry 取值,env WALMART_BASE_URL 覆盖用于沙箱)
-  safe_get()       带错误处理的 GET,返回 dict|None(简化接口)
   safe_get_ex()    带状态码/headers 的 GET,返回 (status:int|None, headers:dict, data:dict|None)
-  safe_post()      带错误处理的 POST,返回 dict|None
   safe_post_ex()   带状态码/headers 的 POST
   safe_put_ex()    带状态码/headers 的 PUT
 
@@ -20,7 +18,6 @@
 
 环境变量:
     WALMART_BASE_URL          自定义 API base(默认 production),用于沙箱测试
-    WALMART_DEFAULT_RETRIES   safe_get 默认重试次数(默认 2);safe_post 因幂等性始终默认 0
     WALMART_HTTP2             "0" 关闭 HTTP/2(默认开启)
 """
 
@@ -79,9 +76,6 @@ _HTTP2 = _HAS_H2 and (os.environ.get("WALMART_HTTP2", "1") != "0")
 if not _HAS_H2 and os.environ.get("WALMART_HTTP2", "1") != "0":
     logger.warning("h2 未安装,HTTP/2 已禁用;启用:pip install 'httpx[http2]'")
 
-# safe_get 旧接口的默认重试次数;safe_post 因幂等性问题不用此默认值;
-# ex 接口由调用方显式传 max_retries,不受此变量影响。
-_DEFAULT_RETRIES = int(os.environ.get("WALMART_DEFAULT_RETRIES", "2"))
 
 
 def base_url() -> str:
@@ -582,7 +576,15 @@ def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, quiet=Fal
 
 
 def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
-    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。"""
+    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。
+
+    ⚠ **默认 max_retries=0 是有意的** —— POST 非幂等,自动重试会造成重复提交
+    (feed 重复 / refund 重复 / shipping 重复)。要重试就显式传,并自己保证
+    幂等(典型如查询型 POST);写操作永不自动兜底,feed 提交必须走
+    ops.feed_log 防重反查三态(见 CLAUDE.md 安全铁律)。
+    这段纪律原写在已删除的 safe_get/safe_post 旧接口 docstring 里
+    (2026-08-14 死代码清理),连函数一起删掉的话纪律就没地方落了。
+    """
     return _request_ex("POST", url, token, client_id, proxy,
                        json_body=json_body, params=params, timeout=timeout,
                        quiet=quiet, max_retries=max_retries)
@@ -594,30 +596,3 @@ def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeo
                        json_body=json_body, params=params, timeout=timeout,
                        quiet=quiet, max_retries=max_retries)
 
-
-def safe_get(url, token, client_id, proxy, params=None):
-    """
-    GET 请求,失败返回 None(简化接口)。
-
-    默认重试 WALMART_DEFAULT_RETRIES 次(env,默认 2);想关掉用
-    `WALMART_DEFAULT_RETRIES=0` 或直接调 safe_get_ex 自己控制。
-    需要状态码/headers 的场景请用 safe_get_ex。
-    """
-    _, _, data = safe_get_ex(url, token, client_id, proxy,
-                             params=params, max_retries=_DEFAULT_RETRIES)
-    return data
-
-
-def safe_post(url, token, client_id, proxy, json_body=None, params=None):
-    """
-    POST 请求,失败返回 None(简化接口)。
-
-    ⚠ 默认 max_retries=0 — POST 非幂等,自动重试可能导致重复提交(feed 重复 /
-    refund 重复 / shipping 重复)。需要重试的场景请显式调 safe_post_ex 并自
-    己保证幂等(典型如查询型 POST),或按业务层反查后决定是否重试
-    (feed 提交必须走 ops.feed_log 防重,见 CLAUDE.md 安全铁律)。
-    需要状态码/headers 的场景请用 safe_post_ex。
-    """
-    _, _, data = safe_post_ex(url, token, client_id, proxy,
-                              json_body=json_body, params=params)
-    return data

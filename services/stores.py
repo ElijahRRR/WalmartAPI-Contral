@@ -7,12 +7,41 @@
 import json
 import logging
 import os
+import re
 from urllib.parse import quote
 
 from api import feishu
 from registry import paths, resources
 
 logger = logging.getLogger("services.stores")
+
+_NUM_RE = re.compile(r"\d+")
+
+
+def sort_key(store: str):
+    """输入:店铺名 → 输出:排序键。人看的表格一律按它排,**别用 SQL ORDER BY**。
+
+    所有者定稿 2026-08-15:字母开头 → 数字开头 → 其余(中文等),组内按
+    「前缀 + 数字大小」自然序(谭总9 在 谭总10 之前,A085 在 A089 之前)。
+
+    ⚠ 为什么不交给数据库:PG 的 collation(生产是 en_US.UTF-8 一类)在主排序级
+    **把中文字符整个忽略**,于是「谭总1」当成「1」参与比较,排出来是
+    谭总1…谭总8 → 81刘何秀 → 82杨乾良 → 谭总9 → A085(2026-08-15 生产实见)。
+    而且 collation 随机器 locale 变,同一条 SQL 换台服务器结果就不同。
+    排序是业务规则,得写在代码里、有测试钉着。
+    """
+    s = str(store or "").strip()
+    head = s[:1]
+    if head.isascii() and head.isalpha():
+        group = 0
+    elif head.isdigit():
+        group = 1
+    else:
+        group = 2
+    m = _NUM_RE.search(s)
+    # 无数字的店铺(如「总仓」)给 -1,排在同前缀的带号店铺之前
+    return (group, (s[:m.start()] if m else s).casefold(),
+            int(m.group()) if m else -1, s)
 
 
 def load_stores(filter_names: list[str] | None = None) -> list[dict]:

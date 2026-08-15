@@ -10,7 +10,12 @@
   任何单元格以 '=' 开头的行(Excel SUM 公式)整行跳过;
   sheet 名 == "Not Accountable" → 计入绩效 "⚪ 否",其余 sheet 名作为子分类
 - 指标名带 emoji 前缀是隐式契约(日报的承运商分析按字符串精确匹配)
-- 问题订单去重键 = (Sales Order #, 指标, 子分类, 物流单号, 商品) 五字段
+- 问题订单去重键 = (Sales Order #, 指标, 子分类, 物流单号, 商品) 五字段。
+  **本层不实现它** —— 去重由 workflows/perf_problems.py 的
+  `ON CONFLICT (sales_order_no, indicator, sub_category, tracking_no, item)`
+  唯一约束保证。曾有一份 Python 版 `dedup_key()` 与之并存且零调用
+  (2026-08-14 删):同一语义两份实现,改去重键时漏改没人调的那份不会报错,
+  只会制造"我改了去重逻辑"的错觉。
 """
 
 import io
@@ -39,6 +44,39 @@ METRIC_LABELS = {
 }
 
 _SELLER_ID_RE = re.compile(r"/seller/(\d+)")
+
+ACTIVE_STATUS = "ACTIVE"        # sellerStatus 的在营取值
+NOT_SELLING = "不可售"          # 销售状态取值,与旧表一致(另一取值「可售」)
+
+
+def store_activity(store_status) -> str:
+    """输入:店铺状态原值 → 输出:'active' / 'inactive' / 'unknown'。
+
+    ⚠ **'unknown'(状态为空)必须与 'inactive' 分开**:extract_settlement 取
+    store_status 时没有 _find_key 兜底(payment_status 有),结算响应换个形状
+    就是空串。把空当停用,会让解析故障静默地变成"少抓一半店 + 一半店被标不可售"。
+    判不准就判活:空状态照常抓、照常留空,由调用方计数报警。
+
+    这是「什么算在营」的唯一出处 —— 影刀清单过滤与销售状态推导都用它,
+    两处各写一份 upper() != "ACTIVE" 迟早会飘。
+    """
+    s = str(store_status or "").strip().upper()
+    if not s:
+        return "unknown"
+    return "active" if s == ACTIVE_STATUS else "inactive"
+
+
+def derived_sales_status(store_status) -> str | None:
+    """输入:店铺状态 → 输出:可推导的销售状态(仅停用店 →「不可售」),否则 None。
+
+    所有者定稿 2026-08-15:SUSPENDED / TERMINATED 一类的店影刀不去抓
+    (见 yingdao.write_input 的 inactive 过滤),销售状态不能就此永远空着
+    —— 店都停了,定义上就是不可售。
+
+    ⚠ 这**不违反**「销售状态不做跨日延续」那条旧事故规则:它推导自**本轮**
+    观测到的 store_status,不是把昨天的旧值回填成今天。
+    """
+    return NOT_SELLING if store_activity(store_status) == "inactive" else None
 
 
 def sales_window_utc(now_utc: datetime | None = None) -> tuple[str, str]:
@@ -448,9 +486,3 @@ def parse_history_rows(store: str, header: list, rows: list[list]
         out.append(rec)
     return out, skipped
 
-
-def dedup_key(row: dict) -> tuple:
-    """输入:问题订单行 → 输出:五字段联合去重键(旧系统同款语义)。"""
-    return (row.get("sales_order_no") or "", row.get("indicator") or "",
-            row.get("sub_category") or "", row.get("tracking_no") or "",
-            row.get("item") or "")

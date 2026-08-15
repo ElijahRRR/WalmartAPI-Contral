@@ -131,16 +131,33 @@ FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 
 # 冲突处置要的销量:按 (store, sku) 聚合——**不需要 asin 列**,
 # order_lines 与 walmart_items 共用 (store, sku) 主键口径。
-# 只算"有效销售"类行:统计状态在 raw 里(历史导入),API 行没有该键,
-# 用 coalesce 让两种来源都算进来(API 行本就是真实销售)。
+#
+# 口径两条(2026-08-15 按 order_history_import(#35)的落库事实校准):
+# 1. **只排 Cancelled**。API 行的 sale_status 是真实状态,历史导入行一律
+#    'Delivered'(该工作流只取销售六列)。曾按 `raw->>'统计状态'` 过滤,
+#    但历史行**根本没有 raw**——那个条件对它们恒真,等于没写。
+# 2. ⚠ **历史行里的退款单算进了销量**:源表的「统计状态」列没有被导入,
+#    退款/无效行与有效销售一起进来了。对"留销量大的店"这类相对比较影响
+#    很小(各店同样口径),但绝对额会偏高;真要精确得让导入侧补这一列。
 _SQL_SALES = """
 SELECT store, sku,
        count(*)                                   AS orders,
        coalesce(sum(product_amount), 0)::numeric  AS gmv
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %s)
-  AND coalesce(raw ->> '统计状态', '有效销售') = '有效销售'
+  AND coalesce(sale_status, '') <> 'Cancelled'
 GROUP BY store, sku
+"""
+
+# 订单侧店名 vs 凭证表:对不上的店,其销量进不了"店×类目"维度
+# (只进产品/品牌/类目三个全局维度)。15 万历史行来自 494 家店,
+# 与现凭证表 505 家不是同一套命名的话,店铺适配分会凭空少掉一截。
+_SQL_ORDER_STORES = """
+SELECT store, count(*) AS n,
+       count(*) FILTER (WHERE source IS NOT NULL) AS hist
+FROM orders.order_lines
+WHERE order_date >= now() - make_interval(days => %s)
+GROUP BY store ORDER BY n DESC
 """
 
 

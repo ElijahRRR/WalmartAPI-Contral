@@ -1,251 +1,251 @@
-"""order_history_import — 两年订单 excel(采购分配合并总表)→ orders.order_lines(一次性)。
+"""order_history_import — 旧订单汇总 xlsx → orders.order_lines(历史补全,可重跑)。
 
 用法:
-  python cli.py order_history_import -p file=/path/采购分配合并总表.xlsx            # 预览
-  python cli.py order_history_import -p file=/path/采购分配合并总表.xlsx -p apply=1 # 入库
+  python cli.py order_history_import -p file=<xlsx路径>              # 预览
+  python cli.py order_history_import -p file=<xlsx路径> -p apply=1   # 真正入库
+  python cli.py order_history_import -p file=<...> -p sheet=合并总表  # 换工作表
+  python cli.py order_history_import -p file=<...> -p since=2026-02-15  # 只导某日之后
 
-数据源(Q3 拍板 2026-08-12;表头样例所有者当日提供,精确匹配不做模糊猜列):
-  合并键 | 统计状态 | 统一订单日期 | 店铺名称 | SKU | 商品标题 | 数量 |
-  销售额USD | 采购成本CNY | 利润估算CNY | 退款原因
+数据源:所有者提供的「订单数据合并」workbook,`合并总表` 一行一个订单行,
+15 万行跨 2024-03 ~ 2026-07。**只取销售侧六列**(所有者定稿 2026-08-15):
+统一订单日期 / 店铺名称 / SKU / 商品标题 / 数量 / 销售额USD;
+采购成本、利润估算、退款原因、统计状态四列**不导**。
 
-四条口径(改前先读):
-  1. **没有独立 PO 列**:合并键 = PO号 + SKU 首尾拼接(实证
-     108906521136562B0BC6ZBD7M)。PO = 合并键去掉 SKU 后缀;对不上/非纯数字
-     计坏行报告,不硬猜。行标识仍走 services/order_lines.make_order_line_id
-     (po+sku),与 order_sync 同源 ⇒ 与 API 45 天窗口重叠的单**天然同 ID**。
-  2. **只插不改**:INSERT … ON CONFLICT DO NOTHING。API 拉的行权威,历史行
-     永不覆盖;重复执行幂等。
-  3. 统计状态/采购成本CNY/利润估算CNY 是采购域口径,不映射 order_lines
-     业务列,**原样进 raw**(消费方按 raw->>'统计状态'='有效销售' 过滤);
-     退款原因 → refund_comments;销售额USD($ 前缀)→ product_amount;
-     sale_status 留 NULL(沃尔玛状态域,别拿记账状态污染)。
-  4. 店铺名称原样入库("1杨宜凡" 旧命名可能与现凭证表店名不一致)——预览
-     列出全部店名分布,与现店名对不上时由所有者定改名映射,导入器不猜。
+身份与防重:
+- `po_id` = 合并键**去掉末尾的 SKU 再 strip**。⚠ 不是"前 15 位":生产文件里
+  有 PO 与 SKU 之间夹 8 个空格的行(150,863 行中 1 行),按位切会切出带空格的
+  PO。全量校验过「合并键必以自身 SKU 结尾」,0 例外,所以按后缀切是安全的。
+- `order_line_id` 用 services.order_lines.make_order_line_id(po, sku) 推导 ——
+  与 order_sync 同一算法,将来 API 拉到同一张单算出的 id 完全一致,
+  **不会产生第二条**,而是安静地落到同一行上。
+- `INSERT ... ON CONFLICT DO NOTHING`(不指定冲突目标,order_line_id 主键与
+  UNIQUE(po_id, sku) 两条约束都覆盖):**库里已有的行一个字段都不碰**。
 
-时区:统一订单日期是日期(无时刻),按业务时区 Asia/Shanghai 的 0 点落
-timestamptz(与日配额"北京 0 点重置"同一口径)。
+来源标记:写 `source='历史数据'`。这些是残缺行(无物流地址、无 raw、
+销售状态一律 Delivered),`order_center_push` 据此不把它们推去飞书。
+⚠ order_sync 覆盖同一行时会把 source 写回 NULL —— 那正是想要的:
+API 拉到真行之后它就不再是历史行,自动回到推送流。
+
+时区:表里是日期(00:00:00)没有时区。**按 UTC 零点入库**,不是中国时间零点——
+CN 是 UTC+8,UTC 零点加 8 小时仍在同一日历日,于是这个日期在 UTC 和 CN 两种
+时区下读出来都是同一天;换成 CN 零点则会在 UTC 下退成前一天。
 """
 
-import json
 import logging
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 
 from registry import db
-from services import order_lines as ol
-from services import stores as stores_svc
+from services import order_lines
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.order_history_import")
 
-_BATCH = 2000
-_CN_TZ = timezone(timedelta(hours=8))
+_SHEET = "合并总表"
+_BATCH = 5000
 
-_REQUIRED = ("合并键", "SKU", "店铺名称", "统一订单日期", "数量", "销售额USD")
+# 表头关键词 → 字段,**顺序即优先级**(与 services.kpi._HIST_HEADER_MAP 同款)。
+# 按关键词不按列位:列序是人在 Excel 里随手能改的,表头才是契约。
+_HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("merge_key", ("合并键",)),
+    ("order_date", ("统一订单日期", "订单日期")),
+    ("store", ("店铺名称", "店铺")),
+    ("sku", ("sku",)),                      # 在 product_name 之前:"商品SKU"归 sku
+    ("product_name", ("商品标题", "商品名", "标题")),
+    ("qty", ("数量",)),
+    ("product_amount", ("销售额",)),
+)
+_REQUIRED = tuple(f for f, _ in _HEADER_MAP)
 
-_INSERT_SQL = """
+_INSERT = """
 INSERT INTO orders.order_lines
     (order_line_id, store, po_id, line_number, sku, product_name, qty,
-     order_date, product_amount, refund_comments, raw)
-VALUES (%(order_line_id)s, %(store)s, %(po_id)s, '1', %(sku)s,
-        %(product_name)s, %(qty)s, %(order_date)s, %(product_amount)s,
-        %(refund_comments)s, %(raw)s::jsonb)
+     sale_status, order_date, product_amount, source)
+VALUES (%(order_line_id)s, %(store)s, %(po_id)s, '', %(sku)s, %(product_name)s,
+        %(qty)s, 'Delivered', %(order_date)s, %(product_amount)s, %(source)s)
 ON CONFLICT DO NOTHING
 """
 
+_EXISTING_SQL = ("SELECT order_line_id FROM orders.order_lines"
+                 " WHERE order_line_id = ANY(%(ids)s::text[])")
 
-def _cell(v) -> str:
-    return str(v).strip() if v is not None else ""
+
+def map_header(header: list) -> tuple[dict[int, str], list[str]]:
+    """输入:表头行 → 输出:({列下标: 字段名}, 未映射表头)。关键词包含匹配(casefold)。"""
+    mapping: dict[int, str] = {}
+    taken: set[str] = set()
+    unmapped: list[str] = []
+    for i, h in enumerate(header):
+        text = str(h or "").strip().casefold()
+        if not text:
+            continue
+        for field, kws in _HEADER_MAP:
+            if field not in taken and any(k in text for k in kws):
+                mapping[i] = field
+                taken.add(field)
+                break
+        else:
+            unmapped.append(str(h).strip())
+    return mapping, unmapped
 
 
-def _money(v) -> float | None:
-    """输入:'$23.10' / '¥121.00' / 数字 → 输出:float;解析失败 None(禁止 or 0)。"""
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = _cell(v).replace("$", "").replace("¥", "").replace(",", "").strip()
-    if not s:
+def split_po(merge_key, sku) -> str | None:
+    """输入:合并键 + SKU → 输出:采购订单号;合并键不以 SKU 结尾则 None。
+
+    ⚠ 按**后缀**切不按位切:生产文件里有 PO 与 SKU 之间夹空格的行,
+    切完再 strip。返回 None 的行由调用方计数并跳过,不许猜。
+    """
+    key, sku = str(merge_key or "").strip(), str(sku or "").strip()
+    if not key or not sku or not key.endswith(sku):
         return None
+    po = key[:-len(sku)].strip()
+    return po or None
+
+
+def _as_utc_midnight(v) -> datetime | None:
+    """输入:单元格日期值 → 输出:带 UTC 时区的当日零点;解析不了返回 None。"""
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=timezone.utc) if v.tzinfo is None else v
+    s = str(v or "").strip()[:10].replace("/", "-")
     try:
-        return float(s)
+        d = datetime.strptime(s, "%Y-%m-%d")
     except ValueError:
         return None
+    return d.replace(tzinfo=timezone.utc)
 
 
-def _date(v) -> datetime | None:
-    if isinstance(v, datetime):
-        return v if v.tzinfo else v.replace(tzinfo=_CN_TZ)
-    s = _cell(v)
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt).replace(tzinfo=_CN_TZ)
-        except ValueError:
-            continue
-    return None
-
-
-def _split_po(merge_key: str, sku: str) -> str | None:
-    """输入:合并键 + SKU → 输出:PO 号;拼接对不上或非纯数字返回 None。
-
-    ⚠ 实测有 `'108909730063166        B08M4D1GMT'` 这种 PO 与 SKU 之间夹空白的
-    行(2026-08-15 首跑),所以切完要 strip——**只去空白,不做别的清洗**:
-    PO 必须仍是纯数字,否则宁可判坏行也不猜。
-    """
-    if not merge_key or not sku or not merge_key.endswith(sku):
+def _num(v):
+    try:
+        return float(str(v).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
         return None
-    po = merge_key[: -len(sku)].strip()
-    return po if po.isdigit() and len(po) >= 10 else None
 
 
-def _parse(headers: dict, row: tuple) -> tuple[dict | None, str | None]:
-    """输入:表头索引 + 行 → 输出:(入库行, None) 或 (None, 坏行原因)。"""
-    def g(name):
-        i = headers.get(name)
-        return row[i] if i is not None and i < len(row) else None
+def parse_rows(header: list, rows, since: str = "") -> tuple[list[dict], dict[str, int]]:
+    """输入:表头 + 数据行迭代器 + 可选起始日期 → 输出:(待插入行, 各口径计数)。
 
-    sku = ol.norm_sku(_cell(g("SKU")))
-    po = _split_po(_cell(g("合并键")), sku)
-    if not po:
-        return None, f"合并键/SKU 对不上:{_cell(g('合并键'))!r} vs {sku!r}"
-    store = _cell(g("店铺名称"))
-    if not store:
-        return None, f"店铺名称为空(PO {po})"
-    order_date = _date(g("统一订单日期"))
-    if order_date is None:
-        return None, f"订单日期解析失败:{_cell(g('统一订单日期'))!r}(PO {po})"
-    qty = _money(g("数量"))
-    raw = {name: _cell(g(name)) for name in headers}
-    return {
-        "order_line_id": ol.make_order_line_id(po, sku),
-        "store": store,
-        "po_id": po,
-        "sku": sku,
-        "product_name": _cell(g("商品标题")) or None,
-        "qty": int(qty) if qty is not None else None,
-        "order_date": order_date,
-        "product_amount": _money(g("销售额USD")),
-        "refund_comments": _cell(g("退款原因")) or None,
-        "raw": json.dumps(raw, ensure_ascii=False),
-    }, None
-
-
-_HEADER_SCAN_ROWS = 30      # 表头前的说明/标题行:实测这份表首行是「订单数据合并概览」
-
-
-def _locate_header(wb, sheet_name=None):
-    """输入:workbook(+可选 sheet 名)→ 输出:(数据行迭代器, 表头映射, 位置串, 探测摘要)。
-
-    **不假设表头在第 1 行、也不假设数据在第 1 个 sheet**:实测这份表首行是
-    合并标题「订单数据合并概览」,而 openpyxl 的 read_only 迭代器只能前进,
-    所以逐行扫到第一行"必需列全在"的即认表头,迭代器自然停在数据首行。
-
-    找不到时把扫过的 sheet 与前几行原样回报——猜不出就把现场交出来,
-    比抛一句"表头变了"有用。
+    跳的每一类都单独计数:静默丢行会让"导入了 12 万条"看起来正常,
+    而少的那 3 万条永远没人发现。
     """
-    sheets = [wb[sheet_name]] if sheet_name else list(wb.worksheets)
-    probe: list[str] = []
-    for ws in sheets:
-        rows_iter = ws.iter_rows(values_only=True)
-        seen: list[str] = []
-        for i, row in enumerate(rows_iter):
-            if i >= _HEADER_SCAN_ROWS:
-                break
-            cells = {_cell(h): j for j, h in enumerate(row or ()) if _cell(h)}
-            if all(h in cells for h in _REQUIRED):
-                return rows_iter, cells, f"{ws.title} 第 {i + 1} 行", probe
-            if cells and len(seen) < 3:
-                seen.append("|".join(list(cells)[:6]))
-        probe.append(f"[{ws.title}] " + " ⏎ ".join(seen or ["(空)"]))
-    return None, None, None, "; ".join(probe)
+    mapping, _ = map_header(header)
+    out: list[dict] = []
+    seen: set[str] = set()
+    stat = dict.fromkeys(("total", "bad_key", "bad_date", "bad_num",
+                          "before_since", "dup_in_file"), 0)
+    for raw in rows:
+        if not any(c is not None and str(c).strip() for c in raw):
+            continue
+        stat["total"] += 1
+        rec = {f: (raw[i] if i < len(raw) else None) for i, f in mapping.items()}
+        po = split_po(rec.get("merge_key"), rec.get("sku"))
+        sku = str(rec.get("sku") or "").strip()
+        if not po:
+            stat["bad_key"] += 1
+            continue
+        od = _as_utc_midnight(rec.get("order_date"))
+        if od is None:
+            stat["bad_date"] += 1
+            continue
+        if since and od.strftime("%Y-%m-%d") < since:
+            stat["before_since"] += 1
+            continue
+        qty, amount = _num(rec.get("qty")), _num(rec.get("product_amount"))
+        if qty is None or amount is None:
+            stat["bad_num"] += 1
+            continue
+        line_id = order_lines.make_order_line_id(po, sku)
+        if line_id in seen:
+            stat["dup_in_file"] += 1
+            continue
+        seen.add(line_id)
+        out.append({"order_line_id": line_id, "store": str(rec.get("store") or "").strip(),
+                    "po_id": po, "sku": sku,
+                    "product_name": str(rec.get("product_name") or "").strip()[:500],
+                    "qty": int(qty), "order_date": od,
+                    "product_amount": amount,
+                    "source": order_lines.HISTORY_SOURCE})
+    return out, stat
+
+
+def _read_sheet(path: str, sheet: str):
+    """输入:xlsx 路径 + 工作表名 → 输出:(表头, 数据行迭代器)。"""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    if sheet not in wb.sheetnames:
+        raise LookupError(f"工作表「{sheet}」不存在,本文件有:{wb.sheetnames}")
+    ws = wb[sheet]
+    # 生产实证(2026-08-06 kpi 那次):有些 xlsx 把 dimension 声明成单格,
+    # read_only 模式按声明只读出 1 行 → 必须 reset_dimensions 重扫真实行
+    if hasattr(ws, "reset_dimensions"):
+        ws.reset_dimensions()
+    it = ws.iter_rows(values_only=True)
+    return list(next(it)), it
+
+
+def _existing(conn, ids: list[str]) -> set[str]:
+    """输入:连接 + order_line_id 列表 → 输出:库里已存在的那些。
+
+    先查再插,不靠 rowcount —— executemany 的 rowcount 在各驱动下语义不一,
+    而"新增几条/撞上几条"正是人眼闸门要看的数,报错了比不报更坏。
+    """
+    found: set[str] = set()
+    with conn.cursor() as cur:
+        for i in range(0, len(ids), 50000):
+            cur.execute(_EXISTING_SQL, {"ids": ids[i:i + 50000]})
+            found.update(r[0] for r in cur.fetchall())
+    return found
+
+
+def _summary(stat: dict, rows: list[dict], hit: set[str], unmapped: list[str]) -> str:
+    new = [r for r in rows if r["order_line_id"] not in hit]
+    dates = [r["order_date"] for r in rows]
+    lines = [f"解析 {stat['total']} 行 → 可导 {len(rows)} 行"
+             f"(库中已有 {len(hit)},待新增 {len(new)})"]
+    skipped = ",".join(f"{k} {v}" for k, v in stat.items()
+                       if k != "total" and v)
+    lines.append(f"跳过:{skipped or '无'}")
+    if dates:
+        lines.append(f"日期跨度 {min(dates):%Y-%m-%d} ~ {max(dates):%Y-%m-%d},"
+                     f"店铺 {len({r['store'] for r in rows})} 家")
+    if unmapped:
+        lines.append(f"⚠ 未映射表头(不影响导入,确认没漏列):{unmapped}")
+    return "\n".join(lines)
 
 
 def run(params: dict) -> str:
-    """输入:params(file 必填,apply/sheet 可选)→ 输出:预览或导入摘要。"""
-    apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
+    """输入:params(file/sheet/apply/since)→ 输出:导入摘要。"""
     path = str(params.get("file", "")).strip()
     if not path:
-        return "⛔ 缺 -p file=<采购分配合并总表.xlsx 路径>"
-    f = Path(path)
-    if not f.is_file():
-        return f"⛔ 文件不存在:{path}"
+        return "缺 -p file=<xlsx路径>"
+    sheet = str(params.get("sheet", _SHEET))
+    since = str(params.get("since", "")).strip()
+    apply_ = str(params.get("apply", "")) in ("1", "true", "yes")
 
-    from openpyxl import load_workbook
-    wb = load_workbook(f, read_only=True, data_only=True)
-    rows_iter, headers, where, probe = _locate_header(wb, params.get("sheet"))
-    if headers is None:
-        return ("⛔ 找不到表头行(必需列 " + "/".join(_REQUIRED) + ")。"
-                f"扫过的 sheet 与前几行:{probe}"
-                "——确认文件对不对;表头真变了先校准本文件 _REQUIRED/映射再跑")
+    header, it = _read_sheet(path, sheet)
+    _, unmapped = map_header(header)
+    missing = [f for f in _REQUIRED if f not in dict(map_header(header)[0]).values()]
+    if missing:
+        return (f"表头缺字段 {missing} —— 实际表头 {header};"
+                f" 关键词映射见 _HEADER_MAP,对不上先校准映射再导")
 
-    total = ok = inserted = 0
-    bad: list[str] = []
-    merged: dict[str, dict] = {}          # order_line_id → 行(同 PO 同 SKU 必合并)
-    merge_hits = 0
-    stores: dict[str, int] = {}
-    dmin = dmax = None
+    rows, stat = parse_rows(header, it, since)
+    if not rows:
+        return "解析结果为空,未写入\n" + _summary(stat, rows, set(), unmapped)
 
-    for row in rows_iter:
-        if row is None or all(v is None or _cell(v) == "" for v in row):
-            continue
-        total += 1
-        parsed, err = _parse(headers, row)
-        if err:
-            if len(bad) < 5:
-                bad.append(err)
-            continue
-        ok += 1
-        stores[parsed["store"]] = stores.get(parsed["store"], 0) + 1
-        d = parsed["order_date"]
-        dmin = d if dmin is None or d < dmin else dmin
-        dmax = d if dmax is None or d > dmax else dmax
-        key = parsed["order_line_id"]
-        if key in merged:                  # 身份规则:同 (PO, SKU) 合并,qty/金额累加
-            merge_hits += 1
-            prev = merged[key]
-            if parsed["qty"] is not None:
-                prev["qty"] = (prev["qty"] or 0) + parsed["qty"]
-            if parsed["product_amount"] is not None:
-                prev["product_amount"] = (prev["product_amount"] or 0.0) + parsed["product_amount"]
-        else:
-            merged[key] = parsed
-    wb.close()
-
-    bad_total = total - ok
-    lines = [f"表头定位于 {where}",
-             f"读 {total} 行,可解析 {ok},坏行 {bad_total}"
-             + (f"(样例:{' / '.join(bad)})" if bad else ""),
-             f"日期范围 {dmin:%Y-%m-%d} ~ {dmax:%Y-%m-%d}" if dmin else "日期范围:无",
-             f"店铺 {len(stores)} 个:" + ", ".join(
-                 f"{s}×{n}" for s, n in sorted(stores.items(), key=lambda x: -x[1])[:15])]
-    if merge_hits:
-        lines.append(f"同 (PO,SKU) 合并 {merge_hits} 行(qty/金额累加)")
-
-    if not apply:
-        # 店名对账:excel 里的店名与凭证表现名对不上的行,销量信号会挂不到
-        # 现在的店上(只进全局三维度,不进店×类目)——apply 前必须先看这个数
-        try:
-            reg = stores_svc.registered_names()
-            unknown = {s: n for s, n in stores.items() if s not in reg}
-            hit = len(stores) - len(unknown)
-            lines.append(
-                f"店名对账:{hit}/{len(stores)} 家在凭证表里能找到;对不上 "
-                f"{len(unknown)} 家、{sum(unknown.values())} 行"
-                + (":" + ", ".join(f"{s}×{n}" for s, n in
-                                   sorted(unknown.items(), key=lambda x: -x[1])[:15])
-                   if unknown else "")
-                + "——对不上的行照样入库(事实表永存原文),只是它们的销量只进"
-                  "产品/品牌/类目三个全局维度,不进店×类目维度")
-        except Exception as e:                 # noqa: BLE001 对账失败不阻断预览
-            lines.append(f"店名对账:跳过(凭证表读取失败:{e})")
-        lines.append("预览完毕;-p apply=1 入库(ON CONFLICT DO NOTHING,"
-                     "与 API 同源行标识,45 天窗口重叠单天然去重)")
-        return ";".join(lines)
-
-    rows = list(merged.values())
     with db.pg_conn() as conn:
-        for i in range(0, len(rows), _BATCH):
-            with conn.cursor() as cur:
-                cur.executemany(_INSERT_SQL, rows[i:i + _BATCH])
-                inserted += max(cur.rowcount, 0)
-    lines.append(f"入库 {inserted} 行(已存在跳过 {len(rows) - inserted})")
-    return ";".join(lines)
+        hit = _existing(conn, [r["order_line_id"] for r in rows])
+        new = [r for r in rows if r["order_line_id"] not in hit]
+        head = _summary(stat, rows, hit, unmapped)
+        if not apply_:
+            sample = [(r["po_id"], r["sku"], r["store"],
+                       r["order_date"].strftime("%Y-%m-%d")) for r in new[:5]]
+            return (f"DRY-RUN(-p apply=1 真写)\n{head}\n"
+                    f"新增样本={sample}")
+        done = 0
+        with conn.cursor() as cur:
+            for i in range(0, len(new), _BATCH):
+                chunk = new[i:i + _BATCH]
+                cur.executemany(_INSERT, chunk)
+                done += len(chunk)
+                logger.info("历史订单导入:已提交 %d/%d", done, len(new))
+    return f"{head}\n已写入 {done} 行(source={order_lines.HISTORY_SOURCE},冲突行原样保留)"

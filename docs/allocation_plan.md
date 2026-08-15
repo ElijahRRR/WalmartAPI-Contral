@@ -82,10 +82,11 @@
 | 硬闸·黑名单 | ✅ | `services/blacklist.load_banned_asins` + `services/risk_gate.load_gate/check`(品牌与制造商双字段) |
 | 硬闸·风控 PT | ✅ | `risk_gate.check(gate, pt, None)` |
 | 硬闸·容量 | ⚠ | `walmart_items` 在线数(与 KPI 表口径差一个 `published_status='PUBLISHED'`,`alloc_audit` A0 拆两个数);死店冻结行会污染,见 §九.4 |
-| 店铺配额·GMV | ⚠ | 建议 `orders.order_lines` 聚合(命中 `(store, order_date DESC)` 索引,含两年历史);`store_kpi_daily.sales_amount` 是 API 现拉值、覆盖面窄。⚠ 日界分叉:历史导入按 Asia/Shanghai,order_sync 按 UTC。分母用 `sum/30`(与日目标自洽) |
+| 店铺配额·GMV | ✅ | `orders.order_lines` 聚合(命中 `(store, order_date DESC)` 索引)。**两年历史已入库**(order_history_import #35,15 万行 2024-03~2026-07,494 家店,`source='历史数据'`);时区统一 UTC 零点,无日界分叉。分母用 `sum/30`(与日目标自洽)。⚠ 见下方"历史行的三条语义" |
 | 店铺配额·健康度 | ❌ | KPI 8 率有列但**阈值零实现**,且 NULL 两义(无合规数据 vs 拉取失败)不可区分 ⇒ **v1 降为二值(ACTIVE=1)**,8 率只进方案表展示列,`need_i` 改二项归一 |
 | 店×类目销量 | ⚠ | `order_lines(store,sku) ⋈ walmart_items(store,sku)` → PT → 大类;**sku 大小写敏感**;必须显式过滤在册店(死店冻结行查得出来) |
-| 产品/品牌/类目全局销量 | ❌ | `order_lines` **无 asin 列**,sku→asin 只有 Python 实现 ⇒ 见 §十 A1.5 前置批次 |
+| 产品/品牌/类目全局销量 | ❌ | `order_lines` **无 asin 列**,sku→asin 只有 Python 实现 ⇒ 见 §十 A1.5 前置批次(现在有 15 万历史行等着归一) |
+| **历史订单行的三条语义** | ⚠ | ①`source='历史数据'`,`sale_status` 一律 `Delivered`(不是真实状态)⇒ 销量口径只能排 `Cancelled`,不能按状态细分;②源表「统计状态」列**未导入** ⇒ **退款/无效单被算作销量**(相对比较影响小,绝对额偏高;要精确得让导入侧补列);③「退款原因」未导入 ⇒ **退款率信号只能来自 API 行与 `return_lines`**,历史期算不出来 |
 | 占用落点 | ✅ | `catalog.claims` + `services/claims`(排他由部分唯一索引保证)+ `store_release` + `alloc_backfill` 均已就绪(2026-08-15);`allocation_runs/items` 随 A2 建 |
 | 上架表写入 | ⚠ | 现有五个写函数**全部按行号定点写,无一能新建行**——追加要照 `services/maint_sheet.append_records` 的水位模式另写;且写列权责与审核批次 D 冲突(§九.2) |
 
@@ -205,6 +206,7 @@ quota_i = min(room_i, ceil(批量 × need_i / Σ need))
 | 库存深度 | `stock_count`;NULL + in_stock 按 `AMZ_IN_STOCK_QTY` 记,`< MIN_INVENTORY` 淘汰 |
 | 配送时效 | `delivery_days`;超 `MAX_LEAD_DAYS` 是**减分项**不是闸(既有链路是"上架但库存写 0") |
 | 历史销量 | 见 §八 维度视图;**缺失时该项不计入、权重摊回其余信号**(§三.8) |
+| 退款率 | ⚠ 只有 API 期算得出(历史导入未带退款列);历史期缺失按"没数据"处理,不当"零退款" |
 | 黑历史 | `product_risk` 计数列作减分项(黑名单三表在硬闸) |
 | 评分/评论 | ✅ 进 v1(P2 实测命中率 100%):`raw->>'rating'` / `'review_count'`,text 解析失败按没采到,禁止 `or 0` |
 | 类目饱和度 | v1 不做 |
@@ -310,7 +312,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | **A0 数据接线** | 产品全量入库 / 审核结论 / 订单历史 / 店铺目标四列 | ✅ 收口(见下) |
-| **A0.5 存量审计** | `alloc_audit`:P 探针 4 项 + A 审计 7 项 + C 处置清单 4 份 | ✅ **生产首跑完成 2026-08-15**(实测见 §十一.1) |
+| **A0.5 存量审计** | `alloc_audit`:P 探针 4 项 + A 审计 **8** 项 + C 处置清单 4 份 | ✅ 首跑完成 2026-08-15;**订单入库后需重跑**——C3/C4 的"留销量大的店"首跑时无订单数据,只能按件数打平 |
 | **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
 | **A1.5 订单 ASIN 归一** | `order_lines` 加 asin 列 + `order_asin_normalize` 工作流(照 `sku_normalize` 先例:只补 NULL、numeric 走 item_id 倒查、查不到留 NULL 不猜) | ⬜ **A2 硬前置** |
 | **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | ⬜ 待 A1/A1.5 |
@@ -321,7 +323,10 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
   一轮 0 条、核对行数(v4 事件保留期 30 天,**别拖**);
 - 审核:**无需专门工作流**——main 已把审核系统整库迁入本仓,`product_audit`
   直接写 `catalog.products`(原计划的 `audit_sync` 已撤销,见附 B.2);
-- 订单历史:`order_history_import`(两年 excel;预览核对店名分布后 apply);
+- 订单历史:**已导入**(`order_history_import`,main PR #35 的实现——与本分支
+  同期各写了一版,2026-08-15 合并时按 main 版收口,本分支那份删除);
+  15 万行 / 2024-03~2026-07 / 494 家店,`source='历史数据'` 标记残缺行,
+  `order_center_push` 据此不推飞书。语义限制见 §四"历史订单行的三条语义";
 - 店铺目标四列:限额表已建列 + `services/store_targets` loader 已建;
 - 未完成的既有待办:daily_report/product_ingest 挂调度(分配依赖这两条链保鲜)。
 

@@ -179,6 +179,14 @@ CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_event
 -- services/sku_asin 规则清洗得出,提不出存 NULL;消费方 coalesce(asin, sku);
 -- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
 ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
+-- 身份键索引(2026-08-14 补):本表的身份是 **coalesce(asin, sku)**(2026-08-11
+-- 定稿),而上面两个索引都建在裸 sku 上 —— 按身份键查会退化成全表扫描。
+-- ⚠ 建它的直接原因是一次生产事故:audit_listing_conflicts 视图的 LATERAL
+-- 用 `coalesce(ev.asin, ev.sku) = ...` 关联,对外层每一行做一次几百万行的
+-- 全表扫描,查询挂死。表达式索引必须与查询里的表达式**逐字一致**才会被用上。
+-- 首次建索引在几百万行的表上要跑一会儿,db_init 会慢一次,之后不再。
+CREATE INDEX IF NOT EXISTS product_events_identity_idx
+    ON catalog.product_events ((coalesce(asin, sku)), occurred_at DESC);
 
 -- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
 -- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
@@ -292,8 +300,17 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     synced_at timestamptz NOT NULL DEFAULT now()
 );
 -- 收集侧补列(2026-08-11 过渡遗留):src_sku/biz_cn/pushed_at 当天曾用于
--- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
--- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
+-- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下)。
+-- ⚠ 2026-08-14 逐列复核订正:原注释说"三列不再被任何代码消费"——**src_sku 是活的**,
+--    在 services/risk_gate.py:59-65 的 INSERT 列清单里。真正零消费的只有两列:
+--      biz_cn    —— 全仓命中都在 catalog.asin_blacklist / brand_err_hits,没一处触及本表
+--      pushed_at —— 真实读写全在 workflows/blacklist_push.py 的另两张表
+--    这两列**未删**:DROP COLUMN 不可回滚,而它们的存在成本近乎零
+--    (一个恒 false 的 boolean + 一个恒 NULL 的 timestamp)。要删先连库自证:
+--      SELECT count(*) FILTER (WHERE biz_cn IS TRUE),
+--             count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
+--      FROM catalog.brand_blacklist;   -- 前两个为 0 才谈删
+-- 本表回归单一职责:
 -- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
 
 -- 黑名单中心补全两维(所有者定稿 2026-08-13:黑名单只维护一份——审核的
@@ -386,6 +403,17 @@ CREATE VIEW catalog.product_risk AS
               ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         -- 审核维度(2026-08-14 接消费端):在此之前 audit_passed/audit_rejected
+         -- **零读者** —— 全库 119 万条事件写了没人看,而"审核拒了但还在架"
+         -- 这类跨域问题却要靠 JOIN 两张表现拼。病历的价值本就是把审核结论、
+         -- 上架动作、平台观测串在**一条时间线**上,这几列就是兑现它。
+         count(*) FILTER (WHERE event = 'audit_passed')          AS audit_pass_times,
+         count(*) FILTER (WHERE event = 'audit_rejected')        AS audit_reject_times,
+         max(occurred_at) FILTER (WHERE event = 'audit_passed')  AS last_passed_at,
+         max(occurred_at) FILTER (WHERE event = 'audit_rejected') AS last_rejected_at,
+         -- 上架时点:与上面两个比大小就能答"审核在上架之前还是之后"
+         max(occurred_at) FILTER (WHERE event IN
+             ('item_appeared', 'list_submitted', 'match_submitted')) AS last_listed_at,
          max(occurred_at) AS last_event_at
   FROM catalog.product_events GROUP BY 1;
 
@@ -415,6 +443,65 @@ CREATE OR REPLACE VIEW catalog.status_changes AS
          detail->>'old' AS old_status, detail->>'new' AS new_status,
          detail->'reasons' AS reasons, occurred_at
   FROM catalog.product_events WHERE event = 'status_changed';
+
+-- 审核结论 × 上架现状的冲突面(2026-08-14 所有者要求:"病历里一眼看到
+-- 审核结论",让「审核拒了但还在架」「刚上架就被拒」一条 SQL 出来)。
+--
+-- 为什么不能只看 product_risk:审核事件的 store 是 **NULL**(审核不分店铺,
+-- 一个 ASIN 一个结论),所以它们进得了全局 product_risk,却进不了
+-- product_risk_store(那个视图 WHERE store IS NOT NULL)。要回答"哪个店里
+-- 哪些产品拒了还挂着",必须拿全局审核结论去 JOIN 店铺维度的现状表。
+--
+-- ⚠ 本视图**不依赖 product_risk**,时间线自己就地聚合。理由是 db_init 幂等:
+-- product_risk 是 DROP+CREATE(列改名的历史遗留),而 PG 不允许 DROP 一个
+-- 还有依赖者的视图 —— 依赖它就等于给 db_init 埋一个"第二次跑就报错"的雷。
+--
+-- 两个标志的口径差别(**别混用**):
+--   rejected_still_listed  = 当前结论是 reject 且商品此刻在架。看的是**现状**,
+--                            problem_scan 就按这个建"删除"建议。
+--   rejected_after_listing = 最近一次判拒发生在最近一次上架**之后**。看的是
+--                            **时序**:先上了架、后来才被判拒 ⇒ 上架时的闸没拦住
+--                            (或当时还没审)。这类是审核链本身的漏拦线索,
+--                            与"该不该下架"是两个问题。
+-- ⚠ 本视图 2026-08-14 重写过一次(首版查询挂死,生产实遇)。首版的两个错:
+--   ① LATERAL 对 walmart_items 的**每一行**扫一遍 product_events —— 关联条件
+--      写成 `coalesce(ev.asin, ev.sku) = ...`,而当时表上只有裸 sku 的索引,
+--      表达式匹配不上 ⇒ 每行一次几百万行全表扫描。已补表达式索引
+--      product_events_identity_idx(见上),表达式与这里**逐字一致**才生效。
+--   ② 外层 WHERE 里写了 `... OR e.last_rejected_at IS NOT NULL`,OR 引用了
+--      LATERAL 的产出 ⇒ PG 必须先为每一行算完 LATERAL 才能过滤,一行都剪不掉。
+-- 现在先用 CTE 把基集缩到"在架 且 当前判拒"(小),再去碰事件表。
+-- 顺带一个语义收紧:只看**当前**结论是 reject 的。曾经拒过、现在已经过了的
+-- 不是冲突(那是审核改判,正常),首版把它们捞进来既慢又答非所问。
+DROP VIEW IF EXISTS catalog.audit_listing_conflicts;
+CREATE VIEW catalog.audit_listing_conflicts AS
+  WITH live_rejected AS (
+      SELECT w.store, w.sku, w.published_status, w.last_seen_at,
+             p.asin, p.audit_status, p.audit_reason, p.audited_at, p.audit_version
+      FROM catalog.walmart_items w
+      JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
+      WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
+        AND p.audit_status = 'rejected'
+  )
+  SELECT lr.store, lr.sku, lr.asin,
+         lr.published_status, lr.last_seen_at,
+         lr.audit_status, lr.audit_reason, lr.audited_at, lr.audit_version,
+         e.last_rejected_at, e.last_passed_at, e.last_listed_at,
+         coalesce(e.audit_reject_times, 0)              AS audit_reject_times,
+         true                                           AS rejected_still_listed,
+         (e.last_rejected_at IS NOT NULL
+          AND e.last_listed_at IS NOT NULL
+          AND e.last_rejected_at > e.last_listed_at)    AS rejected_after_listing
+  FROM live_rejected lr
+  LEFT JOIN LATERAL (
+      SELECT max(occurred_at) FILTER (WHERE event = 'audit_rejected') AS last_rejected_at,
+             max(occurred_at) FILTER (WHERE event = 'audit_passed')   AS last_passed_at,
+             max(occurred_at) FILTER (WHERE event IN
+                 ('item_appeared', 'list_submitted', 'match_submitted')) AS last_listed_at,
+             count(*) FILTER (WHERE event = 'audit_rejected')         AS audit_reject_times
+      FROM catalog.product_events ev
+      WHERE coalesce(ev.asin, ev.sku) = lr.asin   -- 与身份键索引逐字一致
+  ) e ON true;
 
 -- *_feed_failed 的读侧(此前只写不读):五类 feed 的逐 SKU 失败回执,
 -- kind ∈ delete/retire/maintenance/match/list
@@ -534,6 +621,15 @@ CREATE INDEX IF NOT EXISTS order_lines_po_idx    ON orders.order_lines (po_id);
 CREATE INDEX IF NOT EXISTS order_lines_sku_idx   ON orders.order_lines (sku);
 CREATE INDEX IF NOT EXISTS order_lines_date_idx  ON orders.order_lines (store, order_date DESC);
 CREATE INDEX IF NOT EXISTS order_lines_audit_idx ON orders.order_lines (audit_status);
+-- 行的来源(2026-08-15):NULL/空 = order_sync 从 Walmart API 拉的完整行;
+-- '历史数据' = order_history_import 从旧汇总表导入的**残缺行**(只有下单时间/
+-- 店铺/PO/SKU/品名/数量/金额,无物流地址、无 raw、销售状态一律填 Delivered)。
+-- 两个消费方按它区分:order_center_push 不把历史行推去飞书(运营看到的会是
+-- 一批半截行)。⚠ 本列在 _ORDER_LINE_COLS 里,order_sync 覆盖同一行时会把它
+-- 写回 NULL —— 那正是想要的:API 拉到真行之后它就不再是历史行,自动回到推送流。
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS source text;
+CREATE INDEX IF NOT EXISTS order_lines_source_idx ON orders.order_lines (source)
+    WHERE source IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号
@@ -796,6 +892,11 @@ CREATE INDEX IF NOT EXISTS scrape_failures_type_idx
     ON ops.scrape_failures (error_type, recorded_at DESC);
 
 -- 采集失败排行 + 顽固失败(连续多批采不到的 ASIN = 该下架或人工看的信号)
+-- ⚠ **零程序读者是设计如此**(2026-08-14 盘点登记,防下次被判死):与
+-- catalog.product_risk_store / status_changes / feed_failures、ops.v_feed_error_stats
+-- 同性质——留给人工与 AI 排查用的聚合面,不是给代码 SELECT 的。
+-- 判它死之前先连库:SELECT query, calls FROM pg_stat_statements
+--   WHERE query ILIKE '%v_scrape_failure_stats%';  "代码不读" ≠ "没人 SELECT"。
 CREATE OR REPLACE VIEW ops.v_scrape_failure_stats AS
   SELECT error_type,
          count(*) AS 次数, count(DISTINCT asin) AS 影响ASIN数,
@@ -923,6 +1024,53 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scope, key)
 );
+
+-- ── 处置建议(批次 E,批复 #8:问题商品链"建议"与"执行"分离)────────────
+-- 为什么要这张表:原来 problem_product_cleanup 一个工作流里既做"查库归类决定
+-- 该怎么处置",又做"发 feed 真删真补"。两件事的风险等级差着数量级——前者只读
+-- 可以随便跑,后者 DELETE_ITEM 不可逆。合在一起的后果是:想看看该删哪些,就得
+-- 跑一个 DANGEROUS 工作流;而建议本身没有留痕,事后无从追"当初为什么删它"。
+--
+-- 拆开后:problem_scan(只读,随时可跑)产出 suggested 行;
+--         problem_product_cleanup(危险,--execute)只消费 suggested,不自己决策。
+--
+-- 状态机 suggested → executing → confirmed / ineffective:
+--   suggested    扫描件给出的建议,还没动手
+--   executing    执行件已提交 feed(feed_id 落在本行),等观测
+--   confirmed    观测确认生效(delete_verified / 反补后重新 PUBLISHED)
+--   ineffective  观测确认**没**生效(delete_not_effective:回执说成了但商品还在架
+--                ——所有者实证过的真实故障模式),下轮重新建议
+--   withdrawn    扫描件本轮**不再建议**它了(问题自己好了 / 不再命中闸)。
+--                建议是有时效的:昨天建议删 A、今天 A 恢复正常,那条 suggested
+--                还挂着的话执行件照样会删。撤销只动 suggested,executing 不碰
+--                (feed 已经在沃尔玛队列里,撤销无意义,归 settle 按观测判)
+-- 生效判定**不自己实现**:直接读 catalog.product_events 里 catalog_sync 经
+-- services/product_events.verify_deletions 落的 delete_verified /
+-- delete_not_effective ——"不信回执信观测"那套已经在跑,再写一份只会两份漂移。
+CREATE TABLE IF NOT EXISTS ops.dispositions (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store        text NOT NULL,
+    sku          text NOT NULL,
+    asin         text,                  -- 有则记,便于与产品中心/黑名单对齐
+    source       text NOT NULL,         -- scan / audit / tro(预留)
+    action       text NOT NULL,         -- relist / delete / retire
+    category     text,                  -- services/problem_products 归类码
+    reason       text,                  -- 依据(人读:沃尔玛给的 unpublished_reasons 等)
+    status       text NOT NULL DEFAULT 'suggested',
+    feed_id      text,                  -- executing 起有值
+    suggested_at timestamptz NOT NULL DEFAULT now(),
+    executed_at  timestamptz,
+    settled_at   timestamptz,
+    detail       jsonb NOT NULL DEFAULT '{}'
+);
+-- 同一 (店铺,SKU,动作) **同时只能有一条未落定的建议**:扫描件每轮重跑要幂等,
+-- 不能每跑一次就堆一行;而已落定(confirmed/ineffective)的行是病历,必须留着,
+-- 所以用**部分**唯一索引只约束未落定态。
+CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
+    ON ops.dispositions (store, sku, action)
+    WHERE status IN ('suggested', 'executing');
+CREATE INDEX IF NOT EXISTS dispositions_status_idx
+    ON ops.dispositions (status, suggested_at);
 
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──

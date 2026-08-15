@@ -1,3 +1,14 @@
+# ⚠ 本文件**不被任何代码加载**(2026-08-14 盘点确认:全仓仅 services/audit_l3.py:19
+#    一处提及,且是否定性声明「不迁」;refdata/audit 下的 yaml 一律经
+#    registry.paths.audit_seed_file(name) 取路径,该函数 4 个调用点的实参全是字面量,
+#    不含本文件名;audit_l3.py 连 `import yaml` 都没有,物理上无法读取)。
+#
+# 它的身份是**参考资料**:services/audit_l3.py 的 system prompt S4 压缩块里那两行
+# 关键词,展开出处就是这份表(yaml 独有词如 Confederate / erotic 已内联进
+# audit_l2.py 与 audit_l3.py 的 Python 字面量)。将来要调 L3 提示词的关键词,
+# 照这份表改再同步内联——**别当死文件删掉**,也别接线加载
+# (迁移决定:旧仓 l3_keywords.yaml 全套不迁,见 audit_l3.py:19)。
+
 # L3 LLM prompt 使用的关键词配置 (原本硬编码在 l3_llm.py, 迁到 yaml 便于维护)
 #
 # 这些词不是"命中即拒"的硬规则, 而是给 LLM 的判定提示

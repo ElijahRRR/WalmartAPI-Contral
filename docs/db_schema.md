@@ -38,17 +38,15 @@ CREATE TABLE catalog.products (
     amazon_category text,
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
-    -- 审核结论(audit_sync 从审核系统库 walmart_audit 回流,2026-08-12 接通)
-    audit_status    text,        -- pass / reject / pending(审核系统 verdict 原文)
-    audit_reason    text,        -- 拒绝理由摘要(pass 恒 NULL)
-    walmart_pt      text,        -- 审核产出的 Product Type 小类
-                                 -- (大类按 PT JOIN risk_product_types.category)
+    -- 审核结论(由审核服务产出)
+    audit_status    text,        -- pending / approved / rejected
+    audit_reason    text,
+    walmart_pt      text,        -- 映射的沃尔玛 Product Type
     audited_at      timestamptz,
-    audit_version   text,        -- 审核系统 audit_runs.run_id(溯源+幂等比对键)
+    audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
     -- (原"复用资产/归属"五列 assigned_upc/listing_attrs/last_feed_id/store/owner
     --  已于 2026-08-12 退役:零读写,职责被 catalog.upc_pool / catalog.llm_cache /
-    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留,同日由分配 A0 的
-    --  audit_sync 接通写入)
+    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留 = 二期审核服务接缝)
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (marketplace, asin)
@@ -85,12 +83,6 @@ CREATE VIEW catalog.latest_snapshot AS
 
 使用约定:审核服务只关心 products(slow_hash 未变则不重审);
 价格库存维护读 latest_snapshot;上架 workflow 两层 JOIN 取完整输入。
-
-审核结论回流:`audit_sync` 工作流直连审核系统库(walmart_audit,
-`registry/db.audit_conn` 只读)取每 ASIN 最新 audit_runs 写五列;
-每轮全量对齐(pass 有 45 天 TTL 可能翻案),audit_version 比对保证
-"内容没变就不写"。products 缺行的 ASIN 只计数报告(身份行由
-product_ingest 建,重采落库后下轮自动补上)。
 
 **"这个 ASIN 为什么没有新数据"的两条查法**(2026-08-09 补齐,互补不重叠):
 
@@ -193,7 +185,8 @@ CREATE TABLE catalog.amazon_cat_blacklist (
 -- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
 -- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清
 -- 2026-08-11)。历史重建走 blacklist_push -p rebuild_brand=1(擦净重灌 +
--- beyKyi 整表重写),日常由 problem_product_cleanup 尾段实时入账。
+-- beyKyi 整表重写),日常由 problem_scan 尾段实时入账
+-- (2026-08-14 批次 E:归类跟着决策搬到扫描件,黑名单收集是归类的副产品)。
 CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
     added_date, src_sku, src_store, biz_cn, pushed_at, created_at);
 -- 采集库缺品牌的候选走 brand_scrape 工作流补货(推采集→摄取→入账;
@@ -332,7 +325,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
-| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 + order_history_import(两年历史 excel 一次性,DO NOTHING 永不覆盖 API 行;采购域字段只进 raw) |
+| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流 | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
@@ -426,7 +419,11 @@ CREATE TABLE ops.store_kpi_daily (
     seller_id        text,
     store_status     text,
     payment_status   text,
-    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)
+    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)。
+                                     -- store_status 有值且非 ACTIVE(SUSPENDED/
+                                     -- TERMINATED 等)→ 默认「不可售」:这些店不进
+                                     -- 影刀清单,不给默认值会永远空着(2026-08-15)。
+                                     -- 推导自本轮 store_status,非跨日回填
     items_online     integer,        -- 来自 catalog.walmart_items(PG 复用,不再调 API)
     items_in_stock   integer,
     items_out_stock  integer,
@@ -488,7 +485,7 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
 另收 **category='LEGACY'**(source='历史继承'):旧审核系统随迁的历史黑名单
 ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统一)。
-写入方 problem_product_cleanup 尾段 + asin_blacklist_import(一次性);
+写入方 problem_scan 尾段(2026-08-14 批次 E 前是 problem_product_cleanup) + asin_blacklist_import(一次性);
 消费方:上架拦截 + 审核 Phase0 ASIN 闸(全表,不分类别)。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
@@ -553,3 +550,46 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
 保留 14 天,完成/失败均发飞书通知。
 
 > 注:`...` 处的列清单由执行 AI 在实现对应工作流时,按旧系统实际字段补全并回写本文档。
+
+
+## catalog.audit_listing_conflicts(2026-08-14 新增)
+
+**审核结论 × 上架现状的冲突面。** 所有者要求"病历里一眼看到审核结论",
+让「审核拒了但还在架」「刚上架就被拒」一条 SQL 出来。
+
+两个标志的口径差别(**别混用**):
+
+| 标志 | 看的是 | 用途 |
+|---|---|---|
+| `rejected_still_listed` | **现状**:当前结论 reject 且商品此刻在架 | problem_scan 按它建"删除"建议 |
+| `rejected_after_listing` | **时序**:最近一次判拒晚于最近一次上架 | 上架时那道闸没拦住(或当时还没审)= **审核链漏拦线索** |
+
+⚠ 两件事,别当成一件:前者问"该不该下架",后者问"我们的闸为什么没拦住"。
+
+**为什么不能只看 product_risk**:审核事件的 `store` 是 NULL(审核不分店铺),
+所以它们进得了全局 `product_risk`,却进不了 `product_risk_store`
+(`WHERE store IS NOT NULL`)。店铺维度的问题必须 JOIN 现状表。
+
+**为什么本视图不依赖 product_risk**:`product_risk` 是 DROP+CREATE
+(列改名的历史遗留),而 PG 不允许 DROP 一个还有依赖者的视图 —— 依赖它
+等于给 `db_init` 埋一个"第二次跑就报错"的雷。所以时间线就地聚合。
+
+### ⚠ 首版查询挂死的教训(2026-08-14 生产实遇,已修)
+
+首版写完当天就把生产库查挂了。两个错叠在一起:
+
+1. **表达式关联没有对应索引**。LATERAL 用 `coalesce(ev.asin, ev.sku) = ...`
+   关联,而 `product_events` 当时只有 `(sku, occurred_at)` 与 `(store, sku)`
+   两个建在**裸 sku** 上的索引 —— 表达式匹配不上,于是对外层每一行做一次
+   几百万行的全表扫描。
+   **已补** `product_events_identity_idx ON (coalesce(asin, sku), occurred_at DESC)`。
+   ⚠ 表达式索引必须与查询里的表达式**逐字一致**才会被用上,改一边就得改另一边。
+   本表的身份键 2026-08-11 就定稿为 `coalesce(asin, sku)`,索引却一直建在裸 sku
+   上 —— 这个缺口在本视图之前没人踩到,因为别的消费方都是**一次**全表聚合
+   (product_risk 那种 GROUP BY),不是逐行关联。
+2. **外层 WHERE 引用了 LATERAL 的产出**(`... OR e.last_rejected_at IS NOT NULL`)
+   ⇒ PG 必须先为每一行算完 LATERAL 才能过滤,一行都剪不掉。
+   现在改成先用 CTE 把基集缩到"在架 且 当前判拒"(小),再去碰事件表。
+
+顺带一个**语义收紧**:只看**当前**结论是 reject 的。曾经拒过、现在已经过了的
+不是冲突(那是审核改判,正常)——首版把它们捞进来既慢又答非所问。

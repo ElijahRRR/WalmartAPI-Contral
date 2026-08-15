@@ -318,6 +318,32 @@ def test_sync_stateful_bootstraps_when_state_empty(monkeypatch):
     assert calls["create"] is None and calls["update"] is None
 
 
+def test_bootstrap_rejects_wrong_table_id(monkeypatch):
+    """登记错表守卫(2026-08-14 从已删除的 feishu.sync_by_key 移植过来)。
+
+    表里明明有行、却一行都读不出键字段 ⇒ 大概率 .env 里 table_id 填错、指向了
+    别人的表。此时状态是空的,下一步会把窗口内全部行当"缺失"新建——**把人家的
+    表写坏且不可逆**。必须炸,不能静默当成空表。
+    """
+    t = resources.ORDER_PERF
+    calls = _state_env(monkeypatch, {})
+    monkeypatch.setattr(feishu, "list_records", lambda table, field_names: [
+        {"record_id": "x1", "fields": {"别的字段": "v"}},
+        {"record_id": "x2", "fields": {"别的字段": "w"}}])
+    with pytest.raises(feishu.FeishuError, match="疑似 table_id 登记错表"):
+        ocp._sync_stateful(t, {"k1": {"perf_key": "k1"}})
+    assert calls["create"] is None and calls["update"] is None   # 一个字都没写
+
+
+def test_bootstrap_empty_table_is_not_an_error(monkeypatch):
+    """守卫的边界:表**本身就是空的**(0 行)是正常首轮,不能误判成登记错表。"""
+    t = resources.ORDER_PERF
+    _state_env(monkeypatch, {})
+    monkeypatch.setattr(feishu, "list_records", lambda table, field_names: [])
+    c, u, s = ocp._sync_stateful(t, {"k1": {"perf_key": "k1"}})
+    assert (c, u, s) == (1, 0, 0)            # 照常建行
+
+
 def test_sync_stateful_write_failure_drops_state(monkeypatch):
     t = resources.ORDER_PERF
     calls = _state_env(monkeypatch, {"k1": ("r1", "stale")})

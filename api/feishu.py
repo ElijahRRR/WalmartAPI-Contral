@@ -231,6 +231,11 @@ def batch_update(table: Bitable, updates: list[dict]) -> int:
     return n
 
 
+# ⚠ 本函数当前**无仓内调用方**,但它是 HTTP 原语(与 batch_create/batch_update
+# 同级),不是策略——2026-08-14 死代码盘点时唯一的调用方 sync_by_key 被删,
+# 它本身保留:哪天要删行时不必重写一遍分批/节流/错误模型。
+# 真要删行前先想清楚:订单中心六表的纪律是**任何表都不删行**(主订单表是
+# 永久枢纽,行间有关联字段,删行断链),见 workflows/order_center_push.py 头注。
 def batch_delete(table: Bitable, record_ids: list[str]) -> int:
     """输入:record_id 列表 → 输出:删除数。仅限展示类表重建;登记类表永不删人写的行。"""
     t = table.require()
@@ -302,71 +307,6 @@ def _row_hash(fields: dict, hash_field: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def sync_by_key(table: Bitable, key_field: str, desired: dict[str, dict],
-                *, delete_stale: bool = True,
-                hash_field: str | None = None) -> tuple[int, int, int]:
-    """输入:表 + 去重键字段名 + {键: fields dict} → 输出:(新建, 更新, 删除) 计数。
-
-    投影同步(PG 权威):键不存在则建,存在则**只覆盖 fields 里给出的字段**
-    (desired 里为 None 的字段显式送 null 清空,不能省略——省略=保留飞书旧值;
-    因此人工/关联字段只要不出现在 fields 里就绝不会被碰)。
-
-    hash_field(变更检测,万行级表的写放大治理):写行时同时存载荷指纹;
-    下一轮把指纹随键读回,指纹一致的行跳过不写——写请求量从"窗口行数"
-    降到"真实变化行数"。副作用要知情:人工改动程序列后,只要 PG 侧没变化,
-    该行不会被重写纠正(指纹仍一致)——程序列本就不该手改。
-
-    delete_stale=True:飞书多出的键删除,重复/无键行清理——仅限程序独占展示表。
-    delete_stale=False:任何行都不删(键消失只是停止刷新);用于与人工列/
-    关联字段共存的表(删行会断关联、丢人工数据),重复/无键行仅告警。
-
-    防错登记守卫:表里已有记录但没有任何一行能读出键字段 → 大概率 table_id
-    填错(指向了别的表),拒绝执行而不是把人家的表写坏。
-    """
-    field_names = [key_field] + ([hash_field] if hash_field else [])
-    existing = list_records(table, field_names=field_names)
-    by_key: dict[str, str] = {}
-    old_hash: dict[str, str] = {}
-    dupes: list[str] = []
-    for rec in existing:
-        k = _plain_text(rec["fields"].get(key_field)).strip()
-        if not k or k in by_key:
-            dupes.append(rec["record_id"])
-        else:
-            by_key[k] = rec["record_id"]
-            if hash_field:
-                old_hash[k] = _plain_text(rec["fields"].get(hash_field)).strip()
-    if existing and not by_key:
-        raise FeishuError(None,
-                          f"表「{table.name}」现有 {len(existing)} 行均无「{key_field}」字段值,"
-                          f"疑似 table_id 登记错表,拒绝同步(会写坏对方数据)")
-    if dupes:
-        logger.warning("表「%s」发现 %d 行重复/无键记录%s", table.name, len(dupes),
-                       ",将删除" if delete_stale else "(不删,请人工核查)")
-
-    if hash_field:
-        for f in desired.values():
-            f[hash_field] = _row_hash(f, hash_field)
-
-    creates = [f for k, f in desired.items() if k not in by_key]
-    updates = [{"record_id": by_key[k], "fields": f}
-               for k, f in desired.items()
-               if k in by_key and (not hash_field
-                                   or old_hash.get(k) != f[hash_field])]
-    unchanged = len(desired) - len(creates) - len(updates)
-    deletes = (dupes + [rid for k, rid in by_key.items() if k not in desired]) \
-        if delete_stale else []
-    if creates:
-        batch_create(table, creates)
-    if updates:
-        batch_update(table, updates)
-    if deletes:
-        batch_delete(table, deletes)
-    logger.info("表「%s」同步:新建 %d,更新 %d,删除 %d%s",
-                table.name, len(creates), len(updates), len(deletes),
-                f",指纹一致跳过 {unchanged}" if hash_field else "")
-    return len(creates), len(updates), len(deletes)
-
 
 def update_by_key(table: Bitable, key_field: str,
                   desired: dict[str, dict]) -> tuple[int, list[str]]:
@@ -378,7 +318,7 @@ def update_by_key(table: Bitable, key_field: str,
     键不在表里不是错误——调用方通常在下一轮(等对方建完行)自然补上,
     返回缺键清单供调用方计数与告警。
 
-    与 sync_by_key 一样:只覆盖 fields 里给出的列,人工列绝不会被碰。
+    只覆盖 fields 里给出的列(省略的列保留飞书旧值),人工列绝不会被碰。
     """
     existing: dict[str, str] = {}
     for rec in list_records(table, field_names=[key_field]):
@@ -394,21 +334,6 @@ def update_by_key(table: Bitable, key_field: str,
                 f",{len(missing)} 个键不在表中(待建行方补齐)" if missing else "")
     return len(updates), missing
 
-
-def ensure_keys(table: Bitable, key_field: str, keys: set[str]) -> int:
-    """输入:表 + 键字段名 + 应存在的键集合 → 输出:本次补建的行数。
-
-    人工域/枢纽表(如主订单表、采购表)的键补齐:缺键的建一行且**只写键字段**,
-    既有行永不更新、永不删除——其余列全部归人工与关联字段所有。
-    """
-    existing = {_plain_text(r["fields"].get(key_field)).strip()
-                for r in list_records(table, field_names=[key_field])}
-    missing = sorted(k for k in keys if k and k not in existing)
-    if missing:
-        batch_create(table, [{key_field: k} for k in missing])
-    logger.info("表「%s」键补齐:新建 %d 行(已有 %d)",
-                table.name, len(missing), len(existing))
-    return len(missing)
 
 
 def _call_multipart(path: str, *, data: dict, files: dict, timeout=120) -> dict:

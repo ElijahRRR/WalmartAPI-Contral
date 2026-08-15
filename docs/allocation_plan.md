@@ -553,7 +553,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | **A0 数据接线** | 产品全量入库 / 审核结论 / 订单历史 / 店铺目标四列 | ✅ 收口(见下) |
 | **A0.5 存量审计** | `alloc_audit`:控制台六节结论 + 明细 csv **5 份** | ✅ 首跑完成 2026-08-15;**订单入库后需重跑**——冲突处置的"留销量大的店"首跑时无订单数据,只能按件数打平(报告会显式点破,不会装作判过了) |
 | **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
-| **A1.5 订单 ASIN 归一** | `order_lines.asin` 列(schema.sql 幂等迁移块 + 部分索引)+ `order_asin_normalize` 工作流。所有者定稿 2026-08-15 晚:「就按 sku=asin 走,绝大部分能拿到,少量拿不到没关系」⇒ 走 `services/sku_asin.extract_asin`(已覆盖四形态:裸 ASIN / 三段式 / 纯数字倒查 item_id / 其他),**提不出的留 NULL 不猜**。幂等(`WHERE asin IS NULL`),规则扩充后可重跑再捞一遍 | ✅ **代码就绪 2026-08-15**,待生产跑 |
+| **A1.5 订单 ASIN 归一** | `order_lines.asin` 列(schema.sql 幂等迁移块 + 部分索引)+ `order_asin_normalize` 工作流。所有者定稿 2026-08-15 晚:「就按 sku=asin 走,绝大部分能拿到,少量拿不到没关系」⇒ 走 `services/sku_asin.extract_asin`(已覆盖四形态:裸 ASIN / 三段式 / 纯数字倒查 item_id / 其他),**提不出的留 NULL 不猜**。幂等(`WHERE asin IS NULL`),规则扩充后可重跑再捞一遍。⚠ **写入侧同时改了**:`order_sync`(经 `extract_order_lines`)与 `order_history_import` **落库当场**填 asin,所以以后新进的行不是空的;扫尾工作流只管存量补洗 + 纯数字 item_id 那一跳(要查库,写入路径做不了)。`upsert_order_lines` 给该列配了 `COALESCE(EXCLUDED.asin, t.asin)` 守卫 —— 否则同步侧对纯数字算不出 asin,每轮都会把扫尾填好的值冲回 NULL | ✅ **代码就绪 2026-08-15**,待生产跑 |
 | **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | ⬜ 待 A1/A1.5 |
 | **A3 学习型** | 权重离线校准(远景) | ⬜ 快照从 A2 第一天就落 |
 

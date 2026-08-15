@@ -23,6 +23,16 @@
 所以消费方一律按 `asin IS NOT NULL` 过滤,解析不了的那批**退出销量维度**
 但**不影响店×SKU 维度**(那一层本来就用 sku,不需要 asin)。
 
+**它是扫尾不是主路**(与 `sku_normalize` 同一分工):`order_sync` 与
+`order_history_import` **落库当场**就调 `sku_asin.extract_asin` 填好 asin,
+所以新进的行不会是空的。本工作流只负责两件事 ——
+  ① **存量补洗**(加列之前入库的历史行);
+  ② **纯数字 item_id 形态**:那一跳要查 `catalog.walmart_items`,
+     写入路径上做不了(逐行查库),只能事后扫。
+⚠ 正因为同步侧对纯数字形态算不出 asin,`upsert_order_lines` 给这一列配了
+`COALESCE(EXCLUDED.asin, t.asin)` 守卫 —— 否则每轮同步都会把本工作流
+填好的值冲回 NULL,那一列永远填不满。
+
 **幂等**:`WHERE asin IS NULL`,重复跑只补新增行;规则扩充后重跑会把
 上一轮解析不了的再捞一遍。
 """

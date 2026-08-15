@@ -137,3 +137,47 @@ def test_normalize_agrees_with_the_event_ledger_cleaner():
     assert mine["A109-B08QF9XLMH-02"] == "B08QF9XLMH"   # 曾被过严规则冤枉的那 208 个
     # 两个工作流都只经由 sku_asin,没有各自的规则副本
     assert "re.compile" not in open(sn.__file__, encoding="utf-8").read()
+
+
+# ── 实时链路自己填,扫尾工作流只管补漏(所有者 2026-08-15 晚追问)──────────
+
+def test_order_sync_fills_asin_at_write_time():
+    """新进的订单行**落库当场**就有 asin,不留给后台补。
+
+    否则每次 order_sync 之后,最新的订单——也就是最有价值的选品信号——
+    在产品/品牌销量维度里全是空的,直到有人想起来重跑扫尾工作流。
+    """
+    from services import order_lines as ol
+    assert "asin" in ol._ORDER_LINE_COLS
+    rows = ol.extract_order_lines("A085", {
+        "purchaseOrderId": "108906521136562",
+        "customerOrderId": "C1", "orderDate": 1700000000000,
+        "orderLines": {"orderLine": [{
+            "lineNumber": "1",
+            "item": {"sku": "XKJ-B0GXX75JN5-39.98", "productName": "T"},
+            "orderLineQuantity": {"amount": "1"},
+            "orderLineStatuses": {"orderLineStatus": [{"status": "Shipped"}]},
+        }]}})
+    assert rows[0]["asin"] == "B0GXX75JN5"
+
+
+def test_resync_never_wipes_an_asin_the_sweeper_resolved():
+    """⚠ 纯数字 sku 在同步侧提不出 asin(要查 walmart_items),裸写
+    `EXCLUDED.asin` 会把扫尾工作流填好的值**冲回 NULL** —— 每轮同步抹一次,
+    那一列永远填不满。必须 COALESCE 守着。
+    """
+    from services import order_lines as ol
+    assert ol._ASIN_GUARD == "COALESCE(EXCLUDED.asin, t.asin)"
+    # 纯数字形态在纯 Python 侧确实提不出 —— 这正是要 guard 的原因
+    assert sku_asin.extract_asin("102460018738") is None
+
+
+def test_history_import_also_fills_asin():
+    """历史导入同样当场填,否则 15 万行全靠扫尾补一遍。"""
+    from workflows import order_history_import as ohi
+    assert "asin" in ohi._INSERT and "%(asin)s" in ohi._INSERT
+    rows, _ = ohi.parse_rows(
+        ["合并键", "统一订单日期", "店铺名称", "SKU", "商品标题", "数量", "销售额"],
+        [["108906521136562B0BC6ZBD7M", "2024-03-05", "S", "B0BC6ZBD7M",
+          "T", "1", "23.1"]])
+    assert rows[0]["asin"] == "B0BC6ZBD7M"

@@ -239,6 +239,49 @@ def drop_conflicting_relists(rows: list[dict],
     return kept, len(rows) - len(kept)
 
 
+def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
+               n_items: int) -> list[str]:
+    """输入:**最终会落库的**建议行 + 计数 → 输出:总览与分店明细文本。纯函数。
+
+    ⚠ **必须在剔矛盾之后调**(2026-08-14 生产实遇):首版在剔除前就把 plan()
+    的原始数打出来了(报"反补 10"而实际只落 8),分店明细同理 —— 人眼闸门看的
+    就是这几个数,不该还要自己拿底下那行"剔除 2 条"做减法。
+
+    ⚠ **按建议行统计,不按 plan() 的桶**:`n['delete']` 不含顽固双击那批
+    (那支 continue 前没有 `n['delete'] += 1`),照它报会少一大截 —— 本轮实测
+    plan 报 195、实际 delete 桶 217。
+    """
+    by_act: dict[str, int] = {}
+    for r in allrows:
+        by_act[r["action"]] = by_act.get(r["action"], 0) + 1
+    out = [f"problem_scan:问题商品 {n_items} 行 → 建议 反补 "
+           f"{by_act.get('relist', 0)},删除 {by_act.get('delete', 0)}"
+           f"(其中审核判拒 {len(audit_rows)},反补满额转删 {n['fallback']}),"
+           f"顽固停用 {by_act.get('retire', 0)};"
+           f"Stage 排除 {n['stage']},在途/待观测跳过 {n['inflight']},"
+           f"非 ACTIVE 店跳过 {n['inactive']}"]
+    per_store: dict[str, dict] = {}
+    for r in allrows:
+        b = per_store.setdefault(r["store"],
+                                 {"relist": [], "delete": [], "retire": []})
+        b[r["action"]].append(r)
+    for store, b in sorted(per_store.items()):
+        cats: dict[str, int] = {}
+        for r in b["delete"] + b["relist"]:
+            k = r.get("category") or "-"
+            cats[k] = cats.get(k, 0) + 1
+        line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
+                + (f",顽固停用 {len(b['retire'])}" if b["retire"] else "")
+                + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
+                + "}")
+        if b["delete"]:
+            line += f",删除样本={[(r['sku'], r.get('category')) for r in b['delete'][:5]]}"
+        if b["relist"]:
+            line += f",反补样本={[(r['sku'], r.get('category')) for r in b['relist'][:3]]}"
+        out.append(line)
+    return out
+
+
 def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
     """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
     fresh = [it for it in items if "category" in it
@@ -319,26 +362,7 @@ def run(params: dict) -> str:
 
     plans, n = plan(items, inflight, attempts, inactive, stubborn)
     rows = to_dispositions(plans)
-    lines = [
-        f"problem_scan:问题商品 {len(items)} 行 → 建议 反补 {n['relist']},"
-        f"删除 {n['delete']}(含反补满额转删 {n['fallback']}),"
-        f"Stage 排除 {n['stage']},在途/待观测跳过 {n['inflight']},"
-        f"非 ACTIVE 店跳过 {n['inactive']},顽固双击 {n['stubborn']}"]
-    for store, b in sorted(plans.items()):
-        if not (b["relist"] or b["delete"] or b["retire"]):
-            continue
-        cats: dict[str, int] = {}
-        for r in b["delete"] + b["relist"]:
-            cats[r["category"]] = cats.get(r["category"], 0) + 1
-        line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
-                + (f",顽固双击 {len(b['retire'])}" if b["retire"] else "")
-                + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
-                + "}")
-        if b["delete"]:
-            line += f",删除样本={[(r['sku'], r['category']) for r in b['delete'][:5]]}"
-        if b["relist"]:
-            line += f",反补样本={[(r['sku'], r['category']) for r in b['relist'][:3]]}"
-        lines.append(line)
+    lines: list[str] = []
 
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
@@ -360,6 +384,13 @@ def run(params: dict) -> str:
                 f"「审核拒→删」与「过期→救活」,审核判拒压过救活"
                 f"(否则会先花配额救活、再花配额删掉)")
         allrows = rows + audit_rows
+        # ⚠ 摘要在**剔矛盾之后**才生成,报的是真正会落库的数。首版在剔除之前
+        # 就把 plan() 的原始数打出来了(反补 10),而实际只落 8 —— 人眼闸门看的
+        # 就是这几个数,不该还要自己做减法。分店明细同理。
+        # 另:这里按建议行统计,不是按 plan() 的桶 —— n['delete'] 不含顽固双击
+        # 那 22 个(那支 continue 前没有 n['delete'] += 1),照它报会少 22。
+        head = _summarize(allrows, audit_rows, n, len(items))
+        lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
         if preview:
             lines.append(f"(preview:未落建议行;本轮将写 {len(allrows)} 条"
                          f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"
@@ -378,7 +409,10 @@ def run(params: dict) -> str:
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
                 store=only or None)
-    lines.append(f"建议行落账 {n_sug} 条(ops.dispositions,status=suggested)"
+        n_open = dispositions.count_open(conn)
+    lines.append(f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
+                 + (f"(差额 {n_sug - n_open} 是同一 (店铺,SKU,动作) 被两个来源"
+                    f"命中、按唯一索引合并的)" if n_sug > n_open else "")
                  + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议)" if n_wd else "")
                  + f";归类事件新记 {n_cat} 条")
     if bl_note:

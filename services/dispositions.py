@@ -212,6 +212,22 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
         return len(cur.fetchall())
 
 
+def count_open(conn, status: str = "suggested") -> int:
+    """输入:连接 → 输出:库里该状态的建议行条数。
+
+    ⚠ 与 suggest_many 的返回值**不是一回事**,摘要里别混用:
+      suggest_many → 本轮**写了多少次**(每条 upsert 各算一次)
+      count_open   → 库里**现在有多少条**
+    两者会差,差额 = 同 (店铺,SKU,动作) 被多个来源命中、被部分唯一索引合并的
+    条数(本轮实测 519 次写入 → 库里 470 条,差 49)。执行件领走的是后者,
+    所以摘要要报的也是后者 —— 首版报前者,人对不上账。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ops.dispositions WHERE status = %s::text",
+                    (status,))
+        return cur.fetchone()[0]
+
+
 def claim(conn) -> list[dict]:
     """输入:连接 → 输出:全部 suggested 建议行(dict 列表)。**只读,不改状态**。
 

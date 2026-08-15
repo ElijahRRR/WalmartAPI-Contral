@@ -360,3 +360,42 @@ def test_every_sql_param_is_cast():
     assert not bad, ("这些 SQL 参数没写显式 ::类型,PG 可能推不出来(生产实炸三次):"
                      + ", ".join(bad))
 
+
+
+def test_summarize_counts_the_rows_that_actually_land():
+    """⚠ 摘要必须报**真正会落库**的数(2026-08-14 生产实遇)。
+
+    两个坑各钉一条:
+      ① 剔矛盾之后才生成 —— 首版报 plan() 的原始数(反补 10)而实际落 8;
+      ② 按建议行统计,不按 plan() 的桶 —— n['delete'] 不含顽固双击那批
+         (那支 continue 前没有 n['delete'] += 1),照它报会少一大截。
+    """
+    allrows = [
+        {"store": "T1", "sku": "S1", "action": "delete", "category": "B"},
+        {"store": "T1", "sku": "S2", "action": "delete", "category": None},
+        {"store": "T1", "sku": "S3", "action": "retire", "category": "B"},
+        {"store": "T2", "sku": "S4", "action": "relist", "category": "A"},
+    ]
+    audit_rows = [allrows[1]]
+    n = {"fallback": 0, "stage": 1, "inflight": 2, "inactive": 3, "delete": 1}
+    head = _summ(allrows, audit_rows, n, 99)
+    # 删除报 2(含 retire 之外的全部 delete 行),不是 n['delete'] 的 1
+    assert "删除 2" in head[0] and "反补 1" in head[0]
+    assert "顽固停用 1" in head[0]
+    assert "其中审核判拒 1" in head[0]
+    # 分店明细按建议行重建,audit 来源没有 category → 显示 '-'
+    t1 = [l for l in head if l.startswith("  T1")][0]
+    assert "B:1" in t1 and "-:1" in t1
+
+
+def _summ(*a):
+    return scan._summarize(*a)
+
+
+def test_count_open_is_not_the_write_count():
+    """suggest_many 报"写了多少次",count_open 报"库里有多少条" —— 两者会差,
+    差额是被唯一索引合并的条数(本轮实测 519 次写入 → 库里 470 条)。
+    执行件领走的是后者,摘要要报的也是后者。"""
+    from services import dispositions
+    assert "SELECT count(*) FROM ops.dispositions WHERE status = %s::text" \
+        in __import__("inspect").getsource(dispositions.count_open)

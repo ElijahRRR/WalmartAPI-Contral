@@ -290,7 +290,10 @@ def test_withdraw_scoped_to_scanned_store():
     范围就会把**其余全部店铺**的待执行建议一次清空。扫了哪个范围就只能撤
     哪个范围。"""
     from services import dispositions
-    assert "(%(store)s IS NULL OR d.store = %(store)s)" in dispositions._WITHDRAW_SQL
+    # ::text 不是装饰:少了它 PG 报 "could not determine data type of
+    # parameter"(参数只出现在 IS NULL 与一次比较里,推不出类型)——生产实炸过
+    assert "(%(store)s::text IS NULL OR d.store = %(store)s::text)" \
+        in dispositions._WITHDRAW_SQL
     seen = {}
 
     class _Cur:
@@ -329,5 +332,5 @@ def test_withdraw_empty_keep_also_respects_store():
         def cursor(self): return _Cur()
 
     dispositions.withdraw_stale(_Conn(), "scan", [], "x", store="T9")
-    assert "(%(store)s IS NULL OR store = %(store)s)" in seen["sql"]
+    assert "(%(store)s::text IS NULL OR store = %(store)s::text)" in seen["sql"]
     assert seen["store"] == "T9"

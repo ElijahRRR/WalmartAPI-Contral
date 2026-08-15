@@ -142,12 +142,21 @@ def suggest_many(conn, rows: list[dict]) -> int:
 # 类型不匹配。(2026-08-14 首版就这么写的,靠复查发现——当时的测试只断言 SQL
 # **文本**,跑不到类型检查,全绿也没用。)
 # 三个平行数组 + unnest(a,b,c) 是 PG 的标准写法,三列一一对位。
+#
+# ⚠ **同一段 SQL 因为类型问题炸过两次**(2026-08-14),两次都是测试全绿才在
+# 生产上炸的 —— 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到。
+#   第一次:`record <> ALL(text[][])` 类型不匹配;
+#   第二次:`%(store)s IS NULL OR d.store = %(store)s` —— 参数只出现在
+#           IS NULL 与一次比较里,PG 推不出它的类型,报
+#           "could not determine data type of parameter"。**必须显式 ::text**。
+# 结论不是"以后小心点",是:**这类 SQL 的唯一验证手段是连库跑一次**。
+# 改动本段后别信 pytest 绿,去 dry-run。
 _WITHDRAW_SQL = """
 UPDATE ops.dispositions d
 SET status = 'withdrawn', settled_at = now(),
     detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s)
 WHERE d.status = 'suggested' AND d.source = %(source)s
-  AND (%(store)s IS NULL OR d.store = %(store)s)
+  AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
                            %(actions)s::text[]) AS k(store, sku, action)
@@ -182,7 +191,7 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
                 "UPDATE ops.dispositions SET status = 'withdrawn', "
                 "settled_at = now() WHERE status = 'suggested' "
                 "AND source = %(source)s "
-                "AND (%(store)s IS NULL OR store = %(store)s)",
+                "AND (%(store)s::text IS NULL OR store = %(store)s::text)",
                 {"source": source, "store": store})
             return cur.rowcount or 0
         cur.execute(_WITHDRAW_SQL, {

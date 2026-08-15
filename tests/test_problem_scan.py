@@ -246,9 +246,40 @@ def test_no_audit_rows_changes_nothing():
 def test_withdraw_only_touches_own_source_and_suggested():
     """撤销只动**本来源**且仍是 suggested 的行:扫描件那一轮不该碰审核来源的
     建议(两个来源各跑各的闸);executing 更不能碰——feed 已经提交出去了,
-    撤销无意义,它的归宿是 settle() 按观测判决。"""
+    撤销无意义,它的归宿是 settle() 按观测判决。
+
+    ⚠ 本用例只能断言 SQL **文本**,断不到 PG 的类型检查。首版这条 SQL 写成
+    `(store, sku, action) <> ALL(...::text[][])`(record 比二维数组,类型不匹配,
+    一跑就炸),而当时的同款断言全绿 —— **SQL 子串断言的盲区,记在这里**。
+    真正能发现这类错的只有生产 dry-run。"""
     from services import dispositions
     sql = dispositions._WITHDRAW_SQL
-    assert "status = 'suggested'" in sql          # 只动 suggested
-    assert "source = %(source)s" in sql           # 只动本来源
-    assert "executing" not in sql
+    assert "d.status = 'suggested'" in sql        # 只动 suggested
+    assert "d.source = %(source)s" in sql         # 只动本来源
+    assert "'executing'" not in sql
+    # 三个平行数组 + 多参数 unnest:别退回 record <> ALL(二维数组) 那种写法
+    assert "unnest(%(stores)s::text[], %(skus)s::text[]," in sql
+    assert "<> ALL" not in sql
+
+
+def test_withdraw_passes_three_parallel_arrays(monkeypatch):
+    """参数必须是**三个平行数组**且逐位对齐 —— 错位会撤错行(撤掉本轮仍在
+    建议的、留下本轮已不建议的),而两边行数一样,不会报错。"""
+    from services import dispositions
+    seen = {}
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): seen.update(params or {})
+        def fetchall(self): return [(1,), (2,)]
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    n = dispositions.withdraw_stale(
+        _Conn(), "scan", [("T1", "S1", "delete"), ("T2", "S2", "relist")], "x")
+    assert n == 2
+    assert seen["stores"] == ["T1", "T2"]
+    assert seen["skus"] == ["S1", "S2"]
+    assert seen["actions"] == ["delete", "relist"]

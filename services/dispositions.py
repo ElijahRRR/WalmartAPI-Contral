@@ -136,13 +136,22 @@ def suggest_many(conn, rows: list[dict]) -> int:
         return cur.rowcount if cur.rowcount is not None else len(payload)
 
 
+# ⚠ 用**多参数 unnest + NOT EXISTS**,不要写成
+#   `(store, sku, action) <> ALL(%(keep)s::text[][])`
+# 那样是错的:左边是 record 类型,右边二维数组的元素类型是 text,PG 直接报
+# 类型不匹配。(2026-08-14 首版就这么写的,靠复查发现——当时的测试只断言 SQL
+# **文本**,跑不到类型检查,全绿也没用。)
+# 三个平行数组 + unnest(a,b,c) 是 PG 的标准写法,三列一一对位。
 _WITHDRAW_SQL = """
-UPDATE ops.dispositions
+UPDATE ops.dispositions d
 SET status = 'withdrawn', settled_at = now(),
-    detail = detail || jsonb_build_object('withdrawn_reason', %(why)s)
-WHERE status = 'suggested' AND source = %(source)s
-  AND (store, sku, action) <> ALL(%(keep)s::text[][])
-RETURNING id
+    detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s)
+WHERE d.status = 'suggested' AND d.source = %(source)s
+  AND NOT EXISTS (
+      SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
+                           %(actions)s::text[]) AS k(store, sku, action)
+      WHERE k.store = d.store AND k.sku = d.sku AND k.action = d.action)
+RETURNING d.id
 """
 
 
@@ -167,9 +176,11 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str) -> int:
                         "settled_at = now() WHERE status = 'suggested' "
                         "AND source = %s", (source,))
             return cur.rowcount or 0
-        cur.execute(_WITHDRAW_SQL,
-                    {"source": source, "why": why,
-                     "keep": [[k[0], k[1], k[2]] for k in keep]})
+        cur.execute(_WITHDRAW_SQL, {
+            "source": source, "why": why,
+            "stores": [k[0] for k in keep],
+            "skus": [k[1] for k in keep],
+            "actions": [k[2] for k in keep]})
         return len(cur.fetchall())
 
 

@@ -283,3 +283,51 @@ def test_withdraw_passes_three_parallel_arrays(monkeypatch):
     assert seen["stores"] == ["T1", "T2"]
     assert seen["skus"] == ["S1", "S2"]
     assert seen["actions"] == ["delete", "relist"]
+
+
+def test_withdraw_scoped_to_scanned_store():
+    """⚠ `-p store=X` 只扫一个店,那一轮的 keep 里只有该店的行 —— 撤销不限
+    范围就会把**其余全部店铺**的待执行建议一次清空。扫了哪个范围就只能撤
+    哪个范围。"""
+    from services import dispositions
+    assert "(%(store)s IS NULL OR d.store = %(store)s)" in dispositions._WITHDRAW_SQL
+    seen = {}
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): seen.update(params or {})
+        def fetchall(self): return []
+        rowcount = 0
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    dispositions.withdraw_stale(_Conn(), "scan", [("T1", "S1", "delete")],
+                                "x", store="T1")
+    assert seen["store"] == "T1"
+    # 全量扫传 None = 不限范围(此时 keep 覆盖全库,撤销才安全)
+    dispositions.withdraw_stale(_Conn(), "scan", [("T1", "S1", "delete")], "x")
+    assert seen["store"] is None
+
+
+def test_withdraw_empty_keep_also_respects_store():
+    """本轮一条都不建议时走的是另一条 SQL —— 那条同样必须带范围闸,
+    否则单店扫描扫出零建议会清空全库(最坏的组合)。"""
+    from services import dispositions
+    seen = {}
+
+    class _Cur:
+        rowcount = 3
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            seen["sql"] = sql
+            seen.update(params or {})
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    dispositions.withdraw_stale(_Conn(), "scan", [], "x", store="T9")
+    assert "(%(store)s IS NULL OR store = %(store)s)" in seen["sql"]
+    assert seen["store"] == "T9"

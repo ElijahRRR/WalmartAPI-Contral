@@ -372,9 +372,12 @@ def run(params: dict) -> str:
         # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删
         n_wd = 0
         for src, srows in (("scan", rows), ("audit", audit_rows)):
+            # ⚠ store=only 不能省:`-p store=X` 那一轮只扫了一个店,keep 里
+            # 只有该店的行,不限范围会把其余全部店铺的待执行建议一次清空
             n_wd += dispositions.withdraw_stale(
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
-                why="本轮扫描不再建议")
+                why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
+                store=only or None)
     lines.append(f"建议行落账 {n_sug} 条(ops.dispositions,status=suggested)"
                  + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议)" if n_wd else "")
                  + f";归类事件新记 {n_cat} 条")

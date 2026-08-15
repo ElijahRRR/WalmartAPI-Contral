@@ -147,6 +147,7 @@ UPDATE ops.dispositions d
 SET status = 'withdrawn', settled_at = now(),
     detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s)
 WHERE d.status = 'suggested' AND d.source = %(source)s
+  AND (%(store)s IS NULL OR d.store = %(store)s)
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
                            %(actions)s::text[]) AS k(store, sku, action)
@@ -155,8 +156,9 @@ RETURNING d.id
 """
 
 
-def withdraw_stale(conn, source: str, keep: list[tuple], why: str) -> int:
-    """输入:连接 + 来源 + 本轮仍建议的 (店铺,SKU,动作) → 输出:撤销行数。
+def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
+                   store: str | None = None) -> int:
+    """输入:连接 + 来源 + 本轮仍建议的 (店铺,SKU,动作) + 扫描范围 → 输出:撤销行数。
 
     **建议是有时效的**:今天建议删 A,明天 A 自己恢复正常了、扫描件不再建议它
     —— 但昨天那条 suggested 行还挂着,执行件照样会删。这个函数把"本轮不再
@@ -167,17 +169,24 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str) -> int:
 
     executing 及已落定的行一根手指都不碰:那些已经提交出去了,撤销无意义
     (feed 已经在沃尔玛队列里),它们的归宿是 settle() 按观测判决。
+
+    ⚠ **store 参数是必需的安全边界,不是可选优化**(2026-08-14 加):
+    撤销的判据是"不在本轮 keep 清单里",而扫描件支持 `-p store=X` 只扫一个店
+    —— 那一轮的 keep 里只有该店的行,不限范围就会把**其余全部店铺**的待执行
+    建议一次清空。调用方扫了哪个范围就必须传哪个范围;全量扫传 None。
     """
     with conn.cursor() as cur:
         if not keep:
-            # 本轮一条都不建议 = 该来源的所有 suggested 全撤。空数组喂给
-            # `<> ALL` 在 PG 里恒真,行为正确,但显式分支更好读
-            cur.execute("UPDATE ops.dispositions SET status = 'withdrawn', "
-                        "settled_at = now() WHERE status = 'suggested' "
-                        "AND source = %s", (source,))
+            # 本轮一条都不建议 = 该来源(该范围内)的 suggested 全撤
+            cur.execute(
+                "UPDATE ops.dispositions SET status = 'withdrawn', "
+                "settled_at = now() WHERE status = 'suggested' "
+                "AND source = %(source)s "
+                "AND (%(store)s IS NULL OR store = %(store)s)",
+                {"source": source, "store": store})
             return cur.rowcount or 0
         cur.execute(_WITHDRAW_SQL, {
-            "source": source, "why": why,
+            "source": source, "why": why, "store": store,
             "stores": [k[0] for k in keep],
             "skus": [k[1] for k in keep],
             "actions": [k[2] for k in keep]})

@@ -672,3 +672,45 @@ def test_run_reports_which_stores_opted_out_of_allocation(monkeypatch, tmp_path)
     assert rows["A085"][2] == "否(填了0)" and rows["A085"][3] == "0"
     assert rows["A107"][2] == "是" and rows["A107"][3] == "500"
     assert rows["DEAD1"][2] == "(未填)" and rows["DEAD1"][3] == ""
+
+
+# ── 报告与回填必须同一套判定(2026-08-15 实证的分叉)────────────────────
+
+def test_claimable_is_the_single_row_gate_for_conflicts():
+    """在册 ∧ 已发布 ∧ 规划内 —— 三条缺一不可,且只此一处。"""
+    rows = [{"store": "在营", "published": True},
+            {"store": "在营", "published": False},    # 未发布:不占货位
+            {"store": "死店", "published": True},     # 不在册:冻结快照
+            {"store": "谭总9", "published": True}]    # 规划外:不占任何东西
+    got = sv.claimable(rows, {"在营", "谭总9"})
+    assert got == [{"store": "在营", "published": True}]
+
+
+def test_report_and_backfill_pick_the_same_store(monkeypatch):
+    """同一批数据,alloc_audit 的保留店必须与 alloc_backfill 落库的一致。
+
+    实证过的分叉:报告吃全部在线行、回填只吃已发布行 ⇒ 未发布行进了
+    「在线件数」那一级,真打平组的冠亚军换位,两边给出**不同的保留店**。
+    那份给人照着做的清单于是是假的。
+    """
+    from workflows import alloc_backfill as bf
+    rows = [
+        {"store": "A", "sku": "S1", "asin": "B0A", "brand_key": "acme",
+         "category": "Home", "published": True, "pt": "X", "pt_source": None},
+        {"store": "B", "sku": "S2", "asin": "B0B", "brand_key": "acme",
+         "category": "Home", "published": True, "pt": "X", "pt_source": None},
+        # B 店两条未发布:只要它们进了判定,B 就靠件数赢
+        {"store": "B", "sku": "S3", "asin": "B0C", "brand_key": "acme",
+         "category": "Home", "published": False, "pt": "X", "pt_source": None},
+        {"store": "B", "sku": "S4", "asin": "B0D", "brand_key": "acme",
+         "category": "Home", "published": False, "pt": "X", "pt_source": None},
+    ]
+    reg = {"A", "B"}
+    live = sv.claimable(rows, reg)
+    report = sv.resolve_conflicts(live, {}, "brand_key",
+                                  sv.store_metrics(live, {}))
+    owner, _ = bf._pick(live, {}, "brand_key", include_ties=True,
+                        metrics=sv.store_metrics(live, {}))
+    assert report[0][1] == owner["acme"]
+    # 未发布行不参与:件数打平 → 落到店名,而不是 B 靠 3:1 赢
+    assert report[0][4] == sv.LADDER[4] and owner["acme"] == "A"

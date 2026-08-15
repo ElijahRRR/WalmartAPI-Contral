@@ -89,13 +89,12 @@ def run(params: dict) -> str:
         registered = stores_svc.registered_names()
     except Exception as e:                            # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
-    # 纪律 1 追加:规划范围外的店(店名含「谭总」等)不占任何品牌与产品
-    # ——所有者定稿 2026-08-15,其他店可与它们重复上架
+    # 入行口径走 sv.claimable(在册 ∧ 已发布 ∧ 规划内),与 alloc_audit 同一处
+    # ——两边各写各的筛法,报告说"留 A085"、回填落到别家,清单就是假的。
     # ⚠ **不按店铺状态筛**:SUSPENDED 的店照常回填占用(「暂停不释放、
     # 占用保持」,§六.2)。停用只是暂时不给它分新货,不代表它手上的品牌与
     # 产品可以被别店拿走 —— 要某店不接新货走「单店最大在线数」填 0
-    live = [r for r in rows if r["store"] in registered and r["published"]
-            and not sv.is_excluded(r["store"])]
+    live = sv.claimable(rows, registered)
     dropped = len(rows) - len(live)
 
     try:

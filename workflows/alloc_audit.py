@@ -173,25 +173,30 @@ def run(params: dict) -> str:
     live_rows = [r for r in rows if r["store"] not in skipped]
     oos_rows = sum(prof_all[s]["n"] for s in out_of_scope)
     prof = sv.store_profiles(live_rows)
-    pub_rows = [r for r in live_rows if r["published"]]
 
 
     # ══ 报告拼装:控制台只放"一眼能扫完的结论 + 要做的事",明细全进 csv ══
     n = lambda v: f"{int(v):,}"                       # noqa: E731 千分位
     L: list[str] = ["", "═══ 分配存量审计 ═══"]
 
-    # 先算出各节要用的数
-    metrics = sv.store_metrics(live_rows, sales)
+    # 先算出各节要用的数。
+    # ⚠ 冲突判定吃的是 **claim_rows(在册∧已发布∧规划内)**,与 alloc_backfill
+    # 逐字同一口径(sv.claimable)——用 live_rows 算会把未发布行算进「在线件数」
+    # 那一级,真打平组的冠亚军就换了位,报告与回填给出两个不同的保留店。
+    # live_rows(含未发布)只用来看"这家店的目录长什么样":类目分布、渠道。
+    claim_rows = sv.claimable(rows, registered if registered is not None
+                              else set(prof_all))
+    metrics = sv.store_metrics(claim_rows, sales)
     conflicts = {}
     for tag, field in (("同 ASIN", "asin"), ("同品牌", "brand_key")):
-        conflicts[tag] = sv.resolve_conflicts(live_rows, sales, field,
+        conflicts[tag] = sv.resolve_conflicts(claim_rows, sales, field,
                                               metrics, cfg)
     over = sorted(((s, p) for s, p in prof.items() if len(sv.real_cats(p)) > 2),
                   key=lambda x: (-len(sv.real_cats(x[1])), -x[1]["n"], x[0]))
     # 渠道:没取渠道就没有结论。算出来必是 0,而"不符 0 件"读起来正好像
     # 全店合规 —— 这一节必须显式说"本轮没查",不能拿 0 冒充结论
     can_channel = bool(cfg) and with_channel
-    mism = sv.channel_mismatch(sv.store_profiles(pub_rows), cfg) if can_channel else []
+    mism = sv.channel_mismatch(sv.store_profiles(claim_rows), cfg) if can_channel else []
     offenders = sv.channel_offenders(live_rows, cfg) if can_channel else []
     scope = (sorted(set(registered) | set(prof)) if registered is not None
              else sorted(prof))

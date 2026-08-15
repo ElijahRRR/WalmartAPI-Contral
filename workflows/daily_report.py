@@ -28,9 +28,11 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
 - 昨日出单/销售额两列改读 orders.order_lines(所有者认可 2026-08-08):当前为
   双算对拍期——API 现拉仍是权威值,库算值只记日志差异;连续对平后摘除 API
   拉取,order_sync 成为本工作流的调度前置
-- 影刀接入(-p yingdao=1,2026-08-08):写「店铺KPI」总览 A:H 影刀输入投影
-  (过滤空 sellerId 行——A147 事故防线)→ spawn 影刀 → 等 latest.json 新鲜
-  → 回填当日卖家名称/销售状态。默认关:切换期仍由旧系统 8 点驱动影刀,
+- 影刀接入(-p yingdao=1;2026-08-08 接入,2026-08-15 改为文件衔接):
+  写 input.json 影刀输入清单(过滤空 sellerId 行——A147 事故防线)→ spawn 影刀
+  → 等 latest.json 新鲜 → 回填当日卖家名称/销售状态。
+  **不再经飞书**:原「先把总览写飞书 → 影刀读飞书拿 sellerId」已删,新影刀
+  应用直接读 paths.yingdao_input_file()。默认关:切换期仍由旧系统 8 点驱动影刀,
   **停旧 walmart-kpi-daily 之前严禁开启**(双 spawn 互抢,新鲜度校验会
   反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补 + 跨日延续)
@@ -258,31 +260,18 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
 def _yingdao_refresh(rows: list[dict], data_date) -> str:
     """输入:当日已入库 KPI 行 → 输出:影刀链路结果行。
 
-    三步:①总览 A:H 影刀输入投影(店铺名 key 合并,本次没跑到的店保留旧行;
-    空 sellerId 行过滤——A147 事故:影刀打开 /seller//cp/shopall 会崩掉整条
-    RPA 循环)②spawn + 等 latest.json 新鲜 ③回填当日卖家名称/销售状态。
-    任一步失败只降级不报错:已入库值有跨日延续兜底。
+    三步:①写 input.json 影刀输入清单(空 sellerId 行过滤——A147 事故:影刀打开
+    /seller//cp/shopall 会崩掉整条 RPA 循环)②spawn + 等 latest.json 新鲜
+    ③回填当日卖家名称/销售状态。任一步失败只降级不报错:已入库值有跨日延续兜底。
+
+    ⚠ 输入清单只含**本轮真跑到的店**,不与任何历史合并 —— 旧的飞书投影会把
+    上次的行保留下来(sheet 是长存的),于是单店跑 `-p store=X` 也会让影刀去抓
+    全部 49 家。文件每轮覆盖写,"这轮抓哪些"与"这轮拉了哪些"从此是同一件事。
     """
-    sheet = resources.KPI_SHEET.require()
-    existing = feishu.sheet_values(sheet, "A2:H200")
-    merged: dict[str, list] = {}
-    for r in existing:
-        r = (list(r) + [""] * 8)[:8]
-        store = str(r[1] or "").strip()
-        if store:
-            merged[store] = [str(c or "") for c in r]
-    for row in rows:
-        merged[row["store"]] = [
-            str(data_date), row["store"], row["seller_name"] or "",
-            row["partner_id"] or "", row["seller_id"] or "",
-            row["store_status"] or "", row["payment_status"] or "",
-            row["sales_status"] or ""]
-    out = sorted((v for v in merged.values() if str(v[4]).strip()),
-                 key=lambda v: v[1])
-    dropped = len(merged) - len(out)
-    pad = [[""] * 8 for _ in range(max(0, 199 - len(out)))]     # 清窗口残留行
-    feishu.sheet_write_ranges(sheet, [("A2:H200", (out + pad)[:199])])
-    line = f"影刀:总览投影 {len(out)} 店(空 sellerId 过滤 {dropped})"
+    written, dropped = yingdao.write_input(rows)
+    line = f"影刀:输入清单 {written} 店(空 sellerId 过滤 {dropped})"
+    if not written:
+        return line + ",无可抓店铺,跳过 spawn"
 
     trigger = datetime.now(timezone.utc)
     if not yingdao.spawn():

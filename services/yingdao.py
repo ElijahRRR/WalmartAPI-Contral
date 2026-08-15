@@ -1,5 +1,13 @@
 """影刀 RPA 衔接积木(daily_report 用;仅 macOS 生产机有效)。
 
+衔接是**两个文件**,不经飞书(所有者定稿 2026-08-15,新影刀应用):
+    本仓 write_input() → input.json → 影刀读它决定抓哪些卖家页
+    → 影刀写 latest.json → 本仓 wait_fresh()/读取回填
+旧路径「先把总览写飞书 → 影刀读飞书拿 sellerId」同期删除,不留双轨。
+反转的理由是**新鲜度是被保证的而不是碰巧的**:input.json 由 spawn 它的
+那一次运行在 spawn 前几秒写出,影刀物理上读不到隔夜的清单;若让影刀自己
+连库,它在任何时刻都能读到任意一天的数据,而 cli.py 的 flock 管不到它。
+
 旧系统实证规则全部照搬(docs/legacy_survey.md #daily_report):
 - spawn 用 shadowbot:Run?robot-uuid=<uuid> 协议 URL 非阻塞启动(macOS `open`);
   应用必须已在「我获取的应用」跑过一次(首次有授权弹窗),路径 /Applications/影刀.app
@@ -28,6 +36,43 @@ logger = logging.getLogger("services.yingdao")
 
 def _robot_uuid() -> str:
     return os.environ.get("YINGDAO_ROBOT_UUID", "").strip()
+
+
+# input.json 每行对影刀公开的字段。**store 是主键不是装饰**:sellerId 可能为空
+# 或变更,而 latest.json 现仍按 sellerId 回键(格式不动,一次只改一端)。
+_INPUT_FIELDS = ("store", "seller_id", "store_status", "payment_status")
+
+
+def write_input(rows: list[dict]) -> tuple[int, int]:
+    """输入:当轮已入库的 KPI 行 → 输出:(写出店数, 因 sellerId 为空丢弃数)。
+
+    ⚠ 空 sellerId 必须在这里丢掉(A147 事故防线):影刀拿它拼出
+    https://www.walmart.com/seller//cp/shopall(路径中段为空)会崩掉整条
+    RPA 循环,**后续店铺全被跳过**——不是少抓一家,是少抓一半。
+    这些店照常入库,只是不参与前台抓取。
+
+    原子写(tmp + rename):影刀随时可能在读,写一半被读到会让它解析失败。
+    latest.json 那侧本仓早就在防这件事(读到半截文件继续等),这边同样欠不得。
+    """
+    path = paths.yingdao_input_file()
+    out, dropped = [], 0
+    for r in rows:
+        if not str(r.get("seller_id") or "").strip():
+            dropped += 1
+            continue
+        out.append({f: ("" if r.get(f) is None else str(r[f])) for f in _INPUT_FIELDS})
+    out.sort(key=lambda r: r["store"])
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
+               "count": len(out), "stores": out}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    if dropped:
+        logger.info("影刀输入:%d 店写出 %s,空 sellerId 丢弃 %d 店(A147 防线)",
+                    len(out), path, dropped)
+    return len(out), dropped
 
 
 def spawn() -> bool:

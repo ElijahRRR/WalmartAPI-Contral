@@ -1,5 +1,6 @@
-"""kpi_history_import 解析积木 + 影刀新鲜度回归。"""
+"""kpi_history_import 解析积木 + 影刀衔接(输入清单/新鲜度)回归。"""
 
+import json
 from datetime import datetime, timezone
 
 from services import kpi, yingdao
@@ -94,19 +95,28 @@ def test_board_header_columns_aligned():
 
 
 def test_board_first_two_columns_are_store_then_date():
-    """所有者定稿 2026-08-15:看板首列店铺、次列日期。
-
-    ⚠ 同时钉住旧「店铺KPI」表(影刀输入投影)**保持 日期,店铺 不变** ——
-    RPA 流程定义不在本仓,按列位读表,跟着看板一起调序会直接弄坏它。
-    """
+    """所有者定稿 2026-08-15:看板首列店铺、次列日期。"""
     from registry import resources
     from workflows import daily_report as dr
     assert resources.KPI_BOARD_OVERVIEW.columns[:2] == ("store", "data_date")
     assert resources.KPI_BOARD_HISTORY.columns[:2] == ("store", "data_date")
     assert dr._BOARD_HEADER[:2] == ["店铺", "日期"]
-    assert resources.KPI_SHEET.columns[:2] == ("data_date", "store")
-    # sellerId 两边都在 E 列是巧合,但影刀就靠这一列,回归钉住
-    assert resources.KPI_SHEET.columns[4] == "seller_id"
+
+
+def test_old_kpi_sheet_is_read_only_now():
+    """旧「店铺KPI」workbook 从此只读(kpi_history_import 的导入源)。
+
+    影刀输入投影已改文件,本仓不再按列位写它 —— columns 必须空着,
+    以免下次有人看见一串列名以为"这表还在写",照着加回写入路径:
+    老影刀应用可能还在读它,两个应用同时被喂数据 = 双 spawn 互抢。
+    """
+    import inspect
+
+    from registry import resources
+    from workflows import daily_report as dr
+    assert resources.KPI_SHEET.columns == ()
+    src = inspect.getsource(dr)
+    assert "KPI_SHEET" not in src
 
 
 def test_board_pages_both_sort_by_store(monkeypatch):
@@ -189,3 +199,55 @@ def test_yingdao_freshness():
     assert yingdao.is_fresh(stale, trigger) is False
     assert yingdao.is_fresh({}, trigger) is False           # 缺字段不炸
     assert yingdao.is_fresh({"scraped_at": "垃圾"}, trigger) is False
+
+
+def _rows_for_input():
+    return [
+        {"store": "Z店", "seller_id": "222", "store_status": "ACTIVE",
+         "payment_status": "ACTIVE", "seller_name": "不该出现"},
+        {"store": "A店", "seller_id": "111", "store_status": "ACTIVE",
+         "payment_status": None},
+        {"store": "空号店", "seller_id": "", "store_status": "ACTIVE",
+         "payment_status": "ACTIVE"},
+        {"store": "空号店2", "seller_id": None, "store_status": None,
+         "payment_status": None},
+    ]
+
+
+def test_write_input_filters_empty_seller_id(monkeypatch, tmp_path):
+    """A147 事故防线搬到文件侧:空 sellerId 一个都不许进影刀输入。
+
+    影刀拿它拼出 /seller//cp/shopall(路径中段为空)会崩掉整条 RPA 循环 ——
+    后果不是少抓这一家,是它之后的店**全被跳过**。
+    """
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    written, dropped = yingdao.write_input(_rows_for_input())
+    assert (written, dropped) == (2, 2)
+    data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
+    assert data["count"] == 2
+    assert [s["store"] for s in data["stores"]] == ["A店", "Z店"]   # 按店铺排序
+    assert data["stores"][0]["seller_id"] == "111"
+    assert data["stores"][0]["payment_status"] == ""               # None → 空串
+    # 只公开约定的四个字段,别的列不许漏给影刀
+    assert set(data["stores"][0]) == set(yingdao._INPUT_FIELDS)
+
+
+def test_write_input_is_atomic_and_leaves_no_tmp(monkeypatch, tmp_path):
+    """原子写:影刀随时可能在读,不许让它读到写了一半的文件。"""
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "sub" / "input.json"))
+    yingdao.write_input(_rows_for_input())
+    assert (tmp_path / "sub" / "input.json").exists()      # 目录自建
+    assert list((tmp_path / "sub").glob("*.tmp")) == []    # 临时文件已 rename 掉
+
+
+def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):
+    """全店 sellerId 都为空 → 清单是空的,不该再 spawn 影刀去抓个寂寞。"""
+    from workflows import daily_report as dr
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    monkeypatch.setattr(dr.yingdao, "spawn",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("没店可抓就不该 spawn")))
+    out = dr._yingdao_refresh([{"store": "空号店", "seller_id": "",
+                                "store_status": None, "payment_status": None}],
+                              "2026-08-15")
+    assert "输入清单 0 店" in out and "空 sellerId 过滤 1" in out

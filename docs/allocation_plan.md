@@ -8,8 +8,8 @@
 > **当前状态(2026-08-15)**:A0 收口;A0.5 审计**生产首跑完成**(实测见
 > §十一.1)并产出五份明细清单;**A1 占用台账代码就绪**(claims 表 +
 > services/claims + store_release + alloc_backfill + list_new 占用闸),
-> 待所有者填类目三列、处理清单后生产回填;A1.5 订单 ASIN 归一与 A2 引擎
-> 待动工(§十)。
+> 待所有者填类目三列、处理清单后生产回填;**A1.5 订单 ASIN 归一代码就绪**
+> (待生产跑一次);A2 引擎待动工(§十),设计已按所有者 08-15 晚七问定稿(§7.4~7.4g)。
 >
 > 立案 2026-08-07;历次校准 08-12(四外部仓库摸底)、08-12 晚、08-13、
 > 08-15(main 迁入审核系统与类目映射后的七路调研 + 对抗式审查)。
@@ -92,7 +92,7 @@
 | **店铺在售天数 / 在线数** | ✅ | `ops.store_kpi_daily` **逐店逐日一行**(PK `(store, data_date)`),带 `store_status` / `items_online` / `orders_count` / `sales_amount`。在售天数 = 窗口内**有记录且** `coalesce(upper(store_status),'ACTIVE')='ACTIVE'` 的天数;⚠ **没记录的天既不算 active 也不算停用**(那是"没抓到"),所以必须同时算覆盖率 `rec/N` 并在方案表报出来,低覆盖店的比值指标全靠收缩顶上去,不代表真实水平 |
 | 店铺配额·健康度 | ❌ | KPI 8 率有列但**阈值零实现**,且 NULL 两义(无合规数据 vs 拉取失败)不可区分 ⇒ **v1 降为二值(ACTIVE=1)**,8 率只进方案表展示列,`need_i` 改二项归一 |
 | 店×类目销量 | ⚠ | `order_lines(store,sku) ⋈ walmart_items(store,sku)` → PT → 大类;**sku 大小写敏感**;必须显式过滤在册店(死店冻结行查得出来) |
-| 产品/品牌/类目全局销量 | ❌ | `order_lines` **无 asin 列**,sku→asin 只有 Python 实现 ⇒ 见 §十 A1.5 前置批次(现在有 15 万历史行等着归一) |
+| 产品/品牌/类目全局销量 | ⚠ | **A1.5 代码就绪 2026-08-15**:`order_lines.asin` 列 + `order_asin_normalize`(规则走 `services/sku_asin` 唯一出处,与 `sku_normalize` 同路径,有回归钉住两者结果一致)。**待生产跑一次**;跑完看覆盖率,解析不了的留 NULL ⇒ 消费方一律 `asin IS NOT NULL` 过滤,**绝不拿 sku 原文当 asin**(三段式与纯数字直连采集库永远查空,那是静默的错误信号) |
 | **历史订单行的三条语义** | ⚠ | ①`source='历史数据'`,`sale_status` 一律 `Delivered`(不是真实状态)⇒ 销量口径只能排 `Cancelled`,不能按状态细分;②源表「统计状态」列**未导入** ⇒ **退款/无效单被算作销量**(相对比较影响小,绝对额偏高;要精确得让导入侧补列);③「退款原因」未导入 ⇒ **退款率信号只能来自 API 行与 `return_lines`**,历史期算不出来 |
 | 占用落点 | ✅ | `catalog.claims` + `services/claims`(排他由部分唯一索引保证)+ `store_release` + `alloc_backfill` 均已就绪(2026-08-15);`allocation_runs/items` 随 A2 建 |
 | 上架表写入 | ⚠ | 现有五个写函数**全部按行号定点写,无一能新建行**——追加要照 `services/maint_sheet.append_records` 的水位模式另写;且写列权责与审核批次 D 冲突(§九.2) |
@@ -553,7 +553,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | **A0 数据接线** | 产品全量入库 / 审核结论 / 订单历史 / 店铺目标四列 | ✅ 收口(见下) |
 | **A0.5 存量审计** | `alloc_audit`:控制台六节结论 + 明细 csv **5 份** | ✅ 首跑完成 2026-08-15;**订单入库后需重跑**——冲突处置的"留销量大的店"首跑时无订单数据,只能按件数打平(报告会显式点破,不会装作判过了) |
 | **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
-| **A1.5 订单 ASIN 归一** | `order_lines` 加 asin 列 + `order_asin_normalize` 工作流。所有者 2026-08-15 晚:「sku 和 asin 相等,直接倒查即可」—— **走 `services/sku_asin.extract_asin` 唯一出处**,它已覆盖四种形态(裸 ASIN / 三段式 `前缀-源头码-价格` / 纯数字 item_id 走 `walmart_items` 倒查 / 其他)。⚠ 本仓 2026-08-11 有所有者给样推翻过「sku=asin」全局约定(三段式与纯数字两种确实存在,且有 208 个三段式曾被过严的规则冤枉),所以**不做裸拷贝**:照跑 `extract_asin`,**提不出的留 NULL 并按形态分桶计数**。若实际全是裸 ASIN,那份计数会直接显示命中率 ~100%,用数据把这条约定重新确认下来,比争论省事 | ⬜ **A2 硬前置** |
+| **A1.5 订单 ASIN 归一** | `order_lines.asin` 列(schema.sql 幂等迁移块 + 部分索引)+ `order_asin_normalize` 工作流。所有者定稿 2026-08-15 晚:「就按 sku=asin 走,绝大部分能拿到,少量拿不到没关系」⇒ 走 `services/sku_asin.extract_asin`(已覆盖四形态:裸 ASIN / 三段式 / 纯数字倒查 item_id / 其他),**提不出的留 NULL 不猜**。幂等(`WHERE asin IS NULL`),规则扩充后可重跑再捞一遍 | ✅ **代码就绪 2026-08-15**,待生产跑 |
 | **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | ⬜ 待 A1/A1.5 |
 | **A3 学习型** | 权重离线校准(远景) | ⬜ 快照从 A2 第一天就落 |
 

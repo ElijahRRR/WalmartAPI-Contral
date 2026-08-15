@@ -631,6 +631,17 @@ ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS source text;
 CREATE INDEX IF NOT EXISTS order_lines_source_idx ON orders.order_lines (source)
     WHERE source IS NOT NULL;
 
+-- 源头 ASIN(A1.5,2026-08-15):分配引擎要"这个产品/这个品牌在全公司卖得
+-- 怎么样",而 order_lines 只有沃尔玛侧的订货号 sku。没有这一列,产品分的
+-- 销量信号只能退到最粗的"大类基线"那一级。
+-- 由 `order_asin_normalize` 补填,规则走 services/sku_asin 唯一出处;
+-- **提不出的留 NULL**(所有者 2026-08-15:少量拿不到没关系),消费方按
+-- `asin IS NOT NULL` 过滤,**绝不拿 sku 原文当 asin 用**——三段式与纯数字
+-- 两种形态直连采集库会永远查空。
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS asin text;
+CREATE INDEX IF NOT EXISTS order_lines_asin_idx ON orders.order_lines (asin)
+    WHERE asin IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号
     order_line_id   text NOT NULL,

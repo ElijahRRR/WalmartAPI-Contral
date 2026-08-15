@@ -472,24 +472,68 @@ def fix_invalid_enums(spec: dict, visible: dict) -> tuple[dict, list[str]]:
 _VARIANT_BAG = ("variantGroupId", "variantAttributeNames", "isPrimaryVariant")
 
 
-def ensure_variant_bag(spec: dict, visible: dict, sku: str = ""
-                       ) -> tuple[dict, list[str]]:
-    """输入:spec + visible + SKU → 输出:(变体三件套自洽的 visible, 说明)。
+def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
+                        plan: dict) -> tuple[dict, list[str]]:
+    """输入:spec 属性 + 三件套在册列表 + visible + 变体决策 → 输出:(visible, 说明)。
+
+    ⚠ 三件套必须**同时**落进 visible:spec 若只登记了其中一两个(各 PT 不同),
+    我们就只发登记的那些——发 spec 没有的字段会被 additionalProperties=false
+    整条拒(EXT_DATA_ERROR_60670554076755)。
+    ⚠ 属性名要用本 PT 的枚举复核:决策是拿枚举算的,但 spec 可能换版,
+    不复核就会发出 PT 不认的属性名。复核不过 → 整套剔除退单品,不猜。
+    """
+    name = plan.get("attr_name")
+    enum = _enum_of(props.get("variantAttributeNames", {}))
+    if enum and name not in {str(e) for e in enum}:
+        for k in in_spec:
+            visible.pop(k, None)
+        return visible, [f"变体属性名 {name} 不在本 PT 枚举内,整套剔除退单品"]
+    notes = []
+    if "variantGroupId" in props:
+        visible["variantGroupId"] = str(plan["group_id"])[:300]
+    if "variantAttributeNames" in props:
+        visible["variantAttributeNames"] = [name]
+    if "isPrimaryVariant" in props:
+        yn = _enum_of(props["isPrimaryVariant"]) or ["Yes", "No"]
+        want = "Yes" if plan.get("is_primary") else "No"
+        visible["isPrimaryVariant"] = want if want in yn else yn[0]
+    # 维度取值写进同名属性:组内没有差异值 = 沃尔玛看不出这几个有什么不同。
+    # 只在 spec 登记了该属性时写(同上,发 spec 没有的字段整条被拒)。
+    if name in props and plan.get("attr_value"):
+        visible[name] = plan["attr_value"]
+    else:
+        notes.append(f"⚠ 本 PT 无 {name} 属性,组内差异值无处可写")
+    notes.append(f"变体组 {plan['group_id']} 按 {name}={plan.get('attr_value')}"
+                 f"(家族 {plan.get('family_size')},"
+                 f"{'主' if plan.get('is_primary') else '非主'}变体)")
+    return visible, notes
+
+
+def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
+                       plan: dict | None = None) -> tuple[dict, list[str]]:
+    """输入:spec + visible + SKU + 变体决策 → 输出:(三件套自洽的 visible, 说明)。
 
     EXT_DATA_ERROR_05570905585050 "Variant metadata bag is missing or empty":
     三件套(变体组 ID / 变体属性名 / 是否主变体)要么都给要么都不给,
     给一半会被拒——我们此前必填兜底填了 variantAttributeNames 却没配套。
 
-    **单品口径**(变体分组尚未实现,当前全是单品):沃尔玛报错原文即指引——
-    "If you only have 1 item in a variant group, select 'Yes' in Is Primary
-    Variant";变体组 ID 用 SKU 占位(旧设计文档同款:本批只有 1 个变体产品时
-    也带 groupId 上架,后续兄弟按同 ID 自动归组)。
-    真正的多变体分组等采集侧 variation 数据到位后再做,届时改这一个函数。
+    `plan` = services.variant_group.plan() 的产出(2026-08-15 接线):
+    - `mode='variant'` → **真变体口径**:按决策写三件套,并把维度取值写进同名
+      属性(组内没有差异值 = 沃尔玛看不出这几个有什么不同)。
+      ⚠ 枚举用本 PT 的 variantAttributeNames 复核一次:决策是拿枚举算的,
+      但 spec 可能换版,不复核就会发出 PT 不认的属性名。
+    - `mode='single'` / 不给 plan → **单品口径**(下方原逻辑,一字未改)。
+
+    单品口径:非必填时半套整套剔除(旧系统单品从不发变体字段);spec 列为必填时
+    才用 SKU 占位补全——沃尔玛报错原文即指引:"If you only have 1 item in a
+    variant group, select 'Yes' in Is Primary Variant"。
     """
     props = _props(spec)
     in_spec = [k for k in _VARIANT_BAG if k in props]
     if not in_spec:
         return visible, []
+    if plan and plan.get("mode") == "variant":
+        return _apply_variant_plan(props, in_spec, dict(visible), plan)
     required = _required(spec) & set(in_spec)
     present = [k for k in in_spec if visible.get(k) not in _EMPTY]
     if not required:

@@ -60,40 +60,16 @@ sku→asin 走 services/sku_asin 唯一规则,提不出的**单列计数**不猜
 
 import csv
 import logging
-import unicodedata
 from collections import Counter
 
 from registry import db, paths
 from services import alloc_survey as sv
 from services import sku_asin, store_targets, stores as stores_svc
+from services import textfmt
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.alloc_audit")
-
-
-def _width(s: str) -> int:
-    """输入:文本 → 输出:终端显示宽度(中日韩字符按 2 格算)。"""
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
-
-
-def _grid(rows: list[tuple], indent: str = "  ", gap: str = "  ") -> list[str]:
-    """输入:等长元组行 → 输出:各列按显示宽度左对齐的文本行(末列不补尾空格)。
-
-    不用 f"{s:<8}":那个按**字符数**补,而中文在终端占 2 格 ——
-    「同品牌」(3 字)和「同 ASIN」(7 字)补到同样字符数,显示宽度差 3 格,
-    列就是歪的。列宽也不写死,按本次实际内容算,加一列不用回来调常数。
-    """
-    if not rows:
-        return []
-    cols = max(len(r) for r in rows)
-    grid = [[str(c) for c in r] + [""] * (cols - len(r)) for r in rows]
-    w = [max(_width(r[i]) for r in grid) for i in range(cols)]
-    out = []
-    for r in grid:
-        cells = [c + " " * (w[i] - _width(c)) for i, c in enumerate(r[:-1])]
-        out.append((indent + gap.join(cells + [r[-1]])).rstrip())
-    return out
 
 
 def _write_csv(name: str, header: list, rows: list) -> str:
@@ -263,7 +239,7 @@ def run(params: dict) -> str:
                      "→ alloc_店铺总览.csv「缺配置列」"
                      + (f";另有 {len(empty_stores)} 家空店没登记,"
                         f"要它们参与分配才用填" if empty_stores else "")))
-    L += ["", "▍要你做的事"] + _grid(todo)
+    L += ["", "▍要你做的事"] + textfmt.grid(todo)
 
     # ── ▍数据体检 ──
     body = [("候选池", f"产品 {n(pool['total'])} → 审核通过 "
@@ -289,7 +265,7 @@ def run(params: dict) -> str:
     n_key = sum(1 for r in rows if r["brand_key"])
     body.append(("品牌键", f"可占用 {n(n_key)} 行 · 真·无品牌 {n(st['no_brand'])}"
                            f" · 产品库缺行 {n(st['asin_not_in_products'])}"))
-    L += ["", "▍数据体检"] + _grid(body)
+    L += ["", "▍数据体检"] + textfmt.grid(body)
 
     # ── ▍在线商品 ──
     n_pub = sum(1 for r in rows if r["published"])
@@ -312,7 +288,7 @@ def run(params: dict) -> str:
                              f"SKU 提不出 ASIN {n(st['no_asin'])} 行"))
     L += ["", f"▍在线商品 {n(st['online'])} 行(已发布 {n(n_pub)} / "
               f"未发布 {n(st['online'] - n_pub)};RETIRED 退市行已在 SQL 排除)"]
-    L += _grid(body)
+    L += textfmt.grid(body)
 
     # ── ▍冲突 ──
     body = []
@@ -330,7 +306,7 @@ def run(params: dict) -> str:
                      "依据:" + " · ".join(
                          f"{k.removeprefix('按')} {v}"
                          for k, v in by_level.most_common(3))))
-    L += ["", "▍冲突(只算规划内店铺)"] + _grid(body)
+    L += ["", "▍冲突(只算规划内店铺)"] + textfmt.grid(body)
     if not sales:
         # 销量全空时阶梯必然一路降到"在线件数/店名",那是打平不是判定。
         # 不说破的话,csv 里每行都写着判定依据,看起来像是真判过了
@@ -365,7 +341,7 @@ def run(params: dict) -> str:
         body.append(("类目有不符", f"{len(by)} 家", f"共 {len(cat_bad)} 件待下架;"
                      + "、".join(f"{s}×{c}" for s, c in by.most_common(3))))
     L += ["", f"▍店铺(规划内有货 {len(prof)} 家)"]
-    L += _grid(body) if body else ["  ✓ 没发现异常"]
+    L += textfmt.grid(body) if body else ["  ✓ 没发现异常"]
 
     # ── ▍要留意 ──
     notes = []

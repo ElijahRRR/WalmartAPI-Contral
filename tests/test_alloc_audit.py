@@ -413,14 +413,17 @@ def test_report_columns_align_by_display_width():
     """列宽按**显示宽度**补,不按字符数——中文占 2 格,按字符补列就是歪的。
 
     这正是所有者说"看不明白"的那一半原因:数字列对不齐,一屏数字糊成一片。
+    对齐工具沉在 services/textfmt(两个报告 workflow 共用,铁律 1 不许
+    workflow 互相 import)。
     """
-    assert wf._width("同品牌") == 6 and wf._width("同 ASIN") == 7
-    lines = wf._grid([("同品牌", "1 组", "依据:x"),
-                      ("同 ASIN", "12 组", "依据:y")])
+    from services import textfmt
+    assert textfmt.width("同品牌") == 6 and textfmt.width("同 ASIN") == 7
+    lines = textfmt.grid([("同品牌", "1 组", "依据:x"),
+                          ("同 ASIN", "12 组", "依据:y")])
     # 判据:两行"依据"之前的**显示宽度**相等(字符数则不等——正是老写法的错)
-    assert len({wf._width(ln.split("依据")[0]) for ln in lines}) == 1
+    assert len({textfmt.width(ln.split("依据")[0]) for ln in lines}) == 1
     assert len({len(ln.split("依据")[0]) for ln in lines}) == 2
-    assert wf._grid([]) == []                      # 空表不产出空行
+    assert textfmt.grid([]) == []                  # 空表不产出空行
 
 
 def test_run_degrades_when_pt_dict_fails(monkeypatch):

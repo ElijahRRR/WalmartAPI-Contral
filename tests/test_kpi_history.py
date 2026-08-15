@@ -240,6 +240,35 @@ def test_write_input_is_atomic_and_leaves_no_tmp(monkeypatch, tmp_path):
     assert list((tmp_path / "sub").glob("*.tmp")) == []    # 临时文件已 rename 掉
 
 
+def test_yingdao_mode_rejects_unknown_value():
+    """打错一个字不许当成"关"静默跑过去 —— 少跑半条链而摘要看不出区别。"""
+    import pytest
+
+    from workflows import daily_report as dr
+    assert dr._yingdao_mode(None) == "" and dr._yingdao_mode("0") == ""
+    assert dr._yingdao_mode("1") == "full" and dr._yingdao_mode("YES") == "full"
+    assert dr._yingdao_mode(" Input ") == "input"
+    with pytest.raises(ValueError, match="yingdao 只接受"):
+        dr._yingdao_mode("inupt")
+
+
+def test_yingdao_input_mode_writes_list_without_spawning(monkeypatch, tmp_path):
+    """接入调试档:清单要真写出来,但一次都不许 spawn。
+
+    旧 walmart-kpi-daily 还开着时就靠这一条 —— spawn 了就是双 spawn 互抢,
+    会把旧系统那次影刀的新鲜度校验搅到超时。
+    """
+    from workflows import daily_report as dr
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    monkeypatch.setattr(dr.yingdao, "spawn",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("yingdao=input 不许 spawn")))
+    out = dr._yingdao_refresh(_rows_for_input(), "2026-08-15", do_spawn=False)
+    assert "输入清单 2 店" in out and "未 spawn" in out
+    data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
+    assert data["count"] == 2
+
+
 def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):
     """全店 sellerId 都为空 → 清单是空的,不该再 spawn 影刀去抓个寂寞。"""
     from workflows import daily_report as dr

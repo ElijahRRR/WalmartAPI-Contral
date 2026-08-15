@@ -17,7 +17,7 @@
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from api import scraper
 from registry import db
@@ -49,19 +49,29 @@ ERROR_TYPES = {
 RETRYABLE = {"network", "timeout", "blocked", "captcha",
              "zip_switch_failed", "zip_not_effective", "session_not_ready"}
 
-# 重采一百次也是同一个结果的类型 —— 采集侧 NO_AUTO_RETRY_ERROR_TYPES 的镜像
-# (2026-08-10 所有者实测口径):失败上限 cap=1,**首次上报即终态**,
-# 自动重试排除,手动 POST /{name}/retry 跳过,连 ?force=true 也不越过。
-# 因为它们描述的是产品/页面层的稳定事实(如 variant_offset:Amazon 把请求
-# 重定向到了兄弟变体页),不是瞬时抖动。
+# 采集侧**自己不会再试**、但换个时间重新提交批次有意义的类型。
 #
-# ⚠ 所以这类**任务反而是最快到终态的**,`tasks.open` 立刻减一,不拖慢批次。
-# 本侧据此给终局结论(建议拒绝)而不是永远挂"待采集"——挂着的话行会等一个
-# 永远不来的快照,每轮还为它烧一次配额,两侧都不报错。
+# ⚠ 这一档是 2026-08-14 从 TERMINAL 拆出来的,原注释("描述的是产品/页面层的
+# 稳定事实,不是瞬时抖动")**是错的**,按采集仓库 worker/engine.py:1501-1508
+# 的复盘注释订正:
+#     "variant 偏移通常不是 session/cookie 状态引起的,多由 Amazon A/B test、
+#      地域缓存、库存差异引起,rotate 后重试**结果一样**;大量 rotation 会瞬间
+#      打爆隧道代理 5 QPS 限额"
+# 也就是说:成因是**非确定性**的,采集侧不重试是「配额保护 + 防数据中毒」的
+# 策略决定(写错变体的标题在采集侧叫"数据中毒"),不是"重试也没用"的事实判断。
+# 采集侧的处置是 cap=1 + NO_AUTO_RETRY_ERROR_TYPES 唯一成员,手动
+# POST /{name}/retry 跳过、连 ?force=true 也不越过 ⇒ **唯一出路是提交新批次**,
+# 而那正好是本侧能做的事(所有者定稿 2026-08-14:"这种都可以再重采,全局适用")。
 #
-# `unknown` **故意不在此列**:它是兜底桶,拿不准就别替人下终局结论,
-# 照旧转人工。采集侧新增类型时 pull_failures 会告警,人来决定归哪边。
-TERMINAL = set(ERROR_TYPES) - RETRYABLE - {"unknown"}
+# 但**必须带冷却期**:采集侧实测"立刻 rotate 重试结果一样",非确定性成因
+# (A/B 分桶、地域缓存)要隔一段时间才会重新掷骰子。不设冷却 = 每轮全额重推,
+# 烧配额且命中率约等于 0。冷却天数在 workflows/scrape_missing.COOLDOWN_DAYS。
+RETRY_LATER = {"variant_offset"}
+
+# 重采一百次也是同一个结果的类型。`unknown` **故意不在此列**:它是兜底桶,
+# 拿不准就别替人下终局结论,照旧转人工。采集侧新增类型时 pull_failures 会
+# 告警,人来决定归哪边。
+TERMINAL = set(ERROR_TYPES) - RETRYABLE - RETRY_LATER - {"unknown"}
 
 _SQL_FAILURE = """
 INSERT INTO ops.scrape_failures (batch_name, asin, status, error_type,
@@ -202,3 +212,66 @@ def shots_open(status_body: dict) -> int:
         return int((status_body.get("screenshots") or {}).get("open") or 0)
     except (TypeError, ValueError):
         return 0
+
+
+_SQL_OPEN = """
+SELECT batch_name, batch_id, asin_count, status, submitted_at
+FROM ops.scrape_batches
+WHERE status IN ('pushed', 'running') AND batch_name LIKE %(prefix)s
+ORDER BY submitted_at
+"""
+
+
+def check_open(prefix: str, timeout_hours: int) -> list[str]:
+    """输入:批次名前缀 + 超时小时 → 输出:在途批次状态行(顺手落定/标超时)。
+
+    ops.scrape_batches 是全项目共用台账(维护链/订单审核/补采各有前缀),
+    **查在途必须按前缀圈自己的**——否则会拿自己的超时口径去把别人的批次
+    标成 timeout,而那边正等着它。落定判据 is_settled 与拉失败明细同源。
+    住在 services 而不是某个 workflow:两条推采集链都要用,而工作流之间
+    不准互相 import(铁律 1)。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_OPEN, {"prefix": prefix + "%"})
+        rows = cur.fetchall()
+    if not rows:
+        return ["无在途采集批次"]
+    out = []
+    deadline = timedelta(hours=timeout_hours)
+    for name, bid, n, status, submitted in rows:
+        try:
+            st = scraper.batch_status(name)
+        except LookupError:
+            finish(name, "failed", None, None, "采集侧查无此批次")
+            out.append(f"  {name}:⚠ 采集侧查无此批次(已标 failed)")
+            continue
+        except Exception as e:
+            out.append(f"  {name}:状态查询失败 {e}(保持在途,下轮再查)")
+            continue
+        # 台账没记下 batch_id 时(老行/推送时响应异常)从状态响应补:
+        # 失败明细端点只认 batch_id,缺了就查不了
+        bid = bid or st.get("batch_id")
+        stats = st.get("stats") or {}
+        done, failed = stats.get("done") or 0, stats.get("failed") or 0
+        total = stats.get("total") or n
+        age = datetime.now(timezone.utc) - submitted.astimezone(timezone.utc)
+        # 落定判据与 order_audit 同一份(services.scrape_batches.is_settled):
+        # open == 0 即采完,failed 算终态
+        if is_settled(st):
+            finish(name, "completed", done, failed)
+            out.append(f"  {name}:✅ 采完 {done}/{total}(失败 {failed})"
+                       f",耗时 {age.total_seconds() / 60:.0f} 分钟")
+            out.append(f"      {pull_failures(name, bid)[0]}")
+        elif age > deadline:
+            # 超时不代表数据没用:已采到的照常进增量流,只是这批不再等
+            finish(name, "timeout", done, failed,
+                           f"超 {timeout_hours} 小时未采完")
+            out.append(f"  {name}:⏰ 超时({done}/{total}),已标 timeout;"
+                       f"已采到的部分照常进增量流")
+            # 超时批同样拉:此刻已判失败的那些,原因照样有价值
+            out.append(f"      {pull_failures(name, bid)[0]}")
+        else:
+            record(name, None, n, "running")
+            out.append(f"  {name}:采集中 {done}/{total}"
+                       f"(已 {age.total_seconds() / 60:.0f} 分钟)")
+    return out

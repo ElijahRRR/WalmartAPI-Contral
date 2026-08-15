@@ -7,6 +7,7 @@ CREATE SCHEMA IF NOT EXISTS catalog;
 CREATE SCHEMA IF NOT EXISTS listing;
 CREATE SCHEMA IF NOT EXISTS orders;
 CREATE SCHEMA IF NOT EXISTS ops;
+CREATE SCHEMA IF NOT EXISTS audit;
 
 -- ── catalog:产品主数据(身份与观测分离)─────────────────────────────────────
 
@@ -18,18 +19,21 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     amazon_category text,
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
-    audit_status    text,        -- pass / reject / pending(审核系统 verdict 原文;
-                                 --   audit_sync 回流,2026-08-12 接通)
-    audit_reason    text,        -- 拒绝理由摘要(37 政策类目/规则码,pass 恒 NULL)
-    walmart_pt      text,        -- 审核产出的沃尔玛 Product Type(小类;
-                                 --   大类按 PT JOIN risk_product_types.category)
+    audit_status    text,        -- pending / approved / rejected
+    audit_reason    text,
+    walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
+    --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
+    --   audit_llm         = 审核链第三级 LLM 推断出来的
+    -- 混在一起会洗白:LLM 猜一个 → 下轮当"高置信历史实证"直出 → catmap_mine
+    -- 当实证票投进映射表 → 整个类目按这个猜测直出。分开后 catmap_mine
+    -- 只数 walmart_confirmed,回路在造成伤害的那一环被切断。
+    pt_source       text,
     audited_at      timestamptz,
-    audit_version   text,        -- 审核系统 audit_runs.run_id(可溯源;
-                                 --   audit_sync 按它比对"没变就不写")
+    audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
     -- (assigned_upc/listing_attrs/last_feed_id/store/owner 五列 2026-08-12
     --  退役:零读写,职责已被 catalog.upc_pool / catalog.llm_cache /
-    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留,同日由分配 A0 的
-    --  audit_sync 接通写入)
+    --  ops.feed_log / 飞书上架表接管;audit_* 五列保留 = 二期审核接缝)
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (marketplace, asin)
@@ -114,7 +118,9 @@ CREATE OR REPLACE VIEW catalog.latest_snapshot AS
   FROM catalog.snapshots ORDER BY marketplace, asin, scrape_params, scraped_at DESC;
 
 -- 沃尔玛侧在线商品:每 (店铺, SKU) 一行,catalog_sync 全量扫店 upsert
--- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,按 sku=asin JOIN)
+-- (替代旧飞书「在线产品总表」的沃尔玛列;amz 侧数据在 products/snapshots,
+--  按 extract_asin(sku) 归一后关联——sku=asin 全局约定已废 2026-08-11,
+--  规则唯一出处 services/sku_asin)
 CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     store        text NOT NULL,
     sku          text NOT NULL,
@@ -173,6 +179,23 @@ CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_event
 -- services/sku_asin 规则清洗得出,提不出存 NULL;消费方 coalesce(asin, sku);
 -- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
 ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
+
+-- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
+-- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
+-- **类目名会漂,ID 不会**:Amazon 的 URL slug / 面包屑 / Best Sellers 导航
+-- 三套名称不一致,按路径字符串匹配会把同一类目误判成缺口;ID 链最后一段
+-- = 当前最细类目,直查 walmart_category_map.browse_node_id 精确命中。
+-- 审核 L1 ②级优先用它,字符串路径与 category_path_alias 降级为无 ID 老行兜底
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_chain text;
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS browse_node_id text;
+CREATE INDEX IF NOT EXISTS products_browse_node_idx
+    ON catalog.products (browse_node_id);
+
+-- PT 来源分道(2026-08-14):存量行按证据反推——pt_backfill 写过的(在
+-- walmart_cleanup/审核报错两源里出现过的 ASIN)是实证,其余审核写的算推断。
+-- 存量无从区分的一律留 NULL,由下一轮审核按新口径补写(NULL 视同推断,
+-- 保守:不把来历不明的 PT 当实证喂给挖掘)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
@@ -272,6 +295,23 @@ CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
 -- "自产行投影"方案,同日被渠道独立表 brand_err_hits 取代(见下),三列
 -- **不再被任何代码消费**,保留仅为不破坏已建库。本表回归单一职责:
 -- 总清单镜像(risk_sync 飞书→PG)+ 否决闸数据源 + cleanup 自产品牌补进闸门。
+
+-- 黑名单中心补全两维(所有者定稿 2026-08-13:黑名单只维护一份——审核的
+-- 卖家/类目/ASIN/品牌四闸全部直读本中心,旧审核系统那张独立三列表退出
+-- 本仓链路;audit schema 的 phase0_* 三表与 blacklist_brands 退役为历史快照)
+-- 卖家店铺黑名单:飞书黑名单 wiki 子表(registry.SELLER_BLACKLIST_SHEET)
+-- → risk_sync 全量重灌(空读/骤缩护栏)
+CREATE TABLE IF NOT EXISTS catalog.seller_blacklist (
+    seller_id  text PRIMARY KEY,     -- Amazon 卖家店铺 ID
+    synced_at  timestamptz NOT NULL DEFAULT now()
+);
+-- 亚马逊类目黑名单:同 wiki 子表(registry.AMZCAT_BLACKLIST_SHEET)
+-- → risk_sync 全量重灌;存归一化键(audit_phase0.normalize_amazon_category)
+CREATE TABLE IF NOT EXISTS catalog.amazon_cat_blacklist (
+    category_norm text PRIMARY KEY,  -- 归一化:去空白 + '>'/'->'/'/' → '->'
+    category_raw  text,              -- 飞书原文(调试用)
+    synced_at     timestamptz NOT NULL DEFAULT now()
+);
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
@@ -389,9 +429,13 @@ DROP TABLE IF EXISTS listing.upc_pool;
 DROP VIEW IF EXISTS orders.order_center;
 DO $$
 BEGIN
-  IF to_regclass('orders.orders') IS NOT NULL
-     AND NOT EXISTS (SELECT 1 FROM orders.orders) THEN
-    DROP TABLE orders.orders;
+  -- 嵌套 IF 是幂等的关键:PL/pgSQL 逐语句惰性计划,表已删时外层判空跳过,
+  -- 内层的表引用永不进计划;平铺 AND 会在计划期解析表名——首跑删表成功、
+  -- 重跑必炸 UndefinedTable(2026-08-13 生产实证,db_init 重跑被它卡死)
+  IF to_regclass('orders.orders') IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM orders.orders) THEN
+      DROP TABLE orders.orders;
+    END IF;
   END IF;
 END $$;
 ALTER TABLE catalog.products DROP COLUMN IF EXISTS assigned_upc;
@@ -851,3 +895,330 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (scope, key)
 );
+
+-- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
+--    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──
+-- 与旧仓的有意差异:① audit_runs 去掉对 products(asin) 的外键——本仓身份表
+--   catalog.products 是 (marketplace, asin) 复合主键,且旧 runs 含未入库 ASIN,
+--   硬挂 FK 导入即炸;② 三个自增主键用 GENERATED BY DEFAULT(非 ALWAYS):
+--   audit_import 要带原 id 整体搬入(hits 靠 run_id 关联),导入后 setval 续接;
+--   ③ walmart_pt_meta / walmart_pt_spec / walmart_prohibited_policy 三表旧仓
+--   无 DDL,列类型按 sync 脚本反推——audit_import dry-run 会拿系统目录
+--   (pg_attribute/format_type,含精度)与生产实表逐列对照,不符先改这里再导入。
+-- ⚠ 最终基准是生产实表的 pg_dump -s,不是旧仓 schema.sql——后者已知滞后
+--   (category_map 5 列、ip_stats 2 列是当年手工/脚本 ALTER 的,评审 2026-08-13
+--   按 sync 脚本证据补齐);执行 audit_import 前先在生产核对一遍。
+-- 不迁的旧表:products(catalog.products 取代)、llm_cache(catalog.llm_cache
+--   已有)、sync_runs(ops.runs 取代)、llm_usage / llm_route_events(批次 C
+--   可选重建)。
+
+-- ⚠ 退役为历史快照(所有者定稿 2026-08-13 黑名单中心统一):本表与下方
+-- phase0_* 三表是批次 A 从旧审核库搬来的快照,审核四闸已改读 catalog 黑名单
+-- 中心(brand_blacklist / asin_blacklist / seller_blacklist /
+-- amazon_cat_blacklist),本表零消费、不再同步,保留仅作迁移对账。
+CREATE TABLE IF NOT EXISTS audit.blacklist_brands (
+    brand    text PRIMARY KEY,
+    source   text,               -- '飞书' / 'TRO' / 'USPTO'
+    added_at timestamptz DEFAULT now(),
+    raw      jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_blacklist_source ON audit.blacklist_brands(source);
+
+-- Amazon 类目 → Walmart PT 映射(L1 快速通道;15,770 行映射明细的库内形态)
+CREATE TABLE IF NOT EXISTS audit.walmart_category_map (
+    amazon_category      text NOT NULL,
+    walmart_product_type text NOT NULL,
+    confidence           text,        -- '高' / '中' / '低'
+    requires_certificate boolean DEFAULT false,
+    zh_seller_forbidden  boolean DEFAULT false,
+    requirements         text,
+    notes                text,
+    synced_at            timestamptz DEFAULT now(),
+    raw                  jsonb,
+    -- 下五列旧仓 schema.sql 缺失、生产实表存在(sync_category_map.py INSERT
+    -- 无条件写入,当年手工 ALTER 的产物;评审 2026-08-13 补齐)
+    amazon_leaf          text,
+    browse_node_id       text,
+    rank_in_pt           integer,     -- 该 PT 下排序(L1 候选排序用)
+    match_type           text,        -- a2w_agent / 人工 / *_unmapped 等匹配来源
+    source_batch         text,
+    PRIMARY KEY (amazon_category, walmart_product_type)
+);
+CREATE INDEX IF NOT EXISTS idx_catmap_pt ON audit.walmart_category_map(walmart_product_type);
+CREATE INDEX IF NOT EXISTS idx_catmap_forbidden ON audit.walmart_category_map(zh_seller_forbidden) WHERE zh_seller_forbidden = TRUE;
+CREATE INDEX IF NOT EXISTS idx_catmap_cert ON audit.walmart_category_map(requires_certificate) WHERE requires_certificate = TRUE;
+
+-- ⚠ Phase0 三表退役为历史快照(2026-08-13,同上注):消费与同步均已迁到
+-- catalog.seller_blacklist / asin_blacklist / amazon_cat_blacklist
+CREATE TABLE IF NOT EXISTS audit.phase0_blacklist_sellers (
+    seller_id text PRIMARY KEY,
+    synced_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS audit.phase0_blacklist_asins (
+    asin      text PRIMARY KEY,
+    synced_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS audit.phase0_blacklist_amazon_cats (
+    category_norm text PRIMARY KEY,  -- 归一化:去空格 + '>' → '->'
+    category_raw  text,
+    synced_at     timestamptz DEFAULT now()
+);
+
+-- 黑名单品牌 IP 侵权 precision 统计(含人工 override 三列——必须搬数据
+-- 不能重算;override 优先于自动 severity,重算永不覆盖)
+CREATE TABLE IF NOT EXISTS audit.blacklist_brand_ip_stats (
+    brand             text PRIMARY KEY,
+    total_hits        integer DEFAULT 0,
+    e_hits            integer DEFAULT 0,
+    precision_pct     numeric(5,2),
+    -- c_* 两列是 analyze_brand_multi_class.py --write 运行时 ALTER 加的
+    -- (生产实表有;评审 2026-08-13 补齐)
+    c_hits            integer DEFAULT 0,
+    c_precision_pct   numeric(5,2) DEFAULT 0,
+    severity          text,            -- auto: hard / c_hard / medium / soft
+    override_severity text,            -- 人工覆盖(优先)
+    override_note     text,
+    override_by       text,
+    last_analyzed_at  timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_bbs_severity
+    ON audit.blacklist_brand_ip_stats(COALESCE(override_severity, severity));
+CREATE INDEX IF NOT EXISTS idx_bbs_precision
+    ON audit.blacklist_brand_ip_stats(precision_pct DESC);
+
+-- 回测 ground truth(批次 B 双跑校准的黄金集)
+CREATE TABLE IF NOT EXISTS audit.violation_groundtruth (
+    asin            text NOT NULL,
+    source_sheet    text NOT NULL,
+    raw_reason      text,
+    reason_category text,
+    labeled_by      text DEFAULT 'keyword_filter',
+    labeled_at      timestamptz DEFAULT now(),
+    PRIMARY KEY (asin, source_sheet)
+);
+CREATE INDEX IF NOT EXISTS idx_gt_category ON audit.violation_groundtruth(reason_category);
+CREATE INDEX IF NOT EXISTS idx_gt_source ON audit.violation_groundtruth(source_sheet);
+
+-- 沃尔玛错误商品日报(97k 行,precision 规则证据源 + 实证类目反哺来源之一)
+CREATE TABLE IF NOT EXISTS audit.walmart_error_records (
+    id           bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    source_sheet text NOT NULL,
+    sheet_id     text,
+    report_date  date,
+    shop         text,
+    asin         text,
+    sku          text,
+    title        text,
+    walmart_pt   text,
+    status       text,
+    status2      text,
+    price        numeric,
+    raw_reason   text NOT NULL,
+    error_code   char(1),
+    recorded_at  timestamptz,
+    feed_id      text,
+    synced_at    timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_werror_asin   ON audit.walmart_error_records(asin);
+CREATE INDEX IF NOT EXISTS idx_werror_code   ON audit.walmart_error_records(error_code);
+CREATE INDEX IF NOT EXISTS idx_werror_pt     ON audit.walmart_error_records(walmart_pt);
+CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(report_date);
+CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
+CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
+
+-- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
+-- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
+-- 人工确认后经批准通道(编辑权威待所有者定:飞书「映射明细」或 PG)升级
+-- 进映射表才生效。status:inherited(兄弟继承,免 LLM)/ok/unknown/excluded/no_candidate/llm_failed
+
+-- 亚马逊类目树(所有者对账版 2026-08-14;taxonomy_import 灌入)。
+-- **以 browse_node_id 为主键**——与产品侧 products.browse_node_id、映射表
+-- walmart_category_map.browse_node_id 三方 JOIN,名称漂移在此不成问题
+-- (2026-08-13 撤掉的那棵 Best Sellers 名称树正因只有名字才对不上)。
+-- 用途:①缺口工作面(树 3.2 万 node vs 映射 1.57 万,差集即未映射类目)
+-- ②规范名(人工复核/LLM 提示词用它,不用产品侧漂移面包屑)③祖先回退
+-- 迁移:2026-08-13 那版名称树(主键 path、有 parent_path 列)与本表结构
+-- 不兼容,且它**从未被填充过**(预览即撤,库内 0 行)——检出旧形态直接
+-- 丢弃重建。判据用 information_schema 精确到列,不误伤新表(生产实测:
+-- CREATE TABLE IF NOT EXISTS 遇旧表静默跳过,后面建索引才炸)
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'audit' AND table_name = 'amazon_taxonomy'
+                 AND column_name = 'parent_path') THEN
+        DROP TABLE audit.amazon_taxonomy;
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS audit.amazon_taxonomy (
+    node_id         text PRIMARY KEY,
+    name            text NOT NULL,     -- 类目名(路径末段)
+    path            text,              -- 完整路径(官方口径)
+    depth           integer,
+    parent_node_id  text,              -- 父 node;根级为 NULL
+    is_leaf         boolean,
+    root_name       text,              -- L1 根类目名
+    product_samples integer,           -- 树自带的样本数(采集侧统计,仅参考)
+    source          text,              -- leaves / verified_added_paths /
+                                       -- unverified_new_nodes(未验证新 node)
+                                       -- derived_products = taxonomy_derive 从
+                                       -- (ID 链 × 面包屑)反推的中间层补层:
+                                       -- 文件只发叶子,父链靠它才走得通。
+                                       -- taxonomy_import 重灌只删文件段的行
+    imported_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS amztax_parent_idx ON audit.amazon_taxonomy (parent_node_id);
+
+-- 类目**路径**关系(所有者定稿 2026-08-14):Amazon 的 browse tree 是 DAG
+-- 不是树——同一个 node 可以挂在多个父下、有多条完整路径(Belts 挂在男装
+-- 配件、汽车皮带、工业传动…)。按 browse_node_id 简单去重会**静默丢掉
+-- 多路径关系**,父链回退就只剩其中一条,回退到错误的祖先。
+-- 分工:节点级属性(名称/是否叶子)在 amazon_taxonomy 按 ID 一行;
+--       路径级属性(父/完整路径/深度/L1 根)在本表,键是**三元组**。
+-- amazon_taxonomy.parent_node_id / path / depth / root_name 保留为「代表路径」
+-- 的取值(展示与 1:1 JOIN 用,**不是唯一真相**);要走父链一律查本表。
+-- parent_node_id 用 '' 表示根级(PK 不收 NULL),读的时候 NULLIF(parent,'')。
+CREATE TABLE IF NOT EXISTS audit.amazon_node_paths (
+    node_id        text NOT NULL,
+    parent_node_id text NOT NULL,     -- '' = 根级
+    full_path      text NOT NULL,
+    depth          integer,
+    root_name      text,
+    source         text,              -- 与 amazon_taxonomy.source 同口径
+    imported_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (node_id, parent_node_id, full_path)
+);
+CREATE INDEX IF NOT EXISTS amzpath_parent_idx
+    ON audit.amazon_node_paths (parent_node_id);
+CREATE INDEX IF NOT EXISTS amzpath_path_idx
+    ON audit.amazon_node_paths (full_path);
+
+-- 类目路径别名(catmap_align 产出;所有者发现 2026-08-13:Amazon 的 slug /
+-- 面包屑 / Best Sellers 导航三套名称不完全一致,中间层节点名有别名漂移
+-- 'Home Décor Products' vs 'Home Décor'、'Outdoor Power Tools' vs
+-- 'Mowers & Outdoor Power Tools'——按完整路径精确等值会把已映射路径误判
+-- 成缺口)。对齐三闸:叶子相等 + 顶级相等 + 段集重叠且唯一(services/catpath)。
+-- 消费:audit_rules ②级映射精确匹配未命中时,经本表折到 canonical 再查
+CREATE TABLE IF NOT EXISTS audit.category_path_alias (
+    path           text PRIMARY KEY,   -- 产品侧面包屑原文(btrim)
+    canonical_path text NOT NULL,      -- 映射表里的等价路径
+    score          numeric NOT NULL,   -- 段集重叠分(≥0.5 才落)
+    aligned_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS audit.category_map_suggestions (
+    amazon_category text PRIMARY KEY,
+    suggested_pt    text,
+    confidence      text,
+    status          text NOT NULL,
+    sample_asin     text,
+    sample_title    text,
+    product_count   integer,
+    created_at      timestamptz NOT NULL DEFAULT now()
+);
+-- 挖掘家族补列(catmap_mine,2026-08-13):support=支持该 PT 的产品数,
+-- distribution=该路径下全部 PT 分布(分流时人工核对的依据)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS support_count integer;
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS pt_distribution jsonb;
+-- node 键挖掘(2026-08-14)必须留 ID:建议表主键是代表路径,不存 ID 的话
+-- 复核清单看不到 node、catmap_fix 也无从圈定(生产实测所有者反馈)
+ALTER TABLE audit.category_map_suggestions
+    ADD COLUMN IF NOT EXISTS browse_node_id text;
+
+-- PT 元数据(7033 行;L2 R1 双白名单闸:access_state + zh_can_do)
+-- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
+CREATE TABLE IF NOT EXISTS audit.walmart_pt_meta (
+    walmart_product_type text PRIMARY KEY,
+    walmart_category     text,
+    walmart_ptg          text,
+    access_state         text,
+    zh_can_do            text,
+    zh_seller_forbidden  boolean,
+    requirements         text,
+    notes                text,
+    total_fields         integer,
+    required_count       integer,
+    -- ⚠ text 不是 jsonb:pt_meta 的 required_fields 是飞书 J 列自由文本
+    -- (' | ' 分隔),sync_pt_meta.py 裸 %s 写入;与 pt_spec 同名列不同型,
+    -- 批次 B 消费时勿按 jsonb 语义查(评审 2026-08-13 纠正)
+    required_fields      text,
+    raw                  jsonb,
+    synced_at            timestamptz DEFAULT now()
+);
+
+-- PT 官方 spec 摘要(6942 行;R3a 硬认证字段判定)
+-- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照;
+--   源文件即旧 erpAPI 的 pt_templates_full.json(304MB),本仓 spec 链可重生成
+CREATE TABLE IF NOT EXISTS audit.walmart_pt_spec (
+    walmart_product_type text PRIMARY KEY,
+    total_fields         integer,
+    required_count       integer,
+    required_fields      jsonb,
+    real_cert_fields     jsonb,
+    has_real_cert        boolean,
+    soft_cert_fields     jsonb,
+    has_soft_cert        boolean DEFAULT false,   -- 源仓运行时 ALTER 带此默认
+    fields               jsonb,
+    synced_at            timestamptz DEFAULT now()
+);
+
+-- 沃尔玛禁售政策(43 类;L3 理由映射与 policy 提示行来源)
+-- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
+CREATE TABLE IF NOT EXISTS audit.walmart_prohibited_policy (
+    id                integer PRIMARY KEY,
+    category_en       text,
+    category_zh       text,
+    overall_status    text,
+    preapproval       text,
+    zh_seller_risk    text,
+    prohibited_items  text,
+    conditional_items text,
+    preapproval_items text,
+    legal_refs        text,
+    zh_seller_notes   text,
+    full_policy       text,
+    official_url      text,
+    policy_updated_at date,   -- sync_prohibited.py 传 datetime.date(评审纠正)
+    raw               jsonb,
+    synced_at         timestamptz DEFAULT now()
+);
+
+-- 审核结论(一 ASIN 可多次,run_id 区分;历史 runs 是"reject 永久短路"的
+-- 依据与 force_rerun 对照,必须随迁)
+CREATE TABLE IF NOT EXISTS audit.audit_runs (
+    run_id               bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    asin                 text NOT NULL,   -- 不挂 FK,理由见本节头注
+    walmart_product_type text,
+    pt_confidence        text,
+    pt_source            text,            -- map_direct / llm / walmart_confirmed(批次 C 新增值)
+    score_start          integer DEFAULT 100,
+    score_final          integer,
+    verdict              text,            -- pass / reject / pending
+    stage_stopped_at     text,
+    l3_verdict           text,
+    l3_reason_category   text,
+    l3_reason_text       text,
+    l4_verdict           text,
+    l4_issues            jsonb,
+    created_at           timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_asin    ON audit.audit_runs(asin);
+CREATE INDEX IF NOT EXISTS idx_audit_verdict ON audit.audit_runs(verdict);
+CREATE INDEX IF NOT EXISTS idx_audit_stage   ON audit.audit_runs(stage_stopped_at);
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit.audit_runs(created_at);
+
+-- 逐条规则命中明细(理由码账本)
+CREATE TABLE IF NOT EXISTS audit.audit_hits (
+    hit_id     bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    run_id     bigint NOT NULL REFERENCES audit.audit_runs(run_id) ON DELETE CASCADE,
+    stage      text NOT NULL,     -- L0 / L1 / L2 / L3 / L4
+    rule_code  text NOT NULL,
+    penalty    integer DEFAULT 0,
+    detail     jsonb,
+    created_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_hits_run   ON audit.audit_hits(run_id);
+CREATE INDEX IF NOT EXISTS idx_hits_rule  ON audit.audit_hits(rule_code);
+CREATE INDEX IF NOT EXISTS idx_hits_stage ON audit.audit_hits(stage);

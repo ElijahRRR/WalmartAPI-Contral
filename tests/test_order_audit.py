@@ -1063,12 +1063,15 @@ def test_timeout_backstop_spares_inflight_batches():
 
 
 def test_audit_batches_are_prefix_isolated():
-    """两条工作流共用 ops.scrape_batches,查在途必须按前缀圈自己的。
+    """三条链共用 ops.scrape_batches,查在途必须按前缀圈自己的。
     否则 product_refresh 的 1 小时超时口径会把订单审核的批次标成 timeout。"""
-    from workflows import order_audit as wf, product_refresh as pr
-    assert wf._BATCH_PREFIX != pr.BATCH_PREFIX
+    from services import scrape_batches as sb
+    from workflows import (order_audit as wf, product_refresh as pr,
+                           scrape_missing as sm)
+    prefixes = {wf._BATCH_PREFIX, pr.BATCH_PREFIX, sm.BATCH_PREFIX}
+    assert len(prefixes) == 3                    # 三个前缀互不相同
     assert "batch_name LIKE" in wf._OPEN_BATCHES_SQL
-    assert "batch_name LIKE" in pr._SQL_OPEN
+    assert "batch_name LIKE" in sb._SQL_OPEN     # 共用的在途查询也按前缀圈
 
 
 def test_push_scrape_records_batch_id_for_failures(wired, monkeypatch):

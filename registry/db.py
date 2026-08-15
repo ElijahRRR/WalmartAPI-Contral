@@ -1,6 +1,6 @@
 """数据库连接唯一入口(工程规范:禁止在其他任何文件自行 psycopg.connect / sqlite3.connect)。
 
-- 业务数据连本机 PostgreSQL 17 库 walmart_data(四 schema 见 docs/db_schema.md)。
+- 业务数据连本机 PostgreSQL 17 库 walmart_data(五 schema 见 docs/db_schema.md)。
 - 可重建缓存用 <DATA_ROOT>/cache 下的 SQLite(内置 WAL + busy_timeout)。
 """
 
@@ -17,8 +17,12 @@ def pg_dsn() -> str:
 
 
 @contextlib.contextmanager
-def pg_conn():
-    """输入:无 → 输出:psycopg 连接上下文;正常退出 commit,异常 rollback,总是 close。
+def pg_conn(autocommit: bool = False):
+    """输入:(可选 autocommit)→ 输出:psycopg 连接上下文;总是 close。
+
+    默认事务模式:正常退出 commit,异常 rollback。autocommit=True 给并发
+    worker 的只读+幂等缓存写用(product_audit workers>1:每 worker 一条
+    连接,写路径仍归主线程的事务连接)。
 
     用法:
         with db.pg_conn() as conn:
@@ -26,12 +30,14 @@ def pg_conn():
     """
     import psycopg  # 惰性导入:让不碰 PG 的 workflow 在缺 psycopg 的环境也能运行
 
-    conn = psycopg.connect(pg_dsn())
+    conn = psycopg.connect(pg_dsn(), autocommit=autocommit)
     try:
         yield conn
-        conn.commit()
+        if not autocommit:
+            conn.commit()
     except BaseException:
-        conn.rollback()
+        if not autocommit:
+            conn.rollback()
         raise
     finally:
         conn.close()
@@ -64,27 +70,54 @@ def legacy_cleanup_conn():
         conn.close()
 
 
-def audit_dsn() -> str:
-    """输入:无 → 输出:审核系统库 walmart_audit 的 DSN(env WALMART_AUDIT_DSN 覆盖)。
+def legacy_audit_dsn() -> str:
+    """输入:无 → 输出:旧审核库 walmart_audit 的 DSN。
 
-    审核系统(walmart-audit-system 仓库)无 JSON API,其现行下游对接方式就是
-    直连库(该仓库 cli/get_problem_images.py 明写"上架脚本用法")。
-    地址只准从这里取(铁律 3),工作流不许自带 DSN 参数。
+    审核迁入批次 A(audit_import)与批次 B 双跑校准专用。旧库与中心库在
+    同一台生产 Mac 同一 PG 实例(调研定稿 docs/audit_migration_plan.md);
+    若不同实例用 LEGACY_AUDIT_DSN 覆盖。地址只准从这里取(铁律 3)。
     """
-    return os.environ.get("WALMART_AUDIT_DSN", "dbname=walmart_audit")
+    return os.environ.get("LEGACY_AUDIT_DSN", "dbname=walmart_audit")
 
 
 @contextlib.contextmanager
-def audit_conn():
-    """输入:无 → 输出:审核库**只读**连接上下文(audit_sync 的读取端)。
+def legacy_audit_conn():
+    """输入:无 → 输出:旧审核库**只读**连接上下文。
 
-    审核结论的权威永远在审核系统的库里,本侧只有读的权利——回流落点是
-    catalog.products 的 audit_* 五列(写走 pg_conn,与这里无关)。
+    搬迁与校准的读取端。旧库是待归档真值,本仓对它只有读的权利。
     """
     import psycopg
 
-    conn = psycopg.connect(audit_dsn())
+    conn = psycopg.connect(legacy_audit_dsn())
     try:
+        conn.read_only = True
+        yield conn
+    finally:
+        conn.close()
+
+
+def uspto_dsn() -> str:
+    """输入:无 → 输出:USPTO 商标库 DSN(env USPTO_DSN 覆盖,默认本机 uspto 库)。
+
+    批复 #3(2026-08-13):R5 商标反查继续跨库连它;灌库链路在外部仓,
+    本仓永远只读。
+    """
+    return os.environ.get("USPTO_DSN", "dbname=uspto")
+
+
+@contextlib.contextmanager
+def uspto_conn():
+    """输入:无 → 输出:USPTO 库**只读、autocommit**连接上下文(1400 万行)。
+
+    autocommit 是批量消费的关键:整批共用一个连接,若开事务,第一条报错后
+    事务进 aborted 态,后续每条查询都 InFailedSqlTransaction——"fail-soft"
+    变成整轮静默失效(审核 R5 评审实证 2026-08-13)。只读查询无需事务语义。
+    """
+    import psycopg
+
+    conn = psycopg.connect(uspto_dsn())
+    try:
+        conn.autocommit = True
         conn.read_only = True
         yield conn
     finally:

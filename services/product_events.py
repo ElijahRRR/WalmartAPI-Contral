@@ -32,6 +32,12 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
   delete_verified        观测核验:回执成功且商品确实从目录消失
   delete_not_effective   观测核验:回执成功但宽限期后商品仍在架(真实案例,
                          所有者实证)——告警,人工处置
+  product_ingested       product_ingest 新 ASIN 首次入库(审核迁入批次 A 登记,
+                         批次 B 接线写入;detail 建议含 source_id/slow_hash)
+  audit_passed           product_audit 审核通过(批次 B 起写;detail 建议含
+                         walmart_pt/audit_version/run_id)
+  audit_rejected         product_audit 审核拒绝(批次 B 起写;detail 建议含
+                         reason/rule_code/run_id)
 
 原则:只追加永不改;回执与观测分开记,互相印证。
 
@@ -48,9 +54,10 @@ product_risk_store(店铺维度:"这个产品在哪些店被删过几次")/
 status_changes(平台状态迁移与官方下架原因)/ feed_failures(五类 feed
 的逐 SKU 失败回执)。
 
-二期接缝(只登记意图,不预留事件码):入库(product_ingest 写账本)与
-审核(catalog.products 的 audit_* 五列)两类事件,等审核服务落地时再来
-此登记常量——休眠码不进 EVENTS,免得恰好吞掉一个拼错的真实码。
+审核接缝落地(2026-08-13 批次 A):入库/审核三码已登记(product_ingested /
+audit_passed / audit_rejected),写入方 product_ingest 与 product_audit 在
+批次 B 接线。登记先行不算休眠码——批次序列已定稿
+(docs/audit_migration_plan.md 第十一节),写入方已在路上。
 
 入账边界(所有者定稿 2026-08-07):病历只记**产品生死**(删除/停用/反补)
 与观测事实。标题/价格/库存维护(含清库存)一律不进——清库存是店铺维度的
@@ -83,6 +90,9 @@ LIST_SUBMITTED = "list_submitted"
 PROBLEM_CATEGORIZED = "problem_categorized"
 DELETE_VERIFIED = "delete_verified"
 DELETE_NOT_EFFECTIVE = "delete_not_effective"
+PRODUCT_INGESTED = "product_ingested"
+AUDIT_PASSED = "audit_passed"
+AUDIT_REJECTED = "audit_rejected"
 
 # 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
 # record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。
@@ -91,6 +101,7 @@ EVENTS = frozenset({
     DELETE_SUBMITTED, RETIRE_SUBMITTED, MAINTENANCE_SUBMITTED,
     MATCH_SUBMITTED, LIST_SUBMITTED, PROBLEM_CATEGORIZED,
     DELETE_VERIFIED, DELETE_NOT_EFFECTIVE,
+    PRODUCT_INGESTED, AUDIT_PASSED, AUDIT_REJECTED,
 } | {f"{k}_feed_{st}" for k in _FEED_KIND.values()
      for st in ("success", "failed")})
 

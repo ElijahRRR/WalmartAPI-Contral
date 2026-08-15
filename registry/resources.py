@@ -77,10 +77,28 @@ WALMART_ERR_SKU_LOCKED = "ERR_EXT_DATA_0101211"     # SKU 绑死旧 UPC。解法
 # RETIRE→24h 冷却→清列→新 UPC 重上(sku_locked_heal 自愈链;旧实证:不先
 # 退役直接换 UPC 重发同一 SKU 也失败。不是永久跳过,所有者纠正 2026-08-12)
 WALMART_ERR_UPC_CONFLICT = "ERR_EXT_DATA_0101119"
+# 政策违禁(旧 sync_listing_state.PROHIBITED_CODES 实证,2026-08-12 抢救):
+# 永远不能上架——回执标 PROHIBITED,不进重试通道(重发也永远是拒)
+WALMART_ERR_PROHIBITED = frozenset({
+    "EXT_DATA_ERROR_71666506605865",    # Military/Law Enforcement
+    "EXT_DATA_ERROR_61696573580701",    # Firearm Accessories
+    "EXT_DATA_ERROR_61020366035308",    # General Prohibited Product
+})
 # 异步审核假错误(旧实证:'还在合规审核中',几小时~几天自然变 SUCCESS;
 # 绝不能当失败重发,否则 duplicate listing)
 WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
                             "EXT_DATA_ERROR_66547201695750")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  类目树来源标记(audit.amazon_taxonomy.source)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 所有者的对账版类目树只发叶子层,中间层由 taxonomy_derive 从我们自有的
+# (ID 链 × 面包屑)反推补齐。两者用 source 分辨:taxonomy_import 重灌时
+# 只删文件段的行,反推行留着;同 node 文件行永远覆盖反推行。
+# 两个 workflow 都要用,故登记在此(workflow 之间不互相 import)。
+TAXONOMY_SOURCE_DERIVED = "derived_products"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -414,6 +432,38 @@ MATCH_SHEET = Spreadsheet(
              "feed_check_time"),
 )
 
+
+# 黑名单中心两张新表(所有者定稿 2026-08-13:黑名单只维护一份,与品牌总表
+# 同一个黑名单 wiki 承载;取代旧审核系统的独立三列表)。镜像语义 = 单事务
+# TRUNCATE 全量重灌 + 空读/骤缩护栏(飞书删行必须跟着消失,残留即幽灵拦截)。
+SELLER_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单卖家店铺ID",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_SELLER_BLACKLIST_SHEET_ID", ""),
+    columns=("seller_id",),
+    wiki=True,
+)
+AMZCAT_BLACKLIST_SHEET = Spreadsheet(
+    name="黑名单亚马逊类目",
+    token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_AMZCAT_BLACKLIST_SHEET_ID", ""),
+    columns=("category",),
+    wiki=True,
+)
+
+# 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
+# 写入 catalog.products.audit_version;按版本批量重审走
+# product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
+AUDIT_RULES_VERSION = "c.2026-08-13.1"   # 批次 C:L1 rerank + L3 语义 + L4 视觉接线
+
+# LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
+# 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose
+# 参数;视觉走豆包 api/llm_vision.py,不在此表)
+LLM_PURPOSE_ENV = {
+    "default": "DEEPSEEK_MODEL",
+    "audit_l1": "DEEPSEEK_MODEL_AUDIT_L1",
+    "audit_l3": "DEEPSEEK_MODEL_AUDIT_L3",
+}
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
 # 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——

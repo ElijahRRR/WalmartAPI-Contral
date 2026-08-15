@@ -15,8 +15,10 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
 闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
-  ② 日配额(限额表「上架限制」- 今日已提交数(ops.feed_items MP_ITEM);
-    北京日界)
+  ② 日配额**在全部过滤之后切**(所有者批复 2026-08-12:配额以成功提交为准,
+    淘汰放切片前——先切片再过滤会让被淘汰行白占名额,淘汰率 40% 时实际
+    只能上到配额的 60%)。额度 = 限额表「上架限制」- 今日已提交数
+    (ops.feed_items MP_ITEM,北京日界);超配额行不写终态,次日自动续上
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
     cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist 永久禁止
@@ -24,9 +26,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     2026-08-12:拦"出现过侵权/审查等拉黑类别"的,不拦"因产品问题删过"
     的——可修复类删除后重上是正常经营,曾按删除史一刀切拦过,当日拆除);
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
-  ⑤ 数据源(services/amz_source,暂不可用:该行本轮跳过**不写终态**,
-    数据恢复自动续上)
-  ⑥ 数据过滤:库存 <5 淘汰;配送 >12 天上架但库存写 0;品牌黑名单;
+  ⑤ 数据源(services/amz_source,缺席:该行本轮跳过**不写终态**,并把
+    缺数据 ASIN **自动推给采集服务**补采(所有者批复 2026-08-12 接上闭环;
+    日界批次名防重,当天已推不重推),采集落库后自动续上
+  ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
+    (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
     只有区间内倍率未配置才淘汰)
   ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
@@ -42,8 +46,8 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 import logging
 from datetime import datetime
 
-from api import feeds, feishu, llm, settings as settings_api
-from registry import db, resources
+from api import feeds, feishu, llm, scraper, settings as settings_api
+from registry import db, paths, resources
 from services import amz_source, blacklist, kpi, listing_sheet, \
     listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
     product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
@@ -127,17 +131,72 @@ def _load_multipliers() -> dict[str, dict]:
     return out
 
 
-def _map_visible(conn, pt: str, spec, product: dict) -> dict:
-    """LLM 映射(缓存优先)→ mapper 硬约束清洗。"""
-    messages = mp_mapper.build_llm_messages(pt, spec, product)
+def _dump_llm_debug(asin: str, visible: dict, orderable: dict,
+                    missing: list, notes: list) -> None:
+    """必填缺失的载荷落盘(旧 llm_raw_*.json 语义,2026-08-12 接线):
+    排障直接看文件,不必重跑 LLM;失败只告警不影响主链。"""
+    try:
+        import json
+        d = paths.logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(kpi.CN_TZ).strftime("%Y%m%d_%H%M%S")
+        f = d / f"llm_raw_{asin}_{ts}.json"
+        f.write_text(json.dumps(
+            {"asin": asin, "missing": missing, "notes": notes,
+             "visible": visible, "orderable": orderable},
+            ensure_ascii=False, indent=2))
+        logger.info("必填缺失载荷已落盘:%s", f)
+    except Exception as e:
+        logger.warning("载荷落盘失败(不影响主链): %s", e)
+
+
+def _push_scrape(absent: list[str], execute: bool) -> str | None:
+    """输入:缺数据 ASIN 列表 + 是否真跑 → 输出:摘要行(None=无缺数据)。
+
+    采集闭环(所有者批复 2026-08-12):数据源缺席的 ASIN 自动推给采集服务,
+    替代"接线期人工推"。批次名带北京日界,天然防重——当天第二轮撞名
+    (BatchExistsError)直接跳过,增量 ASIN 次日随新批次推,不追当天。
+    最快形态(不切邮编不截图);采集落库(product_ingest)后主链自动续上。
+    推送失败只告警不阻塞上架:缺数据行本来就是跳过不写终态。
+    """
+    if not absent:
+        return None
+    day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
+    name = f"listing_gap_{day}"
+    if not execute:
+        return (f"  [DRY-RUN] 缺数据 {len(absent)} 个 ASIN,"
+                f"--execute 时将推采集批次 {name}")
+    try:
+        r = scraper.submit_batch(name, absent)
+        return (f"  缺数据 {len(absent)} 个 ASIN 已推采集"
+                f"(批次 {name},入库 {r.get('inserted')})")
+    except scraper.BatchExistsError:
+        return (f"  缺数据 {len(absent)} 个 ASIN:今日批次 {name} 已推过,"
+                f"不重推(增量明日随新批次)")
+    except Exception as e:
+        logger.warning("推采集失败(不阻塞上架,缺数据行本轮跳过): %s", e)
+        return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}"
+
+
+def _map_llm(conn, pt: str, spec, product: dict) -> tuple[dict, dict]:
+    """LLM 映射(缓存优先)→ (清洗后 Visible, LLM 填的 Orderable 字段)。
+
+    2026-08-12 旧仓对照恢复两段式:Orderable 的非系统字段(条件必填等)
+    交还 LLM 填,系统强制项在 build_orderable 里覆盖;Visible 照旧过
+    finalize_visible 硬约束清洗。
+    """
+    messages = mp_mapper.build_llm_messages(pt, spec, product,
+                                            ospec=pt_spec.orderable_spec())
     key = llm_cache.cache_key(messages, 0.2, 4096)
     raw = llm_cache.get(conn, key)
     if raw is None:
         raw = llm.chat_json(messages)
         llm_cache.put(conn, key, raw)
-    return mp_mapper.finalize_visible(pt, raw, spec,
-                                      images=product.get("images"),
-                                      product=product)
+    raw_v, raw_o = mp_mapper.split_llm_output(raw)
+    visible = mp_mapper.finalize_visible(pt, raw_v, spec,
+                                         images=product.get("images"),
+                                         product=product)
+    return visible, raw_o
 
 
 MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
@@ -195,13 +254,14 @@ def _spec_precheck(ready: list[dict]) -> str:
         for r in ready[:20]:
             spec = pt_spec.load_pt(r["product_type"])
             try:
-                visible = _map_visible(conn, r["product_type"], spec, r["_p"])
+                visible, llm_o = _map_llm(conn, r["product_type"], spec,
+                                          r["_p"])
             except Exception as e:
                 lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
                 continue
             orderable = mp_mapper.build_orderable(
                 r["asin"], "000000000000", r["_price"], r["_qty"], "0",
-                pt=r["product_type"], product=r["_p"])
+                pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
                 sku=r["asin"])
@@ -225,7 +285,9 @@ def run(params: dict) -> str:
              if r["audit_result"].lower() == "pass"
              and r["listed"].lower() in ("", "no")
              and not r["feed_id"]
-             and r["list_result"] != "SKU_LOCKED"]
+             # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
+             # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
+             and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
     retry, exhausted = _retry_rows(rows)
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
@@ -244,7 +306,7 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "no_data": 0, "filtered": 0,
-         "no_upc": 0, "stock_assumed": 0, "invalid": 0}
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
@@ -253,6 +315,9 @@ def run(params: dict) -> str:
     for r in pending:
         by_store.setdefault(r["store"], []).append(r)
 
+    # 配额**不在这里切**(所有者批复 2026-08-12):先过全部闸门与数据过滤,
+    # 幸存者再按店切片——被淘汰行不占名额,配额以能成功提交的行计
+    allow_by_store: dict[str, int] = {}
     for store_name, srows in sorted(by_store.items()):
         if store_name not in stores_by_name:
             lines.append(f"  {store_name}:凭证缺失,整店跳过")
@@ -260,11 +325,9 @@ def run(params: dict) -> str:
         if store_name in inactive:
             n["inactive"] += len(srows)
             continue
-        allow = max(0, quota.get(store_name, 999)
-                    - today_used.get(store_name, 0))
-        take, over = srows[:allow], srows[allow:]
-        n["quota"] += len(over)
-        for r in take:
+        allow_by_store[store_name] = max(0, quota.get(store_name, 999)
+                                         - today_used.get(store_name, 0))
+        for r in srows:
             if pt_spec.load_pt(r["product_type"]) is None:
                 n["no_spec"] += 1
                 reasons.append((r["rownum"], f"PT无spec:{r['product_type']}"))
@@ -294,12 +357,23 @@ def run(params: dict) -> str:
             candidates.append(r)
 
     products = amz_source.fetch_products([r["asin"] for r in candidates])
-    ready: list[dict] = []
+    # 缺数据 ASIN 自动推采集(所有者批复 2026-08-12 接上闭环,替代"接线期
+    # 人工推")。日界批次名天然防重:当天已推过撞名即跳过,增量次日再推
+    absent = sorted({r["asin"] for r in candidates
+                     if products.get(r["asin"]) is None})
+    scrape_note = _push_scrape(absent, execute)
+    survivors: list[dict] = []
+    data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
     for r in candidates:
         p = products.get(r["asin"])
         if p is None:
             n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
             continue
+        # 拉到数据的行,无论最终去向都回显标题与价库——运营在表上直接
+        # 看到"为什么这行没上"的数字(旧系统对 prep_fails 同款)
+        echo = [(p.get("title") or "")[:190], p.get("price") or "",
+                p.get("stock") if p.get("stock") is not None else "", ""]
+        data_echo.append((r["rownum"], echo))
         # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
         #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
         #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
@@ -318,7 +392,9 @@ def run(params: dict) -> str:
             n["filtered"] += 1
             reasons.append((r["rownum"], f"库存不足:{stock}"))
             continue
-        why = risk_gate.check(gate, None, p.get("brand"))
+        # 品牌与制造商两个字段都查(所有者批复 2026-08-12):brand=Generic
+        # 而真品牌在 manufacturer 是亚马逊常态,只查 brand 黑名单必漏
+        why = risk_gate.check(gate, None, p.get("brand"), p.get("manufacturer"))
         if why:
             n["risk"] += 1
             reasons.append((r["rownum"], why))
@@ -352,7 +428,21 @@ def run(params: dict) -> str:
         lead = p.get("lead_days")
         qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
             else int(stock)
-        ready.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+        echo[3] = w_price               # 算出定价的行回显 J 列
+        if not ((p.get("attrs") or {}).get("weight")):
+            n["no_weight"] += 1         # ShippingWeight 将按 1.0 磅兜底,亮出来
+        survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+
+    # 配额切片(在全部过滤**之后**):幸存者按店取额度内前 N 行;
+    # 超额行不写终态、不算失败,次日配额刷新自动续上
+    ready: list[dict] = []
+    sv_by_store: dict[str, list[dict]] = {}
+    for r in survivors:
+        sv_by_store.setdefault(r["store"], []).append(r)
+    for store_name, srows in sorted(sv_by_store.items()):
+        allow = allow_by_store.get(store_name, 0)
+        ready.extend(srows[:allow])
+        n["quota"] += max(0, len(srows) - allow)
 
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
@@ -362,7 +452,13 @@ def run(params: dict) -> str:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
+    if n["no_weight"]:
+        # 采集侧没给 attrs.weight → ShippingWeight 兜 1.0 磅。持续大面积
+        # 出现 = 采集契约的 weight 形态可能对不上(backlog P1 核实项)
+        gate_line += f";无重量数据按 1.0 磅 {n['no_weight']} 行"
     lines.append(gate_line)
+    if scrape_note:
+        lines.append(scrape_note)
     if missing_warn:
         lines.append(f"  ⚠ {len(missing_warn)} 行有\"不明原因消失\"史"
                      f"(疑似平台下架)仍放行:{','.join(missing_warn[:8])}"
@@ -386,6 +482,10 @@ def run(params: dict) -> str:
     for rownum, why in reasons:
         listing_sheet.write_reason(rownum, why)
     n_reasons_written = len(reasons)
+    # 淘汰行数据回显(待提交行随后由 write_submit_cols 写全套,不重复写)
+    ready_rownums = {r["rownum"] for r in ready}
+    listing_sheet.write_data_cols(
+        [(rn, v) for rn, v in data_echo if rn not in ready_rownums])
 
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     by_store2: dict[str, list[dict]] = {}
@@ -406,16 +506,17 @@ def run(params: dict) -> str:
                         n["no_upc"] += 1
                         reasons.append((r["rownum"], "UPC池余量不足"))
                         continue
-                    visible = _map_visible(conn, r["product_type"],
-                                           pt_spec.load_pt(r["product_type"]),
-                                           r["_p"])
+                    visible, llm_o = _map_llm(
+                        conn, r["product_type"],
+                        pt_spec.load_pt(r["product_type"]), r["_p"])
                     if len(visible.get("productName") or "") < 10:
                         upc_pool.release(conn, [upc], "prep_failed")
                         reasons.append((r["rownum"], "标题不足10字符"))
                         continue
                     orderable = mp_mapper.build_orderable(
                         r["asin"], upc, r["_price"], r["_qty"], partner,
-                        pt=r["product_type"], product=r["_p"])
+                        pt=r["product_type"], product=r["_p"],
+                        llm_fields=llm_o)
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
                     visible, orderable, notes, missing = mp_conform.conform(
@@ -430,6 +531,8 @@ def run(params: dict) -> str:
                         n["invalid"] += 1
                         reasons.append((r["rownum"],
                                         f"必填缺失:{','.join(missing[:6])}"))
+                        _dump_llm_debug(r["asin"], visible, orderable,
+                                        missing, notes)
                         continue
                     items.append(mp_mapper.assemble_mp_item(
                         orderable, r["product_type"], visible))

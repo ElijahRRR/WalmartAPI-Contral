@@ -21,7 +21,30 @@
 - LLM(DeepSeek/Qwen)API key、采集地址等全部进 `<DATA_ROOT>/.env`,
   经 registry 引用;spec 文件入 `<DATA_ROOT>/specs/<版本>/`。
 
+## 当前状态(2026-08-12 晚,代码迁移收官)
+
+- **代码面:迁移完成**。L0~L2d 全部就绪;2026-08-12 四批收官:六点批复
+  (批次一)+ 载荷漏迁补齐(批次二,旧仓逐字段对照)+ 接线(批次三)+
+  违禁反哺黑名单闭环;两重自愈(SKU_LOCKED / K=Unknown)、跟卖库存
+  provider、缺数据推采集闭环全部接通;第 5 轮错误(releaseDate 日期格式)
+  已修,576 测试全绿。
+- **验收面:✅ L2d 端到端验收通过**(2026-08-13:feed 18CB051E… 回执
+  PROCESSED **成功 3 失败 0**,所有者确认)。**L2a 已验**(注入 47 →
+  四态 28/0/10/9);**L2b 已验**(825 禁售 + 42102 品牌 + ASIN 黑名单
+  5.6 万自产回路在库);**L1 跟卖试点后置**(所有者:功能暂时用不上,
+  启用前再验)。
+- **运维面(验收后)**:调度挂载(catalog_sync→maintenance→list_new 顺序
+  硬约束;feed_poll 高频)→ 切换清单(**旧 launchd 5 条 + AI skill 链
+  两条调度必须同停**,新旧并跑=重复领号重复上架)→ L4 收尾(历史数据
+  迁移批次/upc_audit)。
+- **刻意后置**:变体分组(等采集 variation 三字段提顶层)、update_listed
+  五字段集(归 maintenance)、健康仪表盘。
+
 ## 阶段划分
+
+> ⚠ 勘误说明(2026-08-12):L0/L1 规划段的复选框是**立案时原文**,一直没勾
+> ——实况以各「实施状态」节与上方「当前状态」为准(L0/L1 均已完成;
+> listing.tasks/retry_state 两表后来判定不建,见 backlog 第四节)。
 
 ### L0 地基(无沃尔玛写操作,可随时动工)
 
@@ -114,11 +137,15 @@
       + 枚举合法化 + 未知字段剔除(Orderable.productName 即因此被拒)+
       stateRestrictions 清理 + 空值/minItems 裁剪 + 小数位 + **提交前必填校验
       (不过就不提交,省 UPC 与配额)**;dry-run 加 -p check_spec=1 预检
-- [ ] 重跑验收:预检 → --execute → 回执 SUCCESS
+- [x] **重跑验收通过**(2026-08-13,feed 18CB051E…):A121许家蕴 3 条
+      (Bar Stools $194.99 / Bulb Planter Tools $82.48 / Fence Screens $61.47)
+      **PROCESSED 成功 3 失败 0**,O/P/Q 反哺回填正常。六轮错误账收官:
+      30 错 → 0 错。L2d 端到端验收 ✅
 
-### ⏸ L2d 攻坚暂停(所有者定稿 2026-08-09)
+### L2d 攻坚(2026-08-09 暂停 → 2026-08-12 续做收官)
 
-**状态:代码全部保留,不回退。** 四轮真跑把载荷问题从 30 个错收敛到只剩
+**状态:✅ 验收通过(2026-08-13,3/3 SUCCESS)**(续做内容见上方
+「续迁批次一/二/三」与「续迁调研定稿」各节)。以下为暂停期存档。 四轮真跑把载荷问题从 30 个错收敛到只剩
 UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先做别的",
 本阶段暂停;续做时从「下次续做怎么走」直接接上。
 
@@ -137,6 +164,7 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 | 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标) |
 | 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位 |
 | 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
+| 5 | 3 | `00030257670757` `[releaseDate]` 要 YYYY-MM-DD(批次二重跑,2026-08-12) | **批次二自伤**:新加的 Orderable 条件必填兜底把日期字段当普通字符串填了 'Not Available' | 日期字段感知(`_date_kind`:format 显式严格/名字推断两格式都认——endDate 要 DateTime 是同码反向实证)+ fix_type_mismatches 日期硬闸 + 提示词送 format |
 
 #### 攻坚期沉淀下来的通用设施(已惠及全部 feed 类型)
 
@@ -154,6 +182,75 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
    按上表的模式定位是哪一层没对齐;
 3. 新错误码进 `mp_conform` 对应工序 + 一条回归测试 + 本表追加一行;
 4. 只剩 `0101119` 撞库 = **已经通了**,那是运气不是缺陷。
+
+#### 续迁调研定稿(2026-08-12,旧仓 erpAPI 三路全量对照)
+
+完整缺口清单(P0~P3 分级)在 **docs/backlog.md 第八节**,此处只记结论:
+
+- **旧 auto_listing 40+ 模块逐一定性完毕**:主链/映射/定价/回执/UPC 池/风控/
+  自愈/限速全部已被新系统承接(多数更强);死代码与一次性脚本共 8 个不迁;
+  真缺口 6 个 P0(K=Unknown 自愈、跟卖库存、闸门前淘汰计次、缺数据推采集、
+  配额增量补齐、manufacturer 双字段风控),回归/能力项见总账。
+- **旧生产有两条调度链**:launchd 5 条 + AI skill 平台 erp-online-products-track
+  (07:30,也写上架表 O/P/Q 与 R~W)。切换清单必须两条都停。
+- **26→21 列**:旧 V/W 左移至新 T/U,迁移/对照一律**按列名**;旧读侧键名与
+  config.py 列表早已过期,以 feishu_io.py docstring + 写侧函数为准。
+- **变体分组评估**:核心 ~190 行纯函数,可做;跨店重定向(与人工域/配额
+  口径冲突)与 LLM remap 建议砍;先决条件 = 采集契约顶层暴露
+  parent_asin / variation_asins / variation_attributes。
+- **旧 Excel/DMIT 47 列输入模式不迁**;excel_row_to_amazon_dict(120 行)是
+  唯一完整的字段映射基准,已用于契约对照——结论:仅 manufacturer 需提顶层,
+  其余都在 attrs 里;attrs.weight 形态需生产核实(否则 ShippingWeight 全量
+  兜底 1.0 磅)。
+
+#### 续迁批次一实施状态(2026-08-12,所有者六点批复当日落地)
+
+- [x] K=Unknown 自愈:`listing_sheet.heal_unknown`(feed_poll 第五反哺器;
+      feed 台账终态双向收尾 + 目录在线判定;"查无"永不负向写;UPC 随判定
+      标已用/回收;SKU_LOCKED 移交自愈链)
+- [x] 跟卖库存:`maintenance_intents.match_inventory_intents`(唯一路径,
+      默认铺 10;stockzero 解除自动回补)
+- [x] 配额切片后置(淘汰放切片前,配额以成功提交为准)
+- [x] 缺数据自动推采集(`list_new._push_scrape`,日界批次名防重)
+- [x] manufacturer 提顶层 + risk_gate 双字段
+- [x] 闸门前淘汰计次:**否决不做**(所有者:数据每轮会变,不该永久淘汰;
+      贵步骤已在切片后,无浪费)
+- 批复原文与实现细节:docs/backlog.md 第八节
+
+#### 续迁批次二:载荷构造漏迁补齐(2026-08-12,所有者"始终上不成"追查)
+
+两路深比对(旧 mapper 全工序逐字段 / feed 信封逐键 + LLM 提示对照)结论:
+**信封与三大陷阱形态逐键一致,洗清嫌疑;漏迁集中在 LLM 输入面与 Orderable**:
+
+- [x] **LLM 提示词恢复旧富元数据**(最大嫌疑):此前只送 enum+desc——
+      type 不送,模型只能猜数组还是标量(第 1/3 轮"要 JSONArray 给标量"
+      "要 String 给数组"就是两种猜错方向);[:200] 硬截断会永久截掉排后面
+      的必填字段。现恢复 type/required/minItems/items/object 结构、必填
+      全量+可选截断(Visible 20/Orderable 10)、allOf 条件必填翻译块
+- [x] **Orderable 交还 LLM**:旧结构=LLM 按 spec 填+force_overrides 覆盖
+      10 项;此前写死 14 键,Orderable 条件必填永远给不出。LLM 输出改两段
+      {"visible","orderable"}(旧缓存平铺形态兼容);**删掉旧金样从未发过
+      的 Orderable.brand / countryOfOriginAssembly**(与 productName 同血统
+      60670554076755);Orderable 段同过条件必填/类型/枚举一致化;
+      ospec 空时不再把整个 Orderable 清空(改为保留+告警)
+- [x] 零认证降级序列补回第四档 **"None"**(enum 只有 None 时旧选 None,
+      漏这档掉到 enum[0]='Yes - Warranty Text' → 触发 warrantyText 必填)
+- [x] 文档字段清单补 **suggested_number_of_people_for_assembly**(旧八项
+      之一,留着与 isAssemblyRequired=No 自相矛盾)
+- [x] safe_default array 分支优选 No/None/Not Applicable(此前 ["Yes","No"]
+      兜成 Yes,方向反,还级联触发条件必填)
+- [x] **keyFeatures 按 per-PT minItems 凑句**(旧 enforce_copy_limits;
+      写死 4 会让 minItems=5/6 的 PT 被本地 validate 卡死**永远进不了 feed**
+      ——"始终无法上架"的另一半可能是这个:不是被拒,是根本没提交)
+- [x] 变体三件套改必填驱动:非必填半套整套剔除(旧系统单品从不发变体字段,
+      SKU 占位组 ID 无实证),spec 必填才补全(第 4 轮实证 PT)
+- [x] 图片保序去重(主图=亚马逊原序第一张;此前字典序把主图换掉)
+- [x] DEEPSEEK_MODEL 可经 .env 切换(旧生产 deepseek-v4-flash),
+      llm_cache 键与请求模型同源
+
+**验收路径不变**:`list_new -p check_spec=1` 全 ✓ → `--execute` →
+`feed_poll -p feed_id=X` 看 description。新错误码继续进 mp_conform+回归
+测试+四轮错误账追加。
 
 #### 已知未做(续做时的清单)
 
@@ -183,7 +280,16 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       SKU_LOCKED)+ 优先级(SKU_LOCKED > 真SUCCESS > INPROGRESS > 全ASYNC >
       SUCCESS_WITH_WARNING > DATA_ERROR)+ 异步审核假错误绝不当失败重发;
       做成 feed_poll 反哺器回写上架表
-- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted);上架拦截 2026-08-12 定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看删除史,product_risk 只是查询档案 + unexplained_missing 报警);**入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
+- [~] 产品事件账本接线:上架事件已接(list_submitted/match_submitted;
+      回执 list_feed_{success|failed} 带错误码由 feed_track 落账,读侧
+      catalog.feed_failures / ops.v_feed_error_stats);上架拦截 2026-08-12
+      定稿=**黑名单双闸**(asin_blacklist + risk_gate,双链接通;防呆不看
+      删除史,product_risk 只是查询档案 + unexplained_missing 报警);
+      **失败反哺拦截闭环**(所有者 2026-08-12):上架回执命中三违禁码 →
+      自动入 asin_blacklist B=禁售(feed_track 收口,幂等)→ 黑名单闸
+      上架前拦截,同一产品不再烧 UPC/配额;其余 DATA_ERROR 只入事件
+      不入黑名单(可修复类,入了会误杀重上架——与"防呆不看删除史"同源);
+      **入库/审核两类事件未接**(等二期审核服务,见 docs/backlog.md 第三节)
 
 ### L3 自愈链(依赖 L2)——**暂缓**(所有者定稿 2026-08-07:暂时不用做,以后需要了再做)
 
@@ -191,15 +297,15 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
       跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
       工作流默认 dry-run;回执失败标 failed 人工处置不自动重试;需每日调度
-- [ ] 状态跟踪:旧 sync_status_track 的"反查真实状态 + Unknown 自愈"由
-      catalog_sync(已上线)+ product_events 观测地基承接,只补
-      "上架表 K=Unknown 而目录已在线 → 自愈回写"这一条
+- [x] 状态跟踪:旧 sync_status_track 的"反查真实状态"由 catalog_sync 承接;
+      "K=Unknown 自愈"已由 listing_sheet.heal_unknown 落地(2026-08-12,
+      feed 台账终态双向 + 目录在线双源,挂 feed_poll 反哺器)
 
 ### L4 收尾
 
 - [ ] upc_audit(全站 UPC 冲突审计,只读)
-- [ ] 历史数据迁移批次:上架表 26 列全量、UPC 池 12 万行、pending_feeds
-      在途收干净、retry_state 永久淘汰名单(丢了会重拉几万个已死 ASIN)
+- ~~历史数据迁移批次~~(2026-08-12 所有者整批关闭:26 列/UPC 池 12 万行/
+      pending_feeds/retry_state 全部不迁;防重拉已死 ASIN 由黑名单承担)
 - [ ] 切换清单:停 launchd 4 条(morning/reconcile_hourly/retire_daily/
       health_4x)+ scheduled-tasks 的 dedup_sync(前端不迁,此任务作废)
 

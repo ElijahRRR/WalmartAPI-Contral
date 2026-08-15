@@ -8,6 +8,8 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
     "openpyxl>=3.1",
+    "pyahocorasick>=2.1",   # 审核 R4:42k 品牌黑名单扫描(批次 B)
+    "pyyaml>=6.0",          # 审核规则 seed yaml(refdata/audit/)
 ]
 
 [dependency-groups]

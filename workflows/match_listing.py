@@ -28,7 +28,10 @@
 修好重上是正常经营;曾按 product_risk 删除史/GTIN 删除史一刀切拦过,
 当日拆除)。
 结果:J/K 由 feed_poll 反哺器按 ops.feed_items 回填;跟卖新 offer 默认
-0 库存是正常现象(v4.2 spec 无库存字段),不当失败。
+0 库存是正常现象(v4.2 spec 无库存字段),不当失败——库存由 maintenance
+的 match_inventory provider 铺(offer 进目录后自动补到保守值;所有者批复
+2026-08-12,补"建成即 0 库存永远没人补"的结构洞,旧 inventory_push
+因 --no-poll 从未真跑)。
 
 与地基的融合:提交走 api/feeds 唯一通道(三层防重/切片/限速);轮询走
 全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,
@@ -50,9 +53,12 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.match_listing")
 
-# F 列终态(不重复预检/提交;运营清空 F 即重新排队)
-_TERMINAL = ("需完整建品", "目录无", "预检失败", "店铺不识别", "码无效",
-             "风控拦截", "ASIN黑名单")     # 后两类为前缀
+# F 列终态(不重复预检/提交;运营清空 F 即重新排队)。
+# "预检失败"**不是终态**(2026-08-12 旧仓对照纠正:那多半是 SPEC 接口网络
+# 抖动,旧系统每次跑批全新 xlsx 自然重试;当终态会把行永久停摆)——
+# 每轮自动重新预检,持续失败的行留在表上反复出现即是信号
+_TERMINAL = ("需完整建品", "目录无", "店铺不识别", "码无效",
+             "风控拦截", "ASIN黑名单", "数据无效")     # 后三类为前缀
 
 
 def _gate_reason(spec: dict, gate: dict, banned: dict) -> str | None:
@@ -113,7 +119,8 @@ def run(params: dict) -> str:
     # 行分拣:在途(反哺器管)/终态/待处理(F 空或=可跟卖 且 I 空)
     inflight = [r for r in rows if r["feed_id"]]
     todo = [r for r in rows if not r["feed_id"]
-            and r["status"] in ("", "可跟卖")]
+            and (r["status"] in ("", "可跟卖")
+                 or r["status"].startswith("预检失败"))]
     lines = [f"{mode}跟卖表 {len(rows)} 行:待处理 {len(todo)},"
              f"在途/已提交 {len(inflight)},终态 "
              f"{len(rows) - len(todo) - len(inflight)}"]

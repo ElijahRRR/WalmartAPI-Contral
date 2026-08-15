@@ -1,0 +1,120 @@
+# NRTL 认证 required 但属于"电气小件/配件" → R3 降为 -10 软警告
+#
+# 设计: 整机电器/灯具/家电/电池/测量仪整机搬运模式客观做不了 (R3 hard -100 reject)
+#       电气小件/替换件/布线/保险丝/开关/绝缘子等, 部分卖家可填 No 上架 + 下游人工审核
+#       → 标记为 small_part, R3 降为 -10 软警告 (不 reject)
+#
+# 匹配规则:
+#   PT 名 (小写) 含任一 small_part_keywords 关键词 (子串匹配)
+#   AND PT 名 (小写) 不含任一 whole_unit_keywords 关键词 (override)
+#   EXCEPT PT 名 含 'Replacement' 或 'Parts' 或 'Accessor' 时 → 强制 small_part (即使同时含整机词)
+#
+# 未命中任一关键词的 PT → 保持 -100 (保守, 不降级)
+
+version: 1
+updated: 2026-04-21
+
+small_part_keywords:
+  # 电路元件
+  - "Switch"
+  - "Outlet"
+  - "Plug"
+  - "Receptacle"
+  - "Fuse"
+  - "Circuit Breaker"
+  - "Breaker"
+  - "Relay"
+  - "Dimmer"
+  - "Ballast"
+  - "Transformer"
+  - "Capacitor"
+  - "Resistor"
+  - "Inductor"
+  - "Diode"
+  - "Transistor"
+  - "Potentiometer"
+  # 传感器/接口小件
+  - "Electronic Component Sensor"
+  - "Household Water Sensor"
+  - "Household Sensors & Alarms"
+  # 布线/连接件
+  - "Wire"
+  - "Cable"
+  - "Cord"
+  - "Connector"
+  - "Insulator"
+  - "Terminal"
+  - "Junction"
+  - "Bracket"
+  - "Clamp"
+  - "Coupling"
+  - "Pigtail"
+  # 照明配件 (非整机灯具)
+  - "Lamp Holder"
+  - "Lampholder"
+  - "Lamp Socket"
+  - "Bulb Socket"
+  # 发动机/工具零件
+  - "Ignition Coil"
+  - "Spark Plug"
+  # 通用"配件/替换件" (覆盖性关键词)
+  - "Replacement"
+  - "Accessor"  # Accessory / Accessories
+  # 小开关类
+  - "Push Button"
+  - "Toggle"
+  - "Rocker"
+
+whole_unit_keywords:
+  # 灯具整机 (即使 PT 含 "Bulb" 或 "Light" 也视为整机)
+  - "Light Bulb"
+  - "Light Fixture"
+  - "Chandelier"
+  - "Sconce"
+  - "Lantern"
+  - "Floodlight"
+  - "Spotlight"
+  - "Torch"
+  - "Flashlight"
+  - "Ceiling Fan"        # 整机
+  - "Floor Lamp"
+  - "Table Lamp"
+  - "Desk Lamp"
+  - "Wall Lamp"
+  # 家电整机
+  - "Refrigerator"
+  - "Freezer"
+  - "Oven"
+  - "Microwave"
+  - "Dishwasher"
+  - "Washer"
+  - "Dryer"
+  - "Cooker"
+  - "Blender"
+  - "Air Purifier"
+  - "Dehumidifier"
+  - "Humidifier"
+  - "Air Conditioner"
+  - "Space Heater"
+  - "Water Heater"
+  # 泵/压缩机整机
+  - "Compressor"
+  - "Generator"
+  # 电池/电源整机
+  - "Battery Pack"
+  - "Power Bank"
+  - "Battery Charger"
+  # 测量仪器整机
+  - "Multimeter"
+  - "Meter"              # Clamp Meter / Flow Meter / Gas Meter 等 (整机)
+  - "Tester"             # Cable Tester / Current Tester 等 (整机)
+  - "Oscilloscope"
+  - "Analyzer"
+  - "Monitor"            # Blood Pressure Monitor / Computer Monitor 等
+  - "Gauge"              # Pressure Gauge / Tire Gauge 整机
+  # 电子产品整机
+  - "Laptop"
+  - "Desktop Computer"
+  - "Television"
+  - "Smartphone"
+  - "Tablet"

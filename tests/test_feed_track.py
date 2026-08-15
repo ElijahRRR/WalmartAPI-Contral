@@ -254,3 +254,39 @@ def test_all_reflectors_write_code_plus_desc(monkeypatch):
                         lambda s, ups: (captured.update(match=ups), len(ups))[1])
     match_sheet.sync_from_ledger()
     assert captured["match"][0][1][0][0] == f"失败:{want}"
+
+
+def test_prohibited_receipt_flows_into_blacklist(monkeypatch):
+    """上架回执违禁 → 自动入 ASIN 黑名单 B=禁售(所有者 2026-08-12:失败
+    事件反哺'上架前拦截')。只收 kind=list;跟卖 sku 提不出 ASIN 不收。"""
+    class _C(_Conn):
+        def fetchall(self):
+            if "FROM ops.feed_items" in self._last:
+                return [("B0BAD01", "list_new", "MP_ITEM", "submitted"),
+                        ("PHUMWMT1", "match_listing", "MP_ITEM_MATCH",
+                         "submitted")]
+            return []
+
+    conn = _C()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "B0BAD01", "ingestionStatus": "DATA_ERROR",
+         "ingestionErrors": {"ingestionError": [
+             {"code": "EXT_DATA_ERROR_61020366035308",
+              "description": "General Prohibited Product"}]}},
+        {"sku": "PHUMWMT1", "ingestionStatus": "DATA_ERROR",
+         "ingestionErrors": {"ingestionError": [
+             {"code": "EXT_DATA_ERROR_61020366035308"}]}},
+    ]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
+    got = []
+    monkeypatch.setattr(feed_track.blacklist, "record_asins",
+                        lambda c, items: (got.extend(items), len(items))[1])
+
+    feed_track.poll_feed(STORE, "F9")
+    assert len(got) == 1 and got[0]["sku"] == "B0BAD01"
+    assert got[0]["category"] == "B"
+    assert "61020366035308" in got[0]["reasons"]
+    assert "General Prohibited" in got[0]["reasons"]

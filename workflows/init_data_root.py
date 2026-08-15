@@ -18,9 +18,6 @@ _ENV_TEMPLATE = """\
 # PostgreSQL(默认本机 socket 连 walmart_data,通常无需改)
 #WALMART_PG_DSN=dbname=walmart_data
 
-# 审核系统库(audit_sync 只读回流审核结论;同机默认值即可,异机填完整 DSN)
-#WALMART_AUDIT_DSN=dbname=walmart_audit
-
 # 飞书自建应用凭据(注意:旧系统的 APP_SECRET 已进 git 历史,必须在飞书后台轮换后再填)
 FEISHU_APP_ID=
 FEISHU_APP_SECRET=
@@ -48,6 +45,10 @@ FEISHU_BLACKLIST_WIKI_TOKEN=
 FEISHU_ASIN_BLACKLIST_SHEET_ID=
 FEISHU_BRAND_ERR_WIKI_TOKEN=
 FEISHU_BRAND_ERR_SHEET_ID=
+# 黑名单中心两张只读源(飞书→PG,risk_sync TRUNCATE 全量重灌;
+# 同一份 wiki 文档,复用 FEISHU_BLACKLIST_WIKI_TOKEN;定稿 2026-08-13)
+FEISHU_SELLER_BLACKLIST_SHEET_ID=
+FEISHU_AMZCAT_BLACKLIST_SHEET_ID=
 
 # listing 风控两张只读源(飞书→PG,risk_sync 镜像入库)
 # FEISHU_BRAND_* = 黑名单品牌总表(各渠道人工归拢的总清单,方向与
@@ -56,6 +57,18 @@ FEISHU_RISK_PT_WIKI_TOKEN=
 FEISHU_RISK_PT_SHEET_ID=
 FEISHU_BRAND_WIKI_TOKEN=
 FEISHU_BRAND_SHEET_ID=
+
+# LLM(DeepSeek 单链;api/llm.py)。分用途覆盖模型可选(批复 #1,
+# 未配置回落 DEEPSEEK_MODEL 默认;registry.LLM_PURPOSE_ENV 登记)
+DEEPSEEK_API_KEY=
+#DEEPSEEK_MODEL=deepseek-chat
+#DEEPSEEK_MODEL_AUDIT_L1=
+#DEEPSEEK_MODEL_AUDIT_L3=
+# L4 视觉(豆包/火山方舟;api/llm_vision.py;默认关,-p l4=on 才用)
+# base_url/model 不填用旧生产默认值
+ARK_API_KEY=
+#ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+#ARK_VISION_MODEL=doubao-seed-1-6-flash-250615
 
 # 沃尔玛 API(默认 production;沙箱测试才需要设)
 #WALMART_BASE_URL=https://sandbox.walmartapis.com

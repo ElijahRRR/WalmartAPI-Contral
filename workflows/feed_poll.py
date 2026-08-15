@@ -45,6 +45,10 @@ _REFLECTORS: list[tuple[str, object]] = [
     ("维护记录", maint_sheet.sync_from_ledger),
     ("跟卖表", match_sheet.sync_from_ledger),
     ("上架表", listing_sheet.sync_from_ledger),
+    # K=Unknown 自愈(所有者批复 2026-08-12):feed 台账终态 + 目录在线
+    # 双源收尾,替代旧 sync_status_track 的自愈半边。只写飞书与 UPC 池,
+    # 不碰沃尔玛——反哺器"只读沃尔玛"的契约不破
+    ("上架表自愈", listing_sheet.heal_unknown),
 ]
 
 

@@ -71,7 +71,10 @@ def build_match_item(spec_raw: dict | None, sku: str, price, weight,
                  .get("MPItem") or [{}])[0].get("Item") or {})
     base["sku"] = str(sku)
     base["price"] = round(float(price), 2)
-    base["ShippingWeight"] = round(float(weight), 2)
+    # 重量留空默认 1 磅(旧 DEFAULT_WEIGHT 实证,2026-08-12 旧仓对照补回:
+    # 旧系统运营可以不填重量;此前 float('') 抛异常把行打成"数据无效"卡死)
+    w = str(weight or "").strip()
+    base["ShippingWeight"] = round(float(w), 2) if w else 1.0
     base.setdefault("condition", "New")
     if "productIdentifiers" not in base and product_id:
         base["productIdentifiers"] = {"productIdType": product_id_type or "GTIN",

@@ -42,12 +42,18 @@ NO_CERT_FORCES = {
     "has_written_warranty": "No",
     "isAssemblyRequired": "No",
 }
-# LLM 可能瞎填的文档引用字段:必须删除(填了 = 声称有证书 → 必拒)
+# LLM 可能瞎填的文档引用字段:必须删除(填了 = 声称有证书 → 必拒)。
+# suggested_number_of_people_for_assembly 是旧八项之一(2026-08-12 旧仓对照
+# 补齐):留着会与 isAssemblyRequired=No 自相矛盾,触发文档依赖必拒
 DANGEROUS_DOC_FIELDS = ("warrantyText", "warrantyURL", "prop65WarningText",
-                        "nrtl_information", "assemblyInstructions")
+                        "nrtl_information", "assemblyInstructions",
+                        "suggested_number_of_people_for_assembly")
 _DOC_SUFFIX = "_document_reference_id"
-# 强制值不在 enum 时的降级顺序(None=删字段)
-_FORCE_FALLBACK = ("No", "Neither of these applies", "Skip for now")
+# 强制值不在 enum 时的降级顺序(旧 mapper 四档,"None" 2026-08-12 旧仓对照
+# 补回:PT enum 只有 None 而无前三者时旧选 None,漏这档会掉到 enum[0]——
+# has_written_warranty 之类 enum[0] 常是 'Yes - Warranty Text',一填就触发
+# warrantyText 条件必填)
+_FORCE_FALLBACK = ("No", "Neither of these applies", "Skip for now", "None")
 
 
 def clamp(text, limit: int, ellipsis: bool = False) -> str:
@@ -59,8 +65,10 @@ def clamp(text, limit: int, ellipsis: bool = False) -> str:
 
 
 def sort_images(urls: list) -> list[str]:
-    """防御性排序:采集侧 set() 去重导致顺序随机 → 字典序保 idempotent。"""
-    return sorted({str(u) for u in urls or [] if u})
+    """保序去重(2026-08-12 旧仓对照纠正):旧系统保持亚马逊原序,
+    mainImageUrl=原序第一张=亚马逊主图。此前的字典序排序会把主图换成
+    URL 最小的那张;来源真被 set() 打乱时保序也不比排序差。"""
+    return list(dict.fromkeys(str(u) for u in urls or [] if u))
 
 
 def apply_images(attrs: dict, urls: list) -> dict:
@@ -139,18 +147,23 @@ def _sentences(text: str, brands: list[str]) -> list[str]:
     return [text] if len(text) >= 10 else []
 
 
-def force_amazon_copy(attrs: dict, product: dict) -> dict:
-    """输入:Visible 属性 + 产品数据 → 输出:文案强制用亚马逊原文的属性。
+def force_amazon_copy(attrs: dict, product: dict,
+                      min_features: int = 4) -> dict:
+    """输入:Visible 属性 + 产品数据(+该 PT 的 keyFeatures 下限)→ 输出:
+    文案强制用亚马逊原文的属性。
 
     移植自旧 auto_listing/mapper.force_amazon_copy(2026-08-09 补迁):
     **LLM 不重写文案,只做结构化字段映射**——文案与亚马逊保持一致,仅去品牌名
     与截长度。品牌名来自采集数据(Unbranded/Generic 之类噪声词不参与)。
 
     productName ← title;keyFeatures ← bullet_points;shortDescription ← 卖点拼接。
-    ⚠ keyFeatures 部分 PT 的 minItems 已从 3 提到 4~6
-    (EXT_DATA_ERROR_55506974520167):不足时从描述/标题拆句补齐,
+    ⚠ keyFeatures 部分 PT 的 minItems 已提到 4~6(EXT_DATA_ERROR_55506974520167):
+    min_features 由调用方按该 PT spec 传入(旧 enforce_copy_limits 的 per-PT
+    查询,2026-08-12 旧仓对照补回——写死 4 会让 minItems=5/6 的 PT 被本地
+    validate 永久卡死,永远进不了 feed),不足时从描述/标题拆句补齐,
     **宁可凑短句也不能少于 minItems**。
     """
+    min_features = max(4, min(int(min_features or 4), 7))
     a = (product or {}).get("attrs") or {}
     brands = [b for b in (product.get("brand"), a.get("brand"),
                           a.get("manufacturer")) if b]
@@ -174,14 +187,14 @@ def force_amazon_copy(attrs: dict, product: dict) -> dict:
         c = _clean_copy(b, brands) if isinstance(b, str) else ""
         if c:
             cleaned.append(c[:500])
-    if len(cleaned) < 4:        # 拆句补齐(卖点不够是常态,少于 minItems 会被拒)
+    if len(cleaned) < min_features:     # 拆句补齐(少于 minItems 会被拒)
         for text in cleaned + [long_text, title]:
             for p in _sentences(text, brands):
                 if p not in cleaned:
                     cleaned.append(p[:500])
-                if len(cleaned) >= 4:
+                if len(cleaned) >= min_features:
                     break
-            if len(cleaned) >= 4:
+            if len(cleaned) >= min_features:
                 break
     if cleaned:
         attrs["keyFeatures"] = cleaned[:7]      # maxItems=7
@@ -228,11 +241,13 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     # 系统后处理字段:LLM 输出一律丢弃(swatchImages 这类 LLM 给标量会被拒)
     for k in SYSTEM_OWNED_FIELDS:
         attrs.pop(k, None)
-    # 文案强制用亚马逊原文(去品牌名);无产品数据时保持旧行为
-    if product:
-        attrs = force_amazon_copy(attrs, product)
-    # 零认证强制覆盖(字段在 spec 里才写,带 enum 降级)
     props = (spec or {}).get("properties") or {}
+    # 文案强制用亚马逊原文(去品牌名);无产品数据时保持旧行为。
+    # keyFeatures 下限按该 PT spec 的 minItems(旧 enforce_copy_limits 语义)
+    if product:
+        kf_min = (props.get("keyFeatures") or {}).get("minItems") or 4
+        attrs = force_amazon_copy(attrs, product, min_features=kf_min)
+    # 零认证强制覆盖(字段在 spec 里才写,带 enum 降级)
     for field, wanted in NO_CERT_FORCES.items():
         if spec is not None and field not in props:
             attrs.pop(field, None)
@@ -257,42 +272,129 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     return apply_images(attrs, images or [])
 
 
-def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
-    """输入:PT + 该 PT spec + 产品数据契约 → 输出:LLM 映射的 messages。
+def _field_block(name: str, meta: dict, required: bool) -> dict:
+    """输入:字段 schema → 输出:给 LLM 的字段元数据块。
 
-    只送字段面(名称/enum/描述截断),产品侧送标题+attrs;产出要求纯 JSON
-    (Visible 字段对象)。红线不靠提示词,finalize_visible 兜底执行。
+    2026-08-12 旧仓对照恢复(旧 _format_field_block/_summarize_prop 给 12 类
+    元数据,此前只送 enum+desc):**type 不送,模型就只能猜数组还是标量**——
+    四轮错误账里"要 JSONArray 却给标量"与"要 String 却给数组"就是没有
+    类型信息的两种猜错方向。
+    """
+    f: dict = {"type": meta.get("type") or "string"}
+    if required:
+        f["required"] = True
+    if meta.get("format"):
+        f["format"] = meta["format"]    # date/date-time/uri:格式错=必拒
+    if "enum" in meta:
+        f["enum"] = meta["enum"][:30]
+    if meta.get("description"):
+        f["desc"] = str(meta["description"])[:200]
+    if meta.get("minItems"):
+        f["minItems"] = meta["minItems"]
+    items = meta.get("items")
+    if isinstance(items, dict):
+        it: dict = {"type": items.get("type") or "string"}
+        if "enum" in items:
+            it["enum"] = items["enum"][:30]
+        f["items"] = it
+    sub = meta.get("properties")
+    if isinstance(sub, dict):
+        f["object_properties"] = {
+            sn: {"type": (sd or {}).get("type") or "string",
+                 **({"enum": sd["enum"][:15]} if isinstance(sd, dict)
+                    and "enum" in sd else {})}
+            for sn, sd in list(sub.items())[:20] if isinstance(sd, dict)}
+        if meta.get("required"):
+            f["object_required"] = meta["required"]
+    return f
+
+
+def _fields_for_llm(spec: dict | None, skip: tuple,
+                    optional_cap: int) -> tuple[dict, dict]:
+    """输入:spec + 剔除清单 + 可选字段上限 → 输出:(必填字段块, 可选字段块)。
+
+    必填**全量**送(旧提示词同款,不设上限——此前 [:200] 硬截断会让排在
+    后面的必填字段永不出现);可选按旧口径截断(Visible 20 / Orderable 10)。
+    """
+    props = (spec or {}).get("properties") or {}
+    required = set((spec or {}).get("required") or [])
+    req_out, opt_out = {}, {}
+    for name, meta in props.items():
+        if name in skip or not isinstance(meta, dict):
+            continue
+        if name in required:
+            req_out[name] = _field_block(name, meta, True)
+        elif len(opt_out) < optional_cap:
+            opt_out[name] = _field_block(name, meta, False)
+    return req_out, opt_out
+
+
+def _conditional_blocks(spec: dict | None, cap: int = 12) -> list[dict]:
+    """输入:spec → 输出:allOf if-then 条件必填的简写块(给 LLM 看真实值)。
+
+    旧 _format_conditional_block 语义:让模型知道"填了 X=Yes 就必须给 Y",
+    从源头给出**真实值**;mp_conform 的占位兜底只是最后防线,占位≠真实值
+    (EXT_DATA_ERROR_72600149546850 的根治在这里)。
+    """
+    out = []
+    for cond in (spec or {}).get("allOf") or []:
+        if not isinstance(cond, dict) or "if" not in cond or "then" not in cond:
+            continue
+        then_req = (cond.get("then") or {}).get("required") or []
+        if not then_req:
+            continue
+        if_c = cond["if"]
+        cond_desc: dict = {}
+        if if_c.get("required"):
+            cond_desc["若已填"] = if_c["required"]
+        for fn, fc in (if_c.get("properties") or {}).items():
+            if isinstance(fc, dict) and fc.get("enum") is not None:
+                cond_desc.setdefault("若取值", {})[fn] = fc["enum"][:10]
+        out.append({"当": cond_desc or "见 spec", "则必填": then_req})
+        if len(out) >= cap:
+            break
+    return out
+
+
+def build_llm_messages(pt: str, spec: dict | None, product: dict,
+                       ospec: dict | None = None) -> list[dict]:
+    """输入:PT + 该 PT spec + 产品数据契约(+Orderable spec)→ 输出:messages。
+
+    2026-08-12 旧仓对照重写(此前砍掉的三样全部恢复):
+      ① 字段元数据含 type/required/minItems/items/object 结构(旧 12 类);
+      ② 必填全量 + 可选截断(Visible 20 / Orderable 10),分四区——
+        此前平铺 [:200] 会把排后面的必填字段永久截掉;
+      ③ **Orderable 段交还 LLM**(除系统专属字段),输出两段
+        {"visible": {…}, "orderable": {…}}——Orderable 的条件必填此前
+        没人填。红线仍由 finalize_visible/mp_conform 兜底执行。
     """
     import json as _json
-    props = (spec or {}).get("properties") or {}
-    fields = {}
-    for name, meta in list(props.items())[:200]:
-        if not isinstance(meta, dict):
-            continue
-        f: dict = {}
-        if "enum" in meta:
-            f["enum"] = meta["enum"][:30]
-        if meta.get("description"):
-            f["desc"] = str(meta["description"])[:120]
-        fields[name] = f
-    # 提示词规则逐条移植自旧系统(硬约束仍由 finalize_visible/mp_conform 兜底,
-    # 提示词只是让 LLM 少犯错、少烧一轮修正)
+    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
+    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10)
     sys = (
         "你是沃尔玛商品属性映射器。根据亚马逊产品资料,填写目标 Product Type "
-        "的字段,只输出一个 JSON 对象(字段名→值),不要 markdown 不要注释。\n"
-        "1. 只用给定字段名,不要造字段。\n"
+        "的字段,只输出一个 JSON 对象,形如 {\"visible\": {字段→值}, "
+        "\"orderable\": {字段→值}},不要 markdown 不要注释。\n"
+        "1. 只用给定字段名,不要造字段;visible 字段放 visible 段,"
+        "orderable 字段放 orderable 段,不要混。\n"
         "2. **不要输出系统后处理字段**:" + "/".join(SYSTEM_OWNED_FIELDS) +
-        "——文案、图片、品牌由系统用亚马逊原文填,你只做结构化字段。\n"
+        "——文案、图片、品牌、价格、库存、UPC 由系统填,你只做结构化字段。\n"
         "3. enum 字段必须**原样**取给定枚举值之一;语义最近的也行,宁可取第一个"
         "也绝不输出枚举外的值。\n"
-        "4. **spec 里 type=array 的字段必须给数组**,不能给裸字符串"
-        "(pattern/color/material/shape 这类看着是单值的往往也是 array)。\n"
-        "5. 数组字段宁缺勿空:没有真实数据就**不输出该字段**,不要写 []、\"\"、"
-        "null、\"No\"、\"Not Available\" 之类占位。\n"
-        "6. 不要输出任何认证/保修/文档类字段。")
+        "4. 每个字段都标了 type:**type=array 必须给数组,type=string/number "
+        "必须给标量**,object 按 object_properties 的子字段给对象。\n"
+        "5. required=true 的字段尽量都给出真实值;conditional 清单里"
+        "\"当…则必填\"的字段,一旦你填了触发条件就必须一起给。\n"
+        "6. 数组字段宁缺勿空:没有真实数据就**不输出该字段**,不要写 []、\"\"、"
+        "null、\"No\"、\"Not Available\" 之类占位;minItems 是该数组的最少条数。\n"
+        "7. 不要输出任何认证/保修/文档类字段。")
     user = _json.dumps({
         "product_type": pt,
-        "fields": fields,
+        "visible_required": v_req,
+        "visible_optional": v_opt,
+        "orderable_required": o_req,
+        "orderable_optional": o_opt,
+        "conditional": _conditional_blocks(spec),
         "product": {"title": product.get("title"),
                     "brand": product.get("brand"),
                     "category": product.get("category"),
@@ -300,6 +402,21 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict) -> list[dict]:
     }, ensure_ascii=False)
     return [{"role": "system", "content": sys},
             {"role": "user", "content": user}]
+
+
+def split_llm_output(raw: dict) -> tuple[dict, dict]:
+    """输入:LLM 原始 JSON → 输出:(visible 段, orderable 段)。
+
+    新提示词产出 {"visible": …, "orderable": …};旧缓存/旧提示词是平铺
+    Visible 字段对象——兼容两种形态(缓存键含 messages,新提示词自然产生
+    新缓存条目,平铺形态只出现在残留旧缓存)。
+    """
+    if not isinstance(raw, dict):
+        return {}, {}
+    if isinstance(raw.get("visible"), dict) or isinstance(
+            raw.get("orderable"), dict):
+        return (raw.get("visible") or {}, raw.get("orderable") or {})
+    return dict(raw), {}
 
 
 DEFAULT_SHIPPING_WEIGHT = 1.0   # 采不到重量时的保守值(单位磅,旧 test_pipeline 同值)
@@ -326,12 +443,27 @@ def shipping_weight(product: dict | None) -> float:
     return DEFAULT_SHIPPING_WEIGHT
 
 
-def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
-                    pt: str = "", product: dict | None = None) -> dict:
-    """输入:sku/upc/沃尔玛价/库存/Partner ID/PT/产品数据 → 输出:Orderable 段。
+# Orderable 段的**系统专属字段**(旧 mapper 的 10 项 force_overrides +
+# ShippingWeight/specProductType):LLM 不该填、填了也一律被系统值覆盖。
+# 这些字段也不进 LLM 提示词(旧 _orderable_fields_for_llm 同款剔除)。
+ORDERABLE_SYSTEM_FIELDS = (
+    "sku", "productIdentifiers", "price", "inventory", "startDate", "endDate",
+    "MustShipAlone", "fulfillmentLagTime",
+    "country_of_origin_substantial_transformation", "specProductType",
+    "ShippingWeight", "brand", "productName",
+)
 
-    字段面与取值逐条对齐旧 auto_listing/mapper.force_overrides 的 Orderable 段
-    (2026-08-09 首跑三条全拒后逐行比对补齐,四处差异都有实证代价):
+
+def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
+                    pt: str = "", product: dict | None = None,
+                    llm_fields: dict | None = None) -> dict:
+    """输入:sku/upc/沃尔玛价/库存/Partner ID/PT/产品数据(+LLM 填的 Orderable
+    字段)→ 输出:Orderable 段。
+
+    结构 = 旧 auto_listing 的"LLM 按 spec 填 + force_overrides 强制覆盖"
+    (2026-08-12 旧仓对照恢复:此前写死 12 键,Orderable 里的其它条件必填
+    永远给不出,本地 validate 卡死或被沃尔玛拒):llm_fields 打底(剔除
+    系统专属字段),强制项覆盖在上。取值实证:
       · productIdentifiers 单对象、price 裸 number、fulfillmentCenterID=Partner ID
       · **inventory[].quantity 是裸 int**——写成 {unit,amount} 会被拒
         (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
@@ -341,12 +473,16 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
       · endDate 必须 ISO DateTime(纯 yyyy-mm-dd 会被拒
         EXT_DATA_ERROR_00030257670757)
       · ShippingWeight 是 Orderable 必填:旧系统由 LLM 补,新系统从采集重量取
+      · **不发 brand / countryOfOriginAssembly**(2026-08-12 旧仓对照删除:
+        旧金样从未发过这两个字段,Orderable 多发字段与 productName 同一血统
+        EXT_DATA_ERROR_60670554076755)
     """
     end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
-    o = {
+    o = {k: v for k, v in (llm_fields or {}).items()
+         if k not in ORDERABLE_SYSTEM_FIELDS and v not in (None, "", [], {})}
+    o.update({
         "sku": str(sku),
         "productIdentifiers": {"productId": str(upc), "productIdType": "UPC"},
-        "brand": FORCE_BRAND,
         "price": round(float(price), 2),
         "ShippingWeight": shipping_weight(product),
         "MustShipAlone": DEFAULT_MUST_SHIP_ALONE,
@@ -354,10 +490,9 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         "startDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "endDate": end_date,
         "country_of_origin_substantial_transformation": DEFAULT_COUNTRY_OF_ORIGIN,
-        "countryOfOriginAssembly": DEFAULT_COUNTRY_OF_ORIGIN,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
                        "quantity": int(qty)}],
-    }
+    })
     if pt:
         o["specProductType"] = str(pt)
     return o

@@ -1,4 +1,4 @@
-"""db_init — 执行 refdata/schema.sql 建四 schema(幂等),可选创建只读角色 readonly。
+"""db_init — 执行 refdata/schema.sql 建五 schema(幂等),可选创建只读角色 readonly。
 
 用法:python cli.py db_init
 前置:本机 PostgreSQL 17 已建库 walmart_data(createdb walmart_data)。
@@ -27,9 +27,9 @@ BEGIN
         EXECUTE format('ALTER ROLE readonly WITH LOGIN PASSWORD %L', {pw});
     END IF;
 END $do$;
-GRANT USAGE ON SCHEMA catalog, listing, orders, ops TO readonly;
-GRANT SELECT ON ALL TABLES IN SCHEMA catalog, listing, orders, ops TO readonly;
-ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops
+GRANT USAGE ON SCHEMA catalog, listing, orders, ops, audit TO readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA catalog, listing, orders, ops, audit TO readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
     GRANT SELECT ON TABLES TO readonly;
 """
 
@@ -50,4 +50,4 @@ def run(params: dict) -> str:
             conn.execute(_sql.SQL(_READONLY_SQL).format(pw=_sql.Literal(pw)))
             readonly_note = "readonly 角色:已创建/更新并授权"
 
-    return f"schema.sql 执行完成(catalog/listing/orders/ops 幂等就绪);{readonly_note}"
+    return f"schema.sql 执行完成(catalog/listing/orders/ops/audit 幂等就绪);{readonly_note}"

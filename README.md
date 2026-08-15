@@ -31,7 +31,7 @@ registry/    接线盒(全项目唯一允许出现 token/表ID/路径/地址的�
 
 | 存储 | 内容 | 说明 |
 |---|---|---|
-| PostgreSQL(本机 17) | catalog / listing / orders / ops 四个 schema | 业务数据+运行记录+防重状态,见 `docs/db_schema.md` |
+| PostgreSQL(本机 17) | catalog / listing / orders / ops / audit 五个 schema | 业务数据+运行记录+防重状态,见 `docs/db_schema.md` |
 | 飞书多维表格 | 店铺凭证、业务登记表、结果回写 | 人机界面;按表头(字段名)索引,字段名清单在 registry |
 | `<DATA_ROOT>/` | .env(密钥)、specs/(官方规范,按版本)、cache/、logs/、backups/ | 不进 git |
 | SQLite | 仅 cache/ 下可重建缓存 | 业务数据一律不放 SQLite |
@@ -46,7 +46,7 @@ uv pip install -e . --group dev        # 或 pip install httpx[http2,socks] psyc
 python cli.py init_data_root           # 建 <DATA_ROOT> 目录 + .env 模板(chmod 600)
 vi ~/walmart_data/.env                 # 填飞书凭据(APP_SECRET 必须先在后台轮换!)等
 createdb walmart_data                  # PostgreSQL 17 建库
-python cli.py db_init                  # 四 schema + 只读角色(幂等)
+python cli.py db_init                  # 五 schema + 只读角色(幂等)
 # 飞书建「店铺凭证表」(字段名见 registry/resources.py),app_token/table_id 填入 .env
 python cli.py ping_stores              # 端到端验收:每店经代理连通沃尔玛 = 地基就绪
 ```
@@ -68,7 +68,7 @@ python cli.py ping_stores              # 端到端验收:每店经代理连通�
 |---|---|
 | `CLAUDE.md` | 三条铁律 + 安全铁律 + 工程规范(AI 开工必读) |
 | `docs/plan.md` | 迁移总计划:阶段、顺序、切换规程、验收标准 |
-| `docs/db_schema.md` | Postgres 四 schema 设计与 DDL 草案 |
+| `docs/db_schema.md` | Postgres 五 schema 设计与 DDL 草案 |
 | `docs/feishu_tables.md` | 飞书多维表格清单、字段约定、读写规范 |
 | `docs/legacy_reference.md` | 旧仓库事实清单:魔数、事故教训、各工作流行为规格 |
 | `docs/legacy_survey.md` | 旧仓库全量摸底报告:14 模块逐一通读的证据级结论(带文件:行号) |

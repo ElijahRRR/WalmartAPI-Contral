@@ -9,14 +9,21 @@ import hashlib
 import json
 import logging
 
+from api import llm as _llm_api
+
 logger = logging.getLogger("services.llm_cache")
 
-_MODEL = "deepseek-chat"
 
+def cache_key(messages: list[dict], temperature: float, max_tokens: int,
+              purpose: str = "default") -> str:
+    """输入:LLM 请求要素(+用途)→ 输出:32 位哈希键(旧系统配方)。
 
-def cache_key(messages: list[dict], temperature: float, max_tokens: int) -> str:
-    """输入:LLM 请求要素 → 输出:32 位哈希键(旧系统配方)。"""
-    raw = json.dumps({"model": _MODEL, "messages": messages,
+    键里的 model 经 llm.model_for(purpose) 解析,与 chat_json 实际请求的
+    模型**按构造同源**(批次 C 分用途选模型后,若键固定用默认模型,会造成
+    "用途换了模型还命中旧缓存"的静默错);不同用途/模型天然分缓存键空间。
+    """
+    raw = json.dumps({"model": _llm_api.model_for(purpose),
+                      "messages": messages,
                       "temperature": temperature, "max_tokens": max_tokens},
                      ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
@@ -35,10 +42,12 @@ def get(conn, key: str) -> dict | None:
     return v if isinstance(v, dict) else json.loads(v)
 
 
-def put(conn, key: str, response: dict) -> None:
-    """输入:连接 + 键 + 模型回复 JSON → 输出:无(幂等)。"""
+def put(conn, key: str, response: dict,
+        purpose: str = "default") -> None:
+    """输入:连接 + 键 + 模型回复 JSON(+用途)→ 输出:无(幂等)。"""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO catalog.llm_cache (input_hash, model, response) "
             "VALUES (%s, %s, %s::jsonb) ON CONFLICT (input_hash) DO NOTHING",
-            (key, _MODEL, json.dumps(response, ensure_ascii=False)))
+            (key, _llm_api.model_for(purpose),
+             json.dumps(response, ensure_ascii=False)))

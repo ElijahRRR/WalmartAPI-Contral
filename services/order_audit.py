@@ -35,7 +35,18 @@ from difflib import SequenceMatcher
 # list_new 上架定价,三处都吃「单价 + 运费」。各写各的迟早漂 —— 一处漏运费
 # 就是选错档 / 定价偏低,而全程不报错。
 from services.pricing import landed_price
-from services.scrape_batches import ERROR_TYPES, RETRYABLE, TERMINAL
+from services.scrape_batches import ERROR_TYPES, RETRY_LATER, RETRYABLE, TERMINAL
+
+# ⚠ **订单链的"终局"比产品库的宽一档**(2026-08-14 拆 RETRY_LATER 时定):
+# 判据是**决策窗口**,不是错误类型的物理性质。
+#   · 产品库补采的时间尺度是**周**——variant_offset / not_found 成因非确定性
+#     (A/B 分桶、地域缓存、下架后重新上架),隔两周重提批次有意义 ⇒ 归 RETRY_LATER。
+#   · 订单链的时间尺度是**小时**——一张单等着发货,冷却两周再给答案等于没答案。
+#     在这个窗口内它们就是终局:采集侧对 variant_offset 自己永远不再试
+#     (cap=1,force=true 也不越过),not_found 页面此刻确实取不到货源。
+# 所以订单链取并集。合并不是"顺手统一口径",拆开也不是——这两个集合服务于
+# 两个不同的问题,谁改都得先问"决策窗口多长"。
+_TERMINAL_FOR_ORDER = TERMINAL | RETRY_LATER
 
 logger = logging.getLogger("services.order_audit")
 
@@ -306,12 +317,15 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
 
     # ③ 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
     if not snap:
-        # 上次采集是**重采也没用**的那类失败(variant_offset / parse_error /
-        # server_reject …)⇒ 这个 ASIN 的数据永远拿不到,给终局结论。
+        # 上次采集是**在本单的决策窗口内重采也拿不到**的那类失败
+        # (parse_error / server_reject / variant_offset …)⇒ 给终局结论。
         # 所有者定稿 2026-08-10:直接建议拒绝,后续不再重采。
         # 挂"待采集"才是害人的——行会一直等一个永远不来的快照,而每轮
         # 还要为它烧一次配额,两侧都不报错(典型的静默卡死)。
-        if scrape_fail in TERMINAL:
+        # 措辞 2026-08-14 订正:variant_offset 不是"永远拿不到"(成因非确定性,
+        # 隔冷却期重提批次有意义,见 _TERMINAL_FOR_ORDER 头注),但在一张单
+        # 等着发货的窗口内它就是拿不到——终局结论对订单链依然成立。
+        if scrape_fail in _TERMINAL_FOR_ORDER:
             detail["rules"]["scrape"] = {"error_type": scrape_fail,
                                          "retryable": False}
             return AuditResult(REJECT,
@@ -336,15 +350,17 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
         # 混成一桶:前者放弃得太早,后者每轮白烧一次配额。
         detail["rules"]["scrape"] = {"outcome": snap["outcome"],
                                      "error_type": scrape_fail}
-        if scrape_fail in TERMINAL:
+        if scrape_fail in _TERMINAL_FOR_ORDER:
             return AuditResult(REJECT,
                                f"采集未成功({snap['outcome']} → 实际 {scrape_fail}:"
                                f"{ERROR_TYPES[scrape_fail]}),重采无效,建议拒绝",
                                detail)
         if snap["outcome"] == "not_found":
-            # 所有者拍板 2026-08-12:页面 404 = 产品已从亚马逊下架,货源没了,
-            # 与 TERMINAL 同性质(页面层稳定事实,重采一百次也一样);此前
-            # 白烧一天重采配额再堆待人工。审核只出建议,人工仍是最后一道。
+            # 所有者拍板 2026-08-12:页面 404 = 产品已从亚马逊下架,货源没了;
+            # 此前白烧一天重采配额再堆待人工。审核只出建议,人工仍是最后一道。
+            # 2026-08-14 订正措辞(不改行为):404 在**产品库**那侧归 RETRY_LATER
+            # ——下架后重新上架是常事,采集侧注释也明写"下一轮定时采集自动纠正"。
+            # 但订单链等不了那一轮:此刻没货源就是没货源,终局结论依旧成立。
             return AuditResult(REJECT,
                                "采集未成功(not_found:亚马逊页面不存在/已下架,"
                                "货源缺失),重采无效,建议拒绝", detail)

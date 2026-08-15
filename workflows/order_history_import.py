@@ -33,6 +33,7 @@ from pathlib import Path
 
 from registry import db
 from services import order_lines as ol
+from services import stores as stores_svc
 
 DANGEROUS = False
 
@@ -84,10 +85,15 @@ def _date(v) -> datetime | None:
 
 
 def _split_po(merge_key: str, sku: str) -> str | None:
-    """输入:合并键 + SKU → 输出:PO 号;拼接对不上或非纯数字返回 None。"""
+    """输入:合并键 + SKU → 输出:PO 号;拼接对不上或非纯数字返回 None。
+
+    ⚠ 实测有 `'108909730063166        B08M4D1GMT'` 这种 PO 与 SKU 之间夹空白的
+    行(2026-08-15 首跑),所以切完要 strip——**只去空白,不做别的清洗**:
+    PO 必须仍是纯数字,否则宁可判坏行也不猜。
+    """
     if not merge_key or not sku or not merge_key.endswith(sku):
         return None
-    po = merge_key[: -len(sku)]
+    po = merge_key[: -len(sku)].strip()
     return po if po.isdigit() and len(po) >= 10 else None
 
 
@@ -215,7 +221,22 @@ def run(params: dict) -> str:
         lines.append(f"同 (PO,SKU) 合并 {merge_hits} 行(qty/金额累加)")
 
     if not apply:
-        lines.append("⚠ 店铺名与现凭证表对不上时先定改名映射再 apply(本导入器不猜)")
+        # 店名对账:excel 里的店名与凭证表现名对不上的行,销量信号会挂不到
+        # 现在的店上(只进全局三维度,不进店×类目)——apply 前必须先看这个数
+        try:
+            reg = stores_svc.registered_names()
+            unknown = {s: n for s, n in stores.items() if s not in reg}
+            hit = len(stores) - len(unknown)
+            lines.append(
+                f"店名对账:{hit}/{len(stores)} 家在凭证表里能找到;对不上 "
+                f"{len(unknown)} 家、{sum(unknown.values())} 行"
+                + (":" + ", ".join(f"{s}×{n}" for s, n in
+                                   sorted(unknown.items(), key=lambda x: -x[1])[:15])
+                   if unknown else "")
+                + "——对不上的行照样入库(事实表永存原文),只是它们的销量只进"
+                  "产品/品牌/类目三个全局维度,不进店×类目维度")
+        except Exception as e:                 # noqa: BLE001 对账失败不阻断预览
+            lines.append(f"店名对账:跳过(凭证表读取失败:{e})")
         lines.append("预览完毕;-p apply=1 入库(ON CONFLICT DO NOTHING,"
                      "与 API 同源行标识,45 天窗口重叠单天然去重)")
         return ";".join(lines)

@@ -288,6 +288,7 @@ class _FakeCur:
 
     def __init__(self, fail_pt_dict=False):
         self.fail_pt_dict = fail_pt_dict
+        self._no_sales = False
         self.description = []
         self._rows: list = []
 
@@ -318,6 +319,9 @@ class _FakeCur:
             self._rows = list(ITEMS)
         elif "store_kpi_daily" in sql:
             self._rows = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE")]
+        elif "FROM orders.order_lines" in sql:
+            # A085 的那件卖过,A107 的同款没卖过 → 冲突留 A085
+            self._rows = [] if self._no_sales else [("A085", "B0AAAA0001", 3, 120.0)]
         elif "FROM catalog.products p" in sql:
             self._rows = [(a, m["brand"], m["manufacturer"], m["walmart_pt"],
                            m["pt_source"], m["fulfillment"])
@@ -356,11 +360,14 @@ class _FakeConn:
         return False
 
 
-def _wire(monkeypatch, cur, *, registered=None, stores=None, cfg=None):
+def _wire(monkeypatch, cur, *, registered=None, stores=None, cfg=None,
+          reports=None):
     import contextlib
     conn = _FakeConn(cur)
     monkeypatch.setattr(wf.db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([conn])))
+    if reports is not None:
+        monkeypatch.setattr(wf.paths, "reports_dir", lambda: reports)
     monkeypatch.setattr(wf.stores_svc, "registered_names",
                         lambda: registered if registered is not None else {"A085", "A107"})
     monkeypatch.setattr(wf.stores_svc, "load_stores",
@@ -370,10 +377,11 @@ def _wire(monkeypatch, cur, *, registered=None, stores=None, cfg=None):
                         lambda: cfg if cfg is not None else {
                             "A085": {"gmv": 100.0, "orders": 3.0,
                                      "max_online": 500.0, "channel": "FBA",
-                                     "channel_raw": "fba"},
+                                     "channel_raw": "fba",
+                                     "categories": ["Fashion"]},
                             "A107": {"gmv": None, "orders": None,
                                      "max_online": None, "channel": None,
-                                     "channel_raw": ""}})
+                                     "channel_raw": "", "categories": []}})
     return conn
 
 
@@ -411,6 +419,48 @@ def test_run_marks_channel_skip_instead_of_reporting_zero(monkeypatch):
     _wire(monkeypatch, cur)
     out = wf.run({"channel": "0"})
     assert "A5 渠道对拍:**跳过**" in out
+
+
+def test_run_exports_four_lists(monkeypatch, tmp_path):
+    """C 段四份处置清单要真落盘,且内容是"照着能做"的逐行明细。"""
+    cur = _FakeCur()
+    _wire(monkeypatch, cur, reports=tmp_path)
+    out = wf.run({})
+
+    names = sorted(p.name for p in tmp_path.glob("*.csv"))
+    assert names == ["alloc_同ASIN冲突处置.csv", "alloc_同品牌冲突处置.csv",
+                     "alloc_渠道不符下架清单.csv", "alloc_类目建议.csv"]
+    assert "C1 类目建议" in out and "C2 渠道不符" in out
+    assert "C3 同 ASIN 跨店" in out and "C4 同品牌跨店" in out
+
+    # C1:A085 在线 Fashion×2 → 建议 Fashion;表格已填 Fashion → 一致
+    c1 = (tmp_path / "alloc_类目建议.csv").read_text(encoding="utf-8-sig")
+    assert "A085" in c1 and "一致" in c1
+    assert "A107" in c1 and "未填" in c1
+
+    # C3:A085 卖过 120 元、A107 零销量 → 留 A085,A107 那行判下架
+    c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
+    lines = [ln for ln in c3.splitlines() if "B0AAAA0001" in ln]
+    assert any(ln.startswith("B0AAAA0001,A085") and ln.endswith("保留")
+               for ln in lines)
+    assert any(",A107," in ln and ln.endswith("下架") for ln in lines)
+
+
+def test_run_export_off(monkeypatch, tmp_path):
+    cur = _FakeCur()
+    _wire(monkeypatch, cur, reports=tmp_path)
+    out = wf.run({"export": "0"})
+    assert "C 处置清单:跳过" in out
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_run_flags_missing_order_history(monkeypatch, tmp_path):
+    """订单没导入时销量全零,冲突清单只能打平——必须明说,不能装作判过了。"""
+    cur = _FakeCur()
+    cur._no_sales = True
+    _wire(monkeypatch, cur, reports=tmp_path)
+    out = wf.run({})
+    assert "订单历史还没导入" in out
 
 
 def test_run_warns_when_credential_table_unreadable(monkeypatch):

@@ -8,7 +8,7 @@ cli.py 加载 .env 之后才就位,call-time 求值保证拿到最终值。
 import os
 from pathlib import Path
 
-_SUBDIRS = ("specs", "cache", "logs", "backups", "locks")
+_SUBDIRS = ("specs", "cache", "logs", "backups", "locks", "reports")
 
 
 def data_root() -> Path:
@@ -58,6 +58,15 @@ def backups_dir() -> Path:
 
 def locks_dir() -> Path:
     return data_root() / "locks"
+
+
+def reports_dir() -> Path:
+    """输入:无 → 输出:人工处置清单落盘目录(<DATA_ROOT>/reports)。
+
+    只放"给人打开看/照着做"的明细 csv(下架清单、类目建议、冲突处置),
+    每次跑覆盖同名文件——它们是报告不是账本,权威始终在库里。
+    """
+    return data_root() / "reports"
 
 
 def frontend_scrape_file() -> Path:

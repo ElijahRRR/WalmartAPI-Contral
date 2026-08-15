@@ -46,7 +46,12 @@ def _channel(v) -> tuple[str | None, str]:
 
 
 def load_targets() -> dict[str, dict]:
-    """输入:无 → 输出:{店铺: {gmv/orders/max_online/channel/channel_raw}}。
+    """输入:无 → 输出:{店铺: {gmv/orders/max_online/channel/channel_raw/categories}}。
+
+    `categories` 是**准入大类集合**(类目1/2/3 三列非空值去重);
+    **空集合 = 该店不限制类目**(所有者定稿 2026-08-15),调用方用
+    `allowed(cfg_row, cat)` 判定,别自己写 `if not categories: pass`
+    ——那句话正着写反着写都像对的,判定只留一处。
 
     表未登记(.env 缺 FEISHU_LIMITS_*)时抛 LookupError,由调用方决定
     是降级还是停——分配引擎必须停(没有容量上限与渠道就没法过硬闸),
@@ -56,7 +61,7 @@ def load_targets() -> dict[str, dict]:
     f = t.fields
     recs = feishu.list_records(t, field_names=[
         f.store, f.target_gmv_daily, f.target_orders_daily,
-        f.max_online, f.channel_limit])
+        f.max_online, f.channel_limit, f.category1, f.category2, f.category3])
     out: dict[str, dict] = {}
     for rec in recs:
         fields = rec.get("fields", {})
@@ -64,14 +69,33 @@ def load_targets() -> dict[str, dict]:
         if not name:
             continue
         channel, channel_raw = _channel(fields.get(f.channel_limit))
+        cats = []
+        for key in (f.category1, f.category2, f.category3):
+            v = feishu._plain_text(fields.get(key)).strip()
+            if v and v not in cats:
+                cats.append(v)
         out[name] = {
             "gmv": _num(fields.get(f.target_gmv_daily)),
             "orders": _num(fields.get(f.target_orders_daily)),
             "max_online": _num(fields.get(f.max_online)),
             "channel": channel,
             "channel_raw": channel_raw,
+            "categories": cats,
         }
     return out
+
+
+def allowed(cfg_row: dict | None, category: str | None) -> bool:
+    """输入:某店配置行 + 产品大类 → 输出:该店能不能接这个大类。
+
+    两条口径(所有者 2026-08-15):**表里三列都空 = 不限制**(放行一切);
+    填了就**只准入填的那几个**。产品归不到大类(category 为 None)时,
+    受限店拒收(宁可不分也不错分),不限制店放行。
+    """
+    cats = (cfg_row or {}).get("categories") or []
+    if not cats:
+        return True
+    return bool(category) and category in cats
 
 
 def missing_config(cfg: dict[str, dict], stores: list[str]) -> dict[str, list]:

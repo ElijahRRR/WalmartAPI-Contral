@@ -1,9 +1,11 @@
 """alloc_audit — 分配动工前的存量审计 + 数据探针(只读,随时可跑)。
 
 用法:
-  python cli.py alloc_audit                 # 全部检查,摘要 + 各表前 10 行样例
-  python cli.py alloc_audit -p sample=30    # 样例条数
-  python cli.py alloc_audit -p channel=0    # 跳过渠道探测(最慢的一段;A5 会明说跳过)
+  python cli.py alloc_audit                    # 全部检查 + 落四份处置清单 csv
+  python cli.py alloc_audit -p sample=30       # 摘要里的样例条数
+  python cli.py alloc_audit -p channel=0       # 跳过渠道探测(最慢的一段)
+  python cli.py alloc_audit -p export=0        # 只看摘要不落 csv
+  python cli.py alloc_audit -p sales_days=180  # 冲突处置的销量窗口(默认 365 天)
 
 这是 docs/allocation_plan.md §十三 的 **A0.5 批次**:占用台账(A1)与分配
 引擎(A2)动工前,必须先知道存量长什么样、设计稿里的假设数字实际是多少。
@@ -31,6 +33,13 @@
   A6 店铺配置完备度 —— 四列没填齐的店(引擎硬闸的前置);
   A7 店铺状态 —— 有在线行但非 ACTIVE 的店。
 
+**C 处置清单**(落 `<DATA_ROOT>/reports/*.csv`,每次覆盖;所有者照着做)
+  C1 类目建议 —— 每店"在线数量最多的两类",所有者据此填飞书「类目1/2/3」;
+     同时对拍已填值与实际 top2 是否一致;
+  C2 渠道不符逐行清单 —— 所有者自行下架(只列确实是另一个已知渠道的);
+  C3 同 ASIN 跨店处置 / C4 同品牌跨店处置 —— 按"留销量大的店"给出保留/下架,
+     **两边都零销量的组单独标记**(机器判不出谁该留,要人眼看)。
+
 三条口径纪律(2026-08-15 对抗式审查后定,每条都对应一次会算错数的实例):
 
 1. **冻结行不进冲突**:A1/A2/A3/A5 只吃"仍在册店铺"的行。已从凭证表删除的
@@ -46,10 +55,11 @@
 sku→asin 走 services/sku_asin 唯一规则,提不出的**单列计数**不猜。
 """
 
+import csv
 import logging
 from collections import Counter, defaultdict
 
-from registry import db
+from registry import db, paths
 from services import brand_key as bk
 from services import sku_asin, store_targets, stores as stores_svc
 
@@ -169,6 +179,20 @@ SELECT DISTINCT ON (store) store, store_status
 FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 """
 
+# 冲突处置要的销量:按 (store, sku) 聚合——**不需要 asin 列**,
+# order_lines 与 walmart_items 共用 (store, sku) 主键口径。
+# 只算"有效销售"类行:统计状态在 raw 里(历史导入),API 行没有该键,
+# 用 coalesce 让两种来源都算进来(API 行本就是真实销售)。
+_SQL_SALES = """
+SELECT store, sku,
+       count(*)                                   AS orders,
+       coalesce(sum(product_amount), 0)::numeric  AS gmv
+FROM orders.order_lines
+WHERE order_date >= now() - make_interval(days => %s)
+  AND coalesce(raw ->> '统计状态', '有效销售') = '有效销售'
+GROUP BY store, sku
+"""
+
 
 # ── 纯函数(逻辑都在这里,好测)────────────────────────────────────────────
 
@@ -282,6 +306,100 @@ def _fmt_counter(c: Counter, top=4) -> str:
     return ", ".join(f"{k}×{n}" for k, n in c.most_common(top))
 
 
+def suggest_categories(prof, cfg, top=2):
+    """输入:店铺画像 + 配置 → 输出:[(店, 建议类目列表, 在线件数分布, 已填值)]。
+
+    所有者口径(2026-08-15):**超 2 类目的店保留在线数量最多的两类**。
+    本函数只出建议,不写任何地方——所有者填进飞书「类目1/2/3」三列,
+    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍"填的 vs
+    实际最多的"是否一致。
+    """
+    out = []
+    for store, p in sorted(prof.items()):
+        ranked = [(c, n) for c, n in p["categories"].most_common()
+                  if c != UNCLASSIFIED]
+        if not ranked:
+            continue
+        out.append((store, [c for c, _ in ranked[:top]], ranked,
+                    list((cfg.get(store) or {}).get("categories") or [])))
+    return out
+
+
+def channel_offenders(rows, cfg):
+    """输入:富化行 + 配置 → 输出:不符渠道的**逐行**清单(给人去下架)。
+
+    与 `channel_mismatch` 的计数同口径(白名单:只有确实是另一个已知渠道
+    才算不符),但输出到 SKU 级——"存在不符 9 件"没法照着做,一行行的
+    店铺/SKU/ASIN/渠道才行。只列已发布行:未发布的下架没有意义。
+    """
+    out = []
+    for r in rows:
+        if not r["published"]:
+            continue
+        want = (cfg.get(r["store"]) or {}).get("channel")
+        ch = r["channel"]
+        if want and ch in store_targets.CHANNELS and ch != want:
+            out.append(r)
+    out.sort(key=lambda r: (r["store"], r["sku"]))
+    return out
+
+
+def resolve_conflicts(rows, sales, field):
+    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名
+    → 输出:[(键, 保留店, 保留店销量, [(店, sku, asin, 销量, 金额, 判定)])]。
+
+    所有者口径(2026-08-15):**同品牌/同 ASIN 跨店的,留销量大的店**。
+    销量按该店该键名下**全部在线 SKU 的订单金额**合计;
+    打平顺序:金额 → 单量 → 在线件数 → 店名(全打平也要给确定答案,
+    否则同一份数据两次跑给出两份不同的下架清单)。
+    **零销量组单列标记**:两边都没卖过时"留销量大的"无从判起,
+    这类必须让人看见,不能悄悄按店名字典序决定谁生谁死。
+    """
+    groups: dict = defaultdict(list)
+    for r in rows:
+        v = r.get(field)
+        if v:
+            groups[v].append(r)
+    out = []
+    for key, items in groups.items():
+        by_store: dict[str, dict] = {}
+        for r in items:
+            o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
+            st = by_store.setdefault(r["store"], {"orders": 0, "gmv": 0.0,
+                                                  "items": 0})
+            st["orders"] += o
+            st["gmv"] += float(g)
+            st["items"] += 1
+        if len(by_store) < 2:
+            continue
+        ranked = sorted(by_store.items(),
+                        key=lambda kv: (-kv[1]["gmv"], -kv[1]["orders"],
+                                        -kv[1]["items"], kv[0]))
+        keep = ranked[0][0]
+        tie = all(v["gmv"] == 0 and v["orders"] == 0 for _, v in ranked)
+        detail = []
+        for r in sorted(items, key=lambda r: (r["store"], r["sku"])):
+            s = by_store[r["store"]]
+            detail.append((r["store"], r["sku"], r["asin"] or "",
+                           s["orders"], round(s["gmv"], 2),
+                           "保留" if r["store"] == keep else "下架"))
+        out.append((key, keep, ranked[0][1], detail, tie))
+    # 涉及店铺数多、销量大的排前面:人先处理影响面大的
+    out.sort(key=lambda x: (-len(x[3]), -x[2]["gmv"], str(x[0])))
+    return out
+
+
+def _write_csv(name: str, header: list, rows: list) -> str:
+    """输入:文件名 + 表头 + 行 → 输出:落盘路径(报告目录,每次覆盖)。"""
+    paths.reports_dir().mkdir(parents=True, exist_ok=True)
+    p = paths.reports_dir() / name
+    with p.open("w", newline="", encoding="utf-8-sig") as fh:   # BOM:Excel 直开不乱码
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
+    return str(p)
+
+
 # ── 取数 ────────────────────────────────────────────────────────────────
 
 def _fetch_meta(cur, asins: list[str], with_channel: bool) -> dict:
@@ -304,6 +422,8 @@ def run(params: dict) -> str:
     """输入:params(sample/channel)→ 输出:探针 + 存量审计报告。"""
     sample = int(params.get("sample", 10))
     with_channel = str(params.get("channel", "1")).lower() not in {"0", "false", "no"}
+    sales_days = int(params.get("sales_days", 365))
+    export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
     L: list[str] = []
 
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -325,6 +445,8 @@ def run(params: dict) -> str:
         items = cur.fetchall()
         cur.execute(_SQL_STATUS)
         status = {s: (st or "").strip().upper() for s, st in cur.fetchall()}
+        cur.execute(_SQL_SALES, (sales_days,))
+        sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
 
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
                                     for it in items) if a})
@@ -479,6 +601,65 @@ def run(params: dict) -> str:
              + f"(无 KPI 记录或状态为空、按 fail-open 视同 ACTIVE 的 {no_status} 家)"
              + "——SUSPENDED 店的占用按设计保持,其在线行仍计入 A1/A2 冲突")
 
-    L.append("→ 下一步:所有者按本报告定各店保留大类/渠道与下架清单;"
-             "A1/A2 冲突项的处置口径定了才能回填 claims(A1 批次)")
+    # ── C 处置清单(落盘 csv,给人照着做)──
+    if not export:
+        L.append("═══ C 处置清单:跳过(-p export=0)═══")
+        return "\n".join(L)
+
+    L.append(f"═══ C 处置清单(csv 落 {paths.reports_dir()},每次覆盖)═══")
+    n_sales_keys = len(sales)
+    L.append(f"   销量口径:近 {sales_days} 天「有效销售」行按 (店,SKU) 聚合,"
+             f"命中 {n_sales_keys} 个组合"
+             + ("——**订单历史还没导入,冲突清单只能按在线件数打平**,"
+                "先跑 order_history_import -p apply=1 再重跑本报告"
+                if n_sales_keys == 0 else ""))
+
+    if cfg_err:
+        L.append("   类目建议/渠道清单:跳过(限额表读不到,无法对拍已填值)")
+    else:
+        # C1 类目建议:所有者据此填飞书「类目1/2/3」三列
+        sug = suggest_categories(prof, cfg)
+        rows_c1 = [(s, len([c for c, _ in rk]), "|".join(top),
+                    "|".join(filled), "一致" if set(filled) == set(top)
+                    else ("未填" if not filled else "不一致"),
+                    "; ".join(f"{c}×{n}" for c, n in rk[:8]))
+                   for s, top, rk, filled in sug]
+        p1 = _write_csv("alloc_类目建议.csv",
+                        ["店铺", "在线大类数", "建议类目(在线数 top2)",
+                         "表格已填", "对拍", "在线大类分布"], rows_c1)
+        unfilled = sum(1 for r in rows_c1 if r[4] == "未填")
+        diff = sum(1 for r in rows_c1 if r[4] == "不一致")
+        L.append(f"C1 类目建议 {len(rows_c1)} 家店 → {p1};其中表格未填 "
+                 f"{unfilled} 家、已填但与在线 top2 不一致 {diff} 家"
+                 f"(**三列都空 = 不限制类目**,填了才生效)")
+
+        # C2 渠道不符逐行清单:所有者自己去下架
+        off = channel_offenders(live_rows, cfg)
+        p2 = _write_csv("alloc_渠道不符下架清单.csv",
+                        ["店铺", "限定渠道", "SKU", "ASIN", "实际渠道",
+                         "大类", "PT"],
+                        [(r["store"], cfg[r["store"]]["channel"], r["sku"],
+                          r["asin"] or "", r["channel"], r["category"] or "",
+                          r["pt"] or "") for r in off])
+        L.append(f"C2 渠道不符 {len(off)} 件(已发布行)→ {p2}"
+                 f"——只列确实是另一个已知渠道的;N/A 与未采到不进清单")
+
+    # C3/C4 冲突处置:留销量大的店(所有者口径 2026-08-15)
+    for tag, field, fname in (("C3 同 ASIN 跨店", "asin", "alloc_同ASIN冲突处置.csv"),
+                              ("C4 同品牌跨店", "brand_key", "alloc_同品牌冲突处置.csv")):
+        res = resolve_conflicts(live_rows, sales, field)
+        rows_x = [(key, keep, "是" if tie else "",
+                   st, sku, asin, o, g, verdict)
+                  for key, keep, _, detail, tie in res
+                  for st, sku, asin, o, g, verdict in detail]
+        p = _write_csv(fname, ["冲突键", "保留店", "零销量打平", "店铺", "SKU",
+                               "ASIN", f"近{sales_days}天单量", "销售额", "处置"],
+                       rows_x)
+        ties = sum(1 for r in res if r[4])
+        L.append(f"{tag}:{len(res)} 组、{len(rows_x)} 行 → {p};"
+                 f"其中**两边都零销量、按在线件数/店名打平的 {ties} 组**"
+                 f"(这些要人眼看一下,机器判不出谁该留)")
+
+    L.append("→ 下一步:①按 C1 填飞书类目三列(填了才限制,空=不限制);"
+             "②按 C2 自行下架渠道不符商品;③C3/C4 确认后进 A1 回填 claims")
     return "\n".join(L)

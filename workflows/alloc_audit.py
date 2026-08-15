@@ -201,7 +201,10 @@ def run(params: dict) -> str:
     # 全店合规 —— 这一节必须显式说"本轮没查",不能拿 0 冒充结论
     can_channel = bool(cfg) and with_channel
     mism = sv.channel_mismatch(sv.store_profiles(claim_rows), cfg) if can_channel else []
-    offenders = sv.channel_offenders(live_rows, cfg) if can_channel else []
+    offenders = sv.channel_offenders(claim_rows, cfg) if can_channel else []
+    # 类目不符:所有者填完类目三列后的第一件事。与销量无关——类目是硬闸
+    cat_bad, cat_unknown = (sv.category_offenders(claim_rows, cfg) if cfg
+                            else ([], 0))
     scope = (sorted(set(registered) | set(prof)) if registered is not None
              else sorted(prof))
     miss_cfg = store_targets.missing_config(cfg, scope) if cfg else {}
@@ -230,7 +233,11 @@ def run(params: dict) -> str:
              "→ alloc_渠道不符下架清单.csv" if can_channel else
              ("**跳过**:-p channel=0 没取渠道,去掉该参数重跑才有结论"
               if with_channel is False else "**跳过**:限额表读不到,没有配送限制可对拍")),
-            ("③ 确认冲突处置",
+            ("③ 下架类目不符",
+             f"{len(cat_bad)} 件" if cfg else "本轮没查",
+             "→ alloc_类目不符下架清单.csv" if cfg else
+             "**跳过**:限额表读不到,没有准入类目可对拍"),
+            ("④ 确认冲突处置",
              f"同 ASIN {len(conflicts['同 ASIN'])} 组 · "
              f"同品牌 {len(conflicts['同品牌'])} 组",
              "→ alloc_同ASIN冲突处置.csv 等 2 份"
@@ -238,7 +245,7 @@ def run(params: dict) -> str:
                 else ",全部可自动判"))]
     if miss_cfg:
         have = [s for s in miss_cfg if s in prof]
-        todo.append(("④ 补店铺配置", f"有货店缺列 {len(have)} 家",
+        todo.append(("⑤ 补店铺配置", f"有货店缺列 {len(have)} 家",
                      "→ alloc_店铺总览.csv「缺配置列」"
                      + (f";另有 {len(empty_stores)} 家空店没登记,"
                         f"要它们参与分配才用填" if empty_stores else "")))
@@ -284,10 +291,13 @@ def run(params: dict) -> str:
     if registered is None:
         body.append(("⚠ 未排除", f"凭证表读不到({reg_err}),幻影店一个没排,"
                                  f"下面的冲突数只可参考"))
+    unpub = sum(1 for r in live_rows if not r["published"])
+    body.append(("不占货位", f"未发布 {n(unpub)} 行 —— 在店里但没上架,"
+                             f"不算占着货位,冲突与回填都不算它"))
     body.append(("数据缺口", f"归不到大类 {n(st['no_category'])} 行 · "
                              f"SKU 提不出 ASIN {n(st['no_asin'])} 行"))
-    L += ["", f"▍在线商品 {n(st['online'])} 行"
-              f"(已发布 {n(n_pub)} / 未发布 {n(st['online'] - n_pub)})"]
+    L += ["", f"▍在线商品 {n(st['online'])} 行(已发布 {n(n_pub)} / "
+              f"未发布 {n(st['online'] - n_pub)};RETIRED 退市行已在 SQL 排除)"]
     L += _grid(body)
 
     # ── ▍冲突 ──
@@ -329,11 +339,20 @@ def run(params: dict) -> str:
                      "缺代理/ClientId,**不是死店**,别整店释放"))
     if mism:
         body.append(("渠道有不符", f"{len(mism)} 家", f"共 {len(offenders)} 件待下架"))
+    if cat_bad:
+        from collections import Counter as _C
+        by = _C(r["store"] for r in cat_bad)
+        body.append(("类目有不符", f"{len(by)} 家", f"共 {len(cat_bad)} 件待下架;"
+                     + "、".join(f"{s}×{c}" for s, c in by.most_common(3))))
     L += ["", f"▍店铺(规划内有货 {len(prof)} 家)"]
     L += _grid(body) if body else ["  ✓ 没发现异常"]
 
     # ── ▍要留意 ──
     notes = []
+    if cat_unknown:
+        notes.append(f"归不到大类 {n(cat_unknown)} 行(在准入受限的店里)—— "
+                     f"**没进类目不符清单**:那是「不知道它属于哪类」,"
+                     f"不是「属于不该有的类」,别拿它当违规下架")
     if st["channel_weird"]:
         notes.append(f"渠道值认不出 {n(st['channel_weird'])} 行 —— "
                      f"采集侧 is_fba 没给值,不是货不对,**别下架**")
@@ -377,6 +396,13 @@ def run(params: dict) -> str:
             [(r["store"], cfg[r["store"]]["channel"], r["sku"], r["asin"] or "",
               r["channel"], r["category"] or "", r["pt"] or "")
              for r in offenders]))
+        files.append(_write_csv(
+            "alloc_类目不符下架清单.csv",
+            ["店铺", "准入类目", "商品大类", "SKU", "ASIN", "PT", "渠道"],
+            [(r["store"], "|".join(cfg[r["store"]]["categories"]),
+              r["category"], r["sku"], r["asin"] or "", r["pt"] or "",
+              r["channel"])
+             for r in cat_bad]))
     # 店铺总览:逐店明细一次给全,控制台只留计数
     _ACCEPT = {True: "是", False: "否(填了0)", None: "(未填)"}
     files.append(_write_csv(

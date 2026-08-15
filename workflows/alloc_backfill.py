@@ -99,6 +99,16 @@ def run(params: dict) -> str:
     # 产品可以被别店拿走 —— 要某店不接新货走「单店最大在线数」填 0
     live = sv.claimable(rows, registered)
     dropped = len(rows) - len(live)
+    # "排除 N" 不写明分类等于让人猜(所有者 2026-08-15 就是看到这个数才问
+    # "是不是把历史上架过的也算进去了")。三类各自计数,每类都可自行核对
+    why = Counter()
+    for r in rows:
+        if r["store"] not in registered:
+            why["不在册店(冻结快照)"] += 1
+        elif sv.is_excluded(r["store"]):
+            why["规划范围外(谭总系)"] += 1
+        elif not r["published"]:
+            why["未发布(不占货位)"] += 1
 
     try:
         cfg = store_targets.load_targets()      # 类目准入是冲突判定的硬闸
@@ -123,8 +133,11 @@ def run(params: dict) -> str:
     ]
 
     per_store = Counter(r["store"] for r in to_claim)
-    head = (f"在线行 {st['online']},入选(在册∧已发布){len(live)}、"
-            f"排除 {dropped};将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"
+    head = (f"在线行 {st['online']}(已排 RETIRED 退市行),"
+            f"入选(在册∧已发布∧规划内){len(live)}、排除 {dropped}"
+            + (";其中 " + "、".join(f"{k} {v}" for k, v in why.most_common())
+               if why else "")
+            + f"\n   将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"
             f";涉及 {len(per_store)} 家店"
             f"\n   销量窗口 {win['day']} 往前 {sales_days} 天 —— "
             f"**与出清单那次必须一致**,不一致就是照 A 的清单落 B 的判定")

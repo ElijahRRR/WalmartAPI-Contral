@@ -122,9 +122,20 @@ GROUP BY 1 ORDER BY 2 DESC, 1
 """
 
 # ORDER BY 固定:同一份数据两次跑要出同一份清单(样例截断才有意义)
+#
+# ⚠ **必须排 RETIRED**(2026-08-15 所有者质疑"历史上架过的记录是不是也算进去了",
+# 查证属实)。`catalog_sync` 的全量扫描显式含一轮 `("RETIRED", None)`
+# (api/items._SWEEP_MODES),所以退市商品在本表里 **missing_since 也是 NULL**
+# ——它没缺席,它只是退市了。只按 missing_since 判"在线",会把历史上架过、
+# 早已退市的 SKU 当成活货位:占用凭空多出一批,冲突组也凭空多出一批。
+# 判法照抄仓内既有先例(maintenance_intents._SQL_MATCH_INV、
+# product_events 把 RETIRED 记 'gone'):**coalesce 到 ACTIVE 是 fail-open**
+# ——这一列没采到不算退市,判不准就判活。
 _SQL_ONLINE = """
 SELECT store, sku, product_type, published_status
-FROM catalog.walmart_items WHERE missing_since IS NULL
+FROM catalog.walmart_items
+WHERE missing_since IS NULL
+  AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'
 ORDER BY store, sku
 """
 
@@ -361,6 +372,33 @@ def channel_offenders(rows, cfg):
             out.append(r)
     out.sort(key=lambda r: (r["store"], r["sku"]))
     return out
+
+
+def category_offenders(rows, cfg) -> tuple[list, int]:
+    """输入:富化行 + 配置 → 输出:(不在准入大类的**逐行**清单, 归不到大类的行数)。
+
+    所有者填完「类目1/2/3」之后的第一件事:**这家店现在卖的东西里,哪些
+    不属于它准入的大类**。类目是硬闸(§十二.12 处理顺序:先定类目再判冲突),
+    所以这份清单与销量无关——不准入就得走,卖得再好也一样。
+
+    三条与 `channel_offenders` 同源的口径:
+      · 三列全空的店 = **不限制类目**,一件都不列(不是"全部不符");
+      · 只列**已发布**行:未发布的下架没有意义;
+      · ⚠ **归不到大类的行不进清单,单列计数**。那是"我们不知道它属于哪类",
+        不是"它属于不该有的类"——把不知道算成违规,会让无辜商品进下架清单
+        (与渠道那条「未知不算不符」同一条纪律)。
+    """
+    out, unknown = [], 0
+    for r in rows:
+        if not r["published"] or not (cfg.get(r["store"]) or {}).get("categories"):
+            continue
+        if not r.get("category"):
+            unknown += 1
+            continue
+        if not store_targets.allowed(cfg.get(r["store"]), r["category"]):
+            out.append(r)
+    out.sort(key=lambda r: (r["store"], r.get("category") or "", r["sku"]))
+    return out, unknown
 
 
 def store_metrics(rows, sales):

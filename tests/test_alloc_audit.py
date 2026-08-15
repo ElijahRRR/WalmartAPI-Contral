@@ -445,7 +445,8 @@ def test_run_marks_channel_skip_instead_of_reporting_zero(monkeypatch, tmp_path)
     stale.write_text("上一轮的清单", encoding="utf-8-sig")
     out = wf.run({"channel": "0"})
     assert "下架渠道不符  本轮没查" in out and "**跳过**" in out
-    assert "0 件" not in out
+    ch_line = next(ln for ln in out.splitlines() if "下架渠道不符" in ln)
+    assert "件" not in ch_line          # 渠道那行不许出现任何件数
     assert stale.read_text(encoding="utf-8-sig") == "上一轮的清单"
     assert "alloc_渠道不符下架清单.csv" not in out.split("▍明细")[-1]
 
@@ -463,8 +464,8 @@ def test_run_marks_channel_skip_when_limits_table_unreadable(monkeypatch):
     assert "限额表读不到" in out
 
 
-def test_run_exports_five_lists(monkeypatch, tmp_path):
-    """五份明细要真落盘,且内容是"照着能做"的逐行明细。
+def test_run_exports_six_lists(monkeypatch, tmp_path):
+    """六份明细要真落盘,且内容是"照着能做"的逐行明细。
 
     控制台只留计数,所以 csv 是唯一能照着动手的东西——少一份就等于那件事
     没法做。
@@ -475,8 +476,8 @@ def test_run_exports_five_lists(monkeypatch, tmp_path):
 
     names = sorted(p.name for p in tmp_path.glob("*.csv"))
     assert set(names) == {"alloc_类目建议.csv", "alloc_渠道不符下架清单.csv",
-                          "alloc_店铺总览.csv", "alloc_同ASIN冲突处置.csv",
-                          "alloc_同品牌冲突处置.csv"}
+                          "alloc_类目不符下架清单.csv", "alloc_店铺总览.csv",
+                          "alloc_同ASIN冲突处置.csv", "alloc_同品牌冲突处置.csv"}
     for name in names:                       # 每份都在控制台列了名
         assert name in out
 
@@ -788,3 +789,55 @@ def test_sales_sql_uses_named_params_matching_the_window_dict():
         used = set(re.findall(r"%\((\w+)\)s", sql))
         assert used and used <= keys, (used, keys)
         assert "now()" not in sql            # 滑动窗口 = 每天换一个答案
+
+
+# ── 类目不符处置清单(所有者 2026-08-15 晚:填完类目后缺这一份)──────────
+
+def test_category_offenders_lists_only_real_violations():
+    rows = [
+        {"store": "限", "sku": "S1", "category": "Home", "published": True},
+        {"store": "限", "sku": "S2", "category": "Toys", "published": True},   # 不准入
+        {"store": "限", "sku": "S3", "category": "Toys", "published": False},  # 未发布
+        {"store": "限", "sku": "S4", "category": None, "published": True},     # 未归类
+        {"store": "不限", "sku": "S5", "category": "Toys", "published": True},
+    ]
+    cfg = {"限": {"categories": ["Home"]}, "不限": {"categories": []}}
+    bad, unknown = sv.category_offenders(rows, cfg)
+    assert [r["sku"] for r in bad] == ["S2"]
+    assert unknown == 1          # 未归类单列计数,不进下架清单
+
+
+def test_category_offenders_never_blames_unclassified_products():
+    """归不到大类 ≠ 违规:那是"不知道属于哪类",不是"属于不该有的类"。
+
+    与渠道那条「未知不算不符」同一条纪律——把不知道算成违规,
+    会让无辜商品进下架清单。
+    """
+    rows = [{"store": "限", "sku": f"S{i}", "category": None, "published": True}
+            for i in range(5)]
+    bad, unknown = sv.category_offenders(rows, {"限": {"categories": ["Home"]}})
+    assert bad == [] and unknown == 5
+
+
+def test_online_sql_excludes_retired_rows():
+    """RETIRED 退市行的 missing_since 也是 NULL —— 它没缺席,只是退市了。
+
+    catalog_sync 的全量扫描显式含一轮 ("RETIRED", None)(api/items._SWEEP_MODES),
+    所以只按 missing_since 判"在线"会把历史上架过、早已退市的 SKU 当成活货位。
+    coalesce 到 ACTIVE 是 fail-open:这一列没采到不算退市。
+    """
+    assert "lifecycle_status" in sv._SQL_ONLINE
+    assert "coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'" in sv._SQL_ONLINE
+    from api import items as api_items
+    assert ("RETIRED", None) in api_items._SWEEP_MODES["full"]   # 确实会扫进来
+
+
+def test_run_exports_the_category_disposal_list(monkeypatch, tmp_path):
+    """A085 准入 Fashion,它有一件 Knives(Home)→ 该进类目不符清单。"""
+    cur = _FakeCur()
+    cur.extra_items = [("A085", "B0CCCC0003", "Knives", "PUBLISHED")]
+    _wire(monkeypatch, cur, reports=tmp_path)
+    out = wf.run({})
+    txt = (tmp_path / "alloc_类目不符下架清单.csv").read_text(encoding="utf-8-sig")
+    assert "A085" in txt and "Home" in txt and "B0CCCC0003" in txt
+    assert "下架类目不符" in out and "alloc_类目不符下架清单.csv" in out

@@ -414,7 +414,13 @@ _ORDER_LINE_COLS = [
     "est_ship_date", "est_delivery_date", "product_amount", "shipping_amount",
     "cancel_reason", "refund_amount", "refund_comments", "carrier", "tracking_no",
     "tracking_url", "ship_name", "phone", "address1", "address2", "city", "state",
-    "postal_code", "country", "raw"]
+    "postal_code", "country", "raw",
+    # ⚠ source 留在覆盖列里是**有意的**:order_sync 的行不带这个键 → 写 NULL,
+    # 于是 API 一拉到真行,历史标记自动摘掉,该行回到飞书推送流。
+    # 把它挪进 skip_update 会让残缺行永远被当历史行排除在外。
+    "source"]
+
+HISTORY_SOURCE = "历史数据"      # order_history_import 写;push 侧按它排除
 
 _RETURN_LINE_COLS = [
     "return_order_id", "order_line_id", "store", "po_id", "line_number",

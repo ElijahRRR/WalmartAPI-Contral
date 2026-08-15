@@ -325,7 +325,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
-| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示 | 订单拉取工作流 + order_audit 回写审核 |
+| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流 | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |

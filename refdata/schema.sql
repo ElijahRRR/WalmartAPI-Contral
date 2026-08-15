@@ -593,6 +593,15 @@ CREATE INDEX IF NOT EXISTS order_lines_po_idx    ON orders.order_lines (po_id);
 CREATE INDEX IF NOT EXISTS order_lines_sku_idx   ON orders.order_lines (sku);
 CREATE INDEX IF NOT EXISTS order_lines_date_idx  ON orders.order_lines (store, order_date DESC);
 CREATE INDEX IF NOT EXISTS order_lines_audit_idx ON orders.order_lines (audit_status);
+-- 行的来源(2026-08-15):NULL/空 = order_sync 从 Walmart API 拉的完整行;
+-- '历史数据' = order_history_import 从旧汇总表导入的**残缺行**(只有下单时间/
+-- 店铺/PO/SKU/品名/数量/金额,无物流地址、无 raw、销售状态一律填 Delivered)。
+-- 两个消费方按它区分:order_center_push 不把历史行推去飞书(运营看到的会是
+-- 一批半截行)。⚠ 本列在 _ORDER_LINE_COLS 里,order_sync 覆盖同一行时会把它
+-- 写回 NULL —— 那正是想要的:API 拉到真行之后它就不再是历史行,自动回到推送流。
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS source text;
+CREATE INDEX IF NOT EXISTS order_lines_source_idx ON orders.order_lines (source)
+    WHERE source IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号

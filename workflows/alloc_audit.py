@@ -5,6 +5,7 @@
   python cli.py alloc_audit -p channel=0       # 跳过渠道探测(最慢的一段)
   python cli.py alloc_audit -p export=0        # 只看摘要不落 csv
   python cli.py alloc_audit -p sales_days=180  # 冲突处置的销量窗口(默认 365 天)
+  python cli.py alloc_audit -p as_of=2026-08-15  # 钉住销量窗口右端(默认今天 UTC)
 
 这是 docs/allocation_plan.md §十三 的 **A0.5 批次**:占用台账(A1)与分配
 引擎(A2)动工前,必须先知道存量长什么样、设计稿里的假设数字实际是多少。
@@ -38,7 +39,9 @@
      商品销量等于把两千多组丢给人工,所以按**降级阶梯**判(见
      services/alloc_survey.LADDER):该商品销量 → 该店该大类销量 → 该店整体
      销量 → 在线件数 → 店名。**判定依据写进每一行**,人一眼看出这条靠什么
-     定的、要不要推翻;只有落到最后两级才是机器真判不出、需要人眼的。
+     定的、要不要推翻;**只有落到最后一级(店名)才是机器真判不出、需要
+     人眼的**——在线件数是库里查得到的客观数据,算机器判得出(所有者
+     定稿 2026-08-15 晚)。
 
 三条口径纪律(2026-08-15 对抗式审查后定,每条都对应一次会算错数的实例):
 
@@ -108,6 +111,7 @@ def run(params: dict) -> str:
     """输入:params(channel/sales_days/export)→ 输出:存量审计报告 + 明细 csv。"""
     with_channel = str(params.get("channel", "1")).lower() not in {"0", "false", "no"}
     sales_days = int(params.get("sales_days", 365))
+    win = sv.sales_window(str(params.get("as_of", "")), sales_days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
     L: list[str] = []
 
@@ -130,9 +134,9 @@ def run(params: dict) -> str:
         items = cur.fetchall()
         cur.execute(sv._SQL_STATUS)
         status = {s: (st or "").strip().upper() for s, st in cur.fetchall()}
-        cur.execute(sv._SQL_SALES, (sales_days,))
+        cur.execute(sv._SQL_SALES, win)
         sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
-        cur.execute(sv._SQL_ORDER_STORES, (sales_days,))
+        cur.execute(sv._SQL_ORDER_STORES, win)
         order_stores = cur.fetchall()
 
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
@@ -216,7 +220,7 @@ def run(params: dict) -> str:
 
     # ── ▍要你做的事(放最前面:报告是为了让人动手,不是为了让人读)──
     hard = sum(1 for c in conflicts.values() for x in c
-               if x[4] in (sv.LADDER[3], sv.LADDER[4]))
+               if x[4] in sv.NEEDS_HUMAN)
     todo = [("① 填类目三列",
              f"{len(unfilled_cat)} 家店待填" if not cfg_err else "本轮没查",
              "→ alloc_类目建议.csv" if not cfg_err else
@@ -411,6 +415,11 @@ def run(params: dict) -> str:
              for key, keep, _, detail, level in conflicts[tag]
              for s2, sku, asin, o, g, cg, sg, verdict in detail]))
 
+    # 销量窗口必须打出来:阶梯前三级全看销量,窗口一滑判定就可能翻。
+    # 回填要照这份清单落,就得吃同一个窗口 —— 命令原样给出,不让人自己拼
+    L += ["", f"▍销量窗口 {win['day']} 往前 {sales_days} 天(右端不含当天)",
+          f"  回填照这份清单落:python cli.py alloc_backfill "
+          f"-p as_of={win['day']} -p sales_days={sales_days} --execute"]
     L += ["", f"▍明细 {len(files)} 份 csv → {paths.reports_dir()}"]
     for f in files:
         L.append(f"  · {f.rsplit('/', 1)[-1]}")

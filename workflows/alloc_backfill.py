@@ -6,6 +6,7 @@
   python cli.py alloc_backfill -p include_ties=1 --execute
         # 连"两边都零销量"的冲突组也一并落(默认跳过等人工)
   python cli.py alloc_backfill -p sales_days=180    # 判定销量的窗口(默认 365)
+  python cli.py alloc_backfill -p as_of=2026-08-15  # **与出清单那次传同一个值**
 
 把当前在线的商品变成占用台账的初始状态。跨店冲突按所有者口径
 (2026-08-15)**留销量大的店**——与 `alloc_audit` C3/C4 清单同一套判定,
@@ -56,8 +57,9 @@ def _pick(rows, sales, field, include_ties, metrics=None, cfg=None):
     skipped = 0
     for key, keep, _stat, _detail, level in sv.resolve_conflicts(
             rows, sales, field, metrics, cfg):
-        # 只有"连店铺整体销量都分不出"才算真打平(靠在线件数/店名定序)
-        if level in (sv.LADDER[3], sv.LADDER[4]) and not include_ties:
+        # 只有落到**店名**才算真打平(拿字典序当经营决策)。在线件数是库里
+        # 查得到的客观数据,算判得出 —— 名单见 sv.NEEDS_HUMAN
+        if level in sv.NEEDS_HUMAN and not include_ties:
             owner.pop(key, None)
             skipped += 1
         else:
@@ -70,13 +72,14 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     include_ties = str(params.get("include_ties", "")).lower() in {"1", "true", "yes"}
     sales_days = int(params.get("sales_days", 365))
+    win = sv.sales_window(str(params.get("as_of", "")), sales_days)
 
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(sv._SQL_PT2CAT)
         pt2cat = {pt: c for pt, c in cur.fetchall() if c}
         cur.execute(sv._SQL_ONLINE)
         items = cur.fetchall()
-        cur.execute(sv._SQL_SALES, (sales_days,))
+        cur.execute(sv._SQL_SALES, win)
         sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
                                     for it in items) if a})
@@ -122,7 +125,9 @@ def run(params: dict) -> str:
     per_store = Counter(r["store"] for r in to_claim)
     head = (f"在线行 {st['online']},入选(在册∧已发布){len(live)}、"
             f"排除 {dropped};将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"
-            f";涉及 {len(per_store)} 家店")
+            f";涉及 {len(per_store)} 家店"
+            f"\n   销量窗口 {win['day']} 往前 {sales_days} 天 —— "
+            f"**与出清单那次必须一致**,不一致就是照 A 的清单落 B 的判定")
     ties_note = (f";**无销售依据、只能按件数/店名定序而跳过:品牌 {brand_ties} 组 / "
                  f"产品 {prod_ties} 组**"
                  "(机器判不出谁该留,先看 alloc_audit 的 C3/C4 清单,"

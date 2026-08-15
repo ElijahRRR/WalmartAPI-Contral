@@ -177,7 +177,8 @@ SELECT store, sku,
        count(*)                                   AS orders,
        coalesce(sum(product_amount), 0)::numeric  AS gmv
 FROM orders.order_lines
-WHERE order_date >= now() - make_interval(days => %s)
+WHERE order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
+  AND order_date <  %(as_of)s::timestamptz
   AND coalesce(sale_status, '') <> 'Cancelled'
 GROUP BY store, sku
 """
@@ -189,9 +190,27 @@ _SQL_ORDER_STORES = """
 SELECT store, count(*) AS n,
        count(*) FILTER (WHERE source IS NOT NULL) AS hist
 FROM orders.order_lines
-WHERE order_date >= now() - make_interval(days => %s)
+WHERE order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
+  AND order_date <  %(as_of)s::timestamptz
 GROUP BY store ORDER BY n DESC
 """
+
+
+def sales_window(as_of: str = "", days: int = 365) -> dict:
+    """输入:可选 as_of(YYYY-MM-DD)+ 窗口天数 → 输出:两条 SQL 的参数字典。
+
+    **窗口右端默认取「今天 UTC 零点」而不是 now()**,于是同一天内跑多少次、
+    先跑 alloc_audit 再跑 alloc_backfill,吃到的销量**逐行一致**。
+    用 now() 时两次调用差几秒就可能差几张单,而阶梯的前三级全看销量——
+    报告说"留 A"、几分钟后回填落"留 B",两边都没错,只是各自看了不同的世界。
+
+    要复现某一天出的那份清单(比如清单跑完隔了几天才回填),两个工作流
+    传同一个 `-p as_of=YYYY-MM-DD` 即可;报告会把该重跑什么原样打出来。
+    """
+    from datetime import datetime, timezone
+    day = (as_of or "").strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    datetime.strptime(day, "%Y-%m-%d")      # 格式不对就当场报错,别悄悄退回 now()
+    return {"as_of": f"{day} 00:00:00+00", "days": days, "day": day}
 
 
 # ── 纯函数(逻辑都在这里,好测)────────────────────────────────────────────
@@ -352,16 +371,26 @@ def store_metrics(rows, sales):
     (实测 687 组同 ASIN 里 660 组、1657 组同品牌里 1432 组),只看该商品
     销量等于判不了——但"这家店整体卖得怎么样""这家店在这个大类卖得怎么样"
     是有数的,拿它们当代理指标,决定就有依据且能解释。
+
+    ⚠ **整体销量按订单表全量算,不按"当前还在线的 SKU"算**(2026-08-15 修)。
+    原来是遍历 rows 累加,于是有一条反馈回路:所有者照本报告的建议下架了
+    一批商品 → 那批商品的历史销量跟着退出统计 → 这家店的"整体销量"下降 →
+    **下一轮别的冲突组判定跟着翻**。照建议做事反而惩罚自己,而且第二天重跑
+    结果对不上,没人看得出为什么。销量是既成事实,不该随货架变。
+    (`per_cat` 仍按在线行推大类——订单行还没有 asin/大类列,A1.5 补上之后
+     这一层也应改成订单侧口径。)
     """
     per_store: dict[str, dict] = {}
     per_cat: dict[tuple, float] = {}
-    for r in rows:
-        o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
-        st = per_store.setdefault(r["store"], {"gmv": 0.0, "orders": 0, "online": 0})
+    for (store, _sku), (o, g) in sales.items():
+        st = per_store.setdefault(store, {"gmv": 0.0, "orders": 0, "online": 0})
         st["gmv"] += float(g)
         st["orders"] += int(o)
-        st["online"] += 1
+    for r in rows:
+        st = per_store.setdefault(r["store"], {"gmv": 0.0, "orders": 0, "online": 0})
+        st["online"] += 1                      # 件数只数行,金额上面已按订单表算完
         if r.get("category"):
+            _o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
             key = (r["store"], r["category"])
             per_cat[key] = per_cat.get(key, 0.0) + float(g)
     return per_store, per_cat
@@ -371,6 +400,11 @@ def store_metrics(rows, sales):
 LADDER = ("按该商品销量", "按该店该大类销量", "按该店整体销量", "按在线件数", "按店名")
 #: 类目准入是**硬闸不是阶梯**:店不准入这个大类,货就必须离开它,与销量无关
 BY_CATEGORY = "按类目准入"
+#: 机器判不出、必须人眼看的依据级别(所有者定稿 2026-08-15 晚)。
+#: **「按在线件数」不在其中**——在线数是库里查得到的客观数据,"这个品牌你在
+#: 哪家店铺得更开"是站得住的经营判断,不需要人工复核。只有落到**店名**才是
+#: 真打平:那一级等于拿字典序当经营决策,机器确实判不出。
+NEEDS_HUMAN = (LADDER[4],)
 
 
 def resolve_conflicts(rows, sales, field, metrics=None, cfg=None):

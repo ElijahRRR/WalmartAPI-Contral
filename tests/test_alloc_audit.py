@@ -714,3 +714,77 @@ def test_report_and_backfill_pick_the_same_store(monkeypatch):
     assert report[0][1] == owner["acme"]
     # 未发布行不参与:件数打平 → 落到店名,而不是 B 靠 3:1 赢
     assert report[0][4] == sv.LADDER[4] and owner["acme"] == "A"
+
+
+# ── 可复现性:同一份数据两次跑必须同一个结果(所有者 2026-08-15 晚追问)──
+
+def test_needs_human_is_only_the_store_name_tier():
+    """「按在线件数」算机器判得出——在线数是库里查得到的客观数据。
+
+    所有者定稿 2026-08-15 晚:只有落到**店名**才是真打平(拿字典序当经营
+    决策),那一级才需要人眼。
+    """
+    assert sv.NEEDS_HUMAN == ("按店名",)
+    assert sv.LADDER[3] == "按在线件数" and sv.LADDER[3] not in sv.NEEDS_HUMAN
+
+
+def test_store_gmv_comes_from_orders_not_from_what_is_still_online():
+    """整体销量按订单表算,**不随货架变** —— 否则有反馈回路:
+
+    照报告建议下架一批商品 → 那批的历史销量退出统计 → 这家店"整体销量"下降
+    → 下一轮别的冲突组判定跟着翻。照建议做事反而惩罚自己,且第二天重跑结果
+    对不上,没人看得出为什么。
+    """
+    rows = [{"store": "A", "sku": "还在线", "category": "Home"}]
+    sales = {("A", "还在线"): (1, 10.0), ("A", "已下架"): (9, 900.0)}
+    per_store, _ = sv.store_metrics(rows, sales)
+    assert per_store["A"]["gmv"] == 910.0        # 下架那件的销量照算
+    assert per_store["A"]["orders"] == 10
+    assert per_store["A"]["online"] == 1         # 但件数只数还在线的
+
+
+def test_verdict_does_not_depend_on_row_order():
+    """行序不许影响判定:同一批数据换个顺序喂进来,保留店必须一模一样。"""
+    import random
+    rows = [
+        {"store": s, "sku": f"S{i}", "asin": f"B0{i:08d}", "brand_key": "acme",
+         "category": "Home", "published": True, "pt": "X", "pt_source": None}
+        for i, s in enumerate(["A", "B", "C", "A", "B", "C", "A"])
+    ]
+    sales = {("B", "S1"): (2, 20.0)}
+    base = sv.resolve_conflicts(rows, sales, "brand_key",
+                                sv.store_metrics(rows, sales))
+    for seed in range(5):
+        shuffled = rows[:]
+        random.Random(seed).shuffle(shuffled)
+        got = sv.resolve_conflicts(shuffled, sales, "brand_key",
+                                   sv.store_metrics(shuffled, sales))
+        assert [(k, keep, lv) for k, keep, _s, _d, lv in got] == \
+               [(k, keep, lv) for k, keep, _s, _d, lv in base]
+
+
+def test_sales_window_is_pinned_to_a_day_not_to_now():
+    """窗口右端取「某日 UTC 零点」,同一天跑多少次都是同一个窗口。
+
+    用 now() 时 alloc_audit 与随后的 alloc_backfill 差几秒就可能差几张单,
+    而阶梯前三级全看销量 —— 两边都没错,只是各自看了不同的世界。
+    """
+    from datetime import datetime, timezone
+    w = sv.sales_window("2026-08-15", 365)
+    assert w == {"as_of": "2026-08-15 00:00:00+00", "days": 365,
+                 "day": "2026-08-15"}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert sv.sales_window("", 30)["day"] == today
+    assert sv.sales_window(None or "", 30)["days"] == 30
+    with pytest.raises(ValueError):          # 格式不对当场炸,不悄悄退回 now()
+        sv.sales_window("08/15/2026", 365)
+
+
+def test_sales_sql_uses_named_params_matching_the_window_dict():
+    """SQL 的占位符名必须与 sales_window 的键对上——对不上是运行时才炸。"""
+    import re
+    keys = set(sv.sales_window("2026-08-15", 365))
+    for sql in (sv._SQL_SALES, sv._SQL_ORDER_STORES):
+        used = set(re.findall(r"%\((\w+)\)s", sql))
+        assert used and used <= keys, (used, keys)
+        assert "now()" not in sql            # 滑动窗口 = 每天换一个答案

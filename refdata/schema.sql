@@ -335,6 +335,34 @@ CREATE TABLE IF NOT EXISTS catalog.brand_err_hits (
 );
 ALTER TABLE catalog.brand_err_hits ADD COLUMN IF NOT EXISTS src_store text;
 
+-- 占用台账(分配 A1,docs/allocation_plan.md §五):品牌与产品的排他归属。
+-- **占用是决策不是观测**:只有「分配」和「释放」两个显式动作能改它,
+-- 在线快照怎么抖都不影响(店铺暂停、商品下架、从没上架成功,占用都不动)。
+-- 排他性由**部分唯一索引**保证,不靠代码自觉——并发分配时后到的那条直接
+-- 撞索引失败,调用方顺延次优店(与 UPC 池同款事务纪律)。
+-- released 行永久保留:它是"这个品牌当初属于谁、什么时候为什么放出来"的
+-- 唯一答案,删了就再也回答不了。
+CREATE TABLE IF NOT EXISTS catalog.claims (
+    id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    kind       text NOT NULL,              -- brand / product
+    claim_key  text NOT NULL,              -- brand=services/brand_key 归一键;product=ASIN
+    store      text NOT NULL,
+    status     text NOT NULL DEFAULT 'active',   -- active / released
+    -- 决策时快照(2026-08-15):映射表是活表、重采会把 approved 翻 pending,
+    -- 不快照就回答不了"当初按什么把它分给这家店的"
+    walmart_pt text, pt_source text, audit_version text,
+    source     text NOT NULL,              -- 落它的工作流(alloc_backfill / allocate)
+    note       text,
+    claimed_at timestamptz NOT NULL DEFAULT now(),
+    released_at timestamptz,
+    released_reason text
+);
+-- 一个品牌/一个 ASIN 全局只能有一条 active
+CREATE UNIQUE INDEX IF NOT EXISTS claims_active_uniq
+    ON catalog.claims (kind, claim_key) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS claims_store_idx
+    ON catalog.claims (store) WHERE status = 'active';
+
 -- 风险档案:人工/AI SELECT 查询入口。**不是拦截条件**(所有者口径
 -- 2026-08-12:防呆=黑名单,按拉黑类别拦,不按删除史拦——因产品问题删过
 -- 的重上是正常经营);list_new 仅消费 unexplained_missing 做报警(不拦截)。

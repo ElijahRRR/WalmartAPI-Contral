@@ -10,6 +10,7 @@ import pytest
 
 from services import brand_key as bk
 from services import store_targets
+from services import alloc_survey as sv
 from workflows import alloc_audit as wf
 
 # (store, sku, product_type, published_status)
@@ -42,7 +43,7 @@ PT2CAT = {"Socks": "Fashion", "Hats": "Fashion", "Knives": "Home"}
 
 @pytest.fixture
 def enriched():
-    return wf.enrich(ITEMS, META, PT2CAT)
+    return sv.enrich(ITEMS, META, PT2CAT)
 
 
 # ── 品牌占用键(services/brand_key)──────────────────────────────────────
@@ -103,7 +104,7 @@ def test_enrich_falls_back_to_product_pt_for_category():
     两条来源必须分开计数:兜底那部分可能是 LLM 推断的 PT,开新类目时
     不能当实证用(§十二.14⑥)。
     """
-    rows, st = wf.enrich([("A085", "B0AAAA0001", None, "PUBLISHED")],
+    rows, st = sv.enrich([("A085", "B0AAAA0001", None, "PUBLISHED")],
                          META, PT2CAT)
     assert rows[0]["category"] == "Fashion"
     assert rows[0]["cat_source"] == "product"
@@ -122,7 +123,7 @@ def test_enrich_counts_unrecognized_channel():
     meta = {"B0AAAA0001": {"brand": "X", "manufacturer": None,
                            "walmart_pt": "Socks", "pt_source": None,
                            "fulfillment": "海外仓"}}
-    rows, st = wf.enrich([("A085", "B0AAAA0001", "Socks", "PUBLISHED")],
+    rows, st = sv.enrich([("A085", "B0AAAA0001", "Socks", "PUBLISHED")],
                          meta, PT2CAT)
     assert st["channel_weird"] == 1 and rows[0]["channel"] == "海外仓"
 
@@ -136,19 +137,19 @@ def test_enrich_counts_products_without_brand(enriched):
 
 def test_cross_store_asin_and_brand(enriched):
     rows, _ = enriched
-    a1 = wf.cross_store(rows, "asin")
+    a1 = sv.cross_store(rows, "asin")
     assert [k for k, _ in a1] == ["B0AAAA0001"]
     assert a1[0][1] == {"A085": 1, "A107": 1}
     # acme 在 A085(B0AAAA0001)与 A107(两条)——归一化后同键才看得出来
-    brands = dict(wf.cross_store(rows, "brand_key"))
+    brands = dict(sv.cross_store(rows, "brand_key"))
     assert set(brands["acme"]) == {"A085", "A107"}
 
 
 def test_cross_store_ignores_none_keys():
     rows = [{"store": "A", "asin": None, "brand_key": None},
             {"store": "B", "asin": None, "brand_key": None}]
-    assert wf.cross_store(rows, "asin") == []
-    assert wf.cross_store(rows, "brand_key") == []
+    assert sv.cross_store(rows, "asin") == []
+    assert sv.cross_store(rows, "brand_key") == []
 
 
 def test_cross_store_ordering_is_reproducible():
@@ -163,7 +164,7 @@ def test_cross_store_ordering_is_reproducible():
         + [{"store": "A", "asin": "B0ALPHA", "brand_key": None},
            {"store": "B", "asin": "B0ALPHA", "brand_key": None}]
     )
-    assert [k for k, _ in wf.cross_store(rows, "asin")] == [
+    assert [k for k, _ in sv.cross_store(rows, "asin")] == [
         "B0THREE",      # 3 店
         "B0BIG",        # 2 店 9 件
         "B0ALPHA",      # 2 店 2 件,键名靠前
@@ -173,28 +174,28 @@ def test_cross_store_ordering_is_reproducible():
 
 def test_store_profiles_counts_categories_and_channels(enriched):
     rows, _ = enriched
-    prof = wf.store_profiles(rows)
+    prof = sv.store_profiles(rows)
     assert prof["A085"]["n"] == 3
     assert prof["A085"]["published"] == 3
     assert prof["A107"]["published"] == 1                  # 一条 UNPUBLISHED
     assert prof["A085"]["categories"]["Fashion"] == 2
-    assert prof["A085"]["categories"][wf.UNCLASSIFIED] == 1  # numeric sku 那行
+    assert prof["A085"]["categories"][sv.UNCLASSIFIED] == 1  # numeric sku 那行
     assert prof["A107"]["channels"] == Counter({"FBA": 1, "FBM": 1})
 
 
 def test_real_cats_excludes_unclassified(enriched):
     """未归类不是一个大类:它进了计数,"超 2 类"的判定与排序就都偏了。"""
     rows, _ = enriched
-    prof = wf.store_profiles(rows)
-    assert wf.real_cats(prof["A085"]) == ["Fashion"]
+    prof = sv.store_profiles(rows)
+    assert sv.real_cats(prof["A085"]) == ["Fashion"]
     assert len(prof["A085"]["categories"]) == 2            # 含未归类占位
 
 
 def test_channel_mismatch_only_for_configured_stores(enriched):
     rows, _ = enriched
-    prof = wf.store_profiles(rows)
+    prof = sv.store_profiles(rows)
     cfg = {"A107": {"channel": "FBA"}, "A085": {"channel": None}}
-    mism = wf.channel_mismatch(prof, cfg)
+    mism = sv.channel_mismatch(prof, cfg)
     assert [m[0] for m in mism] == ["A107"]        # A085 未填限制,不对拍
     assert mism[0][1] == "FBA" and mism[0][2] == 1  # 一件 FBM 不符
 
@@ -202,15 +203,15 @@ def test_channel_mismatch_only_for_configured_stores(enriched):
 def test_channel_mismatch_does_not_blame_unknown_channel():
     """渠道没采到 ≠ 货不对:不能把无辜商品混进下架清单。"""
     prof = {"S": {"n": 2, "categories": Counter(),
-                  "channels": Counter({"FBA": 1, wf.UNKNOWN_CHANNEL: 1})}}
-    assert wf.channel_mismatch(prof, {"S": {"channel": "FBA"}}) == []
+                  "channels": Counter({"FBA": 1, sv.UNKNOWN_CHANNEL: 1})}}
+    assert sv.channel_mismatch(prof, {"S": {"channel": "FBA"}}) == []
 
 
 def test_channel_mismatch_is_whitelist_not_blacklist():
     """认不出的第三种值同样不算不符——那是采集解析坏了,不是货不对。"""
     prof = {"S": {"n": 3, "categories": Counter(),
                   "channels": Counter({"FBA": 1, "海外仓": 5, "FBM": 2})}}
-    out = wf.channel_mismatch(prof, {"S": {"channel": "FBA"}})
+    out = sv.channel_mismatch(prof, {"S": {"channel": "FBA"}})
     assert out[0][2] == 2                  # 只有 FBM 那 2 件算不符,海外仓不算
 
 
@@ -219,7 +220,7 @@ def test_channel_mismatch_sort_has_tiebreak():
     prof = {s: {"n": 1, "categories": Counter(), "channels": Counter({"FBM": 1})}
             for s in ("S2", "S1", "S3")}
     cfg = {s: {"channel": "FBA"} for s in prof}
-    assert [m[0] for m in wf.channel_mismatch(prof, cfg)] == ["S1", "S2", "S3"]
+    assert [m[0] for m in sv.channel_mismatch(prof, cfg)] == ["S1", "S2", "S3"]
 
 
 # ── 店铺配置 ───────────────────────────────────────────────────────────
@@ -266,19 +267,19 @@ def test_pt_meta_column_name_in_sql():
     2026-08-15 实测教训:写成 m.product_type 会 UndefinedColumn,而它是
     run() 的第三条 SQL —— 整份报告一行都出不来(P1/P2 已查的结果一并丢)。
     """
-    assert "m.walmart_product_type" in wf._SQL_PT_DICT
-    assert "m.product_type" not in wf._SQL_PT_DICT
+    assert "m.walmart_product_type" in sv._SQL_PT_DICT
+    assert "m.product_type" not in sv._SQL_PT_DICT
 
 
 def test_online_query_is_ordered_and_carries_published():
     """固定 ORDER BY:样例截断要可复现;带 published_status:下架判定只看已发布。"""
-    assert "ORDER BY store, sku" in wf._SQL_ONLINE
-    assert "published_status" in wf._SQL_ONLINE
+    assert "ORDER BY store, sku" in sv._SQL_ONLINE
+    assert "published_status" in sv._SQL_ONLINE
 
 
 def test_pool_query_gates_on_category_lookup():
     """P1 末层必须过大类关——查不到大类的产品过不了「一店两大类」硬闸。"""
-    assert "risk_product_types" in wf._SQL_POOL and "with_cat" in wf._SQL_POOL
+    assert "risk_product_types" in sv._SQL_POOL and "with_cat" in sv._SQL_POOL
 
 
 # ── run() 端到端冒烟(报告拼装路径此前零覆盖:未定义变量只有生产跑才炸)──

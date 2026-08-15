@@ -21,11 +21,16 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     (ops.feed_items MP_ITEM,北京日界);超配额行不写终态,次日自动续上
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ ASIN 黑名单(catalog.asin_blacklist 永久禁止
-    六类 + 黑名单品牌,见③)。**防呆=黑名单,不看删除史**(所有者口径
-    2026-08-12:拦"出现过侵权/审查等拉黑类别"的,不拦"因产品问题删过"
-    的——可修复类删除后重上是正常经营,曾按删除史一刀切拦过,当日拆除);
+    cache 的正确替代)+ **占用闸**(catalog.claims:该 ASIN 或其品牌已被
+    **别的店**占用即拦;占用是决策台账,商品下架也不释放,这正是快照闸
+    补不上的那半边——见 docs/allocation_plan.md §二)+ ASIN 黑名单
+    (catalog.asin_blacklist 永久禁止六类 + 黑名单品牌,见③)。
+    **防呆=黑名单,不看删除史**(所有者口径 2026-08-12:拦"出现过侵权/
+    审查等拉黑类别"的,不拦"因产品问题删过"的——可修复类删除后重上是
+    正常经营,曾按删除史一刀切拦过,当日拆除);
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
+    ⚠ 占用闸与快照闸**并存**(A1 阶段):台账回填完整前,快照闸仍是主力;
+    两道都过才放行,理由分开写,谁拦的一目了然
   ⑤ 数据源(services/amz_source,缺席:该行本轮跳过**不写终态**,并把
     缺数据 ASIN **自动推给采集服务**补采(所有者批复 2026-08-12 接上闭环;
     日界批次名防重,当天已推不重推),采集落库后自动续上
@@ -48,9 +53,9 @@ from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
-from services import amz_source, blacklist, kpi, listing_sheet, \
-    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
-    product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
+from services import amz_source, blacklist, brand_key, claims, kpi, \
+    listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
+    pricing, product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -88,7 +93,12 @@ def _load_gate_state():
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
-    return inactive, today_used, listed, banned, unexplained, gate
+        # 占用台账(A1):台账为空时两个 dict 都是空的,闸门恒放行——
+        # 回填前后行为一致,不会因为"还没回填"而误拦
+        owned_asin = claims.load_active(conn, claims.PRODUCT)
+        owned_brand = claims.load_active(conn, claims.BRAND)
+    return (inactive, today_used, listed, banned, unexplained, gate,
+            owned_asin, owned_brand)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -299,13 +309,13 @@ def run(params: dict) -> str:
     if not pending:
         return "\n".join(lines)
 
-    inactive, today_used, listed, banned, unexplained, gate = \
-        _load_gate_state()
+    (inactive, today_used, listed, banned, unexplained, gate,
+     owned_asin, owned_brand) = _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
-         "blacklist": 0, "no_data": 0, "filtered": 0,
+         "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
@@ -340,6 +350,13 @@ def run(params: dict) -> str:
             if r["asin"] in listed:
                 n["dedup"] += 1
                 reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
+                continue
+            holder = owned_asin.get(r["asin"])
+            if holder and holder != store_name:
+                # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
+                # 被占着"正是所有者要的语义(§二);同店占用放行(本来就是它的)
+                n["claimed"] += 1
+                reasons.append((r["rownum"], f"产品占用:已属于 {holder}"))
                 continue
             bl = banned.get(r["asin"])
             if bl:
@@ -398,6 +415,16 @@ def run(params: dict) -> str:
         if why:
             n["risk"] += 1
             reasons.append((r["rownum"], why))
+            continue
+        # 品牌占用闸(A1):品牌排他 ⇒ 同品牌只能在一家店。放在这里而不是
+        # 前面那批闸,是因为品牌要等 amz_source 取回产品数据才知道。
+        # 键与占用侧同一套归一算法(brand_key 唯一出处),否则大小写差一点
+        # 就漏拦;真·无品牌(两字段皆占位符)不参与品牌排他,只受产品占用管
+        bkey = brand_key.brand_key(p.get("brand"), p.get("manufacturer"))
+        bholder = owned_brand.get(bkey) if bkey else None
+        if bholder and bholder != r["store"]:
+            n["claimed"] += 1
+            reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))
             continue
         # 配送方式决定用哪套区间(FBA 0-30/30-75 vs FBM 15-80/80-1000)。
         # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档

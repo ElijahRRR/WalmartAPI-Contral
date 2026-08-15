@@ -1,0 +1,359 @@
+"""分配存量勘察积木:在线商品富化、跨店冲突判定、店铺画像、处置清单素材。
+
+为什么是 services 而不是留在 workflow 里:`alloc_audit`(出报告)与
+`alloc_backfill`(落占用)必须用**同一套判定**——报告说"留 A085"、回填却
+落到别家,那份给人看的清单就成了假的。而工作流之间不准互相 import(铁律 1),
+所以共用的口径只能沉到这里,两边各自 import。
+
+本模块只读、无副作用:SQL 常量 + 取数函数 + 纯函数判定。
+落盘、拼报告、写台账分别在两个 workflow 里。
+"""
+
+import logging
+from collections import Counter, defaultdict
+
+from services import brand_key as bk
+from services import sku_asin, store_targets
+
+logger = logging.getLogger("services.alloc_survey")
+
+_CHUNK = 5000
+UNCLASSIFIED = "(未归类)"
+UNKNOWN_CHANNEL = "(未知)"
+
+# ── P1 候选池:五道谓词逐层收窄(口径与 product_audit/catalog_health 对齐)──
+# title 非空:排掉 pt_backfill 造的占位行;pt <> 'unknown':旧系统量产字面量;
+# 末层 EXISTS:PT 在字典里查得到**非空大类**——查不到大类的产品过不了
+# "一店两大类"这道硬闸,不该计进"引擎能分的量"
+_SQL_POOL = """
+WITH p AS (
+    SELECT walmart_pt, pt_source, brand,
+           audit_status = 'approved'                     AS ok_audit,
+           title IS NOT NULL AND btrim(title) <> ''       AS ok_title,
+           walmart_pt IS NOT NULL AND walmart_pt <> 'unknown' AS ok_pt
+    FROM catalog.products WHERE marketplace = 'US'
+)
+SELECT count(*)                                                  AS total,
+       count(*) FILTER (WHERE ok_audit)                          AS approved,
+       count(*) FILTER (WHERE ok_audit AND ok_title)              AS with_title,
+       count(*) FILTER (WHERE ok_audit AND ok_title AND ok_pt)    AS with_pt,
+       count(*) FILTER (WHERE ok_audit AND ok_title AND ok_pt
+                          AND pt_source = 'walmart_confirmed')    AS pt_evid,
+       count(*) FILTER (WHERE ok_audit AND ok_title AND ok_pt
+                          AND EXISTS (SELECT 1 FROM catalog.risk_product_types r
+                                       WHERE r.product_type = p.walmart_pt
+                                         AND btrim(coalesce(r.category, '')) <> ''))
+                                                                 AS with_cat,
+       count(*) FILTER (WHERE ok_audit AND brand IS NOT NULL
+                          AND btrim(brand) <> '')                AS with_brand
+FROM p
+"""
+
+# ── P2 打分信号探针:契约 v1 字段表没有 rating/review_count,设计稿断言
+#    "随 raw 落进来"——本仓零证据,必须实测。取样而非全表:上亿行 jsonb
+#    全扫没必要,有没有这回事看 5 万条最新快照就够了
+_SQL_SIGNAL = """
+SELECT count(*)                                            AS n,
+       count(*) FILTER (WHERE raw ? 'rating')              AS n_rating,
+       count(*) FILTER (WHERE raw ? 'review_count')        AS n_review,
+       count(*) FILTER (WHERE raw ? 'is_fba')              AS n_fba
+FROM (SELECT raw FROM catalog.snapshots
+      WHERE outcome = 'ok' ORDER BY scraped_at DESC LIMIT 50000) t
+"""
+
+# ⚠ audit.walmart_pt_meta 的主键列叫 **walmart_product_type**,不是
+#   product_type(refdata/schema.sql:1132;全仓另 6 处消费方同款)。
+#   2026-08-15 审查抓到:写成 m.product_type 会 UndefinedColumn 崩掉整份报告
+_SQL_PT_DICT = """
+SELECT (SELECT count(*) FROM catalog.risk_product_types)               AS n_risk,
+       (SELECT count(*) FROM catalog.risk_product_types
+         WHERE category IS NOT NULL AND btrim(category) <> '')         AS n_risk_cat,
+       (SELECT count(*) FROM audit.walmart_pt_meta)                    AS n_meta,
+       (SELECT count(*) FROM catalog.risk_product_types r
+         WHERE NOT EXISTS (SELECT 1 FROM audit.walmart_pt_meta m
+                            WHERE m.walmart_product_type = r.product_type)) AS only_risk,
+       (SELECT count(*) FROM audit.walmart_pt_meta m
+         WHERE NOT EXISTS (SELECT 1 FROM catalog.risk_product_types r
+                            WHERE r.product_type = m.walmart_product_type)) AS only_meta,
+       (SELECT count(*) FROM catalog.risk_product_types r
+          JOIN audit.walmart_pt_meta m ON m.walmart_product_type = r.product_type
+         WHERE btrim(coalesce(r.category, '')) <>
+               btrim(coalesce(m.walmart_category, '')))                AS cat_diff
+"""
+
+_SQL_CATEGORIES = """
+SELECT btrim(category) AS cat, count(*) AS n
+FROM catalog.risk_product_types
+WHERE category IS NOT NULL AND btrim(category) <> ''
+GROUP BY 1 ORDER BY 2 DESC, 1
+"""
+
+# ORDER BY 固定:同一份数据两次跑要出同一份清单(样例截断才有意义)
+_SQL_ONLINE = """
+SELECT store, sku, product_type, published_status
+FROM catalog.walmart_items WHERE missing_since IS NULL
+ORDER BY store, sku
+"""
+
+# 一次拿齐品牌/PT/渠道:渠道那段是 amz_source._SQL 的 LATERAL 口径
+# (latest_snapshot 按 scrape_params 分组会一个 ASIN 出多行,不能裸 JOIN;
+#  zip_verify='mismatch' 的观测不算数)
+_SQL_META = """
+SELECT p.asin, p.brand, p.slow ->> 'manufacturer', p.walmart_pt, p.pt_source,
+       s.fulfillment
+FROM catalog.products p
+LEFT JOIN LATERAL (
+    SELECT raw ->> 'is_fba' AS fulfillment
+    FROM catalog.latest_snapshot ls
+    WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
+      AND coalesce(ls.scrape_params ->> 'zip_verify', '') <> 'mismatch'
+    ORDER BY ls.scraped_at DESC LIMIT 1
+) s ON true
+WHERE p.marketplace = 'US' AND p.asin = ANY(%s)
+"""
+
+_SQL_META_NO_CHANNEL = """
+SELECT p.asin, p.brand, p.slow ->> 'manufacturer', p.walmart_pt, p.pt_source,
+       NULL AS fulfillment
+FROM catalog.products p
+WHERE p.marketplace = 'US' AND p.asin = ANY(%s)
+"""
+
+_SQL_PT2CAT = """
+SELECT product_type, btrim(coalesce(category, '')) FROM catalog.risk_product_types
+"""
+
+# 店铺状态:全仓统一写法(每店最新一行)
+_SQL_STATUS = """
+SELECT DISTINCT ON (store) store, store_status
+FROM ops.store_kpi_daily ORDER BY store, data_date DESC
+"""
+
+# 冲突处置要的销量:按 (store, sku) 聚合——**不需要 asin 列**,
+# order_lines 与 walmart_items 共用 (store, sku) 主键口径。
+# 只算"有效销售"类行:统计状态在 raw 里(历史导入),API 行没有该键,
+# 用 coalesce 让两种来源都算进来(API 行本就是真实销售)。
+_SQL_SALES = """
+SELECT store, sku,
+       count(*)                                   AS orders,
+       coalesce(sum(product_amount), 0)::numeric  AS gmv
+FROM orders.order_lines
+WHERE order_date >= now() - make_interval(days => %s)
+  AND coalesce(raw ->> '统计状态', '有效销售') = '有效销售'
+GROUP BY store, sku
+"""
+
+
+# ── 纯函数(逻辑都在这里,好测)────────────────────────────────────────────
+
+def enrich(items, meta, pt2cat):
+    """输入:在线行 [(store, sku, product_type, published_status)] +
+    {asin: 元数据} + {PT: 大类} → 输出:(富化行 list, 统计 Counter)。
+
+    每行补:asin(提不出为 None)、品牌占用键、大类、大类来源、渠道、是否已发布。
+    大类主路取在线 PT(沃尔玛认过的),兜底取产品审核 PT——两条来源分开计数,
+    因为兜底那部分可能是 LLM 推断的(pt_source),开新类目时不能当实证用。
+    """
+    rows, st = [], Counter()
+    for it in items:
+        store, sku, pt, published = (list(it) + [None] * 4)[:4]
+        st["online"] += 1
+        asin = sku_asin.extract_asin(sku)
+        if asin is None:
+            st["no_asin"] += 1
+            st[f"form_{sku_asin.classify(sku)}"] += 1
+        m = meta.get(asin) if asin else None
+        if asin and m is None:
+            st["asin_not_in_products"] += 1
+        item_pt = (pt or "").strip()
+        prod_pt = ((m or {}).get("walmart_pt") or "").strip()
+        cat, src = pt2cat.get(item_pt), "item"
+        if not cat:
+            cat, src = pt2cat.get(prod_pt), "product"
+        if not cat:
+            src = None
+            st["no_category"] += 1
+        else:
+            st[f"cat_from_{src}"] += 1
+        key = bk.brand_key((m or {}).get("brand"),
+                           (m or {}).get("manufacturer")) if m else None
+        if m and key is None:
+            st["no_brand"] += 1
+        ch = ((m or {}).get("fulfillment") or "").strip().upper() or None
+        if ch and ch not in store_targets.CHANNELS:
+            st["channel_weird"] += 1
+        rows.append({"store": store, "sku": sku, "asin": asin,
+                     "brand_key": key, "category": cat, "cat_source": src,
+                     "channel": ch, "pt": item_pt or prod_pt or None,
+                     "pt_source": (m or {}).get("pt_source"),
+                     "published": (published or "").upper() == "PUBLISHED"})
+    return rows, st
+
+
+def cross_store(rows, field):
+    """输入:富化行 + 键名('asin'/'brand_key')→ 输出:跨店冲突
+    [(键, {店: 件数})],按 涉及店铺数 → 总件数 → 键名 三级降序(键名升序)。
+
+    三级排序是为了**可复现**:样例只打印前 N 条,排序不稳定时两次跑给所有者
+    看的是不同的冲突。只看在线行——占用台账还不存在,存量冲突只能从观测看出来。
+    """
+    idx = defaultdict(Counter)
+    for r in rows:
+        v = r.get(field)
+        if v:
+            idx[v][r["store"]] += 1
+    out = [(k, dict(c)) for k, c in idx.items() if len(c) > 1]
+    out.sort(key=lambda kv: (-len(kv[1]), -sum(kv[1].values()), str(kv[0])))
+    return out
+
+
+def store_profiles(rows):
+    """输入:富化行 → 输出:{店: {n, published, categories, channels, cat_src}}。"""
+    prof: dict[str, dict] = {}
+    for r in rows:
+        p = prof.setdefault(r["store"], {
+            "n": 0, "published": 0, "categories": Counter(),
+            "channels": Counter(), "cat_src": Counter()})
+        p["n"] += 1
+        p["published"] += 1 if r["published"] else 0
+        p["categories"][r["category"] or UNCLASSIFIED] += 1
+        p["channels"][r["channel"] or UNKNOWN_CHANNEL] += 1
+        p["cat_src"][r["cat_source"] or "none"] += 1
+    return prof
+
+
+def real_cats(p) -> list:
+    """输入:店铺画像 → 输出:真实大类名列表(剔除未归类占位)。
+
+    筛选/排序/展示三处共用同一个定义——曾经三处各写一遍表达式,
+    排序把"(未归类)"也数进去,截断后最碎的店反而被挤出样例。
+    """
+    return [c for c in p["categories"] if c != UNCLASSIFIED]
+
+
+def channel_mismatch(prof, cfg):
+    """输入:店铺画像 + 限额表配置 → 输出:[(店, 限制渠道, 不符件数, 分布)]。
+
+    只对**填了配送限制**的店对拍;**白名单判定**:只有渠道确实是另一个已知
+    值(FBA↔FBM)才算不符。采集没采到、或采出第三种值,都不算不符——
+    把"没采到"算成"货不对"会让无辜商品进下架清单;第三种值恒高说明采集侧
+    is_fba 解析坏了,那是要修采集,不是要下架商品(该计数由调用方单列)。
+    """
+    out = []
+    for store, p in prof.items():
+        want = (cfg.get(store) or {}).get("channel")
+        if not want:
+            continue
+        bad = sum(n for ch, n in p["channels"].items()
+                  if ch in store_targets.CHANNELS and ch != want)
+        if bad:
+            out.append((store, want, bad, dict(p["channels"])))
+    out.sort(key=lambda x: (-x[2], x[0]))
+    return out
+
+
+def _fmt_counter(c: Counter, top=4) -> str:
+    return ", ".join(f"{k}×{n}" for k, n in c.most_common(top))
+
+
+def suggest_categories(prof, cfg, top=2):
+    """输入:店铺画像 + 配置 → 输出:[(店, 建议类目列表, 在线件数分布, 已填值)]。
+
+    所有者口径(2026-08-15):**超 2 类目的店保留在线数量最多的两类**。
+    本函数只出建议,不写任何地方——所有者填进飞书「类目1/2/3」三列,
+    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍"填的 vs
+    实际最多的"是否一致。
+    """
+    out = []
+    for store, p in sorted(prof.items()):
+        ranked = [(c, n) for c, n in p["categories"].most_common()
+                  if c != UNCLASSIFIED]
+        if not ranked:
+            continue
+        out.append((store, [c for c, _ in ranked[:top]], ranked,
+                    list((cfg.get(store) or {}).get("categories") or [])))
+    return out
+
+
+def channel_offenders(rows, cfg):
+    """输入:富化行 + 配置 → 输出:不符渠道的**逐行**清单(给人去下架)。
+
+    与 `channel_mismatch` 的计数同口径(白名单:只有确实是另一个已知渠道
+    才算不符),但输出到 SKU 级——"存在不符 9 件"没法照着做,一行行的
+    店铺/SKU/ASIN/渠道才行。只列已发布行:未发布的下架没有意义。
+    """
+    out = []
+    for r in rows:
+        if not r["published"]:
+            continue
+        want = (cfg.get(r["store"]) or {}).get("channel")
+        ch = r["channel"]
+        if want and ch in store_targets.CHANNELS and ch != want:
+            out.append(r)
+    out.sort(key=lambda r: (r["store"], r["sku"]))
+    return out
+
+
+def resolve_conflicts(rows, sales, field):
+    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名
+    → 输出:[(键, 保留店, 保留店销量, [(店, sku, asin, 销量, 金额, 判定)])]。
+
+    所有者口径(2026-08-15):**同品牌/同 ASIN 跨店的,留销量大的店**。
+    销量按该店该键名下**全部在线 SKU 的订单金额**合计;
+    打平顺序:金额 → 单量 → 在线件数 → 店名(全打平也要给确定答案,
+    否则同一份数据两次跑给出两份不同的下架清单)。
+    **零销量组单列标记**:两边都没卖过时"留销量大的"无从判起,
+    这类必须让人看见,不能悄悄按店名字典序决定谁生谁死。
+    """
+    groups: dict = defaultdict(list)
+    for r in rows:
+        v = r.get(field)
+        if v:
+            groups[v].append(r)
+    out = []
+    for key, items in groups.items():
+        by_store: dict[str, dict] = {}
+        for r in items:
+            o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
+            st = by_store.setdefault(r["store"], {"orders": 0, "gmv": 0.0,
+                                                  "items": 0})
+            st["orders"] += o
+            st["gmv"] += float(g)
+            st["items"] += 1
+        if len(by_store) < 2:
+            continue
+        ranked = sorted(by_store.items(),
+                        key=lambda kv: (-kv[1]["gmv"], -kv[1]["orders"],
+                                        -kv[1]["items"], kv[0]))
+        keep = ranked[0][0]
+        tie = all(v["gmv"] == 0 and v["orders"] == 0 for _, v in ranked)
+        detail = []
+        for r in sorted(items, key=lambda r: (r["store"], r["sku"])):
+            s = by_store[r["store"]]
+            detail.append((r["store"], r["sku"], r["asin"] or "",
+                           s["orders"], round(s["gmv"], 2),
+                           "保留" if r["store"] == keep else "下架"))
+        out.append((key, keep, ranked[0][1], detail, tie))
+    # 涉及店铺数多、销量大的排前面:人先处理影响面大的
+    out.sort(key=lambda x: (-len(x[3]), -x[2]["gmv"], str(x[0])))
+    return out
+
+
+# ── 取数 ────────────────────────────────────────────────────────────────
+
+def _fetch_meta(cur, asins: list[str], with_channel: bool) -> dict:
+    sql = _SQL_META if with_channel else _SQL_META_NO_CHANNEL
+    out: dict[str, dict] = {}
+    for i in range(0, len(asins), _CHUNK):
+        cur.execute(sql, (asins[i:i + _CHUNK],))
+        for asin, brand, manu, pt, src, ful in cur.fetchall():
+            out[asin] = {"brand": brand, "manufacturer": manu,
+                         "walmart_pt": pt, "pt_source": src, "fulfillment": ful}
+    return out
+
+
+def _row(cur, sql) -> dict:
+    cur.execute(sql)
+    return dict(zip([d[0] for d in cur.description], cur.fetchone()))
+
+

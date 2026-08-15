@@ -5,9 +5,11 @@
 > 用来回答"当初为什么这么定""这条为什么不做",**不作为实现依据**。
 > 两部分冲突时一律以第一部分为准。
 >
-> **当前状态(2026-08-15)**:A0 数据接线完成/撤销收口,A0.5 审计工作流
-> (`alloc_audit`)代码就绪待生产首跑;A1 占用台账、A1.5 订单 ASIN 归一、
-> A2 引擎待动工(§十)。
+> **当前状态(2026-08-15)**:A0 收口;A0.5 审计**生产首跑完成**(实测见
+> §十一.1)并产出四份处置清单;**A1 占用台账代码就绪**(claims 表 +
+> services/claims + store_release + alloc_backfill + list_new 占用闸),
+> 待所有者填类目三列、处理清单后生产回填;A1.5 订单 ASIN 归一与 A2 引擎
+> 待动工(§十)。
 >
 > 立案 2026-08-07;历次校准 08-12(四外部仓库摸底)、08-12 晚、08-13、
 > 08-15(main 迁入审核系统与类目映射后的七路调研 + 对抗式审查)。
@@ -52,7 +54,7 @@
 | 1 | **大类目定义** | = `catalog.risk_product_types.category`(飞书「沃尔玛类目」表经 risk_sync 日更)。**2026-08-15 P3 实测:与 `audit.walmart_pt_meta` 两本 7,008 行完全一致(差集 0、大类取值不一致 0),漂移担忧解除**;大类取值域 **26 个**(不是设计稿写的 27)(08-07 定,08-15 实测校准) |
 | 1a | **店铺准入大类的权威** | = 限额表「**类目1 / 类目2 / 类目3**」三列(所有者建列 2026-08-15)。**填了就只准入填的那几个;三列都空 = 该店不限制类目**。判定唯一出处 `services/store_targets.allowed()`。⇒ **不建 `catalog.store_categories` 表、引擎永不自行开类目**(与配送限制同一治理方式:改类目 = 改表格一格)。首轮由 `alloc_audit` C1 给每店"在线数量最多的两类"建议,所有者填表 |
 | 2 | **店铺状态** | 从库读 `ops.store_kpi_daily.store_status`(每店最新一行)。**必须再 AND `store ∈ services/stores.load_stores()`**——凭证表已删的店 KPI 行永远停在最后一次 ACTIVE,状态闸单独拦不住(08-12 定,08-15 补)。无记录/状态为空 = fail-open 视同 ACTIVE(全仓统一) |
-| 3 | **PT 与类目可信度** | 分配的类目约束用 `products.walmart_pt` → 大类,**不分 pt_source**;**唯独"给店开新大类"**(store_categories 1→2)要求该 PT 为 `walmart_confirmed`(或 runs 最新一条 ∈ walmart_confirmed/historical_confirmed/map_node)。理由见 §二第三条(08-15) |
+| 3 | **PT 与类目可信度** | 分配的类目约束用 `products.walmart_pt` → 大类,**不分 pt_source**。~~"开新大类须实证 PT"~~ **已作废**(08-15 晚:类目档案改人工填表,引擎不开类目,门槛无处可施;实测 84% 候选是推断 PT,卡门槛会把空店全卡死)。pt_source 仍随 claims 快照存档,供事后追溯 |
 | 4 | **配送方式权威** | = 限额表「配送限制」列(填 fba/fbm,`registry.RETIRE_LIMITS.fields.channel_limit`)。**未填 = 不接自由流分配**,报告点名补填;不建表、不做引擎锁定(08-13) |
 | 5 | **品牌归一化** | `services/brand_key`(唯一出处):`" ".join(raw.lower().split())` + 占位符表(phase0 20 项 ∪ mp_mapper `unknown`);brand 是占位符时用 manufacturer 兜底;两者皆占位符 = 真·无品牌**不占用**。**不做别名表**(08-13 定,08-15 落地) |
 | 6 | **分配单元** | 品牌组(不是单品)——品牌排他 ⇒ 同品牌必同店 |
@@ -84,7 +86,7 @@
 | 店铺配额·健康度 | ❌ | KPI 8 率有列但**阈值零实现**,且 NULL 两义(无合规数据 vs 拉取失败)不可区分 ⇒ **v1 降为二值(ACTIVE=1)**,8 率只进方案表展示列,`need_i` 改二项归一 |
 | 店×类目销量 | ⚠ | `order_lines(store,sku) ⋈ walmart_items(store,sku)` → PT → 大类;**sku 大小写敏感**;必须显式过滤在册店(死店冻结行查得出来) |
 | 产品/品牌/类目全局销量 | ❌ | `order_lines` **无 asin 列**,sku→asin 只有 Python 实现 ⇒ 见 §十 A1.5 前置批次 |
-| 占用落点 | ❌ | `claims` / `store_categories` / `allocation_runs` / `allocation_items` 四表零存在,`services/claims` 与 `store_release` 未写(A1) |
+| 占用落点 | ✅ | `catalog.claims` + `services/claims`(排他由部分唯一索引保证)+ `store_release` + `alloc_backfill` 均已就绪(2026-08-15);`allocation_runs/items` 随 A2 建 |
 | 上架表写入 | ⚠ | 现有五个写函数**全部按行号定点写,无一能新建行**——追加要照 `services/maint_sheet.append_records` 的水位模式另写;且写列权责与审核批次 D 冲突(§九.2) |
 
 ## 五、占用台账设计
@@ -122,8 +124,11 @@
 2. **暂停 = 什么都不做**,占用天然保持;SUSPENDED 店的在线行仍计入冲突统计。
 3. **终止 = 显式释放**:workflow `store_release --store X`(dangerous,默认
    dry-run 列清单):该店全部 active 占用置 released(reason=terminated)、
-   类目档案清空、**同步把该店 walmart_items 行标 missing_since**(§九.4)、
-   进 product_events 留痕。渠道是飞书配置,不归它管。
+   **同步把该店 walmart_items 行标 missing_since**(§九.4;`-p mark_offline=0`
+   可关)。类目与渠道是飞书配置,不归它管。
+   **留痕在 claims 表自身**(released 行 + reason + 时间),不写 product_events
+   ——事件账本的入账边界是"产品生死与观测事实",占用是决策,两边各记一份
+   反而要维护两套口径。
 4. **手动个别释放**:同 workflow `--brand` / `--asin` 精确释放。
    除以上两条显式路径外无任何自动释放。
 5. **TERMINATED 只触发"可释放资格"**:审计发现"已终止仍有 active 占用"→
@@ -305,8 +310,8 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | **A0 数据接线** | 产品全量入库 / 审核结论 / 订单历史 / 店铺目标四列 | ✅ 收口(见下) |
-| **A0.5 存量审计** | `alloc_audit`:P 探针 4 项 + A 审计 7 项 | ✅ **代码就绪 2026-08-15,待生产首跑** |
-| **A1 占用台账** | claims + store_categories + services/claims + list_new 占用闸 + store_release(含标 missing_since)+ 审计对拍 | ⬜ 待动工 |
+| **A0.5 存量审计** | `alloc_audit`:P 探针 4 项 + A 审计 7 项 + C 处置清单 4 份 | ✅ **生产首跑完成 2026-08-15**(实测见 §十一.1) |
+| **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
 | **A1.5 订单 ASIN 归一** | `order_lines` 加 asin 列 + `order_asin_normalize` 工作流(照 `sku_normalize` 先例:只补 NULL、numeric 走 item_id 倒查、查不到留 NULL 不猜) | ⬜ **A2 硬前置** |
 | **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | ⬜ 待 A1/A1.5 |
 | **A3 学习型** | 权重离线校准(远景) | ⬜ 快照从 A2 第一天就落 |

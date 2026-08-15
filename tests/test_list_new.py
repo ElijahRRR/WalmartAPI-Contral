@@ -69,7 +69,8 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         {"T_OFF"}, {}, {"B0LISTED01"},
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
-        {"banned_pts": {"BannedPT"}, "brands": set()}))
+        {"banned_pts": {"BannedPT"}, "brands": set()},
+        {}, {}))                       # 占用台账为空 = 占用闸恒放行
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
@@ -214,7 +215,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}))
+        {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -245,7 +246,7 @@ def test_quota_slices_after_filters(monkeypatch):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}))
+        {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
     monkeypatch.setattr(ln, "_load_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -359,7 +360,8 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
             _sheet_row(3)]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
-        set(), {}, set(), {}, set(), {"banned_pts": set(), "brands": set()}))
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
@@ -368,3 +370,45 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: {})
     out = ln.run({"execute": False})
     assert "待上架 1" in out          # PROHIBITED 行不领任务
+
+
+def test_claim_gates_block_other_stores_only(monkeypatch):
+    """占用闸:别店占着就拦,自家占着放行,真·无品牌不受品牌排他管。
+
+    与快照闸的分工:快照闸看"现在在不在架",占用闸看"归谁"——商品下架后
+    快照闸失守而占用闸仍在,这正是所有者要的"店没停运就不许别店碰"。
+    """
+    rows = [
+        _sheet_row(2, asin="B0OWNED001"),                  # 产品被别店占
+        _sheet_row(3, asin="B0MINE0001"),                  # 自家占着 → 放行
+        _sheet_row(4, asin="B0BRANDED1"),                  # 品牌被别店占
+        _sheet_row(5, asin="B0NOBRAND1"),                  # 无品牌 → 不受品牌闸管
+    ]
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()},
+        {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
+        {"acme": "OTHER"}))                                 # 品牌占用
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 0.0,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda asins: {
+        "B0MINE0001": {**base, "asin": "B0MINE0001", "brand": "beta"},
+        "B0BRANDED1": {**base, "asin": "B0BRANDED1", "brand": "Acme"},
+        "B0NOBRAND1": {**base, "asin": "B0NOBRAND1", "brand": "Generic"},
+    })
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    out = ln.run({"execute": False})
+
+    assert "产品占用:已属于 OTHER" in out          # 别店占的产品被拦
+    assert "品牌占用:acme 已属于 OTHER" in out     # 别店占的品牌被拦
+    # 自家占的产品、以及无品牌(Generic 是占位符,不参与品牌排他)的,
+    # 都要走到待提交——占用闸只拦"别的店占着"的
+    assert "T1 B0MINE0001 定价" in out
+    assert "T1 B0NOBRAND1 定价" in out
+    assert "共 2 行将进入" in out

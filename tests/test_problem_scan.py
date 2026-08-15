@@ -371,16 +371,21 @@ def test_summarize_counts_the_rows_that_actually_land():
          (那支 continue 前没有 n['delete'] += 1),照它报会少一大截。
     """
     allrows = [
-        {"store": "T1", "sku": "S1", "action": "delete", "category": "B"},
-        {"store": "T1", "sku": "S2", "action": "delete", "category": None},
-        {"store": "T1", "sku": "S3", "action": "retire", "category": "B"},
-        {"store": "T2", "sku": "S4", "action": "relist", "category": "A"},
+        {"store": "T1", "sku": "S1", "action": "delete", "category": "B",
+         "source": "scan"},
+        {"store": "T1", "sku": "S2", "action": "delete", "category": None,
+         "source": "audit"},
+        {"store": "T1", "sku": "S3", "action": "retire", "category": "B",
+         "source": "scan"},
+        {"store": "T2", "sku": "S4", "action": "relist", "category": "A",
+         "source": "scan"},
     ]
     audit_rows = [allrows[1]]
     n = {"fallback": 0, "stage": 1, "inflight": 2, "inactive": 3, "delete": 1}
     head = _summ(allrows, audit_rows, n, 99)
     # 删除报 2(含 retire 之外的全部 delete 行),不是 n['delete'] 的 1
     assert "删除 2" in head[0] and "反补 1" in head[0]
+    assert "问题商品 99 行" in head[0]
     assert "顽固停用 1" in head[0]
     assert "其中审核判拒 1" in head[0]
     # 分店明细按建议行重建,audit 来源没有 category → 显示 '-'
@@ -399,3 +404,32 @@ def test_count_open_is_not_the_write_count():
     from services import dispositions
     assert "SELECT count(*) FROM ops.dispositions WHERE status = %s::text" \
         in __import__("inspect").getsource(dispositions.count_open)
+
+
+def test_summarize_dedupes_like_the_unique_index():
+    """⚠ 摘要必须按 (店铺,SKU,动作) 去重(2026-08-14 第二次修)。
+
+    同一个 SKU 被 scan 与 audit 双双建议删除时,建议行数组里是两条,但落库被
+    部分唯一索引合成一条 —— 不去重就会报 489 而执行件只领到 440,两个摘要
+    对不上账,分店明细里还会看到同一个 SKU 出现两次(生产实遇:
+    A121许家蕴 的 B094F29JB6 在删除样本里出现两遍)。
+
+    去重口径与 upsert 一致:**后写的赢**(executemany 按序,audit 排在 scan
+    之后,所以 category 被 audit 的 None 覆盖)。摘要如实显示,不美化。
+    """
+    same = ("T1", "SDUP", "delete")
+    allrows = [
+        {"store": same[0], "sku": same[1], "action": same[2],
+         "category": "A", "source": "scan"},
+        {"store": same[0], "sku": same[1], "action": same[2],
+         "category": None, "source": "audit"},
+        {"store": "T1", "sku": "SOLO", "action": "delete",
+         "category": "B", "source": "scan"},
+    ]
+    n = {"fallback": 0, "stage": 0, "inflight": 0, "inactive": 0}
+    head = scan._summarize(allrows, [allrows[1]], n, 3)
+    assert "删除 2" in head[0]          # 不是 3
+    assert "其中审核判拒 1" in head[0]
+    t1 = [l for l in head if l.startswith("  T1")][0]
+    assert t1.count("SDUP") == 1        # 分店明细里也只出现一次
+    assert "-:1" in t1 and "B:1" in t1  # 后写的赢 ⇒ SDUP 的 category 是 None

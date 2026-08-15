@@ -250,13 +250,26 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
     ⚠ **按建议行统计,不按 plan() 的桶**:`n['delete']` 不含顽固双击那批
     (那支 continue 前没有 `n['delete'] += 1`),照它报会少一大截 —— 本轮实测
     plan 报 195、实际 delete 桶 217。
+
+    ⚠ **还要按 (店铺,SKU,动作) 去重**(2026-08-14 第二次修):同一个 SKU 被
+    scan 与 audit 双双建议删除时,allrows 里是两条,但落库被部分唯一索引合成
+    一条 —— 不去重就会报 489 而执行件只领到 440,两个摘要对不上账,分店明细里
+    还会看到同一个 SKU 出现两次。
+    去重口径与 upsert 一致:**后写的赢**(executemany 按序执行,audit 排在
+    scan 之后,所以 category 会被 audit 的 None 覆盖 —— 摘要如实显示这一点,
+    不美化)。
     """
+    merged: dict[tuple, dict] = {}
+    for r in allrows:
+        merged[(r["store"], r["sku"], r["action"])] = r    # 后写的赢
+    allrows = list(merged.values())
     by_act: dict[str, int] = {}
     for r in allrows:
         by_act[r["action"]] = by_act.get(r["action"], 0) + 1
     out = [f"problem_scan:问题商品 {n_items} 行 → 建议 反补 "
            f"{by_act.get('relist', 0)},删除 {by_act.get('delete', 0)}"
-           f"(其中审核判拒 {len(audit_rows)},反补满额转删 {n['fallback']}),"
+           f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}"
+           f",反补满额转删 {n['fallback']}),"
            f"顽固停用 {by_act.get('retire', 0)};"
            f"Stage 排除 {n['stage']},在途/待观测跳过 {n['inflight']},"
            f"非 ACTIVE 店跳过 {n['inactive']}"]

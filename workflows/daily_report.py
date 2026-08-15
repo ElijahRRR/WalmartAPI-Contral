@@ -409,6 +409,18 @@ def _board_cell(field: str, v):
     return str(v)
 
 
+_STORE_COL = resources.KPI_BOARD_OVERVIEW.columns.index("store")
+
+
+def _by_store(rows):
+    """输入:看板行(元组序列)→ 输出:按店铺重排后的列表(Python 稳定排序)。
+
+    稳定 = 店内保留调用方给的次序(历史页即 SQL 的日期降序),不用在这里
+    再排一次日期,也就不用关心 data_date 是 date 还是 None。
+    """
+    return sorted(rows, key=lambda r: stores_svc.sort_key(r[_STORE_COL]))
+
+
 def _board_matrix(rows) -> list[list]:
     cols = resources.KPI_BOARD_OVERVIEW.columns
     return [[_board_cell(f, v) for f, v in zip(cols, r)] for r in rows]
@@ -442,18 +454,27 @@ def _phase_board(history_days: int) -> str:
     (所有者定稿 2026-08-15,与「店铺」列提到最左同一件事):历史页店内再按
     日期降序,同店的近 N 天连成一段,肉眼可直接看单店趋势——旧的
     `data_date DESC, store` 是按天横切,同一家店被打散在 90 个日期块里。
-    旧「店铺KPI」表 72 张分页停更归档(所有者定稿 2026-08-08),影刀输入除外
-    (yingdao=1 仍写旧总览 A:H——影刀 RPA 内部读旧表,切换需改 RPA 后换 env)。
+
+    ⚠ 店铺序由 `stores_svc.sort_key` 在 Python 里定,**不用 SQL ORDER BY**:
+    PG 的 collation 会忽略中文主排序权重,把「谭总1」当「1」排(见该函数注释)。
+    SQL 只负责日期降序,店铺序靠 Python 稳定排序叠上去。
+
+    旧「店铺KPI」表 72 张分页停更归档(所有者定稿 2026-08-08);影刀输入已改
+    本地 input.json,本仓不再写那张表。
     """
     cols = ", ".join(resources.KPI_BOARD_OVERVIEW.columns)
     with db.pg_conn() as conn, conn.cursor() as cur:
+        # DISTINCT ON 要求 ORDER BY 以 store 打头,这里只用来取"每店最新一行",
+        # 不作展示序——展示序在下面重排
         cur.execute(f"SELECT DISTINCT ON (store) {cols} FROM ops.store_kpi_daily"
                     " ORDER BY store, data_date DESC")
         overview = cur.fetchall()
         cur.execute(f"SELECT {cols} FROM ops.store_kpi_daily"
                     " WHERE data_date >= current_date - %s"
-                    " ORDER BY store, data_date DESC", (history_days,))
+                    " ORDER BY data_date DESC", (history_days,))
         history = cur.fetchall()
+    overview = _by_store(overview)
+    history = _by_store(history)        # 稳定排序:店内保留 SQL 的日期降序
     n1 = feishu.sheet_overwrite(resources.KPI_BOARD_OVERVIEW,
                                 [_BOARD_HEADER] + _board_matrix(overview))
     n2 = feishu.sheet_overwrite(resources.KPI_BOARD_HISTORY,

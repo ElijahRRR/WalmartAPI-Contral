@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timezone
 
 from registry import paths
+from services import stores
 
 logger = logging.getLogger("services.yingdao")
 
@@ -61,7 +62,7 @@ def write_input(rows: list[dict]) -> tuple[int, int]:
             dropped += 1
             continue
         out.append({f: ("" if r.get(f) is None else str(r[f])) for f in _INPUT_FIELDS})
-    out.sort(key=lambda r: r["store"])
+    out.sort(key=lambda r: stores.sort_key(r["store"]))     # 与看板同一店铺序
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
                "count": len(out), "stores": out}
     path.parent.mkdir(parents=True, exist_ok=True)

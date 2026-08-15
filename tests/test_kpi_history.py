@@ -119,11 +119,35 @@ def test_old_kpi_sheet_is_read_only_now():
     assert "KPI_SHEET" not in src
 
 
+def test_store_sort_key_is_not_the_db_collation():
+    """2026-08-15 生产实见:PG collation 忽略中文主排序权重,把「谭总1」当「1」排,
+    排出 谭总1…谭总8 → 81刘何秀 → 82杨乾良 → 谭总9 → A085。所以排序归代码管。
+
+    所有者要的序:字母开头 → 数字开头 → 中文,组内按数字大小自然序。
+    """
+    from services import stores as stores_svc
+    got = sorted(["谭总1", "谭总2", "谭总8", "81刘何秀", "82杨乾良", "谭总9",
+                  "A085朱丽霖", "A089王译尉", "A090徐本傲", "A091张晓康",
+                  "谭总10", "谭总11"], key=stores_svc.sort_key)
+    assert got == ["A085朱丽霖", "A089王译尉", "A090徐本傲", "A091张晓康",
+                   "81刘何秀", "82杨乾良",
+                   "谭总1", "谭总2", "谭总8", "谭总9", "谭总10", "谭总11"]
+    # 谭总10 排在 谭总9 之后 —— 纯字符串序会把它排到 谭总2 前面
+    assert stores_svc.sort_key("谭总9") < stores_svc.sort_key("谭总10")
+    # 数字按大小不按位数:A85 与 A085 同值,靠原名兜底稳定
+    assert stores_svc.sort_key("A085x")[2] == 85
+    # 无数字的店不炸,排在同前缀带号店之前
+    assert stores_svc.sort_key("总仓") < stores_svc.sort_key("总仓2")
+    assert stores_svc.sort_key("")[0] == 2 and stores_svc.sort_key(None)[3] == ""
+
+
 def test_board_pages_both_sort_by_store(monkeypatch):
     """两页都按店铺排序:总览天然一店一行,历史页店内再按日期降序。
 
-    历史页若按 `data_date DESC, store` 排,同一家店会被打散在 90 个日期块里,
-    首列提到店铺就白提了 —— 排序和列序是同一个诉求的两半。
+    历史页若按日期横切,同一家店会被打散在 90 个日期块里,首列提到店铺就白提了
+    —— 排序和列序是同一个诉求的两半。
+    ⚠ 店铺序**必须由 Python 排**(见 stores.sort_key),SQL 只负责日期降序;
+    这条用例同时钉住"历史 SQL 不许再自己按 store 排"。
     """
     import contextlib
 
@@ -131,13 +155,19 @@ def test_board_pages_both_sort_by_store(monkeypatch):
     from workflows import daily_report as dr
 
     sqls: list[str] = []
+    rows = {
+        "overview": [("谭总9",), ("81刘何秀",), ("A085朱丽霖",), ("谭总10",)],
+        # 历史:SQL 已按日期降序返回,店内次序要被稳定排序保住
+        "history": [("谭总9", "d3"), ("A085朱丽霖", "d3"),
+                    ("谭总9", "d2"), ("A085朱丽霖", "d1")],
+    }
 
     class _Cur:
         def execute(self, sql, params=None):
             sqls.append(" ".join(sql.split()))
 
         def fetchall(self):
-            return []
+            return rows["overview" if len(sqls) == 1 else "history"]
 
         def __enter__(self):
             return self
@@ -149,17 +179,28 @@ def test_board_pages_both_sort_by_store(monkeypatch):
         def cursor(self):
             return _Cur()
 
+    written = {}
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([_Conn()])))
-    monkeypatch.setattr(dr.feishu, "sheet_overwrite", lambda sheet, rows: len(rows))
+    monkeypatch.setattr(dr, "_board_matrix", lambda rs: list(rs))
+    def _capture(sheet, rs):
+        written[sheet.name] = rs
+        return len(rs)
+
+    monkeypatch.setattr(dr.feishu, "sheet_overwrite", _capture)
     monkeypatch.setattr(dr.feishu, "sheet_set_formatter", lambda sheet, items: len(items))
     dr._phase_board(90)
     overview_sql, history_sql = sqls
     assert "DISTINCT ON (store)" in overview_sql
-    assert overview_sql.endswith("ORDER BY store, data_date DESC")
-    assert history_sql.endswith("ORDER BY store, data_date DESC")
-    # 取的列就是 registry 列序,首列店铺次列日期
     assert "SELECT store, data_date, seller_name" in history_sql
+    assert history_sql.endswith("ORDER BY data_date DESC")   # store 不进 SQL
+    # 总览:按 sort_key 重排(A → 数字 → 中文,谭总9 在 谭总10 前)
+    assert [r[0] for r in written["KPI看板-总览"][1:]] == [
+        "A085朱丽霖", "81刘何秀", "谭总9", "谭总10"]
+    # 历史:店铺归堆,店内保留 SQL 的日期降序
+    assert written["KPI看板-历史"][1:] == [
+        ("A085朱丽霖", "d3"), ("A085朱丽霖", "d1"),
+        ("谭总9", "d3"), ("谭总9", "d2")]
 
 
 def test_extract_settlement_legacy_shape():

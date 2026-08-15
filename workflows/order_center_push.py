@@ -27,7 +27,7 @@ from decimal import Decimal
 
 from api import feishu
 from registry import db, resources
-from services import kpi
+from services import kpi, order_lines
 
 DANGEROUS = False
 
@@ -42,6 +42,11 @@ SELECT order_line_id, store, po_id, line_number, sku, product_name, qty,
        country, updated_at
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %s)
+  -- 历史导入的残缺行不推飞书(所有者定稿 2026-08-15):它们只有下单时间/店铺/
+  -- PO/SKU/品名/数量/金额,没有物流地址与审核结论,推过去运营看到的是半截行。
+  -- 用 IS DISTINCT FROM 而非 <>:source 绝大多数是 NULL,`<> '历史数据'` 对
+  -- NULL 求值为 NULL ⇒ 会把**全部 API 行**一起过滤掉。
+  AND source IS DISTINCT FROM %s
 """
 
 _RETURNS_SQL = """
@@ -341,7 +346,7 @@ def _push_sales(days: int, reconcile: bool = False) -> tuple[str, set[str]]:
     t = resources.ORDER_SALES
     f = t.fields
     desired = {}
-    for r in _fetch(_SALES_SQL, (days,)):
+    for r in _fetch(_SALES_SQL, (days, order_lines.HISTORY_SOURCE)):
         desired[r["order_line_id"]] = {
             f.key: r["order_line_id"], f.order_date: _cell(r["order_date"]),
             f.store: r["store"], f.po_id: r["po_id"],

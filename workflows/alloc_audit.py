@@ -166,12 +166,10 @@ def run(params: dict) -> str:
     # 不判类目、不占品牌与产品、其在线商品不与别人算冲突——所有者定稿
     # 2026-08-15。**它们的订单销量不受影响**(排除的是归属不是数据)
     out_of_scope = {s for s in prof_all if sv.is_excluded(s)}
-    # 非 ACTIVE 的店**当作全新店**(定稿 2026-08-15 晚):不持有占用 ⇒ 其在线行
-    # 也就拦不住别人,不进冲突。**这不等于不参与分配**——那个开关是限额表
-    # 「单店最大在线数」填 0(store_targets.accepts_allocation),与状态无关
-    dormant = {s for s in prof_all
-               if sv.is_dormant(status.get(s)) and s not in out_of_scope}
-    skipped = frozen | out_of_scope | dormant
+    # ⚠ **店铺状态不参与筛行**:SUSPENDED 的店占用保持、在线行照常计入冲突
+    # (§六.2「暂停不释放」)。停用只是暂时不给它分新货,不代表别店可以来拿
+    # 它的品牌与产品 —— 要某店不接新货是「单店最大在线数」填 0,与状态无关
+    skipped = frozen | out_of_scope
     live_rows = [r for r in rows if r["store"] not in skipped]
     oos_rows = sum(prof_all[s]["n"] for s in out_of_scope)
     prof = sv.store_profiles(live_rows)
@@ -204,11 +202,8 @@ def run(params: dict) -> str:
     # 与店铺状态无关。三态分开数:填 0 / 填了正数 / 还没填
     opted_out = sorted(s for s in scope
                        if store_targets.accepts_allocation(cfg.get(s)) is False)
-    # 报告口径按 scope 数(含没有在线行的空店);`dormant` 只用来筛行,
-    # 所以按 prof_all 算就够 —— 没有行的店没有行可筛
-    non_active = sorted(s for s in set(scope) | set(prof_all)
-                        if sv.is_dormant(status.get(s))
-                        and not sv.is_excluded(s))
+    non_active = sorted(s for s in prof_all
+                        if (status.get(s) or "ACTIVE") != "ACTIVE")
     filtered = (sorted((set(registered) & set(prof_all)) - live_api)
                 if registered is not None and live_api is not None else [])
     order_miss = ([(s, c, h) for s, c, h in order_stores if s not in registered]
@@ -273,11 +268,6 @@ def run(params: dict) -> str:
         body.append(("已排除", f"规划外 {len(out_of_scope)} 家 {n(oos_rows)} 行"
                                f"({'、'.join(sorted(out_of_scope)[:6])})"
                                f" —— 不占用、不算冲突,**销量仍计入**"))
-    if dormant:
-        body.append(("已排除", f"非 ACTIVE {len(dormant)} 家"
-                               f"({'、'.join(sorted(dormant)[:6])})"
-                               f" —— **当全新店**:不占用、不算冲突;"
-                               f"但**照常参与分配**(以空店身份)"))
     if frozen:
         body.append(("已排除", f"不在册店冻结 {len(frozen)} 家"
                                f"({'、'.join(sorted(frozen)[:6])})"
@@ -318,8 +308,8 @@ def run(params: dict) -> str:
             f"{s}({len(sv.real_cats(p))} 类)" for s, p in over[:3])))
     if non_active:
         body.append(("非 ACTIVE", f"{len(non_active)} 家",
-                     "当全新店:回填不给它建占用,在线行不进冲突;"
-                     "恢复后天然以空店身份进梯队 2"))
+                     "SUSPENDED,**占用按设计保持不动**;"
+                     "要它暂时不接新货,把「单店最大在线数」填 0"))
     if cfg:
         body.append(("不参与分配", f"{len(opted_out)} 家",
                      ("「单店最大在线数」填 0 —— 所有者的开关,核对是不是这几家:"
@@ -387,10 +377,10 @@ def run(params: dict) -> str:
          "店铺状态", "缺配置列", "近窗销售额"],
         [(s,
           # 「占用内」= 它的在线商品占不占货位。与「参与分配」是两回事:
-          # 非 ACTIVE 店当全新店(不占用)但照样接货
+          # SUSPENDED 店占用照旧保持(占用内=是),但可以把它的最大在线数
+          # 填 0 让它暂时不接新货(参与分配=否)
           "否(规划外)" if s in out_of_scope else
-          ("否(不在册)" if s in frozen else
-           ("否(非ACTIVE·当全新店)" if s in dormant else "是")),
+          ("否(不在册)" if s in frozen else "是"),
           _ACCEPT[store_targets.accepts_allocation(cfg.get(s))] if cfg else "",
           "" if (cfg.get(s) or {}).get("max_online") is None
              else int(cfg[s]["max_online"]),

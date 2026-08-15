@@ -611,17 +611,6 @@ def test_category_gate_skipped_when_nobody_admits():
 
 # ── 非 ACTIVE = 当全新店;参不参与分配另有开关(所有者定稿 2026-08-15 晚)──
 
-def test_is_dormant_delegates_to_kpi_and_fails_open_on_blank():
-    """空状态 = 'unknown' = **视同在营**(口径总表 #2 全仓 fail-open)。
-
-    在这里另写一份 upper() != 'ACTIVE' 会把"没抓到状态"变成"停用",
-    而停用店的在线商品会被判成不占货位 —— 别的店于是能把它的品牌抢走。
-    """
-    assert sv.is_dormant("SUSPENDED") and sv.is_dormant("TERMINATED")
-    assert not sv.is_dormant("ACTIVE") and not sv.is_dormant("active")
-    assert not sv.is_dormant("") and not sv.is_dormant(None)   # fail-open
-
-
 def test_accepts_allocation_keeps_zero_and_unfilled_apart():
     """0 = 所有者按下"不接货";None = 还没填。压成两态会让没填的店永远分不到货。"""
     assert store_targets.accepts_allocation({"max_online": 0}) is False
@@ -643,10 +632,13 @@ def test_opted_out_store_is_not_nagged_for_the_other_columns():
     assert set(miss["在营"]) == {"配送限制", "单店最大在线数", "目标销售额", "目标订单"}
 
 
-def test_run_treats_non_active_store_as_a_brand_new_store(monkeypatch, tmp_path):
-    """SUSPENDED 店的在线行不进冲突:它当全新店、不持有占用,拦不住别人。
+def test_run_still_counts_a_suspended_store_in_conflicts(monkeypatch, tmp_path):
+    """SUSPENDED 店的在线行**照常进冲突** —— 「暂停不释放、占用保持」(§六.2)。
 
-    ⚠ 这**不是**释放 —— 回填从没给它建过占用,白纸是"没做"出来的。
+    2026-08-15 晚一度被实现成"当作全新店、不进冲突",所有者当即纠正。
+    放它出冲突等于宣布它手上的货没人占:别店可以照同一个品牌上架,而占用
+    没有自动释放,店恢复之后拿不回来。停用只是暂时不给它分新货,那件事的
+    开关是「单店最大在线数」填 0(与占用归属无关)。
     """
     cur = _FakeCur()
     cur.extra_items = [("停用店", "B0AAAA0001", "Socks", "PUBLISHED")]
@@ -655,13 +647,13 @@ def test_run_treats_non_active_store_as_a_brand_new_store(monkeypatch, tmp_path)
     _wire(monkeypatch, cur, registered={"A085", "A107", "停用店"},
           reports=tmp_path)
     out = wf.run({})
-    assert "非 ACTIVE 1 家(停用店)" in out and "当全新店" in out
-    assert "照常参与分配" in out          # 别把"当全新店"读成"不接货"
     c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
-    assert "停用店" not in c3
-    # 但它照样在店铺总览里点名,且标明是哪一种"不占用"
+    assert "停用店" in c3                       # 它参与争 B0AAAA0001 的归属
+    assert "占用按设计保持不动" in out
+    # 「占用内」= 是:停用不改变占用归属
     ov = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
-    assert "否(非ACTIVE·当全新店)" in ov
+    row = next(ln for ln in ov.splitlines() if ln.startswith("停用店,"))
+    assert row.split(",")[1] == "是"
 
 
 def test_run_reports_which_stores_opted_out_of_allocation(monkeypatch, tmp_path):

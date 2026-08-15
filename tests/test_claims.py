@@ -328,30 +328,20 @@ def _wire_bf(monkeypatch, items, status, captured):
     monkeypatch.setattr(bf.claims, "counts_by_store", lambda conn: {})
 
 
-def test_backfill_builds_no_claim_for_a_non_active_store(monkeypatch):
-    """停用店的在线商品**一条占用都不建** —— 这不是释放,是从没占过。
+def test_backfill_claims_for_a_suspended_store_too(monkeypatch):
+    """SUSPENDED 的店**照常回填占用** —— 「暂停不释放、占用保持」(§六.2)。
 
-    建了才是真麻烦:占用没有自动释放,停用店会一直攥着品牌不放,
-    而"当作全新店"要的正是它手上是白纸。
+    2026-08-15 晚一度被实现成"当作全新店、不给它建占用",所有者当即纠正。
+    那个实现有多坏值得留一条测试钉住:停用店手上的品牌与产品会变成"没人占",
+    别店一回填就抢走 —— 而占用没有自动释放,店恢复之后**拿不回来**,
+    它自己还在卖的 listing 反而会撞上别店的占用进下架清单。
+    停用只是暂时不给它分新货,那件事的开关是「单店最大在线数」填 0。
     """
     captured: list = []
     _wire_bf(monkeypatch, items=[("在营店", "B0AAAA0001", "Socks", "PUBLISHED"),
                                  ("停用店", "B0BBBB0002", "Socks", "PUBLISHED")],
              status=[("在营店", "ACTIVE"), ("停用店", "SUSPENDED")],
              captured=captured)
-    out = bf.run({"execute": True})
-    assert {r["store"] for r in captured} == {"在营店"}
-    assert "B0BBBB0002" not in {r["claim_key"] for r in captured}
-    assert "非 ACTIVE 当全新店、不建占用:1 家(停用店)" in out
-
-
-def test_backfill_fails_open_when_status_is_blank(monkeypatch):
-    """状态取不到(空)不算停用——判不准就判活,否则一次抓取故障就会让
-    在营店的品牌被判成"没人占",别的店抢走后不可撤销。"""
-    captured: list = []
-    _wire_bf(monkeypatch, items=[("在营店", "B0AAAA0001", "Socks", "PUBLISHED"),
-                                 ("停用店", "B0BBBB0002", "Socks", "PUBLISHED")],
-             status=[],                      # 一条 KPI 都没有
-             captured=captured)
     bf.run({"execute": True})
     assert {r["store"] for r in captured} == {"在营店", "停用店"}
+    assert "B0BBBB0002" in {r["claim_key"] for r in captured}

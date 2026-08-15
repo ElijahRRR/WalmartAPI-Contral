@@ -546,3 +546,26 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
 保留 14 天,完成/失败均发飞书通知。
 
 > 注:`...` 处的列清单由执行 AI 在实现对应工作流时,按旧系统实际字段补全并回写本文档。
+
+
+## catalog.audit_listing_conflicts(2026-08-14 新增)
+
+**审核结论 × 上架现状的冲突面。** 所有者要求"病历里一眼看到审核结论",
+让「审核拒了但还在架」「刚上架就被拒」一条 SQL 出来。
+
+两个标志的口径差别(**别混用**):
+
+| 标志 | 看的是 | 用途 |
+|---|---|---|
+| `rejected_still_listed` | **现状**:当前结论 reject 且商品此刻在架 | problem_scan 按它建"删除"建议 |
+| `rejected_after_listing` | **时序**:最近一次判拒晚于最近一次上架 | 上架时那道闸没拦住(或当时还没审)= **审核链漏拦线索** |
+
+⚠ 两件事,别当成一件:前者问"该不该下架",后者问"我们的闸为什么没拦住"。
+
+**为什么不能只看 product_risk**:审核事件的 `store` 是 NULL(审核不分店铺),
+所以它们进得了全局 `product_risk`,却进不了 `product_risk_store`
+(`WHERE store IS NOT NULL`)。店铺维度的问题必须 JOIN 现状表。
+
+**为什么本视图不依赖 product_risk**:`product_risk` 是 DROP+CREATE
+(列改名的历史遗留),而 PG 不允许 DROP 一个还有依赖者的视图 —— 依赖它
+等于给 `db_init` 埋一个"第二次跑就报错"的雷。所以时间线就地聚合。

@@ -113,14 +113,19 @@ ORDER BY store, data_date DESC
 
 # 审核判拒但还在架(批复 #8 要的第二个来源)。审核链说这个产品不该卖、
 # 沃尔玛后台却还挂着 —— 拆分前没有任何工作流盯着这个缺口。
-# 只取有实打实结论的:audit_status='rejected';在架 = 未缺席。
-# ⚠ 不看 published_status:审核拒的产品**正常在架**(PUBLISHED)才是最该
-# 下架的那批,恰恰不会出现在问题商品清单里。
+#
+# **判据只有一处**:catalog.audit_listing_conflicts 视图(2026-08-14 建,
+# 同时是 audit_passed/audit_rejected 事件的第一个消费方)。这里原本抄了一份
+# 等价的 JOIN,与视图两份实现迟早漂 —— 口径要改就只改视图那一处。
+# ⚠ 视图**不按 published_status 过滤**:审核拒的产品**正常在架**(PUBLISHED)
+# 才是最该下架的那批,恰恰不会出现在问题商品清单里。
+#
+# 顺带取 rejected_after_listing(先上架、后被判拒)只为在摘要里亮个数:
+# 它是**审核链漏拦**的线索,与"该不该下架"是两个问题,不影响建议本身。
 _SQL_AUDIT_REJECTED = """
-SELECT w.store, w.sku, p.asin, p.audit_reason
-FROM catalog.walmart_items w
-JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
-WHERE p.audit_status = 'rejected' AND w.missing_since IS NULL
+SELECT store, sku, asin, audit_reason, rejected_after_listing
+FROM catalog.audit_listing_conflicts
+WHERE rejected_still_listed
 """
 
 
@@ -266,7 +271,7 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
         cur.execute(_SQL_AUDIT_REJECTED)
         rows = cur.fetchall()
     out = []
-    for store, sku, asin, reason in rows:
+    for store, sku, asin, reason, after_listing in rows:
         if only and store != only:
             continue
         if store in inactive or (store, sku) in inflight:
@@ -275,7 +280,8 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             "store": store, "sku": sku, "asin": asin, "source": "audit",
             "action": "delete", "category": None,
             "reason": f"审核判拒仍在架:{reason or '(理由未留存)'}",
-            "detail": {"audit_reason": reason},
+            "detail": {"audit_reason": reason,
+                       "rejected_after_listing": bool(after_listing)},
         })
     return out
 
@@ -314,9 +320,16 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
         if audit_rows:
+            late = sum(1 for r in audit_rows
+                       if r["detail"].get("rejected_after_listing"))
             lines.append(
                 f"审核判拒但仍在架 {len(audit_rows)} 个 SKU → 建议删除"
                 f"(样本={[r['sku'] for r in audit_rows[:5]]})")
+            if late:
+                lines.append(
+                    f"  其中 {late} 个是**先上架后被判拒** —— 上架时那道闸没拦住"
+                    f"(或当时还没审)。这是审核链的漏拦线索,值得单看,"
+                    f"与本轮该不该删是两个问题")
         if preview:
             lines.append(f"(preview:未落建议行;本轮将写 {len(rows) + len(audit_rows)} 条)")
             return "\n".join(lines)

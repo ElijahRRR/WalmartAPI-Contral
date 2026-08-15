@@ -367,6 +367,17 @@ CREATE VIEW catalog.product_risk AS
               ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         -- 审核维度(2026-08-14 接消费端):在此之前 audit_passed/audit_rejected
+         -- **零读者** —— 全库 119 万条事件写了没人看,而"审核拒了但还在架"
+         -- 这类跨域问题却要靠 JOIN 两张表现拼。病历的价值本就是把审核结论、
+         -- 上架动作、平台观测串在**一条时间线**上,这几列就是兑现它。
+         count(*) FILTER (WHERE event = 'audit_passed')          AS audit_pass_times,
+         count(*) FILTER (WHERE event = 'audit_rejected')        AS audit_reject_times,
+         max(occurred_at) FILTER (WHERE event = 'audit_passed')  AS last_passed_at,
+         max(occurred_at) FILTER (WHERE event = 'audit_rejected') AS last_rejected_at,
+         -- 上架时点:与上面两个比大小就能答"审核在上架之前还是之后"
+         max(occurred_at) FILTER (WHERE event IN
+             ('item_appeared', 'list_submitted', 'match_submitted')) AS last_listed_at,
          max(occurred_at) AS last_event_at
   FROM catalog.product_events GROUP BY 1;
 
@@ -396,6 +407,51 @@ CREATE OR REPLACE VIEW catalog.status_changes AS
          detail->>'old' AS old_status, detail->>'new' AS new_status,
          detail->'reasons' AS reasons, occurred_at
   FROM catalog.product_events WHERE event = 'status_changed';
+
+-- 审核结论 × 上架现状的冲突面(2026-08-14 所有者要求:"病历里一眼看到
+-- 审核结论",让「审核拒了但还在架」「刚上架就被拒」一条 SQL 出来)。
+--
+-- 为什么不能只看 product_risk:审核事件的 store 是 **NULL**(审核不分店铺,
+-- 一个 ASIN 一个结论),所以它们进得了全局 product_risk,却进不了
+-- product_risk_store(那个视图 WHERE store IS NOT NULL)。要回答"哪个店里
+-- 哪些产品拒了还挂着",必须拿全局审核结论去 JOIN 店铺维度的现状表。
+--
+-- ⚠ 本视图**不依赖 product_risk**,时间线自己就地聚合。理由是 db_init 幂等:
+-- product_risk 是 DROP+CREATE(列改名的历史遗留),而 PG 不允许 DROP 一个
+-- 还有依赖者的视图 —— 依赖它就等于给 db_init 埋一个"第二次跑就报错"的雷。
+--
+-- 两个标志的口径差别(**别混用**):
+--   rejected_still_listed  = 当前结论是 reject 且商品此刻在架。看的是**现状**,
+--                            problem_scan 就按这个建"删除"建议。
+--   rejected_after_listing = 最近一次判拒发生在最近一次上架**之后**。看的是
+--                            **时序**:先上了架、后来才被判拒 ⇒ 上架时的闸没拦住
+--                            (或当时还没审)。这类是审核链本身的漏拦线索,
+--                            与"该不该下架"是两个问题。
+CREATE OR REPLACE VIEW catalog.audit_listing_conflicts AS
+  SELECT w.store, w.sku,
+         coalesce(p.asin, w.sku)                        AS asin,
+         w.published_status, w.last_seen_at,
+         p.audit_status, p.audit_reason, p.audited_at, p.audit_version,
+         e.last_rejected_at, e.last_passed_at, e.last_listed_at,
+         e.audit_reject_times,
+         (p.audit_status = 'rejected')                  AS rejected_still_listed,
+         (e.last_rejected_at IS NOT NULL
+          AND e.last_listed_at IS NOT NULL
+          AND e.last_rejected_at > e.last_listed_at)    AS rejected_after_listing
+  FROM catalog.walmart_items w
+  LEFT JOIN catalog.products p
+         ON p.asin = w.sku AND p.marketplace = 'US'
+  LEFT JOIN LATERAL (
+      SELECT max(occurred_at) FILTER (WHERE event = 'audit_rejected') AS last_rejected_at,
+             max(occurred_at) FILTER (WHERE event = 'audit_passed')   AS last_passed_at,
+             max(occurred_at) FILTER (WHERE event IN
+                 ('item_appeared', 'list_submitted', 'match_submitted')) AS last_listed_at,
+             count(*) FILTER (WHERE event = 'audit_rejected')         AS audit_reject_times
+      FROM catalog.product_events ev
+      WHERE coalesce(ev.asin, ev.sku) = coalesce(p.asin, w.sku)
+  ) e ON true
+  WHERE w.missing_since IS NULL          -- 在架 = 最近一轮全量扫描还见得到
+    AND (p.audit_status = 'rejected' OR e.last_rejected_at IS NOT NULL);
 
 -- *_feed_failed 的读侧(此前只写不读):五类 feed 的逐 SKU 失败回执,
 -- kind ∈ delete/retire/maintenance/match/list

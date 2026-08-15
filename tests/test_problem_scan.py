@@ -114,12 +114,16 @@ def test_inflight_sql_blocks_unobserved_success():
     assert "JOIN catalog.walmart_items" in scan._SQL_INFLIGHT
 
 
-def test_audit_rejected_ignores_published_status():
-    """审核判拒但仍在架:**不能按 published_status 过滤**。审核拒的产品
-    正常在架(PUBLISHED)才是最该下架的那批,恰恰不会出现在问题商品清单里。"""
+def test_audit_rejected_reads_the_view_not_its_own_join():
+    """判据只有一处:catalog.audit_listing_conflicts 视图。
+    这里原本抄了一份等价 JOIN,两份实现迟早漂 —— 口径要改只改视图那一处。
+    视图同时是 audit_passed/audit_rejected 事件的第一个消费方
+    (在此之前那 119 万条事件零读者)。"""
+    assert "audit_listing_conflicts" in scan._SQL_AUDIT_REJECTED
+    assert "rejected_still_listed" in scan._SQL_AUDIT_REJECTED
+    # 不能自己再拼一份:出现这些说明又抄回来了
+    assert "JOIN" not in scan._SQL_AUDIT_REJECTED.upper()
     assert "published_status" not in scan._SQL_AUDIT_REJECTED
-    assert "audit_status = 'rejected'" in scan._SQL_AUDIT_REJECTED
-    assert "missing_since IS NULL" in scan._SQL_AUDIT_REJECTED
 
 
 def test_audit_rejected_respects_the_same_gates(monkeypatch):
@@ -129,9 +133,10 @@ def test_audit_rejected_respects_the_same_gates(monkeypatch):
         def __exit__(self, *a): return False
         def execute(self, sql, params=None): pass
         def fetchall(self):
-            return [("T1", "S1", "B01", "知产"),
-                    ("T_OFF", "S2", "B02", "禁售"),
-                    ("T1", "S_FLY", "B03", "禁售")]
+            # 视图的列序:store, sku, asin, audit_reason, rejected_after_listing
+            return [("T1", "S1", "B01", "知产", True),
+                    ("T_OFF", "S2", "B02", "禁售", False),
+                    ("T1", "S_FLY", "B03", "禁售", False)]
 
     class _Conn:
         def cursor(self): return _Cur()
@@ -141,6 +146,10 @@ def test_audit_rejected_respects_the_same_gates(monkeypatch):
     assert [r["sku"] for r in rows] == ["S1"]
     assert rows[0]["source"] == "audit" and rows[0]["action"] == "delete"
     assert rows[0]["asin"] == "B01" and "知产" in rows[0]["reason"]
+    # 先上架后被判拒的标记随建议行带走:它是审核链漏拦的线索,
+    # 与"该不该删"是两个问题,所以只进 detail 不改 action
+    assert rows[0]["detail"]["rejected_after_listing"] is True
+    assert rows[0]["action"] == "delete"
 
 
 def test_preview_writes_nothing(monkeypatch):

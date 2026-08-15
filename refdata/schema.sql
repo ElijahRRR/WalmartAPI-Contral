@@ -1003,6 +1003,10 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
 --   confirmed    观测确认生效(delete_verified / 反补后重新 PUBLISHED)
 --   ineffective  观测确认**没**生效(delete_not_effective:回执说成了但商品还在架
 --                ——所有者实证过的真实故障模式),下轮重新建议
+--   withdrawn    扫描件本轮**不再建议**它了(问题自己好了 / 不再命中闸)。
+--                建议是有时效的:昨天建议删 A、今天 A 恢复正常,那条 suggested
+--                还挂着的话执行件照样会删。撤销只动 suggested,executing 不碰
+--                (feed 已经在沃尔玛队列里,撤销无意义,归 settle 按观测判)
 -- 生效判定**不自己实现**:直接读 catalog.product_events 里 catalog_sync 经
 -- services/product_events.verify_deletions 落的 delete_verified /
 -- delete_not_effective ——"不信回执信观测"那套已经在跑,再写一份只会两份漂移。

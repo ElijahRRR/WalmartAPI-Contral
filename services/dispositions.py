@@ -128,8 +128,49 @@ def suggest_many(conn, rows: list[dict]) -> int:
             "detail": json.dumps(r.get("detail") or {}, ensure_ascii=False),
         })
     with conn.cursor() as cur:
+        # ⚠ 报**实际落库行数**,不是 len(payload)。两者会差:同 (店铺,SKU,动作)
+        # 被两个来源同时命中时,部分唯一索引把它们合成一条。首版报 len(payload)
+        # ——生产实测扫描件说"落账 521 条"、执行件只领到 472 条,对不上账。
+        # executemany 的 rowcount 在 psycopg3 里是各次之和,正是我们要的。
         cur.executemany(_UPSERT_SQL, payload)
-    return len(payload)
+        return cur.rowcount if cur.rowcount is not None else len(payload)
+
+
+_WITHDRAW_SQL = """
+UPDATE ops.dispositions
+SET status = 'withdrawn', settled_at = now(),
+    detail = detail || jsonb_build_object('withdrawn_reason', %(why)s)
+WHERE status = 'suggested' AND source = %(source)s
+  AND (store, sku, action) <> ALL(%(keep)s::text[][])
+RETURNING id
+"""
+
+
+def withdraw_stale(conn, source: str, keep: list[tuple], why: str) -> int:
+    """输入:连接 + 来源 + 本轮仍建议的 (店铺,SKU,动作) → 输出:撤销行数。
+
+    **建议是有时效的**:今天建议删 A,明天 A 自己恢复正常了、扫描件不再建议它
+    —— 但昨天那条 suggested 行还挂着,执行件照样会删。这个函数把"本轮不再
+    建议、但还挂着 suggested"的行置 withdrawn。
+
+    只动**本来源**的行(source 参数):扫描件那一轮不该碰审核来源的建议,
+    反之亦然 —— 两个来源各跑各的闸,互相看不见对方为什么建议。
+
+    executing 及已落定的行一根手指都不碰:那些已经提交出去了,撤销无意义
+    (feed 已经在沃尔玛队列里),它们的归宿是 settle() 按观测判决。
+    """
+    with conn.cursor() as cur:
+        if not keep:
+            # 本轮一条都不建议 = 该来源的所有 suggested 全撤。空数组喂给
+            # `<> ALL` 在 PG 里恒真,行为正确,但显式分支更好读
+            cur.execute("UPDATE ops.dispositions SET status = 'withdrawn', "
+                        "settled_at = now() WHERE status = 'suggested' "
+                        "AND source = %s", (source,))
+            return cur.rowcount or 0
+        cur.execute(_WITHDRAW_SQL,
+                    {"source": source, "why": why,
+                     "keep": [[k[0], k[1], k[2]] for k in keep]})
+        return len(cur.fetchall())
 
 
 def claim(conn) -> list[dict]:

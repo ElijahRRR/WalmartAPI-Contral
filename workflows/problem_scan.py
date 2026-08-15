@@ -216,6 +216,29 @@ def to_dispositions(plans: dict) -> list[dict]:
     return rows
 
 
+def drop_conflicting_relists(rows: list[dict],
+                             audit_rows: list[dict]) -> tuple[list[dict], int]:
+    """输入:scan 建议 + audit 建议 → 输出:(去掉矛盾反补后的 scan 建议, 剔除数)。
+
+    纯函数,可测。⚠ **生产 dry-run 实遇(2026-08-14)**:同一个 SKU 同时被
+    scan 建议"反补"(A 类过期,救活)与 audit 建议"删除"(审核判拒)。两条
+    建议 action 不同 ⇒ 部分唯一索引不冲突 ⇒ 两条都落 ⇒ 执行件按
+    _ACTION_ORDER 先发 relist 再发 delete:**先花配额把它救活,再花配额把它
+    删掉**,两个 feed 都提交、结果还不确定。
+
+    优先级:**审核判拒压过一切救活动作**。审核说这产品不该卖,把它救活是反向
+    操作;而"过期"只是它当前不可售的一个技术原因,救活了照样该被删。
+    删除建议保留(该删还是要删),只砍掉同 SKU 的反补建议。
+    """
+    banned = {(r["store"], r["sku"]) for r in audit_rows
+              if r["action"] == "delete"}
+    if not banned:
+        return rows, 0
+    kept = [r for r in rows
+            if not (r["action"] == "relist" and (r["store"], r["sku"]) in banned)]
+    return kept, len(rows) - len(kept)
+
+
 def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
     """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
     fresh = [it for it in items if "category" in it
@@ -330,14 +353,31 @@ def run(params: dict) -> str:
                     f"  其中 {late} 个是**先上架后被判拒** —— 上架时那道闸没拦住"
                     f"(或当时还没审)。这是审核链的漏拦线索,值得单看,"
                     f"与本轮该不该删是两个问题")
+        rows, n_conflict = drop_conflicting_relists(rows, audit_rows)
+        if n_conflict:
+            lines.append(
+                f"  ⚠ 剔除矛盾反补 {n_conflict} 条:这些 SKU 同时被判"
+                f"「审核拒→删」与「过期→救活」,审核判拒压过救活"
+                f"(否则会先花配额救活、再花配额删掉)")
+        allrows = rows + audit_rows
         if preview:
-            lines.append(f"(preview:未落建议行;本轮将写 {len(rows) + len(audit_rows)} 条)")
+            lines.append(f"(preview:未落建议行;本轮将写 {len(allrows)} 条"
+                         f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"
+                         f"命中时按唯一索引合并)")
             return "\n".join(lines)
         n_cat = _record_categories(conn, items, last_cat)
         bl_note = _collect_blacklists(conn, items)
-        n_sug = dispositions.suggest_many(conn, rows + audit_rows)
-    lines.append(f"建议行落账 {n_sug} 条(ops.dispositions,status=suggested);"
-                 f"归类事件新记 {n_cat} 条")
+        n_sug = dispositions.suggest_many(conn, allrows)
+        # 撤销本轮不再建议的陈旧行(按来源各撤各的):否则昨天建议删、今天
+        # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删
+        n_wd = 0
+        for src, srows in (("scan", rows), ("audit", audit_rows)):
+            n_wd += dispositions.withdraw_stale(
+                conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
+                why="本轮扫描不再建议")
+    lines.append(f"建议行落账 {n_sug} 条(ops.dispositions,status=suggested)"
+                 + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议)" if n_wd else "")
+                 + f";归类事件新记 {n_cat} 条")
     if bl_note:
         lines.append(bl_note)
     lines.append("执行走 `python cli.py problem_product_cleanup --execute`"

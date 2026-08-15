@@ -216,3 +216,39 @@ def test_conflicts_view_join_matches_its_index():
     # 外层过滤不许再引用 LATERAL 产出(那会让 PG 一行都剪不掉)
     tail = sql[sql.index("FROM live_rejected lr"):sql.index(") e ON true;")]
     assert "WHERE" not in tail.split("LEFT JOIN LATERAL")[0]
+
+
+def test_audit_reject_beats_relist():
+    """⚠ 生产 dry-run 实遇(2026-08-14):同一个 SKU 同时被 scan 建议"反补"
+    (A 类过期救活)与 audit 建议"删除"(审核判拒)。两条 action 不同 ⇒ 部分
+    唯一索引不冲突 ⇒ 都落 ⇒ 执行件按 _ACTION_ORDER **先花配额救活、再花配额
+    删掉**,两个 feed 都提交且结果不确定。审核判拒必须压过一切救活动作。"""
+    scan_rows = [
+        {"store": "T1", "sku": "S_X", "action": "relist", "source": "scan"},
+        {"store": "T1", "sku": "S_X", "action": "delete", "source": "scan"},
+        {"store": "T1", "sku": "S_OK", "action": "relist", "source": "scan"},
+    ]
+    audit_rows = [{"store": "T1", "sku": "S_X", "action": "delete",
+                   "source": "audit"}]
+    kept, n = scan.drop_conflicting_relists(scan_rows, audit_rows)
+    assert n == 1
+    # 砍掉的只有那条**反补**;删除建议保留(该删还是要删)
+    assert [(r["sku"], r["action"]) for r in kept] == [
+        ("S_X", "delete"), ("S_OK", "relist")]
+
+
+def test_no_audit_rows_changes_nothing():
+    rows = [{"store": "T1", "sku": "S1", "action": "relist", "source": "scan"}]
+    kept, n = scan.drop_conflicting_relists(rows, [])
+    assert kept == rows and n == 0
+
+
+def test_withdraw_only_touches_own_source_and_suggested():
+    """撤销只动**本来源**且仍是 suggested 的行:扫描件那一轮不该碰审核来源的
+    建议(两个来源各跑各的闸);executing 更不能碰——feed 已经提交出去了,
+    撤销无意义,它的归宿是 settle() 按观测判决。"""
+    from services import dispositions
+    sql = dispositions._WITHDRAW_SQL
+    assert "status = 'suggested'" in sql          # 只动 suggested
+    assert "source = %(source)s" in sql           # 只动本来源
+    assert "executing" not in sql

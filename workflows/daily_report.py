@@ -346,8 +346,10 @@ def _phase_kpi(store_list: list[dict], data_date, do_yingdao: bool = False) -> s
     return line
 
 
-# 看板表头:沿用旧表真实中文列名(与 kpi._HIST_HEADER_MAP 对称,运营零学习成本)
-_BOARD_HEADER = ["日期", "店铺", "卖家名称", "partnerId", "sellerId", "店铺状态",
+# 看板表头:沿用旧表真实中文列名(与 kpi._HIST_HEADER_MAP 对称,运营零学习成本)。
+# ⚠ 首两列 (店铺, 日期) 与旧「店铺KPI」表的 (日期, 店铺) 相反(所有者定稿
+# 2026-08-15),顺序以 resources._KPI_BOARD_COLUMNS 为准,本列表只是它的中文名。
+_BOARD_HEADER = ["店铺", "日期", "卖家名称", "partnerId", "sellerId", "店铺状态",
                  "支付状态", "销售状态", "在线商品", "有库存", "无库存", "昨日出单",
                  "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
                  "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
@@ -417,9 +419,12 @@ def _board_formats(n_rows: int) -> list[tuple[str, str]]:
 def _phase_board(history_days: int) -> str:
     """输入:历史窗口天数 → 输出:结果行。PG → 新 KPI 看板两页(整表重写)。
 
-    总览 = 每店最新一行;历史 = 全店合一近 N 天(日期降序)。旧「店铺KPI」
-    表 72 张分页停更归档(所有者定稿 2026-08-08),影刀输入除外(yingdao=1
-    仍写旧总览 A:H——影刀 RPA 内部读旧表,切换需改 RPA 后换 env)。
+    总览 = 每店最新一行;历史 = 全店合一近 N 天。**两页一律按店铺排序**
+    (所有者定稿 2026-08-15,与「店铺」列提到最左同一件事):历史页店内再按
+    日期降序,同店的近 N 天连成一段,肉眼可直接看单店趋势——旧的
+    `data_date DESC, store` 是按天横切,同一家店被打散在 90 个日期块里。
+    旧「店铺KPI」表 72 张分页停更归档(所有者定稿 2026-08-08),影刀输入除外
+    (yingdao=1 仍写旧总览 A:H——影刀 RPA 内部读旧表,切换需改 RPA 后换 env)。
     """
     cols = ", ".join(resources.KPI_BOARD_OVERVIEW.columns)
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -428,7 +433,7 @@ def _phase_board(history_days: int) -> str:
         overview = cur.fetchall()
         cur.execute(f"SELECT {cols} FROM ops.store_kpi_daily"
                     " WHERE data_date >= current_date - %s"
-                    " ORDER BY data_date DESC, store", (history_days,))
+                    " ORDER BY store, data_date DESC", (history_days,))
         history = cur.fetchall()
     n1 = feishu.sheet_overwrite(resources.KPI_BOARD_OVERVIEW,
                                 [_BOARD_HEADER] + _board_matrix(overview))

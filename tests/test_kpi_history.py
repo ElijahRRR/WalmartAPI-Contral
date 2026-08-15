@@ -87,8 +87,69 @@ def test_board_header_columns_aligned():
     assert dr._board_cell("payout_date", "怪值") == "怪值"           # 解析不了原样
     assert dr._board_cell("store", "A085") == "A085"
     fmts = dict(dr._board_formats(10))
-    assert fmts["A2:A11"] == "yyyy/MM/dd" and fmts["AB2:AB11"] == "yyyy/MM/dd"
+    # 日期格式跟着 data_date 走到 B 列(A 列现在是店铺,文本不设 formatter)
+    assert "A2:A11" not in fmts
+    assert fmts["B2:B11"] == "yyyy/MM/dd" and fmts["AB2:AB11"] == "yyyy/MM/dd"
     assert fmts["I2:I11"] == "#,##0" and fmts["M2:M11"] == "#,##0.00"
+
+
+def test_board_first_two_columns_are_store_then_date():
+    """所有者定稿 2026-08-15:看板首列店铺、次列日期。
+
+    ⚠ 同时钉住旧「店铺KPI」表(影刀输入投影)**保持 日期,店铺 不变** ——
+    RPA 流程定义不在本仓,按列位读表,跟着看板一起调序会直接弄坏它。
+    """
+    from registry import resources
+    from workflows import daily_report as dr
+    assert resources.KPI_BOARD_OVERVIEW.columns[:2] == ("store", "data_date")
+    assert resources.KPI_BOARD_HISTORY.columns[:2] == ("store", "data_date")
+    assert dr._BOARD_HEADER[:2] == ["店铺", "日期"]
+    assert resources.KPI_SHEET.columns[:2] == ("data_date", "store")
+    # sellerId 两边都在 E 列是巧合,但影刀就靠这一列,回归钉住
+    assert resources.KPI_SHEET.columns[4] == "seller_id"
+
+
+def test_board_pages_both_sort_by_store(monkeypatch):
+    """两页都按店铺排序:总览天然一店一行,历史页店内再按日期降序。
+
+    历史页若按 `data_date DESC, store` 排,同一家店会被打散在 90 个日期块里,
+    首列提到店铺就白提了 —— 排序和列序是同一个诉求的两半。
+    """
+    import contextlib
+
+    from registry import db as _db
+    from workflows import daily_report as dr
+
+    sqls: list[str] = []
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            sqls.append(" ".join(sql.split()))
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(dr.feishu, "sheet_overwrite", lambda sheet, rows: len(rows))
+    monkeypatch.setattr(dr.feishu, "sheet_set_formatter", lambda sheet, items: len(items))
+    dr._phase_board(90)
+    overview_sql, history_sql = sqls
+    assert "DISTINCT ON (store)" in overview_sql
+    assert overview_sql.endswith("ORDER BY store, data_date DESC")
+    assert history_sql.endswith("ORDER BY store, data_date DESC")
+    # 取的列就是 registry 列序,首列店铺次列日期
+    assert "SELECT store, data_date, seller_name" in history_sql
 
 
 def test_extract_settlement_legacy_shape():

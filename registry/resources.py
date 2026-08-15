@@ -361,9 +361,15 @@ KPI_SHEET = Spreadsheet(
 # 「总览」= 每店最新一行(全 32 列)、「历史」= 全店合一近 N 天窗口。
 # 列序 = _KPI_BOARD_COLUMNS(与 ops.store_kpi_daily 字段一一对应,
 # 表头沿用旧表真实中文名,运营零学习成本)。整表重写,PG 权威可随时重建。
+#
+# ⚠ 首两列 = (店铺, 日期),**与上面 KPI_SHEET 的 (日期, 店铺) 相反**
+# (所有者定稿 2026-08-15:看板按店铺看,店铺列必须在最左)。两处列序从此
+# 不同,严禁互相照抄:KPI_SHEET 是影刀 RPA 的输入投影,RPA 内部按列位读,
+# 改它的列序 = 直接弄坏 RPA(且 RPA 流程定义不在本仓,改不回来)。
+# 巧合是 sellerId 在两边都落 E 列(只有 A/B 对调),这个巧合**不可依赖**。
 _KPI_BOARD_TOKEN = os.environ.get("FEISHU_KPI_BOARD_TOKEN", "")
 _KPI_BOARD_COLUMNS = (
-    "data_date", "store", "seller_name", "partner_id", "seller_id",
+    "store", "data_date", "seller_name", "partner_id", "seller_id",
     "store_status", "payment_status", "sales_status", "items_online",
     "items_in_stock", "items_out_stock", "orders_count", "sales_amount",
     "otd_rate", "cancel_rate", "vtr_rate", "srr_rate", "refund_rate",

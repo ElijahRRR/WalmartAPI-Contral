@@ -1,5 +1,13 @@
 """影刀 RPA 衔接积木(daily_report 用;仅 macOS 生产机有效)。
 
+衔接是**两个文件**,不经飞书(所有者定稿 2026-08-15,新影刀应用):
+    本仓 write_input() → input.json → 影刀读它决定抓哪些卖家页
+    → 影刀写 latest.json → 本仓 wait_fresh()/读取回填
+旧路径「先把总览写飞书 → 影刀读飞书拿 sellerId」同期删除,不留双轨。
+反转的理由是**新鲜度是被保证的而不是碰巧的**:input.json 由 spawn 它的
+那一次运行在 spawn 前几秒写出,影刀物理上读不到隔夜的清单;若让影刀自己
+连库,它在任何时刻都能读到任意一天的数据,而 cli.py 的 flock 管不到它。
+
 旧系统实证规则全部照搬(docs/legacy_survey.md #daily_report):
 - spawn 用 shadowbot:Run?robot-uuid=<uuid> 协议 URL 非阻塞启动(macOS `open`);
   应用必须已在「我获取的应用」跑过一次(首次有授权弹窗),路径 /Applications/影刀.app
@@ -22,12 +30,87 @@ import time
 from datetime import datetime, timezone
 
 from registry import paths
+from services import kpi, stores
 
 logger = logging.getLogger("services.yingdao")
 
 
 def _robot_uuid() -> str:
     return os.environ.get("YINGDAO_ROBOT_UUID", "").strip()
+
+
+# input.json 每行对影刀公开的字段。**store 是主键不是装饰**:sellerId 可能为空
+# 或变更,而 latest.json 现仍按 sellerId 回键(格式不动,一次只改一端)。
+_INPUT_FIELDS = ("store", "seller_id", "store_status", "payment_status")
+
+# 「什么算在营」的判断在 kpi.store_activity,本模块不自己写 —— 同一个谓词
+# 还被 kpi.derived_sales_status 用着(不抓的那些店直接标「不可售」),
+# 两处各写一份 upper() != "ACTIVE" 迟早会飘成"抓了却标不可售"。
+_STAT_KEYS = ("written", "no_seller_id", "inactive", "dup_seller_id",
+              "unknown_status")
+
+
+def write_input(rows: list[dict]) -> dict[str, int]:
+    """输入:当轮已入库的 KPI 行 → 输出:各口径计数 dict(见 _STAT_KEYS)。
+
+    整文件覆盖写,只含本轮真跑到的店——不追加、不与上一版合并,所以不会重复。
+
+    过滤三道 + 一个警戒计数,**每项单独计数**:合成一个数字的话,"今天少抓了
+    8 家"就没法回答"为什么少"(丢弃静默常态化 = 少抓一半没人知道)。
+    - `no_seller_id` 空 sellerId。⚠ A147 事故防线:影刀拿它拼出
+      https://www.walmart.com/seller//cp/shopall(路径中段为空)会崩掉整条
+      RPA 循环,**后续店铺全被跳过**——不是少抓一家,是少抓一半。
+    - `inactive` store_status **有值且**非 ACTIVE → 排除。
+    - `dup_seller_id` 同一 sellerId 出现多次(店铺凭证表有重复行时会发生),
+      抓两遍同一个页面纯属浪费,后者覆盖前者也看不出来。
+    - `unknown_status` store_status **为空 → 照常纳入**,只计数报警。
+      ⚠ 空不等于停用,是"没拿到":`extract_settlement` 的 store_status 取
+      `sellerInfo.sellerStatus` 且**没有 `_find_key` 兜底**(payment_status 有),
+      结算响应换个形状它就是空串。把空当停用 = 让解析故障静默地少抓一半店,
+      违反本仓「判不准就判活」。这个数长期非 0 说明结算解析该修,不是店停了。
+
+    被排除的店**照常入库**,只是不参与前台抓取;它们当天的销售状态会留空
+    (卖家名称有跨日延续兜底)。
+
+    原子写(tmp + rename):影刀随时可能在读,写一半被读到会让它解析失败。
+    latest.json 那侧本仓早就在防这件事(读到半截文件继续等),这边同样欠不得。
+    """
+    path = paths.yingdao_input_file()
+    out: list[dict] = []
+    seen: set[str] = set()
+    stats = dict.fromkeys(_STAT_KEYS, 0)
+    for r in rows:
+        sid = str(r.get("seller_id") or "").strip()
+        activity = kpi.store_activity(r.get("store_status"))
+        if not sid:
+            stats["no_seller_id"] += 1
+            continue
+        if activity == "inactive":
+            stats["inactive"] += 1
+            continue
+        if sid in seen:
+            stats["dup_seller_id"] += 1
+            continue
+        if activity == "unknown":
+            stats["unknown_status"] += 1      # 纳入,但要看得见
+        seen.add(sid)
+        out.append({f: ("" if r.get(f) is None else str(r[f]))
+                    for f in _INPUT_FIELDS})
+    out.sort(key=lambda r: stores.sort_key(r["store"]))     # 与看板同一店铺序
+    stats["written"] = len(out)
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
+               "count": len(out), "stores": out}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    logger.info("影刀输入:写出 %s,计数 %s", path, stats)
+    if stats["unknown_status"]:
+        logger.warning("影刀输入:%d 店 store_status 为空仍纳入 —— 空≠停用,"
+                       "长期非 0 说明结算解析拿不到 sellerStatus,该查 settle_debug",
+                       stats["unknown_status"])
+    return stats
 
 
 def spawn() -> bool:

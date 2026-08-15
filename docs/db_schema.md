@@ -419,7 +419,11 @@ CREATE TABLE ops.store_kpi_daily (
     seller_id        text,
     store_status     text,
     payment_status   text,
-    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)
+    sales_status     text,           -- 影刀前台抓取;不新鲜宁可留空不回填(旧事故规则)。
+                                     -- store_status 有值且非 ACTIVE(SUSPENDED/
+                                     -- TERMINATED 等)→ 默认「不可售」:这些店不进
+                                     -- 影刀清单,不给默认值会永远空着(2026-08-15)。
+                                     -- 推导自本轮 store_status,非跨日回填
     items_online     integer,        -- 来自 catalog.walmart_items(PG 复用,不再调 API)
     items_in_stock   integer,
     items_out_stock  integer,

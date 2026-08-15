@@ -90,6 +90,7 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
 | 飞书 QNIp…Bb/8280e8 黑名单 ASIN 表(blacklist_sync 写入,本仓找不到读者) | 历史黑名单 ASIN | ✅ catalog.asin_blacklist(只收永久类 B/C/E/F/G/K 过滤导入)→ blacklist_push 投影新「黑名单ASIN」wiki 表 |
 | auto_listing/state/risk_gate_cache.json | 风控两表 24h TTL 读缓存 | 不搬(纯派生):risk_sync 已镜像入 catalog.risk_product_types / brand_blacklist,闸门读库;开 listing 前跑一次 risk_sync 即可 |
 | <旧项目根>/data/frontend_scrape/latest.json(影刀应用内部写死此路径) | 影刀前台抓取结果(卖家名称/销售状态,日报降级源) | <DATA_ROOT>/frontend_scrape/latest.json(paths.frontend_scrape_file;并跑期 env FRONTEND_SCRAPE_JSON 指旧路径,切换需改影刀 RPA 输出) |
+| 飞书「店铺KPI」总览页(旧影刀的**输入**来源) | 影刀读它拿 sellerId 决定抓哪些卖家页 | <DATA_ROOT>/frontend_scrape/input.json(paths.yingdao_input_file;env YINGDAO_INPUT_JSON 覆盖)。所有者定稿 2026-08-15:新影刀应用改读本地文件,不再经飞书中转 |
 
 ## 环境事实
 

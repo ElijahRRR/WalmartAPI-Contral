@@ -73,6 +73,23 @@ def frontend_scrape_file() -> Path:
     return data_root() / "frontend_scrape" / "latest.json"
 
 
+def yingdao_input_file() -> Path:
+    """输入:无 → 输出:影刀 RPA 的**输入**清单 input.json 路径。
+
+    与 frontend_scrape_file()(影刀的输出)配对,构成影刀衔接的两端:
+    本仓写 input.json → 影刀读它决定抓哪些卖家页 → 影刀写 latest.json → 本仓读。
+    所有者定稿 2026-08-15:新影刀应用不再读飞书总览页,改读本文件
+    (旧应用那条"先写飞书→影刀读飞书"的路径同期删除,不留双轨)。
+
+    env YINGDAO_INPUT_JSON 覆盖——影刀应用内部很可能同样写死读取路径
+    (latest.json 就是这么踩的坑),对不上就用这个变量指过去,不要改代码。
+    """
+    override = os.environ.get("YINGDAO_INPUT_JSON", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return data_root() / "frontend_scrape" / "input.json"
+
+
 def audit_seed_file(name: str) -> Path:
     """输入:审核规则种子文件名(如 'forbidden_categories_zh_seller.yaml')
     → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。

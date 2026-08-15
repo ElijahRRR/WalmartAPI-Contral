@@ -340,19 +340,22 @@ SUPPLIER_TABLE = Bitable(
 )
 
 
-# 店铺KPI 电子表格(旧系统存量 workbook,两个用途,PG 权威不变):
-# ① 「总览」页(sheet_id 登记)= **影刀输入投影**:一店一行,影刀 RPA 读它
-#    决定抓哪些卖家页(E 列 sellerId 是其输入;空 sellerId 行会让整条 RPA
-#    崩溃——A147 事故,写入前必须过滤)。daily_report yingdao=1 时只写 A:H。
-# ② 每店一个 sheet(title=店铺名)= 旧系统 KPI 历史(按日期一行累积),
-#    kpi_history_import 的数据源;店铺页 sheet_id 运行时经 sheet_list 发现。
-# columns 前 8 列即总览 A~H 列序;历史导入按表头关键词映射,不按列位。
+# 店铺KPI 电子表格(旧系统存量 workbook,PG 权威不变):
+# 每店一个 sheet(title=店铺名)= 旧系统 KPI 历史(按日期一行累积),
+# kpi_history_import 的**只读**数据源;店铺页 sheet_id 运行时经 sheet_list 发现,
+# 登记的 sheet_id 是总览页(require() 的存在性检查用)。
+# columns 空:本表已无按列位写入的路径,历史导入按表头关键词映射不按列位。
+#
+# 2026-08-15 起本仓**不再写这张表**:原「总览页 = 影刀输入投影」那条路径
+# (daily_report yingdao=1 写 A:H)已删,新影刀应用改读
+# paths.yingdao_input_file() 的 input.json。飞书从此只是影刀改造前的存量,
+# 不是任何一条链路的中继。⚠ 别再往这里加写入 —— 老应用可能还在读它,
+# 新旧两个应用同时被喂数据 = 双 spawn 互抢(latest.json 新鲜度校验会反复失败)。
 KPI_SHEET = Spreadsheet(
     name="店铺KPI",
     token=os.environ.get("FEISHU_KPI_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_KPI_OVERVIEW_SHEET_ID", ""),
-    columns=("data_date", "store", "seller_name", "partner_id", "seller_id",
-             "store_status", "payment_status", "sales_status"),
+    columns=(),
 )
 
 
@@ -361,9 +364,12 @@ KPI_SHEET = Spreadsheet(
 # 「总览」= 每店最新一行(全 32 列)、「历史」= 全店合一近 N 天窗口。
 # 列序 = _KPI_BOARD_COLUMNS(与 ops.store_kpi_daily 字段一一对应,
 # 表头沿用旧表真实中文名,运营零学习成本)。整表重写,PG 权威可随时重建。
+#
+# ⚠ 首两列 = (店铺, 日期)(所有者定稿 2026-08-15:看板按店铺看,店铺列必须
+# 在最左);两页均按店铺排序,历史页店内再按日期降序。
 _KPI_BOARD_TOKEN = os.environ.get("FEISHU_KPI_BOARD_TOKEN", "")
 _KPI_BOARD_COLUMNS = (
-    "data_date", "store", "seller_name", "partner_id", "seller_id",
+    "store", "data_date", "seller_name", "partner_id", "seller_id",
     "store_status", "payment_status", "sales_status", "items_online",
     "items_in_stock", "items_out_stock", "orders_count", "sales_amount",
     "otd_rate", "cancel_rate", "vtr_rate", "srr_rate", "refund_rate",

@@ -45,6 +45,39 @@ METRIC_LABELS = {
 
 _SELLER_ID_RE = re.compile(r"/seller/(\d+)")
 
+ACTIVE_STATUS = "ACTIVE"        # sellerStatus 的在营取值
+NOT_SELLING = "不可售"          # 销售状态取值,与旧表一致(另一取值「可售」)
+
+
+def store_activity(store_status) -> str:
+    """输入:店铺状态原值 → 输出:'active' / 'inactive' / 'unknown'。
+
+    ⚠ **'unknown'(状态为空)必须与 'inactive' 分开**:extract_settlement 取
+    store_status 时没有 _find_key 兜底(payment_status 有),结算响应换个形状
+    就是空串。把空当停用,会让解析故障静默地变成"少抓一半店 + 一半店被标不可售"。
+    判不准就判活:空状态照常抓、照常留空,由调用方计数报警。
+
+    这是「什么算在营」的唯一出处 —— 影刀清单过滤与销售状态推导都用它,
+    两处各写一份 upper() != "ACTIVE" 迟早会飘。
+    """
+    s = str(store_status or "").strip().upper()
+    if not s:
+        return "unknown"
+    return "active" if s == ACTIVE_STATUS else "inactive"
+
+
+def derived_sales_status(store_status) -> str | None:
+    """输入:店铺状态 → 输出:可推导的销售状态(仅停用店 →「不可售」),否则 None。
+
+    所有者定稿 2026-08-15:SUSPENDED / TERMINATED 一类的店影刀不去抓
+    (见 yingdao.write_input 的 inactive 过滤),销售状态不能就此永远空着
+    —— 店都停了,定义上就是不可售。
+
+    ⚠ 这**不违反**「销售状态不做跨日延续」那条旧事故规则:它推导自**本轮**
+    观测到的 store_status,不是把昨天的旧值回填成今天。
+    """
+    return NOT_SELLING if store_activity(store_status) == "inactive" else None
+
 
 def sales_window_utc(now_utc: datetime | None = None) -> tuple[str, str]:
     """输入:当前 UTC 时间(默认 now)→ 输出:(开始, 结束) ISO8601 UTC,24h 窗口。

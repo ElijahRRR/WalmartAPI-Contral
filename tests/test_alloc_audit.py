@@ -393,59 +393,98 @@ def test_run_end_to_end_report(monkeypatch):
     cur = _FakeCur()
     _wire(monkeypatch, cur)
     out = wf.run({})
-    # 七节都在
-    for tag in ("P1 候选池", "P2 打分信号", "P3 PT 字典对拍", "P4 品牌占用键",
-                "A0 在线行", "A1 同 ASIN", "A2 同品牌", "A3 每店大类",
-                "A4 不在册店冻结行", "A5 渠道对拍", "A6 店铺配置", "A7 店铺状态",
-                "A8 订单店名对账"):
+    # 六节都在(报告以"要你做的事"开头——它是给人动手用的,不是给人读的)
+    for tag in ("▍要你做的事", "▍数据体检", "▍在线商品", "▍冲突",
+                "▍店铺", "▍明细"):
         assert tag in out, tag
+    assert out.index("▍要你做的事") < out.index("▍数据体检")
     # 评分/评论探针为 0 → 必须点名删权重(禁止 or 0)
-    assert "禁止 or 0" in out
-    # DEAD1 不在册:其行被排除出冲突,且在 A4 被点名
-    assert "不在册店冻结行 1 家" in out and "合计排除 1 行" in out
-    assert "DEAD1×1" in out
-    # A7:A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
-    assert "非 ACTIVE 的 0 家" in out
-    # A8:订单里的"旧名店"不在凭证表 → 点名(它的销量进不了店×类目维度)
-    assert "对不上 1 家、5 行" in out and "旧名店×5" in out
+    assert "评分 ✗" in out and "v1 权重要删掉这两项" in out
+    # DEAD1 不在册:其行被排除出冲突,且被点名
+    assert "不在册店冻结 1 家(DEAD1)" in out
+    # A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
+    assert "非 ACTIVE" not in out
+    # 订单里的"旧名店"不在凭证表 → 点名(它的销量进不了店×类目维度)
+    assert "订单店名对不上 1 家 5 行" in out and "旧名店 5" in out
+
+
+def test_report_columns_align_by_display_width():
+    """列宽按**显示宽度**补,不按字符数——中文占 2 格,按字符补列就是歪的。
+
+    这正是所有者说"看不明白"的那一半原因:数字列对不齐,一屏数字糊成一片。
+    """
+    assert wf._width("同品牌") == 6 and wf._width("同 ASIN") == 7
+    lines = wf._grid([("同品牌", "1 组", "依据:x"),
+                      ("同 ASIN", "12 组", "依据:y")])
+    # 判据:两行"依据"之前的**显示宽度**相等(字符数则不等——正是老写法的错)
+    assert len({wf._width(ln.split("依据")[0]) for ln in lines}) == 1
+    assert len({len(ln.split("依据")[0]) for ln in lines}) == 2
+    assert wf._grid([]) == []                      # 空表不产出空行
 
 
 def test_run_degrades_when_pt_dict_fails(monkeypatch):
-    """P3 是对拍探针,炸了要降级成一行提示,不能拖垮整份存量审计。"""
+    """PT 字典是对拍探针,炸了要降级成一行提示,不能拖垮整份存量审计。"""
     cur = _FakeCur(fail_pt_dict=True)
     conn = _wire(monkeypatch, cur)
     out = wf.run({})
-    assert "P3 PT 字典对拍:跳过" in out
+    assert "PT 字典" in out and "对拍跳过" in out
     assert conn.rolled_back is True          # 事务 aborted 必须先回滚
-    assert "A1 同 ASIN" in out and "A7 店铺状态" in out
+    assert "▍冲突" in out and "▍店铺" in out
 
 
-def test_run_marks_channel_skip_instead_of_reporting_zero(monkeypatch):
-    """-p channel=0 时 A5 必须明说跳过——打印"不符 0 家"读起来像全店合规。"""
+def test_run_marks_channel_skip_instead_of_reporting_zero(monkeypatch, tmp_path):
+    """-p channel=0 时必须明说跳过——打印"不符 0 件"读起来像全店合规。
+
+    而且这一轮**不能写**下架清单 csv:offenders 必空,照写会把上一轮跑出来的
+    清单覆盖成空表,所有者照着空表下架 = 什么都不下,还看不出是被本轮清掉的。
+    """
+    cur = _FakeCur()
+    _wire(monkeypatch, cur, reports=tmp_path)
+    stale = tmp_path / "alloc_渠道不符下架清单.csv"
+    stale.write_text("上一轮的清单", encoding="utf-8-sig")
+    out = wf.run({"channel": "0"})
+    assert "下架渠道不符  本轮没查" in out and "**跳过**" in out
+    assert "0 件" not in out
+    assert stale.read_text(encoding="utf-8-sig") == "上一轮的清单"
+    assert "alloc_渠道不符下架清单.csv" not in out.split("▍明细")[-1]
+
+
+def test_run_marks_channel_skip_when_limits_table_unreadable(monkeypatch):
+    """限额表读不到时同理:没有配送限制可对拍,不能拿 0 冒充"全合规"。"""
     cur = _FakeCur()
     _wire(monkeypatch, cur)
-    out = wf.run({"channel": "0"})
-    assert "A5 渠道对拍:**跳过**" in out
+
+    def _boom():
+        raise RuntimeError("飞书 500")
+    monkeypatch.setattr(wf.store_targets, "load_targets", _boom)
+    out = wf.run({})
+    assert "填类目三列    本轮没查" in out and "下架渠道不符  本轮没查" in out
+    assert "限额表读不到" in out
 
 
-def test_run_exports_four_lists(monkeypatch, tmp_path):
-    """C 段四份处置清单要真落盘,且内容是"照着能做"的逐行明细。"""
+def test_run_exports_five_lists(monkeypatch, tmp_path):
+    """五份明细要真落盘,且内容是"照着能做"的逐行明细。
+
+    控制台只留计数,所以 csv 是唯一能照着动手的东西——少一份就等于那件事
+    没法做。
+    """
     cur = _FakeCur()
     _wire(monkeypatch, cur, reports=tmp_path)
     out = wf.run({})
 
     names = sorted(p.name for p in tmp_path.glob("*.csv"))
-    assert names == ["alloc_同ASIN冲突处置.csv", "alloc_同品牌冲突处置.csv",
-                     "alloc_渠道不符下架清单.csv", "alloc_类目建议.csv"]
-    assert "C1 类目建议" in out and "C2 渠道不符" in out
-    assert "C3 同 ASIN 跨店" in out and "C4 同品牌跨店" in out
+    assert set(names) == {"alloc_类目建议.csv", "alloc_渠道不符下架清单.csv",
+                          "alloc_店铺总览.csv", "alloc_同ASIN冲突处置.csv",
+                          "alloc_同品牌冲突处置.csv"}
+    for name in names:                       # 每份都在控制台列了名
+        assert name in out
 
-    # C1:A085 在线 Fashion×2 → 建议 Fashion;表格已填 Fashion → 一致
+    # 类目建议:A085 在线 Fashion×2 → 建议 Fashion;表格已填 Fashion → 一致
     c1 = (tmp_path / "alloc_类目建议.csv").read_text(encoding="utf-8-sig")
     assert "A085" in c1 and "一致" in c1
     assert "A107" in c1 and "未填" in c1
 
-    # C3:A085 卖过 120 元、A107 零销量 → 留 A085,A107 那行判下架
+    # 同 ASIN:A085 卖过 120 元、A107 零销量 → 留 A085,A107 那行判下架
     c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
     lines = [ln for ln in c3.splitlines() if "B0AAAA0001" in ln]
     assert any(ln.startswith("B0AAAA0001,A085") and ln.endswith("保留")
@@ -453,25 +492,44 @@ def test_run_exports_four_lists(monkeypatch, tmp_path):
     assert any(",A107," in ln and ln.endswith("下架") for ln in lines)
 
 
+def test_store_overview_csv_carries_the_per_store_detail(monkeypatch, tmp_path):
+    """控制台只报计数,逐店明细全在这份 csv——包括规划外/不在册的点名。"""
+    cur = _FakeCur()
+    cur.extra_items = [("谭总4", "B0CCCC0003", "Knives", "PUBLISHED")]
+    _wire(monkeypatch, cur, registered={"A085", "A107", "谭总4"},
+          reports=tmp_path)          # DEAD1 故意不在册
+    wf.run({})
+    text = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
+    rows = {ln.split(",")[0]: ln for ln in text.splitlines()[1:]}
+    assert rows["谭总4"].split(",")[1] == "否(规划外)"
+    assert rows["DEAD1"].split(",")[1] == "否(不在册)"
+    assert rows["A085"].split(",")[1] == "是"
+    assert "Fashion" in rows["A085"]          # 准入类目/大类分布都在行里
+
+
 def test_run_export_off(monkeypatch, tmp_path):
     cur = _FakeCur()
     _wire(monkeypatch, cur, reports=tmp_path)
     out = wf.run({"export": "0"})
-    assert "C 处置清单:跳过" in out
+    assert "未落明细 csv" in out
     assert list(tmp_path.glob("*.csv")) == []
 
 
 def test_run_flags_missing_order_history(monkeypatch, tmp_path):
-    """订单没导入时销量全零,冲突清单只能打平——必须明说,不能装作判过了。"""
+    """订单没导入时销量全零,冲突清单只能打平——必须明说,不能装作判过了。
+
+    csv 每行都写着"判定依据",不说破的话看起来就像真按销量判过了。
+    """
     cur = _FakeCur()
     cur._no_sales = True
     _wire(monkeypatch, cur, reports=tmp_path)
     out = wf.run({})
-    assert "订单历史还没导入" in out
+    assert "订单历史还没导入" in out and "打平" in out
+    assert "✓ 全部有销量/类目依据" not in out   # 不能同时说"判得了"
 
 
 def test_run_warns_when_credential_table_unreadable(monkeypatch):
-    """凭证表读不到时不能静默不排除冻结行——那正是 A1 被灌水的场景。"""
+    """凭证表读不到时不能静默不排除冻结行——那正是冲突数被灌水的场景。"""
     cur = _FakeCur()
     _wire(monkeypatch, cur)
 
@@ -479,8 +537,8 @@ def test_run_warns_when_credential_table_unreadable(monkeypatch):
         raise RuntimeError("飞书 500")
     monkeypatch.setattr(wf.stores_svc, "registered_names", _boom)
     out = wf.run({})
-    assert "本轮未排除已不在册店的冻结行" in out
-    assert "A4 不在册店冻结行:跳过" in out
+    assert "凭证表读不到" in out and "幻影店一个没排" in out
+    assert "只可参考" in out
 
 
 def test_sales_sql_excludes_cancelled_not_missing_raw_key():
@@ -511,7 +569,8 @@ def test_run_drops_out_of_scope_stores_from_conflicts(monkeypatch, tmp_path):
     cur.extra_items = [("谭总4", "B0AAAA0001", "Socks", "PUBLISHED")]
     _wire(monkeypatch, cur, registered={"A085", "A107", "谭总4"}, reports=tmp_path)
     out = wf.run({})
-    assert "规划范围外的店 1 家/1 行" in out and "谭总4" in out
+    assert "规划外 1 家 1 行(谭总4)" in out
+    assert "销量仍计入" in out          # 排除的是归属不是数据
     # 同 ASIN 仍只算 A085/A107 两家,谭总4 那条不参与
     c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
     assert "谭总4" not in c3

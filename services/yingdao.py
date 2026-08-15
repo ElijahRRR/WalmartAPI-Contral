@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 
 from registry import paths
-from services import stores
+from services import kpi, stores
 
 logger = logging.getLogger("services.yingdao")
 
@@ -43,10 +43,9 @@ def _robot_uuid() -> str:
 # 或变更,而 latest.json 现仍按 sellerId 回键(格式不动,一次只改一端)。
 _INPUT_FIELDS = ("store", "seller_id", "store_status", "payment_status")
 
-# 只放行 sellerStatus 为此值的店(所有者定稿 2026-08-15)。非 ACTIVE 的店前台
-# 页面本就没什么可看,抓它纯耗时间和风控额度。
-_ACTIVE = "ACTIVE"
-
+# 「什么算在营」的判断在 kpi.store_activity,本模块不自己写 —— 同一个谓词
+# 还被 kpi.derived_sales_status 用着(不抓的那些店直接标「不可售」),
+# 两处各写一份 upper() != "ACTIVE" 迟早会飘成"抓了却标不可售"。
 _STAT_KEYS = ("written", "no_seller_id", "inactive", "dup_seller_id",
               "unknown_status")
 
@@ -82,17 +81,17 @@ def write_input(rows: list[dict]) -> dict[str, int]:
     stats = dict.fromkeys(_STAT_KEYS, 0)
     for r in rows:
         sid = str(r.get("seller_id") or "").strip()
-        status = str(r.get("store_status") or "").strip().upper()
+        activity = kpi.store_activity(r.get("store_status"))
         if not sid:
             stats["no_seller_id"] += 1
             continue
-        if status and status != _ACTIVE:
+        if activity == "inactive":
             stats["inactive"] += 1
             continue
         if sid in seen:
             stats["dup_seller_id"] += 1
             continue
-        if not status:
+        if activity == "unknown":
             stats["unknown_status"] += 1      # 纳入,但要看得见
         seen.add(sid)
         out.append({f: ("" if r.get(f) is None else str(r[f]))

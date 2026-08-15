@@ -280,6 +280,40 @@ def test_write_input_filters_each_counted(monkeypatch, tmp_path):
     assert set(data["stores"][0]) == set(yingdao._INPUT_FIELDS)
 
 
+def test_suspended_stores_default_to_not_selling():
+    """所有者定稿 2026-08-15:SUSPENDED / TERMINATED 的店销售状态默认「不可售」。
+
+    这些店不进影刀清单,不给默认值的话销售状态会永远空着;店都停了,
+    定义上就是不可售。⚠ 不违反「销售状态不做跨日延续」—— 它推导自本轮观测到的
+    store_status,不是回填昨天的旧值。
+    """
+    assert kpi.derived_sales_status("SUSPENDED") == "不可售"
+    assert kpi.derived_sales_status("TERMINATED") == "不可售"
+    assert kpi.derived_sales_status("suspended") == "不可售"      # 大小写不敏感
+    assert kpi.derived_sales_status("ACTIVE") is None            # 在营的靠影刀实测
+    assert kpi.derived_sales_status("") is None                  # 空≠停用,别乱标
+    assert kpi.derived_sales_status(None) is None
+    assert (kpi.store_activity("ACTIVE"), kpi.store_activity("SUSPENDED"),
+            kpi.store_activity("")) == ("active", "inactive", "unknown")
+
+
+def test_scraped_and_derived_never_contradict(monkeypatch, tmp_path):
+    """「不抓它」与「标它不可售」必须永远指同一批店。
+
+    两边各写一份 upper() != "ACTIVE" 的话,一旦飘开就会出现"抓了它却把它标成
+    不可售"这种自相矛盾,而且没有任何报错。这里逐个状态值对拍。
+    """
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    for status in ("ACTIVE", "active", "SUSPENDED", "TERMINATED", "INACTIVE",
+                   "", None, "  Active  "):
+        st = yingdao.write_input([{"store": "S", "seller_id": "1",
+                                   "store_status": status}])
+        scraped = st["written"] == 1
+        derived = kpi.derived_sales_status(status)
+        # 抓它 ⇔ 不给它推导不可售;不抓它 ⇔ 直接标不可售
+        assert scraped is (derived is None), status
+
+
 def test_empty_store_status_is_included_not_treated_as_inactive(monkeypatch,
                                                                 tmp_path):
     """⚠ 空状态 ≠ 停用,是"没拿到"。

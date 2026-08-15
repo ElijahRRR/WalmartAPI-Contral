@@ -236,7 +236,9 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         "store": name, "data_date": data_date,
         # 影刀今日值优先(真改名能跟上),缺席才延续库里最近非空值
         "seller_name": names.get(sid) or last_names.get(name) or None,
-        "sales_status": statuses.get(sid) or None,
+        # 影刀实测优先;没抓(停用店本就不进清单)则按店铺状态推导「不可售」
+        "sales_status": (statuses.get(sid)
+                         or kpi.derived_sales_status(settle["store_status"])),
         "partner_id": settle["partner_id"], "seller_id": sid,
         "store_status": settle["store_status"],
         "payment_status": settle["payment_status"],

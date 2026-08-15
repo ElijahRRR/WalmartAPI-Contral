@@ -123,6 +123,36 @@ def _parse(headers: dict, row: tuple) -> tuple[dict | None, str | None]:
     }, None
 
 
+_HEADER_SCAN_ROWS = 30      # 表头前的说明/标题行:实测这份表首行是「订单数据合并概览」
+
+
+def _locate_header(wb, sheet_name=None):
+    """输入:workbook(+可选 sheet 名)→ 输出:(数据行迭代器, 表头映射, 位置串, 探测摘要)。
+
+    **不假设表头在第 1 行、也不假设数据在第 1 个 sheet**:实测这份表首行是
+    合并标题「订单数据合并概览」,而 openpyxl 的 read_only 迭代器只能前进,
+    所以逐行扫到第一行"必需列全在"的即认表头,迭代器自然停在数据首行。
+
+    找不到时把扫过的 sheet 与前几行原样回报——猜不出就把现场交出来,
+    比抛一句"表头变了"有用。
+    """
+    sheets = [wb[sheet_name]] if sheet_name else list(wb.worksheets)
+    probe: list[str] = []
+    for ws in sheets:
+        rows_iter = ws.iter_rows(values_only=True)
+        seen: list[str] = []
+        for i, row in enumerate(rows_iter):
+            if i >= _HEADER_SCAN_ROWS:
+                break
+            cells = {_cell(h): j for j, h in enumerate(row or ()) if _cell(h)}
+            if all(h in cells for h in _REQUIRED):
+                return rows_iter, cells, f"{ws.title} 第 {i + 1} 行", probe
+            if cells and len(seen) < 3:
+                seen.append("|".join(list(cells)[:6]))
+        probe.append(f"[{ws.title}] " + " ⏎ ".join(seen or ["(空)"]))
+    return None, None, None, "; ".join(probe)
+
+
 def run(params: dict) -> str:
     """输入:params(file 必填,apply/sheet 可选)→ 输出:预览或导入摘要。"""
     apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
@@ -135,15 +165,11 @@ def run(params: dict) -> str:
 
     from openpyxl import load_workbook
     wb = load_workbook(f, read_only=True, data_only=True)
-    ws = wb[params["sheet"]] if params.get("sheet") else wb.worksheets[0]
-
-    rows_iter = ws.iter_rows(values_only=True)
-    header_row = next(rows_iter, None) or ()
-    headers = {_cell(h): i for i, h in enumerate(header_row) if _cell(h)}
-    missing = [h for h in _REQUIRED if h not in headers]
-    if missing:
-        return (f"⛔ 缺必需列 {missing};实际表头:{sorted(headers)}"
-                "——表头变了先校准本文件 _REQUIRED/映射再跑")
+    rows_iter, headers, where, probe = _locate_header(wb, params.get("sheet"))
+    if headers is None:
+        return ("⛔ 找不到表头行(必需列 " + "/".join(_REQUIRED) + ")。"
+                f"扫过的 sheet 与前几行:{probe}"
+                "——确认文件对不对;表头真变了先校准本文件 _REQUIRED/映射再跑")
 
     total = ok = inserted = 0
     bad: list[str] = []
@@ -179,7 +205,8 @@ def run(params: dict) -> str:
     wb.close()
 
     bad_total = total - ok
-    lines = [f"读 {total} 行,可解析 {ok},坏行 {bad_total}"
+    lines = [f"表头定位于 {where}",
+             f"读 {total} 行,可解析 {ok},坏行 {bad_total}"
              + (f"(样例:{' / '.join(bad)})" if bad else ""),
              f"日期范围 {dmin:%Y-%m-%d} ~ {dmax:%Y-%m-%d}" if dmin else "日期范围:无",
              f"店铺 {len(stores)} 个:" + ", ".join(

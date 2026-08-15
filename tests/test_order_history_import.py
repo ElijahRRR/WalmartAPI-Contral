@@ -92,4 +92,39 @@ def test_apply_builds_rows(tmp_path, monkeypatch):
 
 def test_missing_required_header_refuses(tmp_path):
     s = wf.run({"file": _xlsx(tmp_path, [], head=["合并键", "SKU"])})
-    assert s.startswith("⛔ 缺必需列")
+    assert s.startswith("⛔ 找不到表头行")
+    assert "Sheet" in s and "合并键|SKU" in s        # 把现场交出来,不只说"变了"
+
+
+def test_header_found_below_title_rows(tmp_path):
+    """实测:这份表首行是合并标题「订单数据合并概览」,表头在下面。"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["订单数据合并概览"])
+    ws.append([])
+    ws.append(_HEAD)
+    for r in _ROWS:
+        ws.append(r)
+    p = tmp_path / "titled.xlsx"
+    wb.save(p)
+    s = wf.run({"file": str(p)})
+    assert "表头定位于 Sheet 第 3 行" in s
+    assert "读 4 行,可解析 3" in s
+
+
+def test_header_found_in_second_sheet(tmp_path):
+    """封面页在前、数据在后一个 sheet 时也要能找到。"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    cover = wb.active
+    cover.title = "概览"
+    cover.append(["订单数据合并概览"])
+    data = wb.create_sheet("明细")
+    data.append(_HEAD)
+    for r in _ROWS:
+        data.append(r)
+    p = tmp_path / "two_sheets.xlsx"
+    wb.save(p)
+    s = wf.run({"file": str(p)})
+    assert "表头定位于 明细 第 1 行" in s

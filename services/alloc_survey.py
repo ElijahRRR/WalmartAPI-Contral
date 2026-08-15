@@ -29,26 +29,44 @@ def is_excluded(store: str) -> bool:
     return any(p in name for p in resources.alloc_excluded_stores())
 
 
-def claimable(rows, registered) -> list[dict]:
-    """输入:富化行 + 在册店名集合 → 输出:**占得住货位的行**。
+def claimable(rows, registered, cfg=None) -> list[dict]:
+    """输入:富化行 + 在册店名集合(+ 店铺配置)→ 输出:**占得住货位的行**。
 
-    冲突判定的唯一入行口径。`alloc_audit`(出清单)与 `alloc_backfill`
-    (落占用)都必须走这里 —— 两边各写各的筛法,报告说"留 A085"、回填却
-    落到别家,那份给人照着做的清单就是假的(本模块存在的理由)。
+    冲突判定与占用回填的唯一入行口径。`alloc_audit`(出清单)与
+    `alloc_backfill`(落占用)都必须走这里 —— 两边各写各的筛法,报告说
+    "留 A085"、回填却落到别家,那份给人照着做的清单就是假的(本模块存在的理由)。
 
-    三条筛法:
+    四条筛法:
       · **在册**:不在册店的行是冻结快照(catalog_sync 早不扫它了),
         混进来会让所有者为一家不存在的店去下架另一家店真在卖的 listing;
       · **规划内**:范围外的店(店名含「谭总」等)不占任何品牌与产品;
-      · **已发布**:未发布的不算真占着货位。
+      · **已发布**:未发布的不算真占着货位;
+      · **类目准入**(传了 cfg 才生效):不准入该大类的行**不产生占用**。
 
     ⚠ 第三条曾经只写在回填侧,报告侧漏了(2026-08-15 实证:同一个品牌
     报告判"留 B"、回填落"留 A"——未发布行进了报告的「在线件数」那一级)。
-    真打平组靠件数定序,多算几条未发布的就能把冠亚军换个位置。
+
+    ⚠ 第四条是 2026-08-15 晚补的,补的是一个会**永久锁错品牌**的洞:
+    `alloc_backfill._pick` 对**只有一家店有**的键直接归属,不过任何类目闸
+    (类目硬闸只在 `resolve_conflicts` 的多店组里跑)。于是「某店独有、且
+    类目不符」的品牌——正躺在 `alloc_类目不符下架清单.csv` 上等着被下架的
+    那些——照样被它占走,**而占用没有自动释放**:货下架了,品牌却永远锁在
+    这家不该做这个大类的店上,再也分不给对的店。
+    同理,一个品牌在两家店都不准入时,旧的硬闸"不作数"会退回销量阶梯,
+    照样把它判给其中一家;现在两边的行都进不了这里,谁也占不到。
     """
-    return [r for r in rows
-            if r["store"] in registered and r["published"]
-            and not is_excluded(r["store"])]
+    out = [r for r in rows
+           if r["store"] in registered and r["published"]
+           and not is_excluded(r["store"])]
+    if cfg:
+        # 丢的必须**恰好**是 `category_offenders` 会列进下架清单的那些行:
+        # 归不到大类的**留着**(「未知不算不符」纪律)。两边口径不一致的话,
+        # 会出现"没进下架清单、却也不给它占用"的行 —— 货还在架上卖着,
+        # 品牌却成了无主,别的店一回填就把它抢走。
+        out = [r for r in out
+               if not r.get("category")
+               or store_targets.allowed(cfg.get(r["store"]), r["category"])]
+    return out
 
 _CHUNK = 5000
 UNCLASSIFIED = "(未归类)"

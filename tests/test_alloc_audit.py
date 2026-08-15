@@ -841,3 +841,54 @@ def test_run_exports_the_category_disposal_list(monkeypatch, tmp_path):
     txt = (tmp_path / "alloc_类目不符下架清单.csv").read_text(encoding="utf-8-sig")
     assert "A085" in txt and "Home" in txt and "B0CCCC0003" in txt
     assert "下架类目不符" in out and "alloc_类目不符下架清单.csv" in out
+
+
+def test_category_violating_rows_never_produce_a_claim():
+    """类目不符的行**不产生占用** —— 它们已经在下架清单上了。
+
+    2026-08-15 晚实证的洞:`alloc_backfill._pick` 对**只有一家店有**的键
+    直接归属,不过任何类目闸(硬闸只在 resolve_conflicts 的多店组里跑)。
+    于是"某店独有 + 类目不符"的品牌照样被占走,而**占用没有自动释放**:
+    货下架了,品牌却永远锁在这家不该做这个大类的店上,再也分不给对的店。
+    """
+    from workflows import alloc_backfill as bf
+    rows = [
+        {"store": "A", "sku": "S1", "asin": "B0AAAA0001", "brand_key": "acme",
+         "category": "Fashion", "published": True, "pt": "x", "pt_source": None},
+        {"store": "A", "sku": "S2", "asin": "B0BBBB0002", "brand_key": "违规牌",
+         "category": "Home", "published": True, "pt": "y", "pt_source": None},
+    ]
+    cfg = {"A": {"categories": ["Fashion"]}}
+    live = sv.claimable(rows, {"A"}, cfg)
+    assert [r["sku"] for r in live] == ["S1"]
+    owner, _ = bf._pick(live, {}, "brand_key", include_ties=False,
+                        metrics=sv.store_metrics(live, {}), cfg=cfg)
+    assert owner == {"acme": "A"}          # 违规牌不被占,留给能做 Home 的店
+
+
+def test_claim_filter_and_disposal_list_agree_on_unclassified():
+    """两边口径必须**恰好**一致:归不到大类的行既不进下架清单,也照常占用。
+
+    不一致会出现"没进下架清单、却也不给它占用"的行 —— 货还在架上卖着,
+    品牌却成了无主,别的店一回填就把它抢走。
+    """
+    rows = [{"store": "A", "sku": "S1", "asin": "B0AAAA0001", "brand_key": "x",
+             "category": None, "published": True}]
+    cfg = {"A": {"categories": ["Fashion"]}}
+    bad, unknown = sv.category_offenders(rows, cfg)
+    assert bad == [] and unknown == 1                    # 不进下架清单
+    assert sv.claimable(rows, {"A"}, cfg) == rows        # 也照常占用
+
+
+def test_disposal_lists_come_from_slot_rows_not_claim_rows(monkeypatch, tmp_path):
+    """处置清单出自"占着货位的行",不是"该占用的行"——否则清单永远是空的。
+
+    货此刻确实在架上卖着,必须列出来让人下架;而它同时又不该产生占用。
+    两个集合各司其职,拿错一个这份清单就自己把自己过滤没了。
+    """
+    cur = _FakeCur()
+    cur.extra_items = [("A085", "B0CCCC0003", "Knives", "PUBLISHED")]
+    _wire(monkeypatch, cur, reports=tmp_path)
+    wf.run({})
+    txt = (tmp_path / "alloc_类目不符下架清单.csv").read_text(encoding="utf-8-sig")
+    assert "B0CCCC0003" in txt and "Home" in txt

@@ -188,8 +188,15 @@ def run(params: dict) -> str:
     # 逐字同一口径(sv.claimable)——用 live_rows 算会把未发布行算进「在线件数」
     # 那一级,真打平组的冠亚军就换了位,报告与回填给出两个不同的保留店。
     # live_rows(含未发布)只用来看"这家店的目录长什么样":类目分布、渠道。
-    claim_rows = sv.claimable(rows, registered if registered is not None
-                              else set(prof_all))
+    reg = registered if registered is not None else set(prof_all)
+    # 两个集合,别混:
+    #   slot_rows —— **占着货位的行**(在册∧已发布∧规划内)。处置清单出自这里:
+    #                类目/渠道不符的货此刻确实在架上卖着,必须列出来让人下架;
+    #   claim_rows —— **该产生占用的行** = slot_rows 再去掉类目不符的。
+    #                它们已经在下架清单上了,不该再被占走(占用无自动释放,
+    #                占了就永远锁在这家不该做这个大类的店上)。
+    slot_rows = sv.claimable(rows, reg)
+    claim_rows = sv.claimable(rows, reg, cfg)
     metrics = sv.store_metrics(claim_rows, sales)
     conflicts = {}
     for tag, field in (("同 ASIN", "asin"), ("同品牌", "brand_key")):
@@ -200,10 +207,10 @@ def run(params: dict) -> str:
     # 渠道:没取渠道就没有结论。算出来必是 0,而"不符 0 件"读起来正好像
     # 全店合规 —— 这一节必须显式说"本轮没查",不能拿 0 冒充结论
     can_channel = bool(cfg) and with_channel
-    mism = sv.channel_mismatch(sv.store_profiles(claim_rows), cfg) if can_channel else []
-    offenders = sv.channel_offenders(claim_rows, cfg) if can_channel else []
+    mism = sv.channel_mismatch(sv.store_profiles(slot_rows), cfg) if can_channel else []
+    offenders = sv.channel_offenders(slot_rows, cfg) if can_channel else []
     # 类目不符:所有者填完类目三列后的第一件事。与销量无关——类目是硬闸
-    cat_bad, cat_unknown = (sv.category_offenders(claim_rows, cfg) if cfg
+    cat_bad, cat_unknown = (sv.category_offenders(slot_rows, cfg) if cfg
                             else ([], 0))
     scope = (sorted(set(registered) | set(prof)) if registered is not None
              else sorted(prof))

@@ -47,6 +47,24 @@ def feishu_app_secret() -> str:
     return v
 
 
+def alloc_excluded_stores() -> tuple[str, ...]:
+    """输入:无 → 输出:**不纳入分配规划**的店铺名子串(命中即排除)。
+
+    所有者定稿 2026-08-15:店名含「谭总」的店不在规划范围内——
+    - 不给它们分配、不判它们的类目、不占品牌与产品;
+    - **其他店可以与它们重复**上同一品牌/产品(所以它们的在线商品既不进
+      冲突清单,也不参与 list_new 的全局去重闸);
+    - 但**它们的销量照常计入**产品/品牌/类目三个全局维度——那是别的店选品
+      时的有效信号,排除的是"归属",不是"数据"。
+
+    env `ALLOC_EXCLUDE_STORES` 覆盖(逗号分隔);留空字符串 = 谁都不排除。
+    """
+    raw = os.environ.get("ALLOC_EXCLUDE_STORES")
+    if raw is None:
+        return ("谭总",)
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
 def feishu_webhook_url() -> str | None:
     """输入:无 → 输出:运行通知群机器人 webhook URL;未配置返回 None(通知降级为仅日志)。"""
     return os.environ.get("FEISHU_WEBHOOK_URL", "").strip() or None

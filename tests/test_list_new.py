@@ -412,3 +412,43 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
     assert "T1 B0MINE0001 定价" in out
     assert "T1 B0NOBRAND1 定价" in out
     assert "共 2 行将进入" in out
+
+
+def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
+    """规划范围外的店(店名含「谭总」)在架的产品**不拦**别的店上架。
+
+    所有者定稿 2026-08-15:那些店不在分配规划内,其他店可以与它们重复。
+    """
+    seen = {}
+
+    class _Cur:
+        def execute(self, sql, args=None):
+            self.sql = sql
+            seen["last"] = sql
+
+        def fetchall(self):
+            if "walmart_items" in seen["last"]:
+                return [("谭总4", "B0TANZONG1"), ("A085", "B0MINE0001")]
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    import contextlib
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(ln.blacklist, "load_banned_asins", lambda c: {})
+    monkeypatch.setattr(ln.risk_gate, "load_gate",
+                        lambda c: {"banned_pts": set(), "brands": set()})
+    monkeypatch.setattr(ln.claims, "load_active", lambda c, k: {})
+
+    _, _, listed, *_ = ln._load_gate_state()
+    assert "B0MINE0001" in listed          # 规划内的店照样拦
+    assert "B0TANZONG1" not in listed      # 范围外的店不拦

@@ -12,10 +12,21 @@
 import logging
 from collections import Counter, defaultdict
 
+from registry import resources
 from services import brand_key as bk
 from services import sku_asin, store_targets
 
 logger = logging.getLogger("services.alloc_survey")
+
+
+def is_excluded(store: str) -> bool:
+    """输入:店铺名 → 输出:是否**不纳入分配规划**(registry 的子串名单)。
+
+    排除的是"归属"不是"数据":这些店不判类目、不占品牌与产品、其在线商品
+    不拦别人上架;但它们的订单销量照常进全局维度,给别的店当选品信号。
+    """
+    name = str(store or "")
+    return any(p in name for p in resources.alloc_excluded_stores())
 
 _CHUNK = 5000
 UNCLASSIFIED = "(未归类)"
@@ -336,9 +347,11 @@ def store_metrics(rows, sales):
 
 #: 判定阶梯:上一级分不出来才看下一级。名字会写进 csv,让人知道这条是怎么定的
 LADDER = ("按该商品销量", "按该店该大类销量", "按该店整体销量", "按在线件数", "按店名")
+#: 类目准入是**硬闸不是阶梯**:店不准入这个大类,货就必须离开它,与销量无关
+BY_CATEGORY = "按类目准入"
 
 
-def resolve_conflicts(rows, sales, field, metrics=None):
+def resolve_conflicts(rows, sales, field, metrics=None, cfg=None):
     """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名(+ store_metrics 产物)
     → 输出:[(键, 保留店, 保留店统计, 明细行, 判定依据)]。
 
@@ -362,6 +375,30 @@ def resolve_conflicts(rows, sales, field, metrics=None):
             groups[v].append(r)
     out = []
     for key, items in groups.items():
+        # ── 硬闸先于阶梯:类目定了之后,不准入该大类的店直接出局 ──
+        # 所有者的处理顺序(2026-08-15):先判每店类目,再判品牌与冲突。
+        # 顺序是有意义的——某店不再做这个大类,那批货就必须离开它,
+        # 不是"销量谁大谁留"能决定的事。
+        admitted = items
+        gated = False
+        if cfg:
+            keep_rows = [r for r in items
+                         if store_targets.allowed(cfg.get(r["store"]),
+                                                  r.get("category"))]
+            # 全被类目闸挡下时不作数(那说明这批货哪家都不该有,交给人看),
+            # 只剩一家或多家时才用它收窄
+            if keep_rows and len({r["store"] for r in keep_rows}) < len(
+                    {r["store"] for r in items}):
+                admitted, gated = keep_rows, True
+        if len({r["store"] for r in admitted}) < 2:
+            if gated:      # 类目闸一刀定音:留下的那家就是答案
+                keep = admitted[0]["store"]
+                detail = [(r["store"], r["sku"], r["asin"] or "", 0, 0.0, 0.0, 0.0,
+                           "保留" if r["store"] == keep else "下架")
+                          for r in sorted(items, key=lambda r: (r["store"], r["sku"]))]
+                out.append((key, keep, {"gmv": 0.0}, detail, BY_CATEGORY))
+            continue
+        items = admitted
         by_store: dict[str, dict] = {}
         for r in items:
             o, g = sales.get((r["store"], r["sku"]), (0, 0.0))

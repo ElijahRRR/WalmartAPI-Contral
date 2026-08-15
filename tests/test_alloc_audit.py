@@ -290,6 +290,7 @@ class _FakeCur:
     def __init__(self, fail_pt_dict=False):
         self.fail_pt_dict = fail_pt_dict
         self._no_sales = False
+        self.extra_items: list = []
         self.description = []
         self._rows: list = []
 
@@ -317,7 +318,7 @@ class _FakeCur:
             self._rows = [("Socks", "Fashion"), ("Hats", "Fashion"),
                           ("Knives", "Home")]
         elif "FROM catalog.walmart_items" in sql:
-            self._rows = list(ITEMS)
+            self._rows = list(ITEMS) + list(self.extra_items)
         elif "store_kpi_daily" in sql:
             self._rows = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE")]
         elif "GROUP BY store ORDER BY n DESC" in sql:      # A8 订单店名对账
@@ -401,7 +402,7 @@ def test_run_end_to_end_report(monkeypatch):
     # 评分/评论探针为 0 → 必须点名删权重(禁止 or 0)
     assert "禁止 or 0" in out
     # DEAD1 不在册:其行被排除出冲突,且在 A4 被点名
-    assert "已排除不在册店的冻结行 1 行 / 1 家店" in out
+    assert "不在册店冻结行 1 家" in out and "合计排除 1 行" in out
     assert "DEAD1×1" in out
     # A7:A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
     assert "非 ACTIVE 的 0 家" in out
@@ -490,3 +491,59 @@ def test_sales_sql_excludes_cancelled_not_missing_raw_key():
     """
     assert "sale_status" in sv._SQL_SALES and "Cancelled" in sv._SQL_SALES
     assert "统计状态" not in sv._SQL_SALES      # 该列根本没被导入
+
+
+# ── 规划范围外的店(所有者定稿 2026-08-15:店名含「谭总」)────────────────
+
+def test_excluded_stores_are_matched_by_substring(monkeypatch):
+    assert sv.is_excluded("谭总4") and sv.is_excluded("X谭总Y")
+    assert not sv.is_excluded("A085朱丽霖")
+    monkeypatch.setenv("ALLOC_EXCLUDE_STORES", "测试店,foo")
+    assert sv.is_excluded("测试店1") and sv.is_excluded("FOObar") is False
+    assert sv.is_excluded("foo仓")
+    monkeypatch.setenv("ALLOC_EXCLUDE_STORES", "")
+    assert not sv.is_excluded("谭总4")        # 显式置空 = 谁都不排除
+
+
+def test_run_drops_out_of_scope_stores_from_conflicts(monkeypatch, tmp_path):
+    """范围外店的在线行不进冲突:别的店可以与它们重复上同一品牌/产品。"""
+    cur = _FakeCur()
+    cur.extra_items = [("谭总4", "B0AAAA0001", "Socks", "PUBLISHED")]
+    _wire(monkeypatch, cur, registered={"A085", "A107", "谭总4"}, reports=tmp_path)
+    out = wf.run({})
+    assert "规划范围外的店 1 家/1 行" in out and "谭总4" in out
+    # 同 ASIN 仍只算 A085/A107 两家,谭总4 那条不参与
+    c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
+    assert "谭总4" not in c3
+
+
+def test_category_admission_is_a_hard_gate_before_the_ladder():
+    """类目先定、冲突后判:店不准入该大类,货就必须离开它,与销量无关。"""
+    rows = [
+        {"store": "A085", "sku": "S1", "asin": "B0A", "brand_key": "acme",
+         "category": "Home", "published": True, "pt": "Socks", "pt_source": None},
+        {"store": "A107", "sku": "S2", "asin": "B0A", "brand_key": "acme",
+         "category": "Home", "published": True, "pt": "Socks", "pt_source": None},
+    ]
+    # A107 卖得更好,但它的准入类目里没有 Home → 仍然判给 A085
+    sales = {("A107", "S2"): (9, 999.0)}
+    cfg = {"A085": {"categories": ["Home"]}, "A107": {"categories": ["Office"]}}
+    key, keep, _st, detail, level = sv.resolve_conflicts(
+        rows, sales, "asin", sv.store_metrics(rows, sales), cfg)[0]
+    assert keep == "A085" and level == sv.BY_CATEGORY
+    assert [d[7] for d in detail] == ["保留", "下架"]
+
+
+def test_category_gate_skipped_when_nobody_admits():
+    """两家都不准入时不作数——那说明这批货哪家都不该有,交给人看,
+    不能因为"都不合规"就随便留一家。"""
+    rows = [
+        {"store": "A", "sku": "S1", "asin": "B0A", "brand_key": None,
+         "category": "Home", "published": True, "pt": None, "pt_source": None},
+        {"store": "B", "sku": "S2", "asin": "B0A", "brand_key": None,
+         "category": "Home", "published": True, "pt": None, "pt_source": None},
+    ]
+    cfg = {"A": {"categories": ["Office"]}, "B": {"categories": ["Office"]}}
+    (key, keep, _st, _d, level) = sv.resolve_conflicts(
+        rows, {}, "asin", ({}, {}), cfg)[0]
+    assert level != sv.BY_CATEGORY          # 退回阶梯,不是类目说了算

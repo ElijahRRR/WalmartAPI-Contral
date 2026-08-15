@@ -32,7 +32,7 @@ from collections import Counter
 from registry import db
 from services import claims
 from services import alloc_survey as sv           # 判定口径与 alloc_audit 同一套
-from services import sku_asin, stores as stores_svc
+from services import sku_asin, store_targets, stores as stores_svc
 
 DANGEROUS = True
 
@@ -41,7 +41,7 @@ logger = logging.getLogger("workflows.alloc_backfill")
 SOURCE = "alloc_backfill"
 
 
-def _pick(rows, sales, field, include_ties, metrics=None):
+def _pick(rows, sales, field, include_ties, metrics=None, cfg=None):
     """输入:富化行 + 销量 + 冲突键名 + 是否含打平组
     → 输出:({键: 归属店}, 跳过的打平组数)。
 
@@ -55,7 +55,7 @@ def _pick(rows, sales, field, include_ties, metrics=None):
             owner[v] = r["store"]
     skipped = 0
     for key, keep, _stat, _detail, level in sv.resolve_conflicts(
-            rows, sales, field, metrics):
+            rows, sales, field, metrics, cfg):
         # 只有"连店铺整体销量都分不出"才算真打平(靠在线件数/店名定序)
         if level in (sv.LADDER[3], sv.LADDER[4]) and not include_ties:
             owner.pop(key, None)
@@ -89,12 +89,20 @@ def run(params: dict) -> str:
         registered = stores_svc.registered_names()
     except Exception as e:                            # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
-    live = [r for r in rows if r["store"] in registered and r["published"]]
+    # 纪律 1 追加:规划范围外的店(店名含「谭总」等)不占任何品牌与产品
+    # ——所有者定稿 2026-08-15,其他店可与它们重复上架
+    live = [r for r in rows if r["store"] in registered and r["published"]
+            and not sv.is_excluded(r["store"])]
     dropped = len(rows) - len(live)
 
+    try:
+        cfg = store_targets.load_targets()      # 类目准入是冲突判定的硬闸
+    except Exception as e:                      # noqa: BLE001
+        return f"⛔ 限额表读不到({e}):类目准入判不了,拒绝回填"
     metrics = sv.store_metrics(live, sales)
-    brand_owner, brand_ties = _pick(live, sales, "brand_key", include_ties, metrics)
-    prod_owner, prod_ties = _pick(live, sales, "asin", include_ties, metrics)
+    brand_owner, brand_ties = _pick(live, sales, "brand_key", include_ties,
+                                    metrics, cfg)
+    prod_owner, prod_ties = _pick(live, sales, "asin", include_ties, metrics, cfg)
 
     snap = {}
     for r in live:

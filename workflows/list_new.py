@@ -53,7 +53,7 @@ from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
-from services import amz_source, blacklist, brand_key, claims, kpi, \
+from services import alloc_survey, amz_source, blacklist, brand_key, claims, kpi, \
     listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
     pricing, product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
 
@@ -73,7 +73,7 @@ WHERE feed_type = 'MP_ITEM'
 GROUP BY store
 """
 _SQL_LISTED_ASINS = """
-SELECT DISTINCT sku FROM catalog.walmart_items WHERE missing_since IS NULL
+SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NULL
 """
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
@@ -88,7 +88,11 @@ def _load_gate_state():
         cur.execute(_SQL_TODAY_LISTED)
         today_used = {s: int(n) for s, n in cur.fetchall()}
         cur.execute(_SQL_LISTED_ASINS)
-        listed = {r[0] for r in cur.fetchall()}
+        # 规划范围外的店(店名含「谭总」等,registry.alloc_excluded_stores)
+        # **不参与全局去重**:所有者定稿 2026-08-15——其他店可以与它们重复
+        # 上同一产品。它们既不占用、也不拦别人
+        listed = {sku for store, sku in cur.fetchall()
+                  if not alloc_survey.is_excluded(store)}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)

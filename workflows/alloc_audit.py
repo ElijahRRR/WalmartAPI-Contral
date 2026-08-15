@@ -142,8 +142,14 @@ def run(params: dict) -> str:
     # 冻结行(不在册店的在线行)不进冲突分析——纪律 1
     frozen = ({s for s in prof_all if s not in registered}
               if registered is not None else set())
-    live_rows = [r for r in rows if r["store"] not in frozen]
+    # 规划范围外的店(registry.alloc_excluded_stores,当前=店名含「谭总」):
+    # 不判类目、不占品牌与产品、其在线商品不与别人算冲突——所有者定稿
+    # 2026-08-15。**它们的订单销量不受影响**(排除的是归属不是数据)
+    out_of_scope = {s for s in prof_all if sv.is_excluded(s)}
+    skipped = frozen | out_of_scope
+    live_rows = [r for r in rows if r["store"] not in skipped]
     dropped = len(rows) - len(live_rows)
+    oos_rows = sum(prof_all[s]["n"] for s in out_of_scope)
     prof = sv.store_profiles(live_rows)
     pub_rows = [r for r in live_rows if r["published"]]
 
@@ -189,8 +195,14 @@ def run(params: dict) -> str:
         L.append(f"⚠ 凭证表读取失败({reg_err}),**本轮未排除已不在册店的冻结行**"
                  f"——A1/A2/A3/A5 的数含幻影店铺,只可参考不可据以下架")
     else:
-        L.append(f"   已排除不在册店的冻结行 {dropped} 行 / {len(frozen)} 家店"
-                 f"(下面 A1~A3、A5 均为在册店口径)")
+        L.append(f"   已排除:不在册店冻结行 {len(frozen)} 家、"
+                 f"**规划范围外的店 {len(out_of_scope)} 家/{oos_rows} 行**"
+                 f"(registry.alloc_excluded_stores="
+                 f"{list(sv.resources.alloc_excluded_stores())};"
+                 f"它们不判类目、不占品牌产品、不与别人算冲突,"
+                 f"但销量照常进全局维度);合计排除 {dropped} 行"
+                 + (f":{', '.join(sorted(out_of_scope)[:sample])}"
+                    if out_of_scope else ""))
 
     a1 = sv.cross_store(live_rows, "asin")
     L.append(f"A1 同 ASIN 跨店在线:{len(a1)} 个 ASIN"
@@ -330,7 +342,7 @@ def run(params: dict) -> str:
     metrics = sv.store_metrics(live_rows, sales)
     for tag, field, fname in (("C3 同 ASIN 跨店", "asin", "alloc_同ASIN冲突处置.csv"),
                               ("C4 同品牌跨店", "brand_key", "alloc_同品牌冲突处置.csv")):
-        res = sv.resolve_conflicts(live_rows, sales, field, metrics)
+        res = sv.resolve_conflicts(live_rows, sales, field, metrics, cfg)
         rows_x = [(key, keep, level, st, sku, asin, o, g, cg, sg, verdict)
                   for key, keep, _, detail, level in res
                   for st, sku, asin, o, g, cg, sg, verdict in detail]

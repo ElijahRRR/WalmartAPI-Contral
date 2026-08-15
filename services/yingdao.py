@@ -43,25 +43,48 @@ def _robot_uuid() -> str:
 # 或变更,而 latest.json 现仍按 sellerId 回键(格式不动,一次只改一端)。
 _INPUT_FIELDS = ("store", "seller_id", "store_status", "payment_status")
 
+# 只放行 sellerStatus 为此值的店(所有者定稿 2026-08-15)。非 ACTIVE 的店前台
+# 页面本就没什么可看,抓它纯耗时间和风控额度。
+_ACTIVE = "ACTIVE"
 
-def write_input(rows: list[dict]) -> tuple[int, int]:
-    """输入:当轮已入库的 KPI 行 → 输出:(写出店数, 因 sellerId 为空丢弃数)。
+_DROP_REASONS = ("no_seller_id", "inactive", "dup_seller_id")
 
-    ⚠ 空 sellerId 必须在这里丢掉(A147 事故防线):影刀拿它拼出
-    https://www.walmart.com/seller//cp/shopall(路径中段为空)会崩掉整条
-    RPA 循环,**后续店铺全被跳过**——不是少抓一家,是少抓一半。
-    这些店照常入库,只是不参与前台抓取。
+
+def write_input(rows: list[dict]) -> tuple[int, dict[str, int]]:
+    """输入:当轮已入库的 KPI 行 → 输出:(写出店数, {丢弃原因: 店数})。
+
+    整文件覆盖写,只含本轮真跑到的店——不追加、不与上一版合并,所以不会重复。
+
+    三道过滤,**每道都单独计数**(丢弃静默常态化 = 少抓一半没人知道):
+    - `no_seller_id` 空 sellerId。⚠ A147 事故防线:影刀拿它拼出
+      https://www.walmart.com/seller//cp/shopall(路径中段为空)会崩掉整条
+      RPA 循环,**后续店铺全被跳过**——不是少抓一家,是少抓一半。
+    - `inactive` store_status 非 ACTIVE。
+    - `dup_seller_id` 同一 sellerId 出现多次(店铺凭证表有重复行时会发生),
+      抓两遍同一个页面纯属浪费,后者覆盖前者也看不出来。
+
+    被丢掉的店**照常入库**,只是不参与前台抓取;它们当天的销售状态会留空
+    (卖家名称有跨日延续兜底)。
 
     原子写(tmp + rename):影刀随时可能在读,写一半被读到会让它解析失败。
     latest.json 那侧本仓早就在防这件事(读到半截文件继续等),这边同样欠不得。
     """
     path = paths.yingdao_input_file()
-    out, dropped = [], 0
+    out: list[dict] = []
+    seen: set[str] = set()
+    drops = dict.fromkeys(_DROP_REASONS, 0)
     for r in rows:
-        if not str(r.get("seller_id") or "").strip():
-            dropped += 1
-            continue
-        out.append({f: ("" if r.get(f) is None else str(r[f])) for f in _INPUT_FIELDS})
+        sid = str(r.get("seller_id") or "").strip()
+        if not sid:
+            drops["no_seller_id"] += 1
+        elif str(r.get("store_status") or "").strip().upper() != _ACTIVE:
+            drops["inactive"] += 1
+        elif sid in seen:
+            drops["dup_seller_id"] += 1
+        else:
+            seen.add(sid)
+            out.append({f: ("" if r.get(f) is None else str(r[f]))
+                        for f in _INPUT_FIELDS})
     out.sort(key=lambda r: stores.sort_key(r["store"]))     # 与看板同一店铺序
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
                "count": len(out), "stores": out}
@@ -70,10 +93,8 @@ def write_input(rows: list[dict]) -> tuple[int, int]:
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                    encoding="utf-8")
     os.replace(tmp, path)
-    if dropped:
-        logger.info("影刀输入:%d 店写出 %s,空 sellerId 丢弃 %d 店(A147 防线)",
-                    len(out), path, dropped)
-    return len(out), dropped
+    logger.info("影刀输入:%d 店写出 %s,丢弃 %s", len(out), path, drops)
+    return len(out), drops
 
 
 def spawn() -> bool:

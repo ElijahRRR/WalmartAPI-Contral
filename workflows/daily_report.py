@@ -294,8 +294,9 @@ def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
     上次的行保留下来(sheet 是长存的),于是单店跑 `-p store=X` 也会让影刀去抓
     全部 49 家。文件每轮覆盖写,"这轮抓哪些"与"这轮拉了哪些"从此是同一件事。
     """
-    written, dropped = yingdao.write_input(rows)
-    line = (f"影刀:输入清单 {written} 店(空 sellerId 过滤 {dropped})"
+    written, drops = yingdao.write_input(rows)
+    skipped = ",".join(f"{k} {v}" for k, v in drops.items() if v) or "无"
+    line = (f"影刀:输入清单 {written} 店(未纳入:{skipped})"
             f" → {paths.yingdao_input_file()}")
     if not written:
         return line + ",无可抓店铺,跳过 spawn"

@@ -246,24 +246,31 @@ def _rows_for_input():
     return [
         {"store": "Z店", "seller_id": "222", "store_status": "ACTIVE",
          "payment_status": "ACTIVE", "seller_name": "不该出现"},
-        {"store": "A店", "seller_id": "111", "store_status": "ACTIVE",
-         "payment_status": None},
+        {"store": "A店", "seller_id": "111", "store_status": "active",
+         "payment_status": None},                       # 大小写不敏感
         {"store": "空号店", "seller_id": "", "store_status": "ACTIVE",
          "payment_status": "ACTIVE"},
         {"store": "空号店2", "seller_id": None, "store_status": None,
          "payment_status": None},
+        {"store": "停用店", "seller_id": "333", "store_status": "SUSPENDED",
+         "payment_status": "ACTIVE"},
+        {"store": "无状态店", "seller_id": "444", "store_status": "",
+         "payment_status": "ACTIVE"},
+        {"store": "重复店", "seller_id": "222", "store_status": "ACTIVE",
+         "payment_status": "ACTIVE"},                   # 与 Z店 同 sellerId
     ]
 
 
-def test_write_input_filters_empty_seller_id(monkeypatch, tmp_path):
-    """A147 事故防线搬到文件侧:空 sellerId 一个都不许进影刀输入。
+def test_write_input_three_filters_each_counted(monkeypatch, tmp_path):
+    """三道过滤各自计数 —— 丢弃静默常态化 = 少抓一半没人知道。
 
-    影刀拿它拼出 /seller//cp/shopall(路径中段为空)会崩掉整条 RPA 循环 ——
-    后果不是少抓这一家,是它之后的店**全被跳过**。
+    ⚠ 空 sellerId 是 A147 事故防线:影刀拿它拼出 /seller//cp/shopall
+    (路径中段为空)会崩掉整条 RPA 循环,后果不是少抓这一家,是它之后的店全被跳过。
     """
     monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
-    written, dropped = yingdao.write_input(_rows_for_input())
-    assert (written, dropped) == (2, 2)
+    written, drops = yingdao.write_input(_rows_for_input())
+    assert written == 2
+    assert drops == {"no_seller_id": 2, "inactive": 2, "dup_seller_id": 1}
     data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
     assert data["count"] == 2
     assert [s["store"] for s in data["stores"]] == ["A店", "Z店"]   # 按店铺排序
@@ -271,6 +278,16 @@ def test_write_input_filters_empty_seller_id(monkeypatch, tmp_path):
     assert data["stores"][0]["payment_status"] == ""               # None → 空串
     # 只公开约定的四个字段,别的列不许漏给影刀
     assert set(data["stores"][0]) == set(yingdao._INPUT_FIELDS)
+
+
+def test_write_input_overwrites_never_accumulates(monkeypatch, tmp_path):
+    """每轮整文件覆盖:上一轮的店不许残留(旧飞书投影就是栽在 sheet 长存上)。"""
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    yingdao.write_input(_rows_for_input())
+    yingdao.write_input([{"store": "单店", "seller_id": "999",
+                          "store_status": "ACTIVE", "payment_status": "ACTIVE"}])
+    data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
+    assert data["count"] == 1 and data["stores"][0]["seller_id"] == "999"
 
 
 def test_write_input_is_atomic_and_leaves_no_tmp(monkeypatch, tmp_path):
@@ -320,4 +337,4 @@ def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):
     out = dr._yingdao_refresh([{"store": "空号店", "seller_id": "",
                                 "store_status": None, "payment_status": None}],
                               "2026-08-15")
-    assert "输入清单 0 店" in out and "空 sellerId 过滤 1" in out
+    assert "输入清单 0 店" in out and "no_seller_id 1" in out

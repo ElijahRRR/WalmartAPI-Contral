@@ -1,6 +1,7 @@
 """order_asin_normalize — 订单行 SKU→ASIN 清洗(可反复跑,只补 NULL)。
 
 用法:
+  python cli.py db_init                          # ★ 首次必跑:应用 asin 列的迁移
   python cli.py order_asin_normalize             # 预览:形态分布 + 各桶样本,零写入
   python cli.py order_asin_normalize -p apply=1  # 补填 orders.order_lines.asin
 
@@ -113,7 +114,19 @@ def run(params: dict) -> str:
     apply = str(params.get("apply", "")).lower() in {"1", "true", "yes"}
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(_DISTINCT_SQL)
+            try:
+                cur.execute(_DISTINCT_SQL)
+            except Exception as e:            # noqa: BLE001 只翻译这一种,其余照抛
+                # 本工作流是 asin 列的第一个消费方,所以"迁移还没应用"这件事
+                # 一定先从这里炸。原始 UndefinedColumn 栈对着列名说话,
+                # 不告诉人下一步该干什么 —— 而下一步只有一条命令
+                if "asin" not in str(e) or "does not exist" not in str(e):
+                    raise
+                conn.rollback()               # 事务已 aborted,不回滚 commit 会再炸
+                return ("⛔ `orders.order_lines.asin` 列还不存在 —— "
+                        "schema.sql 的迁移块没应用到这个库。\n"
+                        "   先跑:python cli.py db_init(幂等,只补缺的表与列)\n"
+                        "   再跑本工作流。")
             skus = [r[0] for r in cur.fetchall()]
         if not skus:
             return "订单 ASIN 清洗:无待洗行(asin 全已填)"

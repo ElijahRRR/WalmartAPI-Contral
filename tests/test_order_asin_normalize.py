@@ -181,3 +181,48 @@ def test_history_import_also_fills_asin():
         [["108906521136562B0BC6ZBD7M", "2024-03-05", "S", "B0BC6ZBD7M",
           "T", "1", "23.1"]])
     assert rows[0]["asin"] == "B0BC6ZBD7M"
+
+
+def test_missing_column_says_run_db_init_not_a_traceback(monkeypatch):
+    """本工作流是 asin 列的第一个消费方,"迁移没应用"一定先从这里炸。
+
+    原始 UndefinedColumn 栈对着列名说话,不告诉人下一步干什么 ——
+    而下一步只有一条命令(db_init 幂等)。2026-08-15 生产实测踩到。
+    """
+    class _Boom(_Cur):
+        def execute(self, sql, args=None):
+            if "SELECT DISTINCT sku" in sql:
+                raise RuntimeError('column "asin" does not exist\nLINE 3: ...')
+            super().execute(sql, args)
+
+    class _C(_Conn):
+        def __init__(self, cur):
+            super().__init__(cur)
+            self.rolled_back = False
+
+        def rollback(self):
+            self.rolled_back = True
+
+    cur = _Boom(skus=[])
+    conn = _C(cur)
+    monkeypatch.setattr(oan.db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([conn])))
+    out = oan.run({})
+    assert "db_init" in out and "asin` 列还不存在" in out
+    assert conn.rolled_back is True        # 事务 aborted 不回滚,commit 时会再炸
+
+
+def test_other_db_errors_are_not_swallowed(monkeypatch):
+    """只翻译"列不存在"这一种,别的错照抛 —— 把所有 DB 错都翻成
+    "去跑 db_init" 会把真故障藏起来。"""
+    import pytest
+
+    class _Boom(_Cur):
+        def execute(self, sql, args=None):
+            raise RuntimeError("connection refused")
+
+    def _gen():                       # 真生成器:iter([...]) 接不住往外抛的异常
+        yield _Conn(_Boom([]))
+    monkeypatch.setattr(oan.db, "pg_conn", contextlib.contextmanager(_gen))
+    with pytest.raises(RuntimeError, match="connection refused"):
+        oan.run({})

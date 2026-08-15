@@ -41,7 +41,7 @@ logger = logging.getLogger("workflows.alloc_backfill")
 SOURCE = "alloc_backfill"
 
 
-def _pick(rows, sales, field, include_ties):
+def _pick(rows, sales, field, include_ties, metrics=None):
     """输入:富化行 + 销量 + 冲突键名 + 是否含打平组
     → 输出:({键: 归属店}, 跳过的打平组数)。
 
@@ -54,8 +54,10 @@ def _pick(rows, sales, field, include_ties):
         if v and v not in owner:
             owner[v] = r["store"]
     skipped = 0
-    for key, keep, _stat, _detail, tie in sv.resolve_conflicts(rows, sales, field):
-        if tie and not include_ties:
+    for key, keep, _stat, _detail, level in sv.resolve_conflicts(
+            rows, sales, field, metrics):
+        # 只有"连店铺整体销量都分不出"才算真打平(靠在线件数/店名定序)
+        if level in (sv.LADDER[3], sv.LADDER[4]) and not include_ties:
             owner.pop(key, None)
             skipped += 1
         else:
@@ -90,8 +92,9 @@ def run(params: dict) -> str:
     live = [r for r in rows if r["store"] in registered and r["published"]]
     dropped = len(rows) - len(live)
 
-    brand_owner, brand_ties = _pick(live, sales, "brand_key", include_ties)
-    prod_owner, prod_ties = _pick(live, sales, "asin", include_ties)
+    metrics = sv.store_metrics(live, sales)
+    brand_owner, brand_ties = _pick(live, sales, "brand_key", include_ties, metrics)
+    prod_owner, prod_ties = _pick(live, sales, "asin", include_ties, metrics)
 
     snap = {}
     for r in live:
@@ -110,7 +113,8 @@ def run(params: dict) -> str:
     head = (f"在线行 {st['online']},入选(在册∧已发布){len(live)}、"
             f"排除 {dropped};将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"
             f";涉及 {len(per_store)} 家店")
-    ties_note = (f";**零销量打平跳过:品牌 {brand_ties} 组 / 产品 {prod_ties} 组**"
+    ties_note = (f";**无销售依据、只能按件数/店名定序而跳过:品牌 {brand_ties} 组 / "
+                 f"产品 {prod_ties} 组**"
                  "(机器判不出谁该留,先看 alloc_audit 的 C3/C4 清单,"
                  "认了再 -p include_ties=1)"
                  if (brand_ties or prod_ties) and not include_ties

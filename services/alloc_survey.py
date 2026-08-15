@@ -311,17 +311,50 @@ def channel_offenders(rows, cfg):
     return out
 
 
-def resolve_conflicts(rows, sales, field):
-    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名
-    → 输出:[(键, 保留店, 保留店销量, [(店, sku, asin, 销量, 金额, 判定)])]。
+def store_metrics(rows, sales):
+    """输入:富化行 + {(店,sku): (单量, 金额)} → 输出:
+    ({店: {gmv, orders, online}}, {(店, 大类): 金额})。
+
+    冲突判定的**降级阶梯**要用:绝大多数冲突组的两家店在该商品上都零销量
+    (实测 687 组同 ASIN 里 660 组、1657 组同品牌里 1432 组),只看该商品
+    销量等于判不了——但"这家店整体卖得怎么样""这家店在这个大类卖得怎么样"
+    是有数的,拿它们当代理指标,决定就有依据且能解释。
+    """
+    per_store: dict[str, dict] = {}
+    per_cat: dict[tuple, float] = {}
+    for r in rows:
+        o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
+        st = per_store.setdefault(r["store"], {"gmv": 0.0, "orders": 0, "online": 0})
+        st["gmv"] += float(g)
+        st["orders"] += int(o)
+        st["online"] += 1
+        if r.get("category"):
+            key = (r["store"], r["category"])
+            per_cat[key] = per_cat.get(key, 0.0) + float(g)
+    return per_store, per_cat
+
+
+#: 判定阶梯:上一级分不出来才看下一级。名字会写进 csv,让人知道这条是怎么定的
+LADDER = ("按该商品销量", "按该店该大类销量", "按该店整体销量", "按在线件数", "按店名")
+
+
+def resolve_conflicts(rows, sales, field, metrics=None):
+    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名(+ store_metrics 产物)
+    → 输出:[(键, 保留店, 保留店统计, 明细行, 判定依据)]。
 
     所有者口径(2026-08-15):**同品牌/同 ASIN 跨店的,留销量大的店**。
-    销量按该店该键名下**全部在线 SKU 的订单金额**合计;
-    打平顺序:金额 → 单量 → 在线件数 → 店名(全打平也要给确定答案,
-    否则同一份数据两次跑给出两份不同的下架清单)。
-    **零销量组单列标记**:两边都没卖过时"留销量大的"无从判起,
-    这类必须让人看见,不能悄悄按店名字典序决定谁生谁死。
+    但实测 96% 的同 ASIN 组、86% 的同品牌组**两边都零销量**——只看该商品
+    销量就得把两千多组丢给人工。所以按 LADDER 逐级降级:
+
+      ① 该商品在该店的销量 → ② 该店该大类的销量 → ③ 该店整体销量
+      → ④ 在线件数 → ⑤ 店名
+
+    ②③ 是代理指标:同样没卖过的两家店,把货留给"这个大类卖得更好"或
+    "整体卖得更好"的那家,是可解释的经营判断。判定依据写进每一行,
+    人一眼能看出这条是靠什么定的、要不要推翻。
+    **只有连店名都要用上(④⑤)才算真打平**——那才是机器确实判不出的。
     """
+    per_store, per_cat = metrics if metrics else ({}, {})
     groups: dict = defaultdict(list)
     for r in rows:
         v = r.get(field)
@@ -333,24 +366,36 @@ def resolve_conflicts(rows, sales, field):
         for r in items:
             o, g = sales.get((r["store"], r["sku"]), (0, 0.0))
             st = by_store.setdefault(r["store"], {"orders": 0, "gmv": 0.0,
-                                                  "items": 0})
+                                                  "items": 0, "cat_gmv": 0.0})
             st["orders"] += o
             st["gmv"] += float(g)
             st["items"] += 1
+            if r.get("category"):
+                st["cat_gmv"] = max(st["cat_gmv"],
+                                    per_cat.get((r["store"], r["category"]), 0.0))
         if len(by_store) < 2:
             continue
-        ranked = sorted(by_store.items(),
-                        key=lambda kv: (-kv[1]["gmv"], -kv[1]["orders"],
-                                        -kv[1]["items"], kv[0]))
+        for name, st in by_store.items():
+            st["store_gmv"] = (per_store.get(name) or {}).get("gmv", 0.0)
+        ranked = sorted(
+            by_store.items(),
+            key=lambda kv: (-kv[1]["gmv"], -kv[1]["cat_gmv"], -kv[1]["store_gmv"],
+                            -kv[1]["items"], kv[0]))
         keep = ranked[0][0]
-        tie = all(v["gmv"] == 0 and v["orders"] == 0 for _, v in ranked)
+        # 判定依据 = 第一个把冠亚军分开的那一级
+        level = LADDER[-1]
+        for i, f in enumerate(("gmv", "cat_gmv", "store_gmv", "items")):
+            if len(ranked) > 1 and ranked[0][1][f] != ranked[1][1][f]:
+                level = LADDER[i]
+                break
         detail = []
         for r in sorted(items, key=lambda r: (r["store"], r["sku"])):
             s = by_store[r["store"]]
             detail.append((r["store"], r["sku"], r["asin"] or "",
                            s["orders"], round(s["gmv"], 2),
+                           round(s["cat_gmv"], 2), round(s["store_gmv"], 2),
                            "保留" if r["store"] == keep else "下架"))
-        out.append((key, keep, ranked[0][1], detail, tie))
+        out.append((key, keep, ranked[0][1], detail, level))
     # 涉及店铺数多、销量大的排前面:人先处理影响面大的
     out.sort(key=lambda x: (-len(x[3]), -x[2]["gmv"], str(x[0])))
     return out

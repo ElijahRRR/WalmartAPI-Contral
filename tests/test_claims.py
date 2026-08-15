@@ -211,14 +211,15 @@ ROWS = [
 
 def test_backfill_keeps_the_higher_selling_store():
     sales = {("A107", "S2"): (5, 500.0), ("A085", "S1"): (1, 10.0)}
-    owner, skipped = bf._pick(ROWS, sales, "asin", include_ties=False)
+    owner, skipped = bf._pick(ROWS, sales, "asin", include_ties=False,
+                              metrics=sv.store_metrics(ROWS, sales))
     assert owner["B0A"] == "A107"          # 销量大的赢,不是先来的赢
     assert owner["B0B"] == "A107"          # 无冲突的键直接归它唯一那家
     assert skipped == 0
 
 
-def test_backfill_skips_zero_sales_ties_by_default():
-    """两边都没卖过时机器判不出谁该留——默认不落,等人看清单。"""
+def test_backfill_skips_only_true_ties():
+    """只有连店铺整体销量都分不出才跳过;能靠店铺表现判的照落。"""
     owner, skipped = bf._pick(ROWS, {}, "asin", include_ties=False)
     assert "B0A" not in owner and skipped == 1
     assert owner["B0B"] == "A107"          # 无冲突的不受影响
@@ -226,18 +227,48 @@ def test_backfill_skips_zero_sales_ties_by_default():
     owner2, skipped2 = bf._pick(ROWS, {}, "asin", include_ties=True)
     assert "B0A" in owner2 and skipped2 == 0
 
+    # 有店铺整体销量可依据时,不算打平,直接落
+    metrics = sv.store_metrics(ROWS, {("A107", "S3"): (5, 500.0)})
+    owner3, skipped3 = bf._pick(ROWS, {}, "asin", include_ties=False, metrics=metrics)
+    assert owner3["B0A"] == "A107" and skipped3 == 0
 
-def test_resolve_conflicts_marks_ties_and_is_deterministic():
-    res = sv.resolve_conflicts(ROWS, {}, "asin")
-    assert len(res) == 1
-    key, keep, _stat, detail, tie = res[0]
-    assert key == "B0A" and tie is True
-    assert keep == "A085"                          # 全打平按店名,但已标 tie
-    assert [d[5] for d in detail] == ["保留", "下架"]
+
+def test_resolve_conflicts_falls_back_through_the_ladder():
+    """两边该商品都零销量时,降级看该店该大类销量 → 该店整体销量。
+
+    实测 96% 的同 ASIN 冲突组两边都零销量,只看商品销量等于把两千多组
+    丢给人工;降级到"这家店整体卖得怎么样"是可解释的经营判断。
+    """
+    # A107 别处卖了 500(整体销量高),两边该商品都没卖过
+    metrics = sv.store_metrics(ROWS, {("A107", "S3"): (5, 500.0)})
+    key, keep, _stat, detail, level = sv.resolve_conflicts(
+        ROWS, {}, "asin", metrics)[0]
+    assert key == "B0A" and keep == "A107"
+    assert level == "按该店整体销量"
+    assert [d[7] for d in detail] == ["下架", "保留"]
+
+
+def test_resolve_conflicts_商品销量优先于店铺整体():
+    """该商品自己有销量时,不看店铺整体——阶梯是有顺序的。"""
+    sales = {("A085", "S1"): (2, 30.0), ("A107", "S3"): (9, 900.0)}
+    metrics = sv.store_metrics(ROWS, sales)
+    key, keep, _stat, _detail, level = sv.resolve_conflicts(
+        ROWS, sales, "asin", metrics)[0]
+    assert keep == "A085" and level == "按该商品销量"   # A107 整体高但该品没卖过
+
+
+def test_resolve_conflicts_真打平才落到店名():
+    """连店铺整体销量都相同才算机器判不出——那才是要人看的。"""
+    key, keep, _stat, detail, level = sv.resolve_conflicts(
+        ROWS, {}, "asin", ({}, {}))[0]
+    assert keep == "A085" and level in (sv.LADDER[3], sv.LADDER[4])
+    assert [d[7] for d in detail] == ["保留", "下架"]
 
 
 def test_resolve_conflicts_sums_sales_per_store():
     sales = {("A085", "S1"): (2, 30.0), ("A107", "S2"): (1, 99.0)}
-    (key, keep, stat, detail, tie) = sv.resolve_conflicts(ROWS, sales, "asin")[0]
-    assert keep == "A107" and tie is False
+    metrics = sv.store_metrics(ROWS, sales)
+    (key, keep, stat, detail, level) = sv.resolve_conflicts(
+        ROWS, sales, "asin", metrics)[0]
+    assert keep == "A107" and level == "按该商品销量"
     assert dict((d[0], d[4]) for d in detail) == {"A085": 30.0, "A107": 99.0}

@@ -37,8 +37,12 @@
   C1 类目建议 —— 每店"在线数量最多的两类",所有者据此填飞书「类目1/2/3」;
      同时对拍已填值与实际 top2 是否一致;
   C2 渠道不符逐行清单 —— 所有者自行下架(只列确实是另一个已知渠道的);
-  C3 同 ASIN 跨店处置 / C4 同品牌跨店处置 —— 按"留销量大的店"给出保留/下架,
-     **两边都零销量的组单独标记**(机器判不出谁该留,要人眼看)。
+  C3 同 ASIN 跨店处置 / C4 同品牌跨店处置 —— 按"留销量大的店"给出保留/下架。
+     ⚠ 实测 96% 的同 ASIN 组、86% 的同品牌组**两边该商品都零销量**,只看
+     商品销量等于把两千多组丢给人工,所以按**降级阶梯**判(见
+     services/alloc_survey.LADDER):该商品销量 → 该店该大类销量 → 该店整体
+     销量 → 在线件数 → 店名。**判定依据写进每一行**,人一眼看出这条靠什么
+     定的、要不要推翻;只有落到最后两级才是机器真判不出、需要人眼的。
 
 三条口径纪律(2026-08-15 对抗式审查后定,每条都对应一次会算错数的实例):
 
@@ -321,21 +325,26 @@ def run(params: dict) -> str:
         L.append(f"C2 渠道不符 {len(off)} 件(已发布行)→ {p2}"
                  f"——只列确实是另一个已知渠道的;N/A 与未采到不进清单")
 
-    # C3/C4 冲突处置:留销量大的店(所有者口径 2026-08-15)
+    # C3/C4 冲突处置:留销量大的店 → 降级阶梯(所有者口径 2026-08-15;
+    # 实测 96% 的组两边都零销量,只看商品销量等于把两千多组丢给人工)
+    metrics = sv.store_metrics(live_rows, sales)
     for tag, field, fname in (("C3 同 ASIN 跨店", "asin", "alloc_同ASIN冲突处置.csv"),
                               ("C4 同品牌跨店", "brand_key", "alloc_同品牌冲突处置.csv")):
-        res = sv.resolve_conflicts(live_rows, sales, field)
-        rows_x = [(key, keep, "是" if tie else "",
-                   st, sku, asin, o, g, verdict)
-                  for key, keep, _, detail, tie in res
-                  for st, sku, asin, o, g, verdict in detail]
-        p = _write_csv(fname, ["冲突键", "保留店", "零销量打平", "店铺", "SKU",
-                               "ASIN", f"近{sales_days}天单量", "销售额", "处置"],
+        res = sv.resolve_conflicts(live_rows, sales, field, metrics)
+        rows_x = [(key, keep, level, st, sku, asin, o, g, cg, sg, verdict)
+                  for key, keep, _, detail, level in res
+                  for st, sku, asin, o, g, cg, sg, verdict in detail]
+        p = _write_csv(fname, ["冲突键", "保留店", "判定依据", "店铺", "SKU",
+                               "ASIN", f"近{sales_days}天单量", "该商品销售额",
+                               "该店该大类销售额", "该店整体销售额", "处置"],
                        rows_x)
-        ties = sum(1 for r in res if r[4])
-        L.append(f"{tag}:{len(res)} 组、{len(rows_x)} 行 → {p};"
-                 f"其中**两边都零销量、按在线件数/店名打平的 {ties} 组**"
-                 f"(这些要人眼看一下,机器判不出谁该留)")
+        by_level = Counter(r[4] for r in res)
+        hard = by_level.get(sv.LADDER[3], 0) + by_level.get(sv.LADDER[4], 0)
+        L.append(f"{tag}:{len(res)} 组、{len(rows_x)} 行 → {p};判定依据分布:"
+                 + ", ".join(f"{k}×{v}" for k, v in by_level.most_common())
+                 + (f";**其中 {hard} 组连店铺整体销量都分不出、只能按在线件数/"
+                    f"店名定序**(这些才需要人眼看)" if hard else
+                    ";全部有销售依据可判"))
 
     L.append("→ 下一步:①按 C1 填飞书类目三列(填了才限制,空=不限制);"
              "②按 C2 自行下架渠道不符商品;③C3/C4 确认后进 A1 回填 claims")

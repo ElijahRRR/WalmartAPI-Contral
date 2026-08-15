@@ -49,10 +49,20 @@ maintenance_submitted、problem_categorized 发了大半个月都没登记)。
 unexplained_missing 标志做"疑似平台下架"的报警(不拦截)。
 
 读侧视图(schema.sql 定义,人工/AI SELECT 入口,身份键一律
-coalesce(asin, sku)):product_risk(全局风险档案)/
+coalesce(asin, sku)):product_risk(全局风险档案,**含审核维度**)/
 product_risk_store(店铺维度:"这个产品在哪些店被删过几次")/
 status_changes(平台状态迁移与官方下架原因)/ feed_failures(五类 feed
-的逐 SKU 失败回执)。
+的逐 SKU 失败回执)/ **audit_listing_conflicts**(审核结论 × 上架现状)。
+
+⚠ **审核事件的 store 是 NULL**(审核不分店铺,一个 ASIN 一个结论),所以
+audit_passed/audit_rejected 进得了全局 product_risk,却进不了
+product_risk_store(那个视图 WHERE store IS NOT NULL)。要回答"哪个店里
+哪些产品拒了还挂着",必须走 audit_listing_conflicts —— 它拿全局审核结论
+JOIN 店铺维度的现状表。problem_scan 的"审核判拒仍在架"就是它的消费方。
+
+这两个码 2026-08-14 前**零读者**:全库 119 万条事件写了没人看,而
+"审核拒了但还在架"却要靠现拼 JOIN 回答。所有者定稿:接消费端而不是停写
+——病历的价值本就是把审核结论、上架动作、平台观测串在一条时间线上。
 
 审核接缝落地(2026-08-13 批次 A):入库/审核三码已登记(product_ingested /
 audit_passed / audit_rejected),写入方 product_ingest 与 product_audit 在

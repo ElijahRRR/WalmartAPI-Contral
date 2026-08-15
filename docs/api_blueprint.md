@@ -63,7 +63,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | workflow | 用到的端点(上表编号) | 备注 |
 |---|---|---|
 | 1 product_query | 5(DEFAULT+SPEC), 6 | 全只读,零状态 |
-| 2 returns_sync | 24 | 不支持时间过滤,只能全量+本地 diff |
+| 2 returns_sync | 24 | 支持真增量,时间窗成对下发(§4.3 实证;原记"不支持时间过滤"已于 2026-08-14 勘误) |
 | 3 daily_report | 4, 2, 23, 25, 26, 27, 28, 29 | 端点最多;29 是 xlsx 二进制 |
 | 4 order_audit | 23 | createdStartDate=now-179d 坑必须带上 |
 | 5 upc_generator | 5(upc=) | 复用 items.search;先落库再查的防重已同构 |
@@ -238,7 +238,10 @@ Phase 0 已移植:token 缓存/每店代理/401 自愈/429 退避/连接池。�
 api/items.py
   list_items(store, *, published_status=None, lifecycle_status=None,
              limit=1000, max_offset=10000) -> (items, truncated)   # 分页模型1
-  iter_all_items(store)          # 5 轮组合器(ACTIVE/UNPUBLISHED/SYSTEM_PROBLEM/STAGE/RETIRED)
+  iter_all_items(store, stats=None, mode="full")
+      # 默认无参即全量(含 RETIRED 兜底轮);mode='fast' 走快档。
+      # ⚠ 2026-08-14 勘误:原写 5 轮组合器且列了 STAGE —— STAGE 状态已作废
+      # (§3.1/§8.5 的枚举里都没有它),逐状态 5 轮也已按 §4.1 降级为对拍/回退用。
   get_item(store, sku)           # 单查;只作补漏,禁止用于批量拿 PT(旧教训:454 SKU=8min)
   count_items(store, status)     # GET /v3/items/count
   search_walmart(store, *, query=None, upc=None, gtin=None)         # DEFAULT 格式
@@ -263,7 +266,10 @@ api/orders.py
   iter_orders(store, *, last_modified_start, created_start=auto_179d, ...)  # 分页模型2;
                                                           # 内部 async 并发多店由 services 组织
 api/returns.py
-  iter_returns(store)                                     # 分页模型3;无时间过滤,全量
+  iter_returns(store, *, created_start, created_end=None, limit=200)
+      # 分页模型3;⚠ created_start 是**必填关键字参数**,时间窗必须成对下发
+      # (只传 start 返 400,见 §4.3 实证)。本行 2026-08-14 勘误:原写
+      # `iter_returns(store)  # 无时间过滤,全量`,照抄直接 TypeError。
 api/reports.py
   payment_statement(store)                                # 含 sellerId 提取 helper
   available_recon_dates(store)

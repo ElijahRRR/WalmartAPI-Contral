@@ -430,14 +430,34 @@ llm_cache 清理器按原拍板"上量后再议",本批验收时带数据重议�
 
 | # | 任务 | 文件 |
 |---|---|---|
-| E1 | 建议表 `ops.dispositions`(store/sku/asin、source(scan/audit/tro 预留)、建议动作、依据、状态 suggested→executing→confirmed/ineffective、时间戳);DDL+db_init | `refdata/schema.sql` |
-| E2 | 扫描件:从 problem_product_cleanup 抽出"查库归类"段 → 写产品事件 + 落建议行;审核 reject 的在架产品(product_audit 发现 audit_status=rejected 且 walmart_items 在线)同样落建议行——**只建议,不动状态不发 feed** | `workflows/problem_scan.py`(新)、`services/problem_products.py`(既有归类规则不动) |
-| E3 | 执行件:problem_product_cleanup 改为消费 dispositions(suggested→executing),全部既有防重/观测确认纪律原样保留;生效确认(feed 落定 + 下轮 catalog_sync 观测)后置 confirmed 并记事件,未生效置 ineffective 待下轮 | `workflows/problem_product_cleanup.py` |
-| E4 | 调度顺序更新:catalog_sync → problem_scan → cleanup(execute) | docs/plan.md 调度约束 |
+| E1 ✅ | 建议表 `ops.dispositions`(store/sku/asin、source(scan/audit/tro 预留)、建议动作、依据、状态 suggested→executing→confirmed/ineffective、时间戳);DDL+db_init | `refdata/schema.sql` |
+| E2 ✅ | 扫描件:从 problem_product_cleanup 抽出"查库归类"段 → 写产品事件 + 落建议行;审核 reject 的在架产品(product_audit 发现 audit_status=rejected 且 walmart_items 在线)同样落建议行——**只建议,不动状态不发 feed** | `workflows/problem_scan.py`(新)、`services/problem_products.py`(既有归类规则不动) |
+| E3 ✅ | 执行件:problem_product_cleanup 改为消费 dispositions(suggested→executing),全部既有防重/观测确认纪律原样保留;生效确认(feed 落定 + 下轮 catalog_sync 观测)后置 confirmed 并记事件,未生效置 ineffective 待下轮 | `workflows/problem_product_cleanup.py` |
+| E4 ✅ | 调度顺序更新:catalog_sync → problem_scan → cleanup(execute) | docs/plan.md 调度约束 |
 
 **验收**:分离后 dry-run 输出与分离前一致(重排不改行为);建议表状态机
 走一轮真实生效追踪。⚠ 本批动的是危险工作流,切换纪律:上新调度前停旧
 cleanup 调度,不并跑。
+
+**代码完成 2026-08-14**(923 测试全绿),落地时的三处实现决定:
+1. **决策逐字搬家,断言一个字没改**。`plan()` 从 cleanup 整体搬进 problem_scan,
+   钉它的 `test_plan_routing_and_dedup` 一并搬到 `tests/test_problem_scan.py`
+   ——"重排不改行为"这条验收标准,那个用例就是锁。
+2. **生效判定不重写**。`services/dispositions.settle()` 读的是 catalog_sync 经
+   `product_events.verify_deletions` 落的 delete_verified / delete_not_effective
+   ——"不信回执信观测"那套(含 48h 宽限、RETIRED/缺席算 gone)已经在跑,
+   再写一份只会产生两份会漂移的真相。反补的生效信号不同(没有对应核验事件),
+   直接看 walmart_items 现状,但**必须等 last_seen_at > executed_at**,
+   否则拿提交前的旧快照判,永远判成"没生效"。
+3. **反补计数的 source 必须同时认新旧两个值**。历史事件的 source 是
+   `problem_product_cleanup`;漏掉它会让 30 天窗口内的历史计数归零,
+   "反补满 2 次转删"重新从 0 数起 ⇒ 商品被无限反补。
+   执行件写事件时也刻意保持旧 source 不变。
+
+**生产验收待办**:① 先 `problem_scan -p preview=1` 与拆分前的 cleanup dry-run
+对拍(数应当一致);② `problem_scan` 落一轮建议行;③ `problem_product_cleanup`
+dry-run 核对;④ `--execute` 跑一轮;⑤ 次日 catalog_sync 之后再跑一次 cleanup,
+看开头的"上一轮落定"行是否给出 confirmed/ineffective。
 
 ### 批次 D|总切换日(一天内按序执行)
 
@@ -445,6 +465,14 @@ cleanup 调度,不并跑。
 2. **双跑对比收官**:库内一致率报告,所有者放行;
 3. **停旧**:黑名单双调度(07:05 cron + 7:00 launchd plist)、stop_workers、
    阿里云队列 server 停(机器去留随所有者正式切换一并处理,批复 #7);
+3b. **⚠ 增量重搬(2026-08-14 补,原计划漏了这一步)**:停旧**之后**再跑一次
+   `audit_import`,把旧系统从上次搬迁到停写这段时间新产生的行补进来。
+   为什么必须有:2026-08-13 那次 `--execute` 按设计是**停写前的快照**
+   (见 `workflows/audit_import.py:23-27` 前置纪律 + 本文 §"全程旧审核系统
+   照常运行直到批次 D 第 3 步"),旧系统在那之后照常运行、照常写 audit_runs。
+   **漏了这一步的后果是静默的**:历史 reject 短路会漏拦最后一段时间的产品,
+   而两侧都不报错——只会表现为"某些早就拒过的商品又被放上架了"。
+   `audit_import` 专门实现了 `-p table=X` 与 `-p replace=yes` 就是为重跑存在的。
 4. **上架链改查库**(批复 #4 二次批复):list_new 领任务判定
    E=pass → `audit_status='approved'`(walmart_pt 同步从库取,替代 LLM 现猜 PT
    的入口逻辑归 C 已就位);listing_sheet 口径注释改(D/E/F/G=审核链投影,仅展示);
@@ -452,9 +480,22 @@ cleanup 调度,不并跑。
 5. **开投影**:product_audit 尾部回填上架表 D/E/F/G(读表 ASIN→查库→批量回写);
 6. **挂新调度**:product_ingest 5 分钟级、product_audit 每小时(批复 #6),
    顺序约束 catalog_sync → product_refresh → product_ingest → product_audit
-   → problem_scan → list_new/maintenance;
+   → problem_scan → problem_product_cleanup --execute → list_new/maintenance;
+   ⚠ **problem_scan 与 cleanup 之间的先后是硬约束**(批次 E 拆分后):
+   scan 产建议、cleanup 消费建议,只跑 cleanup = 消费上一轮的陈旧建议或空转。
 7. **文档收官**:plan.md 总览增行、legacy_schedules.md 停旧清单增审核条目、
    backlog 回销、旧仓归档标记。
+8. **退役快照四表清理(切换日**之后**才谈,2026-08-14 盘点登记)**:
+   `audit.phase0_blacklist_sellers` / `phase0_blacklist_asins` /
+   `phase0_blacklist_amazon_cats` / `blacklist_brands` —— 读侧全部为零,
+   消费方已全改道 `catalog.*` 黑名单中心。**前三张所有者已定「留档不删」**,
+   只有 `blacklist_brands` 无裁决、是唯一待定项。
+   🚫 **在第 3b 步之前绝对不能删**:它们的唯一写入方 `workflows/audit_import.py`
+   的 `TABLES` 元组切换日还要再跑一次,而该工作流对「清单里的表在目标库不存在」
+   判致命 —— **先删表 = 切换日搬迁直接报错**。
+   删除三前置(全满足才谈):① 第 3b 步增量重搬已完成;
+   ② `audit_import.py` 的 `TABLES` 元组同步删对应行;
+   ③ `refdata/schema.sql` 与 `docs/db_schema.md` 同步更新。
 
 **所有者侧**:切换日到场拍板放行(第 2 步)、执行停旧(第 3 步,生产 Mac 操作)。
 

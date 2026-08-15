@@ -57,8 +57,33 @@ services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
 docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md /
-                legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md
+                legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md /
+                api_blueprint.md(端点定稿) / audit_migration_plan.md(审核链) /
+                category_mapping.md(**类目映射链九条工作流的唯一文档**)
 ```
+
+## 判某样东西"没用了"之前(2026-08-14 全项目盘点的教训)
+
+全项目死代码盘点做过一轮:**仓库是干净的**,真能删的只有 4 处代码。但同一轮里
+**10 条被判死的东西反证后全是活的**,险些误删生产链路。三条缺陷务必内化:
+
+1. **`grep 不到调用者` 对 workflow 完全无效。** `cli.py` 是
+   `importlib.import_module(f"workflows.{args.workflow}")`,无白名单——活性不在
+   import 图上,而在**"它写的表还有没有别的补给线"**。正确检索式:
+   `grep -rn 'INSERT INTO <schema>\.|UPDATE <schema>\.|COPY <schema>\.' --include=*.py .`
+2. **"docstring 自述一次性 + 文档记 `[x] 已跑" ≠ 死。** 迁移期脚本有三种状态:
+   已跑完**且数据源已冻结**(才可能死,本仓一条都没有)/ 已跑过**但数据源仍在生产
+   增长**(活)/ **从未跑过、在批次待办里**(活)。
+   ⚠ **"查不到执行记录"在本仓是"还没跑"的证据,不是"跑完被遗忘"的证据**——
+   本仓记录纪律良好,跑过的都有 `[x]`。
+3. **按名字 grep 双向出错**:有假阳性(同名局部变量)、也有假阴性(注释里提到函数名
+   会让它看起来活着)。**必须 AST 引用集 + 文本 grep 双做,每个命中人眼确认是调用
+   还是注释。**
+
+**判不准就判活。** 误删一条生产链路的代价,远大于多留一个死文件。
+DROP TABLE/COLUMN/VIEW 不可回滚,**未连库核对 `pg_stat_user_tables` /
+`pg_stat_statements` 之前一律不执行**——"代码不读"不等于"没人 SELECT",
+本仓有一批视图/列就是专门留给人工与 AI 排查用的。
 
 ## 写沃尔玛调用代码之前
 

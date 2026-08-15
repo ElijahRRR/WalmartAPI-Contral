@@ -193,23 +193,26 @@ def test_channel_known_brand_counts_known():
     assert conn.marked == ["B0B"]
 
 
-# ── 尾段隔离(cleanup 主链不受收集失败影响)──────────────────────────────────
+# ── 尾段隔离(扫描件主链不受收集失败影响)────────────────────────────────────
+# 批次 E 拆分后黑名单收集跟着"归类"走,住到了 problem_scan(执行件不再归类,
+# 也就不再有可收集的 category)。
 
-def test_cleanup_tail_never_breaks_the_main_chain(monkeypatch):
-    from workflows import problem_product_cleanup as wf
-    monkeypatch.setattr(wf.db, "pg_conn",
-                        lambda: (_ for _ in ()).throw(RuntimeError("库炸了")))
-    note = wf._collect_blacklists([_it("B0A", "B")])
+def test_scan_tail_never_breaks_the_main_chain(monkeypatch):
+    from workflows import problem_scan as wf
+    monkeypatch.setattr(wf.blacklist, "record_asins",
+                        lambda conn, cand: (_ for _ in ()).throw(
+                            RuntimeError("库炸了")))
+    note = wf._collect_blacklists(object(), [_it("B0A", "B")])
     assert "黑名单收集失败" in note      # 返回摘要而不是抛异常
 
 
-def test_cleanup_tail_skips_uncategorized_items(monkeypatch):
+def test_scan_tail_skips_uncategorized_items(monkeypatch):
     """stage-pending/在途行没有 category,不参与收集(和归类事件同口径)。"""
-    from workflows import problem_product_cleanup as wf
-    monkeypatch.setattr(wf.db, "pg_conn",
-                        lambda: pytest.fail("没归类的行不该碰库"))
-    assert wf._collect_blacklists([{"sku": "B0A", "store": "S",
-                                    "reasons": "x"}]) == ""
+    from workflows import problem_scan as wf
+    monkeypatch.setattr(wf.blacklist, "record_asins",
+                        lambda conn, cand: pytest.fail("没归类的行不该收集"))
+    assert wf._collect_blacklists(object(), [{"sku": "B0A", "store": "S",
+                                              "reasons": "x"}]) == ""
 
 
 # ── DELETE 防重口径(所有者拍板 2026-08-11:滚动 48h,仅限无终态)────────────
@@ -222,7 +225,7 @@ def test_inflight_sql_caps_submitted_at_48h():
        (条件里**不许**出现对 success 的时间限制);
     ③ failed 不拦(WHERE 里根本不出现)。
     """
-    from workflows import problem_product_cleanup as wf
+    from workflows import problem_scan as wf     # 批次 E:防重预筛随决策搬到扫描件
     sql = wf._SQL_INFLIGHT
     assert "f.status = 'submitted'" in sql
     assert "interval '48 hours'" in sql

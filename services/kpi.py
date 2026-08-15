@@ -10,7 +10,12 @@
   任何单元格以 '=' 开头的行(Excel SUM 公式)整行跳过;
   sheet 名 == "Not Accountable" → 计入绩效 "⚪ 否",其余 sheet 名作为子分类
 - 指标名带 emoji 前缀是隐式契约(日报的承运商分析按字符串精确匹配)
-- 问题订单去重键 = (Sales Order #, 指标, 子分类, 物流单号, 商品) 五字段
+- 问题订单去重键 = (Sales Order #, 指标, 子分类, 物流单号, 商品) 五字段。
+  **本层不实现它** —— 去重由 workflows/perf_problems.py 的
+  `ON CONFLICT (sales_order_no, indicator, sub_category, tracking_no, item)`
+  唯一约束保证。曾有一份 Python 版 `dedup_key()` 与之并存且零调用
+  (2026-08-14 删):同一语义两份实现,改去重键时漏改没人调的那份不会报错,
+  只会制造"我改了去重逻辑"的错觉。
 """
 
 import io
@@ -448,9 +453,3 @@ def parse_history_rows(store: str, header: list, rows: list[list]
         out.append(rec)
     return out, skipped
 
-
-def dedup_key(row: dict) -> tuple:
-    """输入:问题订单行 → 输出:五字段联合去重键(旧系统同款语义)。"""
-    return (row.get("sales_order_no") or "", row.get("indicator") or "",
-            row.get("sub_category") or "", row.get("tracking_no") or "",
-            row.get("item") or "")

@@ -179,6 +179,14 @@ CREATE INDEX IF NOT EXISTS product_events_store_sku_idx ON catalog.product_event
 -- services/sku_asin 规则清洗得出,提不出存 NULL;消费方 coalesce(asin, sku);
 -- 存量补填/规则扩充后重洗走 sku_normalize 工作流(幂等,只补 NULL)。
 ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
+-- 身份键索引(2026-08-14 补):本表的身份是 **coalesce(asin, sku)**(2026-08-11
+-- 定稿),而上面两个索引都建在裸 sku 上 —— 按身份键查会退化成全表扫描。
+-- ⚠ 建它的直接原因是一次生产事故:audit_listing_conflicts 视图的 LATERAL
+-- 用 `coalesce(ev.asin, ev.sku) = ...` 关联,对外层每一行做一次几百万行的
+-- 全表扫描,查询挂死。表达式索引必须与查询里的表达式**逐字一致**才会被用上。
+-- 首次建索引在几百万行的表上要跑一会儿,db_init 会慢一次,之后不再。
+CREATE INDEX IF NOT EXISTS product_events_identity_idx
+    ON catalog.product_events ((coalesce(asin, sku)), occurred_at DESC);
 
 -- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
 -- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
@@ -427,20 +435,36 @@ CREATE OR REPLACE VIEW catalog.status_changes AS
 --                            **时序**:先上了架、后来才被判拒 ⇒ 上架时的闸没拦住
 --                            (或当时还没审)。这类是审核链本身的漏拦线索,
 --                            与"该不该下架"是两个问题。
-CREATE OR REPLACE VIEW catalog.audit_listing_conflicts AS
-  SELECT w.store, w.sku,
-         coalesce(p.asin, w.sku)                        AS asin,
-         w.published_status, w.last_seen_at,
-         p.audit_status, p.audit_reason, p.audited_at, p.audit_version,
+-- ⚠ 本视图 2026-08-14 重写过一次(首版查询挂死,生产实遇)。首版的两个错:
+--   ① LATERAL 对 walmart_items 的**每一行**扫一遍 product_events —— 关联条件
+--      写成 `coalesce(ev.asin, ev.sku) = ...`,而当时表上只有裸 sku 的索引,
+--      表达式匹配不上 ⇒ 每行一次几百万行全表扫描。已补表达式索引
+--      product_events_identity_idx(见上),表达式与这里**逐字一致**才生效。
+--   ② 外层 WHERE 里写了 `... OR e.last_rejected_at IS NOT NULL`,OR 引用了
+--      LATERAL 的产出 ⇒ PG 必须先为每一行算完 LATERAL 才能过滤,一行都剪不掉。
+-- 现在先用 CTE 把基集缩到"在架 且 当前判拒"(小),再去碰事件表。
+-- 顺带一个语义收紧:只看**当前**结论是 reject 的。曾经拒过、现在已经过了的
+-- 不是冲突(那是审核改判,正常),首版把它们捞进来既慢又答非所问。
+DROP VIEW IF EXISTS catalog.audit_listing_conflicts;
+CREATE VIEW catalog.audit_listing_conflicts AS
+  WITH live_rejected AS (
+      SELECT w.store, w.sku, w.published_status, w.last_seen_at,
+             p.asin, p.audit_status, p.audit_reason, p.audited_at, p.audit_version
+      FROM catalog.walmart_items w
+      JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
+      WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
+        AND p.audit_status = 'rejected'
+  )
+  SELECT lr.store, lr.sku, lr.asin,
+         lr.published_status, lr.last_seen_at,
+         lr.audit_status, lr.audit_reason, lr.audited_at, lr.audit_version,
          e.last_rejected_at, e.last_passed_at, e.last_listed_at,
-         e.audit_reject_times,
-         (p.audit_status = 'rejected')                  AS rejected_still_listed,
+         coalesce(e.audit_reject_times, 0)              AS audit_reject_times,
+         true                                           AS rejected_still_listed,
          (e.last_rejected_at IS NOT NULL
           AND e.last_listed_at IS NOT NULL
           AND e.last_rejected_at > e.last_listed_at)    AS rejected_after_listing
-  FROM catalog.walmart_items w
-  LEFT JOIN catalog.products p
-         ON p.asin = w.sku AND p.marketplace = 'US'
+  FROM live_rejected lr
   LEFT JOIN LATERAL (
       SELECT max(occurred_at) FILTER (WHERE event = 'audit_rejected') AS last_rejected_at,
              max(occurred_at) FILTER (WHERE event = 'audit_passed')   AS last_passed_at,
@@ -448,10 +472,8 @@ CREATE OR REPLACE VIEW catalog.audit_listing_conflicts AS
                  ('item_appeared', 'list_submitted', 'match_submitted')) AS last_listed_at,
              count(*) FILTER (WHERE event = 'audit_rejected')         AS audit_reject_times
       FROM catalog.product_events ev
-      WHERE coalesce(ev.asin, ev.sku) = coalesce(p.asin, w.sku)
-  ) e ON true
-  WHERE w.missing_since IS NULL          -- 在架 = 最近一轮全量扫描还见得到
-    AND (p.audit_status = 'rejected' OR e.last_rejected_at IS NOT NULL);
+      WHERE coalesce(ev.asin, ev.sku) = lr.asin   -- 与身份键索引逐字一致
+  ) e ON true;
 
 -- *_feed_failed 的读侧(此前只写不读):五类 feed 的逐 SKU 失败回执,
 -- kind ∈ delete/retire/maintenance/match/list

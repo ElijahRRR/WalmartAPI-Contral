@@ -569,3 +569,23 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
 **为什么本视图不依赖 product_risk**:`product_risk` 是 DROP+CREATE
 (列改名的历史遗留),而 PG 不允许 DROP 一个还有依赖者的视图 —— 依赖它
 等于给 `db_init` 埋一个"第二次跑就报错"的雷。所以时间线就地聚合。
+
+### ⚠ 首版查询挂死的教训(2026-08-14 生产实遇,已修)
+
+首版写完当天就把生产库查挂了。两个错叠在一起:
+
+1. **表达式关联没有对应索引**。LATERAL 用 `coalesce(ev.asin, ev.sku) = ...`
+   关联,而 `product_events` 当时只有 `(sku, occurred_at)` 与 `(store, sku)`
+   两个建在**裸 sku** 上的索引 —— 表达式匹配不上,于是对外层每一行做一次
+   几百万行的全表扫描。
+   **已补** `product_events_identity_idx ON (coalesce(asin, sku), occurred_at DESC)`。
+   ⚠ 表达式索引必须与查询里的表达式**逐字一致**才会被用上,改一边就得改另一边。
+   本表的身份键 2026-08-11 就定稿为 `coalesce(asin, sku)`,索引却一直建在裸 sku
+   上 —— 这个缺口在本视图之前没人踩到,因为别的消费方都是**一次**全表聚合
+   (product_risk 那种 GROUP BY),不是逐行关联。
+2. **外层 WHERE 引用了 LATERAL 的产出**(`... OR e.last_rejected_at IS NOT NULL`)
+   ⇒ PG 必须先为每一行算完 LATERAL 才能过滤,一行都剪不掉。
+   现在改成先用 CTE 把基集缩到"在架 且 当前判拒"(小),再去碰事件表。
+
+顺带一个**语义收紧**:只看**当前**结论是 reject 的。曾经拒过、现在已经过了的
+不是冲突(那是审核改判,正常)——首版把它们捞进来既慢又答非所问。

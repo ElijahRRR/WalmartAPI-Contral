@@ -200,3 +200,19 @@ def test_suggest_many_rejects_unknown_enums(bad):
     row = {"store": "T1", "sku": "S1", "action": "delete", **bad}
     with pytest.raises(ValueError, match="未知"):
         dispositions.suggest_many(object(), [row])
+
+
+def test_conflicts_view_join_matches_its_index():
+    """⚠ 生产事故的锁(2026-08-14):audit_listing_conflicts 的 LATERAL 用
+    `coalesce(asin, sku)` 关联 product_events,而表达式索引必须与它**逐字一致**
+    才会被用上。首版没有这个索引 ⇒ 对外层每行做一次几百万行全表扫描,查挂死。
+    改任何一边都要同步改另一边,这条用例就是提醒。"""
+    import pathlib as _p
+    sql = _p.Path("refdata/schema.sql").read_text()
+    view = sql[sql.index("CREATE VIEW catalog.audit_listing_conflicts"):]
+    view = view[:view.index(") e ON true;")]
+    assert "coalesce(ev.asin, ev.sku) = lr.asin" in view
+    assert "((coalesce(asin, sku)), occurred_at DESC)" in sql, "身份键索引没了"
+    # 外层过滤不许再引用 LATERAL 产出(那会让 PG 一行都剪不掉)
+    tail = sql[sql.index("FROM live_rejected lr"):sql.index(") e ON true;")]
+    assert "WHERE" not in tail.split("LEFT JOIN LATERAL")[0]

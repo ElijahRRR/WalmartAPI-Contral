@@ -76,6 +76,8 @@ def run(params: dict) -> str:
         pt2cat = {pt: c for pt, c in cur.fetchall() if c}
         cur.execute(sv._SQL_ONLINE)
         items = cur.fetchall()
+        cur.execute(sv._SQL_STATUS)
+        status = {s: st for s, st in cur.fetchall()}
         cur.execute(sv._SQL_SALES, (sales_days,))
         sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
@@ -91,9 +93,16 @@ def run(params: dict) -> str:
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
     # 纪律 1 追加:规划范围外的店(店名含「谭总」等)不占任何品牌与产品
     # ——所有者定稿 2026-08-15,其他店可与它们重复上架
+    # 纪律 5:**非 ACTIVE 的店当作全新店,一条占用都不给它建**(定稿 08-15 晚)。
+    # 这不是释放——回填从没给它占过,白纸是"没做"出来的,不是"撤销"出来的。
+    # 空状态 fail-open 视同 ACTIVE(sv.is_dormant → kpi.store_activity)
     live = [r for r in rows if r["store"] in registered and r["published"]
-            and not sv.is_excluded(r["store"])]
+            and not sv.is_excluded(r["store"])
+            and not sv.is_dormant(status.get(r["store"]))]
     dropped = len(rows) - len(live)
+    dormant = sorted({r["store"] for r in rows
+                      if sv.is_dormant(status.get(r["store"]))
+                      and not sv.is_excluded(r["store"])})
 
     try:
         cfg = store_targets.load_targets()      # 类目准入是冲突判定的硬闸
@@ -118,9 +127,30 @@ def run(params: dict) -> str:
     ]
 
     per_store = Counter(r["store"] for r in to_claim)
-    head = (f"在线行 {st['online']},入选(在册∧已发布){len(live)}、"
+    head = (f"在线行 {st['online']},入选(在册∧已发布∧ACTIVE){len(live)}、"
             f"排除 {dropped};将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"
             f";涉及 {len(per_store)} 家店")
+    if dormant:
+        head += (f"\n   非 ACTIVE 当全新店、不建占用:{len(dormant)} 家"
+                 f"({'、'.join(dormant[:6])})")
+        # 上一轮回填之后才停用的店会**已经**持有占用。回填幂等,不会去动它们
+        # ——而"当作全新店"要求它们手上是白纸。自动释放是禁的(品牌被别店占走
+        # 不可撤销),所以只能点名让人跑 store_release
+        try:
+            with db.pg_conn() as conn:
+                held = claims.counts_by_store(conn)
+        except Exception as e:                        # noqa: BLE001 台账还没建也算正常
+            head += f"\n   ⚠ 占用台账读不到({e}),没法查它们是否已持有占用"
+        else:
+            stuck = {s: h for s, h in held.items() if s in set(dormant)}
+            if stuck:
+                head += ("\n   ⚠ 其中 %s 在上一轮停用前**已持有占用**"
+                         "(%s)——本工作流幂等、不会动它们;要按全新店对待"
+                         "得人跑 `store_release -p store=<店>`" % (
+                             len(stuck),
+                             "; ".join(f"{s}:品牌{h.get(claims.BRAND, 0)}/"
+                                       f"产品{h.get(claims.PRODUCT, 0)}"
+                                       for s, h in sorted(stuck.items())[:6])))
     ties_note = (f";**无销售依据、只能按件数/店名定序而跳过:品牌 {brand_ties} 组 / "
                  f"产品 {prod_ties} 组**"
                  "(机器判不出谁该留,先看 alloc_audit 的 C3/C4 清单,"

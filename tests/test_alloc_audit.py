@@ -291,6 +291,7 @@ class _FakeCur:
         self.fail_pt_dict = fail_pt_dict
         self._no_sales = False
         self.extra_items: list = []
+        self.status = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE")]
         self.description = []
         self._rows: list = []
 
@@ -320,7 +321,7 @@ class _FakeCur:
         elif "FROM catalog.walmart_items" in sql:
             self._rows = list(ITEMS) + list(self.extra_items)
         elif "store_kpi_daily" in sql:
-            self._rows = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE")]
+            self._rows = list(self.status)
         elif "GROUP BY store ORDER BY n DESC" in sql:      # A8 订单店名对账
             self._rows = [("A085", 30, 30), ("旧名店", 5, 5)]
         elif "FROM orders.order_lines" in sql:
@@ -606,3 +607,76 @@ def test_category_gate_skipped_when_nobody_admits():
     (key, keep, _st, _d, level) = sv.resolve_conflicts(
         rows, {}, "asin", ({}, {}), cfg)[0]
     assert level != sv.BY_CATEGORY          # 退回阶梯,不是类目说了算
+
+
+# ── 非 ACTIVE = 当全新店;参不参与分配另有开关(所有者定稿 2026-08-15 晚)──
+
+def test_is_dormant_delegates_to_kpi_and_fails_open_on_blank():
+    """空状态 = 'unknown' = **视同在营**(口径总表 #2 全仓 fail-open)。
+
+    在这里另写一份 upper() != 'ACTIVE' 会把"没抓到状态"变成"停用",
+    而停用店的在线商品会被判成不占货位 —— 别的店于是能把它的品牌抢走。
+    """
+    assert sv.is_dormant("SUSPENDED") and sv.is_dormant("TERMINATED")
+    assert not sv.is_dormant("ACTIVE") and not sv.is_dormant("active")
+    assert not sv.is_dormant("") and not sv.is_dormant(None)   # fail-open
+
+
+def test_accepts_allocation_keeps_zero_and_unfilled_apart():
+    """0 = 所有者按下"不接货";None = 还没填。压成两态会让没填的店永远分不到货。"""
+    assert store_targets.accepts_allocation({"max_online": 0}) is False
+    assert store_targets.accepts_allocation({"max_online": 0.0}) is False
+    assert store_targets.accepts_allocation({"max_online": 500}) is True
+    assert store_targets.accepts_allocation({"max_online": None}) is None
+    assert store_targets.accepts_allocation(None) is None
+    assert store_targets.accepts_allocation({}) is None
+
+
+def test_opted_out_store_is_not_nagged_for_the_other_columns():
+    """填了 0 的店不接货,配送限制/目标三列填不填都无所谓,别再点名它。"""
+    cfg = {"关店": {"max_online": 0.0, "channel": None, "gmv": None,
+                    "orders": None, "categories": []},
+           "在营": {"max_online": None, "channel": None, "gmv": None,
+                    "orders": None, "categories": []}}
+    miss = store_targets.missing_config(cfg, ["关店", "在营"])
+    assert "关店" not in miss
+    assert set(miss["在营"]) == {"配送限制", "单店最大在线数", "目标销售额", "目标订单"}
+
+
+def test_run_treats_non_active_store_as_a_brand_new_store(monkeypatch, tmp_path):
+    """SUSPENDED 店的在线行不进冲突:它当全新店、不持有占用,拦不住别人。
+
+    ⚠ 这**不是**释放 —— 回填从没给它建过占用,白纸是"没做"出来的。
+    """
+    cur = _FakeCur()
+    cur.extra_items = [("停用店", "B0AAAA0001", "Socks", "PUBLISHED")]
+    cur.status = [("A085", "ACTIVE"), ("A107", ""), ("DEAD1", "ACTIVE"),
+                  ("停用店", "SUSPENDED")]
+    _wire(monkeypatch, cur, registered={"A085", "A107", "停用店"},
+          reports=tmp_path)
+    out = wf.run({})
+    assert "非 ACTIVE 1 家(停用店)" in out and "当全新店" in out
+    assert "照常参与分配" in out          # 别把"当全新店"读成"不接货"
+    c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
+    assert "停用店" not in c3
+    # 但它照样在店铺总览里点名,且标明是哪一种"不占用"
+    ov = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
+    assert "否(非ACTIVE·当全新店)" in ov
+
+
+def test_run_reports_which_stores_opted_out_of_allocation(monkeypatch, tmp_path):
+    """「单店最大在线数」填 0 的店要点名回读——所有者才能核对表格改对了没。"""
+    cur = _FakeCur()
+    _wire(monkeypatch, cur, reports=tmp_path, cfg={
+        "A085": {"gmv": 100.0, "orders": 3.0, "max_online": 0.0,
+                 "channel": "FBA", "channel_raw": "fba",
+                 "categories": ["Fashion"]},
+        "A107": {"gmv": None, "orders": None, "max_online": 500.0,
+                 "channel": None, "channel_raw": "", "categories": []}})
+    out = wf.run({})
+    assert "不参与分配  1 家" in out and "A085" in out
+    ov = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
+    rows = {ln.split(",")[0]: ln.split(",") for ln in ov.splitlines()[1:]}
+    assert rows["A085"][2] == "否(填了0)" and rows["A085"][3] == "0"
+    assert rows["A107"][2] == "是" and rows["A107"][3] == "500"
+    assert rows["DEAD1"][2] == "(未填)" and rows["DEAD1"][3] == ""

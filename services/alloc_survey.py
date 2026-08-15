@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 
 from registry import resources
 from services import brand_key as bk
-from services import sku_asin, store_targets
+from services import kpi, sku_asin, store_targets
 
 logger = logging.getLogger("services.alloc_survey")
 
@@ -27,6 +27,25 @@ def is_excluded(store: str) -> bool:
     """
     name = str(store or "")
     return any(p in name for p in resources.alloc_excluded_stores())
+
+
+def is_dormant(status) -> bool:
+    """输入:`store_kpi_daily.store_status` 原值 → 输出:是否**按全新店对待**。
+
+    所有者定稿 2026-08-15 晚:**SUSPENDED 的店当作全新店**。落到实现上是
+    两件事,两件都是"不做",没有一件是释放:
+      · 回填**不给它建占用** —— 因此不是"释放",是从来没占过;
+      · 其在线行**不进冲突判定** —— 它不占货位,自然拦不住别的店。
+    "全新"到此为止:**它照常进分配队列**(以空店身份进梯队 2)。要一家店
+    不接货,走「单店最大在线数」填 0(`store_targets.accepts_allocation`),
+    那是所有者按的开关,与店铺状态无关(定稿同日,更正前一版口径)。
+
+    ⚠ 判据委托 `services.kpi.store_activity`(「什么算在营」全仓唯一出处):
+    空状态 = 'unknown' = **fail-open 视同在营**(口径总表 #2)。在这里另写
+    一份 `upper() != 'ACTIVE'` 会把"没抓到状态"变成"停用",而那正是
+    kpi.store_activity docstring 里点名的那类事故。
+    """
+    return kpi.store_activity(status) == "inactive"
 
 _CHUNK = 5000
 UNCLASSIFIED = "(未归类)"

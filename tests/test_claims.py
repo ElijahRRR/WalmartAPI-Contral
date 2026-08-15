@@ -272,3 +272,86 @@ def test_resolve_conflicts_sums_sales_per_store():
         ROWS, sales, "asin", metrics)[0]
     assert keep == "A107" and level == "按该商品销量"
     assert dict((d[0], d[4]) for d in detail) == {"A085": 30.0, "A107": 99.0}
+
+
+# ── 非 ACTIVE 的店当全新店:回填一条占用都不给它建(定稿 2026-08-15 晚)──
+
+class _BfCur:
+    """alloc_backfill 的假游标:按 SQL 特征分派,状态可注入。"""
+
+    def __init__(self, items, status):
+        self.items, self.status, self._rows = items, status, []
+
+    def execute(self, sql, args=None):
+        if "product_type, btrim" in sql:
+            self._rows = [("Socks", "Fashion")]
+        elif "FROM catalog.walmart_items" in sql:
+            self._rows = list(self.items)
+        elif "store_kpi_daily" in sql:
+            self._rows = list(self.status)
+        elif "FROM orders.order_lines" in sql:
+            self._rows = []
+        elif "FROM catalog.products p" in sql:
+            self._rows = [("B0AAAA0001", "Acme", None, "Socks", "walmart_confirmed",
+                           None),
+                          ("B0BBBB0002", "Beta", None, "Socks", "walmart_confirmed",
+                           None)]
+        else:
+            self._rows = []
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _wire_bf(monkeypatch, items, status, captured):
+    cur = _BfCur(items, status)
+
+    class _Conn:
+        def cursor(self):
+            return cur
+
+    monkeypatch.setattr(bf.db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(bf.stores_svc, "registered_names",
+                        lambda: {"在营店", "停用店"})
+    monkeypatch.setattr(bf.store_targets, "load_targets",
+                        lambda: {"在营店": {"categories": [], "max_online": 500.0},
+                                 "停用店": {"categories": [], "max_online": 500.0}})
+    monkeypatch.setattr(bf.claims, "claim_many",
+                        lambda conn, rows: (captured.extend(rows), (len(rows), []))[1])
+    monkeypatch.setattr(bf.claims, "counts_by_store", lambda conn: {})
+
+
+def test_backfill_builds_no_claim_for_a_non_active_store(monkeypatch):
+    """停用店的在线商品**一条占用都不建** —— 这不是释放,是从没占过。
+
+    建了才是真麻烦:占用没有自动释放,停用店会一直攥着品牌不放,
+    而"当作全新店"要的正是它手上是白纸。
+    """
+    captured: list = []
+    _wire_bf(monkeypatch, items=[("在营店", "B0AAAA0001", "Socks", "PUBLISHED"),
+                                 ("停用店", "B0BBBB0002", "Socks", "PUBLISHED")],
+             status=[("在营店", "ACTIVE"), ("停用店", "SUSPENDED")],
+             captured=captured)
+    out = bf.run({"execute": True})
+    assert {r["store"] for r in captured} == {"在营店"}
+    assert "B0BBBB0002" not in {r["claim_key"] for r in captured}
+    assert "非 ACTIVE 当全新店、不建占用:1 家(停用店)" in out
+
+
+def test_backfill_fails_open_when_status_is_blank(monkeypatch):
+    """状态取不到(空)不算停用——判不准就判活,否则一次抓取故障就会让
+    在营店的品牌被判成"没人占",别的店抢走后不可撤销。"""
+    captured: list = []
+    _wire_bf(monkeypatch, items=[("在营店", "B0AAAA0001", "Socks", "PUBLISHED"),
+                                 ("停用店", "B0BBBB0002", "Socks", "PUBLISHED")],
+             status=[],                      # 一条 KPI 都没有
+             captured=captured)
+    bf.run({"execute": True})
+    assert {r["store"] for r in captured} == {"在营店", "停用店"}

@@ -98,6 +98,24 @@ def allowed(cfg_row: dict | None, category: str | None) -> bool:
     return bool(category) and category in cats
 
 
+def accepts_allocation(cfg_row: dict | None) -> bool | None:
+    """输入:某店配置行 → 输出:参不参与分配;**没填返回 None**(三态)。
+
+    所有者定稿 2026-08-15 晚:**不想让它接货的店,「单店最大在线数」填 0**。
+    这一列于是既是容量上限也是参与开关——与类目、配送限制同一治理方式:
+    改表格一格就改了行为,不建表、不改代码、不看店铺状态。
+    (店铺 SUSPENDED **不**代表不参与:那只让它当全新店,见
+     `alloc_survey.is_dormant`。要不要接货只看这一格。)
+
+    ⚠ 三态不许压成两态:`0` = 所有者按下了"不接货"这个开关,
+    `None` = 还没填(报告点名补填,见 `missing_config`)。写成
+    `not max_online` 会把没填的店一并算成不接货 —— 它于是永远分不到货,
+    而且不报错,正是本模块开头那条空值纪律要防的事。
+    """
+    v = (cfg_row or {}).get("max_online")
+    return None if v is None else v > 0
+
+
 def missing_config(cfg: dict[str, dict], stores: list[str]) -> dict[str, list]:
     """输入:配置表 + 在营店名 → 输出:{店铺: [缺哪几项]}(全填的店不出现)。
 
@@ -111,6 +129,8 @@ def missing_config(cfg: dict[str, dict], stores: list[str]) -> dict[str, list]:
         if c is None:
             out[s] = ["未在限额表登记"]
             continue
+        if accepts_allocation(c) is False:
+            continue        # 「单店最大在线数」填了 0 = 不接货,其余三列填不填都无所谓
         miss = [label for key, label in (
             ("channel", "配送限制"), ("max_online", "单店最大在线数"),
             ("gmv", "目标销售额"), ("orders", "目标订单"))

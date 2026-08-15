@@ -261,23 +261,41 @@ def _rows_for_input():
     ]
 
 
-def test_write_input_three_filters_each_counted(monkeypatch, tmp_path):
+def test_write_input_filters_each_counted(monkeypatch, tmp_path):
     """三道过滤各自计数 —— 丢弃静默常态化 = 少抓一半没人知道。
 
     ⚠ 空 sellerId 是 A147 事故防线:影刀拿它拼出 /seller//cp/shopall
     (路径中段为空)会崩掉整条 RPA 循环,后果不是少抓这一家,是它之后的店全被跳过。
     """
     monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
-    written, drops = yingdao.write_input(_rows_for_input())
-    assert written == 2
-    assert drops == {"no_seller_id": 2, "inactive": 2, "dup_seller_id": 1}
+    st = yingdao.write_input(_rows_for_input())
+    assert st == {"written": 3, "no_seller_id": 2, "inactive": 1,
+                  "dup_seller_id": 1, "unknown_status": 1}
     data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
-    assert data["count"] == 2
-    assert [s["store"] for s in data["stores"]] == ["A店", "Z店"]   # 按店铺排序
+    assert data["count"] == 3
+    assert [s["store"] for s in data["stores"]] == ["A店", "Z店", "无状态店"]
     assert data["stores"][0]["seller_id"] == "111"
     assert data["stores"][0]["payment_status"] == ""               # None → 空串
     # 只公开约定的四个字段,别的列不许漏给影刀
     assert set(data["stores"][0]) == set(yingdao._INPUT_FIELDS)
+
+
+def test_empty_store_status_is_included_not_treated_as_inactive(monkeypatch,
+                                                                tmp_path):
+    """⚠ 空状态 ≠ 停用,是"没拿到"。
+
+    extract_settlement 取 store_status 时**没有 _find_key 兜底**(payment_status
+    有),结算响应换个形状就是空串。把空当停用 = 让解析故障静默地少抓一半店
+    —— 2026-08-15 生产实见 38 家里 18 家被判 inactive,正是这个成因待查。
+    """
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    st = yingdao.write_input([
+        {"store": "空状态", "seller_id": "1", "store_status": None},
+        {"store": "真停用", "seller_id": "2", "store_status": "SUSPENDED"},
+    ])
+    assert st["written"] == 1 and st["unknown_status"] == 1 and st["inactive"] == 1
+    data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
+    assert [s["store"] for s in data["stores"]] == ["空状态"]
 
 
 def test_write_input_overwrites_never_accumulates(monkeypatch, tmp_path):
@@ -322,9 +340,10 @@ def test_yingdao_input_mode_writes_list_without_spawning(monkeypatch, tmp_path):
                         lambda: (_ for _ in ()).throw(
                             AssertionError("yingdao=input 不许 spawn")))
     out = dr._yingdao_refresh(_rows_for_input(), "2026-08-15", do_spawn=False)
-    assert "输入清单 2 店" in out and "未 spawn" in out
+    assert "输入清单 3 店" in out and "未 spawn" in out
+    assert "⚠ 状态为空仍纳入 1 店" in out       # 警戒计数必须进摘要,不能只在日志
     data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
-    assert data["count"] == 2
+    assert data["count"] == 3
 
 
 def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):

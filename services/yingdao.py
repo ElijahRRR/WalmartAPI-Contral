@@ -47,23 +47,30 @@ _INPUT_FIELDS = ("store", "seller_id", "store_status", "payment_status")
 # 页面本就没什么可看,抓它纯耗时间和风控额度。
 _ACTIVE = "ACTIVE"
 
-_DROP_REASONS = ("no_seller_id", "inactive", "dup_seller_id")
+_STAT_KEYS = ("written", "no_seller_id", "inactive", "dup_seller_id",
+              "unknown_status")
 
 
-def write_input(rows: list[dict]) -> tuple[int, dict[str, int]]:
-    """输入:当轮已入库的 KPI 行 → 输出:(写出店数, {丢弃原因: 店数})。
+def write_input(rows: list[dict]) -> dict[str, int]:
+    """输入:当轮已入库的 KPI 行 → 输出:各口径计数 dict(见 _STAT_KEYS)。
 
     整文件覆盖写,只含本轮真跑到的店——不追加、不与上一版合并,所以不会重复。
 
-    三道过滤,**每道都单独计数**(丢弃静默常态化 = 少抓一半没人知道):
+    过滤三道 + 一个警戒计数,**每项单独计数**:合成一个数字的话,"今天少抓了
+    8 家"就没法回答"为什么少"(丢弃静默常态化 = 少抓一半没人知道)。
     - `no_seller_id` 空 sellerId。⚠ A147 事故防线:影刀拿它拼出
       https://www.walmart.com/seller//cp/shopall(路径中段为空)会崩掉整条
       RPA 循环,**后续店铺全被跳过**——不是少抓一家,是少抓一半。
-    - `inactive` store_status 非 ACTIVE。
+    - `inactive` store_status **有值且**非 ACTIVE → 排除。
     - `dup_seller_id` 同一 sellerId 出现多次(店铺凭证表有重复行时会发生),
       抓两遍同一个页面纯属浪费,后者覆盖前者也看不出来。
+    - `unknown_status` store_status **为空 → 照常纳入**,只计数报警。
+      ⚠ 空不等于停用,是"没拿到":`extract_settlement` 的 store_status 取
+      `sellerInfo.sellerStatus` 且**没有 `_find_key` 兜底**(payment_status 有),
+      结算响应换个形状它就是空串。把空当停用 = 让解析故障静默地少抓一半店,
+      违反本仓「判不准就判活」。这个数长期非 0 说明结算解析该修,不是店停了。
 
-    被丢掉的店**照常入库**,只是不参与前台抓取;它们当天的销售状态会留空
+    被排除的店**照常入库**,只是不参与前台抓取;它们当天的销售状态会留空
     (卖家名称有跨日延续兜底)。
 
     原子写(tmp + rename):影刀随时可能在读,写一半被读到会让它解析失败。
@@ -72,20 +79,26 @@ def write_input(rows: list[dict]) -> tuple[int, dict[str, int]]:
     path = paths.yingdao_input_file()
     out: list[dict] = []
     seen: set[str] = set()
-    drops = dict.fromkeys(_DROP_REASONS, 0)
+    stats = dict.fromkeys(_STAT_KEYS, 0)
     for r in rows:
         sid = str(r.get("seller_id") or "").strip()
+        status = str(r.get("store_status") or "").strip().upper()
         if not sid:
-            drops["no_seller_id"] += 1
-        elif str(r.get("store_status") or "").strip().upper() != _ACTIVE:
-            drops["inactive"] += 1
-        elif sid in seen:
-            drops["dup_seller_id"] += 1
-        else:
-            seen.add(sid)
-            out.append({f: ("" if r.get(f) is None else str(r[f]))
-                        for f in _INPUT_FIELDS})
+            stats["no_seller_id"] += 1
+            continue
+        if status and status != _ACTIVE:
+            stats["inactive"] += 1
+            continue
+        if sid in seen:
+            stats["dup_seller_id"] += 1
+            continue
+        if not status:
+            stats["unknown_status"] += 1      # 纳入,但要看得见
+        seen.add(sid)
+        out.append({f: ("" if r.get(f) is None else str(r[f]))
+                    for f in _INPUT_FIELDS})
     out.sort(key=lambda r: stores.sort_key(r["store"]))     # 与看板同一店铺序
+    stats["written"] = len(out)
     payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
                "count": len(out), "stores": out}
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,8 +106,12 @@ def write_input(rows: list[dict]) -> tuple[int, dict[str, int]]:
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                    encoding="utf-8")
     os.replace(tmp, path)
-    logger.info("影刀输入:%d 店写出 %s,丢弃 %s", len(out), path, drops)
-    return len(out), drops
+    logger.info("影刀输入:写出 %s,计数 %s", path, stats)
+    if stats["unknown_status"]:
+        logger.warning("影刀输入:%d 店 store_status 为空仍纳入 —— 空≠停用,"
+                       "长期非 0 说明结算解析拿不到 sellerStatus,该查 settle_debug",
+                       stats["unknown_status"])
+    return stats
 
 
 def spawn() -> bool:

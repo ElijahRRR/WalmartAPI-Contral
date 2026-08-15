@@ -488,10 +488,13 @@ def test_run_exports_six_lists(monkeypatch, tmp_path):
 
     # 同 ASIN:A085 卖过 120 元、A107 零销量 → 留 A085,A107 那行判下架
     c3 = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
-    lines = [ln for ln in c3.splitlines() if "B0AAAA0001" in ln]
-    assert any(ln.startswith("B0AAAA0001,A085") and ln.endswith("保留")
-               for ln in lines)
-    assert any(",A107," in ln and ln.endswith("下架") for ln in lines)
+    head, *body = c3.splitlines()
+    col = {name: i for i, name in enumerate(head.split(","))}
+    lines = [ln.split(",") for ln in body if "B0AAAA0001" in ln]
+    assert any(c[col["店铺"]] == "A085" and c[col["处置"]] == "保留" for c in lines)
+    assert any(c[col["店铺"]] == "A107" and c[col["处置"]] == "下架" for c in lines)
+    # 组内店铺数/组内行数摊在每一行上:保留数与下架数为什么不等,看这两列即知
+    assert all(c[col["组内店铺数"]] == "2" for c in lines)
 
 
 def test_store_overview_csv_carries_the_per_store_detail(monkeypatch, tmp_path):
@@ -892,3 +895,40 @@ def test_disposal_lists_come_from_slot_rows_not_claim_rows(monkeypatch, tmp_path
     wf.run({})
     txt = (tmp_path / "alloc_类目不符下架清单.csv").read_text(encoding="utf-8-sig")
     assert "B0CCCC0003" in txt and "Home" in txt
+
+
+def test_keep_and_drop_counts_are_not_expected_to_match():
+    """保留数与下架数**本来就不相等** —— 一个品牌组里赢家保留它全部的行、
+    输家下架它全部的行,各店 SKU 数不一样(所有者 2026-08-15 晚按 1:1
+    对不上而质疑,查证是分组语义不是 bug)。
+
+    而且阶梯第④级正是「按在线件数」——SKU 多的那家更容易赢,
+    所以**保留 > 下架 是系统性的**,不是数据错了。
+    """
+    rows = ([{"store": "A", "sku": f"SA{i}", "asin": f"B0A{i:07d}",
+              "brand_key": "acme", "category": "Home", "published": True}
+             for i in range(4)]
+            + [{"store": "B", "sku": "SB1", "asin": "B0B0000001",
+                "brand_key": "acme", "category": "Home", "published": True}])
+    (key, keep, _s, detail, level) = sv.resolve_conflicts(
+        rows, {}, "brand_key", sv.store_metrics(rows, {}))[0]
+    verdicts = Counter(d[7] for d in detail)
+    assert keep == "A" and level == "按在线件数"
+    assert verdicts == {"保留": 4, "下架": 1}      # 4:1,不是 1:1
+    # 不变量:每组恰好一个保留店,且两边都非空
+    assert {d[0] for d in detail if d[7] == "保留"} == {keep}
+    assert verdicts["保留"] >= 1 and verdicts["下架"] >= 1
+
+
+def test_report_leads_with_the_actionable_row_count(monkeypatch, tmp_path):
+    """摘要报的是"要下架几件",不是"清单几行" —— 清单里过半是保留方,
+    那是上下文不是待办;只报总行数会让人以为要处置那么多。"""
+    cur = _FakeCur()
+    _wire(monkeypatch, cur, reports=tmp_path)
+    out = wf.run({})
+    assert "要下架" in out
+    c = (tmp_path / "alloc_同ASIN冲突处置.csv").read_text(encoding="utf-8-sig")
+    head, *body = c.splitlines()
+    col = head.split(",").index("处置")
+    drop = sum(1 for ln in body if ln.split(",")[col] == "下架")
+    assert f"要下架 {drop} 件" in out or f"要下架 {drop + 1} 件" in out

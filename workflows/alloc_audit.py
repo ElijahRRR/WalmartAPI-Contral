@@ -231,6 +231,12 @@ def run(params: dict) -> str:
     # ── ▍要你做的事(放最前面:报告是为了让人动手,不是为了让人读)──
     hard = sum(1 for c in conflicts.values() for x in c
                if x[4] in sv.NEEDS_HUMAN)
+    # 冲突清单里**只有「下架」那些行要你动手**;「保留」行是上下文,列出来
+    # 是为了让人看见判给了谁。两者数量本来就不等——一个品牌组里赢家保留它
+    # 全部的行、输家下架它全部的行,各店 SKU 数不一样(所有者 2026-08-15 晚
+    # 按 1:1 对不上而质疑)。所以摘要报的是"要下架几件",不是"清单几行"
+    drop_all = sum(1 for c in conflicts.values() for x in c
+                   for d in x[3] if d[7] == "下架")
     todo = [("① 填类目三列",
              f"{len(unfilled_cat)} 家店待填" if not cfg_err else "本轮没查",
              "→ alloc_类目建议.csv" if not cfg_err else
@@ -245,8 +251,9 @@ def run(params: dict) -> str:
              "→ alloc_类目不符下架清单.csv" if cfg else
              "**跳过**:限额表读不到,没有准入类目可对拍"),
             ("④ 确认冲突处置",
-             f"同 ASIN {len(conflicts['同 ASIN'])} 组 · "
-             f"同品牌 {len(conflicts['同品牌'])} 组",
+             f"要下架 {drop_all} 件"
+             f"(同 ASIN {len(conflicts['同 ASIN'])} 组 · "
+             f"同品牌 {len(conflicts['同品牌'])} 组)",
              "→ alloc_同ASIN冲突处置.csv 等 2 份"
              + (f",其中 {hard} 组机器判不出、要人眼看" if hard
                 else ",全部可自动判"))]
@@ -315,8 +322,14 @@ def run(params: dict) -> str:
             body.append((tag, "无", ""))
             continue
         by_level = Counter(x[4] for x in res)
-        body.append((tag, f"{len(res)} 组", "依据:" + " · ".join(
-            f"{k.removeprefix('按')} {v}" for k, v in by_level.most_common(4))))
+        drop = sum(1 for x in res for d in x[3] if d[7] == "下架")
+        rows_n = sum(len(x[3]) for x in res)
+        body.append((tag, f"{len(res)} 组 / {rows_n} 行",
+                     f"**要下架 {drop} 行**(其余 {rows_n - drop} 行是保留方,"
+                     f"列出来只为让你看判给了谁)",
+                     "依据:" + " · ".join(
+                         f"{k.removeprefix('按')} {v}"
+                         for k, v in by_level.most_common(3))))
     L += ["", "▍冲突(只算规划内店铺)"] + _grid(body)
     if not sales:
         # 销量全空时阶梯必然一路降到"在线件数/店名",那是打平不是判定。
@@ -441,10 +454,16 @@ def run(params: dict) -> str:
                        ("同品牌", "alloc_同品牌冲突处置.csv")):
         files.append(_write_csv(
             fname,
-            ["冲突键", "保留店", "判定依据", "店铺", "SKU", "ASIN",
+            # 「组内店铺数/组内行数」两列是给人对数用的:一个品牌组里赢家
+            # 保留它**全部**的行、输家下架它**全部**的行,各店 SKU 数不一样,
+            # 所以保留数与下架数**本来就不相等**(所有者 2026-08-15 晚按 1:1
+            # 对不上而质疑)。把分组摊在每一行上,这件事就不用解释了
+            ["冲突键", "组内店铺数", "组内行数", "保留店", "判定依据",
+             "店铺", "SKU", "ASIN",
              f"近{sales_days}天单量", "该商品销售额", "该店该大类销售额",
              "该店整体销售额", "处置"],
-            [(key, keep, level, s2, sku, asin, o, g, cg, sg, verdict)
+            [(key, len({d[0] for d in detail}), len(detail), keep, level,
+              s2, sku, asin, o, g, cg, sg, verdict)
              for key, keep, _, detail, level in conflicts[tag]
              for s2, sku, asin, o, g, cg, sg, verdict in detail]))
 

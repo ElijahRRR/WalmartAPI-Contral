@@ -24,6 +24,15 @@ import logging
 
 logger = logging.getLogger("services.dispositions")
 
+# ⚠ **本模块每个 SQL 参数都必须显式写 `::类型`**(2026-08-14 定,有 lint 式
+# 测试 test_every_sql_param_is_cast 挡着)。不是风格洁癖 —— 同一段 SQL 因为
+# PG 推不出参数类型,在生产上连炸三次,而每次 pytest 都是全绿:
+#   ① `record <> ALL(text[][])`                     类型不匹配
+#   ② `%(store)s IS NULL OR store = %(store)s`      IS NULL 不提供类型信息
+#   ③ `jsonb_build_object('k', %(why)s)`            该函数收 any,无从推断
+# 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到 —— 靠"下次小心"
+# 是没用的,只有"每个参数都带 cast"这条机械规则能被测试执行。
+
 # 动作取值(与 problem_product_cleanup 的三桶一一对应)
 ACTIONS = ("relist", "delete", "retire")
 # 来源(tro 是预留:侵权投诉链将来也走同一张建议表)
@@ -38,8 +47,9 @@ OPEN_STATUSES = ("suggested", "executing")
 _UPSERT_SQL = """
 INSERT INTO ops.dispositions
     (store, sku, asin, source, action, category, reason, detail)
-VALUES (%(store)s, %(sku)s, %(asin)s, %(source)s, %(action)s,
-        %(category)s, %(reason)s, %(detail)s::jsonb)
+VALUES (%(store)s::text, %(sku)s::text, %(asin)s::text, %(source)s::text,
+        %(action)s::text, %(category)s::text, %(reason)s::text,
+        %(detail)s::jsonb)
 ON CONFLICT (store, sku, action) WHERE status IN ('suggested', 'executing')
 DO UPDATE SET category = EXCLUDED.category,
               reason = EXCLUDED.reason,
@@ -58,8 +68,8 @@ ORDER BY store, action, suggested_at
 
 _MARK_SQL = """
 UPDATE ops.dispositions
-SET status = 'executing', feed_id = %(feed_id)s, executed_at = now()
-WHERE id = ANY(%(ids)s) AND status = 'suggested'
+SET status = 'executing', feed_id = %(feed_id)s::text, executed_at = now()
+WHERE id = ANY(%(ids)s::bigint[]) AND status = 'suggested'
 """
 
 # 观测判决登记:executing 行 × 提交之后落的核验事件。
@@ -154,8 +164,8 @@ def suggest_many(conn, rows: list[dict]) -> int:
 _WITHDRAW_SQL = """
 UPDATE ops.dispositions d
 SET status = 'withdrawn', settled_at = now(),
-    detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s)
-WHERE d.status = 'suggested' AND d.source = %(source)s
+    detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s::text)
+WHERE d.status = 'suggested' AND d.source = %(source)s::text
   AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
@@ -190,7 +200,7 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
             cur.execute(
                 "UPDATE ops.dispositions SET status = 'withdrawn', "
                 "settled_at = now() WHERE status = 'suggested' "
-                "AND source = %(source)s "
+                "AND source = %(source)s::text "
                 "AND (%(store)s::text IS NULL OR store = %(store)s::text)",
                 {"source": source, "store": store})
             return cur.rowcount or 0

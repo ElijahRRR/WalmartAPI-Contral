@@ -4,6 +4,8 @@
 哪,钉它的测试就跟到哪**。执行侧(消费建议行 + 发 feed)的用例留在原文件。
 """
 
+import pathlib
+
 import pytest
 
 from services import problem_products as pp
@@ -334,3 +336,27 @@ def test_withdraw_empty_keep_also_respects_store():
     dispositions.withdraw_stale(_Conn(), "scan", [], "x", store="T9")
     assert "(%(store)s::text IS NULL OR store = %(store)s::text)" in seen["sql"]
     assert seen["store"] == "T9"
+
+
+def test_every_sql_param_is_cast():
+    """⚠ **lint 式护栏,不是风格洁癖。**
+
+    services/dispositions 的 SQL 因为 PG 推不出参数类型,在生产上连炸三次,
+    而每次 pytest 都是全绿:
+      ① `record <> ALL(text[][])`                类型不匹配
+      ② `%(store)s IS NULL OR store = %(store)s` IS NULL 不提供类型信息
+      ③ `jsonb_build_object('k', %(why)s)`       该函数收 any,无从推断
+    本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到 —— "下次小心"
+    不是能执行的结论,"每个参数都带 ::类型"才是,而且能被这条用例机械检查。
+
+    只扫模块级 SQL 常量(注释里的反例不算)。
+    """
+    import re
+    src = pathlib.Path("services/dispositions.py").read_text()
+    bad = []
+    for m in re.finditer(r'^(_\w*SQL)\s*=\s*"""(.*?)"""', src, re.S | re.M):
+        for pm in re.finditer(r"%\((\w+)\)s(?!\s*::)", m.group(2)):
+            bad.append(f"{m.group(1)}.{pm.group(1)}")
+    assert not bad, ("这些 SQL 参数没写显式 ::类型,PG 可能推不出来(生产实炸三次):"
+                     + ", ".join(bad))
+

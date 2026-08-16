@@ -294,3 +294,18 @@ def test_product_sales_window_defaults_to_a_year():
     店铺的缺口与货位值被一年前的经营状况稀释。
     """
     assert ps.SALES_WINDOW_DAYS == 365
+
+
+def test_cutoff_is_calibrated_against_the_reputation_ceiling():
+    """⚠ 淘汰线的严格程度**被口碑满分带着走**,改权重时必须回头看它。
+
+    2026-08-16 实测:口碑满分 75 时,40 只筛掉 7.5%;把口碑压到 60 之后,
+    同一个 40 变成筛掉 56%,中位数直接掉到线下,牌堆缓冲腰斩。
+    这条不是要钉死某个数,是要让"改了满分却忘了挪线"当场变红。
+    """
+    # 只有口碑、没有销量的品(实测占 96%)—— 它们的分全在 0~BASE_MAX 之间。
+    # 淘汰线必须明显低于这批品的中位水平,否则它就从"扫烂品"变成了"砍一半"
+    mid = ps.score({"rating": "4.2", "reviews": "50"})["score"]
+    assert ps.CUTOFF < mid, (
+        f"淘汰线 {ps.CUTOFF} 已经高过「中等口碑无销量」的 {mid:.1f} —— "
+        f"改 BASE_MAX/SALES_BONUS_MAX 之后忘了挪线")

@@ -1,8 +1,8 @@
 """alloc_products — 产品分体检(只读)。分配引擎动工前先看这张表。
 
 用法:
-  python cli.py alloc_products                     # 近 90 天销量窗口
-  python cli.py alloc_products -p days=180
+  python cli.py alloc_products                     # 销量窗口默认近一年
+  python cli.py alloc_products -p days=90          # 换窗口
   python cli.py alloc_products -p as_of=2026-08-15 # 钉住窗口右端
   python cli.py alloc_products -p export=0         # 只看摘要不落 csv
 
@@ -16,8 +16,8 @@
      那和设计意图可能差很远,得先看见才能调;
   ③ **分数分布**:淘汰线(默认 40)切下去还剩多少可分的货。
 
-明细 csv 除了逐段分数,还带**售价/运费/落地价、窗口内与全历史的销量与销售额、
-占用店与在线店**(所有者 2026-08-16 要的)。三条读表纪律:
+明细 csv 除了逐段分数,还带**配送方式、售价/运费/落地价、窗口内与全历史的
+销量与销售额、占用店与在线店**(所有者 2026-08-16 要的)。三条读表纪律:
   · **销售额一律毛额**(未扣退款)—— 逐产品的退款只有 API 期算得出,
     与店铺侧的净额**不是同一口径**,两张表不能对账;
   · **历史销量不进打分** —— 分数只看窗口内(§7.6),否则一个三年前卖爆、
@@ -107,6 +107,8 @@ def run(params: dict) -> str:
         rows.append((c["asin"], c["brand"] or "", c["category"],
                      round(c["score"], 1), round(c["base"], 1),
                      round(c["bonus"], 1), round(c["penalty"], 1), c["why"],
+                     # 配送方式(渠道):渠道闸的产品侧,决定这个品能去哪些店
+                     c["channel"] or "(未知)",
                      c["price"], c["shipping"],
                      # 落地价 = 售价 + 运费,是硬闸真正用的那个数(§7.6);
                      # 只看售价会让"9.9 美元 + 12 美元运费"看起来很便宜
@@ -182,7 +184,7 @@ def run(params: dict) -> str:
         w = csv.writer(fh)
         w.writerow(["ASIN", "品牌", "大类", "产品分", "口碑分", "销量加分",
                     "罚分", "罚分原因",
-                    "售价", "运费", "落地价",
+                    "配送方式", "售价", "运费", "落地价",
                     f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
                     "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
                     "占用店", "在线店",

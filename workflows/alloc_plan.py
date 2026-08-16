@@ -383,7 +383,9 @@ def run(params: dict) -> str:
              "平均的一倍半。**要落 [0.7, 1.3]**(§7.4b)")
     L.append(f"  ⚠ 分母是**它自己拿到的自由流总量**,不是配额:定向流只有占用店"
              f"能要、跳过排队,拿配额当分母会让被定向流填满的店比值趋近 0 而被"
-             f"误标越界。自由流不足 {ae.MIN_FREE_FOR_RATIO} 件的店不出比值(—)。"
+             f"误标越界。自由流不足 {ae.MIN_FREE_FOR_RATIO} 件、"
+             f"或不足自己配额 {ae.MIN_FREE_SHARE_OF_QUOTA:.0%} 的店不出比值(—):"
+             f"量太小时比值是数学假象(全落在 L1 就恒等于 1÷base),不是信号。"
              f"总量独吞看「分到」与「本轮配额」两列")
     over = [s for s in stores if result["by_store"].get(s, {}).get("items", 0)
             > stores[s]["quota"]]

@@ -213,3 +213,23 @@ def test_lifetime_sales_never_feeds_the_score(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path)
     out = wf.run({})
     assert "历史销量**不进打分**" in out
+
+
+def test_csv_carries_the_fulfillment_channel(monkeypatch, tmp_path):
+    """配送方式(FBA/FBM)是渠道闸的产品侧 —— 决定这个品能去哪些店。
+
+    所有者 2026-08-16 追加。⚠ **认不出的写「(未知)」而不是留空**:留空跟
+    "这一列没填"长得一样,而两者处置不同 —— 未知渠道的品在建组时会被整组
+    剔除(不猜),那是要去查采集侧的,不是配置问题。
+    """
+    _wire(monkeypatch, tmp_path)
+    wf.run({})
+    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
+    head, *body = txt.splitlines()
+    cols = head.split(",")
+    assert "配送方式" in cols
+    val = lambda a: dict(zip(cols, next(  # noqa: E731
+        ln for ln in body if ln.startswith(a)).split(",")))
+    assert val("B0AAAA0001")["配送方式"] == "FBA"
+    assert val("B0CCCC0003")["配送方式"] == "FBM"
+    assert val("B0FFFF0006")["配送方式"] == "(未知)"   # 采不到,不留空

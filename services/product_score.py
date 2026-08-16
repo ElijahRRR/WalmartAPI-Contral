@@ -31,6 +31,8 @@
 import logging
 import math
 
+from services import amz_source
+
 logger = logging.getLogger("services.product_score")
 
 #: 低于这个分不参与分配(§7.6 初值,配置化)。
@@ -68,8 +70,14 @@ SEGMENTS = ("口碑", "销量加分", "配送罚分", "退货罚分", "黑历史
 _RATING_FLOOR, _RATING_CEIL = 3.0, 4.8     # 3.0 以下记 0,4.8 以上记满
 _REVIEWS_FULL = 1000                        # 评论数对数标度的满分点
 _SALES_FULL = 50                            # 窗口内销量(件)对数标度满分点
-_LEAD_FREE = 8                              # ≤ 8 天不扣分(amz_source.MAX_LEAD_DAYS)
-_LEAD_DEAD = 30                             # ≥ 30 天扣满
+#: ≤ 这个天数不扣分。**直接引用 amz_source 的唯一出处,不许在这里写字面量**
+#: —— 它是所有者 2026-08-09 从 12 改成 8 的值,list_new 与 maintenance 都跟着它;
+#: 这里抄一份 8 的话,哪天所有者再改,上架链跟着变而打分不变,而且不会报错。
+_LEAD_FREE = amz_source.MAX_LEAD_DAYS
+#: ⚠ **这个 30 是实现时定的占位值,不是所有者给的**(2026-08-15)。
+#: 语义:配送慢到多少天算"扣满"。8~30 之间线性扣。要改就改这里,
+#: 影响面只有产品分的罚分曲线,不碰上架/维护链。
+_LEAD_DEAD = 30
 _REFUND_DEAD = 0.30                         # 退货率 ≥ 30% 扣满
 
 

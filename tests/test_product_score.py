@@ -194,3 +194,25 @@ def test_score_decomposes_into_three_segments():
 def test_weights_sum_to_one_and_all_have_labels():
     assert abs(sum(ps.WEIGHTS.values()) - 1.0) < 1e-9
     assert set(ps.WEIGHTS) == set(ps.LABELS) == {"rating", "reviews"}
+
+
+def test_lead_threshold_follows_amz_source_not_a_local_literal():
+    """配送阈值**只能有一个出处**(CLAUDE.md 铁律)。
+
+    8 天是所有者 2026-08-09 从 12 改的值,`list_new` 与 `maintenance` 都跟着
+    `amz_source.MAX_LEAD_DAYS`。在打分这里抄一份字面量 8 的话,哪天所有者
+    再改,上架链跟着变而打分不变 —— **而且不会报错**。
+    """
+    from services import amz_source
+    assert ps._LEAD_FREE is amz_source.MAX_LEAD_DAYS
+    src = open(ps.__file__, encoding="utf-8").read()
+    assert "_LEAD_FREE = amz_source.MAX_LEAD_DAYS" in src
+
+
+def test_lead_penalty_curve_between_the_two_thresholds():
+    """8 天以内不扣,30 天扣满,中间线性 —— 30 是实现占位值,不是所有者给的。"""
+    assert ps.lead_penalty(ps._LEAD_FREE)[0] == 0.0
+    assert ps.lead_penalty(ps._LEAD_DEAD)[0] == ps.LEAD_PENALTY_MAX
+    assert ps.lead_penalty(ps._LEAD_DEAD * 2)[0] == ps.LEAD_PENALTY_MAX   # 封顶
+    mid = (ps._LEAD_FREE + ps._LEAD_DEAD) / 2
+    assert abs(ps.lead_penalty(mid)[0] - ps.LEAD_PENALTY_MAX / 2) < 1e-9

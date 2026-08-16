@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import orders as orders_api
 from registry import db
+from services import order_center
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -63,4 +64,8 @@ def run(params: dict) -> str:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:
         lines.append(f"失败:{'; '.join(failed)}")
+    # 跑完就写飞书(所有者定稿 2026-08-16:已对接飞书表的执行完就写,
+    # 不做成单独的)。**永不因投影失败而失败** —— 订单已经落 PG 了
+    lines.append(order_center.push_after(
+        order_center.BY_WORKFLOW["order_sync"], days=max(days, 90)))
     return "\n".join(lines)

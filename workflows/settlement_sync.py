@@ -25,6 +25,7 @@ import httpx
 
 from api import _client, reports
 from registry import db
+from services import order_center
 from services import order_lines, stores as stores_svc
 
 DANGEROUS = False
@@ -102,4 +103,8 @@ def run(params: dict) -> str:
     store_list = stores_svc.load_stores(names)
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
-    return _sync(store_list, int(params.get("periods", 6)))
+    out = _sync(store_list, int(params.get("periods", 6)))
+    # 跑完就写飞书。窗口给宽:对账按最近入账日筛,账期是双周发布的,
+    # 90 天才盖得住"上上个账期的行今天才补齐"这种情况
+    return out + "\n" + order_center.push_after(
+        order_center.BY_WORKFLOW["settlement_sync"], days=180)

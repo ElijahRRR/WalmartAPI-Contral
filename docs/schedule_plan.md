@@ -184,6 +184,20 @@ settlement_sync   → 写对账表
 `order_center_push` 保留为**手动全量补推 / 对账入口**(`-p reconcile=1` 那套),
 不再进调度。铁律 1 照旧:抽到 services,不是让工作流互相 import。
 
+**已落地**(2026-08-16)。两处值得记:
+
+- 谁写哪张表登记在 `services.order_center.BY_WORKFLOW` **一处**,工作流里不抄
+  字符串 —— 加一张表时漏改的那条链会**静默不写**,而且看不出来。用例钉住
+  "五张表恰好被瓜分干净,不重不漏"。
+- **两个入口的失败语义相反,是有意的**:业务链顺手写的那次走 `push_after()`,
+  投影失败**只告警不失败**(订单已经落 PG,不该让飞书拖累一轮数据拉取的成败
+  判定),但摘要点名并给出补推命令;`order_center_push` 是你专门去补推的,
+  推不成**必须记 failed**。
+
+⚠ 搬家时顺手修了一个**从没跑通过的分支**:`keys` 分支给 `_SALES_SQL` 只传了
+`(days,)`,而那条 SQL 有**两个**占位符(days + 历史数据过滤)——
+`order_center_push -p table=keys` 一跑就是参数个数不匹配。拆函数把它暴露出来了。
+
 ⚠ ~~销售表 90 天窗口每小时全推,写放大很大~~ —— **这条我判断错了,所有者纠正后
 复核代码属实,撤回**。`_sync_stateful()` 是**本地状态 + 行指纹**驱动:
 每轮只把「本地没有的键」建、「指纹变了的行」更新,其余全部跳过
@@ -226,12 +240,12 @@ settlement_sync   → 写对账表
 ⚠ plist **不需要 activate venv**:直接把上面那个 `.venv/bin/python3` 当解释器写进
 `ProgramArguments` 就行 —— venv 的 python 会自己把 `site-packages` 摆对。
 
-## 七、起调度之前必须先做的四件代码活
+## 七、起调度之前的四件代码活(**已全部完成**)
 
 | | 工作项 | 状态 |
 |---|---|---|
 | **A** | 实现 `product_refresh` 的 `wait`(轮询批次到落定,`TIMEOUT_HOURS=1` 兜底) | ✅ **已做**。落在 `services.scrape_batches.wait_settled()`;等完再跑一次 `check_open` 落台账。超时不停链(已采到的照常能用),但摘要点名 |
-| **B** | 订单中心五表拆到 `services/order_center.py`,各链跑完自己写 | ⬜ **待做**(下一步) |
+| **B** | 订单中心五表拆到 `services/order_center.py`,各链跑完自己写 | ✅ **已做**。`BY_WORKFLOW` 一处登记谁写哪张;`push_after()` 永不因投影失败而失败(数据已在 PG),但会点名并给出补推命令 |
 | **C** | 飞书通知改用**应用直接发给所有者** | ✅ **已做**。三条路依次退;手机号自动换 open_id 并缓存 |
 | **D** | `list_new` 上架**之后**补一次 UPC 池回写 | ✅ **已做**(`_writeback_upc`,dry-run 不写,失败不阻断) |
 

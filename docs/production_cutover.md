@@ -159,30 +159,53 @@ maintenance       (DANGEROUS=True,纯执行件,只消费建议行)
 我们要的值**。比对写在 Python 里不写进 SQL —— `(detail->>'new')::numeric`
 遇到一条脏 detail 会炸掉**整条 UPDATE**(不是跳过那一行,是整轮落定失败)。
 
+## 六·三、串联 / UPC / feed 审计(已落地)
+
+**串联**(所有者:订单链每个跑完自动同步飞书,不要人手动推)——`cli.py` 的
+workflow 位置参数可以给多个:
+
+```
+python cli.py order_sync order_audit order_center_push
+```
+
+⚠ 这是本项目实现"链"的**唯一**方式。铁律 1 禁止 workflow 互相 import,
+让 `order_sync` 结尾去调 `order_center_push` 就是把两条工作流焊死(以后想单跑
+推送、想换目标、想在中间插一步,都得改 `order_sync`)。串联是**调度的事**;
+cli 本来就管锁/记录/通知,链只是把这三件事各做 N 遍。
+
+语义:每步各拿各的锁、各写一行 `ops.runs`、各进各的日志文件;
+**前一步不成功就不跑后面的**(后面几步吃的是前面的输出);飞书**整链一条**
+通知;全部工作流名在跑第一步之前先验一遍。参数 `-p k=v` 发给每一步,
+`-p 工作流名:k=v` 只发给那一步。
+
+**上架先同步 UPC**:注入那段抽到 `services.upc_pool.sync_from_sheet`,
+`list_new` 与 `upc_sync` 共用。排在闸门链**之前**(领号是第 ⑦ 道闸,运营刚贴
+进表格的号这一轮就要能用);失败只告警不阻断(飞书挂了不该把整条上架链拖
+下水);dry-run 不注入,并在摘要里点明 `no_upc` 可能偏多。上架仍**不进调度**。
+
+**feed 闭环审计**:结论与三个发现见 **`docs/feed_closure_audit.md`**。
+一句话:六个提交点无一例外都落 `ops.feed_log` + `ops.feed_items`(写在 api 层,
+工作流绕不过去),提交 → 回执 → 观测核验三段齐全;修了两处 dedup 幽灵事件;
+**唯一没闭的口子是 `pending`**(见下面欠账)。
+
 ## 七、待做清单(按依赖顺序)
 
-### 1. 订单链跑完自动推飞书
+### 1. feed `pending` 自动对账器(审计挖出来的,要所有者点头)
 
-所有者要求:拉单/审核(每小时)、售后/绩效(每日)、对账(双周三)每个跑完
-自动同步飞书,不要人手动推。
+`ops.feed_log` 的 schema 注释与安全铁律都写着"启动对账:pending 行先查
+Walmart 实际状态再决定补交",**但没有任何代码在做**,而且现在**也做不了**:
+`feed_log` 没存条目数(`find_recent_feed` 的必需入参)也没存 SKU 列表
+(收编后要落 `feed_items`)。
 
-⚠ 不能让 `order_sync` import `order_center_push`(铁律:任何层不准 import
-workflows)。**走调度串联**,在 plist 里把两条命令串起来。
+要动两处:① `ALTER TABLE ops.feed_log ADD COLUMN item_count int,
+ADD COLUMN skus text[]`;② 一个新工作流按 `find_recent_feed` 三态收编或判未达。
+**它碰的是全项目最危险的那条不变式(重复提交),动之前要所有者点头。**
 
-### 2. 上架先同步 UPC
+在那之前 pending 走人工:`feed_poll` 摘要里已经摊开了明细(店铺/类型/来源/
+时间),拿去 Walmart 后台对一眼即可。pending 罕见——只在"网络异常**且**反查
+三态也不确定"时产生。
 
-`list_new` 运行时先自动同步一次 UPC。同样不能 import workflow ——
-要把 `upc_sync` 的核心抽到 services 层给 `list_new` 调。
-上架**不进定时调度**,手动运行。
-
-### 3. feed 闭环审计(所有者要的验证)
-
-所有者担心的不是飞书侧(他确认表格侧完整),是**库侧**:「是否有写入数据库,
-产品事件是否完善且闭环」。要做的是把每个提交 feed 的动作、它落的
-`ops.feed_log` / `ops.feed_items` / `catalog.product_events` 行、以及
-`feed_poll` 五个反哺器的覆盖面对一遍,缺口列出来。这是审计任务,不用连库。
-
-### 4. launchd plist 全套 + 停旧清单
+### 2. launchd plist 全套 + 停旧清单
 
 调度顺序的**硬约束**(文档里明写、颠倒会静默出错):
 
@@ -191,23 +214,29 @@ workflows)。**走调度串联**,在 plist 里把两条命令串起来。
 2. `catalog_sync → problem_scan → problem_product_cleanup`
 3. `order_sync` 必须在 `daily_report -p phase=kpi` 之前(否则订单列对拍必差)
 
-时间表(所有者定稿的节奏;KPI 窗口锚在中国时间 06:30,故日报 ≥06:35):
+时间表(所有者定稿的节奏;KPI 窗口锚在中国时间 06:30,故日报 ≥06:35)。
+**箭头即串联,一条 plist 一条命令** —— `python cli.py a b c`,不要写三个 plist,
+也不要在 plist 里拼 `&&`(launchd 的 ProgramArguments 不过 shell):
 
-| 时间 | 命令 |
+| 时间 | `python cli.py` 之后跟什么 |
 |---|---|
 | 05:30 | `catalog_sync` |
 | 05:50 | `product_refresh` |
 | 06:10 | `product_ingest` |
-| 06:20 | `order_sync` → `order_audit` → `order_center_push` |
+| 06:20 | `order_sync order_audit order_center_push` |
 | 06:40 | `daily_report`(默认全链) |
-| 07:10 | `perf_problems` / `returns_sync` |
-| 08:00 | `problem_scan` → `problem_product_cleanup` |
-| 12:00 | `maintenance_scan` → `maintenance` |
-| 每小时 | `order_sync` → `order_audit` → `order_center_push` |
+| 07:10 | `perf_problems returns_sync` |
+| 08:00 | `problem_scan problem_product_cleanup` |
+| 12:00 | `maintenance_scan maintenance` |
+| 每小时 | `order_sync order_audit order_center_push` |
 | 每 30 分 | `feed_poll` |
 | 双周三 | `settlement_sync`(下一次 2026-08-26) |
-| 02:00 | `backup` / `risk_sync` / `blacklist_push` |
-| 手动 | `list_new`(不进调度) |
+| 02:00 | `backup risk_sync blacklist_push` |
+| 手动 | `list_new`(不进调度;它自己会先同步一次 UPC) |
+
+⚠ 每小时那条与 06:20 那条**是同一条链**,别把 06:20 单列一个 plist ——
+两个 plist 撞在同一分钟会各拿各的锁,后到的整链退出码 3(不是错误,但那一轮
+白跑)。要么只留每小时那条,要么把整点那条的分钟错开。
 
 ⚠ **停旧清单见 `docs/legacy_schedules.md`**。最要紧一条:开
 `daily_report`(默认已含影刀)之前必须先停旧 `walmart-kpi-daily` ——

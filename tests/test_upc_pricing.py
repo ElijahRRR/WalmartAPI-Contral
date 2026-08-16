@@ -186,3 +186,88 @@ def test_out_of_band_falls_back_to_default_multiplier():
     assert pricing.walmart_price("FBA", 200, {}, 0) == 600.0
     # 在区间内但倍率没配 → 仍返 None(配置缺失不该拿默认值蒙混)
     assert pricing.walmart_price("FBA", 10, {}, 0) is None
+
+
+# ── 上架先注入 UPC(所有者定稿 2026-08-16)+ feed 闭环审计的两处修复 ──────────
+
+def test_upc_injection_lives_in_services_not_in_upc_sync():
+    """`list_new` 与 `upc_sync` 共用同一段注入代码(铁律 1:不许互相 import)。
+
+    各写一份迟早飘成"上架看到的池"与"upc_sync 看到的池"不是同一个。
+    """
+    import inspect
+
+    from services import upc_pool
+    from workflows import list_new, upc_sync
+    assert "def sync_from_sheet(" in inspect.getsource(upc_pool)
+    for m in (list_new, upc_sync):
+        src = inspect.getsource(m)
+        assert "upc_pool.sync_from_sheet" in src
+        assert "from workflows" not in src and "import workflows" not in src
+
+
+def test_list_new_injects_upc_before_the_gate_chain(monkeypatch):
+    """注入必须排在闸门链之前 —— 领号是第 ⑦ 道闸,刚贴进表格的号这轮就要能用。"""
+    import inspect
+
+    from workflows import list_new
+    src = inspect.getsource(list_new.run)
+    assert src.index("_sync_upc(") < src.index("_load_gate_state()")
+
+
+def test_list_new_upc_injection_failure_never_blocks_listing(monkeypatch):
+    """飞书挂了不该把整条上架链拖下水 —— 但必须**说出来**。"""
+    from services import upc_pool
+    from workflows import list_new
+
+    def boom(conn):
+        raise RuntimeError("飞书 502")
+
+    monkeypatch.setattr(upc_pool, "sync_from_sheet", boom)
+    import contextlib
+
+    from registry import db
+
+    @contextlib.contextmanager
+    def _open():
+        yield object()
+
+    monkeypatch.setattr(db, "pg_conn", _open)
+    lines = []
+    list_new._sync_upc(True, lines)         # 不抛
+    assert "UPC 注入失败" in lines[0] and "飞书 502" in lines[0]
+    # dry-run 不写库,但要点明 no_upc 可能偏多(否则两次跑对不上账)
+    lines2 = []
+    list_new._sync_upc(False, lines2)
+    assert "dry-run 跳过 UPC 注入" in lines2[0] and "no_upc" in lines2[0]
+
+
+def test_dedup_never_writes_a_product_event():
+    """⚠ dedup 挂旧 feed_id、这一轮什么都没提交 —— 记了就是幽灵事件。
+
+    2026-08-16 feed 闭环审计:`product_clear` 与 `sku_locked_heal` 曾把产品事件
+    写在 `outcome in ("submitted","dedup")` 的同一分支里,而
+    `catalog.product_risk` 的 delete_times/retire_times 直接数它 ——
+    "这个 SKU 被删过几次"于是不再是事实。其余四个提交点一直是对的。
+
+    检法:每个 `record_many(` 往上找最近的 `res["outcome"]` 判断,
+    那一行里不许出现 dedup。
+    """
+    import inspect
+
+    from workflows import (list_new, maintenance, match_listing,
+                           problem_product_cleanup, product_clear,
+                           sku_locked_heal)
+    for m in (list_new, match_listing, maintenance, problem_product_cleanup,
+              product_clear, sku_locked_heal):
+        lines = inspect.getsource(m).splitlines()
+        for i, ln in enumerate(lines):
+            if "product_events.record_many(" not in ln:
+                continue
+            gate = next((lines[j] for j in range(i, -1, -1)
+                         if 'res["outcome"]' in lines[j]), None)
+            if gate is None:
+                continue        # 不在 feed 提交分支里(如 catalog_sync 类写法)
+            assert "dedup" not in gate, (
+                f"{m.__name__} 第 {i + 1} 行:产品事件写在了含 dedup 的分支里"
+                f" —— {gate.strip()!r}")

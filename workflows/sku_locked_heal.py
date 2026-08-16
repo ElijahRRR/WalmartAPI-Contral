@@ -95,13 +95,20 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
                         cur.executemany(_SQL_INSERT, [
                             (store_name, r["asin"], res["feed_id"])
                             for r in batch])
-                    product_events.record_many(conn, [
-                        {"sku": r["asin"], "store": store_name,
-                         "event": product_events.RETIRE_SUBMITTED,
-                         "source": "sku_locked_heal",
-                         "detail": {"feed_id": res["feed_id"],
-                                    "reason": "sku_locked"}}
-                        for r in batch])
+                    # ⚠ 事件**只在 submitted 时记**(2026-08-16 feed 闭环审计):
+                    # dedup 挂的是旧 feed_id、这一轮什么都没提交,记了就是幽灵
+                    # 事件 —— catalog.product_risk 的 retire_times 直接数它,
+                    # 灌水后"这个 SKU 被停用过几次"就不再是事实。
+                    # 冷却表那条不用管:ON CONFLICT DO NOTHING 本身幂等,
+                    # 而且 dedup 说明 RETIRE 确实在途,冷却本来就该起算。
+                    if res["outcome"] == "submitted":
+                        product_events.record_many(conn, [
+                            {"sku": r["asin"], "store": store_name,
+                             "event": product_events.RETIRE_SUBMITTED,
+                             "source": "sku_locked_heal",
+                             "detail": {"feed_id": res["feed_id"],
+                                        "reason": "sku_locked"}}
+                            for r in batch])
             elif res["outcome"] == "failed":
                 lines.append(f"  ⚠ {store_name} RETIRE 一批 {res['count']} 条"
                              f"提交被拒,下轮重试")

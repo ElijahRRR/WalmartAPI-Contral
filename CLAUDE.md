@@ -60,6 +60,7 @@ services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
 docs/           plan.md / production_cutover.md(**走进生产的定稿与待办,起调度这一役先读它**) /
+                feed_closure_audit.md(feed 库侧闭环审计:六提交点×三台账×五反哺器) /
                 db_schema.md / feishu_tables.md / legacy_reference.md /
                 legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md /
                 api_blueprint.md(端点定稿) / audit_migration_plan.md(审核链) /

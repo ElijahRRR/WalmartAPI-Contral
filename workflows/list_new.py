@@ -36,6 +36,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
   ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
     硬约束 → 同店打包单个 MP_ITEM feed(10/hour 硬限)
 
+闸门链之前先**注入一次 UPC 池**(所有者定稿 2026-08-16:「运行时自动同步
+一次 UPC,然后再走上架流程」)——运营刚贴进「UPC池」表的号,这一轮就要能领。
+注入那段收在 `services.upc_pool.sync_from_sheet`(铁律 1:不能 import
+upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)。
+
 提交结局(旧三态生死语义,UPC 回收仅三类):
   submitted → K=Yes L=feedid M=日期,UPC 标已用,listing_sources 登记(amz),
               事件 list_submitted;O/P/Q 由 feed_poll 反哺器按回执四集合回填
@@ -320,6 +325,37 @@ def _spec_precheck(ready: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _sync_upc(execute: bool, lines: list[str]) -> None:
+    """先注入一次 UPC 池(所有者定稿 2026-08-16:上架运行时自动同步一次 UPC)。
+
+    ⚠ **不能 import upc_sync 工作流**(铁律 1)——注入那段收在
+    `services.upc_pool.sync_from_sheet`,两个调用方共用同一份代码。
+
+    失败只告警不阻断:飞书挂了不该把整条上架链拖下水,池里已有的号照样能领
+    (最坏情况是本轮 no_upc 多几行,下轮补上)。**但必须说出来** —— 静默跳过
+    会表现为"明明贴了号还是 no_upc",而日志里一个字都没有。
+
+    dry-run 不注入:注入是写库。代价是 dry-run 的 `no_upc` 可能**偏多**
+    (运营刚贴进表格、还没入库的号看不见),这个方向是保守的,摘要里点明。
+    """
+    if not execute:
+        lines.append("  🧪 dry-run 跳过 UPC 注入:真跑会先注入一次,"
+                     "本轮 no_upc 可能比真跑偏多(刚贴进表格的号还没入库)")
+        return
+    try:
+        with db.pg_conn() as conn:
+            got = upc_pool.sync_from_sheet(conn)
+        lines.append(f"  UPC 注入:表内 {len(got['rows'])} 行,新入库 {got['new']}"
+                     + (f",⚠ 非法前缀 {got['bad']}(标注永不分配)"
+                        if got["bad"] else ""))
+    except LookupError as e:
+        lines.append(f"  ⚠ UPC池表未登记,跳过注入({e});池里已有的号照常领")
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("UPC 注入失败(不阻断上架,池里已有的号照常领): %s", e)
+        lines.append(f"  ⚠ UPC 注入失败({e}),本轮用池里已有的号;"
+                     f"刚贴进表格的号要等下轮或手动 `python cli.py upc_sync`")
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
@@ -343,6 +379,9 @@ def run(params: dict) -> str:
                      + ",".join(a for _, a in exhausted[:10]))
     if not pending:
         return "\n".join(lines)
+
+    # UPC 注入排在闸门链之前:领号是第 ⑦ 道闸,运营刚贴进表格的号必须这一轮就能用
+    _sync_upc(execute, lines)
 
     inactive, today_used, listed, banned, unexplained, gate = \
         _load_gate_state()

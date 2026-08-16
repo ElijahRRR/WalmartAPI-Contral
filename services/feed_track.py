@@ -227,7 +227,21 @@ def poll_all(stores_by_name: dict) -> str:
     if skipped:
         line += f",店铺凭证缺失跳过 {skipped}"
     if pendings:
+        # ⚠ 只报个数**没法处理**(2026-08-16 feed 闭环审计):摘要是发去飞书的
+        # 那一份,人看到"pending 3"接下来要干什么?明细只在日志里,而 pending
+        # 行**永不老化**——不落定就永远挂着,数字只增不减,几轮之后这行警告就
+        # 成了背景噪音。把店铺/类型/时间摊开,至少能拿去 Walmart 后台对。
         line += f";⚠ pending 待人工核对 {len(pendings)}"
+        detail_lines.append(
+            "  pending(提交结局不确定,**系统不会自动补交**——"
+            "核对后手工处理,见 docs/feed_closure_audit.md):")
+        for p in pendings[:10]:
+            detail_lines.append(
+                f"    {p['store']} {p['feed_type']}"
+                f"({p.get('workflow') or '-'}) 提交于 {p['created_at']}")
+        if len(pendings) > 10:
+            detail_lines.append(f"    …另有 {len(pendings) - 10} 条,查 "
+                                f"ops.feed_log WHERE status='pending'")
     return "\n".join([line] + detail_lines)
 
 

@@ -176,6 +176,11 @@ def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
     assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
     assert "T_GONE 删除(-) F2:店铺凭证缺失,跳过" in out
     assert any("提交结局不确定" in m for m in caplog.messages)
+    # ⚠ pending 的明细必须进**摘要**(发去飞书的那一份),不能只在日志里:
+    # 只报个数,人看到之后无从下手;而 pending 行永不老化,数字只增不减,
+    # 几轮之后这行警告就成了背景噪音(2026-08-16 feed 闭环审计)
+    assert "系统不会自动补交" in out
+    assert "T1 RETIRE_ITEM(-) 提交于 t" in out
 
 
 def test_save_errors_rows_shape():

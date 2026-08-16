@@ -432,3 +432,38 @@ def test_free_flow_takes_the_leftover_when_directed_underuses_its_share(
     out = wf.run({"batch": 100, "execute": False})
     head = [x for x in out.splitlines() if x.startswith("▍批量")][0]
     assert "定向流 1 +" in head and "自由流 99" in head
+
+
+def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
+    """⚠ 「我那个高分品怎么没分出去」必须在某张表里答得上来。
+
+    实测 2026-08-16:自由流额度为 0 那一跑,63,418 组一件没发,而它们既不在
+    方案表也不在未入选表 —— 所有者哪儿都查不到,分不清是"排队中"还是"被闸挡了"。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
+    _wire_directed(monkeypatch, pool, {}, room=100_000)
+    out = wf.run({"batch": 10, "execute": False})
+    assert "排队中" in out or "一件都没发" in out
+    text = open(tmp_path / "alloc_未入选.csv", encoding="utf-8-sig").read()
+    assert "自由流排队(分数排在本批切口之外)" in text
+    assert "B0FRE00199" in text or "B0FRE00100" in text   # 切口之外的确实写进去了
+
+
+def test_the_cut_score_is_reported_so_queued_is_distinguishable(monkeypatch, tmp_path):
+    """切口分数要报出来:低于它 = 排队中,不是被闸挡了。两者处置不同。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
+    _wire_directed(monkeypatch, pool, {}, room=100_000)
+    out = wf.run({"batch": 10, "execute": False})
+    assert "切口在**组分" in out and "排队中" in out
+
+
+def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
+    """截断必须说破 —— 静默截断读起来像"就这么多了"。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf, "QUEUE_SAMPLE", 5)
+    pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.01) for i in range(100)]
+    _wire_directed(monkeypatch, pool, {}, room=100_000)
+    out = wf.run({"batch": 10, "execute": False})
+    assert "只写了**组分最高的 5 组**" in out

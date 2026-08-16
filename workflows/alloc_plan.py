@@ -61,6 +61,11 @@ HEADROOM = 1.5
 # 一方吃不满时另一方**可以取走余额**(不浪费批量),所以这是上限不是配额。
 DIRECTED_SHARE = 0.5
 
+# 未入选表里,自由流"排队中"最多写多少组(按组分降序取头部)。
+# 全写会把这张表撑到十万行;一组不写则"我那个高分品怎么没分出去"两张表里
+# 都查不到 —— 头部是所有者真正会翻的那一段。
+QUEUE_SAMPLE = 2000
+
 # 当前在线数(容量闸的分子)。⚠ 口径与 `alloc_stores._SQL_ONLINE_NOW`、
 # KPI 表的 items_online 逐字一致(不筛 lifecycle)—— 三处必须同源,否则
 # "剩余容量"在三张表里是三个数
@@ -261,7 +266,7 @@ def run(params: dict) -> str:
 
     cut = int(free_batch * HEADROOM)
     pool_sorted = sorted(free, key=lambda x: (-x["score"], x["key"]))
-    deck = pool_sorted[:cut]
+    deck, below_cut = pool_sorted[:cut], pool_sorted[cut:]
     result = ae.deal(deck, stores) if deck else {
         "assign": [], "unplaced": [], "by_store": {}, "layers": [],
         "params": {"thickness": ae.LAYER_THICKNESS, "slack": ae.LAYER_SLACK,
@@ -324,6 +329,17 @@ def run(params: dict) -> str:
         L.append("  未发出 " + f"{len(result['unplaced']):,} 组:"
                  + " · ".join(f"{ae.REASON_LABEL[k]} {v:,}"
                               for k, v in why.most_common()))
+    # ★ 「我那个高分品怎么没分出去」必须答得上来(所有者 2026-08-16 追问)。
+    # 分数最高的组也可能只是**排在切口之外** —— 它既不在方案表也不在未入选表,
+    # 哪儿都查不到。把切口位置显式报出来:低于这条线的就是"排队中",不是被闸挡了
+    if below_cut:
+        L.append(f"  自由流牌堆 {len(free):,} 组,本批只取前 {len(deck):,} 组"
+                 f"(剩余批量 {free_batch:,} ×{HEADROOM});"
+                 + (f"切口在**组分 {deck[-1]['score']:.1f}**,低于它的 "
+                    f"{len(below_cut):,} 组是**排队中**,不是被闸挡了"
+                    if deck else
+                    f"**本批自由流额度为 0,{len(below_cut):,} 组一件都没发** —— "
+                    f"定向流吃满了 `directed_share`,调小它或加大 batch"))
     if dir_trim:
         L.append(f"  定向流按件筛掉 {dir_trim:,} 件(品牌的类目跨度比占用店的准入宽);"
                  f"**同组里占用店收得了的那些件照常发** —— 不因为组里多数派是别的"
@@ -364,7 +380,8 @@ def run(params: dict) -> str:
         # 却出了 48,816 行,其中 45,815 行是排队与淘汰 —— 那张表没法用,而所有者
         # 第一眼看到的就是那个总行数。摘要里两个数都报,不存在"藏起来"的问题
         p_plan, n_plan = _write_plan(result["assign"], dir_ok)
-        p_out, n_out = _write_rejects(result["unplaced"], dir_out, dir_wait)
+        p_out, n_out = _write_rejects(result["unplaced"], dir_out, dir_wait,
+                                      below_cut[:QUEUE_SAMPLE])
         L += ["", f"▍要上架的 {n_plan:,} 行 → {p_plan}",
               "  逐产品一行(品牌组 / 组分 / 去向店 / 逐段得分 / 层号 / 流别)。"
               "**先看上面的验收指标再看明细** —— 一家独吞是参数错了,不是模型判断"]
@@ -372,6 +389,10 @@ def run(params: dict) -> str:
             L += [f"▍没进这一批的 {n_out:,} 行 → {p_out}",
                   "  「排队」下一批加大 batch 就能发;「淘汰」要你改配置或释放品牌;"
                   "「未发出」看原因列"]
+            if len(below_cut) > QUEUE_SAMPLE:
+                L.append(f"  ⚠ 自由流排队的只写了**组分最高的 {QUEUE_SAMPLE:,} 组**"
+                         f"(共 {len(below_cut):,} 组)—— 全写这张表要十万行。"
+                         f"要看更靠后的,加大 -p batch= 让切口下移")
 
     if not execute:
         L += ["", f"🧪 dry-run:未落任何占用。审完方案表后加 --execute"
@@ -433,12 +454,16 @@ def _write_plan(assign, dir_ok) -> tuple[str, int]:
     return str(p), n
 
 
-def _write_rejects(unplaced, dir_out, dir_wait) -> tuple[str, int]:
-    """输入:三类没进这一批的 → 输出:(路径, 产品行数)。
+def _write_rejects(unplaced, dir_out, dir_wait, queued=()) -> tuple[str, int]:
+    """输入:四类没进这一批的 → 输出:(路径, 产品行数)。
 
     与方案表分开,是因为它们的处置**完全不同**:排队的下一批加大 batch 就能发,
     淘汰的要所有者改配置或释放品牌。混在一张表里,3,000 行要动手的会被 45,815 行
     诊断淹掉(2026-08-16 实测:所有者第一眼看到的就是 48,816 这个总行数)。
+
+    `queued` 是**排在切口之外的自由流组**(按组分降序,只写前 `QUEUE_SAMPLE` 组)。
+    不写的话,"我那个高分品怎么没分出去"在两张表里都查不到 —— 那才是真的藏。
+    全写又会把这张表撑到十万行,所以取头部并在摘要里说明截断。
     """
     p = paths.reports_dir() / "alloc_未入选.csv"
     n = 0
@@ -452,6 +477,8 @@ def _write_rejects(unplaced, dir_out, dir_wait) -> tuple[str, int]:
         for u in unplaced:
             n += _rows(w, f"未发出({ae.REASON_LABEL[u['reason']]})", "", "",
                        u["group"])
+        for grp in queued:
+            n += _rows(w, "自由流排队(分数排在本批切口之外)", "", "", grp)
     return str(p), n
 
 

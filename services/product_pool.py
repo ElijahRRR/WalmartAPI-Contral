@@ -42,15 +42,30 @@ WHERE p.marketplace = 'US'
   AND btrim(coalesce(r.category, '')) <> ''
 """
 
-# 窗口内销量:**按 asin 聚合**(A1.5 补的列,99.2% 行有值)。
-# asin IS NULL 的行进不了这个维度 —— 它们只在店×SKU 维度起作用
+# 窗口内销量与销售额:**按 asin 聚合**(A1.5 补的列,99.2% 行有值)。
+# asin IS NULL 的行进不了这个维度 —— 它们只在店×SKU 维度起作用。
+# ⚠ 金额是**毛额**(未扣退款):逐产品的退款只有 API 期算得出(§7.4e),
+# 拿它当净额会与店铺侧的净额口径混淆。报告里必须标明"毛额"
 _SQL_SALES = """
-SELECT asin, sum(coalesce(qty, 0))::bigint AS units
+SELECT asin, sum(coalesce(qty, 0))::bigint AS units,
+       sum(coalesce(product_amount, 0))::numeric AS gross
 FROM orders.order_lines
 WHERE asin IS NOT NULL
   AND order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
   AND order_date <  %(as_of)s::timestamptz
   AND coalesce(sale_status, '') <> 'Cancelled'
+GROUP BY asin
+"""
+
+# 全历史销量/销售额(**不进打分**,只给报告看)。两年订单已入库,其中
+# `source='历史数据'` 那批只有下单时间/店铺/PO/SKU/品名/数量/金额 —— 数量与
+# 金额是有的,所以这个维度对历史期同样成立(退款不成立,见上)
+_SQL_SALES_ALL = """
+SELECT asin, sum(coalesce(qty, 0))::bigint AS units,
+       sum(coalesce(product_amount, 0))::numeric AS gross,
+       min(order_date)::date AS first_sold, max(order_date)::date AS last_sold
+FROM orders.order_lines
+WHERE asin IS NOT NULL AND coalesce(sale_status, '') <> 'Cancelled'
 GROUP BY asin
 """
 
@@ -95,7 +110,9 @@ def load(conn, win: dict) -> dict:
         cur.execute(_SQL_POOL)
         pool = cur.fetchall()
         cur.execute(_SQL_SALES, win)
-        sales = {a: int(u) for a, u in cur.fetchall()}
+        rows = cur.fetchall()
+        sales = {a: int(u) for a, u, _g in rows}
+        gross = {a: float(g or 0) for a, _u, g in rows}
         cur.execute(_SQL_REFUND, win)
         refund = {a: (int(s), int(r)) for a, s, r in cur.fetchall()}
         try:
@@ -105,10 +122,25 @@ def load(conn, win: dict) -> dict:
                     for a, d, um, mt, ar in cur.fetchall()}
         except Exception as e:                  # noqa: BLE001
             conn.rollback()
-            return {"pool": pool, "sales": sales, "refund": refund,
-                    "risk": {}, "risk_err": str(e).strip().splitlines()[0]}
-    return {"pool": pool, "sales": sales, "refund": refund,
-            "risk": risk, "risk_err": None}
+            risk, risk_err = {}, str(e).strip().splitlines()[0]
+        else:
+            risk_err = None
+    return {"pool": pool, "sales": sales, "gross": gross, "refund": refund,
+            "risk": risk, "risk_err": risk_err}
+
+
+def lifetime_sales(conn) -> dict:
+    """输入:连接 → 输出:{asin: {units, gross, first_sold, last_sold}}(全历史)。
+
+    **不进打分**,只给报告看 —— 分数用的是窗口内销量(§7.6),拿全历史当信号
+    会让一个三年前卖得好、现在没人要的品一直高分。单独一个函数就是为了让
+    "它不参与打分"这件事在调用处也看得见。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_SALES_ALL)
+        return {a: {"units": int(u), "gross": float(g or 0),
+                    "first_sold": f, "last_sold": l}
+                for a, u, g, f, l in cur.fetchall()}
 
 
 def score_all(data: dict) -> tuple[list, dict]:
@@ -139,6 +171,8 @@ def score_all(data: dict) -> tuple[list, dict]:
         ch = (ful or "").strip().upper() or None
         out.append({"asin": asin, "brand": brand, "manufacturer": manuf,
                     "pt": pt, "category": cat,
+                    "price": row["price"], "shipping": row["shipping"],
+                    "gross": data.get("gross", {}).get(asin),
                     "channel": ch if ch in store_targets.CHANNELS else None,
                     "score": r["score"], "base": r["base"], "bonus": r["bonus"],
                     "penalty": r["penalty"], "why": r["why"],

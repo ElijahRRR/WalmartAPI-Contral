@@ -32,10 +32,16 @@ class _Cur:
     def execute(self, sql, args=None):
         if "FROM catalog.products p" in sql:
             self._r = POOL
+        elif "min(order_date)" in sql:          # 全历史(不进打分,只给报告)
+            self._r = [("B0AAAA0001", 900, 8100.0, "2024-03-01", "2026-08-10")]
         elif "sum(coalesce(qty, 0))" in sql:
-            self._r = [("B0AAAA0001", 120), ("B0BBBB0002", 3)]
+            self._r = [("B0AAAA0001", 120, 1080.0), ("B0BBBB0002", 3, 59.7)]
         elif "refunded_qty" in sql:
             self._r = [("B0AAAA0001", 100, 12)]
+        elif "FROM catalog.walmart_items" in sql:
+            self._r = [("A085", "B0AAAA0001")]
+        elif "FROM catalog.claims" in sql:
+            self._r = [("B0AAAA0001", "A085")]
         elif "product_risk" in sql:
             if self.risk_fails:
                 raise RuntimeError("relation catalog.product_risk does not exist")
@@ -149,3 +155,59 @@ def test_refund_denominator_excludes_history_rows():
     """退货率的分母只能是**同期 API 行**:历史导入行没有退款数据,
     拿它们当分母会把退货率系统性稀释成接近 0(§7.4e)。"""
     assert "source IS NULL" in wf._SQL_REFUND
+
+
+def test_csv_carries_price_sales_revenue_and_both_owner_columns(monkeypatch, tmp_path):
+    """所有者 2026-08-16 要的四样:售价、历史销量、销售额、当前所属店铺。
+
+    ⚠ 「所属店铺」拆成**两列**,合成一列会把最有用的信息抹掉:
+      占用店 = 台账里的**决策**(claims,无自动释放)
+      在线店 = 货此刻**实际**挂在谁那儿(walmart_items 观测)
+    两者不一致本身就是信息 —— 占用在 A、货在 B ⇒ B 该下架;有货无占用 ⇒
+    规划外店或回填时被闸挡下的行。这正是本项目"占用是决策不是观测"那条纪律。
+    """
+    _wire(monkeypatch, tmp_path)
+    wf.run({})
+    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
+    head, *body = txt.splitlines()
+    for col in ("售价", "运费", "落地价", "历史总销量(件)", "历史总销售额(毛额)",
+                "占用店", "在线店", "首次售出", "最近售出"):
+        assert col in head, col
+    acme = next(ln for ln in body if ln.startswith("B0AAAA0001")).split(",")
+    cols = head.split(",")
+    val = dict(zip(cols, acme))
+    assert val["售价"] == "9.9" and val["落地价"] == "9.9"
+    assert val["近90天销量(件)"] == "120" and val["近90天销售额(毛额)"] == "1080.0"
+    assert val["历史总销量(件)"] == "900" and val["历史总销售额(毛额)"] == "8100.0"
+    assert val["占用店"] == "A085" and val["在线店"] == "A085"
+
+
+def test_landed_price_is_price_plus_shipping(monkeypatch, tmp_path):
+    """落地价才是硬闸真正用的那个数(§7.6)。
+
+    只看售价会让「9.9 美元 + 12 美元运费」看起来很便宜 —— 而下架/定价链路
+    从来用的是落地价。
+    """
+    _wire(monkeypatch, tmp_path)
+    wf.run({})
+    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
+    head, *body = txt.splitlines()
+    cols = head.split(",")
+    beta = dict(zip(cols, next(ln for ln in body
+                               if ln.startswith("B0BBBB0002")).split(",")))
+    assert beta["售价"] == "19.9" and beta["运费"] == "2.0"
+    assert beta["落地价"] == "21.9"
+
+
+def test_lifetime_sales_never_feeds_the_score(monkeypatch, tmp_path):
+    """⚠ 历史销量**不进打分**:分数只看窗口内(§7.6)。
+
+    拿全历史当信号会让一个三年前卖爆、现在没人要的品一直挂高分。
+    这条盯着"顺手把 life 塞进 score() 的 sales"这个诱惑。
+    """
+    import inspect
+    from services import product_pool
+    assert "lifetime" not in inspect.getsource(product_pool.score_all)
+    _wire(monkeypatch, tmp_path)
+    out = wf.run({})
+    assert "历史销量**不进打分**" in out

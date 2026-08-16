@@ -16,6 +16,15 @@
      那和设计意图可能差很远,得先看见才能调;
   ③ **分数分布**:淘汰线(默认 40)切下去还剩多少可分的货。
 
+明细 csv 除了逐段分数,还带**售价/运费/落地价、窗口内与全历史的销量与销售额、
+占用店与在线店**(所有者 2026-08-16 要的)。三条读表纪律:
+  · **销售额一律毛额**(未扣退款)—— 逐产品的退款只有 API 期算得出,
+    与店铺侧的净额**不是同一口径**,两张表不能对账;
+  · **历史销量不进打分** —— 分数只看窗口内(§7.6),否则一个三年前卖爆、
+    现在没人要的品会一直挂高分;
+  · **占用店与在线店是两列** —— 前者是台账里的决策(无自动释放),后者是货
+    此刻实际挂在谁那儿。不一致本身就是信息,合成一列会把它抹掉。
+
 **只读**:不写任何表、不调沃尔玛、不调 LLM。
 """
 
@@ -25,6 +34,7 @@ from collections import Counter
 
 from registry import db, paths
 from services import alloc_survey as sv
+from services import claims, sku_asin
 from services import product_pool as pool_svc, product_score as ps
 from services import textfmt
 
@@ -40,6 +50,16 @@ _SQL_SALES = pool_svc._SQL_SALES
 _SQL_REFUND = pool_svc._SQL_REFUND
 _SQL_RISK = pool_svc._SQL_RISK
 
+# 在架行(算「在线店」用)。⚠ 与「占用店」是**两个问题**,两列都要出:
+#   占用店 = 台账里的**决策**(claims),没有自动释放;
+#   在线店 = 此刻货**实际**挂在谁那儿(walmart_items 观测)。
+# 两者不一致本身就是信息:占用在 A、货在 B = B 该下架;有货无占用 = 规划外店
+# (谭总系不占任何品牌与产品)或回填时被闸挡下的行。合成一列会把这些全抹掉。
+_SQL_ONLINE_SKU = """
+SELECT store, sku FROM catalog.walmart_items
+WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
+"""
+
 
 def _pct(n, d):
     return f"{n / d:.1%}" if d else "—"
@@ -53,6 +73,15 @@ def run(params: dict) -> str:
 
     with db.pg_conn() as conn:
         data = pool_svc.load(conn, win)
+        life = pool_svc.lifetime_sales(conn)
+        held = claims.load_active(conn, claims.PRODUCT)
+        with conn.cursor() as cur:
+            cur.execute(_SQL_ONLINE_SKU)
+            online: dict = {}
+            for store, sku in cur.fetchall():
+                a = sku_asin.extract_asin(sku)
+                if a:
+                    online.setdefault(a, set()).add(store)
     scored, gated_raw = pool_svc.score_all(data)
     risk_err = data["risk_err"]
 
@@ -71,10 +100,21 @@ def run(params: dict) -> str:
         if data["refund"].get(c["asin"], (0, 0))[0]:
             have["refund"] += 1
         scores.append(c["score"])
+        lf = life.get(c["asin"]) or {}
         rows.append((c["asin"], c["brand"] or "", c["category"],
                      round(c["score"], 1), round(c["base"], 1),
                      round(c["bonus"], 1), round(c["penalty"], 1), c["why"],
-                     c["sales"], c["rating"], c["reviews"], c["lead"],
+                     c["price"], c["shipping"],
+                     # 落地价 = 售价 + 运费,是硬闸真正用的那个数(§7.6);
+                     # 只看售价会让"9.9 美元 + 12 美元运费"看起来很便宜
+                     None if c["price"] is None or c["shipping"] is None
+                     else round(c["price"] + c["shipping"], 2),
+                     c["sales"], round(c["gross"] or 0, 2),
+                     lf.get("units"), round(lf.get("gross") or 0, 2),
+                     lf.get("first_sold"), lf.get("last_sold"),
+                     held.get(c["asin"]) or "",
+                     "|".join(sorted(online.get(c["asin"], ()))),
+                     c["rating"], c["reviews"], c["lead"],
                      "|".join(c["missing"])))
 
     n_pool, n_scored = len(data["pool"]), len(scores)
@@ -138,10 +178,22 @@ def run(params: dict) -> str:
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["ASIN", "品牌", "大类", "产品分", "口碑分", "销量加分",
-                    "罚分", "罚分原因", f"近{days}天销量(件)",
+                    "罚分", "罚分原因",
+                    "售价", "运费", "落地价",
+                    f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
+                    "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
+                    "占用店", "在线店",
                     "评分", "评论数", "配送天数", "缺失信号"])
         w.writerows(rows)
     L += ["", f"▍明细 → {p}(按产品分降序,{len(rows):,} 行)",
           "  「缺失信号」列告诉你这一行的分是靠哪几项算出来的 ——"
-          "分数说不清来源就没法推翻它"]
+          "分数说不清来源就没法推翻它",
+          "  「占用店」是台账里的**决策**(claims,无自动释放),「在线店」是货"
+          "此刻**实际**挂在谁那儿 —— 两列不一致本身就是信息:",
+          "    占用在 A、货在 B ⇒ B 该下架;有货无占用 ⇒ 规划外店(谭总系不占"
+          "任何品牌与产品)或回填时被类目/渠道闸挡下的行",
+          "  ⚠ 销售额一律**毛额**(未扣退款):逐产品的退款只有 API 期算得出,"
+          "与店铺侧的净额**不是同一口径**,别拿两张表对账",
+          "  ⚠ 历史销量**不进打分**:分数只看近 90 天(§7.6)。拿全历史当信号"
+          "会让一个三年前卖爆、现在没人要的品一直挂高分"]
     return "\n".join(L)

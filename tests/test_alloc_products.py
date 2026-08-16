@@ -10,8 +10,10 @@ POOL = [
     # asin, brand, pt, cat, price, shipping, stock, stock_state, lead, rating, reviews
     ("B0AAAA0001", "Acme", "Socks", "Fashion", 9.9, 0.0, 50, "in_stock", 5, "4.6", "820"),
     ("B0BBBB0002", "Beta", "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 12, "4.1", "35"),
-    # 只有配送时效一项:它进得了打分(不是"信号全缺"),但拉低其余信号覆盖率
+    # 只有配送时效一项:**旧实现会让它独占权重拿 100 分**,新实现判「信息不足」
     ("B0CCCC0003", "Gamma", "Knives", "Home", 5.0, 0.0, 100, "in_stock", 3, None, None),
+    # 有口碑、无销量无退货:拉低加分/罚分项的覆盖率,让告警有东西可报
+    ("B0GGGG0007", "Eta", "Socks", "Fashion", 7.5, 0.0, 40, "in_stock", 6, "4.2", "12"),
     ("B0DDDD0004", "Delta", "Socks", "Fashion", None, 0.0, 20, "in_stock", 4, "4.9", "9"),
     ("B0EEEE0005", "Eps", "Socks", "Fashion", 12.0, 1.0, 0, "in_stock", 4, "4.4", "60"),
     ("B0FFFF0006", "Zeta", "Hats", "Fashion", 8.0, 0.0, 30, "in_stock", None, None, None),
@@ -80,10 +82,12 @@ def test_hard_gates_and_all_signals_missing_are_counted_apart(monkeypatch, tmp_p
     归进"淘汰"会让人以为这个品有毛病,其实是我们的数据缺口。"""
     _wire(monkeypatch, tmp_path)
     out = wf.run({})
-    assert "未进入打分" in out and "淘汰" not in out.split("其中:")[0].split("未进入打分")[1][:40]
+    assert "未进入打分" in out
     assert "落地价算不出 1" in out          # price NULL
     assert "库存不足 1" in out              # stock=0,保守量不许救它
-    assert "信号全缺(不判分) 1" in out      # Zeta:五个信号一个都没有
+    # Gamma(只有配送时效)与 Zeta(什么都没有)都进「信息不足」——
+    # 旧实现里 Gamma 会独占权重拿 **100 分**,那正是要防的
+    assert "没有评分/评论(信息不足,不判分) 2" in out
 
 
 def test_low_coverage_signal_is_called_out(monkeypatch, tmp_path):
@@ -95,9 +99,13 @@ def test_low_coverage_signal_is_called_out(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path)
     out = wf.run({})
     line = next(ln for ln in out.splitlines() if "退货率" in ln)
-    assert "⚠ 覆盖太低" in line
+    assert "⚠ 只有 API 期算得出" in line
     # 配送时效 100% 覆盖,不该被点名
     assert "⚠" not in next(ln for ln in out.splitlines() if "配送时效" in ln)
+    # 覆盖率分母是「有分可判」,不许超过 100%
+    for ln in out.splitlines():
+        if "%" in ln and ("评分" in ln or "配送" in ln or "销量" in ln):
+            assert "150" not in ln
 
 
 def test_risk_view_failure_degrades_instead_of_crashing(monkeypatch, tmp_path):
@@ -116,9 +124,10 @@ def test_csv_exposes_which_signals_were_missing(monkeypatch, tmp_path):
     txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
     head, *body = txt.splitlines()
     assert "缺失信号" in head and "罚分原因" in head
+    assert "口碑分" in head and "销量加分" in head   # 三段各自可查
     beta = next(ln for ln in body if ln.startswith("B0BBBB0002"))
     assert "不明原因消失过" in beta          # 罚分理由写进行里
-    assert "refund" in beta                  # 它没有退货数据,如实标出
+    assert "配送12天" in beta                # 配送慢的罚分理由也写进去
 
 
 def test_sales_sql_only_reads_rows_with_asin(monkeypatch):

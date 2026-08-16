@@ -3,19 +3,23 @@
 设计见 docs/allocation_plan.md §7.6 / §7.4c。两件事分清:
 
 **硬闸**(过不了就淘汰,与分数无关):落地价算不出、库存不足、黑名单、风控 PT。
-**产品分**(0~100,低于淘汰线不分):评分 / 评论 / 历史销量 / 配送时效 / 退货率,
-再减黑历史罚分。
+**产品分**三段:
 
-三条纪律,每条都对应一个会把好品判死的实例:
+    score = 口碑基础分(0~75) + 销量加分(0~25) − 罚分(配送/退货/黑历史)
 
-1. **缺失 ≠ 0,禁止 `or 0`**(口径 #8)。某个信号没采到就**不计入**,
-   权重按比例**摊回其余信号** —— 给它 0 分等于惩罚"新品/没采全的品",
-   而"没采到"是我们自己的数据缺口,不是商品的缺点;
-2. **销量只加分不减分**:卖过且卖得动是最强信号;**没卖过只是没信息**。
-   一个从没上过架的品与一个上了架卖不动的品,在 `order_lines` 里长得一样,
-   分不出来 ⇒ 一律当"没信息";
-3. **逐信号得分要能摊开给人看**(口径 #9 透明打分):`score()` 返回每一项的
-   原始值、归一值与权重,方案表照着印 —— 分数说不清来源,人就没法推翻它。
+四条纪律,每条都对应一个**生产实测踩到过**的错:
+
+1. **没有口碑数据 ⇒ 不判分,不是高分**(2026-08-15 实测)。旧实现做五信号
+   加权平均 + 权重摊回,于是"只有配送时效有值"的品独占 100% 权重、
+   而 `lead<=8` 恒等满分 ⇒ **直接 100 分**;98.4% 的品配送都 ≤8 天,
+   等于给所有缺口碑数据的品白送满分。现在口碑两项全缺就进「信息不足」桶;
+2. **销量只加分不减分**(口径 #8)。旧实现让销量参与加权(权重 .35),
+   卖过 3 件的品反而比没订单史的低 17.6 分 —— 而销量覆盖率只有 **1.0%**,
+   等于把**唯一有正面证据的那批品系统性压分**。现在它是纯加分项;
+3. **缺失 ≠ 0,禁 `or 0`**。加分项没数据就 +0,罚分项没数据就 −0;
+   口碑缺一项时权重摊回另一项。编数据两个方向都是错的;
+4. **三段各自可查**(口径 #9 透明打分):`score()` 返回 base/bonus/penalty
+   与逐信号 parts,方案表照印 —— 分数说不清来源,人就没法推翻它。
 
 归一曲线全是 v1 启发式,**进配置、首批 dry-run 对着方案表砍**(§7.4g 同款)。
 """
@@ -25,32 +29,44 @@ import math
 
 logger = logging.getLogger("services.product_score")
 
-#: 低于这个分不参与分配(§7.6 初值,配置化)
+#: 低于这个分不参与分配(§7.6 初值,配置化)。
+#: ⚠ 生产实测 2026-08-15:候选池 40.8 万可判分的品里 **92.5% 都在 40 以上** ——
+#: 这条线基本没在筛。真正的闸是**容量**(14 家店合计剩余约 3 万个货位 vs 37 万
+#: 候选),所以引擎按**分数排序取到配额为止**,淘汰线只是兜底扫掉明显的烂品。
 CUTOFF = 40.0
 
-#: 信号权重(和为 1)。缺失的信号不计入,权重摊回其余 —— 见模块 docstring 纪律 1
-WEIGHTS: dict[str, float] = {
-    "sales": 0.35,      # 卖过且卖得动:最强选品信号
-    "rating": 0.25,
-    "reviews": 0.20,
-    "lead": 0.10,       # 配送时效(减分项,不是闸)
-    "refund": 0.10,     # 退货率(只有 API 期算得出)
-}
+# ══ 三段式打分(2026-08-15 生产实测后重构,按设计稿 §7.6 自己的措辞)══
+#
+# 原实现把五个信号做成一个加权平均,结果**违反了口径 #8「销量只加分不减分」**:
+# 同样的品,卖过 3 件的比没有订单史的低 17.6 分(销量 0.35 的权重把它从
+# "不计入"拉进了"计入且分低")。而销量覆盖率实测只有 **1.0%** ——
+# 那意味着我们**唯一有正面证据的 3,897 个品反而被系统性压分**。
+#
+# 改成三段,每段语义单一,也与设计稿的原话对上:
+#   基础分 = 口碑(评分 + 评论数),0~BASE_MAX
+#   加分   = 卖过且卖得动(**纯加分,没数据就是 0,永远不会因此变低**)
+#   罚分   = 配送慢 / 退货高 / 黑历史(§7.6 原话:"超 MAX_LEAD_DAYS 是**减分项**")
 
-#: 中文名(报告与方案表照印)
-LABELS = {"sales": "历史销量", "rating": "评分", "reviews": "评论数",
-          "lead": "配送时效", "refund": "退货率"}
+#: 基础分(口碑)的权重,和为 1。缺失的不计入,权重摊回另一项
+WEIGHTS: dict[str, float] = {"rating": 0.6, "reviews": 0.4}
+LABELS = {"rating": "评分", "reviews": "评论数"}
 
-#: 黑历史罚分上限(product_risk 计数列;硬拦截归黑名单三表,这里只减分)
-RISK_PENALTY_MAX = 15.0
+BASE_MAX = 75.0             #: 口碑满分 75,留 25 给销量加分 ⇒ 总分仍是 0~100
+SALES_BONUS_MAX = 25.0      #: 卖过且卖得动的加分上限
+LEAD_PENALTY_MAX = 15.0     #: 配送慢的罚分上限
+REFUND_PENALTY_MAX = 20.0   #: 退货高的罚分上限
+RISK_PENALTY_MAX = 15.0     #: 黑历史罚分上限(硬拦截归黑名单三表,这里只减分)
+
+#: 报告里按这个顺序印各段
+SEGMENTS = ("口碑", "销量加分", "配送罚分", "退货罚分", "黑历史罚分")
 
 # ── 归一曲线(全部 v1 启发式,配置化)────────────────────────────────────
 _RATING_FLOOR, _RATING_CEIL = 3.0, 4.8     # 3.0 以下记 0,4.8 以上记满
 _REVIEWS_FULL = 1000                        # 评论数对数标度的满分点
 _SALES_FULL = 50                            # 窗口内销量(件)对数标度满分点
 _LEAD_FREE = 8                              # ≤ 8 天不扣分(amz_source.MAX_LEAD_DAYS)
-_LEAD_DEAD = 30                             # ≥ 30 天记 0
-_REFUND_DEAD = 0.30                         # 退货率 ≥ 30% 记 0
+_LEAD_DEAD = 30                             # ≥ 30 天扣满
+_REFUND_DEAD = 0.30                         # 退货率 ≥ 30% 扣满
 
 
 def _clamp01(v: float) -> float:
@@ -103,35 +119,41 @@ def norm_sales(units) -> float | None:
     return _log_scale(units, _SALES_FULL)
 
 
-def norm_lead(days) -> float | None:
-    """输入:配送天数 → 输出:0~1;**采不到返回 None**(NULL 不当超时)。"""
+def lead_penalty(days) -> tuple[float, str]:
+    """输入:配送天数 → 输出:(罚分, 原因)。**采不到 = 0 罚分**(NULL 不当超时)。
+
+    设计稿 §7.6 原话:"超 MAX_LEAD_DAYS 是**减分项**不是闸"。做成正向信号是
+    错的 —— 实测 98.4% 的品都 ≤8 天拿满分,那一项等于白送 18% 的有效权重、
+    零区分度,还把权重从真正有信息的口碑那里抢走了。
+    """
     if days is None:
-        return None
+        return 0.0, ""
     try:
         d = float(days)
     except (TypeError, ValueError):
-        return None
+        return 0.0, ""
     if d <= _LEAD_FREE:
-        return 1.0
-    if d >= _LEAD_DEAD:
-        return 0.0
-    return _clamp01((_LEAD_DEAD - d) / (_LEAD_DEAD - _LEAD_FREE))
+        return 0.0, ""
+    ratio = _clamp01((d - _LEAD_FREE) / (_LEAD_DEAD - _LEAD_FREE))
+    return LEAD_PENALTY_MAX * ratio, f"配送{int(d)}天"
 
 
-def norm_refund(rate) -> float | None:
-    """输入:退货率(0~1)→ 输出:0~1;**算不出返回 None**。
+def refund_penalty(rate) -> tuple[float, str]:
+    """输入:退货率(0~1)→ 输出:(罚分, 原因)。**算不出 = 0 罚分**。
 
-    ⚠ 历史期算不出退货(order_history_import 只导销售六列)——
-    那时必须传 None,**不能传 0**:把"没数据"当成"零退货"会给历史期的品
-    白送满分,而 API 期的品因为有真实退货被扣分,两边不是同一个口径。
+    ⚠ 历史期算不出退货(order_history_import 只导销售六列),实测覆盖率仅
+    0.9%。算不出就不罚 —— 把"没数据"当成"零退货"和当成"高退货"都是编数据;
+    不罚至少不冤枉人,而真有退货数据的那 0.9% 该罚照罚。
     """
     if rate is None:
-        return None
+        return 0.0, ""
     try:
         r = float(rate)
     except (TypeError, ValueError):
-        return None
-    return _clamp01(1 - r / _REFUND_DEAD)
+        return 0.0, ""
+    if r <= 0:
+        return 0.0, ""
+    return REFUND_PENALTY_MAX * _clamp01(r / _REFUND_DEAD), f"退货{r:.0%}"
 
 
 def risk_penalty(risk: dict | None) -> tuple[float, str]:
@@ -152,33 +174,56 @@ def risk_penalty(risk: dict | None) -> tuple[float, str]:
 
 
 def score(signals: dict, risk: dict | None = None) -> dict:
-    """输入:{sales/rating/reviews/lead/refund: 原始值} (+ product_risk 行)
-    → 输出:{score, parts, missing, penalty, penalty_why}。
+    """输入:{rating/reviews/sales/lead/refund: 原始值} (+ product_risk 行)
+    → 输出:{score, base, bonus, penalty, parts, missing, why}。
 
-    `parts` 逐信号给出 (原值, 归一值, 实际权重),方案表照印 —— 分数说不清
-    来源,人就没法推翻它(口径 #9 透明打分)。
+    **三段,每段语义单一**(2026-08-15 生产实测后重构,见文件头那段):
 
-    **权重摊回**:只在有值的信号间按原权重比例重新归一。全都没有 ⇒ 分数
-    `None`(不是 0):那是"这个品我们一无所知",该进"信息不足"桶让人看,
-    而不是判它 0 分淘汰掉。
+        score = 口碑基础分(0~75) + 销量加分(0~25) − 罚分(配送/退货/黑历史)
+
+    · **口碑**:评分 + 评论数加权;缺的那项不计入、权重摊回另一项(纪律 1);
+    · **销量加分**:纯加分 —— 没订单史就是 +0,**永远不会因为"卖得少"而比
+      "没数据"更低**(口径 #8「只加分不减分」)。旧的加权平均实现违反了这条:
+      卖过 3 件的品比没数据的低 17.6 分,而销量覆盖率只有 1%,等于把我们
+      **唯一有正面证据的那批品系统性压分**;
+    · **罚分**:只有坏消息才扣分,没数据一律不扣 —— 编数据两个方向都是错的,
+      不扣至少不冤枉人。
+
+    两项口碑全缺 ⇒ `score=None`(不是 0):那是"这个品我们一无所知",
+    该进「信息不足」桶让人看,判 0 分会把它和"确实很差的品"混成一堆。
     """
-    norms = {"sales": norm_sales(signals.get("sales")),
-             "rating": norm_rating(signals.get("rating")),
-             "reviews": norm_reviews(signals.get("reviews")),
-             "lead": norm_lead(signals.get("lead")),
-             "refund": norm_refund(signals.get("refund"))}
+    norms = {"rating": norm_rating(signals.get("rating")),
+             "reviews": norm_reviews(signals.get("reviews"))}
     present = {k: v for k, v in norms.items() if v is not None}
     missing = sorted(k for k, v in norms.items() if v is None)
+    sales_n = norm_sales(signals.get("sales"))
+    if sales_n is None:
+        missing.append("sales")
     if not present:
-        return {"score": None, "parts": {}, "missing": missing,
-                "penalty": 0.0, "penalty_why": "信号全缺"}
+        return {"score": None, "base": None, "bonus": 0.0, "penalty": 0.0,
+                "parts": {}, "missing": sorted(missing), "why": "口碑信号全缺"}
+
     total_w = sum(WEIGHTS[k] for k in present)
     parts = {k: (signals.get(k), v, WEIGHTS[k] / total_w)
              for k, v in present.items()}
-    base = 100.0 * sum(v * WEIGHTS[k] for k, v in present.items()) / total_w
-    pen, why = risk_penalty(risk)
-    return {"score": max(0.0, base - pen), "parts": parts, "missing": missing,
-            "penalty": pen, "penalty_why": why}
+    base = BASE_MAX * sum(v * WEIGHTS[k] for k, v in present.items()) / total_w
+    bonus = SALES_BONUS_MAX * (sales_n or 0.0)
+
+    pens, whys = [], []
+    for fn, arg in ((lead_penalty, signals.get("lead")),
+                    (refund_penalty, signals.get("refund"))):
+        pen, why = fn(arg)
+        pens.append(pen)
+        if why:
+            whys.append(why)
+    rpen, rwhy = risk_penalty(risk)
+    pens.append(rpen)
+    if rwhy:
+        whys.append(rwhy)
+    penalty = sum(pens)
+    return {"score": max(0.0, min(100.0, base + bonus - penalty)),
+            "base": base, "bonus": bonus, "penalty": penalty,
+            "parts": parts, "missing": sorted(missing), "why": "、".join(whys)}
 
 
 def gate(row: dict, min_stock: int, in_stock_qty: int) -> str | None:

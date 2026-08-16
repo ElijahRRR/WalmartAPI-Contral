@@ -142,16 +142,25 @@ def run(params: dict) -> str:
         sig = {"sales": sales.get(asin), "rating": rating, "reviews": reviews,
                "lead": lead, "refund": (ret / sold if sold else None)}
         r = ps.score(sig, risk.get(asin))
-        for k in ps.WEIGHTS:
+        if r["score"] is None:
+            # 没评分没评论 = 对这个品一无所知。**不是 0 分,也不是淘汰**,
+            # 单列一桶让人看:判 0 会把它和"确实很差的品"混成一堆
+            gated["没有评分/评论(信息不足,不判分)"] += 1
+            continue
+        # ⚠ 覆盖率的分母是「有分可判」,所以计数必须在剔除之后 ——
+        # 放在前面会把没进打分的品也算进分子,覆盖率能超过 100%
+        for k in ("rating", "reviews", "sales"):
             if k not in r["missing"]:
                 have[k] += 1
-        if r["score"] is None:
-            gated["信号全缺(不判分)"] += 1
-            continue
+        if lead is not None:
+            have["lead"] += 1
+        if sold:
+            have["refund"] += 1
         scores.append(r["score"])
         rows.append((asin, brand or "", cat, round(r["score"], 1),
+                     round(r["base"], 1), round(r["bonus"], 1),
+                     round(r["penalty"], 1), r["why"],
                      sales.get(asin), rating, reviews, lead,
-                     round(r["penalty"], 1), r["penalty_why"],
                      "|".join(r["missing"])))
 
     n_pool, n_scored = len(pool), len(scores)
@@ -173,13 +182,24 @@ def run(params: dict) -> str:
 
     L += ["", "▍信号覆盖率(**权重再合理,信号采不到就是空的**)"]
     L += textfmt.table(
-        ["信号", "设计权重", "有值", "覆盖率", ""],
-        [[ps.LABELS[k], f"{ps.WEIGHTS[k]:.0%}", f"{have[k]:,}",
-          _pct(have[k], n_scored),
-          "⚠ 覆盖太低,它的权重实际被摊给了别的信号"
-          if n_scored and have[k] / n_scored < 0.5 else ""]
-         for k in sorted(ps.WEIGHTS, key=lambda x: -ps.WEIGHTS[x])],
-        align="<>>><")
+        ["信号", "作用", "有值", "覆盖率", ""],
+        [[ps.LABELS["rating"], f"口碑基础分 {ps.WEIGHTS['rating']:.0%}",
+          f"{have['rating']:,}", _pct(have["rating"], n_scored), ""],
+         [ps.LABELS["reviews"], f"口碑基础分 {ps.WEIGHTS['reviews']:.0%}",
+          f"{have['reviews']:,}", _pct(have["reviews"], n_scored), ""],
+         ["历史销量", f"加分 最多 +{ps.SALES_BONUS_MAX:.0f}", f"{have['sales']:,}",
+          _pct(have["sales"], n_scored),
+          "⚠ 有订单史的品极少 —— 加分项几乎只在这批上生效"
+          if n_scored and have["sales"] / n_scored < 0.5 else ""],
+         ["配送时效", f"罚分 最多 −{ps.LEAD_PENALTY_MAX:.0f}", f"{have['lead']:,}",
+          _pct(have["lead"], n_scored), ""],
+         ["退货率", f"罚分 最多 −{ps.REFUND_PENALTY_MAX:.0f}", f"{have['refund']:,}",
+          _pct(have["refund"], n_scored),
+          "⚠ 只有 API 期算得出,历史期一律不罚"
+          if n_scored and have["refund"] / n_scored < 0.5 else ""]],
+        align="<<>><")
+    L.append("  加分/罚分项**没数据就是 0**,不会把分数拉高也不会拉低;"
+             "只有口碑两项都缺才不判分")
 
     if scores:
         scores.sort()
@@ -202,8 +222,9 @@ def run(params: dict) -> str:
     rows.sort(key=lambda r: -r[3])
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["ASIN", "品牌", "大类", "产品分", f"近{days}天销量(件)",
-                    "评分", "评论数", "配送天数", "罚分", "罚分原因", "缺失信号"])
+        w.writerow(["ASIN", "品牌", "大类", "产品分", "口碑分", "销量加分",
+                    "罚分", "罚分原因", f"近{days}天销量(件)",
+                    "评分", "评论数", "配送天数", "缺失信号"])
         w.writerows(rows)
     L += ["", f"▍明细 → {p}(按产品分降序,{len(rows):,} 行)",
           "  「缺失信号」列告诉你这一行的分是靠哪几项算出来的 ——"

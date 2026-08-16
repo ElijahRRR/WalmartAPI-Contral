@@ -271,31 +271,36 @@ settlement_sync   → 写对账表
 | 含 `@` | email |
 | 11 位数字 | ⚠ 飞书**没有**这一档,先换 open_id(见下) |
 
-所有者给的是**手机号 `17882211182`**。飞书 `im/v1/messages` 的
-`receive_id_type` 只有 open_id / user_id / union_id / email / chat_id 五档,
-**没有手机号**,所以代码里先走一步通讯录换 ID:
+**收件人怎么填 —— 按省事程度排**(所有者 2026-08-16 澄清:**苏里就是他本人**,
+所以旧系统硬编码的那个 open_id 就是他的):
 
-```
-POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id
-{"mobiles": ["17882211182"]}          → open_id,进程内缓存,只换一次
-```
+| 填法 | 额外权限 | 备注 |
+|---|---|---|
+| **`ou_36c5f91668c42a735e7b9d4ae74eedc1`** | 无 | 旧系统一直用它发,**已证明能发通** —— ⚠ 但只在同一个应用下成立,见下 |
+| `freafish006@gmail.com` | 无 | 邮箱**与应用无关**,换应用照样能用 |
+| `17882211182`(手机号) | `contact:user.id:readonly` | 要先换 open_id,最麻烦 |
 
-⚠ **这一步要应用有 `contact:user.id:readonly` 权限**(后台加完要发布版本)。
-没有权限时只告警、退到 webhook 或只记日志,**不会把工作流拖垮**。
-嫌麻烦的话:直接把 `FEISHU_NOTIFY_TO` 填成 **open_id 或飞书账号邮箱**,
-就不需要这条权限。
+⚠ **open_id 是 per-app 的** —— 飞书的 open_id 标识的是「用户 × 应用」这一对,
+同一个人在不同应用下是**不同的 open_id**。`ou_36c5f9…` 是他在旧应用
+**`cli_a9561a4f8dfadcd2`** 下的值。所以:
 
-⚠ 实现里踩住的那个坑:`content` 必须是**字符串化的 JSON**
-(`"{\"text\":\"…\"}"`),传成嵌套对象飞书直接拒 —— 有用例钉着。
-
-三条路依次退:应用直发 → webhook → 只记日志。切换期不会把通知打断。
+- 本仓 `.env` 里的 `FEISHU_APP_ID` **就是 `cli_a9561a4f8dfadcd2`** ⇒ 直接填那个
+  open_id,零额外权限,且旧系统已证明这条路通;
+- 是**别的应用** ⇒ 那个 open_id 认不出来(不报"没权限",是"用户不存在"),
+  改填**邮箱**最省事。
 
 **要配的 .env 两行**:
 
 ```
-FEISHU_NOTIFY_TO=17882211182
+# FEISHU_APP_ID 与旧系统同一个应用(cli_a9561a4f8dfadcd2)时:
+FEISHU_NOTIFY_TO=ou_36c5f91668c42a735e7b9d4ae74eedc1
+# 换了应用、或懒得确认时(邮箱与应用无关):
+# FEISHU_NOTIFY_TO=freafish006@gmail.com
 # FEISHU_WEBHOOK_URL=…        # 可留空;应用发通了就不需要它
 ```
+
+验证:`cd 仓库 && .venv/bin/python3 cli.py catalog_health` —— 只读纯 SQL,
+cli 每轮结束都发通知,飞书收到 `✅ catalog_health 成功…` 即通。
 
 ## 八、plist 模板与四个坑(批复 2 之后少了一个)
 

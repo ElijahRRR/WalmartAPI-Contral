@@ -646,7 +646,7 @@ mcp scheduled-tasks（由 AI 按 SKILL.md 执行，非 launchd/cron 进程）：
 - 绩效问题订单：spreadsheetToken=VbVQ…zd(token已脱敏,见旧仓库代码)，sheet_id=0271b5，13 列 A-M（problem_orders.py:85-89）：数据日期/店铺/Sales Order #/PO #/下单日期/指标/子分类/计入绩效/问题描述/商品/承运商/物流单号/备注。指标列带 emoji 前缀（🚚 OTD / 🛰 VTR / ❌ 取消率 / 💰 退款率 / ⭐ 差评率 / 📦 退货率 / 📭 未收到 / 💬 SRR），计入绩效列取值 "✅ 是" / "⚪ 否"
 - 读写模式：lark-cli sheets +info / +read / +write / +append（覆盖式 write 为主，KPI 与问题订单都不用 append 追加）；v2 API POST /open-apis/sheets/v2/spreadsheets/{token}/sheets_batch_update 用于 addSheet（建店铺 sheet）、updateSheet（改 title/index/frozenRowCount/frozenColCount）；POST .../dimension_range 的 appendDimension 用于扩行（problem_orders.py:484-508）
 - sheet 排序：reorder_store_sheets（perf.py:923-936）每次把总览固定 index=0，其余店铺 sheet 按店铺名字典序重排 index=1..N
-- IM 推送：lark-cli im +messages-send --markdown（正常日报）/ --text（异常兜底告警），接收人 open_id = ou_36c5f91668c42a735e7b9d4ae74eedc1（苏里 / freafish006@gmail.com），summary.py:38 硬编码
+- IM 推送：lark-cli im +messages-send --markdown（正常日报）/ --text（异常兜底告警），接收人 open_id = ou_36c5f91668c42a735e7b9d4ae74eedc1（苏里 = **所有者本人**，2026-08-16 澄清；freafish006@gmail.com），summary.py:38 硬编码
 - 身份统一 --as bot，AppID cli_a9561a4f8dfadcd2（README:185）。LARK_IO_SHIM=1 时改走 lark_io.run_cli/lark_io.api（identity="bot"），超时 60/120/180s 不等
 
 ### 沃尔玛端点
@@ -1815,7 +1815,7 @@ macOS launchd 4 条（auto_listing/launchd/*.plist，WorkingDirectory=/Users/nex
 ### 飞书使用
 
 - 飞书 App 凭证固定为项目内置 bot `cli_a9561a4f8dfadcd2`（永不过期）。⚠️ 调度平台会注入错误的 FEISHU_APP_ID / FEISHU_APP_SECRET —— notify.py:69-70 启动即 os.environ.pop 两个变量；walmart-daily-order-sync/SKILL.md:46-51 与 dedup-sync-online-products/SKILL.md:52-57 要求命令前加 `env -u FEISHU_APP_ID -u FEISHU_APP_SECRET`（未注入时是 no-op，保留即可）
-- 通知目标：运营苏里 open_id `ou_36c5f91668c42a735e7b9d4ae74eedc1`（notify.py:63；walmart-kpi-daily 的业务日报也发同一人）。`ou_` 前缀 → --user-id，`oc_` → --chat-id（notify.py:137）
+- 通知目标：苏里 = **所有者本人**（2026-08-16 澄清，此前记成「运营」）open_id `ou_36c5f91668c42a735e7b9d4ae74eedc1`（notify.py:63；walmart-kpi-daily 的业务日报也发同一人）。⚠ **open_id 是 per-app 的**：这个值只在 AppID `cli_a9561a4f8dfadcd2` 下成立，换应用要重新取。`ou_` 前缀 → --user-id，`oc_` → --chat-id（notify.py:137）
 - 主 spreadsheet token `MO2e…mI(token已脱敏,见旧仓库代码)`（一个文档多个 sheet）：sheet `e7834a` = 在线产品总表 / 商品维护主表（tools/sync_online_products.py:71-72；walmart-maintenance-all-stores/SKILL.md:93）；sheet `38df0D` = 下架表（walmart-daily-retire/SKILL.md:54）；「维护记录_YYYY-MM-DD」= 按日期动态建的 sheet，结果回写列 标题 E / 价格 H / 库存 K（walmart-maintenance-all-stores/SKILL.md:56）；另含上架表 sheet 与 UPC 池 sheet（auto_listing.config FEISHU_SHEET_TOKEN / upc_pool.UPC_SHEET_ID）
 - 在线产品总表 20 列（tools/sync_online_products.py:74-81，全部按位置索引，无字段名）：A store B sku C wpid D upc E productName(WMT) F shelf G productType H price_amount(WMT) I availToSellQty(WMT) J publishedStatus K lifecycleStatus L unpublishedReasons M 处理后amz标题 N 相似度 O amz价格 P walmart价格 Q 更新价格 R 库存(DMIT) S 更新库存 T last_updated。M-S 仅对 J=PUBLISHED 行计算（2026-05-18 起）
 - 上架表 26 列 schema（2026-05-12 起，erp-online-products-track/SKILL.md:56-60）：A ASIN B 店铺 C amz标题 D walmart_product_type E 审核结果 F 理由 G 审核日期 H amz价格 I 库存 J walmart价格 K 是否上架 L 上架feedid M 上架日期 N 未上架理由 O 上架结果 P 上架失败理由 Q 上架复核日期 R 真实walmart标题 S 真实walmart_product_type T 状态跟踪 U 最近跟踪日期 V 标题相似度 W 价格库存调整 X 价格库存调整日期 Y 异常状态报错 Z 处理feed。**列所有权严格划分**：reconcile 只写 O/P/Q；main.py 提交时一次写定 K/L/M/N；sync_status_track 管 R/S/T/U/V；审核流程独占 D/E/F/G（erp-online-products-track/SKILL.md:69-74,136）

@@ -149,17 +149,44 @@ def test_column_shuffle_is_caught_before_anything_runs(monkeypatch):
         pa._claim_from_sheet(500)
 
 
-def test_backlog_size_reaches_the_summary_not_just_the_log(monkeypatch):
-    """截断只写日志 = 飞书通知里看着像"审完了"(生产实证:28498 待审 / limit 500)。"""
+def test_already_audited_asins_are_not_re_judged(monkeypatch):
+    """⚠ E 列为空 ≠ 库里没结论 —— 已有结论的**直接回填,不重审**。
+
+    所有者纠正 2026-08-16:「按我们的运行逻辑,不是应该直接从库里读取结果吗」。
+    当成强审的后果:每轮把已审过的几万个 ASIN 重判一遍,钱白花、慢得离谱,
+    而且哪里都看不出不对(结论还是那个结论)。
+    """
+    where, extra = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1"})
+    assert "p.asin = ANY(%(asins)s)" in where
+    assert pa._DEFAULT_CANDIDATE in where          # 叠了默认候选谓词
+    assert extra["asins"] == ["B0A", "B0B"]
+    # 而人手点名的 asins=(不带 from_sheet)仍是强审:点名就是要重判
+    forced, _ = pa._pick_where({"asins": "B0A"})
+    assert forced == "p.asin = ANY(%(asins)s)"
+    assert pa._DEFAULT_CANDIDATE not in forced
+
+
+def test_backlog_breakdown_reaches_the_summary_not_just_the_log(monkeypatch):
+    """三个数就是"为什么这轮还在审"的全部答案,必须进摘要(飞书通知的正文)。
+
+    生产实证 2026-08-16:28498 个 ASIN / limit=500,当时摘要只说"待审 28498",
+    看不出其中多少是已审过的、多少压根不在库里。
+    """
     monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
         {"rownum": i, "asin": f"B0ASIN{i:04d}", "store": "T1"}
-        for i in range(2, 12)])
-    rows, asins, head = pa._claim_from_sheet(4)
-    assert len(rows) == 10 and asins == [f"B0ASIN{i:04d}" for i in range(2, 6)]
-    assert "待审 10 个 ASIN" in head[0]
-    assert "还剩 6 个" in head[1] and "limit=4" in head[1]
-    # 没超 limit 时不该无中生有地报警
-    assert len(pa._claim_from_sheet(500)[2]) == 1
+        for i in range(2, 12)])                       # 10 个 ASIN
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn([
+        ("approved", 3), ("rejected", 1), ("pending", 2), ("未审", 2)]))
+    rows, asins, head = pa._claim_from_sheet(3)
+    # ⚠ 不截断:整批交给候选谓词,LIMIT 只限制**真要判的**那部分
+    assert len(rows) == 10 and len(asins) == 10
+    assert "E 列为空 10 个 ASIN" in head[0]
+    assert "已有结论 4" in head[1] and "不重审" in head[1]
+    assert "待审 4" in head[1]
+    assert "不在库 2" in head[1]                      # 10 - (3+1+2+2)
+    assert "还剩 1 个" in head[2] and "limit=3" in head[2]   # 待审 4 > limit 3
+    # 待审没超 limit 时不该无中生有地报警
+    assert len(pa._claim_from_sheet(500)[2]) == 2
 
 
 def test_from_sheet_reuses_the_asins_path(monkeypatch):

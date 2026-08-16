@@ -29,7 +29,7 @@ delete 是唯一的**不可逆**类(采集永久偏移 / 商品不存在),由 de
 import logging
 import os
 
-from services import mp_mapper, pricing
+from services import mp_mapper, order_audit, pricing, store_limits
 
 logger = logging.getLogger("services.maintenance_intents")
 
@@ -187,6 +187,24 @@ ORDER BY w.store, w.sku
 
 TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标题
 
+def processed_title(slow) -> str:
+    """输入:products.slow → 输出:过完上架文案处理的标题(去品牌/去符号/截 199)。
+
+    ⚠ **相似度必须拿它去比,不能比亚马逊原始标题**:`force_amazon_copy` 会去掉
+    品牌名,我们的沃尔玛标题天生就是"亚马逊标题减品牌"。拿原始标题比,品牌一长
+    (`SuperMegaBrandName Cup` → `Cup`)相似度就掉到 24%,一个完全正常的商品
+    会被判成"不是同一个东西"而删除。两边过同一套处理,剩下的差异才是真差异。
+    """
+    if not isinstance(slow, dict):
+        return ""
+    t = slow.get("title")
+    if not t or str(t).strip() in TITLE_PLACEHOLDERS:
+        return ""
+    return mp_mapper.force_amazon_copy(
+        {}, {"title": t, "brand": slow.get("brand"), "attrs": slow}
+    ).get("productName") or ""
+
+
 # 亚马逊在架状态原文 → 处置(采集侧 raw.stock_status,原文匹配不做模糊)
 _STOCK_STATUS_ZERO = {
     "currently unavailable": ("unavailable", "Currently unavailable"),
@@ -245,10 +263,17 @@ def pick_one(actions: list[tuple]) -> tuple:
     return min(real, key=lambda a: _ACTION_RANK.get(a[0], 9))
 
 
-def _rows(conn, stockzero_stores: list[str]) -> list[tuple]:
+def _rows(conn, stockzero_stores: list[str]) -> list[dict]:
+    """输入:连接 + stockzero 名单 → 输出:在线商品行(**dict,不是元组**)。
+
+    ⚠ 2026-08-16 从元组改成 dict:SQL 加了 outcome/stock_status/stock_state 三列,
+    四个 provider 的位置解包**全部要改**,漏一处轻则 ValueError、重则静默取错
+    字段(元组长度对得上、字段错位时不报错)。按名字取之后,加列只改 SQL。
+    """
     with conn.cursor() as cur:
         cur.execute(_SQL_AMZ_JOIN, (list(stockzero_stores or []),))
-        return cur.fetchall()
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 _DEDUPE_SCOPE = "maintenance:submitted"
@@ -376,9 +401,17 @@ def price_intents(conn, multipliers: dict[str, dict],
     """
     out = []
     skipped_no_rule = skipped_no_channel = skipped_no_shipping = 0
-    for (store, sku, _name, _pt, _upc, wm_price, _qty,
-         amz_price, _sc, _dd, _slow, fulfillment, shipping) in _rows(
-            conn, stockzero_stores):
+    for r in _rows(conn, stockzero_stores):
+        store, sku = r["store"], r["sku"]
+        wm_price, amz_price = r["wm_price"], r["amz_price"]
+        fulfillment, shipping = r["fulfillment"], r["shipping"]
+        # 删除类压过改价:一个 SKU 一轮只出一个动作,否则先花配额改一个
+        # 马上要删的商品(pick_one 的同款理由)。两条删除判据都要判到。
+        if classify(outcome=r["outcome"],
+                    title_similarity=order_audit.title_similarity(
+                        r["product_name"], processed_title(r["slow"]))
+                    )[0] == "delete":
+            continue
         if amz_price is None or wm_price is None:
             continue                    # 缺任一侧现值:没有可比基准,不动
         channel = str(fulfillment or "").strip().upper()
@@ -433,21 +466,35 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
     按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
     真跑前务必看 dry-run 的清零条数。
     """
-    from services import amz_source, store_limits
+    from services import amz_source
     lead_caps = store_limits.lead_day_caps()
     out = []
-    for (store, sku, _name, _pt, _upc, _wp, avail_qty,
-         _ap, stock_count, delivery_days, _slow, _fm, _sh) in _rows(
-            conn, stockzero_stores):
+    for r in _rows(conn, stockzero_stores):
+        store, sku, avail_qty = r["store"], r["sku"], r["avail_qty"]
+        stock_count = r["stock_count"]
         if stock_count is None:
             stock_count = 0             # 没采到 → 不卖(所有者定稿)
         cap = store_limits.cap_for(lead_caps, store, amz_source.MAX_LEAD_DAYS)
-        new_qty = 0 if store_limits.over_lead_cap(delivery_days, cap) \
-            else int(stock_count)
+        over = store_limits.over_lead_cap(r["delivery_days"], cap)
+        # 处置判据集中在 classify():四条清零判据(不可售/无 BuyBox/缺货/超时)
+        # 各自带原因码,飞书「原因」列靠它才分得清 —— 表里四条长得一模一样
+        act, code, why = classify(
+            outcome=r["outcome"], stock_status=r["stock_status"],
+            stock_state=r["stock_state"], over_lead=over,
+            # ⚠ 相似度也要给:不给的话"标题不匹配 → 删除"这条在本 provider 看不见,
+            # 于是该删的行照样产一条库存意图,执行件先花配额清零再花配额删
+            # (2026-08-16 演练实见 B0MISMATCH 10 → 7)
+            title_similarity=order_audit.title_similarity(
+                r["product_name"], processed_title(r["slow"])),
+            lead_note=f"配送 {r['delivery_days']} 天 > 本店上限 {cap} 天")
+        if act == "delete":
+            continue        # 删除类归 delete_intents,这里不抢(一 SKU 一动作)
+        new_qty = 0 if act == "inventory" else int(stock_count)
         if avail_qty is not None and int(avail_qty) == new_qty:
             continue
         out.append({"store": store, "sku": sku, "kind": "inventory",
-                    "old": avail_qty, "new": new_qty})
+                    "old": avail_qty, "new": new_qty,
+                    "code": code, "reason": why})
     return _cap(out, "inventory")
 
 
@@ -463,17 +510,24 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
     (缺任一沃尔玛必退回)。标题相同则不产出。
     """
     out = []
-    skipped_incomplete = 0
-    for (store, sku, product_name, product_type, upc, _wp, _qty,
-         _ap, _sc, _dd, slow, _fm, _sh) in _rows(conn, stockzero_stores):
+    skipped_incomplete = skipped_mismatch = 0
+    for r in _rows(conn, stockzero_stores):
+        store, sku = r["store"], r["sku"]
+        product_name, product_type, upc = r["product_name"], r["product_type"], r["upc"]
+        slow = r["slow"]
         amz_title = ((slow or {}).get("title") if isinstance(slow, dict)
                      else None)
         if not amz_title or str(amz_title).strip() in TITLE_PLACEHOLDERS:
             continue
-        # 与上架同款处理(brand 从 slow 取,和 force_amazon_copy 的入参一致)
-        new_title = mp_mapper.force_amazon_copy(
-            {}, {"title": amz_title, "brand": (slow or {}).get("brand"),
-                 "attrs": slow or {}}).get("productName") or ""
+        # 70% 闸(所有者定稿 2026-08-16):相似度过低说明**采到的可能不是同一个
+        # 商品**,那时把亚马逊标题抄过去是把错的抄进线上 —— 交给删除链处置。
+        # 相似度算不出来(有一边没标题)不算不匹配,照旧走改标题。
+        sim = order_audit.title_similarity(product_name,
+                                           processed_title(slow))
+        if sim is not None and sim < TITLE_SIM_FLOOR:
+            skipped_mismatch += 1
+            continue
+        new_title = processed_title(slow)    # 与上架同款处理(去品牌/截 199)
         if not new_title or new_title == (product_name or ""):
             continue
         if not product_type or not upc:
@@ -481,10 +535,16 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
             continue
         out.append({"store": store, "sku": sku, "kind": "title",
                     "old": product_name, "new": new_title,
-                    "product_type": product_type, "product_id": upc})
+                    "product_type": product_type, "product_id": upc,
+                    "code": "title_sync",
+                    "reason": f"相似度 {sim:.0%},同步亚马逊标题" if sim is not None
+                              else "同步亚马逊标题(相似度算不出)"})
     if skipped_incomplete:
         logger.info("标题:%d 行缺 productType/UPC 跳过(三缺一防线)",
                     skipped_incomplete)
+    if skipped_mismatch:
+        logger.info("标题:%d 行相似度 < %.0f%% 不改标题(交给删除链)",
+                    skipped_mismatch, TITLE_SIM_FLOOR * 100)
     return _cap(out, "title")
 
 
@@ -535,11 +595,22 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
                   {"batches": batches, "first_seen": first_seen,
                    "last_seen": last_seen})
 
-    for (store, sku, _name, _pt, _upc, _wp, _qty,
-         _ap, _sc, _dd, slow, _fm, _sh) in _rows(conn, stockzero_stores):
+    for r in _rows(conn, stockzero_stores):
+        store, sku = r["store"], r["sku"]
+        slow = r["slow"]
         title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
         if str(title or "").strip() in TITLE_PLACEHOLDERS and title:
             _take(store, sku, "商品不存在")
+            continue
+        # 所有者定稿 2026-08-16 新增两条删除判据(judgement 在 classify):
+        #   outcome == 'not_found'  → ASIN 已从亚马逊下架
+        #   标题相似度 < 70%         → 采到的可能不是同一个商品,抄标题会抄错
+        act, code, why = classify(
+            outcome=r["outcome"],
+            title_similarity=order_audit.title_similarity(
+                r["product_name"], processed_title(slow)))
+        if act == "delete":
+            _take(store, sku, code, {"why": why})
 
     with conn.cursor() as cur:
         cur.execute(_SQL_LONG_OOS, {"days": int(oos_days)})

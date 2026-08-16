@@ -68,13 +68,29 @@ def test_zero_intents_only_positive_known_qty():
 
 
 # amz 侧 × 沃尔玛侧联表的一行(顺序 = _SQL_AMZ_JOIN 的 SELECT 列)
-def _row(store="T1", sku="B0A", name="旧标题", pt="Cups", upc="012345678905",
+# ⚠ 默认的 name 与 slow.title 必须是**同一个商品**(处理后相似度高):
+# 2026-08-16 起 price/inventory 两个 provider 都会判"标题相似度 < 70% → 该删",
+# 该删的行不再产改价/清零意图。默认值若是随手写的两个不相干字符串,
+# 全部用例会集体空转而看起来只是"没有意图"。
+def _row(store="T1", sku="B0A", name="Steel Cup", pt="Cups", upc="012345678905",
          wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
-         delivery_days=3, slow=None, fulfillment="FBM", shipping=0.0):
-    return (store, sku, name, pt, upc, wm_price, avail_qty,
-            amz_price, stock_count, delivery_days,
-            slow if slow is not None else {"title": "Amz 标题", "brand": None},
-            fulfillment, shipping)
+         delivery_days=3, slow=None, fulfillment="FBM", shipping=0.0,
+         outcome="ok", stock_status="In Stock", stock_state="in_stock"):
+    """一行在线商品夹具(**dict,与 _rows 的真实产出同形**)。
+
+    ⚠ 2026-08-16 从元组改成 dict:SQL 加了 outcome/stock_status/stock_state 三列,
+    元组夹具会让四个 provider 的位置解包全部错位 —— 而元组长度对得上时**不报错**,
+    只是字段错位。按名字取之后,加列只改这里的默认值。
+    """
+    return {"store": store, "sku": sku, "product_name": name,
+            "product_type": pt, "upc": upc, "wm_price": wm_price,
+            "avail_qty": avail_qty, "amz_price": amz_price,
+            "stock_count": stock_count, "delivery_days": delivery_days,
+            "slow": slow if slow is not None
+                    else {"title": "ACME Steel Cup", "brand": "ACME"},
+            "fulfillment": fulfillment, "shipping": shipping,
+            "outcome": outcome, "stock_status": stock_status,
+            "stock_state": stock_state}
 
 
 _MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
@@ -135,8 +151,9 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
 
 def test_title_intents_reuses_listing_copy_rules(monkeypatch):
     rows = [
-        _row(sku="B0NEW", name="旧标题",
-             slow={"title": "ACME Steel Cup", "brand": "ACME"}),   # 去品牌后不同 → 改
+        # 处理后 "Steel Cup" vs 现值 "Steel Cup 500ml":相似度 82% ≥ 70% → 改标题
+        _row(sku="B0NEW", name="Steel Cup 500ml",
+             slow={"title": "ACME Steel Cup", "brand": "ACME"}),
         _row(sku="B0SAME", name="Steel Cup",
              slow={"title": "ACME Steel Cup", "brand": "ACME"}),   # 处理后相同 → 不动
         _row(sku="B0NOPT", pt="", slow={"title": "X Cup"}),        # 缺 PT → 三缺一跳过
@@ -193,7 +210,7 @@ def test_delete_intents_also_take_title_placeholder(monkeypatch):
     """占位符[商品不存在]:旧系统只是跳过标题,所有者 2026-08-09 改为删除。"""
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
         _row(sku="B0GONE", slow={"title": "[商品不存在]"}),
-        _row(sku="B0OK", slow={"title": "正常标题"}),
+        _row(sku="B0OK", name="正常标题", slow={"title": "正常标题"}),
         _row(sku="B0DUP", slow={"title": "[商品不存在]"}),
     ])
     # B0DUP 同时是偏移件:两个原因命中只删一次

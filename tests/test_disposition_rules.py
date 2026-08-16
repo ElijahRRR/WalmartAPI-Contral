@@ -63,3 +63,78 @@ def test_pick_one_ranks_delete_inventory_title():
 def test_nothing_wrong_means_no_action():
     assert classify(outcome="ok", stock_status="In Stock",
                     stock_state="in_stock", title_similarity=0.95) == (None, "", "")
+
+
+# ── provider 接线回归 ────────────────────────────────────────────────────────
+
+def _row(**kw):
+    base = {"store": "T1", "sku": "B0A", "product_name": "Steel Cup",
+            "product_type": "Cups", "upc": "012345678905", "wm_price": 20.0,
+            "avail_qty": 10, "amz_price": 10.0, "stock_count": 7,
+            "delivery_days": 3, "slow": {"title": "ACME Steel Cup", "brand": "ACME"},
+            "fulfillment": "FBM", "shipping": 0.0, "outcome": "ok",
+            "stock_status": "In Stock", "stock_state": "in_stock"}
+    base.update(kw)
+    return base
+
+
+def test_similarity_compares_processed_titles_not_raw():
+    """⚠ 不能拿沃尔玛标题去比亚马逊**原始**标题。
+
+    force_amazon_copy 会去掉品牌名,我们的沃尔玛标题天生就是"亚马逊标题减品牌"。
+    比原始标题的话,品牌一长(SuperMegaBrandName Cup → Cup)相似度掉到 24%,
+    一个完全正常的商品会被判成"不是同一个东西"而删除。
+    """
+    from services.maintenance_intents import processed_title
+    from services.order_audit import title_similarity
+    slow = {"title": "SuperMegaBrandName Cup", "brand": "SuperMegaBrandName"}
+    assert processed_title(slow) == "Cup"
+    assert title_similarity("Cup", slow["title"]) < 0.3      # 比原始:误判
+    assert title_similarity("Cup", processed_title(slow)) == 1.0
+    assert processed_title({"title": "[商品不存在]"}) == ""   # 占位符不算标题
+    assert processed_title(None) == ""
+
+
+def test_inventory_provider_carries_the_reason_code(monkeypatch):
+    """四条清零判据必须各自带原因码传到飞书「原因」列。"""
+    from services import maintenance_intents as mi
+    rows = [_row(sku="B0UNAVAIL", stock_status="Currently unavailable"),
+            _row(sku="B0NOBB", stock_status="No Featured Offer"),
+            _row(sku="B0OOS", stock_state="out_of_stock"),
+            _row(sku="B0SLOW", delivery_days=30)]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
+    out = {i["sku"]: (i["code"], i["new"]) for i in mi.inventory_intents(None, [])}
+    assert out["B0UNAVAIL"] == ("unavailable", 0)
+    assert out["B0NOBB"] == ("no_buybox", 0)
+    assert out["B0OOS"] == ("out_of_stock", 0)
+    assert out["B0SLOW"][0] == "lead_days" and out["B0SLOW"][1] == 0
+
+
+def test_inventory_provider_yields_to_delete(monkeypatch):
+    """一个 SKU 一轮只出一个动作:该删的不在库存链里再出一条。
+
+    ⚠ **两条删除判据都要覆盖**。2026-08-16 演练实见:只判了 outcome,
+    标题不匹配那条在本 provider 看不见,于是该删的行照样产一条库存意图
+    (B0MISMATCH 10 → 7),执行件先花配额清零再花配额删。
+    """
+    from services import maintenance_intents as mi
+    monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
+    for kw in ({"outcome": "not_found"},
+               {"product_name": "完全不相干的商品名"}):     # 相似度 < 70%
+        monkeypatch.setattr(mi, "_rows", lambda conn, sz, k=kw: [
+            _row(sku="B0DEAD", stock_state="out_of_stock", **k)])
+        assert mi.inventory_intents(None, []) == [], kw
+        assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}}, []) == [], kw
+
+
+def test_title_provider_gates_at_70_percent(monkeypatch):
+    """< 70% 不改标题(交给删除链);≥ 70% 照改。"""
+    from services import maintenance_intents as mi
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
+        _row(sku="B0OK", product_name="Steel Cup 500ml"),        # 82% → 改
+        _row(sku="B0BAD", product_name="完全不同的东西"),          # 低 → 不改
+    ])
+    out = mi.title_intents(None, [])
+    assert [i["sku"] for i in out] == ["B0OK"]
+    assert out[0]["code"] == "title_sync" and "%" in out[0]["reason"]

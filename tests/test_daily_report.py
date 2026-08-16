@@ -197,3 +197,46 @@ def test_settlement_moved_out_tells_you_where(monkeypatch):
 
     from workflows import settlement_sync as ss
     assert hasattr(ss, "run") and ss.DANGEROUS is False
+
+
+def test_push_never_claims_sent_when_webhook_is_unconfigured(monkeypatch):
+    """⚠ 2026-08-16 所有者实见:日志三处写着未配置,摘要却报"日报已推送"。
+
+    sent=False 时一个字节都没发出去,说"已推送"就是假话。摘要是人眼闸门,
+    不许自我美化 —— 人只看摘要就会以为发了,而飞书里什么都没有。
+    """
+    import contextlib
+
+    from registry import db as _db
+    from workflows import daily_report as dr
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            self._n = 3 if "perf_problem" in sql or "DISTINCT" in sql else 1
+
+        def fetchone(self):
+            return (41, 32, 1987.69)
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(dr.feishu, "notify", lambda text: False)
+    out = dr._phase_push("2026-08-16", True)
+    assert "未发出" in out and "FEISHU_WEBHOOK_URL" in out
+    assert "已推送" not in out          # 一个字都不许出现
+    assert "沃尔玛店铺日报" in out       # 内容仍要打出来,人能手动转发
+
+    monkeypatch.setattr(dr.feishu, "notify", lambda text: True)
+    assert dr._phase_push("2026-08-16", True) == "日报已推送"

@@ -524,8 +524,13 @@ def _phase_push(data_date, do_push: bool) -> str:
     text = "\n".join(lines)
 
     if do_push:
-        sent = feishu.notify(text)
-        return f"日报已推送(webhook={'成功' if sent else '未配置/失败'})"
+        # ⚠ 别写成"日报已推送(webhook=未配置/失败)":sent=False 时一个字节都没发出去,
+        # 说"已推送"就是假话。2026-08-16 所有者实见——日志里三处都写着未配置,
+        # 摘要却报成功,人只看摘要就以为发了。摘要是人眼闸门,不许自我美化。
+        if feishu.notify(text):
+            return "日报已推送"
+        return ("⚠ 日报**未发出**:FEISHU_WEBHOOK_URL 未配置或推送被拒"
+                "(填 <DATA_ROOT>/.env 即生效)。内容:\n" + text)
     logger.info("日报预览(未推送,-p push=1 真发):\n%s", text)
     return "日报仅预览(未推送):\n" + text
 

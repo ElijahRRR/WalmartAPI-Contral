@@ -548,6 +548,30 @@ def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
     assert [x["asin"] for x in r["directed"][0]["items"]] == ["B0AAAA0001"]
 
 
+def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
+        monkeypatch, tmp_path):
+    """⚠ 容量闸必须压在类目/货期之上 —— 店满了的时候,类目对不对不影响结果。
+
+    实测 2026-08-16:A154杨凯迪 剩余容量 0,报告把它记成「缺 Arts & Crafts
+    161 件 / 缺 Garden & Patio 113 件」,还附一句"给该店开这个大类就能救回"
+    —— 把所有者送去做一件买不到任何货位的事。而且同一家满店,类目**碰巧对上**
+    的那些组走的是另一条路(进牌堆 → 容量塞不下 → "等下架腾位"),
+    同一个原因两种说法。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0FULL{i:04d}", "acme", 90.0 - i, cat="厨房") for i in range(5)]
+    # 品牌归 A,而 A 只做「家居」且已经装满(在线 5000 = 上限 5000)
+    _wire(monkeypatch, pool, held_brand={"acme": "A"}, claimed=[])
+    monkeypatch.setattr(wf.db, "pg_conn",
+                        lambda *a, **k: __import__("contextlib").nullcontext(
+                            _Conn({"A": 5000, "B": 100})))
+    out = wf.run({"execute": False})
+    assert "占用店容量已满" in out and "容量已满**挡下的" in out
+    # 满店不许出现在类目清单里 —— 那句"开这个大类就能救回"对它是假的
+    cat_lines = [x for x in out.splitlines() if "缺「" in x]
+    assert not any("A 缺" in x for x in cat_lines), cat_lines
+
+
 def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
     """★ 排序按**组分**(组内最高产品分),组里分低的产品跟着一起上架。
 

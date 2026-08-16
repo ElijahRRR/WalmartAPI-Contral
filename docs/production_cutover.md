@@ -190,22 +190,7 @@ cli 本来就管锁/记录/通知,链只是把这三件事各做 N 遍。
 
 ## 七、待做清单(按依赖顺序)
 
-### 1. feed `pending` 自动对账器(审计挖出来的,要所有者点头)
-
-`ops.feed_log` 的 schema 注释与安全铁律都写着"启动对账:pending 行先查
-Walmart 实际状态再决定补交",**但没有任何代码在做**,而且现在**也做不了**:
-`feed_log` 没存条目数(`find_recent_feed` 的必需入参)也没存 SKU 列表
-(收编后要落 `feed_items`)。
-
-要动两处:① `ALTER TABLE ops.feed_log ADD COLUMN item_count int,
-ADD COLUMN skus text[]`;② 一个新工作流按 `find_recent_feed` 三态收编或判未达。
-**它碰的是全项目最危险的那条不变式(重复提交),动之前要所有者点头。**
-
-在那之前 pending 走人工:`feed_poll` 摘要里已经摊开了明细(店铺/类型/来源/
-时间),拿去 Walmart 后台对一眼即可。pending 罕见——只在"网络异常**且**反查
-三态也不确定"时产生。
-
-### 2. launchd plist 全套 + 停旧清单
+### 1. launchd plist 全套 + 停旧清单
 
 调度顺序的**硬约束**(文档里明写、颠倒会静默出错):
 
@@ -251,3 +236,8 @@ ADD COLUMN skus text[]`;② 一个新工作流按 `find_recent_feed` 三态收�
 - 批次 E 真跑未执行(`problem_scan` → `problem_product_cleanup`,470 条建议)
 - 变体分组生产验收未做(`list_new` dry-run 看变体口径分布,重点看 `no_dim`
   —— `_DIM_MAP` 那 20 行映射未经生产校验)
+- feed `pending` **不做自动对账器**(所有者定稿 2026-08-16:「旧工作流生产了
+  几个月,没遇到过 pending。以后遇到了再说」)。⚠ 真遇到时它**长得像正常
+  防重**:那批 SKU 每轮都报「在途防重跳过 N」而 N 不变,实际是被堵死、
+  再也发不出去,且不报错。识别信号与人工处置见
+  `docs/feed_closure_audit.md` §三.1

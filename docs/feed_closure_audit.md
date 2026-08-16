@@ -55,44 +55,94 @@ submitted)与 `ops.feed_items`(SKU 级,提交成功即落),两者都在
 
 ## 三、审出来的三个问题
 
-### 1. `pending` 行是一条**断头路**(最要紧,未修)
+### 1. `pending` 行(所有者定稿 2026-08-16:**不做对账器,遇到了再说**)
 
-`ops.feed_log` 的 schema 注释白纸黑字写着:
+> 所有者:「我旧工作流生产了几个月,没遇到过 pending。以后遇到了再说。」
+> —— 采纳。本节保留是为了**真遇到时能一眼认出来**,它长得像正常防重。
 
-```sql
--- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+#### 什么情况下产生
+
+提交 feed 是先落库再调接口:`ops.feed_log` 先写一行 `status='pending'`,
+POST 之后按结果改成 submitted / failed。**只有一条路会把它留在 pending**:
+POST 网络异常(不知道到没到)→ `find_recent_feed` 反查三态 → 三态里的 UNKNOWN。
+
+⚠ **UNKNOWN 不是"查到了但说不清",是"根本没查成"**(2026-08-16 所有者质疑
+"联通了就肯定能查到有还是没有"后逐行核对代码更正 —— 此前本文把它写成前者,
+是错的):
+
+| 三态 | 判据(`_probe()` 的返回) | 处置 |
+|---|---|---|
+| FOUND | GET 通了,列表里有一条同 feedType、条数精确相同、30 分钟窗内、feedId 未被本系统占用的 | 收编,不补交 |
+| NOT_FOUND | GET 通了,列表里没有;**30 秒后再查一次仍没有**(防沃尔玛索引滞后) | **当没提交过 → 同一载荷补交一次** |
+| UNKNOWN | `_probe()` 返回 None ——**GET 请求自己就没成功**(重试 2 次后仍非 200,或响应不是 JSON) | 保持 pending,不补交 |
+
+所以"没查到就当没提交过"这条规则**代码已经在执行**(NOT_FOUND 那一支)。
+UNKNOWN 留 pending 也是对的:`status != 200` 里混着两种东西 —— 超时/连接断
+(确实没连上)与 **429 被限流 / 401 token 失效**(连上了,但对方没回答你的问题)。
+后者按"没查到 = 没提交过"去补交,如果原来那笔其实到了,就是双删除/双上架。
+**"查了,没有" 与 "没查成" 必须分开,这一点不该改。**
+
+⚠ 还有一条比 UNKNOWN 更常见的路径:**反查时 `get_token` 直接抛异常**
+(代理彻底断了,POST 失败之后连 token 都拿不到)。`_probe()` 里那句
+`get_token` 没有 try,异常一路抛出 `find_recent_feed` → `_submit_one`,
+`_log_update` 根本没机会执行,行**同样停在 pending** —— 而且连 UNKNOWN
+那行日志都不会有,只有工作流单店隔离打的那条"提交异常已跳过"。
+代理不稳的店,这条路径概率高于 UNKNOWN。
+
+第三条:进程在"写完 pending 行"与"POST"之间被 kill。
+
+#### 真遇到了长什么样(**认得出来比修得掉更重要**)
+
+后果不止"这批的结局不明",而是**那批 SKU 被堵死**:
+
+```
+防重第①层拦的是「在途行」,而 pending 算在途。
+下一轮同一批 SKU → payload_key 一样(条目集合的哈希,顺序无关)
+                → _log_claim 撞唯一索引 → 既有行 status='pending'
+                → 不在 (failed, done) 里 → 不给重占 → 返回 outcome='dedup'
 ```
 
-安全铁律也写着「程序重启时,所有 pending 记录先去 Walmart 查实际状态再决定
-是否补交」。**这件事没有任何代码在做。**
+于是**每一轮都被拦下**,日志与飞书显示「**在途防重跳过**」—— 看起来完全正常,
+实际上那批商品的那个动作**再也发不出去**,而且不报错。
+`problem_product_cleanup` 更绕一层:dedup 不转 executing → 建议行停在
+suggested → 下轮再建议 → 再被拦 → **无限空转**。
 
-- `feeds.query_pending()` 的唯一消费方是 `feed_track.poll_all`,而它对 pending
-  行只打一行 warning,不解析、不补交、不关闭。
-- `find_recent_feed()`(反查三态)只在 `_submit_one` 内部、提交出网络异常的那
-  一瞬间被调用;事后再没有任何路径能用它。
+**删除/停用类最容易中招**:feed 没落定说明什么都没变,下一轮扫描算出来还是
+同一批 SKU、同一个指纹。改价/改库存因为亚马逊价格在动,指纹会漂,反而不易卡死。
 
-后果:一条 pending 行**永远挂着**。它的 SKU 在 `ops.feed_items` 里**一行都
-没有**(`_items_record` 只在提交成功时调),飞书对应行停在 Unknown / 处理中,
-而计数只增不减 —— 几轮之后 `⚠ pending N` 这行警告就成了背景噪音。
+识别信号(**这三条同时出现才是它**,单看第一条会与真防重混淆):
+1. 某批 SKU 连着几轮都报「在途防重跳过 N」,N 不变;
+2. `ops.feed_log` 里有 `status='pending'` 且 `feed_id IS NULL` 的行;
+3. `ops.feed_items` 里那批 SKU **一行都没有**(提交成功才落)。
 
-⚠ **就算现在想写这个对账器,也写不了**:`find_recent_feed` 的必需入参是
-`items_received`(按条目数 + 时间窗匹配候选 feed),而 `ops.feed_log`
-**没存条目数**,也**没存 SKU 列表**(收编成功后要拿它去落 `feed_items`)。
-表里只有 `payload_key` 这个指纹,反推不出条目。
+```sql
+SELECT id, workflow, store, feed_type, created_at
+FROM ops.feed_log WHERE status = 'pending' ORDER BY created_at;
+```
 
-**本轮做的**:把 pending 明细(店铺 / feedType / 来源工作流 / 提交时间)摊进
-`feed_poll` 的**摘要**——摘要是发去飞书的那一份,只报个数人看到之后无从下手。
-并且明说「系统不会自动补交」。
+`feed_poll` 的摘要现在会把这几行摊开(店铺 / 类型 / 来源工作流 / 提交时间),
+并明说「系统不会自动补交」—— 之前只报个数,人看到之后无从下手。
 
-**没做的**:自动对账器。它要 ① `ALTER TABLE ops.feed_log ADD COLUMN
-item_count int, ADD COLUMN skus text[]`;② 一个新工作流按
-`find_recent_feed` 三态收编或判未达。这是一个批次的量,而且它碰的是全项目最
-危险的那条不变式(重复提交),**要所有者点头再动**。
+#### 真遇到了怎么处理(人工,两步)
 
-在那之前,pending 的正确处置是**人工**:拿摘要里的店铺 + 时间去 Walmart 后台
-对一眼那个 feed 在不在,在就手工把 `ops.feed_log` 那行补上 feed_id 改
-submitted(下轮 `feed_poll` 会接手),不在就改 failed(下轮业务工作流重提)。
-`pending` 罕见 —— 只在"网络异常 **且** 反查三态也不确定"时产生。
+拿摘要里的店铺 + 时间 + feedType 去 Walmart Seller Center 的 Feed Status 对:
+
+- **那个 feed 在** ⇒ 当时其实到了。给这行补 `feed_id`、`status` 改
+  `submitted`,下轮 `feed_poll` 自动接手轮询回执。
+- **不在** ⇒ 确认未达。`status` 改 `failed`,下轮业务工作流会重占这个
+  payload_key 正常重发。
+
+#### 将来真要做自动对账器的话(不是现在)
+
+判定逻辑**一行都不用新写**:`find_recent_feed` 已经在生产上跑过,GET
+`/v3/feeds` 只读、查一百次也没副作用。差的只是**事后调不起来** ——
+它的匹配键是 `items_received`(精确条数),而 `ops.feed_log` 没存。
+
+要动的:① `ALTER TABLE ops.feed_log ADD COLUMN item_count int,
+ADD COLUMN skus text[]`(后者是收编成功后补 `ops.feed_items` 用的,不然那批
+SKU 在台账里仍然没有);② 一个**只读、自己一个 feed 都不发**的工作流,扫
+pending 行 → 调 `find_recent_feed` → FOUND 补 feed_id 转 submitted /
+NOT_FOUND 转 failed / 仍 UNKNOWN 留着下轮再来。补交仍由原业务工作流按原规则做。
 
 ### 2. `dedup` 时重复写 `*_submitted` 事件(已修)
 
@@ -116,10 +166,10 @@ submitted(下轮 `feed_poll` 会接手),不在就改 failed(下轮业务工作�
 不误 —— 在途 feed 的结果**确实**会落到这些行上,而冷却表的 insert 本身
 `ON CONFLICT DO NOTHING` 幂等。
 
-### 3. `pending` 行永不老化(未修,与 1 同源)
+### 3. `pending` 行永不老化(与 1 同源,同样不做)
 
 没有任何机制把陈年 pending 行升级告警或归档。`_PENDING_ALARM_HOURS = 6` 这个
-常量**定义了但没有任何地方引用**。做对账器时一并处理。
+常量**定义了但没有任何地方引用**。将来做对账器时一并处理。
 
 ## 四、复核过、确认没问题的几处
 
@@ -141,6 +191,7 @@ submitted(下轮 `feed_poll` 会接手),不在就改 failed(下轮业务工作�
 工作流绕不过去**。"产品事件是否完善且闭环":提交 → 回执 → 观测核验三段齐全,
 两处 dedup 幽灵事件已修。
 
-**唯一真正没闭的口子是 `pending`** —— 它按设计"宁停不重"停在那里等人,但
-既没人来、也没留下让人来的信息。本轮补上了信息(摘要里摊开明细),
-自动对账器等所有者点头。
+**唯一没闭的口子是 `pending`**,所有者定稿**不做**(旧系统跑了几个月没遇到过,
+遇到了再说)。本轮只补了"遇到时能被发现":`feed_poll` 摘要摊开明细并明说系统
+不会自动补交,以及上面第三节那份识别信号 —— 它的麻烦不在于难修,
+而在于**长得像正常防重**。

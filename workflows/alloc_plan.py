@@ -106,29 +106,23 @@ WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
 """
 
 
-def _reserved(conn, held_prod: dict) -> dict:
-    """输入:连接 + {asin: 占用店} → 输出:{店: **已占但还没上架**的货位数}。
+def _listed_asins(conn, registered) -> set:
+    """输入:连接 + 在册店名 → 输出:**已经在架**的 ASIN 集合(规划内店)。
 
-    ★ 占用是"这个货位归你了",`online_now` 数的是"已经在架的" —— 两者之间
-    隔着一次真实上架。这个差额必须从剩余容量里扣掉,否则:
-    `alloc_plan --execute` 落了三万条占用、货还没上,第二天再跑一次,剩余容量
-    一点没变,于是**把同一批货位再许诺一次**。已占 ASIN 会被排除所以换了一批
-    产品,但两批货加起来塞不进那些店 —— 而占用撤不回。
-    (2026-08-16 所有者追问「执行会如何标记产品」时发现)
-
-    ⚠ 只数**属于该店自己**的占用:占用在 A、货在 B 的行不算 A 的预留
-    (那种情况是 B 该下架,见 `claim_audit`)。
+    ★ 候选池排除的是「已上架」,**不是「已占位」**(所有者定稿 2026-08-16:
+    「已占位和已上架是两回事…分配即占位」)。占位了但没上架的货,下一轮
+    照样要出现在方案表里 —— 否则方案表就成了增量,上一轮定下、还没执行的
+    上架指令**从表上消失了**,而那恰恰是所有者要照着做的东西。
+    ⚠ 规划外店(谭总系)的在架行不算:它们退出分配体系,不占任何品牌与产品,
+    同一个 ASIN 在那边在架不妨碍规划内的店上它(§六)。
     """
     from services import sku_asin
     with conn.cursor() as cur:
         cur.execute(_SQL_ONLINE_SKU)
-        live = {(store, a) for store, sku in cur.fetchall()
-                if (a := sku_asin.extract_asin(sku))}
-    out: Counter = Counter()
-    for asin, store in held_prod.items():
-        if (store, asin) not in live:
-            out[store] += 1
-    return dict(out)
+        rows = cur.fetchall()
+    return {a for store, sku in rows
+            if store in registered and not sv.is_excluded(store)
+            and (a := sku_asin.extract_asin(sku))}
 
 
 def _fit_to_store(grp: dict, st: dict) -> tuple[dict | None, int]:
@@ -238,7 +232,7 @@ def run(params: dict) -> str:
         held_brand = claims.load_active(conn, claims.BRAND)
         held_prod = claims.load_active(conn, claims.PRODUCT)
         pending = _pending_delist(conn, cfg, registered)
-        reserved = _reserved(conn, held_prod)
+        listed = _listed_asins(conn, registered)
 
     # ── 候选漏斗 ──────────────────────────────────────────────────────
     scored, gated = product_pool.score_all(data)
@@ -248,11 +242,14 @@ def run(params: dict) -> str:
     funnel = [("候选池", len(data["pool"])), ("过硬闸", len(scored))]
     live = [c for c in scored if c["score"] >= ps.CUTOFF]
     funnel.append((f"≥ 淘汰线 {ps.CUTOFF:.0f}", len(live)))
-    # 已占 ASIN:那是别人的货位,连定向流都不走(它已经在架上了)
-    live = [c for c in live if c["asin"] not in held_prod]
-    funnel.append(("去掉已占 ASIN", len(live)))
+    # ★ 排除的是**已在架**的,不是已占位的。占位了没上架的照常进池,
+    #   只是只能回它的占用店(见 alloc_groups.build 的 bound_asins)
+    live = [c for c in live if c["asin"] not in listed]
+    funnel.append(("去掉已在架 ASIN", len(live)))
 
-    g = alloc_groups.build(live, held_brand)
+    # 已占位但还没上架 ⇒ 绑定到占用店。这批是上一轮定了、还没执行的上架指令
+    bound = {a: s for a, s in held_prod.items() if a not in listed}
+    g = alloc_groups.build(live, held_brand, bound)
     free, directed = g["free"], g["directed"]
     grouped = [("组队后·自由流(牌堆)", len(free), sum(x["size"] for x in free)),
                ("组队后·定向流(已占品牌)", len(directed),
@@ -260,7 +257,7 @@ def run(params: dict) -> str:
 
     # ── 店铺配额 ─────────────────────────────────────────────────────
     metrics = store_perf.derive(perf_raw, days)
-    q = store_perf.quota_inputs(metrics, cfg, online_now, pending, reserved)
+    q = store_perf.quota_inputs(metrics, cfg, online_now, pending)
     stores: dict = {}
     for s, qq in q.items():
         if s not in registered or sv.is_excluded(s) or not qq.get("participates"):
@@ -434,13 +431,10 @@ def run(params: dict) -> str:
             L.append("  其中**货期**挡下的,按店:"
                      + " · ".join(f"{s} {n:,} 件" for s, n in slow.most_common(6))
                      + " —— 放宽该店「配送时长限制」或换货源才救得回,开类目没用")
-    if reserved:
-        # 不说破的话,"剩余容量怎么比上次少了"没人查得出来
-        L.append(f"  已占但**还没上架**的货位 {sum(reserved.values()):,} 个已从剩余容量里"
-                 f"扣掉(占用是「这个位置归你了」,在线数是「已经在架的」,"
-                 f"中间隔着一次上架):"
-                 + "、".join(f"{s} {n:,}" for s, n in
-                             Counter(reserved).most_common(6)))
+    if bound:
+        L.append(f"  其中 {len(bound):,} 个 ASIN 是**上一轮定了、还没上架**的,"
+                 f"本轮照常参与(只能回占用店)—— 占位不等于上架,方案表始终是"
+                 f"「现在该上什么」的完整清单,不是增量")
     if no_gap:
         L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额(或算不出货位值),"
                  f"**配额退回剩余容量** —— 它们能接多少全看容量,与经营水平无关:"

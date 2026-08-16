@@ -169,24 +169,21 @@ def derive(raw: dict, win_days: int) -> dict:
 
 
 def quota_inputs(metrics: dict, cfg: dict, online_now: dict,
-                 pending_delist: dict | None = None,
-                 reserved: dict | None = None) -> dict:
-    """输入:`derive()` 产物 + 限额表 + 当前在线数(+ 待下架数, + 已占未上架数)
-    → 输出:{店铺: {gap, room, room_now, reserved, eff, participates}}。
+                 pending_delist: dict | None = None) -> dict:
+    """输入:`derive()` 产物 + 限额表 + 当前在线数(+ 待下架数)
+    → 输出:{店铺: {gap, room, room_now, eff, participates}}。
 
     `room` **预支待下架名额**(所有者是一边下架一边上架的):不预支的话,
     一家马上要空出 300 个货位的店会被算成"满了",这一批一件都分不进去。
     ⚠ 预支只影响配额;`list_new` 真上架时的容量闸必须用 `room_now`
     (当前真实在线数),否则下架没做完就上架会真的超 `单店最大在线数`。
 
-    ★ `reserved` = **已占用但还没上架**的货位数。占用是"这个货位归你了",
-    而 `online_now` 数的是**已经在架的**——两者之间隔着一次真实上架。
-    不扣掉它的后果(2026-08-16 所有者追问"执行会如何标记产品"时发现):
-    `alloc_plan --execute` 落了三万条占用、货还没上,第二天再跑一次,它看到的
-    剩余容量**一点没变**,于是把同一批货位**再许诺一次** —— 已占 ASIN 会被
-    排除所以换了一批产品,但两批货加起来塞不进那些店。而占用撤不回。
+    ⚠ **占位不消耗容量,上架才消耗**(所有者定稿 2026-08-16:「已占位和已上架
+    是两回事…分配即占位」)。所以这里只减在架数,不减"已占未上架"——那批货
+    下一轮**照样进候选池**(只能回占用店),会重新走一遍分配、重新占这些位置。
+    两边都减就成了双重扣减,店铺容量会凭空少一大截。
     """
-    pending, held = pending_delist or {}, reserved or {}
+    pending = pending_delist or {}
     slot_med = _median([m["slot_value"] for m in metrics.values()
                         if m.get("slot_value")])
     out: dict[str, dict] = {}
@@ -199,14 +196,13 @@ def quota_inputs(metrics: dict, cfg: dict, online_now: dict,
         if target and target > 0 and daily is not None:
             gap = min(1.0, max(0.0, (target - daily) / target))
         cap, now = c.get("max_online"), int(online_now.get(store, 0))
-        res = int(held.get(store, 0))
-        room_now = max(0, int(cap) - now - res) if cap is not None else None
-        room = (max(0, int(cap) - (now + res - int(pending.get(store, 0))))
+        room_now = max(0, int(cap) - now) if cap is not None else None
+        room = (max(0, int(cap) - (now - int(pending.get(store, 0))))
                 if cap is not None else None)
         sv = m.get("slot_value")
         out[store] = {
             "gap": gap, "room": room, "room_now": room_now,
-            "pending_delist": int(pending.get(store, 0)), "reserved": res,
+            "pending_delist": int(pending.get(store, 0)),
             "eff": (min(2.0, sv / slot_med) if sv and slot_med else None),
             "participates": store_targets.accepts_allocation(c),
         }

@@ -463,42 +463,62 @@ def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
     assert "其中**类目**挡下的" not in out
 
 
-def test_claims_not_yet_listed_consume_room():
-    """⚠ 占用是「这个位置归你了」,在线数是「已经在架的」—— 中间隔着一次上架。
 
-    不扣掉这个差额的后果(2026-08-16 所有者追问「执行会如何标记产品」时发现):
-    --execute 落了三万条占用、货还没上,第二天再跑一次,剩余容量一点没变,
-    于是**把同一批货位再许诺一次**。已占 ASIN 会被排除所以换了一批产品,
-    但两批货加起来塞不进那些店 —— 而占用撤不回。
+
+# ── 占位 ≠ 上架(所有者定稿 2026-08-16)────────────────────────────────
+
+def test_claimed_but_unlisted_products_stay_in_the_pool():
+    """★ 所有者原话:「已占位和已上架是两回事…分配即占位」。
+
+    上一轮定了、货还没上的 ASIN **照常进候选池**,只是只能回占用店。
+    把它们剔掉的后果:方案表变成增量,上一轮的上架指令**从表上消失** ——
+    而那恰恰是所有者要照着做的东西。
+    """
+    from services import alloc_groups as ag
+    cands = [_c("B0AAAA0001", None, 90.0), _c("B0BBBB0002", None, 80.0)]
+    r = ag.build(cands, {}, {"B0AAAA0001": "A085"})
+    assert [g["key"] for g in r["free"]] == ["(无品牌):B0BBBB0002"]
+    assert len(r["directed"]) == 1 and r["directed"][0]["store"] == "A085"
+
+
+def test_a_claim_never_shrinks_the_stores_room():
+    """⚠ **占位不消耗容量,上架才消耗**。
+
+    两边都减就是双重扣减:那批货下一轮照样进池、重新占这些位置,而容量已经
+    被它们扣过一次了 —— 店铺容量会凭空少一大截。
     """
     from services import store_perf
     cfg = {"A": {"max_online": 1000, "gmv": 400.0}}
     m = {"A": {"slot_value": 1.0, "daily_net_own": 100.0}}
-    plain = store_perf.quota_inputs(m, cfg, {"A": 200})
-    withres = store_perf.quota_inputs(m, cfg, {"A": 200}, None, {"A": 300})
-    assert plain["A"]["room"] == 800 and plain["A"]["room_now"] == 800
-    assert withres["A"]["room"] == 500 and withres["A"]["room_now"] == 500
-    assert withres["A"]["reserved"] == 300
+    q = store_perf.quota_inputs(m, cfg, {"A": 200})
+    assert q["A"]["room"] == 800 and q["A"]["room_now"] == 800
 
 
-def test_reserved_counts_only_claims_whose_goods_are_not_yet_on_that_shelf():
-    """⚠ 只数**属于该店自己**的占用。
-
-    占用在 A、货在 B 的行不算 A 的预留 —— 那种情况是 B 该下架(claim_audit
-    专门报它),把它记成 A 的预留会白白吃掉 A 的容量。
-    """
+def test_pool_excludes_listed_not_claimed():
+    """候选池排除的是**已在架**的;规划外店(谭总系)的在架行不算。"""
     class _C:
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, *a, **k): pass
         def fetchall(self):
-            return [("A", "B0AAAA0001"),      # A 店已上架
-                    ("B", "B0CCCC0003")]      # 货在 B,占用却在 A
+            return [("A085", "B0AAAA0001"),      # 规划内、在架 → 排除
+                    ("谭总3", "B0BBBB0002"),      # 规划外 → 不排除
+                    ("没在册", "B0CCCC0003")]     # 不在册 → 不排除
 
     class _Conn:
         def cursor(self): return _C()
 
-    held = {"B0AAAA0001": "A",     # 已上架 → 不算预留
-            "B0BBBB0002": "A",     # 占了没上 → 算
-            "B0CCCC0003": "A"}     # 货在别人架上 → 仍算 A 的预留(A 那儿确实空着)
-    assert wf._reserved(_Conn(), held) == {"A": 2}
+    assert wf._listed_asins(_Conn(), {"A085", "谭总3"}) == {"B0AAAA0001"}
+
+
+def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
+    """组归 A、组里却有被 B 占着的 ASIN = 两条占用互相矛盾。
+
+    方案表不该写"把它上到 A"(落库时 claim_many 会拒掉并报冲突),所以剔掉
+    并计数 —— 让人看见有多少条占用打架,而不是等发现方案表里有条指令做不到。
+    """
+    from services import alloc_groups as ag
+    cands = [_c("B0AAAA0001", "acme", 90.0), _c("B0AAAA0002", "acme", 80.0)]
+    r = ag.build(cands, {"acme": "A"}, {"B0AAAA0002": "B"})
+    assert r["dropped"]["ASIN 占用与组归属矛盾"] == 1
+    assert [x["asin"] for x in r["directed"][0]["items"]] == ["B0AAAA0001"]

@@ -1,10 +1,12 @@
 """alloc_plan — 产品分配方案(§七)。**危险,默认 dry-run。**
 
 用法:
-  python cli.py alloc_plan                       # 首批 3000,只出方案表
+  python cli.py alloc_plan                          # 首批 3000,只出方案表
   python cli.py alloc_plan -p batch=10000
-  python cli.py alloc_plan -p as_of=2026-08-16   # 钉住销量窗口右端
-  python cli.py alloc_plan --execute             # 审完方案表才落占用
+  python cli.py alloc_plan -p directed_share=0.8    # 这一批多补已占品牌
+  python cli.py alloc_plan -p directed_share=0      # 这一批只拓新品牌
+  python cli.py alloc_plan -p as_of=2026-08-16      # 钉住销量窗口右端
+  python cli.py alloc_plan --execute                # 审完方案表才落占用
 
 把候选池打分、组队、切批、发牌,产出**分配方案表**。`--execute` 只做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
@@ -18,10 +20,13 @@
   50 万、配额才 3 万,整池分层等于让层内上限把货摊到第 8 层去,慢 20 倍、
   未发清单 27 万行,而**发出去的还是那批 top 货**。实测切 `批量×1.5`
   与整池逐字同结果(§7.4b)。
-· **定向流不进分层,但优先吃批量**:品牌已被占用的组只能去占用店(强制路由,
-  它没得选),过不了那店的硬闸就整组淘汰(§7.3);容量够而本批额度用完的
-  **排队等下一批**,与"去不了"分开计数 —— 前者加大 `-p batch=` 就能发,
-  后者要你去改配置或释放品牌。自由流分的是定向流吃剩的那部分批量。
+· **两条流分账,谁也不许把对方饿死**:定向流(补齐已占品牌)最多吃
+  `批量 × directed_share`(默认 50%),自由流(拓新品牌)拿其余 —— 一方吃不满时
+  另一方取走余额。⚠ 这是**上限**不是优先级:实测不设上限时定向流一口吃光
+  3,000 批量、自由流 0,而后面还排着 27,208 件,要十批之后自由流才轮得到。
+  定向流不进分层(强制路由),类目**按件筛**而非整组淘汰;容量够而额度用完的
+  **排队等下一批**,与"去不了占用店"分开计数 —— 前者加大 `-p batch=` 就能发,
+  后者要你去改配置或释放品牌。
 
 **只写占用,不碰沃尔玛。** 上架由 list_new 按自己的节奏执行。
 """
@@ -48,6 +53,13 @@ SOURCE = "alloc_plan"
 # 池子刚好够数就没有腾挪余地 —— 实测切到 1.0× 时少发 7.5% 且顶层比值有
 # 两家越界(轮到某店时它能接的货已被前面挑光)。1.5× 与整池同结果。
 HEADROOM = 1.5
+
+# 定向流最多吃批量的这个比例。**不是"优先"而是"分账"**:定向流(补齐已占品牌)
+# 与自由流(拓新品牌)是两件不同的事,谁也不该把对方饿死。
+# 实测 2026-08-16:不设上限时定向流一口吃光 3,000 批量、自由流 0,而后面还排着
+# 27,208 件 —— 按每批 3,000 算要十批之后自由流才轮得到。
+# 一方吃不满时另一方**可以取走余额**(不浪费批量),所以这是上限不是配额。
+DIRECTED_SHARE = 0.5
 
 # 当前在线数(容量闸的分子)。⚠ 口径与 `alloc_stores._SQL_ONLINE_NOW`、
 # KPI 表的 items_online 逐字一致(不筛 lifecycle)—— 三处必须同源,否则
@@ -127,6 +139,9 @@ def run(params: dict) -> str:
     """输入:params(batch/days/as_of/export/execute)→ 输出:方案摘要。"""
     execute = bool(params.get("execute"))
     batch = int(params.get("batch", 3000))
+    dir_share = float(params.get("directed_share", DIRECTED_SHARE))
+    if not 0.0 <= dir_share <= 1.0:
+        return f"⛔ directed_share 要落在 [0, 1],给的是 {dir_share}"
     days = int(params.get("days", 90))
     win = sv.sales_window(str(params.get("as_of", "")), days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
@@ -191,6 +206,7 @@ def run(params: dict) -> str:
     #   ② **也吃批量**。所有者要的是"这一批上 N 个货位",定向流不受批量约束的话,
     #      写 batch=3000 会落 4 万条占用 —— 而占用撤不回。定向流优先(它没得选),
     #      吃剩的才归自由流。
+    dir_budget = int(batch * dir_share)
     used: Counter = Counter()
     dir_ok, dir_out, dir_wait = [], [], []
     dir_trim = 0
@@ -210,7 +226,7 @@ def run(params: dict) -> str:
             dir_out.append((orig, "过不了占用店的类目/渠道闸"))
         elif used[grp["store"]] + grp["size"] > st["room"]:
             dir_out.append((grp, "占用店容量不足"))
-        elif sum(used.values()) + grp["size"] > batch:
+        elif sum(used.values()) + grp["size"] > dir_budget:
             # 容量够、只是这一批的额度用完了 —— 与"去不了"分开计数:
             # 前者下一批照样能发,后者要所有者去改配置或释放品牌
             dir_wait.append(grp)
@@ -255,10 +271,11 @@ def run(params: dict) -> str:
     placed_items = sum(v["items"] for v in result["by_store"].values())
     L = ["", "═══ 分配方案 ═══", "",
          f"▍批量 {batch:,} 货位 = 定向流 {dir_items:,} + 自由流 {placed_items:,}"
-         f";自由流候选切口 {cut:,} 组(剩余批量 ×{HEADROOM})"
          f";销量窗口 {win['day']} 往前 {days} 天",
-         "  定向流(品牌已被占用)**优先吃批量** —— 它没得选,只能回占用店;"
-         "剩下的才轮到自由流"]
+         f"  定向流(补齐已占品牌)上限 {dir_budget:,} = 批量 ×{dir_share:.0%}"
+         f"(`-p directed_share=` 可调);自由流(拓新品牌)分到 {free_batch:,},"
+         f"候选切口 {cut:,} 组(×{HEADROOM})",
+         "  两条流是不同的事,谁也不该把对方饿死 —— 一方吃不满时另一方取走余额"]
     L += ["", "▍候选漏斗(前四行单位是**产品**,后两行是**组**——别拿组数除产品数)"]
     L += textfmt.table(
         ["", "产品", "占候选池", "组"],
@@ -343,11 +360,18 @@ def run(params: dict) -> str:
 
     if export:
         paths.reports_dir().mkdir(parents=True, exist_ok=True)
-        p = _write_plan(result["assign"], dir_ok, result["unplaced"],
-                        dir_out, dir_wait)
-        L += ["", f"▍方案表 → {p}",
+        # ⚠ **要动手的**和**诊断用的**分两张表。合成一张的实测后果:批量 3,000
+        # 却出了 48,816 行,其中 45,815 行是排队与淘汰 —— 那张表没法用,而所有者
+        # 第一眼看到的就是那个总行数。摘要里两个数都报,不存在"藏起来"的问题
+        p_plan, n_plan = _write_plan(result["assign"], dir_ok)
+        p_out, n_out = _write_rejects(result["unplaced"], dir_out, dir_wait)
+        L += ["", f"▍要上架的 {n_plan:,} 行 → {p_plan}",
               "  逐产品一行(品牌组 / 组分 / 去向店 / 逐段得分 / 层号 / 流别)。"
-              "**先看上面三个验收指标再看明细** —— 一家独吞是参数错了,不是模型判断"]
+              "**先看上面的验收指标再看明细** —— 一家独吞是参数错了,不是模型判断"]
+        if n_out:
+            L += [f"▍没进这一批的 {n_out:,} 行 → {p_out}",
+                  "  「排队」下一批加大 batch 就能发;「淘汰」要你改配置或释放品牌;"
+                  "「未发出」看原因列"]
 
     if not execute:
         L += ["", f"🧪 dry-run:未落任何占用。审完方案表后加 --execute"
@@ -390,32 +414,52 @@ def _prod_claims(grp: dict, store: str) -> list:
             for it in grp["items"]]
 
 
-def _write_plan(assign, dir_ok, unplaced, dir_out, dir_wait=()) -> str:
+_HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类",
+           "渠道", "ASIN", "产品分", "口碑分", "销量加分", "罚分",
+           "罚分原因", "近期销量", "评分", "评论数", "配送天数"]
+
+
+def _write_plan(assign, dir_ok) -> tuple[str, int]:
+    """输入:发牌结果 + 定向流 → 输出:(路径, 产品行数)。**只放要上架的。**"""
     p = paths.reports_dir() / "alloc_分配方案.csv"
+    n = 0
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类",
-                    "渠道", "ASIN", "产品分", "口碑分", "销量加分", "罚分",
-                    "罚分原因", "近期销量", "评分", "评论数", "配送天数"])
+        w.writerow(_HEADER)
         for a in sorted(assign, key=lambda x: (x["layer"], -x["group"]["score"])):
-            _rows(w, "自由流", a["store"], a["layer"], a["group"])
+            n += _rows(w, "自由流", a["store"], a["layer"], a["group"])
         for grp in sorted(dir_ok, key=lambda x: -x["score"]):
-            _rows(w, "定向流", grp["store"], "", grp)
-        for u in unplaced:
-            _rows(w, f"未发出({ae.REASON_LABEL[u['reason']]})", "", "", u["group"])
-        for grp, why in dir_out:
-            _rows(w, f"定向流淘汰({why})", grp["store"], "", grp)
-        # 排队的也要进表:所有者看的是"这一批之外还压着多少",
-        # 不写的话他只会看到"分了 3000 件",不知道后面还有一堆等着
+            n += _rows(w, "定向流", grp["store"], "", grp)
+    return str(p), n
+
+
+def _write_rejects(unplaced, dir_out, dir_wait) -> tuple[str, int]:
+    """输入:三类没进这一批的 → 输出:(路径, 产品行数)。
+
+    与方案表分开,是因为它们的处置**完全不同**:排队的下一批加大 batch 就能发,
+    淘汰的要所有者改配置或释放品牌。混在一张表里,3,000 行要动手的会被 45,815 行
+    诊断淹掉(2026-08-16 实测:所有者第一眼看到的就是 48,816 这个总行数)。
+    """
+    p = paths.reports_dir() / "alloc_未入选.csv"
+    n = 0
+    with p.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(_HEADER)
         for grp in dir_wait:
-            _rows(w, "定向流排队(本批额度用完)", grp["store"], "", grp)
-    return str(p)
+            n += _rows(w, "定向流排队(本批额度用完)", grp["store"], "", grp)
+        for grp, why in dir_out:
+            n += _rows(w, f"定向流淘汰({why})", grp["store"], "", grp)
+        for u in unplaced:
+            n += _rows(w, f"未发出({ae.REASON_LABEL[u['reason']]})", "", "",
+                       u["group"])
+    return str(p), n
 
 
-def _rows(w, flow, store, layer, grp):
+def _rows(w, flow, store, layer, grp) -> int:
     for it in grp["items"]:
         w.writerow([flow, store, layer, grp["key"], round(grp["score"], 1),
                     grp["size"], grp["category"], grp["channel"], it["asin"],
                     round(it["score"], 1), round(it["base"], 1),
                     round(it["bonus"], 1), round(it["penalty"], 1), it["why"],
                     it["sales"], it["rating"], it["reviews"], it["lead"]])
+    return len(grp["items"])

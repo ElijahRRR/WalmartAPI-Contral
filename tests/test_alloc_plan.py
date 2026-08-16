@@ -122,25 +122,34 @@ def test_plan_csv_lists_every_product_not_every_group(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     items = [_c("B0AAAA0001", "acme", 90.0), _c("B0AAAA0002", "acme", 80.0)]
-    p = wf._write_plan([{"group": _grp("acme", "acme", items), "store": "A",
-                         "layer": 1, "tier": 1}], [], [], [])
+    p, n = wf._write_plan([{"group": _grp("acme", "acme", items), "store": "A",
+                            "layer": 1, "tier": 1}], [])
     body = open(p, encoding="utf-8-sig").read().splitlines()
-    assert len(body) == 3                      # 表头 + 2 个产品
+    assert n == 2 and len(body) == 3           # 表头 + 2 个产品
     assert "B0AAAA0001" in body[1] and "B0AAAA0002" in body[2]
 
 
-def test_plan_csv_also_carries_the_ones_that_did_not_make_it(tmp_path, monkeypatch):
-    """未发出与定向流淘汰**必须进同一张表**。
+def test_plan_table_holds_only_what_you_act_on(tmp_path, monkeypatch):
+    """⚠ 要动手的与诊断用的**分两张表**。
 
-    分开放的话,所有者看到的是"分了 3000 件",而不知道有多少货因为
-    没人开这个大类而卡住 —— 那才是他能动手改的东西。
+    合成一张的实测后果(2026-08-16):批量 3,000 却出了 48,816 行,其中
+    45,815 行是排队与淘汰 —— 那张表没法用,而所有者第一眼看到的就是那个总数。
+    摘要里两个数都报,所以不存在"把卡住的货藏起来"的问题。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    ok = _grp("acme", "acme", [_c("B0AAAA0001", "acme", 90.0)])
     g = _grp("zeta", "zeta", [_c("B0BBBB0001", "zeta", 50.0)])
-    p = wf._write_plan([], [], [{"group": g, "reason": wf.ae.NO_GATE}],
-                       [(dict(g, store="A085"), "占用店容量不足")])
-    text = open(p, encoding="utf-8-sig").read()
-    assert "未发出" in text and "定向流淘汰" in text and "占用店容量不足" in text
+    p_plan, n_plan = wf._write_plan([], [dict(ok, store="A")])
+    p_out, n_out = wf._write_rejects([{"group": g, "reason": wf.ae.NO_GATE}],
+                                     [(dict(g, store="A085"), "占用店容量不足")],
+                                     [dict(g, store="A085")])
+    plan = open(p_plan, encoding="utf-8-sig").read()
+    out = open(p_out, encoding="utf-8-sig").read()
+    assert n_plan == 1 and "B0AAAA0001" in plan
+    assert "B0BBBB0001" not in plan          # 诊断行不许混进要动手的那张
+    assert n_out == 3
+    assert "未发出" in out and "定向流淘汰" in out and "排队" in out
+    assert "占用店容量不足" in out
 
 
 def test_dangerous_and_defaults_to_dry_run():
@@ -382,3 +391,44 @@ def test_store_with_no_category_limit_takes_everything():
            "items": [_c("B0AAAA0001", "acme", 80.0, cat="厨房"),
                      _c("B0AAAA0002", "acme", 70.0, cat="家居")]}
     assert wf._fit_to_store(grp, {"categories": []}) == (grp, 0)
+
+
+def test_directed_flow_cannot_starve_the_free_flow(monkeypatch, tmp_path):
+    """⚠ 定向流是**上限**不是优先级。
+
+    实测 2026-08-16:不设上限时定向流一口吃光 3,000 批量、自由流 0,而后面
+    还排着 27,208 件 —— 按每批 3,000 算要十批之后自由流才轮得到。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 定向流管够(100 个已占品牌各 5 件),自由流也管够
+    pool = ([_c(f"B0DIR{i:05d}", f"held{i // 5}", 90.0) for i in range(500)]
+            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
+    held = {f"held{i}": "A" for i in range(100)}
+    _wire_directed(monkeypatch, pool, held, room=100_000)
+    out = wf.run({"batch": 100, "execute": False})
+    head = [x for x in out.splitlines() if x.startswith("▍批量")][0]
+    assert "定向流 50" in head and "自由流" in head
+    assert "自由流 0" not in head
+
+
+def test_directed_share_is_configurable_and_validated(monkeypatch, tmp_path):
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = ([_c(f"B0DIR{i:05d}", f"held{i // 5}", 90.0) for i in range(500)]
+            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
+    _wire_directed(monkeypatch, pool, {f"held{i}": "A" for i in range(100)},
+                   room=100_000)
+    out = wf.run({"batch": 100, "directed_share": "0", "execute": False})
+    assert "定向流 0" in out                       # 全给自由流
+    assert "directed_share 要落在" in wf.run({"directed_share": "1.5"})
+
+
+def test_free_flow_takes_the_leftover_when_directed_underuses_its_share(
+        monkeypatch, tmp_path):
+    """一方吃不满时另一方取走余额 —— 上限不该变成浪费。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = ([_c("B0DIR00001", "held0", 90.0)]                    # 定向流只有 1 件
+            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
+    _wire_directed(monkeypatch, pool, {"held0": "A"}, room=100_000)
+    out = wf.run({"batch": 100, "execute": False})
+    head = [x for x in out.splitlines() if x.startswith("▍批量")][0]
+    assert "定向流 1 +" in head and "自由流 99" in head

@@ -301,20 +301,31 @@ def _deal_tier(pool: list, here: dict, got: dict, assign: list,
     return left, hist
 
 
+# 自由流接货少于这个数的店不出比值:分母太小时比值噪声大过信号,
+# 硬报一个数只会让人去追一个不存在的问题
+MIN_FREE_FOR_RATIO = 20
+
+
 def acceptance(result: dict, top_layers: int = 1,
                rotation_only: bool = True) -> dict:
-    """输入:`deal()` 产物 → 输出:§7.4b 的三个验收指标(逐店)。
+    """输入:`deal()` 产物 → 输出:§7.4b 的验收指标(逐店)。
 
-    **必须进方案表,不是"希望如此"**:一家独大 = 参数错了,不是"模型判断"。
+    **顶层比值 = 「这家店拿到的自由流货里,顶层占多大比例」÷「全体的同一比例」**
+    —— 直接回答所有者那句「好货有没有堆到一家店」:1.0 = 这家店的货**质量构成**
+    与平均一致;1.5 = 它拿到的好货比例是平均的一倍半。
+
+    ⚠ **分母是"它自己拿到的自由流总量",不是配额**(2026-08-16 第三版,前两版
+    都在骗人)。拿配额当分母时:
+      · 定向流把一家店填满 ⇒ 自由流分子接近 0、分母仍是全配额 ⇒ 比值 0.00,
+        被标"越界",而它根本没参与竞争(A142 实测 0.00,分到的 1,909 全是定向);
+      · 层内上限按**总接货量**算,定向流吃掉 L1 的名额后,这家店的自由流只能
+        从下面几层拿 ⇒ 比值又偏低(C017 实测 0.50)。
+    这两种都不是"参数没调对",而是分母选错了。改成"自己的总量"之后,比值
+    与配额、容量、定向流体量全部无关,**只量质量构成**,这才是那句话的意思。
+
+    ⚠ 自由流接货 < `MIN_FREE_FOR_RATIO` 的店**不出比值**(返回 None):分母太小
+    时比值噪声大过信号,硬报一个数只会让人去追一个不存在的问题。
     `top_layers` 决定"好货"算到第几层(默认只算 L1)。
-
-    ⚠ 分子分母**必须同单位**(都是货位)。`by_layer` 数组数、`quota` 是货位的话,
-    比值量的是"这家店拿到的组平均多大",跟公不公平没关系 —— 生产实测里
-    0.16 与 2.05 并存,全是这一个原因。
-    ⚠ `rotation_only`(默认开):**只算参与了轮转的那部分**。绑定单店的牌
-    (定向流)跳过排队直奔占用店,参数管不着它 —— 算进去等于拿一个调不动的量
-    去判"参数没调对"(2026-08-16 实测:4 家"越界"的店,分到的货几乎全是定向流)。
-    要看含定向流的总体集中度,传 False。
     """
     by = result["by_store"]
     key = "by_layer_free" if rotation_only else "by_layer"
@@ -322,19 +333,24 @@ def acceptance(result: dict, top_layers: int = 1,
     tot_i = sum(v["items"] for v in by.values())
     top = {s: sum(n for li, n in (v.get(key) or {}).items() if li <= top_layers)
            for s, v in by.items()}
-    tot_top = sum(top.values())
+    # 该店参与竞争的总量(默认口径:自由流全部层)
+    mine = {s: (sum((v.get(key) or {}).values()) if rotation_only else v["items"])
+            for s, v in by.items()}
+    tot_top, tot_mine = sum(top.values()), sum(mine.values())
+    base = (tot_top / tot_mine) if tot_mine else 0.0   # 全体的顶层占比
     out = {}
     for s, v in by.items():
         qs = v["quota"] / tot_q if tot_q else 0.0
-        ts = top[s] / tot_top if tot_top else 0.0
+        enough = mine[s] >= MIN_FREE_FOR_RATIO
         out[s] = {
             "quota_share": qs,
-            "top_groups": top[s],
-            "top_share": ts,
-            # 好货占比 ÷ 配额占比:落 [0.7, 1.3] 才算摊开了
-            "top_ratio": (ts / qs) if qs else None,
+            "top_items": top[s],
+            "own_items": mine[s],
+            # 这家店货里顶层的占比 ÷ 全体的同一比例;量太少时不给数
+            "top_ratio": ((top[s] / mine[s]) / base
+                          if enough and base and mine[s] else None),
             "batch_share": (v["items"] / tot_i) if tot_i else 0.0,
-            # 单店接货量不得超 1.5 × 配额占比
+            # 单店接货量不得超 1.5 × 配额占比(这条仍按配额,它量的是"总量独吞")
             "over_cap": bool(tot_i and qs and v["items"] / tot_i > 1.5 * qs),
         }
     return out

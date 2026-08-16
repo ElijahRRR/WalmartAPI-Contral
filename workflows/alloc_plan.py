@@ -361,7 +361,8 @@ def run(params: dict) -> str:
         rows_tbl.append([s, f"{stores[s]['room']:,}", f"{stores[s]['quota']:,}",
                          f"{got:,}", f"{dir_by_store[s]:,}",
                          f"{stores[s]['room'] - got:,}",
-                         f"{a.get('top_ratio') or 0:.2f}",
+                         ("—" if a.get("top_ratio") is None
+                          else f"{a['top_ratio']:.2f}"),
                          basis[s],
                          "⚠ 独吞" if a.get("over_cap") else
                          ("⚠ 顶层越界" if a.get("top_ratio") is not None
@@ -369,11 +370,13 @@ def run(params: dict) -> str:
     L += textfmt.table(["店铺", "剩余容量", "本轮配额", "分到", "其中定向",
                         "分完还剩", "顶层比值", "配额依据", ""],
                        rows_tbl, align="<>>>>>><<")
-    L.append("  顶层比值 = 「L1 里**自由流**拿到的货位占比」÷「配额占比」(同单位),"
-             "**要落 [0.7, 1.3]**;越界就是参数没调对,不是模型判断(§7.4b)")
-    L.append("  ⚠ 指标**只算自由流**:定向流的牌只有占用店能要,跳过排队直奔它 ——"
-             "参数管不着,算进去等于拿一个调不动的量去判「参数没调对」。"
-             "「其中定向」那列自己看集中度")
+    L.append("  顶层比值 = 「这家店拿到的**自由流**货里顶层占多大比例」÷"
+             "「全体的同一比例」—— 1.0 = 质量构成与平均一致,1.5 = 好货比例是"
+             "平均的一倍半。**要落 [0.7, 1.3]**(§7.4b)")
+    L.append(f"  ⚠ 分母是**它自己拿到的自由流总量**,不是配额:定向流只有占用店"
+             f"能要、跳过排队,拿配额当分母会让被定向流填满的店比值趋近 0 而被"
+             f"误标越界。自由流不足 {ae.MIN_FREE_FOR_RATIO} 件的店不出比值(—)。"
+             f"总量独吞看「分到」与「本轮配额」两列")
     over = [s for s in stores if result["by_store"].get(s, {}).get("items", 0)
             > stores[s]["quota"]]
     if over:

@@ -113,18 +113,18 @@ def test_layer_cap_stops_thin_category_coverage_from_eating_the_top_layer():
     这里把它压成最小复现:好货全是「宠物」而只有 P 店收宠物,
     没有层内上限的话 P 在 L1 就把配额吃光了。
     """
-    groups = ([_g(f"p{i}", 100.0 - i, category="宠物") for i in range(10)]
-              + [_g(f"h{i}", 80.0 - i, category="家居") for i in range(20)])
-    stores = {"P": _s(10, categories=["宠物", "家居"]),
-              "H1": _s(10, categories=["家居"]), "H2": _s(10, categories=["家居"])}
+    groups = ([_g(f"p{i:02d}", 100.0 - i, category="宠物") for i in range(50)]
+              + [_g(f"h{i:03d}", 40.0 - i * 0.1, category="家居") for i in range(100)])
+    stores = {"P": _s(50, categories=["宠物", "家居"]),
+              "H1": _s(50, categories=["家居"]), "H2": _s(50, categories=["家居"])}
     loose = ae.deal(groups, stores, thickness=0.5, slack=99)   # 松弛拉大 = 等于没上限
     tight = ae.deal(groups, stores, thickness=0.5, slack=1.3)
     l1 = lambda r: r["by_store"]["P"]["by_layer"][1]           # noqa: E731
-    assert l1(loose) == 10 and l1(tight) < 10
+    assert l1(loose) == 50 and l1(tight) < 50
     a_loose, a_tight = ae.acceptance(loose), ae.acceptance(tight)
     assert a_tight["P"]["top_ratio"] < a_loose["P"]["top_ratio"]
     # ★ 而且**一件都没少发** —— 上限只改时机不改总量,详见下一条
-    assert len(loose["assign"]) == len(tight["assign"]) == 30
+    assert len(loose["assign"]) == len(tight["assign"]) == 150
 
 
 def test_capped_groups_are_retried_at_the_next_layer_not_after_all_of_them():
@@ -228,14 +228,14 @@ def test_tier2_only_gets_what_tier1_could_not_take():
 
 def test_acceptance_metrics_flag_a_hoarder():
     """验收指标必须真的会亮红 —— 恒绿的指标等于没有指标。"""
-    groups = [_g(f"g{i}", 100.0 - i) for i in range(20)]
-    r = ae.deal(groups, {"A": _s(10), "B": _s(10)}, thickness=0.5)
+    groups = [_g(f"g{i:03d}", 100.0 - i) for i in range(100)]
+    r = ae.deal(groups, {"A": _s(50), "B": _s(50)}, thickness=0.5)
     m = ae.acceptance(r)
     assert all(0.7 <= v["top_ratio"] <= 1.3 for v in m.values())
     assert not any(v["over_cap"] for v in m.values())
     # 人为造一个独吞:B 只收宠物,货全是家居
-    r2 = ae.deal([_g(f"g{i}", 100.0 - i) for i in range(20)],
-                 {"A": _s(10), "B": _s(10, categories=["宠物"])}, thickness=0.5)
+    r2 = ae.deal(groups, {"A": _s(50), "B": _s(50, categories=["宠物"])},
+                 thickness=0.5)
     assert ae.acceptance(r2)["A"]["over_cap"] is True
 
 
@@ -327,13 +327,12 @@ def test_acceptance_ignores_store_bound_groups_by_default():
     "参数没调对",只会让人去改根本不相干的旋钮。
     """
     # A 的配额全被绑定它的牌吃掉;B 靠自由流拿同样多
-    groups = ([_g(f"bound{i}", 100.0 - i, store="A") for i in range(10)]
-              + [_g(f"free{i}", 99.5 - i) for i in range(10)])
-    r = ae.deal(groups, {"A": _s(10), "B": _s(10)}, thickness=1.0)
-    assert r["by_store"]["A"]["bound_items"] == 10
-    rot = ae.acceptance(r)                       # 默认只算轮转
-    allx = ae.acceptance(r, rotation_only=False)
-    # 只算自由流:A 一件都没靠轮转拿到,B 拿满 —— 比值 0 vs 2
-    assert rot["A"]["top_ratio"] == 0.0 and rot["B"]["top_ratio"] == 2.0
-    # 含定向流:两家一样多,看不出 A 的位置是被强制路由填的
-    assert allx["A"]["top_ratio"] == allx["B"]["top_ratio"] == 1.0
+    groups = ([_g(f"bound{i:02d}", 100.0 - i, store="A") for i in range(50)]
+              + [_g(f"free{i:02d}", 49.5 - i * 0.1) for i in range(50)])
+    r = ae.deal(groups, {"A": _s(50), "B": _s(50)}, thickness=1.0)
+    assert r["by_store"]["A"]["bound_items"] == 50
+    rot = ae.acceptance(r)
+    # A 一件自由流都没拿到 ⇒ **不出比值**,而不是报个 0.00 去误标"越界"
+    assert rot["A"]["top_ratio"] is None and rot["A"]["own_items"] == 0
+    # B 全靠自由流,质量构成就是全体本身 ⇒ 1.0
+    assert rot["B"]["top_ratio"] == 1.0

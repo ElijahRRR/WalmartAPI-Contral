@@ -331,3 +331,54 @@ def test_waiting_and_rejected_directed_groups_are_counted_apart(monkeypatch, tmp
     _wire_directed(monkeypatch, pool, held, room=100_000)
     out = wf.run({"batch": 2, "execute": False})
     assert "排队等下一批" in out and "去不了" in out
+
+
+def test_directed_flow_keeps_the_items_the_claiming_store_can_take(monkeypatch, tmp_path):
+    """⚠ 定向流按**件**筛,不整组淘汰。
+
+    所有者 2026-08-16 追问"定向流淘汰是什么意思"时发现的:组大类取的是件数
+    多数派,所以一个品牌 60% 厨房 / 40% 家居,组大类 = 厨房 → 只做家居的
+    占用店整组拒收,**连里面那 40% 本来能上架的家居商品一起**。
+    去向店已被品牌占用固定死,不存在"该给谁"的竞争,按件筛是良定义的。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    items = ([_c(f"B0KIT{i:05d}", "acme", 80.0, cat="厨房") for i in range(6)]
+             + [_c(f"B0HOM{i:05d}", "acme", 70.0, cat="家居") for i in range(4)])
+    _wire_directed(monkeypatch, items, {"acme": "A"}, room=100_000)
+    landed = []
+    monkeypatch.setattr(wf.claims, "claim_many",
+                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
+    out = wf.run({"batch": 100, "execute": True})
+    assert "按件筛掉 6 件" in out
+    keys = {r["claim_key"] for r in landed}
+    assert keys == {f"B0HOM{i:05d}" for i in range(4)}     # 4 件家居照常发
+
+
+def test_fit_to_store_returns_none_when_nothing_survives():
+    """一件都留不下才算真淘汰 —— 返回 None,由调用方归进"去不了"那一类。"""
+    grp = {"key": "acme", "brand": "acme", "score": 80.0, "size": 2,
+           "category": "厨房", "channel": "FBA", "store": "A",
+           "items": [_c("B0AAAA0001", "acme", 80.0, cat="厨房"),
+                     _c("B0AAAA0002", "acme", 70.0, cat="厨房")]}
+    assert wf._fit_to_store(grp, {"categories": ["家居"]}) == (None, 2)
+
+
+def test_fit_to_store_recomputes_score_and_category_after_trimming():
+    """剪完要重算组分与组大类,否则方案表上写的是被剪掉那批的属性。"""
+    grp = {"key": "acme", "brand": "acme", "score": 95.0, "size": 3,
+           "category": "厨房", "channel": "FBA", "store": "A",
+           "items": [_c("B0AAAA0001", "acme", 95.0, cat="厨房"),
+                     _c("B0AAAA0002", "acme", 60.0, cat="家居"),
+                     _c("B0AAAA0003", "acme", 50.0, cat="家居")]}
+    kept, trimmed = wf._fit_to_store(grp, {"categories": ["家居"]})
+    assert trimmed == 1 and kept["size"] == 2
+    assert kept["score"] == 60.0 and kept["category"] == "家居"
+
+
+def test_store_with_no_category_limit_takes_everything():
+    """三列全空 = 不限制(store_targets.allowed 的口径),一件都不剪。"""
+    grp = {"key": "acme", "brand": "acme", "score": 80.0, "size": 2,
+           "category": "厨房", "channel": "FBA", "store": "A",
+           "items": [_c("B0AAAA0001", "acme", 80.0, cat="厨房"),
+                     _c("B0AAAA0002", "acme", 70.0, cat="家居")]}
+    assert wf._fit_to_store(grp, {"categories": []}) == (grp, 0)

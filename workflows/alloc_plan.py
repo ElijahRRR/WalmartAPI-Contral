@@ -91,6 +91,38 @@ def _pending_delist(conn, cfg, registered) -> dict:
     return dict(out)
 
 
+def _fit_to_store(grp: dict, st: dict) -> tuple[dict | None, int]:
+    """输入:定向流的组 + 占用店 → 输出:(该店收得了的那部分, 被剪掉的件数)。
+
+    **只用于定向流**:去向店已被品牌占用固定死,不存在"该给谁"的竞争,所以按件
+    筛是良定义的、且严格更划算。自由流不许这么做 —— 那边组的完整性参与竞争
+    (组分、size 都会变),按件筛等于让同一个品牌在不同店之间被拆开,破坏排他。
+
+    渠道整组同进退(建组时已按多数派统一过);类目逐件判 —— 一个品牌横跨两个
+    大类时,占用店收得了的那部分**本来就能上架**,不该被组里的多数派连累。
+    全被剪光返回 (None, 原件数)。
+    """
+    ok = [it for it in grp["items"]
+          if store_targets.allowed(st_cfg(st), it["category"])]
+    if not ok:
+        return None, grp["size"]
+    if len(ok) == len(grp["items"]):
+        return grp, 0
+    return {**grp, "items": ok, "size": len(ok),
+            "score": max(x["score"] for x in ok),
+            "category": alloc_groups._major(x["category"] for x in ok)}, \
+        grp["size"] - len(ok)
+
+
+def st_cfg(st: dict) -> dict:
+    """输入:引擎口径的店铺行 → 输出:`store_targets.allowed` 认得的配置行。
+
+    两处对类目的表示必须走同一个判定函数,不能在这里另写 `in` —— 「三列全空 =
+    不限制」这条正着写反着写都像对的,判定只留一处(store_targets.allowed)。
+    """
+    return {"categories": st.get("categories") or []}
+
+
 def run(params: dict) -> str:
     """输入:params(batch/days/as_of/export/execute)→ 输出:方案摘要。"""
     execute = bool(params.get("execute"))
@@ -161,11 +193,21 @@ def run(params: dict) -> str:
     #      吃剩的才归自由流。
     used: Counter = Counter()
     dir_ok, dir_out, dir_wait = [], [], []
-    for grp in sorted(directed, key=lambda x: (-x["score"], x["key"])):
-        st = stores.get(grp["store"])
-        if not st or not ae._gate(grp, grp["store"], st):
-            dir_out.append((grp, "占用店本批不接货" if not st
-                            else "过不了占用店的类目/渠道闸"))
+    dir_trim = 0
+    for orig in sorted(directed, key=lambda x: (-x["score"], x["key"])):
+        st = stores.get(orig["store"])
+        if not st:
+            dir_out.append((orig, "占用店本批不接货"))
+            continue
+        # ★ 定向流按**件**筛,不整组淘汰(§7.3 那句"整组淘汰"写的是自由流的
+        #   竞争场景)。这里去向店已经被品牌占用**固定死**了,没有"该给谁"
+        #   的问题,所以留下该店收得了的那些件、其余才淘汰。
+        #   不这么做的话:一个品牌 60% 厨房 / 40% 家居,组大类取多数派=厨房,
+        #   只做家居的占用店会把**那 40% 本来能上架的家居商品一起拒掉**。
+        grp, trimmed = _fit_to_store(orig, st)
+        dir_trim += trimmed
+        if grp is None:
+            dir_out.append((orig, "过不了占用店的类目/渠道闸"))
         elif used[grp["store"]] + grp["size"] > st["room"]:
             dir_out.append((grp, "占用店容量不足"))
         elif sum(used.values()) + grp["size"] > batch:
@@ -265,15 +307,32 @@ def run(params: dict) -> str:
         L.append("  未发出 " + f"{len(result['unplaced']):,} 组:"
                  + " · ".join(f"{ae.REASON_LABEL[k]} {v:,}"
                               for k, v in why.most_common()))
+    if dir_trim:
+        L.append(f"  定向流按件筛掉 {dir_trim:,} 件(品牌的类目跨度比占用店的准入宽);"
+                 f"**同组里占用店收得了的那些件照常发** —— 不因为组里多数派是别的"
+                 f"大类就整组扔掉")
     if dir_wait:
         L.append(f"  定向流还有 {len(dir_wait):,} 组 / "
                  f"{sum(x['size'] for x in dir_wait):,} 个货位**排队等下一批**"
                  f"(容量够,只是本批额度用完了)—— 加大 -p batch= 就能一次多上些")
     if dir_out:
-        L.append(f"  定向流淘汰 {len(dir_out):,} 组(品牌已被占,但**去不了**占用店):"
+        L.append(f"  定向流淘汰 {len(dir_out):,} 组 / "
+                 f"{sum(x['size'] for x, _ in dir_out):,} 件"
+                 f"(品牌已被占,但**去不了**占用店):"
                  + " · ".join(f"{k} {v}" for k, v in
                               Counter(w for _, w in dir_out).most_common())
                  + " —— 这批要你去改配置或释放品牌,不是等下一批就能好")
+        # 光给总数没法动手。按「店 × 缺的大类」摊开,所有者一眼看出
+        # "给 A085 开厨房能救回多少件" —— 那是他真能做的决定
+        blocked: Counter = Counter()
+        for grp, w in dir_out:
+            if w == "过不了占用店的类目/渠道闸":
+                blocked[(grp["store"], grp["category"] or "(未归类)")] += grp["size"]
+        if blocked:
+            L.append("  其中类目挡下的,按「店 × 缺的大类」:"
+                     + " · ".join(f"{s} 缺「{c}」{n:,} 件"
+                                  for (s, c), n in blocked.most_common(6))
+                     + f"(共 {len(blocked)} 组合)—— 给该店开这个大类就能救回")
     if no_gap:
         L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额,配额公式的主项对它们是空的:"
                  + "、".join(no_gap[:6]))

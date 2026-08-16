@@ -20,10 +20,6 @@
    店铺是一店一渠道,而品牌必须整组去一家店 —— 混渠道的品牌里,不合该店
    渠道的那部分**上不了架**。留在组里会让 size 虚高、配额被吃掉却上不了货。
    渠道未知的产品同样剔除(**不猜**:猜错等于把 FBM 的货分给 FBA 店)。
-5. **搭车闸:组内产品分低于 `RIDE_FLOOR` 的不跟车**(所有者 2026-08-16 定 50)。
-   牌按组分(= 组内最高分)排队,所以一个爆款能把同品牌的平庸品一路带进第一层。
-   实测那一跑里大量 30 多分的货靠 90 多分的同门上了架,而它们挤掉的是排队里
-   **组分更高的整组**。见下面 `RIDE_FLOOR` 的注释,尤其是不剪的那种情况。
 """
 
 import logging
@@ -34,21 +30,6 @@ from services import brand_key as bk
 logger = logging.getLogger("services.alloc_groups")
 
 NO_BRAND = "(无品牌)"
-
-# 搭车地板:组里有 ≥ 这个分的品时,低于它的同门**不跟车上架**。
-#
-# ⚠ 它与淘汰线(`product_score.CUTOFF`,35)是**两条不同的线**,别合并:
-#   · 淘汰线 = 一个产品够不够格进候选池(它自己的准入);
-#   · 搭车地板 = 一个产品够不够格**沾同品牌高分品的光插队**。
-#
-# ⚠ **整组都低于地板时一件都不剪**。那种组没有"车"可搭 —— 组分就是它自己的
-#   真实水平,在自由流里几乎永远轮不到;而定向流是店铺补齐**自己已占的品牌**,
-#   剪光会让店铺连自己名下的品牌都上不了任何货。准入归淘汰线管,不归这里管。
-#
-# 由此有个看着别扭但站得住的结果:44 分的品,若同品牌有个 92 分的,它**不会**
-# 被分配(不许搭车);若同品牌顶格就是 44,它照常排队。规则管的是"插队",
-# 不是"这个品行不行"。
-RIDE_FLOOR = 50.0
 
 
 def _major(vals) -> str | None:
@@ -70,10 +51,7 @@ def build(candidates: list, claimed_brands: dict | None = None,
 
     free      自由流的组 [{key, score, size, category, channel, items, brand}]
     directed  定向流:只有一家店能要(品牌被占,或组里的 ASIN 被占)[{..., store}]
-    dropped   逐类计数:每一类都是"这批货为什么没进牌堆",报告要逐条报出来。
-              ⚠「搭车品」那一类与其余几类**性质不同**:其余是这批货有毛病
-              (渠道不明、占用打架),搭车品是货本身合格(过了淘汰线)、
-              只是不许沾同门高分品的光插队 —— 别把两者当同一回事去排查
+    dropped   逐类计数:每一类都是"这批货为什么没进牌堆",报告要逐条报出来
 
     ★ `bound_asins` 是所有者 2026-08-16 定的口径:**占位不等于上架**。上一轮
     分配定了、货还没上的 ASIN **照常进候选池**(否则方案表就成了增量,上一轮
@@ -94,14 +72,6 @@ def build(candidates: list, claimed_brands: dict | None = None,
     free, directed = [], []
     for gk, b in sorted(buckets.items()):
         items = b["items"]
-        # 搭车闸(模块 docstring 第 5 条)。**必须剪在渠道判定之前**:
-        # [92分 FBA, 40分 FBM, 39分 FBM] 先判渠道的话,两个搭车品把整组判成
-        # FBM,反手把那个 92 分的当少数派剔掉 —— 车上的人把司机赶下了车。
-        if any(x["score"] >= RIDE_FLOOR for x in items):
-            ride = [x for x in items if x["score"] < RIDE_FLOOR]
-            if ride:
-                dropped[f"搭车品(产品分 < {RIDE_FLOOR:.0f})"] += len(ride)
-                items = [x for x in items if x["score"] >= RIDE_FLOOR]
         ch = _major(x["channel"] for x in items)
         if ch is None:
             # 整组都没有可信渠道 —— 渠道闸是硬闸,没有渠道就无从判起

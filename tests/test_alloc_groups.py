@@ -10,50 +10,9 @@ def _c(asin, brand, score, cat="家居", ch="FBA", manuf=None):
 
 def test_group_score_is_the_max_not_the_median():
     """一个爆款带一堆平庸品的品牌,整体不该掉下去 —— 那正是最该抢的品牌。"""
-    g = ag.build([_c("B1", "acme", 95.0), _c("B2", "acme", 60.0),
-                  _c("B3", "acme", 55.0)])["free"]
+    g = ag.build([_c("B1", "acme", 95.0), _c("B2", "acme", 40.0),
+                  _c("B3", "acme", 38.0)])["free"]
     assert len(g) == 1 and g[0]["score"] == 95.0 and g[0]["size"] == 3
-
-
-def test_low_scorers_do_not_ride_along_with_a_high_scoring_sibling():
-    """⚠ 牌按组分排队,一个爆款能把同门平庸品一路带进第一层。
-
-    实测 2026-08-16:所有者问「产品分 38.6 和 91.4 怎么混到一起去的」——
-    就是这条路。那些货位挤掉的是排队里**组分更高的整组**。
-    """
-    r = ag.build([_c("B1", "acme", 95.0), _c("B2", "acme", 49.9),
-                  _c("B3", "acme", 38.6)])
-    g = r["free"][0]
-    assert g["size"] == 1 and [x["asin"] for x in g["items"]] == ["B1"]
-    assert g["score"] == 95.0                     # 组分不受剪裁影响(剪的都比它低)
-    assert r["dropped"][f"搭车品(产品分 < {ag.RIDE_FLOOR:.0f})"] == 2
-
-
-def test_a_group_entirely_below_the_floor_is_not_trimmed_at_all():
-    """⚠ 没车可搭就不算搭车 —— 整组低于地板时**一件都不剪**。
-
-    组分就是它自己的真实水平,自由流里几乎永远轮不到;而定向流是店铺补齐
-    **自己已占的品牌**,剪光会让店铺连自己名下的品牌都上不了任何货。
-    产品的准入线是淘汰线(product_score.CUTOFF),不是这条地板。
-    """
-    r = ag.build([_c("B1", "acme", 44.0), _c("B2", "acme", 40.0),
-                  _c("B3", "acme", 36.0)])
-    g = r["free"][0]
-    assert g["size"] == 3 and g["score"] == 44.0
-    assert not [k for k in r["dropped"] if "搭车" in k]
-
-
-def test_the_ride_floor_is_applied_before_the_channel_vote():
-    """⚠ 顺序反了的话,车上的人能把司机赶下车。
-
-    [95分 FBA, 两个 40 分 FBM] 先投渠道 = FBM 胜出,反手把那个 95 分的
-    当少数派剔掉 —— 整组只剩两个搭车品,而它们本来一个都不该上。
-    """
-    r = ag.build([_c("B1", "acme", 95.0, ch="FBA"), _c("B2", "acme", 40.0, ch="FBM"),
-                  _c("B3", "acme", 38.0, ch="FBM")])
-    g = r["free"][0]
-    assert g["channel"] == "FBA" and [x["asin"] for x in g["items"]] == ["B1"]
-    assert r["dropped"]["渠道少数派(随品牌走不了)"] == 0
 
 
 def test_minority_channel_items_are_dropped_from_the_group():

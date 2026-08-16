@@ -1,7 +1,7 @@
 """daily_report — 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。
 
 用法:
-  python cli.py daily_report                       # 全部阶段(kpi → board)
+  python cli.py daily_report                       # **默认全链**:kpi(含影刀)→ board → 推送飞书
   python cli.py daily_report -p phase=kpi          # 只采集 KPI
   python cli.py daily_report -p phase=kpi -p yingdao=input  # 只产出影刀输入清单,不 spawn
   python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
@@ -38,7 +38,10 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
   **停旧 walmart-kpi-daily 之前严禁开启**(双 spawn 互抢,新鲜度校验会
   反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补 + 跨日延续)
-- push 阶段默认只打印预览;-p push=1 才真发(并跑期不打扰运营)
+- **默认全链**(所有者定稿 2026-08-16 走进生产):不带参数 = kpi(含影刀)+ 看板 +
+  **真发日报**。调度里只写工作流名就是完整一轮,不必逐个 phase 拼命令 ——
+  漏拼一段的后果是"日报每天不发而且报成功"。
+  要空跑预览:`-p push=0`;要关影刀:`-p yingdao=0`
 """
 
 import json
@@ -57,7 +60,13 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.daily_report")
 
-_STORE_WORKERS = 6      # 旧系统 README:店铺级并发不要调高(代理共享/全局风控)
+# 店铺级并发(所有者定稿 2026-08-16 走进生产:6 → 16,"不然速度跟不上")。
+# ⚠ 旧系统 README 曾写"店铺级并发不要调高(代理共享/全局风控)",这条被显式覆盖。
+# 支撑理由:每店有**自己的固定出口代理**,店铺之间不共享出口;沃尔玛配额是
+# 按 (store, endpoint) 计的,api/_client.py 的令牌桶也按这个维度限流,所以
+# 加店铺并发不会挤占同一个桶。真正的共享资源只有本机 CPU/连接数。
+# 若出现大面积 429 或代理超时,先降这个数再查别的。
+_STORE_WORKERS = 16
 
 _KPI_UPSERT = """
 INSERT INTO ops.store_kpi_daily (
@@ -537,6 +546,8 @@ def _phase_push(data_date, do_push: bool) -> str:
 
 def run(params: dict) -> str:
     """输入:params(phase/store/push)→ 输出:各阶段结果摘要。"""
+    # 默认全链(所有者定稿 2026-08-16):kpi + 影刀 + 看板 + 推送。
+    # 调度里只写工作流名就是完整一轮,不必逐个 phase 拼命令。
     phase = str(params.get("phase", "all"))
     if phase not in ("all", "kpi", "board", "push", "settle_debug"):
         if phase == "problems":     # 已摘出为独立工作流(2026-08-08)
@@ -566,7 +577,9 @@ def run(params: dict) -> str:
         if not store_list:
             return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
         try:
-            mode = _yingdao_mode(params.get("yingdao"))
+            # 默认开影刀(所有者定稿 2026-08-16):卖家名称/销售状态是日报的
+            # 固定两列,默认关等于每天少两列而且不报错。要关显式 -p yingdao=0
+            mode = _yingdao_mode(params.get("yingdao", "1"))
         except ValueError as e:
             return str(e)
         lines.append(_phase_kpi(store_list, data_date, mode))
@@ -575,7 +588,8 @@ def run(params: dict) -> str:
             lines.append(_phase_board(int(params.get("days", 90))))
         except LookupError as e:
             lines.append(f"看板:未登记跳过({e})")
-    if phase == "push":
-        do_push = str(params.get("push", "")) in ("1", "true", "yes")
+    if phase in ("all", "push"):
+        # 默认真发(同上):调度里漏写 -p push=1 的后果是日报每天不发而且报成功
+        do_push = str(params.get("push", "1")) not in ("0", "false", "no")
         lines.append(_phase_push(data_date, do_push))
     return "\n".join(lines)

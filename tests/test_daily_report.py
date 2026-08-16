@@ -240,3 +240,35 @@ def test_push_never_claims_sent_when_webhook_is_unconfigured(monkeypatch):
 
     monkeypatch.setattr(dr.feishu, "notify", lambda text: True)
     assert dr._phase_push("2026-08-16", True) == "日报已推送"
+
+
+def test_defaults_are_production_defaults(monkeypatch):
+    """所有者定稿 2026-08-16 走进生产:不带参数 = kpi(含影刀)+ 看板 + 真发日报。
+
+    ⚠ 这三个默认值改的都是同一类风险:调度里漏写一个开关,后果是**那一段每天
+    空转而且报成功** —— 比误跑更难发现(误跑至少有痕迹)。
+    """
+    import inspect
+
+    from workflows import daily_report as dr
+    src = inspect.getsource(dr.run)
+    assert 'params.get("yingdao", "1")' in src          # 影刀默认开
+    assert 'params.get("push", "1")' in src             # 日报默认真发
+    assert 'phase in ("all", "push")' in src            # 默认 all 会走到推送
+    assert dr._yingdao_mode("1") == "full"
+    assert dr._yingdao_mode("0") == ""                  # 要关得显式关
+
+
+def test_cli_default_is_execute_not_dry_run():
+    """所有者定稿 2026-08-16:缺省即真跑,空跑改为显式 --dry-run。
+
+    ⚠ 与旧铁律相反,理由是进了调度之后"缺省 dry-run"只会伤到自己:launchd 里
+    漏写 --execute 的后果是那条链每天空转而且报成功。--execute 保留为兼容别名。
+    """
+    import cli
+    a = cli._parse_args(["problem_product_cleanup"])
+    assert a.dry_run is False                            # 缺省真跑
+    b = cli._parse_args(["problem_product_cleanup", "--dry-run"])
+    assert b.dry_run is True
+    c = cli._parse_args(["problem_product_cleanup", "--execute"])
+    assert c.dry_run is False and c.execute is True      # 兼容别名不报错

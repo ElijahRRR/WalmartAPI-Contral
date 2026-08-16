@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """cli.py — 全项目唯一执行入口。
 
-    python cli.py <workflow> [-p key=value ...] [--execute]
+    python cli.py <workflow> [-p key=value ...] [--dry-run]
 
 统一负责(workflow 文件里不做这些):
   加载 <DATA_ROOT>/.env → flock 单实例锁 → 写 ops.runs 运行记录 → 执行 run(params)
   → 飞书通知(成功/失败都发)→ 退出码(0 成功 / 1 失败 / 3 已有实例在跑)。
 
-危险工作流强制 dry-run:模块声明 DANGEROUS=True 时,params["execute"] 只有
-显式传 --execute 才为 True;缺省 dry-run,run() 只打印将做什么,不碰写接口。
-AI 改完代码必须先 dry-run,人眼确认输出后才允许 --execute(安全铁律)。
+执行语义(所有者定稿 2026-08-16 走进生产时改;此前是"危险工作流缺省 dry-run,
+真跑要 --execute"):**缺省即真跑**,危险工作流也一样;要空跑加 `--dry-run`。
+理由:进了调度之后,"缺省 dry-run"这条防线只会伤到自己 —— launchd 里漏写一个
+`--execute` 的后果是**那条链每天空转而且报成功**,比误跑更难发现。
+
+⚠ 但「AI 改完代码必须先 dry-run,人眼确认输出后才真跑」这条**没有取消**,
+只是从"默认值兜底"改成"纪律"。改完危险工作流的代码,第一次跑必须显式
+`--dry-run`,输出人眼过一遍,再跑真的。--execute 保留为兼容别名(调度里
+写了它也不会出错),但它现在是空操作。
 
 launchd 定时、手动触发、未来的网页按钮和 MCP 工具,全部走这一条路径;
 调用方身份用环境变量 WALMART_OPERATOR 标注(launchd / manual / web / mcp)。
@@ -32,8 +38,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("workflow", help="workflows/ 下的工作流名,如 ping_stores")
     parser.add_argument("-p", "--param", action="append", default=[],
                         metavar="key=value", help="传给 run(params) 的参数,可重复")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="空跑:只打印将做什么,不碰任何写接口")
     parser.add_argument("--execute", action="store_true",
-                        help="危险工作流真跑开关;缺省 dry-run 只打印将做什么")
+                        help="(兼容保留,空操作)缺省即真跑;要空跑用 --dry-run")
     return parser.parse_args(argv)
 
 
@@ -128,15 +136,17 @@ def main(argv: list[str] | None = None) -> int:
         raise
 
     dangerous = bool(getattr(module, "DANGEROUS", False))
-    params["execute"] = args.execute if dangerous else True
-    if dangerous and not args.execute:
-        print(f"🧪 [DRY-RUN] {args.workflow} 为危险工作流,本次只打印将做什么;"
-              f"真跑请加 --execute")
+    # 缺省即真跑(所有者定稿 2026-08-16):调度里漏写 --execute 会让整条链每天
+    # 空转而且报成功,比误跑更难发现。空跑改为显式 --dry-run。
+    # 非危险工作流本来就恒真,不受 --dry-run 影响(它们没有写接口可关)。
+    params["execute"] = (not args.dry_run) if dangerous else True
+    if dangerous and args.dry_run:
+        print(f"🧪 [DRY-RUN] {args.workflow} 本次只打印将做什么,不碰写接口")
 
     import os
     operator = os.environ.get("WALMART_OPERATOR", "manual")
     run_id = _record_start(args.workflow, params, operator)
-    mode = "" if not dangerous else ("[EXECUTE] " if args.execute else "[DRY-RUN] ")
+    mode = "" if not dangerous else ("[DRY-RUN] " if args.dry_run else "[EXECUTE] ")
 
     try:
         summary = module.run(params)

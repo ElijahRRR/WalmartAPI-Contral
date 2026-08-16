@@ -192,12 +192,18 @@ cli 本来就管锁/记录/通知,链只是把这三件事各做 N 遍。
 
 ### 1. launchd plist 全套 + 停旧清单
 
-调度顺序的**硬约束**(文档里明写、颠倒会静默出错):
+**完整计划见 `docs/schedule_plan.md`**(2026-08-16 拟,待批准):49 个工作流的
+去向分类、时间表逐条理由、与旧系统的七处差异、plist 模板与五个坑、
+分四批灰度上线、六个待拍板问题。
 
-1. `catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance`
-   (`list_new` 同样排在 `product_ingest` 之后,但它不进调度)
-2. `catalog_sync → problem_scan → problem_product_cleanup`
-3. `order_sync` 必须在 `daily_report -p phase=kpi` 之前(否则订单列对拍必差)
+⚠ **下面这条链式"硬约束"是错的,已在 schedule_plan.md §零 纠正**:
+`product_refresh` 是把十几万 ASIN 压给采集服务(默认不等),`product_ingest`
+拉的是采集服务**已采完**的增量 —— 两者当天不构成数据依赖。真正的依赖只有:
+
+1. `catalog_sync` → `product_refresh`(要先知道在架哪些才知道推谁)
+2. `catalog_sync` → `maintenance_scan` / `problem_scan`(判据要拿最新现值)
+3. `order_sync` → `daily_report`(否则订单列对拍必差)
+4. `product_ingest` → `maintenance_scan` / `list_new`(先摄取,判据才有新数据)
 
 时间表(所有者定稿的节奏;KPI 窗口锚在中国时间 06:30,故日报 ≥06:35)。
 **箭头即串联,一条 plist 一条命令** —— `python cli.py a b c`,不要写三个 plist,

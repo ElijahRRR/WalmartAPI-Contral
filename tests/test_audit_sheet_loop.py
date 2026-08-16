@@ -148,7 +148,7 @@ def test_from_sheet_reuses_the_asins_path(monkeypatch):
     # 一行待审都没有时直说,而且说明重审入口(清空 E 列)
     monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [])
     out = pa.run({"from_sheet": "1"})
-    assert "没有待审行" in out and "E 列清空" in out
+    assert "没有待审行" in out and "清空" in out
 
 
 # ── ③④ 上架闸:读 PG,不读表 ─────────────────────────────────────────────
@@ -214,8 +214,16 @@ def test_pt_falls_back_to_sheet_when_pg_has_none():
         == "库PT"
 
 
-def test_columns_contract_unchanged():
-    """C/D/E/F/G 是审核域 —— 列序变了这套回填会静默写错列。"""
+def test_columns_contract():
+    """列序的唯一出处是这条元组 —— 错一位,整套回填静默写到隔壁列去。
+
+    A/B 已经被所有者对调过一次(2026-08-16:原 A=ASIN B=店铺 → 现 A=店铺 B=ASIN)。
+    读取全程按字段名,所以那次对调只动了这条元组;**但写入用的是字母 range**,
+    所以 C~G 这一段一旦位移,`write_audit_cols` 会把审核结论写进别人的列里
+    —— 而且不报错。
+    """
     cols = resources.LISTING_SHEET.columns
+    assert cols[0] == "store" and cols[1] == "asin"      # A/B 对调后的现状
     assert cols[2:7] == ("list_title", "product_type", "audit_result",
-                         "audit_reason", "audit_date")
+                         "audit_reason", "audit_date")   # C~G 审核域
+    assert len(cols) == 21                               # A~U

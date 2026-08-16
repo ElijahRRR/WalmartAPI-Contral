@@ -315,7 +315,9 @@ def run(params: dict) -> str:
     if r5_on:
         workers = 1
     # ── 上架表驱动(所有者定稿 2026-08-16)────────────────────────────────
-    # 「审核直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」。
+    # 「审核直接读取上架表的 ASIN 与审核结果两列(结果为空就审核),然后回填
+    #   C、D、E、F、G」。⚠ 列字母只在**写入 range** 上有意义:A/B 被对调过一次
+    #   (2026-08-16),读取一律按字段名走 registry 的列元组。
     # 实现上**走 asins= 那条既有路径**:审核引擎只有一条实现,这里只是换了个
     # 领任务的地方(与 problem_scan/maintenance_scan 那种"决策与执行分家"同理)。
     sheet_rows: list[dict] = []
@@ -323,8 +325,8 @@ def run(params: dict) -> str:
         sheet_rows = listing_sheet.audit_targets()
         want = sorted({r["asin"] for r in sheet_rows})
         if not want:
-            return ("上架表:没有待审行(A 有值且 E 为空的一行都没有)。"
-                    "想重审就把该行 E 列清空 —— 那是唯一的重审入口")
+            return ("上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
+                    "想重审就把该行 E 列(审核结果)清空 —— 那是唯一的重审入口")
         if len(want) > limit:
             # 静默截断 = "审完了"的假象。点名说出来,人自己决定加 limit 还是分轮
             logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d,只审前 %d 个",

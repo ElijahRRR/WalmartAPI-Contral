@@ -449,16 +449,20 @@ RETIRE_SHEET = Spreadsheet(
 # daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
-# A=ASIN B=店铺 C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
+# A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
 # G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
 # M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
 # R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
 # (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
+# ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
+# `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
+# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里。
+# 写入侧一律用显式 range(C:G / O:Q / …),不受本次对调影响。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
-    columns=("asin", "store", "list_title", "product_type", "audit_result",
+    columns=("store", "asin", "list_title", "product_type", "audit_result",
              "audit_reason", "audit_date", "amz_price", "stock",
              "walmart_price", "listed", "feed_id", "list_date",
              "not_listed_reason", "list_result", "list_fail_reason",

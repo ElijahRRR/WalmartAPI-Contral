@@ -1,14 +1,18 @@
 """上架表(registry.LISTING_SHEET)读写积木(list_new 与 feed_poll 共用)。
 
 列契约(21 列 A~U,所有者建表 2026-08-07):
-  A=ASIN B=店铺 C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
+  A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
   G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
   M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
   R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
 
-列权责(旧系统纪律,跨界写就是 bug):**A/B 人工域**(运营填 ASIN 与店铺);
+⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺,现 A=店铺 B=ASIN)。
+代码里没有一处按字母取 ASIN —— 列序的唯一出处是 `resources.LISTING_SHEET.columns`,
+`read_rows()` 按它 zip;写入侧一律显式 range。表头再动只改 registry 那一条元组。
+
+列权责(旧系统纪律,跨界写就是 bug):**A/B 人工域**(运营填店铺与 ASIN);
 **C/D/E/F/G 审核域**(`product_audit -p from_sheet=1` 写,2026-08-16 所有者定稿
-「审核直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」——
+「审核直接读取上架表的 ASIN 与审核结果两列(结果为空就审核),然后回填 C、D、E、F、G」——
 此前 D/E/F/G 记在人工域,那是并跑期旧审核链在填,现在由新审核链接管);
 list_new 写 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
 L3 状态跟踪写 R~U。**唯一例外**:heal_unknown 自愈反哺器对 K=Unknown
@@ -105,11 +109,15 @@ AUDIT_RESULT_CN = {"approved": "pass", "rejected": "reject",
 
 
 def audit_targets() -> list[dict]:
-    """输入:无 → 输出:待审行 [{rownum, asin, store}](A 有值且 **E 为空**)。
+    """输入:无 → 输出:待审行 [{rownum, asin, store}](ASIN 有值且**审核结果为空**)。
 
-    所有者定稿 2026-08-16:「审核直接读取上架表的 A、E 列(为空就审核)」。
-    E 有值就是审过了 —— **想重审就把 E 清空**,这是唯一的重审入口
-    (不设 force 参数:清一格比记一个参数直观,而且看得见改了哪些行)。
+    所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
+    (结果为空就审核)」。审核结果有值就是审过了 —— **想重审就把那格清空**,
+    这是唯一的重审入口(不设 force 参数:清一格比记一个参数直观,
+    而且看得见改了哪些行)。
+
+    ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
+    再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
     """
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
             for r in read_rows()

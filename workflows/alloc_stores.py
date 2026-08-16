@@ -103,7 +103,8 @@ def run(params: dict) -> str:
             "在售天数": m.get("active_days", 0),
             "KPI覆盖": m.get("cover", 0.0),
             "在线均值": m.get("avg_online"),
-            "日均净销售额": m.get("daily_net"),
+            "日均净额实测": m.get("daily_net_own"),
+            "日均净额收缩后": m.get("daily_net"),
             "日目标": (cfg.get(s) or {}).get("gmv"),
             "缺口": qq.get("gap"),
             "单品日产出": m.get("slot_value"),
@@ -117,7 +118,7 @@ def run(params: dict) -> str:
         })
     # 缺口大的排前面(所有者拍板:把货给离目标最远的店)
     rows.sort(key=lambda r: (-(r["缺口"] if r["缺口"] is not None else -1),
-                             -(r["日均净销售额"] or 0)))
+                             -(r["日均净额实测"] or 0)))
 
     part = [r for r in rows if r["参与分配"] == "是"]
     unfilled = [r for r in rows if r["参与分配"] == "(未填)"]
@@ -156,17 +157,18 @@ def run(params: dict) -> str:
         ["店铺", "在售天数", "在线均值", "日均净额", "货位值",
          "日目标", "缺口", "剩余容量", ""],
         [[r["店铺"], r["在售天数"], _fmt(r["在线均值"], 0),
-          _sub(r, _fmt(r["日均净销售额"])), _sub(r, _fmt(r["单品日产出"], 3)),
+          _fmt(r["日均净额实测"]), _sub(r, _fmt(r["单品日产出"], 3)),
           _fmt(r["日目标"], 0),
-          "—" if r["缺口"] is None else _sub(r, f"{r['缺口']:.0%}"),
+          "—" if r["缺口"] is None else f"{r['缺口']:.0%}",
           _fmt(r["剩余容量"], 0),
           "" if r["取值依据"].startswith("自身") else f"⚠ {r['取值依据']}"]
          for r in part[:10]],
         align="<>>>>>>><")
-    L.append("  (货位值 = 日均净额 ÷ 在线均值;缺口 = (日目标 − 日均净额) ÷ 日目标)")
+    L.append("  (缺口 = (日目标 − 日均净额) ÷ 日目标,**日均净额是实测值**;"
+             "货位值 = 日均净额 ÷ 在线均值,但薄样本会被中位数收缩)")
     if any(not r["取值依据"].startswith("自身") for r in part[:10]):
-        L.append("  ⚠ 带 ~ 的是**全店中位数顶上来的**,不是这家店自己的数 ——"
-                 "**上面那两个等式对它们不成立**(在线均值仍是实测值)")
+        L.append("  ⚠ 带 ~ 的货位值是**全店中位数顶上来的**(在售<14 天,比值不可信);"
+                 "**缺口不受影响**——它一律按这家店自己的实测销量算")
 
     if not export:
         L += ["", "(-p export=0:未落 csv)"]
@@ -183,6 +185,6 @@ def run(params: dict) -> str:
                              else v))
                         for k, v in r.items()})
     L += ["", f"▍明细 → {p}",
-          "  逐店 16 列(含取值依据、KPI 覆盖、历史期占比)——"
+          "  逐店 17 列(含取值依据、KPI 覆盖、历史期占比)——"
           "分配跑出奇怪结果时,先回来对这三列"]
     return "\n".join(L)

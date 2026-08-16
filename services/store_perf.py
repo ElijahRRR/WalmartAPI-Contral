@@ -18,7 +18,11 @@
    这是硬切不是收缩——那个区间一单大额就能把单品日产出抬十倍,而收缩公式
    在 active=2 时仍会留 12.5% 权重给它。新店 active=0 落在同一条规则里,
    天然冷启动;
-3. **销量一律净额**(GMV − 退款)。⚠ 历史期算不出退款(`order_history_import`
+3. **缺口用实测日均,效率用收缩后的值**(所有者拍板 2026-08-15 晚,两条决策
+   各管各的量):薄样本的**比值**不可信(一单大额抬十倍)所以货位值要收缩;
+   但**缺口**是"离目标多远",一家一件没卖的空店确实最远,拿中位数替换会让它
+   看起来是平均水平、排在真卖得动的店后面——方向就反了。
+4. **销量一律净额**(GMV − 退款)。⚠ 历史期算不出退款(`order_history_import`
    只导销售六列),所以 `hist_days` 也要报出来:窗口大量落在历史期的店,
    它的"净额"其实是毛额,与 API 期的店**不是同一个口径**,不能直接比。
 """
@@ -135,6 +139,17 @@ def derive(raw: dict, win_days: int) -> dict:
     for store, r in raw.items():
         a = r["active_days"]
         m = dict(r)
+        # **实测日均净额:不收缩、不替换**(所有者拍板 2026-08-15 晚)。
+        # 缺口用它,效率用下面收缩后的那套 —— 两条决策各管各的量:
+        #   「少于 14 天不信它的数据」管的是**比值**(货位值/效率),薄样本
+        #     一单大额就能抬十倍,确实不可信;
+        #   「把货给离目标最远的店」管的是**缺口**,而一家一件没卖的空店
+        #     确实离目标最远。拿中位数替换会让它看起来是"平均水平",
+        #     排在真卖得动的店后面 —— 方向反了。
+        # active=0 且真的零销量 ⇒ 日均就是 0(缺口 100%),不是"算不出";
+        # active=0 却有销量 ⇒ 数据自相矛盾(卖了但从没记为在营),**不猜**。
+        m["daily_net_own"] = (r["net"] / a if a else
+                              (0.0 if r["net"] == 0 else None))
         m["cover"] = r["rec_days"] / win_days if win_days else 0.0
         m["hist_share"] = (r["hist_rows"] / r["orders"]) if r["orders"] else 0.0
         m["trusted"] = a >= MIN_ACTIVE_DAYS
@@ -170,7 +185,8 @@ def quota_inputs(metrics: dict, cfg: dict, online_now: dict,
     for store, c in cfg.items():
         m = metrics.get(store) or {}
         target = c.get("gmv")
-        daily = m.get("daily_net")
+        # 缺口一律用**实测**日均(见 derive 里那段);收缩后的值只喂效率项
+        daily = m.get("daily_net_own")
         gap = None
         if target and target > 0 and daily is not None:
             gap = min(1.0, max(0.0, (target - daily) / target))

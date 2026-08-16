@@ -106,7 +106,7 @@ def test_room_credits_pending_delist_but_keeps_a_conservative_number_too():
     否则下架没做完就上架会真的超 max_online。
     """
     q = sp.quota_inputs(
-        metrics={"A": {"slot_value": 3.0, "daily_net": 100.0}},
+        metrics={"A": {"slot_value": 3.0, "daily_net_own": 100.0}},
         cfg={"A": {"max_online": 1000.0, "gmv": 200.0}},
         online_now={"A": 950},
         pending_delist={"A": 300})
@@ -121,11 +121,11 @@ def test_gap_is_none_when_target_missing_not_zero():
     退化成 0 会让没填目标的店永远分不到货,而且不报错 —— 与
     store_targets 开头那条空值纪律同源。
     """
-    q = sp.quota_inputs({"A": {"daily_net": 100.0}},
+    q = sp.quota_inputs({"A": {"daily_net_own": 100.0}},
                         {"A": {"max_online": 500.0, "gmv": None}},
                         {"A": 100})
     assert q["A"]["gap"] is None
-    q2 = sp.quota_inputs({"A": {"daily_net": 40.0}},
+    q2 = sp.quota_inputs({"A": {"daily_net_own": 40.0}},
                          {"A": {"max_online": 500.0, "gmv": 100.0}},
                          {"A": 100})
     assert q2["A"]["gap"] == 0.6               # (100−40)/100
@@ -222,3 +222,40 @@ def test_median_substituted_values_are_marked_in_the_report():
     sub = {"取值依据": "中位数(在售仅 3 天)"}
     assert st._sub(own, "283.33") == "283.33"
     assert st._sub(sub, "283.33") == "~283.33"
+
+
+def test_gap_uses_the_store_own_rate_not_the_median(monkeypatch):
+    """缺口用**实测**、效率用**收缩后**——所有者 2026-08-15 晚拍板。
+
+    两条决策各管各的量:「少于 14 天不信它的数据」管**比值**(一单大额能把
+    货位值抬十倍);「把货给离目标最远的店」管**缺口**,而一家一件没卖的
+    空店确实最远。拿中位数替换会让它显示成"平均水平",排在真卖得动的店
+    后面 —— 方向反了(生产实测:82杨乾良 在线 0、一件没卖,却和 M001
+    中位数店并列缺口 66%)。
+    """
+    m = sp.derive({
+        "老店": _raw(active_days=90, avg_online=100, gross=27000.0),  # 300/天
+        "空店": _raw(rec_days=10, active_days=10, avg_online=0, gross=0.0),
+    }, 90)
+    # 效率仍走中位数(薄样本的比值不可信)
+    assert m["空店"]["trusted"] is False
+    assert m["空店"]["slot_value"] == m["老店"]["slot_value"]
+    # 缺口走它自己的实测:一件没卖 ⇒ 日均 0
+    assert m["空店"]["daily_net_own"] == 0.0
+    q = sp.quota_inputs(m, {"老店": {"max_online": 500.0, "gmv": 400.0},
+                            "空店": {"max_online": 500.0, "gmv": 400.0}},
+                        {"老店": 100, "空店": 0})
+    assert q["空店"]["gap"] == 1.0             # 100%,排最前
+    assert q["老店"]["gap"] < q["空店"]["gap"]
+
+
+def test_zero_active_days_with_sales_is_not_guessed():
+    """在售 0 天却有销量 = 数据自相矛盾(卖了但从没记为在营)——**不猜**。
+
+    真零销量才当 0(缺口 100%);有销量却算不出速率的,缺口留 None
+    让报告点名,不要编一个数出来。
+    """
+    m = sp.derive({"没记录空店": _raw(rec_days=0, active_days=0, gross=0.0),
+                   "矛盾店": _raw(rec_days=0, active_days=0, gross=500.0)}, 90)
+    assert m["没记录空店"]["daily_net_own"] == 0.0
+    assert m["矛盾店"]["daily_net_own"] is None

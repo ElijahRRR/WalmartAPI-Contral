@@ -25,78 +25,20 @@ from collections import Counter
 
 from registry import db, paths
 from services import alloc_survey as sv
-from services import amz_source, product_score as ps
+from services import product_pool as pool_svc, product_score as ps
 from services import textfmt
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.alloc_products")
 
-# 候选池 + 最新快照。口径与 amz_source._SQL 同源(LATERAL 取最近一次采集,
-# zip_verify='mismatch' 的观测不算);评分/评论从 raw 取 —— 契约字段表没登记,
-# 但 2026-08-15 P2 探针实测命中率 100%(§四)
-_SQL_POOL = """
-SELECT p.asin, p.brand, p.walmart_pt, r.category,
-       s.price, s.shipping, s.stock_count, s.stock_state, s.delivery_days,
-       s.raw ->> 'rating'        AS rating,
-       s.raw ->> 'review_count'  AS reviews
-FROM catalog.products p
-JOIN catalog.risk_product_types r ON r.product_type = p.walmart_pt
-LEFT JOIN LATERAL (
-    SELECT price, shipping, stock_count, stock_state, delivery_days, raw
-    FROM catalog.latest_snapshot ls
-    WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
-      AND coalesce(ls.scrape_params ->> 'zip_verify', '') <> 'mismatch'
-    ORDER BY ls.scraped_at DESC LIMIT 1
-) s ON true
-WHERE p.marketplace = 'US'
-  AND p.audit_status = 'approved'
-  AND p.title IS NOT NULL AND btrim(p.title) <> ''
-  AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> 'unknown'
-  AND btrim(coalesce(r.category, '')) <> ''
-"""
-
-# 窗口内销量:**按 asin 聚合**(A1.5 补的列,99.2% 行有值)。
-# asin IS NULL 的行进不了这个维度 —— 它们只在店×SKU 维度起作用
-_SQL_SALES = """
-SELECT asin, sum(coalesce(qty, 0))::bigint AS units
-FROM orders.order_lines
-WHERE asin IS NOT NULL
-  AND order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
-  AND order_date <  %(as_of)s::timestamptz
-  AND coalesce(sale_status, '') <> 'Cancelled'
-GROUP BY asin
-"""
-
-# 退货率的分母只能是**同期 API 行**:历史导入行没有退款数据,拿它们当分母
-# 会把退货率系统性稀释(§7.4e)。所以这里显式只算 source IS NULL 的行
-_SQL_REFUND = """
-WITH o AS (
-    SELECT asin, order_line_id, coalesce(qty, 0) AS qty
-    FROM orders.order_lines
-    WHERE asin IS NOT NULL AND source IS NULL
-      AND order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
-      AND order_date <  %(as_of)s::timestamptz
-      AND coalesce(sale_status, '') <> 'Cancelled'
-), r AS (
-    SELECT order_line_id, sum(coalesce(refunded_qty, 0)) AS rq
-    FROM orders.return_lines
-    WHERE order_line_id IN (SELECT order_line_id FROM o)
-    GROUP BY order_line_id
-)
-SELECT o.asin, sum(o.qty)::bigint AS sold,
-       sum(coalesce(r.rq, 0))::bigint AS returned
-FROM o LEFT JOIN r ON r.order_line_id = o.order_line_id
-GROUP BY o.asin
-"""
-
-# ⚠ `missing_times` 必须一起查:`risk_penalty` 要用它判「消失够不够 3 次」,
-# 漏这一列等于该项永不扣分(0 >= 3 恒假),而且**不会报错**
-_SQL_RISK = """
-SELECT asin, delete_times, unexplained_missing, missing_times, audit_reject_times
-FROM catalog.product_risk
-WHERE delete_times > 0 OR unexplained_missing OR audit_reject_times > 0
-"""
+# ⚠ 候选池 SQL、打分、硬闸计数全在 `services/product_pool` —— 体检与真分配
+# (`alloc_plan`)必须看到**逐字相同**的池子和分数。两边各写一遍的话,体检说
+# "可分配 27 万"、分配实际只认 19 万,这份体检就是假的。
+_SQL_POOL = pool_svc._SQL_POOL          # 保留别名:回归按名字盯着这几段口径
+_SQL_SALES = pool_svc._SQL_SALES
+_SQL_REFUND = pool_svc._SQL_REFUND
+_SQL_RISK = pool_svc._SQL_RISK
 
 
 def _pct(n, d):
@@ -109,58 +51,33 @@ def run(params: dict) -> str:
     win = sv.sales_window(str(params.get("as_of", "")), days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
 
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_POOL)
-        pool = cur.fetchall()
-        cur.execute(_SQL_SALES, win)
-        sales = {a: int(u) for a, u in cur.fetchall()}
-        cur.execute(_SQL_REFUND, win)
-        refund = {a: (int(sold), int(ret)) for a, sold, ret in cur.fetchall()}
-        try:
-            cur.execute(_SQL_RISK)
-            risk = {a: {"delete_times": d, "unexplained_missing": um,
-                        "missing_times": mt, "audit_reject_times": ar}
-                    for a, d, um, mt, ar in cur.fetchall()}
-        except Exception as e:                  # noqa: BLE001 视图缺了不该拖垮体检
-            conn.rollback()
-            risk, risk_err = {}, str(e).strip().splitlines()[0]
-        else:
-            risk_err = None
+    with db.pg_conn() as conn:
+        data = pool_svc.load(conn, win)
+    scored, gated_raw = pool_svc.score_all(data)
+    risk_err = data["risk_err"]
 
-    gated: Counter = Counter()
+    gated: Counter = Counter(gated_raw)
     have: Counter = Counter()
     scores: list = []
     rows: list = []
-    for (asin, brand, pt, cat, price, shipping, stock, stock_state, lead,
-         rating, reviews) in pool:
-        row = {"price": float(price) if price is not None else None,
-               "shipping": float(shipping) if shipping is not None else None,
-               "stock": stock, "stock_state": stock_state}
-        why = ps.gate(row, amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY)
-        if why:
-            gated[why.split("(")[0]] += 1
-            continue
-        sold, ret = refund.get(asin, (0, 0))
-        sig = {"sales": sales.get(asin), "rating": rating, "reviews": reviews,
-               "lead": lead, "refund": (ret / sold if sold else None)}
-        r = ps.score(sig, risk.get(asin))
+    for c in scored:
         # ⚠ 覆盖率的分母是「有分可判」,所以计数必须在剔除之后 ——
         # 放在前面会把没进打分的品也算进分子,覆盖率能超过 100%
         for k in ("rating", "reviews", "sales"):
-            if k not in r["missing"]:
+            if k not in c["missing"]:
                 have[k] += 1
-        if lead is not None:
+        if c["lead"] is not None:
             have["lead"] += 1
-        if sold:
+        if data["refund"].get(c["asin"], (0, 0))[0]:
             have["refund"] += 1
-        scores.append(r["score"])
-        rows.append((asin, brand or "", cat, round(r["score"], 1),
-                     round(r["base"], 1), round(r["bonus"], 1),
-                     round(r["penalty"], 1), r["why"],
-                     sales.get(asin), rating, reviews, lead,
-                     "|".join(r["missing"])))
+        scores.append(c["score"])
+        rows.append((c["asin"], c["brand"] or "", c["category"],
+                     round(c["score"], 1), round(c["base"], 1),
+                     round(c["bonus"], 1), round(c["penalty"], 1), c["why"],
+                     c["sales"], c["rating"], c["reviews"], c["lead"],
+                     "|".join(c["missing"])))
 
-    n_pool, n_scored = len(pool), len(scores)
+    n_pool, n_scored = len(data["pool"]), len(scores)
     passed = [s for s in scores if s >= ps.CUTOFF]
     L = ["", "═══ 产品分体检 ═══", "",
          f"▍漏斗(候选池口径:approved ∧ 有标题 ∧ PT 有效 ∧ 大类查得到)"]

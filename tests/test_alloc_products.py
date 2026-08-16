@@ -6,17 +6,21 @@ import pathlib
 from services import product_score as ps
 from workflows import alloc_products as wf
 
+# ⚠ 列数必须与 `product_pool._SQL_POOL` 逐字对齐(13 列)。少一列时 score_all
+#   会抛 ValueError —— 这是好事:上一次同类错误被 `except Exception` 的降级分支
+#   吞掉了,测试全绿而分数全错。别再给这里包 try。
 POOL = [
-    # asin, brand, pt, cat, price, shipping, stock, stock_state, lead, rating, reviews
-    ("B0AAAA0001", "Acme", "Socks", "Fashion", 9.9, 0.0, 50, "in_stock", 5, "4.6", "820"),
-    ("B0BBBB0002", "Beta", "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 12, "4.1", "35"),
+    # asin, brand, manufacturer, pt, cat, price, shipping, stock, stock_state,
+    # lead, rating, reviews, fulfillment
+    ("B0AAAA0001", "Acme", None, "Socks", "Fashion", 9.9, 0.0, 50, "in_stock", 5, "4.6", "820", "FBA"),
+    ("B0BBBB0002", "Beta", None, "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 12, "4.1", "35", "FBA"),
     # 只有配送时效一项:**旧实现会让它独占权重拿 100 分**,新实现判「信息不足」
-    ("B0CCCC0003", "Gamma", "Knives", "Home", 5.0, 0.0, 100, "in_stock", 3, None, None),
+    ("B0CCCC0003", "Gamma", None, "Knives", "Home", 5.0, 0.0, 100, "in_stock", 3, None, None, "FBM"),
     # 有口碑、无销量无退货:拉低加分/罚分项的覆盖率,让告警有东西可报
-    ("B0GGGG0007", "Eta", "Socks", "Fashion", 7.5, 0.0, 40, "in_stock", 6, "4.2", "12"),
-    ("B0DDDD0004", "Delta", "Socks", "Fashion", None, 0.0, 20, "in_stock", 4, "4.9", "9"),
-    ("B0EEEE0005", "Eps", "Socks", "Fashion", 12.0, 1.0, 0, "in_stock", 4, "4.4", "60"),
-    ("B0FFFF0006", "Zeta", "Hats", "Fashion", 8.0, 0.0, 30, "in_stock", None, None, None),
+    ("B0GGGG0007", "Eta", None, "Socks", "Fashion", 7.5, 0.0, 40, "in_stock", 6, "4.2", "12", "FBA"),
+    ("B0DDDD0004", "Delta", None, "Socks", "Fashion", None, 0.0, 20, "in_stock", 4, "4.9", "9", "FBA"),
+    ("B0EEEE0005", "Eps", None, "Socks", "Fashion", 12.0, 1.0, 0, "in_stock", 4, "4.4", "60", "FBA"),
+    ("B0FFFF0006", "Zeta", None, "Hats", "Fashion", 8.0, 0.0, 30, "in_stock", None, None, None, None),
 ]
 
 

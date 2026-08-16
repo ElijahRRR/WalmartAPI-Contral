@@ -109,22 +109,35 @@ def _fit_to_store(grp: dict, st: dict) -> tuple[dict | None, int]:
 
     渠道整组同进退(建组时已按多数派统一过);**类目与配送时长逐件判** ——
     一个品牌横跨两个大类、或者快慢货混在一起时,占用店收得了的那部分
-    **本来就能上架**,不该被组里的多数派连累。全被剪光返回 (None, 原件数)。
+    **本来就能上架**,不该被组里的多数派连累。
+
+    全被剪光时返回 `(None, 件数, 原因)`,**原因要分清是类目还是货期**:
+    两者的处置完全不同(开个大类 vs 放宽货期或换货),混成一个标签会把
+    所有者送去改根本没用的那一项 —— 2026-08-16 实测,货期闸上线后被它挡下的
+    组曾一律被记成"缺某大类"。
     """
-    ok = [it for it in grp["items"]
-          if store_targets.allowed(st_cfg(st), it["category"])
-          and store_targets.lead_ok({"lead_limit": st.get("lead_limit")},
-                                    it.get("lead"))]
+    bad: Counter = Counter()
+    ok = []
+    for it in grp["items"]:
+        if not store_targets.allowed(st_cfg(st), it["category"]):
+            bad["类目"] += 1
+        elif not store_targets.lead_ok({"lead_limit": st.get("lead_limit")},
+                                       it.get("lead")):
+            bad["货期"] += 1
+        else:
+            ok.append(it)
     if not ok:
-        return None, grp["size"]
+        # 并列时按名字定序 —— 报告里的归因不许随行序漂
+        top = sorted(bad.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        return None, grp["size"], top
     if len(ok) == len(grp["items"]):
-        return grp, 0
+        return grp, 0, None
     leads = [x.get("lead") for x in ok]
     return {**grp, "items": ok, "size": len(ok),
             "score": max(x["score"] for x in ok),
             "category": alloc_groups._major(x["category"] for x in ok),
             "lead": None if any(v is None for v in leads) else max(leads)}, \
-        grp["size"] - len(ok)
+        grp["size"] - len(ok), None
 
 
 def _quota(qq: dict, m: dict, target) -> tuple[int, str]:
@@ -262,10 +275,13 @@ def run(params: dict) -> str:
         #   所以留下该店收得了的那些件、其余才淘汰。不这么做的话:一个品牌
         #   60% 厨房 / 40% 家居,组大类取多数派=厨房,只做家居的占用店会把
         #   **那 40% 本来能上架的家居商品一起拒掉**。
-        grp, trimmed = _fit_to_store(orig, st)
+        grp, trimmed, blocker = _fit_to_store(orig, st)
         dir_trim += trimmed
         if grp is None:
-            dir_out.append((orig, "过不了占用店的类目/渠道/货期闸"))
+            dir_out.append((orig, f"占用店{blocker}不符"))
+        elif not ae._gate(grp, orig["store"], st):
+            # 逐件筛过之后还过不了 = 组级的渠道闸(渠道整组同进退,剪不动)
+            dir_out.append((grp, "占用店渠道不符"))
         else:
             deck_all.append(grp)            # 带着 store 进牌堆,归属闸会认它
 
@@ -365,15 +381,24 @@ def run(params: dict) -> str:
                  + " —— 这批要你去改配置或释放品牌,不是等下一批就能好")
         # 光给总数没法动手。按「店 × 缺的大类」摊开,所有者一眼看出
         # "给 A085 开厨房能救回多少件" —— 那是他真能做的决定
+        # ⚠ 归因必须按**真实原因**分。三个闸的处置完全不同(开个大类 /
+        # 放宽货期 / 换渠道),混在一起报会把所有者送去改根本没用的那一项
         blocked: Counter = Counter()
+        slow: Counter = Counter()
         for grp, w in dir_out:
-            if w == "过不了占用店的类目/渠道/货期闸":
+            if w == "占用店类目不符":
                 blocked[(grp["store"], grp["category"] or "(未归类)")] += grp["size"]
+            elif w == "占用店货期不符":
+                slow[grp["store"]] += grp["size"]
         if blocked:
-            L.append("  其中类目挡下的,按「店 × 缺的大类」:"
+            L.append("  其中**类目**挡下的,按「店 × 缺的大类」:"
                      + " · ".join(f"{s} 缺「{c}」{n:,} 件"
                                   for (s, c), n in blocked.most_common(6))
                      + f"(共 {len(blocked)} 组合)—— 给该店开这个大类就能救回")
+        if slow:
+            L.append("  其中**货期**挡下的,按店:"
+                     + " · ".join(f"{s} {n:,} 件" for s, n in slow.most_common(6))
+                     + " —— 放宽该店「配送时长限制」或换货源才救得回,开类目没用")
     if no_gap:
         L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额(或算不出货位值),"
                  f"**配额退回剩余容量** —— 它们能接多少全看容量,与经营水平无关:"

@@ -414,3 +414,50 @@ def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
     assert "只写了**组分最高的 5 组**" in out
+
+
+def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
+    """⚠ 三个闸的处置完全不同(开个大类 / 放宽货期 / 换渠道)。
+
+    混成一个标签的实测后果(2026-08-16):货期闸挡下的组一律被记成"缺某大类",
+    把所有者送去开一个根本没用的类目。
+    """
+    st = {"categories": ["家居"], "lead_limit": 5, "channel": "FBA"}
+    # 全被类目挡
+    g1 = _grp("a", "a", [_c("B0AAAA0001", "a", 90.0, cat="厨房")])
+    assert wf._fit_to_store(g1, st)[2] == "类目"
+    # 全被货期挡
+    g2 = _grp("b", "b", [dict(_c("B0AAAA0002", "b", 90.0), lead=9)])
+    assert wf._fit_to_store(g2, st)[2] == "货期"
+    # 混着挡时按件数多的那个归因,并列按名字定序(不许随行序漂)
+    g3 = _grp("c", "c", [_c("B0AAAA0003", "c", 90.0, cat="厨房"),
+                         _c("B0AAAA0004", "c", 80.0, cat="厨房"),
+                         dict(_c("B0AAAA0005", "c", 70.0), lead=9)])
+    assert wf._fit_to_store(g3, st)[2] == "类目"
+
+
+def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
+    """货期挡下的要单列一行 —— 「给该店开这个大类」对它们完全无效。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": [], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0, "lead_limit": 5}})
+    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
+    pool = [dict(_c(f"B0SLW{i:05d}", "held0", 90.0), lead=30) for i in range(4)]
+    monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
+        "pool": [None] * len(pool), "sales": {}, "refund": {}, "risk": {},
+        "gross": {}, "risk_err": None})
+    monkeypatch.setattr(wf.product_pool, "score_all", lambda data: (pool, {}))
+    monkeypatch.setattr(wf.store_perf, "load", lambda conn, win: {
+        "A": dict(rec_days=90, active_days=90, avg_online=100, orders=90,
+                  gross=9000.0, refund=0.0, hist_rows=0, net=9000.0)})
+    monkeypatch.setattr(wf.claims, "load_active",
+                        lambda conn, kind: {"held0": "A"}
+                        if kind == wf.claims.BRAND else {})
+    monkeypatch.setattr(wf, "_pending_delist", lambda *a, **k: {})
+    monkeypatch.setattr(wf.db, "pg_conn",
+                        lambda *a, **k: __import__("contextlib").nullcontext(
+                            _Conn({"A": 0})))
+    out = wf.run({"execute": False})
+    assert "其中**货期**挡下的" in out and "开类目没用" in out
+    assert "其中**类目**挡下的" not in out

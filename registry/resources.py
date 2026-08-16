@@ -48,8 +48,31 @@ def feishu_app_secret() -> str:
 
 
 def feishu_webhook_url() -> str | None:
-    """输入:无 → 输出:运行通知群机器人 webhook URL;未配置返回 None(通知降级为仅日志)。"""
+    """输入:无 → 输出:运行通知群机器人 webhook URL;未配置返回 None。
+
+    ⚠ 这是通知的**第二条路**。首选是用应用身份直接发给人
+    (`feishu_notify_to()`)——旧系统一直是这么做的(legacy_survey:649/1818:
+    `lark-cli im +messages-send --as bot`,收件人 open_id 硬编码在 summary.py:38),
+    而群机器人 webhook 是本仓新引入的第二套身份,至今没配上。
+    """
     return os.environ.get("FEISHU_WEBHOOK_URL", "").strip() or None
+
+
+def feishu_notify_to() -> str | None:
+    """输入:无 → 输出:运行通知的收件人标识(未配置返回 None)。
+
+    取值可以是下面任意一种,**类型由前缀自动认**(见 api/feishu._receive_type):
+      `ou_…` open_id · `oc_…` chat_id(群) · 含 `@` 邮箱 · 11 位数字手机号
+
+    ⚠ 手机号**不能直接当 receive_id**(飞书的 receive_id_type 里没有"手机号"
+    这一档),要先用 `contact/v3/users/batch_get_id` 换成 open_id ——
+    api/feishu 会自动换并缓存,但那个接口要应用有 `contact:user.id:readonly`
+    权限。配 open_id 或邮箱则不需要这条权限。
+
+    前缀判型这条规矩逐字沿用旧系统(legacy_survey:1818,notify.py:137:
+    `ou_` → --user-id,`oc_` → --chat-id),换个人接手不用重新学一套。
+    """
+    return os.environ.get("FEISHU_NOTIFY_TO", "").strip() or None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

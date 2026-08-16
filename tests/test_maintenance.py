@@ -907,3 +907,70 @@ def test_two_chains_claim_disjoint_sources():
     import pytest
     with pytest.raises(ValueError):
         ppc.group_by_store([{"id": 1, "store": "T1", "sku": "S", "action": "price"}])
+
+
+# ── product_refresh 的 wait(工作项 A;产品线一条链跑完的前提)────────────────
+
+def test_product_refresh_actually_reads_the_wait_param():
+    """⚠ 2026-08-16 之前:用法行写着 -p wait=1,run() 里从头到尾没读过它。
+
+    传了等于没传 —— 后果不是报错,是**静默降级**:推完立刻返回,链里下一步
+    product_ingest 摄回来的还是上一轮的数据,而摘要看起来一切正常。
+    """
+    import inspect
+
+    from workflows import product_refresh as pr
+    src = inspect.getsource(pr.run)
+    assert 'params.get("wait")' in src
+    assert "wait_settled(" in src
+
+
+def test_wait_settled_polls_until_settled_and_reports_timeout(monkeypatch):
+    from services import scrape_batches as sb
+
+    # ⚠ 队列**不能 pop 空**:IndexError 是 LookupError 的子类,会被
+    # wait_settled 的 `except LookupError` 当成"采集侧查无此批次"吃掉
+    # (写这条用例时实际踩到,断言从 1 变成 0)。最后一个值重复返回。
+    seen = []
+    states = {"b1": [False, True], "b2": [False]}
+
+    def fake_status(name):
+        seen.append(name)
+        q = states[name]
+        v = q.pop(0) if len(q) > 1 else q[0]
+        return {"stats": {"open": 0 if v else 3}}
+
+    monkeypatch.setattr(sb.scraper, "batch_status", fake_status)
+    monkeypatch.setattr(sb, "logger", sb.logger)
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda s: None)
+
+    line, unsettled = sb.wait_settled(["b1", "b2"], timeout_min=0.01)
+    assert unsettled == 1                       # b2 没落定
+    assert "已落定 1" in line and "仍未采完 1" in line
+
+
+def test_wait_settled_gives_up_on_batches_the_scraper_lost(monkeypatch):
+    """采集侧查不到了:别再问,交给 check_open 那层认账(不算"未采完")。"""
+    from services import scrape_batches as sb
+
+    monkeypatch.setattr(sb.scraper, "batch_status",
+                        lambda n: (_ for _ in ()).throw(LookupError("no such batch")))
+    import time as _t
+    monkeypatch.setattr(_t, "sleep", lambda s: None)
+    line, unsettled = sb.wait_settled(["gone"], timeout_min=1)
+    assert unsettled == 0 and "采集侧查无 1" in line
+
+
+def test_wait_settled_is_not_a_duplicate_of_order_audit_wait():
+    """两个等待函数**能力不同**,不是重复实现 —— 订单审核那条还要等截图。
+
+    合成一个再加开关,只会让两边的超时语义互相拖累(本仓"同一目的多种方法"
+    那条:能力不同就写两个显式函数)。
+    """
+    import inspect
+
+    from services import scrape_batches as sb
+    from workflows import order_audit
+    assert "screenshots" not in inspect.getsource(sb.wait_settled)
+    assert "shots" in inspect.getsource(order_audit._wait_for_batches)

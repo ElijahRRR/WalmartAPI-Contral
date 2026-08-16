@@ -271,3 +271,109 @@ def test_dedup_never_writes_a_product_event():
             assert "dedup" not in gate, (
                 f"{m.__name__} 第 {i + 1} 行:产品事件写在了含 dedup 的分支里"
                 f" —— {gate.strip()!r}")
+
+
+def test_upc_writeback_runs_after_listing_not_beside_injection():
+    """⚠ 回写必须在上架**之后** —— 放注入旁边回写的是上一轮的状态。
+
+    表面看也在动,实际上你永远看不到刚刚这一轮消耗了哪些号
+    (所有者定稿 2026-08-16:upc_sync 并进上架)。
+    """
+    import inspect
+
+    from workflows import list_new
+    src = inspect.getsource(list_new.run)
+    assert src.index("_sync_upc(") < src.index("_load_gate_state()")
+    assert src.index("_writeback_upc(") > src.index("_load_gate_state()")
+
+
+def test_upc_writeback_is_skipped_on_dry_run_and_never_blocks(monkeypatch):
+    from services import upc_pool
+    from workflows import list_new
+
+    lines = []
+    list_new._writeback_upc(False, lines)        # dry-run:一个字都不写
+    assert lines == []
+
+    monkeypatch.setattr(upc_pool, "sync_from_sheet",
+                        lambda conn: (_ for _ in ()).throw(RuntimeError("飞书 502")))
+    import contextlib
+
+    from registry import db
+
+    @contextlib.contextmanager
+    def _open():
+        yield object()
+
+    monkeypatch.setattr(db, "pg_conn", _open)
+    list_new._writeback_upc(True, lines)         # 不抛
+    assert "回写失败" in lines[0] and "feed 已提交" in lines[0]
+
+
+# ── 飞书通知:应用直发(工作项 C)────────────────────────────────────────────
+
+def test_receive_type_follows_the_legacy_prefix_rule():
+    """前缀判型逐字沿用旧系统(legacy_survey:1818,notify.py:137)。"""
+    from api import feishu
+    assert feishu._receive_type("ou_36c5f91668c42a735e7b9d4ae74eedc1") == "open_id"
+    assert feishu._receive_type("oc_abc") == "chat_id"
+    assert feishu._receive_type("someone@example.com") == "email"
+    # ⚠ 手机号飞书**没有**这一档,必须先换 open_id
+    assert feishu._receive_type("17882211182") == "mobile"
+
+
+def test_mobile_is_resolved_to_open_id_before_sending(monkeypatch):
+    from api import feishu
+    feishu._open_id_cache.clear()
+    calls = []
+
+    def fake_call(method, path, *, json_body=None, params=None, timeout=60):
+        calls.append((path, params, json_body))
+        if "batch_get_id" in path:
+            return {"user_list": [{"user_id": "ou_resolved"}]}
+        return {}
+
+    monkeypatch.setattr(feishu, "_call", fake_call)
+    monkeypatch.setattr(feishu.resources, "feishu_notify_to", lambda: "17882211182")
+    assert feishu.notify("测试") is True
+    assert "batch_get_id" in calls[0][0] and calls[0][2] == {"mobiles": ["17882211182"]}
+    send_path, send_params, send_body = calls[1]
+    assert send_path == "/open-apis/im/v1/messages"
+    assert send_params == {"receive_id_type": "open_id"}
+    assert send_body["receive_id"] == "ou_resolved"
+    # ⚠ content 必须是**字符串化的 JSON**,传对象飞书直接拒
+    assert isinstance(send_body["content"], str)
+    import json as _json
+    assert _json.loads(send_body["content"]) == {"text": "测试"}
+    # 换 ID 只做一次(进程内缓存)
+    feishu.notify("再来一条")
+    assert sum(1 for c in calls if "batch_get_id" in c[0]) == 1
+
+
+def test_notify_falls_back_to_webhook_then_to_log(monkeypatch, caplog):
+    """三条路依次退:应用 → webhook → 只记日志。切换期不把通知打断。"""
+    import logging as _logging
+
+    from api import feishu
+    monkeypatch.setattr(feishu.resources, "feishu_notify_to", lambda: "ou_x")
+    monkeypatch.setattr(feishu, "_call",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("没权限")))
+    posted = []
+
+    class _Resp:
+        def json(self):
+            return {"code": 0}
+
+    class _C:
+        def post(self, url, json=None, timeout=None):
+            posted.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(feishu, "_http", lambda: _C())
+    monkeypatch.setattr(feishu.resources, "feishu_webhook_url", lambda: "https://hook")
+    assert feishu.notify("x") is True and posted == ["https://hook"]
+
+    monkeypatch.setattr(feishu.resources, "feishu_webhook_url", lambda: None)
+    with caplog.at_level(_logging.INFO, logger="api.feishu"):
+        assert feishu.notify("x") is False
+    assert any("均未配置" in m for m in caplog.messages)

@@ -18,6 +18,7 @@ bitable 为全新实现,但重试/退避/切块参数照抄旧系统的实测值
 本层不出现任何具体表的字段名。
 """
 
+import json
 import logging
 import re
 import threading
@@ -623,15 +624,110 @@ def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int
     return len(items)
 
 
-def notify(text: str) -> bool:
-    """输入:通知文本 → 输出:是否真正发出。
+_MOBILE_RE = re.compile(r"^\d{11}$")
+_open_id_cache: dict[str, str] = {}      # 手机号/邮箱 → open_id(进程内)
 
-    通过群机器人 webhook(registry:FEISHU_WEBHOOK_URL)发文本消息;
-    未配置时降级为仅记日志并返回 False。绝不抛异常——通知失败不能拖垮工作流。
+
+def _receive_type(who: str) -> str:
+    """输入:收件人标识 → 输出:飞书 receive_id_type。纯函数,可测。
+
+    前缀判型逐字沿用旧系统(legacy_survey:1818,notify.py:137):
+    `ou_` → open_id、`oc_` → chat_id。另补邮箱与手机号两种人好记的写法。
     """
+    w = str(who or "").strip()
+    if w.startswith("ou_"):
+        return "open_id"
+    if w.startswith("oc_"):
+        return "chat_id"
+    if w.startswith("on_"):
+        return "union_id"
+    if "@" in w:
+        return "email"
+    if _MOBILE_RE.match(w):
+        return "mobile"          # ⚠ 飞书**没有**这一档,要先换 open_id
+    return "user_id"
+
+
+def resolve_open_id(who: str) -> str | None:
+    """输入:手机号或邮箱 → 输出:open_id(查不到返 None)。进程内缓存。
+
+    ⚠ **手机号不能直接当 receive_id** —— 飞书 `im/v1/messages` 的
+    receive_id_type 只有 open_id / user_id / union_id / email / chat_id 五档,
+    没有"手机号"。所以先走通讯录换 ID。
+
+    这一步要应用有 **`contact:user.id:readonly`** 权限。没有权限时飞书返
+    99991672 之类的错,本函数只告警返 None —— 调用方会退到 webhook 或只记日志,
+    不会因为"通知发不出去"把工作流拖垮。
+    """
+    key = str(who or "").strip()
+    if not key:
+        return None
+    if key in _open_id_cache:
+        return _open_id_cache[key]
+    field = "mobiles" if _MOBILE_RE.match(key) else "emails"
+    try:
+        data = _call("POST", "/open-apis/contact/v3/users/batch_get_id",
+                     params={"user_id_type": "open_id"}, json_body={field: [key]})
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("手机号/邮箱换 open_id 失败(应用是否有 "
+                       "contact:user.id:readonly 权限?):%s", e)
+        return None
+    for u in (data.get("user_list") or []):
+        oid = str(u.get("user_id") or u.get("open_id") or "").strip()
+        if oid:
+            _open_id_cache[key] = oid
+            return oid
+    logger.warning("通讯录里查不到 %s 对应的用户(号码是否为飞书账号?)", key)
+    return None
+
+
+def _notify_via_app(text: str) -> bool:
+    """输入:通知文本 → 输出:是否发出。用**应用身份**直接发给人或群。
+
+    旧系统一直是这么发的(legacy_survey:649/1818:`lark-cli im +messages-send
+    --as bot`,收件人 open_id 硬编码在 summary.py:38)——本仓改回同一条路,
+    群机器人 webhook 退为备用。
+    """
+    who = resources.feishu_notify_to()
+    if not who:
+        return False
+    rtype = _receive_type(who)
+    if rtype == "mobile":
+        who = resolve_open_id(who)
+        if not who:
+            return False
+        rtype = "open_id"
+    # ⚠ content 必须是**字符串化的 JSON**,不是嵌套对象 ——
+    # 传对象飞书直接拒(这是这个接口最常见的错法)
+    _call("POST", "/open-apis/im/v1/messages",
+          params={"receive_id_type": rtype},
+          json_body={"receive_id": who, "msg_type": "text",
+                     "content": json.dumps({"text": text}, ensure_ascii=False)},
+          timeout=15)
+    return True
+
+
+def notify(text: str) -> bool:
+    """输入:通知文本 → 输出:是否真正发出。**绝不抛异常**(通知失败不能拖垮工作流)。
+
+    三条路依次退,任何一条成了就返回 True:
+      ① 应用身份直发(FEISHU_NOTIFY_TO,支持 open_id/chat_id/邮箱/手机号)
+      ② 群机器人 webhook(FEISHU_WEBHOOK_URL)
+      ③ 都没配 → 只记日志,返回 False
+
+    留两条而不是一刀切换,是为了切换期不把通知打断:应用权限还没批下来时
+    webhook 照样能发,反过来也一样。
+    """
+    try:
+        if _notify_via_app(text):
+            return True
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("飞书应用通知失败(退到 webhook):%s", e)
+
     url = resources.feishu_webhook_url()
     if not url:
-        logger.info("FEISHU_WEBHOOK_URL 未配置,通知仅记日志:%s", text)
+        logger.info("FEISHU_NOTIFY_TO 与 FEISHU_WEBHOOK_URL 均未配置,"
+                    "通知仅记日志:%s", text)
         return False
     try:
         resp = _http().post(url, json={"msg_type": "text", "content": {"text": text}}, timeout=15)

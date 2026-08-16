@@ -214,6 +214,59 @@ def shots_open(status_body: dict) -> int:
         return 0
 
 
+def wait_settled(names: list[str], timeout_min: int) -> tuple[str, int]:
+    """输入:本轮推出的批次名 + 超时分钟 → 输出:(摘要行, 仍未落定的批次数)。
+
+    只回答一个问题:**采集侧还在跑吗**(`is_settled`)。不碰台账、不等截图 ——
+    台账落定归 `check_open`(调用方在等完之后跑一次),截图归订单审核那条链。
+
+    ⚠ **与 `order_audit._wait_for_batches` 是两个函数,不是重复实现。**
+    那一条额外等截图(审核要图做佐证,且有 shots 二次窗口);本条服务的是维护链
+    的数据新鲜度,截图与它无关。按"能力不同的两个端点写两个显式函数"那条规矩,
+    合成一个再加开关只会让两边的超时语义互相拖累。共用的那部分(落定判据
+    `is_settled`)本来就在同一个函数里,不会漂。
+
+    退避 3 秒起、1.5 倍涨、封顶 30 秒:小批次几秒就完,别死等;大批次也不该
+    每 3 秒问一次。超时**不是失败** —— 已采到的照常进增量流,调用方据此决定
+    要不要继续往下走。
+    """
+    import time
+    if not names:
+        return "", 0
+    deadline = time.monotonic() + timeout_min * 60
+    started = time.monotonic()
+    pending, gone = set(names), set()
+    delay = 3.0
+    while pending and time.monotonic() < deadline:
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 30.0)
+        for name in sorted(pending):
+            try:
+                st = scraper.batch_status(name)
+            except LookupError:
+                # 采集侧查不到了(batch_status 只在 HTTP 404 时抛这个):
+                # 再等没意义,交给 check_open 那层认账。
+                # ⚠ IndexError/KeyError 也是 LookupError —— batch_status 现在
+                # 不会抛它们(只 404 抛、坏 JSON 抛 ValueError),将来若改成
+                # 索引取值,那类解析错会被这里误当成"批次没了"
+                pending.discard(name)
+                gone.add(name)
+                continue
+            except Exception as e:                      # noqa: BLE001
+                logger.warning("等批次 %s:状态查询失败(继续等):%s", name, e)
+                continue
+            if is_settled(st):
+                pending.discard(name)
+    mins = (time.monotonic() - started) / 60
+    bits = [f"等采集:{len(names)} 个批次,已落定 {len(names) - len(pending) - len(gone)}"]
+    if gone:
+        bits.append(f"⚠ 采集侧查无 {len(gone)}")
+    if pending:
+        bits.append(f"⚠ **超 {timeout_min} 分钟仍未采完 {len(pending)}** "
+                    f"(已采到的照常进增量流,没采到的下轮再说)")
+    return f"{','.join(bits)},耗时 {mins:.0f} 分钟", len(pending)
+
+
 _SQL_OPEN = """
 SELECT batch_name, batch_id, asin_count, status, submitted_at
 FROM ops.scrape_batches

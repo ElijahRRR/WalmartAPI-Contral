@@ -1,4 +1,4 @@
-# 调度计划 v3(2026-08-16,两轮批复后;只差 python 路径与飞书接收人)
+# 调度计划 v4(2026-08-16,三轮批复后;**输入齐了,四件代码活已做三件**)
 
 > v1 是我按旧系统形态推的;所有者 2026-08-16 给了七条批复,**结构按他的四条业务线
 > 重排**,并答掉了六个开放问题中的五个。本文是 v2。
@@ -15,6 +15,9 @@
 | 5 | 「等待会占锁吗?什么锁」 | 见第五节(会,`<DATA_ROOT>/locks/order_audit.lock`);结论:**保持默认 `wait=1`**,不写 `wait=0` |
 | 6 | 采集器 3000/分钟扛得住 | ✅ **改变了 v1 的结论**:全量重推约 50 分钟采完,产品线**能一次性做完**(见第一节) |
 | 7 | 没有 hermes,现在是 GPT 调度;每小时订单/审核是 cron;feed 轮询也照此 | ✅ 全部走 launchd/cron,一律不接 GPT。⚠ `legacy_schedules.md` A 表写的"hermes 平台"已过时,停旧取证时按 GPT 侧的实际注册表核对 |
+| 8 | python 路径 `/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3` | ✅ 全部 plist 的解释器 |
+| 9 | `sku_locked_heal` **暂不挂调度** | ✅ 从时间表移除,划入手动 |
+| 10 | 飞书接收人 `17882211182`(手机号) | ✅ 已实现自动换 open_id;⚠ 要应用有 `contact:user.id:readonly` 权限,见第七节 C |
 
 ## 一、v1 的一处判断被批复 6 推翻(重要)
 
@@ -117,7 +120,7 @@ KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 
 | 工作流 | 定稿 | 说明 |
 |---|---|---|
 | `product_clear` | **每日 15:00 进调度** | 消费运营填的「停用/删除表」;不定时跑 = 运营填了没人执行(旧系统同款时间) |
-| `sku_locked_heal` | **每日 23:30 进调度**(建议) | 见下面「它是什么」 |
+| `sku_locked_heal` | **暂不挂调度**(所有者定稿) | 手动跑。见下面「它是什么」——不跑的话撞上 SKU_LOCKED 的行会在上架表里积压,上架频率不高时手动清即可 |
 | `upc_sync` | **不进调度**,并进 `list_new` | 所有者:「放到上架里,上架前执行一次就好了」 |
 | `catalog_health` | 不进调度 | 纯 SQL 只读体检,想看时手动跑 |
 
@@ -139,7 +142,9 @@ KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 
 —— ① 和 ③ 在同一轮里各自推进(今天退役的,明天这一轮才够 24 小时被清列)。
 
 所以它服务的是**上架链的自愈**:没有它,撞上 SKU_LOCKED 的行就永久卡在上架表里。
-上架虽然手动,但这条清障要定时跑,否则积压。23:30 是照搬旧时间(冷却按天对齐)。
+上架虽然手动,这条清障**所有者定为暂不挂调度**,手动跑。⚠ 代价是撞上 SKU_LOCKED
+的行会一直躺在上架表里(不会自己好),上架前顺手跑一次即可 ——
+`python cli.py sku_locked_heal --dry-run` 先看,再去掉 --dry-run。
 
 ### `upc_sync` 并进 `list_new` 的做法(有个建议)
 
@@ -209,56 +214,74 @@ settlement_sync   → 写对账表
 远小于一小时,一条命令出真结论,而 `wait=0` 会让结论恒定滞后一轮 ——
 "忘了就静默降级"正是这个默认值当初要避免的。
 
-## 六、还差的两样(其余都已定)
+## 六、输入已齐
 
-1. **那个 venv 的 python 绝对路径。** 在项目目录下、**激活 venv 之后**跑:
+| 项 | 值 |
+|---|---|
+| 解释器 | `/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3` |
+| 仓库 | `/Users/nextderboy/Projects/WalmartAPI-Contral` |
+| DATA_ROOT | `/Users/nextderboy/Projects/WalmartAPI_data`(与仓库平级,`registry/paths` 默认推导) |
+| 通知接收人 | `17882211182`(手机号 → 自动换 open_id) |
 
-   ```
-   python3 -c 'import sys; print(sys.executable)'
-   ```
-
-   (上一版我把全角括号写进了命令里,你复制过去才报 `SyntaxError` —— 我的错。
-   上面这条用单引号,可直接整行复制。)
-
-   plist 不过 shell、不读 `~/.zshrc`,**不需要 activate**,直接把这个绝对路径
-   当解释器写进 `ProgramArguments` 即可。
-
-2. **飞书通知的接收人标识**(见第七节 C)。所有者:「应用可以直接给我发消息,
-   并不需要进群组,现在就是这样子的」—— 那就是**给个人发**,
-   `receive_id_type` 用 `open_id`(或 `user_id` / `email`)。
-   要你给一个:你的 **open_id**,或飞书账号**邮箱**(用 `email` 类型最省事)。
+⚠ plist **不需要 activate venv**:直接把上面那个 `.venv/bin/python3` 当解释器写进
+`ProgramArguments` 就行 —— venv 的 python 会自己把 `site-packages` 摆对。
 
 ## 七、起调度之前必须先做的四件代码活
 
-| | 工作项 | 为什么必须在起调度之前 |
+| | 工作项 | 状态 |
 |---|---|---|
-| **A** | 实现 `product_refresh` 的 `wait`(轮询批次到落定,`TIMEOUT_HOURS=1` 兜底) | 不做的话产品线"一次性做完"是假的:摄回来的是上一轮数据,**而且不报错** |
-| **B** | 订单中心五表拆到 `services/order_center.py`,各链跑完自己写 | 所有者:「已对接飞书表的,执行完就写,不要做成单独的」 |
-| **C** | 飞书通知改用**应用直接发给所有者**,不再依赖群机器人 webhook | `FEISHU_WEBHOOK_URL` 至今没配,15 条链的成功/失败通知一条都发不出去 |
-| **D** | `list_new` 上架**之后**补一次 UPC 池回写(`project_to_sheet`) | 所有者:upc_sync 并进上架、不单独调度。注入已在上架前(已落地),回写要放上架后才看得到这一轮的消耗 |
+| **A** | 实现 `product_refresh` 的 `wait`(轮询批次到落定,`TIMEOUT_HOURS=1` 兜底) | ✅ **已做**。落在 `services.scrape_batches.wait_settled()`;等完再跑一次 `check_open` 落台账。超时不停链(已采到的照常能用),但摘要点名 |
+| **B** | 订单中心五表拆到 `services/order_center.py`,各链跑完自己写 | ⬜ **待做**(下一步) |
+| **C** | 飞书通知改用**应用直接发给所有者** | ✅ **已做**。三条路依次退;手机号自动换 open_id 并缓存 |
+| **D** | `list_new` 上架**之后**补一次 UPC 池回写 | ✅ **已做**(`_writeback_upc`,dry-run 不写,失败不阻断) |
 
-### 关于 C:用绑定的飞书应用**直接发给你** —— 可以,而且更简单
+### 关于 C:飞书通知改应用直发(已实现)——**旧项目就是这么做的**
 
-所有者:「应用可以直接给我发消息,并不需要进群组,现在就是这样子的」。
-那就不用 chat_id、不用拉群 —— 走**给个人发**:
+查了旧仓摸底底稿,证据确凿:
+
+- **身份**:`lark-cli im +messages-send --as bot`,AppID `cli_a9561a4f8dfadcd2`
+  (`legacy_survey.md:649/1818`)—— 一直是**应用身份**,不是群机器人 webhook。
+- **收件人**:open_id `ou_36c5f91668c42a735e7b9d4ae74eedc1`(运营苏里 /
+  freafish006@gmail.com),硬编码在 `summary.py:38`。
+- **判型规则**:`ou_` 前缀 → `--user-id`,`oc_` → `--chat-id`(`notify.py:137`)。
+
+所以群机器人 webhook 是**本仓新引入的第二套身份**,至今没配上 —— 改回应用直发
+等于回到旧系统一直在用的那条路。判型规则逐字沿用,换人接手不用重学。
+
+新增环境变量 **`FEISHU_NOTIFY_TO`**,取值可以是四种写法,类型自动认:
+
+| 写法 | receive_id_type |
+|---|---|
+| `ou_…` | open_id |
+| `oc_…` | chat_id(群) |
+| 含 `@` | email |
+| 11 位数字 | ⚠ 飞书**没有**这一档,先换 open_id(见下) |
+
+所有者给的是**手机号 `17882211182`**。飞书 `im/v1/messages` 的
+`receive_id_type` 只有 open_id / user_id / union_id / email / chat_id 五档,
+**没有手机号**,所以代码里先走一步通讯录换 ID:
 
 ```
-POST /open-apis/im/v1/messages?receive_id_type=open_id      ← 或 user_id / email
-Authorization: Bearer <tenant_access_token>                  ← 项目其余部分本来就在用
-{"receive_id": "<你的 open_id>", "msg_type": "text",
- "content": "{\"text\":\"…\"}"}
+POST /open-apis/contact/v3/users/batch_get_id?user_id_type=open_id
+{"mobiles": ["17882211182"]}          → open_id,进程内缓存,只换一次
 ```
 
-⚠ `content` 是**字符串化的 JSON**,不是嵌套对象 —— 传成对象飞书会报
-`invalid content`。这是这个接口最常见的坑。
+⚠ **这一步要应用有 `contact:user.id:readonly` 权限**(后台加完要发布版本)。
+没有权限时只告警、退到 webhook 或只记日志,**不会把工作流拖垮**。
+嫌麻烦的话:直接把 `FEISHU_NOTIFY_TO` 填成 **open_id 或飞书账号邮箱**,
+就不需要这条权限。
 
-需要的权限:`im:message:send_as_bot`(飞书后台改完要**发布版本**才生效);
-应用与你之间要有会话(既然"现在就是这样子的",这条已经成立)。
+⚠ 实现里踩住的那个坑:`content` 必须是**字符串化的 JSON**
+(`"{\"text\":\"…\"}"`),传成嵌套对象飞书直接拒 —— 有用例钉着。
 
-registry 新增两个变量:`FEISHU_NOTIFY_RECEIVE_ID` 与
-`FEISHU_NOTIFY_RECEIVE_ID_TYPE`(默认 `open_id`)。
-实现上**三条路依次退**:配了接收人走应用 → 否则有 webhook 走 webhook →
-都没有只记日志。切换期不至于把通知打断,也不用一次性把 webhook 拆掉。
+三条路依次退:应用直发 → webhook → 只记日志。切换期不会把通知打断。
+
+**要配的 .env 两行**:
+
+```
+FEISHU_NOTIFY_TO=17882211182
+# FEISHU_WEBHOOK_URL=…        # 可留空;应用发通了就不需要它
+```
 
 ## 八、plist 模板与四个坑(批复 2 之后少了一个)
 
@@ -270,19 +293,19 @@ registry 新增两个变量:`FEISHU_NOTIFY_RECEIVE_ID` 与
   <key>Label</key> <string>com.walmartapi.order_chain</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/绝对路径/venv/bin/python</string>
-    <string>/绝对路径/WalmartAPI-Contral/cli.py</string>
+    <string>/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3</string>
+    <string>/Users/nextderboy/Projects/WalmartAPI-Contral/cli.py</string>
     <string>order_sync</string><string>order_audit</string><string>returns_sync</string>
   </array>
-  <key>WorkingDirectory</key> <string>/绝对路径/WalmartAPI-Contral</string>
+  <key>WorkingDirectory</key> <string>/Users/nextderboy/Projects/WalmartAPI-Contral</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>WALMART_OPERATOR</key> <string>launchd</string>
     <key>PATH</key> <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
   </dict>
   <key>StartCalendarInterval</key> <dict><key>Minute</key><integer>20</integer></dict>
-  <key>StandardOutPath</key>  <string>/绝对路径/WalmartAPI_data/logs/launchd/order_chain.out</string>
-  <key>StandardErrorPath</key><string>/绝对路径/WalmartAPI_data/logs/launchd/order_chain.err</string>
+  <key>StandardOutPath</key>  <string>/Users/nextderboy/Projects/WalmartAPI_data/logs/launchd/order_chain.out</string>
+  <key>StandardErrorPath</key><string>/Users/nextderboy/Projects/WalmartAPI_data/logs/launchd/order_chain.err</string>
   <key>RunAtLoad</key> <false/>
 </dict></plist>
 ```
@@ -306,7 +329,7 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 
 (v1 的"睡眠补跑"坑作废 —— 批复 2:不关机。)
 
-## 九、时间表(v3 汇总)
+## 九、时间表(v4 汇总)
 
 | 时间 | 命令 | 线 |
 |---|---|---|
@@ -316,7 +339,6 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 | 07:30 | `perf_problems` | 线 2 |
 | 09:00 | `catalog_sync product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1` | 线 1 |
 | 15:00 | `product_clear` | 定稿 |
-| 23:30 | `sku_locked_heal` | 建议 |
 | 每小时 :20 | `order_sync order_audit returns_sync` | 线 2 |
 | 每 30 分 | `feed_poll` | 基础 |
 | 双周三 08:00 | `settlement_sync` | 线 2 |

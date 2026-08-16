@@ -356,6 +356,34 @@ def _sync_upc(execute: bool, lines: list[str]) -> None:
                      f"刚贴进表格的号要等下轮或手动 `python cli.py upc_sync`")
 
 
+def _writeback_upc(execute: bool, lines: list[str]) -> None:
+    """上架**之后**把 UPC 池状态回写飞书 C~F(所有者定稿 2026-08-16)。
+
+    与开头那次注入是同一个工作流的两头,合起来等于跑了一次 `upc_sync`,
+    所以 `upc_sync` 不必再单独挂调度(所有者:「放到上架里」)。
+
+    ⚠ **必须放在上架之后**:回写的是 PG 现状(哪些号已领、已用、给了谁)。
+    放在注入旁边一起做,回写出来的是**上一轮**的状态 —— 表面看也在动,
+    实际上你永远看不到刚刚这一轮消耗了哪些号。
+
+    失败只告警不阻断:feed 已经提交出去了,回写只是展示面板
+    (与 maintenance 写维护记录同款纪律)。
+    """
+    if not execute:
+        return
+    try:
+        with db.pg_conn() as conn:
+            got = upc_pool.sync_from_sheet(conn)     # 先取行(顺带把新号补进来)
+            n = upc_pool.project_to_sheet(conn, got["rows"]) if got["rows"] else 0
+        lines.append(f"UPC池状态回写 {n} 行(仅差异行)")
+    except LookupError as e:
+        lines.append(f"⚠ UPC池表未登记,状态未回写({e})")
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("UPC池状态回写失败(不影响本轮上架): %s", e)
+        lines.append(f"⚠ UPC池状态回写失败:{e}"
+                     f"(feed 已提交;补写跑 `python cli.py upc_sync`)")
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
@@ -687,5 +715,6 @@ def run(params: dict) -> str:
 
     for rownum, why in reasons[n_reasons_written:]:   # 提交期新增的理由(UPC/标题)
         listing_sheet.write_reason(rownum, why)
+    _writeback_upc(execute, lines)
     lines.append("回执 O/P/Q 由 feed_poll 反哺器回填;结果轮询走 feed_poll")
     return "\n".join(lines)

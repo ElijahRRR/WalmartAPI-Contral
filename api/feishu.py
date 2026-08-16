@@ -631,7 +631,12 @@ def notify(text: str) -> bool:
     """
     url = resources.feishu_webhook_url()
     if not url:
-        logger.info("FEISHU_WEBHOOK_URL 未配置,通知仅记日志:%s", text)
+        # ⚠ 只记**首行**。整段抄一遍的话,cli 传进来的是完整摘要,而它此刻
+        # 已经打到终端了 —— 再吐一份就是同一屏文字出现两次(2026-08-16 所有者
+        # 反馈"所有的命令都是这样子的")。全文进不进日志由 cli 决定,
+        # 通知这一层只负责说"没发出去"。
+        logger.info("FEISHU_WEBHOOK_URL 未配置,通知未发出:%s",
+                    text.strip().splitlines()[0] if text.strip() else "(空)")
         return False
     try:
         resp = _http().post(url, json={"msg_type": "text", "content": {"text": text}}, timeout=15)

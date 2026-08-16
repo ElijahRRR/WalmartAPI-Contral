@@ -37,24 +37,57 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# 参数值里混进了本该独立成词的开关。成因几乎总是**分隔符不是普通空格**
+# ——从聊天/网页复制命令时容易带上不换行空格(U+00A0)等,shell 不把它当
+# 分词符,于是 `-p k=v --execute` 整串进了 v。
+# ⚠ **只报错,绝不"帮你"把它解释成开关**:那等于让一个粘贴事故把 dry-run
+#    变成真跑。危险工作流的 --execute 必须是人显式敲进去的。
+_FLAGS = ("--execute", "-p", "--param", "-h", "--help")
+
+
 def _build_params(pairs: list[str]) -> dict:
     params = {}
     for item in pairs:
         if "=" not in item:
             raise SystemExit(f"参数格式错误(应为 key=value): {item}")
         k, _, v = item.partition("=")
-        params[k.strip()] = v.strip()
+        v = v.strip()
+        # split() 按任意空白切,包括 U+00A0 —— 正是要抓的那种
+        stuck = [w for w in v.split() if w in _FLAGS]
+        if stuck:
+            raise SystemExit(
+                f"参数值里粘进了开关 {' '.join(stuck)}:\n"
+                f"    -p {k.strip()}={v}\n"
+                f"  多半是路径与开关之间那个空格不是普通空格(从聊天/网页复制\n"
+                f"  常带不换行空格)。把该处空格重敲一遍,或给值加引号:\n"
+                f"    -p \"{k.strip()}={v.split()[0]}\" {' '.join(stuck)}\n"
+                f"  ⚠ 本命令**没有执行**——不会替你把它当成开关,免得一次粘贴\n"
+                f"    事故把 dry-run 变成真跑。")
+        params[k.strip()] = v
     return params
+
+
+class _NotOnScreen(logging.Filter):
+    """带 `file_only=True` 的记录只进日志文件,不上终端。
+
+    摘要要**同时**满足两个需求:终端上干干净净出现一次(人在看),日志文件里
+    留全文(事后查"那次到底输出了什么",这是唯一能回答的地方)。少了过滤器
+    就只能二选一 —— 要么终端刷两遍,要么日志里没有摘要。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "file_only", False)
 
 
 def _setup_logging(workflow: str, logs_dir: Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     logfile = logs_dir / f"{workflow}.log"
+    screen = logging.StreamHandler(sys.stderr)
+    screen.addFilter(_NotOnScreen())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(logfile, encoding="utf-8"),
-                  logging.StreamHandler(sys.stderr)],
+        handlers=[logging.FileHandler(logfile, encoding="utf-8"), screen],
     )
 
 
@@ -148,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         _notify(f"❌ {mode}{args.workflow} 失败\n{err.strip().splitlines()[-1]}")
         return 1
 
-    logger.info("workflow %s 成功: %s", args.workflow, summary)
+    # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
+    logger.info("workflow %s 成功:\n%s", args.workflow, summary,
+                extra={"file_only": True})
     print(summary)
     _record_finish(run_id, "success", summary)
     _notify(f"✅ {mode}{args.workflow} 成功\n{summary}")

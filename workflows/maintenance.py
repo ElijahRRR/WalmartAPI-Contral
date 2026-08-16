@@ -31,7 +31,7 @@
          vs 沃尔玛现价,差异 ≥1 分且 ≥1% 才提交;出界/倍率未配置 → 不动
   改库存 amz stock_count vs 沃尔玛 avail_qty;**没采到(NULL)也写 0**
          (所有者定稿 2026-08-09:采不到就不卖);配送 **>8 天**写 0
-         (同日从旧值 12 收紧,与 list_new 共用 amz_source.MAX_LEAD_DAYS)
+         (两次收紧 12 →08-09→ 8 →08-15→ 7,与 list_new 共用 amz_source.MAX_LEAD_DAYS)
   改标题 amz 标题过与上架同一套文案处理(去品牌/截 199)vs 沃尔玛现标题;
          占位符跳过、productType/UPC/标题三缺一跳过(旧防线)
   跟卖铺货 source_type='match' 且在架且库存 0/未知 → 补到保守值

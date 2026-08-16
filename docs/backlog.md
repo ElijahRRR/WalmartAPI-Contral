@@ -84,7 +84,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 ## 三、产品事件账本(catalog.product_events)
 
 - ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
-- ⬜ **入库/审核事件未接**:product_ingest 不写账本;`catalog.products` 的 audit_status/audit_reason/audited_at/audit_version/walmart_pt 五列零触及(等二期审核服务,`docs/scraper_migration_brief.md:66-68`;接缝已在 `services/product_events.py` docstring 登记——届时补常量,休眠码不预进 EVENTS)
+- 🟡 **审核五列已接通(2026-08-12,分配 A0),入库/审核事件仍未接**:`workflows/audit_sync.py` 直连审核系统库(walmart_audit,registry/db.audit_conn 只读)回流 verdict/PT/理由/时间/run_id 进 `catalog.products` 五列,待生产验收(.env 配 WALMART_AUDIT_DSN → 全量跑一轮 → 抽查);product_ingest 仍不写账本,入库/审核**事件**保持休眠(接缝在 `services/product_events.py` docstring,届时补常量)
 - ✅ ~~只写不读~~(2026-08-11:`status_changes` / `feed_failures` 两个读侧视图平铺 jsonb,AI/人工直接 SELECT;`list/match_submitted` 计入 risk 视图 submit_times;`retire_feed_success` 属回执流水,读侧走 feed_failures 之外的 ops.feed_items,不另建)
 - ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件口径**(所有者两次拍板 2026-08-12,后者为准):**防呆=黑名单,不看删除史**——拦"出现过侵权/审查等拉黑类别"的(asin_blacklist/brand_blacklist),不拦"因产品问题删过"的(可修复类删除后重上是正常经营)。product_risk 视图降级为纯查询档案;曾短暂上过"有删除史即拦",当日拆除。"不明原因消失"史(item_missing 且从未提交删/停=疑似平台下架)只提示不拦截(unexplained_missing 标志,list_new 摘要报警)。"要不要拦停用史"之争随之消解——停用同样看拉黑类别,不看动作)
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
@@ -100,11 +100,12 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 - ✅ ~~`listing` schema 架空双表~~(2026-08-12 workflow 逐一核证零代码引用后清理:`listing.tasks`/`listing.upc_pool` DROP,schema.sql 退役清理节;legacy_reference.md:74 落点同步改正——UPC 池已拍板不迁)
 - ✅ ~~orders.orders / order_center 视图~~(2026-08-12 清理:视图零读者直接 DROP;旧表带"仅空表才删"守卫防手滑)
-- ✅ ~~catalog.products 十列死列~~(2026-08-12 判定:**assigned_upc/listing_attrs/last_feed_id/store/owner 五列删除**(零读写,职责被 catalog.upc_pool/llm_cache/ops.feed_log/飞书上架表接管);**audit_* 五列保留**=二期审核接缝,三处登记一致,非遗忘死列)
+- ✅ ~~catalog.products 十列死列~~(2026-08-12 判定:**assigned_upc/listing_attrs/last_feed_id/store/owner 五列删除**(零读写,职责被 catalog.upc_pool/llm_cache/ops.feed_log/飞书上架表接管);**audit_* 五列保留**=二期审核接缝,三处登记一致,非遗忘死列——同日由分配 A0 的 audit_sync 接通写入,见第三节)
 - ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
 - 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列**留着**(所有者拍板 2026-08-13:已映射到飞书多维表格,是运营参考数据);`ops.scrape_failures.error_detail` **仍是零程序读者**(⚠ 2026-08-14 订正:上一版写它"有读者(v_scrape_failure_stats 视图)"——但那个视图**自己**全仓零引用,拿它当读者是循环论证,会一直给下次盘点提供假证据。视图与列都保留:视图是人工/AI 排查采集失败的聚合面,与 catalog.product_risk_store 等四个视图同性质;error_detail 是 variant_offset 的 `page=<实际ASIN>` 唯一载体),status/retry_count 零读方但为采集契约镜像,随上一条一并保留;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**;清理器**暂不做**(所有者拍板 2026-08-13,上量后再议)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
+- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置已定稿归分配 A1:store_release 整店释放时同步标 missing_since(校正观测;`docs/allocation_plan.md` §十二.11);存量清单随 A0.5 审计出
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)
 
@@ -139,6 +140,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 > 在线产品拉取(catalog_sync)、几种订单拉取、日报拉取**。
 
 - 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
+- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §十二.10)
 - **涨跌幅闸**(maintenance.py:47,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议
 - 挂调度:全部工作流一条没挂;顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance`;feed_poll 高频
 - 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)

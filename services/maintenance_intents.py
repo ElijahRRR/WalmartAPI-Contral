@@ -70,7 +70,11 @@ _SQL_AMZ_JOIN = """
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        w.price AS wm_price, w.avail_qty,
        s.price AS amz_price, s.stock_count, s.delivery_days,
-       p.slow, s.fulfillment, s.shipping
+       p.slow, s.fulfillment, s.shipping,
+       -- 处置三信号(所有者定稿 2026-08-16):采集结局 / 亚马逊在架状态 /
+       -- 契约的 fast.stock_state。三者取自**同一条最新快照**,不能各查各的
+       -- ——分开查会出现"按昨天的 outcome 配今天的库存"这种错配。
+       s.outcome, s.stock_status, s.stock_state
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
@@ -79,8 +83,10 @@ LEFT JOIN LATERAL (
     -- 配送方式(FBA/FBM)决定用哪套定价区间。采集契约的 fast 段没把它列成
     -- 一等字段,但 raw 是"裁剪后的原样载荷",is_fba 就在里面(采集侧
     -- worker/parser._parse_fulfillment 读 buybox 的 Ships from 行)。
-    SELECT price, stock_count, delivery_days, shipping,
-           raw ->> 'is_fba' AS fulfillment
+    SELECT price, stock_count, delivery_days, shipping, outcome, stock_state,
+           raw ->> 'is_fba' AS fulfillment,
+           -- 亚马逊在架状态原文(采集侧存 raw,契约未列为一等字段)
+           raw ->> 'stock_status' AS stock_status
     FROM catalog.latest_snapshot l
     WHERE l.marketplace = 'US' AND l.asin = w.sku
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
@@ -173,6 +179,70 @@ WHERE w.missing_since IS NULL
   AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
 ORDER BY w.store, w.sku
 """
+
+
+# ── 处置判据(所有者定稿 2026-08-16 走进生产)────────────────────────────────
+# **全项目唯一一处**决定"这个在线商品该拿它怎么办"。四个 provider 都问它,
+# 不各判各的 —— 分开写迟早飘成"删除链按 A 判、库存链按 B 判"而两边都不报错。
+
+TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标题
+
+# 亚马逊在架状态原文 → 处置(采集侧 raw.stock_status,原文匹配不做模糊)
+_STOCK_STATUS_ZERO = {
+    "currently unavailable": ("unavailable", "Currently unavailable"),
+    "no featured offer": ("no_buybox", "No Featured Offer"),
+}
+
+# 动作优先级:删除 > 库存 > 标题。一个 SKU 一轮只出一个动作 ——
+# 既建议删除又建议改标题的话,执行件会先花配额改一个马上要删的商品。
+_ACTION_RANK = {"delete": 0, "inventory": 1, "title": 2}
+
+
+def classify(*, outcome=None, stock_status=None, stock_state=None,
+             title_similarity=None, over_lead=False, lead_note="") -> tuple:
+    """输入:一行在线商品的处置信号 → 输出:(动作, 原因码, 原因文案);无动作返回 (None,'','')。
+
+    所有者定稿的判据,逐条对应他给的伪代码:
+
+      outcome == 'not_found'                     → 删除(ASIN 已从亚马逊下架)
+      stock_status == 'Currently unavailable'    → 库存 0(在架但不可售,拿不到价格库存)
+      stock_status == 'No Featured Offer'        → 库存 0(无 Buy Box)
+      stock_state == 'out_of_stock'              → 库存 0(普通缺货)
+      配送超本店上限                              → 库存 0
+      标题相似度 < 0.70                           → 删除
+      标题相似度 ≥ 0.70 且标题有差异              → 改标题
+
+    ⚠ 顺序即优先级,**删除压过一切**:一个 SKU 一轮只出一个动作,否则执行件
+    会先花配额去改一个马上要删的商品(批次 E 踩过同款坑:同一 SKU 既建议反补
+    又建议删除,先花配额救活再花配额删掉)。
+
+    ⚠ 相似度 None(有一边根本没标题)**不算不匹配**:算不出来 ≠ 不像。
+    走到这一步说明标题缺失,那是采集问题,不该拿它当删除依据。
+    """
+    if str(outcome or "").strip().lower() == "not_found":
+        return ("delete", "not_found", "亚马逊已下架(采集 not_found)")
+    if title_similarity is not None and title_similarity < TITLE_SIM_FLOOR:
+        return ("delete", "title_mismatch",
+                f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
+    hit = _STOCK_STATUS_ZERO.get(str(stock_status or "").strip().lower())
+    if hit:
+        return ("inventory", hit[0], hit[1])
+    if str(stock_state or "").strip().lower() == "out_of_stock":
+        return ("inventory", "out_of_stock", "亚马逊缺货")
+    if over_lead:
+        return ("inventory", "lead_days", lead_note or "配送时长超本店上限")
+    return (None, "", "")
+
+
+def pick_one(actions: list[tuple]) -> tuple:
+    """输入:同一 SKU 的多个 (动作,原因码,原因文案) → 输出:优先级最高的那个。
+
+    删除 > 库存 > 标题。空列表返回 (None,'','')。
+    """
+    real = [a for a in actions if a and a[0]]
+    if not real:
+        return (None, "", "")
+    return min(real, key=lambda a: _ACTION_RANK.get(a[0], 9))
 
 
 def _rows(conn, stockzero_stores: list[str]) -> list[tuple]:

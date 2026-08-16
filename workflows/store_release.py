@@ -5,6 +5,8 @@
   python cli.py store_release -p store=A085 --execute       # 真释放
   python cli.py store_release -p brand=vtopmart --execute   # 点名释放一个品牌
   python cli.py store_release -p asin=B08LHF7VLT --execute  # 点名释放一个产品
+  python cli.py store_release -p from_csv=<路径>/alloc_该释放占用.csv --execute
+        # 批量:吃 claim_audit 出的清单,逐条按 (类型, 占用键, **占用店**) 释放
   python cli.py store_release -p store=A085 -p mark_offline=0 --execute
         # 只放占用、不动在线快照(默认整店释放会同步标缺席,见下)
 
@@ -52,17 +54,50 @@ def _reason(params: dict, store, brand, asin) -> str:
     return f"store_release:点名释放 {'品牌 ' + brand if brand else 'ASIN ' + asin}"
 
 
+def _read_csv(path: str) -> tuple[list, str | None]:
+    """输入:claim_audit 落的 csv 路径 → 输出:([(kind, key, store)], 错误)。
+
+    只认 `claim_audit` 的表头(类型/占用键/占用店)。**认死表头而不是按列号取**:
+    按列号取的话,以后往 csv 中间插一列,这条命令就会拿着「原因」当占用键去释放,
+    而且不会报错 —— 一次误释放要人肉查回来。
+    """
+    import csv
+    from pathlib import Path
+    p = Path(path).expanduser()
+    if not p.exists():
+        return [], f"文件不存在:{p}"
+    with p.open(encoding="utf-8-sig", newline="") as fh:
+        rd = csv.DictReader(fh)
+        need = {"类型", "占用键", "占用店"}
+        if not need <= set(rd.fieldnames or []):
+            return [], (f"表头对不上(要有 {'、'.join(sorted(need))}),"
+                        f"实际是 {rd.fieldnames} —— 这份 csv 由 claim_audit 生成")
+        out = []
+        for r in rd:
+            kind = (r["类型"] or "").strip()
+            key = (r["占用键"] or "").strip()
+            st = (r["占用店"] or "").strip()
+            if kind in claims.KINDS and key and st:
+                out.append((kind, key, st))
+    return out, None
+
+
 def run(params: dict) -> str:
-    """输入:params(store/brand/asin/reason/mark_offline/execute)→ 输出:摘要。"""
+    """输入:params(store/brand/asin/from_csv/reason/mark_offline/execute)→ 输出:摘要。"""
     execute = bool(params.get("execute"))
     store = (params.get("store") or "").strip() or None
     brand = (params.get("brand") or "").strip() or None
     asin = (params.get("asin") or "").strip().upper() or None
+    from_csv = (params.get("from_csv") or "").strip() or None
     mark_offline = str(params.get("mark_offline", "1")).lower() not in {"0", "false", "no"}
+
+    if from_csv:
+        return _run_csv(params, from_csv, execute)
 
     given = [x for x in (store, brand, asin) if x]
     if len(given) != 1:
-        return ("⛔ 三选一:-p store=<店铺> / -p brand=<品牌> / -p asin=<ASIN>"
+        return ("⛔ 四选一:-p store=<店铺> / -p brand=<品牌> / -p asin=<ASIN>"
+                " / -p from_csv=<claim_audit 的 csv>"
                 "(一次只给一个;全空会清空整个台账,不允许)")
 
     kind = claims.BRAND if brand else (claims.PRODUCT if asin else None)
@@ -118,3 +153,52 @@ def run(params: dict) -> str:
             + (f";该店 {marked} 行在架商品已标缺席" if marked else "")
             + f";原因={reason}"
             + ";released 行永久保留(回答『当初属于谁』只能靠它)")
+
+
+def _run_csv(params: dict, path: str, execute: bool) -> str:
+    """输入:csv 路径 → 输出:批量释放摘要。**逐条都带 store 条件。**
+
+    ⚠ 每条释放都把 (kind, key, **store**) 三个条件一起传给 `claims.release`。
+    只按 (kind, key) 放的话,占用如果在你出这份 csv 之后换了店(别处释放过、
+    重新分配过),这条命令会把**新店**的占用一起放掉 —— 而它是好的。
+    三条件不匹配时那一行自然放不到,归进"跳过"计数,人能看见。
+    ⚠ 不动在线快照:这是逐条归属调整,货还在架上(要不要下架看 csv 的
+    「要下架的 SKU」列),整店释放那套 mark_offline 与这里无关。
+    """
+    items, err = _read_csv(path)
+    if err:
+        return f"⛔ 读不了 {path}:{err}"
+    if not items:
+        return f"⛔ {path} 里没有可释放的行(类型/占用键/占用店 三列都要有值)"
+    reason = str(params.get("reason") or "").strip() or f"store_release:批量 {path}"
+
+    with db.pg_conn() as conn:
+        hit, miss = [], []
+        for kind, key, st in items:
+            got = claims.preview_release(conn, store=st, kind=kind, key=key)
+            (hit if got else miss).append((kind, key, st))
+        by_store = Counter(s for _k, _key, s in hit)
+        head = (f"csv {len(items)} 行 → 命中 active 占用 {len(hit)} 条"
+                f"(品牌 {sum(1 for k, _, _ in hit if k == claims.BRAND)} / "
+                f"产品 {sum(1 for k, _, _ in hit if k == claims.PRODUCT)})"
+                + (f";**{len(miss)} 行没命中**(已释放过、或占用此刻不属于"
+                   f"csv 里那家店 —— 后者说明 csv 过期了,重跑 claim_audit)"
+                   if miss else ""))
+        if not execute:
+            return ("\n".join(
+                [f"🧪 将批量释放:{head}",
+                 "   涉及 " + "、".join(f"{s}×{n}" for s, n in by_store.most_common(8)),
+                 "   样例:" + "; ".join(f"{k}:{key}→{s}" for k, key, s in hit[:10])
+                 + (" …" if len(hit) > 10 else ""),
+                 "   ⚠ 释放本身可逆(released 行永不删),但释放后这些品牌会被",
+                 "     下一轮分配给别的店,**那一步不可逆** —— 先确认这份 csv 是",
+                 "     刚跑出来的,不是几天前的。",
+                 "   确认后加 --execute"]))
+        freed = 0
+        for kind, key, st in hit:
+            freed += len(claims.release(conn, reason=reason, store=st,
+                                        kind=kind, key=key))
+    logger.warning("store_release 批量:csv=%s,释放 %d 条,未命中 %d,原因=%s",
+                   path, freed, len(miss), reason)
+    return (f"✅ 批量释放完成:{head};实际释放 {freed} 条;原因={reason}"
+            + "\n   货还在架上 —— 按 csv 的「要下架的 SKU」列去下架,那是另一件事")

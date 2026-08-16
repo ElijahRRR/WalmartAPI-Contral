@@ -35,6 +35,9 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.claim_audit")
 
 
+_SAMPLE = 20        # 单元格里塞几百个 SKU 谁也读不了,超了就截断并标出来
+
+
 def _reason(rows, cfg) -> str:
     """输入:某键在某店的在架行 + 配置 → 输出:它们踩了哪道闸(给人看的原因)。"""
     bad = Counter()
@@ -44,6 +47,19 @@ def _reason(rows, cfg) -> str:
         if sv.offends_channel(r, cfg):
             bad[f"渠道不符({r.get('channel') or '?'})"] += 1
     return " · ".join(f"{k}×{v}" for k, v in bad.most_common())
+
+
+def _join(rows, field) -> str:
+    """输入:在架行 + 字段名 → 输出:去重后的值,竖线分隔(超 _SAMPLE 截断)。
+
+    **品牌占用必须带上是哪几个 SKU/ASIN 惹的**(所有者 2026-08-16:
+    「没有给 asin 清单呢?」):`product` 行的占用键本身就是 ASIN,而 `brand`
+    行只有品牌名,拿它没法去下架 —— 得回头翻渠道/类目不符下架清单再对一次。
+    这两列把那一步省掉,一份 csv 既能改账也能下架。
+    """
+    vals = sorted({str(r.get(field)) for r in rows if r.get(field)})
+    head = "|".join(vals[:_SAMPLE])
+    return head + (f"|…共{len(vals)}" if len(vals) > _SAMPLE else "")
 
 
 def run(params: dict) -> str:
@@ -95,7 +111,9 @@ def run(params: dict) -> str:
             if (store, key) in ok_keys[kind]:
                 fine[kind] += 1
                 continue
-            stale.append((kind, key, store, _reason(here, cfg), len(here)))
+            # 只留**踩闸的那些行**去凑 SKU/ASIN 列:这个键的行此刻全都踩闸
+            # (否则不会走到这儿),所以 here 本身就是要下架的那批
+            stale.append((kind, key, store, _reason(here, cfg), len(here), here))
 
     stale.sort(key=lambda x: (x[2], x[0], x[1]))
     n_held = sum(len(v) for v in held.values())
@@ -122,9 +140,10 @@ def run(params: dict) -> str:
     L += ["", f"▍要你处理:{len(stale):,} 条占用当初就不该产生",
           "  涉及 " + "、".join(f"{s}×{n}" for s, n in by_store.most_common(8))]
     L += textfmt.table(
-        ["类型", "占用键", "店铺", "原因", "在架件数"],
-        [[k, key, store, why, n] for k, key, store, why, n in stale[:12]],
-        align="<<<<>")
+        ["类型", "占用键", "店铺", "原因", "要下架的 SKU"],
+        [[k, key, store, why, _join(here, "sku")]
+         for k, key, store, why, _n, here in stale[:12]],
+        align="<<<<<")
     if len(stale) > 12:
         L.append(f"  …… 另 {len(stale) - 12:,} 条见 csv")
 
@@ -137,13 +156,22 @@ def run(params: dict) -> str:
     import csv as _csv
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = _csv.writer(fh)
-        w.writerow(["类型", "占用键", "占用店", "原因", "该店在架件数", "释放命令"])
-        for k, key, store, why, n in stale:
+        w.writerow(["类型", "占用键", "占用店", "原因", "该店在架件数",
+                    "要下架的SKU", "要下架的ASIN", "释放命令"])
+        for k, key, store, why, n, here in stale:
             arg = "brand" if k == claims.BRAND else "asin"
             w.writerow([k, key, store, why, n,
+                        _join(here, "sku"), _join(here, "asin"),
                         f"python cli.py store_release -p {arg}={key} --execute"])
+    n_sku = len({(r["store"], r["sku"]) for _k, _key, _s, _w, _n, here in stale
+                 for r in here})
     L += ["", f"▍明细 → {p}",
-          "  最后一列是拼好的释放命令。**先挑几条 dry-run 看清楚再批量跑** ——",
+          f"  「要下架的 SKU / ASIN」两列 = 这条占用是被哪几件货拖下水的,"
+          f"去重后共 {n_sku} 件 —— **一份 csv 既能改账也能下架**,",
+          "  不用再回头对渠道/类目不符下架清单。",
+          "  ⚠ 同一件货会在 brand 行与 product 行各出现一次(一件货同时拖着",
+          "  它的品牌占用和它自己的产品占用),按 SKU 去重后才是真的件数。",
+          "", "  最后一列是拼好的释放命令。**先挑几条 dry-run 看清楚再批量跑** ——",
           "  释放本身可逆(released 行永不删),但释放后这个品牌会被下一轮",
           "  分配给别的店,那一步就不可逆了。"]
     return "\n".join(L)

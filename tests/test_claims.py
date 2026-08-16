@@ -145,8 +145,37 @@ def _wire_rel(monkeypatch, conn):
 
 
 def test_store_release_requires_exactly_one_target(monkeypatch):
-    assert rel.run({}).startswith("⛔ 三选一")
-    assert rel.run({"store": "A", "brand": "b"}).startswith("⛔ 三选一")
+    assert rel.run({}).startswith("⛔ 四选一")
+    assert rel.run({"store": "A", "brand": "b"}).startswith("⛔ 四选一")
+
+
+def test_store_release_csv_needs_the_claim_audit_header(monkeypatch, tmp_path):
+    """认死表头,不按列号取。
+
+    按列号取的话,以后往 csv 中间插一列,这条命令会拿着「原因」当占用键去释放,
+    **而且不会报错** —— 一次误释放要人肉查回来。
+    """
+    p = tmp_path / "x.csv"
+    p.write_text("a,b,c\n1,2,3\n", encoding="utf-8")
+    assert "表头对不上" in rel.run({"from_csv": str(p)})
+    assert "文件不存在" in rel.run({"from_csv": str(tmp_path / "nope.csv")})
+
+
+def test_store_release_csv_scopes_every_release_to_its_store(monkeypatch, tmp_path):
+    """⚠ 每行都带 store 条件:占用在出 csv 之后换了店的话,不能连新店一起放掉。
+
+    只按 (kind, key) 放的话,一条已经被正确重新分配的占用会被这份过期 csv
+    误伤,而新店那边完全无辜。
+    """
+    c = _Claims(seed=[("brand", "acme", "A085"), ("brand", "zeta", "新店")])
+    _wire_rel(monkeypatch, c)
+    p = tmp_path / "r.csv"
+    p.write_text("类型,占用键,占用店\nbrand,acme,A085\nbrand,zeta,旧店\n",
+                 encoding="utf-8-sig")
+    out = rel.run({"from_csv": str(p), "execute": True})
+    assert "实际释放 1 条" in out and "1 行没命中" in out
+    left = {(r["claim_key"], r["store"]) for r in c.rows if r["status"] == "active"}
+    assert left == {("zeta", "新店")}          # 换了店的那条毫发无损
 
 
 def test_store_release_dry_run_lists_without_changing(monkeypatch):

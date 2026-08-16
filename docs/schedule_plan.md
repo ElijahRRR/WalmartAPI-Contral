@@ -1,4 +1,4 @@
-# 调度计划 v2(2026-08-16,按所有者批复重排;**待批准**)
+# 调度计划 v3(2026-08-16,两轮批复后;只差 python 路径与飞书接收人)
 
 > v1 是我按旧系统形态推的;所有者 2026-08-16 给了七条批复,**结构按他的四条业务线
 > 重排**,并答掉了六个开放问题中的五个。本文是 v2。
@@ -112,14 +112,45 @@ KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 
 | 每 30 分 | `feed_poll` | 所有者:与订单链同款,cron 定时,不接 GPT |
 | 每日 02:00 | `backup` | pg_dump,离峰 |
 
-## 三、所有者没提到的四条,需要拍板(第六节问题 2)
+## 三、其余四条(所有者 2026-08-16 批复已定)
 
-| 工作流 | 现状 | 我的建议 |
+| 工作流 | 定稿 | 说明 |
 |---|---|---|
-| `product_clear` | 消费运营填的「停用/删除表」 | **每日 15:00 进调度**。不定时跑 = 运营填了没人执行(旧系统就是 15:00) |
-| `sku_locked_heal` | SKU_LOCKED 自愈,24h 冷却 | **每日 23:30 进调度**(旧系统同款时间;冷却按天对齐) |
-| `upc_sync` | 注入已由 `list_new` 自己做,它只剩**回写状态列** | 每日一次即可,或干脆不进调度(想看池余量时手动跑) |
-| `catalog_health` | 纯 SQL 只读体检 | 不进调度,想看时跑 |
+| `product_clear` | **每日 15:00 进调度** | 消费运营填的「停用/删除表」;不定时跑 = 运营填了没人执行(旧系统同款时间) |
+| `sku_locked_heal` | **每日 23:30 进调度**(建议) | 见下面「它是什么」 |
+| `upc_sync` | **不进调度**,并进 `list_new` | 所有者:「放到上架里,上架前执行一次就好了」 |
+| `catalog_health` | 不进调度 | 纯 SQL 只读体检,想看时手动跑 |
+
+### `sku_locked_heal` 是什么(所有者问)
+
+沃尔玛报 `ERR_EXT_DATA_0101211` = **这个 SKU 已经和旧 UPC 绑死了**。
+旧实证(`legacy_survey.md:1667`):**不先退役、直接换个新 UPC 重发同一个 SKU
+也会失败**。所以它不是"永久放弃",而是要走三步:
+
+```
+① 对上架表 O=SKU_LOCKED 的行提交 RETIRE_ITEM(退役旧 offer)
+② 冷却 24 小时(listing.retire_cooldown,状态权威在库)
+③ 回执成功 + 冷却期满 → 清列(K~M / O~Q 清空,N 写自愈标记)
+   → 那一行变成"新行",下一轮 list_new 按正常闸门链领**新 UPC** 重上
+```
+
+旧系统是拆开的:launchd `retire_daily` 23:30 干 ①,清列重上在
+`retire_and_relist`。新系统合成一个工作流,**每天跑一次即可**
+—— ① 和 ③ 在同一轮里各自推进(今天退役的,明天这一轮才够 24 小时被清列)。
+
+所以它服务的是**上架链的自愈**:没有它,撞上 SKU_LOCKED 的行就永久卡在上架表里。
+上架虽然手动,但这条清障要定时跑,否则积压。23:30 是照搬旧时间(冷却按天对齐)。
+
+### `upc_sync` 并进 `list_new` 的做法(有个建议)
+
+所有者要的效果是「不用单独调度它」。`upc_sync` 其实是两件事,建议**分开摆**:
+
+| 步 | 函数 | 放哪 | 为什么 |
+|---|---|---|---|
+| 注入(表格新号 → `catalog.upc_pool`) | `upc_pool.sync_from_sheet` | 上架**之前**(已落地) | 运营刚贴进表格的号,这一轮就要能领 |
+| 回写(PG 权威 → 表格 C~F 状态列) | `upc_pool.project_to_sheet` | 上架**之后**(待做) | 放前面回写的是**上一轮**的状态;放后面才能立刻看到"这一轮消耗了哪些号" |
+
+`upc_sync` 工作流本身保留,当手动体检入口用。
 
 ## 四、「已对接飞书表的,执行完就写,不要做成单独的」
 
@@ -148,13 +179,12 @@ settlement_sync   → 写对账表
 `order_center_push` 保留为**手动全量补推 / 对账入口**(`-p reconcile=1` 那套),
 不再进调度。铁律 1 照旧:抽到 services,不是让工作流互相 import。
 
-⚠ **一个必须先定的口径**:`_push_sales` 默认窗口 **90 天**。每小时把 90 天窗口
-整个重推一遍,写放大很大(飞书写入是这套系统最慢的一环)。建议:
-
-- 每小时那轮用**短窗口**(`days=3`,与 `order_audit` 的判定窗口对齐);
-- 每日 06:20 那一轮用 `days=90` 补全。
-
-问题:这个分法你认不认?(第六节问题 3)
+⚠ ~~销售表 90 天窗口每小时全推,写放大很大~~ —— **这条我判断错了,所有者纠正后
+复核代码属实,撤回**。`_sync_stateful()` 是**本地状态 + 行指纹**驱动:
+每轮只把「本地没有的键」建、「指纹变了的行」更新,其余全部跳过
+(摘要里那个「跳过 N」就是它)。日常连飞书表都不拉(只有 `reconcile=1` 才全量
+对账)。所以每小时按默认 90 天窗口跑没有问题,真正写出去的就是几十到几百行。
+**不需要分窗口。**
 
 ## 五、回答「等待会占锁吗?什么锁」
 
@@ -179,42 +209,56 @@ settlement_sync   → 写对账表
 远小于一小时,一条命令出真结论,而 `wait=0` 会让结论恒定滞后一轮 ——
 "忘了就静默降级"正是这个默认值当初要避免的。
 
-## 六、还需要你答的三个问题
+## 六、还差的两样(其余都已定)
 
-1. **那个 venv 的 python 绝对路径是什么?**
-   (在项目里跑 `python -c "import sys; print(sys.executable)"` 贴给我)
-   plist 不过 shell、不读 `~/.zshrc`,必须写死绝对路径。
-2. **第三节那四条(`product_clear` / `sku_locked_heal` / `upc_sync` /
-   `catalog_health`)按我的建议排,还是你另有安排?**
-3. **订单中心销售表:每小时短窗口(3 天)+ 每日全窗口(90 天),这个分法认不认?**
+1. **那个 venv 的 python 绝对路径。** 在项目目录下、**激活 venv 之后**跑:
 
-## 七、起调度之前必须先做的三件代码活
+   ```
+   python3 -c 'import sys; print(sys.executable)'
+   ```
+
+   (上一版我把全角括号写进了命令里,你复制过去才报 `SyntaxError` —— 我的错。
+   上面这条用单引号,可直接整行复制。)
+
+   plist 不过 shell、不读 `~/.zshrc`,**不需要 activate**,直接把这个绝对路径
+   当解释器写进 `ProgramArguments` 即可。
+
+2. **飞书通知的接收人标识**(见第七节 C)。所有者:「应用可以直接给我发消息,
+   并不需要进群组,现在就是这样子的」—— 那就是**给个人发**,
+   `receive_id_type` 用 `open_id`(或 `user_id` / `email`)。
+   要你给一个:你的 **open_id**,或飞书账号**邮箱**(用 `email` 类型最省事)。
+
+## 七、起调度之前必须先做的四件代码活
 
 | | 工作项 | 为什么必须在起调度之前 |
 |---|---|---|
 | **A** | 实现 `product_refresh` 的 `wait`(轮询批次到落定,`TIMEOUT_HOURS=1` 兜底) | 不做的话产品线"一次性做完"是假的:摄回来的是上一轮数据,**而且不报错** |
 | **B** | 订单中心五表拆到 `services/order_center.py`,各链跑完自己写 | 所有者:「已对接飞书表的,执行完就写,不要做成单独的」 |
-| **C** | 飞书通知改用**应用**发消息,不再依赖群机器人 webhook | `FEISHU_WEBHOOK_URL` 至今没配,15 条链的成功/失败通知一条都发不出去 |
+| **C** | 飞书通知改用**应用直接发给所有者**,不再依赖群机器人 webhook | `FEISHU_WEBHOOK_URL` 至今没配,15 条链的成功/失败通知一条都发不出去 |
+| **D** | `list_new` 上架**之后**补一次 UPC 池回写(`project_to_sheet`) | 所有者:upc_sync 并进上架、不单独调度。注入已在上架前(已落地),回写要放上架后才看得到这一轮的消耗 |
 
-### 关于 C:用绑定的飞书应用发消息 —— 可以
+### 关于 C:用绑定的飞书应用**直接发给你** —— 可以,而且更简单
 
-现在 `api/feishu.notify()` 走的是**群机器人 webhook**(`FEISHU_WEBHOOK_URL`),
-与项目其余部分用的**应用身份**(`tenant_access_token`,日志里那行
-`auth/v3/tenant_access_token/internal`)是两套东西。
+所有者:「应用可以直接给我发消息,并不需要进群组,现在就是这样子的」。
+那就不用 chat_id、不用拉群 —— 走**给个人发**:
 
-改用应用发:`POST /open-apis/im/v1/messages?receive_id_type=chat_id`,
-body `{"receive_id": "<群 chat_id>", "msg_type": "text", "content": "{\\"text\\":\\"…\\"}"}`,
-带 `tenant_access_token`。需要三样:
+```
+POST /open-apis/im/v1/messages?receive_id_type=open_id      ← 或 user_id / email
+Authorization: Bearer <tenant_access_token>                  ← 项目其余部分本来就在用
+{"receive_id": "<你的 open_id>", "msg_type": "text",
+ "content": "{\"text\":\"…\"}"}
+```
 
-1. 应用开 **`im:message:send_as_bot`** 权限(飞书后台改完要**发布版本**才生效);
-2. 把这个应用**拉进要收通知的群**;
-3. 那个群的 **chat_id**(应用拉进群后可用 `im/v1/chats` 列出)。
+⚠ `content` 是**字符串化的 JSON**,不是嵌套对象 —— 传成对象飞书会报
+`invalid content`。这是这个接口最常见的坑。
 
-好处:少维护一个 webhook,身份与其余调用统一,以后要发富文本/卡片也是同一条路。
-实现上我会让它**两条路都留**:配了 chat_id 走应用,没配就退回 webhook,
-都没有才只记日志 —— 切换期不至于把通知打断。
+需要的权限:`im:message:send_as_bot`(飞书后台改完要**发布版本**才生效);
+应用与你之间要有会话(既然"现在就是这样子的",这条已经成立)。
 
-需要你提供:**目标群的 chat_id**(或者告诉我群名,我把取 chat_id 的命令写给你)。
+registry 新增两个变量:`FEISHU_NOTIFY_RECEIVE_ID` 与
+`FEISHU_NOTIFY_RECEIVE_ID_TYPE`(默认 `open_id`)。
+实现上**三条路依次退**:配了接收人走应用 → 否则有 webhook 走 webhook →
+都没有只记日志。切换期不至于把通知打断,也不用一次性把 webhook 拆掉。
 
 ## 八、plist 模板与四个坑(批复 2 之后少了一个)
 
@@ -262,7 +306,7 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 
 (v1 的"睡眠补跑"坑作废 —— 批复 2:不关机。)
 
-## 九、时间表(v2 汇总)
+## 九、时间表(v3 汇总)
 
 | 时间 | 命令 | 线 |
 |---|---|---|
@@ -271,8 +315,8 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 | 06:40 | `daily_report` | 线 3 |
 | 07:30 | `perf_problems` | 线 2 |
 | 09:00 | `catalog_sync product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1` | 线 1 |
-| 15:00 | `product_clear` | 待定 |
-| 23:30 | `sku_locked_heal` | 待定 |
+| 15:00 | `product_clear` | 定稿 |
+| 23:30 | `sku_locked_heal` | 建议 |
 | 每小时 :20 | `order_sync order_audit returns_sync` | 线 2 |
 | 每 30 分 | `feed_poll` | 基础 |
 | 双周三 08:00 | `settlement_sync` | 线 2 |

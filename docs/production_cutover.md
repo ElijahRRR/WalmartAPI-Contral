@@ -192,10 +192,11 @@ cli 本来就管锁/记录/通知,链只是把这三件事各做 N 遍。
 
 ### 1. launchd plist 全套 + 停旧清单
 
-**完整计划见 `docs/schedule_plan.md`(v2,按所有者 2026-08-16 七条批复重排)**:
+**完整计划见 `docs/schedule_plan.md`(v3,两轮批复后)**:
 按他划的四条业务线(产品维护线一条链跑完 / 订单线 / KPI / 黑名单中心)排布,
-plist 模板与四个坑、分三批灰度、三件必须先做的代码活(product_refresh 的 wait
-没实现 / 订单中心五表拆进各链 / 飞书通知改用应用发)。
+plist 模板与四个坑、分三批灰度、四件必须先做的代码活(product_refresh 的 wait
+没实现 / 订单中心五表拆进各链 / 飞书通知改用应用直发 / 上架后补 UPC 回写)。
+只差两样输入:venv 的 python 绝对路径、飞书通知接收人标识。
 
 ⚠ **下面这条链式"硬约束"是错的,已在 schedule_plan.md §零 纠正**:
 `product_refresh` 是把十几万 ASIN 压给采集服务(默认不等),`product_ingest`

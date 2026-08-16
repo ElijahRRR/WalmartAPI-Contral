@@ -57,6 +57,15 @@ def _fmt(v, digits=2, dash="—"):
     return dash if v is None else f"{v:,.{digits}f}"
 
 
+def _sub(row, text: str) -> str:
+    """输入:行 + 已格式化的值 → 输出:中位数顶上来的值加 `~` 前缀。
+
+    不加标记的话,同一行里"在线均值 0"与"货位值 0.104"并排出现,
+    读的人会以为算错了 —— 其实是那三个指标整体被中位数替换了(在售<14 天)。
+    """
+    return text if row["取值依据"].startswith("自身") else f"~{text}"
+
+
 def run(params: dict) -> str:
     """输入:params(days/as_of/export)→ 输出:店铺经营水平表。"""
     days = int(params.get("days", 90))
@@ -111,6 +120,8 @@ def run(params: dict) -> str:
                              -(r["日均净销售额"] or 0)))
 
     part = [r for r in rows if r["参与分配"] == "是"]
+    unfilled = [r for r in rows if r["参与分配"] == "(未填)"]
+    opted_out = [r for r in rows if r["参与分配"] == "否(填了0)"]
     thin = [r for r in rows if r["取值依据"].startswith("中位数")]
     no_gap = [r for r in part if r["缺口"] is None]
     hist_heavy = [r for r in part if r["历史期占比"] >= 0.5]
@@ -118,7 +129,14 @@ def run(params: dict) -> str:
     n = lambda v: f"{int(v):,}"                     # noqa: E731
     L = ["", "═══ 店铺经营水平 ═══",
          "", f"▍窗口 {win['day']} 往前 {days} 天(右端不含当天),销售额均为**净额**",
-         f"  规划内 {len(rows)} 家,其中参与分配 {len(part)} 家"]
+         f"  **参与分配 {len(part)} 家**(限额表「单店最大在线数」> 0)"]
+    # 凭证表里有几百家历史店铺,不点破的话"规划内 497 家"读起来像有 497 家要分货
+    if unfilled:
+        L.append(f"  另有 {len(unfilled)} 家在册但**没填「单店最大在线数」**"
+                 f"—— 不参与,要它们接货先填这一列")
+    if opted_out:
+        L.append(f"  {len(opted_out)} 家显式填 0 = 不接货:"
+                 + "、".join(r["店铺"] for r in opted_out[:8]))
     if thin:
         L.append(f"  ⚠ {len(thin)} 家在售不足 {store_perf.MIN_ACTIVE_DAYS} 天,"
                  f"三个指标取全店中位数(不代表其真实水平):"
@@ -138,14 +156,17 @@ def run(params: dict) -> str:
         ["店铺", "在售天数", "在线均值", "日均净额", "货位值",
          "日目标", "缺口", "剩余容量", ""],
         [[r["店铺"], r["在售天数"], _fmt(r["在线均值"], 0),
-          _fmt(r["日均净销售额"]), _fmt(r["单品日产出"], 3),
+          _sub(r, _fmt(r["日均净销售额"])), _sub(r, _fmt(r["单品日产出"], 3)),
           _fmt(r["日目标"], 0),
-          "—" if r["缺口"] is None else f"{r['缺口']:.0%}",
+          "—" if r["缺口"] is None else _sub(r, f"{r['缺口']:.0%}"),
           _fmt(r["剩余容量"], 0),
           "" if r["取值依据"].startswith("自身") else f"⚠ {r['取值依据']}"]
          for r in part[:10]],
         align="<>>>>>>><")
     L.append("  (货位值 = 日均净额 ÷ 在线均值;缺口 = (日目标 − 日均净额) ÷ 日目标)")
+    if any(not r["取值依据"].startswith("自身") for r in part[:10]):
+        L.append("  ⚠ 带 ~ 的是**全店中位数顶上来的**,不是这家店自己的数 ——"
+                 "**上面那两个等式对它们不成立**(在线均值仍是实测值)")
 
     if not export:
         L += ["", "(-p export=0:未落 csv)"]

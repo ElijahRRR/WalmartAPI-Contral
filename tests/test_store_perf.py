@@ -209,3 +209,16 @@ def test_slot_value_is_verifiable_from_the_same_row():
     assert m["A"]["daily_net"] == 200.0                       # 6000/30
     assert m["A"]["slot_value"] == 1.0                        # 200/200
     assert m["A"]["avg_online"] == 200                        # 分母照样报出来
+
+
+def test_median_substituted_values_are_marked_in_the_report():
+    """在线均值是实测、日均净额是中位数顶上来的 —— 并排出现时必须标出来。
+
+    否则同一行里"在线均值 0"与"货位值 0.104"并排,读的人会以为算错了
+    (生产实测 2026-08-15:82杨乾良 在线均值 0、货位值 0.104)。
+    """
+    from workflows import alloc_stores as st
+    own = {"取值依据": "自身 87% + 中位数 13%"}
+    sub = {"取值依据": "中位数(在售仅 3 天)"}
+    assert st._sub(own, "283.33") == "283.33"
+    assert st._sub(sub, "283.33") == "~283.33"

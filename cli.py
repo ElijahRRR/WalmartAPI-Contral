@@ -67,14 +67,27 @@ def _build_params(pairs: list[str]) -> dict:
     return params
 
 
+class _NotOnScreen(logging.Filter):
+    """带 `file_only=True` 的记录只进日志文件,不上终端。
+
+    摘要要**同时**满足两个需求:终端上干干净净出现一次(人在看),日志文件里
+    留全文(事后查"那次到底输出了什么",这是唯一能回答的地方)。少了过滤器
+    就只能二选一 —— 要么终端刷两遍,要么日志里没有摘要。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "file_only", False)
+
+
 def _setup_logging(workflow: str, logs_dir: Path) -> None:
     logs_dir.mkdir(parents=True, exist_ok=True)
     logfile = logs_dir / f"{workflow}.log"
+    screen = logging.StreamHandler(sys.stderr)
+    screen.addFilter(_NotOnScreen())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(logfile, encoding="utf-8"),
-                  logging.StreamHandler(sys.stderr)],
+        handlers=[logging.FileHandler(logfile, encoding="utf-8"), screen],
     )
 
 
@@ -168,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
         _notify(f"❌ {mode}{args.workflow} 失败\n{err.strip().splitlines()[-1]}")
         return 1
 
-    logger.info("workflow %s 成功: %s", args.workflow, summary)
+    # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
+    logger.info("workflow %s 成功:\n%s", args.workflow, summary,
+                extra={"file_only": True})
     print(summary)
     _record_finish(run_id, "success", summary)
     _notify(f"✅ {mode}{args.workflow} 成功\n{summary}")

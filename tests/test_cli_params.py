@@ -1,8 +1,12 @@
-"""cli.py 的 -p 解析回归。
+"""cli.py 的 -p 解析与输出回归。
 
-这里只有一件事要防:**粘贴事故把 dry-run 变成真跑**。所以既要抓住开关
-被吞进参数值的情况,又要保证抓住之后是报错、不是"帮你"重新解释。
+两件事:
+· **粘贴事故不许把 dry-run 变成真跑** —— 既要抓住开关被吞进参数值的情况,
+  又要保证抓住之后是报错、不是"帮你"重新解释;
+· **摘要在终端上只出现一次,但日志文件里留全文** —— 两个需求都要满足。
 """
+
+import logging
 
 import pytest
 
@@ -47,3 +51,57 @@ def test_values_that_merely_contain_dashes_are_fine():
     """别误伤:值里带 `--` 但不是已知开关的,照常放行。"""
     assert cli._build_params(["note=a--b", "flag=--verbose"]) == {
         "note": "a--b", "flag": "--verbose"}
+
+
+# ── 输出:摘要只上屏一次,但日志文件留全文 ──────────────────────────────
+
+def _rec(**extra):
+    r = logging.LogRecord("cli", logging.INFO, __file__, 1, "x", None, None)
+    for k, v in extra.items():
+        setattr(r, k, v)
+    return r
+
+
+def test_file_only_records_are_kept_off_the_screen():
+    f = cli._NotOnScreen()
+    assert f.filter(_rec()) is True                    # 普通记录照常上屏
+    assert f.filter(_rec(file_only=True)) is False     # 摘要那条不上屏
+
+
+def test_summary_still_reaches_the_log_file(tmp_path, capsys):
+    """⚠ 只是"别刷屏"的话,把 logger.info 删掉最省事 —— 但那样日志文件里
+    就没有摘要了,事后再也答不出"那次到底输出了什么"。这条盯住那个偷懒解法。
+    """
+    root = logging.getLogger()
+    saved = root.handlers[:], root.level
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    try:
+        cli._setup_logging("t", tmp_path)
+        cli.logger.info("workflow %s 成功:\n%s", "t", "第一行\n第二行",
+                        extra={"file_only": True})
+        for h in root.handlers:
+            h.flush()
+        text = (tmp_path / "t.log").read_text(encoding="utf-8")
+        assert "第一行" in text and "第二行" in text        # 文件里有全文
+        assert "第二行" not in capsys.readouterr().err     # 屏幕上没有
+    finally:
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+        root.handlers[:], root.level = saved
+
+
+def test_unconfigured_webhook_logs_only_the_first_line(monkeypatch, caplog):
+    """通知降级成"仅记日志"时**不许把整段摘要再抄一遍**。
+
+    cli 传进来的是完整摘要,而它此刻已经打到终端了 —— 再吐一份就是同一屏
+    文字出现两次(2026-08-16 所有者:"所有的命令都是这样子的")。
+    全文进不进日志由 cli 决定,通知这一层只负责说"没发出去"。
+    """
+    from api import feishu
+    monkeypatch.setattr(feishu.resources, "feishu_webhook_url", lambda: None)
+    with caplog.at_level(logging.INFO, logger="api.feishu"):
+        assert feishu.notify("✅ claim_audit 成功\n第二行\n第三行") is False
+    text = caplog.text
+    assert "claim_audit 成功" in text                  # 说清楚是哪条通知没发出去
+    assert "第二行" not in text and "第三行" not in text

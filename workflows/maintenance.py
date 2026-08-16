@@ -205,6 +205,25 @@ def _record_submitted(items: list[dict]) -> None:
         mi.record_submitted(conn, items)
 
 
+def _record(name: str, it: dict, label: str, feed_id, today: str,
+            result: str, err) -> tuple:
+    """输入:店铺 + 意图 + 标签 + feed 结果 → 输出:维护记录表的一行(11 列)。
+
+    列序 = registry.MAINT_SHEET.columns:
+      店铺 SKU 建议 原因 动作 旧值 新值 feedid 日期 结果 报错
+
+    **唯一造行处**。2026-08-16 从 9 列加到 11 列(所有者在飞书加了「建议」「原因」),
+    散在各分支手拼元组的话,漏改一处就整行错位且不报错。
+
+    「建议」与「动作」当前恒等 —— maintenance 还没拆成 scan + 执行件(批次四)。
+    拆完之后「建议」由 scan 写、「动作」由本执行件写,两者分歧(建议了没执行 /
+    在途防重跳过 / 撤销)才是最该看见的信息。
+    """
+    return (name, it["sku"], label, it.get("reason", ""), label,
+            it.get("old"), it.get("new"), feed_id, today, result,
+            err if err is not None else "")
+
+
 def _submit_kind(store: dict, kind: str, items: list[dict],
                  today: str, lines: list[str]) -> list[tuple]:
     """输入:店铺 + 类型 + 意图 → 输出:维护记录表行。路由 PUT/feed(显式 if)。"""
@@ -218,11 +237,12 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
                 ok, why = prices.put_price(store, it["sku"], it["new"])
             else:
                 ok, why = inv_api.put_inventory(store, it["sku"], it["new"])
-            records.append((name, it["sku"], label, it["old"], it["new"],
-                            "sync", today, "成功" if ok else "失败", why))
+            records.append(_record(name, it, label, "sync", today,
+                                   "成功" if ok else "失败", why))
             if ok:
                 _record_submitted([it])
-        n_ok = sum(1 for r in records if r[7] == "成功")
+        _RESULT_IDX = resources.MAINT_SHEET.columns.index("result")
+        n_ok = sum(1 for r in records if r[_RESULT_IDX] == "成功")
         lines.append(f"  {name}:{label} 同步 PUT {len(items)},成功 {n_ok}")
         return records
 
@@ -257,16 +277,14 @@ def _submit_kind(store: dict, kind: str, items: list[dict],
             _record_submitted(batch)
         if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
             for it in batch:
-                # 删除类的 C 列带原因(variant_offset / 商品不存在),便于
-                # 事后按原因统计;其余三类沿用类型标签
-                records.append((name, it["sku"], it.get("label") or label,
-                                it["old"], it["new"],
-                                res["feed_id"], today, "处理中", ""))
+                # 原因不再塞进动作列(旧写法 "删除(variant_offset)"):
+                # 2026-08-16 起「原因」是独立一列,四条清零判据靠它才分得清
+                records.append(_record(name, it, it.get("label") or label,
+                                       res["feed_id"], today, "处理中", ""))
         elif res["outcome"] == "failed":
             for it in batch:
-                records.append((name, it["sku"], it.get("label") or label,
-                                it["old"], it["new"],
-                                "", today, "提交被拒", ""))
+                records.append(_record(name, it, it.get("label") or label,
+                                       "", today, "提交被拒", ""))
     line = f"  {name}:{label} feed 提交 {n['submitted']}"
     if n["dedup"]:
         line += f",在途防重跳过 {n['dedup']}"

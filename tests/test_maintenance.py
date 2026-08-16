@@ -330,7 +330,8 @@ def test_small_batch_routes_to_put_and_records_sync(monkeypatch):
     out = mw.run({"execute": True})
     assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0)]
     assert calls["feeds"] == []
-    assert calls["sheet"][0][5] == "sync" and calls["sheet"][0][7] == "成功"
+    assert calls["sheet"][0][_c("feed_id")] == "sync"
+    assert calls["sheet"][0][_c("result")] == "成功"
     assert "同步 PUT 2,成功 2" in out
 
 
@@ -339,7 +340,7 @@ def test_large_batch_routes_to_feed(monkeypatch):
     mw.run({"execute": True})
     assert calls["put_inv"] == []
     assert calls["feeds"] == [("T1", "inventory", 11)]
-    assert all(r[5] == "F_inventory" and r[7] == "处理中"
+    assert all(r[_c("feed_id")] == "F_inventory" and r[_c("result")] == "处理中"
                for r in calls["sheet"])
 
 
@@ -383,7 +384,8 @@ def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
     assert "删除 feed 提交 2" in out
     # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
     assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
-    assert all(r[2] == "删除(variant_offset)" and r[7] == "处理中"
+    assert all(r[_c("action")] == "删除(variant_offset)"
+               and r[_c("result")] == "处理中"
                for r in calls["sheet"])
 
 
@@ -432,17 +434,19 @@ def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
     _fake_db(monkeypatch, conn)
     # 表里已有 (F1,B0A) 那一行,只该补 B0B
     monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
-                        lambda sheet, rng: [["T1", "B0A", "价格", "", "",
-                                             "F1", "2026-08-09", "成功", ""]])
+                        lambda sheet, rng: [
+                            _sheet_row("T1", "B0A", "价格", "", "", "F1",
+                                       "2026-08-09", "成功")])
     appended = []
     monkeypatch.setattr(maint_sheet, "append_records",
                         lambda rows: (appended.extend(rows), len(rows))[1])
     out = maint_sheet.resync_from_ledger()
     assert "补写 1 行" in out
-    assert appended[0][1] == "B0B" and appended[0][2] == "库存"
-    assert appended[0][5] == "F2" and appended[0][7] == "失败"
+    assert appended[0][_c("sku")] == "B0B" and appended[0][_c("action")] == "库存"
+    assert appended[0][_c("feed_id")] == "F2"
+    assert appended[0][_c("result")] == "失败"
     # 旧值/新值补不回来(PG 只记 SKU 级状态,不存当时的新旧值)
-    assert appended[0][3] == "" and appended[0][4] == ""
+    assert appended[0][_c("old_value")] == "" and appended[0][_c("new_value")] == ""
 
 
 def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
@@ -456,8 +460,8 @@ def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
     monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
-        ["T1", "B0OLD", "价格", "", "", "F1", "2026-08-01", "处理中", ""],
-        ["T1", "B0NEW", "价格", "", "", "F2", "2026-08-09", "处理中", ""],
+        _sheet_row("T1", "B0OLD", "价格", "", "", "F1", "2026-08-01", "处理中"),
+        _sheet_row("T1", "B0NEW", "价格", "", "", "F2", "2026-08-09", "处理中"),
     ])
     monkeypatch.setattr(feed_track, "item_results", lambda fid: {"B0NEW": ("submitted", "")})
     monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
@@ -500,6 +504,22 @@ def test_prune_keeps_recent_days_only(monkeypatch):
 
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────
 
+def _c(name: str) -> int:
+    """列名 → 下标。**按名字取,不写死数字** —— 2026-08-16 从 9 列加到 11 列时,
+    写死下标的断言全线转红(那是好事:它们确实在测错的列);改成按名字取之后,
+    下次加列测试不用动。"""
+    return resources.MAINT_SHEET.columns.index(name)
+
+
+def _sheet_row(store, sku, action, old, new, feed_id, date, result, err="",
+               suggestion=None, reason=""):
+    """按 registry 列序拼一行维护记录夹具(11 列)。"""
+    vals = {"store": store, "sku": sku, "suggestion": suggestion or action,
+            "reason": reason, "action": action, "old_value": old,
+            "new_value": new, "feed_id": feed_id, "op_date": date,
+            "result": result, "error": err}
+    return [vals[c] for c in resources.MAINT_SHEET.columns]
+
 def test_maint_sheet_sync_from_ledger(monkeypatch):
     monkeypatch.setattr(resources, "MAINT_SHEET",
                         Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
@@ -512,10 +532,10 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     # 写死的 08-07 过期,四行全走了未查到,断言在测根本不该触发的兜底)。
     today = maint_sheet._today().isoformat()
     sheet_rows = [
-        ["T1", "S1", "库存", "5", "0", "F1", today, "处理中", ""],
-        ["T1", "S2", "库存", "3", "0", "F1", today, "处理中", ""],
-        ["T1", "S3", "价格", "9", "8", "sync", today, "成功", ""],
-        ["T1", "S4", "库存", "7", "0", "F2", today, "处理中", ""],
+        _sheet_row("T1", "S1", "库存", "5", "0", "F1", today, "处理中"),
+        _sheet_row("T1", "S2", "库存", "3", "0", "F1", today, "处理中"),
+        _sheet_row("T1", "S3", "价格", "9", "8", "sync", today, "成功"),
+        _sheet_row("T1", "S4", "库存", "7", "0", "F2", today, "处理中"),
     ]
     writes = []
     monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
@@ -527,8 +547,9 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
 
     out = maint_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
-    assert w["H2:I2"] == ["成功", ""]
-    assert w["H3:I3"] == ["失败", "ERR_P"]
+    _R, _E = maint_sheet._col("result"), maint_sheet._col("error")
+    assert w[f"{_R}2:{_E}2"] == ["成功", ""]
+    assert w[f"{_R}3:{_E}3"] == ["失败", "ERR_P"]
     assert "H5:I5" not in w                     # F2 未落定不动
     assert "回填 2 行" in out
     # 水位推进到第一个未落定行(第 5 行的 F2):unresolved_from=5
@@ -567,3 +588,40 @@ def test_match_inventory_intents_fills_zero_stock():
     assert "source_type = 'match'" in sql       # 路由铁律:只碰跟卖出身
     assert "missing_since IS NULL" in sql       # 只补在架行
     assert args == (["Z店"],)                   # stockzero 店整店排除
+
+
+def test_no_hardcoded_column_letters_left():
+    """列字母一律从 registry.MAINT_SHEET.columns 推,不许再写死 A/H/I。
+
+    2026-08-16 从 9 列加到 11 列时,硬编码那版会把「动作」写进「建议」列、
+    把回执写进「新值」列 —— **整表错位且不报错**。这条守的是下次再加列。
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(maint_sheet)
+    # 允许同列范围(f"A{row}:A{end}" 是扫 A 列找下一个空行,与列数无关);
+    # 禁的是**跨列**写死,那种才会随列数变化而错位
+    bad = [m for m in re.findall(r'f"([A-Z])\{[^}]+\}:([A-Z])\{', src)
+           if m[0] != m[1]]
+    assert not bad, f"仍有写死列字母的跨列范围:{bad}"
+    assert maint_sheet._span() == ("A", "K")           # 11 列
+    assert maint_sheet._col("result") == "J"
+    assert maint_sheet._col("error") == "K"
+
+
+def test_row_builder_is_the_only_place_that_shapes_a_row():
+    """维护记录只有一处造行 —— 散在各分支手拼元组的话,加列时漏改一处就错位。"""
+    import inspect
+
+    from workflows import maintenance as wf
+    src = inspect.getsource(wf)
+    assert "def _record(" in src
+    # 各分支一律走 _record(),不再出现 records.append((name, ...
+    assert "records.append((name," not in src
+    row = wf._record("T1", {"sku": "S1", "old": 5, "new": 0,
+                            "reason": "Currently unavailable"},
+                     "库存", "F1", "2026-08-16", "处理中", "")
+    assert len(row) == len(resources.MAINT_SHEET.columns)
+    assert row[_c("suggestion")] == "库存" and row[_c("action")] == "库存"
+    assert row[_c("reason")] == "Currently unavailable"

@@ -515,12 +515,21 @@ UPC_SHEET = Spreadsheet(
 # 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
 # feed 路径 F 写真 feedid、H 由 feed_poll 反哺器回填;PUT 同步路径 F 写
 # "sync"、H 当场写 成功/失败。
+# 维护记录(流水账,只追加):A~K 十一列。
+# 2026-08-16 所有者在飞书加了「建议」「原因」两列(9 → 11),配合 maintenance
+# 拆成 scan(决策,写 建议/原因)+ 执行件(写 动作/feedid/结果/报错)。
+# ⚠ 「原因」不是装饰:四条清零判据(Currently unavailable / No Featured Offer /
+#   out_of_stock / 配送超时)在表里长得一模一样(库存 12 → 0),没有原因列
+#   分不出是哪一条触发的;删除那类更要紧(not_found 与 标题相似度 42% 都是删除,
+#   但正确性判断完全不同)。
+# ⚠ services/maint_sheet 按**本元组的下标**算列字母,不再硬编码 A/H/I ——
+#   下次再加列只改这里一行。
 MAINT_SHEET = Spreadsheet(
     name="维护记录",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_MAINT_SHEET_ID", ""),
-    columns=("store", "sku", "action", "old_value", "new_value",
-             "feed_id", "op_date", "result", "error"),
+    columns=("store", "sku", "suggestion", "reason", "action",
+             "old_value", "new_value", "feed_id", "op_date", "result", "error"),
 )
 
 

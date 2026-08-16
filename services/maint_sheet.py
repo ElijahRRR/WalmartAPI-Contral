@@ -31,7 +31,27 @@ from services import feed_track, kpi
 
 logger = logging.getLogger("services.maint_sheet")
 
-_SYNC_MARK = "sync"     # PUT 同步路径的 F 列伪标记(旧系统 'sync:200' 语义的收敛)
+# 列字母**从 registry.MAINT_SHEET.columns 的下标推导**,不再硬编码 A/H/I。
+# 2026-08-16 所有者在飞书加了「建议」「原因」两列(9→11),硬编码的那版会把
+# 「动作」写进「建议」列、把回执写进「新值」列 —— 整表错位且不报错。
+# 列序即契约,契约的唯一权威是 registry;这里只按名字取。
+def _col(name: str) -> str:
+    return feishu._col_letter(resources.MAINT_SHEET.columns.index(name) + 1)
+
+
+def _idx(name: str) -> int:
+    return resources.MAINT_SHEET.columns.index(name)
+
+
+_FIRST_COL = "A"
+
+
+def _span() -> str:
+    """输入:无 → 输出:整行范围的列字母对,如 ('A', 'K')。"""
+    return _FIRST_COL, feishu._col_letter(len(resources.MAINT_SHEET.columns))
+
+
+_SYNC_MARK = "sync"     # PUT 同步路径的伪 feedid 标记(旧 'sync:200' 语义的收敛)
 _PENDING = ("", "处理中")
 _CURSOR = "maint_sheet"
 _APPEND_BLOCK = 500     # 单次写飞书的行数上限(一次裹上千行会被 90202 拒)
@@ -105,7 +125,7 @@ def append_records(rows: list[tuple]) -> int:
         row0 = start + i
         try:
             feishu.sheet_write_ranges(sheet, [
-                (f"A{row0}:I{row0 + len(block) - 1}",
+                (f"A{row0}:{_span()[1]}{row0 + len(block) - 1}",
                  [[str(c) if c is not None else "" for c in r] for r in block])])
         except Exception:
             if written:
@@ -155,19 +175,25 @@ def resync_from_ledger() -> str:
     hi = int(cur_state.get("next_row", 2))
     have: set[tuple[str, str]] = set()
     if hi > 2:
-        for raw in feishu.sheet_values(resources.MAINT_SHEET, f"A2:I{hi - 1}"):
-            cells = [(str(c).strip() if c is not None else "") for c in raw] \
-                + [""] * 9
-            have.add((cells[5], cells[1]))          # (feedid, sku)
+        for raw in feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}"):
+            cells = ([(str(c).strip() if c is not None else "") for c in raw]
+                     + [""] * len(resources.MAINT_SHEET.columns))
+            # 按列名取下标(2026-08-16 加了「建议」「原因」两列;写死 5/1 的话
+            # 存量识别会拿错列 ⇒ 每轮把全部行当"表里没有"重复补写)
+            have.add((cells[_idx("feed_id")], cells[_idx("sku")]))
     rows = []
     for store, sku, ftype, fid, status, code, desc, submitted in ledger:
         if (str(fid or ""), str(sku)) in have:
             continue
         result = _RESULT_BY_STATUS.get(status, status)
         err = feed_track.merge_error(code, desc) if status == "failed" else ""
-        rows.append((store, sku, _LABEL_BY_FEED.get(ftype, ftype), "", "",
-                     fid, submitted.strftime("%Y-%m-%d") if submitted else "",
-                     result, err))
+        label = _LABEL_BY_FEED.get(ftype, ftype)
+        # 按列名拼(11 列):台账只有 SKU 级状态,建议/原因/旧值/新值补不回来
+        vals = {"store": store, "sku": sku, "suggestion": label, "reason": "",
+                "action": label, "old_value": "", "new_value": "",
+                "feed_id": fid, "result": result, "error": err,
+                "op_date": submitted.strftime("%Y-%m-%d") if submitted else ""}
+        rows.append(tuple(vals[c] for c in resources.MAINT_SHEET.columns))
     if not rows:
         return "维护记录:表与台账已一致,无需补写"
     written = append_records(rows)
@@ -196,21 +222,25 @@ def sync_from_ledger() -> str | None:
     lo, hi = int(cur_state.get("unresolved_from", 2)), int(cur_state.get("next_row", 2))
     if lo >= hi:
         return None
-    values = feishu.sheet_values(resources.MAINT_SHEET, f"A{lo}:I{hi - 1}")
+    values = feishu.sheet_values(resources.MAINT_SHEET,
+                                 f"A{lo}:{_span()[1]}{hi - 1}")
     updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
     stale_cut, n_stale = _today() - timedelta(days=STALE_DAYS), 0
     for i, raw in enumerate(values):
-        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
-        sku, fid, result = cells[1], cells[5], cells[7]
+        cells = ([(str(c).strip() if c is not None else "") for c in raw]
+                 + [""] * len(resources.MAINT_SHEET.columns))
+        sku = cells[_idx("sku")]
+        fid = cells[_idx("feed_id")]
+        result = cells[_idx("result")]
         rownum = lo + i
         # 超期兜底(所有者定稿 2026-08-09):一行永远悬着会把水位钉死,
         # 每轮 feed_poll 都要重读整段。超 STALE_DAYS 天判「未查到」放行——
         # **状态权威在 ops.feed_items,这里只是展示面板不再等它**。
-        row_date = _row_date(cells[6])
-        if (cells[5] and result in _PENDING and row_date
+        row_date = _row_date(cells[_idx("op_date")])
+        if (fid and result in _PENDING and row_date
                 and row_date < stale_cut):
-            updates.append((f"H{rownum}:I{rownum}",
+            updates.append((f"{_col('result')}{rownum}:{_col('error')}{rownum}",
                             [["未查到", f"超 {STALE_DAYS} 天未落定,不再等"]]))
             n_stale += 1
             if prefix_done:
@@ -241,7 +271,8 @@ def sync_from_ledger() -> str | None:
         # 报错列写「码 | 人话」(改价/改库存/改标题/清库存共用这一列)
         err = feed_track.merge_error(
             st[1], descs.get(fid, {}).get(sku)) if text == "失败" else ""
-        updates.append((f"H{rownum}:I{rownum}", [[text, err]]))
+        updates.append((f"{_col('result')}{rownum}:{_col('error')}{rownum}",
+                        [[text, err]]))
         if prefix_done:
             new_lo = rownum + 1
     n = feishu.sheet_write_ranges(resources.MAINT_SHEET, updates) if updates else 0
@@ -274,7 +305,7 @@ def prune(days: int = RETAIN_DAYS) -> str:
     hi = int(cur_state.get("next_row", 2))
     if hi <= 2:
         return "维护记录:表内无数据行,无需裁剪"
-    values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:I{hi - 1}")
+    values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}")
     cut = _today() - timedelta(days=days)
     kept = []
     for raw in values:

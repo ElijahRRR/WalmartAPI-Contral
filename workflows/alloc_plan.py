@@ -100,6 +100,37 @@ def _pending_delist(conn, cfg, registered) -> dict:
     return dict(out)
 
 
+_SQL_ONLINE_SKU = """
+SELECT store, sku FROM catalog.walmart_items
+WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
+"""
+
+
+def _reserved(conn, held_prod: dict) -> dict:
+    """输入:连接 + {asin: 占用店} → 输出:{店: **已占但还没上架**的货位数}。
+
+    ★ 占用是"这个货位归你了",`online_now` 数的是"已经在架的" —— 两者之间
+    隔着一次真实上架。这个差额必须从剩余容量里扣掉,否则:
+    `alloc_plan --execute` 落了三万条占用、货还没上,第二天再跑一次,剩余容量
+    一点没变,于是**把同一批货位再许诺一次**。已占 ASIN 会被排除所以换了一批
+    产品,但两批货加起来塞不进那些店 —— 而占用撤不回。
+    (2026-08-16 所有者追问「执行会如何标记产品」时发现)
+
+    ⚠ 只数**属于该店自己**的占用:占用在 A、货在 B 的行不算 A 的预留
+    (那种情况是 B 该下架,见 `claim_audit`)。
+    """
+    from services import sku_asin
+    with conn.cursor() as cur:
+        cur.execute(_SQL_ONLINE_SKU)
+        live = {(store, a) for store, sku in cur.fetchall()
+                if (a := sku_asin.extract_asin(sku))}
+    out: Counter = Counter()
+    for asin, store in held_prod.items():
+        if (store, asin) not in live:
+            out[store] += 1
+    return dict(out)
+
+
 def _fit_to_store(grp: dict, st: dict) -> tuple[dict | None, int]:
     """输入:定向流的组 + 占用店 → 输出:(该店收得了的那部分, 被剪掉的件数)。
 
@@ -207,6 +238,7 @@ def run(params: dict) -> str:
         held_brand = claims.load_active(conn, claims.BRAND)
         held_prod = claims.load_active(conn, claims.PRODUCT)
         pending = _pending_delist(conn, cfg, registered)
+        reserved = _reserved(conn, held_prod)
 
     # ── 候选漏斗 ──────────────────────────────────────────────────────
     scored, gated = product_pool.score_all(data)
@@ -228,7 +260,7 @@ def run(params: dict) -> str:
 
     # ── 店铺配额 ─────────────────────────────────────────────────────
     metrics = store_perf.derive(perf_raw, days)
-    q = store_perf.quota_inputs(metrics, cfg, online_now, pending)
+    q = store_perf.quota_inputs(metrics, cfg, online_now, pending, reserved)
     stores: dict = {}
     for s, qq in q.items():
         if s not in registered or sv.is_excluded(s) or not qq.get("participates"):
@@ -402,6 +434,13 @@ def run(params: dict) -> str:
             L.append("  其中**货期**挡下的,按店:"
                      + " · ".join(f"{s} {n:,} 件" for s, n in slow.most_common(6))
                      + " —— 放宽该店「配送时长限制」或换货源才救得回,开类目没用")
+    if reserved:
+        # 不说破的话,"剩余容量怎么比上次少了"没人查得出来
+        L.append(f"  已占但**还没上架**的货位 {sum(reserved.values()):,} 个已从剩余容量里"
+                 f"扣掉(占用是「这个位置归你了」,在线数是「已经在架的」,"
+                 f"中间隔着一次上架):"
+                 + "、".join(f"{s} {n:,}" for s, n in
+                             Counter(reserved).most_common(6)))
     if no_gap:
         L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额(或算不出货位值),"
                  f"**配额退回剩余容量** —— 它们能接多少全看容量,与经营水平无关:"

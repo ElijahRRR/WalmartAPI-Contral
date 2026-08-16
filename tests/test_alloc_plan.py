@@ -461,3 +461,44 @@ def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
     out = wf.run({"execute": False})
     assert "其中**货期**挡下的" in out and "开类目没用" in out
     assert "其中**类目**挡下的" not in out
+
+
+def test_claims_not_yet_listed_consume_room():
+    """⚠ 占用是「这个位置归你了」,在线数是「已经在架的」—— 中间隔着一次上架。
+
+    不扣掉这个差额的后果(2026-08-16 所有者追问「执行会如何标记产品」时发现):
+    --execute 落了三万条占用、货还没上,第二天再跑一次,剩余容量一点没变,
+    于是**把同一批货位再许诺一次**。已占 ASIN 会被排除所以换了一批产品,
+    但两批货加起来塞不进那些店 —— 而占用撤不回。
+    """
+    from services import store_perf
+    cfg = {"A": {"max_online": 1000, "gmv": 400.0}}
+    m = {"A": {"slot_value": 1.0, "daily_net_own": 100.0}}
+    plain = store_perf.quota_inputs(m, cfg, {"A": 200})
+    withres = store_perf.quota_inputs(m, cfg, {"A": 200}, None, {"A": 300})
+    assert plain["A"]["room"] == 800 and plain["A"]["room_now"] == 800
+    assert withres["A"]["room"] == 500 and withres["A"]["room_now"] == 500
+    assert withres["A"]["reserved"] == 300
+
+
+def test_reserved_counts_only_claims_whose_goods_are_not_yet_on_that_shelf():
+    """⚠ 只数**属于该店自己**的占用。
+
+    占用在 A、货在 B 的行不算 A 的预留 —— 那种情况是 B 该下架(claim_audit
+    专门报它),把它记成 A 的预留会白白吃掉 A 的容量。
+    """
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k): pass
+        def fetchall(self):
+            return [("A", "B0AAAA0001"),      # A 店已上架
+                    ("B", "B0CCCC0003")]      # 货在 B,占用却在 A
+
+    class _Conn:
+        def cursor(self): return _C()
+
+    held = {"B0AAAA0001": "A",     # 已上架 → 不算预留
+            "B0BBBB0002": "A",     # 占了没上 → 算
+            "B0CCCC0003": "A"}     # 货在别人架上 → 仍算 A 的预留(A 那儿确实空着)
+    assert wf._reserved(_Conn(), held) == {"A": 2}

@@ -70,6 +70,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# 参数值里混进了本该独立成词的开关。成因几乎总是**分隔符不是普通空格**
+# ——从聊天/网页复制命令时容易带上不换行空格(U+00A0)等,shell 不把它当
+# 分词符,于是 `-p k=v --execute` 整串进了 v。
+# ⚠ **只报错,绝不"帮你"把它解释成开关**:那等于让一个粘贴事故把 dry-run
+#    变成真跑。危险工作流的 --execute 必须是人显式敲进去的。
+_FLAGS = ("--execute", "-p", "--param", "-h", "--help", "--dry-run")
+
+
 def _build_params(pairs: list[str], steps: list[str]) -> dict[str, dict]:
     """输入:-p 原文 + 本次要跑的工作流名 → 输出:{工作流名: 该步的 params}。
 
@@ -86,22 +94,47 @@ def _build_params(pairs: list[str], steps: list[str]) -> dict[str, dict]:
             raise SystemExit(f"参数格式错误(应为 key=value): {item}")
         k, _, v = item.partition("=")
         k, v = k.strip(), v.strip()
+        # split() 按任意空白切,包括 U+00A0 —— 正是要抓的那种
+        stuck = [w for w in v.split() if w in _FLAGS]
+        if stuck:
+            raise SystemExit(
+                f"参数值里粘进了开关 {' '.join(stuck)}:\n"
+                f"    -p {k}={v}\n"
+                f"  多半是路径与开关之间那个空格不是普通空格(从聊天/网页复制\n"
+                f"  常带不换行空格)。把该处空格重敲一遍,或给值加引号:\n"
+                f"    -p \"{k}={v.split()[0]}\" {' '.join(stuck)}\n"
+                f"  ⚠ 本命令**没有执行**——不会替你把它当成开关,免得一次粘贴\n"
+                f"    事故把 dry-run 变成真跑。")
         scope, sep, rest = k.partition(":")
         if sep and scope in out:
             out[scope][rest.strip()] = v
         else:
-            for s in out:
-                out[s][k] = v
+            for st in out:
+                out[st][k] = v
     return out
+
+
+class _NotOnScreen(logging.Filter):
+    """带 `file_only=True` 的记录只进日志文件,不上终端。
+
+    摘要要**同时**满足两个需求:终端上干干净净出现一次(人在看),日志文件里
+    留全文(事后查"那次到底输出了什么",这是唯一能回答的地方)。少了过滤器
+    就只能二选一 —— 要么终端刷两遍,要么日志里没有摘要。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "file_only", False)
 
 
 def _setup_logging(logs_dir: Path) -> None:
     """根 logger 只配一次(stderr);每步的文件 handler 由 _log_to 挂/摘。"""
     logs_dir.mkdir(parents=True, exist_ok=True)
+    screen = logging.StreamHandler(sys.stderr)
+    screen.addFilter(_NotOnScreen())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stderr)],
+        handlers=[screen],
     )
     # ⚠ basicConfig 在"根 logger 已有 handler"时是**静默空操作**(某个 import
     # 抢先配过就会这样)。级别单独钉一遍 —— 否则根还停在 WARNING,
@@ -226,7 +259,9 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
                 logger.error("workflow %s 失败:\n%s", name, err)
                 _record_finish(run_id, "failed", err[-2000:])
                 return "failed", f"{mode}{name} 失败\n{err.strip().splitlines()[-1]}"
-            logger.info("workflow %s 成功: %s", name, summary)
+            # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
+            logger.info("workflow %s 成功:\n%s", name, summary,
+                        extra={"file_only": True})
             print(summary)
             _record_finish(run_id, "success", summary)
             return "success", f"{mode}{name} 成功\n{summary}"

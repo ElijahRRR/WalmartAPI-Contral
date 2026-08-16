@@ -35,7 +35,7 @@ import logging
 from datetime import datetime, timezone
 
 from registry import db
-from services import order_lines
+from services import order_lines, sku_asin
 
 DANGEROUS = False
 
@@ -57,12 +57,16 @@ _HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 _REQUIRED = tuple(f for f, _ in _HEADER_MAP)
 
+# asin 与 sku 同时写(A1.5,2026-08-15):落库当场清洗,不留给后台补。
+# 规则唯一出处 services/sku_asin;提不出的写 NULL,由 order_asin_normalize
+# 扫尾(纯数字 item_id 形态要查库,这里查不了)
 _INSERT = """
 INSERT INTO orders.order_lines
-    (order_line_id, store, po_id, line_number, sku, product_name, qty,
+    (order_line_id, store, po_id, line_number, sku, asin, product_name, qty,
      sale_status, order_date, product_amount, source)
-VALUES (%(order_line_id)s, %(store)s, %(po_id)s, '', %(sku)s, %(product_name)s,
-        %(qty)s, 'Delivered', %(order_date)s, %(product_amount)s, %(source)s)
+VALUES (%(order_line_id)s, %(store)s, %(po_id)s, '', %(sku)s, %(asin)s,
+        %(product_name)s, %(qty)s, 'Delivered', %(order_date)s,
+        %(product_amount)s, %(source)s)
 ON CONFLICT DO NOTHING
 """
 
@@ -160,6 +164,7 @@ def parse_rows(header: list, rows, since: str = "") -> tuple[list[dict], dict[st
         seen.add(line_id)
         out.append({"order_line_id": line_id, "store": str(rec.get("store") or "").strip(),
                     "po_id": po, "sku": sku,
+                    "asin": sku_asin.extract_asin(sku),
                     "product_name": str(rec.get("product_name") or "").strip()[:500],
                     "qty": int(qty), "order_date": od,
                     "product_amount": amount,

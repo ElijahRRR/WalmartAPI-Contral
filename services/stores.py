@@ -71,6 +71,23 @@ def load_stores(filter_names: list[str] | None = None) -> list[dict]:
     return stores
 
 
+def registered_names() -> set[str]:
+    """输入:无 → 输出:凭证表里**全部**店名(不做任何过滤);飞书失败直接抛。
+
+    与 `load_stores()` 的区别是**不过滤**:后者按启用/ClientId/代理三条筛出
+    "现在能调 API 的店",而审计要回答的是另一个问题——"这个店还在不在册"。
+    两者混用会把「在册但代理没配」的在营店误判成已终止的死店,而死店清单
+    直通整店释放与全店下架(dangerous),误判一次代价极大。
+
+    不做快照兜底:审计要么拿到当下真值,要么明说读不到——拿旧快照算死店
+    正是这道判定最不能承受的降级。
+    """
+    from api import feishu as _feishu       # 与 load_stores 同源,惰性避免循环
+    f = resources.STORE_CREDENTIALS.fields
+    recs = _feishu.list_records(resources.STORE_CREDENTIALS, field_names=[f.store])
+    return {n for n in (_cell(r.get("fields", {}), f.store) for r in recs) if n}
+
+
 def _cell(fields: dict, key: str, default: str = "") -> str:
     """多维表格单元格 → 纯文本:文本字段可能返回 [{'text':...}] 段列表,数字字段返回 int/float。"""
     v = fields.get(key, default)

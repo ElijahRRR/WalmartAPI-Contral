@@ -27,7 +27,10 @@ from registry import db
 logger = logging.getLogger("services.amz_source")
 
 MIN_INVENTORY = 5           # 库存 <5 不上架(旧 MIN_INVENTORY_THRESHOLD)
-MAX_LEAD_DAYS = 8           # 配送 >8 天:上架但库存写 0 / 维护时清零
+MAX_LEAD_DAYS = 7           # 配送 >7 天:上架但库存写 0 / 维护时清零
+                            # 所有者两次收紧:12 →(08-09)8 →(08-15)7。
+                            # ⚠ 改这个数会动**生产在线商品**:下一轮
+                            # maintenance 会把货期超标行的库存清零。
                             # (所有者定稿 2026-08-09 从旧值 12 收紧到 8;
                             #  list_new 与 maintenance 共用这一个口径)
 

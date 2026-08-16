@@ -37,7 +37,11 @@ def test_zero_or_blank_is_treated_as_not_configured(monkeypatch):
     ])
     monkeypatch.setattr(feishu, "_plain_text",
                         lambda v: "" if v is None else str(v))
-    assert resources.RETIRE_LIMITS.fields.max_lead_days == "配送时长限制"
+    # ⚠ **一列一个常量**:2026-08-16 合并时分配链与上下架链各建过一个指向
+    # 同一列的常量,已合并为 lead_limit。两个常量的后果是表头一改名只坏一半,
+    # 另一半静默读空(而"读空"在这条链上表现为"全店回落默认上限",不报错)
+    assert resources.RETIRE_LIMITS.fields.lead_limit == "配送时长限制"
+    assert not hasattr(resources.RETIRE_LIMITS.fields, "max_lead_days")
     assert sl.lead_day_caps() == {"A": 5}
 
 

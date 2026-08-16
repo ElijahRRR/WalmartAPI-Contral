@@ -160,7 +160,7 @@ maintenance/list_new)→ 按域停旧切换。
 | — | blacklist_push | (新增) | 否 | PG 黑名单自产行 → 飞书两张收集表(投影只追加;镜像行按 src_sku 指纹排除,绝不回推;水位 pushed_at 每块落,崩了重推不丢行;追加定位先读列 A 找真空行,防 +append 富文本误判)。**[~] 生产首推已完成**(所有者确认 2026-08-13);待挂调度 |
 | — | backup | (新增) | 否 | 每日 pg_dump + 备份校验,失败飞书告警(cli 统一发)。**[~] 代码完成**(2026-08-13 批次 A:-Fc 先写 .part → pg_restore --list 校验 → 原子换名;保留期清理只碰自家命名且永不删当轮产物;days≥1 硬闸)。待生产首跑 + 挂每日调度。异机恢复注意:readonly 角色不在单库 dump 里 |
 | — | audit_import | (新增,一次性) | **是** | 旧审核库 walmart_audit(同实例隔壁 database)13 表 → audit schema。dry-run 逐表体检(pg_attribute/format_type 含精度列对照;源独有列/类型不符/清单表缺失=致命拒迁;replace 的 TRUNCATE 必预告);--execute 单事务 COPY + 行数校验 + 标识列 setval;源连接 REPEATABLE READ 只读。**[x] 生产实跑完成**(2026-08-13:dry-run 13 表全绿后 --execute 单事务约 614 万行全 ✓,含 audit_runs 204 万 / audit_hits 388 万;blacklist_brands 实测 42,726 行) |
-| — | allocation(占用与分配) | (新增) | **是** | 品牌/产品/类目三重排他占用台账(catalog.claims,与在线快照解耦,释放只走显式动作)+ 分配引擎(硬约束闸→产品分→店铺-产品贪心匹配,第一版规则打分不用 ML/LLM)。**[ ] 立案,全线暂缓**(所有者定稿 2026-08-07:含 A1 地基,等产品中心库建成、审核链接通、可见真实结构与数据后校准再动工)。子计划 docs/allocation_plan.md |
+| — | allocation(占用与分配) | (新增) | **是** | 品牌/产品/类目/渠道四重排他占用台账(catalog.claims,与在线快照解耦,释放只走显式动作)+ 分配引擎(硬约束闸→产品分→店铺-产品贪心匹配,第一版规则打分不用 ML/LLM)。**[~] A0 收口 + A0.5 代码就绪**(2026-08-15 校准:main 迁入审核系统后 audit_sync 撤销——审核结论由 product_audit 直写产品表;候选宇宙=catalog.products 走 product_ingest;`alloc_audit` 存量审计工作流就绪待生产首跑(P 探针 4 项 + A 审计 7 项);services/brand_key(占用键唯一出处)与 services/store_targets(限额表目标四列 loader)已建。后续 A1 占用台账 → A1.5 订单 ASIN 归一(A2 硬前置)→ A2 引擎)。子计划 docs/allocation_plan.md
 
 | — | services_review | (新增) | 否 | 每月一次:AI 巡检 services/ 合并重复积木 |
 

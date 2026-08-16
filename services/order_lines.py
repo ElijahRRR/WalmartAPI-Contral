@@ -24,6 +24,8 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from services import sku_asin
+
 logger = logging.getLogger("services.order_lines")
 
 
@@ -161,6 +163,10 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(order.get("customerOrderId") or ""),
             "sku": sku,
+            # A1.5:落库当场清洗,不留给后台补(2026-08-15)。规则唯一出处
+            # services/sku_asin;纯数字 item_id 形态这里提不出(要查库),
+            # 由 order_asin_normalize 扫尾——所以下面的 upsert 用 COALESCE 守着
+            "asin": sku_asin.extract_asin(sku),
             "product_name": str((ol.get("item") or {}).get("productName") or ""),
             "qty": int(_num((ol.get("orderLineQuantity") or {}).get("amount"), 1) or 1),
             "sale_status": st.get("status", ""),
@@ -365,6 +371,9 @@ def settle_status(net: float, gross: float) -> str:
 # **全 0 不覆盖已有的真电话**——旧系统的「电话全 0 保护」,legacy_survey 明列为
 # 必须照搬的防线,此前漏了。覆盖掉就找不回来:raw 也是每次一起被覆盖的。
 # 反向不设防:真电话覆盖全 0 是正常修复。
+# 算不出就别覆盖:order_sync 拿纯数字 sku 提不出 asin,而扫尾工作流查库能填出来
+_ASIN_GUARD = "COALESCE(EXCLUDED.asin, t.asin)"
+
 _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
                 "AND coalesce(t.phone, '') !~ '^0*$' "
                 "THEN t.phone ELSE EXCLUDED.phone END")
@@ -418,7 +427,11 @@ _ORDER_LINE_COLS = [
     # ⚠ source 留在覆盖列里是**有意的**:order_sync 的行不带这个键 → 写 NULL,
     # 于是 API 一拉到真行,历史标记自动摘掉,该行回到飞书推送流。
     # 把它挪进 skip_update 会让残缺行永远被当历史行排除在外。
-    "source"]
+    "source",
+    # ⚠ asin 必须配 _ASIN_GUARD:order_sync 对纯数字 sku 算不出 asin(要查
+    # walmart_items),裸写 EXCLUDED.asin 会把 order_asin_normalize 扫尾填好的
+    # 值**冲回 NULL**——每轮同步抹一次,那一列永远填不满。COALESCE 保留旧值。
+    "asin"]
 
 HISTORY_SOURCE = "历史数据"      # order_history_import 写;push 侧按它排除
 
@@ -441,7 +454,8 @@ def upsert_order_lines(conn, rows: list[dict]) -> int:
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)
     return _upsert(conn, "orders.order_lines", _ORDER_LINE_COLS,
-                   ["order_line_id"], rows, guards={"phone": _PHONE_GUARD})
+                   ["order_line_id"], rows,
+                   guards={"phone": _PHONE_GUARD, "asin": _ASIN_GUARD})
 
 
 def upsert_return_lines(conn, rows: list[dict]) -> int:

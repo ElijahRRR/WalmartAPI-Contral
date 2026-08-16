@@ -16,6 +16,9 @@
 
 决策(查库 → 定性 → 该改什么)在 `maintenance_scan`;判据在
 `services.maintenance_intents.classify()`。为什么拆:见 maintenance_scan 头注。
+意图的六个来源(删除/清零/改价/改库存/改标题/跟卖铺货)与各自的取舍,
+逐条写在 `services/maintenance_intents` 的模块头注与各 provider docstring 里 ——
+拆分之后它们全部归扫描件,本文件不再复述(两处各写一份必然漂)。
 
 ⚠ **调度顺序是硬约束**:catalog_sync → product_refresh → maintenance_scan →
 本工作流。没跑 scan 就跑本工作流 = 消费上一轮的陈旧建议(或者什么都没有)。

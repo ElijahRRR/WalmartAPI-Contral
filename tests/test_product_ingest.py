@@ -263,7 +263,7 @@ def test_list_new_stock_three_way(monkeypatch):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}))
+        {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
@@ -282,10 +282,14 @@ def test_list_new_stock_three_way(monkeypatch):
     assert f"库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货 1 行" in out
     assert "库存不足:3" in out and "库存不足:0" in out
     assert "库存未知(状态 unknown)" in out
-    assert "配送超时 1" in out                       # 闸门行里单独计数
-    assert "配送 30 天 > 本店上限 8 天" in out        # 理由写清是哪个上限
+    # ⚠ 2026-08-16 合并后**两条改动叠加**:全局上限 8 → 7(main),
+    # 且超限从"上架但清零"改成"不上架"(走进生产批次二)。于是 8 天那行
+    # 也被拦了 —— 超时 2 行,只剩 1 行进入提交
+    assert "配送超时 2" in out                       # 闸门行里单独计数
+    assert "配送 8 天 > 本店上限 7 天" in out         # 8 天那行:全局收紧后也超
+    assert "配送 30 天 > 本店上限 7 天" in out        # 理由写清是哪个上限
     assert "库存 0 待提交" not in out                # 不再有"上架但清零"这一档
-    assert "共 2 行将进入" in out                    # 3 → 2:超时那行被拦下
+    assert "共 1 行将进入" in out
 
 
 def test_partner_id_reads_nested_shape(monkeypatch):

@@ -46,9 +46,11 @@ def lead_day_caps() -> dict[str, int]:
         不上架就不占 UPC、不占配额,比上一个卖不动的更省。
       - **维护**(maintenance):超限 ⇒ **库存写 0**。它已经在架了,只能压库存。
 
-    查不到该店 ⇒ 调用方回落 `services.amz_source.MAX_LEAD_DAYS`(8 天)。
+    查不到该店 ⇒ 调用方回落 `services.amz_source.MAX_LEAD_DAYS`(**7 天**,
+    2026-08-15 从 8 收紧)。⚠ 常量名是 `lead_limit`,与分配链共用同一列同一常量
+    —— 2026-08-16 合并时两边各建过一个,已合并为一个(见 registry 那处注释)。
     """
-    caps = _int_map(resources.RETIRE_LIMITS.fields.max_lead_days)
+    caps = _int_map(resources.RETIRE_LIMITS.fields.lead_limit)
     if not caps:
         logger.info("限额表「配送时长限制」读到 0 店,全店回落默认上限"
                     "(表未登记/该列为空/列名对不上都会走到这里)")

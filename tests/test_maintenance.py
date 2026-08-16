@@ -132,7 +132,7 @@ def test_price_intents_skip_when_fulfillment_unknown(monkeypatch):
 
 
 def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
-    """所有者定稿 2026-08-09:没采到也写 0(采不到就不卖);货期闸收紧到 8 天。"""
+    """所有者定稿 2026-08-09:没采到也写 0(采不到就不卖);货期闸 2026-08-15 再收紧到 7 天。"""
     rows = [
         _row(sku="B0SYNC", avail_qty=10, stock_count=7),        # 7≠10 → 改
         _row(sku="B0SAME", avail_qty=7, stock_count=7),         # 相同 → 不动
@@ -140,14 +140,17 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
         _row(sku="B0UNKNOWN", avail_qty=5, stock_count=None),   # 没采到 → **也 0**
         _row(sku="B0ZEROED", avail_qty=0, stock_count=None),    # 已经是 0 → 不动
         _row(sku="B0LEAD9", avail_qty=9, stock_count=50,
-             delivery_days=9),                                  # 9>8 → 清零
+             delivery_days=9),                                  # 9>7 → 清零
+        # ⚠ 8 天这一档在 2026-08-15 阈值从 8 收到 7 之后**由"同步"翻成"清零"**
         _row(sku="B0LEAD8", avail_qty=9, stock_count=50,
-             delivery_days=8),                                  # 8 不超 → 同步 50
+             delivery_days=8),                                  # 8>7 → 清零
+        _row(sku="B0LEAD7", avail_qty=9, stock_count=50,
+             delivery_days=7),                                  # 7 不超 → 同步 50
     ]
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
     out = {i["sku"]: i["new"] for i in mi.inventory_intents(_Conn(), [])}
     assert out == {"B0SYNC": 7, "B0OOS": 0, "B0UNKNOWN": 0, "B0LEAD9": 0,
-                   "B0LEAD8": 50}
+                   "B0LEAD8": 0, "B0LEAD7": 50}
 
 
 def test_title_intents_reuses_listing_copy_rules(monkeypatch):

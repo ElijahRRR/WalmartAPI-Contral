@@ -356,9 +356,15 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
     """
     try:
         asins = sorted({r["asin"] for r in sheet_rows})
-        with db.pg_conn() as conn, conn.cursor() as cur:
-            cur.execute(_SQL_VERDICT, (asins,))
-            got = {r[0]: r for r in cur.fetchall()}
+        with db.pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_SQL_VERDICT, (asins,))
+                got = {r[0]: r for r in cur.fetchall()}
+            # F 列写**人话**:`products.audit_reason` 存的是 37 条沃尔玛政策的
+            # 类目名,而其中 `General-Use Products` 是"以上全不中"的兜底 ——
+            # 落在一把锤子、一个土豆压泥器上时人只会一头雾水(所有者
+            # 2026-08-16)。真正的原因在命中的规则里,翻出来放前面
+            reasons = audit_store.reject_reasons(conn, asins)
         updates, absent = [], 0
         for r in sheet_rows:
             row = got.get(r["asin"])
@@ -366,10 +372,12 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
                 absent += 1
                 continue
             _, title, pt, status, reason, at = row
+            why = (audit_reason.human_reason(reasons.get(r["asin"], []), reason)
+                   if status == "rejected" else (reason or ""))
             updates.append((r["rownum"], [
                 title or "", pt or "",
                 listing_sheet.AUDIT_RESULT_CN.get(status, status),
-                (reason or "")[:500],
+                why[:500],
                 at.strftime("%Y-%m-%d") if at else ""]))
         listing_sheet.write_audit_cols(updates, execute)
         # ⚠ 回填的是**整张表里所有已有结论的行**,不是本轮判的那 limit 个 ——

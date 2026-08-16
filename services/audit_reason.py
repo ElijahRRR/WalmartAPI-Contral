@@ -260,4 +260,83 @@ def known_policies_check(reason: str | None, known: frozenset) -> bool:
     return reason in known
 
 
-__all__ = ["compute_final_reason", "known_policies_check"]
+# ── 人话理由(给人看的那一面)───────────────────────────────────────────────
+#
+# ⚠ `final_reason_category` 回答的是「按 Walmart 37 条政策的哪一条被拒」——
+# 那是**平台口径**,不是原因。其中 `General-Use Products` 更是第 4g 步的兜底
+# (以上全不中),落在一把螺丝刀、一个土豆压泥器上时,人只会看得一头雾水
+# (所有者 2026-08-16:「理由是 General-Use Products,这是什么意思」)。
+#
+# **真正的原因在命中的规则里**,而且 hit.detail 里本来就写着中文 note
+# (「飞书维护的合规要求(含实验室证书/官方注册号),搬运模式做不了」)——
+# 只是此前一个字都没露给人看。下面这层就是把它翻出来。
+_RULE_CN = {
+    "phase0_forbidden_category":      "禁售大类",
+    "phase0_brand_blacklist":         "品牌黑名单",
+    "phase0_trademark_symbol":        "标题含 ®/™ 商标符号",
+    "phase0_lark_blacklist_asin":     "ASIN 在黑名单中心",
+    "phase0_lark_blacklist_seller":   "卖家在黑名单中心",
+    "phase0_lark_blacklist_amazon_cat": "亚马逊类目在黑名单中心",
+    "forbidden_mega_cat":             "禁售大类",
+    "zh_seller_mega_cat_forbidden":   "中国卖家禁售大类",
+    "cat_zh_blocked":                 "该类目不对中国卖家开放",
+    "cat_access_blocked":             "该类目未开通",
+    "cat_requires_cert_hard":         "**该类目要求认证**(搬运模式提供不了)",
+    "cat_requires_cert_small_part":   "电气小件,需人工确认能否免认证",
+    "cat_requires_cert_soft":         "该类目要软合规(可填披露)",
+    "walmart_strict_sensitive":       "沃尔玛敏感类目",
+    "excluded_category":              "类目被排除",
+    "publication_pt_forbidden":       "出版物类目禁售",
+    "title_desc_blacklist":           "标题/描述命中黑名单词",
+    "trademark_live":                 "命中在效商标",
+    "content_promotional":            "标题含促销用语",
+    "unmapped_amazon_path":           "亚马逊类目映射不出沃尔玛类目",
+    "pt_dict_fallback":               "类目靠字典回落(不是实证)",
+    "l4_vision_violation":            "图片违规",
+    "l4_images_partial":              "图片没取全",
+    "l4_bad_schema":                  "视觉层返回坏 JSON",
+}
+# 这几条不是"被拒的原因",只是过程留痕。它们单独出现时不该当理由显示
+_NOT_A_REASON = {"pt_dict_fallback", "l4_images_partial", "l4_bad_schema"}
+
+
+def explain_hit(rule_code: str, detail: dict | None) -> str:
+    """输入:命中的规则码 + detail → 输出:给人看的一句话(纯函数,零 DB)。
+
+    优先用 detail 里现成的中文 note —— 那是规则作者当场写下的"为什么",
+    比任何事后翻译都准。没有 note 才退回规则码的中文名。
+    """
+    d = detail or {}
+    base = _RULE_CN.get(rule_code, rule_code)
+    bits = [b for b in (
+        d.get("note"),
+        # 命中了什么:关键词 / 类目 / 品牌,取第一个有值的
+        ("要求:" + "、".join(d["matched_hard_kws"][:3]))
+        if d.get("matched_hard_kws") else None,
+        ("认证字段:" + "、".join(str(x) for x in d["hard_cert_fields"][:3]))
+        if d.get("hard_cert_fields") else None,
+        ("命中:" + str(d.get("brand") or d.get("category")
+                       or d.get("keyword") or d.get("matched")))
+        if (d.get("brand") or d.get("category") or d.get("keyword")
+            or d.get("matched")) else None,
+    ) if b]
+    return f"{base}({';'.join(str(b) for b in bits)})" if bits else base
+
+
+def human_reason(hits: list[tuple[str, dict]], policy: str | None) -> str:
+    """输入:[(规则码, detail)] + 37 政策类目 → 输出:上架表 F 列写的那句话。
+
+    形态:`人话1;人话2 [政策:General-Use Products]`。
+    政策类目留在方括号里 —— 它是与沃尔玛对话时的口径(申诉/开类目要报它),
+    丢掉不对;但它不该是**唯一**能看到的东西。
+    一条规则都没有(理论上不该发生)时只剩政策,并明说"未记录命中规则"。
+    """
+    said = [explain_hit(c, d) for c, d in hits if c not in _NOT_A_REASON]
+    tail = f"[政策:{policy}]" if policy else ""
+    if not said:
+        return (f"未记录命中规则{tail}" if tail else "未记录命中规则")
+    return ";".join(said[:3]) + (f" {tail}" if tail else "")
+
+
+__all__ = ["compute_final_reason", "known_policies_check",
+           "explain_hit", "human_reason"]

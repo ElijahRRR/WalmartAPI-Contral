@@ -57,8 +57,10 @@ def test_audit_result_cn_matches_what_list_new_reads():
 # ── ② 回填:C/D/E/F/G,库里没结论的留空 ───────────────────────────────────
 
 class _Cur:
-    def __init__(self, rows):
-        self._rows = rows
+    """按 SQL 分流的假游标:结论查 catalog.products,理由查 audit_runs/hits。"""
+
+    def __init__(self, rows, hits=()):
+        self._rows, self._hits, self._out = rows, hits, ()
 
     def __enter__(self):
         return self
@@ -68,14 +70,15 @@ class _Cur:
 
     def execute(self, sql, args=None):
         self.sql = sql
+        self._out = self._hits if "audit.audit_runs" in sql else self._rows
 
     def fetchall(self):
-        return self._rows
+        return self._out
 
 
 class _Conn:
-    def __init__(self, rows):
-        self._rows = rows
+    def __init__(self, rows, hits=()):
+        self._rows, self._hits = rows, hits
 
     def __enter__(self):
         return self
@@ -84,16 +87,16 @@ class _Conn:
         return False
 
     def cursor(self):
-        return _Cur(self._rows)
+        return _Cur(self._rows, self._hits)
 
 
 def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
     at = dt.datetime(2026, 8, 16, 9, 30)
-    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn([
-        ("B0OK", "沃标题", "Cups", "approved", "", at),
-        ("B0NO", "沃标题2", "Mugs", "rejected", "品牌命中黑名单", at),
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn(
+        [("B0OK", "沃标题", "Cups", "approved", "", at),
+         ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at)],
         # B0NONE 在库里查不到 → 不出现在结果集
-    ]))
+        [("B0NO", None, "phase0_brand_blacklist", {"brand": "Nike"}, -100)]))
     writes = []
     monkeypatch.setattr(listing_sheet, "write_audit_cols",
                         lambda ups, execute: (writes.extend(ups), len(ups))[1])
@@ -106,7 +109,9 @@ def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
     by_row = dict(writes)
     assert set(by_row) == {2, 3, 5}                 # 4 行留空,一格没动
     assert by_row[2] == ["沃标题", "Cups", "pass", "", "2026-08-16"]
-    assert by_row[3][2] == "reject" and by_row[3][3] == "品牌命中黑名单"
+    # F 列要说人话,而不是只甩一个 37 政策类目名(政策留在方括号里)
+    assert by_row[3][2] == "reject"
+    assert by_row[3][3] == "品牌黑名单(命中:Nike) [政策:General-Use Products]"
     assert by_row[5] == by_row[2]
     assert "回填 3 行" in out
     assert "1 行库里没有结论" in out and "E 列留空" in out

@@ -151,3 +151,41 @@ def event_row(outcome: AuditOutcome, run_id: int | None,
         return None      # pending 是过渡态不是生死节点,不进病历
     return {"sku": outcome.asin, "event": code, "source": source,
             "detail": detail}
+
+
+_LATEST_HITS_SQL = """
+WITH latest AS (
+    SELECT DISTINCT ON (asin) asin, run_id, l3_reason_text
+    FROM audit.audit_runs
+    WHERE asin = ANY(%s) AND verdict = 'reject'
+    ORDER BY asin, created_at DESC
+)
+SELECT l.asin, l.l3_reason_text, h.rule_code, h.detail, h.penalty
+FROM latest l
+LEFT JOIN audit.audit_hits h ON h.run_id = l.run_id
+ORDER BY l.asin, h.penalty NULLS LAST, h.hit_id
+"""
+
+
+def reject_reasons(conn, asins: list[str]) -> dict[str, list[tuple[str, dict]]]:
+    """输入:连接 + ASIN 列表 → 输出:{asin: [(规则码, detail), …]}(只判拒的)。
+
+    取每个 ASIN **最近一次判拒**那轮的全部命中,按扣分从重到轻排 ——
+    人要看的是"最重的那条为什么",不是第一条。
+    L3 有自由文本理由时塞成一条伪命中(rule_code='l3_reason'),
+    它往往是判拒里最像人话的一句。
+    """
+    if not asins:
+        return {}
+    out: dict[str, list[tuple[str, dict]]] = {}
+    seen_l3: set[str] = set()
+    with conn.cursor() as cur:
+        cur.execute(_LATEST_HITS_SQL, (sorted(set(asins)),))
+        for asin, l3_text, code, detail, _pen in cur.fetchall():
+            rows = out.setdefault(asin, [])
+            if l3_text and asin not in seen_l3:
+                seen_l3.add(asin)
+                rows.append(("l3_reason", {"note": l3_text}))
+            if code:                       # LEFT JOIN:没有命中时 code 为 NULL
+                rows.append((code, detail or {}))
+    return out

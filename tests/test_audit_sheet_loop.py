@@ -136,6 +136,32 @@ def test_write_audit_cols_stays_inside_cg(monkeypatch):
     assert sent == []
 
 
+def test_column_shuffle_is_caught_before_anything_runs(monkeypatch):
+    """⚠ 表头再被调一次而 registry 没跟着改 —— 必须在动库之前炸。
+
+    不炸的话:审核照样跑完、照样回填,只是全都判"库里没有这个 ASIN"。
+    表现是"这批产品怎么全都没采集",查半天查不到根因(2026-08-16 所有者
+    刚把 A/B 对调过一次,这类事会再发生)。
+    """
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": 2, "asin": "梦琪专营店", "store": "B0REAL0001"}])
+    with pytest.raises(ValueError, match="不像 ASIN"):
+        pa._claim_from_sheet(500)
+
+
+def test_backlog_size_reaches_the_summary_not_just_the_log(monkeypatch):
+    """截断只写日志 = 飞书通知里看着像"审完了"(生产实证:28498 待审 / limit 500)。"""
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": i, "asin": f"B0ASIN{i:04d}", "store": "T1"}
+        for i in range(2, 12)])
+    rows, asins, head = pa._claim_from_sheet(4)
+    assert len(rows) == 10 and asins == [f"B0ASIN{i:04d}" for i in range(2, 6)]
+    assert "待审 10 个 ASIN" in head[0]
+    assert "还剩 6 个" in head[1] and "limit=4" in head[1]
+    # 没超 limit 时不该无中生有地报警
+    assert len(pa._claim_from_sheet(500)[2]) == 1
+
+
 def test_from_sheet_reuses_the_asins_path(monkeypatch):
     """from_sheet 只是换了个领任务的地方 —— 判定引擎仍只有一条实现。"""
     monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [

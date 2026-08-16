@@ -130,6 +130,19 @@ def test_pick_where_rejects_unknown_params():
         product_audit._pick_where({"force_rurn": "x"})     # 手滑拼错
 
 
+def test_pick_where_lets_cli_injected_keys_through():
+    """⚠ cli 自己塞的键不是人敲的参数,白名单必须放行。
+
+    生产实证 2026-08-16:`--dry-run` 上线当天,cli 开始往 params 里塞
+    `dry_run`,这条白名单把它当成手滑拼错**直接抛异常** ——
+    `product_audit --dry-run` 完全起不来。每加一个 cli 级开关都会重演,
+    所以 `_CLI_INJECTED` 与 cli 那侧要一起改。
+    """
+    for k in product_audit._CLI_INJECTED:
+        product_audit._pick_where({k: True})               # 不抛就算过
+    assert {"execute", "dry_run"} <= product_audit._CLI_INJECTED
+
+
 def test_pick_where_rejects_unknown_mode():
     """mode 拼错静默落回默认 = 以为在补刷、实际在跑默认候选,同样宁炸不吞。"""
     with pytest.raises(ValueError, match="未识别 mode"):

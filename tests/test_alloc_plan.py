@@ -403,7 +403,7 @@ def test_the_cut_score_is_reported_so_queued_is_distinguishable(monkeypatch, tmp
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
-    assert "切口在**组分" in out and "排队中" in out
+    assert "候选切口在组分" in out and "排队中" in out
 
 
 def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
@@ -541,3 +541,22 @@ def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
     assert "搭车上架" in out
     line = [x for x in out.splitlines() if "搭车上架" in x][0]
     assert "3 个货位" in line          # 三个 36 分的跟着 95 分的上来了
+
+
+def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(
+        monkeypatch, tmp_path):
+    """⚠ **入场线 = 最后发出去的那张牌的分**,不是候选切口。
+
+    实测 2026-08-16:候选切口 42,705 组(组分 43.0),但配额在第 6,517 张牌上
+    就填满了 —— 只报切口会让人以为 43 分的货都进来了,差着十几分。所有者按
+    "每层 23,000 个、要选两万多个"推算分配行为时,用的就是那个错前提。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(500)]
+    _wire_directed(monkeypatch, pool, {}, room=10)      # 只装得下 10 件
+    out = wf.run({"execute": False})
+    assert "实际入场线:组分" in out
+    entry = float(out.split("实际入场线:组分 ")[1].split("**")[0])
+    cut = float(out.split("候选切口在组分 ")[1].split(" ")[0])
+    assert entry > cut, "入场线必须高于候选切口 —— 配额先填满"
+    assert "这不是入场线" in out

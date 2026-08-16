@@ -357,7 +357,14 @@ def run(params: dict) -> str:
     if data["risk_err"]:
         L.append(f"  ⚠ product_risk 读不到({data['risk_err']}):黑历史罚分全为 0")
 
-    L += ["", f"▍发牌结果:{len(result['assign']):,} 组 / {placed_items:,} 个货位"]
+    # ★ **真正的入场线是"最后发出去的那张牌的分",不是候选切口**。
+    #   实测 2026-08-16:切口 42,705 组(组分 43.0),但配额在第 6,517 张牌上
+    #   就填满了 —— 只报切口会让人以为 43 分的货都进来了,差着十几分。
+    #   所有者按"每层 23,000 个、要选两万多"推算时,用的就是那个错前提。
+    dealt = sorted((a["group"]["score"] for a in result["assign"]))
+    L += ["", f"▍发牌结果:{len(result['assign']):,} 组 / {placed_items:,} 个货位"
+          + (f";**实际入场线:组分 {dealt[0]:.1f}**(最后发出的那张牌),"
+             f"平均每组 {placed_items / len(dealt):.1f} 件" if dealt else "")]
     dir_by_store: Counter = Counter()
     for a in result["assign"]:
         if a["group"].get("store"):
@@ -407,9 +414,10 @@ def run(params: dict) -> str:
     if below_cut:
         L.append(f"  牌堆 {len(deck_all):,} 组,本轮只取前 {len(deck):,} 组"
                  f"(可分 {total_q:,} ×{HEADROOM});"
-                 + (f"切口在**组分 {deck[-1]['score']:.1f}**,低于它的 "
-                    f"{len(below_cut):,} 组是**排队中**,不是被闸挡了 —— "
-                    f"店铺容量腾出来之后下一轮自然轮到"
+                 + (f"候选切口在组分 {deck[-1]['score']:.1f} —— ⚠ **这不是入场线**,"
+                    f"配额早在那之前就填满了(入场线见上一节);"
+                    f"低于切口的 {len(below_cut):,} 组是**排队中**"
+                    f"(连候选都没进,不是被闸挡了 —— 两者处置不同)"
                     if deck else
                     f"**本轮可分为 0,{len(below_cut):,} 组一件都没发** —— "
                     f"所有店的剩余容量或缺口都是 0,先下架腾位"))

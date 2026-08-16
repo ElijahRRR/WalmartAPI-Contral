@@ -43,13 +43,14 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
   unknown → K=Unknown(不重复提交),UPC **不回收**
 """
 
+import collections
 import logging
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
 from services import amz_source, blacklist, kpi, listing_sheet, \
-    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, \
+    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, variant_group, \
     product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
@@ -242,6 +243,48 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
     return retry, exhausted
 
 
+_FAMILY_LISTED_SQL = """
+SELECT sku, variant_group_id,
+       coalesce(variant_group_info->>'isPrimary', '') AS is_primary
+FROM catalog.walmart_items
+WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
+  AND missing_since IS NULL
+"""
+
+
+def _variant_plan(conn, store: str, r: dict, spec) -> dict:
+    """输入:连接 + 店铺 + 待上架行 + PT spec → 输出:variant_group.plan() 决策。
+
+    ③ 所有者定稿:同族已有成员在架 ⇒ 新成员沿用它的 variantGroupId。
+    ② 分配侧保证「一组变体只分配一个店」⇒ **只查本店**,不做跨店重定向。
+
+    ⚠ 查库失败不许把整行拖下水:变体只是锦上添花,拿不到在架信息就按"本店还没有
+    同族"处理 —— 派生 ID 照样能让以后的兄弟归到一起(group_id 由 parent_asin
+    决定,不依赖这次查询)。
+    """
+    p = r.get("_p") or {}
+    fam = variant_group.parse_family(p.get("variation_asins"), r["asin"])
+    gid, has_primary = "", False
+    if store and len(fam) > 1:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_FAMILY_LISTED_SQL,
+                            {"store": store, "skus": [a for a in fam
+                                                      if a != r["asin"]]})
+                for _sku, g, prim in cur.fetchall():
+                    gid = gid or (str(g) if g else "")
+                    has_primary = has_primary or str(prim).lower() in ("yes", "true")
+        except Exception as e:      # noqa: BLE001
+            logger.warning("%s 查同族在架信息失败(按本店无同族处理): %s",
+                           r["asin"], e)
+    props = (spec or {}).get("properties") or {}
+    enum = mp_conform._enum_of(props.get("variantAttributeNames") or {})
+    return variant_group.plan(
+        r["asin"], p.get("variant_attributes"), p.get("variation_asins"),
+        p.get("parent_asin"), enum,
+        existing_group_id=gid, family_has_primary=has_primary)
+
+
 def _spec_precheck(ready: list[dict]) -> str:
     """输入:待提交行 → 输出:spec 一致化预检报告(不领 UPC、不提交)。
 
@@ -264,7 +307,8 @@ def _spec_precheck(ready: list[dict]) -> str:
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
-                sku=r["asin"])
+                sku=r["asin"],
+                variant=_variant_plan(conn, r.get("store") or "", r, spec))
             if missing:
                 lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
                              f"{','.join(missing[:8])}")
@@ -307,6 +351,9 @@ def run(params: dict) -> str:
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
+    # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
+    # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
+    n_var: dict[str, int] = collections.defaultdict(int)
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
@@ -452,6 +499,9 @@ def run(params: dict) -> str:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
+    if n_var:
+        gate_line += (";变体:" + ",".join(f"{k} {v}" for k, v in
+                                          sorted(n_var.items())))
     if n["no_weight"]:
         # 采集侧没给 attrs.weight → ShippingWeight 兜 1.0 磅。持续大面积
         # 出现 = 采集契约的 weight 形态可能对不上(backlog P1 核实项)
@@ -519,10 +569,13 @@ def run(params: dict) -> str:
                         llm_fields=llm_o)
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
+                    vplan = _variant_plan(conn, store_name, r,
+                                          pt_spec.load_pt(r["product_type"]))
+                    n_var[vplan["code"]] += 1
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
                         pt_spec.orderable_spec(), visible, orderable,
-                        sku=r["asin"])
+                        sku=r["asin"], variant=vplan)
                     if notes:
                         logger.info("%s spec 一致化 %d 处:%s", r["asin"],
                                     len(notes), "; ".join(notes[:6]))

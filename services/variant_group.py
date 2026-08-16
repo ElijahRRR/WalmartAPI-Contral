@@ -130,6 +130,9 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
 
     返回:
       mode      'variant' 走变体口径 / 'single' 退回单品口径(不发变体字段)
+      code      稳定短码,给摘要计数用:variant / no_attrs / oversize /
+                no_dim / no_group_id。**别拿 reason 分词当键**——reason 是给人
+                看的中文长句,改一个字计数就散了
       reason    走 single 的原因(mode='variant' 时为 '')
       group_id  变体组 ID
       attr_name 沃尔玛属性名(填 variantAttributeNames)
@@ -143,24 +146,26 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
     attrs = parse_attrs(raw_attrs)
     family = parse_family(raw_family, asin)
     gid = str(existing_group_id or "").strip() or group_id(parent_asin, asin)
-    out = {"mode": "single", "reason": "", "group_id": gid, "attr_name": None,
-           "attr_value": None, "family_size": len(family), "is_primary": False}
+    out = {"mode": "single", "code": "", "reason": "", "group_id": gid,
+           "attr_name": None, "attr_value": None,
+           "family_size": len(family), "is_primary": False}
     if not attrs:
-        out["reason"] = "无变体维度取值"
+        out.update(code="no_attrs", reason="无变体维度取值")
         return out
     if len(family) > MAX_FAMILY:
         # ④ 所有者定稿:几百上千成员的家族放不下,按单品照常上架(不是拒绝)
-        out["reason"] = f"家族 {len(family)} 个超上限 {MAX_FAMILY}"
+        out.update(code="oversize",
+                   reason=f"家族 {len(family)} 个超上限 {MAX_FAMILY}")
         return out
     name = pick_walmart_dim(list(attrs), enum)
     if not name:
-        out["reason"] = f"PT 枚举映不上亚马逊维度 {sorted(attrs)}"
+        out.update(code="no_dim", reason=f"PT 枚举映不上亚马逊维度 {sorted(attrs)}")
         return out
     if not gid:
-        out["reason"] = "无 parent_asin,凑不出稳定组 ID"
+        out.update(code="no_group_id", reason="无 parent_asin,凑不出稳定组 ID")
         return out
     # 取值取被选中那个维度的值:attrs 键是亚马逊维度名,反查回去
     dim = next((d for d in attrs if name in _DIM_MAP.get(d, ())), None)
-    out.update(mode="variant", attr_name=name, attr_value=attrs[dim],
-               is_primary=not family_has_primary)
+    out.update(mode="variant", code="variant", attr_name=name,
+               attr_value=attrs[dim], is_primary=not family_has_primary)
     return out

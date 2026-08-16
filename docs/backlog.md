@@ -172,7 +172,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~只读健康视图 cli.py health~~(所有者拍板 2026-08-13:**不要**)
 - ✅ LLM 校验失败 payload 落盘诊断(2026-08-12:必填缺失行落 `<DATA_ROOT>/logs/llm_raw_*.json`,含 missing/notes/两段载荷)
 - ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
-- ⬜ 变体分组(核心 ~190 行纯函数:full_variant_group_set 并集分组/PT 一致性/inject_variant_fields/标题差异化;**跨店重定向与 LLM remap 建议砍**;先决条件=采集契约顶层暴露 parent_asin/variation_asins/variation_attributes)
+- 🟡 变体分组(**决策层与载荷层已落地** 2026-08-15,余 list_new 生产验收):`services/variant_group.py` + `mp_conform.ensure_variant_bag(plan=...)` + `list_new._variant_plan`。⚠ **先决条件当初写错了**:不是「采集契约顶层暴露三字段」——数据一直在 `catalog.snapshots.raw`(生产实证 358,743 条有 variant_attributes、262,933 条有 variation_asins),之前判断卡在采集侧是**只翻了 products.slow**。`slow.variant.theme` 确实曾恒空,但那是采集侧导出的 bug(按 ':' 切、实际格式是 '='),已由采集侧 dad8f60 修复;即便修好也**只给维度名不给取值**,分变体要的取值仍只能从 raw 取。跨店重定向与 LLM remap 按原计划砍掉(20 个维度手写映射表);`full_set >= 10` 伪组闸**不抄**——采集侧 twister 版已用真实家族键取代会混进广告 ASIN 的旧正则
 
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
 

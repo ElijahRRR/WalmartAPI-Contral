@@ -727,12 +727,15 @@ def validate(spec: dict, ospec: dict, visible: dict, orderable: dict
 
 
 def conform(spec: dict | None, ospec: dict | None, visible: dict,
-            orderable: dict, sku: str = ""
+            orderable: dict, sku: str = "", variant: dict | None = None
             ) -> tuple[dict, dict, list[str], list[str]]:
-    """输入:PT spec + Orderable spec + 两段 → 输出:(visible, orderable, 说明, 缺失)。
+    """输入:PT spec + Orderable spec + 两段 + 变体决策 → 输出:(visible, orderable,
+    说明, 缺失)。
 
     十道工序按旧 main.py 的顺序执行;缺失非空 = **不该提交**(调用方回收 UPC)。
     spec 缺失时只做不依赖 spec 的工序(小数位),并原样返回。
+    `variant` = services.variant_group.plan() 的产出,透传给 ensure_variant_bag;
+    不给则走单品口径(与本参数出现之前的行为逐字相同)。
     """
     notes: list[str] = []
     if not spec:
@@ -754,7 +757,7 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
         notes += [f"orderable:{x}" for x in n]
         orderable, n = fix_invalid_enums(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]
-    visible, n = ensure_variant_bag(spec, visible, sku);    notes += n
+    visible, n = ensure_variant_bag(spec, visible, sku, variant); notes += n
     if _props(ospec):
         visible, orderable, n = strip_unknown(spec, ospec, visible, orderable)
     else:

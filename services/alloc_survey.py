@@ -29,6 +29,31 @@ def is_excluded(store: str) -> bool:
     return any(p in name for p in resources.alloc_excluded_stores())
 
 
+def offends_category(r, cfg) -> bool:
+    """输入:一行 + 配置 → 输出:这行的大类算不算「不符」。
+
+    ⚠ **归不到大类的行不算不符**:那是"不知道它属于哪类",不是"属于不该有
+    的类";把不知道算成违规会让无辜商品进下架清单。店铺三列全空 = 不限制。
+    """
+    cats = (cfg.get(r["store"]) or {}).get("categories")
+    if not cats or not r.get("category"):
+        return False
+    return not store_targets.allowed(cfg.get(r["store"]), r["category"])
+
+
+def offends_channel(r, cfg) -> bool:
+    """输入:一行 + 配置 → 输出:这行的渠道算不算「不符」(白名单口径)。
+
+    只有渠道确实是**另一个已知值**(FBA↔FBM)才算不符。采集没采到、或采出
+    第三种值,都不算——把"没采到"算成"货不对"会让无辜商品进下架清单;
+    第三种值恒高说明采集侧 `is_fba` 解析坏了,那要修采集不是下架商品。
+    店铺没填配送限制 = 不对拍(它另有报告点名补填)。
+    """
+    want = (cfg.get(r["store"]) or {}).get("channel")
+    ch = r.get("channel")
+    return bool(want) and ch in store_targets.CHANNELS and ch != want
+
+
 def claimable(rows, registered, cfg=None) -> list[dict]:
     """输入:富化行 + 在册店名集合(+ 店铺配置)→ 输出:**占得住货位的行**。
 
@@ -36,36 +61,38 @@ def claimable(rows, registered, cfg=None) -> list[dict]:
     `alloc_backfill`(落占用)都必须走这里 —— 两边各写各的筛法,报告说
     "留 A085"、回填却落到别家,那份给人照着做的清单就是假的(本模块存在的理由)。
 
-    四条筛法:
+    五条筛法:
       · **在册**:不在册店的行是冻结快照(catalog_sync 早不扫它了),
         混进来会让所有者为一家不存在的店去下架另一家店真在卖的 listing;
       · **规划内**:范围外的店(店名含「谭总」等)不占任何品牌与产品;
       · **已发布**:未发布的不算真占着货位;
-      · **类目准入**(传了 cfg 才生效):不准入该大类的行**不产生占用**。
+      · **类目准入**(传了 cfg 才生效):不准入该大类的行**不产生占用**;
+      · **渠道准入**(同上):渠道不符的行**不产生占用**。
 
     ⚠ 第三条曾经只写在回填侧,报告侧漏了(2026-08-15 实证:同一个品牌
     报告判"留 B"、回填落"留 A"——未发布行进了报告的「在线件数」那一级)。
 
-    ⚠ 第四条是 2026-08-15 晚补的,补的是一个会**永久锁错品牌**的洞:
-    `alloc_backfill._pick` 对**只有一家店有**的键直接归属,不过任何类目闸
-    (类目硬闸只在 `resolve_conflicts` 的多店组里跑)。于是「某店独有、且
-    类目不符」的品牌——正躺在 `alloc_类目不符下架清单.csv` 上等着被下架的
-    那些——照样被它占走,**而占用没有自动释放**:货下架了,品牌却永远锁在
-    这家不该做这个大类的店上,再也分不给对的店。
+    ⚠ 第四、五条补的是同一个会**永久锁错品牌**的洞(类目 2026-08-15 晚、
+    渠道 2026-08-16 所有者追问时补齐):`alloc_backfill._pick` 对**只有一家
+    店有**的键直接归属,不过任何硬闸(硬闸只在 `resolve_conflicts` 的多店组
+    里跑)。于是「某店独有、且类目/渠道不符」的品牌——正躺在
+    `alloc_类目不符下架清单.csv` / `alloc_渠道不符下架清单.csv` 上等着被下架
+    的那些——照样被它占走,**而占用没有自动释放**:货下架了,品牌却永远锁在
+    这家不该做这个大类(或不做这个渠道)的店上,再也分不给对的店。
     同理,一个品牌在两家店都不准入时,旧的硬闸"不作数"会退回销量阶梯,
     照样把它判给其中一家;现在两边的行都进不了这里,谁也占不到。
+
+    ⚠ 丢的必须**恰好**是两份下架清单会列的那些行,所以判定走
+    `offends_category` / `offends_channel` 这两个共享谓词,不在这里另写一遍。
+    口径不一致会造出"没进下架清单、却也不给它占用"的行 —— 货还在架上卖着,
+    品牌却成了无主,别的店一回填就把它抢走。
     """
     out = [r for r in rows
            if r["store"] in registered and r["published"]
            and not is_excluded(r["store"])]
     if cfg:
-        # 丢的必须**恰好**是 `category_offenders` 会列进下架清单的那些行:
-        # 归不到大类的**留着**(「未知不算不符」纪律)。两边口径不一致的话,
-        # 会出现"没进下架清单、却也不给它占用"的行 —— 货还在架上卖着,
-        # 品牌却成了无主,别的店一回填就把它抢走。
         out = [r for r in out
-               if not r.get("category")
-               or store_targets.allowed(cfg.get(r["store"]), r["category"])]
+               if not offends_category(r, cfg) and not offends_channel(r, cfg)]
     return out
 
 _CHUNK = 5000
@@ -380,14 +407,7 @@ def channel_offenders(rows, cfg):
     才算不符),但输出到 SKU 级——"存在不符 9 件"没法照着做,一行行的
     店铺/SKU/ASIN/渠道才行。只列已发布行:未发布的下架没有意义。
     """
-    out = []
-    for r in rows:
-        if not r["published"]:
-            continue
-        want = (cfg.get(r["store"]) or {}).get("channel")
-        ch = r["channel"]
-        if want and ch in store_targets.CHANNELS and ch != want:
-            out.append(r)
+    out = [r for r in rows if r["published"] and offends_channel(r, cfg)]
     out.sort(key=lambda r: (r["store"], r["sku"]))
     return out
 
@@ -413,7 +433,7 @@ def category_offenders(rows, cfg) -> tuple[list, int]:
         if not r.get("category"):
             unknown += 1
             continue
-        if not store_targets.allowed(cfg.get(r["store"]), r["category"]):
+        if offends_category(r, cfg):
             out.append(r)
     out.sort(key=lambda r: (r["store"], r.get("category") or "", r["sku"]))
     return out, unknown

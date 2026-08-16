@@ -872,6 +872,72 @@ def test_category_violating_rows_never_produce_a_claim():
     assert owner == {"acme": "A"}          # 违规牌不被占,留给能做 Home 的店
 
 
+def test_channel_violating_rows_never_produce_a_claim():
+    """渠道不符的行**也**不产生占用 —— 与类目那条是同一个洞的另一半。
+
+    2026-08-16 所有者追问「分配的时候 FBA/FBM 限制了吗」时才发现:08-15 晚
+    只补了类目,渠道漏了。后果一模一样且不可逆 —— 「某店独有 + 渠道不符」的
+    品牌正躺在 `alloc_渠道不符下架清单.csv` 上等着被下架,却照样被占走,
+    而占用没有自动释放,永远锁在这家不做这个渠道的店上。
+    """
+    from workflows import alloc_backfill as bf
+    rows = [
+        {"store": "A", "sku": "S1", "asin": "B0AAAA0001", "brand_key": "acme",
+         "category": "Fashion", "channel": "FBA", "published": True,
+         "pt": "x", "pt_source": None},
+        {"store": "A", "sku": "S2", "asin": "B0BBBB0002", "brand_key": "错渠道牌",
+         "category": "Fashion", "channel": "FBM", "published": True,
+         "pt": "y", "pt_source": None},
+    ]
+    cfg = {"A": {"categories": ["Fashion"], "channel": "FBA"}}
+    live = sv.claimable(rows, {"A"}, cfg)
+    assert [r["sku"] for r in live] == ["S1"]
+    owner, _ = bf._pick(live, {}, "brand_key", include_ties=False,
+                        metrics=sv.store_metrics(live, {}), cfg=cfg)
+    assert owner == {"acme": "A"}          # 错渠道牌不被占,留给做 FBM 的店
+
+
+def test_claim_filter_and_channel_disposal_list_are_exactly_complementary():
+    """占用闸丢的必须**恰好**是下架清单会列的那些行,一行不多一行不少。
+
+    两边各写一遍判定就会漂:多丢 = 货在架上卖着品牌却成了无主(别的店一回填
+    就抢走);少丢 = 该下架的品牌被永久锁死。所以两边都走 `offends_channel`。
+    """
+    cfg = {"A": {"channel": "FBA"}, "B": {}}    # B 没填配送限制 = 不对拍
+    rows = [
+        {"store": "A", "sku": "ok", "asin": "B0AAAA0001", "brand_key": "b1",
+         "channel": "FBA", "category": None, "published": True},
+        {"store": "A", "sku": "bad", "asin": "B0AAAA0002", "brand_key": "b2",
+         "channel": "FBM", "category": None, "published": True},
+        # ⚠ 采集没采到 / 采出第三种值,**都不算不符**(白名单口径):
+        #   把"没采到"算成"货不对"会让无辜商品进下架清单
+        {"store": "A", "sku": "none", "asin": "B0AAAA0003", "brand_key": "b3",
+         "channel": None, "category": None, "published": True},
+        {"store": "A", "sku": "weird", "asin": "B0AAAA0004", "brand_key": "b4",
+         "channel": "N/A", "category": None, "published": True},
+        {"store": "B", "sku": "unset", "asin": "B0AAAA0005", "brand_key": "b5",
+         "channel": "FBM", "category": None, "published": True},
+    ]
+    dropped = {r["sku"] for r in rows} - {r["sku"] for r in
+                                          sv.claimable(rows, {"A", "B"}, cfg)}
+    listed = {r["sku"] for r in sv.channel_offenders(rows, cfg)}
+    assert dropped == listed == {"bad"}
+
+
+def test_backfill_loads_channel_or_the_gate_is_silently_dead():
+    """回填必须**带渠道取数**,否则第五条筛法恒为假而且不报错。
+
+    `_fetch_meta(..., with_channel=False)` 时 rows 的 channel 全是 None,
+    `offends_channel` 一行都判不出来 —— 于是 alloc_audit 判一套、回填落另一套,
+    正是 alloc_survey 这个模块存在要防的事。
+    """
+    import inspect
+    from workflows import alloc_backfill as bf
+    src = inspect.getsource(bf.run)
+    assert "_fetch_meta(cur, asins, True)" in src, \
+        "回填取数不能省掉渠道:省掉后渠道闸恒为假,与 alloc_audit 口径分叉"
+
+
 def test_claim_filter_and_disposal_list_agree_on_unclassified():
     """两边口径必须**恰好**一致:归不到大类的行既不进下架清单,也照常占用。
 

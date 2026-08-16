@@ -83,7 +83,12 @@ def run(params: dict) -> str:
         sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
         asins = sorted({a for a in (sku_asin.extract_asin(it[1])
                                     for it in items) if a})
-        meta = sv._fetch_meta(cur, asins, False)   # 回填不需要渠道
+        # ⚠ **必须带渠道**(2026-08-16 改):渠道不符的行不产生占用,而这个
+        # 判定要 latest_snapshot 里的 is_fba。这里省掉的话,`sv.claimable` 的
+        # 渠道闸对回填恒为假(channel 全 None ⇒ 一行都不算不符),
+        # 于是 alloc_audit 判一套、回填落另一套 —— 正是 alloc_survey 要防的事。
+        # 代价是这段 LATERAL 慢一些;回填是一次性动作,值这个钱
+        meta = sv._fetch_meta(cur, asins, True)
 
     rows, st = sv.enrich(items, meta, pt2cat)
 
@@ -93,10 +98,10 @@ def run(params: dict) -> str:
     except Exception as e:                            # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
     try:
-        cfg = store_targets.load_targets()      # 类目准入是冲突判定的硬闸
+        cfg = store_targets.load_targets()      # 类目/渠道准入都是硬闸
     except Exception as e:                      # noqa: BLE001
-        return f"⛔ 限额表读不到({e}):类目准入判不了,拒绝回填"
-    # 入行口径走 sv.claimable(在册 ∧ 已发布 ∧ 规划内),与 alloc_audit 同一处
+        return f"⛔ 限额表读不到({e}):类目/渠道准入判不了,拒绝回填"
+    # 入行口径走 sv.claimable(在册 ∧ 已发布 ∧ 规划内 ∧ 类目 ∧ 渠道),与 alloc_audit 同一处
     # ——两边各写各的筛法,报告说"留 A085"、回填落到别家,清单就是假的。
     # ⚠ **不按店铺状态筛**:SUSPENDED 的店照常回填占用(「暂停不释放、
     # 占用保持」,§六.2)。停用只是暂时不给它分新货,不代表它手上的品牌与
@@ -104,7 +109,8 @@ def run(params: dict) -> str:
     live = sv.claimable(rows, registered, cfg)
     dropped = len(rows) - len(live)
     # "排除 N" 不写明分类等于让人猜(所有者 2026-08-15 就是看到这个数才问
-    # "是不是把历史上架过的也算进去了")。三类各自计数,每类都可自行核对
+    # "是不是把历史上架过的也算进去了")。五类各自计数,每类都可自行核对;
+    # 五项之和必须 == dropped,不然有一类被静默吞掉了
     why = Counter()
     for r in rows:
         if r["store"] not in registered:
@@ -113,9 +119,10 @@ def run(params: dict) -> str:
             why["规划范围外(谭总系)"] += 1
         elif not r["published"]:
             why["未发布(不占货位)"] += 1
-        elif r.get("category") and not store_targets.allowed(
-                cfg.get(r["store"]), r["category"]):
+        elif sv.offends_category(r, cfg):
             why["类目不符(在下架清单上)"] += 1
+        elif sv.offends_channel(r, cfg):
+            why["渠道不符(在下架清单上)"] += 1
 
     metrics = sv.store_metrics(live, sales)
     brand_owner, brand_ties = _pick(live, sales, "brand_key", include_ties,
@@ -137,7 +144,7 @@ def run(params: dict) -> str:
 
     per_store = Counter(r["store"] for r in to_claim)
     head = (f"在线行 {st['online']}(已排 RETIRED 退市行),"
-            f"入选(在册∧已发布∧规划内∧类目准入){len(live)}、排除 {dropped}"
+            f"入选(在册∧已发布∧规划内∧类目准入∧渠道准入){len(live)}、排除 {dropped}"
             + (";其中 " + "、".join(f"{k} {v}" for k, v in why.most_common())
                if why else "")
             + f"\n   将占品牌 {len(brand_owner)}、产品 {len(prod_owner)}"

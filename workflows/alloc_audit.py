@@ -168,9 +168,12 @@ def run(params: dict) -> str:
     # 两个集合,别混:
     #   slot_rows —— **占着货位的行**(在册∧已发布∧规划内)。处置清单出自这里:
     #                类目/渠道不符的货此刻确实在架上卖着,必须列出来让人下架;
-    #   claim_rows —— **该产生占用的行** = slot_rows 再去掉类目不符的。
+    #   claim_rows —— **该产生占用的行** = slot_rows 再去掉类目/渠道不符的。
     #                它们已经在下架清单上了,不该再被占走(占用无自动释放,
-    #                占了就永远锁在这家不该做这个大类的店上)。
+    #                占了就永远锁在这家不该做这个大类、或不做这个渠道的店上)。
+    # ⚠ `-p channel=0` 时 rows 里的 channel 全是 None,渠道闸对 claim_rows
+    #    恒为假 —— 于是这一轮的 claim_rows 比 alloc_backfill 的**宽**,冲突
+    #    判定可能给出不同的保留店。下面「要你做的事」那节会显式警告不得据此回填
     slot_rows = sv.claimable(rows, reg)
     claim_rows = sv.claimable(rows, reg, cfg)
     metrics = sv.store_metrics(claim_rows, sales)
@@ -240,6 +243,13 @@ def run(params: dict) -> str:
                      + (f";另有 {len(empty_stores)} 家空店没登记,"
                         f"要它们参与分配才用填" if empty_stores else "")))
     L += ["", "▍要你做的事"] + textfmt.grid(todo)
+    # 渠道闸是 claimable 的第五条筛法,没取渠道时它对本轮恒为假 ⇒ 这一轮算出的
+    # 保留店比 alloc_backfill 会落的**宽**。不点破的话,人照着这份清单去 --execute,
+    # 落库结果与清单不一致,而占用没有自动释放
+    if cfg and not with_channel:
+        L.append("  ⚠ 本轮 `-p channel=0` 没取渠道,冲突判定与占用口径里的"
+                 "**渠道闸是关着的** —— 与 `alloc_backfill` 不一致。"
+                 "**不要照这一份去回填**,去掉该参数重跑一次再落库")
 
     # ── ▍数据体检 ──
     body = [("候选池", f"产品 {n(pool['total'])} → 审核通过 "

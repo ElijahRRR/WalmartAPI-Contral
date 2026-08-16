@@ -180,3 +180,32 @@ def test_textfmt_pad_never_truncates():
     assert textfmt.pad("A085朱丽霖", 4) == "A085朱丽霖"
     assert textfmt.pad("ab", 5) == "ab   "
     assert textfmt.pad("ab", 5, ">") == "   ab"
+
+
+def test_online_now_matches_the_kpi_definition_not_the_occupancy_one():
+    """同一张表里两个「在线数」必须同口径,否则人对不上账还找不出原因。
+
+    「在线均值」取自 KPI 历史行(daily_report._pg_item_counts 写的:
+    published_status='PUBLISHED' AND missing_since IS NULL,**不筛 lifecycle**),
+    「当前在线」取自 alloc_stores._SQL_ONLINE_NOW —— 两者必须逐字一致,
+    否则货位值(÷在线均值)与剩余容量(−当前在线)建在两个不同的"在线"上。
+
+    ⚠ 它与 alloc_survey._SQL_ONLINE **有意不同**:那条管占用与冲突,
+    退市商品不占货位所以筛 lifecycle;这条管容量与产出,跟的是所有者
+    日报里每天看的那个数。两个口径各有其用,别去"统一"。
+    """
+    from services import alloc_survey as sv
+    from workflows import alloc_stores as st
+    q = st._SQL_ONLINE_NOW
+    assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
+    assert "lifecycle_status" not in q          # 跟 KPI 对齐:不筛 lifecycle
+    # 占用侧那条正相反 —— 它必须筛
+    assert "lifecycle_status" in sv._SQL_ONLINE
+
+
+def test_slot_value_is_verifiable_from_the_same_row():
+    """货位值 = 日均净额 ÷ 在线均值 —— 两个输入都在同一行上,读的人能自己验。"""
+    m = sp.derive({"A": _raw(active_days=30, avg_online=200, gross=6000.0)}, 90)
+    assert m["A"]["daily_net"] == 200.0                       # 6000/30
+    assert m["A"]["slot_value"] == 1.0                        # 200/200
+    assert m["A"]["avg_online"] == 200                        # 分母照样报出来

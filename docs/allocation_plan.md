@@ -89,6 +89,7 @@
 | 硬闸·风控 PT | ✅ | `risk_gate.check(gate, pt, None)` |
 | 硬闸·容量 | ⚠ | `walmart_items` 在线数(与 KPI 表口径差一个 `published_status='PUBLISHED'`,`alloc_audit` A0 拆两个数);死店冻结行会污染,见 §九.4 |
 | 店铺配额·GMV | ✅ | `orders.order_lines` 聚合(命中 `(store, order_date DESC)` 索引)。**两年历史已入库**(order_history_import #35,15 万行 2024-03~2026-07,494 家店,`source='历史数据'`);时区统一 UTC 零点,无日界分叉。⚠ **分母是「在售天数」不是日历天数**(§7.4,08-15 晚更正):店铺暂停过的那段没有销售额,除以日历天数会把"停过业"读成"卖得差",缺口被高估 ⇒ 停过业的店反而被灌最多货。⚠ 另见下方"历史行的三条语义" |
+| **两个「在线数」口径,别混**(2026-08-15 晚) | ⚠ | ①**占用/冲突侧**(`alloc_survey._SQL_ONLINE`)= `missing_since IS NULL` **AND 非 RETIRED** —— 退市商品不占货位(口径 #14);②**容量/产出侧**(`alloc_stores._SQL_ONLINE_NOW`、KPI 表 `items_online`)= `published_status='PUBLISHED' AND missing_since IS NULL`,**不筛 lifecycle** —— 跟的是所有者日报里每天看的那个数,且 KPI 历史行已按此存了两年,改不了。**两个各有其用,不许去"统一"**;同一张报表内必须只用其中一个,否则货位值(÷在线均值)与剩余容量(−当前在线)会建在两个不同的"在线"上 |
 | **店铺在售天数 / 在线数** | ✅ | `ops.store_kpi_daily` **逐店逐日一行**(PK `(store, data_date)`),带 `store_status` / `items_online` / `orders_count` / `sales_amount`。在售天数 = 窗口内**有记录且** `coalesce(upper(store_status),'ACTIVE')='ACTIVE'` 的天数;⚠ **没记录的天既不算 active 也不算停用**(那是"没抓到"),所以必须同时算覆盖率 `rec/N` 并在方案表报出来,低覆盖店的比值指标全靠收缩顶上去,不代表真实水平 |
 | 店铺配额·健康度 | ❌ | KPI 8 率有列但**阈值零实现**,且 NULL 两义(无合规数据 vs 拉取失败)不可区分 ⇒ **v1 降为二值(ACTIVE=1)**,8 率只进方案表展示列,`need_i` 改二项归一 |
 | 店×类目销量 | ⚠ | `order_lines(store,sku) ⋈ walmart_items(store,sku)` → PT → 大类;**sku 大小写敏感**;必须显式过滤在册店(死店冻结行查得出来) |

@@ -35,13 +35,20 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.alloc_stores")
 
-# 当前在线数(容量闸的分子):与 alloc_audit 同一口径 —— 已发布、非退市
+# 当前在线数(容量闸的分子)。
+# ⚠ 口径**必须与 KPI 表的 items_online 逐字一致**(daily_report._pg_item_counts:
+#    published_status='PUBLISHED' AND missing_since IS NULL,**不筛 lifecycle**)。
+#    理由:同一张表里「在线均值」取自 KPI 历史行、「当前在线」取自这条 SQL,
+#    两者口径不同的话,货位值(日均净额 ÷ 在线均值)与剩余容量(上限 − 当前在线)
+#    就建在两个不同的"在线"上,人对不上账还找不出原因。
+#    KPI 历史行已经这么存了两年,改不了,所以让这条跟它对齐而不是反过来。
+# ⚠ 与 alloc_survey._SQL_ONLINE **不同**是有意的:那条管占用与冲突,退市商品
+#    不该占货位所以筛掉 lifecycle;这条管容量与产出,跟的是所有者日报里
+#    每天看的那个数。两个口径各有其用,别去"统一"。
 _SQL_ONLINE_NOW = """
 SELECT store, count(*) AS n
 FROM catalog.walmart_items
-WHERE missing_since IS NULL
-  AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'
-  AND published_status = 'PUBLISHED'
+WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
 GROUP BY store
 """
 
@@ -86,6 +93,7 @@ def run(params: dict) -> str:
                 qq.get("participates")],
             "在售天数": m.get("active_days", 0),
             "KPI覆盖": m.get("cover", 0.0),
+            "在线均值": m.get("avg_online"),
             "日均净销售额": m.get("daily_net"),
             "日目标": (cfg.get(s) or {}).get("gmv"),
             "缺口": qq.get("gap"),
@@ -124,15 +132,20 @@ def run(params: dict) -> str:
                  f"(历史行没有退款数据),**与 API 期的店不是同一口径**")
 
     L += ["", "▍缺口最大的 10 家(货优先给它们)"]
+    # 列的顺序是有意的:日均净额 ÷ 在线均值 = 货位值,(日目标−日均净额)÷日目标 = 缺口
+    # —— 两个派生值的输入都在同一行上,读的人能自己验一遍,不用回来问怎么算的
     L += textfmt.table(
-        ["店铺", "在售", "日均净额", "日目标", "缺口", "货位值", "剩余容量", ""],
-        [[r["店铺"], r["在售天数"], _fmt(r["日均净销售额"]),
+        ["店铺", "在售天数", "在线均值", "日均净额", "货位值",
+         "日目标", "缺口", "剩余容量", ""],
+        [[r["店铺"], r["在售天数"], _fmt(r["在线均值"], 0),
+          _fmt(r["日均净销售额"]), _fmt(r["单品日产出"], 3),
           _fmt(r["日目标"], 0),
           "—" if r["缺口"] is None else f"{r['缺口']:.0%}",
-          _fmt(r["单品日产出"], 3), _fmt(r["剩余容量"], 0),
+          _fmt(r["剩余容量"], 0),
           "" if r["取值依据"].startswith("自身") else f"⚠ {r['取值依据']}"]
          for r in part[:10]],
-        align="<>>>>>><")
+        align="<>>>>>>><")
+    L.append("  (货位值 = 日均净额 ÷ 在线均值;缺口 = (日目标 − 日均净额) ÷ 日目标)")
 
     if not export:
         L += ["", "(-p export=0:未落 csv)"]
@@ -149,6 +162,6 @@ def run(params: dict) -> str:
                              else v))
                         for k, v in r.items()})
     L += ["", f"▍明细 → {p}",
-          "  逐店 15 列(含取值依据、KPI 覆盖、历史期占比)——"
+          "  逐店 16 列(含取值依据、KPI 覆盖、历史期占比)——"
           "分配跑出奇怪结果时,先回来对这三列"]
     return "\n".join(L)

@@ -371,9 +371,14 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
                 listing_sheet.AUDIT_RESULT_CN.get(status, status),
                 (reason or "")[:500],
                 at.strftime("%Y-%m-%d") if at else ""]))
-        n = listing_sheet.write_audit_cols(updates, execute)
-        out = (f"上架表回填 {n} 行 C~G"
-               f"{'(dry-run 未写)' if not execute else ''}")
+        listing_sheet.write_audit_cols(updates, execute)
+        # ⚠ 回填的是**整张表里所有已有结论的行**,不是本轮判的那 limit 个 ——
+        # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
+        # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
+        # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
+        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行 C~G"
+               f"(整表已有结论的都投影,不只本轮判的那些)"
+               f"{'' if execute else ';dry-run 一格未写'}")
         if absent:
             out += (f";⚠ {absent} 行库里没有结论,**E 列留空**"
                     f"(下轮自动重领;先跑 product_ingest 把这些 ASIN 采进来)")

@@ -533,15 +533,53 @@ def _split_rows(rng: str, values: list[list]) -> list[tuple[str, list[list]]]:
     return out
 
 
-def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
-    """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:写入的范围数。
+def _coalesce(updates: list[tuple[str, list[list]]]
+              ) -> list[tuple[str, list[list]]]:
+    """输入:[(A1范围, 值矩阵)] → 输出:相邻同列的合成一段(**保持原序**)。
 
-    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补;
-    **先按行切开过大的范围**,再按 100 范围/批切块 values_batch_update,批间节流。
+    定点回写的调用方几乎都是"一行一个 range"(`C{r}:G{r}`),而整表重写走的是
+    "一段 4000 行"。同一个接口,两条路径差了三个数量级:
+      · 一行一 range → 100 行/请求 + 0.3s 节流 ⇒ 28000 行要 280 个请求、~2 分钟
+      · 合成段     → 4000 行/range、100 range/请求 ⇒ 同样 28000 行 1 个请求
+    这就是所有者 2026-08-16 问的「写飞书的速度怎么各处都不一样,有的 4000
+    有的几十甚至逐行」—— 差别不在接口,在调用方给的形状。**在这里补齐**:
+    调用方照旧一行一个 range,api 层负责把连号的粘起来(分批是 api 层职责)。
+
+    只合并**紧邻的下一行**且列区间完全相同的:不排序、不去重、不跨空行,
+    所以"同一行被写两次"的先后覆盖语义与逐行写时逐字一致。
+    """
+    out: list[tuple[str, list[list]]] = []
+    prev: tuple[str, int, int, str] | None = None   # (首列, 起行, 末行, 末列)
+    for rng, vals in updates:
+        m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.strip().upper())
+        if not m or len(vals) != int(m.group(4)) - int(m.group(2)) + 1:
+            out.append((rng, vals))       # 形状看不懂就原样放过,不猜
+            prev = None
+            continue
+        c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+        if prev and prev[0] == c1 and prev[3] == c2 and prev[2] + 1 == r1:
+            out[-1] = (f"{c1}{prev[1]}:{c2}{r2}", out[-1][1] + vals)
+            prev = (c1, prev[1], r2, c2)
+        else:
+            out.append((f"{c1}{r1}:{c2}{r2}", list(vals)))
+            prev = (c1, r1, r2, c2)
+    return out
+
+
+def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
+    """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:**写入的行数**。
+
+    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补。
+    三步:**连号的先粘成段**(否则一行一个请求位,几万行要跑几分钟)→
+    按行切开过大的段 → 按 100 范围/批 values_batch_update,批间节流。
+
+    ⚠ 返回的是行数不是范围数。粘段之前两者恰好相等(调用方全是一行一 range),
+    所有调用方也都当行数在用(「回填 N 行」);粘段之后必须显式数行,
+    否则那些摘要会一夜之间从「回填 200 行」变成「回填 1 行」。
     """
     s = sheet.require()
     split: list[tuple[str, list[list]]] = []
-    for rng, vals in updates:
+    for rng, vals in _coalesce(updates):
         split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
     n = 0
     for i in range(0, len(split), 100):
@@ -556,7 +594,7 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
             # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
             raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
                                       f"{sum(len(v) for _r, v in chunk)} 行)") from None
-        n += len(chunk)
+        n += sum(len(v) for _r, v in chunk)
         if i + 100 < len(split):
             time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     return n

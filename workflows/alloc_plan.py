@@ -210,8 +210,16 @@ def run(params: dict) -> str:
     # 默认**不设总量上限**:每家店能接多少由容量与缺口算出来(见 `_quota`)。
     # `-p batch=` 是想小步试跑时的安全阀,不是模型的一部分
     batch = int(params.get("batch", 0)) or None
+    # ★ **两个窗口,不是一个**(所有者定稿 2026-08-16):
+    #   days       店铺经营水平 —— 要"这家店**现在**什么水平",90 天;
+    #   sales_days 产品销量信号 —— 要"这个品到底卖没卖过",近一年。
+    # 合成一个的话:窗口取 90 天则产品侧覆盖率只有 1.0%(信号形同虚设),
+    # 取 365 天则店铺的缺口与货位值被一年前的经营状况稀释。
     days = int(params.get("days", 90))
-    win = sv.sales_window(str(params.get("as_of", "")), days)
+    sales_days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
+    as_of = str(params.get("as_of", ""))
+    win = sv.sales_window(as_of, days)                    # 店铺侧
+    pwin = sv.sales_window(as_of, sales_days)             # 产品侧
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
 
     try:
@@ -224,7 +232,7 @@ def run(params: dict) -> str:
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝分配"
 
     with db.pg_conn() as conn:
-        data = product_pool.load(conn, win)
+        data = product_pool.load(conn, pwin)
         perf_raw = store_perf.load(conn, win)
         with conn.cursor() as cur:
             cur.execute(_SQL_ONLINE_NOW)
@@ -331,8 +339,8 @@ def run(params: dict) -> str:
          f"  实发 {placed_items:,} 个货位(其中定向流 {dir_items:,} = 补齐已占品牌,"
          f"自由流 {placed_items - dir_items:,} = 拓新品牌)"
          + (f";⚠ `-p batch={batch:,}` 把配额等比缩过" if batch else ""),
-         f"  候选切口 {cut:,} 组(可分 ×{HEADROOM});"
-         f"销量窗口 {win['day']} 往前 {days} 天"]
+         f"  候选切口 {cut:,} 组(可分 ×{HEADROOM});窗口 {win['day']} 往前 ——"
+         f"店铺经营水平 {days} 天、产品销量信号 {sales_days} 天"]
     L += ["", "▍候选漏斗(前四行单位是**产品**,后两行是**组**——别拿组数除产品数)"]
     L += textfmt.table(
         ["", "产品", "占候选池", "组"],
@@ -509,9 +517,12 @@ def _prod_claims(grp: dict, store: str) -> list:
             for it in grp["items"]]
 
 
-_HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类",
-           "渠道", "ASIN", "产品分", "口碑分", "销量加分", "罚分",
-           "罚分原因", "近期销量", "评分", "评论数", "配送天数"]
+# ⚠ 与 `alloc_产品分.csv` 的同名列**必须是同一个数**(同一个 product_pool
+# 取数、同一个窗口常量)—— 两张表对不上账时,人第一个怀疑的就是分配算错了
+_HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类", "渠道",
+           "ASIN", "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
+           "售价", "运费", "落地价", "窗口销量(件)", "窗口销售额(毛额)",
+           "评分", "评论数", "配送天数"]
 
 
 def _write_plan(assign) -> tuple[str, int]:
@@ -560,5 +571,9 @@ def _rows(w, flow, store, layer, grp) -> int:
                     grp["size"], grp["category"], grp["channel"], it["asin"],
                     round(it["score"], 1), round(it["base"], 1),
                     round(it["bonus"], 1), round(it["penalty"], 1), it["why"],
-                    it["sales"], it["rating"], it["reviews"], it["lead"]])
+                    it.get("price"), it.get("shipping"),
+                    None if it.get("price") is None or it.get("shipping") is None
+                    else round(it["price"] + it["shipping"], 2),
+                    it["sales"], round(it.get("gross") or 0, 2),
+                    it["rating"], it["reviews"], it["lead"]])
     return len(grp["items"])

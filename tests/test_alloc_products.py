@@ -177,7 +177,9 @@ def test_csv_carries_price_sales_revenue_and_both_owner_columns(monkeypatch, tmp
     cols = head.split(",")
     val = dict(zip(cols, acme))
     assert val["售价"] == "9.9" and val["落地价"] == "9.9"
-    assert val["近90天销量(件)"] == "120" and val["近90天销售额(毛额)"] == "1080.0"
+    w = ps.SALES_WINDOW_DAYS      # 产品侧窗口默认近一年,不是 90 天
+    assert val[f"近{w}天销量(件)"] == "120"
+    assert val[f"近{w}天销售额(毛额)"] == "1080.0"
     assert val["历史总销量(件)"] == "900" and val["历史总销售额(毛额)"] == "8100.0"
     assert val["占用店"] == "A085" and val["在线店"] == "A085"
 

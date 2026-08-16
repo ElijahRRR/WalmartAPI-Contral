@@ -5,7 +5,11 @@
 **硬闸**(过不了就淘汰,与分数无关):落地价算不出、库存不足、黑名单、风控 PT。
 **产品分**三段:
 
-    score = 口碑基础分(0~75) + 销量加分(0~25) − 罚分(配送/退货/黑历史)
+    score = 口碑基础分(0~60) + 销量加分(0~40) − 罚分(配送/退货/黑历史)
+
+**销量加分 = 件数与销售额合成**(销售额权重更高:店铺目标是日 GMV,
+100 件 × $5 与 10 件 × $100 对补缺口的价值完全不同);窗口默认**近一年**
+(`SALES_WINDOW_DAYS`),与店铺经营水平那个 90 天窗口是两码事。
 
 四条纪律,每条都对应一个**生产实测踩到过**的错:
 
@@ -57,8 +61,17 @@ CUTOFF = 40.0
 WEIGHTS: dict[str, float] = {"rating": 0.6, "reviews": 0.4}
 LABELS = {"rating": "评分", "reviews": "评论数"}
 
-BASE_MAX = 75.0             #: 口碑满分 75,留 25 给销量加分 ⇒ 总分仍是 0~100
-SALES_BONUS_MAX = 25.0      #: 卖过且卖得动的加分上限
+#: 口碑满分,留 SALES_BONUS_MAX 给销量加分 ⇒ 总分仍是 0~100。
+#: ⚠ 2026-08-16 所有者:「销量和销售额的权重我感觉有点不够,应该上调一些」
+#: ⇒ 75/25 改成 60/40。**代价要知道**:销量覆盖率实测只有 1.0%,所以这一改
+#: 主要是把那 1% 往上顶,同时把 99% 没订单史的品的上限从 75 压到 60 ——
+#: 有销售证据的品会大面积挤进顶层。这正是所有者要的,但顶层的品类构成会变。
+BASE_MAX = 60.0
+SALES_BONUS_MAX = 40.0      #: 卖过且卖得动的加分上限(件数 + 销售额)
+#: 销量加分内部怎么分。**销售额权重更高**:店铺目标是日 GMV(§7.4a),
+#: 100 件 × $5 与 10 件 × $100 对"补缺口"的价值完全不同,只数件数会把
+#: 低单价走量品排到高客单品前面 —— 而缺口是按钱算的。
+SALES_SPLIT: dict[str, float] = {"units": 0.375, "gross": 0.625}
 LEAD_PENALTY_MAX = 15.0     #: 配送慢的罚分上限
 REFUND_PENALTY_MAX = 20.0   #: 退货高的罚分上限
 RISK_PENALTY_MAX = 15.0     #: 黑历史罚分上限(硬拦截归黑名单三表,这里只减分)
@@ -73,10 +86,17 @@ UNEXPLAINED_MISSING_MIN = 3
 #: 报告里按这个顺序印各段
 SEGMENTS = ("口碑", "销量加分", "配送罚分", "退货罚分", "黑历史罚分")
 
+#: 产品侧销量信号的默认窗口(天)。⚠ 与**店铺经营水平**的窗口是两码事:
+#: 那边要"这家店现在什么水平"(近 90 天),这边要"这个品到底卖没卖过" ——
+#: 窗口越短、覆盖率越低(90 天实测只有 1.0% 的品有订单史)。
+#: 所有者定稿 2026-08-16:「看销售额,默认统计近一年的」。
+SALES_WINDOW_DAYS = 365
+
 # ── 归一曲线(全部 v1 启发式,配置化)────────────────────────────────────
 _RATING_FLOOR, _RATING_CEIL = 3.0, 4.8     # 3.0 以下记 0,4.8 以上记满
 _REVIEWS_FULL = 1000                        # 评论数对数标度的满分点
 _SALES_FULL = 50                            # 窗口内销量(件)对数标度满分点
+_GROSS_FULL = 2000                          # 窗口内销售额(毛额)对数标度满分点
 #: ≤ 这个天数不扣分。**直接引用 amz_source 的唯一出处,不许在这里写字面量**
 #: —— 它是所有者 2026-08-09 从 12 改成 8 的值,list_new 与 maintenance 都跟着它;
 #: 这里抄一份 8 的话,哪天所有者再改,上架链跟着变而打分不变,而且不会报错。
@@ -127,15 +147,27 @@ def norm_reviews(v) -> float | None:
     return _log_scale(n, _REVIEWS_FULL) if n >= 0 else None
 
 
-def norm_sales(units) -> float | None:
-    """输入:窗口内销量(件)→ 输出:0~1;**没有订单史返回 None(不计入)**。
+def norm_sales(units, gross=None) -> float | None:
+    """输入:窗口内销量(件)+ 销售额(毛额)→ 输出:0~1;**都没有返回 None**。
 
     纪律 2:没卖过只是没信息,不是缺点。一个从没上过架的品与一个上了架
     卖不动的品在 order_lines 里长得一样 —— 分不出来就都当"没信息"。
+
+    ★ 两个信号按 `SALES_SPLIT` 合成,**销售额权重更高**(所有者 2026-08-16):
+    店铺目标是日 GMV,100 件 × $5 与 10 件 × $100 对补缺口的价值完全不同。
+    ⚠ 只有一项有值时,**权重摊回另一项**(与口碑缺项的处理相反,是有意的):
+    口碑那边"没有评分"是真实观测(有快照就一定有这一栏),而这里"有件数
+    没金额"只可能是历史行的金额列缺失 —— 那是数据缺口,不是"卖了 0 元"。
     """
-    if units is None:
+    parts = {"units": (_log_scale(units, _SALES_FULL) if units is not None
+                       else None),
+             "gross": (_log_scale(gross, _GROSS_FULL) if gross is not None
+                       else None)}
+    live = {k: v for k, v in parts.items() if v is not None}
+    if not live:
         return None
-    return _log_scale(units, _SALES_FULL)
+    w = sum(SALES_SPLIT[k] for k in live)
+    return sum(SALES_SPLIT[k] * v for k, v in live.items()) / w
 
 
 def lead_penalty(days) -> tuple[float, str]:
@@ -206,7 +238,7 @@ def score(signals: dict, risk: dict | None = None) -> dict:
 
     **三段,每段语义单一**(2026-08-15 生产实测后重构,见文件头那段):
 
-        score = 口碑基础分(0~75) + 销量加分(0~25) − 罚分(配送/退货/黑历史)
+        score = 口碑基础分(0~60) + 销量加分(0~40) − 罚分(配送/退货/黑历史)
 
     · **口碑**:评分 + 评论数加权;**缺的那项按 0 分算**(所有者定稿 08-15 晚)
       —— 见下面那段:走到打分这步的品一定有快照,"没有评分"是真实观测;
@@ -220,7 +252,7 @@ def score(signals: dict, risk: dict | None = None) -> dict:
     norms = {"rating": norm_rating(signals.get("rating")),
              "reviews": norm_reviews(signals.get("reviews"))}
     missing = sorted(k for k, v in norms.items() if v is None)
-    sales_n = norm_sales(signals.get("sales"))
+    sales_n = norm_sales(signals.get("sales"), signals.get("gross"))
     if sales_n is None:
         missing.append("sales")
 

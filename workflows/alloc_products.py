@@ -67,7 +67,10 @@ def _pct(n, d):
 
 def run(params: dict) -> str:
     """输入:params(days/as_of/export)→ 输出:产品分体检报告。"""
-    days = int(params.get("days", 90))
+    # 产品侧销量窗口默认**近一年**(所有者定稿 2026-08-16)。
+    # ⚠ 与 alloc_stores 的 90 天窗口是两码事:那边要"这家店现在什么水平",
+    # 这边要"这个品到底卖没卖过" —— 窗口越短覆盖率越低(90 天只有 1.0%)
+    days = int(params.get("days", ps.SALES_WINDOW_DAYS))
     win = sv.sales_window(str(params.get("as_of", "")), days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
 

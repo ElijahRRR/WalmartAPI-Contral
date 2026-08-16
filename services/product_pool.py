@@ -164,8 +164,11 @@ def score_all(data: dict) -> tuple[list, dict]:
             gated[k] = gated.get(k, 0) + 1
             continue
         sold, ret = data["refund"].get(asin, (0, 0))
-        r = ps.score({"sales": data["sales"].get(asin), "rating": rating,
-                      "reviews": reviews, "lead": lead,
+        r = ps.score({"sales": data["sales"].get(asin),
+                      # ⚠ 销售额必须一起传:`norm_sales` 的权重大头在它身上,
+                      # 漏了这个键会静默退化成"只按件数打分"(不会报错)
+                      "gross": data.get("gross", {}).get(asin),
+                      "rating": rating, "reviews": reviews, "lead": lead,
                       "refund": (ret / sold if sold else None)},
                      data["risk"].get(asin))
         ch = (ful or "").strip().upper() or None

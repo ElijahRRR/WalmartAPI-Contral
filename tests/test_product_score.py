@@ -6,6 +6,8 @@
   · 卖过 3 件的品比没订单史的低 17.6 分(违反「销量只加分不减分」)。
 """
 
+import pytest
+
 from services import product_score as ps
 
 
@@ -243,3 +245,52 @@ def test_lead_penalty_curve_between_the_two_thresholds():
     assert ps.lead_penalty(ps._LEAD_DEAD * 2)[0] == ps.LEAD_PENALTY_MAX   # 封顶
     mid = (ps._LEAD_FREE + ps._LEAD_DEAD) / 2
     assert abs(ps.lead_penalty(mid)[0] - ps.LEAD_PENALTY_MAX / 2) < 1e-9
+
+
+# ── 销量权重上调 + 销售额进分(所有者 2026-08-16)──────────────────────
+
+def test_sales_bonus_combines_units_and_revenue_with_revenue_weighted_higher():
+    """所有者:「销量和销售额的权重我感觉有点不够,应该上调一些」。
+
+    销售额权重更高是因为**店铺目标是日 GMV**(§7.4a):100 件 × $5 与
+    10 件 × $100 对补缺口的价值完全不同,只数件数会把低单价走量品排到
+    高客单品前面 —— 而缺口是按钱算的。
+    """
+    assert ps.BASE_MAX + ps.SALES_BONUS_MAX == 100.0
+    assert ps.SALES_BONUS_MAX > 25.0                   # 上调过
+    assert ps.SALES_SPLIT["gross"] > ps.SALES_SPLIT["units"]
+    # 同样件数、销售额高的分更高
+    lo = ps.score({"sales": 10, "gross": 100.0, "rating": "4.5", "reviews": "50"})
+    hi = ps.score({"sales": 10, "gross": 2000.0, "rating": "4.5", "reviews": "50"})
+    assert hi["bonus"] > lo["bonus"]
+
+
+def test_sales_signal_missing_entirely_still_adds_nothing_and_subtracts_nothing():
+    """口径 #8 不变:没订单史 = +0,**永远不会因此比别人低**。"""
+    none = ps.score({"rating": "4.5", "reviews": "50"})
+    some = ps.score({"sales": 3, "gross": 30.0, "rating": "4.5", "reviews": "50"})
+    assert none["bonus"] == 0.0
+    assert some["score"] >= none["score"]
+
+
+def test_one_sales_signal_missing_falls_back_to_the_other():
+    """⚠ 有件数没金额只可能是**历史行的金额列缺失**,是数据缺口不是"卖了 0 元"。
+
+    与口碑缺项按 0 算相反 —— 那边有快照就一定有那一栏,这边不是。
+    """
+    both = ps.norm_sales(10, 200.0)
+    only_units = ps.norm_sales(10, None)
+    only_gross = ps.norm_sales(None, 200.0)
+    assert 0 < only_units <= 1 and 0 < only_gross <= 1
+    assert ps.norm_sales(None, None) is None
+    # 权重摊回:只有件数时就是件数那一项的归一值本身
+    assert only_units == pytest.approx(ps._log_scale(10, ps._SALES_FULL))
+
+
+def test_product_sales_window_defaults_to_a_year():
+    """产品侧窗口 ≠ 店铺侧窗口。
+
+    合成一个的话:90 天则产品侧覆盖率只有 1.0%(信号形同虚设);365 天则
+    店铺的缺口与货位值被一年前的经营状况稀释。
+    """
+    assert ps.SALES_WINDOW_DAYS == 365

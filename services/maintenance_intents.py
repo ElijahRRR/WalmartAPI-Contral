@@ -356,7 +356,7 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
       · **stock_count 为 NULL(没采到)→ 也写 0**。采不到就不卖,是运营口径;
         库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在决策这一层
         把"不知道"当成"别卖"。
-      · 配送 > MAX_LEAD_DAYS(8 天,所有者 2026-08-09 从 12 改)→ 写 0
+      · 配送 > MAX_LEAD_DAYS(7 天;所有者两次收紧 12 →08-09→ 8 →08-15→ 7)→ 写 0
     ⚠ 血量提醒:采集服务中断一整轮会让大批行的 stock_count 变 NULL,
     按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
     真跑前务必看 dry-run 的清零条数。

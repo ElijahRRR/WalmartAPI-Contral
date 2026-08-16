@@ -1,4 +1,4 @@
-# 调度计划 v4(2026-08-16,三轮批复后;**输入齐了,四件代码活已做三件**)
+# 调度计划 v5(2026-08-16;四件代码活做完,plist 生成器已落地)
 
 > v1 是我按旧系统形态推的;所有者 2026-08-16 给了七条批复,**结构按他的四条业务线
 > 重排**,并答掉了六个开放问题中的五个。本文是 v2。
@@ -348,19 +348,21 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 
 (v1 的"睡眠补跑"坑作废 —— 批复 2:不关机。)
 
-## 九、时间表(v4 汇总)
+## 九、时间表 —— **唯一出处是代码**
 
-| 时间 | 命令 | 线 |
-|---|---|---|
-| 02:00 | `backup` | 基础 |
-| 02:30 | `risk_sync blacklist_push` | 线 4 |
-| 06:40 | `daily_report` | 线 3 |
-| 07:30 | `perf_problems` | 线 2 |
-| 09:00 | `catalog_sync product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1` | 线 1 |
-| 15:00 | `product_clear` | 定稿 |
-| 每小时 :20 | `order_sync order_audit returns_sync` | 线 2 |
-| 每 30 分 | `feed_poll` | 基础 |
-| 双周三 08:00 | `settlement_sync` | 线 2 |
+`registry/schedule.py` 的 `JOBS`。文档里不再抄一份 —— 这张表已经被批复推翻过
+两次(产品线由四条散点改成一条链、`returns_sync` 从每日改每小时、
+`sku_locked_heal` 移出调度),两处各写一份必然漂。
+
+要看现在排的是什么:
+
+```
+cd /Users/nextderboy/Projects/WalmartAPI-Contral
+.venv/bin/python3 cli.py launchd_install --dry-run
+```
+
+它会把每条链的时间、命令、注意事项、以及按批的 `launchctl load` 命令
+一次打全。
 
 ## 十、上线顺序(分三批,每批观察一天)
 

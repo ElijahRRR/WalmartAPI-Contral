@@ -524,12 +524,16 @@ def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
     assert [x["asin"] for x in r["directed"][0]["items"]] == ["B0AAAA0001"]
 
 
-def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
-    """★ 排序按**组分**(组内最高产品分),组里分低的产品跟着一起上架。
+def test_low_scorers_no_longer_ride_along_and_the_trim_is_reported(
+        monkeypatch, tmp_path):
+    """★ 所有者 2026-08-16:「产品分 38.6 和 91.4 是怎么混到一起去的」。
 
-    所有者 2026-08-16:「产品分 38.6 和 91.4 是怎么混到一起去的」。答案是
-    它们同属一个品牌组 —— 不是 bug(品牌排他要求整组去一家店),但那些货位
-    **挤掉的是排队里组分更高的组**,所以量要报出来让人判断值不值。
+    答案是它们同属一个品牌组,而牌按组分排队 —— 于是低分品沾高分同门的光
+    插了队,挤掉的是排队里**组分更高的整组**。定的处置是搭车地板 50:
+    组里有 ≥50 分的品时,低于 50 的同门不跟车(`alloc_groups.RIDE_FLOOR`)。
+
+    这里连着两件事一起钉:货位真的没被占掉,**而且剪了多少要报出来** ——
+    静默剪掉等于所有者在方案表上找不到自己的品又没处问。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     # 一个品牌:一个 95 分带三个 36 分的;另有一批 50 分的单品组排在后面
@@ -538,9 +542,30 @@ def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
             + [_c(f"B0MID{i:05d}", f"mid{i}", 50.0 - i * 0.01) for i in range(60)])
     _wire_directed(monkeypatch, pool, {}, room=10)
     out = wf.run({"execute": False})
+    assert "搭车品" in out and "3" in [x for x in out.splitlines()
+                                        if "组队时剔除" in x][0]
+    assert "搭车上架" not in out              # 剪干净了就不该再报余量
+    text = open(tmp_path / "alloc_分配方案.csv", encoding="utf-8-sig").read()
+    assert "B0HIGH0001" in text and "B0LOW00000" not in text
+
+
+def test_a_group_wholly_below_the_floor_still_reports_its_ride_alongs(
+        monkeypatch, tmp_path):
+    """⚠ 搭车地板挡不住「整组都低于地板」的组 —— 它们没车可搭,组队时不剪。
+
+    那种组被发出去时组里仍有低分件。**余量必须继续报**:归零了才敢说地板
+    生效,不报的话地板漏了一类也没人知道。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 整组顶格 44 分(低于地板 50),组里带三个 36 分的 —— 一件都不该剪
+    pool = ([_c("B0MEH00001", "acme", 44.0)]
+            + [_c(f"B0LOW{i:05d}", "acme", 36.0) for i in range(3)]
+            + [_c(f"B0MID{i:05d}", f"mid{i}", 43.0 - i * 0.01) for i in range(60)])
+    _wire_directed(monkeypatch, pool, {}, room=10)
+    out = wf.run({"execute": False})
     assert "搭车上架" in out
     line = [x for x in out.splitlines() if "搭车上架" in x][0]
-    assert "3 个货位" in line          # 三个 36 分的跟着 95 分的上来了
+    assert "3 个货位" in line and "没车可搭" in line
 
 
 def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(

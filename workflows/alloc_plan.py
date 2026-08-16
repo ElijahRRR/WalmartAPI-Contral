@@ -394,6 +394,22 @@ def run(params: dict) -> str:
              f"或不足自己配额 {ae.MIN_FREE_SHARE_OF_QUOTA:.0%} 的店不出比值(—):"
              f"量太小时比值是数学假象(全落在 L1 就恒等于 1÷base),不是信号。"
              f"总量独吞看「分到」与「本轮配额」两列")
+    # ⚠ 「顶层越界」只说了**有问题**,没说问题在哪。实测 2026-08-16:两家店
+    # 比值 0.00(自由流各 3,868 / 2,139 件,远超小样本门槛),而报告里查不出
+    # 它们的货究竟来自哪几层 —— 只能手工翻方案表的「层」列。越界的店直接把
+    # 自由流层分布摊开:**全堆在末尾几层 = 这家店过不了前面几层的闸**
+    # (类目/渠道/货期太窄,前面的牌它一张都要不了),不是运气。
+    bad = [s for s in stores
+           if acc.get(s, {}).get("top_ratio") is not None
+           and not 0.7 <= acc[s]["top_ratio"] <= 1.3]
+    if bad:
+        L.append("  越界店的自由流层分布(层号×件数,层号越小分越高;"
+                 "末位那层是发完所有层之后的兜底扫尾):")
+        for s in sorted(bad, key=lambda x: acc[x]["top_ratio"]):
+            hist = result["by_store"].get(s, {}).get("by_layer_free") or {}
+            L.append(f"    {s}(比值 {acc[s]['top_ratio']:.2f}):"
+                     + (" ".join(f"L{li}×{n:,}" for li, n
+                                 in sorted(hist.items())) or "无自由流"))
     over = [s for s in stores if result["by_store"].get(s, {}).get("items", 0)
             > stores[s]["quota"]]
     if over:

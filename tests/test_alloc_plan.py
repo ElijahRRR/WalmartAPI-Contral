@@ -511,6 +511,30 @@ def test_pool_excludes_listed_not_claimed():
     assert wf._listed_asins(_Conn(), {"A085", "谭总3"}) == {"B0AAAA0001"}
 
 
+def test_out_of_band_stores_get_their_layer_histogram_printed(monkeypatch, tmp_path):
+    """⚠ 「顶层越界」只说了有问题,没说问题在哪。
+
+    实测 2026-08-16:两家店比值 0.00、自由流各 3,868 / 2,139 件(远超小样本
+    门槛),报告里却查不出货来自哪几层 —— 只能手工翻方案表。层分布摊开之后,
+    "全堆在末尾几层"就直接指向"这家店过不了前面几层的闸"。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # A 收 FBA、B 收 FBM;高分的全是 FBA ⇒ B 只能从靠后的层拿货,比值必然越界
+    pool = ([_c(f"B0FBA{i:05d}", f"fa{i}", 95.0 - i * 0.1, ch="FBA")
+             for i in range(300)]
+            + [_c(f"B0FBM{i:05d}", f"fm{i}", 60.0 - i * 0.1, ch="FBM")
+               for i in range(300)])
+    _wire(monkeypatch, pool, claimed=[])
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": ["家居"], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0},
+        "B": {"categories": ["家居"], "channel": "FBM", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0}})
+    out = wf.run({"execute": False})
+    assert "越界店的自由流层分布" in out
+    assert [x for x in out.splitlines() if "×" in x and "L" in x]
+
+
 def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
     """组归 A、组里却有被 B 占着的 ASIN = 两条占用互相矛盾。
 

@@ -77,17 +77,20 @@ def _wire(monkeypatch, tmp_path, cur=None):
     return conn
 
 
-def test_hard_gates_and_all_signals_missing_are_counted_apart(monkeypatch, tmp_path):
-    """「信号全缺」**不是硬闸** —— 它是"我们对这个品一无所知",
-    归进"淘汰"会让人以为这个品有毛病,其实是我们的数据缺口。"""
+def test_only_hard_gates_keep_a_product_out_of_scoring(monkeypatch, tmp_path):
+    """「未进入打分」只剩硬闸:落地价算不出、库存不足。
+
+    没评分没评论的品**照常打分**(口碑段记 0),它们靠淘汰线被筛掉 ——
+    走到打分这步的品一定有快照,「没有评分」是真实观测不是数据缺口。
+    """
     _wire(monkeypatch, tmp_path)
     out = wf.run({})
     assert "未进入打分" in out
     assert "落地价算不出 1" in out          # price NULL
     assert "库存不足 1" in out              # stock=0,保守量不许救它
-    # Gamma(只有配送时效)与 Zeta(什么都没有)都进「信息不足」——
-    # 旧实现里 Gamma 会独占权重拿 **100 分**,那正是要防的
-    assert "没有评分/评论(信息不足,不判分) 2" in out
+    # 「未进入打分」现在只剩硬闸两类 —— 没评分没评论的品照常打分(记 0 分),
+    # 不再单列「信息不足」桶(所有者定稿 2026-08-15 晚)
+    assert "信息不足" not in out
 
 
 def test_low_coverage_signal_is_called_out(monkeypatch, tmp_path):

@@ -11,8 +11,8 @@ from services import product_score as ps
 
 # ══ 教训一:没有口碑信息的品不许拿高分 ═══════════════════════════════════
 
-def test_a_product_with_only_delivery_data_is_not_a_perfect_product():
-    """**没评分、没评论 ⇒ 不判分**,不是 100 分。
+def test_a_product_with_only_delivery_data_scores_zero_not_a_hundred():
+    """**没评分、没评论 ⇒ 口碑段记 0 分**,不是 100 分。
 
     旧实现把五个信号做加权平均 + 权重摊回,于是"只有配送时效有值"的品
     独占 100% 权重、`lead<=8` 又恒等于满分 ⇒ **直接 100 分**。
@@ -20,10 +20,28 @@ def test_a_product_with_only_delivery_data_is_not_a_perfect_product():
     P75/P90 全被它们顶上去(生产实测 2026-08-15)。
     """
     r = ps.score({"lead": 3})
-    assert r["score"] is None and r["why"] == "口碑信号全缺"
+    assert r["score"] == 0.0 and r["base"] == 0.0
+    assert r["missing"] == ["rating", "reviews", "sales"]   # 缺了什么照样如实报
     # 配送快也救不了:它现在只是罚分项,永远不加分
     assert ps.lead_penalty(3) == (0.0, "")
     assert ps.lead_penalty(None) == (0.0, "")
+
+
+def test_missing_reputation_is_a_real_observation_not_a_data_gap():
+    """**为什么这里记 0 不违反全仓的「缺失 ≠ 0」纪律** —— 前提要写死。
+
+    落地价硬闸用的 price/shipping 与评分**来自同一条快照**:没快照的品在
+    落地价那一关就被拦了 ⇒ 能走到打分这步的品一定有快照 ⇒ 快照里没有评分,
+    意思是**这个商品确实没有评价**,那是真实观测,不是我们没采到。
+    """
+    from services import amz_source
+    # 没快照 ⇒ price 为 None ⇒ 硬闸拦下,根本走不到 score()
+    assert ps.gate({"price": None, "shipping": None, "stock": 99},
+                   amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY)
+    # 有快照、有价、没评价 ⇒ 过闸,口碑记 0
+    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 99},
+                   amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY) is None
+    assert ps.score({})["base"] == 0.0
 
 
 def test_delivery_is_a_penalty_only_never_a_bonus():
@@ -68,22 +86,30 @@ def test_sales_bonus_is_bounded_and_sales_uses_log_scale():
 
 # ══ 缺失 ≠ 0(口径 #8)══════════════════════════════════════════════════
 
-def test_missing_review_count_does_not_drag_the_score_down():
-    """口碑两项缺一项时,权重摊回另一项 —— 给 0 分等于惩罚"我们没采全的品"。"""
+def test_missing_review_count_costs_exactly_its_own_weight():
+    """缺评论数 = 丢掉评论数那 40% 的分,**不多不少**,也不摊给评分。
+
+    "没评论"是真实观测(见上一条),所以按 0 分算;但它不该连累评分那一项。
+    """
     both = ps.score({"rating": 4.8, "reviews": 1000})
     only = ps.score({"rating": 4.8})
-    assert both["score"] == only["score"] == ps.BASE_MAX
-    assert only["parts"]["rating"][2] == 1.0     # 摊回后独占权重
-    assert "reviews" in only["missing"]
+    assert both["score"] == ps.BASE_MAX                      # 两项满分 = 75
+    assert only["score"] == ps.BASE_MAX * ps.WEIGHTS["rating"]   # 只剩评分那 60%
+    assert "reviews" in only["missing"]                      # 缺了什么照样如实报
 
 
-def test_zero_reviews_is_a_real_value_not_missing():
-    """0 条评论是真值(新品),记 0 分;"没采到"才不计入 —— 两者必须分开。"""
+def test_zero_reviews_and_absent_reviews_score_the_same_but_report_differently():
+    """两者**分数相同**(都记 0 分,所有者定稿:相关分数扣除即可),
+    但 `missing` 仍如实区分 —— 报告里要看得出哪些是真没评论、哪些是字段缺。
+
+    分数上不区分是业务判断(没评论就是没口碑);可追溯性上区分是纪律 ——
+    哪天覆盖率掉下去,得能从 missing 里看出是采集出了问题。
+    """
     real_zero = ps.score({"rating": 4.8, "reviews": 0})
-    not_taken = ps.score({"rating": 4.8})
-    assert "reviews" in real_zero["parts"]
-    assert "reviews" in not_taken["missing"]
-    assert real_zero["score"] < not_taken["score"]
+    absent = ps.score({"rating": 4.8})
+    assert real_zero["score"] == absent["score"]      # 分数一样
+    assert "reviews" not in real_zero["missing"]      # 但来源分得清
+    assert "reviews" in absent["missing"]
 
 
 def test_unparseable_rating_counts_as_not_taken():
@@ -92,13 +118,14 @@ def test_unparseable_rating_counts_as_not_taken():
         assert ps.norm_rating(bad) is None
 
 
-def test_no_signals_at_all_scores_none_not_zero():
-    """一无所知 ⇒ None,进「信息不足」桶让人看。
+def test_no_signals_at_all_scores_zero_and_falls_below_the_cutoff():
+    """什么都没有 ⇒ 0 分,被淘汰线扫掉 —— 不需要单独一个「信息不足」桶。
 
-    判 0 分会把它和"确实很差的品"混成一堆,再也分不出来。
+    所有者定稿 2026-08-15 晚:「没有评分和评论的,相关分数扣除即可」。
     """
     r = ps.score({})
-    assert r["score"] is None and r["base"] is None and r["parts"] == {}
+    assert r["score"] == 0.0 and r["base"] == 0.0
+    assert r["score"] < ps.CUTOFF
 
 
 # ══ 罚分:没数据一律不扣 ════════════════════════════════════════════════

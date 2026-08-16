@@ -9,10 +9,14 @@
 
 四条纪律,每条都对应一个**生产实测踩到过**的错:
 
-1. **没有口碑数据 ⇒ 不判分,不是高分**(2026-08-15 实测)。旧实现做五信号
-   加权平均 + 权重摊回,于是"只有配送时效有值"的品独占 100% 权重、
-   而 `lead<=8` 恒等满分 ⇒ **直接 100 分**;98.4% 的品配送都 ≤8 天,
-   等于给所有缺口碑数据的品白送满分。现在口碑两项全缺就进「信息不足」桶;
+1. **没有口碑数据 ⇒ 口碑段记 0 分**(所有者定稿 2026-08-15 晚)。
+   旧实现做五信号加权平均 + 权重摊回,于是"只有配送时效有值"的品独占
+   100% 权重、而 `lead<=8` 恒等满分 ⇒ **直接 100 分**;98.4% 的品配送都
+   ≤8 天,等于给所有缺口碑数据的品白送满分。
+   **为什么这里记 0 不违反「缺失 ≠ 0」**:落地价硬闸用的 price/shipping
+   与评分**来自同一条快照** ⇒ 能走到打分这步的品一定有快照 ⇒ 快照里没有
+   评分,意思是**这个商品确实没有评价**,那是真实观测不是数据缺口。
+   没人评过的品本来就该排在有 800 条好评的品后面;
 2. **销量只加分不减分**(口径 #8)。旧实现让销量参与加权(权重 .35),
    卖过 3 件的品反而比没订单史的低 17.6 分 —— 而销量覆盖率只有 **1.0%**,
    等于把**唯一有正面证据的那批品系统性压分**。现在它是纯加分项;
@@ -181,32 +185,33 @@ def score(signals: dict, risk: dict | None = None) -> dict:
 
         score = 口碑基础分(0~75) + 销量加分(0~25) − 罚分(配送/退货/黑历史)
 
-    · **口碑**:评分 + 评论数加权;缺的那项不计入、权重摊回另一项(纪律 1);
+    · **口碑**:评分 + 评论数加权;**缺的那项按 0 分算**(所有者定稿 08-15 晚)
+      —— 见下面那段:走到打分这步的品一定有快照,"没有评分"是真实观测;
     · **销量加分**:纯加分 —— 没订单史就是 +0,**永远不会因为"卖得少"而比
       "没数据"更低**(口径 #8「只加分不减分」)。旧的加权平均实现违反了这条:
       卖过 3 件的品比没数据的低 17.6 分,而销量覆盖率只有 1%,等于把我们
       **唯一有正面证据的那批品系统性压分**;
-    · **罚分**:只有坏消息才扣分,没数据一律不扣 —— 编数据两个方向都是错的,
-      不扣至少不冤枉人。
-
-    两项口碑全缺 ⇒ `score=None`(不是 0):那是"这个品我们一无所知",
-    该进「信息不足」桶让人看,判 0 分会把它和"确实很差的品"混成一堆。
+    · **罚分**:只有坏消息才扣分,没数据一律不扣 —— 那些是真数据缺口
+      (退货只有 API 期算得出),编一个数出来两个方向都是错的。
     """
     norms = {"rating": norm_rating(signals.get("rating")),
              "reviews": norm_reviews(signals.get("reviews"))}
-    present = {k: v for k, v in norms.items() if v is not None}
     missing = sorted(k for k, v in norms.items() if v is None)
     sales_n = norm_sales(signals.get("sales"))
     if sales_n is None:
         missing.append("sales")
-    if not present:
-        return {"score": None, "base": None, "bonus": 0.0, "penalty": 0.0,
-                "parts": {}, "missing": sorted(missing), "why": "口碑信号全缺"}
 
-    total_w = sum(WEIGHTS[k] for k in present)
-    parts = {k: (signals.get(k), v, WEIGHTS[k] / total_w)
-             for k, v in present.items()}
-    base = BASE_MAX * sum(v * WEIGHTS[k] for k, v in present.items()) / total_w
+    # **口碑缺项按 0 分算,不摊回、不排除**(所有者定稿 2026-08-15 晚)。
+    # 这跟全仓「缺失 ≠ 0」的纪律不冲突,因为这里的"缺"不是数据缺口:
+    # 落地价硬闸用的 price/shipping **也来自同一条快照** ⇒ 能走到打分这步的品
+    # 一定有快照 ⇒ 快照里没有评分,意思是**这个商品确实没有评价**,
+    # 那是一个真实观测,不是我们没采到。没人买过没人评过的品,本来就该排在
+    # 有 800 条好评的品后面。
+    # ⚠ 这条推理依赖「打分前必先过 gate()」。哪天有人绕过硬闸直接调 score(),
+    #   这个前提就断了 —— 所以 missing 照样如实返回,报告要印出来。
+    parts = {k: (signals.get(k), v if v is not None else 0.0, WEIGHTS[k])
+             for k, v in norms.items()}
+    base = BASE_MAX * sum(WEIGHTS[k] * (v or 0.0) for k, v in norms.items())
     bonus = SALES_BONUS_MAX * (sales_n or 0.0)
 
     pens, whys = [], []

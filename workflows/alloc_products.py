@@ -142,11 +142,6 @@ def run(params: dict) -> str:
         sig = {"sales": sales.get(asin), "rating": rating, "reviews": reviews,
                "lead": lead, "refund": (ret / sold if sold else None)}
         r = ps.score(sig, risk.get(asin))
-        if r["score"] is None:
-            # 没评分没评论 = 对这个品一无所知。**不是 0 分,也不是淘汰**,
-            # 单列一桶让人看:判 0 会把它和"确实很差的品"混成一堆
-            gated["没有评分/评论(信息不足,不判分)"] += 1
-            continue
         # ⚠ 覆盖率的分母是「有分可判」,所以计数必须在剔除之后 ——
         # 放在前面会把没进打分的品也算进分子,覆盖率能超过 100%
         for k in ("rating", "reviews", "sales"):
@@ -198,8 +193,9 @@ def run(params: dict) -> str:
           "⚠ 只有 API 期算得出,历史期一律不罚"
           if n_scored and have["refund"] / n_scored < 0.5 else ""]],
         align="<<>><")
-    L.append("  加分/罚分项**没数据就是 0**,不会把分数拉高也不会拉低;"
-             "只有口碑两项都缺才不判分")
+    L.append("  口碑缺项**按 0 分算**(走到打分这步的品一定有快照,"
+             "「没有评分」是真实观测不是采集缺口);"
+             "加分/罚分项没数据则 +0/−0,既不拉高也不拉低")
 
     if scores:
         scores.sort()

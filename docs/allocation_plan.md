@@ -823,13 +823,47 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | `claim_audit` | 否 | **台账对账**:已落的占用现在还站得住吗(店的类目/渠道/货期后来改过) | `alloc_该释放占用.csv` + 可直接粘的 `store_release` 命令 |
 | `store_release` | **是** | **撤**:整店 / 点名品牌 / 点名 ASIN / `-p from_csv=` 批量释放 | 改 `catalog.claims`;整店释放时一并标 `walmart_items` 下线 |
 
-**跑的顺序**(首次上线):
-`alloc_audit` → 按 csv 补飞书配置、清掉不符的在架货 → `alloc_stores` +
-`alloc_products` 两张体检看数对不对 → `alloc_backfill --execute`(只做一次)
-→ `claim_audit` 清掉回填时闸没拦住的 → `alloc_plan`(先 dry-run,人眼过方案表)
-→ `alloc_plan --execute`。
-**日常**:`alloc_plan` dry-run → 看 → `--execute`;每次改完飞书配置补跑
-`claim_audit`。
+### 例行一跑(复核 pass)
+
+四条只读/dry-run 的串成一条,`&&` 保证前一条挂了就不往下走:
+
+```bash
+python cli.py alloc_audit && \
+python cli.py alloc_stores && \
+python cli.py alloc_products && \
+python cli.py alloc_plan
+```
+
+跑完看四组数、审 `alloc_分配方案.csv`,确认无误再单独一条:
+
+```bash
+python cli.py alloc_plan --execute
+```
+
+⚠ **`--execute` 故意不放进串里**,这不是省事没做:落占用不可逆,而串起来
+跑意味着"最后一条的输入是前三条的输出、人却没看过"。安全铁律要求 dry-run
+之后**人眼确认**才允许 `--execute` —— 一条命令跑到落库,这道确认就没了。
+
+⚠ 每条 `cli.py` 各自拿锁、各自写 `ops.runs`、各自发飞书通知 —— 这是对的:
+中间挂了能从 `ops.runs` 看出断在哪条,而不是一条大记录说"失败了"。
+
+**钉窗口右端**(复现某天的结果,或跨零点跑怕窗口漂移)给每条加同一个
+`as_of`;`days`(店铺 90)与 `sales_days`(产品 365)有默认值,不用传:
+
+```bash
+D=2026-08-16; python cli.py alloc_audit -p as_of=$D && \
+python cli.py alloc_stores -p as_of=$D && \
+python cli.py alloc_products -p as_of=$D && \
+python cli.py alloc_plan -p as_of=$D
+```
+
+### 特殊时候才跑的三条
+
+- `alloc_backfill --execute` —— **只做一次**,新系统认存量用。跑完接
+  `claim_audit` 清掉回填时闸没拦住的;
+- `claim_audit` —— **每次改完飞书限额表都要补跑**(开类目 / 换渠道 /
+  调配送时长限制),已有占用不会自己失效;
+- `store_release` —— 占用落错了、或 `claim_audit` 报出该释放的,拿它撤。
 
 ## 12.3 九个 service
 

@@ -301,9 +301,13 @@ def _deal_tier(pool: list, here: dict, got: dict, assign: list,
     return left, hist
 
 
-# 自由流接货少于这个数的店不出比值:分母太小时比值噪声大过信号,
-# 硬报一个数只会让人去追一个不存在的问题
+# 出比值的两个门槛,**都要过**:绝对量 ≥ 20 件,且占该店配额 ≥ 10%。
+# ⚠ 只卡绝对量不够(2026-08-16 实测):A085 自由流 36 件、A162 24 件,都过了
+# 20 件这道线,但它们的量太小、恰好全落在 L1,于是"自己的顶层占比"= 1.0,
+# 比值双双等于 1÷base = **7.69**(两家一模一样,一眼就知道是假象)。
+# 比值要有意义,这家店得在**多个层**都拿到过货 —— 拿它自己配额的一成当界。
 MIN_FREE_FOR_RATIO = 20
+MIN_FREE_SHARE_OF_QUOTA = 0.10
 
 
 def acceptance(result: dict, top_layers: int = 1,
@@ -323,8 +327,10 @@ def acceptance(result: dict, top_layers: int = 1,
     这两种都不是"参数没调对",而是分母选错了。改成"自己的总量"之后,比值
     与配额、容量、定向流体量全部无关,**只量质量构成**,这才是那句话的意思。
 
-    ⚠ 自由流接货 < `MIN_FREE_FOR_RATIO` 的店**不出比值**(返回 None):分母太小
-    时比值噪声大过信号,硬报一个数只会让人去追一个不存在的问题。
+    ⚠ 自由流接货量不够的店**不出比值**(返回 None):分母太小时比值噪声大过
+    信号。两道门槛都要过 —— 绝对量 ≥ `MIN_FREE_FOR_RATIO`,且占该店配额
+    ≥ `MIN_FREE_SHARE_OF_QUOTA`。只卡绝对量会漏(见常量注释:36 件与 24 件
+    双双得出 7.69 这个假象)。
     `top_layers` 决定"好货"算到第几层(默认只算 L1)。
     """
     by = result["by_store"]
@@ -341,7 +347,8 @@ def acceptance(result: dict, top_layers: int = 1,
     out = {}
     for s, v in by.items():
         qs = v["quota"] / tot_q if tot_q else 0.0
-        enough = mine[s] >= MIN_FREE_FOR_RATIO
+        enough = (mine[s] >= MIN_FREE_FOR_RATIO
+                  and mine[s] >= v["quota"] * MIN_FREE_SHARE_OF_QUOTA)
         out[s] = {
             "quota_share": qs,
             "top_items": top[s],

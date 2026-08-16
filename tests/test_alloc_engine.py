@@ -336,3 +336,31 @@ def test_acceptance_ignores_store_bound_groups_by_default():
     assert rot["A"]["top_ratio"] is None and rot["A"]["own_items"] == 0
     # B 全靠自由流,质量构成就是全体本身 ⇒ 1.0
     assert rot["B"]["top_ratio"] == 1.0
+
+
+def test_a_store_with_a_tiny_free_slice_gets_no_ratio():
+    """⚠ 量太小的时候比值是**数学假象**,不是信号。
+
+    2026-08-16 实测:A085 自由流 36 件、A162 24 件,都过了 20 件那道线,
+    但量小到恰好全落在 L1 ⇒ "自己的顶层占比"= 1.0 ⇒ 比值双双等于 1÷base
+    = **7.69**(两家一模一样,一眼就知道假)。比值要有意义,这家店得在多个层
+    都拿到过货 —— 所以再加一道"占自己配额 ≥ 10%"。
+
+    直接构造 `by_store` 而不是跑一遍发牌:这条测的是**门槛**本身,
+    让发牌去凑一个刚好卡在门槛上的分布,测试会变得又脆又难读。
+    """
+    from collections import Counter
+    r = {"by_store": {
+        # 大店:自由流 500 件铺在 10 层里 —— 比值有意义
+        "BIG": {"quota": 500, "items": 500, "bound_items": 0,
+                "by_layer": Counter({i: 50 for i in range(1, 11)}),
+                "by_layer_free": Counter({i: 50 for i in range(1, 11)})},
+        # 小片:自由流 36 件、全在 L1(A085 的原样),绝对量过线但占配额仅 2.5%
+        "TINY": {"quota": 1460, "items": 1477, "bound_items": 1441,
+                 "by_layer": Counter({1: 1477}),
+                 "by_layer_free": Counter({1: 36})}}}
+    m = ae.acceptance(r)
+    assert m["TINY"]["own_items"] == 36 >= ae.MIN_FREE_FOR_RATIO   # 绝对量过线
+    assert 36 < 1460 * ae.MIN_FREE_SHARE_OF_QUOTA                 # 但占比不过
+    assert m["TINY"]["top_ratio"] is None, "量太小的比值是假象,不该给数"
+    assert m["BIG"]["top_ratio"] is not None

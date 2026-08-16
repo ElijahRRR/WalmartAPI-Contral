@@ -35,7 +35,8 @@ class _Cur:
         elif "product_risk" in sql:
             if self.risk_fails:
                 raise RuntimeError("relation catalog.product_risk does not exist")
-            self._r = [("B0BBBB0002", 3, True, 0)]
+            # (asin, delete_times, unexplained_missing, missing_times, audit_reject_times)
+            self._r = [("B0BBBB0002", 3, True, 4, 0)]
         else:
             self._r = []
 
@@ -129,7 +130,7 @@ def test_csv_exposes_which_signals_were_missing(monkeypatch, tmp_path):
     assert "缺失信号" in head and "罚分原因" in head
     assert "口碑分" in head and "销量加分" in head   # 三段各自可查
     beta = next(ln for ln in body if ln.startswith("B0BBBB0002"))
-    assert "不明原因消失过" in beta          # 罚分理由写进行里
+    assert "不明原因消失过4次" in beta        # 罚分理由带次数写进行里
     assert "配送12天" in beta                # 配送慢的罚分理由也写进去
 
 

@@ -90,8 +90,10 @@ FROM o LEFT JOIN r ON r.order_line_id = o.order_line_id
 GROUP BY o.asin
 """
 
+# ⚠ `missing_times` 必须一起查:`risk_penalty` 要用它判「消失够不够 3 次」,
+# 漏这一列等于该项永不扣分(0 >= 3 恒假),而且**不会报错**
 _SQL_RISK = """
-SELECT asin, delete_times, unexplained_missing, audit_reject_times
+SELECT asin, delete_times, unexplained_missing, missing_times, audit_reject_times
 FROM catalog.product_risk
 WHERE delete_times > 0 OR unexplained_missing OR audit_reject_times > 0
 """
@@ -117,8 +119,8 @@ def run(params: dict) -> str:
         try:
             cur.execute(_SQL_RISK)
             risk = {a: {"delete_times": d, "unexplained_missing": um,
-                        "audit_reject_times": ar}
-                    for a, d, um, ar in cur.fetchall()}
+                        "missing_times": mt, "audit_reject_times": ar}
+                    for a, d, um, mt, ar in cur.fetchall()}
         except Exception as e:                  # noqa: BLE001 视图缺了不该拖垮体检
             conn.rollback()
             risk, risk_err = {}, str(e).strip().splitlines()[0]

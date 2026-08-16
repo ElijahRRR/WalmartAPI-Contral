@@ -62,6 +62,13 @@ SALES_BONUS_MAX = 25.0      #: 卖过且卖得动的加分上限
 LEAD_PENALTY_MAX = 15.0     #: 配送慢的罚分上限
 REFUND_PENALTY_MAX = 20.0   #: 退货高的罚分上限
 RISK_PENALTY_MAX = 15.0     #: 黑历史罚分上限(硬拦截归黑名单三表,这里只减分)
+#: 「不明原因消失」要**连续发生这么多次**才扣分(所有者定稿 2026-08-15 晚)。
+#: 判据来自 `catalog.product_risk`:消失过且我们从没提交过删/停 = 疑似平台
+#: 强制下架。但 `mark_missing` 的判据是"本轮全量扫没扫到",**一次坏扫描
+#: (整店凭证失效、代理挂掉)能把一批好品冤枉成消失** —— offset 截断那种
+#: 已被 catalog_sync 的单查补漏兜住,这类兜不住。
+#: 消失 1~2 次更像扫描抖动;≥3 次基本是真被平台反复下架。
+UNEXPLAINED_MISSING_MIN = 3
 
 #: 报告里按这个顺序印各段
 SEGMENTS = ("口碑", "销量加分", "配送罚分", "退货罚分", "黑历史罚分")
@@ -169,16 +176,24 @@ def refund_penalty(rate) -> tuple[float, str]:
 
 
 def risk_penalty(risk: dict | None) -> tuple[float, str]:
-    """输入:product_risk 行 → 输出:(罚分, 原因)。硬拦截不在这里(归黑名单)。"""
+    """输入:product_risk 行 → 输出:(罚分, 原因)。硬拦截不在这里(归黑名单)。
+
+    ⚠ 「不明原因消失」要 `missing_times >= UNEXPLAINED_MISSING_MIN` 才算数 ——
+    见那个常量的注释:一两次更像扫描抖动,把它当平台下架会冤枉好品。
+    调用方**必须把 `missing_times` 一起查出来**,漏了这一列就等于永不扣分
+    (0 >= 3 恒假),而且不会报错。
+    """
     if not risk:
         return 0.0, ""
     why, pen = [], 0.0
     if risk.get("delete_times"):
         pen += 5.0 * min(2, int(risk["delete_times"]))
         why.append(f"删过{risk['delete_times']}次")
-    if risk.get("unexplained_missing"):
+    # ⚠ 只在**反复**消失时才扣:一两次更可能是扫描抖动,不是平台下架
+    n_missing = int(risk.get("missing_times") or 0)
+    if risk.get("unexplained_missing") and n_missing >= UNEXPLAINED_MISSING_MIN:
         pen += 8.0
-        why.append("不明原因消失过")
+        why.append(f"不明原因消失过{n_missing}次")
     if risk.get("audit_reject_times"):
         pen += 4.0
         why.append(f"审核拒过{risk['audit_reject_times']}次")

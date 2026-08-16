@@ -142,10 +142,37 @@ def test_refund_penalty_only_when_there_is_data():
 
 def test_risk_penalty_is_capped_and_explains_itself():
     pen, why = ps.risk_penalty({"delete_times": 5, "unexplained_missing": True,
-                                "audit_reject_times": 3})
+                                "missing_times": 4, "audit_reject_times": 3})
     assert pen == ps.RISK_PENALTY_MAX
-    assert "删过5次" in why and "不明原因消失过" in why
+    assert "删过5次" in why and "不明原因消失过4次" in why
     assert ps.risk_penalty(None) == (0.0, "") and ps.risk_penalty({}) == (0.0, "")
+
+
+def test_unexplained_missing_needs_three_strikes(monkeypatch):
+    """消失 1~2 次**不扣分**(所有者定稿 2026-08-15 晚)。
+
+    `mark_missing` 的判据是"本轮全量扫没扫到" —— 整店凭证失效或代理挂掉时,
+    一次坏扫描能把一批好品冤枉成"平台强制下架"。offset 截断那种已被
+    catalog_sync 的单查补漏兜住,这类兜不住,所以要求**反复发生**。
+    """
+    def _pen(n):
+        return ps.risk_penalty({"unexplained_missing": n > 0,
+                                "missing_times": n})[0]
+    assert _pen(1) == 0.0 and _pen(2) == 0.0        # 抖动,不扣
+    assert _pen(ps.UNEXPLAINED_MISSING_MIN) == 8.0  # 够次数才扣
+    assert _pen(9) == 8.0                           # 扣的额度不随次数涨
+
+
+def test_missing_times_must_be_selected_by_callers():
+    """调用方漏查 `missing_times` ⇒ 该项**永不扣分且不报错**(0 >= 3 恒假)。
+
+    所以查询里必须有这一列 —— 这种"少一列就静默失效"的依赖,
+    只能靠测试钉住。
+    """
+    from workflows import alloc_products as wf
+    assert "missing_times" in wf._SQL_RISK
+    # 只有 unexplained_missing 没有 missing_times 时,如实不扣(而不是猜)
+    assert ps.risk_penalty({"unexplained_missing": True}) == (0.0, "")
 
 
 def test_penalty_never_pushes_score_below_zero():

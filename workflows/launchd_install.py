@@ -1,4 +1,9 @@
-"""launchd_install — 生成全套 launchd plist(危险:装完就是真调度)。
+"""launchd_install — 生成高频链的 launchd plist(危险:装完就是真调度)。
+
+⚠ **只管 `runner="launchd"` 那几条**(所有者定稿 2026-08-16:feed 轮询 +
+订单链这种每半小时/每小时的东西写死在电脑上最稳)。其余每日/每周一次的
+归智能体定时任务,跑 `python cli.py skill_export` 生成那份技能包。
+**同一条链绝不许两边都挂** —— 撞上了后到的退 3 空跑一轮,而且报"成功"。
 
 用法:
   python cli.py launchd_install --dry-run     # 只打印将生成什么,不落盘 ← **先跑这个**
@@ -32,10 +37,13 @@ _AGENTS = Path.home() / "Library" / "LaunchAgents"
 
 
 def _jobs(batch: str):
+    # ⚠ 只渲染 runner="launchd" 那些。其余归智能体定时任务(skill_export)——
+    # 两边都挂同一条链 = 撞锁,后到的退 3 空跑一轮而且看起来一切正常
+    mine = schedule.jobs_for("launchd")
     if not batch:
-        return list(schedule.JOBS)
+        return mine
     want = {int(b) for b in str(batch).split(",") if b.strip()}
-    return [j for j in schedule.JOBS if j["batch"] in want]
+    return [j for j in mine if j["batch"] in want]
 
 
 def _load_cmds(jobs) -> list[str]:

@@ -20,7 +20,10 @@ def _rendered(job):
     return plistlib.loads(launchd.render(job, _LOGS))
 
 
-@pytest.mark.parametrize("job", schedule.JOBS, ids=lambda j: j["label"])
+_LAUNCHD = schedule.jobs_for("launchd")
+
+
+@pytest.mark.parametrize("job", _LAUNCHD, ids=lambda j: j["label"])
 def test_every_job_renders_a_valid_plist(job):
     d = _rendered(job)
     assert d["Label"].startswith("com.walmartapi.")
@@ -39,7 +42,7 @@ def test_every_job_renders_a_valid_plist(job):
 
 def test_interpreter_and_cli_are_absolute():
     """launchd 不做变量展开也不认 `~` —— 相对路径的表现是静默什么都不跑。"""
-    for job in schedule.JOBS:
+    for job in _LAUNCHD:
         py, cli, *_ = launchd.program_args(job)
         assert py.startswith("/") and py.endswith("python3")
         assert cli.startswith("/") and cli.endswith("cli.py")
@@ -52,7 +55,7 @@ def test_hourly_job_has_no_hour_key():
     再单挂一个整点的 plist 会撞车 —— 两个各拿各的锁,后到的整链退 3 空跑一轮。
     所以每小时的链只能有这一个 plist。
     """
-    job = next(j for j in schedule.JOBS if j["label"] == "order_chain")
+    job = next(j for j in _LAUNCHD if j["label"] == "order_chain")
     cal = _rendered(job)["StartCalendarInterval"]
     assert cal == {"Minute": 20}                # 没有 Hour = 每小时
     # 而且全表里不许再有第二条跑同一批工作流的
@@ -62,21 +65,9 @@ def test_hourly_job_has_no_hour_key():
 
 
 def test_half_hourly_job_renders_a_list():
-    job = next(j for j in schedule.JOBS if j["label"] == "feed_poll")
+    job = next(j for j in _LAUNCHD if j["label"] == "feed_poll")
     assert _rendered(job)["StartCalendarInterval"] == [{"Minute": 0},
                                                        {"Minute": 30}]
-
-
-def test_params_that_must_not_be_dropped_are_present():
-    """两个"漏了就每天空转而且报成功"的参数,写进调度表就别再掉。
-
-    · product_refresh:wait=1 —— 不等采集落定,product_ingest 摄的是上一轮数据;
-    · order_asin_normalize:apply=1 —— 那个工作流缺省是**预览**。
-    两者都不报错,只是那一段白跑,正是"缺省即真跑"这条定稿要消灭的东西。
-    """
-    args = {j["label"]: launchd.program_args(j) for j in schedule.JOBS}
-    assert "product_refresh:wait=1" in args["product_chain"]
-    assert "order_asin_normalize:apply=1" in args["order_daily"]
 
 
 def test_every_workflow_in_the_table_actually_exists():
@@ -92,7 +83,7 @@ def test_every_workflow_in_the_table_actually_exists():
 
 def test_dangerous_chains_carry_no_dry_run_flag():
     """⚠ plist 里**不许**出现 --dry-run:缺省即真跑,写了它就是每天空转报成功。"""
-    for job in schedule.JOBS:
+    for job in _LAUNCHD:
         assert "--dry-run" not in launchd.program_args(job)
 
 
@@ -105,17 +96,19 @@ def test_manual_only_workflows_are_not_scheduled():
         assert name not in scheduled, name
 
 
-def test_settlement_is_weekly_because_launchd_cannot_do_biweekly():
-    """账期双周发布,而 launchd 没有"双周"。
+def test_only_the_high_frequency_chains_live_on_this_machine():
+    """所有者定稿 2026-08-16:电脑上只留高频链,其余交给智能体定时任务。
 
-    每周三跑一次是安全的:已入库账期**永不重拉**(DISTINCT period + recon_done
-    台账),没有新账期那轮就是空转。用频率换掉一个 launchd 表达不了的周期。
+    ⚠ 同一条工作流**绝不许两个 runner 都挂**:撞上了后到的那次拿不到 flock
+    直接退 3 —— 那一轮什么都没做,而通知里写的是"⚠ 已有实例在运行",
+    看久了就当常态了。
     """
-    job = next(j for j in schedule.JOBS if j["label"] == "settlement")
-    assert _rendered(job)["StartCalendarInterval"] == {
-        "Minute": 0, "Hour": 8, "Weekday": 3}          # 3 = 周三
-    assert "永不重拉" in __import__("workflows.settlement_sync",
-                                    fromlist=["x"]).__doc__
+    assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain"}
+    mine = {w for j in _LAUNCHD for w in j["workflows"]}
+    theirs = {w for j in schedule.jobs_for("gpt") for w in j["workflows"]}
+    assert mine & theirs == set()
+    # runner 只有这两个值;打错一个字(比如 "GPT")在 job() 里就炸
+    assert {j["runner"] for j in schedule.JOBS} <= set(schedule.RUNNERS)
 
 
 def test_batches_match_the_greyscale_plan():

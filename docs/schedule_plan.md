@@ -14,7 +14,7 @@
 | 4 | `product_audit` / `brand_scrape` 不进调度 | ✅ 划入手动 |
 | 5 | 「等待会占锁吗?什么锁」 | 见第五节(会,`<DATA_ROOT>/locks/order_audit.lock`);结论:**保持默认 `wait=1`**,不写 `wait=0` |
 | 6 | 采集器 3000/分钟扛得住 | ✅ **改变了 v1 的结论**:全量重推约 50 分钟采完,产品线**能一次性做完**(见第一节) |
-| 7 | 没有 hermes,现在是 GPT 调度;每小时订单/审核是 cron;feed 轮询也照此 | ✅ 全部走 launchd/cron,一律不接 GPT。⚠ `legacy_schedules.md` A 表写的"hermes 平台"已过时,停旧取证时按 GPT 侧的实际注册表核对 |
+| 7 | 没有 hermes,现在是 GPT 调度;每小时订单/审核是 cron;feed 轮询也照此 | ~~✅ 全部走 launchd/cron,一律不接 GPT~~ **2026-08-16 所有者改口径**:高频链(`feed_poll` + 订单链)进 launchd,**其余七条用 skill 形式给智能体注册成定时任务**(见 §9.1)。⚠ `legacy_schedules.md` A 表写的"hermes 平台"已过时,停旧取证时按 GPT 侧的实际注册表核对 |
 | 8 | python 路径 `/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3` | ✅ 全部 plist 的解释器 |
 | 9 | `sku_locked_heal` **暂不挂调度** | ✅ 从时间表移除,划入手动 |
 | 10 | 飞书接收人 `17882211182`(手机号) | ✅ 已实现自动换 open_id;⚠ 要应用有 `contact:user.id:readonly` 权限,见第七节 C |
@@ -351,26 +351,51 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 ## 九、时间表 —— **唯一出处是代码**
 
 `registry/schedule.py` 的 `JOBS`。文档里不再抄一份 —— 这张表已经被批复推翻过
-两次(产品线由四条散点改成一条链、`returns_sync` 从每日改每小时、
-`sku_locked_heal` 移出调度),两处各写一份必然漂。
+三次(产品线由四条散点改成一条链、`returns_sync` 从每日改每小时、
+`sku_locked_heal` 移出调度,以及下面这条调度分工),两处各写一份必然漂。
 
-要看现在排的是什么:
+### 9.1 谁按秒表:`runner`(所有者定稿 2026-08-16,**推翻了批复 7**)
+
+批复 7 当时说"全部走 launchd/cron,一律不接 GPT";2026-08-16 改为分工:
+
+| runner | 哪些 | 为什么 |
+|---|---|---|
+| `launchd` | `feed_poll`(每半小时)、`order_chain`(每小时:销售订单/订单审核/售后订单) | 高频的东西写死在电脑上最稳,不依赖任何智能体在不在线 |
+| `gpt` | 其余每日/每周一次的七条 | 所有者原话:「前期稳定,也方便我维护和调整,以后换个智能体也能用」。改个时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、能当场判断要不要重跑的东西**在旁边 |
+
+⚠ `runner` 只决定**谁按秒表**,不决定跑什么:两边都是同一条 `python cli.py …`,
+同一把 flock 锁,同一份 `ops.runs` 记录。所以**同一条链绝不许两边都挂** ——
+撞上了后到的那次拿不到锁直接退 3 空跑一轮,而且看起来一切正常。
+`tests/test_launchd.py::test_only_the_high_frequency_chains_live_on_this_machine`
+钉住这条。
+
+### 9.2 两个生成器
 
 ```
 cd /Users/nextderboy/Projects/WalmartAPI-Contral
-.venv/bin/python3 cli.py launchd_install --dry-run
+.venv/bin/python3 cli.py launchd_install --dry-run   # 电脑那两条:plist + launchctl 命令
+.venv/bin/python3 cli.py skill_export   --dry-run    # 智能体那七条:技能包 md
 ```
 
-它会把每条链的时间、命令、注意事项、以及按批的 `launchctl load` 命令
-一次打全。
+`skill_export` 写 `skills/walmart-schedule/`(进 git):一份 `SKILL.md` 总纲
+(任务表 + 退出码怎么判 + 三条纪律 + 电脑侧那两条"别重复挂")+ 每条任务一份
+`tasks/<任务名>.md`,注册定时任务时**整篇粘进提示词**。产物与调度表的一致性由
+`tests/test_gpt_skill.py::test_repo_copy_matches_the_schedule_table` 钉住 ——
+提示词是调度表的副本,副本与正本不一致时没有任何东西会报错。
 
 ## 十、上线顺序(分三批,每批观察一天)
 
-| 批 | 开什么 | 先停什么旧的 | 看什么 |
-|---|---|---|---|
-| **一(只读/低危)** | `backup`、`risk_sync blacklist_push`、`feed_poll` | 无 | `ops.runs` 的时长与失败率 |
-| **二(订单 + 日报)** | 每小时订单链、`perf_problems`、`settlement_sync`、`daily_report` | 旧订单同步(GPT 侧 13:30 + cron 每时:15,**两条同停**)、旧 KPI(08:00 + 14:00) | 订单列对拍差异 8 店是否收敛;**影刀有没有数据** |
-| **三(破坏性)** | 产品线整条、`product_clear`、`sku_locked_heal` | 旧维护 12:00、旧下架 15:00、旧 cleanup 0/6/12/18、旧 retire 23:30 | 每条**先手动 `--dry-run` 人眼确认**再挂 plist |
+| 批 | 开什么 | 挂在哪 | 先停什么旧的 | 看什么 |
+|---|---|---|---|---|
+| **一(只读/低危)** | `backup`、`risk_sync blacklist_push` | 智能体 | 无 | `ops.runs` 的时长与失败率 |
+| | `feed_poll` | launchd | 无 | 同上 |
+| **二(订单 + 日报)** | 每小时订单链 | launchd | 旧订单同步(GPT 侧 13:30 + cron 每时:15,**两条同停**) | 订单列对拍差异 8 店是否收敛;**影刀有没有数据** |
+| | `perf_problems`、`settlement_sync`、`daily_report` | 智能体 | 旧 KPI(08:00 + 14:00) | 同上 |
+| **三(破坏性)** | 产品线整条、`product_clear` | 智能体 | 旧维护 12:00、旧下架 15:00、旧 cleanup 0/6/12/18、旧 retire 23:30 | 每条**先手动 `--dry-run` 人眼确认**再注册 |
+
+批一/批二挂 launchd 的那两条走 `launchd_install -p batch=N`;其余七条走
+`skill_export` 生成提示词后**按批逐条注册**(不要一次把七条全注册进去 ——
+"每批观察一天"这回事就没了)。
 
 ⚠ 批三的 `maintenance_scan -p preview=1` 要重点看「标题不匹配」那类删除的条数
 —— 五条删除判据里唯一没有生产数据背书的一条。

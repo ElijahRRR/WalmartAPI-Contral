@@ -59,6 +59,8 @@ api/            按外部系统与沃尔玛 API 域分文件:_client, items, pri
 services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
+skills/         **生成物**(进 git):智能体定时任务的技能包,由 `cli.py skill_export`
+                从 registry/schedule.JOBS 渲染 —— 不要手改,改调度表再重新生成
 docs/           plan.md / production_cutover.md(**走进生产的定稿与待办,起调度这一役先读它**) /
                 feed_closure_audit.md(feed 库侧闭环审计:六提交点×三台账×五反哺器) /
                 db_schema.md / feishu_tables.md / legacy_reference.md /

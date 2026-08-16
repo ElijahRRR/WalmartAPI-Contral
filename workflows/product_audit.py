@@ -44,7 +44,8 @@ import logging
 import time
 
 from registry import db, resources
-from services import audit_reason, audit_rules, audit_store, product_events
+from services import audit_reason, audit_rules, audit_store, \
+    listing_sheet, product_events
 
 DANGEROUS = True
 
@@ -139,7 +140,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 
 _KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
-                 "l3", "l4", "workers", "adopt_only"}
+                 "l3", "l4", "workers", "adopt_only", "from_sheet"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
 _MODES = {"backfill", "pending"}
 
@@ -234,8 +235,62 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     return len(adopted), adopted
 
 
+_SQL_VERDICT = """
+SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%s)
+"""
+
+
+def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
+    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 C/D/E/F/G。
+
+    所有者定稿 2026-08-16。⚠ 三条:
+
+    · **E 列写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
+      `audit_result.lower() == "pass"`。写别的那行永远上不去,而且不报错。
+      映射收在 `listing_sheet.AUDIT_RESULT_CN`。
+    · **库里没有的 ASIN 一行都不写**(留 E 空)。写个 pending 会让人以为审过了;
+      留空则下轮自动重领,而且 `list_new` 只认 pass,留空绝不会误上架。
+      摘要里点名有多少行卡在这。
+    · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
+
+    回填失败只告警不失败:结论已经落 PG 了(products 五列 + audit_runs),
+    飞书只是人机界面 —— 与订单中心那条同款纪律。
+    """
+    try:
+        asins = sorted({r["asin"] for r in sheet_rows})
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute(_SQL_VERDICT, (asins,))
+            got = {r[0]: r for r in cur.fetchall()}
+        updates, absent = [], 0
+        for r in sheet_rows:
+            row = got.get(r["asin"])
+            if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
+                absent += 1
+                continue
+            _, title, pt, status, reason, at = row
+            updates.append((r["rownum"], [
+                title or "", pt or "",
+                listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                (reason or "")[:500],
+                at.strftime("%Y-%m-%d") if at else ""]))
+        n = listing_sheet.write_audit_cols(updates, execute)
+        out = (f"上架表回填 {n} 行 C~G"
+               f"{'(dry-run 未写)' if not execute else ''}")
+        if absent:
+            out += (f";⚠ {absent} 行库里没有结论,**E 列留空**"
+                    f"(下轮自动重领;先跑 product_ingest 把这些 ASIN 采进来)")
+        return out
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("上架表回填失败(结论已在 PG,不影响本轮): %s", e)
+        return (f"⚠ 上架表回填失败:{e}"
+                f"(结论已在 catalog.products;重跑 "
+                f"`python cli.py product_audit -p from_sheet=1` 补写)")
+
+
 def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute)→ 输出:判定统计摘要。"""
+    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
@@ -259,6 +314,23 @@ def run(params: dict) -> str:
                        "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
+    # ── 上架表驱动(所有者定稿 2026-08-16)────────────────────────────────
+    # 「审核直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」。
+    # 实现上**走 asins= 那条既有路径**:审核引擎只有一条实现,这里只是换了个
+    # 领任务的地方(与 problem_scan/maintenance_scan 那种"决策与执行分家"同理)。
+    sheet_rows: list[dict] = []
+    if params.get("from_sheet"):
+        sheet_rows = listing_sheet.audit_targets()
+        want = sorted({r["asin"] for r in sheet_rows})
+        if not want:
+            return ("上架表:没有待审行(A 有值且 E 为空的一行都没有)。"
+                    "想重审就把该行 E 列清空 —— 那是唯一的重审入口")
+        if len(want) > limit:
+            # 静默截断 = "审完了"的假象。点名说出来,人自己决定加 limit 还是分轮
+            logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d,只审前 %d 个",
+                           len(want), limit, limit)
+        params = {**params, "asins": ",".join(want[:limit])}
+
     where, extra = _pick_where(params)
     if adopt_only:
         # 只采用模式下**只挑有历史结论的行**:否则候选按 audited_at NULLS
@@ -498,6 +570,8 @@ def run(params: dict) -> str:
         lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
                      f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
     lines.append(f"全库 pending 存量 {pending_total}")
+    if sheet_rows:
+        lines.append(_project_to_sheet(sheet_rows, execute))
     if not execute:
         lines.append("(dry-run:runs/hits 已落,products 五列与事件未写)")
     return "\n".join(lines)

@@ -85,6 +85,39 @@ SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NUL
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
 """
+# 审核结论与 PT 的**权威在 PG**(所有者定稿 2026-08-16:「上架链应该以数据库
+# 的数据为准,因为我把审核接进来了,要上架就肯定要过审核,读取速度也更快」)。
+# 上架表 E/D 两列自 2026-08-16 起是这两个字段的**投影**
+# (product_audit -p from_sheet=1 回填),给人看的;闸门读库,不读投影。
+_SQL_VERDICT = """
+SELECT asin, audit_status, walmart_pt
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%s)
+"""
+
+
+def load_verdicts(asins: list[str]) -> dict[str, tuple]:
+    """输入:ASIN 列表 → 输出:{asin: (audit_status, walmart_pt)}。库里没有的不在字典里。"""
+    if not asins:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_VERDICT, (sorted(set(asins)),))
+        return {a: (st, pt) for a, st, pt in cur.fetchall()}
+
+
+AUDIT_OK = "approved"       # catalog.products.audit_status 的过审值
+
+
+def _with_pt(row: dict, verdicts: dict) -> dict:
+    """输入:上架表一行 + 审核字典 → 输出:类目以库为准的同一行。
+
+    「以数据库的数据为准」是同一条口径的两半:结论读库,**类目也读库**。
+    只读结论不读类目的话,表 D 列被手改成另一个 PT,上架会按手改的那个走
+    ——而审核是按库里那个 PT 过的,等于绕过审核换了类目。
+    库里没有 PT(老数据/未审)才退回表里的值。
+    """
+    pt = (verdicts.get(row["asin"]) or (None, None))[1]
+    return {**row, "product_type": pt} if pt else row
 
 
 def _load_gate_state():
@@ -233,7 +266,8 @@ GROUP BY f.store, f.sku
 """
 
 
-def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+def _retry_rows(rows: list[dict], verdicts: dict
+                ) -> tuple[list[dict], list[tuple[str, str]]]:
     """输入:上架表全部行 → 输出:(可重试行, 已达上限行)。
 
     O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
@@ -245,7 +279,7 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
     走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
     """
     cand = [r for r in rows
-            if r["audit_result"].lower() == "pass"
+            if (verdicts.get(r["asin"]) or (None,))[0] == AUDIT_OK
             and r["list_result"] == "FAILED"]
     if not cand:
         return [], []
@@ -259,7 +293,8 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
             exhausted.append((r["store"], r["asin"]))
             continue
         # 重新排队:清掉上一轮的 feedid/结果,让主链当新行处理
-        retry.append({**r, "feed_id": "", "listed": "", "list_result": ""})
+        retry.append({**_with_pt(r, verdicts),
+                      "feed_id": "", "listed": "", "list_result": ""})
     return retry, exhausted
 
 
@@ -404,18 +439,38 @@ def run(params: dict) -> str:
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    fresh = [r for r in rows
-             if r["audit_result"].lower() == "pass"
-             and r["listed"].lower() in ("", "no")
-             and not r["feed_id"]
-             # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
-             # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
-             and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
-    retry, exhausted = _retry_rows(rows)
+    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里 E 列是投影,
+    # 可能被人手改、可能滞后;PG 是权威,而且快。
+    verdicts = load_verdicts([r["asin"] for r in rows if r.get("asin")])
+    open_rows = [r for r in rows
+                 if r["listed"].lower() in ("", "no") and not r["feed_id"]
+                 # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
+                 # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
+                 and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
+    fresh, n_unaudited, n_rejected = [], 0, 0
+    for r in open_rows:
+        st = (verdicts.get(r["asin"]) or (None, None))[0]
+        if st == AUDIT_OK:
+            fresh.append(_with_pt(r, verdicts))
+        elif st in ("rejected",):
+            n_rejected += 1
+        else:                       # 没结论 / pending
+            n_unaudited += 1
+    retry, exhausted = _retry_rows(rows, verdicts)
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
              + (f"(其中重试 {len(retry)})" if retry else "")]
+    if n_unaudited or n_rejected:
+        # ⚠ 必须点名:审核闸从"读表 E 列"改成"读库"之后,**没审过的行会静默
+        # 消失在待上架里**。不说的话表现是"表里明明有几百行却一行也不上"
+        lines.append(
+            f"  审核闸(读 catalog.products,不读表 E 列):"
+            + (f"**未审核 {n_unaudited} 行**"
+               f"(先跑 `python cli.py product_audit -p from_sheet=1`)"
+               if n_unaudited else "")
+            + (f"{';' if n_unaudited else ''}审核判拒 {n_rejected} 行(不上)"
+               if n_rejected else ""))
     if exhausted:
         lines.append(f"  ⚠ 重试已达上限({MAX_LIST_ATTEMPTS} 次)不再自动重试:"
                      + ",".join(a for _, a in exhausted[:10]))

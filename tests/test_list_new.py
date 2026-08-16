@@ -30,6 +30,21 @@ def _sheet_row(rownum, **kw):
     return d
 
 
+# 上架表 E 列 → catalog.products.audit_status 的对照(services.listing_sheet
+# .AUDIT_RESULT_CN 的反向)。2026-08-16 起审核闸**读库不读表**,夹具沿用
+# E 列写法只是为了让每行"该不该过审"仍然一眼可见。
+_AUDIT_DB = {"pass": "approved", "reject": "rejected", "pending": "pending"}
+
+
+def fake_verdicts(rows):
+    """输入:上架表行 → 输出:假 catalog.products 的 {asin: (结论, PT)}。
+
+    E 列为空 = 库里查不到那个 ASIN(键直接不存在),这正是"没审核过"的形状。
+    """
+    return {r["asin"]: (_AUDIT_DB[r["audit_result"]], r["product_type"] or None)
+            for r in rows if r["asin"] and r["audit_result"]}
+
+
 def test_listing_reflector_writes_opq(monkeypatch):
     monkeypatch.setattr(resources, "LISTING_SHEET",
                         Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
@@ -65,6 +80,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         _sheet_row(10, asin="B0BANNED01"),                # ASIN 黑名单
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         {"T_OFF"}, {}, {"B0LISTED01"},
         {"B0BANNED01": ("E", "沃尔玛-知产")},
@@ -190,12 +206,13 @@ def test_failed_rows_requeue_until_cap(monkeypatch):
         def cursor(self): return _Cur()
 
     monkeypatch.setattr(ln.db, "pg_conn", lambda: _Conn())
-    retry, exhausted = ln._retry_rows(rows)
+    retry, exhausted = ln._retry_rows(rows, fake_verdicts(rows))
     assert [r["asin"] for r in retry] == ["B0RETRY01"]
     assert exhausted == [("T1", "B0CAPPED01")]
     # 重新排队的行要看起来像新行(主链才会走领 UPC → 提交)
     assert retry[0]["feed_id"] == "" and retry[0]["list_result"] == ""
-    assert ln._retry_rows([_sheet_row(2)]) == ([], [])
+    solo = [_sheet_row(2)]
+    assert ln._retry_rows(solo, fake_verdicts(solo)) == ([], [])
 
 
 def test_list_new_skips_when_shipping_missing(monkeypatch):
@@ -213,6 +230,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
         "B0NOSHIP": {**base, "asin": "B0NOSHIP", "shipping": None},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
@@ -244,6 +262,7 @@ def test_quota_slices_after_filters(monkeypatch):
                 "B0GOODONE1": {**base, "asin": "B0GOODONE1", "stock": 50},
                 "B0GOODONE2": {**base, "asin": "B0GOODONE2", "stock": 50}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
@@ -359,6 +378,7 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     rows = [_sheet_row(2, list_result="PROHIBITED", listed="No"),
             _sheet_row(3)]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
@@ -385,6 +405,7 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
         _sheet_row(5, asin="B0NOBRAND1"),                  # 无品牌 → 不受品牌闸管
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()},

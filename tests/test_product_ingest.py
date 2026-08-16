@@ -7,7 +7,7 @@ import pytest
 
 from api import scraper
 from services import amz_source, product_ingest as ingest
-from tests.test_list_new import _sheet_row
+from tests.test_list_new import _sheet_row, fake_verdicts
 
 
 def _rec(**kw):
@@ -261,6 +261,7 @@ def test_list_new_stock_three_way(monkeypatch):
                       "channel": "FBM", "shipping": 0.0},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))

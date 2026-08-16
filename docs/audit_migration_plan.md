@@ -125,8 +125,10 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
   audit_runs/hits,不写 products.audit_* 五列、不投影飞书)+ risk_sync 扩展
   phase0 三表镜像(镜像语义定死为**单事务全量重灌**,与旧系统同款——risk_sync
   家族现行"只增改不删"语义会在飞书删行后残留幽灵行,本表不适用)。
-  **并跑期纪律:E/D 列投影推迟到批次 D 切换日**——旧审核与人工仍在按旧结论填 E,
-  切换前新系统只落库,双跑对比在库内做(audit_runs vs 旧库结论),绝不双写同列。
+  ~~**并跑期纪律:E/D 列投影推迟到批次 D 切换日**——旧审核与人工仍在按旧结论填 E,
+  切换前新系统只落库,双跑对比在库内做(audit_runs vs 旧库结论),绝不双写同列。~~
+  **↑ 2026-08-16 开闸,此纪律结束**(所有者:「上架链应该以数据库的数据为准,
+  因为我把审核接进来了」)。落地形态见 10.7 后注。
   交付含测试:audit_rules 纯函数单测 + violation_groundtruth 黄金集回归夹具
   (离线,不打 LLM);run 摘要带 pending 计数与最老龄期(超阈值飞书告警依赖
   FEISHU_WEBHOOK_URL,配置前只进日志——已知缺口);audit_version 语义随本批定稿
@@ -335,6 +337,19 @@ catalog_sync(拉在线,已有,不动)
   heal_unknown/write_data_cols 同款形态(读表 ASIN 列→查库→批量回写)。
 - **并跑期风险消解**:切换前旧流程照旧(人工填 E、list_new 读 E);切换日
   一次性完成"上架链改查库 + 投影开闸 + 表口径注释改",不存在双写同列窗口。
+
+**切换已执行(2026-08-16,所有者定稿当日一次性完成)**,四处同轮改完:
+
+| 位置 | 落地 |
+|---|---|
+| 领任务 | `listing_sheet.audit_targets()` = **A 有值且 E 为空**;`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现)。**重审的唯一入口 = 把 E 列清空**(不设 force 参数:清一格比记参数直观,而且看得见改了哪些行) |
+| 投影 | `_project_to_sheet()` 写 **C/D/E/F/G**(标题/PT/结论/理由/日期),一行一个 `C{r}:G{r}`。E 列写 `pass/reject/pending`(`listing_sheet.AUDIT_RESULT_CN`,**不是** `approved`)。库里没结论的行 **E 留空并在摘要里点名**——写 pending 会让人以为审过了,而且它下轮不会被重领。回填失败只告警(结论已在 PG,飞书只是界面) |
+| 上架闸 | `list_new.load_verdicts()` 查 `catalog.products`,只放 `audit_status='approved'`;未审核/判拒**逐类点名**(不点名的表现是"表里几百行一行也不上"而无任何提示)。`_retry_rows` 同闸 |
+| 类目 | `list_new._with_pt()`:**PT 也以库为准**(`walmart_pt`),库里没有才退回表 D 列。只读结论不读类目 = 手改 D 列即可绕过审核换类目 |
+
+⚠ 随之而来的口径变化,所有者需知:**手改上架表 D/E 两列对上架不再有任何影响**
+(下一轮 `from_sheet` 还会把它们覆盖回库里的值)。人工强制通过/拒绝按 #4 后注,
+今后走 cli 通道或驱动表,不经表。回归钉在 `tests/test_audit_sheet_loop.py`。
 
 ### 10.6 架构层面明确不进本仓的清单
 

@@ -6,8 +6,11 @@
   M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
   R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
 
-列权责(旧系统纪律,跨界写就是 bug):A/B/D/E/F/G 人工域;list_new 写
-C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
+列权责(旧系统纪律,跨界写就是 bug):**A/B 人工域**(运营填 ASIN 与店铺);
+**C/D/E/F/G 审核域**(`product_audit -p from_sheet=1` 写,2026-08-16 所有者定稿
+「审核直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」——
+此前 D/E/F/G 记在人工域,那是并跑期旧审核链在填,现在由新审核链接管);
+list_new 写 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
 L3 状态跟踪写 R~U。**唯一例外**:heal_unknown 自愈反哺器对 K=Unknown
 的行可写 K~Q(所有者批复 2026-08-12——Unknown 是 list_new 自己写的
 中间态,自愈是同一职责的收尾,不算跨界)。K 三态语义:Yes(已提交)/Unknown(结局不确定,
@@ -90,6 +93,46 @@ def write_data_cols(updates: list[tuple[int, list]], execute: bool = True) -> in
         ranges.append((f"C{r}:C{r}", [[vals[0]]]))
         ranges.append((f"H{r}:J{r}", [vals[1:4]]))
     feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
+    return len(updates)
+
+
+# 审核结论 → 上架表 E 列的取值。
+# ⚠ **必须是 "pass"**:`list_new` 的领任务闸判的是
+# `r["audit_result"].lower() == "pass"`。写 "approved" 那行就永远不会被上架领走,
+# 而且不报错 —— 表面上"审过了",实际上再也上不去。
+AUDIT_RESULT_CN = {"approved": "pass", "rejected": "reject",
+                   "pending": "pending"}
+
+
+def audit_targets() -> list[dict]:
+    """输入:无 → 输出:待审行 [{rownum, asin, store}](A 有值且 **E 为空**)。
+
+    所有者定稿 2026-08-16:「审核直接读取上架表的 A、E 列(为空就审核)」。
+    E 有值就是审过了 —— **想重审就把 E 清空**,这是唯一的重审入口
+    (不设 force 参数:清一格比记一个参数直观,而且看得见改了哪些行)。
+    """
+    return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
+            for r in read_rows()
+            if r.get("asin") and not str(r.get("audit_result") or "").strip()]
+
+
+def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
+    """输入:[(行号, [C 标题, D PT, E 结果, F 理由, G 日期])] → 输出:写入行数。
+
+    C~G 连续一段,一行一个 range。⚠ 只动这五列 —— H 之后是 list_new 与
+    反哺器的域,跨界写就是 bug(见模块头注的列权责)。
+    """
+    if not updates:
+        return 0
+    if not execute:
+        for rownum, vals in updates[:20]:
+            logger.info("[DRY-RUN] 将回写 第%d行 C:G=%s", rownum, vals)
+        if len(updates) > 20:
+            logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
+        return 0
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, [
+        (f"C{r}:G{r}", [[("" if v is None else str(v)) for v in vals]])
+        for r, vals in updates])
     return len(updates)
 
 

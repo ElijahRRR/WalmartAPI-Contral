@@ -522,3 +522,22 @@ def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
     r = ag.build(cands, {"acme": "A"}, {"B0AAAA0002": "B"})
     assert r["dropped"]["ASIN 占用与组归属矛盾"] == 1
     assert [x["asin"] for x in r["directed"][0]["items"]] == ["B0AAAA0001"]
+
+
+def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
+    """★ 排序按**组分**(组内最高产品分),组里分低的产品跟着一起上架。
+
+    所有者 2026-08-16:「产品分 38.6 和 91.4 是怎么混到一起去的」。答案是
+    它们同属一个品牌组 —— 不是 bug(品牌排他要求整组去一家店),但那些货位
+    **挤掉的是排队里组分更高的组**,所以量要报出来让人判断值不值。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 一个品牌:一个 95 分带三个 36 分的;另有一批 50 分的单品组排在后面
+    pool = ([_c("B0HIGH0001", "acme", 95.0)]
+            + [_c(f"B0LOW{i:05d}", "acme", 36.0) for i in range(3)]
+            + [_c(f"B0MID{i:05d}", f"mid{i}", 50.0 - i * 0.01) for i in range(60)])
+    _wire_directed(monkeypatch, pool, {}, room=10)
+    out = wf.run({"execute": False})
+    assert "搭车上架" in out
+    line = [x for x in out.splitlines() if "搭车上架" in x][0]
+    assert "3 个货位" in line          # 三个 36 分的跟着 95 分的上来了

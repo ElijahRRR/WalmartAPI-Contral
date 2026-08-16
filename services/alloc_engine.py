@@ -77,12 +77,18 @@ def layer_cut(groups: list, thickness: float = LAYER_THICKNESS) -> list[list]:
 
 
 def _gate(group: dict, store: str, st: dict) -> bool:
-    """输入:一组 + 一店 → 输出:过不过**类目/渠道**闸。
+    """输入:一组 + 一店 → 输出:过不过**归属/类目/渠道**闸。
 
     容量与配额不在这里 —— 那两个是随发牌变化的量,而这里只判"静态相容"。
     合在一起写的话,"这家店永远接不了这个大类"与"这家店这批满了"会得出
     同一个结论,而这两件事的处置完全不同(前者要改配置,后者等下一批)。
     """
+    # 品牌已被占用的组只能去占用店(§7.3 定向流)。**它不是另一条流水线,
+    # 就是同一副牌里"只有一家店能要"的那种牌** —— 写成两个阶段的话,两边
+    # 各有一套配额与容量记账,谁也不知道对方吃了多少(2026-08-16 实测:
+    # 分阶段版本让定向流一口吃光批量,而且容量闸各判各的、双双超容)
+    if group.get("store") is not None and group["store"] != store:
+        return False
     cats = st.get("categories") or []
     if cats:                                    # 空 = 不限制(store_targets.allowed 同口径)
         if not group.get("category") or group["category"] not in cats:

@@ -29,7 +29,7 @@ def _grp(key, brand, items, store=None):
 def test_free_flow_claims_both_the_brand_and_every_asin():
     items = [_c("B0AAAA0001", "acme", 90.0), _c("B0AAAA0002", "acme", 80.0)]
     rows = wf._to_claim([{"group": _grp("acme", "acme", items), "store": "A",
-                          "layer": 1, "tier": 1}], [])
+                          "layer": 1, "tier": 1}])
     kinds = [(r["kind"], r["claim_key"], r["store"]) for r in rows]
     assert (claims.BRAND, "acme", "A") in kinds
     assert (claims.PRODUCT, "B0AAAA0001", "A") in kinds
@@ -44,7 +44,8 @@ def test_directed_flow_does_not_re_claim_the_brand():
     人能数出来的东西,而这个数是所有者唯一的核对手段。
     """
     items = [_c("B0BBBB0001", "zeta", 70.0)]
-    rows = wf._to_claim([], [_grp("zeta", "zeta", items, store="A085")])
+    rows = wf._to_claim([{"group": _grp("zeta", "zeta", items, store="A085"),
+                          "store": "A085", "layer": 1, "tier": 1}])
     assert [(r["kind"], r["claim_key"], r["store"]) for r in rows] == [
         (claims.PRODUCT, "B0BBBB0001", "A085")]
 
@@ -54,7 +55,7 @@ def test_unbranded_group_claims_only_the_asin():
     等于凭空造一个叫这个名字的品牌把别人挡住。"""
     items = [_c("B0CCCC0001", None, 60.0)]
     g = _grp("(无品牌):B0CCCC0001", None, items)
-    rows = wf._to_claim([{"group": g, "store": "A", "layer": 1, "tier": 1}], [])
+    rows = wf._to_claim([{"group": g, "store": "A", "layer": 1, "tier": 1}])
     assert [r["kind"] for r in rows] == [claims.PRODUCT]
 
 
@@ -62,7 +63,7 @@ def test_claim_snapshot_carries_the_walmart_pt():
     """每条占用记下当时的 PT —— 回答"当初按什么分的"只能靠它(§7.8)。"""
     items = [_c("B0AAAA0001", "acme", 90.0, pt="Socks")]
     rows = wf._to_claim([{"group": _grp("acme", "acme", items), "store": "A",
-                          "layer": 1, "tier": 1}], [])
+                          "layer": 1, "tier": 1}])
     prod = [r for r in rows if r["kind"] == claims.PRODUCT][0]
     assert prod["walmart_pt"] == "Socks"
 
@@ -80,11 +81,33 @@ def test_headroom_leaves_room_for_gate_failures():
 
 # ── 配额 ──────────────────────────────────────────────────────────────
 
-def test_quota_weights_match_the_owner_ruling():
-    """所有者拍板:把货给离目标最远的店 ⇒ 缺口主导(§7.4g #5)。"""
-    import inspect
-    src = inspect.getsource(wf.run)
-    assert "W_GAP, W_ROOM, W_EFF = 0.6, 0.25, 0.15" in src
+def test_quota_is_capacity_capped_gap_converted():
+    """配额 = min(剩余容量, 缺口 ÷ 单品日产出)。
+
+    所有者原话(2026-08-16):「上限 3500,在线 2200,还有 1300 个位置,按缺口
+    算出来是 1500,但也只能上架 1300 个」——**容量是硬的,缺口是想要的,取小**。
+    """
+    # 缺口 1500 元/天 ÷ 货位值 1.0 = 1500 个货位,但只剩 1300 个位置
+    n, why = wf._quota({"room": 1300, "gap": 0.75}, {"slot_value": 1.0}, 2000.0)
+    assert n == 1300 and "剩余容量" in why
+    # 容量管够时就按缺口来
+    n, why = wf._quota({"room": 9999, "gap": 0.75}, {"slot_value": 1.0}, 2000.0)
+    assert n == 1500 and why == "缺口换算"
+
+
+def test_quota_falls_back_to_room_not_zero_when_gap_is_unknown():
+    """⚠ 算不出缺口时**退回剩余容量**,不是退回 0。
+
+    「单店最大在线数」是所有者显式填的上限,拿它当界是尊重设置;退回 0 会让
+    没填日目标的店永远分不到货,而且不报错 —— 正是空值纪律要防的事。
+    """
+    assert wf._quota({"room": 500, "gap": None}, {"slot_value": 1.0}, None)[0] == 500
+    assert wf._quota({"room": 500, "gap": 0.5}, {"slot_value": None}, 100.0)[0] == 500
+
+
+def test_a_store_at_its_target_gets_nothing():
+    """已达目标的店缺口 0 ⇒ 配额 0(所有者口径:把货给离目标最远的店)。"""
+    assert wf._quota({"room": 999, "gap": 0.0}, {"slot_value": 1.0}, 100.0)[0] == 0
 
 
 def test_pending_delist_is_deduped_across_the_two_gates(monkeypatch):
@@ -123,7 +146,7 @@ def test_plan_csv_lists_every_product_not_every_group(tmp_path, monkeypatch):
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     items = [_c("B0AAAA0001", "acme", 90.0), _c("B0AAAA0002", "acme", 80.0)]
     p, n = wf._write_plan([{"group": _grp("acme", "acme", items), "store": "A",
-                            "layer": 1, "tier": 1}], [])
+                            "layer": 1, "tier": 1}])
     body = open(p, encoding="utf-8-sig").read().splitlines()
     assert n == 2 and len(body) == 3           # 表头 + 2 个产品
     assert "B0AAAA0001" in body[1] and "B0AAAA0002" in body[2]
@@ -139,7 +162,8 @@ def test_plan_table_holds_only_what_you_act_on(tmp_path, monkeypatch):
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     ok = _grp("acme", "acme", [_c("B0AAAA0001", "acme", 90.0)])
     g = _grp("zeta", "zeta", [_c("B0BBBB0001", "zeta", 50.0)])
-    p_plan, n_plan = wf._write_plan([], [dict(ok, store="A")])
+    p_plan, n_plan = wf._write_plan([{"group": ok, "store": "A", "layer": 1,
+                                      "tier": 1}])
     p_out, n_out = wf._write_rejects([{"group": g, "reason": wf.ae.NO_GATE}],
                                      [(dict(g, store="A085"), "占用店容量不足")],
                                      [dict(g, store="A085")])
@@ -294,144 +318,67 @@ def _wire_directed(monkeypatch, pool, held_brand, room):
                             _Conn({"A": 0})))
 
 
-def test_directed_flow_capacity_is_cumulative_not_per_group(monkeypatch, tmp_path):
+def test_capacity_is_never_exceeded_even_by_directed_groups(monkeypatch, tmp_path):
     """⚠ 生产实测 2026-08-16:A142 剩余容量 1,918,定向流塞了 8,384。
 
-    成因是逐组判 `size <= room` —— 十几个组各自都"塞得下",加起来撑爆四倍。
-    容量必须**累计**。
+    成因是定向流当时走的是**另一条流水线**、自己判 `size <= room`,逐组判
+    加起来撑爆四倍。合成一副牌之后容量记账只有引擎一处,天然累计。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    # 10 个已占品牌,各 5 件 = 50 件,而店里只剩 20 个货位
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 5}", 80.0) for i in range(50)]
     held = {f"brand{i}": "A" for i in range(10)}
     _wire_directed(monkeypatch, pool, held, room=20)
     landed = []
     monkeypatch.setattr(wf.claims, "claim_many",
                         lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
-    wf.run({"batch": 10_000, "execute": True})
+    wf.run({"execute": True})
     assert len(landed) <= 20, "定向流突破了剩余容量"
 
 
-def test_directed_flow_is_capped_by_the_batch(monkeypatch, tmp_path):
-    """⚠ 定向流也吃批量。不受批量约束的话,写 batch=3000 会落 4 万条占用 ——
-    而占用撤不回(生产实测 2026-08-16:批量 3,000,定向流 36,894 个货位)。
+def test_directed_and_free_compete_in_one_deck_by_score(monkeypatch, tmp_path):
+    """定向流不是另一条流水线,就是同一副牌里"只有一家店能要"的牌。
+
+    分成两个阶段的实测后果:两边各有一套配额与容量记账,谁也不知道对方吃了
+    多少 —— 定向流一口吃光批量、自由流 0。合成一副之后按组分排,谁分高谁先。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 5}", 80.0) for i in range(500)]
-    held = {f"brand{i}": "A" for i in range(100)}
-    _wire_directed(monkeypatch, pool, held, room=100_000)
-    out = wf.run({"batch": 30, "execute": False})
-    assert "排队等下一批" in out
+    pool = ([_c("B0DIR00001", "held0", 50.0)]          # 定向流分低
+            + [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i) for i in range(5)])
+    _wire_directed(monkeypatch, pool, {"held0": "A"}, room=3)
     landed = []
     monkeypatch.setattr(wf.claims, "claim_many",
                         lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
-    wf.run({"batch": 30, "execute": True})
-    prods = [r for r in landed if r["kind"] == wf.claims.PRODUCT]
-    assert len(prods) <= 30, f"定向流突破了批量:{len(prods)}"
+    wf.run({"execute": True})
+    keys = {r["claim_key"] for r in landed if r["kind"] == wf.claims.PRODUCT}
+    # 容量只有 3:分高的自由流先上,分 50 的定向流轮不到
+    assert "B0DIR00001" not in keys and "B0FRE00000" in keys
 
 
-def test_waiting_and_rejected_directed_groups_are_counted_apart(monkeypatch, tmp_path):
-    """「本批额度用完」与「去不了占用店」处置完全不同:前者加大 batch 就能发,
-    后者要所有者去改配置或释放品牌。混在一起报会让人去改不该改的东西。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 80.0) for i in range(10)]
-    # 一半品牌归 A(能收家居),一半归一家不存在于本批的店
-    held = {f"brand{i}": ("A" if i % 2 else "不接货店") for i in range(10)}
-    _wire_directed(monkeypatch, pool, held, room=100_000)
-    out = wf.run({"batch": 2, "execute": False})
-    assert "排队等下一批" in out and "去不了" in out
+def test_a_group_bound_to_a_store_can_only_go_there(monkeypatch, tmp_path):
+    """归属闸:带 `store` 的组只能去那家店,别的店再空也不给。"""
+    from services import alloc_engine as ae
+    st = {"quota": 99, "room": 99, "categories": [], "channel": "FBA"}
+    grp = {"key": "acme", "score": 90.0, "size": 1, "category": "家居",
+           "channel": "FBA", "store": "A"}
+    assert ae._gate(grp, "A", st) is True
+    assert ae._gate(grp, "B", st) is False
 
 
-def test_directed_flow_keeps_the_items_the_claiming_store_can_take(monkeypatch, tmp_path):
-    """⚠ 定向流按**件**筛,不整组淘汰。
+def test_batch_is_an_optional_safety_valve_not_the_model(monkeypatch, tmp_path):
+    """`-p batch=` 只是想小步试跑时的安全阀。
 
-    所有者 2026-08-16 追问"定向流淘汰是什么意思"时发现的:组大类取的是件数
-    多数派,所以一个品牌 60% 厨房 / 40% 家居,组大类 = 厨房 → 只做家居的
-    占用店整组拒收,**连里面那 40% 本来能上架的家居商品一起**。
-    去向店已被品牌占用固定死,不存在"该给谁"的竞争,按件筛是良定义的。
+    所有者定稿 2026-08-16:"限制 3000 设置的也很奇怪…这个限制我甚至就认为
+    不应该有" —— 每家店能接多少由容量与缺口算出来,默认不设总量上限。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    items = ([_c(f"B0KIT{i:05d}", "acme", 80.0, cat="厨房") for i in range(6)]
-             + [_c(f"B0HOM{i:05d}", "acme", 70.0, cat="家居") for i in range(4)])
-    _wire_directed(monkeypatch, items, {"acme": "A"}, room=100_000)
-    landed = []
-    monkeypatch.setattr(wf.claims, "claim_many",
-                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
-    out = wf.run({"batch": 100, "execute": True})
-    assert "按件筛掉 6 件" in out
-    keys = {r["claim_key"] for r in landed}
-    assert keys == {f"B0HOM{i:05d}" for i in range(4)}     # 4 件家居照常发
-
-
-def test_fit_to_store_returns_none_when_nothing_survives():
-    """一件都留不下才算真淘汰 —— 返回 None,由调用方归进"去不了"那一类。"""
-    grp = {"key": "acme", "brand": "acme", "score": 80.0, "size": 2,
-           "category": "厨房", "channel": "FBA", "store": "A",
-           "items": [_c("B0AAAA0001", "acme", 80.0, cat="厨房"),
-                     _c("B0AAAA0002", "acme", 70.0, cat="厨房")]}
-    assert wf._fit_to_store(grp, {"categories": ["家居"]}) == (None, 2)
-
-
-def test_fit_to_store_recomputes_score_and_category_after_trimming():
-    """剪完要重算组分与组大类,否则方案表上写的是被剪掉那批的属性。"""
-    grp = {"key": "acme", "brand": "acme", "score": 95.0, "size": 3,
-           "category": "厨房", "channel": "FBA", "store": "A",
-           "items": [_c("B0AAAA0001", "acme", 95.0, cat="厨房"),
-                     _c("B0AAAA0002", "acme", 60.0, cat="家居"),
-                     _c("B0AAAA0003", "acme", 50.0, cat="家居")]}
-    kept, trimmed = wf._fit_to_store(grp, {"categories": ["家居"]})
-    assert trimmed == 1 and kept["size"] == 2
-    assert kept["score"] == 60.0 and kept["category"] == "家居"
-
-
-def test_store_with_no_category_limit_takes_everything():
-    """三列全空 = 不限制(store_targets.allowed 的口径),一件都不剪。"""
-    grp = {"key": "acme", "brand": "acme", "score": 80.0, "size": 2,
-           "category": "厨房", "channel": "FBA", "store": "A",
-           "items": [_c("B0AAAA0001", "acme", 80.0, cat="厨房"),
-                     _c("B0AAAA0002", "acme", 70.0, cat="家居")]}
-    assert wf._fit_to_store(grp, {"categories": []}) == (grp, 0)
-
-
-def test_directed_flow_cannot_starve_the_free_flow(monkeypatch, tmp_path):
-    """⚠ 定向流是**上限**不是优先级。
-
-    实测 2026-08-16:不设上限时定向流一口吃光 3,000 批量、自由流 0,而后面
-    还排着 27,208 件 —— 按每批 3,000 算要十批之后自由流才轮得到。
-    """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    # 定向流管够(100 个已占品牌各 5 件),自由流也管够
-    pool = ([_c(f"B0DIR{i:05d}", f"held{i // 5}", 90.0) for i in range(500)]
-            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
-    held = {f"held{i}": "A" for i in range(100)}
-    _wire_directed(monkeypatch, pool, held, room=100_000)
-    out = wf.run({"batch": 100, "execute": False})
-    head = [x for x in out.splitlines() if x.startswith("▍批量")][0]
-    assert "定向流 50" in head and "自由流" in head
-    assert "自由流 0" not in head
-
-
-def test_directed_share_is_configurable_and_validated(monkeypatch, tmp_path):
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = ([_c(f"B0DIR{i:05d}", f"held{i // 5}", 90.0) for i in range(500)]
-            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
-    _wire_directed(monkeypatch, pool, {f"held{i}": "A" for i in range(100)},
-                   room=100_000)
-    out = wf.run({"batch": 100, "directed_share": "0", "execute": False})
-    assert "定向流 0" in out                       # 全给自由流
-    assert "directed_share 要落在" in wf.run({"directed_share": "1.5"})
-
-
-def test_free_flow_takes_the_leftover_when_directed_underuses_its_share(
-        monkeypatch, tmp_path):
-    """一方吃不满时另一方取走余额 —— 上限不该变成浪费。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = ([_c("B0DIR00001", "held0", 90.0)]                    # 定向流只有 1 件
-            + [_c(f"B0FRE{i:05d}", f"new{i}", 85.0) for i in range(200)])
-    _wire_directed(monkeypatch, pool, {"held0": "A"}, room=100_000)
-    out = wf.run({"batch": 100, "execute": False})
-    head = [x for x in out.splitlines() if x.startswith("▍批量")][0]
-    assert "定向流 1 +" in head and "自由流 99" in head
+    pool = [_c(f"B0FRE{i:05d}", f"new{i}", 90.0) for i in range(500)]
+    _wire_directed(monkeypatch, pool, {}, room=400)
+    free = wf.run({"execute": False})
+    capped = wf.run({"batch": 50, "execute": False})
+    n = lambda out: int([x for x in out.splitlines()             # noqa: E731
+                         if "实发" in x][0].split("实发 ")[1].split(" ")[0])
+    assert n(free) > n(capped) and n(capped) <= 50
+    assert "把配额等比缩过" in capped and "把配额等比缩过" not in free
 
 
 def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
@@ -446,7 +393,7 @@ def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
     out = wf.run({"batch": 10, "execute": False})
     assert "排队中" in out or "一件都没发" in out
     text = open(tmp_path / "alloc_未入选.csv", encoding="utf-8-sig").read()
-    assert "自由流排队(分数排在本批切口之外)" in text
+    assert "排队(分数排在本轮切口之外)" in text
     assert "B0FRE00199" in text or "B0FRE00100" in text   # 切口之外的确实写进去了
 
 

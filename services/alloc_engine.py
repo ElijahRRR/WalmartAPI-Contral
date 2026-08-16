@@ -35,6 +35,8 @@ import logging
 import math
 from collections import Counter
 
+from services import store_targets
+
 logger = logging.getLogger("services.alloc_engine")
 
 # §7.4g #7:层厚 10%(所有者拍板 2026-08-15 晚)⇒ 10 层
@@ -89,10 +91,17 @@ def _gate(group: dict, store: str, st: dict) -> bool:
     # 分阶段版本让定向流一口吃光批量,而且容量闸各判各的、双双超容)
     if group.get("store") is not None and group["store"] != store:
         return False
-    cats = st.get("categories") or []
-    if cats:                                    # 空 = 不限制(store_targets.allowed 同口径)
-        if not group.get("category") or group["category"] not in cats:
-            return False
+    # ⚠ 类目与配送时长的判定**一律走 store_targets 的谓词**,不在这里另写。
+    # 「三列全空 = 不限制」「未填时长 = 不限」这类规则正着写反着写都像对的,
+    # 各写一遍迟早分叉(本仓已在报告 vs 回填的行口径上栽过一次)。
+    # 代价是 alloc_engine 不再是零依赖 —— 但 store_targets 的这两个谓词是
+    # 纯函数,发牌照样脱库可测
+    if not store_targets.allowed({"categories": st.get("categories") or []},
+                                 group.get("category")):
+        return False
+    if not store_targets.lead_ok({"lead_limit": st.get("lead_limit")},
+                                 group.get("lead")):
+        return False
     ch = st.get("channel")
     # 店没填配送限制 → 不接自由流(store_targets 的口径,报告点名补填);
     # 组的渠道未知 → 调用方本就不该把它送进来,这里兜一道

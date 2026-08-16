@@ -568,6 +568,11 @@ RETIRE_LIMITS = Bitable(
         category1="类目1",
         category2="类目2",
         category3="类目3",
+        # 逐店配送时长上限(所有者建列 2026-08-16):**只分配 delivery_days
+        # ≤ 该值的产品**。与全局 `amz_source.MAX_LEAD_DAYS`(=7)是两回事:
+        # 全局那条管的是"上架但库存写 0"的既有链路,这一列管的是"这家店压根
+        # 不要慢货"。未填 = 该店不限配送时长(退回全局链路)
+        lead_limit="配送时长限制",
     ),
 )
 

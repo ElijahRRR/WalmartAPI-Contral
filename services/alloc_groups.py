@@ -10,7 +10,13 @@
 2. **组大类 = 组内件数最多的大类**。一个品牌横跨两个大类时,少数派那部分
    跟着走 —— 因为它们本来就只能跟品牌走。**件数并列时按大类名定序**,
    否则同样的输入会给出不同的组大类(占用撤不回,不许有随机)。
-3. **组渠道 = 组内件数最多的渠道,少数派整体剔除**。这一条最容易写错:
+3. **组货期 = 组内**最长**的那个;有一件采不到就整组算未知**。店铺的
+   「配送时长限制」是逐店硬闸,而组必须整组去一家店 —— 取最长才能保证
+   "这家店收得了这个品牌的每一件"。采不到的当未知(不是当快),受限店会拒收:
+   所有者填这一列就是明确不要慢货,拿"没采到"当"够快"是替他做了他没做的决定。
+   ⚠ 定向流另有优待:去向店已固定,`alloc_plan._fit_to_store` 会**按件剪**掉
+   超期的那些,不必整组等。
+4. **组渠道 = 组内件数最多的渠道,少数派整体剔除**。这一条最容易写错:
    店铺是一店一渠道,而品牌必须整组去一家店 —— 混渠道的品牌里,不合该店
    渠道的那部分**上不了架**。留在组里会让 size 虚高、配额被吃掉却上不了货。
    渠道未知的产品同样剔除(**不猜**:猜错等于把 FBM 的货分给 FBA 店)。
@@ -67,10 +73,13 @@ def build(candidates: list, claimed_brands: dict | None = None) -> dict:
         keep = [x for x in items if x["channel"] == ch]
         if len(keep) < len(items):
             dropped["渠道少数派(随品牌走不了)"] += len(items) - len(keep)
+        leads = [x.get("lead") for x in keep]
         g = {"key": gk, "brand": b["brand"],
              "score": max(x["score"] for x in keep),
              "size": len(keep),
              "category": _major(x["category"] for x in keep),
+             # 取**最长**;任一件采不到就整组未知 —— 见模块 docstring 第 3 条
+             "lead": None if any(v is None for v in leads) else max(leads),
              "channel": ch, "items": keep}
         if b["brand"] and b["brand"] in held:
             directed.append({**g, "store": held[b["brand"]]})

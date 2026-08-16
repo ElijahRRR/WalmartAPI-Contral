@@ -4,9 +4,10 @@
   目标销售额 / 目标订单  —— **日目标**(不是月目标,公式里别当月用)
   单店最大在线数        —— 总容量上限(≠「上架限制」列的日配额)
   配送限制              —— fba / fbm,一店一渠道的权威(未填=不接自由流分配)
+  配送时长限制          —— 只分配 delivery_days ≤ 该值的产品(未填=不限)
 
 与 `workflows/list_new._load_quota` 的分工:那边读「上架限制」日配额,
-本模块读分配用的四列;同一张表两个读者,字段常量都在 registry。
+本模块读分配用的那几列;同一张表两个读者,字段常量都在 registry。
 
 **空值语义**:未填一律 None,**绝不退化成 0**——0 是"目标为零"(不该接货),
 None 是"还没填"(引擎报告里点名要求补填)。两者混淆会让没填目标的店被算成
@@ -61,7 +62,8 @@ def load_targets() -> dict[str, dict]:
     f = t.fields
     recs = feishu.list_records(t, field_names=[
         f.store, f.target_gmv_daily, f.target_orders_daily,
-        f.max_online, f.channel_limit, f.category1, f.category2, f.category3])
+        f.max_online, f.channel_limit, f.lead_limit,
+        f.category1, f.category2, f.category3])
     out: dict[str, dict] = {}
     for rec in recs:
         fields = rec.get("fields", {})
@@ -80,6 +82,7 @@ def load_targets() -> dict[str, dict]:
             "max_online": _num(fields.get(f.max_online)),
             "channel": channel,
             "channel_raw": channel_raw,
+            "lead_limit": _num(fields.get(f.lead_limit)),
             "categories": cats,
         }
     return out
@@ -96,6 +99,23 @@ def allowed(cfg_row: dict | None, category: str | None) -> bool:
     if not cats:
         return True
     return bool(category) and category in cats
+
+
+def lead_ok(cfg_row: dict | None, lead) -> bool:
+    """输入:某店配置行 + 产品配送天数 → 输出:该店收不收这个货期。
+
+    两条口径(所有者 2026-08-16 建列):**未填 = 不限**(放行一切);
+    填了就只准入 `delivery_days <= 限制`。
+    ⚠ **产品没采到配送天数(lead 为 None)时受限店拒收**:与类目那条
+    「归不到大类的,受限店拒收」同一纪律 —— 宁可不分也不错分。所有者填了
+    这一列就是明确不要慢货,拿"没采到"当"够快"是替他做了他没做的决定。
+    ⚠ 与全局 `amz_source.MAX_LEAD_DAYS` 是**两回事**:那条管的是"上架但把
+    库存写 0"的既有链路(货照上、只是不卖),这一列管的是"这家店压根不要"。
+    """
+    cap = (cfg_row or {}).get("lead_limit")
+    if cap is None:
+        return True
+    return lead is not None and float(lead) <= float(cap)
 
 
 def accepts_allocation(cfg_row: dict | None) -> bool | None:
@@ -133,6 +153,8 @@ def missing_config(cfg: dict[str, dict], stores: list[str]) -> dict[str, list]:
             continue
         if accepts_allocation(c) is False:
             continue        # 「单店最大在线数」填了 0 = 不接货,其余三列填不填都无所谓
+        # ⚠ 「配送时长限制」不进这张清单:未填 = 不限,是**合法配置**,
+        # 不是漏填(与类目三列同一治理方式)。点名它会让人以为必须填
         miss = [label for key, label in (
             ("channel", "配送限制"), ("max_online", "单店最大在线数"),
             ("gmv", "目标销售额"), ("orders", "目标订单"))

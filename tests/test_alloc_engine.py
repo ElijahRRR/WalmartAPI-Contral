@@ -278,3 +278,42 @@ def test_acceptance_compares_slots_to_slots_not_groups_to_slots():
     assert r["by_store"]["A"]["groups"] == 2 and r["by_store"]["B"]["groups"] == 20
     assert r["by_store"]["A"]["items"] == r["by_store"]["B"]["items"] == 20
     assert m["A"]["top_ratio"] == m["B"]["top_ratio"] == 1.0
+
+
+# ── 逐店配送时长限制(所有者建列 2026-08-16)──────────────────────────
+
+def test_lead_limit_blocks_groups_slower_than_the_store_allows():
+    """「配送时长限制」是逐店硬闸:只分 delivery_days ≤ 该值的货。"""
+    fast = _g("fast", 90.0, lead=3)
+    slow = _g("slow", 95.0, lead=9)
+    stores = {"STRICT": _s(9, lead_limit=5), "LOOSE": _s(9)}
+    r = ae.deal([fast, slow], stores, thickness=1.0)
+    where = {a["group"]["key"]: a["store"] for a in r["assign"]}
+    assert where["slow"] == "LOOSE"          # 9 天只有不限的店收
+    assert "fast" in where                   # 3 天两家都行
+
+
+def test_unknown_lead_is_refused_by_a_capped_store():
+    """⚠ 采不到货期时**受限店拒收**,不是当它够快。
+
+    所有者填这一列就是明确不要慢货;拿"没采到"当"够快"是替他做了他没做的
+    决定。与类目那条「归不到大类的,受限店拒收」同一纪律。
+    """
+    r = ae.deal([_g("unknown", 90.0, lead=None)],
+                {"STRICT": _s(9, lead_limit=5)}, thickness=1.0)
+    assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_GATE
+    # 未填限制的店照收 —— 未填 = 不限
+    r2 = ae.deal([_g("unknown", 90.0, lead=None)], {"ANY": _s(9)}, thickness=1.0)
+    assert r2["assign"][0]["store"] == "ANY"
+
+
+def test_gate_predicates_come_from_store_targets_not_reimplemented():
+    """⚠ 类目与货期的判定只留一处。
+
+    「三列全空 = 不限制」「未填时长 = 不限」这类规则正着写反着写都像对的,
+    各写一遍迟早分叉 —— 本仓已在报告 vs 回填的行口径上栽过一次。
+    """
+    import inspect
+    src = inspect.getsource(ae._gate)
+    assert "store_targets.allowed" in src and "store_targets.lead_ok" in src
+    assert "not in cats" not in src and "<= float(cap)" not in src

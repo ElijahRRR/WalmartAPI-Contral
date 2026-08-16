@@ -79,3 +79,19 @@ def test_groups_are_emitted_in_a_stable_order():
     cs = [_c("B1", "zeta", 90.0), _c("B2", "acme", 80.0), _c("B3", "mid", 85.0)]
     assert ([g["key"] for g in ag.build(cs)["free"]]
             == [g["key"] for g in ag.build(list(reversed(cs)))["free"]])
+
+
+def test_group_lead_is_the_slowest_item():
+    """组必须整组去一家店,所以货期取**最长** —— 那才保证"这家店收得了每一件"。"""
+    g = ag.build([_c("B1", "acme", 90.0), _c("B2", "acme", 80.0)],)["free"][0]
+    assert g["lead"] is None                 # 夹具默认没有 lead
+    g2 = ag.build([dict(_c("B1", "z", 90.0), lead=3),
+                   dict(_c("B2", "z", 80.0), lead=9)])["free"][0]
+    assert g2["lead"] == 9
+
+
+def test_one_unknown_lead_makes_the_whole_group_unknown():
+    """任一件采不到就整组未知 —— 受限店会拒收,宁可不分也不错分。"""
+    g = ag.build([dict(_c("B1", "z", 90.0), lead=3),
+                  dict(_c("B2", "z", 80.0), lead=None)])["free"][0]
+    assert g["lead"] is None

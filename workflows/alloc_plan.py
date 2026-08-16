@@ -107,19 +107,23 @@ def _fit_to_store(grp: dict, st: dict) -> tuple[dict | None, int]:
     筛是良定义的、且严格更划算。自由流不许这么做 —— 那边组的完整性参与竞争
     (组分、size 都会变),按件筛等于让同一个品牌在不同店之间被拆开,破坏排他。
 
-    渠道整组同进退(建组时已按多数派统一过);类目逐件判 —— 一个品牌横跨两个
-    大类时,占用店收得了的那部分**本来就能上架**,不该被组里的多数派连累。
-    全被剪光返回 (None, 原件数)。
+    渠道整组同进退(建组时已按多数派统一过);**类目与配送时长逐件判** ——
+    一个品牌横跨两个大类、或者快慢货混在一起时,占用店收得了的那部分
+    **本来就能上架**,不该被组里的多数派连累。全被剪光返回 (None, 原件数)。
     """
     ok = [it for it in grp["items"]
-          if store_targets.allowed(st_cfg(st), it["category"])]
+          if store_targets.allowed(st_cfg(st), it["category"])
+          and store_targets.lead_ok({"lead_limit": st.get("lead_limit")},
+                                    it.get("lead"))]
     if not ok:
         return None, grp["size"]
     if len(ok) == len(grp["items"]):
         return grp, 0
+    leads = [x.get("lead") for x in ok]
     return {**grp, "items": ok, "size": len(ok),
             "score": max(x["score"] for x in ok),
-            "category": alloc_groups._major(x["category"] for x in ok)}, \
+            "category": alloc_groups._major(x["category"] for x in ok),
+            "lead": None if any(v is None for v in leads) else max(leads)}, \
         grp["size"] - len(ok)
 
 
@@ -219,6 +223,7 @@ def run(params: dict) -> str:
         stores[s] = {"quota": 0, "room": int(qq.get("room") or 0),
                      "categories": (cfg.get(s) or {}).get("categories") or [],
                      "channel": (cfg.get(s) or {}).get("channel"),
+                     "lead_limit": (cfg.get(s) or {}).get("lead_limit"),
                      "fit": 0.0, "tier": 1 if online_now.get(s) else 2}
     if not stores:
         return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
@@ -260,7 +265,7 @@ def run(params: dict) -> str:
         grp, trimmed = _fit_to_store(orig, st)
         dir_trim += trimmed
         if grp is None:
-            dir_out.append((orig, "过不了占用店的类目/渠道闸"))
+            dir_out.append((orig, "过不了占用店的类目/渠道/货期闸"))
         else:
             deck_all.append(grp)            # 带着 store 进牌堆,归属闸会认它
 
@@ -348,7 +353,7 @@ def run(params: dict) -> str:
                     f"**本轮可分为 0,{len(below_cut):,} 组一件都没发** —— "
                     f"所有店的剩余容量或缺口都是 0,先下架腾位"))
     if dir_trim:
-        L.append(f"  定向流按件筛掉 {dir_trim:,} 件(品牌的类目跨度比占用店的准入宽);"
+        L.append(f"  定向流按件筛掉 {dir_trim:,} 件(品牌的类目跨度或货期超出占用店的准入);"
                  f"**同组里占用店收得了的那些件照常发** —— 不因为组里多数派是别的"
                  f"大类就整组扔掉")
     if dir_out:
@@ -362,7 +367,7 @@ def run(params: dict) -> str:
         # "给 A085 开厨房能救回多少件" —— 那是他真能做的决定
         blocked: Counter = Counter()
         for grp, w in dir_out:
-            if w == "过不了占用店的类目/渠道闸":
+            if w == "过不了占用店的类目/渠道/货期闸":
                 blocked[(grp["store"], grp["category"] or "(未归类)")] += grp["size"]
         if blocked:
             L.append("  其中类目挡下的,按「店 × 缺的大类」:"

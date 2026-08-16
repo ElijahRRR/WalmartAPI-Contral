@@ -4,6 +4,7 @@
   python cli.py problem_scan                  # 扫描 + 落建议行(可随时跑)
   python cli.py problem_scan -p store=A085朱丽霖
   python cli.py problem_scan -p preview=1     # 只打印不落建议行
+  python cli.py problem_scan --dry-run        # 同上(--dry-run 等价于 preview)
 
 本工作流是问题商品链拆分后的**建议半边**。原来 problem_product_cleanup 一个
 文件里既做"查库归类决定该怎么处置",又做"发 feed 真删真补"。两件事的风险等级
@@ -367,7 +368,10 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
 
 def run(params: dict) -> str:
     """输入:params(store/preview)→ 输出:归类统计 + 建议行落账摘要。"""
-    preview = str(params.get("preview", "")).strip() == "1"
+    # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不发 feed),
+    # 但它**会写建议表与事件** —— 人敲 --dry-run 的本意就是"这轮别落库"
+    preview = (str(params.get("preview", "")).strip() == "1"
+               or bool(params.get("dry_run")))
     only = params.get("store")
     items, inflight, attempts, last_cat, inactive, stubborn = _load_state()
     if only:
@@ -422,7 +426,10 @@ def run(params: dict) -> str:
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
                 store=only or None)
-        n_open = dispositions.count_open(conn)
+        # 限本链来源:维护链共用同一张建议表,不限的话摘要报的数会把它的
+        # 待执行也算进来,与本链执行件领到的数对不上
+        n_open = dispositions.count_open(
+            conn, sources=dispositions.PROBLEM_SOURCES)
     lines.append(f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
                  + (f"(差额 {n_sug - n_open} 是同一 (店铺,SKU,动作) 被两个来源"
                     f"命中、按唯一索引合并的)" if n_sug > n_open else "")

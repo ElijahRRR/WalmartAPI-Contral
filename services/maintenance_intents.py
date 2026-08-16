@@ -342,7 +342,8 @@ def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(_SQL_ZERO, (list(stockzero_stores),))
         rows = cur.fetchall()
-    return [{"store": s, "sku": k, "kind": "inventory", "old": q, "new": 0}
+    return [{"store": s, "sku": k, "kind": "inventory", "old": q, "new": 0,
+             "code": "stockzero", "reason": "整店清零(限额表「库存特殊要求」=0)"}
             for s, k, q in rows]
 
 
@@ -381,7 +382,9 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
         cur.execute(_SQL_MATCH_INV, (list(stockzero_stores or []),))
         rows = cur.fetchall()
     return _cap([{"store": s, "sku": k, "kind": "inventory",
-                  "old": q, "new": MATCH_INVENTORY_QTY}
+                  "old": q, "new": MATCH_INVENTORY_QTY,
+                  "code": "match_restock",
+                  "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
                  for s, k, q in rows], "inventory")
 
 
@@ -436,7 +439,9 @@ def price_intents(conn, multipliers: dict[str, dict],
         if delta < PRICE_MIN_DELTA or (old > 0 and delta / old < PRICE_MIN_RATIO):
             continue
         out.append({"store": store, "sku": sku, "kind": "price",
-                    "old": old, "new": new_price})
+                    "old": old, "new": new_price, "code": "price_sync",
+                    "reason": f"{channel} 落地价 × 区间倍率 → "
+                              f"{old:.2f}→{new_price:.2f}"})
     if skipped_no_rule:
         logger.info("改价:%d 行因该区间倍率未配置跳过(不动,非改 0)",
                     skipped_no_rule)
@@ -576,7 +581,10 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     caps = caps or {}
     seen, out, per_store = set(), [], {}
 
-    def _take(store, sku, reason, extra=None):
+    def _take(store, sku, code, why="", extra=None):
+        """code = 机器码(飞书「原因」列的分组依据 / 建议行 category);
+        why = 人读原因文案。2026-08-16 前两者是同一个字符串,「原因」列加进来
+        之后必须分开:`title_mismatch` 分得了组但读不出"低到什么程度"。"""
         if (store, sku) in seen:
             return          # 两个原因都命中只删一次
         cap = int(caps.get(store, DELETE_PER_STORE))
@@ -585,13 +593,15 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
             return          # 超单店上限的留到下轮(下面统一告警)
         seen.add((store, sku))
         out.append({"store": store, "sku": sku, "kind": "delete",
-                    "old": "在线", "new": "删除", "reason": reason,
-                    "label": f"删除({reason})", **(extra or {})})
+                    "old": "在线", "new": "删除",
+                    "code": code, "reason": why or code,
+                    "label": f"删除({code})", **(extra or {})})
 
     with conn.cursor() as cur:
         cur.execute(_SQL_VARIANT_OFFSET, {"min_batches": int(min_batches)})
         for store, sku, batches, first_seen, last_seen in cur.fetchall():
             _take(store, sku, "variant_offset",
+                  "采集永久偏移(拿不到新数据)",
                   {"batches": batches, "first_seen": first_seen,
                    "last_seen": last_seen})
 
@@ -600,7 +610,7 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         slow = r["slow"]
         title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
         if str(title or "").strip() in TITLE_PLACEHOLDERS and title:
-            _take(store, sku, "商品不存在")
+            _take(store, sku, "商品不存在", "亚马逊标题是占位符,页面已不存在")
             continue
         # 所有者定稿 2026-08-16 新增两条删除判据(judgement 在 classify):
         #   outcome == 'not_found'  → ASIN 已从亚马逊下架
@@ -610,13 +620,14 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
             title_similarity=order_audit.title_similarity(
                 r["product_name"], processed_title(slow)))
         if act == "delete":
-            _take(store, sku, code, {"why": why})
+            _take(store, sku, code, why)
 
     with conn.cursor() as cur:
         cur.execute(_SQL_LONG_OOS, {"days": int(oos_days)})
         rows = cur.fetchall()
     for store, sku, obs, first_seen, last_seen in rows:
         _take(store, sku, f"连续无货{oos_days}天",
+              f"{oos_days} 天窗口内 {obs} 次观测无一有货,货源已断",
               {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
     if not rows:
         # 采集历史不足窗口长度时这条恒空——说出来,免得被读成"没有长期缺货的"
@@ -629,6 +640,74 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     if over:
         logger.warning("删除超单店上限,本轮留下:%s", over)
     return _cap(out, "delete")
+
+
+def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
+    """输入:连接 + stockzero 名单(+无货天数)→ 输出:本轮全部维护意图。
+
+    ⚠ **住在 services 而不是 workflow 里**:2026-08-16 拆成
+    maintenance_scan(建议)+ maintenance(执行)之后,只有扫描件调它;但铁律
+    禁止 workflow 互相 import,而 dry-run 口径必须与真跑一致 —— 收在这里,
+    两边看到的是同一份意图。
+
+    stockzero 店整店排除在三个自动 provider 之外 —— 它们归 zero_intents,
+    否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
+    """
+    mults = store_limits.price_multipliers()
+    deletes = delete_intents(conn, stockzero, store_limits.retire_caps(),
+                             oos_days=oos_days or LONG_OOS_DAYS)
+    doomed = {(d["store"], d["sku"]) for d in deletes}
+    intents = list(deletes)
+    for it in (title_intents(conn, stockzero)
+               + price_intents(conn, mults, stockzero)
+               + inventory_intents(conn, stockzero)
+               # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
+               # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责
+               + match_inventory_intents(conn, stockzero)
+               + zero_intents(conn, stockzero)):
+        # 将被删除的行不再改价/改库存/改标题:它们的 amz 数据本来就是陈旧的
+        # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上
+        if (it["store"], it["sku"]) not in doomed:
+            intents.append(it)
+    # 近期已提交过同一件事的压掉:提交成功后本地快照要等 catalog_sync 才更新,
+    # 不压就会一轮轮重发同样的载荷(生产实证 208 条 stale update)
+    intents, _n = drop_recent(conn, intents)
+    return intents
+
+
+# ── 意图 ⇄ 建议行(ops.dispositions)的互转 ────────────────────────────────────
+# maintenance_scan 用 to_disposition() 落建议,maintenance 用 from_disposition()
+# 还原成意图。**两个方向必须写在一起**:分散在两个 workflow 里,加一个键时
+# 只改了写侧,读侧就静默丢那个键 —— 最典型的是 title 的 product_type/product_id,
+# 丢了之后 build_title_item 组出 None,feed 被沃尔玛整批退回。
+#
+# 列位对应(建议行 → 飞书维护记录):
+#   action   = kind      → 「建议」列(执行件另写「动作」列)
+#   category = code      → 「原因」列的分组依据
+#   reason   = 人读原因   → 「原因」列正文
+#   detail   = 其余全部   → 旧值/新值/标题载荷/删除证据
+_DETAIL_KEYS = ("old", "new", "label", "product_type", "product_id",
+                "batches", "first_seen", "last_seen", "obs")
+
+
+def to_disposition(it: dict) -> dict:
+    """输入:维护意图 → 输出:ops.dispositions 建议行(services.dispositions 收)。"""
+    return {
+        "store": it["store"], "sku": it["sku"], "source": "maint",
+        "action": it["kind"], "category": it.get("code") or "",
+        "reason": it.get("reason") or "",
+        "detail": {k: it[k] for k in _DETAIL_KEYS if k in it},
+    }
+
+
+def from_disposition(row: dict) -> dict:
+    """输入:ops.dispositions 建议行 → 输出:维护意图(带 disposition_id)。"""
+    detail = row.get("detail") or {}
+    it = {"disposition_id": row["id"], "store": row["store"], "sku": row["sku"],
+          "kind": row["action"], "code": row.get("category") or "",
+          "reason": row.get("reason") or ""}
+    it.update({k: detail[k] for k in _DETAIL_KEYS if k in detail})
+    return it
 
 
 def build_title_item(sku: str, product_type: str, product_id: str,

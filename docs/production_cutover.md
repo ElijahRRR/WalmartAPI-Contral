@@ -59,7 +59,7 @@
 两侧共用 `over_lead_cap`/`cap_for`,有用例钉住 —— 各写各的迟早飘成
 "上架按 8 天拦、维护按 12 天清零"这种自相矛盾。
 
-## 五、在线商品处置判据(判据已落地,provider 接线待做)
+## 五、在线商品处置判据(已落地)
 
 所有者给的伪代码,逐条落在 `services.maintenance_intents.classify()` ——
 **全项目唯一一处**决定"这个在线商品该拿它怎么办"。
@@ -103,48 +103,65 @@
 `resync_from_ledger` 里写死的 `cells[5]` 更隐蔽 —— 取错列会让每轮把全部行
 当"表里没有"重复补写。`workflows/maintenance._record()` 是唯一造行处。
 
-「建议」与「动作」当前**恒等**(maintenance 还没拆)。拆完之后两者分歧才是
-那一列的价值:
+拆分之后(批次四)两列分歧才是那一列的价值:
 
-| 建议 | 动作 | 含义 |
+| 建议 | 动作 | 结果 | 含义 |
+|---|---|---|---|
+| 删除(not_found) | 删除 | 处理中 | 正常执行 |
+| 删除(not_found) | 跳过 | 在途防重 | 上一轮的 feed 还在途 |
+| 删除(not_found) | *(空)* | 未执行(凭证缺失/凭证失效/提交异常) | 领到了没做成 |
+
+⚠ 「领到了没做成」的行**必须也写表**:不写的话它在飞书完全不可见,看起来
+像"扫描件没建议它",而它其实每天都在建议、每天都没做成。
+
+「撤销」不进表:它是 `maintenance_scan` 发现商品自己恢复正常后把建议行置
+withdrawn,那一轮执行件根本没领到它 —— 要看撤销走
+`SELECT * FROM ops.dispositions WHERE status='withdrawn'`。
+
+## 六·二、维护链拆分(批次四,已落地)
+
+```
+maintenance_scan  (DANGEROUS=False,只读,产建议行)
+      ↓ ops.dispositions(source='maint')
+maintenance       (DANGEROUS=True,纯执行件,只消费建议行)
+```
+
+搬家清单(拆分不是复制,原来住在 workflow 里的东西按层归位):
+
+| 原位置 | 新位置 | 为什么 |
 |---|---|---|
-| 删除 | 删除 | 正常执行 |
-| 删除 | *(空)* | 建议了还没执行(配额满 / 没跑执行件) |
-| 删除 | 跳过 | 在途防重命中 |
-| 删除 | 撤销 | 商品自己恢复正常,建议作废 |
+| `maintenance.collect_intents` | `services.maintenance_intents.collect_all` | 铁律 1:workflow 不许互相 import,而两侧口径必须是同一份代码 |
+| `maintenance._load_stockzero` | `services.store_limits.stockzero_stores` | 同上;那张限额表已经有一个消费方模块了 |
+| `maintenance._load_multipliers` | `services.store_limits.price_multipliers` | 同上 |
+| `maintenance._load_delete_caps` | `services.store_limits.retire_caps` | 同上 |
+| 破坏面明细(删除名单/清零原因/改价分布) | `maintenance_scan._preview_lines` | 决策在哪边,"为什么是这些商品"就该在哪边说 |
+
+**两条链共用一张 `ops.dispositions`**,交界处三条纪律(写在
+`services/dispositions.py` 头注,有用例钉着):
+
+1. `claim(sources=…)` **必须传**。不传就领到对方的建议行 ——
+   维护链的 `price` 落进 `problem_product_cleanup.group_by_store` 会直接抛。
+2. 部分唯一索引 `(store, sku, action)` **跨来源**。同一 (店铺,SKU) 被两条链
+   同时建议 `delete` 时合成一条,source 保留先落库那一方,于是只有那条链的
+   执行件去删它。结果仍是"删一次",可接受;但 reason/category 会被后写的
+   一方覆盖,查"当初为什么删"要两条链的日志一起看。
+3. `withdraw_stale` / `count_open` 各撤各的、各数各的。
+
+⚠ **超期放行(`expire_executing`,3 天)不是洁癖,是防死锁。** 部分唯一索引
+只允许同 (店铺,SKU,动作) 有一条未落定行 —— executing 行永远不落定 =
+那个 SKU 的那类维护**永久停摆且完全静默**(扫描件照常算出意图,upsert 撞索引
+写不进去,rowcount 0)。等不到观测的常见原因:商品下架了
+(`walmart_items` 缺席,JOIN 不上)、`catalog_sync` 连着几轮没扫到那家店。
+
+维护三类的"生效"没有对应的核验事件(`catalog_sync` 只是把新值扫回
+`catalog.walmart_items`,没人为"改价生效了"记一条事件),所以
+`settle_maintenance()` 的判据就是最朴素那条:**重新观测之后线上的值是不是
+我们要的值**。比对写在 Python 里不写进 SQL —— `(detail->>'new')::numeric`
+遇到一条脏 detail 会炸掉**整条 UPDATE**(不是跳过那一行,是整轮落定失败)。
 
 ## 七、待做清单(按依赖顺序)
 
-### 1. provider 接 `classify()`(三·下)
-
-`inventory_intents` / `title_intents` / `delete_intents` 三个 provider 改成问
-`classify()`,`title_intents` 加 70% 闸(低于阈值的交给删除,不再改标题)。
-判据已就位,只是接线。
-
-⚠ 接线时注意 `_SQL_AMZ_JOIN` 已补 `outcome/stock_status/stock_state` 三列,
-`_rows()` 的解包元组长度随之变了 —— 所有解包处都要同步(现有 provider 用的是
-位置解包,漏改一处会静默取错字段)。
-
-### 2. maintenance 拆成 scan + 执行件(批次四)
-
-照 `problem_scan` / `problem_product_cleanup` 的形态,走 `ops.dispositions` 串联:
-
-```
-maintenance_scan  (只读,产建议行,DANGEROUS=False)
-      ↓ ops.dispositions
-maintenance       (纯执行件,只消费建议行)
-```
-
-现成可抄的:`services/dispositions.py` 的
-`suggest_many / withdraw_stale / claim / mark_executing / settle` 全套状态机
-(`suggested → executing → confirmed/ineffective/withdrawn`,部分唯一索引只约束
-未落定态)。批次 E 拆 `problem_product_cleanup` 时踩过的四个坑照单全收:
-同一 SKU 出两个冲突动作 / 建议无撤销机制 / 单店扫描清空全库建议 / 摘要报数
-与执行件对不上。
-
-⚠ 铁律:workflow 之间不许互相 import。串联走调度,不走代码。
-
-### 3. 订单链跑完自动推飞书
+### 1. 订单链跑完自动推飞书
 
 所有者要求:拉单/审核(每小时)、售后/绩效(每日)、对账(双周三)每个跑完
 自动同步飞书,不要人手动推。
@@ -152,24 +169,25 @@ maintenance       (纯执行件,只消费建议行)
 ⚠ 不能让 `order_sync` import `order_center_push`(铁律:任何层不准 import
 workflows)。**走调度串联**,在 plist 里把两条命令串起来。
 
-### 4. 上架先同步 UPC
+### 2. 上架先同步 UPC
 
 `list_new` 运行时先自动同步一次 UPC。同样不能 import workflow ——
 要把 `upc_sync` 的核心抽到 services 层给 `list_new` 调。
 上架**不进定时调度**,手动运行。
 
-### 5. feed 闭环审计(所有者要的验证)
+### 3. feed 闭环审计(所有者要的验证)
 
 所有者担心的不是飞书侧(他确认表格侧完整),是**库侧**:「是否有写入数据库,
 产品事件是否完善且闭环」。要做的是把每个提交 feed 的动作、它落的
 `ops.feed_log` / `ops.feed_items` / `catalog.product_events` 行、以及
 `feed_poll` 五个反哺器的覆盖面对一遍,缺口列出来。这是审计任务,不用连库。
 
-### 6. launchd plist 全套 + 停旧清单
+### 4. launchd plist 全套 + 停旧清单
 
 调度顺序的**硬约束**(文档里明写、颠倒会静默出错):
 
-1. `catalog_sync → product_refresh → product_ingest → maintenance/list_new`
+1. `catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance`
+   (`list_new` 同样排在 `product_ingest` 之后,但它不进调度)
 2. `catalog_sync → problem_scan → problem_product_cleanup`
 3. `order_sync` 必须在 `daily_report -p phase=kpi` 之前(否则订单列对拍必差)
 

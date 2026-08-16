@@ -140,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
     # 空转而且报成功,比误跑更难发现。空跑改为显式 --dry-run。
     # 非危险工作流本来就恒真,不受 --dry-run 影响(它们没有写接口可关)。
     params["execute"] = (not args.dry_run) if dangerous else True
+    # ⚠ dry_run 单独透传:扫描类工作流 DANGEROUS=False(不碰沃尔玛写接口),
+    # 但它们**会写建议表**。按"AI 改完代码先 dry-run"的纪律,人会对着扫描件
+    # 敲 --dry-run —— 只看 execute 的话那个开关对它们完全无效,而且不报错。
+    params.setdefault("dry_run", bool(args.dry_run))
     if dangerous and args.dry_run:
         print(f"🧪 [DRY-RUN] {args.workflow} 本次只打印将做什么,不碰写接口")
 

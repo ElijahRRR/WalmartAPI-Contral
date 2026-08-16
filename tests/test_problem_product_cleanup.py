@@ -27,7 +27,8 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
             {"confirmed": 0, "ineffective": 0}}
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([None])))
-    monkeypatch.setattr(ppc.dispositions, "claim", lambda conn: list(rows))
+    monkeypatch.setattr(ppc.dispositions, "claim",
+                        lambda conn, sources=None: list(rows))
     monkeypatch.setattr(ppc.dispositions, "settle",
                         lambda conn: seen["settled"])
     monkeypatch.setattr(ppc.dispositions, "mark_executing",

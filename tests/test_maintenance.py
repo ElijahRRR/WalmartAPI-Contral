@@ -6,7 +6,8 @@ from datetime import date as _date
 from api import feeds, feishu, inventory as inv_api, prices
 from registry import resources
 from registry.resources import Spreadsheet
-from services import feed_track, maint_sheet, maintenance_intents as mi
+from services import feed_track, maint_sheet, \
+    maintenance_intents as mi, store_limits
 from workflows import maintenance as mw
 
 STORE = {"name": "T1", "client_id": "c", "client_secret": "s", "proxy": None}
@@ -59,9 +60,9 @@ class _Conn:
 def test_zero_intents_only_positive_known_qty():
     conn = _Conn(rows=[("T1", "S1", 5), ("T1", "S2", 12)])
     out = mi.zero_intents(conn, ["T1"])
-    assert out == [
-        {"store": "T1", "sku": "S1", "kind": "inventory", "old": 5, "new": 0},
-        {"store": "T1", "sku": "S2", "kind": "inventory", "old": 12, "new": 0}]
+    assert [(i["sku"], i["kind"], i["old"], i["new"], i["code"]) for i in out] == [
+        ("S1", "inventory", 5, 0, "stockzero"),
+        ("S2", "inventory", 12, 0, "stockzero")]
     # 显式条件:未知库存不动(旧系统 None != 0 盲清是坑)
     assert "avail_qty > 0" in mi._SQL_ZERO
     assert mi.zero_intents(conn, []) == []          # 无 stockzero 店零查询
@@ -193,10 +194,12 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
     conn = _Conn(rows=[("T1", "B0A", 1, None, None),
                        ("T1", "B0B", 2, None, None)])
     out = mi.delete_intents(conn)
-    assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"], i["reason"])
+    # code = 机器码(分组用),reason = 人读文案 —— 2026-08-16 起分开两列
+    assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"], i["code"])
             for i in out] == [
         ("T1", "B0A", "delete", "在线", "删除", "variant_offset"),
         ("T1", "B0B", "delete", "在线", "删除", "variant_offset")]
+    assert all(i["reason"] and i["reason"] != i["code"] for i in out)
 
     # 单店上限取限额表「下架限制」;不在表内退 DELETE_PER_STORE(所有者问来源)
     rows3 = [("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
@@ -215,7 +218,7 @@ def test_delete_intents_also_take_title_placeholder(monkeypatch):
     ])
     # B0DUP 同时是偏移件:两个原因命中只删一次
     out = mi.delete_intents(_Conn(rows=[("T1", "B0DUP", 1, None, None)]))
-    got = {i["sku"]: i["reason"] for i in out}
+    got = {i["sku"]: i["code"] for i in out}
     assert got == {"B0DUP": "variant_offset", "B0GONE": "商品不存在"}
     assert [i["label"] for i in out if i["sku"] == "B0GONE"] == ["删除(商品不存在)"]
 
@@ -249,8 +252,10 @@ def test_long_oos_intents_carry_reason(monkeypatch):
                 ("T1", "B0DEAD", 15, None, None)]
 
     out = mi.delete_intents(_TwoQueries(), oos_days=15)
-    assert [(i["sku"], i["reason"], i["label"]) for i in out] == [
+    assert [(i["sku"], i["code"], i["label"]) for i in out] == [
         ("B0DEAD", "连续无货15天", "删除(连续无货15天)")]
+    # 「原因」列要读得出"低到什么程度",机器码读不出来
+    assert out[0]["reason"] == "15 天窗口内 15 次观测无一有货,货源已断"
 
 
 def test_drop_recent_suppresses_same_intent_within_window(monkeypatch):
@@ -289,25 +294,180 @@ def test_build_title_item_shape():
     assert "MPProduct" not in item                  # 顶级并列,不是 MPProduct
 
 
-def test_load_stockzero_survives_integer_zero(monkeypatch):
-    # 旧系统 str(0 or "") 的 0-falsy 陷阱:整数 0 必须仍识别为 stockzero
+def test_stockzero_survives_integer_zero(monkeypatch):
+    """限额表读取搬到 services/store_limits 之后,0-falsy 陷阱的用例跟着搬。"""
     monkeypatch.setattr(feishu, "list_records", lambda t, field_names=None: [
         {"fields": {"店铺": "T1", "库存特殊要求": 0}},
         {"fields": {"店铺": "T2", "库存特殊要求": "0"}},
         {"fields": {"店铺": "T3", "库存特殊要求": ""}},
         {"fields": {"店铺": "T4", "库存特殊要求": "5"}},
     ])
-    assert mw._load_stockzero() == ["T1", "T2"]
+    assert store_limits.stockzero_stores() == ["T1", "T2"]
 
 
-# ── workflow 层 ───────────────────────────────────────────────────────────────
+def test_collect_all_lives_in_services_not_in_a_workflow():
+    """扫描件与执行件不许互相 import(铁律 1),取意图这段必须住在 services。
+
+    dry-run 口径与真跑口径必须是同一份代码 —— 各写一份迟早飘。
+    """
+    import inspect
+
+    from workflows import maintenance_scan as ms
+    assert "def collect_all(" in inspect.getsource(mi)
+    src = inspect.getsource(ms) + inspect.getsource(mw)
+    assert "import workflows" not in src and "from workflows" not in src
+
+
+def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
+    """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
+    conn = _Conn()
+    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps, oos_days=0: [
+        {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
+         "new": "删除", "code": "variant_offset"}])
+    monkeypatch.setattr(mi.store_limits, "retire_caps", lambda: {})
+    monkeypatch.setattr(mi.store_limits, "price_multipliers", lambda: {})
+    monkeypatch.setattr(mi, "title_intents", lambda c, sz: [])
+    monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
+        {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
+        {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
+    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz: [
+        {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 5, "new": 0}])
+    monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
+    monkeypatch.setattr(mi, "match_inventory_intents", lambda c, sz: [])
+    monkeypatch.setattr(mi, "drop_recent", lambda c, i: (i, 0))
+    out = mi.collect_all(conn, [])
+    assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
+                                                    ("B0B", "price")]
+
+
+def test_intent_disposition_roundtrip_keeps_the_title_payload():
+    """⚠ 标题载荷(productType/UPC)必须走完 to→from 一圈还在。
+
+    丢了它 build_title_item 会组出 None,整批 MP_MAINTENANCE 被沃尔玛退回,
+    而两侧都不报错 —— 所以互转写在同一个模块里,并由本用例钉住。
+    """
+    it = {"store": "T1", "sku": "B0A", "kind": "title", "old": "旧", "new": "新",
+          "product_type": "Furniture", "product_id": "012345678905",
+          "code": "title_sync", "reason": "相似度 80%,同步亚马逊标题"}
+    row = mi.to_disposition(it)
+    assert row["source"] == "maint" and row["action"] == "title"
+    assert row["category"] == "title_sync"       # 建议行 category = 原因码
+    back = mi.from_disposition({"id": 7, **row})
+    assert back["disposition_id"] == 7
+    for k in ("store", "sku", "kind", "old", "new", "product_type",
+              "product_id", "code", "reason"):
+        assert back[k] == it[k], k
+
+
+def test_delete_detail_datetimes_survive_json():
+    """删除建议带 first_seen/last_seen(datetime)。不给 json default 会整轮抛。"""
+    import json
+    from datetime import datetime as _dt
+
+    row = mi.to_disposition({
+        "store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
+        "new": "删除", "code": "variant_offset", "reason": "采集永久偏移",
+        "batches": 2, "first_seen": _dt(2026, 8, 1), "last_seen": _dt(2026, 8, 9)})
+    assert json.dumps(row["detail"], default=str)     # 不抛即可
+    import inspect
+
+    from services import dispositions as ds
+    assert "default=str" in inspect.getsource(ds.suggest_many)
+
+
+# ── 扫描件(maintenance_scan)────────────────────────────────────────────────
+
+def _scan_wire(monkeypatch, intents, sz=("T1",)):
+    from workflows import maintenance_scan as ms
+    calls = {"suggest": [], "withdraw": []}
+    monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
+    monkeypatch.setattr(ms.mi, "collect_all",
+                        lambda conn, s, oos=0: list(intents))
+    _fake_db(monkeypatch, _Conn())
+    monkeypatch.setattr(ms.dispositions, "suggest_many",
+                        lambda conn, rows: (calls["suggest"].extend(rows),
+                                            len(rows))[1])
+    monkeypatch.setattr(ms.dispositions, "withdraw_stale",
+                        lambda conn, src, keep, why, store=None: (
+                            calls["withdraw"].append((src, keep, store)), 0)[1])
+    monkeypatch.setattr(ms.dispositions, "count_open",
+                        lambda conn, sources=None: len(calls["suggest"]))
+    return ms, calls
+
+
+def test_scan_lists_delete_names_separately(monkeypatch):
+    """删除不可逆:名单必须看得见,且与其余三类分开说(拆分后归扫描件)。"""
+    intents = ([{"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
+                 "new": "删除", "code": "variant_offset"}]
+               + [{"store": "T1", "sku": f"S{i}", "kind": "inventory",
+                   "old": i + 1, "new": 0, "code": "out_of_stock"}
+                  for i in range(2)])
+    ms, calls = _scan_wire(monkeypatch, intents)
+    out = ms.run({})
+    assert "删除 1" in out and "建议永久删除 1 行" in out and "B0A" in out
+    # 清零四条判据在表里长得一样,摘要必须按原因码摊开
+    assert "清零合计 2 条,原因:out_of_stock×2" in out
+    assert [r["action"] for r in calls["suggest"]] == ["delete", "inventory",
+                                                       "inventory"]
+
+
+def test_scan_writes_no_feed_and_is_not_dangerous(monkeypatch):
+    ms, calls = _scan_wire(monkeypatch, [])
+    assert ms.DANGEROUS is False
+    submitted = []
+    monkeypatch.setattr(feeds, "submit_feed",
+                        lambda *a, **k: submitted.append(a) or [])
+    ms.run({})
+    assert submitted == []
+
+
+def test_scan_withdraw_is_scoped_to_the_store_it_scanned(monkeypatch):
+    """⚠ 批次 E 的坑:单店扫描不限范围会清空其余全部店铺的待执行建议。"""
+    intents = [{"store": "T1", "sku": "A", "kind": "inventory", "old": 1,
+                "new": 0, "code": "out_of_stock"},
+               {"store": "T2", "sku": "B", "kind": "inventory", "old": 1,
+                "new": 0, "code": "out_of_stock"}]
+    ms, calls = _scan_wire(monkeypatch, intents)
+    ms.run({"store": "T1"})
+    src, keep, store = calls["withdraw"][0]
+    assert src == "maint" and store == "T1"
+    assert keep == [("T1", "A", "inventory")]       # 只保留本店本轮的
+    assert [r["store"] for r in calls["suggest"]] == ["T1"]
+
+
+def test_scan_preview_writes_nothing(monkeypatch):
+    ms, calls = _scan_wire(monkeypatch, [
+        {"store": "T1", "sku": "A", "kind": "price", "old": 9.9, "new": 11.0}])
+    out = ms.run({"preview": "1"})
+    assert calls["suggest"] == [] and calls["withdraw"] == []
+    assert "preview" in out and "将写 1 条" in out
+
+
+# ── 执行件(maintenance)────────────────────────────────────────────────────
+
+def _disp(it, i):
+    """意图 → claim() 会返回的建议行形态(带 id)。"""
+    return {"id": 100 + i, **mi.to_disposition(it)}
+
 
 def _wire(monkeypatch, intents, stores=(STORE,)):
-    calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": []}
-    monkeypatch.setattr(mw, "_load_stockzero", lambda: ["T1"])
-    monkeypatch.setattr(mw, "collect_intents",
-                        lambda conn, sz, oos=0: list(intents))
+    calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
+             "marked": [], "settled": 0}
     _fake_db(monkeypatch, _Conn())
+    monkeypatch.setattr(mw.dispositions, "claim",
+                        lambda conn, sources=None: [_disp(it, i)
+                                                    for i, it in enumerate(intents)])
+    monkeypatch.setattr(mw.dispositions, "settle",
+                        lambda conn: (calls.__setitem__("settled",
+                                                        calls["settled"] + 1),
+                                      {"confirmed": 0, "ineffective": 0})[1])
+    monkeypatch.setattr(mw.dispositions, "settle_maintenance",
+                        lambda conn: {"confirmed": 0, "ineffective": 0})
+    monkeypatch.setattr(mw.dispositions, "expire_executing", lambda conn: 0)
+    monkeypatch.setattr(mw.dispositions, "mark_executing",
+                        lambda conn, ids, fid: calls["marked"].append(
+                            (list(ids), fid)))
+    monkeypatch.setattr(mi, "record_submitted", lambda conn, items: len(items))
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
     monkeypatch.setattr(inv_api, "put_inventory",
@@ -326,18 +486,32 @@ def _wire(monkeypatch, intents, stores=(STORE,)):
     monkeypatch.setattr(maint_sheet, "append_records",
                         lambda rows: (calls["sheet"].extend(rows),
                                       len(rows))[1])
+    monkeypatch.setattr(maint_sheet, "prune", lambda *a: "裁剪:0")
     return calls
 
 
 def _zero(n):
     return [{"store": "T1", "sku": f"S{i}", "kind": "inventory",
-             "old": i + 1, "new": 0} for i in range(n)]
+             "old": i + 1, "new": 0, "code": "out_of_stock",
+             "reason": "亚马逊缺货"} for i in range(n)]
+
+
+def test_executor_makes_no_decisions():
+    """执行件不许再自己算意图 —— 决策全在 maintenance_scan。"""
+    import inspect
+
+    # 只看代码,不看头注 —— 头注要指路"判据在 classify()",那不是决策代码
+    src = inspect.getsource(mw).split('"""', 2)[-1]
+    for gone in ("collect_intents", "_load_stockzero", "_load_multipliers",
+                 "_load_delete_caps", "_intents(", "classify("):
+        assert gone not in src, f"执行件里还留着决策代码:{gone}"
 
 
 def test_dry_run_shows_route_and_submits_nothing(monkeypatch):
     calls = _wire(monkeypatch, _zero(3))
     out = mw.run({"execute": False})
     assert calls["put_inv"] == [] and calls["feeds"] == [] and calls["sheet"] == []
+    assert calls["settled"] == 0                # dry-run 不落定
     assert "DRY-RUN" in out and "库存 3" in out and "路由 PUT" in out
     assert "'1→0'" in out                       # 逐 SKU 旧值→新值样本
 
@@ -349,7 +523,9 @@ def test_small_batch_routes_to_put_and_records_sync(monkeypatch):
     assert calls["feeds"] == []
     assert calls["sheet"][0][_c("feed_id")] == "sync"
     assert calls["sheet"][0][_c("result")] == "成功"
+    assert calls["sheet"][0][_c("reason")] == "亚马逊缺货"
     assert "同步 PUT 2,成功 2" in out
+    assert calls["marked"] == [([100], "sync"), ([101], "sync")]
 
 
 def test_large_batch_routes_to_feed(monkeypatch):
@@ -359,6 +535,7 @@ def test_large_batch_routes_to_feed(monkeypatch):
     assert calls["feeds"] == [("T1", "inventory", 11)]
     assert all(r[_c("feed_id")] == "F_inventory" and r[_c("result")] == "处理中"
                for r in calls["sheet"])
+    assert calls["marked"] == [(list(range(100, 111)), "F_inventory")]
 
 
 def test_title_always_feed_and_store_isolation(monkeypatch):
@@ -378,14 +555,18 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
     out = mw.run({"execute": True})
     assert "⚠ T1:提交异常已跳过" in out          # 标题 feed 炸了只跳过 T1
     assert calls["put_inv"] == [("T2", "B", 0)]   # T2 照常(1 条走 PUT)
+    # 炸掉那条也要留痕:动作空、结果写明为什么(否则表里完全看不见)
+    t1 = [r for r in calls["sheet"] if r[0] == "T1"]
+    assert len(t1) == 1 and t1[0][_c("action")] == ""
+    assert t1[0][_c("result")] == "未执行(提交异常)"
 
 
 def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
     """删除走 DELETE_ITEM;只有 submitted 落病历(dedup 记了是幽灵事件)。"""
     intents = [{"store": "T1", "sku": s, "kind": "delete", "old": "在线",
-                "new": "删除", "reason": "variant_offset",
-                "label": "删除(variant_offset)", "batches": 1,
-                "first_seen": None, "last_seen": None}
+                "new": "删除", "code": "variant_offset",
+                "reason": "采集永久偏移(拿不到新数据)",
+                "label": "删除(variant_offset)", "batches": 1}
                for s in ("B0A", "B0B", "B0C")]
     calls = _wire(monkeypatch, intents)
     events = []
@@ -401,38 +582,40 @@ def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
     assert "删除 feed 提交 2" in out
     # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
     assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
-    assert all(r[_c("action")] == "删除(variant_offset)"
-               and r[_c("result")] == "处理中"
+    # 建议列恒是 scan 定的;动作列前两条是"删除",第三条在途防重是"跳过"
+    assert all(r[_c("suggestion")] == "删除(variant_offset)"
+               for r in calls["sheet"])
+    # 动作列只说做了什么(删除/跳过),原因码归「建议」与「原因」两列
+    assert [r[_c("action")] for r in calls["sheet"]] == ["删除", "删除", "跳过"]
+    assert calls["sheet"][2][_c("result")] == "在途防重"
+    # 只有 submitted 才转 executing:dedup 什么都没提交
+    assert calls["marked"] == [([100, 101], "F1")]
+
+
+def test_unexecuted_suggestions_still_get_a_row(monkeypatch):
+    """凭证缺失的店:建议照样写表,动作留空 —— 否则这些行在飞书完全不可见。"""
+    calls = _wire(monkeypatch, _zero(2), stores=())
+    out = mw.run({"execute": True})
+    assert "凭证缺失" in out
+    assert len(calls["sheet"]) == 2
+    assert all(r[_c("action")] == "" and r[_c("result")] == "未执行(凭证缺失)"
                for r in calls["sheet"])
 
 
-def test_dry_run_lists_delete_names_separately(monkeypatch):
-    """删除不可逆:名单必须看得见,且与其余三类分开说。"""
-    intents = ([{"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
-                 "new": "删除", "batches": 1}] + _zero(2))
-    _wire(monkeypatch, intents)
-    out = mw.run({"execute": False})
-    assert "删除 1" in out and "永久删除 1 行" in out and "B0A" in out
+def test_no_suggestions_points_at_the_scanner(monkeypatch):
+    _wire(monkeypatch, [])
+    out = mw.run({"execute": True})
+    assert "maintenance_scan" in out and "顺序是硬约束" in out
 
 
-def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
-    """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
-    conn = _Conn()
-    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps, oos_days=0: [
-        {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
-         "new": "删除", "reason": "variant_offset"}])
-    monkeypatch.setattr(mw, "_load_delete_caps", lambda: {})
-    monkeypatch.setattr(mi, "title_intents", lambda c, sz: [])
-    monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
-        {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
-        {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
-    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz: [
-        {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 5, "new": 0}])
-    monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
-    monkeypatch.setattr(mw, "_load_multipliers", lambda: {})
-    out = mw.collect_intents(conn, [])
-    assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
-                                                    ("B0B", "price")]
+def test_settle_runs_before_claim_and_only_when_executing(monkeypatch):
+    calls = _wire(monkeypatch, _zero(1))
+    mw.run({"execute": True})
+    assert calls["settled"] == 1
+    calls2 = _wire(monkeypatch, _zero(1))
+    mw.run({"execute": False})
+    assert calls2["settled"] == 0
+
 
 
 def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
@@ -636,9 +819,91 @@ def test_row_builder_is_the_only_place_that_shapes_a_row():
     assert "def _record(" in src
     # 各分支一律走 _record(),不再出现 records.append((name, ...
     assert "records.append((name," not in src
-    row = wf._record("T1", {"sku": "S1", "old": 5, "new": 0,
-                            "reason": "Currently unavailable"},
+    row = wf._record("T1", {"sku": "S1", "kind": "inventory", "old": 5,
+                            "new": 0, "reason": "Currently unavailable"},
                      "库存", "F1", "2026-08-16", "处理中", "")
     assert len(row) == len(resources.MAINT_SHEET.columns)
     assert row[_c("suggestion")] == "库存" and row[_c("action")] == "库存"
     assert row[_c("reason")] == "Currently unavailable"
+    # 「建议」来自 scan(label 优先),「动作」是执行件真做了什么 —— 两者可分歧
+    skipped = wf._record("T1", {"sku": "S1", "kind": "delete",
+                                "label": "删除(not_found)"},
+                         "跳过", "OLD", "2026-08-16", "在途防重", "")
+    assert skipped[_c("suggestion")] == "删除(not_found)"
+    assert skipped[_c("action")] == "跳过"
+
+
+# ── 建议行落定(维护链专属)──────────────────────────────────────────────────
+
+class _SettleConn(_Conn):
+    """settle_maintenance 的假连接:第一条 SQL 取待判行,后面两条是 UPDATE。"""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.updates = []
+
+    def execute(self, sql, args=None):
+        super().execute(sql, args)
+        if "UPDATE ops.dispositions" in sql:
+            self.updates.append((args["status"], sorted(args["ids"])))
+
+
+def test_settle_maintenance_splits_by_whether_the_value_actually_changed():
+    """维护三类没有核验事件,判据就是"重新观测后线上值是不是我们要的值"。"""
+    from services import dispositions as ds
+
+    conn = _SettleConn([
+        (1, "price", {"new": 30.0}, 30.0, None, None),       # 改过来了
+        (2, "price", {"new": 30.0}, 20.0, None, None),       # 线上还是旧价
+        (3, "inventory", {"new": 0}, None, 0, None),         # 清零到位
+        (4, "inventory", {"new": 0}, None, 10, None),        # 库存没动
+        (5, "title", {"new": "新标题"}, None, None, "新标题"),
+        (6, "title", {"new": "新标题"}, None, None, "旧标题"),
+    ])
+    assert ds.settle_maintenance(conn) == {"confirmed": 3, "ineffective": 3}
+    assert conn.updates == [("confirmed", [1, 3, 5]), ("ineffective", [2, 4, 6])]
+    # 只判**已被 catalog_sync 重新观测过**的行 —— 拿提交前的旧快照判,
+    # 会把每一条都判成"没生效"
+    assert "w.last_seen_at > d.executed_at" in ds._MAINT_OPEN_SQL
+    assert "d.status = 'executing'" in ds._MAINT_OPEN_SQL
+
+
+def test_settle_maintenance_never_guesses_effective():
+    """⚠ 值转不动一律判未生效:判错成生效 = 这条建议销案、商品永远停在错的值上。"""
+    from services import dispositions as ds
+
+    assert ds.maint_effective("price", 30.0, None, None, None) is False
+    assert ds.maint_effective("inventory", 0, None, None, None) is False
+    assert ds.maint_effective("title", "新", None, None, None) is False
+    assert ds.maint_effective("title", "新", None, None, "新") is True
+    # 浮点回读:30.0 与 30.00 是同一个价
+    assert ds.maint_effective("price", 30.0, 30.00, None, None) is True
+
+
+def test_expire_executing_unblocks_the_partial_unique_index():
+    """executing 行永远不落定 = 那个 SKU 的那类维护永久停摆,而且完全静默。"""
+    from services import dispositions as ds
+
+    q = ds._EXPIRE_SQL
+    assert "status = 'executing'" in q
+    # 只放行本链动作:删除类有自己的 48h 宽限 + 观测判定,不该被时限抢先判掉
+    assert "action = ANY(%(actions)s::text[])" in q
+    assert "executed_at < now() - make_interval(days => %(days)s::int)" in q
+    assert ds.MAINT_ACTIONS == ("title", "price", "inventory")
+    assert "delete" not in ds.MAINT_ACTIONS
+
+
+def test_two_chains_claim_disjoint_sources():
+    """⚠ 两条链共用一张建议表:不限来源就会领到对方的建议行。"""
+    import inspect
+
+    from services import dispositions as ds
+    from workflows import problem_product_cleanup as ppc
+
+    assert set(ds.PROBLEM_SOURCES) & set(ds.MAINT_SOURCES) == set()
+    assert "dispositions.PROBLEM_SOURCES" in inspect.getsource(ppc.run)
+    assert "dispositions.MAINT_SOURCES" in inspect.getsource(mw.run)
+    # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)
+    import pytest
+    with pytest.raises(ValueError):
+        ppc.group_by_store([{"id": 1, "store": "T1", "sku": "S", "action": "price"}])

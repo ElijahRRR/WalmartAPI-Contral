@@ -218,17 +218,27 @@ def deal(groups: list, stores: dict, thickness: float = LAYER_THICKNESS,
     for s in live:
         rows = [a for a in assign if a["store"] == s]
         layer_items: Counter = Counter()
+        # 只有一家店能要的牌(定向流)**跳过了排队** —— 队首过不了归属闸就
+        # 顺延,一路顺延到占用店,不管它排第几。所以它不参与轮转,验收指标
+        # 也不该算它:那等于拿一个参数管不着的量去判"参数没调对"
+        # (2026-08-16 实测:4 家越界的店,分到的货几乎全是定向流)
+        free_items: Counter = Counter()
         for a in rows:
             # ⚠ 按**货位**累计,不是按组数。验收指标要拿它跟「配额占比」比,
             # 而配额的单位是货位 —— 数组数的话,拿到大组的店比值天然偏低、
             # 拿到小组的偏高,指标量的就成了"组的大小"而不是"分得公不公平"。
             # (生产实测 2026-08-16:同一批里 0.16 与 2.05 并存,全是这个原因)
             layer_items[a["layer"]] += int(a["group"]["size"])
+            if a["group"].get("store") is None:
+                free_items[a["layer"]] += int(a["group"]["size"])
         by_store[s] = {
             "groups": len(rows),
             "items": sum(int(a["group"]["size"]) for a in rows),
+            "bound_items": sum(int(a["group"]["size"]) for a in rows
+                               if a["group"].get("store") is not None),
             "quota": live[s]["quota"],
             "by_layer": layer_items,
+            "by_layer_free": free_items,
         }
     return {"assign": assign, "unplaced": unplaced, "by_store": by_store,
             "layers": layers_hist,
@@ -291,7 +301,8 @@ def _deal_tier(pool: list, here: dict, got: dict, assign: list,
     return left, hist
 
 
-def acceptance(result: dict, top_layers: int = 1) -> dict:
+def acceptance(result: dict, top_layers: int = 1,
+               rotation_only: bool = True) -> dict:
     """输入:`deal()` 产物 → 输出:§7.4b 的三个验收指标(逐店)。
 
     **必须进方案表,不是"希望如此"**:一家独大 = 参数错了,不是"模型判断"。
@@ -300,11 +311,16 @@ def acceptance(result: dict, top_layers: int = 1) -> dict:
     ⚠ 分子分母**必须同单位**(都是货位)。`by_layer` 数组数、`quota` 是货位的话,
     比值量的是"这家店拿到的组平均多大",跟公不公平没关系 —— 生产实测里
     0.16 与 2.05 并存,全是这一个原因。
+    ⚠ `rotation_only`(默认开):**只算参与了轮转的那部分**。绑定单店的牌
+    (定向流)跳过排队直奔占用店,参数管不着它 —— 算进去等于拿一个调不动的量
+    去判"参数没调对"(2026-08-16 实测:4 家"越界"的店,分到的货几乎全是定向流)。
+    要看含定向流的总体集中度,传 False。
     """
     by = result["by_store"]
+    key = "by_layer_free" if rotation_only else "by_layer"
     tot_q = sum(v["quota"] for v in by.values())
     tot_i = sum(v["items"] for v in by.values())
-    top = {s: sum(n for li, n in v["by_layer"].items() if li <= top_layers)
+    top = {s: sum(n for li, n in (v.get(key) or {}).items() if li <= top_layers)
            for s, v in by.items()}
     tot_top = sum(top.values())
     out = {}

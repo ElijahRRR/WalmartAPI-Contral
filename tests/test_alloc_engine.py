@@ -317,3 +317,23 @@ def test_gate_predicates_come_from_store_targets_not_reimplemented():
     src = inspect.getsource(ae._gate)
     assert "store_targets.allowed" in src and "store_targets.lead_ok" in src
     assert "not in cats" not in src and "<= float(cap)" not in src
+
+
+def test_acceptance_ignores_store_bound_groups_by_default():
+    """⚠ 绑定单店的牌(定向流)**跳过排队**,验收指标不该算它。
+
+    2026-08-16 实测:4 家"顶层越界"的店,分到的货几乎全是定向流 —— 它们不是
+    被偏心了,是手上的老品牌把自己的位置占满了。拿一个参数调不动的量去判
+    "参数没调对",只会让人去改根本不相干的旋钮。
+    """
+    # A 的配额全被绑定它的牌吃掉;B 靠自由流拿同样多
+    groups = ([_g(f"bound{i}", 100.0 - i, store="A") for i in range(10)]
+              + [_g(f"free{i}", 99.5 - i) for i in range(10)])
+    r = ae.deal(groups, {"A": _s(10), "B": _s(10)}, thickness=1.0)
+    assert r["by_store"]["A"]["bound_items"] == 10
+    rot = ae.acceptance(r)                       # 默认只算轮转
+    allx = ae.acceptance(r, rotation_only=False)
+    # 只算自由流:A 一件都没靠轮转拿到,B 拿满 —— 比值 0 vs 2
+    assert rot["A"]["top_ratio"] == 0.0 and rot["B"]["top_ratio"] == 2.0
+    # 含定向流:两家一样多,看不出 A 的位置是被强制路由填的
+    assert allx["A"]["top_ratio"] == allx["B"]["top_ratio"] == 1.0

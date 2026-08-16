@@ -37,13 +37,33 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# 参数值里混进了本该独立成词的开关。成因几乎总是**分隔符不是普通空格**
+# ——从聊天/网页复制命令时容易带上不换行空格(U+00A0)等,shell 不把它当
+# 分词符,于是 `-p k=v --execute` 整串进了 v。
+# ⚠ **只报错,绝不"帮你"把它解释成开关**:那等于让一个粘贴事故把 dry-run
+#    变成真跑。危险工作流的 --execute 必须是人显式敲进去的。
+_FLAGS = ("--execute", "-p", "--param", "-h", "--help")
+
+
 def _build_params(pairs: list[str]) -> dict:
     params = {}
     for item in pairs:
         if "=" not in item:
             raise SystemExit(f"参数格式错误(应为 key=value): {item}")
         k, _, v = item.partition("=")
-        params[k.strip()] = v.strip()
+        v = v.strip()
+        # split() 按任意空白切,包括 U+00A0 —— 正是要抓的那种
+        stuck = [w for w in v.split() if w in _FLAGS]
+        if stuck:
+            raise SystemExit(
+                f"参数值里粘进了开关 {' '.join(stuck)}:\n"
+                f"    -p {k.strip()}={v}\n"
+                f"  多半是路径与开关之间那个空格不是普通空格(从聊天/网页复制\n"
+                f"  常带不换行空格)。把该处空格重敲一遍,或给值加引号:\n"
+                f"    -p \"{k.strip()}={v.split()[0]}\" {' '.join(stuck)}\n"
+                f"  ⚠ 本命令**没有执行**——不会替你把它当成开关,免得一次粘贴\n"
+                f"    事故把 dry-run 变成真跑。")
+        params[k.strip()] = v
     return params
 
 

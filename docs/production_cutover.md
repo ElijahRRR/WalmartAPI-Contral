@@ -206,29 +206,9 @@ plist 模板与四个坑、分三批灰度、三件必须先做的代码活(prod
 3. `order_sync` → `daily_report`(否则订单列对拍必差)
 4. `product_ingest` → `maintenance_scan` / `list_new`(先摄取,判据才有新数据)
 
-时间表(所有者定稿的节奏;KPI 窗口锚在中国时间 06:30,故日报 ≥06:35)。
-**箭头即串联,一条 plist 一条命令** —— `python cli.py a b c`,不要写三个 plist,
-也不要在 plist 里拼 `&&`(launchd 的 ProgramArguments 不过 shell):
-
-| 时间 | `python cli.py` 之后跟什么 |
-|---|---|
-| 05:30 | `catalog_sync` |
-| 05:50 | `product_refresh` |
-| 06:10 | `product_ingest` |
-| 06:20 | `order_sync order_audit order_center_push` |
-| 06:40 | `daily_report`(默认全链) |
-| 07:10 | `perf_problems returns_sync` |
-| 08:00 | `problem_scan problem_product_cleanup` |
-| 12:00 | `maintenance_scan maintenance` |
-| 每小时 | `order_sync order_audit order_center_push` |
-| 每 30 分 | `feed_poll` |
-| 双周三 | `settlement_sync`(下一次 2026-08-26) |
-| 02:00 | `backup risk_sync blacklist_push` |
-| 手动 | `list_new`(不进调度;它自己会先同步一次 UPC) |
-
-⚠ 每小时那条与 06:20 那条**是同一条链**,别把 06:20 单列一个 plist ——
-两个 plist 撞在同一分钟会各拿各的锁,后到的整链退出码 3(不是错误,但那一轮
-白跑)。要么只留每小时那条,要么把整点那条的分钟错开。
+**时间表不在本文件维护** —— 唯一出处是 `docs/schedule_plan.md` §九。
+两处各写一份必然漂:v1 的表已经被所有者的批复推翻过一次(产品线由四条散点
+改成一条链、`returns_sync` 从每日改每小时、`order_center_push` 不再单列)。
 
 ⚠ **停旧清单见 `docs/legacy_schedules.md`**。最要紧一条:开
 `daily_report`(默认已含影刀)之前必须先停旧 `walmart-kpi-daily` ——

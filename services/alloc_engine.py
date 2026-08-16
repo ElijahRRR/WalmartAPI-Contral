@@ -202,11 +202,18 @@ def deal(groups: list, stores: dict, thickness: float = LAYER_THICKNESS,
     by_store: dict = {}
     for s in live:
         rows = [a for a in assign if a["store"] == s]
+        layer_items: Counter = Counter()
+        for a in rows:
+            # ⚠ 按**货位**累计,不是按组数。验收指标要拿它跟「配额占比」比,
+            # 而配额的单位是货位 —— 数组数的话,拿到大组的店比值天然偏低、
+            # 拿到小组的偏高,指标量的就成了"组的大小"而不是"分得公不公平"。
+            # (生产实测 2026-08-16:同一批里 0.16 与 2.05 并存,全是这个原因)
+            layer_items[a["layer"]] += int(a["group"]["size"])
         by_store[s] = {
             "groups": len(rows),
             "items": sum(int(a["group"]["size"]) for a in rows),
             "quota": live[s]["quota"],
-            "by_layer": Counter(a["layer"] for a in rows),
+            "by_layer": layer_items,
         }
     return {"assign": assign, "unplaced": unplaced, "by_store": by_store,
             "layers": layers_hist,
@@ -260,8 +267,11 @@ def _deal_tier(pool: list, here: dict, got: dict, assign: list,
         else:
             left.append(g)
     if n_carried:
-        logger.info("梯队 %s:%d 次被层内上限压回(松弛 %.2f),其中 %d 组"
-                    "由收尾扫描补发,%d 组仍未发出", tier, n_carried, slack,
+        # 措辞要经得起读:压回次数是**事件数**(一组可能被压回多层),而绝大多数
+        # 会在后续层补上 —— 写成"N 次压回,0 组补发"看起来像丢了 N 组
+        logger.info("梯队 %s:层内上限触发 %d 次(松弛 %.2f);后续层内消化 %d 次,"
+                    "收尾扫描补发 %d 组,最终仍未发出 %d 组",
+                    tier, n_carried, slack, n_carried - len(carry),
                     swept, len(carry) - swept)
     return left, hist
 
@@ -271,6 +281,10 @@ def acceptance(result: dict, top_layers: int = 1) -> dict:
 
     **必须进方案表,不是"希望如此"**:一家独大 = 参数错了,不是"模型判断"。
     `top_layers` 决定"好货"算到第几层(默认只算 L1)。
+
+    ⚠ 分子分母**必须同单位**(都是货位)。`by_layer` 数组数、`quota` 是货位的话,
+    比值量的是"这家店拿到的组平均多大",跟公不公平没关系 —— 生产实测里
+    0.16 与 2.05 并存,全是这一个原因。
     """
     by = result["by_store"]
     tot_q = sum(v["quota"] for v in by.values())

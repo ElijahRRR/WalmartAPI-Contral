@@ -18,8 +18,10 @@
   50 万、配额才 3 万,整池分层等于让层内上限把货摊到第 8 层去,慢 20 倍、
   未发清单 27 万行,而**发出去的还是那批 top 货**。实测切 `批量×1.5`
   与整池逐字同结果(§7.4b)。
-· **定向流不进分层**:品牌已被占用的组只能去占用店,过不了那店的硬闸就
-  整组淘汰(§7.3)。它们与自由流分开计数,别把两者加在一起看。
+· **定向流不进分层,但优先吃批量**:品牌已被占用的组只能去占用店(强制路由,
+  它没得选),过不了那店的硬闸就整组淘汰(§7.3);容量够而本批额度用完的
+  **排队等下一批**,与"去不了"分开计数 —— 前者加大 `-p batch=` 就能发,
+  后者要你去改配置或释放品牌。自由流分的是定向流吃剩的那部分批量。
 
 **只写占用,不碰沃尔玛。** 上架由 list_new 按自己的节奏执行。
 """
@@ -149,7 +151,36 @@ def run(params: dict) -> str:
         return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
                 "先跑 alloc_stores 看是谁被挡下的")
 
-    # §7.4a:need = w_gap·缺口 + w_room·容量比 + w_eff·效率
+    # ── 定向流先走:品牌已占,只能去那家店(强制路由,不是选择)────────
+    # ⚠ 两条纪律,缺一条就会炸:
+    #   ① **容量要累计**。逐组判 `size <= room` 的话,十几个组各自都"塞得下",
+    #      加起来能撑爆好几倍(生产实测 2026-08-16:A142 剩余容量 1,918,
+    #      定向流塞了 8,384)。
+    #   ② **也吃批量**。所有者要的是"这一批上 N 个货位",定向流不受批量约束的话,
+    #      写 batch=3000 会落 4 万条占用 —— 而占用撤不回。定向流优先(它没得选),
+    #      吃剩的才归自由流。
+    used: Counter = Counter()
+    dir_ok, dir_out, dir_wait = [], [], []
+    for grp in sorted(directed, key=lambda x: (-x["score"], x["key"])):
+        st = stores.get(grp["store"])
+        if not st or not ae._gate(grp, grp["store"], st):
+            dir_out.append((grp, "占用店本批不接货" if not st
+                            else "过不了占用店的类目/渠道闸"))
+        elif used[grp["store"]] + grp["size"] > st["room"]:
+            dir_out.append((grp, "占用店容量不足"))
+        elif sum(used.values()) + grp["size"] > batch:
+            # 容量够、只是这一批的额度用完了 —— 与"去不了"分开计数:
+            # 前者下一批照样能发,后者要所有者去改配置或释放品牌
+            dir_wait.append(grp)
+        else:
+            used[grp["store"]] += grp["size"]
+            dir_ok.append(grp)
+    dir_items = sum(used.values())
+    for s in stores:                       # 定向流吃掉的容量,自由流不能再用
+        stores[s]["room"] = max(0, stores[s]["room"] - used[s])
+
+    # ── 自由流:剩下的批量按 §7.4a 分配额 → 切批 → 发牌 ──────────────
+    free_batch = max(0, batch - dir_items)
     W_GAP, W_ROOM, W_EFF = 0.6, 0.25, 0.15
     need = {}
     for s in stores:
@@ -158,7 +189,7 @@ def run(params: dict) -> str:
         # ⚠ 缺口算不出(没填日目标)时**按 0 计**而不是跳过:公式主项对它是空的,
         # 但它仍该按容量与效率拿到一份。摘要会点名这些店要补填目标
         need[s] = (W_GAP * (gap if gap is not None else 0.0)
-                   + W_ROOM * min(1.0, (qq.get("room") or 0) / max(1, batch))
+                   + W_ROOM * min(1.0, stores[s]["room"] / max(1, free_batch))
                    + W_EFF * min(1.0, (qq.get("eff") or 0.0) / 2))
     tot_need = sum(need.values())
     for s in stores:
@@ -166,33 +197,26 @@ def run(params: dict) -> str:
         # ⚠ 必须落成 int:`-(-a // b)` 那个整数向上取整的写法对 float 是
         # 地板除,配额会变成 10.0 这种东西,一路带到报告和 csv 里
         stores[s]["quota"] = min(stores[s]["room"],
-                                 math.ceil(batch * need[s] / tot_need)
+                                 math.ceil(free_batch * need[s] / tot_need)
                                  if tot_need else 0)
     no_gap = [s for s in stores if q[s].get("gap") is None]
 
-    # ── 定向流:品牌已占,只能去那家店 ────────────────────────────────
-    dir_ok, dir_out = [], []
-    for grp in directed:
-        st = stores.get(grp["store"])
-        if st and ae._gate(grp, grp["store"], st) and grp["size"] <= st["room"]:
-            dir_ok.append(grp)
-        else:
-            why = ("占用店本批不接货" if not st else
-                   "过不了占用店的类目/渠道闸" if not ae._gate(grp, grp["store"], st)
-                   else "占用店容量不足")
-            dir_out.append((grp, why))
-
-    # ── 自由流:切批量 → 发牌 ────────────────────────────────────────
-    cut = int(batch * HEADROOM)
+    cut = int(free_batch * HEADROOM)
     pool_sorted = sorted(free, key=lambda x: (-x["score"], x["key"]))
     deck = pool_sorted[:cut]
-    result = ae.deal(deck, stores)
+    result = ae.deal(deck, stores) if deck else {
+        "assign": [], "unplaced": [], "by_store": {}, "layers": [],
+        "params": {"thickness": ae.LAYER_THICKNESS, "slack": ae.LAYER_SLACK,
+                   "stores": 0, "skipped_stores": len(stores)}}
     acc = ae.acceptance(result)
 
     placed_items = sum(v["items"] for v in result["by_store"].values())
     L = ["", "═══ 分配方案 ═══", "",
-         f"▍批量 {batch:,} 货位;候选切口 {cut:,} 组(批量 ×{HEADROOM})"
-         f";销量窗口 {win['day']} 往前 {days} 天"]
+         f"▍批量 {batch:,} 货位 = 定向流 {dir_items:,} + 自由流 {placed_items:,}"
+         f";自由流候选切口 {cut:,} 组(剩余批量 ×{HEADROOM})"
+         f";销量窗口 {win['day']} 往前 {days} 天",
+         "  定向流(品牌已被占用)**优先吃批量** —— 它没得选,只能回占用店;"
+         "剩下的才轮到自由流"]
     L += ["", "▍候选漏斗(前四行单位是**产品**,后两行是**组**——别拿组数除产品数)"]
     L += textfmt.table(
         ["", "产品", "占候选池", "组"],
@@ -225,8 +249,8 @@ def run(params: dict) -> str:
                           and not 0.7 <= a["top_ratio"] <= 1.3 else "")])
     L += textfmt.table(["店铺", "配额", "自由流", "定向流", "剩余容量",
                         "顶层比值", ""], rows_tbl, align="<>>>>><")
-    L.append("  顶层比值 = 「拿到的 L1 组数占比」÷「配额占比」,**要落 [0.7, 1.3]**;"
-             "越界就是参数没调对,不是模型判断(§7.4b)")
+    L.append("  顶层比值 = 「拿到的 L1 **货位**占比」÷「配额占比」(同单位),"
+             "**要落 [0.7, 1.3]**;越界就是参数没调对,不是模型判断(§7.4b)")
     over = [s for s in stores if result["by_store"].get(s, {}).get("items", 0)
             > stores[s]["quota"]]
     if over:
@@ -241,10 +265,15 @@ def run(params: dict) -> str:
         L.append("  未发出 " + f"{len(result['unplaced']):,} 组:"
                  + " · ".join(f"{ae.REASON_LABEL[k]} {v:,}"
                               for k, v in why.most_common()))
+    if dir_wait:
+        L.append(f"  定向流还有 {len(dir_wait):,} 组 / "
+                 f"{sum(x['size'] for x in dir_wait):,} 个货位**排队等下一批**"
+                 f"(容量够,只是本批额度用完了)—— 加大 -p batch= 就能一次多上些")
     if dir_out:
-        L.append(f"  定向流淘汰 {len(dir_out):,} 组(品牌已被占,但去不了占用店):"
+        L.append(f"  定向流淘汰 {len(dir_out):,} 组(品牌已被占,但**去不了**占用店):"
                  + " · ".join(f"{k} {v}" for k, v in
-                              Counter(w for _, w in dir_out).most_common()))
+                              Counter(w for _, w in dir_out).most_common())
+                 + " —— 这批要你去改配置或释放品牌,不是等下一批就能好")
     if no_gap:
         L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额,配额公式的主项对它们是空的:"
                  + "、".join(no_gap[:6]))
@@ -255,7 +284,8 @@ def run(params: dict) -> str:
 
     if export:
         paths.reports_dir().mkdir(parents=True, exist_ok=True)
-        p = _write_plan(result["assign"], dir_ok, result["unplaced"], dir_out)
+        p = _write_plan(result["assign"], dir_ok, result["unplaced"],
+                        dir_out, dir_wait)
         L += ["", f"▍方案表 → {p}",
               "  逐产品一行(品牌组 / 组分 / 去向店 / 逐段得分 / 层号 / 流别)。"
               "**先看上面三个验收指标再看明细** —— 一家独吞是参数错了,不是模型判断"]
@@ -301,7 +331,7 @@ def _prod_claims(grp: dict, store: str) -> list:
             for it in grp["items"]]
 
 
-def _write_plan(assign, dir_ok, unplaced, dir_out) -> str:
+def _write_plan(assign, dir_ok, unplaced, dir_out, dir_wait=()) -> str:
     p = paths.reports_dir() / "alloc_分配方案.csv"
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
@@ -316,6 +346,10 @@ def _write_plan(assign, dir_ok, unplaced, dir_out) -> str:
             _rows(w, f"未发出({ae.REASON_LABEL[u['reason']]})", "", "", u["group"])
         for grp, why in dir_out:
             _rows(w, f"定向流淘汰({why})", grp["store"], "", grp)
+        # 排队的也要进表:所有者看的是"这一批之外还压着多少",
+        # 不写的话他只会看到"分了 3000 件",不知道后面还有一堆等着
+        for grp in dir_wait:
+            _rows(w, "定向流排队(本批额度用完)", grp["store"], "", grp)
     return str(p)
 
 

@@ -259,3 +259,22 @@ def test_layer_count_is_independent_of_store_count():
         r = ae.deal(groups, {f"S{i:02d}": _s(100) for i in range(n)}, thickness=0.1)
         assert max(a["layer"] for a in r["assign"]) <= math.ceil(1 / 0.1) + 1
         assert len(r["assign"]) == 100
+
+
+def test_acceptance_compares_slots_to_slots_not_groups_to_slots():
+    """⚠ 验收指标的分子分母必须同单位(货位)。
+
+    生产实测 2026-08-16:同一批里出现 0.16 与 2.05,不是分配不公平 —— 是分子
+    数的「组数」、分母是「货位配额」。拿到大组的店比值天然偏低、小组的偏高,
+    指标量的成了"组的大小"而不是"分得公不公平"。
+    """
+    # 两家店配额相同;A 只能收大组(每组 10 件),B 只能收小组(每组 1 件)
+    groups = ([_g(f"big{i}", 100.0 - i, size=10, category="宠物") for i in range(2)]
+              + [_g(f"sml{i}", 99.5 - i, size=1, category="家居") for i in range(20)])
+    r = ae.deal(groups, {"A": _s(20, categories=["宠物"]),
+                         "B": _s(20, categories=["家居"])}, thickness=1.0)
+    m = ae.acceptance(r)
+    # 组数:A 拿 2 组、B 拿 20 组(1:10);货位:各 20(1:1)。指标要看后者
+    assert r["by_store"]["A"]["groups"] == 2 and r["by_store"]["B"]["groups"] == 20
+    assert r["by_store"]["A"]["items"] == r["by_store"]["B"]["items"] == 20
+    assert m["A"]["top_ratio"] == m["B"]["top_ratio"] == 1.0

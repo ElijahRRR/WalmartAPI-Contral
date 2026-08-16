@@ -261,3 +261,73 @@ def test_funnel_does_not_divide_group_counts_by_product_counts(monkeypatch, tmp_
     line = [x for x in out.splitlines() if "组队后·自由流" in x][0]
     assert "100.0%" in line and " 60 " in line   # 货位 60/60(**不是** 20/60=33%)
     assert line.rstrip().endswith("20")          # 组数单列一栏
+
+
+# ── 定向流:两条会炸的纪律 ────────────────────────────────────────────
+
+def _wire_directed(monkeypatch, pool, held_brand, room):
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": ["家居"], "channel": "FBA", "max_online": room,
+              "gmv": 400.0, "orders": 5.0}})
+    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
+    monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
+        "pool": [None] * len(pool), "sales": {}, "refund": {}, "risk": {},
+        "risk_err": None})
+    monkeypatch.setattr(wf.product_pool, "score_all", lambda data: (pool, {}))
+    monkeypatch.setattr(wf.store_perf, "load", lambda conn, win: {
+        "A": dict(rec_days=90, active_days=90, avg_online=100, orders=90,
+                  gross=9000.0, refund=0.0, hist_rows=0, net=9000.0)})
+    monkeypatch.setattr(wf.claims, "load_active",
+                        lambda conn, kind: held_brand if kind == wf.claims.BRAND else {})
+    monkeypatch.setattr(wf, "_pending_delist", lambda *a, **k: {})
+    monkeypatch.setattr(wf.db, "pg_conn",
+                        lambda *a, **k: __import__("contextlib").nullcontext(
+                            _Conn({"A": 0})))
+
+
+def test_directed_flow_capacity_is_cumulative_not_per_group(monkeypatch, tmp_path):
+    """⚠ 生产实测 2026-08-16:A142 剩余容量 1,918,定向流塞了 8,384。
+
+    成因是逐组判 `size <= room` —— 十几个组各自都"塞得下",加起来撑爆四倍。
+    容量必须**累计**。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 10 个已占品牌,各 5 件 = 50 件,而店里只剩 20 个货位
+    pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 5}", 80.0) for i in range(50)]
+    held = {f"brand{i}": "A" for i in range(10)}
+    _wire_directed(monkeypatch, pool, held, room=20)
+    landed = []
+    monkeypatch.setattr(wf.claims, "claim_many",
+                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
+    wf.run({"batch": 10_000, "execute": True})
+    assert len(landed) <= 20, "定向流突破了剩余容量"
+
+
+def test_directed_flow_is_capped_by_the_batch(monkeypatch, tmp_path):
+    """⚠ 定向流也吃批量。不受批量约束的话,写 batch=3000 会落 4 万条占用 ——
+    而占用撤不回(生产实测 2026-08-16:批量 3,000,定向流 36,894 个货位)。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 5}", 80.0) for i in range(500)]
+    held = {f"brand{i}": "A" for i in range(100)}
+    _wire_directed(monkeypatch, pool, held, room=100_000)
+    out = wf.run({"batch": 30, "execute": False})
+    assert "排队等下一批" in out
+    landed = []
+    monkeypatch.setattr(wf.claims, "claim_many",
+                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
+    wf.run({"batch": 30, "execute": True})
+    prods = [r for r in landed if r["kind"] == wf.claims.PRODUCT]
+    assert len(prods) <= 30, f"定向流突破了批量:{len(prods)}"
+
+
+def test_waiting_and_rejected_directed_groups_are_counted_apart(monkeypatch, tmp_path):
+    """「本批额度用完」与「去不了占用店」处置完全不同:前者加大 batch 就能发,
+    后者要所有者去改配置或释放品牌。混在一起报会让人去改不该改的东西。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 80.0) for i in range(10)]
+    # 一半品牌归 A(能收家居),一半归一家不存在于本批的店
+    held = {f"brand{i}": ("A" if i % 2 else "不接货店") for i in range(10)}
+    _wire_directed(monkeypatch, pool, held, room=100_000)
+    out = wf.run({"batch": 2, "execute": False})
+    assert "排队等下一批" in out and "去不了" in out

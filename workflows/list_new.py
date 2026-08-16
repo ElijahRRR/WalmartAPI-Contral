@@ -50,7 +50,8 @@ from datetime import datetime
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
 from services import amz_source, blacklist, kpi, listing_sheet, \
-    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, variant_group, \
+    listing_sources, llm_cache, mp_conform, mp_mapper, pricing, store_limits, \
+    variant_group, \
     product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
 
 DANGEROUS = True
@@ -347,10 +348,12 @@ def run(params: dict) -> str:
         _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
+    lead_caps = store_limits.lead_day_caps()      # 按店「配送时长限制」
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "no_data": 0, "filtered": 0,
-         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
+         "lead_days": 0}
     # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
@@ -470,11 +473,18 @@ def run(params: dict) -> str:
                             f"该区间倍率未配置:落地价 "
                             f"{pricing.landed_price(p.get('price'), p.get('shipping'))}"))
             continue
-        # 配送时长同样三态:采到且 >12 天 → 上架但库存写 0(旧规则);
-        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了
-        lead = p.get("lead_days")
-        qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
-            else int(stock)
+        # 配送时长超限 ⇒ **不上架**(所有者定稿 2026-08-16 走进生产;
+        # 此前是"上架但库存写 0")。不上架就不占 UPC、不占配额,比上一个
+        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 8 天。
+        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了。
+        lead_cap = store_limits.cap_for(lead_caps, store_name,
+                                        amz_source.MAX_LEAD_DAYS)
+        if store_limits.over_lead_cap(p.get("lead_days"), lead_cap):
+            n["lead_days"] += 1
+            reasons.append((r["rownum"],
+                            f"配送 {p.get('lead_days')} 天 > 本店上限 {lead_cap} 天"))
+            continue
+        qty = int(stock)
         echo[3] = w_price               # 算出定价的行回显 J 列
         if not ((p.get("attrs") or {}).get("weight")):
             n["no_weight"] += 1         # ShippingWeight 将按 1.0 磅兜底,亮出来
@@ -494,7 +504,8 @@ def run(params: dict) -> str:
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
                  f"去重 {n['dedup']},黑名单 {n['blacklist']},"
-                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
+                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']},"
+                 f"配送超时 {n['lead_days']}")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"

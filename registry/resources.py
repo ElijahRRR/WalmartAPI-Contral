@@ -535,6 +535,10 @@ RETIRE_LIMITS = Bitable(
         max_daily_list="上架限制",
         max_daily_retire="下架限制",
         inventory_note="库存特殊要求",
+        # 配送时长上限(所有者定稿 2026-08-16 走进生产,列名一字不差):
+        # 上架侧超限 = **不上架**(此前是"上架但库存写 0");维护侧超限 = 库存写 0。
+        # 读不到该列的店回落 services.amz_source.MAX_LEAD_DAYS(8 天)。
+        max_lead_days="配送时长限制",
     ),
 )
 

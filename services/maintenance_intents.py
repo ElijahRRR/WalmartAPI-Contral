@@ -356,20 +356,23 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
       · **stock_count 为 NULL(没采到)→ 也写 0**。采不到就不卖,是运营口径;
         库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在决策这一层
         把"不知道"当成"别卖"。
-      · 配送 > MAX_LEAD_DAYS(8 天,所有者 2026-08-09 从 12 改)→ 写 0
+      · 配送超过**本店**「配送时长限制」(限额表列,所有者定稿 2026-08-16)→ 写 0;
+        该店没配就回落 MAX_LEAD_DAYS(8 天)。⚠ 与上架侧口径不同:上架侧超限是
+        **不上架**,这里已经在架了只能压库存
     ⚠ 血量提醒:采集服务中断一整轮会让大批行的 stock_count 变 NULL,
     按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
     真跑前务必看 dry-run 的清零条数。
     """
-    from services import amz_source
+    from services import amz_source, store_limits
+    lead_caps = store_limits.lead_day_caps()
     out = []
     for (store, sku, _name, _pt, _upc, _wp, avail_qty,
          _ap, stock_count, delivery_days, _slow, _fm, _sh) in _rows(
             conn, stockzero_stores):
         if stock_count is None:
             stock_count = 0             # 没采到 → 不卖(所有者定稿)
-        new_qty = 0 if (delivery_days is not None
-                        and delivery_days > amz_source.MAX_LEAD_DAYS) \
+        cap = store_limits.cap_for(lead_caps, store, amz_source.MAX_LEAD_DAYS)
+        new_qty = 0 if store_limits.over_lead_cap(delivery_days, cap) \
             else int(stock_count)
         if avail_qty is not None and int(avail_qty) == new_qty:
             continue

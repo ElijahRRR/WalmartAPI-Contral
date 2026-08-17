@@ -40,8 +40,8 @@
 | 工作流 | 66 条(`workflows/*.py`),21 条进调度、45 条手动/一次性 |
 | 调度 | launchd 2 条(feed_poll 每 30 分 / 订单链每小时 :20)+ 智能体 9 条(每日/每周);验收记录见 `production_cutover.md` §九 |
 | 并发 | 跨店统一 `services.stores.STORE_WORKERS=24`;审核默认 128 worker(按 PG 连接余量自动钳);飞书电子表格写按表加锁 |
-| 数据库 | PostgreSQL 17 `walmart_data`,五 schema、49 表、2 视图 |
-| 测试 | 1563 passed |
+| 数据库 | PostgreSQL 17 `walmart_data`,五 schema、49 表、10 视图 |
+| 测试 | 1569 passed |
 | 仍在跑的旧链路 | 旧上架 / 审核 worker(所有者 2026-08-17 判定:不写表,留作备用) |
 
 | 工作流 | 生产验收 | 剩余 |
@@ -52,7 +52,7 @@
 | order_sync + order_audit | ✅ 151 行全链 2026-08-10 | 挂调度(收敛旧双重调度) |
 | order_center_push | ✅ 全店建库 | 挂调度;Lookup 列人工关联 |
 | perf_problems | ✅ 明细已映射飞书(运营在用) | 挂独立调度 |
-| maintenance | 🟡 三 provider 实跑过;**清零链路未生产验证** | 清零验证(需 FEISHU_LIMITS_* env);涨跌幅闸暂不做;挂调度 |
+| maintenance | 🟡 三 provider 实跑过;**清零链路未生产验证** | 清零验证(⚠ FEISHU_LIMITS_* 已于 2026-08-17 配好,前置解除,可以验了);涨跌幅闸暂不做;~~挂调度~~✅ |
 | product_clear | ✅ 2026-08-07 | RETIRE_ITEM 动作实测;切旧 15:00 cron;挂调度 |
 | problem_scan | ✅ 2026-08-14(批次 E 拆出) | 只读定性,产 ops.dispositions 建议行 |
 | problem_product_cleanup | ✅ 2026-08-07(21 店真跑) | 停旧每 6h cron;挂调度。⚠ 批次 E 后改为**纯执行件**:只消费建议行,自己不做决策 |

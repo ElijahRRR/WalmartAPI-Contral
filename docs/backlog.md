@@ -147,7 +147,9 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 |---|---|---|
 | ✅ | ~~**backup 工作流零代码**~~(2026-08-13 落地 `workflows/backup.py`:`-Fc` 先写 `.part` → `pg_restore --list` 校验 → 原子换名;2026-08-13 生产首跑 1554.5 MB 过校验;2026-08-17 起每天 02:00 自动跑) | 结案 |
 | ✅ | ~~**FEISHU_WEBHOOK_URL 未配** ⇒ 通知没人看~~ —— **这条早就不成立了,别再照它报**(所有者 2026-08-17 纠正)。`api/feishu.notify()` 的**第一条路是应用身份直发**(`FEISHU_NOTIFY_TO`,`im/v1/messages`),webhook 只是切换期的第二条退路;生产用的是应用直发,通知正常发出。⚠ 我在本轮把这条陈述从这里抄进 README 还加重了一遍 —— 教训:**"文档里写着没配"不是"没配"的证据**,证据是 `notify()` 的代码与生产日志 | 结案 |
-| ⚙ | READONLY_DB_PASSWORD(plan.md:34)、SCRAPER_EXPORT_TOKEN(api/scraper.py 每轮告警)、FEISHU_LIMITS_*(maintenance 清零硬依赖,feishu_tables.md:55) | 各自阻塞一条链 |
+| ✅ | ~~**FEISHU_LIMITS_\*** 未配~~ —— **2026-08-17 所有者已配好**。它是「上下架限额表」的 app_token/table_id(`registry.RETIRE_LIMITS`),没配时最要紧的两处是**静默降级**:倍率读不到 ⇒ 区间内的产品一律定不出价、只有出界品能上(300% 兜底);`库存特殊要求=0` 名单为空 ⇒ 该清零的店一件没清。两者都不报错 | 结案 |
+| ⚙ | **READONLY_DB_PASSWORD** 未配(所有者 2026-08-17 确认) | ⚠ **不阻塞任何链**(此前这行写"各自阻塞一条链",不准)。它只在 `db_init` 里决定要不要建 PG 的 `readonly` 角色,给 Metabase/NocoDB/AI 的 MCP 只读连接用。想让 BI 或 AI 直连读库时填上再跑一次 `db_init` 即生效 |
+| ⚙ | **SCRAPER_EXPORT_TOKEN** 未配(所有者 2026-08-17 确认) | 采集侧契约是**鉴权可选**(采集侧没配 `EXPORT_TOKEN` 时放行),所以本地/内网现在正常工作,`api/scraper._headers` 每进程告警一次。⚠ **采集服务上公网/VPS 那天必须两侧同时配**同一个值 —— 不配就是导出接口对全网开放 |
 | ✅ | ~~**旧调度未盘清**~~(2026-08-17 所有者已停掉旧 erpAPI 的全部定时任务并核对:旧冲突的订单/KPI 调度原本已 `PAUSED`/`disabled`;`walmart-daily-cleanup` 那条也在 gpt 侧,随之一并停) | 结案。⚠ 旧上架/审核 worker **仍在跑**,是所有者的决定(不写表,留作备用),不是漏停 |
 | ⬜ | `docs/legacy_schedules/` 归档目录不存在(plan.md:153 回滚预案要求删除旧调度前先归档) | 切换已完成,这条降为"旧配置没留副本";真要回滚只能靠旧仓库 |
 | ⬜ | 旧仓库 `类目映射/.git-archive` 内嵌 git 仓含 7 个未推送 commit,归档前必须处理(legacy_survey.md:2172);`active/extract_pt_templates.py` 不是归档脚本,plan.md:126 "留在旧仓库归档"措辞会切断 erp-core 链(:2171) | 归档动作有前置 |

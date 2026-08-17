@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from registry import resources
 from services import audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
@@ -124,21 +125,36 @@ def test_pick_where_four_states():
     assert w == "p.audit_status = 'pending'" and "interval" not in w
 
 
-def test_pick_where_rerule_targets_only_the_latest_reject():
+def test_pick_where_rerule_targets_only_the_rejected_backlog():
     """改一条规则后要动的只有被它拒过的那批,不是全库(2026-08-17 裁决 A)。
 
     此前唯一的批量通道是 `force_rerun=<版本>`,而版本一递增库里没有一条是新
     版本 ⇒ **全量**十几万条重审,为了几千条误杀烧掉全库的 LLM 钱。
-
-    三条口径都要钉:只认最近一轮(DISTINCT ON)、只翻 reject、不看 audit_status
-    (要动的正是 rejected 存量——reject 永不自动重审)。
     """
     w, e = product_audit._pick_where({"rerule": "phase0_forbidden_category"})
-    assert e == {"rerule": "phase0_forbidden_category"}
-    assert "DISTINCT ON (asin)" in w and "created_at DESC" in w
-    assert "l.verdict = 'reject'" in w
-    assert "audit_status" not in w
-    assert "audit.audit_hits" in w and "h.rule_code = %(rerule)s" in w
+    assert e["rerule"] == "phase0_forbidden_category"
+    assert e["rerule_ver"] == resources.AUDIT_RULES_VERSION
+    assert "p.audit_status = 'rejected'" in w
+    assert "p.audit_version IS DISTINCT FROM %(rerule_ver)s" in w
+    assert "EXISTS" in w and "h.rule_code = %(rerule)s" in w
+
+
+def test_rerule_anchors_on_products_not_on_the_latest_run():
+    """⚠ 锚"最近一轮 audit_runs"会让 dry-run **吃掉**自己要救的产品。
+
+    首版就是那样写的,所有者第一次 dry-run 当场炸出来:dry-run **也落
+    runs/hits**,于是那批的"最近一轮"变成本次 dry-run 的结果 —— 被救回来的
+    45 条新一轮判 pass、也不再带这条 hit,直接掉出候选集;而 dry-run 不写
+    products 五列,它们的 audit_status 还是 rejected。净效果:验证一次就永久
+    搁浅,任何通道都不会再捞,而且全程不报错。
+
+    所以谓词必须锚在 `catalog.products`(dry-run 碰不到的那几列)。
+    """
+    w, _ = product_audit._pick_where({"rerule": "x"})
+    assert "DISTINCT ON" not in w          # 不认"最近一轮"
+    assert "r.verdict" not in w and "l.verdict" not in w
+    # 判过的靠版本号退出候选集 —— 这同时是天然分页(limit 撞满就再跑一轮)
+    assert "audit_version IS DISTINCT FROM" in w
 
 
 def test_pick_where_rejects_unknown_params():
@@ -769,6 +785,56 @@ def test_catmap_suggestion_from_l1():
                                         penalty=-100, detail={}))
     assert suggestion_from_l1(exc) == ("unknown", "低", "excluded")
     assert suggestion_from_l1(None) == (None, None, "unknown")
+
+
+class _CountCur:
+    def __init__(self, n):
+        self.n = n
+        self.sql = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+
+    def fetchone(self):
+        return (self.n,)
+
+
+class _CountConn:
+    def __init__(self, n):
+        self.cur = _CountCur(n)
+
+    def cursor(self):
+        return self.cur
+
+
+def test_rerule_head_says_how_many_are_left():
+    """摘要只说"候选 500"时看不出**是刚好 500 还是撞了 limit**。
+
+    所有者 2026-08-17 首轮 dry-run 实遇:limit 缺省就是 500,而误杀规模正是他
+    决定要不要真跑的唯一依据。与 `_claim_from_sheet` 同款纪律。
+    """
+    conn = _CountConn(3200)
+    head = product_audit._rerule_head(conn, "phase0_forbidden_category",
+                                      "p.audit_status = 'rejected'",
+                                      {"rerule": "x", "rerule_ver": "v"}, 500)
+    assert "共 3200 个" in head[0]
+    assert "只判 500 个,还剩 2700 个" in head[1]
+    # 计数与取候选必须同一 where,否则"还剩多少"是另一件事的数
+    assert "p.audit_status = 'rejected'" in conn.cur.sql
+    assert "LIMIT" not in conn.cur.sql
+
+    # 撞不到上限时不该出现"还剩"那行(它会让人以为没跑完)
+    assert len(product_audit._rerule_head(
+        _CountConn(12), "r", "w", {}, 500)) == 1
+    # 一个都没有:多半是规则码拼错,得说出来而不是静静报"候选 0"
+    assert "拼错" in product_audit._rerule_head(
+        _CountConn(0), "r", "w", {}, 500)[1]
 
 
 def test_is_forced_exempts_rerule_but_not_from_sheet():

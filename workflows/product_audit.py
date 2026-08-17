@@ -206,19 +206,31 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 误杀烧掉全库的 LLM 钱。触发场景:裁决 A 摘掉 Phase0 四个大类
         # (礼品袋被判药品),要翻的就是 phase0_forbidden_category 拒过的那批。
         #
-        # 口径三条,都要:
-        #  · 只认**最近一轮**(DISTINCT ON):早先命中过、后来已重判成别的结论
-        #    的不该再翻出来;
-        #  · 只翻 verdict='reject':同一条规则若在别处只是记了个 hit 没定结论,
-        #    翻它没有意义(而且会把 approved 的产品拖进重判);
-        #  · **不限 audit_status**:要动的正是 rejected 存量(reject 永不自动
-        #    重审,这是唯一的定点通道)。
-        return ("p.asin IN (SELECT l.asin FROM ("
-                "  SELECT DISTINCT ON (asin) asin, run_id, verdict"
-                "  FROM audit.audit_runs ORDER BY asin, created_at DESC) l"
-                "  JOIN audit.audit_hits h ON h.run_id = l.run_id"
-                " WHERE l.verdict = 'reject' AND h.rule_code = %(rerule)s)",
-                {"rerule": rule})
+        # ⚠⚠ **锚在 catalog.products,不能锚在"最近一轮 audit_runs"**。
+        # 首版就是锚最近一轮(verdict='reject' 且该轮有这条 hit),所有者第一次
+        # dry-run 当场炸出问题:**dry-run 也落 runs/hits**,于是那 500 条的
+        # "最近一轮"变成了本次 dry-run 的结果 —— 被救回来的 45 条新一轮判 pass、
+        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 五列,
+        # 它们的 audit_status 还是 rejected。净效果:45 条产品被"验证"了一次就
+        # 永久搁浅,任何通道都不会再捞它们,而且全程不报错。
+        #
+        # 现在的口径(每条都是为了让 dry-run 与真跑说同一件事):
+        #  · `audit_status = 'rejected'` —— 要翻的是**现行结论**,而 dry-run 碰
+        #    不到这一列,所以反复 dry-run 候选集恒定,可重复验证;
+        #  · `audit_version IS DISTINCT FROM <当前版本>` —— 真跑判过的会盖上新
+        #    版本号,自动退出候选集。这同时是**天然分页**:limit 撞满就再跑一轮,
+        #    接着判剩下的,不会每轮都重判同一批(首版没有这条,真跑会原地打转);
+        #  · `EXISTS` 任意一轮命中过该规则 —— 不是"最近一轮"。理由同上:最近
+        #    一轮会被 dry-run 覆盖掉。代价是"早年被它拒、后来改判别的原因仍是
+        #    rejected"的行也会进来,那批重判一次结论不变,只多花一轮 LLM。
+        return ("p.audit_status = 'rejected'"
+                " AND p.audit_version IS DISTINCT FROM %(rerule_ver)s"
+                " AND EXISTS (SELECT 1 FROM audit.audit_runs r"
+                "             JOIN audit.audit_hits h ON h.run_id = r.run_id"
+                "             WHERE r.asin = p.asin"
+                "               AND h.rule_code = %(rerule)s)",
+                {"rerule": rule,
+                 "rerule_ver": resources.AUDIT_RULES_VERSION})
     mode = str(params.get("mode", "")).strip()
     if mode and mode not in _MODES:
         # 与未识别参数同理:静默落回默认 = "补刷跑完了"的假象,宁炸不吞
@@ -232,6 +244,38 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {}
+
+
+# 定点重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+_RERULE_COUNT_SQL = """
+SELECT count(*) FROM catalog.products p
+WHERE p.marketplace = %(marketplace)s AND ({where})
+  AND p.title IS NOT NULL AND p.title <> ''
+"""
+
+
+def _rerule_head(conn, rule: str, where: str, extra: dict,
+                 limit: int) -> list[str]:
+    """输入:连接 + 规则码 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
+
+    没有这一行的话,摘要只会说"候选 500",而 500 正是 limit ——**看不出是刚好
+    500 个还是撞了上限**(所有者 2026-08-17 首轮 dry-run 实遇)。误杀规模是他
+    决定要不要真跑的唯一依据,必须报出来。与 `_claim_from_sheet` 同款纪律。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_RERULE_COUNT_SQL.format(where=where),
+                    {"marketplace": "US", **extra})
+        total = int(cur.fetchone()[0])
+    head = [f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 rejected**、"
+            f"且未按当前规则版本判过的,共 {total} 个"]
+    if total > limit:
+        head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
+                    f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
+                    f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
+                    f"再跑一次接着判(或 -p limit=N 加大)")
+    if not total:
+        head.append("  (一个都没有:规则码拼错?或这批已经全部按当前版本判过了)")
+    return head
 
 
 def _is_forced(params: dict, extra: dict) -> bool:
@@ -495,6 +539,9 @@ def run(params: dict) -> str:
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
             else _RECENT_RUN_GUARD
+        if str(params.get("rerule", "")).strip():
+            sheet_head = _rerule_head(conn, params["rerule"].strip(),
+                                      where, extra, limit) + sheet_head
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where,
                                               recent_guard=guard),

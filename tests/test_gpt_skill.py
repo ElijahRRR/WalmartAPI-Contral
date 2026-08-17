@@ -208,3 +208,30 @@ def test_register_forbids_touching_the_old_erpapi_schedules():
     """旧调度的停用有顺序(先停旧 → 搬状态 → 起新),别人替他删会错位。"""
     md = gpt_skill.register_md()
     assert "不要删" in md and "erpAPI" in md
+
+
+def test_register_sends_the_high_frequency_pair_to_launchd_not_to_the_agent():
+    """⚠ 那两条**不能**注册成智能体的定时任务(所有者 2026-08-17 要给 gpt 交办)。
+
+    两个理由都不是偏好:
+      · 每半小时 / 每小时固定 :20 这种频率,常见的智能体定时任务排不出来,
+        而排不准的后果不是报错,是**悄悄少跑几轮**;
+      · 两边都挂 = 撞锁,后到的退 3 空跑一轮而且外表一切正常。
+    所以交办单必须给出 launchd 那条路(install → load → 回读),
+    而不是把它们塞进第 1 步那张表。
+    """
+    md = gpt_skill.register_md()
+    ld = schedule.jobs_for("launchd")
+    assert ld, "launchd 侧一条都没有?调度表变了"
+    for j in ld:
+        assert f"`{j['label']}`" in md
+        # ⚠ 绝不能出现在"按这张表注册"那一段里
+        assert f"`{gpt_skill.cron(j)}`" not in md
+    assert "launchd_install --dry-run" in md
+    assert "launchctl load -w" in md
+    assert "launchctl list" in md              # 装完回读校验
+    assert str(len(ld)) in md                  # 应当正好几行
+    # 先空跑给人看过再落盘(装完就是真调度)
+    assert md.index("--dry-run") < md.index("cli.py launchd_install\n")
+    # 别自己拼 plist 路径
+    assert schedule.LABEL_PREFIX in md

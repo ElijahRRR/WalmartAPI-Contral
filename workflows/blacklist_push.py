@@ -46,36 +46,11 @@ import logging
 
 from api import feishu
 from registry import db, resources
-from services import blacklist
+from services import blacklist, blacklist_sheet as sheets
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.blacklist_push")
-
-_ASIN_STATS = """
-SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
-FROM catalog.asin_blacklist
-"""
-
-_BRAND_STATS = """
-SELECT count(*) FILTER (WHERE pushed_at IS NOT NULL), count(*)
-FROM catalog.brand_err_hits
-"""
-
-_CHANNEL_ALL = """
-SELECT brand, source, added_date, src_sku
-FROM catalog.brand_err_hits ORDER BY added_date, brand_key
-"""
-
-_CHANNEL_MARK_ALL = "UPDATE catalog.brand_err_hits SET pushed_at = now()"
-
-_ASIN_ALL = """
-SELECT asin, source, created_at::date::text
-FROM catalog.asin_blacklist ORDER BY created_at, asin
-"""
-
-_ASIN_MARK_ALL = "UPDATE catalog.asin_blacklist SET pushed_at = now()"
-
 
 def _probe() -> str:
     """输入:无 → 输出:两张表的只读体检报告,不写任何东西。
@@ -87,9 +62,9 @@ def _probe() -> str:
     """
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(_ASIN_STATS)
+            cur.execute(sheets.ASIN_STATS)
             asin_stats = cur.fetchone()
-            cur.execute(_BRAND_STATS)
+            cur.execute(sheets.BRAND_STATS)
             brand_stats = cur.fetchone()
     lines = []
     for sheet, (pushed, total) in ((resources.ASIN_BLACKLIST_SHEET, asin_stats),
@@ -101,7 +76,7 @@ def _probe() -> str:
                          f"实有子表 {[f'{t}({i})' for i, t in titles.items()]}"
                          f"——env 的 wiki token 或 sheet_id 指错了")
             continue
-        filled = _next_empty(s) - 2
+        filled = sheets.next_empty(s) - 2
         width = chr(ord("A") + len(s.columns) - 1)
         head = feishu.sheet_values(s, f"A2:{width}2") if filled else []
         lines.append(f"「{s.name}」→ 子表「{titles[s.sheet_id]}」已填 {filled} 行"
@@ -112,97 +87,13 @@ def _probe() -> str:
     return "黑名单投影探针(只读):" + ";".join(lines)
 
 
-_SCAN_BLOCK = 5000      # 找空行时每个 GET 读多少行(**只读列 A**,一列 5000 个
-                        # 短串约 50KB,离飞书的响应上限很远)。
-                        # 原值 200:ASIN 表已填 5.7 万行 ⇒ 每轮 285 个 GET、
-                        # 每个约 0.3 秒 ≈ 一分半,而真正的写只有 3 个请求
-                        # (4000 行/块)。所有者 2026-08-17 实见"一次就写了
-                        # 200 行"——那不是写,是这里在逐段读。
-                        # ⚠ 这一段是 O(表已填行数):表越长越慢,只是常数小了
-                        # 24 倍。哪天 ASIN 表涨到几十万行,该换成二分探测
-                        # (但那要求"已填行是连续前缀",与现在"找首个空行"的
-                        # 语义不同——中间被手工删出一个洞时两者结果不一样)。
-
-
-def _next_empty(sheet, start: int = 2) -> int:
-    """输入:登记条目 + 起扫行 → 输出:列 A 首个空行行号(1 行是表头)。"""
-    grid = feishu.sheet_row_count(sheet)
-    row = start
-    while row <= grid:
-        end = min(row + _SCAN_BLOCK - 1, grid)
-        vals = feishu.sheet_values(sheet, f"A{row}:A{end}")
-        got = [(str(c[0]).strip() if c and c[0] is not None else "")
-               for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]
-        for i, v in enumerate(got):
-            if not v:
-                return row + i
-        row = end + 1
-    return row
-
-
-SHRINK_TOLERANCE = 0.02     # 与 catmap_export 同一口径
-
-
-class _Shrink(Exception):
-    """骤缩:本次要写的行数比表里现有的少太多 —— 停手,一格不写。"""
-
-
-def _rewrite_sheet(sheet, all_sql: str, mark_sql: str,
-                   *, allow_shrink: bool = False) -> int:
-    """输入:登记条目 + 全量行 SQL + 打水位 SQL → 输出:重写的数据行数。
-
-    整表重写三步:①表头行回读原样保留(读不到才用登记列名兜底);
-    ②sheet_overwrite 全量替换(尾部残留自动删——错版内容就是这样清掉的);
-    ③全表打 pushed_at 水位。
-
-    ⚠ **骤缩护栏**(2026-08-17 catmap_export 的生产事故教训:整表重写把飞书
-    17592 行写成 15770 行,净丢 1847 行且当时没有任何东西拦住)。本表虽然是
-    纯程序投影、PG 就是权威,但"库这次只查出一小半"同样会把表清掉 ——
-    查询写错、连接中断拿到半截结果、误删了库里的行,表现都是一样的。
-    缩量超 SHRINK_TOLERANCE 直接抛,一格不写;确认就是要缩加 -p allow_shrink=1。
-    重建类命令(rebuild_asin/rebuild_brand)本来就是"擦净重灌",显式豁免。
-    """
-    s = sheet.require()
-    ncols = len(s.columns)
-    width = chr(ord("A") + ncols - 1)
-    hdr = feishu.sheet_values(s, f"A1:{width}1")
-    header = ((hdr[0] if hdr else []) + [""] * ncols)[:ncols]
-    if not any(str(h or "").strip() for h in header):
-        header = list(s.columns)
-    with db.pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(all_sql)
-            rows = [[c if c is not None else "" for c in r]
-                    for r in cur.fetchall()]
-    if not allow_shrink:
-        # ⚠ 用 `_next_empty`(**已填行数**)而不是 `sheet_row_count`(**网格大小**)。
-        # 飞书的网格会被 ensure_rows 撑大、且只增不减,拿它当"现有行数"会把
-        # 空白网格算进去 —— 6.7 万行的表若网格 7 万,每轮都算成"缩了 2365 行"
-        # 从而**每轮误停手**,护栏反倒成了故障源。代价是这里要扫一遍列 A
-        # (5000 行/段,6.7 万行约 14 个 GET),换护栏说的是真话。
-        now = _next_empty(s) - 2
-        shrink = now - len(rows)
-        if now > 0 and shrink > now * SHRINK_TOLERANCE:
-            raise _Shrink(
-                f"「{s.name}」**已停手,一格未写**:表里现有 {now} 行,"
-                f"库里只查出 {len(rows)} 行,要少 {shrink} 行"
-                f"(超过 {SHRINK_TOLERANCE:.0%} 容忍)。"
-                f"PG 是权威没错,但「库这次只查出一小半」和「本来就该少」"
-                f"长得一样 —— 先确认库侧没出问题;"
-                f"确认就是要缩,加 -p allow_shrink=1")
-    feishu.sheet_overwrite(s, [header] + rows)
-    with db.pg_conn() as conn:
-        conn.execute(mark_sql, ())
-    return len(rows)
-
-
 def _rebuild_brand(do_apply: bool) -> str:
     """输入:是否 apply → 输出:品牌渠道重建摘要(见模块头「一次性命令」)。"""
     sheet = resources.BRAND_ERR_SHEET
     with db.pg_conn() as conn:
         c = blacklist.channel_counts(conn)
         if not do_apply:
-            filled = _next_empty(sheet) - 2
+            filled = sheets.next_empty(sheet) - 2
             return (f"品牌渠道重建预览:①总表认领——沃尔玛来源品牌 "
                     f"{c['master']} 个(旧系统后台收集的历史,日期原样);"
                     f"②时间线推导——C/E 最新类 ASIN "
@@ -211,8 +102,9 @@ def _rebuild_brand(do_apply: bool) -> str:
                     f"两腿去重后的行数(≤{c['master'] + c['brands']});"
                     f"加 -p apply=1 执行")
         st = blacklist.rebuild_brand_channel(conn)
-    n = _rewrite_sheet(sheet, _CHANNEL_ALL, _CHANNEL_MARK_ALL,
-                       allow_shrink=True)   # 擦净重灌,缩是预期
+    n = sheets.rewrite_sheet(sheet, sheets.CHANNEL_ALL,
+                             sheets.CHANNEL_MARK_ALL,
+                             allow_shrink=True)   # 擦净重灌,缩是预期
     return (f"品牌渠道重建:擦净 {st['wiped']} 行 → 总表认领 {st['seeded']} 个"
             f" + 时间线推导 {st['derived']} 个;beyKyi 整表重写 {n} 行")
 
@@ -224,14 +116,15 @@ def _rebuild_asin(do_apply: bool) -> str:
     with db.pg_conn() as conn:
         c = blacklist.backfill_counts(conn)
         if not do_apply:
-            filled = _next_empty(sheet) - 2
+            filled = sheets.next_empty(sheet) - 2
             return (f"ASIN 黑名单重建预览:时间线按标准 asin 归并后共 "
                     f"{c['total']} 个,永久禁止 {c['permanent']} 个;"
                     f"ASIN 表现有 {filled} 行将被整表重写为 {c['permanent']} 行"
                     f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行")
         st = blacklist.rebuild_asin_blacklist(conn)
-    n = _rewrite_sheet(sheet, _ASIN_ALL, _ASIN_MARK_ALL,
-                       allow_shrink=True)   # 擦净重灌,缩是预期
+    n = sheets.rewrite_sheet(sheet, sheets.ASIN_ALL,
+                             sheets.ASIN_MARK_ALL,
+                             allow_shrink=True)   # 擦净重灌,缩是预期
     return (f"ASIN 黑名单重建:擦净 {st['wiped']} 行 → 按标准 asin 重灌 "
             f"{st['inserted']} 行;ASIN 表整表重写 {n} 行")
 
@@ -278,14 +171,5 @@ def run(params: dict) -> str:
     # 整表重写没有水位,自然幂等,表被人动过下一轮自己就正回来了。
     # pushed_at 保留:它现在的意思是"这行投影过了",给探针和对账用。
     allow_shrink = str(params.get("allow_shrink", "")).lower() in {"1", "true", "yes"}
-    for sheet, all_sql, mark_sql in (
-            (resources.ASIN_BLACKLIST_SHEET, _ASIN_ALL, _ASIN_MARK_ALL),
-            (resources.BRAND_ERR_SHEET, _CHANNEL_ALL, _CHANNEL_MARK_ALL)):
-        try:
-            n = _rewrite_sheet(sheet, all_sql, mark_sql, allow_shrink=allow_shrink)
-        except _Shrink as e:
-            # 一张表停手不该拖垮另一张:各写各的
-            lines.append(f"⛔ {e}")
-            continue
-        lines.append(f"「{sheet.name}」整表重写 {n} 行")
+    lines += sheets.push_all(allow_shrink=allow_shrink)
     return "黑名单投影:" + ";".join(lines)

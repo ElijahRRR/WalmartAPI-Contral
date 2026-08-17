@@ -368,13 +368,61 @@ def register_md() -> str:
         f"`cat {SKILL_DIR}/tasks/*.md`,每份以 `# 沃尔玛定时任务:<任务名>` 开头,"
         "按这行切开即可。)",
         "",
-        "## 第 3 步:这两条不要注册",
+        "## 第 3 步:这两条**不要注册成你的定时任务**,改用电脑的 launchd",
         "",
-        f"{launchd_labels} 是高频链,已经挂在苏里电脑的 launchd 上。",
-        "**你这边再挂一份 = 两边同时拉同一条链**,后到的那次拿不到锁直接退出码 3 "
-        "空跑,而外表看起来一切正常。",
+        f"{launchd_labels} 是高频链:",
         "",
-        "同样地:**上面表里没有的,一条都不要注册**。想加是改 "
+        "| 任务 | 频率 | 跑什么 |",
+        "|---|---|---|",
+        *[f"| `{j['label']}` | {when(j)} | {' → '.join(j['workflows'])} |"
+          for j in schedule.jobs_for("launchd")],
+        "",
+        "两个理由,都不是偏好问题:",
+        "",
+        "1. **频率你那边多半排不出来** —— 每半小时一次、每小时固定 :20 这种,"
+        "常见的智能体定时任务最细只到「每小时」甚至「每天」。排不准的后果不是报错,"
+        "是**悄悄少跑几轮**。",
+        "2. **两边都挂 = 撞锁** —— 同一条链被 launchd 和你同时拉起来,后到的那次"
+        "拿不到锁直接退出码 3 空跑一轮,而外表看起来一切正常。",
+        "",
+        "**正确做法:让它们跑在电脑自己的 launchd 上,你只负责装。** 三步,"
+        f"都在 `{schedule.REPO_DIR}` 下:",
+        "",
+        "```bash",
+        "# ① 先空跑,把它要生成什么打给苏里看(不落盘)",
+        f"{schedule.PYTHON} {schedule.REPO_DIR}/cli.py launchd_install --dry-run",
+        "",
+        "# ② 他确认无误后落盘(只写 plist 文件,还没生效)",
+        f"{schedule.PYTHON} {schedule.REPO_DIR}/cli.py launchd_install",
+        "",
+        "# ③ 装载(这一步才真的开始按秒表跑;命令由 ② 的输出原样给出,照抄)",
+        "#    形如:launchctl load -w ~/Library/LaunchAgents/"
+        f"{schedule.LABEL_PREFIX}<任务名>.plist",
+        "```",
+        "",
+        "⚠ **① 必须给苏里看过再做 ②**:`launchd_install` 装完就是真调度,"
+        "而这两条链会写沃尔玛、写数据库。",
+        "⚠ **③ 的命令照抄 ② 的输出,不要自己拼路径**(plist 名带前缀 "
+        f"`{schedule.LABEL_PREFIX}`,拼错的表现是 launchctl 说找不到文件)。",
+        "",
+        "装完**回读校验**,和第 5 步一样的道理:",
+        "",
+        "```bash",
+        "launchctl list | grep " + schedule.LABEL_PREFIX.rstrip("."),
+        "```",
+        "",
+        f"应当正好 {len(schedule.jobs_for('launchd'))} 行。"
+        "然后**等到下一个整点/半点再确认它真的跑了** —— 装上了不等于跑得起来"
+        "(解释器路径错、venv 被删这类问题只会出现在 launchd 自己的日志里,"
+        "不会有人通知你):",
+        "",
+        "```bash",
+        f"cd {schedule.REPO_DIR} && tail -n 30 \"$({schedule.PYTHON} -c "
+        "'from registry import paths; print(paths.logs_dir())'"
+        ")/launchd/\"*.log",
+        "```",
+        "",
+        "**上面第 1 步那张表里没有的,一条都不要注册成定时任务**。想加是改 "
         "`registry/schedule.py` 再重新生成这份交办单,不是在你这边手动加一条。",
         "",
         "## 第 4 步:别动现有的任务",

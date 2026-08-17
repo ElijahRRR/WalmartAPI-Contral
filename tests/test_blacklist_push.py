@@ -9,6 +9,7 @@ from datetime import date
 import pytest
 
 from registry.resources import Spreadsheet
+from services import blacklist_sheet as sheets
 from workflows import blacklist_push as wf
 
 
@@ -138,7 +139,8 @@ def test_brand_projection_reads_channel_table_only():
     """beyKyi 的数据源是渠道表 brand_err_hits,**绝不**碰总清单镜像表
     brand_blacklist(历史上两次走错:只推镜像表自产行→总表已有的品牌
     永远进不了渠道;整表全推→总清单被复制进渠道表)。"""
-    for sql in (wf._BRAND_STATS, wf._CHANNEL_ALL, wf._CHANNEL_MARK_ALL):
+    for sql in (sheets.BRAND_STATS, sheets.CHANNEL_ALL,
+                sheets.CHANNEL_MARK_ALL):
         assert "brand_err_hits" in sql
         assert "brand_blacklist" not in sql
 
@@ -329,11 +331,11 @@ def test_next_empty_scans_in_big_blocks(wired, monkeypatch):
     monkeypatch.setattr(wf.feishu, "sheet_values", spy)
     monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 20000)
 
-    row = wf._next_empty(wf.resources.ASIN_BLACKLIST_SHEET)
+    row = sheets.next_empty(wf.resources.ASIN_BLACKLIST_SHEET)
     assert row == 12002                                    # 表头 + 12000 行
     # 200 行一段要 60 个请求;5000 一段只要 3 个
     assert len(ranges) <= 4, f"扫了 {len(ranges)} 个请求,块太小:{ranges[:3]}"
-    assert wf._SCAN_BLOCK >= 5000
+    assert sheets._SCAN_BLOCK >= 5000
 
 
 def test_shrink_guard_measures_filled_rows_not_grid_size(wired):
@@ -344,12 +346,12 @@ def test_shrink_guard_measures_filled_rows_not_grid_size(wired):
     护栏反倒成了故障源。
     """
     import inspect
-    src = inspect.getsource(wf._rewrite_sheet)
+    src = inspect.getsource(sheets.rewrite_sheet)
     guard = src[src.index("if not allow_shrink"):]
     # ⚠ 必须**剥掉注释**再比:这一段的注释里正好写着 sheet_row_count(解释为什么
     # 不用它),连注释一起 grep 会被自己的说明绊倒(CLAUDE.md 记的那种假阳性)
     code = "\n".join(ln.split("#")[0] for ln in guard.splitlines())
-    assert "_next_empty" in code
+    assert "next_empty" in code
     assert "sheet_row_count" not in code, "又拿网格大小当现有行数了"
 
     # 行为验证:网格 2000 而只填了 1000 行,库里给 995 行(缩 0.5%)应放行
@@ -359,3 +361,68 @@ def test_shrink_guard_measures_filled_rows_not_grid_size(wired):
     calls["channel_rows"] = []
     out = wf.run({})
     assert "asin" in calls["overwritten"], f"网格 2000 把它误判成骤缩了:{out}"
+
+
+# ── problem_scan 跑完立刻投影(所有者定稿 2026-08-17)────────────────────────
+
+def test_problem_scan_projects_right_after_it_collects():
+    """「让 problem_scan 完成后立马推飞书」。
+
+    钉两件事,第二件是这次唯一真会静默出错的地方:
+
+    ① 投影代码在 `services.blacklist_sheet`,`problem_scan` 调 service 而不是
+       import `blacklist_push` 工作流(铁律 1);与 order_center 那次拆分同款。
+    ② ⚠ **投影必须在 `with db.pg_conn()` 块之外**。投影是另开一条连接查全表,
+       放在扫描那个事务里面调的话它**看不到刚写的那几行** —— 表现是
+       "黑名单收集 +5,可表格一行没多",而且不报任何错。
+    """
+    import inspect
+    from workflows import problem_scan as ps
+    src = inspect.getsource(ps.run)
+    assert "_push_sheets()" in src
+    # 缩进说明位置:调用点必须与 `with db.pg_conn()` 同级或更外(4 空格),
+    # 落到 8 空格就是在 with 块里面
+    line = next(ln for ln in src.splitlines() if "_push_sheets()" in ln)
+    assert len(line) - len(line.lstrip()) <= 8, "投影被塞进事务里了"
+    assert src.index("with db.pg_conn()") < src.index("_push_sheets()")
+    # 收集本身仍然只写 PG —— 一个飞书调用都不许有
+    collect = inspect.getsource(ps._collect_blacklists)
+    assert "feishu" not in collect and "push_after" not in collect
+    # 铁律 1:不许 import 工作流
+    whole = inspect.getsource(ps)
+    assert "import blacklist_push" not in whole
+
+
+def test_scan_side_projection_never_raises():
+    """投影挂了不该把一轮扫描记成 failed:黑名单已落 PG、**闸门已经生效**
+    (上架与审核读 PG,从不读飞书表)。但必须说出来 —— 否则表现成
+    "跑成功了可表格没动"(所有者 2026-08-16 在日报上实遇过这种)。"""
+    import services.blacklist_sheet as bs
+
+    def _boom(**kw):
+        raise RuntimeError("飞书 5xx")
+    orig, bs.push_all = bs.push_all, _boom
+    try:
+        out = bs.push_after()
+    finally:
+        bs.push_all = orig
+    assert out.startswith("⚠") and "飞书 5xx" in out
+    assert "闸门已经生效" in out          # 别让人以为拦截也没生效
+    assert "cli.py blacklist_push" in out  # 告诉人怎么补推
+
+
+def test_shrink_is_isolated_per_table(monkeypatch):
+    """一张表被骤缩护栏停手,不该拖垮另一张(它们是两份独立投影)。"""
+    import services.blacklist_sheet as bs
+    seen = []
+
+    def _rw(sheet, all_sql, mark_sql, *, allow_shrink=False):
+        seen.append(sheet.name)
+        if all_sql is bs.ASIN_ALL:
+            raise bs.Shrink("「ASIN 黑名单」**已停手,一格未写**")
+        return 7
+    monkeypatch.setattr(bs, "rewrite_sheet", _rw)
+    lines = bs.push_all()
+    assert len(seen) == 2                      # 第一张停手,第二张照写
+    assert lines[0].startswith("⛔")
+    assert "整表重写 7 行" in lines[1]

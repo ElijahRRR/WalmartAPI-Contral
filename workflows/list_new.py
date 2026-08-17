@@ -736,11 +736,14 @@ def run(params: dict) -> str:
                     vplan = _variant_plan(conn, store_name, r,
                                           pt_spec.load_pt(r["product_type"]))
                     n_var[vplan["code"]] += 1
-                    # 多维家族只按一个维度分组(variant_group.plan 的已知限制)
-                    # ——单列一栏,不许静默:只差 size 的两个成员会带着同一个
-                    # 组 ID + 同一个 color 值发出去,沃尔玛看不出差异
-                    if vplan.get("extra_dims"):
-                        n_var["variant(多维只发一个)"] += 1
+                    if len(vplan.get("attr_pairs") or ()) > 1:
+                        # 多维成功发出的行数:这一栏为 0 而库里明明有 color+size
+                        # 的家族 = 多维那条链没生效(2026-08-17 补齐后的验收点)
+                        n_var["其中多维"] += 1
+                    if vplan.get("unmapped_dims"):
+                        # 映不上的维度只被剔掉、不退单品 —— 但组内差异若恰好
+                        # 只在被剔的那个维度上,发出去就是几条看不出区别的变体
+                        n_var["有维度映不上"] += 1
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
                         pt_spec.orderable_spec(), visible, orderable,

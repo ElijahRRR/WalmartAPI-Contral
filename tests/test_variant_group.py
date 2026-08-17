@@ -40,6 +40,23 @@ def test_group_id_is_derived_not_looked_up():
     assert vg.group_id(None, "") is None
 
 
+def test_group_id_self_parent_falls_back_to_min_family():
+    """⚠ parent_asin **等于自己**时拿它当组 ID,会把同组 N 个兄弟切成 N 组。
+
+    旧仓 `variant_groups_design.md` §3.3 记着这个坑:它的采集侧(DMIT)每行的
+    parent_asin 就是该行自己,所以旧仓一律用 min(full_set)。我们现在的采集侧
+    给真族主,但它哪天改回"填自己",这里得能自愈 —— 而且不报错的分裂最难查。
+    """
+    fam = ["B0000000A1", "B0000000A2", "B0000000A3"]
+    ids = {vg.group_id(a, a, fam) for a in fam}      # parent 全填自己
+    assert ids == {"vg_B0000000A1"}                  # 三个兄弟同一个 ID
+    # 真族主(生产实见形态)照旧按 parent 派生,ID 更好认
+    assert vg.group_id("B000AMXQVI", "B0009GGJ9G",
+                       ["B0009GGJ9G", "B0009GGJCI"]) == "vg_B000AMXQVI"
+    # 孤品(家族只有自己)不受影响
+    assert vg.group_id("", "B0000000A1", ["B0000000A1"]) == "vg_B0000000A1"
+
+
 def test_pick_walmart_dim_never_guesses():
     assert vg.pick_walmart_dim(["color_name"], _ENUM) == "color"
     assert vg.pick_walmart_dim(["size_name"], _ENUM) == "size"
@@ -57,29 +74,45 @@ def test_plan_variant_happy_path():
                 "B000AMXQVI", _ENUM)
     assert p["mode"] == "variant" and p["reason"] == ""
     assert p["group_id"] == "vg_B000AMXQVI"
-    assert (p["attr_name"], p["attr_value"]) == ("color", "Black")
+    assert p["attr_pairs"] == [("color", "Black")]
     assert p["family_size"] == 3 and p["is_primary"] is True
 
 
-def test_multi_dim_family_is_grouped_by_one_dim_and_says_so():
-    """⚠ 多维家族**只按一个维度分组**,这是已知限制,必须可数不可静默。
+def test_multi_dim_family_sends_every_mapped_dimension():
+    """color+size 的家族**两个维度都要发**(2026-08-17 对着旧仓核实后补齐)。
 
-    所有者 2026-08-17 问「单属性多属性都会自动用对应方法吧」——不会:
-    `pick_walmart_dim` 取第一个映得上的维度,color+size 的家族只按 color 分。
-    后果不只是少发一个字段:同族里**只差 size 的两个成员**会带着同一个
-    variantGroupId + 同一个 color 值发出去,沃尔玛看不出它们有什么不同。
+    旧仓 `auto_listing/mapper.py:1374` 是 `sorted(allowed_names &
+    set(var_attrs.keys()))` —— 取交集全体;设计文档 §3.5/§4.2 同。我们首版只取
+    第一个,是**迁漏**。后果不是少个字段:同族里只差 size 的两个成员会带着
+    同一个 variantGroupId + 同一个 color 值发出去,沃尔玛看不出差异。
 
-    真支持多维要发多个 variantAttributeNames + 每个维度各写一个属性,
-    是设计变更待所有者定;在那之前 `extra_dims` 让 list_new 摘要单列一栏。
+    顺序按沃尔玛属性名排序 —— 同组成员算出的顺序必须一致,否则同一个组里
+    几条的 variantAttributeNames 顺序不同,排查时看着像两组。
     """
     p = vg.plan("B0009GGJ9G", "color_name=Black; size_name=L",
                 "B0009GGJCI", "B000AMXQVI", _ENUM)
     assert p["mode"] == "variant"
-    assert (p["attr_name"], p["attr_value"]) == ("color", "Black")
-    assert p["extra_dims"] == ["size_name"]        # 没发的那些,点名
-    # 单维不该报:否则这一栏天天有数,人就不看了
-    assert vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI",
-                   "B000AMXQVI", _ENUM)["extra_dims"] == []
+    assert p["attr_pairs"] == [("color", "Black"), ("size", "L")]
+    assert p["unmapped_dims"] == []
+
+
+def test_unmapped_dimension_is_dropped_not_escalated():
+    """部分维度映不上**只剔那几个**,不退单品(旧仓同款),但要点名。"""
+    p = vg.plan("A1", "color_name=Black; flavor_name=Vanilla", "A2", "P1",
+                _ENUM)                              # _ENUM 没有 flavor
+    assert p["mode"] == "variant"
+    assert p["attr_pairs"] == [("color", "Black")]
+    assert p["unmapped_dims"] == ["flavor_name"]
+
+
+def test_two_amazon_dims_mapping_to_one_walmart_attr_dedupe():
+    """`number_of_items` 与 `item_package_quantity` 都映向 count —— 只能出现一次。
+
+    重复列进 variantAttributeNames 会让载荷自相矛盾(同一个属性名两条)。
+    """
+    p = vg.plan("A1", "number_of_items=6; item_package_quantity=6", "A2",
+                "P1", _ENUM)
+    assert [n for n, _ in p["attr_pairs"]] == ["count"]
 
 
 def test_plan_uses_existing_group_id_when_family_already_listed():
@@ -175,16 +208,55 @@ def test_conform_single_mode_is_untouched():
 
 
 def test_conform_only_writes_fields_the_spec_registered():
-    """spec 没登记的字段一个都不许发:additionalProperties=false,多一个整条被拒。"""
+    """spec 没登记的字段一个都不许发:additionalProperties=false,多一个整条被拒。
+
+    ⚠ 2026-08-17 改判:属性名在 variantAttributeNames 枚举里、但 spec **没登记
+    这个属性**时,首版是"照发三件套 + 记一句'差异值无处可写'",现在**整套退单品**。
+    理由:只发 `variantAttributeNames=[color]` 而没有 color 字段,等于告诉沃尔玛
+    "我们按颜色分组"却不说自己是什么颜色 —— 组里几条长得一模一样。
+    (旧仓这一步会把值原样写进去再被 strip_unknown 剔掉,留下同款矛盾载荷;
+    这是我们比旧仓严的一处,不是迁漏。)
+    """
     from services import mp_conform as mc
     p = vg.plan("A1", "color_name=Black", "A2", "P1", ["color"])
     spec = {"properties": {
         "variantGroupId": {"type": "string"},
         "variantAttributeNames": {"type": "array", "items": {"enum": ["color"]}}}}
     v, notes = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
-    assert set(v) == {"variantGroupId", "variantAttributeNames"}
-    assert "isPrimaryVariant" not in v and "color" not in v
-    assert any("无 color 属性" in n for n in notes)
+    assert not any(k in v for k in mc._VARIANT_BAG)
+    assert any("差异值无处可写" in n for n in notes)
+
+
+def test_conform_drops_one_bad_value_without_killing_the_group():
+    """逐属性校验:一个值不合 enum 只剔它,另一个维度照常发(旧仓 Feature A)。
+
+    整组因为一个坏值退回单品,等于一条脏数据毁掉整个家族的变体体验。
+    """
+    from services import mp_conform as mc
+    spec = {"properties": {
+        "variantGroupId": {"type": "string"},
+        "variantAttributeNames": {"type": "array",
+                                  "items": {"enum": ["color", "size"]}},
+        "color": {"type": "string", "enum": ["Black", "Navy"]},
+        "size": {"type": "string"}}}
+    p = vg.plan("A1", "color_name=Chartreuse; size_name=L", "A2", "P1",
+                ["color", "size"])
+    v, notes = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
+    assert v["variantAttributeNames"] == ["size"] and v["size"] == "L"
+    assert "color" not in v
+    assert any("值不合本属性的 enum/类型" in n for n in notes)
+
+
+def test_conform_coerces_integer_variant_values():
+    """count / multipackQuantity 这类 spec 标 integer —— 发字符串会被类型错拒。"""
+    from services import mp_conform as mc
+    spec = {"properties": {
+        "variantGroupId": {"type": "string"},
+        "variantAttributeNames": {"type": "array", "items": {"enum": ["count"]}},
+        "count": {"type": "integer"}}}
+    p = vg.plan("A1", "number_of_items=6", "A2", "P1", ["count"])
+    v, _ = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
+    assert v["count"] == 6 and isinstance(v["count"], int)
 
 
 def test_code_is_stable_for_counting():

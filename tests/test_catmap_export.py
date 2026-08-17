@@ -8,8 +8,16 @@
 这行白填,而表面上"映射是有的")、dry-run 一格不写。
 """
 
+import pytest
+
 from registry import resources
 from workflows import catmap_export as ce
+
+
+@pytest.fixture(autouse=True)
+def _sheet_size(monkeypatch):
+    """默认让表看起来是空的 —— 骤缩护栏只在"表里本来有东西"时才该说话。"""
+    monkeypatch.setattr(ce.feishu, "sheet_row_count", lambda s: 0)
 
 
 class _Cur:
@@ -126,3 +134,36 @@ def test_empty_result_is_not_an_empty_overwrite(monkeypatch):
                         lambda s, rows: (_ for _ in ()).throw(
                             AssertionError("空结果不许写")))
     assert "没有匹配的行" in ce.run({"execute": True, "pt": "NoSuchPT"})
+
+
+def test_shrink_guard_stops_before_deleting_rows(monkeypatch):
+    """⚠ 2026-08-17 生产事故:整表重写把飞书 17592 行覆盖成库里的 15770 行,
+
+    净删 1847 行映射(1695 行指向有效 PT)。库里那份是 v5.5 xlsx 的一次性
+    导入快照,飞书侧此后一直在被维护 —— **"库更全"不是既定事实**。
+    risk_sync 家族的镜像早有空读/骤缩护栏,这里当初没照做。
+    """
+    monkeypatch.setattr(ce.db, "pg_conn", lambda: _Conn(_ROWS))     # 库 2 行
+    monkeypatch.setattr(ce.feishu, "sheet_row_count", lambda s: 101)  # 表 100 行
+    monkeypatch.setattr(ce.feishu, "sheet_overwrite",
+                        lambda s, rows: (_ for _ in ()).throw(
+                            AssertionError("骤缩时不许写")))
+    out = ce.run({"execute": True})
+    assert "已停手,一格未写" in out
+    assert "要少 98 行" in out
+    assert "catmap_import" in out          # 指向正确的补救路径
+
+
+def test_shrink_guard_can_be_overridden_when_intended(monkeypatch):
+    monkeypatch.setattr(ce.db, "pg_conn", lambda: _Conn(_ROWS))
+    monkeypatch.setattr(ce.feishu, "sheet_row_count", lambda s: 101)
+    monkeypatch.setattr(ce.feishu, "sheet_overwrite", lambda s, rows: len(rows))
+    assert "已整表重写" in ce.run({"execute": True, "allow_shrink": "1"})
+
+
+def test_shrink_guard_does_not_fire_on_a_filtered_export(monkeypatch):
+    """只导一个 PT 时本来就该少 —— 护栏不该在这里挡路。"""
+    monkeypatch.setattr(ce.db, "pg_conn", lambda: _Conn(_ROWS))
+    monkeypatch.setattr(ce.feishu, "sheet_row_count", lambda s: 9999)
+    monkeypatch.setattr(ce.feishu, "sheet_overwrite", lambda s, rows: len(rows))
+    assert "已整表重写" in ce.run({"execute": True, "pt": "Hammers"})

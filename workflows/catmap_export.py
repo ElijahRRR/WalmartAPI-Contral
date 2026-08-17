@@ -5,12 +5,20 @@
   python cli.py catmap_export                    # 整表重写
   python cli.py catmap_export -p pt=Hammers      # 只导某个 PT(排查用,仍整表重写)
   python cli.py catmap_export -p node_only=1     # 只导有 browse_node_id 的行
+  python cli.py catmap_export -p allow_shrink=1  # 确认就是要把表写少(默认停手)
 
 所有者定稿 2026-08-17:「以前的审核系统是从这里拿的,我们现在直接当映射查看使用」。
 
-⚠ **方向是库 → 飞书,不是反过来。** 权威在 `audit.walmart_category_map`
-(catmap_mine/suggest/fix/align 那条链维护它),这张表只是镜子。
-在表里改一个格子不会影响任何判定,下一次导出就被覆盖 —— 要改映射走那条链。
+⚠ **方向是库 → 飞书**:判定读的是 `audit.walmart_category_map`,在飞书表里改
+一个格子不会影响任何判定,下一次导出就被覆盖 —— 要改映射走
+catmap_mine/suggest/fix/align 那条链。
+
+⚠⚠ **但"库更全"不是既定事实,先对账再导**(2026-08-17 生产事故):
+库里那份是当年从 `mapping_detail_v5.5.xlsx` 一次导入的 15,770 行**快照**,
+而飞书那张表此后一直在被维护(挖掘成果 + 人工修冲突),涨到 17,592 行,
+**库从没往回同步过**。首版没有护栏,整表重写一把删掉 1,847 行映射
+(其中 1,695 行指向有效 PT)。现在:缩量超 SHRINK_TOLERANCE 直接停手,
+先跑 `catmap_import` 把飞书侧补回库,再导出。
 
 列序即所有者手上那份的表头(`resources.CATMAP_SHEET_HEADER`),一个字都不许动:
 他那边的筛选/公式按列位置写死,列一挪就全废,而且不报错。
@@ -27,6 +35,10 @@ from registry import db, resources
 DANGEROUS = False       # 只写飞书镜子,不碰沃尔玛也不改库
 
 logger = logging.getLogger("workflows.catmap_export")
+
+# 允许的缩量比例。超了就停手 —— 整表重写会把多出来的行删掉,而"库比飞书旧"
+# 在本仓是**实际发生过的**(2026-08-17),不是理论风险
+SHRINK_TOLERANCE = 0.02
 
 # 列序 = registry.CATMAP_SHEET.columns,别在这里另排一遍
 _SQL = """
@@ -62,6 +74,8 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute")) and not params.get("dry_run")
     pt = str(params.get("pt", "")).strip()
     node_only = bool(params.get("node_only"))
+    # 只导一个 PT / 只导带 node 的时候本来就该少,护栏不适用
+    allow_shrink = bool(params.get("allow_shrink")) or bool(pt) or node_only
 
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL, {"pt": pt, "node_only": node_only})
@@ -92,6 +106,22 @@ def run(params: dict) -> str:
         lines.append("     " + "、".join(bad_pts[:12])
                      + (f" …另 {len(bad_pts) - 12} 个" if len(bad_pts) > 12
                         else ""))
+
+    # ⚠ 骤缩护栏(2026-08-17 生产事故:首版没有它,把飞书 17592 行的表整表重写
+    # 成库里的 15770 行,**净丢 1847 行映射,其中 1695 行指向有效 PT**——
+    # 库里那份是 v5.5 xlsx 导入的存量,飞书侧后来补过挖掘成果,库从没同步回来)。
+    # risk_sync 家族的镜像早有"空读/骤缩护栏"先例,这里当初没照做。
+    now = 0 if allow_shrink else (
+        feishu.sheet_row_count(resources.CATMAP_SHEET) - 1)   # 减表头
+    shrink = now - len(body)
+    if now > 0 and shrink > 0 and shrink > now * SHRINK_TOLERANCE:
+        return "\n".join(lines + [
+            "", f"⛔ **已停手,一格未写**:表里现有 {now} 行,本次只有 "
+            f"{len(body)} 行,要少 {shrink} 行"
+            f"(超过 {SHRINK_TOLERANCE:.0%} 容忍)。",
+            "   整表重写会把多出来的那些行**删掉**。库里这份多半比飞书旧 ——",
+            "   先跑 `python cli.py catmap_import --dry-run` 看飞书有多少行库里没有,",
+            "   把飞书侧补回库里之后再导出;确认就是要缩,加 -p allow_shrink=1"])
 
     if not execute:
         lines += ["", "(dry-run:一格未写;去掉 --dry-run 才推飞书)"]

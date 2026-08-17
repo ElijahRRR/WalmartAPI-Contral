@@ -146,7 +146,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 | 状态 | 项 | 后果 |
 |---|---|---|
 | ✅ | ~~**backup 工作流零代码**~~(2026-08-13 落地 `workflows/backup.py`:`-Fc` 先写 `.part` → `pg_restore --list` 校验 → 原子换名;2026-08-13 生产首跑 1554.5 MB 过校验;2026-08-17 起每天 02:00 自动跑) | 结案 |
-| ⚙ | **FEISHU_WEBHOOK_URL 未配**(plan.md:57) | 采集类型告警、feed 未知状态告警、邮编未采纳告警……**全部只进日志没人看**。⚠ 这条**还没解决**,而现在有 11 条自动任务在跑 —— 失败通知发不出去等于没人知道 |
+| ✅ | ~~**FEISHU_WEBHOOK_URL 未配** ⇒ 通知没人看~~ —— **这条早就不成立了,别再照它报**(所有者 2026-08-17 纠正)。`api/feishu.notify()` 的**第一条路是应用身份直发**(`FEISHU_NOTIFY_TO`,`im/v1/messages`),webhook 只是切换期的第二条退路;生产用的是应用直发,通知正常发出。⚠ 我在本轮把这条陈述从这里抄进 README 还加重了一遍 —— 教训:**"文档里写着没配"不是"没配"的证据**,证据是 `notify()` 的代码与生产日志 | 结案 |
 | ⚙ | READONLY_DB_PASSWORD(plan.md:34)、SCRAPER_EXPORT_TOKEN(api/scraper.py 每轮告警)、FEISHU_LIMITS_*(maintenance 清零硬依赖,feishu_tables.md:55) | 各自阻塞一条链 |
 | ✅ | ~~**旧调度未盘清**~~(2026-08-17 所有者已停掉旧 erpAPI 的全部定时任务并核对:旧冲突的订单/KPI 调度原本已 `PAUSED`/`disabled`;`walmart-daily-cleanup` 那条也在 gpt 侧,随之一并停) | 结案。⚠ 旧上架/审核 worker **仍在跑**,是所有者的决定(不写表,留作备用),不是漏停 |
 | ⬜ | `docs/legacy_schedules/` 归档目录不存在(plan.md:153 回滚预案要求删除旧调度前先归档) | 切换已完成,这条降为"旧配置没留副本";真要回滚只能靠旧仓库 |
@@ -265,7 +265,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ⬜ 调度挂载(验收后):upc_sync/catalog_sync(早)→ maintenance → list_new(每日)、feed_poll(每 30 分钟)、sku_locked_heal(每日)、risk_sync(每日);**顺序硬约束 catalog_sync → maintenance/list_new**
 - ⬜ 切换清单执行:停旧 launchd 5 条 + AI skill 链 erp-online-products-track(**两条同停**,新旧并跑=重复领号重复上架);旧在途 pending feed 先收干净
 - ✅ ~~L4~~ 全部关闭:upc_audit **不需要**(所有者拍板 2026-08-13);历史数据迁移批次已整批关闭(2026-08-12)
-- ⬜ FEISHU_WEBHOOK_URL 未配置(生产日志反复出现):配上后 cli 成功/失败通知才真发飞书
+- ✅ ~~FEISHU_WEBHOOK_URL 未配置~~ —— 通知走**应用直发**(`FEISHU_NOTIFY_TO`),webhook 只是退路,不配也正常发(所有者 2026-08-17 纠正;见 `api/feishu.notify`)
 
 **切换清单增补(归第六节后置,但必须记)**:旧系统有**第二条调度链**——AI skill 平台 erp-online-products-track(07:30,reconcile→sync_online_products→sync_status_track,写上架表 O/P/Q 与 R~W)。停旧时 launchd 5 条之外必须一起停,否则新旧双写同列
 **26→21 列迁移口径**:旧 V/W(真实UPC/UPC一致)左移至新 T/U——**按列名对齐,严禁按位对齐**;真丢语义仅旧 T/U(状态跟踪,已由 catalog.walmart_items+product_events 升级承接)与 AA(变体组,随变体后置)

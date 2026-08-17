@@ -1,11 +1,14 @@
-"""catmap_prune 回归:清「改过了但旧行没清」的死映射。
+"""catmap_prune 回归:清掉指向"不存在的 PT"的映射行。
 
-2026-08-17 实证:所有者映射表 150 行死映射,**150 行全是这种** ——
-同一 Amazon 路径已经有一条有效 PT,死行只是当年修正时没清
-(catmap_fix 的惯例是插新行不删旧行,旧映射当历史证据留着)。
+所有者定稿 2026-08-17:「不在 spec 模版里的需要清理掉,准入漏了的需要补」。
 
-它们不是无害的脏数据:装配 L1 catmap 时同路径两个 DISTINCT PT 判两义 →
-连有效那条一起丢,白丢 105 条本可直出的路径。
+首版有两处错,都被他在投影表里当场看出来(那批行还在,而且没有
+Walmart Category / PTG,一眼就是空的):
+  ① 缺省只**降级**不删 —— 降级的行仍留在映射表里,导出到飞书还是那一堆,
+     "清理"根本没有发生;
+  ② 判据用的是 `walmart_pt_meta`(准入明细),而准入明细只是飞书侧的镜像:
+     准入有·spec 无的 66 个 PT 按它判会被当成"有效"漏掉,
+     spec 有·准入无的 9 个(全汽配)则会被误删 —— 那些是真 PT,该补表不该删映射。
 """
 
 import pytest
@@ -17,6 +20,7 @@ class _Cur:
     def __init__(self, store):
         self.store = store
         self.rowcount = 0
+        self._out = []
 
     def __enter__(self):
         return self
@@ -25,11 +29,15 @@ class _Cur:
         return False
 
     def execute(self, sql, params=None):
-        if "SELECT d.amazon_category" in sql:
+        self.store.setdefault("sql", []).append(sql)
+        if "FROM audit.walmart_pt_meta" in sql:
+            self._out = [(p,) for p in self.store["meta"]]
+            return
+        if "FROM audit.walmart_category_map d" in sql:
             self._out = self.store["rows"]
             return
-        self.store["ops"].append(("DELETE" if sql.strip().startswith("DELETE")
-                                  else "UPDATE", params))
+        self.store["ops"].append(
+            ("DELETE" if sql.strip().startswith("DELETE") else "UPDATE", params))
         self.rowcount = 1
 
     def fetchall(self):
@@ -37,8 +45,8 @@ class _Cur:
 
 
 class _Conn:
-    def __init__(self, rows):
-        self.store = {"rows": rows, "ops": []}
+    def __init__(self, rows, meta=()):
+        self.store = {"rows": rows, "meta": set(meta), "ops": []}
         self.committed = False
 
     def __enter__(self):
@@ -54,127 +62,128 @@ class _Conn:
         self.committed = True
 
 
+# (路径, PT, 置信度, 备注, 同路径的另一个 PT)
 _ROWS = [
-    ("Home > Lighting > Book Lights", "Novelty Lights", "高",
-     "阅读灯→Novelty Lights", "Novelty Lighting"),
-    ("Home > Lighting > Disco Ball Lamps", "Novelty Lights", "高",
-     "迪斯科球→Novelty Lights", "Novelty Lighting"),
+    ("Home > Lighting > Book Lights", "Novelty Lights", "低",
+     " [catmap_prune:…降级]", "Novelty Lighting"),      # 上一版降过级,行还在
+    ("Auto > Brakes > Calipers", "Disc Brake Calipers", "高",
+     "", "Automotive Brakes"),                          # spec 有·准入无
+    ("Home > Decor > Clocks", "Retired PT", "高", "", ""),   # 准入有·spec 无
+    ("Tools > Hammers", "Hammers", "高", "", ""),            # 正常
 ]
+_SPEC = {"Novelty Lighting", "Disc Brake Calipers", "Hammers",
+         "Automotive Brakes"}
+_META = {"Novelty Lighting", "Retired PT", "Hammers", "Automotive Brakes"}
 
 
-def test_dry_run_lists_and_changes_nothing(monkeypatch):
-    conn = _Conn(_ROWS)
+@pytest.fixture
+def _spec(monkeypatch):
+    monkeypatch.setattr(cp.pt_spec, "known_pts", lambda: set(_SPEC))
+
+
+def test_spec_is_the_judge_not_the_admission_sheet(_spec, monkeypatch):
+    """⚠ 两个方向都会判错,所以判据必须是 spec 不是准入明细。
+
+    · spec 有·准入无(Disc Brake Calipers)= **真 PT**,该补准入明细,不该删映射;
+    · 准入有·spec 无(Retired PT)= 沃尔玛已经没这个 PT,映射是死的,该删。
+    """
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True})
+    deleted = {p["pt"] for k, p in conn.store["ops"] if k == "DELETE"}
+    assert deleted == {"Novelty Lights", "Retired PT"}
+    assert "Disc Brake Calipers" not in deleted     # 真 PT,留着
+    assert "Hammers" not in deleted
+    assert "官方 MP_ITEM spec" in out
+
+
+def test_meta_mode_judges_differently(_spec, monkeypatch):
+    """旧口径保留但要能看出差别:按准入明细判会漏掉 Retired PT、误删汽配那条。"""
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True, "by": "meta"})
+    deleted = {p["pt"] for k, p in conn.store["ops"] if k == "DELETE"}
+    assert "Retired PT" not in deleted              # 漏掉了(准入表里有)
+    assert "Disc Brake Calipers" in deleted         # 误删(准入表里没有)
+
+
+def test_default_actually_deletes(_spec, monkeypatch):
+    """⚠ 首版缺省只降级 —— 降级的行仍留在表里,导出到飞书还是那一堆空 Category。
+
+    所有者 2026-08-17 在投影表里当场看到这批还在:「数据库的类目映射没有
+    清理干净……这些都没有 Walmart Category / PTG,应该被删掉才对」。
+    """
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True})
+    assert {k for k, _ in conn.store["ops"]} == {"DELETE"}
+    assert "**删除**" in out and conn.committed
+
+
+def test_already_downgraded_rows_are_still_deleted(_spec, monkeypatch):
+    """⚠ 上一版降过级的行**必须还能被删** —— 它们正是所有者看到的那批。
+
+    首版的幂等判据是"备注里有 [catmap_prune:"就跳过,于是第二次跑报
+    "没有了",而行还在表里。幂等不能变成"再也清不掉"。
+    """
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True})
+    assert any(p["pt"] == "Novelty Lights"
+               for k, p in conn.store["ops"] if k == "DELETE")
+
+
+def test_keep_mode_downgrades_with_a_trail(_spec, monkeypatch):
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True, "keep": "1"})
+    assert {k for k, _ in conn.store["ops"]} == {"UPDATE"}
+    tag = conn.store["ops"][0][1]["tag"]
+    assert "不在官方 MP_ITEM spec" in tag and "Novelty Lighting" in tag
+    assert "保留行" in out
+
+
+def test_orphan_paths_are_flagged(_spec, monkeypatch):
+    """同路径没有别的映射 → 清掉就真成缺口,必须点名多少条、由谁重建。"""
+    conn = _Conn(_ROWS, _META)
     monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
     out = cp.run({"execute": True, "dry_run": True})
-    assert "2 行 / 1 个死 PT / 2 条路径" in out
-    assert "Novelty Lights" in out and "Novelty Lighting" in out
+    assert "1 行**同路径没有别的映射**" in out    # Retired PT 那条
+    assert "catmap_mine" in out and "catmap_gap" in out
+
+
+def test_missing_spec_never_becomes_an_empty_truth(monkeypatch):
+    """⚠ spec 取不到就停手 —— 拿空集合当"真相"会把整张表删光。"""
+    monkeypatch.setattr(cp.pt_spec, "known_pts",
+                        lambda: (_ for _ in ()).throw(
+                            FileNotFoundError("_pt_index.json 不存在")))
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS, _META))
+    with pytest.raises(RuntimeError, match="已停手"):
+        cp.run({"execute": True})
+
+
+def test_empty_judge_set_stops_too(monkeypatch):
+    monkeypatch.setattr(cp.pt_spec, "known_pts", lambda: set())
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS, _META))
+    with pytest.raises(RuntimeError, match="删光整张表"):
+        cp.run({"execute": True})
+
+
+def test_dry_run_changes_nothing(_spec, monkeypatch):
+    conn = _Conn(_ROWS, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True, "dry_run": True})
     assert "一行未改" in out
     assert conn.store["ops"] == [] and not conn.committed
 
 
-def test_default_downgrades_and_leaves_a_trail(monkeypatch):
-    """⚠ 缺省不删:旧映射是历史证据,删了就查不出"当初为什么这么映"。
-
-    降级后 confidence='低' 不再进高置信通道,备注写清为什么降、正确答案是谁。
-    """
-    conn = _Conn(_ROWS)
+def test_all_clean_is_said_plainly(_spec, monkeypatch):
+    conn = _Conn([("p", "Hammers", "高", "", "")], _META)
     monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    out = cp.run({"execute": True})
-    kinds = {k for k, _ in conn.store["ops"]}
-    assert kinds == {"UPDATE"}
-    tag = conn.store["ops"][0][1]["tag"]
-    assert "不在 walmart_pt_meta" in tag and "Novelty Lighting" in tag
-    assert "已降级 2 行" in out and conn.committed
-    # 清完要提醒重审,否则受影响的产品还卡在 pending
-    assert "mode=pending" in out
-
-
-def test_delete_requires_an_explicit_flag(monkeypatch):
-    conn = _Conn(_ROWS)
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    out = cp.run({"execute": True, "delete": "1"})
-    assert {k for k, _ in conn.store["ops"]} == {"DELETE"}
-    assert "已删除 2 行" in out
-
-
-def test_nothing_to_do_is_said_plainly(monkeypatch):
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn([]))
     assert "没有" in cp.run({"execute": True})
 
 
-def test_summary_explains_why_these_rows_are_not_harmless(monkeypatch):
-    """不解释的话,人会觉得"反正字典闸会拦,留着无所谓"。"""
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS))
-    out = cp.run({"execute": True, "dry_run": True})
-    assert "两义" in out and "一起丢掉" in out
-
-
-def test_already_pruned_rows_are_not_touched_again(monkeypatch):
-    """⚠ 幂等:降过的不再降。
-
-    所有者 2026-08-17 连跑了两次,同 150 行被处理两遍 —— 降级本身幂等
-    (还是 '低'),但**备注会被重复追加**,而且摘要一直报"已降级 150 行",
-    看着像每天都在发现新问题。判据 = 备注里已有 [catmap_prune: 标记。
-    """
-    sql_seen = []
-
-    class _C(_Cur):
-        def execute(self, sql, params=None):
-            sql_seen.append(sql)
-            super().execute(sql, params)
-
-    conn = _Conn(_ROWS)
-    monkeypatch.setattr(conn, "cursor", lambda: _C(conn.store))
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    cp.run({"execute": True, "dry_run": True})
-    pick = next(s for s in sql_seen if "SELECT d.amazon_category" in s)
-    assert "NOT LIKE" in pick and "catmap_prune" in pick
-
-
-def test_the_trail_tag_matches_what_the_filter_looks_for(monkeypatch):
-    """⚠ 留痕的标记与幂等判据必须是同一串 —— 对不上就等于没有幂等。"""
-    conn = _Conn(_ROWS)
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    cp.run({"execute": True})
-    tag = conn.store["ops"][0][1]["tag"]
-    assert "[catmap_prune:" in tag          # 与 _SQL_PICK 的 NOT LIKE 同串
-
-
-_ORPHAN_ROWS = _ROWS + [
-    ("Only > This > Path", "Ghost PT", "高", "", "(同路径也没有有效 PT)"),
-]
-
-
-def test_all_mode_covers_every_dead_row_and_flags_the_orphans(monkeypatch):
-    """所有者定稿 2026-08-17:「不存在的 pt 直接清理掉」。
-
-    ⚠ 但同路径没有有效 PT 的那些,清掉就**真成缺口** —— 必须点名多少条、
-    由谁重建,否则它会悄悄变成"这些产品从此解不出类目"。
-    """
-    conn = _Conn(_ORPHAN_ROWS)
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    out = cp.run({"execute": True, "dry_run": True, "all": "1"})
-    assert "字典外 PT 的映射(全部)" in out
-    assert "1 行**同路径没有有效 PT**" in out
-    assert "catmap_mine" in out and "catmap_gap" in out
-
-
-def test_all_mode_picks_a_different_query(monkeypatch):
-    """两种口径必须是两条 SQL —— 缺省那条要求有有效兄弟,all 那条不要求。"""
-    seen = []
-
-    class _C(_Cur):
-        def execute(self, sql, params=None):
-            seen.append(sql)
-            super().execute(sql, params)
-
-    conn = _Conn(_ORPHAN_ROWS)
-    monkeypatch.setattr(conn, "cursor", lambda: _C(conn.store))
-    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
-    cp.run({"execute": True, "dry_run": True, "all": "1"})
-    assert any("LEFT JOIN audit.walmart_category_map g" in s for s in seen)
-    seen.clear()
-    cp.run({"execute": True, "dry_run": True})
-    assert any("JOIN audit.walmart_category_map g" in s
-               and "LEFT JOIN audit.walmart_category_map g" not in s
-               for s in seen)
+def test_bad_by_value_is_rejected(monkeypatch):
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS, _META))
+    with pytest.raises(ValueError, match="只能是"):
+        cp.run({"execute": True, "by": "meta2"})

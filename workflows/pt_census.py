@@ -200,13 +200,28 @@ def run(params: dict) -> str:
 
     miss = [r for r in rows if r["判定"] == "准入漏了"]
     if miss:
-        # 真 PT 但准入明细没收 → R1/R3 对它静默放行,这是闸真有洞
+        # 真 PT 但准入明细没收 → R1/R3 对它静默放行,这是闸真有洞。
+        # ⚠ 这批**绝不能当死映射清掉**(catmap_prune 按 spec 判正是为了这个):
+        # 它们在官方 spec 里,是能上架的真类目,只是我们那张表没收
         lines.append("")
         lines.append(f"⚠ **准入明细漏收 {len(miss)} 个真 PT**"
                      f"(官方 spec 里有)—— R1 准入闸与 R3 认证闸对它们静默放行。"
-                     f"处置:补进飞书「沃尔玛类目准入明细」")
+                     f"处置:**补进飞书「沃尔玛类目准入明细」**,"
+                     f"不是删映射(它们是真类目)")
         lines += [f"    {r['walmart_product_type']}(映射 {r['映射条数']} 条)"
                   for r in sorted(miss, key=lambda r: -r["映射条数"])[:15]]
+        if export:
+            paths.reports_dir().mkdir(parents=True, exist_ok=True)
+            p = paths.reports_dir() / "pt_待补准入明细.csv"
+            with open(p, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                # 表头与飞书那张表同序,填完准入两列直接粘回去
+                w.writerow(["Walmart Product Type", "准入状态", "中国卖家可做",
+                            "映射条数", "备注"])
+                for r in sorted(miss, key=lambda r: -r["映射条数"]):
+                    w.writerow([r["walmart_product_type"], "", "",
+                                r["映射条数"], "spec 里有、准入明细没收"])
+            lines.append(f"    → 待补清单 {p}(准入两列留空,填完粘回飞书)")
 
     old = [r for r in rows if r["判定"] == "旧行没清"]
     if old:

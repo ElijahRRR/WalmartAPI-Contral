@@ -197,3 +197,26 @@ def test_superseded_rows_get_their_own_verdict(monkeypatch, tmp_path):
     # 必须说清它不是无害脏数据:两义会把有效那条一起丢掉
     assert "改过了但旧行没清" in out and "一起丢掉" in out
     assert "catmap_prune" in out                       # 指向处置命令
+
+
+def test_admission_gaps_get_their_own_paste_ready_csv(monkeypatch, tmp_path):
+    """⚠ 「准入漏了」的处置是**补表**,不是删映射 —— 它们在官方 spec 里,是真类目。
+
+    所有者 2026-08-17:「不在 spec 模版里的需要清理掉,准入漏了的需要补」。
+    两件事方向相反,清单也要分开给:待补那份按飞书表头出,准入两列留空,
+    填完直接粘回去。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [("Disc Brake Calipers", 2)],
+        "LEFT JOIN audit.walmart_pt_meta dm": []}))
+    monkeypatch.setattr(pc.pt_spec, "known_pts",
+                        lambda: {"Disc Brake Calipers"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    out = pc.run({})
+    assert "不是删映射(它们是真类目)" in out
+    csvp = tmp_path / "pt_待补准入明细.csv"
+    text = csvp.read_text(encoding="utf-8-sig")
+    assert text.splitlines()[0].startswith("Walmart Product Type,准入状态,中国卖家可做")
+    assert "Disc Brake Calipers,,,2" in text      # 准入两列留空待填

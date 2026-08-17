@@ -36,7 +36,7 @@
 
 店铺闸:ops.store_kpi_daily 最新 store_status 非 ACTIVE 的店整体跳过。
 
-调度顺序:catalog_sync → problem_scan → problem_product_cleanup --execute。
+调度顺序:catalog_sync → problem_scan → problem_product_cleanup(真跑)。
 """
 
 import logging
@@ -444,6 +444,6 @@ def run(params: dict) -> str:
         lines.append(dispositions.stuck_note(stuck))
     if bl_note:
         lines.append(bl_note)
-    lines.append("执行走 `python cli.py problem_product_cleanup --execute`"
+    lines.append("执行走 `python cli.py problem_product_cleanup`(先 --dry-run 看破坏面)"
                  "(本工作流不发任何 feed)")
     return "\n".join(lines)

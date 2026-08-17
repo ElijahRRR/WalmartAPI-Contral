@@ -40,6 +40,23 @@ def test_group_id_is_derived_not_looked_up():
     assert vg.group_id(None, "") is None
 
 
+def test_group_id_self_parent_falls_back_to_min_family():
+    """⚠ parent_asin **等于自己**时拿它当组 ID,会把同组 N 个兄弟切成 N 组。
+
+    旧仓 `variant_groups_design.md` §3.3 记着这个坑:它的采集侧(DMIT)每行的
+    parent_asin 就是该行自己,所以旧仓一律用 min(full_set)。我们现在的采集侧
+    给真族主,但它哪天改回"填自己",这里得能自愈 —— 而且不报错的分裂最难查。
+    """
+    fam = ["B0000000A1", "B0000000A2", "B0000000A3"]
+    ids = {vg.group_id(a, a, fam) for a in fam}      # parent 全填自己
+    assert ids == {"vg_B0000000A1"}                  # 三个兄弟同一个 ID
+    # 真族主(生产实见形态)照旧按 parent 派生,ID 更好认
+    assert vg.group_id("B000AMXQVI", "B0009GGJ9G",
+                       ["B0009GGJ9G", "B0009GGJCI"]) == "vg_B000AMXQVI"
+    # 孤品(家族只有自己)不受影响
+    assert vg.group_id("", "B0000000A1", ["B0000000A1"]) == "vg_B0000000A1"
+
+
 def test_pick_walmart_dim_never_guesses():
     assert vg.pick_walmart_dim(["color_name"], _ENUM) == "color"
     assert vg.pick_walmart_dim(["size_name"], _ENUM) == "size"
@@ -57,8 +74,45 @@ def test_plan_variant_happy_path():
                 "B000AMXQVI", _ENUM)
     assert p["mode"] == "variant" and p["reason"] == ""
     assert p["group_id"] == "vg_B000AMXQVI"
-    assert (p["attr_name"], p["attr_value"]) == ("color", "Black")
+    assert p["attr_pairs"] == [("color", "Black")]
     assert p["family_size"] == 3 and p["is_primary"] is True
+
+
+def test_multi_dim_family_sends_every_mapped_dimension():
+    """color+size 的家族**两个维度都要发**(2026-08-17 对着旧仓核实后补齐)。
+
+    旧仓 `auto_listing/mapper.py:1374` 是 `sorted(allowed_names &
+    set(var_attrs.keys()))` —— 取交集全体;设计文档 §3.5/§4.2 同。我们首版只取
+    第一个,是**迁漏**。后果不是少个字段:同族里只差 size 的两个成员会带着
+    同一个 variantGroupId + 同一个 color 值发出去,沃尔玛看不出差异。
+
+    顺序按沃尔玛属性名排序 —— 同组成员算出的顺序必须一致,否则同一个组里
+    几条的 variantAttributeNames 顺序不同,排查时看着像两组。
+    """
+    p = vg.plan("B0009GGJ9G", "color_name=Black; size_name=L",
+                "B0009GGJCI", "B000AMXQVI", _ENUM)
+    assert p["mode"] == "variant"
+    assert p["attr_pairs"] == [("color", "Black"), ("size", "L")]
+    assert p["unmapped_dims"] == []
+
+
+def test_unmapped_dimension_is_dropped_not_escalated():
+    """部分维度映不上**只剔那几个**,不退单品(旧仓同款),但要点名。"""
+    p = vg.plan("A1", "color_name=Black; flavor_name=Vanilla", "A2", "P1",
+                _ENUM)                              # _ENUM 没有 flavor
+    assert p["mode"] == "variant"
+    assert p["attr_pairs"] == [("color", "Black")]
+    assert p["unmapped_dims"] == ["flavor_name"]
+
+
+def test_two_amazon_dims_mapping_to_one_walmart_attr_dedupe():
+    """`number_of_items` 与 `item_package_quantity` 都映向 count —— 只能出现一次。
+
+    重复列进 variantAttributeNames 会让载荷自相矛盾(同一个属性名两条)。
+    """
+    p = vg.plan("A1", "number_of_items=6; item_package_quantity=6", "A2",
+                "P1", _ENUM)
+    assert [n for n, _ in p["attr_pairs"]] == ["count"]
 
 
 def test_plan_uses_existing_group_id_when_family_already_listed():
@@ -154,16 +208,55 @@ def test_conform_single_mode_is_untouched():
 
 
 def test_conform_only_writes_fields_the_spec_registered():
-    """spec 没登记的字段一个都不许发:additionalProperties=false,多一个整条被拒。"""
+    """spec 没登记的字段一个都不许发:additionalProperties=false,多一个整条被拒。
+
+    ⚠ 2026-08-17 改判:属性名在 variantAttributeNames 枚举里、但 spec **没登记
+    这个属性**时,首版是"照发三件套 + 记一句'差异值无处可写'",现在**整套退单品**。
+    理由:只发 `variantAttributeNames=[color]` 而没有 color 字段,等于告诉沃尔玛
+    "我们按颜色分组"却不说自己是什么颜色 —— 组里几条长得一模一样。
+    (旧仓这一步会把值原样写进去再被 strip_unknown 剔掉,留下同款矛盾载荷;
+    这是我们比旧仓严的一处,不是迁漏。)
+    """
     from services import mp_conform as mc
     p = vg.plan("A1", "color_name=Black", "A2", "P1", ["color"])
     spec = {"properties": {
         "variantGroupId": {"type": "string"},
         "variantAttributeNames": {"type": "array", "items": {"enum": ["color"]}}}}
     v, notes = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
-    assert set(v) == {"variantGroupId", "variantAttributeNames"}
-    assert "isPrimaryVariant" not in v and "color" not in v
-    assert any("无 color 属性" in n for n in notes)
+    assert not any(k in v for k in mc._VARIANT_BAG)
+    assert any("差异值无处可写" in n for n in notes)
+
+
+def test_conform_drops_one_bad_value_without_killing_the_group():
+    """逐属性校验:一个值不合 enum 只剔它,另一个维度照常发(旧仓 Feature A)。
+
+    整组因为一个坏值退回单品,等于一条脏数据毁掉整个家族的变体体验。
+    """
+    from services import mp_conform as mc
+    spec = {"properties": {
+        "variantGroupId": {"type": "string"},
+        "variantAttributeNames": {"type": "array",
+                                  "items": {"enum": ["color", "size"]}},
+        "color": {"type": "string", "enum": ["Black", "Navy"]},
+        "size": {"type": "string"}}}
+    p = vg.plan("A1", "color_name=Chartreuse; size_name=L", "A2", "P1",
+                ["color", "size"])
+    v, notes = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
+    assert v["variantAttributeNames"] == ["size"] and v["size"] == "L"
+    assert "color" not in v
+    assert any("值不合本属性的 enum/类型" in n for n in notes)
+
+
+def test_conform_coerces_integer_variant_values():
+    """count / multipackQuantity 这类 spec 标 integer —— 发字符串会被类型错拒。"""
+    from services import mp_conform as mc
+    spec = {"properties": {
+        "variantGroupId": {"type": "string"},
+        "variantAttributeNames": {"type": "array", "items": {"enum": ["count"]}},
+        "count": {"type": "integer"}}}
+    p = vg.plan("A1", "number_of_items=6", "A2", "P1", ["count"])
+    v, _ = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
+    assert v["count"] == 6 and isinstance(v["count"], int)
 
 
 def test_code_is_stable_for_counting():
@@ -177,13 +270,133 @@ def test_code_is_stable_for_counting():
 
 
 def test_list_new_counts_by_code_not_by_reason_words():
-    """接线侧钉住:用 vplan["code"] 做计数键。"""
+    """接线侧钉住:用 vp["code"] 做计数键(reason 是中文长句,分词计数会散)。"""
     import inspect
 
     from workflows import list_new
-    src = inspect.getsource(list_new)
-    assert 'n_var[vplan["code"]]' in src
+    src = inspect.getsource(list_new._plan_variants)
+    assert 'n_var[vp["code"]]' in src
     assert 'reason"].split' not in src
+
+
+def test_variant_counts_are_computed_before_the_summary_line():
+    """⚠ 摘要里的"变体"一栏曾经**从来没出现过** —— 死代码,dry-run 与真跑都没数。
+
+    根因:`gate_line` 是拼好的**字符串**,而 n_var 原来在它下面的提交循环里才填,
+    后填的计数永远进不去;dry-run 更是在提交循环之前就 return 了。
+    这条用例钉的是**顺序**:变体决策必须在 gate_line 拼出来之前算完。
+    """
+    import inspect
+
+    src = inspect.getsource(__import__("workflows.list_new",
+                                       fromlist=["run"]).run)
+    assert src.index("_plan_variants(ready") < src.index('gate_line = (f"闸门')
+    # 提交循环必须**复用**这份决策,不许重算 —— 重算就是 dry-run 报一份、
+    # 真跑发另一份,中间任何差异都表现为"dry-run 说没事"
+    assert 'vplan = r.get("_vplan")' in src
+    assert "_variant_plan(" not in src               # 只在 _plan_variants 里调
+
+
+def _vrow(asin, pairs, gid="vg_G", store="M001"):
+    return {"asin": asin, "store": store,
+            "_vplan": {"mode": "variant", "group_id": gid, "code": "variant",
+                       "is_primary": True, "attr_pairs": list(pairs),
+                       "family_size": 3}}
+
+
+def test_dimension_with_identical_values_across_the_group_is_dropped():
+    """⚠ 声明一个组内取值全同的维度 = 告诉沃尔玛"按尺寸不同"再给三个一样的尺寸。
+
+    2026-08-17 生产实见(所有者的礼品袋组):亚马逊给的 size_name 三个成员**全是**
+    `1 Count (Pack of 100)` —— 那不是尺寸是包装数量,对分组毫无信息量。真正区分
+    它们的是标题里的 Small/Medium/Large,亚马逊自己没放进 twister 维度。
+    """
+    from workflows import list_new as ln
+    S = ("size", "1 Count (Pack of 100)")
+    rows = [_vrow("B0BWMV956C", [("color", "Kraft brown"), S]),
+            _vrow("B0BWMVQHVJ", [("color", "Brown"), S]),
+            _vrow("B0BWMY43TD", [("color", "Original brown"), S])]
+    ln._drop_degenerate_dims(rows)
+    for r in rows:
+        assert [n for n, _ in r["_vplan"]["attr_pairs"]] == ["color"]
+        assert r["_vplan"]["degenerate_dims"] == ["size"]
+        assert r["_vplan"]["mode"] == "variant"      # color 还有差异,仍是变体组
+
+
+def test_group_with_no_differentiating_dimension_falls_back_to_single():
+    """维度剔光 ⇒ 这几条压根不该是一个变体组(沃尔玛看不出区别),整组退单品。
+
+    宁可各自独立上架,也不要发一个成员之间毫无区别的变体组 —— 后者要用
+    MP_MAINTENANCE 才改得回来。
+    """
+    from workflows import list_new as ln
+    rows = [_vrow("A1", [("size", "X")]), _vrow("A2", [("size", "X")])]
+    ln._drop_degenerate_dims(rows)
+    for r in rows:
+        assert r["_vplan"]["mode"] == "single"
+        assert r["_vplan"]["code"] == "no_diff_dim"
+        assert "取值全同" in r["_vplan"]["reason"]
+
+
+def test_single_visible_member_is_never_judged_degenerate():
+    """本轮只看见 1 个成员时**什么都不做** —— 一条数据判不出"组内有没有差异"。
+
+    所有者第一次验收就是只放了 2 个成员进表(家族 3 个),按"可能有差异"处理
+    才是对的;据一条就剔维度,等于把增量上架的第一条永久判成单品。
+    """
+    from workflows import list_new as ln
+    rows = [_vrow("A1", [("size", "X")])]
+    ln._drop_degenerate_dims(rows)
+    assert rows[0]["_vplan"]["mode"] == "variant"
+    assert rows[0]["_vplan"]["attr_pairs"] == [("size", "X")]
+    # 不同组的两条也各算各的,不许跨组比
+    rows2 = [_vrow("A1", [("size", "X")], gid="vg_1"),
+             _vrow("A2", [("size", "X")], gid="vg_2")]
+    ln._drop_degenerate_dims(rows2)
+    assert all(r["_vplan"]["mode"] == "variant" for r in rows2)
+
+
+def test_same_round_siblings_do_not_both_claim_primary():
+    """⚠ 同一轮里同族两个新成员会**各自都判自己是主变体** → 同一个 feed 两个 Yes。
+
+    根因:`family_has_primary` 查的是 `catalog.walmart_items` 里**已在架**的同族,
+    而这两个此刻都还没在架,两边都查到"本店没有主变体"。旧仓正是为了躲这个才
+    干脆不发这个字段(设计文档 §3.4:"会出现两个 primary,Walmart 行为未定义")。
+    我们保留字段,就得自己收口。
+
+    取谁:**ASIN 字母序**第一个,不是行序 —— 行序会随表格增删漂,主变体跟着漂
+    等于每轮都在改沃尔玛端的首图。
+    """
+    from workflows import list_new as ln
+
+    def _row(asin, gid, primary=True):
+        return {"asin": asin, "store": "M001",
+                "_vplan": {"mode": "variant", "group_id": gid,
+                           "is_primary": primary, "attr_pairs": [("color", "X")],
+                           "code": "variant"}}
+
+    rows = [_row("B0BWMV956C", "vg_P1"), _row("B0BWMVQHVJ", "vg_P1"),
+            _row("B078R8W927", "vg_P2")]
+    ln._dedupe_primary(rows)
+    prim = {r["asin"] for r in rows if r["_vplan"]["is_primary"]}
+    # 同组只剩字母序第一个;另一组的独苗不受影响
+    assert prim == {"B0BWMV956C", "B078R8W927"}
+    # 重跑幂等:再跑一次结果不变
+    ln._dedupe_primary(rows)
+    assert {r["asin"] for r in rows if r["_vplan"]["is_primary"]} == prim
+
+
+def test_dedupe_primary_respects_a_listed_primary():
+    """本店同族已有在架主变体时,_variant_plan 已把新成员判成非主 —— 这里不许翻回。"""
+    from workflows import list_new as ln
+    rows = [{"asin": "B1", "store": "M001",
+             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+                        "is_primary": False, "code": "variant"}},
+            {"asin": "B2", "store": "M001",
+             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+                        "is_primary": False, "code": "variant"}}]
+    ln._dedupe_primary(rows)
+    assert not any(r["_vplan"]["is_primary"] for r in rows)
 
 
 def test_list_new_lookup_is_store_scoped_and_failure_tolerant():

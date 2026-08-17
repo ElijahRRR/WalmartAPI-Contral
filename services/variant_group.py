@@ -97,31 +97,68 @@ def parse_family(raw, self_asin: str = "") -> list[str]:
     return seen
 
 
-def group_id(parent_asin, self_asin: str = "") -> str | None:
-    """输入:parent_asin(+ 本 ASIN 兜底)→ 输出:变体组 ID;两者皆空返回 None。
+def group_id(parent_asin, self_asin: str = "", family=()) -> str | None:
+    """输入:parent_asin(+ 本 ASIN 兜底 + 完整家族)→ 输出:变体组 ID;都空则 None。
 
     由 parent_asin 派生 ⇒ 同族成员各自独立计算得到同一个 ID,不必互相查
     ——这是"增量归组自动发生"的全部机制。
+
+    ⚠ **parent_asin 等于自己时改用 min(家族)**(2026-08-17 照旧仓补的护栏)。
+    旧仓设计文档 `variant_groups_design.md` §3.3 记着这个坑:它的采集侧(DMIT)
+    每行的 parent_asin **就是该行自己的 ASIN**,拿它当组 ID 会把同一组 N 个兄弟
+    切成 N 个组,而且不报错 —— 所以旧仓一律用 `min(full_set)`。
+    我们现在的采集侧(twister 版)给的是真族主(生产实见 GustBuster 组:
+    parent=B000AMXQVI,成员是另外三个),所以主路径仍按 parent 派生、ID 更好认;
+    但采集侧哪天改回"填自己",这里必须还能自愈。
+    min(家族) 与 parent 派生一样是**跨兄弟稳定**的:同族每个成员算出的家族集合
+    相同(自己 ∪ variation_asins),min 自然相同。
     """
-    p = str(parent_asin or "").strip().upper() or str(self_asin or "").strip().upper()
+    p = str(parent_asin or "").strip().upper()
+    fam = [str(a).strip().upper() for a in (family or ()) if str(a).strip()]
+    me = str(self_asin or "").strip().upper()
+    if fam and len(fam) > 1 and (not p or p == me):
+        p = min(fam)
+    p = p or me
     return f"{_GROUP_PREFIX}{p}" if p else None
 
 
-def pick_walmart_dim(amazon_dims, enum) -> str | None:
-    """输入:亚马逊维度名列表 + 本 PT 的 variantAttributeNames 枚举 → 输出:选中的
-    沃尔玛属性名;映不上返回 None。
+def pick_walmart_dims(amazon_dims, enum) -> list[tuple[str, str]]:
+    """输入:亚马逊维度名列表 + 本 PT 的 variantAttributeNames 枚举
+    → 输出:[(亚马逊维度名, 沃尔玛属性名)],**全部映得上的都要**,映不上的丢掉。
 
-    枚举为空(spec 没给枚举)时不猜:映不上就走单品口径,总比发一个 PT 不认的
+    ⚠ **多维不是可选项,是旧系统的既有能力**(2026-08-17 对着旧仓核实):
+    `auto_listing/mapper.py:1374` 是 `common = sorted(allowed_names &
+    set(var_attrs.keys()))` —— 取**交集全体**,`variantAttributeNames` 发一个
+    列表。设计文档 `auto_listing/docs/variant_groups_design.md` §3.5/§4.2 同。
+    我们首版只取第一个,是**迁漏**,不是简化。
+
+    枚举为空(spec 没给枚举)时返回空:映不上就走单品口径,总比发一个 PT 不认的
     属性名被整条拒强。
+
+    同一个沃尔玛属性名只出现一次(如 `number_of_items` 与 `item_package_quantity`
+    都映向 `count`,重复列进 variantAttributeNames 会让载荷自相矛盾);
+    顺序按沃尔玛属性名排序,**跨兄弟稳定** —— 同组成员算出的顺序必须一致,
+    否则同一个组里几条的 variantAttributeNames 顺序不同,排查时看着像两组。
     """
     allowed = {str(e) for e in (enum or [])}
     if not allowed:
-        return None
+        return []
+    pairs: dict[str, str] = {}          # 沃尔玛属性名 → 亚马逊维度名(先到先得)
     for dim in amazon_dims or ():
         for cand in _DIM_MAP.get(str(dim), ()):
-            if cand in allowed:
-                return cand
-    return None
+            if cand in allowed and cand not in pairs:
+                pairs[cand] = str(dim)
+                break                   # 一个亚马逊维度只认领一个沃尔玛属性
+    return [(amz, wm) for wm, amz in sorted(pairs.items())]
+
+
+def pick_walmart_dim(amazon_dims, enum) -> str | None:
+    """输入:同上 → 输出:第一个映得上的沃尔玛属性名(无则 None)。
+
+    保留给只关心"能不能映上"的调用方;分变体请用 `pick_walmart_dims`。
+    """
+    pairs = pick_walmart_dims(amazon_dims, enum)
+    return pairs[0][1] if pairs else None
 
 
 def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
@@ -135,8 +172,10 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
                 看的中文长句,改一个字计数就散了
       reason    走 single 的原因(mode='variant' 时为 '')
       group_id  变体组 ID
-      attr_name 沃尔玛属性名(填 variantAttributeNames)
-      attr_value 本 ASIN 在该维度上的取值(必须写进同名属性,否则组内无差异)
+      attr_pairs [(沃尔玛属性名, 本 ASIN 的取值)] —— **可能多个**(color+size)。
+                属性名进 variantAttributeNames,取值各写进同名属性,
+                否则组内无差异
+      unmapped_dims 亚马逊有、但本 PT 枚举映不上的维度名(只剔它们,不退单品)
       family_size 亚马逊真实家族大小(含自己)
       is_primary 是否本组主变体
 
@@ -145,9 +184,10 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
     """
     attrs = parse_attrs(raw_attrs)
     family = parse_family(raw_family, asin)
-    gid = str(existing_group_id or "").strip() or group_id(parent_asin, asin)
+    gid = str(existing_group_id or "").strip() \
+        or group_id(parent_asin, asin, family)
     out = {"mode": "single", "code": "", "reason": "", "group_id": gid,
-           "attr_name": None, "attr_value": None,
+           "attr_pairs": [], "unmapped_dims": [],
            "family_size": len(family), "is_primary": False}
     if not attrs:
         out.update(code="no_attrs", reason="无变体维度取值")
@@ -157,15 +197,26 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
         out.update(code="oversize",
                    reason=f"家族 {len(family)} 个超上限 {MAX_FAMILY}")
         return out
-    name = pick_walmart_dim(list(attrs), enum)
-    if not name:
+    pairs = pick_walmart_dims(list(attrs), enum)
+    if not pairs:
         out.update(code="no_dim", reason=f"PT 枚举映不上亚马逊维度 {sorted(attrs)}")
         return out
     if not gid:
         out.update(code="no_group_id", reason="无 parent_asin,凑不出稳定组 ID")
         return out
-    # 取值取被选中那个维度的值:attrs 键是亚马逊维度名,反查回去
-    dim = next((d for d in attrs if name in _DIM_MAP.get(d, ())), None)
-    out.update(mode="variant", code="variant", attr_name=name,
-               attr_value=attrs[dim], is_primary=not family_has_primary)
+    # 交集全体(旧仓 mapper.py:1374 同款口径),每对 = (沃尔玛属性名, 取值)。
+    # 值的类型/enum 合法性由载荷层按本 PT spec 逐个校验(mp_conform)——
+    # 这里只负责"选哪些维度",不认识 spec 的字段定义
+    attr_pairs = [(wm, attrs[amz]) for amz, wm in pairs]
+    dropped = sorted(set(attrs) - {amz for amz, _ in pairs})
+    out.update(mode="variant", code="variant",
+               attr_pairs=attr_pairs, is_primary=not family_has_primary,
+               unmapped_dims=dropped)
+    if dropped:
+        # 部分维度映不上**不退单品**(旧仓同款:只剔掉映不上的那几个),
+        # 但要报出来 —— 组内差异如果恰好只在被剔掉的那个维度上,发出去
+        # 就是几条看不出区别的变体
+        logger.warning("%s 的变体维度 %s 映不上本 PT 枚举,只按 %s 分组",
+                       asin, ",".join(dropped),
+                       ",".join(wm for wm, _ in attr_pairs))
     return out

@@ -1,9 +1,9 @@
-"""scrape_missing — 给库里缺亚马逊数据的产品补采(危险,默认 dry-run)。
+"""scrape_missing — 给库里缺亚马逊数据的产品补采(危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py scrape_missing                       # 预览:缺什么、几类、能不能采
-  python cli.py scrape_missing -p only=never_tried   # 只看/只推某一类
-  python cli.py scrape_missing -p limit=20000 --execute
+  python cli.py scrape_missing --dry-run             # 预览:缺什么、几类、能不能采
+  python cli.py scrape_missing -p only=never_tried   # 只推某一类(加 --dry-run 只看)
+  python cli.py scrape_missing -p limit=20000        # 真推
   python cli.py scrape_missing -p check=1            # 只查在途批次(同 product_refresh)
 
 **与既有两条推采集的分工**(每个能力只有一条实现路径):
@@ -38,7 +38,7 @@ from api import scraper
 from registry import db
 from services import kpi, scrape_batches as batches
 
-DANGEROUS = True        # 会给采集器压几万个任务,默认 dry-run
+DANGEROUS = True        # 会给采集器压几万个任务,空跑用 --dry-run
 
 logger = logging.getLogger("workflows.scrape_missing")
 
@@ -202,7 +202,7 @@ def run(params: dict) -> str:
     if not targets:
         return "\n".join(lines + ["本次无可推 ASIN"])
     if not params.get("execute"):
-        return "\n".join(lines + ["(dry-run:未推采集;确认无误加 --execute)"])
+        return "\n".join(lines + ["(dry-run:未推采集;确认无误后**去掉 --dry-run** 重跑)"])
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
     tag = only or "mix"

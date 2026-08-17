@@ -183,7 +183,9 @@ def test_store_release_dry_run_lists_without_changing(monkeypatch):
     _wire_rel(monkeypatch, c)
     out = rel.run({"store": "A085"})
     assert "🧪 将释放" in out and "active 占用 2 条" in out
-    assert "确认后加 --execute" in out
+    # 2026-08-17:提示语跟着"缺省即真跑"改口径——dry-run 之后的下一步是
+    # **去掉 --dry-run** 重跑,不是"加 --execute"(那是旧口径的空操作别名)
+    assert "确认后去掉 --dry-run 重跑" in out
     assert all(r["status"] == "active" for r in c.rows)      # 没动
 
 

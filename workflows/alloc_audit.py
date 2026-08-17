@@ -244,7 +244,7 @@ def run(params: dict) -> str:
                         f"要它们参与分配才用填" if empty_stores else "")))
     L += ["", "▍要你做的事"] + textfmt.grid(todo)
     # 渠道闸是 claimable 的第五条筛法,没取渠道时它对本轮恒为假 ⇒ 这一轮算出的
-    # 保留店比 alloc_backfill 会落的**宽**。不点破的话,人照着这份清单去 --execute,
+    # 保留店比 alloc_backfill 会落的**宽**。不点破的话,人照着这份清单去真跑,
     # 落库结果与清单不一致,而占用没有自动释放
     if cfg and not with_channel:
         L.append("  ⚠ 本轮 `-p channel=0` 没取渠道,冲突判定与占用口径里的"
@@ -457,7 +457,7 @@ def run(params: dict) -> str:
     # 回填要照这份清单落,就得吃同一个窗口 —— 命令原样给出,不让人自己拼
     L += ["", f"▍销量窗口 {win['day']} 往前 {sales_days} 天(右端不含当天)",
           f"  回填照这份清单落:python cli.py alloc_backfill "
-          f"-p as_of={win['day']} -p sales_days={sales_days} --execute"]
+          f"-p as_of={win['day']} -p sales_days={sales_days}"]
     L += ["", f"▍明细 {len(files)} 份 csv → {paths.reports_dir()}"]
     for f in files:
         L.append(f"  · {f.rsplit('/', 1)[-1]}")

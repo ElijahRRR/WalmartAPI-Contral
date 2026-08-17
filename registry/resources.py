@@ -540,7 +540,12 @@ PT_TEMPLATE_SHEET = Spreadsheet(
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-13.1"   # 批次 C:L1 rerank + L3 语义 + L4 视觉接线
+AUDIT_RULES_VERSION = "c.2026-08-17.1"
+# c.2026-08-17.1  Phase0 规则 2 摘掉批次 B 新增的 4 个 Amazon 顶级大类
+#                 (裁决 A,见 docs/audit_migration_plan.md 九节补批复)。
+#                 ⚠ 别拿它跑 force_rerun —— 那是**全量**(库里没有一条是新版本)。
+#                 只重审被摘掉的规则拒过的那批:-p rerule=phase0_forbidden_category
+# c.2026-08-13.1  批次 C:L1 rerank + L3 语义 + L4 视觉接线
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
 # 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose
@@ -549,6 +554,10 @@ LLM_PURPOSE_ENV = {
     "default": "DEEPSEEK_MODEL",
     "audit_l1": "DEEPSEEK_MODEL_AUDIT_L1",
     "audit_l3": "DEEPSEEK_MODEL_AUDIT_L3",
+    # 变体维度错位重映射(旧仓 Phase 0.8 补迁,2026-08-17):亚马逊维度名不在
+    # PT 枚举内时问一次"它实际表达什么"。调用极少(命中即缓存,键按
+    # (PT, 维度名) 定案),未配置专用模型时回落 DEEPSEEK_MODEL
+    "variant_remap": "DEEPSEEK_MODEL_VARIANT_REMAP",
 }
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或

@@ -1,8 +1,8 @@
-"""sku_locked_heal — SKU_LOCKED 自愈链(listing L3 首条,旧 retire_and_relist 等价物;危险,默认 dry-run)。
+"""sku_locked_heal — SKU_LOCKED 自愈链(listing L3 首条,旧 retire_and_relist 等价物;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py sku_locked_heal                 # dry-run:打印将退役/将清列哪些行
-  python cli.py sku_locked_heal --execute       # 真跑(提交 RETIRE + 清列)
+  python cli.py sku_locked_heal --dry-run       # 空跑:打印将退役/将清列哪些行
+  python cli.py sku_locked_heal                 # 真跑(提交 RETIRE + 清列)
   python cli.py sku_locked_heal -p store=A085朱丽霖
   python cli.py sku_locked_heal -p cooldown_hours=24
 

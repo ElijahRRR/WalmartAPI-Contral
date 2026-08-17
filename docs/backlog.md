@@ -194,6 +194,41 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
 - 🟡 变体分组(**决策层与载荷层已落地** 2026-08-15,余 list_new 生产验收):`services/variant_group.py` + `mp_conform.ensure_variant_bag(plan=...)` + `list_new._variant_plan`。⚠ **先决条件当初写错了**:不是「采集契约顶层暴露三字段」——数据一直在 `catalog.snapshots.raw`(生产实证 358,743 条有 variant_attributes、262,933 条有 variation_asins),之前判断卡在采集侧是**只翻了 products.slow**。`slow.variant.theme` 确实曾恒空,但那是采集侧导出的 bug(按 ':' 切、实际格式是 '='),已由采集侧 dad8f60 修复;即便修好也**只给维度名不给取值**,分变体要的取值仍只能从 raw 取。跨店重定向与 LLM remap 按原计划砍掉(20 个维度手写映射表);`full_set >= 10` 伪组闸**不抄**——采集侧 twister 版已用真实家族键取代会混进广告 ASIN 的旧正则
 
+  ✅ **多维已补齐**(2026-08-17;此前是**漏的**不是砍的)。所有者问「单属性多属性
+  都会自动用对应方法吧」时暴露:首版 `pick_walmart_dim` 只取第一个映得上的维度,
+  color+size 的家族只发 `variantAttributeNames=[color]`。后果不是少一个字段——
+  同族里只差 size 的两个成员会带着同一个 variantGroupId + 同一个 color 值发出去。
+  所有者给了旧仓地址,**对着旧仓核实后补齐**(`auto_listing/mapper.py:1374`
+  `common = sorted(allowed_names & set(var_attrs.keys()))` + 设计文档
+  `auto_listing/docs/variant_groups_design.md` §3.5/§4.2):
+    · `pick_walmart_dims` 取交集**全体**,同一沃尔玛属性名只出现一次,按名排序
+      (跨兄弟顺序必须一致,否则同组几条看着像两组);
+    · `_apply_variant_plan` 逐属性校验(枚举内 / spec 已登记 / 值过 enum 与
+      integer·number 类型),**单个不合格只剔它**,剔到一个不剩才退单品
+      ——旧仓 Feature A 同款;
+    · `group_id` 补 `parent_asin == 自己` 时回落 `min(家族)`:旧仓设计文档 §3.3
+      记着这个坑(DMIT 每行 parent 填自己,拿它当组 ID 会把同组切成 N 组且不报错)。
+      我们的采集侧给真族主(生产实见 GustBuster 组),但改回去也能自愈;
+    · list_new 摘要新增「其中多维 N」「有维度映不上 N」两栏做验收点。
+  ✅ **Phase 0.8 维度错位重映射 + Feature B 组内标题差异化已补迁**(2026-08-17,
+  所有者批「都补」)。`services/variant_remap.py`(三层:枚举内检查 → 内置错位表 →
+  LLM 兜底,整组一次决策过 llm_cache)+ `services/variant_title.py`(同组
+  productName 全同时追加 ` - <维度取值>`,199 字截 base 保 suffix,幂等)+
+  `list_new._remap_unmapped_dims` / `_differentiate_titles` 接线。
+  **与旧仓三处有意差异**:① 只补映不上的维度,不推翻已映上的(旧仓一触发整组
+  改用一个 key,会把已映上的 color 一起丢);② 本轮取值全同的维度不送 LLM
+  (礼品袋组实证:三个成员 size_name 全是 `1 Count (Pack of 100)`,问了也白问);
+  ③ 缓存键按 (PT, 维度名, 枚举) 而非样本值 —— 同组的 variantAttributeNames
+  必须跨批次一致,按样本值缓存会让分批上架前后判出两套维度名。
+  本轮只看见 1 个成员时只走内置表(判不了有没有差异,不问 LLM)。
+
+  **与旧仓仍存的三处差异**(都是有意的):① 孤品也带 groupId(旧仓 full_set<2
+  不注入)—— 所有者定稿,依据是沃尔玛报错原文明说支持 1 个成员的变体组;
+  ② 发 `isPrimaryVariant`(旧仓从不发,怕分批出现两个 primary)—— 我们先查本店
+  同族在架成员有没有主变体,旧仓没有这个查询;真撞见双 primary 就退回旧仓口径;
+  ③ 属性名在枚举内但 spec 没登记该属性时**整套退单品**(旧仓照发,靠 strip_unknown
+  剔掉,留下"说按颜色分组却不说自己什么颜色"的矛盾载荷)——这处我们比旧仓严。
+
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
 
 **上架验收与收尾待办(2026-08-12 晚定格;代码迁移已收官,以下全是验收/运维/后置)**

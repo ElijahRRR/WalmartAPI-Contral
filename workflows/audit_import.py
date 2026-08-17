@@ -1,10 +1,10 @@
 """audit_import — 旧审核库(walmart_audit)→ 中心库 audit schema 一次性搬迁(批次 A)。
 
 用法:
-  python cli.py audit_import                    # dry-run:逐表体检报告,不写一行
-  python cli.py audit_import --execute          # 真搬(整轮单事务,失败全回滚)
-  python cli.py audit_import -p table=audit_runs --execute   # 只搬指定表(外键对成对)
-  python cli.py audit_import -p replace=yes --execute        # 目标非空时清掉重灌
+  python cli.py audit_import --dry-run          # 空跑:逐表体检报告,不写一行
+  python cli.py audit_import                    # 真搬(整轮单事务,失败全回滚)
+  python cli.py audit_import -p table=audit_runs   # 只搬指定表(外键对成对)
+  python cli.py audit_import -p replace=yes        # 目标非空时清掉重灌
 
 dry-run 报告逐表给出:源行数 / 目标行数 / 列对照 / **将要执行的动作**——
 含 replace=yes 时的 TRUNCATE 预告(dry-run 必须把最危险的动作说出来,
@@ -13,7 +13,7 @@ dry-run 报告逐表给出:源行数 / 目标行数 / 列对照 / **将要执行
   类型不一致 = 致命(先改 refdata/schema.sql 再来);
   目标独有列 = 警告(导入吃默认值);
   清单里的表在旧库不存在 = 致命(清单与旧库对不上,绝不静默少搬)。
-有致命项时 --execute 拒绝执行;execute 摘要含完整体检行,不吞警告。
+有致命项时真跑拒绝执行;真跑摘要含完整体检行,不吞警告。
 
 三张"反推表"(pt_meta/pt_spec/prohibited_policy)旧仓无权威 DDL,
 **生产实表(pg_dump -s walmart_audit)才是最终基准**——执行前先核对一遍,
@@ -208,7 +208,7 @@ def run(params: dict) -> str:
 
         if not execute:
             return "\n".join(
-                ["audit_import dry-run 体检(不写一行;全绿后 --execute):", *lines])
+                ["audit_import dry-run 体检(不写一行;全绿后去掉 --dry-run 重跑):", *lines])
         if fatal_any:
             raise RuntimeError("存在致命项,拒绝搬迁——先按体检报告处置"
                                "(改 refdata/schema.sql 或核对旧库):\n"

@@ -1,8 +1,8 @@
-"""match_listing — 跟卖上架(listing 子计划 L1,替代旧 match_listing/;危险,默认 dry-run)。
+"""match_listing — 跟卖上架(listing 子计划 L1,替代旧 match_listing/;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py match_listing                    # dry-run:预检+打印将提交什么
-  python cli.py match_listing --execute          # 真跑(提交 feed + 回写表格)
+  python cli.py match_listing --dry-run          # 空跑:预检+打印将提交什么
+  python cli.py match_listing                    # 真跑(提交 feed + 回写表格)
   python cli.py match_listing -p store=A085朱丽霖
 
 驱动表(registry.MATCH_SHEET「跟卖表」,所有者定稿 2026-08-07 单路飞书读,
@@ -37,7 +37,7 @@
 全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,
 ⚠ 跟卖商品无 amz 侧身份,sku≠asin 是账本约定的已登记例外)。
 
-⚠ --execute 前置(对拍未完成前只许 dry-run):Item 字段形态与 SKU 生成
+⚠ 真跑前置(对拍未完成前只许 --dry-run):Item 字段形态与 SKU 生成
 规则待旧 feed 备份对拍(services/match_feed.py 标注两处)。
 """
 

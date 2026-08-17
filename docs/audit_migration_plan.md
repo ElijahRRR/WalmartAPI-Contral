@@ -217,6 +217,36 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 | 9 | 45 天 TTL | **废除**;hash 驱动重审——slow_hash 变更时 pass 翻 pending,**reject 永不自动重审**(force_rerun 手动通道保留) |
 | 10 | 实证类目反哺 | 海量在线产品与历史报错数据里有沃尔玛认定的真实类目,重审/重上架**最优先直接用它**(设计见 10.3) |
 
+### 补批复(2026-08-17):Phase0 顶级类目禁售摘掉新增的 4 个
+
+| # | 决策项 | 批复 |
+|---|---|---|
+| 11 | Phase0 规则 2 的类目清单 | **裁决 A:摘掉批次 B 新增的 4 个**(Beauty & Personal Care / Health & Household / Health & Personal Care / Grocery & Gourmet Food),只留旧仓原有 4 个(Books / Kindle Store / Clothing, Shoes & Jewelry / Automotive) |
+
+触发:所有者验收上架时拿 `B0BWMVQHVJ` 来问 —— 一包**牛皮纸礼品袋**被拒,理由
+写着「药品/膳食补充剂 restricted: FDA 注册 + AML vetting + MoCRA」。`audit_why`
+摊开后判据是:
+
+```
+full_path = 'Health & Household > Stationery & Gift Wrapping Supplies
+             > Gift Wrapping Supplies > Gift Bags'
+```
+
+规则没跑偏(`match_type='exact'`),是**判据粒度太粗**:该规则只取路径**第一段**,
+而 Amazon 的 `Health & Household` 本身是杂物筐,底下混着文具礼品包装、家居清洁、
+纸品、宠物用品。停在 L0 意味着连类目都不判就拒。
+
+**为什么摘掉是去重而不是放开**:药品/补剂在 L2 本来就有两道更精准的闸 ——
+R2 的 `drugs_supplements`(按 Walmart **PT 名**关键词)与 R0 的
+`_FORBIDDEN_WALMART_MEGA_CATEGORIES`(按 Walmart **类目**)。那两条判"这东西
+是什么",Phase0 这条判"它在亚马逊被挂在哪个筐里"。
+
+**代价(裁决 A 明知并接受)**:PT 解不出**且** Walmart 类目也拿不到的真药品不再有
+硬闸,会走到 L3 语义层。要再收紧走**补 L2 的 PT 词表**,不是把大类塞回 Phase0。
+
+规则版本随之递增到 `c.2026-08-17.1`;存量重审走 `product_audit -p rerule=<规则码>`
+(只重审最近一轮命中该规则的那批,不是全量)。
+
 **#4 原后注(存量豁免/override 列方案)已被二次批复取代**:表降级为纯展示后,
 "人工与机器双写同列"的冲突不复存在,override 列不需要建。人工改判今后不经表
 ——如需人工强制通过/拒绝,后续加 cli 通道或驱动表(与 maintenance 人工驱动表
@@ -342,7 +372,7 @@ catalog_sync(拉在线,已有,不动)
 
 | 位置 | 落地 |
 |---|---|
-| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空**(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。**重审的唯一入口 = 把 E 列清空**(不设 force 参数:清一格比记参数直观,而且看得见改了哪些行) |
+| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空**(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。⚠ **表格里没有重审入口**(2026-08-17 更正,原文写的"重审的唯一入口 = 把 E 列清空"是错的,与同段的"非强审"自相矛盾):清空 E 列只让该行重新被**领取**,判不判由库里的 `audit_status` 定,已有结论的会被原样投影回同一格。真重审走 CLI 的 `-p asins=`(点名强审)或 `-p rerule=<规则码>`(定点翻案) |
 | 投影 | `_project_to_sheet()` 写 **C/D/E/F/G**(标题/PT/结论/理由/日期),一行一个 `C{r}:G{r}`。E 列写 `pass/reject/pending`(`listing_sheet.AUDIT_RESULT_CN`,**不是** `approved`)。库里没结论的行 **E 留空并在摘要里点名**——写 pending 会让人以为审过了,而且它下轮不会被重领。回填失败只告警(结论已在 PG,飞书只是界面) |
 | 上架闸 | `list_new.load_verdicts()` 查 `catalog.products`,只放 `audit_status='approved'`;未审核/判拒**逐类点名**(不点名的表现是"表里几百行一行也不上"而无任何提示)。`_retry_rows` 同闸 |
 | 类目 | `list_new._with_pt()`:**PT 也以库为准**(`walmart_pt`),库里没有才退回表 D 列。只读结论不读类目 = 手改 D 列即可绕过审核换类目 |

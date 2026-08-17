@@ -187,3 +187,55 @@ def test_bad_by_value_is_rejected(monkeypatch):
     monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS, _META))
     with pytest.raises(ValueError, match="只能是"):
         cp.run({"execute": True, "by": "meta2"})
+
+
+_MIXED = _ROWS + [
+    ("Path > A", cp.SENTINEL, "无", "", ""),
+    ("Path > B", cp.SENTINEL, "无", "", ""),
+    ("Path > C", "-", "低", "", ""),
+    ("Path > D", "", "低", "", ""),
+]
+
+
+def test_every_bucket_is_reported_never_silently_excluded(_spec, monkeypatch):
+    """⚠ 首版把哨兵行与 '-' 行写进 SQL 的 WHERE 排除掉,摘要报 306 行,
+
+    而所有者在投影表里数到 846 行"没有 Walmart Category/PTG"的 ——
+    差的五百多正是被静默排除的两类。静默排除 = 数字对不上,人只能怀疑工具。
+    现在三桶逐桶报数,该不该动由参数定。
+    """
+    conn = _Conn(_MIXED, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True, "dry_run": True})
+    assert "分三类" in out
+    assert "① 死 PT" in out and "② 哨兵" in out and "③ 垃圾" in out
+    # 三桶之和必须等于人在投影表里看到的那个数
+    assert f"共 {2 + 2 + 2} 行" in out       # 死 2(Novelty Lights/Retired PT)+哨兵 2+垃圾 2
+
+
+def test_sentinel_is_kept_by_default_and_says_why(_spec, monkeypatch):
+    """⚠ 哨兵不是垃圾是信息:resolve_pt ⓪ 级读它,把线索带进 LLM 提示词。"""
+    conn = _Conn(_MIXED, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True})
+    touched = {p["pt"] for _k, p in conn.store["ops"]}
+    assert cp.SENTINEL not in touched
+    assert "默认保留" in out and "带进 LLM 提示词" in out
+    assert "sentinel=drop" in out            # 想清也得告诉人怎么清
+
+
+def test_sentinel_drop_is_opt_in(_spec, monkeypatch):
+    conn = _Conn(_MIXED, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True, "sentinel": "drop"})
+    assert cp.SENTINEL in {p["pt"] for _k, p in conn.store["ops"]}
+    assert "本次一并清" in out
+
+
+def test_junk_rows_are_always_cleaned(_spec, monkeypatch):
+    """PT 是 '-' 或空:既不是 PT 也不是标注,纯脏数据,不需要开关。"""
+    conn = _Conn(_MIXED, _META)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True})
+    touched = {p["pt"] for _k, p in conn.store["ops"]}
+    assert "-" in touched and "" in touched

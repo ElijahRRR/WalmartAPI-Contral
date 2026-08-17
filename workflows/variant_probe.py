@@ -70,7 +70,7 @@ def _enum_of_pt(pt: str) -> tuple[list[str], set[str], bool]:
     if not spec:
         return [], set(), False
     props = spec.get("properties") or {}
-    enum = mp_conform._enum_of(props.get("variantAttributeNames") or {})
+    enum = mp_conform.variant_attr_enum(props)
     return [str(e) for e in (enum or [])], set(props), True
 
 

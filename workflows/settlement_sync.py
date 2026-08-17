@@ -32,7 +32,7 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.settlement_sync")
 
-_STORE_WORKERS = 6      # 旧系统 README:店铺级并发不要调高(代理共享/全局风控)
+_STORE_WORKERS = stores_svc.STORE_WORKERS   # 唯一出处在 services/stores
 
 
 def _sync(store_list: list[dict], periods_limit: int) -> str:

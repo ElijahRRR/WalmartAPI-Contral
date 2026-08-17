@@ -15,6 +15,20 @@ from registry import paths, resources
 
 logger = logging.getLogger("services.stores")
 
+#: 跨店并发的**唯一出处**(所有者定稿 2026-08-17:「跨店线程池都应该设置为 24,
+#: 内层对 api 接口的速度才是需要单独注意的」)。
+#:
+#: 为什么安全:每店有**自己的固定出口代理**,店铺之间不共享出口;沃尔玛配额按
+#: `(store, endpoint)` 计,`api/_client` 的令牌桶也按这个维度限流。所以加跨店
+#: 并发不会挤占同一个桶 —— 真正要小心的是**店内**对同一接口的并发,那个各链
+#: 自己按端点配额定(如 catalog_sync 的 `_FILL_WORKERS=8` 对应 items.get 800/min)。
+#:
+#: ⚠ 为什么必须是一个常量而不是六个字面量:旧系统 README 那句「店铺级并发不要
+#: 调高(代理共享/全局风控)」被所有者 2026-08-16 显式推翻,但那次只改了
+#: daily_report(6→16),perf_problems/settlement_sync 连**被推翻的注释**都原样
+#: 留着 —— 同一条判断改一处漏两处,而且不报错,只是那两条链一直慢着。
+STORE_WORKERS = 24
+
 _NUM_RE = re.compile(r"\d+")
 
 

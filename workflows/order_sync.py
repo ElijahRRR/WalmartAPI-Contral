@@ -49,7 +49,7 @@ def run(params: dict) -> str:
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(全部)'}"
     days = int(params.get("days", 45))
-    workers = int(params.get("workers", 12))
+    workers = int(params.get("workers", stores_svc.STORE_WORKERS))
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
 

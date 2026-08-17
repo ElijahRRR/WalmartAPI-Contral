@@ -69,9 +69,18 @@ _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 # 每 N 行提交一次 + 打一行进度,判定结果就变成"跑到哪算到哪"。
 _COMMIT_EVERY = 500
 
-# 判定并发上限:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的
-# 天花板在 LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)
-_MAX_WORKERS = 64
+# 判定并发:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的天花板在
+# LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)。
+# 默认 128(所有者定稿 2026-08-17:「审核默认设置为 128,之前已经实测调大
+# 并发是有效果的」)。此前默认 4 而上限 64 —— 不显式传 -p workers= 就只跑 4,
+# "上限 64"看着高其实从没生效过。
+_DEFAULT_WORKERS = 128
+_MAX_WORKERS = 256
+
+# 落库批大小:并发调到 128 之后,主线程"逐行 savepoint + 逐行 INSERT"成了
+# 新瓶颈,改成攒一批 executemany(见 audit_store.persist_runs)。
+# 批太大则一次失败要退回逐行的代价也大,200 是速度与隔离代价的折中。
+_PERSIST_BATCH = 200
 
 _CANDIDATE_SQL = """
 SELECT p.asin,
@@ -505,7 +514,7 @@ def run(params: dict) -> str:
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
-    want_workers = max(1, int(params.get("workers", 4)))
+    want_workers = max(1, int(params.get("workers", _DEFAULT_WORKERS)))
     workers = min(want_workers, _MAX_WORKERS)
     if workers != want_workers:
         # 静默钳制 = 拿着错的数做并发决策(生产实测 2026-08-14:所有者用
@@ -611,19 +620,60 @@ def run(params: dict) -> str:
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                # 落库缓冲:判定并发调到 128 之后,主线程"逐行 savepoint +
+                # 逐行 INSERT"就是新的瓶颈(所有者定稿 2026-08-17:批量落库)。
+                # 攒够 _PERSIST_BATCH 一次 executemany 落 runs+hits。
+                buf: list = []
+
+                def _flush(force: bool = False) -> int:
+                    """输入:是否强制 → 输出:本次落库失败的行数(已计数的不算)。
+
+                    ⚠ 批量一炸整批回滚,而里面多半只有一行是脏的 —— 已付费的
+                    LLM 结果不能陪葬。所以 except 后对这一批**改走逐行**,
+                    坏行单独隔离,好行照落:好路径拿批量的速度,坏路径保住
+                    「一行落库报错不炸整批」那条评审结论。
+                    """
+                    nonlocal buf
+                    if not buf or (not force and len(buf) < _PERSIST_BATCH):
+                        return 0
+                    batch, buf = buf, []
+                    try:
+                        with conn.transaction():
+                            ids = audit_store.persist_runs(conn, batch)
+                            if execute:
+                                for rid, oc in zip(ids, batch):
+                                    audit_store.write_conclusion(conn, oc)
+                                    ev = audit_store.event_row(oc, rid)
+                                    if ev:
+                                        events.append(ev)
+                        return 0
+                    except Exception as e:              # noqa: BLE001
+                        logger.warning("批量落库失败(%d 行),改逐行隔离:%s",
+                                       len(batch), e)
+                    bad = 0
+                    for oc in batch:
+                        try:
+                            with conn.transaction():
+                                rid = audit_store.persist_run(conn, oc)
+                                if execute:
+                                    audit_store.write_conclusion(conn, oc)
+                                    ev = audit_store.event_row(oc, rid)
+                                    if ev:
+                                        events.append(ev)
+                        except Exception as e2:         # noqa: BLE001
+                            bad += 1
+                            logger.error("单行审核落库失败 asin=%s:%s",
+                                         oc.asin, e2)
+                    return bad
+
                 for fut in as_completed(futs):
                     asin = futs[fut]
                     try:
                         outcome = fut.result()
-                        # 每行 savepoint(评审 P2):一行落库报错不炸整批
-                        # 已付费的 runs/hits
-                        with conn.transaction():
-                            run_id = audit_store.persist_run(conn, outcome)
-                            if execute:
-                                audit_store.write_conclusion(conn, outcome)
-                                ev = audit_store.event_row(outcome, run_id)
-                                if ev:
-                                    events.append(ev)
+                        buf.append(outcome)
+                        bad = _flush()
+                        if bad:
+                            row_errors += bad
                     except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
                         row_errors += 1
                         consec_errors += 1
@@ -639,6 +689,9 @@ def run(params: dict) -> str:
                     done_n += 1
                     if done_n % _COMMIT_EVERY == 0:
                         # 分段落定:此刻之前判的都已持久,中断只丢最后一段
+                        # ⚠ 先把缓冲冲干净再 commit —— 缓冲里还压着没落库的行时
+                        # 提交,那句"都已持久"就是谎话(它们要等下一批才落)
+                        row_errors += _flush(force=True)
                         conn.commit()
                         if events:
                             product_events.record_many(conn, events)
@@ -667,6 +720,8 @@ def run(params: dict) -> str:
                                 outcome.final_reason_category,
                                 ctx.known_policies)):
                         policy_unknown += 1
+                # 收尾冲刷:最后不满一批的那些也要落库,漏了就是"判了没存"
+                row_errors += _flush(force=True)
         if execute and events:
             product_events.record_many(conn, events)
 

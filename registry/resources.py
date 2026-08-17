@@ -502,6 +502,26 @@ AMZCAT_BLACKLIST_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# 类目映射明细(所有者 2026-08-17:「以前的审核系统是从这里拿的,我们现在
+# 直接当映射查看使用」)。**投影,不是数据源** —— 权威在 audit.walmart_category_map,
+# 这张表是给人看的一面镜子,由 catmap_export 整表重写。
+# 列序即所有者手上那份的表头,一个字都不许改(改了他那边的筛选/公式全废)。
+CATMAP_SHEET = Spreadsheet(
+    name="类目映射明细",
+    token=os.environ.get("FEISHU_CATMAP_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_CATMAP_SHEET_ID", ""),
+    columns=("walmart_category", "walmart_ptg", "walmart_product_type",
+             "amazon_leaf", "amazon_category", "browse_node_id",
+             "rank_in_pt", "confidence", "match_type", "notes",
+             "source_batch"),
+    wiki=True,
+)
+# 表头文案(写进第 1 行)。与 columns 一一对应,顺序必须一致
+CATMAP_SHEET_HEADER = (
+    "Walmart Category", "Walmart PTG", "Walmart Product Type",
+    "Amazon 叶子", "Amazon 路径", "browse_node_id",
+    "排名", "置信度", "匹配方式", "备注", "来源批次")
+
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。

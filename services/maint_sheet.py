@@ -1,18 +1,31 @@
 """维护记录工作表(registry.MAINT_SHEET)读写积木(maintenance 与 feed_poll 共用)。
 
-列契约(A~I,列序即契约,所有者建表 2026-08-07):
-  A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
+列契约(A~K 共 11 列,**列序即契约,唯一权威是 registry.MAINT_SHEET.columns**;
+所有者建表 2026-08-07,2026-08-16 加「建议」「原因」两列):
+  A=店铺 B=SKU C=建议 D=原因 E=动作 F=旧值 G=新值 H=feedid I=日期 J=结果 K=报错
+⚠ 代码里一律 `_col(名)` / `_idx(名)` 取位置,**任何地方都不许写死字母或下标** ——
+  加那两列时漏改一处的表现是整表错位且不报错(prune 就漏了,读「新值」当日期)。
 
-流水账语义(区别于 clear_sheet 的运营驱动表):只追加不改行,程序是唯一写入方。
-  提交时 append:feed 路径 F=真 feedid、H=处理中;PUT 同步路径 F="sync"、
-  H=成功/失败 当场落定。
-  C 列取值:标题/价格/库存/删除(variant_offset)——四类都由 maintenance 写,
-  走同一个反哺器,不另建表(所有者问 2026-08-09「删除以后跑 feed 会填写到
-  维护记录里吗」)。
-  feed 路径结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 H/I。
+流水账语义:**只追加不改行**,`maintenance` 提交时一次写全 11 列,程序是唯一
+写入方。feed 路径 H=真 feedid、J=处理中;PUT 同步路径 H="sync"、J 当场落定。
+feed 路径的结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 J/K。
+四类动作(标题/价格/库存/删除)共用本表,不另建表(所有者问 2026-08-09
+「删除以后跑 feed 会填写到维护记录里吗」)。
+
+⚠ **不要再做"扫描件先写半行、执行件回来补齐"** —— 2026-08-17 试过一轮,
+所有者验完口径后撤除(「执行内容无误,不需要再向飞书写入」)。撤除前它还暴露了
+一个真坑,谁要重做必须先解决:**两端算「建议」的方式不一样**。扫描件按 kind 取
+`KIND_LABEL["delete"] = 删除`,而执行件 `_record` 取的是 `it.get("label")`,删除
+意图在 `maintenance_intents:597` 被塞成 `删除(<原因码>)`(如 `删除(title_mismatch)`)
+—— 键对不上,于是每一行都查不到、整行追加,而两边都不报错。
+连接键必须两端同一个函数算出来,不能各取各的字段。
 
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":
 最早未落定行}。反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
+⚠ 反哺器**跨过没有 feedid 的行**(它认为那些没有待办)。当前形态下每行都是提交
+时才造的、必然带 feedid 或 "sync",所以这条不成问题 —— 但它正是上面那个"先写
+半行"方案的第二个坑:半行没有 feedid,水位会直接推过去,等 feedid 补进来时
+反哺器再也不回头看,结果/报错永远空着且不报错。
 
 保留期(所有者定稿 2026-08-09:「一天几千条,要不了多久飞书就很难存了」——
 旧系统靠"一天一个表格"绕开):**飞书只留近 RETAIN_DAYS 天**,每轮维护提交后
@@ -286,7 +299,20 @@ def sync_from_ledger() -> str | None:
     return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1}){tail}"
 
 
-_HEADER = ("店铺", "SKU", "动作", "旧值", "新值", "feedid", "日期", "结果", "报错")
+# 表头中文名:registry 定列序,这里只给每列的显示名。**按名字取,不按位置**
+# —— 硬编码成一个九元组正是下面 prune 三处错位的根因(2026-08-16 加「建议」
+# 「原因」两列时,_col/_idx 改成了从 registry 推导,这一族却被漏下)。
+# registry 加列而这里没补名字 ⇒ KeyError 当场炸,不会静默写出一个短表头。
+_HEADER_NAMES = {
+    "store": "店铺", "sku": "SKU", "suggestion": "建议", "reason": "原因",
+    "action": "动作", "old_value": "旧值", "new_value": "新值",
+    "feed_id": "feedid", "op_date": "日期", "result": "结果", "error": "报错",
+}
+
+
+def _header() -> tuple:
+    """输入:无 → 输出:与 registry 列序一一对应的中文表头。"""
+    return tuple(_HEADER_NAMES[c] for c in resources.MAINT_SHEET.columns)
 
 
 def prune(days: int = RETAIN_DAYS) -> str:
@@ -307,18 +333,19 @@ def prune(days: int = RETAIN_DAYS) -> str:
         return "维护记录:表内无数据行,无需裁剪"
     values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}")
     cut = _today() - timedelta(days=days)
+    ncol = len(resources.MAINT_SHEET.columns)
     kept = []
     for raw in values:
-        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
-        if not any(cells[:9]):
+        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * ncol
+        if not any(cells[:ncol]):
             continue                    # 空行不留
-        d = _row_date(cells[6])
+        d = _row_date(cells[_idx("op_date")])
         if d is None or d >= cut:       # 没日期的保留(宁可留着也不误删)
-            kept.append(cells[:9])
+            kept.append(cells[:ncol])
     dropped = (hi - 2) - len(kept)
     if dropped <= 0:
         return f"维护记录:{len(kept)} 行都在近 {days} 天内,无需裁剪"
-    feishu.sheet_overwrite(resources.MAINT_SHEET, [list(_HEADER)] + kept)
+    feishu.sheet_overwrite(resources.MAINT_SHEET, [list(_header())] + kept)
     # 行号整体上移:水位必须重置,否则反哺器会扫到错行
     with db.pg_conn() as conn:
         _save_cursor(conn, {"next_row": len(kept) + 2, "unresolved_from": 2})

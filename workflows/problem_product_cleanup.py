@@ -117,7 +117,12 @@ def run(params: dict) -> str:
     for r in rows:
         src = (r.get("detail") or {}).get("source") or "scan"
         by_src[src] = by_src.get(src, 0) + 1
-    lines.insert(0, f"{mode}待执行建议 {len(rows)} 条:反补 {tot['relist']},"
+    # ⚠ 措辞随模式走(与 maintenance 同一处理,所有者 2026-08-17 实见):
+    # 这一行在**提交之前**生成,真跑完再说「待执行」就是谎话——那些行此刻
+    # 已经是 executing,而通知开头写着 ✅ 成功,人会以为什么都没干。
+    # 也不能说「已执行」:领取的行里有一部分会被单店上限/在途防重挡下。
+    head = "待执行建议" if not execute else "本轮领取建议"
+    lines.insert(0, f"{mode}{head} {len(rows)} 条:反补 {tot['relist']},"
                     f"删除 {tot['delete']},顽固停用 {tot['retire']}")
 
     if not execute:

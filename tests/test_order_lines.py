@@ -373,3 +373,47 @@ def test_extract_warns_on_duplicate_sku_in_one_po(caplog):
         rows = ol.extract_order_lines("T1", order)
     assert rows[0]["order_line_id"] == rows[1]["order_line_id"]
     assert any("身份撞键" in m for m in caplog.messages)
+
+
+def test_perf_upsert_skips_write_when_nothing_changed():
+    """绩效事件同款:内容没变就别刷 last_seen_at,否则每轮把窗口内全部行重推飞书。
+
+    与 test_upsert_skips_write_when_nothing_changed 是**同一个病**,但当时只修了
+    销售那一半。2026-08-17 所有者实见:`飞书投影:绩效订单:1634 行(全量),
+    新建 0 更新 1093 跳过 541` —— 1093 正是 still_active 的那批,业务字段一个都
+    没变,只因为绩效报表是滚动的、同一批单每轮再出现一次,
+    `last_seen_at = now()` 就被无条件刷新,而它作为「拉取时间」参与飞书指纹。
+
+    自我循环:因为我们跑了时间戳才变,因为时间戳变了才推。
+    """
+    conn = _FakeConn()
+    ol.upsert_perf_events(conn, [{"store": "T1", "po_id": "PO1",
+                                  "metric": "otd", "period": "2026-08-01",
+                                  "detail": {"k": "v"}}])
+    body = conn.cur.calls[0][0].split("DO UPDATE")[1]
+    assert "IS DISTINCT FROM" in body, "没有变更检测 = 每轮全窗口刷时间戳"
+    where = body.split("WHERE")[1]
+    # ⚠ 比的必须是**生效后的值**(带 COALESCE),不是 EXCLUDED:
+    # order_line_id/sku 的 COALESCE 会把"新值为 NULL"挡成不变,拿 EXCLUDED 比
+    # 则把这种假变化当真变化,整行照写、时间戳照跳,等于闸没装
+    assert "COALESCE(EXCLUDED.order_line_id" in where
+    assert "COALESCE(EXCLUDED.sku" in where
+    # 裸 EXCLUDED.order_line_id / EXCLUDED.sku 不许出现在比较里
+    import re
+    assert not re.search(r"(?<!COALESCE\()EXCLUDED\.order_line_id", where)
+    assert not re.search(r"(?<!COALESCE\()EXCLUDED\.sku", where)
+
+
+def test_perf_last_seen_at_has_no_judgement_reader():
+    """`last_seen_at` 少刷新不影响任何结论 —— still_active 看的是 period。
+
+    这条钉的是**改动的前提**:哪天有人拿 last_seen_at 当判据(比如"多久没见到
+    就算滚出窗口"),上面那道闸就会静默改变它的语义。届时本用例转红。
+    """
+    import pathlib
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    span = ddl.split("CREATE OR REPLACE VIEW orders.perf_event_spans")[1]
+    span = span.split(";")[0]
+    assert "still_active" in span
+    assert "max(e.period) = m.latest_period" in span
+    assert "last_seen_at" not in span, "still_active 开始依赖 last_seen_at 了"

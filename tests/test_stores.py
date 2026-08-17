@@ -55,7 +55,11 @@ def test_snapshot_fallback_when_feishu_down(monkeypatch):
 
     monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
     assert stores_svc.load_stores() == snapshot
-    assert stores_svc.load_stores(["不存在"]) == []
+    # 快照兜底时手上只有过滤后的名单,分不出"不在册"还是"未启用/缺代理"——
+    # 那就明说分不出来,不硬猜(此前这里返回 [] 静默少跑)
+    with pytest.raises(ValueError) as ei:
+        stores_svc.load_stores(["不存在"])
+    assert "快照兜底" in str(ei.value)
 
 
 def test_no_snapshot_and_feishu_down_raises(monkeypatch):
@@ -65,6 +69,58 @@ def test_no_snapshot_and_feishu_down_raises(monkeypatch):
     monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
     with pytest.raises(RuntimeError):
         stores_svc.load_stores()
+
+
+def _live(monkeypatch, records):
+    monkeypatch.setattr(stores_svc.feishu, "list_records", lambda *a, **kw: records)
+
+
+def test_filter_names_all_hit_keeps_order(monkeypatch):
+    """全部命中:按**给定顺序**返回,不按表里的顺序。"""
+    _live(monkeypatch, [
+        _rec(store="A1", client_id="c1", client_secret="s", proxy_type="http", host="1.1.1.1", port=80),
+        _rec(store="A2", client_id="c2", client_secret="s", proxy_type="http", host="2.2.2.2", port=80),
+        _rec(store="A3", client_id="c3", client_secret="s", proxy_type="http", host="3.3.3.3", port=80),
+    ])
+    assert [s["name"] for s in stores_svc.load_stores(["A3", "A1"])] == ["A3", "A1"]
+    # 重复给同一个名字不该跑两遍
+    assert [s["name"] for s in stores_svc.load_stores(["A1", "A1"])] == ["A1"]
+
+
+def test_filter_names_typo_raises_not_silently_skipped(monkeypatch):
+    """三个名字打错一个 ⇒ 抛错。
+
+    此前是静默只跑两家、摘要报「2/2 家连通」满绿——人以为三家都验过了。
+    """
+    _live(monkeypatch, [
+        _rec(store="A1", client_id="c1", client_secret="s", proxy_type="http", host="1.1.1.1", port=80),
+        _rec(store="A2", client_id="c2", client_secret="s", proxy_type="http", host="2.2.2.2", port=80),
+    ])
+    with pytest.raises(ValueError) as ei:
+        stores_svc.load_stores(["A1", "A2", "A9typo"])
+    msg = str(ei.value)
+    assert "A9typo" in msg and "查无此店" in msg
+    assert "A1, A2" in msg          # 报错里带可用店铺清单,人能当场看出打错在哪
+
+
+def test_filter_names_disabled_store_says_so(monkeypatch):
+    """在册但被过滤掉的店,**不能**报成「查无此店」。
+
+    把「没配代理」说成「不存在」会让人去凭证表里找一个明明在那儿的店;
+    alloc_audit 的 docstring 专门警告过这一处混淆。
+    """
+    _live(monkeypatch, [
+        _rec(store="A1", client_id="c1", client_secret="s", proxy_type="http", host="1.1.1.1", port=80),
+        _rec(store="停用店", client_id="c2", client_secret="s",
+             proxy_type="http", host="2.2.2.2", port=80, enabled=False),
+        _rec(store="裸连店", client_id="c3", client_secret="s",
+             proxy_type="0", host="0", port="0"),
+    ])
+    for name in ("停用店", "裸连店"):
+        with pytest.raises(ValueError) as ei:
+            stores_svc.load_stores([name])
+        assert "在凭证表里,但被过滤掉了" in str(ei.value)
+        assert "查无此店" not in str(ei.value)
 
 
 def test_success_writes_snapshot(monkeypatch):

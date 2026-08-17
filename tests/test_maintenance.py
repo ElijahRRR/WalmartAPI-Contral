@@ -40,6 +40,21 @@ class _Conn:
         self.sqls.append((sql, list(seq)))
         self._last = sql
 
+    @property
+    def description(self):
+        """psycopg 的 cursor.description。按**最后一条 SQL** 给列名。
+
+        `stuck_executing` 等函数走 `dict(zip(cols, row))` 取值,没有它就 AttributeError。
+        给固定列名而不是 None:拿位置解包的假桩会让"SQL 加了一列而读侧漏改"
+        这类错在测试里看不出来。
+        """
+        class _D:
+            def __init__(self, name):
+                self.name = name
+        if "FROM ops.dispositions" in getattr(self, "_last", ""):
+            return [_D(n) for n in ("store", "action", "n", "oldest")]
+        return []
+
     def fetchall(self):
         return self.rows
 
@@ -686,23 +701,39 @@ def test_prune_keeps_recent_days_only(monkeypatch):
                         Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
                                     columns=resources.MAINT_SHEET.columns))
     conn = _Conn()
-    conn.cursor_value = {"next_row": 5, "unresolved_from": 5}
+    conn.cursor_value = {"next_row": 6, "unresolved_from": 6}   # 4 个数据行
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
+    # ⚠ 行必须按**真实的 11 列**给(店铺 SKU 建议 原因 动作 旧值 新值 feedid
+    #   日期 结果 报错)。此前这里喂的是 9 列、日期在下标 6 —— 正好和 prune 里
+    #   写死的 cells[6] 对齐,于是测试替 bug 背了书。
     monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
-        ["T1", "B0OLD", "价格", "", "", "F1", "2026-07-01", "成功", ""],
-        ["T1", "B0KEEP", "价格", "", "", "F2", "2026-08-08", "成功", ""],
-        ["T1", "B0NODATE", "价格", "", "", "F3", "", "成功", ""],
+        ["T1", "B0OLD", "价格", "涨价", "价格", "10", "12.5", "F1",
+         "2026-07-01", "成功", ""],
+        ["T1", "B0KEEP", "价格", "涨价", "价格", "10", "12.5", "F2",
+         "2026-08-08", "成功", ""],
+        ["T1", "B0NODATE", "价格", "", "价格", "", "", "F3", "", "成功", ""],
+        # 回归钉:**新值**长得像个老日期,而**日期**列是近期的。
+        # 读错列的那版会拿新值当日期,把这行当"早于保留期"删掉。
+        ["T1", "B0TRAP", "标题", "标题不符", "标题", "旧标题", "2026-07-01",
+         "F4", "2026-08-08", "成功", ""],
     ])
     rewritten = []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_overwrite",
                         lambda sheet, rows: (rewritten.extend(rows), len(rows))[1])
     out = maint_sheet.prune(7)
-    assert "删 1 行" in out and "留 2 行" in out
-    assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE"]  # 表头 + 保留
+    assert "删 1 行" in out and "留 3 行" in out
+    assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE", "B0TRAP"]
+    # 整表重写不许把行截短:结果/报错(J/K)是最后两列,截到 9 列就没了
+    ncol = len(resources.MAINT_SHEET.columns)
+    assert all(len(r) == ncol for r in rewritten), "重写把行截短了"
+    # 表头必须与 registry 列序一一对应,否则裁剪一次表头就和数据错位
+    assert tuple(rewritten[0]) == maint_sheet._header()
+    assert rewritten[0][maint_sheet._idx("op_date")] == "日期"
+    assert rewritten[0][maint_sheet._idx("suggestion")] == "建议"
     # 行号整体上移 → 水位必须重置,否则反哺器扫到错行
     saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
-    assert '"next_row": 4' in saved[1] and '"unresolved_from": 2' in saved[1]
+    assert '"next_row": 5' in saved[1] and '"unresolved_from": 2' in saved[1]
 
 
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────
@@ -977,3 +1008,70 @@ def test_wait_settled_is_not_a_duplicate_of_order_audit_wait():
     from workflows import order_audit
     assert "screenshots" not in inspect.getsource(sb.wait_settled)
     assert "shots" in inspect.getsource(order_audit._wait_for_batches)
+
+
+def test_stuck_executing_is_reported_by_both_scans():
+    """卡在 executing 的建议必须被**两个**扫描件报出来。
+
+    部分唯一索引挡的是 (店铺,SKU,动作),所以一条 executing 会让那个组合
+    **建不出新建议**;它靠观测落定,而观测全来自 catalog_sync —— 店铺不被扫
+    (凭证坏掉的店正是如此),观测就永远不来。此前这完全静默:扫描件照常报
+    「建议 N 条」,看不出少了谁。
+
+    ⚠ 尤其问题商品链:它**没有** expire_executing 那道兜底(删除/反补靠观测
+    判定,粗暴时限会抢先判掉真正在途的删除),卡住就是一直卡着。
+    """
+    import inspect
+
+    from services import dispositions as ds
+    from workflows import maintenance_scan as ms
+    from workflows import problem_scan as ps
+
+    q = ds._STUCK_SQL
+    assert "status = 'executing'" in q
+    assert "executed_at < now() - make_interval(days => %(days)s::int)" in q
+    assert "source = ANY(%(sources)s::text[])" in q      # 各查各的链
+    for mod in (ms, ps):
+        src = inspect.getsource(mod.run)
+        assert "stuck_executing" in src and "stuck_note" in src, mod.__name__
+
+
+def test_stuck_note_says_why_and_is_empty_when_clean():
+    from services import dispositions as ds
+
+    assert ds.stuck_note([]) == ""
+    note = ds.stuck_note([{"store": "谭总10", "action": "delete", "n": 3,
+                           "oldest": None}], days=3)
+    assert "谭总10×3" in note
+    assert "建不出新建议" in note        # 后果说清楚,不只报个数
+    assert "catalog_sync" in note        # 指向成因,人知道该去查什么
+
+
+def test_summary_does_not_call_executed_rows_pending(monkeypatch):
+    """真跑完不许再说「待执行建议」—— 那些行此刻已经是 executing 了。
+
+    所有者 2026-08-17 实见:通知开头 `✅ [EXECUTE] maintenance 成功`,正文却是
+    「待执行建议 8257 条」,读起来像"什么都没干"。这一行在**提交之前**生成,
+    dry-run 说「待执行」是对的,真跑就是谎话。
+
+    也不能改口叫「已执行」:领取的行里有一部分会撞上单店上限/在途防重/凭证
+    缺失,并没有全部提交出去 —— 那样只是换了个方向说谎。
+    """
+    calls = _wire(monkeypatch, _zero(2))
+
+    dry = mw.run({"execute": False})
+    assert "待执行建议 2 条" in dry
+
+    real = mw.run({"execute": True})
+    assert "待执行" not in real, "真跑完还在说「待执行」"
+    assert "本轮领取建议 2 条" in real
+    assert calls["put_inv"] or calls["feeds"]      # 确实提交过,不是空跑
+
+
+def test_cleanup_summary_uses_the_same_wording(monkeypatch):
+    """两条链同一处理 —— 各写各的措辞迟早一边改了另一边没改。"""
+    import inspect
+
+    from workflows import problem_product_cleanup as ppc
+    for src in (inspect.getsource(mw.run), inspect.getsource(ppc.run)):
+        assert '"待执行建议" if not execute else "本轮领取建议"' in src

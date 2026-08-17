@@ -430,11 +430,18 @@ def run(params: dict) -> str:
         # 待执行也算进来,与本链执行件领到的数对不上
         n_open = dispositions.count_open(
             conn, sources=dispositions.PROBLEM_SOURCES)
+        # ⚠ 本链**没有** expire_executing 那道兜底(删除/反补靠观测判定,
+        # 粗暴时限会抢先判掉真正在途的删除)。所以卡住就是一直卡着,
+        # 至少要让人看见 —— 否则每轮照常报"建议 N 条",看不出少了谁。
+        stuck = dispositions.stuck_executing(
+            conn, sources=dispositions.PROBLEM_SOURCES)
     lines.append(f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
                  + (f"(差额 {n_sug - n_open} 是同一 (店铺,SKU,动作) 被两个来源"
                     f"命中、按唯一索引合并的)" if n_sug > n_open else "")
                  + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议)" if n_wd else "")
                  + f";归类事件新记 {n_cat} 条")
+    if stuck:
+        lines.append(dispositions.stuck_note(stuck))
     if bl_note:
         lines.append(bl_note)
     lines.append("执行走 `python cli.py problem_product_cleanup`(先 --dry-run 看破坏面)"

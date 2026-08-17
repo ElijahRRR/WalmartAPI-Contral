@@ -157,7 +157,7 @@ def iter_recon_records(store: dict, report_date: str):
         params={"reportDate": report_date, "reportVersion": "v1"},
         timeout=120, max_retries=3, accept="application/octet-stream")
     if status in (401, 403):
-        raise _client.StoreDeadError(f"{store.get('name')} reconFile → {status}")
+        raise _client.StoreDeadError(f"{store.get('name')} reconFile", status)
     if status is None or not (200 <= status < 300) or not body:
         raise RuntimeError(f"reconFile 返回 {status}"
                            f"(店铺 {store['name']}, 账期 {report_date})")

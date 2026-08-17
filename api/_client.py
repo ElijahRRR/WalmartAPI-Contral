@@ -377,6 +377,20 @@ def get_token(client_id, client_secret, proxy):
             data={"grant_type": "client_credentials"},
             timeout=30,
         )
+        # 换 token 阶段的 400/401/403 = 这套凭证被拒,与业务端点的 401/403 同类,
+        # 一律转 StoreDeadError 交给调用方"跳过全店"。
+        # ⚠ 沃尔玛在 client_credentials 授权失败时回的是 **400**(不是 401),
+        #   2026-08-17 生产实见(catalog_sync 谭总10)。此前它以 httpx 原生
+        #   HTTPStatusError 冒出去,落进各 workflow 的 `except Exception` 泛化
+        #   分支 ⇒ **一家店凭证坏掉判整轮失败**,而同样坏掉、只是回 401 的店
+        #   走的却是"凭证失效跳过、整轮照常成功"。同一个现实原因两种相反结果,
+        #   差别只在沃尔玛回哪个状态码。
+        # 请求形状(header/body/grant_type)全项目写死且各店一致,唯一随店变的
+        # 只有 Basic 里的凭证 —— 所以这三个码在这里只可能是"凭证问题"。若哪天
+        # 请求形状被改坏,表现是**全部店**一起 dead,由 workflow 侧"零店完成即
+        # 判失败"那道闸兜住(catalog_sync 已加),不会静默报成功。
+        if resp.status_code in (400, 401, 403):
+            raise StoreDeadError(f"client_id={client_id[:6]}…", resp.status_code)
         resp.raise_for_status()
         data = resp.json()
         token = data["access_token"]

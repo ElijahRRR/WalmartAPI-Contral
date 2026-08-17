@@ -472,7 +472,26 @@ def upsert_settlement_lines(conn, rows: list[dict]) -> int:
 
 def upsert_perf_events(conn, rows: list[dict]) -> int:
     """输入:连接 + 绩效事件行(store/po_id/metric/period/sku/accountable/status/detail)
-    → 输出:写入行数。同键重现只刷新 last_seen_at,保留 first_seen_at。"""
+    → 输出:**送进来的行数**(不是实际写入数,与 upsert_lines 同口径)。
+    同键重现只在内容真变了时才刷新 last_seen_at,保留 first_seen_at。
+
+    ⚠ **内容没变就整行不写**(`WHERE ... IS DISTINCT FROM`)——与 upsert_lines
+    的第 1 条同一个病、同一个药,2026-08-17 所有者实见后补上:
+    绩效报表是**滚动**的,同一批问题订单每轮都会再出现一次。原先无条件
+    `last_seen_at = now()` ⇒ 窗口内每一行的时间戳都被刷新,哪怕一个字段都没变;
+    而 order_center 把 last_seen_at 当「拉取时间」写进飞书载荷、载荷又参与指纹
+    ⇒ **指纹必变 ⇒ 每轮重推窗口内全部行**(实证:1634 行里更新 1093,正是
+    still_active 的那批;剩下 541 行已滚出报表窗口,时间戳不动,指纹一致跳过)。
+    这是自我循环:因为我们跑了时间戳才变,因为时间戳变了才推。
+
+    ⚠ 变更检测比的是**生效后的值**(带 COALESCE)而不是 EXCLUDED:
+    `order_line_id`/`sku` 的 COALESCE 会把"新值为 NULL"挡成不变,拿 EXCLUDED 比
+    则会把这种假变化当成真变化,整行照写、时间戳照跳,等于闸没装。
+
+    ⚠ `last_seen_at` **没有任何判据依赖它**(2026-08-17 逐个核过读者):
+    `perf_event_spans.still_active` 看的是 `max(period) = latest_period`,不是它。
+    唯一读者就是飞书投影那一列。所以少刷新它不影响任何结论。
+    """
     if not rows:
         return 0
     for r in rows:
@@ -488,6 +507,13 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
             sku = COALESCE(EXCLUDED.sku, orders.perf_events.sku),
             accountable = EXCLUDED.accountable, status = EXCLUDED.status,
             detail = EXCLUDED.detail, last_seen_at = now()
+        WHERE (orders.perf_events.order_line_id, orders.perf_events.sku,
+               orders.perf_events.accountable, orders.perf_events.status,
+               orders.perf_events.detail)
+          IS DISTINCT FROM
+              (COALESCE(EXCLUDED.order_line_id, orders.perf_events.order_line_id),
+               COALESCE(EXCLUDED.sku, orders.perf_events.sku),
+               EXCLUDED.accountable, EXCLUDED.status, EXCLUDED.detail)
     """
     defaults = {"order_line_id": None, "sku": None, "accountable": None,
                 "status": None, "detail": None}

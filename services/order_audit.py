@@ -73,6 +73,51 @@ ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  无货三档(采到了页面,但没有可买的报价)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: stock_status(在 snapshots.raw 顶层,契约未列为一等字段)→ (原因码, 页面原文)
+#: ⚠ 第二项是**采集侧页面原文**,不是给人读的句子:维护链已经把它写进生产的
+#: 「维护记录」原因列了,改字面等于改线上数据。**共用的是原因码,措辞归各链**
+#: (审核链的句子在 STOCK_BLOCK_SAY)。
+_STOCK_STATUS_BLOCK = {
+    "currently unavailable": ("unavailable", "Currently unavailable"),
+    "no featured offer": ("no_buybox", "No Featured Offer"),
+}
+
+#: 原因码 → **审核链**的人话。审核结论是给运营看的一句话,不能只甩个英文原文。
+STOCK_BLOCK_SAY = {
+    "unavailable": "亚马逊在架但不可售(Currently unavailable)",
+    "no_buybox": "亚马逊无 Buy Box(No Featured Offer)",
+    "out_of_stock": "亚马逊缺货(out_of_stock)",
+}
+
+
+def stock_block(stock_status=None, stock_state=None) -> tuple | None:
+    """输入:两个库存信号 → 输出:(原因码, 人话)表示"没有可买的报价";正常返回 None。
+
+    **全项目唯一出处**,维护链与审核链共用(`maintenance_intents.classify` 调它)。
+    三档都是"页面采到了、但此刻没有能买的东西",与 `outcome == 'not_found'`
+    (页面本身没了)是两回事——后者货源永久消失,前者可能过几小时就回来。
+
+    两条链拿它做的事不同,但**判据必须同一份**:
+      维护链 → 库存写 0(在架却买不到,不能让顾客下单)
+      审核链 → 待人工 + 重采(此刻算不出限价,但不是采集出了错)
+    各写一份的下场是"维护把它清零了,审核还在报『采集缺字段』",同一个商品
+    两条链说两种话,而且两边都不报错。
+
+    ⚠ 顺序即优先级:stock_status 比 stock_state 具体(前者是页面原文,后者是
+    采集侧归一化出来的三值),先看具体的。
+    """
+    hit = _STOCK_STATUS_BLOCK.get(str(stock_status or "").strip().lower())
+    if hit:
+        return hit
+    if str(stock_state or "").strip().lower() == "out_of_stock":
+        return ("out_of_stock", "亚马逊缺货")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  邮编标准化与钓鱼检测
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -374,6 +419,20 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
                               ("配送时长", snap.get("ship_days")))
                if v is None or v == ""]
     if missing:
+        # ⚠ 先分清**为什么**缺:采到了页面、但此刻没有可买的报价(不可售 /
+        # 无 Buy Box / 缺货)时,单价与货期本来就不存在——那不是采集出了错。
+        # 报「采集缺字段」会把人指向采集器,而采集器什么都没做错;人去查一遍
+        # 才发现商品页好好的,只是 Currently unavailable(所有者 2026-08-17 实遇)。
+        # 判据与维护链同一份(order_audit.stock_block),那边据此把库存写 0。
+        blocked = stock_block(snap.get("stock_status"), snap.get("stock_state"))
+        if blocked:
+            detail["rules"]["stock"] = {"code": blocked[0],
+                                        "stock_status": snap.get("stock_status"),
+                                        "stock_state": snap.get("stock_state")}
+            return AuditResult(
+                MANUAL, f"{STOCK_BLOCK_SAY.get(blocked[0], blocked[1])},"
+                        f"拿不到单价与货期(缺:{'、'.join(missing)}),已排重采",
+                detail, rescrape=True)
         return AuditResult(MANUAL, "采集缺字段:" + "、".join(missing) + ",已排重采",
                            detail, rescrape=True)
 
@@ -552,5 +611,11 @@ def from_snapshot(row: dict | None) -> dict | None:
         "seller": bb.get("buybox_seller"),
         "amz_title": (row.get("title") or "").strip() or None,
         "outcome": row.get("outcome"),
+        # 无货三档的两个信号(与维护链同源):stock_status 在 raw 顶层(契约未列
+        # 为一等字段),stock_state 是 snapshots 的一等列。缺了它们,"页面采到了
+        # 但没有可买的报价"会被后面的缺字段分支报成「采集缺字段」——
+        # 那句话把人指向采集器,而采集器什么都没做错。
+        "stock_status": raw.get("stock_status"),
+        "stock_state": row.get("stock_state"),
         "scraped_at": row.get("scraped_at"),
     }

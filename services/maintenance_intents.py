@@ -205,11 +205,8 @@ def processed_title(slow) -> str:
     ).get("productName") or ""
 
 
-# 亚马逊在架状态原文 → 处置(采集侧 raw.stock_status,原文匹配不做模糊)
-_STOCK_STATUS_ZERO = {
-    "currently unavailable": ("unavailable", "Currently unavailable"),
-    "no featured offer": ("no_buybox", "No Featured Offer"),
-}
+# 无货三档的映射搬去 `order_audit.stock_block`(维护链与审核链的唯一出处);
+# 本模块已经 import order_audit,方向不变。
 
 # 动作优先级:删除 > 库存 > 标题。一个 SKU 一轮只出一个动作 ——
 # 既建议删除又建议改标题的话,执行件会先花配额改一个马上要删的商品。
@@ -242,11 +239,12 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     if title_similarity is not None and title_similarity < TITLE_SIM_FLOOR:
         return ("delete", "title_mismatch",
                 f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
-    hit = _STOCK_STATUS_ZERO.get(str(stock_status or "").strip().lower())
+    # 无货三档的判据是**审核链共用的**(order_audit.stock_block 是唯一出处):
+    # 维护链据此把库存写 0,审核链据此报「无货」而不是「采集缺字段」。
+    # 各写一份的下场是同一个商品两条链说两种话,而且两边都不报错。
+    hit = order_audit.stock_block(stock_status, stock_state)
     if hit:
         return ("inventory", hit[0], hit[1])
-    if str(stock_state or "").strip().lower() == "out_of_stock":
-        return ("inventory", "out_of_stock", "亚马逊缺货")
     if over_lead:
         return ("inventory", "lead_days", lead_note or "配送时长超本店上限")
     return (None, "", "")
@@ -689,6 +687,16 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
 #   detail   = 其余全部   → 旧值/新值/标题载荷/删除证据
 _DETAIL_KEYS = ("old", "new", "label", "product_type", "product_id",
                 "batches", "first_seen", "last_seen", "obs")
+
+#: kind → 「建议」列的中文标签。**全项目唯一出处。**
+#: 2026-08-17 起它不再只是显示文案,而是 maintenance_scan 与 maintenance 之间
+#: 的**连接键**:扫描件按 (店铺, SKU, 建议) append 半行,执行件按同一个键找回
+#: 那一行就地补齐动作/旧值/新值/feedid。两个 workflow 各存一份副本的话,改一处
+#: 忘一处的表现是**执行件找不到扫描件写的行,于是每条都另起一行**——表里一条
+#: 建议对两行、飞书行数翻倍,而两边都不报错。
+#: 铁律 1 禁止 workflow 互相 import,所以这份唯一副本住在 services。
+KIND_LABEL = {"delete": "删除", "title": "标题",
+              "price": "价格", "inventory": "库存"}
 
 
 def to_disposition(it: dict) -> dict:

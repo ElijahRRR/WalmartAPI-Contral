@@ -166,3 +166,37 @@ def test_warn_says_which_direction_it_broke(capsys, tmp_path):
 def test_warn_is_silent_when_env_is_missing(capsys, tmp_path):
     cli._warn_dup_env(tmp_path / "nope.env")
     assert capsys.readouterr().err == ""
+
+def test_failure_notification_carries_whole_message_not_last_line():
+    """失败通知必须带整条消息,**不是** traceback 的最后一行。
+
+    2026-08-17 生产实见(catalog_sync 一家店 400),飞书收到的整条通知是:
+
+        ❌ catalog_sync 失败
+        For more information check: https://developer.mozilla.org/…/400)
+
+    —— 整条消息里最没用的那一行。取"最后一行"只对**单行**异常成立;而本项目
+    的失败摘要恰恰是多行的(catalog_sync 明写「整体判失败,飞书通知会带明细」),
+    那份明细全长在前面几行,被切光了;httpx 的错误自身又是两行、第二行是 MDN
+    链接,于是越是需要细节的失败,通知越是只剩一句废话。
+    """
+    msg = ("catalog_sync:41/42 店完成,入库 30611 行,本轮缺席标记 2149 行\n"
+           "删除核验:生效 2241\n"
+           "失败:谭总10(Client error '400 Bad Request' for url '…/v3/token'\n"
+           "For more information check: https://developer.mozilla.org/…/400)")
+    brief = cli._err_brief(RuntimeError(msg))
+    assert brief.startswith("catalog_sync:41/42 店完成")   # 明细在,而且打头
+    assert "谭总10" in brief                                # 哪家店坏了看得见
+    assert brief != "For more information check: https://developer.mozilla.org/…/400)"
+
+
+def test_err_brief_truncates_but_says_so():
+    brief = cli._err_brief(RuntimeError("x" * (cli._ERR_MAX + 500)))
+    assert len(brief) < cli._ERR_MAX + 200
+    assert "已截断" in brief and "RuntimeError" in brief
+
+
+def test_err_brief_empty_message_falls_back_to_type():
+    """消息为空时不能发一条空通知——至少要说清是什么异常。"""
+    assert cli._err_brief(KeyError()) == "KeyError"
+    assert cli._err_brief(RuntimeError("")) == "RuntimeError"

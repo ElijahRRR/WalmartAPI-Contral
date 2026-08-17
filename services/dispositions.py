@@ -418,3 +418,59 @@ def expire_executing(conn, actions: tuple = MAINT_ACTIONS,
         logger.warning("处置建议超期放行 %d 条(超 %d 天没等到 catalog_sync "
                        "重新观测;不放行会把这些 SKU 的该类维护永久堵住)", n, days)
     return n
+
+
+_STUCK_SQL = """
+SELECT store, action, count(*) AS n, min(executed_at) AS oldest
+FROM ops.dispositions
+WHERE status = 'executing'
+  AND executed_at < now() - make_interval(days => %(days)s::int)
+  AND (%(sources)s::text[] IS NULL OR source = ANY(%(sources)s::text[]))
+GROUP BY store, action
+ORDER BY n DESC, store
+"""
+
+
+def stuck_executing(conn, sources: tuple | None = None,
+                    days: int = EXPIRE_DAYS) -> list[dict]:
+    """输入:连接(+来源/天数)→ 输出:卡在 executing 超期的行,按 (店铺,动作) 聚合。
+
+    **只读,只为了让人看见**——不改状态、不放行(放行归 expire_executing)。
+
+    为什么必须有人报它:部分唯一索引 `dispositions_open_uidx` 约束的是
+    `status IN ('suggested','executing')`,所以一条 executing 会**挡住**同
+    (店铺, SKU, 动作) 的任何新建议。它靠观测落定,而观测全部来自 catalog_sync
+    —— **店铺不被扫,观测就永远不来**(凭证坏掉的店正是这样:换 token 400 →
+    catalog_sync 跳过它 → 它的 executing 行等不到判决)。于是那些 SKU 的这类
+    处置永久停摆,而扫描件每轮照常报"建议 N 条",**完全看不出少了谁**。
+
+    ⚠ 两条链在放行上不对称,这是有意的:维护三类由 `expire_executing` 3 天
+    放行;删除/反补**不自动放行**(它们有自己的观测判定,粗暴时限会抢先判掉
+    真正在途的删除)。所以问题商品链尤其需要这一句 —— 它没有任何兜底,
+    卡住就是一直卡着。自动放行也不是好答案:店铺是死的,放行 → 下轮重新建议
+    → 执行件再提交一次 feed → 凭证坏着照样失败,白烧配额。卡着是**真有原因**
+    卡着,该做的是让人看见。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_STUCK_SQL,
+                    {"days": int(days),
+                     "sources": list(sources) if sources is not None else None})
+        cols = [d.name for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def stuck_note(rows: list[dict], days: int = EXPIRE_DAYS) -> str:
+    """输入:stuck_executing 的返回 → 输出:摘要用的一行(没卡住返回空串)。
+
+    两个扫描件共用同一句措辞 —— 各写一份迟早一边改了另一边没改。
+    """
+    if not rows:
+        return ""
+    total = sum(r["n"] for r in rows)
+    by_store = ",".join(f"{r['store']}×{r['n']}" for r in rows[:8])
+    more = f" 等 {len(rows)} 组" if len(rows) > 8 else ""
+    return (f"⚠ {total} 条建议卡在 executing 超 {days} 天({by_store}{more}):"
+            f"这些 (店铺,SKU,动作) **本轮建不出新建议**(部分唯一索引挡着)。"
+            f"成因多为该店没被 catalog_sync 扫到(凭证坏了?)⇒ 观测永远不来。"
+            f"查:SELECT * FROM ops.dispositions WHERE status='executing' "
+            f"AND executed_at < now() - interval '{days} days'")

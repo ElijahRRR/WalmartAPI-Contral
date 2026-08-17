@@ -386,3 +386,64 @@ def test_projection_skipped_when_sheet_unregistered(monkeypatch):
     from workflows import catalog_sync
     out = catalog_sync._write_projection()
     assert "跳过" in out and "在线产品总表" in out
+
+
+# ── 一家店坏掉 vs 全部店坏掉:两者的成败判定必须相反 ──────────────────────
+
+def _stub_stores(monkeypatch, names):
+    from workflows import catalog_sync
+    monkeypatch.setattr(catalog_sync.stores_svc, "load_stores",
+                        lambda filter_names=None: [
+                            {"name": n, "client_id": f"c{n}", "client_secret": "s",
+                             "proxy": "http://p:1"} for n in names])
+    return catalog_sync
+
+
+def _ok_result(name):
+    return {"store": name, "written": 10, "missing": 0, "item_ids": 0,
+            "truncated": False, "inv_failed": False}
+
+
+def test_partial_dead_store_still_succeeds(monkeypatch):
+    """41/42 店完成、一家凭证坏掉 ⇒ **成功**(所有者 2026-08-17:程序是跑成功的)。
+
+    一家店的凭证坏掉不该拖垮整轮——目录数据已经入库、飞书已经重写。它以
+    「凭证失效跳过」出现在成功通知里,每天可见,不会烂在那没人管。
+    """
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["好店", "坏店"])
+
+    def one(store, *a, **kw):
+        if store["name"] == "坏店":
+            raise catalog_sync._client.StoreDeadError(store["name"], 400)
+        return _ok_result(store["name"])
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", one)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+
+    summary = catalog_sync.run({"skip_feishu": "1"})      # 不碰飞书
+    assert "1/2 店完成" in summary
+    assert "凭证失效跳过:坏店" in summary
+
+
+def test_zero_stores_completed_is_failure_not_success(monkeypatch):
+    """全部店都被跳过 ⇒ **失败**。
+
+    「凭证失效跳过」按设计不进 failed,于是"全部店都跳过"曾经一路走到
+    `return` 报成功——那一轮什么都没同步,而通知是绿的。这也是把换 token 的
+    400 归为死店之后必须堵上的口子:万一请求形状被改坏,表现正是全部店一起
+    dead,不能让它静默报成功。
+    """
+    catalog_sync = _stub_stores(monkeypatch, ["A1", "A2"])
+
+    def dead(store, *a, **kw):
+        raise catalog_sync._client.StoreDeadError(store["name"], 400)
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", dead)
+    with pytest.raises(RuntimeError) as ei:
+        catalog_sync.run({"skip_feishu": "1"})
+    assert "零店完成" in str(ei.value)
+    assert "0/2 店完成" in str(ei.value)

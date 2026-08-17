@@ -128,15 +128,21 @@ JOBS = (
     # 谁提前谁就是在拿昨天的数据做今天的判断,而且**不报错**。
     job("audit_sheet", ["product_audit"], batch=3, hour=18, minute=10,
         runner="gpt", params=["from_sheet=1"],
-        note="审上架表里 E 列为空的行 + 把库里已有结论投影回 C~G。"
-             "⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,"
+        note="审上架表里 E 列为空(或 E=pending)的行 + 把库里已有结论投影回 "
+             "C~G。⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,"
              "只有未审/pending 过退避的才真判;缺省 limit=500,"
-             "存量大时改调度表加 -p limit=N,别在提示词里手改"),
+             "存量大时改调度表加 -p limit=N,别在提示词里手改。"
+             "库里没数据的行会自动推采集批次 audit_gap_<日界> 并把原因写进 "
+             "F 列(E 留空 ⇒ 下轮重领)—— 采回来是**下一轮**审核的事,"
+             "所以这条链首日会有一批行停在「未采集」,第二天才落定"),
     job("list_new", ["list_new"], batch=3, hour=20, minute=0, runner="gpt",
         note="⚠⚠ **开这条之前必须先停旧上架栈**:com.user.autolisting.morning"
              "(06:00,链末尾就是无人值守上架)+ com.nextderboy.erp_worker×20"
              "(常驻,长轮询跑上架)+ dedup 链(每时:05 与 14:02)。"
              "不停就是新旧两套同时对上架表双写、同时消耗 UPC —— 安全铁律"
              "「新旧系统严禁对同一破坏性任务并跑」直接踩上。"
-             "停旧顺序见 docs/legacy_schedules.md §D"),
+             "停旧顺序见 docs/legacy_schedules.md §D。"
+             "UPC **不必单独排一条**:这条链自己开头注入一次 UPC 池、"
+             "结尾把池状态回写飞书 C~F(所有者定稿 2026-08-16「放到上架里」),"
+             "合起来等于跑了一次 upc_sync"),
 )

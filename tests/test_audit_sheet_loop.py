@@ -5,7 +5,7 @@
   ② 上架「以数据库的数据为准 —— 要上架就肯定要过审核,读取速度也更快」。
 
 这两句话合起来是一条**单向环**:表 A 列进审核 → 结论落 PG → 投影回表 C~G(给人看)
-→ 上架读 **PG**(不读投影)。本文件钉住的是这条环上四个"错了也不报错"的接缝:
+→ 上架读 **PG**(不读投影)。本文件钉住的是这条环上"错了也不报错"的接缝:
 
   · E 列写的值必须是 `list_new` 之外的人能看懂的中文态,而 **PG 里是英文态** ——
     两套词表错配的表现是"审过了但一行也上不去",没有任何报错;
@@ -14,6 +14,11 @@
   · 上架的审核闸读 PG:表 E 列被人手改成 pass **不该**让它上架;
   · 类目同样以库为准:表 D 列被手改成另一个 PT,不该按手改的那个上架
     (那等于绕过审核换类目)。
+
+2026-08-17 补两条,都是同一种病(**这行从此没人再管,而且不报错**):
+  · **E=pending 也要被重新领取** —— pending 是中间态,写进 E 就退出通道了;
+  · **库里没数据的行要推去采集、原因写 F 而不是 E** —— 原先摘要只说
+    "先跑 product_ingest",而那是死路(ingest 只摄采回来的东西)。
 """
 
 import datetime as dt
@@ -41,6 +46,25 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
     got = listing_sheet.audit_targets()
     assert [r["rownum"] for r in got] == [2, 3]
     assert got[0]["asin"] and got[0]["store"] == "T1"
+
+
+def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
+    """⚠ pending 是**中间态**,写进 E 之后必须还能被领回来(2026-08-17 修)。
+
+    不领的话:L1 解不出类目 / L3 LLM 故障那批,`_project_to_sheet` 把 pending
+    写进 E 的那一刻就永久退出了上架表通道 —— 库里的一天退避重判照跑、结论也
+    在更新,而表上那一格永远停在 `pending`,谁也不会再看它一眼,全程不报错。
+    (与 rerule 首版同一种搁浅:候选谓词把自己刚写的东西当成了"已处理"。)
+    """
+    rows = [_sheet_row(2, audit_result="pending"),
+            _sheet_row(3, audit_result="Pending"),      # 大小写不该决定命运
+            _sheet_row(4, audit_result="pass"),
+            _sheet_row(5, audit_result="reject")]
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    assert [r["rownum"] for r in listing_sheet.audit_targets()] == [2, 3]
+    # 而 pass 重新被领 = 已上架的行被反复重审,那是另一头的错
+    assert ln.AUDIT_OK == "approved"                    # 上架闸判 PG 英文态
+    assert listing_sheet.AUDIT_RESULT_CN["approved"] == "pass"
 
 
 def test_audit_result_cn_matches_what_list_new_reads():
@@ -285,3 +309,154 @@ def test_columns_contract():
     assert cols[2:7] == ("list_title", "product_type", "audit_result",
                          "audit_reason", "audit_date")   # C~G 审核域
     assert len(cols) == 21                               # A~U
+
+
+# ── ⑤ 缺数据补采闭环(所有者定稿 2026-08-17)──────────────────────────────
+#
+# 「不能因为没有产品就静默失败……需要把理由记录到表格中」。
+# 这一段钉的三件事,每一件失手都表现为"那几行永远空着而且没人知道为什么":
+#   · E 列一个字不许动(动了这行就退出审核通道,采回来也没人再审);
+#   · 采集侧挂掉不许把审核链拖下水,但**必须出现在摘要里**;
+#   · dry-run 不许推、不许写。
+
+
+class _GapConn:
+    """假连接:_SQL_GAP 查"这些 ASIN 库里有没有、有没有标题"。"""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _Cur(self._rows)
+
+
+def _stub_gap(monkeypatch, in_db, *, pushed=None, notes=None, open_lines=None):
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _GapConn(in_db))
+    monkeypatch.setattr(pa.scrape_batches, "check_open",
+                        lambda p, h: open_lines or ["无在途采集批次"])
+    monkeypatch.setattr(pa.scrape_batches, "record",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(pa.scraper, "submit_batch", lambda name, asins: (
+        (pushed if pushed is None else pushed.append((name, list(asins)))),
+        {"batch_id": "bid1", "inserted": len(asins)})[1])
+    monkeypatch.setattr(pa.listing_sheet, "write_audit_notes",
+                        lambda ups, execute: (
+                            (notes if notes is None else notes.extend(ups)),
+                            len(ups) if execute else 0)[1])
+
+
+_ROWS = [{"rownum": 2, "asin": "B0HAVE0001"},
+         {"rownum": 3, "asin": "B0GONE0001"},     # 库里压根没有
+         {"rownum": 4, "asin": "B0THIN0001"},     # 有行但没标题
+         {"rownum": 5, "asin": "B0GONE0001"}]     # 同 ASIN 多店铺:两行都写
+_WANT = ["B0GONE0001", "B0HAVE0001", "B0THIN0001"]
+_IN_DB = [("B0HAVE0001", False), ("B0THIN0001", True)]
+
+
+def test_missing_products_get_pushed_to_the_scraper(monkeypatch):
+    """原先摘要只说"先跑 product_ingest",而那是**死路** —— ingest 只摄已经
+    采回来的东西,这些 ASIN 从来没被采过,跑一百次也不会多出一行。"""
+    pushed, notes = [], []
+    _stub_gap(monkeypatch, _IN_DB, pushed=pushed, notes=notes)
+    out = "\n".join(pa._gap_to_scrape(_WANT, _ROWS, True))
+    assert len(pushed) == 1
+    name, asins = pushed[0]
+    assert name.startswith("audit_gap_")
+    assert asins == ["B0GONE0001", "B0THIN0001"]     # 有标题的那个不重采
+    assert "审不了 2 个 ASIN" in out
+    assert "不在库 1" in out and "采集降级无标题 1" in out
+    assert "已推采集" in out
+
+
+def test_reason_goes_to_f_and_never_to_e(monkeypatch):
+    """⚠ 这是整段最要命的一条。E 一有值这行就不再被领(pending 除外)——
+    往里写个"未采集"等于**这行从此退出审核通道**,而表面上"写着原因呢"。"""
+    notes = []
+    _stub_gap(monkeypatch, _IN_DB, pushed=[], notes=notes)
+    out = "\n".join(pa._gap_to_scrape(_WANT, _ROWS, True))
+    by_row = dict(notes)
+    assert set(by_row) == {3, 4, 5}                  # 有数据的第 2 行不写
+    assert "未采集" in by_row[3] and "已推采集" in by_row[3]
+    assert "采集降级" in by_row[4]
+    assert by_row[5] == by_row[3]                    # 同 ASIN 的另一行同样写
+    assert "E 列留空" in out
+
+
+def test_write_audit_notes_touches_only_f(monkeypatch):
+    """只碰 F:range 里出现别的列就是跨界(E 被扫到 = 上一条守的那个坑)。"""
+    sent = []
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_write_ranges",
+                        lambda s, ups: sent.extend(ups))
+    assert listing_sheet.write_audit_notes([(9, "未采集")]) == 1
+    assert sent == [("F9:F9", [["未采集"]])]
+    sent.clear()
+    assert listing_sheet.write_audit_notes([(9, "x")], execute=False) == 0
+    assert sent == []
+    assert listing_sheet.write_audit_notes([]) == 0
+
+
+def test_scraper_outage_still_records_the_reason(monkeypatch):
+    """采集侧挂了不该拖垮审核(结论已落 PG),但**必须说出来** ——
+    静默跳过就退回原来那个"永远空着没人知道"的坑。"""
+    notes = []
+    _stub_gap(monkeypatch, _IN_DB, notes=notes)
+
+    def _boom(name, asins):
+        raise RuntimeError("采集服务 502")
+    monkeypatch.setattr(pa.scraper, "submit_batch", _boom)
+    out = "\n".join(pa._gap_to_scrape(_WANT, _ROWS, True))
+    assert "推送失败" in out and "采集服务 502" in out
+    # 措辞不许把没推成的说成已推(运营会以为在等采集)
+    assert "推采集失败,下轮重推" in dict(notes)[3]
+    assert "已推采集,采回后下轮自动审" not in dict(notes)[3]
+
+
+def test_dry_run_pushes_nothing_and_writes_nothing(monkeypatch):
+    pushed, notes = [], []
+    _stub_gap(monkeypatch, _IN_DB, pushed=pushed, notes=notes)
+    out = "\n".join(pa._gap_to_scrape(_WANT, _ROWS, False))
+    assert pushed == []
+    assert "真跑时会推采集批次" in out and "dry-run 一格未写" in out
+    assert notes                        # 算出来了,只是没写(execute=False)
+
+
+def test_previous_batch_is_reported_before_todays_push(monkeypatch):
+    """⚠ 顺序:先报**上一批**采完没有,再推今天的。
+
+    反了的话刚推的这批会被算进"在途",于是永远看不出昨天那批到底采完没有
+    —— 而那正是判断这条闭环有没有真的转起来的唯一依据。
+    """
+    _stub_gap(monkeypatch, _IN_DB, pushed=[], notes=[],
+              open_lines=["  audit_gap_20260816:✅ 采完 8/10(失败 2)"])
+    out = "\n".join(pa._gap_to_scrape(_WANT, _ROWS, True))
+    assert out.index("audit_gap_20260816") < out.index("已推采集")
+    assert "补采批次(上一批)" in out
+
+
+def test_no_gap_no_noise(monkeypatch):
+    """一个都不缺时除了在途那句什么都不该说 —— 空节本身就是噪声。"""
+    _stub_gap(monkeypatch, [("B0HAVE0001", False)], pushed=[], notes=[])
+    assert pa._gap_to_scrape(["B0HAVE0001"], [_ROWS[0]], True) == []
+
+
+def test_run_actually_reaches_the_gap_closure(monkeypatch):
+    """⚠ 补采闭环写完了但**没人调**是本仓踩过的坑(变体计数那次:函数在、
+    摘要行在,只是构造摘要的顺序让它永远拼不进去,dry-run 与真跑都看不见)。
+
+    所以这条不看行为看接线:run() 里必须把 `_claim_from_sheet` 的**完整
+    ASIN 列表**交给 `_gap_to_scrape`,并把返回的行拼进摘要。
+    """
+    import inspect
+    src = inspect.getsource(pa.run)
+    assert "sheet_rows, sheet_want, sheet_head = _claim_from_sheet(limit)" in src
+    assert "lines += _gap_to_scrape(sheet_want, sheet_rows, execute)" in src
+    # ⚠ 交的必须是 sheet_want(整批),不是 rows(被 limit 截过的候选)——
+    # 交候选的话:超出 limit 的缺数据行永远排不上,也就永远不会被推去采集
+    assert "_gap_to_scrape(rows" not in src
+    assert "_gap_to_scrape(todo" not in src

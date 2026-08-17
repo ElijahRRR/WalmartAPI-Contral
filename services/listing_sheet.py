@@ -13,7 +13,9 @@
 列权责(旧系统纪律,跨界写就是 bug):**A/B 人工域**(运营填店铺与 ASIN);
 **C/D/E/F/G 审核域**(`product_audit -p from_sheet=1` 写,2026-08-16 所有者定稿
 「审核直接读取上架表的 ASIN 与审核结果两列(结果为空就审核),然后回填 C、D、E、F、G」——
-此前 D/E/F/G 记在人工域,那是并跑期旧审核链在填,现在由新审核链接管);
+此前 D/E/F/G 记在人工域,那是并跑期旧审核链在填,现在由新审核链接管;
+**F 还有一条单列通道** `write_audit_notes` —— 审不了的行(库里没数据)在
+E 留空的前提下只写 F 说明原因,见那个函数的头注);
 list_new 写 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
 L3 状态跟踪写 R~U。**唯一例外**:heal_unknown 自愈反哺器对 K=Unknown
 的行可写 K~Q(所有者批复 2026-08-12——Unknown 是 list_new 自己写的
@@ -122,12 +124,22 @@ def audit_targets() -> list[dict]:
     真重审走 CLI:`product_audit -p asins=<逗号分隔>`(点名强审)或
     `-p rerule=<规则码>`(改了某条规则后定点翻案)。
 
+    ⚠ **`pending` 也算待审**(2026-08-17 修一处静默搁浅):`_project_to_sheet`
+    会把 pending 结论照实写进 E 列,而"E 有值"原本就等于"这行不用再领" ——
+    净效果是 **L1 解不出类目 / L3 LLM 故障的那批,写进 E 那一刻就永久退出了
+    上架表通道**,库里的一天退避重判照跑、结论也在更新,但表上那一格永远停在
+    `pending`,谁也不会再看它一眼,而且全程不报错(与 rerule 首版同一种搁浅)。
+    pending 是**中间态不是结论**,所以它跟空一样要被反复领回来,直到落定。
+    `list_new` 的闸判 `== "pass"`,重新领取不会有误上架风险。
+
     ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
     再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
     """
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
             for r in read_rows()
-            if r.get("asin") and not str(r.get("audit_result") or "").strip()]
+            if r.get("asin")
+            and str(r.get("audit_result") or "").strip().lower()
+            in ("", "pending")]
 
 
 def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
@@ -147,6 +159,35 @@ def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> i
     feishu.sheet_write_ranges(resources.LISTING_SHEET, [
         (f"C{r}:G{r}", [[("" if v is None else str(v)) for v in vals]])
         for r, vals in updates])
+    return len(updates)
+
+
+def write_audit_notes(updates: list[tuple[int, str]],
+                      execute: bool = True) -> int:
+    """输入:[(行号, 一句人话)] → 输出:写入行数。**只写 F 列**。
+
+    给"审核轮到它了、但判不了"的行用(所有者定稿 2026-08-17:「不能因为没有
+    产品就静默失败……需要把理由记录到表格中」)。典型是这行的 ASIN 压根没采集
+    过 —— 库里没有它,审核引擎无从下手。
+
+    ⚠ **绝不碰 E 列**,这是本函数存在的全部理由。E 一有值这行就不再被
+    `audit_targets` 领走(`pending` 除外),往里写个"未采集"就等于**这行从此
+    退出审核通道**:采集回来了也不会有人再审它,而表面上"表里写着原因呢"。
+    E 留空 + F 写原因 = 运营看得见为什么卡着,而下一轮照样重新领取。
+
+    也不碰 C/D/G:那三列是有结论时 `write_audit_cols` 的域,没结论时本来就空,
+    顺手写进去(哪怕写空串)就是跨界写。
+    """
+    if not updates:
+        return 0
+    if not execute:
+        for rownum, note in updates[:20]:
+            logger.info("[DRY-RUN] 将回写 第%d行 F=%s", rownum, note)
+        if len(updates) > 20:
+            logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
+        return 0
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, [
+        (f"F{r}:F{r}", [[note]]) for r, note in updates])
     return len(updates)
 
 

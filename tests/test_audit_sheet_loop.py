@@ -518,14 +518,44 @@ def test_dry_run_pushes_nothing_and_writes_nothing(monkeypatch):
     assert notes                             # 算出来了,只是没写
 
 
-def test_previous_batch_is_reported_before_todays_push(monkeypatch):
-    """⚠ 顺序:先报**上一批**采完没有,再推今天的。反了的话刚推的这批会被算进
-    "在途",于是永远看不出昨天那批到底成没成。"""
+def test_ledger_is_settled_at_the_end_not_reported_a_day_late(monkeypatch):
+    """⚠ 台账落定必须在**最后**(所有者 2026-08-17:「我都已经是当时轮询了,
+    不应该还存在上一批吧」—— 对,首版把 check_open 放开头是个真 bug)。
+
+    `wait_settled` **故意不碰台账**(台账落定归 check_open)。放开头 ⇒ 每轮都把
+    自己这批留在 `pushed` 上,而开头那次看到的正是**昨天自己没关的那笔** ——
+    于是天天报一条"上一批 ✅ 采完",看着像有积压,其实只是台账迟了一天关。
+    放最后:推的、等的、关的是同一批,当轮闭合。
+    """
     _stub(monkeypatch, [_BEFORE, _AFTER_ALL], pushed=[], notes=[],
-          open_lines=["  audit_gap_20260816:✅ 采完 8/10(失败 2)"])
+          open_lines=["  audit_gap_20260817:✅ 采完 2/2(失败 0)"])
     out = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
-    assert out.index("audit_gap_20260816") < out.index("已推采集")
-    assert "补采批次(上一批)" in out
+    assert out.index("已推采集") < out.index("补采批次台账")
+    assert "上一批" not in out
+
+
+def test_ledger_is_settled_even_when_nothing_is_missing(monkeypatch):
+    """缺口为空 ≠ 没有遗留:上一轮超时 / gap_wait=0 / 中途被打断的那批还挂着。
+
+    只在有缺口时才关台账的话,那笔遗留会一直挂到下一次刚好有缺口 —— 而
+    "在途批次挂着没人管"正是 ops.scrape_batches 那张表要防的事。
+    """
+    calls = _stub(monkeypatch, [[("B0HAVE0001", False)]], pushed=[], notes=[],
+                  calls=[],
+                  open_lines=["  audit_gap_20260816:⏰ 超时(3/10)"])
+    out = "\n".join(pa._close_gap(["B0HAVE0001"], [_ROWS[0]], True, 20))
+    assert calls == []                       # 没缺口:不推、不等、不摄取
+    assert "补采批次台账" in out and "超时" in out
+
+
+def test_dry_run_does_not_touch_the_ledger(monkeypatch):
+    """查在途会把批次标 completed/timeout —— 那是写台账,dry-run 不许碰。"""
+    seen = []
+    _stub(monkeypatch, [_BEFORE], pushed=[], notes=[])
+    monkeypatch.setattr(pa.scrape_batches, "check_open",
+                        lambda p, h: (seen.append(p), ["x"])[1])
+    out = "\n".join(pa._close_gap(_WANT, _ROWS, False, 20))
+    assert seen == [] and "补采批次台账" not in out
 
 
 def test_no_gap_no_noise(monkeypatch):

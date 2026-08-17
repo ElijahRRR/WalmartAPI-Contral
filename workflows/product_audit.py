@@ -636,15 +636,27 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
     五步:
 
-      ① 报**上一批**在途/落定(`check_open`)。放在推送之前 —— 放后面会把刚推的
-         算进"在途",于是永远看不出昨天那批到底采完没有。
-      ② 推今天的缺口(日界批次名,撞名沿用)。
-      ③ **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
-      ④ **就地摄取**(借 product_ingest 的锁,见 `_ingest_now`)——
+      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。
+      ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
+      ③ **就地摄取**(借 product_ingest 的锁,见 `_ingest_now`)——
          批次 completed **不等于**我们库里有数据,中间还隔着一次增量导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
-      ⑤ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
+      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
          (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
+      ⑤ **落定台账**(`check_open`)。
+
+    ⚠ ⑤ 为什么在最后、而不是开头报"上一批"(所有者 2026-08-17 质疑:「我都已经
+    是当时轮询了,不应该还存在上一批吧」—— 对,而且首版把它放开头是个真 bug):
+    `wait_settled` **故意不碰台账**(见它的头注:台账落定归 check_open)。所以
+    每一轮成功跑完都会把自己这批留在 `ops.scrape_batches` 的 `pushed` 上,
+    而开头那次 check_open 看到的就是**昨天自己没关的那笔** —— 于是天天报一条
+    "上一批 ✅ 采完",看着像有积压,其实只是自己的台账迟了一天关。
+    放到最后:同一轮里推的、等的、关的是同一批,台账当轮闭合,正常情况下
+    第二天开头没有任何遗留。
+
+    **真正还会有遗留的三种情况**(这时 ⑤ 会报出来,而且**该报**):
+    等采集超时(那批还在采集侧跑)、`gap_wait=0`(只推不等)、
+    本轮中途炸了/被打断(推出去了但没等到)。台账 24 小时没关会被标 timeout。
 
     `wait_min=0` = 只推不等(退回跨轮形态)。采集侧病了、或者人只想让它把队排上
     时用;摘要里会明说这一轮不等。
@@ -662,20 +674,41 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
     if not want:
         return []
     out: list[str] = []
-    try:
-        open_lines = scrape_batches.check_open(_GAP_PREFIX, _GAP_TIMEOUT_H)
-        if open_lines != ["无在途采集批次"]:
-            out.append("补采批次(上一批):")
-            out += open_lines
-    except Exception as e:                                      # noqa: BLE001
-        logger.warning("查在途补采批次失败(不影响本轮): %s", e)
-        out.append(f"  ⚠ 查在途补采批次失败:{e}")
-
     absent, degraded = _find_gap(want)
     gap = absent + degraded
-    if not gap:
-        return out
+    if gap:
+        _run_gap_round(gap, absent, degraded, sheet_rows, execute, wait_min,
+                       want, out)
+    # ⑤ 台账落定:**本轮缺口为空也要跑**。缺口为空只说明今天没新批次,
+    #    不说明没有遗留(上一轮超时/gap_wait=0/中途被打断的那批还挂着)——
+    #    只在有缺口时才关台账的话,那笔遗留会一直挂到有下一次缺口
+    out += _settle_ledger(execute)
+    return out
 
+
+def _settle_ledger(execute: bool) -> list[str]:
+    """输入:是否真跑 → 输出:台账落定摘要(没有在途批次则空,不出空节)。
+
+    `check_open` 会顺手把已采完的标 completed、超 24 小时的标 timeout,并拉失败
+    明细落 `ops.scrape_failures`。放在整段最后,所以正常情况下它关掉的就是
+    **本轮自己推的那批** —— 不会隔一天再报一次(首版放开头就是那个毛病)。
+    """
+    if not execute:
+        return []               # 查在途会改台账状态,dry-run 不碰
+    try:
+        lines = scrape_batches.check_open(_GAP_PREFIX, _GAP_TIMEOUT_H)
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("补采台账落定失败(不影响本轮): %s", e)
+        return [f"  ⚠ 补采台账落定失败:{e}"]
+    if lines == ["无在途采集批次"]:
+        return []
+    return ["补采批次台账:"] + lines
+
+
+def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
+                   sheet_rows: list[dict], execute: bool, wait_min: int,
+                   want: list[str], out: list[str]) -> None:
+    """输入:本轮缺口 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
     day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
     head = (f"⚠ 审不了 {len(gap)} 个 ASIN:不在库 {len(absent)}"
             + (f" / 采集降级无标题 {len(degraded)}" if degraded else ""))
@@ -685,7 +718,7 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
                    f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 F 列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
-        return out
+        return
 
     out.append(head)
     sent = _push_gap(gap, day, out)
@@ -704,7 +737,7 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
                        f"(已采到的下面就摄进来)")
         out.append(f"  {_ingest_now()}")
 
-    # ⑤ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
+    # ④ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
     #    刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉
     still_absent, still_degraded = _find_gap(want)
     still = set(still_absent) | set(still_degraded)
@@ -715,7 +748,6 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
         out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格 F 列,下轮重试")
     _note_gap(sheet_rows, still, set(still_absent),
               _gap_reasons(sent) if still else {}, day, True, out)
-    return out
 
 
 def _note_gap(sheet_rows: list[dict], still: set, absent: set,

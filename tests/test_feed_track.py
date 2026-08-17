@@ -341,3 +341,74 @@ def test_poll_all_is_cross_store_concurrent_and_in_store_serial(monkeypatch):
     got = [l.split(" ")[2] for l in out.splitlines() if "已落定" in l]
     # 每店两个 feed:店序按 sort_key,店内两行相邻(不与别店交织)
     assert got == ["A085", "A085", "81张三", "81张三", "谭总2", "谭总2"], got
+
+
+def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
+    """反哺器链间并发、链内串行;摘要按登记顺序拼,不按完成先后。
+
+    所有者定稿 2026-08-17「一起并」。分链的判据是**写不写同一张表**:
+    上架表与上架表自愈都走 read_rows → 算 → 回写,是读-改-写三步,并发跑
+    后者会读到前者写之前的快照。`_sheet_locks` 只串得住"写"那一步。
+    """
+    import threading
+
+    from workflows import feed_poll
+
+    gate = threading.Barrier(4, timeout=5)      # 四条链会合 = 真的同时在飞
+    order: list[str] = []
+    lock = threading.Lock()
+
+    def _mk(label, first=False):
+        def _f():
+            if first:                            # 每条链的头一个反哺器上会合
+                gate.wait()
+            with lock:
+                order.append(label)
+            return f"{label}:回写 1 行"
+        return _f
+
+    def _boom():
+        gate.wait()          # 也要会合:秒退的话剩下三条永远凑不齐四个
+        raise RuntimeError("飞书 90227")
+
+    monkeypatch.setattr(feed_poll, "_REFLECTOR_CHAINS", [
+        [("停用/删除表", _mk("停用/删除表", first=True))],
+        [("维护记录", _mk("维护记录", first=True))],
+        [("跟卖表", _boom)],                     # 一条链整个炸掉
+        [("上架表", _mk("上架表", first=True)),
+         ("上架表自愈", _mk("上架表自愈"))],
+    ])
+
+    out = feed_poll._run_reflectors()
+
+    assert not gate.broken, "四条反哺链没能同时在飞"
+    # 同一条链内严格按登记顺序:自愈永远在上架表之后
+    assert order.index("上架表") < order.index("上架表自愈")
+    # 摘要按登记顺序拼,不按完成先后;一条链炸了只吃掉它自己那一行
+    assert [l.split(":")[0] for l in out] == [
+        "停用/删除表", "维护记录", "⚠ 跟卖表回写失败", "上架表", "上架表自愈"]
+
+
+def test_same_sheet_reflectors_registered_in_one_chain():
+    """**同一个 services 模块出来的反哺器必须在同一条链里**(登记侧的不变量)。
+
+    上一个用例验的是机制(链内串行、链间并发),这一个钉的是**登记**:
+    每个 sheet 模块正好管一张飞书表,所以"同模块"就是"同一张表"的机械判据。
+    哪天有人往 _REFLECTOR_CHAINS 追加一个 listing_sheet.xxx 却另起一条链,
+    上架表就会被两个线程读-改-写,而且**不报错**,只是偶尔覆盖掉对方的回写。
+    """
+    from workflows import feed_poll
+
+    seen: dict[str, int] = {}
+    for i, chain in enumerate(feed_poll._REFLECTOR_CHAINS):
+        for label, fn in chain:
+            mod = getattr(fn, "__module__", "")
+            if mod in seen and seen[mod] != i:
+                raise AssertionError(
+                    f"{label}({mod})与第 {seen[mod]} 条链同模块=同一张表,"
+                    f"却被登记在第 {i} 条链 —— 并发读-改-写会互相覆盖")
+            seen[mod] = i
+    # 上架的两步是本仓当下唯一的同表组合,正向钉住它别被拆开
+    listing = [c for c in feed_poll._REFLECTOR_CHAINS
+               if any(f.__module__.endswith("listing_sheet") for _, f in c)]
+    assert len(listing) == 1 and len(listing[0]) == 2

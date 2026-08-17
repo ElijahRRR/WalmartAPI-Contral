@@ -270,13 +270,74 @@ def test_code_is_stable_for_counting():
 
 
 def test_list_new_counts_by_code_not_by_reason_words():
-    """接线侧钉住:用 vplan["code"] 做计数键。"""
+    """接线侧钉住:用 vp["code"] 做计数键(reason 是中文长句,分词计数会散)。"""
     import inspect
 
     from workflows import list_new
-    src = inspect.getsource(list_new)
-    assert 'n_var[vplan["code"]]' in src
+    src = inspect.getsource(list_new._plan_variants)
+    assert 'n_var[vp["code"]]' in src
     assert 'reason"].split' not in src
+
+
+def test_variant_counts_are_computed_before_the_summary_line():
+    """⚠ 摘要里的"变体"一栏曾经**从来没出现过** —— 死代码,dry-run 与真跑都没数。
+
+    根因:`gate_line` 是拼好的**字符串**,而 n_var 原来在它下面的提交循环里才填,
+    后填的计数永远进不去;dry-run 更是在提交循环之前就 return 了。
+    这条用例钉的是**顺序**:变体决策必须在 gate_line 拼出来之前算完。
+    """
+    import inspect
+
+    src = inspect.getsource(__import__("workflows.list_new",
+                                       fromlist=["run"]).run)
+    assert src.index("_plan_variants(ready") < src.index('gate_line = (f"闸门')
+    # 提交循环必须**复用**这份决策,不许重算 —— 重算就是 dry-run 报一份、
+    # 真跑发另一份,中间任何差异都表现为"dry-run 说没事"
+    assert 'vplan = r.get("_vplan")' in src
+    assert "_variant_plan(" not in src               # 只在 _plan_variants 里调
+
+
+def test_same_round_siblings_do_not_both_claim_primary():
+    """⚠ 同一轮里同族两个新成员会**各自都判自己是主变体** → 同一个 feed 两个 Yes。
+
+    根因:`family_has_primary` 查的是 `catalog.walmart_items` 里**已在架**的同族,
+    而这两个此刻都还没在架,两边都查到"本店没有主变体"。旧仓正是为了躲这个才
+    干脆不发这个字段(设计文档 §3.4:"会出现两个 primary,Walmart 行为未定义")。
+    我们保留字段,就得自己收口。
+
+    取谁:**ASIN 字母序**第一个,不是行序 —— 行序会随表格增删漂,主变体跟着漂
+    等于每轮都在改沃尔玛端的首图。
+    """
+    from workflows import list_new as ln
+
+    def _row(asin, gid, primary=True):
+        return {"asin": asin, "store": "M001",
+                "_vplan": {"mode": "variant", "group_id": gid,
+                           "is_primary": primary, "attr_pairs": [("color", "X")],
+                           "code": "variant"}}
+
+    rows = [_row("B0BWMV956C", "vg_P1"), _row("B0BWMVQHVJ", "vg_P1"),
+            _row("B078R8W927", "vg_P2")]
+    ln._dedupe_primary(rows)
+    prim = {r["asin"] for r in rows if r["_vplan"]["is_primary"]}
+    # 同组只剩字母序第一个;另一组的独苗不受影响
+    assert prim == {"B0BWMV956C", "B078R8W927"}
+    # 重跑幂等:再跑一次结果不变
+    ln._dedupe_primary(rows)
+    assert {r["asin"] for r in rows if r["_vplan"]["is_primary"]} == prim
+
+
+def test_dedupe_primary_respects_a_listed_primary():
+    """本店同族已有在架主变体时,_variant_plan 已把新成员判成非主 —— 这里不许翻回。"""
+    from workflows import list_new as ln
+    rows = [{"asin": "B1", "store": "M001",
+             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+                        "is_primary": False, "code": "variant"}},
+            {"asin": "B2", "store": "M001",
+             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+                        "is_primary": False, "code": "variant"}}]
+    ln._dedupe_primary(rows)
+    assert not any(r["_vplan"]["is_primary"] for r in rows)
 
 
 def test_list_new_lookup_is_store_scoped_and_failure_tolerant():

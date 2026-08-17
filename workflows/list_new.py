@@ -340,6 +340,103 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
         existing_group_id=gid, family_has_primary=has_primary)
 
 
+def _plan_variants(ready: list[dict], n_var: dict) -> None:
+    """输入:待提交行 + 计数字典 → 输出:无(把决策挂到 r["_vplan"],顺便计数)。
+
+    连接**按需惰性打开**:只有真需要查"本店同族在架成员"的行才要连接
+    (`_variant_plan` 在家族只有自己时压根不查)。一行都不需要就一次连接也不开
+    —— 闸门段本来不持有连接,为了变体硬开一个会让"没有同族"的场景也依赖库。
+    """
+    conn = None
+    try:
+        for r in ready:
+            fam = variant_group.parse_family(
+                (r.get("_p") or {}).get("variation_asins"), r["asin"])
+            if conn is None and r.get("store") and len(fam) > 1:
+                conn = db.pg_conn().__enter__()
+            try:
+                r["_vplan"] = _variant_plan(
+                    conn, r["store"], r, pt_spec.load_pt(r["product_type"]))
+            except Exception as e:                              # noqa: BLE001
+                # 变体是锦上添花,算不出不许拖垮整行(同 _variant_plan 内的纪律)
+                logger.warning("%s 变体决策失败(按单品处理): %s", r["asin"], e)
+                r["_vplan"] = None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:                                   # noqa: BLE001
+                pass
+    _dedupe_primary(ready)
+    for r in ready:
+        vp = r.get("_vplan")
+        if not vp:
+            continue
+        n_var[vp["code"]] += 1
+        if len(vp.get("attr_pairs") or ()) > 1:
+            # 多维发出的行数:这一栏为 0 而库里明明有 color+size 的家族,
+            # 就是多维那条链没生效(2026-08-17 补齐后的验收点)
+            n_var["其中多维"] += 1
+        if vp.get("unmapped_dims"):
+            # 映不上的维度只剔它、不退单品 —— 但组内差异若恰好只在被剔的
+            # 那个维度上,发出去就是几条看不出区别的变体
+            n_var["有维度映不上"] += 1
+
+
+def _dedupe_primary(ready: list[dict]) -> None:
+    """输入:带 _vplan 的待提交行 → 输出:无(就地把同组多余的主变体降成非主)。
+
+    ⚠ **同一轮里同族多个新成员会各自都判自己是主变体**(2026-08-17 拿所有者的
+    真实场景推演时发现):`_variant_plan` 的 `family_has_primary` 查的是
+    `catalog.walmart_items` 里**已在架**的同族成员,而同一批新上的两个兄弟此刻
+    都还没在架,两边都查到"本店没有主变体" ⇒ 两条都发 isPrimaryVariant=Yes,
+    而且**在同一个 feed 里**。旧仓正是为了躲这个才干脆不发这个字段
+    (`auto_listing/docs/variant_groups_design.md` §3.4:"会出现两个 primary,
+    Walmart 行为未定义")。
+
+    我们保留这个字段,但必须自己收口:每个 (店铺, 组 ID) 本轮**最多一个** Yes,
+    按 ASIN 字母序取第一个 —— 定序而非按行序,这样同一批重跑选出的主变体不变
+    (行序会随表格增删漂,主变体跟着漂就等于每轮都在改沃尔玛端的首图)。
+    """
+    by_group: dict[tuple, list[dict]] = {}
+    for r in ready:
+        vp = r.get("_vplan")
+        if vp and vp.get("mode") == "variant" and vp.get("is_primary"):
+            by_group.setdefault((r.get("store"), vp.get("group_id")),
+                                []).append(r)
+    for (store, gid), rows in sorted(by_group.items(),
+                                     key=lambda kv: (str(kv[0][0]),
+                                                     str(kv[0][1]))):
+        if len(rows) < 2:
+            continue
+        keep = min(rows, key=lambda x: x["asin"])
+        for r in rows:
+            if r is not keep:
+                r["_vplan"] = {**r["_vplan"], "is_primary": False}
+        logger.info("变体组 %s(%s)本轮 %d 个新成员都判了主变体,"
+                    "保留 %s 一个", gid, store, len(rows), keep["asin"])
+
+
+def _variant_echo(vp: dict | None) -> str:
+    """输入:变体决策(可为 None)→ 输出:挂在 dry-run 逐行后面的一段中文。
+
+    **逐行报,不只报总数**:所有者的验收问题是"这两个会不会成一组、那一个会不会
+    单独上"(2026-08-17)—— 只给"variant 4"这种总数答不了他的问题,得看到每行
+    各自的组 ID、按哪几个维度分、是不是主变体。
+    """
+    if not vp:
+        return " |变体:决策失败(按单品)"
+    if vp.get("mode") != "variant":
+        return f" |单品口径({vp.get('reason') or vp.get('code')})"
+    pairs = ",".join(f"{n}={v}" for n, v in (vp.get("attr_pairs") or ()))
+    out = (f" |变体组 {vp.get('group_id')} 按 {pairs}"
+           f",家族 {vp.get('family_size')} 个"
+           f",{'主' if vp.get('is_primary') else '非主'}变体")
+    if vp.get("unmapped_dims"):
+        out += f",⚠ 维度 {','.join(vp['unmapped_dims'])} 映不上未发"
+    return out
+
+
 def _spec_precheck(ready: list[dict]) -> str:
     """输入:待提交行 → 输出:spec 一致化预检报告(不领 UPC、不提交)。
 
@@ -654,6 +751,18 @@ def run(params: dict) -> str:
         ready.extend(srows[:allow])
         n["quota"] += max(0, len(srows) - allow)
 
+    # ── 变体决策提前到这里算(2026-08-17 修两个问题)────────────────────────
+    # ① **摘要里的"变体"一栏从来没出现过**:n_var 原来在下面的提交循环里才填,
+    #    而 gate_line 是**字符串**、在那之前就拼好了 —— 后填的计数永远进不去。
+    #    "四类退回逐类见人"这条纪律写在注释里,实际是死代码,dry-run 与真跑都没数。
+    # ② dry-run 压根不算变体决策(它在 664 行就 return 了),所以**验收不了**
+    #    分组 —— 而这正是所有者要拿 dry-run 做的事(2026-08-17 实遇:摘要里
+    #    连"变体"两个字都没有)。
+    # 放这里是安全的:_variant_plan 只读一条 SELECT + 本地 spec 文件,
+    # **零 LLM、不领 UPC、不写库**;提交循环改成复用这份决策,
+    # 于是 dry-run 说的就是真跑要发的(同一份对象,不可能漂)。
+    _plan_variants(ready, n_var)
+
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
                  f"去重 {n['dedup']},黑名单 {n['blacklist']},"
@@ -683,7 +792,8 @@ def run(params: dict) -> str:
             lines.append(f"  第{rownum}行:{why}")
         for r in ready[:10]:
             lines.append(f"  [DRY-RUN] {r['store']} {r['asin']} "
-                         f"定价 {r['_price']} 库存 {r['_qty']} 待提交")
+                         f"定价 {r['_price']} 库存 {r['_qty']} 待提交"
+                         + _variant_echo(r.get("_vplan")))
         if ready:
             lines.append(f"[DRY-RUN] 共 {len(ready)} 行将进入 领UPC→LLM→提交")
             if str(params.get("check_spec", "")) in ("1", "true", "yes"):
@@ -733,17 +843,9 @@ def run(params: dict) -> str:
                         llm_fields=llm_o)
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
-                    vplan = _variant_plan(conn, store_name, r,
-                                          pt_spec.load_pt(r["product_type"]))
-                    n_var[vplan["code"]] += 1
-                    if len(vplan.get("attr_pairs") or ()) > 1:
-                        # 多维成功发出的行数:这一栏为 0 而库里明明有 color+size
-                        # 的家族 = 多维那条链没生效(2026-08-17 补齐后的验收点)
-                        n_var["其中多维"] += 1
-                    if vplan.get("unmapped_dims"):
-                        # 映不上的维度只被剔掉、不退单品 —— 但组内差异若恰好
-                        # 只在被剔的那个维度上,发出去就是几条看不出区别的变体
-                        n_var["有维度映不上"] += 1
+                    # 复用闸门段算好的那份(不重算):重算等于 dry-run 报的
+                    # 与真跑发的各算一次,中间任何差异都会变成"dry-run 说没事"
+                    vplan = r.get("_vplan")
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
                         pt_spec.orderable_spec(), visible, orderable,

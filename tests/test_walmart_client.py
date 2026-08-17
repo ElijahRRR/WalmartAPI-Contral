@@ -119,3 +119,58 @@ def test_parse_retry_after_priority():
     wait = _client._parse_retry_after({"x-next-replenishment-time": str(future_ms)})
     assert 40 < wait < 43
     assert _client._parse_retry_after({}) == 60.0  # 兜底
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_token_4xx_is_store_dead_not_raw_http_error(monkeypatch, status):
+    """换 token 被拒 ⇒ StoreDeadError(调用方"跳过全店"),不是裸 HTTPStatusError。
+
+    2026-08-17 生产实见:沃尔玛在凭证被拒时回 **400**(不是 401),于是它以
+    httpx 原生异常冒进 workflow 的泛化 except ⇒ 一家店凭证坏掉判整轮失败;
+    而同样坏掉、只是回 401 的店走的是"跳过、整轮照常成功"。同一个现实原因
+    两种相反结果,差别只在沃尔玛回哪个码。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": "invalid_client"})
+
+    _use_transport(monkeypatch, handler)
+    with pytest.raises(_client.StoreDeadError) as ei:
+        _client.get_token("cid-abcdef-tail", "sec", "socks5://x:1")
+    assert ei.value.status == status
+    # 报错里带 client_id 前缀便于定位,但不带整串
+    assert "cid-ab" in str(ei.value) and "cid-abcdef-tail" not in str(ei.value)
+
+
+def test_token_5xx_still_raises_http_error(monkeypatch):
+    """5xx 不是凭证问题,不能当死店跳过(跳过 = 那店当轮静默不同步)。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream down")
+
+    _use_transport(monkeypatch, handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        _client.get_token("cid", "sec", "socks5://x:1")
+
+
+def test_store_dead_error_call_sites_have_two_args():
+    """`StoreDeadError(...)` 必须传 (店铺, 状态码) 两个参数。
+
+    api/reports.py 与 api/returns.py 曾各有一处只传一个 f-string:真触发时抛的
+    是 `TypeError: missing 1 required positional argument`,既不会被
+    `except StoreDeadError` 接住(于是整轮判失败,而不是跳过这家店),消息里
+    也没有店名和状态码。一个参数的构造在语法上完全合法,只有真跑到那一行才
+    炸——这种缺陷靠用例钉住比靠人眼靠谱。
+    """
+    import ast
+    import pathlib
+
+    bad = []
+    for path in pathlib.Path("api").glob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name == "StoreDeadError" and len(node.args) + len(node.keywords) != 2:
+                bad.append(f"{path}:{node.lineno} 传了 {len(node.args)} 个参数")
+    assert not bad, "StoreDeadError 参数个数不对:\n" + "\n".join(bad)

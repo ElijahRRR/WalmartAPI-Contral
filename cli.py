@@ -228,6 +228,33 @@ def _record_finish(run_id, status: str, summary: str) -> None:
         logger.warning("ops.runs 结束记录写入失败(不阻断): %s", e)
 
 
+_ERR_MAX = 1200          # 飞书消息不宜过长;超长只截尾并标明
+
+
+def _err_brief(e: BaseException) -> str:
+    """输入:异常对象 → 输出:发飞书用的错误正文(**整条消息,不是最后一行**)。
+
+    ⚠ 2026-08-17 生产实见:此前取 `traceback.format_exc().splitlines()[-1]`,
+    catalog_sync 一家店 400 时飞书收到的整条通知是
+
+        ❌ catalog_sync 失败
+        For more information check: https://developer.mozilla.org/…/400)
+
+    —— 整条消息里最没用的那一行。原因是取"最后一行"只对**单行**异常成立
+    (那时最后一行正好是 `类型: 消息`);而本项目的失败摘要恰恰是多行的:
+    catalog_sync 明写着「有店失败 → 整体判失败,飞书通知会带明细」,那份明细
+    (几店完成/入库多少行/哪家店为什么失败)全长在前面几行,被这一刀切光了。
+    httpx 的错误自身又是两行、第二行是 MDN 链接,于是越是需要细节的失败,
+    通知越是只剩一句废话。
+
+    多行异常(RuntimeError("摘要\\n明细…"))发全文;超长截尾并标明。
+    """
+    body = str(e).strip() or e.__class__.__name__
+    if len(body) > _ERR_MAX:
+        body = body[:_ERR_MAX] + f"\n…(已截断,全文见日志 {e.__class__.__name__})"
+    return body
+
+
 def _notify(text: str) -> None:
     try:
         from api import feishu
@@ -290,11 +317,11 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
             try:
                 summary = module.run(params)
                 summary = str(summary) if summary is not None else "(无摘要)"
-            except Exception:
+            except Exception as e:
                 err = traceback.format_exc()
                 logger.error("workflow %s 失败:\n%s", name, err)
                 _record_finish(run_id, "failed", err[-2000:])
-                return "failed", f"{mode}{name} 失败\n{err.strip().splitlines()[-1]}"
+                return "failed", f"{mode}{name} 失败\n{_err_brief(e)}"
             # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
             logger.info("workflow %s 成功:\n%s", name, summary,
                         extra={"file_only": True})

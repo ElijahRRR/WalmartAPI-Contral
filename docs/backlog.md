@@ -119,6 +119,20 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 11. ✅ ~~AK 图片历史截图~~(所有者拍板 2026-08-12:**不迁**,留旧表归档备查;新链路截图已在正常跑)
 12. ✅ ~~missing_since 清理~~(所有者拍板 2026-08-12:**永不删**——技术上事件在 product_events 独立账本不受主表影响,但保守留行;db_schema.md 已回写)
 
+## 五之二、逐条测工作流(2026-08-17 起)发现的问题
+
+> 本节记「测试会话实测撞出来的」缺陷。已修的写清落在哪;所有者说先不修的
+> 原样留着,别再重复报一遍。
+
+| 状态 | 问题 | 出处/关键事实 |
+|---|---|---|
+| ✅ | ~~`-p store=` 打错名字静默少跑而且报成功~~(2026-08-17 修:`load_stores` 有名字落空就抛,分「在册但被过滤」/「查无此店」/「快照兜底分不出」三档) | `services/stores.py:load_stores` |
+| ✅ | ~~失败通知只发 traceback 最后一行~~(2026-08-17 修:`cli._err_brief` 发整条消息。生产实见 catalog_sync 那次,飞书收到的整条通知是 `For more information check: https://…/400)`——整条消息里最没用的那一行;取"最后一行"只对**单行**异常成立,而本项目的失败摘要恰恰是多行的) | `cli.py:_err_brief` |
+| ✅ | ~~换 token 的 400 判整轮失败~~(2026-08-17 修:沃尔玛凭证被拒回 **400** 不是 401,此前以 httpx 原生异常落进泛化 except ⇒ 一家店坏掉判整轮失败,而回 401 的同类店走"跳过、整轮成功"。已转 `StoreDeadError`;配套加"零店完成即判失败"防新静默口子) | `api/_client.py:get_token` / `workflows/catalog_sync.py` |
+| ✅ | ~~`StoreDeadError` 两处只传一个参数~~(2026-08-17 修:真触发时抛 `TypeError`,不被 `except StoreDeadError` 接住 ⇒ 整轮判失败而非跳过该店,消息里也没有店名和状态码。加了 AST 用例钉住参数个数) | `api/reports.py:160` / `api/returns.py:44` |
+| ⬜ | **`store=` 与 `stores=` 不统一,而 cli 不校验参数名**(所有者 2026-08-17:**记录,先不修**)。全项目只有 `ping_stores` 用复数 `stores=`,其余 17 条用单数 `store=`;参数名打错被静默吞掉 ⇒ `catalog_sync -p stores=A085` **跑全部店**、`ping_stores -p store=A085` **ping 全部店**,都不报错。在「缺省即真跑」下逐条测试尤其容易踩。规避:除 `ping_stores` 外一律 `-p store=`。三档修法(小:ping_stores 兼收单数 / 中:抽共用参数积木 18 处各一行 / 彻底:工作流声明参数名 + cli 层护栏)——彻底那档建议等 #36 落地再做,否则大面积冲突 | `workflows/ping_stores.py:38` vs 其余 17 条;`cli.py` 无未知参数校验 |
+| ⬜ | `catalog_sync` 在**凭证表一家可用店都没有**时 `return "店铺凭证未找到"` 报成功(与上面"零店完成"同一类,但走的是 pool 之前的早退分支,本轮未动) | `workflows/catalog_sync.py:132` |
+
 ## 六、配置与安全(便宜,但都在裸奔)
 
 > **整节后置**(所有者拍板 2026-08-12):生产运维动作(盘旧调度/备份/配 env/挂调度)

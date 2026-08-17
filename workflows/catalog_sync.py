@@ -191,7 +191,14 @@ def run(params: dict) -> str:
 
     if failed:
         lines.append(f"失败:{'; '.join(failed)}")
-        raise RuntimeError("\n".join(lines))   # 有店失败 → 整体判失败,飞书通知会带明细
+    if not results:
+        # 一家都没跑通 ⇒ 不许报成功。「凭证失效跳过」按设计不进 failed(一家店
+        # 坏了不该拖垮整轮),但**全部**店都被跳过意味着这一轮什么都没同步:
+        # 要么凭证表整体出了问题,要么换 token 的请求形状被改坏了。这一轮报
+        # 成功的话没人会来看,而目录数据就那么静静地陈旧下去。
+        lines.append("⚠ 零店完成 —— 本轮没有同步任何数据")
+    if failed or not results:
+        raise RuntimeError("\n".join(lines))   # 飞书通知带的是这份全文(cli._err_brief)
     return "\n".join(lines)
 
 

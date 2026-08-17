@@ -41,7 +41,7 @@ def iter_returns(store: dict, *, created_start: str,
             url, token, store["client_id"], store["proxy"],
             params=params, max_retries=3)
         if status in (401, 403):
-            raise _client.StoreDeadError(f"{store.get('name')} GET /v3/returns → {status}")
+            raise _client.StoreDeadError(f"{store.get('name')} GET /v3/returns", status)
         if status == 404:
             return                          # 窗口内无售后单
         if status != 200:

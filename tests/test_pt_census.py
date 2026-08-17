@@ -286,3 +286,51 @@ def test_probe_survives_a_missing_spec_file(monkeypatch):
     monkeypatch.setattr(pc.pt_spec, "load_pt",
                         lambda pt: (_ for _ in ()).throw(OSError("no file")))
     assert pc.probe_spec_category("X") == (False, [])
+
+
+def test_gap_pts_without_siblings_fall_back_to_nearest_name(monkeypatch, tmp_path):
+    """⚠ 映射 0 条的待补 PT 没有"同路径兄弟",Category 只能靠名字最近邻。
+
+    所有者那 9 个里有 5 个是这种(Custom Wheels / Power Steering Pumps …),
+    全是汽配,pt_meta 里都有同族 PT,取它的大类八九不离十。
+    但**依据要写清是"名字像"而不是"同路径"** —— 前者弱得多,人得复核。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [
+            ("Automotive Wheels", "Automotive", "Wheels & Tires",
+             "禁售", "否")],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [],
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        "SELECT DISTINCT ON (d.walmart_product_type)": []}))   # 没有兄弟
+    monkeypatch.setattr(pc.pt_spec, "known_pts",
+                        lambda: {"Custom Wheels", "Automotive Wheels"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    rows, _ = pc._census()
+    r = next(x for x in rows if x["walmart_product_type"] == "Custom Wheels")
+    assert r["判定"] == "准入漏了"
+    assert r["建议Category"] == "Automotive"
+    assert r["建议PTG"] == "Wheels & Tires"
+    assert "名字最近" in r["建议依据"] and "请复核" in r["建议依据"]
+
+
+def test_sibling_evidence_beats_name_similarity(monkeypatch, tmp_path):
+    """同路径兄弟是强依据,名字像是弱依据 —— 有强的就不用弱的。"""
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [
+            ("Automotive Brakes", "Automotive", "Brakes", "禁售", "否")],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [("Disc Brake Calipers", 2)],
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        "SELECT DISTINCT ON (d.walmart_product_type)": [
+            ("Disc Brake Calipers", "Automotive", "Brake System",
+             "Automotive Brakes", "Auto > Calipers")]}))
+    monkeypatch.setattr(pc.pt_spec, "known_pts",
+                        lambda: {"Disc Brake Calipers", "Automotive Brakes"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    rows, _ = pc._census()
+    r = next(x for x in rows
+             if x["walmart_product_type"] == "Disc Brake Calipers")
+    assert r["建议PTG"] == "Brake System"          # 取兄弟的,不是最近邻的
+    assert r["建议依据"] == "同路径 Automotive Brakes"
+    assert "名字最近" not in r["建议依据"]

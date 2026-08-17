@@ -235,11 +235,28 @@ def _census() -> tuple[list[dict], dict]:
             r["同路径已有有效PT"] = sup[1]
             counts["瞎猜"] -= 1
             counts["旧行没清"] = counts.get("旧行没清", 0) + 1
+    # 待补 PT 的 Category/PTG 建议,两级:
+    #   ① 同 Amazon 路径的兄弟 PT(最强:同一个亚马逊类目映过去的)
+    #   ② 名字最近邻(兜底:映射 0 条的 PT 没有兄弟,只能靠名字。
+    #      实测那 5 个全是汽配,`Custom Wheels`/`Power Steering Pumps` 这种
+    #      在 pt_meta 里都有同族 PT,取它的大类八九不离十)
+    import difflib
+    meta_names = list(meta)
     for r in rows:
-        hit = sib.get(r["walmart_product_type"])
-        if hit and r["判定"] == "准入漏了":
+        if r["判定"] != "准入漏了":
+            continue
+        pt = r["walmart_product_type"]
+        hit = sib.get(pt)
+        if hit:
             r["建议Category"], r["建议PTG"] = hit[0], hit[1]
             r["建议依据"] = f"同路径 {hit[2]}"
+            continue
+        near = difflib.get_close_matches(pt, meta_names, n=1, cutoff=0.5)
+        if near:
+            m = meta[near[0]]
+            r["建议Category"], r["建议PTG"] = m[1] or "", m[2] or ""
+            # ⚠ 依据要写清是"名字像"而不是"同路径" —— 前者弱得多,人得复核
+            r["建议依据"] = f"⚠名字最近 {near[0]}(弱依据,请复核)"
     return rows, counts
 
 

@@ -308,17 +308,24 @@ def explain_hit(rule_code: str, detail: dict | None) -> str:
     """
     d = detail or {}
     base = _RULE_CN.get(rule_code, rule_code)
+    # ⚠ 键名必须**照着各规则真实写进 detail 的那些**取,不能想当然。
+    # 首版只认 brand/category/keyword/matched 四个,而 Phase0 三表写的是
+    # seller_id / asin / normalized —— 于是"黑名单命中"那一栏一个字都没有,
+    # 人还是不知道命中的是哪一条(所有者 2026-08-16 实遇)。
+    hit_val = next((d[k] for k in (
+        "brand", "matched_brand", "normalized", "amazon_category_path",
+        "seller_name", "seller_id", "asin", "category", "keyword", "matched",
+    ) if d.get(k)), None)
     bits = [b for b in (
         d.get("note"),
-        # 命中了什么:关键词 / 类目 / 品牌,取第一个有值的
+        d.get("reason"),
         ("要求:" + "、".join(d["matched_hard_kws"][:3]))
         if d.get("matched_hard_kws") else None,
         ("认证字段:" + "、".join(str(x) for x in d["hard_cert_fields"][:3]))
         if d.get("hard_cert_fields") else None,
-        ("命中:" + str(d.get("brand") or d.get("category")
-                       or d.get("keyword") or d.get("matched")))
-        if (d.get("brand") or d.get("category") or d.get("keyword")
-            or d.get("matched")) else None,
+        (f"准入 {d['access_state']!r}") if d.get("access_state") else None,
+        (f"中国卖家 {d['zh_can_do']!r}") if d.get("zh_can_do") else None,
+        ("命中:" + str(hit_val)) if hit_val else None,
     ) if b]
     return f"{base}({';'.join(str(b) for b in bits)})" if bits else base
 

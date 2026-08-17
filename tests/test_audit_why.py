@@ -126,3 +126,63 @@ def test_missing_pt_row_is_called_out(monkeypatch):
 
 def test_needs_one_of_the_two_params():
     assert "要么给" in audit_why.run({})
+
+
+_BLACKLISTED = {
+    "FROM catalog.products": [
+        ("B00004YOG7", "Shepherd Hardware 9124 Rubber Leg Tips", "Shepherd",
+         "Furniture Grippers, Pads & Sliders", "audit_llm", "rejected",
+         "General-Use Products", _AT, "c.2026-08-13.1"),
+    ],
+    "FROM audit.audit_runs": [
+        (2395753, "B00004YOG7", "(phase0_blocked)", "skipped", "低", 0,
+         "reject", "L0", "skip", None, _AT),
+    ],
+    "FROM audit.audit_hits": [
+        (2395753, "L0", "phase0_lark_blacklist_amazon_cat", -100,
+         {"amazon_category_path": "Tools & Home Improvement > Hardware",
+          "normalized": "tools&homeimprovement->hardware",
+          "source": "blacklist_center"}),
+    ],
+}
+
+
+def test_blacklist_hit_says_which_entry_matched(monkeypatch):
+    """⚠ 黑名单命中必须说出**命中的是哪一条**,否则等于没说。
+
+    生产实证 2026-08-16:首版 explain_hit 只认 brand/category/keyword/matched
+    四个键,而 Phase0 三表写进 detail 的是 seller_id / asin / normalized ——
+    于是判拒理由打出来只有"亚马逊类目在黑名单中心",人还是不知道是哪个类目,
+    没法去黑名单中心里找那一行改。
+    """
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_BLACKLISTED))
+    out = audit_why.run({"asins": "B00004YOG7"})
+    assert "亚马逊类目在黑名单中心" in out
+    assert "Tools & Home Improvement > Hardware" in out    # 命中的那一条
+    assert "catalog.amazon_cat_blacklist" in out           # 去哪张表改
+    assert "停在 L0" in out                                 # 短路在 Phase0
+
+
+def test_meta_gap_warning_says_it_is_not_this_rejects_cause(monkeypatch):
+    """PT 不在 meta 表是**另一个**问题 —— 不说清就会被当成本次判拒的原因。"""
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_BLACKLISTED))
+    out = audit_why.run({"asins": "B00004YOG7"})
+    assert "静默放行" in out and "与本次判拒无关" in out
+    assert "missing_meta=1" in out          # 给出量化那条命令
+
+
+def test_missing_meta_quantifies_the_silent_gate_failure(monkeypatch):
+    """两道硬闸对某些类目静默失效 —— 静默的东西必须能一条命令数出来。"""
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({
+        "FROM catalog.products p": [("Hammers", 120, 30),
+                                    ("Bakeware Sets", 45, 5)]}))
+    out = audit_why.run({"missing_meta": "1"})
+    assert "2 个在用 PT" in out and "165 个产品" in out
+    assert "已判过审 35" in out              # 这批是"闸没生效就过了"的
+    assert "静默放行" in out
+    assert "Hammers" in out
+
+
+def test_missing_meta_all_clear(monkeypatch):
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({}))
+    assert "R1/R3 全覆盖" in audit_why.run({"missing_meta": "1"})

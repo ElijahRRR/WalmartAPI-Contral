@@ -4,6 +4,7 @@
   python cli.py audit_why -p asins=B00004Z4HQ,B0000DI4ZW
   python cli.py audit_why -p pt=Hammers        # 按 PT 看:那一行数据长什么样 + 谁被它拒了
   python cli.py audit_why -p asins=B0X -p runs=3   # 看最近 3 轮(判定改过之后对比用)
+  python cli.py audit_why -p missing_meta=1    # 全库面:哪些 PT 让 R1/R3 两道闸静默失效
 
 为什么要有这条:审核的结论是**多层数据叠出来的**(飞书维护的 walmart_pt_meta
 四列、pt_spec 的认证字段、三张黑名单、映射表、LLM),结论列里只留得下一句话。
@@ -63,6 +64,20 @@ FROM audit.walmart_pt_spec
 WHERE walmart_product_type = ANY(%s)
 """
 
+# 有产品在用、但 walmart_pt_meta 里没有的 PT。这些 PT 的 R1(准入)与
+# R3(认证)两道闸**静默放行** —— 静默的东西必须能一条命令数出来
+_SQL_MISSING_META = """
+SELECT p.walmart_pt, count(*) AS n,
+       count(*) FILTER (WHERE p.audit_status = 'approved') AS approved
+FROM catalog.products p
+LEFT JOIN audit.walmart_pt_meta m
+       ON m.walmart_product_type = p.walmart_pt
+WHERE p.marketplace = 'US' AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> ''
+  AND p.walmart_pt NOT LIKE '(%%'
+  AND m.walmart_product_type IS NULL
+GROUP BY 1 ORDER BY 2 DESC
+"""
+
 _SQL_PT_VICTIMS = """
 SELECT p.asin, p.title, p.audit_status
 FROM catalog.products p
@@ -99,11 +114,13 @@ def _fmt_hit(stage, code, penalty, detail) -> list[str]:
     src = _RULE_SOURCE.get(code)
     if src:
         lines.append(f"          读的是:{src}")
-    for k in ("meta_requirements", "matched_hard_kws", "matched_soft_kws",
-              "hard_cert_fields", "access_state", "zh_can_do",
-              "walmart_category", "walmart_policy"):
-        if d.get(k) not in (None, "", [], {}):
-            lines.append(f"          {k} = {d[k]!r}")
+    # 把 detail 原样摊开(除了纯噪音的几个)—— 排查时"这一格里到底是什么"
+    # 才是答案,挑着打就会漏(首版挑了 8 个键,Phase0 三表写的 asin/normalized/
+    # seller_id 一个都不在里面,于是"黑名单命中"打出来是空的)
+    for k, v in sorted(d.items()):
+        if k in ("source", "note") or v in (None, "", [], {}):
+            continue
+        lines.append(f"          {k} = {v!r}")
     return lines
 
 
@@ -136,13 +153,38 @@ def _by_pt(pt: str, limit: int) -> str:
     return "\n".join(out)
 
 
+def _missing_meta(limit: int) -> str:
+    """输入:列出上限 → 输出:准入/认证两道闸失效面(PT 不在 meta 表的)。"""
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_MISSING_META)
+        rows = cur.fetchall()
+    if not rows:
+        return "所有在用 PT 都在 audit.walmart_pt_meta 里,R1/R3 全覆盖 ✅"
+    total = sum(r[1] for r in rows)
+    ok = sum(r[2] for r in rows)
+    out = [f"⚠ {len(rows)} 个在用 PT **不在 audit.walmart_pt_meta**,涉及 "
+           f"{total} 个产品(其中已判过审 {ok} 个)。",
+           "  后果:R1 准入闸(access_state/zh_can_do)与 R3 认证闸对这些类目"
+           "**静默放行** —— 不报错,只是那两道闸等于不存在。",
+           "  多半是那张飞书类目表没同步全,或者 PT 名与表里对不上"
+           "(大小写/标点/别名)。",
+           f"  按产品数排前 {limit}:"]
+    out += [f"    {n:>7}  (过审 {a:>6})  {pt}" for pt, n, a in rows[:limit]]
+    if len(rows) > limit:
+        out.append(f"    …另有 {len(rows) - limit} 个 PT")
+    return "\n".join(out)
+
+
 def run(params: dict) -> str:
     pt = str(params.get("pt", "")).strip()
     limit = int(params.get("limit", 10))
     asins = [a.strip().upper() for a in str(params.get("asins", "")).split(",")
              if a.strip()]
+    if params.get("missing_meta"):
+        return _missing_meta(limit if limit > 10 else 30)
     if not asins and not pt:
-        return "要么给 -p asins=B0A,B0B,要么给 -p pt=Hammers"
+        return ("要么给 -p asins=B0A,B0B,要么给 -p pt=Hammers,"
+                "要么 -p missing_meta=1 看准入/认证闸的失效面")
     if pt and not asins:
         return _by_pt(pt, limit)
 
@@ -184,7 +226,13 @@ def run(params: dict) -> str:
             out.append(f"  该 PT 在飞书类目表:大类 {m[1]!r} / 准入 {m[3]!r} / "
                        f"中国卖家 {m[4]!r} / 要求 {m[5]!r}")
         elif wpt:
-            out.append(f"  ⚠ 该 PT 不在 audit.walmart_pt_meta —— R1/R3 静默放行")
+            # ⚠ 这**不是**本次判拒的原因(下面会写清停在哪一层),但它是个
+            # 独立的真问题:R1 准入闸与 R3 认证闸都只查 walmart_pt_meta,
+            # 查不到就静默放行 —— 那两道闸对这个类目等于不存在。
+            # 全库有多少 PT 这样,跑 `-p missing_meta=1`
+            out.append(f"  ⚠ 该 PT 不在 audit.walmart_pt_meta —— **R1 准入闸与 "
+                       f"R3 认证闸对它静默放行**(与本次判拒无关,是另一个问题;"
+                       f"全库面看 `python cli.py audit_why -p missing_meta=1`)")
         for r in runs_by_asin.get(asin, [])[:want_runs]:
             rid, _a2, rpt, rsrc, rconf, score, verdict, stage, l3v, l3t, ts = r
             out.append(f"  ── 第 {rid} 轮 {ts:%Y-%m-%d %H:%M} → {verdict} "

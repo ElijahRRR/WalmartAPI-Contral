@@ -389,8 +389,12 @@ def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
     rows = listing_sheet.audit_targets()
     want = sorted({r["asin"] for r in rows})
     if not want:
-        return [], [], ["上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
-                        "想重审就把该行 E 列(审核结果)清空 —— 那是唯一的重审入口"]
+        return [], [], [
+            "上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
+            "⚠ **清空 E 列不是重审入口**:清空只是让这行重新被领,而结论以库为准,"
+            "库里已有结论的会被原样投影回来(见下方 from_sheet 非强审那条注释)。"
+            "真要重审走 `-p asins=<逗号分隔>`(点名强审)或 "
+            "`-p rerule=<规则码>`(改了某条规则后定点翻案)"]
     bad = [a for a in want if not _ASIN_RE.match(a)][:5]
     if bad:
         # ⚠ 列错位的唯一征兆。表头再被调一次而 registry 的列元组没跟着改,

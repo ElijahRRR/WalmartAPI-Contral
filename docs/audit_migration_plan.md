@@ -372,7 +372,7 @@ catalog_sync(拉在线,已有,不动)
 
 | 位置 | 落地 |
 |---|---|
-| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空**(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。**重审的唯一入口 = 把 E 列清空**(不设 force 参数:清一格比记参数直观,而且看得见改了哪些行) |
+| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空**(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。⚠ **表格里没有重审入口**(2026-08-17 更正,原文写的"重审的唯一入口 = 把 E 列清空"是错的,与同段的"非强审"自相矛盾):清空 E 列只让该行重新被**领取**,判不判由库里的 `audit_status` 定,已有结论的会被原样投影回同一格。真重审走 CLI 的 `-p asins=`(点名强审)或 `-p rerule=<规则码>`(定点翻案) |
 | 投影 | `_project_to_sheet()` 写 **C/D/E/F/G**(标题/PT/结论/理由/日期),一行一个 `C{r}:G{r}`。E 列写 `pass/reject/pending`(`listing_sheet.AUDIT_RESULT_CN`,**不是** `approved`)。库里没结论的行 **E 留空并在摘要里点名**——写 pending 会让人以为审过了,而且它下轮不会被重领。回填失败只告警(结论已在 PG,飞书只是界面) |
 | 上架闸 | `list_new.load_verdicts()` 查 `catalog.products`,只放 `audit_status='approved'`;未审核/判拒**逐类点名**(不点名的表现是"表里几百行一行也不上"而无任何提示)。`_retry_rows` 同闸 |
 | 类目 | `list_new._with_pt()`:**PT 也以库为准**(`walmart_pt`),库里没有才退回表 D 列。只读结论不读类目 = 手改 D 列即可绕过审核换类目 |

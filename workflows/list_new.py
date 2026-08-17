@@ -62,7 +62,7 @@ from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     kpi, listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
     pricing, product_events, pt_spec, risk_gate, store_limits, \
-    stores as stores_svc, upc_pool, variant_group
+    stores as stores_svc, upc_pool, variant_group, variant_remap, variant_title
 
 DANGEROUS = True
 
@@ -368,6 +368,7 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
             except Exception:                                   # noqa: BLE001
                 pass
     _drop_degenerate_dims(ready)
+    _remap_unmapped_dims(ready)
     _dedupe_primary(ready)
     for r in ready:
         vp = r.get("_vplan")
@@ -438,6 +439,118 @@ def _drop_degenerate_dims(ready: list[dict]) -> None:
                                      f"上取值全同,没有可分变体的差异维度"}
 
 
+def _remap_unmapped_dims(ready: list[dict]) -> None:
+    """输入:带 _vplan 的待提交行 → 输出:无(给"映不上"的维度找归宿,就地补进 attr_pairs)。
+
+    旧仓 Phase 0.8 的等价物,判定在 `services.variant_remap`(三层:枚举内检查 →
+    内置错位表 → LLM 兜底)。要解决的是**名字对不上而语义有归宿**那一类:
+    旧仓原始案例是文具类目 `color_name=48 Color` 其实是件数,该映 `pieceCount`。
+
+    与旧仓的差异(逐条见 services/variant_remap 头注)里,**接线侧要守的两条**:
+
+    · **只补映不上的,不动已映上的** —— 旧仓 remap 一触发整组改用一个 key,
+      会把已经映上的 color 一起丢掉;
+    · **本轮取值全同的维度不问 LLM** —— 生产实见(礼品袋组三个成员的
+      `size_name` 全是 `1 Count (Pack of 100)`):送去问只会得到一个"看着对"的
+      key,然后三个成员带着同一个值发出去,声明了没有差异的维度等于没声明。
+      这一层在这里过滤,`variant_remap` 只接"值确有差异"的组。
+    · 本轮**只看见 1 个成员**时判不了有没有差异,所以只允许走**内置表**
+      (确定性、零成本、人工策展),不问 LLM。
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for r in ready:
+        vp = r.get("_vplan")
+        if vp and vp.get("mode") == "variant" and vp.get("unmapped_dims"):
+            groups.setdefault((r.get("store"), vp.get("group_id")),
+                              []).append(r)
+    if not groups:
+        return
+    conn = None
+    try:
+        for (store, gid), rows in sorted(groups.items(),
+                                         key=lambda kv: (str(kv[0][0]),
+                                                         str(kv[0][1]))):
+            pt = rows[0].get("product_type") or ""
+            spec = pt_spec.load_pt(pt) or {}
+            enum = mp_conform._enum_of(
+                (spec.get("properties") or {}).get("variantAttributeNames")
+                or {})
+            if not enum:
+                continue
+            used = {n for n, _ in (rows[0]["_vplan"].get("attr_pairs") or ())}
+            raw = {r["asin"]: variant_group.parse_attrs(
+                (r.get("_p") or {}).get("variant_attributes")) for r in rows}
+            for dim in sorted(set(rows[0]["_vplan"]["unmapped_dims"])):
+                values = {a: v[dim] for a, v in raw.items() if dim in v}
+                if len(values) < len(rows):
+                    continue            # 有成员没这个维度,不是整组的共同维度
+                if len(rows) > 1 and len({str(v) for v in values.values()}) < 2:
+                    _mark(rows, "degenerate_dims", dim)
+                    logger.info("变体组 %s 的 %s 取值全同,不送重映射", gid, dim)
+                    continue
+                # 先试内置表(零成本、确定性),表不中且本轮看得见 ≥2 个成员
+                # 才开连接问 LLM —— 连接**在表命中时一次都不开**
+                got = variant_remap.hardcoded(pt, dim, values, enum)
+                if not got and len(rows) > 1:
+                    if conn is None:
+                        conn = db.pg_conn().__enter__()
+                    got = variant_remap.llm_remap(conn, pt, dim, values, enum)
+                if not got:
+                    continue
+                name, vals = got
+                if name in used:
+                    # 已被别的维度占了:两个维度写同一个属性名 = 载荷自相矛盾
+                    logger.info("变体组 %s 的 %s 重映到 %s,但该属性已被占用,跳过",
+                                gid, dim, name)
+                    continue
+                used.add(name)
+                for r in rows:
+                    vp = r["_vplan"]
+                    r["_vplan"] = {
+                        **vp,
+                        "attr_pairs": list(vp["attr_pairs"])
+                        + [(name, vals[r["asin"]])],
+                        "unmapped_dims": [d for d in vp["unmapped_dims"]
+                                          if d != dim],
+                        "remapped_dims": sorted(
+                            set(vp.get("remapped_dims") or ())
+                            | {f"{dim}→{name}"}),
+                    }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:                                   # noqa: BLE001
+                pass
+
+
+def _differentiate_titles(prepped: list[dict]) -> int:
+    """输入:本店已备好的载荷 [{r, upc, visible, orderable}] → 输出:改了几条标题。
+
+    旧仓 Feature B(`auto_listing/mapper.py:1633`)的接线:同一个变体组内
+    `productName` 一字不差时,给每条追加 ` - <维度取值>`。判定在
+    `services.variant_title`(纯函数),这里只负责**按组切分**。
+
+    分组键 = 载荷里的 `variantGroupId`(不是 `_vplan` 的):走到这一步,
+    `mp_conform` 可能已经把变体三件套整套剔掉(属性名不在枚举、值不合类型),
+    那种行不该再被当成同组成员参与"标题是不是全同"的判定。
+    """
+    by_group: dict[str, list[dict]] = {}
+    for p in prepped:
+        gid = str((p.get("visible") or {}).get("variantGroupId") or "")
+        if gid:
+            by_group.setdefault(gid, []).append(p)
+    return sum(variant_title.differentiate(rows)
+               for _gid, rows in sorted(by_group.items()))
+
+
+def _mark(rows: list[dict], field: str, value: str) -> None:
+    """把一个标记并进这一组每行的 _vplan(列表字段,去重有序)。"""
+    for r in rows:
+        vp = r["_vplan"]
+        r["_vplan"] = {**vp, field: sorted(set(vp.get(field) or ()) | {value})}
+
+
 def _dedupe_primary(ready: list[dict]) -> None:
     """输入:带 _vplan 的待提交行 → 输出:无(就地把同组多余的主变体降成非主)。
 
@@ -492,6 +605,8 @@ def _variant_echo(vp: dict | None) -> str:
     if vp.get("degenerate_dims"):
         out += (f",⚠ 维度 {','.join(vp['degenerate_dims'])} 组内取值全同已剔"
                 f"(声明没有差异的维度等于没声明)")
+    if vp.get("remapped_dims"):
+        out += f",重映射 {','.join(vp['remapped_dims'])}"
     return out
 
 
@@ -878,7 +993,7 @@ def run(params: dict) -> str:
         store = stores_by_name[store_name]
         try:
             partner = settings_api.get_partner_id(store)
-            items, claimed = [], []
+            prepped: list[dict] = []
             with db.pg_conn() as conn:
                 upcs = upc_pool.claim(conn, [{"store": store_name,
                                               "asin": r["asin"]}
@@ -919,9 +1034,18 @@ def run(params: dict) -> str:
                         _dump_llm_debug(r["asin"], visible, orderable,
                                         missing, notes)
                         continue
-                    items.append(mp_mapper.assemble_mp_item(
-                        orderable, r["product_type"], visible))
-                    claimed.append((r, upc))
+                    prepped.append({"r": r, "upc": upc, "visible": visible,
+                                    "orderable": orderable})
+            # 同变体组标题差异化(旧仓 Feature B)**必须在 assemble 之前**:
+            # 组装成 MP_ITEM 之后 productName 已经埋进载荷,再改就是改两份。
+            # 按 (组 ID) 分组:同一个 store 循环内,不会跨店混
+            n_title = _differentiate_titles(prepped)
+            if n_title:
+                n_var["标题加维度后缀"] = n_var.get("标题加维度后缀", 0) + n_title
+            items = [mp_mapper.assemble_mp_item(
+                p["orderable"], p["r"]["product_type"], p["visible"])
+                for p in prepped]
+            claimed = [(p["r"], p["upc"]) for p in prepped]
             if not items:
                 continue
             updates = []

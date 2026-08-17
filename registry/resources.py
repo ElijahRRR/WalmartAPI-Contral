@@ -554,6 +554,10 @@ LLM_PURPOSE_ENV = {
     "default": "DEEPSEEK_MODEL",
     "audit_l1": "DEEPSEEK_MODEL_AUDIT_L1",
     "audit_l3": "DEEPSEEK_MODEL_AUDIT_L3",
+    # 变体维度错位重映射(旧仓 Phase 0.8 补迁,2026-08-17):亚马逊维度名不在
+    # PT 枚举内时问一次"它实际表达什么"。调用极少(命中即缓存,键按
+    # (PT, 维度名) 定案),未配置专用模型时回落 DEEPSEEK_MODEL
+    "variant_remap": "DEEPSEEK_MODEL_VARIANT_REMAP",
 }
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或

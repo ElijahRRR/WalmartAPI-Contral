@@ -192,6 +192,18 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
       记着这个坑(DMIT 每行 parent 填自己,拿它当组 ID 会把同组切成 N 组且不报错)。
       我们的采集侧给真族主(生产实见 GustBuster 组),但改回去也能自愈;
     · list_new 摘要新增「其中多维 N」「有维度映不上 N」两栏做验收点。
+  ✅ **Phase 0.8 维度错位重映射 + Feature B 组内标题差异化已补迁**(2026-08-17,
+  所有者批「都补」)。`services/variant_remap.py`(三层:枚举内检查 → 内置错位表 →
+  LLM 兜底,整组一次决策过 llm_cache)+ `services/variant_title.py`(同组
+  productName 全同时追加 ` - <维度取值>`,199 字截 base 保 suffix,幂等)+
+  `list_new._remap_unmapped_dims` / `_differentiate_titles` 接线。
+  **与旧仓三处有意差异**:① 只补映不上的维度,不推翻已映上的(旧仓一触发整组
+  改用一个 key,会把已映上的 color 一起丢);② 本轮取值全同的维度不送 LLM
+  (礼品袋组实证:三个成员 size_name 全是 `1 Count (Pack of 100)`,问了也白问);
+  ③ 缓存键按 (PT, 维度名, 枚举) 而非样本值 —— 同组的 variantAttributeNames
+  必须跨批次一致,按样本值缓存会让分批上架前后判出两套维度名。
+  本轮只看见 1 个成员时只走内置表(判不了有没有差异,不问 LLM)。
+
   **与旧仓仍存的三处差异**(都是有意的):① 孤品也带 groupId(旧仓 full_set<2
   不注入)—— 所有者定稿,依据是沃尔玛报错原文明说支持 1 个成员的变体组;
   ② 发 `isPrimaryVariant`(旧仓从不发,怕分批出现两个 primary)—— 我们先查本店

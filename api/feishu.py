@@ -51,7 +51,26 @@ _table_locks: dict = defaultdict(threading.Lock)  # (app_token, table_id) → �
 #: 让 24 个线程各自进入写函数时,每个线程都以为自己是唯一写者,节流被整体绕过,
 #: 飞书一侧看到的是 24 倍瞬时写入 → 90227/限流。
 #: 用 RLock 是因为 sheet_overwrite 内部还会调 sheet_ensure_rows(同一把锁)。
-_sheet_locks: dict = defaultdict(threading.RLock)
+#:
+#: ⚠⚠ **不能写成 `defaultdict(threading.RLock)`**(2026-08-17 实验反证过)。
+#: `threading.RLock` 是 **Python 函数**(`threading.py` 里那个挑 _CRLock/_PyRLock
+#: 的包装),所以 `defaultdict.__missing__` 调它时会执行 Python 字节码 ⇒
+#: eval breaker 可能触发 ⇒ 线程切换 ⇒ 两个线程各造一把 RLock,只有一把落进
+#: 字典,**落空的那个线程拿着一把没人认的锁**。实测 64 线程同时首次取同一个
+#: key,拿到 2 个不同的锁对象。而这正是本锁存在的那个场景(24 个店铺线程同时
+#: 第一次写同一张表),故障表现恰好就是它要防的那件事:一阵 90227 限流。
+#: `dict.setdefault` 是 C 实现、原子,多造出来的 RLock 直接被 GC —— 实测同一
+#: key 恒返回同一把。
+#: (对照:`_table_locks` 用的 `threading.Lock` 是 `_thread.allocate_lock`,
+#:  **C 工厂**,不执行 Python 字节码,所以那处 defaultdict 是安全的,别一起改。)
+_sheet_locks: dict = {}
+
+
+def _sheet_lock(token: str) -> threading.RLock:
+    """输入:电子表格 token → 输出:该表的串行写锁(同 token 恒为同一把)。"""
+    return _sheet_locks.setdefault(token, threading.RLock())
+
+
 _client: httpx.Client | None = None
 _client_lock = threading.Lock()
 
@@ -472,7 +491,7 @@ def sheet_row_count(sheet: Spreadsheet) -> int:
 def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
     """输入:登记条目 + 需要的总行数 → 输出:本次扩充的行数(网格不足时 add-dimension)。"""
     s = sheet.require()
-    with _sheet_locks[s.token]:
+    with _sheet_lock(s.token):
         current = sheet_row_count(s)
         if current >= need_rows:
             return 0
@@ -591,7 +610,7 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
     for rng, vals in _coalesce(updates):
         split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
     n = 0
-    with _sheet_locks[s.token]:
+    with _sheet_lock(s.token):
         for i in range(0, len(split), 100):
             chunk = split[i:i + 100]
             try:
@@ -623,7 +642,7 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     last_col = _col_letter(n_cols)
     # 锁把「扩行 → 整表写 → 删尾部残留」三步裹成一段:中间插进来一个别的写者,
     # 删尾部那一步会按**自己**算的 len(rows) 去删,把人家刚写的行删掉。
-    with _sheet_locks[s.token]:
+    with _sheet_lock(s.token):
         sheet_ensure_rows(s, len(rows))
 
         written = 0
@@ -667,7 +686,7 @@ def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int
     s = sheet.require()
     if not items:
         return 0
-    with _sheet_locks[s.token]:
+    with _sheet_lock(s.token):
         _call("PUT",
               f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/styles_batch_update",
               json_body={"data": [

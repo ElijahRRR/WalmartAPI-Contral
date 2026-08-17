@@ -274,3 +274,54 @@ def test_sheet_writes_serialize_per_spreadsheet(monkeypatch):
         list(ex.map(lambda s: feishu.sheet_write_ranges(s, [("A2:A2", [["v"]])]),
                     others))
     assert len(met_diff) == 4, f"不同表格之间互相挡住了({len(met_diff)}/4 会合)"
+
+
+# ── 电子表格写锁的取法(2026-08-17 实验反证)────────────────────────────────
+
+def test_sheet_lock_is_not_a_defaultdict_of_rlock():
+    """⚠ `defaultdict(threading.RLock)` 会给同一个 key 发出**两把不同的锁**。
+
+    `threading.RLock` 是 **Python 函数**(threading.py 里挑 _CRLock/_PyRLock 的
+    那个包装),所以 `defaultdict.__missing__` 调它时会执行 Python 字节码 ⇒
+    eval breaker 可能触发 ⇒ 线程切换 ⇒ 两个线程各造一把,只有一把落进字典,
+    **落空的那个线程拿着一把没人认的锁**。实测 64 线程同时首次取同一 key,
+    拿到 2 个不同的锁对象。
+
+    而这正是这把锁存在的那个场景(24 个店铺线程同时第一次写同一张表),
+    故障表现恰好就是它要防的那件事:一阵 90227 限流。
+
+    `dict.setdefault` 是 C 实现、原子 —— 多造出来的 RLock 直接被 GC。
+    ⚠ 对照:`_table_locks` 用的 `threading.Lock` 是 `_thread.allocate_lock`
+    (**C 工厂**,不执行 Python 字节码),那处 defaultdict 是安全的,别一起改。
+    """
+    import inspect
+    import threading
+    from collections import defaultdict
+    # 前提复核:RLock 是 Python 函数、Lock 不是。哪天 CPython 把 RLock 换成
+    # 纯 C 工厂,这条会红 —— 那时这个用例的理由消失了,可以连同 _sheet_lock 一起简化
+    assert inspect.isfunction(threading.RLock)
+    assert not inspect.isfunction(threading.Lock)
+
+    assert isinstance(feishu._sheet_locks, dict)
+    assert not isinstance(feishu._sheet_locks, defaultdict)
+    src = inspect.getsource(feishu._sheet_lock)
+    assert "setdefault" in src
+    # 同一 token 恒为同一把;不同 token 各自一把
+    a = feishu._sheet_lock("tok-A")
+    assert feishu._sheet_lock("tok-A") is a
+    assert feishu._sheet_lock("tok-B") is not a
+    # 必须可重入:sheet_overwrite 内部还会调 sheet_ensure_rows(同一把锁)
+    with a:
+        with a:
+            pass
+
+
+def test_every_sheet_write_goes_through_the_lock():
+    """四个写函数都得裹锁 —— 漏一个就是那张表的节流被跨店线程池整体绕过。"""
+    import inspect
+    for fn in (feishu.sheet_ensure_rows, feishu.sheet_write_ranges,
+               feishu.sheet_overwrite, feishu.sheet_set_formatter):
+        src = inspect.getsource(fn)
+        assert "_sheet_lock(" in src, fn.__name__
+        # 别退回下标取法(那就又是 defaultdict 的坑)
+        assert "_sheet_locks[" not in src, fn.__name__

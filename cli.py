@@ -375,11 +375,39 @@ def main(argv: list[str] | None = None) -> int:
     # 串联:整链一条通知。三步链每小时发三条会把群刷废,而且看不出这几条
     # 属于同一次运行
     worst = next((s for _, s, _ in results if s != "success"), "success")
-    head = "✅" if worst == "success" else _ICON.get(worst, "❌")
-    chain = " → ".join(steps)
-    body = "\n".join(f"{_ICON.get(s, '⏭')} {t}" for _, s, t in results)
-    _notify(f"{head} 链 [{chain}]\n{body}")
+    _notify(_chain_text(steps, results, worst))
     return _EXIT.get(worst, 1)
+
+
+def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:
+    """输入:步骤名 + [(名, 状态, 摘要)] + 最坏状态 → 输出:整链那一条通知正文。
+
+    排版规范见 `services/notify_fmt` 头注。这里落地的是第 5 条:
+    **成功的步骤压成一行(它自己摘要的第一行),失败/跳过的给全文。**
+
+    ⚠ 为什么不是全都给全文(2026-08-17 所有者要求整理通知形态):产品线七步
+    每步都是一段密集中文,拼起来是二十来行没有层次的文字 —— 人第三天就不看了,
+    而**不看的通知等于没有通知**。成功的那些只需要一行证明它跑了、跑出多少;
+    真正要读的是失败那一步的明细,所以只有它铺开。
+    全文并没有丢:`ops.runs.summary` 每步一行整篇存着,日志也在。
+
+    单跑的通知形态**逐字不动**(上面那个分支)—— 人和告警规则都认那个格式。
+    """
+    from services import notify_fmt as nf
+    icon = "✅" if worst == "success" else _ICON.get(worst, "❌")
+    lines = [f"{icon} 链 [{' → '.join(steps)}]"]
+    for name, status, text in results:
+        mark = _ICON.get(status, "⏭")
+        if status == "success":
+            lines.append(f"{mark} {nf.first_line_of(text)}")
+        else:
+            # 失败/跳过:整段铺开(缩进两格,与折叠行区分开)
+            body = "\n".join(f"   {ln}" for ln in str(text).splitlines()
+                             if ln.strip())
+            lines.append(f"{mark} {name}\n{body}" if body else f"{mark} {name}")
+    if worst != "success":
+        lines.append("(成功步骤只显示首行;全文见 ops.runs 与各步日志)")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

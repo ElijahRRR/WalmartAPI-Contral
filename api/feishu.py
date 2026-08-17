@@ -44,6 +44,14 @@ _WRITE_THROTTLE_SECS = 0.15  # 同表批间节流,压在写 QPS≈10 之下
 _token_cache: dict = {}  # {"token": str, "expires_at": float}
 _token_lock = threading.Lock()
 _table_locks: dict = defaultdict(threading.Lock)  # (app_token, table_id) → 串行写锁
+#: 电子表格 token → 串行写锁(与 _table_locks 同一条理由,晚一步补上)。
+#:
+#: 为什么需要:各 sheet_* 写函数内部都靠 `time.sleep(_SHEET_WRITE_THROTTLE_SECS)`
+#: 压 QPS,而那个节流**只在一次调用内部生效**。跨店线程池(STORE_WORKERS=24)
+#: 让 24 个线程各自进入写函数时,每个线程都以为自己是唯一写者,节流被整体绕过,
+#: 飞书一侧看到的是 24 倍瞬时写入 → 90227/限流。
+#: 用 RLock 是因为 sheet_overwrite 内部还会调 sheet_ensure_rows(同一把锁)。
+_sheet_locks: dict = defaultdict(threading.RLock)
 _client: httpx.Client | None = None
 _client_lock = threading.Lock()
 
@@ -464,21 +472,22 @@ def sheet_row_count(sheet: Spreadsheet) -> int:
 def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
     """输入:登记条目 + 需要的总行数 → 输出:本次扩充的行数(网格不足时 add-dimension)。"""
     s = sheet.require()
-    current = sheet_row_count(s)
-    if current >= need_rows:
-        return 0
-    add = need_rows - current
-    remaining = add
-    while remaining > 0:      # 单次最多 5000 行(90204),分块扩
-        step = min(remaining, _SHEET_DIMENSION_MAX)
-        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
-              json_body={"dimension": {"sheetId": s.sheet_id,
-                                       "majorDimension": "ROWS", "length": step}})
-        remaining -= step
-        if remaining > 0:
-            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
-    logger.info("电子表格「%s」扩行 %d(%d → %d)", s.name, add, current, need_rows)
-    return add
+    with _sheet_locks[s.token]:
+        current = sheet_row_count(s)
+        if current >= need_rows:
+            return 0
+        add = need_rows - current
+        remaining = add
+        while remaining > 0:      # 单次最多 5000 行(90204),分块扩
+            step = min(remaining, _SHEET_DIMENSION_MAX)
+            _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
+                  json_body={"dimension": {"sheetId": s.sheet_id,
+                                           "majorDimension": "ROWS", "length": step}})
+            remaining -= step
+            if remaining > 0:
+                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        logger.info("电子表格「%s」扩行 %d(%d → %d)", s.name, add, current, need_rows)
+        return add
 
 
 def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
@@ -582,21 +591,22 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
     for rng, vals in _coalesce(updates):
         split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
     n = 0
-    for i in range(0, len(split), 100):
-        chunk = split[i:i + 100]
-        try:
-            _call("POST",
-                  f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
-                  json_body={"valueRanges": [
-                      {"range": f"{s.sheet_id}!{rng}", "values": vals}
-                      for rng, vals in chunk]})
-        except FeishuError as e:
-            # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
-            raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
-                                      f"{sum(len(v) for _r, v in chunk)} 行)") from None
-        n += sum(len(v) for _r, v in chunk)
-        if i + 100 < len(split):
-            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+    with _sheet_locks[s.token]:
+        for i in range(0, len(split), 100):
+            chunk = split[i:i + 100]
+            try:
+                _call("POST",
+                      f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
+                      json_body={"valueRanges": [
+                          {"range": f"{s.sheet_id}!{rng}", "values": vals}
+                          for rng, vals in chunk]})
+            except FeishuError as e:
+                # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
+                raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
+                                          f"{sum(len(v) for _r, v in chunk)} 行)") from None
+            n += sum(len(v) for _r, v in chunk)
+            if i + 100 < len(split):
+                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     return n
 
 
@@ -611,32 +621,35 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
         return 0
     n_cols = max(len(r) for r in rows)
     last_col = _col_letter(n_cols)
-    sheet_ensure_rows(s, len(rows))
+    # 锁把「扩行 → 整表写 → 删尾部残留」三步裹成一段:中间插进来一个别的写者,
+    # 删尾部那一步会按**自己**算的 len(rows) 去删,把人家刚写的行删掉。
+    with _sheet_locks[s.token]:
+        sheet_ensure_rows(s, len(rows))
 
-    written = 0
-    for i in range(0, len(rows), _SHEET_WRITE_BLOCK_ROWS):
-        block = rows[i:i + _SHEET_WRITE_BLOCK_ROWS]
-        rng = f"{s.sheet_id}!A{i + 1}:{last_col}{i + len(block)}"
-        _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
-              json_body={"valueRanges": [{"range": rng, "values": block}]})
-        written += len(block)
-        logger.info("电子表格「%s」写入 %d/%d 行", s.name, written, len(rows))
-        if i + _SHEET_WRITE_BLOCK_ROWS < len(rows):
-            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        written = 0
+        for i in range(0, len(rows), _SHEET_WRITE_BLOCK_ROWS):
+            block = rows[i:i + _SHEET_WRITE_BLOCK_ROWS]
+            rng = f"{s.sheet_id}!A{i + 1}:{last_col}{i + len(block)}"
+            _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
+                  json_body={"valueRanges": [{"range": rng, "values": block}]})
+            written += len(block)
+            logger.info("电子表格「%s」写入 %d/%d 行", s.name, written, len(rows))
+            if i + _SHEET_WRITE_BLOCK_ROWS < len(rows):
+                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
 
-    surplus = sheet_row_count(s) - len(rows)
-    trimmed = surplus
-    while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
-        step = min(surplus, _SHEET_DIMENSION_MAX)
-        _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
-              json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
-                                       "startIndex": len(rows) + surplus - step + 1,
-                                       "endIndex": len(rows) + surplus}})
-        surplus -= step
-        if surplus > 0:
-            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
-    if trimmed > 0:
-        logger.info("电子表格「%s」删除尾部残留 %d 行", s.name, trimmed)
+        surplus = sheet_row_count(s) - len(rows)
+        trimmed = surplus
+        while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
+            step = min(surplus, _SHEET_DIMENSION_MAX)
+            _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
+                  json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
+                                           "startIndex": len(rows) + surplus - step + 1,
+                                           "endIndex": len(rows) + surplus}})
+            surplus -= step
+            if surplus > 0:
+                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        if trimmed > 0:
+            logger.info("电子表格「%s」删除尾部残留 %d 行", s.name, trimmed)
     return written
 
 
@@ -654,11 +667,12 @@ def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int
     s = sheet.require()
     if not items:
         return 0
-    _call("PUT",
-          f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/styles_batch_update",
-          json_body={"data": [
-              {"ranges": [f"{s.sheet_id}!{rng}"], "style": {"formatter": fmt}}
-              for rng, fmt in items]})
+    with _sheet_locks[s.token]:
+        _call("PUT",
+              f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/styles_batch_update",
+              json_body={"data": [
+                  {"ranges": [f"{s.sheet_id}!{rng}"], "style": {"formatter": fmt}}
+                  for rng, fmt in items]})
     return len(items)
 
 

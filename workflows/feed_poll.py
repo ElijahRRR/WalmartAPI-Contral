@@ -20,7 +20,8 @@ ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
 是一个 services 积木,纯读 ops.feed_items 台账写自己的业务表,幂等;
 单个失败只告警不拖垮轮询本体和其它反哺器。未来上架/改价/改库存/改标题
-feed 上线时,各自的反哺器在 _REFLECTORS 登记一行即接入。
+feed 上线时,各自的反哺器在 _REFLECTOR_CHAINS 登记一条链即接入;
+链与链之间**并发**跑,同一张表的多个反哺器留在同一条链里按序跑。
 
 与各业务工作流的关系:product_clear 等提交后自己也会轮询并刷新飞书投影列;
 本工作流是**兜底与加密度**——业务工作流一天跑一次,它可以挂高频调度
@@ -38,17 +39,28 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.feed_poll")
 
-# 业务表反哺器登记处:(名称, 无参函数 → 摘要行或 None)。
-# 新 feed 工作流上线时在此追加,例:("上架表", listing_sheet.sync_from_ledger)
-_REFLECTORS: list[tuple[str, object]] = [
-    ("停用/删除表", clear_sheet.sync_from_ledger),
-    ("维护记录", maint_sheet.sync_from_ledger),
-    ("跟卖表", match_sheet.sync_from_ledger),
-    ("上架表", listing_sheet.sync_from_ledger),
-    # K=Unknown 自愈(所有者批复 2026-08-12):feed 台账终态 + 目录在线
-    # 双源收尾,替代旧 sync_status_track 的自愈半边。只写飞书与 UPC 池,
-    # 不碰沃尔玛——反哺器"只读沃尔玛"的契约不破
-    ("上架表自愈", listing_sheet.heal_unknown),
+# 业务表反哺器登记处:**每个内层 list 是一条串行链,链与链之间并发**。
+# 新 feed 工作流上线时在此追加一条链,例:[("上架表", listing_sheet.sync_from_ledger)]
+#
+# 为什么要分链而不是拍平了全并发(所有者定稿 2026-08-17「一起并」):
+# 分链的判据是**写不写同一张表**,不是"看着相不相关"。上架表与上架表自愈都
+# 走 `read_rows(LISTING_SHEET)` → 算 → 回写,是**读-改-写三步**;并发跑的话
+# 后者会读到前者写之前的那份快照,回写时按旧值覆盖新值。
+# api.feishu 的 `_sheet_locks` 只串得住"写"这一步,串不住跨了两次网络调用的
+# 读-改-写,所以同表的反哺器必须留在同一条链里、按登记顺序跑。
+#
+# 反过来,不同表之间没有共享写:各自读 ops.feed_items(只读)写自己那张表,
+# 库侧只有 maint_sheet 写 ops.cursors(自己的游标)、listing_sheet 写
+# catalog.upc_pool(两个都在上架链里,已串行)。
+_REFLECTOR_CHAINS: list[list[tuple[str, object]]] = [
+    [("停用/删除表", clear_sheet.sync_from_ledger)],
+    [("维护记录", maint_sheet.sync_from_ledger)],
+    [("跟卖表", match_sheet.sync_from_ledger)],
+    [("上架表", listing_sheet.sync_from_ledger),
+     # K=Unknown 自愈(所有者批复 2026-08-12):feed 台账终态 + 目录在线
+     # 双源收尾,替代旧 sync_status_track 的自愈半边。只写飞书与 UPC 池,
+     # 不碰沃尔玛——反哺器"只读沃尔玛"的契约不破
+     ("上架表自愈", listing_sheet.heal_unknown)],
 ]
 
 
@@ -145,7 +157,19 @@ def run(params: dict) -> str:
                 + "\n(诊断模式:不动 ops.feed_items 台账、不回写飞书;"
                   "要落定并回写请跑不带 -p feed_id 的 python cli.py feed_poll)")
     lines = [feed_track.poll_all(stores_by_name)]
-    for label, sync in _REFLECTORS:
+    lines.extend(_run_reflectors())
+    return "\n".join(lines)
+
+
+def _one_chain(chain: list) -> list[str]:
+    """输入:一条反哺链 → 输出:该链的摘要行(链内按登记顺序串行)。
+
+    单个反哺器失败**只吃掉它自己那一行**,同链后面的照跑 —— 与并发之前逐个
+    try/except 的语义一字不差:台账已经落定了,回写是幂等的补写,下一轮或
+    业务工作流还会再补一次,没有理由让一张表的故障顺带停掉另一张。
+    """
+    out: list[str] = []
+    for label, sync in chain:
         try:
             line = sync()
         except Exception as e:
@@ -153,5 +177,23 @@ def run(params: dict) -> str:
             logger.warning("%s 回写失败(台账已落定,下轮补写): %s", label, e)
             line = f"⚠ {label}回写失败:{e}"
         if line:
-            lines.append(line)
-    return "\n".join(lines)
+            out.append(line)
+    return out
+
+
+def _run_reflectors() -> list[str]:
+    """输入:无 → 输出:全部反哺器的摘要行(链间并发,链内串行)。
+
+    ⚠ 摘要按 `_REFLECTOR_CHAINS` 的**登记顺序**拼,不按完成先后:五张表快慢
+    差得远(上架表几万行、跟卖表几十行),按完成序拼的话每轮通知里的段落顺序
+    都不一样,人对着看会以为少了一段。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    done: dict[int, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=len(_REFLECTOR_CHAINS)) as pool:
+        futs = {pool.submit(_one_chain, c): i
+                for i, c in enumerate(_REFLECTOR_CHAINS)}
+        for f in as_completed(futs):
+            done[futs[f]] = f.result()
+    return [line for i in range(len(_REFLECTOR_CHAINS)) for line in done[i]]

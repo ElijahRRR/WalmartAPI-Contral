@@ -1,6 +1,7 @@
 """api/feishu.py 行为回归:token 缓存与失效重试 / 瞬时退避 / 批量切块 / 分页 / 错误模型。"""
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import httpx
@@ -225,3 +226,51 @@ def test_coalesce_never_merges_across_a_gap_or_a_column_change():
     # 形状看不懂(行数与范围对不上)就原样放过,不猜
     assert [r for r, _ in c([("C2:G9", [[1]]), ("C3:G3", [[2]])])] \
         == ["C2:G9", "C3:G3"]
+
+
+def test_sheet_writes_serialize_per_spreadsheet(monkeypatch):
+    """同一张电子表格的写**互斥**;不同表格互不阻塞。
+
+    起因:跨店线程池(services.stores.STORE_WORKERS=24)让 24 个线程各自进
+    sheet_* 写函数,而那些函数压 QPS 靠的是**调用内部**的
+    `time.sleep(_SHEET_WRITE_THROTTLE_SECS)` —— 每个线程都以为自己是唯一写者,
+    节流被整体绕过,飞书那边看到的是 24 倍瞬时写入。
+    锁必须是**按表**的,不是全局一把:否则上架表的回写会挡住黑名单表的重写,
+    把并发省下来的时间又赔回去。
+
+    ⚠ 用 Barrier 判"同时在飞",不用 sleep 掐秒表:本文件的 _clean_state 把
+    `time.sleep` 打成空操作(退避不真等),掐秒表在这里恒等于 0;而且时间断言
+    在慢机器上本来就会抖。会合成功 = 真的同时有 N 个线程在写,是**确定性**的。
+    """
+    import threading
+
+    def _make(barrier, met):
+        def _call(method, path, **kw):
+            try:
+                barrier.wait()
+                met.append(1)          # 会合上了 = 同时在飞
+            except threading.BrokenBarrierError:
+                pass                   # 超时 = 没人陪它,即被锁挡住了
+            return {}
+        return _call
+
+    # ① 同一张表:8 个线程抢写,任意两个都不该同时在 _call 里
+    met_same: list = []
+    monkeypatch.setattr(feishu, "_call",
+                        _make(threading.Barrier(2, timeout=0.15), met_same))
+    same = Spreadsheet(name="X", token="TOK", sheet_id="SID", columns=("a",))
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda r: feishu.sheet_write_ranges(
+            same, [(f"A{r}:A{r}", [["v"]])]), range(2, 10)))
+    assert met_same == [], "同一张表的写没串起来"
+
+    # ② 四张不同的表:必须四个一起在飞,否则就是锁做粗了
+    met_diff: list = []
+    monkeypatch.setattr(feishu, "_call",
+                        _make(threading.Barrier(4, timeout=5), met_diff))
+    others = [Spreadsheet(name=f"S{i}", token=f"TOK{i}", sheet_id="SID",
+                          columns=("a",)) for i in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(lambda s: feishu.sheet_write_ranges(s, [("A2:A2", [["v"]])]),
+                    others))
+    assert len(met_diff) == 4, f"不同表格之间互相挡住了({len(met_diff)}/4 会合)"

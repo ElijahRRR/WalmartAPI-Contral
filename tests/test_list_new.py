@@ -476,3 +476,91 @@ def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
     _, _, listed, *_ = ln._load_gate_state()
     assert "B0MINE0001" in listed          # 规划内的店照样拦
     assert "B0TANZONG1" not in listed      # 范围外的店不拦
+
+
+def test_submit_loop_is_cross_store_concurrent(monkeypatch):
+    """跨店并发提交:并发确实发生、摘要仍按店名排序、提交期三个计数不丢。
+
+    盯三件事,少一件这次改造就白做:
+      ① **真并发**:submit_feed 里记在飞的店数,峰值必须 >1(不然只是把
+         for 循环包了一层线程池,慢照旧)。
+      ② **顺序确定**:让 T5 最快、T1 最慢,摘要行序仍须 T1…T5 —— 完成先后
+         是随机的,输出跟着随机就没法拿两轮跑对拍。
+      ③ **计数不丢**:no_upc/invalid 从共享 dict 改成各店局部 dict 再合并,
+         合并漏一店就少算,而少算**不报错**。顺带钉住"提交期"那一行:
+         这三个数以前只加不看(gate_line 是字符串,拼在提交循环之前)。
+    """
+    import threading
+    import time
+
+    stores = [f"T{i}" for i in range(1, 6)]
+    rows, rn = [], 1
+    for s in stores:
+        for tag in ("NOUPC", "BAD", "OK"):
+            rn += 1
+            rows.append(_sheet_row(rn, store=s, asin=f"B0{s}{tag}"))
+    base = {"title": "标题够长的十个字以上", "price": 20.0, "stock": 50,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM",
+            "shipping": 3.0}
+    products = {r["asin"]: {**base, "asin": r["asin"]} for r in rows}
+
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {s: {"fbm_range1": "200%"} for s in stores})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": s} for s in stores])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    monkeypatch.setattr(ln, "_sync_upc", lambda e, l: None)
+    monkeypatch.setattr(ln, "_writeback_upc", lambda e, l: None)
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([object()])))
+    monkeypatch.setattr(ln.settings_api, "get_partner_id", lambda s: "P")
+
+    # UPC:每店第一行(…NOUPC)领不到号 → no_upc;其余给号
+    monkeypatch.setattr(ln.upc_pool, "claim", lambda c, wants: [
+        None if w["asin"].endswith("NOUPC") else "0" + w["asin"] for w in wants])
+    monkeypatch.setattr(ln.upc_pool, "release", lambda *a, **k: 0)
+    monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
+    monkeypatch.setattr(ln, "_map_llm",
+                        lambda c, pt, spec, p: ({"productName": p["title"]}, {}))
+    monkeypatch.setattr(ln.mp_mapper, "build_orderable", lambda *a, **k: {})
+    monkeypatch.setattr(ln.mp_mapper, "assemble_mp_item",
+                        lambda o, pt, v: {"pt": pt})
+    # spec 一致化:每店第二行(…BAD)必填缺失 → invalid
+    monkeypatch.setattr(ln.mp_conform, "conform", lambda *a, **k: (
+        a[2], a[3], [], ["brand"] if str(k.get("sku", "")).endswith("BAD") else []))
+    monkeypatch.setattr(ln.listing_sources, "register", lambda *a, **k: None)
+    monkeypatch.setattr(ln.product_events, "record_many", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_reason", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
+    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
+
+    lock = threading.Lock()
+    state = {"inflight": 0, "peak": 0}
+
+    def fake_submit(store, feed_type, items, workflow=None):
+        with lock:
+            state["inflight"] += 1
+            state["peak"] = max(state["peak"], state["inflight"])
+        # T1 最慢、T5 最快:完成顺序与店名顺序**相反**
+        time.sleep(0.02 * (6 - int(store["name"][1:])))
+        with lock:
+            state["inflight"] -= 1
+        yield {"outcome": "submitted", "feed_id": f"F-{store['name']}",
+               "count": len(items)}
+
+    monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)
+
+    out = ln.run({"execute": True})
+
+    assert state["peak"] > 1, f"没有真并发,峰值在飞 {state['peak']} 家"
+    hit = [ln_ for ln_ in out.splitlines() if "提交 1 条" in ln_]
+    assert [l.split(":")[0].strip() for l in hit] == stores, hit
+    assert "提交期:UPC池不足 5,必填缺失 5" in out

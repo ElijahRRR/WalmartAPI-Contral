@@ -15,7 +15,7 @@ import logging
 
 from api import feeds
 from registry import db, resources
-from services import blacklist, product_events
+from services import blacklist, product_events, stores as stores_svc
 
 logger = logging.getLogger("services.feed_track")
 
@@ -183,40 +183,81 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
 def poll_all(stores_by_name: dict) -> str:
     """输入:{店铺名: store dict} → 输出:全局轮询摘要。
 
-    扫 feed_log 全部 submitted 行逐一轮询;pending 行(提交结局不确定,
-    仅网络 UNKNOWN 结局产生)只告警不自动补交——写操作宁停不重。
+    扫 feed_log 全部 submitted 行**跨店并发、店内串行**地轮询;pending 行
+    (提交结局不确定,仅网络 UNKNOWN 结局产生)只告警不自动补交——写操作宁停不重。
+
+    为什么跨店能并发:每店有自己的固定出口代理,沃尔玛配额按 `(store, endpoint)`
+    计,`api/_client` 的令牌桶也按这个维度限流——店与店之间不抢同一个桶。
+    店内保持串行则是因为 `feeds.get_feed_status` / `iter_feed_items` 对**同一个店**
+    才是同一个桶,并发只会让自己排队等退避。
+
+    (所有者定稿 2026-08-17:「feed_poll 应该也设置为跨店并发,但店内可以串行」。
+    改之前一个店挂了会顶着整轮的轮询时间,而 feed_poll 是挂高频调度的那一条。)
     """
     rows = feeds.query_pending()
     submitted = [r for r in rows if r["status"] == "submitted" and r["feed_id"]]
     pendings = [r for r in rows if r["status"] == "pending"]
 
+    by_store: dict[str, list[dict]] = {}
+    for r in submitted:
+        by_store.setdefault(r["store"], []).append(r)
+
+    def _one_store(store_name: str, srows: list[dict]) -> tuple:
+        """输入:店铺名 + 该店在途 feed → 输出:(落定, 仍处理中, 跳过, 明细行)。
+
+        **各店各自的局部计数**,主线程再合并:`done += 1` 是"读-加-写"三步,
+        两个线程交错会丢计数(丢得随机、不报错);明细行直接 append 则会按完成
+        先后乱序交织,同一轮跑两次输出不一样。
+        """
+        done_s = still_s = skipped_s = 0
+        out: list[str] = []
+        store = stores_by_name.get(store_name)
+        for r in srows:
+            label = _FEED_LABEL.get(r["feed_type"], r["feed_type"])
+            fid_disp = ((r["feed_id"][:18] + "…") if len(r["feed_id"]) > 19
+                        else r["feed_id"])
+            who = f"{r['store']} {label}({r['workflow'] or '-'}) {fid_disp}"
+            if store is None:
+                skipped_s += 1
+                out.append(f"  {who}:店铺凭证缺失,跳过")
+                continue
+            try:
+                head, results = poll_feed(store, r["feed_id"])
+            except Exception as e:
+                logger.warning("feed %s 轮询失败(下轮再试): %s", r["feed_id"], e)
+                still_s += 1
+                out.append(f"  {who}:查询失败({e}),下轮再试")
+                continue
+            if results is None:
+                still_s += 1
+                out.append(f"  {who}:{head.get('feedStatus')},{_progress(head)}")
+            else:
+                done_s += 1
+                n_ok = sum(1 for o, _ in results.values() if o == "success")
+                n_bad = sum(1 for o, _ in results.values() if o == "failed")
+                out.append(f"  {who}:已落定 {head.get('feedStatus')},"
+                           f"成功 {n_ok},失败 {n_bad}")
+        return done_s, still_s, skipped_s, out
+
     done = still = skipped = 0
     detail_lines: list[str] = []
-    for r in submitted:
-        label = _FEED_LABEL.get(r["feed_type"], r["feed_type"])
-        fid_disp = (r["feed_id"][:18] + "…") if len(r["feed_id"]) > 19 else r["feed_id"]
-        who = f"{r['store']} {label}({r['workflow'] or '-'}) {fid_disp}"
-        store = stores_by_name.get(r["store"])
-        if store is None:
-            skipped += 1
-            detail_lines.append(f"  {who}:店铺凭证缺失,跳过")
-            continue
-        try:
-            head, results = poll_feed(store, r["feed_id"])
-        except Exception as e:
-            logger.warning("feed %s 轮询失败(下轮再试): %s", r["feed_id"], e)
-            still += 1
-            detail_lines.append(f"  {who}:查询失败({e}),下轮再试")
-            continue
-        if results is None:
-            still += 1
-            detail_lines.append(f"  {who}:{head.get('feedStatus')},{_progress(head)}")
-        else:
-            done += 1
-            n_ok = sum(1 for o, _ in results.values() if o == "success")
-            n_bad = sum(1 for o, _ in results.values() if o == "failed")
-            detail_lines.append(f"  {who}:已落定 {head.get('feedStatus')},"
-                                f"成功 {n_ok},失败 {n_bad}")
+    # 摘要按人看的店铺序排(sort_key),**不是**按完成先后:query_pending 本身
+    # 没有 ORDER BY,原来那份顺序是 PG 的堆序,本来就不稳定。
+    todo = sorted(by_store.items(), key=lambda kv: stores_svc.sort_key(kv[0]))
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        per_store: dict[str, tuple] = {}
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
+            futs = {pool.submit(_one_store, sn, sr): sn for sn, sr in todo}
+            for f in as_completed(futs):
+                per_store[futs[f]] = f.result()
+        for sn, _ in todo:
+            d, s, k, out = per_store[sn]
+            done += d
+            still += s
+            skipped += k
+            detail_lines.extend(out)
 
     if pendings:
         logger.warning("feed_log 有 %d 条 pending(提交结局不确定),"

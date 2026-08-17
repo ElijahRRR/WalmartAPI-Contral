@@ -139,16 +139,34 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
     for r in good:
         by_store.setdefault(r["store"], []).append(r)
 
-    submitted = deferred = 0
-    for store_name, srows in by_store.items():
+    def _limit_of(store_name: str) -> int:
+        """输入:店铺名 → 输出:该店单轮上限(限额表缺该店则回落默认并告警)。
+
+        提交与摘要**共用这一处** —— 摘要那行原本拿的是 for 循环泄漏出来的
+        `limit`,也就是用**最后一个店**的上限去估算所有店(各店上限不同时报的
+        数就是错的,而且不报错)。并发化把它变成 NameError,才暴露出来。
+        """
         limit = limits.get(store_name)
         if limit is None:
             if limits:      # 限额表在用但查不到该店:旧系统在这里静默兜底,已改告警
                 logger.warning("店铺 %s 不在限额表,按默认上限 %d(请核对店铺名拼写)",
                                store_name, default_limit)
             limit = default_limit
+        return limit
+
+    def _one_store(store_name: str, srows: list[dict]) -> tuple:
+        """输入:店铺 + 该店待提交行 → 输出:(店铺名, updates, lines, 提交数, 延后数)。
+
+        **各店各自的局部状态**,主线程再合并 —— 跨店并发之后不能再往共享
+        list/计数器上写:list.append 在 GIL 下不会坏数据,但 `submitted += n`
+        是"读-加-写"三步,两个线程交错会**丢计数**(而且丢得随机、不报错);
+        摘要行序也会按完成先后乱序交织,同一轮跑两次输出不一样,没法对拍。
+        """
+        updates_s: list = []
+        lines_s: list[str] = []
+        submitted_s = 0
+        limit = _limit_of(store_name)
         take, defer = srows[:limit], srows[limit:]
-        deferred += len(defer)
         by_action: dict[str, list[dict]] = {}
         for r in take:
             by_action.setdefault(_ACTIONS[r["action"]], []).append(r)
@@ -158,7 +176,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 logger.info("[DRY-RUN] %s %s 将提交 %d 个 SKU:%s%s",
                             store_name, feed_type, len(skus), skus[:8],
                             " …" if len(skus) > 8 else "")
-                lines.append(f"[DRY-RUN] {store_name} {feed_type} 待提交 {len(skus)}")
+                lines_s.append(f"[DRY-RUN] {store_name} {feed_type} 待提交 {len(skus)}")
                 continue
             results = feeds.submit_feed(stores_by_name[store_name], feed_type,
                                         skus, workflow="product_clear")
@@ -167,10 +185,10 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 slice_rows = arows[i:i + res["count"]]
                 i += res["count"]
                 if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
-                    submitted += len(slice_rows)
+                    submitted_s += len(slice_rows)
                     for r in slice_rows:
-                        updates.append((r["rownum"], res["feed_id"], today,
-                                        "处理中", ""))
+                        updates_s.append((r["rownum"], res["feed_id"], today,
+                                          "处理中", ""))
                     # 产品事件账本:提交事件(含操作原因,病历的"医嘱"部分)。
                     # ⚠ **只在 submitted 时记**(2026-08-16 feed 闭环审计):
                     # dedup 挂的是旧 feed_id、这一轮什么都没提交,记了就是幽灵
@@ -188,13 +206,37 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                                 for r in slice_rows])
                 elif res["outcome"] == "failed":
                     for r in slice_rows:
-                        updates.append((r["rownum"], "", "", "提交被拒", ""))
+                        updates_s.append((r["rownum"], "", "", "提交被拒", ""))
                 else:   # unknown:保持 pending 待启动对账,行不动
-                    lines.append(f"⚠ {store_name} {feed_type} 一批 {res['count']} 条"
-                                 f"提交结果不确定,已留 pending 待对账")
+                    lines_s.append(f"⚠ {store_name} {feed_type} 一批 {res['count']} 条"
+                                   f"提交结果不确定,已留 pending 待对账")
+        return store_name, updates_s, lines_s, submitted_s, len(defer)
+
+    # 跨店并发(所有者定稿 2026-08-17)。每店有自己的固定出口代理,配额与令牌桶
+    # 都按 (store, endpoint) 计,跨店不挤同一个桶;单店上限仍按限额表逐店算。
+    # ⚠ **店内串行不变**:同一店的多个 feed_type 仍在 _one_store 里顺序提交。
+    submitted = deferred = 0
+    todo = sorted(by_store.items())
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        per_store: dict[str, tuple] = {}
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
+            futs = [pool.submit(_one_store, n, s) for n, s in todo]
+            for f in as_completed(futs):
+                name, u, ls, sub, defr = f.result()
+                per_store[name] = (u, ls, sub, defr)
+        # 按店名排序合并:完成先后随机,updates 与摘要的顺序不能跟着随机
+        for name, _ in todo:
+            u, ls, sub, defr = per_store[name]
+            updates.extend(u)
+            lines.extend(ls)
+            submitted += sub
+            deferred += defr
+
     if good or bad:
         lines.append(f"提交:有效待提交 {len(good)} 行,本轮"
-                     f"{'提交' if execute else '将提交'} {submitted if execute else min(len(good), sum(min(len(v), limit) for v in by_store.values()))} 行,"
+                     f"{'提交' if execute else '将提交'} {submitted if execute else min(len(good), sum(min(len(v), _limit_of(k)) for k, v in by_store.items()))} 行,"
                      f"超限延后 {deferred} 行,无效行 {len(bad)}")
     return updates, lines
 

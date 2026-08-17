@@ -119,3 +119,46 @@ def test_only_filter(_sources, monkeypatch, tmp_path):
     pc.run({"only": "瞎猜"})
     text = (tmp_path / "pt_census.csv").read_text(encoding="utf-8-sig")
     assert "Wall Clocks" in text and "Hammers" not in text
+
+
+def test_suggestions_split_naming_diffs_from_real_unknowns(monkeypatch, tmp_path):
+    """⚠ 「纯命名差」与「真找不到」的处置不同 —— 前者可直接改,后者要人判。
+
+    去标点小写后完全相等的(Paperweights vs Paper Weights)是纯命名差;
+    只是"像"的必须人眼定夺 —— 名字像不代表语义对,沃尔玛 PT 粒度与亚马逊
+    叶子不一一对应(旧仓 mp_mapper 自动采纳高分候选吃过亏)。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [
+            ("Paperweights", 19),          # 纯命名差 → Paper Weights
+            ("Novelty Lightss", 6),        # 相似
+            ("Zzz Nothing Like This", 1),  # 无对应
+        ]}))
+    monkeypatch.setattr(pc.pt_spec, "known_pts",
+                        lambda: {"Paper Weights", "Novelty Lights", "Hammers"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    rows, _ = pc._census()
+    by = {r["walmart_product_type"]: r for r in rows}
+    assert by["Paperweights"]["建议PT"] == "Paper Weights"
+    assert by["Paperweights"]["相似度"] == 1.0          # 纯命名差
+    assert by["Novelty Lightss"]["建议PT"] == "Novelty Lights"
+    assert 0 < by["Novelty Lightss"]["相似度"] < 1.0
+    # 八竿子打不着的**不给建议** —— 给了人会顺手采纳
+    assert by["Zzz Nothing Like This"]["建议PT"] == ""
+
+    out = pc.run({})
+    assert "纯命名差 1" in out and "相似 1" in out and "找不到对应 1" in out
+    assert "只是候选" in out and "名字像不代表语义对" in out
+
+
+def test_suggestions_only_for_the_guess_bucket(monkeypatch, tmp_path):
+    """其余几类的处置与改名无关,别给它们配建议添乱。"""
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn(_DATA))
+    monkeypatch.setattr(pc.pt_spec, "known_pts",
+                        lambda: {"Hammers", "Lonely PT", "Retired PTs"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    rows, _ = pc._census()
+    by = {r["walmart_product_type"]: r for r in rows}
+    assert by["Retired PT"]["判定"] == "已废弃?" and by["Retired PT"]["建议PT"] == ""

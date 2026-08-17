@@ -132,3 +132,30 @@ def test_success_writes_snapshot(monkeypatch):
     saved = json.loads(paths.stores_snapshot_file().read_text(encoding="utf-8"))
     assert saved == out
     assert (paths.stores_snapshot_file().stat().st_mode & 0o777) == 0o600
+
+
+def test_cross_store_concurrency_has_one_source():
+    """跨店并发只准有一个出处 —— 六处各写一份正是它漂掉的原因。
+
+    所有者 2026-08-16 推翻了旧 README 的「店铺级并发不要调高」,但那次只改了
+    daily_report(6→16),perf_problems/settlement_sync 连**被推翻的注释**都
+    原样留着 —— 同一条判断改一处漏两处,不报错,只是那两条链一直慢着。
+    """
+    import inspect
+
+    from services import stores as ss
+    assert ss.STORE_WORKERS == 24
+
+    from workflows import (catalog_sync, daily_report, order_sync,
+                           perf_problems, returns_sync, settlement_sync)
+    for mod in (perf_problems, settlement_sync, daily_report):
+        assert mod._STORE_WORKERS == ss.STORE_WORKERS, mod.__name__
+    # 走 -p workers= 的三条:默认值必须取自同一个常量,不许写字面量
+    for mod in (catalog_sync, order_sync, returns_sync):
+        src = inspect.getsource(mod.run)
+        assert "stores_svc.STORE_WORKERS" in src, mod.__name__
+
+    # 被推翻的那句话不许再留在代码里(留着会让下一个人以为 6 是有依据的)
+    for mod in (perf_problems, settlement_sync):
+        text = inspect.getsource(mod)
+        assert "店铺级并发不要调高" not in text, mod.__name__

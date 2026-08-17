@@ -66,7 +66,7 @@ logger = logging.getLogger("workflows.daily_report")
 # 按 (store, endpoint) 计的,api/_client.py 的令牌桶也按这个维度限流,所以
 # 加店铺并发不会挤占同一个桶。真正的共享资源只有本机 CPU/连接数。
 # 若出现大面积 429 或代理超时,先降这个数再查别的。
-_STORE_WORKERS = 16
+_STORE_WORKERS = stores_svc.STORE_WORKERS   # 唯一出处在 services/stores
 
 _KPI_UPSERT = """
 INSERT INTO ops.store_kpi_daily (

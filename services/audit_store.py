@@ -56,33 +56,87 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-def persist_run(conn, outcome: AuditOutcome) -> int:
-    """输入:连接 + 判定结果 → 输出:run_id(runs 一行 + hits 逐条)。"""
+def _run_params(outcome: AuditOutcome) -> tuple:
+    """输入:判定结果 → 输出:_RUN_SQL 的参数元组。
+
+    单条与批量两条路径共用**同一份**取值,不许各拼各的:runs 有 12 列,
+    两处各写一份的话加一列漏改一处 = 静默写错列(元组长度对得上时不报错)。
+    """
+    # l3/l4 槽位口径逐字迁 orchestrator.py:36-58:未跑 = 'skip'/NULL/'[]'
+    l3, l4 = outcome.l3, outcome.l4
+    return (
+        outcome.asin,
+        outcome.l1.walmart_product_type,
+        outcome.l1.pt_confidence,
+        outcome.l1.pt_source,
+        outcome.score_final,
+        outcome.verdict,
+        outcome.stage_stopped_at,
+        l3.verdict if l3 else "skip",
+        l3.reason_category if l3 else None,
+        l3.reason_text if l3 else None,
+        l4.verdict if l4 else "skip",
+        json.dumps(l4.image_issues, ensure_ascii=False, default=str)
+        if l4 else "[]",
+    )
+
+
+def _hit_params(run_id: int, outcome: AuditOutcome) -> list[tuple]:
+    """输入:run_id + 判定结果 → 输出:_HIT_SQL 的参数列表。"""
+    return [(run_id, h.stage, h.rule_code, h.penalty,
+             json.dumps(h.detail or {}, ensure_ascii=False, default=str))
+            for h in outcome.all_hits]
+
+
+def persist_runs(conn, outcomes: list) -> list[int]:
+    """输入:连接 + 一批判定结果 → 输出:与入参**同序**的 run_id 列表。
+
+    批量版:runs 一次 executemany(returning)、hits 再一次 executemany。
+    逐行版每行要走一个 savepoint + 一次 INSERT + N 次 hits INSERT,在单连接的
+    主线程上排队;判定并发调到 128 之后,那一段就是新的瓶颈(所有者定稿
+    2026-08-17:「审核默认设置为 128,并且做批量落库」)。
+
+    ⚠ **调用方必须保留逐行兜底**:批量一炸整批回滚,而里面多半只有一行是脏的
+    (已付费的 LLM 结果不能陪葬)。product_audit 的做法是 except 后对这一批
+    改走 persist_run 逐行落,坏行单独计数 —— 好路径拿批量的速度,坏路径保留
+    「一行落库报错不炸整批」那条评审结论。
+
+    ⚠ 顺序是承重的:`returning=True` 的结果集与入参一一对应,调用方按下标把
+    run_id 配回 outcome(要写 product_events 的事件行)。配错 = 事件挂到别的
+    ASIN 上,而且两边都不报错。
+    """
+    if not outcomes:
+        return []
     with conn.cursor() as cur:
-        # l3/l4 槽位口径逐字迁 orchestrator.py:36-58:未跑 = 'skip'/NULL/'[]'
-        l3, l4 = outcome.l3, outcome.l4
-        cur.execute(_RUN_SQL, (
-            outcome.asin,
-            outcome.l1.walmart_product_type,
-            outcome.l1.pt_confidence,
-            outcome.l1.pt_source,
-            outcome.score_final,
-            outcome.verdict,
-            outcome.stage_stopped_at,
-            l3.verdict if l3 else "skip",
-            l3.reason_category if l3 else None,
-            l3.reason_text if l3 else None,
-            l4.verdict if l4 else "skip",
-            json.dumps(l4.image_issues, ensure_ascii=False, default=str)
-            if l4 else "[]",
-        ))
-        run_id = cur.fetchone()[0]
-        hits = outcome.all_hits
+        run_ids: list[int] = []
+        cur.executemany(_RUN_SQL, [_run_params(o) for o in outcomes],
+                        returning=True)
+        while True:
+            run_ids.append(cur.fetchone()[0])
+            if not cur.nextset():
+                break
+        if len(run_ids) != len(outcomes):
+            raise RuntimeError(
+                f"批量落 runs 返回 {len(run_ids)} 个 id,入参 {len(outcomes)} 条 "
+                f"—— 顺序对不上就没法把 run_id 配回 outcome,停手")
+        hits = [p for rid, o in zip(run_ids, outcomes)
+                for p in _hit_params(rid, o)]
         if hits:
-            cur.executemany(_HIT_SQL, [
-                (run_id, h.stage, h.rule_code, h.penalty,
-                 json.dumps(h.detail or {}, ensure_ascii=False, default=str))
-                for h in hits])
+            cur.executemany(_HIT_SQL, hits)
+    return run_ids
+
+
+def persist_run(conn, outcome: AuditOutcome) -> int:
+    """输入:连接 + 判定结果 → 输出:run_id(runs 一行 + hits 逐条)。
+
+    逐行版,现在只在批量落库出错后当兜底用(见 persist_runs)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_RUN_SQL, _run_params(outcome))
+        run_id = cur.fetchone()[0]
+        hits = _hit_params(run_id, outcome)
+        if hits:
+            cur.executemany(_HIT_SQL, hits)
     return run_id
 
 

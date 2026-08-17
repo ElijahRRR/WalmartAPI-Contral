@@ -333,9 +333,16 @@ def run(params: dict) -> str:
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
-    all_records: list[tuple] = []
-    for store_name, kinds in sorted(by_store.items()):
-        store = stores_by_name.get(store_name)
+
+    def _one_store(store_name: str, kinds: dict) -> tuple:
+        """输入:店铺名 + 该店四类意图 → 输出:(店铺名, 该店的行, 该店的记录)。
+
+        **各店各自的局部状态**,主线程再合并 —— 跨店并发之后不能再往共享
+        list 上追加:追加本身在 GIL 下不会坏数据,但摘要的行序会按完成先后
+        乱序交织,同一轮跑两次输出都不一样,没法对拍。
+        """
+        lines_s: list[str] = []
+        records_s: list[tuple] = []
         pending = [it for k in _KIND_ORDER for it in kinds.get(k) or []]
         done: set = set()
 
@@ -346,28 +353,51 @@ def run(params: dict) -> str:
             而它其实每天都在建议、每天都没做成 —— 这正是所有者要「建议」
             与「动作」两列分开的原因。
             """
-            all_records.extend(_record(store_name, it, "", "", today, why, err)
-                               for it in pending
-                               if it.get("disposition_id") not in done)
+            records_s.extend(_record(store_name, it, "", "", today, why, err)
+                             for it in pending
+                             if it.get("disposition_id") not in done)
 
+        store = stores_by_name.get(store_name)
         if store is None:
-            lines.append(f"  {store_name}:凭证缺失,跳过")
+            lines_s.append(f"  {store_name}:凭证缺失,跳过")
             _unexecuted("未执行(凭证缺失)")
-            continue
+            return store_name, lines_s, records_s
         try:    # 单店隔离:单店代理/网络异常不炸整轮(与 cleanup 同款纪律)
             for kind in _KIND_ORDER:
                 if kinds.get(kind):
-                    _submit_kind(store, kind, kinds[kind], today, lines,
-                                 all_records, done)
+                    _submit_kind(store, kind, kinds[kind], today, lines_s,
+                                 records_s, done)
         except _client.StoreDeadError as e:
             logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
-            lines.append(f"  {store_name}:凭证失效跳过")
+            lines_s.append(f"  {store_name}:凭证失效跳过")
             _unexecuted("未执行(凭证失效)", str(e))
         except Exception as e:
             logger.exception("店铺 %s 维护提交异常,跳过继续其它店: %s",
                              store_name, e)
-            lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+            lines_s.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
             _unexecuted("未执行(提交异常)", str(e))
+        return store_name, lines_s, records_s
+
+    # 跨店并发(所有者定稿 2026-08-17:「跨店都应该并发,某个店当时有问题,
+    # 最后补一次,一个店失败又不能说整个工作流都失败」)。安全性:每店有自己
+    # 的固定出口代理,沃尔玛配额按 (store, endpoint) 计,令牌桶也是这个维度
+    # —— 跨店并发不挤同一个桶。**店内四类动作仍然串行**(同店 token 桶互挤),
+    # 那一层在 _submit_kind 里没动。
+    # 单店失败隔离本来就有(上面的 try/except),并发只是让它们同时跑。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    all_records: list[tuple] = []
+    per_store: dict[str, list[str]] = {}
+    todo = sorted(by_store.items())
+    with ThreadPoolExecutor(
+            max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
+        futs = [pool.submit(_one_store, n, k) for n, k in todo]
+        for f in as_completed(futs):
+            name, lines_s, records_s = f.result()
+            per_store[name] = lines_s
+            all_records.extend(records_s)
+    # 按店名排序合并:完成先后是随机的,摘要顺序不能跟着随机
+    for name, _ in todo:
+        lines.extend(per_store.get(name, []))
 
     _write_sheet(all_records, lines)
     lines.append("生效确认在下一轮本工作流开头(等 catalog_sync 重新观测)")

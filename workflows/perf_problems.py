@@ -31,7 +31,7 @@ DANGEROUS = False
 
 logger = logging.getLogger("workflows.perf_problems")
 
-_STORE_WORKERS = 6      # 旧系统 README:店铺级并发不要调高(代理共享/全局风控)
+_STORE_WORKERS = stores_svc.STORE_WORKERS   # 唯一出处在 services/stores
 
 _PROBLEM_INSERT = """
 INSERT INTO ops.perf_problem_orders (

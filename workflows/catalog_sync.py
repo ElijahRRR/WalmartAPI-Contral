@@ -132,7 +132,7 @@ def run(params: dict) -> str:
     store_list = stores_svc.load_stores(names)
     if not store_list:
         return f"店铺凭证未找到:{params.get('store') or '(任一)'}"
-    workers = int(params.get("workers", 24))    # 2026-08-05 生产实测 24 并发无压力
+    workers = int(params.get("workers", stores_svc.STORE_WORKERS))    # 2026-08-05 生产实测 24 并发无压力
     skip_inventory = str(params.get("skip_inventory", "")) in ("1", "true", "yes")
     mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):

@@ -1065,3 +1065,61 @@ def test_retry_summary_only_calls_429_ratelimit():
     src = inspect.getsource(product_audit.run)
     assert 'retries.get("http_429")' in src
     assert "降并发解决不了" in src
+
+
+# ── 批量落库(所有者定稿 2026-08-17:并发 128 + 批量落库)──────────────────
+
+def test_batch_and_single_persist_share_one_param_builder():
+    """runs 有 12 列,单条与批量各拼一份的话,加一列漏改一处 = 静默写错列
+    (元组长度对得上时不报错)。两条路径必须共用 _run_params/_hit_params。"""
+    import inspect
+
+    from services import audit_store as st
+    for fn in (st.persist_run, st.persist_runs):
+        src = inspect.getsource(fn)
+        assert "_run_params" in src, fn.__name__
+    assert "_hit_params" in inspect.getsource(st.persist_run)
+    assert "_hit_params" in inspect.getsource(st.persist_runs)
+
+
+def test_persist_runs_refuses_when_ids_do_not_line_up():
+    """returning 的结果集必须与入参一一对应 —— 配错 = 事件挂到别的 ASIN 上,
+    而且两边都不报错。数目对不上就停手。"""
+    import pytest
+
+    from services import audit_store as st
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, seq, returning=False): self._n = 0
+        def fetchone(self): self._n += 1; return (self._n,)
+        def nextset(self): return False        # 只回 1 个 id,入参却有 3 条
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    import types
+    o = types.SimpleNamespace(
+        asin="B0A", score_final=1, verdict="pass", stage_stopped_at="L2",
+        l1=types.SimpleNamespace(walmart_product_type="Cups",
+                                 pt_confidence=0.9, pt_source="x"),
+        l3=None, l4=None, all_hits=[])
+    with pytest.raises(RuntimeError, match="顺序对不上"):
+        st.persist_runs(_Conn(), [o, o, o])
+
+
+def test_audit_defaults_are_128_and_batched():
+    """默认 128(此前默认 4 而上限 64——不显式传 -p workers= 就只跑 4,
+    "上限 64"看着高其实从没生效过)。"""
+    import inspect
+
+    from workflows import product_audit as pa
+    assert pa._DEFAULT_WORKERS == 128 and pa._MAX_WORKERS >= 128
+    assert 'params.get("workers", _DEFAULT_WORKERS)' in inspect.getsource(pa.run)
+
+    src = inspect.getsource(pa.run)
+    # 批量落库 + 失败退回逐行(已付费的 LLM 结果不能因为同批一行脏就陪葬)
+    assert "persist_runs" in src and "persist_run(" in src
+    # 分段提交前必须先冲刷缓冲,否则"此刻之前判的都已持久"是谎话
+    assert src.index("_flush(force=True)") < src.index("conn.commit()")

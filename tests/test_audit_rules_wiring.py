@@ -1123,3 +1123,68 @@ def test_audit_defaults_are_128_and_batched():
     assert "persist_runs" in src and "persist_run(" in src
     # 分段提交前必须先冲刷缓冲,否则"此刻之前判的都已持久"是谎话
     assert src.index("_flush(force=True)") < src.index("conn.commit()")
+
+
+# ── 并发受 PG 连接数约束(2026-08-17 补护栏)──────────────────────────────────
+
+def test_worker_count_is_capped_by_pg_connection_headroom(monkeypatch):
+    """⚠ 每个 worker 独占一条 PG 连接,默认 128 就是 **129 条**。
+
+    `db.pg_conn` 是一次 `psycopg.connect`(没有池),而连接在整个 `audit_one`
+    期间被握着(含那次几秒的 LLM 调用)—— 所以池子不能小于 worker 数,
+    唯一能做的是按库的实际余量往下钳 worker 数。
+
+    PostgreSQL 的 `max_connections` 缺省是 **100**:缺省配置的机器上建池建到
+    第 ~100 条就 `FATAL: sorry, too many clients already`,整轮审核起不来 ——
+    而且每天到点炸一次。
+
+    钳制**必须说出来**(2026-08-14 那次 workers=32 实跑 16 而输出只字未提)。
+    """
+    from workflows import product_audit as pa
+
+    def _fake(hard, used):
+        class _Cur:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, sql, args=None): self._sql = sql
+            def fetchone(self):
+                return (hard,) if "max_connections" in self._sql else (used,)
+
+        class _Conn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self): return _Cur()
+        return lambda *a, **k: _Conn()
+
+    # 缺省 max_connections=100、已用 10 ⇒ 余量 100-10-20=70,减主线程那条 = 69
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(100, 10))
+    got, note = pa._cap_by_connections(128)
+    assert got == 69
+    assert "钳到" in note and "max_connections=100" in note
+    assert "workers=" in note          # 告诉人真正该调的是 PG 配置,不是 -p workers
+
+    # 库调大了就不钳,也不留噪声
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(500, 10))
+    assert pa._cap_by_connections(128) == (128, "")
+
+    # 余量被吃光也至少留 1(护栏不该把并发钳成 0)
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(100, 95))
+    got, note = pa._cap_by_connections(128)
+    assert got == 1 and note
+
+    # ⚠ 查不到余量时**不猜不钳**:护栏本身不许成为新的故障点,但要说一句
+    def _boom(*a, **k):
+        raise RuntimeError("PG 连不上")
+    monkeypatch.setattr(pa.db, "pg_conn", _boom)
+    got, note = pa._cap_by_connections(128)
+    assert got == 128 and "未能查到" in note
+
+
+def test_the_clamp_note_reaches_the_summary():
+    """只写日志的话表现是"并发调了没效果" —— 摘要里必须有。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "workers, conn_note = _cap_by_connections(workers)" in src
+    assert "lines.append(conn_note)" in src
+    # 钳制必须在建连接池**之前**发生(钳完才建,不然先炸了)
+    assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")

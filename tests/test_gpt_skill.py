@@ -107,3 +107,33 @@ def test_export_dry_run_writes_nothing(tmp_path):
         encoding="utf-8") == gpt_skill.skill_md()
     assert "无需改动" in skill_export.run({"execute": True,
                                            "dest": str(tmp_path)})
+
+def test_step_table_comes_from_the_workflow_docstrings():
+    """每一步"干什么"取各 workflow 的 docstring 第一行,**不另写一份说明**。
+
+    另写一份的话两份迟早对不上,而**没有任何东西会报错** —— 这份技能包是给
+    智能体看的提示词,对不上的表现是它照着过时的描述去判断该不该重跑。
+    """
+    from workflows import risk_sync
+    rows = gpt_skill.steps_table(
+        {"workflows": ["risk_sync", "blacklist_push"]})
+    head = risk_sync.__doc__.strip().split("\n")[0]
+    # 名字前缀被剥掉,正文一字不改地进表
+    assert "risk_sync —" not in rows[2]
+    assert head.split("— ", 1)[1] in rows[2]
+    assert rows[0].startswith("| 步 | 工作流")
+
+
+def test_step_table_never_invents_a_description():
+    """取不到 docstring 时留"见代码"而不是编一句 —— 编的那句会被当成事实。"""
+    rows = gpt_skill.steps_table({"workflows": ["根本不存在的工作流"]})
+    assert "(见代码 docstring)" in rows[2]
+
+
+def test_multi_step_prompt_states_the_order_is_binding():
+    """多步链要明写"前一步不成功就不跑后面的" —— 智能体不知道 cli 的串联语义,
+    看不到这句会以为某一步失败了可以单独重跑那一步。"""
+    multi = next(j for j in gpt_skill.jobs() if len(j["workflows"]) > 1)
+    single = next(j for j in gpt_skill.jobs() if len(j["workflows"]) == 1)
+    assert "顺序是硬约束" in gpt_skill.task_prompt(multi)
+    assert "顺序是硬约束" not in gpt_skill.task_prompt(single)

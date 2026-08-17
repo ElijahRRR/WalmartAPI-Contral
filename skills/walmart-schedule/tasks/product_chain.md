@@ -8,6 +8,20 @@
 
 这条链跑的是:catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup。
 
+## 这条链在做什么
+
+| 步 | 工作流 | 这一步干什么 |
+|---|---|---|
+| 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
+| 2 | `product_refresh` | 在线产品全量重推采集(维护链的数据新鲜度源头)。 |
+| 3 | `product_ingest` | 采集服务增量 → 产品中心(catalog.products / snapshots)。 |
+| 4 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
+| 5 | `maintenance` | 商品维护执行件(批次四拆分后;危险,缺省即真跑)。 |
+| 6 | `problem_scan` | 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。 |
+| 7 | `problem_product_cleanup` | 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。 |
+
+**顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
+
 备注:整条 ~2 小时;前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)
 
 ## 跑完怎么判

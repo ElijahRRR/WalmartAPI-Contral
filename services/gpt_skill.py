@@ -18,6 +18,8 @@
 `--dry-run`(加了就是每天空转还报成功 —— 这正是缺省即真跑那条定稿要消灭的)。
 """
 
+import importlib
+
 from registry import schedule
 
 RUNNER = "gpt"
@@ -83,6 +85,38 @@ def command(job: dict) -> str:
     return " ".join(parts)
 
 
+def _one_liner(name: str) -> str:
+    """输入:工作流名 → 输出:它 docstring 第一行去掉"名字 — "前缀后的那句话。
+
+    **不另写一份说明**:工程规范早就要求每个 workflow 的 docstring 第一行写清
+    它干什么,拿它当唯一出处 ⇒ 改了代码说明自动跟着变。另写一份的话,两份
+    迟早对不上,而**没有任何东西会报错**(这份技能包是给智能体看的提示词,
+    对不上的表现是它照着过时的描述去判断该不该重跑)。
+
+    取不到 docstring 时返回空串,由调用方决定要不要留白 —— 不编。
+    """
+    try:
+        mod = importlib.import_module(f"workflows.{name}")
+    except Exception:                                       # noqa: BLE001
+        return ""
+    head = ((mod.__doc__ or "").strip().split("\n") or [""])[0].strip()
+    # docstring 第一行的形态是 "name — 做什么(附注)。",剥掉名字前缀
+    for sep in ("—", "--", "-"):
+        pre = f"{name} {sep} "
+        if head.startswith(pre):
+            head = head[len(pre):]
+            break
+    return head.strip()
+
+
+def steps_table(job: dict) -> list[str]:
+    """输入:一条调度 → 输出:这条链每一步干什么的表格行(取各 workflow 的 docstring)。"""
+    rows = ["| 步 | 工作流 | 这一步干什么 |", "|---|---|---|"]
+    for i, name in enumerate(job["workflows"], 1):
+        rows.append(f"| {i} | `{name}` | {_one_liner(name) or '(见代码 docstring)'} |")
+    return rows
+
+
 def task_prompt(job: dict) -> str:
     """输入:一条调度 → 输出:粘进智能体「定时任务」提示词的那段话。
 
@@ -100,7 +134,14 @@ def task_prompt(job: dict) -> str:
         "```",
         "",
         f"这条链跑的是:{workflows}。",
+        "",
+        "## 这条链在做什么",
+        "",
+        *steps_table(job),
     ]
+    if len(job["workflows"]) > 1:
+        lines += ["", "**顺序是硬约束**:前一步不成功就不跑后面的,"
+                      "整条链只发一条飞书通知。"]
     if job["note"]:
         lines += ["", f"备注:{job['note']}"]
     lines += [

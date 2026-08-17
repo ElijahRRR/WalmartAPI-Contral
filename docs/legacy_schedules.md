@@ -2,10 +2,21 @@
 
 > plan.md 回滚预案要求"删除旧调度前先归档"——本文件即归档底稿。
 > ⚠ 这是**仓库静态普查**结果;正式停旧前必须在生产 Mac 取证核对:
-> `launchctl list | grep -iE 'autolisting|walmart|erp'` + 导出 hermes(AI skill
-> 平台)注册表,以实际 loaded 状态为准。backlog:131 判"新旧并跑可能正在发生"。
+> `launchctl list | grep -iE 'autolisting|walmart|erp'` + 导出 **GPT / Codex
+> 侧的定时任务列表**,以实际生效状态为准。backlog:131 判"新旧并跑可能正在发生"。
+>
+> ⚠⚠ **A 表那 14 条注册在 GPT / Codex,不在 hermes**(所有者纠正 2026-08-17;
+> 旧仓 README 写的"与 2026-06-17 hermes 现状对齐"已过时,`schedule_plan.md` §17
+> 早已记下这条,但本文件当时没跟着改 —— 照旧文去 hermes 找会一条都找不到,
+> 然后误以为"旧调度已经没了"就去起新的,那正是新旧并跑的起手式)。
+>
+> ⚠⚠ **新系统的七条 gpt 任务也注册在同一个平台**(`registry/schedule.JOBS`
+> 里 `runner="gpt"` 的那些,由 `cli.py skill_export` 渲染成 `skills/`)。
+> 也就是说停旧与起新**在同一个任务列表里操作** —— 好处是一眼能看到有没有
+> 重叠,风险是"新的加上了、旧的忘了关"会立刻变成同域双跑。纪律:
+> **一个业务域 = 一次操作里关掉旧的那条、打开新的那条**,不许分两天做。
 
-## A. AI Skill 调度链(14 条,注册在外部 hermes 平台;权威表 = 旧仓 定时任务skill/README.md:52-71)
+## A. AI Skill 调度链(14 条,注册在 **GPT / Codex** 的定时任务里;权威表 = 旧仓 定时任务skill/README.md:52-71)
 
 | 时间 | skill | 跑什么 | 新系统对应 | 停旧动作 |
 |---|---|---|---|---|
@@ -48,7 +59,8 @@
 
 ## D. 停旧顺序(上架域切换那天)
 
-1. 生产 Mac 取证:`launchctl list` + hermes 注册表 → 与本文件对账,补漏;
+1. 生产 Mac 取证:`launchctl list` + **GPT / Codex 的定时任务列表** → 与本文件
+   对账,补漏(⚠ 不是 hermes,见文首纠正);
 2. 停 A 表 07:30 + B 表上架 5 条 + erp_worker×20 + A 表 14:02/每时:05(dedup 链);
 3. 收干净旧在途:旧 pending_feeds 全部 reconcile 到终态;
 4. 起新调度(顺序:upc_sync/catalog_sync → product_refresh → product_ingest →

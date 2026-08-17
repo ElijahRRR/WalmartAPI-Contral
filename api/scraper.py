@@ -276,6 +276,44 @@ def fetch_screenshot(batch_name: str, asin: str) -> bytes:
     raise RuntimeError(f"取截图失败 HTTP {resp.status_code}: {resp.text[:200]}")
 
 
+def prioritize(batch_id) -> bool:
+    """输入:batch_id(**不是批次名**)→ 输出:插队成功与否(不抛异常)。
+
+    `POST /api/batches/{batch_id}/prioritize` —— 把该批次**还没开始的**任务
+    提到 `priority=10`。采集侧 worker 每次只拉 `MAX(priority)` 的 pending 任务、
+    默认 0,所以提到 10 就是排到所有常规任务之前。
+    逐字沿用旧仓语义(`scraper_client.aprioritize`,旧仓 `V3客户端.提交批次`
+    在每次提交后调它)。
+
+    **best-effort:失败返回 False,绝不抛**。插不了队只是慢,而把已经提交成功
+    的批次因为"插队请求失败"判成失败,会让调用方去重推 —— 那才是真损失
+    (撞名 409 → 换名重建 → 同一批 ASIN 采两遍)。所以这里连重试都不做:
+    这一轮插不进去,下一轮的批次自己会插。
+
+    ⚠ 只对 **pending** 生效:已经被 worker 领走的任务改不了优先级,
+    所以"提交后立刻调"才有意义,隔几分钟再调等于只对剩下的尾巴生效。
+    """
+    if not batch_id:
+        return False
+    try:
+        # ⚠ `base_url()` / `_headers()` 也要在 try 里:它们在配置缺失时抛
+        # LookupError,漏在外面就等于"承诺不抛却抛了"。2026-08-17 用例当场
+        # 抓到:那个异常一路冒到 order_audit 的泛化 except,把**已经推成功**
+        # 的批次记成 failed —— 正是"做成了报失败"那个形状
+        url = f"{base_url()}/api/batches/{batch_id}/prioritize"
+        resp = httpx.post(url, headers=_headers(),
+                          timeout=httpx.Timeout(30, connect=10))
+    except (httpx.HTTPError, LookupError, ValueError) as e:
+        logger.warning("批次 %s 插队请求失败(不影响已提交的采集):%s",
+                       batch_id, e)
+        return False
+    if resp.status_code != 200:
+        logger.warning("批次 %s 插队被拒 HTTP %s(不影响已提交的采集):%s",
+                       batch_id, resp.status_code, resp.text[:200])
+        return False
+    return True
+
+
 def batch_status(batch_name: str) -> dict:
     """输入:批次名 → 输出:{status, stats:{total,done,failed,...}}。
 

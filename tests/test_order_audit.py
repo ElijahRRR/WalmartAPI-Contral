@@ -1732,3 +1732,16 @@ def test_stock_block_is_the_single_source_for_both_chains():
         assert rules.stock_block(status, state)[0] == code
         assert mi.classify(stock_status=status, stock_state=state)[1] == code
     assert rules.stock_block("In Stock", "in_stock") is None
+
+def test_prioritize_failure_never_turns_a_successful_push_into_failed(monkeypatch):
+    """⚠ 插队是 best-effort:它失败了绝不能把**已经推成功**的批次记成 failed。
+
+    2026-08-17 实证:`api.scraper.prioritize` 首版把 `base_url()` 漏在 try 外面,
+    配置缺失时抛 LookupError,一路冒到 _push_scrape 的泛化 except ⇒ 批次记
+    failed、摘要报推送失败,而采集侧其实已经建好批次在跑了。那之后本侧会换名
+    重推 ⇒ 同一批 ASIN 采两遍。
+    """
+    from api import scraper as sc
+    monkeypatch.delenv("SCRAPER_BASE_URL", raising=False)
+    assert sc.prioritize(12345) is False        # 不抛,只返回 False
+    assert sc.prioritize(None) is False         # 没有 batch_id 也不抛

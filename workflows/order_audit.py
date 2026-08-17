@@ -638,6 +638,11 @@ def _push_scrape(conn, want: list, blocked: dict) -> tuple[str, list]:
         zips = len({z for _, z in wave})
         try:
             res = scraper.submit_json(name, wave, needs_screenshot=True)
+            # 插队(所有者定稿 2026-08-17,旧仓 `V3客户端.提交批次` 同款位置):
+            # 本链**阻塞等采集**(默认 wait=1,最长 20 分钟),排在常规批次
+            # 后面就是白等到超时,然后拿不到快照的单子全落"待采集"。
+            # 只对 pending 生效 ⇒ 必须**紧跟提交**,别挪到轮询那段
+            batches.prioritize(name, res.get("batch_id"))
             batches.record(name, res.get("batch_id"), len(wave), "pushed",
                            f"inserted={res.get('inserted')}")
             pushed += len(wave)
@@ -656,7 +661,9 @@ def _push_scrape(conn, want: list, blocked: dict) -> tuple[str, list]:
                         res.get("batch_id"), res.get("inserted"))
         except scraper.BatchExistsError as e:
             # 撞名 = 上次其实推成功了(v4 绝不静默合并):台账保持 pending,
-            # 顺手把既有 batch_id 记下来,不然这批的失败明细就查不了
+            # 顺手把既有 batch_id 记下来,不然这批的失败明细就查不了。
+            # **插队照做**:沿用的这批还在 pending,而本链正要阻塞等它
+            batches.prioritize(name, e.batch_id)
             batches.record(name, e.batch_id, len(wave), "pushed",
                            "撞名沿用既有批次")
             pushed += len(wave)

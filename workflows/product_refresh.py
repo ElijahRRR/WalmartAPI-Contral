@@ -134,6 +134,15 @@ def run(params: dict) -> str:
                 else f"{BATCH_PREFIX}{stamp}-{i:02d}")
         try:
             res = scraper.submit_batch(name, chunk)
+            # 插队(所有者定稿 2026-08-17):本链是产品线那条串联的第 2 步,
+            # `wait=1` 时后面六步全在等它;排在常规批次后面 = 整条链干等。
+            # ⚠ 与 order_audit 共用同一条高优先级车道(采集侧只有 0 与 10
+            # 两档,`prioritize` 端点写死 10)。本链一次推十几万个任务,
+            # 车道里塞满之后 order_audit 那几百个小批次要排在后面 ——
+            # 表现是它的 20 分钟 wait 超时、单子落"待采集"。真撞上了别把
+            # 本链的插队去掉(那样整条产品链更慢),要么把 product_chain 挪开
+            # 订单链的 :20,要么请采集侧把优先级做成可传值(本侧留好了参数位)
+            batches.prioritize(name, res.get("batch_id"))
             # 200 恒等于新建批次:拿到 batch_id 才算"确认推上去了",此刻起计时
             batches.record(name, res.get("batch_id"), len(chunk), "pushed",
                            f"inserted={res.get('inserted')}")
@@ -142,7 +151,10 @@ def run(params: dict) -> str:
             lines.append(f"  {name}:推送 {len(chunk)} 个"
                          f"(inserted={res.get('inserted')})")
         except scraper.BatchExistsError as e:
-            # 撞名 = 上一次其实推成功了(v4 绝不静默合并):接着用既有批次
+            # 撞名 = 上一次其实推成功了(v4 绝不静默合并):接着用既有批次。
+            # **插队照做**:沿用的这批任务还在 pending,上一次多半正是因为
+            # 插队之前就断了才撞名
+            batches.prioritize(name, e.batch_id)
             batches.record(name, e.batch_id, len(chunk), "pushed",
                            "撞名沿用既有批次")
             pushed += len(chunk)

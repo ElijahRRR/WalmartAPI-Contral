@@ -54,6 +54,7 @@ upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)�
 """
 
 import collections
+import contextlib
 import logging
 from datetime import datetime
 
@@ -333,7 +334,7 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
             logger.warning("%s 查同族在架信息失败(按本店无同族处理): %s",
                            r["asin"], e)
     props = (spec or {}).get("properties") or {}
-    enum = mp_conform._enum_of(props.get("variantAttributeNames") or {})
+    enum = mp_conform.variant_attr_enum(props)
     return variant_group.plan(
         r["asin"], p.get("variant_attributes"), p.get("variation_asins"),
         p.get("parent_asin"), enum,
@@ -346,14 +347,23 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
     连接**按需惰性打开**:只有真需要查"本店同族在架成员"的行才要连接
     (`_variant_plan` 在家族只有自己时压根不查)。一行都不需要就一次连接也不开
     —— 闸门段本来不持有连接,为了变体硬开一个会让"没有同族"的场景也依赖库。
+
+    ⚠ **惰性开连接必须用 ExitStack,不能 `db.pg_conn().__enter__()`**
+    (2026-08-17 事故):`registry.db.pg_conn` 是 `@contextmanager`,
+    `db.pg_conn()` 造出来的临时 CM 对象在那一行之后**立刻被回收**,生成器被
+    `close()`,`finally: conn.close()` 当场执行 —— 拿到手的连接已经是关闭的
+    (实测 `conn.closed is True`)。后果:`_variant_plan` 里那条 SELECT 每行抛
+    "connection is closed",被它自己的 except 吞成一行 warning,于是
+    **所有者定稿③「同族已在架成员 ⇒ 新成员沿用它的 variantGroupId」与
+    `family_has_primary` 在生产里从未真正生效过**,全程不报错。
     """
-    conn = None
-    try:
+    with contextlib.ExitStack() as stack:
+        conn = None
         for r in ready:
             fam = variant_group.parse_family(
                 (r.get("_p") or {}).get("variation_asins"), r["asin"])
             if conn is None and r.get("store") and len(fam) > 1:
-                conn = db.pg_conn().__enter__()
+                conn = stack.enter_context(db.pg_conn())
             try:
                 r["_vplan"] = _variant_plan(
                     conn, r["store"], r, pt_spec.load_pt(r["product_type"]))
@@ -361,12 +371,6 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
                 # 变体是锦上添花,算不出不许拖垮整行(同 _variant_plan 内的纪律)
                 logger.warning("%s 变体决策失败(按单品处理): %s", r["asin"], e)
                 r["_vplan"] = None
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:                                   # noqa: BLE001
-                pass
     _drop_degenerate_dims(ready)
     _remap_unmapped_dims(ready)
     _dedupe_primary(ready)
@@ -460,21 +464,26 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
     groups: dict[tuple, list[dict]] = {}
     for r in ready:
         vp = r.get("_vplan")
-        if vp and vp.get("mode") == "variant" and vp.get("unmapped_dims"):
+        # ⚠ **`no_dim` 那批也要进来**(2026-08-17 修):`code='no_dim'` 是
+        # "一个维度都没映上"⇒ `mode='single'`。而错位重映射存在的**唯一理由**
+        # 正是这一类(旧仓原始案例:Art Sets 的 color_name=48 Color 其实是件数,
+        # 该映 pieceCount)。首版只收 `mode=='variant'` 的组,等于刚补迁的
+        # variant_remap 对它自己的主场景一次都不会被调用。
+        if not vp or not vp.get("unmapped_dims"):
+            continue
+        if vp.get("mode") == "variant" or vp.get("code") == "no_dim":
             groups.setdefault((r.get("store"), vp.get("group_id")),
                               []).append(r)
     if not groups:
         return
-    conn = None
-    try:
+    with contextlib.ExitStack() as stack:
+        conn = None
         for (store, gid), rows in sorted(groups.items(),
                                          key=lambda kv: (str(kv[0][0]),
                                                          str(kv[0][1]))):
             pt = rows[0].get("product_type") or ""
             spec = pt_spec.load_pt(pt) or {}
-            enum = mp_conform._enum_of(
-                (spec.get("properties") or {}).get("variantAttributeNames")
-                or {})
+            enum = mp_conform.variant_attr_enum(spec.get("properties") or {})
             if not enum:
                 continue
             used = {n for n, _ in (rows[0]["_vplan"].get("attr_pairs") or ())}
@@ -489,11 +498,15 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
                     logger.info("变体组 %s 的 %s 取值全同,不送重映射", gid, dim)
                     continue
                 # 先试内置表(零成本、确定性),表不中且本轮看得见 ≥2 个成员
-                # 才开连接问 LLM —— 连接**在表命中时一次都不开**
+                # 才开连接问 LLM —— 连接**在表命中时一次都不开**。
+                # ⚠ 用 ExitStack,不能 `db.pg_conn().__enter__()`:那样拿到的
+                # 连接立刻就被 contextmanager 的 finally 关掉了(见 _plan_variants
+                # 头注的事故说明),而这里的异常**没有 except 兜着**,会一路
+                # 冒到 run() 让整条 list_new 失败(dry-run 也一样)
                 got = variant_remap.hardcoded(pt, dim, values, enum)
                 if not got and len(rows) > 1:
                     if conn is None:
-                        conn = db.pg_conn().__enter__()
+                        conn = stack.enter_context(db.pg_conn())
                     got = variant_remap.llm_remap(conn, pt, dim, values, enum)
                 if not got:
                     continue
@@ -516,12 +529,15 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
                             set(vp.get("remapped_dims") or ())
                             | {f"{dim}→{name}"}),
                     }
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:                                   # noqa: BLE001
-                pass
+        # 重映成功把 `no_dim` 救回来的,升回变体口径(否则决策说"有维度"、
+        # 载荷层却按单品发,两边打架)。`is_primary` 在这里补:no_dim 时它恒 False
+        for rows in groups.values():
+            for r in rows:
+                vp = r["_vplan"]
+                if vp.get("code") == "no_dim" and vp.get("attr_pairs"):
+                    r["_vplan"] = {**vp, "mode": "variant", "code": "variant",
+                                   "reason": "",
+                                   "is_primary": not vp.get("family_has_primary")}
 
 
 def _differentiate_titles(prepped: list[dict]) -> int:

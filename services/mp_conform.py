@@ -118,6 +118,22 @@ def _enum_of(prop: dict):
     return prop.get("enum")
 
 
+def variant_attr_enum(props: dict):
+    """输入:PT 的 properties → 输出:`variantAttributeNames` 的枚举(读不到给 [])。
+
+    ⚠ **不看 `type` 声明,直接找 `items.enum`**(2026-08-17 审查加固):
+    `_type_of` 在 spec 没写 type 时默认 `"string"`,于是 `_enum_of` 不去翻
+    `items`,这个 PT 的变体枚举就成了空 —— 而空枚举的下游行为是"整批静默退单品"
+    (`pick_walmart_dims` 返回 []),看起来跟"这个类目不支持变体"一模一样,
+    无从分辨。旧仓 `pt_spec.get_variant_attribute_enum` 是**无条件**读
+    `items.enum` 的(`auto_listing/pt_spec.py:150-152`),这里对齐它。
+    变体枚举只有这一个消费方,所以单开一个读法,不动通用的 `_enum_of`。
+    """
+    prop = (props or {}).get("variantAttributeNames") or {}
+    items = prop.get("items") or {}
+    return items.get("enum") or prop.get("enum") or []
+
+
 def _is_url_field(name: str, prop: dict) -> bool:
     fmt = (prop.get("items") or {}).get("format") or ""
     return fmt in ("uri", "url") or "url" in name.lower()
@@ -471,34 +487,53 @@ def fix_invalid_enums(spec: dict, visible: dict) -> tuple[dict, list[str]]:
 
 _VARIANT_BAG = ("variantGroupId", "variantAttributeNames", "isPrimaryVariant")
 
+# "48 Color" / "24 Pack" / "6 Pcs" / "3 sets" / "5x" / "8" —— 与
+# services.variant_remap._NUMERIC_RE 同一套口径(两处各覆盖一条路径:
+# 那边是内置错位表,这里是载荷层最后的类型转换)
+_NUM_WITH_UNIT_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(?:Color|Colors|Pack|Packs|Pcs?|Pieces?|Count|"
+    r"Cnt|Ct|set|sets|x)?\s*$", re.IGNORECASE)
+
 
 def _coerce_variant_value(prop: dict, val):
     """输入:该属性的 schema + 原始取值 → 输出:合规值;不合规返回 None。
 
-    逐字对齐旧仓 `mapper.inject_variant_fields` 的 Feature A
+    对齐旧仓 `mapper.inject_variant_fields` 的 Feature A
     (`auto_listing/mapper.py:1391-1424`):string 走 enum 校验、integer/number
     走类型转换,任何一项不过**只剔这一个属性**,不牵连整组。
+
+    ⚠ **没有 catch-all**(2026-08-17 审查修掉的漏洞):首版最后一行是
+    `return val`,于是 spec 标 array / boolean 的变体属性原样出去
+    (实测 `{'type':'array'}` + `'Bamboo'` → `'Bamboo'`,既没包成数组也没查枚举)。
+    `ensure_variant_bag` 是 `conform` 流水线里**最后一个**能改 visible 的类型闸
+    (晚于 fix_type_mismatches / fix_invalid_enums),漏过去就直接发出去被拒。
+    认不出的类型一律 None —— 剔一个属性远好过整条被沃尔玛拒。
+
+    数字型顺带**抽数**:亚马逊的取值常带量词(`48 Color` / `24 Pack` / `6 Pcs`),
+    直接 int() 必失败。抽数口径与 `variant_remap._NUMERIC_RE` 同源
+    (那边只覆盖内置表那条路,LLM 重映射回来的原始串走的是这里)。
     """
     if isinstance(val, str):
         val = val.strip()
     if val in _EMPTY:
         return None
     kind = _type_of(prop)
-    if kind == "integer":
+    if kind in ("integer", "number"):
+        num = _NUM_WITH_UNIT_RE.match(str(val).strip())
+        raw = num.group(1) if num else str(val).strip()
         try:
-            return int(str(val).strip())
-        except (TypeError, ValueError):
-            return None
-    if kind == "number":
-        try:
-            return float(str(val).strip())
+            return int(raw) if kind == "integer" else float(raw)
         except (TypeError, ValueError):
             return None
     if kind == "string":
         enum = _enum_of(prop)
         s = str(val)
         return s if (not enum or s in {str(e) for e in enum}) else None
-    return val          # spec 没写类型:原样(与旧仓兜底同)
+    if kind == "array":
+        # 变体属性的取值是标量,array 型要包一层;元素仍要过 items 的枚举/类型
+        inner = _coerce_variant_value(prop.get("items") or {}, val)
+        return None if inner is None else [inner]
+    return None         # boolean 及一切认不出的类型:不猜,剔掉这个属性
 
 
 def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
@@ -521,7 +556,7 @@ def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
     剔到一个不剩才整套退单品 —— 只发 variantAttributeNames 而没有对应的差异值,
     等于告诉沃尔玛"我们按颜色分组"却不说自己是什么颜色。
     """
-    enum = _enum_of(props.get("variantAttributeNames", {}))
+    enum = variant_attr_enum(props)
     allowed = {str(e) for e in enum} if enum else None
     kept: list[tuple[str, object]] = []
     dropped: list[str] = []
@@ -538,9 +573,15 @@ def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
             continue
         kept.append((name, val))
     if not kept:
+        # ⚠ **只 pop 掉三件套就 return 是不够的**(2026-08-17 审查修):spec 把
+        # 三件套列为必填的 PT,pop 完就直接 return 会让 validate 每轮都报
+        # "visible.variantGroupId/variantAttributeNames/isPrimaryVariant 缺失"
+        # ⇒ 这一行**永远上不了架**,而 note 却写着"退单品"。真正的"退单品"是
+        # 回到下面那条单品口径:非必填整套剔除、必填用 SKU 占位补全。
+        # 返回 None 让调用方接着走那条路(不在这里重复实现)。
         for k in in_spec:
             visible.pop(k, None)
-        return visible, [f"变体属性全被剔除({';'.join(dropped)}),整套剔除退单品"]
+        return None, [f"变体属性全被剔除({';'.join(dropped)}),退单品口径"]
     notes = []
     if "variantGroupId" in props:
         visible["variantGroupId"] = str(plan["group_id"])[:300]
@@ -591,8 +632,16 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
     in_spec = [k for k in _VARIANT_BAG if k in props]
     if not in_spec:
         return visible, []
+    notes0: list[str] = []
     if plan and plan.get("mode") == "variant":
-        return _apply_variant_plan(props, in_spec, dict(visible), plan)
+        got, notes0 = _apply_variant_plan(props, in_spec, dict(visible), plan)
+        if got is not None:
+            return got, notes0
+        # 变体属性一个都没留住 → **接着走下面的单品口径**(必填时 SKU 占位补全)。
+        # 直接 return 会让"spec 把三件套列必填"的 PT 每轮都判必填缺失,永不上架
+        visible = dict(visible)
+        for k in in_spec:
+            visible.pop(k, None)
     required = _required(spec) & set(in_spec)
     present = [k for k in in_spec if visible.get(k) not in _EMPTY]
     if not required:
@@ -604,9 +653,9 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
             visible = dict(visible)
             for k in present:
                 visible.pop(k, None)
-            return visible, [f"变体字段不完整({','.join(present)}),"
-                             f"单品口径整套剔除"]
-        return visible, []
+            return visible, notes0 + [f"变体字段不完整({','.join(present)}),"
+                                      f"单品口径整套剔除"]
+        return visible, notes0
     # spec 把三件套列为必填 → 必须补全(第 4 轮实证 PT:沃尔玛报错原文
     # "If you only have 1 item in a variant group, select 'Yes' in Is
     # Primary Variant";组 ID 用 SKU 占位)
@@ -616,7 +665,7 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
             # 没有 SKU 就凑不出稳定的组 ID:整套拆掉比给半套安全
             for k in in_spec:
                 visible.pop(k, None)
-            return visible, ["变体三件套缺组 ID,整套移除(给一半会被拒)"]
+            return visible, notes0 + ["变体三件套缺组 ID,整套移除(给一半会被拒)"]
         visible["variantGroupId"] = str(sku)[:300]
         notes.append(f"variantGroupId={sku}(单品占位)")
     if "variantAttributeNames" in props and \
@@ -632,7 +681,7 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
         enum = _enum_of(props["isPrimaryVariant"]) or ["Yes", "No"]
         visible["isPrimaryVariant"] = "Yes" if "Yes" in enum else enum[0]
         notes.append("isPrimaryVariant=Yes(单品即主变体)")
-    return visible, notes
+    return visible, notes0 + notes
 
 
 def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict

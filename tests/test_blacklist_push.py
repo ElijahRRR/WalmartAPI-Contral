@@ -300,3 +300,29 @@ def test_block_size_stays_within_feishu_limit():
     水位块会被 api 层拆成多个请求,"每块成功即打水位"的粒度就虚了。"""
     from api.feishu import _SHEET_WRITE_BLOCK_ROWS
     assert wf._BLOCK <= _SHEET_WRITE_BLOCK_ROWS == 4000
+
+
+def test_next_empty_scans_in_big_blocks(wired, monkeypatch):
+    """找空行是 O(表已填行数) 的 GET,块太小会把整轮拖成分钟级。
+
+    所有者 2026-08-17 实见日志里全是
+    `GET .../values/mPwUBu!A9202:A9401`(200 行一段),还以为"一次只写 200 行"
+    —— 那不是写,是这里在逐段**读**。ASIN 表已填 5.7 万行 ⇒ 285 个 GET、
+    每个约 0.3 秒 ≈ 一分半;而真正的写只有 3 个请求(4000 行/块)。
+    """
+    calls, cells = wired
+    cells["asin"] = ["A%d" % i for i in range(12000)]      # 已填 12000 行
+    ranges = []
+    real = wf.feishu.sheet_values
+
+    def spy(sheet, rng):
+        ranges.append(rng)
+        return real(sheet, rng)
+    monkeypatch.setattr(wf.feishu, "sheet_values", spy)
+    monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 20000)
+
+    row = wf._next_empty(wf.resources.ASIN_BLACKLIST_SHEET)
+    assert row == 12002                                    # 表头 + 12000 行
+    # 200 行一段要 60 个请求;5000 一段只要 3 个
+    assert len(ranges) <= 4, f"扫了 {len(ranges)} 个请求,块太小:{ranges[:3]}"
+    assert wf._SCAN_BLOCK >= 5000

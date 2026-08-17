@@ -144,12 +144,24 @@ def _probe() -> str:
     return "黑名单投影探针(只读):" + ";".join(lines)
 
 
+_SCAN_BLOCK = 5000      # 找空行时每个 GET 读多少行(**只读列 A**,一列 5000 个
+                        # 短串约 50KB,离飞书的响应上限很远)。
+                        # 原值 200:ASIN 表已填 5.7 万行 ⇒ 每轮 285 个 GET、
+                        # 每个约 0.3 秒 ≈ 一分半,而真正的写只有 3 个请求
+                        # (4000 行/块)。所有者 2026-08-17 实见"一次就写了
+                        # 200 行"——那不是写,是这里在逐段读。
+                        # ⚠ 这一段是 O(表已填行数):表越长越慢,只是常数小了
+                        # 24 倍。哪天 ASIN 表涨到几十万行,该换成二分探测
+                        # (但那要求"已填行是连续前缀",与现在"找首个空行"的
+                        # 语义不同——中间被手工删出一个洞时两者结果不一样)。
+
+
 def _next_empty(sheet, start: int = 2) -> int:
     """输入:登记条目 + 起扫行 → 输出:列 A 首个空行行号(1 行是表头)。"""
     grid = feishu.sheet_row_count(sheet)
     row = start
     while row <= grid:
-        end = min(row + 199, grid)
+        end = min(row + _SCAN_BLOCK - 1, grid)
         vals = feishu.sheet_values(sheet, f"A{row}:A{end}")
         got = [(str(c[0]).strip() if c and c[0] is not None else "")
                for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]

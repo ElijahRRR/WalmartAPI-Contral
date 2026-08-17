@@ -176,6 +176,18 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
 - 🟡 变体分组(**决策层与载荷层已落地** 2026-08-15,余 list_new 生产验收):`services/variant_group.py` + `mp_conform.ensure_variant_bag(plan=...)` + `list_new._variant_plan`。⚠ **先决条件当初写错了**:不是「采集契约顶层暴露三字段」——数据一直在 `catalog.snapshots.raw`(生产实证 358,743 条有 variant_attributes、262,933 条有 variation_asins),之前判断卡在采集侧是**只翻了 products.slow**。`slow.variant.theme` 确实曾恒空,但那是采集侧导出的 bug(按 ':' 切、实际格式是 '='),已由采集侧 dad8f60 修复;即便修好也**只给维度名不给取值**,分变体要的取值仍只能从 raw 取。跨店重定向与 LLM remap 按原计划砍掉(20 个维度手写映射表);`full_set >= 10` 伪组闸**不抄**——采集侧 twister 版已用真实家族键取代会混进广告 ASIN 的旧正则
 
+  ⚠ **多维家族只按一个维度分组 —— 这条是漏的,不是砍的**(2026-08-17 所有者问
+  「单属性多属性都会自动用对应方法吧」时暴露)。`pick_walmart_dim` 取第一个映得上
+  的维度,color+size 的家族只发 `variantAttributeNames=[color]`,size 不发。
+  后果不是少一个字段:同族里**只差 size 的两个成员**带着同一个 variantGroupId +
+  同一个 color 值发出去,沃尔玛看不出差异。
+  **与其他三条的区别**:跨店重定向/LLM remap/伪组闸都在调研里定过性、在批复里
+  有记录;多维这条**调研没记、批复没有、backlog 没有** —— 是实现时默认按单维写的,
+  没人问过。旧系统是否支持多维,证据在旧仓 `docs/listing_flow_full.md`(不在本仓,
+  本仓 legacy_survey 只记到"变体分组与维度重映射"这一句),**查不了就别猜**。
+  已做的只有可见性:`plan()` 返回 `extra_dims`,list_new 摘要单列
+  「variant(多维只发一个) N」。补不补看那个数,待所有者定。
+
 **P3 — 可选**:live_spec 在线快照过期校验;跟卖逐行 condition(9 种,现只 New);errorReport CSV 下载
 
 **上架验收与收尾待办(2026-08-12 晚定格;代码迁移已收官,以下全是验收/运维/后置)**

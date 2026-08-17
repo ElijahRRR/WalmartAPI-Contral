@@ -55,9 +55,17 @@ def load_stores(filter_names: list[str] | None = None) -> list[dict]:
       1. ClientId 为空或 "0" → 跳过
       2. 无代理(代理类型/IP/端口 任一为空或 "0")→ 跳过(严禁直连,店铺关联风险)
       3. 「启用」字段显式为否 → 跳过(旧 xlsx 无此列,新表新增;缺省视为启用)
+
+    `filter_names` 里**有一个名字落空就抛**,不静默少跑:给三家跑两家、摘要
+    照报「2/2 家连通」满绿,人会以为三家都验过了,而两侧都不报错。名字来源
+    全是人敲的 `-p store=` / `-p stores=`(10 个调用方逐一核过,没有一处是
+    程序从库里算出来的),所以抛错只可能在打错字时触发,不会误伤调度。
     """
+    all_names = None            # 凭证表里的全部店名(未经过滤);快照兜底时无从得知
     try:
         records = feishu.list_records(resources.STORE_CREDENTIALS)
+        f = resources.STORE_CREDENTIALS.fields
+        all_names = {n for n in (_cell(r.get("fields", {}), f.store) for r in records) if n}
         stores = _normalize(records)
         _write_snapshot(stores)
     except Exception as e:
@@ -67,8 +75,36 @@ def load_stores(filter_names: list[str] | None = None) -> list[dict]:
         logger.warning("店铺凭证表读取失败,已回退本地快照(%d 家): %s", len(stores), e)
 
     if filter_names:
-        stores = [s for s in stores if s["name"] in filter_names]
+        wanted = list(dict.fromkeys(filter_names))        # 去重保序
+        by_name = {s["name"]: s for s in stores}
+        missing = [n for n in wanted if n not in by_name]
+        if missing:
+            raise ValueError(_missing_msg(missing, by_name, all_names))
+        stores = [by_name[n] for n in wanted]
     return stores
+
+
+def _missing_msg(missing: list[str], by_name: dict, all_names: set | None) -> str:
+    """输入:落空的店名 → 输出:分得清「不在册」与「在册但被过滤」的报错文案。
+
+    两者必须分开说:把「在册但没配代理」报成「查无此店」会让人去凭证表找一个
+    明明在那儿的店(alloc_audit 的 docstring 专门警告过这一处混淆)。快照兜底
+    时手上只有过滤后的名单,分不出来就**明说分不出来**,不硬猜。
+    """
+    lines = []
+    for n in missing:
+        if all_names is None:
+            lines.append(f"  ✗ {n}:可用店铺里没有(本次是快照兜底,"
+                         f"分不清是不在册还是未启用/缺代理)")
+        elif n in all_names:
+            lines.append(f"  ✗ {n}:在凭证表里,但被过滤掉了"
+                         f"(「启用」为否 / 缺 ClientId / 缺代理配置三者之一)")
+        else:
+            lines.append(f"  ✗ {n}:凭证表里查无此店(名字要一字不差)")
+    return ("指定的店铺名有 %d 个没落到实处:\n%s\n  可用店铺(%d 家):%s\n"
+            "  ⚠ 不静默跳过:少跑一家而摘要照报成功,比直接失败难发现得多。"
+            % (len(missing), "\n".join(lines), len(by_name),
+               ", ".join(sorted(by_name, key=sort_key)) or "(空)"))
 
 
 def registered_names() -> set[str]:

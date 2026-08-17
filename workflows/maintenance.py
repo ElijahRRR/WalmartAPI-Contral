@@ -247,14 +247,8 @@ def _settle(lines: list[str]) -> None:
 def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
     """维护记录写表 + 裁剪。**写表失败绝不能把"feed 已提交"埋进异常里**。"""
     try:
-        # 找到扫描件写的那半行就地补齐(动作/旧值/新值/feedid);找不到才追加
-        filled, added = maint_sheet.fill_submitted(all_records)
-        lines.append(
-            f"维护记录补齐 {filled} 行" + (f",新增 {added} 行" if added else "")
-            + ";feed 结果轮询走 feed_poll"
-            + (f"。⚠ 有 {added} 行没找到对应的建议行 —— 扫描件没跑过,"
-               f"或那行已被裁掉(只留 {maint_sheet.RETAIN_DAYS} 天)"
-               if added else ""))
+        written = maint_sheet.append_records(all_records)
+        lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
         # 一天几千行,不裁飞书很快装不下(所有者定稿 2026-08-09:只留 7 天)。
         # 裁的只是展示面板,流水永久在 ops.feed_items
         try:

@@ -1,8 +1,8 @@
-"""list_new — 上架主链(listing L2d,替代旧 auto_listing/main.py;危险,默认 dry-run)。
+"""list_new — 上架主链(listing L2d,替代旧 auto_listing/main.py;危险:缺省即真跑,空跑用 --dry-run)。
 
-用法:
-  python cli.py list_new                     # dry-run:闸门链判定+逐行去向
-  python cli.py list_new --execute           # 真跑(领 UPC/LLM 映射/提交 feed)
+用法(⚠ 缺省即真跑 —— 会真领 UPC、真提交 feed 到沃尔玛):
+  python cli.py list_new --dry-run           # 空跑:闸门链判定+逐行去向,不提交
+  python cli.py list_new                     # 真跑(领 UPC/LLM 映射/提交 feed)
   python cli.py list_new -p store=A085朱丽霖
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
@@ -219,7 +219,7 @@ def _push_scrape(absent: list[str], execute: bool) -> str | None:
     name = f"listing_gap_{day}"
     if not execute:
         return (f"  [DRY-RUN] 缺数据 {len(absent)} 个 ASIN,"
-                f"--execute 时将推采集批次 {name}")
+                f"真跑时将推采集批次 {name}")
     try:
         r = scraper.submit_batch(name, absent)
         return (f"  缺数据 {len(absent)} 个 ASIN 已推采集"

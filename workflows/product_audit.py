@@ -17,8 +17,8 @@
 
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
-L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;--execute 才写
-products.audit_* 五列与审核事件。**`-p from_sheet=1` 时另把结论投影回上架表
+L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
+products.audit_* 五列与审核事件(空跑用 --dry-run)。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 
 ⚠ `from_sheet` **不是强审**:表 E 列为空只说明表里没有结论,库里可能早就有。

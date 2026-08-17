@@ -1,9 +1,9 @@
-"""alloc_backfill — 存量在线商品 → 占用台账(一次性回填)。**危险,默认 dry-run。**
+"""alloc_backfill — 存量在线商品 → 占用台账(一次性回填)。**危险:缺省即真跑,空跑用 `--dry-run`。**
 
 用法:
-  python cli.py alloc_backfill                      # 预览:占多少、冲突怎么判
-  python cli.py alloc_backfill --execute            # 真回填
-  python cli.py alloc_backfill -p include_ties=1 --execute
+  python cli.py alloc_backfill --dry-run             # 预览:占多少、冲突怎么判
+  python cli.py alloc_backfill                      # 真回填
+  python cli.py alloc_backfill -p include_ties=1
         # 连"两边都零销量"的冲突组也一并落(默认跳过等人工)
   python cli.py alloc_backfill -p sales_days=180    # 判定销量的窗口(默认 365)
   python cli.py alloc_backfill -p as_of=2026-08-15  # **与出清单那次传同一个值**
@@ -164,7 +164,7 @@ def run(params: dict) -> str:
                 f"   占用最多的店:{top}\n"
                 f"   幂等:已存在的占用键会跳过(不覆盖已有归属;"
                 f"改归属要先 store_release)\n"
-                f"   确认后加 --execute")
+                f"   确认后去掉 --dry-run 重跑")
 
     with db.pg_conn() as conn:
         ok, conflicts = claims.claim_many(conn, to_claim)

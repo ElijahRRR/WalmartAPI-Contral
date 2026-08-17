@@ -1,8 +1,8 @@
-"""product_clear — 飞书停用/删除表驱动的商品清理(plan #7,替代旧 daily_retire/沃尔玛批量下架;危险,默认 dry-run)。
+"""product_clear — 飞书停用/删除表驱动的商品清理(plan #7,替代旧 daily_retire/沃尔玛批量下架;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py product_clear                 # dry-run:打印将提交什么、将回写什么
-  python cli.py product_clear --execute       # 真跑(提交 feed + 回写表格)
+  python cli.py product_clear --dry-run       # 空跑:打印将提交什么、将回写什么
+  python cli.py product_clear                 # 真跑(提交 feed + 回写表格)
   python cli.py product_clear -p limit=100    # 单店单日上限覆盖(默认 300,限额表接入前)
   python cli.py product_clear -p store=A085朱丽霖
 
@@ -63,7 +63,7 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
         if store is None:
             continue
         if not execute:
-            # dry-run 连台账都不动:feed_items/feed_log 的落定交给 --execute
+            # dry-run 连台账都不动:feed_items/feed_log 的落定交给真跑
             # 或 feed_poll;这里只报告在途数量
             still += len(frows)
             continue

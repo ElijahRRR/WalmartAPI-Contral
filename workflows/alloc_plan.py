@@ -1,12 +1,12 @@
-"""alloc_plan — 产品分配方案(§七)。**危险,默认 dry-run。**
+"""alloc_plan — 产品分配方案(§七)。**危险:缺省即真跑,空跑用 `--dry-run`。**
 
 用法:
-  python cli.py alloc_plan                       # 各店按自己的容量与缺口分满
+  python cli.py alloc_plan --dry-run             # 只出方案表,不落占用
+  python cli.py alloc_plan                       # 各店按自己的容量与缺口分满 + 落占用
   python cli.py alloc_plan -p batch=3000         # 安全阀:总量封顶,等比缩配额
   python cli.py alloc_plan -p as_of=2026-08-16   # 钉住销量窗口右端
-  python cli.py alloc_plan --execute             # 审完方案表才落占用
 
-把候选池打分、组队、切批、发牌,产出**分配方案表**。`--execute` 只做一件事:
+把候选池打分、组队、切批、发牌,产出**分配方案表**。真跑只多做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
 计划层,不受 list_new 日配额闸约束。
 
@@ -540,7 +540,7 @@ def run(params: dict) -> str:
                          f"要看更靠后的,先下架腾出容量让切口下移")
 
     if not execute:
-        L += ["", f"🧪 dry-run:未落任何占用。审完方案表后加 --execute"
+        L += ["", f"🧪 dry-run:未落任何占用。审完方案表后去掉 --dry-run 重跑"
               f"(将落品牌 {sum(1 for c in to_claim if c['kind'] == claims.BRAND):,}"
               f" + 产品 {sum(1 for c in to_claim if c['kind'] == claims.PRODUCT):,} 条)"]
         return "\n".join(L)

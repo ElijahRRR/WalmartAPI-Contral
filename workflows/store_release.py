@@ -1,13 +1,13 @@
-"""store_release — 释放占用(整店 / 点名品牌 / 点名 ASIN)。**危险,默认 dry-run。**
+"""store_release — 释放占用(整店 / 点名品牌 / 点名 ASIN)。**危险:缺省即真跑,空跑用 `--dry-run`。**
 
 用法:
-  python cli.py store_release -p store=A085                 # 预览该店全部占用
-  python cli.py store_release -p store=A085 --execute       # 真释放
-  python cli.py store_release -p brand=vtopmart --execute   # 点名释放一个品牌
-  python cli.py store_release -p asin=B08LHF7VLT --execute  # 点名释放一个产品
-  python cli.py store_release -p from_csv=<路径>/alloc_该释放占用.csv --execute
+  python cli.py store_release -p store=A085 --dry-run       # 预览该店全部占用
+  python cli.py store_release -p store=A085                 # 真释放
+  python cli.py store_release -p brand=vtopmart             # 点名释放一个品牌
+  python cli.py store_release -p asin=B08LHF7VLT            # 点名释放一个产品
+  python cli.py store_release -p from_csv=<路径>/alloc_该释放占用.csv
         # 批量:吃 claim_audit 出的清单,逐条按 (类型, 占用键, **占用店**) 释放
-  python cli.py store_release -p store=A085 -p mark_offline=0 --execute
+  python cli.py store_release -p store=A085 -p mark_offline=0
         # 只放占用、不动在线快照(默认整店释放会同步标缺席,见下)
 
 **这是全系统唯一的释放路径**(docs/allocation_plan.md §六):没有任何代码会
@@ -137,7 +137,7 @@ def run(params: dict) -> str:
             if not rows and not online:
                 lines.append("   本次无任何可释放的行——占用台账里没有它,"
                              "或已经释放过了(released 行不重复释放)")
-            lines.append("   确认后加 --execute")
+            lines.append("   确认后去掉 --dry-run 重跑")
             return "\n".join(lines)
 
         freed = claims.release(conn, reason=reason, store=store, kind=kind, key=key)
@@ -193,7 +193,7 @@ def _run_csv(params: dict, path: str, execute: bool) -> str:
                  "   ⚠ 释放本身可逆(released 行永不删),但释放后这些品牌会被",
                  "     下一轮分配给别的店,**那一步不可逆** —— 先确认这份 csv 是",
                  "     刚跑出来的,不是几天前的。",
-                 "   确认后加 --execute"]))
+                 "   确认后去掉 --dry-run 重跑"]))
         freed = 0
         for kind, key, st in hit:
             freed += len(claims.release(conn, reason=reason, store=st,

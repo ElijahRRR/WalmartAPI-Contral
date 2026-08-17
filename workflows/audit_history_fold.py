@@ -13,7 +13,7 @@ run 平铺(204 万行进账本 = 噪声淹没病历),只投**每 ASIN 的结论�
 口径:
   · 源 = audit.audit_runs 中 created_at 早于本系统 product_audit 首跑
     (ops.runs 取 min(started_at),与 audit_calibrate 同一分界)的历史行
-    ——新系统 runs 在 --execute 时已实时写事件,折叠再收会双记;
+    ——新系统 runs 在真跑时已实时写事件,折叠再收会双记;
   · SHORTCUT 影子行排除(旧系统 reject 粘性产物,非真实判定);
   · pending 不折(过渡态不进病历,与实时链 event_row 同口径);
   · 事件码复用 audit_passed / audit_rejected(登记制),source 区分来源;

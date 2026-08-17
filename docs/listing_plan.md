@@ -296,7 +296,8 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 - [x] SKU_LOCKED → RETIRE_ITEM → 24h 冷却 → 清列重上(listing.retire_cooldown 表)
       ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
       跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
-      工作流默认 dry-run;回执失败标 failed 人工处置不自动重试;需每日调度
+      工作流缺省即真跑(空跑加 `--dry-run`,2026-08-16 口径反转);回执失败标
+      failed 人工处置不自动重试;需每日调度
 - [x] 状态跟踪:旧 sync_status_track 的"反查真实状态"由 catalog_sync 承接;
       "K=Unknown 自愈"已由 listing_sheet.heal_unknown 落地(2026-08-12,
       feed 台账终态双向 + 目录在线双源,挂 feed_poll 反哺器)

@@ -5,6 +5,11 @@
 
 来源(wiki 承载,api/feishu 自动解析节点 token):
   「沃尔玛类目表」(registry.RISK_PT_SHEET,10 列)→ catalog.risk_product_types
+    (upsert,大类目定义用)**以及** audit.walmart_pt_meta(全量重灌,
+    审核 R1 准入闸 / R3 认证闸唯一查的字典)。⚠ 两个消费方一份数据:
+    2026-08-17 之前只同步了前者,后者是批次 A 的死快照,于是飞书增删对审核
+    毫无影响(所有者实遇:「飞书表格里面的已废弃我已经删掉了,但是重新拉
+    以后还是存在」)。pt_meta 必须**全量重灌**才能让"删行"生效,upsert 不行
   「黑名单品牌总表」(registry.BRAND_BAN_SHEET)→ catalog.brand_blacklist
     ——各渠道黑名单品牌由所有者人工归拢的总清单(2026-08-11 换新表,
     旧「禁止品牌收集」退役)。方向只有飞书→PG;程序自产品牌的**反向**
@@ -114,6 +119,15 @@ def run(params: dict) -> str:
             pt_rows = _read_sheet(resources.RISK_PT_SHEET.require())
             n_pt = risk_gate.sync_product_types(conn, pt_rows)
             lines.append(f"类目表:读 {len(pt_rows)} 行,入库 {n_pt}")
+            # 同一份数据的第二个消费方:审核 R1 准入闸 / R3 认证闸只查
+            # audit.walmart_pt_meta。它此前是批次 A 的死快照没人同步,
+            # 于是飞书增删对审核毫无影响(所有者 2026-08-17 实遇:
+            # 「飞书表格里面的已废弃我已经删掉了,但是重新拉以后还是存在」)
+            n_meta, dropped = risk_gate.sync_pt_meta(conn, pt_rows)
+            lines.append(
+                f"  → 审核准入字典 walmart_pt_meta:全量重灌 {n_meta} 行"
+                + (f",**净减 {dropped} 行**(飞书删掉的已废弃 PT 同步生效)"
+                   if dropped else ""))
         except LookupError as e:
             lines.append(f"类目表跳过:{e}")
         try:

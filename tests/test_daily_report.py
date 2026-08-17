@@ -197,3 +197,78 @@ def test_settlement_moved_out_tells_you_where(monkeypatch):
 
     from workflows import settlement_sync as ss
     assert hasattr(ss, "run") and ss.DANGEROUS is False
+
+
+def test_push_never_claims_sent_when_webhook_is_unconfigured(monkeypatch):
+    """⚠ 2026-08-16 所有者实见:日志三处写着未配置,摘要却报"日报已推送"。
+
+    sent=False 时一个字节都没发出去,说"已推送"就是假话。摘要是人眼闸门,
+    不许自我美化 —— 人只看摘要就会以为发了,而飞书里什么都没有。
+    """
+    import contextlib
+
+    from registry import db as _db
+    from workflows import daily_report as dr
+
+    class _Cur:
+        def execute(self, sql, params=None):
+            self._n = 3 if "perf_problem" in sql or "DISTINCT" in sql else 1
+
+        def fetchone(self):
+            return (41, 32, 1987.69)
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(dr.feishu, "notify", lambda text: False)
+    out = dr._phase_push("2026-08-16", True)
+    assert "未发出" in out and "FEISHU_WEBHOOK_URL" in out
+    assert "已推送" not in out          # 一个字都不许出现
+    assert "沃尔玛店铺日报" in out       # 内容仍要打出来,人能手动转发
+
+    monkeypatch.setattr(dr.feishu, "notify", lambda text: True)
+    assert dr._phase_push("2026-08-16", True) == "日报已推送"
+
+
+def test_defaults_are_production_defaults(monkeypatch):
+    """所有者定稿 2026-08-16 走进生产:不带参数 = kpi(含影刀)+ 看板 + 真发日报。
+
+    ⚠ 这三个默认值改的都是同一类风险:调度里漏写一个开关,后果是**那一段每天
+    空转而且报成功** —— 比误跑更难发现(误跑至少有痕迹)。
+    """
+    import inspect
+
+    from workflows import daily_report as dr
+    src = inspect.getsource(dr.run)
+    assert 'params.get("yingdao", "1")' in src          # 影刀默认开
+    assert 'params.get("push", "1")' in src             # 日报默认真发
+    assert 'phase in ("all", "push")' in src            # 默认 all 会走到推送
+    assert dr._yingdao_mode("1") == "full"
+    assert dr._yingdao_mode("0") == ""                  # 要关得显式关
+
+
+def test_cli_default_is_execute_not_dry_run():
+    """所有者定稿 2026-08-16:缺省即真跑,空跑改为显式 --dry-run。
+
+    ⚠ 与旧铁律相反,理由是进了调度之后"缺省 dry-run"只会伤到自己:launchd 里
+    漏写 --execute 的后果是那条链每天空转而且报成功。--execute 保留为兼容别名。
+    """
+    import cli
+    a = cli._parse_args(["problem_product_cleanup"])
+    assert a.dry_run is False                            # 缺省真跑
+    b = cli._parse_args(["problem_product_cleanup", "--dry-run"])
+    assert b.dry_run is True
+    c = cli._parse_args(["problem_product_cleanup", "--execute"])
+    assert c.dry_run is False and c.execute is True      # 兼容别名不报错

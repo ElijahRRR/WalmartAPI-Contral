@@ -18,6 +18,7 @@ bitable 为全新实现,但重试/退避/切块参数照抄旧系统的实测值
 本层不出现任何具体表的字段名。
 """
 
+import json
 import logging
 import re
 import threading
@@ -532,15 +533,53 @@ def _split_rows(rng: str, values: list[list]) -> list[tuple[str, list[list]]]:
     return out
 
 
-def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
-    """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:写入的范围数。
+def _coalesce(updates: list[tuple[str, list[list]]]
+              ) -> list[tuple[str, list[list]]]:
+    """输入:[(A1范围, 值矩阵)] → 输出:相邻同列的合成一段(**保持原序**)。
 
-    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补;
-    **先按行切开过大的范围**,再按 100 范围/批切块 values_batch_update,批间节流。
+    定点回写的调用方几乎都是"一行一个 range"(`C{r}:G{r}`),而整表重写走的是
+    "一段 4000 行"。同一个接口,两条路径差了三个数量级:
+      · 一行一 range → 100 行/请求 + 0.3s 节流 ⇒ 28000 行要 280 个请求、~2 分钟
+      · 合成段     → 4000 行/range、100 range/请求 ⇒ 同样 28000 行 1 个请求
+    这就是所有者 2026-08-16 问的「写飞书的速度怎么各处都不一样,有的 4000
+    有的几十甚至逐行」—— 差别不在接口,在调用方给的形状。**在这里补齐**:
+    调用方照旧一行一个 range,api 层负责把连号的粘起来(分批是 api 层职责)。
+
+    只合并**紧邻的下一行**且列区间完全相同的:不排序、不去重、不跨空行,
+    所以"同一行被写两次"的先后覆盖语义与逐行写时逐字一致。
+    """
+    out: list[tuple[str, list[list]]] = []
+    prev: tuple[str, int, int, str] | None = None   # (首列, 起行, 末行, 末列)
+    for rng, vals in updates:
+        m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.strip().upper())
+        if not m or len(vals) != int(m.group(4)) - int(m.group(2)) + 1:
+            out.append((rng, vals))       # 形状看不懂就原样放过,不猜
+            prev = None
+            continue
+        c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+        if prev and prev[0] == c1 and prev[3] == c2 and prev[2] + 1 == r1:
+            out[-1] = (f"{c1}{prev[1]}:{c2}{r2}", out[-1][1] + vals)
+            prev = (c1, prev[1], r2, c2)
+        else:
+            out.append((f"{c1}{r1}:{c2}{r2}", list(vals)))
+            prev = (c1, r1, r2, c2)
+    return out
+
+
+def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
+    """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:**写入的行数**。
+
+    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补。
+    三步:**连号的先粘成段**(否则一行一个请求位,几万行要跑几分钟)→
+    按行切开过大的段 → 按 100 范围/批 values_batch_update,批间节流。
+
+    ⚠ 返回的是行数不是范围数。粘段之前两者恰好相等(调用方全是一行一 range),
+    所有调用方也都当行数在用(「回填 N 行」);粘段之后必须显式数行,
+    否则那些摘要会一夜之间从「回填 200 行」变成「回填 1 行」。
     """
     s = sheet.require()
     split: list[tuple[str, list[list]]] = []
-    for rng, vals in updates:
+    for rng, vals in _coalesce(updates):
         split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
     n = 0
     for i in range(0, len(split), 100):
@@ -555,7 +594,7 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
             # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
             raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
                                       f"{sum(len(v) for _r, v in chunk)} 行)") from None
-        n += len(chunk)
+        n += sum(len(v) for _r, v in chunk)
         if i + 100 < len(split):
             time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     return n
@@ -623,19 +662,114 @@ def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int
     return len(items)
 
 
-def notify(text: str) -> bool:
-    """输入:通知文本 → 输出:是否真正发出。
+_MOBILE_RE = re.compile(r"^\d{11}$")
+_open_id_cache: dict[str, str] = {}      # 手机号/邮箱 → open_id(进程内)
 
-    通过群机器人 webhook(registry:FEISHU_WEBHOOK_URL)发文本消息;
-    未配置时降级为仅记日志并返回 False。绝不抛异常——通知失败不能拖垮工作流。
+
+def _receive_type(who: str) -> str:
+    """输入:收件人标识 → 输出:飞书 receive_id_type。纯函数,可测。
+
+    前缀判型逐字沿用旧系统(legacy_survey:1818,notify.py:137):
+    `ou_` → open_id、`oc_` → chat_id。另补邮箱与手机号两种人好记的写法。
     """
+    w = str(who or "").strip()
+    if w.startswith("ou_"):
+        return "open_id"
+    if w.startswith("oc_"):
+        return "chat_id"
+    if w.startswith("on_"):
+        return "union_id"
+    if "@" in w:
+        return "email"
+    if _MOBILE_RE.match(w):
+        return "mobile"          # ⚠ 飞书**没有**这一档,要先换 open_id
+    return "user_id"
+
+
+def resolve_open_id(who: str) -> str | None:
+    """输入:手机号或邮箱 → 输出:open_id(查不到返 None)。进程内缓存。
+
+    ⚠ **手机号不能直接当 receive_id** —— 飞书 `im/v1/messages` 的
+    receive_id_type 只有 open_id / user_id / union_id / email / chat_id 五档,
+    没有"手机号"。所以先走通讯录换 ID。
+
+    这一步要应用有 **`contact:user.id:readonly`** 权限。没有权限时飞书返
+    99991672 之类的错,本函数只告警返 None —— 调用方会退到 webhook 或只记日志,
+    不会因为"通知发不出去"把工作流拖垮。
+    """
+    key = str(who or "").strip()
+    if not key:
+        return None
+    if key in _open_id_cache:
+        return _open_id_cache[key]
+    field = "mobiles" if _MOBILE_RE.match(key) else "emails"
+    try:
+        data = _call("POST", "/open-apis/contact/v3/users/batch_get_id",
+                     params={"user_id_type": "open_id"}, json_body={field: [key]})
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("手机号/邮箱换 open_id 失败(应用是否有 "
+                       "contact:user.id:readonly 权限?):%s", e)
+        return None
+    for u in (data.get("user_list") or []):
+        oid = str(u.get("user_id") or u.get("open_id") or "").strip()
+        if oid:
+            _open_id_cache[key] = oid
+            return oid
+    logger.warning("通讯录里查不到 %s 对应的用户(号码是否为飞书账号?)", key)
+    return None
+
+
+def _notify_via_app(text: str) -> bool:
+    """输入:通知文本 → 输出:是否发出。用**应用身份**直接发给人或群。
+
+    旧系统一直是这么发的(legacy_survey:649/1818:`lark-cli im +messages-send
+    --as bot`,收件人 open_id 硬编码在 summary.py:38)——本仓改回同一条路,
+    群机器人 webhook 退为备用。
+    """
+    who = resources.feishu_notify_to()
+    if not who:
+        return False
+    rtype = _receive_type(who)
+    if rtype == "mobile":
+        who = resolve_open_id(who)
+        if not who:
+            return False
+        rtype = "open_id"
+    # ⚠ content 必须是**字符串化的 JSON**,不是嵌套对象 ——
+    # 传对象飞书直接拒(这是这个接口最常见的错法)
+    _call("POST", "/open-apis/im/v1/messages",
+          params={"receive_id_type": rtype},
+          json_body={"receive_id": who, "msg_type": "text",
+                     "content": json.dumps({"text": text}, ensure_ascii=False)},
+          timeout=15)
+    return True
+
+
+def notify(text: str) -> bool:
+    """输入:通知文本 → 输出:是否真正发出。**绝不抛异常**(通知失败不能拖垮工作流)。
+
+    三条路依次退,任何一条成了就返回 True:
+      ① 应用身份直发(FEISHU_NOTIFY_TO,支持 open_id/chat_id/邮箱/手机号)
+      ② 群机器人 webhook(FEISHU_WEBHOOK_URL)
+      ③ 都没配 → 只记日志,返回 False
+
+    留两条而不是一刀切换,是为了切换期不把通知打断:应用权限还没批下来时
+    webhook 照样能发,反过来也一样。
+    """
+    try:
+        if _notify_via_app(text):
+            return True
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("飞书应用通知失败(退到 webhook):%s", e)
+
     url = resources.feishu_webhook_url()
     if not url:
         # ⚠ 只记**首行**。整段抄一遍的话,cli 传进来的是完整摘要,而它此刻
         # 已经打到终端了 —— 再吐一份就是同一屏文字出现两次(2026-08-16 所有者
         # 反馈"所有的命令都是这样子的")。全文进不进日志由 cli 决定,
         # 通知这一层只负责说"没发出去"。
-        logger.info("FEISHU_WEBHOOK_URL 未配置,通知未发出:%s",
+        logger.info("FEISHU_NOTIFY_TO 与 FEISHU_WEBHOOK_URL 均未配置,"
+                    "通知未发出:%s",
                     text.strip().splitlines()[0] if text.strip() else "(空)")
         return False
     try:

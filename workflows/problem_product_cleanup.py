@@ -95,7 +95,9 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         settled = dispositions.settle(conn) if execute else {
             "confirmed": 0, "ineffective": 0}
-        rows = [r for r in dispositions.claim(conn)
+        # ⚠ 限来源:维护链(source='maint')从 2026-08-16 起共用同一张建议表,
+        # 不限就会领到它的 title/price/inventory 行,group_by_store 直接抛
+        rows = [r for r in dispositions.claim(conn, dispositions.PROBLEM_SOURCES)
                 if not only or r["store"] == only]
 
     mode = "" if execute else "🧪 [DRY-RUN] "

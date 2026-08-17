@@ -66,8 +66,31 @@ def alloc_excluded_stores() -> tuple[str, ...]:
 
 
 def feishu_webhook_url() -> str | None:
-    """输入:无 → 输出:运行通知群机器人 webhook URL;未配置返回 None(通知降级为仅日志)。"""
+    """输入:无 → 输出:运行通知群机器人 webhook URL;未配置返回 None。
+
+    ⚠ 这是通知的**第二条路**。首选是用应用身份直接发给人
+    (`feishu_notify_to()`)——旧系统一直是这么做的(legacy_survey:649/1818:
+    `lark-cli im +messages-send --as bot`,收件人 open_id 硬编码在 summary.py:38),
+    而群机器人 webhook 是本仓新引入的第二套身份,至今没配上。
+    """
     return os.environ.get("FEISHU_WEBHOOK_URL", "").strip() or None
+
+
+def feishu_notify_to() -> str | None:
+    """输入:无 → 输出:运行通知的收件人标识(未配置返回 None)。
+
+    取值可以是下面任意一种,**类型由前缀自动认**(见 api/feishu._receive_type):
+      `ou_…` open_id · `oc_…` chat_id(群) · 含 `@` 邮箱 · 11 位数字手机号
+
+    ⚠ 手机号**不能直接当 receive_id**(飞书的 receive_id_type 里没有"手机号"
+    这一档),要先用 `contact/v3/users/batch_get_id` 换成 open_id ——
+    api/feishu 会自动换并缓存,但那个接口要应用有 `contact:user.id:readonly`
+    权限。配 open_id 或邮箱则不需要这条权限。
+
+    前缀判型这条规矩逐字沿用旧系统(legacy_survey:1818,notify.py:137:
+    `ou_` → --user-id,`oc_` → --chat-id),换个人接手不用重新学一套。
+    """
+    return os.environ.get("FEISHU_NOTIFY_TO", "").strip() or None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -426,16 +449,20 @@ RETIRE_SHEET = Spreadsheet(
 # daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
-# A=ASIN B=店铺 C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
+# A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
 # G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
 # M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
 # R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
 # (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
+# ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
+# `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
+# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里。
+# 写入侧一律用显式 range(C:G / O:Q / …),不受本次对调影响。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
-    columns=("asin", "store", "list_title", "product_type", "audit_result",
+    columns=("store", "asin", "list_title", "product_type", "audit_result",
              "audit_reason", "audit_date", "amz_price", "stock",
              "walmart_price", "listed", "feed_id", "list_date",
              "not_listed_reason", "list_result", "list_fail_reason",
@@ -472,6 +499,41 @@ AMZCAT_BLACKLIST_SHEET = Spreadsheet(
     token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_AMZCAT_BLACKLIST_SHEET_ID", ""),
     columns=("category",),
+    wiki=True,
+)
+
+# 类目映射明细(所有者 2026-08-17:「以前的审核系统是从这里拿的,我们现在
+# 直接当映射查看使用」)。**投影,不是数据源** —— 权威在 audit.walmart_category_map,
+# 这张表是给人看的一面镜子,由 catmap_export 整表重写。
+# 列序即所有者手上那份的表头,一个字都不许改(改了他那边的筛选/公式全废)。
+CATMAP_SHEET = Spreadsheet(
+    name="类目映射明细",
+    token=os.environ.get("FEISHU_CATMAP_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_CATMAP_SHEET_ID", ""),
+    columns=("walmart_category", "walmart_ptg", "walmart_product_type",
+             "amazon_leaf", "amazon_category", "browse_node_id",
+             "rank_in_pt", "confidence", "match_type", "notes",
+             "source_batch"),
+    wiki=True,
+)
+# 表头文案(写进第 1 行)。与 columns 一一对应,顺序必须一致
+CATMAP_SHEET_HEADER = (
+    "Walmart Category", "Walmart PTG", "Walmart Product Type",
+    "Amazon 叶子", "Amazon 路径", "browse_node_id",
+    "排名", "置信度", "匹配方式", "备注", "来源批次")
+
+# PT 上传模板汇总(同一个 wiki 里的另一张工作表;所有者 2026-08-17:
+# 「完整的沃尔玛类目映射时可以直接映射到 PT上传模板_汇总」)。
+# 它由**沃尔玛官方 MP_ITEM spec** 拆出来,是"这个 PT 到底存不存在"的凭据之一。
+# ⚠ **只读**:本仓不往它写(2026-08-17 覆盖事故之后的纪律 —— 人在维护的表,
+# 除非明确要求,一律只读)。
+PT_TEMPLATE_SHEET = Spreadsheet(
+    name="PT上传模板_汇总",
+    token=os.environ.get("FEISHU_CATMAP_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_PT_TEMPLATE_SHEET_ID", ""),
+    columns=("walmart_category", "walmart_ptg", "walmart_product_type",
+             "total_fields", "required_count", "required_fields",
+             "core_fields"),
     wiki=True,
 )
 
@@ -533,12 +595,21 @@ UPC_SHEET = Spreadsheet(
 # 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
 # feed 路径 F 写真 feedid、H 由 feed_poll 反哺器回填;PUT 同步路径 F 写
 # "sync"、H 当场写 成功/失败。
+# 维护记录(流水账,只追加):A~K 十一列。
+# 2026-08-16 所有者在飞书加了「建议」「原因」两列(9 → 11),配合 maintenance
+# 拆成 scan(决策,写 建议/原因)+ 执行件(写 动作/feedid/结果/报错)。
+# ⚠ 「原因」不是装饰:四条清零判据(Currently unavailable / No Featured Offer /
+#   out_of_stock / 配送超时)在表里长得一模一样(库存 12 → 0),没有原因列
+#   分不出是哪一条触发的;删除那类更要紧(not_found 与 标题相似度 42% 都是删除,
+#   但正确性判断完全不同)。
+# ⚠ services/maint_sheet 按**本元组的下标**算列字母,不再硬编码 A/H/I ——
+#   下次再加列只改这里一行。
 MAINT_SHEET = Spreadsheet(
     name="维护记录",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_MAINT_SHEET_ID", ""),
-    columns=("store", "sku", "action", "old_value", "new_value",
-             "feed_id", "op_date", "result", "error"),
+    columns=("store", "sku", "suggestion", "reason", "action",
+             "old_value", "new_value", "feed_id", "op_date", "result", "error"),
 )
 
 
@@ -568,10 +639,20 @@ RETIRE_LIMITS = Bitable(
         category1="类目1",
         category2="类目2",
         category3="类目3",
-        # 逐店配送时长上限(所有者建列 2026-08-16):**只分配 delivery_days
-        # ≤ 该值的产品**。与全局 `amz_source.MAX_LEAD_DAYS`(=7)是两回事:
-        # 全局那条管的是"上架但库存写 0"的既有链路,这一列管的是"这家店压根
-        # 不要慢货"。未填 = 该店不限配送时长(退回全局链路)
+        # 逐店配送时长上限(所有者建列 2026-08-16)。
+        # ⚠ **一列,三个消费方,不是三个常量**(2026-08-16 合并时撞车:
+        # 分配链与上下架链各建了一个常量指同一列 —— 表头一改名只坏一半,
+        # 另一半静默读空)。谁在读:
+        #   · 分配   services.store_targets.lead_ok   —— 只分配 ≤ 该值的产品
+        #   · 上架   list_new                          —— 超限**不上架**
+        #   · 维护   maintenance                       —— 超限**库存写 0**
+        # ⚠ 三者对"这一格没填"的解释**不同,而且都是对的**:
+        #   分配 = 不限(该店不挑货期);上架/维护 = 回落全局
+        #   `amz_source.MAX_LEAD_DAYS`(=7,既有链路的基线)。
+        #   这一列是在全局基线之上**再收紧**,不是替代它。
+        # ⚠ 对"产品没采到配送天数"的解释也相反,同样都是对的 ——
+        #   分配侧拒收(宁可不分也不错分),上架/维护侧放行
+        #   (不拿"未知"当"超限"去删/清零)。方向不同是因为动作不同。
         lead_limit="配送时长限制",
     ),
 )

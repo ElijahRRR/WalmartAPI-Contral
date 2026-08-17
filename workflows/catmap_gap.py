@@ -59,6 +59,34 @@ SELECT
      AND t.node NOT IN (SELECT node FROM mapped))                   AS gap_d
 """
 
+# 缺口里有多少产品**根本走不到类目判定**(所有者 2026-08-17 问:
+# 「这部分是否是 L0 都过不了的,所以缺?这种缺口没必要去补」)。
+# 判据 = 最近一轮 audit_runs 停在 L0(Phase0:黑名单/禁售大类/®™)——
+# 那些产品补了映射也是白补:审核在第一层就短路了,压根不查类目。
+# ⚠ 只数**审过的**;没审过的单列一栏,别把"没数据"混进"不需要补"。
+_GAP_L0_SQL = """
+WITH prod AS (
+    SELECT browse_node_id AS node, asin,
+           (walmart_pt IS NOT NULL AND walmart_pt <> 'unknown') AS has_pt
+    FROM catalog.products
+    WHERE marketplace = 'US' AND browse_node_id IS NOT NULL
+), gap AS (
+    SELECT * FROM prod p
+    WHERE NOT EXISTS (SELECT 1 FROM audit.walmart_category_map m
+                      WHERE m.browse_node_id = p.node AND m.confidence = '高')
+), latest AS (
+    SELECT DISTINCT ON (asin) asin, stage_stopped_at
+    FROM audit.audit_runs ORDER BY asin, created_at DESC
+)
+SELECT g.has_pt,
+       count(*)                                                    AS n,
+       count(*) FILTER (WHERE l.asin IS NULL)                      AS never,
+       count(*) FILTER (WHERE l.stage_stopped_at = 'L0')           AS l0,
+       count(*) FILTER (WHERE l.stage_stopped_at = 'L1')           AS l1
+FROM gap g LEFT JOIN latest l ON l.asin = g.asin
+GROUP BY 1
+"""
+
 _LIST_SQL = """
 WITH prod AS (
     SELECT browse_node_id AS node, count(*) AS n,
@@ -103,6 +131,8 @@ def run(params: dict) -> str:
             cur.execute(_LIST_SQL.format(filter=_FILTERS[only]),
                         {"limit": limit})
             rows = cur.fetchall()
+            cur.execute(_GAP_L0_SQL)
+            worth = {bool(r[0]): r[1:] for r in cur.fetchall()}
 
     if not s["tax_nodes"]:
         return ("catmap_gap:audit.amazon_taxonomy 为空——先跑 "
@@ -119,8 +149,42 @@ def run(params: dict) -> str:
         f" → catmap_suggest(LLM)或人工",
         f"C 有产品·**树里也没有** {s['gap_c']} node → 树没抓全或采集侧新类目",
         f"D 无产品·无映射 {s['gap_d']} node → 亚马逊有但我们没货,**不必处理**",
-        f"—— Top {len(rows)}(only={only},按产品数降序)——",
     ]
+    # 所有者 2026-08-17 问:「这部分是否是 L0 都过不了的,所以缺?
+    # 这种缺口没必要去补」—— 拿数说话
+    if worth:
+        # ⚠ 这一节的口径与上面 A/B **不是同一根轴**:上面按 node 分
+        # (该 node 下有没有任何一个产品带实证 PT),这里按**产品自己**分。
+        # 两处都叫 A/B 会让人以为数字该对得上(180166 vs 113496),故改名。
+        lines.append("")
+        lines.append("缺口里的产品**值不值得补映射**"
+                     "(⚠ 按产品自己有无实证 PT 分,与上面按 node 分的 A/B 不同轴):")
+        have = worth.get(True)
+        if have:
+            n, never, l0, l1 = have
+            # 有实证 PT = resolve_pt 的 ①/①b 级**直接直出**,压根不查映射表。
+            # 补映射对这批产品自身毫无作用 —— 价值只在同路径**将来的新产品**
+            lines.append(
+                f"  ① 产品自己有实证 PT:{n} 件 —— **它们不靠映射表**:"
+                f"resolve_pt 的实证级(walmart_items / 产品主档)直接直出,"
+                f"映射表是第 ② 级,轮不到。补映射对这批自身**无用**,"
+                f"价值只在同路径**将来的新产品**")
+            lines.append(f"      (其中停在 L0 {l0} 件、L1 解不出 {l1} 件、"
+                         f"从没审过 {never} 件 —— L1 近乎为 0 正说明它们不缺类目)")
+        no = worth.get(False)
+        if no:
+            n, never, l0, l1 = no
+            useful = n - l0
+            lines.append(
+                f"  ② 产品自己无实证 PT:{n} 件 —— **这批才真靠映射表**。"
+                f"其中停在 L0(黑名单/禁售大类/®™)**{l0}** 件"
+                f"({l0 / n * 100:.0f}%,补映射白补,审核第一层就短路);"
+                f"停在 L1 类目解不出 {l1} 件;从没审过 {never} 件")
+            lines.append(f"      → **真正值得补的约 {useful} 件**"
+                         f"({useful / n * 100:.0f}%)")
+        lines.append("  结论口径:补映射的收益 = ②里非 L0 的那部分 + 未来新品;"
+                     "①那一大堆数字**不是收益**,别拿它当理由排期")
+    lines.append(f"—— Top {len(rows)}(only={only},按产品数降序)——")
     for node, n, n_pt, name, path, is_leaf, not_in_tree in rows:
         tag = ("树外" if not_in_tree else ("叶" if is_leaf else "非叶"))
         label = (path or name or "(树里无此 node)")

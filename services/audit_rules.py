@@ -152,6 +152,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         for sku, pt in cur.fetchall():
             asin = extract_asin(sku) or sku
             by_asin.setdefault(asin, set()).add(pt)
+        # ⚠ 这里**故意**保持"先数 DISTINCT 再过闸",与下面映射表那两处相反:
+        # 实证的歧义是"两家店对同一 ASIN 报了不同 PT",那是真分歧,与字典无关;
+        # 而且 walmart_items 里的 PT 是沃尔玛线上现有的,它不在 pt_meta 只说明
+        # 我们那张表收得不全,不代表这个 PT 假。别照着下面"优化"这一行。
         confirmed = {a: next(iter(pts)) for a, pts in by_asin.items()
                      if len(pts) == 1 and next(iter(pts)) in pt_meta}
         # 映射表:先筛 confidence='高' 再数 DISTINCT PT(旧仓快速通道同款,
@@ -163,10 +167,16 @@ def load_context(conn, *, uspto=None) -> AuditContext:
             (_UNMAPPED_SENTINEL,))
         cat_pts: dict = {}
         for cat, pt in cur.fetchall():
-            if cat and pt:
+            # ⚠ **先过 pt_meta 闸,再数 DISTINCT**(2026-08-17 修)。
+            # 原来是反的:死 PT(字典里没有,永远不可能被返回)也进集合参与
+            # "是否唯一"的计票,于是"一条有效 + 一条死"的路径被判成两义 →
+            # 整条路径丢弃。生产实测因此白白丢掉 **105 条本可直出的路径**。
+            # 成因:映射修正是"插新行不删旧行"(catmap_fix 的保留证据惯例),
+            # 同一路径于是长期同时挂着新 PT 与旧的无效 PT。
+            if cat and pt and pt in pt_meta:
                 cat_pts.setdefault(cat.strip(), set()).add(pt)
         catmap = {cat: next(iter(pts)) for cat, pts in cat_pts.items()
-                  if len(pts) == 1 and next(iter(pts)) in pt_meta}
+                  if len(pts) == 1}
         # browse_node_id → PT(所有者定稿 2026-08-14:名称会漂 ID 不会)。
         # 同款三闸:高置信 + 剔哨兵 + 该 ID 恰一个 PT + pt_meta 存在
         cur.execute(
@@ -177,10 +187,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
             (_UNMAPPED_SENTINEL,))
         node_pts: dict = {}
         for node, pt in cur.fetchall():
-            if node and pt:
+            if node and pt and pt in pt_meta:      # 同上:先过闸再计票
                 node_pts.setdefault(node.strip(), set()).add(pt)
         node_map = {n: next(iter(pts)) for n, pts in node_pts.items()
-                    if len(pts) == 1 and next(iter(pts)) in pt_meta}
+                    if len(pts) == 1}
         logger.info("类目锚:browse_node %d 个 / 路径 %d 条", len(node_map),
                     len(catmap))
     # 四闸全部直读黑名单中心(所有者定稿 2026-08-13,一份数据):

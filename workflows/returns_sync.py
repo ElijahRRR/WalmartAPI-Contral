@@ -23,6 +23,7 @@ import httpx
 from api import _client
 from api import returns as returns_api
 from registry import db
+from services import order_center
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -84,4 +85,7 @@ def run(params: dict) -> str:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:
         lines.append(f"失败:{'; '.join(failed)}")
+    # 跑完就写飞书(同 order_sync;投影失败只告警,售后行已落 PG)
+    lines.append(order_center.push_after(
+        order_center.BY_WORKFLOW["returns_sync"], days=max(days, 90)))
     return "\n".join(lines)

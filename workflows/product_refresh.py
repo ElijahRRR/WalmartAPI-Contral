@@ -3,7 +3,8 @@
 用法:
   python cli.py product_refresh                 # dry-run:列出将推多少个 ASIN
   python cli.py product_refresh --execute       # 真推(建批次 + 落台账)
-  python cli.py product_refresh -p wait=1       # 真推后阻塞等采完(默认不等)
+  python cli.py product_refresh -p wait=1       # 真推后阻塞等采完(默认不等;
+                                                #   产品线一条链跑完就靠它)
   python cli.py product_refresh -p check=1      # 只查在途批次状态(不推新的)
 
 批次落定(采完/超时)时**顺手拉失败明细落 ops.scrape_failures**:验证码/超时/
@@ -30,7 +31,7 @@ inserted 无歧义。所以不需要 v3 那套毫秒精度躲合并的把戏。
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from api import scraper
 from registry import db
@@ -126,7 +127,7 @@ def run(params: dict) -> str:
                 + "\n".join(["在途批次:"] + _check_open()))
 
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%d-%H%M%S")
-    pushed, lines = 0, []
+    pushed, lines, pushed_names = 0, [], []
     for i, chunk in enumerate(chunks, 1):
         # 单批(常态)不带序号:批次名就是取回的抓手,越简单越好
         name = (f"{BATCH_PREFIX}{stamp}" if len(chunks) == 1
@@ -137,6 +138,7 @@ def run(params: dict) -> str:
             batches.record(name, res.get("batch_id"), len(chunk), "pushed",
                            f"inserted={res.get('inserted')}")
             pushed += len(chunk)
+            pushed_names.append(name)
             lines.append(f"  {name}:推送 {len(chunk)} 个"
                          f"(inserted={res.get('inserted')})")
         except scraper.BatchExistsError as e:
@@ -144,6 +146,7 @@ def run(params: dict) -> str:
             batches.record(name, e.batch_id, len(chunk), "pushed",
                            "撞名沿用既有批次")
             pushed += len(chunk)
+            pushed_names.append(name)
             lines.append(f"  {name}:已存在,沿用既有批次 {e.batch_id}")
         except Exception as e:
             batches.record(name, None, len(chunk), "failed", str(e)[:200])
@@ -153,6 +156,23 @@ def run(params: dict) -> str:
     head = (f"全量重推:{pushed}/{len(asins)} 个 ASIN 已确认推上"
             f"({len(chunks)} 个批次){skip},预计约 {est_min:.0f} 分钟采完;"
             f"超时阈值 {TIMEOUT_HOURS} 小时")
-    tail = ["", "查进度:python cli.py product_refresh -p check=1",
-            "采完后拉数据:python cli.py product_ingest"]
-    return "\n".join([head] + lines + tail)
+
+    if not params.get("wait"):
+        tail = ["", "查进度:python cli.py product_refresh -p check=1",
+                "采完后拉数据:python cli.py product_ingest"]
+        return "\n".join([head] + lines + tail)
+
+    # ⚠ wait 是**产品线一条链跑完**的前提(所有者定稿 2026-08-16)。
+    # 2026-08-16 之前:用法行写着 `-p wait=1`,run() 里从头到尾没读过它 ——
+    # 传了等于没传。后果不是报错,是**静默降级**:推完立刻返回,链里下一步
+    # product_ingest 摄回来的还是上一轮的数据,而摘要看起来一切正常。
+    line, unsettled = batches.wait_settled(pushed_names, TIMEOUT_HOURS * 60)
+    lines.append(line)
+    # 等完再落一次台账:批次状态、失败明细都归 check_open 那一份实现
+    lines += ["批次落定:"] + _check_open()
+    if unsettled:
+        # 不抛错、不停链:已采到的部分照常能用,硬停反而让整条产品链今天全废。
+        # 但必须说出来 —— 这一轮的维护判据会比平时旧一些
+        lines.append(f"⚠ 仍有 {unsettled} 个批次未采完,本轮 product_ingest 只会"
+                     f"摄到已完成的部分;下一轮 catalog_sync 之后自然补上")
+    return "\n".join([head] + lines)

@@ -67,6 +67,62 @@ def sync_rows(conn, sheet_rows: list[tuple[str, str]]) -> tuple[int, int]:
     return len(new_ok), len(new_bad)
 
 
+def sync_from_sheet(conn) -> dict:
+    """输入:连接 → 输出:{rows: 表格行, new: 新入库数, bad: 非法前缀数}。
+
+    ⚠ **住在 services 而不是 upc_sync 工作流里**(2026-08-16,所有者定稿
+    「上架运行时自动同步一次 UPC,然后再走上架流程」):`list_new` 也要用它,
+    而铁律 1 禁止 workflow 互相 import。收在这里,两个调用方注入的是同一段
+    代码 —— 各写一份迟早飘成"上架看到的池"与"upc_sync 看到的池"不是一个。
+
+    只做**注入**(表格新号 → catalog.upc_pool),不回写状态列:回写是展示,
+    归 `project_to_sheet` / upc_sync;上架链要的只是"运营刚贴进表格的号
+    这一轮就能用"。
+
+    表未登记抛 LookupError,由调用方决定是致命还是跳过。
+    """
+    from api import feishu
+    from registry import resources
+
+    sheet = resources.UPC_SHEET
+    sheet.require()
+    total = feishu.sheet_row_count(sheet)
+    values = feishu.sheet_values(sheet, f"A2:F{total}") if total >= 2 else []
+    rows = []
+    for i, raw in enumerate(values):
+        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 6
+        if cells[0]:
+            rows.append({"rownum": i + 2, "upc_raw": cells[0],
+                         "put_date": cells[1], "shown": cells[2:6]})
+    if not rows:
+        return {"rows": [], "new": 0, "bad": 0}
+    n_new, n_bad = sync_rows(conn, [(r["upc_raw"], r["put_date"]) for r in rows])
+    return {"rows": rows, "new": n_new, "bad": n_bad}
+
+
+def project_to_sheet(conn, rows: list[dict]) -> int:
+    """输入:连接 + sync_from_sheet 的表格行 → 输出:回写行数(仅差异行)。
+
+    PG 是权威,表格 C~F(状态/店铺/SKU/上架日期)是投影。只写值变了的行 ——
+    全量重写一是慢,二是把人正在看的表整片刷掉。
+    """
+    from api import feishu
+    from registry import resources
+
+    info = lookup(conn, [normalize(r["upc_raw"]) for r in rows])
+    updates = []
+    for r in rows:
+        st = info.get(normalize(r["upc_raw"]))
+        if st is None:
+            continue
+        status, store, sku, used_at = st
+        vals = [STATUS_CN.get(status, status), store or "", sku or "",
+                used_at.strftime("%Y-%m-%d") if used_at else ""]
+        if vals != r["shown"]:
+            updates.append((f"C{r['rownum']}:F{r['rownum']}", [vals]))
+    return feishu.sheet_write_ranges(resources.UPC_SHEET, updates) if updates else 0
+
+
 def claim(conn, wants: list[dict]) -> list[str | None]:
     """输入:连接 + [{store, asin?}] → 输出:与 wants 等长的 UPC 列表(不足补 None)。
 

@@ -157,7 +157,7 @@ def test_history_rows_excluded_from_feishu_push():
     `source <> '历史数据'` 对 NULL 求值为 NULL —— 而绝大多数行的 source 是
     NULL,那样写会把**全部 API 行**一起过滤掉,飞书表直接变空。
     """
-    from workflows import order_center_push as ocp
+    from services import order_center as ocp
     assert "source IS DISTINCT FROM %s" in ocp._SALES_SQL
     assert "source <> " not in ocp._SALES_SQL
     # source 留在覆盖列里:API 拉到真行后标记自动摘掉,该行回到推送流

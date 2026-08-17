@@ -86,6 +86,21 @@ def _attrs(raw) -> dict:
                                                      if k not in ("fast",)}
 
 
+def _rawget(raw, key: str) -> str | None:
+    """输入:snapshot.raw + 键 → 输出:字符串值(空串归 None)。
+
+    变体三字段在 raw 顶层(采集侧原样键);老行可能把它们裹在 slow 段里,
+    两处都找一遍。空串归 None:调用方按"没采到"处理,与 shipping 同口径。
+    """
+    if not isinstance(raw, dict):
+        return None
+    v = raw.get(key)
+    if v is None and isinstance(raw.get("slow"), dict):
+        v = raw["slow"].get(key)
+    s = str(v).strip() if v is not None else ""
+    return s or None
+
+
 def fetch_products(asins: list[str]) -> dict[str, dict]:
     """输入:ASIN 列表 → 输出:{asin: 产品数据契约 dict}(缺席的不出现)。
 
@@ -133,6 +148,14 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
             "channel": (str(fulfillment).strip().upper()
                         if fulfillment else None),
             "images": images, "attrs": attrs,
+            # 变体三件原料(2026-08-15):**从 raw 取,不从 slow 取**。
+            # 导出契约把 variant_attributes 压成了 slow.variant.theme,而那段
+            # 代码按 ':' 切、采集侧实际格式是 '=',于是 theme 只解析出 0.1%
+            # 且全是垃圾(生产实证:1248/1195018,值形如 "size_name=Height")。
+            # raw 是几乎不裁剪的(_RAW_DROP 只丢 6 个大文本键),三个字段原样都在。
+            "parent_asin": _rawget(raw, "parent_asin"),
+            "variant_attributes": _rawget(raw, "variant_attributes"),
+            "variation_asins": _rawget(raw, "variation_asins"),
         }
     absent = [a for a in asins if a not in out]
     if absent:

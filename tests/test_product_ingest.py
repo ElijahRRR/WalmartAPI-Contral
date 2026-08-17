@@ -7,7 +7,7 @@ import pytest
 
 from api import scraper
 from services import amz_source, product_ingest as ingest
-from tests.test_list_new import _sheet_row
+from tests.test_list_new import _sheet_row, fake_verdicts
 
 
 def _rec(**kw):
@@ -261,6 +261,7 @@ def test_list_new_stock_three_way(monkeypatch):
                       "channel": "FBM", "shipping": 0.0},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
@@ -272,15 +273,24 @@ def test_list_new_stock_three_way(monkeypatch):
     monkeypatch.setattr(ln.pricing, "walmart_price",
                         lambda ch, price, m, ship: 99.0)
 
+    monkeypatch.setattr(ln.store_limits, "lead_day_caps", lambda: {})
     out = ln.run({"execute": False})
     # 真值 37 过闸;3 <5 拦;0 拦(确实缺货);None+in_stock 按常量铺货;
-    # None+unknown 拦(不知道有没有货);50 但 30 天 → 上架但库存 0
+    # None+unknown 拦(不知道有没有货);
+    # ⚠ 50 但 30 天 → **不上架**(所有者定稿 2026-08-16 走进生产改口径:
+    #   此前是"上架但库存写 0";不上架就不占 UPC、不占配额,比上一个卖不动的更省)
     assert "数据过滤 3" in out
     assert f"库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货 1 行" in out
     assert "库存不足:3" in out and "库存不足:0" in out
     assert "库存未知(状态 unknown)" in out
-    assert "库存 0 待提交" in out          # B0SLOW:配送超时,上架但清零
-    assert "共 3 行将进入" in out
+    # ⚠ 2026-08-16 合并后**两条改动叠加**:全局上限 8 → 7(main),
+    # 且超限从"上架但清零"改成"不上架"(走进生产批次二)。于是 8 天那行
+    # 也被拦了 —— 超时 2 行,只剩 1 行进入提交
+    assert "配送超时 2" in out                       # 闸门行里单独计数
+    assert "配送 8 天 > 本店上限 7 天" in out         # 8 天那行:全局收紧后也超
+    assert "配送 30 天 > 本店上限 7 天" in out        # 理由写清是哪个上限
+    assert "库存 0 待提交" not in out                # 不再有"上架但清零"这一档
+    assert "共 1 行将进入" in out
 
 
 def test_partner_id_reads_nested_shape(monkeypatch):

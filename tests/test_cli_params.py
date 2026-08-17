@@ -12,15 +12,23 @@ import pytest
 
 import cli
 
+# 串联之后 _build_params 收 (pairs, steps) 并返回 {工作流名: params}。
+# 这些用例只关心单跑那一档,包一层保持原来的读法。
+_W = "zz"
+
+
+def _params(pairs):
+    return cli._build_params(pairs, [_W])[_W]
+
 
 def test_plain_pairs():
-    assert cli._build_params(["a=1", "b=x y"]) == {"a": "1", "b": "x y"}
-    assert cli._build_params(["as_of=2026-08-16"]) == {"as_of": "2026-08-16"}
+    assert _params(["a=1", "b=x y"]) == {"a": "1", "b": "x y"}
+    assert _params(["as_of=2026-08-16"]) == {"as_of": "2026-08-16"}
 
 
 def test_missing_equals_is_rejected():
     with pytest.raises(SystemExit):
-        cli._build_params(["justakey"])
+        _params(["justakey"])
 
 
 @pytest.mark.parametrize("sep", [" ", " ", "\t", "　"])
@@ -33,7 +41,7 @@ def test_swallowed_execute_flag_is_refused(sep):
     **命令看起来跑了但其实还是 dry-run**。
     """
     with pytest.raises(SystemExit) as e:
-        cli._build_params([f"from_csv=/tmp/x.csv{sep}--execute"])
+        _params([f"from_csv=/tmp/x.csv{sep}--execute"])
     assert "--execute" in str(e.value) and "没有执行" in str(e.value)
 
 
@@ -44,12 +52,12 @@ def test_a_swallowed_flag_is_never_silently_promoted():
     危险工作流的真跑开关必须是人显式敲进去的。
     """
     with pytest.raises(SystemExit):
-        cli._build_params(["k=v --execute"])          # 只能抛,不能返回 dict
+        _params(["k=v --execute"])          # 只能抛,不能返回 dict
 
 
 def test_values_that_merely_contain_dashes_are_fine():
     """别误伤:值里带 `--` 但不是已知开关的,照常放行。"""
-    assert cli._build_params(["note=a--b", "flag=--verbose"]) == {
+    assert _params(["note=a--b", "flag=--verbose"]) == {
         "note": "a--b", "flag": "--verbose"}
 
 
@@ -77,12 +85,15 @@ def test_summary_still_reaches_the_log_file(tmp_path, capsys):
     for h in root.handlers[:]:
         root.removeHandler(h)
     try:
-        cli._setup_logging("t", tmp_path)
-        cli.logger.info("workflow %s 成功:\n%s", "t", "第一行\n第二行",
-                        extra={"file_only": True})
-        for h in root.handlers:
-            h.flush()
-        text = (tmp_path / "t.log").read_text(encoding="utf-8")
+        # 串联之后:根 logger 只挂屏幕 handler,每步的文件 handler 由
+        # _log_to 挂/摘 —— 两段都要在,少一段就是"日志文件是空的"或"屏幕刷两遍"
+        cli._setup_logging(tmp_path)
+        with cli._log_to("t", tmp_path):
+            cli.logger.info("workflow %s 成功:\n%s", "t", "第一行\n第二行",
+                            extra={"file_only": True})
+            for h in root.handlers:
+                h.flush()
+            text = (tmp_path / "t.log").read_text(encoding="utf-8")
         assert "第一行" in text and "第二行" in text        # 文件里有全文
         assert "第二行" not in capsys.readouterr().err     # 屏幕上没有
     finally:
@@ -105,3 +116,53 @@ def test_unconfigured_webhook_logs_only_the_first_line(monkeypatch, caplog):
     text = caplog.text
     assert "claim_audit 成功" in text                  # 说清楚是哪条通知没发出去
     assert "第二行" not in text and "第三行" not in text
+
+
+# ── .env 重复键守卫(2026-08-17 生产实证)────────────────────────────────────
+
+def test_duplicate_env_keys_are_detected():
+    """⚠ dotenv 顺序读取、后者覆盖前者,**且不报重复**。
+
+    所有者的 .env 里 FEISHU_RISK_PT_WIKI_TOKEN 等四个键各出现两次,
+    第二次是模板留下的空值,于是那四张表全读成"未登记" —— 值明明就在
+    文件里、肉眼看过去也在,报错却说"尚未登记"。这种错自己找不到。
+    """
+    dup = cli.dup_env_keys("""
+# 沃尔玛类目
+FEISHU_RISK_PT_WIKI_TOKEN=UKdZwr7JqiO6UckjSnPcwTCgnvd
+FEISHU_BRAND_SHEET_ID=jF8dOw
+OTHER=1
+
+# listing 风控两张只读源(模板留下的空壳)
+FEISHU_RISK_PT_WIKI_TOKEN=
+FEISHU_BRAND_SHEET_ID=
+""")
+    assert set(dup) == {"FEISHU_RISK_PT_WIKI_TOKEN", "FEISHU_BRAND_SHEET_ID"}
+    # 顺序必须保留 —— 判"最后一个是不是空值"全靠它
+    assert dup["FEISHU_RISK_PT_WIKI_TOKEN"] == \
+        ["UKdZwr7JqiO6UckjSnPcwTCgnvd", ""]
+    assert "OTHER" not in dup
+
+
+def test_comments_and_blank_lines_do_not_count():
+    assert cli.dup_env_keys("# A=1\n# A=2\n\nA=3\n") == {}
+
+
+def test_export_prefix_is_normalized():
+    """`export FOO=1` 与 `FOO=2` 是同一个键 —— 不归一就漏报。"""
+    assert list(cli.dup_env_keys("export FOO=1\nFOO=2\n")) == ["FOO"]
+
+
+def test_warn_says_which_direction_it_broke(capsys, tmp_path):
+    """空值覆盖有值 = 静默失效,必须与"重复但都有值"区分开说。"""
+    p = tmp_path / ".env"
+    p.write_text("A=有值\nB=1\nA=\n", encoding="utf-8")
+    cli._warn_dup_env(p)
+    err = capsys.readouterr().err
+    assert "最后一次是空值" in err and "删掉那行空的" in err
+    assert "B" not in err
+
+
+def test_warn_is_silent_when_env_is_missing(capsys, tmp_path):
+    cli._warn_dup_env(tmp_path / "nope.env")
+    assert capsys.readouterr().err == ""

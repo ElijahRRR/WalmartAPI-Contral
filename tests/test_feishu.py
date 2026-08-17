@@ -171,6 +171,57 @@ def test_sheet_write_ranges_splits_big_range_and_scrubs(monkeypatch):
     n = feishu.sheet_write_ranges(sheet, [("A11:B15", rows)])
     ranges = [vr["range"] for body in sent for vr in body["valueRanges"]]
     assert ranges == ["SID!A11:B12", "SID!A13:B14", "SID!A15:B15"]
-    assert n == 3
+    assert n == 5          # 行数,不是范围数(所有调用方都当行数在用)
     # 控制字符会让飞书整批拒收,先剔掉(剔到了记日志,不静默)
     assert sent[0]["valueRanges"][0]["values"][0][1] == "xy"
+
+
+def test_consecutive_single_row_ranges_are_coalesced(monkeypatch):
+    """⚠ 一行一个 range = 100 行/请求 + 0.3s 节流,几万行要跑好几分钟。
+
+    所有者 2026-08-16 实遇并发问:「写飞书的速度怎么各处都不一样,有的 4000
+    有的几百几十,甚至有的逐行」。差别不在接口,在调用方给的形状:
+    整表重写给的是一段 4000 行,定点回写给的是一行一段。**在 api 层补齐**,
+    调用方不用改。
+    """
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID",
+                        columns=("a", "b"))
+    ups = [(f"C{r}:G{r}", [[f"v{r}"] * 5]) for r in range(2, 1002)]
+    n = feishu.sheet_write_ranges(sheet, ups)
+    ranges = [vr["range"] for body in sent for vr in body["valueRanges"]]
+    assert ranges == ["SID!C2:G1001"]      # 1000 行 → 一个请求一个范围
+    assert n == 1000                       # 行数照旧
+    assert len(sent) == 1
+    # 值的顺序不能乱:第 k 行还是第 k 行
+    vals = sent[0]["valueRanges"][0]["values"]
+    assert vals[0][0] == "v2" and vals[-1][0] == "v1001"
+
+
+def test_coalesce_never_merges_across_a_gap_or_a_column_change():
+    """粘段只认**紧邻的下一行 + 完全相同的列区间** —— 别的一律另起一段。
+
+    跨空行粘 = 把中间那些行一起覆盖成空(它们不在本次回写范围里,
+    是别人的数据);跨列粘 = 写到隔壁列去。两者都不报错。
+    """
+    c = feishu._coalesce
+    # 断号:2,3 粘;跳过 4;5 单独
+    assert [r for r, _ in c([("C2:G2", [[1]]), ("C3:G3", [[2]]),
+                             ("C5:G5", [[3]])])] == ["C2:G3", "C5:G5"]
+    # 换列:同一行号连着也不粘
+    assert [r for r, _ in c([("C2:G2", [[1]]), ("O3:Q3", [[2]])])] \
+        == ["C2:G2", "O3:Q3"]
+    # 倒序不粘(不排序:同一行被写两次时,先后覆盖语义必须与逐行写一致)
+    assert [r for r, _ in c([("C3:G3", [[1]]), ("C2:G2", [[2]])])] \
+        == ["C3:G3", "C2:G2"]
+    # 同一行写两次也不粘,顺序原样保留(后写的仍然后写)
+    assert [(r, v) for r, v in c([("C2:G2", [["旧"]]), ("C2:G2", [["新"]])])] \
+        == [("C2:G2", [["旧"]]), ("C2:G2", [["新"]])]
+    # 多行段接单行段照样粘
+    assert [r for r, _ in c([("C2:G3", [[1], [2]]), ("C4:G4", [[3]])])] \
+        == ["C2:G4"]
+    # 形状看不懂(行数与范围对不上)就原样放过,不猜
+    assert [r for r, _ in c([("C2:G9", [[1]]), ("C3:G3", [[2]])])] \
+        == ["C2:G9", "C3:G3"]

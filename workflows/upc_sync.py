@@ -7,14 +7,19 @@
 (catalog.upc_pool,首位白名单校验,非法前缀标注永不分配)→ 按 PG 权威
 回写 C=状态 D=店铺 E=SKU F=上架日期(仅差异行)→ 摘要报池余量。
 
-调度建议:每日一次 + 上架主链(L2d)跑前顺带;领号/用号/回收由主链
-在提交事务内调 services/upc_pool,本工作流只管注入与展示。
+⚠ 两步的实现都在 `services/upc_pool`(`sync_from_sheet` / `project_to_sheet`),
+本工作流只是把它们串起来 —— **注入那一步 `list_new` 也要用**
+(所有者定稿 2026-08-16:上架运行时自动同步一次 UPC),而铁律 1 禁止
+workflow 互相 import。各写一份迟早飘成"上架看到的池"与"本工作流看到的池"
+不是同一个。
+
+调度建议:每日一次;上架主链跑前不必单独安排,`list_new` 自己会先注入一次。
+领号/用号/回收由主链在提交事务内调 services/upc_pool,本工作流只管注入与展示。
 """
 
 import logging
 
-from api import feishu
-from registry import db, resources
+from registry import db
 from services import upc_pool
 
 DANGEROUS = False
@@ -24,44 +29,18 @@ logger = logging.getLogger("workflows.upc_sync")
 
 def run(params: dict) -> str:
     """输入:params(无参)→ 输出:注入与回写摘要。"""
-    sheet = resources.UPC_SHEET
     try:
-        sheet.require()
+        with db.pg_conn() as conn:
+            got = upc_pool.sync_from_sheet(conn)
+            if not got["rows"]:
+                return "UPC池表无数据行"
+            written = upc_pool.project_to_sheet(conn, got["rows"])
+            stats = upc_pool.pool_stats(conn)
     except LookupError as e:
         return f"UPC池表未登记:{e}"
 
-    total = feishu.sheet_row_count(sheet)
-    values = feishu.sheet_values(sheet, f"A2:F{total}") if total >= 2 else []
-    rows = []
-    for i, raw in enumerate(values):
-        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 6
-        if cells[0]:
-            rows.append({"rownum": i + 2, "upc_raw": cells[0],
-                         "put_date": cells[1], "shown": cells[2:6]})
-    if not rows:
-        return "UPC池表无数据行"
-
-    with db.pg_conn() as conn:
-        n_new, n_bad = upc_pool.sync_rows(
-            conn, [(r["upc_raw"], r["put_date"]) for r in rows])
-        info = upc_pool.lookup(conn, [upc_pool.normalize(r["upc_raw"])
-                                      for r in rows])
-        stats = upc_pool.pool_stats(conn)
-
-    updates = []
-    for r in rows:
-        st = info.get(upc_pool.normalize(r["upc_raw"]))
-        if st is None:
-            continue
-        status, store, sku, used_at = st
-        vals = [upc_pool.STATUS_CN.get(status, status), store or "", sku or "",
-                used_at.strftime("%Y-%m-%d") if used_at else ""]
-        if vals != r["shown"]:
-            updates.append((f"C{r['rownum']}:F{r['rownum']}", [vals]))
-    written = feishu.sheet_write_ranges(sheet, updates) if updates else 0
-
-    return (f"UPC池:表内 {len(rows)} 行,新入库 {n_new}"
-            + (f",非法前缀 {n_bad}(已标注永不分配)" if n_bad else "")
+    return (f"UPC池:表内 {len(got['rows'])} 行,新入库 {got['new']}"
+            + (f",非法前缀 {got['bad']}(已标注永不分配)" if got["bad"] else "")
             + f",状态回写 {written} 行;"
             f"池余量:未用 {stats.get('', 0)},已领 {stats.get('claimed', 0)},"
             f"已用 {stats.get('used', 0)},冲突 {stats.get('conflict', 0)}")

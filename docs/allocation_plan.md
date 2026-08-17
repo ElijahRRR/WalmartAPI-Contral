@@ -577,9 +577,12 @@ A2 从第一天起把每次分配的完整信号落库:`catalog.allocation_runs`
 1. 现有五个写函数全部按行号定点写,**无一能新建行** ⇒ 追加新行要照
    `services/maint_sheet.append_records` 的水位模式另写(`ops.cursors` 水位 +
    逐 50 行验空防漂移 + 500 行/块 + **每块成功即落水位**)。
-2. 分配要写的 A/B/D/E 四列**正是审核批次 D 投影的目标列**(`product_audit`
-   明写"投影在批次 D 切换日开闸")⇒ **写列权责必须与批次 D 同一次拍板**,
-   否则投影器与分配器互相覆盖。E 列写 `pass`(飞书侧词表,不是 approved)。
+2. ~~分配要写的 A/B/D/E 四列**正是审核批次 D 投影的目标列**⇒ 写列权责必须与
+   批次 D 同一次拍板。~~ **批次 D 已于 2026-08-16 开闸,此项已定**:
+   **D/E/F/G 归审核域**(`product_audit -p from_sheet=1` 写),分配器**只写 A/B**
+   (ASIN 与店铺,人工域的机器化)。分配器写完 A/B 就完事——E 留空即是"待审",
+   审核链下一轮自动领走。**分配器绝不许自己写 E 列 `pass`**:那是伪造审核结论,
+   而上架闸读的是 `catalog.products`,伪造也上不去,只会骗到人眼。
 
 ### 9.3 事件账本
 
@@ -609,7 +612,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | **A0.5 存量审计** | `alloc_audit`:控制台六节结论 + 明细 csv **5 份** | ✅ 首跑完成 2026-08-15;**订单入库后需重跑**——冲突处置的"留销量大的店"首跑时无订单数据,只能按件数打平(报告会显式点破,不会装作判过了) |
 | **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
 | **A1.5 订单 ASIN 归一** | `order_lines.asin` 列 + `order_asin_normalize`(规则走 `services/sku_asin` 唯一出处)+ **写入侧当场填**(`extract_order_lines` / `order_history_import`;`upsert_order_lines` 配 `COALESCE(EXCLUDED.asin, t.asin)` 守卫,防同步把扫尾填好的值冲回 NULL) | ✅ **生产完成 2026-08-15**,实测见 §十一.4 |
-| **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | 🔄 **两侧体检已落地 2026-08-15**:店铺侧 `services/store_perf` + `alloc_stores`;产品侧 `services/product_score` + `alloc_products`(硬闸/五信号/权重摊回/黑历史罚分,附**信号覆盖率**一栏 —— 权重再合理信号采不到就是空的)。**A2 主体已落地 2026-08-16**:`services/alloc_engine`(分层轮转,18 条回归)+ `services/product_pool`(候选池与打分,单一出处)+ `services/alloc_groups`(品牌组组装,8 条)+ `workflows/alloc_plan`(漏斗/配额/定向流/切批/发牌/方案表/三张验收指标,默认 dry-run,15 条)。**飞书上架表写入(§9.2)仍待所有者裁定**——它的 A/B/D/E 列与审核批次 D 的投影相撞 |
+| **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | 🔄 **两侧体检已落地 2026-08-15**:店铺侧 `services/store_perf` + `alloc_stores`;产品侧 `services/product_score` + `alloc_products`(硬闸/五信号/权重摊回/黑历史罚分,附**信号覆盖率**一栏 —— 权重再合理信号采不到就是空的)。**A2 主体已落地 2026-08-16**:`services/alloc_engine`(分层轮转,18 条回归)+ `services/product_pool`(候选池与打分,单一出处)+ `services/alloc_groups`(品牌组组装,8 条)+ `workflows/alloc_plan`(漏斗/配额/定向流/切批/发牌/方案表/三张验收指标,默认 dry-run,15 条)。**飞书上架表写入(§9.2)的列权责已定 2026-08-16**:审核批次 D 开闸后 D/E/F/G 归审核域,分配器**只写 A/B**,E 留空即「待审」(写入器本身仍待建) |
 | **A3 学习型** | 权重离线校准(远景) | ⬜ 快照从 A2 第一天就落 |
 
 **A0 收口明细**:
@@ -771,7 +774,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 |---|---|
 | `audit.audit_runs.verdict` | pass / reject / pending |
 | **`catalog.products.audit_status`** | **approved / rejected / pending**(候选池按这套) |
-| 飞书上架表 E 列 | `pass`(大小写不敏感) |
+| 飞书上架表 E 列 | `pass` / `reject` / `pending`(2026-08-16 起由 `product_audit` 投影,映射收在 `listing_sheet.AUDIT_RESULT_CN`;**上架闸不读这列**,只读 `catalog.products`) |
 
 ## 附 D 摸底事实(2026-08-12 四外部仓库,仍有效的部分)
 

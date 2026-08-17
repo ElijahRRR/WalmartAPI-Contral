@@ -41,6 +41,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
   ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
     硬约束 → 同店打包单个 MP_ITEM feed(10/hour 硬限)
 
+闸门链之前先**注入一次 UPC 池**(所有者定稿 2026-08-16:「运行时自动同步
+一次 UPC,然后再走上架流程」)——运营刚贴进「UPC池」表的号,这一轮就要能领。
+注入那段收在 `services.upc_pool.sync_from_sheet`(铁律 1:不能 import
+upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)。
+
 提交结局(旧三态生死语义,UPC 回收仅三类):
   submitted → K=Yes L=feedid M=日期,UPC 标已用,listing_sources 登记(amz),
               事件 list_submitted;O/P/Q 由 feed_poll 反哺器按回执四集合回填
@@ -48,14 +53,16 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
   unknown → K=Unknown(不重复提交),UPC **不回收**
 """
 
+import collections
 import logging
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
-from services import alloc_survey, amz_source, blacklist, brand_key, claims, kpi, \
-    listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
-    pricing, product_events, pt_spec, risk_gate, stores as stores_svc, upc_pool
+from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
+    kpi, listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
+    pricing, product_events, pt_spec, risk_gate, store_limits, \
+    stores as stores_svc, upc_pool, variant_group
 
 DANGEROUS = True
 
@@ -78,6 +85,39 @@ SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NUL
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
 """
+# 审核结论与 PT 的**权威在 PG**(所有者定稿 2026-08-16:「上架链应该以数据库
+# 的数据为准,因为我把审核接进来了,要上架就肯定要过审核,读取速度也更快」)。
+# 上架表 E/D 两列自 2026-08-16 起是这两个字段的**投影**
+# (product_audit -p from_sheet=1 回填),给人看的;闸门读库,不读投影。
+_SQL_VERDICT = """
+SELECT asin, audit_status, walmart_pt
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%s)
+"""
+
+
+def load_verdicts(asins: list[str]) -> dict[str, tuple]:
+    """输入:ASIN 列表 → 输出:{asin: (audit_status, walmart_pt)}。库里没有的不在字典里。"""
+    if not asins:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_VERDICT, (sorted(set(asins)),))
+        return {a: (st, pt) for a, st, pt in cur.fetchall()}
+
+
+AUDIT_OK = "approved"       # catalog.products.audit_status 的过审值
+
+
+def _with_pt(row: dict, verdicts: dict) -> dict:
+    """输入:上架表一行 + 审核字典 → 输出:类目以库为准的同一行。
+
+    「以数据库的数据为准」是同一条口径的两半:结论读库,**类目也读库**。
+    只读结论不读类目的话,表 D 列被手改成另一个 PT,上架会按手改的那个走
+    ——而审核是按库里那个 PT 过的,等于绕过审核换了类目。
+    库里没有 PT(老数据/未审)才退回表里的值。
+    """
+    pt = (verdicts.get(row["asin"]) or (None, None))[1]
+    return {**row, "product_type": pt} if pt else row
 
 
 def _load_gate_state():
@@ -226,7 +266,8 @@ GROUP BY f.store, f.sku
 """
 
 
-def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
+def _retry_rows(rows: list[dict], verdicts: dict
+                ) -> tuple[list[dict], list[tuple[str, str]]]:
     """输入:上架表全部行 → 输出:(可重试行, 已达上限行)。
 
     O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
@@ -238,7 +279,7 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
     走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
     """
     cand = [r for r in rows
-            if r["audit_result"].lower() == "pass"
+            if (verdicts.get(r["asin"]) or (None,))[0] == AUDIT_OK
             and r["list_result"] == "FAILED"]
     if not cand:
         return [], []
@@ -252,8 +293,51 @@ def _retry_rows(rows: list[dict]) -> tuple[list[dict], list[tuple[str, str]]]:
             exhausted.append((r["store"], r["asin"]))
             continue
         # 重新排队:清掉上一轮的 feedid/结果,让主链当新行处理
-        retry.append({**r, "feed_id": "", "listed": "", "list_result": ""})
+        retry.append({**_with_pt(r, verdicts),
+                      "feed_id": "", "listed": "", "list_result": ""})
     return retry, exhausted
+
+
+_FAMILY_LISTED_SQL = """
+SELECT sku, variant_group_id,
+       coalesce(variant_group_info->>'isPrimary', '') AS is_primary
+FROM catalog.walmart_items
+WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
+  AND missing_since IS NULL
+"""
+
+
+def _variant_plan(conn, store: str, r: dict, spec) -> dict:
+    """输入:连接 + 店铺 + 待上架行 + PT spec → 输出:variant_group.plan() 决策。
+
+    ③ 所有者定稿:同族已有成员在架 ⇒ 新成员沿用它的 variantGroupId。
+    ② 分配侧保证「一组变体只分配一个店」⇒ **只查本店**,不做跨店重定向。
+
+    ⚠ 查库失败不许把整行拖下水:变体只是锦上添花,拿不到在架信息就按"本店还没有
+    同族"处理 —— 派生 ID 照样能让以后的兄弟归到一起(group_id 由 parent_asin
+    决定,不依赖这次查询)。
+    """
+    p = r.get("_p") or {}
+    fam = variant_group.parse_family(p.get("variation_asins"), r["asin"])
+    gid, has_primary = "", False
+    if store and len(fam) > 1:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_FAMILY_LISTED_SQL,
+                            {"store": store, "skus": [a for a in fam
+                                                      if a != r["asin"]]})
+                for _sku, g, prim in cur.fetchall():
+                    gid = gid or (str(g) if g else "")
+                    has_primary = has_primary or str(prim).lower() in ("yes", "true")
+        except Exception as e:      # noqa: BLE001
+            logger.warning("%s 查同族在架信息失败(按本店无同族处理): %s",
+                           r["asin"], e)
+    props = (spec or {}).get("properties") or {}
+    enum = mp_conform._enum_of(props.get("variantAttributeNames") or {})
+    return variant_group.plan(
+        r["asin"], p.get("variant_attributes"), p.get("variation_asins"),
+        p.get("parent_asin"), enum,
+        existing_group_id=gid, family_has_primary=has_primary)
 
 
 def _spec_precheck(ready: list[dict]) -> str:
@@ -278,7 +362,8 @@ def _spec_precheck(ready: list[dict]) -> str:
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
-                sku=r["asin"])
+                sku=r["asin"],
+                variant=_variant_plan(conn, r.get("store") or "", r, spec))
             if missing:
                 lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
                              f"{','.join(missing[:8])}")
@@ -289,38 +374,125 @@ def _spec_precheck(ready: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _sync_upc(execute: bool, lines: list[str]) -> None:
+    """先注入一次 UPC 池(所有者定稿 2026-08-16:上架运行时自动同步一次 UPC)。
+
+    ⚠ **不能 import upc_sync 工作流**(铁律 1)——注入那段收在
+    `services.upc_pool.sync_from_sheet`,两个调用方共用同一份代码。
+
+    失败只告警不阻断:飞书挂了不该把整条上架链拖下水,池里已有的号照样能领
+    (最坏情况是本轮 no_upc 多几行,下轮补上)。**但必须说出来** —— 静默跳过
+    会表现为"明明贴了号还是 no_upc",而日志里一个字都没有。
+
+    dry-run 不注入:注入是写库。代价是 dry-run 的 `no_upc` 可能**偏多**
+    (运营刚贴进表格、还没入库的号看不见),这个方向是保守的,摘要里点明。
+    """
+    if not execute:
+        lines.append("  🧪 dry-run 跳过 UPC 注入:真跑会先注入一次,"
+                     "本轮 no_upc 可能比真跑偏多(刚贴进表格的号还没入库)")
+        return
+    try:
+        with db.pg_conn() as conn:
+            got = upc_pool.sync_from_sheet(conn)
+        lines.append(f"  UPC 注入:表内 {len(got['rows'])} 行,新入库 {got['new']}"
+                     + (f",⚠ 非法前缀 {got['bad']}(标注永不分配)"
+                        if got["bad"] else ""))
+    except LookupError as e:
+        lines.append(f"  ⚠ UPC池表未登记,跳过注入({e});池里已有的号照常领")
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("UPC 注入失败(不阻断上架,池里已有的号照常领): %s", e)
+        lines.append(f"  ⚠ UPC 注入失败({e}),本轮用池里已有的号;"
+                     f"刚贴进表格的号要等下轮或手动 `python cli.py upc_sync`")
+
+
+def _writeback_upc(execute: bool, lines: list[str]) -> None:
+    """上架**之后**把 UPC 池状态回写飞书 C~F(所有者定稿 2026-08-16)。
+
+    与开头那次注入是同一个工作流的两头,合起来等于跑了一次 `upc_sync`,
+    所以 `upc_sync` 不必再单独挂调度(所有者:「放到上架里」)。
+
+    ⚠ **必须放在上架之后**:回写的是 PG 现状(哪些号已领、已用、给了谁)。
+    放在注入旁边一起做,回写出来的是**上一轮**的状态 —— 表面看也在动,
+    实际上你永远看不到刚刚这一轮消耗了哪些号。
+
+    失败只告警不阻断:feed 已经提交出去了,回写只是展示面板
+    (与 maintenance 写维护记录同款纪律)。
+    """
+    if not execute:
+        return
+    try:
+        with db.pg_conn() as conn:
+            got = upc_pool.sync_from_sheet(conn)     # 先取行(顺带把新号补进来)
+            n = upc_pool.project_to_sheet(conn, got["rows"]) if got["rows"] else 0
+        lines.append(f"UPC池状态回写 {n} 行(仅差异行)")
+    except LookupError as e:
+        lines.append(f"⚠ UPC池表未登记,状态未回写({e})")
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("UPC池状态回写失败(不影响本轮上架): %s", e)
+        lines.append(f"⚠ UPC池状态回写失败:{e}"
+                     f"(feed 已提交;补写跑 `python cli.py upc_sync`)")
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    fresh = [r for r in rows
-             if r["audit_result"].lower() == "pass"
-             and r["listed"].lower() in ("", "no")
-             and not r["feed_id"]
-             # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
-             # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
-             and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
-    retry, exhausted = _retry_rows(rows)
+    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里 E 列是投影,
+    # 可能被人手改、可能滞后;PG 是权威,而且快。
+    verdicts = load_verdicts([r["asin"] for r in rows if r.get("asin")])
+    open_rows = [r for r in rows
+                 if r["listed"].lower() in ("", "no") and not r["feed_id"]
+                 # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
+                 # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
+                 and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
+    fresh, n_unaudited, n_rejected = [], 0, 0
+    for r in open_rows:
+        st = (verdicts.get(r["asin"]) or (None, None))[0]
+        if st == AUDIT_OK:
+            fresh.append(_with_pt(r, verdicts))
+        elif st in ("rejected",):
+            n_rejected += 1
+        else:                       # 没结论 / pending
+            n_unaudited += 1
+    retry, exhausted = _retry_rows(rows, verdicts)
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
              + (f"(其中重试 {len(retry)})" if retry else "")]
+    if n_unaudited or n_rejected:
+        # ⚠ 必须点名:审核闸从"读表 E 列"改成"读库"之后,**没审过的行会静默
+        # 消失在待上架里**。不说的话表现是"表里明明有几百行却一行也不上"
+        lines.append(
+            f"  审核闸(读 catalog.products,不读表 E 列):"
+            + (f"**未审核 {n_unaudited} 行**"
+               f"(先跑 `python cli.py product_audit -p from_sheet=1`)"
+               if n_unaudited else "")
+            + (f"{';' if n_unaudited else ''}审核判拒 {n_rejected} 行(不上)"
+               if n_rejected else ""))
     if exhausted:
         lines.append(f"  ⚠ 重试已达上限({MAX_LIST_ATTEMPTS} 次)不再自动重试:"
                      + ",".join(a for _, a in exhausted[:10]))
     if not pending:
         return "\n".join(lines)
 
+    # UPC 注入排在闸门链之前:领号是第 ⑦ 道闸,运营刚贴进表格的号必须这一轮就能用
+    _sync_upc(execute, lines)
+
     (inactive, today_used, listed, banned, unexplained, gate,
      owned_asin, owned_brand) = _load_gate_state()
     quota = _load_quota()
     mults = _load_multipliers()
+    lead_caps = store_limits.lead_day_caps()      # 按店「配送时长限制」
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
-         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0}
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
+         "lead_days": 0}
+    # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
+    # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
+    n_var: dict[str, int] = collections.defaultdict(int)
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
     missing_warn: list[str] = []             # 不明消失史,放行但报警
     candidates: list[dict] = []
@@ -454,11 +626,18 @@ def run(params: dict) -> str:
                             f"该区间倍率未配置:落地价 "
                             f"{pricing.landed_price(p.get('price'), p.get('shipping'))}"))
             continue
-        # 配送时长同样三态:采到且 >12 天 → 上架但库存写 0(旧规则);
-        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了
-        lead = p.get("lead_days")
-        qty = 0 if (lead is not None and lead > amz_source.MAX_LEAD_DAYS) \
-            else int(stock)
+        # 配送时长超限 ⇒ **不上架**(所有者定稿 2026-08-16 走进生产;
+        # 此前是"上架但库存写 0")。不上架就不占 UPC、不占配额,比上一个
+        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 8 天。
+        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了。
+        lead_cap = store_limits.cap_for(lead_caps, store_name,
+                                        amz_source.MAX_LEAD_DAYS)
+        if store_limits.over_lead_cap(p.get("lead_days"), lead_cap):
+            n["lead_days"] += 1
+            reasons.append((r["rownum"],
+                            f"配送 {p.get('lead_days')} 天 > 本店上限 {lead_cap} 天"))
+            continue
+        qty = int(stock)
         echo[3] = w_price               # 算出定价的行回显 J 列
         if not ((p.get("attrs") or {}).get("weight")):
             n["no_weight"] += 1         # ShippingWeight 将按 1.0 磅兜底,亮出来
@@ -478,11 +657,15 @@ def run(params: dict) -> str:
     gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
                  f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
                  f"去重 {n['dedup']},黑名单 {n['blacklist']},"
-                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']}")
+                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']},"
+                 f"配送超时 {n['lead_days']}")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
+    if n_var:
+        gate_line += (";变体:" + ",".join(f"{k} {v}" for k, v in
+                                          sorted(n_var.items())))
     if n["no_weight"]:
         # 采集侧没给 attrs.weight → ShippingWeight 兜 1.0 磅。持续大面积
         # 出现 = 采集契约的 weight 形态可能对不上(backlog P1 核实项)
@@ -550,10 +733,13 @@ def run(params: dict) -> str:
                         llm_fields=llm_o)
                     # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
                     # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
+                    vplan = _variant_plan(conn, store_name, r,
+                                          pt_spec.load_pt(r["product_type"]))
+                    n_var[vplan["code"]] += 1
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
                         pt_spec.orderable_spec(), visible, orderable,
-                        sku=r["asin"])
+                        sku=r["asin"], variant=vplan)
                     if notes:
                         logger.info("%s spec 一致化 %d 处:%s", r["asin"],
                                     len(notes), "; ".join(notes[:6]))
@@ -615,5 +801,6 @@ def run(params: dict) -> str:
 
     for rownum, why in reasons[n_reasons_written:]:   # 提交期新增的理由(UPC/标题)
         listing_sheet.write_reason(rownum, why)
+    _writeback_upc(execute, lines)
     lines.append("回执 O/P/Q 由 feed_poll 反哺器回填;结果轮询走 feed_poll")
     return "\n".join(lines)

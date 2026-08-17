@@ -22,10 +22,13 @@
 
 - **沃尔玛 API 必须走 api/_client.py,每店铺固定出口代理,严禁直连。**
   每个店铺凭证绑定固定出口 IP,直连会导致店铺关联封号。这是业务生死线。
-- **危险工作流默认 dry-run。** 提交 feed、DELETE_ITEM、清库存类操作,默认只打印
-  "将对哪些 SKU 做什么",真跑必须显式 `--execute`。cli.py 对标记 `dangerous=True`
-  的 workflow 强制此行为。
-- **AI 改完代码必须先 dry-run,人眼确认输出后才允许 --execute。**
+- **⚠ 2026-08-16 走进生产后改了默认值:缺省即真跑,空跑用 `--dry-run`。**
+  此前是"危险工作流缺省 dry-run,真跑加 `--execute`"。改的理由:进了调度之后,
+  "缺省 dry-run"这条防线只会伤到自己 —— launchd 里漏写一个 `--execute` 的后果是
+  **那条链每天空转而且报成功**,比误跑更难发现(误跑至少留下痕迹)。
+  `--execute` 保留为兼容别名(空操作),调度里写了也不会错。
+- **AI 改完代码必须先 `--dry-run`,人眼确认输出后才跑真的。** 这条**没有取消**,
+  只是从"默认值兜底"降级成"纪律" —— 默认值不再替你挡,所以更要自觉。
 - **防重状态先落库再调接口。** 提交 feed 前先写 pending,成功后改 done;
   程序重启时,所有 pending 记录先去 Walmart 查实际状态再决定是否补交。
 - **新旧系统严禁对同一破坏性任务并跑。** 切换某条工作流时:先停旧调度 → 搬状态 → 起新调度。
@@ -56,7 +59,11 @@ api/            按外部系统与沃尔玛 API 域分文件:_client, items, pri
 services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
-docs/           plan.md / db_schema.md / feishu_tables.md / legacy_reference.md /
+skills/         **生成物**(进 git):智能体定时任务的技能包,由 `cli.py skill_export`
+                从 registry/schedule.JOBS 渲染 —— 不要手改,改调度表再重新生成
+docs/           plan.md / production_cutover.md(**走进生产的定稿与待办,起调度这一役先读它**) /
+                feed_closure_audit.md(feed 库侧闭环审计:六提交点×三台账×五反哺器) /
+                db_schema.md / feishu_tables.md / legacy_reference.md /
                 legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md /
                 api_blueprint.md(端点定稿) / audit_migration_plan.md(审核链) /
                 category_mapping.md(**类目映射链九条工作流的唯一文档**)

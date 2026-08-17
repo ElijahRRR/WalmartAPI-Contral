@@ -7,7 +7,8 @@ import pytest
 
 from api import feishu
 from registry import resources
-from workflows import order_center_push as ocp
+from services import order_center as ocp
+from workflows import order_center_push as ocw
 
 F_SALES = resources.ORDER_SALES.fields
 F_PERF = resources.ORDER_PERF.fields
@@ -65,7 +66,7 @@ def test_push_sales_row_shape_and_no_delete(monkeypatch):
     captured = _capture_sync(monkeypatch)
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [_SALES_ROW])
 
-    line, keys = ocp._push_sales(90)
+    line, keys = ocp.push_sales(90)
     assert "1 行" in line and keys == {"ol_abc"}
     cap = captured["订单中心-销售订单"]
     assert cap["key_field"] == F_SALES.key == "order_line_id"
@@ -92,7 +93,7 @@ def test_push_returns_key_is_rma_plus_line(monkeypatch):
                 "store": "T1", "po_id": "PO1"})
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
 
-    ocp._push_returns(90)
+    ocp.push_returns(90)
     cap = captured["订单中心-售后订单"]
     assert cap["key_field"] == "唯一键"
     assert set(cap["desired"]) == {"RMA1|ol_x"}
@@ -116,7 +117,7 @@ def test_push_perf_shaping(monkeypatch):
     ]
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: rows)
 
-    ocp._push_perf()
+    ocp.push_perf()
     desired = captured["订单中心-绩效订单"]["desired"]
     assert set(desired) == {"PO1|otd", "PO2|自创指标"}
     d1 = desired["PO1|otd"]
@@ -145,7 +146,7 @@ def test_push_settlement_latest_period_fields(monkeypatch):
     }
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
 
-    ocp._push_settlement(90)
+    ocp.push_settlement(90)
     d = captured["订单中心-对账明细"]["desired"]["ol_s"]
     assert d[F_SETTLE.settle_status] == "已退款"
     assert d[F_SETTLE.period] == "07292026"
@@ -168,7 +169,7 @@ def test_push_keys_creates_only_missing(monkeypatch):
     monkeypatch.setattr(feishu, "batch_create",
                         lambda t, fl: (created.append((t.name, fl)),
                                        [f"n{i}" for i in range(len(fl))])[1])
-    lines = ocp._push_keys({"ol_a", "ol_b"})
+    lines = ocp.push_keys({"ol_a", "ol_b"})
     # 状态里已有 ol_a → 只建 ol_b;record_id 回存本地状态
     assert len(lines) == 2 and all("键补齐 1 行" in x for x in lines)
     assert created[0][1] == [{"order_line_id": "ol_b"}]
@@ -179,12 +180,12 @@ def test_push_keys_creates_only_missing(monkeypatch):
 def test_run_skips_unregistered_tables(monkeypatch):
     # 默认环境未登记 app_token/table_id → 六表全部走"跳过(未登记)",不报错
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [])
-    out = ocp.run({})
+    out = ocw.run({})
     assert out.count("跳过(未登记)") == 6
 
 
 def test_run_rejects_unknown_table_param():
-    assert "table 只接受" in ocp.run({"table": "nope"})
+    assert "table 只接受" in ocw.run({"table": "nope"})
 
 
 def test_run_partial_failure_raises_after_all_tables(monkeypatch):
@@ -198,10 +199,12 @@ def test_run_partial_failure_raises_after_all_tables(monkeypatch):
         return (0, 0, 0)
 
     monkeypatch.setattr(ocp, "_sync_stateful", fake_sync)
-    monkeypatch.setattr(ocp, "_push_keys",
+    monkeypatch.setattr(ocp, "push_keys",
                         lambda keys, reconcile=False: ["keys ok"])
+    # ⚠ 手动补推入口**失败必须记 failed**;业务链顺手写的那次相反(push_after
+    # 只告警)—— 数据已经在 PG,不该让飞书拖累一轮数据拉取的成败判定
     with pytest.raises(RuntimeError, match="部分表同步失败"):
-        ocp.run({})
+        ocw.run({})
     # 销售表失败不挡后面的表(售后/绩效/对账仍同步)
     assert len(seen) == 4
 
@@ -354,3 +357,64 @@ def test_sync_stateful_write_failure_drops_state(monkeypatch):
     with pytest.raises(feishu.FeishuError):
         ocp._sync_stateful(t, {"k1": {"perf_key": "k1"}})
     assert calls["dropped"] == [t.name]      # 清状态,下轮全量对账自愈
+
+
+# ── 拆家:各链跑完自己写飞书(工作项 B,所有者定稿 2026-08-16)────────────────
+
+def test_each_chain_pushes_its_own_table_and_nobody_else_s():
+    """「已对接飞书表的,执行完就写,不要做成单独的」——四条链各写各的。
+
+    映射收在 services 一处(BY_WORKFLOW),不在各工作流里抄字符串:
+    加一张表时漏改的那条链会**静默不写**,而且看不出来。
+    """
+    import inspect
+
+    from workflows import order_sync, perf_problems, returns_sync, settlement_sync
+    assert set(ocp.BY_WORKFLOW) == {"order_sync", "returns_sync",
+                                    "perf_problems", "settlement_sync"}
+    # 五张表恰好被瓜分干净,不重不漏
+    covered = [t for v in ocp.BY_WORKFLOW.values() for t in v]
+    assert sorted(covered) == sorted(ocp.TABLES)
+    assert len(covered) == len(set(covered))
+    for m, key in ((order_sync, "order_sync"), (returns_sync, "returns_sync"),
+                   (perf_problems, "perf_problems"),
+                   (settlement_sync, "settlement_sync")):
+        src = inspect.getsource(m)
+        assert f'BY_WORKFLOW["{key}"]' in src, m.__name__
+        assert "push_after(" in src, m.__name__
+
+
+def test_push_after_never_fails_the_data_pull(monkeypatch):
+    """⚠ 数据已经落 PG 了,飞书写失败不该让那一轮数据拉取记成 failed。
+
+    但**必须说出来** —— 否则表现成"跑成功了可表格没动"(所有者 2026-08-16
+    在日报上实遇过这种:日志三处写着未配置,摘要却报成功)。
+    """
+    def boom(names, days=90, reconcile=False):
+        raise RuntimeError("飞书 502")
+
+    monkeypatch.setattr(ocp, "push_tables", boom)
+    out = ocp.push_after(("sales",))
+    assert "⚠ 飞书投影失败" in out and "飞书 502" in out
+    assert "数据已在 PG" in out and "order_center_push" in out    # 补推指路
+
+    monkeypatch.setattr(ocp, "push_tables",
+                        lambda names, days=90, reconcile=False: (["sales:ok"],
+                                                                 ["sales"]))
+    out2 = ocp.push_after(("sales",))
+    assert "⚠ 失败 1 张" in out2 and "-p table=sales" in out2
+
+
+def test_keys_branch_passes_both_sql_params(monkeypatch):
+    """⚠ 搬家前 keys 分支只给 _SALES_SQL 传了 (days,),而它有**两个**占位符。
+
+    `order_center_push -p table=keys` 一跑就是参数个数不匹配 —— 拆函数时
+    顺手修的,用例钉住别再退回去。
+    """
+    seen = []
+    monkeypatch.setattr(ocp, "_fetch",
+                        lambda sql, args: (seen.append(args), [])[1])
+    monkeypatch.setattr(ocp, "push_keys", lambda keys, reconcile=False: ["ok"])
+    ocp.push_tables(("keys",), days=30)
+    assert len(seen) == 1 and len(seen[0]) == 2 and seen[0][0] == 30
+    assert ocp._SALES_SQL.count("%s") == 2

@@ -1063,8 +1063,10 @@ CREATE TABLE IF NOT EXISTS ops.dispositions (
     store        text NOT NULL,
     sku          text NOT NULL,
     asin         text,                  -- 有则记,便于与产品中心/黑名单对齐
-    source       text NOT NULL,         -- scan / audit / tro(预留)
-    action       text NOT NULL,         -- relist / delete / retire
+    source       text NOT NULL,         -- scan / audit / tro(预留) / maint
+    action       text NOT NULL,         -- 问题商品链:relist / delete / retire
+                                        -- 维护链(source=maint):title / price /
+                                        -- inventory / delete(delete 两链共用)
     category     text,                  -- services/problem_products 归类码
     reason       text,                  -- 依据(人读:沃尔玛给的 unpublished_reasons 等)
     status       text NOT NULL DEFAULT 'suggested',

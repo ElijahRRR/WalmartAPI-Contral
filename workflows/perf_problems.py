@@ -24,6 +24,7 @@ import httpx
 
 from api import _client, insights
 from registry import db
+from services import order_center
 from services import kpi, order_lines, stores as stores_svc
 
 DANGEROUS = False
@@ -123,4 +124,6 @@ def run(params: dict) -> str:
             f"订单不在库丢弃 {total_unlinked})")
     if failed:
         line += f",失败:{','.join(failed)}"
-    return line
+    # 跑完就写飞书(绩效表全量,自身有界,不吃 days 窗口)
+    return line + "\n" + order_center.push_after(
+        order_center.BY_WORKFLOW["perf_problems"])

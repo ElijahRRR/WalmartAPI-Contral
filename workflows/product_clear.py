@@ -171,15 +171,21 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                     for r in slice_rows:
                         updates.append((r["rownum"], res["feed_id"], today,
                                         "处理中", ""))
-                    # 产品事件账本:提交事件(含操作原因,病历的"医嘱"部分)
-                    with db.pg_conn() as conn:
-                        product_events.record_many(conn, [
-                            {"sku": r["sku"], "store": store_name,
-                             "event": f"{product_events.feed_kind(feed_type)}_submitted",
-                             "source": "product_clear",
-                             "detail": {"feed_id": res["feed_id"],
-                                        "reason": r["reason"]}}
-                            for r in slice_rows])
+                    # 产品事件账本:提交事件(含操作原因,病历的"医嘱"部分)。
+                    # ⚠ **只在 submitted 时记**(2026-08-16 feed 闭环审计):
+                    # dedup 挂的是旧 feed_id、这一轮什么都没提交,记了就是幽灵
+                    # 事件 —— catalog.product_risk 的 delete_times/retire_times
+                    # 直接数它,灌水后"这个 SKU 被删过几次"就不再是事实。
+                    # 表格那几列照写不误:在途 feed 的结果确实会落到这几行上。
+                    if res["outcome"] == "submitted":
+                        with db.pg_conn() as conn:
+                            product_events.record_many(conn, [
+                                {"sku": r["sku"], "store": store_name,
+                                 "event": f"{product_events.feed_kind(feed_type)}_submitted",
+                                 "source": "product_clear",
+                                 "detail": {"feed_id": res["feed_id"],
+                                            "reason": r["reason"]}}
+                                for r in slice_rows])
                 elif res["outcome"] == "failed":
                     for r in slice_rows:
                         updates.append((r["rownum"], "", "", "提交被拒", ""))

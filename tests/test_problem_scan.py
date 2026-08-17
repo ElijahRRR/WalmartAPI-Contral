@@ -400,10 +400,19 @@ def _summ(*a):
 def test_count_open_is_not_the_write_count():
     """suggest_many 报"写了多少次",count_open 报"库里有多少条" —— 两者会差,
     差额是被唯一索引合并的条数(本轮实测 519 次写入 → 库里 470 条)。
-    执行件领走的是后者,摘要要报的也是后者。"""
+    执行件领走的是后者,摘要要报的也是后者。
+
+    2026-08-16 加了 sources 过滤(维护链共用同一张建议表):**必须限本链来源**,
+    否则摘要把维护链的待执行也算进来,又和执行件领到的数对不上。"""
+    import inspect
+
     from services import dispositions
-    assert "SELECT count(*) FROM ops.dispositions WHERE status = %s::text" \
-        in __import__("inspect").getsource(dispositions.count_open)
+    src = inspect.getsource(dispositions.count_open)
+    assert "SELECT count(*) FROM ops.dispositions WHERE status = %(st)s::text" in src
+    assert "source = ANY(%(sources)s::text[])" in src
+    # 调用方必须传 sources —— 不传就退化成"全表计数"
+    scan_src = inspect.getsource(scan.run)
+    assert "sources=dispositions.PROBLEM_SOURCES" in scan_src
 
 
 def test_summarize_dedupes_like_the_unique_index():

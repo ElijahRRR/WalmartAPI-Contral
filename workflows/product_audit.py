@@ -10,12 +10,18 @@
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
+  python cli.py product_audit -p from_sheet=1 --execute    # 上架表驱动:审真待审的 + 回填 C~G
+  python cli.py product_audit -p from_sheet=1 -p limit=3000 --execute   # 存量大时加大一轮的量
 
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
 L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;--execute 才写
-products.audit_* 五列与审核事件。**只落库不投影飞书**(并跑期纪律,
-E/D 列投影在批次 D 切换日开闸)。
+products.audit_* 五列与审核事件。**`-p from_sheet=1` 时另把结论投影回上架表
+C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
+
+⚠ `from_sheet` **不是强审**:表 E 列为空只说明表里没有结论,库里可能早就有。
+已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
+(未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
 五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
@@ -41,14 +47,20 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 """
 
 import logging
+import re
 import time
 
 from registry import db, resources
-from services import audit_reason, audit_rules, audit_store, product_events
+from services import audit_reason, audit_rules, audit_store, \
+    listing_sheet, product_events
 
 DANGEROUS = True
 
 logger = logging.getLogger("workflows.product_audit")
+
+# 上架表取回来的 ASIN 长这样才算 ASIN(与 scrape_missing/product_refresh 同款)。
+# 用途只有一个:列错位守卫 —— 见 run() 里 from_sheet 那段
+_ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
 # 分段提交与进度播报的粒度(生产事故 2026-08-14:34 万行跑在同一个未提交
 # 事务里 —— 外部查不到任何进度、Ctrl-C 全部回滚、长事务还挡住 vacuum)。
@@ -138,20 +150,43 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"execute", "asins", "limit", "mode", "r5", "force_rerun",
-                 "l3", "l4", "workers", "adopt_only"}
+_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun",
+                 "l3", "l4", "workers", "adopt_only", "from_sheet"}
+# cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
+# cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
+# 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
+_CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
 _MODES = {"backfill", "pending"}
 
+# **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
+#   · 没结论(新品 / 从没审过)             → 审
+#   · pending(L1 解不出类目 / L3 LLM 故障)→ 隔天重试一次
+#   · approved / rejected                  → **不重审**。approved 只有在
+#     `slow_hash` 变了(产品本身改了)时由 product_ingest 翻回 pending;
+#     rejected 永不自动重审(45 天 TTL 那套已废除)
+#   · 要整批重审只有一条路:`-p force_rerun=<规则版本>`(人工显式)
+_DEFAULT_CANDIDATE = (
+    "(p.audit_status IS NULL OR (p.audit_status = 'pending' "
+    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))")
+
 
 def _pick_where(params: dict) -> tuple[str, dict]:
-    unknown = set(params) - _KNOWN_PARAMS
+    unknown = set(params) - _KNOWN_PARAMS - _CLI_INJECTED
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
     asins = [a.strip() for a in str(params.get("asins", "")).split(",")
              if a.strip()]
     if asins:
+        if params.get("from_sheet"):
+            # ⚠ 上架表驱动**不是强审**(所有者纠正 2026-08-16:「按我们的运行
+            # 逻辑,不是应该直接从库里读取结果吗」)。E 列为空只说明**表里**
+            # 没有结论,不说明库里没有 —— 库里已有结论的直接投影回表(零 LLM),
+            # 只有真待审的才进判定引擎。当成强审的后果是每轮把已审过的几万个
+            # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
+            return f"p.asin = ANY(%(asins)s) AND {_DEFAULT_CANDIDATE}", \
+                {"asins": asins}
         # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
         # 运行时短路可绕,绕的是 audit_status 候选谓词)
         return "p.asin = ANY(%(asins)s)", {"asins": asins}
@@ -173,8 +208,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         return "p.audit_status = 'pending'", {}
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
-    return ("(p.audit_status IS NULL OR (p.audit_status = 'pending' "
-            "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))"), {}
+    return _DEFAULT_CANDIDATE, {}
 
 
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
@@ -234,8 +268,138 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     return len(adopted), adopted
 
 
+_SQL_VERDICT = """
+SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%s)
+"""
+
+
+_SQL_SHEET_STATE = """
+SELECT coalesce(audit_status, '未审') AS st, count(*)
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%s)
+GROUP BY 1
+"""
+
+
+def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
+    """输入:本轮 limit → 输出:(上架表待审行, 交给候选谓词的 ASIN, 摘要前言)。
+
+    所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
+    (结果为空就审核)」。实现上**走 asins= 那条既有路径** —— 审核引擎只有
+    一条实现,这里只是换了个领任务的地方(与 problem_scan/maintenance_scan
+    那种"决策与执行分家"同理)。
+
+    ⚠ **ASIN 列表不在这里截断**(所有者纠正 2026-08-16:「不是应该直接从库里
+    读取结果吗」)。E 列为空 ≠ 库里没结论:整批交给 `_DEFAULT_CANDIDATE` 谓词,
+    已有结论的**根本不进候选**(零 LLM,靠 `_project_to_sheet` 把库里的结论
+    投影回表),`LIMIT` 只限制**真要判的**那部分。
+    先截断的话已审过的会占满名额,每轮都在重判老货,新品永远排不上。
+
+    一行都没有时 ASIN 列表为空,前言里是那句说明(调用方直接返回它)。
+    """
+    rows = listing_sheet.audit_targets()
+    want = sorted({r["asin"] for r in rows})
+    if not want:
+        return [], [], ["上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
+                        "想重审就把该行 E 列(审核结果)清空 —— 那是唯一的重审入口"]
+    bad = [a for a in want if not _ASIN_RE.match(a)][:5]
+    if bad:
+        # ⚠ 列错位的唯一征兆。表头再被调一次而 registry 的列元组没跟着改,
+        # 这里拿到的就是店铺名/标题,而审核会照样跑完、照样回填,只是全都
+        # 判"库里没有" —— 看起来像"这批产品还没采集",查半天查不到根因。
+        # 宁炸不吞:在动库之前就停下,并说清怀疑的是列序
+        raise ValueError(
+            f"上架表取到的 ASIN 不像 ASIN(样例 {bad});"
+            f"多半是表头列序变了而 registry.resources.LISTING_SHEET.columns "
+            f"没跟着改(现登记:{resources.LISTING_SHEET.columns[:3]}…)")
+    head = [f"上架表 E 列为空 {len(want)} 个 ASIN"
+            f"({len(rows)} 行,同 ASIN 多店铺算多行)"]
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_SHEET_STATE, (want,))
+        st = {k: int(n) for k, n in cur.fetchall()}
+    absent = len(want) - sum(st.values())        # 库里压根没有这个 ASIN
+    done = st.get("approved", 0) + st.get("rejected", 0)
+    todo = st.get("未审", 0) + st.get("pending", 0)
+    # 这三个数是"为什么这轮还在审"的全部答案,必须在摘要里(只写日志的话
+    # 飞书通知看着像"审完了")
+    head.append(
+        f"  库里已有结论 {done}(过 {st.get('approved', 0)}/拒 "
+        f"{st.get('rejected', 0)})→ **直接回填,不重审**"
+        f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
+        + (f";⚠ 不在库 {absent}(采集还没摄进来,本轮既审不了也填不了 —— "
+           f"先跑 product_ingest)" if absent else ""))
+    if todo > limit:
+        logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
+        head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
+                    f"{todo - limit} 个**待审;再跑一次接着判"
+                    f"(或 -p limit=N 加大)")
+    return rows, want, head
+
+
+def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
+    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 C/D/E/F/G。
+
+    所有者定稿 2026-08-16。⚠ 三条:
+
+    · **E 列写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
+      `audit_result.lower() == "pass"`。写别的那行永远上不去,而且不报错。
+      映射收在 `listing_sheet.AUDIT_RESULT_CN`。
+    · **库里没有的 ASIN 一行都不写**(留 E 空)。写个 pending 会让人以为审过了;
+      留空则下轮自动重领,而且 `list_new` 只认 pass,留空绝不会误上架。
+      摘要里点名有多少行卡在这。
+    · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
+
+    回填失败只告警不失败:结论已经落 PG 了(products 五列 + audit_runs),
+    飞书只是人机界面 —— 与订单中心那条同款纪律。
+    """
+    try:
+        asins = sorted({r["asin"] for r in sheet_rows})
+        with db.pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(_SQL_VERDICT, (asins,))
+                got = {r[0]: r for r in cur.fetchall()}
+            # F 列写**人话**:`products.audit_reason` 存的是 37 条沃尔玛政策的
+            # 类目名,而其中 `General-Use Products` 是"以上全不中"的兜底 ——
+            # 落在一把锤子、一个土豆压泥器上时人只会一头雾水(所有者
+            # 2026-08-16)。真正的原因在命中的规则里,翻出来放前面
+            reasons = audit_store.reject_reasons(conn, asins)
+        updates, absent = [], 0
+        for r in sheet_rows:
+            row = got.get(r["asin"])
+            if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
+                absent += 1
+                continue
+            _, title, pt, status, reason, at = row
+            why = (audit_reason.human_reason(reasons.get(r["asin"], []), reason)
+                   if status == "rejected" else (reason or ""))
+            updates.append((r["rownum"], [
+                title or "", pt or "",
+                listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                why[:500],
+                at.strftime("%Y-%m-%d") if at else ""]))
+        listing_sheet.write_audit_cols(updates, execute)
+        # ⚠ 回填的是**整张表里所有已有结论的行**,不是本轮判的那 limit 个 ——
+        # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
+        # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
+        # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
+        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行 C~G"
+               f"(整表已有结论的都投影,不只本轮判的那些)"
+               f"{'' if execute else ';dry-run 一格未写'}")
+        if absent:
+            out += (f";⚠ {absent} 行库里没有结论,**E 列留空**"
+                    f"(下轮自动重领;先跑 product_ingest 把这些 ASIN 采进来)")
+        return out
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("上架表回填失败(结论已在 PG,不影响本轮): %s", e)
+        return (f"⚠ 上架表回填失败:{e}"
+                f"(结论已在 catalog.products;重跑 "
+                f"`python cli.py product_audit -p from_sheet=1` 补写)")
+
+
 def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute)→ 输出:判定统计摘要。"""
+    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
@@ -259,6 +423,15 @@ def run(params: dict) -> str:
                        "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
+    # ── 上架表驱动(所有者定稿 2026-08-16;领任务在 _claim_from_sheet)──────
+    sheet_rows: list[dict] = []
+    sheet_head: list[str] = []
+    if params.get("from_sheet"):
+        sheet_rows, asins, sheet_head = _claim_from_sheet(limit)
+        if not asins:
+            return sheet_head[0]
+        params = {**params, "asins": ",".join(asins)}
+
     where, extra = _pick_where(params)
     if adopt_only:
         # 只采用模式下**只挑有历史结论的行**:否则候选按 audited_at NULLS
@@ -276,9 +449,11 @@ def run(params: dict) -> str:
         ctx = audit_rules.load_context(conn, uspto=uspto)
         query_params = {"marketplace": "US", "limit": limit, **extra}
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
-        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
-        guard = (_RECENT_RUN_GUARD
-                 if (not execute and "asins" not in extra) else "")
+        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉。
+        # 豁免的是**强审**(人点名要审就得审),不是"参数里有 asins" ——
+        # from_sheet 也往 extra 塞 asins,但它走的是默认候选谓词,该护栏照吃
+        forced = bool(extra.get("asins")) and not params.get("from_sheet")
+        guard = _RECENT_RUN_GUARD if (not execute and not forced) else ""
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where,
                                               recent_guard=guard),
@@ -412,11 +587,12 @@ def run(params: dict) -> str:
             (pending_total,) = cur.fetchone()
 
     judged = sum(counts.values())
-    lines = [f"product_audit({resources.AUDIT_RULES_VERSION}"
-             f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
-             f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
-             f"候选 {len(rows)},判定 {judged}"
-             f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
+    lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
+    lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
+              f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
+              f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
+              f"候选 {len(rows)},判定 {judged}"
+              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
     l1s = audit_rules.audit_l1_llm.STATS
     if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
         lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
@@ -498,6 +674,8 @@ def run(params: dict) -> str:
         lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
                      f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
     lines.append(f"全库 pending 存量 {pending_total}")
+    if sheet_rows:
+        lines.append(_project_to_sheet(sheet_rows, execute))
     if not execute:
         lines.append("(dry-run:runs/hits 已落,products 五列与事件未写)")
     return "\n".join(lines)

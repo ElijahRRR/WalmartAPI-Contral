@@ -361,3 +361,46 @@ def test_b7_normalize_l3_cat():
     assert audit_reason._normalize_l3_cat("brand_misuse") == "Intellectual Property"
     assert audit_reason._normalize_l3_cat("None") is None
     assert audit_reason._normalize_l3_cat("some new policy") == "Some New Policy"
+
+
+# ── 人话理由(所有者 2026-08-16:「General-Use Products 这是什么意思」)──────
+
+def test_human_reason_leads_with_the_rule_not_the_policy():
+    """⚠ `General-Use Products` 是 37 政策映射第 4g 步的**兜底**(以上全不中)。
+
+    它落在一把锤子、一个土豆压泥器上时,人只会一头雾水 —— 那不是原因,
+    是"没能归到具体哪条政策"。真正的原因在命中的规则里,而 hit.detail 里
+    本来就写着中文 note,此前一个字都没露给人看。
+    """
+    h = audit_reason.human_reason(
+        [("cat_requires_cert_hard",
+          {"walmart_pt": "Hammers",
+           "note": "飞书维护的合规要求 (含实验室证书/官方注册号), 搬运模式做不了",
+           "matched_hard_kws": ["ASTM F2413", "CPC"]})],
+        "General-Use Products")
+    assert h.startswith("**该类目要求认证**")     # 人话在最前
+    assert "搬运模式做不了" in h                  # 规则作者当场写下的"为什么"
+    assert "ASTM F2413" in h                      # 命中的是哪条要求
+    assert h.endswith("[政策:General-Use Products]")   # 平台口径留着,但不占头
+
+
+def test_human_reason_keeps_the_policy_even_with_no_hits():
+    """一条规则都没记到时也不能只留一个政策名 —— 要明说是"没记录"。"""
+    assert audit_reason.human_reason([], "Intellectual Property") \
+        == "未记录命中规则[政策:Intellectual Property]"
+    assert audit_reason.human_reason([], None) == "未记录命中规则"
+
+
+def test_human_reason_drops_process_only_hits():
+    """`pt_dict_fallback` 之流是过程留痕不是拒绝原因,单独出现时不当理由显示。"""
+    out = audit_reason.human_reason(
+        [("pt_dict_fallback", {}), ("phase0_brand_blacklist", {"brand": "Nike"})],
+        "Intellectual Property")
+    assert "字典回落" not in out and "品牌黑名单(命中:Nike)" in out
+
+
+def test_explain_hit_falls_back_to_the_rule_code_it_does_not_know():
+    """新加规则忘了登记中文名时,露出规则码总好过露出空白。"""
+    assert audit_reason.explain_hit("brand_new_rule", {}) == "brand_new_rule"
+    assert audit_reason.explain_hit("brand_new_rule", {"note": "因为 X"}) \
+        == "brand_new_rule(因为 X)"

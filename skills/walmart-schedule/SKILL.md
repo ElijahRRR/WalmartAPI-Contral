@@ -1,0 +1,69 @@
+---
+name: walmart-schedule
+description: 沃尔玛业务链的定时任务执行手册(每日/每周那部分;高频链在电脑 launchd 上,不归这里)
+---
+
+# 沃尔玛定时任务
+
+> **本文件是生成的,不要手改。** 出处是 `registry/schedule.py` 的 `JOBS`,改完跑 `python cli.py skill_export` 重新生成。
+> 手改会造成「提示词里写的」和「代码里定的」不一致,而这种不一致**没有任何东西会报错**。
+
+## 你要做的事
+
+到点在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下跑一行命令,看退出码,失败了把日志发给苏里。
+就这些 —— 业务判断全在代码里,不需要你替它决定任何事。
+
+## 任务表
+
+| 任务 | 时间(台北) | cron | 跑什么 |
+|---|---|---|---|
+| `backup` | 每天 02:00 | `0 2 * * *` | backup |
+| `blacklist` | 每天 02:30 | `30 2 * * *` | risk_sync → blacklist_push |
+| `daily_report` | 每天 06:40 | `40 6 * * *` | daily_report |
+| `order_daily` | 每天 07:30 | `30 7 * * *` | perf_problems → order_asin_normalize |
+| `product_chain` | 每天 09:00 | `0 9 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `product_clear` | 每天 15:00 | `0 15 * * *` | product_clear |
+| `settlement` | 每周三 08:00 | `0 8 * * 3` | settlement_sync |
+
+⚠ **表里的时间全是台北时间(UTC+8)**,和这台电脑的本地时间一致。要是你那边的定时任务按 UTC 算,自己减 8 小时再填 —— 时区弄反的表现是「每天准时在错的时间跑」,不报任何错(02:00 的备份跑到 10:00 去,09:00 的产品链跑到半夜)。
+
+每条任务的完整提示词在 `tasks/<任务名>.md`,注册定时任务时**整篇粘进去**。
+
+## 不归你管的(在电脑 launchd 上,别重复挂)
+
+| 任务 | 时间 | 跑什么 |
+|---|---|---|
+| `feed_poll` | 每小时 :00/:30 | feed_poll |
+| `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+
+⚠ **两边都挂 = 撞锁**。同一条链同时被 launchd 和你拉起来,后到的那次拿不到锁直接退出码 3 空跑一轮 —— 看起来一切正常。
+
+## 三条通用规则(每条任务都适用)
+
+### 退出码就是结论
+
+| 码 | 意思 | 你该做什么 |
+|---|---|---|
+| 0 | 成功 | 什么都不做(飞书通知它自己会发) |
+| 3 | 没抢到锁,上一轮还在跑 | **不是失败,不要重试**;连着两次才值得说一声 |
+| 1 | 失败 | 取日志末尾,连同失败的那一步一起发给苏里,**不要自动重跑** |
+| 2 | 工作流名写错了 | 说明提示词与 `registry/schedule.py` 脱节了,报给苏里 |
+
+### 不许加 `--dry-run`
+
+缺省即真跑(2026-08-16 定稿)。`--dry-run` 是给人改完代码后自己验的,**不进任何定时任务**:写进去的后果是那条链每天空转而且报成功,比误跑更难发现 —— 误跑至少留下痕迹。
+
+### 失败不自动重跑
+
+这些链会写沃尔玛、写数据库。重跑的代价可能是重复提交;而失败原因通常是外部的(凭证过期、代理不通、飞书表被人改了),重跑一遍还是同样的失败。
+
+## 出了怪事看哪里
+
+- **每次运行的记录**在库里 `ops.runs`(谁触发的、跑了多久、成没成、摘要全文)—— 想知道昨天那次到底跑没跑,看这张表,不要靠回忆。
+- **日志**一个工作流一份,目录问代码要(别写死,`WALMART_DATA_ROOT` 能覆盖它):
+
+```bash
+cd /Users/nextderboy/Projects/WalmartAPI-Contral && tail -n 60 "$(/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 -c 'from registry import paths; print(paths.logs_dir())')/<工作流名>.log"
+```
+
+- **通知**成功失败都会发飞书;一条链只发一条(不是每步一条)。

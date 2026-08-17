@@ -26,6 +26,10 @@ class _Conn:
     def fetchall(self):
         return self.fetch_seq.pop(0) if self.fetch_seq else []
 
+    def fetchone(self):
+        # walmart_pt_meta 重灌前的行数(0 = 空表首灌,骤缩护栏不挡)
+        return (0,)
+
     def __enter__(self):
         return self
 
@@ -115,6 +119,9 @@ def test_risk_sync_workflow(monkeypatch):
 
     out = risk_sync.run({})
     assert "类目表:读 1 行,入库 1" in out
+    # 同一份数据的第二个消费方:审核两道闸只查 walmart_pt_meta,
+    # 它此前是死快照没人同步(所有者 2026-08-17 实遇飞书删了库里还在)
+    assert "walmart_pt_meta:全量重灌 1 行" in out
     assert "品牌表:读 1 行,入库 1" in out
     assert "禁售类目 1 个,黑名单品牌 1 个" in out
 

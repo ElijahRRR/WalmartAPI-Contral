@@ -1,23 +1,40 @@
-"""处置建议台账(ops.dispositions)的读写积木 —— 批次 E 的"建议/执行"分界面。
+"""处置建议台账(ops.dispositions)的读写积木 —— "建议/执行"分界面。
 
-problem_scan(只读,产建议)与 problem_product_cleanup(危险,消费建议)两个
-工作流共用本模块。**必须落在 services**:铁律 1 规定任何层不准 import
-workflows,两个工作流之间不能互相取用。
+两条链共用本模块(2026-08-16 起):
+    problem_scan     → problem_product_cleanup   反补/删除/顽固停用
+    maintenance_scan → maintenance               标题/价格/库存/删除
+**必须落在 services**:铁律 1 规定任何层不准 import workflows,
+两条链的四个工作流之间不能互相取用。
 
 状态机(与 refdata/schema.sql 的 ops.dispositions 头注一致):
-    suggested → executing → confirmed / ineffective
+    suggested → executing → confirmed / ineffective / withdrawn
 
-四个函数各管一段,谁也不越界:
-    suggest_many()   扫描件写建议(幂等:同 (店铺,SKU,动作) 已有未落定行则刷新)
-    claim()          执行件领取待执行建议(只读,不改状态——提交成功才改)
-    mark_executing() 提交成功后落 feed_id 并转 executing
-    settle()         按观测事件把 executing 判成 confirmed / ineffective
+函数各管一段,谁也不越界:
+    suggest_many()      扫描件写建议(幂等:同 (店铺,SKU,动作) 已有未落定行则刷新)
+    withdraw_stale()    本轮不再建议的 suggested 行置 withdrawn
+    claim()             执行件领取待执行建议(只读,不改状态——提交成功才改)
+    mark_executing()    提交成功后落 feed_id 并转 executing
+    settle()            按观测事件把 executing 判成 confirmed / ineffective
+    settle_maintenance() 同上,但判的是"值改过来了没有"(标题/价格/库存)
+    expire_executing()  超期没等到观测的 executing 行放行,免得永久堵住同一 SKU
 
 ⚠ **生效判定不在本模块实现**。settle() 读的是 catalog.product_events 里
 catalog_sync 经 services/product_events.verify_deletions 落的
 delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 48h
 宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
 真相。本模块只做"把已有判决登记到建议行上"。
+
+⚠ **两条链共用一张表,交界处有三条纪律**(2026-08-16 接入维护链时定):
+  ① `claim(sources=...)` **必须传**。不传就会领到另一条链的建议行,而两边的
+     动作集合不同 —— problem_product_cleanup 的 group_by_store 见到 'price'
+     会直接抛(宁炸不吞,但那是白炸一轮)。
+  ② 部分唯一索引 `(store, sku, action)` **跨来源**。同一 (店铺,SKU) 被
+     problem_scan 与 maintenance_scan 同时建议 delete 时,两条合成一条,
+     source 保留先落库那一方 —— 于是**只有那一条链的执行件会去删它**。
+     结果仍是"删一次",可接受;但 reason/category 会被后写的一方覆盖,
+     查"当初为什么删"要连着两条链的日志一起看。
+  ③ 每条链只撤销/只统计**自己来源**的行(withdraw_stale/count_open 的
+     source 参数),否则一条链的扫描会把另一条链的待执行建议清空。
 """
 
 import logging
@@ -33,10 +50,17 @@ logger = logging.getLogger("services.dispositions")
 # 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到 —— 靠"下次小心"
 # 是没用的,只有"每个参数都带 cast"这条机械规则能被测试执行。
 
-# 动作取值(与 problem_product_cleanup 的三桶一一对应)
-ACTIONS = ("relist", "delete", "retire")
+# 动作取值。前三个是问题商品链(problem_product_cleanup 三桶),
+# 后三个是维护链(maintenance 的改标题/改价/改库存;删除两条链共用)。
+ACTIONS = ("relist", "delete", "retire", "title", "price", "inventory")
+# 维护链专属动作:它们的"生效"没有对应的核验事件,由 settle_maintenance()
+# 直接比对 catalog.walmart_items 的现值判定
+MAINT_ACTIONS = ("title", "price", "inventory")
 # 来源(tro 是预留:侵权投诉链将来也走同一张建议表)
-SOURCES = ("scan", "audit", "tro")
+SOURCES = ("scan", "audit", "tro", "maint")
+# 两条链各自的来源集合 —— claim()/count_open() 的取值,别在工作流里手写字符串
+PROBLEM_SOURCES = ("scan", "audit", "tro")
+MAINT_SOURCES = ("maint",)
 OPEN_STATUSES = ("suggested", "executing")
 
 # 幂等写:同 (店铺,SKU,动作) 已有未落定行 → 刷新依据与时间,不新增
@@ -60,9 +84,10 @@ WHERE ops.dispositions.status = 'suggested'
 """
 
 _CLAIM_SQL = """
-SELECT id, store, sku, asin, action, category, reason, detail
+SELECT id, store, sku, asin, source, action, category, reason, detail
 FROM ops.dispositions
 WHERE status = 'suggested'
+  AND (%(sources)s::text[] IS NULL OR source = ANY(%(sources)s::text[]))
 ORDER BY store, action, suggested_at
 """
 
@@ -135,7 +160,11 @@ def suggest_many(conn, rows: list[dict]) -> int:
             "store": r["store"], "sku": r["sku"], "asin": r.get("asin"),
             "source": src, "action": r["action"],
             "category": r.get("category"), "reason": (r.get("reason") or "")[:500],
-            "detail": json.dumps(r.get("detail") or {}, ensure_ascii=False),
+            # default=str:detail 里常有 datetime(删除建议带 first_seen/
+            # last_seen)。不给 default 的话 json.dumps 直接抛,而抛的位置在
+            # 扫描件末尾 —— 一整轮扫描白跑,且看起来像"建议表坏了"
+            "detail": json.dumps(r.get("detail") or {}, ensure_ascii=False,
+                                 default=str),
         })
     with conn.cursor() as cur:
         # ⚠ 报**实际落库行数**,不是 len(payload)。两者会差:同 (店铺,SKU,动作)
@@ -212,8 +241,9 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
         return len(cur.fetchall())
 
 
-def count_open(conn, status: str = "suggested") -> int:
-    """输入:连接 → 输出:库里该状态的建议行条数。
+def count_open(conn, status: str = "suggested",
+               sources: tuple | None = None) -> int:
+    """输入:连接(+状态/来源)→ 输出:库里该状态的建议行条数。
 
     ⚠ 与 suggest_many 的返回值**不是一回事**,摘要里别混用:
       suggest_many → 本轮**写了多少次**(每条 upsert 各算一次)
@@ -221,22 +251,35 @@ def count_open(conn, status: str = "suggested") -> int:
     两者会差,差额 = 同 (店铺,SKU,动作) 被多个来源命中、被部分唯一索引合并的
     条数(本轮实测 519 次写入 → 库里 470 条,差 49)。执行件领走的是后者,
     所以摘要要报的也是后者 —— 首版报前者,人对不上账。
+
+    ⚠ **sources 要传自己那条链的**(2026-08-16 两条链共用本表之后):不传就把
+    另一条链的待执行也算进来,摘要报的数和自家执行件领到的数对不上。
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM ops.dispositions WHERE status = %s::text",
-                    (status,))
+        cur.execute(
+            "SELECT count(*) FROM ops.dispositions WHERE status = %(st)s::text"
+            " AND (%(sources)s::text[] IS NULL"
+            "      OR source = ANY(%(sources)s::text[]))",
+            {"st": status,
+             "sources": list(sources) if sources is not None else None})
         return cur.fetchone()[0]
 
 
-def claim(conn) -> list[dict]:
-    """输入:连接 → 输出:全部 suggested 建议行(dict 列表)。**只读,不改状态**。
+def claim(conn, sources: tuple | None = None) -> list[dict]:
+    """输入:连接 + 本链来源 → 输出:该来源的 suggested 建议行。**只读,不改状态**。
 
     领取与转态分开是有意的:提交 feed 可能失败、可能被在途防重拦下,只有
     真提交成功(拿到 feed_id)才该转 executing。先转态再提交 = 提交失败的行
     卡在 executing 永远等不到判决,而下轮扫描因部分唯一索引还建不出新建议。
+
+    ⚠ **sources 必须传**(默认 None = 全领,只留给排查用)。两条链共用一张表,
+    不限来源就会领到对方的建议行:维护链的 'price' 落进
+    problem_product_cleanup.group_by_store 会直接抛(宁炸不吞,但那是白炸一轮),
+    反过来 'relist' 落进维护执行件同理。
     """
     with conn.cursor() as cur:
-        cur.execute(_CLAIM_SQL)
+        cur.execute(_CLAIM_SQL,
+                    {"sources": list(sources) if sources is not None else None})
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -267,3 +310,111 @@ def settle(conn) -> dict:
         logger.warning("处置建议落定:%d 条**未生效**(回执成功但观测显示没动)"
                        "——下轮扫描会重新建议", out["ineffective"])
     return out
+
+
+# ── 维护链的落定(标题/价格/库存)────────────────────────────────────────────
+# 与删除/反补不同,这三个动作**没有对应的核验事件**:catalog_sync 只是把新值
+# 扫回 catalog.walmart_items,没人为"改价生效了"记一条事件。所以这里的判据就是
+# 最朴素的那条 —— **重新观测之后,线上的值是不是我们要的值**。
+#
+# ⚠ 比对放在 Python 里做,不写进 SQL 的 CASE。理由写在本模块头注:同一段 SQL
+# 因为 PG 推不出参数类型在生产上连炸三次,而 `(detail->>'new')::numeric` 这种
+# 从 jsonb 里取值再强转,遇到一条脏 detail 就炸掉**整条 UPDATE**(不是跳过那
+# 一行,是整轮落定失败)。取回来在 Python 里逐行比,脏行只影响它自己。
+_MAINT_OPEN_SQL = """
+SELECT d.id, d.action, d.detail, w.price, w.avail_qty, w.product_name
+FROM ops.dispositions d
+JOIN catalog.walmart_items w ON w.store = d.store AND w.sku = d.sku
+WHERE d.status = 'executing'
+  AND d.action = ANY(%(actions)s::text[])
+  AND w.last_seen_at > d.executed_at
+"""
+
+_MAINT_SETTLE_SQL = """
+UPDATE ops.dispositions
+SET status = %(status)s::text, settled_at = now(),
+    detail = detail || jsonb_build_object('settled_by', %(by)s::text)
+WHERE id = ANY(%(ids)s::bigint[]) AND status = 'executing'
+"""
+
+# 改价比对的容差:沃尔玛回读的价格是 numeric,我们算出来的是 float,
+# 0.01 的一半足够区分"改过来了"和"没改"
+_PRICE_EPS = 0.005
+
+
+def maint_effective(action: str, want, price, qty, name) -> bool:
+    """输入:动作 + 建议的新值 + 线上现值三件 → 输出:是否已生效。纯函数,可测。
+
+    ⚠ 值转不动(None / 脏数据)一律判**未生效**,不判生效:判错成生效的后果是
+    这条建议被销案、下轮不再建议,那个商品就永远停在错的值上而且没人知道。
+    """
+    if action == "price":
+        try:
+            return want is not None and abs(float(price) - float(want)) < _PRICE_EPS
+        except (TypeError, ValueError):
+            return False
+    if action == "inventory":
+        try:
+            return int(qty) == int(want)
+        except (TypeError, ValueError):
+            return False
+    return bool(name) and str(name) == str(want or "")
+
+
+def settle_maintenance(conn) -> dict:
+    """输入:连接 → 输出:{confirmed: n, ineffective: n}(维护三动作的落定)。
+
+    只判**已被 catalog_sync 重新观测过**的行(w.last_seen_at > d.executed_at)。
+    没重新观测的保持 executing —— 拿提交前的旧快照判,永远判成"没生效"。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_MAINT_OPEN_SQL, {"actions": list(MAINT_ACTIONS)})
+        rows = cur.fetchall()
+    ok, bad = [], []
+    for rid, action, detail, price, qty, name in rows:
+        want = (detail or {}).get("new")
+        (ok if maint_effective(action, want, price, qty, name) else bad).append(rid)
+    with conn.cursor() as cur:
+        for ids, status, by in ((ok, "confirmed", "observed"),
+                                (bad, "ineffective", "value_unchanged")):
+            if ids:
+                cur.execute(_MAINT_SETTLE_SQL,
+                            {"ids": ids, "status": status, "by": by})
+    if bad:
+        logger.warning("维护建议落定:%d 条**未生效**(catalog_sync 重新扫过,"
+                       "线上值仍不是我们提交的值)——下轮扫描会重新建议", len(bad))
+    return {"confirmed": len(ok), "ineffective": len(bad)}
+
+
+# 超期放行。**这条不是洁癖,是防死锁**:部分唯一索引只允许同 (店铺,SKU,动作)
+# 有一条未落定行,executing 行永远不落定 = 那个 SKU 的那类维护**永久停摆**,
+# 而且完全静默(扫描件每轮算出意图,upsert 撞索引写不进去,rowcount 0)。
+# 等不到观测的常见原因:商品下架了(walmart_items 缺席,JOIN 不上)、
+# catalog_sync 连着几轮没扫到那家店。
+_EXPIRE_SQL = """
+UPDATE ops.dispositions
+SET status = 'ineffective', settled_at = now(),
+    detail = detail || jsonb_build_object('settled_by', 'expired')
+WHERE status = 'executing'
+  AND action = ANY(%(actions)s::text[])
+  AND executed_at < now() - make_interval(days => %(days)s::int)
+RETURNING id
+"""
+
+EXPIRE_DAYS = 3         # 维护按日跑,3 天还没等到观测就别再等了
+
+
+def expire_executing(conn, actions: tuple = MAINT_ACTIONS,
+                     days: int = EXPIRE_DAYS) -> int:
+    """输入:连接(+动作集合/天数)→ 输出:超期放行的行数。
+
+    只放行**本链自己的动作**:删除类有它自己的 48h 宽限 + 观测判定
+    (product_events.verify_deletions),不该被这条粗暴的时限抢先判掉。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_EXPIRE_SQL, {"actions": list(actions), "days": int(days)})
+        n = len(cur.fetchall())
+    if n:
+        logger.warning("处置建议超期放行 %d 条(超 %d 天没等到 catalog_sync "
+                       "重新观测;不放行会把这些 SKU 的该类维护永久堵住)", n, days)
+    return n

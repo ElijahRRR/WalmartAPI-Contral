@@ -286,7 +286,20 @@ def sync_from_ledger() -> str | None:
     return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1}){tail}"
 
 
-_HEADER = ("店铺", "SKU", "动作", "旧值", "新值", "feedid", "日期", "结果", "报错")
+# 表头中文名:registry 定列序,这里只给每列的显示名。**按名字取,不按位置**
+# —— 硬编码成一个九元组正是下面 prune 三处错位的根因(2026-08-16 加「建议」
+# 「原因」两列时,_col/_idx 改成了从 registry 推导,这一族却被漏下)。
+# registry 加列而这里没补名字 ⇒ KeyError 当场炸,不会静默写出一个短表头。
+_HEADER_NAMES = {
+    "store": "店铺", "sku": "SKU", "suggestion": "建议", "reason": "原因",
+    "action": "动作", "old_value": "旧值", "new_value": "新值",
+    "feed_id": "feedid", "op_date": "日期", "result": "结果", "error": "报错",
+}
+
+
+def _header() -> tuple:
+    """输入:无 → 输出:与 registry 列序一一对应的中文表头。"""
+    return tuple(_HEADER_NAMES[c] for c in resources.MAINT_SHEET.columns)
 
 
 def prune(days: int = RETAIN_DAYS) -> str:
@@ -307,18 +320,19 @@ def prune(days: int = RETAIN_DAYS) -> str:
         return "维护记录:表内无数据行,无需裁剪"
     values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}")
     cut = _today() - timedelta(days=days)
+    ncol = len(resources.MAINT_SHEET.columns)
     kept = []
     for raw in values:
-        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 9
-        if not any(cells[:9]):
+        cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * ncol
+        if not any(cells[:ncol]):
             continue                    # 空行不留
-        d = _row_date(cells[6])
+        d = _row_date(cells[_idx("op_date")])
         if d is None or d >= cut:       # 没日期的保留(宁可留着也不误删)
-            kept.append(cells[:9])
+            kept.append(cells[:ncol])
     dropped = (hi - 2) - len(kept)
     if dropped <= 0:
         return f"维护记录:{len(kept)} 行都在近 {days} 天内,无需裁剪"
-    feishu.sheet_overwrite(resources.MAINT_SHEET, [list(_HEADER)] + kept)
+    feishu.sheet_overwrite(resources.MAINT_SHEET, [list(_header())] + kept)
     # 行号整体上移:水位必须重置,否则反哺器会扫到错行
     with db.pg_conn() as conn:
         _save_cursor(conn, {"next_row": len(kept) + 2, "unresolved_from": 2})

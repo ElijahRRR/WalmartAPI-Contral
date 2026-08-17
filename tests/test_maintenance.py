@@ -686,23 +686,39 @@ def test_prune_keeps_recent_days_only(monkeypatch):
                         Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
                                     columns=resources.MAINT_SHEET.columns))
     conn = _Conn()
-    conn.cursor_value = {"next_row": 5, "unresolved_from": 5}
+    conn.cursor_value = {"next_row": 6, "unresolved_from": 6}   # 4 个数据行
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
+    # ⚠ 行必须按**真实的 11 列**给(店铺 SKU 建议 原因 动作 旧值 新值 feedid
+    #   日期 结果 报错)。此前这里喂的是 9 列、日期在下标 6 —— 正好和 prune 里
+    #   写死的 cells[6] 对齐,于是测试替 bug 背了书。
     monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
-        ["T1", "B0OLD", "价格", "", "", "F1", "2026-07-01", "成功", ""],
-        ["T1", "B0KEEP", "价格", "", "", "F2", "2026-08-08", "成功", ""],
-        ["T1", "B0NODATE", "价格", "", "", "F3", "", "成功", ""],
+        ["T1", "B0OLD", "价格", "涨价", "价格", "10", "12.5", "F1",
+         "2026-07-01", "成功", ""],
+        ["T1", "B0KEEP", "价格", "涨价", "价格", "10", "12.5", "F2",
+         "2026-08-08", "成功", ""],
+        ["T1", "B0NODATE", "价格", "", "价格", "", "", "F3", "", "成功", ""],
+        # 回归钉:**新值**长得像个老日期,而**日期**列是近期的。
+        # 读错列的那版会拿新值当日期,把这行当"早于保留期"删掉。
+        ["T1", "B0TRAP", "标题", "标题不符", "标题", "旧标题", "2026-07-01",
+         "F4", "2026-08-08", "成功", ""],
     ])
     rewritten = []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_overwrite",
                         lambda sheet, rows: (rewritten.extend(rows), len(rows))[1])
     out = maint_sheet.prune(7)
-    assert "删 1 行" in out and "留 2 行" in out
-    assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE"]  # 表头 + 保留
+    assert "删 1 行" in out and "留 3 行" in out
+    assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE", "B0TRAP"]
+    # 整表重写不许把行截短:结果/报错(J/K)是最后两列,截到 9 列就没了
+    ncol = len(resources.MAINT_SHEET.columns)
+    assert all(len(r) == ncol for r in rewritten), "重写把行截短了"
+    # 表头必须与 registry 列序一一对应,否则裁剪一次表头就和数据错位
+    assert tuple(rewritten[0]) == maint_sheet._header()
+    assert rewritten[0][maint_sheet._idx("op_date")] == "日期"
+    assert rewritten[0][maint_sheet._idx("suggestion")] == "建议"
     # 行号整体上移 → 水位必须重置,否则反哺器扫到错行
     saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
-    assert '"next_row": 4' in saved[1] and '"unresolved_from": 2' in saved[1]
+    assert '"next_row": 5' in saved[1] and '"unresolved_from": 2' in saved[1]
 
 
 # ── 维护记录反哺器 ────────────────────────────────────────────────────────────

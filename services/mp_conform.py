@@ -472,6 +472,35 @@ def fix_invalid_enums(spec: dict, visible: dict) -> tuple[dict, list[str]]:
 _VARIANT_BAG = ("variantGroupId", "variantAttributeNames", "isPrimaryVariant")
 
 
+def _coerce_variant_value(prop: dict, val):
+    """输入:该属性的 schema + 原始取值 → 输出:合规值;不合规返回 None。
+
+    逐字对齐旧仓 `mapper.inject_variant_fields` 的 Feature A
+    (`auto_listing/mapper.py:1391-1424`):string 走 enum 校验、integer/number
+    走类型转换,任何一项不过**只剔这一个属性**,不牵连整组。
+    """
+    if isinstance(val, str):
+        val = val.strip()
+    if val in _EMPTY:
+        return None
+    kind = _type_of(prop)
+    if kind == "integer":
+        try:
+            return int(str(val).strip())
+        except (TypeError, ValueError):
+            return None
+    if kind == "number":
+        try:
+            return float(str(val).strip())
+        except (TypeError, ValueError):
+            return None
+    if kind == "string":
+        enum = _enum_of(prop)
+        s = str(val)
+        return s if (not enum or s in {str(e) for e in enum}) else None
+    return val          # spec 没写类型:原样(与旧仓兜底同)
+
+
 def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
                         plan: dict) -> tuple[dict, list[str]]:
     """输入:spec 属性 + 三件套在册列表 + visible + 变体决策 → 输出:(visible, 说明)。
@@ -479,33 +508,63 @@ def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
     ⚠ 三件套必须**同时**落进 visible:spec 若只登记了其中一两个(各 PT 不同),
     我们就只发登记的那些——发 spec 没有的字段会被 additionalProperties=false
     整条拒(EXT_DATA_ERROR_60670554076755)。
-    ⚠ 属性名要用本 PT 的枚举复核:决策是拿枚举算的,但 spec 可能换版,
-    不复核就会发出 PT 不认的属性名。复核不过 → 整套剔除退单品,不猜。
+
+    **多维**(2026-08-17 对着旧仓 `auto_listing/mapper.py:1374-1432` 补齐):
+    `variantAttributeNames` 是数组,color+size 的家族两个都要发,每个属性的
+    取值各写进同名字段。首版只发一个是迁漏 —— 后果不是少个字段:同族里只差
+    size 的两个成员会带着同一个组 ID + 同一个 color 发出去,沃尔玛看不出差异。
+
+    **逐属性校验,单个剔除不牵连整组**(旧仓 Feature A 同款):
+    ① 属性名要在本 PT 的 variantAttributeNames 枚举内(spec 可能换版);
+    ② 属性本身要在 spec 里登记(发 spec 没有的字段整条被拒);
+    ③ 取值要过该属性的 enum / 类型(string enum、integer、number)。
+    剔到一个不剩才整套退单品 —— 只发 variantAttributeNames 而没有对应的差异值,
+    等于告诉沃尔玛"我们按颜色分组"却不说自己是什么颜色。
     """
-    name = plan.get("attr_name")
     enum = _enum_of(props.get("variantAttributeNames", {}))
-    if enum and name not in {str(e) for e in enum}:
+    allowed = {str(e) for e in enum} if enum else None
+    kept: list[tuple[str, object]] = []
+    dropped: list[str] = []
+    for name, raw in (plan.get("attr_pairs") or []):
+        if allowed is not None and name not in allowed:
+            dropped.append(f"{name}(不在本 PT 枚举内)")
+            continue
+        if name not in props:
+            dropped.append(f"{name}(本 PT 无此属性,差异值无处可写)")
+            continue
+        val = _coerce_variant_value(props[name], raw)
+        if val is None:
+            dropped.append(f"{name}={raw!r}(值不合本属性的 enum/类型)")
+            continue
+        kept.append((name, val))
+    if not kept:
         for k in in_spec:
             visible.pop(k, None)
-        return visible, [f"变体属性名 {name} 不在本 PT 枚举内,整套剔除退单品"]
+        return visible, [f"变体属性全被剔除({';'.join(dropped)}),整套剔除退单品"]
     notes = []
     if "variantGroupId" in props:
         visible["variantGroupId"] = str(plan["group_id"])[:300]
     if "variantAttributeNames" in props:
-        visible["variantAttributeNames"] = [name]
+        visible["variantAttributeNames"] = [n for n, _ in kept]
     if "isPrimaryVariant" in props:
+        # ⚠ 旧仓**从不发**这个字段(设计文档 §3.4:怕分批上架时出现两个 primary,
+        # 沃尔玛行为未定义)。我们发,底气是 `list_new._variant_plan` 会先查
+        # **本店同族在架成员**有没有主变体,有则本条发 No —— 旧仓没有这个查询。
+        # 若生产上真撞见双 primary,退回旧仓口径(整个 if 段删掉)即可。
         yn = _enum_of(props["isPrimaryVariant"]) or ["Yes", "No"]
         want = "Yes" if plan.get("is_primary") else "No"
         visible["isPrimaryVariant"] = want if want in yn else yn[0]
-    # 维度取值写进同名属性:组内没有差异值 = 沃尔玛看不出这几个有什么不同。
-    # 只在 spec 登记了该属性时写(同上,发 spec 没有的字段整条被拒)。
-    if name in props and plan.get("attr_value"):
-        visible[name] = plan["attr_value"]
-    else:
-        notes.append(f"⚠ 本 PT 无 {name} 属性,组内差异值无处可写")
-    notes.append(f"变体组 {plan['group_id']} 按 {name}={plan.get('attr_value')}"
-                 f"(家族 {plan.get('family_size')},"
-                 f"{'主' if plan.get('is_primary') else '非主'}变体)")
+    for name, val in kept:
+        visible[name] = val
+    notes.append(f"变体组 {plan['group_id']} 按 "
+                 + ",".join(f"{n}={v}" for n, v in kept)
+                 + f"(家族 {plan.get('family_size')},"
+                   f"{'主' if plan.get('is_primary') else '非主'}变体)")
+    if dropped:
+        notes.append(f"⚠ 变体属性剔除 {len(dropped)} 个:{';'.join(dropped)}")
+    if plan.get("unmapped_dims"):
+        notes.append(f"⚠ 亚马逊维度 {','.join(plan['unmapped_dims'])} "
+                     f"映不上本 PT 枚举,未发")
     return visible, notes
 
 

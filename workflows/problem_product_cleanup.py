@@ -1,8 +1,8 @@
-"""problem_product_cleanup — 问题商品处置执行件(批次 E 拆分后;危险,默认 dry-run)。
+"""problem_product_cleanup — 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py problem_product_cleanup                # dry-run:将执行哪些建议
-  python cli.py problem_product_cleanup --execute      # 真跑(反补/删除/停用 + 落账)
+  python cli.py problem_product_cleanup --dry-run      # 空跑:将执行哪些建议
+  python cli.py problem_product_cleanup                # 真跑(反补/删除/停用 + 落账)
   python cli.py problem_product_cleanup -p store=A085朱丽霖
 
 **本工作流不再做任何决策**(批次 E,批复 #8)。它只做三件事:
@@ -14,7 +14,7 @@
 文件里既做只读的定性、又做不可逆的 DELETE_ITEM,想看看该删哪些就得跑一个
 DANGEROUS 工作流;而且建议不留痕,事后无从追"当初为什么删它"。
 
-⚠ **调度顺序是硬约束**:catalog_sync → problem_scan → 本工作流 --execute。
+⚠ **调度顺序是硬约束**:catalog_sync → problem_scan → 本工作流(真跑)。
 没跑 scan 就跑本工作流 = 消费上一轮的陈旧建议(或者什么都没有)。
 
 去重与观测纪律(拆分后各归其位,一条没丢):
@@ -138,7 +138,7 @@ def run(params: dict) -> str:
             if b["relist"]:
                 line += f",反补样本={[(r['sku'], r.get('category')) for r in b['relist'][:3]]}"
             lines.append(line)
-        return "\n".join(lines + ["(dry-run:未提交任何 feed;确认无误加 --execute)"])
+        return "\n".join(lines + ["(dry-run:未提交任何 feed;确认无误后**去掉 --dry-run** 重跑)"])
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     retry_stores: list[str] = []

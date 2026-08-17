@@ -1,4 +1,4 @@
-"""order_center_cleanup — 建库一次性清理:删除对不上订单的烂账行(危险,默认 dry-run)。
+"""order_center_cleanup — 建库一次性清理:删除对不上订单的烂账行(危险:缺省即真跑,空跑用 --dry-run)。
 
 背景(所有者决策 2026-08-06):首次建库只拉近 90 天订单,更早订单的售后/绩效/
 对账行永远无法匹配销售行,留着就是烂账。入库侧过滤(returns_sync /
@@ -11,7 +11,7 @@ daily_report problems·settlement 已内置)负责堵住每日回流;本工作�
   3. python cli.py daily_report -p phase=problems
      python cli.py daily_report -p phase=settlement -p periods=99
   4. python cli.py order_center_cleanup             # dry-run 只报数量
-     python cli.py order_center_cleanup --execute   # 确认后真删
+     python cli.py order_center_cleanup   # 确认后真删(先加 --dry-run 看清单)
   5. python cli.py order_center_push
      (若清理前已推过飞书:先清空六表数据行,再 push -p reconcile=1)
 
@@ -63,7 +63,7 @@ def run(params: dict) -> str:
                 f"(其中 {len(vanish)} 个账期将被整期清空,已安排记台账)")
         if not execute:
             return ("🧪 [DRY-RUN] " + head +
-                    "\n确认无误后 --execute 真删;删除后若飞书已推过数据:"
+                    "\n确认无误后去掉 --dry-run 重跑真删;删除后若飞书已推过数据:"
                     "清空六表数据行 → order_center_push -p reconcile=1 重推")
 
         cur.execute(f"DELETE {_RETURNS_WHERE}")

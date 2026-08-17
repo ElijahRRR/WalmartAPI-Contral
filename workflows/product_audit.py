@@ -1,22 +1,24 @@
-"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,默认 dry-run)。
+"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,缺省即真跑)。
 
-用法:
-  python cli.py product_audit                       # dry-run:判定 + 落 runs/hits,不写结论
-  python cli.py product_audit --execute             # 真跑:另写 products 五列 + 审核事件
+用法(2026-08-16 起**缺省即真跑**,空跑加 `--dry-run`;`--execute` 是兼容别名):
+  python cli.py product_audit                       # 真跑:判定 + 落 runs/hits + 写结论
+  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 五列
   python cli.py product_audit -p limit=2000
-  python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
-  python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
-  python cli.py product_audit -p mode=pending --execute    # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
+  python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
+  python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p rerule=phase0_forbidden_category
+                                                    # 改了某条规则后**定点**重审被它拒过的
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
-  python cli.py product_audit -p from_sheet=1 --execute    # 上架表驱动:审真待审的 + 回填 C~G
-  python cli.py product_audit -p from_sheet=1 -p limit=3000 --execute   # 存量大时加大一轮的量
+  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
+  python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
 
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
-L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;--execute 才写
-products.audit_* 五列与审核事件。**`-p from_sheet=1` 时另把结论投影回上架表
+L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
+products.audit_* 五列与审核事件(空跑用 --dry-run)。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 
 ⚠ `from_sheet` **不是强审**:表 E 列为空只说明表里没有结论,库里可能早就有。
@@ -150,7 +152,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun",
+_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
                  "l3", "l4", "workers", "adopt_only", "from_sheet"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
@@ -196,6 +198,39 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
+    rule = str(params.get("rerule", "")).strip()
+    if rule:
+        # 按**规则码**定点重审(2026-08-17 加):改了一条规则之后,要动的只有
+        # "被这条规则拒过"的那批。此前唯一的批量通道是 force_rerun=<版本>,
+        # 而版本一递增库里没有一条是新版本 ⇒ **全量**十几万条重审,为了几千条
+        # 误杀烧掉全库的 LLM 钱。触发场景:裁决 A 摘掉 Phase0 四个大类
+        # (礼品袋被判药品),要翻的就是 phase0_forbidden_category 拒过的那批。
+        #
+        # ⚠⚠ **锚在 catalog.products,不能锚在"最近一轮 audit_runs"**。
+        # 首版就是锚最近一轮(verdict='reject' 且该轮有这条 hit),所有者第一次
+        # dry-run 当场炸出问题:**dry-run 也落 runs/hits**,于是那 500 条的
+        # "最近一轮"变成了本次 dry-run 的结果 —— 被救回来的 45 条新一轮判 pass、
+        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 五列,
+        # 它们的 audit_status 还是 rejected。净效果:45 条产品被"验证"了一次就
+        # 永久搁浅,任何通道都不会再捞它们,而且全程不报错。
+        #
+        # 现在的口径(每条都是为了让 dry-run 与真跑说同一件事):
+        #  · `audit_status = 'rejected'` —— 要翻的是**现行结论**,而 dry-run 碰
+        #    不到这一列,所以反复 dry-run 候选集恒定,可重复验证;
+        #  · `audit_version IS DISTINCT FROM <当前版本>` —— 真跑判过的会盖上新
+        #    版本号,自动退出候选集。这同时是**天然分页**:limit 撞满就再跑一轮,
+        #    接着判剩下的,不会每轮都重判同一批(首版没有这条,真跑会原地打转);
+        #  · `EXISTS` 任意一轮命中过该规则 —— 不是"最近一轮"。理由同上:最近
+        #    一轮会被 dry-run 覆盖掉。代价是"早年被它拒、后来改判别的原因仍是
+        #    rejected"的行也会进来,那批重判一次结论不变,只多花一轮 LLM。
+        return ("p.audit_status = 'rejected'"
+                " AND p.audit_version IS DISTINCT FROM %(rerule_ver)s"
+                " AND EXISTS (SELECT 1 FROM audit.audit_runs r"
+                "             JOIN audit.audit_hits h ON h.run_id = r.run_id"
+                "             WHERE r.asin = p.asin"
+                "               AND h.rule_code = %(rerule)s)",
+                {"rerule": rule,
+                 "rerule_ver": resources.AUDIT_RULES_VERSION})
     mode = str(params.get("mode", "")).strip()
     if mode and mode not in _MODES:
         # 与未识别参数同理:静默落回默认 = "补刷跑完了"的假象,宁炸不吞
@@ -209,6 +244,58 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {}
+
+
+# 定点重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+_RERULE_COUNT_SQL = """
+SELECT count(*) FROM catalog.products p
+WHERE p.marketplace = %(marketplace)s AND ({where})
+  AND p.title IS NOT NULL AND p.title <> ''
+"""
+
+
+def _rerule_head(conn, rule: str, where: str, extra: dict,
+                 limit: int) -> list[str]:
+    """输入:连接 + 规则码 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
+
+    没有这一行的话,摘要只会说"候选 500",而 500 正是 limit ——**看不出是刚好
+    500 个还是撞了上限**(所有者 2026-08-17 首轮 dry-run 实遇)。误杀规模是他
+    决定要不要真跑的唯一依据,必须报出来。与 `_claim_from_sheet` 同款纪律。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_RERULE_COUNT_SQL.format(where=where),
+                    {"marketplace": "US", **extra})
+        total = int(cur.fetchone()[0])
+    head = [f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 rejected**、"
+            f"且未按当前规则版本判过的,共 {total} 个"]
+    if total > limit:
+        head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
+                    f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
+                    f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
+                    f"再跑一次接着判(或 -p limit=N 加大)")
+    if not total:
+        head.append("  (一个都没有:规则码拼错?或这批已经全部按当前版本判过了)")
+    return head
+
+
+def _is_forced(params: dict, extra: dict) -> bool:
+    """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
+
+    只用来决定要不要挂 `_RECENT_RUN_GUARD`(dry-run 复烧护栏)。强审 = 人点名
+    要审的,点了就得审,哪怕 24 小时内刚审过。两种:
+
+    · `asins=` 点名 —— 但 **`from_sheet` 不算**:它也往 extra 塞 asins,走的却是
+      默认候选谓词(E 列为空 ≠ 库里没结论),该吃护栏。
+    · `rerule=` 定点重审 —— 它翻的正是**刚刚被拒**的那批(改规则当天就要验),
+      全在 24 小时内。吃了护栏的话 dry-run 稳定报"0 候选",紧跟着真跑翻出几千
+      条,又是一次"dry-run 说没事、真跑吓一跳"(所有者 2026-08-16 被 from_sheet
+      坑过一次,那次差异在回填行数,这次会差在候选数)。
+
+    代价说清:强审下重复 dry-run 会重复烧 LLM —— 这是点名的固有代价,不是 bug。
+    """
+    if str(params.get("rerule", "")).strip():
+        return True
+    return bool(extra.get("asins")) and not params.get("from_sheet")
 
 
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
@@ -302,8 +389,12 @@ def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
     rows = listing_sheet.audit_targets()
     want = sorted({r["asin"] for r in rows})
     if not want:
-        return [], [], ["上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
-                        "想重审就把该行 E 列(审核结果)清空 —— 那是唯一的重审入口"]
+        return [], [], [
+            "上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
+            "⚠ **清空 E 列不是重审入口**:清空只是让这行重新被领,而结论以库为准,"
+            "库里已有结论的会被原样投影回来(见下方 from_sheet 非强审那条注释)。"
+            "真要重审走 `-p asins=<逗号分隔>`(点名强审)或 "
+            "`-p rerule=<规则码>`(改了某条规则后定点翻案)"]
     bad = [a for a in want if not _ASIN_RE.match(a)][:5]
     if bad:
         # ⚠ 列错位的唯一征兆。表头再被调一次而 registry 的列元组没跟着改,
@@ -449,11 +540,12 @@ def run(params: dict) -> str:
         ctx = audit_rules.load_context(conn, uspto=uspto)
         query_params = {"marketplace": "US", "limit": limit, **extra}
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
-        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉。
-        # 豁免的是**强审**(人点名要审就得审),不是"参数里有 asins" ——
-        # from_sheet 也往 extra 塞 asins,但它走的是默认候选谓词,该护栏照吃
-        forced = bool(extra.get("asins")) and not params.get("from_sheet")
-        guard = _RECENT_RUN_GUARD if (not execute and not forced) else ""
+        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
+        guard = "" if (execute or _is_forced(params, extra)) \
+            else _RECENT_RUN_GUARD
+        if str(params.get("rerule", "")).strip():
+            sheet_head = _rerule_head(conn, params["rerule"].strip(),
+                                      where, extra, limit) + sheet_head
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where,
                                               recent_guard=guard),

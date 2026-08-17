@@ -1,8 +1,8 @@
 """product_refresh — 在线产品全量重推采集(维护链的数据新鲜度源头)。
 
 用法:
-  python cli.py product_refresh                 # dry-run:列出将推多少个 ASIN
-  python cli.py product_refresh --execute       # 真推(建批次 + 落台账)
+  python cli.py product_refresh --dry-run       # 空跑:列出将推多少个 ASIN
+  python cli.py product_refresh                 # 真推(建批次 + 落台账)
   python cli.py product_refresh -p wait=1       # 真推后阻塞等采完(默认不等;
                                                 #   产品线一条链跑完就靠它)
   python cli.py product_refresh -p check=1      # 只查在途批次状态(不推新的)
@@ -37,7 +37,7 @@ from api import scraper
 from registry import db
 from services import kpi, scrape_batches as batches
 
-DANGEROUS = True        # 会给采集器压十几万个任务,默认 dry-run
+DANGEROUS = True        # 会给采集器压十几万个任务,空跑用 --dry-run
 
 logger = logging.getLogger("workflows.product_refresh")
 

@@ -134,15 +134,19 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
 
 
 # =============================================================
-# 规则 2 —— Amazon 顶级类目精准禁售(8 大类)
+# 规则 2 —— Amazon 顶级类目精准禁售(4 大类)
 # =============================================================
 
 # Amazon 顶级类目 → (禁售原因, Walmart 政策 category_en)
 # key 必须是 Amazon 官方顶级类目名 (精确到大小写+标点)
 # walmart_policy 对齐 Walmart 37 条 Prohibited Product Policy category_en
 # (逐字迁自 phase0_category.py:32-52,reason/policy 原文进 detail)
+#
+# ⚠ **只有旧仓这 4 个**(2026-08-17 所有者裁决 A,详见下方"摘掉 4 个"注释块)。
+# 这条规则只看路径**第一段**,而 Amazon 顶级类目的粒度是"筐"不是"品":
+# 往这张表里加大类的代价 = 把整个筐里的杂货一起拒掉,且停在 L0 连类目都不判。
+# 加新 key 之前先问:这个筐里**每一件**都该拒吗?答不上来就别加,交给 L2。
 FORBIDDEN_AMAZON_TOPS: dict[str, tuple[str, str]] = {
-    # === 原有 4 大类 ===
     "Books":                    ("Books 禁售: 版权/内容合规风险, 搬运模式不适合",
                                  "Intellectual Property"),
     "Kindle Store":             ("Kindle Store 禁售: 电子书版权",
@@ -151,17 +155,34 @@ FORBIDDEN_AMAZON_TOPS: dict[str, tuple[str, str]] = {
                                  "Textiles & Apparel"),
     "Automotive":               ("汽配禁售: DOT/SAE 认证 + 安全件责任 + CARB/delete kit",
                                  "Auto & Motor Vehicles"),
-
-    # === 新增: Walmart 整类 restricted, 中国卖家 0 可能合规 ===
-    "Beauty & Personal Care":   ("化妆品 restricted: MoCRA 2024 + FDA 化妆品合规",
-                                 "Cosmetic Products"),
-    "Health & Household":       ("药品/膳食补充剂 restricted: FDA 注册 + AML vetting + MoCRA",
-                                 "Drugs & Paraphernalia"),
-    "Health & Personal Care":   ("同 Health & Household",
-                                 "Drugs & Paraphernalia"),
-    "Grocery & Gourmet Food":   ("食品大部分禁售: USDA 禁中国肉类 + FDA 食品设施注册",
-                                 "Food Products"),
 }
+
+# ── 摘掉 4 个大类(2026-08-17,所有者裁决 A)────────────────────────────────
+#
+# 批次 B 迁入时在旧仓 4 个之外**新增**了 4 个:Beauty & Personal Care /
+# Health & Household / Health & Personal Care / Grocery & Gourmet Food,
+# 理由写的是"Walmart 整类 restricted,中国卖家 0 可能合规"。已全部删除。
+#
+# 触发:所有者拿 B0BWMVQHVJ 来问——一包**牛皮纸礼品袋**被拒,理由
+# 「药品/膳食补充剂 restricted: FDA 注册 + AML vetting + MoCRA」。查 detail:
+#   full_path = 'Health & Household > Stationery & Gift Wrapping Supplies
+#                > Gift Wrapping Supplies > Gift Bags'
+# 规则没跑偏(match_type='exact'),是**判据粒度太粗**:Amazon 的
+# Health & Household 本身就是杂物筐,底下混着文具礼品包装、家居清洁、纸品、
+# 宠物用品;只取第一段 = 把整个筐一起拒。
+#
+# 为什么摘掉是安全的 —— 药品/补剂**本来就有两道更精准的闸**,都在 L2:
+#   · R2  refdata/audit/forbidden_categories_zh_seller.yaml 的 drugs_supplements
+#         按 **Walmart PT 名**关键词判(Vitamin/Probiotic/Dietary Supplement/
+#         Melatonin/Homeopathic/Herbal Remedy…),另有 medical_devices 等 key
+#   · R0  audit_l2._FORBIDDEN_WALMART_MEGA_CATEGORIES 按 **Walmart 类目**硬禁
+#         (Health & Personal Care / Beauty / Food & Beverage / Baby …)
+# 那两条判的是"这东西到底是什么",Phase0 这条判的是"它在亚马逊被挂在哪个筐里"。
+# 前者才是判据,后者是筐 —— 所以是**去重**,不是"放开一道闸"。
+#
+# ⚠ 代价说清楚:PT 解不出**且** Walmart 类目也拿不到的真药品,不再有硬闸兜,
+# 会往下走到 L3 语义层。这是裁决 A 明知并接受的换取(换回被误杀的杂货)。
+# 要再收紧,正确做法是补 L2 的 PT 词表,**不是**把大类塞回上面那张表。
 
 def _extract_top(amazon_category_path: str | None) -> str:
     """输入:Amazon 路径 → 输出:顶级类目段(第一个 '>' 之前,两端去空白)。

@@ -1,8 +1,8 @@
-"""catmap_fix — 按 node 定点修正映射表(人工圈定;危险,默认 dry-run)。
+"""catmap_fix — 按 node 定点修正映射表(人工圈定;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py catmap_fix -p nodes=2563847011,14008381        # 预览改动
-  python cli.py catmap_fix -p nodes=2563847011,14008381 --execute
+  python cli.py catmap_fix -p nodes=2563847011,14008381 --dry-run   # 预览改动
+  python cli.py catmap_fix -p nodes=2563847011,14008381             # 真改
   python cli.py catmap_fix -p nodes=all_conflicts               # 全部冲突行(慎)
 
 用途:`catmap_mine` 报出的 `map_conflict`(实证 PT 与旧映射相左)只报不改,
@@ -111,7 +111,7 @@ def run(params: dict) -> str:
         if len(seen) > 30:
             lines.append(f"  …余 {len(seen) - 30} 条")
         if not execute:
-            lines.append("(dry-run:未改库;确认无误加 --execute)")
+            lines.append("(dry-run:未改库;确认无误后**去掉 --dry-run** 重跑)")
             return "\n".join(lines)
 
         changed = 0

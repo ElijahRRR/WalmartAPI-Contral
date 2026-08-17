@@ -162,7 +162,7 @@ def run(params: dict) -> str:
             arg = "brand" if k == claims.BRAND else "asin"
             w.writerow([k, key, store, why, n,
                         _join(here, "sku"), _join(here, "asin"),
-                        f"python cli.py store_release -p {arg}={key} --execute"])
+                        f"python cli.py store_release -p {arg}={key}"])
     n_sku = len({(r["store"], r["sku"]) for _k, _key, _s, _w, _n, here in stale
                  for r in here})
     L += ["", f"▍明细 → {p}",

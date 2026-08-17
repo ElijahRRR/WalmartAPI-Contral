@@ -1,8 +1,8 @@
-"""asin_blacklist_import — 黑名单 ASIN 批量导入(一次性;危险,默认 dry-run)。
+"""asin_blacklist_import — 黑名单 ASIN 批量导入(一次性;危险:缺省即真跑,空跑用 --dry-run)。
 
 用法:
-  python cli.py asin_blacklist_import -p file=~/Desktop/黑名单asin.txt
-  python cli.py asin_blacklist_import -p file=... --execute
+  python cli.py asin_blacklist_import -p file=~/Desktop/黑名单asin.txt --dry-run
+  python cli.py asin_blacklist_import -p file=~/Desktop/黑名单asin.txt   # 真导
 
 所有者定稿 2026-08-13:历史继承的一批黑名单 ASIN 导入 catalog.asin_blacklist
 (黑名单中心——审核 ASIN 闸与上架拦截共用同一份)。规则:
@@ -14,7 +14,7 @@
     不标准也不丢行,record_asins 同款),单独计数亮出——它们拦不着按 ASIN
     建档的产品,但也不误拦。
 dry-run 打印完整体检(总行/去重后/文件内重复/非标准/库内已有/将新增),
---execute 才写库。
+真跑才写库(空跑用 --dry-run)。
 """
 
 import logging
@@ -84,7 +84,7 @@ def run(params: dict) -> str:
                  f"库内已有 {existing}(DO NOTHING 不覆盖),将新增 "
                  f"{len(asins) - existing}(category=LEGACY,source=历史继承)"]
         if not execute:
-            lines.append("(dry-run:未写库;确认无误加 --execute)")
+            lines.append("(dry-run:未写库;确认无误后**去掉 --dry-run** 重跑)")
             return "\n".join(lines)
 
         added = 0

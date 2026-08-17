@@ -612,7 +612,7 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 | **A0.5 存量审计** | `alloc_audit`:控制台六节结论 + 明细 csv **5 份** | ✅ 首跑完成 2026-08-15;**订单入库后需重跑**——冲突处置的"留销量大的店"首跑时无订单数据,只能按件数打平(报告会显式点破,不会装作判过了) |
 | **A1 占用台账** | claims 表 + services/claims + services/alloc_survey(判定口径共用)+ list_new 占用闸 + store_release + alloc_backfill 存量回填 | ✅ **代码就绪 2026-08-15**,待生产回填 |
 | **A1.5 订单 ASIN 归一** | `order_lines.asin` 列 + `order_asin_normalize`(规则走 `services/sku_asin` 唯一出处)+ **写入侧当场填**(`extract_order_lines` / `order_history_import`;`upsert_order_lines` 配 `COALESCE(EXCLUDED.asin, t.asin)` 守卫,防同步把扫尾填好的值冲回 NULL) | ✅ **生产完成 2026-08-15**,实测见 §十一.4 |
-| **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | 🔄 **两侧体检已落地 2026-08-15**:店铺侧 `services/store_perf` + `alloc_stores`;产品侧 `services/product_score` + `alloc_products`(硬闸/五信号/权重摊回/黑历史罚分,附**信号覆盖率**一栏 —— 权重再合理信号采不到就是空的)。**A2 主体已落地 2026-08-16**:`services/alloc_engine`(分层轮转,18 条回归)+ `services/product_pool`(候选池与打分,单一出处)+ `services/alloc_groups`(品牌组组装,8 条)+ `workflows/alloc_plan`(漏斗/配额/定向流/切批/发牌/方案表/三张验收指标,默认 dry-run,15 条)。**飞书上架表写入(§9.2)的列权责已定 2026-08-16**:审核批次 D 开闸后 D/E/F/G 归审核域,分配器**只写 A/B**,E 留空即「待审」(写入器本身仍待建) |
+| **A2 分配引擎** | §七 全部 + 四个维度视图 + 方案表 | 🔄 **两侧体检已落地 2026-08-15**:店铺侧 `services/store_perf` + `alloc_stores`;产品侧 `services/product_score` + `alloc_products`(硬闸/五信号/权重摊回/黑历史罚分,附**信号覆盖率**一栏 —— 权重再合理信号采不到就是空的)。**A2 主体已落地 2026-08-16**:`services/alloc_engine`(分层轮转,18 条回归)+ `services/product_pool`(候选池与打分,单一出处)+ `services/alloc_groups`(品牌组组装,8 条)+ `workflows/alloc_plan`(漏斗/配额/定向流/切批/发牌/方案表/三张验收指标,15 条)。**飞书上架表写入(§9.2)的列权责已定 2026-08-16**:审核批次 D 开闸后 D/E/F/G 归审核域,分配器**只写 A/B**,E 留空即「待审」(写入器本身仍待建) |
 | **A3 学习型** | 权重离线校准(远景) | ⬜ 快照从 A2 第一天就落 |
 
 **A0 收口明细**:
@@ -813,8 +813,9 @@ missing_since IS NULL`——店铺终止后商品事实上已全部下架,这是
 
 ## 12.2 七条 workflow
 
-**入口一律 `python cli.py <name> [-p k=v] [--execute]`。**
-危险的三条(`dangerous=True`)默认 dry-run,只打印将做什么。
+**入口一律 `python cli.py <name> [-p k=v] [--dry-run]`。**
+危险的三条(`dangerous=True`)**缺省即真跑**;加 `--dry-run` 才只打印将做什么
+(2026-08-16 口径反转,此前是"默认 dry-run、真跑加 --execute")。
 
 | workflow | 危险 | 干什么 | 产出 |
 |---|---|---|---|
@@ -893,8 +894,8 @@ python cli.py alloc_plan -p as_of=$D
 
 ## 12.5 上线前必须知道的三条
 
-1. **`--execute` 之前一定先 dry-run 并人眼过方案表。** `cli.py` 对
-   `DANGEROUS = True` 的工作流强制默认 dry-run,但它拦不住"看都没看就加 flag"。
+1. **真跑之前一定先 `--dry-run` 并人眼过方案表。** ⚠ 2026-08-16 起缺省即真跑,
+   默认值**不再替你挡** —— 这条从"默认值兜底"降级成纪律,所以更要自觉。
 2. **占用不可逆(靠人撤,不靠系统)。** 分配落的是 `catalog.claims`,
    没有任何自动释放路径。落错了走 `store_release`,不要改库。
 3. **配置改完必跑 `claim_audit`。** 飞书限额表一改(开类目 / 换渠道 /

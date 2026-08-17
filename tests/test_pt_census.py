@@ -61,6 +61,7 @@ _DATA = {
     # 「旧行没清」那一档:同路径已有有效 PT 的死行(这里刻意留空,
     # 由专门那条用例给数据)
     "LEFT JOIN audit.walmart_pt_meta dm": [],
+    "SELECT DISTINCT ON (d.walmart_product_type)": [],
 }
 
 
@@ -139,7 +140,8 @@ def test_suggestions_split_naming_diffs_from_real_unknowns(monkeypatch, tmp_path
             ("Novelty Lightss", 6),        # 相似
             ("Zzz Nothing Like This", 1),  # 无对应
         ],
-        "LEFT JOIN audit.walmart_pt_meta dm": []}))
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        "SELECT DISTINCT ON (d.walmart_product_type)": []}))
     monkeypatch.setattr(pc.pt_spec, "known_pts",
                         lambda: {"Paper Weights", "Novelty Lights", "Hammers"})
     monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
@@ -183,6 +185,7 @@ def test_superseded_rows_get_their_own_verdict(monkeypatch, tmp_path):
             ("Novelty Lights", 6), ("Truly Orphan PT", 2)],
         "LEFT JOIN audit.walmart_pt_meta dm": [
             ("Novelty Lights", 6, "Novelty Lighting")],
+        "SELECT DISTINCT ON (d.walmart_product_type)": [],
     }))
     monkeypatch.setattr(pc.pt_spec, "known_pts", lambda: {"Novelty Lighting"})
     monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
@@ -210,7 +213,11 @@ def test_admission_gaps_get_their_own_paste_ready_csv(monkeypatch, tmp_path):
         "FROM audit.walmart_pt_meta": [],
         "FROM audit.walmart_pt_spec": [],
         "FROM audit.walmart_category_map": [("Disc Brake Calipers", 2)],
-        "LEFT JOIN audit.walmart_pt_meta dm": []}))
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        # 同路径兄弟 PT 给得出 Category/PTG —— 这是有依据的建议,不是猜
+        "SELECT DISTINCT ON (d.walmart_product_type)": [
+            ("Disc Brake Calipers", "Automotive", "Brakes",
+             "Automotive Brakes", "Auto > Brakes > Calipers")]}))
     monkeypatch.setattr(pc.pt_spec, "known_pts",
                         lambda: {"Disc Brake Calipers"})
     monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
@@ -218,5 +225,8 @@ def test_admission_gaps_get_their_own_paste_ready_csv(monkeypatch, tmp_path):
     assert "不是删映射(它们是真类目)" in out
     csvp = tmp_path / "pt_待补准入明细.csv"
     text = csvp.read_text(encoding="utf-8-sig")
-    assert text.splitlines()[0].startswith("Walmart Product Type,准入状态,中国卖家可做")
-    assert "Disc Brake Calipers,,,2" in text      # 准入两列留空待填
+    # 表头与飞书那张表同序,填完准入两列直接粘回去
+    assert text.splitlines()[0].startswith(
+        "Walmart Category,Walmart PTG,Walmart Product Type,准入状态,中国卖家可做")
+    # Category/PTG 给建议(同路径兄弟的,有依据);准入两列**只能人判**,留空
+    assert "Automotive,Brakes,Disc Brake Calipers,,,2,同路径 Automotive Brakes" in text

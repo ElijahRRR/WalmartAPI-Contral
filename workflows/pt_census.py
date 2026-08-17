@@ -64,6 +64,26 @@ GROUP BY 1
 # 死 PT 的行里,**同一 Amazon 路径已经有一条有效 PT** 的那些 ——
 # 修正做过了(catmap_fix 的惯例是插新行不删旧行),旧行只是没清。
 # 生产实测 2026-08-17:150 行死映射里 150 行都是这种,真孤儿 0 个。
+# 「准入漏了」那批要补进飞书准入明细,而 Category/PTG 从哪来?
+# 官方 spec 是 feed **字段 schema**,不含类目层级,给不出这两列。
+# 但**同一条 Amazon 路径上的兄弟 PT** 给得出:它们在准入明细里、有 Category/PTG,
+# 而且与缺失的那个 PT 映自同一个亚马逊类目 —— 这是有依据的建议,不是猜。
+# (实测那 9 个全是汽配,兄弟行是 Automotive Brakes / Automotive Specialty Parts。)
+_SQL_SIBLING_CAT = """
+SELECT DISTINCT ON (d.walmart_product_type)
+       d.walmart_product_type, m.walmart_category, m.walmart_ptg,
+       m.walmart_product_type AS sibling_pt, d.amazon_category
+FROM audit.walmart_category_map d
+JOIN audit.walmart_category_map g
+       ON g.amazon_category = d.amazon_category
+      AND g.walmart_product_type <> d.walmart_product_type
+JOIN audit.walmart_pt_meta m
+       ON m.walmart_product_type = g.walmart_product_type
+WHERE d.walmart_product_type = ANY(%s)
+  AND m.walmart_category IS NOT NULL AND btrim(m.walmart_category) <> ''
+ORDER BY d.walmart_product_type, m.walmart_category
+"""
+
 _SQL_SUPERSEDED = """
 SELECT d.walmart_product_type, count(*), min(g.walmart_product_type)
 FROM audit.walmart_category_map d
@@ -81,6 +101,7 @@ GROUP BY 1
 
 _COLS = ("walmart_product_type", "判定", "在spec", "在准入明细", "在上传模板",
          "映射条数", "同路径已有有效PT", "建议PT", "相似度",
+         "建议Category", "建议PTG", "建议依据",
          "walmart_category", "walmart_ptg", "access_state", "zh_can_do")
 
 # 相似度阈值:低于它的候选不给 —— 给一个八竿子打不着的建议比不给更糟,
@@ -148,6 +169,12 @@ def _census() -> tuple[list[dict], dict]:
         used = {r[0]: int(r[1]) for r in cur.fetchall()}
         cur.execute(_SQL_SUPERSEDED)
         superseded = {r[0]: (int(r[1]), r[2]) for r in cur.fetchall()}
+        # 待补那批的 Category/PTG 建议:取同 Amazon 路径兄弟 PT 的
+        gap_pts = sorted(spec - set(meta))
+        sib = {}
+        if gap_pts:
+            cur.execute(_SQL_SIBLING_CAT, (gap_pts,))
+            sib = {r[0]: r[1:] for r in cur.fetchall()}
 
     rows, counts = [], {}
     for pt in sorted(spec | set(meta) | tmpl | set(used)):
@@ -161,6 +188,7 @@ def _census() -> tuple[list[dict], dict]:
             "在上传模板": "Y" if pt in tmpl else "",
             "映射条数": used.get(pt, 0),
             "建议PT": "", "相似度": "", "同路径已有有效PT": "",
+            "建议Category": "", "建议PTG": "", "建议依据": "",
             "walmart_category": (m[1] if m else "") or "",
             "walmart_ptg": (m[2] if m else "") or "",
             "access_state": (m[3] if m else "") or "",
@@ -181,6 +209,11 @@ def _census() -> tuple[list[dict], dict]:
             r["同路径已有有效PT"] = sup[1]
             counts["瞎猜"] -= 1
             counts["旧行没清"] = counts.get("旧行没清", 0) + 1
+    for r in rows:
+        hit = sib.get(r["walmart_product_type"])
+        if hit and r["判定"] == "准入漏了":
+            r["建议Category"], r["建议PTG"] = hit[0], hit[1]
+            r["建议依据"] = f"同路径 {hit[2]}"
     return rows, counts
 
 
@@ -216,11 +249,16 @@ def run(params: dict) -> str:
             with open(p, "w", encoding="utf-8-sig", newline="") as f:
                 w = csv.writer(f)
                 # 表头与飞书那张表同序,填完准入两列直接粘回去
-                w.writerow(["Walmart Product Type", "准入状态", "中国卖家可做",
-                            "映射条数", "备注"])
+                w.writerow(["Walmart Category", "Walmart PTG",
+                            "Walmart Product Type", "准入状态", "中国卖家可做",
+                            "映射条数", "建议依据"])
                 for r in sorted(miss, key=lambda r: -r["映射条数"]):
-                    w.writerow([r["walmart_product_type"], "", "",
-                                r["映射条数"], "spec 里有、准入明细没收"])
+                    # Category/PTG 给建议(同路径兄弟 PT 的,有依据);
+                    # 准入状态与中国卖家可做**只能人判**,留空
+                    w.writerow([r["建议Category"], r["建议PTG"],
+                                r["walmart_product_type"], "", "",
+                                r["映射条数"],
+                                r["建议依据"] or "同路径无兄弟,Category 待人填"])
             lines.append(f"    → 待补清单 {p}(准入两列留空,填完粘回飞书)")
 
     old = [r for r in rows if r["判定"] == "旧行没清"]

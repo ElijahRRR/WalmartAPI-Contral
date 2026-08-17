@@ -75,12 +75,26 @@ def test_cron_is_taipei_and_says_so():
     assert "台北" in md and "UTC" in md
 
 
-def test_skill_lists_the_launchd_side_as_off_limits():
-    """总纲必须点名电脑上那两条 —— 不点名就会被"顺手也注册一个"。"""
+def test_skill_says_the_launchd_pair_still_needs_installing(monkeypatch):
+    """⚠ 这一节**不能写成「不归你管」**(所有者 2026-08-17 指出逻辑不对)。
+
+    原文是「不归你管的(在电脑 launchd 上,别重复挂)」—— 它把"已经装好了"
+    当成既成事实陈述,而实际上装 launchd 那一步本身就还没做。两个后果:
+      · 读到这一节的人/智能体不会去装;
+      · 而**没装的表现和"别人在管"长得一模一样** —— 所有已注册的任务照常报
+        成功,只有飞书上的「处理中」永远不消失、日报订单列空着。
+
+    所以总纲必须做到三件事:点名那两条(否则被顺手注册一个 → 撞锁)、
+    说清装法在哪、给出一条能自己查"到底装没装"的命令。
+    """
     md = gpt_skill.skill_md()
     for j in schedule.jobs_for("launchd"):
         assert j["label"] in md
-    assert "撞锁" in md
+    assert "撞锁" in md                       # 装好之后别再挂一份
+    assert "不归你管" not in md                # ⚠ 就是这句话不许再出现
+    assert "REGISTER.md" in md                # 装法指得出去
+    assert "launchctl list" in md             # 能自己查装没装
+    assert "从来不跑" in md                    # 没装的后果说明白
 
 
 def test_settlement_stays_weekly_because_no_scheduler_does_biweekly():

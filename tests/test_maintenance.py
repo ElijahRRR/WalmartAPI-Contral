@@ -1075,3 +1075,31 @@ def test_cleanup_summary_uses_the_same_wording(monkeypatch):
     from workflows import problem_product_cleanup as ppc
     for src in (inspect.getsource(mw.run), inspect.getsource(ppc.run)):
         assert '"待执行建议" if not execute else "本轮领取建议"' in src
+
+
+def test_maintenance_goes_cross_store_concurrent_but_serial_within_a_store():
+    """跨店并发,店内四类动作仍串行(所有者定稿 2026-08-17)。
+
+    店内必须留着串行:同店 token 桶互挤,四类一起发只会互相退避。
+    跨店安全:每店有自己的固定出口代理,配额与令牌桶都按 (store, endpoint) 计。
+    """
+    import inspect
+
+    from services import stores as ss
+    src = inspect.getsource(mw.run)
+    assert "ThreadPoolExecutor" in src
+    assert "stores_svc.STORE_WORKERS" in src
+    # 店内串行:提交仍在 for kind in _KIND_ORDER 里逐类走
+    assert "for kind in _KIND_ORDER" in src
+    assert ss.STORE_WORKERS == 24
+
+
+def test_summary_order_does_not_depend_on_which_store_finishes_first():
+    """摘要按店名排序合并 —— 完成先后是随机的,行序不能跟着随机。
+
+    往共享 list 上追加在 GIL 下不会坏数据,但同一轮跑两次输出不一样就没法对拍。
+    """
+    import inspect
+    src = inspect.getsource(mw.run)
+    merge = src[src.index("as_completed"):]
+    assert "per_store" in merge and "for name, _ in todo" in merge

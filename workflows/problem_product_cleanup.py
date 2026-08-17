@@ -146,14 +146,42 @@ def run(params: dict) -> str:
         return "\n".join(lines + ["(dry-run:未提交任何 feed;确认无误后**去掉 --dry-run** 重跑)"])
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
-    retry_stores: list[str] = []
-    for store_name, b in sorted(plans.items()):
-        store = stores_by_name.get(store_name)
-        if store is None:
-            lines.append(f"  {store_name}:凭证缺失,跳过")
-            continue
-        if _submit_store(store_name, store, b, lines):
-            retry_stores.append(store_name)
+
+    def _round(names: list[str]) -> tuple[dict, list[str]]:
+        """输入:要跑的店铺名 → 输出:({店铺: 该店的行}, 需二轮重试的店)。
+
+        跨店并发(所有者定稿 2026-08-17)。每店各写各的 lines_s,主线程按店名
+        排序合并 —— 往共享 list 上追加不会坏数据(GIL),但摘要行序会按完成
+        先后乱序交织,同一轮跑两次输出都不一样,没法对拍。
+        安全性:每店有自己的固定出口代理,配额与令牌桶都按 (store, endpoint) 计,
+        跨店并发不挤同一个桶;单店失败隔离本来就在 _submit_store 里。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        out: dict[str, list[str]] = {}
+        retry: list[str] = []
+
+        def _one(store_name: str):
+            lines_s: list[str] = []
+            store = stores_by_name.get(store_name)
+            if store is None:
+                lines_s.append(f"  {store_name}:凭证缺失,跳过")
+                return store_name, lines_s, False
+            need = _submit_store(store_name, store, plans[store_name], lines_s)
+            return store_name, lines_s, need
+
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(names))) as pool:
+            for f in as_completed([pool.submit(_one, n) for n in names]):
+                name, lines_s, need = f.result()
+                out[name] = lines_s
+                if need:
+                    retry.append(name)
+        return out, retry
+
+    first = sorted(plans)
+    got, retry_stores = _round(first)
+    for name in first:
+        lines.extend(got.get(name, []))
 
     if retry_stores:
         # 二轮重试(所有者定稿 2026-08-07):第一轮全部店跑完后,对网络波动
@@ -162,11 +190,13 @@ def run(params: dict) -> str:
         # 切片已落 failed 可重占,同载荷重提。二轮仍失败交下轮调度,不无限重试。
         # 建议行侧同样安全:已转 executing 的行不会被本轮再领(claim 只取
         # suggested),二轮重提的是同一批 rows 对象,不会重复转态。
+        retry_stores.sort()
         lines.append(f"二轮重试 {len(retry_stores)} 店:{','.join(retry_stores)}")
-        for store_name in retry_stores:
-            if _submit_store(store_name, stores_by_name[store_name],
-                             plans[store_name], lines):
-                lines.append(f"  ⚠ {store_name}:二轮仍失败,待下轮调度")
+        got2, still = _round(retry_stores)
+        for name in retry_stores:
+            lines.extend(got2.get(name, []))
+            if name in still:
+                lines.append(f"  ⚠ {name}:二轮仍失败,待下轮调度")
 
     lines.append("结果轮询走 feed_poll;生效确认在下一轮本工作流开头"
                  "(等 catalog_sync 重新观测)")

@@ -137,6 +137,8 @@ def run(params: dict) -> str:
             store=only or None)
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
+        stuck = dispositions.stuck_executing(
+            conn, sources=dispositions.MAINT_SOURCES)
     lines.append(
         f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
         + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议 —— 商品自己恢复正常了)"
@@ -145,6 +147,8 @@ def run(params: dict) -> str:
            f"已有 executing 行(上一轮提交了还没等到 catalog_sync 复核),"
            f"按部分唯一索引写不进去 —— 这是防重不是丢单"
            if n_sug < len(intents) else ""))
+    if stuck:
+        lines.append(dispositions.stuck_note(stuck))
     _write_sheet(intents, lines)
     lines.append("执行走 `python cli.py maintenance`(本工作流不发任何 feed)")
     return "\n".join(lines)

@@ -40,6 +40,21 @@ class _Conn:
         self.sqls.append((sql, list(seq)))
         self._last = sql
 
+    @property
+    def description(self):
+        """psycopg 的 cursor.description。按**最后一条 SQL** 给列名。
+
+        `stuck_executing` 等函数走 `dict(zip(cols, row))` 取值,没有它就 AttributeError。
+        给固定列名而不是 None:拿位置解包的假桩会让"SQL 加了一列而读侧漏改"
+        这类错在测试里看不出来。
+        """
+        class _D:
+            def __init__(self, name):
+                self.name = name
+        if "FROM ops.dispositions" in getattr(self, "_last", ""):
+            return [_D(n) for n in ("store", "action", "n", "oldest")]
+        return []
+
     def fetchall(self):
         return self.rows
 
@@ -1132,3 +1147,40 @@ def test_scan_row_carries_a_date_so_prune_can_age_it_out(monkeypatch):
     written_row = wrote[0][1][0]
     assert written_row[maint_sheet._idx("op_date")] == "2026-08-17"
     assert written_row[maint_sheet._idx("action")] == ""      # 动作留给执行件
+
+
+def test_stuck_executing_is_reported_by_both_scans():
+    """卡在 executing 的建议必须被**两个**扫描件报出来。
+
+    部分唯一索引挡的是 (店铺,SKU,动作),所以一条 executing 会让那个组合
+    **建不出新建议**;它靠观测落定,而观测全来自 catalog_sync —— 店铺不被扫
+    (凭证坏掉的店正是如此),观测就永远不来。此前这完全静默:扫描件照常报
+    「建议 N 条」,看不出少了谁。
+
+    ⚠ 尤其问题商品链:它**没有** expire_executing 那道兜底(删除/反补靠观测
+    判定,粗暴时限会抢先判掉真正在途的删除),卡住就是一直卡着。
+    """
+    import inspect
+
+    from services import dispositions as ds
+    from workflows import maintenance_scan as ms
+    from workflows import problem_scan as ps
+
+    q = ds._STUCK_SQL
+    assert "status = 'executing'" in q
+    assert "executed_at < now() - make_interval(days => %(days)s::int)" in q
+    assert "source = ANY(%(sources)s::text[])" in q      # 各查各的链
+    for mod in (ms, ps):
+        src = inspect.getsource(mod.run)
+        assert "stuck_executing" in src and "stuck_note" in src, mod.__name__
+
+
+def test_stuck_note_says_why_and_is_empty_when_clean():
+    from services import dispositions as ds
+
+    assert ds.stuck_note([]) == ""
+    note = ds.stuck_note([{"store": "谭总10", "action": "delete", "n": 3,
+                           "oldest": None}], days=3)
+    assert "谭总10×3" in note
+    assert "建不出新建议" in note        # 后果说清楚,不只报个数
+    assert "catalog_sync" in note        # 指向成因,人知道该去查什么

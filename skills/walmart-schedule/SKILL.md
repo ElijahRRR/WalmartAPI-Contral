@@ -18,11 +18,13 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 | 任务 | 时间(台北) | cron | 跑什么 |
 |---|---|---|---|
 | `backup` | 每天 02:00 | `0 2 * * *` | backup |
-| `blacklist` | 每天 02:30 | `30 2 * * *` | risk_sync → blacklist_push |
 | `daily_report` | 每天 06:40 | `40 6 * * *` | daily_report |
 | `order_daily` | 每天 07:30 | `30 7 * * *` | perf_problems → order_asin_normalize |
-| `product_chain` | 每天 09:00 | `0 9 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `product_chain` | 每天 13:00 | `0 13 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `blacklist` | 每天 15:00 | `0 15 * * *` | risk_sync → blacklist_push |
 | `product_clear` | 每天 15:00 | `0 15 * * *` | product_clear |
+| `audit_sheet` | 每天 18:10 | `10 18 * * *` | product_audit |
+| `list_new` | 每天 20:00 | `0 20 * * *` | list_new |
 | `settlement` | 每周三 08:00 | `0 8 * * 3` | settlement_sync |
 
 ⚠ **表里的时间全是台北时间(UTC+8)**,和这台电脑的本地时间一致。要是你那边的定时任务按 UTC 算,自己减 8 小时再填 —— 时区弄反的表现是「每天准时在错的时间跑」,不报任何错(02:00 的备份跑到 10:00 去,09:00 的产品链跑到半夜)。

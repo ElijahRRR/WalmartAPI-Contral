@@ -153,23 +153,37 @@ def run(params: dict) -> str:
     # 所有者 2026-08-17 问:「这部分是否是 L0 都过不了的,所以缺?
     # 这种缺口没必要去补」—— 拿数说话
     if worth:
+        # ⚠ 这一节的口径与上面 A/B **不是同一根轴**:上面按 node 分
+        # (该 node 下有没有任何一个产品带实证 PT),这里按**产品自己**分。
+        # 两处都叫 A/B 会让人以为数字该对得上(180166 vs 113496),故改名。
         lines.append("")
-        lines.append("缺口里的产品**值不值得补映射**(按最近一轮审核停在哪):")
-        for has_pt, label in ((True, "A 有实证 PT"), (False, "B 无实证 PT")):
-            g = worth.get(has_pt)
-            if not g:
-                continue
-            n, never, l0, l1 = g
+        lines.append("缺口里的产品**值不值得补映射**"
+                     "(⚠ 按产品自己有无实证 PT 分,与上面按 node 分的 A/B 不同轴):")
+        have = worth.get(True)
+        if have:
+            n, never, l0, l1 = have
+            # 有实证 PT = resolve_pt 的 ①/①b 级**直接直出**,压根不查映射表。
+            # 补映射对这批产品自身毫无作用 —— 价值只在同路径**将来的新产品**
+            lines.append(
+                f"  ① 产品自己有实证 PT:{n} 件 —— **它们不靠映射表**:"
+                f"resolve_pt 的实证级(walmart_items / 产品主档)直接直出,"
+                f"映射表是第 ② 级,轮不到。补映射对这批自身**无用**,"
+                f"价值只在同路径**将来的新产品**")
+            lines.append(f"      (其中停在 L0 {l0} 件、L1 解不出 {l1} 件、"
+                         f"从没审过 {never} 件 —— L1 近乎为 0 正说明它们不缺类目)")
+        no = worth.get(False)
+        if no:
+            n, never, l0, l1 = no
             useful = n - l0
             lines.append(
-                f"  {label}:{n} 件 —— 停在 L0(黑名单/禁售大类/®™)**{l0}** 件"
-                f"({l0 / n * 100:.0f}%,补映射白补,审核第一层就短路了);"
-                f"停在 L1 类目解不出 {l1} 件(**正是缺映射害的**);"
-                f"从没审过 {never} 件")
-            lines.append(f"      → 真正值得补的约 {useful} 件"
+                f"  ② 产品自己无实证 PT:{n} 件 —— **这批才真靠映射表**。"
+                f"其中停在 L0(黑名单/禁售大类/®™)**{l0}** 件"
+                f"({l0 / n * 100:.0f}%,补映射白补,审核第一层就短路);"
+                f"停在 L1 类目解不出 {l1} 件;从没审过 {never} 件")
+            lines.append(f"      → **真正值得补的约 {useful} 件**"
                          f"({useful / n * 100:.0f}%)")
-        lines.append("  ⚠ 「从没审过」不等于「不用补」:它们只是还没轮到,"
-                     "补了映射下轮就能直出;真正白补的只有 L0 那一档")
+        lines.append("  结论口径:补映射的收益 = ②里非 L0 的那部分 + 未来新品;"
+                     "①那一大堆数字**不是收益**,别拿它当理由排期")
     lines.append(f"—— Top {len(rows)}(only={only},按产品数降序)——")
     for node, n, n_pt, name, path, is_leaf, not_in_tree in rows:
         tag = ("树外" if not_in_tree else ("叶" if is_leaf else "非叶"))

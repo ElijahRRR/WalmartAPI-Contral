@@ -1,0 +1,128 @@
+"""audit_why 回归:把"为什么是这个结论"的整条链摊开(只读排查)。
+
+所有者 2026-08-16 实遇:一把普通锤子(`Home Improvement / Hand Tools /
+Hammers / 普通商品 / 是`)被判拒,理由栏写着 `General-Use Products`。
+结论列只留得下一句话,而结论是多层数据叠出来的 —— 要判断是"规则对数据错"
+还是"数据对规则错",必须同时看见**命中哪条规则**和**那条规则读的那一格里
+写着什么**。这条工作流就干这个,本文件钉住它不许少说这两样。
+"""
+
+import datetime as dt
+
+from workflows import audit_why
+
+
+class _Cur:
+    """按 SQL 分流的假游标。"""
+
+    def __init__(self, data):
+        self._data, self._out = data, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=None):
+        # 长键优先:_SQL_PT_VICTIMS 也 FROM catalog.products,不这样会串台
+        for key in sorted(self._data, key=len, reverse=True):
+            if key in sql:
+                self._out = self._data[key]
+                return
+        self._out = []
+
+    def fetchall(self):
+        return self._out
+
+
+class _Conn:
+    def __init__(self, data):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return _Cur(self._data)
+
+
+_AT = dt.datetime(2026, 8, 16, 20, 21)
+
+_HAMMER = {
+    "FROM catalog.products": [
+        ("B00004Z4HQ", "Goldblatt G15813 Corner Clincher and Mallet", "Goldblatt",
+         "Hammers", "map_direct", "rejected", "General-Use Products", _AT, "v1"),
+    ],
+    "FROM audit.audit_runs": [
+        (77, "B00004Z4HQ", "Hammers", "map_direct", "高", 0, "reject",
+         "L2", "skip", None, _AT),
+    ],
+    "FROM audit.audit_hits": [
+        (77, "L2", "cat_requires_cert_hard", -100,
+         {"walmart_pt": "Hammers", "walmart_policy": "General-Use Products",
+          "meta_requirements": "Comply with applicable regulations",
+          "matched_hard_kws": ["UL 认证"],
+          "note": "飞书维护的合规要求 (含实验室证书/官方注册号), 搬运模式做不了"}),
+    ],
+    "FROM audit.walmart_pt_meta": [
+        ("Hammers", "Home Improvement", "Hand Tools", "普通商品", "是",
+         "Comply with applicable regulations", None),
+    ],
+    "p.audit_status = 'rejected'": [
+        ("B00004Z4HQ", "Goldblatt G15813 Corner Clincher and Mallet",
+         "rejected"),
+    ],
+}
+
+
+def test_shows_both_the_rule_and_the_cell_it_read(monkeypatch):
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_HAMMER))
+    out = audit_why.run({"asins": "b00004z4hq"})      # 小写也认
+    # ① 结论那一行(人看到的那句)
+    assert "rejected" in out and "General-Use Products" in out
+    # ② 命中的规则 + 人话
+    assert "cat_requires_cert_hard" in out and "-100" in out
+    assert "该类目要求认证" in out
+    # ③ **规则读的是哪张表哪一列** —— 没有这个就只能干瞪眼
+    assert "audit.walmart_pt_meta.requirements" in out
+    # ④ 那一格里到底写着什么 + 匹配上了什么(误判一眼可见)
+    assert "Comply with applicable regulations" in out
+    assert "UL 认证" in out
+    # ⑤ 准入两列同时亮出来:它们是过的,拒它的是第三列 —— 这个对比是关键
+    assert "普通商品" in out and "'是'" in out
+
+
+def test_says_so_when_the_asin_was_never_audited(monkeypatch):
+    data = {"FROM catalog.products": _HAMMER["FROM catalog.products"]}
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(data))
+    out = audit_why.run({"asins": "B00004Z4HQ"})
+    assert "没审过" in out
+
+
+def test_says_so_when_the_asin_is_not_in_the_catalog(monkeypatch):
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({}))
+    out = audit_why.run({"asins": "B0MISSING1"})
+    assert "不在 catalog.products" in out and "product_ingest" in out
+
+
+def test_by_pt_dumps_the_row_the_gates_actually_read(monkeypatch):
+    """按 PT 看:一个类目被拒一片时,先确认是不是那一行数据填错了。"""
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_HAMMER))
+    out = audit_why.run({"pt": "Hammers"})
+    assert "access_state" in out and "普通商品" in out
+    assert "zh_can_do" in out
+    assert "requirements" in out and "**R3 在这一格里扫认证关键词**" in out
+
+
+def test_missing_pt_row_is_called_out(monkeypatch):
+    """PT 不在 meta 表 = R1/R3 静默放行(旧仓原语义)—— 静默的东西必须说出来。"""
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({}))
+    assert "没有这个 PT" in audit_why.run({"pt": "NoSuchPT"})
+
+
+def test_needs_one_of_the_two_params():
+    assert "要么给" in audit_why.run({})

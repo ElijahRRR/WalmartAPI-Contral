@@ -318,7 +318,15 @@ def _collect_blacklists(conn, items: list[dict]) -> str:
     按品牌去重入 brand_blacklist。
     **任何失败只告警不阻断**——黑名单是扫描的副产品,收集炸了不该把建议
     产出拖下水;漏一轮下一轮照样补(入选条件不变)。
-    飞书投影由 blacklist_push 按 pushed_at 水位另推,这里只写 PG。
+    ⚠ **这里只写 PG,一个格子也不碰飞书**(所有者 2026-08-17 问「黑名单的品牌和
+    asin 出来了会立刻推送到飞书表格吗」—— 不会,而且两条时间线不一样):
+
+      · **否决闸立刻生效**:写完 `brand_blacklist`/`asin_blacklist` 那一刻,
+        上架与审核就拦得住了 —— 它们读 PG,从不读飞书表。
+      · **表格要等 `blacklist_push`**(调度里的 `blacklist` 任务,15:00),
+        按库里全量整表重写。想立刻看见就手动跑一次 `cli.py blacklist_push`。
+
+    (水位追加那套 2026-08-17 已废除,`pushed_at` 只剩"这行投影过了"的含义。)
     """
     cand = [it for it in items if "category" in it]
     if not cand:

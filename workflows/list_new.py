@@ -1014,7 +1014,27 @@ def run(params: dict) -> str:
     for r in ready:
         by_store2.setdefault(r["store"], []).append(r)
 
-    for store_name, srows in sorted(by_store2.items()):
+    def _one_store(store_name: str, srows: list[dict]) -> tuple:
+        """输入:店铺 + 该店待提交行 → 输出:(店铺名, 计数增量, reasons, lines)。
+
+        **各店各自的局部状态**,主线程按店名排序合并 —— 跨店并发之后不能再往
+        共享 dict/list 上写:`n["no_upc"] += 1` 是"读-加-写"三步,两个线程交错
+        会**丢计数**(丢得随机、不报错);`reasons`/`lines` 直接 append 则会按
+        完成先后乱序交织,同一轮跑两次输出不一样,dry-run 与真跑没法对拍。
+
+        **店内仍然串行**:领 UPC → LLM 出参 → spec 一致化 → 提交 feed 这条链
+        对同一个店是有序的,并发只加在店与店之间。领号本身并发安全
+        (upc_pool.claim 用 FOR UPDATE SKIP LOCKED,「并发领号互不阻塞且绝不
+        双领」),每店各开各的 pg 连接,不共享游标。
+
+        飞书回写 write_submit_cols **留在本函数内**、不挪到合并之后:UPC 已
+        mark_used、product_events 已落库,而表上 K 列还是空 —— 下一轮读表看到
+        「listed=No 且无 feed_id」就会重发一遍。让每个店的表写紧跟自己的提交,
+        别的店炸了也带不走它。(并发下的写节流由 api.feishu 的 _sheet_locks 兜。)
+        """
+        cnt = {"no_upc": 0, "invalid": 0, "title_diff": 0}
+        reasons_s: list[tuple[int, str]] = []
+        lines_s: list[str] = []
         store = stores_by_name[store_name]
         try:
             partner = settings_api.get_partner_id(store)
@@ -1025,15 +1045,15 @@ def run(params: dict) -> str:
                                              for r in srows])
                 for r, upc in zip(srows, upcs):
                     if upc is None:
-                        n["no_upc"] += 1
-                        reasons.append((r["rownum"], "UPC池余量不足"))
+                        cnt["no_upc"] += 1
+                        reasons_s.append((r["rownum"], "UPC池余量不足"))
                         continue
                     visible, llm_o = _map_llm(
                         conn, r["product_type"],
                         pt_spec.load_pt(r["product_type"]), r["_p"])
                     if len(visible.get("productName") or "") < 10:
                         upc_pool.release(conn, [upc], "prep_failed")
-                        reasons.append((r["rownum"], "标题不足10字符"))
+                        reasons_s.append((r["rownum"], "标题不足10字符"))
                         continue
                     orderable = mp_mapper.build_orderable(
                         r["asin"], upc, r["_price"], r["_qty"], partner,
@@ -1053,9 +1073,9 @@ def run(params: dict) -> str:
                                     len(notes), "; ".join(notes[:6]))
                     if missing:
                         upc_pool.release(conn, [upc], "prep_failed")
-                        n["invalid"] += 1
-                        reasons.append((r["rownum"],
-                                        f"必填缺失:{','.join(missing[:6])}"))
+                        cnt["invalid"] += 1
+                        reasons_s.append((r["rownum"],
+                                          f"必填缺失:{','.join(missing[:6])}"))
                         _dump_llm_debug(r["asin"], visible, orderable,
                                         missing, notes)
                         continue
@@ -1064,15 +1084,13 @@ def run(params: dict) -> str:
             # 同变体组标题差异化(旧仓 Feature B)**必须在 assemble 之前**:
             # 组装成 MP_ITEM 之后 productName 已经埋进载荷,再改就是改两份。
             # 按 (组 ID) 分组:同一个 store 循环内,不会跨店混
-            n_title = _differentiate_titles(prepped)
-            if n_title:
-                n_var["标题加维度后缀"] = n_var.get("标题加维度后缀", 0) + n_title
+            cnt["title_diff"] = _differentiate_titles(prepped)
             items = [mp_mapper.assemble_mp_item(
                 p["orderable"], p["r"]["product_type"], p["visible"])
                 for p in prepped]
             claimed = [(p["r"], p["upc"]) for p in prepped]
             if not items:
-                continue
+                return store_name, cnt, reasons_s, lines_s
             updates = []
             i = 0
             for res in feeds.submit_feed(store, "MP_ITEM", items,
@@ -1111,10 +1129,40 @@ def run(params: dict) -> str:
                                 "", "", "", "", "Unknown", "", today,
                                 "提交结局不确定,待对账"]))
             listing_sheet.write_submit_cols(updates)
-            lines.append(f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条")
+            lines_s.append(f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条")
         except Exception as e:
             logger.exception("店铺 %s 上架异常,跳过继续其它店: %s", store_name, e)
-            lines.append(f"  ⚠ {store_name}:上架异常已跳过({e}),下轮重试")
+            lines_s.append(f"  ⚠ {store_name}:上架异常已跳过({e}),下轮重试")
+        return store_name, cnt, reasons_s, lines_s
+
+    todo2 = sorted(by_store2.items())
+    if todo2:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        per_store: dict[str, tuple] = {}
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(todo2))) as pool:
+            futs = [pool.submit(_one_store, sn, sr) for sn, sr in todo2]
+            for f in as_completed(futs):
+                sn, cnt, reasons_s, lines_s = f.result()
+                per_store[sn] = (cnt, reasons_s, lines_s)
+        # 按店名排序合并:完成先后是随机的,摘要行序与 N 列理由的写入顺序不能跟着随机
+        for sn, _ in todo2:
+            cnt, reasons_s, lines_s = per_store[sn]
+            n["no_upc"] += cnt["no_upc"]
+            n["invalid"] += cnt["invalid"]
+            n_var["标题加维度后缀"] += cnt["title_diff"]
+            reasons.extend(reasons_s)
+            lines.extend(lines_s)
+
+    # 提交期三个计数一直是**只加不看**:gate_line 是字符串,在提交循环之前就拼死了
+    # (2026-08-17 修 n_var 那一处时同一个坑没扫干净)。逐行理由确实写进了 N 列,
+    # 但摘要里一个字没有 —— 于是"这轮 300 行只上了 40 条"在通知里看不出原因。
+    post = [(lab, v) for lab, v in (("UPC池不足", n["no_upc"]),
+                                    ("必填缺失", n["invalid"]),
+                                    ("标题加维度后缀", n_var["标题加维度后缀"]))
+            if v]
+    if post:
+        lines.append("提交期:" + ",".join(f"{lab} {v}" for lab, v in post))
 
     for rownum, why in reasons[n_reasons_written:]:   # 提交期新增的理由(UPC/标题)
         listing_sheet.write_reason(rownum, why)

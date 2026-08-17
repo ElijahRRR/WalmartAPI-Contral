@@ -297,6 +297,65 @@ def test_variant_counts_are_computed_before_the_summary_line():
     assert "_variant_plan(" not in src               # 只在 _plan_variants 里调
 
 
+def _vrow(asin, pairs, gid="vg_G", store="M001"):
+    return {"asin": asin, "store": store,
+            "_vplan": {"mode": "variant", "group_id": gid, "code": "variant",
+                       "is_primary": True, "attr_pairs": list(pairs),
+                       "family_size": 3}}
+
+
+def test_dimension_with_identical_values_across_the_group_is_dropped():
+    """⚠ 声明一个组内取值全同的维度 = 告诉沃尔玛"按尺寸不同"再给三个一样的尺寸。
+
+    2026-08-17 生产实见(所有者的礼品袋组):亚马逊给的 size_name 三个成员**全是**
+    `1 Count (Pack of 100)` —— 那不是尺寸是包装数量,对分组毫无信息量。真正区分
+    它们的是标题里的 Small/Medium/Large,亚马逊自己没放进 twister 维度。
+    """
+    from workflows import list_new as ln
+    S = ("size", "1 Count (Pack of 100)")
+    rows = [_vrow("B0BWMV956C", [("color", "Kraft brown"), S]),
+            _vrow("B0BWMVQHVJ", [("color", "Brown"), S]),
+            _vrow("B0BWMY43TD", [("color", "Original brown"), S])]
+    ln._drop_degenerate_dims(rows)
+    for r in rows:
+        assert [n for n, _ in r["_vplan"]["attr_pairs"]] == ["color"]
+        assert r["_vplan"]["degenerate_dims"] == ["size"]
+        assert r["_vplan"]["mode"] == "variant"      # color 还有差异,仍是变体组
+
+
+def test_group_with_no_differentiating_dimension_falls_back_to_single():
+    """维度剔光 ⇒ 这几条压根不该是一个变体组(沃尔玛看不出区别),整组退单品。
+
+    宁可各自独立上架,也不要发一个成员之间毫无区别的变体组 —— 后者要用
+    MP_MAINTENANCE 才改得回来。
+    """
+    from workflows import list_new as ln
+    rows = [_vrow("A1", [("size", "X")]), _vrow("A2", [("size", "X")])]
+    ln._drop_degenerate_dims(rows)
+    for r in rows:
+        assert r["_vplan"]["mode"] == "single"
+        assert r["_vplan"]["code"] == "no_diff_dim"
+        assert "取值全同" in r["_vplan"]["reason"]
+
+
+def test_single_visible_member_is_never_judged_degenerate():
+    """本轮只看见 1 个成员时**什么都不做** —— 一条数据判不出"组内有没有差异"。
+
+    所有者第一次验收就是只放了 2 个成员进表(家族 3 个),按"可能有差异"处理
+    才是对的;据一条就剔维度,等于把增量上架的第一条永久判成单品。
+    """
+    from workflows import list_new as ln
+    rows = [_vrow("A1", [("size", "X")])]
+    ln._drop_degenerate_dims(rows)
+    assert rows[0]["_vplan"]["mode"] == "variant"
+    assert rows[0]["_vplan"]["attr_pairs"] == [("size", "X")]
+    # 不同组的两条也各算各的,不许跨组比
+    rows2 = [_vrow("A1", [("size", "X")], gid="vg_1"),
+             _vrow("A2", [("size", "X")], gid="vg_2")]
+    ln._drop_degenerate_dims(rows2)
+    assert all(r["_vplan"]["mode"] == "variant" for r in rows2)
+
+
 def test_same_round_siblings_do_not_both_claim_primary():
     """⚠ 同一轮里同族两个新成员会**各自都判自己是主变体** → 同一个 feed 两个 Yes。
 

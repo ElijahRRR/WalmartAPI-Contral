@@ -367,6 +367,7 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
                 conn.close()
             except Exception:                                   # noqa: BLE001
                 pass
+    _drop_degenerate_dims(ready)
     _dedupe_primary(ready)
     for r in ready:
         vp = r.get("_vplan")
@@ -381,6 +382,60 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
             # 映不上的维度只剔它、不退单品 —— 但组内差异若恰好只在被剔的
             # 那个维度上,发出去就是几条看不出区别的变体
             n_var["有维度映不上"] += 1
+
+
+def _drop_degenerate_dims(ready: list[dict]) -> None:
+    """输入:带 _vplan 的待提交行 → 输出:无(就地剔掉组内**取值完全相同**的维度)。
+
+    ⚠ **声明了一个维度却在组内没有差异值,等于告诉沃尔玛"这几个按尺寸不同"
+    然后给出三个一样的尺寸。** 2026-08-17 生产实见(所有者的礼品袋组):
+    亚马逊给的 `size_name` 三个成员**全是** `1 Count (Pack of 100)` —— 那不是
+    尺寸,是包装数量,而且对分组毫无信息量。真正区分它们的是标题里的
+    Small/Medium/Large,亚马逊自己没把它放进 twister 维度。
+
+    判据只用**本轮看得见的成员**:同 (店铺, 组 ID) 至少 2 条时,某维度的取值集合
+    只有 1 个 ⇒ 剔掉它。只看见 1 条时**什么都不做** —— 一条数据判不出"组内有没有
+    差异",按"可能有"处理(所有者的第一次验收就是只放了 2 个成员进表)。
+
+    剔到一个维度都不剩 ⇒ 这几条压根不该是一个变体组(沃尔玛看不出区别),
+    整组退回单品口径并计一笔 `no_diff_dim`。宁可各自独立上架,也不要发一个
+    成员之间毫无区别的变体组 —— 后者要用 MP_MAINTENANCE 才能改回来。
+    """
+    by_group: dict[tuple, list[dict]] = {}
+    for r in ready:
+        vp = r.get("_vplan")
+        if vp and vp.get("mode") == "variant" and vp.get("attr_pairs"):
+            by_group.setdefault((r.get("store"), vp.get("group_id")),
+                                []).append(r)
+    for (store, gid), rows in sorted(by_group.items(),
+                                     key=lambda kv: (str(kv[0][0]),
+                                                     str(kv[0][1]))):
+        if len(rows) < 2:
+            continue                     # 一条判不出组内差异,不动
+        names = [n for n, _ in rows[0]["_vplan"]["attr_pairs"]]
+        for name in names:
+            vals = {str(dict(r["_vplan"]["attr_pairs"]).get(name))
+                    for r in rows if name in dict(r["_vplan"]["attr_pairs"])}
+            if len(vals) > 1:
+                continue
+            logger.warning("变体组 %s(%s)的维度 %s 在本轮 %d 个成员上取值全同"
+                           "(%s),剔掉 —— 声明了没有差异的维度等于没声明",
+                           gid, store, name, len(rows), vals)
+            for r in rows:
+                vp = r["_vplan"]
+                r["_vplan"] = {**vp, "attr_pairs": [
+                    (n, v) for n, v in vp["attr_pairs"] if n != name],
+                    "degenerate_dims": sorted(
+                        set(vp.get("degenerate_dims") or ()) | {name})}
+        for r in rows:
+            vp = r["_vplan"]
+            if vp["attr_pairs"]:
+                continue
+            # 所有维度都没差异 ⇒ 这不是一个变体组
+            r["_vplan"] = {**vp, "mode": "single", "code": "no_diff_dim",
+                           "reason": f"组内 {len(rows)} 个成员在 "
+                                     f"{','.join(vp.get('degenerate_dims') or ())} "
+                                     f"上取值全同,没有可分变体的差异维度"}
 
 
 def _dedupe_primary(ready: list[dict]) -> None:
@@ -434,6 +489,9 @@ def _variant_echo(vp: dict | None) -> str:
            f",{'主' if vp.get('is_primary') else '非主'}变体")
     if vp.get("unmapped_dims"):
         out += f",⚠ 维度 {','.join(vp['unmapped_dims'])} 映不上未发"
+    if vp.get("degenerate_dims"):
+        out += (f",⚠ 维度 {','.join(vp['degenerate_dims'])} 组内取值全同已剔"
+                f"(声明没有差异的维度等于没声明)")
     return out
 
 

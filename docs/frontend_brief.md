@@ -255,9 +255,43 @@
 
 ---
 
-## 附:如果它问起技术栈
+## 附:技术栈(已定,不用再建议)
 
-前端技术栈未定,由它建议。后端是 Python(工作流脚本)+ PostgreSQL 17,
-本机运行(macOS),单用户,不需要考虑高并发或多租户。
-读数据可以直连 PostgreSQL 只读角色;触发工作流需要一层很薄的服务去起进程
-—— 但这一层不在本次设计范围内,设计时假设"触发"这个能力存在即可。
+```
+UI       Vite + React + TypeScript
+表格     TanStack Table + TanStack Virtual
+组件     Tailwind + shadcn/ui
+图表     Recharts
+服务端   FastAPI(放进本仓库)
+```
+
+现有后端:Python(66 条工作流脚本)+ PostgreSQL 17,本机 macOS 运行,
+**单用户**,不考虑高并发、多租户、SEO、SSR。
+
+### 为什么服务端是 Python 而不是 Next.js / SvelteKit
+
+服务端必须存在(浏览器读不了 PostgreSQL,触发工作流是起进程),但**它必须是
+Python 的**:服务端要知道「66 条工作流各叫什么、**哪 21 条是危险的**、每条收哪些
+参数、调度表长什么样」——这些真值全在 Python 代码里
+(`workflows/*.DANGEROUS`、`registry/schedule.JOBS`、各工作流的 `_KNOWN_PARAMS`)。
+
+Node 服务端只能把它们**再抄一份到 TypeScript**,而抄漏一条的后果是:
+那条工作流在界面上少了"预览 → 确认"那道闸,**点一下直接真跑**,且不报错。
+FastAPI 则是直接 import —— 加一条新工作流,界面自动就有、危险标记自动就对。
+
+服务端既然是 Python,Next.js/SvelteKit 最大的价值(自带服务端运行时)就用不上,
+只剩当 SPA 打包器,那是 Vite 更擅长的事。
+
+⚠ **TanStack Table 不是可选项**:产品表几十万行,普通表格组件会卡死。
+headless(只给逻辑不给样式)+ TanStack Virtual 窗口化 + 服务端分页。
+
+### ⚠ 服务端的边界(设计时按这个假设)
+
+FastAPI 层**只做两件事**:①只读查 PostgreSQL;②起 `cli.py` 进程、流式读它的输出。
+
+**它绝不自己写库。** 一旦绕过 `cli.py` 直接 INSERT,单实例锁、`ops.runs` 运行记录、
+飞书通知这三样全部失效 —— 那是本项目「写路径只有一道门」的全部意义所在。
+
+所以设计时可以假设这些能力存在:列出工作流(带危险标记与参数)、
+起一次运行(可带 `--dry-run`)、实时拿到它的输出、查任意表与视图。
+**不能**假设"保存这一行的修改"这种能力存在。

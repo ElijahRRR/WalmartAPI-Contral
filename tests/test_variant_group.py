@@ -290,7 +290,7 @@ def test_variant_counts_are_computed_before_the_summary_line():
 
     src = inspect.getsource(__import__("workflows.list_new",
                                        fromlist=["run"]).run)
-    assert src.index("_plan_variants(ready") < src.index('gate_line = (f"闸门')
+    assert src.index("_plan_variants(ready") < src.index("闸门:")
     # 提交循环必须**复用**这份决策,不许重算 —— 重算就是 dry-run 报一份、
     # 真跑发另一份,中间任何差异都表现为"dry-run 说没事"
     assert 'vplan = r.get("_vplan")' in src

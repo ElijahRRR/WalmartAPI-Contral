@@ -8,6 +8,15 @@
 
 这条链跑的是:perf_problems → order_asin_normalize。
 
+## 这条链在做什么
+
+| 步 | 工作流 | 这一步干什么 |
+|---|---|---|
+| 1 | `perf_problems` | 绩效问题订单明细(原 daily_report 的 problems 阶段,独立成流)。 |
+| 2 | `order_asin_normalize` | 订单行 SKU→ASIN 清洗(可反复跑,只补 NULL)。 |
+
+**顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
+
 备注:⚠ apply=1 不能省:order_asin_normalize 缺省是预览,漏了就每天空转报成功
 
 ## 跑完怎么判

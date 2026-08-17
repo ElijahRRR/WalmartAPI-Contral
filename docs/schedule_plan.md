@@ -361,7 +361,7 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 | runner | 哪些 | 为什么 |
 |---|---|---|
 | `launchd` | `feed_poll`(每半小时)、`order_chain`(每小时:销售订单/订单审核/售后订单) | 高频的东西写死在电脑上最稳,不依赖任何智能体在不在线 |
-| `gpt` | 其余每日/每周一次的七条 | 所有者原话:「前期稳定,也方便我维护和调整,以后换个智能体也能用」。改个时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、能当场判断要不要重跑的东西**在旁边 |
+| `gpt` | 其余每日/每周一次的九条 | 所有者原话:「前期稳定,也方便我维护和调整,以后换个智能体也能用」。改个时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、能当场判断要不要重跑的东西**在旁边 |
 
 ⚠ `runner` 只决定**谁按秒表**,不决定跑什么:两边都是同一条 `python cli.py …`,
 同一把 flock 锁,同一份 `ops.runs` 记录。所以**同一条链绝不许两边都挂** ——
@@ -374,14 +374,25 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 ```
 cd /Users/nextderboy/Projects/WalmartAPI-Contral
 .venv/bin/python3 cli.py launchd_install --dry-run   # 电脑那两条:plist + launchctl 命令
-.venv/bin/python3 cli.py skill_export   --dry-run    # 智能体那七条:技能包 md
+.venv/bin/python3 cli.py skill_export   --dry-run    # 智能体那九条:技能包 md
 ```
 
-`skill_export` 写 `skills/walmart-schedule/`(进 git):一份 `SKILL.md` 总纲
-(任务表 + 退出码怎么判 + 三条纪律 + 电脑侧那两条"别重复挂")+ 每条任务一份
-`tasks/<任务名>.md`,注册定时任务时**整篇粘进提示词**。产物与调度表的一致性由
+`skill_export` 写 `skills/walmart-schedule/`(进 git):
+
+| 文件 | 给谁看 | 内容 |
+|---|---|---|
+| `SKILL.md` | 智能体(常驻技能) | 任务表(时间 + cron 台北 + **cron UTC**)+ 退出码怎么判 + 三条纪律 + 电脑侧那两条"别重复挂" |
+| `REGISTER.md` | 注册那一次(整篇发给它) | 一次性注册全套的交办话术:先定时区 → 按表注册 → 提示词取自哪个文件 → 哪两条不许挂 → 别动旧任务 → **注册完回读对表** |
+| `tasks/<任务名>.md` | 每条定时任务的提示词 | 注册时**整篇粘进去**,不许改写/摘要 |
+
+产物与调度表的一致性由
 `tests/test_gpt_skill.py::test_repo_copy_matches_the_schedule_table` 钉住 ——
 提示词是调度表的副本,副本与正本不一致时没有任何东西会报错。
+
+⚠ **UTC 那一列是算好的**(`gpt_skill.cron_utc`,跨日连星期一起往前挪)。
+让注册的人自己减 8 小时,跨日那三条(台北 02:00 / 06:40 / 07:30 → UTC 前一天)
+几乎注定有一条减错;而时区弄反是这套东西里**唯一**"每天准时在错的时间跑"
+且不报任何错、通知照发的故障。`REGISTER.md` 第 0 步就是先把时区问清楚。
 
 ## 十、上线顺序(分三批,每批观察一天)
 
@@ -393,9 +404,35 @@ cd /Users/nextderboy/Projects/WalmartAPI-Contral
 | | `perf_problems`、`settlement_sync`、`daily_report` | 智能体 | 旧 KPI(08:00 + 14:00) | 同上 |
 | **三(破坏性)** | 产品线整条、`product_clear` | 智能体 | 旧维护 12:00、旧下架 15:00、旧 cleanup 0/6/12/18、旧 retire 23:30 | 每条**先手动 `--dry-run` 人眼确认**再注册 |
 
-批一/批二挂 launchd 的那两条走 `launchd_install -p batch=N`;其余七条走
-`skill_export` 生成提示词后**按批逐条注册**(不要一次把七条全注册进去 ——
-"每批观察一天"这回事就没了)。
+批一/批二挂 launchd 的那两条走 `launchd_install -p batch=N`。
 
 ⚠ 批三的 `maintenance_scan -p preview=1` 要重点看「标题不匹配」那类删除的条数
 —— 五条删除判据里唯一没有生产数据背书的一条。
+
+### 10.1 智能体那九条:一次性注册(所有者定稿 2026-08-17)
+
+原计划是"按批逐条注册,每批观察一天"。所有者改为**一次性注册到位**
+(原话:「我将让 gpt 一次性注册到位」)—— 交办单 `skills/walmart-schedule/REGISTER.md`
+就是按这个定稿生成的。
+
+放弃的东西讲清楚:分批注册买到的是"出事时只有一条新链在跑,一眼知道是谁"。
+一次注册进去,第一天晚上会有九条陆续首跑,真出事得靠 `ops.runs` 与飞书通知
+按时间倒排去认 —— 这两样都有,所以代价可承受。
+
+**但"分批"里有一半根本不是观察节奏,是安全铁律**(新旧系统严禁对同一破坏性
+任务并跑),这部分不随注册方式改变。一次性注册后,**每条新链首跑之前**对应的
+旧调度必须已经停掉:
+
+| 新链首跑 | 必须先停的旧调度 | 撞上会怎样 |
+|---|---|---|
+| `daily_report` 06:40 / `order_daily` 07:30 | 旧 KPI `walmart-kpi-daily` 08:00、`walmart-kpi-afternoon` 14:00 | 同一天两套都写影刀 ⇒ 店铺日报数据双写 |
+| `product_chain` 13:00 | 旧维护 `walmart-maintenance-all-stores` 12:00(先收干净旧在途 feed)、旧 cleanup `walmart-daily-cleanup` 0/6/12/18:04 | 同一天两套都改沃尔玛商品 ⇒ 互相踩,且旧在途 feed 的回执会被新链当成自己的 |
+| `product_clear` 15:00 | 旧下架 `walmart-daily-retire` **15:00** | ⚠ **同一分钟、同一件破坏性事**:两套各自算一遍该下架谁,谁也不知道对方下了什么 |
+| `list_new` 20:00 / `audit_sheet` 18:10 | (无 —— 所有者 2026-08-17 判定旧上架/审核 worker 不写表,留着当备用) | — |
+| `backup` 02:00 / `blacklist` 15:00 / `settlement` 周三 08:00 | 无 | — |
+
+⚠ **`walmart-daily-cleanup`(0/6/12/18:04)的调度器至今没定位**(A 表就记着这一条)。
+停不掉它 ⇒ `product_chain` 最后一步 `problem_product_cleanup` 会与它并跑。
+两条路:先把它找出来停掉,或者**先从 `product_chain` 里摘掉最后那一步**
+(改 `registry/schedule.py` 后重新 `skill_export`),等定位到了再加回去。
+不要"先跑着看看" —— 这一条正是铁律说的那种破坏性并跑。

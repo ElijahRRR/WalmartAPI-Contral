@@ -1,28 +1,20 @@
-# 沃尔玛定时任务:product_chain(每天 13:00,台北时间)
+# 沃尔玛定时任务:list_new(每天 20:00,台北时间)
 
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py list_new
 ```
 
-这条链跑的是:catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup。
+这条链跑的是:list_new。
 
 ## 这条链在做什么
 
 | 步 | 工作流 | 这一步干什么 |
 |---|---|---|
-| 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
-| 2 | `product_refresh` | 在线产品全量重推采集(维护链的数据新鲜度源头)。 |
-| 3 | `product_ingest` | 采集服务增量 → 产品中心(catalog.products / snapshots)。 |
-| 4 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
-| 5 | `maintenance` | 商品维护执行件(批次四拆分后;危险,缺省即真跑)。 |
-| 6 | `problem_scan` | 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。 |
-| 7 | `problem_product_cleanup` | 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。 |
+| 1 | `list_new` | 上架主链(listing L2d,替代旧 auto_listing/main.py;危险:缺省即真跑,空跑用 --dry-run)。 |
 
-**顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
-
-备注:整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)
+备注:⚠⚠ **开这条之前必须先停旧上架栈**:com.user.autolisting.morning(06:00,链末尾就是无人值守上架)+ com.nextderboy.erp_worker×20(常驻,长轮询跑上架)+ dedup 链(每时:05 与 14:02)。不停就是新旧两套同时对上架表双写、同时消耗 UPC —— 安全铁律「新旧系统严禁对同一破坏性任务并跑」直接踩上。停旧顺序见 docs/legacy_schedules.md §D。UPC **不必单独排一条**:这条链自己开头注入一次 UPC 池、结尾把池状态回写飞书 C~F(所有者定稿 2026-08-16「放到上架里」),合起来等于跑了一次 upc_sync
 
 ## 跑完怎么判
 

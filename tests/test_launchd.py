@@ -88,12 +88,38 @@ def test_dangerous_chains_carry_no_dry_run_flag():
 
 
 def test_manual_only_workflows_are_not_scheduled():
-    """所有者定稿:上架/跟卖/分配/审核/自愈一律手动,不进调度。"""
+    """跟卖/分配/补采/自愈一律手动,不进调度。
+
+    ⚠ **审核与上架 2026-08-17 起进表**(所有者定稿,上架域生产验收通过之后):
+    `audit_sheet` 18:10 + `list_new` 20:00。这条用例此前把它们也钉在"不许进
+    调度"里,现在只钉剩下那几条 —— 改的时候要一起想清楚:`match_listing`
+    留在这里是因为它的对拍还没做完(头注"对拍未完成前只许 --dry-run" 仍有效),
+    不是因为"跟卖不该自动化"。
+    """
     scheduled = {w for j in schedule.JOBS for w in j["workflows"]}
-    for name in ("list_new", "match_listing", "sku_locked_heal",
-                 "product_audit", "scrape_missing", "brand_scrape",
+    for name in ("match_listing", "sku_locked_heal",
+                 "scrape_missing", "brand_scrape",
                  "alloc_plan", "alloc_backfill", "order_center_push"):
         assert name not in scheduled, name
+
+
+def test_the_listing_day_order_is_encoded_in_the_times():
+    """当天次序是硬约束:产品链 → 黑名单 → 审核 → 上架。
+
+    谁提前谁就是拿昨天的数据做今天的判断,而且**不报错**:
+      · problem_scan(产品链里)当天产出的黑名单 ASIN/品牌,要等 blacklist
+        投影出去、收回 PG,审核 Phase0 与上架闸读的才是今天的黑名单;
+      · 上架的领任务闸读 `catalog.products.audit_status`,审核没跑完就没有
+        今天新审的行可上。
+    时间写在调度表里,这条用例保证改时间的人会撞上它。
+    """
+    at = {j["label"]: (j["hour"], j["minute"]) for j in schedule.JOBS}
+    order = ["product_chain", "blacklist", "audit_sheet", "list_new"]
+    times = [at[k] for k in order]
+    assert times == sorted(times), dict(zip(order, times))
+    # product_chain 约 2 小时:13:00 起、约 15:00 收,blacklist 紧贴在后面。
+    # 真跑起来若发现产品链常超过两小时,把 blacklist 往后挪,别把它提前
+    assert at["product_chain"] == (13, 0) and at["blacklist"] == (15, 0)
 
 
 def test_only_the_high_frequency_chains_live_on_this_machine():
@@ -114,7 +140,8 @@ def test_only_the_high_frequency_chains_live_on_this_machine():
 def test_batches_match_the_greyscale_plan():
     """分三批灰度是所有者定的节奏 —— 批号只有 1/2/3,且破坏性链都在批 3。"""
     assert {j["batch"] for j in schedule.JOBS} == {1, 2, 3}
-    dangerous = {"product_chain", "product_clear"}
+    # 破坏性 = 会写沃尔玛/不可逆的那些(2026-08-17 加进审核与上架两条)
+    dangerous = {"product_chain", "product_clear", "audit_sheet", "list_new"}
     for j in schedule.JOBS:
         if j["label"] in dangerous:
             assert j["batch"] == 3, j["label"]

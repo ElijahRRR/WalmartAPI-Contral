@@ -85,6 +85,15 @@ def run(params: dict) -> str:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:
         lines.append(f"失败:{'; '.join(failed)}")
+    if not results:
+        # ⚠ 零店完成不许报成功(2026-08-17 补,与 catalog_sync 同款闸)。
+        # 「凭证失效跳过」按设计不进 failed —— 一家店坏了不该拖垮整轮;但
+        # **全部**店都被跳过意味着这一轮什么都没同步。同日 api/_client 把换
+        # token 阶段的 **400** 也归成 StoreDeadError(沃尔玛凭证被拒回的是 400),
+        # 于是"请求形状被改坏"这类全店故障从"整轮报错"变成了"整轮跳过" ——
+        # 没有这道闸就是报成功。本链**每小时**跑,静默陈旧起来最难发现。
+        lines.append("⚠ 零店完成 —— 本轮没有同步任何售后数据")
+        raise RuntimeError("\n".join(lines))
     # 跑完就写飞书(同 order_sync;投影失败只告警,售后行已落 PG)
     lines.append(order_center.push_after(
         order_center.BY_WORKFLOW["returns_sync"], days=max(days, 90)))

@@ -84,6 +84,42 @@ ON CONFLICT (batch_name, asin) DO UPDATE SET
 """
 
 
+def prioritize(batch_name: str, batch_id) -> bool:
+    """输入:批次名(只为日志好读)+ batch_id → 输出:插队成功与否。
+
+    **哪些链该插队**(所有者定稿 2026-08-17):`order_audit`、`product_refresh`
+    与 `product_audit` 的补采(`audit_gap_*`)—— 它们的共同点是**本侧在等这批
+    采集**(order_audit 默认 wait=1 阻塞 20 分钟;product_refresh 在产品线串联里,
+    wait=1 时后面六步全在等;product_audit 同轮闭环等 20 分钟,等不到那批产品
+    今天就审不了、20:00 的上架也上不了)。排在常规批次后面就是干等到超时。
+
+    ⚠ `audit_gap_*` 是 2026-08-17 加的第三条,加它的**理由是时间账**:
+    审核 18:10 起跑,而 `product_refresh` 13:00 推的十几万个任务这时很可能还在
+    排。不插队的话那 20 分钟几乎注定等不到 —— 等于同轮闭环写了但从不生效,
+    而且表现是"每天都超时",看着像采集侧慢。稀释风险可接受:它一天一次、
+    通常只有几十个 ASIN。
+
+    **哪些链不插队**:`scrape_missing`(几万条存量补采)、`brand_scrape`、
+    `list_new` 顺手补采的那几个 —— 它们都是"采到了下轮自然用上"的形态,
+    没有谁在等。全都插队 = 谁都没插队,那条车道就成了新的常规车道。
+
+    ⚠ 采集侧只有两档(0 与 10,`prioritize` 端点写死),所以插队的两条链
+    **共用一条车道**;`product_refresh` 一次十几万个任务塞进去之后,
+    order_audit 的小批次只能排在它后面。真撞上了看 `ops.scrape_batches`
+    与 order_audit 的超时率,处置见 `workflows/product_refresh` 那段注释。
+
+    best-effort:失败只记一笔日志,**不影响已提交的采集**,也不写台账状态
+    —— 插不了队不是批次的状态,别把"慢"记成"坏"。
+    """
+    ok = scraper.prioritize(batch_id)
+    if ok:
+        logger.info("批次 %s(id=%s)已提到高优先级车道", batch_name, batch_id)
+    else:
+        logger.warning("批次 %s(id=%s)插队没成功:这批会按常规优先级采,"
+                       "只是慢,不影响正确性", batch_name, batch_id)
+    return ok
+
+
 def record(batch_name: str, batch_id, n: int, status: str,
            note: str = "") -> None:
     """输入:批次名 + batch_id + ASIN 数 + 状态 → 输出:无(写 ops.scrape_batches)。"""

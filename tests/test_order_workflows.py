@@ -150,6 +150,28 @@ def test_returns_sync_end_to_end(monkeypatch):
     assert rows[0]["return_status"] == "INITIATED"
 
 
+def test_returns_sync_all_stores_dead_is_not_success(monkeypatch):
+    """⚠ 全部店凭证失效时**不许报成功**(2026-08-17 补,与 catalog_sync 同款闸)。
+
+    「凭证失效跳过」按设计不进 failed —— 一家店坏了不该拖垮整轮。但同日
+    `api/_client` 把换 token 阶段的 **400** 也归成 StoreDeadError(沃尔玛凭证
+    被拒回的是 400,不是 401),于是"请求形状被改坏"这类**全店**故障从
+    "整轮报错"变成了"整轮跳过"。没有这道闸,摘要只剩一句"0/N 店完成"而通知
+    照报 ✅。本链每小时跑,静默陈旧起来最难发现。
+    """
+    from workflows import returns_sync
+
+    def handler(request):
+        # 换 token 就回 400 —— 生产实见的凭证被拒形态
+        return httpx.Response(400, json={"error": "invalid_client"})
+    monkeypatch.setattr(_client, "_build_transport",
+                        lambda proxy: httpx.MockTransport(handler))
+    _fake_pg(monkeypatch, [])
+    _fake_stores(monkeypatch, returns_sync)
+    with pytest.raises(RuntimeError, match="零店完成"):
+        returns_sync.run({})
+
+
 # ── 绩效事件构建与账期挑选 ────────────────────────────────────────────────────
 
 def test_perf_rows_from_problems():

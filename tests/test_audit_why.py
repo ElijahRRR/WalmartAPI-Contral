@@ -181,8 +181,9 @@ def test_missing_meta_only_counts_runs_that_reached_the_gate(monkeypatch):
     monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({
         "GROUP BY 1 ORDER BY 2 DESC\n": [("L1", 7872), ("L0", 500),
                                           ("(过了闸)", 300), ("L2", 100)],
-        "LEFT JOIN audit.walmart_pt_meta": [("Christmas Ornaments", 47, 44),
-                                            ("coffee mugs", 84, 0)],
+        "LEFT JOIN audit.walmart_pt_meta": [
+            ("Christmas Ornaments", 47, 44, _OLD, ["l1_llm"]),
+            ("coffee mugs", 84, 0, _OLD, ["l1_llm"])],
         "= ANY(%s)": [("Coffee Mugs", "coffeemugs")],
     }))
     out = audit_why.run({"missing_meta": "1"})
@@ -192,6 +193,34 @@ def test_missing_meta_only_counts_runs_that_reached_the_gate(monkeypatch):
     assert "名字对不上" in out and "'coffee mugs'" in out and "'Coffee Mugs'" in out
     assert "表里真没有" in out and "Christmas Ornaments" in out
     assert "131 个的 PT 不在" in out          # 47+84,只数走到闸的
+
+
+_OLD = dt.datetime(2026, 5, 1)
+_NEW = dt.datetime(2026, 8, 16)
+
+
+def test_missing_meta_separates_migrated_history_from_a_live_hole(monkeypatch):
+    """⚠ 现在的引擎**产不出字典外 PT** —— 所以字典外 PT 只可能是搬进来的历史。
+
+    是不是,看 run 的年代,别猜:`resolve_pt` 末尾有一道 `pt not in ctx.pt_meta
+    → None` 的防御,L1 LLM 侧有 `_in_dictionary` 双闸(字典就是 pt_meta 本身)。
+    全是老 run = 历史包袱(要不要复核由人定);有新 run = 那两道闸真漏了,是 bug。
+    """
+    def _data(ts):
+        return {"GROUP BY 1 ORDER BY 2 DESC\n": [("(过了闸)", 300)],
+                "LEFT JOIN audit.walmart_pt_meta": [
+                    ("Wall Clocks", 155, 145, ts, ["l1_llm"])],
+                "= ANY(%s)": []}
+
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_data(_OLD)))
+    old = audit_why.run({"missing_meta": "1"})
+    assert "之前的 run" in old and "不是现在这套的洞" in old
+    assert "force_rerun" in old              # 要复核的话怎么做
+
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_data(_NEW)))
+    new = audit_why.run({"missing_meta": "1"})
+    assert "现在这套产出的" in new and "字典闸真有漏" in new
+    assert "_in_dictionary" in new           # 直接点名去查哪
 
 
 def test_missing_meta_all_clear(monkeypatch):

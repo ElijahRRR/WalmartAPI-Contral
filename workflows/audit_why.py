@@ -90,9 +90,22 @@ SELECT coalesce(stage_stopped_at, '(过了闸)') AS stage, count(*)
 FROM latest GROUP BY 1 ORDER BY 2 DESC
 """
 
-_SQL_MISSING_META = _LATEST_RUN_CTE + """
+_SQL_MISSING_META = """
+WITH latest AS (
+    SELECT DISTINCT ON (asin)
+           asin, walmart_product_type AS pt, stage_stopped_at, verdict,
+           pt_source, created_at
+    FROM audit.audit_runs
+    ORDER BY asin, created_at DESC
+)
 SELECT l.pt, count(*) AS n,
-       count(*) FILTER (WHERE l.verdict = 'pass') AS passed
+       count(*) FILTER (WHERE l.verdict = 'pass') AS passed,
+       -- ⚠ 年代与来源是判"这是现在的洞还是搬进来的历史"的唯一凭据:
+       -- 今天的引擎**产不出字典外 PT**(resolve_pt 末尾一道防御 + L1 LLM 的
+       -- _in_dictionary 双闸),所以字典外 PT 只可能来自旧系统迁进来的
+       -- 204 万行历史 run。是不是,看这两列,别猜
+       max(l.created_at) AS newest,
+       array_agg(DISTINCT coalesce(l.pt_source, '(空)')) AS sources
 FROM latest l
 LEFT JOIN audit.walmart_pt_meta m ON m.walmart_product_type = l.pt
 WHERE (l.stage_stopped_at IS NULL
@@ -102,6 +115,10 @@ WHERE (l.stage_stopped_at IS NULL
   AND m.walmart_product_type IS NULL
 GROUP BY 1 ORDER BY 2 DESC
 """
+
+# 本仓规则引擎上线日:之后跑的 run 才是"现在这套"判的。
+# 早于它的一律是旧系统迁进来的历史(批次 A 搬 audit_runs 全史,见迁移计划)
+_NEW_ENGINE_SINCE = "2026-08-13"
 
 # 「表里真没有」还是「名字对不上」——两者的修法完全不同(补数据 vs 对齐命名),
 # 而看 PT 名字本身分不出来。去标点去空白小写后再比一次
@@ -232,23 +249,38 @@ def _missing_meta(limit: int) -> str:
         out.append("走到 R1/R3 的产品,PT 全都在 audit.walmart_pt_meta 里 ✅")
         return "\n".join(out)
 
-    named = [(pt, n, p) for pt, n, p in rows if fuzzy.get(_norm(pt))]
-    absent = [(pt, n, p) for pt, n, p in rows if not fuzzy.get(_norm(pt))]
+    named = [r for r in rows if fuzzy.get(_norm(r[0]))]
+    absent = [r for r in rows if not fuzzy.get(_norm(r[0]))]
     total = sum(r[1] for r in rows)
+    fresh = [r for r in rows if str(r[3])[:10] >= _NEW_ENGINE_SINCE]
+
     out.append(f"⚠ 走到 R1/R3 的产品里,{total} 个的 PT 不在 walmart_pt_meta"
-               f"({len(rows)} 个 PT)—— 那两道闸对它们**静默放行**")
+               f"({len(rows)} 个 PT)")
+    # 先定性:是现在的洞,还是搬进来的历史?这决定了要不要动手
+    if not fresh:
+        out.append(f"  ✅ 但**全部是 {_NEW_ENGINE_SINCE} 之前的 run** —— "
+                   f"是旧系统迁进来的历史,不是现在这套的洞。")
+        out.append(f"     现在的引擎产不出字典外 PT(resolve_pt 末尾一道防御 + "
+                   f"L1 的 _in_dictionary 双闸,字典就是 pt_meta 本身)。")
+        out.append(f"     这些行的结论**没被现在这套复核过**;要复核就把它们的"
+                   f"上架表 E 列清空,或 `-p force_rerun=<新版本号>` 整批重审。")
+    else:
+        out.append(f"  ⚠ 其中 {sum(r[1] for r in fresh)} 个是 "
+                   f"{_NEW_ENGINE_SINCE} 之后跑的(**现在这套产出的**)——"
+                   f"那说明字典闸真有漏,要查 resolve_pt / _in_dictionary")
     if named:
         out.append(f"  ① 名字对不上({len(named)} 个 PT,"
                    f"{sum(r[1] for r in named)} 个产品):表里有等价的一行,"
                    f"只是大小写/标点/空白不同 —— 修的是**命名对齐**,不是补数据")
         out += [f"      {n:>6}(过 {p:>5})  {pt!r}\n"
                 f"              表里是 {fuzzy[_norm(pt)]!r}"
-                for pt, n, p in named[:limit]]
+                for pt, n, p, _ts, _src in named[:limit]]
     if absent:
         out.append(f"  ② 表里真没有({len(absent)} 个 PT,"
-                   f"{sum(r[1] for r in absent)} 个产品):去飞书类目表确认"
-                   f"这些 PT 是不是漏了,漏了补上再跑 risk_sync 家族同步")
-        out += [f"      {n:>6}(过 {p:>5})  {pt}" for pt, n, p in absent[:limit]]
+                   f"{sum(r[1] for r in absent)} 个产品):")
+        out += [f"      {n:>6}(过 {p:>5})  {pt:<42} 最近 {str(ts)[:10]} "
+                f"来源 {','.join(src)}"
+                for pt, n, p, ts, src in absent[:limit]]
     if len(rows) > limit:
         out.append(f"  (每类只列前 {limit} 个,-p limit=N 看更多)")
     return "\n".join(out)

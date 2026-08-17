@@ -39,10 +39,15 @@ def wired(monkeypatch):
         # 行 2 起的列 A:表里已有 len(cells) 行旧数据
         cells = sheet_cells[which(sheet)]
         start = int(rng[1:rng.index(":")])
+        if start == 1:
+            return []          # 表头行回读为空 → 回落 registry 登记列名
         return [[c] for c in cells[start - 2:]]
     monkeypatch.setattr(wf.feishu, "sheet_values", values)
     monkeypatch.setattr(wf.feishu, "sheet_write_ranges",
                         lambda s, ups: calls["writes"].append((which(s), ups)) or 1)
+    calls["overwritten"] = {}
+    monkeypatch.setattr(wf.feishu, "sheet_overwrite",
+                        lambda s, body: calls["overwritten"].__setitem__(which(s), body) or len(body))
 
     class _Cur:
         def __enter__(self): return self
@@ -73,69 +78,69 @@ def wired(monkeypatch):
     return calls, sheet_cells
 
 
-def test_push_appends_after_existing_rows(wired):
-    """追加起点 = 列 A 首个空行——表里已有 3 行旧数据就从第 5 行写起
-    (1 表头 + 3 数据),绝不覆盖。"""
+def test_push_rewrites_whole_sheet_from_db(wired):
+    """整表重写:不管飞书里原来是什么,按库里全量覆盖(所有者定稿 2026-08-17)。
+
+    换掉的是"按 pushed_at 水位只追加"那套 —— 增量要先线性扫列 A 找空行
+    (5.7 万行的表每轮 285 个 GET,比写还贵),表被手工删过几行水位就永久
+    对不上,崩在半路还留重复行。整表重写没有水位,天然幂等。
+    """
     calls, cells = wired
-    cells["asin"] = ["B0OLD1", "B0OLD2", "B0OLD3"]
-    calls["asin_pending"] = [("B0NEW", "沃尔玛-禁售", "2026-08-11")]
-    out = wf.run({})
-    assert "ASIN 表 +1 行" in out
-    which, ups = calls["writes"][0]
-    assert which == "asin" and ups[0][0] == "A5:C5"
-    assert ups[0][1] == [["B0NEW", "沃尔玛-禁售", "2026-08-11"]]
-
-
-def test_push_marks_watermark_per_block(wired, monkeypatch):
-    """每块写成功当场打 pushed_at——8500 行 3 块就打 3 次,攒最后一起提交
-    的话中途崩 = 全部重推。"""
-    calls, _ = wired
-    monkeypatch.setattr(wf.time, "sleep", lambda s: None)
-    calls["asin_pending"] = [(f"B{i:04d}", "沃尔玛-禁售", "2026-08-11")
-                             for i in range(8500)]
-    out = wf.run({})
-    assert "ASIN 表 +8500 行(3 块)" in out
-    asin_marks = [k for w, k in calls["marked"] if w == "asin"]
-    assert [len(k) for k in asin_marks] == [4000, 4000, 500]
-    assert asin_marks[0][0] == "B0000"
+    cells["asin"] = ["B0OLD1", "B0OLD2", "B0OLD3"]        # 表里原有的,全不管
+    calls["asin_all"] = [("B0NEW", "沃尔玛-禁售", "2026-08-11")]
+    calls["channel_rows"] = [("Nike", "沃尔玛-品牌", "2026-08-11", "B0A")]
+    out = wf.run({"allow_shrink": "1"})       # 3 行 → 1 行,本用例不测护栏
+    assert "整表重写 1 行" in out
+    body = [r for r in calls["overwritten"]["asin"]]
+    assert body[0][0] == "asin"               # 表头行保留(回读不到用登记列名)
+    assert body[1] == ["B0NEW", "沃尔玛-禁售", "2026-08-11"]
+    assert len(body) == 2                     # 表头 + 1 行,旧的三行没了
+    # 水位改成整表打:不再按块传 key
+    assert ("asin", "ALL") in calls["marked"]
 
 
 def test_push_brand_rows_carry_sku_provenance(wired):
     """品牌表四列:品牌/来源/入库日期/SKU(溯源)。空溯源写空串不写 None。"""
     calls, _ = wired
-    calls["brand_pending"] = [("nike", "Nike", "沃尔玛-品牌", "2026-08-11", "B0A")]
-    wf.run({})
-    which, ups = calls["writes"][0]
-    assert which == "brand"
-    assert ups[0][1] == [["Nike", "沃尔玛-品牌", "2026-08-11", "B0A"]]
-    marks = [k for w, k in calls["marked"] if w == "brand"]
-    assert marks == [["nike"]]          # 水位按 brand_key 打
+    calls["channel_rows"] = [("Nike", "沃尔玛-品牌", "2026-08-11", None)]
+    wf.run({"allow_shrink": "1"})
+    body = calls["overwritten"]["brand"]
+    assert body[1] == ["Nike", "沃尔玛-品牌", "2026-08-11", ""]
 
 
-def test_push_nothing_pending(wired):
-    calls, _ = wired
-    assert wf.run({}) == "黑名单投影:无待推行"
-    assert calls["writes"] == [] and calls["marked"] == []
+def test_push_stops_dead_when_db_returns_far_fewer_rows(wired):
+    """骤缩护栏:库里只查出一小半就停手,一格不写。
+
+    catmap_export 2026-08-17 的生产事故:整表重写把飞书 17592 行写成 15770 行,
+    净丢 1847 行,当时没有任何东西拦住。PG 是权威没错,但"库这次只查出
+    一小半"(查询写错/连接中断拿到半截)和"本来就该少"长得一模一样。
+    """
+    calls, cells = wired
+    cells["asin"] = [f"B{i:04d}" for i in range(1000)]
+    calls["asin_all"] = [("B0001", "沃尔玛-禁售", "d")]      # 1000 → 1
+    calls["channel_rows"] = []
+    out = wf.run({})
+    assert "已停手,一格未写" in out and "allow_shrink" in out
+    assert "asin" not in calls["overwritten"], "护栏没拦住,表被覆盖了"
+    # 一张表停手不该拖垮另一张
+    assert "brand" in calls["overwritten"]
 
 
-def test_push_warns_at_limit(wired):
-    calls, _ = wired
-    calls["asin_pending"] = [(f"B{i}", "沃尔玛-禁售", "d") for i in range(5)]
-    out = wf.run({"limit": "5"})
-    assert "达单轮上限 5" in out
+def test_shrink_guard_can_be_overridden(wired):
+    calls, cells = wired
+    cells["asin"] = [f"B{i:04d}" for i in range(1000)]
+    calls["asin_all"] = [("B0001", "沃尔玛-禁售", "d")]
+    wf.run({"allow_shrink": "1"})
+    assert "asin" in calls["overwritten"]
 
 
 def test_brand_projection_reads_channel_table_only():
     """beyKyi 的数据源是渠道表 brand_err_hits,**绝不**碰总清单镜像表
     brand_blacklist(历史上两次走错:只推镜像表自产行→总表已有的品牌
-    永远进不了渠道;整表全推→总清单被复制进渠道表)。SQL 文本钉死,
-    探针对账口径与推送范围同表。"""
-    for sql in (wf._BRAND_PENDING, wf._BRAND_STATS, wf._BRAND_MARK,
-                wf._CHANNEL_ALL, wf._CHANNEL_MARK_ALL):
+    永远进不了渠道;整表全推→总清单被复制进渠道表)。"""
+    for sql in (wf._BRAND_STATS, wf._CHANNEL_ALL, wf._CHANNEL_MARK_ALL):
         assert "brand_err_hits" in sql
         assert "brand_blacklist" not in sql
-    assert "pushed_at IS NULL" in wf._BRAND_PENDING
-    assert "pushed_at IS NULL" in wf._ASIN_PENDING
 
 
 # ── 历史回填 ──────────────────────────────────────────────────────────────────
@@ -293,13 +298,16 @@ def test_probe_warns_on_watermark_mismatch(wired):
     assert "表行数≠已推水位" in out
 
 
-def test_block_size_stays_within_feishu_limit():
-    """块大小与 api 层同源:sheet_write_ranges 内部按 4000 行自动切
-    (_SHEET_WRITE_BLOCK_ROWS,在线产品总表 13 万行实证;真硬限是单请求
-    载荷 ~4MB,20 列×5000 行撞 90227)。_BLOCK 超过 4000 只是白切——
-    水位块会被 api 层拆成多个请求,"每块成功即打水位"的粒度就虚了。"""
+def test_chunking_is_delegated_to_the_api_layer():
+    """整表重写之后,切块完全归 api 层(sheet_overwrite),本工作流不再自带块大小。
+
+    ⚠ 4000 是实测天花板不是随手定的:真硬限是单请求载荷约 4MB,
+    20 列×5000 行撞 90227(api/feishu.py 头注)。谁想调大先读那条。
+    """
     from api.feishu import _SHEET_WRITE_BLOCK_ROWS
-    assert wf._BLOCK <= _SHEET_WRITE_BLOCK_ROWS == 4000
+    assert _SHEET_WRITE_BLOCK_ROWS == 4000
+    assert not hasattr(wf, "_BLOCK"), "又自带了一份块大小,两处必漂"
+    assert not hasattr(wf, "_append"), "增量追加应随水位一起退役"
 
 
 def test_next_empty_scans_in_big_blocks(wired, monkeypatch):
@@ -326,3 +334,28 @@ def test_next_empty_scans_in_big_blocks(wired, monkeypatch):
     # 200 行一段要 60 个请求;5000 一段只要 3 个
     assert len(ranges) <= 4, f"扫了 {len(ranges)} 个请求,块太小:{ranges[:3]}"
     assert wf._SCAN_BLOCK >= 5000
+
+
+def test_shrink_guard_measures_filled_rows_not_grid_size(wired):
+    """护栏比的是**已填行数**,不是网格大小 —— 否则每轮都会误停手。
+
+    飞书网格被 ensure_rows 撑大后只增不减:6.7 万行的表若网格 7 万,
+    拿 `sheet_row_count` 当"现有行数"会算成"缩了 2365 行"从而每轮停手,
+    护栏反倒成了故障源。
+    """
+    import inspect
+    src = inspect.getsource(wf._rewrite_sheet)
+    guard = src[src.index("if not allow_shrink"):]
+    # ⚠ 必须**剥掉注释**再比:这一段的注释里正好写着 sheet_row_count(解释为什么
+    # 不用它),连注释一起 grep 会被自己的说明绊倒(CLAUDE.md 记的那种假阳性)
+    code = "\n".join(ln.split("#")[0] for ln in guard.splitlines())
+    assert "_next_empty" in code
+    assert "sheet_row_count" not in code, "又拿网格大小当现有行数了"
+
+    # 行为验证:网格 2000 而只填了 1000 行,库里给 995 行(缩 0.5%)应放行
+    calls, cells = wired
+    cells["asin"] = [f"B{i:04d}" for i in range(1000)]
+    calls["asin_all"] = [(f"B{i:04d}", "沃尔玛-禁售", "d") for i in range(995)]
+    calls["channel_rows"] = []
+    out = wf.run({})
+    assert "asin" in calls["overwritten"], f"网格 2000 把它误判成骤缩了:{out}"

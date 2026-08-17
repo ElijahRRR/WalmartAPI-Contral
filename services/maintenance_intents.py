@@ -690,6 +690,16 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
 _DETAIL_KEYS = ("old", "new", "label", "product_type", "product_id",
                 "batches", "first_seen", "last_seen", "obs")
 
+#: kind → 「建议」列的中文标签。**全项目唯一出处。**
+#: 2026-08-17 起它不再只是显示文案,而是 maintenance_scan 与 maintenance 之间
+#: 的**连接键**:扫描件按 (店铺, SKU, 建议) append 半行,执行件按同一个键找回
+#: 那一行就地补齐动作/旧值/新值/feedid。两个 workflow 各存一份副本的话,改一处
+#: 忘一处的表现是**执行件找不到扫描件写的行,于是每条都另起一行**——表里一条
+#: 建议对两行、飞书行数翻倍,而两边都不报错。
+#: 铁律 1 禁止 workflow 互相 import,所以这份唯一副本住在 services。
+KIND_LABEL = {"delete": "删除", "title": "标题",
+              "price": "价格", "inventory": "库存"}
+
 
 def to_disposition(it: dict) -> dict:
     """输入:维护意图 → 输出:ops.dispositions 建议行(services.dispositions 收)。"""

@@ -29,16 +29,17 @@ maintenance 也应该像 problem_scan 和 problem_product_cleanup 一样分开,
 """
 
 import logging
+from datetime import datetime
 
 from registry import db
-from services import dispositions, maintenance_intents as mi, store_limits
+from services import dispositions, kpi, maint_sheet, \
+    maintenance_intents as mi, store_limits
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
 
 logger = logging.getLogger("workflows.maintenance_scan")
 
-_KIND_LABEL = {"delete": "删除", "title": "标题",
-               "price": "价格", "inventory": "库存"}
+_KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与执行件的连接键)
 _KIND_ORDER = ("delete", "title", "price", "inventory")
 
 
@@ -144,5 +145,36 @@ def run(params: dict) -> str:
            f"已有 executing 行(上一轮提交了还没等到 catalog_sync 复核),"
            f"按部分唯一索引写不进去 —— 这是防重不是丢单"
            if n_sug < len(intents) else ""))
+    _write_sheet(intents, lines)
     lines.append("执行走 `python cli.py maintenance`(本工作流不发任何 feed)")
     return "\n".join(lines)
+
+
+def _write_sheet(intents: list[dict], lines: list[str]) -> None:
+    """建议投影到飞书「维护记录」的前五列(店铺/SKU/建议/原因/日期)。
+
+    所有者定稿 2026-08-17:「我执行 maintenance_scan 是为了预览实际的逻辑有无
+    问题,不展现出来我就只能看到总览,无法判断提交前的真实情况」。总览只能说
+    「删除 2194 行」,判断不了「该不该删**这一行**」—— 而删除不可逆。
+
+    列的分工:本工作流写前五列,`maintenance` 就地补齐动作/旧值/新值/feedid,
+    `feed_poll` 反哺器落结果/报错。
+
+    ⚠ **写表失败不能把"建议行已落库"埋进异常里**:库里那份才是执行件的输入,
+    表只是给人看的面板(与 maintenance._write_sheet 同一口径)。
+    """
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    rows = [(it["store"], it["sku"], _KIND_LABEL.get(it["kind"], it["kind"]),
+             it.get("reason") or "", today) for it in intents]
+    try:
+        written, skipped = maint_sheet.append_suggestions(rows)
+        lines.append(
+            f"飞书「维护记录」写入建议 {written} 行"
+            + (f"(另有 {skipped} 行本就在表里未执行,不重复写)" if skipped else "")
+            + ";动作/旧值/新值/feedid 由 maintenance 补齐,结果由 feed_poll 落")
+    except LookupError as e:
+        lines.append(f"飞书「维护记录」未登记,建议未投影({e})")
+    except Exception as e:                                  # noqa: BLE001
+        logger.exception("建议投影飞书失败(建议行已落库,不影响执行): %s", e)
+        lines.append(f"⚠ 飞书「维护记录」写入失败:{e}(建议行已落库,"
+                     f"maintenance 照常可执行)")

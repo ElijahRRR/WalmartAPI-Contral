@@ -77,8 +77,7 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.maintenance")
 
-_KIND_LABEL = {"delete": "删除", "title": "标题",
-               "price": "价格", "inventory": "库存"}
+_KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与扫描件的连接键)
 # 单店内串行顺序(旧系统纪律);**删除排最前**:同一 SKU 既要删又要改价时,
 # 先删掉就不必再为它烧改价/改库存的 feed 配额(maintenance_scan 的
 # collect_all 已把删除名单从其余三类里剔掉,这里的顺序是双保险)
@@ -248,8 +247,14 @@ def _settle(lines: list[str]) -> None:
 def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
     """维护记录写表 + 裁剪。**写表失败绝不能把"feed 已提交"埋进异常里**。"""
     try:
-        written = maint_sheet.append_records(all_records)
-        lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
+        # 找到扫描件写的那半行就地补齐(动作/旧值/新值/feedid);找不到才追加
+        filled, added = maint_sheet.fill_submitted(all_records)
+        lines.append(
+            f"维护记录补齐 {filled} 行" + (f",新增 {added} 行" if added else "")
+            + ";feed 结果轮询走 feed_poll"
+            + (f"。⚠ 有 {added} 行没找到对应的建议行 —— 扫描件没跑过,"
+               f"或那行已被裁掉(只留 {maint_sheet.RETAIN_DAYS} 天)"
+               if added else ""))
         # 一天几千行,不裁飞书很快装不下(所有者定稿 2026-08-09:只留 7 天)。
         # 裁的只是展示面板,流水永久在 ops.feed_items
         try:

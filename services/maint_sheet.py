@@ -1,18 +1,34 @@
 """维护记录工作表(registry.MAINT_SHEET)读写积木(maintenance 与 feed_poll 共用)。
 
-列契约(A~I,列序即契约,所有者建表 2026-08-07):
-  A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
+列契约(A~K 共 11 列,**列序即契约,唯一权威是 registry.MAINT_SHEET.columns**;
+所有者建表 2026-08-07,2026-08-16 加「建议」「原因」两列):
+  A=店铺 B=SKU C=建议 D=原因 E=动作 F=旧值 G=新值 H=feedid I=日期 J=结果 K=报错
+⚠ 代码里一律 `_col(名)` / `_idx(名)` 取位置,**任何地方都不许写死字母或下标** ——
+  加那两列时漏改一处的表现是整表错位且不报错(prune 就漏了,读「新值」当日期)。
 
-流水账语义(区别于 clear_sheet 的运营驱动表):只追加不改行,程序是唯一写入方。
-  提交时 append:feed 路径 F=真 feedid、H=处理中;PUT 同步路径 F="sync"、
-  H=成功/失败 当场落定。
-  C 列取值:标题/价格/库存/删除(variant_offset)——四类都由 maintenance 写,
-  走同一个反哺器,不另建表(所有者问 2026-08-09「删除以后跑 feed 会填写到
-  维护记录里吗」)。
-  feed 路径结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 H/I。
+三段式写入(所有者定稿 2026-08-17:「执行 maintenance_scan 是为了预览实际的
+逻辑有无问题,不展现出来我就只能看到总览,无法判断提交前的真实情况」):
+
+  maintenance_scan  A~D + I   append 半行  (店铺/SKU/建议/原因/日期)
+  maintenance       E~H       就地补齐     (动作/旧值/新值/feedid)
+  feed_poll         J~K       反哺         (结果/报错)
+
+  所以本表**不再是纯追加的流水账**:扫描件先把「该拿这个商品怎么办」摆到人眼
+  前,执行件回来补齐它真做了什么。「建议」与「动作」分歧才是这两列的价值 ——
+  建议删除而动作为空 = 领到了没执行(撞上单店上限/配额切片外),结果列说明白。
+  连接键是 (店铺, SKU, 建议),与 ops.dispositions 的部分唯一索引同一口径;
+  「建议」的中文标签唯一出处在 `services.maintenance_intents.KIND_LABEL`。
+  PUT 同步路径(F="sync")当场就知道结果,J/K 由执行件一并落 —— 它不进 feed
+  台账,反哺器永远不会来管它。
+  四类动作(标题/价格/库存/删除)共用本表,不另建表(所有者问 2026-08-09
+  「删除以后跑 feed 会填写到维护记录里吗」)。
 
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":
 最早未落定行}。反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
+⚠ 反哺器会**跨过没有 feedid 的行**(它认为那些没有待办)——而扫描件写的半行
+正是这种。所以 `fill_submitted` 补完 feedid 必须把 `unresolved_from` 拉回到本次
+补过的最小行号,否则反哺器再也不回头看,结果/报错永远空着且不报错。
+查重与定位(`_open_index`)因此走**整表读**而非水位窗口:窗口早已跨过那些半行。
 
 保留期(所有者定稿 2026-08-09:「一天几千条,要不了多久飞书就很难存了」——
 旧系统靠"一天一个表格"绕开):**飞书只留近 RETAIN_DAYS 天**,每轮维护提交后
@@ -140,6 +156,131 @@ def append_records(rows: list[tuple]) -> int:
     with db.pg_conn() as conn:
         _save_cursor(conn, cur_state)
     return written
+
+
+def _all_rows() -> list[list[str]]:
+    """输入:无 → 输出:表内**全部数据行**(每行补齐到 ncol),行号从 2 起。
+
+    为什么读整表而不是水位窗口:水位 `unresolved_from` 会跨过"没有 feedid"
+    的行(反哺器认为它们没有待办)——而扫描件写的半行正是没有 feedid 的。
+    拿窗口去查重就会看不见它们,于是每扫一次追加一遍,飞书行数按扫描次数翻。
+    prune / resync_from_ledger 一直是这么读整表的,不是新增的开销量级。
+    """
+    with db.pg_conn() as conn:
+        hi = int(_load_cursor(conn).get("next_row", 2))
+    if hi <= 2:
+        return []
+    ncol = len(resources.MAINT_SHEET.columns)
+    out = []
+    for raw in feishu.sheet_values(resources.MAINT_SHEET,
+                                   f"A2:{_span()[1]}{hi - 1}"):
+        out.append([(str(c).strip() if c is not None else "") for c in raw]
+                   + [""] * ncol)
+    return out
+
+
+def _open_index() -> dict:
+    """输入:无 → 输出:{(店铺, SKU, 建议): 行号} —— 只含**动作列still空**的行。
+
+    「动作为空」= 扫描件建议了、执行件还没碰过它。只认这种行有两个理由:
+      · 执行件补齐时不该改到一条已经提交过的旧流水;
+      · 同一 (店铺,SKU,建议) 明天再次被建议时,应当另起一行,而不是把
+        昨天那条已执行的记录覆盖掉。
+    同键有多行未填时取**行号最小**的那条(先建议的先补)。
+    """
+    idx: dict = {}
+    for i, cells in enumerate(_all_rows()):
+        if cells[_idx("action")]:
+            continue
+        key = (cells[_idx("store")], cells[_idx("sku")],
+               cells[_idx("suggestion")])
+        idx.setdefault(key, 2 + i)
+    return idx
+
+
+def append_suggestions(rows: list[tuple]) -> tuple[int, int]:
+    """输入:[(店铺, SKU, 建议, 原因, 日期)] → 输出:(写入行数, 查重跳过行数)。
+
+    扫描件(maintenance_scan)用:先把「该拿这个商品怎么办」摆到人眼前,
+    执行件再回来补齐动作/旧值/新值/feedid。**这五列里「日期」是承重的** ——
+    prune 靠它把行老化掉;不写日期的话,那些建议了却一直没被执行的行
+    (撞上单店删除上限、或配额切片外的)永远裁不掉,表只涨不减。
+
+    可重复跑:同 (店铺, SKU, 建议) 已有未填行就跳过,不重复追加。
+    """
+    if not rows:
+        return 0, 0
+    resources.MAINT_SHEET.require()
+    have = set(_open_index())
+    fresh, skipped = [], 0
+    for store, sku, suggestion, reason, op_date in rows:
+        if (str(store), str(sku), str(suggestion)) in have:
+            skipped += 1
+            continue
+        have.add((str(store), str(sku), str(suggestion)))
+        vals = {"store": store, "sku": sku, "suggestion": suggestion,
+                "reason": reason, "op_date": op_date, "action": "",
+                "old_value": "", "new_value": "", "feed_id": "",
+                "result": "", "error": ""}
+        fresh.append(tuple(vals[c] for c in resources.MAINT_SHEET.columns))
+    return append_records(fresh), skipped
+
+
+# 执行件回填的列。⚠ **两段,不是一段**:「日期」(op_date,扫描件写的)正夹在
+# feedid 与 结果 之间。当成一段连续区间写下去,6 个值会摊进 7 个格子 ——
+# 整体错位,而且把扫描件写的日期覆盖成「结果」。日期一没,prune 就再也裁不掉
+# 这一行(它按日期判年龄),两边都不报错。
+_FILL_MAIN = ("action", "old_value", "new_value", "feed_id")   # E:H
+_FILL_DONE = ("result", "error")                               # J:K,仅 PUT 同步路径
+
+
+def fill_submitted(rows: list[tuple]) -> tuple[int, int]:
+    """输入:执行件造的整行(11 列)→ 输出:(就地补齐行数, 找不到而追加的行数)。
+
+    按 (店铺, SKU, 建议) 找到扫描件写的那一行,只写 `_FILL_COLS` 这几列;
+    找不到就整行追加(扫描件没跑过、或那行已被 prune 裁掉——流水不能丢)。
+
+    ⚠ **补完要把水位拉回去**:`sync_from_ledger` 会跨过没有 feedid 的行
+    (扫描件写的半行正是这种),等执行件把 feedid 填进去时,`unresolved_from`
+    早已越过它 —— 反哺器再也不回头看,结果/报错两列就永远空着,而且不报错。
+    所以这里把水位拉到本次补过的最小行号。
+    """
+    if not rows:
+        return 0, 0
+    resources.MAINT_SHEET.require()
+    idx = _open_index()
+    ranges, appended, touched = [], [], []
+    for row in rows:
+        cells = dict(zip(resources.MAINT_SHEET.columns, row))
+        key = (str(cells["store"]), str(cells["sku"]),
+               str(cells["suggestion"]))
+        rownum = idx.pop(key, None)
+        if rownum is None:
+            appended.append(row)
+            continue
+        touched.append(rownum)
+
+        def _seg(cols):
+            return [[str(cells[c]) if cells[c] is not None else "" for c in cols]]
+
+        ranges.append((f"{_col(_FILL_MAIN[0])}{rownum}:"
+                       f"{_col(_FILL_MAIN[-1])}{rownum}", _seg(_FILL_MAIN)))
+        # 结果/报错归反哺器;只有 PUT 同步路径当场就知道结果(feedid="sync",
+        # 不进 feed 台账,反哺器永远不会来管它),那一档在这里落定
+        if str(cells.get("result") or ""):
+            ranges.append((f"{_col(_FILL_DONE[0])}{rownum}:"
+                           f"{_col(_FILL_DONE[-1])}{rownum}", _seg(_FILL_DONE)))
+    for i in range(0, len(ranges), _APPEND_BLOCK):
+        feishu.sheet_write_ranges(resources.MAINT_SHEET, ranges[i:i + _APPEND_BLOCK])
+    if touched:
+        with db.pg_conn() as conn:
+            st = _load_cursor(conn)
+            lo = min(touched)
+            if lo < int(st.get("unresolved_from", 2)):
+                st["unresolved_from"] = lo
+                _save_cursor(conn, st)
+    n_app = append_records(appended) if appended else 0
+    return len(touched), n_app
 
 
 _LABEL_BY_FEED = {"MP_MAINTENANCE": "标题", "price": "价格",

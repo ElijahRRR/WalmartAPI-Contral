@@ -137,3 +137,74 @@ def test_multi_step_prompt_states_the_order_is_binding():
     single = next(j for j in gpt_skill.jobs() if len(j["workflows"]) == 1)
     assert "顺序是硬约束" in gpt_skill.task_prompt(multi)
     assert "顺序是硬约束" not in gpt_skill.task_prompt(single)
+
+
+def test_utc_cron_is_precomputed_including_the_day_rollover():
+    """⚠ 时区弄反是唯一"每天准时在错的时间跑"且不报错的故障。
+
+    所以两个 cron 都印、**不让人自己减 8 小时**:台北 02:00 / 06:40 / 07:30
+    对应 UTC **前一天**,带星期的还得把星期一起往前挪 —— 让人手算,跨日那三条
+    几乎注定有一条减错。
+    """
+    got = {j["label"]: gpt_skill.cron_utc(j) for j in gpt_skill.jobs()}
+    assert got["backup"] == "0 18 * * *"          # 台北 02:00 → UTC 前一天 18:00
+    assert got["daily_report"] == "40 22 * * *"   # 06:40 → 前一天 22:40
+    assert got["product_chain"] == "0 5 * * *"    # 13:00 → 同日 05:00
+    assert got["audit_sheet"] == "10 10 * * *"
+    assert got["list_new"] == "0 12 * * *"
+    # 周三 08:00 台北 = 周三 00:00 UTC —— 刚好不跨日,星期不动
+    assert got["settlement"] == "0 0 * * 3"
+    # 表里两列都在
+    md = gpt_skill.skill_md()
+    assert "cron(台北)" in md and "cron(UTC)" in md
+    assert "别自己减" in md
+
+
+def test_utc_cron_moves_the_weekday_back_when_it_crosses_midnight():
+    """周一 02:00 台北 = **周日** 18:00 UTC —— 星期不跟着挪就是整整差一天。"""
+    job = schedule.job("x", ["backup"], batch=1, hour=2, minute=0,
+                       weekday=1, runner="gpt")
+    assert gpt_skill.cron_utc(job) == "0 18 * * 0"
+    job0 = schedule.job("y", ["backup"], batch=1, hour=2, minute=0,
+                        weekday=0, runner="gpt")
+    assert gpt_skill.cron_utc(job0) == "0 18 * * 6"     # 周日 → 周六
+
+
+# ── 交办单 REGISTER.md ──────────────────────────────────────────────────────
+#
+# 它也是生成的(受 test_repo_copy_matches_the_schedule_table 管),这里钉的是
+# 它必须**自带校验**:注册定时任务这件事没有退出码,注册漏一条的表现是
+# 那条链从此每天不跑而没有任何东西会说一声。
+
+def test_register_lists_every_gpt_job_with_both_crons_and_its_prompt_file():
+    md = gpt_skill.register_md()
+    for j in gpt_skill.jobs():
+        assert f"`{j['label']}`" in md
+        assert f"`{gpt_skill.cron(j)}`" in md
+        assert f"`{gpt_skill.cron_utc(j)}`" in md
+        # 提示词正文不复制进交办单,只给路径 —— 复制一份必然与 tasks/ 漂
+        assert f"{gpt_skill.SKILL_DIR}/tasks/{j['label']}.md" in md
+        assert gpt_skill.task_prompt(j) not in md
+
+
+def test_register_names_the_launchd_jobs_as_off_limits():
+    """两边都挂 = 撞锁,而撞锁的那次退 3 空跑一轮,外表一切正常。"""
+    md = gpt_skill.register_md()
+    for j in schedule.jobs_for("launchd"):
+        assert f"`{j['label']}`" in md
+    assert "不要注册" in md
+
+
+def test_register_states_the_exact_count_so_a_missing_one_is_catchable():
+    """⚠ 条数是唯一能一眼看出"漏注册了一条"的东西 —— 少一条不会有人报错。"""
+    md = gpt_skill.register_md()
+    n = len(gpt_skill.jobs())
+    assert f"注册这 {n} 条" in md
+    assert f"正好 {n} 条" in md
+    assert "回读" in md            # 注册完必须把结果读回来对表
+
+
+def test_register_forbids_touching_the_old_erpapi_schedules():
+    """旧调度的停用有顺序(先停旧 → 搬状态 → 起新),别人替他删会错位。"""
+    md = gpt_skill.register_md()
+    assert "不要删" in md and "erpAPI" in md

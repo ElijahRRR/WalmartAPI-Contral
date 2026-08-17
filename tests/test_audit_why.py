@@ -171,18 +171,30 @@ def test_meta_gap_warning_says_it_is_not_this_rejects_cause(monkeypatch):
     assert "missing_meta=1" in out          # 给出量化那条命令
 
 
-def test_missing_meta_quantifies_the_silent_gate_failure(monkeypatch):
-    """两道硬闸对某些类目静默失效 —— 静默的东西必须能一条命令数出来。"""
+def test_missing_meta_only_counts_runs_that_reached_the_gate(monkeypatch):
+    """⚠ 前面被拦下的**没走到** R1/R3,不能算进"闸失效"。
+
+    所有者 2026-08-17 当场指出首版输出误导:8394 个里 7872 个 PT='unknown'
+    —— 那是类目没解出来、停在 L1 判 pending,与那两道闸毫无关系。
+    分层停在哪的分布必须一起打出来,分母说不清的比例没有意义。
+    """
     monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({
-        "FROM catalog.products p": [("Hammers", 120, 30),
-                                    ("Bakeware Sets", 45, 5)]}))
+        "GROUP BY 1 ORDER BY 2 DESC\n": [("L1", 7872), ("L0", 500),
+                                          ("(过了闸)", 300), ("L2", 100)],
+        "LEFT JOIN audit.walmart_pt_meta": [("Christmas Ornaments", 47, 44),
+                                            ("coffee mugs", 84, 0)],
+        "= ANY(%s)": [("Coffee Mugs", "coffeemugs")],
+    }))
     out = audit_why.run({"missing_meta": "1"})
-    assert "2 个在用 PT" in out and "165 个产品" in out
-    assert "已判过审 35" in out              # 这批是"闸没生效就过了"的
-    assert "静默放行" in out
-    assert "Hammers" in out
+    # 分层分布:让人自己看见 7872 个根本没走到闸
+    assert "7872" in out and "没走到 R1/R3" in out
+    # 两类分开:名字对不上(补命名) vs 表里真没有(补数据)—— 修法完全不同
+    assert "名字对不上" in out and "'coffee mugs'" in out and "'Coffee Mugs'" in out
+    assert "表里真没有" in out and "Christmas Ornaments" in out
+    assert "131 个的 PT 不在" in out          # 47+84,只数走到闸的
 
 
 def test_missing_meta_all_clear(monkeypatch):
     monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({}))
-    assert "R1/R3 全覆盖" in audit_why.run({"missing_meta": "1"})
+    assert "PT 全都在 audit.walmart_pt_meta 里" in audit_why.run(
+        {"missing_meta": "1"})

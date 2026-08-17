@@ -64,18 +64,53 @@ FROM audit.walmart_pt_spec
 WHERE walmart_product_type = ANY(%s)
 """
 
-# 有产品在用、但 walmart_pt_meta 里没有的 PT。这些 PT 的 R1(准入)与
-# R3(认证)两道闸**静默放行** —— 静默的东西必须能一条命令数出来
-_SQL_MISSING_META = """
-SELECT p.walmart_pt, count(*) AS n,
-       count(*) FILTER (WHERE p.audit_status = 'approved') AS approved
-FROM catalog.products p
-LEFT JOIN audit.walmart_pt_meta m
-       ON m.walmart_product_type = p.walmart_pt
-WHERE p.marketplace = 'US' AND p.walmart_pt IS NOT NULL AND p.walmart_pt <> ''
-  AND p.walmart_pt NOT LIKE '(%%'
+# R1(准入)与 R3(认证)两道闸只查 walmart_pt_meta,查不到就静默放行。
+#
+# ⚠ 口径必须是「**真的走到了那两道闸**、而 meta 表没有这个 PT」。
+# 首版拿 `catalog.products.walmart_pt` 直接 LEFT JOIN,数出来 8394 个产品,
+# 其中 7872 个 PT='unknown' —— 那是"类目没解出来"(审核停在 L1 判 pending),
+# 压根没走到 R1/R3,算进"闸失效"是**冤枉的**(所有者 2026-08-17 当场指出:
+# 「如果在前面任何步骤被拦截,就不会进入下一步,所以可能是输出的结果有误导性」)。
+#
+# 判据是 `audit_runs.stage_stopped_at`:
+#   'L0' Phase0 拦下   → 没走到,不算
+#   'L1' 类目解不出    → 没走到,不算
+#   NULL / 'L2'/'L3'/'L4' → **走到了**,这才是闸该生效的那批
+_LATEST_RUN_CTE = """
+WITH latest AS (
+    SELECT DISTINCT ON (asin)
+           asin, walmart_product_type AS pt, stage_stopped_at, verdict
+    FROM audit.audit_runs
+    ORDER BY asin, created_at DESC
+)
+"""
+
+_SQL_STAGE_MIX = _LATEST_RUN_CTE + """
+SELECT coalesce(stage_stopped_at, '(过了闸)') AS stage, count(*)
+FROM latest GROUP BY 1 ORDER BY 2 DESC
+"""
+
+_SQL_MISSING_META = _LATEST_RUN_CTE + """
+SELECT l.pt, count(*) AS n,
+       count(*) FILTER (WHERE l.verdict = 'pass') AS passed
+FROM latest l
+LEFT JOIN audit.walmart_pt_meta m ON m.walmart_product_type = l.pt
+WHERE (l.stage_stopped_at IS NULL
+       OR l.stage_stopped_at IN ('L2', 'L3', 'L4'))      -- 真走到了闸
+  AND l.pt IS NOT NULL AND l.pt <> '' AND l.pt <> 'unknown'
+  AND l.pt NOT LIKE '(%%'                                 -- 桩值不是 PT
   AND m.walmart_product_type IS NULL
 GROUP BY 1 ORDER BY 2 DESC
+"""
+
+# 「表里真没有」还是「名字对不上」——两者的修法完全不同(补数据 vs 对齐命名),
+# 而看 PT 名字本身分不出来。去标点去空白小写后再比一次
+_SQL_META_FUZZY = """
+SELECT walmart_product_type,
+       lower(regexp_replace(walmart_product_type, '[^a-zA-Z0-9]', '', 'g')) AS k
+FROM audit.walmart_pt_meta
+WHERE lower(regexp_replace(walmart_product_type, '[^a-zA-Z0-9]', '', 'g'))
+      = ANY(%s)
 """
 
 _SQL_PT_VICTIMS = """
@@ -132,6 +167,12 @@ def _by_pt(pt: str, limit: int) -> str:
         if not rows:
             out.append("  ⚠ audit.walmart_pt_meta 里**没有这个 PT** —— "
                        "R1/R3 一律静默放行(旧仓原语义)")
+            # 十有八九是名字对不上而不是真没有,直接把近似的那行报出来
+            cur.execute(_SQL_META_FUZZY, ([_norm(pt)],))
+            near = cur.fetchall()
+            if near:
+                out.append(f"  但表里有等价的一行:{near[0][0]!r} —— "
+                           f"**是命名对不上,不是数据缺**(大小写/标点/空白)")
         for r in rows:
             _pt, cat, ptg, access, zh, req, notes = r
             out += [f"  walmart_category = {cat!r}",
@@ -153,25 +194,63 @@ def _by_pt(pt: str, limit: int) -> str:
     return "\n".join(out)
 
 
+def _norm(s: str) -> str:
+    return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+_STAGE_CN = {
+    "L0": "停在 Phase0(黑名单/禁售大类/®™)—— 没走到 R1/R3",
+    "L1": "停在 L1 类目解不出(判 pending)—— 没走到 R1/R3",
+    "L2": "走到 L2 被规则拒",
+    "L3": "走到 L3 被语义拒",
+    "L4": "走到 L4 被图片拒",
+    "(过了闸)": "过了全部闸",
+}
+
+
 def _missing_meta(limit: int) -> str:
-    """输入:列出上限 → 输出:准入/认证两道闸失效面(PT 不在 meta 表的)。"""
+    """输入:列出上限 → 输出:R1/R3 两道闸真正失效的面。
+
+    只数**真的走到那两道闸**的(见 _SQL_MISSING_META 头注),并把各层停在哪里
+    的分布一并打出来 —— 分母说不清的比例没有意义。
+    """
     with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_STAGE_MIX)
+        stages = cur.fetchall()
         cur.execute(_SQL_MISSING_META)
         rows = cur.fetchall()
+        fuzzy = {}
+        if rows:
+            cur.execute(_SQL_META_FUZZY, ([_norm(r[0]) for r in rows],))
+            fuzzy = {k: name for name, k in cur.fetchall()}
+
+    out = ["每个 ASIN 最近一轮停在哪(R1/R3 只对走到 L2 的那批生效):"]
+    out += [f"    {n:>7}  {stage:<8} {_STAGE_CN.get(stage, '')}"
+            for stage, n in stages]
+    out.append("")
     if not rows:
-        return "所有在用 PT 都在 audit.walmart_pt_meta 里,R1/R3 全覆盖 ✅"
+        out.append("走到 R1/R3 的产品,PT 全都在 audit.walmart_pt_meta 里 ✅")
+        return "\n".join(out)
+
+    named = [(pt, n, p) for pt, n, p in rows if fuzzy.get(_norm(pt))]
+    absent = [(pt, n, p) for pt, n, p in rows if not fuzzy.get(_norm(pt))]
     total = sum(r[1] for r in rows)
-    ok = sum(r[2] for r in rows)
-    out = [f"⚠ {len(rows)} 个在用 PT **不在 audit.walmart_pt_meta**,涉及 "
-           f"{total} 个产品(其中已判过审 {ok} 个)。",
-           "  后果:R1 准入闸(access_state/zh_can_do)与 R3 认证闸对这些类目"
-           "**静默放行** —— 不报错,只是那两道闸等于不存在。",
-           "  多半是那张飞书类目表没同步全,或者 PT 名与表里对不上"
-           "(大小写/标点/别名)。",
-           f"  按产品数排前 {limit}:"]
-    out += [f"    {n:>7}  (过审 {a:>6})  {pt}" for pt, n, a in rows[:limit]]
+    out.append(f"⚠ 走到 R1/R3 的产品里,{total} 个的 PT 不在 walmart_pt_meta"
+               f"({len(rows)} 个 PT)—— 那两道闸对它们**静默放行**")
+    if named:
+        out.append(f"  ① 名字对不上({len(named)} 个 PT,"
+                   f"{sum(r[1] for r in named)} 个产品):表里有等价的一行,"
+                   f"只是大小写/标点/空白不同 —— 修的是**命名对齐**,不是补数据")
+        out += [f"      {n:>6}(过 {p:>5})  {pt!r}\n"
+                f"              表里是 {fuzzy[_norm(pt)]!r}"
+                for pt, n, p in named[:limit]]
+    if absent:
+        out.append(f"  ② 表里真没有({len(absent)} 个 PT,"
+                   f"{sum(r[1] for r in absent)} 个产品):去飞书类目表确认"
+                   f"这些 PT 是不是漏了,漏了补上再跑 risk_sync 家族同步")
+        out += [f"      {n:>6}(过 {p:>5})  {pt}" for pt, n, p in absent[:limit]]
     if len(rows) > limit:
-        out.append(f"    …另有 {len(rows) - limit} 个 PT")
+        out.append(f"  (每类只列前 {limit} 个,-p limit=N 看更多)")
     return "\n".join(out)
 
 

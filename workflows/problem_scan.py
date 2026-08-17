@@ -42,7 +42,7 @@
 import logging
 
 from registry import db
-from services import blacklist, dispositions
+from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
 from services import product_events
 
@@ -318,7 +318,8 @@ def _collect_blacklists(conn, items: list[dict]) -> str:
     按品牌去重入 brand_blacklist。
     **任何失败只告警不阻断**——黑名单是扫描的副产品,收集炸了不该把建议
     产出拖下水;漏一轮下一轮照样补(入选条件不变)。
-    飞书投影由 blacklist_push 按 pushed_at 水位另推,这里只写 PG。
+    ⚠ **本函数只写 PG**;飞书投影归 `run()` 收尾那一步(`_push_sheets`)——
+    它必须在事务提交**之后**才看得见这一轮的行,详见那里的注释。
     """
     cand = [it for it in items if "category" in it]
     if not cand:
@@ -338,6 +339,31 @@ def _collect_blacklists(conn, items: list[dict]) -> str:
     if st["skipped"]:
         bits.append(f"已处理跳过 {st['skipped']}")
     return "黑名单收集:" + ",".join(bits)
+
+
+def _push_sheets() -> str:
+    """输入:无 → 输出:飞书投影摘要一行。**必须在 `with db.pg_conn()` 之外调**。
+
+    所有者定稿 2026-08-17:「让 problem_scan 完成后立马推飞书」。做法与
+    `order_center` 那次拆分同款(`docs/schedule_plan.md` §四:「已对接飞书表的,
+    执行完就写,不要做成单独的」)—— 投影代码在 `services.blacklist_sheet`,
+    不是 import `blacklist_push` 工作流(铁律 1)。
+
+    ⚠ **位置有讲究:必须等本轮的写提交之后。** 投影是另开一条连接查全表
+    (`SELECT … FROM catalog.asin_blacklist`),放在扫描那个事务里面调的话它
+    **看不到刚写的那几行** —— 表现是"黑名单收集 +5,可表格一行没多",
+    而且不报任何错。所以它长在这儿、由 `run()` 在 `with` 块退出后调用。
+
+    ⚠ 两条时间线本来就不一样,这次只是把第二条提前了:
+      · **否决闸**在 `_collect_blacklists` 写完那一刻就生效 —— 上架与审核读 PG,
+        从不读飞书表。这条**从来不等投影**。
+      · **表格**原先要等 15:00 的 `blacklist` 任务;现在这一轮顺手就写完。
+        `blacklist_push` 仍留在调度里当兜底(整表重写幂等),也仍是手动补推入口。
+
+    失败只告警不阻断(`push_after` 里那条纪律):黑名单已落 PG、闸门已生效,
+    飞书写挂不该把一轮扫描记成 failed —— 但必须出现在摘要里。
+    """
+    return blacklist_sheet.push_after()
 
 
 def _audit_rejected_rows(conn, inflight: set, inactive: set,
@@ -444,6 +470,7 @@ def run(params: dict) -> str:
         lines.append(dispositions.stuck_note(stuck))
     if bl_note:
         lines.append(bl_note)
+        lines.append(_push_sheets())
     lines.append("执行走 `python cli.py problem_product_cleanup`(先 --dry-run 看破坏面)"
                  "(本工作流不发任何 feed)")
     return "\n".join(lines)

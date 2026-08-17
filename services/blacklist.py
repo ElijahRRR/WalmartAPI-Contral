@@ -30,8 +30,19 @@
   BIZ-CN 独立成维度(legacy_survey:2077:唯一明确标注中国卖家专属禁售的
   错误码,不能被 C 品牌类的关键词匹配吸收)——两张表都带 biz_cn 布尔列。
 
-写入方向:cleanup → PG(本文件)→ 飞书投影(blacklist_push 工作流按
-pushed_at 水位推)。PG 权威,飞书只是人机界面。
+写入方向:`problem_scan` → PG(本文件)→ 飞书投影(`blacklist_push` 工作流,
+**整表重写**;按 pushed_at 水位追加那套 2026-08-17 已废除)。
+PG 权威,飞书只是人机界面。
+
+⚠ **两条时间线不一样,别混**(所有者 2026-08-17 问「黑名单出来了会立刻推送到
+飞书表格吗」):
+
+  · **否决闸立刻生效** —— 本文件写完 `brand_blacklist` / `asin_blacklist` 那一刻,
+    上架(`list_new` / `match_listing`)与审核(Phase0)就拦得住了。它们读的是
+    **PG**,从不读飞书表。
+  · **表格要等 `blacklist_push`** —— 那是另一条链(调度里的 `blacklist` 任务)。
+    所以"扫出来"和"表格里看得见"之间隔着一条链、两个小时。想立刻看见就手动跑
+    `python cli.py blacklist_push`。
 """
 
 import json

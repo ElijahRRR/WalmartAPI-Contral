@@ -58,6 +58,9 @@ _DATA = {
     "FROM audit.walmart_category_map": [
         ("Hammers", 3), ("Wall Clocks", 155), ("Lonely PT", 0),
     ],
+    # 「旧行没清」那一档:同路径已有有效 PT 的死行(这里刻意留空,
+    # 由专门那条用例给数据)
+    "LEFT JOIN audit.walmart_pt_meta dm": [],
 }
 
 
@@ -135,7 +138,8 @@ def test_suggestions_split_naming_diffs_from_real_unknowns(monkeypatch, tmp_path
             ("Paperweights", 19),          # 纯命名差 → Paper Weights
             ("Novelty Lightss", 6),        # 相似
             ("Zzz Nothing Like This", 1),  # 无对应
-        ]}))
+        ],
+        "LEFT JOIN audit.walmart_pt_meta dm": []}))
     monkeypatch.setattr(pc.pt_spec, "known_pts",
                         lambda: {"Paper Weights", "Novelty Lights", "Hammers"})
     monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
@@ -162,3 +166,34 @@ def test_suggestions_only_for_the_guess_bucket(monkeypatch, tmp_path):
     rows, _ = pc._census()
     by = {r["walmart_product_type"]: r for r in rows}
     assert by["Retired PT"]["判定"] == "已废弃?" and by["Retired PT"]["建议PT"] == ""
+
+
+def test_superseded_rows_get_their_own_verdict(monkeypatch, tmp_path):
+    """⚠ 「改过了但旧行没清」不该混进「瞎猜」—— 它根本不需要判断。
+
+    同一 Amazon 路径已经有一条有效 PT,正确答案就在隔壁;混进瞎猜的话
+    人会对着 107 个 PT 逐条想"这该映到哪",而其中大部分压根不用想。
+    生产实测 2026-08-17:150 行死映射 **150 行全是这种**,真孤儿 0 个。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [
+            ("Novelty Lighting", "Home", "Lighting", "普通商品", "是")],
+        "FROM audit.walmart_pt_spec": [("Novelty Lighting",)],
+        "FROM audit.walmart_category_map": [
+            ("Novelty Lights", 6), ("Truly Orphan PT", 2)],
+        "LEFT JOIN audit.walmart_pt_meta dm": [
+            ("Novelty Lights", 6, "Novelty Lighting")],
+    }))
+    monkeypatch.setattr(pc.pt_spec, "known_pts", lambda: {"Novelty Lighting"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    rows, counts = pc._census()
+    by = {r["walmart_product_type"]: r for r in rows}
+    assert by["Novelty Lights"]["判定"] == "旧行没清"
+    assert by["Novelty Lights"]["同路径已有有效PT"] == "Novelty Lighting"
+    assert by["Truly Orphan PT"]["判定"] == "瞎猜"      # 这个才真要人判
+    assert counts["旧行没清"] == 1 and counts["瞎猜"] == 1
+
+    out = pc.run({})
+    # 必须说清它不是无害脏数据:两义会把有效那条一起丢掉
+    assert "改过了但旧行没清" in out and "一起丢掉" in out
+    assert "catmap_prune" in out                       # 指向处置命令

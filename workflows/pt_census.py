@@ -61,9 +61,27 @@ WHERE walmart_product_type NOT IN ('无对应Walmart PT', '-', '')
 GROUP BY 1
 """
 
+# 死 PT 的行里,**同一 Amazon 路径已经有一条有效 PT** 的那些 ——
+# 修正做过了(catmap_fix 的惯例是插新行不删旧行),旧行只是没清。
+# 生产实测 2026-08-17:150 行死映射里 150 行都是这种,真孤儿 0 个。
+_SQL_SUPERSEDED = """
+SELECT d.walmart_product_type, count(*), min(g.walmart_product_type)
+FROM audit.walmart_category_map d
+LEFT JOIN audit.walmart_pt_meta dm
+       ON dm.walmart_product_type = d.walmart_product_type
+JOIN audit.walmart_category_map g
+       ON g.amazon_category = d.amazon_category
+      AND g.walmart_product_type <> d.walmart_product_type
+JOIN audit.walmart_pt_meta gm
+       ON gm.walmart_product_type = g.walmart_product_type
+WHERE dm.walmart_product_type IS NULL
+  AND d.walmart_product_type NOT IN ('无对应Walmart PT', '-', '')
+GROUP BY 1
+"""
+
 _COLS = ("walmart_product_type", "判定", "在spec", "在准入明细", "在上传模板",
-         "映射条数", "建议PT", "相似度", "walmart_category", "walmart_ptg",
-         "access_state", "zh_can_do")
+         "映射条数", "同路径已有有效PT", "建议PT", "相似度",
+         "walmart_category", "walmart_ptg", "access_state", "zh_can_do")
 
 # 相似度阈值:低于它的候选不给 —— 给一个八竿子打不着的建议比不给更糟,
 # 人会顺手采纳(旧仓 mp_mapper 就吃过"高置信度自动采纳"的亏)
@@ -128,6 +146,8 @@ def _census() -> tuple[list[dict], dict]:
         tmpl = {r[0] for r in cur.fetchall()}
         cur.execute(_SQL_MAP)
         used = {r[0]: int(r[1]) for r in cur.fetchall()}
+        cur.execute(_SQL_SUPERSEDED)
+        superseded = {r[0]: (int(r[1]), r[2]) for r in cur.fetchall()}
 
     rows, counts = [], {}
     for pt in sorted(spec | set(meta) | tmpl | set(used)):
@@ -140,7 +160,7 @@ def _census() -> tuple[list[dict], dict]:
             "在准入明细": "Y" if pt in meta else "",
             "在上传模板": "Y" if pt in tmpl else "",
             "映射条数": used.get(pt, 0),
-            "建议PT": "", "相似度": "",
+            "建议PT": "", "相似度": "", "同路径已有有效PT": "",
             "walmart_category": (m[1] if m else "") or "",
             "walmart_ptg": (m[2] if m else "") or "",
             "access_state": (m[3] if m else "") or "",
@@ -153,6 +173,14 @@ def _census() -> tuple[list[dict], dict]:
         hit = sug.get(r["walmart_product_type"])
         if hit:
             r["建议PT"], r["相似度"] = hit[0], hit[1]
+        sup = superseded.get(r["walmart_product_type"])
+        if sup and r["判定"] == "瞎猜":
+            # ⚠ 这一档**不需要判断**:同路径已经有有效 PT,修正做过了,
+            # 这行只是没清。改判定,免得人对着它逐条想"该映到哪"
+            r["判定"] = "旧行没清"
+            r["同路径已有有效PT"] = sup[1]
+            counts["瞎猜"] -= 1
+            counts["旧行没清"] = counts.get("旧行没清", 0) + 1
     return rows, counts
 
 
@@ -166,7 +194,7 @@ def run(params: dict) -> str:
     n_spec = sum(1 for r in rows if r["在spec"])
     lines = [f"PT 四源对账:合计 {len(rows)} 个 PT"
              f"(官方 spec {n_spec} 个)"]
-    for v in ("ok", "没人用", "准入漏了", "已废弃?", "瞎猜"):
+    for v in ("ok", "没人用", "准入漏了", "已废弃?", "旧行没清", "瞎猜"):
         if counts.get(v):
             lines.append(f"  {v:<6} {counts[v]:>5}")
 
@@ -179,6 +207,25 @@ def run(params: dict) -> str:
                      f"处置:补进飞书「沃尔玛类目准入明细」")
         lines += [f"    {r['walmart_product_type']}(映射 {r['映射条数']} 条)"
                   for r in sorted(miss, key=lambda r: -r["映射条数"])[:15]]
+
+    old = [r for r in rows if r["判定"] == "旧行没清"]
+    if old:
+        # 这一档不需要任何判断:正确答案就在同一路径的兄弟行里
+        lines.append("")
+        lines.append(
+            f"⚠ **{len(old)} 个 PT / {sum(r['映射条数'] for r in old)} 条映射是"
+            f"「改过了但旧行没清」** —— 同一 Amazon 路径已经有一条有效 PT,"
+            f"这些只是当年修正时留下的旧行(catmap_fix 的惯例是插新行不删旧行)。")
+        lines.append(
+            "     ⚠⚠ 它们**不是无害的脏数据**:装配 catmap 时同一路径出现两个 "
+            "DISTINCT PT 会被判成两义,**连那条有效的一起丢掉** —— "
+            "生产实测因此白丢 105 条本可直出的路径(已在 audit_rules 修:"
+            "先过 pt_meta 闸再计票)。清掉它们还能顺带修好映射表本身。")
+        lines += [f"    {r['walmart_product_type']}({r['映射条数']} 条)"
+                  f" → 同路径已有 **{r['同路径已有有效PT']}**"
+                  for r in sorted(old, key=lambda r: -r["映射条数"])[:12]]
+        lines.append("  处置:`python cli.py catmap_prune --dry-run` 看清单,"
+                     "确认后去掉 --dry-run(降级为低置信 + 备注留痕,不删行)")
 
     guess = [r for r in rows if r["判定"] == "瞎猜"]
     if guess:

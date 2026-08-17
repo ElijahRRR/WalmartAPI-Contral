@@ -107,3 +107,34 @@ def test_summary_explains_why_these_rows_are_not_harmless(monkeypatch):
     monkeypatch.setattr(cp.db, "pg_conn", lambda: _Conn(_ROWS))
     out = cp.run({"execute": True, "dry_run": True})
     assert "两义" in out and "一起丢掉" in out
+
+
+def test_already_pruned_rows_are_not_touched_again(monkeypatch):
+    """⚠ 幂等:降过的不再降。
+
+    所有者 2026-08-17 连跑了两次,同 150 行被处理两遍 —— 降级本身幂等
+    (还是 '低'),但**备注会被重复追加**,而且摘要一直报"已降级 150 行",
+    看着像每天都在发现新问题。判据 = 备注里已有 [catmap_prune: 标记。
+    """
+    sql_seen = []
+
+    class _C(_Cur):
+        def execute(self, sql, params=None):
+            sql_seen.append(sql)
+            super().execute(sql, params)
+
+    conn = _Conn(_ROWS)
+    monkeypatch.setattr(conn, "cursor", lambda: _C(conn.store))
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True, "dry_run": True})
+    pick = next(s for s in sql_seen if "SELECT d.amazon_category" in s)
+    assert "NOT LIKE" in pick and "catmap_prune" in pick
+
+
+def test_the_trail_tag_matches_what_the_filter_looks_for(monkeypatch):
+    """⚠ 留痕的标记与幂等判据必须是同一串 —— 对不上就等于没有幂等。"""
+    conn = _Conn(_ROWS)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True})
+    tag = conn.store["ops"][0][1]["tag"]
+    assert "[catmap_prune:" in tag          # 与 _SQL_PICK 的 NOT LIKE 同串

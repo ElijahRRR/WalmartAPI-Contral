@@ -44,6 +44,10 @@ JOIN audit.walmart_pt_meta gm
        ON gm.walmart_product_type = g.walmart_product_type
 WHERE dm.walmart_product_type IS NULL
   AND d.walmart_product_type NOT IN ('无对应Walmart PT', '-', '')
+  -- ⚠ 幂等:降过的不再降(所有者 2026-08-17 连跑两次,同 150 行被处理两遍,
+  -- 备注被重复追加)。降级本身是幂等的(还是 '低'),但备注会越追越长,
+  -- 而且摘要会一直报"已降级 150 行" —— 看着像每天都在发现新问题
+  AND coalesce(d.notes, '') NOT LIKE '%%[catmap_prune:%%'
 GROUP BY d.amazon_category, d.walmart_product_type, d.confidence, d.notes
 ORDER BY d.walmart_product_type, d.amazon_category
 """

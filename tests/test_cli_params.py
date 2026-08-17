@@ -116,3 +116,53 @@ def test_unconfigured_webhook_logs_only_the_first_line(monkeypatch, caplog):
     text = caplog.text
     assert "claim_audit 成功" in text                  # 说清楚是哪条通知没发出去
     assert "第二行" not in text and "第三行" not in text
+
+
+# ── .env 重复键守卫(2026-08-17 生产实证)────────────────────────────────────
+
+def test_duplicate_env_keys_are_detected():
+    """⚠ dotenv 顺序读取、后者覆盖前者,**且不报重复**。
+
+    所有者的 .env 里 FEISHU_RISK_PT_WIKI_TOKEN 等四个键各出现两次,
+    第二次是模板留下的空值,于是那四张表全读成"未登记" —— 值明明就在
+    文件里、肉眼看过去也在,报错却说"尚未登记"。这种错自己找不到。
+    """
+    dup = cli.dup_env_keys("""
+# 沃尔玛类目
+FEISHU_RISK_PT_WIKI_TOKEN=UKdZwr7JqiO6UckjSnPcwTCgnvd
+FEISHU_BRAND_SHEET_ID=jF8dOw
+OTHER=1
+
+# listing 风控两张只读源(模板留下的空壳)
+FEISHU_RISK_PT_WIKI_TOKEN=
+FEISHU_BRAND_SHEET_ID=
+""")
+    assert set(dup) == {"FEISHU_RISK_PT_WIKI_TOKEN", "FEISHU_BRAND_SHEET_ID"}
+    # 顺序必须保留 —— 判"最后一个是不是空值"全靠它
+    assert dup["FEISHU_RISK_PT_WIKI_TOKEN"] == \
+        ["UKdZwr7JqiO6UckjSnPcwTCgnvd", ""]
+    assert "OTHER" not in dup
+
+
+def test_comments_and_blank_lines_do_not_count():
+    assert cli.dup_env_keys("# A=1\n# A=2\n\nA=3\n") == {}
+
+
+def test_export_prefix_is_normalized():
+    """`export FOO=1` 与 `FOO=2` 是同一个键 —— 不归一就漏报。"""
+    assert list(cli.dup_env_keys("export FOO=1\nFOO=2\n")) == ["FOO"]
+
+
+def test_warn_says_which_direction_it_broke(capsys, tmp_path):
+    """空值覆盖有值 = 静默失效,必须与"重复但都有值"区分开说。"""
+    p = tmp_path / ".env"
+    p.write_text("A=有值\nB=1\nA=\n", encoding="utf-8")
+    cli._warn_dup_env(p)
+    err = capsys.readouterr().err
+    assert "最后一次是空值" in err and "删掉那行空的" in err
+    assert "B" not in err
+
+
+def test_warn_is_silent_when_env_is_missing(capsys, tmp_path):
+    cli._warn_dup_env(tmp_path / "nope.env")
+    assert capsys.readouterr().err == ""

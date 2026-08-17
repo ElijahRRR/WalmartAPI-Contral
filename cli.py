@@ -126,6 +126,42 @@ class _NotOnScreen(logging.Filter):
         return not getattr(record, "file_only", False)
 
 
+def dup_env_keys(text: str) -> dict[str, list[str]]:
+    """输入:.env 全文 → 输出:{重复出现的键: [每次的值]}(纯函数,可测)。
+
+    ⚠ dotenv **顺序读取、后者覆盖前者,且不报重复**。生产实证 2026-08-17:
+    所有者的 .env 里 FEISHU_RISK_PT_WIKI_TOKEN 等四个键各出现两次,
+    第二次是模板留下的空值,于是那四张表全部读成"未登记" ——
+    值明明就在文件里,肉眼看过去也在,报错却说没配。这种错自己找不到。
+    """
+    seen: dict[str, list[str]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        if k:
+            seen.setdefault(k, []).append(v.strip())
+    return {k: vs for k, vs in seen.items() if len(vs) > 1}
+
+
+def _warn_dup_env(env_file: Path) -> None:
+    """.env 有重复键就吼一声 —— 尤其是"后面那个是空值"的情况。"""
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for k, vs in dup_env_keys(text).items():
+        blanked = (not vs[-1]) and any(vs[:-1])
+        msg = ("⚠ .env 里 %s 出现 %d 次,**最后一次是空值,把前面的覆盖了**"
+               "(dotenv 后者覆盖前者且不报重复)——删掉那行空的"
+               if blanked else "⚠ .env 里 %s 出现 %d 次,最后一次生效")
+        print(msg % (k, len(vs)), file=sys.stderr)
+
+
 def _setup_logging(logs_dir: Path) -> None:
     """根 logger 只配一次(stderr);每步的文件 handler 由 _log_to 挂/摘。"""
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -281,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from registry import paths
     load_dotenv(paths.env_file(), override=False)
+    _warn_dup_env(paths.env_file())
 
     # cli 只自建它直接需要的 logs/locks;完整 DATA_ROOT 初始化走 init_data_root 工作流
     logs_dir = paths.logs_dir()

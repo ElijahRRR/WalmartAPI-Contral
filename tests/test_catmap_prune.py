@@ -138,3 +138,43 @@ def test_the_trail_tag_matches_what_the_filter_looks_for(monkeypatch):
     cp.run({"execute": True})
     tag = conn.store["ops"][0][1]["tag"]
     assert "[catmap_prune:" in tag          # 与 _SQL_PICK 的 NOT LIKE 同串
+
+
+_ORPHAN_ROWS = _ROWS + [
+    ("Only > This > Path", "Ghost PT", "高", "", "(同路径也没有有效 PT)"),
+]
+
+
+def test_all_mode_covers_every_dead_row_and_flags_the_orphans(monkeypatch):
+    """所有者定稿 2026-08-17:「不存在的 pt 直接清理掉」。
+
+    ⚠ 但同路径没有有效 PT 的那些,清掉就**真成缺口** —— 必须点名多少条、
+    由谁重建,否则它会悄悄变成"这些产品从此解不出类目"。
+    """
+    conn = _Conn(_ORPHAN_ROWS)
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    out = cp.run({"execute": True, "dry_run": True, "all": "1"})
+    assert "字典外 PT 的映射(全部)" in out
+    assert "1 行**同路径没有有效 PT**" in out
+    assert "catmap_mine" in out and "catmap_gap" in out
+
+
+def test_all_mode_picks_a_different_query(monkeypatch):
+    """两种口径必须是两条 SQL —— 缺省那条要求有有效兄弟,all 那条不要求。"""
+    seen = []
+
+    class _C(_Cur):
+        def execute(self, sql, params=None):
+            seen.append(sql)
+            super().execute(sql, params)
+
+    conn = _Conn(_ORPHAN_ROWS)
+    monkeypatch.setattr(conn, "cursor", lambda: _C(conn.store))
+    monkeypatch.setattr(cp.db, "pg_conn", lambda: conn)
+    cp.run({"execute": True, "dry_run": True, "all": "1"})
+    assert any("LEFT JOIN audit.walmart_category_map g" in s for s in seen)
+    seen.clear()
+    cp.run({"execute": True, "dry_run": True})
+    assert any("JOIN audit.walmart_category_map g" in s
+               and "LEFT JOIN audit.walmart_category_map g" not in s
+               for s in seen)

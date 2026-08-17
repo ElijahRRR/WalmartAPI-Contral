@@ -522,6 +522,21 @@ CATMAP_SHEET_HEADER = (
     "Amazon 叶子", "Amazon 路径", "browse_node_id",
     "排名", "置信度", "匹配方式", "备注", "来源批次")
 
+# PT 上传模板汇总(同一个 wiki 里的另一张工作表;所有者 2026-08-17:
+# 「完整的沃尔玛类目映射时可以直接映射到 PT上传模板_汇总」)。
+# 它由**沃尔玛官方 MP_ITEM spec** 拆出来,是"这个 PT 到底存不存在"的凭据之一。
+# ⚠ **只读**:本仓不往它写(2026-08-17 覆盖事故之后的纪律 —— 人在维护的表,
+# 除非明确要求,一律只读)。
+PT_TEMPLATE_SHEET = Spreadsheet(
+    name="PT上传模板_汇总",
+    token=os.environ.get("FEISHU_CATMAP_WIKI_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_PT_TEMPLATE_SHEET_ID", ""),
+    columns=("walmart_category", "walmart_ptg", "walmart_product_type",
+             "total_fields", "required_count", "required_fields",
+             "core_fields"),
+    wiki=True,
+)
+
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。

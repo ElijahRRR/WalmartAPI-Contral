@@ -14,7 +14,7 @@
 |---|---|---|
 | 1 | `list_new` | 上架主链(listing L2d,替代旧 auto_listing/main.py;危险:缺省即真跑,空跑用 --dry-run)。 |
 
-备注:⚠⚠ **开这条之前必须先停旧上架栈**:com.user.autolisting.morning(06:00,链末尾就是无人值守上架)+ com.nextderboy.erp_worker×20(常驻,长轮询跑上架)+ dedup 链(每时:05 与 14:02)。不停就是新旧两套同时对上架表双写、同时消耗 UPC —— 安全铁律「新旧系统严禁对同一破坏性任务并跑」直接踩上。停旧顺序见 docs/legacy_schedules.md §D
+备注:⚠⚠ **开这条之前必须先停旧上架栈**:com.user.autolisting.morning(06:00,链末尾就是无人值守上架)+ com.nextderboy.erp_worker×20(常驻,长轮询跑上架)+ dedup 链(每时:05 与 14:02)。不停就是新旧两套同时对上架表双写、同时消耗 UPC —— 安全铁律「新旧系统严禁对同一破坏性任务并跑」直接踩上。停旧顺序见 docs/legacy_schedules.md §D。UPC **不必单独排一条**:这条链自己开头注入一次 UPC 池、结尾把池状态回写飞书 C~F(所有者定稿 2026-08-16「放到上架里」),合起来等于跑了一次 upc_sync
 
 ## 跑完怎么判
 

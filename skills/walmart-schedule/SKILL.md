@@ -15,19 +15,19 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 
 ## 任务表
 
-| 任务 | 时间(台北) | cron | 跑什么 |
-|---|---|---|---|
-| `backup` | 每天 02:00 | `0 2 * * *` | backup |
-| `daily_report` | 每天 06:40 | `40 6 * * *` | daily_report |
-| `order_daily` | 每天 07:30 | `30 7 * * *` | perf_problems → order_asin_normalize |
-| `product_chain` | 每天 13:00 | `0 13 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
-| `blacklist` | 每天 15:00 | `0 15 * * *` | risk_sync → blacklist_push |
-| `product_clear` | 每天 15:00 | `0 15 * * *` | product_clear |
-| `audit_sheet` | 每天 18:10 | `10 18 * * *` | product_audit |
-| `list_new` | 每天 20:00 | `0 20 * * *` | list_new |
-| `settlement` | 每周三 08:00 | `0 8 * * 3` | settlement_sync |
+| 任务 | 时间(台北) | cron(台北) | cron(UTC) | 跑什么 |
+|---|---|---|---|---|
+| `backup` | 每天 02:00 | `0 2 * * *` | `0 18 * * *` | backup |
+| `daily_report` | 每天 06:40 | `40 6 * * *` | `40 22 * * *` | daily_report |
+| `order_daily` | 每天 07:30 | `30 7 * * *` | `30 23 * * *` | perf_problems → order_asin_normalize |
+| `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `blacklist` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | risk_sync → blacklist_push |
+| `product_clear` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | product_clear |
+| `audit_sheet` | 每天 18:10 | `10 18 * * *` | `10 10 * * *` | product_audit |
+| `list_new` | 每天 20:00 | `0 20 * * *` | `0 12 * * *` | list_new |
+| `settlement` | 每周三 08:00 | `0 8 * * 3` | `0 0 * * 3` | settlement_sync |
 
-⚠ **表里的时间全是台北时间(UTC+8)**,和这台电脑的本地时间一致。要是你那边的定时任务按 UTC 算,自己减 8 小时再填 —— 时区弄反的表现是「每天准时在错的时间跑」,不报任何错(02:00 的备份跑到 10:00 去,09:00 的产品链跑到半夜)。
+⚠ **时区:「时间」与「cron(台北)」两列是台北时间(UTC+8),和这台电脑的本地时间一致;平台按 UTC 存就用「cron(UTC)」那一列,**别自己减** —— 台北 02:00 / 06:40 / 07:30 对应的是 UTC **前一天**,带星期的还得把星期一起往前挪,已经替你算好了。时区弄反的表现是「每天准时在错的时间跑」,不报任何错(02:00 的备份跑到 10:00 去,13:00 的产品链跑到半夜)。
 
 每条任务的完整提示词在 `tasks/<任务名>.md`,注册定时任务时**整篇粘进去**。
 

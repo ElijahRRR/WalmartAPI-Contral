@@ -301,7 +301,13 @@ def run(params: dict) -> str:
 
     by_store = group_by_store(intents)
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
-    lines.append(f"{mode}待执行建议 {len(intents)} 条:删除 {n_kind['delete']},"
+    # ⚠ 措辞随模式走(所有者 2026-08-17 实见):这一行在**提交之前**生成,
+    # dry-run 说「待执行」是对的;真跑完再说「待执行」就是谎话——那些行此刻
+    # 已经是 executing 了,而通知开头还写着 ✅ 成功,人会以为什么都没干。
+    # 也不能改成「已执行」:领取的行里有一部分会撞上单店上限/在途防重/凭证
+    # 缺失,并没有全部提交出去。准确的只有"本轮领取了多少",结果归后面几行。
+    head = "待执行建议" if not execute else "本轮领取建议"
+    lines.append(f"{mode}{head} {len(intents)} 条:删除 {n_kind['delete']},"
                  f"标题 {n_kind['title']},价格 {n_kind['price']},"
                  f"库存 {n_kind['inventory']}")
 

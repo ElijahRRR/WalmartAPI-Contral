@@ -1045,3 +1045,33 @@ def test_stuck_note_says_why_and_is_empty_when_clean():
     assert "谭总10×3" in note
     assert "建不出新建议" in note        # 后果说清楚,不只报个数
     assert "catalog_sync" in note        # 指向成因,人知道该去查什么
+
+
+def test_summary_does_not_call_executed_rows_pending(monkeypatch):
+    """真跑完不许再说「待执行建议」—— 那些行此刻已经是 executing 了。
+
+    所有者 2026-08-17 实见:通知开头 `✅ [EXECUTE] maintenance 成功`,正文却是
+    「待执行建议 8257 条」,读起来像"什么都没干"。这一行在**提交之前**生成,
+    dry-run 说「待执行」是对的,真跑就是谎话。
+
+    也不能改口叫「已执行」:领取的行里有一部分会撞上单店上限/在途防重/凭证
+    缺失,并没有全部提交出去 —— 那样只是换了个方向说谎。
+    """
+    calls = _wire(monkeypatch, _zero(2))
+
+    dry = mw.run({"execute": False})
+    assert "待执行建议 2 条" in dry
+
+    real = mw.run({"execute": True})
+    assert "待执行" not in real, "真跑完还在说「待执行」"
+    assert "本轮领取建议 2 条" in real
+    assert calls["put_inv"] or calls["feeds"]      # 确实提交过,不是空跑
+
+
+def test_cleanup_summary_uses_the_same_wording(monkeypatch):
+    """两条链同一处理 —— 各写各的措辞迟早一边改了另一边没改。"""
+    import inspect
+
+    from workflows import problem_product_cleanup as ppc
+    for src in (inspect.getsource(mw.run), inspect.getsource(ppc.run)):
+        assert '"待执行建议" if not execute else "本轮领取建议"' in src

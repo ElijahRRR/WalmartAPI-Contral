@@ -61,6 +61,27 @@ def test_plan_variant_happy_path():
     assert p["family_size"] == 3 and p["is_primary"] is True
 
 
+def test_multi_dim_family_is_grouped_by_one_dim_and_says_so():
+    """⚠ 多维家族**只按一个维度分组**,这是已知限制,必须可数不可静默。
+
+    所有者 2026-08-17 问「单属性多属性都会自动用对应方法吧」——不会:
+    `pick_walmart_dim` 取第一个映得上的维度,color+size 的家族只按 color 分。
+    后果不只是少发一个字段:同族里**只差 size 的两个成员**会带着同一个
+    variantGroupId + 同一个 color 值发出去,沃尔玛看不出它们有什么不同。
+
+    真支持多维要发多个 variantAttributeNames + 每个维度各写一个属性,
+    是设计变更待所有者定;在那之前 `extra_dims` 让 list_new 摘要单列一栏。
+    """
+    p = vg.plan("B0009GGJ9G", "color_name=Black; size_name=L",
+                "B0009GGJCI", "B000AMXQVI", _ENUM)
+    assert p["mode"] == "variant"
+    assert (p["attr_name"], p["attr_value"]) == ("color", "Black")
+    assert p["extra_dims"] == ["size_name"]        # 没发的那些,点名
+    # 单维不该报:否则这一栏天天有数,人就不看了
+    assert vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI",
+                   "B000AMXQVI", _ENUM)["extra_dims"] == []
+
+
 def test_plan_uses_existing_group_id_when_family_already_listed():
     """③ 所有者定稿:同族已有成员在架 → 新成员沿用它的 variantGroupId。"""
     p = vg.plan("B0009GGJCI", "color_name=Navy", "B0009GGJ9G,B0009GGJDW",

@@ -736,6 +736,11 @@ def run(params: dict) -> str:
                     vplan = _variant_plan(conn, store_name, r,
                                           pt_spec.load_pt(r["product_type"]))
                     n_var[vplan["code"]] += 1
+                    # 多维家族只按一个维度分组(variant_group.plan 的已知限制)
+                    # ——单列一栏,不许静默:只差 size 的两个成员会带着同一个
+                    # 组 ID + 同一个 color 值发出去,沃尔玛看不出差异
+                    if vplan.get("extra_dims"):
+                        n_var["variant(多维只发一个)"] += 1
                     visible, orderable, notes, missing = mp_conform.conform(
                         pt_spec.load_pt(r["product_type"]),
                         pt_spec.orderable_spec(), visible, orderable,

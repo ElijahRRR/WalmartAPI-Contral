@@ -166,6 +166,19 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
         return out
     # 取值取被选中那个维度的值:attrs 键是亚马逊维度名,反查回去
     dim = next((d for d in attrs if name in _DIM_MAP.get(d, ())), None)
+    # ⚠ **多维度只发一个**(2026-08-17 补可见性,所有者问「单属性多属性都会
+    # 自动用对应方法吧」)。`pick_walmart_dim` 取的是第一个映得上的维度,
+    # 一个 color+size 的家族只会按 color 分组,size 不发。
+    # 后果不是"少发一个字段"这么轻:同族里**只差 size 的两个成员**发出去
+    # 带着同一个 variantGroupId + 同一个 color 值,沃尔玛看不出它们有什么
+    # 不同(EXT_DATA_ERROR_05570905585050 那一族错误的邻居)。
+    # 真支持多维要动 variantAttributeNames 发多个 + 每个维度各写一个属性,
+    # 是设计变更,待所有者定。**在那之前至少让它可数,不许静默**。
+    dropped = [d for d in attrs if d != dim]
     out.update(mode="variant", code="variant", attr_name=name,
-               attr_value=attrs[dim], is_primary=not family_has_primary)
+               attr_value=attrs[dim], is_primary=not family_has_primary,
+               extra_dims=sorted(dropped))
+    if dropped:
+        logger.warning("%s 有 %d 个变体维度,只按 %s 分组,未发:%s",
+                       asin, len(attrs), dim, ",".join(sorted(dropped)))
     return out

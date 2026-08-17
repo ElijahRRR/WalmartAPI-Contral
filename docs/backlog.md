@@ -204,6 +204,33 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   必须跨批次一致,按样本值缓存会让分批上架前后判出两套维度名。
   本轮只看见 1 个成员时只走内置表(判不了有没有差异,不问 LLM)。
 
+  ⚠ **2026-08-17 对抗审查(7 个只读 agent)揪出五处并已修**,四处是"1460 个测试
+  全绿也没挡住"的静默类:
+    · **`db.pg_conn().__enter__()` 拿到的是已关闭连接**(两处)。`pg_conn` 是
+      `@contextmanager`,临时 CM 对象在那一行之后立刻被回收 ⇒ 生成器 close ⇒
+      `finally: conn.close()` 当场执行(实测 `conn.closed is True`)。后果:
+      定稿③「同族已在架 ⇒ 沿用它的 variantGroupId」与 `family_has_primary`
+      **在生产里从未真正生效过**(异常被 except 吞成一行 warning);另一处在
+      重映射的 LLM 路径上**没有 except 兜着**,会一路冒到 run() 让整条
+      list_new 失败。改用 `contextlib.ExitStack`,并补真调那段代码的用例。
+    · **同一家族被切成两个组**:`group_id` 的判据写成 `parent == 自己`,
+      "部分行 parent 填自己、部分行填某个兄弟"的混合形态下两条路各走一边。
+      改成 `parent in 家族` 一律 min(家族)(真族主不在家族里 ⇒ 行为不变,
+      **不动已发出去的组 ID**)。
+    · **错位重映射对它的主场景不可达**:`no_dim` 早退时 `unmapped_dims` 留空,
+      而接线侧按它入组 ⇒ 刚补迁的 variant_remap 对旧仓 Art Sets 那类案例
+      一次都不会被调用。现在 no_dim 也带上维度名,重映成功后升回变体口径。
+    · **载荷层最后一道类型闸有 catch-all**:`_coerce_variant_value` 末尾
+      `return val` 让 array/boolean 型变体属性原样出去。删掉,认不出的类型
+      一律剔;数字型顺带抽数(`48 Color` → 48,LLM 重映射回来的原始串靠它)。
+    · **属性全被剔时不接单品口径**:只 pop 三件套就 return,spec 把三件套列
+      必填的 PT 会每轮判必填缺失、永不上架,而 note 写着"退单品"。现在真的
+      落到单品口径(SKU 占位补全),降级说明一并带出。
+  顺带加固:`variant_attr_enum` 无条件读 `items.enum`(spec 没写 `type: array`
+  时通用 `_enum_of` 读不到 ⇒ 空枚举 ⇒ 整批静默退单品,与"类目不支持变体"
+  无从分辨);件数一族补 `multipackQuantity` / `pieceCount` 候选;`_DIM_MAP`
+  表外维度名加一层驼峰归一兜底(零成本,省一次 LLM)。
+
   **与旧仓仍存的三处差异**(都是有意的):① 孤品也带 groupId(旧仓 full_set<2
   不注入)—— 所有者定稿,依据是沃尔玛报错原文明说支持 1 个成员的变体组;
   ② 发 `isPrimaryVariant`(旧仓从不发,怕分批出现两个 primary)—— 我们先查本店

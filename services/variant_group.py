@@ -52,15 +52,40 @@ _DIM_MAP: dict[str, tuple[str, ...]] = {
     "team_name": ("team",),
     "lens_color": ("lensColor", "color"),
     "hand_orientation": ("handOrientation",),
-    "number_of_items": ("count", "numberOfPieces"),
-    "item_package_quantity": ("count", "numberOfPieces"),
-    "unit_count": ("count",),
+    # ⚠ 件数一族要带上 multipackQuantity / pieceCount(2026-08-17 审查补):
+    # 全仓此前一个都不出现,而这两个名字在礼品袋/文具这类 PT 的枚举里很常见
+    # (旧仓 excel_io.py:71-72 就映 multipackQuantity);只收这两个名字的 PT
+    # 会整个维度丢失,而且看起来只是"没映上"
+    "number_of_items": ("count", "numberOfPieces", "multipackQuantity",
+                        "pieceCount", "countPerPack"),
+    "item_package_quantity": ("count", "numberOfPieces", "multipackQuantity",
+                              "pieceCount", "countPerPack"),
+    "unit_count": ("count", "multipackQuantity", "pieceCount"),
     "set_name": ("style", "styleName"),
     "platform_for_display": ("platform",),
     "item_display_weight": ("weight",),
 }
 
 _ASIN_SPLIT = re.compile(r"[,\s|]+")
+
+# 亚马逊维度名的后缀噪声:剥掉再驼峰化,拿去和枚举碰一次(旧仓
+# `excel_io._normalize_attr_key` 的退化分支同款)。这是**确定性零成本**的一层,
+# 放在字面表之后、错位重映射(要么查表要么问 LLM)之前 —— 表外的新维度名
+# 若与沃尔玛枚举同名,这一层就接住了,不必花一次 LLM
+_DIM_SUFFIX = ("_name", "_type", "_style", "_group")
+
+
+def _camel(dim: str) -> str:
+    """输入:`size_name` / `age_range` → 输出:`size` / `ageRange`(驼峰,首字母小写)。"""
+    d = str(dim or "").strip().lower()
+    for suf in _DIM_SUFFIX:
+        if d.endswith(suf) and len(d) > len(suf):
+            d = d[: -len(suf)]
+            break
+    parts = [p for p in d.split("_") if p]
+    if not parts:
+        return ""
+    return parts[0] + "".join(p.capitalize() for p in parts[1:])
 
 
 def parse_attrs(raw) -> dict[str, str]:
@@ -103,20 +128,29 @@ def group_id(parent_asin, self_asin: str = "", family=()) -> str | None:
     由 parent_asin 派生 ⇒ 同族成员各自独立计算得到同一个 ID,不必互相查
     ——这是"增量归组自动发生"的全部机制。
 
-    ⚠ **parent_asin 等于自己时改用 min(家族)**(2026-08-17 照旧仓补的护栏)。
-    旧仓设计文档 `variant_groups_design.md` §3.3 记着这个坑:它的采集侧(DMIT)
-    每行的 parent_asin **就是该行自己的 ASIN**,拿它当组 ID 会把同一组 N 个兄弟
-    切成 N 个组,而且不报错 —— 所以旧仓一律用 `min(full_set)`。
-    我们现在的采集侧(twister 版)给的是真族主(生产实见 GustBuster 组:
-    parent=B000AMXQVI,成员是另外三个),所以主路径仍按 parent 派生、ID 更好认;
-    但采集侧哪天改回"填自己",这里必须还能自愈。
-    min(家族) 与 parent 派生一样是**跨兄弟稳定**的:同族每个成员算出的家族集合
-    相同(自己 ∪ variation_asins),min 自然相同。
+    ⚠ **parent_asin 落在家族内时改用 min(家族)**(2026-08-17 照旧仓补,
+    当日审查又收紧了一次)。旧仓设计文档 `variant_groups_design.md` §3.3 记着
+    这个坑:它的采集侧(DMIT)每行的 parent_asin **就是该行自己的 ASIN**,拿它
+    当组 ID 会把同一组 N 个兄弟切成 N 个组,而且不报错 —— 所以旧仓一律用
+    `min(full_set)`。
+
+    判据是 **`p in 家族`,不是 `p == 自己`**。写成后者时"部分行 parent 填自己、
+    部分行 parent 填某个兄弟"的**混合形态**会裂:填自己的那行走 min(家族),
+    填兄弟的那行走 parent,两个不同的 ID(审查实测:同一家族三行算出两个组)。
+    落在家族内一律 min(家族) 后,三种形态都稳:
+      · parent 是真族主(不在家族里,我们采集侧的生产实见形态)→ 按 parent 派生,
+        ID 更好认,且每个成员算出的都是同一个;
+      · parent 全填自己(旧仓 DMIT 形态)→ min(家族);
+      · 混合 → min(家族)。
+    min(家族) 的稳定性来自:同族每个成员算出的家族集合相同(自己 ∪
+    variation_asins),min 自然相同。
+
+    ⚠ **不要改成 `min(家族 ∪ {parent})`**:parent 列脏(部分行空)时它照样会裂。
     """
     p = str(parent_asin or "").strip().upper()
     fam = [str(a).strip().upper() for a in (family or ()) if str(a).strip()]
     me = str(self_asin or "").strip().upper()
-    if fam and len(fam) > 1 and (not p or p == me):
+    if fam and len(fam) > 1 and (not p or p in set(fam)):
         p = min(fam)
     p = p or me
     return f"{_GROUP_PREFIX}{p}" if p else None
@@ -145,7 +179,13 @@ def pick_walmart_dims(amazon_dims, enum) -> list[tuple[str, str]]:
         return []
     pairs: dict[str, str] = {}          # 沃尔玛属性名 → 亚马逊维度名(先到先得)
     for dim in amazon_dims or ():
-        for cand in _DIM_MAP.get(str(dim), ()):
+        # 字面表优先(人工策展),表里没有或都不在枚举内时退一步试驼峰归一
+        # ——`_DIM_MAP` 是闭表,表外的新维度名以前会直接静默丢弃
+        cands = list(_DIM_MAP.get(str(dim), ()))
+        cam = _camel(dim)
+        if cam and cam not in cands:
+            cands.append(cam)
+        for cand in cands:
             if cand in allowed and cand not in pairs:
                 pairs[cand] = str(dim)
                 break                   # 一个亚马逊维度只认领一个沃尔玛属性
@@ -188,6 +228,9 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
         or group_id(parent_asin, asin, family)
     out = {"mode": "single", "code": "", "reason": "", "group_id": gid,
            "attr_pairs": [], "unmapped_dims": [],
+           # 存下来给接线侧用:`no_dim` 被错位重映射救回来时要重算 is_primary,
+           # 那时已经拿不到这个入参了(2026-08-17 审查发现)
+           "family_has_primary": bool(family_has_primary),
            "family_size": len(family), "is_primary": False}
     if not attrs:
         out.update(code="no_attrs", reason="无变体维度取值")
@@ -199,7 +242,13 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
         return out
     pairs = pick_walmart_dims(list(attrs), enum)
     if not pairs:
-        out.update(code="no_dim", reason=f"PT 枚举映不上亚马逊维度 {sorted(attrs)}")
+        # ⚠ `unmapped_dims` **也要填**(2026-08-17 修):一个都没映上时,这些维度
+        # 正是错位重映射(services/variant_remap)存在的**唯一场景** ——
+        # 旧仓原始案例 Art Sets 的 `color_name=48 Color` 其实是件数,该映
+        # pieceCount。首版这里留空,于是接线侧按 `unmapped_dims` 入组的那段
+        # 永远收不到它们,刚补迁的整条重映射链对主场景一次都不会被调用。
+        out.update(code="no_dim", unmapped_dims=sorted(attrs),
+                   reason=f"PT 枚举映不上亚马逊维度 {sorted(attrs)}")
         return out
     if not gid:
         out.update(code="no_group_id", reason="无 parent_asin,凑不出稳定组 ID")

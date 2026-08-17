@@ -230,3 +230,59 @@ def test_admission_gaps_get_their_own_paste_ready_csv(monkeypatch, tmp_path):
         "Walmart Category,Walmart PTG,Walmart Product Type,准入状态,中国卖家可做")
     # Category/PTG 给建议(同路径兄弟的,有依据);准入两列**只能人判**,留空
     assert "Automotive,Brakes,Disc Brake Calipers,,,2,同路径 Automotive Brakes" in text
+
+
+def test_deprecated_pts_get_a_delete_list_aimed_at_feishu(monkeypatch, tmp_path):
+    """所有者定稿 2026-08-17:「已废弃的应该删除」。
+
+    ⚠ 但删要在**飞书**删:`walmart_pt_meta` 是那张表的镜像,risk_sync 全量
+    重灌,库里删掉下次同步就回来 —— 不说清的话人会去库里删然后以为删干净了。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [
+            ("Retired PT", "Home", "Old Stuff", "普通商品", "是")],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [("Retired PT", 3)],
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        "SELECT DISTINCT ON (d.walmart_product_type)": []}))
+    monkeypatch.setattr(pc.pt_spec, "known_pts", lambda: {"Something Else"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+    out = pc.run({})
+    assert "官方 spec 里已经没有" in out
+    assert "去飞书" in out and "库里删没用" in out
+    text = (tmp_path / "pt_待删准入明细.csv").read_text(encoding="utf-8-sig")
+    assert "Home,Old Stuff,Retired PT,3,官方 MP_ITEM spec 里已无此 PT" in text
+    assert "risk_sync" in out          # 删完怎么同步
+
+
+def test_spec_is_probed_for_category_instead_of_asserting(monkeypatch, tmp_path):
+    """所有者直接问:「是 spec 里本来就没有还是我们没去补」——**拿证据回答**。
+
+    不去读一遍就断言"spec 里没有",那是猜。真读 spec 文件,报它的顶层键。
+    """
+    monkeypatch.setattr(pc.db, "pg_conn", lambda: _Conn({
+        "FROM audit.walmart_pt_meta": [],
+        "FROM audit.walmart_pt_spec": [],
+        "FROM audit.walmart_category_map": [("Disc Brake Calipers", 2)],
+        "LEFT JOIN audit.walmart_pt_meta dm": [],
+        "SELECT DISTINCT ON (d.walmart_product_type)": []}))
+    monkeypatch.setattr(pc.pt_spec, "known_pts", lambda: {"Disc Brake Calipers"})
+    monkeypatch.setattr(pc.paths, "reports_dir", lambda: tmp_path)
+
+    # ① spec 里确实没有类目字段 → 结论是"我们没补"
+    monkeypatch.setattr(pc.pt_spec, "load_pt",
+                        lambda pt: {"properties": {}, "required": [], "$schema": ""})
+    out = pc.run({})
+    assert "**spec 里没有**" in out and "我们没补" in out
+    assert "properties" in out          # 亮出顶层键当证据
+
+    # ② 万一 spec 真带类目字段 → 结论反过来,别嘴硬
+    monkeypatch.setattr(pc.pt_spec, "load_pt",
+                        lambda pt: {"category": "Automotive", "properties": {}})
+    assert "**spec 里有类目字段**" in pc.run({})
+
+
+def test_probe_survives_a_missing_spec_file(monkeypatch):
+    monkeypatch.setattr(pc.pt_spec, "load_pt",
+                        lambda pt: (_ for _ in ()).throw(OSError("no file")))
+    assert pc.probe_spec_category("X") == (False, [])

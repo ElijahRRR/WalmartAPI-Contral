@@ -141,6 +141,32 @@ def _suggest(dead: list[str], spec: set) -> dict[str, tuple[str, float]]:
     return out
 
 
+# spec 文件里可能带类目层级的键(不同版本命名不一,全试一遍)。
+# 所有者 2026-08-17 直接问:「是 spec 里本来就没有还是我们没去补」——
+# 这个问题要**拿证据回答**,不能靠我断言,所以真去 spec 文件里找一遍
+_CAT_KEYS = ("category", "categoryName", "walmartCategory", "department",
+             "departmentName", "productTypeGroup", "ptg", "taxonomy",
+             "categoryPath", "vertical")
+
+
+def probe_spec_category(pt: str) -> tuple[bool, list[str]]:
+    """输入:PT 名 → 输出:(spec 里有没有类目字段, spec 的顶层键)。
+
+    MP_ITEM spec 是**上架 feed 的字段 schema**(哪些字段、必填与否、取值域),
+    类目层级(Walmart Category / PTG)是分类学元数据,通常不在里面 ——
+    但"通常"不是证据,所以真读一遍再说。
+    """
+    try:
+        spec = pt_spec.load_pt(pt)
+    except Exception:                                    # noqa: BLE001
+        return False, []
+    if not isinstance(spec, dict):
+        return False, []
+    keys = sorted(spec.keys())[:12]
+    low = {k.lower() for k in spec}
+    return any(c.lower() in low for c in _CAT_KEYS), keys
+
+
 def _verdict(in_spec: bool, in_meta: bool, in_tmpl: bool, n_map: int) -> str:
     if not in_spec and not in_meta and not in_tmpl:
         return "瞎猜"                      # 映射在用但三处都不存在
@@ -260,6 +286,43 @@ def run(params: dict) -> str:
                                 r["映射条数"],
                                 r["建议依据"] or "同路径无兄弟,Category 待人填"])
             lines.append(f"    → 待补清单 {p}(准入两列留空,填完粘回飞书)")
+        # 所有者的原话问题:「是 spec 里本来就没有还是我们没去补」——拿证据答
+        has_cat, keys = probe_spec_category(miss[0]["walmart_product_type"])
+        lines.append(
+            f"  ❓「Category/PTG 是 spec 里没有还是我们没补」:"
+            + (f"**spec 里有类目字段**,可以自动补,回来说一声"
+               if has_cat else
+               f"**spec 里没有** —— 它是上架 feed 的字段 schema"
+               f"(顶层键:{'/'.join(keys[:6]) or '读不到'}),"
+               f"类目层级是分类学元数据不在里面。所以是**我们没补**:"
+               f"这两列一直由飞书那张表人工维护,补进去就有了"))
+
+    dep = [r for r in rows if r["判定"] == "已废弃?"]
+    if dep:
+        # 准入明细收了 spec 里不存在的 PT。⚠ 删要在**飞书**删:
+        # walmart_pt_meta 是飞书那张表的镜像,risk_sync 全量重灌,
+        # 库里删掉下次同步又回来
+        lines.append("")
+        lines.append(f"⚠ **准入明细里有 {len(dep)} 个 PT 官方 spec 里已经没有**"
+                     f"(沃尔玛下架了该 PT)—— 留着会让映射/审核指向一个上架必失败"
+                     f"的类目。处置:**去飞书「沃尔玛类目准入明细」删这些行**"
+                     f"(库里删没用,walmart_pt_meta 是它的镜像,同步就回来)")
+        lines += [f"    {r['walmart_product_type']}(映射 {r['映射条数']} 条)"
+                  for r in sorted(dep, key=lambda r: -r["映射条数"])[:15]]
+        if export:
+            paths.reports_dir().mkdir(parents=True, exist_ok=True)
+            p2 = paths.reports_dir() / "pt_待删准入明细.csv"
+            with open(p2, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Walmart Category", "Walmart PTG",
+                            "Walmart Product Type", "映射条数", "删除理由"])
+                for r in sorted(dep, key=lambda r: -r["映射条数"]):
+                    w.writerow([r["walmart_category"], r["walmart_ptg"],
+                                r["walmart_product_type"], r["映射条数"],
+                                "官方 MP_ITEM spec 里已无此 PT"])
+            lines.append(f"    → 待删清单 {p2}(按 PT 名在飞书表里找到并删行)")
+            lines.append(f"    删完跑 `python cli.py risk_sync` 同步,"
+                         f"再跑 `catmap_prune` 清掉指向它们的映射")
 
     old = [r for r in rows if r["判定"] == "旧行没清"]
     if old:

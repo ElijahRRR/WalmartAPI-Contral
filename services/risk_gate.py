@@ -44,6 +44,65 @@ def sync_product_types(conn, rows: list[dict]) -> int:
     return len(rows)
 
 
+def _int_or_none(v):
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+# 允许的缩量比例:飞书表删几行是常态,删掉一半必是读漏/读错
+_PT_META_SHRINK_TOLERANCE = 0.2
+
+
+def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int]:
+    """输入:连接 + 类目表行(同 sync_product_types 的那份)→ 输出:(入库数, 净减数)。
+
+    ⚠ **全量重灌,不是 upsert** —— 这正是所有者 2026-08-17 撞上的坑:
+    「飞书表格里面的已废弃我已经删掉了。但是重新拉以后还是存在」。
+    upsert 只增改不删,飞书删掉的行在库里永远留着。
+
+    `audit.walmart_pt_meta` 是审核 R1 准入闸 / R3 认证闸**唯一**查的表,
+    此前它是批次 A 一次性迁入的**死快照,没有任何同步链** —— 而同一张飞书表
+    早就被 risk_sync 读着灌 `catalog.risk_product_types` 了。同一份数据两个
+    消费方,只同步了一个,于是飞书增删对审核毫无影响。
+
+    列一一对应(飞书 10 列 → pt_meta):category/ptg/product_type/admit_status/
+    cn_seller/cert_required/note/field_total/field_required/field_list。
+    `zh_seller_forbidden` 与 `raw` 两列表里没有、全仓也无人读(只在注释里被提到),
+    重灌不保。
+
+    骤缩护栏:比库里现有行数少超 20% 就拒绝重灌 —— 飞书表删几行是常态,
+    删掉一半必是读漏/读错(与 `risk_sync._mirror` 同款纪律)。
+    """
+    rows = [r for r in rows if r.get("product_type")]
+    if not rows:
+        raise ValueError("类目表读到 0 行,拒绝重灌 walmart_pt_meta"
+                         "(那是审核两道闸唯一查的表,清空 = 全部静默放行)")
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM audit.walmart_pt_meta")
+        before = int(cur.fetchone()[0])
+        if before and len(rows) < before * (1 - _PT_META_SHRINK_TOLERANCE):
+            raise ValueError(
+                f"类目表只读到 {len(rows)} 行,库里现有 {before} 行,"
+                f"少了 {before - len(rows)} 行(超 "
+                f"{_PT_META_SHRINK_TOLERANCE:.0%})——拒绝重灌,先核实飞书表")
+        cur.execute("TRUNCATE audit.walmart_pt_meta")
+        cur.executemany(
+            "INSERT INTO audit.walmart_pt_meta "
+            "(walmart_product_type, walmart_category, walmart_ptg, "
+            " access_state, zh_can_do, requirements, notes, "
+            " total_fields, required_count, required_fields, synced_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())",
+            [(r["product_type"], r.get("category"), r.get("ptg"),
+              r.get("admit_status"), r.get("cn_seller"),
+              r.get("cert_required"), r.get("note"),
+              _int_or_none(r.get("field_total")),
+              _int_or_none(r.get("field_required")),
+              r.get("field_list")) for r in rows])
+    return len(rows), max(0, before - len(rows))
+
+
 def sync_brands(conn, rows: list[dict]) -> int:
     """输入:连接 + 品牌表行({brand, source, added_date, sku})→ 输出:upsert 数。
 

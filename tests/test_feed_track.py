@@ -295,3 +295,49 @@ def test_prohibited_receipt_flows_into_blacklist(monkeypatch):
     assert got[0]["category"] == "B"
     assert "61020366035308" in got[0]["reasons"]
     assert "General Prohibited" in got[0]["reasons"]
+
+
+def test_poll_all_is_cross_store_concurrent_and_in_store_serial(monkeypatch):
+    """跨店并发、店内串行;摘要按店铺序排,不按完成先后。
+
+    所有者定稿 2026-08-17。盯三件事:
+      ① **跨店真并发**:三家店的 poll_feed 必须能同时在飞(Barrier 会合)。
+      ② **店内仍串行**:同一店的两个 feed 不许并发 —— 沃尔玛配额按
+         `(store, endpoint)` 计,店内并发只会让自己排队等退避。
+      ③ **顺序确定**:让 A085 最慢、谭总2 最快,摘要仍须按 sort_key 排
+         (A085 → 81张三 → 谭总2)。query_pending 没有 ORDER BY,原来那份
+         顺序是 PG 堆序,本来就不稳定,并发之后更要显式定序。
+    """
+    import threading
+
+    stores = ["谭总2", "A085", "81张三"]
+    monkeypatch.setattr(feeds, "query_pending", lambda store_name=None: [
+        {"status": "submitted", "feed_id": f"F{s}{i}", "store": s,
+         "feed_type": "DELETE_ITEM", "workflow": "", "created_at": "t"}
+        for s in stores for i in (1, 2)])
+
+    gate = threading.Barrier(3, timeout=5)     # 三家店会合 = 真的同时在飞
+    lock = threading.Lock()
+    in_store: dict[str, int] = {}
+    peak_in_store = {"v": 0}
+
+    def fake_poll(store, fid):
+        name = store["name"]
+        with lock:
+            in_store[name] = in_store.get(name, 0) + 1
+            peak_in_store["v"] = max(peak_in_store["v"], in_store[name])
+        if fid.endswith("1"):
+            gate.wait()                        # 每店第一个 feed 上会合
+        with lock:
+            in_store[name] -= 1
+        return {"feedStatus": "PROCESSED"}, {"A": ("success", "")}
+
+    monkeypatch.setattr(feed_track, "poll_feed", fake_poll)
+    out = feed_track.poll_all({s: {"name": s} for s in stores})
+
+    assert gate.n_waiting == 0 and not gate.broken, "三家店没能同时在飞"
+    assert peak_in_store["v"] == 1, "同一个店内并发了,配额桶会自己挤自己"
+    assert "落定 6" in out
+    got = [l.split(" ")[2] for l in out.splitlines() if "已落定" in l]
+    # 每店两个 feed:店序按 sort_key,店内两行相邻(不与别店交织)
+    assert got == ["A085", "A085", "81张三", "81张三", "谭总2", "谭总2"], got

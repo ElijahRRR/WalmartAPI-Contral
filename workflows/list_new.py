@@ -952,11 +952,20 @@ def run(params: dict) -> str:
     # 于是 dry-run 说的就是真跑要发的(同一份对象,不可能漂)。
     _plan_variants(ready, n_var)
 
-    gate_line = (f"闸门:非ACTIVE店 {n['inactive']},超配额 {n['quota']},"
-                 f"PT无spec {n['no_spec']},风控拦截 {n['risk']},"
-                 f"去重 {n['dedup']},黑名单 {n['blacklist']},"
-                 f"待数据源 {n['no_data']},数据过滤 {n['filtered']},"
-                 f"配送超时 {n['lead_days']}")
+    # 闸门行:**只报真的拦到了的**(排版规范 services/notify_fmt 规矩 2)。
+    # 2026-08-17 之前是九个计数不管零不零全打印,于是每天那一行都长这样:
+    #   闸门:非ACTIVE店 0,超配额 0,PT无spec 0,风控拦截 0,去重 1,黑名单 0,
+    #   待数据源 0,数据过滤 1,配送超时 0
+    # 真正发生的只有两项,剩下七个 0 是噪声 —— 而噪声多了人就不看了。
+    # ⚠ 抑制的判据是**恰好 0**,不是"看着不重要":1 也要报(本仓最怕静默)。
+    blocked = [(label, n[key]) for key, label in (
+        ("inactive", "非 ACTIVE 店"), ("quota", "超配额"),
+        ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
+        ("dedup", "全局去重"), ("blacklist", "黑名单"),
+        ("no_data", "待数据源"), ("filtered", "数据过滤"),
+        ("lead_days", "配送超时")) if n[key]]
+    gate_line = ("闸门:" + ",".join(f"{lab} {v}" for lab, v in blocked)
+                 if blocked else "闸门:一条都没拦")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"

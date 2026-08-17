@@ -21,10 +21,17 @@ runner = 谁来按这个点触发(所有者定稿 2026-08-16,**推翻了 v5 的"
   同一把 flock 锁,同一份 ops.runs 记录。所以两边**永远不许同时挂同一条链**
   —— 撞上了后到的那条退 3 空跑一轮,而且报"成功"。
 
-不在表里的一律**手动**:上架链(list_new / match_listing)、分配链
-(alloc_* / claim_audit / alloc_backfill)、审核(product_audit)、
-补采(scrape_missing / brand_scrape)、自愈(sku_locked_heal)、
-一次性迁移与体检(各 *_import / catmap_* / catalog_health / …)。
+不在表里的一律**手动**:跟卖(match_listing)、分配链
+(alloc_* / claim_audit / alloc_backfill)、补采(scrape_missing / brand_scrape)、
+自愈(sku_locked_heal)、一次性迁移与体检
+(各 *_import / catmap_* / catalog_health / variant_probe / audit_why / …)。
+⚠ **审核与上架 2026-08-17 起进表**(所有者定稿):`audit_sheet` 18:10、
+`list_new` 20:00。此前它们在这份"手动"清单里,是因为上架域还没做生产验收;
+验收通过(变体组三条真发上去了)之后排进调度。`match_listing`(跟卖)仍手动
+—— 它的对拍还没做完,头注里那条"对拍未完成前只许 --dry-run"仍有效。
+
+**当天的次序是硬约束**(谁提前谁就是拿昨天的数据做今天的判断,而且不报错):
+  product_chain 13:00 → blacklist 15:00 → audit_sheet 18:10 → list_new 20:00
 """
 
 _REPO = "/Users/nextderboy/Projects/WalmartAPI-Contral"
@@ -68,9 +75,12 @@ JOBS = (
     # ── 批一:只读 / 低危 ────────────────────────────────────────────────
     job("backup", ["backup"], batch=1, hour=2, minute=0, runner="gpt",
         note="pg_dump,离峰;⚠ PATH 里要有 pg_dump"),
-    job("blacklist", ["risk_sync", "blacklist_push"], batch=1, hour=2, minute=30,
+    job("blacklist", ["risk_sync", "blacklist_push"], batch=1, hour=15, minute=0,
         runner="gpt",
-        note="黑名单双向同步,排在当天所有上架/审核之前"),
+        note="黑名单双向同步。**必须排在 product_chain 之后、审核/上架之前**"
+             "(所有者定稿 2026-08-17):problem_scan 当天产出的黑名单 ASIN 与"
+             "品牌要立刻投影出去,而审核 Phase0 与上架闸读的是 PG,"
+             "同步没跑就是拿昨天的黑名单在放行"),
     job("feed_poll", ["feed_poll"], batch=1, minute=[0, 30],
         note="每 30 分;feed 落定后越早反哺,飞书上的「处理中」越少"),
 
@@ -102,10 +112,31 @@ JOBS = (
         ["catalog_sync", "product_refresh", "product_ingest",
          "maintenance_scan", "maintenance",
          "problem_scan", "problem_product_cleanup"],
-        batch=3, hour=9, minute=0, runner="gpt",
+        batch=3, hour=13, minute=0, runner="gpt",
         params=["product_refresh:wait=1"],
-        note="整条 ~2 小时;前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)"),
+        note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
+             "(拿隔夜现值当判据会误伤)"),
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),
+
+    # ── 批三·上架域(所有者定稿 2026-08-17 排进调度)────────────────────
+    # 当天的次序是硬的:product_chain(13:00,problem_scan 产黑名单)
+    #   → blacklist(15:00,把它投影出去、并把飞书侧改动收回 PG)
+    #   → audit_sheet(18:10,Phase0 与准入闸读的就是那份 PG 黑名单)
+    #   → list_new(20:00,闸门读 PG 的审核结论)
+    # 谁提前谁就是在拿昨天的数据做今天的判断,而且**不报错**。
+    job("audit_sheet", ["product_audit"], batch=3, hour=18, minute=10,
+        runner="gpt", params=["from_sheet=1"],
+        note="审上架表里 E 列为空的行 + 把库里已有结论投影回 C~G。"
+             "⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,"
+             "只有未审/pending 过退避的才真判;缺省 limit=500,"
+             "存量大时改调度表加 -p limit=N,别在提示词里手改"),
+    job("list_new", ["list_new"], batch=3, hour=20, minute=0, runner="gpt",
+        note="⚠⚠ **开这条之前必须先停旧上架栈**:com.user.autolisting.morning"
+             "(06:00,链末尾就是无人值守上架)+ com.nextderboy.erp_worker×20"
+             "(常驻,长轮询跑上架)+ dedup 链(每时:05 与 14:02)。"
+             "不停就是新旧两套同时对上架表双写、同时消耗 UPC —— 安全铁律"
+             "「新旧系统严禁对同一破坏性任务并跑」直接踩上。"
+             "停旧顺序见 docs/legacy_schedules.md §D"),
 )

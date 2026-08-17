@@ -1918,7 +1918,7 @@ macOS launchd 4 条（auto_listing/launchd/*.plist，WorkingDirectory=/Users/nex
 - 飞书各业务表当前内容（上架表 26 列 / 在线产品总表 20 列 / 下架表 C-E 列 feedid 与是否删除 / 维护记录_YYYY-MM-DD 系列 sheet / 绩效问题订单永久累积表）
 - ERP listing server 的 dedup cache 内容（可由新系统重建，但切换窗口内必须保证非空，否则 worker 去重失效会重复上架）
 - notify.py 的 /tmp/erp_skill_notify/*.json 标记（无需迁移，但切换时应清空，避免残留标记算出荒谬耗时）
-- 调度注册本身：14 条 skill 的 cron 只存在于外部平台（hermes）配置里、6 个 launchd plist 只存在于 ~/Library/LaunchAgents/，仓库里没有权威清单——切换前必须先在机器上 `launchctl list` + 导出平台任务列表，否则会漏停旧调度
+- 调度注册本身：14 条 skill 的 cron 只存在于外部平台（**GPT / Codex 的定时任务**，所有者 2026-08-17 纠正；旧 README 写的 hermes 已过时）配置里、6 个 launchd plist 只存在于 ~/Library/LaunchAgents/，仓库里没有权威清单——切换前必须先在机器上 `launchctl list` + 导出平台任务列表，否则会漏停旧调度
 
 ### 迁移建议
 
@@ -1948,14 +1948,14 @@ macOS launchd 4 条（auto_listing/launchd/*.plist，WorkingDirectory=/Users/nex
 - split_xlsx_by_store.py 的 INPUT_HEADERS_COUNT=47 / COL_STORE=44 与 auto_listing/excel_io.py 手工对齐 —— 新仓所有列定义进 registry，杜绝这种双份魔数。
 
 【迁移顺序建议】
-1. 先做调度盘点：`launchctl list | grep -E 'autolisting|order_audit|erp_worker'` + 导出外部平台（hermes）的 14 条任务，形成权威清单——仓库里没有，必须在机器上取。
+1. 先做调度盘点：`launchctl list | grep -E 'autolisting|order_audit|erp_worker'` + 导出外部平台（**GPT / Codex**，不是 hermes）的 14 条任务，形成权威清单——仓库里没有，必须在机器上取。
 2. 特别确认 com.user.autolisting.morning 是否仍 loaded；若是，它 06:00 在自动上架，与「上架已改手动」的文档矛盾，是最大的未知破坏源，优先停或确认。
 3. 按铁律「停旧调度 → 搬状态 → 起新调度」逐条切；破坏性工作流（DELETE_ITEM / RETIRE_ITEM / 改价改库存 / 上架）必须完成 dry-run 人眼确认后才 --execute，且严禁与旧调度并跑。
 4. 建议切换顺序（从只读到破坏性）：returns 同步 → KPI/日报 → 在线产品总表同步 → 订单同步 → reconcile/状态跟踪 → 商品维护 → 批量下架 → 问题商品清理。TRO/商标/黑名单三条链跑在另外两个仓（tro-scraper-matrix、商标数据、新审核系统），本次迁移是否纳入需要先定边界。
 
 ### 待确认问题
 
-- 14 条 skill 的真实 cron 到底注册在哪个平台？README 只说「与 2026-06-17 hermes 现状对齐」，仓库里没有任何平台配置文件。必须在机器上导出权威清单，否则切换时一定漏停旧调度。
+- ~~14 条 skill 的真实 cron 到底注册在哪个平台？~~ **已答(所有者 2026-08-17):注册在 GPT / Codex 的定时任务里,不是 hermes**（旧仓 README 那句「与 2026-06-17 hermes 现状对齐」已过时）。仍需在机器上导出那份任务列表当权威清单——仓库里没有。⚠ 新系统 `runner="gpt"` 的七条任务**注册在同一个平台**，停旧与起新在同一个列表里操作，纪律见 `docs/legacy_schedules.md` 文首。
 - com.user.autolisting.morning（06:00 full_morning，链末尾是 auto_listing.main 上架）是否仍 loaded？若是，则每天 06:00 有无人值守的 MP_ITEM feed 提交 + UPC 消耗，与 erp-online-products-track/SKILL.md:54,164「上架已移除、由用户手动触发」直接矛盾。这是本次盘点发现的最大风险点，需实机 launchctl list 确认。
 - 沃尔玛问题商品清理 daily_cleanup（每 6h，含 DELETE_ITEM）的调度器在哪？docs/feishu_cutover_checklist.md:54 明确说「不在本仓 launchd/，先 launchctl list | grep 定位」。既不在 skill 的 launchd 列表也不在 auto_listing/launchd/。
 - 订单同步的 launchd 每小时 :15 与 skill 13:30 是有意保留的双保险，还是 skill 化之后忘了停 launchd？需要产品侧确认保留哪一条。

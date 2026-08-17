@@ -1,28 +1,20 @@
-# 沃尔玛定时任务:product_chain(每天 13:00,台北时间)
+# 沃尔玛定时任务:audit_sheet(每天 18:10,台北时间)
 
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py product_audit -p from_sheet=1
 ```
 
-这条链跑的是:catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup。
+这条链跑的是:product_audit。
 
 ## 这条链在做什么
 
 | 步 | 工作流 | 这一步干什么 |
 |---|---|---|
-| 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
-| 2 | `product_refresh` | 在线产品全量重推采集(维护链的数据新鲜度源头)。 |
-| 3 | `product_ingest` | 采集服务增量 → 产品中心(catalog.products / snapshots)。 |
-| 4 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
-| 5 | `maintenance` | 商品维护执行件(批次四拆分后;危险,缺省即真跑)。 |
-| 6 | `problem_scan` | 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。 |
-| 7 | `problem_product_cleanup` | 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。 |
+| 1 | `product_audit` | 产品审核主流程(批次 C:全链含 LLM 层;危险,缺省即真跑)。 |
 
-**顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
-
-备注:整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)
+备注:审上架表里 E 列为空的行 + 把库里已有结论投影回 C~G。⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;缺省 limit=500,存量大时改调度表加 -p limit=N,别在提示词里手改
 
 ## 跑完怎么判
 

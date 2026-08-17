@@ -102,8 +102,11 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
 
     out = ln.run({"execute": False})
     assert "待上架 7" in out    # 9 行中 K=Yes 不领,SKU_LOCKED 归自愈链不归本链
-    assert "非ACTIVE店 1" in out and "风控拦截 1" in out
-    assert "去重 1" in out and "PT无spec 1" in out
+    # 2026-08-17 起闸门行**只报真拦到的**(零值不打印,排版规范规矩 2),
+    # 标签也加了空格更好读 —— 这里跟着改,顺便断言那些 0 确实不出现
+    assert "非 ACTIVE 店 1" in out and "风控拦截 1" in out
+    assert "配送超时 0" not in out and "黑名单 0" not in out
+    assert "全局去重 1" in out and "PT 无 spec 1" in out
     assert "黑名单 1" in out and "待数据源 2" in out
     # 黑名单理由带来源与类别(收集侧建好,拦截侧在此接通)
     assert any("ASIN黑名单:沃尔玛-知产(E类)" in why for _, why in

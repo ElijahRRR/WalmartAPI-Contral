@@ -180,7 +180,7 @@ WHERE order_date >= now() - make_interval(days => %(days)s)
 # 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷)。
 # 标题在身份层(products),两层 JOIN 才拿得到——商品一致性要用它。
 _SNAP_SQL = """
-SELECT s.asin, s.price, s.stock_count, s.delivery_days,
+SELECT s.asin, s.price, s.stock_count, s.stock_state, s.delivery_days,
        s.shipping, s.shipping_raw, s.buybox,
        s.scrape_params, s.raw, s.outcome, s.scraped_at, p.title
 FROM catalog.latest_snapshot s

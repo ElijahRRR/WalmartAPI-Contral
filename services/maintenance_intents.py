@@ -205,11 +205,8 @@ def processed_title(slow) -> str:
     ).get("productName") or ""
 
 
-# 亚马逊在架状态原文 → 处置(采集侧 raw.stock_status,原文匹配不做模糊)
-_STOCK_STATUS_ZERO = {
-    "currently unavailable": ("unavailable", "Currently unavailable"),
-    "no featured offer": ("no_buybox", "No Featured Offer"),
-}
+# 无货三档的映射搬去 `order_audit.stock_block`(维护链与审核链的唯一出处);
+# 本模块已经 import order_audit,方向不变。
 
 # 动作优先级:删除 > 库存 > 标题。一个 SKU 一轮只出一个动作 ——
 # 既建议删除又建议改标题的话,执行件会先花配额改一个马上要删的商品。
@@ -242,11 +239,12 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     if title_similarity is not None and title_similarity < TITLE_SIM_FLOOR:
         return ("delete", "title_mismatch",
                 f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
-    hit = _STOCK_STATUS_ZERO.get(str(stock_status or "").strip().lower())
+    # 无货三档的判据是**审核链共用的**(order_audit.stock_block 是唯一出处):
+    # 维护链据此把库存写 0,审核链据此报「无货」而不是「采集缺字段」。
+    # 各写一份的下场是同一个商品两条链说两种话,而且两边都不报错。
+    hit = order_audit.stock_block(stock_status, stock_state)
     if hit:
         return ("inventory", hit[0], hit[1])
-    if str(stock_state or "").strip().lower() == "out_of_stock":
-        return ("inventory", "out_of_stock", "亚马逊缺货")
     if over_lead:
         return ("inventory", "lead_days", lead_note or "配送时长超本店上限")
     return (None, "", "")

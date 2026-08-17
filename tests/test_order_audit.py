@@ -1682,3 +1682,53 @@ def test_wait_skipped_when_nothing_was_pushed(wired, monkeypatch):
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _needs_scrape_conn())
     wf.run({"scrape": "0"})
     assert calls["waited"] == [] and calls["ingested"] == 0
+
+
+# ── 无货三档:采到了页面,但没有可买的报价(所有者 2026-08-17)────────────────
+
+def test_out_of_stock_says_out_of_stock_not_missing_fields(monkeypatch):
+    """`Currently unavailable` 缺单价/货期 ⇒ 理由是**无货**,不是「采集缺字段」。
+
+    所有者 2026-08-17 实遇:审核报「采集缺字段:亚马逊单价、配送时长,已排重采」,
+    人去查那个产品,标题什么都拿得到,只是 Currently unavailable —— 那句话把人
+    指向采集器,而采集器什么都没做错。没有可买的报价时单价与货期本来就不存在。
+    """
+    snap = _snap(amz_price=None, ship_days=None)
+    snap["stock_status"] = "Currently unavailable"
+    res = rules.judge(LINE, snap, SUPPLIERS, set())
+    assert res.status == rules.MANUAL
+    assert "不可售" in res.note and "采集缺字段" not in res.note
+    assert res.rescrape                       # 仍排重采:过几小时可能回货
+    assert res.detail["rules"]["stock"]["code"] == "unavailable"
+
+
+def test_no_buybox_and_out_of_stock_have_their_own_reasons():
+    for status, state, code, word in (
+            ("No Featured Offer", None, "no_buybox", "Buy Box"),
+            (None, "out_of_stock", "out_of_stock", "缺货")):
+        snap = _snap(amz_price=None, ship_days=None)
+        snap["stock_status"] = status
+        snap["stock_state"] = state
+        res = rules.judge(LINE, snap, SUPPLIERS, set())
+        assert res.status == rules.MANUAL, (status, state)
+        assert word in res.note and "采集缺字段" not in res.note
+        assert res.detail["rules"]["stock"]["code"] == code
+
+
+def test_genuinely_missing_fields_still_says_so():
+    """有货却缺字段 = 采集真的漏了,原文案保留(别把两种情况混成一句)。"""
+    snap = _snap(amz_price=None, ship_days=None)
+    snap["stock_status"] = "In Stock"
+    res = rules.judge(LINE, snap, SUPPLIERS, set())
+    assert "采集缺字段" in res.note
+
+
+def test_stock_block_is_the_single_source_for_both_chains():
+    """维护链与审核链共用同一份判据 —— 各写一份会让同一个商品两条链说两种话。"""
+    from services import maintenance_intents as mi
+    for status, state, code in (("Currently unavailable", None, "unavailable"),
+                                ("No Featured Offer", None, "no_buybox"),
+                                (None, "out_of_stock", "out_of_stock")):
+        assert rules.stock_block(status, state)[0] == code
+        assert mi.classify(stock_status=status, stock_state=state)[1] == code
+    assert rules.stock_block("In Stock", "in_stock") is None

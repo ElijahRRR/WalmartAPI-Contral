@@ -132,6 +132,10 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 | ✅ | ~~`StoreDeadError` 两处只传一个参数~~(2026-08-17 修:真触发时抛 `TypeError`,不被 `except StoreDeadError` 接住 ⇒ 整轮判失败而非跳过该店,消息里也没有店名和状态码。加了 AST 用例钉住参数个数) | `api/reports.py:160` / `api/returns.py:44` |
 | ⬜ | **`store=` 与 `stores=` 不统一,而 cli 不校验参数名**(所有者 2026-08-17:**记录,先不修**)。全项目只有 `ping_stores` 用复数 `stores=`,其余 17 条用单数 `store=`;参数名打错被静默吞掉 ⇒ `catalog_sync -p stores=A085` **跑全部店**、`ping_stores -p store=A085` **ping 全部店**,都不报错。在「缺省即真跑」下逐条测试尤其容易踩。规避:除 `ping_stores` 外一律 `-p store=`。三档修法(小:ping_stores 兼收单数 / 中:抽共用参数积木 18 处各一行 / 彻底:工作流声明参数名 + cli 层护栏)——彻底那档建议等 #36 落地再做,否则大面积冲突 | `workflows/ping_stores.py:38` vs 其余 17 条;`cli.py` 无未知参数校验 |
 | ⬜ | `catalog_sync` 在**凭证表一家可用店都没有**时 `return "店铺凭证未找到"` 报成功(与上面"零店完成"同一类,但走的是 pool 之前的早退分支,本轮未动) | `workflows/catalog_sync.py:132` |
+| ✅ | ~~`maintenance_scan` 建议只有总览、看不到逐行~~(2026-08-17 修:扫描件 append 店铺/SKU/建议/原因/日期,`maintenance` 就地补齐动作/旧值/新值/feedid,`feed_poll` 落结果/报错) | `services/maint_sheet.py` |
+| ✅ | ~~审核把「无货」报成「采集缺字段」~~(2026-08-17 修:`stock_block` 三档 unavailable/no_buybox/out_of_stock 收成唯一出处,维护链与审核链共用**原因码**、措辞各归各链) | `services/order_audit.py:stock_block` |
+| ⛔ | **`problem_scan` 的逐行建议不投影**(所有者拍板 2026-08-17:**不需要进表,也不需要导出**)。⚠ 它与 `maintenance_scan` 形状相同(同产 `ops.dispositions`、同由危险执行件消费),后者做了飞书投影 —— **两者的差别是所有者的决定,不是遗漏**,别再当缺口提。要看明细直接读 `ops.dispositions`;原「错误商品记录」表 2026-08-11 已拍板裁撤 | `workflows/problem_scan.py` |
+| ⛔ | **`order_audit` 等截图的 180 秒不是 bug**(2026-08-17 核采集器源码):截图行建批次时就为每个 ASIN 预建(`common/pgdb/tasks.py:211`),由**独立子进程**渲染(`worker/engine.py:2345`)——任务完成 ≠ 截图完成,采集侧自己的 `status="completed"` 也要求 `screenshots.open==0`。日志那句「数据已采完」正说明任务信号读对了。唯一白等的情形是任务失败后其截图槽位永久 pending(代码注释已记) | `workflows/order_audit.py:_SHOT_GRACE_SEC` |
 
 ## 六、配置与安全(便宜,但都在裸奔)
 

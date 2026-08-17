@@ -94,6 +94,43 @@ def test_forbidden_category_policy_books():
     assert r.hits[0].detail["walmart_policy"] == "Intellectual Property"
 
 
+# ── B2b 摘掉批次 B 新增的 4 个大类(2026-08-17 裁决 A)──────────────────────
+
+# 所有者验收上架时的真实产品:B0BWMVQHVJ,一包牛皮纸礼品袋,被判
+# 「药品/膳食补充剂 restricted」。判据只是路径**第一段**是 Health & Household
+_GIFT_BAG_PATH = ("Health & Household > Stationery & Gift Wrapping Supplies"
+                  " > Gift Wrapping Supplies > Gift Bags")
+
+
+@pytest.mark.parametrize("path", [
+    _GIFT_BAG_PATH,                                    # 礼品袋(真实误杀)
+    "Health & Household > Household Supplies > Paper & Plastic",
+    "Beauty & Personal Care > Tools & Accessories > Bags & Cases",
+    "Health & Personal Care > Household Supplies",
+    "Grocery & Gourmet Food > Beverages > Coffee",
+])
+def test_removed_tops_no_longer_block(path):
+    """⚠ 这 4 个大类是**筐**不是**品**,Phase0 只看第一段 = 整筐一起拒。
+
+    药品/补剂改由 L2 两道更精准的闸判(R2 按 Walmart PT 名词表、R0 按 Walmart
+    类目)。摘掉是**去重**不是放开——详见 audit_phase0.FORBIDDEN_AMAZON_TOPS
+    下方的注释块与 docs/audit_migration_plan.md 九节补批复。
+    """
+    assert audit_phase0.check(_p(amazon_category_path=path), _ctx()).blocked \
+        is False
+
+
+def test_forbidden_tops_is_exactly_the_legacy_four():
+    """往这张表里加大类 = 把整个筐的杂货一起拒,且停在 L0 连类目都不判。
+
+    这条用例的作用是**让"再加一个"必须先改测试**:改测试时会读到上面那条
+    误杀向量,以及"这筐里每一件都该拒吗"那句提问。首版加了 4 个新大类时
+    一条用例都没动过,所以礼品袋被判药品这件事直到生产验收才被发现。
+    """
+    assert set(audit_phase0.FORBIDDEN_AMAZON_TOPS) == {
+        "Books", "Kindle Store", "Clothing, Shoes & Jewelry", "Automotive"}
+
+
 # ── B3 商标符号 ──────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("title,blocked,brand_phrase", [

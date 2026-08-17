@@ -1,17 +1,19 @@
-"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,默认 dry-run)。
+"""product_audit — 产品审核主流程(批次 C:全链含 LLM 层;危险,缺省即真跑)。
 
-用法:
-  python cli.py product_audit                       # dry-run:判定 + 落 runs/hits,不写结论
-  python cli.py product_audit --execute             # 真跑:另写 products 五列 + 审核事件
+用法(2026-08-16 起**缺省即真跑**,空跑加 `--dry-run`;`--execute` 是兼容别名):
+  python cli.py product_audit                       # 真跑:判定 + 落 runs/hits + 写结论
+  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 五列
   python cli.py product_audit -p limit=2000
-  python cli.py product_audit -p asins=B0A,B0B --execute   # 指定 ASIN(无视现有结论强审)
-  python cli.py product_audit -p mode=backfill --execute   # 补刷:只审无结论,历史结论直接采用
-  python cli.py product_audit -p mode=pending --execute    # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
+  python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
+  python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p rerule=phase0_forbidden_category
+                                                    # 改了某条规则后**定点**重审被它拒过的
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
-  python cli.py product_audit -p from_sheet=1 --execute    # 上架表驱动:审真待审的 + 回填 C~G
-  python cli.py product_audit -p from_sheet=1 -p limit=3000 --execute   # 存量大时加大一轮的量
+  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
+  python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
 
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
@@ -150,7 +152,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun",
+_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
                  "l3", "l4", "workers", "adopt_only", "from_sheet"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
@@ -196,6 +198,27 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
+    rule = str(params.get("rerule", "")).strip()
+    if rule:
+        # 按**规则码**定点重审(2026-08-17 加):改了一条规则之后,要动的只有
+        # "被这条规则拒过"的那批。此前唯一的批量通道是 force_rerun=<版本>,
+        # 而版本一递增库里没有一条是新版本 ⇒ **全量**十几万条重审,为了几千条
+        # 误杀烧掉全库的 LLM 钱。触发场景:裁决 A 摘掉 Phase0 四个大类
+        # (礼品袋被判药品),要翻的就是 phase0_forbidden_category 拒过的那批。
+        #
+        # 口径三条,都要:
+        #  · 只认**最近一轮**(DISTINCT ON):早先命中过、后来已重判成别的结论
+        #    的不该再翻出来;
+        #  · 只翻 verdict='reject':同一条规则若在别处只是记了个 hit 没定结论,
+        #    翻它没有意义(而且会把 approved 的产品拖进重判);
+        #  · **不限 audit_status**:要动的正是 rejected 存量(reject 永不自动
+        #    重审,这是唯一的定点通道)。
+        return ("p.asin IN (SELECT l.asin FROM ("
+                "  SELECT DISTINCT ON (asin) asin, run_id, verdict"
+                "  FROM audit.audit_runs ORDER BY asin, created_at DESC) l"
+                "  JOIN audit.audit_hits h ON h.run_id = l.run_id"
+                " WHERE l.verdict = 'reject' AND h.rule_code = %(rerule)s)",
+                {"rerule": rule})
     mode = str(params.get("mode", "")).strip()
     if mode and mode not in _MODES:
         # 与未识别参数同理:静默落回默认 = "补刷跑完了"的假象,宁炸不吞
@@ -209,6 +232,26 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {}
+
+
+def _is_forced(params: dict, extra: dict) -> bool:
+    """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
+
+    只用来决定要不要挂 `_RECENT_RUN_GUARD`(dry-run 复烧护栏)。强审 = 人点名
+    要审的,点了就得审,哪怕 24 小时内刚审过。两种:
+
+    · `asins=` 点名 —— 但 **`from_sheet` 不算**:它也往 extra 塞 asins,走的却是
+      默认候选谓词(E 列为空 ≠ 库里没结论),该吃护栏。
+    · `rerule=` 定点重审 —— 它翻的正是**刚刚被拒**的那批(改规则当天就要验),
+      全在 24 小时内。吃了护栏的话 dry-run 稳定报"0 候选",紧跟着真跑翻出几千
+      条,又是一次"dry-run 说没事、真跑吓一跳"(所有者 2026-08-16 被 from_sheet
+      坑过一次,那次差异在回填行数,这次会差在候选数)。
+
+    代价说清:强审下重复 dry-run 会重复烧 LLM —— 这是点名的固有代价,不是 bug。
+    """
+    if str(params.get("rerule", "")).strip():
+        return True
+    return bool(extra.get("asins")) and not params.get("from_sheet")
 
 
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
@@ -449,11 +492,9 @@ def run(params: dict) -> str:
         ctx = audit_rules.load_context(conn, uspto=uspto)
         query_params = {"marketplace": "US", "limit": limit, **extra}
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
-        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉。
-        # 豁免的是**强审**(人点名要审就得审),不是"参数里有 asins" ——
-        # from_sheet 也往 extra 塞 asins,但它走的是默认候选谓词,该护栏照吃
-        forced = bool(extra.get("asins")) and not params.get("from_sheet")
-        guard = _RECENT_RUN_GUARD if (not execute and not forced) else ""
+        # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
+        guard = "" if (execute or _is_forced(params, extra)) \
+            else _RECENT_RUN_GUARD
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where,
                                               recent_guard=guard),

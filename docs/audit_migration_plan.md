@@ -217,6 +217,36 @@ DMIT VPS(采集,目标态)                 生产 Mac(一个 PG 实例 = 所有�
 | 9 | 45 天 TTL | **废除**;hash 驱动重审——slow_hash 变更时 pass 翻 pending,**reject 永不自动重审**(force_rerun 手动通道保留) |
 | 10 | 实证类目反哺 | 海量在线产品与历史报错数据里有沃尔玛认定的真实类目,重审/重上架**最优先直接用它**(设计见 10.3) |
 
+### 补批复(2026-08-17):Phase0 顶级类目禁售摘掉新增的 4 个
+
+| # | 决策项 | 批复 |
+|---|---|---|
+| 11 | Phase0 规则 2 的类目清单 | **裁决 A:摘掉批次 B 新增的 4 个**(Beauty & Personal Care / Health & Household / Health & Personal Care / Grocery & Gourmet Food),只留旧仓原有 4 个(Books / Kindle Store / Clothing, Shoes & Jewelry / Automotive) |
+
+触发:所有者验收上架时拿 `B0BWMVQHVJ` 来问 —— 一包**牛皮纸礼品袋**被拒,理由
+写着「药品/膳食补充剂 restricted: FDA 注册 + AML vetting + MoCRA」。`audit_why`
+摊开后判据是:
+
+```
+full_path = 'Health & Household > Stationery & Gift Wrapping Supplies
+             > Gift Wrapping Supplies > Gift Bags'
+```
+
+规则没跑偏(`match_type='exact'`),是**判据粒度太粗**:该规则只取路径**第一段**,
+而 Amazon 的 `Health & Household` 本身是杂物筐,底下混着文具礼品包装、家居清洁、
+纸品、宠物用品。停在 L0 意味着连类目都不判就拒。
+
+**为什么摘掉是去重而不是放开**:药品/补剂在 L2 本来就有两道更精准的闸 ——
+R2 的 `drugs_supplements`(按 Walmart **PT 名**关键词)与 R0 的
+`_FORBIDDEN_WALMART_MEGA_CATEGORIES`(按 Walmart **类目**)。那两条判"这东西
+是什么",Phase0 这条判"它在亚马逊被挂在哪个筐里"。
+
+**代价(裁决 A 明知并接受)**:PT 解不出**且** Walmart 类目也拿不到的真药品不再有
+硬闸,会走到 L3 语义层。要再收紧走**补 L2 的 PT 词表**,不是把大类塞回 Phase0。
+
+规则版本随之递增到 `c.2026-08-17.1`;存量重审走 `product_audit -p rerule=<规则码>`
+(只重审最近一轮命中该规则的那批,不是全量)。
+
 **#4 原后注(存量豁免/override 列方案)已被二次批复取代**:表降级为纯展示后,
 "人工与机器双写同列"的冲突不复存在,override 列不需要建。人工改判今后不经表
 ——如需人工强制通过/拒绝,后续加 cli 通道或驱动表(与 maintenance 人工驱动表

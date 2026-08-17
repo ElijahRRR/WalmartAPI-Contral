@@ -124,6 +124,23 @@ def test_pick_where_four_states():
     assert w == "p.audit_status = 'pending'" and "interval" not in w
 
 
+def test_pick_where_rerule_targets_only_the_latest_reject():
+    """改一条规则后要动的只有被它拒过的那批,不是全库(2026-08-17 裁决 A)。
+
+    此前唯一的批量通道是 `force_rerun=<版本>`,而版本一递增库里没有一条是新
+    版本 ⇒ **全量**十几万条重审,为了几千条误杀烧掉全库的 LLM 钱。
+
+    三条口径都要钉:只认最近一轮(DISTINCT ON)、只翻 reject、不看 audit_status
+    (要动的正是 rejected 存量——reject 永不自动重审)。
+    """
+    w, e = product_audit._pick_where({"rerule": "phase0_forbidden_category"})
+    assert e == {"rerule": "phase0_forbidden_category"}
+    assert "DISTINCT ON (asin)" in w and "created_at DESC" in w
+    assert "l.verdict = 'reject'" in w
+    assert "audit_status" not in w
+    assert "audit.audit_hits" in w and "h.rule_code = %(rerule)s" in w
+
+
 def test_pick_where_rejects_unknown_params():
     """静默吞参数 = '全量重审跑完了'的假象,宁炸不吞。"""
     with pytest.raises(ValueError, match="未识别参数"):
@@ -752,6 +769,20 @@ def test_catmap_suggestion_from_l1():
                                         penalty=-100, detail={}))
     assert suggestion_from_l1(exc) == ("unknown", "低", "excluded")
     assert suggestion_from_l1(None) == (None, None, "unknown")
+
+
+def test_is_forced_exempts_rerule_but_not_from_sheet():
+    """强审才豁免复烧护栏;`from_sheet` 塞的 asins 不算强审(2026-08-16 纠正)。
+
+    `rerule` 必须豁免:它翻的全是 24 小时内刚被拒的行,吃了护栏 dry-run 会稳定
+    报"0 候选",真跑却翻出几千条 —— dry-run 说的话必须是真跑要做的事。
+    """
+    assert product_audit._is_forced({"asins": "B0A"}, {"asins": ["B0A"]})
+    assert not product_audit._is_forced(
+        {"from_sheet": 1, "asins": "B0A"}, {"asins": ["B0A"]})
+    assert product_audit._is_forced({"rerule": "phase0_forbidden_category"}, {})
+    assert not product_audit._is_forced({}, {})
+    assert not product_audit._is_forced({"rerule": "  "}, {})   # 空串不算
 
 
 def test_candidate_sql_recent_guard_shape():

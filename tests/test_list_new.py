@@ -543,7 +543,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln.upc_pool, "release", lambda *a, **k: 0)
     monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
     monkeypatch.setattr(ln, "_map_llm",
-                        lambda c, pt, spec, p: ({"productName": p["title"]}, {}))
+                        lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
     monkeypatch.setattr(ln.mp_mapper, "build_orderable", lambda *a, **k: {})
     monkeypatch.setattr(ln.mp_mapper, "assemble_mp_item",
                         lambda o, pt, v: {"pt": pt})
@@ -620,7 +620,7 @@ def _wire_execute_env(monkeypatch, rows, products):
                         lambda c, upcs, reason: seen["released"].extend(upcs))
     monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
     monkeypatch.setattr(ln, "_map_llm",
-                        lambda c, pt, spec, p: ({"productName": p["title"]}, {}))
+                        lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
     monkeypatch.setattr(
         ln.mp_mapper, "build_orderable",
         lambda sku, upc, price, qty, partner, **k: (
@@ -726,3 +726,52 @@ def test_same_round_scrape_closure_rescues(monkeypatch):
     calls["fetch"] = 0
     out2 = ln.run({"execute": True, "gap_wait": 0})
     assert calls["order"] == [] and "同轮闭环" not in out2
+
+
+def test_map_llm_three_level_fetch(monkeypatch):
+    """取数三级(所有者定稿 2026-08-18):一级 hash → 二级 (asin,pt) 复用
+    (硬条件签名 + 标题规格验证)→ 才真调 LLM。盯三件事:复用零 LLM 且
+    回写新键;验证不过重打;一级命中不重复 put。"""
+    calls = {"llm": 0, "put": []}
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln.mp_mapper, "build_llm_messages",
+                        lambda *a, **k: [{"role": "user", "content": "m"}])
+    monkeypatch.setattr(ln.mp_mapper, "reuse_sig", lambda *a, **k: "SIG1")
+    monkeypatch.setattr(ln.mp_mapper, "split_llm_output",
+                        lambda raw: (raw.get("visible") or {},
+                                     raw.get("orderable") or {}))
+    monkeypatch.setattr(ln.mp_mapper, "finalize_visible",
+                        lambda pt, rv, spec, **k: rv)
+    monkeypatch.setattr(ln.llm_cache, "get", lambda c, k: None)
+    monkeypatch.setattr(ln.llm_cache, "put",
+                        lambda c, k, r, **meta: calls["put"].append(meta))
+    old = {"visible": {"material": "Paper", "count": "48"}, "orderable": {}}
+    monkeypatch.setattr(ln.llm_cache, "find_reusable",
+                        lambda c, a, p, s: (old, "Gift Bags 48 Pcs Brown"))
+
+    def chat(messages):
+        calls["llm"] += 1
+        return {"visible": {"material": "Paper"}, "orderable": {}}
+    monkeypatch.setattr(ln.llm, "chat_json", chat)
+
+    stats: dict = {}
+    # 标题只是措辞变了(数字/规格词都在)→ 二级复用,零 LLM,回写新键
+    prod = {"asin": "B0X", "title": "Brown Gift Bags, 48 Pcs, New",
+            "attrs": {}}
+    v, _o = ln._map_llm(object(), "Cups", {}, prod, stats=stats)
+    assert v == {"material": "Paper", "count": "48"}
+    assert calls["llm"] == 0 and stats == {"reuse": 1}
+    assert calls["put"][-1]["asin"] == "B0X"      # 下轮直接走一级
+
+    # 件数 48→100:数字集合变了 → 验证不过,重打 LLM
+    prod2 = {"asin": "B0X", "title": "Brown Gift Bags, 100 Pcs", "attrs": {}}
+    ln._map_llm(object(), "Cups", {}, prod2, stats=stats)
+    assert calls["llm"] == 1
+    assert stats["reuse_miss"] == 1 and stats["llm"] == 1
+
+    # 一级命中:不调 LLM 也不重复 put
+    monkeypatch.setattr(ln.llm_cache, "get", lambda c, k: old)
+    n_put = len(calls["put"])
+    ln._map_llm(object(), "Cups", {}, prod, stats=stats)
+    assert calls["llm"] == 1 and len(calls["put"]) == n_put
+    assert stats["cache"] == 1

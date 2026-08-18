@@ -42,12 +42,41 @@ def get(conn, key: str) -> dict | None:
     return v if isinstance(v, dict) else json.loads(v)
 
 
-def put(conn, key: str, response: dict,
-        purpose: str = "default") -> None:
-    """输入:连接 + 键 + 模型回复 JSON(+用途)→ 输出:无(幂等)。"""
+def put(conn, key: str, response: dict, purpose: str = "default", *,
+        asin: str | None = None, pt: str | None = None,
+        src_title: str | None = None, reuse_sig: str | None = None) -> None:
+    """输入:连接 + 键 + 模型回复 JSON(+用途/二级复用元数据)→ 输出:无(幂等)。
+
+    四个元数据列只有 list_new 出参路径传(find_reusable 的反查依据);
+    audit_l3 等其它用途不传、留 NULL——它们的复用语义不同,不参与二级。
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO catalog.llm_cache (input_hash, model, response) "
-            "VALUES (%s, %s, %s::jsonb) ON CONFLICT (input_hash) DO NOTHING",
+            "INSERT INTO catalog.llm_cache (input_hash, model, response, "
+            "asin, pt, src_title, reuse_sig) "
+            "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s) "
+            "ON CONFLICT (input_hash) DO NOTHING",
             (key, _llm_api.model_for(purpose),
-             json.dumps(response, ensure_ascii=False)))
+             json.dumps(response, ensure_ascii=False),
+             asin, pt, src_title, reuse_sig))
+
+
+def find_reusable(conn, asin: str, pt: str, sig: str
+                  ) -> tuple[dict, str] | None:
+    """输入:连接 + ASIN + PT + 硬条件签名 → 输出:(旧出参, 出参时标题) 或 None。
+
+    二级反查(2026-08-18 所有者定稿):一级 input_hash miss 时,取该
+    (asin, pt) 最近一次出参。reuse_sig 必须相等——签名把"不许复用"的
+    硬条件(spec 字段面/brand/category/变体属性)压成一个等值判断,
+    这里只管取;标题规格验证归调用方(mp_mapper.title_spec_compatible)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT response, src_title FROM catalog.llm_cache "
+            "WHERE asin = %s AND pt = %s AND reuse_sig = %s "
+            "ORDER BY created_at DESC LIMIT 1", (asin, pt, sig))
+        row = cur.fetchone()
+    if not row:
+        return None
+    v = row[0]
+    return (v if isinstance(v, dict) else json.loads(v)), (row[1] or "")

@@ -44,8 +44,10 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     只有区间内倍率未配置才淘汰)
   ⑦ 三段式提交(所有者定稿 2026-08-18 重排:「过闸后默认128并发打
     deepseek…能过的才能领 upc,领完直接按店批量上架」):
-    预备期 = LLM 出参(llm_cache 缓存优先,默认 128 并发,按 PG 连接余量
-    钳制)+ mapper 硬约束 + spec 一致化,UPC 用占位号,缺必填本地拦下
+    预备期 = LLM 出参(取数三级:llm_cache 一级 hash 命中 → 二级同
+    (asin,pt) 旧出参复用(硬条件签名 + 标题规格验证,见 _map_llm 头注)
+    → 才真调;默认 128 并发,按 PG 连接余量钳制)+ mapper 硬约束 +
+    spec 一致化,UPC 用占位号,缺必填本地拦下
     (不领号不烧配额)→ 领号期 = 通过的行按店批量领 UPC(catalog.upc_pool
     事务,FOR UPDATE SKIP LOCKED),真号回填占位号 → 提交期 = 同店打包
     单个 MP_ITEM feed(10/hour 硬限),店间并发 ≤24
@@ -65,6 +67,7 @@ upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)�
 import collections
 import contextlib
 import logging
+import threading
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
@@ -278,20 +281,63 @@ def _ingest_now() -> str:
     return "就地" + product_ingest.pump_summary(res)
 
 
-def _map_llm(conn, pt: str, spec, product: dict) -> tuple[dict, dict]:
+_STATS_LOCK = threading.Lock()
+
+
+def _bump(stats: dict | None, key: str) -> None:
+    """预备期并发下的取数计数(dict 的 += 非原子,统一走这把锁)。"""
+    if stats is not None:
+        with _STATS_LOCK:
+            stats[key] = stats.get(key, 0) + 1
+
+
+def _map_llm(conn, pt: str, spec, product: dict,
+             stats: dict | None = None) -> tuple[dict, dict]:
     """LLM 映射(缓存优先)→ (清洗后 Visible, LLM 填的 Orderable 字段)。
 
     2026-08-12 旧仓对照恢复两段式:Orderable 的非系统字段(条件必填等)
     交还 LLM 填,系统强制项在 build_orderable 里覆盖;Visible 照旧过
     finalize_visible 硬约束清洗。
+
+    取数三级(2026-08-18 所有者定稿加二级):
+      ① input_hash 精确命中(catalog.llm_cache);
+      ② miss 时按 (asin, pt) 反查最近出参:reuse_sig 相等(spec 字段面/
+        brand/category/变体属性都没变)且新旧标题过规格 token 验证
+        (mp_mapper.title_spec_compatible)才复用——文案图片本就由系统
+        每轮从最新采集数据覆盖、不靠 LLM,复用只赌"结构化字段没变"。
+        命中回写新 hash,下轮直接走 ①;
+      ③ 都不中才真打 LLM。
+    stats 计四类(cache/reuse/reuse_miss/llm),预备期摘要必须亮出来——
+    二级是兜底式优化,静默常态化 = 它在替 LLM 说话而没人知道。
     """
     messages = mp_mapper.build_llm_messages(pt, spec, product,
                                             ospec=pt_spec.orderable_spec())
     key = llm_cache.cache_key(messages, 0.2, 4096)
     raw = llm_cache.get(conn, key)
-    if raw is None:
-        raw = llm.chat_json(messages)
-        llm_cache.put(conn, key, raw)
+    meta = {"asin": product.get("asin"), "pt": pt,
+            "src_title": product.get("title"),
+            "reuse_sig": mp_mapper.reuse_sig(pt, spec, product,
+                                             ospec=pt_spec.orderable_spec())}
+    if raw is not None:
+        _bump(stats, "cache")
+    else:
+        got = (llm_cache.find_reusable(conn, meta["asin"], pt,
+                                       meta["reuse_sig"])
+               if meta["asin"] else None)
+        if got and mp_mapper.title_spec_compatible(
+                got[1], product.get("title") or "", got[0]):
+            raw = got[0]
+            _bump(stats, "reuse")
+            logger.info("%s 二级复用旧出参(硬条件同 + 标题规格验证通过,"
+                        "零 LLM)", meta["asin"])
+        else:
+            if got:
+                _bump(stats, "reuse_miss")
+                logger.info("%s 有旧出参但标题规格验证不过(规格疑似变了),"
+                            "重打 LLM", meta["asin"])
+            raw = llm.chat_json(messages)
+            _bump(stats, "llm")
+        llm_cache.put(conn, key, raw, **meta)
     raw_v, raw_o = mp_mapper.split_llm_output(raw)
     visible = mp_mapper.finalize_visible(pt, raw_v, spec,
                                          images=product.get("images"),
@@ -325,9 +371,12 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import ExitStack
 
+    llm_stats: dict = {}     # cache/reuse/reuse_miss/llm 四类取数计数
+
     def _one(conn, r: dict) -> tuple:
         spec = pt_spec.load_pt(r["product_type"])
-        visible, llm_o = _map_llm(conn, r["product_type"], spec, r["_p"])
+        visible, llm_o = _map_llm(conn, r["product_type"], spec, r["_p"],
+                                  stats=llm_stats)
         if len(visible.get("productName") or "") < 10:
             return ("title_short", r, "标题不足10字符", None)
         orderable = mp_mapper.build_orderable(
@@ -377,6 +426,7 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
             reasons.append((r["rownum"], why))
     ok.sort(key=lambda x: x["rownum"])
     reasons.sort(key=lambda t: t[0])
+    cnt["llm_stats"] = llm_stats
     return ok, reasons, cnt
 
 
@@ -1198,6 +1248,15 @@ def run(params: dict) -> str:
                      f"通过 {len(prep_ok)}/{len(prep_in)}"
                      + (";" + ",".join(f"{lab} {v}" for lab, v in prep_post)
                         if prep_post else ""))
+        # 取数四类只报非零(规矩 2)。二级复用/拒绝必须见人——它是兜底式
+        # 优化,静默常态化 = 旧出参在替 LLM 说话而没人知道
+        st = pc.get("llm_stats") or {}
+        llm_line = ",".join(f"{lab} {st[k]}" for k, lab in (
+            ("cache", "一级缓存命中"), ("reuse", "二级复用(零LLM)"),
+            ("reuse_miss", "二级验证不过重打"), ("llm", "真调 LLM"))
+            if st.get(k))
+        if llm_line:
+            lines.append(f"  LLM 取数:{llm_line}")
 
     by_store2: dict[str, list[dict]] = {}
     for r in prep_ok:

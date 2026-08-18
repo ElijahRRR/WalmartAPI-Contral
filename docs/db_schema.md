@@ -158,6 +158,25 @@ CREATE TABLE catalog.upc_pool (
 ```
 
 ```sql
+-- LLM 输入哈希缓存(L2c;旧 llm_cache.sqlite 的 PG 化,旧数据不迁)。
+-- 一级:input_hash 精确命中(键含 model,换模型即失效——接受的语义)。
+-- 二级(2026-08-18 所有者定稿):hash miss 时按 (asin, pt) 反查该 ASIN
+-- 最近一次出参,reuse_sig 相等(spec 字段面/brand/category/变体属性都没变)
+-- 且新旧标题过"规格 token 验证"才复用——标题描述图片等文案本就由系统
+-- 每轮从最新采集数据覆盖,不靠 LLM,所以复用只赌"结构化字段没变"。
+-- 四个元数据列只在 list_new 出参路径写入;audit_l3 等其它用途留 NULL
+-- (它们的复用语义不同,不参与二级)。
+CREATE TABLE catalog.llm_cache (
+    input_hash text PRIMARY KEY,     -- sha256(model+messages+温度+tokens)[:32]
+    model text NOT NULL, response jsonb NOT NULL,
+    hit_count int DEFAULT 0, created_at, last_hit_at,
+    asin text, pt text,              -- 二级反查键(部分索引 asin IS NOT NULL)
+    src_title text,                  -- 出参时的亚马逊标题(规格 token 验证输入)
+    reuse_sig text                   -- 硬条件签名:变了不许复用,直接重打
+);
+```
+
+```sql
 -- 风控库(L2b,2026-08-07):飞书两表镜像,闸门读库不读表(表格将停用)
 -- 同步只增改不删;拦截条件:准入状态='禁售' 或 中国卖家可做 以'否'开头;
 -- 品牌 casefold 精确匹配(brand_key)

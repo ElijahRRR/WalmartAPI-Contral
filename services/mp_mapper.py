@@ -356,6 +356,102 @@ def _conditional_blocks(spec: dict | None, cap: int = 12) -> list[dict]:
     return out
 
 
+# 进提示词前从 attrs 剔掉的媒体键(2026-08-18 所有者定稿,治缓存 hash 脆):
+# 图片/视频是纯 URL,系统本就禁止 LLM 输出媒体字段(SYSTEM_OWNED_FIELDS,
+# 图片由 apply_images 从采集数据覆盖),进提示词纯粹是噪声——却让"慢采只
+# 刷新了图片列表"也打穿 llm_cache。
+# ⚠ 改这份清单 = 改 messages = 现有缓存整体失效一次,只许在接受重烧时动。
+PROMPT_DROP_KEYS = ("images", "image_url", "image_urls",
+                    "video", "videos", "video_url")
+
+
+def _prompt_attrs(attrs) -> dict:
+    """输入:采集 slow 段 attrs → 输出:进 LLM 提示词的属性(剔媒体键)。"""
+    if not isinstance(attrs, dict):
+        return {}
+    return {k: v for k, v in attrs.items() if k not in PROMPT_DROP_KEYS}
+
+
+def reuse_sig(pt: str, spec: dict | None, product: dict,
+              ospec: dict | None = None) -> str:
+    """输入:PT + spec + 产品数据(+Orderable spec)→ 输出:二级复用硬条件签名。
+
+    llm_cache 二级复用(2026-08-18 所有者定稿)的"不许复用"等值判断:
+    签名里任何一样变了,旧出参直接作废重打 LLM——
+      · spec 字段面 + 条件必填(spec 改版后旧出参可能给不出新必填);
+      · brand / category(语义地基);
+      · variant_attributes(变体属性 = 规格本体)。
+    **title 与 attrs 文案故意不进签名**:文案变化正是二级复用要跨过去的
+    那类变化;标题里可能藏规格,那一半风险由 title_spec_compatible 单验。
+    """
+    import hashlib as _hashlib
+    import json as _json
+    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
+    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10)
+    raw = _json.dumps(
+        {"pt": pt, "vr": v_req, "vo": v_opt, "onr": o_req, "ono": o_opt,
+         "cond": _conditional_blocks(spec),
+         "brand": product.get("brand"),
+         "category": product.get("category"),
+         "variant_attributes": product.get("variant_attributes")},
+        ensure_ascii=False, sort_keys=True, default=str)
+    return _hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _title_hit(value: str, title: str) -> bool:
+    """值是否按词边界出现在标题里(纯数字不许配进更长的数字:4 ≠ 48)。"""
+    v = str(value).strip()
+    if not v or len(v) > 40:
+        return False
+    if _NUM_RE.fullmatch(v):
+        return re.search(rf"(?<![\d.]){re.escape(v)}(?![\d.])",
+                         title) is not None
+    return re.search(rf"(?<!\w){re.escape(v)}(?!\w)", title,
+                     re.IGNORECASE) is not None
+
+
+def _response_scalars(node) -> list[str]:
+    """出参 JSON 里的全部标量值(str/数字;bool 不算——'No' 类枚举才有意义)。"""
+    out: list[str] = []
+    if isinstance(node, dict):
+        for v in node.values():
+            out.extend(_response_scalars(v))
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            out.extend(_response_scalars(v))
+    elif isinstance(node, (str, int, float)) and not isinstance(node, bool):
+        out.append(str(node))
+    return out
+
+
+def title_spec_compatible(old_title: str, new_title: str,
+                          response: dict) -> bool:
+    """输入:出参时标题 + 现标题 + 旧出参 → 输出:旧出参对新标题是否仍成立。
+
+    所有者的验证思路(2026-08-18:「llm取出来的参数在原来的标题里会有,
+    如果新的标题里这部分参数变了…再走llm重新输出」)+ 两处修正:
+
+    ① **对称验证,不是"值∈新标题"**:出参分两类——从标题抄/提取的
+      (件数/尺寸/颜色词)与推断/枚举归一的("Kraft"→material=Paper、"No")。
+      后者在旧标题里本来就找不到,拿去新标题验会全军覆没、复用率归零。
+      所以只验**在旧标题命中过**的值:旧有、新没了 ⇒ 规格变了,重打。
+    ② **数字 token 集合必须相等**(双向护栏):新标题**新增**的规格
+      (4 Pack → 48 Pack)在旧出参里没有值可验,①看不见;而规格变化
+      几乎总带数字(件数/尺寸/容量)。误伤方向是安全的——顶多多烧一次
+      LLM,绝不把旧规格发给新形态的产品。
+    """
+    old_t, new_t = str(old_title or ""), str(new_title or "")
+    if set(_NUM_RE.findall(old_t)) != set(_NUM_RE.findall(new_t)):
+        return False
+    for v in _response_scalars(response):
+        if _title_hit(v, old_t) and not _title_hit(v, new_t):
+            return False
+    return True
+
+
 def build_llm_messages(pt: str, spec: dict | None, product: dict,
                        ospec: dict | None = None) -> list[dict]:
     """输入:PT + 该 PT spec + 产品数据契约(+Orderable spec)→ 输出:messages。
@@ -398,7 +494,9 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict,
         "product": {"title": product.get("title"),
                     "brand": product.get("brand"),
                     "category": product.get("category"),
-                    "attrs": product.get("attrs") or {}},
+                    # 剔媒体键(PROMPT_DROP_KEYS):图片列表进提示词是噪声,
+                    # 还让"慢采只刷新了图片"也打穿缓存 hash
+                    "attrs": _prompt_attrs(product.get("attrs"))},
     }, ensure_ascii=False)
     return [{"role": "system", "content": sys},
             {"role": "user", "content": user}]

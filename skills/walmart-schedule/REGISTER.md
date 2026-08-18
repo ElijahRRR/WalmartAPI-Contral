@@ -6,6 +6,19 @@
 
 请把下面 9 条定时任务一次性注册好。这几条是沃尔玛业务链的每日/每周调度,注册完之后由你到点触发。
 
+## 第 0 步之前:先确认你能写仓库**外面**那个目录
+
+本项目的状态目录是仓库的**同级**目录 `/Users/nextderboy/Projects/WalmartAPI_data`(锁/日志/备份/报告都在那儿)。默认沙箱只放行工作区,于是每条工作流在拿运行锁的第一步就死,报 `PermissionError: [Errno 1] Operation not permitted`。
+
+**注册之前先自检**(30 秒,能省掉一整天的空转):
+
+```bash
+touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && echo OK
+```
+
+被拒就先修沙箱:项目级 `/Users/nextderboy/Projects/WalmartAPI-Contral/.codex/config.toml` 已在仓库里(`sandbox_workspace_write.writable_roots` 指向 DATA_ROOT),拉下来即生效。
+⚠ **别用 chmod 777 / 改 WALMART_DATA_ROOT / 建软链接**绕过去 —— 那几样都是把状态搬到别处,只会让两份状态各写各的。
+
 ## 第 0 步:先把时区定了(**唯一一个会静默出错的地方**)
 
 先确认你这边的定时任务按哪个时区存:

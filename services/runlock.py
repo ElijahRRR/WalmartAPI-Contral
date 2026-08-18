@@ -16,6 +16,7 @@
 """
 
 import contextlib
+import errno
 import fcntl
 import logging
 import os
@@ -59,28 +60,58 @@ def _me() -> str:
         return str(os.getuid())
 
 
-def _permission_hint(target) -> str:
-    """输入:锁文件路径 → 输出:一句能直接照着修的诊断。
+def _looks_writable(target) -> bool:
+    """输入:锁文件路径 → 输出:按**普通文件权限**看,当前用户本该写得动吗。
+
+    ⚠ `os.access` 只看 DAC(属主/组/mode),**看不见沙箱与 MAC**。这正是它在这里
+    有用的原因:DAC 说能写、实际却被拒 ⇒ 拦你的是 DAC 之外的东西。
+    """
+    if target.exists():
+        return os.access(target, os.W_OK)
+    return target.parent.is_dir() and os.access(target.parent, os.W_OK)
+
+
+def _permission_hint(target, err: OSError | None = None) -> str:
+    """输入:锁文件路径(+原始 OSError)→ 输出:一句能直接照着修的诊断。
 
     ⚠ 原先这里只让 OSError 裸奔上去,报出来就是「Permission denied: …lock」——
-    人(和替我们看告警的智能体)只能猜是目录权限,而**最常见的成因是某次用
-    sudo 跑过、锁文件归了 root,目录本身好好的**。猜错方向就会去 chmod 目录,
-    改完下一轮照样失败。所以把属主/权限/当前用户三样一次说清。
+    人(和替我们看告警的智能体)只能猜。所以把属主/权限/当前用户一次说清。
 
-    ⚠ 建议 `chown` 而**不是** `rm`:删掉锁文件不会让此刻正持有 flock 的进程
-    释放锁,只会让新进程创建一个**新的 inode** 去锁 —— 于是两个实例同时跑同一条
-    危险链,而互斥"看起来还在"。chown 保留 inode,语义不变。
+    ⚠⚠ **必须先分清 EACCES 与 EPERM**(2026-08-17 生产两次踩反方向):
+      · `EACCES`(errno 13)= 普通文件权限不够。最常见是某次用 sudo 跑过、
+        锁文件归了 root(此时**目录**是好的,改目录没用)。
+      · `EPERM`(errno 1)= 属主与权限都正常**却仍被拒** ⇒ 拦你的不是文件权限,
+        是**沙箱 / MAC**(macOS 上典型是 Codex 之类的智能体沙箱只放行仓库目录,
+        而 DATA_ROOT 是仓库的**同级**目录;也可能是 TCC 或 uchg 标志)。
+        这一档去 chmod/chown 是白费力气 —— 实测那一次属主是对的,而首版这段
+        提示照样在劝人 chown。
+
+    ⚠ 需要改属主时建议 `chown` 而**不是** `rm`:删掉锁文件不会让此刻正持有 flock
+    的进程释放锁,只会让新进程创建一个**新的 inode** 去锁 —— 于是两个实例同时跑
+    同一条危险链,而互斥"看起来还在"。chown 保留 inode,语义不变。
     """
-    return (f"锁文件 {target}({_owner_of(target)});"
-            f"锁目录 {target.parent}({_owner_of(target.parent)});"
-            f"DATA_ROOT {target.parent.parent}({_owner_of(target.parent.parent)});"
-            f"当前用户={_me()}。"
-            f"⚠ 最常见成因:某次用 sudo 跑过,锁文件归了 root(此时目录权限是好的,"
-            f"改目录没用)。修法 —— 先确认没有 cli.py 在跑,再把属主改回来:"
-            f"`sudo chown \"$(id -un)\" {target}`(整体归位:"
+    facts = (f"锁文件 {target}({_owner_of(target)});"
+             f"锁目录 {target.parent}({_owner_of(target.parent)});"
+             f"DATA_ROOT {target.parent.parent}({_owner_of(target.parent.parent)});"
+             f"当前用户={_me()}")
+    if err is not None:
+        facts += f";errno={err.errno}({errno.errorcode.get(err.errno, '?')})"
+
+    if _looks_writable(target):
+        return (facts + "。⚠ **属主与权限都正常,却仍被拒** —— 那就不是文件权限"
+                "问题,别去 chmod/chown。这一档几乎总是**沙箱**:跑它的那个进程"
+                "只被放行了仓库目录,而 DATA_ROOT 是仓库的**同级**目录"
+                f"({target.parent.parent})。修法是给那个 runner 的沙箱配置加上"
+                "对 DATA_ROOT 的写权限(Codex 走项目级 .codex/config.toml 的 "
+                "`sandbox_workspace_write.writable_roots`),**不要** chmod 777、"
+                "不要改 WALMART_DATA_ROOT、不要建软链接 —— 那三样都是把状态搬到"
+                "别处,只会让两个身份各写各的一份")
+    return (facts + "。⚠ 最常见成因:某次用 sudo 跑过,锁文件归了 root"
+            "(此时目录权限是好的,改目录没用)。修法 —— 先确认没有 cli.py 在跑,"
+            f"再把属主改回来:`sudo chown \"$(id -un)\" {target}`(整体归位:"
             f"`sudo chown -R \"$(id -un)\" {target.parent.parent}`)。"
-            f"**别用 rm**:删锁文件不会让正持锁的进程放手,只会让新进程锁到另一个 "
-            f"inode 上 —— 两个实例同时跑同一条链,而互斥看起来还在")
+            "**别用 rm**:删锁文件不会让正持锁的进程放手,只会让新进程锁到另一个 "
+            "inode 上 —— 两个实例同时跑同一条链,而互斥看起来还在")
 
 
 def acquire(name: str):
@@ -98,7 +129,8 @@ def acquire(name: str):
         d.mkdir(parents=True, exist_ok=True)
         fh = open(target, "w")
     except OSError as e:
-        raise LockUnavailable(f"建不了运行锁:{e}。{_permission_hint(target)}") from e
+        raise LockUnavailable(
+            f"建不了运行锁:{e}。{_permission_hint(target, e)}") from e
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

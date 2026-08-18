@@ -6,6 +6,46 @@ import pathlib
 
 SRC = pathlib.Path("../ref-design/console.dc.html")
 CSS = pathlib.Path("industry-styles.css").read_text(encoding="utf-8")
+for old, new in [
+    ("@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');", "/* 字体统一在页面 <link> 引入:Inter + Noto Sans SC + JetBrains Mono */"),
+    ("--color-bg: #f2f2f3;", "--color-bg: #fafafa;"),
+    ("--color-surface: #e9e9ea;", "--color-surface: #ffffff;"),
+    ("--color-text: #1d1f20;", "--color-text: #18181b;"),
+    ("--color-accent: #5980a6;", "--color-accent: #18181b;"),
+    ("--color-accent-2: #728fab;", "--color-accent-2: #52525b;"),
+    ("--color-divider: color-mix(in srgb, #1d1f20 16%, transparent);", "--color-divider: #e4e4e7;"),
+    ('--font-heading: "Barlow Condensed", system-ui, sans-serif;', "--font-heading: 'Inter', 'Noto Sans SC', system-ui, sans-serif;"),
+    ('--font-body: "Barlow", system-ui, sans-serif;', "--font-body: 'Inter', 'Noto Sans SC', system-ui, sans-serif;"),
+    ("--color-neutral-100: #f5f5f8;", "--color-neutral-100: #f4f4f5;"),
+    ("--color-neutral-200: #e7e7ea;", "--color-neutral-200: #e4e4e7;"),
+    ("--color-neutral-300: #d4d4d7;", "--color-neutral-300: #d4d4d8;"),
+    ("--color-neutral-400: #b7b7ba;", "--color-neutral-400: #a1a1aa;"),
+    ("--color-neutral-500: #98989b;", "--color-neutral-500: #71717a;"),
+    ("--color-neutral-600: #7a7a7d;", "--color-neutral-600: #52525b;"),
+    ("--color-neutral-700: #5d5d60;", "--color-neutral-700: #3f3f46;"),
+    ("--color-neutral-800: #424244;", "--color-neutral-800: #27272a;"),
+    ("--color-neutral-900: #2b2b2d;", "--color-neutral-900: #18181b;"),
+    ("--color-accent-100: #eef6ff;", "--color-accent-100: #f4f4f5;"),
+    ("--color-accent-200: #d6ebff;", "--color-accent-200: #e4e4e7;"),
+    ("--color-accent-300: #b5d9fd;", "--color-accent-300: #d4d4d8;"),
+    ("--color-accent-400: #94bce3;", "--color-accent-400: #a1a1aa;"),
+    ("--color-accent-500: #749dc4;", "--color-accent-500: #71717a;"),
+    ("--color-accent-600: #597ea3;", "--color-accent-600: #27272a;"),
+    ("--color-accent-700: #416180;", "--color-accent-700: #3f3f46;"),
+    ("--color-accent-800: #2c455d;", "--color-accent-800: #27272a;"),
+    ("--color-accent-900: #1d2d3d;", "--color-accent-900: #18181b;"),
+    ("--color-accent-2-100: #eef6ff;", "--color-accent-2-100: #f0f9ff;"),
+    ("--color-accent-2-200: #d6ebff;", "--color-accent-2-200: #e0f2fe;"),
+    ("--color-accent-2-300: #bdd8f2;", "--color-accent-2-300: #bae6fd;"),
+    ("--color-accent-2-400: #9ebbd8;", "--color-accent-2-400: #7dd3fc;"),
+    ("--color-accent-2-500: #7e9cb8;", "--color-accent-2-500: #38bdf8;"),
+    ("--color-accent-2-600: #627d98;", "--color-accent-2-600: #0284c7;"),
+    ("--color-accent-2-700: #486077;", "--color-accent-2-700: #0369a1;"),
+    ("--color-accent-2-800: #314457;", "--color-accent-2-800: #075985;"),
+    ("--color-accent-2-900: #1f2d3a;", "--color-accent-2-900: #0c4a6e;"),
+]:
+    assert old in CSS, "CSS 锚点缺失: " + old[:50]
+    CSS = CSS.replace(old, new)
 s = SRC.read_text(encoding="utf-8")
 
 def sub1(old, new):
@@ -18,6 +58,102 @@ sub1('<link rel="stylesheet" href="_ds/industry-71bd4807-93ea-4481-ab4b-859c6b1d
      "<style>\n" + CSS + "\n</style>")
 sub1('<script src="_ds/industry-71bd4807-93ea-4481-ab4b-859c6b1d7a71/_ds_bundle.js"></script>',
      '<script>window.Industry_indust = window.Industry_indust || {__errors: []};</script>')
+
+
+# ── 2.5 换肤:erp-core 配色(所有者 2026-08-18 定稿:功能用原型的,配色用 erp-core)──
+# 原型的颜色全走 CSS 变量,换肤 = 换 token;组件形态(方角/四角标记/斜纹危险钮)不动。
+
+# 字体:Barlow 三件套 → Inter + Noto Sans SC + JetBrains Mono(erp-core 同款)
+sub1('<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&family=Barlow+Semi+Condensed:wght@400;500&display=swap" rel="stylesheet">',
+     '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">')
+
+# 语义色:红黄绿 → erp-core 的 red/amber/emerald 三组(50 底 / 700 字 / 200 线),
+# 另立 mid(sky,在途/中间态)与 ok-dot(emerald-500 圆点),字体变量一并锚定
+sub1("""[data-theme]{
+  --sev-bad:#a32b1c; --sev-bad-ink:#7d2015; --sev-bad-bg:#fbeae7; --sev-bad-line:#d99d92;
+  --sev-warn-ink:#7a5205; --sev-warn-bg:#fdf2de; --sev-warn-line:#ddb972;
+  --sev-ok-ink:#1b5e40; --sev-ok-bg:#e4f1ea; --sev-ok-line:#9dc5b1;
+}""",
+"""[data-theme]{
+  --sev-bad:#dc2626; --sev-bad-ink:#b91c1c; --sev-bad-bg:#fef2f2; --sev-bad-line:#fecaca;
+  --sev-warn-ink:#b45309; --sev-warn-bg:#fffbeb; --sev-warn-line:#fde68a;
+  --sev-ok-ink:#047857; --sev-ok-bg:#ecfdf5; --sev-ok-line:#a7f3d0; --sev-ok-dot:#10b981;
+  --sev-mid-ink:#0369a1; --sev-mid-line:#7dd3fc;
+  --font-heading:'Inter','Noto Sans SC',system-ui,sans-serif;
+  --font-body:'Inter','Noto Sans SC',system-ui,sans-serif;
+}""")
+
+# 浅色主题:蓝主色 → zinc 中性系 + 黑主按钮(accent 阶映射 zinc 阶;
+# accent-600 定 #27272A 让 btn-primary:hover = zinc-800)
+sub1("""[data-theme="light"]{
+  --color-bg:#ffffff; --color-text:#0e1114;
+  --color-divider:#c6ccd2;
+  --color-accent:#2b5c8c;
+  --color-accent-100:#e6edf5; --color-accent-200:#c9dbeb; --color-accent-300:#9bbcd8;
+  --color-accent-400:#6a93b8; --color-accent-500:#2b5c8c; --color-accent-600:#234d76;
+  --color-accent-700:#1d4062; --color-accent-800:#16324d; --color-accent-900:#0c2035;
+  --color-neutral-400:#aeb5bc;
+}""",
+"""[data-theme="light"]{
+  --color-bg:#fafafa; --color-surface:#ffffff; --color-text:#18181b;
+  --color-divider:#e4e4e7;
+  --color-accent:#18181b;
+  --color-accent-100:#f4f4f5; --color-accent-200:#e4e4e7; --color-accent-300:#d4d4d8;
+  --color-accent-400:#a1a1aa; --color-accent-500:#71717a; --color-accent-600:#27272a;
+  --color-accent-700:#3f3f46; --color-accent-800:#27272a; --color-accent-900:#18181b;
+  --color-neutral-400:#a1a1aa;
+}""")
+sub1('[data-theme="light"] > aside{background:#eceff2}',
+     '[data-theme="light"] > aside{background:#ffffff}')
+
+# 深色主题:zinc 暗面等价映射(主按钮反白,语义色亮一档)
+sub1("""[data-theme="dark"]{
+  --color-bg:#17191b; --color-surface:#1f2225; --color-text:#e8e9ea;
+  --color-divider:color-mix(in srgb,#e8e9ea 30%,transparent);
+  --sev-bad:#c2452f; --sev-bad-ink:#f2b6ab; --sev-bad-bg:#3a1a14; --sev-bad-line:#7d3325;
+  --sev-warn-ink:#e8c07a; --sev-warn-bg:#332715; --sev-warn-line:#6b5426;
+  --sev-ok-ink:#8fd0ae; --sev-ok-bg:#16301f; --sev-ok-line:#2f6144;
+  --color-accent:#7ea5c9;
+  --color-accent-100:#22303d; --color-accent-200:#2b425a; --color-accent-300:#3a5a78; --color-accent-400:#5c81a8; --color-accent-700:#a9c6e0;
+  --color-accent-800:#cfe1f2; --color-accent-900:#e8f1fa;
+  --color-neutral-100:#23262a; --color-neutral-800:#d3d5d7; --color-neutral-900:#eceded;
+  --shadow-lg:0 12px 32px rgba(0,0,0,.55);
+}""",
+"""[data-theme="dark"]{
+  --color-bg:#18181b; --color-surface:#27272a; --color-text:#f4f4f5;
+  --color-divider:color-mix(in srgb,#f4f4f5 22%,transparent);
+  --sev-bad:#dc2626; --sev-bad-ink:#fca5a5; --sev-bad-bg:#3f1d1d; --sev-bad-line:#7f1d1d;
+  --sev-warn-ink:#fcd34d; --sev-warn-bg:#3a2e12; --sev-warn-line:#78591b;
+  --sev-ok-ink:#6ee7b7; --sev-ok-bg:#132e21; --sev-ok-line:#065f46; --sev-ok-dot:#34d399;
+  --sev-mid-ink:#7dd3fc; --sev-mid-line:#0369a1;
+  --color-accent:#f4f4f5;
+  --color-accent-100:#27272a; --color-accent-200:#3f3f46; --color-accent-300:#52525b; --color-accent-400:#71717a; --color-accent-700:#d4d4d8;
+  --color-accent-800:#e4e4e7; --color-accent-900:#f4f4f5;
+  --color-neutral-100:#27272a; --color-neutral-400:#71717a; --color-neutral-800:#d4d4d8; --color-neutral-900:#f4f4f5;
+  --shadow-lg:0 12px 32px rgba(0,0,0,.55);
+}""")
+sub1('[data-theme="dark"] .tag-accent{background:#22303d;color:#cfe1f2}',
+     '[data-theme="dark"] .tag-accent{background:#27272a;color:#e4e4e7}')
+sub1('[data-theme="dark"] .tag-neutral{background:#23262a;color:#d3d5d7}',
+     '[data-theme="dark"] .tag-neutral{background:#27272a;color:#d4d4d8}')
+
+# ID/数字等宽:Barlow Semi Condensed → JetBrains Mono(要逐字符比对的东西)
+sub1('.mono{font-family:"Barlow Semi Condensed",ui-monospace,monospace;font-variant-numeric:tabular-nums}',
+     ".mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:.94em;letter-spacing:-0.01em}")
+
+# 表头压回 erp-core 的弱灰(zinc 映射后 accent-900 会太黑)
+sub1(".hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}",
+     ".hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}\n"
+     ".table thead th{color:#71717a}\n"
+     '[data-theme="dark"] .table thead th{color:#a1a1aa}')
+
+# 中间态签:accent(会映成灰,与「忙」撞)→ sky —— 在途/还没完 用 erp-core 的 sky
+sub1("const MID  = {chipBg:'transparent',chipFg:'var(--color-accent-700)',chipBorder:'var(--color-accent-400)',chipBorderStyle:'dashed'};",
+     "const MID  = {chipBg:'transparent',chipFg:'var(--sev-mid-ink)',chipBorder:'var(--sev-mid-line)',chipBorderStyle:'dashed'};")
+
+# 店铺点阵:凭证有效 = emerald 点(黑点读不出「健康」)
+sub1("out.push({title: '店铺 ' + (i + 1) + ' · 凭证有效', bg: 'var(--color-accent-700)', borderStyle: 'solid'});",
+     "out.push({title: '店铺 ' + (i + 1) + ' · 凭证有效', bg: 'var(--sev-ok-dot)', borderStyle: 'solid'});")
 
 # ── 2. 两处事实修正 ──
 sub1("没抢到锁：上一轮 17:30 那次还在跑（27 个在途轮询慢）。不是失败，不要重试",

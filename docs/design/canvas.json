@@ -1,0 +1,80 @@
+{
+  "artboards": [
+    {
+      "file": "DesignSystem.dc.html",
+      "title": "设计系统",
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 1200
+    },
+    {
+      "file": "Main.dc.html",
+      "title": "总览(首页)",
+      "x": 0,
+      "y": 1320,
+      "w": 1440,
+      "h": 1100
+    },
+    {
+      "file": "RunSelect.dc.html",
+      "title": "工作流 · 选择与参数",
+      "x": 0,
+      "y": 2540,
+      "w": 1440,
+      "h": 900
+    },
+    {
+      "file": "RunPreview.dc.html",
+      "title": "工作流 · 预览破坏面",
+      "x": 1560,
+      "y": 2540,
+      "w": 1440,
+      "h": 900
+    },
+    {
+      "file": "RunLive.dc.html",
+      "title": "工作流 · 执行与结局",
+      "x": 3120,
+      "y": 2540,
+      "w": 1440,
+      "h": 900
+    },
+    {
+      "file": "ProductDetail.dc.html",
+      "title": "产品详情",
+      "x": 1560,
+      "y": 3560,
+      "w": 1440,
+      "h": 1400
+    },
+    {
+      "file": "OrderQueue.dc.html",
+      "title": "订单待人工",
+      "x": 1560,
+      "y": 1320,
+      "w": 1440,
+      "h": 1000
+    },
+    {
+      "file": "ListingFunnel.dc.html",
+      "title": "上架闸门漏斗",
+      "x": 0,
+      "y": 3560,
+      "w": 1440,
+      "h": 900
+    }
+  ],
+  "annotations": [
+    {
+      "id": "round-1-note",
+      "x": 0,
+      "y": -150,
+      "w": 560,
+      "text": "第一轮六块(工作流触发拆成三联,共 8 画板)· 配色与组件词汇逐值对齐旧系统 erp-core:黑主按钮 + emerald/amber/red/sky/violet/gray 状态点,Inter + Noto Sans SC + JetBrains Mono,行高 32/40 两档。\n数据全部对上库里真有的表与状态,详见仓库 docs/frontend_brief.md。"
+    }
+  ],
+  "launch": {
+    "view": "canvas"
+  }
+}

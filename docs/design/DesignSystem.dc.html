@@ -1,0 +1,110 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter','Noto Sans SC',system-ui,sans-serif; -webkit-font-smoothing: antialiased;
+       background: #fafafa; color: #18181b; }
+a { color: #0369a1; text-decoration: none; } a:hover { color: #075985; }
+.mono { font-family: 'JetBrains Mono',ui-monospace,monospace; }
+.tab { font-variant-numeric: tabular-nums; }
+.card { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; }
+.chead { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 44px; border-bottom: 1px solid #f4f4f5; }
+.ctitle { font-size: 13px; font-weight: 500; color: #18181b; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; flex: none; }
+.dothollow { display: inline-block; width: 9px; height: 9px; border-radius: 99px; background: #fff; border: 2px solid #f59e0b; flex: none; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #27272a; white-space: nowrap; }
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; height: 20px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid; white-space: nowrap; }
+.tagdash { border-style: dashed; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; border-radius: 6px;
+       font-weight: 500; font-size: 14px; height: 36px; padding: 0 12px; border: 1px solid transparent; cursor: default; }
+.btn.sm { height: 28px; padding: 0 8px; font-size: 12px; }
+.btn.lg { height: 40px; padding: 0 16px; }
+.bp { background: #18181b; color: #fff; }
+.bs { background: #fff; color: #18181b; border-color: #d4d4d8; }
+.bghost { background: transparent; color: #3f3f46; }
+.bdanger { background: #dc2626; color: #fff; }
+.bdghost { background: transparent; color: #b91c1c; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; }
+.th { background: #fafafa; text-align: left; padding: 0 12px; height: 36px; font-size: 11px; font-weight: 500; color: #71717a;
+      text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #e4e4e7; white-space: nowrap; }
+.td { padding: 0 12px; font-size: 13px; color: #27272a; border-bottom: 1px solid #f4f4f5; vertical-align: middle; }
+.rz .td { height: 40px; } .rc .td { height: 32px; }
+.num { text-align: right; font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.id { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; letter-spacing: -0.01em; color: #3f3f46; }
+.kbd { font-family: 'JetBrains Mono',monospace; font-size: 10px; padding: 1px 5px; border: 1px solid #e4e4e7;
+       border-bottom-width: 2px; border-radius: 4px; background: #fafafa; color: #52525b; }
+.grouptitle { padding: 0 16px; margin: 12px 0 4px; font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #a1a1aa; }
+.navitem { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 16px; font-size: 13px; color: #3f3f46; }
+.navitem.on { background: #18181b; color: #fff; }
+.navbadge { font-family: 'JetBrains Mono',monospace; font-variant-numeric: tabular-nums; font-size: 10px; padding: 0 6px; height: 16px;
+            display: inline-flex; align-items: center; border-radius: 4px; background: #f4f4f5; color: #3f3f46; margin-left: auto; }
+.navbadge.amber { background: #fffbeb; color: #b45309; }
+.kpilabel { font-size: 12px; color: #71717a; }
+.kpival { font-size: 24px; font-weight: 600; font-family: 'JetBrains Mono',ui-monospace,monospace; font-variant-numeric: tabular-nums; color: #18181b; }
+.log { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12px; line-height: 1.7; color: #d4d4d8;
+       background: #18181b; border-radius: 6px; padding: 14px 16px; white-space: pre; overflow: hidden; }
+.log .ok { color: #34d399; } .log .warn { color: #fbbf24; } .log .err { color: #f87171; } .log .dim { color: #71717a; }
+</style>
+</helmet>
+<div style="width:1440px;height:1200px;background:#fafafa;padding:32px;display:flex;flex-direction:column;gap:16px;overflow:hidden">
+      <div style="display:flex;align-items:baseline;gap:16px">
+        <h1 style="font-size:20px;font-weight:600">设计系统 · WalmartAPI 运营台</h1>
+        <span style="font-size:12px;color:#71717a">配色与组件词汇对齐旧系统 erp-core · 桌面 1440 · 单用户全天盯的工具,信息密度高但有层次</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><section class="card" style=""><header class="chead"><h2 class="ctitle">色板 · 逐值取自旧系统 erp-core</h2></header><div style="padding:16px;display:flex;flex-direction:column;gap:16px">
+      <div style="display:flex;gap:12px"><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#fafafa;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">底</div><div class="id" style="font-size:11px;color:#a1a1aa">#fafafa</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#ffffff;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">面板</div><div class="id" style="font-size:11px;color:#a1a1aa">#ffffff</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#f4f4f5;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">内边框</div><div class="id" style="font-size:11px;color:#a1a1aa">#f4f4f5</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#e4e4e7;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">边框</div><div class="id" style="font-size:11px;color:#a1a1aa">#e4e4e7</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#18181b;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">文字主 / 主按钮</div><div class="id" style="font-size:11px;color:#a1a1aa">#18181b</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#71717a;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">文字次</div><div class="id" style="font-size:11px;color:#a1a1aa">#71717a</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#a1a1aa;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">文字弱</div><div class="id" style="font-size:11px;color:#a1a1aa">#a1a1aa</div></div></div>
+      <div style="display:flex;gap:12px"><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#10b981;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">成功 emerald</div><div class="id" style="font-size:11px;color:#a1a1aa">#10b981</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#ef4444;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">失败 red</div><div class="id" style="font-size:11px;color:#a1a1aa">#ef4444</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#a1a1aa;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">忙 gray</div><div class="id" style="font-size:11px;color:#a1a1aa">#a1a1aa</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#f59e0b;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">不确定 amber</div><div class="id" style="font-size:11px;color:#a1a1aa">#f59e0b</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#0ea5e9;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">在途 sky</div><div class="id" style="font-size:11px;color:#a1a1aa">#0ea5e9</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#8b5cf6;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">特例 violet</div><div class="id" style="font-size:11px;color:#a1a1aa">#8b5cf6</div></div><div style="flex:1;min-width:0"><div style="height:40px;border-radius:6px;background:#dc2626;border:1px solid #e4e4e7"></div><div style="margin-top:6px;font-size:12px;color:#3f3f46">危险按钮 red-600</div><div class="id" style="font-size:11px;color:#a1a1aa">#dc2626</div></div></div>
+      <div style="font-size:12px;color:#71717a">中性色 = Tailwind zinc;状态色 emerald / amber / red / sky / violet;主按钮是 <b>zinc-900 黑</b>,不引入品牌蓝(界面上的按钮真的会写沃尔玛,不能染官方色)。</div>
+    </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">字阶 · Inter + Noto Sans SC / JetBrains Mono</h2></header><table><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">24 / 600 / mono tab</td><td class="td"><span class="kpival">128,455</span></td><td class="td" style="color:#a1a1aa;font-size:12px">KPI 大数</td></tr><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">14 / 400</td><td class="td"><span style="font-size:14px">订单行按「订单号 + SKU」合并,同订单同 SKU 必为一行。</span></td><td class="td" style="color:#a1a1aa;font-size:12px">正文 / 表格单元</td></tr><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">13 / 500</td><td class="td"><span style="font-size:13px;font-weight:500">卡片标题 · 导航项</span></td><td class="td" style="color:#a1a1aa;font-size:12px">组件标题</td></tr><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">12.5 / mono</td><td class="td"><span class="id">B0CHXNPXVX · PHUMWMT202608180042 · 6f9c41d2-8e31</span></td><td class="td" style="color:#a1a1aa;font-size:12px">ID:ASIN / SKU / feedId,要逐字符比对</td></tr><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">11 / 500 / 全大写</td><td class="td"><span class="th" style="border:0;background:none;padding:0">store · audit_status · exit</span></td><td class="td" style="color:#a1a1aa;font-size:12px">表头</td></tr><tr class="rz"><td class="td" style="width:170px;color:#71717a;font-size:12px">10 / mono</td><td class="td"><span class="navbadge">23</span> <span class="kbd">⌘K</span></td><td class="td" style="color:#a1a1aa;font-size:12px">徽标 / 快捷键</td></tr></table></section></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><section class="card" style=""><header class="chead"><h2 class="ctitle">语义① 运行结局 —— 五种,不是两种</h2></header><div style="padding:16px;display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;align-items:center;gap:24px">
+        <span class="pill"><span class="dot" style="background:#10b981"></span><span>成功 · 退出码 0</span></span><span class="pill"><span class="dot" style="background:#ef4444"></span><span>失败 · 退出码 1</span></span><span class="pill"><span class="dot" style="background:#a1a1aa"></span><span>忙 · 退出码 3,上一轮还在跑</span></span>
+        <span class="pill"><span class="dothollow"></span><span>结局不确定 · feed Unknown</span></span><span class="pill"><span class="dot" style="background:#8b5cf6"></span><span>配置错 · 退出码 2</span></span>
+      </div>
+      <div style="font-size:12px;color:#71717a;line-height:1.7">忙用<b>石板灰、不许红</b> —— 染红的话「它正忙」和「它坏了」混为一谈,人会天天去查一个没坏的东西。<br>
+      「结局不确定」用<b>琥珀空心点</b>(实心 = 已落定):它既不是成功也不是失败,系统的处理是不重复提交、等自愈链收尾。</div>
+    </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">语义② 按钮三档 + 危险的形状</h2></header><div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="btn bghost">查询</span><span class="btn bs">导出 CSV</span><span class="btn bp">同步 UPC</span>
+        <span class="btn bdanger"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>确认执行</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="btn sm bghost">查询</span><span class="btn sm bs">导出</span><span class="btn sm bp">运行</span>
+        <span class="btn sm bdanger"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>执行</span>
+        <span style="width:24px"></span>
+        <span style="font-size:12px;color:#71717a">对照:危险按钮(红<b>实心块</b> + ⚡)vs 失败徽章(红<b>点</b> + 文字)→</span>
+        <span class="pill"><span class="dot" style="background:#ef4444"></span><span>失败</span></span><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">拒绝</span>
+      </div>
+      <div style="font-size:12px;color:#71717a;line-height:1.7">危险按钮与失败徽章同色相,靠<b>形状 + ⚡ 图标</b>区分。危险按钮永远先出现「预览」那一步,不给直达;只读动作用幽灵按钮,常规写入用黑实心。</div>
+    </div></section></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px"><section class="card" style=""><header class="chead"><h2 class="ctitle">语义③ 中间态 vs 终态</h2></header><div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;align-items:center;gap:16px">
+        <span style="font-size:12px;color:#a1a1aa;width:64px">终态(实心)</span>
+        <span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">approved</span><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">rejected</span><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">done</span><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">withdrawn</span><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">通过</span><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">拒绝</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:16px">
+        <span style="font-size:12px;color:#a1a1aa;width:64px">中间态(虚线)</span>
+        <span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">pending</span><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">executing</span><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">Unknown</span><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">待人工</span>
+      </div>
+      <div style="font-size:12px;color:#71717a;line-height:1.7">pending / executing / Unknown 都是<b>还没完</b>,不配与 approved / done 相同的视觉重量:浅底 + 虚线描边,且列表里可一键筛出。</div>
+    </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">表格两档密度</h2></header><div style="padding:16px;display:flex;gap:16px">
+      <div style="flex:1"><div style="font-size:12px;color:#71717a;margin-bottom:6px">紧凑 32px —— 几十万行的产品/订单表默认档</div><div style="border:1px solid #e4e4e7;border-radius:6px;overflow:hidden"><table><tr><th class="th">ASIN</th><th class="th">标题</th><th class="th" style="text-align:right">采集价</th><th class="th">审核</th></tr><tr class="rc"><td class="td id">B0CHXNPXVX</td><td class="td">Anker 65W 充电器 …</td><td class="td num">$23.99</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">approved</span></td></tr><tr class="rc"><td class="td id">B0CHXNPXWX</td><td class="td">Anker 65W 充电器 …</td><td class="td num">$23.99</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">approved</span></td></tr></table></div></div>
+      <div style="flex:1"><div style="font-size:12px;color:#71717a;margin-bottom:6px">舒适 40px —— 队列与详情内嵌表</div><div style="border:1px solid #e4e4e7;border-radius:6px;overflow:hidden"><table><tr><th class="th">ASIN</th><th class="th">标题</th><th class="th" style="text-align:right">采集价</th><th class="th">审核</th></tr><tr class="rz"><td class="td id">B0CHXNPXVX</td><td class="td">Anker 65W 充电器 …</td><td class="td num">$23.99</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">approved</span></td></tr><tr class="rz"><td class="td id">B0CHXNPXWX</td><td class="td">Anker 65W 充电器 …</td><td class="td num">$23.99</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">approved</span></td></tr></table></div></div>
+    </div></section></div>
+    </div>
+</x-dc>
+<script data-dc-script data-props='{"$preview": {"width": 1440, "height": 1200}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

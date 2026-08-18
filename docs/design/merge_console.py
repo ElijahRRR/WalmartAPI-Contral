@@ -1,17 +1,37 @@
 # -*- coding: utf-8 -*-
-"""把所有者提供的交互原型(设计项目 465557a5 的 沃尔玛运营控制台.dc.html)
-合入本画布:内联 _ds 资源(画布 CSP 下相对路径加载不了)、修两处事实、
-补「审核中心」与「类目映射」两个原型里缺的视图。幂等:每次从 ref 原文重建。"""
+"""把所有者提供的交互原型合入本画布,并施加 erp-core 皮肤。幂等:每次从
+ref 原文(console.ref.dc.html 的源)重建。
+
+⚠ 换肤方法论(2026-08-18 第二次返工的教训):**不做变量硬映射**。
+原型把一个蓝色 accent 用在 72 处、承担了七种角色(链接/导航高亮/区块标
+/强调数字/中间态签/选中态/主按钮)。第一版把 accent 直接映成 zinc-900 黑,
+等于把七种角色全砸成黑灰 —— 层级和对比全毁。这版按角色拆:
+
+  · 信息/链接/强调  → sky(erp-core 的「在途/信息」蓝,#0369A1 系)
+  · 主动作/激活导航 → zinc-900 黑(**独立组件规则**,不走 accent)
+  · 危险动作       → red-600 实心(替换原型的斜纹描边语言)
+  · 语义三组       → red / amber / emerald 各 50 底 · 700 字 · 200 线
+  · 中间态         → sky 虚线(与「忙」的灰虚线必须分得开)
+"""
 import pathlib
 
 SRC = pathlib.Path("../ref-design/console.dc.html")
+s = SRC.read_text(encoding="utf-8")
+
+def sub1(old, new, n=1):
+    global s
+    assert s.count(old) == n, f"锚点计数 {s.count(old)} ≠ {n}: " + old[:60]
+    s = s.replace(old, new)
+
+# ══ 1. 内联设计系统资源(画布 CSP 下相对路径加载不了)══
 CSS = pathlib.Path("industry-styles.css").read_text(encoding="utf-8")
 for old, new in [
-    ("@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');", "/* 字体统一在页面 <link> 引入:Inter + Noto Sans SC + JetBrains Mono */"),
+    ("@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');",
+     "/* 字体统一在页面 <link> 引入:Inter + Noto Sans SC + JetBrains Mono */"),
     ("--color-bg: #f2f2f3;", "--color-bg: #fafafa;"),
     ("--color-surface: #e9e9ea;", "--color-surface: #ffffff;"),
     ("--color-text: #1d1f20;", "--color-text: #18181b;"),
-    ("--color-accent: #5980a6;", "--color-accent: #18181b;"),
+    ("--color-accent: #5980a6;", "--color-accent: #0369a1;"),
     ("--color-accent-2: #728fab;", "--color-accent-2: #52525b;"),
     ("--color-divider: color-mix(in srgb, #1d1f20 16%, transparent);", "--color-divider: #e4e4e7;"),
     ('--font-heading: "Barlow Condensed", system-ui, sans-serif;', "--font-heading: 'Inter', 'Noto Sans SC', system-ui, sans-serif;"),
@@ -25,50 +45,37 @@ for old, new in [
     ("--color-neutral-700: #5d5d60;", "--color-neutral-700: #3f3f46;"),
     ("--color-neutral-800: #424244;", "--color-neutral-800: #27272a;"),
     ("--color-neutral-900: #2b2b2d;", "--color-neutral-900: #18181b;"),
-    ("--color-accent-100: #eef6ff;", "--color-accent-100: #f4f4f5;"),
-    ("--color-accent-200: #d6ebff;", "--color-accent-200: #e4e4e7;"),
-    ("--color-accent-300: #b5d9fd;", "--color-accent-300: #d4d4d8;"),
-    ("--color-accent-400: #94bce3;", "--color-accent-400: #a1a1aa;"),
-    ("--color-accent-500: #749dc4;", "--color-accent-500: #71717a;"),
-    ("--color-accent-600: #597ea3;", "--color-accent-600: #27272a;"),
-    ("--color-accent-700: #416180;", "--color-accent-700: #3f3f46;"),
-    ("--color-accent-800: #2c455d;", "--color-accent-800: #27272a;"),
-    ("--color-accent-900: #1d2d3d;", "--color-accent-900: #18181b;"),
-    ("--color-accent-2-100: #eef6ff;", "--color-accent-2-100: #f0f9ff;"),
-    ("--color-accent-2-200: #d6ebff;", "--color-accent-2-200: #e0f2fe;"),
-    ("--color-accent-2-300: #bdd8f2;", "--color-accent-2-300: #bae6fd;"),
-    ("--color-accent-2-400: #9ebbd8;", "--color-accent-2-400: #7dd3fc;"),
-    ("--color-accent-2-500: #7e9cb8;", "--color-accent-2-500: #38bdf8;"),
-    ("--color-accent-2-600: #627d98;", "--color-accent-2-600: #0284c7;"),
-    ("--color-accent-2-700: #486077;", "--color-accent-2-700: #0369a1;"),
-    ("--color-accent-2-800: #314457;", "--color-accent-2-800: #075985;"),
-    ("--color-accent-2-900: #1f2d3a;", "--color-accent-2-900: #0c4a6e;"),
+    ("--color-accent-100: #eef6ff;", "--color-accent-100: #f0f9ff;"),
+    ("--color-accent-200: #d6ebff;", "--color-accent-200: #e0f2fe;"),
+    ("--color-accent-300: #b5d9fd;", "--color-accent-300: #bae6fd;"),
+    ("--color-accent-400: #94bce3;", "--color-accent-400: #38bdf8;"),
+    ("--color-accent-500: #749dc4;", "--color-accent-500: #0284c7;"),
+    ("--color-accent-600: #597ea3;", "--color-accent-600: #0369a1;"),
+    ("--color-accent-700: #416180;", "--color-accent-700: #075985;"),
+    ("--color-accent-800: #2c455d;", "--color-accent-800: #0c4a6e;"),
+    ("--color-accent-900: #1d2d3d;", "--color-accent-900: #082f49;"),
+    ("--color-accent-2-100: #eef6ff;", "--color-accent-2-100: #f4f4f5;"),
+    ("--color-accent-2-200: #d6ebff;", "--color-accent-2-200: #e4e4e7;"),
+    ("--color-accent-2-300: #bdd8f2;", "--color-accent-2-300: #d4d4d8;"),
+    ("--color-accent-2-400: #9ebbd8;", "--color-accent-2-400: #a1a1aa;"),
+    ("--color-accent-2-500: #7e9cb8;", "--color-accent-2-500: #71717a;"),
+    ("--color-accent-2-600: #627d98;", "--color-accent-2-600: #52525b;"),
+    ("--color-accent-2-700: #486077;", "--color-accent-2-700: #3f3f46;"),
+    ("--color-accent-2-800: #314457;", "--color-accent-2-800: #27272a;"),
+    ("--color-accent-2-900: #1f2d3a;", "--color-accent-2-900: #18181b;"),
 ]:
     assert old in CSS, "CSS 锚点缺失: " + old[:50]
     CSS = CSS.replace(old, new)
-s = SRC.read_text(encoding="utf-8")
-
-def sub1(old, new):
-    global s
-    assert s.count(old) == 1, "锚点不唯一或缺失: " + old[:60]
-    s = s.replace(old, new)
-
-# ── 1. 内联设计系统资源 ──
 sub1('<link rel="stylesheet" href="_ds/industry-71bd4807-93ea-4481-ab4b-859c6b1d7a71/styles.css">',
      "<style>\n" + CSS + "\n</style>")
 sub1('<script src="_ds/industry-71bd4807-93ea-4481-ab4b-859c6b1d7a71/_ds_bundle.js"></script>',
      '<script>window.Industry_indust = window.Industry_indust || {__errors: []};</script>')
 
-
-# ── 2.5 换肤:erp-core 配色(所有者 2026-08-18 定稿:功能用原型的,配色用 erp-core)──
-# 原型的颜色全走 CSS 变量,换肤 = 换 token;组件形态(方角/四角标记/斜纹危险钮)不动。
-
-# 字体:Barlow 三件套 → Inter + Noto Sans SC + JetBrains Mono(erp-core 同款)
+# ══ 2. 字体 ══
 sub1('<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&family=Barlow+Semi+Condensed:wght@400;500&display=swap" rel="stylesheet">',
      '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">')
 
-# 语义色:红黄绿 → erp-core 的 red/amber/emerald 三组(50 底 / 700 字 / 200 线),
-# 另立 mid(sky,在途/中间态)与 ok-dot(emerald-500 圆点),字体变量一并锚定
+# ══ 3. 主题变量:语义三组 + sky 信息蓝 ══
 sub1("""[data-theme]{
   --sev-bad:#a32b1c; --sev-bad-ink:#7d2015; --sev-bad-bg:#fbeae7; --sev-bad-line:#d99d92;
   --sev-warn-ink:#7a5205; --sev-warn-bg:#fdf2de; --sev-warn-line:#ddb972;
@@ -82,9 +89,6 @@ sub1("""[data-theme]{
   --font-heading:'Inter','Noto Sans SC',system-ui,sans-serif;
   --font-body:'Inter','Noto Sans SC',system-ui,sans-serif;
 }""")
-
-# 浅色主题:蓝主色 → zinc 中性系 + 黑主按钮(accent 阶映射 zinc 阶;
-# accent-600 定 #27272A 让 btn-primary:hover = zinc-800)
 sub1("""[data-theme="light"]{
   --color-bg:#ffffff; --color-text:#0e1114;
   --color-divider:#c6ccd2;
@@ -97,16 +101,14 @@ sub1("""[data-theme="light"]{
 """[data-theme="light"]{
   --color-bg:#fafafa; --color-surface:#ffffff; --color-text:#18181b;
   --color-divider:#e4e4e7;
-  --color-accent:#18181b;
-  --color-accent-100:#f4f4f5; --color-accent-200:#e4e4e7; --color-accent-300:#d4d4d8;
-  --color-accent-400:#a1a1aa; --color-accent-500:#71717a; --color-accent-600:#27272a;
-  --color-accent-700:#3f3f46; --color-accent-800:#27272a; --color-accent-900:#18181b;
+  --color-accent:#0369a1;
+  --color-accent-100:#f0f9ff; --color-accent-200:#e0f2fe; --color-accent-300:#bae6fd;
+  --color-accent-400:#38bdf8; --color-accent-500:#0284c7; --color-accent-600:#0369a1;
+  --color-accent-700:#075985; --color-accent-800:#0c4a6e; --color-accent-900:#082f49;
   --color-neutral-400:#a1a1aa;
 }""")
 sub1('[data-theme="light"] > aside{background:#eceff2}',
      '[data-theme="light"] > aside{background:#ffffff}')
-
-# 深色主题:zinc 暗面等价映射(主按钮反白,语义色亮一档)
 sub1("""[data-theme="dark"]{
   --color-bg:#17191b; --color-surface:#1f2225; --color-text:#e8e9ea;
   --color-divider:color-mix(in srgb,#e8e9ea 30%,transparent);
@@ -120,58 +122,150 @@ sub1("""[data-theme="dark"]{
   --shadow-lg:0 12px 32px rgba(0,0,0,.55);
 }""",
 """[data-theme="dark"]{
-  --color-bg:#18181b; --color-surface:#27272a; --color-text:#f4f4f5;
-  --color-divider:color-mix(in srgb,#f4f4f5 22%,transparent);
+  --color-bg:#18181b; --color-surface:#232327; --color-text:#f4f4f5;
+  --color-divider:color-mix(in srgb,#f4f4f5 20%,transparent);
   --sev-bad:#dc2626; --sev-bad-ink:#fca5a5; --sev-bad-bg:#3f1d1d; --sev-bad-line:#7f1d1d;
   --sev-warn-ink:#fcd34d; --sev-warn-bg:#3a2e12; --sev-warn-line:#78591b;
   --sev-ok-ink:#6ee7b7; --sev-ok-bg:#132e21; --sev-ok-line:#065f46; --sev-ok-dot:#34d399;
   --sev-mid-ink:#7dd3fc; --sev-mid-line:#0369a1;
-  --color-accent:#f4f4f5;
-  --color-accent-100:#27272a; --color-accent-200:#3f3f46; --color-accent-300:#52525b; --color-accent-400:#71717a; --color-accent-700:#d4d4d8;
-  --color-accent-800:#e4e4e7; --color-accent-900:#f4f4f5;
+  --color-accent:#7dd3fc;
+  --color-accent-100:#12283a; --color-accent-200:#143a54; --color-accent-300:#1e5372; --color-accent-400:#2f6f96; --color-accent-700:#a5ddfc;
+  --color-accent-800:#cfeefe; --color-accent-900:#e8f7ff;
   --color-neutral-100:#27272a; --color-neutral-400:#71717a; --color-neutral-800:#d4d4d8; --color-neutral-900:#f4f4f5;
   --shadow-lg:0 12px 32px rgba(0,0,0,.55);
 }""")
 sub1('[data-theme="dark"] .tag-accent{background:#22303d;color:#cfe1f2}',
-     '[data-theme="dark"] .tag-accent{background:#27272a;color:#e4e4e7}')
+     '[data-theme="dark"] .tag-accent{background:#12283a;color:#cfeefe}')
 sub1('[data-theme="dark"] .tag-neutral{background:#23262a;color:#d3d5d7}',
      '[data-theme="dark"] .tag-neutral{background:#27272a;color:#d4d4d8}')
 
-# ID/数字等宽:Barlow Semi Condensed → JetBrains Mono(要逐字符比对的东西)
+# ══ 4. 等宽与 erp-core 组件皮肤层(按组件重写;追加在原型样式之后,级联取胜)══
 sub1('.mono{font-family:"Barlow Semi Condensed",ui-monospace,monospace;font-variant-numeric:tabular-nums}',
      ".mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:.94em;letter-spacing:-0.01em}")
-
-# 表头压回 erp-core 的弱灰(zinc 映射后 accent-900 会太黑)
 sub1(".hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}",
-     ".hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}\n"
-     ".table thead th{color:#71717a}\n"
-     '[data-theme="dark"] .table thead th{color:#a1a1aa}')
+     """.hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}
 
-# 中间态签:accent(会映成灰,与「忙」撞)→ sky —— 在途/还没完 用 erp-core 的 sky
+/* ═══ erp-core 组件皮肤(逐组件重写,非变量映射)═══ */
+body{font-size:14px}
+.blueprint > .corner{display:none}
+.blueprint{border-radius:8px}
+.card{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:8px}
+.card.blueprint{background:var(--color-surface)}
+.dialog{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:8px}
+.btn{border-radius:6px}
+.input{border-radius:6px;background:var(--color-surface);border-color:#d4d4d8}
+.seg{border-radius:6px;border-color:#d4d4d8}
+.seg-opt:has(input:checked){background:#18181b;color:#fff}
+.tag{border-radius:4px}
+.btn-primary{background:#18181b;border-color:#18181b;color:#fff}
+.btn-primary:hover{background:#27272a}
+.btn-primary:active{background:#3f3f46}
+.btn-secondary{border-color:#d4d4d8;background:var(--color-surface);color:var(--color-text)}
+.btn-secondary:hover{background:#f4f4f5}
+.btn-secondary:active{background:#e4e4e7}
+.btn-ghost{color:#3f3f46}
+.btn-ghost:hover{background:#f4f4f5}
+.btn.hz{background:#dc2626;border-color:#dc2626;color:#fff;background-image:none}
+.btn.hz:hover{background:#b91c1c}
+.table thead th{background:#fafafa;color:#71717a;border-bottom:1px solid #e4e4e7}
+.table td{border-bottom:1px solid #f4f4f5}
+.table tbody tr:hover{background:#fafafa}
+:focus-visible{outline-color:#18181b}
+/* —— 深色等价 —— */
+[data-theme="dark"] > aside{background:#1c1c20}
+[data-theme="dark"] .input{background:#27272a;border-color:#3f3f46}
+[data-theme="dark"] .seg{border-color:#3f3f46}
+[data-theme="dark"] .seg-opt:has(input:checked){background:#f4f4f5;color:#18181b}
+[data-theme="dark"] .btn-primary{background:#f4f4f5;border-color:#f4f4f5;color:#18181b}
+[data-theme="dark"] .btn-primary:hover{background:#e4e4e7}
+[data-theme="dark"] .btn-primary:active{background:#d4d4d8}
+[data-theme="dark"] .btn-secondary{border-color:#3f3f46}
+[data-theme="dark"] .btn-secondary:hover{background:#3f3f46}
+[data-theme="dark"] .btn-secondary:active{background:#52525b}
+[data-theme="dark"] .btn-ghost{color:#d4d4d8}
+[data-theme="dark"] .btn-ghost:hover{background:#27272a}
+[data-theme="dark"] .table thead th{background:#1f1f23;color:#a1a1aa;border-bottom-color:#3f3f46}
+[data-theme="dark"] .table td{border-bottom-color:#2b2b30}
+[data-theme="dark"] .table tbody tr:hover{background:#1f1f23}
+[data-theme="dark"] :focus-visible{outline-color:#f4f4f5}""")
+
+# ══ 5. 语义常量与点阵 ══
 sub1("const MID  = {chipBg:'transparent',chipFg:'var(--color-accent-700)',chipBorder:'var(--color-accent-400)',chipBorderStyle:'dashed'};",
      "const MID  = {chipBg:'transparent',chipFg:'var(--sev-mid-ink)',chipBorder:'var(--sev-mid-line)',chipBorderStyle:'dashed'};")
-
-# 店铺点阵:凭证有效 = emerald 点(黑点读不出「健康」)
 sub1("out.push({title: '店铺 ' + (i + 1) + ' · 凭证有效', bg: 'var(--color-accent-700)', borderStyle: 'solid'});",
      "out.push({title: '店铺 ' + (i + 1) + ' · 凭证有效', bg: 'var(--sev-ok-dot)', borderStyle: 'solid'});")
 
-# ── 2. 两处事实修正 ──
+# ══ 6. 激活导航 = 黑底白字(erp-core navActive;深色反白)══
+sub1("""  navGroups() {
+    return NAV.map(([title, items]) => ({
+      title,
+      items: items.map(([id, label, badge, tone]) => ({
+        label, badge, href: '#' + id, go: this.go(id),
+        rule: this.state.page === id ? 'var(--color-accent)' : 'transparent',
+        bg: this.state.page === id ? 'color-mix(in srgb,var(--color-accent) 12%,transparent)' : 'transparent',
+        badgeColor: tone === 'accent' ? 'var(--color-accent)' : 'color-mix(in srgb,var(--color-text) 42%,transparent)',
+      })),
+    }));
+  }""",
+"""  navGroups() {
+    const dark = this.theme() === 'dark';
+    return NAV.map(([title, items]) => ({
+      title,
+      items: items.map(([id, label, badge, tone]) => {
+        const on = this.state.page === id;
+        return {
+          label, badge, href: '#' + id, go: this.go(id),
+          rule: 'transparent',
+          bg: on ? (dark ? '#f4f4f5' : '#18181b') : 'transparent',
+          fg: on ? (dark ? '#18181b' : '#ffffff') : 'inherit',
+          badgeColor: on ? (dark ? 'rgba(24,24,27,.6)' : 'rgba(255,255,255,.72)')
+                         : tone === 'accent' ? 'var(--color-accent)'
+                         : 'color-mix(in srgb,var(--color-text) 42%,transparent)',
+        };
+      }),
+    }));
+  }""")
+sub1('style="display:flex;align-items:center;gap:8px;padding:6px 8px;text-decoration:none;font-size:13.5px;color:inherit;border-left:2px solid {{ it.rule }};background:{{ it.bg }}"',
+     'style="display:flex;align-items:center;gap:8px;padding:6px 8px;text-decoration:none;font-size:13.5px;color:{{ it.fg }};border-radius:6px;border-left:2px solid {{ it.rule }};background:{{ it.bg }}"')
+
+# ══ 7. 危险语言换装:斜纹描边 → 红实心(与皮肤层的 .btn.hz 一致)+ 危数改 20 ══
+sub1("{chip:'危险 · 预览→确认', ...FAIL, hatch:'hz', desc:'21 条会真写沃尔玛且不可逆：上架、删除、改价。斜纹描边，两步走。'},",
+     "{chip:'危险 · 预览→确认', ...FAIL, hatch:'', desc:'20 条会真写沃尔玛且不可逆：上架、删除、改价。红实心按钮，预览 → 确认两步走。'},")
+sub1('危险工作流的按钮是<span class="hz" style="padding:1px 6px;border:1px solid var(--color-text)">斜纹描边</span>，只读的是普通线框 —— 一眼看出这个按钮会不会写沃尔玛。',
+     '危险工作流的按钮是<span style="padding:1px 8px;background:#dc2626;color:#fff;border-radius:4px">红实心</span>，只读的是普通线框 —— 一眼看出这个按钮会不会写沃尔玛。')
+sub1("<!-- ═══ 预览 → 确认 → 执行：右侧抽屉（21 条危险工作流共用） ═══ -->",
+     "<!-- ═══ 预览 → 确认 → 执行：右侧抽屉（20 条危险工作流共用） ═══ -->")
+sub1("note:'21 条危险工作流共用。", "note:'20 条危险工作流共用。")
+sub1('token 对齐本设计系统（方角、hairline、四角定位十字用一个 Frame 组件包）',
+     'token 对齐 erp-core（zinc 中性系、黑主按钮、sky 信息蓝、圆角 8 / 6 / 4、hairline 分隔）')
+
+# ══ 8. 两处事实修正 ══
 sub1("没抢到锁：上一轮 17:30 那次还在跑（27 个在途轮询慢）。不是失败，不要重试",
      "没抢到锁：上一轮 17:30 那次还在跑。不是失败，不要重试。⚠ 这一轮不写 ops.runs（拿不到锁在记录之前就退出）——此行是时间轴合成显示")
-# 该字符串出现两次(时间轴 + 运行记录),两处一起改
 old_wh = "日报推送失败：飞书群 webhook 403"
 assert s.count(old_wh) == 2
 s = s.replace(old_wh, "日报发送失败：飞书应用凭证过期（401）——通知走应用直发，没有 webhook")
 
-# ── 3. PAGES / NAV 注册两个新视图 ──
+
+# ══ 8.5 三处数据修正(原型自带)══
+# ① 订单表审核列越界:audit 值在 r[10],r[11] 是 undefined → 整列落到兜底「建议拒绝」
+sub1("      const c = chip(r[11]);", "      const c = chip(r[10]);")
+# ② 危险工作流实数 20(grep -c '^DANGEROUS = True' workflows/*.py)
+sub1("""              <div style="font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent)">危险（会写沃尔玛 / 不可逆）</div>
+              <div class="num" style="font-family:var(--font-heading);font-weight:600;font-size:28px">21</div>""",
+"""              <div style="font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent)">危险（会写沃尔玛 / 不可逆）</div>
+              <div class="num" style="font-family:var(--font-heading);font-weight:600;font-size:28px">20</div>""")
+# ③ 「在调度里 11」数的是任务不是工作流:11 条任务共跑 21 条工作流,手动 45 条
+sub1('<div style="font-size:11px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">其余 55 条人手动触发</div>',
+     '<div style="font-size:11px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">11 条任务共跑 21 条工作流;其余 45 条人手动触发</div>')
+
+# ══ 9. 注册并补齐两个原型缺的视图(审核中心 / 类目映射)══
 sub1("  products:  ['产品中心', '产品列表 · 亚马逊侧 / 沃尔玛侧对照'],",
      "  products:  ['产品中心', '产品列表 · 亚马逊侧 / 沃尔玛侧对照'],\n"
      "  audit:     ['产品中心', '审核中心 · L0-L4 分层 · pending 两来源 · 重审三通道'],\n"
      "  catmap:    ['产品中心', '类目映射 · node_id 锚 · 四桶缺口 · 置信度生命周期'],")
 sub1("  ['产品', [['products','产品列表','128k',''],['listing','上架漏斗 · UPC 池','40',''],['blacklist','黑名单中心','4','']]],",
      "  ['产品', [['products','产品列表','128k',''],['audit','审核中心','1.2k',''],['listing','上架漏斗 · UPC 池','40',''],['blacklist','黑名单中心','4',''],['catmap','类目映射','37','']]],")
-
-# ── 4. renderVals 视图开关与数据接线 ──
 sub1("      isAlloc: page === 'alloc', isNotes: page === 'notes',",
      "      isAlloc: page === 'alloc', isNotes: page === 'notes',\n"
      "      isAudit: page === 'audit', isCatmap: page === 'catmap',")
@@ -184,7 +278,6 @@ sub1("      stores: this.stores(),",
      "      catmapBuckets: this.catmapBuckets(),\n"
      "      catmapLife: this.catmapLife(),")
 
-# ── 5. 两个新视图的数据(与其余视图同一批语义色常量) ──
 GETTERS = r'''
   auditTiles() {
     return [
@@ -246,7 +339,6 @@ GETTERS = r'''
 '''
 sub1("  renderVals() {", GETTERS + "\n  renderVals() {")
 
-# ── 6. 两个新视图的标记(沿用 cellgrid / card blueprint / 脚注条语言) ──
 VIEWS = r'''      <!-- ═══ 审核中心 ═══ -->
       <sc-if value="{{ isAudit }}">
         <div style="display:flex;flex-direction:column;gap:16px">
@@ -288,8 +380,8 @@ VIEWS = r'''      <!-- ═══ 审核中心 ═══ -->
               <div class="card-kicker">重审三通道(危险,各自确认;「清空表 E 列」不是重审入口)</div>
               <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px">
                 <sc-for list="{{ auditRedo }}" as="r" hint-placeholder-count="3">
-                  <div style="border:1px solid var(--color-divider);padding:10px 12px;display:flex;flex-direction:column;gap:5px">
-                    <span class="mono" style="font-size:12px;font-weight:600;color:var(--color-accent-800)">{{ r.cmd }}</span>
+                  <div style="border:1px solid var(--color-divider);border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:5px">
+                    <span class="mono" style="font-size:12px;font-weight:600;color:var(--color-accent-700)">{{ r.cmd }}</span>
                     <span style="font-size:12.5px;font-weight:500">{{ r.title }}</span>
                     <span style="font-size:11px;line-height:1.5;color:color-mix(in srgb,var(--color-text) 62%,transparent);white-space:normal">{{ r.note }}</span>
                   </div>

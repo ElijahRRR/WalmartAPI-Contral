@@ -20,7 +20,7 @@
   --color-bg: #fafafa;
   --color-surface: #ffffff;
   --color-text: #18181b;
-  --color-accent: #18181b;
+  --color-accent: #0369a1;
   --color-accent-2: #52525b;
   --color-divider: #e4e4e7;
 
@@ -36,25 +36,25 @@
   --color-neutral-800: #27272a;
   --color-neutral-900: #18181b;
 
-  --color-accent-100: #f4f4f5;
-  --color-accent-200: #e4e4e7;
-  --color-accent-300: #d4d4d8;
-  --color-accent-400: #a1a1aa;
-  --color-accent-500: #71717a;
-  --color-accent-600: #27272a;
-  --color-accent-700: #3f3f46;
-  --color-accent-800: #27272a;
-  --color-accent-900: #18181b;
+  --color-accent-100: #f0f9ff;
+  --color-accent-200: #e0f2fe;
+  --color-accent-300: #bae6fd;
+  --color-accent-400: #38bdf8;
+  --color-accent-500: #0284c7;
+  --color-accent-600: #0369a1;
+  --color-accent-700: #075985;
+  --color-accent-800: #0c4a6e;
+  --color-accent-900: #082f49;
 
-  --color-accent-2-100: #f0f9ff;
-  --color-accent-2-200: #e0f2fe;
-  --color-accent-2-300: #bae6fd;
-  --color-accent-2-400: #7dd3fc;
-  --color-accent-2-500: #38bdf8;
-  --color-accent-2-600: #0284c7;
-  --color-accent-2-700: #0369a1;
-  --color-accent-2-800: #075985;
-  --color-accent-2-900: #0c4a6e;
+  --color-accent-2-100: #f4f4f5;
+  --color-accent-2-200: #e4e4e7;
+  --color-accent-2-300: #d4d4d8;
+  --color-accent-2-400: #a1a1aa;
+  --color-accent-2-500: #71717a;
+  --color-accent-2-600: #52525b;
+  --color-accent-2-700: #3f3f46;
+  --color-accent-2-800: #27272a;
+  --color-accent-2-900: #18181b;
 
   --font-heading: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
   --font-heading-weight: 600;
@@ -313,27 +313,27 @@ textarea.input { min-height: 90px; resize: vertical; }
 [data-theme="light"]{
   --color-bg:#fafafa; --color-surface:#ffffff; --color-text:#18181b;
   --color-divider:#e4e4e7;
-  --color-accent:#18181b;
-  --color-accent-100:#f4f4f5; --color-accent-200:#e4e4e7; --color-accent-300:#d4d4d8;
-  --color-accent-400:#a1a1aa; --color-accent-500:#71717a; --color-accent-600:#27272a;
-  --color-accent-700:#3f3f46; --color-accent-800:#27272a; --color-accent-900:#18181b;
+  --color-accent:#0369a1;
+  --color-accent-100:#f0f9ff; --color-accent-200:#e0f2fe; --color-accent-300:#bae6fd;
+  --color-accent-400:#38bdf8; --color-accent-500:#0284c7; --color-accent-600:#0369a1;
+  --color-accent-700:#075985; --color-accent-800:#0c4a6e; --color-accent-900:#082f49;
   --color-neutral-400:#a1a1aa;
 }
 [data-theme="light"] > aside{background:#ffffff}
 [data-theme="dark"]{
-  --color-bg:#18181b; --color-surface:#27272a; --color-text:#f4f4f5;
-  --color-divider:color-mix(in srgb,#f4f4f5 22%,transparent);
+  --color-bg:#18181b; --color-surface:#232327; --color-text:#f4f4f5;
+  --color-divider:color-mix(in srgb,#f4f4f5 20%,transparent);
   --sev-bad:#dc2626; --sev-bad-ink:#fca5a5; --sev-bad-bg:#3f1d1d; --sev-bad-line:#7f1d1d;
   --sev-warn-ink:#fcd34d; --sev-warn-bg:#3a2e12; --sev-warn-line:#78591b;
   --sev-ok-ink:#6ee7b7; --sev-ok-bg:#132e21; --sev-ok-line:#065f46; --sev-ok-dot:#34d399;
   --sev-mid-ink:#7dd3fc; --sev-mid-line:#0369a1;
-  --color-accent:#f4f4f5;
-  --color-accent-100:#27272a; --color-accent-200:#3f3f46; --color-accent-300:#52525b; --color-accent-400:#71717a; --color-accent-700:#d4d4d8;
-  --color-accent-800:#e4e4e7; --color-accent-900:#f4f4f5;
+  --color-accent:#7dd3fc;
+  --color-accent-100:#12283a; --color-accent-200:#143a54; --color-accent-300:#1e5372; --color-accent-400:#2f6f96; --color-accent-700:#a5ddfc;
+  --color-accent-800:#cfeefe; --color-accent-900:#e8f7ff;
   --color-neutral-100:#27272a; --color-neutral-400:#71717a; --color-neutral-800:#d4d4d8; --color-neutral-900:#f4f4f5;
   --shadow-lg:0 12px 32px rgba(0,0,0,.55);
 }
-[data-theme="dark"] .tag-accent{background:#27272a;color:#e4e4e7}
+[data-theme="dark"] .tag-accent{background:#12283a;color:#cfeefe}
 [data-theme="dark"] .tag-neutral{background:#27272a;color:#d4d4d8}
 [data-density="compact"] .table td{padding:3px 7px}
 [data-density="compact"] .table th{padding:4px 7px}
@@ -346,8 +346,50 @@ textarea.input { min-height: 90px; resize: vertical; }
 .mono{font-family:'JetBrains Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:.94em;letter-spacing:-0.01em}
 .num{font-variant-numeric:tabular-nums}
 .hz{background-image:repeating-linear-gradient(135deg,transparent 0 5px,color-mix(in srgb,var(--color-text) 22%,transparent) 5px 6px)}
-.table thead th{color:#71717a}
-[data-theme="dark"] .table thead th{color:#a1a1aa}
+
+/* ═══ erp-core 组件皮肤(逐组件重写,非变量映射)═══ */
+body{font-size:14px}
+.blueprint > .corner{display:none}
+.blueprint{border-radius:8px}
+.card{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:8px}
+.card.blueprint{background:var(--color-surface)}
+.dialog{background:var(--color-surface);border:1px solid var(--color-divider);border-radius:8px}
+.btn{border-radius:6px}
+.input{border-radius:6px;background:var(--color-surface);border-color:#d4d4d8}
+.seg{border-radius:6px;border-color:#d4d4d8}
+.seg-opt:has(input:checked){background:#18181b;color:#fff}
+.tag{border-radius:4px}
+.btn-primary{background:#18181b;border-color:#18181b;color:#fff}
+.btn-primary:hover{background:#27272a}
+.btn-primary:active{background:#3f3f46}
+.btn-secondary{border-color:#d4d4d8;background:var(--color-surface);color:var(--color-text)}
+.btn-secondary:hover{background:#f4f4f5}
+.btn-secondary:active{background:#e4e4e7}
+.btn-ghost{color:#3f3f46}
+.btn-ghost:hover{background:#f4f4f5}
+.btn.hz{background:#dc2626;border-color:#dc2626;color:#fff;background-image:none}
+.btn.hz:hover{background:#b91c1c}
+.table thead th{background:#fafafa;color:#71717a;border-bottom:1px solid #e4e4e7}
+.table td{border-bottom:1px solid #f4f4f5}
+.table tbody tr:hover{background:#fafafa}
+:focus-visible{outline-color:#18181b}
+/* —— 深色等价 —— */
+[data-theme="dark"] > aside{background:#1c1c20}
+[data-theme="dark"] .input{background:#27272a;border-color:#3f3f46}
+[data-theme="dark"] .seg{border-color:#3f3f46}
+[data-theme="dark"] .seg-opt:has(input:checked){background:#f4f4f5;color:#18181b}
+[data-theme="dark"] .btn-primary{background:#f4f4f5;border-color:#f4f4f5;color:#18181b}
+[data-theme="dark"] .btn-primary:hover{background:#e4e4e7}
+[data-theme="dark"] .btn-primary:active{background:#d4d4d8}
+[data-theme="dark"] .btn-secondary{border-color:#3f3f46}
+[data-theme="dark"] .btn-secondary:hover{background:#3f3f46}
+[data-theme="dark"] .btn-secondary:active{background:#52525b}
+[data-theme="dark"] .btn-ghost{color:#d4d4d8}
+[data-theme="dark"] .btn-ghost:hover{background:#27272a}
+[data-theme="dark"] .table thead th{background:#1f1f23;color:#a1a1aa;border-bottom-color:#3f3f46}
+[data-theme="dark"] .table td{border-bottom-color:#2b2b30}
+[data-theme="dark"] .table tbody tr:hover{background:#1f1f23}
+[data-theme="dark"] :focus-visible{outline-color:#f4f4f5}
 </style>
 </helmet>
 
@@ -365,7 +407,7 @@ textarea.input { min-height: 90px; resize: vertical; }
         <div style="display:flex;flex-direction:column;gap:1px">
           <div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 45%,transparent);padding:0 6px 5px">{{ g.title }}</div>
           <sc-for list="{{ g.items }}" as="it" hint-placeholder-count="3">
-            <a href="{{ it.href }}" onClick="{{ it.go }}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;text-decoration:none;font-size:13.5px;color:inherit;border-left:2px solid {{ it.rule }};background:{{ it.bg }}" style-hover="background:color-mix(in srgb,var(--color-text) 6%,transparent)">
+            <a href="{{ it.href }}" onClick="{{ it.go }}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;text-decoration:none;font-size:13.5px;color:{{ it.fg }};border-radius:6px;border-left:2px solid {{ it.rule }};background:{{ it.bg }}" style-hover="background:color-mix(in srgb,var(--color-text) 6%,transparent)">
               <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis">{{ it.label }}</span>
               <span class="num" style="font-size:11px;color:{{ it.badgeColor }}">{{ it.badge }}</span>
             </a>
@@ -541,13 +583,13 @@ textarea.input { min-height: 90px; resize: vertical; }
             </div>
             <div style="background:var(--color-bg);padding:12px 14px">
               <div style="font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent)">危险（会写沃尔玛 / 不可逆）</div>
-              <div class="num" style="font-family:var(--font-heading);font-weight:600;font-size:28px">21</div>
+              <div class="num" style="font-family:var(--font-heading);font-weight:600;font-size:28px">20</div>
               <div style="font-size:11px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">一律走「预览 → 确认」两步</div>
             </div>
             <div style="background:var(--color-bg);padding:12px 14px">
               <div style="font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent)">在调度里</div>
               <div class="num" style="font-family:var(--font-heading);font-weight:600;font-size:28px">11</div>
-              <div style="font-size:11px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">其余 55 条人手动触发</div>
+              <div style="font-size:11px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">11 条任务共跑 21 条工作流;其余 45 条人手动触发</div>
             </div>
             <div style="background:var(--color-bg);padding:12px 14px">
               <div style="font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent)">此刻持锁</div>
@@ -563,7 +605,7 @@ textarea.input { min-height: 90px; resize: vertical; }
                 <label class="seg-opt"><input type="radio" name="wff" checked="{{ f.on }}" onChange="{{ f.pick }}">{{ f.label }}</label>
               </sc-for>
             </div>
-            <div style="font-size:11.5px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">危险工作流的按钮是<span class="hz" style="padding:1px 6px;border:1px solid var(--color-text)">斜纹描边</span>，只读的是普通线框 —— 一眼看出这个按钮会不会写沃尔玛。</div>
+            <div style="font-size:11.5px;color:color-mix(in srgb,var(--color-text) 55%,transparent)">危险工作流的按钮是<span style="padding:1px 8px;background:#dc2626;color:#fff;border-radius:4px">红实心</span>，只读的是普通线框 —— 一眼看出这个按钮会不会写沃尔玛。</div>
           </div>
 
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));gap:16px;align-items:start">
@@ -1874,8 +1916,8 @@ textarea.input { min-height: 90px; resize: vertical; }
               <div class="card-kicker">重审三通道(危险,各自确认;「清空表 E 列」不是重审入口)</div>
               <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px">
                 <sc-for list="{{ auditRedo }}" as="r" hint-placeholder-count="3">
-                  <div style="border:1px solid var(--color-divider);padding:10px 12px;display:flex;flex-direction:column;gap:5px">
-                    <span class="mono" style="font-size:12px;font-weight:600;color:var(--color-accent-800)">{{ r.cmd }}</span>
+                  <div style="border:1px solid var(--color-divider);border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:5px">
+                    <span class="mono" style="font-size:12px;font-weight:600;color:var(--color-accent-700)">{{ r.cmd }}</span>
                     <span style="font-size:12.5px;font-weight:500">{{ r.title }}</span>
                     <span style="font-size:11px;line-height:1.5;color:color-mix(in srgb,var(--color-text) 62%,transparent);white-space:normal">{{ r.note }}</span>
                   </div>
@@ -2025,7 +2067,7 @@ textarea.input { min-height: 90px; resize: vertical; }
   </main>
 </div>
 
-<!-- ═══ 预览 → 确认 → 执行：右侧抽屉（21 条危险工作流共用） ═══ -->
+<!-- ═══ 预览 → 确认 → 执行：右侧抽屉（20 条危险工作流共用） ═══ -->
 <sc-if value="{{ drawerOpen }}">
   <div style="position:fixed;inset:0;z-index:40;display:flex;justify-content:flex-end;background:color-mix(in srgb,var(--color-neutral-900) 42%,transparent)">
     <div onClick="{{ closeDrawer }}" style="flex:1"></div>
@@ -2522,14 +2564,21 @@ class Component extends DCLogic {
   theme() { return this.state.theme || (this.props.theme === '深色' ? 'dark' : 'light'); }
 
   navGroups() {
+    const dark = this.theme() === 'dark';
     return NAV.map(([title, items]) => ({
       title,
-      items: items.map(([id, label, badge, tone]) => ({
-        label, badge, href: '#' + id, go: this.go(id),
-        rule: this.state.page === id ? 'var(--color-accent)' : 'transparent',
-        bg: this.state.page === id ? 'color-mix(in srgb,var(--color-accent) 12%,transparent)' : 'transparent',
-        badgeColor: tone === 'accent' ? 'var(--color-accent)' : 'color-mix(in srgb,var(--color-text) 42%,transparent)',
-      })),
+      items: items.map(([id, label, badge, tone]) => {
+        const on = this.state.page === id;
+        return {
+          label, badge, href: '#' + id, go: this.go(id),
+          rule: 'transparent',
+          bg: on ? (dark ? '#f4f4f5' : '#18181b') : 'transparent',
+          fg: on ? (dark ? '#18181b' : '#ffffff') : 'inherit',
+          badgeColor: on ? (dark ? 'rgba(24,24,27,.6)' : 'rgba(255,255,255,.72)')
+                         : tone === 'accent' ? 'var(--color-accent)'
+                         : 'color-mix(in srgb,var(--color-text) 42%,transparent)',
+        };
+      }),
     }));
   }
 
@@ -2595,7 +2644,7 @@ class Component extends DCLogic {
     return [
       {title: '只读 vs 危险操作', rows: [
         {chip:'只读 · 一键跑', ...NEU, hatch:'', desc:'扫描 / 同步 / 体检。不写沃尔玛，随时可跑，普通线框按钮。'},
-        {chip:'危险 · 预览→确认', ...FAIL, hatch:'hz', desc:'21 条会真写沃尔玛且不可逆：上架、删除、改价。斜纹描边，两步走。'},
+        {chip:'危险 · 预览→确认', ...FAIL, hatch:'', desc:'20 条会真写沃尔玛且不可逆：上架、删除、改价。红实心按钮，预览 → 确认两步走。'},
       ]},
       {title: '运行的四种结局', rows: [
         {chip:'成功 · 0', ...OK, hatch:'', desc:'实线浅底。通知会自己发，什么都不用做。'},
@@ -2910,7 +2959,7 @@ class Component extends DCLogic {
     const chip = (v) => v === '通过' ? {...OK, label: '✓ 通过'} : v === '待人工' ? {...MID, label: '待人工'}
       : v === '钓鱼' ? {...FAIL, label: '钓鱼'} : {...FAIL, label: '建议拒绝'};
     return O.map(r => {
-      const c = chip(r[11]);
+      const c = chip(r[10]);
       return {po: r[0], store: r[1], sku: r[2], name: r[3], qty: r[4], amount: r[5],
         sale: r[6], at: r[7], eta: r[8], tracking: r[9],
         audit: c.label, bg: c.chipBg, fg: c.chipFg, border: c.chipBorder, borderStyle: c.chipBorderStyle,
@@ -3715,7 +3764,7 @@ class Component extends DCLogic {
         {name:'数据表格', note:'表头分组（身份 / 亚马逊侧 / 沃尔玛侧）、列冻结、虚拟滚动、排序走库、行点开抽屉。几十万行的表不做前端分页器，做游标 + 虚拟滚动。'},
         {name:'状态标签', note:'三组语义各有形状语言：只读=线框 / 危险=斜纹描边；成功=浅底实线、失败=反白实心、忙=中性虚线、不确定=虚线加问号；中间态一律虚线无填充。'},
         {name:'时间线', note:'产品病历与运行时间轴共用一套：时间列 + 节点 + 事件标签 + 明细 + 来源。链路关系用竖线连起来（当天硬次序、变体组）。'},
-        {name:'「预览 → 确认 → 执行」抽屉', note:'21 条危险工作流共用。三步：填参数（命令行原文可见）→ 预览破坏面（要删哪 N 个 SKU、影响哪些店）→ 确认执行 + 实时进度。只读工作流走同一个抽屉的两步版，没有斜纹与红线。'},
+        {name:'「预览 → 确认 → 执行」抽屉', note:'20 条危险工作流共用。三步：填参数（命令行原文可见）→ 预览破坏面（要删哪 N 个 SKU、影响哪些店）→ 确认执行 + 实时进度。只读工作流走同一个抽屉的两步版，没有斜纹与红线。'},
         {name:'运行进度', note:'持锁时长 + 进度条 + 日志尾部滚动。关掉抽屉不中断进程 —— 进程不属于界面。'},
         {name:'漏斗 / 统计图', note:'漏斗用「实心=往下走、斜纹=被拦掉」，一眼看出今天为什么只上了 46 条。排行榜用单色条，不用饼图。'},
       ],
@@ -3731,7 +3780,7 @@ class Component extends DCLogic {
       stack: [
         {k:'框架', v:'Vite + React + TypeScript（无 SSR 需求，单用户本机跑）'},
         {k:'大表', v:'TanStack Table + TanStack Virtual：几十万行只渲染视口内的行；排序/筛选下推到 SQL，不在前端算'},
-        {k:'样式与组件', v:'Tailwind + shadcn/ui，token 对齐本设计系统（方角、hairline、四角定位十字用一个 Frame 组件包）'},
+        {k:'样式与组件', v:'Tailwind + shadcn/ui，token 对齐 erp-core（zinc 中性系、黑主按钮、sky 信息蓝、圆角 8 / 6 / 4、hairline 分隔）'},
         {k:'图表', v:'Recharts：漏斗与排行榜用单色条形，耗时趋势用 bar；饼图一律不用'},
         {k:'读数据', v:'FastAPI 只读端点直连 PG 只读角色 readonly；每张表一个 /rows 端点，带游标分页与列筛选'},
         {k:'触发工作流', v:'一层很薄的服务起 python cli.py <name> 进程；--dry-run 与真跑是同一个端点的一个布尔参数，前端两步流程对应两次调用'},

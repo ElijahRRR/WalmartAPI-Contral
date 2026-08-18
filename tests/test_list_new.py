@@ -290,16 +290,28 @@ def test_push_scrape_daily_dedup(monkeypatch):
     monkeypatch.setattr(ln.scraper, "submit_batch",
                         lambda name, asins: (calls.append((name, asins)),
                                              {"inserted": len(asins)})[1])
-    note = ln._push_scrape(["B1", "B2"], execute=True)
+    # 台账与插队是写库/调采集侧的副作用,这里只验证被叫到(2026-08-18
+    # 同轮闭环:推完本侧在等,所以要 record + prioritize)
+    booked, jumped = [], []
+    monkeypatch.setattr(ln.scrape_batches, "record",
+                        lambda name, bid, n, status, note="": booked.append(
+                            (name, status)))
+    monkeypatch.setattr(ln.scrape_batches, "prioritize",
+                        lambda name, bid: (jumped.append(name), True)[1])
+    note, names = ln._push_scrape(["B1", "B2"], execute=True)
     assert "已推采集" in note and calls[0][1] == ["B1", "B2"]
     assert calls[0][0].startswith("listing_gap_")
+    assert names == [calls[0][0]]            # 可等待的批次名交还调用方
+    assert booked == [(calls[0][0], "pushed")] and jumped == [calls[0][0]]
 
     def boom(name, asins):
         raise ln.scraper.BatchExistsError(7, name)
     monkeypatch.setattr(ln.scraper, "submit_batch", boom)
-    assert "已推过" in ln._push_scrape(["B3"], execute=True)
-    assert "DRY-RUN" in ln._push_scrape(["B4"], execute=False)   # dry-run 不推
-    assert ln._push_scrape([], True) is None
+    note2, names2 = ln._push_scrape(["B3"], execute=True)
+    assert "已推过" in note2 and len(names2) == 1   # 撞名沿用既有批次,照样可等
+    note3, names3 = ln._push_scrape(["B4"], execute=False)   # dry-run 不推
+    assert "DRY-RUN" in note3 and names3 == []
+    assert ln._push_scrape([], True) == (None, [])
 
 
 def test_heal_unknown_three_paths(monkeypatch):
@@ -486,9 +498,9 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
          for 循环包了一层线程池,慢照旧)。
       ② **顺序确定**:让 T5 最快、T1 最慢,摘要行序仍须 T1…T5 —— 完成先后
          是随机的,输出跟着随机就没法拿两轮跑对拍。
-      ③ **计数不丢**:no_upc/invalid 从共享 dict 改成各店局部 dict 再合并,
-         合并漏一店就少算,而少算**不报错**。顺带钉住"提交期"那一行:
-         这三个数以前只加不看(gate_line 是字符串,拼在提交循环之前)。
+      ③ **计数不丢**:no_upc 从共享 dict 改成各店局部 dict 再合并,合并漏
+         一店就少算,而少算**不报错**;invalid 自 2026-08-18 起在预备期
+         (_prep_rows 跨店并发)统计,钉住"预备期/提交期"两行摘要都在。
     """
     import threading
     import time
@@ -519,8 +531,10 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
     monkeypatch.setattr(ln, "_sync_upc", lambda e, l: None)
     monkeypatch.setattr(ln, "_writeback_upc", lambda e, l: None)
+    # _prep_rows 的连接池会带 autocommit=True 开连接,桩要收 kwargs
     monkeypatch.setattr(ln.db, "pg_conn",
-                        contextlib.contextmanager(lambda: iter([object()])))
+                        contextlib.contextmanager(
+                            lambda **kw: iter([object()])))
     monkeypatch.setattr(ln.settings_api, "get_partner_id", lambda s: "P")
 
     # UPC:每店第一行(…NOUPC)领不到号 → no_upc;其余给号
@@ -563,4 +577,152 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     assert state["peak"] > 1, f"没有真并发,峰值在飞 {state['peak']} 家"
     hit = [ln_ for ln_ in out.splitlines() if "提交 1 条" in ln_]
     assert [l.split(":")[0].strip() for l in hit] == stores, hit
-    assert "提交期:UPC池不足 5,必填缺失 5" in out
+    # 必填缺失在预备期拦下(不领号),UPC 池不足在提交期领号时才知道
+    prep = [l for l in out.splitlines() if l.startswith("预备期")]
+    assert prep and "通过 10/15" in prep[0] and "必填缺失 5" in prep[0], prep
+    assert "提交期:UPC池不足 5" in out
+
+
+def _wire_execute_env(monkeypatch, rows, products):
+    """真跑路径的标准桩(闸门全放行、外设全假);返回可观测容器。
+
+    2026-08-18 三段式重排(预备期→领号期→提交期)的三个验收点共用这套底座:
+    prep 失败不领号 / 占位号回填成真号 / 同轮闭环救回。
+    """
+    stores = sorted({r["store"] for r in rows})
+    seen = {"claim_wants": [], "released": [], "orderable_upcs": [],
+            "assembled_upcs": [], "submitted": []}
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {s: {"fbm_range1": "200%"} for s in stores})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": s} for s in stores])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    monkeypatch.setattr(ln, "_sync_upc", lambda e, l: None)
+    monkeypatch.setattr(ln, "_writeback_upc", lambda e, l: None)
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([object()])))
+    monkeypatch.setattr(ln.settings_api, "get_partner_id", lambda s: "P")
+
+    def claim(c, wants):
+        seen["claim_wants"].extend(wants)
+        return ["19999" + w["asin"][-7:] for w in wants]
+    monkeypatch.setattr(ln.upc_pool, "claim", claim)
+    monkeypatch.setattr(ln.upc_pool, "release",
+                        lambda c, upcs, reason: seen["released"].extend(upcs))
+    monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
+    monkeypatch.setattr(ln, "_map_llm",
+                        lambda c, pt, spec, p: ({"productName": p["title"]}, {}))
+    monkeypatch.setattr(
+        ln.mp_mapper, "build_orderable",
+        lambda sku, upc, price, qty, partner, **k: (
+            seen["orderable_upcs"].append(str(upc)),
+            {"productIdentifiers": {"productId": str(upc),
+                                    "productIdType": "UPC"}})[1])
+    # 每店第二类行(…BAD)必填缺失 → 预备期本地拦下
+    monkeypatch.setattr(ln.mp_conform, "conform", lambda *a, **k: (
+        a[2], a[3], [],
+        ["brand"] if str(k.get("sku", "")).endswith("BAD") else []))
+    monkeypatch.setattr(
+        ln.mp_mapper, "assemble_mp_item",
+        lambda o, pt, v: (seen["assembled_upcs"].append(
+            o["productIdentifiers"]["productId"]), {"pt": pt})[1])
+    monkeypatch.setattr(ln.listing_sources, "register", lambda *a, **k: None)
+    monkeypatch.setattr(ln.product_events, "record_many", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_reason", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
+    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
+
+    def fake_submit(store, feed_type, items, workflow=None):
+        seen["submitted"].append((store["name"], len(items)))
+        yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)
+    return seen
+
+
+_PRODUCT_OK = {"title": "标题够长的十个字以上", "price": 20.0, "stock": 50,
+               "stock_state": "in_stock", "lead_days": 2, "channel": "FBM",
+               "shipping": 3.0}
+
+
+def test_prep_fail_does_not_claim_upc(monkeypatch):
+    """预备期失败的行**根本不领号**(2026-08-18 重排的核心收益)。
+
+    旧序是"领了再 release":池紧张时号先被注定失败的行占走,水位来回抖。
+    新序里 BAD 行在 _prep_rows 就被拦下,claim 的 wants 里不许出现它,
+    release 一次都不该发生(没领过,无号可回收)。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1"),
+            _sheet_row(3, asin="B0AAAAABAD")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    out = ln.run({"execute": True})
+    assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]
+    assert seen["released"] == []
+    assert "必填缺失 1" in out and "通过 1/2" in out
+
+
+def test_placeholder_upc_backfilled_with_real(monkeypatch):
+    """占位号只进预备期,发出去的载荷必须是真号。
+
+    build_orderable 在预备期只见占位号(_UPC_PLACEHOLDER);领号期把真号
+    回填进 productIdentifiers;assemble 时载荷里若还是 000000000000,
+    等于把占位号提交给沃尔玛 —— 这是本次重排最不能出的错。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    ln.run({"execute": True})
+    assert seen["orderable_upcs"] == [ln._UPC_PLACEHOLDER]
+    assert seen["assembled_upcs"] == ["19999AAAAOK1"]
+    assert ln._UPC_PLACEHOLDER not in seen["assembled_upcs"]
+    assert seen["submitted"] == [("T1", 1)]
+
+
+def test_same_round_scrape_closure_rescues(monkeypatch):
+    """同轮闭环(所有者定稿 2026-08-18):推采集→等窗口→就地摄取→本轮续走。
+
+    数据源缺席的行不再"本轮跳过次日续":refetch 拿到数据后这一轮就提交。
+    wait_settled/_ingest_now 打桩(它们各自有自己的测试),这里只验接线:
+    次序对(等完才摄取才复查)、救回的行真的进了提交、摘要说了人话。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1"), _sheet_row(3, asin="B0AAAAAGAP")]
+    full = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    calls = {"fetch": 0, "order": []}
+    seen = _wire_execute_env(monkeypatch, rows, full)
+
+    def fetch(asins):
+        calls["fetch"] += 1
+        if calls["fetch"] == 1:      # 首查:GAP 缺席
+            return {a: (full[a] if a != "B0AAAAAGAP" else None) for a in asins}
+        calls["order"].append("refetch")
+        return {a: full[a] for a in asins}
+    monkeypatch.setattr(ln.amz_source, "fetch_products", fetch)
+    monkeypatch.setattr(
+        ln, "_push_scrape",
+        lambda absent, execute: (f"  缺数据 {len(absent)} 个 ASIN 已推采集",
+                                 ["listing_gap_test"]))
+    monkeypatch.setattr(
+        ln.scrape_batches, "wait_settled",
+        lambda names, t: (calls["order"].append("wait"), ("1/1 落定", 0))[1])
+    monkeypatch.setattr(
+        ln, "_ingest_now",
+        lambda: (calls["order"].append("ingest"), "就地摄取:新增 1")[1])
+    out = ln.run({"execute": True})
+    assert calls["order"] == ["wait", "ingest", "refetch"]
+    assert "同轮闭环" in out and "救回 1/1" in out
+    assert sorted(w["asin"] for w in seen["claim_wants"]) == [
+        "B0AAAAAGAP", "B0AAAAAOK1"]          # 救回的行本轮就领号提交
+    # gap_wait=0 = 只推不等(不打 wait/ingest,行照旧不写终态)
+    calls["order"].clear()
+    calls["fetch"] = 0
+    out2 = ln.run({"execute": True, "gap_wait": 0})
+    assert calls["order"] == [] and "同轮闭环" not in out2

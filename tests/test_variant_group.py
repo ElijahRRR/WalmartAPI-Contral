@@ -288,13 +288,17 @@ def test_variant_counts_are_computed_before_the_summary_line():
     """
     import inspect
 
-    src = inspect.getsource(__import__("workflows.list_new",
-                                       fromlist=["run"]).run)
+    mod = __import__("workflows.list_new", fromlist=["run"])
+    src = inspect.getsource(mod.run)
     assert src.index("_plan_variants(ready") < src.index("闸门:")
-    # 提交循环必须**复用**这份决策,不许重算 —— 重算就是 dry-run 报一份、
-    # 真跑发另一份,中间任何差异都表现为"dry-run 说没事"
-    assert 'vplan = r.get("_vplan")' in src
-    assert "_variant_plan(" not in src               # 只在 _plan_variants 里调
+    # 一致化必须**复用**这份决策,不许重算 —— 重算就是 dry-run 报一份、
+    # 真跑发另一份,中间任何差异都表现为"dry-run 说没事"。
+    # 2026-08-18 三段式重排后,消费点从提交循环移进预备期 _prep_rows
+    prep_src = inspect.getsource(mod._prep_rows)
+    assert 'variant=r.get("_vplan")' in prep_src
+    # _variant_plan 只在 _plan_variants 里调,run/_prep_rows 都不许重算
+    assert "_variant_plan(" not in src
+    assert "_variant_plan(" not in prep_src
 
 
 def _vrow(asin, pairs, gid="vg_G", store="M001"):

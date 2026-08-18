@@ -780,20 +780,26 @@ def emit():
     for f in DOMAIN_BOARDS:
         arts.append({"file": f, "title": DOMAIN_BOARDS[f][1], "x": DOMAIN_POS[f][0], "y": DOMAIN_POS[f][1],
                      "w": DOMAIN_BOARDS[f][2], "h": DOMAIN_BOARDS[f][3], "page": "page-domains"})
+    arts.insert(0, {"file": "Console.dc.html", "title": "运营控制台 · 交互原型",
+                    "x": 0, "y": 0, "w": 1600, "h": 1000, "expand": "fill",
+                    "page": "page-proto"})
     canvas = {
-        "pages": [{"id": "page-domains", "name": "业务域主页面"},
+        "pages": [{"id": "page-proto", "name": "交互原型(主)"},
+                  {"id": "page-domains", "name": "业务域主页面"},
                   {"id": "page-core", "name": "核心交互与设计系统"}],
         "artboards": arts,
         "annotations": [
+            {"id": "proto-note", "x": 0, "y": -150, "w": 640, "page": "page-proto",
+             "text": "主画板 · 交互原型(可点导航、13+2 视图、危险两步抽屉)。底稿来自所有者提供的设计项目「前端设计方案讨论」,在其上:内联了设计系统资源、修了两处事实(退出码 3 那轮不写 ops.runs;日报通知走飞书应用直发,无 webhook)、补了原型缺的「审核中心」与「类目映射」两个视图。"},
             {"id": "round-1-note", "x": 0, "y": -150, "w": 560, "page": "page-core",
              "text": "第一轮:设计系统 + 核心交互(总览 / 工作流触发三联 / 产品详情 / 订单待人工 / 上架漏斗)。配色与组件词汇逐值对齐旧系统 erp-core。"},
             {"id": "round-2-note", "x": 0, "y": -150, "w": 640, "page": "page-domains",
              "text": "第二轮:业务域主页面全集(按全项目扫读的真值画:分配链 / 订单全貌 / 类目映射 / 审核中心 / 黑名单 / Feed / 采集 / 店铺 / 维护 / 产品列表 / 运行与调度 / 工作流全景)。\n每块画板的表名与状态取值都对着库里真有的东西,画布上没有的状态库里也没有。"},
         ],
-        "launch": {"view": "canvas", "page": "page-domains"},
+        "launch": {"view": "focused", "file": "Console.dc.html"},
     }
     pathlib.Path("canvas.json").write_text(json.dumps(canvas, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"canvas.json OK · {len(arts)} 画板 · 2 页")
+    print(f"canvas.json OK · {len(arts)} 画板 · 3 页")
 
 if __name__ == "__main__":
     emit()

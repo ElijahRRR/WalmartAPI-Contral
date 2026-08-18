@@ -1,6 +1,10 @@
 {
   "pages": [
     {
+      "id": "page-proto",
+      "name": "交互原型(主)"
+    },
+    {
       "id": "page-domains",
       "name": "业务域主页面"
     },
@@ -10,6 +14,16 @@
     }
   ],
   "artboards": [
+    {
+      "file": "Console.dc.html",
+      "title": "运营控制台 · 交互原型",
+      "x": 0,
+      "y": 0,
+      "w": 1600,
+      "h": 1000,
+      "expand": "fill",
+      "page": "page-proto"
+    },
     {
       "file": "DesignSystem.dc.html",
       "title": "设计系统",
@@ -193,6 +207,14 @@
   ],
   "annotations": [
     {
+      "id": "proto-note",
+      "x": 0,
+      "y": -150,
+      "w": 640,
+      "page": "page-proto",
+      "text": "主画板 · 交互原型(可点导航、13+2 视图、危险两步抽屉)。底稿来自所有者提供的设计项目「前端设计方案讨论」,在其上:内联了设计系统资源、修了两处事实(退出码 3 那轮不写 ops.runs;日报通知走飞书应用直发,无 webhook)、补了原型缺的「审核中心」与「类目映射」两个视图。"
+    },
+    {
       "id": "round-1-note",
       "x": 0,
       "y": -150,
@@ -210,7 +232,7 @@
     }
   ],
   "launch": {
-    "view": "canvas",
-    "page": "page-domains"
+    "view": "focused",
+    "file": "Console.dc.html"
   }
 }

@@ -93,3 +93,39 @@ def test_the_reversed_dry_run_default_is_stated_not_the_old_one():
     assert "缺省 dry-run" not in _README.replace('"缺省 dry-run"这条防线', "")
     # --execute 只该以"兼容别名/空操作"的身份出现,不该是真跑的必要条件
     assert "人眼确认输出后才加 `--execute`" not in _README
+
+
+# ────────────────────────── 前端设计计划的事实核对 ──────────────────────────
+# docs/frontend_brief.md 是前端的施工图,里面**引用了代码里的真值**(有多少条
+# 工作流、其中几条危险)。这类数字漂了不会有任何东西报错,而漂的后果不轻:
+# 那份文档整套交互模型都建立在「危险的那几条要先 dry-run 预览」之上,数字
+# 记错 = 照它施工的人对不上账。2026-08-18 已经漂过一次(写 21,实有 20)。
+
+_BRIEF = (_ROOT / "docs" / "frontend_brief.md").read_text(encoding="utf-8")
+
+
+def _dangerous() -> set[str]:
+    """输入:无 → 输出:声明了 DANGEROUS = True 的工作流名集合。
+
+    ⚠ 按源码文本取而不是 import:import 会连带跑各模块的顶层副作用
+    (建连接、读 .env),这份测试不需要那些。
+    """
+    return {p.stem for p in (_ROOT / "workflows").glob("*.py")
+            if p.stem != "__init__"
+            and re.search(r"^DANGEROUS = True", p.read_text(encoding="utf-8"),
+                          re.M)}
+
+
+def test_frontend_brief_dangerous_count_matches_the_code():
+    """危险条数是那份文档交互模型的地基,不能是抄来的手写数字。"""
+    n = len(_dangerous())
+    assert f"`DANGEROUS=True` 的 {n} 条" in _BRIEF, \
+        f"实有 {n} 条危险工作流,docs/frontend_brief.md 里的数字要同步"
+    stale = re.findall(r"(\d+) 条危险工作流复用", _BRIEF)
+    assert stale == [str(n)], f"「N 条危险工作流复用」写的是 {stale},应为 {n}"
+    assert f"哪 {n} 条是危险的" in _BRIEF
+
+
+def test_frontend_brief_workflow_count_matches_the_code():
+    n = len(_workflows())
+    assert f"{n} 条工作流" in _BRIEF, f"实有 {n} 条,docs/frontend_brief.md 要同步"

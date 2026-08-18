@@ -1,0 +1,171 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter','Noto Sans SC',system-ui,sans-serif; -webkit-font-smoothing: antialiased;
+       background: #fafafa; color: #18181b; }
+a { color: #0369a1; text-decoration: none; } a:hover { color: #075985; }
+.mono { font-family: 'JetBrains Mono',ui-monospace,monospace; }
+.tab { font-variant-numeric: tabular-nums; }
+.card { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; }
+.chead { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 44px; border-bottom: 1px solid #f4f4f5; }
+.ctitle { font-size: 13px; font-weight: 500; color: #18181b; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; flex: none; }
+.dothollow { display: inline-block; width: 9px; height: 9px; border-radius: 99px; background: #fff; border: 2px solid #f59e0b; flex: none; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #27272a; white-space: nowrap; }
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; height: 20px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid; white-space: nowrap; }
+.tagdash { border-style: dashed; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; border-radius: 6px;
+       font-weight: 500; font-size: 14px; height: 36px; padding: 0 12px; border: 1px solid transparent; cursor: default; }
+.btn.sm { height: 28px; padding: 0 8px; font-size: 12px; }
+.btn.lg { height: 40px; padding: 0 16px; }
+.bp { background: #18181b; color: #fff; }
+.bs { background: #fff; color: #18181b; border-color: #d4d4d8; }
+.bghost { background: transparent; color: #3f3f46; }
+.bdanger { background: #dc2626; color: #fff; }
+.bdghost { background: transparent; color: #b91c1c; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; }
+.th { background: #fafafa; text-align: left; padding: 0 12px; height: 36px; font-size: 11px; font-weight: 500; color: #71717a;
+      text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #e4e4e7; white-space: nowrap; }
+.td { padding: 0 12px; font-size: 13px; color: #27272a; border-bottom: 1px solid #f4f4f5; vertical-align: middle; }
+.rz .td { height: 40px; } .rc .td { height: 32px; }
+.num { text-align: right; font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.id { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; letter-spacing: -0.01em; color: #3f3f46; }
+.kbd { font-family: 'JetBrains Mono',monospace; font-size: 10px; padding: 1px 5px; border: 1px solid #e4e4e7;
+       border-bottom-width: 2px; border-radius: 4px; background: #fafafa; color: #52525b; }
+.grouptitle { padding: 0 16px; margin: 12px 0 4px; font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #a1a1aa; }
+.navitem { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 16px; font-size: 13px; color: #3f3f46; }
+.navitem.on { background: #18181b; color: #fff; }
+.navbadge { font-family: 'JetBrains Mono',monospace; font-variant-numeric: tabular-nums; font-size: 10px; padding: 0 6px; height: 16px;
+            display: inline-flex; align-items: center; border-radius: 4px; background: #f4f4f5; color: #3f3f46; margin-left: auto; }
+.navbadge.amber { background: #fffbeb; color: #b45309; }
+.kpilabel { font-size: 12px; color: #71717a; }
+.kpival { font-size: 24px; font-weight: 600; font-family: 'JetBrains Mono',ui-monospace,monospace; font-variant-numeric: tabular-nums; color: #18181b; }
+.log { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12px; line-height: 1.7; color: #d4d4d8;
+       background: #18181b; border-radius: 6px; padding: 14px 16px; white-space: pre; overflow: hidden; }
+.log .ok { color: #34d399; } .log .warn { color: #fbbf24; } .log .err { color: #f87171; } .log .dim { color: #71717a; }
+</style>
+</helmet>
+<div style="width:1440px;height:1400px;display:flex;background:#fafafa;overflow:hidden"><aside style="width:240px;flex:none;background:#fff;border-right:1px solid #e4e4e7;display:flex;flex-direction:column">
+  <div style="height:48px;border-bottom:1px solid #f4f4f5;display:flex;align-items:center;gap:8px;padding:0 16px">
+    <div class="mono" style="height:24px;width:24px;border-radius:4px;background:#18181b;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700">W</div>
+    <div style="line-height:1.25"><div style="font-size:13px;font-weight:600;color:#18181b">WalmartAPI 运营台</div>
+    <div style="font-size:10px;color:#a1a1aa">45 店 · 生产 · macOS 本机</div></div>
+  </div>
+  <nav style="flex:1;padding:8px 0"><div class="grouptitle">每天看</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg><span style="flex:1">总览</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/></svg><span style="flex:1">订单待人工</span><span class="navbadge amber">23</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg><span style="flex:1">运行记录</span></div><div class="grouptitle">按需查</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m7.5 4.27 9 5.15"/><path d="M21 8 12 2 3 8v8l9 6 9-6V8z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg><span style="flex:1">产品</span></div><div class="navitem on"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg><span style="flex:1">审核</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg><span style="flex:1">上架</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg><span style="flex:1">分配</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="3" y1="6" x2="13" y2="6"/><line x1="17" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="13" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="13" y2="18"/><line x1="17" y1="18" x2="21" y2="18"/><circle cx="15" cy="6" r="2"/><circle cx="11" cy="12" r="2"/><circle cx="15" cy="18" r="2"/></svg><span style="flex:1">维护与清理</span><span class="navbadge">214</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg><span style="flex:1">订单</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg><span style="flex:1">黑名单中心</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span style="flex:1">类目映射</span><span class="navbadge amber">37</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg><span style="flex:1">Feed 追踪</span><span class="navbadge">7</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span style="flex:1">采集监控</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m2 7 2-3h16l2 3"/><path d="M4 7v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V7"/><path d="M2 7a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0"/></svg><span style="flex:1">店铺</span></div><div class="grouptitle">操作</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span style="flex:1">工作流</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg><span style="flex:1">调度</span></div></nav>
+  <div style="padding:12px 16px;border-top:1px solid #f4f4f5;font-size:11px;color:#a1a1aa">
+    <div style="display:flex;align-items:center;gap:6px"><span class="dot" style="background:#10b981"></span> launchd 2 条 · 智能体 9 条在班</div>
+    <div class="mono" style="margin-top:4px">Asia/Shanghai · 2026-08-18</div>
+  </div>
+</aside><div style="flex:1;display:flex;flex-direction:column;min-width:0"><header style="height:48px;flex:none;background:#fff;border-bottom:1px solid #e4e4e7;display:flex;align-items:center;gap:12px;padding:0 16px 0 24px;">
+  <div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px;font-weight:400;color:#71717a">审核</span><span style="color:#d4d4d8"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg></span><span style="font-size:13px;font-weight:500;color:#18181b">审核中心</span></div>
+  <div style="flex:1"></div>
+  <div style="position:relative;width:320px">
+    <span style="position:absolute;left:10px;top:9px"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#a1a1aa" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+    <div style="height:32px;border:1px solid #d4d4d8;border-radius:6px;background:#fff;display:flex;align-items:center;padding:0 8px 0 30px;font-size:13px;color:#a1a1aa">输 ASIN / 工作流名 / 店铺名 直达…</div>
+    <span class="kbd" style="position:absolute;right:8px;top:8px">⌘K</span>
+  </div>
+</header><main style="flex:1;padding:24px;display:flex;flex-direction:column;gap:16px;overflow:hidden"><section class="card" style=""><header class="chead"><h2 class="ctitle">今日 audit_sheet · 18:10(上架表驱动;审核权威在库,E 列只是投影)</h2></header>
+      <div style="padding:14px 16px;display:flex;align-items:center;gap:0">
+        <div style="flex:1"><div class="kpilabel">表 E 列空 · 领取</div><div class="kpival" style="margin-top:6px">9,402</div></div>
+        <div style="width:30px;color:#d4d4d8"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg></div>
+        <div style="flex:1"><div class="kpilabel">库里已有结论 · 零 LLM 直接投影</div><div class="kpival" style="margin-top:6px">8,140</div></div>
+        <div style="width:30px;color:#d4d4d8"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg></div>
+        <div style="flex:1"><div class="kpilabel">真待审(未审 + pending)</div><div class="kpival" style="margin-top:6px">1,262</div></div>
+        <div style="width:30px"></div>
+        <div style="flex:1;background:#fafafa;border:1px solid #f4f4f5;border-radius:6px;padding:10px 12px">
+          <div style="font-size:11px;color:#71717a">limit 撞满时必须给三个数</div>
+          <div class="id" style="font-size:13px;margin-top:4px">总量 1,262 · 本轮 1,262 · 还剩 0</div></div>
+      </div>
+      <div style="padding:8px 16px;font-size:11px;color:#a1a1aa;border-top:1px solid #f4f4f5">E 列写回值是小写 <span class="id">pass / reject</span>(不是 approved);缺数据行只写 F 列原因、E 列必须留空 —— E 一有值该行就退出审核通道。</div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">分层判定漏斗 · audit.audit_runs(统计一律排除 stage_stopped_at='SHORTCUT' 影子行)</h2></header>
+      <div style="padding:12px 16px">
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">L0 Phase0 四硬规则</span>
+          <span style="width:88px;flex:none"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">reject</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#ef4444;width:17%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">214</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">R0 中国卖家类目硬禁 / R1 准入双白名单 / R2 十八条禁售大类 / R3a 硬认证;串行短路,单条 hit ≠ 只违反一条</span></div>
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">L1 类目解析</span>
+          <span style="width:88px;flex:none"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">pending</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#f59e0b;width:3%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">37</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">类目解不出 → pending(中间态不是结论),隔日退避重试</span></div>
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">L2 硬规则复核</span>
+          <span style="width:88px;flex:none"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">reject</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#ef4444;width:8%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">96</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">结论只由 -100 硬规则决定;R3b/R3c/R4 黑名单/R5 商标/R7/R8 penalty=0 纯证据,不画成拒因</span></div>
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">L3 语义(LLM)</span>
+          <span style="width:88px;flex:none"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">pending</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#f59e0b;width:2%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">6</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">LLM 故障 → pending;http_429 才算撞限流,5xx 是对端故障</span></div>
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">L4 视觉</span>
+          <span style="width:88px;flex:none"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">reject</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#d4d4d8;width:2%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">0</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">故障回落 pass 按 rule_code 计数 —— 全故障 = 层未生效,要亮出来</span></div>
+        <div style="display:flex;align-items:center;gap:12px;padding:6px 0">
+          <span style="width:170px;flex:none;font-size:13px;color:#27272a">最终</span>
+          <span style="width:88px;flex:none"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">pass</span></span>
+          <div style="flex:1;height:18px;border-radius:3px;background:#f4f4f5"><div style="height:18px;border-radius:3px;background:#10b981;width:72%"></div></div>
+          <span class="id" style="width:52px;text-align:right;flex:none">909</span>
+          <span style="width:320px;flex:none;font-size:11px;color:#71717a">写回 products 五列 + 投影上架表 E 列</span></div>
+      </div></section><div style="display:flex;gap:16px"><div style="flex:1;display:flex;flex-direction:column;gap:16px"><section class="card" style=""><header class="chead"><h2 class="ctitle">同轮补采闭环 · 审核不等下一天</h2></header>
+      <div style="padding:12px 16px;display:flex;align-items:center;gap:8px;font-size:12.5px;color:#27272a">
+        <span>审不了 <b class="id">118</b>(不在库/无标题)</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg>
+        <span>推 <span class="id">audit_gap_20260818</span>(插队成功)</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg>
+        <span>轮询等采(默认 20 分钟)</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg>
+        <span>就地摄取</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg>
+        <span style="color:#047857">救回 <b class="id">81</b> 本轮判掉</span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg>
+        <span style="color:#b45309">仍缺 <b class="id">37</b> 写 F 列理由</span>
+      </div>
+      <div style="padding:8px 16px;font-size:11px;color:#a1a1aa;border-top:1px solid #f4f4f5">产品审核补采走 ops.scrape_batches 的 audit_gap_ 前缀;订单审核的按邮编台账是 ops.audit_scrape —— 两套台账,别画进同一块。</div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">pending 队列 · 1,207(两来源分开,不混)</h2></header>
+      <div style="padding:12px 16px;display:flex;gap:16px;align-items:center">
+        <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">L1 · 类目解不出</span><span class="kpival" style="font-size:20px">1,144</span><span style="font-size:11px;color:#71717a">类目映射补上自然消化</span></div>
+        <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">L3 · LLM 故障</span><span class="kpival" style="font-size:20px">63</span><span style="font-size:11px;color:#71717a">隔日退避重试</span></div>
+        <span class="btn bs sm">mode=pending 专刷(无退避 · 手动)</span>
+      </div>
+      <div style="padding:8px 16px;font-size:11px;color:#a1a1aa;border-top:1px solid #f4f4f5">audited_at 是审核动作时刻,不是进入 pending 的时刻 —— 页面只报 pending 总量,不算龄期。</div></section></div><div style="flex:1;display:flex;flex-direction:column;gap:16px"><section class="card" style=""><header class="chead"><h2 class="ctitle">单产品「为什么被拒」· audit_why 的界面化(产品详情页可跳)</h2></header>
+      <div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px;font-size:12.5px">
+        <div style="display:flex;gap:8px;align-items:center"><span class="id" style="font-weight:600">B0BSNKKR6T</span><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">rejected</span><span style="color:#71717a">现行结论(products 五列)· pt_source=walmart_confirmed 的 PT 一个字不许动</span></div>
+        <div style="display:flex;gap:8px;align-items:center;padding-left:12px"><span class="dot" style="background:#ef4444"></span><span class="id">L2 · R2 禁售大类</span><span style="color:#71717a">penalty −100 —— 结论由它决定</span></div>
+        <div style="display:flex;gap:8px;align-items:center;padding-left:12px"><span class="dot" style="background:#a1a1aa"></span><span class="id">L2 · R4 品牌黑名单 sony</span><span style="color:#71717a">penalty 0 —— 纯证据,不是拒因</span></div>
+        <div style="display:flex;gap:8px;align-items:center;padding-left:12px"><span class="dot" style="background:#a1a1aa"></span><span class="id">读数实况</span><span style="color:#71717a">walmart_pt_meta.access_state / zh_can_do / pt_spec 认证字段 / 黑名单命中,让人一眼看到规则读的格子</span></div>
+      </div></section></div></div><section class="card" style=""><header class="chead"><h2 class="ctitle">重审三通道(危险,各自确认;「清空表 E 列」不是重审入口)</h2></header>
+      <div style="padding:12px 16px;display:flex;gap:12px">
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:10px 12px">
+          <div class="id" style="font-size:12px;font-weight:600">-p asins=…</div>
+          <div style="font-size:11px;color:#71717a;margin-top:4px;line-height:1.6">点名强审,无视现有结论。rejected 永不自动重审,这是唯一救活通道。</div></div>
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:10px 12px">
+          <div class="id" style="font-size:12px;font-weight:600">-p rerule=R2</div>
+          <div style="font-size:11px;color:#71717a;margin-top:4px;line-height:1.6">改规则后定点翻案:只翻被该规则拒过的;显示 总量/本轮/还剩。</div></div>
+        <div style="flex:1;border:1px solid #fecaca;border-radius:6px;padding:10px 12px;background:#fef2f2">
+          <div class="id" style="font-size:12px;font-weight:600;color:#b91c1c">-p force_rerun=v3</div>
+          <div style="font-size:11px;color:#b91c1c;margin-top:4px;line-height:1.6">全量重审,最重 —— LLM 费用警示,必走预览。</div></div>
+      </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">审核 × 上架冲突 · catalog.audit_listing_conflicts(两列分开,不合并)</h2></header>
+      <div style="padding:12px 16px;display:flex;gap:16px">
+        <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">rejected_still_listed</span><span class="kpival" style="font-size:20px">4</span><span style="font-size:11px;color:#71717a">已拒仍在架 —— 该下架</span></div>
+        <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">rejected_after_listing</span><span class="kpival" style="font-size:20px">2</span><span style="font-size:11px;color:#71717a">上架后才被拒 —— 闸漏拦,查规则时序</span></div>
+        <div style="flex:1;display:flex;align-items:center;gap:10px"><span style="font-size:11px;color:#a1a1aa">工具区:audit_calibrate 四桶报告 · audit_import 体检 · audit_history_fold(全手动)</span></div>
+      </div></section></main></div></div>
+</x-dc>
+<script data-dc-script data-props='{"$preview": {"width": 1440, "height": 1400}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

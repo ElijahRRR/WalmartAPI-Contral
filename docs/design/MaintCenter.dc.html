@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter','Noto Sans SC',system-ui,sans-serif; -webkit-font-smoothing: antialiased;
+       background: #fafafa; color: #18181b; }
+a { color: #0369a1; text-decoration: none; } a:hover { color: #075985; }
+.mono { font-family: 'JetBrains Mono',ui-monospace,monospace; }
+.tab { font-variant-numeric: tabular-nums; }
+.card { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; }
+.chead { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 44px; border-bottom: 1px solid #f4f4f5; }
+.ctitle { font-size: 13px; font-weight: 500; color: #18181b; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; flex: none; }
+.dothollow { display: inline-block; width: 9px; height: 9px; border-radius: 99px; background: #fff; border: 2px solid #f59e0b; flex: none; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #27272a; white-space: nowrap; }
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; height: 20px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid; white-space: nowrap; }
+.tagdash { border-style: dashed; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; border-radius: 6px;
+       font-weight: 500; font-size: 14px; height: 36px; padding: 0 12px; border: 1px solid transparent; cursor: default; }
+.btn.sm { height: 28px; padding: 0 8px; font-size: 12px; }
+.btn.lg { height: 40px; padding: 0 16px; }
+.bp { background: #18181b; color: #fff; }
+.bs { background: #fff; color: #18181b; border-color: #d4d4d8; }
+.bghost { background: transparent; color: #3f3f46; }
+.bdanger { background: #dc2626; color: #fff; }
+.bdghost { background: transparent; color: #b91c1c; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; }
+.th { background: #fafafa; text-align: left; padding: 0 12px; height: 36px; font-size: 11px; font-weight: 500; color: #71717a;
+      text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #e4e4e7; white-space: nowrap; }
+.td { padding: 0 12px; font-size: 13px; color: #27272a; border-bottom: 1px solid #f4f4f5; vertical-align: middle; }
+.rz .td { height: 40px; } .rc .td { height: 32px; }
+.num { text-align: right; font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.id { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; letter-spacing: -0.01em; color: #3f3f46; }
+.kbd { font-family: 'JetBrains Mono',monospace; font-size: 10px; padding: 1px 5px; border: 1px solid #e4e4e7;
+       border-bottom-width: 2px; border-radius: 4px; background: #fafafa; color: #52525b; }
+.grouptitle { padding: 0 16px; margin: 12px 0 4px; font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #a1a1aa; }
+.navitem { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 16px; font-size: 13px; color: #3f3f46; }
+.navitem.on { background: #18181b; color: #fff; }
+.navbadge { font-family: 'JetBrains Mono',monospace; font-variant-numeric: tabular-nums; font-size: 10px; padding: 0 6px; height: 16px;
+            display: inline-flex; align-items: center; border-radius: 4px; background: #f4f4f5; color: #3f3f46; margin-left: auto; }
+.navbadge.amber { background: #fffbeb; color: #b45309; }
+.kpilabel { font-size: 12px; color: #71717a; }
+.kpival { font-size: 24px; font-weight: 600; font-family: 'JetBrains Mono',ui-monospace,monospace; font-variant-numeric: tabular-nums; color: #18181b; }
+.log { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12px; line-height: 1.7; color: #d4d4d8;
+       background: #18181b; border-radius: 6px; padding: 14px 16px; white-space: pre; overflow: hidden; }
+.log .ok { color: #34d399; } .log .warn { color: #fbbf24; } .log .err { color: #f87171; } .log .dim { color: #71717a; }
+</style>
+</helmet>
+<div style="width:1440px;height:1000px;display:flex;background:#fafafa;overflow:hidden"><aside style="width:240px;flex:none;background:#fff;border-right:1px solid #e4e4e7;display:flex;flex-direction:column">
+  <div style="height:48px;border-bottom:1px solid #f4f4f5;display:flex;align-items:center;gap:8px;padding:0 16px">
+    <div class="mono" style="height:24px;width:24px;border-radius:4px;background:#18181b;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700">W</div>
+    <div style="line-height:1.25"><div style="font-size:13px;font-weight:600;color:#18181b">WalmartAPI 运营台</div>
+    <div style="font-size:10px;color:#a1a1aa">45 店 · 生产 · macOS 本机</div></div>
+  </div>
+  <nav style="flex:1;padding:8px 0"><div class="grouptitle">每天看</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg><span style="flex:1">总览</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/></svg><span style="flex:1">订单待人工</span><span class="navbadge amber">23</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg><span style="flex:1">运行记录</span></div><div class="grouptitle">按需查</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m7.5 4.27 9 5.15"/><path d="M21 8 12 2 3 8v8l9 6 9-6V8z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg><span style="flex:1">产品</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg><span style="flex:1">审核</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg><span style="flex:1">上架</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg><span style="flex:1">分配</span></div><div class="navitem on"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="3" y1="6" x2="13" y2="6"/><line x1="17" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="13" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="13" y2="18"/><line x1="17" y1="18" x2="21" y2="18"/><circle cx="15" cy="6" r="2"/><circle cx="11" cy="12" r="2"/><circle cx="15" cy="18" r="2"/></svg><span style="flex:1">维护与清理</span><span class="navbadge" style="background:rgba(255,255,255,.2);color:#fff">214</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg><span style="flex:1">订单</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg><span style="flex:1">黑名单中心</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span style="flex:1">类目映射</span><span class="navbadge amber">37</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg><span style="flex:1">Feed 追踪</span><span class="navbadge">7</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span style="flex:1">采集监控</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m2 7 2-3h16l2 3"/><path d="M4 7v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V7"/><path d="M2 7a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0"/></svg><span style="flex:1">店铺</span></div><div class="grouptitle">操作</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span style="flex:1">工作流</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg><span style="flex:1">调度</span></div></nav>
+  <div style="padding:12px 16px;border-top:1px solid #f4f4f5;font-size:11px;color:#a1a1aa">
+    <div style="display:flex;align-items:center;gap:6px"><span class="dot" style="background:#10b981"></span> launchd 2 条 · 智能体 9 条在班</div>
+    <div class="mono" style="margin-top:4px">Asia/Shanghai · 2026-08-18</div>
+  </div>
+</aside><div style="flex:1;display:flex;flex-direction:column;min-width:0"><header style="height:48px;flex:none;background:#fff;border-bottom:1px solid #e4e4e7;display:flex;align-items:center;gap:12px;padding:0 16px 0 24px;">
+  <div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px;font-weight:500;color:#18181b">维护与清理</span></div>
+  <div style="flex:1"></div>
+  <div style="position:relative;width:320px">
+    <span style="position:absolute;left:10px;top:9px"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#a1a1aa" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+    <div style="height:32px;border:1px solid #d4d4d8;border-radius:6px;background:#fff;display:flex;align-items:center;padding:0 8px 0 30px;font-size:13px;color:#a1a1aa">输 ASIN / 工作流名 / 店铺名 直达…</div>
+    <span class="kbd" style="position:absolute;right:8px;top:8px">⌘K</span>
+  </div>
+</header><main style="flex:1;padding:24px;display:flex;flex-direction:column;gap:16px;overflow:hidden"><div class="card" style="padding:14px 16px;display:flex;align-items:center;gap:0;flex:none">
+      <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span><span class="kpival" style="font-size:20px">214</span><span style="font-size:12px;color:#71717a">已建议,待 maintenance 执行</span></div>
+      <div style="width:36px;text-align:center;color:#d4d4d8"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg></div>
+      <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">executing</span><span class="kpival" style="font-size:20px">37</span><span style="font-size:12px;color:#71717a">已提交 feed,等生效核验</span></div>
+      <div style="width:36px;text-align:center;color:#d4d4d8"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#d4d4d8" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="9 18 15 12 9 6"/></svg></div>
+      <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">confirmed</span><span class="kpival" style="font-size:20px">51</span><span style="font-size:12px;color:#71717a">观测落定(不信回执信重扫)</span></div>
+      <div style="width:36px;text-align:center;color:#d4d4d8"></div>
+      <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">ineffective</span><span class="kpival" style="font-size:20px">7</span><span style="font-size:12px;color:#71717a">回执说成了、线上没变 → 下轮重建议</span></div>
+      <div style="width:36px;text-align:center;color:#d4d4d8"></div>
+      <div style="flex:1;display:flex;align-items:center;gap:10px"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">withdrawn</span><span class="kpival" style="font-size:20px">12</span><span style="font-size:12px;color:#71717a">撤销 —— 商品自己恢复了</span></div>
+    </div><section class="card" style=""><header class="chead"><h2 class="ctitle">处置台账 · ops.dispositions —— 原因码就在列表上,不藏进详情</h2></header>
+      <div style="padding:10px 16px;display:flex;gap:8px;border-bottom:1px solid #f4f4f5">
+        <span class="btn sm bs">状态:全部</span><span class="btn sm bs">动作:全部</span><span class="btn sm bs">原因码:全部</span>
+        <span style="flex:1"></span><span class="btn bdanger sm"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>去执行 maintenance(214 条建议)</span></div>
+      <table><tr><th class="th">ASIN</th><th class="th">店铺</th><th class="th">动作</th><th class="th">原因码</th>
+      <th class="th">变更</th><th class="th">状态</th></tr><tr class="rz"><td class="td id">B0D1KPLM88</td><td class="td id">A085</td>
+        <td class="td"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">删除</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">商品在亚马逊已下架</td>
+        <td class="td id">—</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span></td></tr><tr class="rz"><td class="td id">B08HJKL223</td><td class="td id">A102</td>
+        <td class="td"><span class="tag" style="background:#fef2f2;color:#b91c1c;border-color:#fecaca">删除</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">标题相似度 42% · 疑似换品</td>
+        <td class="td id">—</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span></td></tr><tr class="rz"><td class="td id">B0CQW2RT45</td><td class="td id">A117</td>
+        <td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">改库存→0</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">no_buybox · 无 Buy Box</td>
+        <td class="td id">12 → 0</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span></td></tr><tr class="rz"><td class="td id">B09ZZKL776</td><td class="td id">A093</td>
+        <td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">改库存→0</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">unavailable · 商品不可售</td>
+        <td class="td id">8 → 0</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#0369a1;border-color:#bae6fd">suggested</span></td></tr><tr class="rz"><td class="td id">B0BXY44Q19</td><td class="td id">A128</td>
+        <td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">改库存→0</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">out_of_stock · 缺货</td>
+        <td class="td id">15 → 0</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">executing</span></td></tr><tr class="rz"><td class="td id">B07YMN6P31</td><td class="td id">A140</td>
+        <td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">改库存→0</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">lead_days · 货期 9 天超限 · <b style=color:#b91c1c>executing 4 天未落定</b></td>
+        <td class="td id">20 → 0</td><td class="td"><span class="tag tagdash" style="background:#fff;color:#b45309;border-color:#fde68a">executing</span></td></tr><tr class="rz"><td class="td id">B0CHXNPXVX</td><td class="td id">A085</td>
+        <td class="td"><span class="tag" style="background:#f0f9ff;color:#0369a1;border-color:#bae6fd">改价</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">亚马逊涨价 $19.99 → $23.99</td>
+        <td class="td id">$45.99 → $47.99</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">confirmed</span></td></tr><tr class="rz"><td class="td id">B0CC71GH02</td><td class="td id">A076</td>
+        <td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">反补上架</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">曾缺货删除,现已恢复供货(2 次/30 天封顶)</td>
+        <td class="td id">—</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">confirmed</span></td></tr><tr class="rz"><td class="td id">B0BPQ88XYZ</td><td class="td id">A111</td>
+        <td class="td"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">停用</span></td>
+        <td class="td" style="font-size:12.5px;font-weight:500;color:#27272a">连续 30 天零动销 + 亚马逊涨价</td>
+        <td class="td id">—</td><td class="td"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">withdrawn</span></td></tr></section><div style="display:flex;align-items:center;gap:8px;font-size:12px;color:#71717a;background:#fafafa;border:1px solid #f4f4f5;border-radius:6px;padding:10px 12px;flex:none"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#b45309" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>四条清零判据表里长得一模一样(库存 N → 0),只有原因码 unavailable / no_buybox / out_of_stock / lead_days 分得清;两类删除正确性判断完全不同。维护三类 executing 超 3 天自动放行,问题链的删除/反补**故意不放行** —— 卡住必须在这页看得见(上表红字那行)。</main></div></div>
+</x-dc>
+<script data-dc-script data-props='{"$preview": {"width": 1440, "height": 1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

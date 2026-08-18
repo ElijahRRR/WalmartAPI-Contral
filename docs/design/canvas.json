@@ -1,4 +1,14 @@
 {
+  "pages": [
+    {
+      "id": "page-domains",
+      "name": "业务域主页面"
+    },
+    {
+      "id": "page-core",
+      "name": "核心交互与设计系统"
+    }
+  ],
   "artboards": [
     {
       "file": "DesignSystem.dc.html",
@@ -6,7 +16,8 @@
       "x": 0,
       "y": 0,
       "w": 1440,
-      "h": 1200
+      "h": 1200,
+      "page": "page-core"
     },
     {
       "file": "Main.dc.html",
@@ -14,7 +25,8 @@
       "x": 0,
       "y": 1320,
       "w": 1440,
-      "h": 1100
+      "h": 1100,
+      "page": "page-core"
     },
     {
       "file": "RunSelect.dc.html",
@@ -22,7 +34,8 @@
       "x": 0,
       "y": 2540,
       "w": 1440,
-      "h": 900
+      "h": 900,
+      "page": "page-core"
     },
     {
       "file": "RunPreview.dc.html",
@@ -30,7 +43,8 @@
       "x": 1560,
       "y": 2540,
       "w": 1440,
-      "h": 900
+      "h": 900,
+      "page": "page-core"
     },
     {
       "file": "RunLive.dc.html",
@@ -38,7 +52,8 @@
       "x": 3120,
       "y": 2540,
       "w": 1440,
-      "h": 900
+      "h": 900,
+      "page": "page-core"
     },
     {
       "file": "ProductDetail.dc.html",
@@ -46,7 +61,8 @@
       "x": 1560,
       "y": 3560,
       "w": 1440,
-      "h": 1400
+      "h": 1400,
+      "page": "page-core"
     },
     {
       "file": "OrderQueue.dc.html",
@@ -54,7 +70,8 @@
       "x": 1560,
       "y": 1320,
       "w": 1440,
-      "h": 1000
+      "h": 1000,
+      "page": "page-core"
     },
     {
       "file": "ListingFunnel.dc.html",
@@ -62,7 +79,116 @@
       "x": 0,
       "y": 3560,
       "w": 1440,
-      "h": 900
+      "h": 900,
+      "page": "page-core"
+    },
+    {
+      "file": "CatmapCenter.dc.html",
+      "title": "类目映射中心",
+      "x": 3120,
+      "y": 0,
+      "w": 1440,
+      "h": 1400,
+      "page": "page-domains"
+    },
+    {
+      "file": "Stores.dc.html",
+      "title": "店铺",
+      "x": 0,
+      "y": 4160,
+      "w": 1440,
+      "h": 1100,
+      "page": "page-domains"
+    },
+    {
+      "file": "AuditCenter.dc.html",
+      "title": "审核中心",
+      "x": 1560,
+      "y": 0,
+      "w": 1440,
+      "h": 1400,
+      "page": "page-domains"
+    },
+    {
+      "file": "AllocCenter.dc.html",
+      "title": "分配中心",
+      "x": 0,
+      "y": 1520,
+      "w": 1440,
+      "h": 1400,
+      "page": "page-domains"
+    },
+    {
+      "file": "OrdersCenter.dc.html",
+      "title": "订单中心 · 全貌",
+      "x": 1560,
+      "y": 1520,
+      "w": 1440,
+      "h": 1100,
+      "page": "page-domains"
+    },
+    {
+      "file": "ProductList.dc.html",
+      "title": "产品列表",
+      "x": 0,
+      "y": 0,
+      "w": 1440,
+      "h": 1000,
+      "page": "page-domains"
+    },
+    {
+      "file": "FeedTracker.dc.html",
+      "title": "Feed 追踪",
+      "x": 1560,
+      "y": 3040,
+      "w": 1440,
+      "h": 1000,
+      "page": "page-domains"
+    },
+    {
+      "file": "BlacklistCenter.dc.html",
+      "title": "黑名单中心",
+      "x": 0,
+      "y": 3040,
+      "w": 1440,
+      "h": 1000,
+      "page": "page-domains"
+    },
+    {
+      "file": "ScrapeMonitor.dc.html",
+      "title": "采集监控",
+      "x": 3120,
+      "y": 3040,
+      "w": 1440,
+      "h": 1000,
+      "page": "page-domains"
+    },
+    {
+      "file": "MaintCenter.dc.html",
+      "title": "维护与清理",
+      "x": 3120,
+      "y": 1520,
+      "w": 1440,
+      "h": 1000,
+      "page": "page-domains"
+    },
+    {
+      "file": "WorkflowAtlas.dc.html",
+      "title": "工作流全景 · 66 条",
+      "x": 3120,
+      "y": 4160,
+      "w": 1440,
+      "h": 1340,
+      "page": "page-domains"
+    },
+    {
+      "file": "RunsSchedule.dc.html",
+      "title": "运行记录与调度",
+      "x": 1560,
+      "y": 4160,
+      "w": 1440,
+      "h": 1100,
+      "page": "page-domains"
     }
   ],
   "annotations": [
@@ -71,10 +197,20 @@
       "x": 0,
       "y": -150,
       "w": 560,
-      "text": "第一轮六块(工作流触发拆成三联,共 8 画板)· 配色与组件词汇逐值对齐旧系统 erp-core:黑主按钮 + emerald/amber/red/sky/violet/gray 状态点,Inter + Noto Sans SC + JetBrains Mono,行高 32/40 两档。\n数据全部对上库里真有的表与状态,详见仓库 docs/frontend_brief.md。"
+      "page": "page-core",
+      "text": "第一轮:设计系统 + 核心交互(总览 / 工作流触发三联 / 产品详情 / 订单待人工 / 上架漏斗)。配色与组件词汇逐值对齐旧系统 erp-core。"
+    },
+    {
+      "id": "round-2-note",
+      "x": 0,
+      "y": -150,
+      "w": 640,
+      "page": "page-domains",
+      "text": "第二轮:业务域主页面全集(按全项目扫读的真值画:分配链 / 订单全貌 / 类目映射 / 审核中心 / 黑名单 / Feed / 采集 / 店铺 / 维护 / 产品列表 / 运行与调度 / 工作流全景)。\n每块画板的表名与状态取值都对着库里真有的东西,画布上没有的状态库里也没有。"
     }
   ],
   "launch": {
-    "view": "canvas"
+    "view": "canvas",
+    "page": "page-domains"
   }
 }

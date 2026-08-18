@@ -89,6 +89,9 @@ ICONS = {
  "Zap": '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
  "ScrollText": '<path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>',
  "Send": '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+ "Layers": '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+ "ShieldCheck": '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+ "GitBranch": '<line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
  "Inbox": '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/>',
 }
 
@@ -121,10 +124,13 @@ NAV = [
     ]),
     ("按需查", [
         ("products",  "Package",           "产品", None, None),
+        ("audit",     "ShieldCheck",       "审核", None, None),
         ("listing",   "ListChecks",        "上架", None, None),
+        ("alloc",     "Layers",            "分配", None, None),
         ("maint",     "SlidersHorizontal", "维护与清理", "214", None),
         ("orders",    "ShoppingCart",      "订单", None, None),
         ("blacklist", "Ban",               "黑名单中心", None, None),
+        ("catmap",    "GitBranch",         "类目映射", "37", "amber"),
         ("feeds",     "Send",              "Feed 追踪", "7", None),
         ("scrape",    "Download",          "采集监控", None, None),
         ("stores",    "Store",             "店铺", None, None),
@@ -282,7 +288,7 @@ def ds_board():
     midfinal = card("语义③ 中间态 vs 终态", f'''<div style="padding:16px;display:flex;flex-direction:column;gap:14px">
       <div style="display:flex;align-items:center;gap:16px">
         <span style="font-size:12px;color:#a1a1aa;width:64px">终态(实心)</span>
-        {tag("emerald", "approved")}{tag("red", "rejected")}{tag("emerald", "done")}{tag("gray", "withdrawn")}{tag("emerald", "通过")}{tag("red", "拒绝")}
+        {tag("emerald", "approved")}{tag("red", "rejected")}{tag("emerald", "confirmed")}{tag("gray", "withdrawn")}{tag("emerald", "done")}{tag("emerald", "✓ 通过")}{tag("red", "建议拒绝")}
       </div>
       <div style="display:flex;align-items:center;gap:16px">
         <span style="font-size:12px;color:#a1a1aa;width:64px">中间态(虚线)</span>
@@ -313,7 +319,11 @@ def ds_board():
     </div>'''
     return shell(body, 1440, 1200)
 
-# ════════════════════════ 2. 总览首页(Main) ════════════════════════
+# ════════════════════════ 2. 总览首页(Main)v2 ════════════════════════
+def scrollbar(track_h, thumb_h, thumb_top):
+    return (f'<div style="position:absolute;right:3px;top:{thumb_top + 8}px;width:5px;height:{thumb_h}px;'
+            f'border-radius:3px;background:#d4d4d8"></div>')
+
 def main_board():
     kpis = "".join([
         kpi("在架商品", "128,455", "9/9 店 ACTIVE · catalog_sync 13:00"),
@@ -322,61 +332,74 @@ def main_board():
         kpi("在途 feed", "7", "含 1 条 pending 超 3 天", tone="amber"),
         kpi("UPC 池余量", "412", "低于 3 天用量,需补池", tone="amber"),
     ])
-    kpirow = f'<div style="display:flex;gap:16px">{kpis}</div>'
+    kpirow = f'<div style="display:flex;gap:16px;flex:none">{kpis}</div>'
 
-    def todo(tone, hollow, text, dest):
-        d = '<span class="dothollow"></span>' if hollow else dot(tone)
-        return (f'<div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid #f4f4f5">'
-                f'{d}<span style="flex:1;font-size:13px;color:#27272a">{text}</span>'
-                f'<span style="font-size:12px;color:#0369a1;display:inline-flex;align-items:center;gap:2px">{dest}{ic("ChevronRight", 12, "#0369a1")}</span></div>')
-    todos = card("需要我管的事 · 5", "".join([
-        todo("red", False, "<b>谭总10</b> 凭证失效 —— 该店今天整体被跳过(订单/上架/维护全停)", "店铺"),
-        todo("red", False, "product_clear 15:00 失败(退出码 1)· 摘要:PG 连接数触顶,已钳制并发", "运行记录"),
-        todo("amber", True, '<span class="id">6f9c41d2</span> 在途 3 天未落定(pending)· 301 SKU 每轮被防重跳过且 N 不变', "Feed 追踪"),
-        todo("amber", False, "UPC 池余量 412,按日均领用 180 只够 2.3 天", "上架 · UPC 池"),
-        todo("amber", False, "订单待人工 23 单,最早滞留 08-16(商品一致性闸 14 单)", "订单待人工"),
-    ]), style="flex:1")
-
-    chain = card("当天次序 · 硬约束", f'''<div style="padding:12px 16px;display:flex;flex-direction:column;gap:0">
-      <div style="font-size:12px;color:#71717a;padding-bottom:8px">谁提前,谁就是拿昨天的数据做今天的判断</div>
-      {"".join(f'<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid #f4f4f5"><span class="id" style="width:44px">{t}</span><span style="font-size:13px;font-weight:500">{n}</span><span style="font-size:12px;color:#a1a1aa">{d}</span></div>' for t, n, d in [
-        ("13:00", "产品链", "采集→入库→维护→问题"), ("15:00", "黑名单 / 清仓", "先拦后清"),
-        ("18:10", "产品审核", "拿当天新数据判"), ("20:00", "上架", "只上今天过审的")])}
-    </div>''')
+    def todo(tone, hollow, title, detail, dest):
+        d = '<span class="dothollow" style="margin-top:5px"></span>' if hollow else f'<span class="dot" style="background:{DOTS[tone]};margin-top:6px"></span>'
+        return (f'<div style="display:flex;gap:12px;padding:12px 16px;border-bottom:1px solid #f4f4f5">'
+                f'{d}<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:500;color:#18181b">{title}</div>'
+                f'<div style="font-size:12px;color:#71717a;margin-top:3px;line-height:1.6">{detail}</div></div>'
+                f'<span style="flex:none;align-self:center;font-size:12px;color:#0369a1;display:inline-flex;align-items:center;gap:2px">{dest}{ic("ChevronRight", 12, "#0369a1")}</span></div>')
+    todo_items = "".join([
+        todo("red", False, "谭总10 凭证失效", "该店今天整体被跳过:订单 / 上架 / 维护 / 清仓全停。换凭证后跑 ping_stores 核验。", "店铺"),
+        todo("red", False, "product_clear 15:00 失败(退出码 1)", "PG 连接数触顶(129/100),已钳制并发 —— 今天的清仓一件没做,待重跑。", "运行记录"),
+        todo("red", False, "feed 回执错误码激增:PROHIBITED ×14", "b7e04a11(A102)14 个 SKU 被判违禁 —— problem_scan 明天会归类,但值得今天看一眼是不是同一品牌。", "Feed 追踪"),
+        todo("amber", True, "6f9c41d2 在途 3 天未落定(pending)", "301 SKU 每轮被「在途防重跳过」且 N 一直不变 —— 看着像正常防重,实际是再也发不出去了。", "Feed 追踪"),
+        todo("amber", False, "UPC 池余量 412,只够 2.3 天", "按日均领用 180 计。余量告急会卡住 20:00 的上架。", "上架 · UPC 池"),
+        todo("amber", False, "订单待人工 23 单,最早滞留 08-16", "商品一致性闸 14 单 / 限价 5 单 / 其他 4 单 —— 一致性那批多为疑似换品,优先。", "订单待人工"),
+        todo("amber", False, "采集批次 zip=10019 timeout", "1,208 个 ASIN 未回,今晚审核的同轮闭环会重推一次;连续 timeout 要查采集端。", "采集监控"),
+        todo("amber", False, "类目映射缺口 +37", "昨天入库产品里 37 个亚马逊类目解不出映射 —— 审核会把它们判 pending 而不是拒。", "类目映射"),
+        todo("amber", False, "对账差异 3 行,合计 $12.40", "settlement_by_line 口径;逐行看是佣金变了还是丢件。", "订单 · 对账"),
+        todo("gray", False, "audit_calibrate 双跑偏差 0.4%", "低于 1% 阈值,不用动;备忘:上周是 0.2%。", "审核"),
+    ])
+    todos = card("需要我管的事 · 14", f'''<div style="position:relative;flex:1;min-height:0">
+      <div style="height:100%;overflow:hidden">{todo_items}</div>
+      {scrollbar(0, 210, 40)}
+      <div style="position:absolute;left:0;right:0;bottom:0;height:44px;background:linear-gradient(to bottom,rgba(255,255,255,0),#fff 70%);display:flex;align-items:flex-end;justify-content:center;padding-bottom:6px;font-size:11px;color:#a1a1aa">还有 4 条 · 滚动查看</div>
+    </div>''', action='<span class="btn sm bs">只看红</span><span class="btn sm bghost">全部已读</span>',
+        style="flex:1;min-width:0;display:flex;flex-direction:column")
 
     runs_rows = []
-    for t, label, wfs, st, dur, summary in [
-        ("02:00", "backup", "backup", ("emerald", False, "成功"), "3m08s", "全库 pg_dump 4.2GB → 保留 14 份"),
-        ("06:40", "daily_report", "daily_report", ("emerald", False, "成功"), "11m42s", "42 店日报已发飞书;影刀 KPI 腿沿用旧值(唤起失败已另报)"),
-        ("07:30", "order_daily", "perf_problems · order_asin_normalize", ("emerald", False, "成功"), "4m51s", "绩效问题 3 单入台账;ASIN 归一 217 行"),
-        ("14:20", "order_chain", "order_sync · order_audit · returns_sync", ("emerald", False, "成功"), "9m17s", "42/43 店 3,368 订单行;审核 通过 3,201 / 拒 96 / 钓鱼 2 / 待人工 23"),
-        ("14:30", "feed_poll", "feed_poll", ("emerald", False, "成功"), "1m02s", "2 feed 落定 301 SKU;在途 7"),
-        ("13:00", "product_chain", "catalog_sync … problem_product_cleanup(7 步)", ("emerald", False, "成功"), "1h48m", "在架 128,455;维护建议 214;问题归类 37"),
-        ("15:00", "blacklist", "risk_sync · blacklist_push", ("emerald", False, "成功"), "2m33s", "品牌黑名单 +3(err_hits 自产);已推飞书"),
-        ("15:00", "product_clear", "product_clear", ("red", False, "失败"), "22s", "PG 连接数触顶(129/100)—— 已钳制并发,待重跑"),
-        ("18:10", "audit_sheet", "product_audit", None, "", "今晚 18:10"),
-        ("20:00", "list_new", "list_new", None, "", "今晚 20:00"),
-        ("周三 08:00", "settlement", "settlement_sync", None, "", "下次 08-19"),
+    for t, label, st, dur, summary in [
+        ("02:00", "backup", ("emerald", False), "3m08s", "pg_dump 4.2GB,保留 14 份"),
+        ("06:40", "daily_report", ("emerald", False), "11m42s", "42 店日报已发;影刀腿沿用旧值"),
+        ("07:30", "order_daily", ("emerald", False), "4m51s", "绩效 3 单;ASIN 归一 217"),
+        ("13:00", "product_chain", ("emerald", False), "1h48m", "7 步全过;建议 214;问题 37"),
+        ("14:20", "order_chain", ("emerald", False), "9m17s", "42/43 店 3,368 行;待人工 23"),
+        ("14:30", "feed_poll", ("emerald", False), "1m02s", "2 feed 落定 301 SKU"),
+        ("15:00", "blacklist", ("emerald", False), "2m33s", "品牌 +3;已推飞书"),
+        ("15:00", "product_clear", ("red", False), "22s", "PG 连接触顶,待重跑"),
+        ("18:10", "audit_sheet", None, "", "今晚"),
+        ("20:00", "list_new", None, "", "今晚"),
+        ("周三", "settlement", None, "", "08-19"),
     ]:
         if st is None:
-            state = f'<span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#a1a1aa">{ic("Clock", 13, "#a1a1aa")}未到点</span>'
-            dim = ";color:#a1a1aa"
+            left = f'<span style="display:inline-flex;align-items:center;gap:6px">{ic("Clock", 12, "#a1a1aa")}<span class="id" style="color:#a1a1aa">{t}</span></span>'
+            name = f'<span class="id" style="color:#a1a1aa;font-weight:500">{label}</span>'
+            tail = f'<span style="font-size:11px;color:#a1a1aa">{summary}</span>'
         else:
-            state = pill(st[0], st[2], hollow=st[1])
-            dim = ""
-        runs_rows.append(f'<tr class="rz"><td class="td id" style="width:84px{dim}">{t}</td>'
-                         f'<td class="td id" style="width:120px;font-weight:500{dim}">{label}</td>'
-                         f'<td class="td" style="width:280px;font-size:12px;color:#71717a">{wfs}</td>'
-                         f'<td class="td" style="width:110px">{state}</td>'
-                         f'<td class="td num" style="width:80px;color:#71717a">{dur}</td>'
-                         f'<td class="td" style="font-size:12px;color:#52525b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:390px">{summary}</td></tr>')
-    runs = card("今天的自动任务 · 11 条(launchd 2 + 智能体 9)",
-                f'<table><tr><th class="th">时间</th><th class="th">任务</th><th class="th">工作流</th><th class="th">结局</th><th class="th" style="text-align:right">耗时</th><th class="th">摘要首行</th></tr>{"".join(runs_rows)}</table>',
-                action='<span class="btn sm bghost">运行记录</span>')
+            left = f'<span style="display:inline-flex;align-items:center;gap:6px">{dot(st[0])}<span class="id" style="color:#71717a">{t}</span></span>'
+            name = f'<span class="id" style="font-weight:500">{label}</span>'
+            tail = f'<span class="id" style="color:#a1a1aa">{dur}</span>'
+        runs_rows.append(f'''<div style="padding:7px 14px;border-bottom:1px solid #f4f4f5">
+          <div style="display:flex;align-items:center;gap:8px">{left}{name}<span style="flex:1"></span>{tail}</div>
+          <div style="font-size:11px;color:#71717a;margin-top:2px;padding-left:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{summary if st else ""}</div>
+        </div>''')
+    autoruns = card("今天的自动任务 · 11", f'''<div style="position:relative;flex:1;min-height:0">
+      <div style="height:100%;overflow:hidden">{"".join(runs_rows)}</div>
+      {scrollbar(0, 150, 30)}
+    </div>''', action='<span class="btn sm bghost">运行记录</span>',
+        style="display:flex;flex-direction:column;flex:1;min-height:0")
 
+    chain = card("当天次序 · 硬约束", '''<div style="padding:10px 14px;font-size:12px;color:#52525b;line-height:2">
+      <div><span class="id">13:00</span> 产品链 → <span class="id">15:00</span> 黑名单/清仓</div>
+      <div>→ <span class="id">18:10</span> 审核 → <span class="id">20:00</span> 上架</div>
+      <div style="color:#a1a1aa;font-size:11px;line-height:1.6;margin-top:4px">谁提前,谁就在拿昨天的数据做今天的判断</div>
+    </div>''', style="flex:none")
+
+    right = f'<div style="width:380px;flex:none;display:flex;flex-direction:column;gap:16px;min-height:0">{autoruns}{chain}</div>'
     content = (kpirow +
-               f'<div style="display:grid;grid-template-columns:2fr 1fr;gap:16px;align-items:stretch">{todos}{chain}</div>' +
-               runs)
+               f'<div style="display:flex;gap:16px;flex:1;min-height:0">{todos}{right}</div>')
     return shell(page("overview", ["总览", "2026-08-18 周二"], content, 1100), 1440, 1100)
 
 # ════════════════════════ 3. 工作流触发 · 选择与参数 ════════════════════════
@@ -423,7 +446,7 @@ def wfselect_board():
       {field("l3 — LLM 语义层", inp("on"), "off = 只走规则闸,不调用 LLM")}
       <div style="border-top:1px solid #f4f4f5;padding-top:14px;display:flex;flex-direction:column;gap:10px">
         <span class="btn bp" style="width:100%">{ic("Eye", 14, "#fff") if "Eye" in ICONS else ""}预览这一轮会做什么(--dry-run)</span>
-        <div style="font-size:11px;color:#a1a1aa;line-height:1.6">危险工作流必须先预览:服务端不持有同参数的 dry-run 预览票就拒绝真跑(409)。预览本身就是一次真实空跑,输出即破坏面。</div>
+        <div style="font-size:11px;color:#a1a1aa;line-height:1.6">危险工作流必须先预览:服务端不持有同参数的 dry-run 预览票就拒绝真跑(409)。预览即真实空跑,输出即破坏面。表单只给白名单参数键 —— CLI 对打错的参数名是静默吞掉的,这里不给犯错的机会。</div>
       </div>
     </div>''', style="width:400px;flex:none")
 
@@ -560,9 +583,9 @@ def product_board():
         ev("07-03 18:22", "emerald", "审核通过", False, "L1 规则全过;L3 语义未触发;类目映射 Electronics → Walmart『Wall Chargers』", "product_audit"),
         ev("07-05 20:03", "sky", "上架提交", False, 'MP_ITEM feed <span class="id">8f31c2d9</span> · 领 UPC 194735092345', "list_new"),
         ev("07-06 13:47", "emerald", "商品出现", False, "沃尔玛侧首次观测到,PUBLISHED", "problem_scan"),
-        ev("08-11 13:55", "amber", "维护提交", False, "改价 $45.99 → $47.99;原因码:亚马逊涨价 $19.99 → $23.99", "maintenance"),
-        ev("08-12 14:00", "gray", "状态变更", False, "价格生效核验通过,建议 #4471 executing → done", "feed_poll"),
-    ]) + '<div style="padding:10px 16px;font-size:11px;color:#a1a1aa">事件全集:入库 / 审核通过 / 审核拒绝 / 上架提交 / 删除提交 / 停用提交 / 维护提交 / 问题归类 / 商品出现 / 商品消失 / 状态变更 / 删除已核验 / 删除未生效</div>')
+        ev("07-28 13:47", "gray", "商品消失", False, "沃尔玛侧未观测到,标 missing_since(观察,不动作)", "problem_scan"),
+        ev("07-29 13:52", "emerald", "商品出现", False, "重新观测到,missing_since 清空", "problem_scan"),
+    ]) + '<div style="padding:10px 16px;font-size:11px;color:#a1a1aa">事件 25 类(item_appeared / item_reappeared / item_missing / status_changed / delete_submitted / retire_submitted / match_submitted / 审核类 …;中文标签是显示层映射)。⚠ 改价/改库存/改标题不进病历(流水在 feed 台账),生死类恒记 —— 别在这条时间线上找改价。身份键 = coalesce(asin, sku)。</div>')
 
     feeds_rows = "".join([
         f'<tr class="rz"><td class="td id">8f31c2d9</td><td class="td id">MP_ITEM</td><td class="td">{tag("emerald", "done")}</td><td class="td">success · 07-05 21:12 落定</td><td class="td id" style="color:#a1a1aa">list_new</td></tr>',
@@ -604,12 +627,12 @@ def orderqueue_board():
         f'<td class="td id">{sku}</td><td class="td id">{store}</td><td class="td num">{amt}</td>'
         f'<td class="td">{tag("amber", gate, dashed=True)}</td><td class="td">{tag("amber", "待人工", dashed=True)}</td></tr>'
         for t, po, sku, store, amt, gate, on in rows)
-    left = card("待人工 · 23 单(六道闸任一给不出确定答案,一律进这里 —— 绝不当通过)",
+    left = card("待人工 · 23 单(五道审核任一给不出确定答案,一律进这里 —— 绝不当通过)",
         f'''<div style="padding:12px 16px;display:flex;gap:8px;border-bottom:1px solid #f4f4f5">
           <span class="btn sm bs">店铺:全部</span><span class="btn sm bs">判闸:全部</span><span class="btn sm bs">滞留 ≥ 1 天</span>
           <span style="flex:1"></span><span class="btn sm bghost">导出</span></div>
-        <table><tr><th class="th">下单时间</th><th class="th">订单号</th><th class="th">SKU</th><th class="th">店铺</th><th class="th" style="text-align:right">金额</th><th class="th">判成待人工的闸</th><th class="th">状态</th></tr>{trs}''' +
-        '<div style="padding:10px 16px;font-size:11px;color:#a1a1aa">六道闸依次判:钓鱼(邮编)→ 采集完整性 → 商品一致性 → 配送时长 → 采购方匹配 → 限价</div>',
+        <table><tr><th class="th">下单时间</th><th class="th">订单号</th><th class="th">SKU</th><th class="th">店铺</th><th class="th" style="text-align:right">金额</th><th class="th">判成待人工的那一道</th><th class="th">状态</th></tr>{trs}''' +
+        '<div style="padding:10px 16px;font-size:11px;color:#a1a1aa">采集完整性是前置(缺快照先推采集);五道审核:钓鱼邮编 → 商品一致性 → 配送时长 → 采购方匹配 → 限价(= 商品金额 × 0.75)</div>',
         style="flex:1;min-width:0")
 
     def gate(name, ok, detail):
@@ -621,10 +644,10 @@ def orderqueue_board():
       <header class="chead"><div style="display:flex;align-items:center;gap:8px"><h2 class="ctitle id">108934567890123</h2>{tag("amber", "待人工", dashed=True)}</div>{ic("X", 15, "#a1a1aa")}</header>
       <div style="padding:14px 16px;display:flex;flex-direction:column;gap:14px;overflow:hidden">
         <div>
-          <div style="font-size:12px;color:#71717a;margin-bottom:4px">六道闸</div>
-          {gate("钓鱼邮编", True, "97035 不在钓鱼库")}{gate("采集完整性", True, "快照 08-18 07:40 · 全字段")}
+          <div style="font-size:12px;color:#71717a;margin-bottom:4px">前置 + 五道审核</div>
+          {gate("采集完整性(前置)", True, "快照 08-18 07:40 · 全字段")}{gate("钓鱼邮编", True, "97035 不在钓鱼库")}
           {gate("商品一致性", False, "标题相似度 43% —— 给不出确定答案")}
-          {gate("配送时长", True, "5 天")}{gate("采购方匹配", True, "P-201 可用")}{gate("限价", True, "落地 $30.98 ≤ 限 $33.50")}
+          {gate("配送时长", True, "5 天")}{gate("采购方匹配", True, "P-201 可用")}{gate("限价 = 金额×0.75", True, "落地 $30.98 ≤ 限 $39.37")}
         </div>
         <div>
           <div style="font-size:12px;color:#71717a;margin-bottom:6px">证据 · 标题对照(相似度 43%)</div>
@@ -643,7 +666,7 @@ def orderqueue_board():
         </div>
         <div style="border-top:1px solid #f4f4f5;padding-top:12px;display:flex;flex-direction:column;gap:8px">
           <div style="display:flex;gap:8px"><span class="btn bs" style="flex:1">{ic("ExternalLink", 14)}沃尔玛后台处理</span><span class="btn bs">{ic("Copy", 14)}复制订单号</span></div>
-          <div style="font-size:11px;color:#a1a1aa;line-height:1.6">判定由 order_audit 写回 orders.order_lines;人工处理(发货/取消)在沃尔玛后台完成 —— 这里不提供改判按钮。</div>
+          <div style="font-size:11px;color:#a1a1aa;line-height:1.6">审核只出建议:✓ 通过 / 建议拒绝 / 待人工(钓鱼在 note 里,状态即建议拒绝且不可覆盖)。人工处理(发货/取消)在沃尔玛后台完成 —— 这里不提供改判按钮。</div>
         </div>
       </div>
     </div>'''
@@ -653,14 +676,16 @@ def orderqueue_board():
 # ════════════════════════ 8. 上架闸门漏斗 ════════════════════════
 def funnel_board():
     stages = [
-        ("待上架(飞书上架表过审行)", 1262, None, "#18181b"),
-        ("非 ACTIVE 店", 38, "凭证失效/暂停的店整体让位", "#a1a1aa"),
-        ("超配额", 310, "配额 = 成功提交口径,按店计", "#a1a1aa"),
-        ("风控", 124, "品牌词/制造商双字段", "#a1a1aa"),
+        ("待上架(上架表过审行,审核权威在库)", 1262, None, "#18181b"),
+        ("超配额", 240, "配额在全部过滤之后切,被淘汰行不占名额", "#a1a1aa"),
+        ("待数据源", 214, "缺快照/缺运费(NULL≠0)→ 自动推采集,次日续上", "#a1a1aa"),
+        ("风控拦截", 110, "品牌词 + 制造商双字段", "#a1a1aa"),
         ("黑名单", 86, "brand + asin + seller + 类目 四库", "#a1a1aa"),
+        ("占用", 49, "品牌/ASIN 已归属别店(catalog.claims)", "#a1a1aa"),
         ("全局去重", 41, "同 ASIN 已在任一店在架", "#a1a1aa"),
-        ("防呆", 7, "SKU 登记簿不认识的一律不动", "#a1a1aa"),
-        ("数据不全", 214, "缺快照/缺运费 → 自动推采集,明天再来", "#a1a1aa"),
+        ("非 ACTIVE 店", 38, "凭证失效/暂停的店整体让位", "#a1a1aa"),
+        ("PT 无 spec", 27, "类目缺官方规格,提了也被拒", "#a1a1aa"),
+        ("配送超时", 15, "货期超店铺限", "#a1a1aa"),
     ]
     bars = []
     for i, (name, n, note, _) in enumerate(stages):
@@ -682,14 +707,14 @@ def funnel_board():
       <span style="width:190px;flex:none;font-size:13px;font-weight:600;color:#047857">实际提交</span>
       <div style="flex:1"><div style="height:22px;border-radius:4px;background:#10b981;width:35.0%"></div></div>
       <span style="width:64px;text-align:right;flex:none" class="id"><b>442</b></span>
-      <span style="width:250px;flex:none;font-size:11px;color:#a1a1aa">领 UPC 442 · 9 店 · 每档可点开看被拦行</span></div>''')
+      <span style="width:250px;flex:none;font-size:11px;color:#a1a1aa">领 UPC 442 · 9 店 · 恰好 0 的闸不显示</span></div>''')
     funnel = card('闸门漏斗 · 今晚 20:00 那一轮(run #18492)', f'<div style="padding:12px 16px">{"".join(bars)}</div>',
                   action='<span class="btn sm bs">按店拆分</span><span class="btn sm bs">对比昨天</span>')
 
     outcome = f'''<div style="display:flex;gap:16px">
       <div class="card" style="flex:1;padding:14px 16px;display:flex;align-items:center;gap:10px">{dot("emerald")}<span style="font-size:13px">已提交</span><span class="kpival" style="font-size:20px">438</span></div>
-      <div class="card" style="flex:1;padding:14px 16px;display:flex;align-items:center;gap:10px">{dot("red")}<span style="font-size:13px">失败(附错误码)</span><span class="kpival" style="font-size:20px">3</span></div>
-      <div class="card" style="flex:1;padding:14px 16px;display:flex;align-items:center;gap:10px;border-color:#fde68a"><span class="dothollow"></span><span style="font-size:13px">结局不确定 —— 不重复提交,等自愈链收尾</span><span class="kpival" style="font-size:20px;color:#b45309">1</span></div>
+      <div class="card" style="flex:1;padding:14px 16px;display:flex;align-items:center;gap:10px">{dot("red")}<span style="font-size:13px">失败(自动重试 ≤3;PROHIBITED 永不重试)</span><span class="kpival" style="font-size:20px">3</span></div>
+      <div class="card" style="flex:1;padding:14px 16px;display:flex;align-items:center;gap:10px;border-color:#fde68a"><span class="dothollow"></span><span style="font-size:13px">Unknown —— 也算已上架,重复提交=双上架;UPC 永不回收</span><span class="kpival" style="font-size:20px;color:#b45309">1</span></div>
     </div>'''
 
     blocked = card("被拦明细 · 黑名单(−86)", f'''<table>
@@ -701,8 +726,10 @@ def funnel_board():
 
     tabs = '''<div style="display:flex;gap:2px;border-bottom:1px solid #e4e4e7">
       <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;font-weight:500;color:#18181b;border-bottom:2px solid #18181b">闸门漏斗</span>
-      <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;color:#52525b">UPC 池 <span class="navbadge amber" style="margin-left:6px">412</span></span>
+      <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;color:#52525b">UPC 池(未用/已领/已用/撞库/非法前缀)<span class="navbadge amber" style="margin-left:6px">412</span></span>
       <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;color:#52525b">变体组</span>
+      <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;color:#52525b">跟卖线(独立状态机)</span>
+      <span style="height:36px;display:flex;align-items:center;padding:0 12px;font-size:13px;color:#52525b">SKU_LOCKED 自愈</span>
     </div>'''
     content = tabs + funnel + outcome + blocked
     return shell(page("listing", ["上架", "闸门漏斗"], content, 900), 1440, 900)
@@ -710,7 +737,8 @@ def funnel_board():
 # ════════════════════════ 输出 ════════════════════════
 import json, pathlib
 
-BOARDS = {
+# 第一页:核心交互(第一轮 8 块);第二页:业务域主页面(第二轮)
+CORE = {
     "DesignSystem.dc.html": (ds_board, "设计系统", 1440, 1200),
     "Main.dc.html": (main_board, "总览(首页)", 1440, 1100),
     "RunSelect.dc.html": (wfselect_board, "工作流 · 选择与参数", 1440, 900),
@@ -720,8 +748,7 @@ BOARDS = {
     "OrderQueue.dc.html": (orderqueue_board, "订单待人工", 1440, 1000),
     "ListingFunnel.dc.html": (funnel_board, "上架闸门漏斗", 1440, 900),
 }
-
-POS = {
+CORE_POS = {
     "DesignSystem.dc.html": (0, 0),
     "Main.dc.html": (0, 1320),
     "OrderQueue.dc.html": (1560, 1320),
@@ -732,21 +759,41 @@ POS = {
     "ProductDetail.dc.html": (1560, 3560),
 }
 
-for fname, (fn, title, w, h) in BOARDS.items():
-    pathlib.Path(fname).write_text(fn(), encoding="utf-8")
-    print(f"{fname:24s} {len(pathlib.Path(fname).read_bytes())/1024:6.1f} KB")
+# 第二轮画板在 gen2.py 里定义后注入这里
+DOMAIN_BOARDS = {}
+DOMAIN_POS = {}
+try:
+    from gen2 import DOMAIN_BOARDS, DOMAIN_POS  # noqa: F401
+except ImportError:
+    pass
 
-canvas = {
-    "artboards": [
-        {"file": f, "title": BOARDS[f][1], "x": POS[f][0], "y": POS[f][1],
-         "w": BOARDS[f][2], "h": BOARDS[f][3]}
-        for f in BOARDS
-    ],
-    "annotations": [
-        {"id": "round-1-note", "x": 0, "y": -150, "w": 560,
-         "text": "第一轮六块(工作流触发拆成三联,共 8 画板)· 配色与组件词汇逐值对齐旧系统 erp-core:黑主按钮 + emerald/amber/red/sky/violet/gray 状态点,Inter + Noto Sans SC + JetBrains Mono,行高 32/40 两档。\n数据全部对上库里真有的表与状态,详见仓库 docs/frontend_brief.md。"},
-    ],
-    "launch": {"view": "canvas"},
-}
-pathlib.Path("canvas.json").write_text(json.dumps(canvas, ensure_ascii=False, indent=2), encoding="utf-8")
-print("canvas.json OK")
+def emit():
+    boards = dict(CORE)
+    boards.update(DOMAIN_BOARDS)
+    for fname, (fn, title, w, h) in boards.items():
+        pathlib.Path(fname).write_text(fn(), encoding="utf-8")
+        print(f"{fname:26s} {len(pathlib.Path(fname).read_bytes())/1024:6.1f} KB")
+    arts = []
+    for f in CORE:
+        arts.append({"file": f, "title": CORE[f][1], "x": CORE_POS[f][0], "y": CORE_POS[f][1],
+                     "w": CORE[f][2], "h": CORE[f][3], "page": "page-core"})
+    for f in DOMAIN_BOARDS:
+        arts.append({"file": f, "title": DOMAIN_BOARDS[f][1], "x": DOMAIN_POS[f][0], "y": DOMAIN_POS[f][1],
+                     "w": DOMAIN_BOARDS[f][2], "h": DOMAIN_BOARDS[f][3], "page": "page-domains"})
+    canvas = {
+        "pages": [{"id": "page-domains", "name": "业务域主页面"},
+                  {"id": "page-core", "name": "核心交互与设计系统"}],
+        "artboards": arts,
+        "annotations": [
+            {"id": "round-1-note", "x": 0, "y": -150, "w": 560, "page": "page-core",
+             "text": "第一轮:设计系统 + 核心交互(总览 / 工作流触发三联 / 产品详情 / 订单待人工 / 上架漏斗)。配色与组件词汇逐值对齐旧系统 erp-core。"},
+            {"id": "round-2-note", "x": 0, "y": -150, "w": 640, "page": "page-domains",
+             "text": "第二轮:业务域主页面全集(按全项目扫读的真值画:分配链 / 订单全貌 / 类目映射 / 审核中心 / 黑名单 / Feed / 采集 / 店铺 / 维护 / 产品列表 / 运行与调度 / 工作流全景)。\n每块画板的表名与状态取值都对着库里真有的东西,画布上没有的状态库里也没有。"},
+        ],
+        "launch": {"view": "canvas", "page": "page-domains"},
+    }
+    pathlib.Path("canvas.json").write_text(json.dumps(canvas, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"canvas.json OK · {len(arts)} 画板 · 2 页")
+
+if __name__ == "__main__":
+    emit()

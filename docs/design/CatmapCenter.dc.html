@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter','Noto Sans SC',system-ui,sans-serif; -webkit-font-smoothing: antialiased;
+       background: #fafafa; color: #18181b; }
+a { color: #0369a1; text-decoration: none; } a:hover { color: #075985; }
+.mono { font-family: 'JetBrains Mono',ui-monospace,monospace; }
+.tab { font-variant-numeric: tabular-nums; }
+.card { background: #fff; border: 1px solid #e4e4e7; border-radius: 8px; }
+.chead { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 44px; border-bottom: 1px solid #f4f4f5; }
+.ctitle { font-size: 13px; font-weight: 500; color: #18181b; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; flex: none; }
+.dothollow { display: inline-block; width: 9px; height: 9px; border-radius: 99px; background: #fff; border: 2px solid #f59e0b; flex: none; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #27272a; white-space: nowrap; }
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; height: 20px; border-radius: 4px; font-size: 11px; font-weight: 500; border: 1px solid; white-space: nowrap; }
+.tagdash { border-style: dashed; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; border-radius: 6px;
+       font-weight: 500; font-size: 14px; height: 36px; padding: 0 12px; border: 1px solid transparent; cursor: default; }
+.btn.sm { height: 28px; padding: 0 8px; font-size: 12px; }
+.btn.lg { height: 40px; padding: 0 16px; }
+.bp { background: #18181b; color: #fff; }
+.bs { background: #fff; color: #18181b; border-color: #d4d4d8; }
+.bghost { background: transparent; color: #3f3f46; }
+.bdanger { background: #dc2626; color: #fff; }
+.bdghost { background: transparent; color: #b91c1c; }
+table { border-collapse: separate; border-spacing: 0; width: 100%; }
+.th { background: #fafafa; text-align: left; padding: 0 12px; height: 36px; font-size: 11px; font-weight: 500; color: #71717a;
+      text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #e4e4e7; white-space: nowrap; }
+.td { padding: 0 12px; font-size: 13px; color: #27272a; border-bottom: 1px solid #f4f4f5; vertical-align: middle; }
+.rz .td { height: 40px; } .rc .td { height: 32px; }
+.num { text-align: right; font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.id { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12.5px; letter-spacing: -0.01em; color: #3f3f46; }
+.kbd { font-family: 'JetBrains Mono',monospace; font-size: 10px; padding: 1px 5px; border: 1px solid #e4e4e7;
+       border-bottom-width: 2px; border-radius: 4px; background: #fafafa; color: #52525b; }
+.grouptitle { padding: 0 16px; margin: 12px 0 4px; font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em; color: #a1a1aa; }
+.navitem { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 16px; font-size: 13px; color: #3f3f46; }
+.navitem.on { background: #18181b; color: #fff; }
+.navbadge { font-family: 'JetBrains Mono',monospace; font-variant-numeric: tabular-nums; font-size: 10px; padding: 0 6px; height: 16px;
+            display: inline-flex; align-items: center; border-radius: 4px; background: #f4f4f5; color: #3f3f46; margin-left: auto; }
+.navbadge.amber { background: #fffbeb; color: #b45309; }
+.kpilabel { font-size: 12px; color: #71717a; }
+.kpival { font-size: 24px; font-weight: 600; font-family: 'JetBrains Mono',ui-monospace,monospace; font-variant-numeric: tabular-nums; color: #18181b; }
+.log { font-family: 'JetBrains Mono',ui-monospace,monospace; font-size: 12px; line-height: 1.7; color: #d4d4d8;
+       background: #18181b; border-radius: 6px; padding: 14px 16px; white-space: pre; overflow: hidden; }
+.log .ok { color: #34d399; } .log .warn { color: #fbbf24; } .log .err { color: #f87171; } .log .dim { color: #71717a; }
+</style>
+</helmet>
+<div style="width:1440px;height:1400px;display:flex;background:#fafafa;overflow:hidden"><aside style="width:240px;flex:none;background:#fff;border-right:1px solid #e4e4e7;display:flex;flex-direction:column">
+  <div style="height:48px;border-bottom:1px solid #f4f4f5;display:flex;align-items:center;gap:8px;padding:0 16px">
+    <div class="mono" style="height:24px;width:24px;border-radius:4px;background:#18181b;color:#fff;display:grid;place-items:center;font-size:11px;font-weight:700">W</div>
+    <div style="line-height:1.25"><div style="font-size:13px;font-weight:600;color:#18181b">WalmartAPI 运营台</div>
+    <div style="font-size:10px;color:#a1a1aa">45 店 · 生产 · macOS 本机</div></div>
+  </div>
+  <nav style="flex:1;padding:8px 0"><div class="grouptitle">每天看</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg><span style="flex:1">总览</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/></svg><span style="flex:1">订单待人工</span><span class="navbadge amber">23</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg><span style="flex:1">运行记录</span></div><div class="grouptitle">按需查</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m7.5 4.27 9 5.15"/><path d="M21 8 12 2 3 8v8l9 6 9-6V8z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg><span style="flex:1">产品</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg><span style="flex:1">审核</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg><span style="flex:1">上架</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg><span style="flex:1">分配</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="3" y1="6" x2="13" y2="6"/><line x1="17" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="9" y2="12"/><line x1="13" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="13" y2="18"/><line x1="17" y1="18" x2="21" y2="18"/><circle cx="15" cy="6" r="2"/><circle cx="11" cy="12" r="2"/><circle cx="15" cy="18" r="2"/></svg><span style="flex:1">维护与清理</span><span class="navbadge">214</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="8" cy="21" r="1"/><circle cx="19" cy="21" r="1"/><path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12"/></svg><span style="flex:1">订单</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg><span style="flex:1">黑名单中心</span></div><div class="navitem on"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#fff" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg><span style="flex:1">类目映射</span><span class="navbadge amber" style="background:rgba(255,255,255,.2);color:#fff">37</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg><span style="flex:1">Feed 追踪</span><span class="navbadge">7</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg><span style="flex:1">采集监控</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><path d="m2 7 2-3h16l2 3"/><path d="M4 7v13a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V7"/><path d="M2 7a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0"/></svg><span style="flex:1">店铺</span></div><div class="grouptitle">操作</div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><polygon points="6 3 20 12 6 21 6 3"/></svg><span style="flex:1">工作流</span></div><div class="navitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg><span style="flex:1">调度</span></div></nav>
+  <div style="padding:12px 16px;border-top:1px solid #f4f4f5;font-size:11px;color:#a1a1aa">
+    <div style="display:flex;align-items:center;gap:6px"><span class="dot" style="background:#10b981"></span> launchd 2 条 · 智能体 9 条在班</div>
+    <div class="mono" style="margin-top:4px">Asia/Shanghai · 2026-08-18</div>
+  </div>
+</aside><div style="flex:1;display:flex;flex-direction:column;min-width:0"><header style="height:48px;flex:none;background:#fff;border-bottom:1px solid #e4e4e7;display:flex;align-items:center;gap:12px;padding:0 16px 0 24px;">
+  <div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px;font-weight:500;color:#18181b">类目映射</span></div>
+  <div style="flex:1"></div>
+  <div style="position:relative;width:320px">
+    <span style="position:absolute;left:10px;top:9px"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#a1a1aa" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+    <div style="height:32px;border:1px solid #d4d4d8;border-radius:6px;background:#fff;display:flex;align-items:center;padding:0 8px 0 30px;font-size:13px;color:#a1a1aa">输 ASIN / 工作流名 / 店铺名 直达…</div>
+    <span class="kbd" style="position:absolute;right:8px;top:8px">⌘K</span>
+  </div>
+</header><main style="flex:1;padding:24px;display:flex;flex-direction:column;gap:16px;overflow:hidden"><div style="display:flex;gap:16px;flex:none"><div class="card" style="padding:16px;flex:1"><div class="kpilabel">映射覆盖率(产品侧)</div><div class="kpival" style="margin-top:8px">64.4%</div><div style="margin-top:4px;font-size:11px;color:#a1a1aa">15,538 node 已映射 10,011 · 自增强回路在涨</div></div><div class="card" style="padding:16px;flex:1"><div class="kpilabel">映射表</div><div class="kpival" style="margin-top:8px">13,349 node</div><div style="margin-top:4px;font-size:11px;color:#a1a1aa">audit.walmart_category_map · 高置信行直出</div></div><div class="card" style="padding:16px;flex:1"><div class="kpilabel">类目树</div><div class="kpival" style="margin-top:8px">28,495 node</div><div style="margin-top:4px;font-size:11px;color:#a1a1aa">重导后应达 32,147(中间层已修解析)</div></div><div class="card" style="padding:16px;flex:1"><div class="kpilabel">三方 JOIN 命中</div><div class="kpival" style="margin-top:8px">82.2% / 99.9%</div><div style="margin-top:4px;font-size:11px;color:#a1a1aa">产品侧 / 映射表侧 —— 导入前必看这两个数</div></div></div><section class="card" style=""><header class="chead"><h2 class="ctitle">四桶缺口 · catmap_gap(按 node 分:该 node 下有没有任何一个产品带实证 PT)</h2></header>
+      <div style="padding:12px 16px;display:flex;gap:12px">
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:12px 14px;background:#fff">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:13px;font-weight:600">A 桶 · 有实证没映射</span><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">catmap_mine 常态重跑</span></div>
+          <div class="id" style="font-size:15px;font-weight:600;margin-top:6px">1,740 node<span style="font-size:11px;color:#a1a1aa;font-weight:400"> · 16.6 万件</span></div>
+          <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.6">瓶颈是实证太稀;每跑一轮 product_audit,walmart_pt 就多一批,下一轮 mine 就多挖一批 —— 自增强回路</div></div>
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:12px 14px;background:#fff">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:13px;font-weight:600">B 桶 · 零实证</span><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">⛔ 不排期</span></div>
+          <div class="id" style="font-size:15px;font-weight:600;margin-top:6px">3,787 node<span style="font-size:11px;color:#a1a1aa;font-weight:400"> · 4.5 万件</span></div>
+          <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.6">所有者 08-17 裁决:真实收益仅约 1.37 万件(84% 停在 L0 压根不查类目);解不出走 L1 LLM 兜底,慢些贵些但判得了</div></div>
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:12px 14px;background:#fff">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:13px;font-weight:600">C 桶 · 树里没有</span><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">采集侧补抓</span></div>
+          <div class="id" style="font-size:15px;font-weight:600;margin-top:6px">2,759 node<span style="font-size:11px;color:#a1a1aa;font-weight:400"> · —</span></div>
+          <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.6">产品带着这个 node 但类目树没有 → catmap_gap -p only=not_in_tree 出清单</div></div>
+        <div style="flex:1;border:1px solid #e4e4e7;border-radius:6px;padding:12px 14px;background:#fff">
+          <div style="display:flex;align-items:center;gap:8px"><span style="font-size:13px;font-weight:600">D 桶 · 没货</span><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">不处理</span></div>
+          <div class="id" style="font-size:15px;font-weight:600;margin-top:6px">12,386 node<span style="font-size:11px;color:#a1a1aa;font-weight:400"> · —</span></div>
+          <div style="font-size:11px;color:#71717a;margin-top:6px;line-height:1.6">亚马逊有我们没货 —— 别浪费 LLM</div></div>
+      </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">置信度生命周期 · 升档自动,降档只走人工</h2></header>
+      <div style="padding:12px 16px;display:flex;gap:16px">
+        <div style="flex:1;display:flex;flex-direction:column;gap:8px;font-size:12.5px">
+          <div style="display:flex;gap:8px;align-items:center"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">高</span><span style="color:#52525b">审核 ②级闸<b>直出</b>,不经 LLM(硬筛 confidence='高')</span></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">中</span><span style="color:#52525b">只进候选,LLM 拿它当参考自己判</span></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">低</span><span style="color:#52525b">凭空推测 —— 弱证据永远绕不过 LLM。中/低是设计内档位,不是待修复的错误</span></div>
+          <div style="font-size:11px;color:#71717a;margin-top:4px;line-height:1.7">升档:catmap_mine -p promote=1,数据攒够低→中→高自动走,重跑幂等。<br>
+          降档<b>不自动</b>(证据可能只是暂时变薄;高置信可能是人定的)—— 只走 catmap_fix:旧行降「低」留痕不删,新行插「高」。</div>
+        </div>
+        <div style="flex:1">
+          <table><tr><th class="th">mine 产出桶</th><th class="th">判据</th><th class="th">落档</th></tr>
+          <tr class="rc"><td class="td id">mined_trusted</td><td class="td" style="font-size:12px">≥5 票且优势 ≥70~80%</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">高</span></td></tr>
+          <tr class="rc"><td class="td id">mined_review</td><td class="td" style="font-size:12px">2~4 票、优势达标</td><td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">中</span></td></tr>
+          <tr class="rc"><td class="td id">map_conflict</td><td class="td" style="font-size:12px">实证与旧映射相左(旧行不动)</td><td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">中</span></td></tr>
+          <tr class="rc"><td class="td id">mined_mixed</td><td class="td" style="font-size:12px">票分流,首选是多数派非共识</td><td class="td"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">低</span></td></tr>
+          <tr class="rc"><td class="td id">map_ambiguous</td><td class="td" style="font-size:12px;color:#b91c1c;font-weight:500">映射表自己挂多条高置信 PT —— ②级直出对该 node 失明且无报错,必须高亮</td><td class="td" style="font-size:12px;color:#71717a">只报不写;裁剪走 catmap_fix</td></tr>
+          </table></div>
+      </div></section><section class="card" style=""><header class="chead"><h2 class="ctitle">映射明细 · audit.walmart_category_map(键 = browse_node_id;名字会漂 ID 不会;PG 是权威,飞书只是镜子 —— 在飞书改格子不影响判定。哨兵行「无对应Walmart PT」是信息不是脏数据)</h2><div style="display:flex;align-items:center;gap:8px"><span class="btn sm bs">查 node</span><span class="btn sm bs">只看冲突</span></div></header>
+      <table><tr><th class="th">node_id</th><th class="th">代表路径(非唯一真相 —— 树是 DAG,走父链查 amazon_node_paths)</th>
+      <th class="th">沃尔玛 PT</th><th class="th">置信</th><th class="th">来源</th><th class="th">票(只数 pt_source=walmart_confirmed,偏少正常)</th></tr>
+      <tr class="rc"><td class="td id">172456</td><td class="td" style="font-size:12px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Electronics › Chargers &amp; Power Adapters</td><td class="td id">Wall Chargers</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">高</span></td><td class="td id" style="color:#71717a">mined_trusted</td><td class="td num">38 · 92%</td></tr>
+      <tr class="rc"><td class="td id">3741411</td><td class="td" style="font-size:12px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Sports &amp; Outdoors › Golf › Cart Accessories</td><td class="td id">Golf Cart Parts</td><td class="td"><span class="tag" style="background:#fffbeb;color:#b45309;border-color:#fde68a">中</span></td><td class="td id" style="color:#71717a">mined_review</td><td class="td num">3 · 100%</td></tr>
+      <tr class="rc"><td class="td id">228013</td><td class="td" style="font-size:12px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Tools &amp; Home Improvement › Power Tools</td><td class="td id">Power Drills</td><td class="td"><span class="tag" style="background:#ecfdf5;color:#047857;border-color:#a7f3d0">高</span></td><td class="td id" style="color:#71717a">catmap_fix(人工)</td><td class="td num">—</td></tr>
+      <tr class="rc"><td class="td id">1055398</td><td class="td" style="font-size:12px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Home &amp; Kitchen › Home Décor(旧行 · 降「低」留痕)</td><td class="td id">Home Decor</td><td class="td"><span class="tag" style="background:#f4f4f5;color:#3f3f46;border-color:#e4e4e7">低</span></td><td class="td id" style="color:#71717a">mined_conflict_fix 前身</td><td class="td num">—</td></tr>
+      </table></section><section class="card" style=""><header class="chead"><h2 class="ctitle">九条工作流(全部手动;两条危)</h2></header>
+      <div style="padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px">
+        <span class="btn sm bp">catmap_mine 常态重跑</span><span class="btn sm bs">catmap_promote 升档</span>
+        <span class="btn sm bdghost">catmap_fix 定点修 危</span><span class="btn sm bdghost">catmap_prune 清死 PT 危</span>
+        <span class="btn sm bs">catmap_gap 缺口</span><span class="btn sm bs" style="text-decoration:line-through;color:#a1a1aa">catmap_suggest(⛔不排期)</span>
+        <span class="btn sm bs">catmap_align 无 ID 老行兜底</span><span class="btn sm bs">catmap_export 推飞书(缩量>2% ⛔停手护栏 —— 08-17 曾误删 1,847 行)</span><span class="btn sm bs">catmap_import 收飞书</span>
+        <span style="flex:1"></span><span style="color:#a1a1aa">树:taxonomy_import(预览强制先看三方命中率)· taxonomy_derive 零采集补树外 node</span>
+      </div></section></main></div></div>
+</x-dc>
+<script data-dc-script data-props='{"$preview": {"width": 1440, "height": 1400}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

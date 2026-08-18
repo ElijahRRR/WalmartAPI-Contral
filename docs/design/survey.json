@@ -1,0 +1,1473 @@
+[
+ {
+  "domain": "订单域(orders schema:拉单→审核→售后→绩效→对账,PG 权威、飞书订单中心六表是人机界面投影)",
+  "tables": [
+   {
+    "name": "orders.order_lines",
+    "purpose": "销售明细行,订单域锚点表;行身份=UNIQUE(po_id,sku),order_line_id='ol_'+sha256(po+\\x1f+sku)[:24],店铺与行号不参与身份;审核结论(audit_status/audit_detail jsonb/audited_at)就落在本表,order_sync 重拉冲不掉",
+    "key_columns": "order_date, store, po_id, sku, asin, product_name, qty, product_amount, sale_status, audit_status, carrier, tracking_no, postal_code, source, audited_at",
+    "states": "sale_status: Created/Acknowledged/Shipped/Delivered/Cancelled;audit_status: NULL(未审)/✓ 通过/建议拒绝/待人工(三值封闭集,钓鱼标记「钓鱼」在 audit_detail.note 里且钓鱼行 status=建议拒绝);source: NULL(API 完整行)/历史数据(残缺导入行)"
+   },
+   {
+    "name": "orders.return_lines",
+    "purpose": "售后单行(一条 returnOrderLine 一行),PK(return_order_id, order_line_id)——同一订单行可多次售后、同 RMA 可多行;物流实证藏在 returnLineGroups[].labels[].carrierInfoList[]",
+    "key_columns": "return_created, store, return_order_id(RMA), po_id, sku, return_status, refund_status, return_method, is_keep_it, refund_total, return_reason, qty, refunded_qty, carrier, tracking_no",
+    "states": "return_status: INITIATED/DELIVERED/CLOSED…(行级);refund_status: NOT_REFUNDED/REFUNDED;return_method: SHIPPED_TO_RETURN_CENTER/KEEP_ITEM…;refund_mode: FIRST_SCAN/POST_DELIVERY(订单级)"
+   },
+   {
+    "name": "orders.perf_events",
+    "purpose": "绩效问题订单,逐周期累积:PK(po_id, metric, period),同一违规出现在多个周期即多行;历史累计口径 COUNT(DISTINCT (store,po_id,metric)),当期状态取 period 最新一行",
+    "key_columns": "store, po_id, metric, period, sku, accountable, status, last_seen_at",
+    "states": "metric: otd/vtr/cancellations/returns/negativeFeedback/refunds/itemNotReceived/srr;status: 违规/达标;accountable: true/false(是否计入绩效)"
+   },
+   {
+    "name": "orders.perf_event_spans(视图)",
+    "purpose": "每条违规的存续区间:first_period/last_period/periods_seen/ever_accountable + still_active(=该单仍出现在此店铺×指标的最新一期报表,即仍在拖当前绩效分;消失即滚出官方统计窗口,不自行推算窗口)",
+    "key_columns": "store, po_id, metric, first_period, last_period, periods_seen, ever_accountable, still_active",
+    "states": "still_active: true(仍在拖分)/false(已滚出窗口)"
+   },
+   {
+    "name": "orders.settlement_lines",
+    "purpose": "对账明细按 行×账期 聚合,PK(order_line_id, period),period 为 MMDDYYYY 字符串;gross=各行|Amount|之和,用于区分「净0=全额退款」与「净0=无金额」;关账快照不可变,已入库账期永不重拉",
+    "key_columns": "store, po_id, period, net_amount, gross_amount, product_amount, commission_amount, commission_rate, incentive, settle_date",
+    "states": ""
+   },
+   {
+    "name": "orders.settlement_by_line(视图)",
+    "purpose": "跨账期合并 + 入账状态推导(金额 round6 吸收浮点相消误差),订单中心对账表数据源",
+    "key_columns": "store, po_id, line_number, net_amount, gross_amount, product_amount, commission_amount, periods, last_settle_date, settle_status",
+    "states": "settle_status: 已入账(net>0)/已冲销(net<0)/已退款(net=0 且 gross>0)/待入账(其余)"
+   },
+   {
+    "name": "ops.audit_scrape",
+    "purpose": "审核采集防重台账,一个 (ASIN,邮编) 一行:先落 pending 再推采集批次;error_type 单独成列供判定链分流(终局失败类型 variant_offset/parse_error/server_reject… 给建议拒绝不再重推);重试窗口 24h 封顶",
+    "key_columns": "asin, zip, batch_name, state, error_type, reason, requested_at, first_requested_at, attempts, settled_at",
+    "states": "state: pending/done/failed;前端派生态(_BLOCKED_SQL):inflight(在途)/gaveup(超24h重试窗口已放弃,需人工)/dead(终局 error_type 不再重推)"
+   },
+   {
+    "name": "ops.perf_problem_orders",
+    "purpose": "绩效问题订单明细存档(perf_problems 写,五字段唯一键 sales_order_no+indicator+sub_category+tracking_no+item,first_seen_date 永不覆盖;indicator 带 emoji 前缀是下游匹配契约)",
+    "key_columns": "first_seen_date, store, sales_order_no, po_no, order_date, indicator, sub_category, accountable, carrier, tracking_no",
+    "states": ""
+   }
+  ],
+  "workflows": [
+   {
+    "name": "order_sync",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "订单拉取入订单中心:每店 GET /v3/orders 45 天窗口全量重拉 → upsert orders.order_lines,跑完顺手推飞书销售表+键补齐(order_chain 每小时 :20 第一棒)",
+    "params": "store, days(默认45), workers"
+   },
+   {
+    "name": "order_audit",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "五道审核出结论(钓鱼邮编→采集完整性→商品一致性/标题相似度→配送时长→采购方匹配→限价=商品金额×0.75),任一道给不出确定答案一律待人工,只出建议不自动拒单;缺快照自动推采集并阻塞等落定(默认 wait=1 最长 20 分钟)",
+    "params": "days(默认3), stores, line, recheck, scrape, push, wait, refill_shots"
+   },
+   {
+    "name": "returns_sync",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "售后单同步:GET /v3/returns 45 天窗口重拉 → 展开 returnOrderLine → upsert orders.return_lines(订单不在库的行不入库);order_chain 第三棒",
+    "params": "store, days(默认45,建库首拉90), workers"
+   },
+   {
+    "name": "settlement_sync",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "沃尔玛对账明细:按店拉缺失账期(双周发布,已入库账期永不重拉)→ orders.settlement_lines;每周三 08:00",
+    "params": "store, periods(单店账期上限,默认6,建库放开99)"
+   },
+   {
+    "name": "perf_problems",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "绩效问题订单明细(Insights performance report xlsx)→ ops.perf_problem_orders + orders.perf_events 逐周期累积;每天 07:30 order_daily 第一棒",
+    "params": "store"
+   },
+   {
+    "name": "order_asin_normalize",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "订单行 SKU→ASIN 清洗,只补 NULL 可反复跑(缺省是预览零写入,调度里必须带 apply=1);提不出留 NULL 绝不拿 sku 原文兜底",
+    "params": "apply"
+   },
+   {
+    "name": "claim_audit",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "占用台账对账(只读):只报「当初就不该占」的品牌/产品占用(该店仍有在架行且全踩类目/渠道闸),不写任何表,真释放走 store_release",
+    "params": "export(默认1,0=只看摘要)"
+   },
+   {
+    "name": "order_center_push",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "订单中心飞书六表手动全量补推/对账入口(日常不用跑,四条业务链各自跑完就写自己那张);这里失败会记 failed",
+    "params": "table(sales/returns/perf/settlement/keys), days(默认90), reconcile"
+   },
+   {
+    "name": "order_center_cleanup",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "建库一次性清理:删除对不上订单行的售后/绩效/对账烂账行(缺省即真删,空跑加 --dry-run;被删空的账期记 recon_done 台账防重拉)",
+    "params": "execute(cli 注入;--dry-run 只报数量)"
+   },
+   {
+    "name": "order_history_import",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "旧订单汇总 xlsx(15 万行 2024-03~2026-07)→ order_lines 残缺历史行,source='历史数据',ON CONFLICT DO NOTHING 已有行一个字段不碰;缺省预览",
+    "params": "file, sheet(默认合并总表), since, apply"
+   }
+  ],
+  "page_blocks": [
+   "订单行列表页(orders.order_lines):筛选=店铺/下单时间窗/sale_status/audit_status/source(隐藏历史数据行开关);列=下单时间、店铺、PO号、SKU/ASIN、品名、数量、商品金额、销售状态徽章(Created/Acknowledged/Shipped/Delivered/Cancelled 五态)、审核状态徽章(未审=灰、✓ 通过=绿、建议拒绝=红、待人工=黄)、承运商+运单号",
+   "订单行详情抽屉(order_lines.audit_detail jsonb + raw):收件人/地址/电话(注意 0000000000 打码),审核复盘区=note、限价 price_cap vs 成本 cost、采购方 supplier+汇率 rate、标题相似度 title_similarity、五道 rules 过程值(phishing/title/delivery/supplier/price)、亚马逊快照(amz_price/stock_qty/ship_method/ship_days/shipping/scraped_at)与截图;并列同一 order_line_id 的售后/绩效/对账关联记录(四表单键 JOIN)",
+   "审核工作台块(order_lines + ops.audit_scrape):待人工队列(audit_status=待人工按 order_date 倒序)、采集台账计数条=pending 在途/done/failed,派生 inflight/gaveup(超24h需人工,必须单独醒目)/dead(终局失败不再重推);单行重审与 recheck 操作入口",
+   "售后页(orders.return_lines LEFT JOIN order_lines 取下单时间):筛选=店铺/return_status/refund_status/发起时间窗;列=发起时间、RMA号、PO、SKU、行级状态徽章(INITIATED/DELIVERED/CLOSED…)、退款徽章(NOT_REFUNDED/REFUNDED)、退货方式(SHIPPED_TO_RETURN_CENTER/KEEP_ITEM)、is_keep_it、退款总额、数量/已退数量、退货原因、物流 carrier+tracking_no",
+   "绩效页(orders.perf_event_spans 为主 + perf_events 明细、ops.perf_problem_orders 存档):顶部按 8 指标(otd/vtr/cancellations/returns/negativeFeedback/refunds/itemNotReceived/srr)×店铺的 still_active 违规计数卡;明细表列=店铺、PO、指标、首见周期/末见周期、periods_seen、ever_accountable、still_active 徽章(仍拖分=红/已滚出窗口=灰)、最新一期 status(违规/达标)",
+   "对账页(orders.settlement_by_line 汇总 + settlement_lines 逐账期展开):筛选=店铺/settle_status/账期;列=店铺、PO、行号、入账状态四态徽章(已入账=绿/已冲销=橙/已退款=蓝/待入账=灰)、net/gross/product/commission 金额、跨账期数 periods、最近入账日;行展开=逐账期明细(period MMDDYYYY、佣金率、原佣金、佣金优惠、incentive)",
+   "订单域运行状态块(ops.runs + registry/schedule):order_chain 每小时:20(order_sync→order_audit→returns_sync)、order_daily 07:30(perf_problems→order_asin_normalize)、settlement 周三 08:00 三条链的最近运行状态/时长/summary;手动操作区=order_center_push 补推(table/days/reconcile)、order_history_import、order_center_cleanup(危险,须先 --dry-run 确认)"
+  ],
+  "gotchas": [
+   "audit_status 是「✓ 通过/建议拒绝/待人工」三值封闭集,钓鱼判定不看 status——标记「钓鱼」在 audit_detail.note 里,钓鱼行的 status 就是「建议拒绝」,前端要展示钓鱼须读 note",
+   "钓鱼行不可覆盖:后续轮次一律跳过,复审必须人工清空审核状态——前端别提供对钓鱼行的一键重审",
+   "审核只出建议不真拒单也不自动下单;任一道给不出确定答案一律待人工,绝不当通过——待人工不是错误态,是常态队列",
+   "行身份=UNIQUE(po_id,sku),店铺与行号都不参与;同一 PO 同一 SKU 必合并为一行,行号(line_number)只是展示列",
+   "source='历史数据' 的行是残缺行(无地址无物流、sale_status 一律 Delivered),不推飞书;order_sync 拉到真行会把 source 写回 NULL 自动回到推送流——列表页默认应过滤或明显标记它们",
+   "asin 提不出就留 NULL,消费方一律按 asin IS NOT NULL 过滤,绝不许拿 sku 原文当 asin(三段式与纯数字形态直连采集库永远查空)",
+   "买家电话 84% 被沃尔玛打码成 0000000000,且全 0 不允许覆盖库里真电话——前端展示全 0 时应显示为「已打码」而非当作真号码",
+   "对账净额为 0 有两义:gross>0=全额退款(Sale/Refund 相消),gross=0=无金额;必须用视图的 settle_status 四态(已入账/已冲销/已退款/待入账),别自己拿 net 判",
+   "账期 period 是 MMDDYYYY 字符串,直接字符串排序是错的,要按 YYYY+MMDD 重排;账期双周发布,已入库账期永不重拉",
+   "perf_events 逐周期累积:同一违规多周期出现即多行,直接 count(*) 会虚高,历史累计口径是 COUNT(DISTINCT (store,po_id,metric));still_active 以最新报表是否仍包含该单为准,不自行推算官方统计窗口",
+   "return_lines 主键是 (RMA, order_line_id):同一订单行可多次售后,页面按订单行聚合时会出现多条 RMA;refund_mode 是订单级字段不是行级",
+   "audit_detail.shipping 为 NULL 表示「运费没采到」不是免运费(FREE 才是 0.0),这类行落地价算不出转待人工——前端别把空运费渲染成 $0",
+   "危险工作流缺省即真跑(2026-08-16 起),空跑要显式 --dry-run;order_center_cleanup 是唯一 DANGEROUS=True,前端触发按钮必须默认带 dry-run 并二次确认",
+   "order_center_push 日常不用跑:四条业务链跑完各自写飞书,它只是手动补推/对账入口;它失败记 failed,业务链顺手写的那次只告警不失败",
+   "order_asin_normalize 缺省是预览零写入,调度/前端触发必须带 apply=1,漏了就每天空转还报成功",
+   "order_audit 默认 wait=1 会阻塞最长 20 分钟等采集落定;cli 有 flock,阻塞期间再触发同一工作流会退出码 3 直接退出不排队",
+   "updated_at 只在内容真变时刷新(=「这行什么时候变的」),可以放心当变更时间展示;45 天窗口每小时全量重拉不会刷新它",
+   "采集台账的 gaveup(超 24h 重试窗口)和终局 error_type(dead)是「系统已放弃、只能人工处理」的行,必须与在途 inflight 分开显示,混成一个数就没人知道该去人工处理了"
+  ]
+ },
+ {
+  "domain": "店铺分配域(品牌/产品/类目/渠道四重排他占用 + 分配引擎):把候选产品按「品牌组」分配到店铺,品牌与 ASIN 全局排他(一个品牌/一个 ASIN 只能属于一家店),归属落 catalog.claims 占用台账;占用是决策不是观测,只有「分配」与「释放」两个显式动作能改。链路顺序:alloc_audit(存量审计出五份处置清单)→ 所有者填飞书限额表类目/渠道/容量列并按清单下架 → alloc_backfill(存量一次性回填占用)→ alloc_stores / alloc_products(店铺侧与产品侧体检)→ alloc_plan(打分组队发牌出方案、execute 落占用)→ list_new 按方案上架 → claim_audit(占用对账)→ store_release(唯一释放路径)。全链不在定时调度里,全部手动触发(registry/schedule.py 明文:分配链一律手动)。",
+  "tables": [
+   {
+    "name": "catalog.claims",
+    "purpose": "占用台账(域内唯一权威写表):品牌与产品的排他归属,一行一个占用;排他由部分唯一索引 claims_active_uniq (kind, claim_key) WHERE status='active' 保证;released 行永久保留作历史答案",
+    "key_columns": "kind(brand/product), claim_key(品牌键或ASIN), store, status, source(alloc_backfill/alloc_plan/store_release写入), walmart_pt/pt_source/audit_version(决策时快照), claimed_at, released_at, released_reason",
+    "states": "active / released(kind 取值 brand / product;source 常见值 alloc_backfill / alloc_plan)"
+   },
+   {
+    "name": "catalog.walmart_items",
+    "purpose": "在线商品快照(观测侧,分配域只读):冲突判定、容量闸、待下架清单、在线店列的数据源;有两个互不统一的在线口径(见 gotchas)",
+    "key_columns": "store, sku, published_status, lifecycle_status, missing_since",
+    "states": ""
+   },
+   {
+    "name": "ops.store_kpi_daily",
+    "purpose": "店铺逐日 KPI(alloc_stores/alloc_plan 的店铺经营水平数据源):在售天数、日均净额、货位值、缺口全从它算;分母是在售天数不是日历天数",
+    "key_columns": "store, data_date, store_status, items_online, orders_count, sales_amount",
+    "states": "store_status:ACTIVE / SUSPENDED / TERMINATED(空或无记录 fail-open 视同 ACTIVE)"
+   },
+   {
+    "name": "catalog.products",
+    "purpose": "候选池来源(只读):audit_status='approved' ∧ 有标题 ∧ walmart_pt 有效 ∧ 大类查得到 才进池;经 services/product_pool 打分(体检与真分配逐字同一份池子与分数)",
+    "key_columns": "asin, brand, walmart_pt, pt_source, audit_status",
+    "states": ""
+   },
+   {
+    "name": "orders.order_lines / orders.return_lines",
+    "purpose": "销量与退款(只读):店铺侧净销售额(GMV−退款)与产品侧销量加分的数据源;历史行 source='历史数据' 算不出退款,净额实为毛额",
+    "key_columns": "store, order_date, asin, sku, sale_status, source; return_lines: refund_total, refunded_qty",
+    "states": ""
+   },
+   {
+    "name": "飞书限额表(外部配置,services/store_targets 读)",
+    "purpose": "店铺准入的唯一权威(不建库表,改表格一格即生效):类目1/2/3(三列全空=不限)、配送限制(fba/fbm,未填=不接自由流)、单店最大在线数(0=不接货/未填=待补/正数=参与,三态)、配送时长限制、日目标销售额",
+    "key_columns": "店铺, 类目1/2/3, 配送限制, 单店最大在线数, 配送时长限制, 日目标销售额",
+    "states": "参与分配三态:是(>0) / 否(填了0) / (未填)"
+   },
+   {
+    "name": "报告 CSV(<DATA_ROOT>/reports/,每次覆盖)",
+    "purpose": "全链的人机接口:alloc_audit 出 类目建议/渠道不符下架/类目不符下架/店铺总览/同ASIN冲突处置/同品牌冲突处置;alloc_stores 出 店铺经营水平;alloc_products 出 产品分;alloc_plan 出 分配方案+未入选;claim_audit 出 该释放占用(含拼好的释放命令,store_release 可 -p from_csv 直接吃)",
+    "key_columns": "冲突处置表:冲突键, 保留店, 判定依据, 处置(保留/下架);方案表:流别(定向流/自由流), 去向店, 层, 品牌组, 组分, ASIN, 产品分",
+    "states": "冲突处置列:保留 / 下架;判定依据五级降级阶梯:按该商品销量 / 按该店该大类销量 / 按该店整体销量 / 按在线件数 / 按店名(仅最后一级需人眼)"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "alloc_audit",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "分配动工前的存量审计 + 数据探针(只读,随时可跑):候选池漏斗、冲突组、店铺体检,产出五份处置 csv 让所有者动手",
+    "params": "channel, export, sales_days, as_of"
+   },
+   {
+    "name": "alloc_stores",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "店铺经营水平体检(只读):日均净额/单品日产出(货位值)/缺口/剩余容量摊开给人看,引擎店铺侧决策全建在这三个数上",
+    "params": "days, as_of, export"
+   },
+   {
+    "name": "alloc_products",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "产品分体检(只读):候选漏斗、五信号覆盖率、分数分布与淘汰线(40)切后可分量,与 alloc_plan 共用同一份池子与分数",
+    "params": "days, as_of, export"
+   },
+   {
+    "name": "alloc_plan",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "产品分配方案(危,缺省即真跑):打分→品牌组队→切批→分层轮转发牌,出方案表与未入选表;真跑把方案落成占用(catalog.claims),不碰沃尔玛,上架由 list_new 执行",
+    "params": "batch, days, sales_days, as_of, export, execute"
+   },
+   {
+    "name": "alloc_backfill",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "存量在线商品→占用台账一次性回填(危,缺省即真跑):跨店冲突留销量大的店,与 alloc_audit 清单同一套判定;幂等,零销量打平组默认跳过",
+    "params": "execute, include_ties, sales_days, as_of"
+   },
+   {
+    "name": "claim_audit",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "占用台账对账(只读):只报「当初就不该占」(该店在架行全踩类目/渠道闸)的占用,出带释放命令的 csv;已无在架行的只计数不列清单",
+    "params": "export"
+   },
+   {
+    "name": "store_release",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "释放占用(危,缺省即真跑;全系统唯一释放路径):整店/点名品牌/点名 ASIN/批量吃 claim_audit 的 csv;整店释放默认同步把该店在架行标 missing_since",
+    "params": "store, brand, asin, from_csv, mark_offline, reason, execute"
+   }
+  ],
+  "page_blocks": [
+   "占用台账总览(catalog.claims):按店的 active 品牌数/产品数条形榜(services/claims.counts_by_store 口径),status 筛选 active/released,单条占用展开显示 kind/claim_key/store/source/决策时快照(walmart_pt/pt_source/audit_version)/claimed_at,released 行显示 released_at 与 released_reason 且明示「历史永不删」",
+   "链路流水线导航条(静态 + ops.runs 各工作流最近一次运行时间/结果):审计 alloc_audit → 填限额表&按清单下架(人工) → 回填 alloc_backfill(一次性) → 体检 alloc_stores/alloc_products → 方案 alloc_plan(dry-run→人审→execute) → 上架 list_new → 对账 claim_audit → 释放 store_release;三条危险工作流(plan/backfill/release)标红并默认勾选 dry-run",
+   "要你做的事清单(alloc_audit 五份 csv 的落地视图):①填类目三列(alloc_类目建议.csv:店铺/建议top2/表格已填/对拍一致与否)②下架渠道不符 ③下架类目不符 ④确认冲突处置(alloc_同ASIN冲突处置.csv + alloc_同品牌冲突处置.csv,每行带判定依据五级阶梯与处置=保留/下架,「按店名」级高亮为需人眼)⑤补店铺配置(缺配置列点名)",
+   "店铺经营水平表(alloc_店铺经营水平.csv 17 列,源 ops.store_kpi_daily + walmart_items + 限额表):逐店一行,列含 参与分配三态/在售天数/KPI覆盖/在线均值/日均净额实测与收缩后/日目标/缺口%/单品日产出(货位值)/效率倍数/当前在线/容量上限/剩余容量/历史期占比/取值依据;缺口降序,「取值依据=中位数」的行加 ~ 标记,并单列三组警示(在售<14天/没填日目标/窗口过半历史期)",
+   "产品分体检块(alloc_产品分.csv,源 catalog.products + services/product_pool):候选漏斗(候选池→未进入打分→有分可判→≥淘汰线40)、五信号覆盖率表(评分/评论/历史销量/配送时效/退货率)、分数分位数(P10~P90);明细表列含 产品分=口碑分+销量加分−罚分、罚分原因、配送方式、落地价、占用店与在线店两列(不一致高亮为信息而非错误)",
+   "分配方案审阅块(alloc_plan dry-run 输出,execute 前必审):按店表(剩余容量/本轮配额/分到/其中定向/分完还剩/顶层比值/配额依据),顶层比值出界 [0.7,1.3] 标红并展开该店自由流层分布直方图;候选漏斗(前四行产品单位、后两行组单位分列);未发出三原因计数(no_gate=要开大类/no_room=等下架腾位/no_quota=等下一批);定向流淘汰按「店×缺的大类」摊开;显式并列「候选切口」与「实际入场线」两个数;方案表(alloc_分配方案.csv)与未入选表(alloc_未入选.csv)分开下载",
+   "占用对账块(claim_audit,源 catalog.claims × walmart_items × 限额表):三分类计数表(站得住/当初就不该占/不判-已无在架行),「当初就不该占」明细(类型/占用键/占用店/踩闸原因/要下架的SKU与ASIN/拼好的释放命令),一键复制命令或导出 alloc_该释放占用.csv 供 store_release -p from_csv 批量吃",
+   "释放操作块(store_release,写 catalog.claims + 可选 walmart_items):四种入口(整店/品牌/ASIN/批量csv)各带 dry-run 预览清单;整店模式显示「将同步标 missing_since 的在架行数」与 mark_offline 开关;确认文案必须写明「释放后品牌可被下一轮分给别店,那一步不可逆」",
+   "运行参数一致性提示条(贯穿页面):alloc_audit 出清单时的 as_of/sales_days 显示在页面上,alloc_backfill 表单预填同一对值并在不一致时拦截警告(照 A 的清单落 B 的判定);-p channel=0 跑过的审计轮次标记「渠道闸关着,不得据此回填」"
+  ],
+  "gotchas": [
+   "占用是决策不是观测:商品下架、店铺暂停(SUSPENDED)、KPI 报 TERMINATED 都不释放占用,全系统唯一释放路径是 store_release——前端严禁提供任何「自动清理失效占用」按钮",
+   "危险工作流缺省即真跑(2026-08-16 改):alloc_plan/alloc_backfill/store_release 默认执行,空跑要 --dry-run,--execute 只是兼容空操作别名——前端触发按钮必须默认带 dry-run",
+   "两个「在线数」口径并存且不许统一:占用/冲突侧排 RETIRED(missing_since IS NULL AND lifecycle ACTIVE),容量/产出侧跟 KPI 日报(published_status='PUBLISHED',不筛 lifecycle)——同一张页面块内只准用其中一个",
+   "「参与分配」三态不许压成两态:单店最大在线数 0=所有者按下不接货 / 未填=待补(点名) / >0=参与;它与店铺状态无关,SUSPENDED 不是这个开关且占用照旧保持",
+   "「暂时不给某店分货」= 限额表填 0,不是改状态也不动占用;把未填当成 0 会让店永远分不到货且不报错",
+   "alloc_backfill 的 as_of/sales_days 必须与出清单那次 alloc_audit 完全一致,窗口一滑冲突判定就可能翻——报告末尾原样给出回填命令就是为此",
+   "-p channel=0 跑的 alloc_audit 渠道闸恒为假,口径比回填宽,不得照那一轮清单回填(报告会显式警告)",
+   "类目/渠道不符的行不产生占用(claimable 五条筛法:在册∧已发布∧规划内∧类目∧渠道),否则「某店独有+不符」的品牌被永久锁死在不该做的店上;slot_rows(占货位)与 claim_rows(该占用)是两个集合",
+   "冲突处置清单保留行数≠下架行数是正常的(赢家保留全部行、输家下架全部行,各店 SKU 数不同),别做 1:1 对账校验",
+   "冲突判定五级降级阶梯(按该商品销量→该店该大类销量→该店整体销量→在线件数→店名),只有落到「按店名」才算机器判不出需人眼;零销量打平组回填默认跳过,include_ties=1 才收",
+   "分配即占位≠上架:方案表是「现在该上什么」的完整清单不是增量,已占位未上架的 ASIN 每轮照常出现(只能回占用店);上架由 list_new 按自己的节奏执行",
+   "候选切口(可分×1.5 进牌堆的门槛)不是实际入场线(最后发出那张牌的组分),两者实测差十几分,页面必须并列两个数并标注",
+   "顶层比值分母是该店自由流总量不是配额;自由流<20 件或不足配额 10% 的店不出比值(显示 —),硬报会诱人追一个不存在的问题",
+   "「分到」可以超过「本轮配额」不是 bug:组是原子的、配额在挑人之前判,最后一张牌可顶过头;真正不许越的是剩余容量硬闸",
+   "一张牌=一个品牌组:组分=组内最高产品分,低分品跟车上架是设计(品牌排他),报告只报量不治;「组内低于50分不跟车」方案已试过并撤销,别再提",
+   "占用店与在线店是两列两个事实:占用在A货在B=B该下架;有货无占用=规划外店或被闸挡下——合成一列会把信息抹掉",
+   "claim_audit 只报「当初就不该占」;「该店已无在架行」只计数不列清单——列出来会诱人误删,而释放后品牌被下轮分给别店不可逆",
+   "释放本身可逆(released 行永不删)但后果不可逆:释放后品牌可被下一轮 alloc_plan 分给别的店——确认弹窗必须写这句",
+   "整店释放默认同步把该店在架行标 missing_since(校正冻结快照,mark_offline=0 可关);点名释放品牌/ASIN 不碰快照",
+   "谭总系店(registry.alloc_excluded_stores)排除的是「归属」不是「数据」:不占用、不算冲突、不判类目,但销量照常计入三个全局维度",
+   "店铺侧窗口 90 天与产品侧销量窗口 365 天是两个窗口不许合一;店铺日均分母是在售天数不是日历天数(停业期不算),历史期占比高的店「净额」实为毛额与 API 期不同口径",
+   "产品销售额毛额(产品分表)与店铺净额(经营水平表)是两个口径,两张表不能对账——页面别做跨表对账校验",
+   "在售<14 天的店三个比值指标一律取全店中位数(带~标记),但缺口仍按实测算——两者故意不同",
+   "整个分配链(alloc_*/claim_audit/store_release)全部不在定时调度里,是手动工作流;前端是它们唯一的触发与呈现入口"
+  ]
+ },
+ {
+  "domain": "上架域(listing):新品上架主链 list_new + 跟卖线 match_listing + UPC 池 + SKU_LOCKED 自愈 + 占用释放",
+  "tables": [
+   {
+    "name": "飞书上架表(registry.LISTING_SHEET,21 列 A~U)",
+    "purpose": "新品上架线的驱动表与展示面:A/B 人工域(店铺/ASIN),C~G 审核域投影,C/H/I/J 数据回显,K/L/M/N 提交结果,O/P/Q 回执反哺,R~U 真实状态跟踪;审核权威在 PG 不在表",
+    "key_columns": "A店铺, B ASIN, D walmart_product_type, E审核结果(投影), K是否上架, L上架feedid, M上架日期, N未上架理由, O上架结果, P上架失败理由",
+    "states": "K: 空/No(待上架)、Yes(已提交)、Unknown(结局不确定,也算已上架不重复提交);O: 空/处理中/ASYNC_PENDING/SUCCESS/SUCCESS_WITH_WARNING/FAILED/SKU_LOCKED/PROHIBITED/MISSING;E(投影): pass/reject/pending"
+   },
+   {
+    "name": "catalog.upc_pool",
+    "purpose": "UPC 池,PG 权威;飞书「UPC池」表=运营注入口(A=UPC B=放入日期)+投影(C状态 D店铺 E SKU F上架日期);领号单事务 FOR UPDATE SKIP LOCKED,杜绝双领",
+    "key_columns": "upc, status, asin, store, sku, put_date, claimed_at, used_at",
+    "states": "''(未用) → claimed(已领) → used(已用);conflict(全站撞库,永久弃用)/bad_prefix(首位非 016789,永不分配);回收仅三类:提交前失败/双确认未达/4xx 被拒;Unknown 永不回收"
+   },
+   {
+    "name": "listing.retire_cooldown",
+    "purpose": "SKU_LOCKED 自愈链状态台账:RETIRE_ITEM 提交后进 24h 冷却,回执成功且期满才清列重上;部分唯一索引 (store,sku) WHERE pending 防重复退役",
+    "key_columns": "store, sku, feed_id, retired_at, status, cleared_at",
+    "states": "pending(冷却中)/ cleared(已清列重上)/ failed(RETIRE 回执失败,不自动重试,人工处置)"
+   },
+   {
+    "name": "飞书跟卖表(registry.MATCH_SHEET,11 列 A~K)",
+    "purpose": "跟卖线驱动表:运营填 A=UPC C=售价 D=重量 E=店铺(B=SKU 人工优先,空则自动 PHUMWMT+日期+4位序号);脚本填 B/F/G/H/I;J/K 由 feed_poll 回填;清空 F 即重新排队",
+    "key_columns": "A UPC, B SKU, C售价, D重量, E店铺, F跟卖状态, G匹配GTIN, I feedId, J feed结果",
+    "states": "F: 空(待处理)/可跟卖/需完整建品/目录无/店铺不识别/码无效/风控拦截:*/ASIN黑名单:*/数据无效:*/预检失败(⚠非终态,每轮自动重试);J: 空/处理中/提交被拒 + feed_poll 回填终态"
+   },
+   {
+    "name": "catalog.claims",
+    "purpose": "占用台账(决策不是观测):ASIN/品牌被哪家店占用,商品下架也不释放;list_new 第④道闸的数据源;store_release 是全系统唯一释放路径;released 行永不删",
+    "key_columns": "kind, claim_key, store, status, walmart_pt, released_at, released_reason",
+    "states": "status: active/released;kind: brand/product"
+   },
+   {
+    "name": "catalog.listing_sources",
+    "purpose": "产品来源登记簿:每个上架产品登记出身,amz 驱动的自动流程按出身路由不误伤跟卖品(跟卖 sku≠asin)",
+    "key_columns": "store, sku, source_type, source_key, workflow",
+    "states": "source_type: amz/match/self/1688/unknown"
+   },
+   {
+    "name": "ops.feed_items(+ ops.feed_log)",
+    "purpose": "feed 提交台账:配额计数(今日 MP_ITEM 按店去重 SKU)、FAILED 重试次数(上限 3)、回执四集合分类、跟卖 SKU 续号都从这里读",
+    "key_columns": "store, sku, feed_type(MP_ITEM/MP_ITEM_MATCH/RETIRE_ITEM), feed_id, status, error_code, submitted_at",
+    "states": "提交结局三态:submitted/failed/unknown(+dedup 在途防重);回执 status: submitted/success/failed/missing"
+   },
+   {
+    "name": "catalog.walmart_items",
+    "purpose": "沃尔玛在架现值:全局 ASIN 去重闸(missing_since IS NULL 即在架任一店就拦)、变体同族在架查询(variant_group_id/isPrimary)、Unknown 自愈的目录源",
+    "key_columns": "store, sku, variant_group_id, published_status, missing_since",
+    "states": ""
+   },
+   {
+    "name": "catalog.products(审核五列)",
+    "purpose": "审核结论与 PT 的权威(上架闸读库不读表 E 列):audit_status=approved 才进待上架;walmart_pt 以库为准防手改表绕过审核",
+    "key_columns": "asin, audit_status, walmart_pt, audit_reason, audited_at",
+    "states": "audit_status: approved/rejected/pending(空=未审)"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "list_new",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "上架主链(每日 20:00):七道闸门 → 领 UPC → LLM 属性映射 → spec 一致化 → 按店打包提交 MP_ITEM feed → 回写上架表;首尾各同步一次 UPC 池(等于顺带跑了 upc_sync);变体自动成组、组内标题差异化。七道闸准确名序:①店铺状态(非 ACTIVE 整店跳过)②日配额(在全部过滤之后切,额度=限额表「上架限制」-今日已提交)③PT spec 存在+风控否决闸(禁售 PT)④全局 ASIN 去重+占用闸(claims,别店占用即拦)+ASIN 黑名单⑤数据源(缺席不写终态并自动推采集批次 listing_gap_YYYYMMDD)⑥数据过滤(库存<5 淘汰、品牌/制造商双字段黑名单、FBA/FBM 定价区间×倍率、运费 NULL 不定价、配送时长超店上限不上)⑦UPC 领号→LLM 映射→mapper 硬约束→提交",
+    "params": "execute, store, check_spec(dry-run 下 spec 预检,真调 LLM 不领 UPC 不提交)"
+   },
+   {
+    "name": "match_listing",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "跟卖上架(MP_ITEM_MATCH):读跟卖表 → SPEC 预检三路分拣(可跟卖/需完整建品/目录无)→ 可跟卖行过两道闸(①风控闸 risk_gate:禁售 PT+黑名单品牌 ②ASIN 黑名单;防呆=黑名单口径,不看删除史)→ SPEC 预填模板+sku/price/ShippingWeight 按店打包提交。⚠ 仍手动:对拍未完成前只许 --dry-run;跟卖新 offer 默认 0 库存是正常,由 maintenance 补",
+    "params": "execute, store"
+   },
+   {
+    "name": "upc_sync",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "UPC 池注入同步与投影回写(手动体检入口):表格新号入库(首位 016789 白名单校验)→ 按 PG 权威回写 C~F 状态列 → 报池余量;不必单独挂调度,list_new 自己首尾各做一次",
+    "params": "(无参)"
+   },
+   {
+    "name": "sku_locked_heal",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "SKU_LOCKED 自愈链(手动):对上架表 O=SKU_LOCKED 的行提交 RETIRE_ITEM → 24h 冷却(retire_cooldown 台账)→ 回执成功+期满清列(K~M/O~Q 清空,N 写自愈标记)→ 行变新行,下轮 list_new 领新 UPC 重上;回执失败标 failed 不自动重试点名人工",
+    "params": "execute, store, cooldown_hours(默认24)"
+   },
+   {
+    "name": "store_release",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "释放占用(整店/点名品牌/点名 ASIN/批量 csv)——全系统唯一释放路径,任何自动释放都不存在;整店释放默认同步把该店在架行标 missing_since(校正观测)",
+    "params": "store, brand, asin, from_csv(claim_audit 的 csv), reason, mark_offline(默认1), execute"
+   },
+   {
+    "name": "variant_probe",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "变体维度为什么没发?只读三路诊断:①采集侧给了什么(snapshots.raw)②映射表 _DIM_MAP 怎么映 ③该 PT spec 的 variantAttributeNames 枚举允许什么,最后给字面候选建议(不参与自动判定)",
+    "params": "asins, pt"
+   }
+  ],
+  "page_blocks": [
+   "上架漏斗块:七道闸逐道拦截计数(非ACTIVE店/超配额/PT无spec/风控拦截/全局去重/占用/黑名单/待数据源/数据过滤/配送超时)+ 提交期计数(UPC池不足/必填缺失),数据源 ops.runs 的 list_new 摘要与 ops.feed_items;恰好 0 的闸不显示(notify_fmt 规矩)",
+   "新品线状态表块(上架表镜像):按 K×O 双状态呈现每行去向(待上架/Yes在途/Unknown待对账/FAILED重试≤3/SKU_LOCKED移交自愈/PROHIBITED永不重试),列 = 店铺/ASIN/PT/审核结果/K/L feedid/N 理由/O/P;数据源飞书 LISTING_SHEET + catalog.products(审核权威)",
+   "跟卖线独立块(与新品线必须分开画):跟卖表 A~K 行状态机(待处理→预检三路→两道闸→在途→J 终态),SKU 自动编号 PHUMWMT+日期+序号,清空 F=重新排队;数据源 MATCH_SHEET + ops.feed_items MP_ITEM_MATCH;显著标注「对拍未完成,仅 dry-run」",
+   "UPC 池页:余量仪表(未用/已领/已用/冲突/非法前缀 五态计数,catalog.upc_pool)+ 注入流水(put_date)+ 回收/撞库事件;强调 Unknown 永不回收、bad_prefix 永不分配、conflict≠产品已在架",
+   "变体组页:本轮变体口径分布(variant/no_attrs/no_dim/no_group_id/oversize/no_diff_dim + 其中多维/有维度映不上/标题加维度后缀,来自 list_new n_var 计数)+ 按 (店铺,组ID) 的成员/维度/主变体明细(catalog.walmart_items.variant_group_id)+ variant_probe 三路诊断入口",
+   "SKU_LOCKED 自愈看板:listing.retire_cooldown 按 pending(冷却倒计时)/期满待核回执/cleared/failed(人工处置队列)分栏,链路图 RETIRE→24h→清列→list_new 领新 UPC 重上",
+   "占用台账块:catalog.claims active 占用按店×kind(brand/product)汇总,store_release 四选一操作入口(整店/品牌/ASIN/csv 批量)+ released 历史(回答「当初属于谁」)",
+   "配额与调度块:各店「上架限制」额度 vs 今日已提交(ops.feed_items MP_ITEM 北京日界),链路时序 product_chain 13:00→blacklist 15:00→audit_sheet 18:10→list_new 20:00(次序是硬约束)",
+   "在途 feed 与回执块:L 有 feedid 且 O∈{空,处理中,ASYNC_PENDING} 的在途行,feed_poll 反哺器回填 O/P/Q,回执四集合优先级 SKU_LOCKED>真SUCCESS>ASYNC>失败;K=Unknown 自愈三源判定(feed 台账/沃尔玛目录/保持观察)",
+   "缺数据采集闭环块:数据源缺席 ASIN 数、今日已推批次 listing_gap_YYYYMMDD 状态(当天防重不重推)、采集落库后自动续上"
+  ],
+  "gotchas": [
+   "缺省即真跑(2026-08-16 反转):空跑必须显式 --dry-run,--execute 只是兼容空操作——前端按钮语义必须默认危险",
+   "审核闸读 PG(catalog.products.audit_status)不读表 E 列:E/D 只是投影,手改 E 不生效,未审行会静默消失在待上架里(摘要点名「未审核 N 行」)",
+   "清空 E 列 ≠ 重审:只是重新领取投影,判定权威在库;真重审只有 CLI 显式通道(-p asins= / -p rerule=)",
+   "K=Unknown 也算已上架:沃尔玛可能已收单,重复提交=双上架(旧生死规则);Unknown 的 UPC 永不回收,收尾交 feed_poll 的 heal_unknown 三源自愈",
+   "SKU_LOCKED 不是永久失败也不能直接重试:旧实证不先 RETIRE 换新 UPC 重发同一 SKU 也失败,唯一解是自愈链 RETIRE→24h 冷却→清列重上",
+   "PROHIBITED(政策违禁)永不重试,不进 FAILED 重试通道——重发也永远是拒,白烧 UPC 与配额;FAILED 自动重试上限 3 次",
+   "UPC 撞库(conflict)只说明这个号被别人占了,与我们的产品是否已在架无关,照常领新号重试,不得据此推断该走跟卖",
+   "配额在全部过滤之后切:被淘汰行不占名额,超配额行不写终态、次日自动续上——「今天没上完」不等于失败",
+   "占用(claims)是决策不是观测:商品下架、店铺暂停、KPI 报 TERMINATED 都不自动释放,store_release 人工跑是唯一释放路径",
+   "运费 NULL 或配送方式(FBA/FBM)未采到一律不定价不上架:当 0 用会定出偏低价且两侧都不报错;库存三态 None≠0(None=没采到,0=确实缺货)",
+   "跟卖的「预检失败」不是终态(网络抖动居多),每轮自动重试;真终态由运营清空 F 列才重新排队",
+   "跟卖新 offer 默认 0 库存是正常现象(v4.2 spec 无库存字段),不当失败,库存由 maintenance 的 match_inventory 后补",
+   "UPC 首位非 0/1/6/7/8/9(GS1 特殊段 2/3/4/5 开头)沃尔玛拒收,注入即标 bad_prefix 永不分配",
+   "upc_sync 不必单独排调度:list_new 开头注入一次、结尾回写一次,合起来等于跑了一次 upc_sync;dry-run 不注入所以 no_upc 计数会偏多",
+   "变体组内某维度取值全同会被自动剔掉(声明没有差异的维度等于没声明),全剔光整组退回单品(no_diff_dim);同轮同族多个主变体自动收口只留 ASIN 字母序第一个",
+   "上架表列权责严格分域(A/B 人工、C~G 审核、K~N list_new、O~Q 反哺器、R~U 状态跟踪),前端若做编辑必须遵守——跨界写就是 bug",
+   "「上架限制」配额与四个定价倍率区间都在飞书限额表(RETIRE_LIMITS),未登记按 999 不限;倍率未配置的区间行会被淘汰而非兜底"
+  ]
+ },
+ {
+  "domain": "产品/目录域(catalog:亚马逊侧主档 + 采集快照 + 沃尔玛在架现值 + 产品病历)",
+  "tables": [
+   {
+    "name": "catalog.products",
+    "purpose": "产品身份主档:一个 ASIN 一行(亚马逊侧慢变字段 + 审核结论五列 + PT 及来源 + 类目 ID 锚)",
+    "states": "audit_status: NULL未审 / pending / approved / rejected;pt_source: walmart_confirmed / historical_confirmed / audit_llm / NULL(NULL 视同推断)",
+    "key_columns": "image_url, asin, title, brand, amazon_category, browse_node_id, audit_status, audit_reason, walmart_pt, pt_source, audited_at, audit_version"
+   },
+   {
+    "name": "catalog.snapshots",
+    "purpose": "采集快照:追加不改永不去重,快变字段(价格/库存/货期/运费)的历次观测",
+    "states": "outcome: ok / not_found / blocked / parse_failed / stale;stock_state: in_stock / out_of_stock / unknown;completeness_ok: true/false",
+    "key_columns": "asin, scrape_params(邮编), price, shipping(NULL≠0), stock_state, stock_count, delivery_days, outcome, completeness_ok, scraped_at"
+   },
+   {
+    "name": "catalog.latest_snapshot",
+    "purpose": "视图:每 (marketplace, asin, scrape_params) 取最新一条快照,产品列表/详情的亚马逊现值来源",
+    "states": "",
+    "key_columns": "同 snapshots,列表页展示价格/运费/库存/货期/采集时间"
+   },
+   {
+    "name": "catalog.walmart_items",
+    "purpose": "沃尔玛侧在架现值:每 (店铺, SKU) 一行,catalog_sync 每日全量扫店 upsert,缺席标 missing_since 永不删行",
+    "states": "在架判定:missing_since IS NULL=在架,非空=缺席(缺席时 published/lifecycle_status 被清空);lifecycle_status 含 RETIRED(平台值,库不枚举全集)",
+    "key_columns": "store, sku, item_id, product_name, upc, price, avail_qty, published_status, lifecycle_status, unpublished_reasons, variant_group_id, last_seen_at, missing_since"
+   },
+   {
+    "name": "catalog.product_events",
+    "purpose": "产品病历:只追加事件账本,SKU 一生的入库/审核/上架/观测/删除核验时间线(事件码唯一出处 services/product_events.py,record_many 对未登记码抛错)",
+    "states": "event 全集(25 个):item_appeared / item_reappeared / item_missing / status_changed / delete_submitted / retire_submitted / maintenance_submitted / match_submitted / list_submitted / problem_categorized / delete_verified / delete_not_effective / product_ingested / audit_passed / audit_rejected + {delete|retire|maintenance|match|list}_feed_{success|failed}",
+    "key_columns": "occurred_at, event, store, sku(订货号原文), asin, source, error_code, detail(jsonb)"
+   },
+   {
+    "name": "catalog.product_risk(视图)",
+    "purpose": "全局风险档案:按 coalesce(asin,sku) 聚合上架/提交/删除/停用/缺席/审核计数——只是查询档案,不是拦截条件",
+    "states": "unexplained_missing: true=消失过且从未提交删/停(疑似平台强制下架,list_new 只报警不拦截)",
+    "key_columns": "asin, listed_times, submit_times, delete_times, retire_times, missing_times, delete_not_effective_times, unexplained_missing, audit_pass_times, audit_reject_times, last_removed_at, last_event_at"
+   },
+   {
+    "name": "catalog.product_risk_store(视图)",
+    "purpose": "店铺维度风险档案:这个产品在哪些店被删过几次(store 为 NULL 的事件——含全部审核事件——不在此视图)",
+    "states": "同 product_risk",
+    "key_columns": "asin, store, listed_times, delete_times, retire_times, missing_times, unexplained_missing, last_removed_at"
+   },
+   {
+    "name": "catalog.status_changes(视图)",
+    "purpose": "平台状态迁移平铺:谁被平台下架、官方原因是什么(查法 WHERE new_status <> 'PUBLISHED')",
+    "states": "old_status/new_status 为沃尔玛 published_status 平台值",
+    "key_columns": "occurred_at, store, asin, sku, old_status, new_status, reasons(官方下架原因)"
+   },
+   {
+    "name": "catalog.feed_failures(视图)",
+    "purpose": "五类 feed 的逐 SKU 失败回执读侧",
+    "states": "kind: delete / retire / maintenance / match / list",
+    "key_columns": "occurred_at, store, asin, sku, kind, error_code, detail"
+   },
+   {
+    "name": "catalog.audit_listing_conflicts(视图)",
+    "purpose": "审核结论 × 上架现状冲突面:当前判拒且此刻在架的行(problem_scan 的删除建议来源)",
+    "states": "rejected_still_listed: 恒 true(现状口径);rejected_after_listing: true/false(时序口径=判拒晚于上架,审核链漏拦线索)——两个标志问的是两件事,别混用",
+    "key_columns": "store, sku, asin, published_status, audit_reason, audited_at, last_rejected_at, last_listed_at, audit_reject_times, rejected_after_listing"
+   },
+   {
+    "name": "catalog.listing_sources",
+    "purpose": "产品来源登记簿:每个上架产品的出身,自动化破坏动作按出身路由(unknown 不自动动)",
+    "states": "source_type: amz / match / self / 1688 / unknown",
+    "key_columns": "store, sku, source_type, source_key, workflow"
+   },
+   {
+    "name": "ops.scrape_failures",
+    "purpose": "采集侧『根本没采到』的失败明细(验证码/超时/404/封禁),与 snapshots.outcome≠ok 互补,回答『这个 ASIN 为什么没有新数据』的第二半",
+    "states": "",
+    "key_columns": "asin, batch_name, error_type, 时间"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "catalog_sync",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "沃尔玛在线商品全量同步:GET /v3/items 全量扫店 + 库存合并 → upsert walmart_items → 标缺席 → 写观测事件,是几乎所有判据的现值来源(product_chain 每天 13:00 链首)",
+    "params": "store, workers, skip_inventory, rounds(fast/full), item_ids, skip_feishu"
+   },
+   {
+    "name": "product_refresh",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "在架产品全量重推采集(维护链数据新鲜度源头),批次落定顺手拉失败明细落 ops.scrape_failures;调度里 wait=1 阻塞等采完",
+    "params": "wait, check, execute(兼容空操作别名)"
+   },
+   {
+    "name": "product_ingest",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "采集服务增量 → catalog.products/snapshots,全项目唯一直连采集器取数的工作流;游标在 ops.cursors,409 cursor_below_retention 立即停并告警",
+    "params": "limit, max_pages, cursor"
+   },
+   {
+    "name": "catalog_health",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "产品库完备度体检(纯 SQL 只读):采集完备度/类目锚/PT×类目交叉/审核分布/PT spec 就位度五段报告",
+    "params": "(无)"
+   },
+   {
+    "name": "product_query",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "按产品 ID(ASIN/UPC/关键词自动分类)查沃尔玛商品详情,零状态全只读,结果落 CSV",
+    "params": "ids, file, store, mode(global/catalog), field"
+   },
+   {
+    "name": "sku_normalize",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "事件账本 SKU→ASIN 存量清洗(缺省预览零写入;只补 NULL 天然幂等,规则扩充后重跑)",
+    "params": "apply"
+   },
+   {
+    "name": "node_backfill",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "从已存快照 raw.category_ids 回填 products.browse_node_id/chain(零重采,只填空不覆盖)",
+    "params": "apply"
+   },
+   {
+    "name": "pt_backfill",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "两份历史实证(删除历史 41.7 万 + 报错日报 9.7 万)回填 products.walmart_pt,实证覆盖推断并盖 pt_source=walmart_confirmed",
+    "params": "apply"
+   },
+   {
+    "name": "pt_census",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "沃尔玛 PT 四源对账(spec/meta/tmpl/map),判定每个 PT 是 ok/准入漏了/已废弃?/瞎猜/没人用,纯只读落 CSV",
+    "params": "only, export"
+   },
+   {
+    "name": "variant_probe",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "变体维度为什么没发:采集侧给了什么 / _DIM_MAP 怎么映 / PT spec 枚举允许什么,三路只读诊断 + 字面候选建议",
+    "params": "asins, pt"
+   }
+  ],
+  "page_blocks": [
+   "产品列表大表格(catalog.products LEFT JOIN catalog.latest_snapshot + walmart_items 在架店数聚合):列 = 图片缩略、ASIN、标题、品牌、amz 价格+运费(latest_snapshot,NULL 显 N/A 不显 0)、库存状态/货期、沃尔玛在架店数、audit_status 四态徽标、walmart_pt(带 pt_source 实证/推断双色标)。几十万行,必须虚拟滚动 + 服务端分页",
+   "列表筛选栏八维度(frontend_brief 定稿):店铺 / 审核状态(NULL·pending·approved·rejected)/ 在架状态(walmart_items.missing_since)/ 品牌 / 类目(browse_node_id/amazon_category)/ 有无采集数据(latest_snapshot 有无 + outcome)/ 货期区间 / 价格区间",
+   "产品详情·两侧对照区(核心张力):左=亚马逊侧(catalog.products + latest_snapshot:标题/品牌/browse_node_chain 类目链/价格/运费/stock_count/delivery_days/图/scraped_at 新鲜度),右=沃尔玛侧(catalog.walmart_items 每店一行:store/sku/price/avail_qty/published_status/unpublished_reasons/missing_since)",
+   "产品详情·病历时间线(catalog.product_events 按 coalesce(asin,sku) 查,25 个事件码分组配色:观测类/提交类/回执类/审核类/核验类):这是『当初为什么被删/被拒』的唯一答案来源,占详情页主区,禁止做成折叠小角落",
+   "产品详情·风险档案卡(catalog.product_risk + product_risk_store):上架/提交/删除/停用/缺席/审核通过拒绝计数、last_removed_at,unexplained_missing=true 亮报警标(疑似平台强制下架)——展示为档案,不是拦截标志",
+   "冲突面板(catalog.audit_listing_conflicts):『审核拒了还在架』工作队列,rejected_still_listed(该不该下架)与 rejected_after_listing(闸为什么没拦住)分列呈现,勿合并成一个标志",
+   "平台下架流水块(catalog.status_changes WHERE new_status<>'PUBLISHED':old→new + 官方 reasons)与 feed 失败回执块(catalog.feed_failures 按 kind 五类分页签)",
+   "快照历史区(catalog.snapshots 按 asin 倒序:价格/库存/运费走势 + outcome/completeness_ok 标记)+『为什么没新数据』双查入口:有快照行看 outcome≠ok,无快照行查 ops.scrape_failures(按 asin/batch_name)",
+   "变体组呈现(catalog.walmart_items.variant_group_id 分组折叠行:同组共享一个组头,variant_group_info.isPrimary 标主变体、展示分组维度;组内每 SKU 一行)+ variant_probe 诊断入口(输 asins 出三路诊断:采集侧维度/映射表/PT spec 枚举)",
+   "目录健康仪表块:catalog_health 五段(A 采集完备度含空壳行 / B 类目 ID 锚与映射直出率 / C PT×类目四象限 / D 审核结论分布 / E PT spec 就位度)+ pt_census 判定分布(ok/准入漏了/已废弃?/瞎猜/没人用)",
+   "工作流操作台:product_chain 链状态条(每天 13:00,catalog_sync→product_refresh(wait=1)→product_ingest→维护清理,前一步失败后面不跑)+ 手动工作流按钮组(catalog_health/product_query/sku_normalize/node_backfill/pt_backfill/pt_census/variant_probe,回填类均为『缺省预览 → apply=1 执行』两段式)"
+  ],
+  "gotchas": [
+   "NULL≠0 铁律:snapshots.stock_count/shipping/delivery_days 的 NULL=没采到、0=确实是 0(0.0 运费=确认免运费),前端禁止 `or 0` 式展示——把 N/A 画成 0 会让维护链按错误落地价决策",
+   "audit_status 的 pending 是中间态不是结论(类目解不出或 LLM 故障),视觉上必须与 approved/rejected 区分;NULL(未审)又是第四态,别与 pending 混",
+   "sku≠asin:沃尔玛侧 sku 是订货号原文(三段式 JTZW-D01027HVK3W-38、纯数字 item id 均实证),病历身份键一律 coalesce(asin,sku),按订货号聚合会把同一产品拆散",
+   "审核事件 store=NULL(审核不分店铺),进得了全局 product_risk 却进不了 product_risk_store;『哪个店拒了还挂着』只能看 audit_listing_conflicts,别在店铺视图里找审核计数",
+   "walmart_items 缺席行的 published/lifecycle_status 已被同步清空(2026-08-07 定稿):缺席商品不能展示旧状态,复现时才写回;行永不删除",
+   "feed 回执 success 是沃尔玛的一面之词:删除以 catalog_sync 观测核验为准,delete_not_effective(回执成功但宽限期后仍在架)是所有者实证的真实故障模式,要当告警画",
+   "product_risk 只是风险档案查询入口,不是拦截条件(所有者口径:防呆=黑名单按拉黑类别拦,不按删除史拦;可修复类删过重上是正常经营),前端别把删除次数画成禁止标",
+   "pt_source 防洗白:只有 walmart_confirmed/historical_confirmed 算实证,audit_llm 是推断,NULL 视同推断——混为一色会让 LLM 猜测被当实证放大到整个类目",
+   "『没有新数据』有两条互补查法:采到但降级看 snapshots.outcome≠ok / completeness_ok=false;根本没采到(验证码/超时/封禁)只在 ops.scrape_failures,增量流里完全不出现",
+   "upc/gtin 必须按文本渲染(前导零教训),数字化展示会静默截掉前导 0",
+   "前端不画『编辑产品价格然后保存』式表单:那样的写入通道不存在,一切执行走 cli.py 工作流(frontend_brief 明令)",
+   "缺省即真跑(2026-08-16 反转):调度工作流缺省执行、空跑要 --dry-run;但回填类(sku_normalize/node_backfill/pt_backfill)相反——缺省预览、apply=1 才写,两套约定并存,操作台按钮文案要按各自语义写",
+   "cli 参数名不校验:打错的参数键被静默吞掉(stores= 不报错照跑全量),操作台传参要用下拉/白名单不给自由输入",
+   "variant_probe 的候选建议只是字面提示不是判定(旧仓实证:文具类 color_name=48 Color 其实是件数,该映 pieceCount),界面要标『采纳前人眼确认语义』",
+   "product_chain 次序是硬的:catalog_sync 没跑成,后面全链拿隔夜现值判据(会对已下架 SKU 建议改价改库存)且不报错——链状态条要把『前一步失败』画成醒目阻断",
+   "product_query 的 catalog 模式 store 必填(查的是『哪家店』的目录,不允许缺省第一家);global 模式与店铺无关",
+   "pt_backfill 曾发生『历史结论把 9 万条实证冲掉』事故,重跑一次即复原——它是修复通道,界面别标成一次性脚本"
+  ]
+ },
+ {
+  "domain": "产品审核(product_audit 审核中心:L0-L4 分层判定 + 上架表驱动 + 同轮补采闭环)",
+  "tables": [
+   {
+    "name": "audit.audit_runs",
+    "purpose": "逐次审核结论账本(一 ASIN 可多次 run;dry-run 也落;历史 reject 短路与补刷采用的依据)",
+    "states": "verdict: pass / reject / pending;stage_stopped_at: L0 / L1 / L2 / L3 / L4 / NULL(全过) / SHORTCUT(旧系统影子行,一切统计必须排除)",
+    "key_columns": "run_id, asin, walmart_product_type, pt_source, pt_confidence, score_final, verdict, stage_stopped_at, l3_reason_category, created_at"
+   },
+   {
+    "name": "audit.audit_hits",
+    "purpose": "逐条规则命中明细(理由码账本,回答「为什么被拒」的唯一真值)",
+    "states": "stage: L0 / L1 / L2 / L3 / L4;penalty: -100(硬拒 R0/R1/R2/R3a、Phase0)或 0(软证据 R3b/R3c/R4/R5/R7/R8)",
+    "key_columns": "run_id, stage, rule_code, penalty, detail(jsonb)"
+   },
+   {
+    "name": "catalog.products(audit_* 五列)",
+    "purpose": "审核结论的权威落点:audit_status/audit_reason/audited_at/audit_version + walmart_pt/pt_source",
+    "states": "audit_status: NULL(未审) / pending / approved / rejected;pt_source: walmart_confirmed(实证,不可被审核覆盖) / map_direct / audit_llm / audit_cached 等",
+    "key_columns": "asin, title, walmart_pt, pt_source, audit_status, audit_reason, audited_at, audit_version"
+   },
+   {
+    "name": "ops.scrape_batches(audit_gap_ 前缀)",
+    "purpose": "产品审核同轮补采闭环的批次台账(缺数据推采集 audit_gap_<日界>,当轮 check_open 落定)",
+    "states": "pushed / completed / timeout(超 24h) / failed",
+    "key_columns": "batch_name, batch_id, count, state, note, 时间戳"
+   },
+   {
+    "name": "ops.audit_scrape",
+    "purpose": "⚠ 属订单审核域不属产品审核:order_audit 按邮编采集的防重台账(一 ASIN×邮编一行),画布上别混进产品审核页",
+    "states": "state: pending / done / failed",
+    "key_columns": "asin, zip, batch_name, state, reason, requested_at, settled_at, attempts"
+   },
+   {
+    "name": "audit.walmart_pt_meta / walmart_pt_spec / walmart_prohibited_policy",
+    "purpose": "规则读的数据格:PT 元数据 7033(R1 准入闸读 access_state+zh_can_do)/ 官方 spec 6942(R3 认证闸)/ 37 条禁售政策(理由映射)",
+    "states": "",
+    "key_columns": "walmart_product_type, walmart_category, access_state, zh_can_do, requirements;spec: has_real_cert, real_cert_fields"
+   },
+   {
+    "name": "audit.walmart_category_map",
+    "purpose": "Amazon 类目 → Walmart PT 映射(L1 快速通道,高置信唯一才直出)",
+    "states": "",
+    "key_columns": "amazon_category, walmart_product_type, 置信度"
+   },
+   {
+    "name": "catalog.audit_listing_conflicts",
+    "purpose": "审核结论 × 上架现状冲突面(拒了还在架 / 上架后才被拒 = 闸漏拦线索,两个标志口径不同别混用)",
+    "states": "rejected_still_listed(现状:该不该下架) / rejected_after_listing(时序:闸为什么没拦住)",
+    "key_columns": "asin, audit_status, audit_reason, audited_at, 两个布尔标志"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "product_audit",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "审核主流程:Phase0 四件套 → L1 类目解析(实证→映射表→候选+rerank)→ L2 硬规则 R0-R8 → L3 语义 → L4 视觉 → 落 runs/hits + 写 products 五列;调度名 audit_sheet 每天 18:10 带 from_sheet=1(审上架表 E 列空的行 + 结论投影回 C~G + 缺数据同轮补采闭环)",
+    "params": "asins, limit(缺省500), mode(backfill/pending), rerule(按规则码定点重审), force_rerun(按版本全量重审), r5(on 开 USPTO), l3(off 关语义层), l4(on 开视觉层), workers(缺省128), adopt_only, from_sheet, gap_wait(等采集分钟,缺省20,0=只推不等)"
+   },
+   {
+    "name": "audit_why",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "这个 ASIN 为什么是这个审核结论(只读排查):命中哪条规则 → 规则读哪张表哪一列 → 那一格写着什么,一条链摊开",
+    "params": "asins, pt(按 PT 看数据行+被它拒的), runs(看最近 N 轮), missing_meta(全库面:哪些 PT 让 R1/R3 闸静默失效)"
+   },
+   {
+    "name": "audit_calibrate",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "双跑校准报告(只读):新旧系统按 product_audit 首跑时刻切界,四桶=一致/新拦旧放/旧拦新放/新 pending,分歧按 rule_code 下钻 top10",
+    "params": "since(ISO 时间覆盖自动切点)"
+   },
+   {
+    "name": "audit_import",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "旧审核库 13 表一次性搬迁(dry-run 出逐表体检报告:源/目标行数、列对照、致命项拒真跑;整轮单事务失败全回滚)",
+    "params": "table(只搬指定表), replace(yes 清掉重灌,TRUNCATE 预告)"
+   },
+   {
+    "name": "audit_history_fold",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "历史审核结论折叠进产品事件账本(一次性):不平铺 204 万 run,只投每 ASIN 的结论变迁点;幂等=擦净重灌本 source",
+    "params": "apply(1=真入库,缺省预览)"
+   }
+  ],
+  "page_blocks": [
+   "分层判定漏斗:候选→判定数,按 verdict(pass/reject/pending)×stage_stopped_at(L0 Phase0→L1 类目→L2 硬规则→L3 语义→L4 视觉)呈现每层拦了多少;数据源 audit.audit_runs(必须排除 stage_stopped_at='SHORTCUT')",
+   "今日 audit_sheet 运行看板(18:10 调度):上架表 E 列空领取数 / 库里已有结论直接投影数(零 LLM)/ 真待审数(未审+pending)/ limit 撞满时显示「总量 vs 本轮 vs 还剩」三个数;数据源 ops.runs 摘要 + catalog.products",
+   "同轮补采闭环状态条:审不了 N(不在库/采集降级无标题)→ 推 audit_gap_<日界> 批次(含插队成败)→ 等采集(缺省20分钟)→ 就地摄取 → 救回 M 个本轮判掉 → 仍缺 K 个写 F 列;数据源 ops.scrape_batches(state: pushed/completed/timeout/failed)",
+   "单产品「为什么被拒」详情页(audit_why 的界面化):顶部 products 五列现行结论 → 最近 N 轮 audit_runs 时间线 → 每轮 audit_hits 明细(stage/rule_code/penalty/detail)→ 规则读的数据格实况(walmart_pt_meta 的 access_state/zh_can_do、pt_spec 认证字段、黑名单命中),让人一眼判断是「规则对数据错」还是「数据对规则错」",
+   "pending 队列块:全库 pending 存量 + 按两来源拆分(L1=类目解不出 / L3=LLM 故障),标注隔日退避规则;入口按钮 mode=pending 专刷(无退避、手动、不进调度);数据源 catalog.products.audit_status='pending' + audit_runs",
+   "重审操作面板(三条通道,危险需确认):asins= 点名强审(无视现有结论)/ rerule=<规则码> 定点翻案(改规则后只翻被它拒过的,展示 _rerule_head 的总量/本轮/还剩)/ force_rerun=<版本> 全量重审(最重,警示 LLM 费用);并明示「清空表 E 列不是重审入口」",
+   "LLM 运行健康块:L1 rerank 调用/失败/坏 JSON/unknown→待定/字典回落、退避统计(只有 http_429 才标「已撞限流」,other/5xx 是网络与对端故障)、并发实际值与 PG 连接钳制提示、L4 故障回落 pass 逐 rule_code 计数(全故障=层未生效);数据源 ops.runs 摘要",
+   "审核×上架冲突块:rejected_still_listed(该下架)与 rejected_after_listing(闸漏拦)两列分开呈现;数据源 catalog.audit_listing_conflicts",
+   "标定与迁移工具入口区:audit_calibrate 四桶报告(一致/新拦旧放/旧拦新放/新 pending + rule_code 下钻 top10)、audit_import 体检报告(只读工具区)、audit_history_fold 预览/入库;均手动触发"
+  ],
+  "gotchas": [
+   "from_sheet 不是强审:表 E 列空只说明表里没结论,库里已有结论的零 LLM 直接投影回表;当强审做会把几万个已审 ASIN 每轮重判一遍",
+   "上架表 E 列写的是 'pass' 不是 'approved'(AUDIT_RESULT_CN 映射:approved→pass, rejected→reject),list_new 领任务闸只认小写 pass,写错永不上架且不报错",
+   "缺数据行只写 F 列原因、E 列必须留空:E 一有值该行就退出审核通道,采回来也没人再审它",
+   "pending 是中间态不是结论,两来源要分开呈现:L1=类目解不出、L3=LLM 故障;均隔日退避重试,mode=pending 是人工无退避旁路且不采用历史结论",
+   "重审政策(唯一出处 _DEFAULT_CANDIDATE):rejected 永不自动重审(45 天 TTL 已废除);approved 只在产品 slow_hash 变了时由 product_ingest 翻回 pending",
+   "dry-run 语义反直觉:判定照跑、runs/hits 照落、LLM 照样真调用真花钱,只是不写 products 五列不投影;所以 dry-run 前后统计 audit_runs 会看到新行",
+   "结论只由硬规则的 -100 决定:R0(中国卖家类目硬禁)/R1(准入双白名单)/R2(18 条禁售大类)/R3a(硬认证);R3b/R3c/R4(黑名单品牌)/R5(USPTO 商标,默认关)/R7(促销宣称)/R8(敏感内容)penalty 全为 0 纯证据,前端别把软命中画成拒因",
+   "Phase0(L0)四规则串行短路,同时踩多条也只落 1 行 hit —— 单条 hit 不代表只违反一条",
+   "历史 audit_runs 里有 204 万存量中的 SHORTCUT 影子行(旧系统 reject 粘性产物),任何统计/对比必须 stage_stopped_at IS DISTINCT FROM 'SHORTCUT'",
+   "pt_source='walmart_confirmed' 的 PT 一个字不许动(沃尔玛回执实证压过一切审核推断,曾因覆盖酿成 9 万条实证降级事故)",
+   "候选数恰等于 limit 时看不出是刚好还是撞了上限,页面必须展示「总量/本轮/还剩」三个数(所有者实遇)",
+   "并发默认 128 但按 PG max_connections 余量自动往下钳,钳制值必须亮出(静默钳制=拿错的数做并发决策)",
+   "ops.audit_scrape 是订单审核(order_audit 按邮编)的台账,产品审核补采走 ops.scrape_batches 的 audit_gap_ 前缀,两者别画进同一块",
+   "audit_why 的 missing_meta 口径:只有 stage_stopped_at 为 NULL/L2/L3/L4(真走到了 R1/R3 闸)才算闸失效,停在 L0/L1 的算进去是冤枉的",
+   "audited_at 是审核动作时刻不是进入 pending 时刻,不能拿它算 pending 龄期(两种来源口径相反),前端只报 pending 总量",
+   "无标题产品(采集降级)跳过不审只计数;seller 闸依赖契约外字段 buybox_seller_id,恒缺=卖家闸从未生效,缺失率要在页面亮出"
+  ]
+ },
+ {
+  "domain": "维护/清理(商品维护链 + 问题商品链 + 停用/删除表清理)",
+  "tables": [
+   {
+    "name": "ops.dispositions",
+    "purpose": "处置建议台账,「建议/执行」分界面:两条链(maintenance_scan→maintenance、problem_scan→problem_product_cleanup)共用,部分唯一索引保证同 (店铺,SKU,动作) 同时只有一条未落定行,已落定行是病历永久留存",
+    "states": "suggested / executing / confirmed / ineffective / withdrawn(状态机:suggested→executing→confirmed|ineffective|withdrawn;source 取值 scan/audit/tro(预留)/maint;action 取值 relist/delete/retire(问题链)+ title/price/inventory(维护链,delete 两链共用))",
+    "key_columns": "store, sku, source, action, category(原因码), reason(人读原因), status, feed_id, suggested_at, executed_at, settled_at, detail(旧值/新值/删除证据/settled_by)"
+   },
+   {
+    "name": "catalog.product_events",
+    "purpose": "产品病历:执行件写 delete_submitted/retire_submitted/maintenance_submitted(反补),catalog_sync 观测写 delete_verified/delete_not_effective —— settle() 靠它落定建议行(不信回执信观测);problem_scan 写 problem_categorized 归类事件",
+    "states": "",
+    "key_columns": "store, sku, event, source, occurred_at, detail(feed_id/reason/category/disposition_id)"
+   },
+   {
+    "name": "ops.feed_log / ops.feed_items",
+    "purpose": "feed 提交权威台账与逐 SKU 结果:提交期在途防重(outcome=dedup)在这里判;feed_poll 回填终态;problem_scan 的在途预筛(submitted 48h 封顶 / success 待观测)也读它",
+    "states": "feed_items.status:submitted / success / failed(问题链预筛口径:submitted 48h 内拦、success 且 resolved_at>last_seen_at 待观测拦、failed 不拦)",
+    "key_columns": "store, sku, feed_id, status, submitted_at, resolved_at, error_code"
+   },
+   {
+    "name": "ops.dedupe(scope='maintenance:submitted')",
+    "purpose": "维护链 20 小时提交抑制:同 (店铺,SKU,类型,新值) 近期已提交过就压掉,防 catalog_sync 未重扫前一轮轮重发同样载荷(生产实证 208 条 stale update)",
+    "states": "",
+    "key_columns": "scope, key(店铺|SKU|类型|新值), created_at"
+   },
+   {
+    "name": "catalog.walmart_items",
+    "purpose": "沃尔玛在线现值:维护三动作(标题/价格/库存)的落定判据 —— catalog_sync 重扫后现值等于建议新值才 confirmed;problem_scan 的问题清单也从它取(UNPUBLISHED/SYSTEM_PROBLEM 且未缺席)",
+    "states": "published_status:PUBLISHED / UNPUBLISHED / SYSTEM_PROBLEM / STAGE 等;lifecycle_status:ACTIVE / RETIRED / ARCHIVED",
+    "key_columns": "store, sku, published_status, unpublished_reasons, price, avail_qty, product_name, last_seen_at, missing_since"
+   },
+   {
+    "name": "飞书「维护记录」表(registry.MAINT_SHEET,11 列,只留 7 天)",
+    "purpose": "maintenance 执行件的展示面板:本轮领到的每条建议都写一行(不只提交成功的),「建议」列来自扫描件、「动作」列是真做了什么,两列分歧即价值;台账权威在 PG,写表失败可 -p resync_sheet=1 补写",
+    "states": "结果列:处理中 / 成功 / 失败 / 在途防重 / 未执行(凭证缺失|凭证失效|提交异常);动作列:删除|标题|价格|库存 / 跳过 / (空=领到没执行)",
+    "key_columns": "店铺, SKU, 建议, 原因, 动作, 旧值, 新值, feedid, 日期, 结果, 报错"
+   },
+   {
+    "name": "飞书「停用/删除表」(registry.RETIRE_SHEET,A~H 列)",
+    "purpose": "product_clear 的驱动表:A~D 运营填(店铺/SKU/停用或删除/操作原因),E~H 程序写(feedid/操作日期/结果/报错);feed_poll 共用回填",
+    "states": "行状态机:E 空+C 合法=待提交 → 结果=处理中 → 成功/失败/未查到/提交被拒/动作不识别/店铺不识别;失败行不自动重试,运营清空 E 列即重新排队",
+    "key_columns": "店铺(A), SKU(B), 停用/删除(C), 操作原因(D), feedid(E), 操作日期(F), 结果(G), 报错(H)"
+   },
+   {
+    "name": "ops.store_kpi_daily",
+    "purpose": "店铺闸:最新 store_status 非 ACTIVE 的店整体跳过建议(problem_scan 与维护删除 provider 同口径,无记录 fail-open)",
+    "states": "store_status:ACTIVE / 其他(非 ACTIVE 即跳过)",
+    "key_columns": "store, store_status, data_date"
+   },
+   {
+    "name": "ops.scrape_failures(error_type='variant_offset')",
+    "purpose": "采集永久偏移证据:同 ASIN 偏移批次数 ≥1 且此后无 outcome=ok 快照 → 删除意图的 variant_offset 判据来源",
+    "states": "",
+    "key_columns": "asin, batch_name, recorded_at"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "maintenance_scan",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "商品维护扫描定性(只读,不发任何 feed):从产品中心自动算 amz 观测×沃尔玛现值×定价规则的差异,产删除/标题/价格/库存建议行落 ops.dispositions,并撤销本轮不再成立的旧建议",
+    "params": "store, preview, oos_days, dry_run(等价 preview)"
+   },
+   {
+    "name": "maintenance",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "维护执行件(不做任何决策):落定上一轮(删除按观测事件、三类按线上现值)→ 超期 3 天放行 → 领取 source=maint 建议 → 按店分桶提交(改价≤5/改库存≤10 走单品 PUT,超走 feed,标题恒 feed)+ 写维护记录表",
+    "params": "store, only(delete/title/price/inventory), resync_sheet, prune_sheet, days, execute"
+   },
+   {
+    "name": "problem_scan",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "问题商品扫描定性(只读,不发 feed):沃尔玛后台 UNPUBLISHED/SYSTEM_PROBLEM 按 A~L/Z 类别码归类 + 审核判拒仍在架(audit 来源),产反补/删除/顽固停用建议;尾段顺手收黑名单并投影飞书",
+    "params": "store, preview, dry_run(等价 preview)"
+   },
+   {
+    "name": "problem_product_cleanup",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "问题商品处置执行件(不做任何决策):落定上一轮按观测判决 → 领取 source=scan/audit 建议 → 按店发 relist(MP_MAINTENANCE)/retire(RETIRE_ITEM)/delete(DELETE_ITEM)三种 feed,网络失败店整店二轮重试一次",
+    "params": "store, execute"
+   },
+   {
+    "name": "product_clear",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "飞书停用/删除表驱动的商品清理:轮询已提交行的 feed 终态回写 G/H → 新行按 店铺×动作 分组提交(停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM),受限额表「下架限制」单店单日上限约束",
+    "params": "execute, limit, store"
+   }
+  ],
+  "page_blocks": [
+   "建议段(第一段):ops.dispositions status=suggested 列表,按链分 tab(维护链 source=maint / 问题链 source=scan+audit),列:店铺、SKU、建议动作(删除/标题/价格/库存/反补/顽固停用)、原因码 category、原因 reason、旧值→新值(detail.old/new)、suggested_at —— 原因码必须是列表一眼可见的一列,不能藏进详情",
+   "执行段(第二段):status=executing 行(带 feed_id、executed_at),配「卡住告警」子块:executing 超 3 天的行按 (店铺,动作) 聚合(services/dispositions.stuck_executing),标红说明这些 (店铺,SKU,动作) 被部分唯一索引挡着建不出新建议 —— 问题链没有自动放行,卡住就一直卡着(数据源 ops.dispositions)",
+   "落定段(第三段):status=confirmed / ineffective / withdrawn 病历,ineffective 高亮(回执成功但观测显示没动,下轮会重新建议),withdrawn 显示 detail.withdrawn_reason,settled_by 显示判决依据(delete_verified / observed / value_unchanged / expired / absent)(数据源 ops.dispositions)",
+   "四条清零判据区分块:清零建议按原因码摊开计数 —— unavailable(在架不可售 Currently unavailable)/ no_buybox(无 Buy Box)/ out_of_stock(缺货)/ lead_days(配送超本店上限),另加 stockzero(整店清零)与 match_restock(跟卖铺货,方向相反)—— 表里四条清零长得一模一样(库存 12→0),只有 category 分得清(数据源 ops.dispositions.category)",
+   "删除原因码分布块:not_found(亚马逊已下架)/ title_mismatch(相似度<70%)/ variant_offset(采集永久偏移)/ 商品不存在(标题占位符)/ 连续无货N天,问题链另有 A~L/Z 类别码(A过期 B禁售 C品牌 D价格 E知产 F限类 G药品 H信息 I内容 J特殊 K审查 L系统 Z其他)与「审核判拒仍在架」(数据源 ops.dispositions.category + catalog.product_events)",
+   "维护记录流水块:「建议」vs「动作」两列对照过滤器 —— 建议=删除&动作=删除(正常)/ 动作=跳过(在途防重,没有提交)/ 动作=空(领到没执行,结果列写凭证缺失/失效/提交异常),结果列:处理中/成功/失败(数据源 飞书 MAINT_SHEET 镜像,权威在 ops.feed_items)",
+   "停用/删除表状态块(product_clear):运营填报行的状态机视图 —— 待提交 / 处理中 / 成功 / 失败 / 未查到 / 提交被拒 / 动作不识别 / 店铺不识别,附单店单日上限(限额表「下架限制」列)与超限延后计数;失败行提示「清空 E 列重新排队」而非重试按钮(数据源 飞书 RETIRE_SHEET + ops.feed_log)",
+   "反补/顽固计数块(问题链):同 SKU 30 天窗口内 maintenance_submitted 反补次数(满 2 次转删除兜底),顽固 SKU(最新事件 delete_not_effective)= retire+delete 双 feed 两条建议行(数据源 catalog.product_events)",
+   "对账提示块:本轮写入次数(suggest_many)≠ 库里待执行条数(count_open),差额=同 (店铺,SKU,动作) 被两来源命中按唯一索引合并 —— 页面两个数并排展示并解释差额,不许只报一个(数据源 ops.dispositions)"
+  ],
+  "gotchas": [
+   "2026-08-16 起缺省即真跑、空跑要显式 --dry-run(--execute 只是兼容空操作别名)—— 前端按钮语义必须默认危险、空跑是显式选项。",
+   "两个扫描件的 --dry-run 等价于 preview=1(它们本身 DANGEROUS=False,但会写建议表,dry-run 的本意是这轮别落库)。",
+   "本轮写入 N 次 ≠ 库里待执行 N 条:同 (店铺,SKU,动作) 被 scan 与 audit 双来源命中会被部分唯一索引合成一条(实测 519 写入→470 条),category/reason 被后写方覆盖。",
+   "executing 行永不落定 = 该 (店铺,SKU,动作) 永久停摆且完全静默(唯一索引挡新建议、upsert rowcount 0);维护三类 3 天超期自动放行,问题链的删除/反补故意不自动放行 —— 卡住必须靠页面让人看见。",
+   "落定不信回执信观测:ineffective = 沃尔玛回执说成功但 catalog_sync 重扫发现线上值没变/商品还在,下轮会重新建议;没被重新观测(last_seen_at<=executed_at)的行保持 executing 不判。",
+   "一个 SKU 一轮只出一个动作,优先级 删除>库存>标题 —— 否则先花配额改一个马上要删的商品;审核判拒压过反补(同 SKU「审核拒→删」与「过期→救活」并存时砍掉反补)。",
+   "顽固 SKU(delete_not_effective)是 retire+delete 两条建议行、两个 feed、两次独立落定 —— 前端不能把它合并成一行显示。",
+   "维护记录表「动作=跳过」是在途防重没有提交,不是做了两次;「动作=空」是领到了没执行(凭证缺失/失效/提交异常)—— 建议与动作分歧正是这张表存在的原因。",
+   "四条清零判据在表里长得一模一样(库存 X→0),只有原因码 unavailable/no_buybox/out_of_stock/lead_days 分得清;原因码全集唯一出处是 services/maintenance_intents.classify() + order_audit.stock_block()。",
+   "product_clear 的 C 列留空默认 DELETE_ITEM(永久删除),不是停用 —— 前端展示这张表时必须把空值渲染成「删除(默认)」;失败/未查到行不自动重试,清空 E 列才重新排队。",
+   "反补满 2 次(30 天窗)仍过期 → 转永久删除兜底;dedup 结果绝不落事件,否则反补计数灌水会让商品少一次真实机会就被判死。",
+   "调度顺序是硬约束(product_chain 13:00:catalog_sync→product_refresh→product_ingest→maintenance_scan→maintenance→problem_scan→problem_product_cleanup;product_clear 单独 15:00)—— 没跑 sync 就扫会对已下架 SKU 建议改价改库存。",
+   "维护三动作不进 catalog.product_events(流水在 feed_log/feed_items),唯一例外是删除(生死类恒记)—— 病历时间线页面只画删除/反补/停用,别指望找到改价事件。",
+   "stockzero 店整店排除在自动 provider 之外;手动把单个跟卖品清零会被 match_restock 自动回填 —— 清零不是停售手段,前端不要提供「单品清零」按钮。",
+   "采集侧信号缺失一律保守:配送方式(FBA/FBM)未知不改价、运费没采到不改价、stock_count 采不到写 0(采不到就不卖)、相似度算不出不算不匹配。"
+  ]
+ },
+ {
+  "domain": "风控与黑名单域(blacklist / risk)",
+  "tables": [
+   {
+    "name": "catalog.brand_blacklist",
+    "purpose": "黑名单品牌总清单镜像(risk_sync 飞书「黑名单品牌总表」→PG,只增改不删)+ 上架/审核品牌否决闸唯一数据源;problem_scan 自产品牌 DO NOTHING 补进",
+    "key_columns": "brand_key, brand, source, added_date, src_sku, synced_at",
+    "states": ""
+   },
+   {
+    "name": "catalog.brand_err_hits",
+    "purpose": "品牌·后台报错渠道表(PG 权威,beyKyi 飞书表的投影源):完整记录沃尔玛后台问题商品拿到过哪些品牌,渠道内按品牌去重、不与总清单去重",
+    "key_columns": "brand, source, added_date, src_sku, src_store, biz_cn, pushed_at",
+    "states": "pushed_at: NULL=未投影 / 非空=已投影到飞书"
+   },
+   {
+    "name": "catalog.asin_blacklist",
+    "purpose": "ASIN 黑名单(自产回路收集侧,PG 权威):只收永久禁止类 B/C/E/F/G/K + LEGACY 历史继承;上架拦截与审核 Phase0 ASIN 闸共读全表",
+    "key_columns": "asin, category, source, reason, src_store, src_sku, biz_cn, created_at, pushed_at",
+    "states": "category: B(禁售)/C(品牌)/E(知产)/F(限类)/G(药品)/K(审查)/LEGACY(历史继承);biz_cn: true/false;pushed_at: NULL=待推/非空=已投影"
+   },
+   {
+    "name": "catalog.seller_blacklist",
+    "purpose": "黑名单亚马逊卖家店铺 ID 镜像(risk_sync 飞书 sheet=B19LKn → TRUNCATE 全量重灌;审核 Phase0 卖家闸数据源)",
+    "key_columns": "seller_id, synced_at",
+    "states": ""
+   },
+   {
+    "name": "catalog.amazon_cat_blacklist",
+    "purpose": "黑名单亚马逊类目镜像(risk_sync 飞书 sheet=twjmql → TRUNCATE 全量重灌,入库即归一化;审核 Phase0 类目闸数据源)",
+    "key_columns": "category_norm, category_raw, synced_at",
+    "states": ""
+   },
+   {
+    "name": "catalog.risk_product_types",
+    "purpose": "沃尔玛类目风控表镜像(risk_sync 飞书「沃尔玛类目表」→PG upsert):上架否决闸判「准入状态=禁售 或 中国卖家可做以否开头」;同一份数据还全量重灌 audit.walmart_pt_meta 供审核 R1/R3 闸",
+    "key_columns": "product_type, category, admit_status, cn_seller, cert_required, synced_at",
+    "states": "admit_status: 禁售=拦截 / 其它放行;cn_seller: 以「否」开头=拦截"
+   },
+   {
+    "name": "ops.dedupe (scope=cleanup:brand_asin / cleanup:brand_scrape)",
+    "purpose": "品牌收集防重台账:brand_asin=该 ASIN 已做过品牌入账(缺品牌的不标,等补上重试);brand_scrape=已推过采集的 ASIN 不再推(防无限烧配额)",
+    "key_columns": "scope, key, meta, created_at",
+    "states": ""
+   }
+  ],
+  "workflows": [
+   {
+    "name": "risk_sync",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "风控/黑名单中心四表镜像入库(只读飞书):类目表(双写 risk_product_types + audit.walmart_pt_meta 全量重灌)+品牌总表 upsert;卖家/亚马逊类目两张单列表 TRUNCATE 全量重灌(空读不灌 + 骤缩超 50% 拒绝),末尾报闸门现状计数",
+    "params": "(无参)"
+   },
+   {
+    "name": "blacklist_push",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "PG 自产黑名单 → 飞书两张收集表(ASIN 黑名单表 + 品牌后台报错表 beyKyi),整表重写、天然幂等,带骤缩护栏(缩超 2% 停手一格不写)",
+    "params": "probe, allow_shrink, backfill, rebuild_asin, rebuild_brand, apply, limit"
+   },
+   {
+    "name": "asin_blacklist_import",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "黑名单 ASIN 批量导入(一次性):文件逐行一个 ASIN,库内已有 DO NOTHING,category='LEGACY' source='历史继承',非标准格式照灌不丢行;--dry-run 打印完整体检",
+    "params": "file, execute"
+   },
+   {
+    "name": "brand_scrape",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "采集库缺品牌的 C/E 类 ASIN:推采集补货 → 摄取 → 品牌入账(渠道表+否决闸+投影三处随链路到位);三道防循环闸(非标准 asin 过滤 / 尝试台账 / 收集防重)",
+    "params": "apply, wait, limit, timeout_min"
+   }
+  ],
+  "page_blocks": [
+   "黑名单中心总览四卡片:品牌闸(catalog.brand_blacklist 计数)/ ASIN 闸(catalog.asin_blacklist 计数,按 category B/C/E/F/G/K/LEGACY 分色)/ 卖家闸(catalog.seller_blacklist)/ 亚马逊类目闸(catalog.amazon_cat_blacklist)——每张卡标注同步方向箭头:品牌总表·卖家·类目是「飞书→PG」镜像,ASIN 与品牌渠道是「PG 自产→飞书投影」,方向必须画出来,四类不是一个模子",
+   "查询拦截框(最重要交互):输入品牌名/ASIN/卖家ID/亚马逊类目,回答「会不会被拦、被哪道闸拦、为什么」——品牌走 brand_key 归一(小写+空白压单空格,casefold 精确匹配,查 catalog.brand_blacklist),ASIN 全表精确查 catalog.asin_blacklist(显示 category/source/reason/src_store),类目先过 normalize_amazon_category 再查 category_norm",
+   "ASIN 黑名单列表页(catalog.asin_blacklist):列 asin/category/source/reason/src_store/src_sku/biz_cn/created_at/pushed_at,按 category 与 biz_cn(中国卖家专属禁售独立维度)可筛,pushed_at 为 NULL 的行标「待投影」",
+   "品牌两张表并排呈现但严格分区(catalog.brand_blacklist 总清单 vs catalog.brand_err_hits 后台报错渠道):UI 必须显式标注「总表=人工归拢、飞书→PG」「渠道表=程序自产、PG→飞书、不与总表去重」,两区各自列表 + 渠道表 src_sku/src_store/biz_cn 溯源列",
+   "命中/入账统计块:今日与近 7 天新增(asin_blacklist 按 created_at、brand_err_hits 按 added_date),按 category 六类分布条形图;数据来源 catalog.asin_blacklist + catalog.brand_err_hits",
+   "投影健康块(对应 blacklist_push -p probe=1):两张飞书收集表各一行——已填行数 vs 库侧 pushed_at 水位 vs 自产总数,三数不齐标 ⚠;附「立即补推」按钮(blacklist_push)与「只读体检」按钮(probe=1)",
+   "同步链路时间线块:blacklist 调度任务每天 15:00 跑 risk_sync → blacklist_push(registry/schedule.JOBS),展示 ops.runs 里两条工作流最近一次运行的成功/失败与摘要;并用文案钉死两条时间线:「否决闸在写入 PG 那一刻生效(上架/审核读 PG 从不读飞书),飞书表格是投影、要等 blacklist_push」",
+   "风控类目闸块(catalog.risk_product_types):列 product_type/admit_status/cn_seller/cert_required,筛「禁售」与「中国卖家不可做」的拦截子集;标注同一份数据还灌 audit.walmart_pt_meta 供审核闸",
+   "缺品牌待办块(brand_scrape 预览):C/E 类已归类但采集库无品牌的 ASIN 缺口清单(services/blacklist.uncollected_brand_items,含 has_brand 已到货只差入账的行),附「推采集补品牌」手动按钮(brand_scrape -p apply=1)",
+   "手动操作区:asin_blacklist_import(危险,file 参数,先 --dry-run 出体检再真跑)、blacklist_push rebuild_asin/rebuild_brand(一次性重建,预览先行 apply 才动)、allow_shrink 豁免开关——危险与一次性操作需二次确认样式"
+  ],
+  "gotchas": [
+   "两条时间线不一样:否决闸在 problem_scan 写完 PG 那一刻就生效(上架与审核只读 PG,从不读飞书表);飞书表格只是投影,要等 blacklist_push——「表格没更新」不等于「没拦住」,页面必须把这两个时刻分开呈现",
+   "品牌有两张飞书表且方向相反:「黑名单品牌总表」是人工归拢总清单(飞书→PG,risk_sync 管),「黑名单品牌(后台报错集成)beyKyi」是程序自产渠道(PG→飞书,blacklist_push 管);渠道表不与总清单去重——历史上混过两次,UI 千万别把它们画成一张表的两个视图",
+   "ASIN 黑名单只收永久禁止类 B/C/E/F/G/K,明确排除 A/D/H/I/J/L/Z(可修复/临时/平台类)——进了会误杀重上架;飞书来源列的 13 类词表只是格式约定,不是入选范围",
+   "入选按当轮=最新类别判,「曾经命中过 B」不作数(历史 48.5 万行折叠出 23.9 万次类别变迁,按曾命中会把短暂误判的商品永久拉黑);一次入选不更新(DO NOTHING,先到先得)",
+   "四张镜像表同步语义分两族:类目表/品牌总表只增改不删(upsert),卖家/亚马逊类目两张单列表 TRUNCATE 全量重灌(飞书删行必须跟着消失,残留即幽灵拦截)——前端展示同步方式时不能一概而论",
+   "三道骤缩护栏阈值各不同:单列黑名单镜像重灌缩超 50% 拒绝、walmart_pt_meta 重灌缩超 20% 拒绝、飞书投影整表重写缩超 2% 停手——护栏触发是「停手保旧数据」不是失败丢数据,UI 要把 ⛔ 停手与真失败区分开",
+   "品牌匹配是 casefold/归一后精确匹配,不是模糊匹配:归一=小写+内部空白压单空格,不去标点不做 unicode 折叠(L'Oréal→l'oréal);占位符(n/a、generic、oem、unknown、无品牌 等 21 项)一律判为无品牌,查询框按同一算法归一后再查,否则查不到会误报「未拦」",
+   "asin_blacklist 的键是清洗后的标准 ASIN,提不出标准码时用订货号原文兜底(宁可键不标准也不丢行)——非标准键拦不着按 ASIN 建档的产品但也不误拦,列表页这类行值得视觉弱化",
+   "biz_cn 是独立维度(中国卖家专属禁售 BIZ-CN 错误码),不能被 C 品牌类吸收——它是布尔列不是类别码,筛选器要单独给开关",
+   "亚马逊类目黑名单存的就是归一化值(入库/查询共用 normalize_amazon_category),读取端不再二次归一化;前端查询必须先调同一归一化再比对",
+   "缺品牌的 C/E 类 ASIN 不标已处理,等 product_ingest 补上品牌后下一轮自然重试——「缺口清单」是动态自愈的待办不是错误;清单必须含 has_brand=true(已有品牌只差入账)的行,只查仍缺品牌的会永远漏掉刚补到货的",
+   "audit schema 里的 blacklist_brands / phase0_blacklist_* 是退役历史快照(2026-08-13 黑名单中心统一后不再被读取),前端不要从这些表取数",
+   "asin_blacklist_import 是危险工作流且缺省即真跑(2026-08-16 起项目全局约定:空跑要显式 --dry-run),前端按钮默认应带 dry-run 预检"
+  ]
+ },
+ {
+  "domain": "feed 台账与运行记录 / 调度(ops 运维域)",
+  "tables": [
+   {
+    "name": "ops.feed_log",
+    "purpose": "feed 防重台账(核心安全表):先落 pending 再调沃尔玛接口,唯一索引 (feed_type, store, payload_key) 只拦在途行",
+    "states": "pending / submitted / done / failed",
+    "key_columns": "store, feed_type, feed_id, status, workflow, payload_key, created_at, updated_at"
+   },
+   {
+    "name": "ops.feed_items",
+    "purpose": "feed 的 SKU 级台账(所有 feed 操作共用),SKU 级状态权威在此,飞书驱动表的结果列只是投影",
+    "states": "submitted / success / failed / missing",
+    "key_columns": "feed_id, sku, store, feed_type, workflow, status, error_code, error_desc, submitted_at, resolved_at"
+   },
+   {
+    "name": "ops.feed_item_errors",
+    "purpose": "feed 报错明细:一条 ingestionError 一行(同一 SKU 可多条,seq 编号),报错是系统自我优化的燃料",
+    "states": "error_type 取值:DATA_ERROR / SYSTEM_ERROR / TIMEOUT_ERROR(非流转状态)",
+    "key_columns": "feed_id, sku, seq, error_type, code, field, description, feed_type, store, occurred_at"
+   },
+   {
+    "name": "ops.v_feed_error_stats",
+    "purpose": "报错排行视图(GROUP BY feed_type/field/code):改哪个字段收益最大一眼可见;零程序读者是设计如此,专供人工/前端",
+    "states": "",
+    "key_columns": "feed_type, field, code, 次数, 影响SKU数, 首次, 最近, 描述样本"
+   },
+   {
+    "name": "ops.runs",
+    "purpose": "运行记录:cli.py 每次执行每步写一行(谁触发、跑多久、成没成、摘要全文),排障第一入口",
+    "states": "running / success / failed",
+    "key_columns": "started_at, workflow, status, operator, finished_at-started_at 耗时, params, summary 首行(点开全文)"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "feed_poll",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "全局 feed 轮询(所有 feed 操作共用):扫 feed_log 的 submitted 行查沃尔玛终态,SKU 级结果落 feed_items,再并发跑五个反哺器回写飞书业务表;launchd 每小时 :00/:30",
+    "params": "store, feed_id(诊断模式,只读不动台账), stats(=1 报错排行), days(默认30), feed_type"
+   },
+   {
+    "name": "backup",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "中心库 pg_dump 备份:-Fc 先写 .part → pg_restore --list 校验 → 原子换名 → 按保留天数清理;gpt runner 每天 02:00",
+    "params": "days(保留天数,默认14,最小1)"
+   },
+   {
+    "name": "launchd_install",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "生成高频链(runner=launchd 那几条)的 launchd plist,装完就是真调度;只写文件不自动 load,load 命令打印出来按批灰度执行",
+    "params": "batch(1/2/3 灰度), dest(写到别处先看), uninstall(=1 打印卸载命令), execute"
+   },
+   {
+    "name": "skill_export",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "生成智能体定时任务的技能包(每日/每周那 9 条),从 registry/schedule.JOBS 渲染到 skills/walmart-schedule/,产物进 git 不许手改",
+    "params": "dest"
+   },
+   {
+    "name": "db_init",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "执行 refdata/schema.sql 建五 schema(幂等)+ 可选创建只读角色 readonly(供 Metabase/NocoDB/MCP)",
+    "params": "(无)"
+   },
+   {
+    "name": "init_data_root",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "初始化 <DATA_ROOT> 目录结构与 .env 模板(幂等)",
+    "params": "(无)"
+   },
+   {
+    "name": "ping_stores",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "端到端验收:读凭证表 → 每店经固定代理调只读端点 GET /v3/token/detail → 汇总;全通过 = 地基就绪",
+    "params": "stores(复数!逗号分隔,全项目唯一用复数的)"
+   }
+  ],
+  "page_blocks": [
+   "【Feed 追踪页】在途 feed 看板:ops.feed_log 中 status ∈ pending/submitted 的行,按 store × feed_type 分组,列出 feed_id/workflow/payload_key/created_at,pending 行红色高亮(它是『提交结局不确定』,不是『排队中』)。",
+   "【Feed 追踪页】pending 卡死预警条:ops.feed_log 里 status='pending' 且 created_at 超 6 小时(services/feed_track._PENDING_ALARM_HOURS=6)的行置顶告警,文案必须写明『系统不会自动补交,需人工核对后处理』。",
+   "【Feed 追踪页】三层下钻:feed_log 行点 feed_id → ops.feed_items 该 feed 的 SKU 级列表(sku/status/error_code/error_desc,四态 submitted/success/failed/missing)→ 点失败 SKU → ops.feed_item_errors 逐条明细(seq/error_type/code/field/description,同一 SKU 可有十几条)。",
+   "【Feed 追踪页】报错排行块:读 ops.v_feed_error_stats(feed_type/field/code/次数/影响SKU数/首次/最近/描述样本),支持天数与 feed_type 过滤(等价 feed_poll -p stats=1 -p days=N),回答『改哪个字段收益最大』。",
+   "【Feed 追踪页】反哺器状态块:五个反哺链(停用/删除表、维护记录、跟卖表、上架表、上架表自愈)最近一次回写结果,数据源是 feed_poll 那行 ops.runs.summary;单链失败只提示『台账已落定,下轮补写』。",
+   "【Feed 追踪页】操作区:触发 feed_poll(全量轮询)与 feed_id 诊断两个按钮,诊断按钮旁必须标注『只读:不动 ops.feed_items 台账、不回写飞书』。",
+   "【调度页】JOBS 全表:registry/schedule.JOBS 的 11 条,列 label/batch(1只读 2订单日报 3破坏性)/时间(hour:minute/weekday,feed_poll 是 :00+:30 双分钟)/workflows 链(箭头串联)/params/note;按 runner 分两个泳道:launchd(feed_poll、order_chain 高频 2 条)与 gpt(backup、blacklist、daily_report、order_daily、settlement、product_chain、product_clear、audit_sheet、list_new 共 9 条)。",
+   "【调度页】当天次序时间轴:product_chain 13:00 → blacklist 15:00(与 product_clear 同刻)→ audit_sheet 18:10 → list_new 20:00,标注『次序是硬约束,谁提前谁在拿昨天的数据做今天的判断且不报错』。",
+   "【调度页】手动工作流面板:不在 JOBS 里的工作流(跟卖、分配链、补采、自愈、一次性迁移与体检等)列表 + dry-run 试跑入口,与定时任务视觉区分。",
+   "【运行记录页】ops.runs 列表:started_at/workflow/status(running/success/failed 三色)/operator(launchd/manual/web/mcp)/耗时(finished_at-started_at)/summary 首行,点开看 summary 全文与 params jsonb;按 workflow/status/operator/时间过滤。",
+   "【运行记录页】卡死 running 提示:status='running' 且 started_at 过老的行(进程被杀不会有 finish 更新)单独标黄提示核查。",
+   "【运行记录页】退出码图例卡:0 成功 / 1 失败(看日志末尾,不要自动重跑)/ 2 工作流名写错(调度与 workflows/ 脱节)/ 3 flock 锁被占(不是失败不要重试,连着两次才值得追);注明退 3 的那步不写 ops.runs。",
+   "【运行记录页】按 workflow 聚合的失败率与时长趋势小图(数据源 ops.runs),回答『哪条链最近变慢/变红了』。"
+  ],
+  "gotchas": [
+   "退出码 3(锁占用)不是失败:后到的那次直接退出且『看起来一切正常』,前端绝不能把它画成红色,但连续两次退 3 值得追。",
+   "拿不到锁的那一步不写 ops.runs(_run_step 在 _record_start 之前就 return),串联中被跳过(skipped)的步骤也不写——运行记录页查不到这两类轮次是正常的。",
+   "feed_log 的 pending ≠ 排队中:它是『提交结局不确定』,系统永不自动补交(写操作永不自动兜底铁律),超 6 小时告警升级,必须人工核对后处理。",
+   "feed_poll -p feed_id=X 是纯诊断模式:只打印报错、补落 feed_item_errors 明细,不动 feed_items 状态、不回写飞书——2026-08-09 所有者曾因两条路径长得太像把它当成故障,界面必须显式区分。",
+   "feed 已到终态但个别 SKU 仍 INPROGRESS 时,feed_log 保持 submitted 留待下轮再查——这是设计,不是异常,别画成卡死。",
+   "feed_items.status='missing' 表示沃尔玛回执明细里查无此 SKU,是独立终态,不是错误码。",
+   "feed_log 唯一索引只拦在途行(pending/submitted);终态行被重占回 pending 后同载荷可再发,同一 (feed_type,store,payload_key) 会复用同一行——这张表不是『一行一次提交』的历史流水。",
+   "缺省即真跑(2026-08-16 改),空跑要显式 --dry-run;--execute 是空操作兼容别名;调度配置里永不出现 --dry-run(写了那条链每天空转且报成功)。",
+   "参数名不校验:打错的键被静默吞掉(catalog_sync -p stores=A085 会跑全部店不报错);除 ping_stores 用复数 stores= 外其余一律单数 store=。",
+   "同一条链绝不许 launchd 与 gpt 两个 runner 都挂:撞上后到的退 3 空跑一轮且报成功,tests/test_launchd.py 钉住这条——调度页两个泳道不能出现同名链。",
+   "runner 只决定谁按秒表,不决定跑什么:两边都是同一条 python cli.py、同一把 flock 锁、同一份 ops.runs。",
+   "串联链前一步不成功就不跑后面的,飞书通知整链只发一条,成功步骤压成一行、失败步骤铺全文;ops.runs.summary 里每步全文都在。",
+   "报错明细是标准动作不是排障动作(2026-08-09 定稿):数字错误码本身不含可修信息,description/field 才是线索,前端展示报错必须带 field 与描述。",
+   "v_feed_error_stats 等聚合视图零程序读者是设计如此(2026-08-14 盘点登记),专给人工与前端用,别因『代码不读』判死。",
+   "skills/ 目录是生成物(cli.py skill_export 从 schedule.JOBS 渲染),不要手改;launchd_install 只写 plist 不自动 load,上线分三批灰度。"
+  ]
+ },
+ {
+  "domain": "亚马逊采集(批次推送 / 增量摄取 / 失败台账 / 补采)",
+  "tables": [
+   {
+    "name": "ops.scrape_batches",
+    "purpose": "全项目共用的采集批次台账:每次推送一行,批次名前缀区分链路(wm-refresh-=维护全量重推、missing-=存量补采、brandfix-=品牌补采、audit_gap_*=审核补采、订单审核批次),记录采集侧 batch_id、ASIN 数、生命周期与 done/failed 计数",
+    "key_columns": "batch_name, batch_id, asin_count, status, done, failed, submitted_at, finished_at, note",
+    "states": "pushed / running / completed / failed / timeout"
+   },
+   {
+    "name": "ops.scrape_failures",
+    "purpose": "采集失败明细(逐 ASIN 真实原因):批次落定/超时时从采集侧 /api/batches/{batch_id}/failures 主动拉取落库——这些 ASIN 在增量流里根本不出现(没采到就没有可导出的记录),不拉就永远答不上『这个 ASIN 为什么没数据』;PK (batch_name, asin)",
+    "key_columns": "batch_name, asin, error_type, error_detail, status, retry_count, occurred_at, recorded_at",
+    "states": "error_type 封闭集 = 11 类 + unknown 兜底:network(网络请求失败) / timeout(请求超时) / blocked(被 Amazon 判异常流量拦截,403/503 非验证码) / captcha(验证码页) / parse_error(页面拿到但解析不出字段) / zip_switch_failed(切换配送邮编失败) / zip_not_effective(邮编多次重发未生效) / variant_offset(重定向到兄弟变体页) / session_not_ready(worker session 迟迟未就绪) / discover_failed(卖家店铺发现失败) / server_reject(server 二次校验判定不合法) / unknown(兜底)"
+   },
+   {
+    "name": "ops.v_scrape_failure_stats",
+    "purpose": "失败原因排行聚合视图(次数、影响 ASIN 数、最近时间、明细样本),零程序读者是设计如此——专门留给人工/AI/前端排查的聚合面,前端失败分布图可直接对着它画",
+    "key_columns": "error_type, 次数, 影响ASIN数, 最近, 明细样本",
+    "states": ""
+   },
+   {
+    "name": "catalog.snapshots",
+    "purpose": "采集观测层(追加不改):降级采集与真失败互补的另一半——『采到了但降级/不完整』落在这里的 outcome≠ok / completeness_ok=false,而『根本没采到』只在 ops.scrape_failures;每行带 scrape_params(邮编等)与 source_id 幂等键",
+    "key_columns": "asin, outcome, completeness_ok, price, stock_state, stock_count, shipping, scraped_at, scrape_params",
+    "states": "outcome: ok / not_found / blocked / parse_failed / stale;stock_state: in_stock / out_of_stock / unknown"
+   },
+   {
+    "name": "ops.audit_scrape",
+    "purpose": "订单审核链按邮编采集的防重台账:一个 (ASIN, 邮编) 一行,先落 pending 再调接口;error_type 单独成列供三档分流,first_requested_at 圈定『可重试一天』窗口",
+    "key_columns": "asin, zip, batch_name, state, error_type, requested_at, settled_at, attempts",
+    "states": "pending / done / failed"
+   },
+   {
+    "name": "ops.cursors",
+    "purpose": "增量摄取游标(name='product_ingest'):推进只认响应 next_cursor,空页原样不推进;409 cursor_below_retention 时硬停不动——是『数据流有没有断』的健康探针",
+    "key_columns": "name, cursor 值, 更新时间",
+    "states": ""
+   }
+  ],
+  "workflows": [
+   {
+    "name": "product_refresh",
+    "scheduled": true,
+    "dangerous": true,
+    "purpose": "在线产品全量重推采集(维护链的数据新鲜度源头);每天 13:00 product_chain 串联,wait=1 阻塞等采完,批次落定时顺手拉失败明细落 ops.scrape_failures",
+    "params": "wait, check, execute"
+   },
+   {
+    "name": "product_ingest",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "采集服务增量 → catalog.products / snapshots;全项目唯一直连采集服务取数的工作流(漏斗铁律),游标存 ops.cursors,空页不推进",
+    "params": "limit, max_pages, cursor"
+   },
+   {
+    "name": "scrape_missing",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "给库里缺亚马逊数据的产品补采(手动):缺数据三层(无标题/无类目/无类目ID)× 采集履历七分类,默认只推 never_tried/had_snapshot/retryable/retry_later 四类,hard_failed/cooling/ok_but_thin 不推;同日同类只建一个批次",
+    "params": "only, limit, check, execute"
+   },
+   {
+    "name": "brand_scrape",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "缺品牌的 C/E 类 ASIN(手动):推采集(不设邮编不截图)→ 等落定 → 借 product_ingest 泵摄取 → 品牌入账;三道防循环闸(非标准 ASIN 过滤 / 尝试台账不重推 / 入账防重)",
+    "params": "apply, wait, limit, timeout_min"
+   }
+  ],
+  "page_blocks": [
+   "在途批次看板:ops.scrape_batches 里 status IN (pushed, running) 的批次,按批次名前缀分链路泳道(wm-refresh- 维护 / missing- 补采 / brandfix- 品牌 / audit_gap_ 审核 / 订单审核),每行显示 done/failed/total 进度条 + 已耗时 vs 各自超时口径(维护 1h、补采 2h、订单 20min)——超时口径必须随前缀走,不能全页一个数",
+   "批次生命周期历史列表:ops.scrape_batches 按 submitted_at 倒序,列 batch_name / batch_id / asin_count / status(pushed→running→completed|failed|timeout 五态徽章)/ done / failed / finished_at / note;timeout 行要有提示『不是失败:已采到的照常进增量流』",
+   "失败原因分布图:ops.v_scrape_failure_stats(或 ops.scrape_failures 按 error_type 聚合),12 键封闭集按三档着色分组——RETRYABLE(network/timeout/blocked/captcha/zip_switch_failed/zip_not_effective/session_not_ready,采集侧自己会重试)/ RETRY_LATER(variant_offset,过 14 天冷却后重提批次才有意义)/ TERMINAL(parse_error/discover_failed/server_reject,重采一百次也一样,不值得重采)/ unknown 单列(不归档,人来判)",
+   "顽固失败 ASIN 榜:ops.scrape_failures 按 asin 聚合,连续多批采不到的 ASIN(= 该下架或人工看的信号),列 asin / 最近 error_type / 出现批次数 / 最近 recorded_at / error_detail 样本",
+   "补采漏斗块(scrape_missing 预览面):缺数据产品行总数拆三层(无标题/无类目/无类目ID,一行可同时缺多项)+ 采集履历七分类计数(never_tried / had_snapshot / retryable / retry_later / cooling / hard_failed / ok_but_thin),明确标出默认推的四类与不推的三类各自理由(hard_failed 多为 pt_backfill 建的 8 万下架空壳、cooling 未满 14 天冷却、ok_but_thin 重采大概率还缺)",
+   "冷却期队列:cooling 类 ASIN 列表(variant_offset / outcome=not_found 且最近证据不足 COOLDOWN_DAYS=14 天),显示距可重推还剩几天——数据源 ops.scrape_failures.recorded_at 与 catalog.snapshots.scraped_at(失败台账优先)",
+   "增量摄取健康块:ops.cursors 的 product_ingest 游标值与最近推进时间,加一个 409 cursor_below_retention 红色告警位(出现即硬停,需人工全量对账后 -p cursor=N 重置,绝不自动重试)",
+   "『这个 ASIN 为什么没数据』双查入口:输入 ASIN,一边查 catalog.snapshots(有行 → 看 outcome≠ok/completeness_ok=false 的降级采集),一边查 ops.scrape_failures(无快照行 → 看 error_type 真实失败原因)——两表互补不重叠",
+   "品牌补采块(brand_scrape 预览面):未入账候选总数 / 已到货待入账 / 缺品牌 / 其中标准 ASIN(非标准过滤数,闸①)/ 已推过采集不再推(闸②)/ 本轮将推数(单批上限 1000);数据源 blacklist 服务清单 + ops.dedupe 尝试台账",
+   "四条工作流的手动触发按钮区:product_refresh(危,调度中)/ product_ingest(调度中)/ scrape_missing(危,手动)/ brand_scrape(手动),危险的两条按钮必须先给 --dry-run 预览再放行真跑"
+  ],
+  "gotchas": [
+   "批次 completed 不等于库里有数据:中间还隔着增量导出 → product_ingest 两跳,批次状态只回答『还要不要等』,『这条数据到没到』必须另看 catalog.snapshots 里快照是否真出现——前端不能拿批次绿灯当数据到位",
+   "not_found 不是 error_type:采集侧 404 走成功路径(任务状态 done),只体现在 snapshots.outcome='not_found'——失败分布图里永远不会出现它,它藏在降级快照那一半",
+   "variant_offset 的 outcome 是 parse_failed,两列按设计就不一致,只能靠 error_type 认;classify 是失败台账优先于快照(失败的 ASIN 压根不产出快照行,有两者时失败是更新的证据)",
+   "timeout 状态不是失败:已采到的照常进增量流,只是这批不再等;同理 wait 超时的批次下次重跑工作流会自然收账——前端把 timeout 画成红色错误会误导运营重推烧配额",
+   "落定判据只看 tasks.open==0(failed 算终态),故意不看 screenshots.open——任务失败后那张图永远截不出来,拿截图当闸批次会永久卡死",
+   "查在途必须按批次名前缀圈自己的链:ops.scrape_batches 是全项目共用台账,用维护链 1 小时口径去看订单审核 20 分钟批次(或反过来)会把正常在途标成超时",
+   "unknown 三档都不进:它是兜底桶,采集侧新增 error_type 时会落 unknown 并告警,前端不要把它归进 TERMINAL『不值得重采』——拿不准别替人下终局结论",
+   "hard_failed(TERMINAL)默认不推是有账的:库里约 8 万空壳大头来自 pt_backfill 用删除历史建的占位行,推了纯烧配额;要试必须显式 -p only=hard_failed",
+   "冷却期 14 天不是可选项:variant_offset/not_found 成因非确定性(A/B 分桶、地域缓存),采集侧实测立刻重试结果一样,不冷却 = 每轮全额重推且命中率约等于 0",
+   "同日同类批次撞名(409 BatchExistsError)= 今天已推过,沿用既有 batch_id,不算错误——前端别把它渲染成失败",
+   "插队只有两档(0 与 10):order_audit / product_refresh / audit_gap_* 共用一条高优车道,product_refresh 十几万任务塞进去后订单小批次也只能排它后面;scrape_missing / brand_scrape / list_new 补采故意不插队",
+   "snapshots 的 null ≠ 0:stock_count/shipping/delivery_days 里 null=本次没采到、0=采到确实是 0,下游(含前端展示)一律禁止 or 0 兜底,免运费显示 0.0、没采到显示『未知』",
+   "409 cursor_below_retention 是硬停信号:告警 + 停止推进游标 + 转人工全量对账,绝不当普通错误重试——重试会静默跳过被裁掉的区间丢数据",
+   "brand_scrape 的顺序纪律:批次 completed 只说明采集侧干完,必须先摄取再入账,否则整批被冤枉成『还是没品牌』;缺品牌收不回来(页面已下架)属正常损耗不是故障",
+   "失败明细只认 batch_id 不认批次名:推送时没记下 batch_id 的批次永远查不出失败原因——台账里 batch_id 为空是一个值得亮出来的数据质量信号"
+  ]
+ },
+ {
+  "domain": "店铺/KPI/报表 + 运维基础设施(店铺凭证与连通、店铺日报 KPI、备份、调度安装)",
+  "tables": [
+   {
+    "name": "ops.store_kpi_daily",
+    "purpose": "店铺日报权威表,每店每天一行 32 列(对齐旧飞书「店铺KPI」),daily_report 采集写入、看板与日报都从它读",
+    "key_columns": "store, data_date, seller_name, store_status, payment_status, sales_status, items_online, items_in_stock, items_out_stock, orders_count, sales_amount, otd_rate…8项比率, payout, payout_date, no_hold, prev_payout",
+    "states": "sales_status: 可售/不可售(空=未知,不回填);store_status: 沃尔玛原值 ACTIVE/SUSPENDED/TERMINATED 等(空≠停用,判活性用 services.kpi.store_activity 三态 active/inactive/unknown);no_hold: true 仅当 ACTIVE 且 payout>=closing"
+   },
+   {
+    "name": "ops.runs",
+    "purpose": "运行记录,cli.py 每次执行写一行(所有工作流共用),是运行历史页与调度健康监控的数据源",
+    "key_columns": "workflow, started_at, finished_at, status, summary, operator",
+    "states": "status: running/success/failed;operator: launchd/manual/web/mcp"
+   },
+   {
+    "name": "ops.perf_problem_orders",
+    "purpose": "绩效问题订单永久累积台账(perf_problems 工作流写),日报 push 段的「今日新增问题订单 TOP5」从它读",
+    "key_columns": "first_seen_date, store, sales_order_no, indicator(带emoji), sub_category, accountable, tracking_no",
+    "states": ""
+   },
+   {
+    "name": "catalog.walmart_items",
+    "purpose": "沃尔玛在架现值(catalog_sync 产出);日报的在线商品/有库存/无库存三列直接从它算,不再调 API(省 60/min 配额)",
+    "key_columns": "store, sku, published_status, avail_qty, missing_since",
+    "states": "published_status=PUBLISHED 且 missing_since IS NULL 记为在架;avail_qty>0 有库存,NULL 或 0 无库存"
+   },
+   {
+    "name": "ops.rate_events",
+    "purpose": "跨进程稀缺桶限速事件(api/_client 写),店铺×桶维度的 API 配额消耗观测(feeds.post.*/prices.put/reports.request/insights 等)",
+    "key_columns": "client_id(店铺维度), bucket, called_at",
+    "states": ""
+   },
+   {
+    "name": "(文件) <DATA_ROOT>/cache/stores_snapshot.json",
+    "purpose": "店铺凭证本地快照(registry.paths.stores_snapshot_file,含密钥 chmod 600):services.stores.load_stores 读飞书凭证表成功后写快照,飞书故障时回退快照并告警——店铺列表页的兜底数据源",
+    "key_columns": "name, client_id, client_secret, proxy(每店固定出口代理URL)",
+    "states": ""
+   },
+   {
+    "name": "(飞书) 限额表 registry.RETIRE_LIMITS",
+    "purpose": "上下架配额唯一出处(services/store_limits.py 读):运营给每店定的下架配额、配送时长上限、整店清零标记、四区间改价倍率;list_new/maintenance/product_clear 三链共用",
+    "key_columns": "店铺, 下架限制(max_daily_retire), 配送时长限制(lead_limit, 默认7天), 库存特殊要求(=0 即整店清零), fba/fbm 四区间倍率",
+    "states": "单元格 0 或负数=视同没填回默认值(限额0=整店停摆不像人的本意);读不到=回默认值,两者必须分开"
+   },
+   {
+    "name": "(飞书 sheet) KPI 看板两页 KPI_BOARD_OVERVIEW / KPI_BOARD_HISTORY",
+    "purpose": "PG→飞书整表重写的展示投影:总览=每店最新一行全32列,历史=全店合一近90天;前端画看板可直接对标这两页的列与排序",
+    "key_columns": "店铺, 日期, …32 列中文表头(_BOARD_HEADER),首两列(店铺,日期)与旧表相反",
+    "states": ""
+   }
+  ],
+  "workflows": [
+   {
+    "name": "daily_report",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "沃尔玛店铺日报:默认全链 kpi(含影刀)→ 看板两页 → 真发飞书日报;调度 gpt 每日 06:40(KPI 窗口锚中国时间 06:30)",
+    "params": "phase(all/kpi/board/push/settle_debug), store, yingdao(0/input/1,默认1), days(看板历史窗口,默认90), push(默认1真发)"
+   },
+   {
+    "name": "ping_stores",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "端到端验收:读凭证表 → 每店经固定代理换 token 并调只读端点 /v3/token/detail → 汇总每店连通结果(凭证状态的实测判据)",
+    "params": "stores(逗号分隔店名,缺省全部)"
+   },
+   {
+    "name": "backup",
+    "scheduled": true,
+    "dangerous": false,
+    "purpose": "中心库 pg_dump -Fc 备份:先写 .part → pg_restore --list 校验 → 原子换名 → 按保留天数清理(只碰自家命名模式);调度 gpt 每日 02:00",
+    "params": "days(保留天数,默认14,最小1)"
+   },
+   {
+    "name": "kpi_history_import",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "一次性:旧「店铺KPI」飞书历史 → ops.store_kpi_daily;ON CONFLICT DO NOTHING 绝不覆盖已有行,预览模式先看未映射表头与重叠日期对比",
+    "params": "apply(缺省预览), store(单店 sheet 标题)"
+   },
+   {
+    "name": "cleanup_history_import",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "一次性:旧问题商品三笔历史入库(error_items 时间线折叠→product_events、seen_sku_categories、brand_cache);①擦净重灌②③DO NOTHING",
+    "params": "apply(缺省预览), seen(JSON绝对路径), brand(JSON绝对路径)"
+   },
+   {
+    "name": "launchd_install",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "生成高频链(runner=launchd:feed轮询+订单链)的 launchd plist,装完就是真调度;只写文件不自动 load,load 命令按批次1/2/3灰度打印由人执行",
+    "params": "batch(1/2/3灰度批次), dest(写到别处先看), uninstall(只打印卸载命令), execute"
+   },
+   {
+    "name": "skill_export",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "从 registry/schedule.JOBS 渲染智能体定时任务技能包(runner=gpt 的每日/每周链):SKILL.md 总纲+每任务一份提示词,产物进 git;生成后仍需人工逐条注册",
+    "params": "dest(缺省仓库根), dry_run(经 --dry-run 透传)"
+   },
+   {
+    "name": "db_init",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "执行 refdata/schema.sql 建五 schema(catalog/listing/orders/ops/audit,幂等)+ 可选创建 readonly 只读角色(设 READONLY_DB_PASSWORD 才建,供 Metabase/NocoDB/MCP)",
+    "params": "(无)"
+   },
+   {
+    "name": "init_data_root",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "初始化 <DATA_ROOT>(默认 ~/walmart_data,WALMART_DATA_ROOT 覆盖)目录结构与 .env 模板(幂等),密钥永不进 git",
+    "params": "(无)"
+   }
+  ],
+  "page_blocks": [
+   "店铺列表页:全店一行一卡,排序必须按 services.stores.sort_key(字母开头→数字开头→中文,组内前缀+数字自然序),列含 店铺名/凭证状态徽标/代理配置/最近连通结果/最新 store_status 与 sales_status/在架数;数据源:飞书店铺凭证表(兜底 stores_snapshot.json)+ ops.store_kpi_daily 每店最新行 + catalog.walmart_items 计数",
+   "凭证状态徽标(店铺列表与详情共用):三种被过滤原因分开显示——「启用」为否 / ClientId 空或0 / 代理三项(类型/IP/端口)任一缺——再叠加 ping_stores 实测结果(ok / 换token失败 / token-detail 非200);数据源:凭证表过滤逻辑 services/stores._normalize + ops.runs 里 ping_stores 的 summary",
+   "单店详情-KPI 卡组:ops.store_kpi_daily 最新行 32 列分四组——状态组(store_status/payment_status/sales_status/卖家名称)、商品组(在线商品/有库存/无库存)、订单组(昨日出单/昨日销售额,24h 窗口锚中国时间 06:30)、绩效组(准时送达90%/取消率/有效追踪99%/卖家回复率95%/退款率/差评率/退货率/未收到 八项比率)",
+   "单店详情-结算卡:账期销售额/佣金/退款金额/期末余额/迄今备用金/回款/回款日/收款方/结算周期/无Hold/上期回款(严格-14天账期无则0);数据源 ops.store_kpi_daily 结算列",
+   "单店 KPI 历史趋势:ops.store_kpi_daily 单店近 90 天(对齐飞书看板历史页口径,店内按日期降序连成一段)",
+   "单店上下架配额块:飞书限额表(RETIRE_LIMITS)该店行——下架/删除配额、配送时长上限(未配置显示默认7天)、库存特殊要求(=0 标红「整店清零」)、四区间改价倍率;标注「0或负=视同没填回默认」",
+   "单店 API 配额观测块:ops.rate_events 按 bucket 汇总该店稀缺桶近48h调用数(feeds.post.*/prices.put/reports.request/insights)",
+   "日报入口页:daily_report 分阶段运行按钮(全链/仅kpi/仅board/仅push,含 yingdao 与 push 开关,默认值=真跑真发)+ 最近一次日报内容预览(全店合计、店铺状态变化 diff、今日新增问题订单 TOP5,后者读 ops.perf_problem_orders first_seen_date=当日)",
+   "运行记录页:ops.runs 列表(workflow/status running·success·failed/operator launchd·manual·web·mcp/时长/summary 展开),支持按 workflow 过滤——所有 66 条工作流共用此页",
+   "调度总览块:registry/schedule.JOBS 只读投影(label/时间/批次1-3/runner launchd·gpt/note),并标注「同一条链严禁两 runner 同挂」",
+   "运维工具页:backup(显示 backups/walmart_data_YYYYMMDD_HHMMSS.dump 文件列表与保留天数)、ping_stores、launchd_install(危险标记,强制先 dry-run 预览 plist)、skill_export、db_init、init_data_root、kpi_history_import 与 cleanup_history_import(一次性导入,预览→apply 两步)"
+  ],
+  "gotchas": [
+   "店铺排序严禁用 SQL ORDER BY:PG collation 在主排序级忽略中文字符,「谭总1」会被当「1」排;必须用 services.stores.sort_key(字母→数字→中文,前缀+数字自然序)",
+   "「查无此店」与「在册但被过滤(启用为否/缺ClientId/缺代理)」必须分开显示——混为一谈会让人去凭证表找一个明明在那儿的店",
+   "指定店名有一个落空就整体报错,不静默少跑:给三家跑两家而摘要报满绿,比直接失败更难发现",
+   "sales_status 与 seller_name 规则相反:卖家名称允许 stale 跨日延续,销售状态绝不回填旧值(旧事故:昨天状态传染成今天);非 ACTIVE 店推导为「不可售」是本轮推导不是回填",
+   "store_status 为空是「未知」不是「停用」:结算响应换形状就是空串,把空当停用会静默把一半店标成不可售——判不准就判活",
+   "payout 业务规则:非 ACTIVE 强制 0、负值归 0;no_hold 仅 ACTIVE 且 payout>=closing 才 true;prev_payout 严格取 -14 天账期无则 0",
+   "缺省即真跑(2026-08-16 定稿):daily_report 不带参数=含影刀+真发日报,前端按钮默认值必须按这个语义;空跑走 -p push=0 / --dry-run,不能想当然默认预览",
+   "日报推送状态不许自我美化:webhook 未配置时一个字节都没发出去,必须显示「未发出」而非「已推送(webhook未配置)」——摘要是人眼闸门",
+   "在线商品三列来自 catalog.walmart_items(PG 复用)不是实时 API;昨日出单/销售额当前处双算对拍期,API 现拉仍是权威,库算值只记差异",
+   "限额表单元格填 0 或负数=视同没填回默认值,不是整店停摆;真正整店清零走「库存特殊要求=0」显式路径,两者语义前端要分开呈现",
+   "配送时长上限两个消费方口径不同:上架超限=不上架,维护超限=库存写0——同一列两种动作,页面文案不能混写",
+   "launchd 与 gpt 两个 runner 永不许同挂同一条链:撞锁后到的退出码 3 空跑一轮而且报「成功」;launchd_install 只管 runner=launchd 的高频链,其余归 skill_export",
+   "launchd_install 只写 plist 不自动 load(分三批灰度,批二前必须先停旧 KPI 与旧订单同步两条同停);skill_export 生成完也没生效,需人工逐条注册",
+   "kpi_history_import 绝不覆盖已有行(DO NOTHING);cleanup_history_import 的 ①笔是擦净重灌——两个导入的幂等语义不同,前端提示不能套同一句",
+   "影刀数据不新鲜(>24h)时销售状态留空但卖家名称仍可用;影刀输入清单只含本轮真跑到的店,单店跑不会触发全店抓取"
+  ]
+ },
+ {
+  "domain": "类目映射(亚马逊类目 → 沃尔玛 PT,ID 锚定)",
+  "tables": [
+   {
+    "name": "audit.walmart_category_map",
+    "purpose": "映射主表(PG 是权威,审核链 L1 ②级直出闸硬筛 confidence='高' 直接吃它;主键 amazon_category+walmart_product_type)",
+    "states": "confidence: 高/中/低",
+    "key_columns": "amazon_category, walmart_product_type, browse_node_id, confidence, match_type, rank_in_pt, notes, source_batch, synced_at"
+   },
+   {
+    "name": "audit.category_map_suggestions",
+    "purpose": "建议与人工核对工作台:catmap_mine 挖掘分桶 + catmap_suggest LLM 建议都落这里,catmap_fix/promote 处理后改状态(主键 amazon_category,node 无代表路径时用 'node:<id>' 兜底标签)",
+    "states": "mined_trusted/mined_review/mined_mixed/map_conflict/map_ambiguous(来自 catmap_mine)/ok/unknown/excluded/no_candidate/llm_failed(来自 catmap_suggest)/promoted(catmap_promote 已升级)/fixed(catmap_fix 已修)",
+    "key_columns": "browse_node_id, amazon_category, suggested_pt, status, confidence, support_count, product_count, pt_distribution, sample_asin, sample_title"
+   },
+   {
+    "name": "audit.amazon_taxonomy",
+    "purpose": "亚马逊类目节点主档(node_id 主键;路径/父/深度列只是「代表路径」取值,不是唯一真相)",
+    "states": "source: leaves/verified_added_paths/unverified_new_nodes/derived_products",
+    "key_columns": "node_id, name, path, depth, is_leaf, root_name, source, imported_at"
+   },
+   {
+    "name": "audit.amazon_node_paths",
+    "purpose": "父子路径关系表(browse tree 是 DAG,同一 node 多父多路径各一行;走父链一律查它;parent_node_id='' 表示根级)",
+    "states": "",
+    "key_columns": "node_id, parent_node_id, full_path, depth, root_name, source"
+   },
+   {
+    "name": "audit.category_path_alias",
+    "purpose": "路径别名折叠表(catmap_align 产出,只做查询侧折叠不改映射表;审核 ②级精确匹配未命中时经它折到 canonical 再查)",
+    "states": "",
+    "key_columns": "path, canonical_path, score, aligned_at"
+   },
+   {
+    "name": "catalog.products(相关列)",
+    "purpose": "实证数据源:browse_node_id/browse_node_chain(ID 链)/amazon_category(面包屑)/walmart_pt+pt_source(实证票,只认 walmart_confirmed)",
+    "states": "",
+    "key_columns": "browse_node_id, browse_node_chain, amazon_category, walmart_pt, pt_source"
+   },
+   {
+    "name": "audit.walmart_pt_meta",
+    "purpose": "PT 字典闸:建议/映射指向的 PT 必须在字典里否则是死映射;导出时 pt_alive 即据此算",
+    "states": "",
+    "key_columns": "walmart_product_type, walmart_category, walmart_ptg, access_state, zh_can_do"
+   }
+  ],
+  "workflows": [
+   {
+    "name": "catmap_mine",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "从产品实证数据挖类目映射(纯 SQL 零 LLM;可反复跑),promote=1 时按档位(高/中/低)写进映射表,升档自动只升不降",
+    "params": "min_support(默认5), min_dominance(默认0.8), min_write_dominance, promote, key(node|path)"
+   },
+   {
+    "name": "catmap_gap",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "类目映射缺口清单:树×产品×映射三方对账,分 A/B/C/D 四桶按产品数降序(纯 SQL 只读)",
+    "params": "limit(默认30), only(如 unmapped_with_products / not_in_tree)"
+   },
+   {
+    "name": "catmap_align",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "类目路径别名对齐(纯 SQL+纯函数零 LLM):把精确匹配不到的产品路径折回映射表等价路径,产出六态只有 verified/aligned 落库",
+    "params": "apply"
+   },
+   {
+    "name": "catmap_suggest",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "类目映射缺口批量出建议(LLM,按路径去重,一路径只调一次 LLM);⛔ 批量补 B 桶已被所有者裁决不排期",
+    "params": "limit(默认50), refresh"
+   },
+   {
+    "name": "catmap_promote",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "把 LLM 建议(status='ok')升级进映射表;缺省写「中」置信只进候选,写「高」必须 as=高 配 paths 点名",
+    "params": "execute, dry_run, limit(默认500), as(默认中), paths"
+   },
+   {
+    "name": "catmap_fix",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "按 node 定点修正映射冲突:旧高置信行降'低'留痕不删,插实证 PT 新行;nodes 必填无批量默认值",
+    "params": "nodes(必填,逗号分隔或 all_conflicts), execute"
+   },
+   {
+    "name": "catmap_prune",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "清掉映射表里指向不存在 PT 的行(缺省按官方 MP_ITEM spec 判、缺省真删;keep=1 改为降级留痕)",
+    "params": "execute, dry_run, keep, sentinel(=drop 连哨兵行一起清), by(spec|meta)"
+   },
+   {
+    "name": "catmap_export",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "映射明细投影到飞书(库→飞书整表重写,给人看的镜子);缩量超 2% SHRINK_TOLERANCE 自动停手",
+    "params": "execute, dry_run, pt, node_only, allow_shrink"
+   },
+   {
+    "name": "catmap_import",
+    "scheduled": false,
+    "dangerous": true,
+    "purpose": "把飞书映射明细补回库(飞书→库,缺省只增不改 ON CONFLICT DO NOTHING;2026-08-17 覆盖事故的补救路径)",
+    "params": "execute, dry_run, update(=1 覆盖已有行)"
+   },
+   {
+    "name": "taxonomy_import",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "亚马逊类目树入库(ID 主键,按内容认段;预览强制先报文件体检+三方 JOIN 命中率,重灌只删文件来源行)",
+    "params": "file(必填), apply"
+   },
+   {
+    "name": "taxonomy_derive",
+    "scheduled": false,
+    "dangerous": false,
+    "purpose": "从产品自有数据(ID 链×面包屑右对齐 zip)反推树外 node(C 桶),零采集;中间位对拍一致率低于 min_agree 拒绝写入",
+    "params": "apply, min_agree(默认0.9)"
+   }
+  ],
+  "page_blocks": [
+   "覆盖率总览条:树 node 数 / 产品侧 node 数 / 映射 node 数 / 产品侧已映射比例(当前 64.4%,10,011/15,538),数据源 audit.amazon_taxonomy + catalog.products + audit.walmart_category_map(即 catmap_gap 的 summary SQL)",
+   "四桶缺口卡片(catmap_gap):每桶给 node 数+产品件数+去向按钮——A 有实证 PT→跑 catmap_mine;B 无实证 PT→标注「所有者裁决不排期,审核链 LLM 兜底」;C 树里没有→导出补抓清单(only=not_in_tree);D 我们没货→灰显不处理",
+   "映射表浏览器:audit.walmart_category_map 按 browse_node_id / 路径 / PT 搜索,列出 confidence(高/中/低徽章)、match_type、pt_alive(PT 不在 pt_meta 字典=死映射红标)、notes、source_batch;顶部常驻 map_ambiguous 警示条(同 node 多条高置信不同 PT,②级直出已失明,当前 8 个 node 等人工裁剪)",
+   "人工核对工作队列:audit.category_map_suggestions 按 status 分栏——map_conflict(冲突,展示旧映射 PT vs 实证 PT+票数→转 catmap_fix)、mined_review(2~4 票待核 224 条)、mined_mixed(分流,展开 pt_distribution 全分布条形)、ok(LLM 建议→转 catmap_promote)、no_candidate/unknown(最需人工);这正是文档未决项「②段人工核对没有载体」的补位",
+   "挖掘控制台(catmap_mine):min_support / min_dominance / key 参数滑块 → 预览分桶计数(可信/待核/分流/冲突/自相矛盾)与分流优势度分档,确认后 promote=1 写入;旁边画档位流转图:低→中→高只升不降,降档只能走 catmap_fix",
+   "类目树维护面板:taxonomy_import 文件体检表(每段行数/是否解析/meta 自报数差)+ 三方 JOIN 命中率对比上次(产品侧 82.2% / 映射表侧 99.9% 不得降)→ apply;taxonomy_derive 对拍一致率仪表(叶位/中间位分开,中间位 <0.9 拒绝写入)→ apply;数据源 audit.amazon_taxonomy / audit.amazon_node_paths",
+   "别名对齐面板(catmap_align):六态分布(verified/aligned 落库,low_score/pt_conflict/ambiguous 列成待人工清单,no_match 归缺口),数据源 audit.category_path_alias",
+   "飞书同步区:catmap_export(库→飞书,显示骤缩护栏状态:缩量>2% 停手)与 catmap_import(飞书→库,只增不改/update=1 覆盖)两个方向按钮 + 各自上次 synced_at;明示「PG 是权威,飞书是镜子,在飞书改格子会被下次导出覆盖」",
+   "清理操作区(catmap_prune):按 spec 判死映射清单预览(spec 有准入无 9 个汽配=该补不该删;准入有 spec 无 66 个=该删)+ keep/sentinel 开关;所有危险工作流(fix/prune/promote/import)统一「dry-run 预览 → 人眼确认 → 真跑」两步交互"
+  ],
+  "gotchas": [
+   "缺省即真跑(2026-08-16 改制):危险工作流不带参数就是真改库,空跑要显式 --dry-run,--execute 只是空操作兼容别名——前端按钮必须默认走 dry-run 预览再确认",
+   "键是 browse_node_id 不是类目名:Amazon 三套名称(slug/面包屑/Best Sellers)互不一致会漂,ID 不会——界面搜索与展示以 node_id 锚定,路径只是「代表路径」展示用",
+   "PG 是权威、飞书「映射明细」只是镜子(所有者定稿 2026-08-17):在飞书改一个格子不影响任何判定,下次 catmap_export 就被覆盖;改映射必须走 mine/suggest/fix/align 链",
+   "catmap_export 整表重写曾一把误删 1,847 行映射(2026-08-17 生产事故),现在缩量超 2% 自动停手,先跑 catmap_import 补回再导——前端要把护栏状态显式画出来",
+   "升档自动、降档必须人工:自动降档会让 ②级直出对整个类目静默失效且没人发现;降档只走 catmap_fix(旧行降'低'留痕,永不删——旧映射是历史证据)",
+   "只有 confidence='高' 能直出不经 LLM;中/低只是喂给 LLM 的候选参考——界面不要把中/低渲染成「待修复的错误」,它们是设计内的正常档位",
+   "map_ambiguous(同 node 挂多条高置信不同 PT)会让 ②级直出对该 node 失明且全程无报错——必须在映射表浏览器里高亮,机器只报不写,裁剪走 catmap_fix;所有者曾否掉「两边摊开供选的小工具」提案,画布方案需重新获批",
+   "B 桶(有产品无映射无实证 PT)不排期(所有者原话「不用补,以后真用上了自然会审核」):真实收益只有约 1.37 万件而非十几万件——界面不应引导批量跑 catmap_suggest",
+   "catmap_mine 只数 pt_source='walmart_confirmed' 的实证票(防 LLM 自我印证闭环),存量 pt_source 为 NULL 的行不参与投票,所以票数看着偏少是正常的",
+   "哨兵行「无对应Walmart PT」不是垃圾是信息(resolve_pt ⓪级读它给 LLM 留线索),投影表里表现为空 Category/PTG 看着像空行——prune 缺省不动它,前端别当脏数据渲染",
+   "browse tree 是 DAG 不是树:同一 node 多父多路径,走父链一律查 amazon_node_paths,按 node_id 去重展示会静默丢关系",
+   "catmap_prune 缺省真删且判据是官方 MP_ITEM spec 文件而非 pt_meta 准入表——两个方向都会判错:spec 有准入无(9 个汽配)该补不该删,准入有 spec 无(66 个)才该删",
+   "catmap_fix 的 nodes 参数必填、没有批量默认值(要么逐个列 node,要么显式 all_conflicts)——表单不要给隐式全选",
+   "整个域 11 条工作流全部手动、无一进定时调度(registry/schedule.py 明示 catmap_* 属手动清单)——页面是操作台不是监控台",
+   "飞书表头列序(CATMAP_SHEET_HEADER)一个字不许动:所有者的筛选/公式按列位置写死,列一挪全废且不报错;catmap_import 表头对不上直接停"
+  ]
+ }
+]

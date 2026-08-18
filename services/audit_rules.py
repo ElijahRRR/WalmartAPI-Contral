@@ -331,8 +331,10 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
 
 
 def audit_one(product, ctx: AuditContext, conn=None, *,
-              run_l3: bool = True, run_l4: bool = False) -> AuditOutcome:
-    """输入:ProductInfo + 上下文(+连接与层开关)→ 输出:AuditOutcome。
+              run_l3: bool = True, run_l4: bool = False,
+              only_l0: bool = False) -> AuditOutcome | None:
+    """输入:ProductInfo + 上下文(+连接与层开关)→ 输出:AuditOutcome;
+    only_l0 且 Phase0 未命中时返回 **None**(见下)。
 
     批次 C 全链:phase0 → L1(实证→哨兵→映射→候选+rerank)→ L2 → [L3 → L4]。
     conn=None 时退化为批次 B 形态(L1 第三级与 L3/L4 需要查库/调 LLM,全跳过,
@@ -341,6 +343,14 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
     L4 仅 outcome pass 且开关开,只认 reject(默认关,批复 #2)。
     """
     p0 = audit_phase0.check(product, ctx)
+    if only_l0 and not p0.blocked:
+        # 只跑 L0(stages=L0,所有者 2026-08-18):纯查库、零 LLM。
+        # 未命中 ⇒ 返回 None = **不落结论**:不写 runs、不动 products、
+        # 不盖规则版本 —— 截断的链没资格发 pass/pending(不完整审核
+        # 绝不当通过,与「任一道给不出确定答案一律待人工」同一条纪律)。
+        # 用途:配合 rerule 零 LLM 翻新黑名单历史行 —— 仍命中的重判
+        # (拿到新版本的理由映射),不再命中的保持原判、不被"复活"。
+        return None
     if p0.blocked:
         # 旧仓字面量三件套照迁(orchestrator.py:340-343):score_final 硬写 0
         outcome = AuditOutcome(

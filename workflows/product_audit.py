@@ -9,6 +9,10 @@
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
+  python cli.py product_audit -p stages=L0                 # 只跑 Phase0:纯查库零 LLM;
+                                                    # 未命中的不落结论不盖版本(不"复活")
+  python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
+                                                    # 零 LLM 翻新黑名单历史行的标准姿势
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
@@ -176,7 +180,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
-                 "l3", "l4", "workers", "adopt_only", "from_sheet",
+                 "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
                  "gap_wait"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
@@ -851,6 +855,15 @@ def run(params: dict) -> str:
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
     run_l4 = str(params.get("l4", "")).strip().lower() == "on"
+    # stages=L0:只跑 Phase0,纯查库零 LLM(所有者 2026-08-18)。
+    # 命中 → 正常 reject 落库;未命中 → 不落结论不盖版本(见 audit_one)。
+    # 值域先只放 L0 —— L1 起每一层都可能要 LLM,"指定到哪层"再扩时
+    # 必须逐层想清楚"没走完的行算什么",不预开口子。
+    stages = str(params.get("stages", "")).strip().upper()
+    if stages not in ("", "L0"):
+        raise ValueError(f"stages 只支持 L0(收到 {stages!r});"
+                         f"L3/L4 已有独立开关 -p l3=off / -p l4=on")
+    only_l0 = stages == "L0"
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
@@ -934,6 +947,7 @@ def run(params: dict) -> str:
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
+        l0_untouched = 0
         done_n = 0
         t0 = time.monotonic()
         todo = []
@@ -963,7 +977,8 @@ def run(params: dict) -> str:
                 c = pool.get()
                 try:
                     return audit_rules.audit_one(product, ctx, c,
-                                                 run_l3=run_l3, run_l4=run_l4)
+                                                 run_l3=run_l3, run_l4=run_l4,
+                                                 only_l0=only_l0)
                 finally:
                     pool.put(c)
 
@@ -1019,6 +1034,10 @@ def run(params: dict) -> str:
                     asin = futs[fut]
                     try:
                         outcome = fut.result()
+                        if outcome is None:     # stages=L0 未命中:保持原结论
+                            l0_untouched += 1
+                            consec_errors = 0
+                            continue
                         buf.append(outcome)
                         bad = _flush()
                         if bad:
@@ -1086,9 +1105,15 @@ def run(params: dict) -> str:
     lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
     lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
               f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
-              f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
+              f"{',只跑L0' if only_l0 else ''}"
+              f"{',L3关' if not run_l3 and not only_l0 else ''}"
+              f"{',L4开' if run_l4 else ''}):"
               f"候选 {len(rows)},判定 {judged}"
               f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
+    if only_l0:
+        lines.append(
+            f"stages=L0:Phase0 未命中 {l0_untouched} 个**保持原结论**"
+            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
     l1s = audit_rules.audit_l1_llm.STATS
     if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
         lines.append(f"L1 rerank:调用 {l1s['llm_called']}"

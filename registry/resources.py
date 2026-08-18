@@ -540,7 +540,15 @@ PT_TEMPLATE_SHEET = Spreadsheet(
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-17.1"
+AUDIT_RULES_VERSION = "c.2026-08-18.1"
+# c.2026-08-18.1  理由映射:黑名单中心三码(lark_blacklist_asin/seller/
+#                 amazon_cat)→ 政策 None(内部决策,不挂 [政策:General-Use
+#                 Products] 兜底尾巴)。判定本身零变化(仍 reject),只影响
+#                 audit_reason 与 F 列文案。历史行翻新(零 LLM,L0 短路):
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_asin
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_amazon_cat
+#                 ⚠ 别拿它跑 force_rerun —— 那是全量。
 # c.2026-08-17.1  Phase0 规则 2 摘掉批次 B 新增的 4 个 Amazon 顶级大类
 #                 (裁决 A,见 docs/audit_migration_plan.md 九节补批复)。
 #                 ⚠ 别拿它跑 force_rerun —— 那是**全量**(库里没有一条是新版本)。

@@ -9,6 +9,8 @@
 
   0.  verdict != 'reject'(含 outcome 为 None)          → None(pass/pending 恒为 None)
   1.  hits 中 rule_code ∈ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
+  1.2 hits 含黑名单中心三码(lark_blacklist_asin/seller/amazon_cat)→ **None**
+      (内部黑名单决策,不对应任何 Walmart 政策;2026-08-18 修,此前漏到 4g)
   2.  l3 存在且 l3.verdict=='reject' 且归一化后的 reason_category 非 None → 归一化值
   1.5 hits 中 rule_code ∉ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
   3.  l4 存在且 l4.verdict=='reject' → 第一条 confidence=='high' 的 dict issue:
@@ -175,6 +177,20 @@ def compute_final_reason(
             policy = (h.detail or {}).get('walmart_policy')
             if policy:
                 return policy
+
+    # (1.2) 黑名单中心三码(ASIN / 卖家 / 亚马逊类目)→ **None,不挂政策**。
+    # 这是我们自己的内部黑名单决策,不对应任何一条 Walmart 政策;此前无分支
+    # 会一路漏到 4g 兜底,F 列写出「ASIN 在黑名单中心 [政策:General-Use
+    # Products]」这种自相矛盾的话(所有者 2026-08-18 实遇,B0F2ZS3M31 一张
+    # 床头柜)。拿兜底政策去申诉口径也是错的 —— 没有政策就是没有政策。
+    # ⚠ 品牌黑名单(phase0_brand_blacklist)不在此列:品牌拉黑多因知产风险,
+    # 4f 归 Intellectual Property 是既定口径,别顺手改。
+    # 这三码都是 Phase0 短路(单 hit 即终局),不会与政策规则同轮并存。
+    _INTERNAL_BLACKLIST = {'phase0_lark_blacklist_asin',
+                           'phase0_lark_blacklist_seller',
+                           'phase0_lark_blacklist_amazon_cat'}
+    if any(h.rule_code in _INTERNAL_BLACKLIST for h in outcome.all_hits):
+        return None
 
     # (2) L3 语义判 (硬规则没给时, L3 最准)
     if outcome.l3 and outcome.l3.verdict == 'reject':

@@ -31,6 +31,29 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 
 每条任务的完整提示词在 `tasks/<任务名>.md`,注册定时任务时**整篇粘进去**。
 
+## ⚠ 跑之前:你得能写仓库**外面**那个目录
+
+本项目的状态目录不在仓库里,而是仓库的**同级**目录 `/Users/nextderboy/Projects/WalmartAPI_data` —— 锁、日志、备份、报告全在那儿。
+
+**沙箱默认只放行工作区(= 仓库目录),于是每条工作流在拿运行锁的第一步就死**,报 `PermissionError: [Errno 1] Operation not permitted: …/locks/<名>.lock`。
+
+⚠ 这个报错**长得像权限问题但不是**:文件属主和 mode 都是对的,errno 是 **EPERM(1)** 而不是 EACCES(13)。所以**别去 chmod/chown**,也**别** chmod 777、别改 `WALMART_DATA_ROOT`、别建软链接 —— 那几样都是把状态搬到别处,只会让两份状态各写各的。
+
+正确做法是给沙箱按目录授权。Codex 走项目级 `/Users/nextderboy/Projects/WalmartAPI-Contral/.codex/config.toml`(已在仓库里,拉下来即生效):
+
+```toml
+sandbox_mode = "workspace-write"
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["/Users/nextderboy/Projects/WalmartAPI_data"]
+```
+
+**跑第一条任务之前先自检**(能写 = 一切就绪;被拒就先修沙箱,别急着注册):
+
+```bash
+touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && echo OK
+```
+
 ## 这两条不进你的定时任务表,但**得有人管**
 
 | 任务 | 时间 | 跑什么 |

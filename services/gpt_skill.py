@@ -89,6 +89,18 @@ def cron_utc(job: dict) -> str:
     return f"{m} {h} * * {w}"
 
 
+def data_root_str() -> str:
+    """输入:无 → 输出:生产机的 DATA_ROOT 绝对路径(字符串)。
+
+    ⚠ **从 `schedule.REPO_DIR` 推,不调 `paths.data_root()`**:技能包可能在
+    另一台机器(容器/云端会话)上渲染,那里 `paths.data_root()` 算出来的是
+    **那台机器**的路径,写进给生产机看的提示词里就是错的。
+    推导规则与 `registry/paths.data_root` 同款:仓库的同级目录 WalmartAPI_data。
+    """
+    import posixpath
+    return posixpath.join(posixpath.dirname(schedule.REPO_DIR), "WalmartAPI_data")
+
+
 def _logs_snippet() -> str:
     """日志目录**问代码要**,不要在文档里写死。
 
@@ -255,6 +267,38 @@ def skill_md() -> str:
         "",
         "每条任务的完整提示词在 `tasks/<任务名>.md`,注册定时任务时**整篇粘进去**。",
         "",
+        "## ⚠ 跑之前:你得能写仓库**外面**那个目录",
+        "",
+        f"本项目的状态目录不在仓库里,而是仓库的**同级**目录 `{data_root_str()}`"
+        " —— 锁、日志、备份、报告全在那儿。",
+        "",
+        "**沙箱默认只放行工作区(= 仓库目录),于是每条工作流在拿运行锁的"
+        "第一步就死**,报 `PermissionError: [Errno 1] Operation not permitted: "
+        "…/locks/<名>.lock`。",
+        "",
+        "⚠ 这个报错**长得像权限问题但不是**:文件属主和 mode 都是对的,"
+        "errno 是 **EPERM(1)** 而不是 EACCES(13)。所以**别去 chmod/chown**,"
+        "也**别** chmod 777、别改 `WALMART_DATA_ROOT`、别建软链接 —— "
+        "那几样都是把状态搬到别处,只会让两份状态各写各的。",
+        "",
+        f"正确做法是给沙箱按目录授权。Codex 走项目级 `{schedule.REPO_DIR}"
+        "/.codex/config.toml`(已在仓库里,拉下来即生效):",
+        "",
+        "```toml",
+        "sandbox_mode = \"workspace-write\"",
+        "[sandbox_workspace_write]",
+        "network_access = true",
+        f"writable_roots = [\"{data_root_str()}\"]",
+        "```",
+        "",
+        "**跑第一条任务之前先自检**(能写 = 一切就绪;被拒就先修沙箱,"
+        "别急着注册):",
+        "",
+        "```bash",
+        f"touch {data_root_str()}/locks/_probe && "
+        f"rm {data_root_str()}/locks/_probe && echo OK",
+        "```",
+        "",
         "## 这两条不进你的定时任务表,但**得有人管**",
         "",
         "| 任务 | 时间 | 跑什么 |",
@@ -343,6 +387,24 @@ def register_md() -> str:
         "",
         f"请把下面 {len(js)} 条定时任务一次性注册好。这几条是沃尔玛业务链的"
         "每日/每周调度,注册完之后由你到点触发。",
+        "",
+        "## 第 0 步之前:先确认你能写仓库**外面**那个目录",
+        "",
+        f"本项目的状态目录是仓库的**同级**目录 `{data_root_str()}`(锁/日志/备份/"
+        "报告都在那儿)。默认沙箱只放行工作区,于是每条工作流在拿运行锁的第一步"
+        "就死,报 `PermissionError: [Errno 1] Operation not permitted`。",
+        "",
+        "**注册之前先自检**(30 秒,能省掉一整天的空转):",
+        "",
+        "```bash",
+        f"touch {data_root_str()}/locks/_probe && "
+        f"rm {data_root_str()}/locks/_probe && echo OK",
+        "```",
+        "",
+        f"被拒就先修沙箱:项目级 `{schedule.REPO_DIR}/.codex/config.toml` 已在仓库里"
+        "(`sandbox_workspace_write.writable_roots` 指向 DATA_ROOT),拉下来即生效。",
+        "⚠ **别用 chmod 777 / 改 WALMART_DATA_ROOT / 建软链接**绕过去 —— "
+        "那几样都是把状态搬到别处,只会让两份状态各写各的。",
         "",
         "## 第 0 步:先把时区定了(**唯一一个会静默出错的地方**)",
         "",

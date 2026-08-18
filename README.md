@@ -551,6 +551,7 @@ python -m pytest -q          # 1563 passed
 | `docs/feed_closure_audit.md` | feed 闭环审计:六提交点 × 三台账 × 五反哺器 |
 | `docs/scraper_migration_brief.md` | 采集服务对接约定;采集失败三档语义 |
 | `docs/backlog.md` | 未完成工作总账 |
+| `docs/frontend_brief.md` | 前端设计交办单(整篇发给设计侧;含库对象、状态枚举、必须区分的三组语义) |
 | `skills/walmart-schedule/` | 智能体定时任务技能包(**生成物**,改调度表后重新生成) |
 
 ### 过程档案(留档,不当任务派活)

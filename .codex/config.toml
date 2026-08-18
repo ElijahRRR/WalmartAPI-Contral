@@ -1,0 +1,27 @@
+# Codex 在本项目的沙箱配置(所有者定稿 2026-08-17,由一次生产故障坐实)。
+#
+# ⚠ 为什么必须有这个文件:本项目的**状态目录在仓库外面**。
+#   仓库    /Users/nextderboy/Projects/WalmartAPI-Contral
+#   DATA_ROOT /Users/nextderboy/Projects/WalmartAPI_data   ← 同级,不是子目录
+# 锁 / 日志 / 备份 / 报告 全在 DATA_ROOT 下(出处 registry/paths.py:data_root)。
+# 默认沙箱只放行工作区(= 仓库目录),于是每条工作流在 cli.py 拿 flock 的**第一步**
+# 就死:`PermissionError: [Errno 1] Operation not permitted: …/locks/<名>.lock`。
+#
+# ⚠ 这个报错**长得像权限问题但不是**:属主是 nextderboy、mode 也允许写,
+#   errno 是 EPERM(1) 而不是 EACCES(13)。2026-08-17 因此两次找错方向
+#   (先怀疑 sudo 留下的 root 属主,又怀疑 PostgreSQL 角色),实测都排除了:
+#   当前用户 = PG 用户 = nextderboy,locks/logs 属主均为 nextderboy:staff,
+#   ops 里建临时表也成功。真正拦住的是沙箱。
+#
+# ⚠ 三条**不要**(所有者定稿):不要 chmod 777、不要改 WALMART_DATA_ROOT、
+#   不要建软链接。那三样都是把状态搬到别处或放宽全局权限,而问题只是
+#   "这个 runner 没被授权写那一个目录" —— 按目录授权才是最小修复。
+
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+# 工作流要真的调沃尔玛 / 飞书 / 采集服务 / LLM
+network_access = true
+# 仓库同级的状态目录:锁、日志、备份、报告、.env
+writable_roots = ["/Users/nextderboy/Projects/WalmartAPI_data"]

@@ -325,3 +325,47 @@ def test_every_sheet_write_goes_through_the_lock():
         assert "_sheet_lock(" in src, fn.__name__
         # 别退回下标取法(那就又是 defaultdict 的坑)
         assert "_sheet_locks[" not in src, fn.__name__
+
+
+def test_write_ranges_caps_rows_per_request(monkeypatch):
+    """⚠ 2026-08-18 生产事故:audit_sheet 回填 28,498 行 × C:G,粘段后
+    8 个 4000 行段被塞进**同一个** values_batch_update,飞书 90227
+    (request too large)整批拒收。
+
+    每请求的行预算 = _SHEET_WRITE_BLOCK_ROWS(整表重写路径久经生产的
+    「一段 4000 行」,不另立数字)。这里把块阈值缩小到 4 行来演同一形状:
+    18 个连号单行段 → 粘成一段 → 切成 5 个 ≤4 行的子段 → 必须发 5 个请求,
+    每个请求 ≤4 行,而不是 5 段合一个请求。
+    """
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_BLOCK_ROWS", 4)
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_THROTTLE_SECS", 0)
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID",
+                        columns=("a", "b"))
+    ups = [(f"C{r}:G{r}", [[f"v{r}"] * 5]) for r in range(2, 20)]   # 18 行连号
+    n = feishu.sheet_write_ranges(sheet, ups)
+    assert n == 18
+    rows_per_req = [sum(len(vr["values"]) for vr in body["valueRanges"])
+                    for body in sent]
+    assert len(sent) == 5                       # 4+4+4+4+2,不是一锅端
+    assert all(r <= 4 for r in rows_per_req), rows_per_req
+    # 顺序与覆盖语义不变:拼回去仍是 v2..v19
+    flat = [row[0] for body in sent for vr in body["valueRanges"]
+            for row in vr["values"]]
+    assert flat == [f"v{r}" for r in range(2, 20)]
+
+
+def test_write_ranges_still_caps_100_ranges_per_request(monkeypatch):
+    """不连号的小段照旧受「≤100 范围/请求」约束(飞书 valueRanges 数量限制),
+    行预算不该反过来把这条放宽。120 个互不相邻的单行段 → 2 个请求。"""
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_THROTTLE_SECS", 0)
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID", columns=("a",))
+    ups = [(f"A{r}:A{r}", [["v"]]) for r in range(2, 242, 2)]   # 120 段,行号隔一
+    n = feishu.sheet_write_ranges(sheet, ups)
+    assert n == 120
+    assert [len(b["valueRanges"]) for b in sent] == [100, 20]

@@ -568,10 +568,13 @@ def _coalesce(updates: list[tuple[str, list[list]]]
     定点回写的调用方几乎都是"一行一个 range"(`C{r}:G{r}`),而整表重写走的是
     "一段 4000 行"。同一个接口,两条路径差了三个数量级:
       · 一行一 range → 100 行/请求 + 0.3s 节流 ⇒ 28000 行要 280 个请求、~2 分钟
-      · 合成段     → 4000 行/range、100 range/请求 ⇒ 同样 28000 行 1 个请求
+      · 合成段     → 4000 行/range,每请求 ≤4000 行 ⇒ 同样 28000 行 8 个请求
     这就是所有者 2026-08-16 问的「写飞书的速度怎么各处都不一样,有的 4000
     有的几十甚至逐行」—— 差别不在接口,在调用方给的形状。**在这里补齐**:
     调用方照旧一行一个 range,api 层负责把连号的粘起来(分批是 api 层职责)。
+    ⚠ 粘完的段**不能**再 100 段合一个请求:2026-08-18 audit_sheet 回填
+    28,498 行 × C:G,8 段进同一请求被飞书 90227(request too large)整批拒。
+    每请求的行预算见 sheet_write_ranges。
 
     只合并**紧邻的下一行**且列区间完全相同的:不排序、不去重、不跨空行,
     所以"同一行被写两次"的先后覆盖语义与逐行写时逐字一致。
@@ -599,7 +602,14 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
 
     定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补。
     三步:**连号的先粘成段**(否则一行一个请求位,几万行要跑几分钟)→
-    按行切开过大的段 → 按 100 范围/批 values_batch_update,批间节流。
+    按行切开过大的段 → 分批 values_batch_update,批间节流。
+    每批两条上限,**先撞哪条哪条生效**:
+      · ≤100 个范围(飞书 valueRanges 数量限制);
+      · ≤ _SHEET_WRITE_BLOCK_ROWS 行(请求体大小限制:2026-08-18 audit_sheet
+        回填 28,498 行,8 个 4000 行段进同一请求被 90227 request too large
+        整批拒 —— 单请求的安全预算以整表重写路径久经生产的「一段 4000 行」
+        为准,不另立数字)。
+    逐行小段的老路径不受影响:100 个一行段合计 100 行,远在行预算之内。
 
     ⚠ 返回的是行数不是范围数。粘段之前两者恰好相等(调用方全是一行一 range),
     所有调用方也都当行数在用(「回填 N 行」);粘段之后必须显式数行,
@@ -609,10 +619,21 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
     split: list[tuple[str, list[list]]] = []
     for rng, vals in _coalesce(updates):
         split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
+    batches: list[list[tuple[str, list[list]]]] = []
+    cur: list[tuple[str, list[list]]] = []
+    cur_rows = 0
+    for rng, vals in split:
+        if cur and (len(cur) >= 100
+                    or cur_rows + len(vals) > _SHEET_WRITE_BLOCK_ROWS):
+            batches.append(cur)
+            cur, cur_rows = [], 0
+        cur.append((rng, vals))
+        cur_rows += len(vals)
+    if cur:
+        batches.append(cur)
     n = 0
     with _sheet_lock(s.token):
-        for i in range(0, len(split), 100):
-            chunk = split[i:i + 100]
+        for i, chunk in enumerate(batches):
             try:
                 _call("POST",
                       f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
@@ -624,7 +645,7 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
                 raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
                                           f"{sum(len(v) for _r, v in chunk)} 行)") from None
             n += sum(len(v) for _r, v in chunk)
-            if i + 100 < len(split):
+            if i + 1 < len(batches):
                 time.sleep(_SHEET_WRITE_THROTTLE_SECS)
     return n
 

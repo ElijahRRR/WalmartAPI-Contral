@@ -352,6 +352,24 @@ def test_b7_pt_to_policy_step8():
     assert audit_reason.compute_final_reason(o) == "Military & Law Enforcement"
 
 
+def test_b7_internal_blacklist_maps_to_none_not_general_use():
+    """⚠ 2026-08-18 所有者实遇:B0F2ZS3M31(床头柜)命中 ASIN 黑名单被拒,
+    F 列却写「ASIN 在黑名单中心 [政策:General-Use Products]」—— 黑名单中心
+    是内部决策,不对应任何 Walmart 政策,此前无分支一路漏到 4g 兜底。
+    三码(ASIN / 卖家 / 亚马逊类目)都必须映 None;品牌黑名单仍归 IP 不动。"""
+    for code in ("phase0_lark_blacklist_asin", "phase0_lark_blacklist_seller",
+                 "phase0_lark_blacklist_amazon_cat"):
+        o = _outcome(hits=[RuleHit("L0", code, -100,
+                                   {"asin": "B0F2ZS3M31",
+                                    "source": "blacklist_center"})])
+        assert audit_reason.compute_final_reason(o) is None, code
+    # 政策 None ⇒ F 列只剩人话,没有 [政策:…] 尾巴
+    h = audit_reason.human_reason(
+        [("phase0_lark_blacklist_asin", {"asin": "B0F2ZS3M31"})], None)
+    assert "[政策:" not in h
+    assert "黑名单中心" in h
+
+
 def test_b7_fallback_general_use():
     o = _outcome(hits=[RuleHit("L2", "cat_zh_blocked", -100, {})])
     assert audit_reason.compute_final_reason(o) == "General-Use Products"

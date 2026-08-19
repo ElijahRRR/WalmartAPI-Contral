@@ -1201,8 +1201,9 @@ def run(params: dict) -> str:
                              "预检:会真调 LLM,但不领 UPC 不提交)")
         return "\n".join(lines)
 
-    for rownum, why in reasons:
-        listing_sheet.write_reason(rownum, why)
+    # 批量写理由(2026-08-19 所有者实遇修复):此前逐行调 write_reason,
+    # 一行一个飞书请求 ~0.7s,几百行淘汰理由 = 提交前先白耗几分钟
+    listing_sheet.write_reasons(reasons)
     n_reasons_written = len(reasons)
     # 淘汰行数据回显(待提交行随后由 write_submit_cols 写全套,不重复写)
     ready_rownums = {r["rownum"] for r in ready}
@@ -1387,8 +1388,8 @@ def run(params: dict) -> str:
     if post:
         lines.append("提交期:" + ",".join(f"{lab} {v}" for lab, v in post))
 
-    for rownum, why in reasons[n_reasons_written:]:   # 提交期新增的理由(UPC/标题)
-        listing_sheet.write_reason(rownum, why)
+    # 预备/提交期新增的理由(出参失败/必填缺失/UPC 不足),同样批量写
+    listing_sheet.write_reasons(reasons[n_reasons_written:])
     _writeback_upc(execute, lines)
     lines.append("回执 O/P/Q 由 feed_poll 反哺器回填;结果轮询走 feed_poll")
     return "\n".join(lines)

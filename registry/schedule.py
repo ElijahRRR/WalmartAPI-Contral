@@ -87,18 +87,19 @@ JOBS = (
     # ── 批二:订单 + 日报 ────────────────────────────────────────────────
     # ⚠ 只挂这一条,**不要**再单挂一个 06:20:两个 plist 撞在同一分钟会各拿
     # 各的锁,后到的整链退出码 3 空跑一轮。日报依赖的那次就是每小时的 06:20 那次。
-    # product_ingest 排进 order_chain(所有者定稿 2026-08-19:「维护/中心库要
-    # 当时最新的数据」):同轮闭环改按批取数后,order_audit 不再顺手抽全库,
-    # 中心库的小时级新鲜度就没了着落 —— 把全局泵作为正式一步每小时走正门跑,
-    # 恢复原有新鲜度且锁语义干净。放 order_audit 之前:它的 24h 快照新鲜度闸
-    # 能用上刚抽的值;泵一轮常态几分钟,不挤 :20 的档期。
-    job("order_chain", ["order_sync", "product_ingest", "order_audit",
-                        "returns_sync"],
+    job("order_chain", ["order_sync", "order_audit", "returns_sync"],
         batch=2, minute=20,
-        params=["product_ingest:lock_wait=900"],
-        note="每小时 :20;order_audit 默认 wait=1,最长阻塞 20 分钟等采集落定;"
-             "product_ingest 每小时抽全局流保中心库新鲜(13:20 与 product_chain"
-             " 的同名步撞车时等锁,谁先拿到谁泵,后到的接着泵增量)"),
+        note="每小时 :20;order_audit 默认 wait=1,最长阻塞 20 分钟等采集落定"),
+    # product_ingest 单独长驻(所有者定稿 2026-08-19:「product_ingest 现在的
+    # 主要功能是让本地产品库与采集器数据库对齐,单独配长驻定时任务」):
+    # 三条链的同轮闭环已改按批次自取(谁推的批谁拉),这条管的是**其余一切
+    # 增量**(product_refresh 的尾巴、下午零散采集)——保中心库小时级对齐。
+    # :50 错开 order_chain 的 :20;13:50 与 product_chain 的同名步撞车时
+    # 等锁 15 分钟(runlock 等锁模式),谁先拿到谁泵,后到的接着泵增量
+    job("product_ingest", ["product_ingest"], batch=2, minute=50,
+        params=["lock_wait=900"],
+        note="每小时 :50;全局增量泵:本地产品中心 ↔ 采集器数据库对齐"
+             "(各链按批自取之外的全部增量走这条)"),
     job("daily_report", ["daily_report"], batch=2, hour=6, minute=40,
         runner="gpt",
         note="KPI 窗口锚 06:30,必须 ≥06:35;⚠ 开它之前先停旧 KPI 调度"),

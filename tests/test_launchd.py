@@ -129,19 +129,22 @@ def test_only_the_high_frequency_chains_live_on_this_machine():
     直接退 3 —— 那一轮什么都没做,而通知里写的是"⚠ 已有实例在运行",
     看久了就当常态了。
 
-    唯一例外:`product_ingest`(所有者定稿 2026-08-19)——它同时在
-    order_chain(每小时,保中心库新鲜)与 product_chain(13:00,链内闭环)。
-    例外成立的前提是**两边都带 lock_wait**:撞锁不再退 3,而是等对方泵完
-    再泵自己的增量(runlock.hold 等锁模式,PR #56),数据与通知都不空转。
-    下面就把这个前提钉死。
+    唯一例外:`product_ingest`(所有者定稿 2026-08-19)——它既是 launchd
+    上的单独长驻(每小时,本地产品库 ↔ 采集器对齐)又在 product_chain
+    (13:00,链内闭环)。例外成立的前提是**两边都带 lock_wait**:撞锁不再
+    退 3,而是等对方泵完再泵自己的增量(runlock.hold 等锁模式,PR #56),
+    数据与通知都不空转。下面就把这个前提钉死。
     """
-    assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain"}
+    assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain",
+                                              "product_ingest"}
     mine = {w for j in _LAUNCHD for w in j["workflows"]}
     theirs = {w for j in schedule.jobs_for("gpt") for w in j["workflows"]}
     assert mine & theirs == {"product_ingest"}
     for j in schedule.JOBS:
         if "product_ingest" in j["workflows"]:
-            assert any(p.startswith("product_ingest:lock_wait=")
+            # 单步 job 用裸 "lock_wait=";链里用 "product_ingest:lock_wait="
+            assert any(p.split(":")[-1].startswith("lock_wait=")
+                       and (":" not in p or p.startswith("product_ingest:"))
                        for p in j["params"]), \
                 f"{j['label']}:product_ingest 双 runner 并存的前提是等锁"
     # runner 只有这两个值;打错一个字(比如 "GPT")在 job() 里就炸

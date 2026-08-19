@@ -531,6 +531,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    monkeypatch.setattr(ln, "_push_scrape", lambda want, execute: (None, []))
     monkeypatch.setattr(ln, "_sync_upc", lambda e, l: None)
     monkeypatch.setattr(ln, "_writeback_upc", lambda e, l: None)
     # _prep_rows 的连接池会带 autocommit=True 开连接,桩要收 kwargs
@@ -607,6 +608,14 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    # 2026-08-19 起全部候选先推采集刷新:底座默认"推了但没有可等的批次"
+    # (不等不摄取),要测同轮闭环的用例自己覆盖
+    seen["scrape_pushed"] = []
+    monkeypatch.setattr(ln, "_push_scrape",
+                        lambda want, execute: (
+                            seen["scrape_pushed"].extend(want),
+                            (f"  候选 {len(want)} 个 ASIN 已推采集刷新",
+                             []))[1])
     monkeypatch.setattr(ln, "_sync_upc", lambda e, l: None)
     monkeypatch.setattr(ln, "_writeback_upc", lambda e, l: None)
     monkeypatch.setattr(ln.db, "pg_conn",
@@ -689,29 +698,28 @@ def test_placeholder_upc_backfilled_with_real(monkeypatch):
     assert seen["submitted"] == [("T1", 1)]
 
 
-def test_same_round_scrape_closure_rescues(monkeypatch):
-    """同轮闭环(所有者定稿 2026-08-18):推采集→等窗口→就地摄取→本轮续走。
+def test_same_round_scrape_refreshes_all_candidates(monkeypatch):
+    """同轮闭环(2026-08-19 升级:上架必须用当天最新数据):**全部候选**先推
+    采集刷新(不只缺数据的)→ 等窗口 → 按批摄取 → 才取数定价提交。
 
-    数据源缺席的行不再"本轮跳过次日续":refetch 拿到数据后这一轮就提交。
     wait_settled/_ingest_batches 打桩(它们各自有自己的测试),这里只验接线:
-    次序对(等完才摄取才复查)、救回的行真的进了提交、摘要说了人话。
+    推的是全候选、次序对(推→等→摄取→才取数)、只拉自己那批、摘要说人话。
     """
     rows = [_sheet_row(2, asin="B0AAAAAOK1"), _sheet_row(3, asin="B0AAAAAGAP")]
     full = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
-    calls = {"fetch": 0, "order": []}
+    calls = {"order": [], "pushed": []}
     seen = _wire_execute_env(monkeypatch, rows, full)
 
     def fetch(asins):
-        calls["fetch"] += 1
-        if calls["fetch"] == 1:      # 首查:GAP 缺席
-            return {a: (full[a] if a != "B0AAAAAGAP" else None) for a in asins}
-        calls["order"].append("refetch")
+        calls["order"].append("fetch")
         return {a: full[a] for a in asins}
     monkeypatch.setattr(ln.amz_source, "fetch_products", fetch)
     monkeypatch.setattr(
         ln, "_push_scrape",
-        lambda absent, execute: (f"  缺数据 {len(absent)} 个 ASIN 已推采集",
-                                 ["listing_gap_test"]))
+        lambda want, execute: (calls["order"].append("push"),
+                               calls["pushed"].extend(want),
+                               (f"  候选 {len(want)} 个 ASIN 已推采集刷新",
+                                ["listing_gap_test"]))[2])
     monkeypatch.setattr(
         ln.scrape_batches, "wait_settled",
         lambda names, t: (calls["order"].append("wait"), ("1/1 落定", 0))[1])
@@ -719,18 +727,31 @@ def test_same_round_scrape_closure_rescues(monkeypatch):
         ln, "_ingest_batches",
         lambda names: (calls["order"].append("ingest"),
                        calls.setdefault("ingested_names", []).append(list(names)),
-                       "按批摄取:新增 1")[2])
+                       "按批摄取:新增 2")[2])
     out = ln.run({"execute": True})
-    assert calls["order"] == ["wait", "ingest", "refetch"]
+    # 推的是**全部候选**,而且推→等→摄取都发生在取数之前
+    assert calls["order"] == ["push", "wait", "ingest", "fetch"]
+    assert sorted(calls["pushed"]) == ["B0AAAAAGAP", "B0AAAAAOK1"]
     assert calls["ingested_names"] == [["listing_gap_test"]]  # 只拉自己那批
-    assert "同轮闭环" in out and "救回 1/1" in out
+    assert "同轮闭环" in out
     assert sorted(w["asin"] for w in seen["claim_wants"]) == [
-        "B0AAAAAGAP", "B0AAAAAOK1"]          # 救回的行本轮就领号提交
-    # gap_wait=0 = 只推不等(不打 wait/ingest,行照旧不写终态)
+        "B0AAAAAGAP", "B0AAAAAOK1"]          # 刷新后本轮就领号提交
+    # gap_wait=0 = 只推不等(不打 wait/ingest,直接用库中现值)
     calls["order"].clear()
-    calls["fetch"] = 0
+    calls["pushed"].clear()
     out2 = ln.run({"execute": True, "gap_wait": 0})
-    assert calls["order"] == [] and "同轮闭环" not in out2
+    assert calls["order"] == ["push", "fetch"] and "同轮闭环" not in out2
+
+
+def test_absent_rows_skip_without_terminal_state(monkeypatch):
+    """刷新之后库里仍没有的行:不写终态、次日续上,摘要点名"仍缺"。"""
+    rows = [_sheet_row(2, asin="B0AAAAAOK1"), _sheet_row(3, asin="B0AAAAAGAP")]
+    have = {"B0AAAAAOK1": {**_PRODUCT_OK, "asin": "B0AAAAAOK1"}}
+    seen = _wire_execute_env(monkeypatch, rows, have)
+    out = ln.run({"execute": True})
+    assert sorted(seen["scrape_pushed"]) == ["B0AAAAAGAP", "B0AAAAAOK1"]
+    assert "仍缺 1 个 ASIN 无数据" in out
+    assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]
 
 
 def test_map_llm_three_level_fetch(monkeypatch):

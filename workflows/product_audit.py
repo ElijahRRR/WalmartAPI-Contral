@@ -36,13 +36,16 @@ C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结�
 领取口径含 **E=pending**(2026-08-17):pending 是中间态不是结论,写进 E 之后
 若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
 
-**缺数据同轮补采闭环**(所有者定稿 2026-08-17:「产品审核不能等下一次,要轮询
-等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
-表里轮到审、但库里压根没有(或有行无标题=采集降级)的 ASIN → 推采集批次
+**同轮补采/刷新闭环**(所有者定稿 2026-08-17「产品审核不能等下一次,要轮询
+等采完拿数据审核」+ 2026-08-19「对于要审核的产品,推送采集,轮询拿最新数据
+后审核」):表里轮到审的 ASIN 里,库里压根没有(或有行无标题=采集降级)的
+是**缺口**,在库且本轮会真进判定引擎的是**待刷新**——两者同批推进采集批次
 `audit_gap_<日界>` → **轮询等它采完**(缺省 20 分钟,`-p gap_wait=N` 调,0=只推
-不等)→ **就地增量摄取**(借 product_ingest 的锁)→ 采回来的**这一轮就判掉**。
-仍缺的把采集侧真实 `error_type` 写进表格 **F 列、E 列留空**(留空才会被下轮重领)。
-整段跑在候选查询**之前**,所以不需要第二遍判定循环。见 `_close_gap`。
+不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的**这一轮就判掉**。
+仍缺的把采集侧真实 `error_type` 写进表格 **F 列、E 列留空**(留空才会被下轮
+重领);待刷新行没等到的用库中现值审(审得了,只是数据旧)。已有结论只投影
+的行不推采集(非强审)。整段跑在候选查询**之前**,不需要第二遍判定循环。
+见 `_close_gap`。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
 五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
@@ -566,6 +569,24 @@ def _find_gap(want: list[str]) -> tuple[list[str], list[str]]:
             sorted(a for a, no_title in got.items() if no_title))
 
 
+# 在库、且本轮会真进判定引擎的行(与候选谓词 _DEFAULT_CANDIDATE 同一口径):
+# 这些行审核前也要推采集刷新(所有者定稿 2026-08-19:「对于要审核的产品,
+# 推送采集,轮询拿最新数据后审核」)。已有结论只投影的行**不刷新**——
+# 非强审,采了也不会重判,纯烧配额
+_SQL_UNJUDGED = f"""
+SELECT p.asin FROM catalog.products p
+WHERE p.marketplace = 'US' AND p.asin = ANY(%s) AND {_DEFAULT_CANDIDATE}
+"""
+
+
+def _find_unjudged(want: list[str], exclude: set) -> list[str]:
+    """输入:待审 ASIN + 已在缺口集合里的 → 输出:要推刷新的在库真待审行。"""
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_UNJUDGED, (want,))
+        got = [r[0] for r in cur.fetchall()]
+    return sorted(set(got) - exclude)
+
+
 def _push_gap(gap: list[str], day: str,
               out: list[str]) -> list[tuple[str, object]]:
     """输入:缺口 ASIN + 日界 → 输出:[(批次名, batch_id)];摘要写进 out。
@@ -656,7 +677,9 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
     五步:
 
-      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。
+      ① 推今天的缺口 + **在库真待审行的刷新**(所有者定稿 2026-08-19:
+         审核必须拿当天最新数据;已有结论只投影的行不刷新——非强审,
+         采了也不会重判)。日界批次名,撞名沿用,插队。
       ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
       ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
          批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
@@ -696,9 +719,11 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
     out: list[str] = []
     absent, degraded = _find_gap(want)
     gap = absent + degraded
-    if gap:
-        _run_gap_round(gap, absent, degraded, sheet_rows, execute, wait_min,
-                       want, out)
+    # 在库真待审的行也要刷新(所有者定稿 2026-08-19:审核必须拿当天最新数据)
+    stale = _find_unjudged(want, exclude=set(gap))
+    if gap or stale:
+        _run_gap_round(gap, absent, degraded, stale, sheet_rows, execute,
+                       wait_min, want, out)
     # ⑤ 台账落定:**本轮缺口为空也要跑**。缺口为空只说明今天没新批次,
     #    不说明没有遗留(上一轮超时/gap_wait=0/中途被打断的那批还挂着)——
     #    只在有缺口时才关台账的话,那笔遗留会一直挂到有下一次缺口
@@ -726,25 +751,35 @@ def _settle_ledger(execute: bool) -> list[str]:
 
 
 def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
-                   sheet_rows: list[dict], execute: bool, wait_min: int,
-                   want: list[str], out: list[str]) -> None:
-    """输入:本轮缺口 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
+                   stale: list[str], sheet_rows: list[dict], execute: bool,
+                   wait_min: int, want: list[str], out: list[str]) -> None:
+    """输入:本轮缺口 + 待刷新在库行 + 上下文 → 输出:无(摘要写进 out)。
+    见 `_close_gap` 头注;`stale` 是**在库、本轮会真进判定引擎**的行——
+    审核必须拿当天最新数据(所有者定稿 2026-08-19),与缺口同批推、同窗口等,
+    没等到的用库中现值审(不像缺口那样写 F 列:它们审得了,只是数据旧)。"""
     day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
-    head = (f"⚠ 审不了 {len(gap)} 个 ASIN:不在库 {len(absent)}"
-            + (f" / 采集降级无标题 {len(degraded)}" if degraded else ""))
+    parts = []
+    if gap:
+        parts.append(f"⚠ 审不了 {len(gap)} 个 ASIN(不在库 {len(absent)}"
+                     + (f" / 采集降级无标题 {len(degraded)}" if degraded
+                        else "") + ")")
+    if stale:
+        parts.append(f"待审在库行 {len(stale)} 个推采集刷新(审核用当天最新数据)")
+    head = ";".join(parts)
     if not execute:
         out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
-                   f"等它采完(最多 {wait_min} 分钟)、就地摄取,"
+                   f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
                    f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 F 列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
         return
 
     out.append(head)
-    sent = _push_gap(gap, day, out)
+    sent = _push_gap(sorted(set(gap) | set(stale)), day, out)
 
     if not sent:
-        out.append("  一个批次都没推成:本轮这些行审不了,理由照写")
+        out.append("  一个批次都没推成:缺数据行本轮审不了(理由照写),"
+                   "在库待审行用库中现值审")
     elif wait_min <= 0:
         out.append(f"  gap_wait=0:只推不等,这批退回下轮审"
                    f"(采回来在 {_GAP_PREFIX}{day},下一轮自动捞起)")

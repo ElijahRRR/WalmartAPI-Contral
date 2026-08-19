@@ -11,9 +11,9 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
 
 - **67 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
-- **11 条自动任务**在生产运行(电脑 launchd 2 条高频 + 智能体定时任务 9 条每日/每周);
+- **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1563 个单元测试**。
+- **1620 个单元测试**。
 
 ---
 
@@ -208,7 +208,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 |---|---|---|
 | **沃尔玛 Marketplace API** | 商品、价格、库存、订单、售后、feed、报表、Insights | 每店固定出口代理;配额按 `(store, endpoint)` 计;**价格三件套 feed 共享桶**,其余 feedType 各自独立;端点/配额定稿见 `docs/api_blueprint.md` |
 | **飞书开放平台** | 多维表格 + 电子表格 + 群通知 | 批量写 ≤500/次;同表串行写 + 批间节流(写 QPS≈10);字段名按表头索引 |
-| **亚马逊采集服务** | 产品数据来源(标题/价格/库存/类目/运费/图) | **取回只有 `product_ingest` 一条路**(漏斗铁律);推送有三条(`product_refresh` / `order_audit` 按邮编 / `product_audit` 补采) |
+| **亚马逊采集服务** | 产品数据来源(标题/价格/库存/类目/运费/图) | 取回两条路:**全局增量流只归 `product_ingest`**(游标独占,漏斗铁律),各链同轮闭环走**批次端点**只拉自己推的批;推送有四条(`product_refresh` / `order_audit` 按邮编 / `product_audit` 刷新+补采 / `list_new` 候选刷新) |
 | **DeepSeek** | 类目 rerank、属性映射、语义审核 | 按用途路由模型;输入哈希缓存在 `catalog.llm_cache` |
 | **火山方舟(豆包)** | 视觉审核 L4 | 默认关,`-p l4=on` 开 |
 | **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`) |
@@ -373,7 +373,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 两个 runner,按频率分工:
 
-### 电脑 launchd(高频,2 条)
+### 电脑 launchd(高频,3 条)
 
 写死在电脑上最稳,不依赖任何智能体在不在线。装载:`cli.py launchd_install`。
 
@@ -381,6 +381,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | `feed_poll` |
 | `order_chain` | 每小时 :20 | `order_sync` → `order_audit` → `returns_sync` |
+| `product_ingest` | 每小时 :50 | `product_ingest`(全局增量泵:本地产品中心 ↔ 采集器对齐;各链已按批自取,这条管其余一切增量) |
 
 ### 智能体定时任务(每日/每周,9 条)
 

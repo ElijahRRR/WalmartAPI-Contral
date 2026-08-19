@@ -328,10 +328,11 @@ def test_columns_contract():
 
 
 class _GapCur:
-    """假游标:_SQL_GAP 每次调用返回队列里的下一份"库里现状"。"""
+    """假游标:_SQL_GAP 每次调用返回队列里的下一份"库里现状";
+    _SQL_UNJUDGED(按 audit_status 路由)返回固定的"待刷新在库行"。"""
 
-    def __init__(self, queue):
-        self._q, self._out = queue, ()
+    def __init__(self, queue, unjudged):
+        self._q, self._u, self._out = queue, unjudged, ()
 
     def __enter__(self):
         return self
@@ -340,15 +341,18 @@ class _GapCur:
         return False
 
     def execute(self, sql, args=None):
-        self._out = self._q.pop(0) if self._q else []
+        if "audit_status" in sql:
+            self._out = [(a,) for a in self._u]
+        else:
+            self._out = self._q.pop(0) if self._q else []
 
     def fetchall(self):
         return self._out
 
 
 class _GapConn:
-    def __init__(self, queue):
-        self._q = queue
+    def __init__(self, queue, unjudged=()):
+        self._q, self._u = queue, unjudged
 
     def __enter__(self):
         return self
@@ -357,7 +361,7 @@ class _GapConn:
         return False
 
     def cursor(self):
-        return _GapCur(self._q)
+        return _GapCur(self._q, self._u)
 
 
 _ROWS = [{"rownum": 2, "asin": "B0HAVE0001"},
@@ -376,13 +380,15 @@ _AFTER_PART = [("B0HAVE0001", False), ("B0THIN0001", False)]
 
 
 def _stub(monkeypatch, states, *, pushed=None, notes=None, calls=None,
-          open_lines=None, failures=None, settle=("等采集:全部落定", 0)):
-    """states = _SQL_GAP 依次返回的库里现状(推送前一份、摄取后一份)。"""
+          open_lines=None, failures=None, settle=("等采集:全部落定", 0),
+          unjudged=()):
+    """states = _SQL_GAP 依次返回的库里现状(推送前一份、摄取后一份);
+    unjudged = 在库、本轮会真进判定引擎的行(要推刷新的)。"""
     trace = calls if calls is not None else []
     # ⚠ 队列必须**跨连接共享**:_find_gap 每次开一条新连接,每条各拿一份
     #   完整副本的话第二次复查又读到"推送前"那一份 —— 那正是这段要防的 bug
     shared = [list(x) for x in states]
-    monkeypatch.setattr(pa.db, "pg_conn", lambda: _GapConn(shared))
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _GapConn(shared, unjudged))
     monkeypatch.setattr(pa.scrape_batches, "check_open",
                         lambda p, h: open_lines or ["无在途采集批次"])
     monkeypatch.setattr(pa.scrape_batches, "record", lambda *a, **k: None)
@@ -449,6 +455,47 @@ def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):
     _stub(monkeypatch, [_BEFORE, _AFTER_ALL], pushed=[], notes=notes)
     pa._close_gap(_WANT, _ROWS, True, 20)
     assert notes == []          # 复查后一个都不缺 ⇒ 一行原因都不该写
+
+
+def test_unjudged_rows_are_refreshed_before_judging(monkeypatch):
+    """在库真待审的行也要推采集刷新(所有者定稿 2026-08-19:「对于要审核的
+    产品,推送采集,轮询拿最新数据后审核」)——与缺口同批推、同窗口等。
+    没等到的不写 F 列(它们审得了,只是数据旧,用库中现值审)。"""
+    pushed, notes = [], []
+    calls = _stub(monkeypatch, [_BEFORE, _AFTER_ALL], pushed=pushed,
+                  notes=notes, calls=[], unjudged=["B0HAVE0001"])
+    out = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
+    assert calls == ["push", "prioritize", "wait20", "ingest"]
+    # 缺口(GONE/THIN)与待刷新(HAVE)同批推
+    assert pushed[0][1] == ["B0GONE0001", "B0HAVE0001", "B0THIN0001"]
+    assert "待审在库行 1 个推采集刷新" in out
+    assert notes == []                       # 全补齐:F 列一行都不写
+
+
+def test_refresh_only_round_still_pushes(monkeypatch):
+    """缺口为空、只有待刷新行:照样推采集 + 等 + 摄取(审核用当天最新数据),
+    不写任何 F 列原因(没有审不了的行)。"""
+    pushed, notes = [], []
+    have_all = [("B0GONE0001", False), ("B0HAVE0001", False),
+                ("B0THIN0001", False)]
+    calls = _stub(monkeypatch, [have_all, have_all], pushed=pushed,
+                  notes=notes, calls=[], unjudged=["B0HAVE0001"])
+    out = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
+    assert calls == ["push", "prioritize", "wait20", "ingest"]
+    assert pushed[0][1] == ["B0HAVE0001"]
+    assert "待审在库行 1 个" in out and "审不了" not in out
+    assert notes == []
+
+
+def test_all_judged_rows_push_nothing(monkeypatch):
+    """缺口为空且没有真待审的行(全是已有结论待投影)→ 一个批次都不推,
+    零采集调用(非强审:采了也不会重判,纯烧配额)。"""
+    have_all = [("B0GONE0001", False), ("B0HAVE0001", False),
+                ("B0THIN0001", False)]
+    calls = _stub(monkeypatch, [have_all, have_all], pushed=[], notes=[],
+                  calls=[], unjudged=[])
+    pa._close_gap(_WANT, _ROWS, True, 20)
+    assert calls == []                       # 不推不等不摄取
 
 
 def test_gap_wait_zero_pushes_without_waiting(monkeypatch):

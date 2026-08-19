@@ -34,10 +34,11 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
     ⚠ 占用闸与快照闸**并存**(A1 阶段):台账回填完整前,快照闸仍是主力;
     两道都过才放行,理由分开写,谁拦的一目了然
-  ⑤ 数据源(services/amz_source,缺席:**同轮闭环**,所有者定稿 2026-08-18
-    与审核链同款——缺数据 ASIN 推采集(日界批次名防重)+ 插队 → 等它采完
-    (默认 20 分钟,`-p gap_wait=` 可调)→ 就地摄取(借 product_ingest 的
-    锁)→ 本轮续走;超时不是失败,救回多少上多少,仍缺的照旧不写终态
+  ⑤ 数据源(services/amz_source):**上架必须用当天最新数据**(所有者定稿
+    2026-08-19)——**全部候选**先推采集刷新(日界批次名防重)+ 插队 →
+    等它采完(默认 20 分钟,`-p gap_wait=` 可调)→ 就地按批摄取(批次
+    端点,无锁)→ 才取数定价;超时不是失败,没刷到的行用库中现值上架
+    (维护链次日纠正),库里压根没有的照旧不写终态、次日续
   ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
     (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
@@ -223,47 +224,47 @@ def _dump_llm_debug(asin: str, visible: dict, orderable: dict,
         logger.warning("载荷落盘失败(不影响主链): %s", e)
 
 
-def _push_scrape(absent: list[str], execute: bool
+def _push_scrape(want: list[str], execute: bool
                  ) -> tuple[str | None, list[str]]:
-    """输入:缺数据 ASIN 列表 + 是否真跑 → 输出:(摘要行, 可等待的批次名)。
+    """输入:本轮要刷新的 ASIN 列表 + 是否真跑 → 输出:(摘要行, 可等待的批次名)。
 
-    采集闭环(所有者批复 2026-08-12):数据源缺席的 ASIN 自动推给采集服务,
-    替代"接线期人工推"。批次名带北京日界,天然防重——当天第二轮撞名
-    (BatchExistsError)直接跳过,增量 ASIN 次日随新批次推,不追当天。
-    最快形态(不切邮编不截图);采集落库(product_ingest)后主链自动续上。
-    推送失败只告警不阻塞上架:缺数据行本来就是跳过不写终态。
+    2026-08-19 所有者定稿「上架必须用最新数据」之后,这里推的是**全部候选**
+    的刷新(此前只推缺数据的)。批次名带北京日界,天然防重——当天第二轮
+    撞名(BatchExistsError)沿用既有批次:那轮的新增候选刷不到,用库中现值
+    上架,次日随新批次刷。最快形态(不切邮编不截图);按批摄取后主链续走。
+    推送失败只告警不阻塞上架:有数据的行用现值,缺数据的照旧跳过不写终态。
     """
-    if not absent:
+    if not want:
         return None, []
     day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
     name = f"listing_gap_{day}"
     if not execute:
-        return (f"  [DRY-RUN] 缺数据 {len(absent)} 个 ASIN,"
-                f"真跑时将推采集批次 {name}"), []
+        return (f"  [DRY-RUN] 候选 {len(want)} 个 ASIN,"
+                f"真跑时将推采集批次 {name} 刷新"), []
     # 2026-08-18 所有者定稿同轮闭环之后,这批采集**本侧在等**(下游 20 分钟
     # 窗口),所以:①落 ops.scrape_batches 台账(check_open/监控能圈到它);
     # ②插队(与 audit_gap 同一条时间账:不插队几乎注定等不到)。此前
     # "list_new 补采不插队"的口径随"本轮跳过"语义一并作废。
     try:
-        r = scraper.submit_batch(name, absent)
+        r = scraper.submit_batch(name, want)
         bid = r.get("batch_id")
-        scrape_batches.record(name, bid, len(absent), "pushed",
+        scrape_batches.record(name, bid, len(want), "pushed",
                               f"list_new 同轮闭环 inserted={r.get('inserted')}")
-        note = (f"  缺数据 {len(absent)} 个 ASIN 已推采集"
+        note = (f"  候选 {len(want)} 个 ASIN 已推采集刷新"
                 f"(批次 {name},入库 {r.get('inserted')})"
                 + ("" if scrape_batches.prioritize(name, bid)
                    else ",⚠ 插队没成功(按常规优先级采,可能等不到)"))
         return note, [name]
     except scraper.BatchExistsError as e:
-        scrape_batches.record(name, e.batch_id, len(absent), "pushed",
+        scrape_batches.record(name, e.batch_id, len(want), "pushed",
                               "同日已推,沿用既有批次")
         scrape_batches.prioritize(name, e.batch_id)
-        return (f"  缺数据 {len(absent)} 个 ASIN:今日批次 {name} 已推过,"
-                f"沿用既有批次接着等"), [name]
+        return (f"  候选 {len(want)} 个 ASIN:今日批次 {name} 已推过,"
+                f"沿用既有批次接着等(本轮新增候选刷不到,用库中现值)"), [name]
     except Exception as e:
-        logger.warning("推采集失败(不阻塞上架,缺数据行本轮跳过): %s", e)
-        scrape_batches.record(name, None, len(absent), "failed", str(e)[:200])
-        return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}", []
+        logger.warning("推采集失败(不阻塞上架,有数据的行用现值): %s", e)
+        scrape_batches.record(name, None, len(want), "failed", str(e)[:200])
+        return f"  ⚠ 候选 {len(want)} 个 ASIN 推采集刷新失败:{e}", []
 
 
 def _ingest_batches(names: list[str]) -> str:
@@ -1113,32 +1114,26 @@ def run(params: dict) -> str:
                 missing_warn.append(r["asin"])
             candidates.append(r)
 
-    products = amz_source.fetch_products([r["asin"] for r in candidates])
-    # 缺数据 ASIN 自动推采集(所有者批复 2026-08-12 接上闭环,替代"接线期
-    # 人工推")。日界批次名天然防重:当天已推过撞名即跳过,增量次日再推
-    absent = sorted({r["asin"] for r in candidates
-                     if products.get(r["asin"]) is None})
-    # 内容拒捞回里"副标题未拆分"的老记录一并推重采(它们没进本轮 pending,
-    # 只搭推送的车;同轮闭环的救回判定仍只对 absent)
-    scrape_note, gap_names = _push_scrape(
-        sorted(set(absent) | set(c_need_sub)), execute)
+    # 上架必须用当天最新数据(所有者定稿 2026-08-19):**全部候选**先推采集
+    # 刷新(不再只推缺数据的),等窗口 + 按批摄取之后才取数定价。日界批次名
+    # 天然防重:当天第二轮撞名沿用(新增候选那轮刷不到,用库中现值,次日续)。
+    # 内容拒捞回里"副标题未拆分"的老记录一并搭车重采。
+    all_want = sorted({r["asin"] for r in candidates} | set(c_need_sub))
+    scrape_note, gap_names = _push_scrape(all_want, execute)
     gap_line = None
     if execute and gap_names and gap_wait > 0:
         # 同轮闭环(所有者定稿 2026-08-18,与审核链同款):推完**等它采完**,
-        # 就地摄取后本轮续走 —— 不再"本轮跳过、次日续上"。超时不是失败:
-        # 救回多少上多少,仍缺的照旧不写终态。list_new 是当天最后一棒
-        # (20:00),这 20 分钟不挤任何下游。
+        # 按批摄取后本轮续走。超时不是失败:已采到的照常用上,没刷到的行
+        # 用库中现值上架(维护链次日按最新采集纠正),库里压根没有的照旧
+        # 不写终态、次日续。list_new 是当天最后一棒(20:00),不挤下游。
         wnote, _n_open = scrape_batches.wait_settled(gap_names, gap_wait)
-        ing = _ingest_batches(gap_names)
-        refreshed = amz_source.fetch_products(absent)
-        saved = [a for a in absent if refreshed.get(a) is not None]
-        for a in saved:
-            products[a] = refreshed[a]
-        gap_line = (f"  同轮闭环:{wnote};{ing};"
-                    f"救回 {len(saved)}/{len(absent)}"
-                    + (f",仍缺 {len(absent) - len(saved)}"
-                       f"(不写终态,次日续)"
-                       if len(saved) < len(absent) else ""))
+        gap_line = f"  同轮闭环:{wnote};{_ingest_batches(gap_names)}"
+    products = amz_source.fetch_products([r["asin"] for r in candidates])
+    absent = sorted({r["asin"] for r in candidates
+                     if products.get(r["asin"]) is None})
+    if absent:
+        gap_line = ((gap_line + ";") if gap_line else "  ") + \
+            f"仍缺 {len(absent)} 个 ASIN 无数据(不写终态,次日续)"
     survivors: list[dict] = []
     data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
     for r in candidates:

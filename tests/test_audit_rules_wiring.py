@@ -123,6 +123,22 @@ def test_pick_where_four_states():
     w, _ = product_audit._pick_where({"mode": "pending"})
     # 待定专刷:只圈 pending,且**不带 1 天退避**(改完判定要立刻验证)
     assert w == "p.audit_status = 'pending'" and "interval" not in w
+    w, _ = product_audit._pick_where({"mode": "pass"})
+    # 现役 pass 全量重扫(2026-08-19 所有者:黑名单翻案要能覆盖放行过的行)
+    assert w == "p.audit_status = 'approved'"
+
+
+def test_mode_pass_requires_stages_l0():
+    """mode=pass 不带 stages=L0 必须炸:全链重审全部 pass = 重烧全库 LLM。
+
+    钉住的是 fail-loud —— 静默跑全链的话,几万个 approved 行进 L1/L3,
+    钱花完了才发现,而且部分行可能被 LLM 层改判(那是 force_rerun 的语义,
+    不是"黑名单翻案"的语义)。
+    """
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "pass", "limit": 10})
 
 
 def test_pick_where_rerule_targets_only_the_rejected_backlog():

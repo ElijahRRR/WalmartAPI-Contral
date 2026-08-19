@@ -488,11 +488,11 @@ def test_ingest_borrows_product_ingest_lock(monkeypatch):
     后写的盖掉先写的,中间那段记录永远不会再被拉一次 —— 两侧都不报错。"""
     import inspect
     src = inspect.getsource(pa._ingest_now)
-    assert "runlock.hold(product_ingest.CURSOR_NAME)" in src
+    assert "runlock.hold(product_ingest.CURSOR_NAME" in src   # 带 holder 也算
     assert "if not got" in src               # 拿不到锁 = 跳过,不是失败
     held = []
     monkeypatch.setattr(pa.runlock, "hold",
-                        lambda n: (held.append(n), _NullCtx(False))[1])
+                        lambda n, **kw: (held.append(n), _NullCtx(False))[1])
     assert "product_ingest 正在跑" in pa._ingest_now()
     assert held == ["product_ingest"]
 

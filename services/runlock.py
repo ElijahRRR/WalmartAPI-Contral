@@ -114,14 +114,30 @@ def _permission_hint(target, err: OSError | None = None) -> str:
             "inode 上 —— 两个实例同时跑同一条链,而互斥看起来还在")
 
 
-def acquire(name: str):
-    """输入:锁名(=工作流名)→ 输出:文件句柄(拿到)或 None(已被占用)。
+_POLL_SECS = 5.0        # 等锁轮询间隔(测试打小);每 ~30s 报一次等待日志
+
+
+def _holder_info(name: str) -> str:
+    """输入:锁名 → 输出:锁文件内容(pid/时刻/占用者身份),读不到就说读不到。"""
+    try:
+        return (paths.locks_dir() / f"{name}.lock").read_text().strip() \
+            or "(锁文件为空)"
+    except OSError:
+        return "(读不到锁文件)"
+
+
+def acquire(name: str, holder: str = ""):
+    """输入:锁名(=工作流名)+ 占用者身份 → 输出:文件句柄(拿到)或 None(已被占用)。
 
     ⚠ **返回值必须留着**:句柄被 GC 掉即释放锁。cli.py 靠把它绑在局部变量上
     活到进程结束,别改成 `_acquire_lock(...)` 丢弃返回值那种写法。
 
     拿不到锁(别人在跑)返回 None;**建不了锁**(权限/磁盘)抛
     `LockUnavailable`,消息里带属主诊断 —— 见 `_permission_hint`。
+
+    `holder` 写进锁文件(2026-08-19 生产实遇:product_ingest 的锁被
+    order_audit 借走,链退 3 之后没人说得清是谁占的——借锁的人必须留名,
+    等锁方与考古者才知道在等谁)。不给就按锁名记(= 本尊在跑)。
     """
     d = paths.locks_dir()
     target = d / f"{name}.lock"
@@ -136,19 +152,44 @@ def acquire(name: str):
     except BlockingIOError:
         fh.close()
         return None
-    fh.write(f"pid={os.getpid()} at={datetime.now(timezone.utc).isoformat()}\n")
+    fh.write(f"pid={os.getpid()} at={datetime.now(timezone.utc).isoformat()}"
+             f" holder={holder or name}\n")
     fh.flush()
     return fh
 
 
 @contextlib.contextmanager
-def hold(name: str):
-    """输入:锁名 → 输出:上下文里 True=拿到锁 / False=已被占用(不抛错)。
+def hold(name: str, wait_secs: float = 0, holder: str = ""):
+    """输入:锁名(+最长等待秒数/占用者身份)→ 输出:上下文里 True=拿到 / False=没拿到。
 
     退出时释放。**拿不到不是错误**——调用方按"这轮跳过"处理,
     因为占着锁的那个进程正在干同一件事。
+
+    `wait_secs>0` = 等锁模式(2026-08-19 所有者定稿):每 _POLL_SECS 重试,
+    直到拿到或超时;等待期间每 ~30 秒记一行"在等谁"。**缺省 0 = 立刻放弃,
+    行为与从前逐字相同** —— 等锁只给调度里显式配了 lock_wait 的那一步用
+    (product_chain 的 product_ingest 撞 order_audit 借锁),高频链自身的
+    防重语义(退 3 不排队,防止晚点班次叠罗汉)不许被全局改掉。
     """
-    fh = acquire(name)
+    import time as _time
+    fh = acquire(name, holder)
+    if fh is None and wait_secs > 0:
+        deadline = _time.monotonic() + wait_secs
+        waited = 0.0
+        next_log = 0.0
+        while fh is None and _time.monotonic() < deadline:
+            if waited >= next_log:
+                logger.info("等待锁 %s(已等 %.0fs/上限 %.0fs,占用者:%s)",
+                            name, waited, wait_secs, _holder_info(name))
+                next_log = waited + 30
+            _time.sleep(_POLL_SECS)
+            waited += _POLL_SECS
+            fh = acquire(name, holder)
+        if fh is not None:
+            logger.info("等到锁 %s(等了 %.0fs)", name, waited)
+        else:
+            logger.warning("等锁 %s 超时(%.0fs),放弃;占用者:%s",
+                           name, wait_secs, _holder_info(name))
     try:
         yield fh is not None
     finally:

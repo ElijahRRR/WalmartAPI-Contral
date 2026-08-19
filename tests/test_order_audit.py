@@ -1223,7 +1223,7 @@ def test_ingest_now_skips_when_product_ingest_holds_the_lock(monkeypatch):
     import contextlib
     from workflows import order_audit as wf        # 要真的 _ingest_now,不用 wired 的桩
     monkeypatch.setattr(wf.runlock, "hold",
-                        lambda name: contextlib.nullcontext(False))
+                        lambda name, **kw: contextlib.nullcontext(False))
     monkeypatch.setattr(wf.ingest, "pump",
                         lambda *a, **k: pytest.fail("没拿到锁就不该摄取"))
     note = wf._ingest_now()
@@ -1235,7 +1235,7 @@ def test_ingest_now_pumps_under_the_lock(monkeypatch):
     from workflows import order_audit as wf        # 同上
     taken = []
     monkeypatch.setattr(wf.runlock, "hold",
-                        lambda name: taken.append(name) or
+                        lambda name, **kw: taken.append(name) or
                         contextlib.nullcontext(True))
     monkeypatch.setattr(wf.ingest, "pump",
                         lambda sc, d, **k: {"ok": True, "pages": 1, "fetched": 2,

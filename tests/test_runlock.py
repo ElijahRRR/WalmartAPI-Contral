@@ -112,3 +112,33 @@ def test_real_permission_denied_is_caught(tmp_path, monkeypatch):
     with pytest.raises(runlock.LockUnavailable) as ei:
         runlock.acquire("perf_problems")
     assert "chown" in str(ei.value)
+
+
+def test_hold_waits_for_lock_release(tmp_path, monkeypatch):
+    """wait_secs>0 = 等锁模式(2026-08-19):占用方释放后等待方拿到;
+    超时仍占着 → False(与老语义同款,只是晚一点放弃)。缺省 0 不等。"""
+    import threading
+    import time as _t
+
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    monkeypatch.setattr(runlock.paths, "locks_dir", lambda: locks)
+    monkeypatch.setattr(runlock, "_POLL_SECS", 0.02)
+
+    fh = runlock.acquire("pi", holder="order_audit._ingest_now")
+    assert "holder=order_audit._ingest_now" in (locks / "pi.lock").read_text()
+
+    # 0.1s 后对方释放;等待方最多等 2s → 必然拿到
+    threading.Timer(0.1, lambda: (runlock.__dict__, fh.close())).start()
+    with runlock.hold("pi", wait_secs=2) as got:
+        assert got is True
+
+    # 占着不放 + 超时很短 → False;缺省不等 → 立刻 False
+    fh2 = runlock.acquire("pi")
+    t0 = _t.monotonic()
+    with runlock.hold("pi", wait_secs=0.06) as got:
+        assert got is False
+    assert _t.monotonic() - t0 < 1.5             # 是"短等后放弃",不是死等
+    with runlock.hold("pi") as got:
+        assert got is False
+    fh2.close()

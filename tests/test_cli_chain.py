@@ -108,7 +108,7 @@ def test_locked_step_stops_the_chain_with_exit_3(calls, notes, monkeypatch):
     import contextlib
 
     @contextlib.contextmanager
-    def fake_hold(name):
+    def fake_hold(name, wait_secs=0, holder=""):
         if name == "zz_busy":
             yield False
         else:

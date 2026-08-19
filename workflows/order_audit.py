@@ -780,7 +780,8 @@ def _ingest_now() -> str:
     拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
     只是本轮看不到,下轮再判。
     """
-    with runlock.hold(ingest.CURSOR_NAME) as got:
+    with runlock.hold(ingest.CURSOR_NAME,
+                      holder="order_audit._ingest_now") as got:
         if not got:
             return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
                     "数据仍会由它摄入,下轮再判")

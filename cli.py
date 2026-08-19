@@ -307,11 +307,20 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
     if dangerous and dry_run:
         print(f"🧪 [DRY-RUN] {name} 本次只打印将做什么,不碰写接口")
 
-    with runlock.hold(name) as got:
+    # lock_wait 是 cli 保留参数,不透传给 run()(2026-08-19 所有者定稿):
+    # 只给调度里显式配了它的那一步用(product_chain 的 product_ingest 撞
+    # order_audit 借锁的日常档期);缺省 0 = 立刻退 3,老语义一字不变
+    try:
+        lock_wait = float(params.pop("lock_wait", 0) or 0)
+    except (TypeError, ValueError):
+        lock_wait = 0.0
+
+    with runlock.hold(name, wait_secs=lock_wait) as got:
         if not got:
-            print(f"⚠ {name} 已有实例在运行(flock 占用),本次退出",
+            extra = f"(等锁 {lock_wait:.0f}s 超时)" if lock_wait else ""
+            print(f"⚠ {name} 已有实例在运行(flock 占用){extra},本次退出",
                   file=sys.stderr)
-            return "locked", f"{name}:已有实例在运行,未执行"
+            return "locked", f"{name}:已有实例在运行{extra},未执行"
         with _log_to(name, logs_dir):
             run_id = _record_start(name, params, operator)
             try:

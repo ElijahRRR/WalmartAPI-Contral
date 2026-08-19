@@ -13,6 +13,9 @@
                                                     # 未命中的不落结论不盖版本(不"复活")
   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
                                                     # 零 LLM 翻新黑名单历史行的标准姿势
+  python cli.py product_audit -p mode=pass -p stages=L0 -p limit=1000000
+                                                    # 现役 pass 全量重过 L0(黑名单翻案);
+                                                    # 未命中不退出候选,**一次大 limit 扫完**
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
@@ -188,7 +191,7 @@ _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
-_MODES = {"backfill", "pending"}
+_MODES = {"backfill", "pending", "pass"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -270,6 +273,16 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 待定专刷:**无 1 天退避**——判定逻辑刚改过时要立刻拿存量 pending
         # 验证效果,等一天等的是自己。人工显式动作,不进任何定时调度
         return "p.audit_status = 'pending'", {}
+    if mode == "pass":
+        # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
+        # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
+        # 行不重扫就等于黑名单只管新品。只与 stages=L0 连用(run() 钉死):
+        # 全链重审全部 pass = 重烧全库 LLM,要那么干请 force_rerun=<版本>。
+        # ⚠ 本模式**没有天然分页**:命中翻案(status 变 rejected)会退出
+        # 候选,但未命中不落结论不盖版本(截断链没资格,#49 语义)、
+        # **不退出候选** —— 小批多轮每轮都从头扫同一批,必须一次大 limit
+        # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
+        return "p.audit_status = 'approved'", {}
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {}
@@ -822,6 +835,11 @@ def run(params: dict) -> str:
         raise ValueError(f"stages 只支持 L0(收到 {stages!r});"
                          f"L3/L4 已有独立开关 -p l3=off / -p l4=on")
     only_l0 = stages == "L0"
+    if str(params.get("mode", "")).strip() == "pass" and not only_l0:
+        # pass 全量重扫只准走零 LLM 的 L0(黑名单翻案场景);全链重审全部
+        # pass = 重烧全库 LLM,真要做请用 force_rerun=<版本> 显式来
+        raise ValueError("mode=pass 只与 stages=L0 连用"
+                         "(加 -p stages=L0;全链重审请用 force_rerun)")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)

@@ -42,20 +42,31 @@ _COLS = 21          # A~U
 PENDING_O = ("", "处理中", "ASYNC_PENDING")   # O 列这些值反哺器继续跟
 
 
-def read_rows() -> list[dict]:
-    """输入:无 → 输出:表内全部数据行(键=registry columns,含 rownum)。"""
+def read_rows(upto: str | None = None) -> list[dict]:
+    """输入:可选「只读到某字段」→ 输出:表内数据行(键=registry columns,含 rownum)。
+
+    `upto` 给字段名(如 'audit_result')时只读 A 到该字段那一列——飞书单次
+    读取响应体官方上限 10MB(90221 data exceeded),行列数本身不设限;
+    21 列全量一把读在表长大后必炸(2026-08-19 生产实证,audit_sheet 当场
+    炸在这里)。只要前几列的调用方(audit_targets)别拉全宽;要全宽的
+    (list_new / 自愈 / 反哺器)靠行方向分块 + 90221 对半兜底
+    (api 层 feishu.sheet_values_rows)。
+    """
     sheet = resources.LISTING_SHEET
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    values = feishu.sheet_values(sheet, f"A2:U{total}")
+    cols = resources.LISTING_SHEET.columns
+    width = (cols.index(upto) + 1) if upto else _COLS
+    pairs = feishu.sheet_values_rows(sheet, "A", chr(ord("A") + width - 1),
+                                     2, total)
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] \
-            + [""] * _COLS
-        d = dict(zip(resources.LISTING_SHEET.columns, cells[:_COLS]))
+            + [""] * width
+        d = dict(zip(cols[:width], cells[:width]))
         if d["asin"] or d["store"]:
-            d["rownum"] = i + 2
+            d["rownum"] = rownum
             rows.append(d)
     return rows
 
@@ -135,8 +146,10 @@ def audit_targets() -> list[dict]:
     ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
     再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
     """
+    # 只读 A..E 五列(store/asin/标题/PT/审核结果):领任务用不着 F 之后的
+    # 理由/回显长文本,少读 3/4 的字节,离 10MB 上限远得多
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
-            for r in read_rows()
+            for r in read_rows(upto="audit_result")
             if r.get("asin")
             and str(r.get("audit_result") or "").strip().lower()
             in ("", "pending")]

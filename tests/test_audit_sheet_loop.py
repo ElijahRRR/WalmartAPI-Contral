@@ -42,10 +42,28 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
         _sheet_row(5, audit_result="reject"),      # 审过了(判拒也是结论)
         _sheet_row(6, asin="", audit_result=""),   # 没 ASIN:不是待审行
     ]
-    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(listing_sheet, "read_rows",
+                        lambda upto=None: rows)
     got = listing_sheet.audit_targets()
     assert [r["rownum"] for r in got] == [2, 3]
     assert got[0]["asin"] and got[0]["store"] == "T1"
+
+
+def test_audit_targets_reads_only_first_five_columns(monkeypatch):
+    """领任务只读 A..E(store/asin/标题/PT/审核结果),不拉 F 之后的理由/
+    回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应 10MB 上限
+    (90221),audit_sheet 整链失败。行方向分块归 api 层。"""
+    asked = []
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_row_count", lambda s: 3)
+    monkeypatch.setattr(
+        listing_sheet.feishu, "sheet_values_rows",
+        lambda s, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            [(2, ["T1", "B0AAAAAAA1", "t", "pt", ""]),
+             (3, ["T1", "B0AAAAAAA2", "t", "pt", "pass"])])[1])
+    got = listing_sheet.audit_targets()
+    assert asked == [("A", "E", 2, 3)]        # 只读前五列,行区间对
+    assert [r["asin"] for r in got] == ["B0AAAAAAA1"]
 
 
 def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
@@ -60,7 +78,8 @@ def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
             _sheet_row(3, audit_result="Pending"),      # 大小写不该决定命运
             _sheet_row(4, audit_result="pass"),
             _sheet_row(5, audit_result="reject")]
-    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(listing_sheet, "read_rows",
+                        lambda upto=None: rows)
     assert [r["rownum"] for r in listing_sheet.audit_targets()] == [2, 3]
     # 而 pass 重新被领 = 已上架的行被反复重审,那是另一头的错
     assert ln.AUDIT_OK == "approved"                    # 上架闸判 PG 英文态

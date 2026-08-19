@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **66 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **67 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **11 条自动任务**在生产运行(电脑 launchd 2 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
@@ -252,6 +252,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | `product_query` | | 按产品 ID 查沃尔玛商品详情 |
 | `node_backfill` | | 从已存快照回填类目 ID 锚(零重采) |
 | `pt_backfill` | | 历史实证 PT 回填产品主档 |
+| `sources_backfill` | | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
 | `pt_census` | | 沃尔玛类目(PT)四源对账:哪些 PT 真实存在 |
 | `sku_normalize` | | 事件账本 SKU→ASIN 清洗 |
 | `taxonomy_import` | | 亚马逊类目树入库(ID 主键) |

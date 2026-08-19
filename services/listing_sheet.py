@@ -254,6 +254,11 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
         # 政策违禁(旧 O 列第五类,2026-08-12 抢救接线):永远不能上架,
         # 不进 FAILED 重试通道——重发也永远是拒,白烧 UPC 与配额
         return "PROHIBITED", code
+    if code in resources.WALMART_ERR_CONTENT:
+        # 内容标准拒(2026-08-19):文案图片取自亚马逊原文,原样重发必然
+        # 同拒,还触发/延长 QARTH 审查。不自动重试;人工改文案后清 O 列
+        # 可重回通道(语义与 PROHIBITED 的"永不"有别)
+        return "CONTENT_REJECTED", code
     if status == "success":
         return ("SUCCESS", "") if not code else ("SUCCESS_WITH_WARNING", code)
     if status == "failed":

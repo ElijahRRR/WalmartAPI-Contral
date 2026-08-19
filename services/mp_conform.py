@@ -834,6 +834,39 @@ def validate(spec: dict, ospec: dict, visible: dict, orderable: dict
     return bad
 
 
+def clamp_max_length(spec: dict | None, section: dict
+                     ) -> tuple[dict, list[str]]:
+    """输入:spec + 段 → 输出:(截断后段, 说明)。按 spec 的 maxLength 本地截超长。
+
+    2026-08-19 生产实证(EXT_DATA_ERROR_01076067496949 ×12:envelopeSize>12 /
+    manufacturerPartNumber>60 / clothingSize>17):沃尔玛按 maxLength 整条拒,
+    本地拦下省 UPC 也省配额。两种形态:字符串字段本体的 maxLength、数组字段
+    items.maxLength(逐元素)。截断必须记 notes——静默截断 = 数据悄悄变了
+    没人知道。spec 没标 maxLength 的字段不碰。
+    """
+    props = _props(spec)
+    out, notes = dict(section), []
+    for k, meta in props.items():
+        if k not in out or not isinstance(meta, dict):
+            continue
+        v = out[k]
+        ml = meta.get("maxLength")
+        if isinstance(ml, int) and ml > 0 and isinstance(v, str) and len(v) > ml:
+            out[k] = v[:ml].rstrip()
+            notes.append(f"{k} 超长 {len(v)} 字符按 maxLength 截到 ≤{ml}")
+            continue
+        it = meta.get("items")
+        iml = it.get("maxLength") if isinstance(it, dict) else None
+        if isinstance(iml, int) and iml > 0 and isinstance(v, list):
+            n_cut = sum(1 for x in v if isinstance(x, str) and len(x) > iml)
+            if n_cut:
+                out[k] = [x[:iml].rstrip()
+                          if isinstance(x, str) and len(x) > iml else x
+                          for x in v]
+                notes.append(f"{k} {n_cut} 个元素超长按 maxLength 截到 ≤{iml}")
+    return out, notes
+
+
 def conform(spec: dict | None, ospec: dict | None, visible: dict,
             orderable: dict, sku: str = "", variant: dict | None = None
             ) -> tuple[dict, dict, list[str], list[str]]:
@@ -855,6 +888,7 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
     visible, n = fill_missing_required(spec, visible);      notes += n
     visible, n = fix_type_mismatches(spec, visible);        notes += n
     visible, n = fix_invalid_enums(spec, visible);          notes += n
+    visible, n = clamp_max_length(spec, visible);           notes += n
     if _props(ospec):
         # Orderable 段同样过条件必填/类型/枚举一致化(2026-08-12 旧仓对照:
         # 旧系统 Orderable 由 LLM 按 spec 填,新系统交还 LLM 后这层同样要兜;
@@ -864,6 +898,8 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
         orderable, n = fix_type_mismatches(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]
         orderable, n = fix_invalid_enums(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
+        orderable, n = clamp_max_length(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]
     visible, n = ensure_variant_bag(spec, visible, sku, variant); notes += n
     if _props(ospec):

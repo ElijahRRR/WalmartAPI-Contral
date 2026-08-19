@@ -292,3 +292,25 @@ def test_date_fields_never_get_junk_defaults():
                                           "enum": ["Yes", "No"]}}}
     v3, _ = mc.fix_type_mismatches(spec3, {"promoDate": "No"})
     assert v3["promoDate"] == "No"
+
+
+def test_clamp_max_length_local_gate():
+    """按 spec maxLength 本地截超长(2026-08-19 生产实证 01076067496949 ×12:
+    envelopeSize>12 / manufacturerPartNumber>60 / clothingSize>17 被沃尔玛
+    整条拒)。字符串本体与数组元素两种形态;没标 maxLength 的字段不碰。"""
+    from services import mp_conform as mc
+    spec = {"properties": {
+        "envelopeSize": {"type": "string", "maxLength": 12},
+        "tags": {"type": "array", "items": {"type": "string", "maxLength": 5}},
+        "free": {"type": "string"}}}
+    out, notes = mc.clamp_max_length(spec, {
+        "envelopeSize": "4.13 x 9.5 inches long",
+        "tags": ["short", "waytoolongvalue"],
+        "free": "x" * 500})
+    assert len(out["envelopeSize"]) <= 12
+    assert out["tags"] == ["short", "wayto"]
+    assert out["free"] == "x" * 500                 # 没标上限的不碰
+    assert any("envelopeSize" in n for n in notes)
+    assert any("tags" in n for n in notes)          # 截断必须见 notes
+    out2, notes2 = mc.clamp_max_length(spec, {"envelopeSize": "small"})
+    assert out2["envelopeSize"] == "small" and notes2 == []

@@ -15,6 +15,8 @@ def test_classify_receipt_priority():
     assert c("success", "ERR_EXT_DATA_0101211\t")[0] == "SKU_LOCKED"  # 尾部 \t 实证
     # 异步审核假错误绝不当失败(即使 status=failed)
     assert c("failed", "EXT_DATA_ERROR_56026862530206")[0] == "ASYNC_PENDING"
+    # 内容标准拒(2026-08-19):文案是亚马逊原文,原样重发必然同拒 → 不重试
+    assert c("failed", "EXT_DATA_ERROR_07705958490105")[0] == "CONTENT_REJECTED"
     assert c("success", "")[0] == "SUCCESS"
     assert c("success", "SOME_WARN") == ("SUCCESS_WITH_WARNING", "SOME_WARN")
     assert c("failed", "ERR_X") == ("FAILED", "ERR_X")

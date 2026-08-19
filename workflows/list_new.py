@@ -912,8 +912,11 @@ def run(params: dict) -> str:
     open_rows = [r for r in rows
                  if r["listed"].lower() in ("", "no") and not r["feed_id"]
                  # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
-                 # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额)
-                 and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED")]
+                 # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额);
+                 # CONTENT_REJECTED 内容标准拒(2026-08-19):文案是亚马逊
+                 # 原文,原样重发必然同拒——人工改文案清 O 列后才重回通道
+                 and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED",
+                                              "CONTENT_REJECTED")]
     fresh, n_unaudited, n_rejected = [], 0, 0
     for r in open_rows:
         st = (verdicts.get(r["asin"]) or (None, None))[0]

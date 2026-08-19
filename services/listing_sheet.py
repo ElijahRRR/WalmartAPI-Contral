@@ -192,12 +192,31 @@ def write_audit_notes(updates: list[tuple[int, str]],
 
 
 def write_reason(rownum: int, reason: str, execute: bool = True) -> None:
-    """输入:行号 + 未上架理由 → 输出:无(只写 N 列)。"""
+    """输入:行号 + 未上架理由 → 输出:无(只写 N 列,单行单请求)。
+
+    ⚠ 只给"确实只有一行要写"的调用方用;成批理由必须走 write_reasons ——
+    循环调本函数 = 一行一个飞书请求(2026-08-19 所有者实遇:几百行淘汰
+    理由逐行写,提交前白耗几分钟)。
+    """
+    write_reasons([(rownum, reason)], execute)
+
+
+def write_reasons(items: list[tuple[int, str]], execute: bool = True) -> int:
+    """输入:[(行号, 理由)] → 输出:写入行数(N 列一次批量提交)。
+
+    切块交给 feishu.sheet_write_ranges(≤100 范围且 ≤4000 行/请求,
+    90227 修复后的双预算)——几百行理由从几百个请求收敛到几个。
+    """
+    if not items:
+        return 0
     if not execute:
-        logger.info("[DRY-RUN] 将回写 第%d行 N=%s", rownum, reason)
-        return
-    feishu.sheet_write_ranges(resources.LISTING_SHEET,
-                              [(f"N{rownum}:N{rownum}", [[reason]])])
+        for rownum, reason in items[:20]:
+            logger.info("[DRY-RUN] 将回写 第%d行 N=%s", rownum, reason)
+        return 0
+    feishu.sheet_write_ranges(
+        resources.LISTING_SHEET,
+        [(f"N{rn}:N{rn}", [[reason]]) for rn, reason in items])
+    return len(items)
 
 
 def clear_for_relist(rownums: list[int], execute: bool = True) -> int:

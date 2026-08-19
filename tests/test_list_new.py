@@ -552,7 +552,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
         a[2], a[3], [], ["brand"] if str(k.get("sku", "")).endswith("BAD") else []))
     monkeypatch.setattr(ln.listing_sources, "register", lambda *a, **k: None)
     monkeypatch.setattr(ln.product_events, "record_many", lambda *a, **k: None)
-    monkeypatch.setattr(ln.listing_sheet, "write_reason", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_reasons", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
 
@@ -637,7 +637,7 @@ def _wire_execute_env(monkeypatch, rows, products):
             o["productIdentifiers"]["productId"]), {"pt": pt})[1])
     monkeypatch.setattr(ln.listing_sources, "register", lambda *a, **k: None)
     monkeypatch.setattr(ln.product_events, "record_many", lambda *a, **k: None)
-    monkeypatch.setattr(ln.listing_sheet, "write_reason", lambda *a, **k: None)
+    monkeypatch.setattr(ln.listing_sheet, "write_reasons", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
 
@@ -775,3 +775,20 @@ def test_map_llm_three_level_fetch(monkeypatch):
     ln._map_llm(object(), "Cups", {}, prod, stats=stats)
     assert calls["llm"] == 1 and len(calls["put"]) == n_put
     assert stats["cache"] == 1
+
+
+def test_write_reasons_is_one_batched_call(monkeypatch):
+    """理由回写必须批量(2026-08-19 所有者实遇):此前逐行一格一请求,
+    几百行淘汰理由 = 提交前白耗几分钟。现在 N 行收敛为一次
+    sheet_write_ranges(切块归飞书层的双预算)。"""
+    from api import feishu
+    from services import listing_sheet as ls
+    calls = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda t, ranges: (calls.append(ranges), len(ranges))[1])
+    n = ls.write_reasons([(2, "理由A"), (5, "理由B"), (9, "理由C")])
+    assert n == 3 and len(calls) == 1               # 三行一次请求
+    assert calls[0][0] == ("N2:N2", [["理由A"]])
+    assert ls.write_reasons([], True) == 0 and len(calls) == 1
+    assert ls.write_reasons([(3, "x")], execute=False) == 0   # dry-run 不写
+    assert len(calls) == 1

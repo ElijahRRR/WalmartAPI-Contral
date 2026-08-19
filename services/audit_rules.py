@@ -196,10 +196,18 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # 四闸全部直读黑名单中心(所有者定稿 2026-08-13,一份数据):
     # 卖家/类目 = risk_sync 镜像的两张新表;ASIN = 自产黑名单(问题商品清理
     # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
+    p0_sellers = _frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist")
+    p0_asins = _frozen(conn, "SELECT asin FROM catalog.asin_blacklist")
+    p0_cats = _frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist")
+    # 报数与品牌黑名单同款(2026-08-19 所有者在运行日志里找不到这三张表的
+    # 加载痕迹——加载是真的,静默也是真的;三张表载成空集与没加载在行为上
+    # 无法区分,必须让数字见人)
+    logger.info("黑名单中心加载:卖家 %d / ASIN %d / 类目 %d",
+                len(p0_sellers), len(p0_asins), len(p0_cats))
     return AuditContext(
-        phase0_sellers=_frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist"),
-        phase0_asins=_frozen(conn, "SELECT asin FROM catalog.asin_blacklist"),
-        phase0_cats=_frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"),
+        phase0_sellers=p0_sellers,
+        phase0_asins=p0_asins,
+        phase0_cats=p0_cats,
         brand_blacklist=brand,
         pt_meta=pt_meta,
         pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "

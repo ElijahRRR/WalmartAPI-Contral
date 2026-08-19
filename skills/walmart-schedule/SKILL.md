@@ -59,7 +59,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 | 任务 | 时间 | 跑什么 |
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
-| `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+| `order_chain` | 每小时 :20 | order_sync → product_ingest → order_audit → returns_sync |
 
 它们跑在**电脑自己的 launchd** 上,而不是你的定时任务里 —— 频率太细(每半小时 / 每小时固定分钟),你那边多半排不准,而排不准的后果不是报错,是悄悄少跑几轮。
 

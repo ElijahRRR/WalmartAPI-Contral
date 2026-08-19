@@ -60,7 +60,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 | 任务 | 频率 | 跑什么 |
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
-| `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+| `order_chain` | 每小时 :20 | order_sync → product_ingest → order_audit → returns_sync |
 
 两个理由,都不是偏好问题:
 

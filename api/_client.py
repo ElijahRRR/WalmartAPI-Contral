@@ -563,7 +563,10 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 except Exception as e:
                     _log(f"✗ {method} {status} 但 JSON 解析失败 {url}: {e}", quiet)
         else:
-            body_snip = resp.text[:200] if method in ("POST", "PUT") else ""
+            # 500 截取,不是 200(2026-08-19):Akamai 错误页的 Reference #
+            # 在 HTML 后半段,200 字符正好截在它前面——持续 5xx 要开沃尔玛
+            # 工单,工单要的就是这个号
+            body_snip = resp.text[:500] if method in ("POST", "PUT") else ""
             msg = f"✗ {method} {status} {url}"
             if body_snip:
                 msg += f": {body_snip}"

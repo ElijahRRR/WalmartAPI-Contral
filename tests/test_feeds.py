@@ -369,3 +369,47 @@ def test_feed_rate_buckets_default_deny():
     _client.rate_acquire("feeds.get", "cid_bucket_test")
     with pytest.raises(KeyError, match="限速桶未登记"):
         _client.rate_acquire("feeds.post.MP_INVENTORY", "cid_bucket_test")
+
+
+def test_submit_5xx_found_adopts_instead_of_terminal_fail(monkeypatch):
+    """5xx ≠ 4xx(2026-08-19 官方核验 + 生产实证 Akamai 'Internal Server
+    Error - Read' = 边缘从源站读响应失败):请求可能已达、feed 可能已建成。
+    终态拒会把已达的 feed 弄丢台账 → 必须反查三态,查到就收编。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+    now_ms = int(time.time() * 1000)
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500, text="<HTML><HEAD>\n<TITLE>Internal "
+                                            "Server Error</TITLE></HEAD>")
+        return httpx.Response(200, json={"results": {"feed": [
+            {"feedId": "F_5XX", "itemsReceived": 1, "feedDate": now_ms}]}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0] == {"feed_id": "F_5XX", "count": 1, "outcome": "submitted"}
+    assert calls["post"] == 1                    # 反查已达 → 收编,不补交
+
+
+def test_submit_5xx_notfound_resubmits_once(monkeypatch):
+    """5xx 且双确认未达 → 同一载荷补交一次(官方口径 retry with backoff;
+    反查的 30s 双确认就是退避)。4xx 的"绝不重试"语义不变(上面老测试钉着)。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            if calls["post"] == 1:
+                return httpx.Response(500, text="<HTML>edge error</HTML>")
+            return httpx.Response(200, json={"feedId": "F_RETRY"})
+        return httpx.Response(200, json={"results": {"feed": []}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0]["outcome"] == "submitted" and out[0]["feed_id"] == "F_RETRY"
+    assert calls["post"] == 2

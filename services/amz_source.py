@@ -101,6 +101,31 @@ def _rawget(raw, key: str) -> str | None:
     return s or None
 
 
+def main_title(p: dict) -> str | None:
+    """输入:fetch_products 的产品 dict → 输出:**主标题原文**;拆不出返回 None。
+
+    2026-08 亚马逊把标题拆两段,采集侧按 " | " 拼回 title 并把后半段单独放
+    slow.subtitle(在本模块的 attrs 里)。这里做精确逆操作 removesuffix
+    (" | " + subtitle)——不按 "|" 猜切(采集契约明令禁止:正文本来就可能
+    含 |)。三种形态:
+      · subtitle 非空且 title 以其结尾 → 剥掉尾段,得主标题;
+      · subtitle 空且 title 不含 " | " → title 本身就是主标题(无副标题页,
+        或本来就短);
+      · 其余(改版前老记录:subtitle 空但 title 是拼好的长串)→ None,
+        调用方推重采等新数据,**不猜**。
+    """
+    t = str(p.get("title") or "")
+    sub = str((p.get("attrs") or {}).get("subtitle") or "")
+    if not t:
+        return None
+    if sub:
+        tail = " | " + sub
+        if t.endswith(tail) and t[: -len(tail)].strip():
+            return t[: -len(tail)]
+        return None
+    return t if " | " not in t else None
+
+
 def fetch_products(asins: list[str]) -> dict[str, dict]:
     """输入:ASIN 列表 → 输出:{asin: 产品数据契约 dict}(缺席的不出现)。
 

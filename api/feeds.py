@@ -313,14 +313,26 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
                     store["name"], feed_type, n, data["feedId"])
         return _ok(data["feedId"])
 
-    if status is not None:
-        # 服务端明确拒绝(4xx/5xx):没提交上,落 failed,绝不自动换姿势重试
+    if status is not None and status < 500:
+        # 4xx 明确拒绝:载荷/权限问题,没提交上,落 failed,绝不自动换姿势重试
         _log_update(log_id, "failed")
         logger.error("feed 提交被拒:%s %s HTTP %s 响应=%s",
                      store["name"], feed_type, status, str(data)[:300])
         return {"feed_id": None, "count": n, "outcome": "failed"}
 
-    # 网络异常(status=None):不知道到没到 → 反查三态
+    if status is not None:
+        # 5xx ≠ 4xx(2026-08-19 官方核验 developer.walmart.com error-codes:
+        # SYSTEM_ERROR/INVALID_SYSTEM_STATE 的官方处置是 retry with backoff)。
+        # 生产实证:Akamai「Internal Server Error - Read」= 边缘从**源站**读
+        # 响应失败——请求可能已达业务层、feed 可能已建成而响应丢了。这与
+        # 网络异常同属"不知道到没到",当终态拒会漏收编已达的 feed、白弃
+        # 未达的提交。往下走反查三态(NOT_FOUND 自带 30s 双确认 = 天然退避;
+        # 此前把 5xx 与 4xx 混在一起终态拒,C017 的 297 条删除因此反复搁浅)
+        logger.warning("feed 提交遇 5xx:%s %s HTTP %s,"
+                       "按'不知道到没到'走反查三态",
+                       store["name"], feed_type, status)
+
+    # 网络异常(status=None)或 5xx:不知道到没到 → 反查三态
     verdict, feed = find_recent_feed(store, feed_type, n)
     if verdict == "FOUND":
         logger.warning("feed 网络异常但反查已达:%s %s feedId=%s(收编,不补交)",

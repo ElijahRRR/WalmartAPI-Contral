@@ -1103,3 +1103,75 @@ def test_summary_order_does_not_depend_on_which_store_finishes_first():
     src = inspect.getsource(mw.run)
     merge = src[src.index("as_completed"):]
     assert "per_store" in merge and "for name, _ in todo" in merge
+
+
+def test_title_mismatch_delete_is_paused(monkeypatch):
+    """2026-08-19 所有者:「暂时关闭'删除(title_mismatch)'这个维护」。
+
+    停闸只停删除这一个出口:not_found 的删除照发;classify 的判据本身不动
+    (price/title provider 的"低相似度不改价不改标题"防呆靠它,必须活着)。
+    恢复 = TITLE_MISMATCH_DELETE 改回 True,行为回到停闸前(下面一段钉住)。
+    """
+    assert mi.TITLE_MISMATCH_DELETE is False        # 停闸是当前现状
+    rows = [_row(sku="B0MISMATCH", name="Walmart Title AAA",
+                 slow={"title": "Totally Different ZZZ"}),
+            _row(sku="B0GONE2", outcome="not_found",
+                 name="X", slow={"title": "X"})]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = mi.delete_intents(_Conn(rows=[]))
+    got = {i["sku"]: i["code"] for i in out}
+    assert "B0MISMATCH" not in got                  # 停闸:不出删除建议
+    assert got.get("B0GONE2") == "not_found"        # 别的删除原因不受影响
+    # classify 判据本身仍在(防呆消费方靠它)
+    assert mi.classify(title_similarity=0.42)[:2] == ("delete", "title_mismatch")
+
+    monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)
+    out2 = mi.delete_intents(_Conn(rows=[]))
+    assert {i["sku"]: i["code"] for i in out2}.get("B0MISMATCH") \
+        == "title_mismatch"                          # 恢复开关即回到旧行为
+
+
+# ── 双基准标题相似度(2026-08-19 所有者定稿:亚马逊标题拆两段之后)──────────
+
+_LONG = "River Dream Waffle Shower Curtain with Liner Graphite Grey 71x74"
+_SUB = "Snap-in Liner Heavy Duty Hotel Grade Mesh Top Window Standard Size"
+_SLOW_SPLIT = {"title": f"{_LONG} | {_SUB}", "subtitle": _SUB, "brand": None}
+
+
+def test_main_processed_title_exact_removesuffix():
+    """主标题 = 精确剥掉 " | "+subtitle 尾段;不按 "|" 猜切。
+
+    改版前老记录(subtitle 空、title 是拼好的长串)返回 "" —— 拆不出就说
+    拆不出,不猜(契约明令禁止按分隔符切,正文本来就可能含 |)。
+    """
+    assert mi.main_processed_title(_SLOW_SPLIT).startswith("River Dream")
+    assert _SUB.split()[0] not in mi.main_processed_title(_SLOW_SPLIT)
+    assert mi.main_processed_title(
+        {"title": f"{_LONG} | {_SUB}", "subtitle": None}) == ""   # 老记录不猜
+    assert mi.main_processed_title(
+        {"title": "尾巴对不上 | X", "subtitle": "Y"}) == ""       # 结尾不匹配
+    assert mi.main_processed_title(None) == ""
+
+
+def test_title_sim_dual_takes_the_better_basis():
+    """双基准取 max:在架标题=主标题(内容拒捞回重上的短标题行)时,
+    单基准 ~0.6 会误判"不是同一个商品",双基准 = 1.0。"""
+    wm = mi.processed_title({"title": _LONG, "brand": None})    # 短标题在架
+    single = mi.order_audit.title_similarity(wm, mi.processed_title(_SLOW_SPLIT))
+    assert single is not None and single < mi.TITLE_SIM_FLOOR   # 单基准会误杀
+    dual = mi.title_sim_dual(wm, _SLOW_SPLIT)
+    assert dual is not None and dual > 0.99                     # 双基准救回
+
+
+def test_short_title_row_survives_delete_and_retitle(monkeypatch):
+    """捞回重上的短标题行:①删除判据(即使停闸恢复后)不再命中
+    title_mismatch;②改标题 provider 不把它改回长标题(改回去 = 亲手撤销
+    捞回修复,下一轮又被内容审查拒一遍)。"""
+    monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)      # 按停闸恢复后验
+    wm = mi.processed_title({"title": _LONG, "brand": None})
+    rows = [_row(sku="B0SHORT", name=wm, slow=_SLOW_SPLIT)]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    dels = mi.delete_intents(_Conn(rows=[]))
+    assert [d for d in dels if d["sku"] == "B0SHORT"] == []     # ① 不删
+    titles = mi.title_intents(_Conn(rows=[]))
+    assert [t for t in titles if t["sku"] == "B0SHORT"] == []   # ② 不改回长

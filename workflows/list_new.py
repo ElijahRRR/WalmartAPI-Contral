@@ -2,8 +2,11 @@
 
 用法(⚠ 缺省即真跑 —— 会真领 UPC、真提交 feed 到沃尔玛):
   python cli.py list_new --dry-run           # 空跑:闸门链判定+逐行去向,不提交
-  python cli.py list_new                     # 真跑(领 UPC/LLM 映射/提交 feed)
+  python cli.py list_new                     # 真跑(LLM 出参/领 UPC/提交 feed)
   python cli.py list_new -p store=A085朱丽霖
+  python cli.py list_new -p gap_wait=0       # 缺数据只推采集不等(默认等 20 分钟)
+  python cli.py list_new -p workers=64       # 预备期 LLM 并发(默认 128,
+                                             # 实际还会按 PG 连接余量钳制)
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
 且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
@@ -31,15 +34,23 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
     ⚠ 占用闸与快照闸**并存**(A1 阶段):台账回填完整前,快照闸仍是主力;
     两道都过才放行,理由分开写,谁拦的一目了然
-  ⑤ 数据源(services/amz_source,缺席:该行本轮跳过**不写终态**,并把
-    缺数据 ASIN **自动推给采集服务**补采(所有者批复 2026-08-12 接上闭环;
-    日界批次名防重,当天已推不重推),采集落库后自动续上
+  ⑤ 数据源(services/amz_source,缺席:**同轮闭环**,所有者定稿 2026-08-18
+    与审核链同款——缺数据 ASIN 推采集(日界批次名防重)+ 插队 → 等它采完
+    (默认 20 分钟,`-p gap_wait=` 可调)→ 就地摄取(借 product_ingest 的
+    锁)→ 本轮续走;超时不是失败,救回多少上多少,仍缺的照旧不写终态
   ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
     (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
     只有区间内倍率未配置才淘汰)
-  ⑦ UPC 领号(catalog.upc_pool 事务)→ LLM 映射(llm_cache)→ mapper
-    硬约束 → 同店打包单个 MP_ITEM feed(10/hour 硬限)
+  ⑦ 三段式提交(所有者定稿 2026-08-18 重排:「过闸后默认128并发打
+    deepseek…能过的才能领 upc,领完直接按店批量上架」):
+    预备期 = LLM 出参(取数三级:llm_cache 一级 hash 命中 → 二级同
+    (asin,pt) 旧出参复用(硬条件签名 + 标题规格验证,见 _map_llm 头注)
+    → 才真调;默认 128 并发,按 PG 连接余量钳制)+ mapper 硬约束 +
+    spec 一致化,UPC 用占位号,缺必填本地拦下
+    (不领号不烧配额)→ 领号期 = 通过的行按店批量领 UPC(catalog.upc_pool
+    事务,FOR UPDATE SKIP LOCKED),真号回填占位号 → 提交期 = 同店打包
+    单个 MP_ITEM feed(10/hour 硬限),店间并发 ≤24
 
 闸门链之前先**注入一次 UPC 池**(所有者定稿 2026-08-16:「运行时自动同步
 一次 UPC,然后再走上架流程」)——运营刚贴进「UPC池」表的号,这一轮就要能领。
@@ -56,14 +67,16 @@ upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)�
 import collections
 import contextlib
 import logging
+import threading
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
-    kpi, listing_sheet, listing_sources, llm_cache, mp_conform, mp_mapper, \
-    pricing, product_events, pt_spec, risk_gate, store_limits, \
-    stores as stores_svc, upc_pool, variant_group, variant_remap, variant_title
+    db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
+    mp_mapper, pricing, product_events, product_ingest, pt_spec, risk_gate, \
+    runlock, scrape_batches, store_limits, stores as stores_svc, upc_pool, \
+    variant_group, variant_remap, variant_title
 
 DANGEROUS = True
 
@@ -205,8 +218,9 @@ def _dump_llm_debug(asin: str, visible: dict, orderable: dict,
         logger.warning("载荷落盘失败(不影响主链): %s", e)
 
 
-def _push_scrape(absent: list[str], execute: bool) -> str | None:
-    """输入:缺数据 ASIN 列表 + 是否真跑 → 输出:摘要行(None=无缺数据)。
+def _push_scrape(absent: list[str], execute: bool
+                 ) -> tuple[str | None, list[str]]:
+    """输入:缺数据 ASIN 列表 + 是否真跑 → 输出:(摘要行, 可等待的批次名)。
 
     采集闭环(所有者批复 2026-08-12):数据源缺席的 ASIN 自动推给采集服务,
     替代"接线期人工推"。批次名带北京日界,天然防重——当天第二轮撞名
@@ -215,43 +229,205 @@ def _push_scrape(absent: list[str], execute: bool) -> str | None:
     推送失败只告警不阻塞上架:缺数据行本来就是跳过不写终态。
     """
     if not absent:
-        return None
+        return None, []
     day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
     name = f"listing_gap_{day}"
     if not execute:
         return (f"  [DRY-RUN] 缺数据 {len(absent)} 个 ASIN,"
-                f"真跑时将推采集批次 {name}")
+                f"真跑时将推采集批次 {name}"), []
+    # 2026-08-18 所有者定稿同轮闭环之后,这批采集**本侧在等**(下游 20 分钟
+    # 窗口),所以:①落 ops.scrape_batches 台账(check_open/监控能圈到它);
+    # ②插队(与 audit_gap 同一条时间账:不插队几乎注定等不到)。此前
+    # "list_new 补采不插队"的口径随"本轮跳过"语义一并作废。
     try:
         r = scraper.submit_batch(name, absent)
-        return (f"  缺数据 {len(absent)} 个 ASIN 已推采集"
-                f"(批次 {name},入库 {r.get('inserted')})")
-    except scraper.BatchExistsError:
+        bid = r.get("batch_id")
+        scrape_batches.record(name, bid, len(absent), "pushed",
+                              f"list_new 同轮闭环 inserted={r.get('inserted')}")
+        note = (f"  缺数据 {len(absent)} 个 ASIN 已推采集"
+                f"(批次 {name},入库 {r.get('inserted')})"
+                + ("" if scrape_batches.prioritize(name, bid)
+                   else ",⚠ 插队没成功(按常规优先级采,可能等不到)"))
+        return note, [name]
+    except scraper.BatchExistsError as e:
+        scrape_batches.record(name, e.batch_id, len(absent), "pushed",
+                              "同日已推,沿用既有批次")
+        scrape_batches.prioritize(name, e.batch_id)
         return (f"  缺数据 {len(absent)} 个 ASIN:今日批次 {name} 已推过,"
-                f"不重推(增量明日随新批次)")
+                f"沿用既有批次接着等"), [name]
     except Exception as e:
         logger.warning("推采集失败(不阻塞上架,缺数据行本轮跳过): %s", e)
-        return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}"
+        scrape_batches.record(name, None, len(absent), "failed", str(e)[:200])
+        return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}", []
 
 
-def _map_llm(conn, pt: str, spec, product: dict) -> tuple[dict, dict]:
+def _ingest_now() -> str:
+    """输入:无 → 输出:就地增量摄取摘要(拿不到锁则说明原因)。
+
+    **借的是 product_ingest 的活,就得借它的锁**(与 product_audit._ingest_now
+    逐字同款纪律):增量游标 `ops.cursors` name='product_ingest' 是独占推进的,
+    两个进程同时拉 `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉
+    先写的,中间那段记录**永远不会再被拉一次**(游标只前进不回头)——
+    两侧都不报错,只是产品中心少了一批数据。
+
+    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
+    只是本轮这批可能来不及,照旧不写终态、次日续上。
+    """
+    with runlock.hold(product_ingest.CURSOR_NAME) as got:
+        if not got:
+            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
+                    "数据仍会由它摄入,这批照旧不写终态")
+        res = product_ingest.pump(scraper, db)
+    return "就地" + product_ingest.pump_summary(res)
+
+
+_STATS_LOCK = threading.Lock()
+
+
+def _bump(stats: dict | None, key: str) -> None:
+    """预备期并发下的取数计数(dict 的 += 非原子,统一走这把锁)。"""
+    if stats is not None:
+        with _STATS_LOCK:
+            stats[key] = stats.get(key, 0) + 1
+
+
+def _map_llm(conn, pt: str, spec, product: dict,
+             stats: dict | None = None) -> tuple[dict, dict]:
     """LLM 映射(缓存优先)→ (清洗后 Visible, LLM 填的 Orderable 字段)。
 
     2026-08-12 旧仓对照恢复两段式:Orderable 的非系统字段(条件必填等)
     交还 LLM 填,系统强制项在 build_orderable 里覆盖;Visible 照旧过
     finalize_visible 硬约束清洗。
+
+    取数三级(2026-08-18 所有者定稿加二级):
+      ① input_hash 精确命中(catalog.llm_cache);
+      ② miss 时按 (asin, pt) 反查最近出参:reuse_sig 相等(spec 字段面/
+        brand/category/变体属性都没变)且新旧标题过规格 token 验证
+        (mp_mapper.title_spec_compatible)才复用——文案图片本就由系统
+        每轮从最新采集数据覆盖、不靠 LLM,复用只赌"结构化字段没变"。
+        命中回写新 hash,下轮直接走 ①;
+      ③ 都不中才真打 LLM。
+    stats 计四类(cache/reuse/reuse_miss/llm),预备期摘要必须亮出来——
+    二级是兜底式优化,静默常态化 = 它在替 LLM 说话而没人知道。
     """
     messages = mp_mapper.build_llm_messages(pt, spec, product,
                                             ospec=pt_spec.orderable_spec())
     key = llm_cache.cache_key(messages, 0.2, 4096)
     raw = llm_cache.get(conn, key)
-    if raw is None:
-        raw = llm.chat_json(messages)
-        llm_cache.put(conn, key, raw)
+    meta = {"asin": product.get("asin"), "pt": pt,
+            "src_title": product.get("title"),
+            "reuse_sig": mp_mapper.reuse_sig(pt, spec, product,
+                                             ospec=pt_spec.orderable_spec())}
+    if raw is not None:
+        _bump(stats, "cache")
+    else:
+        got = (llm_cache.find_reusable(conn, meta["asin"], pt,
+                                       meta["reuse_sig"])
+               if meta["asin"] else None)
+        if got and mp_mapper.title_spec_compatible(
+                got[1], product.get("title") or "", got[0]):
+            raw = got[0]
+            _bump(stats, "reuse")
+            logger.info("%s 二级复用旧出参(硬条件同 + 标题规格验证通过,"
+                        "零 LLM)", meta["asin"])
+        else:
+            if got:
+                _bump(stats, "reuse_miss")
+                logger.info("%s 有旧出参但标题规格验证不过(规格疑似变了),"
+                            "重打 LLM", meta["asin"])
+            raw = llm.chat_json(messages)
+            _bump(stats, "llm")
+        llm_cache.put(conn, key, raw, **meta)
     raw_v, raw_o = mp_mapper.split_llm_output(raw)
     visible = mp_mapper.finalize_visible(pt, raw_v, spec,
                                          images=product.get("images"),
                                          product=product)
     return visible, raw_o
+
+
+# 预备期占位 UPC(_spec_precheck 的生产验证方案):出参与 spec 一致化都不依赖
+# 真号 —— UPC 只进 orderable 的 productIdentifiers,通过后领到真号原位回填。
+_UPC_PLACEHOLDER = "000000000000"
+
+
+def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
+               ) -> tuple[list[dict], list[tuple[int, str]], dict]:
+    """输入:待提交行 + {店: partner_id} + 并发数 → 输出:(备好行, 理由, 计数)。
+
+    预备期(所有者定稿 2026-08-18 新流程):LLM 出参 + spec 一致化**前置到
+    领号之前**、全行跨店并发 —— 缓存优先,miss 才打 DeepSeek,高并发把墙钟
+    大头(LLM)压下来;UPC 用占位号,**过了一致化的行才有资格领号**,预备
+    失败不再走"领了再 release":池紧张时那会把号先占给注定失败的行,而且
+    release 回收让水位来回抖、摘要里 no_upc 忽多忽少没法对拍。
+
+    worker 各领一条 autocommit 连接(product_audit 判定并发同款连接池);
+    并发数由调用方先过 db_guard.cap_workers 钳制。输出按 rownum 定序 ——
+    完成序是随机的,不定序的话同一批重跑,摘要行序与随后的领号顺序都会漂。
+
+    备好行挂 `_visible` / `_orderable`(占位号在里面),提交期领到真号后
+    只回填 productIdentifiers,不重算。
+    """
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import ExitStack
+
+    llm_stats: dict = {}     # cache/reuse/reuse_miss/llm 四类取数计数
+
+    def _one(conn, r: dict) -> tuple:
+        spec = pt_spec.load_pt(r["product_type"])
+        visible, llm_o = _map_llm(conn, r["product_type"], spec, r["_p"],
+                                  stats=llm_stats)
+        if len(visible.get("productName") or "") < 10:
+            return ("title_short", r, "标题不足10字符", None)
+        orderable = mp_mapper.build_orderable(
+            r["asin"], _UPC_PLACEHOLDER, r["_price"], r["_qty"],
+            partners[r["store"]], pt=r["product_type"], product=r["_p"],
+            llm_fields=llm_o)
+        visible, orderable, notes, missing = mp_conform.conform(
+            spec, pt_spec.orderable_spec(), visible, orderable,
+            sku=r["asin"], variant=r.get("_vplan"))
+        if notes:
+            logger.info("%s spec 一致化 %d 处:%s", r["asin"],
+                        len(notes), "; ".join(notes[:6]))
+        if missing:
+            _dump_llm_debug(r["asin"], visible, orderable, missing, notes)
+            return ("invalid", r, f"必填缺失:{','.join(missing[:6])}", None)
+        return ("ok", r, None, (visible, orderable))
+
+    with ExitStack() as stack:
+        conns: _queue.SimpleQueue = _queue.SimpleQueue()
+        for _ in range(workers):
+            conns.put(stack.enter_context(db.pg_conn(autocommit=True)))
+
+        def _judge(r: dict) -> tuple:
+            c = conns.get()
+            try:
+                return _one(c, r)
+            except Exception as e:                              # noqa: BLE001
+                # 单行失败不许拖垮整批:该行不提交、理由写表,下轮重试
+                logger.warning("%s 预备期失败(该行本轮不提交): %s",
+                               r["asin"], e)
+                return ("llm_failed", r, f"出参失败:{e}", None)
+            finally:
+                conns.put(c)
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_judge, ready))
+
+    cnt = {"invalid": 0, "title_short": 0, "llm_failed": 0}
+    ok: list[dict] = []
+    reasons: list[tuple[int, str]] = []
+    for kind, r, why, payload in results:
+        if kind == "ok":
+            v, o = payload
+            ok.append({**r, "_visible": v, "_orderable": o})
+        else:
+            cnt[kind] += 1
+            reasons.append((r["rownum"], why))
+    ok.sort(key=lambda x: x["rownum"])
+    reasons.sort(key=lambda t: t[0])
+    cnt["llm_stats"] = llm_stats
+    return ok, reasons, cnt
 
 
 MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
@@ -644,7 +820,7 @@ def _spec_precheck(ready: list[dict]) -> str:
                 lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
                 continue
             orderable = mp_mapper.build_orderable(
-                r["asin"], "000000000000", r["_price"], r["_qty"], "0",
+                r["asin"], _UPC_PLACEHOLDER, r["_price"], r["_qty"], "0",
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
@@ -722,6 +898,11 @@ def _writeback_upc(execute: bool, lines: list[str]) -> None:
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
+    # 同轮闭环等待窗(分钟,0=只推不等)与预备期 LLM 并发(所有者定稿
+    # 2026-08-18:「过闸后默认128并发打deepseek」;实际并发还要过
+    # db_guard.cap_workers 按 PG 连接余量钳一道)
+    gap_wait = int(params.get("gap_wait", 20))
+    prep_workers = int(params.get("workers", 128))
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
@@ -840,7 +1021,24 @@ def run(params: dict) -> str:
     # 人工推")。日界批次名天然防重:当天已推过撞名即跳过,增量次日再推
     absent = sorted({r["asin"] for r in candidates
                      if products.get(r["asin"]) is None})
-    scrape_note = _push_scrape(absent, execute)
+    scrape_note, gap_names = _push_scrape(absent, execute)
+    gap_line = None
+    if execute and gap_names and gap_wait > 0:
+        # 同轮闭环(所有者定稿 2026-08-18,与审核链同款):推完**等它采完**,
+        # 就地摄取后本轮续走 —— 不再"本轮跳过、次日续上"。超时不是失败:
+        # 救回多少上多少,仍缺的照旧不写终态。list_new 是当天最后一棒
+        # (20:00),这 20 分钟不挤任何下游。
+        wnote, _n_open = scrape_batches.wait_settled(gap_names, gap_wait)
+        ing = _ingest_now()
+        refreshed = amz_source.fetch_products(absent)
+        saved = [a for a in absent if refreshed.get(a) is not None]
+        for a in saved:
+            products[a] = refreshed[a]
+        gap_line = (f"  同轮闭环:{wnote};{ing};"
+                    f"救回 {len(saved)}/{len(absent)}"
+                    + (f",仍缺 {len(absent) - len(saved)}"
+                       f"(不写终态,次日续)"
+                       if len(saved) < len(absent) else ""))
     survivors: list[dict] = []
     data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
     for r in candidates:
@@ -980,6 +1178,8 @@ def run(params: dict) -> str:
     lines.append(gate_line)
     if scrape_note:
         lines.append(scrape_note)
+    if gap_line:
+        lines.append(gap_line)
     if missing_warn:
         lines.append(f"  ⚠ {len(missing_warn)} 行有\"不明原因消失\"史"
                      f"(疑似平台下架)仍放行:{','.join(missing_warn[:8])}"
@@ -1010,77 +1210,101 @@ def run(params: dict) -> str:
         [(rn, v) for rn, v in data_echo if rn not in ready_rownums])
 
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
-    by_store2: dict[str, list[dict]] = {}
+
+    # ── 预备期(所有者定稿 2026-08-18 新流程)──────────────────────────────
+    # LLM 出参 + spec 一致化前置到领号之前、跨店高并发(缓存优先,miss 才打
+    # DeepSeek);占位号跑 conform,**通过的行才有资格领号**。Partner ID 预取:
+    # build_orderable 要它,而取不到凭证的店整店提交不了 —— 提前拦,
+    # 别让它的行进预备期白烧 LLM。
+    partners: dict[str, str] = {}
+    prep_in: list[dict] = []
+    by_store_pre: dict[str, list[dict]] = {}
     for r in ready:
+        by_store_pre.setdefault(r["store"], []).append(r)
+    for store_name, srows in sorted(by_store_pre.items()):
+        try:
+            partners[store_name] = settings_api.get_partner_id(
+                stores_by_name[store_name])
+            prep_in.extend(srows)
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("店铺 %s 取 Partner ID 失败,整店本轮跳过: %s",
+                           store_name, e)
+            lines.append(f"  ⚠ {store_name}:取 Partner ID 失败整店跳过"
+                         f"({e}),下轮重试")
+    prep_ok: list[dict] = []
+    if prep_in:
+        workers, clamp_note = db_guard.cap_workers(
+            min(prep_workers, max(1, len(prep_in))))
+        if clamp_note:
+            lines.append(f"  {clamp_note}")
+        prep_ok, prep_reasons, pc = _prep_rows(prep_in, partners, workers)
+        reasons.extend(prep_reasons)
+        n["invalid"] += pc["invalid"]
+        prep_post = [(lab, v) for lab, v in (
+            ("必填缺失", pc["invalid"]),
+            ("标题不足10字符", pc["title_short"]),
+            ("出参失败", pc["llm_failed"])) if v]
+        lines.append(f"预备期(出参+一致化,并发 {workers}):"
+                     f"通过 {len(prep_ok)}/{len(prep_in)}"
+                     + (";" + ",".join(f"{lab} {v}" for lab, v in prep_post)
+                        if prep_post else ""))
+        # 取数四类只报非零(规矩 2)。二级复用/拒绝必须见人——它是兜底式
+        # 优化,静默常态化 = 旧出参在替 LLM 说话而没人知道
+        st = pc.get("llm_stats") or {}
+        llm_line = ",".join(f"{lab} {st[k]}" for k, lab in (
+            ("cache", "一级缓存命中"), ("reuse", "二级复用(零LLM)"),
+            ("reuse_miss", "二级验证不过重打"), ("llm", "真调 LLM"))
+            if st.get(k))
+        if llm_line:
+            lines.append(f"  LLM 取数:{llm_line}")
+
+    by_store2: dict[str, list[dict]] = {}
+    for r in prep_ok:
         by_store2.setdefault(r["store"], []).append(r)
 
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
-        """输入:店铺 + 该店待提交行 → 输出:(店铺名, 计数增量, reasons, lines)。
+        """输入:店铺 + 该店**已备好**的行 → 输出:(店铺名, 计数增量, reasons, lines)。
+
+        提交期只剩三步:批量领号 → 真号回填占位号 → 同店打包提交。
+        LLM 出参与 spec 一致化已在预备期做完(挂在 _visible/_orderable 上),
+        这里**不重算** —— 重算等于预备期说的与真跑发的各算一次,
+        中间任何差异都会变成"预备期说没事"。
 
         **各店各自的局部状态**,主线程按店名排序合并 —— 跨店并发之后不能再往
         共享 dict/list 上写:`n["no_upc"] += 1` 是"读-加-写"三步,两个线程交错
         会**丢计数**(丢得随机、不报错);`reasons`/`lines` 直接 append 则会按
         完成先后乱序交织,同一轮跑两次输出不一样,dry-run 与真跑没法对拍。
 
-        **店内仍然串行**:领 UPC → LLM 出参 → spec 一致化 → 提交 feed 这条链
-        对同一个店是有序的,并发只加在店与店之间。领号本身并发安全
-        (upc_pool.claim 用 FOR UPDATE SKIP LOCKED,「并发领号互不阻塞且绝不
-        双领」),每店各开各的 pg 连接,不共享游标。
+        领号并发安全(upc_pool.claim 用 FOR UPDATE SKIP LOCKED,「并发领号
+        互不阻塞且绝不双领」),每店各开各的 pg 连接,不共享游标。
 
         飞书回写 write_submit_cols **留在本函数内**、不挪到合并之后:UPC 已
         mark_used、product_events 已落库,而表上 K 列还是空 —— 下一轮读表看到
         「listed=No 且无 feed_id」就会重发一遍。让每个店的表写紧跟自己的提交,
         别的店炸了也带不走它。(并发下的写节流由 api.feishu 的 _sheet_locks 兜。)
         """
-        cnt = {"no_upc": 0, "invalid": 0, "title_diff": 0}
+        cnt = {"no_upc": 0, "title_diff": 0}
         reasons_s: list[tuple[int, str]] = []
         lines_s: list[str] = []
         store = stores_by_name[store_name]
         try:
-            partner = settings_api.get_partner_id(store)
             prepped: list[dict] = []
             with db.pg_conn() as conn:
                 upcs = upc_pool.claim(conn, [{"store": store_name,
                                               "asin": r["asin"]}
                                              for r in srows])
-                for r, upc in zip(srows, upcs):
-                    if upc is None:
-                        cnt["no_upc"] += 1
-                        reasons_s.append((r["rownum"], "UPC池余量不足"))
-                        continue
-                    visible, llm_o = _map_llm(
-                        conn, r["product_type"],
-                        pt_spec.load_pt(r["product_type"]), r["_p"])
-                    if len(visible.get("productName") or "") < 10:
-                        upc_pool.release(conn, [upc], "prep_failed")
-                        reasons_s.append((r["rownum"], "标题不足10字符"))
-                        continue
-                    orderable = mp_mapper.build_orderable(
-                        r["asin"], upc, r["_price"], r["_qty"], partner,
-                        pt=r["product_type"], product=r["_p"],
-                        llm_fields=llm_o)
-                    # spec 一致化流水线(类型/条件必填/枚举/未知字段/minItems…):
-                    # 缺必填就**不提交**——本地拦下比让沃尔玛拒省 UPC 也省配额
-                    # 复用闸门段算好的那份(不重算):重算等于 dry-run 报的
-                    # 与真跑发的各算一次,中间任何差异都会变成"dry-run 说没事"
-                    vplan = r.get("_vplan")
-                    visible, orderable, notes, missing = mp_conform.conform(
-                        pt_spec.load_pt(r["product_type"]),
-                        pt_spec.orderable_spec(), visible, orderable,
-                        sku=r["asin"], variant=vplan)
-                    if notes:
-                        logger.info("%s spec 一致化 %d 处:%s", r["asin"],
-                                    len(notes), "; ".join(notes[:6]))
-                    if missing:
-                        upc_pool.release(conn, [upc], "prep_failed")
-                        cnt["invalid"] += 1
-                        reasons_s.append((r["rownum"],
-                                          f"必填缺失:{','.join(missing[:6])}"))
-                        _dump_llm_debug(r["asin"], visible, orderable,
-                                        missing, notes)
-                        continue
-                    prepped.append({"r": r, "upc": upc, "visible": visible,
-                                    "orderable": orderable})
+            for r, upc in zip(srows, upcs):
+                if upc is None:
+                    cnt["no_upc"] += 1
+                    reasons_s.append((r["rownum"], "UPC池余量不足"))
+                    continue
+                # 真号回填占位号:UPC 在载荷里只有这一处(build_orderable
+                # 实证:productIdentifiers 单对象非数组),其余字段不重算
+                r["_orderable"]["productIdentifiers"] = {
+                    "productId": str(upc), "productIdType": "UPC"}
+                prepped.append({"r": r, "upc": upc,
+                                "visible": r["_visible"],
+                                "orderable": r["_orderable"]})
             # 同变体组标题差异化(旧仓 Feature B)**必须在 assemble 之前**:
             # 组装成 MP_ITEM 之后 productName 已经埋进载荷,再改就是改两份。
             # 按 (组 ID) 分组:同一个 store 循环内,不会跨店混
@@ -1149,16 +1373,15 @@ def run(params: dict) -> str:
         for sn, _ in todo2:
             cnt, reasons_s, lines_s = per_store[sn]
             n["no_upc"] += cnt["no_upc"]
-            n["invalid"] += cnt["invalid"]
             n_var["标题加维度后缀"] += cnt["title_diff"]
             reasons.extend(reasons_s)
             lines.extend(lines_s)
 
-    # 提交期三个计数一直是**只加不看**:gate_line 是字符串,在提交循环之前就拼死了
+    # 提交期计数曾经**只加不看**:gate_line 是字符串,在提交循环之前就拼死了
     # (2026-08-17 修 n_var 那一处时同一个坑没扫干净)。逐行理由确实写进了 N 列,
     # 但摘要里一个字没有 —— 于是"这轮 300 行只上了 40 条"在通知里看不出原因。
+    # 必填缺失自 2026-08-18 起在预备期报(那一行紧跟 _prep_rows),这里不再重复。
     post = [(lab, v) for lab, v in (("UPC池不足", n["no_upc"]),
-                                    ("必填缺失", n["invalid"]),
                                     ("标题加维度后缀", n_var["标题加维度后缀"]))
             if v]
     if post:

@@ -1188,3 +1188,20 @@ def test_the_clamp_note_reaches_the_summary():
     assert "lines.append(conn_note)" in src
     # 钳制必须在建连接池**之前**发生(钳完才建,不然先炸了)
     assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")
+
+
+def test_audit_one_only_l0_hits_reject_and_misses_return_none():
+    """stages=L0(所有者 2026-08-18):只跑 Phase0,纯查库零 LLM。
+
+    命中 → 正常 reject(与全链的 L0 短路逐字一致);
+    未命中 → **None = 不落结论**:截断的链没资格发 pass/pending
+    (不完整审核绝不当通过)。用途:配合 rerule 翻新黑名单历史行 ——
+    仍命中的拿到新理由映射,不再命中的保持原判,不被"复活"。
+    """
+    ctx = _ctx(pt_meta=META, phase0_asins=frozenset({"B0F"}))
+    hit = audit_rules.audit_one(ProductInfo(asin="B0F", title="w"), ctx,
+                                only_l0=True)
+    assert hit.verdict == "reject" and hit.stage_stopped_at == "L0"
+    miss = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx,
+                                 only_l0=True)
+    assert miss is None          # 不是 pending、更不是 pass —— 什么都不写

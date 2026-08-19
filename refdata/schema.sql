@@ -258,6 +258,15 @@ CREATE TABLE IF NOT EXISTS catalog.llm_cache (
     created_at  timestamptz NOT NULL DEFAULT now(),
     last_hit_at timestamptz
 );
+-- 二级复用元数据(2026-08-18 所有者定稿,详见 db_schema.md llm_cache 节):
+-- hash miss 时按 (asin, pt) 反查最近出参,reuse_sig 相等 + 新旧标题规格
+-- token 验证通过才复用。仅 list_new 出参路径写入,其它用途留 NULL。
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS asin      text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS pt        text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS src_title text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS reuse_sig text;
+CREATE INDEX IF NOT EXISTS llm_cache_asin_pt_idx
+    ON catalog.llm_cache (asin, pt) WHERE asin IS NOT NULL;
 
 -- ── 风控库(L2b,2026-08-07 所有者定稿:两张飞书表镜像入 PG,闸门读库
 -- 不读表——表格随时会停用;同步只增改不删,未来产品中心黑名单增量以

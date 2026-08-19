@@ -62,6 +62,11 @@ upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)�
               事件 list_submitted;O/P/Q 由 feed_poll 反哺器按回执四集合回填
   failed(4xx 拒)→ N=提交被拒,UPC 回收(rejected)
   unknown → K=Unknown(不重复提交),UPC **不回收**
+  内容标准拒(回执 O=CONTENT_REJECTED)不入 FAILED 通道:走**内容拒捞回**
+  (所有者定稿 2026-08-19)——冷却 7 天后用**短主标题**重上一次(一次为限,
+  ops.dedupe 记账;图片类留人工;副标题未拆分的老记录先推重采),
+  见 _content_retry_rows。维护链的标题比对已升级双基准(拼接标题/主标题
+  谁像算谁),捞回重上的短标题行不会被 title_mismatch 反手删掉
 """
 
 import collections
@@ -474,6 +479,98 @@ def _retry_rows(rows: list[dict], verdicts: dict
         retry.append({**_with_pt(r, verdicts),
                       "feed_id": "", "listed": "", "list_result": ""})
     return retry, exhausted
+
+
+_CONTENT_COOLDOWN_DAYS = 7      # 内容拒后冷却:QARTH 审查在跑期间重发只会被
+                                # 56026862530206 挡回来,白烧配额
+
+_SQL_CONTENT_RECEIPT = """
+SELECT DISTINCT ON (f.store, f.sku)
+       f.store, f.sku, coalesce(f.error_desc, ''), f.resolved_at
+FROM ops.feed_items f
+JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
+  ON f.store = t.store AND f.sku = t.sku
+WHERE f.feed_type = 'MP_ITEM' AND f.error_code = %s
+ORDER BY f.store, f.sku, f.resolved_at DESC NULLS LAST
+"""
+
+
+def _content_retry_rows(rows: list[dict], verdicts: dict, execute: bool
+                        ) -> tuple[list[dict], list[str], str | None]:
+    """输入:上架表全部行 + 审核字典 + 真跑? → 输出:(捞回行, 待重采 ASIN, 摘要行)。
+
+    内容拒捞回通道(所有者定稿 2026-08-19):O=CONTENT_REJECTED 的行用
+    **短主标题**重上一次——内容审查罚的多是拼接长串(堆词/多产品类型枚举),
+    主标题是干净形态。四条纪律:
+
+      · **按理由路由**:回执理由(feed_items.error_desc)含 image 的是图片
+        问题——图取自亚马逊原图,自动改不了,重发必拒,留人工;
+      · **冷却 ≥7 天**:内容拒的商品多半同时进了 QARTH 审查,冷却前重发
+        只会撞在审锁;
+      · **一次为限**(ops.dedupe scope='content_heal',**领取即记**——宁可
+        prep 失败烧掉这次机会,也不反复拿同一商品骚扰内容审查);
+      · 同号复用由 upc_pool.claim 保证(重试不换号)。
+
+    捞回行带 `_short_title=True`,主链在数据过滤段把 title 换成主标题。
+    **副标题预检在本函数内做**(amz_source.main_title):拆得出主标题的行
+    才领取、才记 dedupe;拆不出(改版前老记录)只进"待重采"清单——随主链
+    推采集,下轮数据到位自动再来,**不烧那次唯一机会**。
+    dry-run 不记 dedupe,可反复对拍。
+    """
+    cand = [r for r in rows
+            if (verdicts.get(r["asin"]) or (None,))[0] == AUDIT_OK
+            and r["list_result"] == "CONTENT_REJECTED"]
+    if not cand:
+        return [], [], None
+    code = next(iter(resources.WALMART_ERR_CONTENT))
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_CONTENT_RECEIPT, ([r["store"] for r in cand],
+                                           [r["asin"] for r in cand], code))
+        info = {(s, k): (d, at) for s, k, d, at in cur.fetchall()}
+        cur.execute("SELECT key FROM ops.dedupe WHERE scope = %s "
+                    "AND key = ANY(%s)",
+                    ("content_heal",
+                     [f"{r['store']}|{r['asin']}" for r in cand]))
+        used = {k for (k,) in cur.fetchall()}
+    ripe, n_img, n_cool, n_used = [], 0, 0, 0
+    now = datetime.now(kpi.CN_TZ)
+    for r in cand:
+        if f"{r['store']}|{r['asin']}" in used:
+            n_used += 1                 # 已用掉唯一一次机会:终态,归人工
+            continue
+        desc, at = info.get((r["store"], r["asin"]), ("", None))
+        if "image" in desc.lower():
+            n_img += 1
+            continue
+        if at is not None and (now - at).days < _CONTENT_COOLDOWN_DAYS:
+            n_cool += 1
+            continue
+        ripe.append(r)
+    # 副标题预检:拆得出主标题的才领取(几十行以内,单独取一次产品数据不贵)
+    prods = amz_source.fetch_products([r["asin"] for r in ripe]) if ripe else {}
+    out, need_sub = [], []
+    for r in ripe:
+        p = prods.get(r["asin"])
+        if p is None or amz_source.main_title(p) is None:
+            need_sub.append(r["asin"])  # 老记录/缺数据:推重采,不烧机会
+            continue
+        out.append({**_with_pt(r, verdicts), "feed_id": "", "listed": "",
+                    "list_result": "", "_short_title": True})
+    if execute and out:
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO ops.dedupe (scope, key, meta) "
+                "VALUES (%s, %s, %s::jsonb) ON CONFLICT DO NOTHING",
+                [("content_heal", f"{r['store']}|{r['asin']}", "{}")
+                 for r in out])
+    note = (f"  内容拒捞回:领取 {len(out)}(短主标题重上,一次为限)"
+            + (f";等副标题重采 {len(need_sub)}(随本轮推采,下轮自动再试)"
+               if need_sub else "")
+            + (f";图片类留人工 {n_img}" if n_img else "")
+            + (f";冷却中 {n_cool}(拒后满 {_CONTENT_COOLDOWN_DAYS} 天再试)"
+               if n_cool else "")
+            + (f";已试过不再碰 {n_used}" if n_used else ""))
+    return out, sorted(need_sub), note
 
 
 _FAMILY_LISTED_SQL = """
@@ -928,7 +1025,8 @@ def run(params: dict) -> str:
         else:                       # 没结论 / pending
             n_unaudited += 1
     retry, exhausted = _retry_rows(rows, verdicts)
-    pending = fresh + retry
+    c_rows, c_need_sub, c_note = _content_retry_rows(rows, verdicts, execute)
+    pending = fresh + retry + c_rows
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
              + (f"(其中重试 {len(retry)})" if retry else "")]
@@ -945,6 +1043,8 @@ def run(params: dict) -> str:
     if exhausted:
         lines.append(f"  ⚠ 重试已达上限({MAX_LIST_ATTEMPTS} 次)不再自动重试:"
                      + ",".join(a for _, a in exhausted[:10]))
+    if c_note:
+        lines.append(c_note)
     if not pending:
         return "\n".join(lines)
 
@@ -1025,7 +1125,10 @@ def run(params: dict) -> str:
     # 人工推")。日界批次名天然防重:当天已推过撞名即跳过,增量次日再推
     absent = sorted({r["asin"] for r in candidates
                      if products.get(r["asin"]) is None})
-    scrape_note, gap_names = _push_scrape(absent, execute)
+    # 内容拒捞回里"副标题未拆分"的老记录一并推重采(它们没进本轮 pending,
+    # 只搭推送的车;同轮闭环的救回判定仍只对 absent)
+    scrape_note, gap_names = _push_scrape(
+        sorted(set(absent) | set(c_need_sub)), execute)
     gap_line = None
     if execute and gap_names and gap_wait > 0:
         # 同轮闭环(所有者定稿 2026-08-18,与审核链同款):推完**等它采完**,
@@ -1050,6 +1153,16 @@ def run(params: dict) -> str:
         if p is None:
             n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
             continue
+        if r.get("_short_title"):
+            # 内容拒捞回行:标题换成主标题(领取时已预检拆得出;这里再兜一道
+            # ——refetch 合并后数据可能变形,拆不出就退下轮,机会已烧认账)
+            mt = amz_source.main_title(p)
+            if mt is None:
+                n["filtered"] += 1
+                reasons.append((r["rownum"],
+                                "内容拒捞回:主标题拆不出(数据变形),留人工"))
+                continue
+            p = {**p, "title": mt}
         # 拉到数据的行,无论最终去向都回显标题与价库——运营在表上直接
         # 看到"为什么这行没上"的数字(旧系统对 prep_fails 同款)
         echo = [(p.get("title") or "")[:190], p.get("price") or "",

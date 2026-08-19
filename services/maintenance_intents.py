@@ -211,6 +211,46 @@ def processed_title(slow) -> str:
     ).get("productName") or ""
 
 
+def main_processed_title(slow) -> str:
+    """输入:products.slow → 输出:**主标题**过完同一套文案处理;拆不出返回 ""。
+
+    2026-08 亚马逊把标题拆两段,采集侧按 " | " 拼回 `slow.title` 并把后半段
+    单独放 `slow.subtitle`(采集契约 §slow.subtitle)。这里做**精确逆操作**:
+    removesuffix(" | " + subtitle)——不是按 "|" 猜切(契约明令禁止:标题
+    正文本来就可能含 |),结尾对不上(改版前老记录 subtitle 为 null)
+    一律返回 "",调用方退回单基准。
+    """
+    if not isinstance(slow, dict):
+        return ""
+    t, sub = str(slow.get("title") or ""), str(slow.get("subtitle") or "")
+    if not t or not sub or str(t).strip() in TITLE_PLACEHOLDERS:
+        return ""
+    tail = " | " + sub
+    if not t.endswith(tail) or not t[: -len(tail)].strip():
+        return ""
+    return mp_mapper.force_amazon_copy(
+        {}, {"title": t[: -len(tail)], "brand": slow.get("brand"),
+             "attrs": slow}
+    ).get("productName") or ""
+
+
+def title_sim_dual(wm_name, slow):
+    """输入:沃尔玛在线商品名 + products.slow → 输出:双基准相似度(None=算不了)。
+
+    基准一 = 完整拼接标题;基准二 = 主标题(subtitle 拆得出时)。取 **max**:
+    「像两种形态里的任何一种都算像」(所有者定稿 2026-08-19)。为什么:
+    上架默认口径是长标题,但内容拒捞回通道用**主标题**重上——单基准下
+    这些行相似度 ~0.6,title_mismatch 会把自己刚捞回的商品删掉;将来
+    整体切短标题口径也天然兼容,不用再改比对。
+    """
+    sims = [order_audit.title_similarity(wm_name, processed_title(slow))]
+    mt = main_processed_title(slow)
+    if mt:
+        sims.append(order_audit.title_similarity(wm_name, mt))
+    real = [s for s in sims if s is not None]
+    return max(real) if real else None
+
+
 # 无货三档的映射搬去 `order_audit.stock_block`(维护链与审核链的唯一出处);
 # 本模块已经 import order_audit,方向不变。
 
@@ -415,9 +455,8 @@ def price_intents(conn, multipliers: dict[str, dict],
         # 删除类压过改价:一个 SKU 一轮只出一个动作,否则先花配额改一个
         # 马上要删的商品(pick_one 的同款理由)。两条删除判据都要判到。
         if classify(outcome=r["outcome"],
-                    title_similarity=order_audit.title_similarity(
-                        r["product_name"], processed_title(r["slow"]))
-                    )[0] == "delete":
+                    title_similarity=title_sim_dual(
+                        r["product_name"], r["slow"]))[0] == "delete":
             continue
         if amz_price is None or wm_price is None:
             continue                    # 缺任一侧现值:没有可比基准,不动
@@ -532,13 +571,16 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         # 70% 闸(所有者定稿 2026-08-16):相似度过低说明**采到的可能不是同一个
         # 商品**,那时把亚马逊标题抄过去是把错的抄进线上 —— 交给删除链处置。
         # 相似度算不出来(有一边没标题)不算不匹配,照旧走改标题。
-        sim = order_audit.title_similarity(product_name,
-                                           processed_title(slow))
+        sim = title_sim_dual(product_name, slow)
         if sim is not None and sim < TITLE_SIM_FLOOR:
             skipped_mismatch += 1
             continue
         new_title = processed_title(slow)    # 与上架同款处理(去品牌/截 199)
         if not new_title or new_title == (product_name or ""):
+            continue
+        if (product_name or "") == main_processed_title(slow):
+            # 在架标题 = 主标题(内容拒捞回用短标题重上的行):**不改回长标题**
+            # ——改回去等于把捞回的修复亲手撤销,下一轮又被内容审查拒一遍
             continue
         if not product_type or not upc:
             skipped_incomplete += 1     # 三缺一跳过(旧防线)
@@ -623,8 +665,7 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         #   标题相似度 < 70%         → 采到的可能不是同一个商品,抄标题会抄错
         act, code, why = classify(
             outcome=r["outcome"],
-            title_similarity=order_audit.title_similarity(
-                r["product_name"], processed_title(slow)))
+            title_similarity=title_sim_dual(r["product_name"], slow))
         if act == "delete":
             if code == "title_mismatch" and not TITLE_MISMATCH_DELETE:
                 paused_mismatch += 1        # 停闸计数,压制必须见人

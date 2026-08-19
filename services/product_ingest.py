@@ -470,14 +470,16 @@ def pump_batch(scraper, db, batch_name: str, *, limit: int = 500,
             return out
 
 
-def pump_batches(scraper, db, names: list[str], *, limit: int = 500
-                 ) -> tuple[list[dict], str]:
+def pump_batches(scraper, db, names: list[str], *, limit: int = 500,
+                 max_pages: int = 400) -> tuple[list[dict], str]:
     """输入:批次名列表 → 输出:(逐批结果列表, 一行人读摘要)。
 
     逐批调 pump_batch 并汇总。摘要纪律:失败/批次消失必须点名(best-effort
-    不等于静默),全成功给合计。
+    不等于静默),全成功给合计。max_pages 给 product_refresh 那种十几万
+    ASIN 的大批放宽用(默认档按同轮闭环的小批定)。
     """
-    results = [pump_batch(scraper, db, n, limit=limit) for n in names if n]
+    results = [pump_batch(scraper, db, n, limit=limit, max_pages=max_pages)
+               for n in names if n]
     if not results:
         return [], "按批摄取:0 批"
     t: dict = {}

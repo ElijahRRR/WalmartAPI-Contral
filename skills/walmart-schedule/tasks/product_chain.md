@@ -3,10 +3,10 @@
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh product_ingest maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1 -p product_ingest:lock_wait=900
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh maintenance_scan maintenance problem_scan problem_product_cleanup -p product_refresh:wait=1
 ```
 
-这条链跑的是:catalog_sync → sources_backfill → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup。
+这条链跑的是:catalog_sync → sources_backfill → product_refresh → maintenance_scan → maintenance → problem_scan → problem_product_cleanup。
 
 ## 这条链在做什么
 
@@ -15,11 +15,10 @@
 | 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
 | 2 | `sources_backfill` | 在架商品来源登记簿补齐(格式回填;幂等可重跑)。 |
 | 3 | `product_refresh` | 在线产品全量重推采集(维护链的数据新鲜度源头)。 |
-| 4 | `product_ingest` | 采集服务增量 → 产品中心(catalog.products / snapshots)。 |
-| 5 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
-| 6 | `maintenance` | 商品维护执行件(批次四拆分后;危险,缺省即真跑)。 |
-| 7 | `problem_scan` | 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。 |
-| 8 | `problem_product_cleanup` | 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。 |
+| 4 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
+| 5 | `maintenance` | 商品维护执行件(批次四拆分后;危险,缺省即真跑)。 |
+| 6 | `problem_scan` | 问题商品扫描定性(批次 E,批复 #8;只读沃尔玛,**不发任何 feed**)。 |
+| 7 | `problem_product_cleanup` | 问题商品处置执行件(批次 E 拆分后;危险:缺省即真跑,空跑用 --dry-run)。 |
 
 **顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
 

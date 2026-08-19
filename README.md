@@ -394,7 +394,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `backup` | 每天 02:00 | `backup` |
 | `daily_report` | 每天 06:40 | `daily_report` |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
-| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh` → `product_ingest` → `maintenance_scan` → `maintenance` → `problem_scan` → `problem_product_cleanup` |
+| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `maintenance_scan` → `maintenance` → `problem_scan` → `problem_product_cleanup` |
 | `blacklist` | 每天 15:00 | `risk_sync` → `blacklist_push` |
 | `product_clear` | 每天 15:00 | `product_clear` |
 | `audit_sheet` | 每天 18:10 | `product_audit -p from_sheet=1` |

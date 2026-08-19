@@ -35,7 +35,7 @@ from datetime import datetime
 
 from api import scraper
 from registry import db
-from services import kpi, scrape_batches as batches
+from services import kpi, product_ingest, scrape_batches as batches
 
 DANGEROUS = True        # 会给采集器压十几万个任务,空跑用 --dry-run
 
@@ -182,9 +182,16 @@ def run(params: dict) -> str:
     lines.append(line)
     # 等完再落一次台账:批次状态、失败明细都归 check_open 那一份实现
     lines += ["批次落定:"] + _check_open()
+    # 同轮按批摄取(所有者定稿 2026-08-19:「product_chain 链也应该使用
+    # 按批次拿」):自己推的批自己拉(批次端点,批内游标,无锁),链里不再
+    # 单摆一步全局泵 —— 维护判据当轮就是刚采回的值。max_pages 放宽:
+    # 本链一批十几万 ASIN,按 500/页要几百页,默认护栏(400 页)不够
+    _, ing = product_ingest.pump_batches(scraper, db, pushed_names,
+                                         max_pages=2000)
+    lines.append(ing)
     if unsettled:
         # 不抛错、不停链:已采到的部分照常能用,硬停反而让整条产品链今天全废。
         # 但必须说出来 —— 这一轮的维护判据会比平时旧一些
-        lines.append(f"⚠ 仍有 {unsettled} 个批次未采完,本轮 product_ingest 只会"
-                     f"摄到已完成的部分;下一轮 catalog_sync 之后自然补上")
+        lines.append(f"⚠ 仍有 {unsettled} 个批次未采完,本轮只摄到已完成的"
+                     f"部分;其余由长驻 product_ingest 陆续摄入,明天自然补上")
     return "\n".join([head] + lines)

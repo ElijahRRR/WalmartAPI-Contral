@@ -218,7 +218,10 @@ plist 模板与四个坑、分三批灰度、四件必须先做的代码活(prod
 1. `catalog_sync` → `product_refresh`(要先知道在架哪些才知道推谁)
 2. `catalog_sync` → `maintenance_scan` / `problem_scan`(判据要拿最新现值)
 3. `order_sync` → `daily_report`(否则订单列对拍必差)
-4. `product_ingest` → `maintenance_scan` / `list_new`(先摄取,判据才有新数据)
+4. ~~`product_ingest` → `maintenance_scan` / `list_new`~~(2026-08-19 起
+   摄取按批内嵌:`product_refresh wait=1` 等采完后**就地按批摄取**自己推的
+   批,list_new 的候选刷新同理;`product_ingest` 退为单独长驻的全局对齐泵,
+   不再是链内一步)
 
 **时间表不在本文件维护** —— 唯一出处是 `docs/schedule_plan.md` §九。
 两处各写一份必然漂:v1 的表已经被所有者的批复推翻过一次(产品线由四条散点

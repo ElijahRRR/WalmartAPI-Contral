@@ -92,10 +92,10 @@ JOBS = (
         note="每小时 :20;order_audit 默认 wait=1,最长阻塞 20 分钟等采集落定"),
     # product_ingest 单独长驻(所有者定稿 2026-08-19:「product_ingest 现在的
     # 主要功能是让本地产品库与采集器数据库对齐,单独配长驻定时任务」):
-    # 三条链的同轮闭环已改按批次自取(谁推的批谁拉),这条管的是**其余一切
-    # 增量**(product_refresh 的尾巴、下午零散采集)——保中心库小时级对齐。
-    # :50 错开 order_chain 的 :20;13:50 与 product_chain 的同名步撞车时
-    # 等锁 15 分钟(runlock 等锁模式),谁先拿到谁泵,后到的接着泵增量
+    # 四条链(order_audit/product_audit/list_new/product_refresh)的同轮闭环
+    # 全部按批次自取(谁推的批谁拉,无锁),这条管的是**其余一切增量**
+    # (超时批次的尾巴、零散采集)——保中心库小时级对齐。全局游标从此只有
+    # 这一个属主;lock_wait 只防手动跑 product_ingest 撞上它(等而不空转)
     job("product_ingest", ["product_ingest"], batch=2, minute=50,
         params=["lock_wait=900"],
         note="每小时 :50;全局增量泵:本地产品中心 ↔ 采集器数据库对齐"
@@ -118,17 +118,16 @@ JOBS = (
     # 产品维护线一条链跑完(所有者定稿:「这些我认为可以一次性做完」)。
     # ⚠ wait=1 不能省:不等采集落定就往下走,product_ingest 摄回来的是上一轮
     # 的数据,而且不报错。整条约 2 小时(采集 ~50 分钟是大头)。
+    # 链里不再单摆 product_ingest 一步(所有者定稿 2026-08-19:「product_chain
+    # 链也应该使用按批次拿」):product_refresh wait=1 等采完后**就地按批摄取**
+    # 自己推的批(批次端点,无锁),维护判据当轮就是刚采回的值;全局对齐归
+    # 单独长驻的 product_ingest(launchd 每小时)
     job("product_chain",
         ["catalog_sync", "sources_backfill", "product_refresh",
-         "product_ingest", "maintenance_scan", "maintenance",
+         "maintenance_scan", "maintenance",
          "problem_scan", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
-        # product_ingest:lock_wait=900(2026-08-19 所有者定稿):order_chain
-        # 每小时 :20 也有一步 product_ingest(全局泵保中心库小时级新鲜),
-        # 与本链 13:25~13:35 轮到的同名步天天咬合(同名工作流共用一把 flock)。
-        # 等它 15 分钟(泵一轮一般几分钟)再跑自己的——等到再泵才补得齐
-        # product_refresh 刚采回的增量;跳过 = maintenance 拿隔夜值算差异
-        params=["product_refresh:wait=1", "product_ingest:lock_wait=900"],
+        params=["product_refresh:wait=1"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
              "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
              "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"

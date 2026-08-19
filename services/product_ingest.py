@@ -279,24 +279,25 @@ def ingest_batch(conn, records: list[dict]) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  增量泵(游标 + 翻页 + 落库)—— workflows/product_ingest 与 order_audit 共用
+#  两台泵:全局增量泵 pump(全局游标,独占,要锁)
+#        与按批泵 pump_batch(批内游标,幂等,无锁)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# 提到 services 是因为 order_audit 的 `-p wait=1` 要**就地**跑一次摄取
-# (推完采集等批次落定后,不等下一轮调度就把数据拉进来出结论),
-# 而工作流之间不准互相 import(铁律 1)。抄第二份的代价具体而致命:
-# 游标推进规则(空页不推进、只认 next_cursor、409 停在原地)抄漏一条就是
-# **静默丢一段数据**,两侧都不报错。
+# 放 services 是因为多个工作流要用而工作流之间不准互相 import(铁律 1)。
+# pump 的游标推进规则(空页不推进、只认 next_cursor、409 停在原地)抄漏
+# 一条就是**静默丢一段数据**,两侧都不报错——所以全项目只有这一份。
+# pump_batch(2026-08-19)给 order_audit / product_audit / list_new 的
+# 同轮闭环用:批内游标每次从 0 拉到底,不落库不占锁,重复摄取靠
+# snapshots.source_id 幂等吸收。
 
 CURSOR_NAME = "product_ingest"
 
 # 「摄取跑到哪儿了」的水位线。**和游标是两件事**:游标只在有新数据时前进,
-# 水位线每次跑完都刷。分开是因为下游要问的问题不是"取到第几条",而是
-# **"我有没有资格说'这条数据没到'"**——
-# 采集侧批次 completed 只说明它干完了,数据还在增量流里;摄取没追上就断言
-# "无快照 ⇒ 采集失败",会把采成功的整批冤枉掉(2026-08-10 实测:127 个组合
-# 全被判失败,紧接着一次 product_ingest 就把这 127 条全摄进来了)。
-# 有了水位线,order_audit 才能只在"摄取确实跑过这个时间点之后"才认账失败。
+# 水位线每次跑完都刷。历史职责是给 order_audit 当"我有没有资格说'这条数据
+# 没到'"的凭据(2026-08-10 的 127 条冤案:批次 completed ≠ 数据落库);
+# 2026-08-19 起 order_audit 改用 pump_batch 把批次自己的事件流拉到底,
+# 逐批凭据更强,水位线**不再参与认账**,保留作运维观测
+# ("全局泵最后一次追平是什么时候"排障时仍要看)。
 WATERMARK_NAME = "product_ingest:last_run"
 
 
@@ -398,6 +399,108 @@ def touch_watermark(conn, cursor_value: int) -> None:
             " ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value,"
             " updated_at = now()", (WATERMARK_NAME, cursor_value))
     conn.commit()
+
+
+def pump_batch(scraper, db, batch_name: str, *, limit: int = 500,
+               max_pages: int = 400) -> dict:
+    """输入:api.scraper + registry.db + 批次名 → 输出:该批摄取结果 dict。
+
+    与 `pump`(全局增量泵)的分工(2026-08-19 所有者批准接入采集侧批次端点):
+      pump        全局游标,独占推进,**必须先拿 product_ingest 锁**,
+                  是产品中心的兜底全量补给线(product_chain 每天跑);
+      pump_batch  批内游标,**每次调用都从 0 拉到底**,不落 ops.cursors、
+                  不碰水位线、**不需要任何锁**——批内游标互不相干,
+                  幂等靠 snapshots.source_id 的 ON CONFLICT DO NOTHING
+                  (与全局泵重复摄取同一条记录也只是 dup 计数 +1)。
+                  给 order_audit / product_audit / list_new 的同轮闭环用:
+                  「我刚推的这一批,到底采到了什么」。
+
+    返回 {ok, batch, pages, fetched, totals, coverage, gone, error}:
+    - `ok=True` **当且仅当拉到底**(has_more=False)——调用方(尤其 order_audit
+      的认账失败)拿它当「这批的事件流我全看过了」的凭据,半途而废不算 ok;
+    - `gone=True` 表示批次在采集侧已不存在(404),数据要不回来了,
+      调用方按"交给兜底超时收尾"处置;
+    - 采集侧故障(鉴权/重试耗尽/端点未部署)一律 ok=False + error,
+      **不抛**——同轮闭环是 best-effort,采集侧挂了不该拖垮调用链,
+      但每一次失败都要出现在调用方摘要里(静默跳过 = 没人知道主路径坏了)。
+    """
+    totals: dict = {"snapshots": 0, "dup": 0, "products": 0,
+                    "skipped_outcome": 0, "incomplete": 0, "invalid": 0}
+    out = {"ok": False, "batch": batch_name, "pages": 0, "fetched": 0,
+           "totals": totals, "coverage": None, "gone": False, "error": None}
+    cur_pos = 0
+    while True:
+        try:
+            records, next_cursor, has_more, meta = \
+                scraper.export_batch_records(batch_name, cur_pos, limit)
+        except LookupError as e:
+            out.update(gone=True, error=str(e))
+            return out
+        except Exception as e:                                  # noqa: BLE001
+            # 鉴权/参数/重试耗尽:本批这轮拉不了。告警 + 报给调用方,不抛
+            logger.warning("批次 %s 摄取失败(本轮放弃,已入库 %d 条不回滚):%s",
+                           batch_name, out["fetched"], e)
+            out["error"] = str(e)
+            return out
+
+        out["pages"] += 1
+        out["fetched"] += len(records)
+        if meta.get("coverage") is not None:
+            out["coverage"] = meta["coverage"]
+        if records:
+            with db.pg_conn() as conn:
+                counts = ingest_batch(conn, records)
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v     # outcome_* 键是动态的
+        if not has_more:
+            out["ok"] = True        # 拉到底才算 ok(空批也是 200 + has_more=False)
+            return out
+        if not records or next_cursor == cur_pos:
+            # has_more=True 却空页/游标原地踏步:服务端异常,再拉只会死循环。
+            # 不能声称 ok——调用方会拿 ok 当"这批我全看过了"去认账失败
+            out["error"] = (f"批次导出异常:has_more=True 但"
+                            f"{'返回空页' if not records else '游标未推进'}"
+                            f"(cursor={cur_pos}),提前止损")
+            logger.warning("批次 %s %s", batch_name, out["error"])
+            return out
+        cur_pos = next_cursor
+        if out["pages"] >= max_pages:
+            out["error"] = f"超过 {max_pages} 页仍未拉完(批次大得反常),提前止损"
+            logger.warning("批次 %s %s", batch_name, out["error"])
+            return out
+
+
+def pump_batches(scraper, db, names: list[str], *, limit: int = 500,
+                 max_pages: int = 400) -> tuple[list[dict], str]:
+    """输入:批次名列表 → 输出:(逐批结果列表, 一行人读摘要)。
+
+    逐批调 pump_batch 并汇总。摘要纪律:失败/批次消失必须点名(best-effort
+    不等于静默),全成功给合计。max_pages 给 product_refresh 那种十几万
+    ASIN 的大批放宽用(默认档按同轮闭环的小批定)。
+    """
+    results = [pump_batch(scraper, db, n, limit=limit, max_pages=max_pages)
+               for n in names if n]
+    if not results:
+        return [], "按批摄取:0 批"
+    t: dict = {}
+    for r in results:
+        for k, v in r["totals"].items():
+            t[k] = t.get(k, 0) + v
+    fetched = sum(r["fetched"] for r in results)
+    n_ok = sum(1 for r in results if r["ok"])
+    line = (f"按批摄取:{n_ok}/{len(results)} 批拉到底 / 拉取 {fetched} 条;"
+            f"观测入库 {t.get('snapshots', 0)}(重复跳过 {t.get('dup', 0)}),"
+            f"身份更新 {t.get('products', 0)}")
+    if t.get("skipped_outcome"):
+        dist = ",".join(f"{k[len('outcome_'):]}×{v}" for k, v in sorted(t.items())
+                        if k.startswith("outcome_"))
+        line += f",非 ok 采集只落观测 {t['skipped_outcome']}({dist})"
+    bad = [r for r in results if not r["ok"]]
+    if bad:
+        line += ";⚠ " + ",".join(
+            f"{r['batch']}:{'采集侧查不到' if r['gone'] else r['error']}"
+            for r in bad)
+    return results, line
 
 
 def pump_summary(res: dict) -> str:

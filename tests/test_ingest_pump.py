@@ -185,3 +185,93 @@ def test_runlock_is_exclusive(tmp_path, monkeypatch):
         fh.close()
     with runlock.hold("product_ingest") as got:
         assert got is True                # 释放后拿得到
+
+
+# ── 按批泵(pump_batch:批内游标,无锁,幂等)──────────────────────────────────
+
+class FakeBatchScraper:
+    """按脚本吐页的假批次端点;记录每次请求的 (批次名, 批内游标)。"""
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.asked = []
+
+    def export_batch_records(self, name, cursor, limit):
+        self.asked.append((name, cursor))
+        page = self.pages.pop(0)
+        if isinstance(page, Exception):
+            raise page
+        return page          # (records, next_cursor, has_more, meta)
+
+
+_COV = {"asin_total": 3, "asin_with_event": 3}
+
+
+def test_pump_batch_drains_without_touching_global_state(wired):
+    """按批泵翻页拉到底,**不落全局游标、不刷水位线** —— 批内游标只在
+    一次调用里活着,全局状态一根手指都不碰(碰了就得要锁,锁冲突回来了)。"""
+    sc = FakeBatchScraper([([{"a": 1}], 10, True, {"coverage": _COV}),
+                           ([{"a": 2}, {"a": 3}], 25, False, {"coverage": _COV})])
+    res = ingest.pump_batch(sc, wired, "wm-audit-x")
+    assert res["ok"] and res["pages"] == 2 and res["fetched"] == 3
+    assert res["coverage"] == _COV
+    assert sc.asked == [("wm-audit-x", 0), ("wm-audit-x", 10)]
+    assert wired.saved == [] and wired.watermark == []      # 全局状态零触碰
+
+
+def test_pump_batch_empty_batch_is_ok(wired):
+    """批次存在但一条事件都没有:200 + 空 records + has_more=False ⇒ ok。
+    (「拉到底」的凭据成立:这批的流我看完了,里面确实什么都没有。)"""
+    sc = FakeBatchScraper([([], 0, False, {"coverage": {"asin_total": 2,
+                                                        "asin_with_event": 0}})])
+    res = ingest.pump_batch(sc, wired, "wm-audit-x")
+    assert res["ok"] and res["fetched"] == 0
+
+
+def test_pump_batch_refuses_to_claim_ok_on_anomaly(wired):
+    """has_more=True 却空页/游标原地踏步 ⇒ **不许声称 ok**。
+    order_audit 拿 ok 当「这批的流我全看过了」去认账失败,
+    半途而废还报 ok 就是把采成功的判失败(127 条冤案的形状)。"""
+    sc = FakeBatchScraper([([], 7, True, {})])
+    res = ingest.pump_batch(sc, wired, "wm-audit-x")
+    assert res["ok"] is False and "空页" in res["error"]
+
+    sc2 = FakeBatchScraper([([{"a": 1}], 0, True, {})])     # 游标不动
+    res2 = ingest.pump_batch(sc2, wired, "wm-audit-x")
+    assert res2["ok"] is False and "游标未推进" in res2["error"]
+
+
+def test_pump_batch_gone_batch_is_flagged_not_raised(wired):
+    """批次在采集侧不存在(404)→ gone=True,不抛 —— 调用方按
+    「交给兜底超时收尾」处置,同轮闭环不被拖垮。"""
+    sc = FakeBatchScraper([LookupError("批次不存在:wm-audit-x")])
+    res = ingest.pump_batch(sc, wired, "wm-audit-x")
+    assert res["ok"] is False and res["gone"] is True
+
+
+def test_pump_batch_scraper_outage_reports_not_raises(wired):
+    """采集侧故障(重试耗尽/鉴权)→ ok=False + error,不抛;
+    已入库的部分不回滚(source_id 幂等,下轮重拉自动续上)。"""
+    sc = FakeBatchScraper([([{"a": 1}], 10, True, {}),
+                           RuntimeError("HTTP 503")])
+    res = ingest.pump_batch(sc, wired, "wm-audit-x")
+    assert res["ok"] is False and "503" in res["error"]
+    assert res["fetched"] == 1          # 第一页已入库,计数如实
+
+
+def test_pump_batches_summary_names_failures(wired):
+    """汇总摘要:全成给合计;失败/批次消失必须点名(best-effort ≠ 静默)。"""
+    pages = {"b1": [([{"a": 1}], 5, False, {"coverage": _COV})],
+             "b2": [LookupError("批次不存在:b2")]}
+
+    class Router:
+        def export_batch_records(self, name, cursor, limit):
+            page = pages[name].pop(0)
+            if isinstance(page, Exception):
+                raise page
+            return page
+
+    results, note = ingest.pump_batches(Router(), wired, ["b1", "b2"])
+    assert len(results) == 2
+    assert "1/2 批拉到底" in note
+    assert "b2" in note and "采集侧查不到" in note

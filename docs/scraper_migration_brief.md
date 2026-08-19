@@ -251,6 +251,34 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    `services/scrape_batches.ERROR_TYPES`——采集侧新增类型而本侧不知道时会告警,
    不会被静默当成普通失败。
 
+6. **按批次取记录端点(采集侧 #12,2026-08-19 本侧接入)**——
+   `GET /api/export/batch/{batch_name}/records?cursor=&limit=`:
+   与 `/api/export/incremental` 读同一张事件表、records 逐字段同构,
+   差别只在取行范围(`WHERE batch_id = ? AND seq > ?`)。它回答
+   「我刚推的这一批,到底采到了什么」——事件流里**没采成就没有行**,
+   不会拿旧行冒充本批结果(`/api/results?batch_id=` 那条老路的洞)。
+   响应带 `coverage {asin_total, asin_with_event}`(齐不齐,一个请求判断;
+   相等 ≠ 全成功,成功看逐条 `outcome`)与 `retention_min_cursor`
+   (老批次被保留期裁过时对账用)。
+
+   本侧接法(api/scraper.export_batch_records +
+   services/product_ingest.pump_batch):
+   - **批内游标与全局游标不可互换**(数值同源于 seq 但定义域不同,喂错
+     不报错、会静默跳过中间所有别的批次的事件)——批内游标只做单次调用
+     的翻页,**绝不落 ops.cursors**;
+   - 每次调用从 cursor=0 拉到 has_more=false,幂等靠 snapshots.source_id,
+     与全局泵重复摄取无害 ⇒ **不需要任何锁**;
+   - order_audit / product_audit / list_new 的同轮闭环 2026-08-19 起全部
+     改走本端点(此前借 product_ingest 的锁抽全库到当刻头部,整点
+     order_chain 与 13:00 product_chain 一撞就是 15 分钟等锁);
+     order_audit 的认账失败凭据也随之从"全局摄取水位线越过落定时刻"
+     升级为"该批自己的事件流已拉到底"(逐批确定性,127 条冤案的防线加强版);
+   - 本端点 404 **只有一个含义:批次名不存在**(与增量端点的 404 语义
+     不同);没有 409——保留期裁老批次时照实回 200 + 不完整集合。
+   - `/api/export/incremental` 仍是产品中心的**兜底全量补给线**
+     (product_chain 每天的 product_ingest),批次端点不替代它——
+     product_refresh 那条大流水仍靠全量泵摄入。
+
 **另有两条实现语义,消费侧必须遵守**:
 
 - **`null` / `[]` 一律表示"本次采集没取到",不表示"该商品没有这个属性"**

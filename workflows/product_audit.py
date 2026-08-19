@@ -40,9 +40,13 @@ C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结�
 等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
 表里轮到审、但库里压根没有(或有行无标题=采集降级)的 ASIN → 推采集批次
 `audit_gap_<日界>` → **轮询等它采完**(缺省 20 分钟,`-p gap_wait=N` 调,0=只推
-不等)→ **就地增量摄取**(借 product_ingest 的锁)→ 采回来的**这一轮就判掉**。
+不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的**这一轮就判掉**。
 仍缺的把采集侧真实 `error_type` 写进表格 **F 列、E 列留空**(留空才会被下轮重领)。
 整段跑在候选查询**之前**,所以不需要第二遍判定循环。见 `_close_gap`。
+⚠ **在库的待审行不做"先刷新再审"**(所有者复议定稿 2026-08-19):审核判的是
+"这个产品卖的是什么",第一次就定性了,改标题/描述不改变它是什么——
+强刷带来的翻案更大可能是 LLM 随机性(上架链相反,**必须**先刷新:价格库存
+是要写到沃尔玛的真金白银)。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
 五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
@@ -76,7 +80,7 @@ from api import scraper
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, db_guard, \
     kpi, \
-    listing_sheet, product_events, product_ingest, runlock, scrape_batches
+    listing_sheet, product_events, product_ingest, scrape_batches
 
 DANGEROUS = True
 
@@ -566,6 +570,13 @@ def _find_gap(want: list[str]) -> tuple[list[str], list[str]]:
             sorted(a for a, no_title in got.items() if no_title))
 
 
+# ⚠ 审核**不做**"先推采集刷新拿最新数据"(所有者定稿 2026-08-19,当天曾
+# 短暂加过又按所有者复议撤回):审核判的是**这个产品卖的是什么**(标题里的
+# 品牌词是不是真品牌、是否碰沃尔玛政策)——第一次审核就定性了,改标题/描述
+# 不改变它是什么,重采+重审带来的"翻案"更大可能只是 LLM 的随机性。
+# 缺口(不在库/无标题)照旧同轮补采——那是"审不了",不是"数据旧"。
+
+
 def _push_gap(gap: list[str], day: str,
               out: list[str]) -> list[tuple[str, object]]:
     """输入:缺口 ASIN + 日界 → 输出:[(批次名, batch_id)];摘要写进 out。
@@ -604,25 +615,17 @@ def _push_gap(gap: list[str], day: str,
     return sent
 
 
-def _ingest_now() -> str:
-    """输入:无 → 输出:就地增量摄取摘要(拿不到锁则说明原因)。
+def _ingest_batches(names: list[str]) -> str:
+    """输入:本轮推的批次名 → 输出:按批摄取摘要。
 
-    **借的是 product_ingest 的活,就得借它的锁**(与 order_audit._ingest_now
-    逐字同款纪律):增量游标 `ops.cursors` name='product_ingest' 是独占推进的,
-    两个进程同时拉 `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉
-    先写的,中间那段记录**永远不会再被拉一次**(游标只前进不回头)——
-    两侧都不报错,只是产品中心少了一批数据。
-
-    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
-    只是本轮这批可能来不及,退回"下一轮审"。
+    2026-08-19 起走采集侧批次端点(`export_batch_records`,契约 §4.11):
+    只拉**自己这批**的事件,批内游标每次从 0 拉到底,不碰全局游标、
+    **不需要 product_ingest 的锁**——此前是借锁抽全库到当刻头部,与
+    product_chain / order_chain 的抽水互相排队。幂等靠 snapshots.source_id,
+    与全局泵重复摄取无害。没拉到底的批次摘要里点名,那部分退回下轮审。
     """
-    with runlock.hold(product_ingest.CURSOR_NAME,
-                      holder="product_audit._ingest_now") as got:
-        if not got:
-            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
-                    "数据仍会由它摄入,这批退回下轮审")
-        res = product_ingest.pump(scraper, db)
-    return "就地" + product_ingest.pump_summary(res)
+    _, note = product_ingest.pump_batches(scraper, db, names)
+    return note
 
 
 def _gap_reasons(sent: list[tuple[str, object]]) -> dict[str, str]:
@@ -664,10 +667,12 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
     五步:
 
-      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。
+      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。**只推缺口**:在库的
+         待审行不做"先刷新再审"(所有者复议定稿 2026-08-19,理由见模块头注
+         ——审核判的是"它是什么",第一次就定性了)。
       ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
-      ③ **就地摄取**(借 product_ingest 的锁,见 `_ingest_now`)——
-         批次 completed **不等于**我们库里有数据,中间还隔着一次增量导出。
+      ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
+         批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
       ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
          (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
@@ -742,7 +747,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
             + (f" / 采集降级无标题 {len(degraded)}" if degraded else ""))
     if not execute:
         out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
-                   f"等它采完(最多 {wait_min} 分钟)、就地摄取,"
+                   f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
                    f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 F 列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
@@ -763,7 +768,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
         if stuck:
             out.append(f"  ⚠ {stuck} 个批次超时仍在跑:这部分退回下轮审"
                        f"(已采到的下面就摄进来)")
-        out.append(f"  {_ingest_now()}")
+        out.append(f"  {_ingest_batches([n for n, _ in sent])}")
 
     # ④ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
     #    刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉

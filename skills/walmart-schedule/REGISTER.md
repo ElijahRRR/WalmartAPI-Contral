@@ -55,12 +55,13 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 
 ## 第 3 步:这两条**不要注册成你的定时任务**,改用电脑的 launchd
 
-`feed_poll`, `order_chain` 是高频链:
+`feed_poll`, `order_chain`, `product_ingest` 是高频链:
 
 | 任务 | 频率 | 跑什么 |
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
 | `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+| `product_ingest` | 每小时 :50 | product_ingest |
 
 两个理由,都不是偏好问题:
 
@@ -89,7 +90,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 launchctl list | grep com.walmartapi
 ```
 
-应当正好 2 行。然后**等到下一个整点/半点再确认它真的跑了** —— 装上了不等于跑得起来(解释器路径错、venv 被删这类问题只会出现在 launchd 自己的日志里,不会有人通知你):
+应当正好 3 行。然后**等到下一个整点/半点再确认它真的跑了** —— 装上了不等于跑得起来(解释器路径错、venv 被删这类问题只会出现在 launchd 自己的日志里,不会有人通知你):
 
 ```bash
 cd /Users/nextderboy/Projects/WalmartAPI-Contral && tail -n 30 "$(/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 -c 'from registry import paths; print(paths.logs_dir())')/launchd/"*.log

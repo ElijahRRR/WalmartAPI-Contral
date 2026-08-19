@@ -231,11 +231,12 @@ settlement_sync   → 写对账表
 2. **下一轮定时**:每小时跑一次,最长占 20 分钟 < 60 分钟,正常不会撞上。
    真撞上了(某轮异常慢),那一轮的链会在 `order_audit` 这步停,
    `returns_sync` 不跑 —— 但 `order_sync` 已经跑完了,数据不丢,下一小时自动恢复。
-3. **它还会短暂借 `product_ingest` 的锁**:`wait` 期间要就地跑一次增量摄取,
-   而游标是独占推进的(两个进程同推会静默丢掉中间一段)。借不到就**跳过**
-   (不是失败)—— 说明 `product_ingest` 真的在跑,数据照样会进来。
-   ⚠ 反过来也成立:产品线 09:00 跑 `product_ingest` 时,如果 09:20 那轮
-   `order_audit` 想就地摄取,它会跳过。**这是安全的,不是故障。**
+3. ~~**它还会短暂借 `product_ingest` 的锁**~~ **已不再借锁**(2026-08-19):
+   就地摄取改走采集侧批次端点(`export_batch_records`,批内游标每次从 0
+   拉到底,幂等靠 snapshots.source_id),只拉本轮自己推的那几批,
+   不碰全局游标 —— `order_audit` 与 `product_ingest` 之间的锁交互消失,
+   product_chain 13:00 的 `product_ingest`(带 `lock_wait=900`)也不会
+   再等到 order_chain 手里的锁。
 
 **结论:保持默认 `wait=1`**(v1 的建议是 `wait=0`,现在收回)。理由:20 分钟
 远小于一小时,一条命令出真结论,而 `wait=0` 会让结论恒定滞后一轮 ——

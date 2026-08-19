@@ -128,11 +128,21 @@ def test_only_the_high_frequency_chains_live_on_this_machine():
     ⚠ 同一条工作流**绝不许两个 runner 都挂**:撞上了后到的那次拿不到 flock
     直接退 3 —— 那一轮什么都没做,而通知里写的是"⚠ 已有实例在运行",
     看久了就当常态了。
+
+    2026-08-19 所有者定稿后 `product_ingest` 单独长驻在 launchd(全局游标
+    唯一属主),四条链的同轮闭环全部按批次自取(无锁)——两个 runner 之间
+    重新回到零交集。它自带 lock_wait(防手动跑同名工作流撞上它:等而不是
+    退 3 空转),这个前提也钉死。
     """
-    assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain"}
+    assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain",
+                                              "product_ingest"}
     mine = {w for j in _LAUNCHD for w in j["workflows"]}
     theirs = {w for j in schedule.jobs_for("gpt") for w in j["workflows"]}
     assert mine & theirs == set()
+    for j in schedule.JOBS:
+        if "product_ingest" in j["workflows"]:
+            assert any(p.startswith("lock_wait=") for p in j["params"]), \
+                f"{j['label']}:product_ingest 要带等锁(手动撞车不空转)"
     # runner 只有这两个值;打错一个字(比如 "GPT")在 job() 里就炸
     assert {j["runner"] for j in schedule.JOBS} <= set(schedule.RUNNERS)
 

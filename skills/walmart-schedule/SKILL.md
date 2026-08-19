@@ -20,7 +20,7 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 | `backup` | 每天 02:00 | `0 2 * * *` | `0 18 * * *` | backup |
 | `daily_report` | 每天 06:40 | `40 6 * * *` | `40 22 * * *` | daily_report |
 | `order_daily` | 每天 07:30 | `30 7 * * *` | `30 23 * * *` | perf_problems → order_asin_normalize |
-| `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → sources_backfill → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → sources_backfill → product_refresh → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
 | `blacklist` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | risk_sync → blacklist_push |
 | `product_clear` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | product_clear |
 | `audit_sheet` | 每天 18:10 | `10 18 * * *` | `10 10 * * *` | product_audit |
@@ -60,10 +60,11 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
 | `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+| `product_ingest` | 每小时 :50 | product_ingest |
 
 它们跑在**电脑自己的 launchd** 上,而不是你的定时任务里 —— 频率太细(每半小时 / 每小时固定分钟),你那边多半排不准,而排不准的后果不是报错,是悄悄少跑几轮。
 
-⚠ **别把这一节读成「不用管」。** 装 launchd 那一步本身**是要人做的**,做法在 `skills/walmart-schedule/REGISTER.md` 第 3 步(`launchd_install` → `launchctl load` → 回读校验)。**没装 = 这两条链从来不跑,而且没有任何东西会说一声** —— 表现是飞书上的「处理中」永远不消失(feed 回执没人反哺)、日报的订单列是空的(订单没人拉),而所有已注册的任务都报成功。拿不准装没装就去查:`launchctl list | grep com.walmartapi`,应当正好 2 行。
+⚠ **别把这一节读成「不用管」。** 装 launchd 那一步本身**是要人做的**,做法在 `skills/walmart-schedule/REGISTER.md` 第 3 步(`launchd_install` → `launchctl load` → 回读校验)。**没装 = 这两条链从来不跑,而且没有任何东西会说一声** —— 表现是飞书上的「处理中」永远不消失(feed 回执没人反哺)、日报的订单列是空的(订单没人拉),而所有已注册的任务都报成功。拿不准装没装就去查:`launchctl list | grep com.walmartapi`,应当正好 3 行。
 
 ⚠ **装好之后,你这边不要再挂一份 —— 两边都挂 = 撞锁**:同一条链被 launchd 和你同时拉起来,后到的那次拿不到锁直接退出码 3 空跑一轮 —— 看起来一切正常。
 

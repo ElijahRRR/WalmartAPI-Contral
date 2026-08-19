@@ -32,7 +32,7 @@ import logging
 from api import feeds
 from registry import db
 from services import feed_track, listing_sheet, product_events, \
-    stores as stores_svc
+    stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -132,6 +132,7 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
                      f"{len(ripe)} 条,回执成功即清列重上")
         return lines
     clear_rows, waiting, failed = [], 0, []
+    burn_pairs: list[tuple[str, str]] = []   # RETIRE 成功即烧旧号(标 conflict)
     receipts: dict[str, dict] = {}
     for store_name, sku, feed_id, _at in ripe:
         if feed_id not in receipts:
@@ -155,6 +156,10 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
         if st[0] == "success":
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("cleared", store_name, sku))
+            # 旧号永久弃用(2026-08-19,配 claim 的原号复用逻辑):SKU 绑死过
+            # 它,退役后谁也不能再用;不烧的话下一轮 claim 会把它复用回来,
+            # "清列重上领新号"就成了空话
+            burn_pairs.append((store_name, sku))
             if row is not None:
                 clear_rows.append(row["rownum"])
             else:
@@ -165,6 +170,11 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("failed", store_name, sku))
             failed.append(f"{store_name}/{sku}({st[1]})")
+    if burn_pairs:
+        with db.pg_conn() as conn:
+            n_burn = upc_pool.burn_for_retire(conn, burn_pairs)
+        if n_burn:
+            lines.append(f"  退役烧号 {n_burn} 个(标 conflict,重上必领新号)")
     n = listing_sheet.clear_for_relist(clear_rows, execute)
     if n:
         lines.append(f"  清列重上 {n} 行(下一轮 list_new 领新 UPC 重提交)")

@@ -129,6 +129,12 @@ WALMART_ERR_PROHIBITED = frozenset({
 # 绝不能当失败重发,否则 duplicate listing)
 WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
                             "EXT_DATA_ERROR_66547201695750")
+# 内容标准拒(2026-08-19 生产实证 ~30 例:标题堆词/图文不符/描述自相矛盾)。
+# 文案图片全部取自亚马逊原文(系统的地盘,LLM 不碰),原样重发结果必然相同
+# ——进 FAILED 通道重试三次 = 纯烧 UPC 与配额,还会触发/延长 QARTH 合规
+# 审查。O 列写 CONTENT_REJECTED,list_new 不再自动领;文案人工改好后
+# 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
+WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

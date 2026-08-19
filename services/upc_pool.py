@@ -126,26 +126,82 @@ def project_to_sheet(conn, rows: list[dict]) -> int:
 def claim(conn, wants: list[dict]) -> list[str | None]:
     """输入:连接 + [{store, asin?}] → 输出:与 wants 等长的 UPC 列表(不足补 None)。
 
-    单事务 FOR UPDATE SKIP LOCKED:并发领号互不阻塞且绝不双领。
+    **先复用后新领**(2026-08-19 生产实证 ERR_EXT_DATA_0101211):同
+    (store, asin) 名下已有 claimed/used 的号必须原号复用——SKU 在沃尔玛端
+    已绑死首次提交的 UPC,O=FAILED 重试换新号重发同一 SKU 必败(旧仓
+    legacy_survey:1667 同款死亡路径),而且每次重试白烧一个新号。
+    多个旧号时取**最早领的**(最可能是沃尔玛端建 SKU 时绑的那个)。
+    自愈链要"领新号"的场景不受影响:RETIRE 成功清列时旧号已被
+    burn_for_retire 标 conflict,复用查询摸不到它。
+
+    新领仍是单事务 FOR UPDATE SKIP LOCKED:并发领号互不阻塞且绝不双领。
     调用方必须在同一事务或紧随其后提交 feed;领了不用要走 release 三类路径。
     """
     if not wants:
         return []
+    reuse: dict[int, str] = {}
+    with conn.cursor() as cur:
+        pairs = [(w.get("store"), w.get("asin")) for w in wants]
+        cur.execute(
+            "SELECT DISTINCT ON (store, asin) store, asin, upc "
+            "FROM catalog.upc_pool "
+            "JOIN unnest(%s::text[], %s::text[]) AS t(s, a) "
+            "  ON store = t.s AND asin = t.a "
+            "WHERE status IN ('claimed', 'used') "
+            "ORDER BY store, asin, claimed_at NULLS LAST, upc",
+            ([p[0] for p in pairs], [p[1] for p in pairs]))
+        by_pair = {(s, a): u for s, a, u in cur.fetchall()}
+        for i, w in enumerate(wants):
+            u = by_pair.get((w.get("store"), w.get("asin")))
+            if u:
+                reuse[i] = u
+        fresh_idx = [i for i in range(len(wants)) if i not in reuse]
+        got: list[str] = []
+        if fresh_idx:
+            cur.execute(
+                "SELECT upc FROM catalog.upc_pool WHERE status = '' "
+                "ORDER BY created_at, upc LIMIT %s FOR UPDATE SKIP LOCKED",
+                (len(fresh_idx),))
+            got = [r[0] for r in cur.fetchall()]
+            cur.executemany(
+                "UPDATE catalog.upc_pool SET status = 'claimed', store = %s, "
+                "asin = %s, claimed_at = now() WHERE upc = %s",
+                [(wants[i].get("store"), wants[i].get("asin"), u)
+                 for i, u in zip(fresh_idx, got)])
+    if reuse:
+        logger.info("UPC 原号复用 %d 个(同店同 ASIN 领过号,重试不换号):%s",
+                    len(reuse), list(reuse.values())[:5])
+    if len(got) < len(fresh_idx):
+        logger.warning("UPC 池余量不足:需要 %d 个,只领到 %d 个(请注入新号段)",
+                       len(fresh_idx), len(got))
+    out: list[str | None] = [None] * len(wants)
+    for i, u in reuse.items():
+        out[i] = u
+    for i, u in zip(fresh_idx, got):
+        out[i] = u
+    return out
+
+
+def burn_for_retire(conn, pairs: list[tuple[str, str]]) -> int:
+    """输入:[(store, asin)] → 输出:标 conflict 的行数(RETIRE 成功后旧号永久弃用)。
+
+    自愈链清列重上要的是**新号**(SKU 已绑死旧号,不退役换号必败;退役后
+    旧号也不能再给任何人用)。标成 conflict 之后,claim 的同 (店,ASIN)
+    复用查询摸不到它,下一轮 list_new 自然领新号——两条语义各归其位。
+    """
+    if not pairs:
+        return 0
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT upc FROM catalog.upc_pool WHERE status = '' "
-            "ORDER BY created_at, upc LIMIT %s FOR UPDATE SKIP LOCKED",
-            (len(wants),))
-        got = [r[0] for r in cur.fetchall()]
-        cur.executemany(
-            "UPDATE catalog.upc_pool SET status = 'claimed', store = %s, "
-            "asin = %s, claimed_at = now() WHERE upc = %s",
-            [(w.get("store"), w.get("asin"), u)
-             for w, u in zip(wants, got)])
-    if len(got) < len(wants):
-        logger.warning("UPC 池余量不足:需要 %d 个,只领到 %d 个(请注入新号段)",
-                       len(wants), len(got))
-    return got + [None] * (len(wants) - len(got))
+            "UPDATE catalog.upc_pool SET status = 'conflict' "
+            "FROM unnest(%s::text[], %s::text[]) AS t(s, a) "
+            "WHERE store = t.s AND asin = t.a "
+            "  AND status IN ('claimed', 'used')",
+            ([p[0] for p in pairs], [p[1] for p in pairs]))
+        n = cur.rowcount
+    if n:
+        logger.info("RETIRE 退役烧号 %d 个(标 conflict,重上必领新号)", n)
+    return n
 
 
 def mark_used(conn, pairs: list[tuple[str, str]]) -> int:

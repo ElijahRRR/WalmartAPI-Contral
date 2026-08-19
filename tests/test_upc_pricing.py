@@ -28,6 +28,8 @@ class _Conn:
         self.sqls.append((sql, list(rows)))
 
     def fetchall(self):
+        if "DISTINCT ON (store, asin)" in self._last:
+            return getattr(self, "reuse", [])    # claim 的原号复用查询
         if "FOR UPDATE SKIP LOCKED" in self._last:
             return self.fetch
         if "GROUP BY status" in self._last:
@@ -73,12 +75,37 @@ def test_claim_uses_skip_locked_and_pads_none(caplog):
         got = upc_pool.claim(conn, [{"store": "T1", "asin": "B0X"},
                                     {"store": "T1", "asin": "B0Y"}])
     assert got == ["000000000017", None]                     # 池不足补 None
-    sel_sql = conn.sqls[0][0]
+    assert "DISTINCT ON (store, asin)" in conn.sqls[0][0]    # 先查可复用旧号
+    sel_sql = conn.sqls[1][0]
     assert "FOR UPDATE SKIP LOCKED" in sel_sql and "status = ''" in sel_sql
-    upd_sql, upd_rows = conn.sqls[1]
+    upd_sql, upd_rows = conn.sqls[2]
     assert "status = 'claimed'" in upd_sql
     assert upd_rows == [("T1", "B0X", "000000000017")]       # 只更新领到的
     assert any("余量不足" in m for m in caplog.messages)
+
+
+def test_claim_reuses_prior_upc_for_same_store_asin():
+    """O=FAILED 重试不换号(2026-08-19 生产实证 ERR_EXT_DATA_0101211):
+    SKU 在沃尔玛端绑死首个 UPC,换新号重发必败还白烧号。同 (店,ASIN)
+    已有 claimed/used 的号必须原号复用,新号只发给真正的新行。"""
+    conn = _Conn(fetch=[("000000000024",)])
+    conn.reuse = [("T1", "B0OLD", "000000000017")]
+    got = upc_pool.claim(conn, [{"store": "T1", "asin": "B0OLD"},
+                                {"store": "T1", "asin": "B0NEW"}])
+    assert got == ["000000000017", "000000000024"]           # 旧行复用,新行新号
+    upd_sql, upd_rows = conn.sqls[2]
+    assert upd_rows == [("T1", "B0NEW", "000000000024")]     # 复用行不再 UPDATE
+
+
+def test_burn_for_retire_marks_conflict():
+    """RETIRE 成功后旧号永久弃用(标 conflict):不烧的话 claim 的复用逻辑
+    会把旧号还给同 (店,ASIN),"清列重上领新号"就成了空话。"""
+    conn = _Conn()
+    assert upc_pool.burn_for_retire(conn, [("T1", "B0X")]) == 1
+    sql, _ = conn.sqls[0]
+    assert "status = 'conflict'" in sql
+    assert "status IN ('claimed', 'used')" in sql
+    assert upc_pool.burn_for_retire(conn, []) == 0
 
 
 def test_release_only_three_reasons():

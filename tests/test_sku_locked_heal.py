@@ -13,6 +13,7 @@ class _Conn:
     def __init__(self, state=()):
         self.sqls: list = []
         self._state = list(state)
+        self.rowcount = 1        # burn_for_retire 读 rowcount
 
     def cursor(self):
         return self

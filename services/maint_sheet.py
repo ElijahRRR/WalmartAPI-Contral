@@ -102,12 +102,18 @@ def _save_cursor(conn, value: dict) -> None:
             (_CURSOR, json.dumps(value)))
 
 
+_SCAN_BLOCK = 5000      # 找空行每个 GET 读多少行(只读 A 列,单列 5000 格很轻;
+                        # blacklist_sheet 同款先例)。此前 50 行/请求:有游标时
+                        # 只扫一两块无感,但首跑/游标丢失从第 2 行扫几千行历史
+                        # = 上百个串行请求(2026-08-19 全仓飞书逐行请求盘点)
+
+
 def _find_next_empty(start: int) -> int:
     """输入:候选起始行 → 输出:确认为空的首行(防水位漂移覆盖已有数据)。"""
     grid = feishu.sheet_row_count(resources.MAINT_SHEET)
     row = start
     while row <= grid:
-        end = min(row + 49, grid)
+        end = min(row + _SCAN_BLOCK - 1, grid)
         vals = feishu.sheet_values(resources.MAINT_SHEET, f"A{row}:A{end}")
         got = [(str(c[0]).strip() if c and c[0] is not None else "")
                for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]

@@ -186,6 +186,12 @@ ORDER BY w.store, w.sku
 # 不各判各的 —— 分开写迟早飘成"删除链按 A 判、库存链按 B 判"而两边都不报错。
 
 TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标题
+# 2026-08-19 所有者:「暂时关闭'删除(title_mismatch)'这个维护」。08-17/18
+# 两轮该原因的删除建议超两千条、占删除九成,而删除不可逆——先停闸观察
+# (采集标题质量/占位符干扰的嫌疑未排除)。⚠ 只停"删除"这一个出口:
+# 低相似度行照旧**不改价、不改标题**(price/title provider 的防呆用同一
+# 判据,保持生效)——这批行是被冻结,不是被放开维护。恢复改回 True。
+TITLE_MISMATCH_DELETE = False
 
 def processed_title(slow) -> str:
     """输入:products.slow → 输出:过完上架文案处理的标题(去品牌/去符号/截 199)。
@@ -579,6 +585,7 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     """
     caps = caps or {}
     seen, out, per_store = set(), [], {}
+    paused_mismatch = 0
 
     def _take(store, sku, code, why="", extra=None):
         """code = 机器码(飞书「原因」列的分组依据 / 建议行 category);
@@ -619,6 +626,9 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
             title_similarity=order_audit.title_similarity(
                 r["product_name"], processed_title(slow)))
         if act == "delete":
+            if code == "title_mismatch" and not TITLE_MISMATCH_DELETE:
+                paused_mismatch += 1        # 停闸计数,压制必须见人
+                continue
             _take(store, sku, code, why)
 
     with conn.cursor() as cur:
@@ -633,6 +643,10 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         logger.info("连续无货 %d 天:本轮 0 个候选(采集历史不足 %d 天时属正常)",
                     oos_days, oos_days)
 
+    if paused_mismatch:
+        logger.warning("删除(title_mismatch)已停闸(所有者 2026-08-19),"
+                       "本轮压制 %d 条 —— 这批行同时不改价不改标题(冻结)",
+                       paused_mismatch)
     over = {s: n - int(caps.get(s, DELETE_PER_STORE))
             for s, n in per_store.items()
             if n > int(caps.get(s, DELETE_PER_STORE))}

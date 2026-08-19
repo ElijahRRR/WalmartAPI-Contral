@@ -117,6 +117,11 @@ def run(params: dict) -> str:
              f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
     lines += _preview_lines(intents, stockzero)
 
+    if not mi.TITLE_MISMATCH_DELETE:
+        # 停闸必须天天见人(本仓口诀:静默关闭 = 没人记得它关着)。
+        # 生成侧停了之后,存量 suggested 行会被下面的 withdraw_stale 顺带撤掉
+        lines.append("  ⚠ 删除(title_mismatch)已停闸(所有者 2026-08-19 暂停,"
+                     "恢复改 services/maintenance_intents.TITLE_MISMATCH_DELETE)")
     if preview:
         return "\n".join(lines + [
             f"(preview:未落建议行;本轮将写 {len(intents)} 条)"])

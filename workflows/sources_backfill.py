@@ -11,8 +11,12 @@ catalog.listing_sources 里 source_type='amz' 的行——没登记来源的在�
 登记簿的日常写入是「谁上架谁登记」(list_new=amz / match_listing=match),
 **旧系统上的存量、以及旧系统调度停掉之前仍在产出的行,没有任何补给线**
 ——只能靠本工作流按 SKU 格式回填(db_schema.md listing_sources 节
-「存量按 SKU 格式一次性回填」的落地件)。旧系统调度停干净后跑一次即封口,
-之后不需要常驻;多跑无害(幂等)。
+「存量按 SKU 格式一次性回填」的落地件)。
+
+2026-08-19 所有者定稿**常驻 product_chain**(紧跟 catalog_sync):新发现的
+在架商品当轮补关联、当轮就能被维护。零缺口时零成本(一次 SELECT);
+旧系统调度停干净后,摘要长期应为 0 行 —— **非零本身就是报警**
+(有人绕过「谁上架谁登记」的规矩把商品弄上架了)。
 
 规则(与设计定稿一致,一条不加):
   · sku 形如 ASIN(B+9 位大写字母数字)→ source_type='amz',source_key=sku

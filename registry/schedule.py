@@ -109,13 +109,15 @@ JOBS = (
     # ⚠ wait=1 不能省:不等采集落定就往下走,product_ingest 摄回来的是上一轮
     # 的数据,而且不报错。整条约 2 小时(采集 ~50 分钟是大头)。
     job("product_chain",
-        ["catalog_sync", "product_refresh", "product_ingest",
-         "maintenance_scan", "maintenance",
+        ["catalog_sync", "sources_backfill", "product_refresh",
+         "product_ingest", "maintenance_scan", "maintenance",
          "problem_scan", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
         params=["product_refresh:wait=1"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
-             "(拿隔夜现值当判据会误伤)"),
+             "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
+             "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"
+             "当轮就能被维护;零缺口时零成本,摘要非零 = 有人绕过登记上架"),
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),

@@ -80,7 +80,7 @@ from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
     mp_mapper, pricing, product_events, product_ingest, pt_spec, risk_gate, \
-    runlock, scrape_batches, store_limits, stores as stores_svc, upc_pool, \
+    scrape_batches, store_limits, stores as stores_svc, upc_pool, \
     variant_group, variant_remap, variant_title
 
 DANGEROUS = True
@@ -266,25 +266,18 @@ def _push_scrape(absent: list[str], execute: bool
         return f"  ⚠ 缺数据 {len(absent)} 个 ASIN 推采集失败:{e}", []
 
 
-def _ingest_now() -> str:
-    """输入:无 → 输出:就地增量摄取摘要(拿不到锁则说明原因)。
+def _ingest_batches(names: list[str]) -> str:
+    """输入:本轮推的批次名 → 输出:按批摄取摘要。
 
-    **借的是 product_ingest 的活,就得借它的锁**(与 product_audit._ingest_now
-    逐字同款纪律):增量游标 `ops.cursors` name='product_ingest' 是独占推进的,
-    两个进程同时拉 `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉
-    先写的,中间那段记录**永远不会再被拉一次**(游标只前进不回头)——
-    两侧都不报错,只是产品中心少了一批数据。
-
-    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
-    只是本轮这批可能来不及,照旧不写终态、次日续上。
+    2026-08-19 起走采集侧批次端点(`export_batch_records`,契约 §4.11):
+    只拉**自己这批**的事件,批内游标每次从 0 拉到底,不碰全局游标、
+    **不需要 product_ingest 的锁**——此前是借锁抽全库到当刻头部,13:00 的
+    product_chain 与整点 order_chain 一撞就是一场 15 分钟等锁。幂等靠
+    snapshots.source_id,与全局泵(product_chain 每天的 product_ingest)
+    重复摄取无害。没拉到底的批次摘要里点名,这批照旧不写终态、次日续上。
     """
-    with runlock.hold(product_ingest.CURSOR_NAME,
-                      holder="list_new._ingest_now") as got:
-        if not got:
-            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
-                    "数据仍会由它摄入,这批照旧不写终态")
-        res = product_ingest.pump(scraper, db)
-    return "就地" + product_ingest.pump_summary(res)
+    _, note = product_ingest.pump_batches(scraper, db, names)
+    return note
 
 
 _STATS_LOCK = threading.Lock()
@@ -1136,7 +1129,7 @@ def run(params: dict) -> str:
         # 救回多少上多少,仍缺的照旧不写终态。list_new 是当天最后一棒
         # (20:00),这 20 分钟不挤任何下游。
         wnote, _n_open = scrape_batches.wait_settled(gap_names, gap_wait)
-        ing = _ingest_now()
+        ing = _ingest_batches(gap_names)
         refreshed = amz_source.fetch_products(absent)
         saved = [a for a in absent if refreshed.get(a) is not None]
         for a in saved:

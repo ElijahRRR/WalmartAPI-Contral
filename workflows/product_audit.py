@@ -76,7 +76,7 @@ from api import scraper
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, db_guard, \
     kpi, \
-    listing_sheet, product_events, product_ingest, runlock, scrape_batches
+    listing_sheet, product_events, product_ingest, scrape_batches
 
 DANGEROUS = True
 
@@ -604,25 +604,17 @@ def _push_gap(gap: list[str], day: str,
     return sent
 
 
-def _ingest_now() -> str:
-    """输入:无 → 输出:就地增量摄取摘要(拿不到锁则说明原因)。
+def _ingest_batches(names: list[str]) -> str:
+    """输入:本轮推的批次名 → 输出:按批摄取摘要。
 
-    **借的是 product_ingest 的活,就得借它的锁**(与 order_audit._ingest_now
-    逐字同款纪律):增量游标 `ops.cursors` name='product_ingest' 是独占推进的,
-    两个进程同时拉 `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉
-    先写的,中间那段记录**永远不会再被拉一次**(游标只前进不回头)——
-    两侧都不报错,只是产品中心少了一批数据。
-
-    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
-    只是本轮这批可能来不及,退回"下一轮审"。
+    2026-08-19 起走采集侧批次端点(`export_batch_records`,契约 §4.11):
+    只拉**自己这批**的事件,批内游标每次从 0 拉到底,不碰全局游标、
+    **不需要 product_ingest 的锁**——此前是借锁抽全库到当刻头部,与
+    product_chain / order_chain 的抽水互相排队。幂等靠 snapshots.source_id,
+    与全局泵重复摄取无害。没拉到底的批次摘要里点名,那部分退回下轮审。
     """
-    with runlock.hold(product_ingest.CURSOR_NAME,
-                      holder="product_audit._ingest_now") as got:
-        if not got:
-            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
-                    "数据仍会由它摄入,这批退回下轮审")
-        res = product_ingest.pump(scraper, db)
-    return "就地" + product_ingest.pump_summary(res)
+    _, note = product_ingest.pump_batches(scraper, db, names)
+    return note
 
 
 def _gap_reasons(sent: list[tuple[str, object]]) -> dict[str, str]:
@@ -666,8 +658,8 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
       ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。
       ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
-      ③ **就地摄取**(借 product_ingest 的锁,见 `_ingest_now`)——
-         批次 completed **不等于**我们库里有数据,中间还隔着一次增量导出。
+      ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
+         批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
       ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
          (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
@@ -763,7 +755,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
         if stuck:
             out.append(f"  ⚠ {stuck} 个批次超时仍在跑:这部分退回下轮审"
                        f"(已采到的下面就摄进来)")
-        out.append(f"  {_ingest_now()}")
+        out.append(f"  {_ingest_batches([n for n, _ in sent])}")
 
     # ④ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
     #    刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉

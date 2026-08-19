@@ -693,7 +693,7 @@ def test_same_round_scrape_closure_rescues(monkeypatch):
     """同轮闭环(所有者定稿 2026-08-18):推采集→等窗口→就地摄取→本轮续走。
 
     数据源缺席的行不再"本轮跳过次日续":refetch 拿到数据后这一轮就提交。
-    wait_settled/_ingest_now 打桩(它们各自有自己的测试),这里只验接线:
+    wait_settled/_ingest_batches 打桩(它们各自有自己的测试),这里只验接线:
     次序对(等完才摄取才复查)、救回的行真的进了提交、摘要说了人话。
     """
     rows = [_sheet_row(2, asin="B0AAAAAOK1"), _sheet_row(3, asin="B0AAAAAGAP")]
@@ -716,10 +716,13 @@ def test_same_round_scrape_closure_rescues(monkeypatch):
         ln.scrape_batches, "wait_settled",
         lambda names, t: (calls["order"].append("wait"), ("1/1 落定", 0))[1])
     monkeypatch.setattr(
-        ln, "_ingest_now",
-        lambda: (calls["order"].append("ingest"), "就地摄取:新增 1")[1])
+        ln, "_ingest_batches",
+        lambda names: (calls["order"].append("ingest"),
+                       calls.setdefault("ingested_names", []).append(list(names)),
+                       "按批摄取:新增 1")[2])
     out = ln.run({"execute": True})
     assert calls["order"] == ["wait", "ingest", "refetch"]
+    assert calls["ingested_names"] == [["listing_gap_test"]]  # 只拉自己那批
     assert "同轮闭环" in out and "救回 1/1" in out
     assert sorted(w["asin"] for w in seen["claim_wants"]) == [
         "B0AAAAAGAP", "B0AAAAAOK1"]          # 救回的行本轮就领号提交

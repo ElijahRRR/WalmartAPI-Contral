@@ -83,6 +83,70 @@ def test_export_limit_guard(monkeypatch):
         scraper.export_incremental(0, limit=1001)
 
 
+# ── api/scraper.export_batch_records:批次端点状态码分流(契约 §4.11)────────
+
+def test_batch_export_ok_carries_meta(monkeypatch):
+    """200:records/next_cursor/has_more 同增量端点,meta 透传 coverage 等。"""
+    _patch_http(monkeypatch, [(200, {
+        "contract_version": 1, "records": [{"asin": "B0A"}],
+        "next_cursor": 34567, "has_more": False,
+        "batch": {"id": 12, "name": "wm-audit-x", "status": "completed"},
+        "coverage": {"asin_total": 500, "asin_with_event": 498},
+        "retention_min_cursor": 676, "max_cursor": 34567})])
+    records, nxt, more, meta = scraper.export_batch_records("wm-audit-x")
+    assert records == [{"asin": "B0A"}] and nxt == 34567 and more is False
+    assert meta["coverage"] == {"asin_total": 500, "asin_with_event": 498}
+    assert meta["batch"]["status"] == "completed"
+
+
+def test_batch_export_404_batch_not_found_is_terminal(monkeypatch):
+    """本端点的 404 唯一含义:批次名不存在 → LookupError,不重试。"""
+    calls = _patch_http(monkeypatch,
+                        [(404, {"error": "batch_not_found",
+                                "detail": "批次不存在: wm-audit-x"})])
+    with pytest.raises(LookupError, match="批次不存在"):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+
+def test_batch_export_alien_404_is_not_batch_gone(monkeypatch):
+    """长得不像 batch_not_found 的 404(采集侧还是旧版本、端点没挂)→
+    按瞬时故障重试报错,**绝不当「批次没了」**——那会让调用方把一批
+    要得回来的数据判成要不回来。"""
+    monkeypatch.setattr(scraper.time, "sleep", lambda s: None)
+    _patch_http(monkeypatch, [(404, {"detail": "Not Found"})])
+    with pytest.raises(RuntimeError, match="未部署"):
+        scraper.export_batch_records("wm-audit-x", max_retries=2)
+
+
+def test_batch_export_terminal_codes_do_not_retry(monkeypatch):
+    calls = _patch_http(monkeypatch, [(401, {"error": "invalid_export_token"})])
+    with pytest.raises(scraper.ExportAuthError):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+    calls = _patch_http(monkeypatch, [(422, {"error": "invalid_parameter"})])
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("wm-audit-x", limit=1001)
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("")
+
+
+def test_batch_export_503_retries_then_succeeds(monkeypatch):
+    """503(事件流暂不可用)是瞬时故障:退避重试,好了就正常返回。"""
+    monkeypatch.setattr(scraper.time, "sleep", lambda s: None)
+    calls = _patch_http(monkeypatch, [
+        (503, {"error": "event_stream_unavailable"}),
+        (200, {"records": [], "next_cursor": 0, "has_more": False})])
+    records, _nxt, more, _meta = scraper.export_batch_records("wm-audit-x")
+    assert records == [] and more is False and calls["n"] == 2
+
+
 # ── services/product_ingest:三条硬规则 ──────────────────────────────────
 
 class _FakeCur:

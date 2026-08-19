@@ -12,15 +12,17 @@
   python cli.py order_audit -p refill_shots=1  # 为台账无批次记录的行重采一次(只为补图)
 
 **轮询默认开**(所有者定稿 2026-08-10)——一条命令出真结论:
-推采集 → 轮询批次到落定(20 分钟兜底)→ 就地跑增量摄取 → 重新对账重判 →
+推采集 → 轮询批次到落定(20 分钟兜底)→ 就地按批摄取 → 重新对账重判 →
 回写飞书。默认开是因为**忘了加开关就只能看到上一轮的结论,而且不报错**;
 这种"忘了就静默降级"的默认值不该留着。
 代价:一次运行可能阻塞到 20 分钟。挂调度后若不想让它占住那一小时的位置,
 在 plist 里显式写 `-p wait=0`(参数本来就要逐条写,不会漏)。
 注意 cli.py 有 flock:阻塞期间再手动跑一次会直接退出(退出码 3),不排队。
-就地摄取**借 product_ingest 的 flock**——游标独占推进,两个进程同推会静默
-丢掉中间一段(详见 services/runlock 与 services/product_ingest.pump)。
-⚠ `product_ingest` **仍要单独挂调度**:就地摄取只覆盖本工作流推的那批,
+就地摄取走采集侧**批次端点**(2026-08-19 起,`export_batch_records`):
+只拉本工作流自己推的那几批,批内游标每次从 0 拉到底,不碰全局游标、
+不需要 product_ingest 的锁(此前借锁抽全库,整点一到就和 13:00 的
+product_chain 排队等锁)。幂等靠 snapshots.source_id。
+⚠ `product_ingest` **仍要单独挂调度**:按批摄取只覆盖本工作流推的那批,
 product_refresh 那条链(维护/上架用的快照)还是靠它摄。
 
 设计(PG 权威,飞书是人机界面):
@@ -59,14 +61,15 @@ product_refresh 那条链(维护/上架用的快照)还是靠它摄。
 - **先落 pending 再调接口**(CLAUDE.md 铁律):台账 ops.audit_scrape 一个
   (ASIN,邮编) 一行。每轮开工先对账,三层判据各管一段:
   ① 快照真出现 → done(只有它能证明数据到了**我们**库里);
-  ② 批次已落定(**只看 `tasks.open == 0`**)**且摄取水位线
-     已越过其落定时刻**仍无快照 → 认账失败,原因去
+  ② 批次已落定(**只看 `tasks.open == 0`**)且**该批自己的事件流已按批
+     拉到底**仍无快照 → 认账失败,原因去
      `/api/batches/{batch_id}/failures` 拿真值写进台账。
-     水位线这道闸是 2026-08-10 实测踩出来的:批次 completed 只说明**采集侧**
-     干完了,数据还在增量导出流里,中间隔着 product_ingest 一跳。少了它,
-     127 个组合全被判「批次已采完但无快照」,而紧接着一次 product_ingest
-     就把这 127 条原样摄了进来——采集全成功,是我们问早了。且 failed 不挡
-     重推,下一轮会把它们再采一遍,每小时白烧一轮,两侧都不报错;
+     「先拉到底再认账」这道闸的来历是 2026-08-10 实测:批次 completed 只
+     说明**采集侧**干完了,数据还在导出流里,当时 127 个组合全被判「批次
+     已采完但无快照」,紧接着一次摄取就把这 127 条原样摄了进来——采集全
+     成功,是我们问早了。且 failed 不挡重推,每小时白烧一轮,两侧都不报错。
+     (2026-08-19 前这道闸是全局摄取水位线;换成按批拉到底后凭据更强:
+     **这批的流里真没有你**,而不是"全局抽水抽过了你落定的时刻");
   ③ 兜底超时 20 分钟 → 只打在**批次已查不到**的组合上,防台账永远挂着。
   **且落定要稳住 15 分钟才认账**(所有者 2026-08-10 澄清采集侧机制):server 会
   把失败任务推回 worker 再循环两轮(每轮间隔 5 分钟),`tasks.open` 归零**不代表
@@ -126,7 +129,7 @@ import httpx
 from api import feishu, scraper
 from registry import db, resources
 from services import (kpi, order_audit as rules, product_ingest as ingest,
-                      runlock, scrape_batches as batches)
+                      scrape_batches as batches)
 
 DANGEROUS = False
 
@@ -270,20 +273,17 @@ WHERE b.batch_name LIKE %(prefix)s
 ORDER BY b.submitted_at
 """
 
-# 可以认账的批次:已落定、还有 pending 组合、**且摄取水位线已越过它的落定时刻**。
+# 可以认账的批次:已落定、还有 pending 组合、且落定已稳住窗口期。
 #
-# 最后一个条件是 2026-08-10 实测踩出来的:批次 completed 只说明采集侧干完了,
-# 数据还在增量导出流里,中间隔着 product_ingest 一跳。当时 127 个组合全被判
-# 「批次已采完但无快照」,紧接着一次 product_ingest 就把这 127 条原样摄了进来
-# ——采集全成功,是我们问早了。代价不只是台账写错:failed 不挡重推,下一轮
-# 会把这 127 个组合再采一遍,每小时白烧一轮。
-#
-# 反过来,真失败的批次水位线迟早会越过(product_ingest 每轮都刷水位线,
-# 哪怕 0 条新数据),所以只是晚一轮认账,不会漏。真卡住了还有兜底超时兜底。
+# 认账前的最后一道闸(「这批的数据真到我们库里了吗」)不在这条 SQL 里:
+# _reap_batches 会对每个候选批次**把它自己的事件流按批拉到底**
+# (services.product_ingest.pump_batch),拉到底且落定之后仍 pending 的
+# 才判失败。2026-08-19 前这道闸是"全局摄取水位线已越过落定时刻"——
+# 那是 2026-08-10 的 127 条冤案(批次 completed ≠ 数据落库,问早了整批
+# 误判失败 + 每小时白烧重采)踩出来的防线;按批拉到底给出更强的逐批凭据,
+# 水位线不再参与认账(它仍由全局泵维护,只作运维观测)。
 _REAPABLE_SQL = """
-SELECT b.batch_name, b.batch_id,
-       (SELECT c.updated_at > b.finished_at FROM ops.cursors c
-        WHERE c.name = %(watermark)s) AS ingest_caught_up
+SELECT b.batch_name, b.batch_id
 FROM ops.scrape_batches b
 WHERE b.batch_name LIKE %(prefix)s
   AND b.status NOT IN ('pushed', 'running')
@@ -473,16 +473,19 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
 
     两段分开(2026-08-10 实测后改):
     ① 轮询在途批次的状态,落定的记 completed;
-    ② **只对「已落定 且 摄取水位线已越过其落定时刻」的批次认账失败**,
+    ② **只对「已落定 且 该批自己的事件流已按批拉到底」的批次认账失败**,
        这时才拉 `/api/batches/{batch_id}/failures` 把**真实原因**
        (captcha / variant_offset / zip_switch_failed …)写进台账,而不是一律
        记"超时未见快照"——验证码(换时段可重试)和 404(该去删链接)的处置
        完全不同。
 
-    为什么必须分两段:批次 completed **不等于我们库里有数据**,中间隔着增量
-    导出 + product_ingest 一跳。合在一起写(落定即认账)会把采成功的整批冤枉
-    成失败——实测 127 个组合全军覆没,而紧接着一次 product_ingest 就把这 127
-    条原样摄了进来。且 failed 不挡重推,下一轮会把它们再采一遍,每小时白烧。
+    为什么必须分两段:批次 completed **不等于我们库里有数据**,中间还隔着
+    一次导出。合在一起写(落定即认账)会把采成功的整批冤枉成失败——实测
+    127 个组合全军覆没,而紧接着一次摄取就把这 127 条原样摄了进来。且
+    failed 不挡重推,下一轮会把它们再采一遍,每小时白烧。
+    (2026-08-19 起 ② 的凭据从「全局摄取水位线已越过落定时刻」换成
+    「pump_batch 把这批拉到底 + 落定后仍 pending」——逐批的确定性,
+    不再依赖全局泵跑没跑过。)
     """
     with conn.cursor() as cur:
         cur.execute(_OPEN_BATCHES_SQL, {"prefix": _BATCH_PREFIX + "%"})
@@ -518,30 +521,47 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
                        f"screenshots={(st.get('screenshots') or {}).get('done')}")
         settled_batches += 1
 
-    # ② 已落定的批次:摄取追上了才认账,否则原样挂着等下轮
+    # ② 已落定的批次:先把**这批自己的事件流**按批拉到底(批次端点,不碰
+    #    全局游标、不需要锁),刚到的快照落定之后,仍然 pending 的才有资格
+    #    判失败。拉不到底(采集侧故障)的批次这轮不认账,原样挂着等下轮。
     conn.commit()          # 让 ① 写的 finished_at 对下面这条查询可见
     with conn.cursor() as cur:
         cur.execute(_REAPABLE_SQL, {"prefix": _BATCH_PREFIX + "%",
-                                    "watermark": ingest.WATERMARK_NAME,
                                     "stable": _AUTO_RETRY_SETTLE_MIN})
         candidates = cur.fetchall()
 
     waiting = 0
-    for name, batch_id, caught_up in candidates:
-        if not caught_up:
-            waiting += 1        # 数据可能正在增量流里,还没资格说它失败
-            continue
+    pumped: list[tuple] = []
+    for name, batch_id in candidates:
+        res = ingest.pump_batch(scraper, db, name)
+        if res["ok"]:
+            pumped.append((name, batch_id))
+        elif res["gone"]:
+            # 批次在采集侧已查不到,事件也拉不回来了:pending 组合交给
+            # 兜底超时收尾(_TIMEOUT_SQL 只放过在途批次,completed 不挡)
+            notes.append(f"{name}:采集侧已无此批次,交兜底超时")
+        else:
+            waiting += 1        # 采集侧故障,这轮拉不了 ⇒ 没资格说它失败
+            notes.append(f"{name}:批次导出失败,下轮再认账({res['error']})")
+    if pumped:
+        # 刚拉到的快照先落定台账(本函数之前那遍 _SETTLE_SQL 看不见这批
+        # 新行),再问"还有谁 pending"——顺序反了就是把采成功的判失败,
+        # 127 条冤案(2026-08-10)的形状
+        with conn.cursor() as cur:
+            cur.execute(_SETTLE_SQL)
+        conn.commit()
+    for name, batch_id in pumped:
         with conn.cursor() as cur:
             cur.execute(_STILL_PENDING_SQL, {"batch": name})
             stuck = cur.fetchall()
         if not stuck:
             continue
-        # 摄取已越过这批的落定时刻却仍无快照 ⇒ 真失败,去问原因
+        # 这批的事件流已拉到底、快照也落定过了,仍无快照 ⇒ 真失败,去问原因
         summary, by_asin = batches.pull_failures(name, batch_id)
         for asin, zip5 in stuck:
             et = by_asin.get(asin)
             reason = (f"采集失败:{et}" if et
-                      else "批次已采完且摄取已追上,仍无快照(增量导出里没有这条)")
+                      else "批次已采完且其事件流已拉到底,仍无快照")
             with conn.cursor() as cur:
                 cur.execute(_FAIL_PAIR_SQL,
                             {"asin": asin, "zip": zip5, "reason": reason,
@@ -549,10 +569,9 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
             failed_pairs += 1
         notes.append(f"{name}:{len(stuck)} 个组合无快照({summary})")
     if waiting:
-        # 正常态(摄取还没跑);但一直不降就是 product_ingest 停了,得有人看见
-        logger.info("采集台账:%d 个已落定批次在等 product_ingest 摄取后再认账",
+        # 偶发是正常态(采集侧抖一下);一直不降就是采集侧病了,得有人看见
+        logger.info("采集台账:%d 个已落定批次本轮拉不到事件流,下轮再认账",
                     waiting)
-        notes.append(f"{waiting} 个批次已采完,等摄取后认账")
     conn.commit()
     return settled_batches, failed_pairs, notes
 
@@ -565,8 +584,8 @@ def _settle_ledger(conn) -> tuple[int, int, dict, list[str]]:
 
     三层判据各管一段,**谁也替代不了谁**:
       快照真出现   → done(只有它能证明数据到了**我们**库里;批次 completed
-                     不等于落库,中间还隔着增量导出 + product_ingest 两跳)
-      批次已落定   → 该认账的失败(原因来自 /failures)
+                     不等于落库,中间还隔着一次导出)
+      批次已落定且事件流拉到底 → 该认账的失败(原因来自 /failures)
       兜底超时     → 批次查不到时防台账永远挂着
     """
     with conn.cursor() as cur:
@@ -768,25 +787,18 @@ def _wait_for_batches(names: list, timeout_min: int) -> tuple[str, int]:
     return f"等采集:{len(names)} 批全部落定(耗时 {mins:.1f} 分钟)", 0
 
 
-def _ingest_now() -> str:
-    """输入:无 → 输出:就地增量摄取的摘要(拿不到锁则说明原因)。
+def _ingest_batches(names: list[str]) -> str:
+    """输入:本轮推的批次名 → 输出:按批摄取摘要。
 
-    **借的是 product_ingest 的活,就得借它的锁**:增量游标
-    (`ops.cursors` name='product_ingest')是独占推进的,两个进程同时拉
-    `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉先写的,
-    中间那段记录**永远不会再被拉一次**(游标只前进不回头)——两侧都不报错,
-    只是产品中心少了一批数据。
-
-    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
-    只是本轮看不到,下轮再判。
+    2026-08-19 起走采集侧批次端点(`export_batch_records`,契约 §4.11):
+    只拉**自己这几批**的事件,批内游标每次从 0 拉到底,不碰全局游标、
+    **不需要 product_ingest 的锁**——此前是借锁抽全库到当刻头部,整点的
+    order_chain 和 13:00 的 product_chain 一撞就是一场 15 分钟等锁。
+    幂等靠 snapshots.source_id,与全局泵重复摄取无害。
+    没拉到底的批次摘要里点名,那部分下轮再判。
     """
-    with runlock.hold(ingest.CURSOR_NAME,
-                      holder="order_audit._ingest_now") as got:
-        if not got:
-            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
-                    "数据仍会由它摄入,下轮再判")
-        res = ingest.pump(scraper, db)
-    return "就地" + ingest.pump_summary(res)
+    _, note = ingest.pump_batches(scraper, db, names)
+    return note
 
 
 def _save(conn, results: list) -> int:
@@ -1128,19 +1140,18 @@ def run(params: dict) -> str:
         if do_scrape:
             scrape_note, sent = _push_scrape(conn, want, blocked)
 
-        # ③′ wait=1:等这批采完 → 就地摄取 → 重新对账重判(一条命令出结论)
+        # ③′ wait=1:等这批采完 → 就地按批摄取 → 重新对账重判(一条命令出结论)
         #
-        # 顺序不能换。批次 completed 只说明**采集侧**干完了,数据还在增量流里;
+        # 顺序不能换。批次 completed 只说明**采集侧**干完了,数据还在导出流里;
         # 不先摄取就去对账,每一条都会被判成"批次已采完但无快照",一轮全军覆没。
-        #     等批次落定 → 摄取(拿 product_ingest 的锁)→ 对账 → 重判
+        #     等批次落定 → 按批摄取(批次端点,无锁)→ 对账 → 重判
         wait_notes: list[str] = []
         if do_wait and sent:
             note, _stuck = _wait_for_batches(sent, _SCRAPE_TIMEOUT_MIN)
             wait_notes.append(note)
-            # 先记落定(写 finished_at),再摄取 —— 这样水位线必晚于落定时刻,
-            # 本轮就能认账。反过来的话这批要白等一轮才判得了失败。
+            # 先记落定(写 finished_at,认账的稳定窗口从这里起算),再摄取
             _settle_ledger(conn)
-            wait_notes.append(_ingest_now())
+            wait_notes.append(_ingest_batches(sent))
             settled2, gone2, _blocked2, notes2 = _settle_ledger(conn)
             settled += settled2
             gone += gone2

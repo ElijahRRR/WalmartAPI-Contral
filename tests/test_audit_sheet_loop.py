@@ -394,8 +394,9 @@ def _stub(monkeypatch, states, *, pushed=None, notes=None, calls=None,
         trace.append("prioritize"), True)[1])
     monkeypatch.setattr(pa.scrape_batches, "wait_settled", lambda names, m: (
         trace.append(f"wait{m}"), settle)[1])
-    monkeypatch.setattr(pa, "_ingest_now",
-                        lambda: (trace.append("ingest"), "就地摄取:入库 2 行")[1])
+    monkeypatch.setattr(pa, "_ingest_batches",
+                        lambda names: (trace.append("ingest"),
+                                       "按批摄取:入库 2 行")[1])
     monkeypatch.setattr(pa.scrape_batches, "pull_failures",
                         lambda n, b: ("失败明细", failures or {}))
     monkeypatch.setattr(pa.listing_sheet, "write_audit_notes",
@@ -483,29 +484,19 @@ def test_scraper_outage_still_records_the_reason(monkeypatch):
     assert dict(notes)[3]                    # 理由照写
 
 
-def test_ingest_borrows_product_ingest_lock(monkeypatch):
-    """⚠ 借 product_ingest 的活就得借它的锁:两个进程同推增量游标,
-    后写的盖掉先写的,中间那段记录永远不会再被拉一次 —— 两侧都不报错。"""
+def test_ingest_pulls_only_own_batches_without_lock(monkeypatch):
+    """就地摄取只拉本轮自己推的那几批(批次端点,批内游标),不碰全局游标
+    也不借 product_ingest 的锁 —— 2026-08-19 起的形态,锁冲突从根上消失。"""
     import inspect
-    src = inspect.getsource(pa._ingest_now)
-    assert "runlock.hold(product_ingest.CURSOR_NAME" in src   # 带 holder 也算
-    assert "if not got" in src               # 拿不到锁 = 跳过,不是失败
-    held = []
-    monkeypatch.setattr(pa.runlock, "hold",
-                        lambda n, **kw: (held.append(n), _NullCtx(False))[1])
-    assert "product_ingest 正在跑" in pa._ingest_now()
-    assert held == ["product_ingest"]
-
-
-class _NullCtx:
-    def __init__(self, got):
-        self._got = got
-
-    def __enter__(self):
-        return self._got
-
-    def __exit__(self, *a):
-        return False
+    src = inspect.getsource(pa._ingest_batches)
+    assert "pump_batches" in src
+    assert "runlock" not in src              # 无锁:批内游标互不相干
+    seen = []
+    monkeypatch.setattr(pa.product_ingest, "pump_batches",
+                        lambda sc, d, names, **kw: (seen.append(list(names)),
+                                                    ([], "按批摄取:0 批"))[1])
+    assert "按批摄取" in pa._ingest_batches(["audit_gap_x"])
+    assert seen == [["audit_gap_x"]]
 
 
 def test_dry_run_pushes_nothing_and_writes_nothing(monkeypatch):

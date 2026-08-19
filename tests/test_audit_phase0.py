@@ -266,3 +266,38 @@ def test_phase0_all_clear():
 ])
 def test_is_stopword_vectors(token, expect):
     assert is_stopword(token) is expect
+
+
+# ── 专利声明硬拦(规则 2.5,2026-08-19 所有者定稿新增)────────────────────────
+
+@pytest.mark.parametrize("title,blocked", [
+    ("Yociyoga 4-Tier Closet Organizer (Patent Protection)"
+     "(Patent No. 30022416)", True),                        # 实证原型
+    ("Patented Ergonomic Design Pillow", True),
+    ("Storage Rack, Patent Pending", True),
+    ("Covered by US Patents 9,876,543", True),
+    ("Women's Patent Leather Handbag", False),              # 漆皮=材质,豁免
+    ("Patent-Leather Loafers", False),                      # 连字符变体也豁免
+    ("Plain Storage Shelf Black", False),
+])
+def test_patent_claim_vectors(title, blocked):
+    r = audit_phase0.check(_p(title=title), _ctx())
+    assert r.blocked is blocked, title
+    if blocked:
+        h = r.hits[0]
+        assert h.rule_code == "phase0_patent_claim" and h.penalty == -100
+        assert h.detail["walmart_policy"] == "Intellectual Property"
+
+
+def test_patent_scans_bullets_and_desc_same_window_as_trademark():
+    """与商标规则同一扫描面:bullets 前 5 条、desc 前 1000 字符。"""
+    r = audit_phase0.check(
+        _p(title="Shelf", bullet_points=["sturdy", "patented latch design"]),
+        _ctx())
+    assert r.blocked and r.hits[0].rule_code == "phase0_patent_claim"
+    # 第 6 条 bullet 之外的 patent 不扫(窗口截断,与商标规则同款)
+    r2 = audit_phase0.check(
+        _p(title="Shelf", bullet_points=["a", "b", "c", "d", "e",
+                                         "patented design"]),
+        _ctx())
+    assert r2.blocked is False

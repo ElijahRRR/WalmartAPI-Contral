@@ -23,6 +23,7 @@ LLM 输出 unknown、字典外 PT 且候选全不可用、无候选——一律�
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections import Counter
 from functools import lru_cache
@@ -105,16 +106,29 @@ def _load_excluded_rules() -> tuple[dict[str, Any], ...]:
     return tuple(data.get("excluded_categories", []) or [])
 
 
+_CAT_SEG_RE = re.compile(r"->|>|/")
+
+
 def check_seed_excluded(product: ProductInfo, walmart_pt: str = "") -> str | None:
     """输入:产品(+可选已知 PT)→ 输出:seed yaml 命中的禁售 reason 或 None。
 
-    逐字迁自 l1_category.py:128-144:三个 haystack 全小写、子串匹配、
-    **首命中即返回**(yaml 条目顺序即优先级)、scope 缺省 'walmart_pt'。
-    `title_keyword` 这一 haystack 当前 yaml 无条目使用(死路径,但保留:yaml 可加)。
+    迁自 l1_category.py:128-144:全小写、**首命中即返回**(yaml 条目顺序即
+    优先级)、scope 缺省 'walmart_pt'。
+
+    ⚠ scope=amazon_category 是**段级等值**,不是子串(2026-08-19 所有者实证
+    修正):旧的子串匹配拿 "Clothing" 扫整条路径,把
+    `Home & Kitchen > Storage & Organization > Clothing & Closet Storage`
+    下的**衣柜收纳置物架**整族误伤成"服饰禁售"——命中的是路径里的一个词,
+    不是产品是什么。段级等值下 "Clothing" 只命中真叫 Clothing 的那一段
+    (如 `… > Men > Clothing > Shirts`),"Clothing & Closet Storage" 是
+    另一个段名,不再中枪。walmart_pt / title_keyword 维持子串(PT 词表
+    如 "Medical Device" 靠子串覆盖 "Medical Device Cleaners" 一族)。
     """
+    cat_segs = {seg.strip().lower()
+                for seg in _CAT_SEG_RE.split(product.amazon_category_path or "")
+                if seg.strip()}
     haystacks = {
         "walmart_pt": (walmart_pt or "").lower(),
-        "amazon_category": (product.amazon_category_path or "").lower(),
         "title_keyword": (product.title or "").lower(),
     }
     for rule in _load_excluded_rules():
@@ -122,6 +136,10 @@ def check_seed_excluded(product: ProductInfo, walmart_pt: str = "") -> str | Non
         scope = rule.get("scope") or "walmart_pt"
         reason = rule.get("reason") or f"seed-{scope}"
         if not m:
+            continue
+        if scope == "amazon_category":
+            if m in cat_segs:
+                return reason
             continue
         hay = haystacks.get(scope, "")
         if m in hay:

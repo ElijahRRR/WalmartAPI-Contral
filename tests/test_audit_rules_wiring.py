@@ -1221,3 +1221,54 @@ def test_audit_one_only_l0_hits_reject_and_misses_return_none():
     miss = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx,
                                  only_l0=True)
     assert miss is None          # 不是 pending、更不是 pass —— 什么都不写
+
+
+def test_adopt_history_says_the_old_reason_from_hits():
+    """采用历史结论时「理由未留存」要去 audit_hits 反查旧命中说出旧结论
+    (所有者定稿 2026-08-19:「history_shortcut 的也需要输出旧结论」)——
+    runs 行的 l3_reason_category 为空 ≠ 当年没理由,hits 里躺着真实命中。"""
+
+    class _Cur:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            if "audit_hits" in sql:
+                self._rows = [(11, "phase0_brand_blacklist",
+                               {"matched_brand": "IKEA"})]
+            else:   # _HISTORY_SQL:两行 reject——一行 hits 有货,一行孤儿
+                self._rows = [
+                    ("B0AAAAAAA1", 11, "reject", 0, None, None, "L0",
+                     None, None),
+                    ("B0AAAAAAA2", 12, "reject", 0, None, None, "L2",
+                     None, None),
+                ]
+
+        def executemany(self, sql, rows):
+            self.conn.adopted = list(rows)
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        adopted = []
+
+        def cursor(self):
+            return _Cur(self)
+
+    conn = _Conn()
+    import unittest.mock as m
+    with m.patch.object(product_audit.product_events, "record_many"):
+        n, adopted = product_audit._adopt_history(
+            conn, ["B0AAAAAAA1", "B0AAAAAAA2"], execute=True)
+    assert n == 2 and adopted == {"B0AAAAAAA1", "B0AAAAAAA2"}
+    by = {r["asin"]: r["reason"] for r in conn.adopted}
+    assert "品牌黑名单" in by["B0AAAAAAA1"]        # 旧命中翻成人话
+    assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]
+    assert "理由未留存" in by["B0AAAAAAA2"]        # 连 hits 都没有才落这句

@@ -422,3 +422,44 @@ def test_explain_hit_falls_back_to_the_rule_code_it_does_not_know():
     assert audit_reason.explain_hit("brand_new_rule", {}) == "brand_new_rule"
     assert audit_reason.explain_hit("brand_new_rule", {"note": "因为 X"}) \
         == "brand_new_rule(因为 X)"
+
+
+def _meta_for(pt):
+    return {pt: {"walmart_category": None, "access_state": "普通商品",
+                 "zh_can_do": "是", "requirements": "", "notes": "",
+                 "walmart_ptg": None}}
+
+
+def test_r2_pt_exact_machines_blocked_accessories_freed():
+    """pt_exact(2026-08-19 所有者「减少误伤」定稿):整机拦、配件放。
+
+    词边界 "Camera" 会把相机包/贴膜一起拦——词在 PT 里 ≠ 产品是那个东西。
+    换成整机精确清单后:Digital Cameras 照拦(matched_by=pt_exact),
+    Camera Bags & Cases / Cell Phone Cases / Skins for Cell Phones /
+    Laptop Sleeves(所有者点名要卖的不带电配件)放行。
+    """
+    hit = audit_l2.evaluate(_p(), _l1(pt="Digital Cameras", cat=None),
+                            _ctx(pt_meta=_meta_for("Digital Cameras")))
+    mega = [x for x in hit.hits if x.rule_code == "forbidden_mega_cat"]
+    assert mega and mega[0].detail["matched_by"] == "pt_exact"
+    for pt in ("Camera Bags & Cases", "Cell Phone Cases",
+               "Skins for Cell Phones", "Laptop Sleeves"):
+        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
+                                _ctx(pt_meta=_meta_for(pt)))
+        assert "forbidden_mega_cat" not in _codes(res), pt
+
+
+def test_r2_word_in_pt_is_not_the_product():
+    """同一定稿的另外三族:鱼缸温度计不是医疗器械、酒杯不是酒、
+    绞肉机不是肉——全部放行;真物件(体温计/整瓶酒/鲜肉)照拦。"""
+    for pt in ("Aquarium Thermometers", "Oven Thermometers", "Wine Glasses",
+               "Wine Racks", "Corkscrews & Wine Bottle Openers",
+               "Meat Grinders", "Coffee Makers", "Coffee Tables"):
+        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
+                                _ctx(pt_meta=_meta_for(pt)))
+        assert "forbidden_mega_cat" not in _codes(res), pt
+    for pt in ("Medical Thermometers", "Wine", "Fresh & Frozen Meats",
+               "Ground Coffee", "Sweatpants", "Swimsuit Sets", "Dollhouses"):
+        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
+                                _ctx(pt_meta=_meta_for(pt)))
+        assert "forbidden_mega_cat" in _codes(res), pt

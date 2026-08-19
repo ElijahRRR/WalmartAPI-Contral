@@ -290,6 +290,7 @@ _RULE_CN = {
     "phase0_forbidden_category":      "禁售大类",
     "phase0_brand_blacklist":         "品牌黑名单",
     "phase0_trademark_symbol":        "标题含 ®/™ 商标符号",
+    "phase0_patent_claim":            "文案自述专利保护",
     "phase0_lark_blacklist_asin":     "ASIN 在黑名单中心",
     "phase0_lark_blacklist_seller":   "卖家在黑名单中心",
     "phase0_lark_blacklist_amazon_cat": "亚马逊类目在黑名单中心",

@@ -2,9 +2,14 @@
 # L1 阶段只做 Amazon 路径/title 关键词硬拦 (excluded_categories)
 # L2 R2 阶段做 9 大禁售大类 (mega_forbidden_categories, 基于 walmart_product_type 匹配)
 #
-# 匹配规则:
-#   - excluded_categories: scope ∈ {amazon_category, walmart_pt, title_keyword} 子串 (大小写不敏感)
-#   - mega_forbidden_categories.pt_contains: walmart_product_type 子串 (大小写不敏感, 任一命中)
+# 匹配规则(2026-08-19 与实现对齐,此前这段注释写的"子串"是旧口径):
+#   - excluded_categories: scope=amazon_category 是**路径段等值**(2026-08-19 修:
+#     子串匹配曾把 "Clothing & Closet Storage" 下的衣柜收纳当服饰拦);
+#     scope=walmart_pt / title_keyword 仍是子串 (大小写不敏感)
+#   - mega_forbidden_categories.pt_contains: walmart_product_type **词边界 + 可选
+#     复数**(\bkws?\b,大小写不敏感;"Bra" 不会命中 "Brackets")
+#   - mega_forbidden_categories.pt_exact: walmart_product_type **精确等值**——
+#     给"整机拦、配件放"的类目用(词在 PT 里 ≠ 产品是那个东西)
 #   - mega_forbidden_categories.walmart_category_prefix: walmart_category_map.raw->>'walmart_category' 前缀
 
 version: 2
@@ -25,7 +30,10 @@ excluded_categories:
   - match: "Smartwatches"
     scope: walmart_pt
     reason: 3C 禁售
-  - match: "Cell Phone"
+  # "Cell Phones" 不是 "Cell Phone"(2026-08-19 所有者定稿:手机壳/数据线/
+  # 贴膜等不带电配件要卖):walmart_pt 是子串匹配,"Cell Phone" 会连
+  # "Cell Phone Cases" 一起拦;整机 PT 是 "Cell Phones",按整机词拦
+  - match: "Cell Phones"
     scope: walmart_pt
     reason: 3C 禁售
   - match: "Tablets"
@@ -89,7 +97,12 @@ mega_forbidden_categories:
       - "Surgical"
       - "Blood Pressure Monitor"
       - "Glucose Meter"
-      - "Thermometer"
+      # "Thermometer" 泛词已收窄(2026-08-19 所有者「减少误伤」定稿):词边界
+      # 命中 Aquarium/Oven/Pool/Weather/Automotive Thermometers 等 19 个 PT,
+      # 其中医疗只有 2 个——鱼缸温度计不是医疗器械。真医疗按具体词拦:
+      - "Medical Thermometer"
+      - "Basal Thermometer"
+      - "Ear Thermometer"
       - "Pulse Oximeter"
       - "Nebulizer"
       - "CPAP"
@@ -98,7 +111,6 @@ mega_forbidden_categories:
       - "OTC Drug"
       - "Pharmaceutical"
       # 新增 (来自 walmart_error_records F 类实证 PT):
-      - "Medical Thermometer"
       - "Heating Pad"
       - "Drug Test"
       - "Catheter"
@@ -129,6 +141,7 @@ mega_forbidden_categories:
       - "Protein Supplement"
       - "Mineral Supplement"
       - "Vitamin"
+      - "Multivitamin"
       - "Probiotic"
       - "Weight Loss"
       - "Melatonin"
@@ -171,9 +184,12 @@ mega_forbidden_categories:
   - key: alcohol_tobacco
     walmart_policy: "Alcohol"
     reason: "酒精/烟草/电子烟完全禁售 (Walmart 零容忍)"
+    pt_exact:          # 词边界 "Wine" 会把酒架/酒杯/开瓶器/酒柜全拦——
+      - "Wine"           # 酒具不是酒(2026-08-19 减少误伤定稿)
+      - "Cooking Wines"
     pt_contains:
       - "Alcohol"
-      - "Wine"
+      - "Alcoholic"      # 补漏:Coolers & Flavored Alcoholic Beverages
       - "Beer"
       - "Liquor"
       - "Distill"
@@ -244,6 +260,7 @@ mega_forbidden_categories:
       - "Toy Vehicle"
       - "Toy Figure"
       - "Doll"
+      - "Dollhouse"
       - "Stuffed Animal"
       - "Plush"
       - "Action Figure"
@@ -278,6 +295,7 @@ mega_forbidden_categories:
       - "Fragrance"
       - "Hair Dye"
       - "Hair Color"
+      - "Hair Coloring"
       # 新增 (walmart_error_records F-cosmetics 实证)
       - "Other Nail Care"
       - "Nail Base Coat"
@@ -332,11 +350,43 @@ mega_forbidden_categories:
   - key: electronics
     walmart_policy: "Electronics & RF"
     reason: "电子产品禁售: NRTL/FCC 认证要求, 搬运无法提供"
+    pt_exact:          # 整机拦、配件放(2026-08-19 所有者定稿:手机壳/数据线/
+                        # 贴膜/相机包等不带电配件要卖);词边界 "Camera" 会把
+                        # 相机包/背带/镜头盖/贴膜一起拦
+      - "Laptop Computers"
+      - "Laptop Docking Stations"
+      - "Laptop Cooling Pads"
+      - "Laptop Replacement Keyboards"
+      - "Laptop Replacement Screens"
+      - "Cell Phones"
+      - "Cell Phone Signal Boosters"
+      - "Cell Phone Parts"
+      - "360° Cameras"
+      - "Digital Cameras"
+      - "Film Cameras"
+      - "Instant Cameras"
+      - "Disposable Cameras"
+      - "Movie Cameras"
+      - "Video Cameras"
+      - "Underwater Cameras"
+      - "Surveillance Cameras"
+      - "Car Dash Cameras"
+      - "Vehicle Backup Cameras"
+      - "Automotive Backup Camera Systems"
+      - "Line-Scan Cameras"
+      - "Pipe Inspection Cameras"
+      - "Thermal Imaging Cameras"
+      - "Microscope Eyepiece Cameras"
+      - "Camera Flashes"
+      - "Toy Cameras"
+      - "Mini Projectors"
+      - "Multimedia Projectors"
+      - "Overhead Projectors"
+      - "Slide Projectors"
+      - "Video Projectors"
+      - "Projector Replacement Lamps"
     pt_contains:
-      - "Laptop"
       - "Desktop Computer"
-      - "Tablet Computer"
-      - "Cell Phone"
       - "Smartphone"
       - "Smartwatch"
       - "Headphone"
@@ -345,8 +395,6 @@ mega_forbidden_categories:
       - "Television"
       - "Computer Monitor"     # 收窄, 避免命中 Blood Pressure Monitor
       - "LCD Monitor"
-      - "Projector"
-      - "Camera"
       - "Camcorder"
       - "Drone"
       - "Game Console"
@@ -369,28 +417,63 @@ mega_forbidden_categories:
       - "Shirt"
       - "Pants"
       - "Jeans"
-      - "Dress"
       # "Skirt": 去掉, 会误中 "Christmas Tree Skirts" / "Deck Skirt" 装饰类
       - "Sweater"
       - "Jacket"
-      - "Coat"
       - "Suit"
       - "Swimwear"
       - "Underwear"
       - "Lingerie"
       - "Bra"
-      - "Sock"
       - "Hosiery"
       - "Footwear"
       - "Sneaker"
       - "Boot"
       - "Sandal"
       - "Slipper"
-      - "Hat"
       # "Cap": 去掉, 会误中 "Bottle Cap" / "Wheel Cap" / "Lens Cap"
       - "Scarf"
       - "Glove"
       - "Uniform"
+      # 复合词补漏(2026-08-19):词边界下这些从来没被拦到过
+      - "Sweatshirt"
+      - "Sweatpants"
+      - "Undershirt"
+      - "Underpants"
+      - "Bodysuit"
+      - "Swimsuit"
+      - "Jumpsuit"
+      - "Wetsuit"
+      - "Snowsuit"
+      - "Sweatsuit"
+      - "Nightgown"
+      - "Sleepshirt"
+    pt_exact:          # 词边界 "Coat/Hat/Sock/Dress" 会拦到衣帽钩/帽盒/
+                        # 风向袋/缝纫人台/美甲底油——词在 PT 里 ≠ 是那件衣服
+      - "Outerwear Coats"
+      - "Rain Coats"
+      - "Lab Coats"
+      - "Suit Jackets, Blazers & Sport Coats"
+      - "Hats"
+      - "Golf Hats"
+      - "Party Hats"
+      - "Tennis Hats"
+      - "Workwear Uniform Hats"
+      - "Hat, Scarf & Glove Sets"
+      - "Socks"
+      - "Sports Socks"
+      - "Athletic Compression Socks"
+      - "Moisturizing Socks"
+      - "Yoga Socks"
+      - "Compression Gloves, Sleeves & Socks"
+      - "Dresses"
+      - "Wedding Dresses"
+      - "Dog Dresses"
+      - "Traditional Jingle Dresses"
+      - "Workwear Uniform Dresses"
+      - "Fancy-Dress Costumes"
+      - "Casual & Dress Shoes"
+      - "Dress Shirts"
     walmart_category_prefix:
       - "Clothing"
       - "Apparel"
@@ -400,6 +483,23 @@ mega_forbidden_categories:
   - key: food
     walmart_policy: "Food Products"
     reason: "食品禁售: FDA 食品设施注册 + 标签合规"
+    pt_exact:          # 这三个词按词边界会拦到器具(2026-08-19 减少误伤定稿):
+      - "Wine"           # Wine Racks/Glasses/Corkscrews 是酒具
+      - "Cooking Wines"
+      - "Canned & Jarred Meats"          # Meat Grinders/Tenderizers 是厨具
+      - "Canned & Packaged Meat Substitutes"
+      - "Fresh & Frozen Meats"
+      - "Jerky & Dried Meats"
+      - "Lunch & Deli Meats"
+      - "Meat Dips & Spreads"
+      - "Meatballs"
+      - "Coffee"                          # Coffee Makers/Grinders/Tables 是器具/家具
+      - "Bottled Coffee Drinks"
+      - "Ground Coffee"
+      - "Instant Coffee"
+      - "Whole Bean Coffee"
+      - "Coffee Pods"
+      - "Coffee Substitutes"
     pt_contains:
       - "Food"
       - "Beverage"
@@ -409,18 +509,16 @@ mega_forbidden_categories:
       - "Condiment"
       - "Candy"
       - "Chocolate"
-      - "Coffee"
       - "Tea Bag"
       - "Juice"
       - "Soda"
-      - "Wine"
       - "Beer"
       - "Liquor"
       - "Sauce"
       - "Spice"
       - "Dairy"
-      - "Meat"
       - "Seafood"
+      - "Meatball"
       - "Frozen Food"
     walmart_category_prefix:
       - "Food"

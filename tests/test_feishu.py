@@ -369,3 +369,53 @@ def test_write_ranges_still_caps_100_ranges_per_request(monkeypatch):
     n = feishu.sheet_write_ranges(sheet, ups)
     assert n == 120
     assert [len(b["valueRanges"]) for b in sent] == [100, 20]
+
+
+# ── 分块读(sheet_values_rows):单响应 10MB 上限的解法 ─────────────────────────
+
+def _rows_sheet():
+    return Spreadsheet(name="X", token="TOK", sheet_id="SID", columns=("a",))
+
+
+def test_values_rows_blocks_and_keeps_rownums(monkeypatch):
+    """行方向分块拼接,行号按块首偏移——飞书裁掉块尾空行也不许错位。"""
+    asked = []
+
+    def fake_values(sheet, rng):
+        asked.append(rng)
+        # A2:C6 返回 5 行;A7:C11 只回 3 行(尾部两行为空被飞书裁掉)
+        if rng == "A2:C6":
+            return [[f"r{i}"] for i in range(2, 7)]
+        return [[f"r{i}"] for i in range(7, 10)]
+    monkeypatch.setattr(feishu, "sheet_values", fake_values)
+    out = feishu.sheet_values_rows(_rows_sheet(), "A", "C", 2, 11,
+                                   block_rows=5)
+    assert asked == ["A2:C6", "A7:C11"]
+    assert [(n, r[0]) for n, r in out] == [(i, f"r{i}") for i in range(2, 10)]
+
+
+def test_values_rows_halves_on_90221(monkeypatch):
+    """单块仍超 10MB(90221)→ 对半再切,数据一行不丢;其他错误照抛。
+
+    2026-08-19 生产实证:上架表 21 列全量一把读撞 90221,audit_sheet 整链
+    失败——分块 + 对半兜底后同一张表怎么长都读得完。
+    """
+    asked = []
+
+    def fake_values(sheet, rng):
+        asked.append(rng)
+        if rng == "A2:U9":                    # 整块太大
+            raise feishu.FeishuError(90221, "data exceeded 10485760 bytes")
+        lo, hi = rng[1:].split(":U")
+        return [[f"r{i}"] for i in range(int(lo), int(hi) + 1)]
+    monkeypatch.setattr(feishu, "sheet_values", fake_values)
+    out = feishu.sheet_values_rows(_rows_sheet(), "A", "U", 2, 9,
+                                   block_rows=8)
+    assert asked == ["A2:U9", "A2:U5", "A6:U9"]      # 对半各读一次
+    assert [n for n, _ in out] == list(range(2, 10))  # 一行不丢
+
+    def always_401(sheet, rng):
+        raise feishu.FeishuError(401, "auth")
+    monkeypatch.setattr(feishu, "sheet_values", always_401)
+    with pytest.raises(feishu.FeishuError):           # 只兜 90221,不当 catch-all
+        feishu.sheet_values_rows(_rows_sheet(), "A", "U", 2, 9)

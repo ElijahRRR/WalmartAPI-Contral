@@ -513,6 +513,8 @@ def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
     """输入:登记条目 + A1 范围(如 'A2:G500',不带 sheet 前缀)→ 输出:值矩阵。
 
     单元格统一 ToString 渲染(公式取结果,数字转文本),调用方拿到的都是 str/None。
+    ⚠ 单次读取响应体官方上限 10MB(超出返 90221 data exceeded),行列数本身
+    不设限——大范围读取用下面的 sheet_values_rows(行方向分块)。
     """
     s = sheet.require()
     data = _call("GET",
@@ -520,6 +522,47 @@ def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
                  f"{s.sheet_id}!{a1_range}",
                  params={"valueRenderOption": "ToString"})
     return ((data.get("valueRange") or {}).get("values")) or []
+
+
+_SHEET_READ_BLOCK_ROWS = 5000   # 行方向分块粒度(与 maint_sheet 扫描块同量级)
+
+
+def sheet_values_rows(sheet: Spreadsheet, first_col: str, last_col: str,
+                      row_from: int, row_to: int, *,
+                      block_rows: int = _SHEET_READ_BLOCK_ROWS
+                      ) -> list[tuple[int, list]]:
+    """输入:列区间 + 行区间 → 输出:[(行号, 该行值列表)](行方向分块拼接)。
+
+    2026-08-19 生产实证:上架表 21 列全量一把读,表长大后撞官方单响应
+    10MB 上限(90221 data exceeded)。读取本身没有行列数限制,所以按行
+    分块;单块仍超(块内长文本堆积)则**对半再切**,每次触发都记日志
+    (兜底静默常态化 = 主路径已坏没人知道)。
+
+    行号按块首偏移计算:飞书只裁掉**范围尾部**的空行(中段空行仍占位),
+    块内 enumerate + 块首行号恒对得上,调用方拿到的 rownum 可直接回写。
+    """
+    out: list[tuple[int, list]] = []
+
+    def _read(rf: int, rt: int) -> None:
+        try:
+            vals = sheet_values(sheet, f"{first_col}{rf}:{last_col}{rt}")
+        except FeishuError as e:
+            if e.code == 90221 and rt > rf:
+                mid = (rf + rt) // 2
+                logger.warning("读取 %s%d:%s%d 超 10MB(90221),对半重读",
+                               first_col, rf, last_col, rt)
+                _read(rf, mid)
+                _read(mid + 1, rt)
+                return
+            raise
+        for i, row in enumerate(vals):
+            out.append((rf + i, row))
+
+    start = row_from
+    while start <= row_to:
+        _read(start, min(start + block_rows - 1, row_to))
+        start += block_rows
+    return out
 
 
 _CTRL_CHARS = {c: None for c in range(32) if c not in (9, 10, 13)}

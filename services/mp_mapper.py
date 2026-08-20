@@ -543,6 +543,9 @@ def shipping_weight(product: dict | None) -> float:
 
 # Orderable 段的**系统专属字段**(旧 mapper 的 10 项 force_overrides +
 # ShippingWeight/specProductType):LLM 不该填、填了也一律被系统值覆盖。
+# `specProductType` 官方 20260608 已移除,我们也不再写 —— 但**保留在这张表里**:
+# 它得继续挡住 LLM 往 Orderable 里塞这个字段(spec 外字段会让整条被拒,
+# EXT_DATA_ERROR_60670554076755),也继续不进 LLM 提示词。
 # 这些字段也不进 LLM 提示词(旧 _orderable_fields_for_llm 同款剔除)。
 ORDERABLE_SYSTEM_FIELDS = (
     "sku", "productIdentifiers", "price", "inventory", "startDate", "endDate",
@@ -567,7 +570,10 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
       · **country_of_origin_substantial_transformation 必填**
         (EXT_DATA_ERROR_72600149546850,此前整个字段没给)
-      · specProductType / startDate 旧系统都写,此前漏
+      · startDate 旧系统都写,此前漏
+      · **specProductType 不再写**(2026-08-20 换 spec 到 20260608:官方把这个
+        可选字段移除了)。留着也会被 mp_conform.strip_unknown 按新 spec 剔掉,
+        但"写了再剔"白费一道工序,而且读代码的人会以为它还有用
       · endDate 必须 ISO DateTime(纯 yyyy-mm-dd 会被拒
         EXT_DATA_ERROR_00030257670757)
       · ShippingWeight 是 Orderable 必填:旧系统由 LLM 补,新系统从采集重量取
@@ -591,8 +597,6 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
                        "quantity": int(qty)}],
     })
-    if pt:
-        o["specProductType"] = str(pt)
     return o
 
 

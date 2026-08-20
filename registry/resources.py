@@ -108,9 +108,18 @@ FEED_SPEC_VERSIONS = {
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
-    # 上架主链(L2;旧系统实测值,官方 4-6 周滚版,上线前需实测仍被接受;
-    # header version 必须完整时间戳,写 '5.0' 被拒 74597363510508 实证)
-    "MP_ITEM": "5.0.20260304-22_45_32-api",
+    # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
+    #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
+    # 改一处两边一起变 —— 两边错开就是拿一个版本的数据去过另一个版本的校验。
+    # header version 必须完整时间戳,写 '5.0' 被拒(74597363510508 旧实证)。
+    #
+    # 2026-08-20 从 5.0.20260304-22_45_32-api 切到 20260608(旧版停了五个月;
+    # MP_MAINTENANCE 早已在 20260608)。切换前用 `spec_split -p diff=1` 量过差集:
+    #   PT 6951 → 6951(零增零减);Orderable 24 → 23(只移除 specProductType);
+    #   顶层必填有变化的 PT 仅 48 个;**新增必填只有 center_bore、影响 1 个 PT**
+    #   (轮毂中心孔径,汽车整顶级不做,实际影响为零);其余 5 个字段全是
+    #   "不再必填"(partTerminologyID 24 / condition 20 / …),只放松不收紧。
+    "MP_ITEM": "5.0.20260608-18_15_07-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)

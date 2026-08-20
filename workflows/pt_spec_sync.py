@@ -4,6 +4,7 @@
   python cli.py pt_spec_sync --dry-run           # 只读 spec + 判定,打印对账,不写库
   python cli.py pt_spec_sync                     # 落 audit.walmart_pt_spec + 导出飞书粘贴表
   python cli.py pt_spec_sync -p limit=200        # 先判 200 个看看
+  python cli.py pt_spec_sync -p pt="Baby Formula,Pet Bowls" --dry-run   # 单点看证据链
 
 数据源:`services.pt_spec` —— `<DATA_ROOT>/specs/MP_ITEM/<版本>/` 那份按 PT 拆分的
 官方 spec,**上架链(listing L2c)用的就是它**。不调 `POST /v3/items/spec`:
@@ -33,6 +34,7 @@
 只读本地文件 + 只写 audit.walmart_pt_spec,不碰任何店铺状态、不发任何请求。
 """
 
+import collections
 import csv
 import json
 import logging
@@ -58,8 +60,24 @@ ON CONFLICT (walmart_product_type) DO UPDATE SET
     synced_at        = now()
 """
 
-_META_SQL = ("SELECT walmart_product_type, walmart_category, walmart_ptg, notes "
-             "FROM audit.walmart_pt_meta")
+_META_SQL = ("SELECT walmart_product_type, walmart_category, walmart_ptg, notes, "
+             "zh_can_do FROM audit.walmart_pt_meta")
+
+
+def _old_bucket(zh_can_do: str) -> str:
+    """输入:现表「中国卖家可做」自由文本 → 输出:三档之一(便于与新判定比)。
+
+    实测 35 种取值,但全都以 是 / 需评估 / 否 开头(「否(上架记录回测,
+    BIZ-CN触发5次)」这类只是把证据写进了值里)。
+    """
+    z = (zh_can_do or "").strip()
+    if z.startswith("是"):
+        return pt_admission.OK
+    if z.startswith("需评估"):
+        return pt_admission.EVAL
+    if z.startswith("否"):
+        return pt_admission.BLOCK
+    return ""
 
 
 def _age_values(spec: dict) -> list:
@@ -118,8 +136,8 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_META_SQL)
-            meta = {r[0]: {"cat": r[1] or "", "ptg": r[2] or "", "notes": r[3] or ""}
-                    for r in cur.fetchall()}
+            meta = {r[0]: {"cat": r[1] or "", "ptg": r[2] or "", "notes": r[3] or "",
+                           "zh": r[4] or ""} for r in cur.fetchall()}
         only_spec = [p for p in pt_spec.known_pts() if p not in meta]
         only_meta = sorted(set(meta) - pt_spec.known_pts())
         lines.append(f"对账准入明细(walmart_pt_meta {len(meta)} 个):"
@@ -130,7 +148,9 @@ def run(params: dict) -> str:
                 lines.append(f"  {tag}:" + "、".join(xs))
 
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
-        rows, changed, no_spec = [], 0, 0
+        rows, review, changed, no_spec = [], [], 0, 0
+        diff: collections.Counter = collections.Counter()
+        want = {x.strip() for x in str(params.get("pt", "")).split(",") if x.strip()}
         for pt in pts:
             spec = pt_spec.load_pt(pt)
             if spec is None:
@@ -140,10 +160,25 @@ def run(params: dict) -> str:
             adm = pt_admission.judge(pt, req, age_values=_age_values(spec))
             stat[adm.verdict] += 1
             m = meta.get(pt, {})
+            old = _old_bucket(m.get("zh", ""))
+            order = {pt_admission.OK: 0, pt_admission.EVAL: 1, pt_admission.BLOCK: 2}
+            move = ("新增(现表无此 PT)" if not old else
+                    "不变" if old == adm.verdict else
+                    "收紧" if order[adm.verdict] > order[old] else "放松")
+            diff[f"{old or '(无)'} → {adm.verdict}"] += 1
             rows.append([m.get("cat", ""), m.get("ptg", ""), pt, "",
                          adm.verdict, " | ".join(adm.certs), m.get("notes", ""),
                          len(common_all | pt_admission.all_fields(spec)), len(req),
                          " | ".join(sorted(req))])
+            review.append([pt, m.get("cat", ""), m.get("ptg", ""),
+                           m.get("zh", ""), adm.verdict, move,
+                           " | ".join(adm.certs),
+                           " ;; ".join(adm.reasons), ""])
+            if pt in want:
+                lines.append(f"── {pt}:{adm.verdict}(现表「{m.get('zh','(无)')}」→ {move})")
+                for r_ in adm.reasons:
+                    lines.append(f"     {r_}")
+                lines.append(f"     必填字段({len(req)}):{'、'.join(sorted(req))[:300]}")
             if not dry_run:
                 real = adm.certs if adm.verdict == pt_admission.BLOCK else []
                 with conn.cursor() as cur:
@@ -159,6 +194,11 @@ def run(params: dict) -> str:
         if not dry_run:
             conn.commit()
 
+    if diff:
+        lines.append("与现表「中国卖家可做」逐条比对(现值 → 新判定):")
+        for k, v in diff.most_common():
+            tag = "" if k.split(" → ")[0] == k.split(" → ")[1] else "  ←要看的"
+            lines.append(f"  {v:>6}  {k}{tag}")
     lines.append(f"判定 {len(rows)} 个 PT:是 {stat[pt_admission.OK]} / "
                  f"需评估 {stat[pt_admission.EVAL]} / 否 {stat[pt_admission.BLOCK]}"
                  + (f";{no_spec} 个索引里有但读不到 spec(跳过)" if no_spec else ""))
@@ -171,7 +211,15 @@ def run(params: dict) -> str:
                         "准入状态", "中国卖家可做", "必需认证", "特殊备注",
                         "字段总数", "必填字段数", "必填字段清单"])
             w.writerows(rows)
-        lines.append(f"飞书粘贴表(列名同现表):{out}")
+        lines.append(f"飞书粘贴表(列名同现表,10 列整齐):{out}")
+        rv = paths.reports_dir() / "pt_admission_review.csv"
+        with open(rv, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Walmart Product Type", "Walmart Category", "Walmart PTG",
+                        "现中国卖家可做", "新判定", "变化", "必需认证",
+                        "判据(逐条溯源)", "人工"])
+            w.writerows(review)
+        lines.append(f"差异复核表(带判据溯源,不用于粘贴):{rv}")
         lines.append("  ⚠「准入状态」列留空 —— 那是沃尔玛侧的准入事实"
                      "(普通商品/附条件允许/需Walmart审批/禁售),spec 里没有,"
                      "沿用现表旧值或人工填,别让它被空值覆盖")

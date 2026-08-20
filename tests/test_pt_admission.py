@@ -113,3 +113,17 @@ def test_age_values_missing_is_empty_not_crash():
 def test_all_fields_collects_property_names():
     spec = {"properties": {"a": {"properties": {"b": {}, "c": {}}}, "d": {}}}
     assert pa.all_fields(spec) == {"a", "b", "c", "d"}
+
+
+# ── 与现表比对:自由文本取值要能归到三档 ──────────────────────────────────
+
+def test_old_bucket_reads_the_35_freetext_variants():
+    """现表「中国卖家可做」实测 35 种取值,但都以 是/需评估/否 开头
+    ——「否(上架记录回测,BIZ-CN触发5次)」这类只是把证据写进了值里。
+    归不到档的返回空串(当作"现表没有结论"),不许猜成"是"。"""
+    from workflows.pt_spec_sync import _old_bucket
+    assert _old_bucket("是") == pa.OK
+    assert _old_bucket("需评估 (要合规投入)") == pa.EVAL
+    assert _old_bucket("否 (中国卖家进不去)") == pa.BLOCK
+    assert _old_bucket("否（上架记录回测，BIZ-CN触发5次）") == pa.BLOCK
+    assert _old_bucket("") == "" and _old_bucket("待定") == ""

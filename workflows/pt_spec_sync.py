@@ -80,6 +80,24 @@ def _old_bucket(zh_can_do: str) -> str:
     return ""
 
 
+# 现表「否」里带**spec 看不见的证据**的措辞:政策禁售、上架回测实证。
+# 这两类不许被 spec 判定翻案 —— spec 只说明"要什么材料",它既不知道沃尔玛
+# 政策禁不禁,更不知道这个 PT 真上架时被拒过多少次。
+_LOCK_MARKS = ("Walmart 禁售", "Walmart禁售", "上架记录回测", "BIZ-CN")
+
+
+def _locked(zh_can_do: str) -> str:
+    """输入:现表「中国卖家可做」→ 输出:锁定理由(空 = 不锁)。"""
+    z = (zh_can_do or "").strip()
+    if not z.startswith("否"):
+        return ""
+    for mark in _LOCK_MARKS:
+        if mark in z:
+            return ("实证:上架回测被拒" if mark in ("上架记录回测", "BIZ-CN")
+                    else "沃尔玛政策禁售")
+    return ""
+
+
 def _age_values(spec: dict) -> list:
     """输入:PT spec → 输出:ageGroup 的枚举取值(判儿童产品用)。
 
@@ -148,8 +166,9 @@ def run(params: dict) -> str:
                 lines.append(f"  {tag}:" + "、".join(xs))
 
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
-        rows, review, changed, no_spec = [], [], 0, 0
+        rows, review, changed, no_spec, locked_kept = [], [], 0, 0, 0
         diff: collections.Counter = collections.Counter()
+        unlock_detail: collections.Counter = collections.Counter()
         want = {x.strip() for x in str(params.get("pt", "")).split(",") if x.strip()}
         for pt in pts:
             spec = pt_spec.load_pt(pt)
@@ -158,14 +177,26 @@ def run(params: dict) -> str:
                 continue
             req = common_req | pt_admission.extract_required(spec)
             adm = pt_admission.judge(pt, req, age_values=_age_values(spec))
-            stat[adm.verdict] += 1
             m = meta.get(pt, {})
             old = _old_bucket(m.get("zh", ""))
             order = {pt_admission.OK: 0, pt_admission.EVAL: 1, pt_admission.BLOCK: 2}
+            lock = _locked(m.get("zh", ""))
+            spec_says = adm.verdict
+            if lock and order[spec_says] < order[pt_admission.BLOCK]:
+                # spec 只许收紧,不许翻案:它看不见政策,也不知道真上架被拒过
+                adm = pt_admission.Admission(
+                    product_type=pt, certs=adm.certs, verdict=pt_admission.BLOCK,
+                    reasons=[f"**锁定**({lock}):现表判否且依据在 spec 之外,"
+                             f"spec 只看到「{spec_says}」,不足以翻案"] + adm.reasons,
+                    policy=adm.policy, fields_seen=adm.fields_seen)
+                locked_kept += 1
             move = ("新增(现表无此 PT)" if not old else
                     "不变" if old == adm.verdict else
                     "收紧" if order[adm.verdict] > order[old] else "放松")
             diff[f"{old or '(无)'} → {adm.verdict}"] += 1
+            if old == pt_admission.BLOCK and adm.verdict != pt_admission.BLOCK:
+                unlock_detail[(m.get("zh", "") or "(空)")[:28]] += 1
+            stat[adm.verdict] += 1
             rows.append([m.get("cat", ""), m.get("ptg", ""), pt, "",
                          adm.verdict, " | ".join(adm.certs), m.get("notes", ""),
                          len(common_all | pt_admission.all_fields(spec)), len(req),
@@ -194,6 +225,13 @@ def run(params: dict) -> str:
         if not dry_run:
             conn.commit()
 
+    if locked_kept:
+        lines.append(f"**锁定保留**{locked_kept} 条:现表判「否」且依据是政策禁售或"
+                     f"上架回测实证 —— spec 看不见这两类证据,只许收紧不许翻案")
+    if unlock_detail:
+        lines.append("现表判否、新判定放松的,按现表原措辞拆开(这批要逐条看):")
+        for k, v in unlock_detail.most_common():
+            lines.append(f"  {v:>6}  {k}")
     if diff:
         lines.append("与现表「中国卖家可做」逐条比对(现值 → 新判定):")
         for k, v in diff.most_common():

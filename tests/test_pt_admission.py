@@ -1,0 +1,104 @@
+"""PT 准入判定:由官方 spec 必填字段推认证与三档结论。
+
+这套用例钉死的是**为什么要重建那张表**(所有者 2026-08-20 核查):飞书那份
+「必需认证」45% 空、46% 的 PTG 组内一字不差(按组批量套的),于是婴儿配方奶
+标成了 CPSIA、宠物碗标成了 AAFCO。新口径只认官方 spec 的字段。
+"""
+
+from services import pt_admission as pa
+from workflows.pt_spec_sync import _taxonomy_rows
+
+
+# ── 必填字段要**递归**收全 ────────────────────────────────────────────────
+
+def test_required_is_collected_from_every_level():
+    """只取顶层 required 会把 PT 专属的合规字段整批漏掉 —— 而配料表/小零件/电池
+    恰恰都挂在深层,漏了就等于判定件什么都看不见,而且不报错。"""
+    spec = {"properties": {"MPItem": {"items": {
+        "required": ["productName", "brand"],
+        "properties": {"Orderable": {"required": ["ingredients"]},
+                       "Visible": {"properties": {"Baby Food": {
+                           "required": ["smallPartsWarnings", "ageGroup"]}}}}}}}}
+    got = pa.extract_required(spec)
+    assert got == {"productName", "brand", "ingredients",
+                   "smallPartsWarnings", "ageGroup"}
+
+
+def test_extract_required_survives_lists_and_junk():
+    assert pa.extract_required({"a": [{"required": ["x"]}, 3, None],
+                                "required": "不是数组"}) == {"x"}
+
+
+# ── 三档口径:主体资质 → 否 / 买得到报告 → 需评估 / 纯标签 → 是 ────────────
+
+def test_food_fields_mean_fda_facility_registration():
+    """要填配料表 = 食品 = 要 FDA 食品设施注册 + 美国代理人,中国搬运拿不到 → 否。
+
+    这条正是当年填错的那个:`Baby Foods & Formula` 整组被套上 CPSIA
+    (儿童产品符合证书),而婴儿配方奶真正要的是 FDA 注册。
+    """
+    a = pa.judge("Baby Formula", {"ingredients", "nutritionFactsLabel"})
+    assert a.verdict == pa.BLOCK
+    assert any("FDA" in c for c in a.certs)
+    assert a.reasons and "ingredients" in a.reasons[0]
+
+
+def test_nrtl_is_eval_not_block():
+    """NRTL(UL/ETL/CSA)花钱能做,是"要合规投入",不是"进不去"。"""
+    assert pa.judge("Power Strips", {"has_nrtl_listing_certification"}).verdict == pa.EVAL
+
+
+def test_label_only_fields_stay_ok():
+    """纯标签/声明类不该拖低档位 —— 否则全表都是"否",白名单就没意义了。"""
+    a = pa.judge("Candle Holders",
+                 {"isProp65WarningRequired", "labelImage", "has_written_warranty"})
+    assert a.verdict == pa.OK
+
+
+def test_prop65_alone_never_blocks_anything():
+    """`isProp65WarningRequired` **6942 个 PT 全都有**,零区分度。
+    哪天有人把它当硬门槛,整张白名单会一次性全变成"否"。"""
+    assert pa.judge("X", {"isProp65WarningRequired"}).verdict == pa.OK
+
+
+def test_worst_tier_wins():
+    a = pa.judge("Pet Food Bowl Set",
+                 {"labelImage", "has_nrtl_listing_certification", "petFoodForm"})
+    assert a.verdict == pa.BLOCK          # 三档取最严
+
+
+def test_age_group_alone_is_not_a_child_product():
+    """`ageGroup` 本身只是人群标签(成人用品也填),取值落在儿童段才算 CPSIA ——
+    只看字段名会把成人服饰、老人助行器全判成儿童产品。"""
+    assert pa.judge("Adult Slippers", {"ageGroup"}, age_values=["adult"]).verdict == pa.OK
+    assert pa.judge("Toy Blocks", {"ageGroup"}, age_values=["toddler"]).verdict == pa.EVAL
+
+
+def test_policy_prohibited_beats_fields():
+    """政策说完全禁售就是禁售,不看字段 —— 字段只说明"要什么材料",
+    政策说的是"沃尔玛压根不让卖"。"""
+    a = pa.judge("Distillation Apparatus", set(), policy="Alcohol",
+                 policy_status="完全禁售(含酒精食品/蒸馏设备)")
+    assert a.verdict == pa.BLOCK and "Alcohol" in a.reasons[0]
+
+
+def test_no_fields_no_certs_is_ok():
+    a = pa.judge("Bookends", set())
+    assert a.verdict == pa.OK and a.certs == [] and a.fields_seen == 0
+
+
+# ── taxonomy 摊平:按值取,不按固定键路径取 ────────────────────────────────
+
+def test_taxonomy_flatten_is_shape_tolerant():
+    """官方结构层级名历年会变,按固定键路径取一改就全空 —— 而"全空"在这里
+    等于"官方一个 PT 都没有",工作流会拿它当真。"""
+    payload = [{"category": "Animals", "productTypeGroups": [
+        {"name": "Animal Grooming", "productTypes": ["Animal Conditioners", "Brushes"]}]}]
+    rows = _taxonomy_rows(payload)
+    assert {r["pt"] for r in rows} == {"Animal Conditioners", "Brushes"}
+    assert rows[0]["category"] == "Animals" and rows[0]["ptg"] == "Animal Grooming"
+
+
+def test_taxonomy_flatten_returns_empty_on_unknown_shape():
+    """摊不出来要返回空让工作流报错,不许瞎猜出几个 PT 来。"""
+    assert _taxonomy_rows({"unexpected": {"deep": 1}}) == []

@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **69 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **70 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
@@ -277,6 +277,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |
 | `audit_history_fold` | 一 | 历史审核结论折叠进产品事件账本 |
+| `pt_spec_sync` | | 从沃尔玛官方拉 **PT 全集(taxonomy)+ 上架 spec**,重建类目准入明细:由 spec 必填字段推「要什么认证」,再推「中国搬运能不能做」(是/需评估/否),落 `audit.walmart_pt_spec` 并导出飞书粘贴表。`POST /v3/items/spec` 3/min×20PT,全量约 2 小时,**边拉边落库**可续跑 |
 | `audit_reason_backfill` | 一 | 存量「理由未留存」批量刷成旧 run 真实命中,顺带产出规则码分布(挑误伤类型的输入) |
 
 **重审政策**(唯一出处 `product_audit._DEFAULT_CANDIDATE`):没结论的审;

@@ -217,29 +217,29 @@ def test_evidence_kind_separates_empirical_from_inferred():
 
 # ── 「必填」以生产上架链的定义为准,不许对齐旧表的错数字 ────────────────────
 
-def test_required_definition_matches_the_listing_chain():
-    """一个 MP_ITEM 能不能提交,`mp_conform.validate` 只看两处**顶层** required:
-    PT spec 的 与 Orderable spec 的。条件必填由 fill_known_required 按实际取值
-    动态补,不属于静态必填集。
+def test_required_is_pt_top_level_only_matching_the_sheet():
+    """「必填字段清单」= **PT spec 顶层 required**,与飞书现表逐字段核过。
 
-    2026-08-20 纠错:此前为对上现表的 46,用的是"递归 ∪ Orderable 递归"。
-    数字对上了,但**现表那 46 本身就是错的** —— 混着 `certification_type`
-    (实测只在 properties)、`country_of_origin_substantial_transformation`
-    (实测该 PT 压根不存在)、以及儿童产品证书那组条件样板。
-    所有者原话:「必填字段不对,推断就是错的」。对齐一个错数字,只会让错误
-    看起来像验证过。
+    2026-08-20 实测对账(现表 6942 行 vs 本地 spec 6951 个 PT):
+      ingredients 133/133、foodForm 163/163、food_condition 297/297、
+      ageGroup 919/919、labelImage 628/628、activeIngredients 19/19、
+      batterySize 13/13、minimumRecommendedAge 60/60 …逐个对上;
+    而条件必填那批(prop65WarningText 6951、children_product_* 6941、
+    nrtl_information 958)**现表一条都没收** —— 现表当年就是按顶层 required
+    生成的,判断是对的。
+    `3-in-1 Shampoo` 现表 14 项 / 字段总数 62,与本口径一字不差。
+
+    两条不许再犯的:
+      · 不并 Orderable(sku/price/quantity 是任何商品都要的信封字段,零信息量);
+      · 更不能递归(会混进 properties-only 与条件样板,清单一多,人照着去准备
+        材料就白办证 —— 做洗发水的按那种清单要去办儿童产品符合证书)。
     """
     import inspect
-    from services import mp_conform
     from workflows import pt_spec_sync
-    # 上架链的必填读法:顶层 required,两段各查一次
-    src = inspect.getsource(mp_conform.validate)
-    assert '_check(visible, spec' in src and '_check(orderable, ospec' in src
-    assert 'set((spec or {}).get("required")' in inspect.getsource(mp_conform._required)
-    # 本工作流必须同源:导出列不许再出现"递归收全"
     wf = inspect.getsource(pt_spec_sync.run)
-    assert "req = common_req | top_req" in wf
-    assert "extract_required(spec)" not in wf
+    assert "req = top_req" in wf                      # 就是 PT 顶层
+    assert "extract_required(spec)" not in wf         # 不许递归
+    assert "common_req" not in wf                     # 不许并 Orderable
 
 
 def test_conditional_required_is_not_static_required():

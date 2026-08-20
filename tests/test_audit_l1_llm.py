@@ -416,8 +416,26 @@ def test_seed_walmart_pt_scope_never_sees_llm_output():
 
 
 def test_seed_first_hit_wins_and_scope_default():
-    p = _product(amazon_category_path="Clothing, Shoes & Jewelry > Men")
+    p = _product(
+        amazon_category_path="Clothing, Shoes & Jewelry > Men > Clothing > Shirts")
     assert l1.check_seed_excluded(p) == "服饰禁售"     # Clothing 在 Shoes 之前
+
+
+def test_seed_amazon_category_matches_segments_not_substrings():
+    """⚠ scope=amazon_category 是**段级等值**(2026-08-19 所有者实证修正):
+    Yociyoga 衣柜收纳架路径 `Home & Kitchen > Storage & Organization >
+    Clothing & Closet Storage > …` 被旧的子串匹配按 "Clothing" 误伤成
+    服饰禁售——命中的是路径里的一个词,不是产品是什么。"""
+    closet = _product(amazon_category_path=(
+        "Home & Kitchen > Storage & Organization > Clothing & Closet Storage"
+        " > Closet Systems"))
+    assert l1.check_seed_excluded(closet) is None      # 收纳架不是衣服
+    rack = _product(amazon_category_path=(
+        "Home & Kitchen > Storage & Organization > Shoe Organizers"))
+    assert l1.check_seed_excluded(rack) is None        # 鞋架不是鞋
+    apparel = _product(amazon_category_path=(
+        "Clothing, Shoes & Jewelry > Women > Shoes > Sandals"))
+    assert l1.check_seed_excluded(apparel) == "服饰禁售(鞋)"   # 真鞋照拦
 
 
 @pytest.mark.parametrize("pt", sorted(l1.PUBLICATION_HARD_FORBID))

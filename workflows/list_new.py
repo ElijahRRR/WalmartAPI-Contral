@@ -158,9 +158,17 @@ def _load_gate_state():
         banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
         # 占用台账(A1):台账为空时两个 dict 都是空的,闸门恒放行——
-        # 回填前后行为一致,不会因为"还没回填"而误拦
-        owned_asin = claims.load_active(conn, claims.PRODUCT)
-        owned_brand = claims.load_active(conn, claims.BRAND)
+        # 回填前后行为一致,不会因为"还没回填"而误拦。
+        # 规划外店(谭总系)**双向豁免**(所有者定稿 2026-08-15,2026-08-19
+        # 生产实证补全:此前只豁免了快照闸一个方向,占用/品牌闸仍在拦):
+        # 持有人是规划外店的占用行剔除(它们不拦别人);行侧闸门另按
+        # 上架店豁免(它们上架也不被别人拦、不做品牌归属)
+        owned_asin = {a: s for a, s in
+                      claims.load_active(conn, claims.PRODUCT).items()
+                      if not alloc_survey.is_excluded(s)}
+        owned_brand = {b: s for b, s in
+                       claims.load_active(conn, claims.BRAND).items()
+                       if not alloc_survey.is_excluded(s)}
     return (inactive, today_used, listed, banned, unexplained, gate,
             owned_asin, owned_brand)
 
@@ -1078,6 +1086,10 @@ def run(params: dict) -> str:
             continue
         allow_by_store[store_name] = max(0, quota.get(store_name, 999)
                                          - today_used.get(store_name, 0))
+        # 规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
+        # (所有者定稿 2026-08-15「既不占用、也不拦别人」,2026-08-19 生产
+        # 实证补全行侧方向:此前它们上架仍被别店的在架/占用拦下)
+        unplanned = alloc_survey.is_excluded(store_name)
         for r in srows:
             if pt_spec.load_pt(r["product_type"]) is None:
                 n["no_spec"] += 1
@@ -1088,11 +1100,11 @@ def run(params: dict) -> str:
                 n["risk"] += 1
                 reasons.append((r["rownum"], why))
                 continue
-            if r["asin"] in listed:
+            if not unplanned and r["asin"] in listed:
                 n["dedup"] += 1
                 reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
                 continue
-            holder = owned_asin.get(r["asin"])
+            holder = None if unplanned else owned_asin.get(r["asin"])
             if holder and holder != store_name:
                 # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
                 # 被占着"正是所有者要的语义(§二);同店占用放行(本来就是它的)
@@ -1186,7 +1198,11 @@ def run(params: dict) -> str:
         # 键与占用侧同一套归一算法(brand_key 唯一出处),否则大小写差一点
         # 就漏拦;真·无品牌(两字段皆占位符)不参与品牌排他,只受产品占用管
         bkey = brand_key.brand_key(p.get("brand"), p.get("manufacturer"))
-        bholder = owned_brand.get(bkey) if bkey else None
+        # 规划外店(谭总系)不做品牌归属:上架不受品牌占用管(也不占,
+        # load 侧已剔;所有者定稿 2026-08-15,2026-08-19 补全行侧)
+        bholder = (owned_brand.get(bkey)
+                   if bkey and not alloc_survey.is_excluded(r["store"])
+                   else None)
         if bholder and bholder != r["store"]:
             n["claimed"] += 1
             reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))

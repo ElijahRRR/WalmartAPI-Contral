@@ -74,13 +74,21 @@ _AC_LOCK = threading.Lock()   # R4 自动机扫描锁(product_audit workers>1 �
 
 @dataclass(frozen=True)
 class MegaCategory:
-    """R2 禁售大类一条(pt_contains / walmart_category_prefix 入库时已全部小写)。"""
+    """R2 禁售大类一条(pt_contains / pt_exact / walmart_category_prefix
+    入库时已全部小写)。
+
+    pt_exact(2026-08-19 所有者定稿「减少误伤」新增):PT **精确等值**命中。
+    给"整机拦、配件放"的类目用——"Camera"这类词按词边界会把相机包/贴膜/
+    镜头盖一起拦(词在 PT 里 ≠ 产品是那个东西),换成整机 PT 的精确清单,
+    不带电配件(所有者定稿:手机壳/数据线/贴膜/手柄皮肤要卖)不再中枪。
+    """
 
     key: str
     reason: str
     pt_contains: tuple[str, ...]
     walmart_category_prefix: tuple[str, ...]
     walmart_policy: str | None = None   # Walmart 37 条政策 category_en
+    pt_exact: frozenset = frozenset()
 
 
 @dataclass
@@ -119,12 +127,13 @@ def load_mega_categories() -> list[MegaCategory]:
         key = str(it.get("key") or "").strip()
         reason = str(it.get("reason") or "").strip()
         pt_c = tuple(str(x).strip().lower() for x in (it.get("pt_contains") or []) if str(x).strip())
+        pt_e = frozenset(str(x).strip().lower() for x in (it.get("pt_exact") or []) if str(x).strip())
         cat_p = tuple(str(x).strip().lower() for x in (it.get("walmart_category_prefix") or []) if str(x).strip())
         walmart_policy = str(it.get("walmart_policy") or "").strip() or None
-        if not key or (not pt_c and not cat_p):
+        if not key or (not pt_c and not pt_e and not cat_p):
             continue
         out.append(MegaCategory(
-            key=key, reason=reason, pt_contains=pt_c,
+            key=key, reason=reason, pt_contains=pt_c, pt_exact=pt_e,
             walmart_category_prefix=cat_p, walmart_policy=walmart_policy,
         ))
     logger.info("loaded %d mega forbidden categories", len(out))
@@ -391,6 +400,17 @@ def _match_mega(
     if not pt_norm and not cat_norm:
         return None
     for mc in mega:
+        # 0. PT 精确等值命中(pt_exact:整机拦、配件放的类目用)
+        if pt_norm and pt_norm.lower() in mc.pt_exact:
+            return MegaHit(
+                key=mc.key,
+                reason=mc.reason,
+                matched_by="pt_exact",
+                matched_term=pt_norm.lower(),
+                walmart_pt=walmart_pt,
+                walmart_category=walmart_category,
+                walmart_policy=mc.walmart_policy,
+            )
         # 1. PT word-boundary 命中 (大小写不敏感 + 可选复数)
         if pt_norm:
             for term in mc.pt_contains:

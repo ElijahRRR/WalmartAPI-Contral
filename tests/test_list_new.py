@@ -913,3 +913,67 @@ def test_content_retry_run_uses_main_title(monkeypatch):
     assert titles == ["Main Product Title Words"]      # 全链只见主标题
     assert seen["submitted"] == [("T1", 1)]
     assert "内容拒捞回:领取 1" in out
+
+
+def test_out_of_scope_store_skips_dedup_and_claim_gates(monkeypatch):
+    """规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
+    (所有者定稿 2026-08-15「既不占用、也不拦别人」;2026-08-19 生产实证
+    补全这个方向——此前只豁免了"它不拦别人",它自己上架仍被拦)。
+    同一现状下规划内的店照旧被拦,豁免不外溢。
+    """
+    rows = [_sheet_row(2, store="谭总4", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T1", asin="B0AAAAAOK1")]
+    products = {"B0AAAAAOK1": {**_PRODUCT_OK, "asin": "B0AAAAAOK1",
+                               "brand": "SomeBrand"}}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    # 该 ASIN 已在别店在架 + 产品/品牌都被别店占用
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, {"B0AAAAAOK1"}, {}, set(),
+        {"banned_pts": set(), "brands": set()},
+        {"B0AAAAAOK1": "A085"},
+        {ln.brand_key.brand_key("SomeBrand", None): "A085"}))
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "谭总4"}, {"name": "T1"}])
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {s: {"fbm_range1": "200%"}
+                                 for s in ("谭总4", "T1")})
+    out = ln.run({"execute": True})
+    assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]  # 只有谭总
+    assert seen["submitted"] == [("谭总4", 1)]
+    assert "全局去重" in out                    # T1 那行被拦,理由照写
+
+
+def test_out_of_scope_holders_do_not_block_others(monkeypatch):
+    """占用台账里持有人是规划外店的行,加载时剔除——它们不占任何产品/品牌。"""
+    import contextlib
+
+    class _Cur:
+        def execute(self, sql, args=None):
+            self.sql = sql
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_Conn()])))
+    monkeypatch.setattr(ln.blacklist, "load_banned_asins", lambda c: {})
+    monkeypatch.setattr(ln.risk_gate, "load_gate",
+                        lambda c: {"banned_pts": set(), "brands": set()})
+    monkeypatch.setattr(
+        ln.claims, "load_active",
+        lambda c, kind: ({"B0TANZHELD1": "谭总4", "B0NORMAL01": "A085"}
+                         if kind == ln.claims.PRODUCT
+                         else {"somebrand": "谭总4"}))
+    *_, owned_asin, owned_brand = ln._load_gate_state()
+    assert owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
+    assert owned_brand == {}

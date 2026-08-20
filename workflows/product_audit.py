@@ -344,6 +344,29 @@ def _is_forced(params: dict, extra: dict) -> bool:
     return bool(extra.get("asins")) and not params.get("from_sheet")
 
 
+# 采用历史结论时反查旧 run 的命中明细(所有者定稿 2026-08-19:「history_shortcut
+# 的也需要输出旧结论」——"理由未留存"只是 runs 行的 l3_reason_category 为空,
+# **audit_hits 里躺着当年真实的命中**,拿最重的那条把旧结论说出来)。
+# penalty ASC = 最狠的排最前;同分取先落库的
+_HIT_OF_RUN_SQL = """
+SELECT DISTINCT ON (run_id) run_id, rule_code, detail
+FROM audit.audit_hits
+WHERE run_id = ANY(%s)
+ORDER BY run_id, penalty ASC, hit_id ASC
+"""
+
+
+def _hits_of_runs(conn, run_ids: list) -> dict:
+    """输入:run_id 列表 → 输出:{run_id: (rule_code, detail)}(分块防超大 ANY)。"""
+    out: dict = {}
+    for i in range(0, len(run_ids), 10_000):
+        with conn.cursor() as cur:
+            cur.execute(_HIT_OF_RUN_SQL, (run_ids[i:i + 10_000],))
+            for rid, code, detail in cur.fetchall():
+                out[rid] = (code, detail if isinstance(detail, dict) else {})
+    return out
+
+
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     """输入:候选 ASIN 列表 → 输出:(采用数, 已采用 ASIN 集)。
 
@@ -356,6 +379,9 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL, (asins,))
         rows = cur.fetchall()
+    # reject 且 runs 行没留理由的,去 hits 反查旧命中(只查需要的那批)
+    need_hits = [r[1] for r in rows if r[2] == "reject" and not r[5]]
+    old_hits = _hits_of_runs(conn, need_hits) if need_hits else {}
     adopted = set()
     events = []
     adopt_rows = []
@@ -366,9 +392,17 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             continue
         status = "approved" if verdict == "pass" else "rejected"
         if verdict == "reject":
-            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——不留空
-            # (rejected 说不出理由 = 排查断线),也不迁旧'history_shortcut'字面量
-            reason = reason_cat or f"历史结论(阶段 {stage or '未知'},理由未留存)"
+            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——先拿
+            # runs 行的理由;没有就反查 hits 把旧结论说出来;连 hits 都
+            # 没有(极老的孤儿 run)才落"理由未留存"
+            reason = reason_cat
+            if not reason:
+                hit = old_hits.get(run_id)
+                if hit:
+                    reason = (f"历史结论(阶段 {stage or '未知'}):"
+                              f"{audit_reason.explain_hit(hit[0], hit[1])}")
+                else:
+                    reason = f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
             reason = None
         adopt_rows.append({

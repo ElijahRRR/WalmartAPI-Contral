@@ -212,6 +212,9 @@ WITH latest AS (
     SELECT DISTINCT ON (asin) asin, run_id, l3_reason_text
     FROM audit.audit_runs
     WHERE asin = ANY(%s) AND verdict = 'reject'
+      -- SHORTCUT 影子行不算(与 product_audit._HISTORY_SQL 同一条纪律):
+      -- 它们是旧仓历史采用的痕迹,没有自己的命中,选中它 = 理由永远查不出
+      AND stage_stopped_at IS DISTINCT FROM 'SHORTCUT'
     ORDER BY asin, created_at DESC
 )
 SELECT l.asin, l.l3_reason_text, h.rule_code, h.detail, h.penalty

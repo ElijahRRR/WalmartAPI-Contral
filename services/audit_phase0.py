@@ -325,6 +325,49 @@ def _check_trademark(product: ProductInfo) -> Phase0Result:
 
 
 # =============================================================
+# 规则 3.5 —— 专利声明硬拦(2026-08-19 所有者定稿,新增,非旧仓迁移)
+# =============================================================
+#
+# 来历:Yociyoga 收纳架标题明写 "(Patent Protection)(Patent No. 30022416)",
+# 却被类目子串误伤成"服饰禁售"——所有者:「这个写明了专利被保护,拒绝理由
+# 应该是专利」。listing 自述有专利 = 与 ®/™ 同级的强 IP 信号,搬运卖家无授权,
+# 与规则 3 同一política(Intellectual Property),同一扫描面(title/前 5 条
+# bullets/前 1000 字符 desc)。
+#
+# 唯一豁免:**patent leather(漆皮)**——鞋包箱表的常见材质词,与专利无关。
+# 命中词形:Patent No./Number、Patented、Patent Pending、Patent Protection、
+# US/Design Patent、patents 等;"patent" 后紧跟 leather(容一个空格/连字符)
+# 不算。
+_PATENT_RE = re.compile(r"\bpatent(?:ed|s)?\b(?![\s\-]*leather\b)", re.I)
+
+
+def _check_patent(product: ProductInfo) -> Phase0Result:
+    """输入:产品 → 输出:Phase0Result(文案自述专利即 blocked,漆皮豁免)。"""
+    title = product.title or ""
+    bullets_txt = " ".join((product.bullet_points or [])[:_TM_BULLET_LIMIT])
+    long_desc = (product.long_description or "")[:_TM_DESC_LIMIT]
+    hay = title + "\n" + bullets_txt + "\n" + long_desc
+
+    m = _PATENT_RE.search(hay)
+    if not m:
+        return Phase0Result(blocked=False)
+
+    hit = RuleHit(
+        stage="L0",
+        rule_code="phase0_patent_claim",
+        penalty=-100,
+        detail={
+            "matched_phrase": m.group(0),
+            "context": hay[max(0, m.start() - 30): m.end() + 30].strip(),
+            "walmart_policy": "Intellectual Property",
+            "note": "文案自述专利保护(Patent No./Patented/Patent Pending 等),"
+                    "搬运卖家无授权;patent leather(漆皮)已豁免",
+        },
+    )
+    return Phase0Result(blocked=True, hits=[hit])
+
+
+# =============================================================
 # 规则 4 —— 品牌精准黑名单(brand 字段等值,不扫 title)
 # =============================================================
 
@@ -413,6 +456,11 @@ def check(product: ProductInfo, ctx: Any) -> Phase0Result:
     r_tm = _check_trademark(product)
     if r_tm.blocked:
         return r_tm
+
+    # 2.5 专利声明硬拦 (2026-08-19 新增,同一扫描面,漆皮豁免)
+    r_pat = _check_patent(product)
+    if r_pat.blocked:
+        return r_pat
 
     # 3. 品牌黑名单 (精准 brand == blacklist, DB 全量 + yaml 手工补)
     r_brand = _check_brand(product, ctx)

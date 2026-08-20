@@ -1340,3 +1340,39 @@ def test_adopt_history_says_the_old_reason_from_hits():
     assert "品牌黑名单" in by["B0AAAAAAA1"]        # 旧命中翻成人话
     assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]
     assert "理由未留存" in by["B0AAAAAAA2"]        # 连 hits 都没有才落这句
+
+
+def test_shrink_guard_message_says_what_you_are_installing():
+    """护栏拦下来时必须报出**将要装进去的是什么** —— 2026-08-20 生产实见:
+    它只说"11810→223",人被要求"人工核实"却无从核起;他要核的恰恰是那 223 条
+    里子树/顶级/路径各多少(列错位会让三个数全变样)。"""
+    conn = _BLConn(old_n=11810)
+    rows = ([_cat_row(f"T{i} > X", str(i), "", "子树") for i in range(200)]
+            + [_cat_row(f"P{i}", "", "", "顶级名") for i in range(23)])
+    with pytest.raises(RuntimeError) as e:
+        _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                               "catalog.amazon_cat_blacklist", rows)
+    msg = str(e.value)
+    assert "子树 200" in msg and "顶级名 23" in msg and "路径等值 0" in msg
+    assert "读入 223 行" in msg and "allow_shrink" in msg
+
+
+def test_amzcat_dry_run_writes_nothing():
+    """⚠ risk_sync 是 DANGEROUS=False,cli 恒给 execute=True —— `--dry-run`
+    只走 dry_run 这一路。2026-08-20 实见:所有者按"先 --dry-run 看摘要"敲下去,
+    四张 TRUNCATE 全量重灌的表**照样真写了**。"""
+    conn = _BLConn(old_n=200)
+    rows = [_cat_row(f"A{i} > B", str(i), "", "子树") for i in range(200)]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows,
+                                 dry_run=True)
+    assert "[DRY-RUN]" in msg and "一行未写" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql) and conn.inserted == []
+
+
+def test_seller_dry_run_writes_nothing():
+    conn = _BLConn(old_n=1314)
+    msg = _sync_column_blacklist(conn, _SELLER_SHEET, "catalog.seller_blacklist",
+                                 [{"seller_id": "S1"}, {"seller_id": "S2"}],
+                                 allow_shrink=True, dry_run=True)
+    assert "[DRY-RUN]" in msg and conn.inserted == []

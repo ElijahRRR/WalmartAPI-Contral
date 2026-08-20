@@ -104,7 +104,6 @@ class Admission:
     certs: list = field(default_factory=list)      # ["NRTL 认证(UL/ETL/CSA)", ...]
     verdict: str = OK                               # 是 / 需评估 / 否
     reasons: list = field(default_factory=list)     # 逐条依据
-    policy: str = ""                                # 命中的沃尔玛政策类目
     fields_seen: int = 0
 
 
@@ -183,7 +182,6 @@ def find_boilerplate(top_counts: dict, cond_counts: dict, total: int
 
 def judge(product_type: str, required: set, *, conditional: set | None = None,
           age_values: list | None = None, category: str = "",
-          policy: str = "", policy_status: str = "",
           boilerplate_top: set | None = None,
           boilerplate_cond: set | None = None) -> Admission:
     """输入:PT + **顶层必填**字段集(+ 条件必填 / ageGroup 取值 / 类目 / 政策)
@@ -195,8 +193,13 @@ def judge(product_type: str, required: set, *, conditional: set | None = None,
     认证也不升到"否" —— 条件必填只说明"这个 PT 可能涉及",不说明"这个 PT 就是"
     (洗发水的 spec 里也带着儿童产品证书字段)。具体要不要是产品级的事,归 L2/L3。
 
-    政策优先级最高:政策判「完全禁售」直接否,不看字段(政策是沃尔玛明说不让卖,
-    字段只说明要什么材料)。
+    ⚠ **本判定不收沃尔玛禁售政策**,别再往回加(2026-08-20 所有者定稿):
+    那 46 条政策("Alcohol"、"Hazardous Items"、"Plants & Seeds" …)是**按产品**
+    写的概述,不是按类目写的 —— 同一个 PT 下既有能卖的也有不能卖的
+    (`Garden & Patio` 下既有园艺耙也有禁售的活体种苗),PT 级套政策只会误杀整类。
+    `audit_l2` R2 段早就写过同一条结论:"walmart_category 层级太粗…直接按
+    walmart_category 匹配政策会误杀,政策只用作 L3 LLM 上下文"。
+    政策的落点是**产品级**(L2 `_infer_walmart_policy` → L3 上下文),不在这里。
     """
     order = {OK: 0, EVAL: 1, BLOCK: 2}
     certs, reasons, worst = [], [], OK
@@ -237,11 +240,8 @@ def judge(product_type: str, required: set, *, conditional: set | None = None,
         _add("CPSIA GCC/CPC", EVAL,
              f"spec 顶层必填 `{AGE_FIELD}` 且枚举含儿童段 → 儿童产品")
 
-    if policy_status and ("完全禁售" in policy_status or policy_status.strip() == "禁售"):
-        worst = BLOCK
-        reasons.insert(0, f"沃尔玛政策「{policy}」:{policy_status} —— 政策禁售优先于字段")
     return Admission(product_type=product_type, certs=certs, verdict=worst,
-                     reasons=reasons, policy=policy, fields_seen=len(required))
+                     reasons=reasons, fields_seen=len(required))
 
 
 __all__ = ["Admission", "FIELD_CERTS", "INGREDIENTS_FIELD", "BLOCK",

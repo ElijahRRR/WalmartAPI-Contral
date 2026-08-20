@@ -111,12 +111,17 @@ def test_age_group_alone_is_not_a_child_product():
     assert pa.judge("Toy Blocks", {"ageGroup"}, age_values=["toddler"]).verdict == pa.EVAL
 
 
-def test_policy_prohibited_beats_fields():
-    """政策说完全禁售就是禁售,不看字段 —— 字段只说明"要什么材料",
-    政策说的是"沃尔玛压根不让卖"。"""
-    a = pa.judge("Distillation Apparatus", set(), policy="Alcohol",
-                 policy_status="完全禁售(含酒精食品/蒸馏设备)")
-    assert a.verdict == pa.BLOCK and "Alcohol" in a.reasons[0]
+def test_judge_takes_no_policy_input():
+    """PT 级判定**不收政策**(2026-08-20 所有者定稿),别再加回来。
+
+    46 条禁售政策是按**产品**写的概述:同一个 PT 下既有能卖的也有不能卖的,
+    按 PT 套政策必然误杀整类(`audit_l2` R2 段早有同一条结论)。这里用
+    签名断言钉死 —— 谁再加 policy 参数,这条先红。
+    """
+    import inspect
+    assert not {"policy", "policy_status"} & set(
+        inspect.signature(pa.judge).parameters)
+    assert not hasattr(pa.Admission("X"), "policy")
 
 
 def test_no_fields_no_certs_is_ok():

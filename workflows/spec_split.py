@@ -5,6 +5,7 @@
   python cli.py spec_split -p src=<同上>                  # 真拆(目录自动按版本串命名)
   python cli.py spec_split -p src=<同上> -p out=<目录>      # 指定输出目录
   python cli.py spec_split -p src=<同上> -p diff=1          # 拆完与现用版做差集
+  python cli.py spec_split -p out=<已拆好的目录> -p diff=1   # 只对账(已拆过就不重拆)
 
 为什么要它(docs/legacy_survey.md:1535/1665):官方 MP_ITEM v5 是**一个 450MB 的
 单 JSON**,`json.load` 膨胀成约 1.3GB Python 对象 —— 旧系统跑 5048 行 xlsx 时
@@ -46,20 +47,107 @@ def _version_from(src: str) -> str:
     return m.group(1) if m else ""
 
 
+def _selfcheck_lines(out_dir: str) -> list[str]:
+    """输入:新拆目录 → 输出:自检行(用**真加载器**读一遍,不是自己数文件)。"""
+    pt_spec.use_spec_dir(out_dir)
+    try:
+        n_idx, n_ok = pt_spec.coverage()
+        return [f"自检:索引 {n_idx} 个 PT,拆分文件解析到 {n_ok} 个"
+                + ("" if n_idx == n_ok else " ⚠ 有对不上的,别切换")]
+    finally:
+        pt_spec.use_spec_dir(None)
+
+
+def _diff_lines(new_dir: str, cur_dir: str) -> list[str]:
+    """输入:新旧两个 spec 目录 → 输出:换版差集(**换版前唯一必看的那张表**)。
+
+    mapper 给不出的新增必填会被 mp_conform.validate 拦下,上架量**静悄悄地掉**
+    (validate 不过就不提交,省 UPC 与配额,设计如此)。所以按"影响多少个 PT"
+    排序报出来,让人一眼看出改哪几个字段能覆盖大头。
+
+    ⚠ 无论中途出什么事,最后都必须把加载器**恢复到在用版** —— 留在新版上,
+    上架链就会拿新版数据去过旧版 header 的校验。
+    """
+    def _snapshot(d: str) -> tuple[set, dict, dict]:
+        pt_spec.use_spec_dir(d)
+        pts = pt_spec.known_pts()
+        req = {p: set((pt_spec.load_pt(p) or {}).get("required") or []) for p in pts}
+        o = pt_spec.orderable_spec()
+        return pts, req, {"req": set(o.get("required") or []),
+                          "props": set(o.get("properties") or {})}
+
+    try:
+        new_pts, new_req, new_o = _snapshot(new_dir)
+        old_pts, old_req, old_o = _snapshot(cur_dir)
+    finally:
+        pt_spec.use_spec_dir(None)
+
+    out = [f"── 换版差集:在用版 {resources.FEED_SPEC_VERSIONS['MP_ITEM']}"
+           f" {len(old_pts)} 个 PT → 新版 {len(new_pts)} 个",
+           f"   新增 PT {len(new_pts - old_pts)} 个;消失 PT {len(old_pts - new_pts)} 个"]
+    for tag, xs in (("新增样例", sorted(new_pts - old_pts)[:5]),
+                    ("消失样例", sorted(old_pts - new_pts)[:5])):
+        if xs:
+            out.append(f"   {tag}:" + "、".join(xs))
+    o_add, o_del = new_o["props"] - old_o["props"], old_o["props"] - new_o["props"]
+    out.append(f"   Orderable:字段 {len(old_o['props'])} → {len(new_o['props'])};"
+               f"必填 {len(old_o['req'])} → {len(new_o['req'])}")
+    if o_add or o_del:
+        out.append(f"     新增字段 {sorted(o_add) or '—'};移除字段 {sorted(o_del) or '—'}")
+    if new_o["req"] - old_o["req"] or old_o["req"] - new_o["req"]:
+        out.append(f"     必填变化:新增 {sorted(new_o['req'] - old_o['req']) or '—'};"
+                   f"不再必填 {sorted(old_o['req'] - new_o['req']) or '—'}")
+
+    added: dict[str, int] = {}
+    removed: dict[str, int] = {}
+    changed = 0
+    for p in new_pts & old_pts:
+        a, d = new_req[p] - old_req[p], old_req[p] - new_req[p]
+        if a or d:
+            changed += 1
+        for f_ in a:
+            added[f_] = added.get(f_, 0) + 1
+        for f_ in d:
+            removed[f_] = removed.get(f_, 0) + 1
+    out.append(f"   顶层必填有变化的 PT:{changed} 个")
+    out.append("   **新版新增的顶层必填**(按影响 PT 数;mapper 给不出的会被"
+               " validate 拦,上架量静悄悄掉):")
+    for f_, n in sorted(added.items(), key=lambda x: -x[1])[:25] or [("(无)", 0)]:
+        out.append(f"     {f_:<52}{n:>6} 个 PT")
+    if removed:
+        out.append("   新版不再必填的(可以少填,不影响能不能上):")
+        for f_, n in sorted(removed.items(), key=lambda x: -x[1])[:15]:
+            out.append(f"     {f_:<52}{n:>6} 个 PT")
+    return out
+
+
 def run(params: dict) -> str:
     """输入:params(src/out/replace/diff/dry_run)→ 输出:拆分与自检摘要。"""
     dry_run = bool(params.get("dry_run"))
     src = os.path.expanduser(str(params.get("src", "")).strip())
-    if not src:
-        return "没给源文件:用 -p src=<官方 MP_ITEM spec 大 json>"
+    out = str(params.get("out", "")).strip()
+    want_diff = str(params.get("diff", "")).strip() == "1"
+    # 已经拆好的目录 + 只想对账:不重拆(重拆要 -p replace=1,而覆盖一份已经
+    # 自检通过的目录纯属多余风险)
+    only_diff = bool(out and want_diff and not src
+                     and os.path.exists(os.path.expanduser(os.path.join(out, "_pt_index.json"))))
+    if not src and not only_diff:
+        return ("没给源文件:用 -p src=<官方 MP_ITEM spec 大 json>;"
+                "已经拆好了只想对账用 -p out=<目录> -p diff=1")
+    lines = []
+    if only_diff:
+        out_dir = os.path.expanduser(out)
+        cur_dir = str(paths.mp_item_spec_dir())
+        lines.append(f"只对账(目录已拆好,不重拆):{out_dir}")
+        return "\n".join(lines + _diff_lines(out_dir, cur_dir))
+
     if not os.path.exists(src):
         raise FileNotFoundError(f"源文件不存在:{src}")
     size = os.path.getsize(src)
     ver = _version_from(src)
-    lines = [f"源文件:{src}({size / 1024 / 1024:.0f} MB)",
-             f"版本串:{ver or '(文件名里解析不出,输出目录必须用 -p out= 指定)'}"]
+    lines += [f"源文件:{src}({size / 1024 / 1024:.0f} MB)",
+              f"版本串:{ver or '(文件名里解析不出,输出目录必须用 -p out= 指定)'}"]
 
-    out = str(params.get("out", "")).strip()
     if out:
         out_dir = os.path.expanduser(out)
     elif ver:
@@ -125,41 +213,9 @@ def run(params: dict) -> str:
         finally:
             buf.close()
 
-    # 自检:换个进程视角,用真加载器把新目录读一遍
-    pt_spec.use_spec_dir(out_dir)
-    try:
-        n_idx, n_ok = pt_spec.coverage()
-        lines.append(f"自检:索引 {n_idx} 个 PT,拆分文件解析到 {n_ok} 个"
-                     + ("" if n_idx == n_ok else " ⚠ 有对不上的,别切换"))
-        if str(params.get("diff", "")).strip() == "1":
-            new_pts = pt_spec.known_pts()
-            new_req = {p: set((pt_spec.load_pt(p) or {}).get("required") or [])
-                       for p in new_pts}
-            pt_spec.use_spec_dir(cur_dir)
-            old_pts = pt_spec.known_pts()
-            old_req = {p: set((pt_spec.load_pt(p) or {}).get("required") or [])
-                       for p in old_pts}
-            lines.append(f"── 换版差集:在用版 {resources.FEED_SPEC_VERSIONS['MP_ITEM']}"
-                         f" {len(old_pts)} 个 PT → 新版 {len(new_pts)} 个")
-            lines.append(f"   新增 PT {len(new_pts - old_pts)} 个;"
-                         f"消失 PT {len(old_pts - new_pts)} 个")
-            added: dict[str, int] = {}
-            removed: dict[str, int] = {}
-            for p in new_pts & old_pts:
-                for f_ in new_req[p] - old_req[p]:
-                    added[f_] = added.get(f_, 0) + 1
-                for f_ in old_req[p] - new_req[p]:
-                    removed[f_] = removed.get(f_, 0) + 1
-            lines.append("   **新版新增的顶层必填**(按影响 PT 数;mapper 给不出的"
-                         "会被 validate 拦,上架量静悄悄掉):")
-            for f_, n in sorted(added.items(), key=lambda x: -x[1])[:20] or [("(无)", 0)]:
-                lines.append(f"     {f_:<52}{n:>6} 个 PT")
-            if removed:
-                lines.append("   新版不再必填的:")
-                for f_, n in sorted(removed.items(), key=lambda x: -x[1])[:10]:
-                    lines.append(f"     {f_:<52}{n:>6} 个 PT")
-    finally:
-        pt_spec.use_spec_dir(None)      # 绝不把进程留在新版上
+    lines += _selfcheck_lines(out_dir)
+    if want_diff:
+        lines += _diff_lines(out_dir, cur_dir)
     lines.append("下一步:核完差集再改 registry.FEED_SPEC_VERSIONS['MP_ITEM'] 切换;"
                  "feed header 的 version 与 spec 目录同源,改一处两边一起变")
     return "\n".join(lines)

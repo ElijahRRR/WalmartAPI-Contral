@@ -130,3 +130,49 @@ def test_dry_run_writes_nothing(tmp_path):
     msg = wf.run({"src": str(src), "out": str(out), "dry_run": True})
     assert "一个文件都没写" in msg and not out.exists()
     assert "内存峰值约等于它" in msg      # 提醒:峰值与文件总大小无关
+
+
+# ── 已拆好的目录只对账,不重拆 ─────────────────────────────────────────────
+
+def test_only_diff_skips_resplit(tmp_path, monkeypatch):
+    """已经拆好并自检通过的目录,只想看差集时不该被逼着 `-p replace=1` 重拆一遍
+    —— 覆盖一份验过的目录是纯多余的风险。"""
+    from registry import paths
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260608-18_15_07-api_MP_ITEM_0_0_en.json"
+    src.write_bytes(_spec({"W": {"required": ["a"]}, "Z": {"required": ["b"]}}))
+    out = tmp_path / "new"
+    wf.run({"src": str(src), "out": str(out)})
+    stamp = (out / "_pt_index.json").stat().st_mtime_ns
+
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "_pt_index.json").write_text(json.dumps({"W": "W.json"}), encoding="utf-8")
+    (live / "_orderable.json").write_text(json.dumps({"required": ["sku"]}), encoding="utf-8")
+    (live / "W.json").write_text(json.dumps({"required": ["a", "oldOnly"]}), encoding="utf-8")
+    monkeypatch.setattr(paths, "mp_item_spec_dir", lambda: live)
+
+    msg = wf.run({"out": str(out), "diff": "1"})
+    assert "只对账" in msg and "换版差集" in msg
+    assert (out / "_pt_index.json").stat().st_mtime_ns == stamp     # 没重写
+    assert "新增 PT 1 个" in msg                                     # Z 是新的
+    assert "oldOnly" in msg                                          # 旧版必填、新版没了
+
+
+def test_diff_always_restores_the_live_spec_dir(tmp_path, monkeypatch):
+    """对账跑完必须把加载器恢复到在用版 —— 留在新版上,上架链就会拿新版数据
+    去过旧版 header 的校验,而且两边都不报错。"""
+    from registry import paths
+    from services import pt_spec
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260608-18_15_07-api_MP_ITEM_0_0_en.json"
+    src.write_bytes(_spec({"W": {"required": ["a"]}}))
+    out = tmp_path / "new"
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "_pt_index.json").write_text(json.dumps({"W": "W.json"}), encoding="utf-8")
+    (live / "_orderable.json").write_text(json.dumps({}), encoding="utf-8")
+    (live / "W.json").write_text(json.dumps({"required": ["a"]}), encoding="utf-8")
+    monkeypatch.setattr(paths, "mp_item_spec_dir", lambda: live)
+    wf.run({"src": str(src), "out": str(out), "diff": "1"})
+    assert pt_spec._OVERRIDE_DIR is None

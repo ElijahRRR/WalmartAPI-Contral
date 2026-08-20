@@ -54,15 +54,21 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
     out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0, "跳过-匹配方式": 0,
                   "子树": 0, "顶级名": 0, "路径等值": 0, "无匹配方式列-按ID推断": 0}
     with open(path, encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
+        rd = csv.DictReader(f)
+        # 「建议」是**清洗表**才有的列(留/删由人判);飞书那张五列规则表没有
+        # 这一列,里面每一行都是已定稿的规则。整列不存在 ⇒ 不设这道闸,
+        # 否则同一份文件"能粘飞书却导不进库",两条路径就对不上了。
+        has_advice = "建议" in (rd.fieldnames or [])
+        for row in rd:
             n["读入"] += 1
-            advice = (row.get("建议") or "").strip()
-            if not advice:
-                n["跳过-无建议"] += 1
-                continue
-            if advice.startswith("删"):
-                n["跳过-删"] += 1
-                continue
+            if has_advice:
+                advice = (row.get("建议") or "").strip()
+                if not advice:
+                    n["跳过-无建议"] += 1
+                    continue
+                if advice.startswith("删"):
+                    n["跳过-删"] += 1
+                    continue
             cat = (row.get("类目") or "").strip()
             if not cat:
                 continue

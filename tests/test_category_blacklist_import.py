@@ -191,3 +191,29 @@ def test_top_name_rows_are_imported(tmp_path, conn):
     assert by["Video Games"]["mt"] == cb.MATCH_TOP
     assert by["Video Games"]["nid"] is None
     assert "顶级名 1" in out and "匹配方式非录入 0" in out
+
+
+def test_feishu_shaped_csv_without_advice_column_imports(tmp_path, conn):
+    """飞书那张五列规则表**没有「建议」列** —— 整列不存在时不许设那道闸。
+
+    设了的话同一份文件"能粘飞书却导不进库",应急录入和日常同步就对不上,
+    而且失败方式是"读入 223 行、录入 0 行"这种看着像成功的空转。
+    """
+    p = tmp_path / "feishu.csv"
+    p.write_text("类目,browse_node_id,中文翻译,匹配方式,原因\n"
+                 "Toys & Games > Puzzles,166057011,拼图,子树,整棵不做\n"
+                 "Books,,图书,顶级名,整顶级不做\n", encoding="utf-8")
+    out = wf.run({"csv": str(p), "execute": True})
+    assert len(conn.written) == 2
+    assert {r["mt"] for r in conn.written} == {cb.MATCH_NODE, cb.MATCH_TOP}
+    assert "录入 2" in out
+
+
+def test_advice_column_still_gates_when_present(tmp_path, conn):
+    """清洗表带「建议」列时,这道闸照旧生效(删-* 不许进库)。"""
+    path = _csv4(tmp_path, "\n".join([
+        "A > B,,甲,留-真禁售,理由,路径等值,A > B",
+        "C > D,,乙,删-误伤,理由,路径等值,C > D",
+    ]) + "\n")
+    wf.run({"csv": path, "execute": True})
+    assert [r["mv"] for r in conn.written] == ["A > B"]

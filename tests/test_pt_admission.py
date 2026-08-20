@@ -32,15 +32,52 @@ def test_extract_required_survives_lists_and_junk():
 # ── 三档口径:主体资质 → 否 / 买得到报告 → 需评估 / 纯标签 → 是 ────────────
 
 def test_food_fields_mean_fda_facility_registration():
-    """要填配料表 = 食品 = 要 FDA 食品设施注册 + 美国代理人,中国搬运拿不到 → 否。
+    """配料表 + **食品类共现字段** = 食品 = 要 FDA 食品设施注册 + 美国代理人 → 否。
 
     这条正是当年填错的那个:`Baby Foods & Formula` 整组被套上 CPSIA
     (儿童产品符合证书),而婴儿配方奶真正要的是 FDA 注册。
     """
     a = pa.judge("Baby Formula", {"ingredients", "nutritionFactsLabel"})
     assert a.verdict == pa.BLOCK
-    assert any("FDA" in c for c in a.certs)
-    assert a.reasons and "ingredients" in a.reasons[0]
+    assert "FDA 食品设施注册" in a.certs or "FDA 营养标签合规" in a.certs
+
+
+def test_ingredients_without_food_cosignals_is_cosmetics_not_food():
+    """`ingredients` 食品和化妆品都要填,光看它分不出是哪一类,而两类的合规主体
+    完全不同。实见 `3-in-1 Shampoo, Conditioner & Body Washes` 顶层必填带
+    ingredients —— 现表把它标成「FDA 食品设施注册」,其实该是 MoCRA。
+    **结论都是否(都要美国主体),但名字写错了人就没法照着去办证。**"""
+    a = pa.judge("3-in-1 Shampoo", {"ingredients", "labelImage"})
+    assert a.verdict == pa.BLOCK
+    assert any("MoCRA" in c for c in a.certs)
+    assert not any("食品" in c for c in a.certs)
+
+
+def test_conditional_required_caps_at_eval():
+    """`allOf.then.required` 只在特定取值下才要 —— 它说明"这个 PT 可能涉及",
+    不说明"这个 PT 就是"。实见洗发水的 spec 里带着儿童产品证书字段,洗发水
+    显然不是儿童产品;不封顶的话整片个护会被判成儿童产品。"""
+    a = pa.judge("3-in-1 Shampoo", {"labelImage"},
+                 conditional={"children_product_certificate_document_reference_id"})
+    assert a.verdict == pa.EVAL
+    assert "条件必填" in a.reasons[0]
+
+
+def test_properties_only_fields_are_never_evidence():
+    """只躺在 properties 里的字段一律不算判据 —— `certification_type` 实见
+    几乎每个 PT 都有,当判据会让全表变"否"。judge() 只收 required 与 conditional,
+    压根不接受 properties,这条用例钉死这个签名。"""
+    a = pa.judge("X", set(), conditional=set())
+    assert a.verdict == pa.OK and a.certs == []
+
+
+def test_spec_cert_document_fields_are_used_directly():
+    """spec 自带认证文档字段,比按小零件警告猜准得多。"""
+    a = pa.judge("Toy Blocks",
+                 {"children_product_test_report_document_reference_id",
+                  "general_certificate_of_conformity_document_reference_id"})
+    assert a.verdict == pa.EVAL
+    assert "第三方 CPSC 测试报告" in a.certs and "GCC 通用符合证书" in a.certs
 
 
 def test_nrtl_is_eval_not_block():

@@ -147,18 +147,21 @@ def _explain(pt: str) -> list[str]:
     o_req = set((orderable.get("required") or []))
     o_props = set((orderable.get("properties") or {}))
     o_rec_req = pt_admission.extract_required(orderable)
+    o_rec_props = pt_admission.all_fields(orderable)
 
     out = [f"── {pt} 的字段读法对表(现表若是 113/46,看哪一行对得上)"]
     for name, req, props in (
             ("顶层(上架链 mp_conform 口径)", top_req, top_props),
             ("顶层 + allOf.then 条件必填", top_req | cond_req, top_props),
             ("顶层 + 条件 + Orderable 顶层", top_req | cond_req | o_req, top_props | o_props),
-            ("递归收全(我的第一版)", rec_req, rec_props),
-            ("递归 + Orderable 递归", rec_req | o_rec_req, rec_props),
+            ("递归收全(PT 自己)", rec_req, rec_props),
+            ("递归 + Orderable 递归(导出列口径)", rec_req | o_rec_req,
+             rec_props | o_rec_props),
     ):
         out.append(f"   {name:<28} 必填 {len(req):>4} / 字段总数 {len(props):>4}")
     out.append(f"   其中 allOf 条件必填单独 {len(cond_req)} 个;"
-               f"Orderable 顶层必填 {len(o_req)} / 字段 {len(o_props)} 个")
+               f"Orderable 顶层必填 {len(o_req)} / 字段 {len(o_props)} 个,"
+               f"Orderable 递归必填 {len(o_rec_req)} / 字段 {len(o_rec_props)} 个")
     # 合规文档类字段住在哪一层,决定它能不能当"要这个认证"的判据
     marks = ["certification_type", "nrtl_information", "has_nrtl_listing_certification",
              "children_product_certificate_document_reference_id",
@@ -198,10 +201,16 @@ def run(params: dict) -> str:
         lines.append(f"  ⚠ 有 {n_idx - n_ok} 个 PT 在索引里但找不到拆分文件,"
                      f"这批判不了(spec 目录不完整)")
 
-    # Orderable 公共段:6942 个 PT 一模一样,零区分度,但要并进「必填字段清单」
+    # 两套口径,各司其职(2026-08-20 拿本地 spec 对表定的):
+    #  · **导出列**「必填字段数/字段总数」= 递归 ∪ Orderable 递归 —— 与现表口径
+    #    一致(实测 `3-in-1 Shampoo` 必填 46,正是这个数),换口径会让人对不上表;
+    #  · **判定**只看 PT 自己的**顶层必填 + allOf 条件必填** —— 上架链
+    #    services/mp_conform 读的就是顶层,递归会把深层备用字段全收进来
+    #    (所有者:「以前上架系统…搞了很多字段出来」);Orderable 那些
+    #    sku/price/ShippingWeight 是信封字段,零合规信号,进判定只会添噪。
     common_req = pt_admission.extract_required(pt_spec.orderable_spec())
     common_all = pt_admission.all_fields(pt_spec.orderable_spec())
-    lines.append(f"  Orderable 公共必填 {len(common_req)} 个(每个 PT 都有,判定时零区分度)")
+    lines.append(f"  Orderable 公共必填 {len(common_req)} 个(并进导出清单,判定不看)")
 
     pts = sorted(pt_spec.known_pts())
     if limit:
@@ -231,9 +240,15 @@ def run(params: dict) -> str:
             if spec is None:
                 no_spec += 1
                 continue
-            req = common_req | pt_admission.extract_required(spec)
-            adm = pt_admission.judge(pt, req, age_values=_age_values(spec))
+            req = common_req | pt_admission.extract_required(spec)   # 导出列口径
+            top_req = set(spec.get("required") or [])                 # 判定口径
+            cond_req = set()
+            for c in (spec.get("allOf") or []):
+                cond_req.update((c.get("then") or {}).get("required") or [])
             m = meta.get(pt, {})
+            adm = pt_admission.judge(pt, top_req, conditional=cond_req,
+                                     age_values=_age_values(spec),
+                                     category=m.get("cat", ""))
             old = _old_bucket(m.get("zh", ""))
             order = {pt_admission.OK: 0, pt_admission.EVAL: 1, pt_admission.BLOCK: 2}
             move = ("新增(现表无此 PT)" if not old else

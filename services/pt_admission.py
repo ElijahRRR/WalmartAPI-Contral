@@ -28,34 +28,66 @@ logger = logging.getLogger("services.pt_admission")
 #   OK     纯**标签/声明**类(填个字段、印张标签就行)
 BLOCK, EVAL, OK = "否", "需评估", "是"
 
-# spec 必填字段 → (认证要求, 档位, 依据)。字段名取自官方 spec,不是猜的。
+# spec 字段 → (认证要求, 档位, 依据)。字段名取自官方 spec,不是猜的。
+#
+# ⚠ **字段住在哪一层决定它算不算判据**(2026-08-20 拿本地 spec 实测定的口径):
+#   顶层 required        → 硬判据。沃尔玛对这个 PT 无条件要这个东西
+#   allOf.then.required  → **条件必填**,只在某个取值下才要(如 isChildProduct=Yes)。
+#                          它说明"这个 PT 可能涉及",不说明"这个 PT 就是"——
+#                          实见洗发水的 spec 里带着
+#                          `children_product_certificate_document_reference_id`,
+#                          洗发水显然不是儿童产品。所以条件必填只降到"需评估",
+#                          具体要不要是**产品级**的事,归 L2/L3 判,不在 PT 级下结论
+#   仅 properties        → 躺在那儿备用,**一律不算**(`certification_type` 实见
+#                          只是顶层属性,几乎每个 PT 都有,当判据会全表变"否")
 FIELD_CERTS: list[tuple[str, str, str, str]] = [
-    ("has_nrtl_listing_certification", "NRTL 认证(UL/ETL/CSA)", EVAL,
-     "官方 spec 要求申报 NRTL 挂牌;实验室测试花钱能做,但要走认证机构"),
-    ("activeIngredients", "FDA/EPA 活性成分注册", BLOCK,
-     "有活性成分 = 药品/农药/消杀,要 FDA 或 EPA 主体注册"),
-    ("ingredients", "FDA 食品设施注册", BLOCK,
-     "官方要求申报配料表 = 食品/入口物,要 FDA 食品设施注册 + 美国代理人"),
-    ("ingredientListImage", "FDA 食品设施注册", BLOCK, "同上(配料表图)"),
-    ("nutritionFactsLabel", "FDA 营养标签合规", BLOCK, "同上(营养成分表)"),
+    # ── 食品/入口物:要 FDA 食品设施注册 + 美国代理人,中国搬运拿不到 ──
     ("food_condition", "FDA 食品设施注册", BLOCK, "食品状态字段 = 食品"),
     ("foodForm", "FDA 食品设施注册", BLOCK, "食品形态字段 = 食品"),
+    ("nutritionFactsLabel", "FDA 营养标签合规", BLOCK, "营养成分表 = 食品"),
+    ("ingredientListImage", "FDA 食品设施注册", BLOCK, "配料表图 = 入口物"),
     ("is_food_component_monetary_value_over_50", "FDA 食品设施注册", BLOCK, "含食品成分"),
     ("petFoodForm", "FDA 宠物食品设施注册 + AAFCO", BLOCK, "宠物食品形态字段"),
     ("pet_food_condition", "FDA 宠物食品设施注册 + AAFCO", BLOCK, "宠物食品状态字段"),
-    ("smallPartsWarnings", "CPSIA GCC/CPC + 小零件警告", EVAL,
-     "官方要求申报小零件警告 = 儿童产品,要第三方 CPSC 实验室测试报告"),
-    ("minimumRecommendedAge", "CPSIA GCC/CPC", EVAL, "有推荐年龄 = 儿童产品"),
-    ("maximumRecommendedAge", "CPSIA GCC/CPC", EVAL, "同上"),
+    # ── 药品/农药/消杀 ──
+    ("activeIngredients", "FDA/EPA 活性成分注册", BLOCK,
+     "有活性成分 = 药品/农药/消杀,要 FDA 或 EPA 主体注册"),
+    ("drugFacts", "FDA OTC 专论合规", BLOCK, "药品说明字段"),
+    # ── 带电/电池 ──
+    ("has_nrtl_listing_certification", "NRTL 认证(UL/ETL/CSA)", EVAL,
+     "官方要求申报 NRTL 挂牌;实验室测试花钱能做,但要走认证机构"),
+    ("nrtl_information", "NRTL 认证(UL/ETL/CSA)", EVAL, "同上"),
     ("hasBatteries", "UN 38.3 运输测试", EVAL, "含电池,锂电要 UN 38.3"),
     ("batteriesRequired", "UN 38.3 运输测试", EVAL, "同上"),
     ("batterySize", "UN 38.3 运输测试", EVAL, "同上"),
+    # ── 儿童产品:spec 自带的认证文档字段,比按小零件警告猜准得多 ──
+    ("children_product_certificate_document_reference_id", "CPSIA CPC 证书", EVAL,
+     "spec 直接点名要儿童产品符合证书文档"),
+    ("children_product_test_report_document_reference_id", "第三方 CPSC 测试报告", EVAL,
+     "spec 直接点名要儿童产品测试报告"),
+    ("general_certificate_of_conformity_document_reference_id", "GCC 通用符合证书", EVAL,
+     "spec 直接点名要 GCC 文档"),
+    ("smallPartsWarnings", "小零件警告(≤3 岁)", EVAL, "小零件警告 = 儿童可及"),
+    ("minimumRecommendedAge", "CPSIA GCC/CPC", EVAL, "有推荐年龄 = 可能儿童产品"),
+    ("maximumRecommendedAge", "CPSIA GCC/CPC", EVAL, "同上"),
+    # ── 纯标签/声明:填个字段、印张标签就行,不拖低档位 ──
     ("state_chemical_disclosure", "州化学品披露", OK, "填报即可,无需第三方"),
     ("isProp65WarningRequired", "Prop 65 警告标签", OK,
-     "**6942 个 PT 全都有这个字段**,零区分度,只当标签项"),
+     "**每个 PT 都有这个字段**,零区分度,只当标签项"),
+    ("prop65WarningText", "Prop 65 警告语", OK, "同上"),
     ("labelImage", "标签图", OK, "上传标签图即可"),
+    ("labelImageContains", "标签内容申报", OK, "申报项"),
     ("has_written_warranty", "书面保修声明", OK, "声明项"),
 ]
+
+# `ingredients` 单列:食品与化妆品/个护**都要填**,光看它分不出是哪一类,
+# 而两类的合规主体完全不同(FDA 食品设施注册 vs MoCRA + 美国 Responsible Person)。
+# 实见 `3-in-1 Shampoo` 顶层必填带 ingredients —— 现表把它标成了"FDA 食品设施
+# 注册",其实该是 MoCRA。**结论都是"否"(都要美国主体),只是名字不能写错**。
+INGREDIENTS_FIELD = "ingredients"
+_FOOD_COSIGNALS = {"food_condition", "foodForm", "nutritionFactsLabel",
+                   "ingredientListImage", "petFoodForm", "pet_food_condition"}
+
 # ageGroup 单独处理:它本身只是人群标签,只有取值落在儿童段才意味着 CPSIA
 AGE_FIELD = "ageGroup"
 _CHILD_AGE = re.compile(r"infant|toddler|kid|child|baby|youth", re.I)
@@ -110,28 +142,58 @@ def all_fields(node, out: set | None = None) -> set:
     return out
 
 
-def judge(product_type: str, required: set, *, age_values: list | None = None,
+def judge(product_type: str, required: set, *, conditional: set | None = None,
+          age_values: list | None = None, category: str = "",
           policy: str = "", policy_status: str = "") -> Admission:
-    """输入:PT + 必填字段集(+ 政策)→ 输出:Admission(认证清单 + 三档结论)。
+    """输入:PT + **顶层必填**字段集(+ 条件必填 / ageGroup 取值 / 类目 / 政策)
+    → 输出:Admission(认证清单 + 三档结论 + 逐条依据)。
 
     档位取**最严**的一条:任一 BLOCK ⇒ 否;否则任一 EVAL ⇒ 需评估;否则是。
-    政策优先级更高:政策判「完全禁售」直接否,不看字段(政策是沃尔玛明说不让卖,
+
+    `conditional`(allOf.then.required)里的命中**一律只降到"需评估"**,再硬的
+    认证也不升到"否" —— 条件必填只说明"这个 PT 可能涉及",不说明"这个 PT 就是"
+    (洗发水的 spec 里也带着儿童产品证书字段)。具体要不要是产品级的事,归 L2/L3。
+
+    政策优先级最高:政策判「完全禁售」直接否,不看字段(政策是沃尔玛明说不让卖,
     字段只说明要什么材料)。
     """
-    certs, reasons, worst = [], [], OK
     order = {OK: 0, EVAL: 1, BLOCK: 2}
+    certs, reasons, worst = [], [], OK
+    cond = conditional or set()
+
+    def _add(cert: str, tier: str, why: str, weak: bool = False) -> None:
+        nonlocal worst
+        if weak and order[tier] > order[EVAL]:
+            tier = EVAL          # 条件必填封顶在"需评估"
+        if cert not in certs:
+            certs.append(cert)
+            reasons.append(why)
+        if order[tier] > order[worst]:
+            worst = tier
+
     for fname, cert, tier, why in FIELD_CERTS:
         if fname in required:
-            if cert not in certs:
-                certs.append(cert)
-                reasons.append(f"spec 必填 `{fname}` → {cert}({why})")
-            if order[tier] > order[worst]:
-                worst = tier
+            _add(cert, tier, f"spec **顶层必填** `{fname}` → {cert}({why})")
+        elif fname in cond:
+            _add(cert, tier, f"spec **条件必填** `{fname}` → {cert}"
+                             f"(只在特定取值下才要,封顶「需评估」)", weak=True)
+
+    # ingredients:食品与化妆品/个护都要填,靠共现字段分流;两类都要美国主体 ⇒ 都是否
+    if INGREDIENTS_FIELD in required:
+        if required & _FOOD_COSIGNALS:
+            _add("FDA 食品设施注册", BLOCK,
+                 "spec **顶层必填** `ingredients` + 食品类共现字段 → 食品,"
+                 "要 FDA 食品设施注册 + 美国代理人")
+        else:
+            _add("FDA MoCRA + 美国 Responsible Person", BLOCK,
+                 "spec **顶层必填** `ingredients` 但无食品类共现字段 → 化妆品/个护,"
+                 "要 MoCRA 工厂注册 + 美国 Responsible Person(**不是**食品设施注册)")
+
     if AGE_FIELD in required and any(_CHILD_AGE.search(str(v) or "")
                                      for v in (age_values or [])):
-        certs.append("CPSIA GCC/CPC")
-        reasons.append(f"spec 必填 `{AGE_FIELD}` 且取值含儿童段 → CPSIA")
-        worst = EVAL if order[worst] < order[EVAL] else worst
+        _add("CPSIA GCC/CPC", EVAL,
+             f"spec 顶层必填 `{AGE_FIELD}` 且枚举含儿童段 → 儿童产品")
+
     if policy_status and ("完全禁售" in policy_status or policy_status.strip() == "禁售"):
         worst = BLOCK
         reasons.insert(0, f"沃尔玛政策「{policy}」:{policy_status} —— 政策禁售优先于字段")
@@ -139,5 +201,5 @@ def judge(product_type: str, required: set, *, age_values: list | None = None,
                      reasons=reasons, policy=policy, fields_seen=len(required))
 
 
-__all__ = ["Admission", "FIELD_CERTS", "BLOCK", "EVAL", "OK",
-           "all_fields", "extract_required", "judge"]
+__all__ = ["Admission", "FIELD_CERTS", "INGREDIENTS_FIELD", "BLOCK",
+           "EVAL", "OK", "all_fields", "extract_required", "judge"]

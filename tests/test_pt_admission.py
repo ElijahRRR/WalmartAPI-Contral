@@ -293,3 +293,43 @@ def test_explain_reports_both_scopes():
     src = inspect.getsource(pt_spec_sync._explain)
     assert "类目 Visible" in src and "完整商品" in src
     assert "Orderable 顶层必填" in src        # 那 5 个要列名字,便于逐个核
+
+
+# ── 换版对账:能指着另一份 spec 跑,但绝不能让上架链跟着漂 ──────────────────
+
+def test_spec_dir_override_and_restore(tmp_path):
+    """新版 spec 拉下来后,要先量出"新版加了哪些必填、mapper 给不出哪些",
+    再决定改不改 registry 的版本串 —— 切完再发现上架量掉是**静悄悄掉的**
+    (validate 不过就不提交,省 UPC 和配额,设计如此)。
+
+    所以对账要能指着新目录跑而不动 registry;跑完必须恢复,否则同进程后续
+    的上架链会拿新版 spec 去过旧版 header 的校验。
+    """
+    import json
+    from services import pt_spec
+    d = tmp_path / "newspec"
+    d.mkdir()
+    (d / "_pt_index.json").write_text(json.dumps({"Widgets": "w.json"}), encoding="utf-8")
+    (d / "_orderable.json").write_text(json.dumps({"required": ["sku"]}), encoding="utf-8")
+    (d / "w.json").write_text(json.dumps({"required": ["a"], "properties": {"a": {}}}),
+                              encoding="utf-8")
+    try:
+        pt_spec.use_spec_dir(str(d))
+        assert pt_spec.known_pts() == {"Widgets"}
+        assert pt_spec.load_pt("Widgets")["required"] == ["a"]
+    finally:
+        pt_spec.use_spec_dir(None)
+    assert pt_spec._OVERRIDE_DIR is None
+
+
+def test_spec_dir_override_rejects_incomplete_dir(tmp_path):
+    """目录里没有 _pt_index.json 就报错 —— 静默回落到旧版会让"对账通过"
+    变成"其实根本没换过版"。"""
+    import pytest as _pytest
+    from services import pt_spec
+    try:
+        pt_spec.use_spec_dir(str(tmp_path))
+        with _pytest.raises(FileNotFoundError, match="_pt_index.json"):
+            pt_spec.known_pts()
+    finally:
+        pt_spec.use_spec_dir(None)

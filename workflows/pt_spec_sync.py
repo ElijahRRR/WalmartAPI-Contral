@@ -9,6 +9,8 @@
       # 「字段总数/必填字段数」到底该怎么数:一个 PT 在几种读法下分别是多少
   python cli.py pt_spec_sync -p sheet=~/Downloads/沃尔玛类目准入明细.csv --dry-run
       # 拿现表的「必填字段清单」与本地 spec **逐 PT 逐字段**比,看差异长什么样
+  python cli.py pt_spec_sync -p spec_dir=~/…/specs/MP_ITEM/<新版本>/ --dry-run
+      # 换版对账:指着新版 spec 跑而**不动 registry**,先量清楚再决定切不切
 
 数据源:`services.pt_spec` —— `<DATA_ROOT>/specs/MP_ITEM/<版本>/` 那份按 PT 拆分的
 官方 spec,**上架链(listing L2c)用的就是它**。不调 `POST /v3/items/spec`:
@@ -279,14 +281,24 @@ def run(params: dict) -> str:
     dry_run = bool(params.get("dry_run"))
     limit = int(params.get("limit", 0) or 0)
 
+    # 换版对账:临时切到另一份 spec 目录(不动 registry;上架链仍走旧版)
+    spec_dir = str(params.get("spec_dir", "")).strip()
+    if spec_dir:
+        pt_spec.use_spec_dir(spec_dir)
+
     ex = str(params.get("explain", "")).strip()
     if ex:
         return "\n".join(_explain(ex))
 
     n_idx, n_ok = pt_spec.coverage()
     ver = resources.FEED_SPEC_VERSIONS["MP_ITEM"]
-    lines = [f"本地官方 spec:{paths.mp_item_spec_dir()}",
-             f"  版本串 {ver}(与上架链同源);索引 PT {n_idx} 个,拆分文件解析到 {n_ok} 个"]
+    lines = [f"本地官方 spec:{spec_dir or paths.mp_item_spec_dir()}"]
+    if spec_dir:
+        lines.append(f"  ⚠ **换版对账模式**:读的是指定目录,不是上架链在用的那份"
+                     f"(registry 仍是 {ver});本轮只作对账,别拿它落库当定稿")
+    else:
+        lines.append(f"  版本串 {ver}(与上架链同源)")
+    lines.append(f"  索引 PT {n_idx} 个,拆分文件解析到 {n_ok} 个")
     if n_ok < n_idx:
         lines.append(f"  ⚠ 有 {n_idx - n_ok} 个 PT 在索引里但找不到拆分文件,"
                      f"这批判不了(spec 目录不完整)")

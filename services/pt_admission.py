@@ -94,6 +94,22 @@ def extract_required(node, out: set | None = None) -> set:
     return out
 
 
+def all_fields(node, out: set | None = None) -> set:
+    """输入:spec JSON → 输出:出现过的全部属性名(不只必填,对应旧表「字段总数」)。"""
+    if out is None:
+        out = set()
+    if isinstance(node, dict):
+        props = node.get("properties")
+        if isinstance(props, dict):
+            out.update(str(k) for k in props)
+        for v in node.values():
+            all_fields(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            all_fields(v, out)
+    return out
+
+
 def judge(product_type: str, required: set, *, age_values: list | None = None,
           policy: str = "", policy_status: str = "") -> Admission:
     """输入:PT + 必填字段集(+ 政策)→ 输出:Admission(认证清单 + 三档结论)。
@@ -124,4 +140,4 @@ def judge(product_type: str, required: set, *, age_values: list | None = None,
 
 
 __all__ = ["Admission", "FIELD_CERTS", "BLOCK", "EVAL", "OK",
-           "extract_required", "judge"]
+           "all_fields", "extract_required", "judge"]

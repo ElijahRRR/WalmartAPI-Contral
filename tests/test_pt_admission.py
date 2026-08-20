@@ -6,7 +6,7 @@
 """
 
 from services import pt_admission as pa
-from workflows.pt_spec_sync import _taxonomy_rows
+from workflows.pt_spec_sync import _age_values
 
 
 # ── 必填字段要**递归**收全 ────────────────────────────────────────────────
@@ -87,18 +87,29 @@ def test_no_fields_no_certs_is_ok():
     assert a.verdict == pa.OK and a.certs == [] and a.fields_seen == 0
 
 
-# ── taxonomy 摊平:按值取,不按固定键路径取 ────────────────────────────────
+# ── ageGroup 取值:只有落在儿童段才算儿童产品 ────────────────────────────
 
-def test_taxonomy_flatten_is_shape_tolerant():
-    """官方结构层级名历年会变,按固定键路径取一改就全空 —— 而"全空"在这里
-    等于"官方一个 PT 都没有",工作流会拿它当真。"""
-    payload = [{"category": "Animals", "productTypeGroups": [
-        {"name": "Animal Grooming", "productTypes": ["Animal Conditioners", "Brushes"]}]}]
-    rows = _taxonomy_rows(payload)
-    assert {r["pt"] for r in rows} == {"Animal Conditioners", "Brushes"}
-    assert rows[0]["category"] == "Animals" and rows[0]["ptg"] == "Animal Grooming"
+def test_age_values_are_read_from_enum_not_field_name():
+    """`ageGroup` 字段名人人都有,**取值**才说明是不是儿童产品。
+    只看字段名会把成人拖鞋、老人助行器整批判成 CPSIA。"""
+    spec = {"properties": {"MPItem": {"properties": {
+        "ageGroup": {"items": {"enum": ["Infant", "Toddler"]}}}}}}
+    assert set(_age_values(spec)) == {"Infant", "Toddler"}
+    assert pa.judge("X", {"ageGroup"}, age_values=_age_values(spec)).verdict == pa.EVAL
 
 
-def test_taxonomy_flatten_returns_empty_on_unknown_shape():
-    """摊不出来要返回空让工作流报错,不许瞎猜出几个 PT 来。"""
-    assert _taxonomy_rows({"unexpected": {"deep": 1}}) == []
+def test_age_values_adult_only_stays_ok():
+    spec = {"properties": {"ageGroup": {"enum": ["Adult", "Senior"]}}}
+    assert pa.judge("Y", {"ageGroup"}, age_values=_age_values(spec)).verdict == pa.OK
+
+
+def test_age_values_missing_is_empty_not_crash():
+    assert _age_values({"properties": {"brand": {"type": "string"}}}) == []
+    assert _age_values([]) == []
+
+
+# ── 字段总数:属性名递归收集(对应旧表「字段总数」列)────────────────────
+
+def test_all_fields_collects_property_names():
+    spec = {"properties": {"a": {"properties": {"b": {}, "c": {}}}, "d": {}}}
+    assert pa.all_fields(spec) == {"a", "b", "c", "d"}

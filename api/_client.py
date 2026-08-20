@@ -164,10 +164,6 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "items.list": (55, 60.0),                   # GET /v3/items 带 query 参数(官方 60/min,页间≈1.1s)
     "items.list_nofilter": (250, 60.0),         # GET /v3/items 无参数(官方 300/min)
     "items.get": (800, 60.0),                   # GET /v3/items/{sku}(官方 900/min;补漏单查 ≤8 并发)
-    # 官方自相矛盾:限流表写 10/min,Get Spec 指南写 3 TPM/seller(蓝图 §3 表)。
-    # 取指南的 3/min —— 拉全量 PT spec 是一次性/周期性作业,慢没关系,撞死很贵
-    "items.spec": (3, 60.0),                    # POST /v3/items/spec(≤20 PT/次)
-    "items.taxonomy": (180, 60.0),              # GET /v3/items/taxonomy(与 count 共享 200/min)
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
     "returns.list": (46, 60.0),                 # GET /v3/returns(官方 50/min,沿用旧 1.3s 节奏)

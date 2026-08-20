@@ -7,10 +7,8 @@
   list_items()           GET /v3/items                          分页模型1        [catalog_sync]
   iter_all_items()       5 轮组合全量扫店(去重生成器)                            [catalog_sync]
   get_item()             GET /v3/items/{sku}                    单查补漏         [catalog_sync]
-  get_taxonomy()         GET /v3/items/taxonomy                 官方 PT 全集      [pt_spec_sync]
-  get_spec()             POST /v3/items/spec                    PT 上架模板       [pt_spec_sync]
 
-其余函数(count_items)按蓝图 §7 签名预留,随对应工作流迁移时实现
+其余函数(count_items / get_spec)按蓝图 §7 签名预留,随对应工作流迁移时实现
 ——不自创签名(CLAUDE.md api 层收录规则)。
 
 响应字段坑(旧系统实测,api 层统一兜底):
@@ -384,56 +382,3 @@ def summarize_catalog_item(h: dict) -> dict:
         "unpublished_reasons": "; ".join(reasons) if isinstance(reasons, list) else reasons,
     }
 
-
-# =============================================================
-# PT 全集与上架模板(pt_spec_sync;蓝图 §3 行 7 / §7)
-# =============================================================
-
-SPEC_BATCH = 20          # POST /v3/items/spec 官方单次上限 20 个 PT
-
-
-def get_taxonomy(store: dict) -> list[dict]:
-    """输入:店铺 → 输出:官方类目树行列表(每行含 category/ptg/productTypes)。
-
-    GET /v3/items/taxonomy —— 沃尔玛**官方的 PT 全集**,是"我们的准入明细有没有
-    漏类目"的唯一权威基准(飞书那张表是很久以前生成的,类目会漂)。
-    只读端点,与 items/count 共享 200/min 桶。
-    """
-    _client.rate_acquire("items.taxonomy", store["client_id"])
-    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
-    status, _, data = _client.safe_get_ex(
-        f"{_client.base_url()}/v3/items/taxonomy",
-        token, store["client_id"], store["proxy"], max_retries=3)
-    _guard_store_dead(status, store)
-    if status != 200:
-        raise RuntimeError(f"GET /v3/items/taxonomy 返回 {status}: {data}")
-    return (data or {}).get("payload") or []
-
-
-def get_spec(store: dict, product_types: list[str], *,
-             feed_type: str = "MP_ITEM", version: str | None = None) -> dict:
-    """输入:店铺 + PT 名列表(≤20)→ 输出:该批 PT 的上架模板 JSON(原始 payload)。
-
-    POST /v3/items/spec。**配额极低(3/min)**,分批与节奏由 rate_acquire 兜住;
-    查询型 POST 幂等,开自动重试安全。
-
-    ⚠ 超过 20 个直接报错而不是静默截断 —— 静默截断会让调用方以为"这批拉完了",
-    而缺的那些 PT 在准入明细里就成了永远补不上的洞(本仓口诀:宁炸不吞)。
-    """
-    if not product_types:
-        return {}
-    if len(product_types) > SPEC_BATCH:
-        raise ValueError(f"POST /v3/items/spec 单次最多 {SPEC_BATCH} 个 PT,"
-                         f"给了 {len(product_types)} 个——请分批")
-    body: dict = {"feedType": feed_type, "productTypes": list(product_types)}
-    if version:
-        body["version"] = version
-    _client.rate_acquire("items.spec", store["client_id"])
-    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
-    status, _, data = _client.safe_post_ex(
-        f"{_client.base_url()}/v3/items/spec",
-        token, store["client_id"], store["proxy"], json_body=body, max_retries=3)
-    _guard_store_dead(status, store)
-    if status != 200:
-        raise RuntimeError(f"POST /v3/items/spec 返回 {status}(PT {product_types[:3]}…): {data}")
-    return data or {}

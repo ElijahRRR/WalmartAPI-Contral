@@ -1,41 +1,46 @@
-"""pt_spec_sync — 从沃尔玛官方拉 PT 全集与上架 spec,重建类目准入明细。
+"""pt_spec_sync — 用**本地官方 spec** 重建沃尔玛类目准入明细。
 
 用法:
-  python cli.py pt_spec_sync --dry-run                # 只拉 taxonomy + 3 批 spec 样本
-  python cli.py pt_spec_sync -p limit=200             # 先拉 200 个 PT 试水
-  python cli.py pt_spec_sync                          # 全量(约 7000 PT,3/min×20 ≈ 2 小时)
-  python cli.py pt_spec_sync -p store=谭总10 -p only_new=1
+  python cli.py pt_spec_sync --dry-run           # 只读 spec + 判定,打印对账,不写库
+  python cli.py pt_spec_sync                     # 落 audit.walmart_pt_spec + 导出飞书粘贴表
+  python cli.py pt_spec_sync -p limit=200        # 先判 200 个看看
 
-为什么要这条链(所有者 2026-08-20:「这个表我很久没有更新了,所以类目可能不全,
-spec 的必填字段也可能有偏差了」):
+数据源:`services.pt_spec` —— `<DATA_ROOT>/specs/MP_ITEM/<版本>/` 那份按 PT 拆分的
+官方 spec,**上架链(listing L2c)用的就是它**。不调 `POST /v3/items/spec`:
+本地这份就是权威,再拉一遍等于给同一个能力开第二条路径(铁律),而且官方那个
+端点 3 TPM,七千个 PT 要跑两小时。
 
-飞书那张「沃尔玛类目准入明细」是很久以前一次性生成的 6,942 行,核查发现:
-  · 「必需认证」45% 是空的;
-  · 642 个 PTG 分组里 294 组(46%)**组内认证一字不差** —— 当年按 PTG 批量套的,
-    于是婴儿配方奶标成了 CPSIA(儿童产品符合证书)、宠物碗标成了 AAFCO(宠物食品);
-  · 382 个 PT 要硬认证却标「是」(可做且无需合规投入)—— 上架后被罚回来的正是这批。
+## 为什么要重建准入明细(所有者 2026-08-20 核查)
 
-修补不如重建:**官方 spec 的必填字段是客观的**,要填 `has_nrtl_listing_certification`
-就是要 NRTL,要填 `ingredients` 就是食品。判定件在 services/pt_admission.py,
-每条结论都能溯源到"哪个 spec 字段 / 哪条政策"。
+飞书那份 6,942 行是很久以前一次性生成的:
+  · 「必需认证」**45% 是空的** —— 空到底是"不需要"还是"没填",表本身答不了;
+  · 642 个 PTG 分组里 **294 组(46%)组内认证一字不差** —— 当年按 PTG 批量套的。
+    实见 `Baby Foods & Formula` 整组套 CPSIA(儿童产品符合证书),于是**婴儿配方
+    奶**标成了 CPSIA(它要的是 FDA 婴幼儿配方注册);`Pet Bowls`(宠物碗)被标
+    「FDA 设施注册 + AAFCO」——那是宠物**食品**的要求;
+  · **382 个 PT 要硬认证却标「是」**(可做且无需合规投入)—— 上架后被罚回来的正是这批。
 
-节奏与安全:
-  · `POST /v3/items/spec` 官方指南 3 TPM/seller,单次 ≤20 PT —— api 层已按 3/min
-    登记桶,本工作流只管分批,不自己 sleep;
-  · **边拉边落库**(每批一提交):七千个 PT 两小时,中途断了不能从头再来;
-  · 已拉过且 spec 版本未变的 PT 默认跳过(`-p refresh=1` 强制重拉);
-  · 只读端点 + 只写 audit.walmart_pt_spec,不碰任何店铺状态。
+官方 spec 的必填字段是客观的:要填 `has_nrtl_listing_certification` 就是要 NRTL,
+要填 `ingredients` 就是食品。判定件在 services/pt_admission.py,每条结论都能溯源到
+"哪个 spec 字段"。
+
+## 两件它顺带回答的事
+
+  · **类目全不全**:spec 索引里的 PT 全集 vs 准入明细,差集就是要补的类目;
+  · **spec 有没有偏差**:摘要报出读的是哪个版本目录(换版 = 换 registry 里那个
+    版本串,两边永远对得上上架链)。
+
+只读本地文件 + 只写 audit.walmart_pt_spec,不碰任何店铺状态、不发任何请求。
 """
 
 import csv
 import json
 import logging
 
-from api import items
-from registry import db, paths
-from services import pt_admission, stores as stores_svc
+from registry import db, paths, resources
+from services import pt_admission, pt_spec
 
-DANGEROUS = False       # 只读沃尔玛 + 只写 audit.walmart_pt_spec
+DANGEROUS = False       # 只读本地 spec + 只写 audit.walmart_pt_spec
 
 logger = logging.getLogger("workflows.pt_spec_sync")
 
@@ -53,130 +58,123 @@ ON CONFLICT (walmart_product_type) DO UPDATE SET
     synced_at        = now()
 """
 
+_META_SQL = ("SELECT walmart_product_type, walmart_category, walmart_ptg, notes "
+             "FROM audit.walmart_pt_meta")
 
-def _taxonomy_rows(payload) -> list[dict]:
-    """输入:taxonomy payload → 输出:[{category, ptg, pt}](把嵌套摊平)。
 
-    官方结构层级名历年有变(category/categoryName、productTypeGroup/ptg…),
-    所以**按值取而不是按固定键路径取**:任何一层里出现 productTypes 列表就收下,
-    上两层的名字当 category/ptg。摊不出来时报数而不是静默返回空。
+def _age_values(spec: dict) -> list:
+    """输入:PT spec → 输出:ageGroup 的枚举取值(判儿童产品用)。
+
+    `ageGroup` 本身只是人群标签(成人服饰、老人助行器一样要填),**取值**落在
+    儿童段才意味着 CPSIA —— 只看字段名会把成人拖鞋判成儿童产品。
     """
-    out: list[dict] = []
+    out: list = []
 
-    def walk(node, cat="", ptg=""):
+    def walk(node):
         if isinstance(node, dict):
-            name = str(node.get("category") or node.get("categoryName")
-                       or node.get("name") or node.get("productTypeGroup") or "").strip()
-            pts = node.get("productTypes") or node.get("productType")
-            if isinstance(pts, list) and pts and all(isinstance(x, str) for x in pts):
-                for pt in pts:
-                    out.append({"category": cat or name, "ptg": name or ptg,
-                                "pt": pt.strip()})
-            for k, v in node.items():
-                if k in ("productTypes", "productType"):
-                    continue
-                walk(v, cat or name, name or ptg)
+            props = node.get("properties")
+            if isinstance(props, dict) and "ageGroup" in props:
+                ag = props["ageGroup"]
+                if isinstance(ag, dict):
+                    for key in ("enum", "examples"):
+                        v = ag.get(key)
+                        if isinstance(v, list):
+                            out.extend(str(x) for x in v)
+                    items = ag.get("items")
+                    if isinstance(items, dict) and isinstance(items.get("enum"), list):
+                        out.extend(str(x) for x in items["enum"])
+            for v in node.values():
+                walk(v)
         elif isinstance(node, list):
             for v in node:
-                walk(v, cat, ptg)
+                walk(v)
 
-    walk(payload)
+    walk(spec)
     return out
 
 
-def _persist(conn, pt: str, required: set, adm) -> None:
-    real = [c for c in adm.certs if adm.verdict != pt_admission.OK]
-    with conn.cursor() as cur:
-        cur.execute(_UPSERT, {
-            "pt": pt,
-            "real": json.dumps(real, ensure_ascii=False),
-            "has_real": adm.verdict == pt_admission.BLOCK,
-            "soft": json.dumps([c for c in adm.certs if c not in real], ensure_ascii=False),
-            "has_soft": bool(adm.certs) and adm.verdict == pt_admission.OK,
-            "fields": json.dumps(sorted(required), ensure_ascii=False),
-        })
-
-
 def run(params: dict) -> str:
-    """输入:params(store/limit/refresh/only_new/dry_run)→ 输出:拉取与判定摘要。"""
+    """输入:params(limit/dry_run)→ 输出:对账 + 判定分布 + 导出路径。"""
     dry_run = bool(params.get("dry_run"))
     limit = int(params.get("limit", 0) or 0)
-    refresh = str(params.get("refresh", "")).strip() == "1"
-    names = [s.strip() for s in str(params.get("store", "")).split(",") if s.strip()]
-    store = stores_svc.load_stores(names or None)[0]
 
-    tax = items.get_taxonomy(store)
-    rows = _taxonomy_rows(tax)
-    if not rows:
-        raise RuntimeError("taxonomy 摊不出任何 PT —— 官方结构可能变了,"
-                           "先看原始 payload 再改 _taxonomy_rows(宁炸不吞)")
-    seen, uniq = set(), []
-    for r in rows:
-        if r["pt"] and r["pt"] not in seen:
-            seen.add(r["pt"])
-            uniq.append(r)
-    lines = [f"官方 taxonomy:{len(rows)} 行 → PT 去重 {len(uniq)} 个"]
+    n_idx, n_ok = pt_spec.coverage()
+    ver = resources.FEED_SPEC_VERSIONS["MP_ITEM"]
+    lines = [f"本地官方 spec:{paths.mp_item_spec_dir()}",
+             f"  版本串 {ver}(与上架链同源);索引 PT {n_idx} 个,拆分文件解析到 {n_ok} 个"]
+    if n_ok < n_idx:
+        lines.append(f"  ⚠ 有 {n_idx - n_ok} 个 PT 在索引里但找不到拆分文件,"
+                     f"这批判不了(spec 目录不完整)")
+
+    # Orderable 公共段:6942 个 PT 一模一样,零区分度,但要并进「必填字段清单」
+    common_req = pt_admission.extract_required(pt_spec.orderable_spec())
+    common_all = pt_admission.all_fields(pt_spec.orderable_spec())
+    lines.append(f"  Orderable 公共必填 {len(common_req)} 个(每个 PT 都有,判定时零区分度)")
+
+    pts = sorted(pt_spec.known_pts())
+    if limit:
+        pts = pts[:limit]
 
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT walmart_product_type FROM audit.walmart_pt_spec")
-            have = {r[0] for r in cur.fetchall()}
-            cur.execute("SELECT walmart_product_type FROM audit.walmart_pt_meta")
-            in_meta = {r[0] for r in cur.fetchall()}
-        new_pts = [r for r in uniq if r["pt"] not in in_meta]
-        gone = sorted(in_meta - seen)
-        lines.append(f"对账准入明细(walmart_pt_meta {len(in_meta)} 个):"
-                     f"**官方有、明细没有 {len(new_pts)} 个**(要补的类目);"
-                     f"明细有、官方已无 {len(gone)} 个")
-        if new_pts[:5]:
-            lines.append("  待补样例:" + "、".join(r["pt"] for r in new_pts[:5]))
+            cur.execute(_META_SQL)
+            meta = {r[0]: {"cat": r[1] or "", "ptg": r[2] or "", "notes": r[3] or ""}
+                    for r in cur.fetchall()}
+        only_spec = [p for p in pt_spec.known_pts() if p not in meta]
+        only_meta = sorted(set(meta) - pt_spec.known_pts())
+        lines.append(f"对账准入明细(walmart_pt_meta {len(meta)} 个):"
+                     f"**spec 有、明细没有 {len(only_spec)} 个**(要补的类目);"
+                     f"明细有、spec 里没有 {len(only_meta)} 个(PT 可能已下线)")
+        for tag, xs in (("待补样例", sorted(only_spec)[:5]), ("已下线样例", only_meta[:5])):
+            if xs:
+                lines.append(f"  {tag}:" + "、".join(xs))
 
-        todo = [r for r in uniq if refresh or r["pt"] not in have]
-        if str(params.get("only_new", "")).strip() == "1":
-            todo = new_pts
-        if limit:
-            todo = todo[:limit]
-        if dry_run:
-            todo = todo[:items.SPEC_BATCH * 3]
-        lines.append(f"本轮要拉 spec 的 PT:{len(todo)} 个"
-                     f"(已有 {len(have)} 个,{'强制重拉' if refresh else '默认跳过已有'})")
-
-        done = 0
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
-        preview: list[list] = []
-        for i in range(0, len(todo), items.SPEC_BATCH):
-            batch = todo[i:i + items.SPEC_BATCH]
-            spec = items.get_spec(store, [r["pt"] for r in batch])
-            for r in batch:
-                sub = ((spec.get("payload") or {}).get(r["pt"])
-                       if isinstance(spec.get("payload"), dict) else None) or spec
-                required = pt_admission.extract_required(sub)
-                adm = pt_admission.judge(r["pt"], required)
-                stat[adm.verdict] += 1
-                done += 1
-                preview.append([r["category"], r["ptg"], r["pt"], "",
-                                adm.verdict, " | ".join(adm.certs),
-                                (adm.reasons[0] if adm.reasons else ""),
-                                len(required), len(required),
-                                " | ".join(sorted(required))])
-                if not dry_run:
-                    _persist(conn, r["pt"], required, adm)
+        rows, changed, no_spec = [], 0, 0
+        for pt in pts:
+            spec = pt_spec.load_pt(pt)
+            if spec is None:
+                no_spec += 1
+                continue
+            req = common_req | pt_admission.extract_required(spec)
+            adm = pt_admission.judge(pt, req, age_values=_age_values(spec))
+            stat[adm.verdict] += 1
+            m = meta.get(pt, {})
+            rows.append([m.get("cat", ""), m.get("ptg", ""), pt, "",
+                         adm.verdict, " | ".join(adm.certs), m.get("notes", ""),
+                         len(common_all | pt_admission.all_fields(spec)), len(req),
+                         " | ".join(sorted(req))])
             if not dry_run:
-                conn.commit()          # 边拉边落:两小时的活,断了不能从头再来
-            logger.info("spec 已拉 %d/%d(%s)", done, len(todo), r["pt"])
+                real = adm.certs if adm.verdict == pt_admission.BLOCK else []
+                with conn.cursor() as cur:
+                    cur.execute(_UPSERT, {
+                        "pt": pt,
+                        "real": json.dumps(real, ensure_ascii=False),
+                        "has_real": adm.verdict == pt_admission.BLOCK,
+                        "soft": json.dumps([c for c in adm.certs if c not in real],
+                                           ensure_ascii=False),
+                        "has_soft": adm.verdict == pt_admission.EVAL,
+                        "fields": json.dumps(sorted(req), ensure_ascii=False)})
+                changed += 1
+        if not dry_run:
+            conn.commit()
 
-    lines.append(f"判定结果:是 {stat[pt_admission.OK]} / "
-                 f"需评估 {stat[pt_admission.EVAL]} / 否 {stat[pt_admission.BLOCK]}")
-    if preview:
-        out = paths.reports_dir() / "pt_admission_preview.csv"
+    lines.append(f"判定 {len(rows)} 个 PT:是 {stat[pt_admission.OK]} / "
+                 f"需评估 {stat[pt_admission.EVAL]} / 否 {stat[pt_admission.BLOCK]}"
+                 + (f";{no_spec} 个索引里有但读不到 spec(跳过)" if no_spec else ""))
+    if rows:
+        out = paths.reports_dir() / "pt_admission_rebuilt.csv"
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Walmart Category", "Walmart PTG", "Walmart Product Type",
                         "准入状态", "中国卖家可做", "必需认证", "特殊备注",
                         "字段总数", "必填字段数", "必填字段清单"])
-            w.writerows(preview)
+            w.writerows(rows)
         lines.append(f"飞书粘贴表(列名同现表):{out}")
-    if dry_run:
-        lines.append("(dry-run:只拉了前 3 批做结构核对,一行未写库)")
+        lines.append("  ⚠「准入状态」列留空 —— 那是沃尔玛侧的准入事实"
+                     "(普通商品/附条件允许/需Walmart审批/禁售),spec 里没有,"
+                     "沿用现表旧值或人工填,别让它被空值覆盖")
+    lines.append("(dry-run:一行未写库)" if dry_run
+                 else f"已写 audit.walmart_pt_spec {changed} 行")
     return "\n".join(lines)

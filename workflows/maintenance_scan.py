@@ -120,8 +120,15 @@ def run(params: dict) -> str:
     if not mi.TITLE_MISMATCH_DELETE:
         # 停闸必须天天见人(本仓口诀:静默关闭 = 没人记得它关着)。
         # 生成侧停了之后,存量 suggested 行会被下面的 withdraw_stale 顺带撤掉
+        # 停闸期口径(所有者 2026-08-20):只关删除,这批行照常改价/改标题/
+        # 改库存。其中"改标题"是知情取舍(抄的可能不是同一个商品的标题),
+        # 条数要摊在人眼闸门上 —— 混在"标题 N"里等于没说
+        n_low = sum(1 for i in intents if i.get("code") == "title_mismatch_sync")
         lines.append("  ⚠ 删除(title_mismatch)已停闸(所有者 2026-08-19 暂停,"
-                     "恢复改 services/maintenance_intents.TITLE_MISMATCH_DELETE)")
+                     "恢复改 services/maintenance_intents.TITLE_MISMATCH_DELETE)"
+                     "——**只停删除**:这批行照常改价/改标题/改库存"
+                     f"(所有者 2026-08-20:停闸不冻结);其中低相似度改标题 "
+                     f"{n_low} 条(原因码 title_mismatch_sync)")
     if preview:
         return "\n".join(lines + [
             f"(preview:未落建议行;本轮将写 {len(intents)} 条)"])

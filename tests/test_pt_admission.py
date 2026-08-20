@@ -279,3 +279,17 @@ def test_sheet_diff_reports_both_directions(tmp_path):
 def test_sheet_diff_missing_file_says_so():
     from workflows.pt_spec_sync import _sheet_diff
     assert "不存在" in "\n".join(_sheet_diff("/nope/nope.csv", {}))
+
+
+def test_explain_reports_both_scopes():
+    """explain 必须同时给「类目 Visible」和「完整商品」两个口径。
+
+    所有者自查:类目 Visible 62/14、官方完整商品 85/19、本地版本 86/19。
+    两个都对,回答的是不同问题 —— 只报一个,人就会拿类目口径去核提交口径
+    (或反过来),然后以为对方错了。我自己就这么来回错了三轮。
+    """
+    import inspect
+    from workflows import pt_spec_sync
+    src = inspect.getsource(pt_spec_sync._explain)
+    assert "类目 Visible" in src and "完整商品" in src
+    assert "Orderable 顶层必填" in src        # 那 5 个要列名字,便于逐个核

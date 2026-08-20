@@ -240,8 +240,18 @@ def _explain(pt: str) -> list[str]:
     ):
         out.append(f"   {name:<28} 必填 {len(req):>4} / 字段总数 {len(props):>4}")
     out.append(f"   其中 allOf 条件必填单独 {len(cond_req)} 个;"
-               f"Orderable 顶层必填 {len(o_req)} / 字段 {len(o_props)} 个,"
                f"Orderable 递归必填 {len(o_rec_req)} / 字段 {len(o_rec_props)} 个")
+    # 两个口径都给全(所有者 2026-08-20 自查:类目 Visible 62/14、
+    # 官方完整商品 85/19、本地版本 86/19 —— 本地比官方多 1 个字段)
+    out.append("   两个口径(都对,回答的是不同问题):")
+    out.append(f"     类目 Visible(这个类目要准备哪些属性;导出列用它)"
+               f"  字段 {len(top_props):>3} / 必填 {len(top_req):>3}")
+    out.append(f"     完整商品(能不能提交,mp_conform.validate 口径)      "
+               f"  字段 {len(top_props | o_props):>3} / 必填 {len(top_req | o_req):>3}")
+    out.append(f"   Orderable 顶层必填 {len(o_req)} 个:{'、'.join(sorted(o_req))}")
+    out.append(f"   Orderable 顶层字段 {len(o_props)} 个(官方当前 23,"
+               f"多出来的那个就是本地 spec 的版本差):")
+    out.append(f"     {'、'.join(sorted(o_props))}")
     # 合规文档类字段住在哪一层,决定它能不能当"要这个认证"的判据
     marks = ["certification_type", "nrtl_information", "has_nrtl_listing_certification",
              "children_product_certificate_document_reference_id",

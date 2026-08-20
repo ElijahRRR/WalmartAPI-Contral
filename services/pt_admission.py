@@ -84,6 +84,9 @@ FIELD_CERTS: list[tuple[str, str, str, str]] = [
 # 而两类的合规主体完全不同(FDA 食品设施注册 vs MoCRA + 美国 Responsible Person)。
 # 实见 `3-in-1 Shampoo` 顶层必填带 ingredients —— 现表把它标成了"FDA 食品设施
 # 注册",其实该是 MoCRA。**结论都是"否"(都要美国主体),只是名字不能写错**。
+# ⚠ `country_of_origin_substantial_transformation` 是 **Orderable 的必填**,
+# 不在 PT spec 里。2026-08-20 我拿"PT spec 里查不到"当过"旧清单有错"的证据,
+# 那是错的 —— 探针只查了 PT 段。跨段字段查不到 ≠ 不存在,得说清查的是哪一段。
 INGREDIENTS_FIELD = "ingredients"
 _FOOD_COSIGNALS = {"food_condition", "foodForm", "nutritionFactsLabel",
                    "ingredientListImage", "petFoodForm", "pet_food_condition"}

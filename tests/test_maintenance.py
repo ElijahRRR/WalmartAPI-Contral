@@ -429,6 +429,24 @@ def test_scan_lists_delete_names_separately(monkeypatch):
                                                        "inventory"]
 
 
+def test_scan_says_the_pause_only_stops_deletion(monkeypatch):
+    """停闸摘要要说清"只停删除",并把低相似度改标题的条数单独摊开。
+
+    所有者 2026-08-20:「删除(title_mismatch)已停闸,那么就要对这批行同时
+    改价改标题改库存」。改的是"可能不是同一个商品"的标题 —— 混在"标题 N"
+    里等于没说,人眼闸门看不到条数就没法判断今天要不要拦。
+    """
+    assert mi.TITLE_MISMATCH_DELETE is False        # 停闸是当前现状
+    intents = [{"store": "T1", "sku": "B0M", "kind": "title", "old": "A",
+                "new": "B", "code": "title_mismatch_sync"},
+               {"store": "T1", "sku": "B0N", "kind": "title", "old": "A",
+                "new": "B", "code": "title_sync"}]
+    ms, _calls = _scan_wire(monkeypatch, intents)
+    out = ms.run({})
+    assert "只停删除" in out and "照常改价/改标题/改库存" in out
+    assert "低相似度改标题 1 条" in out             # 另一条是常规同步,不算
+
+
 def test_scan_writes_no_feed_and_is_not_dangerous(monkeypatch):
     ms, calls = _scan_wire(monkeypatch, [])
     assert ms.DANGEROUS is False
@@ -1105,15 +1123,19 @@ def test_summary_order_does_not_depend_on_which_store_finishes_first():
     assert "per_store" in merge and "for name, _ in todo" in merge
 
 
-def test_title_mismatch_delete_is_paused(monkeypatch):
-    """2026-08-19 所有者:「暂时关闭'删除(title_mismatch)'这个维护」。
+def test_title_mismatch_delete_is_paused_but_rows_stay_maintained(monkeypatch):
+    """2026-08-19 所有者停闸「删除(title_mismatch)」;2026-08-20 所有者定停闸
+    期口径:「删除(title_mismatch)已停闸,那么就要对这批行同时改价改标题改库存」。
 
-    停闸只停删除这一个出口:not_found 的删除照发;classify 的判据本身不动
-    (price/title provider 的"低相似度不改价不改标题"防呆靠它,必须活着)。
-    恢复 = TITLE_MISMATCH_DELETE 改回 True,行为回到停闸前(下面一段钉住)。
+    闸只关**删除**这一个出口:not_found 的删除照发;被压下来的低相似度行
+    不是被冻结,而是与其余在架行同口径地改价/改标题/改库存。头一版顺手冻结
+    了它们(三类维护也一并停),那是最坏的一种状态 —— 两百多条在架商品挂着
+    错价错标题过夜,日志只说一句"压制 N 条"。
+    恢复 = TITLE_MISMATCH_DELETE 改回 True,整段行为回到停闸前(下面钉住)。
     """
     assert mi.TITLE_MISMATCH_DELETE is False        # 停闸是当前现状
-    rows = [_row(sku="B0MISMATCH", name="Walmart Title AAA",
+    rows = [_row(sku="B0MISMATCH", name="Walmart Title AAA", wm_price=20.0,
+                 amz_price=20.0, avail_qty=10, stock_count=7,
                  slow={"title": "Totally Different ZZZ"}),
             _row(sku="B0GONE2", outcome="not_found",
                  name="X", slow={"title": "X"})]
@@ -1122,13 +1144,29 @@ def test_title_mismatch_delete_is_paused(monkeypatch):
     got = {i["sku"]: i["code"] for i in out}
     assert "B0MISMATCH" not in got                  # 停闸:不出删除建议
     assert got.get("B0GONE2") == "not_found"        # 别的删除原因不受影响
-    # classify 判据本身仍在(防呆消费方靠它)
-    assert mi.classify(title_similarity=0.42)[:2] == ("delete", "title_mismatch")
+
+    # 停闸 = 先别删,**不是**先别管:三类维护照常产出(所有者 2026-08-20)
+    assert {i["sku"]: i["new"]
+            for i in mi.price_intents(_Conn(), _MULTS, [])} \
+        .get("B0MISMATCH") == 40.0                          # 落地价 20×200%
+    assert {i["sku"]: i["new"]
+            for i in mi.inventory_intents(_Conn(), [])} \
+        .get("B0MISMATCH") == 7                             # 跟 amz 库存
+    titled = {i["sku"]: i for i in mi.title_intents(_Conn(), [])}
+    assert titled["B0MISMATCH"]["new"] == "Totally Different ZZZ"
+    # 原因码与常规同步分开:飞书「原因」列要数得出停闸期照改了多少行
+    assert titled["B0MISMATCH"]["code"] == "title_mismatch_sync"
 
     monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)
     out2 = mi.delete_intents(_Conn(rows=[]))
     assert {i["sku"]: i["code"] for i in out2}.get("B0MISMATCH") \
         == "title_mismatch"                          # 恢复开关即回到旧行为
+    # 恢复后这批行重新交给删除链:不改价、不改标题(停闸前的防呆)
+    assert mi.classify(title_similarity=0.42)[:2] == ("delete", "title_mismatch")
+    assert [i for i in mi.price_intents(_Conn(), _MULTS, [])
+            if i["sku"] == "B0MISMATCH"] == []
+    assert [i for i in mi.title_intents(_Conn(), [])
+            if i["sku"] == "B0MISMATCH"] == []
 
 
 # ── 双基准标题相似度(2026-08-19 所有者定稿:亚马逊标题拆两段之后)──────────
@@ -1166,7 +1204,13 @@ def test_title_sim_dual_takes_the_better_basis():
 def test_short_title_row_survives_delete_and_retitle(monkeypatch):
     """捞回重上的短标题行:①删除判据(即使停闸恢复后)不再命中
     title_mismatch;②改标题 provider 不把它改回长标题(改回去 = 亲手撤销
-    捞回修复,下一轮又被内容审查拒一遍)。"""
+    捞回修复,下一轮又被内容审查拒一遍);③库存/改价 provider 也认双基准。
+
+    ③ 是 2026-08-20 补的:库存链此前拿**单基准**相似度问 classify,短标题行
+    在它眼里 ~0.6 = 该删,于是不产库存意图;而删除链用双基准不删它 ——
+    这批行既不清零也不删除,悄悄脱管而两边都不报错。四个 provider 问同一个
+    判据,就必须喂同样的数。
+    """
     monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)      # 按停闸恢复后验
     wm = mi.processed_title({"title": _LONG, "brand": None})
     rows = [_row(sku="B0SHORT", name=wm, slow=_SLOW_SPLIT)]
@@ -1175,3 +1219,7 @@ def test_short_title_row_survives_delete_and_retitle(monkeypatch):
     assert [d for d in dels if d["sku"] == "B0SHORT"] == []     # ① 不删
     titles = mi.title_intents(_Conn(rows=[]))
     assert [t for t in titles if t["sku"] == "B0SHORT"] == []   # ② 不改回长
+    invs = mi.inventory_intents(_Conn(rows=[]), [])
+    assert [i["new"] for i in invs if i["sku"] == "B0SHORT"] == [7]  # ③ 照常跟库存
+    prices = mi.price_intents(_Conn(rows=[]), _MULTS, [])
+    assert [p["sku"] for p in prices] == ["B0SHORT"]                 # ③ 照常改价

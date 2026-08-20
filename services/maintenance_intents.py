@@ -188,9 +188,21 @@ ORDER BY w.store, w.sku
 TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标题
 # 2026-08-19 所有者:「暂时关闭'删除(title_mismatch)'这个维护」。08-17/18
 # 两轮该原因的删除建议超两千条、占删除九成,而删除不可逆——先停闸观察
-# (采集标题质量/占位符干扰的嫌疑未排除)。⚠ 只停"删除"这一个出口:
-# 低相似度行照旧**不改价、不改标题**(price/title provider 的防呆用同一
-# 判据,保持生效)——这批行是被冻结,不是被放开维护。恢复改回 True。
+# (采集标题质量/占位符干扰的嫌疑未排除)。恢复改回 True。
+#
+# ⚠ **2026-08-20 所有者修正停闸期口径**:「删除(title_mismatch)已停闸,
+# 那么就要对这批行同时改价改标题改库存」。停闸头一版顺手把这批行**冻结**了
+# (删除不发,价格/标题/库存也一律不动),那是最坏的一种状态:删除出口关着
+# 的时候冻结等于**没人管** —— 亚马逊涨价了不跟、缺货了不清零、标题错着不改,
+# 两百多条在架商品挂着错价错标题过夜,而日志只说一句"压制 N 条"。
+# 停闸的本意是"先别删",不是"先别管"。所以闸**只关删除这一个出口**:
+#   · 删除                → 不产出(本开关关着时)
+#   · 改价/改库存/改标题  → **照常产出**(与其余在架行同口径)
+# 判据本身一个字没动:开关改回 True 立刻回到"低相似度 → 删除、且不改价不改
+# 标题"的停闸前行为(两侧都有用例钉住)。
+# ⚠ 停闸期改标题 = 把亚马逊标题抄到一个"可能不是同一个商品"的在架行上,
+# 这是所有者知情后的取舍(标题改错可再改回,删除不可逆),但**必须见人**:
+# title_intents 单独计数并 warning,不许它混进"标题 N 条"里无声发生。
 TITLE_MISMATCH_DELETE = False
 
 def processed_title(slow) -> str:
@@ -259,6 +271,17 @@ def title_sim_dual(wm_name, slow):
 _ACTION_RANK = {"delete": 0, "inventory": 1, "title": 2}
 
 
+def title_mismatched(title_similarity) -> bool:
+    """输入:相似度(可为 None)→ 输出:是否算「标题不匹配」。
+
+    **唯一定义处**:classify 用它决定删不删,delete_intents 用它数停闸压了
+    多少条,title_intents 用它决定(停闸恢复后)跳不跳过。三处各写一遍
+    `x is not None and x < FLOOR` 的下场是改阈值时漏改一处,而且不报错。
+    None 不算不匹配:算不出来 ≠ 不像(有一边没标题是采集问题,不是证据)。
+    """
+    return title_similarity is not None and title_similarity < TITLE_SIM_FLOOR
+
+
 def classify(*, outcome=None, stock_status=None, stock_state=None,
              title_similarity=None, over_lead=False, lead_note="") -> tuple:
     """输入:一行在线商品的处置信号 → 输出:(动作, 原因码, 原因文案);无动作返回 (None,'','')。
@@ -270,8 +293,12 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
       stock_status == 'No Featured Offer'        → 库存 0(无 Buy Box)
       stock_state == 'out_of_stock'              → 库存 0(普通缺货)
       配送超本店上限                              → 库存 0
-      标题相似度 < 0.70                           → 删除
+      标题相似度 < 0.70                           → 删除(**停闸中:见下**)
       标题相似度 ≥ 0.70 且标题有差异              → 改标题
+
+    ⚠ `TITLE_MISMATCH_DELETE=False`(当前现状)时,"标题相似度 < 0.70 → 删除"
+    这一条**整条跳过**:不返回删除,继续往下判库存,该行照常改价/改标题/改
+    库存(所有者 2026-08-20:停闸是"先别删",不是"先别管")。
 
     ⚠ 顺序即优先级,**删除压过一切**:一个 SKU 一轮只出一个动作,否则执行件
     会先花配额去改一个马上要删的商品(批次 E 踩过同款坑:同一 SKU 既建议反补
@@ -282,9 +309,13 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     """
     if str(outcome or "").strip().lower() == "not_found":
         return ("delete", "not_found", "亚马逊已下架(采集 not_found)")
-    if title_similarity is not None and title_similarity < TITLE_SIM_FLOOR:
-        return ("delete", "title_mismatch",
-                f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
+    if title_mismatched(title_similarity):
+        if TITLE_MISMATCH_DELETE:
+            return ("delete", "title_mismatch",
+                    f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
+        # 停闸中(所有者 2026-08-20):**不判删除,也不早退**——继续往下判无货
+        # 三档与货期,这批行照常清零/改价/改标题。早退回 (None,"","") 是另一
+        # 种冻结:缺货了也不清零,等于删除停闸顺手把库存链也关了。
     # 无货三档的判据是**审核链共用的**(order_audit.stock_block 是唯一出处):
     # 维护链据此把库存写 0,审核链据此报「无货」而不是「采集缺字段」。
     # 各写一份的下场是同一个商品两条链说两种话,而且两边都不报错。
@@ -454,6 +485,9 @@ def price_intents(conn, multipliers: dict[str, dict],
         fulfillment, shipping = r["fulfillment"], r["shipping"]
         # 删除类压过改价:一个 SKU 一轮只出一个动作,否则先花配额改一个
         # 马上要删的商品(pick_one 的同款理由)。两条删除判据都要判到。
+        # ⚠ title_mismatch 停闸期间 classify 不再判它删 —— 这批行于是照常
+        # 改价(所有者 2026-08-20:停闸不是冻结)。这里**不要**另加相似度
+        # 判断:那就成了"删除关了、改价还自己关着"的第二把暗闸。
         if classify(outcome=r["outcome"],
                     title_similarity=title_sim_dual(
                         r["product_name"], r["slow"]))[0] == "delete":
@@ -532,9 +566,12 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
             stock_state=r["stock_state"], over_lead=over,
             # ⚠ 相似度也要给:不给的话"标题不匹配 → 删除"这条在本 provider 看不见,
             # 于是该删的行照样产一条库存意图,执行件先花配额清零再花配额删
-            # (2026-08-16 演练实见 B0MISMATCH 10 → 7)
-            title_similarity=order_audit.title_similarity(
-                r["product_name"], processed_title(r["slow"])),
+            # (2026-08-16 演练实见 B0MISMATCH 10 → 7)。
+            # ⚠ 用 title_sim_dual,与删除/改价/改标题**同一个算法**(2026-08-20
+            # 对齐):单基准把"内容拒捞回重上的短标题行"算成 ~0.6,停闸恢复后
+            # 本 provider 会判它该删而删除链(双基准)不删 —— 那批行既不清零
+            # 也不删,悄悄脱管。四个 provider 问同一个判据,就得喂同样的数。
+            title_similarity=title_sim_dual(r["product_name"], r["slow"]),
             lead_note=f"配送 {r['delivery_days']} 天 > 本店上限 {cap} 天")
         if act == "delete":
             continue        # 删除类归 delete_intents,这里不抢(一 SKU 一动作)
@@ -557,9 +594,14 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
 
     旧防线原样保留:占位符跳过;**productType / UPC / 标题三缺一跳过**
     (缺任一沃尔玛必退回)。标题相同则不产出。
+
+    相似度 < 70% 的行**跟着删除开关走**(所有者 2026-08-20):
+      · `TITLE_MISMATCH_DELETE=True`  → 跳过(交给删除链,停闸前的老行为)
+      · `TITLE_MISMATCH_DELETE=False` → 照改并计数告警(删除交不出去了,
+        再跳过就是把这批行冻结在错标题上)。
     """
     out = []
-    skipped_incomplete = skipped_mismatch = 0
+    skipped_incomplete = skipped_mismatch = paused_mismatch = 0
     for r in _rows(conn, stockzero_stores):
         store, sku = r["store"], r["sku"]
         product_name, product_type, upc = r["product_name"], r["product_type"], r["upc"]
@@ -571,8 +613,12 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         # 70% 闸(所有者定稿 2026-08-16):相似度过低说明**采到的可能不是同一个
         # 商品**,那时把亚马逊标题抄过去是把错的抄进线上 —— 交给删除链处置。
         # 相似度算不出来(有一边没标题)不算不匹配,照旧走改标题。
+        # ⚠ 这道闸的前提是"交得出去" —— 删除链停闸时它交不出去,跳过就等于
+        # 把这批行冻结在错标题上(所有者 2026-08-20:停闸就要照常改)。所以
+        # **闸随删除开关走**:删除开着才跳过,删除关着照改、单独计数见人。
         sim = title_sim_dual(product_name, slow)
-        if sim is not None and sim < TITLE_SIM_FLOOR:
+        low = title_mismatched(sim)
+        if low and TITLE_MISMATCH_DELETE:
             skipped_mismatch += 1
             continue
         new_title = processed_title(slow)    # 与上架同款处理(去品牌/截 199)
@@ -585,18 +631,35 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         if not product_type or not upc:
             skipped_incomplete += 1     # 三缺一跳过(旧防线)
             continue
+        if sim is None:
+            why = "同步亚马逊标题(相似度算不出)"
+        elif low:
+            # 计数落在**真产出**这一步,不落在闸那一步:后面还有"标题没变/
+            # 三缺一"两道过滤,在闸上数会把没提交的也报成"改了"。
+            paused_mismatch += 1
+            why = f"相似度 {sim:.0%}(删除停闸,照常同步标题)"
+        else:
+            why = f"相似度 {sim:.0%},同步亚马逊标题"
         out.append({"store": store, "sku": sku, "kind": "title",
                     "old": product_name, "new": new_title,
                     "product_type": product_type, "product_id": upc,
-                    "code": "title_sync",
-                    "reason": f"相似度 {sim:.0%},同步亚马逊标题" if sim is not None
-                              else "同步亚马逊标题(相似度算不出)"})
+                    # 原因码分组(飞书「原因」列):停闸期照改的低相似度行与
+                    # 常规同步长得一模一样,不分码就数不出这个口径影响了多少行
+                    "code": "title_mismatch_sync" if low else "title_sync",
+                    "reason": why})
     if skipped_incomplete:
         logger.info("标题:%d 行缺 productType/UPC 跳过(三缺一防线)",
                     skipped_incomplete)
     if skipped_mismatch:
         logger.info("标题:%d 行相似度 < %.0f%% 不改标题(交给删除链)",
                     skipped_mismatch, TITLE_SIM_FLOOR * 100)
+    if paused_mismatch:
+        # 抄的是"可能不是同一个商品"的标题,必须 warning 级别见人:
+        # 这是删除停闸期的临时口径,恢复删除后这批行会回到"跳过"
+        logger.warning("标题:%d 行相似度 < %.0f%% **仍改标题** —— 删除"
+                       "(title_mismatch)停闸期口径(所有者 2026-08-20:"
+                       "停闸不冻结),原因码 title_mismatch_sync 可单独查",
+                       paused_mismatch, TITLE_SIM_FLOOR * 100)
     return _cap(out, "title")
 
 
@@ -663,14 +726,16 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         # 所有者定稿 2026-08-16 新增两条删除判据(judgement 在 classify):
         #   outcome == 'not_found'  → ASIN 已从亚马逊下架
         #   标题相似度 < 70%         → 采到的可能不是同一个商品,抄标题会抄错
-        act, code, why = classify(
-            outcome=r["outcome"],
-            title_similarity=title_sim_dual(r["product_name"], slow))
+        sim = title_sim_dual(r["product_name"], slow)
+        act, code, why = classify(outcome=r["outcome"], title_similarity=sim)
         if act == "delete":
-            if code == "title_mismatch" and not TITLE_MISMATCH_DELETE:
-                paused_mismatch += 1        # 停闸计数,压制必须见人
-                continue
-            _take(store, sku, code, why)
+            _take(store, sku, code, why)   # 停闸由 classify 拦,这里只管收
+        elif title_mismatched(sim) and (store, sku) not in seen:
+            # 停闸压制条数**必须见人**(静默关掉的闸没人记得它关着)。
+            # 报的是"因停闸少删了多少行",所以两类要排除:not_found 同时命中的
+            # (上面已按 not_found 删了)、以及已被 variant_offset 收走的
+            # ——它们照删不误,算进来会把"少删了多少"报大。
+            paused_mismatch += 1
 
     with conn.cursor() as cur:
         cur.execute(_SQL_LONG_OOS, {"days": int(oos_days)})
@@ -686,8 +751,8 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
 
     if paused_mismatch:
         logger.warning("删除(title_mismatch)已停闸(所有者 2026-08-19),"
-                       "本轮压制 %d 条 —— 这批行同时不改价不改标题(冻结)",
-                       paused_mismatch)
+                       "本轮压制 %d 条 —— 这批行照常改价/改标题/改库存"
+                       "(所有者 2026-08-20:停闸不冻结)", paused_mismatch)
     over = {s: n - int(caps.get(s, DELETE_PER_STORE))
             for s, n in per_store.items()
             if n > int(caps.get(s, DELETE_PER_STORE))}

@@ -41,46 +41,14 @@ MATCH_NODE = "node_subtree"
 MATCH_TOP = "top_name"
 MATCH_PATH = "path_exact"
 
-# 建库种子(**只用于 db_init / 导入工作流,判定不读**)。
-# 顶级四条来自原 audit_phase0.FORBIDDEN_AMAZON_TOPS;电子游戏与五棵子树是
-# 所有者 2026-08-19/20 的批复。服饰鞋靴珠宝**已从顶级整拦撤下**——新口径是
-# 「成人与儿童的衣服/裤/鞋不做,配饰箱包帽子珠宝可做,婴儿全部不做」,
-# 按分支判,不能再整顶级一刀切。
-SEED_RULES: list[dict] = [
-    {"match_type": MATCH_TOP, "match_value": "Books", "category_zh": "图书",
-     "reason": "Books 禁售: 版权/内容合规风险, 搬运模式不适合",
-     "walmart_policy": "Intellectual Property"},
-    {"match_type": MATCH_TOP, "match_value": "Kindle Store", "category_zh": "Kindle 电子书",
-     "reason": "Kindle Store 禁售: 电子书版权", "walmart_policy": "Digital Goods"},
-    {"match_type": MATCH_TOP, "match_value": "Automotive", "category_zh": "汽车用品",
-     "reason": "汽配禁售: DOT/SAE 认证 + 安全件责任 + CARB/delete kit",
-     "walmart_policy": "Auto & Motor Vehicles"},
-    {"match_type": MATCH_TOP, "match_value": "Grocery & Gourmet Food", "category_zh": "食品杂货",
-     "reason": "食品禁售: FDA 食品设施注册 + 标签合规(所有者 2026-08-19 定稿整顶级拦)",
-     "walmart_policy": "Food Products"},
-    {"match_type": MATCH_TOP, "match_value": "Video Games", "category_zh": "电子游戏",
-     "reason": "电子游戏禁售(所有者 2026-08-20 定稿整顶级拦)",
-     "walmart_policy": "Intellectual Property"},
-    # ── 五棵子树整块不做(所有者 2026-08-20;两条遥控合用同一个父节点)──
-    {"match_type": MATCH_NODE, "browse_node_id": "3736081",
-     "match_value": "Home & Kitchen > Wall Décor", "category_zh": "家居厨房 > 墙面装饰画",
-     "reason": "墙面装饰画整棵不做(名单原文写 Wall Art,官方树叫 Wall Décor)",
-     "walmart_policy": "Intellectual Property"},
-    {"match_type": MATCH_NODE, "browse_node_id": "3013597011",
-     "match_value": "Industrial & Scientific > Lab & Scientific Products > Lab Chemicals",
-     "category_zh": "工业与科学 > 实验室化学品",
-     "reason": "实验室化学品整棵不做(危化品合规)", "walmart_policy": "Hazardous Materials"},
-    {"match_type": MATCH_NODE, "browse_node_id": "166220011",
-     "match_value": "Toys & Games > Games", "category_zh": "玩具游戏 > 桌游与配件",
-     "reason": "桌游与配件整棵不做(名单原文写 Games & Accessories,官方树叫 Games)",
-     "walmart_policy": "Intellectual Property"},
-    {"match_type": MATCH_NODE, "browse_node_id": "6925830011",
-     "match_value": "Toys & Games > Remote- & App-Controlled Toys",
-     "category_zh": "遥控/App 控制车模与配件",
-     "reason": "遥控车模与配件整棵不做(覆盖「遥控车模配件」与「遥控车模」两枝)",
-     "walmart_policy": "Electronics & RF"},
-]
-
+# ⚠ 这里**曾经**放着一份 SEED_RULES(5 个顶级 + 4 棵子树根),用于在所有者
+# 逐条标注出来之前先把库灌起来。2026-08-20 已删除,理由是所有者定稿的两条:
+#   ①「一切以我回传给你的那份文档为标准,不用考虑旧文档之类的」——种子里的
+#     Video Games 顶级正是所有者随后撤回的那条(标准类目树里没有这个类目);
+#   ②「代码负责拦截我不要的类目」,而类目本身住在库里 —— 代码再留一份平行的
+#     类目清单,就是"改了这边没改那边"的经典事故源,而且它还会**静默生效**。
+# 现在规则只有一个出处:飞书「黑名单亚马逊类目」表 → risk_sync 整表镜像 → 库。
+# 离线应急走 category_blacklist_import -p csv=<导出的规则表>。
 
 @dataclass(frozen=True)
 class CatRules:
@@ -257,5 +225,5 @@ def make_rule(category: str, *, browse_node_id: str = "", category_zh: str = "",
     return rule, fallback
 
 
-__all__ = ["CatRules", "CatHit", "SEED_RULES", "MATCH_NODE", "MATCH_TOP",
+__all__ = ["CatRules", "CatHit", "MATCH_NODE", "MATCH_TOP",
            "MATCH_PATH", "MATCH_BY_ZH", "load", "check", "chain_ids", "make_rule"]

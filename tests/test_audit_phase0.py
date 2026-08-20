@@ -160,13 +160,8 @@ def test_category_rules_live_in_db_not_in_code():
                             phase0_cats=frozenset(), cat_rules=cb.CatRules(),
                             brand_blacklist={})
     assert audit_phase0.check(_p(amazon_category_path="Books"), empty).blocked is False
-    # 种子只用于建库,四个老顶级 + 电子游戏 + 五棵子树都在里面
-    seed_tops = {r["match_value"] for r in cb.SEED_RULES
-                 if r["match_type"] == cb.MATCH_TOP}
-    assert {"Books", "Kindle Store", "Automotive", "Grocery & Gourmet Food",
-            "Video Games"} == seed_tops
-    # 服饰**已从顶级整拦撤下**(新口径按分支判:衣裤鞋不做、配饰箱包可做)
-    assert "Clothing, Shoes & Jewelry" not in seed_tops
+    # 判定件也不许自带种子清单(2026-08-20 所有者:一切以回传的标注文档为准)
+    assert not hasattr(cb, "SEED_RULES")
 
 
 # ── B3 商标符号 ──────────────────────────────────────────────────────────────

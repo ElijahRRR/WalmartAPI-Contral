@@ -4,6 +4,7 @@
 父级不覆盖子级、名字一漂就全失效。
 """
 
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -124,18 +125,19 @@ def test_phase0_reports_subtree_hit_with_evidence():
     assert h.detail["walmart_policy"] == "Intellectual Property"
 
 
-def test_seed_rules_are_wellformed():
-    """种子行必须能被 load 的装配逻辑吃下:node 行必须带 node_id,
-    top 行必须带 match_value(否则建库后那条规则静默不生效)。"""
-    for r in cb.SEED_RULES:
-        assert r["match_type"] in (cb.MATCH_NODE, cb.MATCH_TOP, cb.MATCH_PATH)
-        assert r.get("match_value")
-        if r["match_type"] == cb.MATCH_NODE:
-            assert r.get("browse_node_id", "").isdigit(), r
-        assert r.get("reason")
+def test_no_category_constants_left_in_code():
+    """代码里不许再有第二份类目清单(所有者定稿 2026-08-20)。
 
+    种子清单曾经是"标注出来之前先把库灌起来"的脚手架,但它里面的
+    Video Games 顶级正是所有者随后撤回的那条(标准类目树里没有这个类目)。
+    代码留一份平行清单 = "改了这边没改那边",而且**静默生效**。
+    现在只有一个出处:飞书表 → risk_sync 整表镜像 → 库。
+    """
+    assert not hasattr(cb, "SEED_RULES")
+    src = pathlib.Path("services/category_blacklist.py").read_text(encoding="utf-8")
+    for name in ("Kindle Store", "Grocery & Gourmet Food", "3013597011"):
+        assert src.count(name) <= 1, f"{name} 像是又一份写死的类目清单"
 
-# ── 顶级名两种写法必须归到同一个键(2026-08-20 实见的静默漏拦)──────────
 
 def test_top_name_matches_both_spellings():
     """同一个顶级在真实数据里有两种写法,规则只写一种也得两种都拦。

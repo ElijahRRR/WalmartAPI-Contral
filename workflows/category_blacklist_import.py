@@ -1,9 +1,8 @@
 """category_blacklist_import — 类目黑名单规则录入(种子 / 离线 CSV)。
 
 用法:
-  python cli.py category_blacklist_import -p seed=1            # 灌内置种子
-  python cli.py category_blacklist_import -p csv=<路径>         # 灌清洗名单
-  python cli.py category_blacklist_import -p csv=<路径> -p replace=1   # 先清同源旧行
+  python cli.py category_blacklist_import -p csv=<路径>              # 灌规则表
+  python cli.py category_blacklist_import -p csv=<路径> -p replace=1  # 先清同源旧行
 
 ⚠ **2026-08-20 起飞书「黑名单亚马逊类目」表是这张库表的唯一维护面**
 (所有者定稿:「我把 233 条整个粘贴进飞书表格,你让黑名单中心按实际的读取」)。
@@ -50,18 +49,6 @@ ON CONFLICT (category_norm) DO UPDATE SET
 """
 
 
-def _seed_rows() -> list[dict]:
-    from services.audit_phase0 import normalize_amazon_category as norm
-    out = []
-    for r in cb.SEED_RULES:
-        mv = r["match_value"]
-        out.append({"norm": norm(mv), "raw": mv, "mt": r["match_type"],
-                    "mv": mv, "nid": r.get("browse_node_id") or None,
-                    "zh": r.get("category_zh") or "", "reason": r.get("reason") or "",
-                    "policy": r.get("walmart_policy") or "", "source": "seed"})
-    return out
-
-
 def _csv_rows(path: str) -> tuple[list[dict], dict]:
     from services.audit_phase0 import normalize_amazon_category as norm
     out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0, "跳过-匹配方式": 0,
@@ -97,7 +84,7 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
 
 
 def run(params: dict) -> str:
-    """输入:params(seed/csv/replace/execute)→ 输出:写入摘要。"""
+    """输入:params(csv/replace/execute)→ 输出:写入摘要。"""
     # ⚠ DANGEROUS=False ⇒ cli 恒给 execute=True(缺省即真跑),`--dry-run`
     # 只走 dry_run 这一路;只看 execute 的话本工作流的 --dry-run 完全失效
     execute = bool(params.get("execute")) and not params.get("dry_run")
@@ -105,9 +92,6 @@ def run(params: dict) -> str:
     rows: list[dict] = []
     lines: list[str] = []
 
-    if str(params.get("seed", "")).strip() == "1":
-        rows += _seed_rows()
-        lines.append(f"内置种子:{len(rows)} 条(顶级 + 子树根)")
     path = str(params.get("csv", "")).strip()
     if path:
         got, n = _csv_rows(path)
@@ -121,7 +105,7 @@ def run(params: dict) -> str:
             lines.append(f"  ⚠ 有 {n['无匹配方式列-按ID推断']} 行没有「匹配方式」列,"
                          f"退回按 ID 推断子树 —— 回落匹配来的 ID 会整棵误拦,核一遍")
     if not rows:
-        return "没给数据源:用 -p seed=1 或 -p csv=<路径>(两者可同时给)"
+        return "没给数据源:用 -p csv=<规则表路径>"
 
     # 同一 category_norm 只留最后一条(CSV 里父子同名极少,但要有确定行为)
     dedup = {r["norm"]: r for r in rows if r["norm"]}
@@ -142,7 +126,7 @@ def run(params: dict) -> str:
         if replace:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM catalog.amazon_cat_blacklist "
-                            "WHERE source = ANY(%s)", ([_SOURCE, "seed"],))
+                            "WHERE source = ANY(%s)", ([_SOURCE],))
                 n_del = cur.rowcount or 0
             lines.append(f"重录模式:先清掉同源旧行 {n_del} 条"
                          f"(飞书镜像的 source='feishu' 行**不动**)")

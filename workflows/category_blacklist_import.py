@@ -13,10 +13,19 @@
 
 CSV 列(与清洗表同构,多余列忽略):
   类目               归一化路径或官方路径(写进 category_norm/category_raw)
-  browse_node_id     有值 ⇒ 该行按**子树**拦(推荐);空 ⇒ 退回路径等值
+  browse_node_id     子树规则的判据
   中文翻译           category_zh
   建议               只有 `留-*` / `增-*` 开头的行才录入;`删-*` 一律跳过
   原因               reason
+  匹配方式           **`子树` / `路径等值` / 其它值一律跳过**(见下)
+
+⚠ **「有 ID 就当子树根」是错的**,别再退回那个口径(2026-08-20 做净增覆盖
+对账时实见):名单里 582 条的 browse_node_id 是**回落匹配**来的 —— 祖先前缀、
+存疑候选、或与官方路径深度对不上。旧的路径等值下它们只拦自己一行;当子树根
+用就整棵拦,`Electronics->Camera&Photo->Accessories->DarkroomSupplies->Chemicals`
+的 ID 回落成了 `Electronics > Camera & Photo`(深度 2),升成子树 = 整个相机
+摄影大类全没了,**而且不报错**。所以子树与否由**清洗表的「匹配方式」列**说了算,
+本工作流只执行不推断;没有这一列的老 CSV 才退回「有 ID ⇒ 子树」,且摘要报数。
 
 ⚠ 顶级类目(Books/Automotive/…)在亚马逊没有 browse node id,只能按名字拦,
    走 `-p seed=1` 灌种子(services.category_blacklist.SEED_RULES)。
@@ -63,8 +72,8 @@ def _seed_rows() -> list[dict]:
 
 def _csv_rows(path: str) -> tuple[list[dict], dict]:
     from services.audit_phase0 import normalize_amazon_category as norm
-    out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0,
-                  "子树": 0, "路径等值": 0}
+    out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0, "跳过-匹配方式": 0,
+                  "子树": 0, "路径等值": 0, "无匹配方式列-按ID推断": 0}
     with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             n["读入"] += 1
@@ -79,8 +88,20 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
             if not cat:
                 continue
             nid = (row.get("browse_node_id") or "").strip() or None
-            mt = cb.MATCH_NODE if nid else cb.MATCH_PATH
-            n["子树" if nid else "路径等值"] += 1
+            how = (row.get("匹配方式") or "").strip()
+            if not how:                       # 老 CSV 没这一列:退回按 ID 推断
+                mt = cb.MATCH_NODE if nid else cb.MATCH_PATH
+                n["无匹配方式列-按ID推断"] += 1
+            elif how == "子树" and nid:
+                mt = cb.MATCH_NODE
+            elif how == "路径等值":
+                mt, nid = cb.MATCH_PATH, None
+            else:
+                # 「不录入」「(被覆盖,不单独录入)」「子树但没 ID」都落这里:
+                # 净增覆盖那些行的建议也以「增」开头,只靠建议列会把它们录进去
+                n["跳过-匹配方式"] += 1
+                continue
+            n["子树" if mt == cb.MATCH_NODE else "路径等值"] += 1
             # match_value 一律存**人看的路径**(排查时 audit_why 直接显示它);
             # 子树规则真正的判据是 browse_node_id 列,不是这一列
             out.append({"norm": norm(cat), "raw": (row.get("官方完整路径") or cat).strip(),
@@ -109,7 +130,11 @@ def run(params: dict) -> str:
         rows += got
         lines.append(f"CSV {path}:读入 {n['读入']} 行 → 录入 {len(got)} "
                      f"(子树 {n['子树']} / 路径等值 {n['路径等值']});"
-                     f"跳过:建议为删 {n['跳过-删']}、无建议 {n['跳过-无建议']}")
+                     f"跳过:建议为删 {n['跳过-删']}、无建议 {n['跳过-无建议']}、"
+                     f"匹配方式非录入 {n['跳过-匹配方式']}")
+        if n["无匹配方式列-按ID推断"]:
+            lines.append(f"  ⚠ 有 {n['无匹配方式列-按ID推断']} 行没有「匹配方式」列,"
+                         f"退回按 ID 推断子树 —— 回落匹配来的 ID 会整棵误拦,核一遍")
     if not rows:
         return "没给数据源:用 -p seed=1 或 -p csv=<路径>(两者可同时给)"
 

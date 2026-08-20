@@ -318,7 +318,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `risk_sync` | 调 | 飞书四表 → PG 镜像(类目表 / 黑名单品牌总表 / 黑名单卖家 / 黑名单亚马逊类目)。⚠ 类目表重灌**只洗 `source='feishu'` 的行**,清洗导入与种子不受影响 |
 | `blacklist_push` | 调 | PG 自产黑名单 → 飞书两张收集表(**整表重写**,带骤缩护栏) |
 | `asin_blacklist_import` | 危 一 | 黑名单 ASIN 批量导入 |
-| `category_blacklist_import` | | 类目黑名单录入/重录:`-p seed=1` 灌内置种子(顶级 + 子树根)、`-p csv=<路径>` 灌清洗名单、`-p replace=1` 先清同源旧行 |
+| `category_blacklist_import` | | 类目黑名单录入/重录:`-p seed=1` 灌内置种子(顶级 + 子树根)、`-p csv=<路径>` 灌清洗名单、`-p replace=1` 先清同源旧行。⚠ 子树与否由清洗表的**「匹配方式」列**说了算,工作流不按 ID 推断 —— 名单里 582 条的 browse_node_id 是回落匹配来的,当子树根用会整棵误拦 |
 
 ⚠ **两条时间线**:否决闸在 `problem_scan` 写完 PG 那一刻就生效(上架与审核读 PG,
 从不读飞书表);飞书表格是投影,`problem_scan` 收尾顺手推一次,`blacklist_push` 兜底。

@@ -1,6 +1,21 @@
 """在线商品处置判据回归(所有者定稿 2026-08-16 走进生产,逐条对应他给的伪代码)。"""
 
+import pytest
+
+from services import maintenance_intents as mi
 from services.maintenance_intents import TITLE_SIM_FLOOR, classify, pick_one
+
+
+@pytest.fixture
+def delete_on(monkeypatch):
+    """把 `删除(title_mismatch)` 开关拨回 True。
+
+    2026-08-19 起该出口停闸、2026-08-20 起停闸期不再冻结这批行(照常改价/
+    改标题/改库存),于是"低相似度 → 删除"这条判据在**当前默认下不生效**。
+    钉判据本身的用例都要显式拨开开关 —— 否则它们只是在钉停闸这个临时状态,
+    开关恢复那天没人知道判据是不是还对。
+    """
+    monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)
 
 
 def test_not_found_is_delete():
@@ -25,15 +40,15 @@ def test_three_zero_stock_paths_are_distinguishable():
     assert d[2] == "配送 30 天 > 上限 8 天"
 
 
-def test_title_similarity_splits_delete_from_retitle():
-    """所有者定稿:< 70% 删除,≥ 70% 改标题。"""
+def test_title_similarity_splits_delete_from_retitle(delete_on):
+    """所有者定稿:< 70% 删除,≥ 70% 改标题(判据本身,按开关打开钉)。"""
     assert classify(title_similarity=0.42)[:2] == ("delete", "title_mismatch")
     assert "42%" in classify(title_similarity=0.42)[2]     # 原因带上真实数值
     assert classify(title_similarity=TITLE_SIM_FLOOR)[0] is None   # 边界:不删
     assert classify(title_similarity=0.85)[0] is None      # 交给 title_intents
 
 
-def test_unknown_similarity_is_not_a_mismatch():
+def test_unknown_similarity_is_not_a_mismatch(delete_on):
     """⚠ 相似度 None(有一边根本没标题)**不算不匹配**:算不出来 ≠ 不像。
 
     走到这一步说明标题缺失,那是采集问题;拿它当删除依据 = 采集抖动一次
@@ -43,7 +58,7 @@ def test_unknown_similarity_is_not_a_mismatch():
     assert classify(title_similarity=0.0)[0] == "delete"   # 0.0 是明确的不像
 
 
-def test_delete_beats_everything():
+def test_delete_beats_everything(delete_on):
     """一个 SKU 一轮只出一个动作,删除压过一切 —— 否则执行件会先花配额
     去改/清一个马上要删的商品(批次 E 踩过同款坑)。"""
     assert classify(outcome="not_found", stock_state="out_of_stock",
@@ -76,6 +91,25 @@ def _row(**kw):
             "stock_status": "In Stock", "stock_state": "in_stock"}
     base.update(kw)
     return base
+
+
+class _Conn:
+    """delete_intents 要真跑两条 SQL(variant_offset / long_oos),给个空桩。"""
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=None):
+        pass
+
+    def fetchall(self):
+        return []
 
 
 def test_similarity_compares_processed_titles_not_raw():
@@ -111,7 +145,7 @@ def test_inventory_provider_carries_the_reason_code(monkeypatch):
     assert out["B0SLOW"][0] == "lead_days" and out["B0SLOW"][1] == 0
 
 
-def test_inventory_provider_yields_to_delete(monkeypatch):
+def test_inventory_provider_yields_to_delete(monkeypatch, delete_on):
     """一个 SKU 一轮只出一个动作:该删的不在库存链里再出一条。
 
     ⚠ **两条删除判据都要覆盖**。2026-08-16 演练实见:只判了 outcome,
@@ -128,8 +162,8 @@ def test_inventory_provider_yields_to_delete(monkeypatch):
         assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}}, []) == [], kw
 
 
-def test_title_provider_gates_at_70_percent(monkeypatch):
-    """< 70% 不改标题(交给删除链);≥ 70% 照改。"""
+def test_title_provider_gates_at_70_percent(monkeypatch, delete_on):
+    """< 70% 不改标题(**交得出去的时候**:删除开着);≥ 70% 照改。"""
     from services import maintenance_intents as mi
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
         _row(sku="B0OK", product_name="Steel Cup 500ml"),        # 82% → 改
@@ -138,3 +172,44 @@ def test_title_provider_gates_at_70_percent(monkeypatch):
     out = mi.title_intents(None, [])
     assert [i["sku"] for i in out] == ["B0OK"]
     assert out[0]["code"] == "title_sync" and "%" in out[0]["reason"]
+
+
+# ── 删除(title_mismatch)停闸期的口径(所有者 2026-08-20)────────────────────
+
+def test_paused_mismatch_falls_through_to_stock_judgement():
+    """停闸时 classify **不判删除,也不早退** —— 继续往下判无货三档。
+
+    早退回 (None,"","") 是另一种冻结:缺货了也不清零,等于删除停闸顺手
+    把库存链也一起关了,而日志一个字都不会说。
+    """
+    assert mi.TITLE_MISMATCH_DELETE is False            # 停闸是当前现状
+    assert classify(title_similarity=0.3)[0] is None    # 不删
+    assert classify(title_similarity=0.3,
+                    stock_state="out_of_stock")[:2] == ("inventory",
+                                                        "out_of_stock")
+    assert classify(title_similarity=0.3, over_lead=True)[1] == "lead_days"
+    # not_found 不受停闸影响:它是另一条删除判据
+    assert classify(outcome="not_found", title_similarity=0.3)[1] == "not_found"
+
+
+def test_paused_mismatch_rows_are_maintained_not_frozen(monkeypatch):
+    """所有者 2026-08-20:「删除(title_mismatch)已停闸,那么就要对这批行
+    同时改价改标题改库存」。
+
+    停闸头一版把这批行冻结了(删除不发、价格标题库存也不动)—— 两百多条
+    在架商品挂着错价错标题过夜,而日志只说"压制 N 条"。停闸的本意是
+    "先别删",不是"先别管"。
+    """
+    monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
+    row = _row(sku="B0MISMATCH", product_name="完全不相干的商品名",
+               wm_price=20.0, amz_price=20.0, avail_qty=10, stock_count=7)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [row])
+
+    assert mi.delete_intents(_Conn()) == []                  # ① 不删
+    assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}},
+                            [])[0]["new"] == 40.0            # ② 照常改价
+    assert mi.inventory_intents(None, [])[0]["new"] == 7     # ③ 照常改库存
+    t = mi.title_intents(None, [])[0]                        # ④ 照常改标题
+    assert t["new"] == "Steel Cup" and t["product_id"] == "012345678905"
+    # 原因码分得清:飞书「原因」列要能单独数出停闸期照改了多少行
+    assert t["code"] == "title_mismatch_sync" and "停闸" in t["reason"]

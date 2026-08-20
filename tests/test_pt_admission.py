@@ -201,3 +201,15 @@ def test_boilerplate_only_covers_signal_fields():
     """只对判定表里的字段算覆盖率 —— 其余字段本来就不参与判定。"""
     _, _, detail = pa.find_boilerplate({"productName": 6951}, {}, 6951)
     assert not any(f == "productName" for f, _, _, _ in detail)
+
+
+def test_evidence_kind_separates_empirical_from_inferred():
+    """现表判否的行不是同一种东西:60 多个是**上架回测实证**(真被拒过 N 次),
+    245 个是沃尔玛政策,366 个只是从准入状态推的。所有者定「允许翻」,所以不拦,
+    但复核表要能一列筛出来 —— 翻实证那批的代价和翻推断那批不是一回事。"""
+    from workflows.pt_spec_sync import _evidence_kind
+    assert _evidence_kind("否（上架记录回测，BIZ-CN触发26个SKU）") == "实证:上架被拒过"
+    assert _evidence_kind("否 (Walmart 禁售)") == "沃尔玛政策禁售"
+    assert _evidence_kind("否（Walmart 禁售）") == "沃尔玛政策禁售"
+    assert _evidence_kind("否 (中国卖家进不去)") == "推断:准入状态需审批"
+    assert _evidence_kind("是") == "" and _evidence_kind("需评估 (要合规投入)") == ""

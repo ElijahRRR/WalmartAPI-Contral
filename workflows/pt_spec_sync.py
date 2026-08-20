@@ -63,7 +63,7 @@ ON CONFLICT (walmart_product_type) DO UPDATE SET
 """
 
 _META_SQL = ("SELECT walmart_product_type, walmart_category, walmart_ptg, notes, "
-             "zh_can_do FROM audit.walmart_pt_meta")
+             "zh_can_do, access_state FROM audit.walmart_pt_meta")
 
 
 def _old_bucket(zh_can_do: str) -> str:
@@ -117,6 +117,25 @@ def _age_values(spec: dict) -> list:
 
     walk(spec)
     return out
+
+
+def _evidence_kind(zh_can_do: str) -> str:
+    """输入:现表「中国卖家可做」→ 输出:现值背后是哪一类证据(筛选用)。
+
+    现表判否的行不是同一种东西:有的是从准入状态推的,有的是**沃尔玛政策**,
+    还有 60 多个是**上架回测实证**(真上架被拒过 N 次)。所有者定「允许翻」,
+    所以不拦,但复核表要能一列筛出来 —— 翻实证那批的代价和翻推断那批不是一回事。
+    """
+    z = (zh_can_do or "").strip()
+    if not z.startswith("否"):
+        return ""
+    if "上架记录回测" in z or "BIZ-CN" in z:
+        return "实证:上架被拒过"
+    if "禁售" in z:
+        return "沃尔玛政策禁售"
+    if "进不去" in z:
+        return "推断:准入状态需审批"
+    return "否(未注明依据)"
 
 
 def _explain(pt: str) -> list[str]:
@@ -220,7 +239,8 @@ def run(params: dict) -> str:
         with conn.cursor() as cur:
             cur.execute(_META_SQL)
             meta = {r[0]: {"cat": r[1] or "", "ptg": r[2] or "", "notes": r[3] or "",
-                           "zh": r[4] or ""} for r in cur.fetchall()}
+                           "zh": r[4] or "", "access": r[5] or ""}
+                    for r in cur.fetchall()}
         only_spec = [p for p in pt_spec.known_pts() if p not in meta]
         only_meta = sorted(set(meta) - pt_spec.known_pts())
         lines.append(f"对账准入明细(walmart_pt_meta {len(meta)} 个):"
@@ -284,12 +304,17 @@ def run(params: dict) -> str:
             if old == pt_admission.BLOCK and adm.verdict != pt_admission.BLOCK:
                 unlock_detail[(m.get("zh", "") or "(空)")[:28]] += 1
             stat[adm.verdict] += 1
-            rows.append([m.get("cat", ""), m.get("ptg", ""), pt, "",
+            # ⚠「准入状态」**原样带出现表的值**:那是沃尔玛侧的准入事实
+            # (普通商品/附条件允许/需Walmart审批/禁售),spec 里没有这个信息。
+            # 留空就粘贴 = 把现表 6942 行的准入状态一次洗掉,而且不报错。
+            rows.append([m.get("cat", ""), m.get("ptg", ""), pt,
+                         m.get("access", ""),
                          adm.verdict, " | ".join(adm.certs), m.get("notes", ""),
                          len(common_all | pt_admission.all_fields(spec)), len(req),
                          " | ".join(sorted(req))])
             review.append([pt, m.get("cat", ""), m.get("ptg", ""),
-                           m.get("zh", ""), adm.verdict, move,
+                           m.get("access", ""), m.get("zh", ""), adm.verdict, move,
+                           _evidence_kind(m.get("zh", "")),
                            " | ".join(adm.certs),
                            " ;; ".join(adm.reasons), ""])
             if pt in want:
@@ -338,8 +363,8 @@ def run(params: dict) -> str:
         with open(rv, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["Walmart Product Type", "Walmart Category", "Walmart PTG",
-                        "现中国卖家可做", "新判定", "变化", "必需认证",
-                        "判据(逐条溯源)", "人工"])
+                        "现准入状态", "现中国卖家可做", "新判定", "变化",
+                        "现值证据类型", "必需认证", "判据(逐条溯源)", "人工"])
             w.writerows(review)
         lines.append(f"差异复核表(带判据溯源,不用于粘贴):{rv}")
         lines.append("  ⚠「准入状态」列留空 —— 那是沃尔玛侧的准入事实"

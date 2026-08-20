@@ -112,9 +112,14 @@ class L1Info:
     walmart_product_type: str | None = None       # None = 批次 B 解不出 PT
     pt_confidence: str | None = None              # 高/中/低
     pt_source: str | None = None                  # 'walmart_confirmed' / 'map_direct' / 'skipped'
-    walmart_category: str | None = None           # 给 L2 R2 做前缀匹配用
-    excluded_category_reason: str | None = None   # L1 硬拦(批次 B 恒 None)
+    walmart_category: str | None = None           # 给 L2 R3/L3 提示词用
     hits: list[RuleHit] = field(default_factory=list)
+    # ⚠ 2026-08-20 删除 `excluded_category_reason`(所有者定稿 A1)。它原本装的是
+    # seed yaml 的「3C/服饰/汽配/带电禁售」理由,与 R1 类目白名单同一件事重复了
+    # 三遍(L1 excluded / R0 / R2)。白名单补齐后只留 R1,这个字段连同它的
+    # 三个消费方(R0/R1/R2 的"L1 已死不重复"闸)一起下线。
+    # "已被上游判死"现在统一按 `任一 hit.penalty < 0` 判(audit_rules._blocked
+    # 与 audit_l2._blocked_upstream 同口径),不再靠一个专用字段传话。
 
 
 @dataclass
@@ -123,16 +128,24 @@ class L2Result:
 
     score_final: int
     hits: list[RuleHit] = field(default_factory=list)
+    # 「判不了」信号(2026-08-20 新增):R1 遇到 PT 未知 / PT 不在 walmart_pt_meta
+    # 时写在这里。**分数体系表达不了"判不了"** —— 不扣分就是 100 分放行,
+    # 扣 100 分又成了"证据确凿地拒",两个都是撒谎;所以另开一路。
+    pending_reason: str | None = None
 
     @property
     def verdict(self) -> Verdict:
-        """输入:自身 score_final → 输出:'reject'(低于阈值)或 'pass'。
+        """输入:自身 score_final / pending_reason → 输出:reject / pending / pass。
 
-        逐字迁自 pipelines/models.py:100-103,只把 settings 查询换成模块常量
-        SCORE_THRESHOLD(=60)。因软规则 penalty 全为 0,净语义 = 任一硬规则
+        优先级 **reject > pending > pass**:拒是有证据的确定答案,
+        pending 只是"这一轮判不了",有确定答案时不该被降级成待定。
+        阈值逐字迁自 pipelines/models.py:100-103(settings 换成模块常量
+        SCORE_THRESHOLD=60)。软规则 penalty 全为 0,净语义 = 任一硬规则
         (-100)命中即 reject。
         """
-        return "reject" if self.score_final < SCORE_THRESHOLD else "pass"
+        if self.score_final < SCORE_THRESHOLD:
+            return "reject"
+        return "pending" if self.pending_reason else "pass"
 
 
 @dataclass
@@ -141,7 +154,8 @@ class AuditOutcome:
 
     asin: str
     verdict: Verdict
-    score_final: int | None            # verdict='pending'(PT 解不出)时为 None
+    score_final: int | None            # L1 解不出 PT 的 pending 为 None;
+                                       # L2 判不了的 pending 仍带分(证据已收全)
     stage_stopped_at: Stage | None     # None 表示所有阶段都过了
     l1: L1Info
     phase0: Phase0Result | None = None

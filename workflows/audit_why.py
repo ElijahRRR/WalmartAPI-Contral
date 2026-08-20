@@ -147,8 +147,9 @@ _RULE_SOURCE = {
                                     "audit.walmart_pt_spec.has_real_cert",
     "cat_requires_cert_soft":       "audit.walmart_pt_meta.requirements(软词)",
     "cat_requires_cert_small_part": "audit.walmart_pt_spec + NRTL 词表",
-    "zh_seller_mega_cat_forbidden": "代码常量:中国卖家硬禁 8 大类",
-    "forbidden_mega_cat":           "refdata 禁售大类 yaml",
+    # 判不了(不是判过了):这两条 penalty=0 但整条结论转 pending 待人工
+    "cat_gate_pt_unknown":          "L2 R1:PT 没定下来,白名单查不了",
+    "cat_gate_pt_not_in_meta":      "L2 R1:PT 不在 audit.walmart_pt_meta",
     # ⚠ 判据只是 amazon_category_path 的**第一段**(顶级类目名)。清单
     # 2026-08-20 起住在库里(match_type='top_name'),改类目改表不改代码;
     # 看到这条先核 detail.full_path,再核表里那行顶级名对不对

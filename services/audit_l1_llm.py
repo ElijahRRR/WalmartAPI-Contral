@@ -9,8 +9,7 @@
   candidates(conn, product)            → 七路候选(exact/prefix/leaf/title_keyword/
                                          title_literal/ancestor_N/pt_dict)
   rerank(product, cands, pt_dict)      → L1Info(判出来了) 或 None(解不出 → 调用方转 pending)
-  check_seed_excluded(product, pt)     → seed yaml 禁售品类 reason 或 None(L1 三级共用)
-  check_publication_ban(pt, reason)    → 出版物类 PT 硬禁 RuleHit 或 None(L1 三级共用)
+  check_publication_ban(pt)            → 出版物类 PT 硬禁 RuleHit 或 None(L1 三级共用)
 
 失败语义(合同全局节 / 计划 10.2:单链无自动降级):LLM 抛异常、坏 JSON、
 LLM 输出 unknown、字典外 PT 且候选全不可用、无候选——一律返回 None 由调用方
@@ -23,15 +22,10 @@ LLM 输出 unknown、字典外 PT 且候选全不可用、无候选——一律�
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from collections import Counter
-from functools import lru_cache
 from typing import Any
 
-import yaml
-
-from registry import paths
 from services.audit_models import L1Info, ProductInfo, RuleHit
 
 logger = logging.getLogger("services.audit_l1_llm")
@@ -55,14 +49,16 @@ STATS: Counter = Counter()
 
 _STATS_KEYS = (
     "llm_called", "llm_failed", "bad_json", "dict_fallback",
-    "unknown", "no_candidate", "seed_excluded", "llm_excluded",
+    "unknown", "no_candidate",
     "publication_forbidden", "conf_low",
     # 两阶段开放判定(七路候选全空时;所有者定稿 2026-08-14)
     "open_stage1_called", "open_stage1_failed", "open_stage1_empty",
     "open_stage2_candidates", "open_stage2_scored",
     # 候选都不合适时的二次机会(所有者定稿 2026-08-14:"真的都不合适,那也不行")
     "unknown_retry_called", "unknown_retry_saved",
-    "seed_excluded_direct",   # 接线层:①②直出级 seed 命中(与 rerank 级分开)
+    # ⚠ 2026-08-20 删掉 seed_excluded / seed_excluded_direct / llm_excluded 三个键:
+    # seed yaml 的「3C/服饰/汽配/带电禁售」整条链已下线(所有者定稿 A1),
+    # 类目能不能做只由 L2 R1 的白名单说了算。
 )
 
 
@@ -86,68 +82,6 @@ reset_stats()
 
 
 # =============================================================
-# seed yaml 禁售品类(3C / 服饰 / 汽配 / 带电)—— L1 三级共用
-# =============================================================
-
-
-@lru_cache(maxsize=1)
-def _load_excluded_rules() -> tuple[dict[str, Any], ...]:
-    """输入:无 → 输出:seed yaml 的 excluded_categories 条目元组(顺序即优先级)。
-
-    逐字迁自 l1_category.py:48-54(文件不存在返回空,静默);新仓路径经
-    registry.paths.audit_seed_file。audit_l2.py:105 明写"excluded_categories
-    整节是 L1 消费的,这里从不读"——本函数是该节的唯一消费方。
-    """
-    seed = paths.audit_seed_file("forbidden_categories_zh_seller.yaml")
-    if not seed.exists():
-        return ()
-    with seed.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return tuple(data.get("excluded_categories", []) or [])
-
-
-_CAT_SEG_RE = re.compile(r"->|>|/")
-
-
-def check_seed_excluded(product: ProductInfo, walmart_pt: str = "") -> str | None:
-    """输入:产品(+可选已知 PT)→ 输出:seed yaml 命中的禁售 reason 或 None。
-
-    迁自 l1_category.py:128-144:全小写、**首命中即返回**(yaml 条目顺序即
-    优先级)、scope 缺省 'walmart_pt'。
-
-    ⚠ scope=amazon_category 是**段级等值**,不是子串(2026-08-19 所有者实证
-    修正):旧的子串匹配拿 "Clothing" 扫整条路径,把
-    `Home & Kitchen > Storage & Organization > Clothing & Closet Storage`
-    下的**衣柜收纳置物架**整族误伤成"服饰禁售"——命中的是路径里的一个词,
-    不是产品是什么。段级等值下 "Clothing" 只命中真叫 Clothing 的那一段
-    (如 `… > Men > Clothing > Shirts`),"Clothing & Closet Storage" 是
-    另一个段名,不再中枪。walmart_pt / title_keyword 维持子串(PT 词表
-    如 "Medical Device" 靠子串覆盖 "Medical Device Cleaners" 一族)。
-    """
-    cat_segs = {seg.strip().lower()
-                for seg in _CAT_SEG_RE.split(product.amazon_category_path or "")
-                if seg.strip()}
-    haystacks = {
-        "walmart_pt": (walmart_pt or "").lower(),
-        "title_keyword": (product.title or "").lower(),
-    }
-    for rule in _load_excluded_rules():
-        m = (rule.get("match") or "").lower()
-        scope = rule.get("scope") or "walmart_pt"
-        reason = rule.get("reason") or f"seed-{scope}"
-        if not m:
-            continue
-        if scope == "amazon_category":
-            if m in cat_segs:
-                return reason
-            continue
-        hay = haystacks.get(scope, "")
-        if m in hay:
-            return reason
-    return None
-
-
-# =============================================================
 # 出版物类 PT 硬禁(旧仓 _apply_spec_override 第 3 段)—— L1 三级共用
 # =============================================================
 
@@ -166,21 +100,18 @@ PUBLICATION_HARD_FORBID = frozenset({
 PUBLICATION_BAN_REASON = "出版物类 PT 搬运无法合规 (数据验证 E 知产占比 ≥96%)"
 
 
-def check_publication_ban(pt: str | None,
-                          existing_reason: str | None = None) -> RuleHit | None:
-    """输入:PT(+已有的 excluded 理由)→ 输出:出版物硬禁 RuleHit 或 None。
+def check_publication_ban(pt: str | None) -> RuleHit | None:
+    """输入:PT → 输出:出版物硬禁 RuleHit 或 None。
 
-    逐字迁自 l1_category.py:735-754。条件与旧仓一致:PT 在硬禁集合内**且**
-    还没有别的 excluded 理由(已有理由时旧仓不叠加,故本函数返回 None)。
-    命中时调用方应同时把 `hit.detail["reason"]` 写进 L1Info.excluded_category_reason。
+    逐字迁自 l1_category.py:735-754,条件与旧仓一致:PT 在硬禁集合内即命中。
+    ⚠ 2026-08-20 去掉 `existing_reason` 形参:它原本是"已有 excluded 理由就不叠加"
+    的闸,而 excluded 那条链已整体下线(所有者定稿 A1),形参永远是 None。
+    调用方按需自行去重(resolve_pt 每个产品只调一次)。
 
-    合同 L1-6:旧仓该段对**全部三级**生效(实证/映射直出也过),批次 B 的
-    resolve_pt 漏接——本函数供三级共用;重复调用天然幂等(第二次 existing_reason
-    已非空 → None)。unknown/(unknown) 由 existing_reason 之外的调用方过滤:
-    旧仓 _apply_spec_override 对 unknown PT 直接原样返回(:675-677),
-    而 unknown 永不在硬禁集合内,故此处无需另判。
+    合同 L1-6:旧仓该段对**全部三级**生效(实证/映射直出也过)。unknown/(unknown)
+    无需另判——它永不在硬禁集合内。
     """
-    if pt not in PUBLICATION_HARD_FORBID or existing_reason:
+    if pt not in PUBLICATION_HARD_FORBID:
         return None
     bump("publication_forbidden")
     return RuleHit(
@@ -603,9 +534,9 @@ L1_SYSTEM_PROMPT = """你是沃尔玛 Marketplace 类目判定专家。判定 Am
 
 ## (4) 职责边界 (重要!)
 
-**L1 只负责类目判定**, 不再判定 "需证书/中国卖家禁售", 这两件由下游 L2 打分引擎基于沃尔玛官方 PT spec 和映射表字段自动完成。
-
-**但**: 若产品属于 3C / 服饰 / 汽配 / 带电产品 (严格定义见下方禁售品类), 需要在 `excluded_category_reason` 直接标明, 由 L1 阶段提前拦截。
+**L1 只负责类目判定**, 不再判定 "需证书/中国卖家禁售/类目能不能做"。
+这些全部由下游 L2 基于沃尔玛官方 PT spec 与类目准入白名单自动完成 —— 你只需要把 PT 选对。
+**不要**因为觉得某个类目"我们做不了"就改选别的 PT 或拒绝作答: 选错 PT 会让准入判定查错行, 比选中一个禁售 PT 更糟。
 
 ## (5) 配件 vs 整机 / 被动 vs 主动 (关键微差别)
 
@@ -623,33 +554,12 @@ L1_SYSTEM_PROMPT = """你是沃尔玛 Marketplace 类目判定专家。判定 Am
 
 - Amazon 路径与产品实际用途冲突时, **以 title 实际语义为准** (当 Amazon 明显归类错误), 同时把 pt_source 标成 "llm_direct"
 
-# 禁售品类 (严格定义, 不要扩展)
-
-- **3C 电子**: 手机 / 电脑 / 平板 / 耳机 / 智能手表 / 电视 / 相机 / 游戏机
-- **服饰**: 衣服 / 鞋子 / 内衣 / 袜子 / 手套 / 帽子 / 围巾
-- **汽配**: 汽车零件 / 汽车改装件 / 车用工具 (不含通用五金)
-- **带电产品** (严格定义): 主体功能靠电池/充电/通电, 如:
-    * 充电宝、移动电源、充电器、电源适配器
-    * 单卖的电池 (锂电池、纽扣电池)
-    * 电动工具 (主体是电的)
-  **不算**带电产品 (可上架):
-    * 含 Bluetooth/Wifi 模块但主功能非电的产品 (切割机 / 厨房秤 / 玩具等)
-    * 插电家电 (除非本身是 3C 禁售类)
-    * LED 装饰灯、LED 蜡烛
-    * 内置小纽扣电池的非电子装饰品
-    * **Replacement Part / 替换件 / 单卖零件** - 即使原主机是电器, 单卖的替换配件
-      (如 Power Switch Replacement Part / 电源开关替换件) 自身不带电不算带电产品
-
-**宁可不标带电产品禁售, 也不要把 "Power Switch Replacement Part" 或 "Bluetooth 切割机" 误判成带电产品。**
-只有整机或主体是电池/电源的产品才算。
-
 # 严格 JSON 输出, 不要 markdown / 不要解释
 
 {
   "walmart_product_type": "...",
   "pt_confidence": "高" | "中" | "低",
-  "pt_source": "map_verified" | "llm_direct" | "excluded",
-  "excluded_category_reason": "3C禁售" | "服饰禁售" | "汽配禁售" | "带电产品禁售" | null,
+  "pt_source": "map_verified" | "llm_direct",
   "reasoning": "30 字内中文依据"
 }
 """
@@ -817,12 +727,6 @@ def rerank_ex(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
     置信度**零阈值**(合同 L1-4,旧仓同):pt_confidence='低' 也照样采纳,
     只把低置信计数亮进 STATS 供 run 摘要观测。
     """
-    # seed yaml 在 LLM **之前**跑且不带 PT —— 已知缺陷照迁(spec §3.1,合同 L1-1:
-    # 不补跑)。后果:LLM 选出来的 PT 永远不过 seed 的 walmart_pt scope 9 条规则。
-    seed_reason = check_seed_excluded(product)
-    if seed_reason:
-        bump("seed_excluded")
-
     if not cands:
         # 合同 L1-5:旧仓照调 LLM 且几乎必然产 unknown(自由判的 PT 过不了字典校验),
         # 终点同为 pending,省一次调用。
@@ -846,24 +750,30 @@ def rerank_ex(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
         logger.warning("L1 rerank 回复非法 asin=%s: %r → pending", product.asin, raw)
         return None, "bad_json"
 
-    got = _coerce(product, raw, seed_reason, cands, pt_dict)
+    got = _coerce(product, raw, cands, pt_dict)
     return got, ("ok" if got is not None else "unknown")
 
 
-def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
+def _coerce(product: ProductInfo, raw: dict[str, Any],
             cands: list[dict[str, Any]], pt_dict) -> L1Info | None:
     """输入:LLM 回复 JSON + 候选 → 输出:L1Info 或 None(解不出)。
 
     逐字迁自 l1_category.py:922-1008(_coerce_llm),失败分流按新系统修正:
-    unknown 不再原样进 L2(旧仓 unknown 会让 L2 的 R0/R1/R2/R3a 集体失明、
-    分数保持 100 → 假 pass,spec §7 F6),改返回 None。
+    unknown 不再原样进 L2(旧仓 unknown 会让 L2 硬闸集体失明、分数保持 100
+    → 假 pass,spec §7 F6),改返回 None。
+
+    ⚠ 2026-08-20 删掉 `excluded_category_reason` 分支(所有者定稿 A1):
+    LLM 被要求给「3C禁售/服饰禁售/汽配禁售/带电产品禁售」四选一的标签,
+    命中即 -100 硬拒 —— 那是**让模型凭标题猜类目禁令**,和 R1 白名单
+    (按 PT 查沃尔玛准入事实)讲同一件事,而且猜的那一份还压在事实前面。
+    现在类目能不能做只有 R1 一处判据,模型只负责选 PT。
     """
     pt = str(raw.get("walmart_product_type") or "unknown").strip() or "unknown"
     conf = str(raw.get("pt_confidence") or "低").strip()
     if conf not in {"高", "中", "低"}:
         conf = "低"
     source = str(raw.get("pt_source") or "llm_direct").strip()
-    if source not in {"map_verified", "llm_direct", "excluded"}:
+    if source not in {"map_verified", "llm_direct"}:
         source = "llm_direct"
 
     # F3/F4:字典外 PT 回落到候选里第一个真实可用 PT(逐字 :941-961)
@@ -885,33 +795,6 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
                            product.asin, fallback_from, pt)
         else:
             pt, conf, source = "unknown", "低", "none"
-
-    excluded_reason = raw.get("excluded_category_reason")
-    if excluded_reason in (None, "null", "None", "", "none"):
-        excluded_reason = None
-    llm_excluded = bool(excluded_reason)
-    # seed 仅补位:LLM 的 excluded 优先(逐字 :967-969)
-    if not excluded_reason and seed_reason:
-        excluded_reason = seed_reason
-
-    if excluded_reason:
-        # excluded 命中即 -100 硬拒,与 pt 是否 unknown 无关:旧仓此路走 reject,
-        # 且 -100 已让 L2 直接判死,不存在 F6 的"硬规则失明→假 pass"风险,
-        # 故不并入 unknown→pending(reject 比 pending 更贴近旧仓结论)。
-        if llm_excluded:
-            bump("llm_excluded")
-        l1 = L1Info(walmart_product_type=pt, pt_confidence=conf, pt_source=source,
-                    excluded_category_reason=excluded_reason)
-        l1.hits.append(RuleHit(
-            stage="L1", rule_code="excluded_category", penalty=-100,
-            detail={
-                "reason": excluded_reason,
-                "pt": pt,
-                "llm_reasoning": raw.get("reasoning"),
-                "from_seed_yaml": bool(seed_reason) and not raw.get("excluded_category_reason"),
-                "fallback_from_dict_miss": fallback_from,
-            }))
-        return l1
 
     if pt == "unknown":
         # F4/F5:LLM 主动输出 unknown,或字典外 PT 且候选全不可用 → pending。
@@ -943,10 +826,9 @@ def _coerce(product: ProductInfo, raw: dict[str, Any], seed_reason: str | None,
         bump("conf_low")
 
     # 出版物硬禁(旧仓 _apply_spec_override 第 3 段,第三级出口必经)。
-    # 与接线层对①②级的调用天然幂等:此处已写 reason 后再调返回 None。
-    ban = check_publication_ban(pt, l1.excluded_category_reason)
+    # 接线层只对①②直出级调它,第三级走这里,两条路互斥,不会重复挂 hit。
+    ban = check_publication_ban(pt)
     if ban is not None:
-        l1.excluded_category_reason = ban.detail["reason"]
         l1.hits.append(ban)
     return l1
 
@@ -960,6 +842,5 @@ __all__ = [
     "candidates",
     "rerank",
     "build_user_prompt",
-    "check_seed_excluded",
     "check_publication_ban",
 ]

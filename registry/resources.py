@@ -560,7 +560,21 @@ PT_TEMPLATE_SHEET = Spreadsheet(
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-18.1"
+AUDIT_RULES_VERSION = "c.2026-08-20.1"
+# c.2026-08-20.1  **判定面大改**(所有者定稿:先补白名单、再删黑名单,无真空期):
+#                 ① 删 L2 R0(代码里 8 个 walmart_category 硬禁)、L2 R2
+#                    (yaml 18 条禁售大类)、L1 excluded(yaml 13 条 3C/服饰/
+#                    汽配/带电)——三份清单和 R1 类目准入白名单讲同一件事。
+#                    类目能不能做**从此只有 R1 一处判据**。
+#                 ② R1 两条静默放行改判 pending(PT 未知 / PT 不在 walmart_pt_meta):
+#                    此前"查不到 = 没问题"直接 100 分放行,删掉黑名单后再没人兜底。
+#                 ③ 修三条"看着在跑其实没跑":R3 裸子串(`ul` 命中 `regulation`)、
+#                    R4 中文紧邻不算词边界(中文品牌一条都拦不住)、R7 只命中软词
+#                    时整条证据丢掉;另修 _infer_walmart_policy 的 medical 分支
+#                    与 L3 提示词两处(R7/R8 不进 prompt、cert 取了不存在的键)。
+#                 影响面:曾被 R0/R2/excluded 拦下、而白名单放行的产品会翻成 pass;
+#                 曾因 R3 裸子串误判"要 UL 认证"的会翻案。**全量重审**:
+#                   python cli.py product_audit -p force_rerun=c.2026-08-18.1
 # c.2026-08-18.1  理由映射:黑名单中心三码(lark_blacklist_asin/seller/
 #                 amazon_cat)→ 政策 None(内部决策,不挂 [政策:General-Use
 #                 Products] 兜底尾巴)。判定本身零变化(仍 reject),只影响

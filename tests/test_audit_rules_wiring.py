@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from registry import resources
-from services import audit_rules, audit_store
+from services import audit_l2, audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
@@ -21,7 +21,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 phase0_cats=frozenset(), brand_blacklist={},
-                pt_meta={}, pt_spec={}, ac_automaton=None, mega=[],
+                pt_meta={}, pt_spec={}, ac_automaton=None,
                 nrtl_small=[], nrtl_whole=[], nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
@@ -65,6 +65,26 @@ def test_audit_one_pending_when_pt_unresolved():
     ctx = _ctx(pt_meta=META)
     out = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx)
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_audit_one_l2_pending_when_pt_not_in_meta():
+    """2026-08-20 P0:PT 解出来了但准入明细里没有这一行 ⇒ L2 R1 判不了。
+
+    此前这条路是**静默 100 分放行**;白名单是唯一的类目判据(R0/R2 已删),
+    没人兜底,必须停在 L2 转待人工。注意 stage 是 L2 不是 L1(PT 解出来了),
+    分数照样带出来(证据已收全),这两点与"L1 解不出 PT"的 pending 不同。
+    """
+    # 基准:PT 在明细里 → 正常放行
+    ctx = _ctx(pt_meta=dict(META), walmart_confirmed={"B0P": "GoodPT"})
+    assert audit_rules.audit_one(
+        ProductInfo(asin="B0P", title="w"), ctx).verdict == "pass"
+
+    # 产品行自带 PT(不经 resolve_pt 的 pt_meta 闸),而明细里没有这一行
+    ctx2 = _ctx(pt_meta=dict(META))
+    l1 = L1Info(walmart_product_type="GhostPT", pt_source="audit_cached")
+    l2 = audit_l2.evaluate(ProductInfo(asin="B0Q", title="w"), l1, ctx2)
+    assert l2.verdict == "pending" and l2.score_final == 100
+    assert [h.rule_code for h in l2.hits] == ["cat_gate_pt_not_in_meta"]
 
 
 def test_audit_one_phase0_blocked_stub():

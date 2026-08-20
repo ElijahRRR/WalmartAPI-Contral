@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1720 个单元测试**。
+- **1712 个单元测试**。
 
 ---
 
@@ -260,10 +260,17 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 ### 6.3 审核域
 
-判"这个产品能不能上"。分层:Phase0 精准拦截 → L1 类目 → L2 八条硬规则 →
+判"这个产品能不能上"。分层:L0 精准拦截 → L1 类目 → L2 规则 →
 L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
+**逐层怎么判、每条规则做什么、判不了怎么办,见 `docs/audit_pipeline.md`。**
 
-⚠ **类目闸判据全在库里**(`catalog.amazon_cat_blacklist`,2026-08-20 起),
+⚠ **一个类目能不能做,只有一处判据**(2026-08-20 定稿):
+沃尔玛侧看 `audit.walmart_pt_meta` 的类目准入白名单(L2 R1),亚马逊侧看
+`catalog.amazon_cat_blacklist`(L0)。原先并存的三份沃尔玛类目黑名单
+(L2 R0 代码常量 8 大类 / L2 R2 yaml 18 条禁售大类 / L1 excluded yaml 13 条)
+已全部删除 —— 同一件事三份清单,改一处漏两处而且不报错。
+
+⚠ **亚马逊类目闸判据全在库里**(`catalog.amazon_cat_blacklist`,2026-08-20 起),
 代码里一个类目常量都没有。首选按 `browse_node_id` **拦整棵子树** —— 名单写
 「拼图」,`拼图 > 3-D 拼图` 跟着被拦,类目改名也不失效;顶级类目(亚马逊顶级
 无 node id)按名字拦;归一化完整路径等值是飞书镜像的历史行,**父级不覆盖子级**,
@@ -536,7 +543,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 ### 测试
 
 ```bash
-python -m pytest -q          # 1720 passed
+python -m pytest -q          # 1712 passed
 ```
 
 测试钉的不是覆盖率,是**"错了也不报错"的那些接缝**:参数掉了那一段白跑、
@@ -559,6 +566,7 @@ python -m pytest -q          # 1720 passed
 | `docs/category_mapping.md` | 类目映射链九条工作流的唯一文档 |
 | `docs/allocation_plan.md` | 店铺占用与产品分配子计划 |
 | `docs/listing_plan.md` | 上架子计划:闸门链、载荷构造、变体 |
+| `docs/audit_pipeline.md` | **审核链逐层详细步骤**(L0→L4 每条规则做什么、判据在哪张表、判不了怎么办) |
 | `docs/audit_migration_plan.md` | 审核链设计与分批 |
 | `docs/audit_batch_c_decisions.md` | 审核 LLM 层裁决与 L1 候选面实证结论 |
 | `docs/feed_closure_audit.md` | feed 闭环审计:六提交点 × 三台账 × 五反哺器 |

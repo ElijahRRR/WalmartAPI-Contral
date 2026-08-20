@@ -500,11 +500,16 @@ SELLER_BLACKLIST_SHEET = Spreadsheet(
     columns=("seller_id",),
     wiki=True,
 )
+# ⚠ 2026-08-20 从单列升成五列(所有者定稿:「我把 233 条整个粘贴进飞书表格,
+# 你让黑名单中心按实际的读取」)。单列时代只能表达「这一条精确路径」,存不下
+# 子树规则的 browse_node_id —— 233 条里 189 条子树 + 30 条顶级名会全退化成
+# path_exact,拦截面从 2 万个类目塌回 233 条,等于把子树改造整个还原。
+# **列序即飞书表头顺序,一个字都不许改**(飞书按表头位置索引,改名/换位会静默错位)。
 AMZCAT_BLACKLIST_SHEET = Spreadsheet(
     name="黑名单亚马逊类目",
     token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_AMZCAT_BLACKLIST_SHEET_ID", ""),
-    columns=("category",),
+    columns=("category", "browse_node_id", "category_zh", "match_type", "reason"),
     wiki=True,
 )
 

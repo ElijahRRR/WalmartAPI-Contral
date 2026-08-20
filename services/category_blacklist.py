@@ -205,5 +205,57 @@ def check(rules: CatRules, amazon_category_path: str, browse_node_chain: str = "
     return None
 
 
+# =============================================================
+# 行 → 规则(飞书表与离线 CSV **共用同一个解析件**)
+# =============================================================
+
+# 「匹配方式」列的中文取值 → match_type。运营在飞书里填的就是这三个词。
+MATCH_BY_ZH = {"子树": MATCH_NODE, "顶级名": MATCH_TOP, "路径等值": MATCH_PATH}
+
+
+def make_rule(category: str, *, browse_node_id: str = "", category_zh: str = "",
+              match_type: str = "", reason: str = "", raw_path: str = "",
+              source: str = "manual") -> tuple[dict | None, str]:
+    """输入:一条名单行的各字段 → 输出:(规则 dict, "") 或 (None, 跳过原因码)。
+
+    两个写入口(risk_sync 读飞书 / category_blacklist_import 读 CSV)共用本件,
+    保证"同一行在两条路径上录出来的规则一模一样"。列名各自在自己那侧取
+    (飞书列名只准从 registry 拿,铁律 3),本件只收值。
+
+    ⚠ **「有 ID 就当子树根」是错的**,别再退回那个口径:名单里有一批
+    browse_node_id 是回落匹配来的(祖先前缀 / 存疑 / 与官方路径深度对不上),
+    当子树根用就整棵误拦(实见暗房化学品的 ID 回落成了整个相机摄影大类)。
+    所以子树与否由「匹配方式」列说了算;该列为空才退回按 ID 推断,
+    并返回 `fallback` 码让调用方**报数**(静默回落 = 主路径已坏没人知道)。
+    """
+    from services.audit_phase0 import normalize_amazon_category as _norm  # 循环依赖:audit_phase0 在模块级 import 本模块
+
+    cat = (category or "").strip()
+    if not cat:
+        return None, "空类目"
+    nid = (browse_node_id or "").strip() or None
+    how = (match_type or "").strip()
+    fallback = ""
+    if not how:
+        mt = MATCH_NODE if nid else MATCH_PATH
+        fallback = "无匹配方式列-按ID推断"
+    elif how == "子树" and nid:
+        mt = MATCH_NODE
+    elif how in ("顶级名", "路径等值"):
+        # 顶级 browse node 亚马逊不发 ID;路径等值行的 ID 一并丢掉,
+        # 免得日后被谁当成子树根使
+        mt, nid = MATCH_BY_ZH[how], None
+    else:
+        # 「不录入」「(被覆盖,不单独录入)」「子树但没填 ID」都落这里
+        return None, "匹配方式非录入"
+    norm = _norm(cat)
+    if not norm:
+        return None, "归一化后为空"
+    rule = {"norm": norm, "raw": (raw_path or cat).strip(), "mt": mt,
+            "mv": cat, "nid": nid, "zh": (category_zh or "").strip(),
+            "reason": (reason or "").strip()[:500], "policy": "", "source": source}
+    return rule, fallback
+
+
 __all__ = ["CatRules", "CatHit", "SEED_RULES", "MATCH_NODE", "MATCH_TOP",
-           "MATCH_PATH", "load", "check", "chain_ids"]
+           "MATCH_PATH", "MATCH_BY_ZH", "load", "check", "chain_ids", "make_rule"]

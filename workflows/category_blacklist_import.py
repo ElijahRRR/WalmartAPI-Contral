@@ -1,15 +1,15 @@
-"""category_blacklist_import — 类目黑名单录入/重录(CSV 或内置种子)。
+"""category_blacklist_import — 类目黑名单规则录入(种子 / 离线 CSV)。
 
 用法:
-  python cli.py category_blacklist_import --dry-run           # 只看会写什么
-  python cli.py category_blacklist_import -p seed=1           # 只灌内置种子(顶级+子树)
-  python cli.py category_blacklist_import -p csv=<路径>        # 灌清洗后的名单
-  python cli.py category_blacklist_import -p csv=<路径> -p replace=1
-                                                # 先清掉同源旧行再灌(重录)
+  python cli.py category_blacklist_import -p seed=1            # 灌内置种子
+  python cli.py category_blacklist_import -p csv=<路径>         # 灌清洗名单
+  python cli.py category_blacklist_import -p csv=<路径> -p replace=1   # 先清同源旧行
 
-**判据住在库里**(所有者定稿 2026-08-20:「代码里面的类目可以拿到数据库里来,
-还可以减轻代码的臃肿」)。本工作流是那张表的**唯一写入口**(飞书镜像那条
-由 risk_sync 负责,两边按 `source` 列分家,互不冲刷)。
+⚠ **2026-08-20 起飞书「黑名单亚马逊类目」表是这张库表的唯一维护面**
+(所有者定稿:「我把 233 条整个粘贴进飞书表格,你让黑名单中心按实际的读取」)。
+`risk_sync` 是整表镜像,**下一次同步会把本工作流灌进去的行一并覆盖**。
+所以本工作流的定位收窄成:首次灌种 / 飞书不可用时的应急录入 / 离线核对。
+日常增删类目 = 改飞书表,跑 risk_sync。
 
 CSV 列(与清洗表同构,多余列忽略):
   类目               归一化路径或官方路径(写进 category_norm/category_raw)
@@ -17,18 +17,10 @@ CSV 列(与清洗表同构,多余列忽略):
   中文翻译           category_zh
   建议               只有 `留-*` / `增-*` 开头的行才录入;`删-*` 一律跳过
   原因               reason
-  匹配方式           **`子树` / `顶级名` / `路径等值` / 其它值一律跳过**(见下)
+  匹配方式           **`子树` / `顶级名` / `路径等值` / 其它值一律跳过**
 
-⚠ **「有 ID 就当子树根」是错的**,别再退回那个口径(2026-08-20 做净增覆盖
-对账时实见):名单里 582 条的 browse_node_id 是**回落匹配**来的 —— 祖先前缀、
-存疑候选、或与官方路径深度对不上。旧的路径等值下它们只拦自己一行;当子树根
-用就整棵拦,`Electronics->Camera&Photo->Accessories->DarkroomSupplies->Chemicals`
-的 ID 回落成了 `Electronics > Camera & Photo`(深度 2),升成子树 = 整个相机
-摄影大类全没了,**而且不报错**。所以子树与否由**清洗表的「匹配方式」列**说了算,
-本工作流只执行不推断;没有这一列的老 CSV 才退回「有 ID ⇒ 子树」,且摘要报数。
-
-⚠ 顶级类目(Books/Automotive/…)在亚马逊没有 browse node id,只能按名字拦,
-   走 `-p seed=1` 灌种子(services.category_blacklist.SEED_RULES)。
+行解析走 `services.category_blacklist.make_rule`,与 risk_sync 读飞书**共用同一件**
+—— 同一行在两条路径上必须录出一模一样的规则,否则"离线核对过了"就没有意义。
 """
 
 import csv
@@ -87,32 +79,20 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
             cat = (row.get("类目") or "").strip()
             if not cat:
                 continue
-            nid = (row.get("browse_node_id") or "").strip() or None
-            how = (row.get("匹配方式") or "").strip()
-            if not how:                       # 老 CSV 没这一列:退回按 ID 推断
-                mt = cb.MATCH_NODE if nid else cb.MATCH_PATH
-                n["无匹配方式列-按ID推断"] += 1
-            elif how == "子树" and nid:
-                mt = cb.MATCH_NODE
-            elif how == "顶级名":
-                # 亚马逊顶级 browse node 不发 ID,整顶级不做只能按名字拦
-                mt, nid = cb.MATCH_TOP, None
-            elif how == "路径等值":
-                mt, nid = cb.MATCH_PATH, None
-            else:
-                # 「不录入」「(被覆盖,不单独录入)」「子树但没 ID」都落这里:
-                # 净增覆盖那些行的建议也以「增」开头,只靠建议列会把它们录进去
+            rule, note = cb.make_rule(
+                cat, browse_node_id=row.get("browse_node_id") or "",
+                category_zh=row.get("中文翻译") or "",
+                match_type=row.get("匹配方式") or "",
+                reason=(row.get("原因") or row.get("分析结果") or ""),
+                raw_path=row.get("官方完整路径") or "", source=_SOURCE)
+            if not rule:
                 n["跳过-匹配方式"] += 1
                 continue
+            if note:
+                n["无匹配方式列-按ID推断"] += 1
             n[{cb.MATCH_NODE: "子树", cb.MATCH_TOP: "顶级名",
-               cb.MATCH_PATH: "路径等值"}[mt]] += 1
-            # match_value 一律存**人看的路径**(排查时 audit_why 直接显示它);
-            # 子树规则真正的判据是 browse_node_id 列,不是这一列
-            out.append({"norm": norm(cat), "raw": (row.get("官方完整路径") or cat).strip(),
-                        "mt": mt, "mv": cat, "nid": nid,
-                        "zh": (row.get("中文翻译") or "").strip(),
-                        "reason": (row.get("原因") or row.get("分析结果") or "").strip()[:500],
-                        "policy": "", "source": _SOURCE})
+               cb.MATCH_PATH: "路径等值"}[rule["mt"]]] += 1
+            out.append(rule)
     return out, n
 
 

@@ -347,8 +347,11 @@ CREATE TABLE IF NOT EXISTS catalog.amazon_cat_blacklist (
 --     Wall Art,官方树叫 Wall Décor,按名字一条都拦不住)。
 --   match_type='top_name'     → 按顶级类目名(亚马逊顶级 browse node 无 ID)
 --   match_type='path_exact'   → 归一化完整路径等值(飞书镜像的历史行)
--- source 区分来源:'feishu' 的行由 risk_sync 全量重灌,其余(人工/清洗导入)
--- **不受重灌影响**——否则每天同步一次就把清洗成果洗没了。
+-- source 记来源('feishu' / 'cleanup' / 'seed')。⚠ 2026-08-20 起飞书那张五列
+-- 表是本表的**唯一维护面**(所有者定稿),risk_sync 是**整表镜像**:表里有什么
+-- 库里就是什么,不再按 source 分家——分家会让"飞书里删了库里还在拦"的幽灵长期
+-- 存在。代价:category_blacklist_import 灌的行会被下次同步覆盖,那个工作流从此
+-- 只作首次灌种 / 应急。
 ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_type text NOT NULL DEFAULT 'path_exact';
 ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_value text;
 ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS browse_node_id text;

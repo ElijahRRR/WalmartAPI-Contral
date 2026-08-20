@@ -94,3 +94,17 @@ def test_backfill_reason_is_capped(monkeypatch):
         "B0AAAAAAA1": [("l3_reason", {"note": "x" * 900})]})
     wf.run({"execute": True})
     assert len(conn.updated[0]["reason"]) < 400
+
+
+def test_dry_run_writes_nothing(monkeypatch):
+    """cli 对 DANGEROUS=False 恒给 execute=True,`--dry-run` 只体现在 dry_run。
+
+    漏认这一路的后果不是"少个开关",而是**所有者敲 --dry-run 却把存量刷了,
+    并且报成功** —— 本工作流一次刷全表,没有第二次机会。
+    """
+    pages = [[("B0AAAAAAA1", "历史结论(阶段 L0,理由未留存)")]]
+    reasons = {"B0AAAAAAA1": [("phase0_brand_blacklist", {"matched_brand": "IKEA"})]}
+    conn = _wire(monkeypatch, pages, reasons)
+    out = wf.run({"execute": True, "dry_run": True})
+    assert conn.updated == []
+    assert "[DRY-RUN]" in out and "将改写 1 行" in out

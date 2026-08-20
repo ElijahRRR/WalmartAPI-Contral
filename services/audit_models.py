@@ -55,6 +55,9 @@ class ProductInfo:
                                      # 分道后 ①b 级只把前者当实证(2026-08-14)
     browse_node_id: str = ""         # 类目 ID 链末段(当前最细类目;名称会漂
                                      # ID 不会,resolve_pt ②a 级直查映射表)
+    browse_node_chain: str = ""      # 根→叶完整 ID 链('123,456,789')。
+                                     # L0 类目闸按它判"属不属于某棵禁售子树"
+                                     # ——父级不覆盖子级的老毛病靠它根治
 
     @property
     def searchable_text(self) -> str:

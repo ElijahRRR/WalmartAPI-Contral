@@ -14,13 +14,34 @@ from services.audit_models import ProductInfo
 from services.audit_stopwords import is_stopword
 
 
-def _ctx(sellers=(), asins=(), cats=(), brands=None):
+def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=()):
+    """cats=归一化完整路径(飞书历史行);tops=顶级名;nodes=子树根 node_id。
+
+    2026-08-20 起类目闸判据全在库里(catalog.amazon_cat_blacklist),
+    这里按 services.category_blacklist 的装配形态直接喂。
+    """
+    from services import category_blacklist as cb
+    rules = cb.CatRules(
+        nodes={str(n): {"match_value": str(n), "category_path": f"子树{n}",
+                        "category_zh": "", "reason": "测试子树",
+                        "walmart_policy": "Intellectual Property"} for n in nodes},
+        tops={cb._norm_top(t): {"match_value": t, "category_path": t,
+                                "category_zh": "", "reason": f"{t} 禁售",
+                                "walmart_policy": "Intellectual Property"}
+              for t in tops},
+        paths={c: {"match_value": c, "category_path": c, "category_zh": "",
+                   "reason": "", "walmart_policy": ""} for c in cats})
     return SimpleNamespace(
         phase0_sellers=frozenset(sellers),
         phase0_asins=frozenset(asins),
         phase0_cats=frozenset(cats),
+        cat_rules=rules,
         brand_blacklist=dict(brands or {}),
     )
+
+
+# 迁进 DB 之前硬编码在 audit_phase0 里的四个顶级(现为 SEED_RULES 的一部分)
+_LEGACY_TOPS = ("Books", "Kindle Store", "Clothing, Shoes & Jewelry", "Automotive")
 
 
 def _p(**kw):
@@ -71,26 +92,27 @@ def test_brand_detail_keeps_raw_value():
     ("  books  ", True, "Books"),                                # B2-3 兜底改写规范 key
     ("Clothing Shoes & Jewelry > Men", True,
      "Clothing, Shoes & Jewelry"),                               # B2-4 缺逗号兜底
-    ("Clothing,Shoes & Jewelry > Men", False, None),             # B2-5 已知漏拦钉死
+    ("Clothing,Shoes & Jewelry > Men", True,
+     "Clothing, Shoes & Jewelry"),          # B2-5 旧的逗号漏拦已随 DB 化修掉
     ("Books->Kindle", False, None),                              # B2-6 只切 '>' 口径钉死
     ("Automotive Parts & Accessories", False, None),             # B2-7
     ("", False, None),                                           # B2-8
     ("Video Games > Xbox", False, None),                         # B2-9
 ])
 def test_forbidden_category_vectors(path, blocked, top):
-    r = audit_phase0.check(_p(amazon_category_path=path), _ctx())
+    r = audit_phase0.check(_p(amazon_category_path=path),
+                           _ctx(tops=_LEGACY_TOPS))
     assert r.blocked is blocked
     if blocked:
         h = r.hits[0]
         assert h.rule_code == "phase0_forbidden_category" and h.penalty == -100
-        assert h.detail["amazon_top_category"] == top
         assert h.detail["full_path"] == path
-        assert h.detail["match_type"] == "exact"   # 兜底命中也写 exact(照迁)
-        assert r.matched_category == top
+        assert h.detail["matched_by"] == "top_name"
 
 
 def test_forbidden_category_policy_books():
-    r = audit_phase0.check(_p(amazon_category_path="Books"), _ctx())
+    r = audit_phase0.check(_p(amazon_category_path="Books"),
+                           _ctx(tops=_LEGACY_TOPS))
     assert r.hits[0].detail["walmart_policy"] == "Intellectual Property"
 
 
@@ -113,22 +135,33 @@ def test_removed_tops_no_longer_block(path):
     """⚠ 这 4 个大类是**筐**不是**品**,Phase0 只看第一段 = 整筐一起拒。
 
     药品/补剂改由 L2 两道更精准的闸判(R2 按 Walmart PT 名词表、R0 按 Walmart
-    类目)。摘掉是**去重**不是放开——详见 audit_phase0.FORBIDDEN_AMAZON_TOPS
-    下方的注释块与 docs/audit_migration_plan.md 九节补批复。
+    类目)。摘掉是**去重**不是放开——详见 services/category_blacklist 头注
+    与 docs/audit_migration_plan.md 九节补批复。
     """
-    assert audit_phase0.check(_p(amazon_category_path=path), _ctx()).blocked \
-        is False
+    assert audit_phase0.check(_p(amazon_category_path=path),
+                              _ctx(tops=_LEGACY_TOPS)).blocked is False
 
 
-def test_forbidden_tops_is_exactly_the_legacy_four():
-    """往这张表里加大类 = 把整个筐的杂货一起拒,且停在 L0 连类目都不判。
+def test_category_rules_live_in_db_not_in_code():
+    """⚠ 类目判据**不许再回到代码里**(所有者定稿 2026-08-20:
+    「代码里面的类目可以拿到数据库里来,还可以减轻代码的臃肿」)。
 
-    这条用例的作用是**让"再加一个"必须先改测试**:改测试时会读到上面那条
-    误杀向量,以及"这筐里每一件都该拒吗"那句提问。首版加了 4 个新大类时
-    一条用例都没动过,所以礼品袋被判药品这件事直到生产验收才被发现。
+    判定件零硬编码类目:ctx.cat_rules 为空 = 类目闸整条不生效(而不是
+    "退回某个内置清单")——那样才能保证"改表就改了行为",不会出现
+    "库里删了但代码里还拦着"这种查不出来的鬼。
     """
-    assert set(audit_phase0.FORBIDDEN_AMAZON_TOPS) == {
-        "Books", "Kindle Store", "Clothing, Shoes & Jewelry", "Automotive"}
+    import inspect
+    from services import category_blacklist as cb
+    assert not hasattr(audit_phase0, "FORBIDDEN_AMAZON_TOPS")
+    src = inspect.getsource(audit_phase0)
+    assert "Kindle Store" not in src and "Grocery & Gourmet Food" not in src
+    # 空规则 = 不拦(判定件不自带兜底清单)
+    empty = SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                            phase0_cats=frozenset(), cat_rules=cb.CatRules(),
+                            brand_blacklist={})
+    assert audit_phase0.check(_p(amazon_category_path="Books"), empty).blocked is False
+    # 判定件也不许自带种子清单(2026-08-20 所有者:一切以回传的标注文档为准)
+    assert not hasattr(cb, "SEED_RULES")
 
 
 # ── B3 商标符号 ──────────────────────────────────────────────────────────────
@@ -211,7 +244,7 @@ def test_lark_seller_asin_cat_priority():
         _p(amazon_category_path="Video Games > Xbox"), ctx)
     assert r3.hits[0].rule_code == "phase0_lark_blacklist_amazon_cat"
     assert r3.hits[0].detail["amazon_category_path"] == "Video Games > Xbox"
-    assert r3.hits[0].detail["normalized"] == "VideoGames->Xbox"
+    assert r3.hits[0].detail["matched_by"] == "path_exact"
     assert r3.matched_category == "VideoGames->Xbox"
 
 
@@ -241,7 +274,8 @@ def test_phase0_ordering_lark_beats_category():
 
 def test_phase0_ordering_category_beats_trademark():
     r = audit_phase0.check(
-        _p(amazon_category_path="Books", title="Nike® Book"), _ctx())
+        _p(amazon_category_path="Books", title="Nike® Book"),
+        _ctx(tops=_LEGACY_TOPS))
     assert r.hits[0].rule_code == "phase0_forbidden_category"
 
 

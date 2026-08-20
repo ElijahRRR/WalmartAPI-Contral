@@ -15,7 +15,7 @@ from services import audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
-from workflows.risk_sync import _sync_column_blacklist
+from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 
 
 def _ctx(**kw):
@@ -232,13 +232,17 @@ class _BLConn:
 
 
 _SELLER_SHEET = SimpleNamespace(name="黑名单卖家店铺ID", columns=("seller_id",))
-_CAT_SHEET = SimpleNamespace(name="黑名单亚马逊类目", columns=("category",))
+# 类目表 2026-08-20 从单列升成五列(所有者把 233 条规则整个粘贴进飞书,
+# 黑名单中心要按实际列读)。列序即表头顺序,与 registry 一致。
+_CAT_SHEET = SimpleNamespace(
+    name="黑名单亚马逊类目",
+    columns=("category", "browse_node_id", "category_zh", "match_type", "reason"))
 
 
 def test_sync_blacklist_empty_read_never_truncates():
     conn = _BLConn(old_n=1314)
     msg = _sync_column_blacklist(conn, _SELLER_SHEET,
-                                 "catalog.seller_blacklist", [], False)
+                                 "catalog.seller_blacklist", [])
     assert "不重灌" in msg
     assert not any("TRUNCATE" in s for s in conn.sql)
 
@@ -249,7 +253,7 @@ def test_sync_blacklist_shrink_guard():
     rows = [{"seller_id": "S1"}]
     with pytest.raises(RuntimeError, match="骤缩"):
         _sync_column_blacklist(conn, _SELLER_SHEET,
-                               "catalog.seller_blacklist", rows, False)
+                               "catalog.seller_blacklist", rows)
     assert not any("TRUNCATE" in s for s in conn.sql)
 
 
@@ -258,22 +262,86 @@ def test_sync_blacklist_seller_refill_dedupes():
     rows = [{"seller_id": "S1"}, {"seller_id": "S2"},
             {"seller_id": "S1"}, {"seller_id": ""}]
     msg = _sync_column_blacklist(conn, _SELLER_SHEET,
-                                 "catalog.seller_blacklist", rows, False)
+                                 "catalog.seller_blacklist", rows)
     assert "全量重灌 2 条" in msg
     assert sum("TRUNCATE" in s for s in conn.sql) == 1
     assert conn.inserted == [("S1",), ("S2",)]
 
 
-def test_sync_blacklist_cat_refill_normalizes():
+# ── 类目表五列镜像(risk_sync._sync_amzcat_blacklist)────────────────────
+
+def _cat_row(cat, nid="", zh="", how="", reason=""):
+    return {"category": cat, "browse_node_id": nid, "category_zh": zh,
+            "match_type": how, "reason": reason}
+
+
+def test_sync_amzcat_keeps_match_type_from_sheet():
+    """三种匹配都要原样落库 —— 单列时代只能存 path_exact,子树规则会整批
+    退化成"只拦这一行",拦截面从两万个类目塌回几百条,而且不报错。"""
+    conn = _BLConn(old_n=3)
+    rows = [_cat_row("Toys & Games > Puzzles", "166057011", "拼图", "子树"),
+            _cat_row("Video Games", "", "电子游戏", "顶级名"),
+            _cat_row("A > B", "", "", "路径等值")]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    got = {r["mv"]: r for r in conn.inserted}
+    assert got["Toys & Games > Puzzles"]["mt"] == "node_subtree"
+    assert got["Toys & Games > Puzzles"]["nid"] == "166057011"
+    assert got["Video Games"]["mt"] == "top_name"
+    assert got["Video Games"]["nid"] is None          # 顶级无 ID
+    assert got["A > B"]["mt"] == "path_exact"
+    assert "子树 1" in msg and "顶级名 1" in msg and "路径等值 1" in msg
+    assert sum("TRUNCATE" in s for s in conn.sql) == 1
+
+
+def test_sync_amzcat_empty_read_never_truncates():
+    """读到 0 条可用规则(接口异常 / 表头列错位)绝不重灌 —— 空表重灌 =
+    类目闸整条失效,而且不报错。"""
+    conn = _BLConn(old_n=233)
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist",
+                                 [_cat_row("", "", "", "子树")])
+    assert "不重灌" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql)
+
+
+def test_sync_amzcat_shrink_needs_explicit_key():
+    """11,810 条精确路径换成 233 条子树规则是缩 98%,护栏必须拦下来;
+    确认要缩的人得显式敲 -p allow_shrink=1。"""
+    conn = _BLConn(old_n=11810)
+    rows = [_cat_row(f"T{i} > X", str(i), "", "子树") for i in range(233)]
+    with pytest.raises(RuntimeError, match="allow_shrink"):
+        _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                               "catalog.amazon_cat_blacklist", rows)
+    assert not any("TRUNCATE" in s for s in conn.sql)
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows,
+                                 allow_shrink=True)
+    assert "整表重灌 233 条" in msg
+
+
+def test_sync_amzcat_blank_match_type_falls_back_and_says_so():
+    """「匹配方式」列为空才按 ID 推断,而且必须报数 —— 名单里有一批 ID 是
+    回落匹配来的,当子树根用会整棵误拦,静默回落等于主路径坏了没人知道。"""
+    conn = _BLConn(old_n=1)
+    rows = [_cat_row("A > B", "123", "", ""), _cat_row("C > D", "", "", "")]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    got = {r["mv"]: r for r in conn.inserted}
+    assert got["A > B"]["mt"] == "node_subtree"
+    assert got["C > D"]["mt"] == "path_exact"
+    assert "2 行「匹配方式」列为空" in msg
+
+
+def test_sync_amzcat_normalizes_and_dedupes():
     """类目存归一化值(与查询侧共用 normalize_amazon_category),原文留档。"""
     conn = _BLConn(old_n=1)
-    rows = [{"category": "Toys > Games"},
-            {"category": "Toys>Games"},        # 归一化后与上一行同键 → 去重
-            {"category": ""}]
-    msg = _sync_column_blacklist(conn, _CAT_SHEET,
-                                 "catalog.amazon_cat_blacklist", rows, True)
-    assert "全量重灌 1 条" in msg
-    assert conn.inserted == [("Toys->Games", "Toys > Games")]  # 首见原文为准
+    rows = [_cat_row("Toys > Games", "", "", "路径等值"),
+            _cat_row("Toys>Games", "", "", "路径等值")]   # 归一后同键
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    assert "整表重灌 1 条" in msg
+    assert conn.inserted[0]["norm"] == "Toys->Games"
 
 
 # ── parse_asin_lines(历史继承 ASIN 导入)────────────────────────────────────

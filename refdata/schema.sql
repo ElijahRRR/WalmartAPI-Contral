@@ -338,6 +338,31 @@ CREATE TABLE IF NOT EXISTS catalog.amazon_cat_blacklist (
     category_raw  text,              -- 飞书原文(调试用)
     synced_at     timestamptz NOT NULL DEFAULT now()
 );
+-- 类目闸判据全部住在这张表(所有者定稿 2026-08-20「代码里面的类目可以拿到
+-- 数据库里来」):原 audit_phase0.FORBIDDEN_AMAZON_TOPS 四个硬编码顶级已迁进来。
+--   match_type='node_subtree' + browse_node_id → **拦整棵子树**(首选)
+--     产品的 catalog.products.browse_node_chain(根→叶 ID 链)里出现该 ID 即拦。
+--     解决两个老毛病:①父级不覆盖子级(名单写 Puzzles 拦不住 3-D Puzzles,
+--     1.18 万条名单里 56% 是为补这个洞逐层枚举的);②名字会漂(名单写
+--     Wall Art,官方树叫 Wall Décor,按名字一条都拦不住)。
+--   match_type='top_name'     → 按顶级类目名(亚马逊顶级 browse node 无 ID)
+--   match_type='path_exact'   → 归一化完整路径等值(飞书镜像的历史行)
+-- source 记来源('feishu' / 'cleanup' / 'seed')。⚠ 2026-08-20 起飞书那张五列
+-- 表是本表的**唯一维护面**(所有者定稿),risk_sync 是**整表镜像**:表里有什么
+-- 库里就是什么,不再按 source 分家——分家会让"飞书里删了库里还在拦"的幽灵长期
+-- 存在。代价:category_blacklist_import 灌的行会被下次同步覆盖,那个工作流从此
+-- 只作首次灌种 / 应急。
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_type text NOT NULL DEFAULT 'path_exact';
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_value text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS browse_node_id text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS category_zh text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS reason text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS walmart_policy text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'feishu';
+CREATE INDEX IF NOT EXISTS idx_amzcat_node ON catalog.amazon_cat_blacklist(browse_node_id)
+    WHERE browse_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_amzcat_type ON catalog.amazon_cat_blacklist(match_type) WHERE enabled;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;

@@ -1,4 +1,4 @@
-"""Phase 0 精准前置拦截:飞书黑名单 / 类目禁售 / 商标符号 / 品牌黑名单。
+"""Phase 0 精准前置拦截:黑名单(卖家/ASIN/类目)/ 商标符号 / 专利声明 / 品牌。
 
 移植自旧仓 pipelines/phase0.py + phase0_lark_blacklist.py + phase0_category.py
 + phase0_trademark.py + phase0_brand.py 五个文件(a565d95),合并为一个模块。
@@ -24,7 +24,6 @@ audit_hits 也只有 1 行 —— 这是旧仓行为,照迁。
 public:
   check(product, ctx) -> Phase0Result
   normalize_amazon_category(s) -> str      # risk_sync 等外部复用
-  FORBIDDEN_AMAZON_TOPS
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from services import category_blacklist
 from services.audit_models import Phase0Result, ProductInfo, RuleHit
 
 # =============================================================
@@ -111,139 +111,59 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                 )],
             )
 
-    # 3. Amazon 类目(归一化后等值;取**完整路径**,与规则 2 只取顶级段是两个口径)
-    cat_norm = normalize_amazon_category(product.amazon_category_path)
-    if cat_norm:
-        if cat_norm in ctx.phase0_cats:
-            return Phase0Result(
-                blocked=True,
-                matched_category=cat_norm,
-                hits=[RuleHit(
-                    stage="L0",
-                    rule_code="phase0_lark_blacklist_amazon_cat",
-                    penalty=-100,
-                    detail={
-                        "amazon_category_path": product.amazon_category_path,
-                        "normalized": cat_norm,
-                        "source": "blacklist_center",
-                    },
-                )],
-            )
+    # 3. Amazon 类目 —— 判据全部在库里(catalog.amazon_cat_blacklist),
+    #    三种匹配一次判完:子树 ID > 顶级名 > 完整路径等值。
+    #    2026-08-20 之前这里只有"完整路径等值"一种,父级不覆盖子级,
+    #    名单被迫逐层枚举还照样漏(详见 services/category_blacklist 头注)。
+    hit = category_blacklist.check(
+        getattr(ctx, "cat_rules", None),
+        product.amazon_category_path,
+        browse_node_chain=getattr(product, "browse_node_chain", "") or "",
+        browse_node_id=product.browse_node_id or "",
+        norm_path=normalize_amazon_category(product.amazon_category_path))
+    if hit:
+        code = ("phase0_forbidden_category"
+                if hit.matched_by == category_blacklist.MATCH_TOP
+                else "phase0_lark_blacklist_amazon_cat")
+        detail = {
+            "amazon_category_path": product.amazon_category_path,
+            "matched_by": hit.matched_by,
+            "matched_value": hit.matched_value,
+            "category_zh": hit.category_zh,
+            "reason": hit.reason,
+            "source": "category_blacklist(DB)",
+        }
+        if hit.matched_by == category_blacklist.MATCH_NODE:
+            detail["browse_node_id"] = hit.matched_value
+            detail["subtree"] = hit.category_path
+        if hit.matched_by == category_blacklist.MATCH_TOP:
+            detail["amazon_top_category"] = hit.matched_value
+            detail["full_path"] = product.amazon_category_path
+        if hit.walmart_policy:
+            detail["walmart_policy"] = hit.walmart_policy   # 理由映射第 1 优先级
+        return Phase0Result(
+            blocked=True,
+            matched_category=hit.matched_value,
+            hits=[RuleHit(stage="L0", rule_code=code, penalty=-100, detail=detail)],
+        )
 
     return Phase0Result(blocked=False)
 
 
 # =============================================================
-# 规则 2 —— Amazon 顶级类目精准禁售(4 大类)
+# 规则 2 —— (已并入规则 1)Amazon 类目禁售
 # =============================================================
-
-# Amazon 顶级类目 → (禁售原因, Walmart 政策 category_en)
-# key 必须是 Amazon 官方顶级类目名 (精确到大小写+标点)
-# walmart_policy 对齐 Walmart 37 条 Prohibited Product Policy category_en
-# (逐字迁自 phase0_category.py:32-52,reason/policy 原文进 detail)
 #
-# ⚠ **只有旧仓这 4 个**(2026-08-17 所有者裁决 A,详见下方"摘掉 4 个"注释块)。
-# 这条规则只看路径**第一段**,而 Amazon 顶级类目的粒度是"筐"不是"品":
-# 往这张表里加大类的代价 = 把整个筐里的杂货一起拒掉,且停在 L0 连类目都不判。
-# 加新 key 之前先问:这个筐里**每一件**都该拒吗?答不上来就别加,交给 L2。
-FORBIDDEN_AMAZON_TOPS: dict[str, tuple[str, str]] = {
-    "Books":                    ("Books 禁售: 版权/内容合规风险, 搬运模式不适合",
-                                 "Intellectual Property"),
-    "Kindle Store":             ("Kindle Store 禁售: 电子书版权",
-                                 "Digital Goods"),
-    "Clothing, Shoes & Jewelry":("服饰/鞋/珠宝禁售: 尺码/SKU管理复杂 + 珠宝 AML 审批",
-                                 "Textiles & Apparel"),
-    "Automotive":               ("汽配禁售: DOT/SAE 认证 + 安全件责任 + CARB/delete kit",
-                                 "Auto & Motor Vehicles"),
-}
-
-# ── 摘掉 4 个大类(2026-08-17,所有者裁决 A)────────────────────────────────
+# 2026-08-20 所有者定稿「代码里面的类目可以拿到数据库里来」:原
+# FORBIDDEN_AMAZON_TOPS 四个硬编码顶级 + 独立的 _check_forbidden_category
+# 已整体迁入 `catalog.amazon_cat_blacklist`(match_type='top_name'),
+# 判定并进上面规则 1 的一次 check()。种子数据见
+# services/category_blacklist.SEED_RULES —— 那只是建库用,判定不读它。
 #
-# 批次 B 迁入时在旧仓 4 个之外**新增**了 4 个:Beauty & Personal Care /
-# Health & Household / Health & Personal Care / Grocery & Gourmet Food,
-# 理由写的是"Walmart 整类 restricted,中国卖家 0 可能合规"。已全部删除。
-#
-# 触发:所有者拿 B0BWMVQHVJ 来问——一包**牛皮纸礼品袋**被拒,理由
-# 「药品/膳食补充剂 restricted: FDA 注册 + AML vetting + MoCRA」。查 detail:
-#   full_path = 'Health & Household > Stationery & Gift Wrapping Supplies
-#                > Gift Wrapping Supplies > Gift Bags'
-# 规则没跑偏(match_type='exact'),是**判据粒度太粗**:Amazon 的
-# Health & Household 本身就是杂物筐,底下混着文具礼品包装、家居清洁、纸品、
-# 宠物用品;只取第一段 = 把整个筐一起拒。
-#
-# 为什么摘掉是安全的 —— 药品/补剂**本来就有两道更精准的闸**,都在 L2:
-#   · R2  refdata/audit/forbidden_categories_zh_seller.yaml 的 drugs_supplements
-#         按 **Walmart PT 名**关键词判(Vitamin/Probiotic/Dietary Supplement/
-#         Melatonin/Homeopathic/Herbal Remedy…),另有 medical_devices 等 key
-#   · R0  audit_l2._FORBIDDEN_WALMART_MEGA_CATEGORIES 按 **Walmart 类目**硬禁
-#         (Health & Personal Care / Beauty / Food & Beverage / Baby …)
-# 那两条判的是"这东西到底是什么",Phase0 这条判的是"它在亚马逊被挂在哪个筐里"。
-# 前者才是判据,后者是筐 —— 所以是**去重**,不是"放开一道闸"。
-#
-# ⚠ 代价说清楚:PT 解不出**且** Walmart 类目也拿不到的真药品,不再有硬闸兜,
-# 会往下走到 L3 语义层。这是裁决 A 明知并接受的换取(换回被误杀的杂货)。
-# 要再收紧,正确做法是补 L2 的 PT 词表,**不是**把大类塞回上面那张表。
-
-def _extract_top(amazon_category_path: str | None) -> str:
-    """输入:Amazon 路径 → 输出:顶级类目段(第一个 '>' 之前,两端去空白)。
-
-    逐字迁自 phase0_category.py:55-62。**只认 '>'**,不认 '->' 与 '/':
-    输入 'VideoGames->XboxOne' 会得到 'VideoGames-'(尾横杠留着,永远匹配不上
-    8 个 key)。这是与规则 1 归一化口径不一致的已知缺陷,照迁不修 —— 新仓
-    amazon_category 由 product_ingest 用 ' > ' 拼接,实际不踩这个坑。
-    """
-    if not amazon_category_path:
-        return ""
-    p = amazon_category_path.strip()
-    if ">" in p:
-        p = p.split(">", 1)[0]
-    return p.strip()
-
-
-def _check_forbidden_category(product: ProductInfo) -> Phase0Result:
-    """输入:产品 → 输出:Phase0Result(顶级类目命中 8 大禁售类即 blocked)。
-
-    两级比较(phase0_category.py:65-84):先大小写+标点全敏感的精确等值,
-    失败再去逗号+小写等值。净效果 = 大小写不敏感、逗号可有可无、内部空白必须
-    存在(压缩成单空格),其余标点(& / -)必须一致。
-    第二级命中后 top_norm 回写成规范 key,故 detail 里永远是 8 个原文之一。
-    """
-    top = _extract_top(product.amazon_category_path)
-    if not top:
-        return Phase0Result(blocked=False)
-
-    # 归一化比较 (压缩空格, 不改大小写 — 因为 Amazon 顶级类目是固定大小写)
-    top_norm = " ".join(top.split())
-
-    # 精准等值
-    entry = FORBIDDEN_AMAZON_TOPS.get(top_norm)
-    if entry is None:
-        # 再尝试对某些标点变体 (e.g. "Clothing Shoes & Jewelry" 缺逗号)
-        for key in FORBIDDEN_AMAZON_TOPS:
-            if key.replace(",", "").lower() == top_norm.replace(",", "").lower():
-                entry = FORBIDDEN_AMAZON_TOPS[key]
-                top_norm = key
-                break
-    if not entry:
-        return Phase0Result(blocked=False)
-
-    reason, walmart_policy = entry
-
-    hit = RuleHit(
-        stage="L0",
-        rule_code="phase0_forbidden_category",
-        penalty=-100,
-        detail={
-            "amazon_top_category": top_norm,
-            "reason": reason,
-            "walmart_policy": walmart_policy,   # 理由映射第 1 优先级读这个
-            "full_path": product.amazon_category_path,
-            # 走了第二级模糊匹配时这里仍写 "exact",标签不准,照迁不修
-            "match_type": "exact",
-        },
-    )
-    return Phase0Result(blocked=True, matched_category=top_norm, hits=[hit])
-
+# ⚠ 顶级类目的粒度是"筐"不是"品",往表里加一个顶级 = 把整个筐里的杂货
+# 一起拒掉且停在 L0。加之前先问:这个筐里**每一件**都该拒吗?
+# (2026-08-17 裁决 A 的教训:Health & Household 被整拦,一包牛皮纸礼品袋
+#  因为"药品/膳食补充剂 restricted"被拒。)
 
 # =============================================================
 # 规则 3 —— 商标符号 ®/™/℠/©(原 L2 R9,2026-04-25 提前到 L0)
@@ -435,22 +355,18 @@ def _check_brand(product: ProductInfo, ctx: Any) -> Phase0Result:
 def check(product: ProductInfo, ctx: Any) -> Phase0Result:
     """输入:产品 + 上下文 → 输出:Phase0Result(四规则串行短路,最多 1 条 hit)。
 
-    顺序照迁 phase0.py:30-49:飞书黑名单 → 类目禁售 → 商标符号 → 品牌黑名单。
+    顺序:类目/卖家/ASIN 黑名单(规则 1,类目三种匹配已并入)→ 商标符号 →
+    专利声明 → 品牌黑名单。
     最后一条无 if 直接 return,所以全不命中时返回的是品牌规则那个
     Phase0Result(blocked=False)(空 hits、空 matched_*)。
 
     命中后上层处置(orchestrator.py:336-348,现由 audit_rules.audit_one 承接):
     verdict="reject"、score_final 硬写 0、stage_stopped_at="L0"、l1 用桩值。
     """
-    # 0. 飞书黑名单 (seller_id / asin / amazon_cat) — 人工拉黑最高优先级
+    # 0. 黑名单闸 (seller_id / asin / 类目三合一) — 人工拉黑最高优先级
     r_lark = _check_lark_blacklist(product, ctx)
     if r_lark.blocked:
         return r_lark
-
-    # 1. 类目禁售 (精准 Amazon 顶级)
-    r_cat = _check_forbidden_category(product)
-    if r_cat.blocked:
-        return r_cat
 
     # 2. 商标符号硬拦 (title/bullets/desc 含 ®/™/℠/©)
     r_tm = _check_trademark(product)
@@ -467,4 +383,4 @@ def check(product: ProductInfo, ctx: Any) -> Phase0Result:
     return r_brand
 
 
-__all__ = ["check", "normalize_amazon_category", "FORBIDDEN_AMAZON_TOPS"]
+__all__ = ["check", "normalize_amazon_category"]

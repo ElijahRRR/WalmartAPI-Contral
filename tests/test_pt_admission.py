@@ -333,3 +333,18 @@ def test_spec_dir_override_rejects_incomplete_dir(tmp_path):
             pt_spec.known_pts()
     finally:
         pt_spec.use_spec_dir(None)
+
+
+def test_summary_must_not_claim_a_column_is_blank_when_it_is_filled():
+    """摘要说的必须是**代码正在做的事**。
+
+    2026-08-20 实见:「准入状态」早已从 walmart_pt_meta.access_state 原样带出,
+    摘要却还在打上一版的文案「⚠ 准入状态列留空 …沿用旧值或人工填」。
+    提示与行为对不上比没有提示更坏 —— 人会照着那句话去手填 6942 行,
+    或者以为粘贴会洗掉现表而不敢粘。
+    """
+    import inspect
+    from workflows import pt_spec_sync
+    src = inspect.getsource(pt_spec_sync.run)
+    assert "「准入状态」列留空" not in src
+    assert "原样带出" in src and "access_state" in src

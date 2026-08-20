@@ -462,9 +462,11 @@ def run(params: dict) -> str:
                         "现值证据类型", "必需认证", "判据(逐条溯源)", "人工"])
             w.writerows(review)
         lines.append(f"差异复核表(带判据溯源,不用于粘贴):{rv}")
-        lines.append("  ⚠「准入状态」列留空 —— 那是沃尔玛侧的准入事实"
-                     "(普通商品/附条件允许/需Walmart审批/禁售),spec 里没有,"
-                     "沿用现表旧值或人工填,别让它被空值覆盖")
+        blank = sum(1 for r in rows if not r[3])
+        tail = "就是上面那批新 PT,粘表时手填" if blank else "现表全都有值"
+        lines.append(f"  「准入状态」已从现表(walmart_pt_meta.access_state)原样带出"
+                     f" —— 那是沃尔玛侧的准入事实,spec 里没有,只能沿用不能重算;"
+                     f"其中 {blank} 行为空({tail})")
     lines.append("(dry-run:一行未写库)" if dry_run
                  else f"已写 audit.walmart_pt_spec {changed} 行")
     return "\n".join(lines)

@@ -252,3 +252,30 @@ def test_conditional_required_is_not_static_required():
     assert mp_conform._required(spec) == {"productName"}
     # 取值没触发 → 条件必填不进来
     assert mp_conform.resolve_conditional_required(spec, {"isChildProduct": "No"}) == set()
+
+
+def test_sheet_diff_reports_both_directions(tmp_path):
+    """现表与 spec 的差异要**双向**报:spec 多的可能是换版新增,现表多的可能是
+    当年多收了。只报一边就会把"我的读法可能错"这一半藏起来。
+
+    起因(所有者 2026-08-20):「你要辩证的看待我给你的资料,和你判断的如何
+    获取必填字段」—— 上一轮我把差异一口咬定成"沃尔玛后来设成必填了",
+    但至少三种解释都成立,差异形状才能分辨。
+    """
+    from workflows.pt_spec_sync import _sheet_diff
+    csv_path = tmp_path / "sheet.csv"
+    csv_path.write_text(
+        "Walmart Product Type,必填字段清单\n"
+        "A,productName | brand | oldOnlyField\n"
+        "B,productName | brand\n", encoding="utf-8")
+    cache = {"A": ({}, {"productName", "brand", "specOnlyField"}, set()),
+             "B": ({}, {"productName", "brand"}, set())}
+    out = "\n".join(_sheet_diff(str(csv_path), cache))
+    assert "完全一致 1 个" in out and "有差异 1 个" in out
+    assert "specOnlyField" in out and "oldOnlyField" in out
+    assert "spec 有、现表没有" in out and "现表有、spec 没有" in out
+
+
+def test_sheet_diff_missing_file_says_so():
+    from workflows.pt_spec_sync import _sheet_diff
+    assert "不存在" in "\n".join(_sheet_diff("/nope/nope.csv", {}))

@@ -7,6 +7,8 @@
   python cli.py pt_spec_sync -p pt="Baby Formula,Pet Bowls" --dry-run   # 单点看证据链
   python cli.py pt_spec_sync -p explain="3-in-1 Shampoo, Conditioner & Body Washes"
       # 「字段总数/必填字段数」到底该怎么数:一个 PT 在几种读法下分别是多少
+  python cli.py pt_spec_sync -p sheet=~/Downloads/沃尔玛类目准入明细.csv --dry-run
+      # 拿现表的「必填字段清单」与本地 spec **逐 PT 逐字段**比,看差异长什么样
 
 数据源:`services.pt_spec` —— `<DATA_ROOT>/specs/MP_ITEM/<版本>/` 那份按 PT 拆分的
 官方 spec,**上架链(listing L2c)用的就是它**。不调 `POST /v3/items/spec`:
@@ -116,6 +118,62 @@ def _age_values(spec: dict) -> list:
                 walk(v)
 
     walk(spec)
+    return out
+
+
+def _sheet_diff(path: str, cache: dict) -> list[str]:
+    """输入:现表 CSV + {PT: (spec, 顶层必填, 条件必填)} → 输出:逐 PT 逐字段差异报告。
+
+    为什么要这个(所有者 2026-08-20:「你要辩证的看待我给你的资料,和你判断的
+    如何获取必填字段」):现表与本地 spec 在三个字段上对不上 ——
+    `smallPartsWarnings` +195、`has_written_warranty` +116、
+    `state_chemical_disclosure` +19。至少三种解释都成立:
+      ① spec 换版后确实加了必填 → 现表该更新;
+      ② 现表生成时用的是更早的 spec 版本 → 两边都没错;
+      ③ 当年的生成器有过滤/bug → 该怀疑现表其他列。
+    **差异形状能分辨**:集中在少数类目像版本漂移,散在全表像生成器问题。
+    所以不猜,把差异逐条摆出来。
+    """
+    import csv as _csv
+    import os
+    import re as _re
+    fp = os.path.expanduser(path)
+    if not os.path.exists(fp):
+        return [f"⚠ 现表 CSV 不存在:{fp}"]
+    only_sheet: collections.Counter = collections.Counter()
+    only_spec: collections.Counter = collections.Counter()
+    per_pt, same, n = [], 0, 0
+    for row in _csv.DictReader(open(fp, encoding="utf-8-sig")):
+        pt = (row.get("Walmart Product Type") or "").strip()
+        got = cache.get(pt)
+        if not got:
+            continue
+        n += 1
+        sheet_set = {x.strip() for x in _re.split(r"\s*\|\s*",
+                     row.get("必填字段清单") or "") if x.strip()}
+        spec_set = got[1]
+        a, b = sheet_set - spec_set, spec_set - sheet_set
+        if not a and not b:
+            same += 1
+        else:
+            per_pt.append((pt, sorted(a), sorted(b)))
+        only_sheet.update(a)
+        only_spec.update(b)
+    out = [f"── 现表 vs 本地 spec 顶层必填,逐 PT 比对(能对上的 {n} 个 PT):",
+           f"   完全一致 {same} 个;有差异 {len(per_pt)} 个"]
+    if only_spec:
+        out.append("   **spec 有、现表没有**的字段(现表可能是旧版 spec 生成的):")
+        for f, c in only_spec.most_common(15):
+            out.append(f"     {f:<50}{c:>6} 个 PT")
+    if only_sheet:
+        out.append("   **现表有、spec 没有**的字段(现表当年可能多收了):")
+        for f, c in only_sheet.most_common(15):
+            out.append(f"     {f:<50}{c:>6} 个 PT")
+    if per_pt:
+        out.append("   差异样例(前 8 个 PT):")
+        for pt, a, b in per_pt[:8]:
+            out.append(f"     {pt[:38]:<40} 现表多:{'、'.join(a[:3]) or '—'}"
+                       f" | spec 多:{'、'.join(b[:3]) or '—'}")
     return out
 
 
@@ -287,6 +345,10 @@ def run(params: dict) -> str:
                              + (f"   ⚠ {tag}" if tag else ""))
         if bp_top or bp_cond:
             lines.append(f"   → 剔除样板:顶层 {sorted(bp_top)} / 条件 {sorted(bp_cond)}")
+
+        sheet_csv = str(params.get("sheet", "")).strip()
+        if sheet_csv:
+            lines += _sheet_diff(sheet_csv, cache)
 
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
         rows, review, changed, no_spec = [], [], 0, 0

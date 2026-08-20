@@ -5,6 +5,8 @@
   python cli.py pt_spec_sync                     # 落 audit.walmart_pt_spec + 导出飞书粘贴表
   python cli.py pt_spec_sync -p limit=200        # 先判 200 个看看
   python cli.py pt_spec_sync -p pt="Baby Formula,Pet Bowls" --dry-run   # 单点看证据链
+  python cli.py pt_spec_sync -p explain="3-in-1 Shampoo, Conditioner & Body Washes"
+      # 「字段总数/必填字段数」到底该怎么数:一个 PT 在几种读法下分别是多少
 
 数据源:`services.pt_spec` —— `<DATA_ROOT>/specs/MP_ITEM/<版本>/` 那份按 PT 拆分的
 官方 spec,**上架链(listing L2c)用的就是它**。不调 `POST /v3/items/spec`:
@@ -80,22 +82,10 @@ def _old_bucket(zh_can_do: str) -> str:
     return ""
 
 
-# 现表「否」里带**spec 看不见的证据**的措辞:政策禁售、上架回测实证。
-# 这两类不许被 spec 判定翻案 —— spec 只说明"要什么材料",它既不知道沃尔玛
-# 政策禁不禁,更不知道这个 PT 真上架时被拒过多少次。
-_LOCK_MARKS = ("Walmart 禁售", "Walmart禁售", "上架记录回测", "BIZ-CN")
-
-
-def _locked(zh_can_do: str) -> str:
-    """输入:现表「中国卖家可做」→ 输出:锁定理由(空 = 不锁)。"""
-    z = (zh_can_do or "").strip()
-    if not z.startswith("否"):
-        return ""
-    for mark in _LOCK_MARKS:
-        if mark in z:
-            return ("实证:上架回测被拒" if mark in ("上架记录回测", "BIZ-CN")
-                    else "沃尔玛政策禁售")
-    return ""
+# ⚠ 曾经在这里加过"锁定":现表带政策/上架回测实证的「否」不许被 spec 翻案。
+# 2026-08-20 所有者定稿撤掉 —— **「允许翻,以前生成并不可靠」**。摘要仍按现表
+# 原措辞把"判否却被放松"的行拆开报数,让人看得见这批是从哪种依据翻过来的,
+# 但不再替人拦。
 
 
 def _age_values(spec: dict) -> list:
@@ -129,10 +119,76 @@ def _age_values(spec: dict) -> list:
     return out
 
 
+def _explain(pt: str) -> list[str]:
+    """输入:PT 名 → 输出:该 PT 在**几种字段读法**下的计数与差集(对表用)。
+
+    起因(所有者 2026-08-20):「字段总数 / 必填字段数这两个数和我们现在的对不上,
+    是否对字段总数和必填项目的理解有错误,以前上架系统遇到过相似的问题,
+    搞了很多字段出来」。
+
+    候选读法(生产上架链 services/mp_conform 读的是**顶层**,我第一版用的是递归):
+      顶层        spec["required"] / spec["properties"]              ← 上架链口径
+      +条件必填    ∪ allOf[*].then.required(不看取值,全量并)
+      递归        每一层的 required / properties 全收              ← 我的第一版
+    再叠上 Orderable 公共段与 MP_ITEM 信封段(sku/price/quantity 那些)。
+    哪一种能对上现表的 113/46,哪一种就是当年的口径。
+    """
+    spec = pt_spec.load_pt(pt)
+    if spec is None:
+        return [f"── {pt}:spec 里没有这个 PT"]
+    orderable = pt_spec.orderable_spec()
+    top_req = set((spec.get("required") or []))
+    top_props = set((spec.get("properties") or {}))
+    cond_req = set()
+    for cond in (spec.get("allOf") or []):
+        cond_req.update((cond.get("then") or {}).get("required") or [])
+    rec_req = pt_admission.extract_required(spec)
+    rec_props = pt_admission.all_fields(spec)
+    o_req = set((orderable.get("required") or []))
+    o_props = set((orderable.get("properties") or {}))
+    o_rec_req = pt_admission.extract_required(orderable)
+
+    out = [f"── {pt} 的字段读法对表(现表若是 113/46,看哪一行对得上)"]
+    for name, req, props in (
+            ("顶层(上架链 mp_conform 口径)", top_req, top_props),
+            ("顶层 + allOf.then 条件必填", top_req | cond_req, top_props),
+            ("顶层 + 条件 + Orderable 顶层", top_req | cond_req | o_req, top_props | o_props),
+            ("递归收全(我的第一版)", rec_req, rec_props),
+            ("递归 + Orderable 递归", rec_req | o_rec_req, rec_props),
+    ):
+        out.append(f"   {name:<28} 必填 {len(req):>4} / 字段总数 {len(props):>4}")
+    out.append(f"   其中 allOf 条件必填单独 {len(cond_req)} 个;"
+               f"Orderable 顶层必填 {len(o_req)} / 字段 {len(o_props)} 个")
+    # 合规文档类字段住在哪一层,决定它能不能当"要这个认证"的判据
+    marks = ["certification_type", "nrtl_information", "has_nrtl_listing_certification",
+             "children_product_certificate_document_reference_id",
+             "children_product_test_report_document_reference_id",
+             "general_certificate_of_conformity_document_reference_id",
+             "ingredients", "labelImage", "prop65WarningText",
+             "country_of_origin_substantial_transformation"]
+    out.append("   合规相关字段各住在哪一层(**这决定它算不算判据**):")
+    for f in marks:
+        where = []
+        if f in top_req:
+            where.append("顶层必填")
+        if f in cond_req:
+            where.append("条件必填")
+        if f in top_props:
+            where.append("顶层属性")
+        if f in rec_props and not where:
+            where.append("仅深层")
+        out.append(f"     {f:<58}{'、'.join(where) or '不存在'}")
+    return out
+
+
 def run(params: dict) -> str:
     """输入:params(limit/dry_run)→ 输出:对账 + 判定分布 + 导出路径。"""
     dry_run = bool(params.get("dry_run"))
     limit = int(params.get("limit", 0) or 0)
+
+    ex = str(params.get("explain", "")).strip()
+    if ex:
+        return "\n".join(_explain(ex))
 
     n_idx, n_ok = pt_spec.coverage()
     ver = resources.FEED_SPEC_VERSIONS["MP_ITEM"]
@@ -166,7 +222,7 @@ def run(params: dict) -> str:
                 lines.append(f"  {tag}:" + "、".join(xs))
 
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
-        rows, review, changed, no_spec, locked_kept = [], [], 0, 0, 0
+        rows, review, changed, no_spec = [], [], 0, 0
         diff: collections.Counter = collections.Counter()
         unlock_detail: collections.Counter = collections.Counter()
         want = {x.strip() for x in str(params.get("pt", "")).split(",") if x.strip()}
@@ -180,16 +236,6 @@ def run(params: dict) -> str:
             m = meta.get(pt, {})
             old = _old_bucket(m.get("zh", ""))
             order = {pt_admission.OK: 0, pt_admission.EVAL: 1, pt_admission.BLOCK: 2}
-            lock = _locked(m.get("zh", ""))
-            spec_says = adm.verdict
-            if lock and order[spec_says] < order[pt_admission.BLOCK]:
-                # spec 只许收紧,不许翻案:它看不见政策,也不知道真上架被拒过
-                adm = pt_admission.Admission(
-                    product_type=pt, certs=adm.certs, verdict=pt_admission.BLOCK,
-                    reasons=[f"**锁定**({lock}):现表判否且依据在 spec 之外,"
-                             f"spec 只看到「{spec_says}」,不足以翻案"] + adm.reasons,
-                    policy=adm.policy, fields_seen=adm.fields_seen)
-                locked_kept += 1
             move = ("新增(现表无此 PT)" if not old else
                     "不变" if old == adm.verdict else
                     "收紧" if order[adm.verdict] > order[old] else "放松")
@@ -225,9 +271,6 @@ def run(params: dict) -> str:
         if not dry_run:
             conn.commit()
 
-    if locked_kept:
-        lines.append(f"**锁定保留**{locked_kept} 条:现表判「否」且依据是政策禁售或"
-                     f"上架回测实证 —— spec 看不见这两类证据,只许收紧不许翻案")
     if unlock_detail:
         lines.append("现表判否、新判定放松的,按现表原措辞拆开(这批要逐条看):")
         for k, v in unlock_detail.most_common():

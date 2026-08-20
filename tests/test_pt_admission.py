@@ -127,27 +127,3 @@ def test_old_bucket_reads_the_35_freetext_variants():
     assert _old_bucket("否 (中国卖家进不去)") == pa.BLOCK
     assert _old_bucket("否（上架记录回测，BIZ-CN触发5次）") == pa.BLOCK
     assert _old_bucket("") == "" and _old_bucket("待定") == ""
-
-
-# ── spec 只许收紧,不许翻掉 spec 看不见的证据 ────────────────────────────
-
-def test_locked_marks_policy_and_empirical_reasons():
-    """现表的「否」有三类来源,**只有一类是 spec 看得见的**:
-
-      否(中国卖家进不去)      ← 准入状态=需Walmart审批,沃尔玛侧事实
-      否(Walmart 禁售)        ← **政策**,spec 里没有这个信息
-      否(上架记录回测,BIZ-CN触发5次) ← **实证:真上架被拒过**,比任何推断都硬
-
-    后两类不许被 spec 判定翻案 —— spec 只说明"要什么材料",它既不知道政策
-    禁不禁,更不知道这个 PT 真上架时被拒过多少次。生产实跑里「否 → 是」有
-    384 条,不锁的话这批会被一次性放行。
-    """
-    from workflows.pt_spec_sync import _locked
-    assert _locked("否 (Walmart 禁售)") == "沃尔玛政策禁售"
-    assert _locked("否（Walmart 禁售）") == "沃尔玛政策禁售"
-    assert _locked("否（上架记录回测，BIZ-CN触发5次）") == "实证:上架回测被拒"
-    assert _locked("否（上架记录回测，BIZ-CN触发3个SKU）") == "实证:上架回测被拒"
-    # 这一类是从准入状态推的,spec 可以参与讨论 → 不锁
-    assert _locked("否 (中国卖家进不去)") == ""
-    # 现表说可做的行,压根不进锁定逻辑
-    assert _locked("是") == "" and _locked("需评估 (要合规投入)") == ""

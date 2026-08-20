@@ -164,3 +164,40 @@ def test_old_bucket_reads_the_35_freetext_variants():
     assert _old_bucket("否 (中国卖家进不去)") == pa.BLOCK
     assert _old_bucket("否（上架记录回测，BIZ-CN触发5次）") == pa.BLOCK
     assert _old_bucket("") == "" and _old_bucket("待定") == ""
+
+
+# ── 样板字段:哪儿都有 = 没有区分力,实测覆盖率说了算 ──────────────────────
+
+def test_boilerplate_is_measured_not_hand_listed():
+    """2026-08-20 生产实跑:按"条件必填也算判据"跑出来 6951 个 PT 里 6494 个
+    判「需评估」(93%),白名单直接作废。查下来是儿童产品证书那组字段挂在
+    几乎每个 PT 的 allOf 里(「若声明是儿童产品则要 CPC」的通用样板)。
+
+    这和 `isProp65WarningRequired` 是同一类东西 —— 所以不再靠人眼一个个认,
+    **覆盖率超线就自动剔除**,并且要报得出是哪些(静默剔 = 判定悄悄少一条依据)。
+    """
+    total = 1000
+    top = {"ingredients": 30, "isProp65WarningRequired": 1000}
+    cond = {"children_product_certificate_document_reference_id": 940,
+            "hasBatteries": 120}
+    bp_top, bp_cond, detail = pa.find_boilerplate(top, cond, total)
+    assert "isProp65WarningRequired" in bp_top          # 顶层 100%
+    assert "ingredients" not in bp_top                  # 3%,有区分力
+    assert "children_product_certificate_document_reference_id" in bp_cond   # 条件 94%
+    assert "hasBatteries" not in bp_cond                # 条件 12%
+    assert any(f == "ingredients" and nt == 30 for f, nt, _, _ in detail)
+
+
+def test_boilerplate_fields_are_dropped_from_evidence():
+    """被判样板的字段进不了判据 —— 否则整表一个颜色。"""
+    a = pa.judge("X", {"ingredients"},
+                 conditional={"children_product_certificate_document_reference_id"},
+                 boilerplate_cond={"children_product_certificate_document_reference_id"})
+    assert not any("CPC" in c for c in a.certs)
+    assert a.verdict == pa.BLOCK          # ingredients 不是样板,照旧生效
+
+
+def test_boilerplate_only_covers_signal_fields():
+    """只对判定表里的字段算覆盖率 —— 其余字段本来就不参与判定。"""
+    _, _, detail = pa.find_boilerplate({"productName": 6951}, {}, 6951)
+    assert not any(f == "productName" for f, _, _, _ in detail)

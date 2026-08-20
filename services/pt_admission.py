@@ -142,9 +142,47 @@ def all_fields(node, out: set | None = None) -> set:
     return out
 
 
+# 覆盖率超过这个比例的字段 = **样板块**,不算判据。
+# 起因(2026-08-20 生产实跑):按"条件必填也算判据"跑出来 6951 个 PT 里
+# 6494 个判「需评估」(93%),白名单直接作废。查下来是
+# `children_product_certificate_document_reference_id` 那组儿童产品证书字段
+# 挂在几乎每个 PT 的 allOf 里(「若声明是儿童产品则要 CPC」的通用样板),
+# 和 `isProp65WarningRequired` 是同一类东西。
+# **不再靠人眼一个个认**:哪个字段普遍到这个份上,它就没有区分力,实测说了算。
+BOILERPLATE_TOP = 0.90       # 顶层必填命中率超过 90% ⇒ 样板
+BOILERPLATE_COND = 0.50      # 条件必填命中率超过 50% ⇒ 样板
+
+
+def find_boilerplate(top_counts: dict, cond_counts: dict, total: int
+                     ) -> tuple[set, set, list]:
+    """输入:字段→命中 PT 数(顶层/条件)+ PT 总数 → 输出:(顶层样板集, 条件样板集, 明细)。
+
+    只对判定表里出现过的字段计算 —— 其余字段本来就不参与判定,算了也没用。
+    明细给调用方**报数**用:样板被静默剔掉 = 判定悄悄少了一条依据,
+    正是本仓最忌讳的那种"看起来一切正常"。
+    """
+    signals = {f for f, _, _, _ in FIELD_CERTS} | {INGREDIENTS_FIELD, AGE_FIELD}
+    top_bp, cond_bp, detail = set(), set(), []
+    for f in sorted(signals):
+        nt, nc = top_counts.get(f, 0), cond_counts.get(f, 0)
+        rt = nt / total if total else 0.0
+        rc = nc / total if total else 0.0
+        tag = ""
+        if rt > BOILERPLATE_TOP:
+            top_bp.add(f)
+            tag = f"顶层命中 {rt:.0%} → 样板,不算判据"
+        if rc > BOILERPLATE_COND:
+            cond_bp.add(f)
+            tag = (tag + ";" if tag else "") + f"条件命中 {rc:.0%} → 样板,不算判据"
+        detail.append((f, nt, nc, tag))
+    return top_bp, cond_bp, detail
+
+
 def judge(product_type: str, required: set, *, conditional: set | None = None,
           age_values: list | None = None, category: str = "",
-          policy: str = "", policy_status: str = "") -> Admission:
+          policy: str = "", policy_status: str = "",
+          boilerplate_top: set | None = None,
+          boilerplate_cond: set | None = None) -> Admission:
     """输入:PT + **顶层必填**字段集(+ 条件必填 / ageGroup 取值 / 类目 / 政策)
     → 输出:Admission(认证清单 + 三档结论 + 逐条依据)。
 
@@ -159,7 +197,9 @@ def judge(product_type: str, required: set, *, conditional: set | None = None,
     """
     order = {OK: 0, EVAL: 1, BLOCK: 2}
     certs, reasons, worst = [], [], OK
-    cond = conditional or set()
+    # 样板字段直接从两个集合里剔掉:哪儿都有 = 没有区分力
+    required = set(required) - (boilerplate_top or set())
+    cond = (conditional or set()) - (boilerplate_cond or set())
 
     def _add(cert: str, tier: str, why: str, weak: bool = False) -> None:
         nonlocal worst

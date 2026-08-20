@@ -230,25 +230,51 @@ def run(params: dict) -> str:
             if xs:
                 lines.append(f"  {tag}:" + "、".join(xs))
 
+        # ── 第一遍:只统计判据字段的覆盖率,定出哪些是"哪儿都有"的样板 ──
+        cache: dict = {}
+        top_counts: collections.Counter = collections.Counter()
+        cond_counts: collections.Counter = collections.Counter()
+        for pt in pts:
+            spec = pt_spec.load_pt(pt)
+            if spec is None:
+                continue
+            top_req = set(spec.get("required") or [])
+            cond_req = set()
+            for c in (spec.get("allOf") or []):
+                cond_req.update((c.get("then") or {}).get("required") or [])
+            cache[pt] = (spec, top_req, cond_req)
+            top_counts.update(top_req)
+            cond_counts.update(cond_req)
+        bp_top, bp_cond, bp_detail = pt_admission.find_boilerplate(
+            top_counts, cond_counts, len(cache) or 1)
+        lines.append(f"判据字段覆盖率(共 {len(cache)} 个 PT;"
+                     f"顶层>{pt_admission.BOILERPLATE_TOP:.0%} 或 "
+                     f"条件>{pt_admission.BOILERPLATE_COND:.0%} 即判样板,不算判据):")
+        for f, nt, nc, tag in bp_detail:
+            if nt or nc:
+                lines.append(f"   {f:<58}顶层 {nt:>5} / 条件 {nc:>5}"
+                             + (f"   ⚠ {tag}" if tag else ""))
+        if bp_top or bp_cond:
+            lines.append(f"   → 剔除样板:顶层 {sorted(bp_top)} / 条件 {sorted(bp_cond)}")
+
         stat = {pt_admission.OK: 0, pt_admission.EVAL: 0, pt_admission.BLOCK: 0}
         rows, review, changed, no_spec = [], [], 0, 0
         diff: collections.Counter = collections.Counter()
         unlock_detail: collections.Counter = collections.Counter()
         want = {x.strip() for x in str(params.get("pt", "")).split(",") if x.strip()}
         for pt in pts:
-            spec = pt_spec.load_pt(pt)
-            if spec is None:
+            got = cache.get(pt)
+            if got is None:
                 no_spec += 1
                 continue
+            spec, top_req, cond_req = got
             req = common_req | pt_admission.extract_required(spec)   # 导出列口径
-            top_req = set(spec.get("required") or [])                 # 判定口径
-            cond_req = set()
-            for c in (spec.get("allOf") or []):
-                cond_req.update((c.get("then") or {}).get("required") or [])
             m = meta.get(pt, {})
             adm = pt_admission.judge(pt, top_req, conditional=cond_req,
                                      age_values=_age_values(spec),
-                                     category=m.get("cat", ""))
+                                     category=m.get("cat", ""),
+                                     boilerplate_top=bp_top,
+                                     boilerplate_cond=bp_cond)
             old = _old_bucket(m.get("zh", ""))
             order = {pt_admission.OK: 0, pt_admission.EVAL: 1, pt_admission.BLOCK: 2}
             move = ("新增(现表无此 PT)" if not old else

@@ -71,7 +71,10 @@ def _compose(old_reason: str, hits: list[tuple[str, dict]]) -> tuple[str, str]:
 
 def run(params: dict) -> str:
     """输入:params(execute/chunk)→ 输出:改写统计 + 旧命中规则码全分布。"""
-    execute = bool(params.get("execute"))
+    # ⚠ 同 category_blacklist_import:DANGEROUS=False 时 cli 恒给
+    # execute=True,`--dry-run` 必须自己认 dry_run —— 漏了这一句的话
+    # `--dry-run` 会直接把存量刷了,而且报成功
+    execute = bool(params.get("execute")) and not params.get("dry_run")
     chunk = int(params.get("chunk", 10_000))
     scanned = rewritten = orphan = 0
     dist: collections.Counter = collections.Counter()

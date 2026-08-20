@@ -149,14 +149,18 @@ _RULE_SOURCE = {
     "cat_requires_cert_small_part": "audit.walmart_pt_spec + NRTL 词表",
     "zh_seller_mega_cat_forbidden": "代码常量:中国卖家硬禁 8 大类",
     "forbidden_mega_cat":           "refdata 禁售大类 yaml",
-    # ⚠ 判据只是 amazon_category_path 的**第一段**,清单 2026-08-17 起只剩旧仓
-    # 4 个(礼品袋被判药品那次的直接产物)。看到这条先核 detail.full_path
-    "phase0_forbidden_category":    "代码常量:audit_phase0.FORBIDDEN_AMAZON_TOPS"
-                                    "(只看路径第一段)",
+    # ⚠ 判据只是 amazon_category_path 的**第一段**(顶级类目名)。清单
+    # 2026-08-20 起住在库里(match_type='top_name'),改类目改表不改代码;
+    # 看到这条先核 detail.full_path,再核表里那行顶级名对不对
+    "phase0_forbidden_category":    "catalog.amazon_cat_blacklist "
+                                    "match_type='top_name'(只看路径第一段)",
     "phase0_brand_blacklist":       "catalog.brand_blacklist",
     "phase0_lark_blacklist_asin":   "catalog.asin_blacklist",
     "phase0_lark_blacklist_seller": "catalog.seller_blacklist",
-    "phase0_lark_blacklist_amazon_cat": "catalog.amazon_cat_blacklist",
+    # 同一张表的另外两种匹配:node_subtree 拦整棵子树(detail.browse_node_id
+    # 是被命中的子树根)、path_exact 归一化完整路径等值(飞书镜像历史行)
+    "phase0_lark_blacklist_amazon_cat": "catalog.amazon_cat_blacklist "
+                                    "match_type='node_subtree'/'path_exact'",
     "title_desc_blacklist":         "catalog.brand_blacklist(扫标题/描述)",
     "trademark_live":               "uspto 商标库",
     "phase0_trademark_symbol":      "正则扫标题/bullets/描述",

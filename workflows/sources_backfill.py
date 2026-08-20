@@ -56,7 +56,9 @@ ORDER BY w.store, w.sku
 
 def run(params: dict) -> str:
     """输入:params(execute)→ 输出:盲区统计(dry-run)或回填摘要。"""
-    execute = bool(params.get("execute"))
+    # ⚠ DANGEROUS=False ⇒ cli 恒给 execute=True(缺省即真跑),`--dry-run`
+    # 只走 dry_run 这一路;漏认它的话本工作流的 --dry-run 会照写不误
+    execute = bool(params.get("execute")) and not params.get("dry_run")
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_SQL_GAP)

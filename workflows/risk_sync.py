@@ -20,8 +20,10 @@
     → catalog.amazon_cat_blacklist(审核 Phase0 类目闸,入库即归一化)
 
 同步语义分两族:前两表**只增改不删**(upsert,不碰 pushed_at 列);
-黑名单中心两张单列表 **TRUNCATE 全量重灌**(飞书删行必须跟着消失,
-详见 _sync_column_blacklist)。所有者定稿 2026-08-07:表格随时会停用,
+黑名单中心两张单列表 **全量重灌**(飞书删行必须跟着消失,详见
+_sync_column_blacklist);⚠ 类目表的重灌**只洗 source='feishu' 的行** ——
+同一张表里还住着按 browse_node_id 拦子树的人工/清洗规则,洗掉就等于
+每天把清洗成果还原一次。所有者定稿 2026-08-07:表格随时会停用,
 停用后 PG 是唯一权威;上架否决闸(services/risk_gate)与审核四闸
 (services/audit_rules)都只读 PG。
 
@@ -97,18 +99,34 @@ def _sync_column_blacklist(conn, sheet, table: str, rows: list[dict],
     if not payload:
         return (f"⚠ 「{sheet.name}」:本轮读到 0 条(疑似接口/配置异常),"
                 f"不重灌,库内旧数据保留生效")
+    # ⚠ 重灌**只洗自己灌进去的那批**(source='feishu')。2026-08-20 起同一张
+    # 类目表里还住着人工/清洗导入的子树规则(source<>'feishu'),TRUNCATE 会把
+    # 它们一起洗掉 —— 每天同步一次就把清洗成果洗没了,而且不报错。
+    own = " WHERE source = 'feishu'" if normalize else ""
     with conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {table}")
+        cur.execute(f"SELECT count(*) FROM {table}{own}")
         (old_n,) = cur.fetchone()
     if old_n >= 20 and len(payload) < old_n * 0.5:
         raise RuntimeError(f"「{sheet.name}」骤缩 {old_n}→{len(payload)}"
                            f"(超 50%),拒绝重灌——人工核实飞书表后再跑")
-    cols = "(category_norm, category_raw)" if normalize else "(seller_id)"
-    ph = "(%s, %s)" if normalize else "(%s)"
+    if normalize:
+        cols, ph = "(category_norm, category_raw, match_type, source)", "(%s, %s, 'path_exact', 'feishu')"
+    else:
+        cols, ph = "(seller_id)", "(%s)"
     with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {table}")
+        if own:
+            cur.execute(f"DELETE FROM {table}{own}")
+        else:
+            cur.execute(f"TRUNCATE {table}")
         cur.executemany(f"INSERT INTO {table} {cols} VALUES {ph}", payload)
-    return f"「{sheet.name}」:全量重灌 {len(payload)} 条"
+    kept = ""
+    if own:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {table} WHERE source <> 'feishu'")
+            (n_keep,) = cur.fetchone()
+        if n_keep:
+            kept = f";另有 {n_keep} 条非飞书来源的规则(子树/人工)未受影响"
+    return f"「{sheet.name}」:全量重灌 {len(payload)} 条{kept}"
 
 
 def run(params: dict) -> str:

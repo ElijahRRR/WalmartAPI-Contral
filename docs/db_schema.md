@@ -196,10 +196,22 @@ CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
 -- (与"只增改不删"家族不同:飞书删行必须跟着消失),两道护栏:空读绝不
 -- 重灌 + 骤缩超 50% 拒绝;各走独立事务
 CREATE TABLE catalog.seller_blacklist (seller_id PK, synced_at);
+-- ⚠ 类目表 2026-08-20 扩成**类目闸的唯一判据来源**(所有者定稿「代码里面
+-- 的类目可以拿到数据库里来」):原 audit_phase0.FORBIDDEN_AMAZON_TOPS 四个
+-- 硬编码顶级已迁进表内。三种匹配由 match_type 区分:
+--   node_subtree  产品 browse_node_chain 里出现 browse_node_id ⇒ 拦整棵子树
+--                 (**首选**;解决父级不覆盖子级 + 类目改名两个老毛病)
+--   top_name      按顶级类目名(亚马逊顶级 browse node 无 ID,只能按名字)
+--   path_exact    归一化完整路径等值(飞书镜像历史行,兼容保留)
+-- source 列分家两个写入口:'feishu' 归 risk_sync 全量重灌(**只 DELETE 这一
+-- 源**,否则每天同步一次就把清洗成果洗没了),'cleanup'/'seed' 归
+-- category_blacklist_import。判定件 services/category_blacklist.py 零 DB。
 CREATE TABLE catalog.amazon_cat_blacklist (
     category_norm PK,   -- 归一化路径(audit_phase0.normalize_amazon_category,
                         -- 入库/查询两侧共用同一函数,读取端不再二次归一化)
-    category_raw, synced_at);
+    category_raw, match_type DEFAULT 'path_exact', match_value, browse_node_id,
+    category_zh, reason, walmart_policy, enabled DEFAULT true,
+    source DEFAULT 'feishu', synced_at);
 
 -- 品牌·后台报错渠道表(beyKyi 投影源,PG 权威):完整记录沃尔玛后台问题
 -- 商品拿到过哪些品牌;渠道内按品牌去重,**不与总清单去重**(所有者厘清

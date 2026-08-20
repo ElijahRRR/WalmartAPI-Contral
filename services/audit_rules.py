@@ -21,7 +21,8 @@ import logging
 from dataclasses import dataclass, field
 
 from registry import paths
-from services import audit_l1_llm, audit_l2, audit_phase0, audit_reason
+from services import (audit_l1_llm, audit_l2, audit_phase0, audit_reason,
+                      category_blacklist)
 from services.audit_models import AuditOutcome, L1Info, RuleHit
 from services.audit_stopwords import is_stopword
 
@@ -33,7 +34,7 @@ class AuditContext:
     """规则引擎的全部数据依赖(load_context 一次装配,规则函数零 DB 访问)。"""
     phase0_sellers: frozenset
     phase0_asins: frozenset
-    phase0_cats: frozenset
+    phase0_cats: frozenset          # 兼容保留(路径等值那份)
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
     pt_spec: dict                  # PT → row dict
@@ -51,6 +52,9 @@ class AuditContext:
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
     node_map: dict = field(default_factory=dict)              # browse_node_id → PT(高置信唯一,已 pt_meta 闸)
+    # 类目黑名单(2026-08-20:代码里的类目常量搬进 DB)。三种匹配一次装配:
+    # 子树 node_id / 顶级名 / 完整路径等值,判定见 services.category_blacklist.check
+    cat_rules: object = None
 
 
 def _brand_map(conn) -> tuple[dict, set]:
@@ -198,7 +202,11 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
     p0_sellers = _frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist")
     p0_asins = _frozen(conn, "SELECT asin FROM catalog.asin_blacklist")
-    p0_cats = _frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist")
+    p0_cats = _frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"
+                            " WHERE enabled")
+    # 类目闸的判据全在库里(2026-08-20 所有者定稿:代码里的类目搬进 DB):
+    # 子树 ID / 顶级名 / 路径等值三种匹配,一次装配
+    cat_rules = category_blacklist.load(conn)
     # 报数与品牌黑名单同款(2026-08-19 所有者在运行日志里找不到这三张表的
     # 加载痕迹——加载是真的,静默也是真的;三张表载成空集与没加载在行为上
     # 无法区分,必须让数字见人)
@@ -208,6 +216,7 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         phase0_sellers=p0_sellers,
         phase0_asins=p0_asins,
         phase0_cats=p0_cats,
+        cat_rules=cat_rules,
         brand_blacklist=brand,
         pt_meta=pt_meta,
         pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "
@@ -487,4 +496,5 @@ def product_info_from_row(row: dict):
         known_pt=row.get("walmart_pt") or None,
         known_pt_source=row.get("pt_source") or None,
         browse_node_id=row.get("browse_node_id") or "",
+        browse_node_chain=row.get("browse_node_chain") or "",
     )

@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **68 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **69 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1638 个单元测试**。
+- **1659 个单元测试**。
 
 ---
 
@@ -263,6 +263,13 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 判"这个产品能不能上"。分层:Phase0 精准拦截 → L1 类目 → L2 八条硬规则 →
 L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 
+⚠ **类目闸判据全在库里**(`catalog.amazon_cat_blacklist`,2026-08-20 起),
+代码里一个类目常量都没有。首选按 `browse_node_id` **拦整棵子树** —— 名单写
+「拼图」,`拼图 > 3-D 拼图` 跟着被拦,类目改名也不失效;顶级类目(亚马逊顶级
+无 node id)按名字拦;归一化完整路径等值是飞书镜像的历史行,**父级不覆盖子级**,
+故排最后。判定件 `services/category_blacklist.py` 零 DB 访问,一次 `load()`
+装配后是纯函数。
+
 | 工作流 | | 做什么 |
 |---|---|---|
 | `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 C~G;缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉 |
@@ -308,9 +315,10 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `risk_sync` | 调 | 飞书四表 → PG 镜像(类目表 / 黑名单品牌总表 / 黑名单卖家 / 黑名单亚马逊类目) |
+| `risk_sync` | 调 | 飞书四表 → PG 镜像(类目表 / 黑名单品牌总表 / 黑名单卖家 / 黑名单亚马逊类目)。⚠ 类目表重灌**只洗 `source='feishu'` 的行**,清洗导入与种子不受影响 |
 | `blacklist_push` | 调 | PG 自产黑名单 → 飞书两张收集表(**整表重写**,带骤缩护栏) |
 | `asin_blacklist_import` | 危 一 | 黑名单 ASIN 批量导入 |
+| `category_blacklist_import` | | 类目黑名单录入/重录:`-p seed=1` 灌内置种子(顶级 + 子树根)、`-p csv=<路径>` 灌清洗名单、`-p replace=1` 先清同源旧行 |
 
 ⚠ **两条时间线**:否决闸在 `problem_scan` 写完 PG 那一刻就生效(上架与审核读 PG,
 从不读飞书表);飞书表格是投影,`problem_scan` 收尾顺手推一次,`blacklist_push` 兜底。

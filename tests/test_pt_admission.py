@@ -213,3 +213,42 @@ def test_evidence_kind_separates_empirical_from_inferred():
     assert _evidence_kind("否（Walmart 禁售）") == "沃尔玛政策禁售"
     assert _evidence_kind("否 (中国卖家进不去)") == "推断:准入状态需审批"
     assert _evidence_kind("是") == "" and _evidence_kind("需评估 (要合规投入)") == ""
+
+
+# ── 「必填」以生产上架链的定义为准,不许对齐旧表的错数字 ────────────────────
+
+def test_required_definition_matches_the_listing_chain():
+    """一个 MP_ITEM 能不能提交,`mp_conform.validate` 只看两处**顶层** required:
+    PT spec 的 与 Orderable spec 的。条件必填由 fill_known_required 按实际取值
+    动态补,不属于静态必填集。
+
+    2026-08-20 纠错:此前为对上现表的 46,用的是"递归 ∪ Orderable 递归"。
+    数字对上了,但**现表那 46 本身就是错的** —— 混着 `certification_type`
+    (实测只在 properties)、`country_of_origin_substantial_transformation`
+    (实测该 PT 压根不存在)、以及儿童产品证书那组条件样板。
+    所有者原话:「必填字段不对,推断就是错的」。对齐一个错数字,只会让错误
+    看起来像验证过。
+    """
+    import inspect
+    from services import mp_conform
+    from workflows import pt_spec_sync
+    # 上架链的必填读法:顶层 required,两段各查一次
+    src = inspect.getsource(mp_conform.validate)
+    assert '_check(visible, spec' in src and '_check(orderable, ospec' in src
+    assert 'set((spec or {}).get("required")' in inspect.getsource(mp_conform._required)
+    # 本工作流必须同源:导出列不许再出现"递归收全"
+    wf = inspect.getsource(pt_spec_sync.run)
+    assert "req = common_req | top_req" in wf
+    assert "extract_required(spec)" not in wf
+
+
+def test_conditional_required_is_not_static_required():
+    """条件必填只在取值触发时才要 —— 把它算进"必填字段清单",人照着去准备材料
+    会白准备一堆(洗发水按那张清单要去办儿童产品证书)。"""
+    from services import mp_conform
+    spec = {"required": ["productName"],
+            "allOf": [{"if": {"properties": {"isChildProduct": {"enum": ["Yes"]}}},
+                       "then": {"required": ["children_product_certificate_document_reference_id"]}}]}
+    assert mp_conform._required(spec) == {"productName"}
+    # 取值没触发 → 条件必填不进来
+    assert mp_conform.resolve_conditional_required(spec, {"isChildProduct": "No"}) == set()

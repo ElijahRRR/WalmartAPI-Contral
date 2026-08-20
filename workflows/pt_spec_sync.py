@@ -168,9 +168,15 @@ def _explain(pt: str) -> list[str]:
     o_rec_req = pt_admission.extract_required(orderable)
     o_rec_props = pt_admission.all_fields(orderable)
 
-    out = [f"── {pt} 的字段读法对表(现表若是 113/46,看哪一行对得上)"]
+    out = [f"── {pt} 的字段读法对表",
+           "   ✅ **权威口径 = 上架链 mp_conform.validate**:visible.required ∪ "
+           "orderable.required(两处**顶层**)。条件必填由 fill_known_required 按实际"
+           "取值动态补,不算静态必填;现表那套递归数法混进了 properties-only 与"
+           "条件样板字段,数字大但不是必填。"]
+    out.append(f"   ✅ 上架链口径          必填 {len(top_req | o_req):>4} / "
+               f"字段总数 {len(top_props | o_props):>4}   ← 导出列用这个")
     for name, req, props in (
-            ("顶层(上架链 mp_conform 口径)", top_req, top_props),
+            ("顶层(仅 PT 段)", top_req, top_props),
             ("顶层 + allOf.then 条件必填", top_req | cond_req, top_props),
             ("顶层 + 条件 + Orderable 顶层", top_req | cond_req | o_req, top_props | o_props),
             ("递归收全(PT 自己)", rec_req, rec_props),
@@ -220,16 +226,24 @@ def run(params: dict) -> str:
         lines.append(f"  ⚠ 有 {n_idx - n_ok} 个 PT 在索引里但找不到拆分文件,"
                      f"这批判不了(spec 目录不完整)")
 
-    # 两套口径,各司其职(2026-08-20 拿本地 spec 对表定的):
-    #  · **导出列**「必填字段数/字段总数」= 递归 ∪ Orderable 递归 —— 与现表口径
-    #    一致(实测 `3-in-1 Shampoo` 必填 46,正是这个数),换口径会让人对不上表;
-    #  · **判定**只看 PT 自己的**顶层必填 + allOf 条件必填** —— 上架链
-    #    services/mp_conform 读的就是顶层,递归会把深层备用字段全收进来
-    #    (所有者:「以前上架系统…搞了很多字段出来」);Orderable 那些
-    #    sku/price/ShippingWeight 是信封字段,零合规信号,进判定只会添噪。
-    common_req = pt_admission.extract_required(pt_spec.orderable_spec())
-    common_all = pt_admission.all_fields(pt_spec.orderable_spec())
-    lines.append(f"  Orderable 公共必填 {len(common_req)} 个(并进导出清单,判定不看)")
+    # 「必填」以**生产上架链的定义**为准(services/mp_conform.validate):
+    # 一个 MP_ITEM 能不能提交,只看两处**顶层** required ——
+    #     _check(visible,   spec,  "visible")     PT spec 顶层 required
+    #     _check(orderable, ospec, "orderable")   Orderable spec 顶层 required
+    # 条件必填(allOf.then)由 fill_known_required 按**实际取值**动态补,不属于
+    # 静态必填集。
+    #
+    # ⚠ 2026-08-20 纠错:此前为了对上现表的 46,用的是"递归收全 ∪ Orderable
+    # 递归"。数字是对上了,但**现表那 46 本身就是错的** —— 里面混着
+    # `certification_type`(实测只在 properties)、
+    # `country_of_origin_substantial_transformation`(实测该 PT 压根不存在)、
+    # 以及儿童产品证书那组条件样板。所有者原话:「必填字段不对,推断就是错的」。
+    # 对齐一个错的数字,只会让错误看起来像验证过。
+    ord_spec = pt_spec.orderable_spec()
+    common_req = set(ord_spec.get("required") or [])
+    common_all = set(ord_spec.get("properties") or {})
+    lines.append(f"  Orderable 顶层必填 {len(common_req)} / 字段 {len(common_all)} 个"
+                 f"(与 PT 段并集即上架链 validate 的必填口径)")
 
     pts = sorted(pt_spec.known_pts())
     if limit:
@@ -288,7 +302,7 @@ def run(params: dict) -> str:
                 no_spec += 1
                 continue
             spec, top_req, cond_req = got
-            req = common_req | pt_admission.extract_required(spec)   # 导出列口径
+            req = common_req | top_req          # 上架链 validate 口径
             m = meta.get(pt, {})
             adm = pt_admission.judge(pt, top_req, conditional=cond_req,
                                      age_values=_age_values(spec),
@@ -310,7 +324,7 @@ def run(params: dict) -> str:
             rows.append([m.get("cat", ""), m.get("ptg", ""), pt,
                          m.get("access", ""),
                          adm.verdict, " | ".join(adm.certs), m.get("notes", ""),
-                         len(common_all | pt_admission.all_fields(spec)), len(req),
+                         len(common_all | set(spec.get("properties") or {})), len(req),
                          " | ".join(sorted(req))])
             review.append([pt, m.get("cat", ""), m.get("ptg", ""),
                            m.get("access", ""), m.get("zh", ""), adm.verdict, move,

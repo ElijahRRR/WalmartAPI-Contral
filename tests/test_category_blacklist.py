@@ -133,3 +133,29 @@ def test_seed_rules_are_wellformed():
         if r["match_type"] == cb.MATCH_NODE:
             assert r.get("browse_node_id", "").isdigit(), r
         assert r.get("reason")
+
+
+# ── 顶级名两种写法必须归到同一个键(2026-08-20 实见的静默漏拦)──────────
+
+def test_top_name_matches_both_spellings():
+    """同一个顶级在真实数据里有两种写法,规则只写一种也得两种都拦。
+
+    实见:飞书类目名单存的是挤掉空格的 `VideoGames->XboxOne->Games`,而规则
+    按官方树写的是 `Video Games` —— 旧归一只压空白,两边差 `&` 两侧的空格就
+    **整条「电子游戏整顶级不做」不触发,而且不报错**。
+    """
+    for rule_name, product_top in [("Video Games", "VideoGames"),
+                                   ("VideoGames", "Video Games"),
+                                   ("Clothing, Shoes & Jewelry", "Clothing,Shoes&Jewelry"),
+                                   ("Grocery & Gourmet Food", "Grocery&GourmetFood")]:
+        rules = _rules(tops=[rule_name])
+        hit = cb.check(rules, f"{product_top} > 随便什么子类目")
+        assert hit and hit.matched_by == cb.MATCH_TOP, f"{rule_name} 拦不住 {product_top}"
+
+
+def test_distinct_tops_do_not_collide_after_strip():
+    """删空白删逗号不能把两个**不同**的顶级并成一个 —— 39 官方顶级已核无碰撞,
+    这里钉死几个最像的,防止哪天有人再放宽归一。"""
+    assert cb._norm_top("Baby") != cb._norm_top("Baby Products")
+    assert cb._norm_top("Books") != cb._norm_top("Audible Books & Originals")
+    assert cb._norm_top("Camera & Photo") != cb._norm_top("Cameras & Photo Gear")

@@ -207,3 +207,17 @@ def test_missing_column_falls_back_but_says_so(tmp_path, conn):
     out = wf.run({"csv": path, "execute": True})
     assert conn.written[0]["mt"] == cb.MATCH_NODE
     assert "没有「匹配方式」列" in out and "1 行" in out
+
+
+def test_top_name_rows_are_imported(tmp_path, conn):
+    """「顶级名」行必须录进去 —— 亚马逊顶级 browse node 不发 ID,整顶级不做
+    只能按名字拦。漏了这一路的话「电子游戏整顶级不做」这种规则会被整批跳过。"""
+    path = _csv4(tmp_path, "\n".join([
+        "Video Games,,电子游戏,留-所有者定稿,整顶级不做,顶级名,Video Games",
+        "Toys&Games->Puzzles,166057011,拼图,留-所有者定稿,整棵不做,子树,T > P",
+    ]) + "\n")
+    out = wf.run({"csv": path, "execute": True})
+    by = {r["mv"]: r for r in conn.written}
+    assert by["Video Games"]["mt"] == cb.MATCH_TOP
+    assert by["Video Games"]["nid"] is None
+    assert "顶级名 1" in out and "匹配方式非录入 0" in out

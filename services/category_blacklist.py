@@ -30,7 +30,10 @@ frozenset/dict,`check()` 是纯函数。审核判定件(audit_phase0)只认 chec
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
+
+_TOP_STRIP_RE = re.compile(r"[\s,]+")
 
 logger = logging.getLogger("services.category_blacklist")
 
@@ -112,14 +115,18 @@ WHERE enabled
 
 
 def _norm_top(s: str) -> str:
-    """顶级名归一:逗号先当空格,再压空白 + 小写。
+    """顶级名归一:**空白与逗号全删** + 小写。
 
-    ⚠ 顺序要紧:先删逗号再压空白的话 'Clothing,Shoes & Jewelry'(逗号后无
-    空格,飞书里真实存在的写法)会归成 'clothingshoes...',与
-    'Clothing, Shoes & Jewelry' 对不上 —— 旧实现正是这么漏的
-    (tests/test_audit_phase0.py B2-5 曾把这个漏拦当"已知缺陷"钉死)。
+    ⚠ 2026-08-20 修:同一个顶级在真实数据里有两种写法,而且**互不匹配**——
+      · 官方树 / 产品路径:'Clothing, Shoes & Jewelry'、'Video Games'
+      · 飞书类目名单 / 部分采集路径:'Clothing,Shoes&Jewelry'、'VideoGames'
+    只压空白的话前者归成 'clothing shoes & jewelry'、后者归成
+    'clothing shoes&jewelry',**差一个 & 两侧的空格就整条规则不触发**,
+    `VideoGames->XboxOne->Games` 在「电子游戏整顶级不做」下照样放行,
+    而且不报错。空白和逗号一起删掉,两种写法归到同一个键。
+    (39 个官方顶级 + 已知别名在这个口径下无碰撞,已核。)
     """
-    return " ".join((s or "").replace(",", " ").split()).lower()
+    return _TOP_STRIP_RE.sub("", s or "").lower()
 
 
 def load(conn) -> CatRules:

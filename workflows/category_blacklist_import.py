@@ -17,7 +17,7 @@ CSV 列(与清洗表同构,多余列忽略):
   中文翻译           category_zh
   建议               只有 `留-*` / `增-*` 开头的行才录入;`删-*` 一律跳过
   原因               reason
-  匹配方式           **`子树` / `路径等值` / 其它值一律跳过**(见下)
+  匹配方式           **`子树` / `顶级名` / `路径等值` / 其它值一律跳过**(见下)
 
 ⚠ **「有 ID 就当子树根」是错的**,别再退回那个口径(2026-08-20 做净增覆盖
 对账时实见):名单里 582 条的 browse_node_id 是**回落匹配**来的 —— 祖先前缀、
@@ -73,7 +73,7 @@ def _seed_rows() -> list[dict]:
 def _csv_rows(path: str) -> tuple[list[dict], dict]:
     from services.audit_phase0 import normalize_amazon_category as norm
     out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0, "跳过-匹配方式": 0,
-                  "子树": 0, "路径等值": 0, "无匹配方式列-按ID推断": 0}
+                  "子树": 0, "顶级名": 0, "路径等值": 0, "无匹配方式列-按ID推断": 0}
     with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             n["读入"] += 1
@@ -94,6 +94,9 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
                 n["无匹配方式列-按ID推断"] += 1
             elif how == "子树" and nid:
                 mt = cb.MATCH_NODE
+            elif how == "顶级名":
+                # 亚马逊顶级 browse node 不发 ID,整顶级不做只能按名字拦
+                mt, nid = cb.MATCH_TOP, None
             elif how == "路径等值":
                 mt, nid = cb.MATCH_PATH, None
             else:
@@ -101,7 +104,8 @@ def _csv_rows(path: str) -> tuple[list[dict], dict]:
                 # 净增覆盖那些行的建议也以「增」开头,只靠建议列会把它们录进去
                 n["跳过-匹配方式"] += 1
                 continue
-            n["子树" if mt == cb.MATCH_NODE else "路径等值"] += 1
+            n[{cb.MATCH_NODE: "子树", cb.MATCH_TOP: "顶级名",
+               cb.MATCH_PATH: "路径等值"}[mt]] += 1
             # match_value 一律存**人看的路径**(排查时 audit_why 直接显示它);
             # 子树规则真正的判据是 browse_node_id 列,不是这一列
             out.append({"norm": norm(cat), "raw": (row.get("官方完整路径") or cat).strip(),
@@ -129,7 +133,8 @@ def run(params: dict) -> str:
         got, n = _csv_rows(path)
         rows += got
         lines.append(f"CSV {path}:读入 {n['读入']} 行 → 录入 {len(got)} "
-                     f"(子树 {n['子树']} / 路径等值 {n['路径等值']});"
+                     f"(子树 {n['子树']} / 顶级名 {n['顶级名']} / "
+                     f"路径等值 {n['路径等值']});"
                      f"跳过:建议为删 {n['跳过-删']}、无建议 {n['跳过-无建议']}、"
                      f"匹配方式非录入 {n['跳过-匹配方式']}")
         if n["无匹配方式列-按ID推断"]:

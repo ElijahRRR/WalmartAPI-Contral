@@ -573,13 +573,31 @@ LLM_PRICING_SOURCE = "api-docs.deepseek.com/quick_start/pricing(2026-08-21 核)"
 # 峰值时段(UTC 小时,左闭右开)。谷时段 = 其余全部
 LLM_PEAK_HOURS_UTC = ((1, 4), (6, 10))
 
-# model → {tier: (cache_hit, cache_miss, output)},USD / 1M token
+# model → {tier: (cache_hit, cache_miss, output)},USD / 1M token。
+# 键是**定价页上的产品名**;请求里发的 `model` 可能是别名,先过 LLM_MODEL_ALIASES。
 LLM_PRICING = {
     "deepseek-v4-flash": {"peak":    (0.014, 0.44, 1.32),
                           "offpeak": (0.007, 0.22, 0.66)},
     "deepseek-v4-pro":   {"peak":    (0.044, 1.32, 3.96),
                           "offpeak": (0.022, 0.66, 1.98)},
 }
+
+# 旧别名 → 定价页产品名(2026-08-21 核官方更新日志)。
+# ⚠ `deepseek-chat` / `deepseek-reasoner` 是**官方已宣布停用的旧别名**
+#   (2026-04-24 公告:三个月后即 2026-07-24 停用),当前路由到 v4-flash 的
+#   非思考 / 思考模式。**停用日期已过**,还能用纯属宽限期 —— 一旦切断,
+#   全仓 LLM 调用会同时失败(L1 rerank / L3 / 上架属性映射 / variant_remap)。
+#   生产应在 .env 显式写 `DEEPSEEK_MODEL=deepseek-v4-flash`。
+LLM_LEGACY_ALIASES = {"deepseek-chat", "deepseek-reasoner"}
+LLM_MODEL_ALIASES = {
+    "deepseek-chat": "deepseek-v4-flash",       # 非思考模式
+    "deepseek-reasoner": "deepseek-v4-flash",   # 思考模式,同一张价表
+}
+
+
+def llm_priced_model(model: str) -> str:
+    """输入:请求里发的 model → 输出:LLM_PRICING 里的键(别名已折叠)。"""
+    return LLM_MODEL_ALIASES.get(model, model)
 
 
 def llm_price_tier(dt) -> str:

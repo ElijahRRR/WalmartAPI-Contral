@@ -19,9 +19,32 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-# 旧生产用 deepseek-v4-flash(thinking disabled);模型名可经 .env 切换,
-# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)
-_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# 全仓统一 **deepseek-v4-flash**(所有者定稿 2026-08-21:「LLM 都用
+# deepseek-v4-flash,审核和上架都是」)。模型名仍可经 .env 逐用途覆盖,
+# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)。
+#
+# ⚠ 2026-08-21 把缺省值从 `deepseek-chat` 改成正式模型名。原因不是洁癖:
+#   ① `deepseek-chat` 是官方**已宣布停用**的旧别名(2026-04-24 公告:三个月后
+#      即 2026-07-24 停用;改这行时是 08-21,过期近一个月还能用纯属宽限)。
+#      一旦切断,L1 rerank / L3 / 上架属性映射 / variant_remap **同时失败**;
+#   ② 下面 `if "flash" in model` 那道「thinking 必须永远显式 disabled」的旧铁律
+#      在别名下**整条失效** —— 至今没出事只因 deepseek-chat 恰好就是非思考模式,
+#      那道保险一直是空的。改成正式名后它才真正生效。
+#   生产实见:.env 里 DEEPSEEK_MODEL 没设,一直在吃这个缺省值,而注释却写着
+#   "所有者确认生产用 deepseek-v4-flash" —— 自述与实际不符,靠缺省值兜住才对。
+_DEFAULT_MODEL = "deepseek-v4-flash"
+
+
+def _default_model() -> str:
+    """输入:无 → 输出:缺省模型名(**call-time 求值**)。
+
+    不能在模块级 `os.environ.get(...)` 取:那是 import 时的快照,而 cli.py
+    的约定是「.env 先于一切业务 import 加载,registry 各函数 call-time 求值
+    即可拿到」。快照写法只在"import 恰好晚于 load_dotenv"时碰巧正确,
+    换个入口(测试、未来的网页/MCP 入口、任何提前 import 本模块的路径)
+    就会静默吃缺省值 —— 而且看不出来,只有账单和摘要里的模型名会变。
+    """
+    return os.environ.get("DEEPSEEK_MODEL", "").strip() or _DEFAULT_MODEL
 
 
 def model_for(purpose: str) -> str:
@@ -37,7 +60,7 @@ def model_for(purpose: str) -> str:
     if env is None:
         raise ValueError(f"未登记的 LLM 用途 {purpose!r}:先在 "
                          f"registry.LLM_PURPOSE_ENV 登记再使用")
-    return os.environ.get(env, "").strip() or _MODEL
+    return os.environ.get(env, "").strip() or _default_model()
 
 
 def _api_key() -> str:
@@ -159,7 +182,7 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
                               timeout=httpx.Timeout(180, connect=10))
             if resp.status_code == 200:
                 payload = resp.json()
-                record_usage(body.get("model", _MODEL), purpose,
+                record_usage(body.get("model", ""), purpose,
                              payload.get("usage"))
                 content = payload["choices"][0]["message"]["content"]
                 return _extract_json(content)

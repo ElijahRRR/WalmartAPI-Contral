@@ -28,7 +28,7 @@ def cost_of(model: str, tier: str, row: dict) -> float | None:
     cache_hit/cache_miss 拆分时(两者都是 0)退回按 prompt_tokens 全额
     当未命中算 —— **偏贵不偏便宜**,估出来的账不会让人以为花得比实际少。
     """
-    table = resources.LLM_PRICING.get(model)
+    table = resources.LLM_PRICING.get(resources.llm_priced_model(model))
     if not table or tier not in table:
         return None
     p_hit, p_miss, p_out = table[tier]
@@ -64,6 +64,7 @@ def summarize(usage_stats: dict) -> list[str]:
             agg["cost"] += c
             total_cost += c
 
+    legacy = {m for (m, _, _) in usage_stats if m in resources.LLM_LEGACY_ALIASES}
     lines = []
     for purpose, a in sorted(by_purpose.items()):
         hit, miss = a["cache_hit"], a["cache_miss"]
@@ -76,6 +77,12 @@ def summarize(usage_stats: dict) -> list[str]:
             f"{cache}{money}")
     head = (f"LLM 用量合计 ≈ ${total_cost:.2f}"
             if total_cost else "LLM 用量(无可计价模型)")
+    if legacy:
+        # 停用日期已过还在用 = 随时可能整条链一起挂,且不会提前预警
+        head += (f";⚠ **{sorted(legacy)} 是官方已宣布停用的旧别名**"
+                 f"(现路由到 {sorted({resources.llm_priced_model(m) for m in legacy})}),"
+                 f"生产请在 .env 写死 DEEPSEEK_MODEL=<正式模型名> —— "
+                 f"别名一旦切断,全仓 LLM 调用同时失败")
     if unpriced:
         # 静默按 0 计价 = 假账。点名说哪个模型没价,让人知道这个数字不全
         head += (f";⚠ 未计价模型 {sorted(unpriced)} —— 在 "

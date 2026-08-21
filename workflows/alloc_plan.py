@@ -604,7 +604,7 @@ def _pool_reach(stores: dict) -> dict:
     | 条件 | 并集怎么取 | 谁能让它失效 |
     |---|---|---|
     | 渠道 | 各店 `channel` 的集合 | 无(未填的店本就不接自由流) |
-    | 货期 | 各店 `lead_limit` 的 **max** | **任一店未填 = 不限** ⇒ 整条不筛 |
+    | 货期 | 各店**生效上限**的 **max**(未填回落 7 天) | 无 —— 没有"不限"的店 |
     | 品类 | 各店准入品类的并集 | **任一店三列全空 = 不限制** ⇒ 整条不筛 |
 
     ⚠ 后两条的"任一店放开就整条不筛"不是偷懒,是**并集的定义**:只要存在
@@ -617,13 +617,13 @@ def _pool_reach(stores: dict) -> dict:
     (`room` 是发牌阶段的事),所以"今天恰好满了"不会被读成"我们不做这个渠道"。
     """
     rows = list(stores.values())
-    limits = [r.get("lead_limit") for r in rows]
+    limits = [store_targets.lead_cap_of(r) for r in rows]
     cats = [store_targets.super_categories_of({"categories": r.get("categories")})
             if (r.get("categories") or []) else None for r in rows]
     return {
         "channels": {r.get("channel") for r in rows} - {None},
-        # 未填 = 不限(store_targets.lead_ok 的口径),一家不限则整条不筛
-        "lead_cap": None if any(v is None for v in limits) else max(limits),
+        # 未填回落 7 天(所有者 2026-08-21 统一到上架链的口径)⇒ 恒有上限
+        "lead_cap": max(limits) if limits else None,
         # 三列全空 = 不限制(store_targets.allowed 的口径),同理
         "super_cats": None if any(c is None for c in cats)
                       else set().union(*cats) if cats else set(),

@@ -13,6 +13,9 @@ from services import alloc_engine as ae
 
 
 def _g(key, score, size=1, category="Home", channel="FBA", **kw):
+    # ⚠ lead 必须有值:2026-08-21 起「未填配送时长限制」回落 7 天而不是"不限",
+    # 于是**没有任何店**会收货期未知的组(见 store_targets.lead_ok)。
+    kw.setdefault("lead", 3)
     return dict(key=key, score=score, size=size, category=category,
                 channel=channel, **kw)
 
@@ -288,25 +291,36 @@ def test_lead_limit_blocks_groups_slower_than_the_store_allows():
     """「配送时长限制」是逐店硬闸:只分 delivery_days ≤ 该值的货。"""
     fast = _g("fast", 90.0, lead=3)
     slow = _g("slow", 95.0, lead=9)
-    stores = {"STRICT": _s(9, lead_limit=5), "LOOSE": _s(9)}
+    # ⚠ LOOSE 要**显式填 10**:未填不再是"不限",而是回落 7 天(2026-08-21)
+    stores = {"STRICT": _s(9, lead_limit=5), "LOOSE": _s(9, lead_limit=10)}
     r = ae.deal([fast, slow], stores, thickness=1.0)
     where = {a["group"]["key"]: a["store"] for a in r["assign"]}
-    assert where["slow"] == "LOOSE"          # 9 天只有不限的店收
+    assert where["slow"] == "LOOSE"          # 9 天只有放宽到 10 的店收
     assert "fast" in where                   # 3 天两家都行
 
 
-def test_unknown_lead_is_refused_by_a_capped_store():
-    """⚠ 采不到货期时**受限店拒收**,不是当它够快。
+def test_unknown_lead_is_refused_by_every_store_now():
+    """⚠ 采不到货期时**一律拒收**,不是当它够快。
 
     所有者填这一列就是明确不要慢货;拿"没采到"当"够快"是替他做了他没做的
     决定。与类目那条「归不到大类的,受限店拒收」同一纪律。
+
+    ★ 2026-08-21 起连**未填**的店也拒:那一列的"未填"从"不限"改成回落 7 天,
+    统一到上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 的口径。
+    改之前只要有一家店空着这列,`_pool_reach` 的并集就变成"不限",慢货与
+    未知货期全池涌入,而且不报错。
     """
-    r = ae.deal([_g("unknown", 90.0, lead=None)],
-                {"STRICT": _s(9, lead_limit=5)}, thickness=1.0)
-    assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_LEAD
-    # 未填限制的店照收 —— 未填 = 不限
-    r2 = ae.deal([_g("unknown", 90.0, lead=None)], {"ANY": _s(9)}, thickness=1.0)
-    assert r2["assign"][0]["store"] == "ANY"
+    from services import amz_source
+    for stores in ({"STRICT": _s(9, lead_limit=5)}, {"UNSET": _s(9)}):
+        r = ae.deal([_g("unknown", 90.0, lead=None)], stores, thickness=1.0)
+        assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_LEAD
+    # 未填的店生效上限 = 7:恰好 7 天的收,8 天的不收
+    ok = ae.deal([_g("just", 90.0, lead=amz_source.MAX_LEAD_DAYS)],
+                 {"UNSET": _s(9)}, thickness=1.0)
+    assert ok["assign"][0]["store"] == "UNSET"
+    no = ae.deal([_g("over", 90.0, lead=amz_source.MAX_LEAD_DAYS + 1)],
+                 {"UNSET": _s(9)}, thickness=1.0)
+    assert no["unplaced"][0]["reason"] == ae.NO_LEAD
 
 
 def test_gate_predicates_come_from_store_targets_not_reimplemented():

@@ -359,6 +359,7 @@ def test_a_group_bound_to_a_store_can_only_go_there(monkeypatch, tmp_path):
     from services import alloc_engine as ae
     st = {"quota": 99, "room": 99, "categories": [], "channel": "FBA"}
     grp = {"key": "acme", "score": 90.0, "size": 1, "category": "Home",
+           "lead": 3,
            "channel": "FBA", "store": "A"}
     assert ae._gate(grp, "A", st) is True
     assert ae._gate(grp, "B", st) is False
@@ -440,14 +441,14 @@ def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
     """货期挡下的要单列一行 —— 「给该店开这个大类」对它们完全无效。"""
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     # ⚠ B 是**必需的**:池口按各店「配送时长限制」的并集筛,只有 A 的话 30 天的
-    # 货连池子都进不去(而那正是所有者要的 —— 没人要的货不该进来)。B 没填这一
-    # 列 = 不限 ⇒ 并集不设限,货进得来,再卡在 A 自己的闸上。这才是真实场景:
-    # 一家店严、另一家松,严的那家要看得见"我是被货期挡的"
+    # 货连池子都进不去(而那正是所有者要的 —— 没人要的货不该进来)。
+    # B 要**显式填 40**:2026-08-21 起未填不再是"不限"而是回落 7 天。
+    # 这才是真实场景:一家店严、另一家松,严的那家要看得见"我是被货期挡的"
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
         "A": {"categories": [], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0, "lead_limit": 5},
         "B": {"categories": [], "channel": "FBA", "max_online": 5000,
-              "gmv": 400.0, "orders": 5.0}})
+              "gmv": 400.0, "orders": 5.0, "lead_limit": 40}})
     monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A", "B"})
     pool = [dict(_c(f"B0SLW{i:05d}", "held0", 90.0), lead=30) for i in range(4)]
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {

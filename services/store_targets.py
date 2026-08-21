@@ -131,21 +131,35 @@ def allowed(cfg_row: dict | None, category: str | None) -> bool:
     return want in super_categories_of(cfg_row)
 
 
+def lead_cap_of(cfg_row: dict | None) -> int:
+    """输入:某店配置行 → 输出:该店**生效**的配送时长上限(天)。
+
+    未填 ⇒ 回落 `amz_source.MAX_LEAD_DAYS`(7),与上架链
+    `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 同一个回落。
+    """
+    from services import amz_source          # 惰性:避免 registry ← services 绕回
+    cap = (cfg_row or {}).get("lead_limit")
+    return int(amz_source.MAX_LEAD_DAYS if cap is None else cap)
+
+
 def lead_ok(cfg_row: dict | None, lead) -> bool:
     """输入:某店配置行 + 产品配送天数 → 输出:该店收不收这个货期。
 
-    两条口径(所有者 2026-08-16 建列):**未填 = 不限**(放行一切);
-    填了就只准入 `delivery_days <= 限制`。
-    ⚠ **产品没采到配送天数(lead 为 None)时受限店拒收**:与类目那条
-    「归不到大类的,受限店拒收」同一纪律 —— 宁可不分也不错分。所有者填了
-    这一列就是明确不要慢货,拿"没采到"当"够快"是替他做了他没做的决定。
-    ⚠ 与全局 `amz_source.MAX_LEAD_DAYS` 是**两回事**:那条管的是"上架但把
-    库存写 0"的既有链路(货照上、只是不卖),这一列管的是"这家店压根不要"。
+    口径(所有者 2026-08-16 建列,**2026-08-21 改了回落方向**):
+    填了就只准入 `delivery_days <= 限制`;**未填回落 7 天**,不是"不限"。
+
+    ★ 为什么改:同一列「配送时长限制」,两条链的"未填"回落**方向相反** ——
+    上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 未填回落 7,
+    分配这边原本未填就放行一切。所有者要求两边相互关联(2026-08-21),
+    统一到 7。影响面:只要有**一家店**空着这一列,原写法会让
+    `alloc_plan._pool_reach` 的并集变成"不限",慢货全池涌入 —— 而且不报错。
+
+    ⚠ **产品没采到配送天数(lead 为 None)时一律拒收**:与类目那条
+    「归不到大类的,受限店拒收」同一纪律 —— 宁可不分也不错分。拿"没采到"
+    当"够快"是替所有者做了他没做的决定。**现在没有"不限"的店了,所以这条
+    对每一家店都生效**(改回落之前,未填的店会把未知货期照单全收)。
     """
-    cap = (cfg_row or {}).get("lead_limit")
-    if cap is None:
-        return True
-    return lead is not None and float(lead) <= float(cap)
+    return lead is not None and float(lead) <= float(lead_cap_of(cfg_row))
 
 
 def accepts_allocation(cfg_row: dict | None) -> bool | None:

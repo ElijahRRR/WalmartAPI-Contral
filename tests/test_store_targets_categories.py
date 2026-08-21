@@ -77,3 +77,34 @@ def test_load_targets_reads_three_category_columns(monkeypatch):
     assert out["A085"]["categories"] == ["Home", "Office"]
     assert out["A107"]["categories"] == []
     assert out["A085"]["max_online"] == 500.0
+
+
+# ── 配送时长:未填回落 7 天(所有者 2026-08-21 统一到上架链)──────────────
+
+def test_unset_lead_limit_falls_back_to_seven_not_unlimited():
+    """⚠ 同一列「配送时长限制」,两条链的"未填"回落方向曾经**相反**。
+
+    上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 未填回落 7;
+    分配这边原本未填就放行一切。所有者 2026-08-21 拍板统一到 7。
+    影响面不小:只要有**一家店**空着这列,`alloc_plan._pool_reach` 的并集
+    就变成"不限",慢货与未知货期全池涌入 —— 而且不报错。
+    """
+    from services import amz_source
+    unset = {"lead_limit": None}
+    assert st.lead_cap_of(unset) == amz_source.MAX_LEAD_DAYS
+    assert st.lead_cap_of({}) == amz_source.MAX_LEAD_DAYS
+    assert st.lead_ok(unset, amz_source.MAX_LEAD_DAYS) is True
+    assert st.lead_ok(unset, amz_source.MAX_LEAD_DAYS + 1) is False
+    # 填了的照旧只认自己填的那个数(可松可严)
+    assert st.lead_ok({"lead_limit": 3}, 5) is False
+    assert st.lead_ok({"lead_limit": 30}, 20) is True
+
+
+def test_unmeasured_lead_is_refused_by_every_store_including_unset_ones():
+    """采不到货期 = 拒收。**现在没有"不限"的店了,所以每一家都拒。**
+
+    拿"没采到"当"够快"是替所有者做了他没做的决定 —— 与类目那条
+    「归不到大类的,受限店拒收」同一纪律。
+    """
+    for row in ({"lead_limit": 5}, {"lead_limit": None}, {}, None):
+        assert st.lead_ok(row, None) is False

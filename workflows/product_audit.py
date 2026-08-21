@@ -23,6 +23,10 @@
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
   python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
+  python cli.py product_audit -p from_sheet=1 -p force=1   # 同上,但 E 列为空的**一律重判**
+                                                    # (库里已有结论的也重判,不是回填);
+                                                    # E 列已填结论的表行仍然不领。飞书类目表
+                                                    # 改过之后翻存量走这条
   python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
   python cli.py product_audit -p from_sheet=1 -p gap_wait=0    # 缺数据只推采集不等(采集侧病了时)
@@ -33,7 +37,8 @@ L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑�
 products.audit_* 五列与审核事件(空跑用 --dry-run)。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 
-⚠ `from_sheet` **不是强审**:表 E 列为空只说明表里没有结论,库里可能早就有。
+⚠ `from_sheet` **缺省不是强审**(要强审加 `-p force=1`,见下):
+表 E 列为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
 领取口径含 **E=pending**(2026-08-17):pending 是中间态不是结论,写进 E 之后
@@ -195,7 +200,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
-                 "gap_wait"}
+                 "gap_wait", "force"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
@@ -221,15 +226,23 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
+    if _forced_sheet(params) and not params.get("from_sheet"):
+        # 宁炸不吞:`force` 只对 from_sheet 那条路有意义(别的通道要么本就强审、
+        # 要么有自己的候选谓词)。静默忽略的话,人以为强审了、实际按缺省口径跑,
+        # 摘要还长得一模一样 —— 与 `_pick_where` 顶上那条未识别参数同款纪律
+        raise ValueError("-p force=1 只能与 -p from_sheet=1 连用;"
+                         "点名强审用 -p asins=<逗号分隔>,"
+                         "按规则翻案用 -p rerule=<规则码>")
     asins = [a.strip() for a in str(params.get("asins", "")).split(",")
              if a.strip()]
     if asins:
-        if params.get("from_sheet"):
-            # ⚠ 上架表驱动**不是强审**(所有者纠正 2026-08-16:「按我们的运行
+        if params.get("from_sheet") and not _forced_sheet(params):
+            # ⚠ 上架表驱动**缺省不是强审**(所有者纠正 2026-08-16:「按我们的运行
             # 逻辑,不是应该直接从库里读取结果吗」)。E 列为空只说明**表里**
             # 没有结论,不说明库里没有 —— 库里已有结论的直接投影回表(零 LLM),
-            # 只有真待审的才进判定引擎。当成强审的后果是每轮把已审过的几万个
+            # 只有真待审的才进判定引擎。缺省当成强审的后果是每轮把已审过的几万个
             # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
+            # `-p force=1` 显式打开强审见 `_forced_sheet`。
             return f"p.asin = ANY(%(asins)s) AND {_DEFAULT_CANDIDATE}", \
                 {"asins": asins}
         # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
@@ -384,6 +397,31 @@ def _iter_candidates(sql: str, query_params: dict, chunk: int = _STREAM_CHUNK):
                 yield [dict(zip(cols, r)) for r in batch]
 
 
+def _forced_sheet(params: dict) -> bool:
+    """输入:params → 输出:上架表驱动这一轮要不要**强审**(`-p force=1`)。
+
+    所有者 2026-08-21 提的口径:「对飞书上架表中需要审核的产品进行强制重审,
+    **不是对表格中所有的**强制重审,而是其中**还没填写审核结果的**重审」。
+
+    所以强审只改**库侧**的候选谓词(丢掉 `_DEFAULT_CANDIDATE`),**领任务的
+    口径一个字不动** —— 仍然是 `listing_sheet.audit_targets()` 的「ASIN 有值
+    且审核结果为空(或 pending)」。E 列已经填了结论的行**不会**被这个开关捞回来。
+
+    为什么需要它:`rerule` / `mode=nonpass` 的候选谓词都带
+    `audit_version IS DISTINCT FROM <当前版本>`(天然分页)。全量扫过一遍之后
+    库里每一条都盖着当前版本,两条通道双双归零 —— 而**飞书数据变了**
+    (`risk_sync` 全量重灌 `walmart_pt_meta`,R1/R3 的判据整批换掉)并不会
+    递增仓库侧的规则版本号。2026-08-21 所有者手改类目表后实遇:
+    `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道
+    能重判受影响的存量。这个开关是那种时候的出口。
+
+    ⚠ **贵**:打开之后 E 列为空的每一行都进判定引擎(含库里早有结论的),
+    而 `from_sheet` 又会把 limit 顶到 ASIN 总数、不截断。摘要里必须把
+    "本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    """
+    return str(params.get("force", "")).strip() == "1"
+
+
 def _is_forced(params: dict, extra: dict) -> bool:
     """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
 
@@ -413,7 +451,8 @@ def _is_forced(params: dict, extra: dict) -> bool:
         return True
     if str(params.get("mode", "")).strip() in ("pending", "nonpass"):
         return True
-    return bool(extra.get("asins")) and not params.get("from_sheet")
+    return (_forced_sheet(params)
+            or (bool(extra.get("asins")) and not params.get("from_sheet")))
 
 
 # 采用历史结论时反查旧 run 的命中明细(所有者定稿 2026-08-19:「history_shortcut
@@ -522,7 +561,7 @@ GROUP BY 1
 """
 
 
-def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
+def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
     """输入:本轮 limit → 输出:(上架表待审行, 交给候选谓词的 ASIN, 摘要前言)。
 
     所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
@@ -569,13 +608,25 @@ def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
     # 飞书通知看着像"审完了")
     head.append(
         f"  库里已有结论 {done}(过 {st.get('approved', 0)}/拒 "
-        f"{st.get('rejected', 0)})→ **直接回填,不重审**"
-        f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
+        f"{st.get('rejected', 0)})→ "
+        + ("⚡ **force=1:连同它们一起重判**(不是回填)" if force
+           else "**直接回填,不重审**")
+        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
         # ⚠ 这个数是**补采之前**的快照(补采跑在它后面)。别写成"本轮审不了"
         # —— 同轮闭环正是为了把它们救回来,救回来多少看下面那段
         + (f";⚠ 不在库 {absent}(补采前口径,见下方补采段:"
            f"推采集 → 等采完 → 摄取,救回来的本轮就审)" if absent else ""))
-    if todo > limit:
+    if force:
+        # ⚠ 这一行是**成本告知**,不是装饰。缺省口径只判 todo 条,强审要判
+        # todo+done 条,差的就是 done 那部分实打实的 LLM 钱。不写出来的话
+        # 摘要看着和平时一模一样,人不会意识到这轮贵了几倍
+        head.append(
+            f"  ⚡ **强审(-p force=1)**:本轮进判定引擎 {done + todo} 个 ASIN"
+            f"(缺省口径只判 {todo} 个,多出的 {done} 个是库里已有结论、"
+            f"被这个开关重新打开的)—— **LLM 花费按 {done + todo} 算**。"
+            f"⚠ 领任务口径没变:仍然只领 **E 列为空或 pending** 的行,"
+            f"E 列已有结论的表行一行都不会被捞回来")
+    elif todo > limit:
         logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{todo - limit} 个**待审;再跑一次接着判"
@@ -970,7 +1021,8 @@ def run(params: dict) -> str:
     sheet_head: list[str] = []
     sheet_want: list[str] = []
     if params.get("from_sheet"):
-        sheet_rows, sheet_want, sheet_head = _claim_from_sheet(limit)
+        sheet_rows, sheet_want, sheet_head = _claim_from_sheet(
+            limit, force=_forced_sheet(params))
         if not sheet_want:
             return sheet_head[0]
         # ⚠ 补采闭环必须在**候选查询之前**(所有者定稿 2026-08-17:「产品审核

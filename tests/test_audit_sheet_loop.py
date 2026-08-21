@@ -252,6 +252,86 @@ def test_from_sheet_reuses_the_asins_path(monkeypatch):
     assert "没有待审行" in out and "清空" in out
 
 
+def test_force_drops_the_db_side_predicate_but_not_the_claim_scope(monkeypatch):
+    """⚠ `-p from_sheet=1 -p force=1` 强审:**只改库侧候选谓词,不改领任务口径**。
+
+    所有者 2026-08-21 的原话:「对飞书上架表中需要审核的产品进行强制重审,
+    不是对表格中所有的强制重审,而是**其中还没填写审核结果的**重审」。
+    所以 E 列已填结论的表行一行都不许被捞回来 —— 那是 `audit_targets()` 的事,
+    这个开关碰不到它。
+    """
+    plain, _ = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1"})
+    forced, extra = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1",
+                                    "force": "1"})
+    assert extra["asins"] == ["B0A", "B0B"]
+    # 缺省口径带着"库里没结论才判"的谓词,强审把它整条丢掉
+    assert "audit_status IS NULL" in plain
+    assert "audit_status" not in forced
+    assert forced == "p.asin = ANY(%(asins)s)"
+    # 领任务口径由 audit_targets 决定,与 force 无关 —— 它只认 E 列
+    import inspect
+    src = inspect.getsource(pa._claim_from_sheet)
+    assert "listing_sheet.audit_targets()" in src
+
+
+def test_force_turns_off_the_24h_run_guard():
+    """强审 = 人点名要审,点了就得审 —— 不能被 24 小时复烧护栏挡回去。
+
+    挡回去的后果和 rerule 首版一样:dry-run 稳定报 0 候选,紧跟着真跑翻出
+    几千条,又是一次"dry-run 说没事、真跑吓一跳"。
+    """
+    assert pa._is_forced({"from_sheet": "1", "force": "1"},
+                         {"asins": ["B0A"]}) is True
+    assert pa._is_forced({"from_sheet": "1"}, {"asins": ["B0A"]}) is False
+
+
+def test_force_without_from_sheet_raises_instead_of_being_ignored():
+    """宁炸不吞:`force` 只对 from_sheet 那条路有意义。
+
+    静默忽略的话人以为强审了、实际按缺省口径跑,而摘要长得一模一样。
+    """
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="force=1"):
+        pa._pick_where({"force": "1", "asins": "B0A"})
+
+
+def test_force_summary_states_what_it_will_cost(monkeypatch):
+    """⚠ 强审比缺省贵好几倍,摘要必须把"本轮判几条"写出来。
+
+    不写的话摘要和平时一模一样,人不会意识到这轮把库里已有结论的那批
+    也一起烧了一遍 LLM。
+    """
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": 2, "asin": "B0AAAA0001", "store": "T1"},
+        {"rownum": 3, "asin": "B0BBBB0002", "store": "T1"},
+        {"rownum": 4, "asin": "B0CCCC0003", "store": "T1"},
+    ])
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k): pass
+        # 3 个 ASIN:2 个库里已有结论、1 个待审
+        def fetchall(self): return [("approved", 1), ("rejected", 1), ("未审", 1)]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self, *a, **k): return _Cur()
+
+    monkeypatch.setattr(pa.db, "pg_conn", lambda *a, **k: _Conn())
+    _, _, head = pa._claim_from_sheet(500, force=True)
+    body = "\n".join(head)
+    assert "本轮进判定引擎 3 个 ASIN" in body      # 2 已有结论 + 1 待审
+    assert "缺省口径只判 1 个" in body
+    assert "一起重判" in body and "直接回填" not in body
+    # 领任务口径没变这句必须在 —— 那是所有者唯一关心的边界
+    assert "E 列已有结论的表行一行都不会被捞回来" in body
+    # 缺省口径下则是老话术
+    _, _, plain = pa._claim_from_sheet(500)
+    assert "**直接回填,不重审**" in "\n".join(plain)
+
+
 # ── ③④ 上架闸:读 PG,不读表 ─────────────────────────────────────────────
 
 def _stub_gates(monkeypatch, rows):

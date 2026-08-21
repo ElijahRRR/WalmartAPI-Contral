@@ -1519,3 +1519,76 @@ def test_llm_cost_small_amounts_keep_enough_digits():
            "cache_hit": 0, "cache_miss": 0}
     assert "$132.00" in "\n".join(llm_cost.summarize(
         {("deepseek-v4-flash", "audit_l3", "peak"): big}))
+
+
+# ── 大批量不许把候选全装进内存(2026-08-21 生产 OOM 后加)────────────────
+
+class _FakeNamedCur:
+    """够用的 psycopg3 命名游标替身:记下建它时的参数,按块吐行。"""
+
+    def __init__(self, rows, name):
+        self._rows, self.name, self.itersize = list(rows), name, None
+        self.description = [("asin",), ("title",)]
+        self.executed = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed = (sql, params)
+
+    def fetchmany(self, n):
+        out, self._rows = self._rows[:n], self._rows[n:]
+        return out
+
+
+def test_candidates_are_streamed_through_a_server_cursor(monkeypatch):
+    """候选必须**流式**取,而且要另开一条连接。两条都是踩出来的:
+
+    ① psycopg3 普通游标 execute 时把整个结果集拉进客户端内存,fetchmany 只是
+       切已经拉完的缓冲 —— 省不了一个字节。78 万行带标题/五点/长描述就是几 GB
+       (2026-08-21 所有者跑 `mode=nonpass -p limit=1000000`,机器内存崩了);
+    ② 判定循环每 `_COMMIT_EVERY` 条要 commit,而 **COMMIT 会销毁服务端游标** ——
+       取数用主连接的话,跑到第一个提交点就炸。
+    """
+    made = {}
+
+    class _Conn:
+        def cursor(self, name=None):
+            made["name"] = name
+            return _FakeNamedCur([("B%03d" % i, "t") for i in range(7)], name)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _fake_conn(*a, **k):
+        made["opened"] = made.get("opened", 0) + 1
+        yield _Conn()
+
+    monkeypatch.setattr(product_audit.db, "pg_conn", _fake_conn)
+    chunks = list(product_audit._iter_candidates("SELECT 1", {}, chunk=3))
+    assert [len(c) for c in chunks] == [3, 3, 1]          # 按块吐,不是一次性
+    assert chunks[0][0] == {"asin": "B000", "title": "t"}
+    assert made["name"], "必须是**命名**游标(服务端),否则 psycopg3 会全拉进内存"
+    assert made["opened"] == 1, "取数走自己的连接,不跟会 commit 的主连接抢"
+
+
+def test_run_submits_futures_per_chunk_not_all_at_once():
+    """OOM 的另一半:78 万个 future 一次全提交。
+
+    每个 future 吊着入参(ProductInfo 带标题/五点/长描述),完成后还吊着
+    AuditOutcome —— 全量提交等于把整批数据再复制两份留在内存里。
+    分块提交只限制"在飞的量",线程池与连接池仍整轮共用一套,吞吐不受影响。
+    """
+    import inspect
+
+    src = inspect.getsource(product_audit.run)
+    chunk_loop = src.index("for chunk in chunks:")
+    submit = src.index("ex.submit(_judge, p)")
+    assert chunk_loop < submit, "ex.submit 必须在分块循环**内**"
+    # 候选取数不许再回到 fetchall
+    assert "_iter_candidates(" in src
+    assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"

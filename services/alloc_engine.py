@@ -46,20 +46,40 @@ LAYER_THICKNESS = 0.10
 # 收尾扫描里压。
 LAYER_SLACK = 1.3
 
-# unplaced 的三种原因。分开计数是有用的:
-#   no_gate  = 没有任何店的闸放行 → **可以人工干预**(给某店开这个大类)
-#   no_room  = 有店放行但容量塞不下 → 等下架腾位
-#   no_quota = 有店放行也塞得下,但都到配额了 → 等下一批,不是毛病
-NO_GATE, NO_ROOM, NO_QUOTA = "no_gate", "no_room", "no_quota"
+# `_gate` 的四道闸,**按判定顺序**排列 —— 归因取"走得最远"的那道时按这个序比大小。
+_GATES = ("brand", "category", "lead", "channel")
+
+# unplaced 的原因。分开计数不是为了好看,是因为**每一种的处置完全不同**:
+#   no_category = 没有店做这个大类      → 给某店开这个大类
+#   no_lead     = 有店做这个大类,货期超  → 放宽该店「配送时长限制」或换货源
+#   no_channel  = 有店做这个大类,渠道不对 → 给某店配 FBM / FBA
+#   no_brand    = 只有占用店能要,而它自己都过不了(定向流兜底,正常走不到)
+#   no_room     = 闸全过但容量塞不下      → 等下架腾位
+#   no_quota    = 闸与容量都过,只是配额满 → 等下一批,不是毛病
+#   no_store    = 本批压根没有一家店有容量与配额
+# ⚠ **前三种曾经是同一个 `no_gate`**,标签写死"要它出货得先给某店开这个大类"。
+# 2026-08-21 实测:卡住的 6,490 件 FBA 里,**每一件的大类都有店在收**,真正
+# 拦路的是货期(已分配的货配送天数最大 7 天,一件超的都没有;卡住的 17.6% 超 7 天)。
+# 也就是说这个标签把所有者往"去开大类"上支了整整一批,而开大类一件也救不回来。
+# 定向流那边 2026-08-16 已经按真实原因拆过(见 alloc_plan._fit_to_store 的
+# docstring),自由流这边漏了 —— 这次补上。
+NO_BRAND, NO_CATEGORY, NO_LEAD, NO_CHANNEL = (
+    "no_brand", "no_category", "no_lead", "no_channel")
+NO_ROOM, NO_QUOTA, NO_STORE = "no_room", "no_quota", "no_store"
+_GATE_REASON = {"brand": NO_BRAND, "category": NO_CATEGORY,
+                "lead": NO_LEAD, "channel": NO_CHANNEL}
 REASON_LABEL = {
-    NO_GATE: "没有店的类目/渠道闸放行(要它出货得先给某店开这个大类)",
+    NO_CATEGORY: "没有店的类目闸放行(给某店开这个大类才能出货)",
+    NO_LEAD: "有店做这个大类但货期超出所有店的配送时长限制(放宽限制或换货源;开类目没用)",
+    NO_CHANNEL: "有店做这个大类但没有店做这个渠道(给某店配上这个渠道)",
+    NO_BRAND: "只有占用店能要,而占用店自己过不了闸(先释放品牌)",
     NO_ROOM: "有店放行但容量塞不下(等下架腾位)",
     NO_QUOTA: "候选店本批配额都满了(留池等下一批)",
+    NO_STORE: "本批没有一家店有容量与配额(先下架腾位或补齐店铺配置)",
 }
 # ⚠ 归类要取**走得最远**的那一条。别拿字符串比大小 —— 按字典序
 # "no_gate" < "no_quota" < "no_room",顺序正好是错的,而且不会报错:
 # 一批本该记成"等下一批"的货会全被记成"配置有问题",所有者跑去改类目配置
-_REASON_RANK = (NO_GATE, NO_ROOM, NO_QUOTA)
 
 
 def layer_cut(groups: list, thickness: float = LAYER_THICKNESS) -> list[list]:
@@ -78,19 +98,23 @@ def layer_cut(groups: list, thickness: float = LAYER_THICKNESS) -> list[list]:
     return [ordered[i:i + per] for i in range(0, len(ordered), per)]
 
 
-def _gate(group: dict, store: str, st: dict) -> bool:
-    """输入:一组 + 一店 → 输出:过不过**归属/类目/渠道**闸。
+def _blocker(group: dict, store: str, st: dict) -> str | None:
+    """输入:一组 + 一店 → 输出:**第一道**拦下它的闸名(`_GATES` 之一);全过返回 None。
 
     容量与配额不在这里 —— 那两个是随发牌变化的量,而这里只判"静态相容"。
     合在一起写的话,"这家店永远接不了这个大类"与"这家店这批满了"会得出
     同一个结论,而这两件事的处置完全不同(前者要改配置,后者等下一批)。
+
+    ⚠ **返回闸名而不是布尔**,是为了让 `_why` 说得出"到底哪道闸拦的"。
+    压成布尔的版本上线过一批,结果所有者拿着"去给某店开这个大类"的摘要
+    改了一轮飞书配置,而实际拦路的是货期 —— 一件都没救回来(见常量段注释)。
     """
     # 品牌已被占用的组只能去占用店(§7.3 定向流)。**它不是另一条流水线,
     # 就是同一副牌里"只有一家店能要"的那种牌** —— 写成两个阶段的话,两边
     # 各有一套配额与容量记账,谁也不知道对方吃了多少(2026-08-16 实测:
     # 分阶段版本让定向流一口吃光批量,而且容量闸各判各的、双双超容)
     if group.get("store") is not None and group["store"] != store:
-        return False
+        return "brand"
     # ⚠ 类目与配送时长的判定**一律走 store_targets 的谓词**,不在这里另写。
     # 「三列全空 = 不限制」「未填时长 = 不限」这类规则正着写反着写都像对的,
     # 各写一遍迟早分叉(本仓已在报告 vs 回填的行口径上栽过一次)。
@@ -98,16 +122,21 @@ def _gate(group: dict, store: str, st: dict) -> bool:
     # 纯函数,发牌照样脱库可测
     if not store_targets.allowed({"categories": st.get("categories") or []},
                                  group.get("category")):
-        return False
+        return "category"
     if not store_targets.lead_ok({"lead_limit": st.get("lead_limit")},
                                  group.get("lead")):
-        return False
+        return "lead"
     ch = st.get("channel")
     # 店没填配送限制 → 不接自由流(store_targets 的口径,报告点名补填);
     # 组的渠道未知 → 调用方本就不该把它送进来,这里兜一道
     if not ch or group.get("channel") != ch:
-        return False
-    return True
+        return "channel"
+    return None
+
+
+def _gate(group: dict, store: str, st: dict) -> bool:
+    """输入:一组 + 一店 → 输出:过不过归属/类目/货期/渠道四闸(要哪道拦的用 `_blocker`)。"""
+    return _blocker(group, store, st) is None
 
 
 def _order(stores: dict, got: dict) -> list:
@@ -156,20 +185,34 @@ def _try_place(group: dict, stores: dict, got: dict, take: dict,
 def _why(group: dict, stores: dict, got: dict) -> str:
     """输入:一组 + 最终世界 → 输出:它为什么没发出去(**只读,不改任何量**)。
 
-    取**走得最远**的那一条:有店放行只是配额满,比"没人放行"轻得多,
-    两者的处置完全不同(前者等下一批,后者要改飞书配置)。
+    取**走得最远**的那一条,两个层次都是:
+
+    1. 闸 → 容量 → 配额:有店放行只是配额满,比"没人放行"轻得多,两者的
+       处置完全不同(前者等下一批,后者要改飞书配置);
+    2. **四道闸之间同样比远近**:某店的类目放行了只是货期超,就该记"货期",
+       不能记"类目" —— 这一步 2026-08-21 之前是没有的,四道闸压成一个
+       `no_gate` 并写死"去开个大类"(见常量段注释里的实测)。
+       跨店取 max:只要**有一家**店把这组放到了更靠后的闸,归因就归那一道。
+
     与 `_try_place` 分开写是有意的:合在一起的话,"重新解释一遍原因"这个
     动作会顺手把货发出去 —— 那时结果里就多了一条没人知道来路的分配。
     """
-    rank = 0
+    if not stores:
+        return NO_STORE
+    far = -1                     # 走到第几道闸(len(_GATES) = 四闸全过)
+    room_ok = False
     for s, st in stores.items():
-        if not _gate(group, s, st):
+        blocked = _blocker(group, s, st)
+        if blocked is not None:
+            far = max(far, _GATES.index(blocked))
             continue
-        rank = max(rank, 1)
+        far = len(_GATES)
         if got[s] + int(group["size"]) > st["room"]:
             continue
-        rank = max(rank, 2)
-    return _REASON_RANK[rank]
+        room_ok = True
+    if far < len(_GATES):
+        return _GATE_REASON[_GATES[far]]
+    return NO_QUOTA if room_ok else NO_ROOM
 
 
 def deal(groups: list, stores: dict, thickness: float = LAYER_THICKNESS,

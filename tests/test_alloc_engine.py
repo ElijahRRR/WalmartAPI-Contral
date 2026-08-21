@@ -12,7 +12,10 @@ import pytest
 from services import alloc_engine as ae
 
 
-def _g(key, score, size=1, category="家居", channel="FBA", **kw):
+def _g(key, score, size=1, category="Home", channel="FBA", **kw):
+    # ⚠ lead 必须有值:2026-08-21 起「未填配送时长限制」回落 7 天而不是"不限",
+    # 于是**没有任何店**会收货期未知的组(见 store_targets.lead_ok)。
+    kw.setdefault("lead", 3)
     return dict(key=key, score=score, size=size, category=category,
                 channel=channel, **kw)
 
@@ -113,10 +116,10 @@ def test_layer_cap_stops_thin_category_coverage_from_eating_the_top_layer():
     这里把它压成最小复现:好货全是「宠物」而只有 P 店收宠物,
     没有层内上限的话 P 在 L1 就把配额吃光了。
     """
-    groups = ([_g(f"p{i:02d}", 100.0 - i, category="宠物") for i in range(50)]
-              + [_g(f"h{i:03d}", 40.0 - i * 0.1, category="家居") for i in range(100)])
-    stores = {"P": _s(50, categories=["宠物", "家居"]),
-              "H1": _s(50, categories=["家居"]), "H2": _s(50, categories=["家居"])}
+    groups = ([_g(f"p{i:02d}", 100.0 - i, category="Animals") for i in range(50)]
+              + [_g(f"h{i:03d}", 40.0 - i * 0.1, category="Home") for i in range(100)])
+    stores = {"P": _s(50, categories=["Animals", "Home"]),
+              "H1": _s(50, categories=["Home"]), "H2": _s(50, categories=["Home"])}
     loose = ae.deal(groups, stores, thickness=0.5, slack=99)   # 松弛拉大 = 等于没上限
     tight = ae.deal(groups, stores, thickness=0.5, slack=1.3)
     l1 = lambda r: r["by_store"]["P"]["by_layer"][1]           # noqa: E731
@@ -134,15 +137,15 @@ def test_capped_groups_are_retried_at_the_next_layer_not_after_all_of_them():
     于是从"晚一点拿"变成"永远拿不到",净发牌量下降。这是本模块最容易
     写反的一处:两种写法都"看起来在均衡",但一种是倒扣。
     """
-    groups = ([_g(f"p{i}", 100.0 - i, category="宠物") for i in range(10)]
-              + [_g(f"h{i}", 80.0 - i, category="家居") for i in range(20)])
-    stores = {"P": _s(10, categories=["宠物", "家居"]),
-              "H1": _s(10, categories=["家居"]), "H2": _s(10, categories=["家居"])}
+    groups = ([_g(f"p{i}", 100.0 - i, category="Animals") for i in range(10)]
+              + [_g(f"h{i}", 80.0 - i, category="Home") for i in range(20)])
+    stores = {"P": _s(10, categories=["Animals", "Home"]),
+              "H1": _s(10, categories=["Home"]), "H2": _s(10, categories=["Home"])}
     r = ae.deal(groups, stores, thickness=0.5, slack=1.3)
     assert len(r["assign"]) == 30 and not r["unplaced"]
     # 10 个宠物组只有 P 收得了,一个都不许丢
     assert sum(1 for a in r["assign"]
-               if a["group"]["category"] == "宠物" and a["store"] == "P") == 10
+               if a["group"]["category"] == "Animals" and a["store"] == "P") == 10
 
 
 def test_capped_groups_are_swept_up_not_dropped():
@@ -178,11 +181,11 @@ def test_category_and_channel_gates():
     """类目:店填了就只准入填的;没填 = 不限制(与 store_targets.allowed 同口径)。
     渠道:店没填配送限制就不接自由流分配。
     """
-    stores = {"CAT": _s(9, categories=["户外"]), "ANY": _s(9),
+    stores = {"CAT": _s(9, categories=["Sporting Goods"]), "ANY": _s(9),
               "NOCH": _s(9, channel=None)}
-    r = ae.deal([_g("k", 50.0, category="家居")], stores, thickness=1.0)
+    r = ae.deal([_g("k", 50.0, category="Home")], stores, thickness=1.0)
     assert r["assign"][0]["store"] == "ANY"              # 受限店拒收,没填渠道的不参与
-    r2 = ae.deal([_g("k", 50.0, category=None)], {"CAT": _s(9, categories=["户外"])},
+    r2 = ae.deal([_g("k", 50.0, category=None)], {"CAT": _s(9, categories=["Sporting Goods"])},
                  thickness=1.0)
     assert not r2["assign"]                              # 归不到大类 → 受限店拒收
 
@@ -199,10 +202,12 @@ def test_unplaced_reasons_do_not_collapse_into_the_wrong_bucket():
                 thickness=1.0)
     assert r["unplaced"][0]["reason"] == ae.NO_QUOTA
     # 没人放行
-    r2 = ae.deal([_g("x", 90.0, category="宠物")],
-                 {"S": _s(quota=9, categories=["家居"])}, thickness=1.0)
-    assert r2["unplaced"][0]["reason"] == ae.NO_GATE
-    assert set(ae.REASON_LABEL) == {ae.NO_GATE, ae.NO_ROOM, ae.NO_QUOTA}
+    r2 = ae.deal([_g("x", 90.0, category="Animals")],
+                 {"S": _s(quota=9, categories=["Home"])}, thickness=1.0)
+    assert r2["unplaced"][0]["reason"] == ae.NO_CATEGORY
+    assert set(ae.REASON_LABEL) == {ae.NO_BRAND, ae.NO_CATEGORY, ae.NO_LEAD,
+                                    ae.NO_CHANNEL, ae.NO_ROOM, ae.NO_QUOTA,
+                                    ae.NO_STORE}
 
 
 def test_stores_with_zero_quota_or_room_are_skipped_not_divided_by():
@@ -234,7 +239,7 @@ def test_acceptance_metrics_flag_a_hoarder():
     assert all(0.7 <= v["top_ratio"] <= 1.3 for v in m.values())
     assert not any(v["over_cap"] for v in m.values())
     # 人为造一个独吞:B 只收宠物,货全是家居
-    r2 = ae.deal(groups, {"A": _s(50), "B": _s(50, categories=["宠物"])},
+    r2 = ae.deal(groups, {"A": _s(50), "B": _s(50, categories=["Animals"])},
                  thickness=0.5)
     assert ae.acceptance(r2)["A"]["over_cap"] is True
 
@@ -269,10 +274,10 @@ def test_acceptance_compares_slots_to_slots_not_groups_to_slots():
     指标量的成了"组的大小"而不是"分得公不公平"。
     """
     # 两家店配额相同;A 只能收大组(每组 10 件),B 只能收小组(每组 1 件)
-    groups = ([_g(f"big{i}", 100.0 - i, size=10, category="宠物") for i in range(2)]
-              + [_g(f"sml{i}", 99.5 - i, size=1, category="家居") for i in range(20)])
-    r = ae.deal(groups, {"A": _s(20, categories=["宠物"]),
-                         "B": _s(20, categories=["家居"])}, thickness=1.0)
+    groups = ([_g(f"big{i}", 100.0 - i, size=10, category="Animals") for i in range(2)]
+              + [_g(f"sml{i}", 99.5 - i, size=1, category="Home") for i in range(20)])
+    r = ae.deal(groups, {"A": _s(20, categories=["Animals"]),
+                         "B": _s(20, categories=["Home"])}, thickness=1.0)
     m = ae.acceptance(r)
     # 组数:A 拿 2 组、B 拿 20 组(1:10);货位:各 20(1:1)。指标要看后者
     assert r["by_store"]["A"]["groups"] == 2 and r["by_store"]["B"]["groups"] == 20
@@ -286,25 +291,36 @@ def test_lead_limit_blocks_groups_slower_than_the_store_allows():
     """「配送时长限制」是逐店硬闸:只分 delivery_days ≤ 该值的货。"""
     fast = _g("fast", 90.0, lead=3)
     slow = _g("slow", 95.0, lead=9)
-    stores = {"STRICT": _s(9, lead_limit=5), "LOOSE": _s(9)}
+    # ⚠ LOOSE 要**显式填 10**:未填不再是"不限",而是回落 7 天(2026-08-21)
+    stores = {"STRICT": _s(9, lead_limit=5), "LOOSE": _s(9, lead_limit=10)}
     r = ae.deal([fast, slow], stores, thickness=1.0)
     where = {a["group"]["key"]: a["store"] for a in r["assign"]}
-    assert where["slow"] == "LOOSE"          # 9 天只有不限的店收
+    assert where["slow"] == "LOOSE"          # 9 天只有放宽到 10 的店收
     assert "fast" in where                   # 3 天两家都行
 
 
-def test_unknown_lead_is_refused_by_a_capped_store():
-    """⚠ 采不到货期时**受限店拒收**,不是当它够快。
+def test_unknown_lead_is_refused_by_every_store_now():
+    """⚠ 采不到货期时**一律拒收**,不是当它够快。
 
     所有者填这一列就是明确不要慢货;拿"没采到"当"够快"是替他做了他没做的
     决定。与类目那条「归不到大类的,受限店拒收」同一纪律。
+
+    ★ 2026-08-21 起连**未填**的店也拒:那一列的"未填"从"不限"改成回落 7 天,
+    统一到上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 的口径。
+    改之前只要有一家店空着这列,`_pool_reach` 的并集就变成"不限",慢货与
+    未知货期全池涌入,而且不报错。
     """
-    r = ae.deal([_g("unknown", 90.0, lead=None)],
-                {"STRICT": _s(9, lead_limit=5)}, thickness=1.0)
-    assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_GATE
-    # 未填限制的店照收 —— 未填 = 不限
-    r2 = ae.deal([_g("unknown", 90.0, lead=None)], {"ANY": _s(9)}, thickness=1.0)
-    assert r2["assign"][0]["store"] == "ANY"
+    from services import amz_source
+    for stores in ({"STRICT": _s(9, lead_limit=5)}, {"UNSET": _s(9)}):
+        r = ae.deal([_g("unknown", 90.0, lead=None)], stores, thickness=1.0)
+        assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_LEAD
+    # 未填的店生效上限 = 7:恰好 7 天的收,8 天的不收
+    ok = ae.deal([_g("just", 90.0, lead=amz_source.MAX_LEAD_DAYS)],
+                 {"UNSET": _s(9)}, thickness=1.0)
+    assert ok["assign"][0]["store"] == "UNSET"
+    no = ae.deal([_g("over", 90.0, lead=amz_source.MAX_LEAD_DAYS + 1)],
+                 {"UNSET": _s(9)}, thickness=1.0)
+    assert no["unplaced"][0]["reason"] == ae.NO_LEAD
 
 
 def test_gate_predicates_come_from_store_targets_not_reimplemented():
@@ -314,7 +330,7 @@ def test_gate_predicates_come_from_store_targets_not_reimplemented():
     各写一遍迟早分叉 —— 本仓已在报告 vs 回填的行口径上栽过一次。
     """
     import inspect
-    src = inspect.getsource(ae._gate)
+    src = inspect.getsource(ae._blocker)
     assert "store_targets.allowed" in src and "store_targets.lead_ok" in src
     assert "not in cats" not in src and "<= float(cap)" not in src
 
@@ -364,3 +380,59 @@ def test_a_store_with_a_tiny_free_slice_gets_no_ratio():
     assert 36 < 1460 * ae.MIN_FREE_SHARE_OF_QUOTA                 # 但占比不过
     assert m["TINY"]["top_ratio"] is None, "量太小的比值是假象,不该给数"
     assert m["BIG"]["top_ratio"] is not None
+
+
+# ── 四道闸各自归因(2026-08-21 生产实测逼出来的)────────────────────────
+
+def test_lead_block_is_not_reported_as_a_category_block():
+    """⚠ 类目放行、货期拦下 → 记「货期」,**不许记「类目」**。
+
+    这是一条实测教训,不是假想:2026-08-21 复盘生产方案表,「没有店的
+    类目/渠道闸放行(要它出货得先给某店开这个大类)」标签下的 6,490 件 FBA,
+    **每一件的大类都有店在收**。真正拦路的是货期 —— 已分配的货配送天数
+    最大 7 天、一件超的都没有,而卡住的那批 17.6% 超 7 天。
+    所有者照着那份摘要去开大类,一件也救不回来。
+    """
+    r = ae.deal([_g("slow", 90.0, category="Home", lead=12)],
+                {"S": _s(9, categories=["Home"], lead_limit=7)}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_LEAD
+    assert "开类目没用" in ae.REASON_LABEL[ae.NO_LEAD]
+
+
+def test_channel_block_is_not_reported_as_a_category_block():
+    """类目与货期都过、只差渠道 → 记「渠道」。生产里这是最大的一块。"""
+    r = ae.deal([_g("fbm", 90.0, category="Home", channel="FBM")],
+                {"S": _s(9, categories=["Home"], channel="FBA")}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_CHANNEL
+
+
+def test_attribution_takes_the_farthest_gate_across_all_stores():
+    """跨店取**走得最远**的那道闸:一家店类目就不符,另一家店类目过了只是货期超。
+
+    归因该归「货期」—— 因为存在一家店,给它放宽配送时长限制就能收下这批货。
+    归成「类目」的话,所有者会去给第一家店开大类,而那家店开了也还是收不了
+    (它同样有货期限制,只是先被类目挡下,压根没走到那一步)。
+    """
+    stores = {"WRONG_CAT": _s(9, categories=["Animals"], lead_limit=7),
+              "RIGHT_CAT": _s(9, categories=["Home"], lead_limit=7)}
+    r = ae.deal([_g("slow", 90.0, category="Home", lead=12)], stores,
+                thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_LEAD
+
+
+def test_no_live_store_is_its_own_reason_not_a_config_complaint():
+    """一家店都没有(配额/容量全 0)→ 记 NO_STORE。
+
+    记成「没有店的类目闸放行」会把所有者送去改类目配置,而真正要做的是
+    下架腾位或补齐店铺配置 —— 类目一栏改到天亮也没用。
+    """
+    r = ae.deal([_g("a", 90.0)], {"FULL": _s(9, room=0)}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_STORE
+
+
+def test_every_reason_code_has_a_label():
+    """新增原因码忘了配标签 → `REASON_LABEL[k]` 直接 KeyError 炸在报告里。"""
+    codes = {ae.NO_BRAND, ae.NO_CATEGORY, ae.NO_LEAD, ae.NO_CHANNEL,
+             ae.NO_ROOM, ae.NO_QUOTA, ae.NO_STORE}
+    assert set(ae.REASON_LABEL) == codes
+    assert len({ae.REASON_LABEL[c] for c in codes}) == len(codes)   # 标签不重样

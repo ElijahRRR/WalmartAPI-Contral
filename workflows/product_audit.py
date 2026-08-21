@@ -97,6 +97,8 @@ _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 # 事务里 —— 外部查不到任何进度、Ctrl-C 全部回滚、长事务还挡住 vacuum)。
 # 每 N 行提交一次 + 打一行进度,判定结果就变成"跑到哪算到哪"。
 _COMMIT_EVERY = 500
+# 两次进度日志之间至少隔这么久(秒)。按块报,块小时不刷屏、块大时不失联
+_PROGRESS_MIN_SEC = 5.0
 
 # 判定并发:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的天花板在
 # LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)。
@@ -1050,8 +1052,10 @@ def run(params: dict) -> str:
         l0_untouched = 0
         done_n = 0
         cand_n = 0                   # 累计取到的候选行数(摘要报它,取代 len(rows))
+        todo_n = 0                   # 累计**进了判定**的行数(≠ 落结论数,见下)
         adopted_n = 0
         t0 = time.monotonic()
+        last_t, last_cand = t0, 0    # 窗口速率的锚点
 
         def _to_todo(chunk: list) -> list:
             """输入:一块候选行 → 输出:[(asin, ProductInfo)](并累计三个计数)。
@@ -1155,6 +1159,7 @@ def run(params: dict) -> str:
                     #   完成后还吊着 AuditOutcome,78 万份同时在内存里)。
                     #   线程池与连接池仍是整轮共用一套 —— 分块的是"在飞的量",
                     #   不是并发度,吞吐不受影响。
+                    todo_n += len(todo)
                     futs = {ex.submit(_judge, p): asin for asin, p in todo}
                     for fut in as_completed(futs):
                         asin = futs[fut]
@@ -1191,13 +1196,9 @@ def run(params: dict) -> str:
                                 product_events.record_many(conn, events)
                                 conn.commit()
                                 events = []
-                            rate = done_n / max(time.monotonic() - t0, 1e-6)
-                            # ⚠ 分母是**已取到的候选**不是总量 —— 候选现在是
-                            #   流式取的,跑到一半时"总共多少"还没取完。
-                            #   总量在摘要开头那行(_batch_head)里,别在这儿
-                            #   编一个看着像总量的数
-                            logger.info("进度 %d/%d 已取(上限 %d,%.0f 条/秒,"
-                                        "已提交)", done_n, cand_n, limit, rate)
+                            # 进度日志不在这儿 —— 它按**块**报(见 chunk 末尾)。
+                            # 这里只管持久化:两件事混在一行的后果是 stages=L0
+                            # 那种"绝大多数行不落结论"的模式几乎不打日志
                         if outcome.l3 is not None:
                             stage_stats["L3_ran"] += 1
                             if outcome.l3.verdict == "reject":
@@ -1218,6 +1219,22 @@ def run(params: dict) -> str:
                                     outcome.final_reason_category,
                                     ctx.known_policies)):
                             policy_unknown += 1
+                    # 一块判完报一次进度。三个数各说各的,别混:
+                    #   已取   = 从候选流里拉了多少行(进度)
+                    #   落结论 = 其中多少条真写了结论(stages=L0 只有命中的算)
+                    #   速率   = **本段**已取 ÷ 本段耗时
+                    # ⚠ 2026-08-21 所有者质疑「这个速度显示和进度是准确的吗」——
+                    #   不准。原式是 `done_n ÷ (now - t0)`:分子只数落了结论的,
+                    #   分母含启动装配那 80 多秒,于是 L0 模式下报 75 条/秒而实际
+                    #   吞吐 4,900 条/秒(差 65 倍),而且数字单调爬升
+                    #   (启动开销被摊薄),看着像"越跑越快"其实什么都不是。
+                    now = time.monotonic()
+                    if now - last_t >= _PROGRESS_MIN_SEC:
+                        rate = (cand_n - last_cand) / max(now - last_t, 1e-6)
+                        logger.info("进度 已取 %d(落结论 %d),%.0f 条/秒",
+                                    cand_n, done_n, rate)
+                        last_t, last_cand = now, cand_n
+
                 # 收尾冲刷:最后不满一批的那些也要落库,漏了就是"判了没存"
                 row_errors += _flush(force=True)
         if execute and events:
@@ -1320,7 +1337,11 @@ def run(params: dict) -> str:
     if no_title:
         lines.append(f"无标题跳过 {no_title}(采集降级,不够格判定)")
     if seller_missing:
-        lines.append(f"⚠ 卖家字段缺失 {seller_missing}/{judged}"
+        # ⚠ 分母是**进了判定的行数**不是 judged。2026-08-21 生产实见
+        # 「卖家字段缺失 97331/10147」—— 分子比分母还大:stages=L0 下 judged
+        # 只数 Phase0 命中的那一小撮,而卖家缺失数的是全部候选行。
+        # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
+        lines.append(f"⚠ 卖家字段缺失 {seller_missing}/{todo_n}"
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
     if policy_unknown:
         lines.append(f"⚠ 理由映射落 37 政策外 {policy_unknown} 条(详见日志,只记不改判)")

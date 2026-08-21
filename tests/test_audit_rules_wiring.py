@@ -1185,8 +1185,36 @@ def test_run_commits_in_segments_with_progress():
     import inspect
     src = inspect.getsource(product_audit.run)
     assert "_COMMIT_EVERY" in src and "conn.commit()" in src
-    assert "进度 %d/%d" in src                     # 日志可见,不必查库
+    assert "进度 已取 %d" in src                    # 日志可见,不必查库
     assert 0 < product_audit._COMMIT_EVERY <= 2000  # 段太大就退化回老问题
+
+
+def test_progress_rate_measures_throughput_not_conclusions():
+    """速率必须量**吞吐**,而且是窗口速率(2026-08-21 所有者质疑后修)。
+
+    原式 `done_n ÷ (now - t0)` 两头都错:
+      · 分子只数**落了结论**的行 —— `stages=L0` 下绝大多数行返回 None
+        不落结论,于是报 75 条/秒而真实吞吐 4,900 条/秒(差 65 倍);
+      · 分母从 t0 起算,含启动装配那 80 多秒 —— 数字随时间单调爬升
+        (6→11→16→…→75),看着像"越跑越快",其实只是固定开销被摊薄。
+    """
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "(cand_n - last_cand)" in src, "分子必须是**本段已取**"
+    assert "now - last_t" in src, "分母必须是**本段耗时**,不是从 t0 起算"
+    assert "done_n / max(time.monotonic() - t0" not in src   # 旧式不许回来
+    assert product_audit._PROGRESS_MIN_SEC > 0
+
+
+def test_seller_missing_denominator_is_the_judged_面_not_the_conclusion_count():
+    """分母得是**进了判定的行数**。2026-08-21 生产实见「卖家字段缺失
+    97331/10147」—— 分子比分母还大:`stages=L0` 下 judged 只数 Phase0 命中的
+    那一小撮,而卖家缺失数的是全部候选行。这一列量的是"卖家闸对多大面积
+    失效",那是候选面的属性,不是结论面的。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert '卖家字段缺失 {seller_missing}/{todo_n}' in src
+    assert '卖家字段缺失 {seller_missing}/{judged}' not in src
 
 
 def test_retry_summary_only_calls_429_ratelimit():

@@ -1225,7 +1225,7 @@ def run(params: dict) -> str:
             n["claimed"] += 1
             reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))
             continue
-        # 配送方式决定用哪套区间(FBA 0-30/30-75 vs FBM 15-80/80-1000)。
+        # 配送方式决定用哪套区间(FBA 0-30/30-1000 vs FBM 15-80/80-1000)。
         # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档
         # 就是拿错倍率定价;宁可这行等下一轮采到 is_fba 再上。
         channel = p.get("channel")

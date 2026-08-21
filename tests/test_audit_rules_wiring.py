@@ -148,6 +148,25 @@ def test_pick_where_four_states():
     assert w == "p.audit_status = 'approved'"
 
 
+def test_pick_where_nonpass_covers_all_three_non_pass_states():
+    """非 pass 全量重判(所有者定稿 2026-08-21:判定标准改了就整批重认一次)。
+
+    两条钉死:
+    ① 用 `IS DISTINCT FROM 'approved'` 而**不是** `<> 'approved'` ——
+       后者对 NULL 求值为 NULL,**从没审过的会被整批漏掉且不报错**;
+    ② 必须带版本闸 —— rejected 判完还是 rejected,状态不变 ⇒ 不退出候选,
+       没有版本闸的话每轮 limit 都从头扫同一批,真跑原地打转
+       (mode=pass 那条注释记着的同款坑)。
+    """
+    w, e = product_audit._pick_where({"mode": "nonpass"})
+    assert "p.audit_status IS DISTINCT FROM 'approved'" in w
+    assert "<> 'approved'" not in w and "!= 'approved'" not in w
+    assert "audit_version IS DISTINCT FROM" in w
+    assert e["nonpass_ver"] == resources.AUDIT_RULES_VERSION
+    # 非 pass 重判是人工显式动作,不吃 24 小时 run 护栏(否则 dry-run 抽样漂移)
+    assert product_audit._is_forced({"mode": "nonpass"}, {})
+
+
 def test_mode_pass_requires_stages_l0():
     """mode=pass 不带 stages=L0 必须炸:全链重审全部 pass = 重烧全库 LLM。
 

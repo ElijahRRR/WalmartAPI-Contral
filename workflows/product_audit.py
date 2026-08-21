@@ -7,6 +7,9 @@
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p mode=nonpass -p limit=5000
+                                                    # **非 pass 全量重判**(rejected+pending+
+                                                    # 未审):判定标准改了就整批用新标准重认一次
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
   python cli.py product_audit -p stages=L0                 # 只跑 Phase0:纯查库零 LLM;
@@ -195,8 +198,9 @@ _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
-# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
-_MODES = {"backfill", "pending", "pass"}
+# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
+# pass=现役 pass 重过 L0;nonpass=非 pass 全量重判
+_MODES = {"backfill", "pending", "pass", "nonpass"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -278,6 +282,26 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 待定专刷:**无 1 天退避**——判定逻辑刚改过时要立刻拿存量 pending
         # 验证效果,等一天等的是自己。人工显式动作,不进任何定时调度
         return "p.audit_status = 'pending'", {}
+    if mode == "nonpass":
+        # **非 pass 全量重判**(所有者定稿 2026-08-21:「对于库里面非 pass 的,
+        # 我全部重跑一次就可以了。以前 reject 的自然会用新的标准确认真实情况」)。
+        # 判定标准整体改过之后(如 2026-08-20 类目判据收敛到 R1 白名单),按
+        # rule_code 一条一条 rerule 既漏又重:漏的是"没被这条规则拒、但被别的
+        # 规则误拒"的行,重的是同一批产品在多条 rerule 里反复出现。
+        #
+        # 口径 = `audit_status IS DISTINCT FROM 'approved'` —— 一次覆盖
+        # rejected + pending + **NULL(从没审过)**,三种非 pass 状态全收。
+        # ⚠ `IS DISTINCT FROM` 不是 `<>`:后者对 NULL 求值为 NULL,从没审过的
+        # 会被整批漏掉,而且不报错。
+        #
+        # 版本闸是**天然分页**,不是可选项:真跑判过的会盖上当前规则版本,
+        # 自动退出候选集,limit 撞满再跑一轮接着判。没有它的话每轮都从头扫
+        # 同一批(rejected 判完还是 rejected,状态不变 ⇒ 不退出候选)——
+        # 这正是 mode=pass 那条注释记着的坑,不要在这里重犯。
+        # dry-run 不写版本 ⇒ 候选集恒定,可重复抽样验证。
+        return ("p.audit_status IS DISTINCT FROM 'approved'"
+                " AND p.audit_version IS DISTINCT FROM %(nonpass_ver)s",
+                {"nonpass_ver": resources.AUDIT_RULES_VERSION})
     if mode == "pass":
         # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
@@ -345,12 +369,14 @@ def _is_forced(params: dict, extra: dict) -> bool:
       —— 紧跟着真跑处理的是另外 200 条,想"拿同一批验证完再真跑"做不到,
       而且每 dry-run 一次就把一批 pending 推迟一天,排空 16k 存量时尤其伤。
       它与 rerule 同类:人工显式动作、**不进任何定时调度**,吃护栏无收益。
+    · `mode=nonpass` 非 pass 全量重判 —— 同上,而且它翻的多半就是刚被拒的那批;
+      版本闸已经保证真跑不重判,护栏只会让 dry-run 抽样漂移。
 
     代价说清:强审下重复 dry-run 会重复烧 LLM —— 这是点名的固有代价,不是 bug。
     """
     if str(params.get("rerule", "")).strip():
         return True
-    if str(params.get("mode", "")).strip() == "pending":
+    if str(params.get("mode", "")).strip() in ("pending", "nonpass"):
         return True
     return bool(extra.get("asins")) and not params.get("from_sheet")
 

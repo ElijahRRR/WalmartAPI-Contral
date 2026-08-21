@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1712 个单元测试**。
+- **1713 个单元测试**。
 
 ---
 
@@ -290,8 +290,19 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 
 **重审政策**(唯一出处 `product_audit._DEFAULT_CANDIDATE`):没结论的审;
 `pending` 隔天重试;`approved`/`rejected` **不自动重审**。要整批重审只有显式通道:
-`-p asins=`(点名强审)、`-p rerule=<规则码>`(改了某条规则后定点翻案)、
-`-p force_rerun=<版本>`。
+
+| 通道 | 圈谁 | 什么时候用 |
+|---|---|---|
+| `-p asins=A,B` | 点名这几个,无视现有结论 | 排查单品 |
+| `-p mode=nonpass` | **非 pass 全部**(rejected + pending + 未审) | **判定标准改了**,整批用新标准重认一次 |
+| `-p mode=pass -p stages=L0` | 现役 pass,**只重过 L0** | 黑名单在长,放行过的行也要被新拉黑覆盖;L0 未命中**保持原状不动**,命中即 reject |
+| `-p rerule=<规则码>` | 历史命中过某条规则、现仍 rejected | 只改了一条规则,定点翻案 |
+| `-p force_rerun=<旧版本>` | `audit_version` ≠ 该值的**全部**(含 pass) | 全链全库重审,最贵 |
+| `-p mode=pending` | 只重刷 pending,无退避 | LLM 故障恢复后排空待定存量 |
+
+`mode=nonpass` / `mode=pass` / `mode=pending` / `rerule` 都带**版本闸做天然分页**
+(`mode=pass` 除外,它未命中不盖版本,须一次大 limit 扫完):真跑判过的自动
+退出候选集,`limit` 撞满再跑一轮接着判,不会原地打转。
 
 ### 6.4 上架域
 
@@ -543,7 +554,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 ### 测试
 
 ```bash
-python -m pytest -q          # 1712 passed
+python -m pytest -q          # 1713 passed
 ```
 
 测试钉的不是覆盖率,是**"错了也不报错"的那些接缝**:参数掉了那一段白跑、

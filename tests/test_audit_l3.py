@@ -116,12 +116,20 @@ def _reset_prompt_cache():
 
 
 def test_s1_s3_literals_byte_pinned():
-    """S1/S3 逐字节等于旧仓 l3_llm.py:295-431 / :432-438(脚本切片 sha256)。"""
+    """S1/S3 字节钉死 —— 提示词是判定面,不许无声漂移。
+
+    S3 仍逐字节等于旧仓 l3_llm.py:432-438。
+    S1 原本也是逐字节移植(旧仓 :295-431,sha256 859aced1…,5233 字符),
+    **2026-08-21 有意改过一次**:补入判定维度 6「整机电器 / NRTL 认证」。
+    那是所有者定的 —— L2 里按 PT 名猜整机/小件的分类器同日下线,而"这个产品
+    是不是整机电器"必须有人接,不能留真空期(见 test_audit_l2_reason 里
+    `test_the_whole_appliance_call_moved_to_the_l3_prompt`)。
+    """
     assert hashlib.sha256(audit_l3._S1.encode()).hexdigest() == (
-        "859aced1d428641bc97b6712053ac586d7c6313d68ef3e12caa19a1bc896aee0")
+        "8248ff0c2c2ac2960625a6a14348a578e00efbc89410d390f45f4cee156dc1a3")
     assert hashlib.sha256(audit_l3._S3.encode()).hexdigest() == (
         "1564f179581b34ad5785caba6daa1b461e0624129c55cbec19e47c5025d2d409")
-    assert len(audit_l3._S1) == 5233
+    assert len(audit_l3._S1) == 6027
     assert audit_l3._S1.endswith("# 候选 reason_category (verdict=reject 时必选其一)\n")
     assert audit_l3._S3.startswith("\n\n# 沃尔玛 37 条 Prohibited Products Policy 全清单")
 

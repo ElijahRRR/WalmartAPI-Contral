@@ -176,8 +176,8 @@ Sheet Music, Autographed Collectibles}。
 |---|---|---|---|
 | **R1 类目准入** | `cat_access_blocked` / `cat_zh_blocked` | **-100** | `audit.walmart_pt_meta` 的 `access_state` + `zh_can_do` |
 | R1(判不了) | `cat_gate_pt_unknown` / `cat_gate_pt_not_in_meta` | 0 → **pending** | 同上 |
-| **R3 类目需证书** | `cat_requires_cert_hard` | **-100** | `walmart_pt_meta.requirements` 或 `walmart_pt_spec.has_real_cert` |
-| R3(软) | `cat_requires_cert_small_part` / `cat_requires_cert_soft` | 0 | 同上 + NRTL 词表 |
+| **R3 类目需证书** | `cat_requires_cert_hard` | **-100** | `walmart_pt_meta.requirements`(**唯一判据**,2026-08-21 收敛) |
+| R3(软) | `cat_requires_cert_soft` | 0 | 同上 |
 | R4 品牌黑名单扫文案 | `title_desc_blacklist` | 0 | `catalog.brand_blacklist`(Aho-Corasick) |
 | R5 USPTO 在效商标 | `trademark_live` | 0 | uspto 库 `brand_nice_class`(**默认关**) |
 | R7 促销宣称 | `content_promotional` | 0 | 代码内短语表 |
@@ -233,22 +233,45 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 
 ### 4.2 R3:类目需证书(硬/软四分支)
 
-四个分支互斥、依次判定(硬优先):
+**两个**分支互斥、依次判定(硬优先):
 
 | 分支 | 条件 | rule_code | penalty |
 |---|---|---|---|
 | A | `walmart_pt_meta.requirements` 命中**硬**认证关键词 | `cat_requires_cert_hard` | -100 |
-| B | `walmart_pt_spec.has_real_cert` 且 PT 判为**整机** | `cat_requires_cert_hard` | -100 |
-| B' | 同上但判为**小件/配件** | `cat_requires_cert_small_part` | 0 |
-| C | requirements 只命中**软**关键词 | `cat_requires_cert_soft` | 0 |
-| D | `walmart_pt_spec.has_soft_cert` | `cat_requires_cert_soft` | 0 |
+| B | requirements 只命中**软**关键词 | `cat_requires_cert_soft` | 0 |
 
 硬词:UL / ETL / CSA / NRTL / FCC / FDA(食品·药品·510(k))/ MoCRA / EPA(FIFRA)
 / CPSIA / CPC / GCC / AAFCO / NSF / ATF / DEA。
 软词:SDS / ASTM / ANSI / ISO / RoHS / Prop 65 / 警告标签 / 测试报告。
 
-整机 vs 小件:PT 名含 `replacement` / `parts` / `accessor` **强制**判小件;
-其次整机词优先;都不中保守判整机。
+### ⚠ 2026-08-21 下线了两条链(所有者定稿)
+
+原本还有两个分支读 `audit.walmart_pt_spec`(硬 `has_real_cert` / 软
+`has_soft_cert`),外加一个 NRTL **整机/小件分类器**(PT 名含
+`replacement`/`parts`/`accessor` 强制判小件,否则保守判整机)。整套下线,理由两条,
+都是实证:
+
+1. **那张表是死快照。** `audit.walmart_pt_spec` 是批次 A 从旧审核库整表搬来的,
+   `pt_spec_sync` 重建过但从没进过调度 —— 库里 `real_cert_fields` 存的还是**原始
+   spec 字段名**(`has_nrtl_listing_certification`),而重建写进去的是认证**名称**
+   (`NRTL 认证(UL/ETL/CSA)`)。两者口径还相反:旧数据判**硬**,清洗判**需评估**。
+2. **整机 vs 小件代码判不了。** 生产实见:一张**实木咖啡桌**被判「整机电器,
+   必须 NRTL 认证, 搬运做不了」—— 因为 `Coffee Tables` 的官方 spec 里带着
+   `has_nrtl_listing_certification`(那是给带 USB 口的电动升降桌准备的字段),
+   而分类器拿 PT 名猜,咖啡桌不含 `parts`/`accessor` ⇒ 保守判整机。同一个类目下
+   整机与非电产品本来就是混着的。
+
+所有者原话:「**代码只判定确定性的**,这种很明显不确定,应该交给 LLM 看这个产品
+是不是整机电器,而不是让代码从类目看是不是整机。所以,旧的死快照不要了,死代码
+也不要了,**以飞书源为准,以后我们只更新这个**」。
+
+**先补后删,无真空期**:「整机电器」这一判定同批移入 **L3 判定维度 6**
+(`audit_l3._S1`)——由 LLM 看 title/bullets/description 判产品本身带不带电、
+是不是成品,**默认放行、拿不准 pass**。删掉的 `cat_requires_cert_small_part`
+在存量 `audit_hits` 里仍有,理由渲染保留兼容。
+
+`audit.walmart_pt_spec` 这张表**不删**:`pt_spec_sync` 仍写它,`audit_why` /
+`pt_census` 仍查它做诊断 —— 只是审核链不再拿它当判据。
 
 > **2026-08-20 P0 修复:裸子串 → 词边界。**
 > 此前是 `kw in requirements`,`"ul" in "fda regulation"` 为真 ——
@@ -302,10 +325,21 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 
 ## 5. L3 —— 语义审核(LLM,`services/audit_l3.py`)
 
-**只对 L2 pass 的产品跑。** 补 L2 硬规则抓不到的两类问题:
+**只对 L2 pass 的产品跑。** 补 L2 硬规则抓不到的问题,提示词里是**六个判定维度**:
 
-1. **品牌真伪** —— R4/R5 命中的词是真品牌还是通用英文词;
-2. **冒犯性 / IP 侵权 / 儿童产品 CPC** —— 从 title + 五点 + 描述语义判。
+| # | 维度 | 判什么 |
+|---|---|---|
+| 1 | 品牌真伪 | R4 命中的词是真品牌还是通用英文词 |
+| 2 | 冒犯性内容 | 色情 / 仇恨象征 / 仿真武器 |
+| 3 | 知识产权 | 商标 / 版权 IP / 专利 / Trade Dress / 肖像权 |
+| 4 | 品牌字段伪装 | brand 填 Unbranded 但文案暗示大牌 |
+| 5 | 儿童产品 CPC 兜底 | L1 类目漏判时从文案兜 |
+| **6** | **整机电器 / NRTL**(2026-08-21 新增) | 产品**本身**带不带电、是不是成品 |
+
+**维度 6 是从 L2 移上来的**,不是新加的判定 —— L2 原来按 PT 名猜整机/小件的
+分类器同日下线(见 §4 R3 那节)。移上来的理由是所有者定的:「代码只判定确定性
+的,这种很明显不确定」。**默认放行、拿不准 pass** —— 绝大多数产品不带电,宁可
+漏一个也不要重蹈"按类目名连坐整类"的覆辙。
 
 判定**不动分数**(hit penalty 恒 0),只决定 verdict:
 `reject` → 整品拒(stage=L3);`pending` → 待人工;`pass` → 交 L4(若开)。

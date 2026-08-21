@@ -236,7 +236,7 @@ def compute_final_reason(
     # cat_requires_cert_* 按 walmart_category 推
     if outcome.l1:
         wc = (outcome.l1.walmart_category or '').lower()
-        if {'cat_requires_cert_hard', 'cat_requires_cert_small_part',
+        if {'cat_requires_cert_hard',
             'cat_requires_cert_soft'} & hit_codes:
             if 'baby' in wc or 'children' in wc:
                 return "Children's Products"
@@ -292,7 +292,6 @@ _RULE_CN = {
     "cat_gate_pt_unknown":            "类目没定下来,判不了(待人工)",
     "cat_gate_pt_not_in_meta":        "该类目不在准入明细里,判不了(待人工)",
     "cat_requires_cert_hard":         "**该类目要求认证**(搬运模式提供不了)",
-    "cat_requires_cert_small_part":   "电气小件,需人工确认能否免认证",
     "cat_requires_cert_soft":         "该类目要软合规(可填披露)",
     "walmart_strict_sensitive":       "沃尔玛敏感类目",
     "publication_pt_forbidden":       "出版物类目禁售",

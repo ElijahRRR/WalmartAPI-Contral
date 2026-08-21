@@ -350,6 +350,38 @@ def _batch_head(conn, what: str, where: str, extra: dict,
     return head
 
 
+# 一次从服务端游标取多少行(内存与往返次数的折中)。
+# ⚠ 这个数**不是**判定批量,只影响内存驻留:每块判完就释放。
+_STREAM_CHUNK = 2000
+
+
+def _iter_candidates(sql: str, query_params: dict, chunk: int = _STREAM_CHUNK):
+    """输入:候选 SQL + 参数 → 输出:逐块产出候选行 dict 的生成器。
+
+    ⚠ **必须走服务端游标,而且必须另开一条连接**,两条都是踩出来的:
+
+    ① psycopg3 的普通游标 `execute` 时把整个结果集拉进客户端内存,`fetchmany`
+       只是从已经拉完的缓冲里切片 —— 省不了一个字节。78 万行带 title/五点/
+       长描述,单行几 KB 就是几 GB(2026-08-21 生产实测:所有者跑
+       `mode=nonpass -p limit=1000000`,机器内存崩了)。命名游标才是流式。
+    ② 主连接在判定循环里每 `_COMMIT_EVERY` 条要 `commit()`,而 **COMMIT 会
+       销毁服务端游标**。所以取数必须用独立连接,不然跑到第一个提交点就炸。
+       这条连接只读,判完即关。
+    """
+    import uuid
+    name = f"audit_cand_{uuid.uuid4().hex[:12]}"
+    with db.pg_conn() as c:
+        with c.cursor(name=name) as cur:
+            cur.itersize = chunk
+            cur.execute(sql, query_params)
+            cols = [d[0] for d in cur.description]
+            while True:
+                batch = cur.fetchmany(chunk)
+                if not batch:
+                    return
+                yield [dict(zip(cols, r)) for r in batch]
+
+
 def _is_forced(params: dict, extra: dict) -> bool:
     """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
 
@@ -983,25 +1015,26 @@ def run(params: dict) -> str:
                       "且未按当前规则版本判过的",
                 where, extra, limit,
                 "一个都没有:这批已经全部按当前版本判过了") + sheet_head
-        with conn.cursor() as cur:
-            cur.execute(_CANDIDATE_SQL.format(where=where,
-                                              recent_guard=guard),
-                        query_params)
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
+        # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
+        cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)
+        chunks = _iter_candidates(cand_sql, query_params)
 
-        adopted_n, adopted = (0, set())
-        if backfill:
-            adopted_n, adopted = _adopt_history(
-                conn, [r["asin"] for r in rows], execute)
         if adopt_only:
             # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
             # 再单独安排要真判的那批)。86 万可采用 vs 33 万要真判,混在
             # 一起跑等于为了采用而顺带付 33 万次 LLM
-            return (f"product_audit(仅采用历史,零 LLM):候选 {len(rows)} → "
+            # ⚠ 逐块采用:`_adopt_history` 是按 asin 独立的,分块与整批等价,
+            #   而整批意味着把 86 万个 asin 塞进一个 `= ANY(%s)`(又一处 OOM)
+            cand_n = adopted_n = 0
+            for chunk in chunks:
+                cand_n += len(chunk)
+                n, _ = _adopt_history(conn, [r["asin"] for r in chunk], execute)
+                adopted_n += n
+            return (f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
                     f"采用 {adopted_n}"
                     + ("" if execute else "(dry-run:未写库)")
-                    + f";其余 {len(rows) - adopted_n} 条无历史,需另跑判定")
+                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定")
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0
@@ -1016,17 +1049,34 @@ def run(params: dict) -> str:
         row_errors, consec_errors = 0, 0
         l0_untouched = 0
         done_n = 0
+        cand_n = 0                   # 累计取到的候选行数(摘要报它,取代 len(rows))
+        adopted_n = 0
         t0 = time.monotonic()
-        todo = []
-        for row in rows:
-            if row["asin"] in adopted:
-                continue
-            if not row.get("title"):
-                no_title += 1        # 采集降级无标题:不够格判定,跳过不写结论
-                continue
-            if not row.get("seller_id"):
-                seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
-            todo.append((row["asin"], audit_rules.product_info_from_row(row)))
+
+        def _to_todo(chunk: list) -> list:
+            """输入:一块候选行 → 输出:[(asin, ProductInfo)](并累计三个计数)。
+
+            与原来那个一次性 for 循环逐字同语义,只是按块调用 —— 行对象
+            出了这一块就没人引用,可以被回收(OOM 修复的另一半)。
+            """
+            nonlocal no_title, seller_missing, adopted_n
+            out = []
+            adopted: set = set()
+            if backfill:
+                n, adopted = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute)
+                adopted_n += n
+            for row in chunk:
+                if row["asin"] in adopted:
+                    continue
+                if not row.get("title"):
+                    no_title += 1    # 采集降级无标题:不够格判定,跳过不写结论
+                    continue
+                if not row.get("seller_id"):
+                    seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
+                out.append((row["asin"],
+                            audit_rules.product_info_from_row(row)))
+            return out
 
         # 判定并发:worker 各领一条 autocommit 连接跑 audit_one(LLM 秒级,
         # 是墙钟大头);结果按完成序回主线程,落库/计数全在主线程单连接上
@@ -1050,7 +1100,7 @@ def run(params: dict) -> str:
                     pool.put(c)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                futs: dict = {}
                 # 落库缓冲:判定并发调到 128 之后,主线程"逐行 savepoint +
                 # 逐行 INSERT"就是新的瓶颈(所有者定稿 2026-08-17:批量落库)。
                 # 攒够 _PERSIST_BATCH 一次 executemany 落 runs+hits。
@@ -1097,64 +1147,77 @@ def run(params: dict) -> str:
                                          oc.asin, e2)
                     return bad
 
-                for fut in as_completed(futs):
-                    asin = futs[fut]
-                    try:
-                        outcome = fut.result()
-                        if outcome is None:     # stages=L0 未命中:保持原结论
-                            l0_untouched += 1
-                            consec_errors = 0
+                for chunk in chunks:
+                    cand_n += len(chunk)
+                    todo = _to_todo(chunk)
+                    # ⚠ **一块一提交**,不是一次把 78 万个 future 全丢进去
+                    #   (2026-08-21 生产 OOM 的另一半:每个 future 吊着入参,
+                    #   完成后还吊着 AuditOutcome,78 万份同时在内存里)。
+                    #   线程池与连接池仍是整轮共用一套 —— 分块的是"在飞的量",
+                    #   不是并发度,吞吐不受影响。
+                    futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                    for fut in as_completed(futs):
+                        asin = futs[fut]
+                        try:
+                            outcome = fut.result()
+                            if outcome is None:     # stages=L0 未命中:保持原结论
+                                l0_untouched += 1
+                                consec_errors = 0
+                                continue
+                            buf.append(outcome)
+                            bad = _flush()
+                            if bad:
+                                row_errors += bad
+                        except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
+                            row_errors += 1
+                            consec_errors += 1
+                            logger.error("单行审核失败 asin=%s:%s", asin, e)
+                            if consec_errors >= 5:
+                                for f in futs:
+                                    f.cancel()
+                                raise RuntimeError(
+                                    f"连续 {consec_errors} 行失败(共 {row_errors}),"
+                                    f"疑似系统性故障,停批。最后错误:{e}") from e
                             continue
-                        buf.append(outcome)
-                        bad = _flush()
-                        if bad:
-                            row_errors += bad
-                    except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
-                        row_errors += 1
-                        consec_errors += 1
-                        logger.error("单行审核失败 asin=%s:%s", asin, e)
-                        if consec_errors >= 5:
-                            for f in futs:
-                                f.cancel()
-                            raise RuntimeError(
-                                f"连续 {consec_errors} 行失败(共 {row_errors}),"
-                                f"疑似系统性故障,停批。最后错误:{e}") from e
-                        continue
-                    consec_errors = 0
-                    done_n += 1
-                    if done_n % _COMMIT_EVERY == 0:
-                        # 分段落定:此刻之前判的都已持久,中断只丢最后一段
-                        # ⚠ 先把缓冲冲干净再 commit —— 缓冲里还压着没落库的行时
-                        # 提交,那句"都已持久"就是谎话(它们要等下一批才落)
-                        row_errors += _flush(force=True)
-                        conn.commit()
-                        if events:
-                            product_events.record_many(conn, events)
+                        consec_errors = 0
+                        done_n += 1
+                        if done_n % _COMMIT_EVERY == 0:
+                            # 分段落定:此刻之前判的都已持久,中断只丢最后一段
+                            # ⚠ 先把缓冲冲干净再 commit —— 缓冲里还压着没落库的行时
+                            # 提交,那句"都已持久"就是谎话(它们要等下一批才落)
+                            row_errors += _flush(force=True)
                             conn.commit()
-                            events = []
-                        rate = done_n / max(time.monotonic() - t0, 1e-6)
-                        logger.info("进度 %d/%d(%.0f 条/秒,已提交)",
-                                    done_n, len(todo), rate)
-                    if outcome.l3 is not None:
-                        stage_stats["L3_ran"] += 1
-                        if outcome.l3.verdict == "reject":
-                            stage_stats["L3_reject"] += 1
-                        elif outcome.l3.verdict == "pending":
-                            stage_stats["L3_pending"] += 1
-                    if outcome.l4 is not None:
-                        stage_stats["L4_ran"] += 1
-                        if outcome.l4.verdict == "reject":
-                            stage_stats["L4_reject"] += 1
-                        for h in outcome.l4.hits:
-                            if h.penalty == 0 and h.rule_code.startswith("l4_"):
-                                l4_fail[h.rule_code] = \
-                                    l4_fail.get(h.rule_code, 0) + 1
-                    counts[outcome.verdict] += 1
-                    if (outcome.verdict == "reject" and ctx.known_policies
-                            and not audit_reason.known_policies_check(
-                                outcome.final_reason_category,
-                                ctx.known_policies)):
-                        policy_unknown += 1
+                            if events:
+                                product_events.record_many(conn, events)
+                                conn.commit()
+                                events = []
+                            rate = done_n / max(time.monotonic() - t0, 1e-6)
+                            # ⚠ 分母是**已取到的候选**不是总量 —— 候选现在是
+                            #   流式取的,跑到一半时"总共多少"还没取完。
+                            #   总量在摘要开头那行(_batch_head)里,别在这儿
+                            #   编一个看着像总量的数
+                            logger.info("进度 %d/%d 已取(上限 %d,%.0f 条/秒,"
+                                        "已提交)", done_n, cand_n, limit, rate)
+                        if outcome.l3 is not None:
+                            stage_stats["L3_ran"] += 1
+                            if outcome.l3.verdict == "reject":
+                                stage_stats["L3_reject"] += 1
+                            elif outcome.l3.verdict == "pending":
+                                stage_stats["L3_pending"] += 1
+                        if outcome.l4 is not None:
+                            stage_stats["L4_ran"] += 1
+                            if outcome.l4.verdict == "reject":
+                                stage_stats["L4_reject"] += 1
+                            for h in outcome.l4.hits:
+                                if h.penalty == 0 and h.rule_code.startswith("l4_"):
+                                    l4_fail[h.rule_code] = \
+                                        l4_fail.get(h.rule_code, 0) + 1
+                        counts[outcome.verdict] += 1
+                        if (outcome.verdict == "reject" and ctx.known_policies
+                                and not audit_reason.known_policies_check(
+                                    outcome.final_reason_category,
+                                    ctx.known_policies)):
+                            policy_unknown += 1
                 # 收尾冲刷:最后不满一批的那些也要落库,漏了就是"判了没存"
                 row_errors += _flush(force=True)
         if execute and events:
@@ -1175,7 +1238,7 @@ def run(params: dict) -> str:
               f"{',只跑L0' if only_l0 else ''}"
               f"{',L3关' if not run_l3 and not only_l0 else ''}"
               f"{',L4开' if run_l4 else ''}):"
-              f"候选 {len(rows)},判定 {judged}"
+              f"候选 {cand_n},判定 {judged}"
               f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
     if only_l0:
         lines.append(
@@ -1249,9 +1312,9 @@ def run(params: dict) -> str:
                      f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
     if row_errors:
         lines.append(f"⚠ 单行失败跳过 {row_errors}(savepoint 隔离,详见日志)")
-    if "asins" in extra and len(rows) < len(extra["asins"]):
-        lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
-                     f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")
+    if "asins" in extra and cand_n < len(extra["asins"]):
+        lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {cand_n}"
+                     f"——缺的 {len(extra['asins']) - cand_n} 个不在 catalog.products")
     if adopted_n:
         lines.append(f"历史结论采用 {adopted_n}(不写新 run,detail 指回原 run_id)")
     if no_title:

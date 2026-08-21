@@ -257,7 +257,14 @@ def run(params: dict) -> str:
                 lines.append(f"⚠ 「{sheet_ref.name}」同步失败(旧数据保留):{e}")
         gate = risk_gate.load_gate(conn)
         banned_asins = blacklist.load_banned_asins(conn)
-    lines.append(f"闸门现状:禁售类目 {len(gate['banned_pts'])} 个,"
+    # ⚠ 2026-08-21 改措辞:原文写「禁售类目 N 个」,紧跟在上面那行
+    # 「黑名单亚马逊类目 223 条」后面,所有者当场把两个数当成同一件事对不上。
+    # 它们**单位都不同**:上面是**亚马逊**类目路径/子树条目(L0 类目闸),
+    # 这里是**沃尔玛 PT**(上架前的风控闸)。名字里写清是哪一侧、查的哪张表。
+    lines.append(f"闸门现状:上架禁售沃尔玛 PT {len(gate['banned_pts'])} 个"
+                 f"(catalog.risk_product_types 里 准入状态=禁售 或 "
+                 f"中国卖家可做以「否」开头;与上面那 223 条**亚马逊**类目黑名单"
+                 f"是两回事),"
                  f"黑名单品牌 {len(gate['brands'])} 个,"
                  f"ASIN 黑名单 {len(banned_asins)} 个")
     # ASIN 黑名单**不由本工作流同步**(所有者问询 2026-08-12 补可见性):

@@ -103,10 +103,10 @@ def test_llm_thinking_disable_gated_by_flash_family(monkeypatch):
 def test_llm_model_for_purpose(monkeypatch):
     """批复 #1:env 逐用途覆盖,未配置回落默认;未登记用途 fail loud。"""
     monkeypatch.delenv("DEEPSEEK_MODEL_AUDIT_L1", raising=False)
-    assert llm.model_for("audit_l1") == llm._MODEL          # 未配置回落
+    assert llm.model_for("audit_l1") == llm._default_model()          # 未配置回落
     monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L1", "deepseek-reasoner")
     assert llm.model_for("audit_l1") == "deepseek-reasoner"
-    assert llm.model_for("default") == llm._MODEL
+    assert llm.model_for("default") == llm._default_model()
     with pytest.raises(ValueError, match="未登记的 LLM 用途"):
         llm.model_for("audit_l9")
 
@@ -118,7 +118,7 @@ def test_llm_cache_key_purpose_splits_keyspace(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-reasoner")
     assert llm_cache.cache_key(m, 0.2, 4096, purpose="audit_l3") \
         != llm_cache.cache_key(m, 0.2, 4096)
-    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", llm._MODEL)
+    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", llm._default_model())
     assert llm_cache.cache_key(m, 0.2, 4096, purpose="audit_l3") \
         == llm_cache.cache_key(m, 0.2, 4096)
 
@@ -244,3 +244,85 @@ def test_llm_cache_put_and_find_reusable_metadata():
         _FakeConn([( '{"visible": {"x": 1}}', "旧标题")]), "B0X", "Cups", "SIG")
     assert got == ({"visible": {"x": 1}}, "旧标题")
     assert llm_cache.find_reusable(_FakeConn(), "B0X", "Cups", "SIG") is None
+
+
+def test_default_model_is_call_time_not_an_import_snapshot(monkeypatch):
+    """缺省模型必须 **call-time 求值**(2026-08-21)。
+
+    cli.py 的约定是「.env 先于一切业务 import 加载,registry 各函数
+    call-time 求值即可拿到」。模块级 `os.environ.get` 是 import 快照,
+    只在"import 恰好晚于 load_dotenv"时碰巧正确;换个入口就静默吃缺省值,
+    而且看不出来 —— 只有账单和摘要里的模型名会变。
+    """
+    from api import llm
+
+    monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+    assert llm._default_model() == "deepseek-v4-flash"
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    assert llm._default_model() == "deepseek-v4-pro"        # 立刻生效
+    monkeypatch.setenv("DEEPSEEK_MODEL", "   ")             # 空白视同未配置
+    assert llm._default_model() == "deepseek-v4-flash"
+
+
+def test_default_model_is_not_a_retired_alias():
+    """缺省值不许是官方已宣布停用的旧别名(2026-08-21)。
+
+    踩上去的后果不是"某个功能怪怪的",是**全仓 LLM 调用在别名切断当天
+    一起失败**;而且 thinking-disabled 那道闸按 "flash" in model 门控,
+    别名下整条失效。这条用例是那两件事的守门人。
+    """
+    from registry import resources
+    from api import llm
+
+    assert llm._DEFAULT_MODEL not in resources.LLM_LEGACY_ALIASES
+    assert llm._DEFAULT_MODEL in resources.LLM_PRICING     # 缺省值必须能算出钱
+    # 缺省值必须触发 thinking disabled(v4-flash 家族官方默认开 thinking)
+    body = llm._request_body([{"role": "user", "content": "x"}], 0.2, 100,
+                             "default")
+    assert body["thinking"] == {"type": "disabled"}
+
+
+def test_legacy_alias_is_priced_and_called_out():
+    """旧别名要能算出钱(折叠到正式产品名),同时在摘要里点名警告。
+
+    停用日期(2026-07-24)已过还在用 = 随时可能整条链一起挂,而且不会预警。
+    """
+    from registry import resources
+    from services import llm_cost
+
+    assert resources.llm_priced_model("deepseek-chat") == "deepseek-v4-flash"
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 0, "cache_miss": 0}
+    assert (llm_cost.cost_of("deepseek-chat", "peak", row)
+            == llm_cost.cost_of("deepseek-v4-flash", "peak", row))
+    out = "\n".join(llm_cost.summarize(
+        {("deepseek-chat", "audit_l3", "peak"): row}))
+    assert "已宣布停用的旧别名" in out and "deepseek-v4-flash" in out
+    assert "无计价" not in out          # 别名不该再报"无计价"
+
+
+def test_cache_key_folds_alias_but_still_separates_real_models(monkeypatch):
+    """键里必须有 model,但**换标签不算换模型**(2026-08-21 所有者提问)。
+
+    · 不含 model = "换了模型还吃旧模型的出参",而且不报错 —— 换模型多半正是
+      为了换答案质量,拿旧答案顶上把这件事整个抵消掉;
+    · 但 deepseek-chat 只是 deepseek-v4-flash(非思考)的旧别名,**同一个模型**。
+      不折叠的话,缺省值从别名改成正式名的那一刻存量缓存全废、下一轮全额重付;
+    · deepseek-reasoner 是**思考模式**,行为不同,**必须**另分键空间 ——
+      计价可以合并(同一张价表),缓存身份不行。
+    """
+    from registry import resources
+    from services import llm_cache
+
+    m = [{"role": "user", "content": "映射"}]
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    k_alias = llm_cache.cache_key(m, 0.2, 4096)
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    assert llm_cache.cache_key(m, 0.2, 4096) == k_alias      # 同一个模型,同一个键
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    assert llm_cache.cache_key(m, 0.2, 4096) != k_alias      # 真换模型,换键空间
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+    assert llm_cache.cache_key(m, 0.2, 4096) != k_alias      # 思考模式,不许共用
+    # 折叠只影响缓存身份,不影响计价:reasoner 仍走 v4-flash 那张价表
+    assert resources.llm_priced_model("deepseek-reasoner") == "deepseek-v4-flash"
+    assert resources.llm_cache_model("deepseek-reasoner") == "deepseek-reasoner"

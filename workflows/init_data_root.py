@@ -61,7 +61,10 @@ FEISHU_BRAND_SHEET_ID=
 # LLM(DeepSeek 单链;api/llm.py)。分用途覆盖模型可选(批复 #1,
 # 未配置回落 DEEPSEEK_MODEL 默认;registry.LLM_PURPOSE_ENV 登记)
 DEEPSEEK_API_KEY=
-#DEEPSEEK_MODEL=deepseek-chat
+# 全仓统一 deepseek-v4-flash(所有者定稿 2026-08-21:审核与上架都用它);
+# 不填即用这个缺省值。**别填 deepseek-chat/deepseek-reasoner** —— 官方已宣布
+# 停用的旧别名,切断当天全仓 LLM 调用会一起失败
+#DEEPSEEK_MODEL=deepseek-v4-flash
 #DEEPSEEK_MODEL_AUDIT_L1=
 #DEEPSEEK_MODEL_AUDIT_L3=
 # L4 视觉(豆包/火山方舟;api/llm_vision.py;默认关,-p l4=on 才用)

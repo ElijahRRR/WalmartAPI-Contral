@@ -3,6 +3,17 @@
 旧系统 llm_cache.sqlite(462MB)PG 化:key = sha256(model+messages+
 temperature+max_tokens)[:32](旧配方原样,换模型即全部失效——这是接受的
 语义,旧数据因此不迁)。命中计数与 last_hit_at 便于后续清理低频行。
+
+**为什么键里要有 model**(2026-08-21 所有者问):因为出参取决于模型 ——
+不含 model 就等于"换了模型还在命中旧模型的答案",而换模型多半正是为了
+换答案质量,拿旧答案顶上把这件事整个抵消掉,**而且不报错**。
+批次 C 把键里的 model 从固定默认改成 `model_for(purpose)` 也是同一个理由:
+分用途选模型之后,键固定用默认模型会造成"这个用途换了模型还吃旧缓存"。
+
+**但换个标签不算换模型**:模型串先过 `registry.llm_cache_model()` 折叠别名,
+`deepseek-chat` 与 `deepseek-v4-flash` 共用一个键空间(同一个模型的同一个
+模式,前者只是旧别名)。没有这层折叠,把缺省值从别名改成正式名的那一刻
+存量缓存会全部作废、下一轮全额重付 —— 白烧一次钱换零收益。
 """
 
 import hashlib
@@ -21,8 +32,12 @@ def cache_key(messages: list[dict], temperature: float, max_tokens: int,
     键里的 model 经 llm.model_for(purpose) 解析,与 chat_json 实际请求的
     模型**按构造同源**(批次 C 分用途选模型后,若键固定用默认模型,会造成
     "用途换了模型还命中旧缓存"的静默错);不同用途/模型天然分缓存键空间。
+    再经 `registry.llm_cache_model()` 折叠别名 —— **换标签不算换模型**,
+    见模块头注。
     """
-    raw = json.dumps({"model": _llm_api.model_for(purpose),
+    from registry import resources
+    raw = json.dumps({"model": resources.llm_cache_model(
+                          _llm_api.model_for(purpose)),
                       "messages": messages,
                       "temperature": temperature, "max_tokens": max_tokens},
                      ensure_ascii=False, sort_keys=True)

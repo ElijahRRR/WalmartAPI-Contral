@@ -148,6 +148,25 @@ def test_pick_where_four_states():
     assert w == "p.audit_status = 'approved'"
 
 
+def test_pick_where_nonpass_covers_all_three_non_pass_states():
+    """非 pass 全量重判(所有者定稿 2026-08-21:判定标准改了就整批重认一次)。
+
+    两条钉死:
+    ① 用 `IS DISTINCT FROM 'approved'` 而**不是** `<> 'approved'` ——
+       后者对 NULL 求值为 NULL,**从没审过的会被整批漏掉且不报错**;
+    ② 必须带版本闸 —— rejected 判完还是 rejected,状态不变 ⇒ 不退出候选,
+       没有版本闸的话每轮 limit 都从头扫同一批,真跑原地打转
+       (mode=pass 那条注释记着的同款坑)。
+    """
+    w, e = product_audit._pick_where({"mode": "nonpass"})
+    assert "p.audit_status IS DISTINCT FROM 'approved'" in w
+    assert "<> 'approved'" not in w and "!= 'approved'" not in w
+    assert "audit_version IS DISTINCT FROM" in w
+    assert e["nonpass_ver"] == resources.AUDIT_RULES_VERSION
+    # 非 pass 重判是人工显式动作,不吃 24 小时 run 护栏(否则 dry-run 抽样漂移)
+    assert product_audit._is_forced({"mode": "nonpass"}, {})
+
+
 def test_mode_pass_requires_stages_l0():
     """mode=pass 不带 stages=L0 必须炸:全链重审全部 pass = 重烧全库 LLM。
 
@@ -953,6 +972,12 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
     assert product_audit._is_forced({"rerule": "phase0_forbidden_category"}, {})
     assert not product_audit._is_forced({}, {})
     assert not product_audit._is_forced({"rerule": "  "}, {})   # 空串不算
+    # mode=pending 也是强审(2026-08-21):它自述「无 1 天退避,等一天等的是自己」,
+    # 而 24 小时 run 护栏让你等的正是一天 —— dry-run 也落 runs,抽样看过的那批
+    # 24 小时内捞不回来,真跑处理的是另一批。人工显式动作、不进调度,吃护栏无收益。
+    assert product_audit._is_forced({"mode": "pending"}, {})
+    assert not product_audit._is_forced({"mode": "backfill"}, {})
+    assert not product_audit._is_forced({"mode": "pass"}, {})
 
 
 def test_candidate_sql_recent_guard_shape():
@@ -1396,3 +1421,76 @@ def test_seller_dry_run_writes_nothing():
                                  [{"seller_id": "S1"}, {"seller_id": "S2"}],
                                  allow_shrink=True, dry_run=True)
     assert "[DRY-RUN]" in msg and conn.inserted == []
+
+
+# ── LLM token 记账与成本折算(2026-08-21)──────────────────────────────────
+
+def test_record_usage_buckets_by_model_purpose_and_tier():
+    """token 是接口回的事实,记在 api 层;**时段在调用当时就定死**。
+
+    DeepSeek 峰谷价差整整一倍,一轮跑几小时会跨越分界 —— 事后按"现在是
+    什么时段"统一折算必然算错。
+    """
+    import datetime as dt
+    from api import llm as _llm
+
+    _llm.reset_usage_stats()
+    peak = dt.datetime(2026, 8, 21, 3, tzinfo=dt.timezone.utc)     # 01–04 UTC
+    off = dt.datetime(2026, 8, 21, 20, tzinfo=dt.timezone.utc)
+    u = {"prompt_tokens": 1000, "completion_tokens": 100,
+         "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "peak")] == {
+        "calls": 2, "prompt": 2000, "completion": 200,
+        "cache_hit": 1800, "cache_miss": 200}
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "offpeak")
+                            ]["calls"] == 1
+    # 供应商不回 usage:只累加次数,其余留 0 —— 少算不瞎算
+    _llm.record_usage("deepseek-v4-flash", "audit_l1", None, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l1", "offpeak")] == {
+        "calls": 1, "prompt": 0, "completion": 0,
+        "cache_hit": 0, "cache_miss": 0}
+    _llm.reset_usage_stats()
+    assert _llm.USAGE_STATS == {}
+
+
+def test_llm_cost_never_invents_a_number_for_unpriced_models():
+    """不认识的模型**只报 token 不报钱**,并在摘要里点名。
+
+    按 0 计价会产出一个看着像钱、其实是编的数字 —— 比不报更糟。
+    """
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 1000, "completion": 100,
+           "cache_hit": 0, "cache_miss": 1000}
+    assert llm_cost.cost_of("no-such-model", "peak", row) is None
+    out = "\n".join(llm_cost.summarize(
+        {("no-such-model", "list_new", "peak"): row}))
+    assert "该模型无计价" in out and "未计价模型" in out
+    assert "$0.00" not in out
+
+
+def test_llm_cost_peak_is_exactly_double_offpeak():
+    """峰谷差一倍 —— 大重审排在谷时段直接省一半,这个结论要能被算出来。"""
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 500_000, "cache_miss": 500_000}
+    peak = llm_cost.cost_of("deepseek-v4-flash", "peak", row)
+    off = llm_cost.cost_of("deepseek-v4-flash", "offpeak", row)
+    assert abs(peak - 2 * off) < 1e-9
+
+
+def test_llm_cost_falls_back_to_miss_price_when_split_absent():
+    """供应商不拆缓存命中时,整块 prompt 按**未命中**(贵的那档)算 ——
+    偏贵不偏便宜,估出来的账不会让人以为花得比实际少。"""
+    from services import llm_cost
+
+    split = {"calls": 1, "prompt": 0, "completion": 0,
+             "cache_hit": 0, "cache_miss": 1_000_000}
+    nosplit = {"calls": 1, "prompt": 1_000_000, "completion": 0,
+               "cache_hit": 0, "cache_miss": 0}
+    assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
+            == llm_cost.cost_of("deepseek-v4-flash", "peak", split))

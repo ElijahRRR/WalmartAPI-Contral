@@ -123,7 +123,11 @@ def test_risk_sync_workflow(monkeypatch):
     # 它此前是死快照没人同步(所有者 2026-08-17 实遇飞书删了库里还在)
     assert "walmart_pt_meta:全量重灌 1 行" in out
     assert "品牌表:读 1 行,入库 1" in out
-    assert "禁售类目 1 个,黑名单品牌 1 个" in out
+    # 摘要必须说清是**沃尔玛 PT**、查的哪张表(2026-08-21:原文「禁售类目 N 个」
+    # 紧跟在「黑名单亚马逊类目 223 条」后面,所有者当场把两个数当成一件事)
+    assert "上架禁售沃尔玛 PT 1 个" in out
+    assert "catalog.risk_product_types" in out and "亚马逊" in out
+    assert "黑名单品牌 1 个" in out
 
 
 def test_check_brand_and_manufacturer(monkeypatch):

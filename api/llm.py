@@ -96,6 +96,51 @@ def _bump_retry(key: str) -> None:
         RETRY_STATS[key] = RETRY_STATS.get(key, 0) + 1
 
 
+# ── token 用量记账(2026-08-21)────────────────────────────────────────────
+# 此前 chat_json 只取 choices[0].message.content,DeepSeek 同一个 JSON 里回的
+# `usage` **整块丢掉** —— 于是"这一轮花了多少钱"全仓答不出来(旧仓的
+# usage_logger 迁移时明确不迁,见 audit_l3 头注)。跑一次十几万条的重审之后
+# 再想知道花了多少,数据已经没了。
+#
+# 记的是 **token 不是钱**:token 是接口回的事实(api 层的活),单价是会变的
+# 业务参数(registry 存表、services 折算),换模型/换供应商只动后者。
+# 形态照抄同文件的 RETRY_STATS:线程安全累加 + 每轮 reset + 摘要渲染。
+USAGE_STATS: dict[tuple, dict] = {}
+_USAGE_LOCK = threading.Lock()
+
+
+def reset_usage_stats() -> None:
+    with _USAGE_LOCK:
+        USAGE_STATS.clear()
+
+
+def record_usage(model: str, purpose: str, usage: dict | None,
+                 at: "datetime.datetime | None" = None) -> None:
+    """输入:模型 + 用途 + 响应里的 usage 块 → 输出:无(按 (模型,用途,时段) 累加)。
+
+    **时段在调用当时就定死**(不是渲染时):DeepSeek 峰谷价差整整一倍,
+    一轮跑几小时会跨越峰谷分界,事后按"现在是什么时段"统一折算必然算错。
+    `usage` 缺失(供应商不回)只累加 calls,其余留 0 —— 少算不瞎算。
+    """
+    import datetime as _dt
+    from registry import resources
+    now = at or _dt.datetime.now(_dt.timezone.utc)
+    tier = resources.llm_price_tier(now)
+    u = usage or {}
+    key = (model, purpose, tier)
+    with _USAGE_LOCK:
+        row = USAGE_STATS.setdefault(
+            key, {"calls": 0, "prompt": 0, "completion": 0,
+                  "cache_hit": 0, "cache_miss": 0})
+        row["calls"] += 1
+        row["prompt"] += int(u.get("prompt_tokens") or 0)
+        row["completion"] += int(u.get("completion_tokens") or 0)
+        # DeepSeek 专有:命中前缀缓存的输入 token 便宜一个数量级,不分开记
+        # 就等于把 L3 那条"system prompt 逐字节相同"的缓存契约的收益抹平了
+        row["cache_hit"] += int(u.get("prompt_cache_hit_tokens") or 0)
+        row["cache_miss"] += int(u.get("prompt_cache_miss_tokens") or 0)
+
+
 def chat_json(messages: list[dict], *, temperature: float = 0.2,
               max_tokens: int = 4096, max_retries: int = 3,
               purpose: str = "default") -> dict:
@@ -113,7 +158,10 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
             resp = httpx.post(_BASE_URL, json=body, headers=headers,
                               timeout=httpx.Timeout(180, connect=10))
             if resp.status_code == 200:
-                content = (resp.json()["choices"][0]["message"]["content"])
+                payload = resp.json()
+                record_usage(body.get("model", _MODEL), purpose,
+                             payload.get("usage"))
+                content = payload["choices"][0]["message"]["content"]
                 return _extract_json(content)
             if resp.status_code in (429, 500, 502, 503, 504):
                 _bump_retry("http_429" if resp.status_code == 429

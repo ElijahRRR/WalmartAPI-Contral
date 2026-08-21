@@ -557,6 +557,40 @@ PT_TEMPLATE_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# ── LLM 计价表(2026-08-21 加;单位 USD / 每 100 万 token)──────────────
+# **DeepSeek 没有任何端点能查到单价或某次调用的花费**(核过官方文档:
+# `/user/balance` 只回余额;`/chat/completions` 的 usage 只回 token 数),
+# 所以单价只能落在本地。放这里是铁律 3:一切配置从 registry 取。
+#
+# 数据来源:api-docs.deepseek.com/quick_start/pricing,**2026-08-21 核**。
+# 官方会调价,对不上账时先来这里核一遍日期。
+#
+# ⚠ **峰谷价差整整一倍**,峰值时段(UTC)01:00–04:00 与 06:00–10:00
+#   —— 换算成北京时间就是 **09:00–12:00 与 14:00–18:00**;其余时段半价。
+#   所以十几万条的大重审排在**北京时间晚 18:00 到次日早 08:00**跑,直接省一半。
+LLM_PRICING_SOURCE = "api-docs.deepseek.com/quick_start/pricing(2026-08-21 核)"
+
+# 峰值时段(UTC 小时,左闭右开)。谷时段 = 其余全部
+LLM_PEAK_HOURS_UTC = ((1, 4), (6, 10))
+
+# model → {tier: (cache_hit, cache_miss, output)},USD / 1M token
+LLM_PRICING = {
+    "deepseek-v4-flash": {"peak":    (0.014, 0.44, 1.32),
+                          "offpeak": (0.007, 0.22, 0.66)},
+    "deepseek-v4-pro":   {"peak":    (0.044, 1.32, 3.96),
+                          "offpeak": (0.022, 0.66, 1.98)},
+}
+
+
+def llm_price_tier(dt) -> str:
+    """输入:带时区的 datetime → 输出:'peak' 或 'offpeak'。
+
+    换模型/换供应商不改这里 —— 时段规则是 DeepSeek 的,新供应商加自己的表。
+    """
+    h = dt.astimezone(__import__("datetime").timezone.utc).hour
+    return "peak" if any(a <= h < b for a, b in LLM_PEAK_HOURS_UTC) else "offpeak"
+
+
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。

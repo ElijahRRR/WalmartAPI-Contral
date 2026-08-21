@@ -157,8 +157,9 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
 # 2026-08-20 所有者定稿「代码里面的类目可以拿到数据库里来」:原
 # FORBIDDEN_AMAZON_TOPS 四个硬编码顶级 + 独立的 _check_forbidden_category
 # 已整体迁入 `catalog.amazon_cat_blacklist`(match_type='top_name'),
-# 判定并进上面规则 1 的一次 check()。种子数据见
-# services/category_blacklist.SEED_RULES —— 那只是建库用,判定不读它。
+# 判定并进上面规则 1 的一次 check()。名单只有一个出处:飞书「黑名单亚马逊
+# 类目」表 → risk_sync 整表镜像 → 库;代码里一条类目都不留
+#(曾经的 SEED_RULES 已于 2026-08-20 删除,理由见 category_blacklist 头注)。
 #
 # ⚠ 顶级类目的粒度是"筐"不是"品",往表里加一个顶级 = 把整个筐里的杂货
 # 一起拒掉且停在 L0。加之前先问:这个筐里**每一件**都该拒吗?

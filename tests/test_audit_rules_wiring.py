@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from registry import resources
-from services import audit_rules, audit_store
+from services import audit_l2, audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
@@ -21,7 +21,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 phase0_cats=frozenset(), brand_blacklist={},
-                pt_meta={}, pt_spec={}, ac_automaton=None, mega=[],
+                pt_meta={}, pt_spec={}, ac_automaton=None,
                 nrtl_small=[], nrtl_whole=[], nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
@@ -65,6 +65,26 @@ def test_audit_one_pending_when_pt_unresolved():
     ctx = _ctx(pt_meta=META)
     out = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx)
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_audit_one_l2_pending_when_pt_not_in_meta():
+    """2026-08-20 P0:PT 解出来了但准入明细里没有这一行 ⇒ L2 R1 判不了。
+
+    此前这条路是**静默 100 分放行**;白名单是唯一的类目判据(R0/R2 已删),
+    没人兜底,必须停在 L2 转待人工。注意 stage 是 L2 不是 L1(PT 解出来了),
+    分数照样带出来(证据已收全),这两点与"L1 解不出 PT"的 pending 不同。
+    """
+    # 基准:PT 在明细里 → 正常放行
+    ctx = _ctx(pt_meta=dict(META), walmart_confirmed={"B0P": "GoodPT"})
+    assert audit_rules.audit_one(
+        ProductInfo(asin="B0P", title="w"), ctx).verdict == "pass"
+
+    # 产品行自带 PT(不经 resolve_pt 的 pt_meta 闸),而明细里没有这一行
+    ctx2 = _ctx(pt_meta=dict(META))
+    l1 = L1Info(walmart_product_type="GhostPT", pt_source="audit_cached")
+    l2 = audit_l2.evaluate(ProductInfo(asin="B0Q", title="w"), l1, ctx2)
+    assert l2.verdict == "pending" and l2.score_final == 100
+    assert [h.rule_code for h in l2.hits] == ["cat_gate_pt_not_in_meta"]
 
 
 def test_audit_one_phase0_blocked_stub():
@@ -1340,3 +1360,39 @@ def test_adopt_history_says_the_old_reason_from_hits():
     assert "品牌黑名单" in by["B0AAAAAAA1"]        # 旧命中翻成人话
     assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]
     assert "理由未留存" in by["B0AAAAAAA2"]        # 连 hits 都没有才落这句
+
+
+def test_shrink_guard_message_says_what_you_are_installing():
+    """护栏拦下来时必须报出**将要装进去的是什么** —— 2026-08-20 生产实见:
+    它只说"11810→223",人被要求"人工核实"却无从核起;他要核的恰恰是那 223 条
+    里子树/顶级/路径各多少(列错位会让三个数全变样)。"""
+    conn = _BLConn(old_n=11810)
+    rows = ([_cat_row(f"T{i} > X", str(i), "", "子树") for i in range(200)]
+            + [_cat_row(f"P{i}", "", "", "顶级名") for i in range(23)])
+    with pytest.raises(RuntimeError) as e:
+        _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                               "catalog.amazon_cat_blacklist", rows)
+    msg = str(e.value)
+    assert "子树 200" in msg and "顶级名 23" in msg and "路径等值 0" in msg
+    assert "读入 223 行" in msg and "allow_shrink" in msg
+
+
+def test_amzcat_dry_run_writes_nothing():
+    """⚠ risk_sync 是 DANGEROUS=False,cli 恒给 execute=True —— `--dry-run`
+    只走 dry_run 这一路。2026-08-20 实见:所有者按"先 --dry-run 看摘要"敲下去,
+    四张 TRUNCATE 全量重灌的表**照样真写了**。"""
+    conn = _BLConn(old_n=200)
+    rows = [_cat_row(f"A{i} > B", str(i), "", "子树") for i in range(200)]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows,
+                                 dry_run=True)
+    assert "[DRY-RUN]" in msg and "一行未写" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql) and conn.inserted == []
+
+
+def test_seller_dry_run_writes_nothing():
+    conn = _BLConn(old_n=1314)
+    msg = _sync_column_blacklist(conn, _SELLER_SHEET, "catalog.seller_blacklist",
+                                 [{"seller_id": "S1"}, {"seller_id": "S2"}],
+                                 allow_shrink=True, dry_run=True)
+    assert "[DRY-RUN]" in msg and conn.inserted == []

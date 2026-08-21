@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **69 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **71 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1673 个单元测试**。
+- **1712 个单元测试**。
 
 ---
 
@@ -260,10 +260,17 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 ### 6.3 审核域
 
-判"这个产品能不能上"。分层:Phase0 精准拦截 → L1 类目 → L2 八条硬规则 →
+判"这个产品能不能上"。分层:L0 精准拦截 → L1 类目 → L2 规则 →
 L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
+**逐层怎么判、每条规则做什么、判不了怎么办,见 `docs/audit_pipeline.md`。**
 
-⚠ **类目闸判据全在库里**(`catalog.amazon_cat_blacklist`,2026-08-20 起),
+⚠ **一个类目能不能做,只有一处判据**(2026-08-20 定稿):
+沃尔玛侧看 `audit.walmart_pt_meta` 的类目准入白名单(L2 R1),亚马逊侧看
+`catalog.amazon_cat_blacklist`(L0)。原先并存的三份沃尔玛类目黑名单
+(L2 R0 代码常量 8 大类 / L2 R2 yaml 18 条禁售大类 / L1 excluded yaml 13 条)
+已全部删除 —— 同一件事三份清单,改一处漏两处而且不报错。
+
+⚠ **亚马逊类目闸判据全在库里**(`catalog.amazon_cat_blacklist`,2026-08-20 起),
 代码里一个类目常量都没有。首选按 `browse_node_id` **拦整棵子树** —— 名单写
 「拼图」,`拼图 > 3-D 拼图` 跟着被拦,类目改名也不失效;顶级类目(亚马逊顶级
 无 node id)按名字拦;归一化完整路径等值是飞书镜像的历史行,**父级不覆盖子级**,
@@ -277,6 +284,8 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |
 | `audit_history_fold` | 一 | 历史审核结论折叠进产品事件账本 |
+| `spec_split` | | 把官方 **450MB 单文件** MP_ITEM spec 流式拆成按 PT 的目录(`_pt_index`/`_orderable`/`_header`/`{PT}.json`)。mmap + 括号配对,**整份 JSON 从不变成 Python 对象**(旧仓 json.load 膨胀 1.3GB 触发 OOM);与在用版**并排放**不覆盖,`-p diff=1` 出换版差集(新增顶层必填 × 影响 PT 数);已拆好的目录用 `-p out=<目录> -p diff=1` 只对账不重拆 |
+| `pt_spec_sync` | | 用**本地官方 spec**(`<DATA_ROOT>/specs/MP_ITEM/<版本>/`,上架链同一份)重建类目准入明细:由 spec 必填字段推「要什么认证」→「中国搬运能不能做」(是/需评估/否),落 `audit.walmart_pt_spec`,导出**飞书粘贴表(10 列整齐)+ 差异复核表(带判据溯源)**;顺带对账「spec 有、准入明细没有」的类目,并与现表逐条比出收紧/放松。`-p pt=<名字>` 单点看证据链;`-p explain=<PT>` 对表字段读法;`-p sheet=<现表CSV>` 逐 PT 逐字段比现表与 spec 的差异(双向);`-p spec_dir=<新版目录>` 换版对账(不动 registry)。**不调接口** |
 | `audit_reason_backfill` | 一 | 存量「理由未留存」批量刷成旧 run 真实命中,顺带产出规则码分布(挑误伤类型的输入) |
 
 **重审政策**(唯一出处 `product_audit._DEFAULT_CANDIDATE`):没结论的审;
@@ -315,7 +324,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `risk_sync` | 调 | 飞书四表 → PG 镜像(类目表 / 黑名单品牌总表 / 黑名单卖家 / 黑名单亚马逊类目)。⚠ 黑名单亚马逊类目表是**五列整表镜像**(A=类目 B=browse_node_id C=中文翻译 D=匹配方式 E=原因),飞书是它的唯一维护面;骤缩超 50% 拒绝重灌,确认要缩加 `-p allow_shrink=1` |
+| `risk_sync` | 调 | 飞书四表 → PG 镜像(类目表 / 黑名单品牌总表 / 黑名单卖家 / 黑名单亚马逊类目)。⚠ 黑名单亚马逊类目表是**五列整表镜像**(A=类目 B=browse_node_id C=中文翻译 D=匹配方式 E=原因),飞书是它的唯一维护面;骤缩超 50% 拒绝重灌(报错里带**新数据构成**),确认要缩加 `-p allow_shrink=1`;四张表都认 `--dry-run` |
 | `blacklist_push` | 调 | PG 自产黑名单 → 飞书两张收集表(**整表重写**,带骤缩护栏) |
 | `asin_blacklist_import` | 危 一 | 黑名单 ASIN 批量导入 |
 | `category_blacklist_import` | | 类目黑名单**离线**录入:`-p csv=<规则表>`、`-p replace=1` 先清同源旧行。⚠ 只作飞书不可用时的应急 —— 日常维护改飞书表跑 `risk_sync`,整表镜像会覆盖本工作流灌的行。**代码里不留任何类目清单**,子树与否由「匹配方式」列说了算 |
@@ -534,7 +543,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 ### 测试
 
 ```bash
-python -m pytest -q          # 1563 passed
+python -m pytest -q          # 1712 passed
 ```
 
 测试钉的不是覆盖率,是**"错了也不报错"的那些接缝**:参数掉了那一段白跑、
@@ -557,6 +566,7 @@ python -m pytest -q          # 1563 passed
 | `docs/category_mapping.md` | 类目映射链九条工作流的唯一文档 |
 | `docs/allocation_plan.md` | 店铺占用与产品分配子计划 |
 | `docs/listing_plan.md` | 上架子计划:闸门链、载荷构造、变体 |
+| `docs/audit_pipeline.md` | **审核链逐层详细步骤**(L0→L4 每条规则做什么、判据在哪张表、判不了怎么办) |
 | `docs/audit_migration_plan.md` | 审核链设计与分批 |
 | `docs/audit_batch_c_decisions.md` | 审核 LLM 层裁决与 L1 候选面实证结论 |
 | `docs/feed_closure_audit.md` | feed 闭环审计:六提交点 × 三台账 × 五反哺器 |

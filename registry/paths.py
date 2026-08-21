@@ -100,8 +100,14 @@ def yingdao_input_file() -> Path:
 
 
 def audit_seed_file(name: str) -> Path:
-    """输入:审核规则种子文件名(如 'forbidden_categories_zh_seller.yaml')
+    """输入:审核规则种子文件名(如 'nrtl_small_parts.yaml')
     → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。
+
+    现存两个消费方:nrtl_small_parts.yaml(L2 R3 分整机/小件)与
+    pt_nice_class.yaml(L2 R5 的 Nice Class 过滤)。
+    forbidden_categories_zh_seller.yaml 已于 2026-08-20 删除 —— 它装的
+    13 条 L1 excluded + 18 条 R2 禁售大类,和 L2 R1 的类目准入白名单
+    讲同一件事,白名单补齐后整份下线。
 
     审核规则代码取 yaml 一律经此函数(铁律 3:路径不散落在 services)。
     """

@@ -1,46 +1,44 @@
-"""L2 规则引擎(R0-R8):四条硬拒 + 四条软证据,纯函数,自己不碰数据库。
+"""L2 规则引擎(R1/R3/R4/R5/R7/R8):两条硬拒 + 四条软证据,纯函数,自己不碰数据库。
 
-移植自旧仓 `pipelines/l2_rules.py`(并入 `forbidden_mega_categories.py` /
-`nrtl_classifier.py` / `nice_class_mapper.py` 三个小模块),判定语义逐字复刻。
-外部数据(pt_meta / pt_spec / 黑名单自动机 / 三个 yaml 的加载结果 / USPTO 连接)
-一律由调用方经 `ctx` 注入(见 services/audit_rules.AuditContext);本模块不连库、
-不读环境变量,yaml 路径只经 registry.paths.audit_seed_file 取(铁律 3)。
+移植自旧仓 `pipelines/l2_rules.py`(并入 `nrtl_classifier.py` /
+`nice_class_mapper.py`)。外部数据(pt_meta / pt_spec / 黑名单自动机 / yaml 加载
+结果 / USPTO 连接)一律由调用方经 `ctx` 注入(见 services/audit_rules.AuditContext);
+本模块不连库、不读环境变量,yaml 路径只经 registry.paths.audit_seed_file 取(铁律 3)。
 
-执行模型(旧仓 l2_rules.py:1345-1389):
-  起始 100 分 → 先叠加 l1.hits 的 penalty(**只加分**,不把 L1 hit 复制进 L2 hits;
-  批次 B 无 L1 阶段,这一步是空循环)→ 八条规则**按固定顺序全跑、不短路**
-  (R0 命中 -100 后 R1/R2/R3 照跑,分数可叠到 -300,这是有意的:detail 要收全证据)
-  → 下界保护 -1000。判定在 L2Result.verdict:score_final < 60 → reject。
-  软规则(R3b/R3c/R4/R5/R7/R8)penalty 全为 0,**不参与累积**;结论只由
-  R0/R1/R2/R3a 的 -100 决定,软 hit 纯粹是给 L3(批次 C)准备的证据账本。
+执行模型:起始 100 分 → 先叠加 l1.hits 的 penalty(**只加分**,不把 L1 hit 复制进
+L2 hits)→ 六条规则**按固定顺序全跑、不短路**(R1 命中 -100 后 R3 照跑,分数可叠到
+-200,这是有意的:detail 要收全证据)→ 下界保护 -1000。判定在 L2Result.verdict:
+score_final < 60 → reject;分数够但 R1 报了"判不了" → pending;否则 pass。
+软规则(R3b/R3c/R4/R5/R7/R8)penalty 全为 0,**不参与累积**;结论只由 R1/R3a 的
+-100 决定,软 hit 是给 L3 准备的证据账本。
 
-四条硬规则共用两道闸:`l1.excluded_category_reason` 非空 → 直接放行(L1 已死不重复);
-PT 空或 ∈ {"unknown", "(unknown)"}(**大小写敏感**,"Unknown" 拦不住)→ 直接放行
-——注意 R0 **没有** PT 闸,它只看 walmart_category。PT 未知要不要单独标 pending
-是 workflow 层的决定,不在这里偷改。
+两条硬规则共用一道闸:上游已判死(任一 l1.hit penalty<0,如出版物硬禁)→ 直接放行,
+既不重复扣分也不会把确定的拒降级成 pending。
 
-已知缺陷(**照迁不修**:批次 B 要与旧仓双跑对齐,现在改就分不清是移植 bug
-还是有意修复;要修得先拿双跑数据向所有者申请):
-  - R0 查表是精确等值、**大小写敏感**("electronics"、"Electronics & Accessories" 都不命中);
-  - R3 的 requirements 关键词是**裸子串**、无词边界:`"ul" in "fda regulation"` 为真,
-    任何含 regulation 的 requirements 都会被打成硬认证「UL 认证」;
-    `"iso" in "poison control"`、`"atf" in "platform"`、`"dea" in "idea"` 同理;
-  - R3 的软词抑制表达式实际只有「ansi 被 NSF/ANSI 61 抑制」一条生效,其余软词永不被抑制;
-  - `_infer_walmart_policy` 第 9 步在 hard label 拼接串上判 'food'/'medical',
-    而 label 是中文(「FDA 食品设施」不含拉丁 food),故 fda 分支几乎总落 Cosmetic Products;
-  - R4 的词边界判定用 `c.isalnum()`,中文/全角字符返回 True → 中文紧邻不算边界;
-  - R5 每个 mark 最多留 2 条 goods_samples 且各截断到 80 字符;
-  - R7 **只命中 soft 短语时不产出 hit**(证据被丢弃,L3 看不到);
-  - `_ALLCAPS_NOISE_TOKENS` 中的 "RoHS"(比较用 `t.upper()`,"ROHS" 不在集合内)
-    与单字母项(正则要求 ≥2 字符)**永不生效**,原样保留。
+**2026-08-20 的三件事(所有者定稿,不要往回改):**
+  1. **删 R0 与 R2。** R0 是代码里 8 个 walmart_category 硬禁,R2 是 yaml 里 18 条
+     禁售大类,它们和 R1 的类目白名单讲的是同一件事 —— 一个类目能不能做。
+     三份清单各自维护,改一处漏两处而且**不报错**。前置条件已完成:白名单先按
+     官方 spec 重建补齐(pt_spec_sync),再删这两份黑名单,中间无真空期。
+     现在类目层面只有 R1 一处判据。
+  2. **R1 的两条静默放行改判 pending。** PT 未知 / PT 不在 walmart_pt_meta 时
+     原先 `return []`,等于"查不到 = 没问题"直接 100 分放行。删掉 R0/R2 之后
+     这个洞再没有别的清单兜底,必须堵。判不了 ≠ 判过了。
+  3. **修掉三条"看着在跑其实没跑"的匹配缺陷**(详见各自 docstring):
+     R3 裸子串(`"ul" in "fda regulation"` → 打成 UL 认证 -100 硬拒)、
+     R4 中文紧邻不算词边界(中文品牌一个都拦不住)、
+     R7 只命中软短语时把证据整条丢掉(L3 收不到)。
+
+其余已知偏差(**有意保留**,动机写在各自 docstring 里):
+  - R3 的软词抑制实际只有「ansi 被 NSF/ANSI 61 抑制」一条生效(其余软词没有
+    对应的硬 label,不是缺陷);
+  - R5 每个 mark 最多留 2 条 goods_samples 且各截断到 80 字符(提示词预算)。
 
 不迁(旧仓死代码,移植规格 §6):R9 `trademark_symbol_in_title`(®/™ 判定已归 Phase0)、
 R6 `blacklist_compatible_for`(2026-04 删除,误伤率 90%)、`HARD_CERT_FIELDS` frozenset
 (真值在 sync 侧,已固化成 walmart_pt_spec.has_real_cert 列)、旧 37000 条 regex 版
-黑名单 `_compile_blacklist_patterns`、以及 yaml 里被注释掉的 Battery/Rechargeable/
-Lithium 与 Wheel/Speaker/Skirt/Cap 关键词。
+黑名单 `_compile_blacklist_patterns`。
 
-陈旧注释已按规格改对:R2 是 **18** 条禁售大类(旧注释写 17 / yaml 头写 9);
 R4/R5/R7/R8 的 penalty 一律 **0**(旧注释写 -15 / -10 / -20 / -30)。
 """
 
@@ -70,74 +68,6 @@ _AC_LOCK = threading.Lock()   # R4 自动机扫描锁(product_audit workers>1 �
 # =============================================================
 # yaml 加载(三个 refdata/audit 种子文件;结果由调用方塞进 ctx)
 # =============================================================
-
-
-@dataclass(frozen=True)
-class MegaCategory:
-    """R2 禁售大类一条(pt_contains / pt_exact / walmart_category_prefix
-    入库时已全部小写)。
-
-    pt_exact(2026-08-19 所有者定稿「减少误伤」新增):PT **精确等值**命中。
-    给"整机拦、配件放"的类目用——"Camera"这类词按词边界会把相机包/贴膜/
-    镜头盖一起拦(词在 PT 里 ≠ 产品是那个东西),换成整机 PT 的精确清单,
-    不带电配件(所有者定稿:手机壳/数据线/贴膜/手柄皮肤要卖)不再中枪。
-    """
-
-    key: str
-    reason: str
-    pt_contains: tuple[str, ...]
-    walmart_category_prefix: tuple[str, ...]
-    walmart_policy: str | None = None   # Walmart 37 条政策 category_en
-    pt_exact: frozenset = frozenset()
-
-
-@dataclass
-class MegaHit:
-    """R2 命中结果(matched_by 二选一:pt_contains / walmart_category_prefix)。"""
-
-    key: str
-    reason: str
-    matched_by: str
-    matched_term: str
-    walmart_pt: str | None = None
-    walmart_category: str | None = None
-    walmart_policy: str | None = None
-
-
-@lru_cache(maxsize=1)
-def load_mega_categories() -> list[MegaCategory]:
-    """输入:无 → 输出:R2 禁售大类清单(**yaml 条目顺序 = 优先级**,现为 18 条)。
-
-    条目内先查完全部 pt_contains 再查自己的 walmart_category_prefix,所以靠前条目的
-    category 前缀会压过靠后条目的 PT 关键词(yaml 把 medical/pet_food 排在
-    electronics/food 之前就是为此)——**移植时顺序一个都不许动**。
-    丢弃规则照迁:key 为空、或两个列表都空的条目整条跳过。
-    yaml 缺失 → 记 warning 并返回空列表(R2 整体失效但不报错)。
-    yaml 里的 `excluded_categories` 整节是 L1 消费的,这里从不读。
-    """
-    seed = paths.audit_seed_file("forbidden_categories_zh_seller.yaml")
-    if not seed.exists():
-        logger.warning("seed yaml %s 不存在, R2 返回空", seed)
-        return []
-    with seed.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    items = data.get("mega_forbidden_categories") or []
-    out: list[MegaCategory] = []
-    for it in items:
-        key = str(it.get("key") or "").strip()
-        reason = str(it.get("reason") or "").strip()
-        pt_c = tuple(str(x).strip().lower() for x in (it.get("pt_contains") or []) if str(x).strip())
-        pt_e = frozenset(str(x).strip().lower() for x in (it.get("pt_exact") or []) if str(x).strip())
-        cat_p = tuple(str(x).strip().lower() for x in (it.get("walmart_category_prefix") or []) if str(x).strip())
-        walmart_policy = str(it.get("walmart_policy") or "").strip() or None
-        if not key or (not pt_c and not pt_e and not cat_p):
-            continue
-        out.append(MegaCategory(
-            key=key, reason=reason, pt_contains=pt_c, pt_exact=pt_e,
-            walmart_category_prefix=cat_p, walmart_policy=walmart_policy,
-        ))
-    logger.info("loaded %d mega forbidden categories", len(out))
-    return out
 
 
 @lru_cache(maxsize=1)
@@ -210,75 +140,14 @@ def _classes_for(
 
 
 # =============================================================
-# R0: 中国搬运卖家全类目硬禁 (2026-04-28 用户指定)
-#
-# 业务规则: 中国搬运卖家完全做不了下面这些大类目, 不论 PT 是否在 walmart_pt_meta
-# 标"普通商品", 都直接挡. 与 Phase0 的区别:
-#   - Phase0 按 Amazon 顶级类目硬禁 (amazon_category_path 是 "Automotive" 等)
-#   - R0 按 Walmart 类目硬禁 (l1.walmart_category)
-#   兜底逻辑: 商家把汽配挂 Home & Kitchen 路径 Phase0 漏了, R0 看 walmart_category 兜住
-#
-# 注: 清单本体是 8 个 key (旧仓注释块只列 7 行, 把 Vehicles/Automotive 合并了),
-#     以清单为准. R0 与 R2 的 automotive/baby/food 等会重复命中 (一按 category
-#     一按 PT 名), 这是设计如此, 两条独立 hit 各扣 -100, 不去重.
-# =============================================================
-
-# walmart_category → (禁售原因, walmart_policy)
-_FORBIDDEN_WALMART_MEGA_CATEGORIES: dict[str, tuple[str, str]] = {
-    "Vehicles":               ("汽配/汽车整车: DOT/SAE 认证 + 安全件责任 + CARB 排放合规, 中国搬运做不了",
-                               "Auto & Motor Vehicles"),
-    "Automotive":             ("汽车: 整车类目禁",
-                               "Auto & Motor Vehicles"),
-    "Electronics":            ("3C 电子: UL/ETL/CSA/FCC 必备认证, 中国搬运做不了",
-                               "Electronics & RF"),
-    "Fashion":                ("服饰/鞋/包: 尺码/SKU/退货管理 + 仿大牌高发, 中国搬运做不了",
-                               "Textiles & Apparel"),
-    "Food & Beverage":        ("食品: FDA Food Facility Registration + 美国代理人 + 设施实地审, 中国搬运做不了",
-                               "Food Products"),
-    "Health & Personal Care": ("药品/医疗器械/护理: FDA + AML vetting + MoCRA, 中国搬运做不了",
-                               "Drugs & Paraphernalia"),
-    "Beauty":                 ("化妆品: MoCRA 2024 + FDA, 中国搬运做不了",
-                               "Cosmetic Products"),
-    "Baby":                   ("婴儿用品: CPSIA + Safe Sleep Act + CPC, 中国搬运做不了",
-                               "Baby Products"),
-}
-
-
-def _rule_zh_seller_mega_category_forbidden(l1: L1Info) -> list[RuleHit]:
-    """输入:L1 结果 → 输出:R0 命中的 hit 列表(0 或 1 条,penalty=-100)。
-
-    数据源 l1.walmart_category:**只 strip 不 lower**,精确等值查表(大小写敏感)。
-    空串/None 直接放行;R0 没有 PT 闸,只有 excluded 闸。
-    """
-    cat = (l1.walmart_category or "").strip()
-    if not cat:
-        return []
-    if l1.excluded_category_reason:  # L1 已扣过 → 不重复
-        return []
-
-    entry = _FORBIDDEN_WALMART_MEGA_CATEGORIES.get(cat)
-    if not entry:
-        return []
-
-    reason, walmart_policy = entry
-    return [
-        RuleHit(
-            stage="L2",
-            rule_code="zh_seller_mega_cat_forbidden",
-            penalty=-100,
-            detail={
-                "walmart_pt": l1.walmart_product_type,   # 原值, 未 strip
-                "walmart_category": cat,                 # strip 后的值
-                "walmart_policy": walmart_policy,
-                "reason": reason,
-                "source": "用户指定: 中国搬运卖家全类目硬禁",
-            },
-        )
-    ]
-
-
-# =============================================================
 # R1: 类目准入 gate — 双字段白名单 (access_state + zh_can_do)
+#
+# **2026-08-20 起,类目层面能不能做,只有这一条规则说了算。**
+# 同期删掉的 R0(代码里 8 个 walmart_category 硬禁)与 R2(yaml 18 条禁售大类)
+# 讲的是同一件事的另外两种写法:三份清单各自维护,改一处漏两处,而且漏了
+# **不报错**。所有者定稿:「以后我只要维护这个沃尔玛类目白名单即可」。
+# 前置条件已完成 —— 白名单先补齐(pt_spec_sync 按官方 spec 重建准入明细),
+# 再删黑名单,中间没有真空期。
 #
 # 业务规则 (用户 2026-04-27):
 #   一个 PT 必须**同时满足**两条才允许进入后续审核:
@@ -295,29 +164,84 @@ def _rule_zh_seller_mega_category_forbidden(l1: L1Info) -> list[RuleHit]:
 
 _ACCESS_WHITELIST = {"普通商品", "附条件允许"}
 
+# R1 判不了时写进 L2Result.pending_reason 的两个 rule_code(evaluate 认这个集合)
+PENDING_RULE_CODES = frozenset({"cat_gate_pt_unknown", "cat_gate_pt_not_in_meta"})
+
+
+def _blocked_upstream(l1: L1Info) -> bool:
+    """输入:L1Info → 输出:上游是否已判死(任一 hit 扣了分)。
+
+    取代原先的 `l1.excluded_category_reason` 闸(该字段 2026-08-20 已删)。
+    口径与 audit_rules._blocked 一致:**按 penalty<0 判,不按"有没有 hit"** ——
+    0 分留痕的 hit(如 unmapped_amazon_path 哨兵)不算判死。
+    """
+    return any(h.penalty < 0 for h in l1.hits)
+
 
 def _rule_category_gate(l1: L1Info, ctx: Any) -> list[RuleHit]:
     """输入:L1 结果 + ctx(用 ctx.pt_meta) → 输出:R1 命中的 hit(0 或 1 条,-100)。
 
-    rule_code 二选一,**闸一先 return**,所以两个都拒时只报更上游的 cat_access_blocked:
-      cat_access_blocked — access_state 不在白名单(需审批/禁售/已废弃/空)
-      cat_zh_blocked     — zh_can_do 既不等于 '是' 也不以 '需评估' 开头(含空)
-    PT 查不到 pt_meta → **不拒、不标记、静默放行**(旧仓 l2_rules.py:269-271 唯一 None 分支),
-    这里只补一条 warning 便于计数,**不新增 hit**(会改 audit_hits 行数口径,破坏双跑比对)。
+    四种出口:
+      cat_access_blocked    -100  access_state 不在白名单(需审批/禁售/已废弃/空)
+      cat_zh_blocked        -100  zh_can_do 既不等于 '是' 也不以 '需评估' 开头(含空)
+      cat_gate_pt_unknown      0  PT 空 / 'unknown' / '(unknown)' → **待人工**
+      cat_gate_pt_not_in_meta  0  PT 不在 walmart_pt_meta        → **待人工**
+    前两个**闸一先 return**,所以两个都拒时只报更上游的 cat_access_blocked。
+    后两个 penalty=0 但会让 evaluate 把整条结论置成 pending(见 PENDING_RULE_CODES)。
+
+    ⚠ 2026-08-20 修掉两条静默放行(所有者定 P0)。此前这两种情况一律
+    `return []` —— 白名单是唯一的类目判据,而"查不到这个 PT"被当成了
+    "这个 PT 没问题",分数原封不动 100 分直接 pass。
+    **判不了不是判过了**:改判 pending 交人工,与"L1 解不出 PT → pending"
+    同一条纪律(审核宁缺勿滥)。不扣分是有意的 —— 扣分等于"证据确凿地拒",
+    而事实是**没有证据**。
+
+    ⚠ 说实话:**当前接线下这两条走不到**。`audit_rules.resolve_pt` 末尾有一道
+    同款 pt_meta 闸(解出来的 PT 不在表里就丢弃),PT 解不出会先在 L1 转 pending,
+    所以 evaluate 收到的 PT 必定在 pt_meta 里。这两个分支是**防御网**,不是
+    在补一个正在漏货的洞。留着的理由只有一条:白名单成了唯一判据之后,
+    "查不到就放行"这个默认值本身不能存在 —— 上游任何一道闸被放松、或者有人
+    直接调 evaluate,后果就是**静默满分放行且不报错**。默认值要站在安全那一侧。
+
+    上游已判死(任一 hit penalty<0,如出版物硬禁)时整条规则不参与:
+    既不重复扣分,也**不会把一条已经拒掉的结论降级成 pending**。
     两条 detail 的 access_state 处理**不对称**(前者带 `or "(空)"` 后者不带),照迁。
     """
+    if _blocked_upstream(l1):
+        return []
+
     pt = (l1.walmart_product_type or "").strip()
     if not pt or pt in {"unknown", "(unknown)"}:
-        return []
-    # 已在 L1 阶段扣过 excluded_category → L2 不重复
-    if l1.excluded_category_reason:
-        return []
+        return [
+            RuleHit(
+                stage="L2",
+                rule_code="cat_gate_pt_unknown",
+                penalty=0,
+                detail={
+                    "walmart_pt": l1.walmart_product_type,
+                    "pt_source": l1.pt_source,
+                    "rule": "PT 未知 ⇒ 类目白名单查不了 ⇒ 待人工",
+                    "source": "L2 R1",
+                },
+            )
+        ]
 
     row = ctx.pt_meta.get(pt)
     if not row:
-        # PT 不在 meta 表 → 不拒 (旧仓原语义);静默常态化 = 主路径已坏没人知道, 故记一笔
-        logger.warning("R1: PT %r 不在 walmart_pt_meta, 按旧语义静默放行", pt)
-        return []
+        logger.warning("R1: PT %r 不在 walmart_pt_meta,转 pending 待人工", pt)
+        return [
+            RuleHit(
+                stage="L2",
+                rule_code="cat_gate_pt_not_in_meta",
+                penalty=0,
+                detail={
+                    "walmart_pt": pt,
+                    "pt_source": l1.pt_source,
+                    "rule": "PT 不在 walmart_pt_meta ⇒ 类目白名单查不了 ⇒ 待人工",
+                    "source": "walmart_pt_meta",
+                },
+            )
+        ]
 
     access = (row.get("access_state") or "").strip()
     zh = (row.get("zh_can_do") or "").strip()
@@ -365,115 +289,33 @@ def _rule_category_gate(l1: L1Info, ctx: Any) -> list[RuleHit]:
 
 
 # =============================================================
-# R2: 禁售大类 (seed yaml 的 18 条: PT 名关键词 / walmart_category 前缀)
-#
-# 为什么不用 walmart_prohibited_policy 的粗粒度映射:
-#   walmart_category 层级太粗 (Garden & Patio 下既有园艺耙也有 Plants & Seeds 禁售),
-#   直接按 walmart_category 匹配政策会误杀. 政策只用作 L3 LLM 上下文.
-# =============================================================
-
-
-@lru_cache(maxsize=512)
-def _compile_kw_pattern(term: str) -> re.Pattern:
-    """输入:yaml 关键词 → 输出:词边界 + 可选尾部单个 's' 的大小写不敏感正则。
-
-    examples:
-      - "bra"         → \\bbras?\\b  (匹配 "bra"/"Bras", 不匹配 "Brackets")
-      - "cell phone"  → \\bcell\\ phones?\\b  (含空格的整体短语)
-      - "E-Cigarette" → \\be\\-cigarettes?\\b
-    """
-    return re.compile(rf"\b{re.escape(term.lower())}s?\b", re.IGNORECASE)
-
-
-def _match_mega(
-    walmart_pt: str,
-    walmart_category: str | None,
-    mega: list[MegaCategory],
-) -> MegaHit | None:
-    """输入:PT + walmart_category + yaml 清单 → 输出:首个命中的 MegaHit 或 None。
-
-    PT 走词边界正则(不 lower,靠 IGNORECASE);category 走 **纯前缀**(两侧都已 lower)。
-    遍历按 yaml 条目顺序,条目内先 pt_contains 后 walmart_category_prefix。
-    """
-    pt_norm = (walmart_pt or "").strip()
-    cat_norm = (walmart_category or "").strip().lower()
-    if not pt_norm and not cat_norm:
-        return None
-    for mc in mega:
-        # 0. PT 精确等值命中(pt_exact:整机拦、配件放的类目用)
-        if pt_norm and pt_norm.lower() in mc.pt_exact:
-            return MegaHit(
-                key=mc.key,
-                reason=mc.reason,
-                matched_by="pt_exact",
-                matched_term=pt_norm.lower(),
-                walmart_pt=walmart_pt,
-                walmart_category=walmart_category,
-                walmart_policy=mc.walmart_policy,
-            )
-        # 1. PT word-boundary 命中 (大小写不敏感 + 可选复数)
-        if pt_norm:
-            for term in mc.pt_contains:
-                if not term:
-                    continue
-                if _compile_kw_pattern(term).search(pt_norm):
-                    return MegaHit(
-                        key=mc.key,
-                        reason=mc.reason,
-                        matched_by="pt_contains",
-                        matched_term=term,
-                        walmart_pt=walmart_pt,
-                        walmart_category=walmart_category,
-                        walmart_policy=mc.walmart_policy,
-                    )
-        # 2. Walmart Category 前缀命中
-        if cat_norm:
-            for pref in mc.walmart_category_prefix:
-                if pref and cat_norm.startswith(pref):
-                    return MegaHit(
-                        key=mc.key,
-                        reason=mc.reason,
-                        matched_by="walmart_category_prefix",
-                        matched_term=pref,
-                        walmart_pt=walmart_pt,
-                        walmart_category=walmart_category,
-                        walmart_policy=mc.walmart_policy,
-                    )
-    return None
-
-
-def _rule_forbidden_mega_cat(l1: L1Info, ctx: Any) -> list[RuleHit]:
-    """输入:L1 结果 + ctx(用 ctx.mega) → 输出:R2 命中的 hit(0 或 1 条,-100)。"""
-    pt = (l1.walmart_product_type or "").strip()
-    if not pt or pt in {"unknown", "(unknown)"}:
-        return []
-    if l1.excluded_category_reason:
-        return []  # L1 已死不重复扣
-
-    hit = _match_mega(walmart_pt=pt, walmart_category=l1.walmart_category, mega=ctx.mega)
-    if not hit:
-        return []
-    return [
-        RuleHit(
-            stage="L2",
-            rule_code="forbidden_mega_cat",
-            penalty=-100,
-            detail={
-                "key": hit.key,
-                "reason": hit.reason,
-                "matched_by": hit.matched_by,
-                "matched_term": hit.matched_term,
-                "walmart_pt": hit.walmart_pt,
-                "walmart_category": hit.walmart_category,
-                "walmart_policy": hit.walmart_policy,   # 对齐 Walmart 37 条政策
-            },
-        )
-    ]
-
-
-# =============================================================
 # R3: 类目需证书 (飞书 requirements + 沃尔玛官方 PT spec) — 硬/软分层
 # =============================================================
+
+
+_ASCII_RE = re.compile(r"^[\x00-\x7f]+$")
+
+
+@lru_cache(maxsize=256)
+def _kw_re(kw: str) -> re.Pattern | None:
+    """输入:一个认证关键词 → 输出:带词边界的正则,或 None(表示该退回子串匹配)。
+
+    只有**纯 ASCII** 关键词才配词边界:中文没有分词空格,`\b` 夹在两个汉字
+    之间永不成立,给「fda 食品」加边界等于让它永不命中。
+    边界只加在两端本身是字母数字的那一侧 —— 「510(k)」右端是 `)`,右侧不加,
+    否则 `\b` 要求 `)` 后面跟词字符,反而漏掉句末的命中。
+    """
+    if not kw or not _ASCII_RE.match(kw):
+        return None
+    left = r"\b" if kw[0].isalnum() else ""
+    right = r"\b" if kw[-1].isalnum() else ""
+    return re.compile(left + re.escape(kw) + right, re.IGNORECASE)
+
+
+def _kw_hit(kw: str, hay_low: str) -> bool:
+    """输入:关键词 + 已小写的待扫文本 → 输出:是否命中(ASCII 走词边界,其余走子串)。"""
+    pat = _kw_re(kw)
+    return bool(pat.search(hay_low)) if pat else (kw in hay_low)
 
 
 def _classify_nrtl_pt(pt_name: str, small_kws: list[str], whole_kws: list[str]) -> str:
@@ -626,7 +468,11 @@ def _infer_walmart_policy(walmart_category: str, hard_matches: list[str], walmar
     if any(k in cert_str for k in ('cpsia', 'cpc', 'gcc')):
         return "Children's Products"
     if any(k in cert_str for k in ('fda', 'mocra')):
-        if 'medical' in cert_str:
+        # ⚠ 2026-08-20 修:cert_str 是**中文 label 的拼接串**(「FDA 食品设施」
+        # 「FDA 药品」「FDA 510(k)」),里面根本不会出现拉丁 'medical' ——
+        # 这一支此前永不成立,医疗器械类目一律错落成 Cosmetic Products。
+        # 补上 label 里真会出现的写法('510(k)' 与中文「医疗」)。
+        if any(k in cert_str for k in ('medical', '510(k)', '医疗')):
             return "Medical Devices"
         if 'food' in cert_str or '食品' in cert_str:
             return "Food Products"
@@ -663,12 +509,14 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
       D. spec.has_soft_cert                   → cat_requires_cert_soft         0
     pt_meta / pt_spec 查不到该 PT → 一律当"无要求"处理,不拒不标记(与 R1 同调)。
 
-    ⚠ 关键词是 `kw in req_low` 的**裸子串匹配**,无词边界:`"ul" in "fda regulation"`
-    为真,任何含 regulation 的 requirements 都会被打成硬认证「UL 认证」;
-    `"iso" in "poison control"`、`"atf" in "platform"`、`"dea" in "idea"` 同理。
-    这是旧仓已知高危缺陷,批次 B **逐字复刻以保证双跑一致**,改不改要拿双跑数据请示。
-    软词抑制 `not any(kw in hm.lower() for hm in hard_matches)` 实际只让
-    「ansi」被「NSF/ANSI 61」抑制一条生效,同样逐字迁移,不许"优化"成硬命中跳过全部软词。
+    ⚠ 2026-08-20 修掉裸子串(所有者定 P0)。此前是 `kw in req_low`,无词边界:
+    `"ul" in "fda regulation"` 为真 —— **任何**含 regulation 的 requirements 都被
+    打成硬认证「UL 认证」并 -100 硬拒;`"iso" in "poison control"`、
+    `"atf" in "platform"`、`"dea" in "idea"`、`"cpc" in "cpcb"` 同理。
+    这是纯误伤:拒得理直气壮,理由却是从别的词里抠出来的两个字母。
+    现在 ASCII 关键词走词边界正则(`_kw_re`),中文/混排关键词(如「fda 食品」)
+    仍走子串 —— 中文没有词边界概念,`\b` 在中文串里反而永不成立。
+    软词抑制 `not _kw_re(kw).search(...)` 同步改成同一口径。
 
     A 与 B 两个分支的 cat_requires_cert_hard **detail 结构不同**(A 有 meta_requirements /
     matched_hard_kws / walmart_policy;B 有 hard_cert_fields / classified_as 且**没有
@@ -677,8 +525,8 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
     """
     pt = (l1.walmart_product_type or "").strip()
     if not pt or pt in {"unknown", "(unknown)"}:
-        return []
-    if l1.excluded_category_reason:
+        return []          # PT 未知已由 R1 转 pending,这里不重复表态
+    if _blocked_upstream(l1):
         return []
 
     # ---- 1. 取 walmart_pt_meta.requirements (飞书业务维护) ----
@@ -710,10 +558,13 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
         ("警告标签", "警告"), ("标签", "标签"), ("测试报告", "测试报告"),
     ]
     for label, kw in HARD_KWS:
-        if kw in req_low:
+        if _kw_hit(kw, req_low):
             hard_matches.append(label)
     for label, kw in SOFT_KWS:
-        if kw in req_low and not any(kw in hm.lower() for hm in hard_matches):
+        # 软词抑制:该软词已经作为某条硬认证 label 的一部分出现过就不再单列
+        # (实际生效的只有「ansi」被「NSF/ANSI 61」抑制这一条,保留原意)
+        if _kw_hit(kw, req_low) and not any(_kw_hit(kw, hm.lower())
+                                            for hm in hard_matches):
             soft_matches.append(label)
 
     # ---- 2. 取 walmart_pt_spec ----
@@ -827,11 +678,23 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
 R4_PENALTY = 0   # v3 用户 2026-04-27: 软证据不扣分, 只标记 detail 传 L3 判通用词/真品牌
 
 
-def _is_word_boundary_char(c: str) -> bool:
-    """输入:单个字符 → 输出:它是否算词边界(非字母数字下划线,等价 Python \\b)。
+# 中日韩 + 全角:这些文字之间不写空格,"紧邻"就是词与词的分界
+_CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff"
+                     r"\ufe30-\ufe4f\uff00-\uffef]")
 
-    ⚠ `c.isalnum()` 对中文/全角字符返回 True ⇒ 中文紧邻不算边界。照迁。
+
+def _is_word_boundary_char(c: str) -> bool:
+    """输入:单个字符 → 输出:它是否算词边界。
+
+    ⚠ 2026-08-20 修:`c.isalnum()` 对中文/全角返回 True,于是"耐克运动鞋"里
+    黑名单词「耐克」左右都被判成非边界 —— **中文品牌一个都拦不住**,而且不报错。
+    中日韩与全角字符不写分词空格,紧邻即边界,单独判掉;拉丁带音标字母
+    (café 的 é)仍按词内字符处理,免得把 "Caf" 这种前缀切出来误命中。
     """
+    if not c:
+        return True
+    if _CJK_RE.match(c):
+        return True
     return not (c.isalnum() or c == '_')
 
 
@@ -1105,21 +968,25 @@ _ALLCAPS_RUN_RE = re.compile(
 )
 
 # 纯数字/常见尺寸单位 token, 不计入 "全大写滥用"
-_ALLCAPS_NOISE_TOKENS = {
+# ⚠ 2026-08-20 两处修正(此前是死条目,留着只会让人以为它们在起作用):
+#   · "RoHS" —— 比较用的是 `t.upper()`,大小写混写的条目永远匹配不上,
+#     整表统一大写(见下方 frozenset 推导),ROHS 现在真的被当噪声了;
+#   · 单字母 "L"/"M"/"S" —— 全大写连跑正则要求每个词 ≥2 字符,
+#     切出来的 token 不可能是单字母,这三项**证明不可达**,删除。
+_ALLCAPS_NOISE_TOKENS = frozenset(t.upper() for t in {
     "USB", "LED", "LCD", "OLED", "HDMI", "AC", "DC", "RGB", "IP",
     "GHZ", "MHZ", "HZ", "FM", "AM", "3D", "4K", "8K", "HD", "UHD",
     "PACK", "PCS", "CT", "GSM", "LBS", "OZ", "ML", "FL", "FT",
     "ISO", "ASTM", "ANSI", "NRTL", "UL", "ETL", "CE", "FCC", "RoHS",
     "USA", "US", "EU", "UK", "CA", "NBA", "NFL", "MLB", "NHL",
-    "PRO", "PLUS", "MAX", "MINI", "XXL", "XL", "L", "M", "S", "XS",
-}
+    "PRO", "PLUS", "MAX", "MINI", "XXL", "XL", "XS",
+})
 
 
 def _scan_allcaps_runs(title: str) -> list[str]:
     """输入:标题 → 输出:连续 3+ 个全大写词的原文片段列表(去噪去重后)。
 
-    去噪后 real_tokens 不足 3 个的片段不算。噪声表里 "RoHS"(比较用 t.upper())
-    与单字母项(正则要求 ≥2 字符)**永不生效**,保留原样不动。
+    去噪后 real_tokens 不足 3 个的片段不算。
     """
     if not title:
         return []
@@ -1143,7 +1010,10 @@ def _rule_content_promotional(product: ProductInfo) -> list[RuleHit]:
 
     扫 title + bullet_points[0..2](**只前 3 条五点**,不扫 long_description,
     避免过长文本误杀);全大写连跑**只扫 title**。
-    ⚠ 只命中 soft 短语时**不产出 hit**(证据被丢弃,L3 看不到)——旧仓已知缺口,照迁。
+    ⚠ 2026-08-20 修:此前只命中 soft 短语时**不产出 hit**,证据当场丢掉,
+    L3 永远看不到 —— 而 detail 里还写着"L3 LLM 需判断",承诺了却没送到。
+    现在照样产 hit(penalty 仍是 0,不影响任何判定),detail 里用
+    `soft_only=True` 标出它的份量,L3 提示词按这个字段区别对待。
     """
     title = (product.title or "")
     bullets_txt = " ".join((product.bullet_points or [])[:3])
@@ -1155,8 +1025,7 @@ def _rule_content_promotional(product: ProductInfo) -> list[RuleHit]:
     soft_hits = sorted({m.group(0) for m in _PROMO_SOFT_RE.finditer(scan_text)})
     allcaps_hits = _scan_allcaps_runs(title)
 
-    if not (strong_hits or allcaps_hits):
-        # 只命中 soft 不返回 hit (避免过激)
+    if not (strong_hits or soft_hits or allcaps_hits):
         return []
 
     return [
@@ -1168,6 +1037,7 @@ def _rule_content_promotional(product: ProductInfo) -> list[RuleHit]:
                 "strong_phrases": strong_hits,      # 核心命中
                 "soft_phrases": soft_hits,          # 辅助命中 (仅记录)
                 "allcaps_runs": allcaps_hits,       # 连续全大写片段
+                "soft_only": not (strong_hits or allcaps_hits),
                 "strong_count": len(strong_hits),
                 "allcaps_count": len(allcaps_hits),
                 "title_preview": title[:200],
@@ -1382,21 +1252,25 @@ def _rule_walmart_strict_sensitive(product: ProductInfo) -> list[RuleHit]:
 
 
 def evaluate(product: ProductInfo, l1: L1Info, ctx: Any) -> L2Result:
-    """输入:产品 + L1 结果 + 数据上下文 ctx → 输出:L2Result(score_final + hits)。
+    """输入:产品 + L1 结果 + 数据上下文 ctx → 输出:L2Result(score + hits + pending)。
 
     顺序:
       1. 起始 100 分
       2. 叠加 l1.hits 的 penalty(**只累加分数,不把 L1 hit 复制进 L2 hits**,
-         避免与 AuditOutcome.all_hits 重复入库;批次 B 无 L1 阶段 ⇒ 空循环)
-      3. 八条规则按固定顺序**全部执行、不短路**(R0 命中后 R1/R2/R3 照跑,
-         分数可叠到 -300,这是有意的:detail 要收全证据)
+         避免与 AuditOutcome.all_hits 重复入库)
+      3. 六条规则按固定顺序**全部执行、不短路**(R1 命中 -100 后 R3 照跑,
+         分数可叠到 -200,这是有意的:detail 要收全证据)
       4. 下界保护 -1000
+      5. R1 报了"判不了"(PENDING_RULE_CODES)⇒ 置 pending_reason;
+         有 -100 的确定拒时 reject 优先(见 L2Result.verdict)
 
     注:
+      - R0 / R2 已删除(2026-08-20 所有者定稿):与 R1 类目白名单三份清单讲同
+        一件事,只留 R1 一处维护。
       - R6 (blacklist_compatible_for) 已删除, 改由 L3 LLM 判 (规则硬拦误伤率 90%).
       - R9 (trademark_symbol_in_title) 已迁 Phase0 (phase0_trademark), 这里不调用.
       - 软规则 (R3b/R3c/R4/R5/R7/R8) penalty 均为 0, 不参与累积;
-        结论只由 R0/R1/R2/R3a 的 -100 决定 (score_threshold=60 下 100-0=100 ≥ 60 → pass).
+        结论只由 R1/R3a 的 -100 决定 (score_threshold=60 下 100-0=100 ≥ 60 → pass).
     """
     score = 100
     all_hits: list[RuleHit] = []
@@ -1407,32 +1281,31 @@ def evaluate(product: ProductInfo, l1: L1Info, ctx: Any) -> L2Result:
 
     # 2. 跑 L2 规则
     rules = [
-        _rule_zh_seller_mega_category_forbidden(l1),        # R0 walmart_category 全类目硬禁
-        _rule_category_gate(l1, ctx),                       # R1 PT 准入双白名单
-        _rule_forbidden_mega_cat(l1, ctx),                  # R2 禁售大类 (yaml 18 条)
+        _rule_category_gate(l1, ctx),                       # R1 PT 准入双白名单(唯一类目判据)
         _rule_cat_requires_cert(l1, ctx),                   # R3 类目需证书 (硬/软四分支)
         _rule_title_desc_blacklist(product, ctx),           # R4 黑名单品牌 (证据)
         _rule_trademark_live(product, l1, ctx),             # R5 USPTO LIVE 商标 (证据)
         _rule_content_promotional(product),                 # R7 内容宣称 (证据)
         _rule_walmart_strict_sensitive(product),            # R8 严格合规敏感词 (证据)
     ]
+    pending_reason = None
     for hits in rules:
         for h in hits:
             all_hits.append(h)
             score += h.penalty
+            if pending_reason is None and h.rule_code in PENDING_RULE_CODES:
+                pending_reason = h.detail.get("rule") or h.rule_code
 
     # 3. 下界保护
     if score < -1000:
         score = -1000
 
-    return L2Result(score_final=score, hits=all_hits)
+    return L2Result(score_final=score, hits=all_hits, pending_reason=pending_reason)
 
 
 __all__ = [
-    "MegaCategory",
-    "MegaHit",
+    "PENDING_RULE_CODES",
     "evaluate",
-    "load_mega_categories",
     "load_nice_mapping",
     "load_nrtl_keywords",
 ]

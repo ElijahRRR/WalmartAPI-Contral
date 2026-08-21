@@ -161,7 +161,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 
 | feedType | header | version(旧系统实测在用) | item 结构 | 切片上限(实践值) |
 |---|---|---|---|---|
-| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260304-22_45_32-api(完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 单店单 feed 打包 |
+| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260608-18_15_07-api(2026-08-20 换版,完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 单店单 feed 打包 |
 | MP_MAINTENANCE | 同上 | 同上 | 同上(Visible 可空) | 1000 条+25MB |
 | MP_ITEM_MATCH | MPItemFeedHeader{processMode:REPLACE,subset:EXTERNAL,locale,sellingChannel:mpsetupbymatch,version} | 4.2(sellingChannel 制,与 v5 businessUnit 制不同套) | MPItem[{Item:{}}] | 1000 条 |
 | DELETE_ITEM | ItemFeedHeader{locale,version,businessUnit}(官方示例同名,已核验) | 5.0.20250919-16_45_47-api(**仍是官方现值**) | Item[{Deletable:{sku}}] | 官方 400KB;定稿 350KB+2500 条双约束 |
@@ -171,7 +171,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | inventory | InventoryHeader{version} | 1.4 **Inventory 首字母大写**(小写→ERR_EXT_DATA_0503009) | Inventory[{sku,quantity}] | 4000 条+10MB(旧代码 25MB **超官方上限**,收紧) |
 
 version 字符串全部进 registry(不准散落硬编码),且**必须定期核对**:官方版本表约 4-6 周滚动一版(观察值,官方无更新频率承诺),
-旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前推荐 5.0.20260608-18_15_07-api),
+旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前 5.0.20260608-18_15_07-api);**MP_MAINTENANCE 早已切,MP_ITEM 2026-08-20 切**。换版前用 `spec_split -p diff=1` 量过差集:PT 6951→6951 零增零减,Orderable 24→23(仅移除可选的 specProductType),顶层必填有变化的 PT 仅 48 个,**新增必填只有 center_bore、影响 1 个 PT**(轮毂中心孔径,汽车整顶级不做),其余 5 个字段全是「不再必填」。
 仅 DELETE_ITEM 的 5.0.20250919 仍是现值。来源:官方 Item spec versioning and diff reporting 页。
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。

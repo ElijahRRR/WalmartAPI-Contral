@@ -1177,14 +1177,10 @@ def run(params: dict) -> str:
     if conn_note:
         # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
         lines.append(conn_note)
-    l1_blocked = (l1s.get("seed_excluded_direct", 0)
-                  + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
-                  + l1s.get("publication_forbidden", 0))
-    if l1_blocked:
-        lines.append(f"L1 硬拦:直出级 seed {l1s.get('seed_excluded_direct', 0)}"
-                     f" / rerank 级 excluded {l1s.get('llm_excluded', 0)}"
-                     f"(seed 补位 {l1s.get('seed_excluded', 0)})"
-                     f" / 出版物 {l1s.get('publication_forbidden', 0)}")
+    # 2026-08-20:seed/LLM 的 excluded 三个计数键随 excluded 链下线,L1 硬拦
+    # 现在只剩出版物一条(类目能不能做已全部归 L2 R1 白名单)
+    if l1s.get("publication_forbidden", 0):
+        lines.append(f"L1 硬拦:出版物 {l1s.get('publication_forbidden', 0)}")
     if stage_stats["L3_ran"]:
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"

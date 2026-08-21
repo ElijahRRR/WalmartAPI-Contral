@@ -42,6 +42,10 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.risk_sync")
 
 
+class _Skip(Exception):
+    """dry-run 时跳过写入段的内部信号(不外泄,run() 自己吃掉)。"""
+
+
 def _read_sheet(sheet) -> list[dict]:
     """输入:登记条目 → 输出:按 columns 命名的行 dict 列表(跳过全空行)。"""
     total = feishu.sheet_row_count(sheet)
@@ -77,7 +81,8 @@ def _first_row(sheet) -> list[dict]:
 
 
 def _sync_column_blacklist(conn, sheet, table: str, rows: list[dict],
-                           *, allow_shrink: bool = False) -> str:
+                           *, allow_shrink: bool = False,
+                           dry_run: bool = False) -> str:
     """输入:连接 + 登记条目 + 目标表 + 行 → 输出:重灌计数摘要(**单列表专用**)。
 
     现在只剩黑名单卖家一张(类目表 2026-08-20 升成五列,走
@@ -93,28 +98,37 @@ def _sync_column_blacklist(conn, sheet, table: str, rows: list[dict],
     with conn.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {table}")
         (old_n,) = cur.fetchone()
-    _guard_shrink(sheet, old_n, len(payload), allow_shrink)
+    _guard_shrink(sheet, old_n, len(payload), allow_shrink,
+                  f"新数据 {len(payload)} 条;")
+    if dry_run:
+        return f"[DRY-RUN] 「{sheet.name}」:将全量重灌 {len(payload)} 条,一行未写"
     with conn.cursor() as cur:
         cur.execute(f"TRUNCATE {table}")
         cur.executemany(f"INSERT INTO {table} (seller_id) VALUES (%s)", payload)
     return f"「{sheet.name}」:全量重灌 {len(payload)} 条"
 
 
-def _guard_shrink(sheet, old_n: int, new_n: int, allow_shrink: bool) -> None:
-    """输入:旧行数/新行数/放行开关 → 输出:无(骤缩且未显式放行则抛错)。
+def _guard_shrink(sheet, old_n: int, new_n: int, allow_shrink: bool,
+                  detail: str = "") -> None:
+    """输入:旧行数/新行数/放行开关(+ 新数据构成)→ 输出:无(骤缩未放行则抛错)。
 
     接口异常与运营删几行是两回事;但**有意的大改**也确实存在(2026-08-20
-    类目表从 11,810 条精确路径换成 233 条子树规则,缩 98%)。所以护栏保留,
+    类目表从 11,810 条精确路径换成 223 条子树规则,缩 98%)。所以护栏保留,
     只多一把要人显式敲的钥匙:`-p allow_shrink=1`。
+
+    ⚠ detail 必须报出**将要装进去的是什么**(2026-08-20 生产实见:护栏只说
+    "11810→223",人被要求"人工核实"却无从核起——他要核的恰恰是那 223 条里
+    子树/顶级/路径各多少,列错位会让三个数全变样)。
     """
     if old_n >= 20 and new_n < old_n * 0.5 and not allow_shrink:
         raise RuntimeError(
             f"「{sheet.name}」骤缩 {old_n}→{new_n}(超 50%),拒绝重灌——"
-            f"人工核实飞书表后,确认要缩就加 -p allow_shrink=1 重跑")
+            f"{detail}核对无误后加 -p allow_shrink=1 重跑")
 
 
 def _sync_amzcat_blacklist(conn, sheet, table: str, rows: list[dict],
-                           *, allow_shrink: bool = False) -> str:
+                           *, allow_shrink: bool = False,
+                           dry_run: bool = False) -> str:
     """输入:连接 + 登记条目 + 目标表 + 五列行 → 输出:重灌计数摘要。
 
     黑名单亚马逊类目表镜像(所有者定稿 2026-08-20:「我把 233 条整个粘贴进
@@ -147,10 +161,18 @@ def _sync_amzcat_blacklist(conn, sheet, table: str, rows: list[dict],
     if not payload:
         return (f"⚠ 「{sheet.name}」:本轮读到 0 条可用规则(疑似接口/配置异常"
                 f"或表头列错位),不重灌,库内旧数据保留生效")
+    kinds = collections.Counter(r["mt"] for r in payload)
+    compo = (f"新数据构成:子树 {kinds[category_blacklist.MATCH_NODE]} / "
+             f"顶级名 {kinds[category_blacklist.MATCH_TOP]} / "
+             f"路径等值 {kinds[category_blacklist.MATCH_PATH]}"
+             f"(读入 {n['读入']} 行,跳过 {n['跳过']}"
+             + (f",{n['按ID推断']} 行匹配方式为空" if n["按ID推断"] else "") + ");")
     with conn.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {table}")
         (old_n,) = cur.fetchone()
-    _guard_shrink(sheet, old_n, len(payload), allow_shrink)
+    _guard_shrink(sheet, old_n, len(payload), allow_shrink, compo)
+    if dry_run:
+        return f"[DRY-RUN] 「{sheet.name}」:将整表重灌 {len(payload)} 条;{compo}一行未写"
     with conn.cursor() as cur:
         cur.execute(f"TRUNCATE {table}")
         cur.executemany(
@@ -158,7 +180,6 @@ def _sync_amzcat_blacklist(conn, sheet, table: str, rows: list[dict],
             f" match_value, browse_node_id, category_zh, reason, source)"
             f" VALUES (%(norm)s, %(raw)s, %(mt)s, %(mv)s, %(nid)s, %(zh)s,"
             f" %(reason)s, %(source)s)", payload)
-    kinds = collections.Counter(r["mt"] for r in payload)
     tail = (f";⚠ {n['按ID推断']} 行「匹配方式」列为空,按 ID 推断("
             f"回落匹配来的 ID 会整棵误拦,核一遍)" if n["按ID推断"] else "")
     return (f"「{sheet.name}」:整表重灌 {len(payload)} 条"
@@ -169,11 +190,24 @@ def _sync_amzcat_blacklist(conn, sheet, table: str, rows: list[dict],
 
 
 def run(params: dict) -> str:
-    """输入:params(无参)→ 输出:两表同步计数与禁售/黑名单摘要。"""
+    """输入:params(allow_shrink / dry_run)→ 输出:四表同步计数与闸门摘要。
+
+    ⚠ 本工作流 `DANGEROUS=False`,而 cli 对非危险工作流恒给 `execute=True`
+    —— `--dry-run` 只体现在 `params["dry_run"]`。2026-08-20 实见:所有者按
+    "先 --dry-run 看摘要"敲下去,四张表**照样真写了**(它们都是 TRUNCATE +
+    全量重灌)。写的内容与日常调度一致所以没造成损失,但"敲了 dry-run 却在
+    写"这件事本身不能留。现在四张表全部认这个开关。
+    """
     lines = []
+    dry_run = bool(params.get("dry_run"))
+    if dry_run:
+        lines.append("[DRY-RUN] 只读飞书 + 核对护栏,一行不写")
     with db.pg_conn() as conn:
         try:
             pt_rows = _read_sheet(resources.RISK_PT_SHEET.require())
+            if dry_run:
+                lines.append(f"类目表:读 {len(pt_rows)} 行,将入库(未写)")
+                raise _Skip
             n_pt = risk_gate.sync_product_types(conn, pt_rows)
             lines.append(f"类目表:读 {len(pt_rows)} 行,入库 {n_pt}")
             # 同一份数据的第二个消费方:审核 R1 准入闸 / R3 认证闸只查
@@ -185,12 +219,19 @@ def run(params: dict) -> str:
                 f"  → 审核准入字典 walmart_pt_meta:全量重灌 {n_meta} 行"
                 + (f",**净减 {dropped} 行**(飞书删掉的已废弃 PT 同步生效)"
                    if dropped else ""))
+        except _Skip:
+            pass
         except LookupError as e:
             lines.append(f"类目表跳过:{e}")
         try:
             brand_rows = _read_sheet(resources.BRAND_BAN_SHEET.require())
+            if dry_run:
+                lines.append(f"品牌表:读 {len(brand_rows)} 行,将入库(未写)")
+                raise _Skip
             n_b = risk_gate.sync_brands(conn, brand_rows)
             lines.append(f"品牌表:读 {len(brand_rows)} 行,入库 {n_b}")
+        except _Skip:
+            pass
         except LookupError as e:
             lines.append(f"品牌表跳过:{e}")
         # 黑名单中心两张镜像表(卖家单列 / 亚马逊类目五列;所有者定稿 2026-08-13,
@@ -206,7 +247,8 @@ def run(params: dict) -> str:
                 rows = _first_row(sheet) + _read_sheet(sheet)
                 with db.pg_conn() as c2:
                     lines.append(fn(c2, sheet, table, rows,
-                                    allow_shrink=allow_shrink))
+                                    allow_shrink=allow_shrink,
+                                    dry_run=dry_run))
             except LookupError as e:
                 lines.append(f"「{sheet_ref.name}」跳过:{e}")
             except Exception as e:

@@ -80,8 +80,6 @@ def _ctx(monkeypatch, path_rows=_MAP_PATH, node_rows=_MAP_NODE):
                             if "walmart_pt_meta" in sql else {}))
     monkeypatch.setattr(audit_rules, "_frozen",
                         lambda conn, sql: frozenset())
-    monkeypatch.setattr(audit_rules.audit_l2, "load_mega_categories",
-                        lambda *a, **k: [])
     monkeypatch.setattr(audit_rules.audit_l2, "load_nrtl_keywords",
                         lambda *a, **k: ([], []))
     monkeypatch.setattr(audit_rules.audit_l2, "load_nice_mapping",

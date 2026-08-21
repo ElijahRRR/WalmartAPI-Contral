@@ -1,6 +1,6 @@
 """L2 硬规则/软证据 + 理由映射向量(spec_vectors B6/B7;旧仓零测试)。
 
-ctx 用 SimpleNamespace 鸭子拼装;mega/nrtl/nice 走真实 refdata yaml
+ctx 用 SimpleNamespace 鸭子拼装;nrtl/nice 走真实 refdata yaml
 (loader 即被测面之一);R5 恒关(ctx.uspto=None)。
 """
 
@@ -17,7 +17,7 @@ def _ctx(pt_meta=None, pt_spec=None, ac=None):
     small, whole = audit_l2.load_nrtl_keywords()
     return SimpleNamespace(
         pt_meta=pt_meta or {}, pt_spec=pt_spec or {},
-        ac_automaton=ac, mega=audit_l2.load_mega_categories(),
+        ac_automaton=ac,
         nrtl_small=small, nrtl_whole=whole,
         nice_mapping=mapping, nice_default=default, uspto=None)
 
@@ -27,44 +27,31 @@ def _p(**kw):
     return ProductInfo(**kw)
 
 
-def _l1(pt=None, cat=None, excluded=None):
-    return L1Info(walmart_product_type=pt, walmart_category=cat,
-                  excluded_category_reason=excluded)
+def _l1(pt=None, cat=None, dead=False):
+    """dead=True 模拟"上游已判死"(带一条 -100 的 L1 hit),取代已删的
+    excluded_category_reason 字段。"""
+    l1 = L1Info(walmart_product_type=pt, walmart_category=cat)
+    if dead:
+        l1.hits.append(RuleHit(stage="L1", rule_code="publication_pt_forbidden",
+                               penalty=-100, detail={}))
+    return l1
+
+
+def _ok_meta(pt="Widgets", cat=None):
+    """一个能过 R1 白名单的 pt_meta,给只想测软规则的用例用。"""
+    return {pt: {"walmart_category": cat, "walmart_ptg": None,
+                 "access_state": "普通商品", "zh_can_do": "是",
+                 "requirements": "", "notes": ""}}
+
+
+def _soft(title="", **kw):
+    """跑一遍 evaluate,PT 走白名单直通 —— 只留软规则的命中。"""
+    return audit_l2.evaluate(_p(title=title, **kw), _l1(pt="Widgets"),
+                             _ctx(pt_meta=_ok_meta()))
 
 
 def _codes(res):
     return [h.rule_code for h in res.hits]
-
-
-# ── R0 中国卖家八大类硬禁 ────────────────────────────────────────────────────
-
-def test_r0_electronics_hit():
-    res = audit_l2.evaluate(_p(), _l1(pt="Widgets", cat="Electronics"), _ctx())
-    h = [x for x in res.hits if x.rule_code == "zh_seller_mega_cat_forbidden"][0]
-    assert h.penalty == -100
-    assert h.detail["walmart_policy"] == "Electronics & RF"
-    assert h.detail["source"] == "用户指定: 中国搬运卖家全类目硬禁"
-    assert res.verdict == "reject"
-
-
-def test_r0_case_sensitive_and_guard():
-    assert "zh_seller_mega_cat_forbidden" not in _codes(
-        audit_l2.evaluate(_p(), _l1(pt="Widgets", cat="electronics"), _ctx()))
-    assert "zh_seller_mega_cat_forbidden" not in _codes(
-        audit_l2.evaluate(_p(), _l1(pt="W", cat="Electronics",
-                                    excluded="3C禁售"), _ctx()))
-
-
-@pytest.mark.parametrize("cat,policy", [
-    ("Vehicles", "Auto & Motor Vehicles"), ("Automotive", "Auto & Motor Vehicles"),
-    ("Fashion", "Textiles & Apparel"), ("Food & Beverage", "Food Products"),
-    ("Health & Personal Care", "Drugs & Paraphernalia"),
-    ("Beauty", "Cosmetic Products"), ("Baby", "Baby Products"),
-])
-def test_r0_all_keys(cat, policy):
-    res = audit_l2.evaluate(_p(), _l1(pt="Widgets", cat=cat), _ctx())
-    h = [x for x in res.hits if x.rule_code == "zh_seller_mega_cat_forbidden"][0]
-    assert h.detail["walmart_policy"] == policy
 
 
 # ── R1 双白名单闸 ────────────────────────────────────────────────────────────
@@ -110,44 +97,31 @@ def test_r1_empty_access_shows_placeholder():
     assert h.detail["access_state"] == "(空)"
 
 
-def test_r1_pt_not_in_meta_silently_passes():
+def test_r1_pt_not_in_meta_is_pending_not_pass():
+    """2026-08-20 P0:"查不到这个 PT" 曾经等于 "这个 PT 没问题",100 分放行。
+
+    白名单是唯一的类目判据,判不了必须转待人工。
+    ⚠ 这是**防御网**:当前接线下 resolve_pt 有同款 pt_meta 闸,走不到这里。
+    钉住它是因为"查不到就放行"这个默认值本身不能存在 —— 上游闸一松就是
+    静默满分放行且不报错。
+    """
     res = audit_l2.evaluate(_p(), _l1(pt="UnknownPT"), _ctx())
-    assert "cat_access_blocked" not in _codes(res)
-    assert res.verdict == "pass"
+    assert "cat_gate_pt_not_in_meta" in _codes(res)
+    assert res.score_final == 100 and res.verdict == "pending"   # 不扣分:没有证据
+    assert res.pending_reason
 
 
-# ── R2 禁售大类(真实 yaml)───────────────────────────────────────────────────
-
-def test_r2_word_boundary_plural():
-    """B6-11/12:'Bras' 命中 bra(可选复数 s),'Brackets' 不命中。"""
-    ok = audit_l2.evaluate(_p(), _l1(pt="Sports Bras", cat=None),
-                           _ctx(pt_meta={"Sports Bras": {
-                               "walmart_category": None, "access_state": "普通商品",
-                               "zh_can_do": "是", "requirements": "", "notes": "",
-                               "walmart_ptg": None}}))
-    assert "forbidden_mega_cat" in _codes(ok)
-    no = audit_l2.evaluate(_p(), _l1(pt="Shelf Brackets"),
-                           _ctx(pt_meta={"Shelf Brackets": {
-                               "walmart_category": None, "access_state": "普通商品",
-                               "zh_can_do": "是", "requirements": "", "notes": "",
-                               "walmart_ptg": None}}))
-    assert "forbidden_mega_cat" not in _codes(no)
+@pytest.mark.parametrize("pt", [None, "", "unknown", "(unknown)"])
+def test_r1_unknown_pt_is_pending_not_pass(pt):
+    res = audit_l2.evaluate(_p(), _l1(pt=pt), _ctx())
+    assert "cat_gate_pt_unknown" in _codes(res) and res.verdict == "pending"
 
 
-def test_r2_detail_shape():
-    res = audit_l2.evaluate(_p(), _l1(pt="E-Cigarette Kits", cat=None),
-                            _ctx(pt_meta={"E-Cigarette Kits": {
-                                "walmart_category": None, "access_state": "普通商品",
-                                "zh_can_do": "是", "requirements": "", "notes": "",
-                                "walmart_ptg": None}}))
-    hits = [x for x in res.hits if x.rule_code == "forbidden_mega_cat"]
-    assert hits and hits[0].detail["matched_by"] == "pt_contains"
-    assert hits[0].penalty == -100
-
-
-def test_r2_skips_unknown_pt():
-    res = audit_l2.evaluate(_p(), _l1(pt="(unknown)"), _ctx())
-    assert "forbidden_mega_cat" not in _codes(res)
+def test_r1_pending_never_downgrades_a_real_reject():
+    """上游已判死(出版物硬禁)时 R1 整条不参与 —— 确定的拒不许变成待定。"""
+    res = audit_l2.evaluate(_p(), _l1(pt=None, dead=True), _ctx())
+    assert "cat_gate_pt_unknown" not in _codes(res)
+    assert res.pending_reason is None and res.verdict == "reject"
 
 
 # ── R3 认证四分支 ────────────────────────────────────────────────────────────
@@ -205,6 +179,56 @@ def test_r3b_small_part_vs_whole_unit():
     assert h.detail["source"] == "walmart_pt_spec.has_real_cert + nrtl_classifier"
 
 
+def test_r3_hard_keywords_need_word_boundaries():
+    """2026-08-20 P0:关键词曾是裸子串,`"ul" in "fda regulation"` 为真 ——
+    任何 requirements 里写了 regulation 的类目都被打成「UL 认证」并 -100 硬拒。
+    拒得理直气壮,理由却是从别的词里抠出来的两个字母。"""
+    trap = _meta("普通商品", "是")
+    trap["Widgets"]["requirements"] = "遵守 FDA regulation 的一般标签要求"
+    res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
+                            _ctx(pt_meta=trap, pt_spec=_spec()))
+    codes = _codes(res)
+    assert "cat_requires_cert_hard" in codes          # fda 本身是真命中
+    h = [x for x in res.hits if x.rule_code == "cat_requires_cert_hard"][0]
+    assert "UL 认证" not in h.detail["matched_hard_kws"]   # 但 UL 不是
+    # 其余三个同款陷阱:整条 requirements 不该产生任何硬认证
+    for req in ("poison control 信息", "platform 使用说明", "idea 阶段无要求"):
+        m = _meta("普通商品", "是")
+        m["Widgets"]["requirements"] = req
+        r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
+                              _ctx(pt_meta=m, pt_spec=_spec()))
+        assert "cat_requires_cert_hard" not in _codes(r), req
+    # 真写了这些认证,照样拦
+    for req, label in (("需 UL 认证", "UL 认证"), ("ISO/DEA 管控物质", "DEA 管控"),
+                       ("需 ATF 许可", "ATF 管控")):
+        m = _meta("普通商品", "是")
+        m["Widgets"]["requirements"] = req
+        r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
+                              _ctx(pt_meta=m, pt_spec=_spec()))
+        hh = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
+        assert label in hh.detail["matched_hard_kws"], req
+
+
+def test_r3_chinese_keywords_still_substring():
+    """中文没有词边界,`\\b` 夹在两个汉字之间永不成立 —— 混排关键词维持子串。"""
+    m = _meta("普通商品", "是")
+    m["Widgets"]["requirements"] = "须完成 FDA 食品设施注册并指定美国代理人"
+    r = audit_l2.evaluate(_p(), _l1(pt="Widgets"), _ctx(pt_meta=m, pt_spec=_spec()))
+    h = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
+    assert "FDA 食品设施" in h.detail["matched_hard_kws"]
+
+
+def test_infer_policy_medical_no_longer_lands_on_cosmetics():
+    """2026-08-20 P1:第 9 步在**中文 label 拼接串**上找拉丁 'medical',
+    永不成立 —— 医疗器械类目一律错落成 Cosmetic Products。"""
+    assert audit_l2._infer_walmart_policy("", ["FDA 510(k)"], "Widgets") \
+        == "Medical Devices"
+    # 同一支里本来就靠中文命中的两条不受影响
+    assert audit_l2._infer_walmart_policy("", ["FDA 食品设施"], "W") == "Food Products"
+    assert audit_l2._infer_walmart_policy("", ["FDA 药品"], "W") \
+        == "Drugs & Paraphernalia"
+
+
 def test_r3d_spec_soft():
     res = audit_l2.evaluate(
         _p(), _l1(pt="Widgets"),
@@ -242,6 +266,22 @@ def test_r4_hit_and_boundary_and_own_brand():
                           _l1(), _ctx(ac=ac)))
 
 
+def test_r4_chinese_neighbours_are_boundaries():
+    """2026-08-20:`c.isalnum()` 对汉字返回 True,于是「耐克运动鞋」里的
+    黑名单词「耐克」左右都被判成词内字符 —— **中文品牌一个都拦不住**,
+    而且不报错。中日韩不写分词空格,紧邻即边界。"""
+    ac = _ac(["耐克", "小米"])
+    res = audit_l2.evaluate(_p(title="耐克运动鞋 男款"), _l1(pt="Widgets"),
+                            _ctx(pt_meta=_ok_meta(), ac=ac))
+    h = [x for x in res.hits if x.rule_code == "title_desc_blacklist"][0]
+    assert h.detail["matches"][0]["brand"] == "耐克"
+    # 拉丁词边界不受影响(带音标字母仍算词内字符,不切出假前缀)
+    ac2 = _ac(["caf"])
+    assert "title_desc_blacklist" not in _codes(
+        audit_l2.evaluate(_p(title="Café table"), _l1(pt="Widgets"),
+                          _ctx(pt_meta=_ok_meta(), ac=ac2)))
+
+
 def test_r4_none_automaton_skips():
     res = audit_l2.evaluate(_p(title="Fender strap"), _l1(), _ctx(ac=None))
     assert "title_desc_blacklist" not in _codes(res)
@@ -250,28 +290,40 @@ def test_r4_none_automaton_skips():
 # ── R7 促销宣称 ──────────────────────────────────────────────────────────────
 
 def test_r7_strong_and_softonly_and_allcaps():
-    res = audit_l2.evaluate(_p(title="The #1 Best Seller Steel Frame"),
-                            _l1(), _ctx())
+    res = _soft(title="The #1 Best Seller Steel Frame")
     h = [x for x in res.hits if x.rule_code == "content_promotional"][0]
     assert h.penalty == 0 and h.detail["walmart_policy"] == "Content Standards"
-    # B6-32 soft-only 不产 hit
-    assert "content_promotional" not in _codes(
-        audit_l2.evaluate(_p(title="high quality bolt"), _l1(), _ctx()))
+    assert h.detail["soft_only"] is False
     # B6-33 全大写连跑;B6-34 噪声 token 不凑数
-    assert "content_promotional" in _codes(
-        audit_l2.evaluate(_p(title="HEAVY DUTY STEEL FRAME"), _l1(), _ctx()))
-    assert "content_promotional" not in _codes(
-        audit_l2.evaluate(_p(title="USB LED HDMI"), _l1(), _ctx()))
+    assert "content_promotional" in _codes(_soft(title="HEAVY DUTY STEEL FRAME"))
+    assert "content_promotional" not in _codes(_soft(title="USB LED HDMI"))
+
+
+def test_r7_soft_only_now_keeps_the_evidence():
+    """2026-08-20 修:只命中空洞形容词时,此前整条 hit 丢掉 ——
+    detail 里写着"L3 LLM 需判断",而 L3 根本收不到。现在照样落账,
+    penalty 仍是 0(不影响任何判定),用 soft_only 标出份量。"""
+    res = _soft(title="high quality bolt")
+    h = [x for x in res.hits if x.rule_code == "content_promotional"][0]
+    assert h.penalty == 0 and h.detail["soft_only"] is True
+    assert h.detail["soft_phrases"] and not h.detail["strong_phrases"]
+    assert res.verdict == "pass"        # 证据留痕,不改结论
+
+
+def test_r7_noise_tokens_are_case_normalized():
+    """噪声表里的 "RoHS" 此前永远匹配不上(比较用 t.upper()),等于没写。"""
+    assert "ROHS" in audit_l2._ALLCAPS_NOISE_TOKENS
+    assert "content_promotional" not in _codes(_soft(title="ROHS USB LED"))
 
 
 # ── R8 敏感内容 ──────────────────────────────────────────────────────────────
 
 def test_r8_subtypes():
-    res = audit_l2.evaluate(_p(title="Juneteenth party banner"), _l1(), _ctx())
+    res = _soft(title="Juneteenth party banner")
     h = [x for x in res.hits if x.rule_code == "walmart_strict_sensitive"][0]
     assert "cultural_day" in h.detail["subtypes"]
     assert h.detail["walmart_policy"] == "Offensive Content"
-    res2 = audit_l2.evaluate(_p(title="Mickey Mouse sticker set"), _l1(), _ctx())
+    res2 = _soft(title="Mickey Mouse sticker set")
     h2 = [x for x in res2.hits if x.rule_code == "walmart_strict_sensitive"][0]
     assert "cartoon_ip_character" in h2.detail["subtypes"]
     assert h2.penalty == 0
@@ -281,31 +333,32 @@ def test_r8_subtypes():
 
 def test_evaluate_soft_only_passes_with_hits():
     """B6-40:全 0 分软证据 → score 100 pass,但 hits 落账。"""
-    res = audit_l2.evaluate(_p(title="Juneteenth HEAVY DUTY STEEL FRAME #1 best"),
-                            _l1(), _ctx())
+    res = _soft(title="Juneteenth HEAVY DUTY STEEL FRAME #1 best")
     assert res.score_final == 100 and res.verdict == "pass"
     assert len(res.hits) >= 2
 
 
 def test_evaluate_stacking_and_floor():
-    """B6-41:硬规则叠加 -100 不去重;R0+R1 = -100×2。"""
+    """B6-41:硬规则叠加 -100 不去重;R0/R2 删除后只剩 R1+R3 两条会扣分。"""
     res = audit_l2.evaluate(
         _p(), _l1(pt="Widgets", cat="Electronics"),
         _ctx(pt_meta={"Widgets": {"walmart_category": "Electronics",
                                   "walmart_ptg": None, "access_state": "禁售",
-                                  "zh_can_do": "否", "requirements": "",
-                                  "notes": ""}}))
-    assert res.score_final == -100      # 100 - 100(R0) - 100(R1)
+                                  "zh_can_do": "否",
+                                  "requirements": "需 UL 认证", "notes": ""}}))
+    assert res.score_final == -100      # 100 - 100(R1) - 100(R3a)
     assert res.verdict == "reject"
+    assert _codes(res) == ["cat_access_blocked", "cat_requires_cert_hard"]
 
 
 def test_evaluate_l1_hits_only_add_score():
     """B6-39:L1 hits 只加分不进 L2 hits 列表。"""
     l1 = _l1(pt=None)
-    l1.hits = [RuleHit(stage="L1", rule_code="excluded_category", penalty=-100)]
+    l1.hits = [RuleHit(stage="L1", rule_code="publication_pt_forbidden",
+                       penalty=-100)]
     res = audit_l2.evaluate(_p(), l1, _ctx())
     assert res.score_final == 0 and res.verdict == "reject"
-    assert "excluded_category" not in _codes(res)
+    assert "publication_pt_forbidden" not in _codes(res)
 
 
 # ── B7 理由映射 ──────────────────────────────────────────────────────────────
@@ -430,36 +483,22 @@ def _meta_for(pt):
                  "walmart_ptg": None}}
 
 
-def test_r2_pt_exact_machines_blocked_accessories_freed():
-    """pt_exact(2026-08-19 所有者「减少误伤」定稿):整机拦、配件放。
+def test_r0_and_r2_are_gone_whitelist_is_the_only_category_judge():
+    """2026-08-20 所有者定稿:类目能不能做只由 R1 白名单说了算。
 
-    词边界 "Camera" 会把相机包/贴膜一起拦——词在 PT 里 ≠ 产品是那个东西。
-    换成整机精确清单后:Digital Cameras 照拦(matched_by=pt_exact),
-    Camera Bags & Cases / Cell Phone Cases / Skins for Cell Phones /
-    Laptop Sleeves(所有者点名要卖的不带电配件)放行。
+    R0(代码里 8 个 walmart_category 硬禁)与 R2(yaml 18 条禁售大类)已删。
+    这条用例钉的是**没有第二份平行清单**:白名单说行的类目,不许再被
+    别处的黑名单拦下来;想加回黑名单,先在这里红。
     """
-    hit = audit_l2.evaluate(_p(), _l1(pt="Digital Cameras", cat=None),
-                            _ctx(pt_meta=_meta_for("Digital Cameras")))
-    mega = [x for x in hit.hits if x.rule_code == "forbidden_mega_cat"]
-    assert mega and mega[0].detail["matched_by"] == "pt_exact"
-    for pt in ("Camera Bags & Cases", "Cell Phone Cases",
-               "Skins for Cell Phones", "Laptop Sleeves"):
-        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
-                                _ctx(pt_meta=_meta_for(pt)))
-        assert "forbidden_mega_cat" not in _codes(res), pt
-
-
-def test_r2_word_in_pt_is_not_the_product():
-    """同一定稿的另外三族:鱼缸温度计不是医疗器械、酒杯不是酒、
-    绞肉机不是肉——全部放行;真物件(体温计/整瓶酒/鲜肉)照拦。"""
-    for pt in ("Aquarium Thermometers", "Oven Thermometers", "Wine Glasses",
-               "Wine Racks", "Corkscrews & Wine Bottle Openers",
-               "Meat Grinders", "Coffee Makers", "Coffee Tables"):
-        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
-                                _ctx(pt_meta=_meta_for(pt)))
-        assert "forbidden_mega_cat" not in _codes(res), pt
-    for pt in ("Medical Thermometers", "Wine", "Fresh & Frozen Meats",
-               "Ground Coffee", "Sweatpants", "Swimsuit Sets", "Dollhouses"):
-        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=None),
-                                _ctx(pt_meta=_meta_for(pt)))
-        assert "forbidden_mega_cat" in _codes(res), pt
+    assert not hasattr(audit_l2, "load_mega_categories")
+    assert not hasattr(audit_l2, "_rule_forbidden_mega_cat")
+    assert not hasattr(audit_l2, "_rule_zh_seller_mega_category_forbidden")
+    # 曾被 R0 按 walmart_category 硬禁、被 R2 按 PT 词表硬禁的类目,
+    # 只要白名单放行就一路 pass
+    for pt, cat in (("Digital Cameras", "Electronics"), ("Wine", "Food & Beverage"),
+                    ("Sweatpants", "Fashion"), ("Medical Thermometers",
+                                                "Health & Personal Care")):
+        res = audit_l2.evaluate(_p(), _l1(pt=pt, cat=cat),
+                                _ctx(pt_meta=_ok_meta(pt, cat)))
+        assert res.verdict == "pass", pt
+        assert _codes(res) == [], pt

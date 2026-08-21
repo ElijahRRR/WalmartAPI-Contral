@@ -22,7 +22,10 @@ def test_orderable_three_traps():
     assert "T" in o["startDate"] and "Z" in o["startDate"]
     o2 = m.build_orderable("B0X", "0123", 10, 1, "P1", pt="Cups",
                            product={"attrs": {"weight": {"package": "3.5 pounds"}}})
-    assert o2["specProductType"] == "Cups" and o2["ShippingWeight"] == 3.5
+    assert o2["ShippingWeight"] == 3.5
+    # specProductType 官方 20260608 已移除,不再写(写了也会被 strip_unknown
+    # 按新 spec 剔掉,"写了再剔"白费一道工序还误导读代码的人)
+    assert "specProductType" not in o2
 
 
 def test_orderable_merges_llm_fields_forced_win():

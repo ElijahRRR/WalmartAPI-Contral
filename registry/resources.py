@@ -108,9 +108,18 @@ FEED_SPEC_VERSIONS = {
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
-    # 上架主链(L2;旧系统实测值,官方 4-6 周滚版,上线前需实测仍被接受;
-    # header version 必须完整时间戳,写 '5.0' 被拒 74597363510508 实证)
-    "MP_ITEM": "5.0.20260304-22_45_32-api",
+    # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
+    #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
+    # 改一处两边一起变 —— 两边错开就是拿一个版本的数据去过另一个版本的校验。
+    # header version 必须完整时间戳,写 '5.0' 被拒(74597363510508 旧实证)。
+    #
+    # 2026-08-20 从 5.0.20260304-22_45_32-api 切到 20260608(旧版停了五个月;
+    # MP_MAINTENANCE 早已在 20260608)。切换前用 `spec_split -p diff=1` 量过差集:
+    #   PT 6951 → 6951(零增零减);Orderable 24 → 23(只移除 specProductType);
+    #   顶层必填有变化的 PT 仅 48 个;**新增必填只有 center_bore、影响 1 个 PT**
+    #   (轮毂中心孔径,汽车整顶级不做,实际影响为零);其余 5 个字段全是
+    #   "不再必填"(partTerminologyID 24 / condition 20 / …),只放松不收紧。
+    "MP_ITEM": "5.0.20260608-18_15_07-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
@@ -551,7 +560,21 @@ PT_TEMPLATE_SHEET = Spreadsheet(
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-18.1"
+AUDIT_RULES_VERSION = "c.2026-08-20.1"
+# c.2026-08-20.1  **判定面大改**(所有者定稿:先补白名单、再删黑名单,无真空期):
+#                 ① 删 L2 R0(代码里 8 个 walmart_category 硬禁)、L2 R2
+#                    (yaml 18 条禁售大类)、L1 excluded(yaml 13 条 3C/服饰/
+#                    汽配/带电)——三份清单和 R1 类目准入白名单讲同一件事。
+#                    类目能不能做**从此只有 R1 一处判据**。
+#                 ② R1 两条静默放行改判 pending(PT 未知 / PT 不在 walmart_pt_meta):
+#                    此前"查不到 = 没问题"直接 100 分放行,删掉黑名单后再没人兜底。
+#                 ③ 修三条"看着在跑其实没跑":R3 裸子串(`ul` 命中 `regulation`)、
+#                    R4 中文紧邻不算词边界(中文品牌一条都拦不住)、R7 只命中软词
+#                    时整条证据丢掉;另修 _infer_walmart_policy 的 medical 分支
+#                    与 L3 提示词两处(R7/R8 不进 prompt、cert 取了不存在的键)。
+#                 影响面:曾被 R0/R2/excluded 拦下、而白名单放行的产品会翻成 pass;
+#                 曾因 R3 裸子串误判"要 UL 认证"的会翻案。**全量重审**:
+#                   python cli.py product_audit -p force_rerun=c.2026-08-18.1
 # c.2026-08-18.1  理由映射:黑名单中心三码(lark_blacklist_asin/seller/
 #                 amazon_cat)→ 政策 None(内部决策,不挂 [政策:General-Use
 #                 Products] 兜底尾巴)。判定本身零变化(仍 reject),只影响

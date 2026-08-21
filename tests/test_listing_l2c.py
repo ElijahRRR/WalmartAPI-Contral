@@ -1,6 +1,7 @@
 """listing L2c 回归:PT spec 加载器、LLM JSON 提取与缓存键、MP_ITEM feed 收录。"""
 
 import json
+import re
 
 import pytest
 
@@ -130,7 +131,12 @@ def test_mp_item_payload_header_exactly_three_fields():
         {"Orderable": {"sku": "B0X"}, "Visible": {"Cups": {"productName": "n"}}}])
     assert set(p["MPItemFeedHeader"].keys()) == {"businessUnit", "locale",
                                                  "version"}
-    assert p["MPItemFeedHeader"]["version"] == "5.0.20260304-22_45_32-api"
+    # 版本串取自 registry 一处 —— 它同时决定 feed header 与 spec 目录,
+    # 用例跟着 registry 走,别写死:写死了换版时这条会"通过"而生产已经不一致
+    assert (p["MPItemFeedHeader"]["version"]
+            == resources.FEED_SPEC_VERSIONS["MP_ITEM"])
+    assert re.fullmatch(r"\d+\.\d+\.\d{8}-\d{2}_\d{2}_\d{2}-api",
+                        p["MPItemFeedHeader"]["version"]), "必须完整时间戳"
     assert p["MPItem"][0]["Orderable"]["sku"] == "B0X"
 
 

@@ -21,6 +21,10 @@ _VERDICT_TO_STATUS = {"pass": "approved", "reject": "rejected",
 
 _PENDING_REASON = "待类目判定(候选/rerank 均解不出,每日退避重试)"
 _PENDING_REASON_L3 = "LLM 全链路故障, 待人工复核"   # 旧仓字面量(l3_llm.py F1)
+# 第三种 pending(2026-08-20):PT 解出来了,但类目准入白名单里查不到这一行
+# ⇒ 判不了。与 L1 那种"根本没解出 PT"是两回事,重试口径也不同:
+# 这种要等 walmart_pt_meta 补行(pt_spec_sync),重刷一百遍也不会自己好。
+_PENDING_REASON_L2 = "PT 不在类目准入明细,判不了(待补 walmart_pt_meta)"
 
 _RUN_SQL = """
 INSERT INTO audit.audit_runs
@@ -172,9 +176,13 @@ def write_conclusion(conn, outcome: AuditOutcome,
     if outcome.verdict == "reject":
         reason = outcome.final_reason_category
     elif outcome.verdict == "pending":
-        # 两种 pending 来源分开留痕:L1=类目解不出,L3=LLM 故障(重试口径不同)
-        reason = (_PENDING_REASON_L3 if outcome.stage_stopped_at == "L3"
-                  else _PENDING_REASON)
+        # 三种 pending 来源分开留痕(重试口径不同):
+        #   L1 = 类目根本解不出(候选/rerank 无解)—— 隔天重试有意义
+        #   L2 = PT 解出来了但不在准入明细 —— 要等明细补行,重刷无用
+        #   L3 = LLM 故障 —— 重试有意义
+        reason = {"L3": _PENDING_REASON_L3,
+                  "L2": _PENDING_REASON_L2}.get(outcome.stage_stopped_at,
+                                                _PENDING_REASON)
     else:
         reason = None
     conn.execute(_PRODUCT_SQL, {

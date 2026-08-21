@@ -1,7 +1,7 @@
 """L2 规则引擎(R1/R3/R4/R5/R7/R8):两条硬拒 + 四条软证据,纯函数,自己不碰数据库。
 
 移植自旧仓 `pipelines/l2_rules.py`(并入 `nrtl_classifier.py` /
-`nice_class_mapper.py`)。外部数据(pt_meta / pt_spec / 黑名单自动机 / yaml 加载
+`nice_class_mapper.py`)。外部数据(pt_meta / 黑名单自动机 / yaml 加载
 结果 / USPTO 连接)一律由调用方经 `ctx` 注入(见 services/audit_rules.AuditContext);
 本模块不连库、不读环境变量,yaml 路径只经 registry.paths.audit_seed_file 取(铁律 3)。
 
@@ -36,7 +36,7 @@ score_final < 60 → reject;分数够但 R1 报了"判不了" → pending;否则
 
 不迁(旧仓死代码,移植规格 §6):R9 `trademark_symbol_in_title`(®/™ 判定已归 Phase0)、
 R6 `blacklist_compatible_for`(2026-04 删除,误伤率 90%)、`HARD_CERT_FIELDS` frozenset
-(真值在 sync 侧,已固化成 walmart_pt_spec.has_real_cert 列)、旧 37000 条 regex 版
+(2026-08-21 起 R3 只认飞书 requirements,不再读 walmart_pt_spec)、旧 37000 条 regex 版
 黑名单 `_compile_blacklist_patterns`。
 
 R4/R5/R7/R8 的 penalty 一律 **0**(旧注释写 -15 / -10 / -20 / -30)。
@@ -68,25 +68,6 @@ _AC_LOCK = threading.Lock()   # R4 自动机扫描锁(product_audit workers>1 �
 # =============================================================
 # yaml 加载(三个 refdata/audit 种子文件;结果由调用方塞进 ctx)
 # =============================================================
-
-
-@lru_cache(maxsize=1)
-def load_nrtl_keywords() -> tuple[list[str], list[str]]:
-    """输入:无 → 输出:(small_part_keywords, whole_unit_keywords),均已 strip+小写。
-
-    yaml 缺失 → warning + 返回 ([], []) ⇒ 所有 PT 归 whole_unit(即全部硬拒),
-    方向保守,照迁旧语义。
-    """
-    seed = paths.audit_seed_file("nrtl_small_parts.yaml")
-    if not seed.exists():
-        logger.warning("nrtl_small_parts yaml %s 不存在, 分类器返回全部 whole_unit", seed)
-        return [], []
-    with seed.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    sp = [str(x).strip().lower() for x in (data.get("small_part_keywords") or []) if str(x).strip()]
-    wu = [str(x).strip().lower() for x in (data.get("whole_unit_keywords") or []) if str(x).strip()]
-    logger.info("loaded %d small_part / %d whole_unit keywords", len(sp), len(wu))
-    return sp, wu
 
 
 @lru_cache(maxsize=1)
@@ -289,7 +270,7 @@ def _rule_category_gate(l1: L1Info, ctx: Any) -> list[RuleHit]:
 
 
 # =============================================================
-# R3: 类目需证书 (飞书 requirements + 沃尔玛官方 PT spec) — 硬/软分层
+# R3: 类目需证书 (**只看飞书 requirements** — 2026-08-21 收敛) — 硬/软分层
 # =============================================================
 
 
@@ -316,35 +297,6 @@ def _kw_hit(kw: str, hay_low: str) -> bool:
     """输入:关键词 + 已小写的待扫文本 → 输出:是否命中(ASCII 走词边界,其余走子串)。"""
     pat = _kw_re(kw)
     return bool(pat.search(hay_low)) if pat else (kw in hay_low)
-
-
-def _classify_nrtl_pt(pt_name: str, small_kws: list[str], whole_kws: list[str]) -> str:
-    """输入:PT 名 + 小件/整机词表 → 输出:'small_part' | 'whole_unit'。
-
-    全部**裸子串 + 小写**、无词边界。三个覆盖词 replacement/parts/accessor 写死在
-    代码里(不在 yaml)且**最优先**;其次整机优先;再次小件;都不中 → 保守 whole_unit。
-    (yaml 头注描述的"含 small AND 不含 whole"漏了覆盖词的位置,以代码为准。)
-    """
-    pt_low = (pt_name or "").strip().lower()
-    if not pt_low:
-        return "whole_unit"
-
-    # 覆盖性关键词: Replacement/Parts/Accessor → 强制 small_part
-    if any(kw in pt_low for kw in ("replacement", "parts", "accessor")):
-        return "small_part"
-
-    # 整机优先 (如果 PT 名里同时含整机词, 以整机为准)
-    for wkw in whole_kws:
-        if wkw in pt_low:
-            return "whole_unit"
-
-    # 小件命中
-    for skw in small_kws:
-        if skw in pt_low:
-            return "small_part"
-
-    # 未命中 — 保守: whole_unit
-    return "whole_unit"
 
 
 # =============================================================
@@ -499,15 +451,29 @@ def _infer_walmart_policy(walmart_category: str, hard_matches: list[str], walmar
 
 
 def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
-    """输入:L1 结果 + ctx(用 ctx.pt_meta / ctx.pt_spec / ctx.nrtl_*) → 输出:0 或 1 条 hit。
+    """输入:L1 结果 + ctx(只用 ctx.pt_meta)→ 输出:0 或 1 条 hit。
 
-    四个分支互斥、依次 return(硬优先):
-      A. meta.requirements 命中硬关键词        → cat_requires_cert_hard      -100
-      B. spec.has_real_cert:small_part        → cat_requires_cert_small_part   0
-                            whole_unit        → cat_requires_cert_hard      -100
-      C. meta.requirements 仅命中软关键词      → cat_requires_cert_soft         0
-      D. spec.has_soft_cert                   → cat_requires_cert_soft         0
-    pt_meta / pt_spec 查不到该 PT → 一律当"无要求"处理,不拒不标记(与 R1 同调)。
+    两个分支互斥、依次 return(硬优先):
+      A. meta.requirements 命中硬关键词   → cat_requires_cert_hard   -100
+      B. meta.requirements 仅命中软关键词 → cat_requires_cert_soft      0
+    pt_meta 查不到该 PT → 当"无要求"处理,不拒不标记(与 R1 同调)。
+
+    ★ **判据只有飞书类目表一个源**(所有者定稿 2026-08-21)。此前还有两条读
+    `audit.walmart_pt_spec` 的分支,连同 NRTL 整机/小件分类器一起下线,原话:
+    「代码只判定确定性的,这种很明显不确定,应该交给 LLM 看这个产品是不是整机
+    电器,而不是让代码从类目看是不是整机。所以,旧的死快照不要了,死代码也不要
+    了,以飞书源为准,以后我们只更新这个」。
+
+    两条理由,都是实证:
+    1. **那张表是死快照**。`audit.walmart_pt_spec` 是批次 A 从旧审核库整表搬来
+       的,`pt_spec_sync` 重建过但从没进过调度 —— 库里 `real_cert_fields` 存的
+       还是**原始 spec 字段名**(`has_nrtl_listing_certification`),而重建写的是
+       认证**名称**。旧口径把这个字段当硬认证,清洗判的却是「需评估」。
+    2. **整机 vs 小件代码判不了**。原分类器拿 PT 名里有没有 `parts`/`accessor`
+       裸子串猜,于是一张实木咖啡桌被判成「整机电器, 必须 NRTL 认证, 搬运做不了」
+       ——因为 `Coffee Tables` 的官方 spec 里带着 `has_nrtl_listing_certification`
+       (那是给带 USB 口的电动桌准备的字段)。同一个类目下整机与非电产品是混着的,
+       **只能看产品本身**。这件事已移交 L3 的判定维度 6(`audit_l3._S1`)。
 
     ⚠ 2026-08-20 修掉裸子串(所有者定 P0)。此前是 `kw in req_low`,无词边界:
     `"ul" in "fda regulation"` 为真 —— **任何**含 regulation 的 requirements 都被
@@ -518,10 +484,9 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
     仍走子串 —— 中文没有词边界概念,`\b` 在中文串里反而永不成立。
     软词抑制 `not _kw_re(kw).search(...)` 同步改成同一口径。
 
-    A 与 B 两个分支的 cat_requires_cert_hard **detail 结构不同**(A 有 meta_requirements /
-    matched_hard_kws / walmart_policy;B 有 hard_cert_fields / classified_as 且**没有
-    walmart_policy**),C 与 D 同 rule_code 不同 detail(靠 source 区分)。下游按
-    rule_code 取字段时必须两种都兼容。
+    ⚠ 下游取 detail 字段时**仍要兼容 `hard_cert_fields`**:那是已下线的 spec 分支
+    留在存量 `audit_hits` 里的键,历史行照样要能渲染出理由(audit_reason / audit_l3
+    都保留了对它的回退)。新写的行只会有 `meta_requirements`。
     """
     pt = (l1.walmart_product_type or "").strip()
     if not pt or pt in {"unknown", "(unknown)"}:
@@ -567,15 +532,7 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
                                             for hm in hard_matches):
             soft_matches.append(label)
 
-    # ---- 2. 取 walmart_pt_spec ----
-    spec = ctx.pt_spec.get(pt)
-
-    spec_has_hard = bool(spec and spec.get("has_real_cert"))
-    spec_has_soft = bool(spec and spec.get("has_soft_cert"))
-    spec_real = (spec and spec.get("real_cert_fields")) or []
-    spec_soft = (spec and spec.get("soft_cert_fields")) or []
-
-    # ---- 3. 综合判定 (硬优先) ----
+    # ---- 2. 判定(只有飞书那一个源)----
 
     # A. meta 硬性认证命中 → -100
     if hard_matches:
@@ -594,47 +551,13 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
                     "matched_hard_kws": hard_matches,
                     "matched_soft_kws": soft_matches,
                     "ts_notes": meta_notes or None,
-                    "spec_real_cert_fields": spec_real,
                     "source": "walmart_pt_meta.requirements",
                     "note": "飞书维护的合规要求 (含实验室证书/官方注册号), 搬运模式做不了",
                 },
             )
         ]
 
-    # B. walmart_pt_spec 硬 cert (NRTL 电气): 分整机/小件
-    if spec_has_hard:
-        part_type = _classify_nrtl_pt(pt, ctx.nrtl_small, ctx.nrtl_whole)
-        if part_type == "small_part":
-            return [
-                RuleHit(
-                    stage="L2",
-                    rule_code="cat_requires_cert_small_part",
-                    penalty=0,   # v3: 软证据不扣分, 交 L3 看 PT 上下文判
-                    detail={
-                        "walmart_pt": pt,
-                        "hard_cert_fields": spec_real,
-                        "classified_as": "small_part",
-                        "source": "walmart_pt_spec + nrtl_classifier",
-                        "note": "电气小件/配件, 部分可填 No 上架, 需下游人工审核",
-                    },
-                )
-            ]
-        return [
-            RuleHit(
-                stage="L2",
-                rule_code="cat_requires_cert_hard",
-                penalty=-100,
-                detail={
-                    "walmart_pt": pt,
-                    "hard_cert_fields": spec_real,
-                    "classified_as": part_type,
-                    "source": "walmart_pt_spec.has_real_cert + nrtl_classifier",
-                    "note": "整机电器, 必须 NRTL 认证, 搬运做不了",
-                },
-            )
-        ]
-
-    # C. meta 仅软合规命中 → 0 (软证据不扣分, 交 L3 综合判)
+    # B. meta 仅软合规命中 → 0 (软证据不扣分, 交 L3 综合判)
     if soft_matches:
         return [
             RuleHit(
@@ -647,22 +570,6 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
                     "matched_soft_kws": soft_matches,
                     "source": "walmart_pt_meta.requirements (软合规)",
                     "note": "软合规 (SDS/ASTM/ISO/RoHS/Prop65/警告标签/测试报告), 可提供资料或填披露",
-                },
-            )
-        ]
-
-    # D. walmart_pt_spec 软合规 (smallParts/state_chemical/ingredients) → 0
-    if spec_has_soft:
-        return [
-            RuleHit(
-                stage="L2",
-                rule_code="cat_requires_cert_soft",
-                penalty=0,
-                detail={
-                    "walmart_pt": pt,
-                    "soft_cert_fields": spec_soft,
-                    "source": "walmart_pt_spec.has_soft_cert",
-                    "note": "软合规 (Prop65/小件警告/成分披露等), 需填写披露信息",
                 },
             )
         ]
@@ -1307,5 +1214,4 @@ __all__ = [
     "PENDING_RULE_CODES",
     "evaluate",
     "load_nice_mapping",
-    "load_nrtl_keywords",
 ]

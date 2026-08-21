@@ -634,7 +634,30 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-20.1"
+AUDIT_RULES_VERSION = "c.2026-08-21.1"
+# c.2026-08-21.1  **R3 收敛成单一判据**(所有者定稿):判类目要不要认证,从此
+#                 **只看飞书类目表的「必需认证」列**。同日下线两条链:
+#                 ① L2 R3 读 `audit.walmart_pt_spec` 的两条分支(硬 has_real_cert /
+#                    软 has_soft_cert)—— 那张表是批次 A 从旧审核库整表搬来的
+#                    **死快照**,`pt_spec_sync` 重建过但从没进调度;库里
+#                    `real_cert_fields` 存的还是原始 spec 字段名,而重建写的是
+#                    认证名称,两者口径相反(旧判硬、清洗判「需评估」);
+#                 ② NRTL 整机/小件分类器(`_classify_nrtl_pt` + nrtl_small_parts.yaml)
+#                    —— 拿 PT 名里有没有 `parts`/`accessor` 裸子串猜物理事实。
+#                    生产实见:一张实木咖啡桌被判「整机电器, 必须 NRTL 认证,
+#                    搬运做不了」,因为 `Coffee Tables` 的 spec 带着
+#                    `has_nrtl_listing_certification`(给带 USB 口的电动桌用的字段)。
+#                 所有者原话:「代码只判定确定性的,这种很明显不确定,应该交给
+#                 LLM 看这个产品是不是整机电器,而不是让代码从类目看是不是整机。
+#                 所以,旧的死快照不要了,死代码也不要了,以飞书源为准,以后我们
+#                 只更新这个」。
+#                 **先补后删,无真空期**:「整机电器」这一判定同批移入 L3 提示词
+#                 判定维度 6(`audit_l3._S1`,默认放行、拿不准 pass),不是删了拉倒。
+#                 删掉的 rule_code:`cat_requires_cert_small_part`(存量 hits 里
+#                 仍有,理由渲染保留兼容)。
+#                 影响面:曾被 spec 那条链判死的产品会翻案。**定点重审**:
+#                   python cli.py product_audit -p rerule=cat_requires_cert_hard
+#                   python cli.py product_audit -p rerule=cat_requires_cert_small_part
 # c.2026-08-20.1  **判定面大改**(所有者定稿:先补白名单、再删黑名单,无真空期):
 #                 ① 删 L2 R0(代码里 8 个 walmart_category 硬禁)、L2 R2
 #                    (yaml 18 条禁售大类)、L1 excluded(yaml 13 条 3C/服饰/

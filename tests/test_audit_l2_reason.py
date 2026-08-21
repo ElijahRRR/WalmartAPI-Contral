@@ -1,7 +1,9 @@
 """L2 硬规则/软证据 + 理由映射向量(spec_vectors B6/B7;旧仓零测试)。
 
-ctx 用 SimpleNamespace 鸭子拼装;nrtl/nice 走真实 refdata yaml
-(loader 即被测面之一);R5 恒关(ctx.uspto=None)。
+ctx 用 SimpleNamespace 鸭子拼装;nice 走真实 refdata yaml(loader 即被测面之一);
+R5 恒关(ctx.uspto=None)。
+⚠ 2026-08-21 起 R3 只看飞书 requirements —— `pt_spec` / `nrtl_*` 三个 ctx 字段
+连同 NRTL 整机/小件分类器一起下线,所以 `_ctx` 不再接 `pt_spec`。
 """
 
 from types import SimpleNamespace
@@ -12,13 +14,10 @@ from services import audit_l2, audit_reason
 from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
 
 
-def _ctx(pt_meta=None, pt_spec=None, ac=None):
+def _ctx(pt_meta=None, ac=None):
     mapping, default = audit_l2.load_nice_mapping()
-    small, whole = audit_l2.load_nrtl_keywords()
     return SimpleNamespace(
-        pt_meta=pt_meta or {}, pt_spec=pt_spec or {},
-        ac_automaton=ac,
-        nrtl_small=small, nrtl_whole=whole,
+        pt_meta=pt_meta or {}, ac_automaton=ac,
         nice_mapping=mapping, nice_default=default, uspto=None)
 
 
@@ -56,10 +55,10 @@ def _codes(res):
 
 # ── R1 双白名单闸 ────────────────────────────────────────────────────────────
 
-def _meta(access, zh, cat="Home"):
+def _meta(access, zh, cat="Home", req=""):
     return {"Widgets": {"walmart_category": cat, "walmart_ptg": None,
                         "access_state": access, "zh_can_do": zh,
-                        "requirements": "", "notes": ""}}
+                        "requirements": req, "notes": ""}}
 
 
 def test_r1_access_blocked():
@@ -126,20 +125,14 @@ def test_r1_pending_never_downgrades_a_real_reject():
 
 # ── R3 认证四分支 ────────────────────────────────────────────────────────────
 
-def _spec(hard=False, real=None, soft=False, softf=None):
-    return {"Widgets": {"has_real_cert": hard, "real_cert_fields": real or [],
-                        "has_soft_cert": soft, "soft_cert_fields": softf or []}}
-
-
 def test_r3a_hard_keyword():
     res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=_meta("普通商品", "是"),
-                                 pt_spec=_spec()))
+                            _ctx(pt_meta=_meta("普通商品", "是")))
     assert "cat_requires_cert_hard" not in _codes(res)
     meta = _meta("普通商品", "是")
     meta["Widgets"]["requirements"] = "需 UL 认证与测试报告"
     res2 = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                             _ctx(pt_meta=meta, pt_spec=_spec()))
+                             _ctx(pt_meta=meta))
     h = [x for x in res2.hits if x.rule_code == "cat_requires_cert_hard"][0]
     assert h.penalty == -100
     assert "UL 认证" in h.detail["matched_hard_kws"]
@@ -150,33 +143,48 @@ def test_r3c_soft_only_zero_penalty():
     meta = _meta("普通商品", "是")
     meta["Widgets"]["requirements"] = "ISO 9001 质量体系"
     res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=meta, pt_spec=_spec()))
+                            _ctx(pt_meta=meta))
     h = [x for x in res.hits if x.rule_code == "cat_requires_cert_soft"][0]
     assert h.penalty == 0 and res.verdict == "pass"
 
 
-def test_r3b_small_part_vs_whole_unit():
-    """B6-20/21:has_real_cert + nrtl 分流(真实 yaml:Switch=小件)。"""
-    small = audit_l2.evaluate(
-        _p(), _l1(pt="Toggle Switches"),
-        _ctx(pt_meta={"Toggle Switches": {"walmart_category": None,
+def test_r3_no_longer_reads_the_spec_snapshot_at_all():
+    """⚠ 2026-08-21 收敛:R3 **只看飞书 requirements**,spec 那条链整条下线。
+
+    所有者原话:「代码只判定确定性的,这种很明显不确定,应该交给 LLM 看这个产品
+    是不是整机电器,而不是让代码从类目看是不是整机。所以,旧的死快照不要了,
+    死代码也不要了,以飞书源为准,以后我们只更新这个」。
+
+    生产实见的那条:一张**实木咖啡桌**被判「整机电器, 必须 NRTL 认证, 搬运做不了」
+    —— 因为 `Coffee Tables` 的官方 spec 里带着 `has_nrtl_listing_certification`
+    (那是给带 USB 口的电动桌准备的字段),而分类器拿 PT 名里有没有
+    `parts`/`accessor` 裸子串猜整机/小件,咖啡桌两个词都不含 ⇒ 保守判整机。
+
+    现在:飞书「必需认证」为空 ⇒ **一条 cert hit 都不出**,交给 L3 看产品本身。
+    """
+    res = audit_l2.evaluate(
+        _p(title="FABATO 31.5'' Lift Top Coffee Table Wood Center Table"),
+        _l1(pt="Coffee Tables"),
+        _ctx(pt_meta={"Coffee Tables": {"walmart_category": "Furniture",
                       "access_state": "普通商品", "zh_can_do": "是",
-                      "requirements": "", "notes": "", "walmart_ptg": None}},
-             pt_spec={"Toggle Switches": {"has_real_cert": True,
-                      "real_cert_fields": ["nrtl_information"],
-                      "has_soft_cert": False, "soft_cert_fields": []}}))
-    codes = _codes(small)
-    assert "cat_requires_cert_small_part" in codes
-    whole = audit_l2.evaluate(
-        _p(), _l1(pt="Space Heaters"),
-        _ctx(pt_meta={"Space Heaters": {"walmart_category": None,
-                      "access_state": "普通商品", "zh_can_do": "是",
-                      "requirements": "", "notes": "", "walmart_ptg": None}},
-             pt_spec={"Space Heaters": {"has_real_cert": True,
-                      "real_cert_fields": ["nrtl_information"],
-                      "has_soft_cert": False, "soft_cert_fields": []}}))
-    h = [x for x in whole.hits if x.rule_code == "cat_requires_cert_hard"][0]
-    assert h.detail["source"] == "walmart_pt_spec.has_real_cert + nrtl_classifier"
+                      "requirements": "", "notes": "", "walmart_ptg": None}}))
+    assert not [c for c in _codes(res) if c.startswith("cat_requires_cert")]
+    assert res.score_final == 100 and res.verdict == "pass"
+    # 分类器与词表加载器都不该还在
+    assert not hasattr(audit_l2, "_classify_nrtl_pt")
+    assert not hasattr(audit_l2, "load_nrtl_keywords")
+
+
+def test_the_whole_appliance_call_moved_to_the_l3_prompt():
+    """删之前必须先补 —— 「整机电器」这一维现在住在 L3 提示词里(不留真空期)。
+
+    这是所有者自己定过的纪律(2026-08-20 删 R0/R2 时):「关键是先补白名单、
+    再删黑名单,中间不能有真空期」。
+    """
+    from services import audit_l3
+    assert "整机电器" in audit_l3._S1 and "NRTL" in audit_l3._S1
+    assert "只能看产品本身" in audit_l3._S1
+    assert "拿不准一律 pass" in audit_l3._S1      # 默认放行,不许再连坐整类
 
 
 def test_r3_hard_keywords_need_word_boundaries():
@@ -186,7 +194,7 @@ def test_r3_hard_keywords_need_word_boundaries():
     trap = _meta("普通商品", "是")
     trap["Widgets"]["requirements"] = "遵守 FDA regulation 的一般标签要求"
     res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=trap, pt_spec=_spec()))
+                            _ctx(pt_meta=trap))
     codes = _codes(res)
     assert "cat_requires_cert_hard" in codes          # fda 本身是真命中
     h = [x for x in res.hits if x.rule_code == "cat_requires_cert_hard"][0]
@@ -196,7 +204,7 @@ def test_r3_hard_keywords_need_word_boundaries():
         m = _meta("普通商品", "是")
         m["Widgets"]["requirements"] = req
         r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                              _ctx(pt_meta=m, pt_spec=_spec()))
+                              _ctx(pt_meta=m))
         assert "cat_requires_cert_hard" not in _codes(r), req
     # 真写了这些认证,照样拦
     for req, label in (("需 UL 认证", "UL 认证"), ("ISO/DEA 管控物质", "DEA 管控"),
@@ -204,7 +212,7 @@ def test_r3_hard_keywords_need_word_boundaries():
         m = _meta("普通商品", "是")
         m["Widgets"]["requirements"] = req
         r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                              _ctx(pt_meta=m, pt_spec=_spec()))
+                              _ctx(pt_meta=m))
         hh = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
         assert label in hh.detail["matched_hard_kws"], req
 
@@ -213,7 +221,7 @@ def test_r3_chinese_keywords_still_substring():
     """中文没有词边界,`\\b` 夹在两个汉字之间永不成立 —— 混排关键词维持子串。"""
     m = _meta("普通商品", "是")
     m["Widgets"]["requirements"] = "须完成 FDA 食品设施注册并指定美国代理人"
-    r = audit_l2.evaluate(_p(), _l1(pt="Widgets"), _ctx(pt_meta=m, pt_spec=_spec()))
+    r = audit_l2.evaluate(_p(), _l1(pt="Widgets"), _ctx(pt_meta=m))
     h = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
     assert "FDA 食品设施" in h.detail["matched_hard_kws"]
 
@@ -229,13 +237,14 @@ def test_infer_policy_medical_no_longer_lands_on_cosmetics():
         == "Drugs & Paraphernalia"
 
 
-def test_r3d_spec_soft():
+def test_soft_evidence_also_comes_only_from_feishu_now():
+    """软合规同理:spec 那条软分支一并下线,软证据只从飞书「必需认证」出。"""
     res = audit_l2.evaluate(
         _p(), _l1(pt="Widgets"),
-        _ctx(pt_meta=_meta("普通商品", "是"),
-             pt_spec=_spec(soft=True, softf=["smallPartsWarnings"])))
+        _ctx(pt_meta=_meta("普通商品", "是", req="ASTM 测试报告")))
     h = [x for x in res.hits if x.rule_code == "cat_requires_cert_soft"][0]
-    assert h.detail["source"] == "walmart_pt_spec.has_soft_cert"
+    assert h.detail["source"] == "walmart_pt_meta.requirements (软合规)"
+    assert h.penalty == 0
 
 
 # ── R4 品牌黑名单扫描(小自动机)──────────────────────────────────────────────

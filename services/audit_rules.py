@@ -37,10 +37,7 @@ class AuditContext:
     phase0_cats: frozenset          # 兼容保留(路径等值那份)
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
-    pt_spec: dict                  # PT → row dict
     ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
-    nrtl_small: list
-    nrtl_whole: list
     nice_mapping: dict
     nice_default: list
     uspto: object = None           # psycopg 连接或 None(R5 开关)
@@ -138,7 +135,6 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     """
     brand, r4_keys = _brand_map(conn)
     nice_mapping, nice_default = audit_l2.load_nice_mapping()
-    nrtl_small, nrtl_whole = audit_l2.load_nrtl_keywords()
     pt_meta = _rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
                                "walmart_ptg, access_state, zh_can_do, requirements, "
                                "notes FROM audit.walmart_pt_meta",
@@ -218,12 +214,11 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         cat_rules=cat_rules,
         brand_blacklist=brand,
         pt_meta=pt_meta,
-        pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "
-                                 "real_cert_fields, has_soft_cert, soft_cert_fields "
-                                 "FROM audit.walmart_pt_spec",
-                           "walmart_product_type"),
+        # ⚠ 2026-08-21 起**不再取 audit.walmart_pt_spec**:R3 收敛成"只看飞书
+        # requirements"(所有者定稿),那张表是批次 A 搬来的死快照,而"整机 vs
+        # 小件"这类推断已移交 L3 判定维度 6。表本身不删(pt_spec_sync 仍写它、
+        # audit_why / pt_census 仍查它做诊断),只是审核链不再拿它当判据。
         ac_automaton=_build_automaton(r4_keys),
-        nrtl_small=nrtl_small, nrtl_whole=nrtl_whole,
         nice_mapping=nice_mapping, nice_default=nice_default,
         uspto=uspto,
         walmart_confirmed=confirmed,

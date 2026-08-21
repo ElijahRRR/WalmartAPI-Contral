@@ -21,8 +21,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 phase0_cats=frozenset(), brand_blacklist={},
-                pt_meta={}, pt_spec={}, ac_automaton=None,
-                nrtl_small=[], nrtl_whole=[], nice_mapping={},
+                pt_meta={}, ac_automaton=None, nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
     return audit_rules.AuditContext(**base)
@@ -686,10 +685,14 @@ def test_pt_backfill_fold_rows():
 
 
 def test_rerank_exit_pt_meta_gate(monkeypatch):
-    """评审 P0:rerank 出口过 pt_meta 闸——spec-only PT 直出会让 L2 四闸失明
-    产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。"""
+    """评审 P0:rerank 出口过 pt_meta 闸 —— pt_meta 里没有的 PT 直出会让 L2 四闸
+    失明产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。
+
+    ⚠ 这条原来叫「spec-only PT」:ctx 曾同时装 pt_meta 与 pt_spec 两本字典,
+    只在 spec 里的 PT 能绕过 meta 闸。2026-08-21 R3 收敛后 ctx 只剩 pt_meta,
+    但这道防御照旧要有 —— LLM 可以凭空回一个 meta 表里没有的 PT 名。"""
     from services import audit_l1_llm
-    ctx = _ctx(pt_meta=META, pt_spec={"SpecOnlyPT": {}})
+    ctx = _ctx(pt_meta=META)
     p = ProductInfo(asin="B0Z", title="widget", amazon_category_path="X > Y")
     seen = {}
     monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [

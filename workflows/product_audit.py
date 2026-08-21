@@ -12,6 +12,10 @@
                                                     # 未审):判定标准改了就整批用新标准重认一次
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
+  python cli.py product_audit -p repts=1                   # 改了**飞书类目表**之后重审:
+                                                    # 判据(准入状态/中国卖家可做/必需认证)
+                                                    # 在我判过之后变过的那批 rejected;
+                                                    # 变更由 risk_sync 落台账,不看版本号
   python cli.py product_audit -p stages=L0                 # 只跑 Phase0:纯查库零 LLM;
                                                     # 未命中的不落结论不盖版本(不"复活")
   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
@@ -200,7 +204,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
-                 "gap_wait", "force"}
+                 "gap_wait", "force", "repts"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
@@ -254,6 +258,26 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
+    if str(params.get("repts", "")).strip() == "1":
+        # 按**判据变更**取候选(2026-08-21 加)。触发场景:所有者改了飞书类目表,
+        # `risk_sync` 全量重灌 `walmart_pt_meta` 时把真变了的 PT 落进
+        # `audit.pt_meta_change_log`,这里按"这个 PT 的判据在我判过之后变过"取。
+        #
+        # ⚠ **不看 `audit_version`**,这是它和 `rerule` / `mode=nonpass` 的根本
+        # 区别,也是它存在的全部理由:那两条的版本谓词是天然分页,而**飞书数据
+        # 变了不会递增仓库侧的规则版本号** —— 全量扫过一遍之后库里每条都盖着
+        # 当前版本,两条通道双双归零(所有者 2026-08-21 实遇「共 0 个」)。
+        #
+        # ⚠ 用 `changed_at > p.audited_at` 而不是"最近一批变更":
+        #  · 真跑判过的 `audited_at` 会推到变更之后,**自动退出候选**——天然分页
+        #    照样有,只是锚在时间上不是版本上,而时间是数据变更自己带的;
+        #  · 同一个 PT 被改过好几轮也只重判一次,不会每轮都从头扫;
+        #  · `audited_at IS NULL` 的(压根没审过)不在这条通道里 —— 那是
+        #    `mode=backfill` 的活,混进来会把"补刷"和"翻案"两件事的数搅在一起。
+        return ("p.audit_status = 'rejected' AND p.audited_at IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM audit.pt_meta_change_log c"
+                "             WHERE c.walmart_product_type = p.walmart_pt"
+                "               AND c.changed_at > p.audited_at)", {})
     rule = str(params.get("rerule", "")).strip()
     if rule:
         # 按**规则码**定点重审(2026-08-17 加):改了一条规则之后,要动的只有
@@ -452,6 +476,7 @@ def _is_forced(params: dict, extra: dict) -> bool:
     if str(params.get("mode", "")).strip() in ("pending", "nonpass"):
         return True
     return (_forced_sheet(params)
+            or str(params.get("repts", "")).strip() == "1"
             or (bool(extra.get("asins")) and not params.get("from_sheet")))
 
 

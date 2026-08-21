@@ -189,6 +189,46 @@ def _sync_amzcat_blacklist(conn, sheet, table: str, rows: list[dict],
             f"读入 {n['读入']} 行,跳过 {n['跳过']}{tail}")
 
 
+_SQL_AFFECTED = """
+SELECT count(*) FROM catalog.products
+WHERE marketplace = 'US'
+  AND audit_status = 'rejected'
+  AND walmart_pt = ANY(%s)
+"""
+
+
+def _pt_meta_change_note(conn, changes: list) -> list[str]:
+    """输入:连接 + 本次变更行 → 输出:摘要里那两三行(**判据变了多少 / 影响多少条存量**)。
+
+    ⚠ 这两个数是所有者决定"要不要跑重判"的唯一依据,不能只报"重灌了 6942 行"
+    ——那句话每次都一样,改没改看不出来。2026-08-21 的教训就是这个:他手改完
+    类目表,系统一声不吭,直到 `-p rerule=` 报「共 0 个」才发现没有通道可走。
+
+    影响面按 **rejected** 算而不是全部:pass 的产品判据放宽了结论不会变,
+    判据收紧才需要重判 —— 但那属于"新增禁售"的场景,eval 成本比误伤大得多,
+    这里先只报误伤那一侧,并在文案里说清口径。
+    """
+    if not changes:
+        return ["  → 判据三列(准入状态/中国卖家可做/必需认证)**一个 PT 都没变**"
+                ",存量结论不受影响"]
+    kinds: collections.Counter = collections.Counter(c[1] for c in changes)
+    pts = sorted({c[0] for c in changes})
+    out = [f"  → ⚡ **判据变了 {len(pts)} 个 PT**("
+           + " / ".join(f"{k} {v}" for k, v in kinds.most_common())
+           + ");已落 audit.pt_meta_change_log"]
+    with conn.cursor() as cur:
+        cur.execute(_SQL_AFFECTED, (pts,))
+        n = int(cur.fetchone()[0])
+    if n:
+        out.append(
+            f"     影响库里 **{n:,} 条现结论为 rejected** 的产品(pass 的不算:"
+            f"判据放宽不改变已放行的结论)。重判走:"
+            f"`python cli.py product_audit -p repts=1 --dry-run` 先看数")
+    else:
+        out.append("     库里没有 rejected 的产品落在这些 PT 上,不用重判")
+    return out
+
+
 def run(params: dict) -> str:
     """输入:params(allow_shrink / dry_run)→ 输出:四表同步计数与闸门摘要。
 
@@ -214,11 +254,12 @@ def run(params: dict) -> str:
             # audit.walmart_pt_meta。它此前是批次 A 的死快照没人同步,
             # 于是飞书增删对审核毫无影响(所有者 2026-08-17 实遇:
             # 「飞书表格里面的已废弃我已经删掉了,但是重新拉以后还是存在」)
-            n_meta, dropped = risk_gate.sync_pt_meta(conn, pt_rows)
+            n_meta, dropped, changes = risk_gate.sync_pt_meta(conn, pt_rows)
             lines.append(
                 f"  → 审核准入字典 walmart_pt_meta:全量重灌 {n_meta} 行"
                 + (f",**净减 {dropped} 行**(飞书删掉的已废弃 PT 同步生效)"
                    if dropped else ""))
+            lines += _pt_meta_change_note(conn, changes)
         except _Skip:
             pass
         except LookupError as e:

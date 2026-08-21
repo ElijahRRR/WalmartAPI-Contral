@@ -146,7 +146,8 @@ _RULE_SOURCE = {
     "cat_requires_cert_hard":       "audit.walmart_pt_meta.requirements 或 "
                                     "audit.walmart_pt_spec.has_real_cert",
     "cat_requires_cert_soft":       "audit.walmart_pt_meta.requirements(软词)",
-    "cat_requires_cert_small_part": "audit.walmart_pt_spec + NRTL 词表",
+    # 2026-08-21 下线的码,只可能出现在**存量** audit_hits 里,留着让历史行说得出来路
+    "cat_requires_cert_small_part": "audit.walmart_pt_spec + NRTL 词表(已下线)",
     # 判不了(不是判过了):这两条 penalty=0 但整条结论转 pending 待人工
     "cat_gate_pt_unknown":          "L2 R1:PT 没定下来,白名单查不了",
     "cat_gate_pt_not_in_meta":      "L2 R1:PT 不在 audit.walmart_pt_meta",

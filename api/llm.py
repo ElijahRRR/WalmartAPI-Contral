@@ -19,9 +19,29 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-# 旧生产用 deepseek-v4-flash(thinking disabled);模型名可经 .env 切换,
-# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)
-_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# 模型名可经 .env 切换,换模型即换 llm_cache 键空间(缓存键含 model,
+# 自动失效无需清理)。
+# ⚠ 缺省值 `deepseek-chat` 是**官方已宣布停用的旧别名**(见
+#   registry.LLM_LEGACY_ALIASES),留着只为不中断既有环境;生产必须在
+#   .env 显式写 `DEEPSEEK_MODEL=deepseek-v4-flash`。吃缺省值有两个后果:
+#   ① 别名一旦切断,全仓 LLM 调用同时失败;
+#   ② 下面 `if "flash" in model` 那道「thinking 必须显式 disabled」的旧铁律
+#      **整条失效**(deepseek-chat 恰好本身就是非思考模式,所以至今没出事,
+#      但那道保险是空的 —— 换个别名就会开着 thinking 烧钱)。
+#   摘要里会点名警告,别当噪声划过去。
+_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _default_model() -> str:
+    """输入:无 → 输出:缺省模型名(**call-time 求值**)。
+
+    不能在模块级 `os.environ.get(...)` 取:那是 import 时的快照,而 cli.py
+    的约定是「.env 先于一切业务 import 加载,registry 各函数 call-time 求值
+    即可拿到」。快照写法只在"import 恰好晚于 load_dotenv"时碰巧正确,
+    换个入口(测试、未来的网页/MCP 入口、任何提前 import 本模块的路径)
+    就会静默吃缺省值 —— 而且看不出来,只有账单和摘要里的模型名会变。
+    """
+    return os.environ.get("DEEPSEEK_MODEL", "").strip() or _DEFAULT_MODEL
 
 
 def model_for(purpose: str) -> str:
@@ -37,7 +57,7 @@ def model_for(purpose: str) -> str:
     if env is None:
         raise ValueError(f"未登记的 LLM 用途 {purpose!r}:先在 "
                          f"registry.LLM_PURPOSE_ENV 登记再使用")
-    return os.environ.get(env, "").strip() or _MODEL
+    return os.environ.get(env, "").strip() or _default_model()
 
 
 def _api_key() -> str:
@@ -159,7 +179,7 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
                               timeout=httpx.Timeout(180, connect=10))
             if resp.status_code == 200:
                 payload = resp.json()
-                record_usage(body.get("model", _MODEL), purpose,
+                record_usage(body.get("model", ""), purpose,
                              payload.get("usage"))
                 content = payload["choices"][0]["message"]["content"]
                 return _extract_json(content)

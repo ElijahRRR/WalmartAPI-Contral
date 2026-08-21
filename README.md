@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1717 个单元测试**。
+- **1719 个单元测试**。
 
 ---
 
@@ -220,6 +220,11 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 09:00–12:00 与 14:00–18:00),其余半价。大批量重审排在北京时间
 **晚 18:00 至次日早 08:00** 跑,直接省一半。
 不认识的模型**只报 token 不报钱**并点名 —— 按 0 计价 = 假账。
+⚠ **生产必须在 `.env` 写 `DEEPSEEK_MODEL=deepseek-v4-flash`**。缺省值
+`deepseek-chat` 是官方已宣布停用的旧别名(公告的停用日 2026-07-24 已过,
+现在还能用是宽限);别名一旦切断,**全仓 LLM 调用同时失败**,而且
+`thinking 必须显式 disabled` 那道旧铁律在别名下**整条失效**。
+用了别名时摘要会点名警告。
 | **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`) |
 | **USPTO 商标库** | 审核 R5 商标反查 | 跨库只读,默认关 |
 
@@ -563,7 +568,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 ### 测试
 
 ```bash
-python -m pytest -q          # 1717 passed
+python -m pytest -q          # 1719 passed
 ```
 
 测试钉的不是覆盖率,是**"错了也不报错"的那些接缝**:参数掉了那一段白跑、

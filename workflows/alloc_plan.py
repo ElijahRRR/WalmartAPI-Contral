@@ -35,7 +35,7 @@ import logging
 import math
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_engine as ae
 from services import alloc_groups, alloc_survey as sv
 from services import claims, product_pool, product_score as ps
@@ -242,43 +242,11 @@ def run(params: dict) -> str:
         pending = _pending_delist(conn, cfg, registered)
         listed = _listed_asins(conn, registered)
 
-    # ── 候选漏斗 ──────────────────────────────────────────────────────
-    scored, gated = product_pool.score_all(data)
-    # ⚠ 漏斗前四行的单位是**产品**,后两行是**组**。混在一列里报会骗人:
-    # "60 个产品 → 20 组"会显示成 33.3%,读起来像丢了三分之二的货,
-    # 其实一件没丢(每组 3 件)。所以组那两行同时给组数与货位数
-    funnel = [("候选池", len(data["pool"])), ("过硬闸", len(scored))]
-    live = [c for c in scored if c["score"] >= ps.CUTOFF]
-    funnel.append((f"≥ 淘汰线 {ps.CUTOFF:.0f}", len(live)))
-    # ★ 排除的是**已在架**的,不是已占位的。占位了没上架的照常进池,
-    #   只是只能回它的占用店(见 alloc_groups.build 的 bound_asins)
-    live = [c for c in live if c["asin"] not in listed]
-    funnel.append(("去掉已在架 ASIN", len(live)))
-    # ★ 没有任何店做这个渠道的货**不进牌堆**(所有者 2026-08-21:"我暂时没有做
-    #   FBM")。挂在"未发出"名下会骗人:那个标签的意思是"配置一改就能救",
-    #   而这批要的是开一家新渠道的店 —— 生产实测 43,573 件 FBM 就是这么混进
-    #   50,063 件"卡住的货"里,把真正要动手的 6,490 件 FBA 淹掉的。
-    # ⚠ 渠道集合按**在册且规划内**的店取,不按最终参与分配的店 —— 后者还要过
-    #   配额与容量,拿它当分母会把"这批店今天恰好满了"读成"我们不做这个渠道",
-    #   于是货被永久挡在池外。宁可放宽:多进来的货最多是本轮未发出,不会丢。
-    live_ch = {(cfg.get(s) or {}).get("channel") for s in registered
-               if not sv.is_excluded(s)} - {None}
-    off_ch = Counter(c["channel"] for c in live if c["channel"] not in live_ch)
-    if off_ch:
-        live = [c for c in live if c["channel"] in live_ch]
-        detail = " / ".join(f"{k or '渠道未知'} {v:,}"
-                            for k, v in off_ch.most_common())
-        funnel.append((f"去掉没有店做的渠道({detail})", len(live)))
-
-    # 已占位但还没上架 ⇒ 绑定到占用店。这批是上一轮定了、还没执行的上架指令
-    bound = {a: s for a, s in held_prod.items() if a not in listed}
-    g = alloc_groups.build(live, held_brand, bound)
-    free, directed = g["free"], g["directed"]
-    grouped = [("组队后·自由流(牌堆)", len(free), sum(x["size"] for x in free)),
-               ("组队后·定向流(已占品牌)", len(directed),
-                sum(x["size"] for x in directed))]
-
-    # ── 店铺配额 ─────────────────────────────────────────────────────
+    # ── 店铺(先建,漏斗要用它们的条件)──────────────────────────────
+    # ⚠ **顺序是有意的**:候选池的准入条件全部来自这批店的限额表行(渠道 /
+    #   配送时长 / 准入类目),所以店必须先建好。所有者 2026-08-21 原话:
+    #   "每一个店,对于配送时间的限制、配送方式的限制都在表格里……分配的时候
+    #   会读取表,这些信息都能拿到,再拿着条件去拿品过来分配"。
     metrics = store_perf.derive(perf_raw, days)
     q = store_perf.quota_inputs(metrics, cfg, online_now, pending)
     stores: dict = {}
@@ -294,7 +262,35 @@ def run(params: dict) -> str:
         return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
                 "先跑 alloc_stores 看是谁被挡下的")
 
-    # ── 配额:每家店自己能接多少,**不从一个人为总数里分**(所有者定稿
+
+    # ── 候选漏斗 ──────────────────────────────────────────────────────
+    scored, gated = product_pool.score_all(data)
+    # ⚠ 漏斗前四行的单位是**产品**,后两行是**组**。混在一列里报会骗人:
+    # "60 个产品 → 20 组"会显示成 33.3%,读起来像丢了三分之二的货,
+    # 其实一件没丢(每组 3 件)。所以组那两行同时给组数与货位数
+    funnel = [("候选池", len(data["pool"])), ("过硬闸", len(scored))]
+    live = [c for c in scored if c["score"] >= ps.CUTOFF]
+    funnel.append((f"≥ 淘汰线 {ps.CUTOFF:.0f}", len(live)))
+    # ★ 排除的是**已在架**的,不是已占位的。占位了没上架的照常进池,
+    #   只是只能回它的占用店(见 alloc_groups.build 的 bound_asins)
+    live = [c for c in live if c["asin"] not in listed]
+    funnel.append(("去掉已在架 ASIN", len(live)))
+    # ★ **没有任何店的条件容得下的货,不进牌堆**(所有者 2026-08-21)。
+    #   条件全在限额表同一行里(渠道 / 配送时长 / 准入类目),拿着条件去取品。
+    live, out_of_reach = _in_reach(live, _pool_reach(stores))
+    if out_of_reach:
+        detail = " / ".join(f"{k} {v:,}" for k, v in out_of_reach)
+        funnel.append((f"去掉没有店要的({detail})", len(live)))
+
+    # 已占位但还没上架 ⇒ 绑定到占用店。这批是上一轮定了、还没执行的上架指令
+    bound = {a: s for a, s in held_prod.items() if a not in listed}
+    g = alloc_groups.build(live, held_brand, bound)
+    free, directed = g["free"], g["directed"]
+    grouped = [("组队后·自由流(牌堆)", len(free), sum(x["size"] for x in free)),
+               ("组队后·定向流(已占品牌)", len(directed),
+                sum(x["size"] for x in directed))]
+
+    # ── 店铺配额:每家店自己能接多少,**不从一个人为总数里分**(所有者定稿
     #    2026-08-16:"限制 3000 设置的也很奇怪…这个限制我甚至就认为不应该有")──
     basis, no_gap, at_target = {}, [], []
     for s in stores:
@@ -596,6 +592,69 @@ def _prod_claims(grp: dict, store: str) -> list:
 
 # ⚠ 与 `alloc_产品分.csv` 的同名列**必须是同一个数**(同一个 product_pool
 # 取数、同一个窗口常量)—— 两张表对不上账时,人第一个怀疑的就是分配算错了
+def _pool_reach(stores: dict) -> dict:
+    """输入:参与分配的店 → 输出:候选池准入条件的**并集**(限额表同一行三列)。
+
+    所有者 2026-08-21 原话:「每一个店,对于配送时间的限制、配送方式的限制都在
+    表格里,和该店的目标销量、销售额、产品数量限制、类目,都在同一个表里,
+    分配的时候会读取表,这些信息都能拿到,再拿着条件去拿品过来分配」。
+
+    所以这里**一个字面量都不写**,三条全从店铺行推:
+
+    | 条件 | 并集怎么取 | 谁能让它失效 |
+    |---|---|---|
+    | 渠道 | 各店 `channel` 的集合 | 无(未填的店本就不接自由流) |
+    | 货期 | 各店 `lead_limit` 的 **max** | **任一店未填 = 不限** ⇒ 整条不筛 |
+    | 品类 | 各店准入品类的并集 | **任一店三列全空 = 不限制** ⇒ 整条不筛 |
+
+    ⚠ 后两条的"任一店放开就整条不筛"不是偷懒,是**并集的定义**:只要存在
+    一家店可能要它,这件货就有去处,池口没有资格替发牌阶段做决定。反过来写
+    (取 min / 取交集)会把一家店的严格条件强加给所有店,静默丢货。
+
+    ⚠ 用的是**参与分配的店**(在册 ∧ 规划内 ∧ participates),不是全部在册店:
+    `stores_svc.registered_names()` 连已终止的店都在里面,拿它们的限额表行去
+    放宽池口,等于让一家死店把货放进来又没人接。已满的店仍在这个集合里
+    (`room` 是发牌阶段的事),所以"今天恰好满了"不会被读成"我们不做这个渠道"。
+    """
+    rows = list(stores.values())
+    limits = [r.get("lead_limit") for r in rows]
+    cats = [store_targets.super_categories_of({"categories": r.get("categories")})
+            if (r.get("categories") or []) else None for r in rows]
+    return {
+        "channels": {r.get("channel") for r in rows} - {None},
+        # 未填 = 不限(store_targets.lead_ok 的口径),一家不限则整条不筛
+        "lead_cap": None if any(v is None for v in limits) else max(limits),
+        # 三列全空 = 不限制(store_targets.allowed 的口径),同理
+        "super_cats": None if any(c is None for c in cats)
+                      else set().union(*cats) if cats else set(),
+    }
+
+
+def _in_reach(cands: list, reach: dict) -> tuple[list, list]:
+    """输入:候选 + 准入并集 → 输出:(留下的, [(报告用标签, 件数), …])。
+
+    ⚠ 归因**按第一道拦下它的条件**分,不合并成一个总数:三者的处置完全不同
+    (开一家该渠道的店 / 放宽某店配送时长或换货源 / 给某店开这个品类),而且
+    货期里还要再分「超期」与「没采到」—— 后者**补一次采集就能进池**。
+    自由流的未发出归因刚为同一个毛病返过工(见 alloc_engine 常量段)。
+    """
+    kept, bad = [], Counter()
+    cap, cats = reach["lead_cap"], reach["super_cats"]
+    for c in cands:
+        ch, lead = c.get("channel"), c.get("lead")
+        if ch not in reach["channels"]:
+            bad[f"渠道 {ch or '未知'}"] += 1
+        elif cap is not None and lead is None:
+            bad["配送天数没采到(补一次采集就能进池)"] += 1
+        elif cap is not None and int(lead) > int(cap):
+            bad[f"配送超 {int(cap)} 天(各店限制里最宽的那个)"] += 1
+        elif cats is not None and resources.super_category(c.get("category")) not in cats:
+            bad[f"品类 {resources.super_category(c.get('category')) or '归不到'}"] += 1
+        else:
+            kept.append(c)
+    return kept, bad.most_common()
+
+
 def _unplaced_breakdown(unplaced: list) -> list[str]:
     """输入:自由流未发出的组 → 输出:按**真实拦路闸**摊开的摘要行。
 

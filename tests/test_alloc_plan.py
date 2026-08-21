@@ -439,25 +439,32 @@ def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
 def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
     """货期挡下的要单列一行 —— 「给该店开这个大类」对它们完全无效。"""
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # ⚠ B 是**必需的**:池口按各店「配送时长限制」的并集筛,只有 A 的话 30 天的
+    # 货连池子都进不去(而那正是所有者要的 —— 没人要的货不该进来)。B 没填这一
+    # 列 = 不限 ⇒ 并集不设限,货进得来,再卡在 A 自己的闸上。这才是真实场景:
+    # 一家店严、另一家松,严的那家要看得见"我是被货期挡的"
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
         "A": {"categories": [], "channel": "FBA", "max_online": 5000,
-              "gmv": 400.0, "orders": 5.0, "lead_limit": 5}})
-    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
+              "gmv": 400.0, "orders": 5.0, "lead_limit": 5},
+        "B": {"categories": [], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0}})
+    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A", "B"})
     pool = [dict(_c(f"B0SLW{i:05d}", "held0", 90.0), lead=30) for i in range(4)]
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
         "pool": [None] * len(pool), "sales": {}, "refund": {}, "risk": {},
         "gross": {}, "risk_err": None})
     monkeypatch.setattr(wf.product_pool, "score_all", lambda data: (pool, {}))
     monkeypatch.setattr(wf.store_perf, "load", lambda conn, win: {
-        "A": dict(rec_days=90, active_days=90, avg_online=100, orders=90,
-                  gross=9000.0, refund=0.0, hist_rows=0, net=9000.0)})
+        s: dict(rec_days=90, active_days=90, avg_online=100, orders=90,
+                gross=9000.0, refund=0.0, hist_rows=0, net=9000.0)
+        for s in ("A", "B")})
     monkeypatch.setattr(wf.claims, "load_active",
                         lambda conn, kind: {"held0": "A"}
                         if kind == wf.claims.BRAND else {})
     monkeypatch.setattr(wf, "_pending_delist", lambda *a, **k: {})
     monkeypatch.setattr(wf.db, "pg_conn",
                         lambda *a, **k: __import__("contextlib").nullcontext(
-                            _Conn({"A": 0})))
+                            _Conn({"A": 0, "B": 0})))
     out = wf.run({"execute": False})
     assert "其中**货期**挡下的" in out and "开类目没用" in out
     assert "其中**类目**挡下的" not in out
@@ -560,8 +567,16 @@ def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FULL{i:04d}", "acme", 90.0 - i, cat="Garden & Patio") for i in range(5)]
-    # 品牌归 A,而 A 只做「家居」且已经装满(在线 5000 = 上限 5000)
+    # 品牌归 A,而 A 只做 Home 且已经装满(在线 5000 = 上限 5000)。
+    # ⚠ B 必须做 Hardlines,否则这批货在**池口**就因"没有店要这个品类"出局,
+    # 复现不出原 bug —— 而原 bug 恰恰发生在"货有别的店能要、只是被品牌绑在
+    # 一家满店上"的时候
     _wire(monkeypatch, pool, held_brand={"acme": "A"}, claimed=[])
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0},
+        "B": {"categories": ["Garden & Patio"], "channel": "FBA",
+              "max_online": 5000, "gmv": 400.0, "orders": 5.0}})
     monkeypatch.setattr(wf.db, "pg_conn",
                         lambda *a, **k: __import__("contextlib").nullcontext(
                             _Conn({"A": 5000, "B": 100})))
@@ -644,27 +659,38 @@ def test_unplaced_breakdown_splits_the_three_actions_apart():
     assert "None" not in body
 
 
-def test_goods_no_store_serves_the_channel_of_leave_the_funnel_not_the_reject_table(
-        monkeypatch, tmp_path):
-    """⚠ 没有任何店做这个渠道的货,在**漏斗**里出局,不在"未发出"里躺着。
+def test_goods_beyond_every_store_condition_leave_at_the_funnel(monkeypatch,
+                                                                tmp_path):
+    """⚠ 没有任何店的条件容得下的货,在**漏斗**里出局,不在"未发出"里躺着。
 
-    所有者 2026-08-21:「我暂时没有做 FBM」。这批挂在"未发出"名下会骗人 ——
-    那个标签的意思是"配置一改就能救",而这批要的是开一家新渠道的店。
-    生产实测:43,573 件 FBM 就是这么混进 50,063 件"卡住的货"里,把真正要
-    动手的 6,490 件 FBA 淹掉的。
+    条件全从限额表读(渠道 / 配送时长 / 准入类目),**一个字面量都不写** ——
+    所有者 2026-08-21:「每一个店……的限制都在表格里……再拿着条件去拿品过来
+    分配」。这里三条各来一件,验的是三条都按表判、且归因分得开。
+
+    为什么必须在漏斗出局:挂在"未发出"名下会骗人 —— 那个标签的意思是
+    "配置一改就能救",而这批要的是**开一家新店/新渠道**。生产实测 43,573 件
+    FBM 就是这么混进 50,063 件"卡住的货"里,把真正要动手的 6,490 件 FBA 淹掉的。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = ([_c(f"B0FBA{i:05d}", f"fa{i}", 90.0 - i * 0.1, ch="FBA")
-             for i in range(20)]
+    pool = ([_c(f"B0OK00{i:04d}", f"ok{i}", 90.0 - i * 0.1) for i in range(20)]
+            # 分更高,但三条各自出局:渠道没人做 / 比最宽的店还慢 / 品类没人做
             + [_c(f"B0FBM{i:05d}", f"fm{i}", 95.0 - i * 0.1, ch="FBM")
-               for i in range(30)])          # 分更高,但没人收
+               for i in range(3)]
+            + [dict(_c(f"B0SLW{i:05d}", f"sl{i}", 95.0), lead=30) for i in range(4)]
+            + [_c(f"B0CAT{i:05d}", f"ct{i}", 95.0, cat="Animals")
+               for i in range(5)])
     _wire(monkeypatch, pool, claimed=[])
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
         "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
-              "gmv": 400.0, "orders": 5.0}})
+              "gmv": 400.0, "orders": 5.0, "lead_limit": 7}})
     out = wf.run({"execute": False})
-    assert "去掉没有店做的渠道" in out and "FBM 30" in out
-    rej = (tmp_path / "alloc_未入选.csv").read_text(encoding="utf-8-sig")
-    assert "B0FBM" not in rej        # 不许在未入选表里占篇幅
+    assert "去掉没有店要的" in out
+    assert "渠道 FBM 3" in out                    # 没人做这个渠道
+    assert "配送超 7 天" in out and "4" in out    # 比最宽的店还慢
+    assert "品类 FCHW 5" in out                   # 没人做这个品类
+    for f in ("alloc_未入选.csv", "alloc_分配方案.csv"):
+        txt = (tmp_path / f).read_text(encoding="utf-8-sig")
+        for pre in ("B0FBM", "B0SLW", "B0CAT"):
+            assert pre not in txt, (f, pre)       # 不许在任何一张表里占篇幅
     plan = (tmp_path / "alloc_分配方案.csv").read_text(encoding="utf-8-sig")
-    assert "B0FBM" not in plan and "B0FBA" in plan
+    assert "B0OK00" in plan

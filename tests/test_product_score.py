@@ -324,34 +324,17 @@ def test_cutoff_is_calibrated_against_the_reputation_ceiling():
         f"不是砍正经货;多半是 BASE_MAX 调小了而线没跟着降")
 
 
-def test_lead_is_gated_at_the_pool_mouth_not_only_scored():
-    """⚠ 货期在**池口**就挡(所有者 2026-08-21 拍 Q3),不是只扣分。
+def test_the_hard_gate_judges_the_product_alone_never_a_store_condition():
+    """⚠ `gate()` 只判产品自身:定不了价 / 没库存。**逐店的条件不许写进来。**
 
-    上移的理由不是省事:留在下游的话,一件 12 天的货会因为「组货期 = 组内
-    最长」把整个品牌组带走(§7.2),而组是原子的、拆不开。
-    「超期」与「没采到」必须是**两个原因**:后者补一次采集就能进池,合成一个
-    数就等于把能救的那批藏起来。
+    2026-08-21 一度把「配送 >7 天」写在这里,当天撤回:货期是限额表
+    「配送时长限制」一店一填的,写死一个全局数两头错 —— 有店填 10 就白白丢掉
+    它能卖的货,全店都填 5 又让 6~7 天的货空占池子。落点是
+    `alloc_plan._pool_reach`(取参与分配的店的并集)。
     """
-    from services import amz_source
     ok = {"price": 9.9, "shipping": 0.0, "stock": 99}
-    assert ps.gate({**ok, "lead": amz_source.MAX_LEAD_DAYS}, 5, 10) is None
-    slow = ps.gate({**ok, "lead": amz_source.MAX_LEAD_DAYS + 1}, 5, 10)
-    assert slow and "配送超期" in slow
-    unknown = ps.gate({**ok, "lead": None}, 5, 10)
-    assert unknown and "未采到" in unknown
-    assert slow != unknown          # 两个原因不许合并
-
-
-def test_lead_penalty_is_unreachable_while_the_pool_gate_shares_its_threshold():
-    """免罚线 == 池口闸值 ⇒ 进得了池的货罚分恒 0。**这是现状,不是 bug。**
-
-    钉死这个关系是为了让"有人改了语义"这件事发得出声:两个数一旦不再相等,
-    这条会红,提醒改的人先想清楚是要让快货占优(降免罚线)还是要放慢货进池
-    (抬闸值)—— 而不是以为自己只是调了个数字。
-    """
+    for lead in (0, 3, 7, 12, 99, None):
+        assert ps.gate({**ok, "lead": lead}, 5, 10) is None
+    # 免罚线仍与上架链共用同一常量(打分归打分,闸归闸)
     from services import amz_source
     assert ps._LEAD_FREE == amz_source.MAX_LEAD_DAYS
-    ok = {"price": 9.9, "shipping": 0.0, "stock": 99}
-    for lead in range(0, amz_source.MAX_LEAD_DAYS + 1):
-        assert ps.gate({**ok, "lead": lead}, 5, 10) is None
-        assert ps.score({"lead": lead})["penalty"] == 0.0

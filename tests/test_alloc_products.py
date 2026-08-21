@@ -14,8 +14,8 @@ POOL = [
     # lead, rating, reviews, fulfillment
     ("B0AAAA0001", "Acme", None, "Socks", "Fashion", 9.9, 0.0, 50, "in_stock", 5, "4.6", "820", "FBA"),
     ("B0BBBB0002", "Beta", None, "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 6, "4.1", "35", "FBA"),
-    # 配送 12 天:2026-08-21 起在**池口**就被挡(所有者拍 Q3),用来钉住
-    # "它不进产品分表、但淘汰计数里查得到"
+    # 配送 12 天:产品分表照收 —— 货期是**逐店**条件(限额表「配送时长限制」),
+    # 不是产品自身的硬闸,筛在 alloc_plan._pool_reach,不在这里
     ("B0HHHH0008", "Theta", None, "Hats", "Fashion", 9.0, 0.0, 30, "in_stock", 12, "4.0", "8", "FBA"),
     # 只有配送时效一项:**旧实现会让它独占权重拿 100 分**,新实现判「信息不足」
     ("B0CCCC0003", "Gamma", None, "Knives", "Home", 5.0, 0.0, 100, "in_stock", 3, None, None, "FBM"),
@@ -235,17 +235,3 @@ def test_csv_carries_the_fulfillment_channel(monkeypatch, tmp_path):
     assert val("B0AAAA0001")["配送方式"] == "FBA"
     assert val("B0CCCC0003")["配送方式"] == "FBM"
     assert val("B0FFFF0006")["配送方式"] == "(未知)"   # 采不到,不留空
-
-
-def test_slow_and_unmeasured_delivery_never_reach_the_score_table(monkeypatch,
-                                                                  tmp_path):
-    """⚠ 货期在池口挡(所有者 2026-08-21 拍 Q3),但**淘汰计数里必须查得到**。
-
-    挡掉不报 = 静默丢货。而且「超期」与「没采到」要分开:后者补一次采集就能
-    进池,合成一个数就把能救的那批藏起来了。
-    """
-    _wire(monkeypatch, tmp_path)
-    out = wf.run({})
-    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
-    assert "B0HHHH0008" not in txt          # 12 天,进不了表
-    assert "配送超期" in out                 # 但摘要里点了名

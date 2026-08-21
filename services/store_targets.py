@@ -88,17 +88,47 @@ def load_targets() -> dict[str, dict]:
     return out
 
 
+def super_categories_of(cfg_row: dict | None) -> set:
+    """输入:某店配置行 → 输出:该店准入的**五大品类**集合(空集 = 三列全空或全归不到)。
+
+    ⚠ 空集有**两种来源,不能混**:三列全空(= 不限制)与"填了但填的全是归不到
+    品类的类目"(= 谁也接不了)。本函数只回集合,判不限制看 `categories` 本身;
+    报告要区分这两种时用 `bool(cfg_row["categories"])` 判有没有填。
+    """
+    cats = (cfg_row or {}).get("categories") or []
+    return {resources.super_category(c) for c in cats} - {None}
+
+
 def allowed(cfg_row: dict | None, category: str | None) -> bool:
     """输入:某店配置行 + 产品大类 → 输出:该店能不能接这个大类。
 
     两条口径(所有者 2026-08-15):**表里三列都空 = 不限制**(放行一切);
-    填了就**只准入填的那几个**。产品归不到大类(category 为 None)时,
-    受限店拒收(宁可不分也不错分),不限制店放行。
+    填了就**只准入填的那几个**。产品归不到大类时,受限店拒收(宁可不分也
+    不错分),不限制店放行。
+
+    ★ **判定在五大品类那一层**(所有者 2026-08-21 拍 Q1)。两边都折一次:
+    店填「Furniture」= 它做 Home 品类,产品是 Furniture 也是 Home 品类,
+    过。**准入类目列不用重填** —— 26 类与五品类的名字都认。
+    为什么改:按 26 类判时,品牌组内的少数派件 156,188 件(全池 24.2%)会
+    被锁死在做不了那个大类的店里(品牌排他要求整组同店);折到五品类是
+    105,571 件(16.3%)。⚠ 代价所有者已认:「一店最多两大类」在这一层几乎
+    失效 —— Home + Hardlines = 他 91% 的货。
+
+    ★ **两个容易写反的地方**:
+    1. 店填了类目、但填的全是「不归」的那两类(Safety & Emergency /
+       Everything Else)→ 折完是空集。**不许因为空集就当"没填 = 不限制"**,
+       那是把最严的店误读成最松的店。填了 = 不空着,折完空集 = 谁也接不了。
+    2. 归不到品类的货只能去**没填类目**的店(所有者 2026-08-21 原话:
+       「不归,可以分配给没有确定类目的店」)—— 所以 `want is None` 时,
+       凡填了类目的店一律拒,而不是"反正归不到就随便给一家"。
     """
     cats = (cfg_row or {}).get("categories") or []
     if not cats:
-        return True
-    return bool(category) and category in cats
+        return True                          # 三列全空 = 不限制(唯一的放行一切)
+    want = resources.super_category(category)
+    if want is None:
+        return False                         # 归不到品类 → 只能去没填类目的店
+    return want in super_categories_of(cfg_row)
 
 
 def lead_ok(cfg_row: dict | None, lead) -> bool:

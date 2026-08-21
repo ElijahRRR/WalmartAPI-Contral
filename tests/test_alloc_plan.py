@@ -8,7 +8,7 @@ from services import claims
 from workflows import alloc_plan as wf
 
 
-def _c(asin, brand, score, cat="家居", ch="FBA", pt="pt1"):
+def _c(asin, brand, score, cat="Home", ch="FBA", pt="pt1"):
     return {"asin": asin, "brand": brand, "manufacturer": None, "pt": pt,
             "category": cat, "channel": ch, "score": score, "base": score,
             "bonus": 0.0, "penalty": 0.0, "why": "", "missing": [],
@@ -199,9 +199,9 @@ class _Conn:
 def _wire(monkeypatch, pool, held_brand=None, held_prod=None, claimed=None):
     online = {"A": 100, "B": 100}
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
-        "A": {"categories": ["家居"], "channel": "FBA", "max_online": 5000,
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0},
-        "B": {"categories": ["家居"], "channel": "FBA", "max_online": 5000,
+        "B": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0}})
     monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A", "B"})
     monkeypatch.setattr(wf.product_pool, "load",
@@ -300,7 +300,7 @@ def test_funnel_does_not_divide_group_counts_by_product_counts(monkeypatch, tmp_
 
 def _wire_directed(monkeypatch, pool, held_brand, room):
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
-        "A": {"categories": ["家居"], "channel": "FBA", "max_online": room,
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": room,
               "gmv": 400.0, "orders": 5.0}})
     monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
@@ -358,7 +358,7 @@ def test_a_group_bound_to_a_store_can_only_go_there(monkeypatch, tmp_path):
     """归属闸:带 `store` 的组只能去那家店,别的店再空也不给。"""
     from services import alloc_engine as ae
     st = {"quota": 99, "room": 99, "categories": [], "channel": "FBA"}
-    grp = {"key": "acme", "score": 90.0, "size": 1, "category": "家居",
+    grp = {"key": "acme", "score": 90.0, "size": 1, "category": "Home",
            "channel": "FBA", "store": "A"}
     assert ae._gate(grp, "A", st) is True
     assert ae._gate(grp, "B", st) is False
@@ -422,16 +422,16 @@ def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
     混成一个标签的实测后果(2026-08-16):货期闸挡下的组一律被记成"缺某大类",
     把所有者送去开一个根本没用的类目。
     """
-    st = {"categories": ["家居"], "lead_limit": 5, "channel": "FBA"}
+    st = {"categories": ["Home"], "lead_limit": 5, "channel": "FBA"}
     # 全被类目挡
-    g1 = _grp("a", "a", [_c("B0AAAA0001", "a", 90.0, cat="厨房")])
+    g1 = _grp("a", "a", [_c("B0AAAA0001", "a", 90.0, cat="Garden & Patio")])
     assert wf._fit_to_store(g1, st)[2] == "类目"
     # 全被货期挡
     g2 = _grp("b", "b", [dict(_c("B0AAAA0002", "b", 90.0), lead=9)])
     assert wf._fit_to_store(g2, st)[2] == "货期"
     # 混着挡时按件数多的那个归因,并列按名字定序(不许随行序漂)
-    g3 = _grp("c", "c", [_c("B0AAAA0003", "c", 90.0, cat="厨房"),
-                         _c("B0AAAA0004", "c", 80.0, cat="厨房"),
+    g3 = _grp("c", "c", [_c("B0AAAA0003", "c", 90.0, cat="Garden & Patio"),
+                         _c("B0AAAA0004", "c", 80.0, cat="Garden & Patio"),
                          dict(_c("B0AAAA0005", "c", 70.0), lead=9)])
     assert wf._fit_to_store(g3, st)[2] == "类目"
 
@@ -526,9 +526,9 @@ def test_out_of_band_stores_get_their_layer_histogram_printed(monkeypatch, tmp_p
                for i in range(300)])
     _wire(monkeypatch, pool, claimed=[])
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
-        "A": {"categories": ["家居"], "channel": "FBA", "max_online": 5000,
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0},
-        "B": {"categories": ["家居"], "channel": "FBM", "max_online": 5000,
+        "B": {"categories": ["Home"], "channel": "FBM", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0}})
     out = wf.run({"execute": False})
     assert "越界店的自由流层分布" in out
@@ -559,7 +559,7 @@ def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
     同一个原因两种说法。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    pool = [_c(f"B0FULL{i:04d}", "acme", 90.0 - i, cat="厨房") for i in range(5)]
+    pool = [_c(f"B0FULL{i:04d}", "acme", 90.0 - i, cat="Garden & Patio") for i in range(5)]
     # 品牌归 A,而 A 只做「家居」且已经装满(在线 5000 = 上限 5000)
     _wire(monkeypatch, pool, held_brand={"acme": "A"}, claimed=[])
     monkeypatch.setattr(wf.db, "pg_conn",
@@ -622,7 +622,7 @@ def test_unplaced_breakdown_splits_the_three_actions_apart():
     2026-08-21 实测,旧摘要把三者压成一句「要它出货得先给某店开这个大类」,
     所有者据此改了一轮飞书类目配置,而实际拦路的是货期 —— 一件没救回来。
     """
-    def u(reason, cat="家居", ch="FBA", lead=3, n=2):
+    def u(reason, cat="Home", ch="FBA", lead=3, n=2):
         items = [_c(f"B0{reason[:4]}{i:06d}", "b", 50.0, cat=cat, ch=ch)
                  for i in range(n)]
         g = _grp(f"g-{reason}-{cat}-{lead}", "b", items)
@@ -642,3 +642,29 @@ def test_unplaced_breakdown_splits_the_three_actions_apart():
     assert "FBM 4 件" in body
     # ⚠ 未知货期不许混进"按组货期"那一行 —— 混进去就成了 "None 天 7 件"
     assert "None" not in body
+
+
+def test_goods_no_store_serves_the_channel_of_leave_the_funnel_not_the_reject_table(
+        monkeypatch, tmp_path):
+    """⚠ 没有任何店做这个渠道的货,在**漏斗**里出局,不在"未发出"里躺着。
+
+    所有者 2026-08-21:「我暂时没有做 FBM」。这批挂在"未发出"名下会骗人 ——
+    那个标签的意思是"配置一改就能救",而这批要的是开一家新渠道的店。
+    生产实测:43,573 件 FBM 就是这么混进 50,063 件"卡住的货"里,把真正要
+    动手的 6,490 件 FBA 淹掉的。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = ([_c(f"B0FBA{i:05d}", f"fa{i}", 90.0 - i * 0.1, ch="FBA")
+             for i in range(20)]
+            + [_c(f"B0FBM{i:05d}", f"fm{i}", 95.0 - i * 0.1, ch="FBM")
+               for i in range(30)])          # 分更高,但没人收
+    _wire(monkeypatch, pool, claimed=[])
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0}})
+    out = wf.run({"execute": False})
+    assert "去掉没有店做的渠道" in out and "FBM 30" in out
+    rej = (tmp_path / "alloc_未入选.csv").read_text(encoding="utf-8-sig")
+    assert "B0FBM" not in rej        # 不许在未入选表里占篇幅
+    plan = (tmp_path / "alloc_分配方案.csv").read_text(encoding="utf-8-sig")
+    assert "B0FBM" not in plan and "B0FBA" in plan

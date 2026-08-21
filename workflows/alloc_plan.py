@@ -254,6 +254,21 @@ def run(params: dict) -> str:
     #   只是只能回它的占用店(见 alloc_groups.build 的 bound_asins)
     live = [c for c in live if c["asin"] not in listed]
     funnel.append(("去掉已在架 ASIN", len(live)))
+    # ★ 没有任何店做这个渠道的货**不进牌堆**(所有者 2026-08-21:"我暂时没有做
+    #   FBM")。挂在"未发出"名下会骗人:那个标签的意思是"配置一改就能救",
+    #   而这批要的是开一家新渠道的店 —— 生产实测 43,573 件 FBM 就是这么混进
+    #   50,063 件"卡住的货"里,把真正要动手的 6,490 件 FBA 淹掉的。
+    # ⚠ 渠道集合按**在册且规划内**的店取,不按最终参与分配的店 —— 后者还要过
+    #   配额与容量,拿它当分母会把"这批店今天恰好满了"读成"我们不做这个渠道",
+    #   于是货被永久挡在池外。宁可放宽:多进来的货最多是本轮未发出,不会丢。
+    live_ch = {(cfg.get(s) or {}).get("channel") for s in registered
+               if not sv.is_excluded(s)} - {None}
+    off_ch = Counter(c["channel"] for c in live if c["channel"] not in live_ch)
+    if off_ch:
+        live = [c for c in live if c["channel"] in live_ch]
+        detail = " / ".join(f"{k or '渠道未知'} {v:,}"
+                            for k, v in off_ch.most_common())
+        funnel.append((f"去掉没有店做的渠道({detail})", len(live)))
 
     # 已占位但还没上架 ⇒ 绑定到占用店。这批是上一轮定了、还没执行的上架指令
     bound = {a: s for a, s in held_prod.items() if a not in listed}

@@ -157,7 +157,7 @@ def score_all(data: dict) -> tuple[list, dict]:
          lead, rating, reviews, ful) in data["pool"]:
         row = {"price": float(price) if price is not None else None,
                "shipping": float(shipping) if shipping is not None else None,
-               "stock": stock, "stock_state": stock_state}
+               "stock": stock, "stock_state": stock_state, "lead": lead}
         why = ps.gate(row, amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY)
         if why:
             k = why.split("(")[0]

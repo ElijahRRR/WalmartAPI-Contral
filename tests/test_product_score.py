@@ -41,7 +41,7 @@ def test_missing_reputation_is_a_real_observation_not_a_data_gap():
     assert ps.gate({"price": None, "shipping": None, "stock": 99},
                    amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY)
     # 有快照、有价、没评价 ⇒ 过闸,口碑记 0
-    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 99},
+    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 99, "lead": 3},
                    amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY) is None
     assert ps.score({})["base"] == 0.0
 
@@ -195,13 +195,14 @@ def test_landed_price_gate_is_a_gate_not_a_deduction():
     """落地价 = 单价 + 运费,任一 NULL 就**定不了价**,不是"便宜一点"。"""
     assert ps.gate({"price": None, "shipping": 0.0}, 5, 10)
     assert ps.gate({"price": 9.9, "shipping": None}, 5, 10)
-    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 10}, 5, 10) is None
+    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 10, "lead": 3},
+                   5, 10) is None
 
 
 def test_stock_gate_never_overrides_a_confirmed_zero():
     """有货但没采到数量 → 用保守量;**stock=0 是确实缺货,不许被覆盖**。"""
     assert ps.gate({"price": 1.0, "shipping": 0.0, "stock": None,
-                    "stock_state": "in_stock"}, 5, 10) is None
+                    "stock_state": "in_stock", "lead": 3}, 5, 10) is None
     why = ps.gate({"price": 1.0, "shipping": 0.0, "stock": 0,
                    "stock_state": "in_stock"}, 5, 10)
     assert why and "库存不足" in why
@@ -321,3 +322,36 @@ def test_cutoff_is_calibrated_against_the_reputation_ceiling():
     assert ps.CUTOFF < good, (
         f"淘汰线 {ps.CUTOFF} 已经砍到「好口碑」({good:.1f})头上 —— 它该扫烂品,"
         f"不是砍正经货;多半是 BASE_MAX 调小了而线没跟着降")
+
+
+def test_lead_is_gated_at_the_pool_mouth_not_only_scored():
+    """⚠ 货期在**池口**就挡(所有者 2026-08-21 拍 Q3),不是只扣分。
+
+    上移的理由不是省事:留在下游的话,一件 12 天的货会因为「组货期 = 组内
+    最长」把整个品牌组带走(§7.2),而组是原子的、拆不开。
+    「超期」与「没采到」必须是**两个原因**:后者补一次采集就能进池,合成一个
+    数就等于把能救的那批藏起来。
+    """
+    from services import amz_source
+    ok = {"price": 9.9, "shipping": 0.0, "stock": 99}
+    assert ps.gate({**ok, "lead": amz_source.MAX_LEAD_DAYS}, 5, 10) is None
+    slow = ps.gate({**ok, "lead": amz_source.MAX_LEAD_DAYS + 1}, 5, 10)
+    assert slow and "配送超期" in slow
+    unknown = ps.gate({**ok, "lead": None}, 5, 10)
+    assert unknown and "未采到" in unknown
+    assert slow != unknown          # 两个原因不许合并
+
+
+def test_lead_penalty_is_unreachable_while_the_pool_gate_shares_its_threshold():
+    """免罚线 == 池口闸值 ⇒ 进得了池的货罚分恒 0。**这是现状,不是 bug。**
+
+    钉死这个关系是为了让"有人改了语义"这件事发得出声:两个数一旦不再相等,
+    这条会红,提醒改的人先想清楚是要让快货占优(降免罚线)还是要放慢货进池
+    (抬闸值)—— 而不是以为自己只是调了个数字。
+    """
+    from services import amz_source
+    assert ps._LEAD_FREE == amz_source.MAX_LEAD_DAYS
+    ok = {"price": 9.9, "shipping": 0.0, "stock": 99}
+    for lead in range(0, amz_source.MAX_LEAD_DAYS + 1):
+        assert ps.gate({**ok, "lead": lead}, 5, 10) is None
+        assert ps.score({"lead": lead})["penalty"] == 0.0

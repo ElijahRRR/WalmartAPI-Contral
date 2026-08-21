@@ -13,14 +13,17 @@ POOL = [
     # asin, brand, manufacturer, pt, cat, price, shipping, stock, stock_state,
     # lead, rating, reviews, fulfillment
     ("B0AAAA0001", "Acme", None, "Socks", "Fashion", 9.9, 0.0, 50, "in_stock", 5, "4.6", "820", "FBA"),
-    ("B0BBBB0002", "Beta", None, "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 12, "4.1", "35", "FBA"),
+    ("B0BBBB0002", "Beta", None, "Hats", "Fashion", 19.9, 2.0, 8, "in_stock", 6, "4.1", "35", "FBA"),
+    # 配送 12 天:2026-08-21 起在**池口**就被挡(所有者拍 Q3),用来钉住
+    # "它不进产品分表、但淘汰计数里查得到"
+    ("B0HHHH0008", "Theta", None, "Hats", "Fashion", 9.0, 0.0, 30, "in_stock", 12, "4.0", "8", "FBA"),
     # 只有配送时效一项:**旧实现会让它独占权重拿 100 分**,新实现判「信息不足」
     ("B0CCCC0003", "Gamma", None, "Knives", "Home", 5.0, 0.0, 100, "in_stock", 3, None, None, "FBM"),
     # 有口碑、无销量无退货:拉低加分/罚分项的覆盖率,让告警有东西可报
     ("B0GGGG0007", "Eta", None, "Socks", "Fashion", 7.5, 0.0, 40, "in_stock", 6, "4.2", "12", "FBA"),
     ("B0DDDD0004", "Delta", None, "Socks", "Fashion", None, 0.0, 20, "in_stock", 4, "4.9", "9", "FBA"),
     ("B0EEEE0005", "Eps", None, "Socks", "Fashion", 12.0, 1.0, 0, "in_stock", 4, "4.4", "60", "FBA"),
-    ("B0FFFF0006", "Zeta", None, "Hats", "Fashion", 8.0, 0.0, 30, "in_stock", None, None, None, None),
+    ("B0FFFF0006", "Zeta", None, "Hats", "Fashion", 8.0, 0.0, 30, "in_stock", 4, None, None, None),
 ]
 
 
@@ -141,7 +144,6 @@ def test_csv_exposes_which_signals_were_missing(monkeypatch, tmp_path):
     assert "口碑分" in head and "销量加分" in head   # 三段各自可查
     beta = next(ln for ln in body if ln.startswith("B0BBBB0002"))
     assert "不明原因消失过4次" in beta        # 罚分理由带次数写进行里
-    assert "配送12天" in beta                # 配送慢的罚分理由也写进去
 
 
 def test_sales_sql_only_reads_rows_with_asin(monkeypatch):
@@ -233,3 +235,17 @@ def test_csv_carries_the_fulfillment_channel(monkeypatch, tmp_path):
     assert val("B0AAAA0001")["配送方式"] == "FBA"
     assert val("B0CCCC0003")["配送方式"] == "FBM"
     assert val("B0FFFF0006")["配送方式"] == "(未知)"   # 采不到,不留空
+
+
+def test_slow_and_unmeasured_delivery_never_reach_the_score_table(monkeypatch,
+                                                                  tmp_path):
+    """⚠ 货期在池口挡(所有者 2026-08-21 拍 Q3),但**淘汰计数里必须查得到**。
+
+    挡掉不报 = 静默丢货。而且「超期」与「没采到」要分开:后者补一次采集就能
+    进池,合成一个数就把能救的那批藏起来了。
+    """
+    _wire(monkeypatch, tmp_path)
+    out = wf.run({})
+    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
+    assert "B0HHHH0008" not in txt          # 12 天,进不了表
+    assert "配送超期" in out                 # 但摘要里点了名

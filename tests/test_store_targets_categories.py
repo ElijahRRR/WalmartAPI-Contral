@@ -14,11 +14,40 @@ def test_allowed_empty_means_unrestricted():
         assert st.allowed(row, None) is True          # 归不到大类也放行
 
 
-def test_allowed_filled_admits_only_listed():
-    row = _cfg(["Home", "Office"])
+def test_allowed_filled_admits_only_the_super_categories_listed():
+    """填了就只准入填的那几个 —— 但**判定在五大品类那一层**(所有者拍 Q1)。
+
+    ⚠ 这是一次**有意的放宽**,不是 bug:店填「Office」= 它做 Hardlines,
+    于是同属 Hardlines 的 Sporting Goods 也收得了。改的理由见 `allowed`
+    的 docstring(按 26 类判会锁死全池 24.2% 的货)。
+    别的品类照旧拒 —— 放宽的是"同品类内",不是"什么都收"。
+    """
+    row = _cfg(["Home", "Office"])                    # Home / Hardlines
     assert st.allowed(row, "Home") is True
     assert st.allowed(row, "Office") is True
-    assert st.allowed(row, "Sporting Goods") is False
+    assert st.allowed(row, "Sporting Goods") is True  # 同属 Hardlines
+    assert st.allowed(row, "Furniture") is True       # 同属 Home
+    assert st.allowed(row, "Animals") is False        # FCHW,没填
+    assert st.allowed(row, "Toys") is False           # ETS,没填
+
+
+def test_a_store_that_filled_only_unmapped_categories_admits_nothing():
+    """⚠ 填了类目、但填的全是「不归」的那两类 → 折完是空集。
+
+    **不许因为空集就当成"没填 = 不限制"** —— 那是把最严的店误读成最松的店,
+    一批本该只去无类目店的货会全灌给它,而占用撤不回。
+    """
+    row = _cfg(["Safety & Emergency", "Everything Else"])
+    assert st.super_categories_of(row) == set()
+    assert st.allowed(row, "Home") is False
+    assert st.allowed(row, "Safety & Emergency") is False   # 它自己也不收
+
+
+def test_unmapped_goods_go_only_to_stores_with_no_category_set():
+    """「不归」的两类只能去**没有确定类目**的店(所有者 2026-08-21 原话)。"""
+    for cat in ("Safety & Emergency", "Everything Else"):
+        assert st.allowed(_cfg([]), cat) is True        # 没填类目的店:收
+        assert st.allowed(_cfg(["Home"]), cat) is False  # 填了的:一律拒
 
 
 def test_allowed_restricted_store_rejects_unclassified():

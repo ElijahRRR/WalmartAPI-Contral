@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1721 个单元测试**。
+- **1722 个单元测试**。
 
 ---
 
@@ -568,7 +568,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 ### 测试
 
 ```bash
-python -m pytest -q          # 1721 passed
+python -m pytest -q          # 1722 passed
 ```
 
 测试钉的不是覆盖率,是**"错了也不报错"的那些接缝**:参数掉了那一段白跑、

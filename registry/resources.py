@@ -697,6 +697,10 @@ LLM_PURPOSE_ENV = {
     # PT 枚举内时问一次"它实际表达什么"。调用极少(命中即缓存,键按
     # (PT, 维度名) 定案),未配置专用模型时回落 DEEPSEEK_MODEL
     "variant_remap": "DEEPSEEK_MODEL_VARIANT_REMAP",
+    # 上架出参(mp_mapper:把亚马逊产品映成沃尔玛 PT 的属性)。2026-08-21 建:
+    # 此前这条链**不传 purpose**,于是全落进 "default" 桶 —— 记是记了,但摘要里
+    # 和别的默认调用混成一坨,换模型时看不出"上架这一段到底花了多少"
+    "listing_attrs": "DEEPSEEK_MODEL_LISTING_ATTRS",
 }
 
 # ── 沃尔玛五大品类(Walmart Category 之上的一层)────────────────────────

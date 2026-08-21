@@ -775,8 +775,11 @@ def test_map_llm_three_level_fetch(monkeypatch):
     monkeypatch.setattr(ln.llm_cache, "find_reusable",
                         lambda c, a, p, s: (old, "Gift Bags 48 Pcs Brown"))
 
-    def chat(messages):
+    def chat(messages, **kw):
         calls["llm"] += 1
+        # ⚠ purpose 必须传:不传就全落进 "default" 桶,摘要里和别的默认调用
+        # 混成一坨,换模型时看不出"上架这一段花了多少"(2026-08-21 建的用途)
+        assert kw.get("purpose") == "listing_attrs"
         return {"visible": {"material": "Paper"}, "orderable": {}}
     monkeypatch.setattr(ln.llm, "chat_json", chat)
 
@@ -977,3 +980,57 @@ def test_out_of_scope_holders_do_not_block_others(monkeypatch):
     *_, owned_asin, owned_brand = ln._load_gate_state()
     assert owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
     assert owned_brand == {}
+
+
+# ── LLM 花费上报(所有者 2026-08-21:「上架我也希望可以输出花了多少钱」)────
+
+def test_listing_llm_purpose_is_registered_not_falling_into_default():
+    """上架出参有自己的用途桶 —— 落进 "default" 就和别的默认调用混成一坨。
+
+    摘要按**用途**分行,那是换模型时唯一有用的维度:要回答"上架这一段值不值得
+    换个更便宜的模型",就得先能把它单独看见。
+    """
+    from registry import resources
+    assert "listing_attrs" in resources.LLM_PURPOSE_ENV
+
+
+def test_cost_is_reported_at_every_exit_including_dry_run():
+    """⚠ 每一个 return 之前都要报,**dry-run 也不例外**。
+
+    `-p check_spec=1` 的 spec 预检是**真调 LLM** 的(那行提示自己写着
+    "会真调 LLM,但不领 UPC 不提交")。漏报就是白花钱不留痕 —— 而 dry-run
+    恰恰是人最容易以为"不花钱"的那条路。
+    """
+    import inspect
+    src = inspect.getsource(ln.run)
+    exits = [i for i, line in enumerate(src.splitlines())
+             if line.strip() == 'return "\\n".join(lines)']
+    assert exits, "run() 的出口形状变了,这条守卫要跟着改"
+    body = src.splitlines()
+    for i in exits:
+        # 往回看几行,必须有花费上报(中间可能隔着 append 一两行)
+        window = "\n".join(body[max(0, i - 4):i])
+        assert "_llm_cost_lines" in window, f"第 {i} 行的 return 没报花费"
+
+
+def test_no_llm_call_means_no_noise_line():
+    """一次都没调 LLM 时不许多打一行 —— 摘要里每一行都得是有信息量的。"""
+    from api import llm as _llm
+    saved = dict(_llm.USAGE_STATS)
+    _llm.USAGE_STATS.clear()
+    try:
+        assert ln._llm_cost_lines(100) == []
+    finally:
+        _llm.USAGE_STATS.update(saved)
+
+
+def test_denominator_is_rows_that_entered_prep_not_rows_that_succeeded():
+    """每千条的分母是**进过预备期**的行,不是提交成功的行。
+
+    出参失败 / 必填缺失的行钱照花,拿成功数当分母会把单价算低 —— 而这个数
+    正是用来推整批预算的。
+    """
+    import inspect
+    src = inspect.getsource(ln.run)
+    assert "_llm_cost_lines(len(prep_in))" in src
+    assert "_llm_cost_lines(len(prep_ok))" not in src

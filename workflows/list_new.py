@@ -343,7 +343,7 @@ def _map_llm(conn, pt: str, spec, product: dict,
                 _bump(stats, "reuse_miss")
                 logger.info("%s 有旧出参但标题规格验证不过(规格疑似变了),"
                             "重打 LLM", meta["asin"])
-            raw = llm.chat_json(messages)
+            raw = llm.chat_json(messages, purpose="listing_attrs")
             _bump(stats, "llm")
         llm_cache.put(conn, key, raw, **meta)
     raw_v, raw_o = mp_mapper.split_llm_output(raw)
@@ -995,6 +995,23 @@ def _writeback_upc(execute: bool, lines: list[str]) -> None:
                      f"(feed 已提交;补写跑 `python cli.py upc_sync`)")
 
 
+def _llm_cost_lines(items: int = 0) -> list[str]:
+    """输入:本轮进过预备期的行数 → 输出:LLM 用量/花费摘要行(没调过就返回空)。
+
+    所有者 2026-08-21:「上架我也希望可以输出花了多少钱」。数据本来就在记 ——
+    `api.llm.chat_json` 每次成功都调 `record_usage`,只是从没人打印。
+    `items` 给的是**进预备期的行数**(那一段才烧 LLM),不是提交成功数:
+    出参失败/必填缺失的行钱照花,拿成功数当分母会把单价算低。
+
+    ⚠ 放在**每一个 return 之前**,dry-run 也不例外 —— `-p check_spec=1` 的
+    预检是**真调 LLM** 的(那行提示自己写着),不报就等于白花钱不留痕。
+    没调过 LLM 时 `summarize` 返回空列表,所以到处放不会制造噪声。
+    """
+    from api import llm as _llm
+    from services import llm_cost as _cost
+    return _cost.summarize(_llm.USAGE_STATS, items=items)
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
@@ -1048,6 +1065,7 @@ def run(params: dict) -> str:
     if c_note:
         lines.append(c_note)
     if not pending:
+        lines += _llm_cost_lines()
         return "\n".join(lines)
 
     # UPC 注入排在闸门链之前:领号是第 ⑦ 道闸,运营刚贴进表格的号必须这一轮就能用
@@ -1320,6 +1338,7 @@ def run(params: dict) -> str:
             else:
                 lines.append("  (加 -p check_spec=1 可在提交前跑 spec 一致化"
                              "预检:会真调 LLM,但不领 UPC 不提交)")
+        lines += _llm_cost_lines(len(ready))
         return "\n".join(lines)
 
     # 批量写理由(2026-08-19 所有者实遇修复):此前逐行调 write_reason,
@@ -1512,5 +1531,6 @@ def run(params: dict) -> str:
     # 预备/提交期新增的理由(出参失败/必填缺失/UPC 不足),同样批量写
     listing_sheet.write_reasons(reasons[n_reasons_written:])
     _writeback_upc(execute, lines)
+    lines += _llm_cost_lines(len(prep_in))
     lines.append("回执 O/P/Q 由 feed_poll 反哺器回填;结果轮询走 feed_poll")
     return "\n".join(lines)

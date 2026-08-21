@@ -329,7 +329,7 @@ def _is_forced(params: dict, extra: dict) -> bool:
     """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
 
     只用来决定要不要挂 `_RECENT_RUN_GUARD`(dry-run 复烧护栏)。强审 = 人点名
-    要审的,点了就得审,哪怕 24 小时内刚审过。两种:
+    要审的,点了就得审,哪怕 24 小时内刚审过。三种:
 
     · `asins=` 点名 —— 但 **`from_sheet` 不算**:它也往 extra 塞 asins,走的却是
       默认候选谓词(E 列为空 ≠ 库里没结论),该吃护栏。
@@ -337,10 +337,20 @@ def _is_forced(params: dict, extra: dict) -> bool:
       全在 24 小时内。吃了护栏的话 dry-run 稳定报"0 候选",紧跟着真跑翻出几千
       条,又是一次"dry-run 说没事、真跑吓一跳"(所有者 2026-08-16 被 from_sheet
       坑过一次,那次差异在回填行数,这次会差在候选数)。
+    · `mode=pending` 待定专刷(2026-08-21 补)—— 它自述「**无 1 天退避**……
+      判定逻辑刚改过时要立刻拿存量 pending 验证效果,等一天等的是自己」,
+      而 24 小时 run 护栏让你等的**正是一天**:自述与实现直接打架。
+      具体表现(所有者实遇):`-p mode=pending --dry-run` 抽 200 条看效果,
+      **dry-run 也落 runs**,于是这 200 条接下来 24 小时被护栏挡在候选集外
+      —— 紧跟着真跑处理的是另外 200 条,想"拿同一批验证完再真跑"做不到,
+      而且每 dry-run 一次就把一批 pending 推迟一天,排空 16k 存量时尤其伤。
+      它与 rerule 同类:人工显式动作、**不进任何定时调度**,吃护栏无收益。
 
     代价说清:强审下重复 dry-run 会重复烧 LLM —— 这是点名的固有代价,不是 bug。
     """
     if str(params.get("rerule", "")).strip():
+        return True
+    if str(params.get("mode", "")).strip() == "pending":
         return True
     return bool(extra.get("asins")) and not params.get("from_sheet")
 

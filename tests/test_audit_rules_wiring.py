@@ -953,6 +953,12 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
     assert product_audit._is_forced({"rerule": "phase0_forbidden_category"}, {})
     assert not product_audit._is_forced({}, {})
     assert not product_audit._is_forced({"rerule": "  "}, {})   # 空串不算
+    # mode=pending 也是强审(2026-08-21):它自述「无 1 天退避,等一天等的是自己」,
+    # 而 24 小时 run 护栏让你等的正是一天 —— dry-run 也落 runs,抽样看过的那批
+    # 24 小时内捞不回来,真跑处理的是另一批。人工显式动作、不进调度,吃护栏无收益。
+    assert product_audit._is_forced({"mode": "pending"}, {})
+    assert not product_audit._is_forced({"mode": "backfill"}, {})
+    assert not product_audit._is_forced({"mode": "pass"}, {})
 
 
 def test_candidate_sql_recent_guard_shape():

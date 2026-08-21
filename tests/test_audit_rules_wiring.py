@@ -1421,3 +1421,76 @@ def test_seller_dry_run_writes_nothing():
                                  [{"seller_id": "S1"}, {"seller_id": "S2"}],
                                  allow_shrink=True, dry_run=True)
     assert "[DRY-RUN]" in msg and conn.inserted == []
+
+
+# ── LLM token 记账与成本折算(2026-08-21)──────────────────────────────────
+
+def test_record_usage_buckets_by_model_purpose_and_tier():
+    """token 是接口回的事实,记在 api 层;**时段在调用当时就定死**。
+
+    DeepSeek 峰谷价差整整一倍,一轮跑几小时会跨越分界 —— 事后按"现在是
+    什么时段"统一折算必然算错。
+    """
+    import datetime as dt
+    from api import llm as _llm
+
+    _llm.reset_usage_stats()
+    peak = dt.datetime(2026, 8, 21, 3, tzinfo=dt.timezone.utc)     # 01–04 UTC
+    off = dt.datetime(2026, 8, 21, 20, tzinfo=dt.timezone.utc)
+    u = {"prompt_tokens": 1000, "completion_tokens": 100,
+         "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "peak")] == {
+        "calls": 2, "prompt": 2000, "completion": 200,
+        "cache_hit": 1800, "cache_miss": 200}
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "offpeak")
+                            ]["calls"] == 1
+    # 供应商不回 usage:只累加次数,其余留 0 —— 少算不瞎算
+    _llm.record_usage("deepseek-v4-flash", "audit_l1", None, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l1", "offpeak")] == {
+        "calls": 1, "prompt": 0, "completion": 0,
+        "cache_hit": 0, "cache_miss": 0}
+    _llm.reset_usage_stats()
+    assert _llm.USAGE_STATS == {}
+
+
+def test_llm_cost_never_invents_a_number_for_unpriced_models():
+    """不认识的模型**只报 token 不报钱**,并在摘要里点名。
+
+    按 0 计价会产出一个看着像钱、其实是编的数字 —— 比不报更糟。
+    """
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 1000, "completion": 100,
+           "cache_hit": 0, "cache_miss": 1000}
+    assert llm_cost.cost_of("no-such-model", "peak", row) is None
+    out = "\n".join(llm_cost.summarize(
+        {("no-such-model", "list_new", "peak"): row}))
+    assert "该模型无计价" in out and "未计价模型" in out
+    assert "$0.00" not in out
+
+
+def test_llm_cost_peak_is_exactly_double_offpeak():
+    """峰谷差一倍 —— 大重审排在谷时段直接省一半,这个结论要能被算出来。"""
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 500_000, "cache_miss": 500_000}
+    peak = llm_cost.cost_of("deepseek-v4-flash", "peak", row)
+    off = llm_cost.cost_of("deepseek-v4-flash", "offpeak", row)
+    assert abs(peak - 2 * off) < 1e-9
+
+
+def test_llm_cost_falls_back_to_miss_price_when_split_absent():
+    """供应商不拆缓存命中时,整块 prompt 按**未命中**(贵的那档)算 ——
+    偏贵不偏便宜,估出来的账不会让人以为花得比实际少。"""
+    from services import llm_cost
+
+    split = {"calls": 1, "prompt": 0, "completion": 0,
+             "cache_hit": 0, "cache_miss": 1_000_000}
+    nosplit = {"calls": 1, "prompt": 1_000_000, "completion": 0,
+               "cache_hit": 0, "cache_miss": 0}
+    assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
+            == llm_cost.cost_of("deepseek-v4-flash", "peak", split))

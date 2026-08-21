@@ -998,6 +998,7 @@ def run(params: dict) -> str:
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
+        _llm.reset_usage_stats()                 # token 记账同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
         l0_untouched = 0
@@ -1192,8 +1193,12 @@ def run(params: dict) -> str:
             saved = l1s.get("unknown_retry_saved", 0)
             lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
                          f"({called - saved} 条换开放候选面仍解不出 → 待定)")
-    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
+    # token / 成本(2026-08-21):跑完才想知道"这一轮花了多少"就晚了 ——
+    # usage 只在响应里存在一次,不当场记就永远没了
+    from services import llm_cost as _cost
     from api import llm as _llm2
+    lines.extend(_cost.summarize(_llm2.USAGE_STATS))
+    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
     retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
     # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
     # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",

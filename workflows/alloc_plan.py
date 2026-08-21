@@ -434,6 +434,7 @@ def run(params: dict) -> str:
         L.append("  未发出 " + f"{len(result['unplaced']):,} 组:"
                  + " · ".join(f"{ae.REASON_LABEL[k]} {v:,}"
                               for k, v in why.most_common()))
+        L += _unplaced_breakdown(result["unplaced"])
     # ★ 「我那个高分品怎么没分出去」必须答得上来(所有者 2026-08-16 追问)。
     # 分数最高的组也可能只是**排在切口之外** —— 它既不在方案表也不在未入选表,
     # 哪儿都查不到。把切口位置显式报出来:低于这条线的就是"排队中",不是被闸挡了
@@ -580,6 +581,55 @@ def _prod_claims(grp: dict, store: str) -> list:
 
 # ⚠ 与 `alloc_产品分.csv` 的同名列**必须是同一个数**(同一个 product_pool
 # 取数、同一个窗口常量)—— 两张表对不上账时,人第一个怀疑的就是分配算错了
+def _unplaced_breakdown(unplaced: list) -> list[str]:
+    """输入:自由流未发出的组 → 输出:按**真实拦路闸**摊开的摘要行。
+
+    与定向流那边(`dir_out` 的三段)同一条纪律,只是维度不同:定向流的去向店
+    是固定的,所以摊「店 × 缺的大类」;自由流没有固定去向,所以摊的是
+    **这批货自己的属性** —— 缺哪个大类 / 卡在几天 / 差哪个渠道。
+
+    ⚠ 光报总数没法动手。所有者能做的动作只有三种(给某店开大类 / 放宽某店
+    的配送时长 / 给某店配上渠道),摘要就得按这三种摊开,否则他只能看着一个
+    五万件的总数干瞪眼 —— 2026-08-21 实测,他照着旧摘要去开类目,而实际拦路
+    的是货期,一件没救回来。
+    """
+    L: list[str] = []
+    by_cat: Counter = Counter()
+    by_lead: Counter = Counter()
+    by_ch: Counter = Counter()
+    for u in unplaced:
+        g, n = u["group"], int(u["group"]["size"])
+        if u["reason"] == ae.NO_CATEGORY:
+            by_cat[g.get("category") or "(未归类)"] += n
+        elif u["reason"] == ae.NO_LEAD:
+            by_lead[g.get("lead")] += n
+        elif u["reason"] == ae.NO_CHANNEL:
+            by_ch[g.get("channel") or "(未知)"] += n
+    if by_cat:
+        L.append(f"  其中**类目**挡下的 {sum(by_cat.values()):,} 件,按缺的大类:"
+                 + " · ".join(f"{c} {n:,} 件" for c, n in by_cat.most_common(8))
+                 + f"(共 {len(by_cat)} 个大类)—— 给任意一家店开这个大类就能救回")
+    if by_lead:
+        # 货期 None = 组里有件没采到配送天数(§7.2 组货期取最长,任一件未知就整组未知)。
+        # 它和"确实慢"的处置不同:前者补采集就好,后者要放宽限制或换货源
+        unk = by_lead.pop(None, 0)
+        if by_lead:
+            L.append(f"  其中**货期**挡下的 {sum(by_lead.values()):,} 件,按组货期"
+                     f"(= 组内最长的那一件):"
+                     + " · ".join(f"{d} 天 {n:,} 件"
+                                  for d, n in sorted(by_lead.items())[:8])
+                     + " —— 放宽某店「配送时长限制」或换货源才救得回,**开类目没用**")
+        if unk:
+            L.append(f"  其中**货期未知**挡下的 {unk:,} 件:组里有件没采到配送天数,"
+                     f"受限店一律拒收(§7.2「任一件采不到就整组算未知」)—— "
+                     f"这批**补采集就能救**,不用改任何配置")
+    if by_ch:
+        L.append(f"  其中**渠道**挡下的 {sum(by_ch.values()):,} 件:"
+                 + " · ".join(f"{c} {n:,} 件" for c, n in by_ch.most_common())
+                 + " —— 没有一家参与分配的店把「配送限制」列填成这个渠道")
+    return L
+
+
 _HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类", "渠道",
            "ASIN", "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
            "售价", "运费", "落地价", "窗口销量(件)", "窗口销售额(毛额)",

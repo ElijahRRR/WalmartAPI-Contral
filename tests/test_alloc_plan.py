@@ -164,7 +164,7 @@ def test_plan_table_holds_only_what_you_act_on(tmp_path, monkeypatch):
     g = _grp("zeta", "zeta", [_c("B0BBBB0001", "zeta", 50.0)])
     p_plan, n_plan = wf._write_plan([{"group": ok, "store": "A", "layer": 1,
                                       "tier": 1}])
-    p_out, n_out = wf._write_rejects([{"group": g, "reason": wf.ae.NO_GATE}],
+    p_out, n_out = wf._write_rejects([{"group": g, "reason": wf.ae.NO_CATEGORY}],
                                      [(dict(g, store="A085"), "占用店容量不足")],
                                      [dict(g, store="A085")])
     plan = open(p_plan, encoding="utf-8-sig").read()
@@ -613,3 +613,32 @@ def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(
     cut = float(out.split("候选切口在组分 ")[1].split(" ")[0])
     assert entry > cut, "入场线必须高于候选切口 —— 配额先填满"
     assert "这不是入场线" in out
+
+
+def test_unplaced_breakdown_splits_the_three_actions_apart():
+    """未发出的货必须按**所有者能做的那三个动作**摊开,不能只报一个总数。
+
+    三个动作互不相干:给某店开大类 / 放宽某店的配送时长 / 给某店配上渠道。
+    2026-08-21 实测,旧摘要把三者压成一句「要它出货得先给某店开这个大类」,
+    所有者据此改了一轮飞书类目配置,而实际拦路的是货期 —— 一件没救回来。
+    """
+    def u(reason, cat="家居", ch="FBA", lead=3, n=2):
+        items = [_c(f"B0{reason[:4]}{i:06d}", "b", 50.0, cat=cat, ch=ch)
+                 for i in range(n)]
+        g = _grp(f"g-{reason}-{cat}-{lead}", "b", items)
+        g["lead"] = lead
+        return {"group": g, "reason": reason}
+
+    lines = wf._unplaced_breakdown([
+        u(wf.ae.NO_CATEGORY, cat="Furniture", n=5),
+        u(wf.ae.NO_LEAD, lead=12, n=3),
+        u(wf.ae.NO_LEAD, lead=None, n=7),      # 采不到 ≠ 慢,处置完全不同
+        u(wf.ae.NO_CHANNEL, ch="FBM", n=4),
+    ])
+    body = "\n".join(lines)
+    assert "Furniture 5 件" in body and "给任意一家店开这个大类" in body
+    assert "12 天 3 件" in body and "开类目没用" in body
+    assert "货期未知**挡下的 7 件" in body and "补采集就能救" in body
+    assert "FBM 4 件" in body
+    # ⚠ 未知货期不许混进"按组货期"那一行 —— 混进去就成了 "None 天 7 件"
+    assert "None" not in body

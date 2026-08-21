@@ -676,6 +676,54 @@ LLM_PURPOSE_ENV = {
     "variant_remap": "DEEPSEEK_MODEL_VARIANT_REMAP",
 }
 
+# ── 沃尔玛五大品类(Walmart Category 之上的一层)────────────────────────
+#
+# 来源:所有者 2026-08-21 提供的沃尔玛官方招商材料「五大品类多元商品」。
+# 这是沃尔玛自己的商品部门划分,坐在 `Walmart Category`(库里 26 个值)**之上**。
+#
+# ⚠ **两层都在用,别混**:附 A.1(2026-08-07)拍的「大类目 = Walmart Category」
+# 是**下层**,分配链的类目闸至今按它判;所有者心智里的"大类"是**上层**。
+# 2026-08-21 实测这个差异不是术语出入 —— 按下层判,品牌组内的少数派件
+# 156,188 件(全池 24.2%)会被锁死在做不了那个大类的店里;折到上层判是
+# 105,571 件(16.3%)。**类目闸切不切上层仍未决**(Q1),本表先登记,
+# 让报告两个口径都说得出来。
+#
+# 归类由所有者 2026-08-21 逐条拍板,其中四条是他当天点名回的:
+#   Musical Instruments   → ETS
+#   Business & Industrial → Hardlines
+#   Safety & Emergency    → **不归**(None)
+#   Everything Else       → **不归**(None)
+# 「不归」不是漏填,是一条口径:这两类**只能分给没有确定类目的店**。它正好
+# 落在 `store_targets.allowed` 已有的两条规则上(「三列全空 = 不限制」+
+# 「归不到大类的,受限店拒收」),所以映成 None 就够了,不需要任何新逻辑。
+WALMART_SUPER_CATEGORIES = ("Fashion", "ETS", "Home", "FCHW", "Hardlines")
+
+# Walmart Category → 五大品类;**不在表里 = 归不到**(与映成 None 同义)。
+_SUPER_CATEGORY_OF = {
+    "Fashion": "Fashion",
+    "Electronics": "ETS", "Toys": "ETS", "Occasion & Seasonal": "ETS",
+    "Media": "ETS", "Photography": "ETS", "Musical Instruments": "ETS",
+    "Home": "Home", "Furniture": "Home", "Arts & Crafts": "Home",
+    "Beauty": "FCHW", "Health & Personal Care": "FCHW", "Animals": "FCHW",
+    "Baby": "FCHW", "Household": "FCHW", "Food & Beverage": "FCHW",
+    "Office": "Hardlines", "Sporting Goods": "Hardlines",
+    "Sports & Outdoors": "Hardlines", "Vehicles": "Hardlines",
+    "Automotive": "Hardlines", "Home Improvement": "Hardlines",
+    "Garden & Patio": "Hardlines", "Business & Industrial": "Hardlines",
+    # Safety & Emergency / Everything Else 刻意不列 —— 见上面「不归」那条
+}
+
+
+def super_category(category: str | None) -> str | None:
+    """输入:Walmart Category → 输出:五大品类之一,或 None(不归任何品类)。
+
+    None 有确切含义,不是"查不到":这类货**只能分给没有确定类目的店**
+    (所有者 2026-08-21)。调用方不许把 None 兜成某个默认品类 —— 那会把
+    "谁都能收"变成"某一家专收",正好反了。
+    """
+    return _SUPER_CATEGORY_OF.get((category or "").strip())
+
+
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
 # 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——
 # 所有者 2026-08-07:表格随时会停用)

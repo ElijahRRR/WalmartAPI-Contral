@@ -201,8 +201,10 @@ def test_unplaced_reasons_do_not_collapse_into_the_wrong_bucket():
     # 没人放行
     r2 = ae.deal([_g("x", 90.0, category="宠物")],
                  {"S": _s(quota=9, categories=["家居"])}, thickness=1.0)
-    assert r2["unplaced"][0]["reason"] == ae.NO_GATE
-    assert set(ae.REASON_LABEL) == {ae.NO_GATE, ae.NO_ROOM, ae.NO_QUOTA}
+    assert r2["unplaced"][0]["reason"] == ae.NO_CATEGORY
+    assert set(ae.REASON_LABEL) == {ae.NO_BRAND, ae.NO_CATEGORY, ae.NO_LEAD,
+                                    ae.NO_CHANNEL, ae.NO_ROOM, ae.NO_QUOTA,
+                                    ae.NO_STORE}
 
 
 def test_stores_with_zero_quota_or_room_are_skipped_not_divided_by():
@@ -301,7 +303,7 @@ def test_unknown_lead_is_refused_by_a_capped_store():
     """
     r = ae.deal([_g("unknown", 90.0, lead=None)],
                 {"STRICT": _s(9, lead_limit=5)}, thickness=1.0)
-    assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_GATE
+    assert not r["assign"] and r["unplaced"][0]["reason"] == ae.NO_LEAD
     # 未填限制的店照收 —— 未填 = 不限
     r2 = ae.deal([_g("unknown", 90.0, lead=None)], {"ANY": _s(9)}, thickness=1.0)
     assert r2["assign"][0]["store"] == "ANY"
@@ -314,7 +316,7 @@ def test_gate_predicates_come_from_store_targets_not_reimplemented():
     各写一遍迟早分叉 —— 本仓已在报告 vs 回填的行口径上栽过一次。
     """
     import inspect
-    src = inspect.getsource(ae._gate)
+    src = inspect.getsource(ae._blocker)
     assert "store_targets.allowed" in src and "store_targets.lead_ok" in src
     assert "not in cats" not in src and "<= float(cap)" not in src
 
@@ -364,3 +366,59 @@ def test_a_store_with_a_tiny_free_slice_gets_no_ratio():
     assert 36 < 1460 * ae.MIN_FREE_SHARE_OF_QUOTA                 # 但占比不过
     assert m["TINY"]["top_ratio"] is None, "量太小的比值是假象,不该给数"
     assert m["BIG"]["top_ratio"] is not None
+
+
+# ── 四道闸各自归因(2026-08-21 生产实测逼出来的)────────────────────────
+
+def test_lead_block_is_not_reported_as_a_category_block():
+    """⚠ 类目放行、货期拦下 → 记「货期」,**不许记「类目」**。
+
+    这是一条实测教训,不是假想:2026-08-21 复盘生产方案表,「没有店的
+    类目/渠道闸放行(要它出货得先给某店开这个大类)」标签下的 6,490 件 FBA,
+    **每一件的大类都有店在收**。真正拦路的是货期 —— 已分配的货配送天数
+    最大 7 天、一件超的都没有,而卡住的那批 17.6% 超 7 天。
+    所有者照着那份摘要去开大类,一件也救不回来。
+    """
+    r = ae.deal([_g("slow", 90.0, category="家居", lead=12)],
+                {"S": _s(9, categories=["家居"], lead_limit=7)}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_LEAD
+    assert "开类目没用" in ae.REASON_LABEL[ae.NO_LEAD]
+
+
+def test_channel_block_is_not_reported_as_a_category_block():
+    """类目与货期都过、只差渠道 → 记「渠道」。生产里这是最大的一块。"""
+    r = ae.deal([_g("fbm", 90.0, category="家居", channel="FBM")],
+                {"S": _s(9, categories=["家居"], channel="FBA")}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_CHANNEL
+
+
+def test_attribution_takes_the_farthest_gate_across_all_stores():
+    """跨店取**走得最远**的那道闸:一家店类目就不符,另一家店类目过了只是货期超。
+
+    归因该归「货期」—— 因为存在一家店,给它放宽配送时长限制就能收下这批货。
+    归成「类目」的话,所有者会去给第一家店开大类,而那家店开了也还是收不了
+    (它同样有货期限制,只是先被类目挡下,压根没走到那一步)。
+    """
+    stores = {"WRONG_CAT": _s(9, categories=["宠物"], lead_limit=7),
+              "RIGHT_CAT": _s(9, categories=["家居"], lead_limit=7)}
+    r = ae.deal([_g("slow", 90.0, category="家居", lead=12)], stores,
+                thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_LEAD
+
+
+def test_no_live_store_is_its_own_reason_not_a_config_complaint():
+    """一家店都没有(配额/容量全 0)→ 记 NO_STORE。
+
+    记成「没有店的类目闸放行」会把所有者送去改类目配置,而真正要做的是
+    下架腾位或补齐店铺配置 —— 类目一栏改到天亮也没用。
+    """
+    r = ae.deal([_g("a", 90.0)], {"FULL": _s(9, room=0)}, thickness=1.0)
+    assert r["unplaced"][0]["reason"] == ae.NO_STORE
+
+
+def test_every_reason_code_has_a_label():
+    """新增原因码忘了配标签 → `REASON_LABEL[k]` 直接 KeyError 炸在报告里。"""
+    codes = {ae.NO_BRAND, ae.NO_CATEGORY, ae.NO_LEAD, ae.NO_CHANNEL,
+             ae.NO_ROOM, ae.NO_QUOTA, ae.NO_STORE}
+    assert set(ae.REASON_LABEL) == codes
+    assert len({ae.REASON_LABEL[c] for c in codes}) == len(codes)   # 标签不重样

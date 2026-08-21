@@ -149,10 +149,13 @@ def test_upc_sync_workflow_projection(monkeypatch):
 # ── 定价 ─────────────────────────────────────────────────────────────────────
 
 def test_price_bands_overlap_prefers_lower():
-    # 所有者定稿:FBA 0-30/30-75,FBM 15-80/80-1000;边界/重叠向下兼容
+    # 所有者定稿:FBA 0-30/30-1000,FBM 15-80/80-1000;边界/重叠向下兼容
     assert pricing.pick_band("FBA", 30) == "fba_range1"      # 30 用低区间
     assert pricing.pick_band("FBA", 30.01) == "fba_range2"
-    assert pricing.pick_band("FBA", 76) is None              # 出界(走默认倍率)
+    # 2026-08-21 所有者把 FBA 区间2 上界从 75 抬到 1000:76 此前出界走 300%,
+    # 现在吃 fba区间2 的倍率(该店没配那一格就变成不定价——见下面那条用例)
+    assert pricing.pick_band("FBA", 76) == "fba_range2"
+    assert pricing.pick_band("FBA", 1001) is None            # 出界(走默认倍率)
     assert pricing.pick_band("FBM", 80) == "fbm_range1"
     assert pricing.pick_band("FBM", 14) is None
     assert pricing.pick_band("FBM", 999) == "fbm_range2"
@@ -206,13 +209,30 @@ def test_out_of_band_falls_back_to_default_multiplier():
     """所有者定稿 2026-08-09:价格出界按 300% 定价,不再淘汰。"""
     mults = {"fba_range1": "275%", "fbm_range1": "200%"}
     assert pricing.OUT_OF_BAND_MULTIPLIER == 3.0
-    assert pricing.walmart_price("FBA", 200, mults, 0) == 600.0  # FBA 上界 75 外
+    assert pricing.walmart_price("FBA", 2000, mults, 0) == 6000.0  # FBA 上界 1000 外
     assert pricing.walmart_price("FBM", 10, mults, 0) == 30.0     # FBM 下界 15 外
     assert pricing.walmart_price("FBM", 2000, mults, 0) == 6000.0
     # 出界不查表:该店一个倍率都没配也照样出价
-    assert pricing.walmart_price("FBA", 200, {}, 0) == 600.0
+    assert pricing.walmart_price("FBA", 2000, {}, 0) == 6000.0
     # 在区间内但倍率没配 → 仍返 None(配置缺失不该拿默认值蒙混)
     assert pricing.walmart_price("FBA", 10, {}, 0) is None
+
+
+def test_fba_band2_upper_bound_moved_to_1000():
+    """2026-08-21 所有者:FBA 区间2 上界 75 → 1000。
+
+    **换版的代价钉在这里**:75~1000 这一段此前出界、走 300% 兜底照样出价;
+    现在它落进 fba区间2,该店那一格没填就变成**不定价**(上架不上、维护不改)。
+    这是"配置缺失不拿默认值蒙混"的正确表现,但换版当天会多出一批跳过,
+    别把它当成故障——去限额表把 fba区间2 填上就是了。
+    """
+    assert pricing.PRICE_BANDS["FBA"] == [(0, 30, "fba_range1"),
+                                          (30, 1000, "fba_range2")]
+    配了 = {"fba_range1": "275%", "fba_range2": "250%"}
+    没配 = {"fba_range1": "275%"}
+    assert pricing.walmart_price("FBA", 200, 配了, 0) == 500.0   # 200×250%
+    assert pricing.walmart_price("FBA", 200, 没配, 0) is None    # ← 换版的代价
+    assert pricing.walmart_price("FBA", 2000, 没配, 0) == 6000.0  # 1000 外仍兜底
 
 
 # ── 上架先注入 UPC(所有者定稿 2026-08-16)+ feed 闭环审计的两处修复 ──────────

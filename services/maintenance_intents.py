@@ -470,7 +470,7 @@ def price_intents(conn, multipliers: dict[str, dict],
     新价 = services.pricing.walmart_price(**落地价(amz 现价 + 运费)** × 该店
     对应区间倍率),
     与上架用的是**同一套定价规则**(避免上架价与维护价两套口径)。
-    区间按**配送方式**分两套(FBA 0-30/30-75、FBM 15-80/80-1000),配送方式
+    区间按**配送方式**分两套(FBA 0-30/30-1000、FBM 15-80/80-1000),配送方式
     取 latest_snapshot 的 raw.is_fba(采集侧 parser 读 buybox 的 Ships from);
     **未知则不改价**——猜错一档就是拿错倍率改线上价。
     出界按 300% 兜底(所有者定稿 2026-08-09);只有**区间内倍率未配置**

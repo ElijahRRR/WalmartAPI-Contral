@@ -936,16 +936,18 @@ class _CountConn:
         return self.cur
 
 
-def test_rerule_head_says_how_many_are_left():
-    """摘要只说"候选 500"时看不出**是刚好 500 还是撞了 limit**。
+def test_batch_head_says_how_many_are_left():
+    """摘要只说"候选 200"时看不出**是刚好 200 还是撞了 limit**。
 
-    所有者 2026-08-17 首轮 dry-run 实遇:limit 缺省就是 500,而误杀规模正是他
-    决定要不要真跑的唯一依据。与 `_claim_from_sheet` 同款纪律。
+    两次实遇:2026-08-17 rerule 首轮 dry-run(limit 缺省 500,误杀规模是
+    要不要真跑的唯一依据);2026-08-21 mode=nonpass —— 所有者:「nonpass 的
+    看不出来有多少个呢?」。要跑几轮、要花多少钱全靠这个总量。
     """
     conn = _CountConn(3200)
-    head = product_audit._rerule_head(conn, "phase0_forbidden_category",
-                                      "p.audit_status = 'rejected'",
-                                      {"rerule": "x", "rerule_ver": "v"}, 500)
+    head = product_audit._batch_head(conn, "定点重审 rerule=x",
+                                     "p.audit_status = 'rejected'",
+                                     {"rerule": "x", "rerule_ver": "v"}, 500,
+                                     "规则码拼错?")
     assert "共 3200 个" in head[0]
     assert "只判 500 个,还剩 2700 个" in head[1]
     # 计数与取候选必须同一 where,否则"还剩多少"是另一件事的数
@@ -953,11 +955,11 @@ def test_rerule_head_says_how_many_are_left():
     assert "LIMIT" not in conn.cur.sql
 
     # 撞不到上限时不该出现"还剩"那行(它会让人以为没跑完)
-    assert len(product_audit._rerule_head(
-        _CountConn(12), "r", "w", {}, 500)) == 1
-    # 一个都没有:多半是规则码拼错,得说出来而不是静静报"候选 0"
-    assert "拼错" in product_audit._rerule_head(
-        _CountConn(0), "r", "w", {}, 500)[1]
+    assert len(product_audit._batch_head(
+        _CountConn(12), "w", "w", {}, 500, "hint")) == 1
+    # 一个都没有:得说出可能的原因,而不是静静报"候选 0"
+    assert "拼错" in product_audit._batch_head(
+        _CountConn(0), "w", "w", {}, 500, "规则码拼错?")[1]
 
 
 def test_is_forced_exempts_rerule_but_not_from_sheet():
@@ -1494,3 +1496,26 @@ def test_llm_cost_falls_back_to_miss_price_when_split_absent():
                "cache_hit": 0, "cache_miss": 0}
     assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
             == llm_cost.cost_of("deepseek-v4-flash", "peak", split))
+
+
+def test_llm_cost_small_amounts_keep_enough_digits():
+    """固定两位小数在这里等于没报(2026-08-21 所有者实遇)。
+
+    一轮 200 条的抽样常常只花几厘钱,`:.2f` 打出来就是 `$0.00` ——
+    而"拿抽样推整轮预算"正是这行字存在的唯一理由,推不出来就白记了。
+    """
+    from services import llm_cost
+
+    row = {"calls": 9, "prompt": 70_000, "completion": 1_400,
+           "cache_hit": 64_400, "cache_miss": 5_600}
+    out = "\n".join(llm_cost.summarize(
+        {("deepseek-v4-flash", "audit_l3", "peak"): row}, items=200))
+    import re as _re
+    # 金额不能被四舍五入成正好 $0.00(后面还跟着位数的 $0.0052 才是要的)
+    assert not _re.search(r"\$0\.00(?!\d)", out), out
+    assert "/ 千条" in out          # 抽样直接给出可外推的单价
+    # 大额仍按两位小数,不会变成一串小数点后的噪声
+    big = {"calls": 1, "prompt": 0, "completion": 100_000_000,
+           "cache_hit": 0, "cache_miss": 0}
+    assert "$132.00" in "\n".join(llm_cost.summarize(
+        {("deepseek-v4-flash", "audit_l3", "peak"): big}))

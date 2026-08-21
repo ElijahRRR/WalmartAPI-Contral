@@ -21,6 +21,21 @@ from registry import resources
 _M = 1_000_000
 
 
+def _money(usd: float) -> str:
+    """输入:金额 → 输出:带**足够有效位**的字符串。
+
+    ⚠ 固定两位小数在这里等于没报:一轮 200 条的抽样常常只花几厘钱,
+    打出来就是 `$0.00` —— 而"拿抽样推整轮预算"正是这行字存在的唯一理由
+    (所有者 2026-08-21 实遇:合计与两个用途全是 $0.00,推不出任何东西)。
+    小额自动加位到能看出量级为止。
+    """
+    if usd >= 0.01:
+        return f"${usd:.2f}"
+    if usd >= 0.0001:
+        return f"${usd:.4f}"
+    return f"${usd:.6f}" if usd else "$0"
+
+
 def cost_of(model: str, tier: str, row: dict) -> float | None:
     """输入:模型 + 时段 + 一行用量计数 → 输出:USD 金额,或 None(该模型无计价)。
 
@@ -39,11 +54,13 @@ def cost_of(model: str, tier: str, row: dict) -> float | None:
             + row.get("completion", 0) * p_out) / _M
 
 
-def summarize(usage_stats: dict) -> list[str]:
-    """输入:api.llm.USAGE_STATS → 输出:摘要行列表(空用量返回空列表)。
+def summarize(usage_stats: dict, items: int = 0) -> list[str]:
+    """输入:api.llm.USAGE_STATS(+本轮判定条数)→ 输出:摘要行列表。
 
     按**用途**汇总(L1 rerank / L3 语义 / 上架映射各花多少),这是换模型时
     真正要看的维度;单价与峰谷只在总额里体现。
+    `items` 非零时额外折算**每千条**单价 —— 抽样跑一轮就是为了推整轮预算,
+    不给这个数就得让人自己拿两个都被四舍五入过的数字对除。
     """
     if not usage_stats:
         return []
@@ -69,13 +86,15 @@ def summarize(usage_stats: dict) -> list[str]:
     for purpose, a in sorted(by_purpose.items()):
         hit, miss = a["cache_hit"], a["cache_miss"]
         cache = f",缓存命中 {hit / (hit + miss):.0%}" if (hit + miss) else ""
-        money = (f" ≈ ${a['cost']:.2f}"
+        money = (f" ≈ {_money(a['cost'])}"
                  if not (a["models"] & unpriced) else "(该模型无计价)")
         lines.append(
             f"  {purpose}:调用 {a['calls']} 次,"
             f"入 {a['prompt'] / _M:.2f}M / 出 {a['completion'] / _M:.2f}M token"
             f"{cache}{money}")
-    head = (f"LLM 用量合计 ≈ ${total_cost:.2f}"
+    per_k = (f",合 {_money(total_cost / items * 1000)} / 千条"
+             if items and total_cost else "")
+    head = (f"LLM 用量合计 ≈ {_money(total_cost)}{per_k}"
             if total_cost else "LLM 用量(无可计价模型)")
     if legacy:
         # 停用日期已过还在用 = 随时可能整条链一起挂,且不会提前预警

@@ -317,7 +317,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     return _DEFAULT_CANDIDATE, {}
 
 
-# 定点重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+# 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
 _RERULE_COUNT_SQL = """
 SELECT count(*) FROM catalog.products p
 WHERE p.marketplace = %(marketplace)s AND ({where})
@@ -325,27 +325,28 @@ WHERE p.marketplace = %(marketplace)s AND ({where})
 """
 
 
-def _rerule_head(conn, rule: str, where: str, extra: dict,
-                 limit: int) -> list[str]:
-    """输入:连接 + 规则码 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
+def _batch_head(conn, what: str, where: str, extra: dict,
+                limit: int, empty_hint: str) -> list[str]:
+    """输入:连接 + 这批是什么 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
 
-    没有这一行的话,摘要只会说"候选 500",而 500 正是 limit ——**看不出是刚好
-    500 个还是撞了上限**(所有者 2026-08-17 首轮 dry-run 实遇)。误杀规模是他
-    决定要不要真跑的唯一依据,必须报出来。与 `_claim_from_sheet` 同款纪律。
+    没有这一行的话,摘要只会说"候选 200",而 200 正是 limit ——**看不出是刚好
+    200 个还是撞了上限**(所有者 2026-08-17 用 rerule 首轮 dry-run 实遇;
+    2026-08-21 用 mode=nonpass 又遇一次:「nonpass 的看不出来有多少个呢?」)。
+    要跑几轮、要花多少钱,全靠这个总量,必须报出来。
+    与 `_claim_from_sheet` 同款纪律。
     """
     with conn.cursor() as cur:
         cur.execute(_RERULE_COUNT_SQL.format(where=where),
                     {"marketplace": "US", **extra})
         total = int(cur.fetchone()[0])
-    head = [f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 rejected**、"
-            f"且未按当前规则版本判过的,共 {total} 个"]
+    head = [f"{what},共 {total} 个"]
     if total > limit:
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
                     f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
                     f"再跑一次接着判(或 -p limit=N 加大)")
     if not total:
-        head.append("  (一个都没有:规则码拼错?或这批已经全部按当前版本判过了)")
+        head.append(f"  ({empty_hint})")
     return head
 
 
@@ -967,9 +968,21 @@ def run(params: dict) -> str:
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
             else _RECENT_RUN_GUARD
-        if str(params.get("rerule", "")).strip():
-            sheet_head = _rerule_head(conn, params["rerule"].strip(),
-                                      where, extra, limit) + sheet_head
+        rule_ = str(params.get("rerule", "")).strip()
+        mode_ = str(params.get("mode", "")).strip()
+        if rule_:
+            sheet_head = _batch_head(
+                conn, f"定点重审 rerule={rule_}:命中过该规则且**现结论仍是 "
+                      f"rejected**、且未按当前规则版本判过的",
+                where, extra, limit,
+                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了") \
+                + sheet_head
+        elif mode_ == "nonpass":
+            sheet_head = _batch_head(
+                conn, "非 pass 全量重判:rejected + pending + 未审过、"
+                      "且未按当前规则版本判过的",
+                where, extra, limit,
+                "一个都没有:这批已经全部按当前版本判过了") + sheet_head
         with conn.cursor() as cur:
             cur.execute(_CANDIDATE_SQL.format(where=where,
                                               recent_guard=guard),
@@ -1197,7 +1210,7 @@ def run(params: dict) -> str:
     # usage 只在响应里存在一次,不当场记就永远没了
     from services import llm_cost as _cost
     from api import llm as _llm2
-    lines.extend(_cost.summarize(_llm2.USAGE_STATS))
+    lines.extend(_cost.summarize(_llm2.USAGE_STATS, items=judged))
     # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
     retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
     # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者

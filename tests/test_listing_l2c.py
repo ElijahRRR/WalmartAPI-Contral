@@ -299,3 +299,30 @@ def test_legacy_alias_is_priced_and_called_out():
         {("deepseek-chat", "audit_l3", "peak"): row}))
     assert "已宣布停用的旧别名" in out and "deepseek-v4-flash" in out
     assert "无计价" not in out          # 别名不该再报"无计价"
+
+
+def test_cache_key_folds_alias_but_still_separates_real_models(monkeypatch):
+    """键里必须有 model,但**换标签不算换模型**(2026-08-21 所有者提问)。
+
+    · 不含 model = "换了模型还吃旧模型的出参",而且不报错 —— 换模型多半正是
+      为了换答案质量,拿旧答案顶上把这件事整个抵消掉;
+    · 但 deepseek-chat 只是 deepseek-v4-flash(非思考)的旧别名,**同一个模型**。
+      不折叠的话,缺省值从别名改成正式名的那一刻存量缓存全废、下一轮全额重付;
+    · deepseek-reasoner 是**思考模式**,行为不同,**必须**另分键空间 ——
+      计价可以合并(同一张价表),缓存身份不行。
+    """
+    from registry import resources
+    from services import llm_cache
+
+    m = [{"role": "user", "content": "映射"}]
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    k_alias = llm_cache.cache_key(m, 0.2, 4096)
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    assert llm_cache.cache_key(m, 0.2, 4096) == k_alias      # 同一个模型,同一个键
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    assert llm_cache.cache_key(m, 0.2, 4096) != k_alias      # 真换模型,换键空间
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+    assert llm_cache.cache_key(m, 0.2, 4096) != k_alias      # 思考模式,不许共用
+    # 折叠只影响缓存身份,不影响计价:reasoner 仍走 v4-flash 那张价表
+    assert resources.llm_priced_model("deepseek-reasoner") == "deepseek-v4-flash"
+    assert resources.llm_cache_model("deepseek-reasoner") == "deepseek-reasoner"

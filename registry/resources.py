@@ -600,6 +600,28 @@ def llm_priced_model(model: str) -> str:
     return LLM_MODEL_ALIASES.get(model, model)
 
 
+# ── llm_cache 键空间锚点(2026-08-21)──────────────────────────────────────
+# 缓存键里**必须**含模型(换模型 = 换答案,不含就等于"换了模型还在吃旧模型的
+# 出参"且不报错),但**换个标签不算换模型**。
+#
+# `deepseek-chat` 与 `deepseek-v4-flash`(+ thinking disabled)是**同一个模型
+# 的同一个模式**——前者只是后者的旧别名。所以它俩必须共用一个键空间,
+# 否则把缺省值从别名改成正式名的那一刻,存量缓存全部作废、下一轮全额重付。
+#
+# ⚠ 锚点故意锚在**历史用过的那个串**上:键是哈希,存量行是按 'deepseek-chat'
+#   算出来的,想让它们继续命中就只能沿用这个串。它只是哈希输入,**永远不会
+#   发给接口**,别名被官方下线也不影响。
+# ⚠ `deepseek-reasoner` **不在这里** —— 它是 v4-flash 的**思考模式**,
+#   与非思考模式是两种输出行为,共用键空间就是拿思考模式的答案冒充非思考的。
+#   计价可以合并(同一张价表),缓存身份不行。
+LLM_CACHE_ANCHOR = {"deepseek-v4-flash": "deepseek-chat"}
+
+
+def llm_cache_model(model: str) -> str:
+    """输入:请求里发的 model → 输出:缓存键里用的模型身份串。"""
+    return LLM_CACHE_ANCHOR.get(model, model)
+
+
 def llm_price_tier(dt) -> str:
     """输入:带时区的 datetime → 输出:'peak' 或 'offpeak'。
 

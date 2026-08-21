@@ -112,7 +112,8 @@ def test_risk_sync_workflow(monkeypatch):
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: 2)
     monkeypatch.setattr(feishu, "sheet_values",
                         lambda s, rng: sheets_data[s.sheet_id])
-    conn = _Conn(fetch_seq=[[("Cups", "禁售", "")], [("nike",)]])
+    # 第一个 [] 是**变更比对**读的现有 pt_meta(空表 = 这次全是 added)
+    conn = _Conn(fetch_seq=[[], [("Cups", "禁售", "")], [("nike",)]])
     from registry import db as _db
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([conn])))
@@ -122,6 +123,11 @@ def test_risk_sync_workflow(monkeypatch):
     # 同一份数据的第二个消费方:审核两道闸只查 walmart_pt_meta,
     # 它此前是死快照没人同步(所有者 2026-08-17 实遇飞书删了库里还在)
     assert "walmart_pt_meta:全量重灌 1 行" in out
+    # ⚡ 判据变更必须报出来:"重灌了 N 行"这句每次都一样,改没改看不出来。
+    # 2026-08-21 的教训就是这个 —— 所有者手改完类目表,系统一声不吭,
+    # 直到 `-p rerule=` 报「共 0 个」才发现没有通道可走
+    assert "判据变了 1 个 PT" in out and "added 1" in out
+    assert "pt_meta_change_log" in out
     assert "品牌表:读 1 行,入库 1" in out
     # 摘要必须说清是**沃尔玛 PT**、查的哪张表(2026-08-21:原文「禁售类目 N 个」
     # 紧跟在「黑名单亚马逊类目 223 条」后面,所有者当场把两个数当成一件事)

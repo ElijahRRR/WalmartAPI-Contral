@@ -293,7 +293,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 C~G;缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 E 列为空的**一律重判**(库里已有结论的也重判,不是回填)——飞书类目表改过之后翻存量走这条;领任务口径不变,E 列已填结论的表行仍然不领 |
+| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 C~G;缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 E 列为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |

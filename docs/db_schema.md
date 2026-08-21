@@ -551,6 +551,7 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 | `walmart_error_records` | 错误商品日报 97k 行(precision 证据 + 实证类目反哺源) | audit_import 搬入;增量同步链批次 B 定 |
 | `walmart_pt_meta` / `walmart_pt_spec` / `walmart_prohibited_policy` | PT 元数据 7033 / 官方 spec 摘要 6942 / 禁售政策 43 类 | ⚠ 反推表(旧仓无 DDL):列类型按 sync 脚本推定,audit_import dry-run 与生产实表对照后才准导入 |
 | `audit_runs` / `audit_hits` | 逐次审核结论 + 逐条规则命中(reject 永久短路的依据) | audit_import 搬历史;product_audit 批次 B 起追加 |
+| `pt_meta_change_log` | **PT 判据变更台账**(2026-08-21 加,只追加):`sync_pt_meta` 每次全量重灌**前**逐 PT 比对 `access_state` / `zh_can_do` / `requirements` 三列,只落真变了的(前后值都记)。存在的理由:飞书类目表一改,R1 准入闸与 R3 认证闸的判据整批换掉,而 `products.audit_version` 是**仓库侧**的规则版本号,不会因为数据变了而递增 —— 于是 `rerule` / `mode=nonpass` 那两条带版本谓词的通道对数据变更完全无感(所有者 2026-08-21 实遇:全量扫过一遍之后双双报「共 0 个」)。有了它,`product_audit -p repts=1` 按`changed_at > products.audited_at` 精确取候选,既不依赖版本号也不用人记得加开关 | risk_sync(每次重灌时写) |
 
 **历史实证 PT 不设边表**(所有者定稿 2026-08-13):PT 是产品属性,直接回填
 `catalog.products.walmart_pt`(pt_backfill 工作流:删除历史 error_items

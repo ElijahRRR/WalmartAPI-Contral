@@ -705,3 +705,29 @@ def test_gap_batch_jumps_the_queue_and_says_so_when_it_cannot(monkeypatch):
     monkeypatch.setattr(pa.scrape_batches, "prioritize", lambda n, b: False)
     out2 = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
     assert "插队没成功" in out2 and "可能等不到" in out2
+
+
+def test_repts_takes_candidates_by_judgement_change_not_by_version():
+    """⚠ `-p repts=1` **不看 `audit_version`** —— 那正是它存在的理由。
+
+    `rerule` / `mode=nonpass` 的候选谓词都带
+    `audit_version IS DISTINCT FROM <当前版本>`(天然分页),而**飞书数据变了
+    不会递增仓库侧的规则版本号**。所有者 2026-08-21 手改类目表后实遇:全量扫过
+    一遍之后库里每条都盖着当前版本,两条通道双双报「共 0 个」,没有任何现成
+    路径能重判受影响的存量。
+    """
+    where, extra = pa._pick_where({"repts": "1"})
+    assert extra == {}
+    assert "audit_version" not in where            # ← 这条是全部要点
+    assert "pt_meta_change_log" in where
+    # 锚在时间上:判过的 audited_at 会推到变更之后,自动退出候选(分页照样有)
+    assert "c.changed_at > p.audited_at" in where
+    # 只翻**现结论 rejected** 的;从没审过的归 mode=backfill,混进来会把
+    # "补刷"和"翻案"两件事的数搅在一起
+    assert "p.audit_status = 'rejected'" in where
+    assert "p.audited_at IS NOT NULL" in where
+
+
+def test_repts_is_a_named_human_action_so_it_skips_the_24h_guard():
+    """与 rerule / force 同类:人点名要审的,点了就得审。"""
+    assert pa._is_forced({"repts": "1"}, {}) is True

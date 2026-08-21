@@ -55,8 +55,50 @@ def _int_or_none(v):
 _PT_META_SHRINK_TOLERANCE = 0.2
 
 
-def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int]:
-    """输入:连接 + 类目表行(同 sync_product_types 的那份)→ 输出:(入库数, 净减数)。
+# R1 准入闸 / R3 认证闸真正读的三列。**只比这三列**:别的列(类目名、字段数、
+# 备注)改了不影响任何一条判定,记进变更台账只会让"要重判多少"这个数虚高,
+# 而那个数是所有者决定跑不跑的唯一依据。
+_JUDGED_COLS = (("access_state", "admit_status"),
+                ("zh_can_do", "cn_seller"),
+                ("requirements", "cert_required"))
+
+
+def _diff_pt_meta(cur, rows: list[dict]) -> list[tuple]:
+    """输入:游标 + 新行 → 输出:变更台账待插入行(**只含判据真的变了的 PT**)。
+
+    ⚠ 必须在 TRUNCATE **之前**调 —— 之后旧值就没了。
+
+    空值归一到 `''` 再比:飞书空单元格读出来有时是 None 有时是空串,不归一的话
+    每次同步都会报一堆"变了"的假阳性,而假阳性会把"要重判 M 条"这个数撑爆,
+    人看两次就不看了。
+    """
+    def _norm(v):
+        return (v or "").strip()
+
+    cur.execute("SELECT walmart_product_type, access_state, zh_can_do, "
+                "requirements FROM audit.walmart_pt_meta")
+    old = {r[0]: (_norm(r[1]), _norm(r[2]), _norm(r[3])) for r in cur.fetchall()}
+    out = []
+    seen = set()
+    for r in rows:
+        pt = r["product_type"]
+        seen.add(pt)
+        new = tuple(_norm(r.get(src)) for _, src in _JUDGED_COLS)
+        was = old.get(pt)
+        if was is None:
+            out.append((pt, "added", None, new[0], None, new[1], None, new[2]))
+        elif was != new:
+            out.append((pt, "changed", was[0], new[0], was[1], new[1],
+                        was[2], new[2]))
+    for pt, was in old.items():
+        if pt not in seen:
+            # 删行同样是判据变更:R1 的两条 pending 分支正是"PT 不在 pt_meta"
+            out.append((pt, "removed", was[0], None, was[1], None, was[2], None))
+    return out
+
+
+def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int, list[tuple]]:
+    """输入:连接 + 类目表行(同 sync_product_types 的那份)→ 输出:(入库数, 净减数, 变更行)。
 
     ⚠ **全量重灌,不是 upsert** —— 这正是所有者 2026-08-17 撞上的坑:
     「飞书表格里面的已废弃我已经删掉了。但是重新拉以后还是存在」。
@@ -74,6 +116,14 @@ def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int]:
 
     骤缩护栏:比库里现有行数少超 20% 就拒绝重灌 —— 飞书表删几行是常态,
     删掉一半必是读漏/读错(与 `risk_sync._mirror` 同款纪律)。
+
+    ★ **顺带落变更台账**(2026-08-21):重灌前逐 PT 比对 R1/R3 真正读的三列,
+    只把变了的写进 `audit.pt_meta_change_log`。这是"飞书数据变了"这条失效信号
+    的落点 —— 在此之前它根本没接上:`products.audit_version` 是仓库侧的规则
+    版本号,飞书改表不会让它动,于是 `rerule` / `mode=nonpass` 那两条带版本
+    谓词的通道对数据变更完全无感(所有者 2026-08-21 实遇:全量扫过一遍之后
+    两条通道双双报「共 0 个」)。有了台账,`product_audit -p repts=1` 就能按
+    "PT 的判据在我判过之后变过"精确取候选。
     """
     rows = [r for r in rows if r.get("product_type")]
     if not rows:
@@ -87,6 +137,7 @@ def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int]:
                 f"类目表只读到 {len(rows)} 行,库里现有 {before} 行,"
                 f"少了 {before - len(rows)} 行(超 "
                 f"{_PT_META_SHRINK_TOLERANCE:.0%})——拒绝重灌,先核实飞书表")
+        changes = _diff_pt_meta(cur, rows)      # ⚠ 必须在 TRUNCATE 之前
         cur.execute("TRUNCATE audit.walmart_pt_meta")
         cur.executemany(
             "INSERT INTO audit.walmart_pt_meta "
@@ -100,7 +151,13 @@ def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int]:
               _int_or_none(r.get("field_total")),
               _int_or_none(r.get("field_required")),
               r.get("field_list")) for r in rows])
-    return len(rows), max(0, before - len(rows))
+        if changes:
+            cur.executemany(
+                "INSERT INTO audit.pt_meta_change_log "
+                "(walmart_product_type, change_kind, before_access, "
+                " after_access, before_zh, after_zh, before_req, after_req) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", changes)
+    return len(rows), max(0, before - len(rows)), changes
 
 
 def sync_brands(conn, rows: list[dict]) -> int:

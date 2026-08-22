@@ -731,8 +731,11 @@ def test_needs_human_is_only_the_store_name_tier():
     所有者定稿 2026-08-15 晚:只有落到**店名**才是真打平(拿字典序当经营
     决策),那一级才需要人眼。
     """
-    assert sv.NEEDS_HUMAN == ("按店名",)
+    assert sv.LADDER[4] in sv.NEEDS_HUMAN
     assert sv.LADDER[3] == "按在线件数" and sv.LADDER[3] not in sv.NEEDS_HUMAN
+    # 阶梯里只有「按店名」那一级需要人;另一条(2026-08-22 加的)不是阶梯,
+    # 是"判出来的结论与已落的占用矛盾" —— 占用只能人来撤
+    assert set(sv.NEEDS_HUMAN) - {sv.CLAIM_STUCK} == {"按店名"}
 
 
 def test_store_gmv_comes_from_orders_not_from_what_is_still_online():

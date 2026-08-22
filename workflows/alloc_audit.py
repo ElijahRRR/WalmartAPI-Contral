@@ -66,7 +66,7 @@ from collections import Counter
 
 from registry import db, paths, resources
 from services import alloc_survey as sv
-from services import sku_asin, store_targets, stores as stores_svc
+from services import claims, sku_asin, store_targets, stores as stores_svc
 from services import textfmt
 
 DANGEROUS = False
@@ -140,6 +140,17 @@ def run(params: dict) -> str:
         cfg = store_targets.load_targets()
     except Exception as e:                    # noqa: BLE001
         cfg_err = str(e)
+    # ★ 已有占用(2026-08-22)。冲突判定必须先看它 —— 占用是**决策**不是观测,
+    #   报告拿销量把一个已经有主的品牌判给别人,人照做就会"货下了、品牌还锁着"。
+    #   ⚠ 读不到时**不静默退回销量阶梯**:那正是会给出相反建议的那条路,
+    #     报告要显式说"本轮没看占用"。
+    held, held_err = None, None
+    try:
+        with db.pg_conn() as _c:
+            held = {"同品牌": claims.load_active(_c, claims.BRAND),
+                    "同 ASIN": claims.load_active(_c, claims.PRODUCT)}
+    except Exception as e:                    # noqa: BLE001
+        held_err = str(e)
 
     # 冻结行(不在营店的在线行)不进冲突分析——纪律 1
     frozen = ({s for s in prof_all if s not in registered}
@@ -181,8 +192,9 @@ def run(params: dict) -> str:
     metrics = sv.store_metrics(claim_rows, sales)
     conflicts = {}
     for tag, field in (("同 ASIN", "asin"), ("同品牌", "brand_key")):
-        conflicts[tag] = sv.resolve_conflicts(claim_rows, sales, field,
-                                              metrics, cfg)
+        conflicts[tag] = sv.resolve_conflicts(
+            claim_rows, sales, field, metrics, cfg,
+            held=held.get(tag) if held else None)
     # ⚠ 「碎不碎」按**品类层**数(2026-08-22)。按 26 类数的实测后果:
     # 47 家有货店里 41 家"超 2 大类",而它们绝大多数只是 Home + Hardlines
     # 两个品类 —— 报出来的是一份所有者无从下手的名单,因为闸根本不按 26 类判
@@ -322,6 +334,27 @@ def run(params: dict) -> str:
                          f"{k.removeprefix('按')} {v}"
                          for k, v in by_level.most_common(3))))
     L += ["", "▍冲突(只算规划内店铺)"] + textfmt.grid(body)
+    if held_err:
+        L.append(f"  ⚠ **占用台账读不到({held_err}):本轮没看占用**,上面全是"
+                 f"按销量阶梯判的。已经有主的品牌可能被判给别人 —— "
+                 f"**先修好再照着做**")
+    elif held is not None:
+        n_held = sum(len(v) for v in held.values())
+        stuck = [x for tag in ("同 ASIN", "同品牌")
+                 for x in conflicts[tag] if x[4] == sv.CLAIM_STUCK]
+        by_claim = sum(1 for tag in ("同 ASIN", "同品牌")
+                       for x in conflicts[tag] if x[4] == sv.BY_CLAIM)
+        if not n_held:
+            L.append("  占用台账是**空的**(还没跑过 alloc_backfill),"
+                     "所以这一轮全按销量阶梯判 —— 回填之后重跑,结论可能变")
+        else:
+            L.append(f"  占用台账 {n_held:,} 条:其中 {by_claim} 组**按占用定**"
+                     f"(不看销量,占用是决策不是观测)")
+        if stuck:
+            L.append(f"  ⚠ **{len(stuck)} 组占用站不住**:占用店手上的货踩了"
+                     f"类目/渠道闸。报告**不替你改判给第二名** —— 那等于绕过"
+                     f"store_release 撤一条不可逆的决策。先释放再重跑:"
+                     + "、".join(f"{x[1]}:{x[0]}" for x in stuck[:4]))
     if not sales:
         # 销量全空时阶梯必然一路降到"在线件数/店名",那是打平不是判定。
         # 不说破的话,csv 里每行都写着判定依据,看起来像是真判过了
@@ -475,12 +508,17 @@ def run(params: dict) -> str:
             # 保留它**全部**的行、输家下架它**全部**的行,各店 SKU 数不一样,
             # 所以保留数与下架数**本来就不相等**(所有者 2026-08-15 晚按 1:1
             # 对不上而质疑)。把分组摊在每一行上,这件事就不用解释了
-            ["冲突键", "组内店铺数", "组内行数", "保留店", "判定依据",
+            # 「已有占用」单独一列而不是只靠「判定依据」:阶梯判的组也要看得出
+            # 它**确实没有占用**,而不是"我们没查"(空列有歧义,所以读不到占用
+            # 时整列写「(本轮没读到)」)
+            ["冲突键", "组内店铺数", "组内行数", "已有占用", "保留店", "判定依据",
              "店铺", "SKU", "ASIN",
              f"近{sales_days}天单量", "该商品销售额", "该店该大类销售额",
              "该店整体销售额", "处置"],
-            [(key, len({d[0] for d in detail}), len(detail), keep, level,
-              s2, sku, asin, o, g, cg, sg, verdict)
+            [(key, len({d[0] for d in detail}), len(detail),
+              ("(本轮没读到)" if held is None
+               else (held[tag].get(key) or "(无)")),
+              keep, level, s2, sku, asin, o, g, cg, sg, verdict)
              for key, keep, _, detail, level in conflicts[tag]
              for s2, sku, asin, o, g, cg, sg, verdict in detail]))
 

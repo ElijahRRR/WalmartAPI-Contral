@@ -709,11 +709,13 @@ LLM_PURPOSE_ENV = {
 # 这是沃尔玛自己的商品部门划分,坐在 `Walmart Category`(库里 26 个值)**之上**。
 #
 # ⚠ **两层都在用,别混**:附 A.1(2026-08-07)拍的「大类目 = Walmart Category」
-# 是**下层**,分配链的类目闸至今按它判;所有者心智里的"大类"是**上层**。
+# 是**下层**(库里 26 个值,产品侧的事实);所有者心智里的"大类"是**上层**。
 # 2026-08-21 实测这个差异不是术语出入 —— 按下层判,品牌组内的少数派件
 # 156,188 件(全池 24.2%)会被锁死在做不了那个大类的店里;折到上层判是
-# 105,571 件(16.3%)。**类目闸切不切上层仍未决**(Q1),本表先登记,
-# 让报告两个口径都说得出来。
+# 105,571 件(16.3%)。
+# **Q1 已拍板(2026-08-21):类目闸判上层。** 见 `store_targets.allowed`。
+# 下层不作废 —— 它仍是产品侧的事实来源,报告要拿它当佐证(说"缺 Home 品类"
+# 而不说是哪几个 26 类,所有者没法照着去开类目)。
 #
 # 归类由所有者 2026-08-21 逐条拍板,其中四条是他当天点名回的:
 #   Musical Instruments   → ETS
@@ -724,6 +726,17 @@ LLM_PURPOSE_ENV = {
 # 落在 `store_targets.allowed` 已有的两条规则上(「三列全空 = 不限制」+
 # 「归不到大类的,受限店拒收」),所以映成 None 就够了,不需要任何新逻辑。
 WALMART_SUPER_CATEGORIES = ("Fashion", "ETS", "Home", "FCHW", "Hardlines")
+
+# 「不归五品类」那一桶的**显示名与可填名**(所有者 2026-08-22:建议列要
+# 「填写 5 大类和其他」)。它是限额表「类目1/2/3」里的**一等值** —— 填了
+# 「其他」的店就是"专收归不到五品类的货"那种店。
+# ⚠ 有它之前,「其他」填进表里会把店废掉:折完是空集 ⇒ 按「填了就只准入填的
+# 那几个」判 ⇒ 谁也接不了。所以出建议之前必须先让它可填,否则那份建议
+# 是照着做就出事的。
+SUPER_OTHER = "其他"
+
+# 限额表「类目1/2/3」三列的**可填值全集**(建议列只从这里出)。
+SUPER_BUCKETS = (*WALMART_SUPER_CATEGORIES, SUPER_OTHER)
 
 # Walmart Category → 五大品类;**不在表里 = 归不到**(与映成 None 同义)。
 _SUPER_CATEGORY_OF = {
@@ -740,15 +753,61 @@ _SUPER_CATEGORY_OF = {
     # Safety & Emergency / Everything Else 刻意不列 —— 见上面「不归」那条
 }
 
+# 那两个**是**合法的 Walmart Category,只是不归五品类。单列出来是因为
+# 「认不认得这个填写值」与「归不归得到品类」是两个问题:把它们判成"认不出"
+# 会让 alloc_audit 去点名两个其实填得对的值,人就学会忽略那一栏了。
+_UNMAPPED_CATEGORIES = ("Safety & Emergency", "Everything Else")
+
+# 库里 26 个 `Walmart Category` 的全集(24 个有映射 + 上面两个不归)。
+WALMART_CATEGORIES = tuple(sorted(_SUPER_CATEGORY_OF)) + _UNMAPPED_CATEGORIES
+
 
 def super_category(category: str | None) -> str | None:
-    """输入:Walmart Category → 输出:五大品类之一,或 None(不归任何品类)。
+    """输入:Walmart Category → 输出:五大品类之一,或 None(**归不到**)。
 
-    None 有确切含义,不是"查不到":这类货**只能分给没有确定类目的店**
-    (所有者 2026-08-21)。调用方不许把 None 兜成某个默认品类 —— 那会把
-    "谁都能收"变成"某一家专收",正好反了。
+    ⚠ **闸门与报告都不要用这个,用 `super_bucket`。** 这一支只回答一个
+    很窄的问题:"这个 26 类映得到五品类吗" —— 它给 `Everything Else` 和
+    一个拼错的字符串**同样的 None**,分不清"业务上归不到"与"根本不认得"。
+    2026-08-22 之前闸门用的就是它,后果是填「其他」的店被折成空集而废掉。
+    现存的正当用途只有一处:`tests/test_alloc_registry` 拿它盘点**哪些 26 类
+    还没映射**(换成 `super_bucket` 那条测试就永远绿了,盘不出漏项)。
     """
     return _SUPER_CATEGORY_OF.get((category or "").strip())
+
+
+def super_bucket(category: str | None) -> str | None:
+    """输入:Walmart Category(或已经是品类名/「其他」)→ 输出:
+    五大品类之一 / `SUPER_OTHER`;**真·未知(空值)仍返回 None**。
+
+    与 `super_category` 的分工 —— 这是**总函数**版本,给闸门与报告用:
+    把"归不到"从 `None` 折成一个能显示、能填表、能进集合的值。
+
+    ⚠ **空 ≠ 其他,这条不许合并。** 「其他」是"我们知道它属于 Safety &
+    Emergency / Everything Else 这类"(一条业务归类);空是"我们不知道它
+    属于哪类"(一条数据缺口)。合并的后果:填了「其他」的店会开始收**大类
+    采不到**的货 —— 而那批货的处置是补采集,不是分给谁。`category_offenders`
+    也正是靠这条区分才没把"不知道"当成"违规"。
+
+    ⚠ **认不出的字面量也归「其他」**,不再像原来那样被静默丢掉。丢掉时
+    表里一个拼写错误会让店变成"填了但空集 = 谁也接不了";归「其他」则是
+    "只收归不到的货"。两种都不对,但后者不会静默把一家店废掉,而且
+    `alloc_audit` 会把认不出的值单独点名(见 `known_category_literal`)。
+    """
+    cat = (category or "").strip()
+    if not cat:
+        return None
+    return _SUPER_CATEGORY_OF.get(cat, SUPER_OTHER)
+
+
+def known_category_literal(value: str | None) -> bool:
+    """输入:限额表「类目1/2/3」里的一个填写值 → 输出:这个值认不认得。
+
+    认得的三种:26 个 `Walmart Category` 之一、五大品类之一、或「其他」。
+    认不出的会被 `super_bucket` 折进「其他」——**不报出来就是静默改变准入**,
+    所以 `alloc_audit` 必须逐店点名(拼写错、旧类目名、随手写的中文都在此列)。
+    """
+    v = (value or "").strip()
+    return bool(v) and (v in WALMART_CATEGORIES or v in SUPER_BUCKETS)
 
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或

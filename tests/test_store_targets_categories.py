@@ -31,23 +31,60 @@ def test_allowed_filled_admits_only_the_super_categories_listed():
     assert st.allowed(row, "Toys") is False           # ETS,没填
 
 
-def test_a_store_that_filled_only_unmapped_categories_admits_nothing():
-    """⚠ 填了类目、但填的全是「不归」的那两类 → 折完是空集。
+def test_a_store_that_filled_other_becomes_the_store_that_takes_other():
+    """★ 2026-08-22 改口径:填「其他」的店 = **专收归不到五品类的货**。
 
-    **不许因为空集就当成"没填 = 不限制"** —— 那是把最严的店误读成最松的店,
-    一批本该只去无类目店的货会全灌给它,而占用撤不回。
+    改之前这三种填法都折成空集 ⇒ 按「填了就只准入填的那几个」判 ⇒ 谁也
+    接不了,一家店被静默废掉 —— 而所有者要的建议列正是「填写 5 大类和其他」,
+    照着填就会踩这个坑。所以出建议之前先让它可填。
     """
-    row = _cfg(["Safety & Emergency", "Everything Else"])
-    assert st.super_categories_of(row) == set()
-    assert st.allowed(row, "Home") is False
-    assert st.allowed(row, "Safety & Emergency") is False   # 它自己也不收
+    for row in (_cfg(["其他"]), _cfg(["Safety & Emergency"]),
+                _cfg(["Everything Else"])):
+        assert st.super_categories_of(row) == {"其他"}
+        assert st.allowed(row, "Safety & Emergency") is True
+        assert st.allowed(row, "Everything Else") is True
+        assert st.allowed(row, "Home") is False          # 五品类的货照旧拒
 
 
-def test_unmapped_goods_go_only_to_stores_with_no_category_set():
-    """「不归」的两类只能去**没有确定类目**的店(所有者 2026-08-21 原话)。"""
+def test_other_store_still_rejects_goods_whose_category_is_unknown():
+    """⚠ **空 ≠ 其他,这条不许合并。**
+
+    「其他」是业务归类(处置:找一家收「其他」的店);大类采不到是数据缺口
+    (处置:补采集)。合并会让填了「其他」的店开始收一批**我们根本不知道
+    是什么**的货,而且 `category_offenders` 那条"不知道不算违规"也会跟着塌。
+    """
+    row = _cfg(["其他"])
+    assert st.allowed(row, None) is False
+    assert st.allowed(row, "") is False
+
+
+def test_unmapped_goods_go_to_no_category_stores_or_to_other_stores():
+    """「不归」的两类能去**没填类目**的店,也能去**明确填了「其他」**的店。
+
+    所有者 2026-08-21 原话是「不归,可以分配给没有确定类目的店」——
+    那是"可以给没填的店",不是"只能给没填的店"(2026-08-22 补开后一条)。
+    """
     for cat in ("Safety & Emergency", "Everything Else"):
-        assert st.allowed(_cfg([]), cat) is True        # 没填类目的店:收
-        assert st.allowed(_cfg(["Home"]), cat) is False  # 填了的:一律拒
+        assert st.allowed(_cfg([]), cat) is True          # 没填类目的店:收
+        assert st.allowed(_cfg(["其他"]), cat) is True     # 明确填「其他」:收
+        assert st.allowed(_cfg(["Home"]), cat) is False   # 填了别的:一律拒
+
+
+def test_an_unrecognised_literal_folds_into_other_not_into_nothing():
+    """表里写错字(「Hoem」)折进「其他」,而不是被丢掉变成空集。
+
+    两种都不对,但丢掉会**静默废掉一家店**;折进「其他」只是让它收错一批货,
+    而且 `alloc_audit` 会拿 `known_category_literal` 把这个值点名出来。
+    这条测试同时是那条点名的理由 —— 没有点名,这就成了静默改准入。
+    """
+    from registry import resources
+    row = _cfg(["Hoem"])
+    assert st.super_categories_of(row) == {"其他"}
+    assert st.allowed(row, "Home") is False
+    assert resources.known_category_literal("Hoem") is False
+    assert resources.known_category_literal("Home") is True
+    assert resources.known_category_literal("其他") is True
+    assert resources.known_category_literal("Everything Else") is True
 
 
 def test_allowed_restricted_store_rejects_unclassified():

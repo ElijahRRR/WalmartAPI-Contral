@@ -58,10 +58,10 @@ HEADROOM = 1.5
 # 都查不到 —— 头部是所有者真正会翻的那一段。
 QUEUE_SAMPLE = 2000
 
-# 五品类映射之外的那两个大类(Safety & Emergency / Everything Else)在画像里
-# 单占一个桶。它们**不是漏填**:所有者 2026-08-21 定的口径是"只能分给没有
-# 确定类目的店",并进别的品类等于把"谁都能收"算成"某一家专收"。
-NOT_SUPER = "(不归五品类)"
+# 归不到五品类的那一桶在画像里的名字 —— 直接用 registry 的常量,不另起一个。
+# 2026-08-22 之前这里自造了「(不归五品类)」,而所有者管它叫「其他」并且要
+# 能填进限额表:同一个桶两个名字,报告说的和表里填的对不上。
+NOT_SUPER = resources.SUPER_OTHER
 
 # 当前在线数(容量闸的分子)。⚠ 口径与 `alloc_stores._SQL_ONLINE_NOW`、
 # KPI 表的 items_online 逐字一致(不筛 lifecycle)—— 三处必须同源,否则
@@ -662,8 +662,12 @@ def _in_reach(cands: list, reach: dict) -> tuple[list, list]:
             bad["配送天数没采到(补一次采集就能进池)"] += 1
         elif cap is not None and int(lead) > int(cap):
             bad[f"配送超 {int(cap)} 天(各店限制里最宽的那个)"] += 1
-        elif cats is not None and resources.super_category(c.get("category")) not in cats:
-            bad[f"品类 {resources.super_category(c.get('category')) or '归不到'}"] += 1
+        elif cats is not None and resources.super_bucket(c.get("category")) not in cats:
+            # ⚠ 与 `store_targets.allowed` 同一个折法(`super_bucket`)。
+            # 这里用 `super_category` 的实测后果:填了「其他」的店在 allowed
+            # 那边收得了 Everything Else,池口却把它当"归不到"筛掉 —— 那家店
+            # 于是永远等不到它唯一能收的那批货,而且报告说的是"品类 归不到"
+            bad[f"品类 {resources.super_bucket(c.get('category')) or '大类未知'}"] += 1
         else:
             kept.append(c)
     return kept, bad.most_common()
@@ -736,9 +740,10 @@ def _brand_profile(free: list, directed: list) -> tuple[list, list]:
     ⚠ 两个口径都要报。26 类是代码现行判据,五品类是所有者心智里的大类
     (§11.6),两者差着约 5 万件 —— 只报一个,"折到上层能救回多少"这个问题
     就问不出来。
-    ⚠ `super_category` 返回 None 是**口径不是漏填**(Safety & Emergency /
-    Everything Else 只能分给没有确定类目的店),所以单列一个桶,不许并进别处
-    —— 并进去等于把"谁都能收"算成"某一家专收",正好反了。
+    ⚠ 归不到五品类的(Safety & Emergency / Everything Else)单列
+    `resources.SUPER_OTHER`「其他」这一桶,不许并进别处 —— 并进去等于把
+    "谁都能收"算成"某一家专收",正好反了。名字取自 registry:它同时是
+    限额表里**可填**的值,报告与表格必须是同一个词。
     ⚠ 组大类不在这里重算:26 类那个直接用 `alloc_groups.build` 定的
     `g["category"]`,五品类那个走同一个 `_major`(并列按值定序)。画像与发牌
     对不上同一个组大类,这份画像就是假的。
@@ -749,7 +754,9 @@ def _brand_profile(free: list, directed: list) -> tuple[list, list]:
            [g for g in directed if not g["brand"]]
 
     def _super(cat) -> str:
-        return resources.super_category(cat) or NOT_SUPER
+        # 走 `super_bucket`(与闸门同一个折法);它对空值回 None,
+        # 而画像里"大类采不到"也该单独看得见,所以这里再兜一次
+        return resources.super_bucket(cat) or NOT_SUPER
 
     buckets = (("1 件", 1, 1), ("2–5 件", 2, 5), ("6–20 件", 6, 20),
                ("21–100 件", 21, 100), ("100 件以上", 101, 10 ** 9))

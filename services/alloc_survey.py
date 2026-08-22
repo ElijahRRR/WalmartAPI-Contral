@@ -348,12 +348,31 @@ def store_profiles(rows):
 
 
 def real_cats(p) -> list:
-    """输入:店铺画像 → 输出:真实大类名列表(剔除未归类占位)。
+    """输入:店铺画像 → 输出:真实**大类**名列表(26 类,剔除未归类占位)。
 
     筛选/排序/展示三处共用同一个定义——曾经三处各写一遍表达式,
     排序把"(未归类)"也数进去,截断后最碎的店反而被挤出样例。
+
+    ⚠ 这是**下层**(26 类)。判"这家店碎不碎"要用 `real_supers` ——
+    类目闸判的是品类层,拿 26 类数去说"超 2 大类"会报出一批其实只做
+    Home+Hardlines 的店(§A.5 已认:那一层「一店最多两大类」几乎失效)。
     """
     return [c for c in p["categories"] if c != UNCLASSIFIED]
+
+
+def real_supers(p) -> list:
+    """输入:店铺画像 → 输出:真实**品类**名列表(五大品类 + 「其他」,去重)。
+
+    「这家店做几个品类」的唯一算法(2026-08-22)。与 `real_cats` 的分工:
+    那个是产品侧事实(26 类),这个是**闸门看见的东西**。报告里凡是要与
+    准入配置对照的地方一律用这个 —— 两边不同层地比,人永远看不懂为什么。
+    """
+    seen = []
+    for c in real_cats(p):
+        b = resources.super_bucket(c)
+        if b and b not in seen:
+            seen.append(b)
+    return seen
 
 
 def channel_mismatch(prof, cfg):
@@ -382,12 +401,30 @@ def _fmt_counter(c: Counter, top=4) -> str:
 
 
 def suggest_categories(prof, cfg, top=2):
-    """输入:店铺画像 + 配置 → 输出:[(店, 建议类目列表, 在线件数分布, 已填值)]。
+    """输入:店铺画像 + 配置 → 输出:每店一个 dict(见下)。
 
     所有者口径(2026-08-15):**超 2 类目的店保留在线数量最多的两类**。
     本函数只出建议,不写任何地方——所有者填进飞书「类目1/2/3」三列,
-    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍"填的 vs
-    实际最多的"是否一致。
+    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍。
+
+    ★ **2026-08-22 改在品类层出建议**(所有者:建议列要「填写 5 大类和其他」)。
+    改的理由不是好看:类目闸判的就是品类层(`store_targets.allowed`,Q1),
+    出 26 类的建议等于**让所有者照着填一份闸门不按它判的东西** —— 他填
+    「Home」+「Furniture」以为开了两类,闸看见的是同一个 Home,实际只开了一类。
+    对拍那一栏更糟:拿 26 类原文去比品类建议,永远显示"不一致"。
+
+    ⚠ 26 类**不作废**,同时回传当佐证:只说"建议 Hardlines"而不说它是由
+    Home Improvement 218 件 + Garden & Patio 96 件堆出来的,所有者没法判断
+    这个建议是不是合理。判据用上层,证据给下层。
+
+    每店一个 dict:
+      store        店名
+      suggest      建议填进三列的值(品类层,含「其他」),最多 `top` 个
+      by_super     [(品类, 件数)] 降序 —— 建议的直接依据
+      by_category  [(26 类, 件数)] 降序 —— 佐证
+      filled       表格已填原文
+      filled_super 已填值折成品类(对拍用的就是这个)
+      unknown      已填值里**认不出**的那些(拼写错/旧类目名/随手写的中文)
     """
     out = []
     for store, p in sorted(prof.items()):
@@ -395,8 +432,24 @@ def suggest_categories(prof, cfg, top=2):
                   if c != UNCLASSIFIED]
         if not ranked:
             continue
-        out.append((store, [c for c, _ in ranked[:top]], ranked,
-                    list((cfg.get(store) or {}).get("categories") or [])))
+        sup: Counter = Counter()
+        for c, n in ranked:
+            sup[resources.super_bucket(c) or UNCLASSIFIED] += n
+        # 「未归类」不该出现在这里(上面已按 UNCLASSIFIED 过滤过 26 类),
+        # 但真出现了也不许进建议 —— 那是数据缺口,不是一个可填的类目
+        by_super = [(k, v) for k, v in sup.most_common() if k != UNCLASSIFIED]
+        filled = list((cfg.get(store) or {}).get("categories") or [])
+        out.append({
+            "store": store,
+            "suggest": [k for k, _ in by_super[:top]],
+            "by_super": by_super,
+            "by_category": ranked,
+            "filled": filled,
+            "filled_super": sorted(store_targets.super_categories_of(
+                {"categories": filled})),
+            "unknown": [v for v in filled
+                        if not resources.known_category_literal(v)],
+        })
     return out
 
 

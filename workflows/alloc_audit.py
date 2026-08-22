@@ -62,7 +62,7 @@ import csv
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_survey as sv
 from services import sku_asin, store_targets, stores as stores_svc
 from services import textfmt
@@ -181,8 +181,11 @@ def run(params: dict) -> str:
     for tag, field in (("同 ASIN", "asin"), ("同品牌", "brand_key")):
         conflicts[tag] = sv.resolve_conflicts(claim_rows, sales, field,
                                               metrics, cfg)
-    over = sorted(((s, p) for s, p in prof.items() if len(sv.real_cats(p)) > 2),
-                  key=lambda x: (-len(sv.real_cats(x[1])), -x[1]["n"], x[0]))
+    # ⚠ 「碎不碎」按**品类层**数(2026-08-22)。按 26 类数的实测后果:
+    # 47 家有货店里 41 家"超 2 大类",而它们绝大多数只是 Home + Hardlines
+    # 两个品类 —— 报出来的是一份所有者无从下手的名单,因为闸根本不按 26 类判
+    over = sorted(((s, p) for s, p in prof.items() if len(sv.real_supers(p)) > 2),
+                  key=lambda x: (-len(sv.real_supers(x[1])), -x[1]["n"], x[0]))
     # 渠道:没取渠道就没有结论。算出来必是 0,而"不符 0 件"读起来正好像
     # 全店合规 —— 这一节必须显式说"本轮没查",不能拿 0 冒充结论
     can_channel = bool(cfg) and with_channel
@@ -329,8 +332,9 @@ def run(params: dict) -> str:
     # ── ▍店铺 ──
     body = []
     if over:
-        body.append(("超 2 大类", f"{len(over)} 家", "最碎:" + "、".join(
-            f"{s}({len(sv.real_cats(p))} 类)" for s, p in over[:3])))
+        body.append(("超 2 品类", f"{len(over)} 家", "最碎:" + "、".join(
+            f"{s}({len(sv.real_supers(p))} 品类 / {len(sv.real_cats(p))} 个 26 类)"
+            for s, p in over[:3])))
     if non_active:
         body.append(("非 ACTIVE", f"{len(non_active)} 家",
                      "SUSPENDED,**占用按设计保持不动**;"
@@ -383,15 +387,26 @@ def run(params: dict) -> str:
     files = []
     if cfg is not None and not cfg_err:
         sug = sv.suggest_categories(prof, cfg)
+        # ⚠ 建议出在**品类层**(所有者 2026-08-22)——闸判的就是这一层。
+        # 出 26 类的建议 = 让所有者照着填一份闸门不按它判的东西:填
+        # 「Home」+「Furniture」以为开了两类,闸看见的是同一个 Home。
+        # 26 类留在最后一列当**佐证**:只说"建议 Hardlines"而不说它是
+        # Home Improvement 218 + Garden & Patio 96 堆出来的,他没法判合不合理
         files.append(_write_csv(
             "alloc_类目建议.csv",
-            ["店铺", "在线大类数", "建议类目(在线数top2)", "表格已填", "对拍",
-             "在线大类分布"],
-            [(s, len(rk), "|".join(top), "|".join(filled),
-              "一致" if set(filled) == set(top) else ("未填" if not filled
-                                                      else "不一致"),
-              "; ".join(f"{c}×{x}" for c, x in rk[:8]))
-             for s, top, rk, filled in sug]))
+            ["店铺", "在线品类数", "建议类目分类(填这一列)", "表格已填",
+             "表格已填(折品类)", "对拍", "认不出的填写值",
+             "在线品类分布", "在线大类分布(26类,佐证)"],
+            [(r["store"], len(r["by_super"]), "|".join(r["suggest"]),
+              "|".join(r["filled"]), "|".join(r["filled_super"]),
+              # 对拍在**品类层**比:拿 26 类原文去比品类建议,永远"不一致"
+              ("未填" if not r["filled"] else
+               "一致" if set(r["filled_super"]) == set(r["suggest"])
+               else "不一致"),
+              "|".join(r["unknown"]),
+              "; ".join(f"{c}×{x}" for c, x in r["by_super"]),
+              "; ".join(f"{c}×{x}" for c, x in r["by_category"][:8]))
+             for r in sug]))
     if can_channel:
         # ⚠ 只在真查过渠道时才写这份。`-p channel=0` 时 offenders 必空,照写
         # 会把上一轮跑出来的下架清单覆盖成空表 —— 所有者照着空表下架 = 什么
@@ -402,19 +417,27 @@ def run(params: dict) -> str:
             [(r["store"], cfg[r["store"]]["channel"], r["sku"], r["asin"] or "",
               r["channel"], r["category"] or "", r["pt"] or "")
              for r in offenders]))
+        # ⚠ 两侧都同时给**原文与折后**四列。只给原文的实测后果:所有者看到
+        # 「准入 Furniture / 商品 Home Improvement」问不出为什么不符 —— 他得
+        # 自己在脑子里折一遍才对得上闸的判断。判据在品类层,清单就得把品类摆出来
         files.append(_write_csv(
             "alloc_类目不符下架清单.csv",
-            ["店铺", "准入类目", "商品大类", "SKU", "ASIN", "PT", "渠道"],
+            ["店铺", "准入类目(表格原文)", "准入品类", "商品大类(26类)",
+             "商品品类", "SKU", "ASIN", "PT", "渠道"],
             [(r["store"], "|".join(cfg[r["store"]]["categories"]),
-              r["category"], r["sku"], r["asin"] or "", r["pt"] or "",
-              r["channel"])
+              "|".join(sorted(store_targets.super_categories_of(
+                  cfg[r["store"]]))),
+              r["category"],
+              resources.super_bucket(r["category"]) or "(大类未知)",
+              r["sku"], r["asin"] or "", r["pt"] or "", r["channel"])
              for r in cat_bad]))
     # 店铺总览:逐店明细一次给全,控制台只留计数
     _ACCEPT = {True: "是", False: "否(填了0)", None: "(未填)"}
     files.append(_write_csv(
         "alloc_店铺总览.csv",
         ["店铺", "占用内", "参与分配", "单店最大在线数", "在线数", "已发布",
-         "大类数", "前3大类", "渠道限制", "渠道不符件数", "准入类目",
+         "品类数", "在售品类", "大类数(26类)", "前3大类(26类)",
+         "渠道限制", "渠道不符件数", "准入类目", "准入品类",
          "店铺状态", "缺配置列", "近窗销售额"],
         [(s,
           # 「占用内」= 它的在线商品占不占货位。与「参与分配」是两回事:
@@ -425,12 +448,18 @@ def run(params: dict) -> str:
           _ACCEPT[store_targets.accepts_allocation(cfg.get(s))] if cfg else "",
           "" if (cfg.get(s) or {}).get("max_online") is None
              else int(cfg[s]["max_online"]),
-          p["n"], p["published"], len(sv.real_cats(p)),
+          p["n"], p["published"],
+          len(sv.real_supers(p)), "|".join(sv.real_supers(p)),
+          len(sv.real_cats(p)),
           "; ".join(f"{c}×{x}" for c, x in p["categories"].most_common(3)
                     if c != sv.UNCLASSIFIED),
           (cfg.get(s) or {}).get("channel") or "",
           next((m[2] for m in mism if m[0] == s), 0),
           "|".join((cfg.get(s) or {}).get("categories") or []),
+          # 准入品类:闸真正看见的东西。与左边一列并排,人才能一眼看出
+          # 「填了 Home + Furniture」其实只开了一个 Home
+          "|".join(sorted(store_targets.super_categories_of(cfg.get(s))))
+          if cfg else "",
           status.get(s) or "(无KPI)",
           "/".join(miss_cfg.get(s, [])),
           round((metrics[0].get(s) or {}).get("gmv", 0.0), 2))

@@ -71,16 +71,35 @@ def sort_images(urls: list) -> list[str]:
     return list(dict.fromkeys(str(u) for u in urls or [] if u))
 
 
-def apply_images(attrs: dict, urls: list) -> dict:
-    """输入:Visible 属性 + 图片 URL → 输出:写好图片字段的属性。"""
+def secondary_min(spec: dict | None) -> int:
+    """输入:PT spec → 输出:副图下限(该 PT 的 minItems;没写按 1)。
+
+    **唯一出处**:apply_images 与素材闸(material_gap)问同一个数,
+    否则又是"一处写死一处读表"。没有 minItems 时按 1:字段有值就比没有强。
+    """
+    return int((((spec or {}).get("properties") or {})
+                .get("productSecondaryImageURL") or {}).get("minItems") or 1)
+
+
+def apply_images(attrs: dict, urls: list, spec: dict | None = None) -> dict:
+    """输入:Visible 属性 + 图片 URL(+该 PT 的 spec)→ 输出:写好图片字段的属性。
+
+    ⚠ 副图下限**按该 PT 的 minItems 取,不写死**(2026-08-22 生产实证):
+    在用的 62 个 PT 里副图 minItems 是 1/2/3/4,**一个 5 都没有**;写死 5
+    的那版把 34/112 条**素材完全够**的行删成"必填缺失"——字段被 pop 掉,
+    而它在那些 PT 里是必填,于是本地 validate 必拒。与 keyFeatures 当年
+    写死 4 是同一个坑(见 force_amazon_copy 头注),这次一并按 spec 取。
+    """
     imgs = sort_images(urls)
     if not imgs:
         return attrs
     attrs["mainImageUrl"] = imgs[0]
     secondary = imgs[1:9]
-    if len(secondary) >= 5:      # schema minItems=5:不足整个字段不写
+    if len(secondary) >= secondary_min(spec):
         attrs["productSecondaryImageURL"] = secondary
     else:
+        # 不足该 PT 的 minItems:整个字段不写(必填的话由 validate 拦下,
+        # 选填的话少一个字段照样能上)
         attrs.pop("productSecondaryImageURL", None)
     return attrs
 
@@ -111,40 +130,78 @@ def scrub_brand(text: str, brands: list[str]) -> str:
     return re.sub(r"\s+([,.;:])", r"\1", out)
 
 
+# HTML 标签(采集侧的 description 有一部分是详情页原样 HTML)。
+# ⚠ 不剥的话标签会**原样进 keyFeatures / shortDescription 发到线上**:
+# 2026-08-22 实证有 `<p>…</p><ul><li>…` 整段被当成一条卖点(那次因为只凑出
+# 1 条被拦下,卖点本来就有 2 条的行就直接发出去了)。
+_HTML_TAG = re.compile(r"<[^<>]{0,200}>")
+
+
 def _clean_copy(value, brands: list[str]) -> str:
-    """输入:原始文案 → 输出:去品牌 + 去项目符号 + 折叠空白后的单行文本。"""
+    """输入:原始文案 → 输出:去品牌 + 去标签 + 去项目符号 + 折叠空白的单行文本。"""
     if value is None:
         return ""
     text = scrub_brand(str(value), brands).strip()
+    text = _HTML_TAG.sub(" ", text)
     text = re.sub(r"[•·▪▫]+", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _sentences(text: str, brands: list[str]) -> list[str]:
-    """输入:长文本 → 输出:可当卖点用的句子(≥25 字符;句号切不动就按长度切)。"""
+def _sentences(text: str, brands: list[str], want: int = 4) -> list[str]:
+    """输入:长文本(+想要几条)→ 输出:可当卖点用的句子(≥25 字符)。
+
+    `want` 只影响**切不动时**的按长度切块:块长按 `len/want` 自适应并夹在
+    60~200 字符之间。写死 120 的那版对 200 字左右的描述只切得出 2 条,
+    而 keyFeatures 的门槛是 3~4 条 —— 差一条和差十条一样上不了架。
+    """
     text = _clean_copy(text, brands)
     if not text:
         return []
     # 英文标点要求后随空白(防 "12.5 in" 被切开);中日文标点自带停顿,不要求
-    parts = [p.strip() for p in re.split(r"(?:\n+|[.;!?]\s+|[。;!?、])", text)
-             if len(p.strip()) >= 25]
-    if parts:
+    raw = [p.strip() for p in re.split(r"(?:\n+|[.;!?]\s+|[。;!?、])", text)
+           if len(p.strip()) >= 10]
+    parts = [p for p in raw if len(p) >= 25]     # 够长的句子优先
+    if len(parts) >= max(2, int(want or 4)):
         return parts
+    if len(raw) >= max(2, int(want or 4)):
+        # 长句不够条数,把 10~25 字符的短句按原序掺回来:
+        # "Rust proof." 这种是**真句子**,当卖点比按长度硬切的半截强
+        return raw
+    if len(parts) >= 2:
+        return parts
+    # ⚠ 只切出**一段** = 这段文本没有句读(规格表折行 / HTML / 中文连写),
+    # 必须往下走按长度切块。旧版这里写的是 `if parts: return parts` ——
+    # 整段原样返回、切块兜底成了死代码,于是再长的描述也只补得出一条,
+    # keyFeatures 的 3 条门槛永远过不去(2026-08-22 实证 11/112 行栽在这)。
     words = text.split()
-    if len(words) >= 24:
+    want = max(2, int(want or 4))
+    size = min(200, max(40, len(text) // want))   # 自适应块长(下限 40 字符)
+    # 闸改成"够不够切出两块"(旧版是词数 ≥24):一段 139 字符的详情页文案
+    # 只有 23 个词,旧闸不放行 → 整段原样成一条 → 3 条的门槛差一条过不去。
+    # 无空格文本(中文连写)split 后只有一个词,下面自然只出一块,不硬切字符。
+    if len(text) >= size * 2:
+        cap = max(4, want)
         chunks, cur = [], []
         for w in words:
             cur.append(w)
-            if len(" ".join(cur)) >= 120:
+            if len(" ".join(cur)) >= size:
                 chunks.append(" ".join(cur))
                 cur = []
-                if len(chunks) >= 4:
+                if len(chunks) >= cap:
                     break
-        if cur and len(chunks) < 4:
-            chunks.append(" ".join(cur))
+        tail = " ".join(cur)
+        if tail:
+            # 尾巴够长才单独成条;太短就并回上一块 —— 8 个字符的碎片当卖点
+            # 发上线是内容事故,而 Walmart 不会因为"短"报错
+            if len(tail) >= 25 and len(chunks) < cap:
+                chunks.append(tail)
+            elif chunks:
+                chunks[-1] = f"{chunks[-1]} {tail}"
+            else:
+                chunks.append(tail)
         if chunks:
             return chunks
-    return [text] if len(text) >= 10 else []
+    return parts or ([text] if len(text) >= 10 else [])
 
 
 def force_amazon_copy(attrs: dict, product: dict,
@@ -189,7 +246,7 @@ def force_amazon_copy(attrs: dict, product: dict,
             cleaned.append(c[:500])
     if len(cleaned) < min_features:     # 拆句补齐(少于 minItems 会被拒)
         for text in cleaned + [long_text, title]:
-            for p in _sentences(text, brands):
+            for p in _sentences(text, brands, want=min_features):
                 if p not in cleaned:
                     cleaned.append(p[:500])
                 if len(cleaned) >= min_features:
@@ -206,6 +263,36 @@ def force_amazon_copy(attrs: dict, product: dict,
     if paragraph:
         attrs["shortDescription"] = paragraph[:4000]
     return attrs
+
+
+def material_gap(spec: dict | None, product: dict) -> str | None:
+    """输入:PT spec + 产品数据 → 输出:素材凑不够必填数组的原因(够则 None)。
+
+    只查两项:`keyFeatures` 与 `productSecondaryImageURL` —— 它们**全由系统
+    从采集数据生成**(SYSTEM_OWNED_FIELDS 会把 LLM 写的这两项一律丢掉),
+    所以在取数这一步就能定论,用的还是 `mp_conform.validate` 的同一组数字,
+    结论不可能与它相左。
+
+    为什么要提前判(2026-08-22 实证):这两样不够的行一路走到预备期才被
+    validate 拦下,代价是**白打一次 LLM、白占一个当天配额名额**(配额切片
+    在预备期之前),而素材是产品的固定属性 —— 这批行天天重来、天天白烧。
+    结论完全一样(都是不上架),只是早说、说清楚、不花钱。
+    """
+    props, req = (spec or {}).get("properties") or {}, \
+        set((spec or {}).get("required") or [])
+    if "keyFeatures" in req:
+        need = int((props.get("keyFeatures") or {}).get("minItems") or 4)
+        got = len(force_amazon_copy({}, product, min_features=need)
+                  .get("keyFeatures") or [])
+        if got < need:
+            return (f"卖点凑不够:{got} 条 < 该类目需 {need} 条"
+                    f"(亚马逊卖点与描述都补不出来)")
+    if "productSecondaryImageURL" in req:
+        need = secondary_min(spec)
+        got = max(0, len(sort_images(product.get("images"))) - 1)
+        if got < need:
+            return f"副图不够:{got} 张 < 该类目需 {need} 张(主图另算)"
+    return None
 
 
 def _enum_of(spec: dict | None, field: str) -> list | None:
@@ -269,7 +356,7 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     if "manufacturer" in attrs:
         attrs["manufacturer"] = clamp(attrs["manufacturer"], 60)
     attrs["brand"] = FORCE_BRAND
-    return apply_images(attrs, images or [])
+    return apply_images(attrs, images or [], spec)
 
 
 def _field_block(name: str, meta: dict, required: bool) -> dict:

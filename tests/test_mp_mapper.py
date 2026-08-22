@@ -80,17 +80,101 @@ def test_visible_text_clamps():
     assert len(out["manufacturer"]) == 60
 
 
-def test_images_keep_amazon_order_and_min_five_secondary():
-    # 保序去重(2026-08-12 旧仓对照):主图=亚马逊原序第一张,不再字典序;
-    # secondary 不足 5 张整个字段不写(schema minItems=5)
+def test_images_keep_amazon_order_and_secondary_min_follows_spec():
+    """保序去重(2026-08-12 旧仓对照):主图=亚马逊原序第一张,不再字典序。
+
+    副图下限**跟该 PT 的 minItems 走**(2026-08-22):写死 5 那版把素材完全
+    够的行删成"必填缺失"——生产实证 62 个在用 PT 的副图 minItems 是 1/2/3/4,
+    **一个 5 都没有**,于是 34/112 条是被自己判死的。spec 缺省按 1 张。
+    """
     a = m.finalize_visible("Cups", {}, None,
                            images=["u9", "u1", "u5", "u3", "u9"])
     assert a["mainImageUrl"] == "u9"                         # 原序第一张=主图
-    assert "productSecondaryImageURL" not in a               # 只有 3 张 secondary
+    assert a["productSecondaryImageURL"] == ["u1", "u5", "u3"]   # 无 spec:1 张即可
     b = m.finalize_visible("Cups", {}, None,
                            images=[f"u{i}" for i in range(7, 0, -1)])   # 7 张倒序
     assert b["mainImageUrl"] == "u7"
     assert b["productSecondaryImageURL"] == ["u6", "u5", "u4", "u3", "u2", "u1"]
+
+
+def test_secondary_images_respect_per_pt_min_items():
+    """够不够按该 PT 的 minItems 判:3 张副图在 minItems=3 的类目要留下,
+    在 minItems=5 的类目才删掉。判据只有 secondary_min 一处。"""
+    imgs = ["main", "s1", "s2", "s3"]                        # 主图 1 + 副图 3
+    spec3 = {"properties": {"productSecondaryImageURL": {"minItems": 3}}}
+    spec5 = {"properties": {"productSecondaryImageURL": {"minItems": 5}}}
+    assert m.secondary_min(spec3) == 3 and m.secondary_min(None) == 1
+    assert m.apply_images({}, imgs, spec3)["productSecondaryImageURL"] == \
+        ["s1", "s2", "s3"]
+    assert "productSecondaryImageURL" not in m.apply_images({}, imgs, spec5)
+
+
+def test_key_features_padding_survives_punctuationless_text():
+    """描述切不动时也要凑够条数(2026-08-22 实证 11/112 行栽在这)。
+
+    旧版 `_sentences` 里 `if parts: return parts` —— 没有句读的文本被
+    re.split 原样吐回**一整段**(非空),于是按长度切块的兜底成了死代码,
+    再长的描述也只补得出一条,3 条的门槛永远过不去。三种真实形态:
+    规格表折行(无句号)、详情页 HTML、长短句混排。
+    """
+    specs = {"properties": {"keyFeatures": {"minItems": 3}}}
+    def kf(desc, need=3):
+        return m.finalize_visible(
+            "Cups", {}, specs,
+            product={"title": "ACME Steel Widget", "brand": "ACME",
+                     "attrs": {"bullet_points": [], "description": desc}}
+        ).get("keyFeatures") or []
+
+    flat = ("Color Black Size 10 inch Weight 2 pounds Material aluminum alloy "
+            "Package includes one unit and a user manual Compatible with most "
+            "standard mounts Suitable for indoor and outdoor use Warranty one year")
+    assert len(kf(flat)) >= 3                     # 无句号:按长度切块
+
+    html = ("<p>Durable powder coated finish resists scratches over time</p>"
+            "<ul><li>Holds up to 40 pounds of weight safely</li>"
+            "<li>Mounts in minutes with the included hardware</li></ul>")
+    got = kf(html)
+    assert len(got) >= 3
+    # ⚠ 标签必须剥掉:带着 <p>/<li> 发上线是内容事故,而它不会报错
+    assert not any("<" in g for g in got)
+
+    mixed = ("Made of durable stainless steel for long lasting use. Rust proof. "
+             "The handle is ergonomic and comfortable to grip during work. "
+             "Easy to clean. Fits most standard fittings sold in the US market.")
+    got = kf(mixed)
+    assert len(got) >= 3
+    # 长句不够条数时掺回 10~25 字符的**真句子**,好过按长度硬切半截
+    assert any(g.startswith("Rust proof") for g in kf(mixed))
+
+    # 真没料的照旧凑不够 —— 那批归素材闸拦,不是这里的活
+    assert len(kf("A small clip")) < 3
+
+
+def test_material_gap_speaks_the_pt_numbers():
+    """素材闸:够不够按该 PT 的 minItems 判,理由说人话(不是字段名)。
+
+    判据与 mp_conform.validate 同一组数字 —— 结论不可能相左,提前判只是把
+    "白打一次 LLM、白占一个配额名额"省掉(配额切片在预备期之前)。
+    """
+    spec = {"required": ["keyFeatures", "productSecondaryImageURL"],
+            "properties": {"keyFeatures": {"minItems": 3},
+                           "productSecondaryImageURL": {"minItems": 2}}}
+    rich = {"bullet_points": [f"Bullet {i} describing this widget in detail"
+                              for i in range(5)], "description": "D" * 400}
+    ok = {"title": "Steel Widget", "attrs": rich,
+          "images": ["main", "s1", "s2"]}
+    assert m.material_gap(spec, ok) is None
+
+    thin_img = {**ok, "images": ["main", "s1"]}          # 副图 1 < 2
+    assert "副图不够:1 张 < 该类目需 2 张" in m.material_gap(spec, thin_img)
+
+    thin_kf = {**ok, "attrs": {"bullet_points": ["one"], "description": ""}}
+    assert "卖点凑不够" in m.material_gap(spec, thin_kf)
+
+    # 选填就不拦:字段少一个照样能上架
+    optional = {"properties": spec["properties"]}
+    assert m.material_gap(optional, thin_img) is None
+    assert m.material_gap(None, thin_kf) is None
 
 
 def test_assemble_mp_item_shape():

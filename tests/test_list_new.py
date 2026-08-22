@@ -286,6 +286,53 @@ def test_quota_slices_after_filters(monkeypatch):
     assert "超配额 1" in out             # 超额的是第二个幸存者,不是被淘汰行
 
 
+def test_material_gate_drops_before_llm_and_quota(monkeypatch):
+    """卖点/副图凑不够的行**在预备期之前**就淘汰(2026-08-22 生产实证)。
+
+    这两项由系统从采集数据生成(LLM 一个字也插不上手),够不够在取数这一步
+    就是定论。不提前拦的话它们要走到预备期才被 validate 拦成"必填缺失",
+    代价是白打一次 LLM + 白占一个当天配额名额(切片在预备期之前),而素材是
+    产品的固定属性 —— 天天重来天天白烧。理由也要说人话,不能只报字段名。
+    """
+    rows = [_sheet_row(2, asin="B0NOBULLET"),   # 卖点 1 条、描述空 → 凑不够
+            _sheet_row(3, asin="B0FEWIMGS"),    # 主图 1 + 副图 1 → 少于 minItems 2
+            _sheet_row(4, asin="B0GOODONE1")]   # 素材齐全
+    base = {"title": "Steel Widget Pro", "price": 20.0, "stock": 50,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM",
+            "shipping": 3.0}
+    rich = {"bullet_points": [f"Bullet {i} describing the widget in detail"
+                              for i in range(5)], "description": "D" * 500}
+    products = {
+        "B0NOBULLET": {**base, "asin": "B0NOBULLET",
+                       "attrs": {"bullet_points": ["only one"], "description": ""},
+                       "images": [f"i{i}" for i in range(6)]},
+        "B0FEWIMGS": {**base, "asin": "B0FEWIMGS", "attrs": rich,
+                      "images": ["main", "s1"]},
+        "B0GOODONE1": {**base, "asin": "B0GOODONE1", "attrs": rich,
+                       "images": [f"i{i}" for i in range(6)]},
+    }
+    spec = {"required": ["keyFeatures", "productSecondaryImageURL"],
+            "properties": {"keyFeatures": {"minItems": 3},
+                           "productSecondaryImageURL": {"minItems": 2}}}
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: spec)
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "素材不足 2" in out            # 摘要单独一栏,不混进"数据过滤"
+    assert "卖点凑不够" in out and "副图不够" in out    # 理由说人话
+    assert "共 1 行将进入" in out         # 只有素材齐全那行进预备期
+
+
 def test_push_scrape_daily_dedup(monkeypatch):
     """缺数据自动推采集(所有者批复 2026-08-12):日界批次名撞名即防重。"""
     calls = []

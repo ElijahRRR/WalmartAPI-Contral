@@ -348,12 +348,31 @@ def store_profiles(rows):
 
 
 def real_cats(p) -> list:
-    """输入:店铺画像 → 输出:真实大类名列表(剔除未归类占位)。
+    """输入:店铺画像 → 输出:真实**大类**名列表(26 类,剔除未归类占位)。
 
     筛选/排序/展示三处共用同一个定义——曾经三处各写一遍表达式,
     排序把"(未归类)"也数进去,截断后最碎的店反而被挤出样例。
+
+    ⚠ 这是**下层**(26 类)。判"这家店碎不碎"要用 `real_supers` ——
+    类目闸判的是品类层,拿 26 类数去说"超 2 大类"会报出一批其实只做
+    Home+Hardlines 的店(§A.5 已认:那一层「一店最多两大类」几乎失效)。
     """
     return [c for c in p["categories"] if c != UNCLASSIFIED]
+
+
+def real_supers(p) -> list:
+    """输入:店铺画像 → 输出:真实**品类**名列表(五大品类 + 「其他」,去重)。
+
+    「这家店做几个品类」的唯一算法(2026-08-22)。与 `real_cats` 的分工:
+    那个是产品侧事实(26 类),这个是**闸门看见的东西**。报告里凡是要与
+    准入配置对照的地方一律用这个 —— 两边不同层地比,人永远看不懂为什么。
+    """
+    seen = []
+    for c in real_cats(p):
+        b = resources.super_bucket(c)
+        if b and b not in seen:
+            seen.append(b)
+    return seen
 
 
 def channel_mismatch(prof, cfg):
@@ -382,12 +401,30 @@ def _fmt_counter(c: Counter, top=4) -> str:
 
 
 def suggest_categories(prof, cfg, top=2):
-    """输入:店铺画像 + 配置 → 输出:[(店, 建议类目列表, 在线件数分布, 已填值)]。
+    """输入:店铺画像 + 配置 → 输出:每店一个 dict(见下)。
 
     所有者口径(2026-08-15):**超 2 类目的店保留在线数量最多的两类**。
     本函数只出建议,不写任何地方——所有者填进飞书「类目1/2/3」三列,
-    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍"填的 vs
-    实际最多的"是否一致。
+    那三列才是准入权威(§三.1a)。已填的店也出一行,便于对拍。
+
+    ★ **2026-08-22 改在品类层出建议**(所有者:建议列要「填写 5 大类和其他」)。
+    改的理由不是好看:类目闸判的就是品类层(`store_targets.allowed`,Q1),
+    出 26 类的建议等于**让所有者照着填一份闸门不按它判的东西** —— 他填
+    「Home」+「Furniture」以为开了两类,闸看见的是同一个 Home,实际只开了一类。
+    对拍那一栏更糟:拿 26 类原文去比品类建议,永远显示"不一致"。
+
+    ⚠ 26 类**不作废**,同时回传当佐证:只说"建议 Hardlines"而不说它是由
+    Home Improvement 218 件 + Garden & Patio 96 件堆出来的,所有者没法判断
+    这个建议是不是合理。判据用上层,证据给下层。
+
+    每店一个 dict:
+      store        店名
+      suggest      建议填进三列的值(品类层,含「其他」),最多 `top` 个
+      by_super     [(品类, 件数)] 降序 —— 建议的直接依据
+      by_category  [(26 类, 件数)] 降序 —— 佐证
+      filled       表格已填原文
+      filled_super 已填值折成品类(对拍用的就是这个)
+      unknown      已填值里**认不出**的那些(拼写错/旧类目名/随手写的中文)
     """
     out = []
     for store, p in sorted(prof.items()):
@@ -395,8 +432,24 @@ def suggest_categories(prof, cfg, top=2):
                   if c != UNCLASSIFIED]
         if not ranked:
             continue
-        out.append((store, [c for c, _ in ranked[:top]], ranked,
-                    list((cfg.get(store) or {}).get("categories") or [])))
+        sup: Counter = Counter()
+        for c, n in ranked:
+            sup[resources.super_bucket(c) or UNCLASSIFIED] += n
+        # 「未归类」不该出现在这里(上面已按 UNCLASSIFIED 过滤过 26 类),
+        # 但真出现了也不许进建议 —— 那是数据缺口,不是一个可填的类目
+        by_super = [(k, v) for k, v in sup.most_common() if k != UNCLASSIFIED]
+        filled = list((cfg.get(store) or {}).get("categories") or [])
+        out.append({
+            "store": store,
+            "suggest": [k for k, _ in by_super[:top]],
+            "by_super": by_super,
+            "by_category": ranked,
+            "filled": filled,
+            "filled_super": sorted(store_targets.super_categories_of(
+                {"categories": filled})),
+            "unknown": [v for v in filled
+                        if not resources.known_category_literal(v)],
+        })
     return out
 
 
@@ -474,18 +527,45 @@ def store_metrics(rows, sales):
 
 #: 判定阶梯:上一级分不出来才看下一级。名字会写进 csv,让人知道这条是怎么定的
 LADDER = ("按该商品销量", "按该店该大类销量", "按该店整体销量", "按在线件数", "按店名")
+
+# 占用判据(2026-08-22,压在整条阶梯之上 —— 见 resolve_conflicts)。
+BY_CLAIM = "按已有占用"
+CLAIM_STUCK = "占用站不住(先 store_release 释放再判)"
 #: 类目准入是**硬闸不是阶梯**:店不准入这个大类,货就必须离开它,与销量无关
 BY_CATEGORY = "按类目准入"
 #: 机器判不出、必须人眼看的依据级别(所有者定稿 2026-08-15 晚)。
 #: **「按在线件数」不在其中**——在线数是库里查得到的客观数据,"这个品牌你在
 #: 哪家店铺得更开"是站得住的经营判断,不需要人工复核。只有落到**店名**才是
 #: 真打平:那一级等于拿字典序当经营决策,机器确实判不出。
-NEEDS_HUMAN = (LADDER[4],)
+# 机器判不出、必须人接手的两种。CLAIM_STUCK 归这里的理由与"打平"不同:
+# 它不是判不出,而是**判出来的结论与已落的占用矛盾**,而占用只能人来撤。
+NEEDS_HUMAN = (LADDER[4], CLAIM_STUCK)
 
 
-def resolve_conflicts(rows, sales, field, metrics=None, cfg=None):
-    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名(+ store_metrics 产物)
-    → 输出:[(键, 保留店, 保留店统计, 明细行, 判定依据)]。
+def resolve_conflicts(rows, sales, field, metrics=None, cfg=None, held=None):
+    """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名(+ store_metrics 产物
+    + **已有占用** {键: 占用店})→ 输出:[(键, 保留店, 保留店统计, 明细行, 判定依据)]。
+
+    ★ **已有占用压在整条阶梯之上**(所有者 2026-08-22:「那张表要问有没有被
+    占用……如果不看这个,给出的建议就是不可靠的,甚至完全相反的建议」)。
+
+    为什么它不是又一级阶梯而是**先于**阶梯:占用是**决策**不是观测(§二),
+    没有任何自动释放。品牌已经占给 X,报告却按销量算出"留 Y" —— 人照做以后
+    X 的货没了、品牌还锁在 X,**谁也上不了**。这不是判得不准,是判反了。
+
+    三种形态,分开处置:
+
+    | 形态 | 结论 | 依据 |
+    |---|---|---|
+    | 占用店在这组里、且过硬闸 | 留占用店 | `BY_CLAIM` |
+    | 占用店**在这组里没有在架行**(占位≠上架,上一轮定了还没上) | 仍留占用店,别家全下架 | `BY_CLAIM` |
+    | 占用店有货、却被类目/渠道闸挡下 | **不改判给别人**,报出来先释放 | `CLAIM_STUCK` |
+
+    第三种最要紧:硬闸说这家不该有这个大类,占用却还锁着。直接改判给第二名
+    等于**绕过 `store_release`**(全系统唯一释放路径)—— 报告没有资格替人撤
+    一条不可逆的决策。所以只标出来,归 `NEEDS_HUMAN`。
+
+    ⚠ 占用店手上的货**全都在**时不进清单:那是正常状态,没有要下架的行。
 
     所有者口径(2026-08-15):**同品牌/同 ASIN 跨店的,留销量大的店**。
     但实测 96% 的同 ASIN 组、86% 的同品牌组**两边都零销量**——只看该商品
@@ -500,6 +580,7 @@ def resolve_conflicts(rows, sales, field, metrics=None, cfg=None):
     **只有连店名都要用上(④⑤)才算真打平**——那才是机器确实判不出的。
     """
     per_store, per_cat = metrics if metrics else ({}, {})
+    held = held or {}
     groups: dict = defaultdict(list)
     for r in rows:
         v = r.get(field)
@@ -522,6 +603,26 @@ def resolve_conflicts(rows, sales, field, metrics=None, cfg=None):
             if keep_rows and len({r["store"] for r in keep_rows}) < len(
                     {r["store"] for r in items}):
                 admitted, gated = keep_rows, True
+
+        # ── 占用先于阶梯:这个键已经有主了,不许拿销量把它判给别人 ──
+        owner = held.get(key)
+        if owner is not None:
+            # 占用店手上的货全都在 = 正常状态,没有要下架的行
+            offenders = [r for r in items if r["store"] != owner]
+            if not offenders:
+                continue
+            here = {r["store"] for r in items}
+            ok_here = {r["store"] for r in admitted}
+            # 占用店在这组里**有货却被硬闸挡下** ⇒ 占用站不住。不改判给第二名:
+            # 那等于绕过 store_release 替人撤一条不可逆的决策
+            level = (CLAIM_STUCK if owner in here and owner not in ok_here
+                     else BY_CLAIM)
+            detail = [(r["store"], r["sku"], r["asin"] or "", 0, 0.0, 0.0, 0.0,
+                       "保留" if r["store"] == owner else "下架")
+                      for r in sorted(items, key=lambda r: (r["store"], r["sku"]))]
+            out.append((key, owner, {"gmv": 0.0}, detail, level))
+            continue
+
         if len({r["store"] for r in admitted}) < 2:
             if gated:      # 类目闸一刀定音:留下的那家就是答案
                 keep = admitted[0]["store"]

@@ -89,14 +89,22 @@ def load_targets() -> dict[str, dict]:
 
 
 def super_categories_of(cfg_row: dict | None) -> set:
-    """输入:某店配置行 → 输出:该店准入的**五大品类**集合(空集 = 三列全空或全归不到)。
+    """输入:某店配置行 → 输出:该店准入的**品类桶**集合(五大品类 + 「其他」)。
 
-    ⚠ 空集有**两种来源,不能混**:三列全空(= 不限制)与"填了但填的全是归不到
-    品类的类目"(= 谁也接不了)。本函数只回集合,判不限制看 `categories` 本身;
-    报告要区分这两种时用 `bool(cfg_row["categories"])` 判有没有填。
+    ★ 2026-08-22 改判 `super_bucket`(所有者:建议列要「填写 5 大类和其他」)。
+    改之前填「其他 / Safety & Emergency / Everything Else」的店会折成**空集**
+    ⇒ 按「填了就只准入填的那几个」判 ⇒ **谁也接不了**,一家店被静默废掉。
+    改之后这类店的语义是"专收归不到五品类的货",与所有者 2026-08-21 那句
+    「不归,可以分配给没有确定类目的店」相容 —— 那是"可以给没填的店",
+    不是"只能给没填的店"。
+
+    ⚠ 由此 **空集 ⟺ 三列全空**(唯一来源),原来那条"两种空集不能混"的
+    警告随之消失:任何非空填写值都折得出一个桶(认不出的归「其他」)。
+    代价是拼写错不再"响亮地废掉一家店",而是让它静默变成只收「其他」——
+    所以 `alloc_audit` 必须逐店点名认不出的填写值(`known_category_literal`)。
     """
     cats = (cfg_row or {}).get("categories") or []
-    return {resources.super_category(c) for c in cats} - {None}
+    return {resources.super_bucket(c) for c in cats} - {None}
 
 
 def allowed(cfg_row: dict | None, category: str | None) -> bool:
@@ -114,20 +122,23 @@ def allowed(cfg_row: dict | None, category: str | None) -> bool:
     105,571 件(16.3%)。⚠ 代价所有者已认:「一店最多两大类」在这一层几乎
     失效 —— Home + Hardlines = 他 91% 的货。
 
-    ★ **两个容易写反的地方**:
-    1. 店填了类目、但填的全是「不归」的那两类(Safety & Emergency /
-       Everything Else)→ 折完是空集。**不许因为空集就当"没填 = 不限制"**,
-       那是把最严的店误读成最松的店。填了 = 不空着,折完空集 = 谁也接不了。
-    2. 归不到品类的货只能去**没填类目**的店(所有者 2026-08-21 原话:
-       「不归,可以分配给没有确定类目的店」)—— 所以 `want is None` 时,
-       凡填了类目的店一律拒,而不是"反正归不到就随便给一家"。
+    ★ **「其他」是一等值**(所有者 2026-08-22)。归不到五品类的货
+    (Safety & Emergency / Everything Else)可以去**没填类目的店**,也可以去
+    **明确填了「其他」的店** —— 后者是 2026-08-22 新开的一条,此前填「其他」
+    会把店折成空集而废掉。两边都走 `super_bucket`,所以自洽。
+
+    ★ **一个绝不许合并的区分**:`category` 为**空**(大类没采到)返回 False,
+    而不是当成「其他」。空是数据缺口(处置是补采集),「其他」是业务归类
+    (处置是找一家收「其他」的店)。合并会让填了「其他」的店开始收一批
+    **我们根本不知道是什么**的货 —— 而且 `category_offenders` 那条
+    "不知道不算违规"的纪律也会跟着塌。
     """
     cats = (cfg_row or {}).get("categories") or []
     if not cats:
         return True                          # 三列全空 = 不限制(唯一的放行一切)
-    want = resources.super_category(category)
+    want = resources.super_bucket(category)
     if want is None:
-        return False                         # 归不到品类 → 只能去没填类目的店
+        return False                         # 大类采不到 → 受限店一律拒收
     return want in super_categories_of(cfg_row)
 
 

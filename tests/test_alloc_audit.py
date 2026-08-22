@@ -373,7 +373,7 @@ def _wire(monkeypatch, cur, *, registered=None, stores=None, cfg=None,
                         contextlib.contextmanager(lambda: iter([conn])))
     if reports is not None:
         monkeypatch.setattr(wf.paths, "reports_dir", lambda: reports)
-    monkeypatch.setattr(wf.stores_svc, "registered_names",
+    monkeypatch.setattr(wf.stores_svc, "enabled_names",
                         lambda: registered if registered is not None else {"A085", "A107"})
     monkeypatch.setattr(wf.stores_svc, "load_stores",
                         lambda: [{"name": n} for n in (stores if stores is not None
@@ -402,7 +402,7 @@ def test_run_end_to_end_report(monkeypatch):
     # 评分/评论探针为 0 → 必须点名删权重(禁止 or 0)
     assert "评分 ✗" in out and "v1 权重要删掉这两项" in out
     # DEAD1 不在册:其行被排除出冲突,且被点名
-    assert "不在册店冻结 1 家(DEAD1)" in out
+    assert "不在营店冻结 1 家(DEAD1)" in out
     # A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
     assert "非 ACTIVE" not in out
     # 订单里的"旧名店"不在凭证表 → 点名(它的销量进不了店×类目维度)
@@ -510,7 +510,7 @@ def test_store_overview_csv_carries_the_per_store_detail(monkeypatch, tmp_path):
     text = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
     rows = {ln.split(",")[0]: ln for ln in text.splitlines()[1:]}
     assert rows["谭总4"].split(",")[1] == "否(规划外)"
-    assert rows["DEAD1"].split(",")[1] == "否(不在册)"
+    assert rows["DEAD1"].split(",")[1] == "否(不在营)"
     assert rows["A085"].split(",")[1] == "是"
     assert "Fashion" in rows["A085"]          # 准入类目/大类分布都在行里
 
@@ -543,7 +543,7 @@ def test_run_warns_when_credential_table_unreadable(monkeypatch):
 
     def _boom():
         raise RuntimeError("飞书 500")
-    monkeypatch.setattr(wf.stores_svc, "registered_names", _boom)
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", _boom)
     out = wf.run({})
     assert "凭证表读不到" in out and "幻影店一个没排" in out
     assert "只可参考" in out
@@ -731,8 +731,11 @@ def test_needs_human_is_only_the_store_name_tier():
     所有者定稿 2026-08-15 晚:只有落到**店名**才是真打平(拿字典序当经营
     决策),那一级才需要人眼。
     """
-    assert sv.NEEDS_HUMAN == ("按店名",)
+    assert sv.LADDER[4] in sv.NEEDS_HUMAN
     assert sv.LADDER[3] == "按在线件数" and sv.LADDER[3] not in sv.NEEDS_HUMAN
+    # 阶梯里只有「按店名」那一级需要人;另一条(2026-08-22 加的)不是阶梯,
+    # 是"判出来的结论与已落的占用矛盾" —— 占用只能人来撤
+    assert set(sv.NEEDS_HUMAN) - {sv.CLAIM_STUCK} == {"按店名"}
 
 
 def test_store_gmv_comes_from_orders_not_from_what_is_still_online():

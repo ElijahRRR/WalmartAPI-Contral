@@ -42,6 +42,13 @@
   不自行处理调度/通知/锁。
 - **数据库连接唯一入口**:只准通过 `registry/db.py` 的连接函数访问数据库,
   禁止自行 `psycopg.connect` / `sqlite3.connect`。
+- **「这家店还在不在营」只有一个判据:`services/stores.enabled_names()`**
+  (在册 ∧ 凭证表勾了「启用」,所有者定稿 2026-08-22)。三层别混:
+  `registered_names()` 答"在不在**册**"(连停用的都算)、`enabled_names()`
+  答"在不在**营**"、`load_stores()` 答"现在能不能**调 API**"(还筛
+  ClientId/代理)。用错的两个方向都会出事 —— 拿 `load_stores()` 判在营,
+  「在营但代理没配」的店会被当成死店而整店下线;拿 `registered_names()`
+  判在营,停用的店照样占着品牌、照样用冻结行拦着别的店上架。
 - **services 新增积木前必须先通读 services/ 现有函数确认无重复**;每个函数 docstring
   第一行写清"输入什么 → 输出什么"。
 - **飞书字段名只准引用 registry 中的字段常量**,不准在代码里写字段名字符串字面量

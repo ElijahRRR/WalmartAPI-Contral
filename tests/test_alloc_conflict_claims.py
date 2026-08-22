@@ -30,7 +30,7 @@ def test_claim_beats_sales_even_when_the_other_store_sells_more():
     sales = {("B", "S2"): (99, 9999.0)}
     key, keep, _stat, detail, level = _one(rows, sales, held={"acme": "A"})
     assert keep == "A" and level == sv.BY_CLAIM
-    assert dict((d[0], d[7]) for d in detail) == {"A": "保留", "B": "下架"}
+    assert dict((d[0], d.verdict) for d in detail) == {"A": "保留", "B": "下架"}
     # 不看占用时正好判反
     assert _one(rows, sales)[1] == "B"
 
@@ -41,7 +41,7 @@ def test_claim_holder_wins_even_with_no_online_rows_of_its_own():
     rows = [_r("B", "S1"), _r("C", "S2")]
     key, keep, _s, detail, level = _one(rows, held={"acme": "A店还没上架"})
     assert keep == "A店还没上架" and level == sv.BY_CLAIM
-    assert {d[7] for d in detail} == {"下架"}
+    assert {d.verdict for d in detail} == {"下架"}
 
 
 def test_a_single_store_selling_someone_elses_claimed_brand_is_reported():

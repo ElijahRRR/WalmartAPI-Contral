@@ -828,6 +828,22 @@ def super_bucket(category: str | None) -> str | None:
     return _BUCKET_INDEX.get(key, SUPER_OTHER)
 
 
+# 报表里「大类采不到」那一格的显示值。**不是** SUPER_OTHER:「其他」是业务
+# 归类(Safety & Emergency / Everything Else),这个是数据缺口 —— 两者处置
+# 不同(找一家收「其他」的店 vs 补一次采集),在表上必须一眼分得开。
+UNKNOWN_SUPER = "(大类未知)"
+
+
+def super_label(category: str | None) -> str:
+    """输入:Walmart Category → 输出:**报表列**里那个品类值(总是有字)。
+
+    所有 csv 的「品类」列都走这一个函数 —— 每处各写一遍
+    `super_bucket(x) or "…"` 的话,兜底文案迟早分叉,而这一列是所有者用来
+    跟飞书限额表对照的,两张表写法不一样就对不上了。
+    """
+    return super_bucket(category) or UNKNOWN_SUPER
+
+
 def known_category_literal(value: str | None) -> bool:
     """输入:限额表「类目1/2/3」里的一个填写值 → 输出:这个值认不认得。
 

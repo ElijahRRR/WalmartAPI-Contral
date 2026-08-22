@@ -338,6 +338,7 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
     dir_out: list = []
     dir_trim = 0
     rounds_hist: list = []
+    capped_tiers: list = []          # 撞到 max_rounds 护栏而停的梯队
 
     ordered = sorted(products, key=lambda c: (-float(c["score"]), str(c["asin"])))
     cursor = 0
@@ -364,7 +365,7 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
         for rnd in range(1, max_rounds + 1):
             need = sum(max(0, int(here[s]["quota"]) - got[s]) for s in here)
             if need <= 0 or cursor >= len(ordered):
-                break
+                break                       # 正常收敛:配额填满 / 池子见底
             take = ordered[cursor:cursor + need]
             cursor += len(take)
             placed_before = len(assign)
@@ -439,6 +440,14 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
             rounds_hist.append({"tier": tier, "round": rnd, "taken": len(take),
                                 "groups": len(assign) - placed_before,
                                 "swept": swept})
+        else:
+            # ⚠ for-else:循环跑满 `max_rounds` 却**没有** break ⇒ 既没填满配额、
+            #   池子也没见底,是被护栏截断的。**静默截断在这里最危险** ——
+            #   报告会说"未发出 N 组",读起来像"闸挡的",而真相是我们根本
+            #   没往下取。所有者会去改配置,而该做的是提高护栏或缩小配额。
+            if sum(max(0, int(here[s]["quota"]) - got[s]) for s in here) > 0 \
+                    and cursor < len(ordered):
+                capped_tiers.append(tier)
 
     n_dir = sum(1 for a in assign if a["group"].get("store"))
     by_store = _by_store(live, assign, got)
@@ -449,6 +458,8 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
             "dir_out": dir_out, "dir_trim": dir_trim, "rounds": rounds_hist,
             "params": {"slices": slices, "rounds": len(rounds_hist),
                        "directed_groups": n_dir,
+                       "max_rounds": max_rounds,
+                       "capped_tiers": capped_tiers,
                        "stores": len(live),
                        "skipped_stores": len(stores) - len(live)}}
 

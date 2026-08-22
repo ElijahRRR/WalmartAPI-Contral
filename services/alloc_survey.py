@@ -10,7 +10,7 @@
 """
 
 import logging
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, namedtuple
 
 from registry import resources
 from services import brand_key as bk
@@ -528,6 +528,14 @@ def store_metrics(rows, sales):
 #: 判定阶梯:上一级分不出来才看下一级。名字会写进 csv,让人知道这条是怎么定的
 LADDER = ("按该商品销量", "按该店该大类销量", "按该店整体销量", "按在线件数", "按店名")
 
+#: 冲突处置的**一行**。用具名元组而不是裸元组:2026-08-22 给它插一列「大类」
+#: 时,三个消费方全是 `d[7] == "下架"` 这种按位取,插一列全错 —— 而且不报错,
+#: 只是把「保留/下架」读成一个数字。这正是 `store_release._read_csv` 那条
+#: "认死表头不按列号取"的同一个坑,换了个地方又踩一次。
+ConflictRow = namedtuple(
+    "ConflictRow",
+    "store sku asin category orders gmv cat_gmv store_gmv verdict")
+
 # 占用判据(2026-08-22,压在整条阶梯之上 —— 见 resolve_conflicts)。
 BY_CLAIM = "按已有占用"
 CLAIM_STUCK = "占用站不住(先 store_release 释放再判)"
@@ -545,6 +553,10 @@ NEEDS_HUMAN = (LADDER[4], CLAIM_STUCK)
 def resolve_conflicts(rows, sales, field, metrics=None, cfg=None, held=None):
     """输入:富化行 + {(店,sku): (单量, 金额)} + 冲突键名(+ store_metrics 产物
     + **已有占用** {键: 占用店})→ 输出:[(键, 保留店, 保留店统计, 明细行, 判定依据)]。
+
+    明细行 = `ConflictRow`(具名元组;**别按列号取** —— 见它的注释)
+    —— 大类是 2026-08-22 补的:处置清单上没有它,人看不出这一行属于哪个品类,
+    也就没法跟飞书限额表的准入列对照(所有者原话:"我看不清晰")。
 
     ★ **已有占用压在整条阶梯之上**(所有者 2026-08-22:「那张表要问有没有被
     占用……如果不看这个,给出的建议就是不可靠的,甚至完全相反的建议」)。
@@ -617,8 +629,9 @@ def resolve_conflicts(rows, sales, field, metrics=None, cfg=None, held=None):
             # 那等于绕过 store_release 替人撤一条不可逆的决策
             level = (CLAIM_STUCK if owner in here and owner not in ok_here
                      else BY_CLAIM)
-            detail = [(r["store"], r["sku"], r["asin"] or "", 0, 0.0, 0.0, 0.0,
-                       "保留" if r["store"] == owner else "下架")
+            detail = [ConflictRow(r["store"], r["sku"], r["asin"] or "",
+                                  r.get("category") or "", 0, 0.0, 0.0, 0.0,
+                                  "保留" if r["store"] == owner else "下架")
                       for r in sorted(items, key=lambda r: (r["store"], r["sku"]))]
             out.append((key, owner, {"gmv": 0.0}, detail, level))
             continue
@@ -626,8 +639,9 @@ def resolve_conflicts(rows, sales, field, metrics=None, cfg=None, held=None):
         if len({r["store"] for r in admitted}) < 2:
             if gated:      # 类目闸一刀定音:留下的那家就是答案
                 keep = admitted[0]["store"]
-                detail = [(r["store"], r["sku"], r["asin"] or "", 0, 0.0, 0.0, 0.0,
-                           "保留" if r["store"] == keep else "下架")
+                detail = [ConflictRow(r["store"], r["sku"], r["asin"] or "",
+                                      r.get("category") or "", 0, 0.0, 0.0, 0.0,
+                                      "保留" if r["store"] == keep else "下架")
                           for r in sorted(items, key=lambda r: (r["store"], r["sku"]))]
                 out.append((key, keep, {"gmv": 0.0}, detail, BY_CATEGORY))
             continue
@@ -661,10 +675,11 @@ def resolve_conflicts(rows, sales, field, metrics=None, cfg=None, held=None):
         detail = []
         for r in sorted(items, key=lambda r: (r["store"], r["sku"])):
             s = by_store[r["store"]]
-            detail.append((r["store"], r["sku"], r["asin"] or "",
-                           s["orders"], round(s["gmv"], 2),
-                           round(s["cat_gmv"], 2), round(s["store_gmv"], 2),
-                           "保留" if r["store"] == keep else "下架"))
+            detail.append(ConflictRow(
+                r["store"], r["sku"], r["asin"] or "", r.get("category") or "",
+                s["orders"], round(s["gmv"], 2), round(s["cat_gmv"], 2),
+                round(s["store_gmv"], 2),
+                "保留" if r["store"] == keep else "下架"))
         out.append((key, keep, ranked[0][1], detail, level))
     # 涉及店铺数多、销量大的排前面:人先处理影响面大的
     out.sort(key=lambda x: (-len(x[3]), -x[2]["gmv"], str(x[0])))

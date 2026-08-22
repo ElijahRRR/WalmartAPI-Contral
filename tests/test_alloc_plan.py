@@ -707,3 +707,73 @@ def test_goods_beyond_every_store_condition_leave_at_the_funnel(monkeypatch,
             assert pre not in txt, (f, pre)       # 不许在任何一张表里占篇幅
     plan = (tmp_path / "alloc_分配方案.csv").read_text(encoding="utf-8-sig")
     assert "B0OK00" in plan
+
+
+# ── 取货对账(所有者 2026-08-22 追问)──────────────────────────────────
+
+def _wire_tight(monkeypatch, pool):
+    """A 只收 Home 且容量大;B 收 Animals 但**容量只剩 5**。
+
+    这样 Animals 的货过得了漏斗那道「至少有一家店的条件容得下」(B 收),
+    却在发牌时被 B 的容量/配额挡下 —— 正是"取进来了却发不出去"的那批。
+    """
+    _wire(monkeypatch, pool, claimed=[])
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+        "A": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
+              "gmv": 400.0, "orders": 5.0},
+        "B": {"categories": ["Animals"], "channel": "FBA", "max_online": 105,
+              "gmv": 400.0, "orders": 5.0}})
+
+
+def test_the_take_ledger_accounts_for_every_product(monkeypatch, tmp_path):
+    """★ 所有者:「只有 26,785 个货位为什么取了 50,457 件?」
+
+    因为取货按**产品**取,而取进来的未必发得出去。这几笔此前分散在报告三处、
+    **单位还不一样**(未发出报的是组数),人只能自己去减。
+
+    ⚠ 这条对账一定要**能对上**。对不上就说明有一笔货在实现里凭空消失了 ——
+    那种 bug 从任何单项数字上都看不出来,只有做减法才会露头。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = ([_c(f"B0OK{i:06d}", f"ok{i}", 90.0 - i * 0.1) for i in range(30)]
+            + [_c(f"B0NO{i:06d}", f"no{i}", 80.0 - i * 0.1, cat="Animals")
+               for i in range(60)])
+    _wire_tight(monkeypatch, pool)
+    out = wf.run({"execute": False})
+    line = [x for x in out.splitlines() if "取货去向:" in x][0]
+    assert "对不上取货" not in line, line
+    assert "实发" in line
+
+
+def test_unplaced_is_reported_in_items_not_only_groups(monkeypatch, tmp_path):
+    """未发出要跟「取货」「实发」同单位(件),否则三个数没法互相对。"""
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    pool = ([_c(f"B0OK{i:06d}", f"ok{i}", 90.0 - i * 0.1) for i in range(10)]
+            + [_c(f"B0NO{i:06d}", f"no{i}", 80.0 - i * 0.1, cat="Animals")
+               for i in range(60)])
+    _wire_tight(monkeypatch, pool)
+    out = wf.run({"execute": False})
+    # ⚠ 取「未发出 …」开头那一行 —— 对账行里也提到"未发出"三个字
+    line = [x for x in out.splitlines() if x.strip().startswith("未发出")][0]
+    assert "组 /" in line and "件:" in line
+
+
+def test_hitting_the_round_guard_is_shouted_not_swallowed(monkeypatch, tmp_path):
+    """⚠ 撞到 `MAX_ROUNDS` 护栏而停 ≠ 发完了。
+
+    静默截断在这里最危险:报告会说"未发出 N 组",读起来像"闸挡的",而真相是
+    我们**根本没往下取**。所有者会去改配置,该做的却是提高护栏或缩小配额。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # ⚠ 不能 monkeypatch `ae.MAX_ROUNDS`:它是 `deal` 的**默认参数**,def 时就
+    #   绑好了,改模块常量对已定义的函数无效(改源码有效,打补丁无效)。
+    #   这里包一层把 max_rounds 显式传进去,走的仍是真实渲染路径
+    real = wf.ae.deal
+    monkeypatch.setattr(wf.ae, "deal",
+                        lambda *a, **k: real(*a, **{**k, "max_rounds": 1}))
+    pool = ([_c(f"B0OK{i:06d}", f"ok{i}", 90.0 - i * 0.01) for i in range(20)]
+            + [_c(f"B0NO{i:06d}", f"no{i}", 89.0 - i * 0.01, cat="Animals")
+               for i in range(600)])
+    _wire_tight(monkeypatch, pool)
+    out = wf.run({"execute": False})
+    assert "撞到轮次护栏" in out and "不是发完了" in out

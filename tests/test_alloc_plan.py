@@ -70,13 +70,17 @@ def test_claim_snapshot_carries_the_walmart_pt():
 
 # ── 批量与切口 ────────────────────────────────────────────────────────
 
-def test_headroom_leaves_room_for_gate_failures():
-    """候选切口必须**大于**批量。
+def test_headroom_is_gone_replaced_by_taking_another_round():
+    """★ `HEADROOM`(切口 ×1.5)2026-08-22 删掉了,两个毛病:
 
-    切到刚好够数就没有腾挪余地:轮到某家店时,它类目/渠道能接的货已被前面
-    挑光了。实测 1.0× 少发 7.5% 且顶层比值两家越界。
+    · **单位错配** —— `cut = int(total_q * HEADROOM)` 里 total_q 的单位是货位
+      (产品),却拿去切**组**的列表。平均一组 k 件,牌堆实际装了约
+      1.5×k×total_q 件货,比标称多出 k 倍,而报告还写着"切口 N 组(×1.5)";
+    · **留余量这件事**已由"一轮不够就取下一个 N"取代(所有者 2026-08-22),
+      那是按实际缺口续取,比拍一个倍数准。
     """
-    assert wf.HEADROOM > 1.0
+    assert not hasattr(wf, "HEADROOM")
+    assert wf.ae.MAX_ROUNDS > 1
 
 
 # ── 配额 ──────────────────────────────────────────────────────────────
@@ -164,9 +168,10 @@ def test_plan_table_holds_only_what_you_act_on(tmp_path, monkeypatch):
     g = _grp("zeta", "zeta", [_c("B0BBBB0001", "zeta", 50.0)])
     p_plan, n_plan = wf._write_plan([{"group": ok, "store": "A", "layer": 1,
                                       "tier": 1}])
+    # ★ 排队的现在是**产品**不是组(切口挪到了产品层)
     p_out, n_out = wf._write_rejects([{"group": g, "reason": wf.ae.NO_CATEGORY}],
                                      [(dict(g, store="A085"), "占用店容量不足")],
-                                     [dict(g, store="A085")])
+                                     [_c("B0CCCC0001", "zeta", 40.0)])
     plan = open(p_plan, encoding="utf-8-sig").read()
     out = open(p_out, encoding="utf-8-sig").read()
     assert n_plan == 1 and "B0AAAA0001" in plan
@@ -291,9 +296,16 @@ def test_funnel_does_not_divide_group_counts_by_product_counts(monkeypatch, tmp_
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 3}", 95.0 - i * 0.7) for i in range(60)]
     _wire(monkeypatch, pool, claimed=[])
     out = wf.run({"batch": 20, "execute": False})
-    line = [x for x in out.splitlines() if "组队后·自由流" in x][0]
-    assert "100.0%" in line and " 60 " in line   # 货位 60/60(**不是** 20/60=33%)
-    assert line.rstrip().endswith("20")          # 组数单列一栏
+    # ★ 重排之后进片的只有**本轮取到的**那 20 件(切口),不是全部 60 件 ——
+    #   所以先核对「本轮取货」那一行,再核对组队行与它对得上
+    took = [x for x in out.splitlines() if "本轮取货" in x][0]
+    # ⚠ 22 而不是 20:`-p batch=` 是**逐店** ceil 等比缩的(2 家店各 11),
+    #   总和会略微超过 batch —— 那是安全阀的取整,不是模型的一部分
+    assert " 22 " in took, "取货量 = 各店配额之和(N),不是候选池全量 60"
+    line = [x for x in out.splitlines() if "片内组队·自由流" in x][0]
+    # 货位 12(每组 3 件 ⇒ 组数 8 中有 4 组只取到部分件);关键是**两个单位
+    # 各占一栏**,而不是把 8÷20 报成 40% 读起来像丢了六成
+    assert line.rstrip().endswith("8") and " 12 " in line
 
 
 # ── 定向流:两条会炸的纪律 ────────────────────────────────────────────
@@ -394,7 +406,7 @@ def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
     out = wf.run({"batch": 10, "execute": False})
     assert "排队中" in out or "一件都没发" in out
     text = open(tmp_path / "alloc_未入选.csv", encoding="utf-8-sig").read()
-    assert "排队(分数排在本轮切口之外)" in text
+    assert "排队(产品分排在本轮切口之外)" in text
     assert "B0FRE00199" in text or "B0FRE00100" in text   # 切口之外的确实写进去了
 
 
@@ -404,7 +416,7 @@ def test_the_cut_score_is_reported_so_queued_is_distinguishable(monkeypatch, tmp
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
-    assert "候选切口在组分" in out and "排队中" in out
+    assert "切口在产品分" in out and "排队中" in out
 
 
 def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
@@ -414,7 +426,7 @@ def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.01) for i in range(100)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
-    assert "只写了**组分最高的 5 组**" in out
+    assert "只写了**产品分最高的 5 件**" in out
 
 
 def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
@@ -426,15 +438,15 @@ def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
     st = {"categories": ["Home"], "lead_limit": 5, "channel": "FBA"}
     # 全被类目挡
     g1 = _grp("a", "a", [_c("B0AAAA0001", "a", 90.0, cat="Garden & Patio")])
-    assert wf._fit_to_store(g1, st)[2] == "类目"
+    assert wf.ae._fit_to_store(g1, st)[2] == "类目"
     # 全被货期挡
     g2 = _grp("b", "b", [dict(_c("B0AAAA0002", "b", 90.0), lead=9)])
-    assert wf._fit_to_store(g2, st)[2] == "货期"
+    assert wf.ae._fit_to_store(g2, st)[2] == "货期"
     # 混着挡时按件数多的那个归因,并列按名字定序(不许随行序漂)
     g3 = _grp("c", "c", [_c("B0AAAA0003", "c", 90.0, cat="Garden & Patio"),
                          _c("B0AAAA0004", "c", 80.0, cat="Garden & Patio"),
                          dict(_c("B0AAAA0005", "c", 70.0), lead=9)])
-    assert wf._fit_to_store(g3, st)[2] == "类目"
+    assert wf.ae._fit_to_store(g3, st)[2] == "类目"
 
 
 def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
@@ -588,28 +600,28 @@ def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
     assert not any("A 缺" in x for x in cat_lines), cat_lines
 
 
-def test_ride_along_low_scorers_are_counted(monkeypatch, tmp_path):
-    """★ 排序按**组分**(组内最高产品分),组里分低的产品跟着一起上架。
+def test_no_low_scorer_can_ride_along_any_more(monkeypatch, tmp_path):
+    """★ 所有者 2026-08-16 追问「产品分 38.6 和 91.4 是怎么混到一起去的」——
+    2026-08-22 重排把这件事从"只报不治"变成了**结构上不可能**。
 
-    所有者 2026-08-16:「产品分 38.6 和 91.4 是怎么混到一起去的」。答案是
-    它们同属一个品牌组 —— 不是 bug(品牌排他要求整组去一家店),但那些货位
-    **挤掉的是排队里组分更高的组**,所以量要报出来让人判断值不值。
+    旧版:切口切在组这一层、组分取组内最高 ⇒ 一个 95 分的爆款把同品牌三个
+    42 分的货一起拉进牌堆。所有者原话:"你会把大量排名靠后的产品拉到前面来"。
+    新版:先按产品分取 top-N,组只由**取到的产品**组成 ⇒ 组内每一件都在
+    切口之上,不可能有搭车的。
 
-    ⚠ 曾试过用"组内低于 50 分的不跟车"压掉它,**已撤**(口径 #17c):牌一瘦,
-    填同样的货位就要发更多张牌,发牌深度从 1.5 层掉到 3.5 层,入场线不升反降。
-    所以这个量**只报不治** —— 这条盯着它一直报得出来。
+    这条同时也是「搭车上架」那一节被撤掉的理由 —— 报一个恒为 0 的数是噪声。
     """
     monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
-    # 一个品牌:一个 95 分带三个 42 分的(42 在淘汰线 40 之上,进得了候选池);
-    # 另有一批 50 分的单品组排在后面,把本轮切口压到 49.9 附近
     pool = ([_c("B0HIGH0001", "acme", 95.0)]
             + [_c(f"B0LOW{i:05d}", "acme", 42.0) for i in range(3)]
             + [_c(f"B0MID{i:05d}", f"mid{i}", 50.0 - i * 0.01) for i in range(60)])
     _wire_directed(monkeypatch, pool, {}, room=10)
     out = wf.run({"execute": False})
-    assert "搭车上架" in out
-    line = [x for x in out.splitlines() if "搭车上架" in x][0]
-    assert "3 个货位" in line          # 三个 42 分的跟着 95 分的上来了
+    assert "搭车上架" not in out
+    # 方案表里一件 42 分的都不该有:它们排在切口之外
+    plan = open(tmp_path / "alloc_分配方案.csv", encoding="utf-8-sig").read()
+    assert "B0LOW" not in plan
+    assert "B0HIGH0001" in plan          # 而那个 95 分的照常发出去
 
 
 def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(
@@ -626,7 +638,7 @@ def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(
     out = wf.run({"execute": False})
     assert "实际入场线:组分" in out
     entry = float(out.split("实际入场线:组分 ")[1].split("**")[0])
-    cut = float(out.split("候选切口在组分 ")[1].split(" ")[0])
+    cut = float(out.split("切口在产品分 ")[1].split(" ")[0])
     assert entry > cut, "入场线必须高于候选切口 —— 配额先填满"
     assert "这不是入场线" in out
 

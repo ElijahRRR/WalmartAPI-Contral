@@ -251,6 +251,45 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    `services/scrape_batches.ERROR_TYPES`——采集侧新增类型而本侧不知道时会告警,
    不会被静默当成普通失败。
 
+5b. **gzip 传输(采集侧 2026-08-21 上线,本侧零改动)**——
+   `/api/export/incremental` 与 `/api/export/batch/{批次名}/records` 同源同构,
+   两个端点一起受益。生产实测(一页 500 条):
+
+   | | 线上字节 | 耗时 |
+   |---|---|---|
+   | 未压缩 | 2,869 KB | 3.3 ~ 10.9s(波动大) |
+   | **gzip** | **694 KB** | **0.30s** |
+
+   压缩比 **4.1 : 1**,每条记录约 **5.7 KB**。按此,11.7 万条的补积压从十几分钟
+   降到两三分钟。⚠ **别拿"上完 0.30s vs 上完前 9.5s"当效果** —— 同一个请求在
+   半小时内已经在 9.5s / 3.33s 之间跳过一次,那个 9.5s 里掺着运气差;
+   坐实的部分是**字节少了 4.1 倍**。
+
+   **本侧为什么零改动**:httpx 默认发 `accept-encoding: gzip, deflate` 并自动
+   解压,而 `api/scraper._headers()` 只返回鉴权头、全仓没有一处手写
+   `Accept-Encoding`。⚠ 这也意味着**那个默认协商就是 gzip 生效的全部机制**,
+   谁在 `_headers()` 里加一个 Accept-Encoding,压缩就静默失效(见
+   `tests/test_scraper_gzip.py`)。
+
+   **数据准确性已实测核实**(所有者 2026-08-21 追问「能确保这么拿回来的数据也是
+   准确的吗」):同一页 identity 与 gzip 两次取回**逐字段完全相同**。更硬的保证
+   来自"整页是一个 JSON 文档":httpx 的解码器在流被截断时**不抛错**(跳过 gzip
+   尾部 CRC32),但半截字节不是合法 JSON ⇒ `json.loads` 抛 ⇒ `export_incremental`
+   记成"200 但不是 JSON"退避重试。单比特翻转 300 次实测 300 次全部报错,
+   零次静默出错。**没有"少几条但看着正常"这种中间态。**
+   ⚠⚠ **这条前提只在整页解析时成立**:哪天把它改成流式(逐条 yield / ijson),
+   截断就会变成"静默少几条",而少掉的那几条会被游标跳过、永不回头。
+   `tests/test_scraper_gzip.py` 里那条 parametrize 测试就是留给改的人的红灯。
+
+   **转告采集侧的三条**:① 用 gzip / deflate,别用 br / zstd(本仓 httpx 只装了
+   前两个解码器);② nginx 反代要 `gzip_proxied any;`(默认不压上游代理来的响应);
+   ③ 别双压(FastAPI 与 nginx 只压一次)。
+
+   ★ **由此作废两个曾经排上日程的优化**:`fields=` 字段投影(收益已被压缩吃掉,
+   而砍 `long_description` 会让 L3 只剩标题+五点判语义,代价还在)与
+   "预取流水线 / 批量 INSERT"(落库本来就只占 0.3s;gzip 后 HTTP 也是 0.3s,
+   流水线理论上省 40%,但绝对值是把两分钟变成一分半)。
+
 6. **按批次取记录端点(采集侧 #12,2026-08-19 本侧接入)**——
    `GET /api/export/batch/{batch_name}/records?cursor=&limit=`:
    与 `/api/export/incremental` 读同一张事件表、records 逐字段同构,

@@ -555,3 +555,37 @@ def test_a_same_round_regroup_is_not_reported_as_an_existing_claim():
 
     r2 = ae.deal(wide, {"A": _s(40)}, held_brand={"wide": "A"}, slices=10)
     assert {g.get("bound_by") for g in r2["groups"] if g.get("store")} == {"claim"}
+
+
+def test_directed_groups_consume_the_slice_cap_too():
+    """★ 所有者 2026-08-22 更正:"定向组直接归占用店,**需要占用片内上限**"。
+
+    不吃上限的话,一家手上老品牌多的店可以在每一片里先把定向吃满、**再照常
+    参与自由流轮转** —— 上限就管不住它了,而上限存在的理由正是"别让一家店
+    把最好的那批拿光"。
+
+    构造:一片 10 件 / 2 家店 ⇒ 上限 5。A 手上有 6 件已占品牌(定向),
+    另有自由货。A 在这一片吃到上限就该停,自由组转给 B。
+    """
+    a_brand = [_p(f"A#{i}", 100.0 - i, "aheld") for i in range(6)]
+    free = [_p(f"F#{i}", 90.0 - i, f"f{i}") for i in range(14)]
+    r = ae.deal(a_brand + free, {"A": _s(20), "B": _s(20)},
+                held_brand={"aheld": "A"}, slices=2)
+    # 第一片 10 件 / 2 店 ⇒ 上限 5;A 的定向组 6 件一次就顶到上限
+    assert r["by_store"]["A"]["by_layer"][1] <= 6
+    # B 在第一片必须拿到货 —— 上限把 A 挡住了
+    assert r["by_store"]["B"]["by_layer"][1] > 0
+
+
+def test_without_the_shared_cap_one_store_would_take_the_whole_top_slice():
+    """上一条的反面:定向与自由**共用**同一个计数器。
+
+    直接检查实现 —— 两段分别传 `Counter()` 的写法看起来也"在均衡",
+    但定向那一段的量根本不进自由那一段的账。
+    """
+    import inspect
+    src = inspect.getsource(ae.deal)
+    body = src[src.index("take_ct"):src.index("# 收尾扫描")]
+    assert body.count("_try_place(grp, here, got, take_ct, cap)") == 1, \
+        "定向与自由必须走同一次 _try_place 调用,共用 take_ct 与 cap"
+    assert "Counter(), None)" not in body, "定向不许绕过上限"

@@ -291,9 +291,10 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
       └ 轮次:取 N = 各店剩余差额之和 件
           └ 分 10 片(按**产品数**)
               ├ 片内组队(alloc_groups.build,组分 = 0.7均分 + 0.3最高)
-              ├ 定向组(已被占用的品牌)**直接归占用店**,不占片内上限
+              ├ 定向组(已被占用的品牌)**直接归占用店**
               └ 自由组按轮转发:离配额最远的先挑(相对比值,所有者拍 Q2)
-                 每店每片上限 = **片产品数 ÷ 店数**(所有者拍 Q3)
+                 每店每片上限 = **片产品数 ÷ 店数**(所有者拍 Q3);
+                 **定向与自由共用这一个上限**(所有者 2026-08-22 更正)
           └ 收尾扫描:去掉片内上限再走一遍
       └ 还有店没满、池里还有货 ⇒ 取下一个 N,再来一轮
     ```
@@ -307,8 +308,11 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
     **必须还归 A** —— 否则同一个品牌在一轮之内被拆给两家店,品牌排他当场失效。
     所以 `owner` 是边发边更新的,不是一开始那份快照。
 
-    ★ **片内上限是固定的**(片产品数 ÷ 店数),不随定向拿走多少、也不随店挑完
-    而缩水 —— 可复现优先。被上限压回去的组不丢,进收尾扫描。上限管的是
+    ★ **片内上限是固定的**(片产品数 ÷ 店数),不随店挑完而缩水 —— 可复现优先。
+    **定向组也吃这个上限**(所有者 2026-08-22 更正):不吃的话,一家手上老品牌
+    多的店可以每片先把定向吃满、再照常参与自由流轮转,上限就管不住它了 ——
+    而上限存在的理由正是"别让一家店把最好的那批拿光"。
+    被上限压回去的组不丢,排到下一片开头,最后进收尾扫描。上限管的是
     "谁先拿到最好的那批",不是"谁最终拿多少"。
 
     返回 {assign, unplaced, queued, by_store, groups, dropped, dir_out,
@@ -381,28 +385,30 @@ def deal(products: list, stores: dict, held_brand: dict | None = None,
                 all_groups.extend(g["free"])
                 all_groups.extend(g["directed"])
 
-                # ① 定向组:只有占用店能要,**直接归它**,不占片内上限
+                # 片内三段,顺序有意:
+                #   ① 压回来的(上一片被上限挡下的)—— 它们已经排过一次队,
+                #      放到后面等于"从晚一点拿变成永远拿不到";
+                #   ② 定向组(只有占用店能要,直接归它);
+                #   ③ 自由组轮转。
+                # ★ **三段共用同一个 `take_ct` 与同一个 `cap`**(所有者
+                #   2026-08-22 更正:"定向组直接归占用店,需要占用片内上限")。
+                #   定向不占上限的话,一家手上老品牌多的店可以在每一片里先把
+                #   定向吃满、再照常参与自由流轮转 —— 上限就管不住它了,
+                #   而上限存在的理由正是"别让一家店把最好的那批拿光"。
+                take_ct: Counter = Counter({s: 0 for s in here})
+                pending, carry = carry, []
+                ready = list(pending)
                 for orig in sorted(g["directed"],
                                    key=lambda x: (-float(x["score"]), str(x["key"]))):
                     grp, trimmed, why = _prep_directed(orig, here, dir_out,
                                                        stores)
                     dir_trim += trimmed
-                    if grp is None:
-                        continue
-                    store, _ = _try_place(grp, here, got, Counter(), None)
-                    if store:
-                        assign.append({"group": grp, "store": store,
-                                       "layer": si, "tier": tier})
-                    else:
-                        unplaced.append({"group": grp,
-                                         "reason": _why(grp, here, got)})
+                    if grp is not None:
+                        ready.append(grp)
+                ready += sorted(g["free"],
+                                key=lambda x: (-float(x["score"]), str(x["key"])))
 
-                # ② 自由组:轮转 + 片内上限。压回来的排在下一片**前面**
-                take_ct: Counter = Counter({s: 0 for s in here})
-                pending, carry = carry, []
-                for grp in pending + sorted(
-                        g["free"],
-                        key=lambda x: (-float(x["score"]), str(x["key"]))):
+                for grp in ready:
                     store, capped = _try_place(grp, here, got, take_ct, cap)
                     if store:
                         assign.append({"group": grp, "store": store,

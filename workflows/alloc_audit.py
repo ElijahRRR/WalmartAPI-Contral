@@ -45,13 +45,15 @@
 
 三条口径纪律(2026-08-15 对抗式审查后定,每条都对应一次会算错数的实例):
 
-1. **冻结行不进冲突**:A1/A2/A3/A5 只吃"仍在册店铺"的行。已从凭证表删除的
-   店,其 walmart_items 行永久冻结为"在架"(catalog_sync 只扫在册店),
-   混进来会让所有者为一家不存在的店去下架另一家店真在卖的 listing。
+1. **冻结行不进冲突**:A1/A2/A3/A5 只吃"仍在营店铺"的行。已停用(或已从
+   凭证表删除)的店,其 walmart_items 行永久冻结为"在架"(catalog_sync 只扫
+   在营店),混进来会让所有者为一家不做了的店去下架另一家店真在卖的 listing。
    排除了多少必须打印——静默兜底等于主路径坏了没人知道。
-2. **"不在册" ≠ "被过滤"**:A4 用 `stores.registered_names()`(凭证表全集)
-   判在册,不用 `load_stores()`(它按启用/代理筛过)——后者会把"代理没配的
-   在营店"误判成死店,而死店清单直通整店释放。
+2. **"不在营" ≠ "被过滤"**:判在营用 `stores.enabled_names()`(在册 ∧ 勾了
+   「启用」,所有者定稿 2026-08-22),**不用** `load_stores()`——后者还筛
+   ClientId/代理,会把"代理没配的在营店"误判成死店,而死店清单直通整店释放。
+   ⚠ 也**不用** `registered_names()`:它连「启用」都不看,勾了停用的店会被
+   当成还在营,于是它的冻结行继续拦着别的店上架(2026-08-22 前正是如此)。
 3. **未知不算不符**:渠道判不符只在两侧都是 FBA/FBM 且不同时;采集没采到、
    或采出第三种值,都单列计数——把"没采到"算成"货不对"会让无辜商品进下架清单。
 
@@ -122,10 +124,10 @@ def run(params: dict) -> str:
     rows, st = sv.enrich(items, meta, pt2cat)
     prof_all = sv.store_profiles(rows)          # 全量(含不在册店):A4/A7 点名用
 
-    # 在册店名(凭证表全集,不做启用/代理过滤——见模块 docstring 纪律 2)
+    # 在营店名(在册 ∧ 勾了「启用」;不做 ClientId/代理过滤——见纪律 2)
     registered, reg_err = None, None
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                    # noqa: BLE001 报告降级,不阻断
         reg_err = str(e)
     live_api, live_err = None, None
@@ -139,7 +141,7 @@ def run(params: dict) -> str:
     except Exception as e:                    # noqa: BLE001
         cfg_err = str(e)
 
-    # 冻结行(不在册店的在线行)不进冲突分析——纪律 1
+    # 冻结行(不在营店的在线行)不进冲突分析——纪律 1
     frozen = ({s for s in prof_all if s not in registered}
               if registered is not None else set())
     # 规划范围外的店(registry.alloc_excluded_stores,当前=店名含「谭总」):
@@ -288,7 +290,7 @@ def run(params: dict) -> str:
                                f"({'、'.join(sorted(out_of_scope)[:6])})"
                                f" —— 不占用、不算冲突,**销量仍计入**"))
     if frozen:
-        body.append(("已排除", f"不在册店冻结 {len(frozen)} 家"
+        body.append(("已排除", f"不在营店冻结 {len(frozen)} 家"
                                f"({'、'.join(sorted(frozen)[:6])})"
                                f" —— 整店释放见 store_release"))
     if registered is None:
@@ -375,7 +377,7 @@ def run(params: dict) -> str:
     if live_err:
         # 读不到就没有「配置缺失 vs 真不在册」这一栏,而不是"一家都没有"
         notes.append(f"店铺配置读不到({live_err}),本轮没法区分"
-                     f"「缺代理/ClientId 的在营店」和「真不在册的死店」")
+                     f"「缺代理/ClientId 的在营店」和「已停用的死店」")
     if notes:
         L += ["", "▍要留意"] + [f"  · {x}" for x in notes]
 
@@ -444,7 +446,7 @@ def run(params: dict) -> str:
           # SUSPENDED 店占用照旧保持(占用内=是),但可以把它的最大在线数
           # 填 0 让它暂时不接新货(参与分配=否)
           "否(规划外)" if s in out_of_scope else
-          ("否(不在册)" if s in frozen else "是"),
+          ("否(不在营)" if s in frozen else "是"),
           _ACCEPT[store_targets.accepts_allocation(cfg.get(s))] if cfg else "",
           "" if (cfg.get(s) or {}).get("max_online") is None
              else int(cfg[s]["max_online"]),

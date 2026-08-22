@@ -84,7 +84,7 @@ def run(params: dict) -> str:
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 限额表读不到({e}):没有目标与容量就算不出缺口与配额"
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝出表"
 

@@ -55,7 +55,7 @@ def _wire(monkeypatch, online, registered, held=None, freed=None):
     monkeypatch.setattr(wf.db, "pg_conn",
                         lambda *a, **k: contextlib.nullcontext(conn))
     import services.stores as stores_svc
-    monkeypatch.setattr(stores_svc, "registered_names", lambda: set(registered))
+    monkeypatch.setattr(stores_svc, "enabled_names", lambda: set(registered))
     monkeypatch.setattr(wf.claims, "preview_release",
                         lambda c, **kw: (held or {}).get(kw.get("store"), []))
     monkeypatch.setattr(wf.claims, "release",
@@ -74,7 +74,7 @@ def test_refuses_when_the_credential_sheet_cannot_be_read():
         raise RuntimeError("飞书超时")
 
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(stores_svc, "registered_names", boom)
+        m.setattr(stores_svc, "enabled_names", boom)
         out = wf.run({"dead": "1", "execute": False})
     assert out.startswith("⛔") and "凭证表读不到" in out
 

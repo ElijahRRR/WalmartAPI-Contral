@@ -94,7 +94,7 @@ def run(params: dict) -> str:
 
     # 纪律 1:只认在册店的已发布行
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                            # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
     try:

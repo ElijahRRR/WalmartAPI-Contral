@@ -29,10 +29,11 @@
 分配队列")。它就是把上面那条整店释放**对每一家不在册的店各跑一遍**,
 不是另一套逻辑 —— 同一个能力只有一条实现路径。
 
-名录的权威是**凭证表**(`stores.registered_names()`),不写进代码:店铺名录是
-会变的业务数据,写死在这里,下次开一家新店就得改代码(铁律 3)。所以用法是
-**先把不再运营的店从凭证表删掉**,再跑这条;dry-run 会把"保留 / 清理"两张
-名单都列出来,拿它跟手上的在营名单逐个对。
+名录的权威是**凭证表的「启用」勾选**(`stores.enabled_names()`,所有者定稿
+2026-08-22),不写进代码:店铺名录是会变的业务数据,写死在这里,下次开一家
+新店就得改代码(铁律 3)。所以用法是**把不再运营的店的「启用」取消勾选**
+(不必删行,历史凭证留着),再跑这条;dry-run 会把"保留 / 清理"两张名单都
+列出来,拿它跟手上的在营名单逐个对。
 
 ⚠ **规划外 ≠ 不在营。** 判定只看在不在凭证表,**不看** `alloc_excluded_stores`
 (「谭总」那些)—— 它们不参与分配,但货是真在卖的,扫掉就是把在售商品
@@ -201,9 +202,10 @@ def run(params: dict) -> str:
 def _run_dead(params: dict, execute: bool, mark_offline: bool) -> str:
     """输入:params → 输出:批量清死店摘要。**逐店走整店释放那条路,不另写。**
 
-    在册与否是唯一判据,来源是**凭证表全集** `stores.registered_names()` ——
-    不是 `load_stores()`。后者按启用/ClientId/代理筛过,会把「在册但代理没配
-    的在营店」误判成死店,而这条命令直通整店下线(§九.4 的原话)。
+    **在不在营**是唯一判据,来源是 `stores.enabled_names()`(在册 ∧ 勾了启用)。
+    另外两个都不能用:`load_stores()` 还筛 ClientId/代理,会把「在营但代理没配
+    的店」误判成死店(§九.4 的原话);`registered_names()` 连「启用」都不看,
+    勾了停用的店会被当成还在营 —— 而这条命令直通整店下线。
 
     三道拒跑闸,每一道都对应一种"看起来像死店、其实是我们自己错了":
       1. 凭证表读不到 / 读回空 —— 拿不到真值时**不许降级**,更不许当成"全死了";
@@ -213,7 +215,7 @@ def _run_dead(params: dict, execute: bool, mark_offline: bool) -> str:
     from services import stores as stores_svc
 
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return (f"⛔ 凭证表读不到({e}):分不清在营店与死店,拒绝清理。"
                 f"**不拿旧快照兜底** —— 这道判定最不能承受的就是这种降级")

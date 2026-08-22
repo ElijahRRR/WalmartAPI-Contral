@@ -81,7 +81,7 @@ def run(params: dict) -> str:
 
     rows, _st = sv.enrich(items, meta, pt2cat)
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在册店与冻结快照,拒绝对账"
     try:

@@ -349,7 +349,7 @@ def _wire_bf(monkeypatch, items, status, captured):
 
     monkeypatch.setattr(bf.db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([_Conn()])))
-    monkeypatch.setattr(bf.stores_svc, "registered_names",
+    monkeypatch.setattr(bf.stores_svc, "enabled_names",
                         lambda: {"在营店", "停用店"})
     monkeypatch.setattr(bf.store_targets, "load_targets",
                         lambda: {"在营店": {"categories": [], "max_online": 500.0},

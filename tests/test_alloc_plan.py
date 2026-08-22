@@ -203,7 +203,7 @@ def _wire(monkeypatch, pool, held_brand=None, held_prod=None, claimed=None):
               "gmv": 400.0, "orders": 5.0},
         "B": {"categories": ["Home"], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0}})
-    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A", "B"})
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: {"A", "B"})
     monkeypatch.setattr(wf.product_pool, "load",
                         lambda conn, win: {"pool": [None] * len(pool), "sales": {},
                                            "refund": {}, "risk": {}, "risk_err": None})
@@ -251,7 +251,7 @@ def test_run_refuses_when_no_store_can_take_goods(monkeypatch):
     """一家店都接不了货时**明说**,不要出一张空方案表让人以为没货可分。"""
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
         "A": {"categories": [], "channel": "FBA", "max_online": 0}})
-    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: {"A"})
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
         "pool": [], "sales": {}, "refund": {}, "risk": {}, "risk_err": None})
     monkeypatch.setattr(wf.product_pool, "score_all", lambda data: ([], {}))
@@ -302,7 +302,7 @@ def _wire_directed(monkeypatch, pool, held_brand, room):
     monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
         "A": {"categories": ["Home"], "channel": "FBA", "max_online": room,
               "gmv": 400.0, "orders": 5.0}})
-    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A"})
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: {"A"})
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
         "pool": [None] * len(pool), "sales": {}, "refund": {}, "risk": {},
         "risk_err": None})
@@ -449,7 +449,7 @@ def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
               "gmv": 400.0, "orders": 5.0, "lead_limit": 5},
         "B": {"categories": [], "channel": "FBA", "max_online": 5000,
               "gmv": 400.0, "orders": 5.0, "lead_limit": 40}})
-    monkeypatch.setattr(wf.stores_svc, "registered_names", lambda: {"A", "B"})
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: {"A", "B"})
     pool = [dict(_c(f"B0SLW{i:05d}", "held0", 90.0), lead=30) for i in range(4)]
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win: {
         "pool": [None] * len(pool), "sales": {}, "refund": {}, "risk": {},

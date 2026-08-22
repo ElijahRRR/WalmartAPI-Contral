@@ -232,7 +232,7 @@ def run(params: dict) -> str:
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 限额表读不到({e}):没有类目/渠道/容量就没法分配"
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝分配"
 
@@ -625,9 +625,8 @@ def _pool_reach(stores: dict) -> dict:
     一家店可能要它,这件货就有去处,池口没有资格替发牌阶段做决定。反过来写
     (取 min / 取交集)会把一家店的严格条件强加给所有店,静默丢货。
 
-    ⚠ 用的是**参与分配的店**(在册 ∧ 规划内 ∧ participates),不是全部在册店:
-    `stores_svc.registered_names()` 连已终止的店都在里面,拿它们的限额表行去
-    放宽池口,等于让一家死店把货放进来又没人接。已满的店仍在这个集合里
+    ⚠ 用的是**参与分配的店**(在营 ∧ 规划内 ∧ participates),不是全部在营店:
+    拿一家不接货的店的限额表行去放宽池口,等于让货进来又没人接。已满的店仍在这个集合里
     (`room` 是发牌阶段的事),所以"今天恰好满了"不会被读成"我们不做这个渠道"。
     """
     rows = list(stores.values())

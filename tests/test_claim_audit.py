@@ -21,7 +21,7 @@ def _run(monkeypatch, rows, held):
     """把 IO 全替掉,只跑判定逻辑 —— 这条工作流的全部风险都在判定上。"""
     monkeypatch.setattr(ca.sv, "_fetch_meta", lambda *a, **k: {})
     monkeypatch.setattr(ca.sv, "enrich", lambda *a, **k: (rows, {}))
-    monkeypatch.setattr(ca.stores_svc, "registered_names", lambda: {"A"})
+    monkeypatch.setattr(ca.stores_svc, "enabled_names", lambda: {"A"})
     monkeypatch.setattr(ca.store_targets, "load_targets", lambda: CFG)
     monkeypatch.setattr(ca.claims, "load_active",
                         lambda conn, kind: held.get(kind, {}))
@@ -104,7 +104,7 @@ def test_claim_held_by_the_wrong_store_is_judged_against_that_store(monkeypatch)
     写成"这个键在任何店有合规行就算站得住"的话,一个被错误的店占走的品牌
     会因为正确的店也在卖它而被判成健康 —— 恰好把最该修的那条藏起来。
     """
-    monkeypatch.setattr(ca.stores_svc, "registered_names", lambda: {"A", "B"})
+    monkeypatch.setattr(ca.stores_svc, "enabled_names", lambda: {"A", "B"})
     monkeypatch.setattr(ca.store_targets, "load_targets",
                         lambda: {"A": {"categories": ["Fashion"], "channel": "FBA"},
                                  "B": {"categories": ["Home"], "channel": "FBA"}})

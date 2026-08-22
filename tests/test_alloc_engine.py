@@ -589,3 +589,27 @@ def test_without_the_shared_cap_one_store_would_take_the_whole_top_slice():
     assert body.count("_try_place(grp, here, got, take_ct, cap)") == 1, \
         "定向与自由必须走同一次 _try_place 调用,共用 take_ct 与 cap"
     assert "Counter(), None)" not in body, "定向不许绕过上限"
+
+
+def test_the_round_guard_is_recorded_when_it_actually_stops_the_deal():
+    """撞到 `max_rounds` 而停时要记下来 —— 调用方靠它喊出"不是发完了"。
+
+    ⚠ 只有**既没填满配额、池子也还有货**时才算撞栏。正常收敛(配额满 / 池子
+    见底)跑满轮次也不算 —— 把两者混起来会天天误报,人就学会忽略它了。
+    """
+    # 只有 P 收 Animals,货绝大多数是 Home ⇒ 每轮取到的大半发不出去
+    groups = ([_g(f"a{i}", 100.0 - i * 0.01, category="Animals") for i in range(5)]
+              + [_g(f"h{i}", 99.0 - i * 0.01, category="Home") for i in range(500)])
+    r = _deal(groups, {"P": _s(200, categories=["Animals"])}, slices=2)
+    assert r["params"]["capped_tiers"] == []          # 池子见底,正常收敛
+
+    r2 = ae.deal([p for g in groups for p in g],
+                 {"P": _s(200, categories=["Animals"])}, slices=2, max_rounds=1)
+    assert r2["params"]["capped_tiers"] == [1]
+    assert r2["queued"], "撞栏时池里必然还有没取的货"
+
+
+def test_a_normal_finish_is_not_reported_as_hitting_the_guard():
+    """配额填满就停 —— 那是发完了,不是被护栏截断。"""
+    r = _deal([_g(f"g{i}", 90.0 - i) for i in range(5)], {"S": _s(3)}, slices=1)
+    assert r["params"]["capped_tiers"] == []

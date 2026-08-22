@@ -307,6 +307,7 @@ def run(params: dict) -> str:
          f"{ae.SLICES} 片(每轮取「各店剩余差额之和」件,不够就再取一轮);"
          f"窗口 {win['day']} 往前 —— 店铺经营水平 {days} 天、"
          f"产品销量信号 {sales_days} 天"]
+    L += _take_ledger(taken, placed_items, result)
     # ★ 「本轮取货」单独一行(2026-08-22)。不加这一行的话,漏斗从
     #   「去掉没有店要的 60 件」直接跳到「片内组队 12 件」,读起来像丢了 48 件
     #   —— 其实那是**切口**,它们在排队,下一轮/下一批照常轮到。
@@ -392,9 +393,16 @@ def run(params: dict) -> str:
 
     if result["unplaced"]:
         why = Counter(u["reason"] for u in result["unplaced"])
-        L.append("  未发出 " + f"{len(result['unplaced']):,} 组:"
-                 + " · ".join(f"{ae.REASON_LABEL[k]} {v:,}"
-                              for k, v in why.most_common()))
+        # ⚠ **组数与件数一起报**(所有者 2026-08-22 追问「只有 26,785 个货位
+        #   为什么取了 50,457 件」)。只报组数的话,这一行跟上面的「取货」
+        #   「实发」不同单位,账对不上,人只能自己去减
+        why_n = Counter()
+        for u in result["unplaced"]:
+            why_n[u["reason"]] += int(u["group"]["size"])
+        L.append(f"  未发出 {len(result['unplaced']):,} 组 / "
+                 f"{sum(why_n.values()):,} 件:"
+                 + " · ".join(f"{ae.REASON_LABEL[k]} {why_n[k]:,} 件"
+                              for k, _ in why.most_common()))
         L += _unplaced_breakdown(result["unplaced"])
     # ★ 「我那个高分品怎么没分出去」必须答得上来(所有者 2026-08-16 追问)。
     # 分数最高的品也可能只是**排在切口之外** —— 它既不在方案表也不在未入选表,
@@ -651,6 +659,47 @@ def _unplaced_breakdown(unplaced: list) -> list[str]:
                  + " · ".join(f"{c} {n:,} 件" for c, n in by_ch.most_common())
                  + " —— 没有一家参与分配的店把「配送限制」列填成这个渠道")
     return L
+
+
+def _take_ledger(taken: int, placed: int, result: dict) -> list[str]:
+    """输入:取货量 + 实发量 + 发牌结果 → 输出:**取货去哪了**的对账行。
+
+    所有者 2026-08-22 追问:「只有 26,785 个货位为什么取了 50,457 件?」——
+    因为取货是按**产品**取的,而取进来的产品未必发得出去:过不了闸、占用店
+    不接、组队时被剔除。这三笔此前分散在报告的三个地方,且**单位还不一样**
+    (未发出报的是组数),人只能自己去减。
+
+    ⚠ 这条一定要**能对上**。对不上就说明有一笔货在实现里凭空消失了 ——
+    那种 bug 从任何单项数字上都看不出来,只有做减法才会露头,所以差额不为 0
+    时直接把它印出来,不许悄悄吞掉。
+    """
+    unplaced = sum(int(u["group"]["size"]) for u in result["unplaced"])
+    dir_out = sum(int(g["size"]) for g, _ in result["dir_out"])
+    trimmed = int(result["dir_trim"])
+    dropped = int(sum(result["dropped"].values()))
+    known = placed + unplaced + dir_out + trimmed + dropped
+    parts = [("实发", placed), ("过不了闸(未发出)", unplaced),
+             ("定向淘汰(去不了占用店)", dir_out),
+             ("定向按件剪掉", trimmed), ("组队时剔除", dropped)]
+    line = ("  取货去向:" + " + ".join(f"{k} {v:,}" for k, v in parts if v)
+            + f" = {known:,}")
+    out = [line if known == taken else
+           line + f" ⚠ **对不上取货 {taken:,},差 {taken - known:,} 件**"
+                  f" —— 这不该发生,有一笔货在实现里丢了"]
+    if taken > placed:
+        out.append(f"  ⇒ 取了 {taken:,} 件只发出 {placed:,} 件,是因为取货按"
+                   f"**产品**取,而取进来的未必发得出去(上面那几笔)。"
+                   f"每轮取「各店剩余差额之和」件,发不满就再往下取一轮 ——"
+                   f"所以总取货量高于总货位数是**正常的**,它等于"
+                   f"「为了填满配额一共往下翻了多深」")
+    cap = result["params"].get("capped_tiers") or []
+    if cap:
+        out.append(f"  ⚠⚠ **梯队 {'、'.join(map(str, cap))} 撞到轮次护栏"
+                   f"({result['params']['max_rounds']} 轮)就停了,不是发完了** ——"
+                   f"配额还没填满、池子也还有货。上面的「未发出」因此**偏小**,"
+                   f"少的那部分连片都没进。要么提高 alloc_engine.MAX_ROUNDS,"
+                   f"要么先查为什么每轮发得这么少(通常是闸把大半挡住了)")
+    return out
 
 
 def _brand_profile(free: list, directed: list) -> tuple[list, list]:

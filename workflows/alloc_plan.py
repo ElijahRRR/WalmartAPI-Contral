@@ -58,6 +58,11 @@ HEADROOM = 1.5
 # 都查不到 —— 头部是所有者真正会翻的那一段。
 QUEUE_SAMPLE = 2000
 
+# 五品类映射之外的那两个大类(Safety & Emergency / Everything Else)在画像里
+# 单占一个桶。它们**不是漏填**:所有者 2026-08-21 定的口径是"只能分给没有
+# 确定类目的店",并进别的品类等于把"谁都能收"算成"某一家专收"。
+NOT_SUPER = "(不归五品类)"
+
 # 当前在线数(容量闸的分子)。⚠ 口径与 `alloc_stores._SQL_ONLINE_NOW`、
 # KPI 表的 items_online 逐字一致(不筛 lifecycle)—— 三处必须同源,否则
 # "剩余容量"在三张表里是三个数
@@ -289,6 +294,9 @@ def run(params: dict) -> str:
     grouped = [("组队后·自由流(牌堆)", len(free), sum(x["size"] for x in free)),
                ("组队后·定向流(已占品牌)", len(directed),
                 sum(x["size"] for x in directed))]
+    # 画像在**剪之前**算:定向流后面会按件剪掉少数派(`_fit_to_store`),
+    # 剪完再量等于量自己的处置结果,那个数永远好看
+    brand_lines, brand_rows = _brand_profile(free, directed)
 
     # ── 店铺配额:每家店自己能接多少,**不从一个人为总数里分**(所有者定稿
     #    2026-08-16:"限制 3000 设置的也很奇怪…这个限制我甚至就认为不应该有")──
@@ -377,6 +385,7 @@ def run(params: dict) -> str:
                                                   for k, v in g["dropped"].most_common()))
     if data["risk_err"]:
         L.append(f"  ⚠ product_risk 读不到({data['risk_err']}):黑历史罚分全为 0")
+    L += brand_lines
 
     # ★ **真正的入场线是"最后发出去的那张牌的分",不是候选切口**。
     #   实测 2026-08-16:切口 42,705 组(组分 43.0),但配额在第 6,517 张牌上
@@ -539,6 +548,7 @@ def run(params: dict) -> str:
         p_plan, n_plan = _write_plan(result["assign"])
         p_out, n_out = _write_rejects(result["unplaced"], dir_out,
                                       below_cut[:QUEUE_SAMPLE])
+        p_brand, n_brand = _write_brands(brand_rows)
         L += ["", f"▍要上架的 {n_plan:,} 行 → {p_plan}",
               "  逐产品一行(品牌组 / 组分 / 去向店 / 逐段得分 / 层号 / 流别)。"
               "**先看上面的验收指标再看明细** —— 一家独吞是参数错了,不是模型判断"]
@@ -550,6 +560,10 @@ def run(params: dict) -> str:
                 L.append(f"  ⚠ 排队的只写了**组分最高的 {QUEUE_SAMPLE:,} 组**"
                          f"(共 {len(below_cut):,} 组)—— 全写这张表要十万行。"
                          f"要看更靠后的,先下架腾出容量让切口下移")
+        if n_brand:
+            L += [f"▍横跨多个大类的品牌组 {n_brand:,} 组 → {p_brand}",
+                  "  按**少数派件数**降序:排在最前面的就是"
+                  "「一个品牌拖着一堆做不了的货」最严重的那些(§11.3 #5 要处置的)"]
 
     if not execute:
         L += ["", f"🧪 dry-run:未落任何占用。审完方案表后去掉 --dry-run 重跑"
@@ -702,6 +716,114 @@ def _unplaced_breakdown(unplaced: list) -> list[str]:
                  + " · ".join(f"{c} {n:,} 件" for c, n in by_ch.most_common())
                  + " —— 没有一家参与分配的店把「配送限制」列填成这个渠道")
     return L
+
+
+def _brand_profile(free: list, directed: list) -> tuple[list, list]:
+    """输入:组队后的自由流 + 定向流 → 输出:(控制台行, csv 行)。
+
+    **只读画像,不参与任何判断**,回答 §11.3 #5/#6 两条未决要的那几个数:
+    组有多大、一个品牌横跨几个大类、**少数派件数**在两个口径下各是多少。
+
+    少数派 = 组内不属于组大类的那些件。它们跟着品牌去了一家做不了这个大类的
+    店,**既上不了架、又占着位置挡别人** —— 这个数就是方案 A 的标的。
+
+    ⚠ 调用点在漏斗之后:进来的候选**都已经过了「至少有一家店的条件容得下」**
+    那一闸(`_in_reach`)。所以少数派的语义是"**有店能收它,只是不是它品牌
+    去的那家**",这正是方案 A 能救的那部分;一件都没店能收的货不在此列,
+    它们的处置是开类目或放宽货期,漏斗里单独报。§11.6 的 105,571 是**全池**
+    口径,比这个数大 —— 两者不能互相印证,也不该互相印证。
+
+    ⚠ 两个口径都要报。26 类是代码现行判据,五品类是所有者心智里的大类
+    (§11.6),两者差着约 5 万件 —— 只报一个,"折到上层能救回多少"这个问题
+    就问不出来。
+    ⚠ `super_category` 返回 None 是**口径不是漏填**(Safety & Emergency /
+    Everything Else 只能分给没有确定类目的店),所以单列一个桶,不许并进别处
+    —— 并进去等于把"谁都能收"算成"某一家专收",正好反了。
+    ⚠ 组大类不在这里重算:26 类那个直接用 `alloc_groups.build` 定的
+    `g["category"]`,五品类那个走同一个 `_major`(并列按值定序)。画像与发牌
+    对不上同一个组大类,这份画像就是假的。
+    """
+    real = ([(g, "自由流") for g in free if g["brand"]]
+            + [(g, "定向流") for g in directed if g["brand"]])
+    solo = [g for g in free if not g["brand"]] + \
+           [g for g in directed if not g["brand"]]
+
+    def _super(cat) -> str:
+        return resources.super_category(cat) or NOT_SUPER
+
+    buckets = (("1 件", 1, 1), ("2–5 件", 2, 5), ("6–20 件", 6, 20),
+               ("21–100 件", 21, 100), ("100 件以上", 101, 10 ** 9))
+    by_size = {b[0]: [0, 0] for b in buckets}          # 名 → [组数, 件数]
+    sp26_g, sp26_i, sp5_g, sp5_i = (Counter() for _ in range(4))
+    minor26 = minor5 = 0
+    rows: list = []
+    for grp, flow in real:
+        n = int(grp["size"])
+        for label, lo, hi in buckets:
+            if lo <= n <= hi:
+                by_size[label][0] += 1
+                by_size[label][1] += n
+                break
+        c26 = Counter(x["category"] for x in grp["items"])
+        c5 = Counter(_super(x["category"]) for x in grp["items"])
+        maj26 = grp["category"]
+        maj5 = alloc_groups._major(_super(x["category"]) for x in grp["items"])
+        m26, m5 = n - c26.get(maj26, 0), n - c5.get(maj5, 0)
+        minor26 += m26
+        minor5 += m5
+        # 跨 4 类以上归一个桶:再往上分对处置没有区别,徒增表格行数
+        sp26_g[min(len(c26), 4)] += 1
+        sp26_i[min(len(c26), 4)] += n
+        sp5_g[min(len(c5), 4)] += 1
+        sp5_i[min(len(c5), 4)] += n
+        if m26 or m5:
+            rows.append([flow, grp.get("store") or "", grp["brand"], n,
+                         round(grp["score"], 1), maj26, maj5,
+                         len(c26), len(c5), m26, m5, grp["channel"],
+                         " | ".join(f"{k}×{v}" for k, v in sorted(
+                             c26.items(), key=lambda kv: (-kv[1], kv[0])))])
+    rows.sort(key=lambda r: (-r[10], -r[9], -r[3], r[2]))
+
+    tot = sum(int(grp["size"]) for grp, _ in real)
+    L = ["", "▍品牌组画像(组是原子的 —— 一张牌打不出去,卡住的是**一整块**货)"]
+    L.append(f"  真品牌组 {len(real):,} 组 / {tot:,} 件 · "
+             f"无品牌单品组 {len(solo):,} 组 / {len(solo):,} 件"
+             f"(每 ASIN 自成一组,不参与品牌排他)")
+    L += textfmt.table(
+        ["组规模", "组数", "件数", "占件数"],
+        [[k, f"{v[0]:,}", f"{v[1]:,}", _pct(v[1], tot)]
+         for k, v in by_size.items()], align="<>>>")
+    L += textfmt.table(
+        ["一个品牌横跨", "组数(26类)", "件数(26类)", "组数(五品类)",
+         "件数(五品类)"],
+        [[("4 类以上" if k == 4 else f"{k} 类"), f"{sp26_g[k]:,}",
+          f"{sp26_i[k]:,}", f"{sp5_g[k]:,}", f"{sp5_i[k]:,}"]
+         for k in sorted(set(sp26_g) | set(sp5_g))], align="<>>>>")
+    L.append(f"  **少数派件数**:26 类口径 {minor26:,} 件({_pct(minor26, tot)})"
+             f" · 五品类口径 {minor5:,} 件({_pct(minor5, tot)})")
+    L.append("  少数派 = 跟着品牌去了一家做不了它那个大类的店:上不了架、"
+             "还占着位置挡别人(§11.3 #5 的标的)")
+    L.append("  ⚠ 分母是**过了漏斗「去掉没有店要的」那一闸之后**的池子 —— 一件"
+             "都没有店能收的货不算少数派(它的处置是开类目/放宽货期,在漏斗那行"
+             "已单独报了)。所以这个数会**小于** §11.6 全池量出来的 105,571,"
+             "两个数说的不是同一件事")
+    return L, rows
+
+
+_BRAND_HEADER = ["流别", "去向店", "品牌", "组件数", "组分", "组大类(26类)",
+                 "组大类(五品类)", "跨26类数", "跨五品类数", "少数派件(26类)",
+                 "少数派件(五品类)", "渠道", "组内大类分布"]
+
+
+def _write_brands(rows) -> tuple[str, int]:
+    """输入:品牌组画像行 → 输出:(路径, 行数)。**只写有少数派的组** ——
+    没有少数派的组在这张表上没有任何要处置的东西,写进来只会淹掉要看的那些。"""
+    p = paths.reports_dir() / "alloc_品牌组.csv"
+    with p.open("w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(_BRAND_HEADER)
+        w.writerows(rows)
+    return str(p), len(rows)
 
 
 _HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类", "渠道",

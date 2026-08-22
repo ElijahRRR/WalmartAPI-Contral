@@ -5,6 +5,9 @@
   python cli.py store_release -p store=A085                 # 真释放
   python cli.py store_release -p brand=vtopmart             # 点名释放一个品牌
   python cli.py store_release -p asin=B08LHF7VLT            # 点名释放一个产品
+  python cli.py store_release -p brand=vtopmart -p store=A085
+        # 点名 + **限定占用店**:只有这个品牌此刻确实占在 A085 才放
+        #(不动在线快照 —— 那是个别归属调整,店还在正常经营)
   python cli.py store_release -p from_csv=<路径>/alloc_该释放占用.csv
         # 批量:吃 claim_audit 出的清单,逐条按 (类型, 占用键, **占用店**) 释放
   python cli.py store_release -p store=A085 -p mark_offline=0
@@ -90,9 +93,10 @@ def _name_key(s) -> str:
 def _reason(params: dict, store, brand, asin) -> str:
     if params.get("reason"):
         return str(params["reason"]).strip()
-    if store:
+    if not brand and not asin:
         return "store_release:整店释放"
-    return f"store_release:点名释放 {'品牌 ' + brand if brand else 'ASIN ' + asin}"
+    return (f"store_release:点名释放 {'品牌 ' + brand if brand else 'ASIN ' + asin}"
+            + (f"(限 {store})" if store else ""))
 
 
 def _read_csv(path: str) -> tuple[list, str | None]:
@@ -138,11 +142,22 @@ def run(params: dict) -> str:
     if from_csv:
         return _run_csv(params, from_csv, execute)
 
-    given = [x for x in (store, brand, asin) if x]
-    if len(given) != 1:
-        return ("⛔ 四选一:-p store=<店铺> / -p brand=<品牌> / -p asin=<ASIN>"
-                " / -p from_csv=<claim_audit 的 csv>"
-                "(一次只给一个;全空会清空整个台账,不允许)")
+    named = [x for x in (brand, asin) if x]
+    if len(named) > 1:
+        return "⛔ `-p brand=` 与 `-p asin=` 二选一,不能同时给"
+    if not named and not store:
+        return ("⛔ 至少给一个:-p store=<店铺> / -p brand=<品牌> / -p asin=<ASIN>"
+                " / -p dead=1 / -p from_csv=<claim_audit 的 csv>"
+                "(全空会清空整个台账,不允许)")
+    # ★ `-p store=` 与 brand/asin **同时给** = 点名释放**并限定占用店**
+    #   (2026-08-22)。为什么要有:按 (类型, 键) 无条件释放的话,占用如果在你
+    #   出清单之后换了店(别处释放过、重新分配过),这条命令会把**新店的好占用**
+    #   一起放掉 —— `_run_csv` 早就按三条件释放,而 claim_audit 拼给人手跑的
+    #   单条命令却没带 store,两条路径口径不一致。
+    whole_store = bool(store) and not named
+    # ⚠ **限定店的点名释放绝不许动快照**:那是个别归属调整,店还在正常经营。
+    #   不加这道判断的话 `-p brand=X -p store=A085` 会把 A085 整店标缺席
+    mark_offline = mark_offline and whole_store
 
     kind = claims.BRAND if brand else (claims.PRODUCT if asin else None)
     key = brand or asin
@@ -158,13 +173,16 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         rows = claims.preview_release(conn, store=store, kind=kind, key=key)
         online = 0
-        if store and mark_offline:
+        if mark_offline:
             with conn.cursor() as cur:
                 cur.execute(_COUNT_ONLINE_SQL, (store,))
                 online = int(cur.fetchone()[0])
 
         by_kind = Counter(k for k, _, _ in rows)
-        head = (f"{'整店 ' + store if store else ('品牌 ' + key if brand else 'ASIN ' + key)}:"
+        what = ("整店 " + store if whole_store else
+                ("品牌 " + key if brand else "ASIN " + key)
+                + (f"(限 {store})" if store else ""))
+        head = (f"{what}:"
                 f"active 占用 {len(rows)} 条"
                 + (f"(品牌 {by_kind.get(claims.BRAND, 0)} / 产品 "
                    f"{by_kind.get(claims.PRODUCT, 0)})" if rows else ""))
@@ -174,7 +192,7 @@ def run(params: dict) -> str:
             lines = [f"🧪 将释放 {head}"]
             if sample:
                 lines.append(f"   样例:{sample}" + (" …" if len(rows) > 15 else ""))
-            if store and mark_offline:
+            if mark_offline:
                 lines.append(f"   同时把该店 {online} 行在架商品标缺席"
                              f"(校正观测:店终止后商品事实上已下架;"
                              f"-p mark_offline=0 可只放占用不动快照)")
@@ -186,7 +204,7 @@ def run(params: dict) -> str:
 
         freed = claims.release(conn, reason=reason, store=store, kind=kind, key=key)
         marked = 0
-        if store and mark_offline:
+        if mark_offline:
             with conn.cursor() as cur:
                 cur.execute(_MARK_OFFLINE_SQL, (store,))
                 marked = cur.rowcount or 0

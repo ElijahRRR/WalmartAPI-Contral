@@ -112,3 +112,32 @@ def test_claim_held_by_the_wrong_store_is_judged_against_that_store(monkeypatch)
             _row("B", "S2", "B0AAAA0002", "牌", cat="Home")]   # B 准入
     out = _run(monkeypatch, rows, {claims.BRAND: {"牌": "A"}, claims.PRODUCT: {}})
     assert "1 条占用当初就不该产生" in out
+
+
+# ── 拼给人跑的释放命令(2026-08-22 生产实证补)────────────────────────
+
+def test_release_command_is_shell_quoted():
+    """⚠ 不引用时 shell 把 `-p brand=cor cordium` 拆成 `-p brand=cor` 加一个
+    多余参数 —— 匹配不到任何占用,报「无任何可释放的行」**并退出码 0**。
+    人以为放掉了,其实一条没动。带 `&` 的更糟:命令被后台化。
+    """
+    import shlex
+    for key in ("cor cordium", "knape & vogt", "magnusson's garden",
+                "phillips safety products, inc.", "tlk&fbb", "learn to brew llc"):
+        cmd = ca._release_cmd("brand", key, "A085朱丽霖")
+        parts = shlex.split(cmd)                     # shell 会怎么拆
+        assert f"brand={key}" in parts, key          # 键一字不差地到达
+        assert "store=A085朱丽霖" in parts
+
+
+def test_release_command_carries_the_holding_store():
+    """按 (类型, 键) 无条件释放的话,占用如果在出表之后换了店,这条命令会把
+    **新店的好占用**一起放掉。`_run_csv` 一直是三条件,这一列必须一致。"""
+    cmd = ca._release_cmd("asin", "B08LHF7VLT", "B023黄垂辉")
+    assert "-p asin=B08LHF7VLT" in cmd and "store=B023黄垂辉" in cmd
+
+
+def test_a_plain_key_needs_no_quotes():
+    """不含特殊字符的键别加多余引号 —— 这一列是给人看的,噪声越少越好。"""
+    assert ca._release_cmd("brand", "allgemdiy", "A085") == (
+        "python cli.py store_release -p brand=allgemdiy -p store=A085")

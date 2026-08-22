@@ -122,12 +122,23 @@ JOBS = (
     # 链也应该使用按批次拿」):product_refresh wait=1 等采完后**就地按批摄取**
     # 自己推的批(批次端点,无锁),维护判据当轮就是刚采回的值;全局对齐归
     # 单独长驻的 product_ingest(launchd 每小时)
+    # product_audit 排在 problem_scan **紧前面**(所有者定稿 2026-08-22):
+    # 在架 pass 重过 L0(纯查库零 LLM)→ 今天新拉黑/新禁售的东西当天翻成
+    # rejected → 紧接着 problem_scan 按 audit_listing_conflicts 建删除建议
+    # → problem_product_cleanup 执行。三步同一轮闭环,不用等第二天。
+    # ⚠ 三个参数一个都不能少:
+    #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
+    #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
+    #   limit 要一次扫得完 —— 这条**没有天然分页**(未命中不落结论不盖版本、
+    #   不退出候选),小 limit 会让每天都从头扫同一批前缀,尾巴永远轮不到
+    #   而且不报错
     job("product_chain",
         ["catalog_sync", "sources_backfill", "product_refresh",
          "maintenance_scan", "maintenance",
-         "problem_scan", "problem_product_cleanup"],
+         "product_audit", "problem_scan", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
-        params=["product_refresh:wait=1"],
+        params=["product_refresh:wait=1", "product_audit:mode=online",
+                "product_audit:stages=L0", "product_audit:limit=1000000"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
              "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
              "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"

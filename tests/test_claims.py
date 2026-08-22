@@ -332,7 +332,7 @@ def test_resolve_conflicts_falls_back_through_the_ladder():
         ROWS, {}, "asin", metrics)[0]
     assert key == "B0A" and keep == "A107"
     assert level == "按该店整体销量"
-    assert [d[7] for d in detail] == ["下架", "保留"]
+    assert [d.verdict for d in detail] == ["下架", "保留"]
 
 
 def test_resolve_conflicts_商品销量优先于店铺整体():
@@ -349,7 +349,7 @@ def test_resolve_conflicts_真打平才落到店名():
     key, keep, _stat, detail, level = sv.resolve_conflicts(
         ROWS, {}, "asin", ({}, {}))[0]
     assert keep == "A085" and level in (sv.LADDER[3], sv.LADDER[4])
-    assert [d[7] for d in detail] == ["保留", "下架"]
+    assert [d.verdict for d in detail] == ["保留", "下架"]
 
 
 def test_resolve_conflicts_sums_sales_per_store():
@@ -358,7 +358,9 @@ def test_resolve_conflicts_sums_sales_per_store():
     (key, keep, stat, detail, level) = sv.resolve_conflicts(
         ROWS, sales, "asin", metrics)[0]
     assert keep == "A107" and level == "按该商品销量"
-    assert dict((d[0], d[4]) for d in detail) == {"A085": 30.0, "A107": 99.0}
+    # ⚠ 按字段名取,别按列号 —— 2026-08-22 给明细插了一列「大类」,
+    #   全仓的 `d[7]` 一起错位而且不报错(把「保留/下架」读成一个数字)
+    assert {d.store: d.gmv for d in detail} == {"A085": 30.0, "A107": 99.0}
 
 
 # ── 非 ACTIVE 的店当全新店:回填一条占用都不给它建(定稿 2026-08-15 晚)──

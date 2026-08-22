@@ -797,9 +797,11 @@ def _brand_profile(free: list, directed: list) -> tuple[list, list]:
     return L, rows
 
 
-_BRAND_HEADER = ["流别", "去向店", "品牌", "组件数", "组分", "组大类(26类)",
-                 "组大类(五品类)", "跨26类数", "跨五品类数", "少数派件(26类)",
-                 "少数派件(五品类)", "渠道", "组内大类分布"]
+_BRAND_HEADER = ["流别", "去向店", "品牌", "组件数", "组分",
+                 "组大类(26类)", "组品类(五大类)",
+                 "跨大类数(26类)", "跨品类数(五大类)",
+                 "少数派件(26类)", "少数派件(五大类)",
+                 "渠道", "组内大类分布(26类)"]
 
 
 def _write_brands(rows) -> tuple[str, int]:
@@ -813,8 +815,13 @@ def _write_brands(rows) -> tuple[str, int]:
     return str(p), len(rows)
 
 
-_HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数", "大类", "渠道",
-           "ASIN", "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
+# ⚠ 四列类目并排是有意的(所有者 2026-08-22:"我看不清晰")。组大类是**多数派**,
+# 而一张牌整组去一家店 —— 商品自己的大类跟组大类不一样的那些件就是「少数派」,
+# 它们上不了架却占着位置(§11.3 #5)。只给组大类的话,那批件在表上根本看不出来。
+_HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数",
+           "组大类(26类)", "组品类(五大类)", "渠道",
+           "ASIN", "商品大类(26类)", "商品品类(五大类)",
+           "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
            "售价", "运费", "落地价", "窗口销量(件)", "窗口销售额(毛额)",
            "评分", "评论数", "配送天数"]
 
@@ -867,7 +874,10 @@ def _write_rejects(unplaced, dir_out, queued=()) -> tuple[str, int]:
 def _rows(w, flow, store, layer, grp) -> int:
     for it in grp["items"]:
         w.writerow([flow, store, layer, grp["key"], round(grp["score"], 1),
-                    grp["size"], grp["category"], grp["channel"], it["asin"],
+                    grp["size"], grp["category"],
+                    resources.super_label(grp["category"]), grp["channel"],
+                    it["asin"], it.get("category") or "",
+                    resources.super_label(it.get("category")),
                     round(it["score"], 1), round(it["base"], 1),
                     round(it["bonus"], 1), round(it["penalty"], 1), it["why"],
                     it.get("price"), it.get("shipping"),

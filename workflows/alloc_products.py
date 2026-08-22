@@ -32,7 +32,7 @@ import csv
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_survey as sv
 from services import claims, sku_asin
 from services import product_pool as pool_svc, product_score as ps
@@ -105,6 +105,7 @@ def run(params: dict) -> str:
         scores.append(c["score"])
         lf = life.get(c["asin"]) or {}
         rows.append((c["asin"], c["brand"] or "", c["category"],
+                     resources.super_label(c["category"]),
                      round(c["score"], 1), round(c["base"], 1),
                      round(c["bonus"], 1), round(c["penalty"], 1), c["why"],
                      # 配送方式(渠道):渠道闸的产品侧,决定这个品能去哪些店
@@ -179,16 +180,20 @@ def run(params: dict) -> str:
 
     paths.reports_dir().mkdir(parents=True, exist_ok=True)
     p = paths.reports_dir() / "alloc_产品分.csv"
-    rows.sort(key=lambda r: -r[3])
+    header = ["ASIN", "品牌", "大类(26类)", "品类(五大类)",
+              "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
+              "配送方式", "售价", "运费", "落地价",
+              f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
+              "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
+              "占用店", "在线店", "评分", "评论数", "配送天数", "缺失信号"]
+    # ⚠ 按**表头算下标**排序,不写死列号。2026-08-22 插「品类」那一列时,
+    #   原来的 `-r[3]` 正好排到了新插进来的字符串上 —— TypeError 还算走运,
+    #   要是插的是个数字列就会静默按错的列排。同一天在冲突明细的 `d[7]` 上
+    #   踩过同款(那次不报错,把「保留/下架」读成了一个数字)
+    rows.sort(key=lambda r: -r[header.index("产品分")])
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["ASIN", "品牌", "大类", "产品分", "口碑分", "销量加分",
-                    "罚分", "罚分原因",
-                    "配送方式", "售价", "运费", "落地价",
-                    f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
-                    "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
-                    "占用店", "在线店",
-                    "评分", "评论数", "配送天数", "缺失信号"])
+        w.writerow(header)
         w.writerows(rows)
     L += ["", f"▍明细 → {p}(按产品分降序,{len(rows):,} 行)",
           "  「缺失信号」列告诉你这一行的分是靠哪几项算出来的 ——"

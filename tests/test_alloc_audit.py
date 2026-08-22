@@ -598,7 +598,7 @@ def test_category_admission_is_a_hard_gate_before_the_ladder():
     key, keep, _st, detail, level = sv.resolve_conflicts(
         rows, sales, "asin", sv.store_metrics(rows, sales), cfg)[0]
     assert keep == "A085" and level == sv.BY_CATEGORY
-    assert [d[7] for d in detail] == ["保留", "下架"]
+    assert [d.verdict for d in detail] == ["保留", "下架"]
 
 
 def test_category_gate_skipped_when_nobody_admits():
@@ -984,11 +984,11 @@ def test_keep_and_drop_counts_are_not_expected_to_match():
                 "brand_key": "acme", "category": "Home", "published": True}])
     (key, keep, _s, detail, level) = sv.resolve_conflicts(
         rows, {}, "brand_key", sv.store_metrics(rows, {}))[0]
-    verdicts = Counter(d[7] for d in detail)
+    verdicts = Counter(d.verdict for d in detail)
     assert keep == "A" and level == "按在线件数"
     assert verdicts == {"保留": 4, "下架": 1}      # 4:1,不是 1:1
     # 不变量:每组恰好一个保留店,且两边都非空
-    assert {d[0] for d in detail if d[7] == "保留"} == {keep}
+    assert {d[0] for d in detail if d.verdict == "保留"} == {keep}
     assert verdicts["保留"] >= 1 and verdicts["下架"] >= 1
 
 

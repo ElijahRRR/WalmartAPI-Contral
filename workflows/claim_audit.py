@@ -25,7 +25,7 @@
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_survey as sv
 from services import claims, sku_asin, store_targets, stores as stores_svc
 from services import textfmt
@@ -178,10 +178,14 @@ def run(params: dict) -> str:
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = _csv.writer(fh)
         w.writerow(["类型", "占用键", "占用店", "原因", "该店在架件数",
+                    "大类(26类)", "品类(五大类)",
                     "要下架的SKU", "要下架的ASIN", "释放命令"])
         for k, key, store, why, n, here in stale:
             arg = "brand" if k == claims.BRAND else "asin"
+            cats = sorted({r.get("category") or "" for r in here} - {""})
+            sups = sorted({resources.super_label(c) for c in cats})
             w.writerow([k, key, store, why, n,
+                        "|".join(cats), "|".join(sups),
                         _join(here, "sku"), _join(here, "asin"),
                         _release_cmd(arg, key, store)])
     n_sku = len({(r["store"], r["sku"]) for _k, _key, _s, _w, _n, here in stale

@@ -232,7 +232,7 @@ def run(params: dict) -> str:
     # 全部的行、输家下架它全部的行,各店 SKU 数不一样(所有者 2026-08-15 晚
     # 按 1:1 对不上而质疑)。所以摘要报的是"要下架几件",不是"清单几行"
     drop_all = sum(1 for c in conflicts.values() for x in c
-                   for d in x[3] if d[7] == "下架")
+                   for d in x[3] if d.verdict == "下架")
     todo = [("① 填类目三列",
              f"{len(unfilled_cat)} 家店待填" if not cfg_err else "本轮没查",
              "→ alloc_类目建议.csv" if not cfg_err else
@@ -325,7 +325,7 @@ def run(params: dict) -> str:
             body.append((tag, "无", ""))
             continue
         by_level = Counter(x[4] for x in res)
-        drop = sum(1 for x in res for d in x[3] if d[7] == "下架")
+        drop = sum(1 for x in res for d in x[3] if d.verdict == "下架")
         rows_n = sum(len(x[3]) for x in res)
         body.append((tag, f"{len(res)} 组 / {rows_n} 行",
                      f"**要下架 {drop} 行**(其余 {rows_n - drop} 行是保留方,"
@@ -429,9 +429,9 @@ def run(params: dict) -> str:
         # Home Improvement 218 + Garden & Patio 96 堆出来的,他没法判合不合理
         files.append(_write_csv(
             "alloc_类目建议.csv",
-            ["店铺", "在线品类数", "建议类目分类(填这一列)", "表格已填",
-             "表格已填(折品类)", "对拍", "认不出的填写值",
-             "在线品类分布", "在线大类分布(26类,佐证)"],
+            ["店铺", "在线品类数(五大类)", "建议类目分类(填这一列·五大类)",
+             "表格已填", "表格已填(折五大类)", "对拍", "认不出的填写值",
+             "在线品类分布(五大类)", "在线大类分布(26类,佐证)"],
             [(r["store"], len(r["by_super"]), "|".join(r["suggest"]),
               "|".join(r["filled"]), "|".join(r["filled_super"]),
               # 对拍在**品类层**比:拿 26 类原文去比品类建议,永远"不一致"
@@ -448,22 +448,24 @@ def run(params: dict) -> str:
         # 都不下,而且看不出是被本轮清掉的
         files.append(_write_csv(
             "alloc_渠道不符下架清单.csv",
-            ["店铺", "限定渠道", "SKU", "ASIN", "实际渠道", "大类", "PT"],
+            ["店铺", "限定渠道", "SKU", "ASIN", "实际渠道",
+             "大类(26类)", "品类(五大类)", "PT"],
             [(r["store"], cfg[r["store"]]["channel"], r["sku"], r["asin"] or "",
-              r["channel"], r["category"] or "", r["pt"] or "")
+              r["channel"], r["category"] or "",
+              resources.super_label(r["category"]), r["pt"] or "")
              for r in offenders]))
         # ⚠ 两侧都同时给**原文与折后**四列。只给原文的实测后果:所有者看到
         # 「准入 Furniture / 商品 Home Improvement」问不出为什么不符 —— 他得
         # 自己在脑子里折一遍才对得上闸的判断。判据在品类层,清单就得把品类摆出来
         files.append(_write_csv(
             "alloc_类目不符下架清单.csv",
-            ["店铺", "准入类目(表格原文)", "准入品类", "商品大类(26类)",
-             "商品品类", "SKU", "ASIN", "PT", "渠道"],
+            ["店铺", "准入类目(表格原文)", "准入品类(五大类)",
+             "大类(26类)", "品类(五大类)", "SKU", "ASIN", "PT", "渠道"],
             [(r["store"], "|".join(cfg[r["store"]]["categories"]),
               "|".join(sorted(store_targets.super_categories_of(
                   cfg[r["store"]]))),
               r["category"],
-              resources.super_bucket(r["category"]) or "(大类未知)",
+              resources.super_label(r["category"]),
               r["sku"], r["asin"] or "", r["pt"] or "", r["channel"])
              for r in cat_bad]))
     # 店铺总览:逐店明细一次给全,控制台只留计数
@@ -471,8 +473,8 @@ def run(params: dict) -> str:
     files.append(_write_csv(
         "alloc_店铺总览.csv",
         ["店铺", "占用内", "参与分配", "单店最大在线数", "在线数", "已发布",
-         "品类数", "在售品类", "大类数(26类)", "前3大类(26类)",
-         "渠道限制", "渠道不符件数", "准入类目", "准入品类",
+         "品类数(五大类)", "在售品类(五大类)", "大类数(26类)", "前3大类(26类)",
+         "渠道限制", "渠道不符件数", "准入类目(表格原文)", "准入品类(五大类)",
          "店铺状态", "缺配置列", "近窗销售额"],
         [(s,
           # 「占用内」= 它的在线商品占不占货位。与「参与分配」是两回事:
@@ -512,15 +514,16 @@ def run(params: dict) -> str:
             # 它**确实没有占用**,而不是"我们没查"(空列有歧义,所以读不到占用
             # 时整列写「(本轮没读到)」)
             ["冲突键", "组内店铺数", "组内行数", "已有占用", "保留店", "判定依据",
-             "店铺", "SKU", "ASIN",
+             "店铺", "SKU", "ASIN", "大类(26类)", "品类(五大类)",
              f"近{sales_days}天单量", "该商品销售额", "该店该大类销售额",
              "该店整体销售额", "处置"],
             [(key, len({d[0] for d in detail}), len(detail),
               ("(本轮没读到)" if held is None
                else (held[tag].get(key) or "(无)")),
-              keep, level, s2, sku, asin, o, g, cg, sg, verdict)
+              keep, level, s2, sku, asin, cat, resources.super_label(cat),
+              o, g, cg, sg, verdict)
              for key, keep, _, detail, level in conflicts[tag]
-             for s2, sku, asin, o, g, cg, sg, verdict in detail]))
+             for s2, sku, asin, cat, o, g, cg, sg, verdict in detail]))
 
     # 销量窗口必须打出来:阶梯前三级全看销量,窗口一滑判定就可能翻。
     # 回填要照这份清单落,就得吃同一个窗口 —— 命令原样给出,不让人自己拼

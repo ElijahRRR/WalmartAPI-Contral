@@ -1080,7 +1080,7 @@ def run(params: dict) -> str:
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
-         "lead_days": 0}
+         "lead_days": 0, "no_material": 0}
     # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
@@ -1260,6 +1260,15 @@ def run(params: dict) -> str:
             reasons.append((r["rownum"],
                             f"配送 {p.get('lead_days')} 天 > 本店上限 {lead_cap} 天"))
             continue
+        # 素材闸(2026-08-22):卖点/副图这两个**必填数组**由系统从采集数据
+        # 生成,LLM 插不上手,所以此刻就能定论。不在这儿拦的话它们要走到
+        # 预备期才被 validate 拦下 —— 白打一次 LLM、白占一个当天配额名额
+        # (切片在预备期之前),而且素材是产品的固定属性,天天重来天天白烧。
+        gap = mp_mapper.material_gap(pt_spec.load_pt(r["product_type"]), p)
+        if gap:
+            n["no_material"] += 1
+            reasons.append((r["rownum"], gap))
+            continue
         qty = int(stock)
         echo[3] = w_price               # 算出定价的行回显 J 列
         if not ((p.get("attrs") or {}).get("weight")):
@@ -1300,7 +1309,7 @@ def run(params: dict) -> str:
         ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
         ("dedup", "全局去重"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
-        ("lead_days", "配送超时")) if n[key]]
+        ("lead_days", "配送超时"), ("no_material", "素材不足")) if n[key]]
     gate_line = ("闸门:" + ",".join(f"{lab} {v}" for lab, v in blocked)
                  if blocked else "闸门:一条都没拦")
     if n["stock_assumed"]:

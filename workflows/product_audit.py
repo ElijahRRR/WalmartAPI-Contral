@@ -23,6 +23,10 @@
   python cli.py product_audit -p mode=pass -p stages=L0 -p limit=1000000
                                                     # 现役 pass 全量重过 L0(黑名单翻案);
                                                     # 未命中不退出候选,**一次大 limit 扫完**
+  python cli.py product_audit -p mode=online -p stages=L0 -p limit=1000000
+                                                    # **在架** pass 重过 L0(product_chain
+                                                    # 每天 13:00 跑这一条);翻成 rejected 的
+                                                    # 由紧随其后的 problem_scan 建删除建议
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
@@ -210,8 +214,9 @@ _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
-# pass=现役 pass 重过 L0;nonpass=非 pass 全量重判
-_MODES = {"backfill", "pending", "pass", "nonpass"}
+# pass=现役 pass 重过 L0;online=**在架** pass 重过 L0(链上那条);
+# nonpass=非 pass 全量重判
+_MODES = {"backfill", "pending", "pass", "online", "nonpass"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -351,6 +356,21 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # **不退出候选** —— 小批多轮每轮都从头扫同一批,必须一次大 limit
         # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
         return "p.audit_status = 'approved'", {}
+    if mode == "online":
+        # **在架** pass 重过 L0(所有者定稿 2026-08-22:接进 product_chain,
+        # 排在 problem_scan 之前 —— 今天新拉黑的东西当天就能变成删除建议)。
+        # 与 mode=pass 只差范围:那条扫全库 approved(几十万行),这条只扫
+        # 此刻还挂在沃尔玛上的。下游 problem_scan 只认在架行
+        # (audit_listing_conflicts.rejected_still_listed),不在架的翻案
+        # 产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
+        # 口径是 `missing_since IS NULL`(还在目录里),**不加**
+        # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
+        # ⚠ 与 mode=pass 同样**没有天然分页**(未命中不落结论不盖版本、
+        # 不退出候选),所以调度里必须给一次能扫完的 limit,小 limit 会让
+        # 每天都从头扫同一批前缀,尾巴永远轮不到而且不报错。
+        return ("p.audit_status = 'approved' AND EXISTS ("
+                "SELECT 1 FROM catalog.walmart_items w "
+                "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {}
@@ -1023,10 +1043,11 @@ def run(params: dict) -> str:
         raise ValueError(f"stages 只支持 L0(收到 {stages!r});"
                          f"L3/L4 已有独立开关 -p l3=off / -p l4=on")
     only_l0 = stages == "L0"
-    if str(params.get("mode", "")).strip() == "pass" and not only_l0:
-        # pass 全量重扫只准走零 LLM 的 L0(黑名单翻案场景);全链重审全部
-        # pass = 重烧全库 LLM,真要做请用 force_rerun=<版本> 显式来
-        raise ValueError("mode=pass 只与 stages=L0 连用"
+    if str(params.get("mode", "")).strip() in ("pass", "online") and not only_l0:
+        # pass/online 重扫只准走零 LLM 的 L0(黑名单翻案场景);全链重审全部
+        # pass = 重烧全库 LLM,真要做请用 force_rerun=<版本> 显式来。
+        # online 那条还挂在 product_chain 上天天跑,更不能让它打 LLM
+        raise ValueError("mode=pass / mode=online 只与 stages=L0 连用"
                          "(加 -p stages=L0;全链重审请用 force_rerun)")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义

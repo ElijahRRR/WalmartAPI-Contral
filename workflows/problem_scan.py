@@ -44,9 +44,20 @@ import logging
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
-from services import product_events
+from services import product_events, store_limits
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
+
+# 审核判拒的删除:**单店单轮上限**(限额表「下架限制」列,与维护链删除、
+# product_clear 同一个配额口径)。
+# 为什么必须有(2026-08-22 把 product_audit 接进 product_chain 时补):接链
+# 之后「翻案 → 建议 → 删除」整条是**无人值守**的,而一次黑名单导入或规则
+# 收紧可能同时翻掉上千个在架行 —— 没有刹车的话 13:00 那一轮会一次性全部
+# 提交,而 DELETE_ITEM 不可逆。超上限的**不是丢弃,是留到下轮**:每天削一层,
+# 人有时间在摘要里发现不对。
+# ⚠ 限额表读不到时**退到常量而不是不限**(fail-closed):这道闸的存在意义
+# 就是防"一次删光",读不到表就退回不限等于闸不存在。
+_AUDIT_DELETE_PER_STORE = 300      # 与 maintenance_intents.DELETE_PER_STORE 同值
 
 logger = logging.getLogger("workflows.problem_scan")
 
@@ -366,21 +377,50 @@ def _push_sheets() -> str:
     return blacklist_sheet.push_after()
 
 
+def _audit_caps() -> dict[str, int]:
+    """输入:无 → 输出:{店铺: 单轮删除上限}(限额表「下架限制」)。
+
+    读不到表**不是退到不限**,是让每家店都退到 `_AUDIT_DELETE_PER_STORE`
+    ——由调用方按缺省值处理。fail-closed 是这道闸唯一说得通的方向。
+    """
+    try:
+        return store_limits.retire_caps()
+    except Exception as e:                      # noqa: BLE001 — 读表失败不炸链
+        logger.warning("限额表「下架限制」读不到(%s):审核判拒删除本轮按每店 "
+                       "%d 条封顶", e, _AUDIT_DELETE_PER_STORE)
+        return {}
+
+
 def _audit_rejected_rows(conn, inflight: set, inactive: set,
-                         only: str | None) -> list[dict]:
-    """输入:连接 + 去重状态 → 输出:审核判拒但仍在架的建议行。
+                         only: str | None,
+                         caps: dict[str, int] | None = None
+                         ) -> tuple[list[dict], dict[str, int]]:
+    """输入:连接 + 去重状态(+单店上限)→ 输出:(判拒仍在架的建议行, 超额分布)。
 
     与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
     ——审核已经给出结论了,这里不需要再猜沃尔玛为什么不高兴。
+
+    单店上限见 `_AUDIT_DELETE_PER_STORE` 的注释:超出的留到下轮,不丢弃。
+    视图按 store 有序与否不保证,所以**先按 (店铺, SKU) 定序再切**——
+    不定序的话每轮削掉的是随机的一批,削了几天也说不清削到哪儿了。
     """
     with conn.cursor() as cur:
         cur.execute(_SQL_AUDIT_REJECTED)
         rows = cur.fetchall()
-    out = []
-    for store, sku, asin, reason, after_listing in rows:
+    caps = _audit_caps() if caps is None else caps
+    out: list[dict] = []
+    per_store: dict[str, int] = {}
+    over: dict[str, int] = {}
+    for store, sku, asin, reason, after_listing in sorted(
+            rows, key=lambda r: (str(r[0]), str(r[1]))):
         if only and store != only:
             continue
         if store in inactive or (store, sku) in inflight:
+            continue
+        cap = int(caps.get(store, _AUDIT_DELETE_PER_STORE))
+        per_store[store] = per_store.get(store, 0) + 1
+        if per_store[store] > cap:
+            over[store] = over.get(store, 0) + 1
             continue
         out.append({
             "store": store, "sku": sku, "asin": asin, "source": "audit",
@@ -389,7 +429,9 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             "detail": {"audit_reason": reason,
                        "rejected_after_listing": bool(after_listing)},
         })
-    return out
+    if over:
+        logger.warning("审核判拒删除超单店上限,本轮留下:%s(下轮继续)", over)
+    return out, over
 
 
 def run(params: dict) -> str:
@@ -408,7 +450,16 @@ def run(params: dict) -> str:
     lines: list[str] = []
 
     with db.pg_conn() as conn:
-        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        audit_rows, over_cap = _audit_rejected_rows(
+            conn, inflight, inactive, only)
+        if over_cap:
+            # 删除不可逆,削掉多少必须见人 —— 静默截断会让人以为"今天就这么多"
+            lines.append(
+                f"  ⚠ 超单店删除上限,本轮留下 {sum(over_cap.values())} 个"
+                f"(下轮继续):"
+                + ",".join(f"{s}×{n}" for s, n in sorted(over_cap.items()))
+                + "。上限取限额表「下架限制」,缺该店退 "
+                + f"{_AUDIT_DELETE_PER_STORE}")
         if audit_rows:
             late = sum(1 for r in audit_rows
                        if r["detail"].get("rejected_after_listing"))

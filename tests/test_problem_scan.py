@@ -143,15 +143,58 @@ def test_audit_rejected_respects_the_same_gates(monkeypatch):
     class _Conn:
         def cursor(self): return _Cur()
 
-    rows = scan._audit_rejected_rows(_Conn(), inflight={("T1", "S_FLY")},
-                                     inactive={"T_OFF"}, only=None)
-    assert [r["sku"] for r in rows] == ["S1"]
+    rows, over = scan._audit_rejected_rows(
+        _Conn(), inflight={("T1", "S_FLY")}, inactive={"T_OFF"}, only=None,
+        caps={})
+    assert [r["sku"] for r in rows] == ["S1"] and not over
     assert rows[0]["source"] == "audit" and rows[0]["action"] == "delete"
     assert rows[0]["asin"] == "B01" and "知产" in rows[0]["reason"]
     # 先上架后被判拒的标记随建议行带走:它是审核链漏拦的线索,
     # 与"该不该删"是两个问题,所以只进 detail 不改 action
     assert rows[0]["detail"]["rejected_after_listing"] is True
     assert rows[0]["action"] == "delete"
+
+
+def test_audit_deletes_are_capped_per_store():
+    """审核判拒的删除有**单店单轮上限**(2026-08-22 接 product_chain 时补)。
+
+    product_audit 进链之后「翻案 → 建议 → 删除」整条是无人值守的,而一次
+    黑名单导入或规则收紧可能同时翻掉上千个在架行 —— 没有刹车的话那一轮会
+    一次性全提交,DELETE_ITEM 不可逆。超上限的**留到下轮不丢弃**,而且要
+    在摘要里见人。上限取限额表「下架限制」,缺该店退 `_AUDIT_DELETE_PER_STORE`。
+    """
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): pass
+        def fetchall(self):
+            return ([("T1", f"S{i:03d}", f"B{i:03d}", "禁售", False)
+                     for i in range(5)]
+                    + [("T2", f"K{i:03d}", f"C{i:03d}", "知产", False)
+                       for i in range(3)])
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    rows, over = scan._audit_rejected_rows(
+        _Conn(), inflight=set(), inactive=set(), only=None,
+        caps={"T1": 2})                       # T1 限 2;T2 未配 → 退默认值
+    assert [r["sku"] for r in rows if r["store"] == "T1"] == ["S000", "S001"]
+    assert over == {"T1": 3}                  # 削掉的条数要报出来
+    assert len([r for r in rows if r["store"] == "T2"]) == 3   # 没到默认上限
+    # 定序切片:不定序的话每轮削掉的是随机一批,削了几天说不清削到哪儿
+    assert scan._AUDIT_DELETE_PER_STORE == 300
+
+
+def test_audit_caps_fail_closed(monkeypatch):
+    """限额表读不到 ⇒ 退到常量,**不是退到不限**。
+
+    这道闸的存在意义就是防"一次删光";读不到表就不限,等于闸不存在,
+    而且恰好在配置出问题的那天最危险。
+    """
+    monkeypatch.setattr(scan.store_limits, "retire_caps",
+                        lambda: (_ for _ in ()).throw(LookupError("限额表未登记")))
+    assert scan._audit_caps() == {}            # 调用方按缺省值 300 处理
 
 
 def test_preview_writes_nothing(monkeypatch):
@@ -163,7 +206,7 @@ def test_preview_writes_nothing(monkeypatch):
                         lambda conn, rows: (_ for _ in ()).throw(
                             AssertionError("preview 不许写建议行")))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only: [])
+                        lambda conn, inflight, inactive, only, caps=None: ([], {}))
 
     import contextlib
     from registry import db as _db

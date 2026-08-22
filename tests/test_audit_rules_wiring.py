@@ -147,6 +147,34 @@ def test_pick_where_four_states():
     assert w == "p.audit_status = 'approved'"
 
 
+def test_pick_where_online_scopes_to_listed_rows():
+    """mode=online:**在架** pass 重过 L0(product_chain 每天 13:00 那条)。
+
+    与 mode=pass 只差范围。为什么要收窄:下游 problem_scan 只认在架行
+    (`audit_listing_conflicts.rejected_still_listed`),不在架的翻案产不出
+    任何动作 —— 白扫一遍还把 audit_runs 灌大。
+    口径是 `missing_since IS NULL`(还在目录里),**不加** published_status:
+    UNPUBLISHED 的行也占着账号、也删得掉。
+    """
+    w, e = product_audit._pick_where({"mode": "online"})
+    assert "p.audit_status = 'approved'" in w and e == {}
+    assert "catalog.walmart_items" in w and "missing_since IS NULL" in w
+    assert "published_status" not in w
+    assert "online" in product_audit._MODES
+
+
+def test_online_mode_is_pinned_to_l0(monkeypatch):
+    """mode=online 只准零 LLM:它挂在 product_chain 上天天跑。
+
+    忘了 stages=L0 就该**起不来**,而不是默默打一轮全库 LLM
+    (与 mode=pass 同款钉死)。
+    """
+    with pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "online"})
+    with pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "pass"})
+
+
 def test_pick_where_nonpass_covers_all_three_non_pass_states():
     """非 pass 全量重判(所有者定稿 2026-08-21:判定标准改了就整批重认一次)。
 

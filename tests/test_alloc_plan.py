@@ -568,6 +568,30 @@ def test_conflicting_asin_and_brand_claims_are_counted_not_silently_shipped():
     assert [x["asin"] for x in r["directed"][0]["items"]] == ["B0AAAA0001"]
 
 
+def test_all_dashes_says_whether_the_top_layer_had_any_free_flow(
+        monkeypatch, tmp_path):
+    """⚠ 全表「—」有两种成因,读反了会得出相反结论。
+
+    ① 每家自由流量都没过门槛 = 样本太小,别当信号;
+    ② **顶层一件自由流都没有** ⇒ base=0 ⇒ 全体一律 None —— 这时门槛过没过
+       根本不影响结果,而含义是**反堆积这一轮压根没被验证过**。
+
+    生产实测 2026-08-16:定向流 25,420 / 自由流 3,078 那一跑,15 家全是「—」,
+    其中好几家的自由流远超门槛(82杨乾良 587 件 vs 门槛 386)—— 照 ① 去读
+    会以为"量小而已,没事"。
+    """
+    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 高分的**每个都是独立的已占品牌** —— 牌堆顶部整整几层全是定向流,
+    # 自由流只能从下面拿。合成一个品牌不行:那只是一张牌,占不满 L1
+    pool = ([_c(f"B0OWNED{i:04d}", f"own{i}", 95.0 - i * 0.01) for i in range(300)]
+            + [_c(f"B0FREE{i:05d}", f"new{i}", 50.0 - i * 0.01) for i in range(300)])
+    _wire(monkeypatch, pool, held_brand={f"own{i}": "A" for i in range(300)},
+          claimed=[])
+    out = wf.run({"execute": False})
+    assert "本轮全表无比值" in out and "顶层一件自由流都没有" in out
+    assert "反堆积这一轮没有被验证过" in out
+
+
 def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
         monkeypatch, tmp_path):
     """⚠ 容量闸必须压在类目/货期之上 —— 店满了的时候,类目对不对不影响结果。

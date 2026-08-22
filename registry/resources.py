@@ -762,6 +762,32 @@ _UNMAPPED_CATEGORIES = ("Safety & Emergency", "Everything Else")
 WALMART_CATEGORIES = tuple(sorted(_SUPER_CATEGORY_OF)) + _UNMAPPED_CATEGORIES
 
 
+def _fold(v) -> str:
+    """输入:任意填写值 → 输出:比对用的归一键(小写 + 内部空白压单空格)。
+
+    限额表「类目1/2/3」是**人手填的**,而同一张表的「配送限制」列早就做了
+    `fba/FBA/Fba` 都认(`store_targets._channel` 的 `.upper()`)—— 类目这三列
+    漏了。2026-08-22 实测:所有者填「hardlines」,查不到规范名 `Hardlines`,
+    被静默兜进「其他」⇒ 这家店的准入从 Hardlines 变成了「只收归不到的货」,
+    **没有任何报错**。
+    ⚠ 只归一大小写与空白,**不做别的猜测**:不去标点、不认中文译名、不做
+    近似匹配。猜错一次就是一家店收错一批货,而占用撤不回。真填错了就让
+    `known_category_literal` 报出来,人改一格比代码猜一辈子强。
+    """
+    return " ".join(str(v or "").lower().split())
+
+
+# 归一键 → 规范值。26 类映到它的品类,五品类与「其他」映到自己。
+_BUCKET_INDEX = {
+    **{_fold(c): b for c, b in _SUPER_CATEGORY_OF.items()},
+    **{_fold(c): SUPER_OTHER for c in _UNMAPPED_CATEGORIES},
+    **{_fold(b): b for b in SUPER_BUCKETS},
+}
+
+# 认得的填写值(归一键)。与 `_BUCKET_INDEX` 同源 —— 两处各列一遍必然漂。
+_KNOWN_LITERALS = frozenset(_BUCKET_INDEX)
+
+
 def super_category(category: str | None) -> str | None:
     """输入:Walmart Category → 输出:五大品类之一,或 None(**归不到**)。
 
@@ -788,26 +814,29 @@ def super_bucket(category: str | None) -> str | None:
     采不到**的货 —— 而那批货的处置是补采集,不是分给谁。`category_offenders`
     也正是靠这条区分才没把"不知道"当成"违规"。
 
+    ⚠ **大小写与多余空白不算认不出**(`hardlines` = `Hardlines`)—— 这三列
+    是人手填的,与同表「配送限制」列的 `fba/FBA` 一视同仁。
+
     ⚠ **认不出的字面量也归「其他」**,不再像原来那样被静默丢掉。丢掉时
     表里一个拼写错误会让店变成"填了但空集 = 谁也接不了";归「其他」则是
     "只收归不到的货"。两种都不对,但后者不会静默把一家店废掉,而且
     `alloc_audit` 会把认不出的值单独点名(见 `known_category_literal`)。
     """
-    cat = (category or "").strip()
-    if not cat:
+    key = _fold(category)
+    if not key:
         return None
-    return _SUPER_CATEGORY_OF.get(cat, SUPER_OTHER)
+    return _BUCKET_INDEX.get(key, SUPER_OTHER)
 
 
 def known_category_literal(value: str | None) -> bool:
     """输入:限额表「类目1/2/3」里的一个填写值 → 输出:这个值认不认得。
 
-    认得的三种:26 个 `Walmart Category` 之一、五大品类之一、或「其他」。
+    认得的三种:26 个 `Walmart Category` 之一、五大品类之一、或「其他」;
+    **大小写与多余空白不算错**(`hardlines` = `Hardlines`,见 `_fold`)。
     认不出的会被 `super_bucket` 折进「其他」——**不报出来就是静默改变准入**,
     所以 `alloc_audit` 必须逐店点名(拼写错、旧类目名、随手写的中文都在此列)。
     """
-    v = (value or "").strip()
-    return bool(v) and (v in WALMART_CATEGORIES or v in SUPER_BUCKETS)
+    return _fold(value) in _KNOWN_LITERALS
 
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或

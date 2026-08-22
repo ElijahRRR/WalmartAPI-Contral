@@ -134,3 +134,44 @@ def test_real_supers_drops_unclassified_but_keeps_other():
     p = {"categories": Counter({sv.UNCLASSIFIED: 5, "Everything Else": 3,
                                 "Home": 2})}
     assert sv.real_supers(p) == [resources.SUPER_OTHER, "Home"]
+
+
+# ── 人手填的三列:大小写与空白 ────────────────────────────────────────
+
+def test_filled_values_are_matched_case_insensitively():
+    """⚠ 2026-08-22 生产实测的真 bug:所有者填「hardlines」,查不到规范名
+    `Hardlines`,被**静默**兜进「其他」—— 这家店的准入从 Hardlines 变成了
+    "只收归不到的货",没有任何报错,报告还把它列成"认不出"。
+
+    同一张表的「配送限制」列早就 `fba/FBA/Fba` 都认,类目这三列漏了。
+    """
+    r = _one({"A085": _prof(Home=300, **{"Home Improvement": 120})},
+             {"A085": {"categories": ["Home", "hardlines"]}})
+    assert r["filled_super"] == ["Hardlines", "Home"]   # 规范名,不是「其他」
+    assert r["unknown"] == []
+    assert set(r["suggest"]) == {"Home", "Hardlines"}
+    assert r["filled_super"] == sorted(r["suggest"])    # 对拍应判"一致"
+
+
+def test_case_and_spacing_do_not_change_the_gate():
+    from services import store_targets as st
+    for v in ("hardlines", "HARDLINES", " Hardlines ", "Hardlines"):
+        row = {"categories": [v]}
+        assert st.super_categories_of(row) == {"Hardlines"}
+        assert st.allowed(row, "Home Improvement") is True
+        assert st.allowed(row, "Furniture") is False
+
+
+def test_walmart_categories_also_match_case_insensitively():
+    """26 类名同样宽容 —— 所有者填的是类目名还是品类名,这一列都收。"""
+    assert resources.super_bucket("FURNITURE") == "Home"
+    assert resources.super_bucket("garden & patio") == "Hardlines"
+    assert resources.known_category_literal("everything else") is True
+
+
+def test_folding_does_not_guess_beyond_case_and_space():
+    """只归一大小写与空白,**不做别的猜测**:近似匹配猜错一次就是一家店收错
+    一批货,而占用撤不回。真填错了让报告点名,人改一格比代码猜一辈子强。"""
+    for junk in ("Hoem", "家居", "Home-Improvement", "Hardline"):
+        assert resources.known_category_literal(junk) is False
+        assert resources.super_bucket(junk) == resources.SUPER_OTHER

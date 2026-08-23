@@ -52,19 +52,27 @@ def _p(**kw):
 # ── B1 品牌精准黑名单 ─────────────────────────────────────────────────────────
 
 BRANDS = {"ikea": "IKEA", "ernie ball": "Ernie Ball", "n/a": "N/A",
-          "无": "无", "nexgrill": "Nexgrill"}
+          "无": "无", "nexgrill": "Nexgrill",
+          # 所有者 2026-08-23 在飞书品牌总表登记的是大写 GENERIC;
+          # 键侧一律小写(audit_rules._brand_map 规整),原文回显保留大写
+          "generic": "GENERIC", "oem": "OEM"}
 
 
 @pytest.mark.parametrize("brand,blocked", [
     ("IKEA", True),            # B1-1
     ("ikea", True),            # B1-2 大小写不敏感
     ("  Ernie   Ball ", True), # B1-3 空白压一
-    ("N/A", False),            # B1-4 占位符优先于黑名单
+    ("N/A", False),            # B1-4 占位符优先于黑名单(未撤下的 17 项照旧)
     ("n / a", False),          # B1-5 变体不识别(内部空格保留)
     ("", False), ("   ", False),   # B1-7
     ("无", False),             # B1-8 中文占位符
     ("IKEA Furniture", False), # B1-9 等值非前缀
     ("Nexgrill", True),        # B1-10 yaml additional_hard_brands 同池
+    # B1-11/12/13(2026-08-23 所有者撤下 generic/oem/various):登记了就拦。
+    # 大小写两侧都规整,飞书写 GENERIC / 产品写 Generic 落同一个键
+    ("Generic", True), ("GENERIC", True), ("  oem ", True),
+    # B1-14 撤下 ≠ 无条件拦:黑名单里没登记的照旧放行(查表落空)
+    ("various", False),
 ])
 def test_brand_blacklist_vectors(brand, blocked):
     r = audit_phase0.check(_p(brand=brand), _ctx(brands=BRANDS))
@@ -74,6 +82,27 @@ def test_brand_blacklist_vectors(brand, blocked):
         assert h.rule_code == "phase0_brand_blacklist" and h.penalty == -100
         assert h.detail["source"] == "blacklist_center"
         assert h.detail["match_type"] == "exact"
+
+
+def test_placeholder_whitelist_no_longer_shields_generic_oem_various():
+    """撤下的三项(所有者定稿 2026-08-23)不再挡在黑名单前面。
+
+    起因:飞书品牌总表登记了 GENERIC,审核却对 brand=Generic 的产品照发
+    pass —— _check_brand 在查黑名单**之前**先过白名单就短路返回了。
+    白名单原本的假设是"占位符出现在黑名单里 = 飞书录错了",而所有者是
+    **故意**登记的,代码分不出这两种情况,故按所有者口径交还黑名单裁决。
+
+    ⚠ 同时钉住**不能顺手同步改**的那一半:services/brand_key.PLACEHOLDERS
+    必须仍含这三个词。两张表方向相反 —— 这边多留一个词只是少拦一个黑名单
+    品牌,占用键那边少留一个词就是 "Generic" 变成排他占用键,把成千上万个
+    无关产品锁进同一家店,而占用没有自动释放。
+    """
+    from services import brand_key as bk
+    gone = {"generic", "oem", "various"}
+    assert not (gone & audit_phase0._NON_BRAND_PLACEHOLDERS)
+    assert len(audit_phase0._NON_BRAND_PLACEHOLDERS) == 17
+    assert gone <= bk.PLACEHOLDERS              # 占用键那边一个都不许少
+    assert bk.brand_key("Generic", "OEM") is None    # 仍是真·无品牌,不占用
 
 
 def test_brand_detail_keeps_raw_value():

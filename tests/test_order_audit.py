@@ -371,6 +371,23 @@ def test_plan_waves_skips_blocked():
     assert waves == [[("B1", "90210")]]
 
 
+def test_rescrape_window_tracks_the_audit_window():
+    """重采窗口 = 审核窗口(所有者定稿 2026-08-22:1 天 → 3 天)。
+
+    待审行按 `days`(默认 3)挑,重采只死磕 1 天的话,后两天那些行挂着
+    「待采集」而系统早就放弃了 —— 两个数必须同进同退。钉的是**关系**不是
+    数值:哪天改了 days 默认值,这条会红,提醒你一起想重采窗口。
+
+    ⚠ 与 `_SNAPSHOT_FRESH_HOURS` 是两件事:那个管"快照多久算陈旧",也是
+    「上次推送已过期 ⇒ 视为新需求、窗口重置」的判据。重采窗口拉长不该让
+    "新需求"的门槛跟着变,所以两者**故意不相等**。
+    """
+    from workflows import order_audit as aw
+    assert aw._RESCRAPE_WINDOW_HOURS == aw._DEFAULT_DAYS * 24 == 72
+    assert aw._SNAPSHOT_FRESH_HOURS == 24
+    assert aw._RESCRAPE_WINDOW_HOURS != aw._SNAPSHOT_FRESH_HOURS
+
+
 def test_plan_waves_all_blocked_gives_nothing():
     assert rules.plan_waves([("B1", "10001")], {("B1", "10001")}) == []
 

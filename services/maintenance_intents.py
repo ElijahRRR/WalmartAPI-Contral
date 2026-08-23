@@ -251,9 +251,10 @@ def title_sim_dual(wm_name, slow):
 
     基准一 = 完整拼接标题;基准二 = 主标题(subtitle 拆得出时)。取 **max**:
     「像两种形态里的任何一种都算像」(所有者定稿 2026-08-19)。为什么:
-    上架默认口径是长标题,但内容拒捞回通道用**主标题**重上——单基准下
-    这些行相似度 ~0.6,title_mismatch 会把自己刚捞回的商品删掉;将来
-    整体切短标题口径也天然兼容,不用再改比对。
+    上架默认口径是长标题,但**在架存量里有一批是主标题(短标题)上的**
+    ——单基准下这些行相似度只有 ~0.6,title_mismatch 会把它们当成串货删掉。
+    ⚠ 当初造这批短标题行的「内容拒捞回」通道已于 2026-08-23 撤除,但**行还在线**,
+    所以双基准不能跟着撤;将来整体切短标题口径也天然兼容,不用再改比对。
     """
     sims = [order_audit.title_similarity(wm_name, processed_title(slow))]
     mt = main_processed_title(slow)
@@ -568,7 +569,7 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
             # 于是该删的行照样产一条库存意图,执行件先花配额清零再花配额删
             # (2026-08-16 演练实见 B0MISMATCH 10 → 7)。
             # ⚠ 用 title_sim_dual,与删除/改价/改标题**同一个算法**(2026-08-20
-            # 对齐):单基准把"内容拒捞回重上的短标题行"算成 ~0.6,停闸恢复后
+            # 对齐):单基准把"在架的短标题存量行"算成 ~0.6,停闸恢复后
             # 本 provider 会判它该删而删除链(双基准)不删 —— 那批行既不清零
             # 也不删,悄悄脱管。四个 provider 问同一个判据,就得喂同样的数。
             title_similarity=title_sim_dual(r["product_name"], r["slow"]),
@@ -625,8 +626,8 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         if not new_title or new_title == (product_name or ""):
             continue
         if (product_name or "") == main_processed_title(slow):
-            # 在架标题 = 主标题(内容拒捞回用短标题重上的行):**不改回长标题**
-            # ——改回去等于把捞回的修复亲手撤销,下一轮又被内容审查拒一遍
+            # 在架标题 = 主标题(短标题存量行):**不改回长标题** —— 这批行当初
+            # 就是长标题被内容审查拒了才换的短标题,改回去等于自找再拒一遍
             continue
         if not product_type or not upc:
             skipped_incomplete += 1     # 三缺一跳过(旧防线)

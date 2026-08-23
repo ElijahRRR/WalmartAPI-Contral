@@ -1192,7 +1192,7 @@ def test_main_processed_title_exact_removesuffix():
 
 
 def test_title_sim_dual_takes_the_better_basis():
-    """双基准取 max:在架标题=主标题(内容拒捞回重上的短标题行)时,
+    """双基准取 max:在架标题=主标题(在架的短标题存量行)时,
     单基准 ~0.6 会误判"不是同一个商品",双基准 = 1.0。"""
     wm = mi.processed_title({"title": _LONG, "brand": None})    # 短标题在架
     single = mi.order_audit.title_similarity(wm, mi.processed_title(_SLOW_SPLIT))
@@ -1202,9 +1202,13 @@ def test_title_sim_dual_takes_the_better_basis():
 
 
 def test_short_title_row_survives_delete_and_retitle(monkeypatch):
-    """捞回重上的短标题行:①删除判据(即使停闸恢复后)不再命中
-    title_mismatch;②改标题 provider 不把它改回长标题(改回去 = 亲手撤销
-    捞回修复,下一轮又被内容审查拒一遍);③库存/改价 provider 也认双基准。
+    """在架的短标题存量行:①删除判据(即使停闸恢复后)不再命中
+    title_mismatch;②改标题 provider 不把它改回长标题(这批行当初就是长标题
+    被内容审查拒了才换的短标题,改回去 = 自找再拒一遍);③库存/改价
+    provider 也认双基准。
+
+    ⚠ 造出这批行的「内容拒捞回」通道已于 2026-08-23 撤除,**但行还在线**,
+    所以这三条防线一条都不能跟着撤 —— 撤了就是维护链自己把它们删掉/改坏。
 
     ③ 是 2026-08-20 补的:库存链此前拿**单基准**相似度问 classify,短标题行
     在它眼里 ~0.6 = 该删,于是不产库存意图;而删除链用双基准不删它 ——

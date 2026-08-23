@@ -144,9 +144,65 @@ def _wire_rel(monkeypatch, conn):
                         contextlib.contextmanager(lambda: iter([conn])))
 
 
-def test_store_release_requires_exactly_one_target(monkeypatch):
-    assert rel.run({}).startswith("⛔ 四选一")
-    assert rel.run({"store": "A", "brand": "b"}).startswith("⛔ 四选一")
+def test_store_release_refuses_an_empty_target(monkeypatch):
+    """全空会清空整个台账。"""
+    assert rel.run({}).startswith("⛔ 至少给一个")
+
+
+def test_store_release_refuses_brand_and_asin_together(monkeypatch):
+    assert rel.run({"brand": "b", "asin": "B0X"}).startswith("⛔ ")
+
+
+def test_store_qualifies_a_named_release_instead_of_conflicting(monkeypatch):
+    """★ `-p brand=X -p store=A` = 只有这个品牌**此刻确实占在 A** 才放。
+
+    为什么要有:按 (类型, 键) 无条件释放的话,占用如果在你出清单之后换了店,
+    这条命令会把**新店的好占用**一起放掉。`_run_csv` 早就按三条件释放,
+    claim_audit 拼给人手跑的单条命令却没带 store —— 两条路径口径不一致。
+    """
+    seen = {}
+
+    class _C:
+        def cursor(self):
+            raise AssertionError("限定店的点名释放不许碰在线快照")
+
+    monkeypatch.setattr(rel.claims, "preview_release",
+                        lambda c, **kw: seen.update(kw) or [])
+    _wire_rel(monkeypatch, _C())
+    out = rel.run({"brand": "acme", "store": "A085", "execute": False})
+    assert seen == {"store": "A085", "kind": rel.claims.BRAND, "key": "acme"}
+    assert "品牌 acme(限 A085)" in out
+
+
+def test_a_qualified_release_never_marks_the_whole_store_offline(monkeypatch):
+    """⚠ 不加这道判断的话 `-p brand=X -p store=A085` 会把 A085 **整店**标缺席
+    —— 那是个别归属调整,店还在正常经营。"""
+    marked = []
+
+    class _Cur:
+        rowcount = 0
+
+        def execute(self, sql, args=None):
+            marked.append(sql)
+
+        def fetchone(self):
+            return (0,)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _C:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setattr(rel.claims, "preview_release", lambda c, **kw: [])
+    monkeypatch.setattr(rel.claims, "release", lambda c, **kw: [])
+    _wire_rel(monkeypatch, _C())
+    rel.run({"brand": "acme", "store": "A085", "execute": True})
+    assert not [q for q in marked if "missing_since" in q]
 
 
 def test_store_release_csv_needs_the_claim_audit_header(monkeypatch, tmp_path):
@@ -276,7 +332,7 @@ def test_resolve_conflicts_falls_back_through_the_ladder():
         ROWS, {}, "asin", metrics)[0]
     assert key == "B0A" and keep == "A107"
     assert level == "按该店整体销量"
-    assert [d[7] for d in detail] == ["下架", "保留"]
+    assert [d.verdict for d in detail] == ["下架", "保留"]
 
 
 def test_resolve_conflicts_商品销量优先于店铺整体():
@@ -293,7 +349,7 @@ def test_resolve_conflicts_真打平才落到店名():
     key, keep, _stat, detail, level = sv.resolve_conflicts(
         ROWS, {}, "asin", ({}, {}))[0]
     assert keep == "A085" and level in (sv.LADDER[3], sv.LADDER[4])
-    assert [d[7] for d in detail] == ["保留", "下架"]
+    assert [d.verdict for d in detail] == ["保留", "下架"]
 
 
 def test_resolve_conflicts_sums_sales_per_store():
@@ -302,7 +358,9 @@ def test_resolve_conflicts_sums_sales_per_store():
     (key, keep, stat, detail, level) = sv.resolve_conflicts(
         ROWS, sales, "asin", metrics)[0]
     assert keep == "A107" and level == "按该商品销量"
-    assert dict((d[0], d[4]) for d in detail) == {"A085": 30.0, "A107": 99.0}
+    # ⚠ 按字段名取,别按列号 —— 2026-08-22 给明细插了一列「大类」,
+    #   全仓的 `d[7]` 一起错位而且不报错(把「保留/下架」读成一个数字)
+    assert {d.store: d.gmv for d in detail} == {"A085": 30.0, "A107": 99.0}
 
 
 # ── 非 ACTIVE 的店当全新店:回填一条占用都不给它建(定稿 2026-08-15 晚)──
@@ -349,7 +407,7 @@ def _wire_bf(monkeypatch, items, status, captured):
 
     monkeypatch.setattr(bf.db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([_Conn()])))
-    monkeypatch.setattr(bf.stores_svc, "registered_names",
+    monkeypatch.setattr(bf.stores_svc, "enabled_names",
                         lambda: {"在营店", "停用店"})
     monkeypatch.setattr(bf.store_targets, "load_targets",
                         lambda: {"在营店": {"categories": [], "max_online": 500.0},

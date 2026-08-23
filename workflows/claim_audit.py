@@ -25,7 +25,7 @@
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_survey as sv
 from services import claims, sku_asin, store_targets, stores as stores_svc
 from services import textfmt
@@ -36,6 +36,27 @@ logger = logging.getLogger("workflows.claim_audit")
 
 
 _SAMPLE = 20        # 单元格里塞几百个 SKU 谁也读不了,超了就截断并标出来
+
+
+def _release_cmd(arg: str, key: str, store: str) -> str:
+    """输入:(brand|asin, 占用键, 占用店) → 输出:**能直接粘进 shell 跑**的释放命令。
+
+    两条都是 2026-08-22 生产实证补的,补之前这一列拼出来的命令会**静默无操作**:
+
+    1. **必须 shlex 引用。** 品牌键里有空格、逗号、单引号、`&` 的多得很
+       (`cor cordium` / `phillips safety products, inc.` / `magnusson's garden` /
+       `knape & vogt`)。不引用时 shell 把 `-p brand=cor cordium` 拆成
+       `-p brand=cor` 加一个多余参数 —— 匹配不到任何占用,于是报「无任何可释放
+       的行」**并退出码 0**。人以为放掉了,其实一条没动。带 `&` 的更糟:命令被
+       后台化,后半截当成另一条命令去执行。
+    2. **必须带 `-p store=`。** 按 (类型, 键) 无条件释放的话,占用如果在你出这
+       份 csv 之后换了店(别处释放过、重新分配过),这条命令会把**新店的好占用**
+       一起放掉。`store_release._run_csv` 一直是按三条件释放的 —— 这一列不带
+       store,等于同一件事两条路径两个口径。
+    """
+    import shlex
+    return ("python cli.py store_release "
+            f"-p {shlex.quote(f'{arg}={key}')} -p {shlex.quote(f'store={store}')}")
 
 
 def _reason(rows, cfg) -> str:
@@ -81,7 +102,7 @@ def run(params: dict) -> str:
 
     rows, _st = sv.enrich(items, meta, pt2cat)
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在册店与冻结快照,拒绝对账"
     try:
@@ -157,12 +178,16 @@ def run(params: dict) -> str:
     with p.open("w", newline="", encoding="utf-8-sig") as fh:
         w = _csv.writer(fh)
         w.writerow(["类型", "占用键", "占用店", "原因", "该店在架件数",
+                    "大类(26类)", "品类(五大类)",
                     "要下架的SKU", "要下架的ASIN", "释放命令"])
         for k, key, store, why, n, here in stale:
             arg = "brand" if k == claims.BRAND else "asin"
+            cats = sorted({r.get("category") or "" for r in here} - {""})
+            sups = sorted({resources.super_label(c) for c in cats})
             w.writerow([k, key, store, why, n,
+                        "|".join(cats), "|".join(sups),
                         _join(here, "sku"), _join(here, "asin"),
-                        f"python cli.py store_release -p {arg}={key}"])
+                        _release_cmd(arg, key, store)])
     n_sku = len({(r["store"], r["sku"]) for _k, _key, _s, _w, _n, here in stale
                  for r in here})
     L += ["", f"▍明细 → {p}",
@@ -171,7 +196,15 @@ def run(params: dict) -> str:
           "  不用再回头对渠道/类目不符下架清单。",
           "  ⚠ 同一件货会在 brand 行与 product 行各出现一次(一件货同时拖着",
           "  它的品牌占用和它自己的产品占用),按 SKU 去重后才是真的件数。",
-          "", "  最后一列是拼好的释放命令。**先挑几条 dry-run 看清楚再批量跑** ——",
-          "  释放本身可逆(released 行永不删),但释放后这个品牌会被下一轮",
-          "  分配给别的店,那一步就不可逆了。"]
+          "",
+          f"  ▸ **批量释放就一条命令,别一条条粘**(逐条粘 {len(stale)} 次,"
+          f"漏一条你也不会知道):",
+          f"      python cli.py store_release -p from_csv={p} --dry-run",
+          "      看清楚再去掉 --dry-run。它按(类型, 占用键, **占用店**)三条件",
+          "      逐条放 —— 占用在你出表之后换了店的那些会自然放不到,归进",
+          "      「跳过」计数,而不是把新店的好占用误放。",
+          "  ▸ 最后一列是**单条**释放命令,给你挑着放用的(已 shell 引用、已带",
+          "    占用店 —— 品牌名里有空格/逗号/`&` 的不引用会静默放不到)。",
+          "  ⚠ 释放本身可逆(released 行永不删),但释放后这个品牌会被下一轮",
+          "  分配给别的店,**那一步就不可逆了**。"]
     return "\n".join(L)

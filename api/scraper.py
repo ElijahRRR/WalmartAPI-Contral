@@ -59,6 +59,20 @@ _warned_no_token = False
 
 
 def _headers() -> dict:
+    """输入:无 → 输出:采集侧请求头(只有鉴权;没配 token 时空 dict)。
+
+    ⚠⚠ **绝不能在这里设 `Accept-Encoding`**(2026-08-21 采集侧上 gzip 后立的规矩)。
+    httpx 默认发 `accept-encoding: gzip, deflate` 并自动解压 —— gzip 生效**全靠
+    这个默认协商**,本仓一行代码都没为它改过。手写这个头(哪怕只是想加别的头时
+    顺手带一个 `identity`)会覆盖默认值,**gzip 静默失效、没有任何告警**,只是
+    每页从 0.3 秒退回 10 秒级,而那种慢是会被当成"采集侧又抖了"的。
+
+    生产实测(2026-08-21,`/api/export/incremental` 一页 500 条):
+        未压缩 2,869 KB / 3.3~10.9s   →   gzip 后 694 KB / 0.30s(压缩比 4.1:1)
+        每条记录约 5.7 KB
+    ⚠ 只声明 gzip / deflate:本仓 httpx 的解码器就这两个(外加 identity),
+    采集侧若改用 br / zstd 且不看协商直接压,我们拿到的是解不开的字节流。
+    """
     global _warned_no_token
     token = os.environ.get("SCRAPER_EXPORT_TOKEN", "").strip()
     if not token:

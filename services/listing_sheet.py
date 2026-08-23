@@ -39,6 +39,8 @@ from services import feed_track, kpi, upc_pool
 logger = logging.getLogger("services.listing_sheet")
 
 _COLS = 21          # A~U
+_APPEND_BLOCK = 500 # 单次写飞书的行数上限(一次裹上千行会被 90202 拒;
+                    # 与 maint_sheet 同值,那边是实遇被拒后定的)
 PENDING_O = ("", "处理中", "ASYNC_PENDING")   # O 列这些值反哺器继续跟
 
 
@@ -69,6 +71,61 @@ def read_rows(upto: str | None = None) -> list[dict]:
             d["rownum"] = rownum
             rows.append(d)
     return rows
+
+
+def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, int]:
+    """输入:[(店铺, ASIN)] → 输出:(写入行数, 起始行号)。**只写 A/B 两列。**
+
+    分配器把定好的货追加进上架表,E 列留空即「待审」—— 审核链下一轮
+    (`product_audit -p from_sheet=1`)自动领走。这是 §9.2 定的列权责:
+    **A/B 人工域的机器化**,分配器写完这两列就完事。
+    ⚠ **绝不许顺手写 E 列 `pass`**:那是伪造审核结论。而且伪造也没用 ——
+    上架闸读的是 `catalog.products`,只会骗到人眼。
+
+    ★ **不用 `ops.cursors` 水位,直接从表里算下一空行** —— 这里有意偏离
+    `maint_sheet.append_records` 的成例,理由是两张表的所有权不同:
+    维护记录表**程序是唯一写入方**,水位不会被别人动;上架表是**运营在手工
+    编辑**的,插行删行随时发生。存了水位反而危险:
+      · 有人删了几十行 ⇒ 水位停在表尾之外,追加会在中间留一片空行;
+      · 水位与表实际状态一旦不一致,谁也说不清该信哪个。
+    而这里本来就要**整读一遍 A/B 做去重**(同一个 ASIN 不能重复派工),
+    那一次读顺手就给出了"最后一个非空行" —— 一次读同时解决位置与去重,
+    还不用维护第二份状态。
+    ★ 附带的好处:**中途失败自愈**。写了三块挂在第四块时不用记账 ——
+    下次跑重新读表,已写进去的三块自然被去重掉,只补剩下的。
+    """
+    if not pairs:
+        return 0, 0
+    sheet = resources.LISTING_SHEET.require()
+    have = read_rows(upto="asin")
+    seen = {r["asin"] for r in have if r["asin"]}
+    todo = [(st, a) for st, a in pairs if a not in seen]
+    if not todo:
+        return 0, 0
+    start = (max((r["rownum"] for r in have), default=1)) + 1
+
+    if not execute:
+        for st, a in todo[:20]:
+            logger.info("[DRY-RUN] 将追加 第%d行 A=%s B=%s", start, st, a)
+        if len(todo) > 20:
+            logger.info("[DRY-RUN] …另有 %d 行省略", len(todo) - 20)
+        return len(todo), start
+
+    feishu.sheet_ensure_rows(sheet, start + len(todo))
+    written = 0
+    for i in range(0, len(todo), _APPEND_BLOCK):
+        block = todo[i:i + _APPEND_BLOCK]
+        row0 = start + i
+        try:
+            feishu.sheet_write_ranges(sheet, [
+                (f"A{row0}:B{row0 + len(block) - 1}",
+                 [[st, a] for st, a in block])])
+        except Exception:
+            logger.error("上架表追加到第 %d 行时失败,已写 %d 行 —— 重跑即可,"
+                         "已写的会被去重跳过", row0, written)
+            raise
+        written += len(block)
+    return written, start
 
 
 def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:

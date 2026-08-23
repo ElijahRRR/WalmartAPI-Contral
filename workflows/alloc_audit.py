@@ -45,13 +45,15 @@
 
 三条口径纪律(2026-08-15 对抗式审查后定,每条都对应一次会算错数的实例):
 
-1. **冻结行不进冲突**:A1/A2/A3/A5 只吃"仍在册店铺"的行。已从凭证表删除的
-   店,其 walmart_items 行永久冻结为"在架"(catalog_sync 只扫在册店),
-   混进来会让所有者为一家不存在的店去下架另一家店真在卖的 listing。
+1. **冻结行不进冲突**:A1/A2/A3/A5 只吃"仍在营店铺"的行。已停用(或已从
+   凭证表删除)的店,其 walmart_items 行永久冻结为"在架"(catalog_sync 只扫
+   在营店),混进来会让所有者为一家不做了的店去下架另一家店真在卖的 listing。
    排除了多少必须打印——静默兜底等于主路径坏了没人知道。
-2. **"不在册" ≠ "被过滤"**:A4 用 `stores.registered_names()`(凭证表全集)
-   判在册,不用 `load_stores()`(它按启用/代理筛过)——后者会把"代理没配的
-   在营店"误判成死店,而死店清单直通整店释放。
+2. **"不在营" ≠ "被过滤"**:判在营用 `stores.enabled_names()`(在册 ∧ 勾了
+   「启用」,所有者定稿 2026-08-22),**不用** `load_stores()`——后者还筛
+   ClientId/代理,会把"代理没配的在营店"误判成死店,而死店清单直通整店释放。
+   ⚠ 也**不用** `registered_names()`:它连「启用」都不看,勾了停用的店会被
+   当成还在营,于是它的冻结行继续拦着别的店上架(2026-08-22 前正是如此)。
 3. **未知不算不符**:渠道判不符只在两侧都是 FBA/FBM 且不同时;采集没采到、
    或采出第三种值,都单列计数——把"没采到"算成"货不对"会让无辜商品进下架清单。
 
@@ -62,9 +64,9 @@ import csv
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, paths, resources
 from services import alloc_survey as sv
-from services import sku_asin, store_targets, stores as stores_svc
+from services import claims, sku_asin, store_targets, stores as stores_svc
 from services import textfmt
 
 DANGEROUS = False
@@ -122,10 +124,10 @@ def run(params: dict) -> str:
     rows, st = sv.enrich(items, meta, pt2cat)
     prof_all = sv.store_profiles(rows)          # 全量(含不在册店):A4/A7 点名用
 
-    # 在册店名(凭证表全集,不做启用/代理过滤——见模块 docstring 纪律 2)
+    # 在营店名(在册 ∧ 勾了「启用」;不做 ClientId/代理过滤——见纪律 2)
     registered, reg_err = None, None
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                    # noqa: BLE001 报告降级,不阻断
         reg_err = str(e)
     live_api, live_err = None, None
@@ -138,8 +140,19 @@ def run(params: dict) -> str:
         cfg = store_targets.load_targets()
     except Exception as e:                    # noqa: BLE001
         cfg_err = str(e)
+    # ★ 已有占用(2026-08-22)。冲突判定必须先看它 —— 占用是**决策**不是观测,
+    #   报告拿销量把一个已经有主的品牌判给别人,人照做就会"货下了、品牌还锁着"。
+    #   ⚠ 读不到时**不静默退回销量阶梯**:那正是会给出相反建议的那条路,
+    #     报告要显式说"本轮没看占用"。
+    held, held_err = None, None
+    try:
+        with db.pg_conn() as _c:
+            held = {"同品牌": claims.load_active(_c, claims.BRAND),
+                    "同 ASIN": claims.load_active(_c, claims.PRODUCT)}
+    except Exception as e:                    # noqa: BLE001
+        held_err = str(e)
 
-    # 冻结行(不在册店的在线行)不进冲突分析——纪律 1
+    # 冻结行(不在营店的在线行)不进冲突分析——纪律 1
     frozen = ({s for s in prof_all if s not in registered}
               if registered is not None else set())
     # 规划范围外的店(registry.alloc_excluded_stores,当前=店名含「谭总」):
@@ -179,10 +192,14 @@ def run(params: dict) -> str:
     metrics = sv.store_metrics(claim_rows, sales)
     conflicts = {}
     for tag, field in (("同 ASIN", "asin"), ("同品牌", "brand_key")):
-        conflicts[tag] = sv.resolve_conflicts(claim_rows, sales, field,
-                                              metrics, cfg)
-    over = sorted(((s, p) for s, p in prof.items() if len(sv.real_cats(p)) > 2),
-                  key=lambda x: (-len(sv.real_cats(x[1])), -x[1]["n"], x[0]))
+        conflicts[tag] = sv.resolve_conflicts(
+            claim_rows, sales, field, metrics, cfg,
+            held=held.get(tag) if held else None)
+    # ⚠ 「碎不碎」按**品类层**数(2026-08-22)。按 26 类数的实测后果:
+    # 47 家有货店里 41 家"超 2 大类",而它们绝大多数只是 Home + Hardlines
+    # 两个品类 —— 报出来的是一份所有者无从下手的名单,因为闸根本不按 26 类判
+    over = sorted(((s, p) for s, p in prof.items() if len(sv.real_supers(p)) > 2),
+                  key=lambda x: (-len(sv.real_supers(x[1])), -x[1]["n"], x[0]))
     # 渠道:没取渠道就没有结论。算出来必是 0,而"不符 0 件"读起来正好像
     # 全店合规 —— 这一节必须显式说"本轮没查",不能拿 0 冒充结论
     can_channel = bool(cfg) and with_channel
@@ -215,7 +232,7 @@ def run(params: dict) -> str:
     # 全部的行、输家下架它全部的行,各店 SKU 数不一样(所有者 2026-08-15 晚
     # 按 1:1 对不上而质疑)。所以摘要报的是"要下架几件",不是"清单几行"
     drop_all = sum(1 for c in conflicts.values() for x in c
-                   for d in x[3] if d[7] == "下架")
+                   for d in x[3] if d.verdict == "下架")
     todo = [("① 填类目三列",
              f"{len(unfilled_cat)} 家店待填" if not cfg_err else "本轮没查",
              "→ alloc_类目建议.csv" if not cfg_err else
@@ -285,7 +302,7 @@ def run(params: dict) -> str:
                                f"({'、'.join(sorted(out_of_scope)[:6])})"
                                f" —— 不占用、不算冲突,**销量仍计入**"))
     if frozen:
-        body.append(("已排除", f"不在册店冻结 {len(frozen)} 家"
+        body.append(("已排除", f"不在营店冻结 {len(frozen)} 家"
                                f"({'、'.join(sorted(frozen)[:6])})"
                                f" —— 整店释放见 store_release"))
     if registered is None:
@@ -308,7 +325,7 @@ def run(params: dict) -> str:
             body.append((tag, "无", ""))
             continue
         by_level = Counter(x[4] for x in res)
-        drop = sum(1 for x in res for d in x[3] if d[7] == "下架")
+        drop = sum(1 for x in res for d in x[3] if d.verdict == "下架")
         rows_n = sum(len(x[3]) for x in res)
         body.append((tag, f"{len(res)} 组 / {rows_n} 行",
                      f"**要下架 {drop} 行**(其余 {rows_n - drop} 行是保留方,"
@@ -317,6 +334,27 @@ def run(params: dict) -> str:
                          f"{k.removeprefix('按')} {v}"
                          for k, v in by_level.most_common(3))))
     L += ["", "▍冲突(只算规划内店铺)"] + textfmt.grid(body)
+    if held_err:
+        L.append(f"  ⚠ **占用台账读不到({held_err}):本轮没看占用**,上面全是"
+                 f"按销量阶梯判的。已经有主的品牌可能被判给别人 —— "
+                 f"**先修好再照着做**")
+    elif held is not None:
+        n_held = sum(len(v) for v in held.values())
+        stuck = [x for tag in ("同 ASIN", "同品牌")
+                 for x in conflicts[tag] if x[4] == sv.CLAIM_STUCK]
+        by_claim = sum(1 for tag in ("同 ASIN", "同品牌")
+                       for x in conflicts[tag] if x[4] == sv.BY_CLAIM)
+        if not n_held:
+            L.append("  占用台账是**空的**(还没跑过 alloc_backfill),"
+                     "所以这一轮全按销量阶梯判 —— 回填之后重跑,结论可能变")
+        else:
+            L.append(f"  占用台账 {n_held:,} 条:其中 {by_claim} 组**按占用定**"
+                     f"(不看销量,占用是决策不是观测)")
+        if stuck:
+            L.append(f"  ⚠ **{len(stuck)} 组占用站不住**:占用店手上的货踩了"
+                     f"类目/渠道闸。报告**不替你改判给第二名** —— 那等于绕过"
+                     f"store_release 撤一条不可逆的决策。先释放再重跑:"
+                     + "、".join(f"{x[1]}:{x[0]}" for x in stuck[:4]))
     if not sales:
         # 销量全空时阶梯必然一路降到"在线件数/店名",那是打平不是判定。
         # 不说破的话,csv 里每行都写着判定依据,看起来像是真判过了
@@ -329,8 +367,9 @@ def run(params: dict) -> str:
     # ── ▍店铺 ──
     body = []
     if over:
-        body.append(("超 2 大类", f"{len(over)} 家", "最碎:" + "、".join(
-            f"{s}({len(sv.real_cats(p))} 类)" for s, p in over[:3])))
+        body.append(("超 2 品类", f"{len(over)} 家", "最碎:" + "、".join(
+            f"{s}({len(sv.real_supers(p))} 品类 / {len(sv.real_cats(p))} 个 26 类)"
+            for s, p in over[:3])))
     if non_active:
         body.append(("非 ACTIVE", f"{len(non_active)} 家",
                      "SUSPENDED,**占用按设计保持不动**;"
@@ -371,7 +410,7 @@ def run(params: dict) -> str:
     if live_err:
         # 读不到就没有「配置缺失 vs 真不在册」这一栏,而不是"一家都没有"
         notes.append(f"店铺配置读不到({live_err}),本轮没法区分"
-                     f"「缺代理/ClientId 的在营店」和「真不在册的死店」")
+                     f"「缺代理/ClientId 的在营店」和「已停用的死店」")
     if notes:
         L += ["", "▍要留意"] + [f"  · {x}" for x in notes]
 
@@ -383,54 +422,81 @@ def run(params: dict) -> str:
     files = []
     if cfg is not None and not cfg_err:
         sug = sv.suggest_categories(prof, cfg)
+        # ⚠ 建议出在**品类层**(所有者 2026-08-22)——闸判的就是这一层。
+        # 出 26 类的建议 = 让所有者照着填一份闸门不按它判的东西:填
+        # 「Home」+「Furniture」以为开了两类,闸看见的是同一个 Home。
+        # 26 类留在最后一列当**佐证**:只说"建议 Hardlines"而不说它是
+        # Home Improvement 218 + Garden & Patio 96 堆出来的,他没法判合不合理
         files.append(_write_csv(
             "alloc_类目建议.csv",
-            ["店铺", "在线大类数", "建议类目(在线数top2)", "表格已填", "对拍",
-             "在线大类分布"],
-            [(s, len(rk), "|".join(top), "|".join(filled),
-              "一致" if set(filled) == set(top) else ("未填" if not filled
-                                                      else "不一致"),
-              "; ".join(f"{c}×{x}" for c, x in rk[:8]))
-             for s, top, rk, filled in sug]))
+            ["店铺", "在线品类数(五大类)", "建议类目分类(填这一列·五大类)",
+             "表格已填", "表格已填(折五大类)", "对拍", "认不出的填写值",
+             "在线品类分布(五大类)", "在线大类分布(26类,佐证)"],
+            [(r["store"], len(r["by_super"]), "|".join(r["suggest"]),
+              "|".join(r["filled"]), "|".join(r["filled_super"]),
+              # 对拍在**品类层**比:拿 26 类原文去比品类建议,永远"不一致"
+              ("未填" if not r["filled"] else
+               "一致" if set(r["filled_super"]) == set(r["suggest"])
+               else "不一致"),
+              "|".join(r["unknown"]),
+              "; ".join(f"{c}×{x}" for c, x in r["by_super"]),
+              "; ".join(f"{c}×{x}" for c, x in r["by_category"][:8]))
+             for r in sug]))
     if can_channel:
         # ⚠ 只在真查过渠道时才写这份。`-p channel=0` 时 offenders 必空,照写
         # 会把上一轮跑出来的下架清单覆盖成空表 —— 所有者照着空表下架 = 什么
         # 都不下,而且看不出是被本轮清掉的
         files.append(_write_csv(
             "alloc_渠道不符下架清单.csv",
-            ["店铺", "限定渠道", "SKU", "ASIN", "实际渠道", "大类", "PT"],
+            ["店铺", "限定渠道", "SKU", "ASIN", "实际渠道",
+             "大类(26类)", "品类(五大类)", "PT"],
             [(r["store"], cfg[r["store"]]["channel"], r["sku"], r["asin"] or "",
-              r["channel"], r["category"] or "", r["pt"] or "")
+              r["channel"], r["category"] or "",
+              resources.super_label(r["category"]), r["pt"] or "")
              for r in offenders]))
+        # ⚠ 两侧都同时给**原文与折后**四列。只给原文的实测后果:所有者看到
+        # 「准入 Furniture / 商品 Home Improvement」问不出为什么不符 —— 他得
+        # 自己在脑子里折一遍才对得上闸的判断。判据在品类层,清单就得把品类摆出来
         files.append(_write_csv(
             "alloc_类目不符下架清单.csv",
-            ["店铺", "准入类目", "商品大类", "SKU", "ASIN", "PT", "渠道"],
+            ["店铺", "准入类目(表格原文)", "准入品类(五大类)",
+             "大类(26类)", "品类(五大类)", "SKU", "ASIN", "PT", "渠道"],
             [(r["store"], "|".join(cfg[r["store"]]["categories"]),
-              r["category"], r["sku"], r["asin"] or "", r["pt"] or "",
-              r["channel"])
+              "|".join(sorted(store_targets.super_categories_of(
+                  cfg[r["store"]]))),
+              r["category"],
+              resources.super_label(r["category"]),
+              r["sku"], r["asin"] or "", r["pt"] or "", r["channel"])
              for r in cat_bad]))
     # 店铺总览:逐店明细一次给全,控制台只留计数
     _ACCEPT = {True: "是", False: "否(填了0)", None: "(未填)"}
     files.append(_write_csv(
         "alloc_店铺总览.csv",
         ["店铺", "占用内", "参与分配", "单店最大在线数", "在线数", "已发布",
-         "大类数", "前3大类", "渠道限制", "渠道不符件数", "准入类目",
+         "品类数(五大类)", "在售品类(五大类)", "大类数(26类)", "前3大类(26类)",
+         "渠道限制", "渠道不符件数", "准入类目(表格原文)", "准入品类(五大类)",
          "店铺状态", "缺配置列", "近窗销售额"],
         [(s,
           # 「占用内」= 它的在线商品占不占货位。与「参与分配」是两回事:
           # SUSPENDED 店占用照旧保持(占用内=是),但可以把它的最大在线数
           # 填 0 让它暂时不接新货(参与分配=否)
           "否(规划外)" if s in out_of_scope else
-          ("否(不在册)" if s in frozen else "是"),
+          ("否(不在营)" if s in frozen else "是"),
           _ACCEPT[store_targets.accepts_allocation(cfg.get(s))] if cfg else "",
           "" if (cfg.get(s) or {}).get("max_online") is None
              else int(cfg[s]["max_online"]),
-          p["n"], p["published"], len(sv.real_cats(p)),
+          p["n"], p["published"],
+          len(sv.real_supers(p)), "|".join(sv.real_supers(p)),
+          len(sv.real_cats(p)),
           "; ".join(f"{c}×{x}" for c, x in p["categories"].most_common(3)
                     if c != sv.UNCLASSIFIED),
           (cfg.get(s) or {}).get("channel") or "",
           next((m[2] for m in mism if m[0] == s), 0),
           "|".join((cfg.get(s) or {}).get("categories") or []),
+          # 准入品类:闸真正看见的东西。与左边一列并排,人才能一眼看出
+          # 「填了 Home + Furniture」其实只开了一个 Home
+          "|".join(sorted(store_targets.super_categories_of(cfg.get(s))))
+          if cfg else "",
           status.get(s) or "(无KPI)",
           "/".join(miss_cfg.get(s, [])),
           round((metrics[0].get(s) or {}).get("gmv", 0.0), 2))
@@ -444,14 +510,20 @@ def run(params: dict) -> str:
             # 保留它**全部**的行、输家下架它**全部**的行,各店 SKU 数不一样,
             # 所以保留数与下架数**本来就不相等**(所有者 2026-08-15 晚按 1:1
             # 对不上而质疑)。把分组摊在每一行上,这件事就不用解释了
-            ["冲突键", "组内店铺数", "组内行数", "保留店", "判定依据",
-             "店铺", "SKU", "ASIN",
+            # 「已有占用」单独一列而不是只靠「判定依据」:阶梯判的组也要看得出
+            # 它**确实没有占用**,而不是"我们没查"(空列有歧义,所以读不到占用
+            # 时整列写「(本轮没读到)」)
+            ["冲突键", "组内店铺数", "组内行数", "已有占用", "保留店", "判定依据",
+             "店铺", "SKU", "ASIN", "大类(26类)", "品类(五大类)",
              f"近{sales_days}天单量", "该商品销售额", "该店该大类销售额",
              "该店整体销售额", "处置"],
-            [(key, len({d[0] for d in detail}), len(detail), keep, level,
-              s2, sku, asin, o, g, cg, sg, verdict)
+            [(key, len({d[0] for d in detail}), len(detail),
+              ("(本轮没读到)" if held is None
+               else (held[tag].get(key) or "(无)")),
+              keep, level, s2, sku, asin, cat, resources.super_label(cat),
+              o, g, cg, sg, verdict)
              for key, keep, _, detail, level in conflicts[tag]
-             for s2, sku, asin, o, g, cg, sg, verdict in detail]))
+             for s2, sku, asin, cat, o, g, cg, sg, verdict in detail]))
 
     # 销量窗口必须打出来:阶梯前三级全看销量,窗口一滑判定就可能翻。
     # 回填要照这份清单落,就得吃同一个窗口 —— 命令原样给出,不让人自己拼

@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **71 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **72 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
@@ -383,6 +383,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `alloc_products` | | 产品分体检 |
 | `alloc_stores` | | 店铺经营水平体检 |
 | `alloc_plan` | 危 | 产品分配方案 |
+| `alloc_push` | 危 | 已落占用 → 追加进飞书上架表 A/B 两列(分配链与上架链的接口) |
 | `alloc_backfill` | 危 一 | 存量在线商品 → 占用台账 |
 | `claim_audit` | | 占用台账对账:已落的占用现在还站得住吗 |
 | `store_release` | 危 | 释放占用(整店 / 点名品牌 / 点名 ASIN) |

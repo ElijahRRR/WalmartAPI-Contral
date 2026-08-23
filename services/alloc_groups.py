@@ -5,8 +5,16 @@
 
 由此带来三个必须在这里定死的决定 —— 三个都会静默地把货分错地方:
 
-1. **组分 = 组内最高产品分**(§7.5)。取中位数会让"一个爆款带一堆平庸品"的
-   品牌整体掉下去,而那正是最该抢的品牌。
+1. **组分 = 0.7×组内均分 + 0.3×组内最高分**(所有者 2026-08-22 拍 Q1)。
+   ⚠ **这条 2026-08-22 改过,理由跟着切口一起变了。**原来是纯取最高分,
+   道理是"取中位数会让一个爆款带一堆平庸品的品牌整体掉下去,而那正是最该
+   抢的品牌"—— 那个道理成立的**前提是切口在组这一层做**:全池组队、按组分
+   切口,不取最高分就抢不到好品牌。
+   切口挪到**产品层**之后(先按产品分取 top-N,再在 N 里分片组队),平庸品
+   在切口那一步就挡住了,进片的本来就只有好品 —— 均分不会再把爆款拖下去,
+   而纯取最高分反而会把"一个 95 分带四十个 41 分"的组整体拉到前排。
+   保留 0.3 的最高分权重是所有者的选择:有爆款的品牌仍然优先,只是不再
+   一俊遮百丑。
 2. **组大类 = 组内件数最多的大类**。一个品牌横跨两个大类时,少数派那部分
    跟着走 —— 因为它们本来就只能跟品牌走。**件数并列时按大类名定序**,
    否则同样的输入会给出不同的组大类(占用撤不回,不许有随机)。
@@ -30,6 +38,20 @@ from services import brand_key as bk
 logger = logging.getLogger("services.alloc_groups")
 
 NO_BRAND = "(无品牌)"
+
+# 组分权重(所有者 2026-08-22 拍 Q1:"组分用加权")。两个数必须加起来为 1,
+# 否则组分就不在 0~100 这个量纲上,跟产品分没法互相印证。
+SCORE_W_AVG, SCORE_W_MAX = 0.7, 0.3
+
+
+def group_score(items) -> float:
+    """输入:组内产品 → 输出:组分(唯一出处)。
+
+    单独一个函数而不是写在 `build` 里:`alloc_engine` 的分片发牌要按组分排序,
+    报告要按组分展示,两处再各算一遍就会漂。
+    """
+    vals = [float(x["score"]) for x in items]
+    return SCORE_W_AVG * (sum(vals) / len(vals)) + SCORE_W_MAX * max(vals)
 
 
 def _major(vals) -> str | None:
@@ -97,7 +119,7 @@ def build(candidates: list, claimed_brands: dict | None = None,
                 continue
         leads = [x.get("lead") for x in keep]
         g = {"key": gk, "brand": b["brand"],
-             "score": max(x["score"] for x in keep),
+             "score": group_score(keep),
              "size": len(keep),
              "category": _major(x["category"] for x in keep),
              # 取**最长**;任一件采不到就整组未知 —— 见模块 docstring 第 3 条

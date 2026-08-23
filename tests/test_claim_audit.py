@@ -21,7 +21,7 @@ def _run(monkeypatch, rows, held):
     """把 IO 全替掉,只跑判定逻辑 —— 这条工作流的全部风险都在判定上。"""
     monkeypatch.setattr(ca.sv, "_fetch_meta", lambda *a, **k: {})
     monkeypatch.setattr(ca.sv, "enrich", lambda *a, **k: (rows, {}))
-    monkeypatch.setattr(ca.stores_svc, "registered_names", lambda: {"A"})
+    monkeypatch.setattr(ca.stores_svc, "enabled_names", lambda: {"A"})
     monkeypatch.setattr(ca.store_targets, "load_targets", lambda: CFG)
     monkeypatch.setattr(ca.claims, "load_active",
                         lambda conn, kind: held.get(kind, {}))
@@ -104,7 +104,7 @@ def test_claim_held_by_the_wrong_store_is_judged_against_that_store(monkeypatch)
     写成"这个键在任何店有合规行就算站得住"的话,一个被错误的店占走的品牌
     会因为正确的店也在卖它而被判成健康 —— 恰好把最该修的那条藏起来。
     """
-    monkeypatch.setattr(ca.stores_svc, "registered_names", lambda: {"A", "B"})
+    monkeypatch.setattr(ca.stores_svc, "enabled_names", lambda: {"A", "B"})
     monkeypatch.setattr(ca.store_targets, "load_targets",
                         lambda: {"A": {"categories": ["Fashion"], "channel": "FBA"},
                                  "B": {"categories": ["Home"], "channel": "FBA"}})
@@ -112,3 +112,32 @@ def test_claim_held_by_the_wrong_store_is_judged_against_that_store(monkeypatch)
             _row("B", "S2", "B0AAAA0002", "牌", cat="Home")]   # B 准入
     out = _run(monkeypatch, rows, {claims.BRAND: {"牌": "A"}, claims.PRODUCT: {}})
     assert "1 条占用当初就不该产生" in out
+
+
+# ── 拼给人跑的释放命令(2026-08-22 生产实证补)────────────────────────
+
+def test_release_command_is_shell_quoted():
+    """⚠ 不引用时 shell 把 `-p brand=cor cordium` 拆成 `-p brand=cor` 加一个
+    多余参数 —— 匹配不到任何占用,报「无任何可释放的行」**并退出码 0**。
+    人以为放掉了,其实一条没动。带 `&` 的更糟:命令被后台化。
+    """
+    import shlex
+    for key in ("cor cordium", "knape & vogt", "magnusson's garden",
+                "phillips safety products, inc.", "tlk&fbb", "learn to brew llc"):
+        cmd = ca._release_cmd("brand", key, "A085朱丽霖")
+        parts = shlex.split(cmd)                     # shell 会怎么拆
+        assert f"brand={key}" in parts, key          # 键一字不差地到达
+        assert "store=A085朱丽霖" in parts
+
+
+def test_release_command_carries_the_holding_store():
+    """按 (类型, 键) 无条件释放的话,占用如果在出表之后换了店,这条命令会把
+    **新店的好占用**一起放掉。`_run_csv` 一直是三条件,这一列必须一致。"""
+    cmd = ca._release_cmd("asin", "B08LHF7VLT", "B023黄垂辉")
+    assert "-p asin=B08LHF7VLT" in cmd and "store=B023黄垂辉" in cmd
+
+
+def test_a_plain_key_needs_no_quotes():
+    """不含特殊字符的键别加多余引号 —— 这一列是给人看的,噪声越少越好。"""
+    assert ca._release_cmd("brand", "allgemdiy", "A085") == (
+        "python cli.py store_release -p brand=allgemdiy -p store=A085")

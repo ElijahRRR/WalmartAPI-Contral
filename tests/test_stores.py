@@ -159,3 +159,74 @@ def test_cross_store_concurrency_has_one_source():
     for mod in (perf_problems, settlement_sync):
         text = inspect.getsource(mod)
         assert "店铺级并发不要调高" not in text, mod.__name__
+
+
+# ── 在营判据:三层之间的边界(所有者定稿 2026-08-22)────────────────────
+
+def _cred(name, **f):
+    from registry import resources
+    fl = resources.STORE_CREDENTIALS.fields
+    fields = {fl.store: name, fl.client_id: "cid", fl.client_secret: "sec",
+              fl.proxy_type: "http", fl.proxy_host: "1.2.3.4",
+              fl.proxy_port: "8080"}
+    fields.update(f)
+    return {"fields": fields}
+
+
+def test_is_enabled_is_the_single_predicate():
+    """「启用」的判定只留一处 —— 此前埋在 `_normalize` 的循环里,
+    和 ClientId、代理两条过滤混成一体,没有函数单独回答得了"在不在营"。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    assert st.is_enabled({}) is True                      # 缺省视为启用(旧表无此列)
+    assert st.is_enabled({fl.enabled: True}) is True
+    assert st.is_enabled({fl.enabled: False}) is False
+    for no in ("否", "false", "0", " 否 "):
+        assert st.is_enabled({fl.enabled: no}) is False
+    for yes in ("是", "true", "1"):
+        assert st.is_enabled({fl.enabled: yes}) is True
+
+
+def test_enabled_names_ignores_client_id_and_proxy(monkeypatch):
+    """★ **在营 ≠ 能调 API。**
+
+    「启用」是所有者的**意图**开关,ClientId/代理是**技术就绪**。合并的后果:
+    「在营但代理没配」的店会被当成死店 —— 而死店名录直通整店下线。
+    """
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    recs = [_cred("A085朱丽霖"),
+            _cred("A102无代理", **{fl.proxy_host: "0"}),        # 在营,只是没配代理
+            _cred("A107无凭证", **{fl.client_id: "0"}),
+            _cred("Z001已停用", **{fl.enabled: False})]
+    monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
+    assert st.enabled_names() == {"A085朱丽霖", "A102无代理", "A107无凭证"}
+
+
+def test_load_stores_is_strictly_narrower_than_enabled_names(monkeypatch):
+    """三层是包含关系:能调 API ⊆ 在营 ⊆ 在册。任何一层拿去当另一层用都会出事。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    recs = [_cred("能调"), _cred("在营没代理", **{fl.proxy_host: "0"}),
+            _cred("已停用", **{fl.enabled: False})]
+    monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
+    monkeypatch.setattr(st, "_write_snapshot", lambda s: None)
+    api_ok = {s["name"] for s in st.load_stores()}
+    assert api_ok == {"能调"}
+    assert api_ok < st.enabled_names() == {"能调", "在营没代理"}
+    assert st.enabled_names() < st.registered_names()
+
+
+def test_disabled_store_is_not_registered_away(monkeypatch):
+    """停用**不等于**从凭证表删行 —— 历史凭证留着,`registered_names` 照样有它。
+    所以判在营只能看 `enabled_names`,看 `registered_names` 会把停用店当在营。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    monkeypatch.setattr("api.feishu.list_records",
+                        lambda *a, **k: [_cred("Z001", **{fl.enabled: False})])
+    assert st.registered_names() == {"Z001"}
+    assert st.enabled_names() == set()

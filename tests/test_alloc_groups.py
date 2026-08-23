@@ -8,11 +8,22 @@ def _c(asin, brand, score, cat="家居", ch="FBA", manuf=None):
             "score": score, "category": cat, "channel": ch}
 
 
-def test_group_score_is_the_max_not_the_median():
-    """一个爆款带一堆平庸品的品牌,整体不该掉下去 —— 那正是最该抢的品牌。"""
+def test_group_score_is_weighted_average_plus_a_slice_of_the_best():
+    """组分 = 0.7×均分 + 0.3×最高(所有者 2026-08-22 拍 Q1)。
+
+    ⚠ **这条改过,理由跟着切口一起变了。**原来是纯取最高分,道理是"一个爆款
+    带一堆平庸品的品牌整体不该掉下去,那正是最该抢的品牌" —— 那个道理成立的
+    **前提是切口在组这一层做**。切口挪到产品层之后,平庸品在切口那一步就挡住
+    了,进片的本来就只有好品;而纯取最高分反而会把"一个 95 分带一堆 40 分"的
+    组整体拉到前排(所有者原话:"你会把大量排名靠后的产品拉到前面来")。
+    保留 0.3 的最高分权重:有爆款的品牌仍然优先,只是不再一俊遮百丑。
+    """
     g = ag.build([_c("B1", "acme", 95.0), _c("B2", "acme", 40.0),
                   _c("B3", "acme", 38.0)])["free"]
-    assert len(g) == 1 and g[0]["score"] == 95.0 and g[0]["size"] == 3
+    assert len(g) == 1 and g[0]["size"] == 3
+    # 0.7×(95+40+38)/3 + 0.3×95 = 40.37 + 28.5
+    assert round(g[0]["score"], 2) == 68.87
+    assert round(ag.group_score([{"score": 50}] * 4), 2) == 50.0   # 同分 ⇒ 就是它
 
 
 def test_minority_channel_items_are_dropped_from_the_group():
@@ -27,7 +38,7 @@ def test_minority_channel_items_are_dropped_from_the_group():
     assert g["channel"] == "FBA" and g["size"] == 2
     assert [x["asin"] for x in g["items"]] == ["B1", "B2"]
     # 组分要按**留下的**算:99 分那个是 FBM,它上不了这家店的架
-    assert g["score"] == 90.0
+    assert round(g["score"], 1) == round(0.7 * 89.0 + 0.3 * 90.0, 1) == 89.3
     assert r["dropped"]["渠道少数派(随品牌走不了)"] == 1
 
 

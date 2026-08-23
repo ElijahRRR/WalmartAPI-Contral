@@ -294,13 +294,25 @@ def _check_patent(product: ProductInfo) -> Phase0Result:
 
 # 非品牌占位符 — Amazon / DMIT 常见的 "没标品牌" 字面量.
 # 不把这些当品牌名做 Phase0 精准拦截 (否则 6/10 的 Amazon 产品无脑被挡).
-# blacklist_brands 表里若含这些词 (如飞书错把 N/A 当品牌录入) 会被此白名单绕过.
-# (20 项逐字迁自 phase0_brand.py:37-44)
+# 这张表**优先于黑名单**: 表里的词就算登记进黑名单中心也照样放行 —— 立这条
+# 白名单时的假设是"占位符出现在黑名单里 = 飞书录错了"(如错把 N/A 当品牌录入).
+# (原 20 项逐字迁自 phase0_brand.py:37-44)
+#
+# ⚠ 2026-08-23 所有者定稿撤下三项: generic / oem / various.
+# 起因: 飞书品牌总表里显式登记了 GENERIC, 但审核对 brand=Generic 的产品照发
+# pass —— 因为 _check_brand 在查黑名单**之前**先过这张白名单就短路返回了.
+# 所有者是**故意**登记的, 与上面那条"录错了"的假设正好相反, 而代码没有区分
+# 这两种情况的手段, 所以按所有者口径把这三个词交还给黑名单裁决:
+# 登记了就拦, 没登记照旧放行(黑名单里没有 = 查表落空 = 与在白名单里同效).
+#
+# ⚠ **不要顺手同步改 services/brand_key.PLACEHOLDERS** —— 那三个词在占用键
+# 那边必须留着. 两张表方向相反: 这里多留一个词 = 少拦一个黑名单品牌(可控);
+# 占用键那边少留一个词 = "Generic" 变成排他占用键, 把成千上万个互不相干的
+# 产品锁进同一家店, 而占用**没有自动释放**(brand_key.py 模块头注 §二铁律).
 _NON_BRAND_PLACEHOLDERS = {
     "n/a", "na", "n.a.", "n.a",
     "none", "null", "nil",
     "unbranded", "no brand", "no brand name", "no name",
-    "generic", "oem", "various",
     "不详", "无品牌", "无",
     "-", "--", "---",
 }

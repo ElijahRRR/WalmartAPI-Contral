@@ -71,11 +71,17 @@ def test_placeholder_list_is_superset_of_both_upstreams():
 
     漏一个词 = 一次大面积误锁(该词名下所有产品被锁进一家店,且占用无自动
     释放);多一个词只是少占一个品牌。方向明确,取并集。
+
+    ⚠ 断言是**单向子集**,不是相等:2026-08-23 所有者把 generic/oem/various
+    从 phase0 白名单撤下(交还品牌黑名单裁决),本表**不跟着撤** —— 两张表
+    自此分家,phase0 ⊆ 本表仍成立,反向不成立。
     """
     from services.audit_phase0 import _NON_BRAND_PLACEHOLDERS as P0
     from services.mp_mapper import _BRAND_NOISE
     assert P0 <= bk.PLACEHOLDERS
     assert {w for w in _BRAND_NOISE if w} <= bk.PLACEHOLDERS
+    # 分家的那三个词:本表留、phase0 不留(任一侧被顺手改回都会红)
+    assert {"generic", "oem", "various"} <= bk.PLACEHOLDERS - P0
 
 
 # ── enrich ─────────────────────────────────────────────────────────────

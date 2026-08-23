@@ -56,7 +56,7 @@
 | 2 | **店铺状态** | 从库读 `ops.store_kpi_daily.store_status`(每店最新一行)。**必须再 AND `store ∈ services/stores.load_stores()`**——凭证表已删的店 KPI 行永远停在最后一次 ACTIVE,状态闸单独拦不住(08-12 定,08-15 补)。无记录/状态为空 = fail-open 视同 ACTIVE(全仓统一)。**状态既不决定占用归属、也不决定参不参与分配**:SUSPENDED 的占用照旧保持(§六.2),不接新货是 #13 那个开关(08-15 晚澄清) |
 | 3 | **PT 与类目可信度** | 分配的类目约束用 `products.walmart_pt` → 大类,**不分 pt_source**。~~"开新大类须实证 PT"~~ **已作废**(08-15 晚:类目档案改人工填表,引擎不开类目,门槛无处可施;实测 84% 候选是推断 PT,卡门槛会把空店全卡死)。pt_source 仍随 claims 快照存档,供事后追溯 |
 | 4 | **配送方式权威** | = 限额表「配送限制」列(填 fba/fbm,`registry.RETIRE_LIMITS.fields.channel_limit`)。**未填 = 不接自由流分配**,报告点名补填;不建表、不做引擎锁定(08-13) |
-| 5 | **品牌归一化** | `services/brand_key`(唯一出处):`" ".join(raw.lower().split())` + 占位符表(phase0 20 项 ∪ mp_mapper `unknown`);brand 是占位符时用 manufacturer 兜底;两者皆占位符 = 真·无品牌**不占用**。**不做别名表**(08-13 定,08-15 落地) |
+| 5 | **品牌归一化** | `services/brand_key`(唯一出处):`" ".join(raw.lower().split())` + 占位符表(phase0 白名单 17 项 ∪ `generic`/`oem`/`various` ∪ mp_mapper `unknown`;⚠ 2026-08-23 起与 phase0 分家——那三个词在 phase0 被撤下交还品牌黑名单裁决,**占用键这边必须留着**,撤了就是把 Generic 当排他占用键、一次误锁没有自动释放);brand 是占位符时用 manufacturer 兜底;两者皆占位符 = 真·无品牌**不占用**。**不做别名表**(08-13 定,08-15 落地) |
 | 6 | **分配单元** | 品牌组(不是单品)——品牌排他 ⇒ 同品牌必同店 |
 | 7 | **分配优先级** | 两梯队:先 ACTIVE ∧ 有在线产品,后 ACTIVE ∧ 空店(08-13) |
 | 8 | **产品分中的销量** | 无订单史是常态 ⇒ 该信号**缺失时不计入、权重摊回其余信号**,只加分不减分(08-13) |

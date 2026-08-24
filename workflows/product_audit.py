@@ -225,9 +225,16 @@ _MODES = {"backfill", "pending", "pass", "online", "nonpass", "stale"}
 #     `slow_hash` 变了(产品本身改了)时由 product_ingest 翻回 pending;
 #     rejected 永不自动重审(45 天 TTL 那套已废除)
 #   · 要整批重审只有一条路:`-p force_rerun=<规则版本>`(人工显式)
+# 2026-08-24 起第三支:approved 而 audit_version 落后于当前判据版本的,
+# **重审而不是投影**(所有者定稿:「就算 hash 没变,审核版本号变了也完整重审」,
+# 且不进调度 —— 上架前的 from_sheet 走到这条谓词,要上架的品自然被新判据
+# 重过一遍;平时手动 mode=stale 批量消化)。rejected 不在此列:沿用旧结论
+# (reject 粘性),要翻案走 rerule/mode=nonpass。
 _DEFAULT_CANDIDATE = (
     "(p.audit_status IS NULL OR (p.audit_status = 'pending' "
-    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))")
+    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day'))"
+    " OR (p.audit_status = 'approved'"
+    " AND p.audit_version IS DISTINCT FROM %(cand_ver)s))")
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -253,7 +260,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
             # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
             # `-p force=1` 显式打开强审见 `_forced_sheet`。
             return f"p.asin = ANY(%(asins)s) AND {_DEFAULT_CANDIDATE}", \
-                {"asins": asins}
+                {"asins": asins,
+                 "cand_ver": resources.AUDIT_RULES_VERSION}
         # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
         # 运行时短路可绕,绕的是 audit_status 候选谓词)
         return "p.asin = ANY(%(asins)s)", {"asins": asins}
@@ -391,7 +399,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
                 "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
-    return _DEFAULT_CANDIDATE, {}
+    return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
 
 
 # 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
@@ -617,7 +625,9 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 
 
 _SQL_SHEET_STATE = """
-SELECT coalesce(audit_status, '未审') AS st, count(*)
+SELECT CASE WHEN audit_status = 'approved'
+             AND audit_version IS DISTINCT FROM %s THEN '版本过期'
+       ELSE coalesce(audit_status, '未审') END AS st, count(*)
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 GROUP BY 1
@@ -662,11 +672,12 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
     head = [f"上架表 E 列为空 {len(want)} 个 ASIN"
             f"({len(rows)} 行,同 ASIN 多店铺算多行)"]
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_SHEET_STATE, (want,))
+        cur.execute(_SQL_SHEET_STATE,
+                    (resources.AUDIT_RULES_VERSION, want))
         st = {k: int(n) for k, n in cur.fetchall()}
     absent = len(want) - sum(st.values())        # 库里压根没有这个 ASIN
     done = st.get("approved", 0) + st.get("rejected", 0)
-    todo = st.get("未审", 0) + st.get("pending", 0)
+    todo = st.get("未审", 0) + st.get("pending", 0) + st.get("版本过期", 0)
     # 这三个数是"为什么这轮还在审"的全部答案,必须在摘要里(只写日志的话
     # 飞书通知看着像"审完了")
     head.append(
@@ -674,7 +685,8 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
         f"{st.get('rejected', 0)})→ "
         + ("⚡ **force=1:连同它们一起重判**(不是回填)" if force
            else "**直接回填,不重审**")
-        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
+        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 "
+        f"{st.get('pending', 0)}/判据提版重审 {st.get('版本过期', 0)})"
         # ⚠ 这个数是**补采之前**的快照(补采跑在它后面)。别写成"本轮审不了"
         # —— 同轮闭环正是为了把它们救回来,救回来多少看下面那段
         + (f";⚠ 不在库 {absent}(补采前口径,见下方补采段:"

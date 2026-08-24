@@ -43,7 +43,7 @@ from api import _client, feeds
 from registry import db
 from services import dispositions
 from services import problem_products as pp
-from services import product_events, stores as stores_svc
+from services import product_events, store_limits, stores as stores_svc
 
 DANGEROUS = True
 
@@ -88,6 +88,20 @@ def _record(conn, store: str, event: str, rows: list[dict], feed_id) -> None:
         for r in rows])
 
 
+def _retire_caps() -> dict[str, int]:
+    """输入:无 → 输出:{店铺: 单轮破坏类上限}(限额表「下架限制」)。
+
+    读不到表**不是退到不限**,是让每家店退到 `dispositions.DESTRUCTIVE_PER_STORE`
+    ——由 cap_destructive 按缺省值处理。fail-closed 是这道闸唯一的方向。
+    """
+    try:
+        return store_limits.retire_caps()
+    except Exception as e:                  # noqa: BLE001 — 读表失败不炸链
+        logger.warning("限额表「下架限制」读不到(%s):本轮破坏类按每店 %d 条封顶",
+                       e, dispositions.DESTRUCTIVE_PER_STORE)
+        return {}
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store)→ 输出:落定 + 领取 + 提交结果摘要。"""
     execute = bool(params.get("execute"))
@@ -95,10 +109,15 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         settled = dispositions.settle(conn) if execute else {
             "confirmed": 0, "ineffective": 0}
-        # ⚠ 限来源:维护链(source='maint')从 2026-08-16 起共用同一张建议表,
-        # 不限就会领到它的 title/price/inventory 行,group_by_store 直接抛
-        rows = [r for r in dispositions.claim(conn, dispositions.PROBLEM_SOURCES)
+        # ⚠ 限**动作**不限来源(2026-08-24 改):本工作流是破坏动作的唯一
+        # 出口,维护链建议的删除(source='maint', action='delete')也由它执行。
+        # 不限动作会领到 title/price/inventory,group_by_store 直接抛。
+        rows = [r for r in dispositions.claim(conn, dispositions.PROBLEM_ACTIONS)
                 if not only or r["store"] == only]
+    # 单店删除上限**只在这里施加一次**(2026-08-24 归一):此前两条扫描件各按
+    # 同一张限额表「下架限制」截一次,每店最多 N 条实际变成了最多 2N。
+    rows, over_cap = dispositions.cap_destructive(
+        rows, _retire_caps(), dispositions.DESTRUCTIVE_PER_STORE)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = []
@@ -124,6 +143,11 @@ def run(params: dict) -> str:
     head = "待执行建议" if not execute else "本轮领取建议"
     lines.insert(0, f"{mode}{head} {len(rows)} 条:反补 {tot['relist']},"
                     f"删除 {tot['delete']},顽固停用 {tot['retire']}")
+    if over_cap:
+        # 截断必须见人(本仓口诀:静默截断读起来就是"全做完了")
+        lines.append(f"  ⚠ 超单店「下架限制」留到下轮:"
+                     + ",".join(f"{s}×{n}" for s, n in sorted(over_cap.items()))
+                     + f"(共 {sum(over_cap.values())} 条,**没有丢弃**)")
 
     if not execute:
         # 按动作分开列样本(人眼闸门的判断依据:反补=救活方向,
@@ -229,7 +253,8 @@ def _submit_store(store_name: str, store: dict, b: dict,
                 with db.pg_conn() as conn:
                     _record(conn, store_name, event, rows_slice, res["feed_id"])
                     dispositions.mark_executing(
-                        conn, [r["id"] for r in rows_slice], res["feed_id"])
+                        conn, [r["id"] for r in rows_slice], res["feed_id"],
+                        by="problem_product_cleanup")
             elif res.get("retryable"):
                 need_retry = True
         line = f"  {store_name}:{label}提交 {n['submitted']}"

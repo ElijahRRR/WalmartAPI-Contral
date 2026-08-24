@@ -126,6 +126,15 @@ JOBS = (
     # 在架 pass 重过 L0(纯查库零 LLM)→ 今天新拉黑/新禁售的东西当天翻成
     # rejected → 紧接着 problem_scan 按 audit_listing_conflicts 建删除建议
     # → problem_product_cleanup 执行。三步同一轮闭环,不用等第二天。
+    # ⚠ **建议期与执行期分开编排**(所有者定稿 2026-08-24):
+    #   两个扫描件(maintenance_scan / problem_scan)先跑完,再跑两个执行件
+    #   (maintenance / problem_product_cleanup)。理由是破坏类建议要能压制
+    #   同 SKU 的维护类建议 —— 旧序里 maintenance 排在 problem_scan 之前,
+    #   审核链上午刚判拒的东西,维护链已经先花配额去改标题/改价了。
+    #   **但压制不靠这个顺序**:压制在 dispositions.claim() 里按库里所有未落定
+    #   的破坏类建议判,与写入先后无关。顺序改了结果也不变 —— 这是有意的,
+    #   本仓吃过"顺序即语义"的亏,不再让调度表承载判据。
+    #   product_audit 跟着 problem_scan 一起前移,紧邻关系不变。
     # ⚠ 三个参数一个都不能少:
     #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
     #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
@@ -134,8 +143,8 @@ JOBS = (
     #   而且不报错
     job("product_chain",
         ["catalog_sync", "sources_backfill", "product_refresh",
-         "maintenance_scan", "maintenance",
-         "product_audit", "problem_scan", "problem_product_cleanup"],
+         "product_audit", "maintenance_scan", "problem_scan",
+         "maintenance", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
         params=["product_refresh:wait=1", "product_audit:mode=online",
                 "product_audit:stages=L0", "product_audit:limit=1000000"],

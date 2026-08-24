@@ -50,7 +50,6 @@ MAX_INTENTS_PER_KIND = 5000
 
 # 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
-DELETE_PER_STORE = 300          # 限额表「下架限制」缺该店时的退路(会告警)
 LONG_OOS_DAYS = 15              # 连续这么多天没有库存 → 删除(所有者定稿)
 
 _SQL_ZERO = """
@@ -664,10 +663,9 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
 
 
 def delete_intents(conn, stockzero_stores: list[str] | None = None,
-                   caps: dict[str, int] | None = None,
                    min_batches: int = MIN_OFFSET_BATCHES,
                    oos_days: int = LONG_OOS_DAYS) -> list[dict]:
-    """输入:连接(+单店上限表/批次数门槛/无货天数)→ 输出:删除意图(kind='delete')。
+    """输入:连接(+批次数门槛/无货天数)→ 输出:删除意图(kind='delete')。
 
     三个原因(所有者定稿 2026-08-09),都是"这个产品已经不值得留在架上了":
 
@@ -685,11 +683,12 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
       库存 provider 早就把它清零了,清零后还这么久不回货 = 这个货源没了。
       ⚠ 采集接线于 2026-08-08,历史攒够 15 天之前这条恒返空,不是坏了。
 
-    单店单轮上限取限额表「下架限制」(caps,与 product_clear 同一列同一口径),
-    店铺不在表内退 DELETE_PER_STORE 并告警。
+    ⚠ **本函数不再截单店上限**(2026-08-24 归一)。限额表「下架限制」由执行件
+    `problem_product_cleanup` 在领取时施加一次(services.dispositions.
+    cap_destructive)。此前两条扫描件各截一次同一张表,每店最多 N 条实际变成
+    最多 2N —— 扫描件如实报待办、执行件按配额取件,才只有一处上限。
     """
-    caps = caps or {}
-    seen, out, per_store = set(), [], {}
+    seen, out = set(), []
     paused_mismatch = 0
 
     def _take(store, sku, code, why="", extra=None):
@@ -698,10 +697,6 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         之后必须分开:`title_mismatch` 分得了组但读不出"低到什么程度"。"""
         if (store, sku) in seen:
             return          # 两个原因都命中只删一次
-        cap = int(caps.get(store, DELETE_PER_STORE))
-        per_store[store] = per_store.get(store, 0) + 1
-        if per_store[store] > cap:
-            return          # 超单店上限的留到下轮(下面统一告警)
         seen.add((store, sku))
         out.append({"store": store, "sku": sku, "kind": "delete",
                     "old": "在线", "new": "删除",
@@ -753,11 +748,6 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         logger.warning("删除(title_mismatch)已停闸(所有者 2026-08-19),"
                        "本轮压制 %d 条 —— 这批行照常改价/改标题/改库存"
                        "(所有者 2026-08-20:停闸不冻结)", paused_mismatch)
-    over = {s: n - int(caps.get(s, DELETE_PER_STORE))
-            for s, n in per_store.items()
-            if n > int(caps.get(s, DELETE_PER_STORE))}
-    if over:
-        logger.warning("删除超单店上限,本轮留下:%s", over)
     return _cap(out, "delete")
 
 
@@ -773,7 +763,7 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
     否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
     """
     mults = store_limits.price_multipliers()
-    deletes = delete_intents(conn, stockzero, store_limits.retire_caps(),
+    deletes = delete_intents(conn, stockzero,
                              oos_days=oos_days or LONG_OOS_DAYS)
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)

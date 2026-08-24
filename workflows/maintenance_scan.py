@@ -26,6 +26,11 @@ maintenance 也应该像 problem_scan 和 problem_product_cleanup 一样分开,
 调度顺序是硬约束:catalog_sync → product_refresh → 本工作流 → maintenance。
 没跑 catalog_sync 就扫 = 拿上一轮的沃尔玛现值算差异,会对已下架的 SKU 建议
 改价改库存(生产实证:38 条改库存 + 30 条改价 not found)。
+
+⚠ **本工作流照常建议删除,但执行它的不是 maintenance**(2026-08-24):
+破坏动作(delete/retire)的唯一出口是 `problem_product_cleanup`,建议按
+**动作**分工领取,不按来源。本文件产出的 action='delete' 行归它执行,
+action ∈ (title/price/inventory) 的行归 maintenance。
 """
 
 import logging
@@ -159,5 +164,7 @@ def run(params: dict) -> str:
            if n_sug < len(intents) else ""))
     if stuck:
         lines.append(dispositions.stuck_note(stuck))
-    lines.append("执行走 `python cli.py maintenance`(本工作流不发任何 feed)")
+    lines.append("执行:标题/价格/库存 走 `python cli.py maintenance`;"
+                 "**删除走 `python cli.py problem_product_cleanup`**"
+                 "(破坏动作只有一个出口,2026-08-24)。本工作流不发任何 feed")
     return "\n".join(lines)

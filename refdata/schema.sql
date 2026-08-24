@@ -1118,6 +1118,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     WHERE status IN ('suggested', 'executing');
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
+-- 执行者(2026-08-24):建议按动作分工之后,"这条最终是谁干的"必须在库里有
+-- 答案。此前只能从 source 反推执行件,而 source 是"谁先建议"不是"谁执行"
+-- ——08-19 生产实见一行维护链执行、审核链原因的记录,就是这么来的。
+ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS executed_by text;
 
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──

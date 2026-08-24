@@ -219,12 +219,13 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
         ("T1", "B0B", "delete", "在线", "删除", "variant_offset")]
     assert all(i["reason"] and i["reason"] != i["code"] for i in out)
 
-    # 单店上限取限额表「下架限制」;不在表内退 DELETE_PER_STORE(所有者问来源)
+    # ⚠ 2026-08-24 归一:扫描件**不再截**单店上限,如实报待办。上限只在
+    # 执行件领取时施加一次(dispositions.cap_destructive)——此前两条链各截
+    # 一次同一张限额表,每店最多 N 条实际变成了最多 2N。
     rows3 = [("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
              ("T2", "B0C", 1, None, None)]
-    assert len(mi.delete_intents(_Conn(rows=rows3), caps={"T1": 1})) == 2
-    monkeypatch.setattr(mi, "DELETE_PER_STORE", 1)
-    assert len(mi.delete_intents(_Conn(rows=rows3))) == 2    # 每店各留 1
+    assert len(mi.delete_intents(_Conn(rows=rows3))) == 3
+    assert not hasattr(mi, "DELETE_PER_STORE")   # 唯一出处搬去 dispositions
 
 
 def test_delete_intents_also_take_title_placeholder(monkeypatch):
@@ -339,7 +340,7 @@ def test_collect_all_lives_in_services_not_in_a_workflow():
 def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
     conn = _Conn()
-    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps, oos_days=0: [
+    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, oos_days=0: [
         {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
          "new": "删除", "code": "variant_offset"}])
     monkeypatch.setattr(mi.store_limits, "retire_caps", lambda: {})
@@ -488,21 +489,24 @@ def _disp(it, i):
 
 def _wire(monkeypatch, intents, stores=(STORE,)):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
-             "marked": [], "settled": 0}
+             "marked": [], "marked_by": set(), "settled": 0}
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(mw.dispositions, "claim",
-                        lambda conn, sources=None: [_disp(it, i)
+                        lambda conn, actions=None: [_disp(it, i)
                                                     for i, it in enumerate(intents)])
     monkeypatch.setattr(mw.dispositions, "settle",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("maintenance 不该落定破坏类"
+                                           "——归 problem_product_cleanup")))
+    monkeypatch.setattr(mw.dispositions, "settle_maintenance",
                         lambda conn: (calls.__setitem__("settled",
                                                         calls["settled"] + 1),
                                       {"confirmed": 0, "ineffective": 0})[1])
-    monkeypatch.setattr(mw.dispositions, "settle_maintenance",
-                        lambda conn: {"confirmed": 0, "ineffective": 0})
     monkeypatch.setattr(mw.dispositions, "expire_executing", lambda conn: 0)
     monkeypatch.setattr(mw.dispositions, "mark_executing",
-                        lambda conn, ids, fid: calls["marked"].append(
-                            (list(ids), fid)))
+                        lambda conn, ids, fid, by="": (
+                            calls["marked"].append((list(ids), fid)),
+                            calls["marked_by"].add(by))[0])
     monkeypatch.setattr(mi, "record_submitted", lambda conn, items: len(items))
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
@@ -597,35 +601,26 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
     assert t1[0][_c("result")] == "未执行(提交异常)"
 
 
-def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
-    """删除走 DELETE_ITEM;只有 submitted 落病历(dedup 记了是幽灵事件)。"""
-    intents = [{"store": "T1", "sku": s, "kind": "delete", "old": "在线",
-                "new": "删除", "code": "variant_offset",
-                "reason": "采集永久偏移(拿不到新数据)",
-                "label": "删除(variant_offset)", "batches": 1}
-               for s in ("B0A", "B0B", "B0C")]
-    calls = _wire(monkeypatch, intents)
-    events = []
-    monkeypatch.setattr(mw, "_record_deletes",
-                        lambda store, rows, fid: events.append(
-                            (store, [r["sku"] for r in rows], fid)))
-    monkeypatch.setattr(feeds, "submit_feed",
-                        lambda store, ft, entries, workflow="": [
-                            {"feed_id": "F1", "count": 2, "outcome": "submitted"},
-                            {"feed_id": "OLD", "count": 1, "outcome": "dedup"}])
-    out = mw.run({"execute": True})
-    assert events == [("T1", ["B0A", "B0B"], "F1")]
-    assert "删除 feed 提交 2" in out
-    # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
-    assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
-    # 建议列恒是 scan 定的;动作列前两条是"删除",第三条在途防重是"跳过"
-    assert all(r[_c("suggestion")] == "删除(variant_offset)"
-               for r in calls["sheet"])
-    # 动作列只说做了什么(删除/跳过),原因码归「建议」与「原因」两列
-    assert [r[_c("action")] for r in calls["sheet"]] == ["删除", "删除", "跳过"]
-    assert calls["sheet"][2][_c("result")] == "在途防重"
-    # 只有 submitted 才转 executing:dedup 什么都没提交
-    assert calls["marked"] == [([100, 101], "F1")]
+def test_maintenance_no_longer_deletes_anything(monkeypatch):
+    """删除的唯一出口是 problem_product_cleanup(所有者定稿 2026-08-24)。
+
+    两个执行件都能发 DELETE_ITEM 的时候,配额、在途防重、病历口径各有一套,
+    同一个 SKU 被两条链先后删两次是生产实证过的。这里钉三件事:
+      ① 维护链的领取集不含 delete/retire;
+      ② 真有一条删除行混进来(领取集写错),分桶直接抛,不会静默删掉;
+      ③ 本文件不再产出任何 DELETE_ITEM 载荷。
+    """
+    import inspect
+
+    import pytest
+
+    from services import dispositions as ds
+
+    assert set(mw._KIND_ORDER) == set(ds.MAINT_ACTIONS)
+    assert "delete" not in mw._KIND_ORDER and "retire" not in mw._KIND_ORDER
+    with pytest.raises(ValueError):
+        mw.group_by_store([{"store": "T1", "sku": "B0A", "kind": "delete"}])
+    assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
 
 
 def test_unexecuted_suggestions_still_get_a_row(monkeypatch):
@@ -945,16 +940,26 @@ def test_expire_executing_unblocks_the_partial_unique_index():
     assert "delete" not in ds.MAINT_ACTIONS
 
 
-def test_two_chains_claim_disjoint_sources():
-    """⚠ 两条链共用一张建议表:不限来源就会领到对方的建议行。"""
+def test_two_chains_claim_disjoint_actions():
+    """⚠ 两条链共用一张建议表,按**动作**分工领取(2026-08-24 改)。
+
+    旧口径按 source 领。后果 08-19 生产实见:一条 (店铺,SKU,delete) 被维护链
+    先建议(source='maint')、审核链后覆写 reason,那行仍归维护链执行 —— 表里
+    写着维护链的「建议」、问题链的「原因」,谁也说不清是哪条链干的。
+    source 回答"为什么建议",action 回答"该谁干",不能互相顶替。
+    """
     import inspect
 
     from services import dispositions as ds
     from workflows import problem_product_cleanup as ppc
 
-    assert set(ds.PROBLEM_SOURCES) & set(ds.MAINT_SOURCES) == set()
-    assert "dispositions.PROBLEM_SOURCES" in inspect.getsource(ppc.run)
-    assert "dispositions.MAINT_SOURCES" in inspect.getsource(mw.run)
+    assert set(ds.PROBLEM_ACTIONS) & set(ds.MAINT_ACTIONS) == set()
+    assert set(ds.PROBLEM_ACTIONS) | set(ds.MAINT_ACTIONS) == set(ds.ACTIONS)
+    assert "dispositions.PROBLEM_ACTIONS" in inspect.getsource(ppc.run)
+    assert "dispositions.MAINT_ACTIONS" in inspect.getsource(mw.run)
+    # 破坏动作只有一个出口:maintenance 不再发任何删除 feed
+    assert "delete" in ds.PROBLEM_ACTIONS and "delete" not in ds.MAINT_ACTIONS
+    assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
     # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)
     import pytest
     with pytest.raises(ValueError):

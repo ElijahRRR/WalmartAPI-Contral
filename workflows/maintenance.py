@@ -4,15 +4,23 @@
   python cli.py maintenance                      # 真跑(提交 + 写维护记录表)
   python cli.py maintenance --dry-run            # 空跑:将执行哪些建议
   python cli.py maintenance -p store=A085朱丽霖
-  python cli.py maintenance -p only=inventory    # 只执行某一类(delete/title/price/inventory)
+  python cli.py maintenance -p only=inventory    # 只执行某一类(title/price/inventory)
   python cli.py maintenance -p resync_sheet=1    # 只补维护记录表(写表炸过之后)
   python cli.py maintenance -p prune_sheet=1     # 只裁维护记录表(默认留 7 天)
 
 **本工作流不再做任何决策**(批次四,所有者定稿 2026-08-16)。它只做四件事:
-  ① 落定上一轮:删除类按观测事件、维护三类按"线上值改过来了没有";
+  ① 落定上一轮:维护三类按"线上值改过来了没有";
   ② 超期放行:3 天没等到 catalog_sync 复核的 executing 行放行(见下);
-  ③ 领取 ops.dispositions 里 source='maint' 且 status='suggested' 的建议行;
+  ③ 领取 ops.dispositions 里 **action ∈ (title, price, inventory)** 且
+     status='suggested' 的建议行;
   ④ 按 (店铺, 动作) 分桶提交,提交成功的转 executing 并落 feed_id。
+
+⚠ **本工作流不再发任何删除 feed**(所有者定稿 2026-08-24)。破坏动作
+(delete/retire)全部归 `problem_product_cleanup` —— 两个执行件都能发
+DELETE_ITEM 的时候,配额、在途防重、病历口径各有一套,同一个 SKU 被两条链
+先后删两次是生产实证过的。破坏面只留一个出口之后,这三样各只剩一处。
+维护链照常**建议**删除(maintenance_scan 产 action='delete' 的行),只是
+领取它的是问题链的执行件。
 
 决策(查库 → 定性 → 该改什么)在 `maintenance_scan`;判据在
 `services.maintenance_intents.classify()`。为什么拆:见 maintenance_scan 头注。
@@ -40,26 +48,26 @@ catalog_sync 连着几轮没扫到那家店。
   · **提交期权威防重** → api/feeds.submit_feed 的 ops.feed_log(返回
     outcome=dedup,本文件如实计数);
   · 建议行本身的防重 → ops.dispositions 的部分唯一索引 + claim() 只取 suggested;
-  · 生效确认 → services.dispositions.settle()(删除,读 catalog_sync 落的
-    delete_verified/delete_not_effective)与 settle_maintenance()(标题/价格/
-    库存,比对 catalog.walmart_items 的现值)。
+  · 生效确认 → settle_maintenance()(标题/价格/库存,比对
+    catalog.walmart_items 的现值)。删除类的落定归 problem_product_cleanup,
+    本文件不再调 settle() —— 两个执行件都调会把同一批落定报两遍。
 
 维护记录(registry.MAINT_SHEET,电子表格「维护记录」工作表,只追加,11 列):
   **本轮领到的每一条建议都写一行**,不只是提交成功的那些 —— 所有者要的是
   「建议」与「动作」两列的分歧:
 
     | 建议 | 动作 | 含义 |
-    | 删除 | 删除 | 正常执行 |
-    | 删除 | 跳过 | 在途防重命中 |
-    | 删除 | (空) | 领到了但没执行(凭证缺失/提交异常),结果列写明原因 |
+    | 库存 | 库存 | 正常执行 |
+    | 库存 | 跳过 | 在途防重命中 |
+    | 库存 | (空) | 领到了但没执行(凭证缺失/提交异常),结果列写明原因 |
 
   feed 路径 feedid=真 feedid、结果=处理中(feed_poll 反哺器回填结果/报错);
   PUT 路径 feedid="sync"、结果=成功/失败 当场落定。
 
 维护事件不进 catalog.product_events(所有者定稿 2026-08-07):流水在
 ops.feed_log/feed_items,现状在 catalog.walmart_items,状态后果由
-catalog_sync 观测入账。**唯一例外是删除**——生死类事件恒记
-(delete_submitted,source=maintenance,detail.reason 记删除原因码)。
+catalog_sync 观测入账。此前的唯一例外「删除恒记 delete_submitted」随删除
+功能一并迁去 problem_product_cleanup —— 本文件已不产生生死类事件。
 
 ⚠ 切换纪律:上调度前必须停旧 12:00 walmart-maintenance-all-stores(AI 调度
 任务,非 cron);停旧前先收干净旧系统在途 feed(见 legacy_survey 切换清单)。
@@ -71,17 +79,19 @@ from datetime import datetime
 from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
-    maintenance_intents as mi, product_events, stores as stores_svc
+    maintenance_intents as mi, stores as stores_svc
 
 DANGEROUS = True
 
 logger = logging.getLogger("workflows.maintenance")
 
 _KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与扫描件的连接键)
-# 单店内串行顺序(旧系统纪律);**删除排最前**:同一 SKU 既要删又要改价时,
-# 先删掉就不必再为它烧改价/改库存的 feed 配额(maintenance_scan 的
-# collect_all 已把删除名单从其余三类里剔掉,这里的顺序是双保险)
-_KIND_ORDER = ("delete", "title", "price", "inventory")
+# 单店内串行顺序(旧系统纪律;同店 token 桶互挤)。**删除不在其中**:
+# 破坏动作归 problem_product_cleanup(见模块头注),本工作流领不到它。
+# "要删的 SKU 不再花配额去改"这条压制也不在这里了 —— 它上移到
+# services.dispositions.claim(),按库里所有未落定的破坏类建议压制,
+# 而不是只看本轮自己算出来的那些。
+_KIND_ORDER = dispositions.MAINT_ACTIONS
 
 
 def group_by_store(intents: list[dict]) -> dict[str, dict]:
@@ -97,21 +107,6 @@ def group_by_store(intents: list[dict]) -> dict[str, dict]:
     return out
 
 
-def _record_deletes(store: str, rows: list[dict], feed_id) -> None:
-    """删除提交入病历(catalog.product_events;回执由 feed_track 另记)。"""
-    with db.pg_conn() as conn:
-        product_events.record_many(conn, [
-            {"sku": r["sku"], "store": store, "event": product_events.DELETE_SUBMITTED,
-             "source": "maintenance",
-             "detail": {"feed_id": feed_id,
-                        "reason": r.get("code") or "variant_offset",
-                        "disposition_id": r.get("disposition_id"),
-                        "batches": r.get("batches"),
-                        "first_seen": r.get("first_seen"),
-                        "last_seen": r.get("last_seen")}}
-            for r in rows])
-
-
 def _mark(items: list[dict], feed_id) -> None:
     """提交成功的意图:建议行转 executing + 落 ops.dedupe(供下轮 drop_recent)。
 
@@ -123,7 +118,7 @@ def _mark(items: list[dict], feed_id) -> None:
         mi.record_submitted(conn, items)
         dispositions.mark_executing(
             conn, [i["disposition_id"] for i in items if i.get("disposition_id")],
-            feed_id)
+            feed_id, by="maintenance")
 
 
 def _record(name: str, it: dict, action: str, feed_id, today: str,
@@ -175,10 +170,7 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
         lines.append(f"  {name}:{label} 同步 PUT {len(items)},成功 {n_ok}")
         return
 
-    if kind == "delete":
-        entries = [it["sku"] for it in items]
-        feed_type = "DELETE_ITEM"
-    elif kind == "title":
+    if kind == "title":
         entries = [mi.build_title_item(it["sku"], it["product_type"],
                                        it["product_id"], it["new"])
                    for it in items]
@@ -198,16 +190,13 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
         i += res["count"]
         n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
         if res["outcome"] == "submitted":
-            # 删除是生死类:提交入病历(维护类不入,见模块 docstring)。
             # 只记 submitted——dedup 挂的是旧 feed_id 但什么都没提交
-            if kind == "delete" and res["feed_id"]:
-                _record_deletes(name, batch, res["feed_id"])
             _mark(batch, res["feed_id"])
             for it in batch:
                 _add(it, label, res["feed_id"], "处理中")
         elif res["outcome"] == "dedup":
-            # 动作写「跳过」而不是类型名:在途防重是**没有提交**,写成"删除"
-            # 会让表格看起来做了两次删除。feedid 挂旧 feed 便于顺藤查回执
+            # 动作写「跳过」而不是类型名:在途防重是**没有提交**,写成"库存"
+            # 会让表格看起来做了两次。feedid 挂旧 feed 便于顺藤查回执
             for it in batch:
                 _add(it, "跳过", res["feed_id"], "在途防重")
         elif res["outcome"] == "failed":
@@ -227,13 +216,17 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
 
 
 def _settle(lines: list[str]) -> None:
-    """上一轮落定 + 超期放行,结果写进摘要。任何失败只告警不阻断本轮提交。"""
+    """上一轮落定 + 超期放行,结果写进摘要。任何失败只告警不阻断本轮提交。
+
+    ⚠ **只落定维护三类**。删除/停用/反补的落定(dispositions.settle,按观测
+    事件判)归 problem_product_cleanup —— 两个执行件都调会把同一批落定报两遍,
+    人对账时会以为生效数翻倍。
+    """
     with db.pg_conn() as conn:
-        dele = dispositions.settle(conn)            # 删除:按观测事件
         maint = dispositions.settle_maintenance(conn)   # 三类:按线上现值
         expired = dispositions.expire_executing(conn)
-    ok = dele["confirmed"] + maint["confirmed"]
-    bad = dele["ineffective"] + maint["ineffective"]
+    ok = maint["confirmed"]
+    bad = maint["ineffective"]
     if ok or bad:
         lines.append(f"上一轮落定:生效 {ok},**未生效 {bad}**"
                      f"(提交成功但 catalog_sync 复核时线上值没变,"
@@ -279,13 +272,15 @@ def run(params: dict) -> str:
     execute = bool(params.get("execute"))
     only = params.get("only")
     if only and only not in _KIND_ORDER:
-        return f"only 参数只接受 delete/title/price/inventory,收到:{only}"
+        return (f"only 参数只接受 {'/'.join(_KIND_ORDER)},收到:{only}"
+                + ("(删除已迁去 problem_product_cleanup)"
+                   if only == "delete" else ""))
 
     lines: list[str] = []
     if execute:
         _settle(lines)
     with db.pg_conn() as conn:
-        rows = dispositions.claim(conn, dispositions.MAINT_SOURCES)
+        rows = dispositions.claim(conn, dispositions.MAINT_ACTIONS)
     intents = [mi.from_disposition(r) for r in rows]
     if params.get("store"):
         intents = [i for i in intents if i["store"] == params["store"]]
@@ -297,7 +292,9 @@ def run(params: dict) -> str:
         return "\n".join(lines + [
             f"{mode}没有待执行的维护建议 —— 先跑 "
             f"`python cli.py maintenance_scan`"
-            f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束)"])
+            f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束);"
+            f"也可能是这些 SKU 都挂着待执行的删除/停用建议而被压制"
+            f"(破坏类压制维护类,执行归 problem_product_cleanup)"])
 
     by_store = group_by_store(intents)
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
@@ -307,9 +304,8 @@ def run(params: dict) -> str:
     # 也不能改成「已执行」:领取的行里有一部分会撞上单店上限/在途防重/凭证
     # 缺失,并没有全部提交出去。准确的只有"本轮领取了多少",结果归后面几行。
     head = "待执行建议" if not execute else "本轮领取建议"
-    lines.append(f"{mode}{head} {len(intents)} 条:删除 {n_kind['delete']},"
-                 f"标题 {n_kind['title']},价格 {n_kind['price']},"
-                 f"库存 {n_kind['inventory']}")
+    lines.append(f"{mode}{head} {len(intents)} 条:标题 {n_kind['title']},"
+                 f"价格 {n_kind['price']},库存 {n_kind['inventory']}")
 
     if not execute:
         # 执行件的 dry-run 只回答"要提交什么、走哪条路由"。

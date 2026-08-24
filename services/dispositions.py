@@ -50,15 +50,42 @@ logger = logging.getLogger("services.dispositions")
 # 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到 —— 靠"下次小心"
 # 是没用的,只有"每个参数都带 cast"这条机械规则能被测试执行。
 
-# 动作取值。前三个是问题商品链(problem_product_cleanup 三桶),
-# 后三个是维护链(maintenance 的改标题/改价/改库存;删除两条链共用)。
+# 动作取值。破坏组(delete/retire)与反补归 problem_product_cleanup,
+# 维护三类归 maintenance —— **按动作分工,不按来源**(理由见下面 PROBLEM_ACTIONS)。
 ACTIONS = ("relist", "delete", "retire", "title", "price", "inventory")
+
+# ⚠ **动作优先级,全项目唯一出处**(所有者定稿 2026-08-24)。
+# 序:删除 > 停用 > 反补 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
+# claim() 的取件顺序、摘要的列序。
+# 这条规则本来就在跑,只是关在 maintenance_intents 的**一轮内存**里
+# (`_ACTION_RANK` / `collect_all` 的 `doomed` 集合)——那份只看得见本轮
+# 自己算出来的删除,看不见另一条链挂在库里的建议,于是跨链重复删了两次
+# (所有者 2026-08-24 实证)。提升作用域到"库里所有未落定建议"就是本常量。
+ACTION_RANK = {"delete": 0, "retire": 1, "relist": 2,
+               "inventory": 3, "title": 4, "price": 5}
+ACTION_ORDER = tuple(sorted(ACTIONS, key=lambda a: ACTION_RANK[a]))
+
+# 破坏组:不可逆。一个 SKU 同时只能有一条,且**存在即压制该 SKU 的维护组建议**
+# ——要删的东西没必要再花配额去改(批次 E 踩过:先花配额救活再花配额删掉)。
+DESTRUCTIVE_ACTIONS = ("delete", "retire")
+# 单店单轮破坏类上限的缺省值:限额表「下架限制」缺该店时的退路(会告警)。
+# **唯一出处**(2026-08-24 归一):此前 maintenance_intents.DELETE_PER_STORE 与
+# problem_scan._AUDIT_DELETE_PER_STORE 各写一个 300,两条链各截一次 ⇒ 每店 600。
+DESTRUCTIVE_PER_STORE = 300
+
+# ── 执行件按**动作**领取,不按来源(2026-08-24 定)────────────────────────
+# source 回答"为什么建议",action 回答"该谁干"。拿前者当后者用就会错位:
+# 2026-08-19 生产实见一行 —— 维护链先落 delete 建议(source='maint'),审核链
+# 后来覆写了它的 reason,那行仍归维护链执行,于是维护记录表里写着维护链的
+# 「建议」、问题链的「原因」,谁也说不清是哪条链干的。按动作领之后不可能再错位。
+PROBLEM_ACTIONS = ("delete", "retire", "relist")
 # 维护链专属动作:它们的"生效"没有对应的核验事件,由 settle_maintenance()
-# 直接比对 catalog.walmart_items 的现值判定
+# 直接比对 catalog.walmart_items 的现值判定。**同时是 maintenance 的领取集**
 MAINT_ACTIONS = ("title", "price", "inventory")
-# 来源(tro 是预留:侵权投诉链将来也走同一张建议表)
+
+# 来源(tro 是预留:侵权投诉链将来也走同一张建议表)。按动作领之后来源只剩
+# 两个用途:withdraw_stale(每条链只撤自己建的)与 count_open(各报各的账)
 SOURCES = ("scan", "audit", "tro", "maint")
-# 两条链各自的来源集合 —— claim()/count_open() 的取值,别在工作流里手写字符串
 PROBLEM_SOURCES = ("scan", "audit", "tro")
 MAINT_SOURCES = ("maint",)
 OPEN_STATUSES = ("suggested", "executing")
@@ -87,13 +114,14 @@ _CLAIM_SQL = """
 SELECT id, store, sku, asin, source, action, category, reason, detail
 FROM ops.dispositions
 WHERE status = 'suggested'
-  AND (%(sources)s::text[] IS NULL OR source = ANY(%(sources)s::text[]))
-ORDER BY store, action, suggested_at
+  AND (%(actions)s::text[] IS NULL OR action = ANY(%(actions)s::text[]))
+ORDER BY store, array_position(%(rank)s::text[], action), suggested_at
 """
 
 _MARK_SQL = """
 UPDATE ops.dispositions
-SET status = 'executing', feed_id = %(feed_id)s::text, executed_at = now()
+SET status = 'executing', feed_id = %(feed_id)s::text, executed_at = now(),
+    executed_by = %(by)s::text
 WHERE id = ANY(%(ids)s::bigint[]) AND status = 'suggested'
 """
 
@@ -265,31 +293,73 @@ def count_open(conn, status: str = "suggested",
         return cur.fetchone()[0]
 
 
-def claim(conn, sources: tuple | None = None) -> list[dict]:
-    """输入:连接 + 本链来源 → 输出:该来源的 suggested 建议行。**只读,不改状态**。
+def claim(conn, actions: tuple | None = None) -> list[dict]:
+    """输入:连接 + 本执行件能干的动作 → 输出:这些动作的 suggested 行。**只读**。
 
     领取与转态分开是有意的:提交 feed 可能失败、可能被在途防重拦下,只有
     真提交成功(拿到 feed_id)才该转 executing。先转态再提交 = 提交失败的行
     卡在 executing 永远等不到判决,而下轮扫描因部分唯一索引还建不出新建议。
 
-    ⚠ **sources 必须传**(默认 None = 全领,只留给排查用)。两条链共用一张表,
-    不限来源就会领到对方的建议行:维护链的 'price' 落进
-    problem_product_cleanup.group_by_store 会直接抛(宁炸不吞,但那是白炸一轮),
-    反过来 'relist' 落进维护执行件同理。
+    ⚠ **actions 必须传**(默认 None = 全领,只留给排查用)。传的是
+    `PROBLEM_ACTIONS` / `MAINT_ACTIONS`,别在工作流里手写字符串。
+    领错动作的后果是白炸一轮:维护链的 'price' 落进
+    problem_product_cleanup.group_by_store 会直接抛,反过来 'relist' 落进
+    维护执行件同理。
+
+    ⚠ **按动作领,不按来源领**(2026-08-24 改)。旧口径按 source 领,后果见
+    PROBLEM_ACTIONS 的注释:一条被两条链先后建议过的删除,归谁执行取决于
+    "谁先落库",而表里显示的原因是"谁后覆写"。
+
+    返回顺序 = (店铺, 动作优先级, 建议时间)。破坏组排在维护组前面,单店上限
+    截断(cap_destructive)因此总是先保住优先级高的那些。
     """
     with conn.cursor() as cur:
-        cur.execute(_CLAIM_SQL,
-                    {"sources": list(sources) if sources is not None else None})
+        cur.execute(_CLAIM_SQL, {
+            "actions": list(actions) if actions is not None else None,
+            "rank": list(ACTION_ORDER)})
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def mark_executing(conn, ids: list[int], feed_id) -> int:
-    """输入:连接 + 建议行 id 列表 + feed_id → 输出:转态行数。"""
+def cap_destructive(rows: list[dict], caps: dict, default: int
+                    ) -> tuple[list[dict], dict]:
+    """输入:已领取的建议行 + {店铺:上限} + 缺省上限 → 输出:(截后的行, {店铺:超额})。
+
+    **单店删除上限的唯一施加点**(2026-08-24 归一)。此前两条链各自在扫描期
+    按同一张限额表「下架限制」截一次 —— 应用两遍的结果是"每店最多 N 条"
+    实际变成了最多 2N。现在扫描期一律不截(建议表如实反映待办),执行期截一次。
+
+    只截破坏组:维护三类(标题/价格/库存)不烧下架配额,不该被这个上限管。
+    超出的**留在 suggested 不动**,下轮继续领 —— 丢弃会让它们永远轮不到。
+    """
+    kept, over, per_store = [], {}, {}
+    for r in rows:
+        if r["action"] not in DESTRUCTIVE_ACTIONS:
+            kept.append(r)
+            continue
+        store = r["store"]
+        cap = int(caps.get(store, default))
+        per_store[store] = per_store.get(store, 0) + 1
+        if per_store[store] > cap:
+            over[store] = over.get(store, 0) + 1
+            continue
+        kept.append(r)
+    if over:
+        logger.warning("破坏类建议超单店上限,本轮留到下轮:%s", over)
+    return kept, over
+
+
+def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
+    """输入:连接 + 建议行 id 列表 + feed_id + 执行者 → 输出:转态行数。
+
+    `by` 是工作流名,落 executed_by 列 —— 建议合并之后"这条最终是谁干的"
+    在库里必须有答案,否则又回到 08-19 那种从表面推不出执行者的状态。
+    """
     if not ids:
         return 0
     with conn.cursor() as cur:
-        cur.execute(_MARK_SQL, {"ids": list(ids), "feed_id": str(feed_id or "")})
+        cur.execute(_MARK_SQL, {"ids": list(ids), "by": str(by or ""),
+                                "feed_id": str(feed_id or "")})
         return cur.rowcount
 
 

@@ -281,6 +281,9 @@ def run(params: dict) -> str:
         _settle(lines)
     with db.pg_conn() as conn:
         rows = dispositions.claim(conn, dispositions.MAINT_ACTIONS)
+        # 压制必须见人:claim 少返回几行是静默的,不报的话摘要写着"没有待执行
+        # 的维护建议",人会以为扫描件没算出东西来
+        n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
     intents = [mi.from_disposition(r) for r in rows]
     if params.get("store"):
         intents = [i for i in intents if i["store"] == params["store"]]
@@ -292,9 +295,10 @@ def run(params: dict) -> str:
         return "\n".join(lines + [
             f"{mode}没有待执行的维护建议 —— 先跑 "
             f"`python cli.py maintenance_scan`"
-            f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束);"
-            f"也可能是这些 SKU 都挂着待执行的删除/停用建议而被压制"
-            f"(破坏类压制维护类,执行归 problem_product_cleanup)"])
+            f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束)"
+            + (f";⚠ 另有 {n_sup} 条被压制(这些 SKU 挂着待执行的删除/停用,"
+               f"要删的东西不再花配额去改;执行归 problem_product_cleanup)"
+               if n_sup else "")])
 
     by_store = group_by_store(intents)
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
@@ -305,7 +309,9 @@ def run(params: dict) -> str:
     # 缺失,并没有全部提交出去。准确的只有"本轮领取了多少",结果归后面几行。
     head = "待执行建议" if not execute else "本轮领取建议"
     lines.append(f"{mode}{head} {len(intents)} 条:标题 {n_kind['title']},"
-                 f"价格 {n_kind['price']},库存 {n_kind['inventory']}")
+                 f"价格 {n_kind['price']},库存 {n_kind['inventory']}"
+                 + (f";因同 SKU 待删/待停用被压制 {n_sup} 条"
+                    f"(留在建议表,删除没生效的话下轮还在)" if n_sup else ""))
 
     if not execute:
         # 执行件的 dry-run 只回答"要提交什么、走哪条路由"。

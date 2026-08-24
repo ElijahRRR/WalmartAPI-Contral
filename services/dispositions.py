@@ -24,17 +24,35 @@ delete_verified / delete_not_effective ——"不信回执信观测"那套规则
 宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
 真相。本模块只做"把已有判决登记到建议行上"。
 
-⚠ **两条链共用一张表,交界处有三条纪律**(2026-08-16 接入维护链时定):
-  ① `claim(sources=...)` **必须传**。不传就会领到另一条链的建议行,而两边的
-     动作集合不同 —— problem_product_cleanup 的 group_by_store 见到 'price'
-     会直接抛(宁炸不吞,但那是白炸一轮)。
-  ② 部分唯一索引 `(store, sku, action)` **跨来源**。同一 (店铺,SKU) 被
-     problem_scan 与 maintenance_scan 同时建议 delete 时,两条合成一条,
-     source 保留先落库那一方 —— 于是**只有那一条链的执行件会去删它**。
-     结果仍是"删一次",可接受;但 reason/category 会被后写的一方覆盖,
-     查"当初为什么删"要连着两条链的日志一起看。
-  ③ 每条链只撤销/只统计**自己来源**的行(withdraw_stale/count_open 的
-     source 参数),否则一条链的扫描会把另一条链的待执行建议清空。
+⚠ **两条链共用一张表,交界处五条纪律**(2026-08-16 定,2026-08-24 大修)。
+起因是所有者在 08-19 的维护记录里翻到一行「删除 | 审核判拒仍在架:(理由未留存)」
+——那句措辞只有 problem_scan 造得出,而维护记录表只有 maintenance 写得进。
+病根是旧形态的三个毛病凑在一起:按来源领取、按来源记原因、压制只活在一轮内存里。
+
+  ① **按动作领,不按来源领**(`claim(actions=...)`,必须传)。source 答
+     "为什么建议",action 答"该谁干"。拿前者当后者用,归属就取决于"谁先落库"
+     而显示的原因取决于"谁后覆写",两边对不上。
+  ② **破坏动作只有一个出口** problem_product_cleanup。maintenance 从
+     2026-08-24 起不发 DELETE_ITEM —— 两个出口意味着配额、在途防重、病历口径
+     各有一套,同一个 SKU 被两条链先后删两次是生产实证过的(提交期防重按
+     **整批载荷指纹**算,两条链批次内容不同就撞不上)。
+  ③ **破坏组存在即压制同 SKU 的维护组**,实现在 `claim()` 的 _SUPPRESS_CLAUSE
+     ——按库里所有未落定的破坏类建议判,**与两个扫描件谁先跑无关**。
+     压制条数由 `count_suppressed()` 报,不许静默。
+     ⚠ 破坏组内部**不合并**:retire + delete 同 SKU 是 problem_scan 对顽固件
+     的有意设计(双 feed 齐发),合成一条会让一个的落定覆盖另一个。
+  ④ **多来源支撑**:`sources` 列按来源分格记 {action, code, reason, at}。
+     部分唯一索引 `(store, sku, action)` 跨来源,同一条被两条链命中时合成
+     一行 —— 但两条理由都留在 sources 里,`reason`/`category` 由 claim() 现算
+     (单来源逐字不变,多来源拼成「维护:… | 审核:…」)。
+     `source`/`reason`/`category` 三列**不再被后写方覆盖**,它们是病历。
+  ⑤ 每条链只撤销/只统计**自己那一格**(withdraw_stale/count_open 的 source
+     参数):撤销删掉自己那格,**全空才 withdrawn**;另一条链还在支撑的行照旧
+     待执行。整行撤会把对方的建议一起干掉,而对方永远撤不掉自己那条。
+
+单店破坏类上限(限额表「下架限制」)只在执行件领取时施加一次
+(`cap_destructive`)。此前两条扫描件各截一次同一张表,每店最多 N 条实际变成
+最多 2N。
 """
 
 import logging
@@ -65,8 +83,11 @@ ACTION_RANK = {"delete": 0, "retire": 1, "relist": 2,
                "inventory": 3, "title": 4, "price": 5}
 ACTION_ORDER = tuple(sorted(ACTIONS, key=lambda a: ACTION_RANK[a]))
 
-# 破坏组:不可逆。一个 SKU 同时只能有一条,且**存在即压制该 SKU 的维护组建议**
-# ——要删的东西没必要再花配额去改(批次 E 踩过:先花配额救活再花配额删掉)。
+# 破坏组:不可逆。**存在即压制该 SKU 的维护组建议** —— 要删的东西没必要再花
+# 配额去改(批次 E 踩过:先花配额救活再花配额删掉)。压制在 claim() 里判。
+# ⚠ 组内**不合并**:同 SKU 同时挂 retire 与 delete 是 problem_scan 对顽固件的
+# 有意设计(双 feed 齐发,能删的删、删不掉的至少停用),两条是两个 feed、
+# 两次独立的生效判定,合成一条会让其中一个的落定结果覆盖另一个。
 DESTRUCTIVE_ACTIONS = ("delete", "retire")
 # 单店单轮破坏类上限的缺省值:限额表「下架限制」缺该店时的退路(会告警)。
 # **唯一出处**(2026-08-24 归一):此前 maintenance_intents.DELETE_PER_STORE 与
@@ -95,75 +116,26 @@ OPEN_STATUSES = ("suggested", "executing")
 # ⚠ 只更新 suggested 行:**executing 行绝不能被覆盖**——它已经提交了 feed,
 # 把它的 suggested_at 刷新会让"等观测多久了"失真,更严重的是若同轮把
 # feed_id 洗掉,这条提交就永远等不到落定判决了。
+# 合并规则。⚠ 三个键**不再被后写方覆盖**(2026-08-24 改):
+#   source   = 首个支撑来源(与"谁先落库"一致,不再与 reason 自相矛盾)
+#   reason   = 首次建议时的原因,留给病历
+#   category = 同上
+# 当前全貌在 sources 里,由 claim() 现算 —— 旧形态让后写方覆盖 reason,结果是
+# 一行显示着 A 链的建议、B 链的原因(08-19 生产实见那条维护记录)。
+# detail 改成**合并**而不是替换:替换会把维护链删除行的 label/旧值/新值 洗掉
+#(那正是 08-19 那行「建议」列只剩光秃秃"删除"、旧值新值全空的原因)。
 _UPSERT_SQL = """
 INSERT INTO ops.dispositions
-    (store, sku, asin, source, action, category, reason, detail)
+    (store, sku, asin, source, action, category, reason, detail, sources)
 VALUES (%(store)s::text, %(sku)s::text, %(asin)s::text, %(source)s::text,
         %(action)s::text, %(category)s::text, %(reason)s::text,
-        %(detail)s::jsonb)
+        %(detail)s::jsonb, %(sources)s::jsonb)
 ON CONFLICT (store, sku, action) WHERE status IN ('suggested', 'executing')
-DO UPDATE SET category = EXCLUDED.category,
-              reason = EXCLUDED.reason,
-              asin = COALESCE(EXCLUDED.asin, ops.dispositions.asin),
-              detail = EXCLUDED.detail,
+DO UPDATE SET asin = COALESCE(EXCLUDED.asin, ops.dispositions.asin),
+              detail = ops.dispositions.detail || EXCLUDED.detail,
+              sources = ops.dispositions.sources || EXCLUDED.sources,
               suggested_at = now()
 WHERE ops.dispositions.status = 'suggested'
-"""
-
-_CLAIM_SQL = """
-SELECT id, store, sku, asin, source, action, category, reason, detail
-FROM ops.dispositions
-WHERE status = 'suggested'
-  AND (%(actions)s::text[] IS NULL OR action = ANY(%(actions)s::text[]))
-ORDER BY store, array_position(%(rank)s::text[], action), suggested_at
-"""
-
-_MARK_SQL = """
-UPDATE ops.dispositions
-SET status = 'executing', feed_id = %(feed_id)s::text, executed_at = now(),
-    executed_by = %(by)s::text
-WHERE id = ANY(%(ids)s::bigint[]) AND status = 'suggested'
-"""
-
-# 观测判决登记:executing 行 × 提交之后落的核验事件。
-# gone 侧(delete_verified)= 生效;still 侧(delete_not_effective)= 没生效。
-# 反补(relist)的生效信号不同:商品重新 PUBLISHED —— 直接看 walmart_items
-# 现状,不看事件(反补没有对应的核验事件流)。
-_SETTLE_DELETE_SQL = """
-UPDATE ops.dispositions d
-SET status = CASE WHEN e.event = 'delete_verified'
-                  THEN 'confirmed' ELSE 'ineffective' END,
-    settled_at = now(),
-    detail = d.detail || jsonb_build_object('settled_by', e.event)
-FROM (
-    SELECT DISTINCT ON (store, sku) store, sku, event, occurred_at
-    FROM catalog.product_events
-    WHERE event IN ('delete_verified', 'delete_not_effective')
-    ORDER BY store, sku, occurred_at DESC
-) e
-WHERE d.status = 'executing' AND d.action IN ('delete', 'retire')
-  AND d.store = e.store AND d.sku = e.sku
-  AND e.occurred_at > d.executed_at
-RETURNING d.status
-"""
-
-# 反补生效 = 该 SKU 已不在问题清单里(published_status 回到正常或已缺席);
-# 仍在问题清单 = 没生效。**必须等 catalog_sync 重新观测过**
-# (last_seen_at > executed_at),否则拿提交前的旧快照判,永远判成"没生效"。
-_SETTLE_RELIST_SQL = """
-UPDATE ops.dispositions d
-SET status = CASE
-        WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
-             OR w.published_status NOT IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
-        THEN 'confirmed' ELSE 'ineffective' END,
-    settled_at = now(),
-    detail = d.detail || jsonb_build_object(
-        'settled_by', coalesce(w.published_status, 'absent'))
-FROM catalog.walmart_items w
-WHERE d.status = 'executing' AND d.action = 'relist'
-  AND w.store = d.store AND w.sku = d.sku
-  AND w.last_seen_at > d.executed_at
-RETURNING d.status
 """
 
 
@@ -173,10 +145,16 @@ def suggest_many(conn, rows: list[dict]) -> int:
     detail 传 dict,本函数负责序列化;asin/category/reason 可缺省。
     非法 action/source 直接抛 —— 拼错一个字符串会静默落一批永远没人领的
     建议行(执行件按 action 分桶,不认识的桶不会被消费),宁炸不吞。
+
+    每行都往 sources 里写自己那一格(来源 → 动作/原因码/原因/时间),同
+    (店铺,SKU,动作) 被两条链命中时两格并存 —— 这是"查当初为什么删要翻两条链
+    日志"的解法。
     """
     import json
+    from datetime import datetime, timezone
     if not rows:
         return 0
+    now = datetime.now(timezone.utc).isoformat()
     payload = []
     for r in rows:
         if r["action"] not in ACTIONS:
@@ -184,15 +162,20 @@ def suggest_many(conn, rows: list[dict]) -> int:
         src = r.get("source", "scan")
         if src not in SOURCES:
             raise ValueError(f"未知 source={src!r}(可用:{SOURCES})")
+        reason = (r.get("reason") or "")[:500]
         payload.append({
             "store": r["store"], "sku": r["sku"], "asin": r.get("asin"),
             "source": src, "action": r["action"],
-            "category": r.get("category"), "reason": (r.get("reason") or "")[:500],
+            "category": r.get("category"), "reason": reason,
             # default=str:detail 里常有 datetime(删除建议带 first_seen/
             # last_seen)。不给 default 的话 json.dumps 直接抛,而抛的位置在
             # 扫描件末尾 —— 一整轮扫描白跑,且看起来像"建议表坏了"
             "detail": json.dumps(r.get("detail") or {}, ensure_ascii=False,
                                  default=str),
+            "sources": json.dumps(
+                {src: {"action": r["action"], "code": r.get("category"),
+                       "reason": reason, "at": now}},
+                ensure_ascii=False, default=str),
         })
     with conn.cursor() as cur:
         # ⚠ 报**实际落库行数**,不是 len(payload)。两者会差:同 (店铺,SKU,动作)
@@ -218,17 +201,36 @@ def suggest_many(conn, rows: list[dict]) -> int:
 #           "could not determine data type of parameter"。**必须显式 ::text**。
 # 结论不是"以后小心点",是:**这类 SQL 的唯一验证手段是连库跑一次**。
 # 改动本段后别信 pytest 绿,去 dry-run。
+# 撤销 = **只删自己那一格**,全空才 withdrawn(2026-08-24 多来源支撑之后)。
+# 旧写法按标量 source 整行撤:一行只能记一个来源,另一条链既撤不掉它、也不
+# 知道自己那条理由还成不成立 —— 合并之后照旧写就会出现"维护链不再建议了,
+# 但因为 source 记的是 audit,这行永远撤不掉"。
+#
+# ⚠ 用 jsonb_exists(...) 函数形式而不是 `?` 运算符:`?` 在若干驱动/工具链里
+# 会被当占位符,炸的时候只在生产上炸。
+# ⚠ 兼容存量:sources 还是 '{}' 的老行按标量 source 匹配(schema.sql 有一次性
+# 回填,但别让这条 SQL 依赖它跑过 —— 漏回填的行会永远撤不掉且不报错)。
+# ⚠ keep 比对用**该来源自己记的动作**:破坏组撞车时行上的 action 可能已被
+# 升格(retire → delete),拿升格后的动作去比对方的 keep 清单必然对不上。
 _WITHDRAW_SQL = """
 UPDATE ops.dispositions d
-SET status = 'withdrawn', settled_at = now(),
+SET sources = d.sources - %(source)s::text,
+    status = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                  THEN 'withdrawn' ELSE d.status END,
+    settled_at = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                      THEN now() ELSE d.settled_at END,
     detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s::text)
-WHERE d.status = 'suggested' AND d.source = %(source)s::text
+WHERE d.status = 'suggested'
+  AND (jsonb_exists(d.sources, %(source)s::text)
+       OR (d.sources = '{}'::jsonb AND d.source = %(source)s::text))
   AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
                            %(actions)s::text[]) AS k(store, sku, action)
-      WHERE k.store = d.store AND k.sku = d.sku AND k.action = d.action)
-RETURNING d.id
+      WHERE k.store = d.store AND k.sku = d.sku
+        AND k.action = COALESCE(d.sources -> %(source)s::text ->> 'action',
+                                d.action))
+RETURNING d.id, d.status
 """
 
 
@@ -240,8 +242,10 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
     —— 但昨天那条 suggested 行还挂着,执行件照样会删。这个函数把"本轮不再
     建议、但还挂着 suggested"的行置 withdrawn。
 
-    只动**本来源**的行(source 参数):扫描件那一轮不该碰审核来源的建议,
+    只动**本来源那一格**(source 参数):扫描件那一轮不该碰审核来源的建议,
     反之亦然 —— 两个来源各跑各的闸,互相看不见对方为什么建议。
+    合并行(两条链都在支撑)撤掉自己那一格之后**照旧待执行**,返回值不计它:
+    报"已撤销"而另一条链还在建议、执行件照样会做,那是谎话。
 
     executing 及已落定的行一根手指都不碰:那些已经提交出去了,撤销无意义
     (feed 已经在沃尔玛队列里),它们的归宿是 settle() 按观测判决。
@@ -255,18 +259,31 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
         if not keep:
             # 本轮一条都不建议 = 该来源(该范围内)的 suggested 全撤
             cur.execute(
-                "UPDATE ops.dispositions SET status = 'withdrawn', "
-                "settled_at = now() WHERE status = 'suggested' "
-                "AND source = %(source)s::text "
-                "AND (%(store)s::text IS NULL OR store = %(store)s::text)",
+                "UPDATE ops.dispositions d "
+                "SET sources = d.sources - %(source)s::text, "
+                "    status = CASE WHEN (d.sources - %(source)s::text) "
+                "                       = '{}'::jsonb "
+                "                  THEN 'withdrawn' ELSE d.status END, "
+                "    settled_at = CASE WHEN (d.sources - %(source)s::text) "
+                "                           = '{}'::jsonb "
+                "                      THEN now() ELSE d.settled_at END "
+                "WHERE d.status = 'suggested' "
+                "  AND (jsonb_exists(d.sources, %(source)s::text) "
+                "       OR (d.sources = '{}'::jsonb "
+                "           AND d.source = %(source)s::text)) "
+                "  AND (%(store)s::text IS NULL "
+                "       OR d.store = %(store)s::text) "
+                "RETURNING d.status",
                 {"source": source, "store": store})
-            return cur.rowcount or 0
+            return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {
             "source": source, "why": why, "store": store,
             "stores": [k[0] for k in keep],
             "skus": [k[1] for k in keep],
             "actions": [k[2] for k in keep]})
-        return len(cur.fetchall())
+        # 报的是**真撤掉的**条数,不是"少了一个支撑来源"的条数:后者里有一批
+        # 另一条链还在建议、执行件照样会做,说成"已撤销"就是谎话
+        return sum(1 for _id, st in cur.fetchall() if st == "withdrawn")
 
 
 def count_open(conn, status: str = "suggested",
@@ -287,10 +304,85 @@ def count_open(conn, status: str = "suggested",
         cur.execute(
             "SELECT count(*) FROM ops.dispositions WHERE status = %(st)s::text"
             " AND (%(sources)s::text[] IS NULL"
-            "      OR source = ANY(%(sources)s::text[]))",
+            "      OR jsonb_exists_any(sources, %(sources)s::text[])"
+            "      OR (sources = '{}'::jsonb"
+            "          AND source = ANY(%(sources)s::text[])))",
             {"st": status,
              "sources": list(sources) if sources is not None else None})
         return cur.fetchone()[0]
+
+
+#: 来源 → 人读标签。多来源合并时给每条理由挂上出处,否则
+#: 「标题相似度 62% | 审核判拒仍在架」读不出哪句话是谁说的。
+# 破坏组压制维护组的**唯一实现**。为什么在 claim 而不在写入期:压制必须与
+# 两个扫描件谁先跑无关(本仓吃过"顺序即语义"的亏),而写入期只能压住后写的
+# 那一方。被压制的行留在 suggested 不撤 —— 删除若最终没生效,它们还在,
+# 不用等下一轮扫描件重算。
+_SUPPRESS_CLAUSE = """
+  AND (d.action = ANY(%(destructive)s::text[]) OR NOT EXISTS (
+        SELECT 1 FROM ops.dispositions x
+        WHERE x.store = d.store AND x.sku = d.sku
+          AND x.status IN ('suggested', 'executing')
+          AND x.action = ANY(%(destructive)s::text[])))
+"""
+
+_CLAIM_SQL = """
+SELECT d.id, d.store, d.sku, d.asin, d.source, d.action, d.category,
+       d.reason, d.detail, d.sources
+FROM ops.dispositions d
+WHERE d.status = 'suggested'
+  AND (%(actions)s::text[] IS NULL OR d.action = ANY(%(actions)s::text[]))
+""" + _SUPPRESS_CLAUSE + """
+ORDER BY d.store, array_position(%(rank)s::text[], d.action), d.suggested_at
+"""
+
+# 被压制了多少条 —— 必须报出来。静默压制读起来就是"今天没有维护建议",
+# 而其实是"这批 SKU 都等着被删"(本仓口诀:静默的闸没人记得它关着)。
+_SUPPRESSED_SQL = """
+SELECT count(*)
+FROM ops.dispositions d
+WHERE d.status = 'suggested'
+  AND (%(actions)s::text[] IS NULL OR d.action = ANY(%(actions)s::text[]))
+  AND NOT (d.action = ANY(%(destructive)s::text[]))
+  AND EXISTS (
+        SELECT 1 FROM ops.dispositions x
+        WHERE x.store = d.store AND x.sku = d.sku
+          AND x.status IN ('suggested', 'executing')
+          AND x.action = ANY(%(destructive)s::text[]))
+"""
+
+_MARK_SQL = """
+UPDATE ops.dispositions
+SET status = 'executing', feed_id = %(feed_id)s::text, executed_at = now(),
+    executed_by = %(by)s::text
+WHERE id = ANY(%(ids)s::bigint[]) AND status = 'suggested'
+"""
+
+SOURCE_LABEL = {"maint": "维护", "scan": "问题", "audit": "审核", "tro": "投诉"}
+
+
+def _merge_view(row: dict) -> dict:
+    """输入:一行建议(带 sources)→ 输出:同一行,reason/category 按全部来源现算。
+
+    **单来源时逐字不变**(不加前缀):维护记录表的「原因」列、以及任何拿这段
+    文本做匹配的地方,不该因为这次改造而变样。多来源才拼接,并按各来源写入
+    时间排序 —— 08-19 那行的病根正是"只看得到后写的那一方"。
+    """
+    srcs = row.get("sources") or {}
+    row["merged_from"] = tuple(sorted(srcs))
+    if len(srcs) <= 1:
+        return row
+    ordered = sorted(srcs.items(),
+                     key=lambda kv: (str((kv[1] or {}).get("at") or ""), kv[0]))
+    parts = [f"{SOURCE_LABEL.get(src, src)}:{(v or {}).get('reason')}"
+             for src, v in ordered if (v or {}).get("reason")]
+    if parts:
+        row["reason"] = " | ".join(parts)[:500]
+    for _src, v in ordered:                 # 原因码取最早那个非空的
+        if (v or {}).get("code"):
+            row["category"] = v["code"]
+            break
+    return row
 
 
 def claim(conn, actions: tuple | None = None) -> list[dict]:
@@ -312,13 +404,36 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
 
     返回顺序 = (店铺, 动作优先级, 建议时间)。破坏组排在维护组前面,单店上限
     截断(cap_destructive)因此总是先保住优先级高的那些。
+
+    ⚠ **破坏组压制维护组**:同一 SKU 挂着未落定的 delete/retire 时,它的
+    title/price/inventory/relist 行一条都不返回 —— 要删的东西没必要再花配额去
+    改(批次 E 踩过:先花配额救活、再花配额删掉)。被压制的行留在 suggested
+    不撤:删除若最终没生效,它们还在,不用等扫描件重算。压制了多少条由
+    count_suppressed() 报,别让它静默。
+
+    reason/category 由 sources 现算(见 _merge_view):多来源支撑时两条理由
+    都要看得见,不能只显示后写的那一方。
     """
     with conn.cursor() as cur:
         cur.execute(_CLAIM_SQL, {
             "actions": list(actions) if actions is not None else None,
+            "destructive": list(DESTRUCTIVE_ACTIONS),
             "rank": list(ACTION_ORDER)})
         cols = [d.name for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return [_merge_view(dict(zip(cols, r))) for r in cur.fetchall()]
+
+
+def count_suppressed(conn, actions: tuple | None = None) -> int:
+    """输入:连接 + 动作集 → 输出:因同 SKU 挂着破坏类建议而被压制的条数。
+
+    **必须有人报它**:压制是静默的(claim 少返回几行,谁也不报错),不报的话
+    摘要写着"没有待执行的维护建议",人会以为扫描件没算出东西来。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SUPPRESSED_SQL, {
+            "actions": list(actions) if actions is not None else None,
+            "destructive": list(DESTRUCTIVE_ACTIONS)})
+        return cur.fetchone()[0]
 
 
 def cap_destructive(rows: list[dict], caps: dict, default: int
@@ -495,7 +610,9 @@ SELECT store, action, count(*) AS n, min(executed_at) AS oldest
 FROM ops.dispositions
 WHERE status = 'executing'
   AND executed_at < now() - make_interval(days => %(days)s::int)
-  AND (%(sources)s::text[] IS NULL OR source = ANY(%(sources)s::text[]))
+  AND (%(sources)s::text[] IS NULL
+       OR jsonb_exists_any(sources, %(sources)s::text[])
+       OR (sources = '{}'::jsonb AND source = ANY(%(sources)s::text[])))
 GROUP BY store, action
 ORDER BY n DESC, store
 """

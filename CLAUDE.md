@@ -49,6 +49,19 @@
   ClientId/代理)。用错的两个方向都会出事 —— 拿 `load_stores()` 判在营,
   「在营但代理没配」的店会被当成死店而整店下线;拿 `registered_names()`
   判在营,停用的店照样占着品牌、照样用冻结行拦着别的店上架。
+- **「这条处置建议该谁执行」只看 `action`,不看 `source`**(所有者定稿
+  2026-08-24)。`ops.dispositions` 一张表两条链共用:`source` 答"为什么建议"
+  (maint/scan/audit/tro),`action` 答"该谁干"——`PROBLEM_ACTIONS`
+  (delete/retire/relist)归 `problem_product_cleanup`,`MAINT_ACTIONS`
+  (title/price/inventory)归 `maintenance`。**破坏动作只有一个出口**;
+  破坏组存在即压制同 SKU 的维护组,压制在 `dispositions.claim()` 里判,
+  **与两个扫描件谁先跑无关**(调度顺序不许承载判据);破坏组内部**不合并**
+  (retire+delete 同 SKU 是顽固件双 feed 齐发,合成一条会让一个的落定覆盖
+  另一个)。合并行的每个来源各占 `sources` 一格,撤销只删自己那一格、
+  全空才 withdrawn。
+  拿 source 当执行者用的下场:08-19 生产实见一行「维护链执行 + 审核链原因」
+  的维护记录,谁也说不清是哪条链干的;更早的后果是同一个 SKU 被两条链先后
+  删了两次(提交期防重按**整批载荷指纹**算,两条链批次不同就撞不上)。
 - **services 新增积木前必须先通读 services/ 现有函数确认无重复**;每个函数 docstring
   第一行写清"输入什么 → 输出什么"。
 - **飞书字段名只准引用 registry 中的字段常量**,不准在代码里写字段名字符串字面量

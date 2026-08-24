@@ -1110,18 +1110,46 @@ CREATE TABLE IF NOT EXISTS ops.dispositions (
     settled_at   timestamptz,
     detail       jsonb NOT NULL DEFAULT '{}'
 );
+-- 执行者(2026-08-24):建议按动作分工之后,"这条最终是谁干的"必须在库里有
+-- 答案。此前只能从 source 反推执行件,而 source 是"谁先建议"不是"谁执行"
+-- ——08-19 生产实见一行维护链执行、审核链原因的记录,就是这么来的。
+ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS executed_by text;
+
+-- ── 多来源支撑(2026-08-24 路由器)────────────────────────────────────────
+-- 一条未落定建议可以同时被多条链支撑(同一个 SKU,维护链说"标题对不上该删"、
+-- 审核链说"判拒了还在架该删")。**必须把每个来源各自的依据都留住**:
+--   {"maint": {"action":"delete","code":"title_mismatch","reason":"…","at":…},
+--    "audit": {"action":"delete","code":null,"reason":"审核判拒仍在架:…","at":…}}
+-- 为什么不能只留一个 source 标量(旧形态):
+--   ① 查"当初为什么删它"只看得到后写的那一方(08-19 生产实见);
+--   ② withdraw_stale 每条链只撤自己建的 —— 一行只有一个 source 时,另一条链
+--      既撤不掉它、也不知道自己那条理由还成不成立。
+-- 撤销时只删自己那一格,**全空才 withdrawn**。
+ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS sources jsonb
+    NOT NULL DEFAULT '{}'::jsonb;
+-- 存量行一次性回填(幂等):按旧的标量 source 造出单来源的那一格
+UPDATE ops.dispositions
+SET sources = jsonb_build_object(
+        source, jsonb_build_object('action', action, 'code', category,
+                                   'reason', reason))
+WHERE sources = '{}'::jsonb AND status IN ('suggested', 'executing');
+
 -- 同一 (店铺,SKU,动作) **同时只能有一条未落定的建议**:扫描件每轮重跑要幂等,
 -- 不能每跑一次就堆一行;而已落定(confirmed/ineffective)的行是病历,必须留着,
 -- 所以用**部分**唯一索引只约束未落定态。
+--
+-- ⚠ **动作在键里,不能去掉**(2026-08-24 复核)。所有者提的"破坏组一 SKU 一条"
+-- 会打掉一条现存的有意设计:problem_scan 对**顽固 SKU**(上一轮 delete 观测到
+-- 没生效)同时建议 retire 与 delete —— 停用+删除双 feed 齐发,"能删的删,
+-- 删不掉的至少停用"。两条是两个 feed、两次独立的生效判定,合成一条会让其中
+-- 一个的落定结果覆盖另一个。
+-- 「破坏组存在即压制该 SKU 的维护组」不靠索引实现,靠 dispositions.claim()
+-- ——索引管不了跨行的条件,而且压制必须与两个扫描件谁先跑无关。
 CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     ON ops.dispositions (store, sku, action)
     WHERE status IN ('suggested', 'executing');
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
--- 执行者(2026-08-24):建议按动作分工之后,"这条最终是谁干的"必须在库里有
--- 答案。此前只能从 source 反推执行件,而 source 是"谁先建议"不是"谁执行"
--- ——08-19 生产实见一行维护链执行、审核链原因的记录,就是这么来的。
-ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS executed_by text;
 
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──

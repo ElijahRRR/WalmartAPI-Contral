@@ -152,6 +152,7 @@ def run(params: dict) -> str:
             store=only or None)
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
+        n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
         stuck = dispositions.stuck_executing(
             conn, sources=dispositions.MAINT_SOURCES)
     lines.append(
@@ -162,6 +163,11 @@ def run(params: dict) -> str:
            f"已有 executing 行(上一轮提交了还没等到 catalog_sync 复核),"
            f"按部分唯一索引写不进去 —— 这是防重不是丢单"
            if n_sug < len(intents) else ""))
+    if n_sup:
+        # 「库里待执行 N 条」里有一批 maintenance 今天不会碰:同 SKU 挂着删除/
+        # 停用,破坏类压制维护类。不说的话两边的数对不上,人会以为执行件漏做
+        lines.append(f"  其中 {n_sup} 条被压制(同 SKU 挂着待执行的删除/停用,"
+                     f"maintenance 领不到它们;删除若最终没生效,下轮它们还在)")
     if stuck:
         lines.append(dispositions.stuck_note(stuck))
     lines.append("执行:标题/价格/库存 走 `python cli.py maintenance`;"

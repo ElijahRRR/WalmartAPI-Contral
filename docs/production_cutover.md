@@ -164,8 +164,13 @@ withdrawn,那一轮执行件根本没领到它 —— 要看撤销走
 ```
 maintenance_scan  (DANGEROUS=False,只读,产建议行)
       ↓ ops.dispositions(source='maint')
-maintenance       (DANGEROUS=True,纯执行件,只消费建议行)
+maintenance       (DANGEROUS=True,纯执行件,只消费 title/price/inventory)
+      ⤷ action='delete' 的行归 problem_product_cleanup(2026-08-24,见六·三)
 ```
+
+⚠ `product_chain` 的次序自 2026-08-24 起是 **建议期 → 执行期**:
+`catalog_sync → sources_backfill → product_refresh → product_audit →
+maintenance_scan → problem_scan → maintenance → problem_product_cleanup`。
 
 搬家清单(拆分不是复制,原来住在 workflow 里的东西按层归位):
 
@@ -174,19 +179,41 @@ maintenance       (DANGEROUS=True,纯执行件,只消费建议行)
 | `maintenance.collect_intents` | `services.maintenance_intents.collect_all` | 铁律 1:workflow 不许互相 import,而两侧口径必须是同一份代码 |
 | `maintenance._load_stockzero` | `services.store_limits.stockzero_stores` | 同上;那张限额表已经有一个消费方模块了 |
 | `maintenance._load_multipliers` | `services.store_limits.price_multipliers` | 同上 |
-| `maintenance._load_delete_caps` | `services.store_limits.retire_caps` | 同上 |
+| `maintenance._load_delete_caps` | `services.store_limits.retire_caps` | 同上(2026-08-24 起只由执行件调,见六·三) |
 | 破坏面明细(删除名单/清零原因/改价分布) | `maintenance_scan._preview_lines` | 决策在哪边,"为什么是这些商品"就该在哪边说 |
 
-**两条链共用一张 `ops.dispositions`**,交界处三条纪律(写在
-`services/dispositions.py` 头注,有用例钉着):
+## 六·三、建议路由器(所有者定稿 2026-08-24)
 
-1. `claim(sources=…)` **必须传**。不传就领到对方的建议行 ——
-   维护链的 `price` 落进 `problem_product_cleanup.group_by_store` 会直接抛。
-2. 部分唯一索引 `(store, sku, action)` **跨来源**。同一 (店铺,SKU) 被两条链
-   同时建议 `delete` 时合成一条,source 保留先落库那一方,于是只有那条链的
-   执行件去删它。结果仍是"删一次",可接受;但 reason/category 会被后写的
-   一方覆盖,查"当初为什么删"要两条链的日志一起看。
-3. `withdraw_stale` / `count_open` 各撤各的、各数各的。
+**两条链共用一张 `ops.dispositions`**。08-19 生产实见一行维护记录
+「A154 B08NDR1SGJ 删除 **审核判拒仍在架**:(理由未留存)」—— 那句措辞只有
+`problem_scan` 造得出,而维护记录表只有 `maintenance` 写得进。查下来是旧形态
+的三个毛病凑在一起:按来源领取、按来源记原因、压制只活在一轮内存里。
+整改后的五条纪律(写在 `services/dispositions.py` 头注,有用例钉着):
+
+1. **按动作领,不按来源领。** `source` 回答"为什么建议",`action` 回答
+   "该谁干"。`claim(actions=…)` 取 `PROBLEM_ACTIONS`(delete/retire/relist)
+   或 `MAINT_ACTIONS`(title/price/inventory),两者不交、并集 = 全部动作。
+2. **破坏动作只有一个出口**:`problem_product_cleanup`。`maintenance` 摘掉了
+   DELETE_ITEM —— 两个出口意味着配额、在途防重、病历口径各有一套,同一个
+   SKU 被两条链先后删两次是生产实证过的。维护链照常**建议**删除。
+3. **未落定唯一性仍是 (店铺, SKU, 动作)**。所有者原案「破坏组一 SKU 一条」
+   **没有采纳**:`problem_scan` 对顽固件(上一轮 delete 观测到没生效)同时
+   建议 retire 与 delete —— 双 feed 齐发,"能删的删,删不掉的至少停用"。
+   合成一条会让其中一个的落定结果覆盖另一个,而且两边都不报错
+   (`to_dispositions` 是纯函数,照样产两条,只有落库那一刻悄悄少一条)。
+4. **破坏组存在即压制该 SKU 的维护组**,实现在 `claim()` 里,按库里所有未落定
+   的破坏类建议判 —— **与两个扫描件谁先跑无关**。调度上把两个扫描件排在两个
+   执行件前面只是让人读着顺,顺序改了结果不变。压制条数由 `count_suppressed()`
+   报,进两边摘要(静默压制读起来就是"今天没有维护建议")。
+5. **多来源支撑**:`sources` 列按来源分格记 `{action, code, reason, at}`,
+   `reason`/`category` 由 `claim()` 现算(单来源时逐字不变,多来源拼成
+   「维护:… | 审核:…」)。`withdraw_stale` 只删自己那一格,**全空才
+   withdrawn**;`count_open` 按格数。旧形态让后写方覆盖 reason,结果就是一行
+   显示着 A 链的建议、B 链的原因。
+
+单店「下架限制」也归一了:此前两条扫描件各按同一张限额表截一次,每店最多 N 条
+实际变成最多 2N。现在扫描件如实报待办,执行件领取时截一次
+(`dispositions.cap_destructive`),截断条数进摘要。
 
 ⚠ **超期放行(`expire_executing`,3 天)不是洁癖,是防死锁。** 部分唯一索引
 只允许同 (店铺,SKU,动作) 有一条未落定行 —— executing 行永远不落定 =
@@ -200,7 +227,7 @@ maintenance       (DANGEROUS=True,纯执行件,只消费建议行)
 我们要的值**。比对写在 Python 里不写进 SQL —— `(detail->>'new')::numeric`
 遇到一条脏 detail 会炸掉**整条 UPDATE**(不是跳过那一行,是整轮落定失败)。
 
-## 六·三、串联 / UPC / feed 审计(已落地)
+## 六·四、串联 / UPC / feed 审计(已落地)
 
 **串联**(所有者:订单链每个跑完自动同步飞书,不要人手动推)——`cli.py` 的
 workflow 位置参数可以给多个:

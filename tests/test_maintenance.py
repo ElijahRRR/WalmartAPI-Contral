@@ -411,6 +411,8 @@ def _scan_wire(monkeypatch, intents, sz=("T1",)):
                             calls["withdraw"].append((src, keep, store)), 0)[1])
     monkeypatch.setattr(ms.dispositions, "count_open",
                         lambda conn, sources=None: len(calls["suggest"]))
+    monkeypatch.setattr(ms.dispositions, "count_suppressed",
+                        lambda conn, actions=None: calls.get("suppressed", 0))
     return ms, calls
 
 
@@ -489,7 +491,8 @@ def _disp(it, i):
 
 def _wire(monkeypatch, intents, stores=(STORE,)):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
-             "marked": [], "marked_by": set(), "settled": 0}
+             "marked": [], "marked_by": set(), "settled": 0,
+             "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(mw.dispositions, "claim",
                         lambda conn, actions=None: [_disp(it, i)
@@ -503,6 +506,8 @@ def _wire(monkeypatch, intents, stores=(STORE,)):
                                                         calls["settled"] + 1),
                                       {"confirmed": 0, "ineffective": 0})[1])
     monkeypatch.setattr(mw.dispositions, "expire_executing", lambda conn: 0)
+    monkeypatch.setattr(mw.dispositions, "count_suppressed",
+                        lambda conn, actions=None: calls["suppressed"])
     monkeypatch.setattr(mw.dispositions, "mark_executing",
                         lambda conn, ids, fid, by="": (
                             calls["marked"].append((list(ids), fid)),

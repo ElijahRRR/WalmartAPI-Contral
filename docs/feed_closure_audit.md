@@ -16,7 +16,7 @@
 | `product_clear` | DELETE_ITEM / RETIRE_ITEM | product_clear | `delete/retire_submitted` | `delete/retire_feed_*` | 停用/删除表 |
 | `sku_locked_heal` | RETIRE_ITEM | sku_locked_heal | `retire_submitted` | `retire_feed_*` | 无(冷却表自管)|
 | `problem_product_cleanup` | DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE | problem_product_cleanup | 三种 `*_submitted` | 三种 `*_feed_*` | 无(建议表自管)|
-| `maintenance` | DELETE_ITEM / MP_MAINTENANCE / price / inventory | maintenance | 仅 `delete_submitted` | 仅 `delete_feed_*` | 维护记录 |
+| `maintenance` | MP_MAINTENANCE / price / inventory | maintenance | 无(维护类不入病历)| 无 | 维护记录 |
 
 **每一条 feed 都落两张台账**,无例外 —— `ops.feed_log`(提交前 pending,成功转
 submitted)与 `ops.feed_items`(SKU 级,提交成功即落),两者都在
@@ -32,6 +32,12 @@ submitted)与 `ops.feed_items`(SKU 级,提交成功即落),两者都在
 `maintenance` 的 price / inventory / MP_MAINTENANCE **回执不进病历**,是所有者
 2026-08-07 的定稿(流水已在 `ops.feed_items`),由
 `product_events.receipt_in_ledger()` 一处收口,不是各写各的。
+
+⚠ **2026-08-24 起 `maintenance` 不再发 DELETE_ITEM**(所有者定稿):破坏动作
+只留 `problem_product_cleanup` 与 `product_clear`(人工通道)两个出口。此前
+维护链也能发删除,于是配额、在途防重、病历口径各有一套 —— 同一个 SKU 被两条
+链先后删两次是生产实证过的(`api/feeds` 的在途防重按**整批载荷指纹**算,
+两条链批次内容不同就撞不上)。维护链照常**建议**删除,领它的换成了问题链。
 
 ## 二、闭环的四段链条
 

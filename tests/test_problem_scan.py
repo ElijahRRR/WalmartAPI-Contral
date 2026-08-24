@@ -292,7 +292,11 @@ def test_withdraw_only_touches_own_source_and_suggested():
     from services import dispositions
     sql = dispositions._WITHDRAW_SQL
     assert "d.status = 'suggested'" in sql        # 只动 suggested
-    assert "d.source = %(source)s" in sql         # 只动本来源
+    # 只动**本来源那一格**(多来源支撑,2026-08-24):整行撤会把另一条链还在
+    # 支撑的建议一起干掉,而它撤不掉自己那一格 —— 08-19 那类合并行的病根
+    assert "sources = d.sources - %(source)s::text" in sql
+    assert "jsonb_exists(d.sources, %(source)s::text)" in sql
+    assert "?" not in sql              # `?` 在若干驱动里会被当占位符
     assert "'executing'" not in sql
     # 三个平行数组 + 多参数 unnest:别退回 record <> ALL(二维数组) 那种写法
     assert "unnest(%(stores)s::text[], %(skus)s::text[]," in sql
@@ -309,7 +313,9 @@ def test_withdraw_passes_three_parallel_arrays(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, params=None): seen.update(params or {})
-        def fetchall(self): return [(1,), (2,)]
+        def fetchall(self):
+            # 合并行(另一条链还在支撑)只是少了一格,不算"已撤销"
+            return [(1, "withdrawn"), (2, "withdrawn"), (3, "suggested")]
 
     class _Conn:
         def cursor(self): return _Cur()
@@ -358,19 +364,21 @@ def test_withdraw_empty_keep_also_respects_store():
     seen = {}
 
     class _Cur:
-        rowcount = 3
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, params=None):
             seen["sql"] = sql
             seen.update(params or {})
+        def fetchall(self): return [("withdrawn",), ("suggested",)]
 
     class _Conn:
         def cursor(self): return _Cur()
 
-    dispositions.withdraw_stale(_Conn(), "scan", [], "x", store="T9")
-    assert "(%(store)s::text IS NULL OR store = %(store)s::text)" in seen["sql"]
+    n = dispositions.withdraw_stale(_Conn(), "scan", [], "x", store="T9")
+    flat = " ".join(seen["sql"].split())
+    assert "(%(store)s::text IS NULL OR d.store = %(store)s::text)" in flat
     assert seen["store"] == "T9"
+    assert n == 1           # 只数真撤掉的,合并行少一格不算
 
 
 def test_every_sql_param_is_cast():

@@ -211,6 +211,13 @@ maintenance_scan → problem_scan → maintenance → problem_product_cleanup`�
    withdrawn**;`count_open` 按格数。旧形态让后写方覆盖 reason,结果就是一行
    显示着 A 链的建议、B 链的原因。
 
+**维护记录表接上了删除**:删除归口到 `problem_product_cleanup` 之后,它也往
+`registry.MAINT_SHEET` 写流水(造行走 `maint_sheet.build_row`,两个执行件同一
+个函数;写表失败吞掉走 `maint_sheet.publish`)。不接的话所有者每天看的那张面板
+就再也看不见删除,而且完全静默 —— 两边都不报错,只是那张表少了一类。
+裁剪仍只由 `maintenance` 一处做(同一张表两处裁会各按各的水位重复读全段)。
+顺带补上的是:**审核链判拒的删除此前根本不进这张表**,现在也进了。
+
 单店「下架限制」也归一了:此前两条扫描件各按同一张限额表截一次,每店最多 N 条
 实际变成最多 2N。现在扫描件如实报待办,执行件领取时截一次
 (`dispositions.cap_destructive`),截断条数进摘要。

@@ -38,11 +38,13 @@ DANGEROUS 工作流;而且建议不留痕,事后无从追"当初为什么删它"
 """
 
 import logging
+from datetime import datetime
 
 from api import _client, feeds
 from registry import db
 from services import dispositions
 from services import problem_products as pp
+from services import kpi, maint_sheet
 from services import product_events, store_limits, stores as stores_svc
 
 DANGEROUS = True
@@ -170,6 +172,8 @@ def run(params: dict) -> str:
         return "\n".join(lines + ["(dry-run:未提交任何 feed;确认无误后**去掉 --dry-run** 重跑)"])
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    records: list[tuple] = []       # 维护记录表的行(见文件末尾一次性写出)
 
     def _round(names: list[str]) -> tuple[dict, list[str]]:
         """输入:要跑的店铺名 → 输出:({店铺: 该店的行}, 需二轮重试的店)。
@@ -186,18 +190,29 @@ def run(params: dict) -> str:
 
         def _one(store_name: str):
             lines_s: list[str] = []
+            recs_s: list[tuple] = []        # 各店各写各的,主线程按店名合并
             store = stores_by_name.get(store_name)
             if store is None:
                 lines_s.append(f"  {store_name}:凭证缺失,跳过")
-                return store_name, lines_s, False
-            need = _submit_store(store_name, store, plans[store_name], lines_s)
-            return store_name, lines_s, need
+                # 领到了却没执行的建议**也要写表**(与 maintenance 同一纪律):
+                # 不写的话它在飞书完全不可见,看起来像"扫描件没建议它",
+                # 而它其实每天都在建议、每天都没做成
+                for action in _ACTION_ORDER:
+                    label = _ACTION_FEED[action][2]
+                    recs_s.extend(_sheet_row(store_name, r, label, "", "",
+                                             today, "未执行(凭证缺失)")
+                                  for r in plans[store_name].get(action) or [])
+                return store_name, lines_s, recs_s, False
+            need = _submit_store(store_name, store, plans[store_name], lines_s,
+                                 recs_s, today)
+            return store_name, lines_s, recs_s, need
 
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(names))) as pool:
             for f in as_completed([pool.submit(_one, n) for n in names]):
-                name, lines_s, need = f.result()
+                name, lines_s, recs_s, need = f.result()
                 out[name] = lines_s
+                records.extend(recs_s)
                 if need:
                     retry.append(name)
         return out, retry
@@ -222,13 +237,29 @@ def run(params: dict) -> str:
             if name in still:
                 lines.append(f"  ⚠ {name}:二轮仍失败,待下轮调度")
 
+    # 维护记录表(2026-08-24):删除归口到本工作流之后不写表的话,所有者的
+    # 这张面板就再也看不见删除流水了 —— 那是他每天看的东西。裁剪归 maintenance
+    # 一处做(同一张表两处裁会各按各的水位重复读全段)
+    maint_sheet.publish(records, lines, prune_after=False)
     lines.append("结果轮询走 feed_poll;生效确认在下一轮本工作流开头"
                  "(等 catalog_sync 重新观测)")
     return "\n".join(lines)
 
 
+def _sheet_row(store: str, r: dict, suggestion: str, action: str,
+               feed_id, today: str, result: str, err="") -> tuple:
+    """输入:店铺 + 建议行 + 实际动作 + 结果 → 输出:维护记录表的一行。
+
+    造行走 `maint_sheet.build_row`(唯一造行处,与 maintenance 同一个函数)。
+    「旧值/新值」空:破坏/反补动作没有值的变化,那两列是维护三类用的。
+    """
+    return maint_sheet.build_row(store, r["sku"], suggestion,
+                                 r.get("reason") or "", action,
+                                 feed_id, today, result, err)
+
+
 def _submit_store(store_name: str, store: dict, b: dict,
-                  lines: list[str]) -> bool:
+                  lines: list[str], records: list[tuple], today: str) -> bool:
     """输入:店铺 + 按动作分桶的建议行 → 输出:是否需二轮重试(网络类失败)。
 
     多切片滑窗对位记账(与 product_clear._submit_new 同款);**只有
@@ -236,6 +267,11 @@ def _submit_store(store_name: str, store: dict, b: dict,
     什么都没提交,记了就是幽灵事件:反补计数被灌水会导致少一次真实反补就转
     永久删除,而建议行会卡在 executing 等一个不存在的 feed 的判决。
     retryable=token/代理阶段确定未达;凭证失效(StoreDeadError)不重试。
+
+    ⚠ records 是传进来的、不是返回的(与 maintenance._submit_kind 同款理由):
+    提交到一半抛异常时,已经提交出去的那几片必须留下记录。返回局部列表的话,
+    异常一抛连同"这几条其实发出去了"一起丢掉,表里看起来什么都没干、
+    沃尔玛队列里却真在跑。
     """
     need_retry = False
 
@@ -255,7 +291,24 @@ def _submit_store(store_name: str, store: dict, b: dict,
                     dispositions.mark_executing(
                         conn, [r["id"] for r in rows_slice], res["feed_id"],
                         by="problem_product_cleanup")
-            elif res.get("retryable"):
+                records.extend(_sheet_row(store_name, r, label, label,
+                                          res["feed_id"], today, "处理中")
+                               for r in rows_slice)
+            elif res["outcome"] == "dedup":
+                # 动作写「跳过」而不是类型名:在途防重是**没有提交**,写成
+                # "删除"会让表格看起来做了两次删除(与 maintenance 同一口径)
+                records.extend(_sheet_row(store_name, r, label, "跳过",
+                                          res["feed_id"] or "", today, "在途防重")
+                               for r in rows_slice)
+            elif res["outcome"] == "failed":
+                records.extend(_sheet_row(store_name, r, label, label, "",
+                                          today, "提交被拒")
+                               for r in rows_slice)
+            else:                       # unknown:结局不确定,留 pending 待对账
+                records.extend(_sheet_row(store_name, r, label, label,
+                                          res["feed_id"] or "", today, "处理中")
+                               for r in rows_slice)
+            if res.get("retryable"):
                 need_retry = True
         line = f"  {store_name}:{label}提交 {n['submitted']}"
         if n["dedup"]:

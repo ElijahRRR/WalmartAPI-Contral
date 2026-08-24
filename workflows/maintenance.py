@@ -125,19 +125,15 @@ def _record(name: str, it: dict, action: str, feed_id, today: str,
             result: str, err) -> tuple:
     """输入:店铺 + 意图 + **实际动作** + 结果 → 输出:维护记录表的一行(11 列)。
 
-    列序 = registry.MAINT_SHEET.columns:
-      店铺 SKU 建议 原因 动作 旧值 新值 feedid 日期 结果 报错
-
-    **唯一造行处**。散在各分支手拼元组的话,漏改一处就整行错位且不报错。
-
-    「建议」取自建议行(scan 定的),「动作」是本执行件真做了什么 —— 两者分歧
-    才是这两列的价值:建议删除但动作为空 = 领到了没执行,结果列写明为什么。
+    造行本身在 `services.maint_sheet.build_row`(唯一造行处,两个执行件共用);
+    这里只负责把「意图」这套字段翻译过去 —— 「建议」取自建议行(扫描件定的),
+    「动作」是本执行件真做了什么。
     """
     kind = it.get("kind", "")
-    suggestion = it.get("label") or _KIND_LABEL.get(kind, kind)
-    return (name, it["sku"], suggestion, it.get("reason", ""), action,
-            it.get("old"), it.get("new"), feed_id, today, result,
-            err if err is not None else "")
+    return maint_sheet.build_row(
+        name, it["sku"], it.get("label") or _KIND_LABEL.get(kind, kind),
+        it.get("reason", ""), action, feed_id, today, result, err,
+        old=it.get("old"), new=it.get("new"))
 
 
 def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
@@ -238,27 +234,8 @@ def _settle(lines: list[str]) -> None:
 
 
 def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
-    """维护记录写表 + 裁剪。**写表失败绝不能把"feed 已提交"埋进异常里**。"""
-    try:
-        written = maint_sheet.append_records(all_records)
-        lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
-        # 一天几千行,不裁飞书很快装不下(所有者定稿 2026-08-09:只留 7 天)。
-        # 裁的只是展示面板,流水永久在 ops.feed_items
-        try:
-            lines.append(maint_sheet.prune())
-        except Exception as e:            # 裁剪失败不影响本轮维护结果
-            logger.warning("维护记录裁剪失败(不影响提交): %s", e)
-    except LookupError as e:
-        lines.append(f"⚠ 维护记录表未登记,流水未写表(台账已在 PG):{e}")
-    except Exception as e:
-        # 飞书只是展示面板:写表失败绝不能把"feed 已经提交出去了"这件事
-        # 埋进一个异常里(所有者 2026-08-09 实遇:提交成功但表格一行没写,
-        # 事后只能靠 ops.cursors 的时间戳反推)。台账在 PG,补写靠
-        # -p resync_sheet=1。
-        logger.exception("维护记录写表失败(feed 已提交,台账在 PG): %s", e)
-        lines.append(f"⚠ 维护记录写表失败:{e}"
-                     f"(feed 已提交,{len(all_records)} 行流水只在 PG;"
-                     f"补写:python cli.py maintenance -p resync_sheet=1)")
+    """维护记录写表 + 裁剪。收口在 services.maint_sheet.publish(两个执行件共用)。"""
+    maint_sheet.publish(all_records, lines)
 
 
 def run(params: dict) -> str:

@@ -53,9 +53,12 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 | `inventory`(v1.4) | ❌ 单文件单节点 | 载荷无 shipNode 字段;"可省略→默认虚拟节点";**节点到底怎么指定是官方文档空白** |
 | `MP_INVENTORY`(v1.5) | ✅ `shipNodes[]` per SKU | **官方已无 BETA 标记**(蓝图 §3.2 的"暂不用,盯 BETA 走向"可更新);JSON only;⚠ 1.5 的 key 小写(`inventoryHeader`)与 1.4 大写(`InventoryHeader`)相反,builder 必须两套模板 |
 
-**本计划的取舍:配置店的库存写一律走 `PUT /v3/inventories/{sku}`(200/min,
-单店几百条意图完全够),不接 MP_INVENTORY**——省一条 feed 通道的防重/回执/
-台账接线;它登记进蓝图预留,量真大了再议。
+**本计划的取舍(所有者定稿 2026-08-24:「有指定仓库的,也需要接批量上架
+和维护」)**:配置店两条路都接——小批量走 `PUT /v3/inventories/{sku}`
+(单品同步,结果当场已知),大批量走 **MP_INVENTORY feed(v1.5)**;
+`SYNC_THRESHOLDS` 分流语义与现状一致。未配置店维持 legacy 两条路不动。
+批量**上架**不需要新通道:MP_ITEM feed 本来就是批量,批次 3 只把
+`fulfillmentCenterID` 换成配置节点。
 
 ### 2.3 节点管理与上架
 
@@ -99,8 +102,8 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 3. 问题链 **WFS 删除闸**:回执 `ERR_EXT_DATA_0101218`(WFS eligible 不能删)
    的 SKU 改走 retire 或标记跳过并单列报数——停止每天空烧注定失败的 DELETE_ITEM。
 4. 蓝图补账:`GET/PUT /v3/inventories/{sku}`、`GET/POST shipnodes` 登记;
-   MP_INVENTORY 行的"BETA"表述更新为"官方已转正,本仓暂不接";
-   单仓假设写成有意识的文档决策。
+   MP_INVENTORY 行更新为"官方已转正,批次 2 收录实现"(所有者定稿:
+   指定仓库的店要接批量维护);单仓假设写成有意识的文档决策。
 
 ## 5. 批次 1|配置 + 读侧(含实测清单落账)
 
@@ -124,10 +127,18 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
    `match_inventory_intents`(:439)。
 2. 意图契约与 `_DETAIL_KEYS`(:799-800)加 `ship_node` 键(未配置店不带,
    建议行与现状逐字节一致)。
-3. `put_inventory(store, sku, qty, ship_node=None)`:带 node 走
-   `PUT /v3/inventories/{sku}`(body nodes、`inputQty`),**逐节点解析
-   `nodes[].status`**;不带走 legacy(现状)。配置店的 feed 路由改为逐条
-   REST(`SYNC_THRESHOLDS` 对配置店不再分流;200/min 配额足够)。
+3. 写通道两条(配置店;`SYNC_THRESHOLDS` 分流语义与现状一致):
+   - 小批量:`put_inventory(store, sku, qty, ship_node=None)`——带 node 走
+     `PUT /v3/inventories/{sku}`(body nodes、`inputQty`),**逐节点解析
+     `nodes[].status`**;不带走 legacy(现状)。
+   - 大批量:**MP_INVENTORY feed(v1.5)**接入 `api/feeds.build_payload`
+     (小写 key `inventoryHeader`/`inventory`,每 SKU `shipNodes[]`,本仓
+     恒单元素 = 受管仓;数量字段名 `quantity`)。切片按官方 1MB 上限保守配
+     (字节封顶 + 条数封顶),令牌桶按 50/hour 进 `_client.py`;防重/回执
+     走 ops.feed_log/feed_items 既有机械,feed_poll 零改动。
+     ⚠ 现有 `build_payload` 对 MP_INVENTORY 是显式 `raise`(登记不实现),
+     `tests/test_feeds.py:106-107` 钉着这个行为——批次 2 一并翻案。
+   未配置店两条路径原样不动(legacy PUT + inventory feed v1.4)。
 4. `settle_maintenance`(dispositions.py:552,585)对带 `ship_node` 的建议行
    按 `item_node_inventory` 判生效;未配置店按 `avail_qty`(现状)。
 5. stockzero:配置店清**受管仓**(运营语义=停售自发货;其它节点本就不归
@@ -155,7 +166,6 @@ partnerId(数组仍单元素)。跟卖链零改动(v4.2 feed 本就无库存段)
 - 不动 WFS(读写都不碰;WFS 库存归沃尔玛管)。
 - 不自动建仓、不自动做运费模板映射(人工 runbook)。
 - 不依赖 legacy 端点的"默认节点"语义(官方无定义)。
-- 不接 MP_INVENTORY feed(登记预留,量大再议)。
 - 不做存量 SKU 搬仓、不做一品多仓分配。
 
 ## 9. 核验来源(2026-08-24)

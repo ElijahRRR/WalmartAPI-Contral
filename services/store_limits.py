@@ -191,3 +191,71 @@ def resolve_node(store: dict, nodes: dict[str, str]) -> str | None:
             f"(认识的:{sorted(known) or '(空)'})—— 本轮整店跳过。"
             f"FC ID 见 Seller Center → Shipping Profile → Seller Fulfillment")
     return node
+
+
+def managed_nodes(stores: list[dict] | None = None
+                  ) -> tuple[dict[str, str], dict[str, str]]:
+    """输入:店铺列表(None=按需自取)→ 输出:({店铺: 已校验的受管仓}, {跳过的店: 原因})。
+
+    **各链拿受管仓表的唯一入口**(维护链/上架链/清零共用)。把「读表」与
+    「逐店校验」合成一次调用,是因为两件事必须成对发生:只读不校验 =
+    填错一个字符就静默写到别的节点;只校验不汇总 = 摘要报不出"今天几家店
+    生效、几家被跳过"(计划 §6 第 6 条要求配置生效与否天天见人)。
+
+    跳过的店(NodeConfigError)**不进第一个字典** —— 于是各链对它们
+    既不按受管仓办、也不回落 Virtual Node,而是整店不动(fail-closed)。
+    调用方必须把第二个返回值摊到摘要里,否则"这店今天没动"没人看得见。
+    """
+    from services import stores as stores_mod
+
+    configured = maint_nodes()
+    if not configured:
+        return {}, {}
+    rows = stores_mod.load_stores() if stores is None else stores
+    by_name = {s["name"]: s for s in rows}
+    ok: dict[str, str] = {}
+    skipped: dict[str, str] = {}
+    for name in sorted(configured):
+        store = by_name.get(name)
+        if store is None:
+            # 填了「维护仓库」但这店根本调不了 API(未启用/没配代理/没凭证):
+            # 不算配置错误,各链本来就不会碰它 —— 但也不能悄悄当"未配置",
+            # 否则哪天它恢复了,行为会从"按合计"跳到"按受管仓"而无人知情
+            skipped[name] = "不在可调用店铺列表里"
+            continue
+        try:
+            node = resolve_node(store, configured)
+        except NodeConfigError as e:
+            logger.warning("%s", e)
+            skipped[name] = str(e)
+            continue
+        if node:
+            ok[name] = node
+    return ok, skipped
+
+
+def managed_note(ok: dict[str, str], skipped: dict[str, str]) -> str:
+    """输入:managed_nodes() 的两个返回值 → 输出:摘要里那一行(空配置返回 "")。"""
+    if not ok and not skipped:
+        return ""
+    parts = [f"{n}={ok[n]}" for n in sorted(ok)]
+    line = f"受管仓:{len(ok)} 家店已生效(" + ",".join(parts) + ")"
+    if skipped:
+        line += (f";⚠ 校验失败整店跳过 {len(skipped)} 家:"
+                 + ",".join(sorted(skipped))
+                 + "(不回落默认节点,见 services/store_limits.resolve_node)")
+    return line
+
+
+def listing_fc(store: dict, ok: dict[str, str]) -> str:
+    """输入:店铺 + managed_nodes() 的已生效字典 → 输出:上架用的 FC ID。
+
+    **上架链取 fulfillmentCenterID 的唯一入口**(MP_ITEM 的
+    `Orderable.inventory[].fulfillmentCenterID`)。官方口径:建了自建仓就填
+    该仓的 shipNode,没建过才用 Virtual Node(= Partner ID)。
+
+    ⚠ 调用方必须**先把 `skipped` 里的店整店排掉**再调本函数:校验失败的店
+    不在 `ok` 里,直接调会回落 Partner ID —— 那就是把本该进新仓的货上到旧
+    节点,正是 resolve_node 拼命避免的那件事。
+    """
+    return ok.get(store["name"]) or settings.get_partner_id(store)

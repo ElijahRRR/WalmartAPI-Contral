@@ -679,12 +679,14 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
     monkeypatch.setattr(ln, "_map_llm",
                         lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
+    seen["orderable_fcs"] = []
     monkeypatch.setattr(
         ln.mp_mapper, "build_orderable",
         lambda sku, upc, price, qty, partner, **k: (
             seen["orderable_upcs"].append(str(upc)),
+            seen["orderable_fcs"].append(str(partner)),
             {"productIdentifiers": {"productId": str(upc),
-                                    "productIdType": "UPC"}})[1])
+                                    "productIdType": "UPC"}})[2])
     # 每店第二类行(…BAD)必填缺失 → 预备期本地拦下
     monkeypatch.setattr(ln.mp_conform, "conform", lambda *a, **k: (
         a[2], a[3], [],
@@ -999,3 +1001,36 @@ def test_denominator_is_rows_that_entered_prep_not_rows_that_succeeded():
     src = inspect.getsource(ln.run)
     assert "_llm_cost_lines(len(prep_in))" in src
     assert "_llm_cost_lines(len(prep_ok))" not in src
+
+
+# ── 多仓:上架仓(批次 3)────────────────────────────────────────────────────
+
+def test_listing_uses_the_managed_node_as_fulfillment_center(monkeypatch):
+    """配置了「维护仓库」的店:MP_ITEM 的 fulfillmentCenterID = 那个 FC ID。
+
+    ⚠ 恒填 Partner ID 是**退化写法**:对已建实体仓的店铺是错的 —— 货上到
+    Virtual Node,而运费模板挂在新仓上,回执一切正常。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_limits, "managed_nodes",
+                        lambda stores=None: ({"T1": "91539778610008065"}, {}))
+    ln.run({"execute": True})
+    assert seen["orderable_fcs"] == ["91539778610008065"]
+
+
+def test_listing_skips_the_store_when_the_node_fails_validation(monkeypatch):
+    """校验失败**整店跳过,不回落 Virtual Node**。
+
+    回落等于把本该进新仓的货上到旧节点,而且全程不报错 —— 比"这店今天没上架"
+    坏得多(与 services/store_limits.resolve_node 同一条口径)。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_limits, "managed_nodes",
+                        lambda stores=None: ({}, {"T1": "填的 999 认不出"}))
+    out = ln.run({"execute": True})
+    assert seen["claim_wants"] == [] and seen["submitted"] == []
+    assert "整店跳过" in out and "不回落 Virtual Node" in out

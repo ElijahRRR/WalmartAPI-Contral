@@ -103,8 +103,18 @@ def test_build_payload_schemas():
     assert m["MPItem"][0]["price"] == 2.0                        # sanitize round2
     assert "MPItemFeedHeader" in m
 
-    with pytest.raises(ValueError, match="未在 api/feeds.py 收录"):
-        feeds.build_payload("MP_INVENTORY", [])     # BETA 端点:登记不实现
+    # MP_INVENTORY v1.5(多仓批次 2 翻案:此前是"登记不实现"的显式 raise)。
+    # ⚠ key **小写**、每 SKU 带 shipNodes[]、数量字段名 `quantity` —— 三处
+    # 与 v1.4 都不同,任一处套错都是整批退回
+    mpi = feeds.build_payload("MP_INVENTORY",
+                              [{"sku": "S", "qty": 7, "ship_node": "12345"}])
+    assert set(mpi.keys()) == {"inventoryHeader", "inventory"}   # 小写,非 1.4
+    assert mpi["inventoryHeader"]["version"] == "1.5"
+    assert mpi["inventory"][0]["shipNodes"] == [
+        {"shipNode": "12345", "quantity": {"unit": "EACH", "amount": 7}}]
+    # 缺节点必须**响亮失败**:悄悄发出去就是写到官方无定义的"默认节点"
+    with pytest.raises(ValueError, match="缺 ship_node"):
+        feeds.build_payload("MP_INVENTORY", [{"sku": "S", "qty": 7}])
 
 
 def test_build_payload_price_and_inventory_schemas():
@@ -367,8 +377,9 @@ def test_sku_outcome_mapping(caplog):
 def test_feed_rate_buckets_default_deny():
     _client.rate_acquire("feeds.post.DELETE_ITEM", "cid_bucket_test")
     _client.rate_acquire("feeds.get", "cid_bucket_test")
+    _client.rate_acquire("feeds.post.MP_INVENTORY", "cid_bucket_test")
     with pytest.raises(KeyError, match="限速桶未登记"):
-        _client.rate_acquire("feeds.post.MP_INVENTORY", "cid_bucket_test")
+        _client.rate_acquire("feeds.post.SHIPPING_OVERRIDES", "cid_bucket_test")
 
 
 def test_submit_5xx_found_adopts_instead_of_terminal_fail(monkeypatch):

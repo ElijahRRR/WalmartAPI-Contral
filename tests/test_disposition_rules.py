@@ -136,7 +136,7 @@ def test_inventory_provider_carries_the_reason_code(monkeypatch):
             _row(sku="B0NOBB", stock_status="No Featured Offer"),
             _row(sku="B0OOS", stock_state="out_of_stock"),
             _row(sku="B0SLOW", delivery_days=30)]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
     out = {i["sku"]: (i["code"], i["new"]) for i in mi.inventory_intents(None, [])}
     assert out["B0UNAVAIL"] == ("unavailable", 0)
@@ -156,7 +156,7 @@ def test_inventory_provider_yields_to_delete(monkeypatch, delete_on):
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
     for kw in ({"outcome": "not_found"},
                {"product_name": "完全不相干的商品名"}):     # 相似度 < 70%
-        monkeypatch.setattr(mi, "_rows", lambda conn, sz, k=kw: [
+        monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None, k=kw: [
             _row(sku="B0DEAD", stock_state="out_of_stock", **k)])
         assert mi.inventory_intents(None, []) == [], kw
         assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}}, []) == [], kw
@@ -165,7 +165,7 @@ def test_inventory_provider_yields_to_delete(monkeypatch, delete_on):
 def test_title_provider_gates_at_70_percent(monkeypatch, delete_on):
     """< 70% 不改标题(**交得出去的时候**:删除开着);≥ 70% 照改。"""
     from services import maintenance_intents as mi
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [
         _row(sku="B0OK", product_name="Steel Cup 500ml"),        # 82% → 改
         _row(sku="B0BAD", product_name="完全不同的东西"),          # 低 → 不改
     ])
@@ -203,7 +203,7 @@ def test_paused_mismatch_rows_are_maintained_not_frozen(monkeypatch):
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
     row = _row(sku="B0MISMATCH", product_name="完全不相干的商品名",
                wm_price=20.0, amz_price=20.0, avail_qty=10, stock_count=7)
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [row])
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [row])
 
     assert mi.delete_intents(_Conn()) == []                  # ① 不删
     assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}},

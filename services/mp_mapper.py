@@ -7,7 +7,8 @@ feed,任何字段级红线都在这里落地,不依赖提示词自觉。
 实证约束清单(改动前先查 legacy_survey auto_listing 章):
   - orderable 三陷阱:productIdentifiers 必须**单对象非数组**;price 必须
     **裸 number** 非 {amount,currency};inventory[].fulfillmentCenterID 必填
-    且必须是 Partner ID(api/settings.get_partner_id)
+    且必须是**该店的上架仓**(services/store_limits.listing_fc:配置了
+    「维护仓库」的店 = 那个 shipNode,没配的店 = Partner ID/Virtual Node)
   - endDate 必须 ISO DateTime(纯日期被拒 EXT_DATA_ERROR_00030257670757)
   - 零认证强制覆盖(搬运场景拿不到 CPC/NRTL/Prop65/Warranty 文档):
     强制值 + **同时删掉**文档引用字段,填了会被判"该证书不存在"必拒;
@@ -645,14 +646,20 @@ ORDERABLE_SYSTEM_FIELDS = (
 def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
                     pt: str = "", product: dict | None = None,
                     llm_fields: dict | None = None) -> dict:
-    """输入:sku/upc/沃尔玛价/库存/Partner ID/PT/产品数据(+LLM 填的 Orderable
-    字段)→ 输出:Orderable 段。
+    """输入:sku/upc/沃尔玛价/库存/**上架仓 FC ID**/PT/产品数据(+LLM 填的
+    Orderable 字段)→ 输出:Orderable 段。
+
+    ⚠ 第 5 个参数是"这批货上到哪个仓",不是"Partner ID"(多仓批次 3):
+    配置了「维护仓库」的店传那个仓的 shipNode,没配的店传 Partner ID
+    (= Virtual Node,官方口径)。取值的唯一入口是
+    `services.store_limits.listing_fc()` —— 别在调用点各自 `get_partner_id`,
+    那样多仓的店会静默上到旧节点。形参名保留是为了不动三个调用点的关键字。
 
     结构 = 旧 auto_listing 的"LLM 按 spec 填 + force_overrides 强制覆盖"
     (2026-08-12 旧仓对照恢复:此前写死 12 键,Orderable 里的其它条件必填
     永远给不出,本地 validate 卡死或被沃尔玛拒):llm_fields 打底(剔除
     系统专属字段),强制项覆盖在上。取值实证:
-      · productIdentifiers 单对象、price 裸 number、fulfillmentCenterID=Partner ID
+      · productIdentifiers 单对象、price 裸 number、fulfillmentCenterID=上架仓
       · **inventory[].quantity 是裸 int**——写成 {unit,amount} 会被拒
         (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
       · **country_of_origin_substantial_transformation 必填**

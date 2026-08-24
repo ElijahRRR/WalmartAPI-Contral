@@ -113,7 +113,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 故障(§1)在配置「维护仓库」并跑完批次 2 之前依然存在 —— 探测告警只是让它
 不再静默。
 
-## 5. 批次 1|配置 + 读侧(含实测清单落账)
+## 5. 批次 1|配置 + 读侧(含实测清单落账)✅ 代码完成(2026-08-24)
 
 - registry:`RETIRE_LIMITS` 加 `maint_node` 字段常量;`store_limits.maint_nodes()
   -> dict[str, str]`(店铺 → FC ID,未填不出现)。
@@ -123,9 +123,10 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   seen_at, PRIMARY KEY (store, sku, ship_node))`;`catalog_sync` 停止只求和:
   合计仍写 `walmart_items.avail_qty`(全部现有消费方零改动),节点明细同轮
   落新表。
-- 跑 §2.4 四条实测,结果回填本文档。
+- ⏳ §2.4 四条实测**待所有者建好第二个仓后跑**,结果回填本文档 ——
+  这是批次 1 唯一未完项(建仓是人工前置,代码这边等它)。
 
-## 6. 批次 2|维护链切受管仓(核心)
+## 6. 批次 2|维护链切受管仓(核心)✅ 代码完成(2026-08-24)
 
 一个取数积木统一口径:`受管仓现值(store, sku) = 配置店 → item_node_inventory
 里该 shipNode 的 avail_qty;未配置店 → walmart_items.avail_qty(现状)`。
@@ -154,11 +155,12 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 6. 摘要新增一行:「受管仓=<FC ID> 的店 N 家;校验失败跳过 M 家」——
    配置生效与否必须天天见人。
 
-## 7. 批次 3|上架链(最薄)+ 运维 runbook
+## 7. 批次 3|上架链(最薄)+ 运维 runbook ✅ 代码完成(2026-08-24)
 
-代码:`list_new` 预取 `partners` 处并取 `maint_nodes()`;
-`build_orderable` 的 `fulfillmentCenterID` = 配置店 FC ID / 未配置店
-partnerId(数组仍单元素)。跟卖链零改动(v4.2 feed 本就无库存段)。
+代码:`list_new` 预取 `partners` 处改调 `store_limits.managed_nodes()` +
+`listing_fc()`;`build_orderable` 的 `fulfillmentCenterID` = 配置店 FC ID /
+未配置店 partnerId(数组仍单元素)。跟卖链零改动(v4.2 feed 本就无库存段)。
+**校验失败的店整店跳过、不回落 Virtual Node** —— 与维护链同一条口径。
 
 **Runbook(人工步骤,顺序是硬约束)**:
 1. 建仓(Seller Center 或 API)→ 记下 FC ID;
@@ -168,6 +170,25 @@ partnerId(数组仍单元素)。跟卖链零改动(v4.2 feed 本就无库存段)
    校验通过;
 5. 之后新上架自动进指定仓;存量 SKU 的仓迁移(如需)另议——**本计划不做
    存量搬仓**。
+
+### 落地实现速查(批次 1-3,2026-08-24)
+
+| 关注点 | 唯一出处 | 说明 |
+|---|---|---|
+| 读表(不校验) | `store_limits.maint_nodes()` | 一个飞书请求拿全店 |
+| 逐店校验(fail-closed) | `store_limits.resolve_node()` | 认不出抛 `NodeConfigError` |
+| 读 + 校验 + 汇总 | `store_limits.managed_nodes()` | 返回 `(已生效, {跳过: 原因})` |
+| 摘要那一行 | `store_limits.managed_note()` | 维护扫描 / 上架都摊这一行 |
+| 上架仓 FC ID | `store_limits.listing_fc()` | 配置店 FC ID,否则 Partner ID |
+| 维护比对基准 | `maintenance_intents.current_qty()` | 配置店取节点值,**明细没扫到返回 None 跳过** |
+| 意图带节点 | `maintenance_intents._node_of()` + `_DETAIL_KEYS` | 未配置店不带这个键 |
+| 小批量写 | `api.inventory.put_inventory(..., ship_node)` | 带节点走 `PUT /v3/inventories/{sku}`,**逐节点解析 status** |
+| 大批量写 | `api.feeds.build_payload("MP_INVENTORY", …)` | v1.5 小写 key,每 SKU `shipNodes[]` |
+| 落定判据 | `dispositions.settle_maintenance()` | 带 `ship_node` 的行按 `item_node_inventory` 判 |
+
+三处**故意的响亮失败**(都不回落):FC ID 认不出 → 整店跳过;受管仓明细本轮
+没扫到 → 该行跳过并计数;同批混着带/不带节点 → 本店不提交。回落的共同后果
+是"写到官方无定义的默认节点且全程不报错",比少动一轮坏得多。
 
 ## 8. 明确不做
 

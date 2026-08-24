@@ -158,7 +158,11 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
             if kind == "price":
                 ok, why = prices.put_price(store, it["sku"], it["new"])
             else:
-                ok, why = inv_api.put_inventory(store, it["sku"], it["new"])
+                # ship_node 由扫描件放进 detail(未配置「维护仓库」的店没有
+                # 这个键)。带节点走 PUT /v3/inventories/{sku},不带走 legacy
+                # —— **显式路由**,不是失败自动换端点重试
+                ok, why = inv_api.put_inventory(store, it["sku"], it["new"],
+                                                it.get("ship_node"))
             _add(it, label, "sync", "成功" if ok else "失败", why)
             if ok:
                 _mark([it], "sync")
@@ -174,6 +178,20 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
     elif kind == "price":
         entries = [{"sku": it["sku"], "price": it["new"]} for it in items]
         feed_type = "price"
+    elif any(it.get("ship_node") for it in items):
+        # 受管仓的店:分节点批量库存走 MP_INVENTORY v1.5(v1.4 载荷里根本
+        # 没有节点字段,发出去就是写到官方无定义的"默认节点")。
+        # ⚠ 一店一个受管仓,所以同一店的这批要么全带节点、要么全不带;
+        # 混着出现说明配置在本轮中途变了 —— 响亮失败,别挑着发一半
+        missing = [it["sku"] for it in items if not it.get("ship_node")]
+        if missing:
+            raise RuntimeError(
+                f"{name}:同一批库存意图里 {len(missing)} 条缺 ship_node "
+                f"(如 {missing[:3]}),而其余带节点 —— 受管仓配置本轮中途变了?"
+                f"本店本轮不提交,重跑 maintenance_scan 后再执行")
+        entries = [{"sku": it["sku"], "qty": it["new"],
+                    "ship_node": it["ship_node"]} for it in items]
+        feed_type = "MP_INVENTORY"
     else:
         entries = [{"sku": it["sku"], "qty": it["new"]} for it in items]
         feed_type = "inventory"

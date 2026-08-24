@@ -73,14 +73,33 @@ class _Conn:
 # ── provider 层 ───────────────────────────────────────────────────────────────
 
 def test_zero_intents_only_positive_known_qty():
-    conn = _Conn(rows=[("T1", "S1", 5), ("T1", "S2", 12)])
+    # 列序 = _SQL_ZERO 的 SELECT:(store, sku, avail_qty, node_qty)
+    conn = _Conn(rows=[("T1", "S1", 5, None), ("T1", "S2", 12, None),
+                       ("T1", "S3", None, None)])
     out = mi.zero_intents(conn, ["T1"])
+    # 未知库存不动(旧系统 None != 0 盲清是坑):S3 不出现
     assert [(i["sku"], i["kind"], i["old"], i["new"], i["code"]) for i in out] == [
         ("S1", "inventory", 5, 0, "stockzero"),
         ("S2", "inventory", 12, 0, "stockzero")]
-    # 显式条件:未知库存不动(旧系统 None != 0 盲清是坑)
-    assert "avail_qty > 0" in mi._SQL_ZERO
-    assert mi.zero_intents(conn, []) == []          # 无 stockzero 店零查询
+    assert all("ship_node" not in i for i in out)    # 未配置店不带这个键
+    assert mi.zero_intents(conn, []) == []           # 无 stockzero 店零查询
+
+
+def test_zero_intents_clears_the_managed_node_not_the_total():
+    """⚠ 多仓下清的是**受管仓**(所有者定稿:自动链只管自建自发货仓)。
+
+    按合计选行、只清一个节点的话,合计永远 > 0 ⇒ 每轮重选重清,而"这家店
+    停售"从未真达成 —— 摘要还一直显示"清零 N 条"。故障清单里唯一后果是
+    钱在漏的那条。
+    """
+    # S1:受管仓 4 件(合计 9,别的节点 5 件不归自动链管)→ 清 4
+    # S2:受管仓 0 件(合计 5)→ 已经停售,不动
+    # S3:受管仓明细还没扫到 → **不回落合计**,本轮跳过
+    conn = _Conn(rows=[("T1", "S1", 9, 4), ("T1", "S2", 5, 0),
+                       ("T1", "S3", 7, None)])
+    out = mi.zero_intents(conn, ["T1"], managed={"T1": "FC9"})
+    assert [(i["sku"], i["old"], i["new"], i["ship_node"]) for i in out] == [
+        ("S1", 4, 0, "FC9")]
 
 
 # amz 侧 × 沃尔玛侧联表的一行(顺序 = _SQL_AMZ_JOIN 的 SELECT 列)
@@ -124,7 +143,7 @@ def test_price_intents_threshold_and_no_rule(monkeypatch):
         # 在区间内但该渠道倍率没配 → 仍不动(配置缺失不拿默认值蒙混)
         _row(sku="B0NORULE", wm_price=20.0, amz_price=10.0, fulfillment="FBA"),
     ]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), _MULTS, [])}
     assert out == {"B0CHANGE": 40.0, "B0OUTBAND": 15000.0}
 
@@ -137,7 +156,7 @@ def test_price_intents_skip_when_fulfillment_unknown(monkeypatch):
         _row(sku="B0UNK", wm_price=20.0, amz_price=15.0, fulfillment=None),
         _row(sku="B0JUNK", wm_price=20.0, amz_price=15.0, fulfillment="???"),
     ]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     mults = {"T1": {"fbm_range1": "200%", "fba_range1": "300%"}}
     out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), mults, [])}
     # 同一个 15 美金:FBM 落区间1(×2=30),FBA 落区间1(×3=45)——区间不同套
@@ -162,7 +181,7 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
         _row(sku="B0LEAD7", avail_qty=9, stock_count=50,
              delivery_days=7),                                  # 7 不超 → 同步 50
     ]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     out = {i["sku"]: i["new"] for i in mi.inventory_intents(_Conn(), [])}
     assert out == {"B0SYNC": 7, "B0OOS": 0, "B0UNKNOWN": 0, "B0LEAD9": 0,
                    "B0LEAD8": 0, "B0LEAD7": 50}
@@ -179,7 +198,7 @@ def test_title_intents_reuses_listing_copy_rules(monkeypatch):
         _row(sku="B0NOUPC", upc="", slow={"title": "X Cup"}),      # 缺 UPC → 跳过
         _row(sku="B0PLACE", slow={"title": "[商品不存在]"}),        # 占位符 → 跳过
     ]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     out = mi.title_intents(_Conn(), [])
     assert [i["sku"] for i in out] == ["B0NEW"]
     assert out[0]["new"] == "Steel Cup"          # 与上架同一套文案处理(去品牌)
@@ -189,7 +208,7 @@ def test_title_intents_reuses_listing_copy_rules(monkeypatch):
 def test_amz_join_honors_routing_and_stockzero():
     # 路由铁律:只作用于 source_type='amz';stockzero 店整店排除(归 zero_intents)
     assert "source_type = 'amz'" in mi._SQL_AMZ_JOIN
-    assert "NOT (w.store = ANY(%s))" in mi._SQL_AMZ_JOIN
+    assert "NOT (w.store = ANY(%(stores)s::text[]))" in mi._SQL_AMZ_JOIN
     assert "missing_since IS NULL" in mi._SQL_AMZ_JOIN
     assert "zip_verify" in mi._SQL_AMZ_JOIN
 
@@ -208,7 +227,7 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
     assert "published_status = 'PUBLISHED'" in q and "missing_since IS NULL" in q
     assert mi.MIN_OFFSET_BATCHES == 1
 
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [])
     conn = _Conn(rows=[("T1", "B0A", 1, None, None),
                        ("T1", "B0B", 2, None, None)])
     out = mi.delete_intents(conn)
@@ -230,7 +249,7 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
 
 def test_delete_intents_also_take_title_placeholder(monkeypatch):
     """占位符[商品不存在]:旧系统只是跳过标题,所有者 2026-08-09 改为删除。"""
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [
         _row(sku="B0GONE", slow={"title": "[商品不存在]"}),
         _row(sku="B0OK", name="正常标题", slow={"title": "正常标题"}),
         _row(sku="B0DUP", slow={"title": "[商品不存在]"}),
@@ -261,7 +280,7 @@ def test_long_oos_delete_sql_guards():
 
 
 def test_long_oos_intents_carry_reason(monkeypatch):
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [])
 
     class _TwoQueries(_Conn):
         """第一条 SQL(偏移)无结果,第二条(连续无货)返回一行。"""
@@ -349,10 +368,10 @@ def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
         {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
         {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
-    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz: [
+    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz, mn=None: [
         {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 5, "new": 0}])
-    monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
-    monkeypatch.setattr(mi, "match_inventory_intents", lambda c, sz: [])
+    monkeypatch.setattr(mi, "zero_intents", lambda c, sz, mn=None: [])
+    monkeypatch.setattr(mi, "match_inventory_intents", lambda c, sz, mn=None: [])
     monkeypatch.setattr(mi, "drop_recent", lambda c, i: (i, 0))
     out = mi.collect_all(conn, [])
     assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
@@ -400,8 +419,10 @@ def _scan_wire(monkeypatch, intents, sz=("T1",)):
     from workflows import maintenance_scan as ms
     calls = {"suggest": [], "withdraw": []}
     monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
+    # 默认没有店配「维护仓库」= 现状;要钉受管仓的用例自己覆盖这一项
+    monkeypatch.setattr(ms.store_limits, "managed_nodes", lambda: ({}, {}))
     monkeypatch.setattr(ms.mi, "collect_all",
-                        lambda conn, s, oos=0: list(intents))
+                        lambda conn, s, oos=0, managed=None: list(intents))
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(ms.dispositions, "suggest_many",
                         lambda conn, rows: (calls["suggest"].extend(rows),
@@ -516,8 +537,11 @@ def _wire(monkeypatch, intents, stores=(STORE,)):
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
     monkeypatch.setattr(inv_api, "put_inventory",
-                        lambda store, sku, qty: (calls["put_inv"].append(
-                            (store["name"], sku, qty)), (True, ""))[1])
+                        lambda store, sku, qty, node=None: (
+                            calls["put_inv"].append(
+                                (store["name"], sku, qty)
+                                + ((node,) if node else ())),
+                            (True, ""))[1])
     monkeypatch.setattr(prices, "put_price",
                         lambda store, sku, amt: (calls["put_price"].append(
                             (store["name"], sku, amt)), (True, ""))[1])
@@ -823,7 +847,7 @@ def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
         # 运费没采到:不改价
         _row(sku="B0NOSHIP", wm_price=20.0, amz_price=20.0, shipping=None),
     ]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     out = {i["sku"]: i["new"] for i in mi.price_intents(_Conn(), _MULTS, [])}
     assert out == {"B0SHIP": 50.0, "B0FREE": 40.0}
 
@@ -831,7 +855,10 @@ def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
 def test_match_inventory_intents_fills_zero_stock():
     """跟卖品铺货(所有者批复 2026-08-12):唯一给 source_type='match' 行
     补库存的路径;stockzero 店排除(解除后自动回补,修清零/回补不对称)。"""
-    conn = _Conn(rows=[("T1", "PHUMWMT001", 0), ("T2", "PHUMWMT002", None)])
+    # 列序 = _SQL_MATCH_INV 的 SELECT:(store, sku, avail_qty, node_qty)
+    conn = _Conn(rows=[("T1", "PHUMWMT001", 0, None),
+                       ("T2", "PHUMWMT002", None, None),
+                       ("T3", "PHUMWMT003", 10, None)])     # 已有货 → 不铺
     out = mi.match_inventory_intents(conn, ["Z店"])
     assert [(i["store"], i["sku"], i["kind"], i["new"]) for i in out] == [
         ("T1", "PHUMWMT001", "inventory", mi.MATCH_INVENTORY_QTY),
@@ -839,7 +866,16 @@ def test_match_inventory_intents_fills_zero_stock():
     sql, args = conn.sqls[0]
     assert "source_type = 'match'" in sql       # 路由铁律:只碰跟卖出身
     assert "missing_since IS NULL" in sql       # 只补在架行
-    assert args == (["Z店"],)                   # stockzero 店整店排除
+    assert args["stores"] == ["Z店"]            # stockzero 店整店排除
+
+
+def test_match_inventory_looks_at_the_managed_node():
+    """⚠ 多仓下"库存为 0"要按受管仓判:受管仓 0 而别的节点有货时,合计非 0
+    会让**该铺的行选不出来、永远不铺**,而且完全静默(P3 假阴性)。"""
+    conn = _Conn(rows=[("T1", "M1", 8, 0),      # 合计 8、受管仓 0 → 要铺
+                       ("T1", "M2", 8, 3)])     # 受管仓有货 → 不铺
+    out = mi.match_inventory_intents(conn, [], managed={"T1": "FC9"})
+    assert [(i["sku"], i["ship_node"]) for i in out] == [("M1", "FC9")]
 
 
 def test_no_hardcoded_column_letters_left():
@@ -904,13 +940,14 @@ def test_settle_maintenance_splits_by_whether_the_value_actually_changed():
     """维护三类没有核验事件,判据就是"重新观测后线上值是不是我们要的值"。"""
     from services import dispositions as ds
 
+    # 末列 node_qty:受管仓那一行的现值(NULL = 未配置 / 本轮没扫到)
     conn = _SettleConn([
-        (1, "price", {"new": 30.0}, 30.0, None, None),       # 改过来了
-        (2, "price", {"new": 30.0}, 20.0, None, None),       # 线上还是旧价
-        (3, "inventory", {"new": 0}, None, 0, None),         # 清零到位
-        (4, "inventory", {"new": 0}, None, 10, None),        # 库存没动
-        (5, "title", {"new": "新标题"}, None, None, "新标题"),
-        (6, "title", {"new": "新标题"}, None, None, "旧标题"),
+        (1, "price", {"new": 30.0}, 30.0, None, None, None),   # 改过来了
+        (2, "price", {"new": 30.0}, 20.0, None, None, None),   # 线上还是旧价
+        (3, "inventory", {"new": 0}, None, 0, None, None),     # 清零到位
+        (4, "inventory", {"new": 0}, None, 10, None, None),    # 库存没动
+        (5, "title", {"new": "新标题"}, None, None, "新标题", None),
+        (6, "title", {"new": "新标题"}, None, None, "旧标题", None),
     ])
     assert ds.settle_maintenance(conn) == {"confirmed": 3, "ineffective": 3}
     assert conn.updates == [("confirmed", [1, 3, 5]), ("ineffective", [2, 4, 6])]
@@ -930,6 +967,28 @@ def test_settle_maintenance_never_guesses_effective():
     assert ds.maint_effective("title", "新", None, None, "新") is True
     # 浮点回读:30.0 与 30.00 是同一个价
     assert ds.maint_effective("price", 30.0, 30.00, None, None) is True
+
+
+def test_settle_maintenance_judges_managed_node_by_node_qty():
+    """受管仓的库存建议按**该节点**的现值判,不按全店合计(多仓批次 2)。
+
+    ⚠ 拿 `w.avail_qty`(全节点合计)跟单仓目标比,多节点店永远判 ineffective
+    ⇒ 下轮重新建议、再发一遍,循环不会自己停(多仓故障清单 P1)。
+    """
+    from services import dispositions as ds
+
+    conn = _SettleConn([
+        # 合计 10(另一个节点还有货),受管仓已清零 → **生效**
+        (1, "inventory", {"new": 0, "ship_node": "N1"}, None, 10, None, 0),
+        # 合计 0 但受管仓还是 10 → **未生效**(只看合计会判反)
+        (2, "inventory", {"new": 0, "ship_node": "N1"}, None, 0, None, 10),
+        # 受管仓的行,节点明细本轮没重新扫到 → 保持 executing,**不落判**
+        (3, "inventory", {"new": 0, "ship_node": "N1"}, None, 0, None, None),
+    ])
+    assert ds.settle_maintenance(conn) == {"confirmed": 1, "ineffective": 1}
+    assert conn.updates == [("confirmed", [1]), ("ineffective", [2])]
+    # 新鲜度写在 JOIN 里:没重新扫到的节点明细取不出来,而不是取出旧值来判
+    assert "ni.seen_at > d.executed_at" in ds._MAINT_OPEN_SQL
 
 
 def test_expire_executing_unblocks_the_partial_unique_index():
@@ -1149,7 +1208,7 @@ def test_title_mismatch_delete_is_paused_but_rows_stay_maintained(monkeypatch):
                  slow={"title": "Totally Different ZZZ"}),
             _row(sku="B0GONE2", outcome="not_found",
                  name="X", slow={"title": "X"})]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     out = mi.delete_intents(_Conn(rows=[]))
     got = {i["sku"]: i["code"] for i in out}
     assert "B0MISMATCH" not in got                  # 停闸:不出删除建议
@@ -1228,7 +1287,7 @@ def test_short_title_row_survives_delete_and_retitle(monkeypatch):
     monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)      # 按停闸恢复后验
     wm = mi.processed_title({"title": _LONG, "brand": None})
     rows = [_row(sku="B0SHORT", name=wm, slow=_SLOW_SPLIT)]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     dels = mi.delete_intents(_Conn(rows=[]))
     assert [d for d in dels if d["sku"] == "B0SHORT"] == []     # ① 不删
     titles = mi.title_intents(_Conn(rows=[]))
@@ -1292,3 +1351,115 @@ def test_resolve_node_fails_closed_when_node_list_unreadable(monkeypatch):
                         lambda s: (_ for _ in ()).throw(RuntimeError("HTTP 500")))
     with pytest.raises(store_limits.NodeConfigError):
         store_limits.resolve_node(_store(), {"T1": "999"})
+
+
+# ── 多仓:维护链切受管仓(批次 2)──────────────────────────────────────────
+
+def test_managed_nodes_splits_effective_from_skipped(monkeypatch):
+    """校验通过的进字典、失败的进跳过名单 —— **两个都要有**。
+
+    只读不校验 = 填错一个字符就静默写到别的节点;只校验不汇总 = 摘要报不出
+    "今天几家店生效",配置生不生效没人看得见(计划 §6 第 6 条)。
+    """
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits, "maint_nodes",
+                        lambda: {"T1": "111", "T2": "999", "T3": "222"})
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: {"T1": {"111": {}}, "T2": {"333": {}}}[s["name"]])
+    ok, skipped = store_limits.managed_nodes(
+        [_store("T1"), _store("T2")])          # T3 填了但不在可调用店铺列表里
+    assert ok == {"T1": "111"}
+    assert set(skipped) == {"T2", "T3"}
+    assert "不在可调用店铺列表里" in skipped["T3"]
+    note = store_limits.managed_note(ok, skipped)
+    assert "T1=111" in note and "整店跳过 2 家" in note
+
+
+def test_managed_nodes_costs_nothing_when_unconfigured(monkeypatch):
+    """一家店都没配 = 一次沃尔玛调用都不发生(现状零成本、零行为变化)。"""
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits, "maint_nodes", lambda: {})
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: (_ for _ in ()).throw(
+                            AssertionError("没配置就不该调 shipnodes")))
+    assert store_limits.managed_nodes() == ({}, {})
+    assert store_limits.managed_note({}, {}) == ""      # 摘要里也不占一行
+
+
+def test_ship_node_survives_the_disposition_round_trip():
+    """⚠ `ship_node` 必须在 _DETAIL_KEYS 里:它决定执行件走哪条写通道。
+
+    漏登记的表现是扫描件判对了受管仓、执行件却写到默认节点,**两边都不报错**。
+    """
+    it = {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 10,
+          "new": 0, "code": "stockzero", "reason": "整店清零",
+          "ship_node": "91539778610008065"}
+    back = mi.from_disposition({"id": 7, **mi.to_disposition(it)})
+    assert back["ship_node"] == "91539778610008065"
+    # 未配置店不带这个键 —— 建议行与改造前逐字节一致
+    plain = mi.to_disposition({k: v for k, v in it.items() if k != "ship_node"})
+    assert "ship_node" not in plain["detail"]
+
+
+def test_managed_store_routes_both_write_channels(monkeypatch):
+    """受管仓的店:小批量走分节点 PUT,大批量走 MP_INVENTORY v1.5。
+
+    ⚠ 大批量若照旧走 v1.4 `inventory` feed,载荷里**根本没有节点字段** ——
+    发出去就是写到官方无定义的"默认节点",而且回执一切正常。
+    """
+    small = [dict(i, ship_node="N1") for i in _zero(2)]
+    calls = _wire(monkeypatch, small)
+    mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S0", 0, "N1"), ("T1", "S1", 0, "N1")]
+
+    big = [dict(i, ship_node="N1")
+           for i in _zero(mi.SYNC_THRESHOLDS["inventory"] + 1)]
+    calls = _wire(monkeypatch, big)
+    mw.run({"execute": True})
+    assert [(ft, n) for _, ft, n in calls["feeds"]] == [("MP_INVENTORY", 11)]
+
+    # 未配置店逐字节维持现状:v1.4 `inventory`
+    calls = _wire(monkeypatch, _zero(mi.SYNC_THRESHOLDS["inventory"] + 1))
+    mw.run({"execute": True})
+    assert [(ft, n) for _, ft, n in calls["feeds"]] == [("inventory", 11)]
+
+
+def test_mixed_node_batch_fails_loudly(monkeypatch):
+    """一店一个受管仓:同批混着带/不带节点 = 配置本轮中途变了,**响亮失败**。
+
+    挑着发一半的后果是另一半写到默认节点,而摘要显示"提交成功 N 条"。
+    """
+    items = _zero(mi.SYNC_THRESHOLDS["inventory"] + 1)
+    for it in items[:-1]:
+        it["ship_node"] = "N1"
+    calls = _wire(monkeypatch, items)
+    out = mw.run({"execute": True})
+    assert calls["feeds"] == []                  # 一片都没发
+    assert "提交异常已跳过" in out
+
+
+def test_scan_reports_which_stores_the_managed_node_took_effect_for(monkeypatch):
+    """配置生效与否必须天天见人(计划 §6 第 6 条)。"""
+    ms, _calls = _scan_wire(monkeypatch, _zero(1))
+    monkeypatch.setattr(ms.store_limits, "managed_nodes",
+                        lambda: ({"T1": "111"}, {"T2": "认不出"}))
+    out = ms.run({"preview": "1"})
+    assert "T1=111" in out and "整店跳过 1 家" in out
+
+
+# ── 多仓:上架链(批次 3)────────────────────────────────────────────────────
+
+def test_listing_fc_prefers_the_managed_node(monkeypatch):
+    """上架仓:配置了「维护仓库」的店填那个 FC ID,没配的店才用 Partner ID。
+
+    官方口径:建了自建仓就填该仓的 shipNode,"没建过 FC、走 Default Node
+    (Virtual)时才用 Virtual Node ID(它等于 Partner ID)"。
+    """
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits.settings, "get_partner_id",
+                        lambda s: "PARTNER")
+    assert store_limits.listing_fc(_store("T1"), {"T1": "111"}) == "111"
+    assert store_limits.listing_fc(_store("T2"), {"T1": "111"}) == "PARTNER"

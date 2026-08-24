@@ -54,6 +54,9 @@ _SLICE_LIMITS = {
     "MP_MAINTENANCE": (1000, 24_000_000),
     "price": (1000, 9_500_000),
     "inventory": (4000, 9_500_000),
+    # MP_INVENTORY v1.5:官方给的是 **1MB** 上限(与 price/inventory 的 10MB
+    # 不同档),字节按 950KB 保守封顶;条数封顶另给,防单条异常大时切不动
+    "MP_INVENTORY": (1000, 950_000),
     "MP_ITEM_MATCH": (1000, 24_000_000),
     "MP_ITEM": (2000, 24_000_000),
 }
@@ -125,6 +128,28 @@ def build_payload(feed_type: str, entries: list) -> dict:
                                "quantity": {"unit": "EACH",
                                             "amount": int(e["qty"])}}
                               for e in entries]}
+    if feed_type == "MP_INVENTORY":
+        # 分节点批量库存 v1.5(多仓批次 2 启用;官方已无 BETA 标记)。
+        # ⚠ 三处与 v1.4 不同,逐条都踩过或会踩:
+        #   ① key 全小写(inventoryHeader/inventory),v1.4 是大写;
+        #   ② 每 SKU 带 `shipNodes[]` —— **本仓恒单元素 = 该店受管仓**
+        #      (一店一个受管仓,见 docs/multi_node_plan.md §0);
+        #   ③ 数量字段名是 `quantity`(REST 写侧叫 inputQty、读侧叫
+        #      availToSellQty,三套名字并存,别拿一套去套另一套)。
+        # 条目 {"sku", "qty", "ship_node"};缺 ship_node 直接报错而不是
+        # 悄悄发成"默认节点"——默认节点官方无定义,多仓下禁止依赖。
+        rows = []
+        for e in entries:
+            node = str(e.get("ship_node") or "")
+            if not node:
+                raise ValueError(
+                    f"MP_INVENTORY 条目缺 ship_node(sku={e.get('sku')})"
+                    f":该 feedType 专供受管仓的店,不带节点的走 v1.4 inventory")
+            rows.append({"sku": str(e["sku"]),
+                         "shipNodes": [{"shipNode": node,
+                                        "quantity": {"unit": "EACH",
+                                                     "amount": int(e["qty"])}}]})
+        return {"inventoryHeader": {"version": ver}, "inventory": rows}
     raise ValueError(f"feedType 未在 api/feeds.py 收录: {feed_type}"
                      f"(蓝图收录规则:预留端点只登记不实现)")
 

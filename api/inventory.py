@@ -139,12 +139,82 @@ def list_inventory_nodes(store: dict,
     return result
 
 
-def put_inventory(store: dict, sku: str, qty: int) -> tuple[bool, str]:
-    """输入:店铺 + SKU + 新可售数量 → 输出:(是否成功, 失败原因串)。
+def _node_result(data, sku: str, ship_node: str) -> tuple[bool, str]:
+    """输入:PUT /v3/inventories/{sku} 响应 + 目标节点 → 输出:(该节点是否成功, 原因)。
+
+    ⚠ **部分成功语义**:HTTP 200 不代表写进去了。官方响应里每个
+    `nodes[]` 各带自己的 `status`(失败项还带 `errors[]`),整单 200 而某个
+    节点 failure 是正常返回。只看 HTTP 码的话,写失败会被当成写成功 ——
+    随后 settle 判 ineffective、下一轮重发,而"为什么没生效"没有任何线索。
+
+    认不出响应形状(字段改名/文档与实测不符)一律判**失败**:
+    宁可多重发一轮,也不能把没写进去的当成写进去了。
+    """
+    nodes = ((data or {}).get("inventories") or data or {}).get("nodes") \
+        if isinstance(data, dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        return False, f"响应里没有 nodes[](形状变了?):{str(data)[:200]}"
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        # 只认目标节点那一条:一次只写一个节点,别的节点的 status 与本次无关
+        if str(n.get("shipNode") or "") not in (str(ship_node), ""):
+            continue
+        st = str(n.get("status") or "")
+        if st.upper() in ("SUCCESS", "SUCCESSFUL", "OK"):
+            return True, ""
+        errs = n.get("errors") or n.get("error") or ""
+        return False, f"节点 {ship_node} status={st or '(空)'}: {str(errs)[:200]}"
+    return False, (f"响应 nodes[] 里没有目标节点 {ship_node}"
+                   f"(有的是 {[n.get('shipNode') for n in nodes if isinstance(n, dict)]})")
+
+
+def _put_inventory_node(store: dict, sku: str, qty: int,
+                        ship_node: str) -> tuple[bool, str]:
+    """输入:店铺 + SKU + 数量 + 发货节点 → 输出:(是否成功, 失败原因串)。
+
+    `PUT /v3/inventories/{sku}`:shipNode 在 **body** 里(不是 query),数量字段
+    名是 **`inputQty`**(读侧是 `availToSellQty`、feed 侧是 `quantity` ——
+    三套名字并存,序列化器不能共用,见 docs/multi_node_plan.md §2.1)。
+    """
+    _client.rate_acquire("inventory.put_node", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"],
+                              store["proxy"])
+    body = {"inventories": {"nodes": [
+        {"shipNode": str(ship_node),
+         "inputQty": {"unit": "EACH", "amount": int(qty)}}]}}
+    status, _, data = _client.safe_put_ex(
+        f"{_client.base_url()}/v3/inventories/{sku}", token,
+        store["client_id"], store["proxy"], json_body=body, timeout=60)
+    if status in (401, 403):
+        raise _client.StoreDeadError(store["name"], status)
+    if status != 200:
+        why = f"HTTP {status}" + (f": {str(data)[:200]}" if data else "")
+        logger.warning("PUT /v3/inventories/%s 失败(%s 节点 %s → %s): %s",
+                       sku, store["name"], ship_node, qty, why)
+        return False, why
+    ok, why = _node_result(data, sku, ship_node)
+    if not ok:
+        logger.warning("PUT /v3/inventories/%s 整单 200 但节点未生效"
+                       "(%s 节点 %s → %s): %s",
+                       sku, store["name"], ship_node, qty, why)
+    return ok, why
+
+
+def put_inventory(store: dict, sku: str, qty: int,
+                  ship_node: str | None = None) -> tuple[bool, str]:
+    """输入:店铺 + SKU + 新可售数量(+ 发货节点)→ 输出:(是否成功, 失败原因串)。
 
     同步接口,结果当场已知,不产生 feed_id 不进 feed 台账。
     401/403 抛 StoreDeadError。
+
+    带 `ship_node` 走分节点端点(受管仓的店);不带走 legacy
+    `PUT /v3/inventory`(未配置「维护仓库」的店,逐字节维持现状)。
+    ⚠ 两条路是**显式路由**,不是"试 A 失败落 B":写操作永不自动兜底
+    (换方法重试 = 重复提交制造机,CLAUDE.md 口诀)。
     """
+    if ship_node:
+        return _put_inventory_node(store, sku, qty, ship_node)
     _client.rate_acquire("inventory.put", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"],
                               store["proxy"])

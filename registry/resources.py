@@ -107,6 +107,10 @@ FEED_SPEC_VERSIONS = {
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
+    # 分节点批量库存(多仓批次 2 启用)。⚠ **1.5 的 key 小写**
+    # (inventoryHeader/inventory)与 1.4 大写恰好相反 —— 两套模板不能共用,
+    # 混用的表现是整批 ERR_EXT_DATA_0503009 退回(1.4 小写时的同款错误码)
+    "MP_INVENTORY": "1.5",
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
     # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
     #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。

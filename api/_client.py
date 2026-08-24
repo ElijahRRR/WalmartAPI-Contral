@@ -182,10 +182,15 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "feeds.post.MP_ITEM": (8, 3600.0),          # 官方 10/hour;同店打包单 feed
     "feeds.post.price": (6, 86400.0),           # 价格三件套共享桶,CLAUDE.md 保守 6/天
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
+    "feeds.post.MP_INVENTORY": (40, 3600.0),    # 官方 50/hour(多仓批次 2 启用;与 v1.4 各自独立桶)
     "settings.partnerprofile": (40, 60.0),      # 官方 60/min,lru 缓存后每店仅首次调
     "settings.shipnodes": (40, 60.0),           # 官方 50/min(tsv:152),同样 lru 缓存
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
+    # ⚠ 分节点写与 legacy 写**共用官方那 200/min 吗?官方未明**。分桶登记是
+    # 保守解:两条路各 160/min,同店同时用两条路时总量可能超 —— 但本仓一店
+    # 只走其中一条(配置了「维护仓库」走分节点,没配走 legacy),不会叠加
+    "inventory.put_node": (160, 60.0),          # PUT /v3/inventories/{sku} 官方 200/min
 }
 # insights performance 类:官方 1/min/端点,summary 与 report 各自独立端点 → 逐个登记
 for _m in ("otd", "cancellations", "vtr", "srr", "refunds",

@@ -553,3 +553,65 @@ def test_node_inventory_payload_flattens_every_node():
     assert n == 3
     assert {(r["sku"], r["ship_node"], r["avail_qty"]) for r in seen} == {
         ("A", "N1", 3), ("A", "N2", 2), ("B", "", 7)}
+
+
+# ── 分节点写(批次 2)─────────────────────────────────────────────────────────
+
+def test_put_inventory_without_node_stays_on_legacy(monkeypatch):
+    """未配置「维护仓库」的店逐字节维持现状:legacy PUT /v3/inventory。"""
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        return httpx.Response(200, json={"sku": "A"})
+
+    _use(monkeypatch, handler)
+    assert inv_api.put_inventory(STORE, "A", 7) == (True, "")
+    assert seen["path"] == "/v3/inventory"
+
+
+def test_put_inventory_with_node_uses_body_and_input_qty(monkeypatch):
+    """带节点走 PUT /v3/inventories/{sku}:shipNode 在 **body**,数量字段
+    名是 **inputQty**(读侧 availToSellQty / feed 侧 quantity,三套并存)。"""
+    import json as _json
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N1", "status": "SUCCESS"}]})
+
+    _use(monkeypatch, handler)
+    assert inv_api.put_inventory(STORE, "A", 7, "N1") == (True, "")
+    assert seen["path"] == "/v3/inventories/A"
+    assert seen["body"] == {"inventories": {"nodes": [
+        {"shipNode": "N1", "inputQty": {"unit": "EACH", "amount": 7}}]}}
+
+
+def test_put_inventory_node_parses_partial_success(monkeypatch):
+    """⚠ **HTTP 200 不代表写进去了**:每个 nodes[] 各带自己的 status。
+
+    只看 HTTP 码的话,写失败会被当成写成功 —— settle 随后判 ineffective、
+    下一轮重发,而"为什么没生效"没有任何线索。
+    """
+    def fail(request):
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N1", "status": "FAILURE",
+             "errors": [{"code": "ERR_X", "description": "node not eligible"}]}]})
+
+    _use(monkeypatch, fail)
+    ok, why = inv_api.put_inventory(STORE, "A", 7, "N1")
+    assert ok is False and "ERR_X" in why
+
+    # 目标节点根本没出现在响应里:同样判失败(宁可多重发一轮)
+    def other(request):
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N2", "status": "SUCCESS"}]})
+
+    _use(monkeypatch, other)
+    assert inv_api.put_inventory(STORE, "A", 7, "N1")[0] is False
+
+    # 形状认不出(字段改名/文档与实测不符)也判失败,绝不当成功
+    _use(monkeypatch, lambda r: httpx.Response(200, json={"status": "OK"}))
+    assert inv_api.put_inventory(STORE, "A", 7, "N1")[0] is False

@@ -110,7 +110,11 @@ CREATE TABLE catalog.walmart_items (
     variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)
     variant_group_info jsonb,                -- 变体组详情(isPrimary/分组维度,原样存)
     price numeric, currency text,
-    avail_qty integer,                       -- GET /v3/inventories 合并
+    avail_qty integer,                       -- GET /v3/inventories 合并(**全节点合计**)
+    node_count smallint,                     -- 该 SKU 铺在几个发货节点(多仓批次 0)。
+                                             -- 现状恒 1;价值全在"什么时候不再是"
+                                             -- ——catalog_sync 摘要按它告警。
+                                             -- 与 avail_qty 同源于 merge_rows 的一份入参
     published_status text, lifecycle_status text, unpublished_reasons text,
     last_seen_at timestamptz NOT NULL,       -- 最近一次全量扫描见到它的时间
     missing_since timestamptz,               -- 连续缺席起点;NULL=最近一轮仍在
@@ -128,6 +132,23 @@ CREATE TABLE catalog.walmart_items (
 不丢病历,但拍板保守留行,13 万行 PG 无压力)。飞书「在线产品总表」投影只写在架行
 (missing_since IS NULL),缺席商品不进表;last_seen_at/missing_since
 两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
+
+```sql
+-- 分节点库存明细(多仓批次 1):每 (店铺, SKU, 发货节点) 一行,
+-- catalog_sync 与 walmart_items 同轮落库(同一份 GET /v3/inventories 响应)。
+-- ⚠ 存在的理由是 walmart_items.avail_qty 是**合计**,而写只写一个节点:
+-- 多节点店里"合计 == 单仓目标值"永远不成立 ⇒ 每轮判有差异 ⇒ 每轮全量重发,
+-- 而 settle 又永远判 ineffective。维护链的比对基准与落定判据都改读这张表
+-- (受管仓 = 限额表「维护仓库」填的 FC ID;未填的店不碰这张表,行为零变化)。
+CREATE TABLE catalog.item_node_inventory (
+    store text NOT NULL, sku text NOT NULL,
+    ship_node text NOT NULL,                 -- FC ID(17-18 位数字);Virtual Node 时为空串
+    avail_qty integer NOT NULL,              -- 该节点 availToSellQty
+    seen_at timestamptz NOT NULL,            -- 本轮观测时刻;落定判据靠它比 executed_at
+    PRIMARY KEY (store, sku, ship_node)
+);
+CREATE INDEX item_node_inventory_node_idx ON catalog.item_node_inventory (ship_node);
+```
 
 ```sql
 -- 产品来源登记簿(2026-08-07 所有者定稿):每个上架产品登记"出身"
@@ -549,6 +570,7 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 | `source` | 谁**首先**建议的(maint/scan/audit/tro) | **不是执行者**。拿它反推谁干的,就会读出 08-19 那条「维护链执行 + 审核链原因」的记录 |
 | `action` | **该谁干**:delete/retire/relist → `problem_product_cleanup`;title/price/inventory → `maintenance` | 执行件按它领取(`claim(actions=…)`),与 source 无关 |
 | `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
+| `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:

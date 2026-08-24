@@ -110,9 +110,13 @@ def run(params: dict) -> str:
     only = params.get("store")
 
     stockzero = store_limits.stockzero_stores()
+    # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
+    # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生
+    managed, skipped_nodes = store_limits.managed_nodes()
     with db.pg_conn() as conn:
         intents = mi.collect_all(conn, stockzero,
-                                 int(params.get("oos_days", 0) or 0))
+                                 int(params.get("oos_days", 0) or 0),
+                                 managed=managed)
     if only:
         intents = [i for i in intents if i["store"] == only]
 
@@ -121,6 +125,9 @@ def run(params: dict) -> str:
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
              f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
     lines += _preview_lines(intents, stockzero)
+    node_note = store_limits.managed_note(managed, skipped_nodes)
+    if node_note:
+        lines.append("  " + node_note)
 
     if not mi.TITLE_MISMATCH_DELETE:
         # 停闸必须天天见人(本仓口诀:静默关闭 = 没人记得它关着)。

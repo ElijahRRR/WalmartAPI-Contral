@@ -44,12 +44,12 @@
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
 | 30 | GET /v3/settings/partnerprofile | settings | Partner ID(**无自建仓时**的上架 shipNode) | safe_get_ex | auto_listing |
+| 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
+| 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
 | 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
-PUT /v3/inventories/{sku}(**按发货节点**改库存,shipNode 在 body、一次可写多
-节点、**部分成功语义**;多仓批次 2 实现)、
-GET/POST /v3/settings/shipping/shipnodes(发货节点列表/建仓,多仓批次 1 实现)、
+POST /v3/settings/shipping/shipnodes(**建仓**,人工 runbook,不自动化)、
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
 GET /v3/insights/items/unpublished/items|counts(被下架商品清单,清理工作流可换用)、
 GET /v3/insights/items/buybox 类(旧系统承认缺失)、DELETE /v3/items/{sku}(单品 retire,全仓未用过)、
@@ -62,7 +62,9 @@ GET /v3/items/taxonomy、GET /v3/token/detail(ping_stores 已用)。
 `api/settings.py:30-31` 记的那句:当时全部卖家"无实体仓 → 每店一个 Virtual
 Node",一店一节点。**该依据正在失效**(所有者 2026-08-24 起自建第二个自发货仓),
 改造范围/批次/官方端点形状全部定稿在 `docs/multi_node_plan.md`。
-读侧已于批次 0 统一为"全节点合计"(#22 换端点);写侧仍是单仓,批次 2 切换。
+读侧已于批次 0 统一为"全节点合计"(#22 换端点);写侧已于批次 2 切换
+(#32 分节点 PUT + MP_INVENTORY feed,按「维护仓库」显式路由,未配置的店
+逐字节维持 legacy 单仓路径)。
 
 **明确不做:** Walmart Affiliate API(非 marketplace 域,需独立资质)、
 marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁移)、
@@ -79,11 +81,11 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 3 daily_report | 4, 2, 23, 25, 26, 27, 28, 29 | 端点最多;29 是 xlsx 二进制 |
 | 4 order_audit | 23 | createdStartDate=now-179d 坑必须带上 |
 | 5 upc_generator | 5(upc=) | 复用 items.search;先落库再查的防重已同构 |
-| 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
+| 6 maintenance | 10, 14, 15, 19, 20, 17, (32, 33) | 同步/feed 双路由是 services 层职责;配了「维护仓库」的店走 32 + MP_INVENTORY feed |
 | 7 daily_retire | 11, 17, (2) | DELETE_ITEM;防重走 ops.feed_log |
 | 8 daily_cleanup | 2, 11, 12, 10, 25, 17 | 反补(MP_MAINTENANCE 改 endDate)+删除+停用 |
 | 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
-| 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
+| 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12, (33) | 最大;api 面在此全部收口;上架仓 FC ID 走 33 校验(未配置店仍用 30) |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -130,7 +132,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | ≤10000 条;建议 1000 条/10MB | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | 6/day 保守沿用(官方页自相矛盾期间不放宽) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
 | inventory | 10/hour | 10MB;≤10000 item/ship node | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
-| MP_INVENTORY | 50/hour | 1MB;多 ship node(spec 1.5,JSON only) | 旧未用;**官方站点已无 BETA 标记**(2026-08-24 核验),与 legacy inventory 中立并列,未见弃用/推荐表述 | **批次 2 收录实现**(所有者定稿:指定仓库的店也要接批量维护),见 docs/multi_node_plan.md |
+| MP_INVENTORY | 50/hour | 1MB;多 ship node(spec 1.5,JSON only) | 旧未用;**官方站点已无 BETA 标记**(2026-08-24 核验),与 legacy inventory 中立并列,未见弃用/推荐表述 | ✅ **批次 2 已实现**(2026-08-24):`build_payload` v1.5 小写 key、每 SKU `shipNodes[]`(恒单元素=受管仓)、切片 1000 条/950KB、桶 `feeds.post.MP_INVENTORY` 40/hour;缺 `ship_node` 直接报错不发。见 docs/multi_node_plan.md |
 | PUT /v3/price | 100/hour(⚠官方 Deprecation Guide 列"Price management Sunset 2026",需另行核验) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
 | PUT /v3/inventory | 200/min | — | 一致 | 160/min |
 
@@ -316,7 +318,7 @@ api/settings.py
 5. **枚举核验**:items/count 的 status 枚举含 SYSTEM_PROBLEM/IN_PROGRESS 但**无 STAGE**;
    getAllItems 响应 publishedStatus 文档描述 6 值(含 READY_TO_PUBLISH)但无机器可读 enum
    → api 层对未知 status 容错,不做白名单硬校验。
-6. **inventory feed = 10/hour**(10MB),旧代码 50/hr 登记值是错的;MP_INVENTORY(BETA)才是 50/hour。
+6. **inventory feed = 10/hour**(10MB),旧代码 50/hr 登记值是错的;MP_INVENTORY 才是 50/hour(**已无 BETA 标记**,2026-08-24 核验;本仓桶按 40/hour 保守配)。
 7. **nextCursor 官方口径与实证一致**:"cursor 在所有翻页请求中保持不变,有效 2 分钟,
    过期返回 400 Invalid Cursor";offset ≤10000 官方明文。
 

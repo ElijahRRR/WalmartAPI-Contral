@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     variant_group_info jsonb,        -- 变体组详情(isPrimary/分组维度等,原样存)
     price        numeric,
     currency     text,
-    avail_qty    integer,            -- GET /v3/inventories 合并进来
+    avail_qty    integer,            -- GET /v3/inventories **全节点合计**
     published_status    text,
     lifecycle_status    text,
     unpublished_reasons text,
@@ -1148,6 +1148,14 @@ WHERE sources = '{}'::jsonb AND status IN ('suggested', 'executing');
 CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     ON ops.dispositions (store, sku, action)
     WHERE status IN ('suggested', 'executing');
+-- 多仓探测(2026-08-24,批次 0):这个 SKU 的库存分布在几个发货节点上。
+-- 现状全店单节点(每店一个 Virtual Node),所以这一列**恒 1** —— 它的价值全在
+-- "什么时候不再是 1":所有者自建第二个仓之后,catalog_sync 第一轮就会把它变成 2,
+-- 摘要里那行告警随即出现。没有它的话多仓是**静默**发生的:avail_qty 变成合计、
+-- 维护链按合计比对却只写单仓,一路错到底都不报错(见 docs/multi_node_plan.md §1)。
+-- 本轮没拿到库存时保留上一轮值(与 avail_qty 同款 COALESCE),不刷成 NULL。
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS node_count smallint;
+
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
 

@@ -61,11 +61,12 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
                     summaries.append(items.summarize_item(item))
                     filled += 1
 
-    inventory: dict[str, int] = {}
+    # {sku: {发货节点: 可售数量}} —— 合计与节点数都由 merge_rows 从这一份算
+    inventory: dict[str, dict[str, int]] = {}
     inv_failed = False
     if not skip_inventory:
         try:
-            inventory = inv_api.list_inventories(store)
+            inventory = inv_api.list_inventory_nodes(store)
         except _client.StoreDeadError:
             raise                       # 凭证失效仍按跳店处理
         except Exception as e:
@@ -79,10 +80,13 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
     backfilled = _backfill_item_ids(store) if backfill_ids else 0
+    # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。现状恒 0 —— 它的
+    # 价值全在"什么时候不再是 0"(见 refdata/schema.sql 的 node_count 列注释)
+    multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
             "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
-            "item_ids": backfilled}
+            "item_ids": backfilled, "multi_node": multi}
 
 
 def _backfill_item_ids(store: dict) -> int:
@@ -174,6 +178,16 @@ def run(params: dict) -> str:
     inv_failed = [r["store"] for r in results if r.get("inv_failed")]
     if inv_failed:
         lines.append(f"库存拉取失败(沿用旧值,目录已更新):{','.join(inv_failed)}")
+    # 多仓探测必须见人(批次 0):多仓一旦发生而没人知道,维护链会按"全节点合计"
+    # 比对却只写单个节点 —— 清零永久失效、库存每轮重写、生效永久判未生效,
+    # 三条全是静默的(docs/multi_node_plan.md §1)。这一行是它的唯一告警面。
+    multi = {r["store"]: r["multi_node"] for r in results if r.get("multi_node")}
+    if multi:
+        lines.append(
+            f"⚠ **发现多发货节点**:{sum(multi.values())} 个 SKU 铺在 2 个及以上"
+            f"节点(" + ",".join(f"{s}×{n}" for s, n in sorted(multi.items()))
+            + ")。**维护链现在仍按单仓写**,配置「维护仓库」之前这些店的库存"
+              "维护会漂 —— 见 docs/multi_node_plan.md 批次 1/2")
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
 

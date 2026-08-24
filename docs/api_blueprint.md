@@ -35,7 +35,7 @@
 | 19 | PUT /v3/price | prices | 单品改价(同步快路径) | safe_put_ex | 3 个模块 |
 | 20 | PUT /v3/inventory | inventory | 单品改库存(同步快路径) | safe_put_ex | 4 个模块 |
 | 21 | GET /v3/inventories | inventory | 全店库存分页(bulk) | safe_get_ex | sync_online_products |
-| 22 | GET /v3/inventory?sku= | inventory | 单品库存(bulk 漏数据兜底) | safe_get_ex | sync_online_products |
+| 22 | GET /v3/inventories/{sku} | inventory | 单品库存(bulk 漏数据兜底,**全节点合计**) | safe_get_ex | sync_online_products |
 | 23 | GET /v3/orders | orders | 订单增量拉取/销量统计 | **裸 httpx(async)** | 订单审核/店铺日报 |
 | 24 | GET /v3/returns | returns | 售后单全量拉取 | safe_get_ex | 售后同步 |
 | 25 | GET /v3/report/payment/statement | reports | 结算摘要/店铺状态/sellerId | 混合(裸×1) | 3 个模块 |
@@ -43,14 +43,26 @@
 | 27 | GET /v3/report/reconreport/reconFileJson | reports | 对账明细 JSON | 混合 | 2 个模块 |
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
-| 30 | GET /v3/settings/partnerprofile | settings | Partner ID(上架注入 shipNode) | safe_get_ex | auto_listing |
+| 30 | GET /v3/settings/partnerprofile | settings | Partner ID(**无自建仓时**的上架 shipNode) | safe_get_ex | auto_listing |
 | 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
+PUT /v3/inventories/{sku}(**按发货节点**改库存,shipNode 在 body、一次可写多
+节点、**部分成功语义**;多仓批次 2 实现)、
+GET/POST /v3/settings/shipping/shipnodes(发货节点列表/建仓,多仓批次 1 实现)、
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
 GET /v3/insights/items/unpublished/items|counts(被下架商品清单,清理工作流可换用)、
 GET /v3/insights/items/buybox 类(旧系统承认缺失)、DELETE /v3/items/{sku}(单品 retire,全仓未用过)、
 GET /v3/items/taxonomy、GET /v3/token/detail(ping_stores 已用)。
+
+**⚠ 单仓假设(2026-08-24 由无意识默认转为有意识决策)。** 此前 inventory 域的
+函数面 `(store, sku, qty)` 把 `(店铺, SKU)` 当成库存的完整主键,而沃尔玛的库存
+主键是 `(店铺, SKU, 发货节点)`。这不是当初权衡过的取舍——本仓决策留痕密度极高
+而此事零留痕,分节点端点连"预留"都没进(现已补上)。它成立的业务依据是
+`api/settings.py:30-31` 记的那句:当时全部卖家"无实体仓 → 每店一个 Virtual
+Node",一店一节点。**该依据正在失效**(所有者 2026-08-24 起自建第二个自发货仓),
+改造范围/批次/官方端点形状全部定稿在 `docs/multi_node_plan.md`。
+读侧已于批次 0 统一为"全节点合计"(#22 换端点);写侧仍是单仓,批次 2 切换。
 
 **明确不做:** Walmart Affiliate API(非 marketplace 域,需独立资质)、
 marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁移)、
@@ -118,7 +130,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | ≤10000 条;建议 1000 条/10MB | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | 6/day 保守沿用(官方页自相矛盾期间不放宽) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
 | inventory | 10/hour | 10MB;≤10000 item/ship node | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
-| MP_INVENTORY(BETA) | 50/hour | 1MB;多 ship node,JSON only | 旧未用;官方未废弃 inventory | 暂不用,盯 BETA 走向 |
+| MP_INVENTORY | 50/hour | 1MB;多 ship node(spec 1.5,JSON only) | 旧未用;**官方站点已无 BETA 标记**(2026-08-24 核验),与 legacy inventory 中立并列,未见弃用/推荐表述 | **批次 2 收录实现**(所有者定稿:指定仓库的店也要接批量维护),见 docs/multi_node_plan.md |
 | PUT /v3/price | 100/hour(⚠官方 Deprecation Guide 列"Price management Sunset 2026",需另行核验) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
 | PUT /v3/inventory | 200/min | — | 一致 | 160/min |
 
@@ -259,9 +271,10 @@ api/prices.py
   put_price(store, sku, amount)                           # 单品(100/hour,慎用)
   # 批量走 feeds.submit_feed(feed_type="price"|"PRICE_AND_PROMOTION")
 api/inventory.py
-  put_inventory(store, sku, qty)
-  list_inventories(store)                                 # 分页模型4+单品兜底补漏内置
-  get_inventory(store, sku)
+  put_inventory(store, sku, qty)                          # 单仓(legacy);批次 2 加 ship_node
+  list_inventory_nodes(store)                             # {sku:{节点:数量}};分页模型4+单品兜底内置
+  list_inventories(store)                                 # ↑ 的求和包装({sku: 合计})
+  get_inventory(store, sku)                               # 全节点合计(GET /v3/inventories/{sku})
 api/orders.py
   iter_orders(store, *, last_modified_start, created_start=auto_179d, ...)  # 分页模型2;
                                                           # 内部 async 并发多店由 services 组织

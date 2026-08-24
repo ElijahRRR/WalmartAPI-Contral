@@ -197,12 +197,12 @@ def test_preview_writes_nothing(monkeypatch):
     """preview=1 只打印:一条建议行都不许落(与危险工作流的 dry-run 同精神)。"""
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, {}, set(), set()))
+        set(), set(), {}, {}, set(), set(), set()))
     monkeypatch.setattr(scan.dispositions, "suggest_many",
                         lambda conn, rows: (_ for _ in ()).throw(
                             AssertionError("preview 不许写建议行")))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only: [])
+                        lambda conn, inflight, inactive, only, wfs=None: [])
 
     import contextlib
     from registry import db as _db
@@ -429,6 +429,7 @@ def test_summarize_counts_the_rows_that_actually_land():
     ]
     audit_rows = [allrows[1]]
     n = {"fallback": 0, "stage": 1, "inflight": 2, "inflight_listing": 0,
+         "wfs": 0,
          "inactive": 3, "delete": 1}
     head = _summ(allrows, audit_rows, n, 99)
     # 删除报 2(含 retire 之外的全部 delete 行),不是 n['delete'] 的 1
@@ -484,6 +485,7 @@ def test_summarize_dedupes_like_the_unique_index():
          "category": "B", "source": "scan"},
     ]
     n = {"fallback": 0, "stage": 0, "inflight": 0, "inflight_listing": 0,
+         "wfs": 0,
          "inactive": 0}
     head = scan._summarize(allrows, [allrows[1]], n, 3)
     assert "删除 2" in head[0]          # 不是 3
@@ -552,3 +554,52 @@ def test_policy_gap_note_reports_unknown_policy_names():
     class _ConnAll(_Conn2):
         def cursor(self): return _CurAll()
     assert scan._policy_gap_note(_ConnAll(), items) == ""
+
+
+# ── WFS 删不掉的闸(多仓批次 0)──────────────────────────────────────────────
+
+def test_wfs_blocked_skus_are_skipped_not_re_deleted_every_round():
+    """WFS 件删不掉 → 跳过并计数,**不再每天空发一次注定被拒的 DELETE_ITEM**。
+
+    生产实证 11 条(L001/A152/A154/A170)连着几轮同一个 ERR_EXT_DATA_0101218。
+    ⚠ 只拦破坏动作:反补走 MP_MAINTENANCE,对 WFS 件照常可用。
+    """
+    items = [_item("T1", "S_DEL", "prohibited product policy"),   # → 删除
+             _item("T1", "S_OK", "prohibited product policy")]
+    plans, n = scan.plan(items, set(), {}, set(),
+                         wfs_blocked={("T1", "S_DEL")})
+    assert n["wfs"] == 1
+    assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_OK"]
+
+
+def test_wfs_gate_lets_relist_through():
+    """A/L 类的反补不受 WFS 闸影响(该救的仍然救),救不成才被拦。"""
+    it = _item("T1", "S_EXP", "end date has passed")
+    it["gtin"] = "00012345678905"
+    plans, n = scan.plan([it], set(), {}, set(), wfs_blocked={("T1", "S_EXP")})
+    assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_EXP"]
+    assert n["wfs"] == 0            # 走了反补,没走破坏动作
+
+
+def test_wfs_gate_also_blocks_stubborn_double_feed():
+    """顽固件的 retire+delete 双发同样拦:delete 注定被拒,而 retire 对 WFS
+    件行不行官方没有明文 —— 按本仓纪律不按推断编码,整条跳过并报数。"""
+    items = [_item("T1", "S_Z", "prohibited product policy")]
+    plans, n = scan.plan(items, set(), {}, set(), stubborn={("T1", "S_Z")},
+                         wfs_blocked={("T1", "S_Z")})
+    assert n["wfs"] == 1 and n["stubborn"] == 0
+    assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
+
+
+def test_wfs_blocked_sql_reads_only_the_latest_attempt():
+    """口径是**最近一次**删除回执,不是"历史上出现过就永久拉黑"。
+
+    商品转出 WFS 之后就该能删了 —— 下一次尝试的回执会把它放出来。
+    写成 EXISTS(任意一轮命中过)的话,转出 WFS 的件永远删不了,而且没人
+    看得出来是被自己的闸拦着。
+    """
+    q = scan._SQL_WFS_BLOCKED
+    assert "DISTINCT ON (store, sku)" in q
+    assert "ORDER BY store, sku, submitted_at DESC" in q
+    assert "feed_type = 'DELETE_ITEM'" in q
+    assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"

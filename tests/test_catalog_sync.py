@@ -177,16 +177,22 @@ def test_summarize_item_variant_group():
 # ── GET /v3/inventories 分页模型 4 ───────────────────────────────────────────
 
 def test_list_inventories_terminates_on_cursor_not_page_length(monkeypatch):
+    seen_paths = []
+
     def handler(request):
-        if request.url.path == "/v3/inventory":
-            return httpx.Response(200, json={"sku": request.url.params["sku"],
-                                             "quantity": {"amount": 9}})
+        seen_paths.append(request.url.path)
+        if request.url.path.startswith("/v3/inventories/"):
+            # 单品兜底:与 bulk 同族端点,响应同样带 nodes(多仓批次 0 改)
+            return httpx.Response(200, json={
+                "sku": request.url.path.rsplit("/", 1)[-1],
+                "nodes": [{"shipNode": "N1", "availToSellQty": {"amount": 9}}]})
         cursor = request.url.params.get("nextCursor")
         if not cursor:
             # 第一页只有 1 条(< limit)但仍有下页——历史 bug 场景
             return httpx.Response(200, json={
                 "elements": {"inventories": [{"sku": "A", "nodes": [
-                    {"availToSellQty": {"amount": 3}}, {"availToSellQty": {"amount": 2}}]}]},
+                    {"shipNode": "N1", "availToSellQty": {"amount": 3}},
+                    {"shipNode": "N2", "availToSellQty": {"amount": 2}}]}]},
                 "meta": {"nextCursor": "PAGE2"}})
         return httpx.Response(200, json={
             "elements": {"inventories": [{"sku": "B", "quantity": {"amount": 7}}]},
@@ -197,6 +203,51 @@ def test_list_inventories_terminates_on_cursor_not_page_length(monkeypatch):
     assert inv["A"] == 5          # 多 node 求和
     assert inv["B"] == 7
     assert inv["C"] == 9          # bulk 漏掉 → 单查兜底
+    # ⚠ 兜底走的是 /v3/inventories/{sku},**不是** legacy /v3/inventory?sku=:
+    # 后者不带 shipNode 时返回"默认节点"而非合计,与 bulk 不同语义,多节点店
+    # 会让 avail_qty 这一列混进两种口径且无从分辨(多仓批次 0 修)
+    assert "/v3/inventories/C" in seen_paths
+    assert "/v3/inventory" not in seen_paths
+
+
+def test_list_inventory_nodes_keeps_node_identity(monkeypatch):
+    """节点身份保留在键上——多仓探测靠它数"这个 SKU 铺在几个仓"。"""
+    def handler(request):
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "A", "nodes": [
+                    {"shipNode": "N1", "availToSellQty": {"amount": 3}},
+                    {"shipNode": "N2", "availToSellQty": 2}]},      # 裸值也收
+                {"sku": "B", "quantity": {"amount": 7}}]},
+            "meta": {"nextCursor": None}})
+
+    _use(monkeypatch, handler)
+    nodes = inv_api.list_inventory_nodes(STORE)
+    assert nodes["A"] == {"N1": 3, "N2": 2}
+    assert nodes["B"] == {"": 7}        # 空串 = 节点身份未知(legacy 扁平响应)
+    # 合计包装与改造前逐字节同口径
+    assert inv_api.list_inventories(STORE) == {"A": 5, "B": 7}
+
+
+def test_unrecognised_inventory_shape_is_none_not_zero(monkeypatch):
+    """⚠ nodes 在而无一带 availToSellQty(官方文档样例给的就是这种 PUT 风格)
+    → 判"读不到"返回 None,**绝不当 0**。
+
+    当 0 的后果:该 SKU 的 avail_qty 被刷成 0 → 维护链认为线上没货 → 把 amz
+    库存整店重推一遍。返回 None 则落不进结果,COALESCE 保留上一轮值。
+    """
+    def handler(request):
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "A", "nodes": [{"shipNode": "N1", "status": "Success"}]},
+                {"sku": "B", "nodes": [{"shipNode": "N1",
+                                        "availToSellQty": {"amount": 0}}]}]},
+            "meta": {"nextCursor": None}})
+
+    _use(monkeypatch, handler)
+    inv = inv_api.list_inventories(STORE)
+    assert "A" not in inv               # 形状认不出 → 不落结果
+    assert inv["B"] == 0                # 真的是 0 → 照落(与上面区分开)
 
 
 # ── services 合并与落库 ───────────────────────────────────────────────────────
@@ -245,7 +296,8 @@ def test_merge_rows_and_upsert():
                   "price": 9.9, "currency": "USD", "published_status": "PUBLISHED",
                   "lifecycle_status": "ACTIVE", "unpublished_reasons": ""},
                  {"sku": None}]     # 无 sku 的丢弃
-    rows = walmart_catalog.merge_rows("T1", summaries, {"A": 4}, "2026-08-05")
+    rows = walmart_catalog.merge_rows("T1", summaries, {"A": {"N1": 4}},
+                                      "2026-08-05")
     assert len(rows) == 1 and rows[0]["avail_qty"] == 4 and rows[0]["store"] == "T1"
 
     conn = _FakeConn()
@@ -447,3 +499,28 @@ def test_zero_stores_completed_is_failure_not_success(monkeypatch):
         catalog_sync.run({"skip_feishu": "1"})
     assert "零店完成" in str(ei.value)
     assert "0/2 店完成" in str(ei.value)
+
+
+# ── 多仓探测(批次 0)─────────────────────────────────────────────────────────
+
+def test_merge_rows_derives_total_and_node_count_from_one_source():
+    """合计与节点数**同源**:两列都从 {sku:{节点:数量}} 那一份算。
+
+    各算各的就是"一条判据散在多处"的老病 —— 改了其中一处,另外几处不报错、
+    只是悄悄按旧规矩办事。读不到库存的 SKU 两列都是 None(走 COALESCE 保旧值,
+    不刷成 0)。
+    """
+    summaries = [{"sku": "A"}, {"sku": "B"}, {"sku": "C"}]
+    rows = walmart_catalog.merge_rows(
+        "T1", summaries, {"A": {"N1": 3, "N2": 2}, "B": {"": 7}}, "2026-08-24")
+    got = {r["sku"]: (r["avail_qty"], r["node_count"]) for r in rows}
+    assert got["A"] == (5, 2)       # 两个节点 → 合计 5,node_count 2
+    assert got["B"] == (7, 1)
+    assert got["C"] == (None, None)  # 本轮读不到 → 两列都 None
+
+
+def test_upsert_preserves_node_count_when_absent():
+    """本轮没拿到库存时 node_count 保留上一轮值(与 avail_qty 同款 COALESCE)。"""
+    sql = walmart_catalog._UPSERT_SQL
+    assert "node_count = COALESCE(EXCLUDED.node_count," in sql
+    assert "catalog.walmart_items.node_count)" in sql

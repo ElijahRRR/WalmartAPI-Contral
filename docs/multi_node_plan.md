@@ -93,17 +93,25 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   该店维护/上架**整店跳过并告警**(填错了宁可不动,不能静默回落 Virtual
   Node——那会把新仓的货写到旧节点)。校验结果缓存一天(节点不会天天变)。
 
-## 4. 批次 0|止血 + 探测(可先行,不依赖实测)
+## 4. 批次 0|止血 + 探测 ✅ 已完成(2026-08-24)
 
-1. `api/inventory.get_inventory` 兜底改为与 bulk 同口径(解析 `nodes[]` 求和)
-   ——消掉 `avail_qty` 单列双语义(api/inventory.py:78-81 混用点)。
-2. `catalog_sync` 落**节点探测**:`walmart_items` 加 `node_count` 列,摘要报
-   「N 店 M 个 SKU 出现多节点」——新仓建好后第一时间可见,也是空白 4 的探针。
-3. 问题链 **WFS 删除闸**:回执 `ERR_EXT_DATA_0101218`(WFS eligible 不能删)
-   的 SKU 改走 retire 或标记跳过并单列报数——停止每天空烧注定失败的 DELETE_ITEM。
-4. 蓝图补账:`GET/PUT /v3/inventories/{sku}`、`GET/POST shipnodes` 登记;
-   MP_INVENTORY 行更新为"官方已转正,批次 2 收录实现"(所有者定稿:
-   指定仓库的店要接批量维护);单仓假设写成有意识的文档决策。
+1. ✅ 单品兜底换端点 `GET /v3/inventory?sku=` → `GET /v3/inventories/{sku}`
+   ——读侧口径统一为"全节点合计",消掉 `avail_qty` 单列双语义。
+   `_nodes()` 保留节点身份(`{shipNode: 数量}`),`_qty()` 变成它的求和;
+   **认不出的形状返回 None 并告警,绝不当 0**(官方那份 PUT 风格的错误样例真
+   撞上时,当 0 会让维护链把 amz 库存整店重推)。
+2. ✅ `walmart_items.node_count` + `catalog_sync` 摘要告警行(现状恒 1/0,
+   价值全在"什么时候不再是")。合计与节点数**同源**于 merge_rows 的一份入参。
+3. ✅ 问题链 WFS 闸:按**最近一次**删除回执是否 `ERR_EXT_DATA_0101218` 拦
+   (不是历史命中过就永久拉黑——转出 WFS 后要能自己放出来);**只拦破坏动作**,
+   反补(MP_MAINTENANCE)照常;顽固件双发同样拦(RETIRE 对 WFS 件行不行官方
+   无明文,不按推断编码);摘要单列报数。
+4. ✅ 蓝图补账:#22 换端点、分节点写与 shipnodes 进预留、MP_INVENTORY 去 BETA
+   标记并注明批次 2 实现、**单仓假设写成有意识的决策**(附失效时点与去向)。
+
+⚠ 批次 0 **没有**改写侧:`put_inventory` 仍是 legacy 单仓。多节点店的四条
+故障(§1)在配置「维护仓库」并跑完批次 2 之前依然存在 —— 探测告警只是让它
+不再静默。
 
 ## 5. 批次 1|配置 + 读侧(含实测清单落账)
 

@@ -1651,3 +1651,50 @@ def test_run_submits_futures_per_chunk_not_all_at_once():
     # 候选取数不许再回到 fetchall
     assert "_iter_candidates(" in src
     assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"
+
+
+# ── mode=stale:版本重审(所有者定稿 2026-08-24)────────────────────────────
+
+def test_mode_stale_reaudits_approved_only_and_needs_full_chain():
+    """判据提版后 approved 存量按新版本全链重审;rejected 沿用不重审。
+
+    与 force_rerun=<版本> 的区别就是砍掉贵的那半:那条 approved+rejected
+    全量,为几千条可能翻案的 pass 烧掉全库 rejected 的 LLM 钱。
+    版本谓词是天然分页:真跑判过盖当前版本号,自动退出候选。
+    **不进调度**(所有者定稿 2026-08-24):手动批量消化的旁路。
+    """
+    from registry import resources, schedule
+
+    w, e = product_audit._pick_where({"mode": "stale"})
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w
+    assert e["stale_ver"] == resources.AUDIT_RULES_VERSION
+    assert "rejected" not in w      # rejected 沿用,不进候选
+    assert not any("stale" in " ".join(j["params"]) for j in schedule.JOBS)
+
+
+def test_default_candidate_reaudits_stale_approved():
+    """缺省谓词第三支(所有者定稿 2026-08-24):approved 而版本落后 → 重审
+    而不是投影。这样 from_sheet(上架前 18:10 那轮)走到这条谓词,**要上架的
+    品自动被新判据重过** —— 版本重审不进调度,靠的就是这一支。
+    rejected 仍不自动重审(沿用)。"""
+    from registry import resources
+
+    w, e = product_audit._pick_where({})
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(cand_ver)s" in w
+    assert e["cand_ver"] == resources.AUDIT_RULES_VERSION
+    assert "rejected" not in w
+    # from_sheet 那条同样带着这支(它就是 asins ∧ 缺省谓词)
+    w2, e2 = product_audit._pick_where({"asins": "B0AAAAAAAA",
+                                        "from_sheet": "1"})
+    assert "cand_ver" in e2 and "%(cand_ver)s" in w2
+
+
+def test_mode_stale_refuses_l0_only(monkeypatch):
+    """stale 不与 stages=L0 连用:L0 未命中不落结论不盖版本 → 候选永不收敛,
+    每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="stale"):
+        product_audit.run({"mode": "stale", "stages": "L0"})

@@ -162,6 +162,11 @@ JOBS = (
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),
+    # 版本重审**不进调度**(所有者定稿 2026-08-24:「规则存在,上架时对要上架
+    # 的品起作用就够了,平常直接审核某一批产品也够」)。两条消化路径:
+    #   · from_sheet(audit_sheet 18:10 已有):_DEFAULT_CANDIDATE 含
+    #     「approved×旧版本」⇒ 要上架的品自动被新判据重过;
+    #   · 手动批量:python cli.py product_audit -p mode=stale [-p limit=N]
 
     # ── 批三·上架域(所有者定稿 2026-08-17 排进调度)────────────────────
     # 当天的次序是硬的:product_chain(13:00,problem_scan 产黑名单)

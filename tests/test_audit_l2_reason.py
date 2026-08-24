@@ -511,3 +511,50 @@ def test_r0_and_r2_are_gone_whitelist_is_the_only_category_judge():
                                 _ctx(pt_meta=_ok_meta(pt, cat)))
         assert res.verdict == "pass", pt
         assert _codes(res) == [], pt
+
+
+# ── R10 Made in USA 声明(2026-08-24,漏判反哺第一条硬规则)──────────────────
+
+def _p10(title="", bullets=None, desc=""):
+    from services.audit_models import ProductInfo
+    return ProductInfo(asin="B0T", title=title,
+                       bullet_points=bullets or [], long_description=desc)
+
+
+def test_r10_made_in_usa_claim_hard_rejects():
+    """字面声明即铁证:FTC 要求卖家实证,搬运文案永远实证不了。
+
+    生产实证下架原因 "Prohibited Product Policy on Made in USA claims"。
+    与"儿童品不进 L2"方向相反且都对:声明在文本里就是证据,儿童品要靠理解。
+    """
+    from services import audit_l2
+
+    hits = audit_l2._rule_made_in_usa(_p10("Steel Bracket Made in USA"))
+    assert len(hits) == 1 and hits[0].penalty == -100
+    assert hits[0].rule_code == "made_in_usa_claim"
+    # 长描述里的声明也要拦(R7/R8 只扫前 3 条五点,这条是硬拒,全文都扫)
+    assert audit_l2._rule_made_in_usa(
+        _p10("Table", desc="Proudly manufactured in the United States"))
+    assert audit_l2._rule_made_in_usa(_p10("USA-Made leather belt"))
+    assert audit_l2._rule_made_in_usa(_p10("American made blanket"))
+
+
+def test_r10_word_boundary_and_negation_do_not_fire():
+    """词边界防误伤 + 否定式排除 + 非声明语境不命中。"""
+    from services import audit_l2
+
+    assert not audit_l2._rule_made_in_usa(
+        _p10("Jerusalem artichoke, thousand pieces"))
+    assert not audit_l2._rule_made_in_usa(
+        _p10("Made in China, not made in USA"))
+    assert not audit_l2._rule_made_in_usa(_p10("Trip to USA travel guide"))
+    assert not audit_l2._rule_made_in_usa(_p10(""))
+
+
+def test_r10_is_wired_into_evaluate():
+    """规则必须真挂进 evaluate 的规则列表 —— 单测函数绿而没接线是静默漏判。"""
+    import inspect
+
+    from services import audit_l2
+
+    assert "_rule_made_in_usa" in inspect.getsource(audit_l2.evaluate)

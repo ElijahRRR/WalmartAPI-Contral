@@ -216,7 +216,7 @@ _CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
 # pass=现役 pass 重过 L0;online=**在架** pass 重过 L0(链上那条);
 # nonpass=非 pass 全量重判
-_MODES = {"backfill", "pending", "pass", "online", "nonpass"}
+_MODES = {"backfill", "pending", "pass", "online", "nonpass", "stale"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -225,9 +225,16 @@ _MODES = {"backfill", "pending", "pass", "online", "nonpass"}
 #     `slow_hash` 变了(产品本身改了)时由 product_ingest 翻回 pending;
 #     rejected 永不自动重审(45 天 TTL 那套已废除)
 #   · 要整批重审只有一条路:`-p force_rerun=<规则版本>`(人工显式)
+# 2026-08-24 起第三支:approved 而 audit_version 落后于当前判据版本的,
+# **重审而不是投影**(所有者定稿:「就算 hash 没变,审核版本号变了也完整重审」,
+# 且不进调度 —— 上架前的 from_sheet 走到这条谓词,要上架的品自然被新判据
+# 重过一遍;平时手动 mode=stale 批量消化)。rejected 不在此列:沿用旧结论
+# (reject 粘性),要翻案走 rerule/mode=nonpass。
 _DEFAULT_CANDIDATE = (
     "(p.audit_status IS NULL OR (p.audit_status = 'pending' "
-    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))")
+    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day'))"
+    " OR (p.audit_status = 'approved'"
+    " AND p.audit_version IS DISTINCT FROM %(cand_ver)s))")
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
@@ -253,7 +260,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
             # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
             # `-p force=1` 显式打开强审见 `_forced_sheet`。
             return f"p.asin = ANY(%(asins)s) AND {_DEFAULT_CANDIDATE}", \
-                {"asins": asins}
+                {"asins": asins,
+                 "cand_ver": resources.AUDIT_RULES_VERSION}
         # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
         # 运行时短路可绕,绕的是 audit_status 候选谓词)
         return "p.asin = ANY(%(asins)s)", {"asins": asins}
@@ -346,6 +354,24 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         return ("p.audit_status IS DISTINCT FROM 'approved'"
                 " AND p.audit_version IS DISTINCT FROM %(nonpass_ver)s",
                 {"nonpass_ver": resources.AUDIT_RULES_VERSION})
+    if mode == "stale":
+        # **版本重审**(所有者定稿 2026-08-24):判据更新(AUDIT_RULES_VERSION
+        # 提版)后,approved 的存量按新版本**全链**重审;rejected 沿用不重审
+        # (reject 粘性,与双跑校准同口径)。这是 force_rerun=<版本> 砍掉贵的
+        # 那半:那条 approved+rejected 全量,为几千条可能翻案的 pass 烧掉全库
+        # rejected 的 LLM 钱(rerule 的注释记着这个痛)。
+        #
+        # 解决的问题是「判据更新了,产品审核结论滞后」:此前 approved 只有
+        # slow_hash 变了才回炉,判据变了内容没变的永远不重审 —— 1183 个
+        # 历史导入 approved 挂在"沃尔玛已下架"清单上就是这么来的
+        # (audited_at 成批相同、audit_runs 无记录,L2/L3 从没碰过)。
+        #
+        # 天然分页:真跑判过盖当前版本号,自动退出候选;dry-run 不写版本
+        # ⇒ 候选恒定,可重复抽样验证。历史导入行版本旧/空,
+        # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
+        return ("p.audit_status = 'approved'"
+                " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
+                {"stale_ver": resources.AUDIT_RULES_VERSION})
     if mode == "pass":
         # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
@@ -373,7 +399,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
                 "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
-    return _DEFAULT_CANDIDATE, {}
+    return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
 
 
 # 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
@@ -599,7 +625,9 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 
 
 _SQL_SHEET_STATE = """
-SELECT coalesce(audit_status, '未审') AS st, count(*)
+SELECT CASE WHEN audit_status = 'approved'
+             AND audit_version IS DISTINCT FROM %s THEN '版本过期'
+       ELSE coalesce(audit_status, '未审') END AS st, count(*)
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 GROUP BY 1
@@ -644,11 +672,12 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
     head = [f"上架表 E 列为空 {len(want)} 个 ASIN"
             f"({len(rows)} 行,同 ASIN 多店铺算多行)"]
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_SHEET_STATE, (want,))
+        cur.execute(_SQL_SHEET_STATE,
+                    (resources.AUDIT_RULES_VERSION, want))
         st = {k: int(n) for k, n in cur.fetchall()}
     absent = len(want) - sum(st.values())        # 库里压根没有这个 ASIN
     done = st.get("approved", 0) + st.get("rejected", 0)
-    todo = st.get("未审", 0) + st.get("pending", 0)
+    todo = st.get("未审", 0) + st.get("pending", 0) + st.get("版本过期", 0)
     # 这三个数是"为什么这轮还在审"的全部答案,必须在摘要里(只写日志的话
     # 飞书通知看着像"审完了")
     head.append(
@@ -656,7 +685,8 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
         f"{st.get('rejected', 0)})→ "
         + ("⚡ **force=1:连同它们一起重判**(不是回填)" if force
            else "**直接回填,不重审**")
-        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
+        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 "
+        f"{st.get('pending', 0)}/判据提版重审 {st.get('版本过期', 0)})"
         # ⚠ 这个数是**补采之前**的快照(补采跑在它后面)。别写成"本轮审不了"
         # —— 同轮闭环正是为了把它们救回来,救回来多少看下面那段
         + (f";⚠ 不在库 {absent}(补采前口径,见下方补采段:"
@@ -1049,6 +1079,11 @@ def run(params: dict) -> str:
         # online 那条还挂在 product_chain 上天天跑,更不能让它打 LLM
         raise ValueError("mode=pass / mode=online 只与 stages=L0 连用"
                          "(加 -p stages=L0;全链重审请用 force_rerun)")
+    if str(params.get("mode", "")).strip() == "stale" and only_l0:
+        # 方向与上面相反:版本重审必须全链 —— L0 未命中不落结论不盖版本,
+        # 候选永不退出,每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)
+        raise ValueError("mode=stale 不与 stages=L0 连用:版本重审必须全链,"
+                         "否则未命中的行不盖版本号,候选集永不收敛")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
@@ -1115,6 +1150,13 @@ def run(params: dict) -> str:
                       "且未按当前规则版本判过的",
                 where, extra, limit,
                 "一个都没有:这批已经全部按当前版本判过了") + sheet_head
+        elif mode_ == "stale":
+            sheet_head = _batch_head(
+                conn, f"版本重审:approved 且未按当前规则版本"
+                      f"({resources.AUDIT_RULES_VERSION})判过的"
+                      f"(rejected 沿用不重审)",
+                where, extra, limit,
+                "一个都没有:approved 存量已全部按当前版本判过") + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
         cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)

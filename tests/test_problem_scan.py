@@ -49,15 +49,18 @@ def test_plan_routing_and_dedup():
         _item("T1", "S_AMAX", "end date has passed"),         # 反补满 2 次 → 删除
         _item("T1", "S_B", "prohibited product policy"),      # → 删除
         _item("T1", "S_STAGE", "stage status until you go live"),   # 排除
-        _item("T1", "S_FLY", "intellectual property"),        # 在途 → 跳过
+        _item("T1", "S_FLY", "intellectual property"),        # 处置在途 → 跳过
+        _item("T1", "S_NEW", "prohibited product policy"),    # 上架在途 → 跳过
         _item("T_OFF", "S_X", "prohibited product policy"),   # 非 ACTIVE 店 → 跳过
         _item("T1", "S_ZOMBIE", "prohibited product policy"),  # 删除未生效 → 双击
     ]
+    # 2026-08-24 起在途计数拆两桶(跳过行为不变):处置在途 vs 上架/维护在途
     plans, n = scan.plan(items,
-                         inflight={("T1", "S_FLY")},
+                         inflight={("T1", "S_FLY"), ("T1", "S_NEW")},
                          attempts={("T1", "S_AMAX"): 2},
                          inactive={"T_OFF"},
-                         stubborn={("T1", "S_ZOMBIE")})
+                         stubborn={("T1", "S_ZOMBIE")},
+                         inflight_disposal={("T1", "S_FLY")})
     assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_A"]
     # 顽固 SKU 停用+删除双 feed
     assert {r["sku"] for r in plans["T1"]["delete"]} == \
@@ -66,6 +69,7 @@ def test_plan_routing_and_dedup():
     assert n["stubborn"] == 1
     assert "T_OFF" not in plans
     assert (n["stage"], n["inflight"], n["inactive"]) == (1, 1, 1)
+    assert n["inflight_listing"] == 1        # S_NEW:上架 feed 在途,单列一桶
     assert n["fallback"] == 1 and n["relist"] == 1 and n["delete"] == 3
 
 
@@ -193,7 +197,7 @@ def test_preview_writes_nothing(monkeypatch):
     """preview=1 只打印:一条建议行都不许落(与危险工作流的 dry-run 同精神)。"""
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), {}, {}, set(), set()))
+        set(), set(), {}, {}, set(), set()))
     monkeypatch.setattr(scan.dispositions, "suggest_many",
                         lambda conn, rows: (_ for _ in ()).throw(
                             AssertionError("preview 不许写建议行")))
@@ -424,7 +428,8 @@ def test_summarize_counts_the_rows_that_actually_land():
          "source": "scan"},
     ]
     audit_rows = [allrows[1]]
-    n = {"fallback": 0, "stage": 1, "inflight": 2, "inactive": 3, "delete": 1}
+    n = {"fallback": 0, "stage": 1, "inflight": 2, "inflight_listing": 0,
+         "inactive": 3, "delete": 1}
     head = _summ(allrows, audit_rows, n, 99)
     # 删除报 2(含 retire 之外的全部 delete 行),不是 n['delete'] 的 1
     assert "删除 2" in head[0] and "反补 1" in head[0]
@@ -478,10 +483,72 @@ def test_summarize_dedupes_like_the_unique_index():
         {"store": "T1", "sku": "SOLO", "action": "delete",
          "category": "B", "source": "scan"},
     ]
-    n = {"fallback": 0, "stage": 0, "inflight": 0, "inactive": 0}
+    n = {"fallback": 0, "stage": 0, "inflight": 0, "inflight_listing": 0,
+         "inactive": 0}
     head = scan._summarize(allrows, [allrows[1]], n, 3)
     assert "删除 2" in head[0]          # 不是 3
     assert "其中审核判拒 1" in head[0]
     t1 = [l for l in head if l.startswith("  T1")][0]
     assert t1.count("SDUP") == 1        # 分店明细里也只出现一次
     assert "-:1" in t1 and "B:1" in t1  # 后写的赢 ⇒ SDUP 的 category 是 None
+
+
+# ── L 类反补 + K 聚集 + 政策名缺口(2026-08-24 审核反哺批)─────────────────────
+
+def test_l_system_error_goes_through_relist_channel():
+    """L 类(internal error)沃尔玛原话是 Resubmit,先反补一次;满 2 次转删。
+    复用 A 类全部机械:计数/30 天窗/无 productId 转删。"""
+    items = [
+        _item("T1", "S_L1", "an internal error occurred while publishing"),
+        _item("T1", "S_LMAX", "an internal error occurred while publishing"),
+        _item("T1", "S_LNOID", "an internal error occurred", gtin=""),
+    ]
+    plans, n = scan.plan(items, inflight=set(),
+                         attempts={("T1", "S_LMAX"): 2}, inactive=set())
+    assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_L1"]
+    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_LMAX", "S_LNOID"}
+    assert n["fallback"] == 1
+
+
+def test_k_cluster_note_fires_on_concentration():
+    """「内部标记」单条无信息量,聚集才是信号(实测谭总11 一店 45 条)。"""
+    items = [{"store": "T1", "sku": f"S{i}", "category": "K"}
+             for i in range(scan._K_CLUSTER_WARN)]
+    note = scan._k_cluster_note(items)
+    assert "T1" in note and "风险" in note
+    assert scan._k_cluster_note(items[:3]) == ""     # 没到阈值不吵
+
+
+def test_policy_gap_note_reports_unknown_policy_names():
+    """沃尔玛点名了政策而政策表没有 ⇒ L3 的 S4 块看不见它,注定漏。
+    政策表无同步器(audit_import 一次性),缺口靠这里天天报。"""
+    class _Cur:
+        def execute(self, sql): pass
+        def fetchall(self):
+            return [("Children's Products",), ("Hazardous Items",)]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class _Conn2:
+        def cursor(self): return _Cur()
+
+    items = [
+        {"store": "T1", "sku": "A",
+         "reasons": "violating Walmart's Prohibited Product Policy on "
+                    "Made in USA claims. Items with..."},
+        {"store": "T1", "sku": "B",
+         "reasons": "||Children's Products Prohibited Products Policy@@@x"},
+        {"store": "T1", "sku": "C",
+         "reasons": "violating Walmart's Marketplace *Prohibited Product "
+                    "Policy*."},
+    ]
+    note = scan._policy_gap_note(_Conn2(), items)
+    assert "Made in USA claims" in note        # 未收录 → 报
+    assert "Children's Products" not in note   # 已收录 → 不报
+    # 裸政策名(没点名)不制造噪音
+    class _CurAll(_Cur):
+        def fetchall(self):
+            return [("Children's Products",), ("Made in USA claims",)]
+    class _ConnAll(_Conn2):
+        def cursor(self): return _CurAll()
+    assert scan._policy_gap_note(_ConnAll(), items) == ""

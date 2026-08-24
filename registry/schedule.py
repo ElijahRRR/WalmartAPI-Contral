@@ -162,6 +162,18 @@ JOBS = (
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),
+    # 版本重审(所有者定稿 2026-08-24):AUDIT_RULES_VERSION 提版后,approved
+    # 存量按新版本全链重审(rejected 沿用不重审,reject 粘性)。天然分页:
+    # 判过的盖当前版本号退出候选,每天 2000 条直到清完;版本没变时候选恒 0,
+    # 一轮空转几秒就收 —— 挂着不亏。⚠ 全链含 LLM,limit 别乱调大。
+    # 16:30 的位置有讲究:product_chain(13:00~15:00)之后 —— 当天翻案成
+    # rejected 的,明天 13:00 的 problem_scan 按 audit_listing_conflicts
+    # 建删除建议,不与今天的链抢在途。
+    job("audit_stale", ["product_audit"], batch=3, hour=16, minute=30,
+        runner="gpt",
+        params=["product_audit:mode=stale", "product_audit:limit=2000"],
+        note="判据提版后的存量消化:approved×旧版本 → 全链重审;"
+             "候选清零后每轮空转,无需人工停"),
 
     # ── 批三·上架域(所有者定稿 2026-08-17 排进调度)────────────────────
     # 当天的次序是硬的:product_chain(13:00,problem_scan 产黑名单)

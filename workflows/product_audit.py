@@ -216,7 +216,7 @@ _CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
 # pass=现役 pass 重过 L0;online=**在架** pass 重过 L0(链上那条);
 # nonpass=非 pass 全量重判
-_MODES = {"backfill", "pending", "pass", "online", "nonpass"}
+_MODES = {"backfill", "pending", "pass", "online", "nonpass", "stale"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -346,6 +346,24 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         return ("p.audit_status IS DISTINCT FROM 'approved'"
                 " AND p.audit_version IS DISTINCT FROM %(nonpass_ver)s",
                 {"nonpass_ver": resources.AUDIT_RULES_VERSION})
+    if mode == "stale":
+        # **版本重审**(所有者定稿 2026-08-24):判据更新(AUDIT_RULES_VERSION
+        # 提版)后,approved 的存量按新版本**全链**重审;rejected 沿用不重审
+        # (reject 粘性,与双跑校准同口径)。这是 force_rerun=<版本> 砍掉贵的
+        # 那半:那条 approved+rejected 全量,为几千条可能翻案的 pass 烧掉全库
+        # rejected 的 LLM 钱(rerule 的注释记着这个痛)。
+        #
+        # 解决的问题是「判据更新了,产品审核结论滞后」:此前 approved 只有
+        # slow_hash 变了才回炉,判据变了内容没变的永远不重审 —— 1183 个
+        # 历史导入 approved 挂在"沃尔玛已下架"清单上就是这么来的
+        # (audited_at 成批相同、audit_runs 无记录,L2/L3 从没碰过)。
+        #
+        # 天然分页:真跑判过盖当前版本号,自动退出候选;dry-run 不写版本
+        # ⇒ 候选恒定,可重复抽样验证。历史导入行版本旧/空,
+        # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
+        return ("p.audit_status = 'approved'"
+                " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
+                {"stale_ver": resources.AUDIT_RULES_VERSION})
     if mode == "pass":
         # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
@@ -1049,6 +1067,11 @@ def run(params: dict) -> str:
         # online 那条还挂在 product_chain 上天天跑,更不能让它打 LLM
         raise ValueError("mode=pass / mode=online 只与 stages=L0 连用"
                          "(加 -p stages=L0;全链重审请用 force_rerun)")
+    if str(params.get("mode", "")).strip() == "stale" and only_l0:
+        # 方向与上面相反:版本重审必须全链 —— L0 未命中不落结论不盖版本,
+        # 候选永不退出,每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)
+        raise ValueError("mode=stale 不与 stages=L0 连用:版本重审必须全链,"
+                         "否则未命中的行不盖版本号,候选集永不收敛")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
@@ -1115,6 +1138,13 @@ def run(params: dict) -> str:
                       "且未按当前规则版本判过的",
                 where, extra, limit,
                 "一个都没有:这批已经全部按当前版本判过了") + sheet_head
+        elif mode_ == "stale":
+            sheet_head = _batch_head(
+                conn, f"版本重审:approved 且未按当前规则版本"
+                      f"({resources.AUDIT_RULES_VERSION})判过的"
+                      f"(rejected 沿用不重审)",
+                where, extra, limit,
+                "一个都没有:approved 存量已全部按当前版本判过") + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
         cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)

@@ -1651,3 +1651,30 @@ def test_run_submits_futures_per_chunk_not_all_at_once():
     # 候选取数不许再回到 fetchall
     assert "_iter_candidates(" in src
     assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"
+
+
+# ── mode=stale:版本重审(所有者定稿 2026-08-24)────────────────────────────
+
+def test_mode_stale_reaudits_approved_only_and_needs_full_chain():
+    """判据提版后 approved 存量按新版本全链重审;rejected 沿用不重审。
+
+    与 force_rerun=<版本> 的区别就是砍掉贵的那半:那条 approved+rejected
+    全量,为几千条可能翻案的 pass 烧掉全库 rejected 的 LLM 钱。
+    版本谓词是天然分页:真跑判过盖当前版本号,自动退出候选。
+    """
+    from registry import resources
+
+    w, e = product_audit._pick_where({"mode": "stale"})
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w
+    assert e["stale_ver"] == resources.AUDIT_RULES_VERSION
+    assert "rejected" not in w      # rejected 沿用,不进候选
+
+
+def test_mode_stale_refuses_l0_only(monkeypatch):
+    """stale 不与 stages=L0 连用:L0 未命中不落结论不盖版本 → 候选永不收敛,
+    每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="stale"):
+        product_audit.run({"mode": "stale", "stages": "L0"})

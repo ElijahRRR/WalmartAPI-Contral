@@ -634,7 +634,10 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-21.1"
+# 2026-08-24 提版:R10 Made in USA 硬规则上线(漏判反哺第一条)。提版即触发
+# mode=stale 版本重审:approved 存量(含历史导入的 1183 个"沃尔玛已下架仍
+# approved")按新判据全链重过,rejected 沿用。
+AUDIT_RULES_VERSION = "c.2026-08-24.1"
 # c.2026-08-21.1  **R3 收敛成单一判据**(所有者定稿):判类目要不要认证,从此
 #                 **只看飞书类目表的「必需认证」列**。同日下线两条链:
 #                 ① L2 R3 读 `audit.walmart_pt_spec` 的两条分支(硬 has_real_cert /

@@ -23,6 +23,7 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 | `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → sources_backfill → product_refresh → product_audit → maintenance_scan → problem_scan → maintenance → problem_product_cleanup |
 | `blacklist` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | risk_sync → blacklist_push |
 | `product_clear` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | product_clear |
+| `audit_stale` | 每天 16:30 | `30 16 * * *` | `30 8 * * *` | product_audit |
 | `audit_sheet` | 每天 18:10 | `10 18 * * *` | `10 10 * * *` | product_audit |
 | `list_new` | 每天 20:00 | `0 20 * * *` | `0 12 * * *` | list_new |
 | `settlement` | 每周三 08:00 | `0 8 * * 3` | `0 0 * * 3` | settlement_sync |

@@ -1,10 +1,10 @@
-# 交办:一次性注册这 9 条沃尔玛定时任务
+# 交办:一次性注册这 10 条沃尔玛定时任务
 
 > **本文件是生成的,不要手改**(出处 `registry/schedule.py`,改完跑 `python cli.py skill_export`)。把下面整篇给要注册的那个智能体。
 
 ---
 
-请把下面 9 条定时任务一次性注册好。这几条是沃尔玛业务链的每日/每周调度,注册完之后由你到点触发。
+请把下面 10 条定时任务一次性注册好。这几条是沃尔玛业务链的每日/每周调度,注册完之后由你到点触发。
 
 ## 第 0 步之前:先确认你能写仓库**外面**那个目录
 
@@ -39,6 +39,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 | `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | `skills/walmart-schedule/tasks/product_chain.md` |
 | `blacklist` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | `skills/walmart-schedule/tasks/blacklist.md` |
 | `product_clear` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | `skills/walmart-schedule/tasks/product_clear.md` |
+| `audit_stale` | 每天 16:30 | `30 16 * * *` | `30 8 * * *` | `skills/walmart-schedule/tasks/audit_stale.md` |
 | `audit_sheet` | 每天 18:10 | `10 18 * * *` | `10 10 * * *` | `skills/walmart-schedule/tasks/audit_sheet.md` |
 | `list_new` | 每天 20:00 | `0 20 * * *` | `0 12 * * *` | `skills/walmart-schedule/tasks/list_new.md` |
 | `settlement` | 每周三 08:00 | `0 8 * * 3` | `0 0 * * 3` | `skills/walmart-schedule/tasks/settlement.md` |
@@ -111,4 +112,4 @@ cd /Users/nextderboy/Projects/WalmartAPI-Contral && tail -n 30 "$(/Users/nextder
 任务名 | 存进去的 cron | 提示词第一行
 ```
 
-苏里会拿它和上面那张表逐行对。**条数必须正好 9 条** —— 多出来的是重复注册(会撞锁),少掉的是那条链从此每天不跑而没人知道。
+苏里会拿它和上面那张表逐行对。**条数必须正好 10 条** —— 多出来的是重复注册(会撞锁),少掉的是那条链从此每天不跑而没人知道。

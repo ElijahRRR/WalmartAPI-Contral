@@ -151,7 +151,10 @@ def test_batches_match_the_greyscale_plan():
     """分三批灰度是所有者定的节奏 —— 批号只有 1/2/3,且破坏性链都在批 3。"""
     assert {j["batch"] for j in schedule.JOBS} == {1, 2, 3}
     # 破坏性 = 会写沃尔玛/不可逆的那些(2026-08-17 加进审核与上架两条)
-    dangerous = {"product_chain", "product_clear", "audit_sheet", "list_new"}
+    # audit_stale 2026-08-24 加:全链真跑落审核结论,翻案成 rejected 会驱动
+    # 次日 problem_scan 的删除建议 —— 后果链与 audit_sheet 同级,归批 3
+    dangerous = {"product_chain", "product_clear", "audit_sheet", "list_new",
+                 "audit_stale"}
     for j in schedule.JOBS:
         if j["label"] in dangerous:
             assert j["batch"] == 3, j["label"]

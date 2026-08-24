@@ -11,7 +11,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
 
 - **72 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
-- **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
+- **13 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 10 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
 - **1880 个单元测试**。
 
@@ -436,11 +436,12 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | 任务 | 时间(台北) | 跑什么 |
 |---|---|---|
 | `backup` | 每天 02:00 | `backup` |
-| `daily_report` | 每天 06:40 | `daily_report` |
+| `daily_report` | 每天 06:40 | `catalog_sync` → `daily_report`(产品三列取今早现状,不再差一天) |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
-| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `maintenance_scan` → `maintenance` → `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `problem_scan` → `problem_product_cleanup` |
+| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
 | `blacklist` | 每天 15:00 | `risk_sync` → `blacklist_push` |
 | `product_clear` | 每天 15:00 | `product_clear` |
+| `audit_stale` | 每天 16:30 | `product_audit -p mode=stale`(判据提版后 approved 存量全链重审,rejected 沿用;每天 2000 条直到清完,版本没变时空转) |
 | `audit_sheet` | 每天 18:10 | `product_audit -p from_sheet=1` |
 | `list_new` | 每天 20:00 | `list_new` |
 | `settlement` | 每周三 08:00 | `settlement_sync` |

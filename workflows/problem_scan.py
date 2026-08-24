@@ -40,6 +40,7 @@
 """
 
 import logging
+import re
 
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
@@ -75,13 +76,21 @@ WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
 #    本条不再命中,直接重发,不等 48h(所有者原话:"有终态但又扫到了,
 #    说明提交成功、给了结果、事实上没操作成功,直接再次执行")。
 # ③ failed 不拦(该重试)。
+# 在途口径**不分 feed 类型是有意的**(2026-08-24 复核确认保留):上架 feed
+# 在途也算在途 —— 刚上架就 SYSTEM_PROBLEM 的商品常在 QARTH 合规复审
+# (最长 48h),复审期内追发 DELETE_ITEM 属于过早,复审通过它会自己恢复。
+# 但摘要必须分开报(处置在途 vs 上架/维护在途),否则"跳过 778"读不出
+# 里面有多少是等复审的新品(生产实遇 B018BDZQUQ 排查半天)。
+_DISPOSAL_FEEDS = ("DELETE_ITEM", "RETIRE_ITEM", "MP_MAINTENANCE")
 _SQL_INFLIGHT = """
-SELECT DISTINCT f.store, f.sku
+SELECT f.store, f.sku,
+       bool_or(f.feed_type = ANY(%(disposal)s::text[])) AS disposal
 FROM ops.feed_items f
 JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
 WHERE (f.status = 'submitted'
        AND f.submitted_at > now() - interval '48 hours')
    OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
+GROUP BY f.store, f.sku
 """
 # 事件名一律绑参传常量,不写字面量:读侧拼错 = 静默查空(计数恒 0,
 # "反补满 2 次转删"永不触发),和写侧拼错是同一类病,但更难发现。
@@ -144,8 +153,10 @@ def _load_state():
         cur.execute(_SQL_ITEMS)
         items = [dict(zip(("store", "sku", "gtin", "upc", "reasons"), r))
                  for r in cur.fetchall()]
-        cur.execute(_SQL_INFLIGHT)
-        inflight = set(cur.fetchall())
+        cur.execute(_SQL_INFLIGHT, {"disposal": list(_DISPOSAL_FEEDS)})
+        rows_if = cur.fetchall()
+        inflight = {(st, sk) for st, sk, _ in rows_if}
+        inflight_disposal = {(st, sk) for st, sk, d in rows_if if d}
         cur.execute(_SQL_ATTEMPTS, (product_events.MAINTENANCE_SUBMITTED,
                                     _ATTEMPT_SOURCES, pp.ATTEMPT_RESET_DAYS))
         attempts = {(s, k): n for s, k, n in cur.fetchall()}
@@ -157,10 +168,12 @@ def _load_state():
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
-    return items, inflight, attempts, last_cat, inactive, stubborn
+    return (items, inflight, inflight_disposal, attempts, last_cat,
+            inactive, stubborn)
 
 
-def plan(items, inflight, attempts, inactive, stubborn=frozenset()):
+def plan(items, inflight, attempts, inactive, stubborn=frozenset(),
+         inflight_disposal=frozenset()):
     """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
     计划形如 {店铺: {"relist": [item行], "delete": [item行], "retire": [...]}}
@@ -168,7 +181,7 @@ def plan(items, inflight, attempts, inactive, stubborn=frozenset()):
     ——行为一个字没改,只是换了个住处:决策归扫描件,执行件不再自己决策。
     """
     out: dict[str, dict] = {}
-    n = {"stage": 0, "inflight": 0, "inactive": 0,
+    n = {"stage": 0, "inflight": 0, "inflight_listing": 0, "inactive": 0,
          "relist": 0, "delete": 0, "fallback": 0, "stubborn": 0}
     for it in items:
         key = (it["store"], it["sku"])
@@ -179,7 +192,12 @@ def plan(items, inflight, attempts, inactive, stubborn=frozenset()):
             n["stage"] += 1
             continue
         if key in inflight:
-            n["inflight"] += 1
+            # 分开数:处置在途(我们的删/停/反补还没落定)vs 上架/维护在途
+            # (常见 = 新品在 QARTH 合规复审)。都跳过,但摘要必须分开报
+            if key in inflight_disposal:
+                n["inflight"] += 1
+            else:
+                n["inflight_listing"] += 1
             continue
         code, name = pp.categorize(it["reasons"])
         it["category"], it["cat_name"] = code, name
@@ -192,14 +210,19 @@ def plan(items, inflight, attempts, inactive, stubborn=frozenset()):
             bucket["delete"].append(it)
             n["stubborn"] += 1
             continue
-        if code == "A":
+        if code in ("A", "L"):
+            # L 类(系统错误)并入反补通道(所有者定稿 2026-08-24):沃尔玛的
+            # 原话是 "internal error … **Resubmit** the item",而旧规则把它
+            # 直接判删 —— 生产实测一轮 186 条,先给一次重摄取的机会。
+            # 反补计数/30 天窗/满 2 次转删/无 productId 转删,全部复用 A 类
+            # 既有机械,不另建一套(A=过期、L=系统错误只是入口不同)。
             if attempts.get(key, 0) >= pp.MAX_ATTEMPTS:
-                n["fallback"] += 1          # 反补满 2 次仍过期 → 转删除兜底
+                n["fallback"] += 1          # 反补满 2 次仍未恢复 → 转删除兜底
             elif pp.build_relist_item(it["sku"], it["gtin"], it["upc"]):
                 bucket["relist"].append(it)
                 n["relist"] += 1
                 continue
-            # A 类无 productId 同样落到删除(旧规则)
+            # 无 productId 同样落到删除(旧规则)
         bucket["delete"].append(it)
         n["delete"] += 1
     return out, n
@@ -281,7 +304,9 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
            f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}"
            f",反补满额转删 {n['fallback']}),"
            f"顽固停用 {by_act.get('retire', 0)};"
-           f"Stage 排除 {n['stage']},在途/待观测跳过 {n['inflight']},"
+           f"Stage 排除 {n['stage']},处置在途/待观测跳过 {n['inflight']},"
+           f"上架/维护在途跳过 {n['inflight_listing']}"
+           f"(多为新品合规复审,复审完自动进扫描),"
            f"非 ACTIVE 店跳过 {n['inactive']}"]
     per_store: dict[str, dict] = {}
     for r in allrows:
@@ -350,6 +375,75 @@ def _collect_blacklists(conn, items: list[dict]) -> str:
     return "黑名单收集:" + ",".join(bits)
 
 
+_K_CLUSTER_WARN = 20    # 同店「内部标记」超过这个数就该当店铺风险信号看
+
+
+def _k_cluster_note(items: list[dict]) -> str:
+    """输入:已归类 item → 输出:K 桶(内部标记)按店聚集的告警行(无则空串)。
+
+    「flagged by our internal team」沃尔玛不给理由,单条没有信息量;它的
+    价值在**聚集度**:同一家店几十条 = 店铺被盯上的风险信号(2026-08-24
+    漏判盘点实见:谭总11 一店 45 条)。ASIN 黑名单收集早就包含 K 类
+    (_collect_blacklists),这里只补"按店看"这一眼。
+    """
+    by_store: dict[str, int] = {}
+    for it in items:
+        if it.get("category") == "K":
+            by_store[it["store"]] = by_store.get(it["store"], 0) + 1
+    hot = {st: n for st, n in by_store.items() if n >= _K_CLUSTER_WARN}
+    if not hot:
+        return ""
+    return ("  ⚠ 「内部标记」按店聚集(≥%d 条,店铺风险信号,建议人工查该店):"
+            % _K_CLUSTER_WARN
+            + ",".join(f"{st}×{n}" for st, n in
+                        sorted(hot.items(), key=lambda kv: -kv[1])))
+
+
+# 政策名提取(2026-08-24,审核反哺):沃尔玛下架原因里带政策名的两种写法
+#   "||Children's Products Prohibited Products Policy@@@…"
+#   "Prohibited Product Policy: Hazardous Items" / "… Policy on Made in USA claims"
+_POLICY_NAME_PATTERNS = (
+    re.compile(r"\|\|\s*([^@|]{3,60}?)\s+prohibited products? policy", re.I),
+    re.compile(r"prohibited products? policy(?:\s*:\s*|\s+on\s+)([^.@|]{3,60})",
+               re.I),
+)
+_SQL_POLICY_NAMES = "SELECT category_en FROM audit.walmart_prohibited_policy"
+
+
+def _policy_gap_note(conn, items: list[dict]) -> str:
+    """输入:连接 + 当轮 item → 输出:政策表未收录的政策名告警行(无则空串)。
+
+    审核反哺的探针:沃尔玛点名了政策(如 Made in USA claims),而
+    `audit.walmart_prohibited_policy` 里没有对应行 ⇒ L3 的 S4 政策块看不见它,
+    语义匹配注定漏。政策表没有同步器(audit_import 一次性),缺口只能靠
+    这里天天报,人工 audit_import 补录。任何失败只告警不阻断(与黑名单收集
+    同款纪律)。
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_SQL_POLICY_NAMES)
+            known = {str(r[0]).strip().lower() for r in cur.fetchall()}
+    except Exception as e:                              # noqa: BLE001
+        logger.warning("政策表读不到,政策名缺口本轮不报:%s", e)
+        return ""
+    missing: dict[str, int] = {}
+    for it in items:
+        text = it.get("reasons") or ""
+        for pat in _POLICY_NAME_PATTERNS:
+            for m in pat.finditer(text):
+                name = " ".join(m.group(1).split()).strip(" *")
+                low = name.lower()
+                if not name or any(low in k or k in low for k in known):
+                    continue
+                missing[name] = missing.get(name, 0) + 1
+    if not missing:
+        return ""
+    top = sorted(missing.items(), key=lambda kv: -kv[1])[:8]
+    return ("  ⚠ 沃尔玛点名、政策表未收录的政策(L3 看不见它们,"
+            "用 audit_import 补录):"
+            + ",".join(f"{n}×{c}" for n, c in top))
+
+
 def _push_sheets() -> str:
     """输入:无 → 输出:飞书投影摘要一行。**必须在 `with db.pg_conn()` 之外调**。
 
@@ -415,11 +509,13 @@ def run(params: dict) -> str:
     preview = (str(params.get("preview", "")).strip() == "1"
                or bool(params.get("dry_run")))
     only = params.get("store")
-    items, inflight, attempts, last_cat, inactive, stubborn = _load_state()
+    (items, inflight, inflight_disposal, attempts, last_cat,
+     inactive, stubborn) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
 
-    plans, n = plan(items, inflight, attempts, inactive, stubborn)
+    plans, n = plan(items, inflight, attempts, inactive, stubborn,
+                    inflight_disposal)
     rows = to_dispositions(plans)
     lines: list[str] = []
 
@@ -450,6 +546,9 @@ def run(params: dict) -> str:
         # 那 22 个(那支 continue 前没有 n['delete'] += 1),照它报会少 22。
         head = _summarize(allrows, audit_rows, n, len(items))
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
+        for note in (_k_cluster_note(items), _policy_gap_note(conn, items)):
+            if note:
+                lines.append(note)
         if preview:
             lines.append(f"(preview:未落建议行;本轮将写 {len(allrows)} 条"
                          f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"

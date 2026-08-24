@@ -139,6 +139,48 @@ WHERE ops.dispositions.status = 'suggested'
 """
 
 
+# 观测判决登记:executing 行 × 提交之后落的核验事件。
+# gone 侧(delete_verified)= 生效;still 侧(delete_not_effective)= 没生效。
+# 反补(relist)的生效信号不同:商品重新 PUBLISHED —— 直接看 walmart_items
+# 现状,不看事件(反补没有对应的核验事件流)。
+_SETTLE_DELETE_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE WHEN e.event = 'delete_verified'
+                  THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object('settled_by', e.event)
+FROM (
+    SELECT DISTINCT ON (store, sku) store, sku, event, occurred_at
+    FROM catalog.product_events
+    WHERE event IN ('delete_verified', 'delete_not_effective')
+    ORDER BY store, sku, occurred_at DESC
+) e
+WHERE d.status = 'executing' AND d.action IN ('delete', 'retire')
+  AND d.store = e.store AND d.sku = e.sku
+  AND e.occurred_at > d.executed_at
+RETURNING d.status
+"""
+
+# 反补生效 = 该 SKU 已不在问题清单里(published_status 回到正常或已缺席);
+# 仍在问题清单 = 没生效。**必须等 catalog_sync 重新观测过**
+# (last_seen_at > executed_at),否则拿提交前的旧快照判,永远判成"没生效"。
+_SETTLE_RELIST_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE
+        WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
+             OR w.published_status NOT IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
+        THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object(
+        'settled_by', coalesce(w.published_status, 'absent'))
+FROM catalog.walmart_items w
+WHERE d.status = 'executing' AND d.action = 'relist'
+  AND w.store = d.store AND w.sku = d.sku
+  AND w.last_seen_at > d.executed_at
+RETURNING d.status
+"""
+
+
 def suggest_many(conn, rows: list[dict]) -> int:
     """输入:连接 + 建议行(store/sku/action 必填)→ 输出:写入行数。幂等。
 

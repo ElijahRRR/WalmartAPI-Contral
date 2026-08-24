@@ -221,3 +221,65 @@ def test_withdraw_only_removes_its_own_source_slot():
             "d.action)") in flat
     # 存量行(sources 还是 '{}')按标量 source 兜底,否则永远撤不掉且不报错
     assert "d.sources = '{}'::jsonb AND d.source = %(source)s::text" in flat
+
+
+def test_every_module_level_name_the_module_uses_is_actually_defined():
+    """⚠ lint 式护栏。**本轮改造自己踩过一次。**
+
+    重构时把 `_SETTLE_DELETE_SQL` / `_SETTLE_RELIST_SQL` 连着一段旧 SQL 一起
+    删掉了,而 `settle()` 还在引用它们 —— 全套用例照样绿,因为每个调用点都把
+    `settle` monkeypatch 掉了。真跑一次才会 NameError,而那是在生产上的
+    problem_product_cleanup 里,发生在"上一轮落定"这一步。
+
+    这条用例不测行为,只测**模块里用到的全局名都还在**(Python 直到执行到
+    那一行才解析全局名,所以少一个常量在导入期是完全静默的)。
+    """
+    import ast
+    import builtins
+
+    src = pathlib.Path("services/dispositions.py").read_text()
+    tree = ast.parse(src)
+    defined = set(dir(builtins)) | {"__name__", "__file__", "__doc__"}
+    for node in tree.body:                      # 模块级定义
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    defined.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                defined.add((a.asname or a.name).split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                defined.add(a.asname or a.name)
+
+    missing = set()
+    for fn in [n for n in tree.body
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        local = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+        if fn.args.vararg:
+            local.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            local.add(fn.args.kwarg.arg)
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                local.add(n.id)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                for a in n.names:
+                    local.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, ast.comprehension):
+                for t in ast.walk(n.target):
+                    if isinstance(t, ast.Name):
+                        local.add(t.id)
+            elif isinstance(n, ast.Lambda):
+                local |= {a.arg for a in n.args.args}
+                local |= {a.arg for a in n.args.kwonlyargs}
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                    and n.id not in local and n.id not in defined):
+                missing.add(f"{fn.name} 用到未定义的 {n.id}")
+    assert not missing, sorted(missing)

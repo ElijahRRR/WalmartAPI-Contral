@@ -44,7 +44,7 @@ import logging
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
-from services import product_events, store_limits
+from services import product_events
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
 

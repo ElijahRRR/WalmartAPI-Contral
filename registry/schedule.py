@@ -100,9 +100,16 @@ JOBS = (
         params=["lock_wait=900"],
         note="每小时 :50;全局增量泵:本地产品中心 ↔ 采集器数据库对齐"
              "(各链按批自取之外的全部增量走这条)"),
-    job("daily_report", ["daily_report"], batch=2, hour=6, minute=40,
-        runner="gpt",
-        note="KPI 窗口锚 06:30,必须 ≥06:35;⚠ 开它之前先停旧 KPI 调度"),
+    # catalog_sync 打头(所有者定稿 2026-08-24):日报的「在线商品/有库存/
+    # 无库存」三列直接读 catalog.walmart_items,而 catalog_sync 此前只在 13:00
+    # 的 product_chain 里跑 —— 06:40 的日报拿到的是昨天 13 点的快照,产品数
+    # 永远差一天。前置一次同步,统计的就是今早的在架现状。
+    # 链式而不是在 daily_report 里调:workflow 不互相调用(铁律 1),
+    # 且链的语义正好是要的 —— 同步失败就不出日报(拿旧数出报不如不出)。
+    job("daily_report", ["catalog_sync", "daily_report"],
+        batch=2, hour=6, minute=40, runner="gpt",
+        note="KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是"
+             "今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度"),
     job("order_daily", ["perf_problems", "order_asin_normalize"],
         batch=2, hour=7, minute=30, runner="gpt",
         params=["order_asin_normalize:apply=1"],

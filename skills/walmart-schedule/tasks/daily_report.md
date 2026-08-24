@@ -3,18 +3,21 @@
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py daily_report
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync daily_report
 ```
 
-这条链跑的是:daily_report。
+这条链跑的是:catalog_sync → daily_report。
 
 ## 这条链在做什么
 
 | 步 | 工作流 | 这一步干什么 |
 |---|---|---|
-| 1 | `daily_report` | 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。 |
+| 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
+| 2 | `daily_report` | 沃尔玛店铺日报(替代旧 沃尔玛店铺日报/ 三脚本流水线)。 |
 
-备注:KPI 窗口锚 06:30,必须 ≥06:35;⚠ 开它之前先停旧 KPI 调度
+**顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
+
+备注:KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度
 
 ## 跑完怎么判
 

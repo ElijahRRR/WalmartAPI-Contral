@@ -99,6 +99,21 @@ def yingdao_input_file() -> Path:
     return data_root() / "frontend_scrape" / "input.json"
 
 
+def yingdao_app() -> Path:
+    """输入:无 → 输出:影刀主程序可执行文件路径(spawn 直启用)。
+
+    env YINGDAO_APP 覆盖。为什么是主程序不是 `open <协议URL>`(2026-08-24
+    生产实证):调度沙箱里 `open` 要经 macOS Launch Services 分发协议,正好
+    被沙箱边界拦下退 1;旧 walmart-kpi-daily 一直是拿主程序绝对路径直启的,
+    旧日志证明这条路能正常拉起 Runner 窗口。协议 URL 作为 argv 传给主程序,
+    语义与 `open` 相同,只是不再绕 Launch Services。
+    """
+    override = os.environ.get("YINGDAO_APP", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path("/Applications/影刀.app/Contents/MacOS/影刀")
+
+
 def audit_seed_file(name: str) -> Path:
     """输入:审核规则种子文件名(如 'nrtl_small_parts.yaml')
     → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。

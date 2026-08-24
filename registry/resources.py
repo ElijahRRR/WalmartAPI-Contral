@@ -961,6 +961,14 @@ RETIRE_LIMITS = Bitable(
         #   分配侧拒收(宁可不分也不错分),上架/维护侧放行
         #   (不拿"未知"当"超限"去删/清零)。方向不同是因为动作不同。
         lead_limit="配送时长限制",
+        # 受管发货节点(所有者建列 2026-08-24,多仓改造)。填 Seller Center →
+        # Shipping Profile → Seller Fulfillment 里的 **FC ID**(即官方 shipNode,
+        # 17-18 位数字)。**留空 = 该店走 Virtual Node**,行为与改造前逐字节一致。
+        # 谁在读:上架(list_new 的 fulfillmentCenterID)、维护(库存读写的节点)。
+        # ⚠ 填错不回落:认不出的 FC ID 会让该店**整店跳过并告警**——静默回落
+        # Virtual Node 等于把新仓的货写到旧节点,比不动更坏(见
+        # docs/multi_node_plan.md §3)。
+        maint_node="维护仓库",
     ),
 )
 

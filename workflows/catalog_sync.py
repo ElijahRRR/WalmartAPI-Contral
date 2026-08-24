@@ -77,6 +77,11 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
     rows = walmart_catalog.merge_rows(name, summaries, inventory, run_at)
     with db.pg_conn() as conn:
         written = walmart_catalog.upsert_items(conn, rows)
+        # 分节点明细(多仓批次 1):合计仍在 walmart_items.avail_qty,这里落
+        # 每个节点各多少 —— 维护链的"受管仓现值"读它。与 upsert_items 同事务:
+        # 合计与明细必须是同一轮观测,分两个事务会出现"合计已更新、明细还是
+        # 上一轮"的窗口,而维护链正好在那个窗口里比对就会误判
+        walmart_catalog.upsert_node_inventory(conn, name, inventory, run_at)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
     backfilled = _backfill_item_ids(store) if backfill_ids else 0

@@ -12,7 +12,7 @@
 
 import logging
 
-from api import feishu
+from api import feishu, settings
 from registry import resources
 
 logger = logging.getLogger("services.store_limits")
@@ -128,3 +128,66 @@ def over_lead_cap(lead_days, cap: int) -> bool:
     这条与 list_new 原注释同款,搬过来集中一处,免得两个消费方各判各的。
     """
     return lead_days is not None and int(lead_days) > int(cap)
+
+
+def maint_nodes() -> dict[str, str]:
+    """输入:无 → 输出:{店铺: 受管发货节点 FC ID};**未填的店不在字典里**。
+
+    多仓改造的唯一配置入口(所有者定稿 2026-08-24)。与「配送限制」同款治理:
+    人在飞书填、程序直读、没填就是现状(Virtual Node)。
+
+    ⚠ **这里只读不校验**。"填的这个 FC ID 认不认识"要调沃尔玛
+    (`api.settings.list_ship_nodes`),而本模块在 services 层、只碰飞书 ——
+    校验归 `resolve_node()`,它才是各链的入口。分开的理由是读表要一次拿全店
+    (一个飞书请求),校验却是逐店调沃尔玛。
+    """
+    t = resources.RETIRE_LIMITS
+    f = t.fields
+    try:
+        recs = feishu.list_records(t, field_names=[f.store, f.maint_node])
+    except LookupError:
+        return {}
+    out: dict[str, str] = {}
+    for rec in recs:
+        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        node = feishu._plain_text(rec["fields"].get(f.maint_node)).strip()
+        if name and node:
+            out[name] = node
+    if out:
+        logger.info("受管发货节点:%d 家店已配置「维护仓库」", len(out))
+    return out
+
+
+class NodeConfigError(RuntimeError):
+    """「维护仓库」填了但沃尔玛不认识 —— 该店整店跳过的信号(fail-closed)。"""
+
+
+def resolve_node(store: dict, nodes: dict[str, str]) -> str | None:
+    """输入:店铺 + maint_nodes() 的字典 → 输出:受管节点 FC ID;未配置返回 None。
+
+    **各链取受管仓的唯一入口**(上架/维护/清零都走它,别各写一遍)。
+
+    校验是 fail-closed 的:填了值就必须在 `GET shipnodes` 的列表里找得到,
+    找不到 **抛 NodeConfigError**,由调用方整店跳过并告警。
+    ⚠ 为什么不"认不出就回落 Virtual Node":那等于把本该进新仓的货写到旧节点,
+    而且全程不报错 —— 比"这店今天没动"坏得多。填错一个字符的代价必须是
+    响亮失败,不是静默走偏。
+
+    ⚠ **查不到节点列表(接口失败)也算认不出**:同理,宁可这店今天不动。
+    未配置的店根本不调沃尔玛(现状零成本、零行为变化)。
+    """
+    node = (nodes or {}).get(store["name"])
+    if not node:
+        return None
+    try:
+        known = settings.list_ship_nodes(store)
+    except Exception as e:                          # noqa: BLE001
+        raise NodeConfigError(
+            f"{store['name']}:「维护仓库」填了 {node},但发货节点列表读不到"
+            f"({e})—— 本轮整店跳过,不回落 Virtual Node") from e
+    if node not in known:
+        raise NodeConfigError(
+            f"{store['name']}:「维护仓库」填的 {node} 不在该店发货节点列表里"
+            f"(认识的:{sorted(known) or '(空)'})—— 本轮整店跳过。"
+            f"FC ID 见 Seller Center → Shipping Profile → Seller Fulfillment")
+    return node

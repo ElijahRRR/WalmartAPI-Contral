@@ -1237,3 +1237,58 @@ def test_short_title_row_survives_delete_and_retitle(monkeypatch):
     assert [i["new"] for i in invs if i["sku"] == "B0SHORT"] == [7]  # ③ 照常跟库存
     prices = mi.price_intents(_Conn(rows=[]), _MULTS, [])
     assert [p["sku"] for p in prices] == ["B0SHORT"]                 # ③ 照常改价
+
+
+# ── 多仓:受管发货节点的配置与校验(批次 1)──────────────────────────────────
+
+def _store(name="T1"):
+    return {"name": name, "client_id": "cid", "client_secret": "sec",
+            "proxy": None}
+
+
+def test_resolve_node_returns_none_when_unconfigured(monkeypatch):
+    """没填「维护仓库」= 现状(Virtual Node):**根本不调沃尔玛**,零成本零变化。"""
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: (_ for _ in ()).throw(
+                            AssertionError("未配置的店不该调 shipnodes")))
+    assert store_limits.resolve_node(_store(), {}) is None
+    assert store_limits.resolve_node(_store(), {"别的店": "123"}) is None
+
+
+def test_resolve_node_accepts_a_known_fc_id(monkeypatch):
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: {"91539778610008065": {"nodeType": "PHYSICAL"}})
+    assert store_limits.resolve_node(
+        _store(), {"T1": "91539778610008065"}) == "91539778610008065"
+
+
+def test_resolve_node_fails_closed_on_unknown_id(monkeypatch):
+    """⚠ 填错不回落 Virtual Node —— 那等于把新仓的货写到旧节点,而且不报错。
+
+    宁可这店今天不动:抛 NodeConfigError,调用方整店跳过并告警。
+    """
+    import pytest
+
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: {"111": {}})
+    with pytest.raises(store_limits.NodeConfigError) as e:
+        store_limits.resolve_node(_store(), {"T1": "999"})
+    assert "999" in str(e.value) and "整店跳过" in str(e.value)
+
+
+def test_resolve_node_fails_closed_when_node_list_unreadable(monkeypatch):
+    """接口失败也算"认不出":同理宁可不动,不许因为查不到就放行。"""
+    import pytest
+
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
+                        lambda s: (_ for _ in ()).throw(RuntimeError("HTTP 500")))
+    with pytest.raises(store_limits.NodeConfigError):
+        store_limits.resolve_node(_store(), {"T1": "999"})

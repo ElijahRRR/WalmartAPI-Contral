@@ -524,3 +524,32 @@ def test_upsert_preserves_node_count_when_absent():
     sql = walmart_catalog._UPSERT_SQL
     assert "node_count = COALESCE(EXCLUDED.node_count," in sql
     assert "catalog.walmart_items.node_count)" in sql
+
+
+# ── 批次 1:配置 + 分节点落库 ────────────────────────────────────────────────
+
+def test_node_inventory_upsert_keeps_rows_not_seen_this_round():
+    """本轮没扫到的节点行**不删**:沃尔玛分页漏 SKU 是常态,删了下轮又建,
+    中间那一轮维护链会读成"该节点没货"而把库存重推一遍。过期与否看 seen_at。
+    """
+    sql = walmart_catalog._NODE_UPSERT_SQL
+    assert "ON CONFLICT (store, sku, ship_node) DO UPDATE" in sql
+    assert "DELETE" not in sql.upper()
+
+
+def test_node_inventory_payload_flattens_every_node():
+    seen = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, rows): seen.extend(rows)
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    n = walmart_catalog.upsert_node_inventory(
+        _Conn(), "T1", {"A": {"N1": 3, "N2": 2}, "B": {"": 7}}, "2026-08-24")
+    assert n == 3
+    assert {(r["sku"], r["ship_node"], r["avail_qty"]) for r in seen} == {
+        ("A", "N1", 3), ("A", "N2", 2), ("B", "", 7)}

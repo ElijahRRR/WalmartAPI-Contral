@@ -75,6 +75,34 @@ def merge_rows(store_name: str, item_summaries: list[dict],
     return rows
 
 
+_NODE_UPSERT_SQL = """
+INSERT INTO catalog.item_node_inventory (store, sku, ship_node, avail_qty, seen_at)
+VALUES (%(store)s, %(sku)s, %(ship_node)s, %(avail_qty)s, %(seen_at)s)
+ON CONFLICT (store, sku, ship_node) DO UPDATE SET
+    avail_qty = EXCLUDED.avail_qty, seen_at = EXCLUDED.seen_at
+"""
+
+
+def upsert_node_inventory(conn, store_name: str,
+                          inventory: dict[str, dict[str, int]], seen_at) -> int:
+    """输入:连接 + 店铺 + {sku:{节点:数量}} + 本轮时间 → 输出:写入行数。
+
+    `walmart_items.avail_qty`(合计)的明细面,给维护链的"受管仓现值"用。
+    ⚠ **本轮没扫到的行不删**(见 refdata/schema.sql 的表头注释):沃尔玛分页
+    漏 SKU 是常态,删了下轮又建,中间那轮维护链会读成"该节点没货"而重推库存。
+    过期与否由 `seen_at` 说了算,不由"在不在表里"说了算。
+    """
+    payload = [{"store": store_name, "sku": sku, "ship_node": node,
+                "avail_qty": qty, "seen_at": seen_at}
+               for sku, nodes in inventory.items()
+               for node, qty in nodes.items()]
+    if not payload:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(_NODE_UPSERT_SQL, payload)
+    return len(payload)
+
+
 def upsert_items(conn, rows: list[dict]) -> int:
     """输入:连接 + merge_rows 产出的行 → 输出:写入行数(upsert,重复执行幂等)。
 

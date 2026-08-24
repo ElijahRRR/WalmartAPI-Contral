@@ -536,6 +536,26 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 );
 ```
 
+### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
+
+两条链共用一张表:`maintenance_scan`/`problem_scan` 写建议,
+`maintenance`/`problem_product_cleanup` 领取执行。DDL 与状态机注释在
+`refdata/schema.sql`,交界处的五条纪律在 `services/dispositions.py` 头注,
+全案在 `docs/production_cutover.md` §六·三。这里只记**读这张表时最容易读错的
+三列**(2026-08-24 路由器改造后):
+
+| 列 | 答的问题 | ⚠ |
+|---|---|---|
+| `source` | 谁**首先**建议的(maint/scan/audit/tro) | **不是执行者**。拿它反推谁干的,就会读出 08-19 那条「维护链执行 + 审核链原因」的记录 |
+| `action` | **该谁干**:delete/retire/relist → `problem_product_cleanup`;title/price/inventory → `maintenance` | 执行件按它领取(`claim(actions=…)`),与 source 无关 |
+| `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
+| `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
+
+未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:
+`problem_scan` 对顽固件同时建议 retire 与 delete(双 feed 齐发),合成一条会让
+其中一个的落定结果覆盖另一个。「破坏类存在即压制同 SKU 的维护类」不靠索引,
+靠 `claim()`(索引管不了跨行的条件,而且压制必须与两个扫描件谁先跑无关)。
+
 ## audit — 审核域(2026-08-13 批次 A,迁自 walmart-audit-system)
 
 审核系统迁入的落库形态(全案见 `docs/audit_migration_plan.md`)。结论权威在

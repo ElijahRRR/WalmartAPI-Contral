@@ -6,8 +6,10 @@
 ⚠ 代码里一律 `_col(名)` / `_idx(名)` 取位置,**任何地方都不许写死字母或下标** ——
   加那两列时漏改一处的表现是整表错位且不报错(prune 就漏了,读「新值」当日期)。
 
-流水账语义:**只追加不改行**,`maintenance` 提交时一次写全 11 列,程序是唯一
-写入方。feed 路径 H=真 feedid、J=处理中;PUT 同步路径 H="sync"、J 当场落定。
+流水账语义:**只追加不改行**,执行件提交时一次写全 11 列(`build_row` 是
+唯一造行处),程序是唯一写入方。写入方两个:`maintenance`(标题/价格/库存)与
+`problem_product_cleanup`(删除/顽固停用/反补,2026-08-24 起 —— 删除归口到它
+之后,不写表的话所有者的这张面板就再也看不见删除流水了)。feed 路径 H=真 feedid、J=处理中;PUT 同步路径 H="sync"、J 当场落定。
 feed 路径的结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 回填 J/K。
 四类动作(标题/价格/库存/删除)共用本表,不另建表(所有者问 2026-08-09
 「删除以后跑 feed 会填写到维护记录里吗」)。
@@ -122,6 +124,59 @@ def _find_next_empty(start: int) -> int:
                 return row + i
         row = end + 1
     return row      # 网格已满,append_records 会先扩行
+
+
+def build_row(store: str, sku: str, suggestion: str, reason: str, action: str,
+              feed_id, op_date: str, result: str, err="",
+              old="", new="") -> tuple:
+    """输入:一条流水的各字段 → 输出:维护记录表的一行(按 registry 列序)。
+
+    **全项目唯一造行处**(2026-08-24 从 workflows/maintenance 提上来,因为
+    problem_product_cleanup 的删除流水也要进这张表)。散在各执行件里手拼元组的
+    话,加一列时漏改一处就整行错位**且不报错** —— 2026-08-16 加「建议」「原因」
+    两列时已经踩过一次(prune 漏了,把「新值」当日期读)。
+
+    「建议」是扫描件定的,「动作」是本执行件真做了什么 —— 两者分歧才是这两列
+    的价值:建议删除但动作为空 = 领到了没执行,结果列写明为什么。
+    """
+    vals = {"store": store, "sku": sku, "suggestion": suggestion,
+            "reason": reason or "", "action": action,
+            "old_value": old, "new_value": new, "feed_id": feed_id,
+            "op_date": op_date, "result": result,
+            "error": err if err is not None else ""}
+    return tuple(vals[c] for c in resources.MAINT_SHEET.columns)
+
+
+def publish(rows: list[tuple], lines: list[str], *, prune_after=True) -> None:
+    """输入:记录行 + 摘要行列表 → **就地** append 摘要。写表失败绝不抛。
+
+    ⚠ **写表失败绝不能把"feed 已提交"埋进异常里**(所有者 2026-08-09 实遇:
+    提交成功但表格一行没写,事后只能靠 ops.cursors 的时间戳反推)。台账在 PG,
+    补写靠 `maintenance -p resync_sheet=1`。
+
+    两个执行件共用(2026-08-24):maintenance 写维护三类,
+    problem_product_cleanup 写删除/停用/反补 —— 各写各的话,"写表失败要吞掉"
+    这条纪律迟早只剩一处。
+    """
+    if not rows:
+        return
+    try:
+        written = append_records(rows)
+        lines.append(f"维护记录追加 {written} 行;feed 结果轮询走 feed_poll")
+        if prune_after:
+            # 一天几千行,不裁飞书很快装不下(所有者定稿 2026-08-09:只留 7 天)。
+            # 裁的只是展示面板,流水永久在 ops.feed_items
+            try:
+                lines.append(prune())
+            except Exception as e:          # 裁剪失败不影响本轮结果
+                logger.warning("维护记录裁剪失败(不影响提交): %s", e)
+    except LookupError as e:
+        lines.append(f"⚠ 维护记录表未登记,流水未写表(台账已在 PG):{e}")
+    except Exception as e:
+        logger.exception("维护记录写表失败(feed 已提交,台账在 PG): %s", e)
+        lines.append(f"⚠ 维护记录写表失败:{e}"
+                     f"(feed 已提交,{len(rows)} 行流水只在 PG;"
+                     f"补写:python cli.py maintenance -p resync_sheet=1)")
 
 
 def append_records(rows: list[tuple]) -> int:

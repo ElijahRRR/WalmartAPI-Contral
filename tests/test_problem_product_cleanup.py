@@ -23,20 +23,24 @@ def _row(store, sku, action="delete", rid=None, category="B", **detail):
 def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     """把 DB 侧全部换成假的:claim 给定建议行,settle 给定落定数,转态记账。"""
     from registry import db as _db
-    seen = {"events": [], "marked": [], "settled": settled or
+    seen = {"events": [], "marked": [], "marked_by": set(), "sheet": [],
+            "settled": settled or
             {"confirmed": 0, "ineffective": 0}}
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([None])))
     monkeypatch.setattr(ppc.dispositions, "claim",
-                        lambda conn, sources=None: list(rows))
+                        lambda conn, actions=None: list(rows))
     monkeypatch.setattr(ppc.dispositions, "settle",
                         lambda conn: seen["settled"])
     monkeypatch.setattr(ppc.dispositions, "mark_executing",
-                        lambda conn, ids, feed_id: (
+                        lambda conn, ids, feed_id, by="": (
                             seen["marked"].append((tuple(ids), feed_id)),
-                            len(ids))[1])
+                            seen["marked_by"].add(by), len(ids))[2])
     monkeypatch.setattr(ppc.product_events, "record_many",
                         lambda conn, rs: (seen["events"].extend(rs), len(rs))[1])
+    monkeypatch.setattr(ppc, "_retire_caps", lambda: {})
+    monkeypatch.setattr(ppc.maint_sheet, "append_records",
+                        lambda rows: (seen["sheet"].extend(rows), len(rows))[1])
     monkeypatch.setattr(ppc.stores_svc, "load_stores",
                         lambda names=None: [{"name": s} for s in stores])
     return seen
@@ -212,3 +216,134 @@ def test_cleanup_makes_no_decisions():
     src = inspect.getsource(ppc)
     assert "categorize" not in src and "is_stage_pending" not in src
     assert "walmart_items" not in src        # 不自己查问题商品清单
+
+
+# ── 破坏动作的唯一出口(所有者定稿 2026-08-24)────────────────────────────
+
+def test_maint_sourced_delete_is_executed_here(monkeypatch):
+    """维护链建议的删除也归本工作流执行 —— 按**动作**领取,不按来源。
+
+    此前 maintenance 也能发 DELETE_ITEM:两个出口意味着配额、在途防重、
+    病历口径各有一套,同一个 SKU 被两条链先后删两次是生产实证过的。
+    """
+    row = _row("T1", "B0A", action="delete")
+    row["source"] = "maint"                 # 维护链建的,审核链没参与
+    seen = _wire(monkeypatch, [row])
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": [
+                            {"feed_id": "F1", "count": len(entries),
+                             "outcome": "submitted"}])
+    out = ppc.run({"execute": True})
+    assert "删除提交 1" in out
+    assert seen["marked"] == [((row["id"],), "F1")]
+    # 转态必须落执行者:合并之后"最终是谁干的"不能靠 source 反推
+    assert seen["marked_by"] == {"problem_product_cleanup"}
+
+
+def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
+    """单店「下架限制」只在这里截一次,削掉多少必须见人。
+
+    此前两条扫描件各按同一张限额表截一次 ⇒ 每店实际可删 2N。截断静默的话,
+    摘要读起来就是"今天就这么多",而其实还压着一批。
+    """
+    rows = [_row("T1", f"S{i}", action="delete", rid=i) for i in range(5)]
+    seen = _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 2})
+    sent = []
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": (
+                            sent.append(list(entries)),
+                            [{"feed_id": "F1", "count": len(entries),
+                              "outcome": "submitted"}])[1])
+    out = ppc.run({"execute": True})
+    assert sent == [["S0", "S1"]]           # 定序取件:留下的不是随机一批
+    assert "⚠ 超单店「下架限制」留到下轮:T1×3" in out
+    assert "没有丢弃" in out
+    assert seen["marked"] == [((0, 1), "F1")]
+
+
+def test_cap_does_not_touch_relist(monkeypatch):
+    """反补不烧下架配额:它是救活方向,不该被删除的刹车管住。"""
+    rows = ([_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
+            + [_row("T1", f"R{i}", action="relist", rid=10 + i, gtin="G",
+                    upc="U") for i in range(3)])
+    _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 1})
+    monkeypatch.setattr(ppc.pp, "build_relist_item",
+                        lambda sku, gtin, upc: {"sku": sku})
+    sent = []
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": (
+                            sent.append((ft, len(entries))),
+                            [{"feed_id": "F1", "count": len(entries),
+                              "outcome": "submitted"}])[1])
+    out = ppc.run({"execute": True})
+    assert ("MP_MAINTENANCE", 3) in sent and ("DELETE_ITEM", 1) in sent
+    assert "T1×2" in out
+
+
+# ── 维护记录表(2026-08-24:删除归口到本工作流之后必须接上)──────────────
+
+def _cell(name):
+    from registry import resources
+    return resources.MAINT_SHEET.columns.index(name)
+
+
+def test_delete_flow_lands_in_the_maintenance_sheet(monkeypatch):
+    """删除流水必须进维护记录表 —— 那是所有者每天看的面板。
+
+    删除此前由 maintenance 执行并写表。归口到本工作流之后不接上写表,面板上
+    就再也看不见删除了,而且**完全静默**:两边都不报错,只是那张表少了一类。
+    """
+    rows = [_row("T1", "S1", action="delete", rid=1),
+            _row("T1", "S2", action="delete", rid=2)]
+    seen = _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": [
+                            {"feed_id": "F1", "count": 1, "outcome": "submitted"},
+                            {"feed_id": "OLD", "count": 1, "outcome": "dedup"}])
+    out = ppc.run({"execute": True})
+    assert "维护记录追加 2 行" in out
+    got = seen["sheet"]
+    assert [r[_cell("sku")] for r in got] == ["S1", "S2"]
+    # 「建议」恒是扫描件定的;「动作」是真做了什么 —— 在途防重写「跳过」,
+    # 写成"删除"会让表格看起来做了两次删除
+    assert [r[_cell("suggestion")] for r in got] == ["删除", "删除"]
+    assert [r[_cell("action")] for r in got] == ["删除", "跳过"]
+    assert [r[_cell("result")] for r in got] == ["处理中", "在途防重"]
+    assert [r[_cell("feed_id")] for r in got] == ["F1", "OLD"]
+    # 旧值/新值是维护三类用的,破坏动作没有值的变化
+    assert all(r[_cell("old_value")] == "" and r[_cell("new_value")] == ""
+               for r in got)
+
+
+def test_unexecuted_rows_still_get_a_sheet_line(monkeypatch):
+    """领到了却没执行的也要写表(与 maintenance 同一纪律)。
+
+    不写的话它在飞书完全不可见,看起来像"扫描件没建议它",而它其实每天都在
+    建议、每天都没做成。
+    """
+    seen = _wire(monkeypatch, [_row("T1", "S1", action="delete")],
+                 stores=())            # 凭证缺失
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("凭证缺失不该提交")))
+    ppc.run({"execute": True})
+    assert [(r[_cell("sku")], r[_cell("action")], r[_cell("result")])
+            for r in seen["sheet"]] == [("S1", "", "未执行(凭证缺失)")]
+
+
+def test_dry_run_writes_no_sheet_rows(monkeypatch):
+    """dry-run 一行都不许写:写表也是写操作,而且会推进水位。"""
+    seen = _wire(monkeypatch, [_row("T1", "S1")])
+    monkeypatch.setattr(ppc.feeds, "submit_feed", lambda *a, **k: [])
+    ppc.run({"execute": False})
+    assert seen["sheet"] == []
+
+
+def test_only_maintenance_prunes_the_shared_sheet():
+    """裁剪只由一处做:同一张表两处裁会各按各的水位重复读全段。"""
+    import inspect
+    assert "prune_after=False" in inspect.getsource(ppc.run)
+    from workflows import maintenance as mw
+    assert "prune_after" not in inspect.getsource(mw._write_sheet)

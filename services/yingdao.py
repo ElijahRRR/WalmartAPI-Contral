@@ -9,8 +9,11 @@
 连库,它在任何时刻都能读到任意一天的数据,而 cli.py 的 flock 管不到它。
 
 旧系统实证规则全部照搬(docs/legacy_survey.md #daily_report):
-- spawn 用 shadowbot:Run?robot-uuid=<uuid> 协议 URL 非阻塞启动(macOS `open`);
-  应用必须已在「我获取的应用」跑过一次(首次有授权弹窗),路径 /Applications/影刀.app
+- spawn 用 shadowbot:Run?robot-uuid=<uuid> 协议 URL 非阻塞启动,**拿影刀主
+  程序绝对路径直启**(registry.paths.yingdao_app(),env YINGDAO_APP 覆盖)。
+  ⚠ 不走 `open <协议URL>`:调度沙箱里 open 要经 Launch Services 分发,被沙箱
+  边界拦下退 1(2026-08-24 生产实证);旧 walmart-kpi-daily 直启主程序是
+  日志验证过的路。应用必须已在「我获取的应用」跑过一次(首次有授权弹窗)
 - 新鲜度校验:latest.json 的 scraped_at 必须晚于本次触发时刻,旧数据继续等
   (这同时是防重:影刀已在跑时绝不能再 spawn,两次互抢会让校验反复失败到超时)
 - 超时 600s / 轮询 15s(env YINGDAO_TIMEOUT_SEC / YINGDAO_POLL_INTERVAL 可调);
@@ -114,17 +117,28 @@ def write_input(rows: list[dict]) -> dict[str, int]:
 
 
 def spawn() -> bool:
-    """输入:无 → 输出:是否成功发出启动指令(非阻塞,不代表 RPA 跑完)。"""
+    """输入:无 → 输出:是否成功发出启动指令(非阻塞,不代表 RPA 跑完)。
+
+    直启主程序、协议 URL 作 argv,与旧 walmart-kpi-daily 同款(旧日志实证
+    能拉起 Runner 窗口)。**不做 `open` 兜底**:两条启动路只会让"哪条路
+    在跑"变成猜谜,沙箱里 open 恒失败,兜它等于每天多一次注定失败的调用。
+    Popen 不 wait:影刀是独立应用,跑完与否由 wait_fresh() 按 latest.json
+    的新鲜度判,不看进程退出码。
+    """
     uuid = _robot_uuid()
     if not uuid:
         logger.warning("YINGDAO_ROBOT_UUID 未配置,跳过影刀启动")
         return False
+    app = paths.yingdao_app()
+    if not app.exists():
+        logger.warning("影刀主程序不存在:%s(装在别处就设 env YINGDAO_APP)", app)
+        return False
     try:
-        subprocess.run(["open", f"shadowbot:Run?robot-uuid={uuid}"],
-                       check=True, timeout=15, capture_output=True)
+        subprocess.Popen([str(app), f"shadowbot:Run?robot-uuid={uuid}"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception as e:
-        logger.warning("影刀启动失败(需 macOS + /Applications/影刀.app): %s", e)
+        logger.warning("影刀启动失败: %s", e)
         return False
 
 

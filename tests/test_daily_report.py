@@ -272,3 +272,43 @@ def test_cli_default_is_execute_not_dry_run():
     assert b.dry_run is True
     c = cli._parse_args(["problem_product_cleanup", "--execute"])
     assert c.dry_run is False and c.execute is True      # 兼容别名不报错
+
+
+# ── 影刀 spawn:直启主程序,不走 open(2026-08-24 生产实证)──────────────────
+
+def test_yingdao_spawn_launches_the_app_binary_not_open(monkeypatch, tmp_path):
+    """⚠ 调度沙箱里 `open <协议URL>` 要经 Launch Services 分发,被沙箱边界
+    拦下退 1 —— 表现是影刀每天不跑而日报报成功(wait_fresh 超时降级用旧数据)。
+    旧 walmart-kpi-daily 直启主程序是日志验证过的路,这里钉三件事:
+    直启不走 open / 协议 URL 原样作 argv / Popen 非阻塞(不 wait 不 check)。
+    """
+    from services import yingdao
+
+    app = tmp_path / "影刀"
+    app.write_text("")
+    monkeypatch.setenv("YINGDAO_APP", str(app))
+    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "abc-123")
+    calls = []
+    monkeypatch.setattr(yingdao.subprocess, "Popen",
+                        lambda argv, **kw: calls.append(argv))
+    assert yingdao.spawn() is True
+    assert calls == [[str(app), "shadowbot:Run?robot-uuid=abc-123"]]
+    assert "open" not in calls[0]
+
+
+def test_yingdao_spawn_fails_closed_without_binary_or_uuid(monkeypatch, tmp_path):
+    """主程序不存在 / UUID 未配置 → 返回 False 且**不发起任何进程**。
+    没有 `open` 兜底:沙箱里 open 恒失败,兜它 = 每天多一次注定失败的调用,
+    而且"哪条路在跑"从此变成猜谜。
+    """
+    from services import yingdao
+
+    calls = []
+    monkeypatch.setattr(yingdao.subprocess, "Popen",
+                        lambda argv, **kw: calls.append(argv))
+    monkeypatch.setenv("YINGDAO_APP", str(tmp_path / "不存在"))
+    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "abc-123")
+    assert yingdao.spawn() is False
+    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "")
+    assert yingdao.spawn() is False
+    assert calls == []

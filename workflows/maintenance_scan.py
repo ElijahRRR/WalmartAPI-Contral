@@ -36,7 +36,8 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 import logging
 
 from registry import db
-from services import dispositions, maintenance_intents as mi, store_limits
+from services import alloc_survey, dispositions, \
+    maintenance_intents as mi, store_limits
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
 
@@ -44,6 +45,45 @@ logger = logging.getLogger("workflows.maintenance_scan")
 
 _KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与执行件的连接键)
 _KIND_ORDER = ("delete", "title", "price", "inventory")
+
+
+def _channel_lines(zeroing: list[dict]) -> list[str]:
+    """输入:清零意图 → 输出:渠道不符那一档的**逐店**明细(不符就返空)。
+
+    为什么单独给它一行,而不是让它混在「清零合计」的原因码里:**补救动作是
+    逐店的**。其余四档(缺货/不可售/无 BuyBox/货期)的处置对象是商品,看总数
+    就够;渠道不符的处置对象是**这家店** —— 要么改它的「配送限制」,要么承认
+    这批货该换店。只报一个总数,人拿到手第一句话必然是"哪几家店",而这份
+    preview 是真提交之前唯一看得见破坏面的地方(与删除名单同一条理由)。
+
+    ⚠ **规划外店(谭总系)标出来的理由变了**(所有者定稿 2026-08-25:
+    「维护链对规划外店不豁免」)。分配链与审计链在判渠道**之前**就剔掉了这些店
+    (`alloc_survey.claimable` 先 is_excluded 再 offends_channel),维护链与上架链
+    则对所有店一视同仁 —— 这个差别**是有意的,不是待修的分歧**:规划外排除的是
+    「归属」(不给它们分货、不占品牌、不拦别人上架),不是「这家店能不能卖这个
+    渠道的货」,后者是店铺自己的经营配置,填了就该生效。
+
+    所以旗标现在只为一件事服务:**这些行不会出现在 `alloc_audit` 的渠道不符
+    下架清单里**。两份报告对不上是预期的 —— 不标的话,迟早有人拿两个数来问
+    "是不是漏了",而那时没人记得起这是定稿。
+    """
+    bad = [z for z in zeroing if z.get("code") == "channel_mismatch"]
+    if not bad:
+        return []
+    by: dict[str, int] = {}
+    for z in bad:
+        by[z["store"]] = by.get(z["store"], 0) + 1
+    n_out = sum(n for s, n in by.items() if alloc_survey.is_excluded(s))
+    cells = ",".join(f"{s}×{n}" + ("⚑" if alloc_survey.is_excluded(s) else "")
+                     for s, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0])))
+    out = [f"  ⚠ 其中渠道不符清零 {len(bad)} 行(本店渠道 ≠ 产品渠道):{cells}"]
+    if n_out:
+        out.append(f"    ⚑ = 规划外店,共 {n_out} 行 —— 所有者定稿 2026-08-25:"
+                   f"**维护链对规划外店不豁免**,照清零、照走「渠道不符 N 天」"
+                   f"下架。标出来只为一件事:这些行**不会**出现在 alloc_audit "
+                   f"的渠道不符下架清单里(那条链判渠道前就剔了规划外店),"
+                   f"两份报告对不上是预期的,不是漏了")
+    return out
 
 
 def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
@@ -88,9 +128,10 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
         codes: dict[str, int] = {}
         for z in zeroing:
             codes[z.get("code") or "-"] = codes.get(z.get("code") or "-", 0) + 1
-        # 四条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
+        # 五条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
         lines.append(f"  清零合计 {len(zeroing)} 条,原因:"
                      + ",".join(f"{c}×{n}" for c, n in sorted(codes.items())))
+        lines += _channel_lines(zeroing)
     by_store: dict[str, dict[str, int]] = {}
     for it in intents:
         by_store.setdefault(it["store"], {})[it["kind"]] = \

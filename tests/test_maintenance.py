@@ -530,6 +530,35 @@ def _scan_wire(monkeypatch, intents, sz=("T1",)):
     return ms, calls
 
 
+def test_scan_breaks_channel_clears_down_by_store():
+    """1600 行清零只报一个总数没用:渠道不符的**补救动作是逐店的**。
+
+    规划外店(谭总系)带旗标,但**照判不豁免**(所有者定稿 2026-08-25)。旗标的
+    用途是提醒:这些行永远不会进 `alloc_audit` 的渠道不符下架清单(那条链在判
+    渠道之前就剔了规划外店),两份报告对不上是预期的,不是漏报。
+    """
+    zeroing = ([{"store": "A085朱丽霖", "sku": f"B0A{i}", "kind": "inventory",
+                 "new": 0, "code": "channel_mismatch"} for i in range(3)]
+               + [{"store": "谭总6", "sku": f"B0T{i}", "kind": "inventory",
+                   "new": 0, "code": "channel_mismatch"} for i in range(9)]
+               + [{"store": "A085朱丽霖", "sku": "B0OOS", "kind": "inventory",
+                   "new": 0, "code": "out_of_stock"}])
+    from workflows import maintenance_scan as ms
+    got = "\n".join(ms._channel_lines(zeroing))
+    # 按条数降序,规划外店带旗标;缺货那条不算进来(它的处置对象是商品不是店)
+    assert "渠道不符清零 12 行" in got
+    assert "谭总6×9⚑" in got and "A085朱丽霖×3" in got
+    assert "A085朱丽霖×3⚑" not in got          # 在册店不许被标成规划外
+    assert "规划外店,共 9 行" in got
+    # 旗标记的是**定稿**(所有者 2026-08-25),不是待办 —— 不许退回"要对齐
+    # 就把这一闸也对规划外店豁免"那种悬案文案:悬案会被人当成"这里还没做完"
+    assert "不豁免" in got
+    assert "要对齐" not in got
+    # 一行渠道不符都没有时不占版面(排版规范规矩 2:只报真的发生了的)
+    assert ms._channel_lines([z for z in zeroing
+                              if z["code"] != "channel_mismatch"]) == []
+
+
 def test_scan_lists_delete_names_separately(monkeypatch):
     """删除不可逆:名单必须看得见,且与其余三类分开说(拆分后归扫描件)。"""
     intents = ([{"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",

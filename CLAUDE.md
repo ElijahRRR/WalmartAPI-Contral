@@ -78,7 +78,7 @@ api/            按外部系统与沃尔玛 API 域分文件:_client, items, pri
                 orders, returns, feeds, reports, insights, feishu, scraper
 services/       跨 workflow 复用的积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
-refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv 等
+refdata/        小型只读参考资料(进 git):walmart_rate_limits.tsv / ebay_rate_limits.tsv 等
 skills/         **生成物**(进 git):智能体定时任务的技能包,由 `cli.py skill_export`
                 从 registry/schedule.JOBS 渲染 —— 不要手改,改调度表再重新生成
 docs/           plan.md / production_cutover.md(**走进生产的定稿与待办,起调度这一役先读它**) /
@@ -86,6 +86,8 @@ docs/           plan.md / production_cutover.md(**走进生产的定稿与待办
                 db_schema.md / feishu_tables.md / legacy_reference.md /
                 legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md /
                 api_blueprint.md(端点定稿) / audit_migration_plan.md(审核链) /
+                ebay_plan.md(**eBay 平台扩展:同仓决策定稿+待拍板判据+批次计划**) /
+                ebay_api_blueprint.md(eBay 端点/配额/认证定稿,写 eBay 调用代码前必读) /
                 category_mapping.md(**类目映射链九条工作流的唯一文档**) /
                 multi_node_plan.md(**一店多仓改造的调研定稿与批次计划**)
 ```

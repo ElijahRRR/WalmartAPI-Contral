@@ -6,7 +6,7 @@
 > 不受此限。
 > 范围:**本仓内**新增 eBay 平台的全套业务工作流,与沃尔玛链共享产品库、采集摄取链、运行纪律(cli.py / registry / 锁 / 台账 /
 > 通知)。来源:仓库侧三份证据级底稿(库影响 / services 积木清点 / 工程契约,2026-08-25,行号可回溯到 `refdata/schema.sql` 与各
-> `.py`)。端点/配额/认证/提交通道形态见 `docs/ebay_api_blueprint.md`(**2026-08-25 定稿,八节,46 组 63 端点**),本文引用它
+> `.py`)。端点/配额/认证/提交通道形态见 `docs/ebay_api_blueprint.md`(**2026-08-25 定稿,八节,44 组 62 端点**),本文引用它
 > 一律写「蓝图 §N」**不重抄**;⚠ 蓝图 §8.3 的未核验项(**2026-08-25 校验轮后为 18 条,其中 5 条已关闭 ✅、1 条降级 🟢**)是本计划
 > **全部批次的共同前置**,动手前**按状态列**逐条过,未关闭的必须补核,不许按推断编码。
 > 前置事实:全仓 `grep -rni "ebay|易贝"` 只命中 `services/audit_stopwords.py:60` 一个停用词
@@ -121,9 +121,20 @@ docstring 第一行写成 `"""ebay_xxx — 一句话说清干什么(危险性)�
 `(store, sku, action)`(`schema.sql:1148-1149`)、`ops.feed_log (feed_type, store, payload_key)`、`catalog.claims(store)`、
 `orders.order_lines(store)` 上,而**全仓没有任何地方强制它**。店名与账号名都来自飞书自由文本(`registry/resources.py:983-997`
 `STORE_CREDENTIALS.fields.store = "店铺"`)。⇒ **定稿:eBay 账号统一命名规则(如统一前缀 `EB-`),并在
-`services/ebay_accounts._normalize` 里校验 —— `stores.enabled_names() ∩ ebay 账号名集合` 非空即抛**(多行 `RuntimeError`,点名撞名的
+`services/ebay_accounts._normalize` 里校验 —— `stores.registered_names() ∩ ebay 账号名集合` 非空即抛**(多行 `RuntimeError`,点名撞名的
 那几个)。代价一条断言;不做的代价是**永久烧号且两侧都不报错**(沃尔玛一次 RETIRE 把 eBay 在用的 UPC 标成 `conflict`,而 conflict
 是永久弃用,`upc_pool.py:16/:189-195`)。**写进批次 1 的单测与 §3.4。**
+
+🔴 **这一处必须是 `registered_names()`(在不在册),不是 `enabled_names()`(在不在营)—— 全文四处断言统一按此写**:
+被守的那五处(`catalog.upc_pool` / `ops.dispositions` / `ops.feed_log` / `catalog.claims` / `orders.order_lines`)
+**全部按 `store` 字符串圈定,与启用位无关**;`services/stores.py:70-74` 的 docstring 逐字点名过这个坑
+——「勾了停用的店照样占着品牌、照样用冻结行拦着别的店上架」,即**一家已停用的沃尔玛店名不在 `enabled_names()` 里,
+却照样在这五张表里留着行**。拿 `enabled_names()` 断言,撞上这种停用店名会**当场放行**,而危害原样存在
+(eBay 复用它在用的 UPC / 沃尔玛一次 RETIRE 把 eBay 在用的号烧成 `conflict` / 唯一索引照撞),
+**而且两个方向仍旧都不报错**。三层分工见 CLAUDE.md 2026-08-22 定稿:`registered_names()` 答在不在**册**(连停用的都算)、
+`enabled_names()` 答在不在**营**、`load_accounts()` 答现在能不能**调 API** —— 本条守的是**表级同源假设**,
+只认最宽的那一层(在册)。⚠ 别把它与 §2.3 上面那条「`enabled_names()` 只判在册 ∧ 启用位」搞混:那条答的是"这账号还做不做",
+本条答的是"这个名字有没有被沃尔玛侧占用过"。
 
 | 项 | 沃尔玛现状 | eBay 差异落点 |
 |---|---|---|
@@ -144,10 +155,14 @@ docstring 第一行写成 `"""ebay_xxx — 一句话说清干什么(危险性)�
 写进 `_client` 函数面)。⚠ **`ops.ebay_tokens` 主键里的 `env` 取值必须与 `EBAY_ENV` 同源**(同一个 registry 常量集,不许在代码里另写
 `"sandbox"` 字面量);⚠ 两 host 的等价性已降级为「文档级已证」(蓝图 §8.3 #8,两份 OAS3 都把两 host 登记为 Production server)⇒
 上线前 sandbox 抽验即可,不再是阻塞项;③ **scope 字符串常量集**(蓝图 §4.3;⚠ **`api_scope/commerce.taxonomy` 这个 scope 不存在**,
-写了就是错的);④ `EBAY_BULK_MAX = 25`(蓝图 §3.2 原文"必须登记进 registry,不许散落");⑤ **GTIN 站点专属替代文本表**(US
-`Does not apply` 等 8 行,蓝图 §5.3 —— 🔴 代码里严禁写 `"Does not apply"` 英文字面量,一上多站点就会在 DE/FR 静默造出不合规
-listing);⑥ **错误码常量**(蓝图 §6.10:REST `429/2001/ACCESS/REQUEST`、Fulfillment 34200/34300/34903/34905、Trading
-518/21919144);⑦ **env 变量名(定名表,见下)**(A 类没有就抛 / B 类回落 None,真值只在 `<DATA_ROOT>/.env`);⑧ 飞书表条目 + 同步
+写了就是错的);④ `EBAY_BULK_MAX = 25`(蓝图 §3.2 原文"必须登记进 registry,不许散落");⑤ **GTIN 站点专属替代文本表:进
+registry 的是 21 行全表**(蓝图 §5.3 定稿 —— 官方 `product-identifier-text.html` 逐行列的是 21 个站点,**以官方页为准**;
+蓝图正文只举例、不是清单);⚠ **Hong Kong 那条是中文串,本轮未逐字取到,建表时必须从官方页抄,不许自译**;🔴 代码里严禁写
+`"Does not apply"` 英文字面量 —— 照残表建 registry,上 UK/AU/IE/SG 会命中 KeyError 或静默回落成 US 值,上 DE/FR 更会静默造出
+不合规 listing;⑥ **错误码常量**(蓝图 §6.10:REST `429/2001/ACCESS/REQUEST`;**Inventory/上架 `190204`**(外链取图失败或非
+HTTPS,批次 4b 验收 #6 要用);Fulfillment 34200/34300/34903/34905 + **`30830`**(`getOrders` 时间区间超 2 年,批次 6 关键点
+要用);Trading `518`(⚠ 待复现)/21919144;**LMS `160025`**(⚠ 待复现;本项目不做 LMS,登记备查,任何设计不得依赖它));
+⑦ **env 变量名(定名表,见下)**(A 类没有就抛 / B 类回落 None,真值只在 `<DATA_ROOT>/.env`);⑧ 飞书表条目 + 同步
 `docs/feishu_tables.md`;⑨ 新路径以**函数**暴露。
 
 **⑦ 的定名表(2026-08-25 定稿,原稿一个名字都没给 = 批次 1 当场卡住的那类洞)**。凭证形状按蓝图 §4.4:一个 eBay App =
@@ -208,7 +223,7 @@ DROP COLUMN。⚠ **坏处也在这里**:eBay 写入方忘传 platform 就**静�
 |---|---|---|
 | `products`/`snapshots`/`latest_snapshot` | **纯读,零改动** | ⚠ `audit_status`/`audit_reason`/`walmart_pt`/`pt_source`/`audit_version`/`audited_at` 六列是**沃尔玛口径**,一行装不下两个平台的判决 → 见判据 ⑤,并在 schema.sql 注释里把六列正式改称"沃尔玛审核结论"(纯注释改动,防下一个 AI 写错地方) |
 | `catalog.product_events` | 加 `platform` + **5 视图 DROP 重建 + 读 SQL 补谓词(⚠ 清单见 §五 批次 2a,**按表分栏**;原稿那句"12 处"把 `listing_sources` 的消费方混了进来,且漏了 `workflows/cleanup_history_import.py:63` 的 `_WIPE_SQL`(`DELETE FROM catalog.product_events WHERE source = %s`,另 `:11` 链路注释)与 `services/dispositions.py:152-154` 的 `_SETTLE_DELETE_SQL` —— **动手前照 2a 那句"现场重数一遍"执行**)** | 🔴 最高危。`_VERIFY_SQL` 的 `LEFT JOIN walmart_items` 对 eBay 行必然 `w.sku IS NULL` ⇒ 判 `gone` ⇒ **凭空落 `delete_verified`**,绕过"不信回执信观测";视图 `product_risk` 按 `coalesce(asin,sku)` 全局聚合,eBay 的 missing 会并进同一 ASIN 的 `unexplained_missing`(`list_new` 正消费它报警) |
-| `catalog.listing_sources` | 加 `platform`(**标注列,不进 PK** —— 依据见右)+ **五处代码消费 SQL 带谓词 + 一处 schema 存量回填显式补 `'walmart'`** | `source_type`(amz/match/self/1688)答"产品出身",**与销售平台正交**。⚠ **校验轮点出的自相矛盾已裁定**:该表 `PRIMARY KEY (store, sku)`(`schema.sql:213-221`),`register()` 是 `ON CONFLICT (store, sku) DO NOTHING`(`services/listing_sources.py:36-42`,首次登记优先不覆盖)⇒ platform 不进 PK 时,**同名 (账号, sku) 的 eBay 行会被静默丢弃并继承沃尔玛行的 `source_type`**,而 `source_type` 正是"自动破坏动作路由铁律"的判据(头注 `:9-12`)—— 这恰恰就是在靠账号名不重名侥幸。**二选一取后者:保持标注列 + 显式互斥校验**,依据是 §2.3 已把"账号名与店名互斥"**从假设升成硬约束**(命名规则 + `_normalize` 断言 + 批次 1 单测),该约束同时保护 `upc_pool`/`dispositions`/`feed_log`/`claims`/`order_lines` 五处同源假设 —— 把 platform 塞进这一张表的 PK 只堵一个洞、还要改 `ON CONFLICT` 推断子句与 `schema.sql:225-231` 的回填 INSERT,**性价比反而低**。⚠ 回填那条(`FROM catalog.walmart_items … ON CONFLICT (store, sku) DO NOTHING`)**每次 `db_init` 都跑**,必须显式补 `'walmart'`。消费方清单:`services/maintenance_intents.py` 四处 JOIN(`:79/:122/:170/:489`)+ `workflows/sources_backfill.py:51` 的 `NOT EXISTS` + schema 回填那条 |
+| `catalog.listing_sources` | 加 `platform`(**标注列,不进 PK** —— 依据见右)+ **五处代码消费 SQL 带谓词 + 一处 schema 存量回填显式补 `'walmart'`** | `source_type`(amz/match/self/1688)答"产品出身",**与销售平台正交**。⚠ **校验轮点出的自相矛盾已裁定**:该表 `PRIMARY KEY (store, sku)`(`schema.sql:213-221`),`register()` 是 `ON CONFLICT (store, sku) DO NOTHING`(`services/listing_sources.py:36-42`,首次登记优先不覆盖)⇒ platform 不进 PK 时,**同名 (账号, sku) 的 eBay 行会被静默丢弃并继承沃尔玛行的 `source_type`**,而 `source_type` 正是"自动破坏动作路由铁律"的判据(头注 `:9-12`)—— 这恰恰就是在靠账号名不重名侥幸。**二选一取后者:保持标注列 + 显式互斥校验**,依据是 §2.3 已把"账号名与店名互斥"**从假设升成硬约束**(命名规则 + `_normalize` 里 `stores.registered_names() ∩ ebay 账号名 ≠ ∅ 即抛` + 批次 1 单测),该约束同时保护 `upc_pool`/`dispositions`/`feed_log`/`claims`/`order_lines` 五处同源假设 —— 把 platform 塞进这一张表的 PK 只堵一个洞、还要改 `ON CONFLICT` 推断子句与 `schema.sql:225-231` 的回填 INSERT,**性价比反而低**。🔴 **"一条断言守五处"能成立的前提是那条断言按「在册」判**:五处(含本表 `(store, sku)` 主键)全按 `store` 字符串圈定、与启用位无关,停用店名仍在表里留行 ⇒ 断言必须用 `registered_names()`;若写成 `enabled_names()`,撞上停用店名会放行,本格"不进 PK"的全部依据当场落空(§2.3)。⚠ 回填那条(`FROM catalog.walmart_items … ON CONFLICT (store, sku) DO NOTHING`)**每次 `db_init` 都跑**,必须显式补 `'walmart'`。消费方清单:`services/maintenance_intents.py` 四处 JOIN(`:79/:122/:170/:489`)+ `workflows/sources_backfill.py:51` 的 `NOT EXISTS` + schema 回填那条 |
 | `catalog.claims` / `ops.dispositions` | **同型改造**:加列 + 唯一索引换名替换 + `ON CONFLICT` 推断子句同批改(claims 详见 §3.3) | 🔴 claims 不改就**拦死 eBay**。⚠ dispositions 的动作在键里**不能去掉**(顽固件 retire+delete 双 feed 齐发);⚠ **压制判定(`claim()` 内)必须同时按平台圈定**,否则 eBay 一条 delete 会压制沃尔玛同 SKU 的维护建议。⚠ **eBay 侧要新增第四种 action**(蓝图 §8.4 #4):因**资格未获批**而被下架的商品官方明文**禁止 relist**,现有 retire/delete/relist 三值表达不了这一态;而 VeRO 只是新 `source`,**不新开执行出口**(08-24「只看 action 不看 source」定稿在 eBay 侧完整成立) |
 | `seller_blacklist`/`amazon_cat_blacklist` 纯读零改动;`asin_blacklist`/`brand_blacklist`/`brand_err_hits` | **eBay 只读做闸,不写渠道表** | 类别码 A~L 由**沃尔玛报错文本**解析而来,一行装不下两个平台的理由;eBay 下架原因先落 `product_events`,归拢另议 |
 | `ops.runs`/`cursors`/`dedupe`/`feishu_sync_state`/`scrape_batches`/`rate_events` | **共写,零 DDL 改动** | 键天然带命名空间(workflow 名 / `'ebay_order_sync:<账号>'` / scope 前缀)。⚠ 但 `rate_events` 的 **bucket 名必须带平台前缀**(如 `ebay.inventory.bulk_create`):两套客户端写同一张表,撞名即互扣配额 |
@@ -308,7 +323,9 @@ store 过滤 ⇒ 沃尔玛 RETIRE 烧号**天然不会误烧 eBay 的号**;⚠ �
 `ON store = t.s AND asin = t.a WHERE status IN ('claimed','used')`、`:194-200` 的 `burn_for_retire` 同样只按 `(store, asin)`,**两处都不看
 平台**;店名与账号名都是飞书自由文本。同名一旦发生**两个方向都不报错**:eBay 上架直接复用沃尔玛该 ASIN 的在用 UPC;沃尔玛一次 RETIRE 把
 eBay 正在用的号标成 `conflict`,而 **conflict 是永久弃用**(`upc_pool.py:16`、`:189-195`)。⇒ **该假设已在 §2.3 升级为硬约束**(eBay 账号
-统一命名规则 + `services/ebay_accounts._normalize` 里 `stores.enabled_names() ∩ ebay 账号名 ≠ ∅ 即抛` + 批次 1 单测)。**S2 依然是零 DDL
+统一命名规则 + `services/ebay_accounts._normalize` 里 `stores.registered_names() ∩ ebay 账号名 ≠ ∅ 即抛` + 批次 1 单测;
+⚠ **是 `registered_names()` 不是 `enabled_names()`** —— `upc_pool` 的两条 SQL 按 `store` 圈定不看启用位,
+停用店名照样在池子里留着领用行,理由见 §2.3)。**S2 依然是零 DDL
 零代码,但它的前提现在有人守了。** ⚠ 另补一条 S2 的代价:**`listing_sheet.heal_unknown` 的 `catalog.upc_pool` 写路径必须带平台条件**
 —— 它是那份反哺器名单里**唯一写 UPC 池**的那个(`workflows/feed_poll.py:60-63` 注释自陈"只写飞书与 UPC 池"),见 §五 批次 4a。
 **S1(语义正确,要拆表)**:新建 `catalog.upc_assignments (upc, platform, store, asin, sku, status, …, PK (upc, platform, store))`,
@@ -338,8 +355,11 @@ eBay 正在用的号标成 `conflict`,而 **conflict 是永久弃用**(`upc_pool
 ⇒ 订单行唯一键必须是 `(orderId, lineItemId)`,**不能是 `(orderId, sku)`**。而现表有一条**表级**约束 `UNIQUE (po_id, sku)`
 (`refdata/schema.sql:651`),`_upsert` 的 `ON CONFLICT` 却打在主键 `order_line_id` 上(`services/order_lines.py:456`)⇒ **同一 eBay
 订单里同 SKU 的两个 lineItem 会算出两个不同的 `order_line_id`、却撞同一条 `UNIQUE (po_id, sku)`;这个冲突不被 `ON CONFLICT` 接住,
-整个 `executemany` 事务中止,那一轮订单同步全炸。** 而"合并成一行"这条退路也不通:发货回传(蓝图 §1 #31)是**按 lineItemId 逐行给
-数量**的,合并后拿不回 lineItemId ⇒ **标发货必失败**。**推荐**:eBay 行的身份哈希第二段喂 **lineItemId** 而非 SKU(**两个显式函数,
+整个 `executemany` 事务中止,那一轮订单同步全炸。** 而"合并成一行"这条退路也不通:发货回传要**按 lineItemId 逐行给数量**,合并后拿不回 lineItemId
+⇒ **标发货必失败**。⚠ **这句的出处要说准**:蓝图 §1 #31 只写了"一包裹一次、发运后不可增删行 + 回读防重",
+`createShippingFulfillment` 的**入参形态属蓝图 §8.3 #15 的未核验项**(carrier + trackingNumber 是否"可选但必须成对"、
+`lineItems` 怎么给)⇒ **此处论据暂以保守假设成立,补核 #15 后确认**;两个方向代价不对称(假设错了只是多留两条索引,
+假设漏了则整轮订单同步炸),故仍按它排。**推荐**:eBay 行的身份哈希第二段喂 **lineItemId** 而非 SKU(**两个显式函数,
 platform 不给默认值**),并把表级 `UNIQUE (po_id, sku)` 换成**两条按平台的部分唯一索引**(walmart:`(po_id, sku) WHERE
 platform='walmart'`;ebay:`(po_id, line_number) WHERE platform='ebay'`),照抄 §3.6 范例 B 的 `DO $$` + information_schema 守卫
 —— **沃尔玛侧语义逐字不变,且不动哈希**。
@@ -398,12 +418,23 @@ orders.order_lines WHERE platform = 'ebay')` —— 语义是"**库里已有 eBa
 "需要"而实际不需要 ⇒ 多付代理钱、多一层故障点(代理挂 = 该账号整轮跳过)。**两个方向代价不对称,所以默认取严。** ⚠ 若最终判不需要,`_normalize`
 那条代理过滤必须**显式删掉并写明为什么**——留个永远为真的空判会让后来者以为这条防线还在。⚠ 同批要定**账号数量与并发常量**(见 §2.3 表末行)。
 
-**⑤ 审核链平台化?推荐:列为二期判据,一期先用人工/简化闸,不复用沃尔玛的 `audit_status`。** `products.audit_status` 单列装的是**沃尔玛政策结论**
-(37 条 Prohibited Products Policy + PT 准入 + 中国搬运卖家可做性),eBay 违禁规则是另一套(VeRO、Restricted Items、类目 required aspects)。一期
-直接复用沃尔玛结论(保守方向)⇒ 只上"沃尔玛已通过"的品,漏放风险低,但**品类被沃尔玛政策白白砍掉一大截**,而 eBay 能卖的很多品沃尔玛本来就不让卖;
-一期把 eBay 判决写进 `audit_status` ⇒ 一个 ASIN 一行**装不下两个判决**,后写覆盖先写,`audit_listing_conflicts` 的 `rejected_after_listing` 判错,
-且**账混了就分不开**——审核结论不是账本,没有 platform 列可以事后补,**不许"先混着跑跑看"**。二期落法:eBay 判决落 `audit` schema 新表(如
-`audit.ebay_verdicts`),`products` 六列**只归沃尔玛**并在 schema.sql 注释里钉死。
+**⑤ 审核链平台化?推荐:方向 A —— 一期直接复用沃尔玛的 `products.audit_status` 当保守闸;平台化列二期。** `products.audit_status` 单列装的是
+**沃尔玛政策结论**(37 条 Prohibited Products Policy + PT 准入 + 中国搬运卖家可做性),eBay 违禁规则是另一套(VeRO、Restricted Items、
+类目 required aspects)—— 两套判决迟早要分家,判的只是**一期用哪个闸**。
+- **方向 A(推荐值):一期 `ebay_list_new` 直接读沃尔玛的 `audit_status`,只上"沃尔玛已通过"的品。**
+  **代价**:品类被沃尔玛政策**白白砍掉一截** —— eBay 能卖的很多品沃尔玛本来就不让卖,这部分一期一条都上不了。
+  **好处**:**零新审核工程**(不用建闸、不用人工名单),且方向是 fail-safe(漏放风险低,错的方向是"少上"不是"上错");
+  与**已接线的两处一致** —— 批次 4b 的入料是 `product_pool` 选品 + 四闸(隐含吃沃尔玛审核结论)、批次 10 把
+  `ebay_list_new` 排在 20:30(`audit_sheet` 18:10 → `list_new` 20:00 之后),两处都建在这个方向上。
+- **方向 B:一期另立人工/简化闸,`ebay_list_new` 不读 `audit_status`。**
+  **代价**:要**新建一道闸**(人工名单或简化规则),有人维护、有人填,且一期就多一份人工负担;闸没建好之前上架链没有准入判据。
+  **好处**:**品类面不受沃尔玛政策连坐** —— 沃尔玛不让卖但 eBay 允许的品一期就能上。
+  ⚠ 选它必须连带改两处已接线的地方:批次 4b 的入料判据、批次 10 的 20:30 排期理由(那个时刻的全部依据就是"吃同一天的审核结论")。
+
+🔴 **两个方向共同的明禁:一期都不许把 eBay 判决写进 `products.audit_status`。** 一个 ASIN 一行**装不下两个判决**,后写覆盖先写,
+`audit_listing_conflicts` 的 `rejected_after_listing` 判错,且**账混了就分不开** —— 审核结论不是账本,没有 platform 列可以事后补,
+**不许"先混着跑跑看"**。二期落法(与推荐值无关,两个方向都走它):eBay 判决落 `audit` schema 新表(如 `audit.ebay_verdicts`),
+`products` 六列**只归沃尔玛**并在 schema.sql 注释里钉死。
 
 **⑥ 🔴 无货源(从亚马逊下单直发买家)这条业务模式,做还是不做?没有推荐值,只有所有者书面拍板。**(**本条为蓝图定稿后补入**,依据
 蓝图头 blockquote —— 原稿四节写于蓝图之前,漏了它,而它是全链最硬的一条。)本项目「亚马逊采集 → eBay 上架 → 出单后从亚马逊下单
@@ -420,7 +451,9 @@ catalog 全量落 PostgreSQL ⇒ opt-out 不适用 ⇒ 只剩订阅这一条路*
 of your access to the Developer Tools, and/or reduced access to all or some APIs."(⚠ 原稿"是否强制、有无替代路径未核验"与"申请豁免"这条
 退路**都已作废,不要再按它排期**。)⇒ **剩下的判据只有"怎么建、谁维护"**:它需要一个**公网入站 HTTPS 端点**,而本项目是"脚本 +
 launchd + PostgreSQL",**没有任何常驻公网服务**,这是全项目唯一的入站面,**等于新增一类运行形态**,不该藏在一条判据里 ⇒ **已立
-§五 批次 11**(选型 + 每日订阅状态自检巡检 + 工时)。塞进业务链 ⇒ 业务链挂了合规订阅跟着 `MARKED_DOWN`,而**丢事件是静默的**;
+§五 批次 11**(选型 + 每日订阅状态自检巡检 + 工时)。塞进业务链 ⇒ 业务链挂了合规订阅跟着 `MARKED_DOWN`
+(⚠ **`MARKED_DOWN` 这个状态本轮未核验** —— `getDestinations` 方法页是 SPA,取不到枚举,蓝图 §8.1 ② 同款标注;
+结论不靠它,但**告警判据不许直接照它写死**),而**丢事件是静默的**;
 不建 ⇒ Growth Check 过不去,配额与账号数**上不去**,且面临上面那句"终止访问"。端点四条硬要求(https、路径不得含内网 IP/localhost、
 `challengeCode` hash 回 200、通知即时 200/201/202/204)与配额桶见蓝图 §2 末格。
 
@@ -434,7 +467,7 @@ launchd + PostgreSQL",**没有任何常驻公网服务**,这是全项目唯一�
 "catmap / 类目映射"命中 **0 次**。)判"一期手填"⇒ 上架品类被限死在手填的那几个类目里,但**表有人填、批次 4b 能跑**,且避开
 `getCategorySuggestions` 那条"**官方明示 sandbox 不支持、且 sandbox 是假成功返回样板 `categoryName`**"(蓝图 §1 #13)的坑 —— 链化后
 连冒烟都只能挪到生产试点;判"一期就链化"⇒ 至少 import/suggest/promote 三条工作流 **4~6 人日**,压在已经最长的关键路径上,且
-`suggest` 的结果**是建议不是判据**,仍要人工定稿,一期收益极低。**一期落法(写进 §七 #10 与批次 2b)**:`audit.ebay_category_map` 由
+`suggest` 的结果**是建议不是判据**,仍要人工定稿,一期收益极低。**一期落法(写进 §七 #11 与批次 2b)**:`audit.ebay_category_map` 由
 所有者**手填**,给出**填表规范**(每行 = `amazon_node_id` + `amazon_node_path`(取自 `audit.amazon_node_paths`,人读校对用)+
 `ebay_category_id` + `ebay_category_path` + `marketplace_id` + `confirmed_by` + `confirmed_at`;**一个 amazon node 只准一条生效行**)
 与 **registry 字段常量**(飞书投影那份的表头只准引常量,不许写字面量);`ebay_admission` 读不到映射的 ASIN **一律拦下并计数**
@@ -463,28 +496,37 @@ launchd + PostgreSQL",**没有任何常驻公网服务**,这是全项目唯一�
 | # | 批次 | 阻塞判据 | 人日 | 可与谁并行 |
 |---|---|---|---|---|
 | 0 | 判据拍板(无代码) | — | 0.5 | — |
-| 1 | registry 登记(含 `.env` 定名表 + `init_data_root`)+ `services/ebay_accounts` + `api/_http` 抽取 + `api/ebay/_client` + `ops.ebay_tokens` 建表与凭证三孔 | ④ | 6 | 2a |
+| 1 | registry 登记(含 `.env` 定名表 + `init_data_root`)+ `services/ebay_accounts` + `api/_http` 抽取 + `api/ebay/_client` + `ops.ebay_tokens` 建表与凭证三孔 | ④ | 6 | 2a / 2b |
 | 2a | 共享表加 `platform` + 谓词补全 + 视图重建(**库里仍只有 walmart 行**)+ **`audit_models` 全仓改名** | ①(claims/dispositions 那半) | 4.5 | 1 |
 | 2b | 新建 `catalog.ebay_items` / **`catalog.ebay_accounts`** / `audit.ebay_category_map` / `audit.ebay_aspects_cache` + 事件码登记 | ⑨(只挡映射表的填表规范那半) | 2.5 | 1 / 2a |
 | 3 | 户口链 + 类目链 + **账号巡检** + **`ebay_authorize` 兑换链与 runbook**(四条) | ④ | 5 | 2a |
-| 4a | 中立抽取(`listing_copy`/`pricing`/变体三件/`audit_models` 收尾)+ **台账平台化**(feed 三表加 `platform`、`feed_track` 按平台过滤、四个 `sync_from_ledger` + `heal_unknown` 同改) | — | 6 | 3(改的不是同一批文件) |
+| 4a | 中立抽取(`listing_copy`/`pricing`/变体三件)+ **台账平台化**(feed 三表加 `platform`、`feed_track` 按平台过滤、四个 `sync_from_ledger` + `heal_unknown` 同改) | — | 6 | 3(改的不是同一批文件) |
 | 4b | 最小上架闭环 `ebay_list_new` + `ebay_submit_poll` + `ebay_*` 六件 services | ①②③⑤⑨(⑥ 只挡真发) | 10 | — |
 | 5 | 回读 `ebay_catalog_sync` | — | 3 | 6 |
 | 6 | 订单链 `ebay_order_sync` + **`ebay_ship_confirm`** + **`ebay_order_audit`** | ⑧ | 7 | 5 |
-| 7 | 维护链 `ebay_maintenance` + **`ebay_problem_cleanup`** | ①⑤ | 5 | 8 |
+| 7 | 维护链 `ebay_maintenance` + **`ebay_problem_cleanup`** | ①②⑤ | 5 | 8 |
 | 8 | 售后 `ebay_returns_sync` + **`ebay_returns_action`** | — | 4 | 7 |
 | 9 | 结算 `ebay_settlement_sync` + **KPI 底座 `ebay_kpi`** | — | 5 | 7 / 8 |
 | 10 | 调度上线(`schedule.JOBS` + `test_launchd` 同批改 + `skill_export` 再生成 + **全部试点段验收** → 放量) | **⑥⑦ + 全部** | 3 | — |
 | 11 | **合规入站面**(`MARKETPLACE_ACCOUNT_DELETION` 最小 webhook + 每日订阅自检) | ⑦ | 3 | 任意(不碰本仓任何既有文件) |
 
-**关键路径(按依赖链算,不按批次号)**:`0 → 1 → 3 → 4a → 4b → 6 → 8 → 10` = **41.5 人日**(⚠ 原稿写的 `0→1→3→4→10` 只算了
-21.5 人日,**低估**:批次 10 的阻塞列自己写着"全部",而 8 依赖 6、7 依赖 4/5;批次 6 也不是真能与 4 并行 —— **它的开发段冒烟要
-sandbox 里先有在架 listing 才出得来单**)。次长的一支是 `0 → 1 → 3 → 4a → 4b → 5 → 7 → 10` = 38.5。**其余可并行**:2a/2b 与 1 并行;
-**批次 3 不再与 2b 并行**(见下条);9 与 7/8 并行;**批次 11 与任何批次并行,但必须在批次 10 之前完成**(它是 Growth Check 门槛)。
+**关键路径(按各批次自己声明的前置真算,不按批次号,也不把并行批次串起来加)**:
+`0 → 1 → 3 → 4b → 6 → 9 → 10` = **36.5 人日**(0.5 + 6 + 5 + 10 + 7 + 5 + 3)。**口径 = 各批次前置依赖的最长链**,三条算法说明:
+① **4a 不在链上** —— 它的前置只有批次 2a(见 4a 段首),总览表"可与谁并行"那格写的就是"3(改的不是同一批文件)"⇒
+2a(0.5+4.5=5.0 完工)→ 4a(11.0 完工)这一支比 `1 → 3`(11.5 完工)短,**4b 的开工时刻由批次 3 决定,不由 4a 决定**;
+② **批次 3 的前置是 1 + 2b**,而 2b 只 2.5 人日、与 1 并行 ⇒ 3 的开工时刻由批次 1 决定;
+③ **批次 6 之后取 9 不取 8** —— 9 的前置就是批次 6(见 9 段首"**前置**:批次 6")且 5 人日 > 批次 8 的 4 人日,
+两支都挂在 6 后面,最长的那支才是关键路径。⚠ **上一版那条把 4a 串进链里、又在 6 之后取批次 8 的算式,连同它的"次长支"一并删除**
+—— 把文档自己在总览表里声明可并行的两批相加、再在分支处取短的那支,**方向对但算法与自身依赖声明打架**;更早的一版则是漏了
+批次 10 阻塞列自己写的"全部"。**本节只留这一个口径,别再并列第二条路径。⚠ 后来的人要改批次工时或前置,必须回来重算这条链。**
+**总工时 64.5 人日不变**(总览表 14 行相加),关键路径变短只是因为并行度算对了,不是工作量变少了。
+**其余可并行**:2a/2b 与 1 并行;**批次 3 不再与 2b 并行**(见下条);4a 与 3 并行;9 与 7/8 并行;
+**批次 11 与任何批次并行,但必须在批次 10 之前完成**(它是 Growth Check 门槛)。
 🔴 **批次 3 的前置是「批次 1 + 批次 2b」,不是只有批次 1**(原稿漏):`ebay_taxonomy_sync` 要把整站 aspects **全量落库**进
 `audit.ebay_aspects_cache`、`services/ebay_aspects.py` 也读它,而这张表在 2b 建;户口链四件产物的落点表 `catalog.ebay_accounts`
 同样在 2b 建。总览表"可与谁并行"那格已把 2b 从批次 3 一行删掉。
-**对给定骨架的调整,逐条给理由**(依据修后蓝图 §2「工作流清单 9 → **13**」):批次 3 多一条 `ebay_account_health`、批次 6 多一条
+**对给定骨架的调整,逐条给理由**(依据修后蓝图 §2「工作流清单 9 → **13** 条业务链」;⚠ 蓝图 §2 矩阵另有**第 14 行
+`ebay_authorize`** —— 一次性人工触发、不进 `schedule.JOBS`,不计进这 13 条,见批次 3):批次 3 多一条 `ebay_account_health`、批次 6 多一条
 **`ebay_ship_confirm`**(蓝图 §2 新增的第 13 条)、批次 7 拆出 `ebay_problem_cleanup`、批次 8 拆出 `ebay_returns_action` ——
 理由分别写在各批次段首,**不是为了多写文件,是既有铁律与端点生产者缺口的落点**。
 
@@ -542,8 +584,10 @@ sandbox 里先有在架 listing 才出得来单**)。次长的一支是 `0 → 1
 1. **单测**:`ebay_accounts` 三层判据各一条(`enabled_names` **只判启用位、不兜快照** / `filter_names` 落空必抛且分「不在册 / 在册但
    被过滤」两种文案 / 快照写完 `chmod 600`);`is_enabled` 三种假值串 + **显式 `False` 也算停用** + 缺省视为启用;`load_accounts` 的
    **技术就绪判据 = 库里有未过期 `refresh_token`**(⚠ 不是判 client_id —— 应用级 client_id 全账号共用,拿它判永远为真;⚠ 也不是
-   读飞书 —— **这条是跨层读库的**,§2.3);🔴 **账号名互斥断言**:构造一个与 `stores.enabled_names()` 撞名的 eBay 账号 ⇒
+   读飞书 —— **这条是跨层读库的**,§2.3);🔴 **账号名互斥断言**:构造一个与 `stores.registered_names()` 撞名的 eBay 账号 ⇒
    `_normalize` **必须抛**(§2.3 的硬约束,守的是 `upc_pool`/`dispositions`/`feed_log`/`claims`/`order_lines` 五处同源假设);
+   ⚠ **同批补一条反向用例:与一个「在册但已停用」的沃尔玛店名撞名时也必须抛** —— 断言用的是 `registered_names()` 不是
+   `enabled_names()`,这条用例就是钉住这个差别的(停用店名仍在那五张表里留着行,§2.3);
    `_RATE_BUCKETS` 未登记键**拒绝而非放行**;`safe_post_ex` 默认 `max_retries=0`;**令牌刷新响应不含 `refresh_token` 时旧值不被洗成
    None**(这条直接钉蓝图 §4.2 #2 那个坑);**`_is_persistent` 对 86400s 大桶返回 False、对小桶返回 True**(钉住新判据)。
 2. **sandbox 冒烟(本批的硬验收)**:`api.sandbox.ebay.com` 用 `client_credentials` 取应用令牌 → `GET
@@ -785,6 +829,10 @@ OAuth **没有** `HardExpirationWarning`(那是 Auth'n'Auth 旧令牌才有的 7
 - **新增 api**:`api/ebay/inventory.py`、`api/ebay/offers.py`。
 - **新增 workflows**:`ebay_list_new.py`、`ebay_submit_poll.py`(**两条都 `DANGEROUS=True`**;⚠ `ebay_submit_poll` 会**自动补交**
   —— 它的灰度批与试点开关见批次 10)。
+  ⚠ **`ebay_submit_poll` 本批只做端点 23/16 那两半,#31 的 `fulfillmentId` 反查随批次 6 接上**:蓝图 §2 第 4 条给它列的端点是
+  `23,16,31`,而 #31 所在的 `api/ebay/orders.py` **在批次 6 才建**(本批新增 api 只有 `inventory.py`/`offers.py`);
+  4b 阶段台账里根本还不会有 `fulfillmentId`(它的唯一生产者 `ebay_ship_confirm` 也在批次 6)⇒ **不阻塞本批**,
+  但两份文档合读容易读成"4b 就要调 #31",故点明。
 - registry:eBay 上架表条目 + `docs/feishu_tables.md`;`tests/test_ebay_list_new.py`、`tests/test_ebay_submit.py`。
 
 **关键函数面 / 契约**:蓝图 §7 `inventory.py`/`offers.py`;三步链职责切分 §5.1;三个工程陷阱 §5.2;变体 **250/5/30** 上限
@@ -797,7 +845,9 @@ services 层显式 if 路由**,**严禁批量失败自动退单品**(§5.5)。
    重试** / 5xx 走反查 / `status=None` 走反查;FOUND 收编、NOT_FOUND **同方法**补交**一次**、UNKNOWN 保持 pending;**429 只能等
    `reset` 后同方法补交,补交前先查三态**;**账号级失败整账号熔断不逐条重试**(蓝图 §5.4 那条 eBay 独有分类:账号被限制时
    "Create new listings or revise existing listings" 是账号级不是条目级,逐条重试会把整批打成假失败);变体 >250 在 services 层拆;
-   GTIN 缺失走**站点替代文本表**而不是英文字面量;pending 行**永不老化**且摘要摊开 `账号/类型/工作流/提交时间`。
+   GTIN 缺失走**站点替代文本表**而不是英文字面量;pending 行**永不老化**且摘要摊开 `账号/类型/工作流/提交时间`;
+   🔴 **「零账号完成即判失败」** —— `ebay_list_new` / `ebay_submit_poll` 每条一测:**全部账号 dead 时 `run()` 必须抛**,
+   不许正常返回(§六 #8;这是最早的多账号**写**链,没有这道闸,请求形状被改坏时整条链**每天空转而且报成功**)。
 2. **`--dry-run` 人眼确认(不可省)**:照抄 `list_new.py:1258-1273` 的形态 —— 前 15 条被拦理由 + 前 10 行"将提交什么(定价/库存/
    类目/aspects)" + 一行 `[DRY-RUN] 共 N 行将进入 领UPC→校验→提交`,摘要行首 `🧪 [DRY-RUN] `。
 3. **sandbox 冒烟**:1 个 SKU 走完 item → offer → publish → `getOffer` 回读 `listingId`;再跑一遍**同载荷**,确认被在途/终态防重挡住。
@@ -826,7 +876,9 @@ listing 就够验收,所以本批可以在判据 ⑥ 悬着的时候照做。
 **关键点**:§3.2 **四条必须原样继承的语义**(COALESCE 不刷 NULL / 缺席只标不删且 `missing_since` 首次值不被刷新 / 标缺席时同步
 清空状态列 / 复现时 `listing_id` 重置 NULL 触发重查);端点 §1 #17/#23/#16。
 
-**验收**:1) **单测**四条语义各一条(照抄 `tests/test_catalog_sync.py` 的形状);2) **`--dry-run` 人眼确认**摘要第一行是"结论 +
+**验收**:1) **单测**四条语义各一条(照抄 `tests/test_catalog_sync.py` 的形状);🔴 **外加「零账号完成即判失败」一格** ——
+全部账号 dead 时 `run()` **必须抛**,不许正常返回(§六 #8;这是最早的多账号**只读**链,只读链更容易被当成"跳过就跳过",
+而它一旦全账号 dead 就是每天空转报成功);2) **`--dry-run` 人眼确认**摘要第一行是"结论 +
 最重要的那一个数"(链通知只显示第一行);3) **sandbox 冒烟**:建 2 条 listing → 扫描 → 下架 1 条 → 再扫描 → 第三轮再扫,确认第二轮
 **标缺席不删行**、第三轮 `missing_since` **首次值不被刷新**。
 
@@ -901,7 +953,8 @@ republish 是**破坏动作**,CLAUDE.md 08-24 定稿「**破坏动作只有一�
 **目标**:`ebay_maintenance` 只做 title/price/inventory(MAINT_ACTIONS);`ebay_problem_cleanup` 独占 withdraw≈retire /
 delete≈delete / republish≈relist(PROBLEM_ACTIONS)。
 
-**前置**:批次 4b/5;判据 ①⑤;⚠ **第四种 action 要先定名**(§3.1 dispositions 行:资格未获批被下架者**禁止 relist**,三值表达不了)。
+**前置**:批次 4b/5;判据 ①②⑤(⚠ **② 也阻塞本批**:维护链要改 `availableQuantity`,双平台库存口径没定就等于两边各按
+"全量可售"改量 —— 与批次 0 表里 ② 那行的阻塞清单一致);⚠ **第四种 action 要先定名**(§3.1 dispositions 行:资格未获批被下架者**禁止 relist**,三值表达不了)。
 
 **改动文件清单**:新增 `services/maint_rules.py`(抽中立纯判定,收"在线现值行 + amz 观测行"两个 dict)、
 `services/ebay_maintenance_intents.py`、`services/ebay_problem.py`、`services/ebay_maint_sheet.py`、`services/ebay_clear_sheet.py`;
@@ -1008,23 +1061,42 @@ launchd 那半 `python cli.py launchd_install --dry-run`;`docs/schedule_plan.md`
 | 1 | `ebay_catalog_sync` | gpt | 每日 11:00 |
 | 1 | `ebay_returns_sync` | gpt | 每日 12:00 |
 | 1 | `ebay_settlement_sync` | gpt | 每日 12:30 |
-| 1 | `ebay_kpi` | gpt | 每日 23:30(当天数据齐了再汇总) |
 | 2(订单 + 日报) | `ebay_order_sync` | **launchd** | 每小时 :10(高频链住在这台机器上,与 `order_chain` 错开) |
 | 2 | `ebay_order_audit` | **launchd** | 每小时 :25(**必须排在 `ebay_order_sync` 之后**,拿的是同一小时刚落库的单) |
-| 2 | `ebay_ship_confirm` | **launchd** | 每小时 :40(排在风控之后:**没过风控的单不许标发货**) |
+| 2 | `ebay_ship_confirm` | **launchd** | 每小时 :40(排在风控之后:**没过风控的单不许标发货**;**破坏链排批 2 的豁免理由见下方 🔴**) |
+| 2 | `ebay_kpi` | gpt | 每日 23:30(当天数据齐了再汇总)。⚠ **它是日报,按仓库 batch 语义「2 = 订单 + 日报」归批 2,不是批 1**(`registry/schedule.py:8-11`;eBay 侧沿用同一套语义,不另起编号)。⚠ **batch 答的是"属于哪一类",不是"哪天 load"**:它是下方验收 #3 里**每一段放量准入的数据源** ⇒ **试点第 1 段就要跟着挂上**,别等批 2 |
 | 3(破坏性,**每条先手动 `--dry-run` 人眼确认再 load**) | `ebay_list_new` | gpt | 每日 **20:30** |
 | 3 | `ebay_submit_poll` | gpt | 每日 21:00(见下方 🔴) |
 | 3 | `ebay_maintenance` | gpt | 每日 16:00 |
 | 3 | `ebay_problem_cleanup` | gpt | 每日 16:30(维护之后,破坏动作唯一出口) |
 | 3 | `ebay_returns_action` | gpt | 每日 13:00 |
 
+🔴 **`ebay_ship_confirm` 留在灰度批 2 是一处显式豁免,不是漏排** —— 它 `DANGEROUS=True`、对 eBay 真写、且**发运后不可增删
+fulfillment 行**(不可逆),按 `ebay_submit_poll` 那条理由本该进批 3。**豁免理由**:发货回传是**履约必需的时效动作**,
+延迟直接吃 late shipment 绩效(并连带 INR),**必须按小时跑** —— 而批 3 的语义是"每条先手动 `--dry-run` 人眼确认再 load",
+一条每小时的链没法逐轮人眼确认,排进批 3 等于要么天天人肉盯、要么这条链形同虚设。**替代闸两道,一道都不许省**:
+① **台账 pending 先落库的三态防重**(提交前写 pending → 在途同指纹拒重 → 提交前先 `GET` 回读防重复标发,§六 #2)——
+这道闸挡的正是批 3 想挡的"重复不可逆写";② **试点期挂上去但先只打印不回传** —— 照 `ebay_submit_poll` 的 `resubmit=0` 同款手法,
+给它一个**自己的开关参数**(如 `schedule.JOBS` 条目里写死 `params=["confirm=0"]`,由 `run()` 自己认),先跑若干天,
+每天人眼看摘要里"将给哪个订单的哪几个 lineItem 回传什么运单",确认无误后改成 `confirm=1` 并重跑 `skill_export`。
+🔴 **这道闸不许用 `-p dry_run=1` 来做**:`cli.py:301` 是 `params["execute"] = (not dry_run) if dangerous else True`,
+`execute` **只由命令行的 `--dry-run` 决定**,`-p dry_run=…` 走的是 `:305` 那条 `setdefault`、**碰不到 `execute`** ⇒
+对 `DANGEROUS=True` 的链写 `-p dry_run=1` 会**照样真发**,而摘要里还印着 dry_run —— 正是本仓最怕的那种"不报错"。
+⚠ **连带一处测试改动**:`tests/test_launchd.py:150-161` 的 `dangerous` **硬编码集合必须把 `ebay_ship_confirm` 登记进去**
+(它确实是破坏链,不登记就等于在测试里撒谎);**但它不在批 3**,而现有断言是双向的(`if label in dangerous: assert batch == 3`)⇒
+**登记它会让"破坏链 ⇒ 批 3"那一半当场红**。⇒ **断言的改法在批次 10 的改动清单里一并处理**:给这条断言加一份**显式豁免清单**
+(名字 + 一行理由),**不是把 `ebay_ship_confirm` 从 `dangerous` 里拿掉,也不是把断言删掉或放宽** —— 语义必须保留成
+"破坏链默认进批 3,例外必须逐条留名留理由"。
+
 🔴 **`ebay_submit_poll` 排灰度批 3,不是批 2(原稿排错)**:它 `DANGEROUS=True` 且**会对 eBay 真写** —— NOT_FOUND 时**同方法补交
 一次**(§六 #2),是**全仓唯一一条会自动补交的链**,排进批 2 等于绕过批 3 那道"每条先手动 `--dry-run` 人眼确认再 load"的闸。
 **试点期它的补交默认关闭**:`schedule.JOBS` 条目里写死 `params=["resubmit=0"]`,观察三天确认台账三态判得对了,再改成 `resubmit=1`
 并重跑 `skill_export`。
-🔴 **`ebay_list_new` 必须排在黑名单与审核之后(当天次序是硬约束,不是偏好)**:`registry/schedule.py:38-40` 明写并被
+🔴 **`ebay_list_new` 必须排在黑名单与审核之后(当天次序是硬约束,不是偏好)**:`registry/schedule.py:33-34` 明写并被
 `tests/test_launchd.py:118` 一带钉死 —— `product_chain 13:00 → blacklist 15:00 → audit_sheet 18:10 → list_new 20:00`;
-**`ebay_list_new` 吃的是同一天的黑名单与 `catalog.products.audit_status`**(判据 ⑤ 一期复用沃尔玛审核结论)⇒ 排在 **20:30**,
+**`ebay_list_new` 吃的是同一天的黑名单与 `catalog.products.audit_status`**(判据 ⑤ 一期复用沃尔玛审核结论 ——
+**推荐值,待拍板**;若最终拍成方向 B「一期另立人工/简化闸、不读 `audit_status`」,本条排期理由里"审核"那一半随之作废,
+20:30 这个时刻要重定,黑名单那一半仍成立)⇒ 排在 **20:30**,
 在 `list_new` 之后。⚠ **写清楚这一条,是因为不写就等于"把判据承载在调度顺序上"** —— 而 §六 #7 自己禁止这件事:
 **顺序只做优化,判据要写进代码**;所以 `ebay_list_new` 内部**也要有"今天的黑名单/审核跑过没有"的显式前置检查**,顺序只是让它别白等。
 `ebay_bootstrap_account` 与 `ebay_authorize` **一次性,不进 `JOBS`**(蓝图 §2 #1;归 `schedule.py` 里那份"不在表里 = 手动"的清单)。
@@ -1037,8 +1109,13 @@ launchd 那半 `python cli.py launchd_install --dry-run`;`docs/schedule_plan.md`
 
 **验收**:
 1. `tests/test_gpt_skill.py` 三条钉子全绿(仓库副本 == 从调度表现渲染 / 无遗留任务文件 / 不许丢参数);
-   `tests/test_launchd.py` **改后**全绿 —— ⚠ 改的是**断言的内容**(高频链集合加了三条 eBay 链、破坏性集合加了四条),
-   **不是把断言删掉或放宽**:那两条测试守的是"只有高频链住在这台机器上"和"批 3 只放破坏性链",**语义必须原样保留**。
+   `tests/test_launchd.py` **改后**全绿 —— ⚠ 改的是**断言的内容**,**不是把断言删掉或放宽**:那两条测试守的是
+   "只有高频链住在这台机器上"和"批 3 只放破坏性链",**语义必须原样保留**。
+   🔴 **不在这里写死条数** —— **破坏性集合与灰度批次登记一律按本文上面那张排法表逐条核对(排法表是唯一口径)**,
+   `tests/test_launchd.py` 两处断言(高频链集合相等断言 `:125-141`、批次/破坏性断言 `:150-161`)**同批同步、改后全绿**。
+   ⚠ 逐条核对时特别注意两格:排法表里 launchd 的那几条要与高频链集合逐字对齐;`ebay_ship_confirm` 是
+   **登记进 `dangerous` 但排在批 2** 的显式豁免,需要按上面那条 🔴 给断言加豁免清单,不是把它从 `dangerous` 里拿掉
+   —— 写死一个数字正是上一版在这里出错的原因(数字与排法表对不上,少登记的那条会被 `elif j["batch"] == 3` 当场抛)。
 2. **`--dry-run` 人眼确认**:`skill_export --dry-run` 与 `launchd_install --dry-run` 各看一遍。
 3. **单账号试点 → 放量(阶梯不许跳),并在此逐条打勾批次 6/7/8/9 的「试点段验收」**(总原则 ④ 把它们统一挪到了这里):
    - **第 1 段(只读)**:先只挂**一个账号的只读链**,观察 3 天 `ops.runs` 的时长与失败率;此段内完成
@@ -1059,7 +1136,8 @@ launchd 那半 `python cli.py launchd_install --dry-run`;`docs/schedule_plan.md`
 
 **为什么单列一批**:它**不碰本仓任何既有文件**,却要给本项目**新增一类运行形态** —— 当前架构是"脚本 + launchd + PostgreSQL",
 **没有任何常驻公网服务**,而 `MARKETPLACE_ACCOUNT_DELETION` 需要一个**公网入站 HTTPS 端点**。原稿把它整个压在判据 ⑦ 里:
-**没有批次、没有工时、没有技术方案(放哪、谁续证书、挂了怎么发现)** —— 而端点挂了 destination 转 `MARKED_DOWN`、**丢事件是静默的**。
+**没有批次、没有工时、没有技术方案(放哪、谁续证书、挂了怎么发现)** —— 而端点挂了 destination 转 `MARKED_DOWN`
+(⚠ **状态名未核验**,见下方交付物 ④)、**丢事件是静默的**。
 
 **前置**:判据 ⑦ 的"怎么建"那半("要不要建"已定:**必须订阅**,蓝图 §2 末格 + §8.3 #12)。
 
@@ -1067,10 +1145,17 @@ launchd 那半 `python cli.py launchd_install --dry-run`;`docs/schedule_plan.md`
 ② 端点实现,**四条硬要求逐条对**(https;路径**不得含内网 IP 或 `localhost``;`challengeCode` + `verificationToken` + `endpointURL`
 **hash 到一起回 `200 OK`**;每条通知**即时**以 `200/201/202/204` 之一应答);③ 用 Notification API 建 destination + subscription
 (桶见蓝图 §3.1,定稿 200/day);④ 🔴 **每日订阅状态自检**:并进 `ebay_account_health`(它本来就是每日巡检链)——
-读 destination 状态,**一旦不是正常态就按"< 7 天"那档抛多行 `RuntimeError` 停链告警**;⑤ 证书续期责任人与到期提醒写进
+读 destination 状态,**一旦不是正常态就按"< 7 天"那档抛多行 `RuntimeError` 停链告警**。
+⚠ **destination 的状态枚举本轮未核验**(`getDestinations` 方法页是 SPA,`MARKED_DOWN` 这个名字取自二手描述)⇒
+**实调 `GET /commerce/notification/v1/destination` 拿到真实取值集、补证并标日期后,再把告警判据写死**;
+在那之前判据只准写成"**不等于已知正常态即告警**"(fail-closed 的方向,宁可误报),**不许按 `MARKED_DOWN` 这一个字面量做等值判断**
+—— 判据挂在一个没核过的枚举值上,状态名一变就变成"永远不告警",正是本项目最贵的那类不报错;⑤ 证书续期责任人与到期提醒写进
 `docs/ebay_runbook.md`。
 
 **验收**:1) 官方控制台的 challenge 校验一次通过;2) 人为把端点停掉 → **自检当天必须告警**(验的是"挂了能发现",不是"能收事件");
+   ⚠ **这一格同时是 destination 状态枚举的补证时刻**:停掉端点后实调一次
+   `GET /commerce/notification/v1/destination`,把返回的真实状态值抄回蓝图 §8.1 ② 与本批交付物 ④ 并标日期
+   —— 验收当天拿不到真实取值,就说明这条告警的判据仍是猜的;
 3) 端点日志里能看到至少一条真实通知并回了 2xx。
 
 ## 六、纪律继承清单
@@ -1103,7 +1188,10 @@ eBay 链从第一行代码起适用,不设过渡期、不设例外:
 8. 🔴 **每条多账号 workflow 必须有「零账号完成即判失败」这道闸**(2026-08-25 补,沃尔玛侧 `api/_client.py:388-390` 的注释自陈:
    "若请求形状被改坏,表现是**全部店一起 dead**,由 workflow 侧『零店完成即判失败』那道闸兜住")。只抄 `EbayAccountDeadError` 的
    状态码枚举是**抄了一半** —— 全账号 dead 时每个账号都被"跳过"、`run()` 正常返回,**这一整条链每天空转而且报"成功"**,正是 CLAUDE.md
-   安全铁律点名的那种事故形状(与风险登记簿 #1 的 refresh token 静默跳过是同一个病)。**写进批次 3/4b/5/6/7/8/9 的验收项。**
+   安全铁律点名的那种事故形状(与风险登记簿 #1 的 refresh token 静默跳过是同一个病)。
+   **落点:批次 3(验收 #1)、批次 4b(验收 #1)、批次 5(验收 #1)三处已各写死一格 —— 分别是最早的多账号只读巡检链、
+   最早的多账号写链、最早的多账号只读业务链;批次 6-9 的多账号链**同规则适用**,新建一条多账号 workflow 就补一格,
+   不再逐批复述。**
 9. 🔴 **运行态凭据不进任何导出、快照、日志与摘要**:`ops.ebay_tokens` 的三个泄漏孔(全库 `pg_dump` / `readonly` 角色 GRANT /
    文档缺失)与堵法见 §3.1"凭证泄漏三孔",**与建表同批(批次 1)落**;`refresh_token` **只有一个出处 = 该表**,严禁进飞书凭证表
    (§2.3);真密钥 client_id / client_secret / RuName **只进 `<DATA_ROOT>/.env`**,仓库与 `_ENV_TEMPLATE` 里只出现变量名。
@@ -1163,4 +1251,4 @@ eBay 链从第一行代码起适用,不设过渡期、不设例外:
 | 11 | **蓝图 §8.3 的未核验项(现 18 条,已关 5 条 + 降级 1 条)** | 逐条影响不同批次:🔴 #1 GSP 双地址(拿反 = **全部国际单寄错地址**)→ 批次 6;🔴 #2 配额口径 → 批次 10;🔴 #3 重复 `createOffer` 行为 → 批次 4b 的补交逻辑;🔴 **#18 offer/listing status 取值封闭集 → 卡住 `catalog.ebay_items` 建表与约 10 处 SQL 字面量、以及 `ebay_submit_poll` 的 FOUND 判据**(⚠ **2026-08-25 新开**:原稿把它挂在 #9 上,而 #9 清单里根本没有这两项 ⇒ "逐条补核"那道闸放不住它);🔴 #16 Compliance/Analytics API 面 → 批次 7 的指标来源;#15 `createShippingFulfillment` 入参 → 批次 6 的 `ebay_ship_confirm`。✅ **已关闭的别再排工时**:#5(时间窗 = **2 年**)、#7、#10、#12、#4 机制侧;#8 降级为上线前抽验 | **动手前必须补核,不许按推断编码**;补核方式蓝图逐条给了(多数是沙箱实调)。补核结果**回填蓝图 §8.3 并标日期**;⚠ **编号永不复用、永不重排**,关闭项留原位标 ✅ |
 | 12 | **共享表并跑对象是沃尔玛链** | eBay 是新平台没有旧系统并跑问题,**但它碰 `catalog.products/snapshots`、`ops.rate_events`、`catalog.product_events`、`orders.*`、`ops.feed_log/feed_items`** ⇒ "新旧严禁并跑"这条铁律的对象变成了沃尔玛链 | 批次 2a 的"加列时库里仍只有 walmart 行 + 行数逐条对拍";批次 4a 的"沃尔玛 feed 链行为逐字不变";批次 6 的"沃尔玛订单链改前后摘要逐字一致" + **`db_init` 两跑后 `order_lines` 行数不变**(专验 v2 守卫);eBay 动 `product_ingest` 游标必须**借同一把锁** |
 | 13 | 🔴 **`ops.ebay_tokens` 泄漏(2026-08-25 补,原稿两文档"备份/backup"命中 0 次)** | 三个孔全部**不报错**:① 每日 02:00 的全库 `pg_dump` 把 18 个月长期凭证打进 `<DATA_ROOT>/backups`(保留 14 天);② `db_init` 的 `GRANT SELECT ON ALL TABLES IN SCHEMA … ops … TO readonly` 把令牌表授给 Metabase/NocoDB/MCP 用的 readonly 角色;③ 令牌值若进异常文案或 `ops.runs.summary` 就永久留痕 | §3.1"凭证泄漏三孔"逐条堵:`--exclude-table-data=ops.ebay_tokens` + 显式 `REVOKE` + 三处文档头注;**批次 1 与建表同批**,验收在批次 1 #5。⚠ **恢复后必须重走 consent**,写进 `docs/ebay_runbook.md` |
-| 14 | **账号名与店名撞名(2026-08-25 补)** | `upc_pool` 的复用与烧号、`ops.dispositions` 唯一索引、`ops.feed_log`、`catalog.claims`、`orders.order_lines` **五处都按 `store` 圈定且不看平台**,而店名/账号名都是飞书自由文本 ⇒ 撞名时**两个方向都不报错**:eBay 复用沃尔玛在用的 UPC;沃尔玛一次 RETIRE 把 eBay 在用的号标成 `conflict`(**永久弃用**) | §2.3 的硬约束:eBay 账号统一命名规则 + `_normalize` 里 `stores.enabled_names() ∩ ebay 账号名 ≠ ∅ 即抛,**批次 1 单测**;代价一条断言 |
+| 14 | **账号名与店名撞名(2026-08-25 补)** | `upc_pool` 的复用与烧号、`ops.dispositions` 唯一索引、`ops.feed_log`、`catalog.claims`、`orders.order_lines` **五处都按 `store` 圈定且不看平台**,而店名/账号名都是飞书自由文本 ⇒ 撞名时**两个方向都不报错**:eBay 复用沃尔玛在用的 UPC;沃尔玛一次 RETIRE 把 eBay 在用的号标成 `conflict`(**永久弃用**) | §2.3 的硬约束:eBay 账号统一命名规则 + `_normalize` 里 `stores.registered_names() ∩ ebay 账号名 ≠ ∅ 即抛,**批次 1 单测**;代价一条断言。⚠ **判据取「在册」不取「在营」**:五处全按 `store` 圈定不看启用位,停用店名仍在表里留行,`enabled_names()` 会放行(§2.3) |

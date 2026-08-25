@@ -1,4 +1,4 @@
-"""店铺准入大类:三列取值 + "空=不限制" 判定(所有者口径 2026-08-15)。"""
+"""店铺准入大类 + 配送限制渠道:取值与"空=不限制"判定(所有者口径 2026-08-15/25)。"""
 
 from services import store_targets as st
 
@@ -145,3 +145,59 @@ def test_unmeasured_lead_is_refused_by_every_store_including_unset_ones():
     """
     for row in ({"lead_limit": 5}, {"lead_limit": None}, {}, None):
         assert st.lead_ok(row, None) is False
+
+
+# ── 配送限制(渠道):四条链共用的唯一谓词 ─────────────────────────────────────
+
+def test_channel_conflict_needs_both_sides_to_be_known():
+    """只有"店标了 ∧ 货确实是另一个已知渠道"才算不符 —— 其余一律不算。
+
+    两个方向写反了都不报错,但后果不同向:
+      · 把"店没标"算成不符 ⇒ 没配置的店整店废掉(上架一件也上不了);
+      · 把"货渠道没采到"算成不符 ⇒ 无辜商品上不了架、在架的先清零再被删。
+    """
+    assert st.channel_conflict("FBA", "FBM") is True
+    assert st.channel_conflict("FBM", "FBA") is True
+    assert st.channel_conflict("FBA", "FBA") is False
+    # 店没标:什么货都行(所有者 2026-08-25「没标就都能上」)
+    for want in (None, "", "  "):
+        assert st.channel_conflict(want, "FBM") is False
+    # 货的渠道未知 / 第三种值:**不猜**(第三种值恒高 = 采集侧 is_fba 坏了)
+    for ch in (None, "", "N/A", "unknown", 0):
+        assert st.channel_conflict("FBA", ch) is False
+
+
+def test_channel_conflict_normalizes_both_sides():
+    """归一收在谓词里:维护侧喂的是 raw->>'is_fba' 原文,上架侧喂的是已归一值。
+
+    两边各 strip().upper() 一遍就是两份口径,迟早只改一处。
+    """
+    assert st.channel_conflict("fba", " fbm ") is True
+    assert st.channel_conflict("fba", "FBA") is False
+    assert st.channel_conflict("FBA", "fba") is False
+
+
+def test_store_channels_only_returns_stores_that_marked_one(monkeypatch):
+    """没标 / 填了认不出的值 ⇒ **不进字典** = 不限制(而不是被当成某个渠道)。"""
+    monkeypatch.setattr(st, "load_targets", lambda: {
+        "T_FBA": {"channel": "FBA", "channel_raw": "fba"},
+        "T_FBM": {"channel": "FBM", "channel_raw": "FBM"},
+        "T_BLANK": {"channel": None, "channel_raw": ""},
+        "T_TYPO": {"channel": None, "channel_raw": "fbaa"},
+    })
+    assert st.store_channels() == {"T_FBA": "FBA", "T_FBM": "FBM"}
+
+
+def test_store_channels_degrades_loudly_when_the_sheet_is_unregistered(caplog):
+    """表未登记 ⇒ 全放行,但**必须出声**:静默兜底会让"闸失效"和"没有不符的行"
+    在摘要里长得一模一样。"""
+    def _boom():
+        raise LookupError("限额表未登记")
+    import logging
+    _orig, st.load_targets = st.load_targets, _boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="services.store_targets"):
+            assert st.store_channels() == {}
+        assert any("全放行" in r.message for r in caplog.records)
+    finally:
+        st.load_targets = _orig

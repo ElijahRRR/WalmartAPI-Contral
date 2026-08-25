@@ -48,10 +48,14 @@ def offends_channel(r, cfg) -> bool:
     第三种值,都不算——把"没采到"算成"货不对"会让无辜商品进下架清单;
     第三种值恒高说明采集侧 `is_fba` 解析坏了,那要修采集不是下架商品。
     店铺没填配送限制 = 不对拍(它另有报告点名补填)。
+
+    ⚠ 判定本身**不在这里**:2026-08-25 上架/维护两条链也要问同一个问题,
+    抽到 `store_targets.channel_conflict`(唯一出处)。本函数只负责把
+    「一行 + 配置」拆成它要的两个参数 —— 与 `alloc_engine` 把类目/货期
+    判定交还 store_targets 是同一条纪律。
     """
-    want = (cfg.get(r["store"]) or {}).get("channel")
-    ch = r.get("channel")
-    return bool(want) and ch in store_targets.CHANNELS and ch != want
+    return store_targets.channel_conflict(
+        (cfg.get(r["store"]) or {}).get("channel"), r.get("channel"))
 
 
 def claimable(rows, registered, cfg=None) -> list[dict]:

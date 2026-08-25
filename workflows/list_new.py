@@ -41,6 +41,9 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     (维护链次日纠正),库里压根没有的照旧不写终态、次日续
   ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
     (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
+    **店铺渠道闸**(限额表「配送限制」:标了 fba/fbm 就只上该渠道的货,
+    **没标=不限制**;判定走 services/store_targets.channel_conflict 唯一谓词。
+    产品渠道采不到的行在上一档就已被"不定价"拦下,不重复判);
     定价:services/pricing(FBA/FBM 区间×倍率;出界按 300% 兜底,
     只有区间内倍率未配置才淘汰)
   ⑦ 三段式提交(所有者定稿 2026-08-18 重排:「过闸后默认128并发打
@@ -82,8 +85,8 @@ from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
     mp_mapper, pricing, product_events, product_ingest, pt_spec, risk_gate, \
-    scrape_batches, store_limits, stores as stores_svc, upc_pool, \
-    variant_group, variant_remap, variant_title
+    scrape_batches, store_limits, store_targets, stores as stores_svc, \
+    upc_pool, variant_group, variant_remap, variant_title
 
 DANGEROUS = True
 
@@ -982,11 +985,12 @@ def run(params: dict) -> str:
     quota = _load_quota()
     mults = _load_multipliers()
     lead_caps = store_limits.lead_day_caps()      # 按店「配送时长限制」
+    store_chs = store_targets.store_channels()   # 按店「配送限制」(没标=不限)
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
-         "lead_days": 0, "no_material": 0}
+         "lead_days": 0, "no_material": 0, "channel": 0}
     # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
@@ -1072,6 +1076,15 @@ def run(params: dict) -> str:
     survivors: list[dict] = []
     data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
     for r in candidates:
+        # ⚠ **必须在这里取本行的店名**(2026-08-25 修):此前 `lead_cap` 那行
+        # 直接用了 `store_name`,而这个名字是上面那个按店循环
+        # (`for store_name, srows in sorted(by_store.items())`)**留下的残值**
+        # —— Python 的循环变量出了循环还活着,于是每一行读到的都是
+        # **店名排序最末那家店**的「配送时长限制」。多店同轮时:那家店填了 3 天
+        # ⇒ 全部店的货按 3 天拦;那家店没填 ⇒ 全部店回落全局 7 天,
+        # 逐店那一列**对其余每家店都静默失效**。d4bcaab(2026-08-17 走进生产,
+        # 把全局常量换成逐店列)引入,单店夹具照不出来。
+        store_name = r["store"]
         p = products.get(r["asin"])
         if p is None:
             n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
@@ -1127,6 +1140,19 @@ def run(params: dict) -> str:
         if channel not in pricing.PRICE_BANDS:
             n["filtered"] += 1
             reasons.append((r["rownum"], "配送方式(FBA/FBM)未采到,不定价"))
+            continue
+        # 店铺渠道闸(所有者定稿 2026-08-25:「读取配送限制列,我会在其中标记
+        # fba/fbm,没标就都能上」)。放在这里是因为**产品渠道上一行才刚判明**,
+        # 而判定本身走 store_targets 唯一谓词(分配/上架/维护/对账共用一处)。
+        # 两条空值口径都在谓词里,别在这儿另写:店没标 → 放行;产品渠道不是
+        # 另一个已知值 → 放行(采不到不算不符,那一档上一行已经拦掉了)。
+        # ⚠ 与分配侧的**未填口径相反**且都对:分配未填=不接自由流(没渠道就
+        # 过不了硬闸),上架未填=不限制(照搬分配会把没配置的店整店废掉)。
+        want_ch = store_chs.get(store_name)
+        if store_targets.channel_conflict(want_ch, channel):
+            n["channel"] += 1
+            reasons.append((r["rownum"],
+                            f"本店只做 {want_ch},该品是 {channel}"))
             continue
         # 定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10):采购真正
         # 付的是单价加运费。运费没采到(采集侧 N/A)一律不上架——与"配送方式
@@ -1204,7 +1230,8 @@ def run(params: dict) -> str:
         ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
         ("dedup", "全局去重"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
-        ("lead_days", "配送超时"), ("no_material", "素材不足")) if n[key]]
+        ("lead_days", "配送超时"), ("no_material", "素材不足"),
+        ("channel", "渠道不符本店")) if n[key]]
     gate_line = ("闸门:" + ",".join(f"{lab} {v}" for lab, v in blocked)
                  if blocked else "闸门:一条都没拦")
     if n["stock_assumed"]:

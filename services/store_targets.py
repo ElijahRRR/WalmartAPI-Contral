@@ -3,7 +3,14 @@
 四列都是所有者在飞书人工维护(2026-08-12 / 08-13 建列),程序只读:
   目标销售额 / 目标订单  —— **日目标**(不是月目标,公式里别当月用)
   单店最大在线数        —— 总容量上限(≠「上架限制」列的日配额)
-  配送限制              —— fba / fbm,一店一渠道的权威(未填=不接自由流分配)
+  配送限制              —— fba / fbm,一店一渠道的权威。**一列三个消费方**,
+                         对"这一格没填"的解释各不相同、而且都是对的:
+                           · 分配 `alloc_engine._blocker` —— 未填=不接自由流
+                             (没有渠道就没法过硬闸,宁可不分)
+                           · 上架 `list_new`               —— 未填=不限制,什么渠道都能上
+                             (所有者定稿 2026-08-25:「没标就都能上」。这里若照
+                             搬分配的口径,没配置的店会被整店废掉)
+                           · 维护 `maintenance_intents`    —— 未填=不限制,同上架
   配送时长限制          —— 只分配 delivery_days ≤ 该值的产品(未填=不限)
 
 与 `workflows/list_new._load_quota` 的分工:那边读「上架限制」日配额,
@@ -86,6 +93,51 @@ def load_targets() -> dict[str, dict]:
             "categories": cats,
         }
     return out
+
+
+def store_channels() -> dict[str, str]:
+    """输入:无 → 输出:{店铺: 'FBA'|'FBM'}(只收**填了且认得出**的店)。
+
+    上架链与维护链的取数入口(分配链走 `load_targets()` 拿全套配置)。
+    不进字典的店 = 「没标」= **不限制**,两条链都放行 —— 与分配侧"未填不接
+    自由流"方向相反,见模块头注那三条。
+
+    表未登记(.env 缺 FEISHU_LIMITS_*)→ 空字典 + **告警**,等价于全放行。
+    这是有意的降级(飞书挂了不该把上架/维护整条链拖下水),但**必须出声**:
+    静默的兜底会让"渠道闸失效"看起来和"没有不符的行"一模一样。
+    """
+    try:
+        targets = load_targets()
+    except LookupError:
+        logger.warning("限额表未登记,渠道闸本轮**全放行**"
+                       "(等同每家店都没标「配送限制」)")
+        return {}
+    return {name: cfg["channel"] for name, cfg in targets.items()
+            if cfg.get("channel")}
+
+
+def channel_conflict(want: str | None, channel) -> bool:
+    """输入:本店渠道要求 + 产品渠道 → 输出:是不是**确定不符**(白名单口径)。
+
+    ★ **全项目唯一一处**判"这个货的渠道对不对得上这家店"。四个消费方
+    (分配审计 `alloc_survey.offends_channel` / 上架 `list_new` / 维护
+    `maintenance_intents` / 占用对账 `claim_audit`)都问它,不各写各的 ——
+    这个判定有两个方向都像对的坑,分开写迟早分叉:
+
+    1. **店没标 → 不冲突**(返回 False)。上架/维护侧「没标就都能上」。
+    2. **产品渠道不是另一个已知值 → 不冲突**。采集没采到(None)、采出第三种
+       值('N/A' 之类),都**不算不符** —— 把"没采到"当成"货不对",在上架侧是
+       无辜商品上不了架,在维护侧是无辜商品被清零然后删掉。第三种值恒高说明
+       采集侧 `is_fba` 解析坏了,那是要修采集,不是要动商品。
+
+    大小写与空白在这里归一(维护侧取的是 `raw->>'is_fba'` 原文,上架侧取的是
+    amz_source 已归一的值)—— 两边各 strip().upper() 一遍就是两份口径。
+    """
+    w = str(want or "").strip().upper()
+    if not w:
+        return False              # 店没标(含只填了空白)= 不限制
+    ch = str(channel or "").strip().upper()
+    return ch in CHANNELS and ch != w
 
 
 def super_categories_of(cfg_row: dict | None) -> set:

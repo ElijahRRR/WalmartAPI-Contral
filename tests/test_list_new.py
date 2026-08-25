@@ -252,6 +252,89 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     assert "共 1 行将进入" in out        # 只有带运费那行进得去
 
 
+def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
+    """逐店「配送时长限制」必须按**本行的店**读(2026-08-25 修的作用域泄漏)。
+
+    d4bcaab(2026-08-17 走进生产)把全局常量换成逐店列时,`lead_cap` 那行用的是
+    上面按店循环留下的 `store_name` 残值 ⇒ 每一行读到的都是**店名排序最末那家
+    店**的上限。这里两家店的上限一宽一严,严的那家排在后面:泄漏一回来,
+    宽松店的货就会被严格店的上限拦掉,而摘要里的"本店上限"还写得振振有词。
+    """
+    rows = [_sheet_row(rownum=2, store="T_A", asin="B0SLOWISH"),
+            _sheet_row(rownum=3, store="T_Z", asin="B0SLOWISH2")]
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
+            "stock_state": "in_stock", "channel": "FBM"}
+    products = {"B0SLOWISH": {**base, "asin": "B0SLOWISH", "lead_days": 10},
+                "B0SLOWISH2": {**base, "asin": "B0SLOWISH2", "lead_days": 10}}
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers",
+                        lambda: {"T_A": {"fbm_range1": "200%"},
+                                 "T_Z": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.store_limits, "lead_day_caps",
+                        lambda: {"T_A": 20, "T_Z": 3})
+    monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
+        {"name": "T_A"}, {"name": "T_Z"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    # T_A 上限 20 天 ⇒ 10 天的货照上;T_Z 上限 3 天 ⇒ 同样 10 天的货拦下
+    assert "配送超时 1" in out
+    assert "第3行:配送 10 天 > 本店上限 3 天" in out
+    assert "共 1 行将进入" in out
+
+
+def test_store_channel_gate(monkeypatch):
+    """限额表「配送限制」标了 fba/fbm 就只上该渠道的货;**没标就都能上**
+    (所有者定稿 2026-08-25)。
+
+    ⚠ 与分配侧的未填口径**相反,而且两边都对**:分配 `alloc_engine._blocker`
+    未填=不接自由流(没渠道就过不了硬闸);上架照搬那条会把没配置的店整店废掉。
+    """
+    rows = [_sheet_row(rownum=2, store="T_FBA", asin="B0FBAGOOD"),
+            _sheet_row(rownum=3, store="T_FBA", asin="B0FBMBAD"),
+            _sheet_row(rownum=4, store="T_FBA", asin="B0JUNKCH"),
+            _sheet_row(rownum=5, store="T_ANY", asin="B0FBMOK")]
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
+            "stock_state": "in_stock", "lead_days": 2}
+    products = {
+        "B0FBAGOOD": {**base, "asin": "B0FBAGOOD", "channel": "FBA"},
+        "B0FBMBAD": {**base, "asin": "B0FBMBAD", "channel": "FBM"},
+        # 第三种值:上一档"配送方式未采到"就拦了,渠道闸这里根本不该看到它
+        "B0JUNKCH": {**base, "asin": "B0JUNKCH", "channel": "N/A"},
+        "B0FBMOK": {**base, "asin": "B0FBMOK", "channel": "FBM"},
+    }
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln, "_load_multipliers", lambda: {
+        "T_FBA": {"fba_range1": "300%", "fbm_range1": "200%"},
+        "T_ANY": {"fba_range1": "300%", "fbm_range1": "200%"}})
+    # T_FBA 标了 FBA;T_ANY 没标(不在字典里)
+    monkeypatch.setattr(ln.store_targets, "store_channels",
+                        lambda: {"T_FBA": "FBA"})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
+        {"name": "T_FBA"}, {"name": "T_ANY"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "渠道不符本店 1" in out                 # 只有 B0FBMBAD 被渠道闸拦
+    assert "第3行:本店只做 FBA,该品是 FBM" in out
+    # 没标的店照上 FBM;本店渠道相符的照上;第三种值走"未采到"那一档不重复计数
+    assert "共 2 行将进入" in out
+    assert "配送方式(FBA/FBM)未采到" in out
+
+
 def test_quota_slices_after_filters(monkeypatch):
     """配额以能成功提交的行计(所有者批复 2026-08-12):先过滤后切片。
 

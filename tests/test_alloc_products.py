@@ -235,3 +235,20 @@ def test_csv_carries_the_fulfillment_channel(monkeypatch, tmp_path):
     assert val("B0AAAA0001")["配送方式"] == "FBA"
     assert val("B0CCCC0003")["配送方式"] == "FBM"
     assert val("B0FFFF0006")["配送方式"] == "(未知)"   # 采不到,不留空
+
+
+def test_the_window_param_is_sales_days_and_days_is_refused(monkeypatch):
+    """⚠ `days` 在这条工作流里曾经装着 365(产品销量窗口),而在
+    `alloc_stores`/`alloc_plan` 里装的是 90(店铺经营水平窗口)。
+
+    同名异义的实测后果:照 §12.4「两个窗口」的心智模型给例行一跑统一加
+    `-p days=90`,alloc_stores 与 alloc_plan 都对,**alloc_products 静默把
+    产品销量窗口从 365 砍到 90** —— 而销量信号覆盖率本来就只有几个百分点,
+    再砍会把唯一有正面证据的那批品抹平,报告上只写"近 90 天销量",看不出配错了。
+
+    处置与 cli 吞 flag 同一路数:**报错,绝不自动改口**。静默接受等于替
+    所有者做了他没做的决定。
+    """
+    import pytest
+    with pytest.raises(ValueError, match="sales_days"):
+        wf.run({"days": 90})

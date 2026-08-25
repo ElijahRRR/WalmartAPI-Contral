@@ -1,13 +1,13 @@
 """alloc_audit — 分配动工前的存量审计 + 数据探针(只读,随时可跑)。
 
 用法:
-  python cli.py alloc_audit                    # 全部检查 + 落五份明细 csv
+  python cli.py alloc_audit                    # 全部检查 + 落六份明细 csv
   python cli.py alloc_audit -p channel=0       # 跳过渠道探测(最慢的一段)
   python cli.py alloc_audit -p export=0        # 只看摘要不落 csv
   python cli.py alloc_audit -p sales_days=180  # 冲突处置的销量窗口(默认 365 天)
   python cli.py alloc_audit -p as_of=2026-08-15  # 钉住销量窗口右端(默认今天 UTC)
 
-这是 docs/allocation_plan.md §十三 的 **A0.5 批次**:占用台账(A1)与分配
+这是 docs/allocation_plan.md §十(批次与当前状态)的 **A0.5 批次**:占用台账(A1)与分配
 引擎(A2)动工前,必须先知道存量长什么样、设计稿里的假设数字实际是多少。
 **只读**——不写任何表、不调沃尔玛、不调 LLM。
 

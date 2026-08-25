@@ -105,7 +105,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列**留着**(所有者拍板 2026-08-13:已映射到飞书多维表格,是运营参考数据);`ops.scrape_failures.error_detail` **仍是零程序读者**(⚠ 2026-08-14 订正:上一版写它"有读者(v_scrape_failure_stats 视图)"——但那个视图**自己**全仓零引用,拿它当读者是循环论证,会一直给下次盘点提供假证据。视图与列都保留:视图是人工/AI 排查采集失败的聚合面,与 catalog.product_risk_store 等四个视图同性质;error_detail 是 variant_offset 的 `page=<实际ASIN>` 唯一载体),status/retry_count 零读方但为采集契约镜像,随上一条一并保留;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**;清理器**暂不做**(所有者拍板 2026-08-13,上量后再议)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
-- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置已定稿归分配 A1:store_release 整店释放时同步标 missing_since(校正观测;`docs/allocation_plan.md` §十二.11);存量清单随 A0.5 审计出
+- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置已定稿归分配 A1:store_release 整店释放时同步标 missing_since(校正观测;`docs/allocation_plan.md` §9.4「死店冻结行」);存量清单随 A0.5 审计出
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)
 
@@ -161,7 +161,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 > 在线产品拉取(catalog_sync)、几种订单拉取、日报拉取**。
 
 - 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
-- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §十二.10)
+- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §八「销量统计维度化」)
 - **涨跌幅闸**(maintenance.py:47,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议
 - ✅ ~~挂调度:全部工作流一条没挂~~(**2026-08-17 全部上线**:launchd 2 条 + 智能体 9 条,顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance` 收在 `product_chain` 一条链里;`feed_poll` 每半小时。唯一出处 `registry/schedule.py`)
 - ✅ ~~停旧 cron 五条~~(**2026-08-17 所有者已全停**并核对;旧上架/审核 worker 按所有者决定保留当备用,不写表)

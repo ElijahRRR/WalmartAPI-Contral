@@ -87,7 +87,8 @@ docs/           plan.md / production_cutover.md(**走进生产的定稿与待办
                 legacy_survey.md(旧仓库全量摸底,证据级) / scraper_migration_brief.md /
                 api_blueprint.md(端点定稿) / audit_migration_plan.md(审核链) /
                 category_mapping.md(**类目映射链九条工作流的唯一文档**) /
-                multi_node_plan.md(**一店多仓改造的调研定稿与批次计划**)
+                multi_node_plan.md(**一店多仓改造的调研定稿与批次计划**) /
+                allocation_plan.md(**产品占用与分配链八条工作流的唯一文档**)
 ```
 
 ## 判某样东西"没用了"之前(2026-08-14 全项目盘点的教训)

@@ -178,12 +178,27 @@ def _load_gate_state():
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
-    """限额表「上架限制」;未登记/读不到按旧语义默认 999(等于不限)。"""
+    """限额表「上架限制」;未登记/读不到按旧语义默认 999(等于不限)。
+
+    ⚠ **同一张限额表,本链与分配链的降级方向相反** —— 这是有意的,但必须说破:
+      · 这里读不到 ⇒ 默认不限,**照常上架**(旧语义,不改:改成硬拒会在飞书抖动
+        时停掉生产上架线);
+      · 分配链(`alloc_plan`/`alloc_stores`/`alloc_backfill`/`claim_audit`)读不到
+        ⇒ **硬拒**(没有类目/渠道/容量就没法分配);
+      · `alloc_audit` 是第三种:记 `cfg_err` 后降级继续,报告末尾点破。
+    最坏组合是**上架侧放开、分配侧关停**:货照上,却没人在决定该上什么。
+    所以这条降级**必须留痕** —— 原来是静默 `return {}`,运行摘要上完全看不出
+    今天的上架是"按限额跑的"还是"限额没读到、全店不限"。
+    """
     t = resources.RETIRE_LIMITS
     f = t.fields
     try:
         recs = feishu.list_records(t, field_names=[f.store, f.max_daily_list])
     except LookupError:
+        logger.warning(
+            "限额表未登记/读不到 —— 本轮**所有店按不限量上架**(旧语义 default=%d)。"
+            "⚠ 同一张表分配链是硬拒:此刻上架侧放开、分配侧很可能已经停摆,"
+            "两边同时发生时先去看限额表的 app_token/table_id 有没有配", default)
         return {}
     out: dict[str, int] = {}
     for rec in recs:

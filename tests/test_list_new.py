@@ -1082,3 +1082,22 @@ def test_denominator_is_rows_that_entered_prep_not_rows_that_succeeded():
     src = inspect.getsource(ln.run)
     assert "_llm_cost_lines(len(prep_in))" in src
     assert "_llm_cost_lines(len(prep_ok))" not in src
+
+
+def test_missing_limits_table_is_logged_not_silent(monkeypatch, caplog):
+    """⚠ 同一张限额表,本链与分配链的降级方向**相反**,所以降级必须留痕。
+
+    这里读不到 ⇒ 默认不限、照常上架(旧语义,故意不改:改成硬拒会在飞书抖动
+    时停掉生产上架线);分配链读不到 ⇒ 硬拒。最坏组合是**上架侧放开、分配侧
+    关停** —— 货照上,却没人在决定该上什么。
+
+    原来是静默 `return {}`:运行摘要上完全看不出今天的上架是"按限额跑的"
+    还是"限额没读到、全店不限"。
+    """
+    import logging as _lg
+    monkeypatch.setattr(ln.feishu, "list_records",
+                        lambda *a, **k: (_ for _ in ()).throw(LookupError("未登记")))
+    with caplog.at_level(_lg.WARNING, logger="workflows.list_new"):
+        assert ln._load_quota() == {}
+    # getMessage() 才是格式化后的整句(message 是模板,args 还没代入)
+    assert any("所有店按不限量上架" in r.getMessage() for r in caplog.records)

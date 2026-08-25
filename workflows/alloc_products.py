@@ -1,9 +1,9 @@
 """alloc_products — 产品分体检(只读)。分配引擎动工前先看这张表。
 
 用法:
-  python cli.py alloc_products                     # 销量窗口默认近一年
-  python cli.py alloc_products -p days=90          # 换窗口
-  python cli.py alloc_products -p as_of=2026-08-15 # 钉住窗口右端
+  python cli.py alloc_products                          # 销量窗口默认近一年
+  python cli.py alloc_products -p sales_days=90         # 换窗口
+  python cli.py alloc_products -p as_of=2026-08-15      # 钉住窗口右端
   python cli.py alloc_products -p export=0         # 只看摘要不落 csv
 
 与 `alloc_stores` 同一路数:**引擎的产品侧决策全建在这套分数上,先摊开
@@ -66,11 +66,25 @@ def _pct(n, d):
 
 
 def run(params: dict) -> str:
-    """输入:params(days/as_of/export)→ 输出:产品分体检报告。"""
+    """输入:params(sales_days/as_of/export)→ 输出:产品分体检报告。"""
     # 产品侧销量窗口默认**近一年**(所有者定稿 2026-08-16)。
     # ⚠ 与 alloc_stores 的 90 天窗口是两码事:那边要"这家店现在什么水平",
     # 这边要"这个品到底卖没卖过" —— 窗口越短覆盖率越低(90 天只有 1.0%)
-    days = int(params.get("days", ps.SALES_WINDOW_DAYS))
+    #
+    # ★ 参数名叫 `sales_days` 而不是 `days`,与 `alloc_plan` 对齐。
+    #   原来这里也叫 `days`,于是同一个名字在两条工作流里装着不同的东西:
+    #   `alloc_stores -p days=90` 是店铺窗口(对),`alloc_products -p days=90`
+    #   却把**产品销量窗口从 365 砍到 90**。照文档 §12.4「两个窗口」的心智
+    #   模型给例行一跑统一加 `-p days=90`,前两条都对、这条**静默**跑偏,
+    #   而销量信号覆盖率本来就只有几个百分点,再砍窗口会把唯一有正面证据的
+    #   那批品抹平 —— 报告上只会写"近 90 天销量",看不出是配错了。
+    if "days" in params:
+        raise ValueError(
+            "alloc_products 的销量窗口参数叫 `sales_days`,不是 `days` ——"
+            "`days` 在 alloc_stores/alloc_plan 里是**店铺经营水平**那个 90 天窗口,"
+            "两者不是一回事(见 docs/allocation_plan.md 口径 #17a)。"
+            f"你大概想要:-p sales_days={params['days']}")
+    days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
     win = sv.sales_window(str(params.get("as_of", "")), days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
 

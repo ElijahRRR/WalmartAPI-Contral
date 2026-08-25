@@ -331,6 +331,22 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
                 logger.error("workflow %s 失败:\n%s", name, err)
                 _record_finish(run_id, "failed", err[-2000:])
                 return "failed", f"{mode}{name} 失败\n{_err_brief(e)}"
+            # ★ **硬拒不是成功**。全仓十几处「前提不成立就别跑」的早退都是
+            # 普通的 `return "⛔ …"`而不抛异常 —— 那是对的，它不是崩溃，
+            # 不该打印 traceback。但原来 cli 原样记 status='success' 并发 ✅，
+            # 后果是 **ops.runs 对这几条工作流失去判别力**：
+            #   实测 2026-08-16 日志：`workflow alloc_plan 成功: ⛔ 限额表读不到…`
+            #   紧跟 `✅ [DRY-RUN] alloc_plan 成功` —— 飞书告警里「什么都没干」
+            #   和「分配了 2.8 万条」长得一模一样。
+            # 且串联模式说好了「前一个失败就不跑后面」，而拒跑计成成功
+            # 会让整条链带着“前提没满足”一路跑到底。
+            # 约定：摘要以 ⛔ 开头 = 前提不成立、**什么都没做**。
+            if summary.lstrip().startswith(REFUSED_MARK):
+                logger.error("workflow %s 硬拒:\n%s", name, summary,
+                             extra={"file_only": True})
+                print(summary)
+                _record_finish(run_id, "refused", summary)
+                return "refused", f"{mode}{name} 未执行(前提不成立)\n{summary}"
             # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
             logger.info("workflow %s 成功:\n%s", name, summary,
                         extra={"file_only": True})
@@ -339,8 +355,14 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
             return "success", f"{mode}{name} 成功\n{summary}"
 
 
-_ICON = {"success": "✅", "failed": "❌", "locked": "⚠"}
-_EXIT = {"success": 0, "failed": 1, "locked": 3}
+#: 摘要以它开头 = 工作流自己判定「前提不成立,什么都没做」。
+#: 工作流写 `return "⛔ …"` 就行,不必招异常。
+REFUSED_MARK = "⛔"
+
+_ICON = {"success": "✅", "failed": "❌", "refused": "⛔", "locked": "⚠"}
+#: 硬拒与失败同一个退出码:两者对调用方的意义一致 —— **活没干成**,
+#: `&&` 串起来的后续步骤都不该再跑。区分在 ops.runs.status 与通知图标上。
+_EXIT = {"success": 0, "failed": 1, "refused": 1, "locked": 3}
 
 
 def main(argv: list[str] | None = None) -> int:

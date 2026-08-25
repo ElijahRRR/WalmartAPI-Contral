@@ -36,7 +36,8 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 import logging
 
 from registry import db
-from services import dispositions, maintenance_intents as mi, store_limits
+from services import alloc_survey, dispositions, \
+    maintenance_intents as mi, store_limits
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
 
@@ -44,6 +45,37 @@ logger = logging.getLogger("workflows.maintenance_scan")
 
 _KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与执行件的连接键)
 _KIND_ORDER = ("delete", "title", "price", "inventory")
+
+
+def _channel_lines(zeroing: list[dict]) -> list[str]:
+    """输入:清零意图 → 输出:渠道不符那一档的**逐店**明细(不符就返空)。
+
+    为什么单独给它一行,而不是让它混在「清零合计」的原因码里:**补救动作是
+    逐店的**。其余四档(缺货/不可售/无 BuyBox/货期)的处置对象是商品,看总数
+    就够;渠道不符的处置对象是**这家店** —— 要么改它的「配送限制」,要么承认
+    这批货该换店。只报一个总数,人拿到手第一句话必然是"哪几家店",而这份
+    preview 是真提交之前唯一看得见破坏面的地方(与删除名单同一条理由)。
+
+    ⚠ **规划外店(谭总系)必须标出来**:分配链与审计链在判渠道**之前**就把
+    它们筛掉了(`alloc_survey.claimable` 先 is_excluded 再 offends_channel),
+    而维护链这一闸对所有店一视同仁。两条链对同一批商品说两种话时,得让人一眼
+    看见是哪些行踩在这个分歧上 —— 不标的话它们混在总数里,谁也不会想起来问。
+    """
+    bad = [z for z in zeroing if z.get("code") == "channel_mismatch"]
+    if not bad:
+        return []
+    by: dict[str, int] = {}
+    for z in bad:
+        by[z["store"]] = by.get(z["store"], 0) + 1
+    n_out = sum(n for s, n in by.items() if alloc_survey.is_excluded(s))
+    cells = ",".join(f"{s}×{n}" + ("⚑" if alloc_survey.is_excluded(s) else "")
+                     for s, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0])))
+    out = [f"  ⚠ 其中渠道不符清零 {len(bad)} 行(本店渠道 ≠ 产品渠道):{cells}"]
+    if n_out:
+        out.append(f"    ⚑ = 规划外店,共 {n_out} 行 —— 这些店**分配链与审计链"
+                   f"不判渠道**(claimable 先剔规划外再判),维护链判了。"
+                   f"要对齐就把这一闸也对规划外店豁免")
+    return out
 
 
 def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
@@ -88,9 +120,10 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
         codes: dict[str, int] = {}
         for z in zeroing:
             codes[z.get("code") or "-"] = codes.get(z.get("code") or "-", 0) + 1
-        # 四条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
+        # 五条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
         lines.append(f"  清零合计 {len(zeroing)} 条,原因:"
                      + ",".join(f"{c}×{n}" for c, n in sorted(codes.items())))
+        lines += _channel_lines(zeroing)
     by_store: dict[str, dict[str, int]] = {}
     for it in intents:
         by_store.setdefault(it["store"], {})[it["kind"]] = \

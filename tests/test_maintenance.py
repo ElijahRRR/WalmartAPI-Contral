@@ -530,6 +530,31 @@ def _scan_wire(monkeypatch, intents, sz=("T1",)):
     return ms, calls
 
 
+def test_scan_breaks_channel_clears_down_by_store():
+    """1600 行清零只报一个总数没用:渠道不符的**补救动作是逐店的**。
+
+    而且规划外店必须打旗标 —— 分配链与审计链在判渠道之前就把它们筛掉了
+    (`claimable` 先 is_excluded 再 offends_channel),维护链判了。两条链对同一批
+    商品说两种话时,得让人一眼看见踩在分歧上的是哪几行。
+    """
+    zeroing = ([{"store": "A085朱丽霖", "sku": f"B0A{i}", "kind": "inventory",
+                 "new": 0, "code": "channel_mismatch"} for i in range(3)]
+               + [{"store": "谭总6", "sku": f"B0T{i}", "kind": "inventory",
+                   "new": 0, "code": "channel_mismatch"} for i in range(9)]
+               + [{"store": "A085朱丽霖", "sku": "B0OOS", "kind": "inventory",
+                   "new": 0, "code": "out_of_stock"}])
+    from workflows import maintenance_scan as ms
+    got = "\n".join(ms._channel_lines(zeroing))
+    # 按条数降序,规划外店带旗标;缺货那条不算进来(它的处置对象是商品不是店)
+    assert "渠道不符清零 12 行" in got
+    assert "谭总6×9⚑" in got and "A085朱丽霖×3" in got
+    assert "A085朱丽霖×3⚑" not in got          # 在册店不许被标成规划外
+    assert "规划外店,共 9 行" in got
+    # 一行渠道不符都没有时不占版面(排版规范规矩 2:只报真的发生了的)
+    assert ms._channel_lines([z for z in zeroing
+                              if z["code"] != "channel_mismatch"]) == []
+
+
 def test_scan_lists_delete_names_separately(monkeypatch):
     """删除不可逆:名单必须看得见,且与其余三类分开说(拆分后归扫描件)。"""
     intents = ([{"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",

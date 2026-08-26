@@ -152,15 +152,24 @@ def run(params: dict) -> str:
 
     stockzero = store_limits.stockzero_stores()
     with db.pg_conn() as conn:
-        intents = mi.collect_all(conn, stockzero,
-                                 int(params.get("oos_days", 0) or 0))
+        intents, capped = mi.collect_all(conn, stockzero,
+                                         int(params.get("oos_days", 0) or 0))
     if only:
         intents = [i for i in intents if i["store"] == only]
+        capped = [c for c in capped if c["store"] == only]
 
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
     lines = [f"维护意图 {len(intents)} 条:删除 {n_kind['delete']},"
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
              f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
+    for c in capped:
+        # 截断必须进摘要(08-25 生产教训:全局闸截掉 7,766 条改价只写了一行
+        # 日志 warning,飞书通知报的全是截断后的数,看起来一切正常 —— 三家店
+        # 的倍率调整拖了三天才被人从"价格没变"倒查出来)
+        lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
+                     f"{c['total']}→{c['kept']} 条(超单店单轮上限,按截断"
+                     f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
+                     f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     lines += _preview_lines(intents, stockzero)
 
     if not mi.TITLE_MISMATCH_DELETE:

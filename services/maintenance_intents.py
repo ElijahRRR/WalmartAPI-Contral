@@ -46,8 +46,30 @@ TITLE_PLACEHOLDERS = {"[商品不存在]"}
 PRICE_MIN_DELTA = 0.01
 PRICE_MIN_RATIO = 0.01          # 1%
 
-# 单轮每类意图上限(防某天采集侧大面积变动 → 一次几万条 feed)
-MAX_INTENTS_PER_KIND = 5000
+# 单店单轮每类意图上限(所有者定稿 2026-08-26:「上限做成按店,数字对齐真实
+# 配额」)。此前是全局 5000/类 —— 那道闸防的是"采集侧事故一次产出几万条",
+# 但它分不清事故与**故意的**大面积调整:08-25 倍率调整日 12,766 条改价被
+# 截成 5,000,谭总 7 家店拖了三天,且截断只进日志不见人。沃尔玛的配额全部
+# **按店**计,全局闸只会卡住合法的大改,废除。
+# 数字 = 该类 feed 的按店速率桶 × 单 feed 切片条数(api/_client._RATE_BUCKETS
+# × api/feeds._SLICE_LIMITS,有测试钉住三处一致;改桶/改切片先看那条测试):
+#   price     feeds.post.price     6/天(三件套共享桶,保守) × 1000 条 = 6000
+#             (本仓价格桶唯一消费者就是维护链,可以吃满)
+#   inventory feeds.post.inventory 8/小时 × 4000 条 = 32000(一小时桶)
+#   title     feeds.post.MP_MAINTENANCE 8/小时 × 1000 条 = 8000(一小时桶)
+# delete **不在表里**:破坏类的按店数量闸唯一在执行件(problem_product_cleanup
+# 领取时 cap_destructive 按限额表「下架限制」截),扫描件如实报待办
+# (2026-08-24 归一口径,扫描期再截一道就是"每店最多 N 实际 2N"的老坑)。
+MAX_INTENTS_PER_STORE = {"price": 6000, "inventory": 32000, "title": 8000}
+
+# 超上限时**截谁**(按店组内排序,升序取前 cap 条;不在表里的类保持产出序):
+#   price     偏差比例大的先走 —— 错得越离谱的价越该当天纠;
+#   inventory 清零(new=0)先走 —— "别卖错"优先于"补货上量"(排序稳定,
+#             同为清零/同为补货时保持产出序)。
+_TRUNC_PRIORITY = {
+    "price": lambda it: -abs(it["new"] - it["old"]) / max(float(it["old"] or 0), 0.01),
+    "inventory": lambda it: 0 if it.get("new") == 0 else 1,
+}
 
 # 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
@@ -454,14 +476,33 @@ def record_submitted(conn, intents: list[dict]) -> int:
     return len(intents)
 
 
-def _cap(intents: list[dict], kind: str) -> list[dict]:
-    """输入:意图列表 → 输出:截到单轮上限(超出只告警,下轮继续)。"""
-    if len(intents) <= MAX_INTENTS_PER_KIND:
-        return intents
-    logger.warning("%s 意图 %d 条超单轮上限 %d,本轮只提交前 %d 条(其余下轮)",
-                   kind, len(intents), MAX_INTENTS_PER_KIND,
-                   MAX_INTENTS_PER_KIND)
-    return intents[:MAX_INTENTS_PER_KIND]
+def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
+    """输入:意图列表 → 输出:(截到单店单轮上限的列表, 截断报告)。
+
+    按 (店铺, 类型) 分组截断,组内先按 _TRUNC_PRIORITY 排序再取前 cap 条
+    (排序只在**真要截**的组里发生,不超限的组一个字不动 —— 平日零成本)。
+    截断报告一行一个被截的组:{"store","kind","total","kept"},调用方必须把它
+    带进运行摘要 —— 08-25 的教训是截断只写日志 warning,飞书摘要报的全是
+    截断后的数,7,766 条没进 feed 而通知看起来一切正常。
+    """
+    by: dict[tuple, list[dict]] = {}
+    for it in intents:
+        by.setdefault((it["store"], it["kind"]), []).append(it)
+    out, report = [], []
+    for (store, kind), group in by.items():
+        cap = MAX_INTENTS_PER_STORE.get(kind)
+        if cap is None or len(group) <= cap:
+            out.extend(group)
+            continue
+        key = _TRUNC_PRIORITY.get(kind)
+        ranked = sorted(group, key=key) if key else group   # sorted 稳定
+        out.extend(ranked[:cap])
+        report.append({"store": store, "kind": kind,
+                       "total": len(group), "kept": cap})
+        logger.warning("%s %s 意图 %d 条超单店单轮上限 %d,本轮只提交 %d 条"
+                       "(按截断优先级取,其余下轮)",
+                       store, kind, len(group), cap, cap)
+    return out, report
 
 
 def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
@@ -510,11 +551,11 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
     with conn.cursor() as cur:
         cur.execute(_SQL_MATCH_INV, (list(stockzero_stores or []),))
         rows = cur.fetchall()
-    return _cap([{"store": s, "sku": k, "kind": "inventory",
-                  "old": q, "new": MATCH_INVENTORY_QTY,
-                  "code": "match_restock",
-                  "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
-                 for s, k, q in rows], "inventory")
+    return [{"store": s, "sku": k, "kind": "inventory",
+             "old": q, "new": MATCH_INVENTORY_QTY,
+             "code": "match_restock",
+             "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
+            for s, k, q in rows]
 
 
 def price_intents(conn, multipliers: dict[str, dict],
@@ -583,7 +624,7 @@ def price_intents(conn, multipliers: dict[str, dict],
     if skipped_no_shipping:
         logger.warning("改价:%d 行运费未采到(采集侧 N/A),落地价算不出来,"
                        "本轮不改价——**绝不当免运费处理**", skipped_no_shipping)
-    return _cap(out, "price")
+    return out
 
 
 def inventory_intents(conn, stockzero_stores: list[str] | None = None,
@@ -607,8 +648,10 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
         `MAX_LEAD_DAYS`(**7 天**,所有者两次收紧 12 →08-09→ 8 →08-15→ 7)。
         ⚠ 与上架侧口径不同:上架侧超限是**不上架**,这里已经在架了只能压库存
     ⚠ 血量提醒:采集服务中断一整轮会让大批行的 stock_count 变 NULL,
-    按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
-    真跑前务必看 dry-run 的清零条数。
+    按本规则即全线清零。2026-08-26 起单轮上限改按店(所有者定稿:及时性
+    优先,配额是按店的,全局闸卡的全是合法大改),**这道闸挡不住整店清零**
+    (单店目录远小于单店上限)—— 防线只剩两道:扫描摘要里的「清零合计
+    (按原因码摊开)」必须有人看;AI 改完代码先 --dry-run 的纪律没有取消。
     """
     from services import amz_source
     lead_caps = store_limits.lead_day_caps()
@@ -666,7 +709,7 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
                        "清零(原因码 channel_mismatch;其余已经是 0 或本轮要删)"
                        "——持续不符会被删除链的「渠道不符 N 天」窗口下架",
                        n_channel, n_zeroed)
-    return _cap(out, "inventory")
+    return out
 
 
 def title_intents(conn, stockzero_stores: list[str] | None = None
@@ -745,7 +788,7 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
                        "(title_mismatch)停闸期口径(所有者 2026-08-20:"
                        "停闸不冻结),原因码 title_mismatch_sync 可单独查",
                        paused_mismatch, TITLE_SIM_FLOOR * 100)
-    return _cap(out, "title")
+    return out
 
 
 def delete_intents(conn, stockzero_stores: list[str] | None = None,
@@ -778,10 +821,12 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
       而删除预览是按原因码分组给人看的。
       店没标「配送限制」时这一档**恒不触发**,判据逐字退回旧口径。
 
-    ⚠ **本函数不再截单店上限**(2026-08-24 归一)。限额表「下架限制」由执行件
-    `problem_product_cleanup` 在领取时施加一次(services.dispositions.
-    cap_destructive)。此前两条扫描件各截一次同一张表,每店最多 N 条实际变成
-    最多 2N —— 扫描件如实报待办、执行件按配额取件,才只有一处上限。
+    ⚠ **本函数不设任何数量闸**(2026-08-24 归一;2026-08-26 连全局 5000 闸
+    一并废除)。限额表「下架限制」由执行件 `problem_product_cleanup` 在领取时
+    施加一次(services.dispositions.cap_destructive)。此前两条扫描件各截一次
+    同一张表,每店最多 N 条实际变成最多 2N —— 扫描件如实报待办、执行件按
+    配额取件,才只有一处上限。cap_per_store 的按店上限表也**刻意不含 delete**,
+    理由相同。
     """
     seen, out = set(), []
     paused_mismatch = 0
@@ -863,11 +908,16 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         logger.warning("删除(title_mismatch)已停闸(所有者 2026-08-19),"
                        "本轮压制 %d 条 —— 这批行照常改价/改标题/改库存"
                        "(所有者 2026-08-20:停闸不冻结)", paused_mismatch)
-    return _cap(out, "delete")
+    return out
 
 
-def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
-    """输入:连接 + stockzero 名单(+无货天数)→ 输出:本轮全部维护意图。
+def collect_all(conn, stockzero: list[str], oos_days: int = 0
+                ) -> tuple[list[dict], list[dict]]:
+    """输入:连接 + stockzero 名单(+无货天数)→ 输出:(本轮全部维护意图, 截断报告)。
+
+    单店单轮上限(cap_per_store)在**最后**施加 —— 在 doomed 剔除与 drop_recent
+    之后,配额名额只花在真会提交的意图上(截在 provider 里的话,先截 5000 再
+    被防重压掉 400,等于白扔 400 个名额)。截断报告必须随摘要见人,不许只进日志。
 
     ⚠ **住在 services 而不是 workflow 里**:2026-08-16 拆成
     maintenance_scan(建议)+ maintenance(执行)之后,只有扫描件调它;但铁律
@@ -902,7 +952,7 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
     # 近期已提交过同一件事的压掉:提交成功后本地快照要等 catalog_sync 才更新,
     # 不压就会一轮轮重发同样的载荷(生产实证 208 条 stale update)
     intents, _n = drop_recent(conn, intents)
-    return intents
+    return cap_per_store(intents)
 
 
 # ── 意图 ⇄ 建议行(ops.dispositions)的互转 ────────────────────────────────────

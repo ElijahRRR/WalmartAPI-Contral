@@ -10,7 +10,10 @@
 
 每店流程:GET /v3/items 5 轮全量扫店(去重)→ offset 截断时用 PG 已知 SKU 单查补漏
 → GET /v3/inventories 合并可售数量 → upsert catalog.walmart_items → 标记本轮缺席行。
-凭证失效(StoreDeadError)跳过全店并计入摘要,不中断其它店铺。
+失败处理走店级重试标准(所有者定稿 2026-08-26,CLAUDE.md 工程规范):
+凭证失效(StoreDeadError)跳过全店不补试;其余失败店跑完别人后**串行补试
+一遍**,仍失败以「⚠ 缺席」点名进摘要首行、**不炸整轮**(零店完成仍失败);
+缺席店由下游按水位避让、链尾逐店重赛。
 
 本期范围(2026-08-05 决策):只做沃尔玛侧,不拉采集服务数据(增量导出契约未定稿,
 见 docs/scraper_migration_brief.md 第六条)。同步完成后把 PG 全量投影回写到
@@ -23,13 +26,14 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-import httpx
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import product_events, stores as stores_svc, walmart_catalog
+from services import product_events, store_retry, stores as stores_svc, \
+    walmart_catalog
 
 DANGEROUS = False
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.catalog_sync")
 
@@ -142,7 +146,8 @@ def run(params: dict) -> str:
     backfill_ids = str(params.get("item_ids", "")) in ("1", "true", "yes")
     run_at = datetime.now(timezone.utc)
 
-    results, dead, failed = [], [], []
+    results, dead, to_retry = [], [], []
+    by_name = {s["name"]: s for s in store_list}
     with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
         futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory, mode,
                                backfill_ids): s["name"]
@@ -152,23 +157,52 @@ def run(params: dict) -> str:
             try:
                 results.append(f.result())
             except _client.StoreDeadError as e:
+                # 凭证死是确定性的:跳过全店,不补试(重试只会再死一次)
                 logger.error("%s", e)
                 dead.append(name)
-            except httpx.ProxyError as e:
-                # 代理认证/连接失败与凭证失效同类:跳过全店,提示修凭证表,不拖垮整轮
-                logger.error("店铺 %s 代理失败(检查凭证表代理账号密码): %s", name, e)
-                dead.append(f"{name}(代理)")
             except Exception as e:
-                logger.exception("店铺 %s 同步失败: %s", name, e)
-                failed.append(f"{name}({e})")
+                # 代理故障(StoreProxyError/socksio)与泛化异常都先收着 ——
+                # 标准①(所有者定稿 2026-08-26):跑完别人再串行补试,
+                # 此刻不判生死。08-26 13:00 的事故正是在这里把两家店的
+                # SOCKS 报错直接判成 failed → 整轮 raise → 八步链全停
+                logger.exception("店铺 %s 同步失败(待串行补试): %s", name, e)
+                to_retry.append((by_name[name], e))
+
+    # 标准①:失败店串行补试一遍。单一落地路径 —— 补试跑的就是第一轮
+    # 同一个 _sync_one_store,不另写简化版
+    absent: list[tuple[str, str]] = []          # (店名, 归类词:代理/其他/凭证)
+    gate_note = ""
+    if to_retry:
+        recovered, still, gate_note = store_retry.serial_second_pass(
+            to_retry, lambda s: _sync_one_store(s, run_at, skip_inventory,
+                                                mode, backfill_ids),
+            total_stores=len(store_list))
+        results.extend(r for _s, r in recovered)
+        for s, e in still:
+            cls = store_retry.diagnose(e)
+            if cls == "凭证失效":                    # 补试中才暴露的凭证死,归 dead 口径
+                dead.append(s["name"])
+            else:
+                absent.append((s["name"], cls))
 
     total_written = sum(r["written"] for r in results)
     total_missing = sum(r["missing"] for r in results)
     total_item_ids = sum(r.get("item_ids", 0) for r in results)
     truncated = [r["store"] for r in results if r["truncated"]]
+    # ⚠ 首行 = 结论 + 最要紧的数,且链通知(product_chain)对成功步骤**只发
+    # 首行**(cli first_line_of)—— 缺席店必须写在这一行,放后面等于只写日志
     lines = [f"catalog_sync:{len(results)}/{len(store_list)} 店完成,"
              f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行,"
-             f"回填 item_id {total_item_ids} 个"]
+             f"回填 item_id {total_item_ids} 个"
+             + (f";⚠ 缺席 {len(absent)} 店:"
+                + ",".join(f"{n}({c})" for n, c in absent)
+                + ("——超补试规模闸未补试(疑似系统性故障)"
+                   if gate_note else
+                   "——已串行补试仍失败")
+                + ",本轮不炸链(下游按水位避让,链尾重赛)"
+                if absent else "")]
+    if gate_note:
+        lines.append(gate_note)
     if truncated:
         lines.append(f"offset 截断已补漏:{','.join(truncated)}")
     inv_failed = [r["store"] for r in results if r.get("inv_failed")]
@@ -188,17 +222,26 @@ def run(params: dict) -> str:
 
     if results and str(params.get("skip_feishu", "")) not in ("1", "true", "yes"):
         lines.append(_write_projection())   # 全部店铺失败时不动飞书表
+        if absent:
+            # 投影恒为全表一致快照(单店同步也整表重写),缺席店的行因此是
+            # 上一轮的旧值 —— 说出来,别让飞书表静默陈旧
+            lines.append(f"  ⚠ 飞书投影中缺席店({','.join(n for n, _ in absent)})"
+                         f"仍是上一轮快照")
 
-    if failed:
-        lines.append(f"失败:{'; '.join(failed)}")
+    # ⚠ 缺席店不再炸整轮(所有者定稿 2026-08-26 标准②;此前 `if failed: raise`
+    # 让两家店的代理抖动放倒八步链)。零店闸**保留**:全部店都没跑通意味着
+    # 凭证表整体出了问题或换 token 请求形状被改坏,报成功没人会来看,
+    # 而目录数据就那么静静地陈旧下去。
     if not results:
-        # 一家都没跑通 ⇒ 不许报成功。「凭证失效跳过」按设计不进 failed(一家店
-        # 坏了不该拖垮整轮),但**全部**店都被跳过意味着这一轮什么都没同步:
-        # 要么凭证表整体出了问题,要么换 token 的请求形状被改坏了。这一轮报
-        # 成功的话没人会来看,而目录数据就那么静静地陈旧下去。
         lines.append("⚠ 零店完成 —— 本轮没有同步任何数据")
-    if failed or not results:
         raise RuntimeError("\n".join(lines))   # 飞书通知带的是这份全文(cli._err_brief)
+    if absent and str(params.get("strict", "")) in ("1", "true", "yes"):
+        # strict=1(daily_report 链专用,调度里配 catalog_sync:strict=1):
+        # 那条链的语义是「同步失败就不出日报 —— 拿旧数出报不如不出」
+        # (registry/schedule.py 定稿),缺席不炸链的新标准会把这道闸静默
+        # 降级成"照出,缺席店三列是昨天的数"。给它保留严格口径;
+        # product_chain 不配 strict(维护链按店避让,不需要整链陪跪)。
+        raise RuntimeError("\n".join(lines + ["⚠ strict 模式:缺席即失败(此链宁可不出产物)"]))
     return "\n".join(lines)
 
 

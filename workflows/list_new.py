@@ -97,6 +97,7 @@ from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     mp_mapper, pricing, product_events, product_ingest, pt_spec, risk_gate, \
     scrape_batches, store_limits, store_targets, stores as stores_svc, \
     upc_pool, variant_group, variant_remap, variant_title
+from services import store_retry
 
 DANGEROUS = True
 
@@ -1623,7 +1624,8 @@ def run(params: dict) -> str:
                 + (f",⏸ {n_defer} 条不确定待整轮后结算" if n_defer else ""))
         except Exception as e:
             logger.exception("店铺 %s 上架异常,跳过继续其它店: %s", store_name, e)
-            lines_s.append(f"  ⚠ {store_name}:上架异常已跳过({e}),下轮重试")
+            lines_s.append(f"  ⚠ {store_name}:上架异常已跳过"
+                           f"({store_retry.diagnose(e)}:{e}),下轮重试")
         return store_name, cnt, reasons_s, lines_s, deferred_s
 
     todo2 = sorted(by_store2.items())

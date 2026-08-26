@@ -47,7 +47,8 @@ from datetime import datetime
 from api import feeds, items as items_api
 from registry import db
 from services import blacklist, kpi, listing_sources, match_feed, \
-    match_sheet, product_events, risk_gate, stores as stores_svc
+    match_sheet, product_events, risk_gate, store_retry, \
+    stores as stores_svc
 
 DANGEROUS = True
 
@@ -244,7 +245,8 @@ def run(params: dict) -> str:
         except Exception as e:
             logger.exception("店铺 %s 跟卖提交异常,跳过继续其它店: %s",
                              store_name, e)
-            lines.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+            lines.append(f"  ⚠ {store_name}:提交异常已跳过"
+                         f"({store_retry.diagnose(e)}:{e}),下轮重试")
 
     written = match_sheet.write_rows(updates)
     lines.append(f"回写 {written} 行;feed 结果轮询走 feed_poll")

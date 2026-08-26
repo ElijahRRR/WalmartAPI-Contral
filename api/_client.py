@@ -55,6 +55,62 @@ class StoreDeadError(Exception):
         self.status = status
         super().__init__(f"店铺 {store_name} 凭证失效(HTTP {status}),跳过全店")
 
+
+# SOCKS 代理栈自己的异常树。socksio 的 ProtocolError **直接继承 Exception**,
+# httpx 不映射它(httpcore 只在自判失败时抛 ProxyError;socksio 在解包阶段抛的
+# 原样穿透)—— 2026-08-26 13:00 生产实证:两家店 "Malformed reply" 落进
+# catalog_sync 的泛化异常桶,整链停摆。装不出 socksio 时给空元组,优雅退化。
+try:
+    from socksio.exceptions import SOCKSError as _SOCKSError
+    SOCKS_ERRORS: tuple = (_SOCKSError,)
+except ImportError:                                 # pragma: no cover
+    SOCKS_ERRORS = ()
+
+# 网络层桶:连接池该剔除、可退避重试的一整类。httpx.ProxyError ⊂ TransportError,
+# 不必单列;socksio 不在 httpx 树上,必须并列进来。
+_NET_ERRORS: tuple = (httpx.TransportError,) + SOCKS_ERRORS
+
+
+class StoreProxyError(httpx.ProxyError):
+    """店铺出口代理故障(SOCKS 握手/隧道层报错,或换 token 阶段传输层失败)。
+
+    **子类化 httpx.ProxyError 是刻意的**:全仓各处
+    `except (StoreDeadError, httpx.ProxyError)` 分类分支因此天然接住它,
+    一处都不用改。与 StoreDeadError 的语义分工:凭证死是**确定性**的
+    (重试只会再死一次),代理故障是**可重试**的(隧道抖动/代理商瞬断)——
+    店级重试标准(所有者定稿 2026-08-26)只补试后者。
+    """
+
+    def __init__(self, store_hint: str, cause: Exception):
+        self.cause = cause
+        super().__init__(f"店铺代理故障({store_hint}):"
+                         f"{cause.__class__.__name__}: {cause}")
+
+
+#: workflow 分类分支的唯一判据元组(「这是店级代理/网络故障」)。
+#: StoreProxyError ⊂ httpx.ProxyError,不必单列。
+PROXY_ERRORS: tuple = (httpx.ProxyError,) + SOCKS_ERRORS
+
+
+# ── 官方退避阶梯 + 抖动(#91 引入于 api/feeds,2026-08-26 上提到此作全项目
+# 唯一出处 —— 店级重试与 feed 补交共用一套,双轨禁止)。官方原文逐条:
+#   INVALID_SYSTEM_STATE/SYSTEM_ERROR (500) —— "retry with jitter"
+#   DOWNSTREAM_SYSTEM_TIME_OUT (504)        —— "retry with exponential backoff"
+#   平台可用性节                             —— "backoff and jitter";阶梯示例 2,4,8,16,32
+BACKOFF_LADDER = (2, 4, 8, 16, 32)
+
+
+def backoff(attempt: int) -> float:
+    """输入:第几次退避(0 起)→ 输出:**带抖动**的秒数(官方阶梯 × [0.5,1.0])。
+
+    抖动取"满阶梯的一半到满值"(AWS full-jitter 变体):既保证退避在长,
+    又保证同时失败的 N 家店**不会同时醒来** —— 没有它,退避只是把洪峰
+    整体平移,不是把它摊平。
+    """
+    import random
+    base = BACKOFF_LADDER[min(attempt, len(BACKOFF_LADDER) - 1)]
+    return base * (0.5 + random.random() * 0.5)
+
 # client_id → {"token": str, "expires_at": float, "secret": str, "proxy": str}
 # secret + proxy 保留是为了 401 时能就地刷新 token,不需要调用方再传一次。
 _token_cache: dict = {}
@@ -310,7 +366,7 @@ def safe_get_raw(url, token, client_id, proxy, params=None, timeout=90,
         try:
             resp = _get_client(proxy).get(
                 url, headers=headers_out, params=params, timeout=timeout)
-        except (httpx.TransportError, httpx.ProxyError) as e:
+        except _NET_ERRORS as e:        # 含 socksio(不在 httpx 树上,单列进桶)
             _invalidate_client(proxy)
             if attempt < max_retries:
                 wait = min(2 ** attempt, 10)
@@ -336,8 +392,14 @@ def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:
     """输入:URL(如报表预签名下载地址)+ 代理 → 输出:响应字节。
 
     走店铺固定出口代理(与所有沃尔玛流量同链路,铁律),非 2xx 抛异常。
+    传输/SOCKS 层失败同样抛(调用方自己兜),但先剔掉池里的坏连接 ——
+    收口清单别漏这一处(2026-08-26 对抗校验)。
     """
-    resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    try:
+        resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    except _NET_ERRORS:
+        _invalidate_client(proxy)
+        raise
     resp.raise_for_status()
     return resp.content
 
@@ -366,19 +428,28 @@ def get_token(client_id, client_secret, proxy):
 
         cred = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         client = _get_client(proxy)
-        resp = client.post(
-            f"{base_url()}/v3/token",
-            headers={
-                "Authorization": f"Basic {cred}",
-                "WM_SVC.NAME": "Walmart Marketplace",
-                "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),
-                "WM_CONSUMER.ID": client_id,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            data={"grant_type": "client_credentials"},
-            timeout=30,
-        )
+        try:
+            resp = client.post(
+                f"{base_url()}/v3/token",
+                headers={
+                    "Authorization": f"Basic {cred}",
+                    "WM_SVC.NAME": "Walmart Marketplace",
+                    "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),
+                    "WM_CONSUMER.ID": client_id,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                data={"grant_type": "client_credentials"},
+                timeout=30,
+            )
+        except _NET_ERRORS as e:
+            # 换 token 是每家店的第一跳,此前对传输层零保护 —— 27 个调用点裸奔,
+            # SOCKS 报错原样穿到各 workflow 的泛化异常桶(2026-08-26 13:00 事故:
+            # "Malformed reply" 判成普通失败 → catalog_sync raise → 整链停摆)。
+            # 收口成 StoreProxyError(⊂ httpx.ProxyError),分类分支按"该店代理坏"
+            # 处理;连接池同步剔除,坏连接不留给下一家店
+            _invalidate_client(proxy)
+            raise StoreProxyError(f"client_id={client_id[:6]}…", e) from e
         # 换 token 阶段的 400/401/403 = 这套凭证被拒,与业务端点的 401/403 同类,
         # 一律转 StoreDeadError 交给调用方"跳过全店"。
         # ⚠ 沃尔玛在 client_credentials 授权失败时回的是 **400**(不是 401),
@@ -506,8 +577,9 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 params=params,
                 timeout=timeout,
             )
-        except (httpx.TransportError, httpx.ProxyError) as e:
-            # 连接级故障:池里这条连接很可能已坏,主动剔除让下次建新的
+        except _NET_ERRORS as e:
+            # 连接级故障(含 socksio 的 SOCKS 层报错,它不在 httpx 异常树上):
+            # 池里这条连接很可能已坏,主动剔除让下次建新的
             _invalidate_client(proxy)
             _log(f"✗ {method} 网络失败(已剔除连接) {url}: {e}", quiet)
             if attempt < max_retries:
@@ -534,6 +606,13 @@ def _request_ex(method, url, token, client_id, proxy, *,
                     refreshed_401 = True
                     _log(f"⚠ {method} 401 → token 已刷新,重试 {url}", quiet)
                     continue
+                except _NET_ERRORS:
+                    # 刷新那一跳撞上代理/传输故障:**原样上抛**,不落回 401 流程
+                    # —— 落回去会被各 api 模块的 401→StoreDeadError 统一动作
+                    # 判成"凭证死"(不补试),而真正的病在代理(可补试)。
+                    # 一次 SOCKS 抖动被记成凭证失效,人被指去查凭证表
+                    # (2026-08-26 对抗校验:分诊口径的静默反例)
+                    raise
                 except Exception as e:
                     _log(f"✗ {method} 401 后换 token 失败 {url}: {e}", quiet)
                     # 落回原 401 返回流程

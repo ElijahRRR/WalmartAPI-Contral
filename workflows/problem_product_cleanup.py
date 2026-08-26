@@ -45,9 +45,11 @@ from registry import db
 from services import dispositions
 from services import problem_products as pp
 from services import kpi, maint_sheet
-from services import product_events, store_limits, stores as stores_svc
+from services import product_events, store_absence, store_limits, \
+    stores as stores_svc
 
 DANGEROUS = True
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.problem_product_cleanup")
 
@@ -116,10 +118,28 @@ def run(params: dict) -> str:
         # 不限动作会领到 title/price/inventory,group_by_store 直接抛。
         rows = [r for r in dispositions.claim(conn, dispositions.PROBLEM_ACTIONS)
                 if not only or r["store"] == only]
-    # 单店删除上限**只在这里施加一次**(2026-08-24 归一):此前两条扫描件各按
-    # 同一张限额表「下架限制」截一次,每店最多 N 条实际变成了最多 2N。
+        # 缺席避让(店级重试标准③补全,2026-08-26 对抗校验):扫描件避让了
+        # 缺席店、withdraw 还特意护住了它们的存量 suggested —— 执行件不避让
+        # 的话,这批按**隔夜观测**建议的删除会在同一轮链里照样领走、照样发
+        # DELETE_ITEM。缺席店的行原地留在 suggested,等重赛/下轮观测刷新后
+        # 由扫描件重新定夺。探测失败按空处理并喊出来(不避让 = 改前行为)。
+        n_absent_held = 0
+        try:
+            absent = set(store_absence.stale_stores(conn))
+        except Exception as e:
+            absent = set()
+            lines_absent_note = f"⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
+        else:
+            lines_absent_note = ""
+        if absent:
+            n_absent_held = sum(1 for r in rows if r["store"] in absent)
+            rows = [r for r in rows if r["store"] not in absent]
+        # 单店删除上限**只在这里施加一次**(2026-08-24 归一),且按**天**记账
+        # (2026-08-26):当日已放行的先扣掉,链尾重赛/人工重跑不会把上限翻倍
+        executed_today = dispositions.destructive_executed_today(conn)
     rows, over_cap = dispositions.cap_destructive(
-        rows, _retire_caps(), dispositions.DESTRUCTIVE_PER_STORE)
+        rows, _retire_caps(), dispositions.DESTRUCTIVE_PER_STORE,
+        executed_today=executed_today)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = []
@@ -127,6 +147,11 @@ def run(params: dict) -> str:
         lines.append(f"上一轮落定:生效 {settled['confirmed']},"
                      f"**未生效 {settled['ineffective']}**"
                      f"(回执成功但观测显示没动,下轮 problem_scan 会重新建议)")
+    if n_absent_held:
+        lines.append(f"⚠ 缺席避让:{n_absent_held} 条建议属于缺席店(目录未刷新),"
+                     f"留在 suggested 原地 —— 隔夜观测不配开破坏 feed")
+    if lines_absent_note:
+        lines.append(lines_absent_note)
     if not rows:
         return "\n".join(lines + [
             f"{mode}没有待执行的处置建议 —— 先跑 `python cli.py problem_scan`"
@@ -175,14 +200,17 @@ def run(params: dict) -> str:
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     records: list[tuple] = []       # 维护记录表的行(见文件末尾一次性写出)
 
-    def _round(names: list[str]) -> tuple[dict, list[str]]:
-        """输入:要跑的店铺名 → 输出:({店铺: 该店的行}, 需二轮重试的店)。
+    def _round(names: list[str], workers: int | None = None
+               ) -> tuple[dict, list[str]]:
+        """输入:要跑的店铺名(+并发上限)→ 输出:({店铺: 该店的行}, 需二轮重试的店)。
 
         跨店并发(所有者定稿 2026-08-17)。每店各写各的 lines_s,主线程按店名
         排序合并 —— 往共享 list 上追加不会坏数据(GIL),但摘要行序会按完成
         先后乱序交织,同一轮跑两次输出都不一样,没法对拍。
         安全性:每店有自己的固定出口代理,配额与令牌桶都按 (store, endpoint) 计,
         跨店并发不挤同一个桶;单店失败隔离本来就在 _submit_store 里。
+        workers=1 给二轮重试用(店级重试标准 2026-08-26:补试**串行**——
+        第一轮既然证明了这批店/代理在抖,补试没有理由再齐射一遍)。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         out: dict[str, list[str]] = {}
@@ -208,7 +236,8 @@ def run(params: dict) -> str:
             return store_name, lines_s, recs_s, need
 
         with ThreadPoolExecutor(
-                max_workers=min(stores_svc.STORE_WORKERS, len(names))) as pool:
+                max_workers=min(workers or stores_svc.STORE_WORKERS,
+                                len(names))) as pool:
             for f in as_completed([pool.submit(_one, n) for n in names]):
                 name, lines_s, recs_s, need = f.result()
                 out[name] = lines_s
@@ -230,8 +259,14 @@ def run(params: dict) -> str:
         # 建议行侧同样安全:已转 executing 的行不会被本轮再领(claim 只取
         # suggested),二轮重提的是同一批 rows 对象,不会重复转态。
         retry_stores.sort()
-        lines.append(f"二轮重试 {len(retry_stores)} 店:{','.join(retry_stores)}")
-        got2, still = _round(retry_stores)
+        lines.append(f"二轮重试 {len(retry_stores)} 店(串行):"
+                     f"{','.join(retry_stores)}")
+        # 二轮**串行**(店级重试标准 2026-08-26)。⚠ 与 store_retry.
+        # serial_second_pass 是**同语义、不同实现**:这里的失败以 need 标志
+        # 传递(不是异常)、feed 层自带官方退避,签名对不上不硬套 —— 改
+        # store_retry 不会连带改到这里,两处的"串行/一次/凭证死不重试"
+        # 三条判据要**各自**维护一致
+        got2, still = _round(retry_stores, workers=1)
         for name in retry_stores:
             lines.extend(got2.get(name, []))
             if name in still:

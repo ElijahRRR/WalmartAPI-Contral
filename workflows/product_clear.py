@@ -33,9 +33,9 @@ cron(每天 15:00),新旧并跑 = 重复删除。
 import logging
 from datetime import datetime
 
-from api import feeds, feishu
+from api import _client, feeds, feishu
 from registry import db, resources
-from services import clear_sheet, feed_track, kpi, product_events, \
+from services import clear_sheet, feed_track, kpi, product_events, store_retry, \
     stores as stores_svc
 
 DANGEROUS = True
@@ -161,8 +161,16 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         list/计数器上写:list.append 在 GIL 下不会坏数据,但 `submitted += n`
         是"读-加-写"三步,两个线程交错会**丢计数**(而且丢得随机、不报错);
         摘要行序也会按完成先后乱序交织,同一轮跑两次输出不一样,没法对拍。
+
+        ⚠ updates 写进 `partial[store]`(逐片追加),不是纯局部变量
+        (2026-08-26 对抗校验):第 2 片抛异常时第 1 片已经真的 submitted,
+        局部变量随异常丢掉 = 那一片在停用/删除表上零记录 → 下一轮把它当
+        「待提交」重占重发(feed_poll 30 分钟内就会把 feed_log 打成 done,
+        在途防重只在这窗口内有效)→ DELETE 重发 + delete_times 事件灌水。
+        补试重跑同一店会再走一遍全部分片:已落地的分片按 dedup 返回同一
+        feed_id,updates 里最多出现取值相同的重复行,写表幂等。
         """
-        updates_s: list = []
+        updates_s: list = partial.setdefault(store_name, [])
         lines_s: list[str] = []
         submitted_s = 0
         limit = _limit_of(store_name)
@@ -220,12 +228,46 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
     if todo:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
+        to_retry: list[tuple] = []
+        partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
-            futs = [pool.submit(_one_store, n, s) for n, s in todo]
+            futs = {pool.submit(_one_store, n, s): (n, s) for n, s in todo}
             for f in as_completed(futs):
-                name, u, ls, sub, defr = f.result()
+                n, s = futs[f]
+                try:
+                    name, u, ls, sub, defr = f.result()
+                    per_store[name] = (u, ls, sub, defr)
+                except _client.StoreDeadError as e:
+                    logger.error("%s", e)
+                    per_store[n] = (partial.get(n, []),
+                                    [f"  {n}:凭证失效跳过,"
+                                     f"{len(s)} 行下轮重试"], 0, 0)
+                except Exception as e:
+                    # 店级隔离 + 补试(标准①,2026-08-26)。此前这里一家店抛
+                    # 异常整轮 run() 直接炸,而 writeback 排在 _submit_new 之后
+                    # —— **已经真发出去的 feed 在停用/删除表上一个字都不回写**,
+                    # 运营看到"什么都没干"而沃尔玛队列里 DELETE_ITEM 正在跑
+                    # (problem_product_cleanup 头注同款坑,那边修了这边没修)
+                    logger.exception("店铺 %s 提交异常(待串行补试): %s", n, e)
+                    to_retry.append(((n, s), e))
+        if to_retry:
+            recovered, still, gate_note = store_retry.serial_second_pass(
+                [({"name": n, "_srows": s}, e) for (n, s), e in to_retry],
+                lambda st: _one_store(st["name"], st["_srows"]),
+                total_stores=len(todo))
+            for _st, (name, u, ls, sub, defr) in recovered:
                 per_store[name] = (u, ls, sub, defr)
+            for st, e in still:
+                # 已发出的分片的回写在 partial 里,照写不丢 —— 表上有 feed_id
+                # 的行下一轮不会被当「待提交」重占重发
+                per_store[st["name"]] = (
+                    partial.get(st["name"], []),
+                    [f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
+                     f"{store_retry.diagnose(e)}:{e});已发出分片已回写表格,"
+                     f"未发出的下轮接续"], 0, 0)
+            if gate_note:
+                lines.append(gate_note)
         # 按店名排序合并:完成先后随机,updates 与摘要的顺序不能跟着随机
         for name, _ in todo:
             u, ls, sub, defr = per_store[name]

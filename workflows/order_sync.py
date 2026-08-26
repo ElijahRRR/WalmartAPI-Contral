@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import orders as orders_api
 from registry import db
-from services import order_center
+from services import order_center, store_retry
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -63,7 +63,15 @@ def run(params: dict) -> str:
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if failed:
-        lines.append(f"失败:{'; '.join(failed)}")
+        # 归类词指路(store_retry.diagnose 六档):代理波动/沃尔玛NNN/…
+        lines.append("失败:" + "; ".join(
+            f"{n}({store_retry.diagnose(e)}:{e})" for n, e in failed))
+    if not results:
+        # ⚠ 零店完成不许报成功(2026-08-26 补齐,与 returns_sync 同款闸;
+        # 此前同一条 order_chain 里两步不对称):全部店都没拉到 = 凭证表
+        # 整体出问题或请求形状被改坏,报成功没人会来看,订单数据静默停更
+        lines.append("⚠ 零店完成 —— 本轮没有同步任何订单数据")
+        raise RuntimeError("\n".join(lines))
     # 跑完就写飞书(所有者定稿 2026-08-16:已对接飞书表的执行完就写,
     # 不做成单独的)。**永不因投影失败而失败** —— 订单已经落 PG 了
     lines.append(order_center.push_after(

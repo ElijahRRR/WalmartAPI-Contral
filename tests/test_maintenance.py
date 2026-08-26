@@ -610,10 +610,12 @@ def test_store_caps_align_with_feed_quota_and_slice():
 
 # ── 扫描件(maintenance_scan)────────────────────────────────────────────────
 
-def _scan_wire(monkeypatch, intents, sz=("T1",), capped=()):
+def _scan_wire(monkeypatch, intents, sz=("T1",), capped=(), absent=()):
     from workflows import maintenance_scan as ms
     calls = {"suggest": [], "withdraw": []}
     monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
+    monkeypatch.setattr(ms.store_absence, "stale_stores",
+                        lambda conn, since=None, hours=None: list(absent))
     monkeypatch.setattr(ms.mi, "collect_all",
                         lambda conn, s, oos=0: (list(intents), list(capped)))
     _fake_db(monkeypatch, _Conn())
@@ -621,8 +623,10 @@ def _scan_wire(monkeypatch, intents, sz=("T1",), capped=()):
                         lambda conn, rows: (calls["suggest"].extend(rows),
                                             len(rows))[1])
     monkeypatch.setattr(ms.dispositions, "withdraw_stale",
-                        lambda conn, src, keep, why, store=None: (
-                            calls["withdraw"].append((src, keep, store)), 0)[1])
+                        lambda conn, src, keep, why, store=None,
+                        exclude_stores=None: (
+                            calls["withdraw"].append(
+                                (src, keep, store, exclude_stores)), 0)[1])
     monkeypatch.setattr(ms.dispositions, "count_open",
                         lambda conn, sources=None: len(calls["suggest"]))
     monkeypatch.setattr(ms.dispositions, "count_suppressed",
@@ -711,7 +715,7 @@ def test_scan_withdraw_is_scoped_to_the_store_it_scanned(monkeypatch):
                 "new": 0, "code": "out_of_stock"}]
     ms, calls = _scan_wire(monkeypatch, intents)
     ms.run({"store": "T1"})
-    src, keep, store = calls["withdraw"][0]
+    src, keep, store, _excl = calls["withdraw"][0]
     assert src == "maint" and store == "T1"
     assert keep == [("T1", "A", "inventory")]       # 只保留本店本轮的
     assert [r["store"] for r in calls["suggest"]] == ["T1"]
@@ -767,6 +771,24 @@ def test_scan_store_filter_scopes_the_truncation_report_too(monkeypatch):
     assert "7000→6000" in out and "9000→6000" not in out
 
 
+def test_scan_avoids_absent_stores_and_shields_their_rows(monkeypatch):
+    """缺席避让(店级重试标准③):catalog_sync 补试后仍缺席的店,本轮
+    ①不产任何意图(拿陈旧现值算差异会误伤 —— 38 条 not found 的老账);
+    ②首行点名(链通知只发首行);③它挂着的 suggested 行不许被撤
+    (缺席 ≠ 恢复正常,withdraw 走 exclude_stores)。"""
+    intents = [
+        {"store": "缺席店", "sku": "A", "kind": "price", "old": 9.9, "new": 11.0},
+        {"store": "正常店", "sku": "B", "kind": "price", "old": 9.9, "new": 11.0}]
+    ms, calls = _scan_wire(monkeypatch, intents, absent=["缺席店"])
+    out = ms.run({})
+    first = out.splitlines()[0]
+    assert "⚠ 缺席避让 1 店:缺席店" in first and "1 条意图不产出" in first
+    assert [r["store"] for r in calls["suggest"]] == ["正常店"]   # ①
+    _src, keep, _store, excl = calls["withdraw"][0]
+    assert keep == [("正常店", "B", "price")]
+    assert excl == ["缺席店"]                                     # ③
+
+
 def test_scan_keeps_deferred_rows_out_of_withdraw(monkeypatch):
     """被配额截掉 ≠ 不再建议:落榜行的旧 suggested 行不许被 withdraw_stale
     撤成「商品自己恢复正常了」—— 错误取证,且下轮扫描又原样重建。"""
@@ -776,7 +798,7 @@ def test_scan_keeps_deferred_rows_out_of_withdraw(monkeypatch):
         {"store": "T1", "kind": "price", "total": 3, "kept": 1,
          "deferred_keys": [("T1", "B", "price"), ("T1", "C", "price")]}])
     ms.run({})
-    _src, keep, _store = calls["withdraw"][0]
+    _src, keep, _store, _excl = calls["withdraw"][0]
     assert ("T1", "A", "price") in keep          # 入选的照常在
     assert ("T1", "B", "price") in keep and ("T1", "C", "price") in keep
 
@@ -788,11 +810,13 @@ def _disp(it, i):
     return {"id": 100 + i, **mi.to_disposition(it)}
 
 
-def _wire(monkeypatch, intents, stores=(STORE,)):
+def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
              "marked": [], "marked_by": set(), "settled": 0,
              "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
+    monkeypatch.setattr(mw.store_absence, "stale_stores",
+                        lambda conn, **k: list(absent))
     monkeypatch.setattr(mw.dispositions, "claim",
                         lambda conn, actions=None: [_disp(it, i)
                                                     for i, it in enumerate(intents)])

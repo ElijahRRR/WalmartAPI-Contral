@@ -39,6 +39,11 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     monkeypatch.setattr(ppc.product_events, "record_many",
                         lambda conn, rs: (seen["events"].extend(rs), len(rs))[1])
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {})
+    # 缺席避让与按日配额记账都走库,测试环境无库:置空(缺席=无、当日已放行=0)
+    monkeypatch.setattr(ppc.store_absence, "stale_stores",
+                        lambda conn, since=None, lag_hours=None: [])
+    monkeypatch.setattr(ppc.dispositions, "destructive_executed_today",
+                        lambda conn, hours=20: {})
     monkeypatch.setattr(ppc.maint_sheet, "append_records",
                         lambda rows: (seen["sheet"].extend(rows), len(rows))[1])
     monkeypatch.setattr(ppc.stores_svc, "load_stores",
@@ -121,7 +126,7 @@ def test_execute_isolates_store_failures(monkeypatch):
     out = ppc.run({"execute": True})
     assert submitted == [("T2", ["S2"])]                     # T2 不被重复提交
     assert "⚠ T1:提交异常" in out and "T2:删除提交 1" in out
-    assert "二轮重试 1 店:T1" in out and "⚠ T1:二轮仍失败" in out
+    assert "二轮重试 1 店(串行):T1" in out and "⚠ T1:二轮仍失败" in out
 
 
 def test_second_round_retry_after_network_failure(monkeypatch):
@@ -142,7 +147,7 @@ def test_second_round_retry_after_network_failure(monkeypatch):
     sub = [e for e in seen["events"] if e["event"] == "delete_submitted"]
     assert len(sub) == 1 and sub[0]["detail"]["feed_id"] == "F_RETRY"
     assert seen["marked"] == [((7,), "F_RETRY")]     # 只转一次态
-    assert "二轮重试 1 店:T1" in out and "二轮仍失败" not in out
+    assert "二轮重试 1 店(串行):T1" in out and "二轮仍失败" not in out
 
 
 def test_relist_uses_detail_not_a_second_db_read(monkeypatch):
@@ -347,3 +352,11 @@ def test_only_maintenance_prunes_the_shared_sheet():
     assert "prune_after=False" in inspect.getsource(ppc.run)
     from workflows import maintenance as mw
     assert "prune_after" not in inspect.getsource(mw._write_sheet)
+
+
+def test_second_round_is_serial():
+    """二轮重试必须串行(店级重试标准 2026-08-26):第一轮已经证明这批店/
+    代理在抖,补试没有理由再齐射一遍。对抗校验实测过改回并发全量照绿,
+    这里按调用点钉住。"""
+    import inspect
+    assert "_round(retry_stores, workers=1)" in inspect.getsource(ppc.run)

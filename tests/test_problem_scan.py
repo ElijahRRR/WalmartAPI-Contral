@@ -208,6 +208,9 @@ def test_preview_writes_nothing(monkeypatch):
     from registry import db as _db
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([None])))
+    # 缺席避让走库里水位(store_absence),测试环境无库无飞书,置空
+    monkeypatch.setattr(scan.store_absence, "stale_stores",
+                        lambda conn, since=None, hours=None: [])
     out = scan.run({"preview": "1"})
     assert "preview" in out and "删除 1" in out
     assert "类别={B:1}" in out and "删除样本=[('S_B', 'B')]" in out

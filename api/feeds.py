@@ -46,36 +46,17 @@ _DETAIL_PAGE = 50          # includeDetails 明细页大小(官方两页矛盾 5
 _PAGE_SLEEP = 0.2
 _RECHECK_SLEEP = 30        # 反查 NOT_FOUND 的二次确认间隔(防索引滞后)
 
-# ── 5xx 退避:官方阶梯 + **抖动**(2026-08-26 核验 developer.walmart.com)────
-# 逐条官方原文:
-#   INVALID_SYSTEM_STATE (500) —— "Retry with jitter. If repeated, open a
-#                                  support ticket with examples."
-#   SYSTEM_ERROR (500)         —— "Confirm Content-Type and payload format,
-#                                  then retry with jitter."
-#   DOWNSTREAM_SYSTEM_TIME_OUT (504) —— "Retry with exponential backoff."
-#   平台可用性节             —— "Retry with exponential backoff and jitter."
-#   退避阶梯示例(秒)         —— 2, 4, 8, 16, 32;"Cap retries (for example,
-#                                  5 attempts)"
-# ⚠ **抖动是官方明写的要求,不是我们的发挥**:此前只有一个**固定 30 秒**、
-# 零抖动的二次确认,正踩在官方建议的反面 —— 一批同时失败的店会在 30 秒后
-# **再次同时**打过去,把第一次的洪峰原样复制一遍。
-_BACKOFF_LADDER = (2, 4, 8, 16, 32)
+# ── 5xx 退避:官方阶梯 + **抖动**(2026-08-26 核验 developer.walmart.com;
+# 官方原文与阶梯值见 api/_client.backoff —— #91 在本文件引入,店级重试标准
+# 落地时**上提到 _client 作全项目唯一出处**,双轨禁止,此处只留别名)。
+# ⚠ 抖动是官方明写的要求:没有它,一批同时失败的店会同时醒来,
+# 把第一次的洪峰原样复制一遍。
+_BACKOFF_LADDER = _client.BACKOFF_LADDER
+_backoff = _client.backoff
 # 一片最多补交几次(含第一次)。官方举例 5;我们取 3 ——
 # 每次补交都吃一枚 feeds.post.MP_ITEM 令牌(8/hour/店),而且失败行还有
 # 次日的 FAILED 重试通道兜着,不必在当轮把配额榨干
 SETTLE_ATTEMPTS = 3
-
-
-def _backoff(attempt: int) -> float:
-    """输入:第几次退避(0 起)→ 输出:**带抖动**的秒数(官方阶梯 × [0.5,1.0])。
-
-    抖动取"满阶梯的一半到满值"(AWS full-jitter 的常见变体):既保证退避在长,
-    又保证同时失败的 N 家店**不会同时醒来**。抖动的全部意义就在后半句——
-    没有它,退避只是把洪峰整体平移,不是把它摊平。
-    """
-    import random
-    base = _BACKOFF_LADDER[min(attempt, len(_BACKOFF_LADDER) - 1)]
-    return base * (0.5 + random.random() * 0.5)
 
 # 切片双约束:(最大条数, 最大字节)。RETIRE_ITEM 官方无现值,按 DELETE 同档保守;
 # price/inventory 官方 10MB(旧代码 25MB 超官方上限,蓝图 §5.4 收紧)。

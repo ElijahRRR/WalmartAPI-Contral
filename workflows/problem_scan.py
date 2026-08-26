@@ -45,9 +45,10 @@ import re
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
-from services import product_events
+from services import product_events, store_absence
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 # 审核判拒的删除:**单店单轮上限**(限额表「下架限制」列,与维护链删除、
 # product_clear 同一个配额口径)。
@@ -513,6 +514,27 @@ def run(params: dict) -> str:
      inactive, stubborn) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
+    # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
+    # 停在上一轮,拿它判「仍在架 → 删」会对可能已变的现实开破坏 feed。
+    # 判据从库里水位派生(services/store_absence),与调度顺序无关。
+    # 探测失败按"不避让"处理并在首行喊出来(preview 是纯 PG 查询,
+    # 不该被一次飞书抖动整个拦下)。
+    with db.pg_conn() as conn:
+        try:
+            absent = set(store_absence.stale_stores(conn))
+            absence_gap = ""
+        except Exception as e:
+            absent = set()
+            absence_gap = f";⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
+    if only:
+        absent &= {only}    # 只报本范围内的缺席
+    # ⚠ 避让只挡**处置建议**(plan/audit_rows —— 会变成删除/反补 feed 的那些);
+    # 观察面不连坐:黑名单收集、K 类聚集信号、归类事件都是只增不减的记录,
+    # 静音一天会让 15:00 blacklist 链少一天的 ASIN/品牌(对抗校验 2026-08-26)
+    items_all = items
+    n_avoided = sum(1 for i in items if i["store"] in absent)
+    if absent:
+        items = [i for i in items if i["store"] not in absent]
 
     plans, n = plan(items, inflight, attempts, inactive, stubborn,
                     inflight_disposal)
@@ -521,6 +543,11 @@ def run(params: dict) -> str:
 
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        if absent:
+            n_audit_avoided = sum(1 for r in audit_rows
+                                  if r["store"] in absent)
+            n_avoided += n_audit_avoided
+            audit_rows = [r for r in audit_rows if r["store"] not in absent]
         if audit_rows:
             late = sum(1 for r in audit_rows
                        if r["detail"].get("rejected_after_listing"))
@@ -545,8 +572,15 @@ def run(params: dict) -> str:
         # 另:这里按建议行统计,不是按 plan() 的桶 —— n['delete'] 不含顽固双击
         # 那 22 个(那支 continue 前没有 n['delete'] += 1),照它报会少 22。
         head = _summarize(allrows, audit_rows, n, len(items))
+        if absent:
+            # ⚠ 缺席避让要进**首行**:链通知只发成功步骤的第一行
+            head[0] += (f";⚠ 缺席避让 {len(absent)} 店:"
+                        f"{','.join(sorted(absent))}"
+                        f"({n_avoided} 条候选不参与本轮处置)")
+        head[0] += absence_gap
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
-        for note in (_k_cluster_note(items), _policy_gap_note(conn, items)):
+        # 观察面用 items_all(缺席不连坐,见上)
+        for note in (_k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
             if note:
                 lines.append(note)
         if preview:
@@ -554,8 +588,8 @@ def run(params: dict) -> str:
                          f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"
                          f"命中时按唯一索引合并)")
             return "\n".join(lines)
-        n_cat = _record_categories(conn, items, last_cat)
-        bl_note = _collect_blacklists(conn, items)
+        n_cat = _record_categories(conn, items_all, last_cat)
+        bl_note = _collect_blacklists(conn, items_all)
         n_sug = dispositions.suggest_many(conn, allrows)
         # 撤销本轮不再建议的陈旧行(按来源各撤各的):否则昨天建议删、今天
         # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删
@@ -563,10 +597,12 @@ def run(params: dict) -> str:
         for src, srows in (("scan", rows), ("audit", audit_rows)):
             # ⚠ store=only 不能省:`-p store=X` 那一轮只扫了一个店,keep 里
             # 只有该店的行,不限范围会把其余全部店铺的待执行建议一次清空
+            # exclude_stores=缺席店:它们的行不在 keep 里(本轮避让了),
+            # 不排除会被撤成"不再建议"——缺席 ≠ 恢复正常
             n_wd += dispositions.withdraw_stale(
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-                store=only or None)
+                store=only or None, exclude_stores=sorted(absent))
         # 限本链来源:维护链共用同一张建议表,不限的话摘要报的数会把它的
         # 待执行也算进来,与本链执行件领到的数对不上
         n_open = dispositions.count_open(

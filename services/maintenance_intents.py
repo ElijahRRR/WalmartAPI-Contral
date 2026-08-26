@@ -51,28 +51,48 @@ PRICE_MIN_RATIO = 0.01          # 1%
 # 但它分不清事故与**故意的**大面积调整:08-25 倍率调整日 12,766 条改价被
 # 截成 5,000,谭总 7 家店拖了三天,且截断只进日志不见人。沃尔玛的配额全部
 # **按店**计,全局闸只会卡住合法的大改,废除。
-# 数字 = 该类 feed 的按店速率桶 × 单 feed 切片条数(api/_client._RATE_BUCKETS
-# × api/feeds._SLICE_LIMITS,有测试钉住三处一致;改桶/改切片先看那条测试):
-#   price     feeds.post.price     8/小时(官方 10/hour 三件套共享留余量,
-#             2026-08-26 复核后从 6/天保守值上调;6/day 只属 feedType=promo,
-#             本仓不用)× 8000 条/feed(官方硬限 10000 留两成;1000 只是官方
-#             建议值,所有者定稿 2026-08-26 新鲜度优先弃用 —— 单店当天扫出
-#             多少当轮连发多少,如 15000 条 = 8000+7000 两个 feed 连续提交)
-#             = 64000。这个数不再是吞吐规划,纯粹是失控护栏,没有店摸得到它
-#   inventory feeds.post.inventory 8/小时 × 4000 条 = 32000(一小时桶)
-#   title     feeds.post.MP_MAINTENANCE 8/小时 × 1000 条 = 8000(一小时桶)
+# 数字 =(该类 feed 的按店速率桶 **− 1**)× 单 feed 切片条数(api/_client.
+# _RATE_BUCKETS × api/feeds._SLICE_LIMITS,连同窗口一致有测试钉住;改桶/改
+# 切片先看那条测试)。**为什么 −1**:api/feeds 的"网络异常 → 双确认未达 →
+# 同一载荷补交一次"路径每次补交**多烧一个桶名额**,切片数吃满桶时一次补交
+# 就会在令牌桶上睡到窗口滑出(≈1 小时),整条链抱着 flock 陪等:
+#   price     (8−1)/小时 × 8000 条/feed = 56000
+#             (桶:官方 10/hour 三件套共享留余量,2026-08-26 复核后从 6/天
+#             上调,6/day 只属本仓不用的 feedType=promo;切片:官方硬限
+#             10000 条留两成,1000 只是建议值 —— 所有者定稿新鲜度优先,
+#             单店当天扫出多少当轮连发多少,15000 条 = 8000+7000 连续提交)
+#   inventory (8−1)/小时 × 4000 条/feed = 28000
+#   title     (8−1)/小时 × 1000 条/feed = 7000
+# 三个数都远大于单店在线目录(千级)——它们不再是吞吐规划,纯粹是失控护栏:
+# 真咬合的那天多半是采集/配置事故在疯狂产单,而下面的截断优先级恰恰会
+# **先放行事故本体**(错价越离谱越靠前、批量 NULL 清零全是 new=0),
+# 所以看到首行"⚠ 截断"先查原因再放行,别急着调大上限。
+# ⚠ 改价侧的数量兜底随全局闸一并消失(与库存侧"挡不住整店清零"同款代价):
+# 倍率误填/区间事故会一轮全量出闸,自动闸仅剩 PRICE_MIN_DELTA/RATIO
+# (下限闸,拦不住大偏差);涨跌幅闸在 plan.md 待办里,上量后需重议
+# (此前全局 5000 至少把错价面封在 5000 行/天,现在没有了)。
 # delete **不在表里**:破坏类的按店数量闸唯一在执行件(problem_product_cleanup
 # 领取时 cap_destructive 按限额表「下架限制」截),扫描件如实报待办
 # (2026-08-24 归一口径,扫描期再截一道就是"每店最多 N 实际 2N"的老坑)。
-MAX_INTENTS_PER_STORE = {"price": 64000, "inventory": 32000, "title": 8000}
+MAX_INTENTS_PER_STORE = {"price": 56000, "inventory": 28000, "title": 7000}
 
-# 超上限时**截谁**(按店组内排序,升序取前 cap 条;不在表里的类保持产出序):
+# 超上限时**截谁**(按店组内排序,升序取前 cap 条):
 #   price     偏差比例大的先走 —— 错得越离谱的价越该当天纠;
-#   inventory 清零(new=0)先走 —— "别卖错"优先于"补货上量"(排序稳定,
-#             同为清零/同为补货时保持产出序)。
+#   inventory 清零(new=0)先走 —— "别卖错"优先于"补货上量";
+#   title     停闸期低相似度同步(title_mismatch_sync)先走 —— 抄错标题
+#             嫌疑最大的行最该当天见人。
+# 三类都以 SKU 为第二键:产出序来自无 ORDER BY 的 SQL,会随 VACUUM/HOT
+# 更新漂移,截断名单必须跨轮可预期(08-25 "随机截"的一半病根就在这)。
+# ⚠ 这套优先级的职责是"正常拥挤时先做最要紧的",不是事故过滤器 ——
+# 事故日它放行的正是事故本体(见上面护栏注释)。
 _TRUNC_PRIORITY = {
-    "price": lambda it: -abs(it["new"] - it["old"]) / max(float(it["old"] or 0), 0.01),
-    "inventory": lambda it: 0 if it.get("new") == 0 else 1,
+    "price": lambda it: (-abs(it["new"] - it["old"])
+                         / max(float(it["old"] or 0), 0.01),
+                         str(it.get("sku") or "")),
+    "inventory": lambda it: (0 if it.get("new") == 0 else 1,
+                             str(it.get("sku") or "")),
+    "title": lambda it: (0 if it.get("code") == "title_mismatch_sync" else 1,
+                         str(it.get("sku") or "")),
 }
 
 # 删除类专属:批次数门槛与单店单轮上限
@@ -485,9 +505,13 @@ def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
 
     按 (店铺, 类型) 分组截断,组内先按 _TRUNC_PRIORITY 排序再取前 cap 条
     (排序只在**真要截**的组里发生,不超限的组一个字不动 —— 平日零成本)。
-    截断报告一行一个被截的组:{"store","kind","total","kept"},调用方必须把它
-    带进运行摘要 —— 08-25 的教训是截断只写日志 warning,飞书摘要报的全是
-    截断后的数,7,766 条没进 feed 而通知看起来一切正常。
+    截断报告一行一个被截的组:{"store","kind","total","kept","deferred_keys"},
+    调用方必须做两件事:
+      ① 把它带进运行摘要**首行**(链通知对成功步骤只发首行)—— 08-25 的
+        教训是截断只写日志 warning,通知看起来一切正常;
+      ② 把 deferred_keys 留在 withdraw_stale 的 keep 里 —— 配额顺延不是
+        "不再建议",撤掉落榜行上一轮挂着的 suggested 行会被记成
+        「商品自己恢复正常了」(错误取证),且下轮又重建。
     """
     by: dict[tuple, list[dict]] = {}
     for it in intents:
@@ -502,7 +526,9 @@ def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
         ranked = sorted(group, key=key) if key else group   # sorted 稳定
         out.extend(ranked[:cap])
         report.append({"store": store, "kind": kind,
-                       "total": len(group), "kept": cap})
+                       "total": len(group), "kept": cap,
+                       "deferred_keys": [(i["store"], i["sku"], i["kind"])
+                                         for i in ranked[cap:]]})
         logger.warning("%s %s 意图 %d 条超单店单轮上限 %d,本轮只提交 %d 条"
                        "(按截断优先级取,其余下轮)",
                        store, kind, len(group), cap, cap)
@@ -920,8 +946,12 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0
     """输入:连接 + stockzero 名单(+无货天数)→ 输出:(本轮全部维护意图, 截断报告)。
 
     单店单轮上限(cap_per_store)在**最后**施加 —— 在 doomed 剔除与 drop_recent
-    之后,配额名额只花在真会提交的意图上(截在 provider 里的话,先截 5000 再
-    被防重压掉 400,等于白扔 400 个名额)。截断报告必须随摘要见人,不许只进日志。
+    之后,名额不浪费在注定不发的意图上(截在 provider 里的话,先截再被防重
+    压掉的部分等于白扔名额)。⚠ 但"进了名额 = 一定提交"不成立,cap 之后还有
+    三条泄漏:领取时的破坏组压制(claim 按库里**所有**未落定 delete/retire 判,
+    含别的链写的)、同键 executing 行挡新建议(摘要的"写入 < 意图"就是它)、
+    执行件缺凭证整店跳过 —— 将来调小上限时别按"名额=提交数"估算。
+    截断报告必须随摘要**首行**见人,不许只进日志(链通知只发成功步骤的首行)。
 
     ⚠ **住在 services 而不是 workflow 里**:2026-08-16 拆成
     maintenance_scan(建议)+ maintenance(执行)之后,只有扫描件调它;但铁律

@@ -120,8 +120,9 @@ DROP TABLE/COLUMN/VIEW 不可回滚,**未连库核对 `pg_stat_user_tables` /
 2026-08-05 官方核验)确认目标端点的函数是否已定义;配额明细以蓝图第 3 节三源
 对照表为准(`refdata/walmart_rate_limits.tsv` 是其来源之一,个别行已被官方核验
 修正)。高危限制速记:价格三件套 feed 共享桶(官方 10/hour,2026-08-26 复核后按 8/小时配置;6/day 只属本仓不用的 feedType=promo);本仓在用的其余
-feedType(MP_ITEM/MP_MAINTENANCE/DELETE_ITEM/inventory)恰各自独立 10/hour
-——**不可外推到别的 feedType**(官方限额分六档,20/hour、50/hour、6/day 皆有,
+feedType:MP_ITEM/MP_MAINTENANCE/DELETE_ITEM/inventory 各自独立 10/hour,
+MP_ITEM_MATCH 20/hour,RETIRE_ITEM 官方无值按 DELETE 同档保守
+——**不可外推到未列的 feedType**(官方限额分六档,20/hour、50/hour、6/day 皆有,
 2026-08-26 复核);单品价格 PUT = 100/小时;Insights performance 类 1/分钟;
 `GET /v3/items` 带 query 参数 60/分钟。响应头 `x-current-token-count` 与
 `X-Next-Replenishment-Time` 用于自适应退避(api/_client.py 已内置,勿自行实现)。

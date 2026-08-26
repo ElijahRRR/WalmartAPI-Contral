@@ -35,7 +35,7 @@
 
 | 端点 | 配额 |
 |---|---|
-| PRICE_AND_PROMOTION feed | **6/天**(价格批量必须聚合,严禁高频提交) |
+| PRICE_AND_PROMOTION feed | **10/hour**(三件套共享桶,2026-08-26 官方复核;旧记 6/天只属本仓不用的 feedType=promo。代码按 8/hour 配置,见蓝图 §3.2) |
 | PUT /v3/price 单品 | 100/小时 |
 | GET /v3/items 带 query | 60/分钟(无 query 300/分钟) |
 | Insights 绩效类 22 个端点 | 全部 1/分钟 |

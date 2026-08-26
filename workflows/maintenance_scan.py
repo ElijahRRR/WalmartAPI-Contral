@@ -159,13 +159,20 @@ def run(params: dict) -> str:
         capped = [c for c in capped if c["store"] == only]
 
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
+    n_zero = sum(1 for i in intents
+                 if i["kind"] == "inventory" and i.get("new") == 0)
+    n_cut = sum(c["total"] - c["kept"] for c in capped)
+    # ⚠ 首行 = 结论 + 最要紧的数(notify_fmt 头注),而且**只有首行能到飞书**:
+    # 唯一调度路径是 product_chain 链,cli 对成功步骤只发 first_line_of。
+    # 清零规模与截断必须写在这一行 —— 放第 2 行等于只写日志,08-25 的
+    # "通知看起来一切正常"就会原样复现(对抗校验 2026-08-26 实跑证实)。
     lines = [f"维护意图 {len(intents)} 条:删除 {n_kind['delete']},"
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
-             f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
+             f"库存 {n_kind['inventory']}(清零 {n_zero};"
+             f"stockzero 店 {len(stockzero)} 家)"
+             + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")]
     for c in capped:
-        # 截断必须进摘要(08-25 生产教训:全局闸截掉 7,766 条改价只写了一行
-        # 日志 warning,飞书通知报的全是截断后的数,看起来一切正常 —— 三家店
-        # 的倍率调整拖了三天才被人从"价格没变"倒查出来)
+        # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
         lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
                      f"{c['total']}→{c['kept']} 条(超单店单轮上限,按截断"
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
@@ -189,6 +196,11 @@ def run(params: dict) -> str:
             f"(preview:未落建议行;本轮将写 {len(intents)} 条)"])
 
     rows = [mi.to_disposition(it) for it in intents]
+    keep = [(r["store"], r["sku"], r["action"]) for r in rows]
+    # 被配额截掉的落榜行**不是"不再建议"**:它们上一轮可能还挂着 suggested
+    # 行,不留在 keep 里就会被撤成「商品自己恢复正常了」(错误取证),
+    # 且下轮扫描又原样重建 —— 配额顺延要留在原地等下轮领取
+    keep += [k for c in capped for k in c.get("deferred_keys", ())]
     with db.pg_conn() as conn:
         n_sug = dispositions.suggest_many(conn, rows)
         # 撤销本轮不再建议的陈旧行:昨天建议清零、今天亚马逊回货了,扫描件
@@ -196,8 +208,7 @@ def run(params: dict) -> str:
         # ⚠ store=only 不能省:`-p store=X` 那一轮 keep 里只有该店的行,
         # 不限范围会把**其余全部店铺**的待执行建议一次清空(批次 E 的坑)
         n_wd = dispositions.withdraw_stale(
-            conn, "maint",
-            [(r["store"], r["sku"], r["action"]) for r in rows],
+            conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
             store=only or None)
         n_open = dispositions.count_open(conn,

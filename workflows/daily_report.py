@@ -54,7 +54,8 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, stores as stores_svc, yingdao
+from services import kpi, order_lines, store_retry, stores as stores_svc, \
+    yingdao
 
 DANGEROUS = False
 

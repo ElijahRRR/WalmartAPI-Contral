@@ -25,7 +25,7 @@ import httpx
 from api import _client, insights
 from registry import db
 from services import order_center
-from services import kpi, order_lines, stores as stores_svc
+from services import kpi, order_lines, store_retry, stores as stores_svc
 
 DANGEROUS = False
 

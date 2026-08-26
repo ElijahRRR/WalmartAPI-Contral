@@ -26,7 +26,7 @@ import httpx
 from api import _client, reports
 from registry import db
 from services import order_center
-from services import order_lines, stores as stores_svc
+from services import order_lines, store_retry, stores as stores_svc
 
 DANGEROUS = False
 

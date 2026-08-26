@@ -242,7 +242,8 @@ def _replay_wire(monkeypatch, absent, statuses, chronic=(), still=(),
     def fake_run_step(name, module, params, dry_run, operator, logs_dir):
         ran.append((params.get("store"), name))
         st = statuses.get((params.get("store"), name), "success")
-        return st, f"{name} {st}\n第二行明细"
+        # 形状 = _run_step 真实产物:横幅行 + 摘要(折叠必须取摘要首行)
+        return st, f"{name} {st}\n{name}:{st} 摘要首行\n第二行明细"
     monkeypatch.setattr(cli, "_run_step", fake_run_step)
     mods = {
         "catalog_sync": types.SimpleNamespace(SUPPORTS_STORE=True),
@@ -265,8 +266,10 @@ def test_replay_runs_store_scoped_steps_once_per_absent_store(monkeypatch):
                    ("店A", "maintenance")]
     assert any("sources_backfill" in ln and "跳过" in ln for ln in lines)
     assert any(ln.startswith("✅ 店A:救回") for ln in lines)
-    # 每步摘要首行保留:重赛跑的是 DANGEROUS 步骤,发了多少不能只剩一个 ✅
-    assert any("maintenance success" in ln for ln in lines)
+    # 每步压的是**摘要首行**(不是「名 成功」横幅):重赛跑的是 DANGEROUS
+    # 步骤,发了多少 feed 不能只剩一个 ✅,更不能只剩横幅
+    assert any("maintenance:success 摘要首行" in ln for ln in lines)
+    assert not any(ln.strip().startswith("· maintenance success") for ln in lines)
 
 
 def test_replay_stops_that_store_on_first_failure_and_says_so(monkeypatch):
@@ -315,6 +318,32 @@ def test_replay_demotes_green_steps_when_watermark_did_not_advance(monkeypatch):
     lines, _ran = _replay_wire(monkeypatch, ["店A"], {}, still=["店A"])
     assert any("水位未推进" in ln for ln in lines)
     assert not any(ln.startswith("✅ 店A") for ln in lines)
+
+
+def test_replay_says_unverified_when_recheck_itself_fails(monkeypatch):
+    """水位复核探测失败 ≠ 都救回了(2026-08-26 审计实见:裸 except 落空 still
+    → 每家都发 ✅):按「未核实」报,不发假 ✅,也不炸重赛结果。"""
+    import contextlib
+    import types
+
+    import cli
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    from services import store_absence as sa
+    monkeypatch.setattr(sa, "split_stale", lambda conn, since: (["店A"], []))
+
+    def boom(conn, since=None, lag_hours=None):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(sa, "stale_stores", boom)
+    monkeypatch.setattr(cli, "_run_step",
+                        lambda name, module, params, dry_run, operator,
+                        logs_dir: ("success", f"{name} 成功\n{name}:摘要首行"))
+    mods = {"catalog_sync": types.SimpleNamespace(SUPPORTS_STORE=True)}
+    lines = cli._replay_absent(list(mods), mods, {"catalog_sync": {}},
+                               False, "test", None, since=None)
+    assert any("水位复核失败" in ln and "未核实" in ln for ln in lines)
+    assert not any(ln.startswith("✅ 店A:救回") for ln in lines)
 
 
 def test_main_wires_replay_after_a_successful_catalog_chain(monkeypatch,
@@ -402,9 +431,11 @@ def test_maint_settle_has_a_grace_period():
     assert ds.MAINT_SETTLE_GRACE_HOURS >= 1
 
 
-def test_order_sync_names_the_culprit_and_gates_zero_stores(monkeypatch):
-    """order_sync 的失败行带六档归类词;零店完成必须失败(2026-08-26 补齐,
-    与 returns_sync 同款闸 —— 此前同一条 order_chain 里两步不对称)。"""
+def test_order_sync_full_standard_and_zero_gate(monkeypatch):
+    """order_sync 走全套标准(2026-08-26 审计补齐:此前只做隔离+分诊,同链
+    returns_sync 是全套):失败店**串行补试**重调同一个 fetch_orders_bulk
+    (单店入参),仍失败以「⚠ 缺席」+ 归类词点名进摘要**首行**;补试救回的
+    照常入账;零店完成必须失败。"""
     import pytest as _pytest
 
     from workflows import order_sync as osw
@@ -413,16 +444,68 @@ def test_order_sync_names_the_culprit_and_gates_zero_stores(monkeypatch):
     monkeypatch.setattr(osw.order_center, "push_after",
                         lambda spec, days=90: "投影桩")
     from socksio.exceptions import ProtocolError
-    monkeypatch.setattr(
-        osw.orders_api, "fetch_orders_bulk",
-        lambda stores, **k: ([{"store": "T1", "lines": 3}], [],
-                             [("T2", ProtocolError("Malformed reply"))]))
+    calls = []
+
+    def fake_bulk(stores, **k):
+        calls.append([s["name"] for s in stores])
+        if len(stores) > 1:                     # 首轮:T2 断
+            return ([{"store": "T1", "lines": 3}], [],
+                    [("T2", ProtocolError("Malformed reply"))])
+        return ([], [], [(stores[0]["name"],    # 补试:同店再断
+                          ProtocolError("Malformed reply"))])
+
+    monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk", fake_bulk)
     out = osw.run({})
-    assert "T2(代理波动:Malformed reply)" in out       # 归类词指路
+    assert calls == [["T1", "T2"], ["T2"]]      # 补试 = 单店重调同一个函数
+    first = out.splitlines()[0]                 # 标准③:缺席点名在首行
+    assert "⚠ 缺席 1 店:T2(代理波动)" in first
+    assert "已串行补试仍失败" in first
+
+    calls.clear()                               # 补试救回:照常入账,无缺席
+
+    def fake_bulk_recover(stores, **k):
+        calls.append([s["name"] for s in stores])
+        if len(stores) > 1:
+            return ([{"store": "T1", "lines": 3}], [],
+                    [("T2", ProtocolError("Malformed reply"))])
+        return ([{"store": "T2", "lines": 7}], [], [])
+
+    monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk", fake_bulk_recover)
+    out = osw.run({})
+    assert "2/2 店完成" in out and "订单行入库 10" in out
+    assert "缺席" not in out
+
     monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk",
                         lambda stores, **k: ([], ["T1", "T2"], []))
     with _pytest.raises(RuntimeError, match="零店完成"):
         osw.run({})
+
+
+def test_workflows_that_use_store_retry_import_it():
+    """调 store_retry.* 的 workflow 必须真的 import 它 —— 2026-08-26 审计实见
+    三个文件(daily_report/perf_problems/settlement_sync)复制了分诊块却漏了
+    import:店一失败 except 体先 NameError,单店隔离变成一店放倒整轮。
+    用 AST 判引用(文本 grep 会被注释里的字样骗过 —— order_sync 当初就是
+    这么漏网的)。"""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "workflows"
+    offenders = []
+    for py in sorted(root.glob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        uses = any(isinstance(n, ast.Attribute)
+                   and isinstance(n.value, ast.Name)
+                   and n.value.id == "store_retry" for n in ast.walk(tree))
+        if not uses:
+            continue
+        imported = any(
+            isinstance(n, ast.ImportFrom) and n.module == "services"
+            and any(a.name == "store_retry" for a in n.names)
+            for n in ast.walk(tree))
+        if not imported:
+            offenders.append(py.name)
+    assert not offenders, f"调 store_retry 却没 import:{offenders}"
 
 
 def test_withdraw_sql_carries_the_exclude_stores_clause():

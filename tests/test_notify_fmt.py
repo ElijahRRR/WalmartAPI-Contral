@@ -74,20 +74,26 @@ _STEPS = ["a", "b", "c"]
 
 
 def _res(status_b="success"):
-    return [("a", "success", "a 完成:入库 100 行\n明细一\n明细二"),
-            ("b", status_b, "b 的摘要第一行\n第二行明细\n第三行明细"),
-            ("c", "success", "c 完成")]
+    # 文本形状 = _run_step 真实产物:首行是 cli 自造的「名 成功」横幅,
+    # 摘要从第二行起(2026-08-26 审计实见:旧夹具没带横幅,正好掩盖了
+    # 折叠取错行的 bug —— 生产里链通知只剩横幅,缺席点名整条被吃)
+    return [("a", "success", "a 成功\na:入库 100 行;⚠ 缺席 1 店:X(代理波动)\n明细一\n明细二"),
+            ("b", status_b, "b 成功\n窗口 45 天,入库 7 行\n第二行明细\n第三行明细"),
+            ("c", "success", "[EXECUTE] c 成功\n提交 feed 2 个")]
 
 
-def test_chain_folds_successful_steps_to_one_line():
-    """七步链每步铺全文 = 二十来行没层次的文字,人第三天就不看了。"""
+def test_chain_folds_successful_steps_to_summary_first_line():
+    """七步链每步铺全文 = 二十来行没层次的文字,人第三天就不看了。
+    折叠取的必须是**工作流摘要的首行**(缺席点名在那里,标准③),
+    不是 cli 的「名 成功」横幅;[EXECUTE] 标记从横幅继承。"""
     out = cli._chain_text(_STEPS, _res(), "success")
     assert out.splitlines() == [
         "✅ 链 [a → b → c]",
-        "✅ a 完成:入库 100 行",
-        "✅ b 的摘要第一行",
-        "✅ c 完成"]
+        "✅ a:入库 100 行;⚠ 缺席 1 店:X(代理波动)",   # 摘要已带名:不重复加
+        "✅ b:窗口 45 天,入库 7 行",                     # 摘要没带名:补上
+        "✅ [EXECUTE] c:提交 feed 2 个"]
     assert "明细一" not in out           # 全文在 ops.runs 与日志里,不在通知里
+    assert "a 成功" not in out           # 横幅不进链通知(它吃掉缺席点名)
 
 
 def test_chain_expands_the_failed_step_in_full():
@@ -96,7 +102,7 @@ def test_chain_expands_the_failed_step_in_full():
     assert out.startswith("❌ 链 [a → b → c]")
     assert "❌ b" in out
     assert "   第二行明细" in out and "   第三行明细" in out
-    assert "✅ a 完成:入库 100 行" in out      # 成功的仍然折叠
+    assert "✅ a:入库 100 行" in out         # 成功的仍然折叠(摘要首行)
     assert "全文见 ops.runs" in out
 
 

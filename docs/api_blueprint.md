@@ -311,6 +311,36 @@ api/settings.py
 cursor+offset 翻页模型、DELETE_ITEM 三处同构与容量 2628 条实测、清库存不存在)。
 其中 C1 的严重性因官方枚举无 COMPLETE 而降级为"防御性设计要求"。
 
+### 8.1 补充核验(2026-08-26,「提交 5xx」专题)
+
+起因:2026-08-24/25 连续两晚,20:00 那一轮多家店的 MP_ITEM 提交被边缘 Akamai
+回「Internal Server Error - Read」。查了四页官方(feeds / api-integration-usage /
+rate-limiting / error-codes),四条结论:
+
+1. **请求体 gzip:官方一个字都没提。** 四页均无 `Content-Encoding` / 压缩相关
+   记载。→ **不做**。压缩几 MB 的 JSON 本可以把上传与源站读取时间同时打下来,
+   但写操作靠猜不得:万一半接受半不接受,就是一笔状态不明的提交。
+   要用先向 Partner Support 问明,或在**非破坏性** feedType 上实测。
+2. **5xx 的官方处置是「retry with jitter」,逐条有原文**:
+   `INVALID_SYSTEM_STATE(500)` = "Retry with jitter. If repeated, open a support
+   ticket with examples.";`SYSTEM_ERROR(500)` = "Confirm Content-Type and payload
+   format, then retry with jitter.";`DOWNSTREAM_SYSTEM_TIME_OUT(504)` =
+   "Retry with exponential backoff.";平台可用性节 = "Retry with exponential
+   backoff and jitter."。退避阶梯示例 **2/4/8/16/32 秒**,"Cap retries
+   (for example, 5 attempts)"。
+   ⚠ **抖动是官方明写的要求**。此前 `api/feeds` 只有一个**固定 30 秒**的二次
+   确认,零抖动 —— 一批同时失败的店会在 30 秒后**再次同时**打过去,把洪峰
+   原样复制一遍。已按官方阶梯 + 抖动重写(`feeds._backoff`)。
+3. **429 之后官方要求降速续跑**,不是停:"Sleep until `x-next-replenish-time`,
+   then **resume at a lower rate**"。→ `list_new._AdaptiveGate` 的降档阶梯
+   (24→16→12→8→4,只降不升)与此同源。
+4. **官方明确建议拆分大 feed**(feeds 页原文):"Keep your bulk files small
+   enough to process reliably. **Split very large submissions into multiple
+   feeds.**" —— 而 §5.1 现行策略是 MP_ITEM「单店单 feed 打包」、切片
+   `(2000 条, 24MB)` 贴着官方 25MB 上限。**这是与官方建议相左的一处**,
+   所有者 2026-08-26 暂未采纳切片(先上延后结算 + 降档看效果),
+   留档待议:切片同时能把单次 5xx 的影响面从"整店"降到"一片"。
+
 ### 遗留问题(官方文档查不到,按保守处理并择机实测)
 
 1. RETIRE_ITEM feed 是否仍被接受(guide 已消失、限流表无行、仅存枚举)——迁移 daily_cleanup 前实测。

@@ -69,7 +69,11 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
     inv_failed = False
     if not skip_inventory:
         try:
-            inventory = inv_api.list_inventories(store)
+            # expected_skus = 本轮扫到的全部 SKU(含截断补漏):bulk 漏掉的
+            # 走单品 GET 兜底(api 层内置,记日志计数;所有者 2026-08-26
+            # 拍板接上 —— 此前没传,蓝图 #22 的补漏在生产从未触发)
+            inventory = inv_api.list_inventories(
+                store, expected_skus={s["sku"] for s in summaries if s.get("sku")})
         except _client.StoreDeadError:
             raise                       # 凭证失效仍按跳店处理
         except Exception as e:

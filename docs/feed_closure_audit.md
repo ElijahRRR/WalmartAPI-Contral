@@ -15,7 +15,7 @@
 | `match_listing` | MP_ITEM_MATCH | match_listing | `match_submitted` | `match_feed_*` | 跟卖表 |
 | `product_clear` | DELETE_ITEM / RETIRE_ITEM | product_clear | `delete/retire_submitted` | `delete/retire_feed_*` | 停用/删除表 |
 | `sku_locked_heal` | RETIRE_ITEM | sku_locked_heal | `retire_submitted` | `retire_feed_*` | 无(冷却表自管)|
-| `problem_product_cleanup` | DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE | problem_product_cleanup | 三种 `*_submitted` | 三种 `*_feed_*` | 无(建议表自管)|
+| `problem_product_cleanup` | DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE | problem_product_cleanup | 三种 `*_submitted` | 三种 `*_feed_*` | 维护记录(2026-08-24 起)|
 | `maintenance` | MP_MAINTENANCE / price / inventory | maintenance | 无(维护类不入病历)| 无 | 维护记录 |
 
 **每一条 feed 都落两张台账**,无例外 —— `ops.feed_log`(提交前 pending,成功转
@@ -23,11 +23,14 @@ submitted)与 `ops.feed_items`(SKU 级,提交成功即落),两者都在
 `api/feeds.submit_feed` 内部无条件写,工作流无从绕过。这是所有者问的
 "是否有写入数据库"的答案:**是,而且不依赖任何工作流记得写**。
 
-两处"无飞书反哺"是**设计如此**,不是漏:
-- `problem_product_cleanup` 的账在 `ops.dispositions`(建议行 → executing →
-  按观测落定),不需要投影到表格;
-- `sku_locked_heal` 的账在 `listing.retire_cooldown`,结果由 24h 后的清列动作
-  自证。
+`sku_locked_heal` 那一处"无飞书反哺"是**设计如此**,不是漏:它的账在
+`listing.retire_cooldown`,结果由 24h 后的清列动作自证。
+
+⚠ `problem_product_cleanup` 曾经也是这一档(账在 `ops.dispositions`:建议行 →
+executing → 按观测落定),**2026-08-24 起不再是**:删除归口到它之后,它也往
+`registry.MAINT_SHEET` 写维护记录流水(`maint_sheet.build_row` 造行、
+`maint_sheet.publish` 写表,与 `maintenance` 同一对函数;裁剪仍只由
+`maintenance` 一处做)。判据全文以 `docs/production_cutover.md` 六·三为准。
 
 `maintenance` 的 price / inventory / MP_MAINTENANCE **回执不进病历**,是所有者
 2026-08-07 的定稿(流水已在 `ops.feed_items`),由
@@ -44,6 +47,10 @@ submitted)与 `ops.feed_items`(SKU 级,提交成功即落),两者都在
 ```
 提交  submit_feed → ops.feed_log(pending→submitted) + ops.feed_items(submitted)
                   → catalog.product_events 的 *_submitted(工作流各自写)
+                  → defer_settle=True(目前只有 list_new):不确定的片子当轮
+                    什么终态都不写(outcome=deferred),整轮跑完由
+                    settle_deferred() 统一「先反查、后补交」,最多
+                    SETTLE_ATTEMPTS(=3)轮,落地共用 _ok_result
 轮询  feed_poll → feed_track.poll_all → poll_feed
                   → ops.feed_items 落 success/failed/missing + 报错明细
                   → ops.feed_log 落 done/failed
@@ -88,14 +95,26 @@ UNKNOWN 留 pending 也是对的:`status != 200` 里混着两种东西 —— �
 后者按"没查到 = 没提交过"去补交,如果原来那笔其实到了,就是双删除/双上架。
 **"查了,没有" 与 "没查成" 必须分开,这一点不该改。**
 
-⚠ 还有一条比 UNKNOWN 更常见的路径:**反查时 `get_token` 直接抛异常**
-(代理彻底断了,POST 失败之后连 token 都拿不到)。`_probe()` 里那句
+⚠ 还有一条路径:**反查时 `get_token` 直接抛异常**(POST 时 token 还拿得到、
+POST 之后代理才断)。⚠ **提交侧的同款失败自 2026-08-26 起不再留 pending**:
+`_post()` 用 `_PRE_FAIL` 哨兵把 token/代理阶段的异常收成「请求未发出、确定
+未达」,直接落 `failed`(outcome=failed + retryable=True,下轮可重占),压根
+走不到反查;只有 `StoreDeadError` 仍原样上抛,那种行照旧停 pending。
+`_probe()` 里那句
 `get_token` 没有 try,异常一路抛出 `find_recent_feed` → `_submit_one`,
 `_log_update` 根本没机会执行,行**同样停在 pending** —— 而且连 UNKNOWN
 那行日志都不会有,只有工作流单店隔离打的那条"提交异常已跳过"。
-代理不稳的店,这条路径概率高于 UNKNOWN。
+代理不稳的店这条路径仍在,但窗口已被 `_PRE_FAIL` 收窄到「POST 拿得到 token、
+反查时拿不到」这一小段,不再比 UNKNOWN 更常见。
 
 第三条:进程在"写完 pending 行"与"POST"之间被 kill。
+
+第四条(2026-08-26 #91 新增,目前只有上架链走):**延后结算**。`list_new` 用
+`submit_feed(..., defer_settle=True)` 提交,遇 5xx / 网络异常当场什么终态都不写
+(outcome=`deferred`,只交回重放句柄),整轮跑完再由 `settle_deferred()` 统一
+「先反查、后补交」,最多 `SETTLE_ATTEMPTS`(=3)轮。三种收尾:反查 FOUND 或
+补交成功 ⇒ submitted;末轮 NOT_FOUND ⇒ failed;末轮仍 UNKNOWN、**或结算这一步
+自己抛异常** ⇒ 行保持 pending,与上面三条同一个下场。
 
 #### 真遇到了长什么样(**认得出来比修得掉更重要**)
 

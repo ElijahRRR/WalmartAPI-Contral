@@ -37,11 +37,11 @@
 
 | 维度 | 现状 |
 |---|---|
-| 工作流 | 66 条(`workflows/*.py`),21 条进调度、45 条手动/一次性 |
-| 调度 | launchd 2 条(feed_poll 每 30 分 / 订单链每小时 :20)+ 智能体 9 条(每日/每周);验收记录见 `production_cutover.md` §九 |
+| 工作流 | 72 条(`workflows/*.py`),22 条进调度、50 条手动/一次性 |
+| 调度 | launchd 3 条(feed_poll 每 30 分 / 订单链每小时 :20 / product_ingest 每小时 :50)+ 智能体 9 条(每日/每周);验收记录见 `production_cutover.md` §九 |
 | 并发 | 跨店统一 `services.stores.STORE_WORKERS=24`;审核默认 128 worker(按 PG 连接余量自动钳);飞书电子表格写按表加锁 |
-| 数据库 | PostgreSQL 17 `walmart_data`,五 schema、49 表、10 视图 |
-| 测试 | 1569 passed |
+| 数据库 | PostgreSQL 17 `walmart_data`,五 schema、52 表、10 视图 |
+| 测试 | 1975 passed, 1 skipped |
 | 仍在跑的旧链路 | 旧上架 / 审核 worker(所有者 2026-08-17 判定:不写表,留作备用) |
 
 | 工作流 | 生产验收 | 剩余 |
@@ -66,10 +66,10 @@
 | risk_sync / upc_sync / blacklist_push / brand_scrape | ✅ 均已生产验证 | 挂调度 |
 | **backup** | ✅ **生产首跑完成**(2026-08-13,1554.5 MB 过校验——生产库第一份备份) | 挂每日调度 |
 
-**功能侧代码余项**(全部非阻塞):变体分组(唯一业务大项)/
+**功能侧代码余项**(全部非阻塞):~~变体分组(唯一业务大项)~~ **代码已落地**(2026-08-15 决策层+载荷层,2026-08-17 补多维/错位重映射/组内标题差异化),只余 list_new 生产验收 /
 产品中心黑名单增量脚本(飞书表停用后才需要)/
 llm_cache 清理器(暂不做,上量后再议;审核批次 C 上量时按约重议)/
-审核迁入批次 B~E(docs/audit_migration_plan.md 第十一节)。
+~~审核迁入批次 B~E~~ **B/C/D/E 均已落地**(B:`services/audit_l1_llm.py`+`audit_models.py`;C:`workflows/product_audit.py` 全链含 LLM 层,并已进 `product_chain`/`audit_sheet` 调度;D:`workflows/audit_import.py` 一次性迁库;E:`problem_scan` / `problem_product_cleanup` 扫描件与执行件拆分),明细见 docs/audit_migration_plan.md 第十一节。
 **已明确不做**(所有者拍板 2026-08-13 增补):update_listed 五字段集、
 upc_audit、cli.py health、UPC 造号、退款、涨跌幅闸(暂)、erp-core 相关、
 历史数据迁移(整批关闭)。**等外部**:二期审核服务(入库/审核事件接缝)、
@@ -209,7 +209,7 @@ catalog,pipeline 代码留在旧仓库归档。
       是那条链**每天空转而且报成功**,比误跑更难发现。`--execute` 保留为空
       操作别名。CLAUDE.md 安全铁律条文与各调度命令已同步
 
-- [ ] **历史数据迁移**(所有者定稿 2026-08-07):系统(工作流)迁移完成后,
+- [x] **历史数据迁移**(所有者定稿 2026-08-07;**2026-08-12 所有者逐项拍板整批关闭**,明细见 backlog 第七节):系统(工作流)迁移完成后,
       还需迁移旧系统的历史数据——如以前的上架数据、错误商品记录等;
       旧格式与新格式可能不一致,届时具体规划和操作。与产品事件账本的
       旧库 41.7 万行历史导入同批统筹(格式映射、去重、时间线拼接)

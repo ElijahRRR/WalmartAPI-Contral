@@ -240,7 +240,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
                                                 # 三处官方一致复核;6/day 只属 feedType=promo,
                                                 # 本仓不用。此前保守 6/天,维护链吞吐被它卡死)
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
-    "settings.partnerprofile": (40, 60.0),      # 官方 60/min,lru 缓存后每店仅首次调
+    "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
 }

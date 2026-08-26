@@ -461,7 +461,7 @@ RETIRE_SHEET = Spreadsheet(
 )
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
-# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+# product_clear 读「下架限制」,listing 链读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
 # A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由

@@ -31,7 +31,7 @@
 
 ## 二、并发(已落地)
 
-**店铺级并发 6 → 16**(`workflows/daily_report._STORE_WORKERS`)。
+**店铺级并发 6 → 16**(当时落在 `workflows/daily_report._STORE_WORKERS`)。⚠ **现值 24**:唯一出处已上提 `services/stores.STORE_WORKERS`,daily_report 里那个名字如今只是它的别名(见第九节 PR #43/#45)。
 
 ⚠ 旧系统 README 曾写"店铺级并发不要调高(代理共享/全局风控)",这条被显式覆盖。
 支撑理由:每店有**自己的固定出口代理**,店铺之间不共享出口;沃尔玛配额按
@@ -62,7 +62,7 @@
 | **上架** `list_new` | **不上架**(此前是"上架但库存写 0")。不上架就不占 UPC、不占配额 |
 | **维护** `maintenance` | **库存写 0**(它已经在架了,只能压库存) |
 
-查不到该店 ⇒ 回落 `services.amz_source.MAX_LEAD_DAYS`(8 天)。
+查不到该店 ⇒ 回落 `services.amz_source.MAX_LEAD_DAYS`(**7 天**,2026-08-15 从 8 收紧)。
 「填了 0」与「没填」同样视同没配(上限 0 天 = 这条链整店停摆,不像人的本意)。
 
 ⚠ **没采到(None)不算超限**:`or 0` 会把"未知"读成"当天达",方向反了,
@@ -81,6 +81,7 @@
 | `stock_status == 'Currently unavailable'` | 库存 0(在架但不可售) | `unavailable` |
 | `stock_status == 'No Featured Offer'` | 库存 0(无 Buy Box) | `no_buybox` |
 | `stock_state == 'out_of_stock'` | 库存 0(普通缺货) | `out_of_stock` |
+| 本店渠道与产品渠道不符(限额表「配送限制」) | 库存 0(**排在无货三档之前**,2026-08-25 起) | `channel_mismatch` |
 | 配送超本店上限 | 库存 0 | `lead_days` |
 | 标题相似度 **< 70%** | **删除**(⚠ **已停闸**,见下) | `title_mismatch` |
 | 标题相似度 **≥ 70%** 且有差异 | 改标题 | (title_intents) |
@@ -240,7 +241,7 @@ maintenance_scan → problem_scan → maintenance → problem_product_cleanup`�
 workflow 位置参数可以给多个:
 
 ```
-python cli.py order_sync order_audit order_center_push
+python cli.py order_sync order_audit returns_sync
 ```
 
 ⚠ 这是本项目实现"链"的**唯一**方式。铁律 1 禁止 workflow 互相 import,
@@ -251,12 +252,18 @@ cli 本来就管锁/记录/通知,链只是把这三件事各做 N 遍。
 语义:每步各拿各的锁、各写一行 `ops.runs`、各进各的日志文件;
 **前一步不成功就不跑后面的**(后面几步吃的是前面的输出);飞书**整链一条**
 通知;全部工作流名在跑第一步之前先验一遍。参数 `-p k=v` 发给每一步,
-`-p 工作流名:k=v` 只发给那一步。
+`-p 工作流名:k=v` 只发给那一步。**2026-08-26 起链还多做一件**:主链全绿且链里
+含 `catalog_sync` 时,cli 按目录水位找出本轮缺席店,对每家把链内声明
+`SUPPORTS_STORE` 的步骤带 `store=X` 逐店重跑一次(`cli._replay_absent`,四道闸:
+单店链不重赛 / 长期缺席只点名 / 今日缺席 > `REPLAY_MAX_STORES`(=5)不重赛 /
+水位复核防假救回),再失败即止。
 
 **上架先同步 UPC**:注入那段抽到 `services.upc_pool.sync_from_sheet`,
 `list_new` 与 `upc_sync` 共用。排在闸门链**之前**(领号是第 ⑦ 道闸,运营刚贴
 进表格的号这一轮就要能用);失败只告警不阻断(飞书挂了不该把整条上架链拖
-下水);dry-run 不注入,并在摘要里点明 `no_upc` 可能偏多。上架仍**不进调度**。
+下水);dry-run 不注入,并在摘要里点明 `no_upc` 可能偏多。⚠ **「上架不进调度」已于
+2026-08-17 推翻**:`list_new` 排进批三 20:00(`registry/schedule.py`,runner=gpt);
+`upc_sync` 仍不单排 —— 注入与回写都在这条链自己头尾。
 
 **feed 闭环审计**:结论与三个发现见 **`docs/feed_closure_audit.md`**。
 一句话:六个提交点无一例外都落 `ops.feed_log` + `ops.feed_items`(写在 api 层,

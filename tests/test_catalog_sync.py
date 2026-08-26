@@ -494,4 +494,4 @@ def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
     summary = catalog_sync.run({"skip_feishu": "1"})     # 不抛 = 不炸链
     first = summary.splitlines()[0]
     assert "1/2 店完成" in first
-    assert "⚠ 缺席 1 店:断店(代理)" in first          # 归类进首行,人知道去查代理
+    assert "⚠ 缺席 1 店:断店(代理波动)" in first     # 归类进首行,人知道去找代理商

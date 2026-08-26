@@ -149,7 +149,7 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
             lines.extend(out)
         for st, e in still:
             lines.append(f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
-                         f"{store_retry.classify(e)}:{e});已发出的分片已"
+                         f"{store_retry.diagnose(e)}:{e});已发出的分片已"
                          f"逐片落冷却台账,下轮自动排除,未发出的下轮接续")
     return lines
 

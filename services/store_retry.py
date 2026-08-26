@@ -13,6 +13,7 @@ api/feeds submit_feed 头注)同源:失败时补打进的正是造成失败的�
 """
 
 import logging
+import re
 import time
 
 from api import _client
@@ -62,14 +63,43 @@ def serial_second_pass(failures: list[tuple], attempt,
     return recovered, still, ""
 
 
-def classify(err: Exception) -> str:
-    """输入:店级异常 → 输出:摘要用的归类词(凭证/代理/其他)。
+# 「代理无效」的判据:代理服务器**明确拒绝**了我们的接入(认证失败/需要
+# 认证),这是配置错,改凭证表的代理账号密码才能好。消息样式来自
+# httpcore/socksio 源码实况("Invalid username/password"、认证协商失败、
+# HTTP 代理 407)。判不准的一律归「代理波动」而不是「无效」——
+# 无效是叫人去改配置,指错路比不指更糟。
+_PROXY_DEAD_MARKS = ("username/password", "auth", "407")
 
-    枚举而非 catch-all(CLAUDE.md:兜底触发条件明确;分类词进摘要首行,
-    人要靠它决定去修凭证表还是去看代理商)。
+
+def diagnose(err: Exception) -> str:
+    """输入:店级异常 → 输出:摘要用的归类词(一眼指路,所有者要求 2026-08-26)。
+
+    词表(枚举,别往里加 catch-all 新词;每个词都对应一条不同的处置路):
+      凭证失效   StoreDeadError:沃尔玛拒了这套凭证 → 修凭证表
+      代理无效   代理服务器拒绝认证/要求认证 → 修凭证表的代理账号密码
+      代理波动   SOCKS/隧道层其他故障(Malformed reply/断线/握手失败)
+                 → 找代理商;补试与链尾重赛常能自愈
+      沃尔玛NNN  沃尔玛端点回了 HTTP NNN(429=配额、5xx=沃尔玛侧故障)
+                 → 看配额/等沃尔玛,与本地无关
+      网络未达   请求经 api 层自动重试后仍没打到(状态码 None)
+                 → 网络/代理链路,看该店代理与出口
+      其他       以上都不是 → 看该工作流日志全文
+
+    ⚠ 「沃尔玛NNN/网络未达」靠匹配 **api 层自家的报错格式**(items.py 等的
+    "返回 {status}"/"返回 None"),改那边的文案要同步这里(有测试钉住两端)。
+    分诊只影响**报告**,不影响重试行为(补试与否只看 StoreDeadError 类型)。
     """
     if isinstance(err, _client.StoreDeadError):
-        return "凭证"
+        return "凭证失效"
     if isinstance(err, _client.PROXY_ERRORS):
-        return "代理"
+        msg = str(err).lower()
+        if any(mark in msg for mark in _PROXY_DEAD_MARKS):
+            return "代理无效"
+        return "代理波动"
+    text = str(err)
+    m = re.search(r"返回 (\d{3})", text)
+    if m:
+        return f"沃尔玛{m.group(1)}"
+    if "返回 None" in text:
+        return "网络未达"
     return "其他"

@@ -72,7 +72,11 @@
   不靠调度顺序)→ 链尾由 cli 对缺席店把链内声明 `SUPPORTS_STORE` 的步骤
   逐店重跑一次,**再失败即止**。SOCKS 层报错(socksio 不在 httpx 异常树上)
   由 `_client.get_token` 收口成 `StoreProxyError`(⊂ httpx.ProxyError,
-  现有分类分支天然接住)。⚠ **缺席 ≠ 停用**:在营判据永远是
+  现有分类分支天然接住)。**失败归类词唯一出处 `store_retry.diagnose`**,
+  六档各指一条处置路,进各工作流摘要首行:凭证失效(修凭证表)/代理无效
+  (修代理账号密码)/代理波动(找代理商,补试常自愈)/沃尔玛NNN(配额或
+  沃尔玛侧,与本地无关)/网络未达(链路)/其他(看日志)。
+  ⚠ **缺席 ≠ 停用**:在营判据永远是
   `enabled_names()`,store_absence 答的是"这轮数据新鲜不新鲜"。
 - **services 新增积木前必须先通读 services/ 现有函数确认无重复**;每个函数 docstring
   第一行写清"输入什么 → 输出什么"。

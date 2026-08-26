@@ -126,13 +126,39 @@ def test_serial_second_pass_never_retries_dead_credentials(monkeypatch):
     assert still == [({"name": "T1"}, dead)]
 
 
-def test_classify_is_an_enumeration_not_catch_all():
-    assert store_retry.classify(_client.StoreDeadError("T", 401)) == "凭证"
-    assert store_retry.classify(
-        _client.StoreProxyError("T", ValueError("x"))) == "代理"
+def test_classify_names_the_actual_culprit():
+    """所有者要求(2026-08-26):出问题一眼看到是凭证失效、代理无效、
+    代理波动还是沃尔玛侧 —— 六档词表,每档指一条不同的处置路。"""
     from socksio.exceptions import ProtocolError
-    assert store_retry.classify(ProtocolError("Malformed reply")) == "代理"
-    assert store_retry.classify(RuntimeError("GET 返回 None")) == "其他"
+    assert store_retry.diagnose(_client.StoreDeadError("T", 401)) == "凭证失效"
+    # 代理服务器明确拒认证 = 配置错,去修凭证表的代理账号密码
+    assert store_retry.diagnose(httpx.ProxyError("Invalid username/password")) \
+        == "代理无效"
+    # SOCKS 层其他故障 = 波动,找代理商;补试/重赛常能自愈(08-26 事故同款)
+    assert store_retry.diagnose(ProtocolError("Malformed reply")) == "代理波动"
+    assert store_retry.diagnose(
+        _client.StoreProxyError("T", ProtocolError("Malformed reply"))) \
+        == "代理波动"
+    # 沃尔玛端点回了状态码(api 层 "返回 {status}" 格式):与本地无关
+    assert store_retry.diagnose(RuntimeError(
+        "GET /v3/items 返回 500(店铺 X): {}")) == "沃尔玛500"
+    assert store_retry.diagnose(RuntimeError(
+        "GET /v3/items 返回 429(店铺 X): {}")) == "沃尔玛429"
+    # api 层重试耗尽后状态码是 None:网络/代理链路未达
+    assert store_retry.diagnose(RuntimeError(
+        "GET /v3/items 返回 None(店铺 X): None")) == "网络未达"
+    assert store_retry.diagnose(ValueError("boom")) == "其他"
+
+
+def test_classify_message_patterns_match_the_api_layer():
+    """「沃尔玛NNN/网络未达」靠匹配 api 层自家的 "返回 {status}" 报错格式 ——
+    这条钉住两端:api 层改文案而没同步 classify 时这里会红。"""
+    import pathlib
+    import re as _re
+    api_src = "".join(p.read_text(encoding="utf-8")
+                      for p in pathlib.Path("api").glob("*.py"))
+    assert _re.search(r'RuntimeError\(f"[^"]*返回 \{status\}', api_src), \
+        "api 层的状态码报错格式变了,同步 services/store_retry.diagnose"
 
 
 # ── ③ 缺席判据(目录水位派生,不建新表、不靠调度顺序)─────────────────────────

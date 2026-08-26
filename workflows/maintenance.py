@@ -79,7 +79,8 @@ from datetime import datetime
 from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
-    maintenance_intents as mi, store_absence, stores as stores_svc
+    maintenance_intents as mi, store_absence, store_retry, \
+    stores as stores_svc
 
 DANGEROUS = True
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -370,7 +371,8 @@ def run(params: dict) -> str:
         except Exception as e:
             logger.exception("店铺 %s 维护提交异常,跳过继续其它店: %s",
                              store_name, e)
-            lines_s.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+            lines_s.append(f"  ⚠ {store_name}:提交异常已跳过"
+                           f"({store_retry.diagnose(e)}:{e}),下轮重试")
             _unexecuted("未执行(提交异常)", str(e))
         return store_name, lines_s, records_s
 

@@ -179,8 +179,8 @@ def run(params: dict) -> str:
             total_stores=len(store_list))
         results.extend(r for _s, r in recovered)
         for s, e in still:
-            cls = store_retry.classify(e)
-            if cls == "凭证":                    # 补试中才暴露的凭证死,归 dead 口径
+            cls = store_retry.diagnose(e)
+            if cls == "凭证失效":                    # 补试中才暴露的凭证死,归 dead 口径
                 dead.append(s["name"])
             else:
                 absent.append((s["name"], cls))

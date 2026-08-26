@@ -264,7 +264,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 per_store[st["name"]] = (
                     partial.get(st["name"], []),
                     [f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
-                     f"{store_retry.classify(e)}:{e});已发出分片已回写表格,"
+                     f"{store_retry.diagnose(e)}:{e});已发出分片已回写表格,"
                      f"未发出的下轮接续"], 0, 0)
             if gate_note:
                 lines.append(gate_note)

@@ -46,6 +46,37 @@ _DETAIL_PAGE = 50          # includeDetails 明细页大小(官方两页矛盾 5
 _PAGE_SLEEP = 0.2
 _RECHECK_SLEEP = 30        # 反查 NOT_FOUND 的二次确认间隔(防索引滞后)
 
+# ── 5xx 退避:官方阶梯 + **抖动**(2026-08-26 核验 developer.walmart.com)────
+# 逐条官方原文:
+#   INVALID_SYSTEM_STATE (500) —— "Retry with jitter. If repeated, open a
+#                                  support ticket with examples."
+#   SYSTEM_ERROR (500)         —— "Confirm Content-Type and payload format,
+#                                  then retry with jitter."
+#   DOWNSTREAM_SYSTEM_TIME_OUT (504) —— "Retry with exponential backoff."
+#   平台可用性节             —— "Retry with exponential backoff and jitter."
+#   退避阶梯示例(秒)         —— 2, 4, 8, 16, 32;"Cap retries (for example,
+#                                  5 attempts)"
+# ⚠ **抖动是官方明写的要求,不是我们的发挥**:此前只有一个**固定 30 秒**、
+# 零抖动的二次确认,正踩在官方建议的反面 —— 一批同时失败的店会在 30 秒后
+# **再次同时**打过去,把第一次的洪峰原样复制一遍。
+_BACKOFF_LADDER = (2, 4, 8, 16, 32)
+# 一片最多补交几次(含第一次)。官方举例 5;我们取 3 ——
+# 每次补交都吃一枚 feeds.post.MP_ITEM 令牌(8/hour/店),而且失败行还有
+# 次日的 FAILED 重试通道兜着,不必在当轮把配额榨干
+SETTLE_ATTEMPTS = 3
+
+
+def _backoff(attempt: int) -> float:
+    """输入:第几次退避(0 起)→ 输出:**带抖动**的秒数(官方阶梯 × [0.5,1.0])。
+
+    抖动取"满阶梯的一半到满值"(AWS full-jitter 的常见变体):既保证退避在长,
+    又保证同时失败的 N 家店**不会同时醒来**。抖动的全部意义就在后半句——
+    没有它,退避只是把洪峰整体平移,不是把它摊平。
+    """
+    import random
+    base = _BACKOFF_LADDER[min(attempt, len(_BACKOFF_LADDER) - 1)]
+    return base * (0.5 + random.random() * 0.5)
+
 # 切片双约束:(最大条数, 最大字节)。RETIRE_ITEM 官方无现值,按 DELETE 同档保守;
 # price/inventory 官方 10MB(旧代码 25MB 超官方上限,蓝图 §5.4 收紧)
 _SLICE_LIMITS = {
@@ -241,12 +272,19 @@ def _items_record(feed_id: str, workflow: str, store_name: str,
 # ── 提交(唯一入口)────────────────────────────────────────────────────────────
 
 def submit_feed(store: dict, feed_type: str, entries: list, *,
-                workflow: str = "") -> list[dict]:
+                workflow: str = "", defer_settle: bool = False) -> list[dict]:
     """输入:店铺 + feedType + 条目 → 输出:逐切片结果
-    [{"feed_id", "count", "outcome": submitted/dedup/unknown/failed}]。
+    [{"feed_id", "count", "outcome": submitted/dedup/unknown/failed/deferred}]。
 
     写操作零自动重试(CLAUDE.md:换方法重试=重复提交制造机);网络异常走
-    反查三态,只有**确认未达**才按同一载荷补交一次。
+    反查三态,只有**确认未达**才按同一载荷补交。
+
+    `defer_settle=True`:遇 5xx / 网络异常**当场不结算**,返回
+    `outcome="deferred"`(附 `_settle` 句柄),由调用方在合适的时机调
+    `settle_deferred()` 收尾。所有者定稿 2026-08-26:「重试的等到完整跑完
+    一轮再尝试」——内联结算的老毛病是**补交打进的正是造成失败的那片拥堵**
+    (固定 30s 后另外二十几家还在传),而整轮跑完之后管子已经空了。
+    调用方不传就是老行为(内联结算),别的链一个字都不用改。
     """
     if feed_type not in _SLICE_LIMITS:
         raise ValueError(f"feedType 未收录: {feed_type}")
@@ -261,7 +299,8 @@ def submit_feed(store: dict, feed_type: str, entries: list, *,
             results.append({"feed_id": prev["feed_id"], "count": len(chunk),
                             "outcome": "dedup"})
             continue
-        results.append(_submit_one(store, feed_type, chunk, log_id, workflow))
+        results.append(_submit_one(store, feed_type, chunk, log_id, workflow,
+                                   defer_settle=defer_settle))
     return results
 
 
@@ -288,15 +327,27 @@ def _post(store: dict, feed_type: str, payload: dict):
         timeout=120)
 
 
+def _ok_result(log_id, feed_id: str, workflow: str, store_name: str,
+               feed_type: str, skus: list, count: int) -> dict:
+    """输入:台账句柄 + feedId + 本片 SKU → 输出:submitted 结果(并落两张台账)。
+
+    从 `_submit_one` 的内部闭包提到模块级:`settle_deferred` 要走**同一条**
+    收编路径。两处各写一遍的话,延后结算收编的 feed 会漏掉 ops.feed_items,
+    而回执反哺器正是按它找行的 —— 漏了就是"feed 成功了但表上永远不回填"。
+    """
+    _log_update(log_id, "submitted", feed_id)
+    _items_record(feed_id, workflow, store_name, feed_type, skus)
+    return {"feed_id": feed_id, "count": count, "outcome": "submitted"}
+
+
 def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
-                workflow: str = "") -> dict:
+                workflow: str = "", defer_settle: bool = False) -> dict:
     payload = build_payload(feed_type, chunk)
     skus = _chunk_skus(feed_type, chunk)
 
     def _ok(feed_id: str) -> dict:
-        _log_update(log_id, "submitted", feed_id)
-        _items_record(feed_id, workflow, store["name"], feed_type, skus)
-        return {"feed_id": feed_id, "count": len(chunk), "outcome": "submitted"}
+        return _ok_result(log_id, feed_id, workflow, store["name"],
+                          feed_type, skus, len(chunk))
 
     status, _, data = _post(store, feed_type, payload)
     n = len(chunk)
@@ -332,6 +383,18 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
                        "按'不知道到没到'走反查三态",
                        store["name"], feed_type, status)
 
+    if defer_settle:
+        # 当场不结算:UPC 不回收、表不写终态,把重放句柄交给调用方。
+        # `chunk` 一起带走 —— 载荷由 build_payload 确定性重建,不必扛着几 MB
+        # 的 dict 过整轮(而且重建保证补交与首发**逐字节同一份载荷**)
+        logger.warning("feed 提交不确定(HTTP %s):%s %s %d 条,"
+                       "**延后到整轮跑完再结算**", status, store["name"],
+                       feed_type, n)
+        return {"feed_id": None, "count": n, "outcome": "deferred",
+                "_settle": {"log_id": log_id, "feed_type": feed_type,
+                            "chunk": chunk, "skus": skus,
+                            "workflow": workflow, "count": n}}
+
     # 网络异常(status=None)或 5xx:不知道到没到 → 反查三态
     verdict, feed = find_recent_feed(store, feed_type, n)
     if verdict == "FOUND":
@@ -348,6 +411,73 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
         return {"feed_id": None, "count": n, "outcome": "failed"}
     # UNKNOWN:保持 pending,留给启动对账(query_pending),人不在环时宁停不重
     logger.error("feed 网络异常且反查不确定:%s %s 保持 pending 待启动对账",
+                 store["name"], feed_type)
+    return {"feed_id": None, "count": n, "outcome": "unknown"}
+
+
+def settle_deferred(store: dict, settle: dict) -> dict:
+    """输入:店铺 + `_settle` 句柄 → 输出:终局结果(submitted/failed/unknown)。
+
+    延后结算(所有者定稿 2026-08-26:「重试的等到完整跑完一轮再尝试」)。
+    每一轮都是**先反查、后补交**,循环最多 `SETTLE_ATTEMPTS` 次:
+
+        反查 FOUND      → 收编那条 feed,**不补交**(它本来就到了)
+        反查 NOT_FOUND  → 按同一载荷补交一次;再遇 5xx 就退避后重来
+        反查 UNKNOWN    → 连查都查不动,**绝不补交**(宁停不重),退避后重来
+
+    ⚠ **补交前必须重新反查,一次都不许省**。省掉的话第二次补交就可能撞上
+    第一次其实已经落地的 feed —— 那是双上架,本仓最贵的错误。反查本身不贵
+    (feeds.get 是 3000/min 的大桶),而每省一次都在赌。
+
+    ⚠ 载荷由 `build_payload(chunk)` **重建**,不是扛着首发那份走完整轮:
+    重建是确定性的,保证补交与首发逐字节同一份 —— 这正是防重指纹
+    (payload_key)成立的前提,也是"同一方法补交"这条铁律的字面意思。
+
+    退避走官方阶梯 + 抖动(见 `_backoff`)。全部尝试用尽仍未确认:
+      · 最后一次是 NOT_FOUND ⇒ failed(调用方可回收 UPC,次日重试通道接手)
+      · 最后一次是 UNKNOWN   ⇒ unknown(feed_log 保持 pending,交启动对账)
+    """
+    log_id = settle["log_id"]
+    feed_type, chunk = settle["feed_type"], settle["chunk"]
+    skus, workflow, n = settle["skus"], settle["workflow"], settle["count"]
+    verdict = "UNKNOWN"
+
+    for attempt in range(SETTLE_ATTEMPTS):
+        verdict, feed = find_recent_feed(store, feed_type, n)
+        if verdict == "FOUND":
+            logger.warning("延后结算:%s %s 反查已达 feedId=%s(收编,不补交)",
+                           store["name"], feed_type, feed["feedId"])
+            return _ok_result(log_id, feed["feedId"], workflow,
+                              store["name"], feed_type, skus, n)
+        if verdict == "NOT_FOUND":
+            logger.warning("延后结算:%s %s 双确认未达,第 %d/%d 次补交",
+                           store["name"], feed_type, attempt + 1,
+                           SETTLE_ATTEMPTS)
+            status, _, data = _post(store, feed_type,
+                                    build_payload(feed_type, chunk))
+            if status == 200 and data and data.get("feedId"):
+                return _ok_result(log_id, data["feedId"], workflow,
+                                  store["name"], feed_type, skus, n)
+            if status is not None and status is not _PRE_FAIL and status < 500:
+                # 4xx:载荷/权限问题,再补多少次都是同一个拒 —— 立刻收手
+                _log_update(log_id, "failed")
+                logger.error("延后结算:%s %s 补交被拒 HTTP %s 响应=%s",
+                             store["name"], feed_type, status, str(data)[:300])
+                return {"feed_id": None, "count": n, "outcome": "failed"}
+        # NOT_FOUND 补交又遇 5xx,或 UNKNOWN 查不动:退避后重来
+        if attempt < SETTLE_ATTEMPTS - 1:
+            wait = _backoff(attempt)
+            logger.info("延后结算:%s %s 第 %d 次未果,退避 %.1fs(官方阶梯+抖动)",
+                        store["name"], feed_type, attempt + 1, wait)
+            time.sleep(wait)
+
+    if verdict == "NOT_FOUND":
+        _log_update(log_id, "failed")
+        logger.error("延后结算:%s %s %d 次补交全未果,判未达(UPC 可回收,"
+                     "次日重试通道接手)", store["name"], feed_type,
+                     SETTLE_ATTEMPTS)
+        return {"feed_id": None, "count": n, "outcome": "failed"}
+    logger.error("延后结算:%s %s 反查始终不确定,保持 pending 待启动对账",
                  store["name"], feed_type)
     return {"feed_id": None, "count": n, "outcome": "unknown"}
 

@@ -7,6 +7,8 @@
   python cli.py list_new -p gap_wait=0       # 缺数据只推采集不等(默认等 20 分钟)
   python cli.py list_new -p workers=64       # 预备期 LLM 并发(默认 128,
                                              # 实际还会按 PG 连接余量钳制)
+  python cli.py list_new -p submit_jitter_ms=0  # 提交期起跑抖动(毫秒,默认 800;
+                                             # 0=关。去同步,不降并发)
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
 且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
@@ -54,7 +56,13 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     spec 一致化,UPC 用占位号,缺必填本地拦下
     (不领号不烧配额)→ 领号期 = 通过的行按店批量领 UPC(catalog.upc_pool
     事务,FOR UPDATE SKIP LOCKED),真号回填占位号 → 提交期 = 同店打包
-    单个 MP_ITEM feed(10/hour 硬限),店间并发 ≤24
+    单个 MP_ITEM feed(10/hour 硬限),店间并发 ≤24。
+    提交期三条防线(所有者定稿 2026-08-26,全部只在出事时花钱):
+      · **起跑抖动** 0~800ms:去掉"24 个线程同一毫秒发起",不降并发
+      · **自适应降档** 24→16→12→8→4:遇 5xx/限流降一档,只降不升
+        (官方 429 口径就是 resume at a lower rate);下轮回顶格
+      · **延后结算**:5xx/网络不确定的片子当轮不写终态,整轮跑完再
+        反查+补交 —— 内联补交打进的正是造成它失败的那片拥堵
 
 闸门链之前先**注入一次 UPC 池**(所有者定稿 2026-08-16:「运行时自动同步
 一次 UPC,然后再走上架流程」)——运营刚贴进「UPC池」表的号,这一轮就要能领。
@@ -77,7 +85,9 @@ upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)�
 import collections
 import contextlib
 import logging
+import random
 import threading
+import time
 from datetime import datetime
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
@@ -89,6 +99,179 @@ from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     upc_pool, variant_group, variant_remap, variant_title
 
 DANGEROUS = True
+
+# ── 提交期自适应降并发(所有者定稿 2026-08-26:「遇到限流以后动态降并发,
+#    而不是直接打死」)────────────────────────────────────────────────────────
+#
+# 阶梯照所有者给的写:24 → 16 → 12 → 8 → 4,**不再往下**(4 路是保底通道,
+# 降到 0 就等于把当轮剩下的店全废了,那正是"直接打死")。
+#
+# 官方口径对得上(2026-08-26 核验 developer.walmart.com/us-marketplace/docs/
+# rate-limiting):429 之后「Sleep until x-next-replenish-time, then **resume
+# at a lower rate**」——沃尔玛自己要求的就是降速续跑,不是停。
+#
+# ⚠ **只降不升**(同一轮内)。升回去要先能判断"拥堵过去了",而一轮就几分钟,
+# 判据必然是猜的;猜错就是在拥堵没散时又冲一次,把刚退下来的让步白费。
+# 下一轮进程重开,阶梯自然回到顶格。
+#
+# ⚠ **第一轮基本降不到东西**:24 家店 ≤ 24 个槽位,全都瞬间拿到许可,等第一个
+# 5xx 浮上来时已经全在飞了。它真正生效的地方是 ①店数超过顶格并发时排队的那些
+# ②**第二轮延后结算** —— 而第二轮恰恰最需要它:第一轮已经证明这个时段拥堵。
+# 所以这套东西治的是**恢复**,不是第一轮的洪峰;洪峰要治得靠切小 feed
+# (官方 feeds 页原话:「Keep your bulk files small enough to process reliably.
+# Split very large submissions into multiple feeds.」),那是另一件事。
+_CONCURRENCY_LADDER = (16, 12, 8, 4)
+
+# 第一轮起跑抖动(毫秒;所有者定稿 2026-08-26:「第一轮不降并发,但是不要所有店
+# 同时执行提交,可以随机抖动多少 ms 来提交」)。
+#
+# ⚠ **它去同步,不降峰值** —— 说清楚免得被当成万灵药:上传要几十秒,几百毫秒的
+# 抖动不会让任何两家店错开成"一前一后",24 家照样同时在传。它消掉的是**同一
+# 毫秒**那一下:TLS 握手、首包、PG 领号、连接池建连全撞在一个瞬间。这一下几乎
+# 不要钱(整轮多花不到 1 秒),所以做;但指望它治住持续重叠是指望错了对象。
+#
+# 为什么三段式重排之后才需要它:重排(#51)把 LLM 出参前置到预备期,提交期只剩
+# 「领号(毫秒)→ 真号回填(微秒)→ POST」,24 个线程从 pool.submit 到发出 POST
+# 几乎没有耗时差。重排之前每店的 LLM 是店内串着做的,POST 天然就错开了。
+SUBMIT_JITTER_MS = 800
+
+
+class _AdaptiveGate:
+    """并发闸:正常放行到顶格,遇 5xx/限流按阶梯降一档(线程安全,只降不升)。
+
+    不用信号量而用 Condition + 计数:信号量的许可数发出去就收不回来,
+    而降档要的正是"**已经发出去的不动、后面来的按新上限排队**"。
+    """
+
+    def __init__(self, top: int, ladder=_CONCURRENCY_LADDER):
+        self._cv = threading.Condition()
+        self._limit = int(top)
+        self._ladder = [n for n in ladder if n < int(top)]
+        self._inflight = 0
+        self.steps: list[tuple[int, str]] = []   # 降档轨迹,摘要里要报
+
+    @property
+    def limit(self) -> int:
+        with self._cv:
+            return self._limit
+
+    def acquire(self) -> None:
+        with self._cv:
+            while self._inflight >= self._limit:
+                self._cv.wait()
+            self._inflight += 1
+
+    def release(self) -> None:
+        with self._cv:
+            self._inflight -= 1
+            self._cv.notify_all()
+
+    def step_down(self, why: str) -> None:
+        """输入:降档理由 → 输出:无。降一档并记轨迹;已到底则只记不降。"""
+        with self._cv:
+            nxt = next((n for n in self._ladder if n < self._limit), None)
+            if nxt is None:
+                return
+            old, self._limit = self._limit, nxt
+            self.steps.append((nxt, why))
+        logger.warning("提交并发降档 %d → %d(%s)——沃尔玛 429 之后的官方口径"
+                       "就是 resume at a lower rate", old, nxt, why)
+
+
+def _settle_round(deferred: list, stores_by_name: dict, gate, today: str) -> list:
+    """输入:整轮攒下的不确定片 + 店表 + 并发闸 → 输出:摘要行。
+
+    **第二轮**(所有者定稿 2026-08-26:「重试的等到完整跑完一轮再尝试」)。
+    第一轮内联结算的老毛病是:补交在失败后 30 秒发出,而那时另外二十几家店
+    还在传 —— 这一次补交打进的正是造成它失败的那片拥堵。整轮跑完之后管子
+    已经空了,同一次补交的成功率完全是另一回事;而且拖过这几分钟之后,
+    沃尔玛侧的 feed 索引也追上了,**反查更可能 FOUND ⇒ 直接收编、连补交都
+    不必发**(生产实证:2026-08-24 那晚 4 家店就是这么救回来的)。
+
+    走 `gate`:第二轮的并发已经被第一轮的降档压过一档 —— 第一轮既然证明了
+    这个时段拥堵,重试就没有理由再按顶格冲。
+    """
+    if not deferred:
+        return []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    lines = [f"⏸ 延后结算:{len(deferred)} 片("
+             f"{sum(len(b) for _, _, b in deferred)} 条)整轮跑完后重试,"
+             f"并发 {gate.limit}"]
+
+    def _one(item):
+        store_name, settle, batch = item
+        updates: list = []
+        try:
+            gate.acquire()
+            try:
+                res = feeds.settle_deferred(stores_by_name[store_name], settle)
+            finally:
+                gate.release()
+            _apply_submit_result(store_name, res, batch, updates, today)
+            if updates:
+                listing_sheet.write_submit_cols(updates)
+            return store_name, res["outcome"], len(batch)
+        except Exception as e:                                  # noqa: BLE001
+            # 结算炸了**不写终态**:UPC 留在「已领」、表上还是空,
+            # feed_log 保持 pending —— 启动对账是它的下一站,不是丢掉
+            logger.exception("延后结算异常(保持 pending):%s: %s", store_name, e)
+            return store_name, "unknown", len(batch)
+
+    tally: dict = {}
+    with ThreadPoolExecutor(max_workers=min(gate.limit, len(deferred))) as pool:
+        for f in as_completed([pool.submit(_one, d) for d in deferred]):
+            sn, outcome, n = f.result()
+            tally.setdefault(outcome, {}).setdefault(sn, 0)
+            tally[outcome][sn] += n
+    label = {"submitted": "✅ 补上", "failed": "❌ 判未达(UPC 已回收,次日重试)",
+             "unknown": "⚠ 仍不确定(保持 pending,交启动对账)"}
+    for outcome in ("submitted", "failed", "unknown"):
+        by = tally.get(outcome)
+        if by:
+            lines.append(f"  {label[outcome]} {sum(by.values())} 条:"
+                         + ",".join(f"{k}×{v}" for k, v in sorted(by.items())))
+    return lines
+
+
+def _apply_submit_result(store_name: str, res: dict, batch: list,
+                         updates: list, today: str) -> None:
+    """输入:一片的提交结果 + 该片的 (行, UPC) → 输出:无(落库并攒表更新)。
+
+    **两轮共用一条落地路径**(第一轮直接提交、第二轮延后结算)。分开写的话,
+    延后结算那条迟早漏掉 mark_used 或 listing_sources.register —— 漏了不报错,
+    只是那批货在维护链眼里成了"来源不明"的孤儿(sources_backfill 才捞得回来)。
+    """
+    with db.pg_conn() as conn:
+        if res["outcome"] == "submitted" and res["feed_id"]:
+            upc_pool.mark_used(conn, [(u, r["asin"]) for r, u in batch])
+            listing_sources.register(conn, [
+                {"store": store_name, "sku": r["asin"],
+                 "source_type": listing_sources.SOURCE_AMZ,
+                 "source_key": r["asin"], "workflow": "list_new"}
+                for r, _ in batch])
+            product_events.record_many(conn, [
+                {"sku": r["asin"], "store": store_name,
+                 "event": product_events.LIST_SUBMITTED, "source": "list_new",
+                 "detail": {"feed_id": res["feed_id"], "price": r["_price"]}}
+                for r, _ in batch])
+            for r, u in batch:
+                updates.append((r["rownum"], [
+                    (r["_p"].get("title") or "")[:190],
+                    r["_p"].get("price") or "",
+                    r["_qty"],      # 实际提交的库存(0 也照写)
+                    r["_price"], "Yes", res["feed_id"], today, ""]))
+        elif res["outcome"] == "failed":
+            upc_pool.release(conn, [u for _, u in batch], "rejected")
+            for r, _ in batch:
+                updates.append((r["rownum"], [
+                    "", "", "", "", "No", "", "", "提交被拒"]))
+        else:   # unknown:UPC 不回收,K=Unknown 防重复提交
+            for r, _ in batch:
+                updates.append((r["rownum"], [
+                    "", "", "", "", "Unknown", "", today,
+                    "提交结局不确定,待对账"]))
+
+
 
 logger = logging.getLogger("workflows.list_new")
 
@@ -947,6 +1130,8 @@ def run(params: dict) -> str:
     # db_guard.cap_workers 按 PG 连接余量钳一道)
     gap_wait = int(params.get("gap_wait", 20))
     prep_workers = int(params.get("workers", 128))
+    # 第一轮起跑抖动(毫秒;0=关)。去同步,不降峰值 —— 见 SUBMIT_JITTER_MS 头注
+    jitter_ms = int(params.get("submit_jitter_ms", SUBMIT_JITTER_MS))
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
@@ -1348,6 +1533,7 @@ def run(params: dict) -> str:
     by_store2: dict[str, list[dict]] = {}
     for r in prep_ok:
         by_store2.setdefault(r["store"], []).append(r)
+    gate = _AdaptiveGate(stores_svc.STORE_WORKERS)
 
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
         """输入:店铺 + 该店**已备好**的行 → 输出:(店铺名, 计数增量, reasons, lines)。
@@ -1373,7 +1559,14 @@ def run(params: dict) -> str:
         cnt = {"no_upc": 0, "title_diff": 0}
         reasons_s: list[tuple[int, str]] = []
         lines_s: list[str] = []
+        # 不确定待结算的片子:**本店局部**(跨店并发之后不能往共享 list 上
+        # append,与 reasons_s/lines_s 同一条纪律),主线程按店名排序合并
+        deferred_s: list[tuple] = []
         store = stores_by_name[store_name]
+        if jitter_ms > 0:
+            # 放在领号之前:ms 级,把「领号→提交」的窗口撑宽不了多少,
+            # 而这样连 PG 领号那一下的同时性也一并去掉了
+            time.sleep(random.random() * jitter_ms / 1000.0)
         try:
             prepped: list[dict] = []
             with db.pg_conn() as conn:
@@ -1401,62 +1594,63 @@ def run(params: dict) -> str:
                 for p in prepped]
             claimed = [(p["r"], p["upc"]) for p in prepped]
             if not items:
-                return store_name, cnt, reasons_s, lines_s
+                return store_name, cnt, reasons_s, lines_s, deferred_s
             updates = []
             i = 0
-            for res in feeds.submit_feed(store, "MP_ITEM", items,
-                                         workflow="list_new"):
+            gate.acquire()
+            try:
+                results = feeds.submit_feed(store, "MP_ITEM", items,
+                                            workflow="list_new",
+                                            defer_settle=True)
+            finally:
+                gate.release()
+            for res in results:
                 batch = claimed[i:i + res["count"]]
                 i += res["count"]
-                with db.pg_conn() as conn:
-                    if res["outcome"] == "submitted" and res["feed_id"]:
-                        upc_pool.mark_used(conn, [(u, r["asin"])
-                                                  for r, u in batch])
-                        listing_sources.register(conn, [
-                            {"store": store_name, "sku": r["asin"],
-                             "source_type": listing_sources.SOURCE_AMZ,
-                             "source_key": r["asin"], "workflow": "list_new"}
-                            for r, _ in batch])
-                        product_events.record_many(conn, [
-                            {"sku": r["asin"], "store": store_name,
-                             "event": product_events.LIST_SUBMITTED, "source": "list_new",
-                             "detail": {"feed_id": res["feed_id"],
-                                        "price": r["_price"]}}
-                            for r, _ in batch])
-                        for r, u in batch:
-                            updates.append((r["rownum"], [
-                                (r["_p"].get("title") or "")[:190],
-                                r["_p"].get("price") or "",
-                                r["_qty"],      # 实际提交的库存(0 也照写)
-                                r["_price"], "Yes", res["feed_id"], today, ""]))
-                    elif res["outcome"] == "failed":
-                        upc_pool.release(conn, [u for _, u in batch], "rejected")
-                        for r, _ in batch:
-                            updates.append((r["rownum"], [
-                                "", "", "", "", "No", "", "", "提交被拒"]))
-                    else:   # unknown:UPC 不回收,K=Unknown 防重复提交
-                        for r, _ in batch:
-                            updates.append((r["rownum"], [
-                                "", "", "", "", "Unknown", "", today,
-                                "提交结局不确定,待对账"]))
-            listing_sheet.write_submit_cols(updates)
-            lines_s.append(f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条")
+                if res["outcome"] == "deferred":
+                    # 不确定态**当轮不写终态**:UPC 不回收、表不动、事件不落。
+                    # 整轮跑完之后统一结算(所有者定稿 2026-08-26)——那时管子
+                    # 已经空了,反查更可能 FOUND、补交也更可能成
+                    gate.step_down(f"{store_name} 提交遇 5xx/网络不确定")
+                    deferred_s.append((store_name, res["_settle"], batch))
+                    continue
+                _apply_submit_result(store_name, res, batch, updates, today)
+            if updates:
+                listing_sheet.write_submit_cols(updates)
+            n_defer = sum(len(b) for _, _, b in deferred_s)
+            lines_s.append(
+                f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条"
+                + (f",⏸ {n_defer} 条不确定待整轮后结算" if n_defer else ""))
         except Exception as e:
             logger.exception("店铺 %s 上架异常,跳过继续其它店: %s", store_name, e)
             lines_s.append(f"  ⚠ {store_name}:上架异常已跳过({e}),下轮重试")
-        return store_name, cnt, reasons_s, lines_s
+        return store_name, cnt, reasons_s, lines_s, deferred_s
 
     todo2 = sorted(by_store2.items())
+    deferred_all: list[tuple] = []
     if todo2:
+        lines.append(
+            f"提交期:并发 {stores_svc.STORE_WORKERS} 起步(遇 5xx 按 "
+            f"{'→'.join(str(n) for n in _CONCURRENCY_LADDER)} 降档)"
+            + (f",起跑抖动 0~{jitter_ms}ms" if jitter_ms > 0
+               else ",⚠ 起跑抖动**已关**(全部店同一毫秒发起)")
+            + ";不确定的片子留到整轮跑完再结算")
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo2))) as pool:
             futs = [pool.submit(_one_store, sn, sr) for sn, sr in todo2]
             for f in as_completed(futs):
-                sn, cnt, reasons_s, lines_s = f.result()
+                sn, cnt, reasons_s, lines_s, deferred_s = f.result()
                 per_store[sn] = (cnt, reasons_s, lines_s)
+                deferred_all.extend(deferred_s)
         # 按店名排序合并:完成先后是随机的,摘要行序与 N 列理由的写入顺序不能跟着随机
+        lines.extend(_settle_round(deferred_all, stores_by_name, gate, today))
+        if gate.steps:
+            lines.append(
+                "  提交并发降档:" + " → ".join(
+                    str(n) for n, _ in [(stores_svc.STORE_WORKERS, "")] + gate.steps)
+                + f"(首因:{gate.steps[0][1]};只降不升,下轮回顶格)")
         for sn, _ in todo2:
             cnt, reasons_s, lines_s = per_store[sn]
             n["no_upc"] += cnt["no_upc"]

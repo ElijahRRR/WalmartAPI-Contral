@@ -622,6 +622,124 @@ def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
     assert "B0TANZONG1" not in listed      # 范围外的店不拦
 
 
+def test_submit_jitter_desynchronizes_the_starts(monkeypatch):
+    """起跑抖动:去同步,**不降并发**(所有者定稿 2026-08-26)。
+
+    三段式重排(#51)之后提交期只剩「领号(毫秒)→ 回填(微秒)→ POST」,
+    24 个线程几乎在同一毫秒发起。抖动消掉的就是这一下 —— TLS 握手、首包、
+    PG 领号、连接池建连不再全撞在一个瞬间。
+
+    ⚠ 它**不减少峰值**:上传要几十秒,几百毫秒错不开任何两家店。用例因此只
+    断言"起跑时刻确实散开了",不断言并发下降 —— 断错了会把这个廉价手段
+    当成万灵药,下次 5xx 又来时没人知道该往哪查。
+    """
+    import time as _t
+
+    rows = [_sheet_row(i + 2, store=f"T{i}", asin=f"B0JIT{i:05d}")
+            for i in range(4)]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    starts, lock = [], __import__("threading").Lock()
+
+    def fake_submit(store, feed_type, items, workflow=None, defer_settle=False):
+        with lock:
+            starts.append(_t.monotonic())
+        yield {"outcome": "submitted", "feed_id": "F-J", "count": len(items)}
+
+    monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)
+    out = ln.run({"execute": True, "submit_jitter_ms": 300})
+
+    assert len(starts) == 4
+    # 四家店的起跑时刻必须真的散开(同一毫秒发起的话跨度会是微秒级)
+    assert max(starts) - min(starts) > 0.01, starts
+    assert "起跑抖动 0~300ms" in out
+
+
+def test_submit_jitter_off_says_so_out_loud(monkeypatch):
+    """关掉抖动要在摘要里喊出来 —— 缺省是开的,关着跑而摘要不提,
+    等于把"今晚为什么又 5xx"的线索藏起来。"""
+    rows = [_sheet_row(2, store="T1", asin="B0NOJIT001")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    out = ln.run({"execute": True, "submit_jitter_ms": 0})
+    assert "起跑抖动**已关**" in out
+
+
+def test_adaptive_gate_steps_down_the_ladder_and_never_back_up():
+    """遇 5xx 按 24 → 16 → 12 → 8 → 4 降档,**到底不再降、也永不回升**
+    (所有者定稿 2026-08-26:「动态降并发,而不是直接打死」)。
+
+    只降不升是有意的:升回去要先判断"拥堵过去了",而一轮就几分钟,判据必然
+    是猜的 —— 猜错就是在拥堵没散时又冲一次,把刚退下来的让步白费。下一轮
+    进程重开,阶梯自然回到顶格。**降到 0 才是"打死"**,所以 4 是保底通道。
+    """
+    g = ln._AdaptiveGate(24)
+    assert g.limit == 24
+    for want in (16, 12, 8, 4):
+        g.step_down("5xx")
+        assert g.limit == want
+    g.step_down("又一个 5xx")
+    assert g.limit == 4, "到底之后还往下降就是把当轮剩下的店全废了"
+    # 轨迹要留:摘要得报出降到哪一档、首因是谁
+    assert [n for n, _ in g.steps] == [16, 12, 8, 4]
+    assert g.steps[0][1] == "5xx"
+
+
+def test_adaptive_gate_ladder_skips_rungs_above_the_start():
+    """顶格本来就低于某几档时,那几档要跳过 —— 否则"降档"会把并发**调高**。
+
+    (`STORE_WORKERS` 是全项目共用常量,别处改小过它这条就会踩上。)
+    """
+    g = ln._AdaptiveGate(10)          # 顶格 10:16 这一档必须跳过
+    g.step_down("5xx")
+    assert g.limit == 8
+    g.step_down("5xx")
+    assert g.limit == 4
+
+
+def test_deferred_rows_write_no_terminal_state_until_the_settle_round(monkeypatch):
+    """不确定的片子**当轮不写终态**,整轮跑完才结算(所有者定稿 2026-08-26)。
+
+    盯三件事:
+      ① 第一轮不回收 UPC、不写表 —— 写了就没得救了;
+      ② 第二轮真的跑了,而且用的是**同一条落地路径**(_apply_submit_result);
+      ③ 并发闸因为这次不确定降了一档 —— 第二轮不该再按顶格冲。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0DEFER001"),
+            _sheet_row(3, store="T2", asin="B0DEFER002")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+
+    def fake_submit(store, feed_type, items, workflow=None, defer_settle=False):
+        assert defer_settle, "上架链必须走延后结算"
+        yield {"outcome": "deferred", "feed_id": None, "count": len(items),
+               "_settle": {"store": store["name"]}}
+
+    settled = []
+
+    def fake_settle(store, settle):
+        settled.append(store["name"])
+        return {"outcome": "submitted", "feed_id": "F-LATE", "count": 1}
+
+    monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)
+    monkeypatch.setattr(ln.feeds, "settle_deferred", fake_settle)
+    written = []
+    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols",
+                        lambda u: (written.extend(u), len(u))[1])
+
+    out = ln.run({"execute": True})
+
+    # ① 第一轮:一个 UPC 都没回收(回收了就等于判了未达)
+    assert seen["released"] == []
+    # ② 第二轮真跑了,两家店都结算了
+    assert sorted(settled) == ["T1", "T2"]
+    assert "⏸ 延后结算:2 片" in out and "✅ 补上 2 条" in out
+    # 表只在结算之后写,且写的是成功态(K=Yes)
+    assert [u[1][4] for u in written] == ["Yes", "Yes"]
+    # ③ 降档发生了,而且摘要报得出来
+    assert "提交并发降档" in out
+
+
 def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     """跨店并发提交:并发确实发生、摘要仍按店名排序、提交期三个计数不丢。
 
@@ -692,7 +810,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     lock = threading.Lock()
     state = {"inflight": 0, "peak": 0}
 
-    def fake_submit(store, feed_type, items, workflow=None):
+    def fake_submit(store, feed_type, items, workflow=None, defer_settle=False):
         with lock:
             state["inflight"] += 1
             state["peak"] = max(state["peak"], state["inflight"])
@@ -705,7 +823,9 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
 
     monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)
 
-    out = ln.run({"execute": True})
+    # 起跑抖动关掉:本用例盯的是"池子是真线程池不是 for 循环包了层壳",
+    # 与抖动**正交**(抖动去的是同一毫秒起跑,不改并发)。抖动另有用例钉着
+    out = ln.run({"execute": True, "submit_jitter_ms": 0})
 
     assert state["peak"] > 1, f"没有真并发,峰值在飞 {state['peak']} 家"
     hit = [ln_ for ln_ in out.splitlines() if "提交 1 条" in ln_]
@@ -725,6 +845,9 @@ def _wire_execute_env(monkeypatch, rows, products):
     stores = sorted({r["store"] for r in rows})
     seen = {"claim_wants": [], "released": [], "orderable_upcs": [],
             "assembled_upcs": [], "submitted": []}
+    # 起跑抖动在单元测试里一律关掉(缺省 0~800ms × 每店会让多店用例真睡几秒)。
+    # 关的是**常量默认值**;要测抖动的用例自己传 submit_jitter_ms
+    monkeypatch.setattr(ln, "SUBMIT_JITTER_MS", 0)
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: (
@@ -782,7 +905,7 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
 
-    def fake_submit(store, feed_type, items, workflow=None):
+    def fake_submit(store, feed_type, items, workflow=None, defer_settle=False):
         seen["submitted"].append((store["name"], len(items)))
         yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
     monkeypatch.setattr(ln.feeds, "submit_feed", fake_submit)

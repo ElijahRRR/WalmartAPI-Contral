@@ -402,6 +402,29 @@ def test_maint_settle_has_a_grace_period():
     assert ds.MAINT_SETTLE_GRACE_HOURS >= 1
 
 
+def test_order_sync_names_the_culprit_and_gates_zero_stores(monkeypatch):
+    """order_sync 的失败行带六档归类词;零店完成必须失败(2026-08-26 补齐,
+    与 returns_sync 同款闸 —— 此前同一条 order_chain 里两步不对称)。"""
+    import pytest as _pytest
+
+    from workflows import order_sync as osw
+    monkeypatch.setattr(osw.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}, {"name": "T2"}])
+    monkeypatch.setattr(osw.order_center, "push_after",
+                        lambda spec, days=90: "投影桩")
+    from socksio.exceptions import ProtocolError
+    monkeypatch.setattr(
+        osw.orders_api, "fetch_orders_bulk",
+        lambda stores, **k: ([{"store": "T1", "lines": 3}], [],
+                             [("T2", ProtocolError("Malformed reply"))]))
+    out = osw.run({})
+    assert "T2(代理波动:Malformed reply)" in out       # 归类词指路
+    monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk",
+                        lambda stores, **k: ([], ["T1", "T2"], []))
+    with _pytest.raises(RuntimeError, match="零店完成"):
+        osw.run({})
+
+
 def test_withdraw_sql_carries_the_exclude_stores_clause():
     """缺席店的行不在 keep 里(本轮避让了),不排除会被撤成
     「商品自己恢复正常了」—— 两条 SQL 分支都必须带排除口。"""

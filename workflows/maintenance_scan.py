@@ -182,7 +182,7 @@ def run(params: dict) -> str:
              f"stockzero 店 {len(stockzero)} 家)"
              + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")
              + (f";⚠ 缺席避让 {len(absent)} 店:{','.join(sorted(absent))}"
-                f"(目录超 {store_absence.STALE_HOURS}h 未更新,"
+                f"(目录落后船队 >{store_absence.LAG_HOURS}h,"
                 f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
                 if absent else "")]
     for c in capped:

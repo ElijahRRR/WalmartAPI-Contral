@@ -19,36 +19,50 @@
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 logger = logging.getLogger("services.store_absence")
 
-# 下游避让的新鲜度窗口:链一天一轮(13:00),留 4 小时余量 ——
-# 与 maintenance_intents.SUPPRESS_HOURS 同一个推导,不是巧合是同源。
-STALE_HOURS = 20
+# 下游避让的判据是**船队相对滞后**,不是绝对小时窗:
+# 「这家店的水位比全船队最新水位落后超过 LAG_HOURS」才算缺席。
+# 为什么不能用绝对窗(如 now()-20h):链一天一轮,昨天 13:05 同步、
+# 今天 09:05 起**所有店**都会超过任何 <24h 的绝对窗 —— 早晨手动
+# `maintenance_scan --dry-run`(改码后必做的纪律)会把全部店误判缺席、
+# 产出恒零;而窗放到 >24h 又接不住"今天刚失败"的事故店(24.4h < 26h)。
+# 相对滞后两头都对:同步刚跑完,健康店水位=今天、缺席店=昨天,滞后 24h
+# 一眼判出;全船队都停在昨天(没人同步过)则彼此滞后 0,判据自然退场
+# ——那是"该不该扫"的问题(调度顺序纪律管),不是"谁缺席"的问题。
+LAG_HOURS = 4   # 同一轮链内各店完成时刻的最大合理散布(补试串行在尾部,留余量)
 
 _SQL_WATERMARK = """
 SELECT store, max(last_seen_at) FROM catalog.walmart_items GROUP BY store
 """
 
 
-def stale_stores(conn, since=None, hours: int = STALE_HOURS) -> list[str]:
-    """输入:连接(+本轮起点 since 或小时窗 hours)→ 输出:缺席店名(排序)。
+def stale_stores(conn, since=None, lag_hours: int = LAG_HOURS) -> list[str]:
+    """输入:连接(+绝对锚点 since 或相对滞后 lag_hours)→ 输出:缺席店名(排序)。
 
-    缺席 = **在营**(enabled_names,唯一在营判据)∧ 有目录行 ∧
-    整店最近观测早于起点。since 优先;不传则用 now()-hours(下游避让口径)。
-    只看在营店:停用店的水位永远陈旧,不过滤的话它会天天霸占缺席名单,
+    缺席 = **在营**(enabled_names,唯一在营判据)∧ 有目录行 ∧ 整店水位
+    早于判据线。判据线二选一:
+      · since(cli 链尾重赛用):绝对锚点 = 本轮链起点,水位没跨过它就是
+        本轮没同步成;
+      · 缺省(下游避让用):船队最新水位 − lag_hours(见模块头注,绝对窗
+        两头都错)。
+    只看在营店:停用店的水位永远陈旧,不过滤会天天霸占缺席名单,
     把真正的临时故障淹没掉。
     """
     from services import stores as stores_svc
 
-    cutoff = since or (datetime.now(timezone.utc) - timedelta(hours=hours))
     enabled = set(stores_svc.enabled_names())
     with conn.cursor() as cur:
         cur.execute(_SQL_WATERMARK)
         rows = cur.fetchall()
-    out = sorted(s for s, wm in rows
-                 if s in enabled and wm is not None and wm < cutoff)
+    marks = {s: wm for s, wm in rows if s in enabled and wm is not None}
+    if not marks:
+        return []
+    cutoff = since if since is not None \
+        else max(marks.values()) - timedelta(hours=lag_hours)
+    out = sorted(s for s, wm in marks.items() if wm < cutoff)
     if out:
         logger.warning("缺席店 %d 家(整店目录水位早于 %s):%s",
                        len(out), cutoff.isoformat(timespec="seconds"),

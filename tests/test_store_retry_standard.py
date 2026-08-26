@@ -145,23 +145,36 @@ class _Conn:
         return _Cur(self._rows)
 
 
-def test_stale_stores_is_enabled_and_watermark_based(monkeypatch):
+def test_stale_stores_is_fleet_relative_and_enabled_only(monkeypatch):
+    """判据 = 落后**船队最新水位**超过 LAG_HOURS,不是绝对小时窗 ——
+    绝对窗两头都错:早晨手动 dry-run 会把全船队误判缺席(>20h),
+    而放宽到 >24h 又接不住今天刚失败的事故店(24.4h)。"""
     from datetime import datetime, timedelta, timezone
     now = datetime.now(timezone.utc)
-    monkeypatch.setattr(store_absence, "STALE_HOURS", 20)
     import services.stores as stores_svc
     monkeypatch.setattr(stores_svc, "enabled_names",
                         lambda: ["新鲜店", "缺席店", "停用外的另一家"])
-    conn = _Conn([("新鲜店", now - timedelta(hours=1)),
-                  ("缺席店", now - timedelta(hours=25)),
-                  ("停用店", now - timedelta(days=9)),      # 不在营:不进名单
-                  ("停用外的另一家", None)])                 # 水位空:查不出,不误报
+    conn = _Conn([("新鲜店", now),                           # 船队最新水位
+                  ("缺席店", now - timedelta(hours=24)),     # 落后 24h > 4h
+                  ("停用店", now - timedelta(days=9)),       # 不在营:不进名单
+                  ("停用外的另一家", None)])                  # 水位空:查不出,不误报
     assert store_absence.stale_stores(conn) == ["缺席店"]
-    # since 显式锚点(cli 链尾重赛用):比 since 旧才算缺席
+    # since 显式锚点(cli 链尾重赛用):水位没跨过链起点 = 本轮没同步成
     assert store_absence.stale_stores(conn, since=now - timedelta(hours=2)) \
         == ["缺席店"]
     assert store_absence.stale_stores(
         conn, since=now - timedelta(days=30)) == []
+
+
+def test_stale_stores_morning_dry_run_is_not_a_false_alarm(monkeypatch):
+    """次日早晨手动 dry-run:全船队水位都停在昨天 13:0x,彼此滞后 ~0 ——
+    谁都不缺席(那是"该不该扫"的调度纪律问题,不是缺席)。"""
+    from datetime import datetime, timedelta, timezone
+    yesterday = datetime.now(timezone.utc) - timedelta(hours=21)
+    import services.stores as stores_svc
+    monkeypatch.setattr(stores_svc, "enabled_names", lambda: ["A", "B"])
+    conn = _Conn([("A", yesterday), ("B", yesterday + timedelta(minutes=40))])
+    assert store_absence.stale_stores(conn) == []
 
 
 # ── ④ 链尾重赛(cli._replay_absent)─────────────────────────────────────────────

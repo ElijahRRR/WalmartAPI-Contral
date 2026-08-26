@@ -121,7 +121,7 @@ def test_execute_isolates_store_failures(monkeypatch):
     out = ppc.run({"execute": True})
     assert submitted == [("T2", ["S2"])]                     # T2 不被重复提交
     assert "⚠ T1:提交异常" in out and "T2:删除提交 1" in out
-    assert "二轮重试 1 店:T1" in out and "⚠ T1:二轮仍失败" in out
+    assert "二轮重试 1 店(串行):T1" in out and "⚠ T1:二轮仍失败" in out
 
 
 def test_second_round_retry_after_network_failure(monkeypatch):
@@ -142,7 +142,7 @@ def test_second_round_retry_after_network_failure(monkeypatch):
     sub = [e for e in seen["events"] if e["event"] == "delete_submitted"]
     assert len(sub) == 1 and sub[0]["detail"]["feed_id"] == "F_RETRY"
     assert seen["marked"] == [((7,), "F_RETRY")]     # 只转一次态
-    assert "二轮重试 1 店:T1" in out and "二轮仍失败" not in out
+    assert "二轮重试 1 店(串行):T1" in out and "二轮仍失败" not in out
 
 
 def test_relist_uses_detail_not_a_second_db_read(monkeypatch):

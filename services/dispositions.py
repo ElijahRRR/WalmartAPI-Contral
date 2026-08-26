@@ -266,6 +266,7 @@ WHERE d.status = 'suggested'
   AND (jsonb_exists(d.sources, %(source)s::text)
        OR (d.sources = '{}'::jsonb AND d.source = %(source)s::text))
   AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
+  AND NOT (d.store = ANY(%(exclude)s::text[]))
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
                            %(actions)s::text[]) AS k(store, sku, action)
@@ -277,8 +278,15 @@ RETURNING d.id, d.status
 
 
 def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
-                   store: str | None = None) -> int:
+                   store: str | None = None,
+                   exclude_stores: list[str] | None = None) -> int:
     """输入:连接 + 来源 + 本轮仍建议的 (店铺,SKU,动作) + 扫描范围 → 输出:撤销行数。
+
+    exclude_stores(2026-08-26 店级重试标准③配套):**本轮没扫**的缺席店。
+    它们的行既不在 keep 里(扫描件避让了),也**不许撤** —— 缺席 ≠ 恢复正常,
+    撤了会把待执行建议记成「商品自己恢复正常了」(错误取证),下轮又重建。
+    与 store 参数是两个正交的范围轴:store 答"这轮只扫了谁",
+    exclude_stores 答"这轮谁没被扫到"。
 
     **建议是有时效的**:今天建议删 A,明天 A 自己恢复正常了、扫描件不再建议它
     —— 但昨天那条 suggested 行还挂着,执行件照样会删。这个函数把"本轮不再
@@ -315,11 +323,14 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
                 "           AND d.source = %(source)s::text)) "
                 "  AND (%(store)s::text IS NULL "
                 "       OR d.store = %(store)s::text) "
+                "  AND NOT (d.store = ANY(%(exclude)s::text[])) "
                 "RETURNING d.status",
-                {"source": source, "store": store})
+                {"source": source, "store": store,
+                 "exclude": list(exclude_stores or [])})
             return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {
             "source": source, "why": why, "store": store,
+            "exclude": list(exclude_stores or []),
             "stores": [k[0] for k in keep],
             "skus": [k[1] for k in keep],
             "actions": [k[2] for k in keep]})

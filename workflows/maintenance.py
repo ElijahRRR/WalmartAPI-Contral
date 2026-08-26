@@ -82,6 +82,7 @@ from services import dispositions, kpi, maint_sheet, \
     maintenance_intents as mi, stores as stores_svc
 
 DANGEROUS = True
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.maintenance")
 

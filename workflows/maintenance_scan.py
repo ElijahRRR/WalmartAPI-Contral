@@ -37,9 +37,10 @@ import logging
 
 from registry import db
 from services import alloc_survey, dispositions, \
-    maintenance_intents as mi, store_limits
+    maintenance_intents as mi, store_absence, store_limits
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.maintenance_scan")
 
@@ -152,8 +153,17 @@ def run(params: dict) -> str:
 
     stockzero = store_limits.stockzero_stores()
     with db.pg_conn() as conn:
+        # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):catalog_sync 补试后
+        # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
+        # (生产老账:38 条改库存 + 30 条改价 not found)。判据从库里水位派生
+        # (services/store_absence),不靠调度顺序、不靠链内传参。
+        absent = set(store_absence.stale_stores(conn))
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0))
+    n_avoided = sum(1 for i in intents if i["store"] in absent)
+    if absent:
+        intents = [i for i in intents if i["store"] not in absent]
+        capped = [c for c in capped if c["store"] not in absent]
     if only:
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
@@ -170,7 +180,11 @@ def run(params: dict) -> str:
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
              f"库存 {n_kind['inventory']}(清零 {n_zero};"
              f"stockzero 店 {len(stockzero)} 家)"
-             + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")]
+             + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")
+             + (f";⚠ 缺席避让 {len(absent)} 店:{','.join(sorted(absent))}"
+                f"(目录超 {store_absence.STALE_HOURS}h 未更新,"
+                f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
+                if absent else "")]
     for c in capped:
         # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
         lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
@@ -207,10 +221,13 @@ def run(params: dict) -> str:
         # 不再建议它 —— 但昨天那条 suggested 还挂着,执行件照样会把它清零。
         # ⚠ store=only 不能省:`-p store=X` 那一轮 keep 里只有该店的行,
         # 不限范围会把**其余全部店铺**的待执行建议一次清空(批次 E 的坑)
+        # ⚠ exclude_stores=缺席店 不能省:缺席店的行不在 keep 里(本轮避让了),
+        # 不排除的话它们挂着的 suggested 会被撤成「商品自己恢复正常了」——
+        # 错误取证,且下轮又原样重建(缺席 ≠ 恢复正常)
         n_wd = dispositions.withdraw_stale(
             conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-            store=only or None)
+            store=only or None, exclude_stores=sorted(absent))
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)

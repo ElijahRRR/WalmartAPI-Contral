@@ -18,12 +18,11 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-import httpx
 
 from api import _client
 from api import returns as returns_api
 from registry import db
-from services import order_center
+from services import order_center, store_retry
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -60,7 +59,8 @@ def run(params: dict) -> str:
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    results, dead, failed = [], [], []
+    results, dead, to_retry = [], [], []
+    by_name = {s["name"]: s for s in store_list}
     with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
         futs = {pool.submit(_sync_one_store, s, created_start): s["name"]
                 for s in store_list}
@@ -68,23 +68,40 @@ def run(params: dict) -> str:
             name = futs[f]
             try:
                 results.append(f.result())
-            except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
+            except _client.StoreDeadError as e:
+                logger.error("店铺 %s 凭证失效跳过: %s", name, e)
                 dead.append(name)
             except Exception as e:
-                logger.exception("店铺 %s 售后同步失败: %s", name, e)
-                failed.append(f"{name}({e})")
+                # 代理故障/泛化异常先收着:跑完别人再串行补试一遍
+                # (店级重试标准①,所有者定稿 2026-08-26)
+                logger.exception("店铺 %s 售后同步失败(待串行补试): %s", name, e)
+                to_retry.append((by_name[name], e))
+
+    absent: list[tuple[str, str]] = []
+    if to_retry:
+        recovered, still = store_retry.serial_second_pass(
+            to_retry, lambda s: _sync_one_store(s, created_start))
+        results.extend(r for _s, r in recovered)
+        for s, e in still:
+            cls = store_retry.classify(e)
+            if cls == "凭证":
+                dead.append(s["name"])
+            else:
+                absent.append((s["name"], cls))
 
     total = sum(r["lines"] for r in results)
     total_dropped = sum(r.get("dropped", 0) for r in results)
+    # 首行 = 结论 + 缺席点名(链通知只发成功步骤的第一行)
     lines = [f"returns_sync:{len(results)}/{len(store_list)} 店完成"
-             f"(窗口 {days} 天),售后行入库 {total}"]
+             f"(窗口 {days} 天),售后行入库 {total}"
+             + (f";⚠ 缺席 {len(absent)} 店:"
+                + ",".join(f"{n}({c})" for n, c in absent)
+                + "——已串行补试仍失败,该店本轮售后缺口由下轮窗口覆盖"
+                if absent else "")]
     if total_dropped:
         lines[0] += f",订单不在库丢弃 {total_dropped}"
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
-    if failed:
-        lines.append(f"失败:{'; '.join(failed)}")
     if not results:
         # ⚠ 零店完成不许报成功(2026-08-17 补,与 catalog_sync 同款闸)。
         # 「凭证失效跳过」按设计不进 failed —— 一家店坏了不该拖垮整轮;但

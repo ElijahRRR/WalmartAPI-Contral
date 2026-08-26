@@ -48,6 +48,7 @@ from services import kpi, maint_sheet
 from services import product_events, store_limits, stores as stores_svc
 
 DANGEROUS = True
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.problem_product_cleanup")
 
@@ -175,14 +176,17 @@ def run(params: dict) -> str:
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     records: list[tuple] = []       # 维护记录表的行(见文件末尾一次性写出)
 
-    def _round(names: list[str]) -> tuple[dict, list[str]]:
-        """输入:要跑的店铺名 → 输出:({店铺: 该店的行}, 需二轮重试的店)。
+    def _round(names: list[str], workers: int | None = None
+               ) -> tuple[dict, list[str]]:
+        """输入:要跑的店铺名(+并发上限)→ 输出:({店铺: 该店的行}, 需二轮重试的店)。
 
         跨店并发(所有者定稿 2026-08-17)。每店各写各的 lines_s,主线程按店名
         排序合并 —— 往共享 list 上追加不会坏数据(GIL),但摘要行序会按完成
         先后乱序交织,同一轮跑两次输出都不一样,没法对拍。
         安全性:每店有自己的固定出口代理,配额与令牌桶都按 (store, endpoint) 计,
         跨店并发不挤同一个桶;单店失败隔离本来就在 _submit_store 里。
+        workers=1 给二轮重试用(店级重试标准 2026-08-26:补试**串行**——
+        第一轮既然证明了这批店/代理在抖,补试没有理由再齐射一遍)。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         out: dict[str, list[str]] = {}
@@ -208,7 +212,8 @@ def run(params: dict) -> str:
             return store_name, lines_s, recs_s, need
 
         with ThreadPoolExecutor(
-                max_workers=min(stores_svc.STORE_WORKERS, len(names))) as pool:
+                max_workers=min(workers or stores_svc.STORE_WORKERS,
+                                len(names))) as pool:
             for f in as_completed([pool.submit(_one, n) for n in names]):
                 name, lines_s, recs_s, need = f.result()
                 out[name] = lines_s
@@ -230,8 +235,11 @@ def run(params: dict) -> str:
         # 建议行侧同样安全:已转 executing 的行不会被本轮再领(claim 只取
         # suggested),二轮重提的是同一批 rows 对象,不会重复转态。
         retry_stores.sort()
-        lines.append(f"二轮重试 {len(retry_stores)} 店:{','.join(retry_stores)}")
-        got2, still = _round(retry_stores)
+        lines.append(f"二轮重试 {len(retry_stores)} 店(串行):"
+                     f"{','.join(retry_stores)}")
+        # 二轮**串行**(店级重试标准 2026-08-26 统一,双轨禁止):
+        # 与 catalog_sync/store_retry 的补试同一条语义
+        got2, still = _round(retry_stores, workers=1)
         for name in retry_stores:
             lines.extend(got2.get(name, []))
             if name in still:

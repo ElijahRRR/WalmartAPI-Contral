@@ -33,9 +33,9 @@ cron(每天 15:00),新旧并跑 = 重复删除。
 import logging
 from datetime import datetime
 
-from api import feeds, feishu
+from api import _client, feeds, feishu
 from registry import db, resources
-from services import clear_sheet, feed_track, kpi, product_events, \
+from services import clear_sheet, feed_track, kpi, product_events, store_retry, \
     stores as stores_svc
 
 DANGEROUS = True
@@ -220,12 +220,38 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
     if todo:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
+        to_retry: list[tuple] = []
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
-            futs = [pool.submit(_one_store, n, s) for n, s in todo]
+            futs = {pool.submit(_one_store, n, s): (n, s) for n, s in todo}
             for f in as_completed(futs):
-                name, u, ls, sub, defr = f.result()
+                n, s = futs[f]
+                try:
+                    name, u, ls, sub, defr = f.result()
+                    per_store[name] = (u, ls, sub, defr)
+                except _client.StoreDeadError as e:
+                    logger.error("%s", e)
+                    per_store[n] = ([], [f"  {n}:凭证失效跳过,"
+                                         f"{len(s)} 行下轮重试"], 0, 0)
+                except Exception as e:
+                    # 店级隔离 + 补试(标准①,2026-08-26)。此前这里一家店抛
+                    # 异常整轮 run() 直接炸,而 writeback 排在 _submit_new 之后
+                    # —— **已经真发出去的 feed 在停用/删除表上一个字都不回写**,
+                    # 运营看到"什么都没干"而沃尔玛队列里 DELETE_ITEM 正在跑
+                    # (problem_product_cleanup 头注同款坑,那边修了这边没修)
+                    logger.exception("店铺 %s 提交异常(待串行补试): %s", n, e)
+                    to_retry.append(((n, s), e))
+        if to_retry:
+            recovered, still = store_retry.serial_second_pass(
+                [({"name": n, "_srows": s}, e) for (n, s), e in to_retry],
+                lambda st: _one_store(st["name"], st["_srows"]))
+            for _st, (name, u, ls, sub, defr) in recovered:
                 per_store[name] = (u, ls, sub, defr)
+            for st, e in still:
+                per_store[st["name"]] = (
+                    [], [f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
+                         f"{store_retry.classify(e)}:{e});已发出的部分由"
+                         f"feed_log 在途防重接住,该店下轮接续"], 0, 0)
         # 按店名排序合并:完成先后随机,updates 与摘要的顺序不能跟着随机
         for name, _ in todo:
             u, ls, sub, defr = per_store[name]

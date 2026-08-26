@@ -447,3 +447,51 @@ def test_zero_stores_completed_is_failure_not_success(monkeypatch):
         catalog_sync.run({"skip_feishu": "1"})
     assert "零店完成" in str(ei.value)
     assert "0/2 店完成" in str(ei.value)
+
+
+def test_failed_store_gets_one_serial_second_pass(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):失败店跑完别人后串行补试一遍,
+    救回的照常入账 —— 且补试跑的是**同一个** _sync_one_store(单一落地路径)。"""
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["好店", "抖店"])
+    calls = []
+
+    def one(store, *a, **kw):
+        calls.append(store["name"])
+        if store["name"] == "抖店" and calls.count("抖店") == 1:
+            raise OSError("proxy hiccup")           # 第一轮抖,补试即好
+        return _ok_result(store["name"])
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", one)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    summary = catalog_sync.run({"skip_feishu": "1"})
+    assert "2/2 店完成" in summary
+    assert "⚠ 缺席" not in summary       # 救回了就不点名(「缺席标记 N 行」是另一回事)
+    assert calls.count("抖店") == 2                  # 首轮 + 补试各一次,不多试
+
+
+def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
+    """标准②:补试仍失败 ⇒ **不炸整轮**(08-26 事故:两家店 SOCKS 报错放倒
+    八步链)。缺席店在摘要**首行**点名并带归类词 —— 链通知只发成功步骤的
+    第一行,放后面等于只写日志。"""
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["好店", "断店"])
+    from socksio.exceptions import ProtocolError
+
+    def one(store, *a, **kw):
+        if store["name"] == "断店":
+            raise ProtocolError("Malformed reply")   # 事故同款,补试也不好
+        return _ok_result(store["name"])
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", one)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    summary = catalog_sync.run({"skip_feishu": "1"})     # 不抛 = 不炸链
+    first = summary.splitlines()[0]
+    assert "1/2 店完成" in first
+    assert "⚠ 缺席 1 店:断店(代理)" in first          # 归类进首行,人知道去查代理

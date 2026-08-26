@@ -45,9 +45,10 @@ import re
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
-from services import product_events
+from services import product_events, store_absence
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 # 审核判拒的删除:**单店单轮上限**(限额表「下架限制」列,与维护链删除、
 # product_clear 同一个配额口径)。
@@ -511,6 +512,14 @@ def run(params: dict) -> str:
     only = params.get("store")
     (items, inflight, inflight_disposal, attempts, last_cat,
      inactive, stubborn) = _load_state()
+    # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
+    # 停在上一轮,拿它判「仍在架 → 删」会对可能已变的现实开破坏 feed。
+    # 判据从库里水位派生(services/store_absence),与调度顺序无关。
+    with db.pg_conn() as conn:
+        absent = set(store_absence.stale_stores(conn))
+    n_avoided = sum(1 for i in items if i["store"] in absent)
+    if absent:
+        items = [i for i in items if i["store"] not in absent]
     if only:
         items = [i for i in items if i["store"] == only]
 
@@ -521,6 +530,11 @@ def run(params: dict) -> str:
 
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        if absent:
+            n_audit_avoided = sum(1 for r in audit_rows
+                                  if r["store"] in absent)
+            n_avoided += n_audit_avoided
+            audit_rows = [r for r in audit_rows if r["store"] not in absent]
         if audit_rows:
             late = sum(1 for r in audit_rows
                        if r["detail"].get("rejected_after_listing"))
@@ -545,6 +559,11 @@ def run(params: dict) -> str:
         # 另:这里按建议行统计,不是按 plan() 的桶 —— n['delete'] 不含顽固双击
         # 那 22 个(那支 continue 前没有 n['delete'] += 1),照它报会少 22。
         head = _summarize(allrows, audit_rows, n, len(items))
+        if absent:
+            # ⚠ 缺席避让要进**首行**:链通知只发成功步骤的第一行
+            head[0] += (f";⚠ 缺席避让 {len(absent)} 店:"
+                        f"{','.join(sorted(absent))}"
+                        f"({n_avoided} 条候选不参与本轮)")
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
         for note in (_k_cluster_note(items), _policy_gap_note(conn, items)):
             if note:
@@ -563,10 +582,12 @@ def run(params: dict) -> str:
         for src, srows in (("scan", rows), ("audit", audit_rows)):
             # ⚠ store=only 不能省:`-p store=X` 那一轮只扫了一个店,keep 里
             # 只有该店的行,不限范围会把其余全部店铺的待执行建议一次清空
+            # exclude_stores=缺席店:它们的行不在 keep 里(本轮避让了),
+            # 不排除会被撤成"不再建议"——缺席 ≠ 恢复正常
             n_wd += dispositions.withdraw_stale(
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-                store=only or None)
+                store=only or None, exclude_stores=sorted(absent))
         # 限本链来源:维护链共用同一张建议表,不限的话摘要报的数会把它的
         # 待执行也算进来,与本链执行件领到的数对不上
         n_open = dispositions.count_open(

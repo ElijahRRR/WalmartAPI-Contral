@@ -384,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
 
     import os
     operator = os.environ.get("WALMART_OPERATOR", "manual")
+    from datetime import datetime, timezone
+    chain_started = datetime.now(timezone.utc)   # 链尾重赛的缺席判据锚点
 
     results: list[tuple[str, str, str]] = []        # (名, status, 文案)
     for i, name in enumerate(steps):
@@ -406,8 +408,67 @@ def main(argv: list[str] | None = None) -> int:
     # 串联:整链一条通知。三步链每小时发三条会把群刷废,而且看不出这几条
     # 属于同一次运行
     worst = next((s for _, s, _ in results if s != "success"), "success")
-    _notify(_chain_text(steps, results, worst))
+    text = _chain_text(steps, results, worst)
+    # 链尾缺席店重赛(店级重试标准④,所有者定稿 2026-08-26):主链全部成功
+    # 且链里含 catalog_sync(缺席判据锚定目录水位)时才有意义;主链没跑完
+    # 就重赛是拿半成品数据干活,不做。
+    if worst == "success" and "catalog_sync" in steps:
+        replay = _replay_absent(steps, modules, per_step, args.dry_run,
+                                operator, logs_dir, chain_started)
+        if replay:
+            text += "\n" + "\n".join(replay)
+    _notify(text)
     return _EXIT.get(worst, 1)
+
+
+def _replay_absent(steps, modules, per_step, dry_run, operator, logs_dir,
+                   since) -> list[str]:
+    """输入:主链步骤与参数 + 本轮起点 → 输出:重赛结果行(无缺席店返回 [])。
+
+    店级重试标准④(所有者定稿 2026-08-26):主链跑完后,按目录水位
+    (services/store_absence,与调度顺序无关)找出本轮缺席的店,对每家把
+    链内**声明 SUPPORTS_STORE 的步骤**带 store=X 逐店重跑一次;某步失败即
+    终止该店的重赛(上游语义与主链一致),**再失败即止,不循环** ——
+    README 的「失败不要自动重跑」禁的是盲目整链重跑,这里是设计内的、
+    逐店限定、单次的重赛。全局步骤(sources_backfill/product_refresh/
+    product_audit)主链已全量跑过、不因单店缺席而陈旧,跳过。
+    防重不在这一层:各工作流自己的三道闸(feed_log 在途 / claim 只取
+    suggested / dedupe 20h)照常起作用,重赛不绕任何入口。
+    每步照常拿 flock、写 ops.runs、进各自日志 —— 与主链同一段 _run_step。
+    """
+    from registry import db
+    from services import store_absence
+    try:
+        with db.pg_conn() as conn:
+            absent = store_absence.stale_stores(conn, since=since)
+    except Exception as e:
+        logger.warning("缺席店探测失败,跳过链尾重赛: %s", e)
+        return []
+    if not absent:
+        return []
+    replayable = [n for n in steps
+                  if getattr(modules[n], "SUPPORTS_STORE", False)]
+    skipped = [n for n in steps if n not in replayable]
+    lines = [f"—— 缺席店重赛:{len(absent)} 店,逐店一次、再失败即止"
+             f"(全局步骤跳过:{','.join(skipped) or '无'})——"]
+    for store in absent:
+        done: list[str] = []
+        stuck = None
+        for name in replayable:
+            params = dict(per_step[name])    # 主链已就地改过 execute 等键,复制再用
+            params["store"] = store
+            status, _text = _run_step(name, modules[name], params, dry_run,
+                                      operator, logs_dir)
+            if status != "success":
+                stuck = (name, status)
+                break
+            done.append(name)
+        if stuck:
+            lines.append(f"❌ {store}:仍缺席 —— 重赛卡在 {stuck[0]}({stuck[1]});"
+                         f"今天到此为止,明天整链自然再试")
+        else:
+            lines.append(f"✅ {store}:救回({'→'.join(done)} 全部成功)")
+    return lines
 
 
 def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:

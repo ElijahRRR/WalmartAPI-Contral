@@ -53,14 +53,16 @@ PRICE_MIN_RATIO = 0.01          # 1%
 # **按店**计,全局闸只会卡住合法的大改,废除。
 # 数字 = 该类 feed 的按店速率桶 × 单 feed 切片条数(api/_client._RATE_BUCKETS
 # × api/feeds._SLICE_LIMITS,有测试钉住三处一致;改桶/改切片先看那条测试):
-#   price     feeds.post.price     6/天(三件套共享桶,保守) × 1000 条 = 6000
-#             (本仓价格桶唯一消费者就是维护链,可以吃满)
+#   price     feeds.post.price     8/小时(官方 10/hour 三件套共享留余量,
+#             2026-08-26 复核后从 6/天保守值上调;6/day 只属 feedType=promo,
+#             本仓不用)× 1000 条 = 8000(一小时桶;价格桶唯一消费者就是
+#             维护链,可以吃满 —— 单店一轮 8 个切片,超过的其余下轮)
 #   inventory feeds.post.inventory 8/小时 × 4000 条 = 32000(一小时桶)
 #   title     feeds.post.MP_MAINTENANCE 8/小时 × 1000 条 = 8000(一小时桶)
 # delete **不在表里**:破坏类的按店数量闸唯一在执行件(problem_product_cleanup
 # 领取时 cap_destructive 按限额表「下架限制」截),扫描件如实报待办
 # (2026-08-24 归一口径,扫描期再截一道就是"每店最多 N 实际 2N"的老坑)。
-MAX_INTENTS_PER_STORE = {"price": 6000, "inventory": 32000, "title": 8000}
+MAX_INTENTS_PER_STORE = {"price": 8000, "inventory": 32000, "title": 8000}
 
 # 超上限时**截谁**(按店组内排序,升序取前 cap 条;不在表里的类保持产出序):
 #   price     偏差比例大的先走 —— 错得越离谱的价越该当天纠;

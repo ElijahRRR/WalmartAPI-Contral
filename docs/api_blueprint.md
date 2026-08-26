@@ -26,7 +26,7 @@
 | 10 | POST /v3/feeds?feedType=MP_MAINTENANCE | feeds | 改标题/属性/endDate | safe_post_ex | 4 个模块 |
 | 11 | POST /v3/feeds?feedType=DELETE_ITEM | feeds | **永久删除**(最高危) | **裸 httpx×3 处** | 批量下架/问题清理 |
 | 12 | POST /v3/feeds?feedType=RETIRE_ITEM | feeds | 可恢复下架 | 混合 | 问题清理/auto_listing |
-| 13 | POST /v3/feeds?feedType=PRICE_AND_PROMOTION | feeds | 批量改价(6/天!) | safe_post_ex | auto_listing |
+| 13 | POST /v3/feeds?feedType=PRICE_AND_PROMOTION | feeds | 批量改价(三件套共享 10/hour) | safe_post_ex | auto_listing |
 | 14 | POST /v3/feeds?feedType=price | feeds | 批量改价(旧版) | safe_post_ex | 商品维护 |
 | 15 | POST /v3/feeds?feedType=inventory | feeds | 批量改库存 | safe_post_ex | 2 个模块 |
 | 16 | GET /v3/feeds | feeds | feed 列表(提交防重反查/轮询) | safe_get_ex | 2 个模块 |
@@ -115,11 +115,11 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | DELETE_ITEM | 10/hour("代码零依据"的 10/hour 现已获官方背书) | **0.4MB(400KB)**;条数未单列(按 ≤10000 推定) | 旧 100KB 字节上限过于保守但方向对 | 6/hour;单 feed ≤350KB 且 ≤2500 条 |
 | RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | 10/day 保守 + **迁移前实测是否仍被接受** |
 | MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour |
-| PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | ≤10000 条;建议 1000 条/10MB | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | 6/day 保守沿用(官方页自相矛盾期间不放宽) |
-| price(Legacy) | 10/hour(三件套共享) | 10MB | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
-| inventory | 10/hour | 10MB;≤10000 item/ship node | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
+| PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | 硬限 10000 条;建议 1000 条/<10MB(413 口径官方标 Not applicable) | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | **8/hour**(2026-08-26 三源复核:三处官方一致 10/hour;6/day 确证只挂 feedType=promo 行且本仓无该路径;promo 行内矛盾官方未修,与三件套无关) |
+| price(Legacy) | 10/hour(三件套共享) | 10MB;硬限 10000 条(1000 条/<10MB 是官方 "we recommend" 建议值,2026-08-26 核) | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
+| inventory | 10/hour | 10MB(旧记 ≤10000 item/ship node 无美区官方出处——属 DSV 文档,2026-08-26 降级为自设批次上限) | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
 | MP_INVENTORY(BETA) | 50/hour | 1MB;多 ship node,JSON only | 旧未用;官方未废弃 inventory | 暂不用,盯 BETA 走向 |
-| PUT /v3/price | 100/hour(⚠官方 Deprecation Guide 列"Price management Sunset 2026",需另行核验) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
+| PUT /v3/price | 100/hour(2026-08-26 复核:被弃用的是 Price management **文档族**,端点级零弃用标记、仍列 100/hour;Sunset 栏只有"2026"无月日,按无预告断供防御——断供即改走价格 feed,函数面已双轨) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
 | PUT /v3/inventory | 200/min | — | 一致 | 160/min |
 
 **feed 轮询官方建议节奏**:INPROGRESS 时 15 分钟 → 1 小时 → 2 小时 → 此后每 4 小时;
@@ -315,9 +315,11 @@ cursor+offset 翻页模型、DELETE_ITEM 三处同构与容量 2628 条实测、
 
 1. RETIRE_ITEM feed 是否仍被接受(guide 已消失、限流表无行、仅存枚举)——迁移 daily_cleanup 前实测。
 2. DELETE_ITEM 删除后同 SKU 能否重建/等待期(仅 1P 文档有"48h 后可重建",非 Marketplace 结论)。
-3. PRICE_AND_PROMOTION 官方页内自相矛盾(主表 10/hour vs promo* 行 6/day)——保守按 6/day 配置。
+3. **已结案**(2026-08-26 三源复核,四代理交叉裁决):价格三件套共享桶三处官方一致 = 10/hour(rate-limiting 页脚注 + update-bulk-prices 页 + update-promotional-pricing 页逐字相同);6/day 只挂 feedType=promo 行(本仓无该路径)。promo 行内矛盾(单元格 6/day vs 脚注共享 10/hour)官方仍未修,但与三件套无关。生产从 6/day 上调为 **8/hour** 留余量;⚠ 将来若引入 feedType=promo 路径,须单独按 6/day 限流,不得并入共享桶计数。
 4. GET /v3/feeds/{id} 明细 limit 50 vs 1000 官方两页矛盾——保守按 50。
-5. **官方 Deprecation Guide 列 "Price management – Sunset 2026"**,未细化端点——
-   迁移 maintenance/价格类工作流前必须单独核验,可能影响 PUT /v3/price 与 PRICE_AND_PROMOTION。
+5. **已核**(2026-08-26):被弃用的是 "Price management" **API 族/文档集**(Status 2025-10-24,
+   Sunset 栏只有光秃秃的"2026",官方至今未给月日;旧 overview 页的 EOL 08-31-2025 已过期一年
+   而端点未下线,属陈旧数据)。PUT /v3/price 端点页零弃用标记、仍列 100/hour,当下可用;
+   但族级迁移可能无预告带走它——防御:断供即改走价格 feed(单品 PUT 与批量 feed 已是双轨显式函数)。
 6. MP_MAINTENANCE 能否改价格/库存无官方明文——以 Get Spec 拉回的 schema 是否含相应字段为准。
 7. 提交过时 spec version 的后果官方未写——registry 登记 + 每次上架季度性核对版本表。

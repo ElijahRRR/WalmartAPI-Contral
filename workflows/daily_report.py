@@ -361,8 +361,12 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 rows_ok.append(row)
                 ok.append(name)
             except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                failed.append(f"{name}(凭证)")
+                # 分诊词跟 store_retry.classify 同口径(2026-08-26):凭证死
+                # 与代理故障的处置完全不同(修凭证表 vs 找代理商),
+                # get_token 收口后 SOCKS 报错到这里是 StoreProxyError(代理)
+                cls = store_retry.classify(e)
+                logger.error("店铺 %s %s失效跳过: %s", name, cls, e)
+                failed.append(f"{name}({cls})")
             except Exception as e:
                 logger.exception("店铺 %s KPI 采集失败: %s", name, e)
                 failed.append(name)

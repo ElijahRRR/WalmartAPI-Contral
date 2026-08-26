@@ -171,10 +171,12 @@ def run(params: dict) -> str:
     # 标准①:失败店串行补试一遍。单一落地路径 —— 补试跑的就是第一轮
     # 同一个 _sync_one_store,不另写简化版
     absent: list[tuple[str, str]] = []          # (店名, 归类词:代理/其他/凭证)
+    gate_note = ""
     if to_retry:
-        recovered, still = store_retry.serial_second_pass(
+        recovered, still, gate_note = store_retry.serial_second_pass(
             to_retry, lambda s: _sync_one_store(s, run_at, skip_inventory,
-                                                mode, backfill_ids))
+                                                mode, backfill_ids),
+            total_stores=len(store_list))
         results.extend(r for _s, r in recovered)
         for s, e in still:
             cls = store_retry.classify(e)
@@ -194,8 +196,13 @@ def run(params: dict) -> str:
              f"回填 item_id {total_item_ids} 个"
              + (f";⚠ 缺席 {len(absent)} 店:"
                 + ",".join(f"{n}({c})" for n, c in absent)
-                + "——已串行补试仍失败,本轮不炸链(下游按水位避让,链尾重赛)"
+                + ("——超补试规模闸未补试(疑似系统性故障)"
+                   if gate_note else
+                   "——已串行补试仍失败")
+                + ",本轮不炸链(下游按水位避让,链尾重赛)"
                 if absent else "")]
+    if gate_note:
+        lines.append(gate_note)
     if truncated:
         lines.append(f"offset 截断已补漏:{','.join(truncated)}")
     inv_failed = [r["store"] for r in results if r.get("inv_failed")]
@@ -228,6 +235,13 @@ def run(params: dict) -> str:
     if not results:
         lines.append("⚠ 零店完成 —— 本轮没有同步任何数据")
         raise RuntimeError("\n".join(lines))   # 飞书通知带的是这份全文(cli._err_brief)
+    if absent and str(params.get("strict", "")) in ("1", "true", "yes"):
+        # strict=1(daily_report 链专用,调度里配 catalog_sync:strict=1):
+        # 那条链的语义是「同步失败就不出日报 —— 拿旧数出报不如不出」
+        # (registry/schedule.py 定稿),缺席不炸链的新标准会把这道闸静默
+        # 降级成"照出,缺席店三列是昨天的数"。给它保留严格口径;
+        # product_chain 不配 strict(维护链按店避让,不需要整链陪跪)。
+        raise RuntimeError("\n".join(lines + ["⚠ strict 模式:缺席即失败(此链宁可不出产物)"]))
     return "\n".join(lines)
 
 

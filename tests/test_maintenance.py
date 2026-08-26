@@ -810,11 +810,13 @@ def _disp(it, i):
     return {"id": 100 + i, **mi.to_disposition(it)}
 
 
-def _wire(monkeypatch, intents, stores=(STORE,)):
+def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
              "marked": [], "marked_by": set(), "settled": 0,
              "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
+    monkeypatch.setattr(mw.store_absence, "stale_stores",
+                        lambda conn, **k: list(absent))
     monkeypatch.setattr(mw.dispositions, "claim",
                         lambda conn, actions=None: [_disp(it, i)
                                                     for i, it in enumerate(intents)])

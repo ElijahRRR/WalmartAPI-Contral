@@ -78,9 +78,11 @@ def run(params: dict) -> str:
                 to_retry.append((by_name[name], e))
 
     absent: list[tuple[str, str]] = []
+    gate_note = ""
     if to_retry:
-        recovered, still = store_retry.serial_second_pass(
-            to_retry, lambda s: _sync_one_store(s, created_start))
+        recovered, still, gate_note = store_retry.serial_second_pass(
+            to_retry, lambda s: _sync_one_store(s, created_start),
+            total_stores=len(store_list))
         results.extend(r for _s, r in recovered)
         for s, e in still:
             cls = store_retry.classify(e)
@@ -100,6 +102,8 @@ def run(params: dict) -> str:
                 if absent else "")]
     if total_dropped:
         lines[0] += f",订单不在库丢弃 {total_dropped}"
+    if gate_note:
+        lines.append(gate_note)
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
     if not results:

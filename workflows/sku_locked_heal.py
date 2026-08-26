@@ -139,15 +139,18 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
             to_retry.append(({"name": store_name, "_store": store,
                               "_srows": srows}, e))
     if to_retry:
-        recovered, still = store_retry.serial_second_pass(
+        recovered, still, gate_note = store_retry.serial_second_pass(
             to_retry,
-            lambda st: _retire_store(st["_store"], st["name"], st["_srows"]))
+            lambda st: _retire_store(st["_store"], st["name"], st["_srows"]),
+            total_stores=len(by_store))
+        if gate_note:
+            lines.append(gate_note)
         for _st, out in recovered:
             lines.extend(out)
         for st, e in still:
             lines.append(f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
-                         f"{store_retry.classify(e)}:{e});已发出的部分由"
-                         f"feed_log 在途防重接住,该店下轮接续")
+                         f"{store_retry.classify(e)}:{e});已发出的分片已"
+                         f"逐片落冷却台账,下轮自动排除,未发出的下轮接续")
     return lines
 
 

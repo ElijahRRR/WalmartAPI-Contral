@@ -392,8 +392,14 @@ def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:
     """输入:URL(如报表预签名下载地址)+ 代理 → 输出:响应字节。
 
     走店铺固定出口代理(与所有沃尔玛流量同链路,铁律),非 2xx 抛异常。
+    传输/SOCKS 层失败同样抛(调用方自己兜),但先剔掉池里的坏连接 ——
+    收口清单别漏这一处(2026-08-26 对抗校验)。
     """
-    resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    try:
+        resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    except _NET_ERRORS:
+        _invalidate_client(proxy)
+        raise
     resp.raise_for_status()
     return resp.content
 
@@ -600,6 +606,13 @@ def _request_ex(method, url, token, client_id, proxy, *,
                     refreshed_401 = True
                     _log(f"⚠ {method} 401 → token 已刷新,重试 {url}", quiet)
                     continue
+                except _NET_ERRORS:
+                    # 刷新那一跳撞上代理/传输故障:**原样上抛**,不落回 401 流程
+                    # —— 落回去会被各 api 模块的 401→StoreDeadError 统一动作
+                    # 判成"凭证死"(不补试),而真正的病在代理(可补试)。
+                    # 一次 SOCKS 抖动被记成凭证失效,人被指去查凭证表
+                    # (2026-08-26 对抗校验:分诊口径的静默反例)
+                    raise
                 except Exception as e:
                     _log(f"✗ {method} 401 后换 token 失败 {url}: {e}", quiet)
                     # 落回原 401 返回流程

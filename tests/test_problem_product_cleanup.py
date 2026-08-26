@@ -39,6 +39,11 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     monkeypatch.setattr(ppc.product_events, "record_many",
                         lambda conn, rs: (seen["events"].extend(rs), len(rs))[1])
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {})
+    # 缺席避让与按日配额记账都走库,测试环境无库:置空(缺席=无、当日已放行=0)
+    monkeypatch.setattr(ppc.store_absence, "stale_stores",
+                        lambda conn, since=None, lag_hours=None: [])
+    monkeypatch.setattr(ppc.dispositions, "destructive_executed_today",
+                        lambda conn, hours=20: {})
     monkeypatch.setattr(ppc.maint_sheet, "append_records",
                         lambda rows: (seen["sheet"].extend(rows), len(rows))[1])
     monkeypatch.setattr(ppc.stores_svc, "load_stores",
@@ -347,3 +352,11 @@ def test_only_maintenance_prunes_the_shared_sheet():
     assert "prune_after=False" in inspect.getsource(ppc.run)
     from workflows import maintenance as mw
     assert "prune_after" not in inspect.getsource(mw._write_sheet)
+
+
+def test_second_round_is_serial():
+    """二轮重试必须串行(店级重试标准 2026-08-26):第一轮已经证明这批店/
+    代理在抖,补试没有理由再齐射一遍。对抗校验实测过改回并发全量照绿,
+    这里按调用点钉住。"""
+    import inspect
+    assert "_round(retry_stores, workers=1)" in inspect.getsource(ppc.run)

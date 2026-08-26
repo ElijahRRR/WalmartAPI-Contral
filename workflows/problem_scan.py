@@ -512,16 +512,29 @@ def run(params: dict) -> str:
     only = params.get("store")
     (items, inflight, inflight_disposal, attempts, last_cat,
      inactive, stubborn) = _load_state()
+    if only:
+        items = [i for i in items if i["store"] == only]
     # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
     # 停在上一轮,拿它判「仍在架 → 删」会对可能已变的现实开破坏 feed。
     # 判据从库里水位派生(services/store_absence),与调度顺序无关。
+    # 探测失败按"不避让"处理并在首行喊出来(preview 是纯 PG 查询,
+    # 不该被一次飞书抖动整个拦下)。
     with db.pg_conn() as conn:
-        absent = set(store_absence.stale_stores(conn))
+        try:
+            absent = set(store_absence.stale_stores(conn))
+            absence_gap = ""
+        except Exception as e:
+            absent = set()
+            absence_gap = f";⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
+    if only:
+        absent &= {only}    # 只报本范围内的缺席
+    # ⚠ 避让只挡**处置建议**(plan/audit_rows —— 会变成删除/反补 feed 的那些);
+    # 观察面不连坐:黑名单收集、K 类聚集信号、归类事件都是只增不减的记录,
+    # 静音一天会让 15:00 blacklist 链少一天的 ASIN/品牌(对抗校验 2026-08-26)
+    items_all = items
     n_avoided = sum(1 for i in items if i["store"] in absent)
     if absent:
         items = [i for i in items if i["store"] not in absent]
-    if only:
-        items = [i for i in items if i["store"] == only]
 
     plans, n = plan(items, inflight, attempts, inactive, stubborn,
                     inflight_disposal)
@@ -563,9 +576,11 @@ def run(params: dict) -> str:
             # ⚠ 缺席避让要进**首行**:链通知只发成功步骤的第一行
             head[0] += (f";⚠ 缺席避让 {len(absent)} 店:"
                         f"{','.join(sorted(absent))}"
-                        f"({n_avoided} 条候选不参与本轮)")
+                        f"({n_avoided} 条候选不参与本轮处置)")
+        head[0] += absence_gap
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
-        for note in (_k_cluster_note(items), _policy_gap_note(conn, items)):
+        # 观察面用 items_all(缺席不连坐,见上)
+        for note in (_k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
             if note:
                 lines.append(note)
         if preview:
@@ -573,8 +588,8 @@ def run(params: dict) -> str:
                          f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"
                          f"命中时按唯一索引合并)")
             return "\n".join(lines)
-        n_cat = _record_categories(conn, items, last_cat)
-        bl_note = _collect_blacklists(conn, items)
+        n_cat = _record_categories(conn, items_all, last_cat)
+        bl_note = _collect_blacklists(conn, items_all)
         n_sug = dispositions.suggest_many(conn, allrows)
         # 撤销本轮不再建议的陈旧行(按来源各撤各的):否则昨天建议删、今天
         # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删

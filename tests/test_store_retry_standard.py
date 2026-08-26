@@ -89,13 +89,30 @@ def test_serial_second_pass_retries_once_and_splits(monkeypatch):
             return {"ok": store["name"]}
         raise TimeoutError("still down")
 
-    recovered, still = store_retry.serial_second_pass(
+    recovered, still, gate = store_retry.serial_second_pass(
         [({"name": "救得回"}, OSError("first")),
          ({"name": "救不回"}, OSError("first"))], attempt)
     assert calls == ["救得回", "救不回"]            # 串行、各一次
     assert [(s["name"], r) for s, r in recovered] == [("救得回", {"ok": "救得回"})]
     assert [(s["name"], type(e).__name__) for s, e in still] == \
         [("救不回", "TimeoutError")]
+    assert gate == ""
+
+
+def test_serial_second_pass_scale_gate_stops_systemic_failures(monkeypatch):
+    """失败店数超过 max(3, 总数//5) = 系统性故障:一家都不补,点名止损 ——
+    串行补试只会把故障时长按店数放大,每小时的链会拖过整点丢下一轮。"""
+    _no_sleep(monkeypatch)
+    attempted = []
+    fails = [({"name": f"店{i}"}, OSError("x")) for i in range(4)]
+    recovered, still, gate = store_retry.serial_second_pass(
+        fails, lambda s: attempted.append(s), total_stores=10)
+    assert attempted == [] and recovered == []      # 4 > max(3, 10//5=2) → 全停
+    assert len(still) == 4 and "系统性故障" in gate
+    # 不给总数 → 闸不生效(闸是止损优化,不是正确性前提)
+    _r, _s, gate2 = store_retry.serial_second_pass(
+        [({"name": "A"}, OSError("x"))], lambda s: {"ok": 1})
+    assert gate2 == ""
 
 
 def test_serial_second_pass_never_retries_dead_credentials(monkeypatch):
@@ -103,7 +120,7 @@ def test_serial_second_pass_never_retries_dead_credentials(monkeypatch):
     _no_sleep(monkeypatch)
     attempted = []
     dead = _client.StoreDeadError("T1", 400)
-    recovered, still = store_retry.serial_second_pass(
+    recovered, still, _gate = store_retry.serial_second_pass(
         [({"name": "T1"}, dead)], lambda s: attempted.append(s))
     assert attempted == [] and recovered == []
     assert still == [({"name": "T1"}, dead)]
@@ -179,7 +196,8 @@ def test_stale_stores_morning_dry_run_is_not_a_false_alarm(monkeypatch):
 
 # ── ④ 链尾重赛(cli._replay_absent)─────────────────────────────────────────────
 
-def _replay_wire(monkeypatch, absent, statuses):
+def _replay_wire(monkeypatch, absent, statuses, chronic=(), still=(),
+                 per_step=None):
     """statuses: {(store, step): status};缺省 success。返回 (lines, 调用序)。"""
     import contextlib
     import types
@@ -190,15 +208,15 @@ def _replay_wire(monkeypatch, absent, statuses):
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([None])))
     from services import store_absence as sa
-    seq = iter([list(absent), []])       # 重赛前=缺席名单;重赛后=全部救回
-    monkeypatch.setattr(sa, "stale_stores",
-                        lambda conn, since=None, hours=None: next(seq))
+    monkeypatch.setattr(sa, "split_stale",
+                        lambda conn, since: (list(absent), list(chronic)))
+    monkeypatch.setattr(sa, "stale_stores",           # 重赛后的水位复核
+                        lambda conn, since=None, lag_hours=None: list(still))
 
     def fake_run_step(name, module, params, dry_run, operator, logs_dir):
         ran.append((params.get("store"), name))
         st = statuses.get((params.get("store"), name), "success")
-        return st, f"{name} {st}"
-
+        return st, f"{name} {st}\n第二行明细"
     monkeypatch.setattr(cli, "_run_step", fake_run_step)
     mods = {
         "catalog_sync": types.SimpleNamespace(SUPPORTS_STORE=True),
@@ -208,7 +226,8 @@ def _replay_wire(monkeypatch, absent, statuses):
     }
     steps = list(mods)
     lines = cli._replay_absent(steps, mods,
-                               {n: {"execute": True} for n in steps},
+                               per_step if per_step is not None
+                               else {n: {"execute": True} for n in steps},
                                False, "test", None, since=None)
     return lines, ran
 
@@ -220,10 +239,13 @@ def test_replay_runs_store_scoped_steps_once_per_absent_store(monkeypatch):
                    ("店A", "maintenance")]
     assert any("sources_backfill" in ln and "跳过" in ln for ln in lines)
     assert any(ln.startswith("✅ 店A:救回") for ln in lines)
+    # 每步摘要首行保留:重赛跑的是 DANGEROUS 步骤,发了多少不能只剩一个 ✅
+    assert any("maintenance success" in ln for ln in lines)
 
 
 def test_replay_stops_that_store_on_first_failure_and_says_so(monkeypatch):
-    """某步失败即终止该店重赛(上游语义与主链一致),**再失败即止**,不循环。"""
+    """某步失败即终止该店重赛(上游语义与主链一致),**再失败即止**,不循环;
+    失败步骤摘要铺开(人要能直接看出该修凭证还是找代理商)。"""
     lines, ran = _replay_wire(monkeypatch, ["店A", "店B"],
                               {("店A", "catalog_sync"): "failed"})
     assert ("店A", "maintenance_scan") not in ran      # 店A 卡住即止
@@ -231,8 +253,8 @@ def test_replay_stops_that_store_on_first_failure_and_says_so(monkeypatch):
     assert [c for c in ran if c[0] == "店B"] == [      # 店B 不受店A牵连
         ("店B", "catalog_sync"), ("店B", "maintenance_scan"),
         ("店B", "maintenance")]
-    assert any(ln.startswith("❌ 店A:仍缺席") and "catalog_sync" in ln
-               for ln in lines)
+    stuck = next(ln for ln in lines if ln.startswith("❌ 店A:仍缺席"))
+    assert "catalog_sync" in stuck and "第二行明细" in stuck   # 失败全文铺开
 
 
 def test_replay_is_a_noop_without_absent_stores(monkeypatch):
@@ -240,7 +262,119 @@ def test_replay_is_a_noop_without_absent_stores(monkeypatch):
     assert lines == [] and ran == []
 
 
+def test_replay_refuses_store_scoped_chains(monkeypatch):
+    """⚠ blocker 回归:主链带了 store= 范围参数时,水位判据看的是全船 ——
+    重赛会把"没被本次范围覆盖"误判成"缺席",对其余全部店真跑破坏步骤。"""
+    per_step = {"catalog_sync": {"execute": True, "store": "A085"},
+                "sources_backfill": {}, "maintenance_scan": {},
+                "maintenance": {}}
+    lines, ran = _replay_wire(monkeypatch, ["店B", "店C"], {},
+                              per_step=per_step)
+    assert ran == []                                   # 一步都不许跑
+    assert any("store= 范围参数" in ln for ln in lines)
+
+
+def test_replay_skips_chronic_and_gates_on_scale(monkeypatch):
+    """长期缺席(>72h)只点名不重赛;今日缺席超规模闸判系统性故障止损。"""
+    lines, ran = _replay_wire(monkeypatch, [], {}, chronic=["死店"])
+    assert ran == [] and any("长期缺席" in ln and "死店" in ln for ln in lines)
+    many = [f"店{i}" for i in range(6)]                # 6 > REPLAY_MAX_STORES=5
+    lines2, ran2 = _replay_wire(monkeypatch, many, {})
+    assert ran2 == [] and any("系统性故障" in ln for ln in lines2)
+
+
+def test_replay_demotes_green_steps_when_watermark_did_not_advance(monkeypatch):
+    """步骤全绿 ≠ 救回:重赛后水位仍没跨过链起点的(在线 0 商品店等),
+    照实说仍缺席,不发假 ✅。"""
+    lines, _ran = _replay_wire(monkeypatch, ["店A"], {}, still=["店A"])
+    assert any("水位未推进" in ln for ln in lines)
+    assert not any(ln.startswith("✅ 店A") for ln in lines)
+
+
+def test_main_wires_replay_after_a_successful_catalog_chain(monkeypatch,
+                                                            tmp_path):
+    """④ 在 main() 里的接线回归:对抗校验变异实测曾证明整段删掉全量测试照样
+    绿。钉三件事:主链全成 + 含 catalog_sync 才重赛;锚点 = 链起点(不是
+    None,传错会退化成船队相对口径);结果拼进那条唯一的链通知。"""
+    import cli
+    monkeypatch.setenv("WALMART_DATA_ROOT", str(tmp_path))
+    calls = {"replay": None, "notify": []}
+    monkeypatch.setattr(
+        cli, "_run_step",
+        lambda name, module, params, dry_run, operator, logs_dir:
+        ("success", f"{name} 成功\n首行{name}"))
+
+    def fake_replay(steps, modules, per_step, dry_run, operator, logs_dir,
+                    since):
+        calls["replay"] = (tuple(steps), since)
+        return ["—— 重赛桩 ——"]
+    monkeypatch.setattr(cli, "_replay_absent", fake_replay)
+    monkeypatch.setattr(cli, "_notify",
+                        lambda text: calls["notify"].append(text))
+    assert cli.main(["catalog_sync", "maintenance_scan"]) == 0
+    steps, since = calls["replay"]
+    assert steps == ("catalog_sync", "maintenance_scan")
+    assert since is not None
+    assert "—— 重赛桩 ——" in calls["notify"][0]
+
+
+def test_main_skips_replay_when_chain_failed_or_lacks_catalog_sync(
+        monkeypatch, tmp_path):
+    """主链没跑完 = 半成品数据,不重赛;链里没有 catalog_sync = 水位无锚,
+    不重赛(order_chain 等链与本机制无关)。"""
+    import cli
+    monkeypatch.setenv("WALMART_DATA_ROOT", str(tmp_path))
+    called = []
+    monkeypatch.setattr(cli, "_replay_absent",
+                        lambda *a, **k: called.append(1) or [])
+    monkeypatch.setattr(cli, "_notify", lambda text: None)
+    monkeypatch.setattr(cli, "_run_step",
+                        lambda name, *a, **k: ("failed", f"{name} 失败"))
+    assert cli.main(["catalog_sync", "maintenance_scan"]) == 1
+    monkeypatch.setattr(cli, "_run_step",
+                        lambda name, *a, **k: ("success", f"{name} 成功"))
+    cli.main(["maintenance_scan", "maintenance"])
+    assert called == []
+
+
 # ── ② 落库面:withdraw_stale 的缺席排除口(缺席 ≠ 恢复正常)─────────────────────
+
+def test_executors_hold_absent_store_rows(monkeypatch):
+    """③ 补全回归(对抗校验):扫描件避让 + withdraw 护行之后,执行件不避让
+    的话,缺席店的存量 suggested 会在同一轮链里照样被领走提交 —— 隔夜现值
+    不配拿来改线上/开破坏 feed。缺席店的行留在 suggested 原地。"""
+    import tests.test_maintenance as tm
+    intents = [
+        {"store": "缺席店", "sku": "A", "kind": "inventory", "old": 5, "new": 0,
+         "code": "out_of_stock", "reason": "x"},
+        {"store": tm.STORE["name"], "sku": "B", "kind": "inventory",
+         "old": 5, "new": 0, "code": "out_of_stock", "reason": "x"}]
+    calls = tm._wire(monkeypatch, intents, absent=("缺席店",))
+    out = tm.mw.run({"execute": True})
+    assert "缺席避让:1 条" in out
+    assert all(sku == "B" for _s, sku, _q in calls["put_inv"])   # 缺席店没执行
+
+
+def test_cap_destructive_counts_todays_already_executed():
+    """「下架限制」是按天的语义:当日已放行的先扣掉,链尾重赛/人工重跑
+    不把上限翻倍(2026-08-24 归一消灭「按来源翻倍」,别让「按轮次翻倍」回来)。"""
+    from services import dispositions as ds
+    rows = [{"store": "A", "action": "delete"} for _ in range(5)]
+    kept, over = ds.cap_destructive(rows, {"A": 4}, 300,
+                                    executed_today={"A": 3})
+    assert len(kept) == 1 and over == {"A": 4}       # 4-3=1 个名额
+    kept2, _ = ds.cap_destructive(rows, {"A": 4}, 300, executed_today={"A": 9})
+    assert kept2 == []                               # 超支不给负数名额
+
+
+def test_maint_settle_has_a_grace_period():
+    """链尾重赛把「提交→重新观测」从 16~24h 压到十几分钟:没有宽限期的话,
+    主链刚提交的 feed 会被重赛的观测判成「未生效」销案(把"太早看"谎报成
+    "沃尔玛没执行")。"""
+    from services import dispositions as ds
+    assert "make_interval(hours => %(grace)s::int)" in ds._MAINT_OPEN_SQL
+    assert ds.MAINT_SETTLE_GRACE_HOURS >= 1
+
 
 def test_withdraw_sql_carries_the_exclude_stores_clause():
     """缺席店的行不在 keep 里(本轮避让了),不排除会被撤成

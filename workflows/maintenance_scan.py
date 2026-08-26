@@ -157,16 +157,24 @@ def run(params: dict) -> str:
         # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
         # (生产老账:38 条改库存 + 30 条改价 not found)。判据从库里水位派生
         # (services/store_absence),不靠调度顺序、不靠链内传参。
-        absent = set(store_absence.stale_stores(conn))
+        # 探测失败按"不避让"处理并在首行喊出来 —— 缺席探测靠 enabled_names
+        # (飞书),不兜底的话本工作流的 preview 会被一次飞书抖动整个拦下
+        try:
+            absent = set(store_absence.stale_stores(conn))
+            absence_gap = ""
+        except Exception as e:
+            absent = set()
+            absence_gap = f";⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0))
+    if only:
+        intents = [i for i in intents if i["store"] == only]
+        capped = [c for c in capped if c["store"] == only]
+        absent &= {only}    # 只报本范围内的缺席:范围外的店与本轮无关
     n_avoided = sum(1 for i in intents if i["store"] in absent)
     if absent:
         intents = [i for i in intents if i["store"] not in absent]
         capped = [c for c in capped if c["store"] not in absent]
-    if only:
-        intents = [i for i in intents if i["store"] == only]
-        capped = [c for c in capped if c["store"] == only]
 
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
     n_zero = sum(1 for i in intents
@@ -184,7 +192,8 @@ def run(params: dict) -> str:
              + (f";⚠ 缺席避让 {len(absent)} 店:{','.join(sorted(absent))}"
                 f"(目录落后船队 >{store_absence.LAG_HOURS}h,"
                 f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
-                if absent else "")]
+                if absent else "")
+             + absence_gap]
     for c in capped:
         # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
         lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "

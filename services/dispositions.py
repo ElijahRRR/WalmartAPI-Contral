@@ -489,31 +489,64 @@ def count_suppressed(conn, actions: tuple | None = None) -> int:
         return cur.fetchone()[0]
 
 
-def cap_destructive(rows: list[dict], caps: dict, default: int
+_EXECUTED_TODAY_SQL = """
+SELECT store, count(*) FROM ops.dispositions
+WHERE action = ANY(%(destructive)s::text[])
+  AND executed_at IS NOT NULL
+  AND executed_at > now() - make_interval(hours => %(hours)s::int)
+GROUP BY store
+"""
+
+
+def destructive_executed_today(conn, hours: int = 20) -> dict[str, int]:
+    """输入:连接(+窗口小时)→ 输出:{店铺: 窗口内已放行的破坏类条数}。
+
+    「下架限制」是**按天**的语义,而 cap_destructive 只看单次运行 —— 同一天
+    第二次运行(链尾重赛缺席店、人工重跑)会把每店上限翻倍(2026-08-24 归一
+    消灭过"按来源翻倍",重赛把它换成"按轮次翻倍"带了回来)。本函数给
+    cap_destructive 提供当日已放行数,把上限做成真·按天。窗口 20h 与
+    drop_recent 同源(链一天一轮留余量)。已 executed 的行无论后来落定成
+    什么状态都占额度 —— 配额花掉了就是花掉了。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_EXECUTED_TODAY_SQL, {
+            "destructive": list(DESTRUCTIVE_ACTIONS), "hours": int(hours)})
+        return {s: int(n) for s, n in cur.fetchall()}
+
+
+def cap_destructive(rows: list[dict], caps: dict, default: int,
+                    executed_today: dict[str, int] | None = None
                     ) -> tuple[list[dict], dict]:
-    """输入:已领取的建议行 + {店铺:上限} + 缺省上限 → 输出:(截后的行, {店铺:超额})。
+    """输入:已领取的建议行 + {店铺:上限} + 缺省上限(+当日已放行数)→ 输出:(截后的行, {店铺:超额})。
 
     **单店删除上限的唯一施加点**(2026-08-24 归一)。此前两条链各自在扫描期
     按同一张限额表「下架限制」截一次 —— 应用两遍的结果是"每店最多 N 条"
     实际变成了最多 2N。现在扫描期一律不截(建议表如实反映待办),执行期截一次。
 
+    executed_today(2026-08-26,链尾重赛配套):同店**当日**已放行的破坏类
+    条数,先从上限里扣掉 —— 否则重赛/人工重跑一次,上限就翻一倍
+    (取数 destructive_executed_today,执行件领取时查一次传入)。
+
     只截破坏组:维护三类(标题/价格/库存)不烧下架配额,不该被这个上限管。
     超出的**留在 suggested 不动**,下轮继续领 —— 丢弃会让它们永远轮不到。
     """
+    used = dict(executed_today or {})
     kept, over, per_store = [], {}, {}
     for r in rows:
         if r["action"] not in DESTRUCTIVE_ACTIONS:
             kept.append(r)
             continue
         store = r["store"]
-        cap = int(caps.get(store, default))
+        cap = max(0, int(caps.get(store, default)) - int(used.get(store, 0)))
         per_store[store] = per_store.get(store, 0) + 1
         if per_store[store] > cap:
             over[store] = over.get(store, 0) + 1
             continue
         kept.append(r)
     if over:
-        logger.warning("破坏类建议超单店上限,本轮留到下轮:%s", over)
+        logger.warning("破坏类建议超单店上限(含当日已放行 %s),本轮留到下轮:%s",
+                       {k: v for k, v in used.items() if k in over} or "0",
+                       over)
     return kept, over
 
 
@@ -565,8 +598,17 @@ FROM ops.dispositions d
 JOIN catalog.walmart_items w ON w.store = d.store AND w.sku = d.sku
 WHERE d.status = 'executing'
   AND d.action = ANY(%(actions)s::text[])
-  AND w.last_seen_at > d.executed_at
+  AND w.last_seen_at > d.executed_at + make_interval(hours => %(grace)s::int)
 """
+
+# 落定宽限(2026-08-26,链尾重赛引入的时间压缩):此前"提交"与"下一次重新
+# 观测"天然隔 16~24 小时,判据只需 last_seen_at > executed_at;链尾重赛把
+# 这个间隔压到十几分钟 —— 主链 14:50 刚提交的 MP_MAINTENANCE 还在沃尔玛
+# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance 落定,
+# 会把"太早看"谎报成 ineffective(销案后行卡 executing,该 SKU 白丢一天)。
+# 2 小时 > 价格 feed SLA(15 分钟)与 MP_MAINTENANCE 常规处理时长;正常
+# 隔日节奏(16~24h)完全不受影响。破坏侧本就有 48h 宽限(verify_deletions)。
+MAINT_SETTLE_GRACE_HOURS = 2
 
 _MAINT_SETTLE_SQL = """
 UPDATE ops.dispositions
@@ -602,11 +644,14 @@ def maint_effective(action: str, want, price, qty, name) -> bool:
 def settle_maintenance(conn) -> dict:
     """输入:连接 → 输出:{confirmed: n, ineffective: n}(维护三动作的落定)。
 
-    只判**已被 catalog_sync 重新观测过**的行(w.last_seen_at > d.executed_at)。
-    没重新观测的保持 executing —— 拿提交前的旧快照判,永远判成"没生效"。
+    只判**提交后过了宽限期、且已被 catalog_sync 重新观测过**的行
+    (w.last_seen_at > d.executed_at + 2h,见 MAINT_SETTLE_GRACE_HOURS)。
+    没重新观测的保持 executing —— 拿提交前的旧快照判,永远判成"没生效";
+    观测得太早同理 —— feed 还在沃尔玛队列里,判了就是把"太早看"报成"没执行"。
     """
     with conn.cursor() as cur:
-        cur.execute(_MAINT_OPEN_SQL, {"actions": list(MAINT_ACTIONS)})
+        cur.execute(_MAINT_OPEN_SQL, {"actions": list(MAINT_ACTIONS),
+                                      "grace": int(MAINT_SETTLE_GRACE_HOURS)})
         rows = cur.fetchall()
     ok, bad = [], []
     for rid, action, detail, price, qty, name in rows:

@@ -294,6 +294,11 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
     """
     from services import runlock
 
+    # 本地副本:此前就地改 per_step 的 dict(设 execute、pop lock_wait),
+    # 链尾重赛复制到的是被消费过的版本 —— lock_wait 静默丢失,配了等锁的
+    # 步骤在重赛里撞锁即退(2026-08-26 对抗校验)。原 dict 谁都不动。
+    params = dict(params)
+
     dangerous = bool(getattr(module, "DANGEROUS", False))
     # 缺省即真跑(所有者定稿 2026-08-16):调度里漏写 --execute 会让整条链每天
     # 空转而且报成功,比误跑更难发现。空跑改为显式 --dry-run。
@@ -421,6 +426,12 @@ def main(argv: list[str] | None = None) -> int:
     return _EXIT.get(worst, 1)
 
 
+#: 链尾重赛的规模闸:今日缺席超过这个数 = 系统性故障(代理商区域挂了/
+#: 网络出口出事),逐店重赛只会把工作量按店数放大、把破坏步骤拖进无人时段
+#: —— 止损点名,让人去修根因(2026-08-26 对抗校验定稿)。
+REPLAY_MAX_STORES = 5
+
+
 def _replay_absent(steps, modules, per_step, dry_run, operator, logs_dir,
                    since) -> list[str]:
     """输入:主链步骤与参数 + 本轮起点 → 输出:重赛结果行(无缺席店返回 [])。
@@ -432,42 +443,86 @@ def _replay_absent(steps, modules, per_step, dry_run, operator, logs_dir,
     README 的「失败不要自动重跑」禁的是盲目整链重跑,这里是设计内的、
     逐店限定、单次的重赛。全局步骤(sources_backfill/product_refresh/
     product_audit)主链已全量跑过、不因单店缺席而陈旧,跳过。
-    防重不在这一层:各工作流自己的三道闸(feed_log 在途 / claim 只取
-    suggested / dedupe 20h)照常起作用,重赛不绕任何入口。
+    防重不在这一层:各工作流自己的闸(feed_log 在途 / claim 只取 suggested /
+    dedupe 20h / cap_destructive 按日记账)照常起作用,重赛不绕任何入口。
     每步照常拿 flock、写 ops.runs、进各自日志 —— 与主链同一段 _run_step。
+
+    四道闸(2026-08-26 对抗校验加,一道都不能少):
+      · **单店链不重赛**:主链任何一步带了 store= 范围参数,水位判据看的
+        却是全船 —— 会把"没被本次范围覆盖"误判成"缺席",对全船跑破坏步骤;
+      · **长期缺席不重赛**(split_stale):凭证死三天的店天天重赛=天天 ❌;
+      · **规模闸**:今日缺席 > REPLAY_MAX_STORES 判系统性故障,点名不重赛;
+      · **水位复核**:步骤全绿不等于救回,重赛后水位仍没跨过链起点的照实说。
     """
     from registry import db
     from services import store_absence
+    if any("store" in (per_step.get(n) or {}) for n in steps):
+        return ["—— 缺席店重赛跳过:主链带了 store= 范围参数"
+                "(水位判据是全船的,单店链重赛会误伤其余店铺)——"]
     try:
         with db.pg_conn() as conn:
-            absent = store_absence.stale_stores(conn, since=since)
+            recent, chronic = store_absence.split_stale(conn, since=since)
     except Exception as e:
         logger.warning("缺席店探测失败,跳过链尾重赛: %s", e)
-        return []
-    if not absent:
-        return []
+        return [f"—— 缺席店重赛跳过:探测失败({e.__class__.__name__}),"
+                f"见 cli 日志 ——"]
+    lines: list[str] = []
+    if chronic:
+        lines.append(f"⚠ 长期缺席 {len(chronic)} 店(落后船队 >"
+                     f"{store_absence.CHRONIC_LAG_HOURS}h,不逐日重赛):"
+                     f"{','.join(chronic)} —— 修凭证/代理,或去凭证表取消「启用」")
+    if not recent:
+        return lines
+    if len(recent) > REPLAY_MAX_STORES:
+        lines.append(f"⚠ 今日缺席 {len(recent)} 店 > 规模闸 {REPLAY_MAX_STORES}"
+                     f",疑似系统性故障(代理商/网络出口),不逐店重赛:"
+                     f"{','.join(recent)} —— 修好根因后手动重跑整链")
+        return lines
     replayable = [n for n in steps
                   if getattr(modules[n], "SUPPORTS_STORE", False)]
     skipped = [n for n in steps if n not in replayable]
-    lines = [f"—— 缺席店重赛:{len(absent)} 店,逐店一次、再失败即止"
-             f"(全局步骤跳过:{','.join(skipped) or '无'})——"]
-    for store in absent:
-        done: list[str] = []
-        stuck = None
+    lines.append(f"—— 缺席店重赛:{len(recent)} 店,逐店一次、再失败即止"
+                 f"(全局步骤跳过:{','.join(skipped) or '无'})——")
+    from services import notify_fmt as nf
+    per_store_lines: dict[str, list[str]] = {}
+    failed_at: dict[str, tuple] = {}
+    for store in recent:
+        got: list[str] = []
         for name in replayable:
-            params = dict(per_step[name])    # 主链已就地改过 execute 等键,复制再用
+            params = dict(per_step[name])
             params["store"] = store
-            status, _text = _run_step(name, modules[name], params, dry_run,
-                                      operator, logs_dir)
+            status, text = _run_step(name, modules[name], params, dry_run,
+                                     operator, logs_dir)
             if status != "success":
-                stuck = (name, status)
+                # 失败铺开全文(_chain_text 同款纪律):人要能从通知里直接
+                # 看出该修凭证表还是找代理商,而不是去翻 ops.runs
+                failed_at[store] = (name, status, text)
                 break
-            done.append(name)
-        if stuck:
-            lines.append(f"❌ {store}:仍缺席 —— 重赛卡在 {stuck[0]}({stuck[1]});"
-                         f"今天到此为止,明天整链自然再试")
+            # 成功步骤压一行:重赛跑的是 DANGEROUS 步骤,发了多少 feed
+            # 不能只剩一个 ✅(「✅ 救回」读起来像补了个同步)
+            got.append(f"   · {nf.first_line_of(text)}")
+        per_store_lines[store] = got
+    # 水位复核:步骤退出码全绿 ≠ 数据真回来了(例:该店返回 0 商品,
+    # upsert 一行不写、水位不前进)—— 按事实说话,不发假 ✅
+    try:
+        with db.pg_conn() as conn:
+            still = set(store_absence.stale_stores(conn, since=since))
+    except Exception:
+        still = set()
+    for store in recent:
+        if store in failed_at:
+            name, status, text = failed_at[store]
+            body = "\n".join(f"   {ln}" for ln in str(text).splitlines()
+                             if ln.strip())
+            lines.append(f"❌ {store}:仍缺席 —— 重赛卡在 {name}({status});"
+                         f"今天到此为止,明天整链自然再试\n{body}")
+        elif store in still:
+            lines.append(f"⚠ {store}:重赛步骤全成但目录水位未推进"
+                         f"(在线 0 商品店?),仍按缺席处理")
+            lines.extend(per_store_lines[store])
         else:
-            lines.append(f"✅ {store}:救回({'→'.join(done)} 全部成功)")
+            lines.append(f"✅ {store}:救回")
+            lines.extend(per_store_lines[store])
     return lines
 
 

@@ -79,7 +79,7 @@ from datetime import datetime
 from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
-    maintenance_intents as mi, stores as stores_svc
+    maintenance_intents as mi, store_absence, stores as stores_svc
 
 DANGEROUS = True
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -262,7 +262,23 @@ def run(params: dict) -> str:
         # 压制必须见人:claim 少返回几行是静默的,不报的话摘要写着"没有待执行
         # 的维护建议",人会以为扫描件没算出东西来
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
+        # 缺席避让(店级重试标准③补全,2026-08-26 对抗校验):扫描件避让了
+        # 缺席店、withdraw 还护住了它们的存量 suggested(cap 顺延/上轮提交
+        # 异常留下的)—— 执行件不避让的话,同一轮链里这批按**隔夜现值**算的
+        # 改价/清零照样被领走提交。缺席店的行留在 suggested 原地,等观测
+        # 刷新后重新定夺。探测失败按空处理并喊出来(不避让 = 改前行为)。
+        try:
+            absent = set(store_absence.stale_stores(conn))
+        except Exception as e:
+            absent = set()
+            lines.append(f"⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让")
     intents = [mi.from_disposition(r) for r in rows]
+    if absent:
+        n_held = sum(1 for i in intents if i["store"] in absent)
+        if n_held:
+            intents = [i for i in intents if i["store"] not in absent]
+            lines.append(f"⚠ 缺席避让:{n_held} 条建议属于缺席店(目录未刷新),"
+                         f"留在 suggested 原地 —— 隔夜现值不配拿来改线上")
     if params.get("store"):
         intents = [i for i in intents if i["store"] == params["store"]]
     if only:

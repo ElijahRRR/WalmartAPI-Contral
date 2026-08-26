@@ -468,9 +468,10 @@ def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "match_inventory_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "drop_recent", lambda c, i: (i, 0))
-    out = mi.collect_all(conn, [])
+    out, capped = mi.collect_all(conn, [])
     assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
                                                     ("B0B", "price")]
+    assert capped == []          # 没超单店上限就一个组都不该进截断报告
 
 
 def test_intent_disposition_roundtrip_keeps_the_title_payload():
@@ -508,14 +509,113 @@ def test_delete_detail_datetimes_survive_json():
     assert "default=str" in inspect.getsource(ds.suggest_many)
 
 
+# ── 单店单轮上限(cap_per_store,2026-08-26 按店化)──────────────────────────
+# 08-25 生产实证的病根:全局 5000/类闸把 7 家店的**合法**倍率调整截成随机零头
+# (SQL 无 ORDER BY,[:5000] 取的是物理序),截断只进日志,飞书摘要看起来一切
+# 正常。按店化后配额才对得上沃尔玛的计法(全部按店),截谁也不再随机。
+
+
+def _price_intent(store, sku, old, new):
+    return {"store": store, "sku": sku, "kind": "price", "old": old, "new": new}
+
+
+def test_cap_is_per_store_not_global():
+    """一家店超限只截这一家;别家一个不少;全局总量允许超旧 5000 闸。"""
+    cap = mi.MAX_INTENTS_PER_STORE["price"]
+    big = [_price_intent("A", f"S{i}", 10.0, 12.0) for i in range(cap + 100)]
+    small = [_price_intent("B", f"T{i}", 10.0, 15.0) for i in range(300)]
+    out, report = mi.cap_per_store(big + small)
+    n = {}
+    for i in out:
+        n[i["store"]] = n.get(i["store"], 0) + 1
+    assert n == {"A": cap, "B": 300}
+    assert len(out) > 5000                    # 全局旧闸已废
+    assert len(report) == 1
+    r = report[0]
+    assert (r["store"], r["kind"], r["total"], r["kept"]) == \
+        ("A", "price", cap + 100, cap)
+    # 落榜行的键要给全:扫描件靠它把落榜行留在 withdraw keep 里
+    assert len(r["deferred_keys"]) == 100
+    assert all(k[0] == "A" and k[2] == "price" for k in r["deferred_keys"])
+
+
+def test_price_truncation_keeps_the_biggest_mispricing(monkeypatch):
+    """截谁不是随机的:偏差比例大的先走 —— 错得越离谱的价越该当天纠。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "price", 2)
+    out, report = mi.cap_per_store([
+        _price_intent("A", "S1", 10.0, 10.2),     # +2%
+        _price_intent("A", "S2", 10.0, 15.0),     # +50%
+        _price_intent("A", "S3", 10.0, 8.0),      # -20%(跌也按幅度算)
+    ])
+    assert {i["sku"] for i in out} == {"S2", "S3"}
+    assert report[0]["total"] == 3 and report[0]["kept"] == 2
+    assert report[0]["deferred_keys"] == [("A", "S1", "price")]
+
+
+def test_title_truncation_keeps_mismatch_sync_first(monkeypatch):
+    """标题也有截断优先级:停闸期低相似度同步(抄错标题嫌疑最大)先走;
+    第二键 SKU —— 产出序是无 ORDER BY 的物理序,会随 VACUUM 漂移,
+    截断名单必须跨轮可预期(08-25 "随机截"的一半病根)。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "title", 2)
+    out, _ = mi.cap_per_store([
+        {"store": "A", "sku": "T3", "kind": "title", "old": "a", "new": "b",
+         "code": "title_sync"},
+        {"store": "A", "sku": "T2", "kind": "title", "old": "a", "new": "b",
+         "code": "title_mismatch_sync"},
+        {"store": "A", "sku": "T1", "kind": "title", "old": "a", "new": "b",
+         "code": "title_sync"},
+    ])
+    assert [i["sku"] for i in out] == ["T2", "T1"]
+
+
+def test_inventory_truncation_keeps_zeroing_first(monkeypatch):
+    """清零(new=0)优先于补货:「别卖错」压过「上量」;同档保持产出序。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "inventory", 2)
+    out, _ = mi.cap_per_store([
+        {"store": "A", "sku": "R1", "kind": "inventory", "old": 0, "new": 10},
+        {"store": "A", "sku": "Z1", "kind": "inventory", "old": 5, "new": 0},
+        {"store": "A", "sku": "Z2", "kind": "inventory", "old": 3, "new": 0},
+    ])
+    assert [i["sku"] for i in out] == ["Z1", "Z2"]
+
+
+def test_delete_is_never_capped_at_scan():
+    """破坏类数量闸唯一在执行件(2026-08-24 归一);扫描件如实报待办。"""
+    dels = [{"store": "A", "sku": f"D{i}", "kind": "delete",
+             "old": "在线", "new": "删除"} for i in range(9000)]
+    out, report = mi.cap_per_store(dels)
+    assert len(out) == 9000 and report == []
+
+
+def test_store_caps_align_with_feed_quota_and_slice():
+    """上限 =(按店速率桶 − 1)× 单 feed 切片条数,三处必须钉在一起。
+
+    **−1 是补交余量**:api/feeds 的"双确认未达 → 同一载荷补交一次"每次
+    多烧一个桶名额,切片数吃满桶时一次补交就会在令牌桶上睡到窗口滑出
+    (≈1 小时),整条链抱着 flock 陪等。
+    **窗口那一维也要钉**:把 (8,3600) 改成 (8,86400) 条数断言照样过,
+    而单轮吞吐掉到 1/24、"×小时"的六处文档全部变假话。
+    谁要改桶/切片/上限表任何一处,先改到全部同时成立。
+    """
+    from api import _client, feeds
+    for kind, bucket, slice_key in (
+            ("price", "feeds.post.price", "price"),
+            ("inventory", "feeds.post.inventory", "inventory"),
+            ("title", "feeds.post.MP_MAINTENANCE", "MP_MAINTENANCE")):
+        n, window = _client._RATE_BUCKETS[bucket]
+        assert window == 3600.0, bucket       # 单轮 = 一小时桶
+        assert mi.MAX_INTENTS_PER_STORE[kind] == \
+            (n - 1) * feeds._SLICE_LIMITS[slice_key][0], kind
+
+
 # ── 扫描件(maintenance_scan)────────────────────────────────────────────────
 
-def _scan_wire(monkeypatch, intents, sz=("T1",)):
+def _scan_wire(monkeypatch, intents, sz=("T1",), capped=()):
     from workflows import maintenance_scan as ms
     calls = {"suggest": [], "withdraw": []}
     monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
     monkeypatch.setattr(ms.mi, "collect_all",
-                        lambda conn, s, oos=0: list(intents))
+                        lambda conn, s, oos=0: (list(intents), list(capped)))
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(ms.dispositions, "suggest_many",
                         lambda conn, rows: (calls["suggest"].extend(rows),
@@ -623,6 +723,62 @@ def test_scan_preview_writes_nothing(monkeypatch):
     out = ms.run({"preview": "1"})
     assert calls["suggest"] == [] and calls["withdraw"] == []
     assert "preview" in out and "将写 1 条" in out
+
+
+def test_scan_surfaces_truncation_in_summary_first_line(monkeypatch):
+    """截断必须进摘要**首行**,不许只进日志或第 2 行。
+
+    08-25 生产实证:全局闸截掉 7,766 条改价只写了一行日志 warning,飞书通知
+    报的全是截断后的数,看起来一切正常。而且唯一调度路径(product_chain 链)
+    对成功步骤**只发首行**(cli first_line_of)—— 截断放第 2 行等于只写日志
+    (对抗校验 2026-08-26 实跑证实)。逐店明细留在后续行。
+    """
+    ms, _calls = _scan_wire(monkeypatch, [], capped=[
+        {"store": "谭总12", "kind": "price", "total": 8000, "kept": 6000}])
+    out = ms.run({"preview": "1"})
+    first = out.splitlines()[0]
+    assert "⚠ 截断 1 组共 2000 条顺延" in first
+    assert "谭总12" in out and "8000→6000" in out
+
+
+def test_scan_first_line_carries_zeroing_count(monkeypatch):
+    """清零规模也必须在首行:全局刹车废除后它是整店误清零的唯一人眼防线,
+    而链通知只发成功步骤的首行 —— 放 _preview_lines 里等于没人看见。"""
+    ms, _calls = _scan_wire(monkeypatch, [
+        {"store": "T1", "sku": "A", "kind": "inventory", "old": 3, "new": 0,
+         "code": "out_of_stock", "reason": "亚马逊缺货"},
+        {"store": "T1", "sku": "B", "kind": "inventory", "old": 0, "new": 7,
+         "code": "match_restock", "reason": "跟卖铺货"}])
+    out = ms.run({"preview": "1"})
+    assert "清零 1" in out.splitlines()[0]     # 补货那条不算清零
+
+
+def test_scan_store_filter_scopes_the_truncation_report_too(monkeypatch):
+    """-p store=X 那一轮,别家的截断行不该混进本店摘要。
+
+    ⚠ 店名别用 stockzero 名单里的:_scan_wire 缺省 sz=("T1",) 会让
+    「stockzero 名单:T1」恒出现,断言 'T1' in out 就是空断言(变异实测:
+    把 store 过滤整个删掉照样绿)。断言只认截断行才会出现的片段。
+    """
+    ms, _calls = _scan_wire(monkeypatch, [], sz=(), capped=[
+        {"store": "甲店", "kind": "price", "total": 7000, "kept": 6000},
+        {"store": "乙店", "kind": "price", "total": 9000, "kept": 6000}])
+    out = ms.run({"preview": "1", "store": "甲店"})
+    assert "7000→6000" in out and "9000→6000" not in out
+
+
+def test_scan_keeps_deferred_rows_out_of_withdraw(monkeypatch):
+    """被配额截掉 ≠ 不再建议:落榜行的旧 suggested 行不许被 withdraw_stale
+    撤成「商品自己恢复正常了」—— 错误取证,且下轮扫描又原样重建。"""
+    intents = [{"store": "T1", "sku": "A", "kind": "price",
+                "old": 9.9, "new": 11.0}]
+    ms, calls = _scan_wire(monkeypatch, intents, capped=[
+        {"store": "T1", "kind": "price", "total": 3, "kept": 1,
+         "deferred_keys": [("T1", "B", "price"), ("T1", "C", "price")]}])
+    ms.run({})
+    _src, keep, _store = calls["withdraw"][0]
+    assert ("T1", "A", "price") in keep          # 入选的照常在
+    assert ("T1", "B", "price") in keep and ("T1", "C", "price") in keep
 
 
 # ── 执行件(maintenance)────────────────────────────────────────────────────

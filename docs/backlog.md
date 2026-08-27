@@ -214,7 +214,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
       我们的采集侧给真族主(生产实见 GustBuster 组),但改回去也能自愈;
     · list_new 摘要新增「其中多维 N」「有维度映不上 N」两栏做验收点。
   ✅ **Phase 0.8 维度错位重映射 + Feature B 组内标题差异化已补迁**(2026-08-17,
-  所有者批「都补」)。`services/variant_remap.py`(三层:枚举内检查 → 内置错位表 →
+  所有者批「都补」)。`services/variant_remap.py`(2026-08-27 定案:①枚举内检查在调用方 list_new;本模块只提供 ②内置错位表 →
   LLM 兜底,整组一次决策过 llm_cache)+ `services/variant_title.py`(同组
   productName 全同时追加 ` - <维度取值>`,199 字截 base 保 suffix,幂等)+
   `list_new._remap_unmapped_dims` / `_differentiate_titles` 接线。

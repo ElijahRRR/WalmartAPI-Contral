@@ -1103,3 +1103,52 @@ def test_report_csv_keeps_bom_and_writes_no_blank_lines(monkeypatch, tmp_path):
     assert b"\r\n" in raw and b"\r\r\n" not in raw  # newline='' 不加倍 \r
     assert raw.decode("utf-8-sig").splitlines() == ["店铺,SKU", "A085,B0AAAA0001"]
     assert Path(p).parent == tmp_path / "r"         # 目录不存在也会先建
+
+
+# ── run() 三段拆解:_collect / _sections / _export(2026-08-27)────────────
+
+def test_run_is_three_stages_over_one_ctx():
+    """run() 只剩三步:`_collect` → `_sections` → `_export`。
+
+    拆之前 run() 451 行、装载与六节报告与六份 csv 同体,中段二十多个局部量
+    被后两段交叉引用。⚠ **不许把这些量摊成参数** —— 那是把臃肿换成穿透,
+    所以判据是"三段各自只收一个对象"。
+    """
+    import inspect
+    from dataclasses import fields
+    assert list(inspect.signature(wf._collect).parameters) == ["params"]
+    for fn in (wf._sections, wf._export):
+        assert len(inspect.signature(fn).parameters) == 1
+    src = inspect.getsource(wf.run)
+    assert "_collect" in src and "_sections" in src and "_export" in src
+    assert len(src.splitlines()) <= 6           # run 里不该再有拼装
+    assert {"conflicts", "held", "rows", "cfg", "prof_all"} <= {
+        f.name for f in fields(wf.Ctx)}
+
+
+def test_conflicts_and_claims_are_computed_exactly_once():
+    """报告段与 csv 段读**同一份** conflicts/held,不许各算一遍(口径纪律 2)。
+
+    各算一遍就会漂:控制台说"留 A085"、csv 里写着另一家,而所有者是照 csv
+    动手的;占用读两遍还会出现"报告说没看占用、清单却按占用写"的自相矛盾。
+    判据落在源码上——两个调用点各自只出现一次。
+    """
+    import inspect
+    src = inspect.getsource(wf)
+    assert src.count("sv.resolve_conflicts(") == 1
+    assert src.count("sv.store_metrics(") == 1
+    assert src.count("claims.load_active(") == 2      # BRAND / PRODUCT 各一次
+
+
+def test_loading_and_csv_both_go_through_the_shared_blocks():
+    """装载走 `sv.load_rows`、落盘走 `report_csv.write`,本件不留第二条路。
+
+    两个积木的**原件都出自这个文件**(2026-08-27 上移):`_write_csv` 是六处
+    抄写的母本,私有 `sv._SQL_*` 则是四条分配链各自伸手进服务内部的那一段
+    ——下划线前缀本来就说明服务侧不认为它们是对外接口。
+    """
+    import inspect
+    src = inspect.getsource(wf)
+    assert "sv.load_rows(" in src and "sv._SQL_" not in src
+    assert "report_csv.write(" in src
+    assert "csv.writer" not in src and "def _write_csv" not in src

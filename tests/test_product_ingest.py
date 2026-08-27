@@ -326,7 +326,7 @@ def test_list_new_stock_three_way(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})

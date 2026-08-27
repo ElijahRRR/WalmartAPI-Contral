@@ -90,6 +90,7 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from api import scraper
@@ -1058,8 +1059,27 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
 _cap_by_connections = db_guard.cap_workers
 
 
-def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+@dataclass
+class Opts:
+    """一轮 run() 的入参定案(值域与四条互斥校验都在 _parse_opts 里做完)。"""
+    execute: bool
+    limit: int
+    backfill: bool
+    adopt_only: bool
+    r5_on: bool
+    run_l3: bool
+    run_l4: bool
+    only_l0: bool
+    workers: int
+    conn_note: str = ""       # 连接余量钳制的说明(_cap_by_connections 回填)
+
+
+def _parse_opts(params: dict) -> Opts:
+    """输入:params → 输出:Opts;四条互斥校验与值域校验都在这一处。
+
+    ⚠ **未识别参数/未识别 mode 的闸不在这里**,在 `_pick_where` —— 它挡的是
+    "静默吞参数"(评审 P1-4),与候选谓词同处一地,别顺手挪过来。
+    """
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
@@ -1103,7 +1123,153 @@ def run(params: dict) -> str:
                        "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
-    workers, conn_note = _cap_by_connections(workers)
+    return Opts(execute=execute, limit=limit, backfill=backfill,
+                adopt_only=adopt_only, r5_on=r5_on, run_l3=run_l3,
+                run_l4=run_l4, only_l0=only_l0, workers=workers)
+
+
+@dataclass
+class Counts:
+    """一轮判定的全部计数(摘要读这一个容器,不摊 20 个散量)。"""
+    verdicts: dict          # pass/reject/pending 三态(判定循环就地累加的那本)
+    cand_n: int             # 从候选流里取到的行数
+    todo_n: int             # **进了判定**的行数 —— 卖家缺失那行的分母
+    l0_untouched: int       # stages=L0 未命中、保持原结论的行
+    adopted_n: int
+    no_title: int
+    seller_missing: int
+    policy_unknown: int
+    row_errors: int
+    asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
+    uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
+    uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
+
+
+def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
+             l4_fail: dict, pending_total: int,
+             sheet_head: list[str]) -> list[str]:
+    """输入:一轮的入参与计数 → 输出:摘要行(纯拼装,零 I/O)。
+
+    ⚠ 这些字样逐字进飞书通知(cli.py 发的就是 run() 的返回值),
+    每一行都是某次事故/复盘留下的可见性,改字面量前先想清楚谁在读它。
+    """
+    judged = sum(counts.verdicts.values())
+    lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
+    lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
+              f"{',补刷' if opts.backfill else ''}"
+              f"{',R5开' if opts.r5_on else ''}"
+              f"{',只跑L0' if opts.only_l0 else ''}"
+              f"{',L3关' if not opts.run_l3 and not opts.only_l0 else ''}"
+              f"{',L4开' if opts.run_l4 else ''}):"
+              f"候选 {counts.cand_n},判定 {judged}"
+              f"(过 {counts.verdicts['pass']}/拒 {counts.verdicts['reject']}"
+              f"/待定 {counts.verdicts['pending']})"]
+    if opts.only_l0:
+        lines.append(
+            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原结论**"
+            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
+    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
+        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
+                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
+                     f"unknown→待定 {l1s.get('unknown', 0)},"
+                     f"字典回落 {l1s.get('dict_fallback', 0)},"
+                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
+                     f"低置信采纳 {l1s.get('conf_low', 0)}")
+        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
+        picked = {k[len("picked_"):]: v for k, v in l1s.items()
+                  if k.startswith("picked_") and v}
+        if picked:
+            lines.append("  选中候选来自:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(picked.items(),
+                                              key=lambda kv: -kv[1])))
+        opened = {k: v for k, v in l1s.items()
+                  if k.startswith("open_") and v}
+        if opened:
+            lines.append("  零参考两阶段:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(opened.items())))
+        if l1s.get("unknown_retry_called", 0):
+            called = l1s["unknown_retry_called"]
+            saved = l1s.get("unknown_retry_saved", 0)
+            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
+                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
+    # token / 成本(2026-08-21):跑完才想知道"这一轮花了多少"就晚了 ——
+    # usage 只在响应里存在一次,不当场记就永远没了
+    from services import llm_cost as _cost
+    from api import llm as _llm2
+    lines.extend(_cost.summarize(_llm2.USAGE_STATS, items=judged))
+    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
+    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
+    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
+    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
+    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
+    if retries.get("http_429"):
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + " ⚠ **已撞限流**,再加并发只会更慢")
+    elif retries:
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
+                  "降并发解决不了)")
+    else:
+        tail = ",LLM 零退避(未撞限流,可继续加并发)"
+    lines.append(f"并发 {opts.workers}{tail}")
+    if opts.conn_note:
+        # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
+        lines.append(opts.conn_note)
+    # 2026-08-20:seed/LLM 的 excluded 三个计数键随 excluded 链下线,L1 硬拦
+    # 现在只剩出版物一条(类目能不能做已全部归 L2 R1 白名单)
+    if l1s.get("publication_forbidden", 0):
+        lines.append(f"L1 硬拦:出版物 {l1s.get('publication_forbidden', 0)}")
+    if stage_stats["L3_ran"]:
+        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
+                     f"(拒 {stage_stats['L3_reject']}/"
+                     f"LLM 故障待定 {stage_stats['L3_pending']})")
+    if stage_stats["L4_ran"]:
+        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
+                     f"(拒 {stage_stats['L4_reject']})")
+    if l4_fail:
+        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
+        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
+        lines.append(f"⚠ L4 故障回落 pass:{detail}"
+                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
+    if counts.row_errors:
+        lines.append(f"⚠ 单行失败跳过 {counts.row_errors}(savepoint 隔离,详见日志)")
+    if counts.asked_asins and counts.cand_n < counts.asked_asins:
+        lines.append(f"⚠ 指定 ASIN {counts.asked_asins} 个,"
+                     f"库中命中 {counts.cand_n}——缺的 "
+                     f"{counts.asked_asins - counts.cand_n} 个不在 catalog.products")
+    if counts.adopted_n:
+        lines.append(f"历史结论采用 {counts.adopted_n}(不写新 run,detail 指回原 run_id)")
+    if counts.no_title:
+        lines.append(f"无标题跳过 {counts.no_title}(采集降级,不够格判定)")
+    if counts.seller_missing:
+        # ⚠ 分母是**进了判定的行数**不是 judged。2026-08-21 生产实见
+        # 「卖家字段缺失 97331/10147」—— 分子比分母还大:stages=L0 下 judged
+        # 只数 Phase0 命中的那一小撮,而卖家缺失数的是全部候选行。
+        # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
+        lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
+                     f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
+    if counts.policy_unknown:
+        lines.append(f"⚠ 理由映射落 37 政策外 {counts.policy_unknown} 条(详见日志,只记不改判)")
+    if opts.r5_on and counts.uspto_failures:
+        lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
+                     f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
+    lines.append(f"全库 pending 存量 {pending_total}")
+    return lines
+
+
+def run(params: dict) -> str:
+    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+    opts = _parse_opts(params)
+    opts.workers, opts.conn_note = _cap_by_connections(opts.workers)
+    # 中段判定主体与 _to_todo/_judge/_flush 三层闭包沿用这些名字:本次拆解只
+    # 搬走两头(参数解析进 _parse_opts、摘要拼装进 _summary),主体一字未动
+    execute, limit, backfill, adopt_only = (opts.execute, opts.limit,
+                                            opts.backfill, opts.adopt_only)
+    r5_on, run_l3, run_l4, only_l0, workers = (opts.r5_on, opts.run_l3,
+                                               opts.run_l4, opts.only_l0,
+                                               opts.workers)
     # ── 上架表驱动(所有者定稿 2026-08-16;领任务在 _claim_from_sheet)──────
     sheet_rows: list[dict] = []
     sheet_head: list[str] = []
@@ -1395,107 +1561,16 @@ def run(params: dict) -> str:
                         "WHERE marketplace = 'US' AND audit_status = 'pending'")
             (pending_total,) = cur.fetchone()
 
-    judged = sum(counts.values())
-    lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
-    lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
-              f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
-              f"{',只跑L0' if only_l0 else ''}"
-              f"{',L3关' if not run_l3 and not only_l0 else ''}"
-              f"{',L4开' if run_l4 else ''}):"
-              f"候选 {cand_n},判定 {judged}"
-              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
-    if only_l0:
-        lines.append(
-            f"stages=L0:Phase0 未命中 {l0_untouched} 个**保持原结论**"
-            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
     l1s = audit_rules.audit_l1_llm.STATS
-    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
-        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
-                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
-                     f"unknown→待定 {l1s.get('unknown', 0)},"
-                     f"字典回落 {l1s.get('dict_fallback', 0)},"
-                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
-                     f"低置信采纳 {l1s.get('conf_low', 0)}")
-        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
-        picked = {k[len("picked_"):]: v for k, v in l1s.items()
-                  if k.startswith("picked_") and v}
-        if picked:
-            lines.append("  选中候选来自:" + " / ".join(
-                f"{k} {v}" for k, v in sorted(picked.items(),
-                                              key=lambda kv: -kv[1])))
-        opened = {k: v for k, v in l1s.items()
-                  if k.startswith("open_") and v}
-        if opened:
-            lines.append("  零参考两阶段:" + " / ".join(
-                f"{k} {v}" for k, v in sorted(opened.items())))
-        if l1s.get("unknown_retry_called", 0):
-            called = l1s["unknown_retry_called"]
-            saved = l1s.get("unknown_retry_saved", 0)
-            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
-                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
-    # token / 成本(2026-08-21):跑完才想知道"这一轮花了多少"就晚了 ——
-    # usage 只在响应里存在一次,不当场记就永远没了
-    from services import llm_cost as _cost
-    from api import llm as _llm2
-    lines.extend(_cost.summarize(_llm2.USAGE_STATS, items=judged))
-    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
-    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
-    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
-    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
-    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
-    if retries.get("http_429"):
-        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
-                                          in sorted(retries.items()))
-                + " ⚠ **已撞限流**,再加并发只会更慢")
-    elif retries:
-        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
-                                          in sorted(retries.items()))
-                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
-                  "降并发解决不了)")
-    else:
-        tail = ",LLM 零退避(未撞限流,可继续加并发)"
-    lines.append(f"并发 {workers}{tail}")
-    if conn_note:
-        # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
-        lines.append(conn_note)
-    # 2026-08-20:seed/LLM 的 excluded 三个计数键随 excluded 链下线,L1 硬拦
-    # 现在只剩出版物一条(类目能不能做已全部归 L2 R1 白名单)
-    if l1s.get("publication_forbidden", 0):
-        lines.append(f"L1 硬拦:出版物 {l1s.get('publication_forbidden', 0)}")
-    if stage_stats["L3_ran"]:
-        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
-                     f"(拒 {stage_stats['L3_reject']}/"
-                     f"LLM 故障待定 {stage_stats['L3_pending']})")
-    if stage_stats["L4_ran"]:
-        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
-                     f"(拒 {stage_stats['L4_reject']})")
-    if l4_fail:
-        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
-        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
-        lines.append(f"⚠ L4 故障回落 pass:{detail}"
-                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
-    if row_errors:
-        lines.append(f"⚠ 单行失败跳过 {row_errors}(savepoint 隔离,详见日志)")
-    if "asins" in extra and cand_n < len(extra["asins"]):
-        lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {cand_n}"
-                     f"——缺的 {len(extra['asins']) - cand_n} 个不在 catalog.products")
-    if adopted_n:
-        lines.append(f"历史结论采用 {adopted_n}(不写新 run,detail 指回原 run_id)")
-    if no_title:
-        lines.append(f"无标题跳过 {no_title}(采集降级,不够格判定)")
-    if seller_missing:
-        # ⚠ 分母是**进了判定的行数**不是 judged。2026-08-21 生产实见
-        # 「卖家字段缺失 97331/10147」—— 分子比分母还大:stages=L0 下 judged
-        # 只数 Phase0 命中的那一小撮,而卖家缺失数的是全部候选行。
-        # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
-        lines.append(f"⚠ 卖家字段缺失 {seller_missing}/{todo_n}"
-                     f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
-    if policy_unknown:
-        lines.append(f"⚠ 理由映射落 37 政策外 {policy_unknown} 条(详见日志,只记不改判)")
-    if r5_on and getattr(ctx, "uspto_failures", 0):
-        lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
-                     f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
-    lines.append(f"全库 pending 存量 {pending_total}")
+    tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
+                   l0_untouched=l0_untouched, adopted_n=adopted_n,
+                   no_title=no_title, seller_missing=seller_missing,
+                   policy_unknown=policy_unknown, row_errors=row_errors,
+                   asked_asins=len(extra.get("asins", ())),
+                   uspto_failures=getattr(ctx, "uspto_failures", 0),
+                   uspto_off=getattr(ctx, "uspto", None) is None)
+    lines = _summary(opts, tally, stage_stats, l1s, l4_fail,
+                     pending_total, sheet_head)
     if sheet_rows:
         # ⚠ 投影必须在补采**之后**跑(它在 _close_gap 之前就跑了的话,
         # 这一轮刚补采回来、刚判出结论的那些行还写不进表格)

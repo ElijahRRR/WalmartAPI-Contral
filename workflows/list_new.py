@@ -89,6 +89,7 @@ import random
 import threading
 import time
 from datetime import datetime
+from typing import NamedTuple
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
@@ -328,7 +329,21 @@ def _with_pt(row: dict, verdicts: dict) -> dict:
     return {**row, "product_type": pt} if pt else row
 
 
-def _load_gate_state():
+class _GateState(NamedTuple):
+    """闸门链的库侧快照。**字段名即闸门名**:原来是无名 8 元组,按位置解包,
+    中间插一个字段就会让后面全部错位 —— 而错位不报错(集合/字典长得都一样)。"""
+    inactive: set               # ops.store_kpi_daily 里非 ACTIVE 的店名
+    today_used: dict            # 店 → 今日已提交 MP_ITEM 条数(北京日界)
+    listed: set                 # 全局在架 SKU(规划外店的不入,见 SQL 处注)
+    banned: dict                # ASIN → (拉黑类别, 说明)
+    unexplained: set            # 有"不明原因消失"史的 ASIN(只报警不拦)
+    gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
+    owned_asin: dict            # ASIN → 持有店(占用台账 A1)
+    owned_brand: dict           # 品牌键 → 持有店(占用台账 A1)
+
+
+def _load_gate_state() -> _GateState:
+    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的八份库侧快照。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_INACTIVE)
         inactive = {s for s, st in cur.fetchall()
@@ -357,8 +372,8 @@ def _load_gate_state():
         owned_brand = {b: s for b, s in
                        claims.load_active(conn, claims.BRAND).items()
                        if not alloc_survey.is_excluded(s)}
-    return (inactive, today_used, listed, banned, unexplained, gate,
-            owned_asin, owned_brand)
+    return _GateState(inactive, today_used, listed, banned, unexplained, gate,
+                      owned_asin, owned_brand)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -814,8 +829,12 @@ def _drop_degenerate_dims(ready: list[dict]) -> None:
 def _remap_unmapped_dims(ready: list[dict]) -> None:
     """输入:带 _vplan 的待提交行 → 输出:无(给"映不上"的维度找归宿,就地补进 attr_pairs)。
 
-    旧仓 Phase 0.8 的等价物,判定在 `services.variant_remap`(三层:枚举内检查 →
-    内置错位表 → LLM 兜底)。要解决的是**名字对不上而语义有归宿**那一类:
+    旧仓 Phase 0.8 的等价物。**三层的路由在这里,不在 services**(2026-08-27
+    定案):第①层"哪些维度还没归宿"由本函数判(`unmapped_dims` +
+    `if not enum: continue` + 全同/单成员两道过滤),`services.variant_remap`
+    只提供第②③层的 `hardcoded` / `llm_remap` 两个显式函数,由本函数显式 if
+    分流(conventions §六「能力不同的两个端点由调用方显式路由」)。
+    要解决的是**名字对不上而语义有归宿**那一类:
     旧仓原始案例是文具类目 `color_name=48 Color` 其实是件数,该映 `pieceCount`。
 
     与旧仓的差异(逐条见 services/variant_remap 头注)里,**接线侧要守的两条**:
@@ -1104,6 +1123,250 @@ def _llm_cost_lines(items: int = 0) -> list[str]:
     return _cost.summarize(_llm.USAGE_STATS, items=items)
 
 
+class _GateCtx(NamedTuple):
+    """两道闸共用的只读上下文:库侧快照 + 三张按店配置表 + 在册凭证。"""
+    state: _GateState           # _load_gate_state() 的库侧快照
+    stores_by_name: dict        # 店名 → 凭证(不在里面 = 凭证缺失,整店跳过)
+    quota: dict                 # 店 → 限额表「上架限制」(读不到按 999 不限)
+    mults: dict                 # 店 → 四区间倍率(services/store_limits)
+    lead_caps: dict             # 店 → 「配送时长限制」上限天数
+    store_chs: dict             # 店 → 「配送限制」渠道(没标=不限)
+
+
+class _StoreGate(NamedTuple):
+    """_gate_by_store 的产物。计数**返回**给调用方合并,不就地改共享计数器。"""
+    survivors: list             # 过了按店闸的候选行
+    reasons: list               # [(rownum, N 理由)]
+    counts: dict                # 闸门计数增量,调用方按键累加进 n
+    allow_by_store: dict        # 店 → 本轮剩余配额(只有过了店闸的店才有)
+    missing_warn: list          # 不明消失史 ASIN(放行但摘要报警)
+    lines: list                 # 整店级摘要行(凭证缺失)
+
+
+class _RowGate(NamedTuple):
+    """_gate_by_row 的产物。同上:计数返回,不就地改。"""
+    survivors: list             # 过了按行闸、已带 _p/_price/_qty 的行
+    reasons: list               # [(rownum, N 理由)]
+    counts: dict                # 闸门计数增量,调用方按键累加进 n
+    data_echo: list             # [(rownum, [C,H,I,J])] 淘汰行也回显
+
+
+def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
+    """输入:待上架行 + 闸门上下文 → 输出:`_StoreGate`(候选行/理由/计数/配额/报警/摘要行)。
+
+    闸门链 ①③④ 的按店那半边:凭证 → 非 ACTIVE 店 → PT spec → 风控 →
+    全局去重 → 产品占用 → ASIN 黑名单 →(不明消失史只报警)。
+    **判据顺序即业务语义,逐条不许挪**(顺序改了 N 列理由就换一个,
+    运营看到的"为什么没上"跟着变)。
+
+    计数与理由**返回**给调用方合并 —— 就地改 run() 的共享计数器是这个函数
+    当年长在 run() 里的原因,拆出来就不能再留那条尾巴。
+    """
+    st = ctx.state
+    counts: dict = collections.defaultdict(int)
+    reasons: list[tuple[int, str]] = []
+    lines: list[str] = []
+    missing_warn: list[str] = []             # 不明消失史,放行但报警
+    candidates: list[dict] = []
+
+    by_store: dict[str, list[dict]] = {}
+    for r in rows:
+        by_store.setdefault(r["store"], []).append(r)
+
+    # 配额**不在这里切**(所有者批复 2026-08-12):先过全部闸门与数据过滤,
+    # 幸存者再按店切片——被淘汰行不占名额,配额以能成功提交的行计
+    allow_by_store: dict[str, int] = {}
+    for store_name, srows in sorted(by_store.items()):
+        if store_name not in ctx.stores_by_name:
+            lines.append(f"  {store_name}:凭证缺失,整店跳过")
+            continue
+        if store_name in st.inactive:
+            counts["inactive"] += len(srows)
+            continue
+        allow_by_store[store_name] = max(0, ctx.quota.get(store_name, 999)
+                                         - st.today_used.get(store_name, 0))
+        # 规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
+        # (所有者定稿 2026-08-15「既不占用、也不拦别人」,2026-08-19 生产
+        # 实证补全行侧方向:此前它们上架仍被别店的在架/占用拦下)
+        unplanned = alloc_survey.is_excluded(store_name)
+        for r in srows:
+            if pt_spec.load_pt(r["product_type"]) is None:
+                counts["no_spec"] += 1
+                reasons.append((r["rownum"], f"PT无spec:{r['product_type']}"))
+                continue
+            why = risk_gate.check(st.gate, r["product_type"], None)
+            if why:
+                counts["risk"] += 1
+                reasons.append((r["rownum"], why))
+                continue
+            if not unplanned and r["asin"] in st.listed:
+                counts["dedup"] += 1
+                reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
+                continue
+            holder = None if unplanned else st.owned_asin.get(r["asin"])
+            if holder and holder != store_name:
+                # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
+                # 被占着"正是所有者要的语义(§二);同店占用放行(本来就是它的)
+                counts["claimed"] += 1
+                reasons.append((r["rownum"], f"产品占用:已属于 {holder}"))
+                continue
+            bl = st.banned.get(r["asin"])
+            if bl:
+                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
+                # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
+                # 2026-08-12:因产品问题删过的修好重上是正常经营)
+                counts["blacklist"] += 1
+                reasons.append((r["rownum"],
+                                f"ASIN黑名单:{bl[1]}({bl[0]}类)"))
+                continue
+            if r["asin"] in st.unexplained:
+                # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
+                # 没提交过删/停 = 疑似平台强制下架,放行但必须在摘要里亮出来
+                missing_warn.append(r["asin"])
+            candidates.append(r)
+    return _StoreGate(candidates, reasons, dict(counts), allow_by_store,
+                      missing_warn, lines)
+
+
+def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
+    """输入:按店闸的候选行 + 采集数据 + 闸门上下文 → 输出:`_RowGate`(幸存行/理由/计数/回显)。
+
+    闸门链 ⑤⑥ 的按行那半边:数据源 → 库存三态 → 库存下限 → 品牌风控 →
+    品牌占用 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 → 配送时长 → 素材。
+    **判据顺序即业务语义,逐条不许挪**(每道闸都假设前面那道已经拦掉了它
+    处理不了的形状,例如店铺渠道闸靠"产品渠道未采到"上一行先拦)。
+
+    计数与理由**返回**给调用方合并,不就地改 run() 的共享计数器。
+    """
+    st = ctx.state
+    counts: dict = collections.defaultdict(int)
+    reasons: list[tuple[int, str]] = []
+    survivors: list[dict] = []
+    data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
+    for r in cands:
+        # ⚠ **必须在这里取本行的店名**(2026-08-25 修):此前 `lead_cap` 那行
+        # 直接用了 `store_name`,而这个名字是上面那个按店循环
+        # (`for store_name, srows in sorted(by_store.items())`)**留下的残值**
+        # —— Python 的循环变量出了循环还活着,于是每一行读到的都是
+        # **店名排序最末那家店**的「配送时长限制」。多店同轮时:那家店填了 3 天
+        # ⇒ 全部店的货按 3 天拦;那家店没填 ⇒ 全部店回落全局 7 天,
+        # 逐店那一列**对其余每家店都静默失效**。d4bcaab(2026-08-17 走进生产,
+        # 把全局常量换成逐店列)引入,单店夹具照不出来。
+        store_name = r["store"]
+        p = products.get(r["asin"])
+        if p is None:
+            counts["no_data"] += 1   # 数据源缺席:不写终态,恢复后自动续上
+            continue
+        # 拉到数据的行,无论最终去向都回显标题与价库——运营在表上直接
+        # 看到"为什么这行没上"的数字(旧系统对 prep_fails 同款)
+        echo = [(p.get("title") or "")[:190], p.get("price") or "",
+                p.get("stock") if p.get("stock") is not None else "", ""]
+        data_echo.append((r["rownum"], echo))
+        # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
+        #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
+        #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
+        #   无真值 + 其余状态 → 不知道有没有货,不上架
+        stock = p.get("stock")
+        if stock is None:
+            if p.get("stock_state") == "in_stock":
+                stock = amz_source.IN_STOCK_QTY
+                counts["stock_assumed"] += 1
+            else:
+                counts["filtered"] += 1
+                reasons.append((r["rownum"],
+                                f"库存未知(状态 {p.get('stock_state') or '缺失'})"))
+                continue
+        if stock < amz_source.MIN_INVENTORY:
+            counts["filtered"] += 1
+            reasons.append((r["rownum"], f"库存不足:{stock}"))
+            continue
+        # 品牌与制造商两个字段都查(所有者批复 2026-08-12):brand=Generic
+        # 而真品牌在 manufacturer 是亚马逊常态,只查 brand 黑名单必漏
+        why = risk_gate.check(st.gate, None, p.get("brand"),
+                              p.get("manufacturer"))
+        if why:
+            counts["risk"] += 1
+            reasons.append((r["rownum"], why))
+            continue
+        # 品牌占用闸(A1):品牌排他 ⇒ 同品牌只能在一家店。放在这里而不是
+        # 前面那批闸,是因为品牌要等 amz_source 取回产品数据才知道。
+        # 键与占用侧同一套归一算法(brand_key 唯一出处),否则大小写差一点
+        # 就漏拦;真·无品牌(两字段皆占位符)不参与品牌排他,只受产品占用管
+        bkey = brand_key.brand_key(p.get("brand"), p.get("manufacturer"))
+        # 规划外店(谭总系)不做品牌归属:上架不受品牌占用管(也不占,
+        # load 侧已剔;所有者定稿 2026-08-15,2026-08-19 补全行侧)
+        bholder = (st.owned_brand.get(bkey)
+                   if bkey and not alloc_survey.is_excluded(r["store"])
+                   else None)
+        if bholder and bholder != r["store"]:
+            counts["claimed"] += 1
+            reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))
+            continue
+        # 配送方式决定用哪套区间(FBA 0-30/30-1000 vs FBM 15-80/80-1000)。
+        # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档
+        # 就是拿错倍率定价;宁可这行等下一轮采到 is_fba 再上。
+        channel = p.get("channel")
+        if channel not in pricing.PRICE_BANDS:
+            counts["filtered"] += 1
+            reasons.append((r["rownum"], "配送方式(FBA/FBM)未采到,不定价"))
+            continue
+        # 店铺渠道闸(所有者定稿 2026-08-25:「读取配送限制列,我会在其中标记
+        # fba/fbm,没标就都能上」)。放在这里是因为**产品渠道上一行才刚判明**,
+        # 而判定本身走 store_targets 唯一谓词(分配/上架/维护/对账共用一处)。
+        # 两条空值口径都在谓词里,别在这儿另写:店没标 → 放行;产品渠道不是
+        # 另一个已知值 → 放行(采不到不算不符,那一档上一行已经拦掉了)。
+        # ⚠ 与分配侧的**未填口径相反**且都对:分配未填=不接自由流(没渠道就
+        # 过不了硬闸),上架未填=不限制(照搬分配会把没配置的店整店废掉)。
+        want_ch = ctx.store_chs.get(store_name)
+        if store_targets.channel_conflict(want_ch, channel):
+            counts["channel"] += 1
+            reasons.append((r["rownum"],
+                            f"本店只做 {want_ch},该品是 {channel}"))
+            continue
+        # 定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10):采购真正
+        # 付的是单价加运费。运费没采到(采集侧 N/A)一律不上架——与"配送方式
+        # 未知不定价"同一个道理,当 0 定出来的价偏低,越贵的运费亏得越多
+        if p.get("shipping") is None:
+            counts["filtered"] += 1
+            reasons.append((r["rownum"], "运费未采到,落地价算不出来,不定价"))
+            continue
+        w_price = pricing.walmart_price(channel, p.get("price"),
+                                        ctx.mults.get(r["store"], {}),
+                                        p.get("shipping"))
+        if w_price is None:
+            counts["filtered"] += 1
+            reasons.append((r["rownum"],
+                            f"该区间倍率未配置:落地价 "
+                            f"{pricing.landed_price(p.get('price'), p.get('shipping'))}"))
+            continue
+        # 配送时长超限 ⇒ **不上架**(所有者定稿 2026-08-16 走进生产;
+        # 此前是"上架但库存写 0")。不上架就不占 UPC、不占配额,比上一个
+        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 8 天。
+        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了。
+        lead_cap = store_limits.cap_for(ctx.lead_caps, store_name,
+                                        amz_source.MAX_LEAD_DAYS)
+        if store_limits.over_lead_cap(p.get("lead_days"), lead_cap):
+            counts["lead_days"] += 1
+            reasons.append((r["rownum"],
+                            f"配送 {p.get('lead_days')} 天 > 本店上限 {lead_cap} 天"))
+            continue
+        # 素材闸(2026-08-22):卖点/副图这两个**必填数组**由系统从采集数据
+        # 生成,LLM 插不上手,所以此刻就能定论。不在这儿拦的话它们要走到
+        # 预备期才被 validate 拦下 —— 白打一次 LLM、白占一个当天配额名额
+        # (切片在预备期之前),而且素材是产品的固定属性,天天重来天天白烧。
+        gap = mp_mapper.material_gap(pt_spec.load_pt(r["product_type"]), p)
+        if gap:
+            counts["no_material"] += 1
+            reasons.append((r["rownum"], gap))
+            continue
+        qty = int(stock)
+        echo[3] = w_price               # 算出定价的行回显 J 列
+        if not ((p.get("attrs") or {}).get("weight")):
+            counts["no_weight"] += 1    # ShippingWeight 将按 1.0 磅兜底,亮出来
+        survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+    return _RowGate(survivors, reasons, dict(counts), data_echo)
+
+
 def run(params: dict) -> str:
     """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
@@ -1162,15 +1425,17 @@ def run(params: dict) -> str:
     # UPC 注入排在闸门链之前:领号是第 ⑦ 道闸,运营刚贴进表格的号必须这一轮就能用
     _sync_upc(execute, lines)
 
-    (inactive, today_used, listed, banned, unexplained, gate,
-     owned_asin, owned_brand) = _load_gate_state()
-    quota = _load_quota()
-    # 四个区间倍率列与维护链**同一份读取**(services/store_limits):上架价与
-    # 维护价两套口径会自己跟自己打架 —— 本链此前另抄了一份 _load_multipliers
-    mults = store_limits.price_multipliers()
-    lead_caps = store_limits.lead_day_caps()      # 按店「配送时长限制」
-    store_chs = store_targets.store_channels()   # 按店「配送限制」(没标=不限)
-    stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
+    # 读取次序与拆函数之前一字不差(闸门状态 → 配额 → 三张按店表 → 凭证)
+    ctx = _GateCtx(
+        state=_load_gate_state(),
+        quota=_load_quota(),
+        # 四个区间倍率列与维护链**同一份读取**(services/store_limits):上架价与
+        # 维护价两套口径会自己跟自己打架 —— 本链此前另抄了一份 _load_multipliers
+        mults=store_limits.price_multipliers(),
+        lead_caps=store_limits.lead_day_caps(),     # 按店「配送时长限制」
+        store_chs=store_targets.store_channels(),   # 按店「配送限制」(没标=不限)
+        stores_by_name={s["name"]: s for s in stores_svc.load_stores()})
+    stores_by_name = ctx.stores_by_name
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
@@ -1179,64 +1444,14 @@ def run(params: dict) -> str:
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
-    missing_warn: list[str] = []             # 不明消失史,放行但报警
-    candidates: list[dict] = []
 
-    by_store: dict[str, list[dict]] = {}
-    for r in pending:
-        by_store.setdefault(r["store"], []).append(r)
-
-    # 配额**不在这里切**(所有者批复 2026-08-12):先过全部闸门与数据过滤,
-    # 幸存者再按店切片——被淘汰行不占名额,配额以能成功提交的行计
-    allow_by_store: dict[str, int] = {}
-    for store_name, srows in sorted(by_store.items()):
-        if store_name not in stores_by_name:
-            lines.append(f"  {store_name}:凭证缺失,整店跳过")
-            continue
-        if store_name in inactive:
-            n["inactive"] += len(srows)
-            continue
-        allow_by_store[store_name] = max(0, quota.get(store_name, 999)
-                                         - today_used.get(store_name, 0))
-        # 规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
-        # (所有者定稿 2026-08-15「既不占用、也不拦别人」,2026-08-19 生产
-        # 实证补全行侧方向:此前它们上架仍被别店的在架/占用拦下)
-        unplanned = alloc_survey.is_excluded(store_name)
-        for r in srows:
-            if pt_spec.load_pt(r["product_type"]) is None:
-                n["no_spec"] += 1
-                reasons.append((r["rownum"], f"PT无spec:{r['product_type']}"))
-                continue
-            why = risk_gate.check(gate, r["product_type"], None)
-            if why:
-                n["risk"] += 1
-                reasons.append((r["rownum"], why))
-                continue
-            if not unplanned and r["asin"] in listed:
-                n["dedup"] += 1
-                reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
-                continue
-            holder = None if unplanned else owned_asin.get(r["asin"])
-            if holder and holder != store_name:
-                # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
-                # 被占着"正是所有者要的语义(§二);同店占用放行(本来就是它的)
-                n["claimed"] += 1
-                reasons.append((r["rownum"], f"产品占用:已属于 {holder}"))
-                continue
-            bl = banned.get(r["asin"])
-            if bl:
-                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
-                # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
-                # 2026-08-12:因产品问题删过的修好重上是正常经营)
-                n["blacklist"] += 1
-                reasons.append((r["rownum"],
-                                f"ASIN黑名单:{bl[1]}({bl[0]}类)"))
-                continue
-            if r["asin"] in unexplained:
-                # 只提示不拦截(所有者口径 2026-08-12):从目录消失过且我们
-                # 没提交过删/停 = 疑似平台强制下架,放行但必须在摘要里亮出来
-                missing_warn.append(r["asin"])
-            candidates.append(r)
+    sg = _gate_by_store(pending, ctx)
+    candidates, allow_by_store = sg.survivors, sg.allow_by_store
+    missing_warn = sg.missing_warn           # 不明消失史,放行但报警
+    reasons.extend(sg.reasons)
+    lines.extend(sg.lines)
+    for k, v in sg.counts.items():
+        n[k] += v
 
     # 上架必须用当天最新数据(所有者定稿 2026-08-19):**全部候选**先推采集
     # 刷新(不再只推缺数据的),等窗口 + 按批摄取之后才取数定价。日界批次名
@@ -1257,128 +1472,11 @@ def run(params: dict) -> str:
     if absent:
         gap_line = ((gap_line + ";") if gap_line else "  ") + \
             f"仍缺 {len(absent)} 个 ASIN 无数据(不写终态,次日续)"
-    survivors: list[dict] = []
-    data_echo: list[tuple[int, list]] = []   # 淘汰行也回显 C/H/I/J(旧行为)
-    for r in candidates:
-        # ⚠ **必须在这里取本行的店名**(2026-08-25 修):此前 `lead_cap` 那行
-        # 直接用了 `store_name`,而这个名字是上面那个按店循环
-        # (`for store_name, srows in sorted(by_store.items())`)**留下的残值**
-        # —— Python 的循环变量出了循环还活着,于是每一行读到的都是
-        # **店名排序最末那家店**的「配送时长限制」。多店同轮时:那家店填了 3 天
-        # ⇒ 全部店的货按 3 天拦;那家店没填 ⇒ 全部店回落全局 7 天,
-        # 逐店那一列**对其余每家店都静默失效**。d4bcaab(2026-08-17 走进生产,
-        # 把全局常量换成逐店列)引入,单店夹具照不出来。
-        store_name = r["store"]
-        p = products.get(r["asin"])
-        if p is None:
-            n["no_data"] += 1        # 数据源缺席:不写终态,恢复后自动续上
-            continue
-        # 拉到数据的行,无论最终去向都回显标题与价库——运营在表上直接
-        # 看到"为什么这行没上"的数字(旧系统对 prep_fails 同款)
-        echo = [(p.get("title") or "")[:190], p.get("price") or "",
-                p.get("stock") if p.get("stock") is not None else "", ""]
-        data_echo.append((r["rownum"], echo))
-        # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
-        #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
-        #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
-        #   无真值 + 其余状态 → 不知道有没有货,不上架
-        stock = p.get("stock")
-        if stock is None:
-            if p.get("stock_state") == "in_stock":
-                stock = amz_source.IN_STOCK_QTY
-                n["stock_assumed"] += 1
-            else:
-                n["filtered"] += 1
-                reasons.append((r["rownum"],
-                                f"库存未知(状态 {p.get('stock_state') or '缺失'})"))
-                continue
-        if stock < amz_source.MIN_INVENTORY:
-            n["filtered"] += 1
-            reasons.append((r["rownum"], f"库存不足:{stock}"))
-            continue
-        # 品牌与制造商两个字段都查(所有者批复 2026-08-12):brand=Generic
-        # 而真品牌在 manufacturer 是亚马逊常态,只查 brand 黑名单必漏
-        why = risk_gate.check(gate, None, p.get("brand"), p.get("manufacturer"))
-        if why:
-            n["risk"] += 1
-            reasons.append((r["rownum"], why))
-            continue
-        # 品牌占用闸(A1):品牌排他 ⇒ 同品牌只能在一家店。放在这里而不是
-        # 前面那批闸,是因为品牌要等 amz_source 取回产品数据才知道。
-        # 键与占用侧同一套归一算法(brand_key 唯一出处),否则大小写差一点
-        # 就漏拦;真·无品牌(两字段皆占位符)不参与品牌排他,只受产品占用管
-        bkey = brand_key.brand_key(p.get("brand"), p.get("manufacturer"))
-        # 规划外店(谭总系)不做品牌归属:上架不受品牌占用管(也不占,
-        # load 侧已剔;所有者定稿 2026-08-15,2026-08-19 补全行侧)
-        bholder = (owned_brand.get(bkey)
-                   if bkey and not alloc_survey.is_excluded(r["store"])
-                   else None)
-        if bholder and bholder != r["store"]:
-            n["claimed"] += 1
-            reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))
-            continue
-        # 配送方式决定用哪套区间(FBA 0-30/30-1000 vs FBM 15-80/80-1000)。
-        # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档
-        # 就是拿错倍率定价;宁可这行等下一轮采到 is_fba 再上。
-        channel = p.get("channel")
-        if channel not in pricing.PRICE_BANDS:
-            n["filtered"] += 1
-            reasons.append((r["rownum"], "配送方式(FBA/FBM)未采到,不定价"))
-            continue
-        # 店铺渠道闸(所有者定稿 2026-08-25:「读取配送限制列,我会在其中标记
-        # fba/fbm,没标就都能上」)。放在这里是因为**产品渠道上一行才刚判明**,
-        # 而判定本身走 store_targets 唯一谓词(分配/上架/维护/对账共用一处)。
-        # 两条空值口径都在谓词里,别在这儿另写:店没标 → 放行;产品渠道不是
-        # 另一个已知值 → 放行(采不到不算不符,那一档上一行已经拦掉了)。
-        # ⚠ 与分配侧的**未填口径相反**且都对:分配未填=不接自由流(没渠道就
-        # 过不了硬闸),上架未填=不限制(照搬分配会把没配置的店整店废掉)。
-        want_ch = store_chs.get(store_name)
-        if store_targets.channel_conflict(want_ch, channel):
-            n["channel"] += 1
-            reasons.append((r["rownum"],
-                            f"本店只做 {want_ch},该品是 {channel}"))
-            continue
-        # 定价输入是**落地价 = 单价 + 运费**(所有者定稿 2026-08-10):采购真正
-        # 付的是单价加运费。运费没采到(采集侧 N/A)一律不上架——与"配送方式
-        # 未知不定价"同一个道理,当 0 定出来的价偏低,越贵的运费亏得越多
-        if p.get("shipping") is None:
-            n["filtered"] += 1
-            reasons.append((r["rownum"], "运费未采到,落地价算不出来,不定价"))
-            continue
-        w_price = pricing.walmart_price(channel, p.get("price"),
-                                        mults.get(r["store"], {}),
-                                        p.get("shipping"))
-        if w_price is None:
-            n["filtered"] += 1
-            reasons.append((r["rownum"],
-                            f"该区间倍率未配置:落地价 "
-                            f"{pricing.landed_price(p.get('price'), p.get('shipping'))}"))
-            continue
-        # 配送时长超限 ⇒ **不上架**(所有者定稿 2026-08-16 走进生产;
-        # 此前是"上架但库存写 0")。不上架就不占 UPC、不占配额,比上一个
-        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 8 天。
-        # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了。
-        lead_cap = store_limits.cap_for(lead_caps, store_name,
-                                        amz_source.MAX_LEAD_DAYS)
-        if store_limits.over_lead_cap(p.get("lead_days"), lead_cap):
-            n["lead_days"] += 1
-            reasons.append((r["rownum"],
-                            f"配送 {p.get('lead_days')} 天 > 本店上限 {lead_cap} 天"))
-            continue
-        # 素材闸(2026-08-22):卖点/副图这两个**必填数组**由系统从采集数据
-        # 生成,LLM 插不上手,所以此刻就能定论。不在这儿拦的话它们要走到
-        # 预备期才被 validate 拦下 —— 白打一次 LLM、白占一个当天配额名额
-        # (切片在预备期之前),而且素材是产品的固定属性,天天重来天天白烧。
-        gap = mp_mapper.material_gap(pt_spec.load_pt(r["product_type"]), p)
-        if gap:
-            n["no_material"] += 1
-            reasons.append((r["rownum"], gap))
-            continue
-        qty = int(stock)
-        echo[3] = w_price               # 算出定价的行回显 J 列
-        if not ((p.get("attrs") or {}).get("weight")):
-            n["no_weight"] += 1         # ShippingWeight 将按 1.0 磅兜底,亮出来
-        survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
+    rg = _gate_by_row(candidates, products, ctx)
+    survivors, data_echo = rg.survivors, rg.data_echo
+    reasons.extend(rg.reasons)
+    for k, v in rg.counts.items():
+        n[k] += v
 
     # 配额切片(在全部过滤**之后**):幸存者按店取额度内前 N 行;
     # 超额行不写终态、不算失败,次日配额刷新自动续上

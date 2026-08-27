@@ -1023,7 +1023,7 @@ Bicycle Spokes / Fishing Hooks / Aquarium Decor / Cheese Making Supplies,
 | 超过 7 天 | **0 件** | 1,059 件(17.6%) |
 
 所有者照这份摘要去开类目,**一件也救不回来**。定向流那边 2026-08-16 已按
-真实原因拆过(`alloc_plan._fit_to_store` 的 docstring),自由流漏了。
+真实原因拆过(`alloc_engine._fit_to_store` 的 docstring,2026-08-22 主序重排时迁入),自由流漏了。
 
 修法:`_gate` 拆成 `_blocker`(返回**第一道拦下它的闸名**),`_why` 跨店取
 **走得最远**的那道 —— 只要有一家店把这组放到了更靠后的闸,就归那一道。

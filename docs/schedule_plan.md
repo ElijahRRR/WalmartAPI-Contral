@@ -8,7 +8,7 @@
 >
 > | | 数量 | 现状 |
 > |---|---|---|
-> | 电脑 launchd | 2 条 | `feed_poll`(每半小时)、`order_chain`(每小时 :20)—— 已装载,首跑 exit 0 |
+> | 电脑 launchd | 3 条 | `feed_poll`(每半小时)、`order_chain`(每小时 :20)—— 已装载,首跑 exit 0;`product_ingest`(每小时 :50,2026-08-19 追加) |
 > | 智能体定时任务 | 9 条 | 每日/每周那批 —— 9/9 `ACTIVE` |
 >
 > 验收明细(首跑数据、两个设计内的尾巴)见 `docs/production_cutover.md` §九。
@@ -24,7 +24,7 @@
 | 1 | 台湾时间 | ✅ **不用换算**:台北与上海同为 UTC+8 且都无夏令时,代码里的 `CN_TZ`(Asia/Shanghai)与机器本地时间**日界一致**。时间表原样可用 |
 | 2 | 不关机 | ✅ 睡眠补跑那条坑作废;`StartCalendarInterval` 直接可用 |
 | 3 | 虚拟环境跑 | ⚠ 仍需要**那个 venv 的 python 绝对路径**(见第六节) |
-| 4 | `product_audit` / `brand_scrape` 不进调度 | ✅ 划入手动 |
+| 4 | `product_audit` / `brand_scrape` 不进调度 | ⚠ **仅 brand_scrape 仍成立**:`product_audit` 已于 2026-08-17 定稿进调度两处 —— `audit_sheet` 18:10(`-p from_sheet=1`)与 `product_chain` 13:00 里的 L0 一步(`mode=online`/`stages=L0`/`limit=1000000`) |
 | 5 | 「等待会占锁吗?什么锁」 | 见第五节(会,`<DATA_ROOT>/locks/order_audit.lock`);结论:**保持默认 `wait=1`**,不写 `wait=0` |
 | 6 | 采集器 3000/分钟扛得住 | ✅ **改变了 v1 的结论**:全量重推约 50 分钟采完,产品线**能一次性做完**(见第一节) |
 | 7 | 没有 hermes,现在是 GPT 调度;每小时订单/审核是 cron;feed 轮询也照此 | ~~✅ 全部走 launchd/cron,一律不接 GPT~~ **2026-08-16 所有者改口径**:高频链(`feed_poll` + 订单链)进 launchd,**其余七条用 skill 形式给智能体注册成定时任务**(见 §9.1)。⚠ `legacy_schedules.md` A 表写的"hermes 平台"已过时,停旧取证时按 GPT 侧的实际注册表核对 |
@@ -47,7 +47,7 @@ catalog_sync → product_refresh → (等采完) → product_ingest
              → problem_scan → problem_product_cleanup
 ```
 
-### ⚠ 但有个前提:`product_refresh` 的 `-p wait=1` **根本没实现**
+### ⚠ 但有个前提:`product_refresh` 的 `-p wait=1` **根本没实现**(⚠ 2026-08-16 已补,见第七节工作项 A;以下是当时的记录)
 
 它的用法行写着 `-p wait=1  # 真推后阻塞等采完(默认不等)`,而 `run()` 里
 **从头到尾没有读过 `params["wait"]`** —— 传了等于没传,推完就返回。
@@ -63,21 +63,22 @@ catalog_sync → product_refresh → (等采完) → product_ingest
 ### 线 1 · 产品维护线 —— 每日一次,一条链跑完
 
 ```
-python cli.py catalog_sync product_refresh product_ingest \
-              maintenance_scan maintenance problem_scan problem_product_cleanup \
-              -p product_refresh:wait=1
+python cli.py catalog_sync sources_backfill product_refresh product_audit \
+              maintenance_scan problem_scan maintenance problem_product_cleanup \
+              -p product_refresh:wait=1 -p product_audit:mode=online \
+              -p product_audit:stages=L0 -p product_audit:limit=1000000
 ```
 
 | 步 | 干什么 | 预估时长 |
 |---|---|---|
 | `catalog_sync` | 48 店全量扫在架商品 + 库存 | ? 待实测 |
 | `product_refresh` | 推 ~15 万 ASIN 给采集器,**等采完** | ~50 分钟 |
-| `product_ingest` | 把采集产出摄进产品中心 | ? |
+| ~~`product_ingest`~~ | **2026-08-19 移出本链**:`product_refresh -p wait=1` 等采完后就地按批摄取(批次端点,无锁);全局对齐归单独长驻的 `product_ingest`(launchd 每小时 :50)。本链另加了 `sources_backfill`(紧跟 catalog_sync)与 `product_audit`(紧排 problem_scan 前) | — |
 | `maintenance_scan` | 定性,落建议行 | ? |
 | `maintenance` | 提交 feed(改标题/价/库存/删除) | ? |
 | `problem_scan` → `problem_product_cleanup` | 问题商品链 | ? |
 
-整条估计 **2 小时以上**。建议 **09:00 起跑**(日报 06:40 之后,避开订单链整点)。
+整条估计 **2 小时以上**。~~建议 09:00 起跑~~ —— **定稿 13:00 起跑**(约 15:00 收),后面还压着 blacklist 15:00 → audit_sheet 18:10 → list_new 20:00 这条硬次序。
 
 ⚠ 一条链里前一步失败就停后面的(cli 串联语义)。对这条链是**对的**:
 `catalog_sync` 没跑成,后面的判据就是拿隔夜现值去比,会对已下架 SKU 建议改价改
@@ -90,8 +91,8 @@ python cli.py catalog_sync product_refresh product_ingest \
 | 频率 | 命令 |
 |---|---|
 | **每小时 :20** | `order_sync order_audit returns_sync` |
-| **每日 07:30** | `perf_problems` |
-| **双周三 08:00** | `settlement_sync`(下一次 2026-08-26) |
+| **每日 07:30** | `perf_problems order_asin_normalize -p order_asin_normalize:apply=1`(调度名 `order_daily`) |
+| **每周三 08:00** | `settlement_sync`(账期是双周节奏,但 launchd/cron 表达不了「双周」;已入库账期永不重拉,没有新账期那轮自然空转) |
 
 ⚠ `returns_sync` 每小时跑是所有者定的(「每小时的订单拉取、订单审核、售后订单
 拉取」)。它是 **45 天窗口全量重拉 × 48 店**,比 `order_sync` 更重。
@@ -104,7 +105,7 @@ python cli.py catalog_sync product_refresh product_ingest \
 ### 线 3 · KPI 日报 —— 每日一次
 
 ```
-06:40  python cli.py daily_report
+06:40  python cli.py catalog_sync daily_report -p catalog_sync:strict=1
 ```
 
 KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 真发日报。
@@ -116,10 +117,10 @@ KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 
 ### 线 4 · 黑名单中心 —— 每日一次
 
 ```
-02:30  python cli.py risk_sync blacklist_push
+15:00  python cli.py risk_sync blacklist_push
 ```
 
-排在所有上架/审核之前,当天的黑名单是新鲜的。
+排在 `product_chain`(13:00)之后、审核(18:10)与上架(20:00)之前:当天 `problem_scan` 产出的黑名单 ASIN 与品牌要先投影出去,而审核 Phase0 与上架闸读的是 PG——同步没跑就是拿昨天的黑名单在放行。
 
 ### 基础设施(不属四条线,但必须有)
 
@@ -127,6 +128,7 @@ KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 
 |---|---|---|
 | 每 30 分 | `feed_poll` | 所有者:与订单链同款,cron 定时,不接 GPT |
 | 每日 02:00 | `backup` | pg_dump,离峰 |
+| 每小时 :50 | `product_ingest -p lock_wait=900` | 全局增量泵(2026-08-19 起单独长驻 launchd):本地产品中心 ↔ 采集器数据库对齐,各链按批自取之外的全部增量走这条 |
 
 ## 三、其余四条(所有者 2026-08-16 批复已定)
 
@@ -235,8 +237,8 @@ settlement_sync   → 写对账表
    就地摄取改走采集侧批次端点(`export_batch_records`,批内游标每次从 0
    拉到底,幂等靠 snapshots.source_id),只拉本轮自己推的那几批,
    不碰全局游标 —— `order_audit` 与 `product_ingest` 之间的锁交互消失,
-   product_chain 13:00 的 `product_ingest`(带 `lock_wait=900`)也不会
-   再等到 order_chain 手里的锁。
+   每小时 :50 那条 `product_ingest`(带 `lock_wait=900`)也不会再等到
+   order_chain 手里的锁 —— 它 2026-08-19 起单独长驻,已不在 product_chain 里。
 
 **结论:保持默认 `wait=1`**(v1 的建议是 `wait=0`,现在收回)。理由:20 分钟
 远小于一小时,一条命令出真结论,而 `wait=0` 会让结论恒定滞后一轮 ——
@@ -374,7 +376,7 @@ launchd 的 stdout/stderr 里。没有它,故障表现是"这条链每天什么�
 
 | runner | 哪些 | 为什么 |
 |---|---|---|
-| `launchd` | `feed_poll`(每半小时)、`order_chain`(每小时:销售订单/订单审核/售后订单) | 高频的东西写死在电脑上最稳,不依赖任何智能体在不在线 |
+| `launchd` | `feed_poll`(每半小时)、`order_chain`(每小时 :20:销售订单/订单审核/售后订单)、`product_ingest`(每小时 :50,2026-08-19 追加) | 高频的东西写死在电脑上最稳,不依赖任何智能体在不在线 |
 | `gpt` | 其余每日/每周一次的九条 | 所有者原话:「前期稳定,也方便我维护和调整,以后换个智能体也能用」。改个时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、能当场判断要不要重跑的东西**在旁边 |
 
 ⚠ `runner` 只决定**谁按秒表**,不决定跑什么:两边都是同一条 `python cli.py …`,
@@ -414,14 +416,13 @@ cd /Users/nextderboy/Projects/WalmartAPI-Contral
 |---|---|---|---|---|
 | **一(只读/低危)** | `backup`、`risk_sync blacklist_push` | 智能体 | 无 | `ops.runs` 的时长与失败率 |
 | | `feed_poll` | launchd | 无 | 同上 |
-| **二(订单 + 日报)** | 每小时订单链 | launchd | 旧订单同步(GPT 侧 13:30 + cron 每时:15,**两条同停**) | 订单列对拍差异 8 店是否收敛;**影刀有没有数据** |
+| **二(订单 + 日报)** | 每小时订单链、`product_ingest`(每小时 :50,2026-08-19 追加) | launchd | 旧订单同步(GPT 侧 13:30 + cron 每时:15,**两条同停**) | 订单列对拍差异 8 店是否收敛;**影刀有没有数据** |
 | | `perf_problems`、`settlement_sync`、`daily_report` | 智能体 | 旧 KPI(08:00 + 14:00) | 同上 |
-| **三(破坏性)** | 产品线整条、`product_clear` | 智能体 | 旧维护 12:00、旧下架 15:00、旧 cleanup 0/6/12/18、旧 retire 23:30 | 每条**先手动 `--dry-run` 人眼确认**再注册 |
+| **三(破坏性)** | 产品线整条、`product_clear`、`audit_sheet` 18:10、`list_new` 20:00 | 智能体 | 旧维护 12:00、旧下架 15:00、旧 cleanup 0/6/12/18、旧 retire 23:30 | 每条**先手动 `--dry-run` 人眼确认**再注册 |
 
-批一/批二挂 launchd 的那两条走 `launchd_install -p batch=N`。
+批一/批二挂 launchd 的那三条(批一 `feed_poll`;批二 `order_chain`、`product_ingest`)走 `launchd_install -p batch=N`。
 
-⚠ 批三的 `maintenance_scan -p preview=1` 要重点看「标题不匹配」那类删除的条数
-—— 五条删除判据里唯一没有生产数据背书的一条。
+⚠ 批三的 `maintenance_scan -p preview=1` 要重点看删除名单的条数。~~「标题不匹配」那一类~~ **2026-08-19 起已停闸**(`maintenance_intents.TITLE_MISMATCH_DELETE = False`:08-17/18 两轮该原因的删除建议超两千条、占删除九成,删除不可逆故先停闸观察);停闸期这批行照常改价/改标题/改库存(所有者 2026-08-20:停闸不冻结),压制条数单独 warning 计数。
 
 ### 10.1 智能体那九条:一次性注册(所有者定稿 2026-08-17)
 
@@ -445,7 +446,7 @@ cd /Users/nextderboy/Projects/WalmartAPI-Contral
 | `list_new` 20:00 / `audit_sheet` 18:10 | (无 —— 所有者 2026-08-17 判定旧上架/审核 worker 不写表,留着当备用) | — |
 | `backup` 02:00 / `blacklist` 15:00 / `settlement` 周三 08:00 | 无 | — |
 
-⚠ **`walmart-daily-cleanup`(0/6/12/18:04)的调度器至今没定位**(A 表就记着这一条)。
+⚠ ~~**`walmart-daily-cleanup`(0/6/12/18:04)的调度器至今没定位**(A 表就记着这一条)~~ —— **2026-08-17 已定位并停掉**(它也在 gpt 侧,随旧任务一并停;权威记录见 `docs/backlog.md` 第六节「旧调度未盘清」)。下面这段是当时备的两条路,结果两条都没走:`product_chain` 最后一步 `problem_product_cleanup` 原样留着。
 停不掉它 ⇒ `product_chain` 最后一步 `problem_product_cleanup` 会与它并跑。
 两条路:先把它找出来停掉,或者**先从 `product_chain` 里摘掉最后那一步**
 (改 `registry/schedule.py` 后重新 `skill_export`),等定位到了再加回去。

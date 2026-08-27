@@ -147,7 +147,7 @@ def test_plan_csv_lists_every_product_not_every_group(tmp_path, monkeypatch):
 
     只写组的话,一个 40 件的组在表上就是一行,没人知道具体上哪 40 个。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     items = [_c("B0AAAA0001", "acme", 90.0), _c("B0AAAA0002", "acme", 80.0)]
     p, n = wf._write_plan([{"group": _grp("acme", "acme", items), "store": "A",
                             "layer": 1, "tier": 1}])
@@ -163,7 +163,7 @@ def test_plan_table_holds_only_what_you_act_on(tmp_path, monkeypatch):
     45,815 行是排队与淘汰 —— 那张表没法用,而所有者第一眼看到的就是那个总数。
     摘要里两个数都报,所以不存在"把卡住的货藏起来"的问题。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     ok = _grp("acme", "acme", [_c("B0AAAA0001", "acme", 90.0)])
     g = _grp("zeta", "zeta", [_c("B0BBBB0001", "zeta", 50.0)])
     p_plan, n_plan = wf._write_plan([{"group": ok, "store": "A", "layer": 1,
@@ -230,7 +230,7 @@ def _wire(monkeypatch, pool, held_brand=None, held_prod=None, claimed=None):
 
 
 def test_run_dry_run_writes_nothing_and_reports_the_funnel(monkeypatch, tmp_path):
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 90.0 - i) for i in range(20)]
     landed = []
     _wire(monkeypatch, pool, claimed=landed)
@@ -241,7 +241,7 @@ def test_run_dry_run_writes_nothing_and_reports_the_funnel(monkeypatch, tmp_path
 
 
 def test_run_execute_lands_claims(monkeypatch, tmp_path):
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 90.0 - i) for i in range(20)]
     landed = []
     _wire(monkeypatch, pool, claimed=landed)
@@ -274,7 +274,7 @@ def test_quota_is_an_integer_not_a_float(monkeypatch, tmp_path):
     成因是 `-(-a // b)` 这个整数向上取整的写法对 float 是地板除 —— 看起来
     对,类型悄悄变了。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 90.0 - i) for i in range(20)]
     _wire(monkeypatch, pool, claimed=[])
     seen = {}
@@ -291,7 +291,7 @@ def test_funnel_does_not_divide_group_counts_by_product_counts(monkeypatch, tmp_
     60 个产品组成 20 个组时,把 20÷60 报成 33.3% 读起来像丢了三分之二的货 ——
     其实一件没丢(每组 3 件)。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     # 分数全在淘汰线以上,好让漏斗只剩"组队"这一处收窄
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 3}", 95.0 - i * 0.7) for i in range(60)]
     _wire(monkeypatch, pool, claimed=[])
@@ -336,7 +336,7 @@ def test_capacity_is_never_exceeded_even_by_directed_groups(monkeypatch, tmp_pat
     成因是定向流当时走的是**另一条流水线**、自己判 `size <= room`,逐组判
     加起来撑爆四倍。合成一副牌之后容量记账只有引擎一处,天然累计。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0AAAA{i:04d}", f"brand{i // 5}", 80.0) for i in range(50)]
     held = {f"brand{i}": "A" for i in range(10)}
     _wire_directed(monkeypatch, pool, held, room=20)
@@ -353,7 +353,7 @@ def test_directed_and_free_compete_in_one_deck_by_score(monkeypatch, tmp_path):
     分成两个阶段的实测后果:两边各有一套配额与容量记账,谁也不知道对方吃了
     多少 —— 定向流一口吃光批量、自由流 0。合成一副之后按组分排,谁分高谁先。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = ([_c("B0DIR00001", "held0", 50.0)]          # 定向流分低
             + [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i) for i in range(5)])
     _wire_directed(monkeypatch, pool, {"held0": "A"}, room=3)
@@ -383,7 +383,7 @@ def test_batch_is_an_optional_safety_valve_not_the_model(monkeypatch, tmp_path):
     所有者定稿 2026-08-16:"限制 3000 设置的也很奇怪…这个限制我甚至就认为
     不应该有" —— 每家店能接多少由容量与缺口算出来,默认不设总量上限。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 90.0) for i in range(500)]
     _wire_directed(monkeypatch, pool, {}, room=400)
     free = wf.run({"execute": False})
@@ -400,7 +400,7 @@ def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
     实测 2026-08-16:自由流额度为 0 那一跑,63,418 组一件没发,而它们既不在
     方案表也不在未入选表 —— 所有者哪儿都查不到,分不清是"排队中"还是"被闸挡了"。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
@@ -412,7 +412,7 @@ def test_a_top_scoring_group_below_the_cut_is_findable(monkeypatch, tmp_path):
 
 def test_the_cut_score_is_reported_so_queued_is_distinguishable(monkeypatch, tmp_path):
     """切口分数要报出来:低于它 = 排队中,不是被闸挡了。两者处置不同。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(200)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
     out = wf.run({"batch": 10, "execute": False})
@@ -421,7 +421,7 @@ def test_the_cut_score_is_reported_so_queued_is_distinguishable(monkeypatch, tmp
 
 def test_queue_sample_is_capped_and_says_so(monkeypatch, tmp_path):
     """截断必须说破 —— 静默截断读起来像"就这么多了"。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     monkeypatch.setattr(wf, "QUEUE_SAMPLE", 5)
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.01) for i in range(100)]
     _wire_directed(monkeypatch, pool, {}, room=100_000)
@@ -451,7 +451,7 @@ def test_directed_blocker_is_attributed_to_the_gate_that_actually_blocked():
 
 def test_lead_blocked_groups_get_their_own_summary_line(monkeypatch, tmp_path):
     """货期挡下的要单列一行 —— 「给该店开这个大类」对它们完全无效。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     # ⚠ B 是**必需的**:池口按各店「配送时长限制」的并集筛,只有 A 的话 30 天的
     # 货连池子都进不去(而那正是所有者要的 —— 没人要的货不该进来)。
     # B 要**显式填 40**:2026-08-21 起未填不再是"不限"而是回落 7 天。
@@ -538,7 +538,7 @@ def test_out_of_band_stores_get_their_layer_histogram_printed(monkeypatch, tmp_p
     门槛),报告里却查不出货来自哪几层 —— 只能手工翻方案表。层分布摊开之后,
     "全堆在末尾几层"就直接指向"这家店过不了前面几层的闸"。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     # A 收 FBA、B 收 FBM;高分的全是 FBA ⇒ B 只能从靠后的层拿货,比值必然越界
     pool = ([_c(f"B0FBA{i:05d}", f"fa{i}", 95.0 - i * 0.1, ch="FBA")
              for i in range(300)]
@@ -580,7 +580,7 @@ def test_all_dashes_says_whether_the_top_layer_had_any_free_flow(
     其中好几家的自由流远超门槛(82杨乾良 587 件 vs 门槛 386)—— 照 ① 去读
     会以为"量小而已,没事"。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     # 高分的**每个都是独立的已占品牌** —— 牌堆顶部整整几层全是定向流,
     # 自由流只能从下面拿。合成一个品牌不行:那只是一张牌,占不满 L1
     pool = ([_c(f"B0OWNED{i:04d}", f"own{i}", 95.0 - i * 0.01) for i in range(300)]
@@ -602,7 +602,7 @@ def test_a_full_store_is_diagnosed_as_full_not_as_missing_a_category(
     的那些组走的是另一条路(进牌堆 → 容量塞不下 → "等下架腾位"),
     同一个原因两种说法。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FULL{i:04d}", "acme", 90.0 - i, cat="Garden & Patio") for i in range(5)]
     # 品牌归 A,而 A 只做 Home 且已经装满(在线 5000 = 上限 5000)。
     # ⚠ B 必须做 Hardlines,否则这批货在**池口**就因"没有店要这个品类"出局,
@@ -635,7 +635,7 @@ def test_no_low_scorer_can_ride_along_any_more(monkeypatch, tmp_path):
 
     这条同时也是「搭车上架」那一节被撤掉的理由 —— 报一个恒为 0 的数是噪声。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = ([_c("B0HIGH0001", "acme", 95.0)]
             + [_c(f"B0LOW{i:05d}", "acme", 42.0) for i in range(3)]
             + [_c(f"B0MID{i:05d}", f"mid{i}", 50.0 - i * 0.01) for i in range(60)])
@@ -656,7 +656,7 @@ def test_report_gives_the_real_entry_score_not_just_the_candidate_cut(
     就填满了 —— 只报切口会让人以为 43 分的货都进来了,差着十几分。所有者按
     "每层 23,000 个、要选两万多个"推算分配行为时,用的就是那个错前提。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = [_c(f"B0FRE{i:05d}", f"new{i}", 95.0 - i * 0.1) for i in range(500)]
     _wire_directed(monkeypatch, pool, {}, room=10)      # 只装得下 10 件
     out = wf.run({"execute": False})
@@ -708,7 +708,7 @@ def test_goods_beyond_every_store_condition_leave_at_the_funnel(monkeypatch,
     "配置一改就能救",而这批要的是**开一家新店/新渠道**。生产实测 43,573 件
     FBM 就是这么混进 50,063 件"卡住的货"里,把真正要动手的 6,490 件 FBA 淹掉的。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = ([_c(f"B0OK00{i:04d}", f"ok{i}", 90.0 - i * 0.1) for i in range(20)]
             # 分更高,但三条各自出局:渠道没人做 / 比最宽的店还慢 / 品类没人做
             + [_c(f"B0FBM{i:05d}", f"fm{i}", 95.0 - i * 0.1, ch="FBM")
@@ -758,7 +758,7 @@ def test_the_take_ledger_accounts_for_every_product(monkeypatch, tmp_path):
     ⚠ 这条对账一定要**能对上**。对不上就说明有一笔货在实现里凭空消失了 ——
     那种 bug 从任何单项数字上都看不出来,只有做减法才会露头。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = ([_c(f"B0OK{i:06d}", f"ok{i}", 90.0 - i * 0.1) for i in range(30)]
             + [_c(f"B0NO{i:06d}", f"no{i}", 80.0 - i * 0.1, cat="Animals")
                for i in range(60)])
@@ -771,7 +771,7 @@ def test_the_take_ledger_accounts_for_every_product(monkeypatch, tmp_path):
 
 def test_unplaced_is_reported_in_items_not_only_groups(monkeypatch, tmp_path):
     """未发出要跟「取货」「实发」同单位(件),否则三个数没法互相对。"""
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     pool = ([_c(f"B0OK{i:06d}", f"ok{i}", 90.0 - i * 0.1) for i in range(10)]
             + [_c(f"B0NO{i:06d}", f"no{i}", 80.0 - i * 0.1, cat="Animals")
                for i in range(60)])
@@ -788,7 +788,7 @@ def test_hitting_the_round_guard_is_shouted_not_swallowed(monkeypatch, tmp_path)
     静默截断在这里最危险:报告会说"未发出 N 组",读起来像"闸挡的",而真相是
     我们**根本没往下取**。所有者会去改配置,该做的却是提高护栏或缩小配额。
     """
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     # ⚠ 不能 monkeypatch `ae.MAX_ROUNDS`:它是 `deal` 的**默认参数**,def 时就
     #   绑好了,改模块常量对已定义的函数无效(改源码有效,打补丁无效)。
     #   这里包一层把 max_rounds 显式传进去,走的仍是真实渲染路径

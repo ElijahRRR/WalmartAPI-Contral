@@ -33,10 +33,10 @@ cron(每天 15:00),新旧并跑 = 重复删除。
 import logging
 from datetime import datetime
 
-from api import _client, feeds, feishu
-from registry import db, resources
-from services import clear_sheet, feed_track, kpi, product_events, store_retry, \
-    stores as stores_svc
+from api import _client, feeds
+from registry import db
+from services import clear_sheet, feed_track, kpi, product_events, \
+    store_limits, store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -89,30 +89,6 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
     return updates, lines
 
 
-def _load_limits(default: int) -> tuple[dict[str, int], str]:
-    """输入:默认上限 → 输出:({店铺: 单日下架上限}, 摘要说明)。
-
-    读上下架限额表「下架限制」列;未登记时返回空表(全店走默认)。
-    """
-    t = resources.RETIRE_LIMITS
-    f = t.fields
-    try:
-        recs = feishu.list_records(t, field_names=[f.store, f.max_daily_retire])
-    except LookupError:
-        return {}, f"限额表未登记,全店统一上限 {default}"
-    limits: dict[str, int] = {}
-    for rec in recs:
-        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
-        try:
-            v = int(float(feishu._plain_text(rec["fields"].get(f.max_daily_retire))
-                          or 0))
-        except ValueError:
-            v = 0
-        if name and v > 0:
-            limits[name] = v
-    return limits, f"限额表生效({len(limits)} 店)"
-
-
 def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 default_limit: int, execute: bool) -> tuple[list, list[str]]:
     """待提交行 → 按 店铺×动作 分组提交(受单店单日上限),回写 E~G。"""
@@ -154,6 +130,8 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
             limit = default_limit
         return limit
 
+    partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
+
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
         """输入:店铺 + 该店待提交行 → 输出:(店铺名, updates, lines, 提交数, 延后数)。
 
@@ -188,10 +166,10 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 continue
             results = feeds.submit_feed(stores_by_name[store_name], feed_type,
                                         skus, workflow="product_clear")
-            i = 0
-            for res in results:
-                slice_rows = arows[i:i + res["count"]]
-                i += res["count"]
+            # 逐切片结果与本店待提交行对位:游标走法是 submit_feed 返回契约的
+            # 机械后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局
+            # 落到别人行上,而且不报错)
+            for res, slice_rows in feeds.iter_result_slices(results, arows):
                 if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                     submitted_s += len(slice_rows)
                     for r in slice_rows:
@@ -229,7 +207,6 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
         to_retry: list[tuple] = []
-        partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
             futs = {pool.submit(_one_store, n, s): (n, s) for n, s in todo}
@@ -277,8 +254,13 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
             deferred += defr
 
     if good or bad:
+        # 本轮行数:真跑报实际提交数,空跑按**各店自己的上限**截断后求和。
+        # ⚠ `_limit_of` 带"不在限额表"告警副作用,所以只在空跑分支算这一次
+        # (条件表达式短路,真跑那边一次都不多调)
+        planned = submitted if execute else min(
+            len(good), sum(min(len(v), _limit_of(k)) for k, v in by_store.items()))
         lines.append(f"提交:有效待提交 {len(good)} 行,本轮"
-                     f"{'提交' if execute else '将提交'} {submitted if execute else min(len(good), sum(min(len(v), _limit_of(k)) for k, v in by_store.items()))} 行,"
+                     f"{'提交' if execute else '将提交'} {planned} 行,"
                      f"超限延后 {deferred} 行,无效行 {len(bad)}")
     return updates, lines
 
@@ -297,7 +279,12 @@ def run(params: dict) -> str:
 
     # 全量加载凭证(49 店,量小):店名对不上时诊断需要完整对照样本
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
-    limits, limits_note = _load_limits(default_limit)
+    # 「下架限制」列与 problem_product_cleanup **同一份读取**
+    # (services/store_limits):两个破坏类执行件读同一列走两条路,改一处漏
+    # 一处的那份会静默读空、全店回落默认值且不报错。摘要文案留在调用点
+    limits = store_limits.retire_caps()
+    limits_note = (f"限额表生效({len(limits)} 店)" if limits
+                   else f"限额表未登记,全店统一上限 {default_limit}")
 
     updates_a, lines_a = _poll_feeds(rows, stores_by_name, execute)
     updates_b, lines_b = _submit_new(rows, stores_by_name, limits,

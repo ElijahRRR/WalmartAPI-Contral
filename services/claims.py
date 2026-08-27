@@ -60,11 +60,6 @@ SELECT kind, claim_key, store FROM catalog.claims
  ORDER BY kind, claim_key
 """
 
-_BY_STORE = """
-SELECT store, kind, count(*) FROM catalog.claims
-WHERE status = 'active' GROUP BY store, kind ORDER BY store, kind
-"""
-
 
 def _row(kind, key, store, source, *, walmart_pt=None, pt_source=None,
          audit_version=None, note=None) -> dict:
@@ -115,15 +110,6 @@ def claim_many(conn, rows: list[dict]) -> tuple[int, list[tuple]]:
     return ok, conflicts
 
 
-def owner_of(conn, kind: str, keys: list[str]) -> dict[str, str]:
-    """输入:连接 + 类型 + 键列表 → 输出:{键: 占用店}(未被占的键不出现)。"""
-    if not keys:
-        return {}
-    with conn.cursor() as cur:
-        cur.execute(_OWNER, (kind, list(keys)))
-        return dict(cur.fetchall())
-
-
 def load_active(conn, kind: str) -> dict[str, str]:
     """输入:连接 + 类型 → 输出:全量 {键: 占用店}(闸门每轮加载一次,逐行零查询)。"""
     with conn.cursor() as cur:
@@ -149,13 +135,3 @@ def release(conn, *, reason: str, store=None, kind=None, key=None) -> list[tuple
         cur.execute(_RELEASE, {"store": store, "kind": kind, "key": key,
                                "reason": reason})
         return cur.fetchall()
-
-
-def counts_by_store(conn) -> dict[str, dict[str, int]]:
-    """输入:连接 → 输出:{店铺: {brand: n, product: n}}(审计与摘要用)。"""
-    out: dict[str, dict[str, int]] = {}
-    with conn.cursor() as cur:
-        cur.execute(_BY_STORE)
-        for store, kind, n in cur.fetchall():
-            out.setdefault(store, {})[kind] = int(n)
-    return out

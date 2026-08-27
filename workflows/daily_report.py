@@ -54,18 +54,13 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, stores as stores_svc, yingdao
+from services import kpi, order_lines, store_retry, stores as stores_svc, \
+    yingdao
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.daily_report")
 
-# 店铺级并发(所有者定稿 2026-08-16 走进生产:6 → 16,"不然速度跟不上")。
-# ⚠ 旧系统 README 曾写"店铺级并发不要调高(代理共享/全局风控)",这条被显式覆盖。
-# 支撑理由:每店有**自己的固定出口代理**,店铺之间不共享出口;沃尔玛配额是
-# 按 (store, endpoint) 计的,api/_client.py 的令牌桶也按这个维度限流,所以
-# 加店铺并发不会挤占同一个桶。真正的共享资源只有本机 CPU/连接数。
-# 若出现大面积 429 或代理超时,先降这个数再查别的。
 _STORE_WORKERS = stores_svc.STORE_WORKERS   # 唯一出处在 services/stores
 
 _KPI_UPSERT = """

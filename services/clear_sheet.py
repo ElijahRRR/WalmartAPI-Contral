@@ -23,9 +23,12 @@ logger = logging.getLogger("services.clear_sheet")
 POLLABLE = ("", "处理中")
 _WRITE_START = "E"
 
-# SKU 台账/轮询状态 → G 列文案(submitted/processing/unknown 均未落定)
-RESULT_TEXT = {"success": "成功", "failed": "失败", "missing": "未查到",
-               "submitted": "处理中", "processing": "处理中", "unknown": "处理中"}
+# SKU 台账/轮询状态 → G 列文案(submitted/processing/unknown 均未落定)。
+# **唯一出处在 feed_track**(2026-08-27 归一:此前四份拷贝 —— 本处 /
+# maint_sheet 两份 / match_sheet)。这里保留同名再导出,因为
+# workflows/product_clear:81 是 `RESULT_TEXT[outcome]` **直接下标**取
+# (不是 .get):少一键就是 KeyError,改名会当场炸那条链。
+RESULT_TEXT = feed_track.RESULT_TEXT
 
 
 def read_rows() -> list[dict]:
@@ -90,7 +93,7 @@ def sync_from_ledger() -> str | None:
         st = cache[fid].get(r["sku"])
         if st is None:
             continue        # 台账查无此 (feed, sku):不是本系统提交的,不动
-        result = RESULT_TEXT.get(st[0], "处理中")
+        result = feed_track.text_of(st[0])
         # 报错列写「码 | 人话」:数字码本身不含可修的信息
         code = feed_track.merge_error(
             st[1], descs.get(fid, {}).get(r["sku"])) if result == "失败" else ""

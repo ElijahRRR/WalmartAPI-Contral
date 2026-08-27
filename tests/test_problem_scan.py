@@ -216,6 +216,33 @@ def test_preview_writes_nothing(monkeypatch):
     assert "类别={B:1}" in out and "删除样本=[('S_B', 'B')]" in out
 
 
+def test_absence_probe_failure_does_not_stop_the_scan(monkeypatch):
+    """扫描件是**只读**件:缺席探测挂了按"不避让"照常出建议(fail-open),
+    与破坏件 problem_product_cleanup 的 fail-closed 方向相反 —— preview 是纯
+    PG 查询,不该被一次飞书抖动整个拦下。
+
+    降级本身收在 services/store_absence.stale_or_note(四处同形,2026-08-27
+    收口),这里钉的是**首行拼装**:分号由调用方补,措辞一个字都不许改。
+    """
+    monkeypatch.setattr(scan, "_load_state", lambda: (
+        [_item("T1", "S_B", "prohibited product policy")],
+        set(), set(), {}, {}, set(), set()))
+    monkeypatch.setattr(scan, "_audit_rejected_rows",
+                        lambda conn, inflight, inactive, only: [])
+
+    import contextlib
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+
+    def _boom(conn, since=None, hours=None):
+        raise RuntimeError("飞书抖了一下")
+    monkeypatch.setattr(scan.store_absence, "stale_stores", _boom)
+    out = scan.run({"preview": "1"})
+    assert ";⚠ 缺席探测失败(RuntimeError),本轮不避让" in out.splitlines()[0]
+    assert "删除 1" in out       # 不避让 = 一条候选都没被挡掉,本轮照常出建议
+
+
 def test_scan_never_submits_feeds():
     """扫描件的核心承诺:够不着 feed 提交入口。
 

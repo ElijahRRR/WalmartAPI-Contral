@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 
 from api import feishu
 from registry import db, resources
-from services import feed_track, kpi
+from services import blacklist_sheet, feed_track, kpi
 
 logger = logging.getLogger("services.maint_sheet")
 
@@ -77,7 +77,7 @@ RETAIN_DAYS = 7         # 飞书只留近这么多天(一天几千行,不裁很�
 
 
 def _row_date(text: str):
-    """输入:G 列日期串 → 输出:date(解析不了返 None,当作"没日期不裁不判")。"""
+    """输入:I 列(日期)串 → 输出:date(解析不了返 None,当作"没日期不裁不判")。"""
     try:
         return datetime.strptime(str(text).strip()[:10], "%Y-%m-%d").date()
     except (ValueError, TypeError):
@@ -102,28 +102,6 @@ def _save_cursor(conn, value: dict) -> None:
             "ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, "
             "updated_at = now()",
             (_CURSOR, json.dumps(value)))
-
-
-_SCAN_BLOCK = 5000      # 找空行每个 GET 读多少行(只读 A 列,单列 5000 格很轻;
-                        # blacklist_sheet 同款先例)。此前 50 行/请求:有游标时
-                        # 只扫一两块无感,但首跑/游标丢失从第 2 行扫几千行历史
-                        # = 上百个串行请求(2026-08-19 全仓飞书逐行请求盘点)
-
-
-def _find_next_empty(start: int) -> int:
-    """输入:候选起始行 → 输出:确认为空的首行(防水位漂移覆盖已有数据)。"""
-    grid = feishu.sheet_row_count(resources.MAINT_SHEET)
-    row = start
-    while row <= grid:
-        end = min(row + _SCAN_BLOCK - 1, grid)
-        vals = feishu.sheet_values(resources.MAINT_SHEET, f"A{row}:A{end}")
-        got = [(str(c[0]).strip() if c and c[0] is not None else "")
-               for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]
-        for i, v in enumerate(got):
-            if not v:
-                return row + i
-        row = end + 1
-    return row      # 网格已满,append_records 会先扩行
 
 
 def build_row(store: str, sku: str, suggestion: str, reason: str, action: str,
@@ -180,14 +158,26 @@ def publish(rows: list[tuple], lines: list[str], *, prune_after=True) -> None:
 
 
 def append_records(rows: list[tuple]) -> int:
-    """输入:[(店铺, sku, 动作, 旧值, 新值, feedid, 日期, 结果, 报错)]
-    → 输出:写入行数。只追加;水位存 ops.cursors,起点先验空防覆盖。"""
+    """输入:[(店铺, SKU, 建议, 原因, 动作, 旧值, 新值, feedid, 日期, 结果, 报错)]
+    → 输出:写入行数。只追加;水位存 ops.cursors,起点先验空防覆盖。
+
+    行必须由 `build_row` 造(全项目唯一造行处,按 registry 列序)。本行元组
+    是 11 列:2026-08-16 加「建议」「原因」两列后,这条 docstring 还照旧
+    9 列写着(2026-08-27 订正)—— 照它手拼元组就是整行错位且不报错。"""
     if not rows:
         return 0
     sheet = resources.MAINT_SHEET.require()
     with db.pg_conn() as conn:
         cur_state = _load_cursor(conn)
-    start = _find_next_empty(int(cur_state.get("next_row", 2)))
+    # 找空行(防水位漂移覆盖已有数据)走 blacklist_sheet.next_empty —— **唯一
+    # 实现**(2026-08-27 归一:本文件此前抄了一份逐行同形的,连那边
+    # 「本算法 O(表已填行数)、涨到几十万行要换二分探测」的警告都没抄过来)。
+    # ⚠ 扫描块大小(_SCAN_BLOCK)也在那边:此前 50 行/请求 —— 有游标时只扫
+    #   一两块无感,但首跑/游标丢失要从第 2 行扫几千行历史 = 上百个串行请求
+    #   (2026-08-19 全仓飞书逐行请求盘点)。
+    # 返回值可能指到网格末尾之后:网格已满,下面 sheet_ensure_rows 会先扩行。
+    start = blacklist_sheet.next_empty(resources.MAINT_SHEET,
+                                       int(cur_state.get("next_row", 2)))
     feishu.sheet_ensure_rows(sheet, start + len(rows))
     cur_state.setdefault("unresolved_from", 2)
 
@@ -218,8 +208,6 @@ def append_records(rows: list[tuple]) -> int:
 
 _LABEL_BY_FEED = {"MP_MAINTENANCE": "标题", "price": "价格",
                   "inventory": "库存", "DELETE_ITEM": "删除"}
-_RESULT_BY_STATUS = {"success": "成功", "failed": "失败",
-                     "missing": "未查到", "submitted": "处理中"}
 
 _SQL_LEDGER = """
 SELECT store, sku, feed_type, feed_id, status, error_code, error_desc,
@@ -259,7 +247,15 @@ def resync_from_ledger() -> str:
     for store, sku, ftype, fid, status, code, desc, submitted in ledger:
         if (str(fid or ""), str(sku)) in have:
             continue
-        result = _RESULT_BY_STATUS.get(status, status)
+        # 中文面走 feed_track 的唯一出处,但**兜底仍是"原样落表"**:未登记的
+        # 状态照写台账里的原文,给人看的是"库里到底写了什么"。这与
+        # feed_track.text_of 的「处理中」不是等价替换,是补写口径的有意差异,
+        # 不当成同一件事悄悄改掉(2026-08-27 收编时按原口径保留)。
+        # ⚠ 本行与旧的 _RESULT_BY_STATUS 只在 processing/unknown 两键上不同,
+        #   而这两个值**进不了 ops.feed_items**:feed_track.poll_feed 的 _STATUS
+        #   (feed_track:137)落库前把它们归一成 'submitted',schema 也只登记
+        #   submitted/success/failed/missing —— 真实值域上逐值等价
+        result = feed_track.RESULT_TEXT.get(status, status)
         err = feed_track.merge_error(code, desc) if status == "failed" else ""
         label = _LABEL_BY_FEED.get(ftype, ftype)
         # 按列名拼(11 列):台账只有 SKU 级状态,建议/原因/旧值/新值补不回来
@@ -279,10 +275,10 @@ def sync_from_ledger() -> str | None:
     """输入:无 → 输出:回写摘要一行(无待回填区间才返 None)。
 
     ⚠ 只有 append_records 写过行、水位推进过,这里才有区间可扫。
-    maintenance 走 PUT 路由的行 F="sync"、H 当场落定,不参与回填。
+    maintenance 走 PUT 路由的行 H="sync"、J 当场落定,不参与回填。
 
-    feed_poll 反哺器:扫 [unresolved_from, next_row) 区间内 F=真 feedid 且
-    H 空/处理中的行,按 ops.feed_items 台账落 H(结果)/I(报错);
+    feed_poll 反哺器:扫 [unresolved_from, next_row) 区间内 H=真 feedid 且
+    J 空/处理中的行,按 ops.feed_items 台账落 J(结果)/K(报错);
     已全落定的前缀推进水位。纯读库,零沃尔玛调用。
     """
     try:
@@ -340,8 +336,7 @@ def sync_from_ledger() -> str | None:
         if st[0] == "submitted":
             prefix_done = False         # feed 未落定,水位停在这里
             continue
-        text = {"success": "成功", "failed": "失败",
-                "missing": "未查到"}.get(st[0], "处理中")
+        text = feed_track.text_of(st[0])
         # 报错列写「码 | 人话」(改价/改库存/改标题/清库存共用这一列)
         err = feed_track.merge_error(
             st[1], descs.get(fid, {}).get(sku)) if text == "失败" else ""

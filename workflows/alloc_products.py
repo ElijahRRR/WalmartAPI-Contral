@@ -28,15 +28,17 @@
 **只读**:不写任何表、不调沃尔玛、不调 LLM。
 """
 
-import csv
 import logging
 from collections import Counter
 
-from registry import db, paths, resources
+from registry import db, resources
 from services import alloc_survey as sv
-from services import claims, sku_asin
+from services import claims, report_csv, sku_asin
 from services import product_pool as pool_svc, product_score as ps
 from services import textfmt
+# ⚠ 按名字导入:run() 的形参就叫 params,`from services import params` 会被它
+# 遮住,`params.flag(...)` 当场 AttributeError(services/params.py 头注)
+from services.params import flag
 
 DANGEROUS = False
 
@@ -86,7 +88,7 @@ def run(params: dict) -> str:
             f"你大概想要:-p sales_days={params['days']}")
     days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
     win = sv.sales_window(str(params.get("as_of", "")), days)
-    export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
+    export = flag(params, "export", default=True)
 
     with db.pg_conn() as conn:
         data = pool_svc.load(conn, win)
@@ -192,8 +194,6 @@ def run(params: dict) -> str:
         L += ["", "(-p export=0:未落 csv)"]
         return "\n".join(L)
 
-    paths.reports_dir().mkdir(parents=True, exist_ok=True)
-    p = paths.reports_dir() / "alloc_产品分.csv"
     header = ["ASIN", "品牌", "大类(26类)", "品类(五大类)",
               "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
               "配送方式", "售价", "运费", "落地价",
@@ -205,10 +205,7 @@ def run(params: dict) -> str:
     #   要是插的是个数字列就会静默按错的列排。同一天在冲突明细的 `d[7]` 上
     #   踩过同款(那次不报错,把「保留/下架」读成了一个数字)
     rows.sort(key=lambda r: -r[header.index("产品分")])
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(header)
-        w.writerows(rows)
+    p = report_csv.write("alloc_产品分.csv", header, rows)
     L += ["", f"▍明细 → {p}(按产品分降序,{len(rows):,} 行)",
           "  「缺失信号」列告诉你这一行的分是靠哪几项算出来的 ——"
           "分数说不清来源就没法推翻它",

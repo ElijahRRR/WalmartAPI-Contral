@@ -240,7 +240,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
                                                 # 三处官方一致复核;6/day 只属 feedType=promo,
                                                 # 本仓不用。此前保守 6/天,维护链吞吐被它卡死)
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
-    "settings.partnerprofile": (40, 60.0),      # 官方 60/min,lru 缓存后每店仅首次调
+    "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
 }
@@ -534,13 +534,13 @@ def _parse_retry_after(headers: dict) -> float:
     return 60.0  # 兜底
 
 
-def _log(msg: str, quiet: bool, level: int = logging.WARNING) -> None:
-    """quiet=True 时降为 DEBUG(替代旧版的 print + quiet 组合)。"""
-    logger.log(logging.DEBUG if quiet else level, msg)
+def _log(msg: str, level: int = logging.WARNING) -> None:
+    """统一日志出口(替代旧版的 print + quiet 组合)。"""
+    logger.log(level, msg)
 
 
 def _request_ex(method, url, token, client_id, proxy, *,
-                json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
+                json_body=None, params=None, timeout=30, max_retries=0):
     """
     统一的请求实现。返回 (status, headers, data)。
 
@@ -581,7 +581,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
             # 连接级故障(含 socksio 的 SOCKS 层报错,它不在 httpx 异常树上):
             # 池里这条连接很可能已坏,主动剔除让下次建新的
             _invalidate_client(proxy)
-            _log(f"✗ {method} 网络失败(已剔除连接) {url}: {e}", quiet)
+            _log(f"✗ {method} 网络失败(已剔除连接) {url}: {e}")
             if attempt < max_retries:
                 attempt += 1
                 time.sleep(min(2 ** attempt, 10))
@@ -589,7 +589,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
             return None, {}, None
         except Exception as e:
             # 非网络层的其他异常(程序错误、JSON 序列化失败等):不动连接池
-            _log(f"✗ {method} 请求异常 {url}: {e}", quiet)
+            _log(f"✗ {method} 请求异常 {url}: {e}")
             return None, {}, None
 
         status = resp.status_code
@@ -604,7 +604,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 try:
                     token = get_token(client_id, secret, (cached or {}).get("proxy") or proxy)
                     refreshed_401 = True
-                    _log(f"⚠ {method} 401 → token 已刷新,重试 {url}", quiet)
+                    _log(f"⚠ {method} 401 → token 已刷新,重试 {url}")
                     continue
                 except _NET_ERRORS:
                     # 刷新那一跳撞上代理/传输故障:**原样上抛**,不落回 401 流程
@@ -614,20 +614,20 @@ def _request_ex(method, url, token, client_id, proxy, *,
                     # (2026-08-26 对抗校验:分诊口径的静默反例)
                     raise
                 except Exception as e:
-                    _log(f"✗ {method} 401 后换 token 失败 {url}: {e}", quiet)
+                    _log(f"✗ {method} 401 后换 token 失败 {url}: {e}")
                     # 落回原 401 返回流程
 
         # 自动重试逻辑(opt-in)
         if attempt < max_retries:
             if status == 429:
                 wait = _parse_retry_after(headers)
-                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)", quiet)
+                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)")
                 time.sleep(wait)
                 attempt += 1
                 continue
             if 500 <= status < 600:
                 wait = min(2 ** attempt, 10)
-                _log(f"⚠ {method} {status} 服务端错误 {url},{wait}s 后重试 (第 {attempt+1}/{max_retries} 次)", quiet)
+                _log(f"⚠ {method} {status} 服务端错误 {url},{wait}s 后重试 (第 {attempt+1}/{max_retries} 次)")
                 time.sleep(wait)
                 attempt += 1
                 continue
@@ -642,7 +642,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 try:
                     data = resp.json()
                 except Exception as e:
-                    _log(f"✗ {method} {status} 但 JSON 解析失败 {url}: {e}", quiet)
+                    _log(f"✗ {method} {status} 但 JSON 解析失败 {url}: {e}")
         else:
             # 500 截取,不是 200(2026-08-19):Akamai 错误页的 Reference #
             # 在 HTML 后半段,200 字符正好截在它前面——持续 5xx 要开沃尔玛
@@ -651,12 +651,12 @@ def _request_ex(method, url, token, client_id, proxy, *,
             msg = f"✗ {method} {status} {url}"
             if body_snip:
                 msg += f": {body_snip}"
-            _log(msg, quiet, level=logging.INFO)
+            _log(msg, level=logging.INFO)
 
         return status, headers, data
 
 
-def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, quiet=False, max_retries=0):
+def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, max_retries=0):
     """
     GET 请求,返回 (status, headers, data)。
 
@@ -670,10 +670,10 @@ def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, quiet=Fal
     可选 max_retries:>0 时启用自动 429/5xx 退避重试(默认 0 关闭)。
     """
     return _request_ex("GET", url, token, client_id, proxy,
-                       params=params, timeout=timeout, quiet=quiet, max_retries=max_retries)
+                       params=params, timeout=timeout, max_retries=max_retries)
 
 
-def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
+def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, max_retries=0):
     """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。
 
     ⚠ **默认 max_retries=0 是有意的** —— POST 非幂等,自动重试会造成重复提交
@@ -685,12 +685,17 @@ def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, time
     """
     return _request_ex("POST", url, token, client_id, proxy,
                        json_body=json_body, params=params, timeout=timeout,
-                       quiet=quiet, max_retries=max_retries)
+                       max_retries=max_retries)
 
 
-def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
-    """PUT 请求,返回 (status, headers, data)。用于 PUT /v3/price 和 PUT /v3/inventory。"""
+def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30):
+    """PUT 请求,返回 (status, headers, data)。用于 PUT /v3/price 和 PUT /v3/inventory。
+
+    没有 max_retries:两个调用方(prices.put_price / inventory.put_inventory)
+    从来没传过,2026-08-27 死件清理随 quiet 一并删(蓝图 §7 未收录 _client
+    的参数面,删前已核)。将来要开 429/5xx 自动重试,先按 safe_post_ex 里
+    那条幂等性判据想清楚再加。
+    """
     return _request_ex("PUT", url, token, client_id, proxy,
-                       json_body=json_body, params=params, timeout=timeout,
-                       quiet=quiet, max_retries=max_retries)
+                       json_body=json_body, params=params, timeout=timeout)
 

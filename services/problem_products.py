@@ -51,7 +51,10 @@ def categorize(reason_text: str | None) -> tuple[str, str]:
 
 
 def is_stage_pending(reason_text: str | None) -> bool:
-    """Stage 待发布(不是错误,排除删除;独立于 categorize,旧 main() 同款)。"""
+    """输入:下架原因文案 → 输出:是否 Stage 待发布。
+
+    不是错误,排除删除;独立于 categorize,旧 main() 同款。
+    """
     return "stage status until you go live" in (reason_text or "").lower()
 
 

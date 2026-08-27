@@ -1,6 +1,6 @@
 """店级「跑完别人再串行补试一遍」公共积木(所有者定稿 2026-08-26 重试标准①)。
 
-标准全文四步(定稿全文在 CLAUDE.md 工程规范「店维工作流的失败处理」条):
+标准全文四步(规则条目在 CLAUDE.md 工程规范,展开全文在 docs/conventions.md §四):
   ① 并发/循环跑完全部店 → 失败店**串行**补试一遍(本模块);
   ② 补试仍失败 → **不炸整轮**:工作流照常报成功,摘要首行点名缺席店;
   ③ 下游店维工作流按水位避让缺席店(services/store_absence);
@@ -15,6 +15,7 @@ api/feeds submit_feed 头注)同源:失败时补打进的正是造成失败的�
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from api import _client
 
@@ -103,3 +104,70 @@ def diagnose(err: Exception) -> str:
     if "返回 None" in text:
         return "网络未达"
     return "其他"
+
+
+def fan_out(store_list: list[dict], attempt, workers: int,
+            log_label: str = "") -> tuple[list, list, list, str]:
+    """输入:店铺列表 + 单店执行函数 → 输出:(结果, 凭证死店名, 缺席, 规模闸说明)。
+
+    缺席 = `[(店名, 归类词)]`(归类词唯一出处 `diagnose`);规模闸说明为空串
+    或止损原文(调用方必须放进摘要,见 serial_second_pass 第四条)。
+
+    标准①②的落地骨架(所有者定稿 2026-08-26,展开全文 docs/conventions.md §四):
+    跨店并发 → StoreDeadError 当场归 dead → 其余异常先收着**不判生死** →
+    跑完别人再 `serial_second_pass` 串行补试一遍 → 仍失败的按 `diagnose`
+    分流(凭证失效归 dead 口径,其余归 absent)。
+
+    · `attempt(store)` 必须是**第一轮同一个函数**:补试跑的就是它,不另写
+      简化版(单一落地路径纪律,见 serial_second_pass 第三条);
+    · `log_label` 只进日志(如「同步」/「售后同步」),不进任何摘要/通知;
+    · 本函数只回答「谁成功、谁凭证死、谁缺席」。**零店完成闸、摘要首行拼装、
+      gate_note 落哪一行、缺席店后续怎么避让,全部留在调用方** —— 那些各件
+      本来就不同(catalog_sync 有 strict 闸、returns_sync 的缺口靠下轮窗口
+      覆盖)。
+
+    收编自 catalog_sync 与 returns_sync 两处逐字相同的实现,语义以
+    catalog_sync 现行代码为准。⚠ **不收编** settlement_sync/perf_problems/
+    daily_report:那三处只 diagnose、故意没有串行补试,折进来等于给它们加
+    重试(行为变更,不是重构)。
+    """
+    results: list = []
+    dead: list[str] = []
+    to_retry: list[tuple] = []
+    absent: list[tuple[str, str]] = []          # (店名, 归类词:代理/其他/凭证)
+    gate_note = ""
+    if not store_list:      # 不开 0 个线程;「零店完成不许报成功」是调用方的闸
+        return results, dead, absent, gate_note
+    by_name = {s["name"]: s for s in store_list}
+    with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
+        futures = {pool.submit(attempt, s): s["name"] for s in store_list}
+        for f in as_completed(futures):
+            name = futures[f]
+            try:
+                results.append(f.result())
+            except _client.StoreDeadError as e:
+                # 凭证死是确定性的:跳过全店,不补试(重试只会再死一次)
+                logger.error("%s", e)       # 异常自带店名,不重复拼
+                dead.append(name)
+            except Exception as e:
+                # 代理故障(StoreProxyError/socksio)与泛化异常都先收着 ——
+                # 标准①(所有者定稿 2026-08-26):跑完别人再串行补试,
+                # 此刻不判生死。08-26 13:00 的事故正是在这里把两家店的
+                # SOCKS 报错直接判成 failed → 整轮 raise → 八步链全停
+                logger.exception("店铺 %s %s失败(待串行补试): %s",
+                                 name, log_label, e)
+                to_retry.append((by_name[name], e))
+
+    # 标准①:失败店串行补试一遍。单一落地路径 —— 补试跑的就是第一轮
+    # 同一个 attempt,不另写简化版
+    if to_retry:
+        recovered, still, gate_note = serial_second_pass(
+            to_retry, attempt, total_stores=len(store_list))
+        results.extend(r for _s, r in recovered)
+        for s, e in still:
+            cls = diagnose(e)
+            if cls == "凭证失效":                    # 补试中才暴露的凭证死,归 dead 口径
+                dead.append(s["name"])
+            else:
+                absent.append((s["name"], cls))
+    return results, dead, absent, gate_note

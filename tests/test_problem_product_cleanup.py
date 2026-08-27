@@ -23,9 +23,13 @@ def _row(store, sku, action="delete", rid=None, category="B", **detail):
 def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     """把 DB 侧全部换成假的:claim 给定建议行,settle 给定落定数,转态记账。"""
     from registry import db as _db
+    from services import store_retry as _sr
     seen = {"events": [], "marked": [], "marked_by": set(), "sheet": [],
             "settled": settled or
             {"confirmed": 0, "ineffective": 0}}
+    # 二轮补试走 store_retry,每店前有 _client.backoff(0) 抖动等待:
+    # 用例只钉行为,不必真等(与 tests/test_store_retry_standard 同款)
+    monkeypatch.setattr(_sr.time, "sleep", lambda s: None)
     monkeypatch.setattr(_db, "pg_conn",
                         contextlib.contextmanager(lambda: iter([None])))
     monkeypatch.setattr(ppc.dispositions, "claim",
@@ -39,7 +43,9 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     monkeypatch.setattr(ppc.product_events, "record_many",
                         lambda conn, rs: (seen["events"].extend(rs), len(rs))[1])
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {})
-    # 缺席避让与按日配额记账都走库,测试环境无库:置空(缺席=无、当日已放行=0)
+    # 缺席避让与按日配额记账都走库,测试环境无库:置空(缺席=无、当日已放行=0)。
+    # 打 stale_stores 这一层:执行件调的 stale_or_note 是它的降级外壳,
+    # 探测正常时 note 为空串 —— fail-closed 那条路专门有用例走
     monkeypatch.setattr(ppc.store_absence, "stale_stores",
                         lambda conn, since=None, lag_hours=None: [])
     monkeypatch.setattr(ppc.dispositions, "destructive_executed_today",
@@ -51,20 +57,27 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     return seen
 
 
-def test_group_by_store_buckets_by_action():
-    rows = [_row("T1", "S1"), _row("T1", "S2", "relist"),
-            _row("T2", "S3", "retire")]
-    got = ppc.group_by_store(rows)
-    assert [r["sku"] for r in got["T1"]["delete"]] == ["S1"]
-    assert [r["sku"] for r in got["T1"]["relist"]] == ["S2"]
-    assert [r["sku"] for r in got["T2"]["retire"]] == ["S3"]
+def test_run_buckets_rows_by_action(monkeypatch):
+    """分桶件 2026-08-27 上移 services.dispositions —— 这里钉**接线**:
+    本工作流按 action × _ACTION_ORDER 分桶,三个动作各进各的桶。
+    (算法与「未知动作即抛」的单元用例在 tests/test_dispositions_router.py)"""
+    _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2", "relist"),
+                        _row("T2", "S3", "retire")], stores=("T1", "T2"))
+    out = ppc.run({"execute": False})
+    assert "反补 1,删除 1,顽固停用 1" in out
+    assert "T1:反补 1,删除 1" in out
+    assert "T2:反补 0,删除 0,顽固停用 1" in out
 
 
-def test_group_by_store_rejects_unknown_action():
-    """建议表里出现不认识的动作 → 宁炸不吞。静默丢弃会让那些行永远挂
-    suggested,而部分唯一索引又挡着新建议,该 SKU 从此再也处理不了。"""
-    with pytest.raises(ValueError, match="未知 action"):
-        ppc.group_by_store([_row("T1", "S1", "nope")])
+def test_run_rejects_unknown_action(monkeypatch):
+    """建议表里出现不认识的动作 → 宁炸不吞,**生产路径上照样抛**。静默丢弃会让
+    那些行永远挂 suggested,而部分唯一索引又挡着新建议,该 SKU 从此再也处理不了。
+
+    报错里的 `id=` 取的必须是本表的 `id` 列(接线传 id_field="id"):点错列会
+    报出 `id=None`,拿着这条报错回表里根本找不到是哪一行。"""
+    _wire(monkeypatch, [_row("T1", "S1", "nope", rid=77)])
+    with pytest.raises(ValueError, match=r"未知 action='nope'.*id=77"):
+        ppc.run({"execute": False})
 
 
 def test_execute_records_events_per_slice(monkeypatch):
@@ -354,9 +367,40 @@ def test_only_maintenance_prunes_the_shared_sheet():
     assert "prune_after" not in inspect.getsource(mw._write_sheet)
 
 
-def test_second_round_is_serial():
+def test_second_round_goes_through_the_standard_serial_pass():
     """二轮重试必须串行(店级重试标准 2026-08-26):第一轮已经证明这批店/
     代理在抖,补试没有理由再齐射一遍。对抗校验实测过改回并发全量照绿,
-    这里按调用点钉住。"""
+    这里按调用点钉住。
+
+    2026-08-27 起钉的是**标准件**:此前本文件自造 `_round(workers=1)`,
+    与 store_retry 是「同语义、不同实现」—— 标准件后来加的规模闸
+    (max(3, 总数//5) 判系统性故障就不补试)因此漏在了外面。
+    """
     import inspect
-    assert "_round(retry_stores, workers=1)" in inspect.getsource(ppc.run)
+    src = inspect.getsource(ppc.run)
+    assert "store_retry.serial_second_pass(" in src
+    assert "total_stores=len(first)" in src     # 规模闸要拿得到总店数
+    assert "workers=1" not in src               # 自造的那份不许回来
+
+
+def test_absence_probe_failure_stops_every_destructive_action(monkeypatch):
+    """缺席探测失败 → **fail-closed**(2026-08-27 改;此前是 fail-open「不避让」)。
+
+    本工作流是破坏动作的唯一出口,而缺席探测经 enabled_names 走飞书:一次
+    飞书抖动就能让「按隔夜观测发 DELETE_ITEM」这条路重新打开(同一次抖动
+    还会一起打开上游 problem_scan 的同款闸,没有第二重兜底)。
+    conventions §六:兜底是补偿外部世界的缺陷,不是补偿自己的不确定 ——
+    拿不准就不删,建议留在 suggested,下轮重新定夺(延后一轮无损)。
+    """
+    seen = _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2")])
+    monkeypatch.setattr(ppc.store_absence, "stale_stores",
+                        lambda conn, **k: (_ for _ in ()).throw(
+                            RuntimeError("飞书 502")))
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("探测失败不许发任何 feed")))
+    out = ppc.run({"execute": True})
+    first = out.splitlines()[0]         # 链通知只发首行,点名必须在这一行
+    assert "⚠ 缺席探测失败,本轮破坏动作全停(fail-closed)" in first
+    assert "2 条建议留在 suggested 原地" in first
+    assert seen["marked"] == [] and seen["events"] == [] and seen["sheet"] == []

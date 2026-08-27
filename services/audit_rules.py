@@ -34,7 +34,6 @@ class AuditContext:
     """规则引擎的全部数据依赖(load_context 一次装配,规则函数零 DB 访问)。"""
     phase0_sellers: frozenset
     phase0_asins: frozenset
-    phase0_cats: frozenset          # 兼容保留(路径等值那份)
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
     ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
@@ -197,6 +196,8 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
     p0_sellers = _frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist")
     p0_asins = _frozen(conn, "SELECT asin FROM catalog.asin_blacklist")
+    # ⚠ p0_cats **只为报数,不进 ctx**:类目闸整体改吃下面装配的 cat_rules,
+    # 这条查询留着单纯是为了下面那行日志里的「类目 N」这个数字有出处。
     p0_cats = _frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"
                             " WHERE enabled")
     # 类目闸的判据全在库里(2026-08-20 所有者定稿:代码里的类目搬进 DB):
@@ -210,7 +211,6 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     return AuditContext(
         phase0_sellers=p0_sellers,
         phase0_asins=p0_asins,
-        phase0_cats=p0_cats,
         cat_rules=cat_rules,
         brand_blacklist=brand,
         pt_meta=pt_meta,

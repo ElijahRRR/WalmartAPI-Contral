@@ -85,7 +85,7 @@ def test_empty_read_never_wipes_the_gate_dictionary():
 
 
 def test_sudden_shrink_is_refused():
-    """删几行是常态,删掉一半必是读漏/读错(与 _mirror 同款护栏)。"""
+    """删几行是常态,删掉一半必是读漏/读错(与 _guard_shrink 同款护栏)。"""
     with pytest.raises(ValueError, match="拒绝重灌"):
         risk_gate.sync_pt_meta(_MetaConn(before=7000), _pt_rows(3000))
 

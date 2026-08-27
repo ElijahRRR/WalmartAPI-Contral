@@ -495,3 +495,36 @@ def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
     first = summary.splitlines()[0]
     assert "1/2 店完成" in first
     assert "⚠ 缺席 1 店:断店(代理波动)" in first     # 归类进首行,人知道去找代理商
+
+
+def test_sync_one_store_wires_scanned_skus_into_inventory_fallback(monkeypatch):
+    """工作流必须把本轮扫到的 SKU 集传给 list_inventories(所有者 2026-08-26
+    拍板接上保险丝)。此前调用没传 expected_skus,api 层的单查兜底(蓝图 #22)
+    在生产从未触发——bulk 漏数据时无人补。桩掉扫描与落库,只验传参与滤 None。"""
+    import contextlib
+    from datetime import datetime, timezone
+    from workflows import catalog_sync
+
+    monkeypatch.setattr(catalog_sync.items, "iter_all_items",
+                        lambda store, stats, mode: iter(
+                            [{"sku": "A"}, {"sku": "B"}, {"sku": None}]))
+    seen: dict = {}
+
+    def fake_inv(store, expected_skus=None):
+        seen["skus"] = expected_skus
+        return {"A": 3}
+
+    monkeypatch.setattr(catalog_sync.inv_api, "list_inventories", fake_inv)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "merge_rows",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_items",
+                        lambda conn, rows: 0)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "mark_missing",
+                        lambda conn, name, run_at: 0)
+
+    r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc),
+                                     False, "fast", False)
+    assert seen["skus"] == {"A", "B"}     # 扫描集原样传入;None SKU 滤掉不进单查
+    assert r["inv"] == 1

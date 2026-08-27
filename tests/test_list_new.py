@@ -83,14 +83,14 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         {"T_OFF"}, {}, {"B0LISTED01"},
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()},
         {}, {}))                       # 占用台账为空 = 占用闸恒放行
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
         {"name": "T1"}, {"name": "T_OFF"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt",
@@ -236,11 +236,11 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "T1"}])
@@ -268,11 +268,11 @@ def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
                 "B0SLOWISH2": {**base, "asin": "B0SLOWISH2", "lead_days": 10}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T_A": {"fbm_range1": "200%"},
                                  "T_Z": {"fbm_range1": "200%"}})
     monkeypatch.setattr(ln.store_limits, "lead_day_caps",
@@ -312,11 +312,11 @@ def test_store_channel_gate(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {
         "T_FBA": {"fba_range1": "300%", "fbm_range1": "200%"},
         "T_ANY": {"fba_range1": "300%", "fbm_range1": "200%"}})
     # T_FBA 标了 FBA;T_ANY 没标(不在字典里)
@@ -351,11 +351,11 @@ def test_quota_slices_after_filters(monkeypatch):
                 "B0GOODONE2": {**base, "asin": "B0GOODONE2", "stock": 50}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "T1"}])
@@ -399,11 +399,11 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
                            "productSecondaryImageURL": {"minItems": 2}}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "T1"}])
@@ -526,11 +526,11 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
             _sheet_row(3)]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
@@ -553,13 +553,13 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
         {"acme": "OTHER"}))                                 # 品牌占用
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 0.0,
@@ -569,7 +569,7 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
         "B0BRANDED1": {**base, "asin": "B0BRANDED1", "brand": "Acme"},
         "B0NOBRAND1": {**base, "asin": "B0NOBRAND1", "brand": "Generic"},
     })
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
     out = ln.run({"execute": False})
 
@@ -617,7 +617,7 @@ def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
                         lambda c: {"banned_pts": set(), "brands": set()})
     monkeypatch.setattr(ln.claims, "load_active", lambda c, k: {})
 
-    _, _, listed, *_ = ln._load_gate_state()
+    listed = ln._load_gate_state().listed
     assert "B0MINE0001" in listed          # 规划内的店照样拦
     assert "B0TANZONG1" not in listed      # 范围外的店不拦
 
@@ -768,11 +768,11 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
 
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": s} for s in stores])
@@ -850,11 +850,11 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln, "SUBMIT_JITTER_MS", 0)
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": s} for s in stores])
@@ -949,6 +949,127 @@ def test_placeholder_upc_backfilled_with_real(monkeypatch):
     assert seen["assembled_upcs"] == ["19999AAAAOK1"]
     assert ln._UPC_PLACEHOLDER not in seen["assembled_upcs"]
     assert seen["submitted"] == [("T1", 1)]
+
+
+def test_multi_slice_results_line_up_with_their_own_rows(monkeypatch):
+    """submit_feed 只回 count 不回条目,对位走 api/feeds.iter_result_slices
+    —— 错一位就是整批结局落到别人行上,而且**不报错**。"""
+    rows = [_sheet_row(rn, store="T1", asin=f"B0SLICE{rn:03d}")
+            for rn in (2, 3, 4)]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    written = []
+    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols",
+                        lambda u: (written.extend(u), len(u))[1])
+
+    def sliced(store, feed_type, items, workflow=None, defer_settle=False):
+        yield {"outcome": "submitted", "feed_id": "F-A", "count": 1}
+        yield {"outcome": "failed", "feed_id": None, "count": 2}
+    monkeypatch.setattr(ln.feeds, "submit_feed", sliced)
+
+    ln.run({"execute": True})
+    by_row = dict(written)
+    assert by_row[2][4] == "Yes" and by_row[2][5] == "F-A"   # 第一片 = 第 2 行
+    assert by_row[3][4] == "No" and by_row[3][7] == "提交被拒"
+    assert by_row[4][4] == "No" and by_row[4][7] == "提交被拒"
+    # 被拒那片的号全数回收,成功那片一个都不回收
+    assert len(seen["released"]) == 2
+
+
+def test_failed_store_gets_one_serial_second_pass(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):失败店跑完别人后串行补试一遍,
+    救回的照常入账 —— 补试跑的是**同一个** _one_store(单一落地路径)。"""
+    from socksio.exceptions import ProtocolError
+    rows = [_sheet_row(2, store="T1", asin="B0GOOD0001"),
+            _sheet_row(3, store="T2", asin="B0SHAKY001")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_retry.time, "sleep", lambda s: None)
+    tries = []
+
+    def flaky(store, feed_type, items, workflow=None, defer_settle=False):
+        tries.append(store["name"])
+        if store["name"] == "T2" and tries.count("T2") == 1:
+            raise ProtocolError("Malformed reply")   # 08-26 事故同款,补试即好
+        yield {"outcome": "submitted", "feed_id": f"F-{store['name']}",
+               "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", flaky)
+
+    out = ln.run({"execute": True})
+    assert tries.count("T2") == 2          # 首轮 + 补试各一次,不多试
+    assert "⚠ 缺席" not in out              # 救回了就不点名
+    assert "T2:提交 1 条" in out
+
+
+def test_second_pass_resubmits_a_byte_identical_payload(monkeypatch):
+    """补试是对**写接口**再发一次,安全性全押在「载荷一字不差」上:同载荷 ⇒
+    同 payload_key ⇒ api/feeds 的在途防重(pending/submitted)把真重复挡回
+    dedup,不会双上架。本用例钉 list_new 这一侧 —— 两次尝试交给 submit_feed
+    的条目必须完全相同:不重领占位号、不把变体后缀叠成第二遍。
+    (领号侧「同 (店,ASIN) 原号复用」是 services/upc_pool.claim 的契约,
+    由它自己的用例钉;这里的桩按该契约回同一个号。)"""
+    import copy
+
+    from socksio.exceptions import ProtocolError
+    rows = [_sheet_row(2, store="T2", asin="B0SHAKY001")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_retry.time, "sleep", lambda s: None)
+    # 底座的 assemble 桩把载荷压成 {"pt": …}(它只观测 UPC),这里换成真形状
+    monkeypatch.setattr(ln.mp_mapper, "assemble_mp_item",
+                        lambda o, pt, v: {"Orderable": o, "Visible": {pt: v}})
+    sent = []
+
+    def flaky(store, feed_type, items, workflow=None, defer_settle=False):
+        sent.append(copy.deepcopy(items))       # 快照:之后被就地改也照得出来
+        if len(sent) == 1:
+            raise ProtocolError("Malformed reply")
+        yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", flaky)
+
+    ln.run({"execute": True})
+    assert len(sent) == 2
+    assert sent[0] == sent[1], (sent[0], sent[1])
+
+
+def test_still_failed_store_is_absent_in_first_line_and_keeps_its_half_work(
+        monkeypatch):
+    """标准②:补试仍失败 ⇒ **不炸整轮**,缺席店带归类词点名在摘要**首行**
+    (链通知只发成功步骤的首行,写在后面等于只写进日志)。
+
+    同时盯**信息零丢失**:逐店那行「(归类词:异常),下轮重试」照旧,
+    领号阶段已经攒好的 no_upc 计数与 N 列理由不许随异常一起蒸发。
+    """
+    from socksio.exceptions import ProtocolError
+    rows = [_sheet_row(2, store="T1", asin="B0GOOD0001"),
+            _sheet_row(3, store="T2", asin="B0NOUPC001"),
+            _sheet_row(4, store="T2", asin="B0DOWN0001")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_retry.time, "sleep", lambda s: None)
+    reasons = []
+    monkeypatch.setattr(ln.listing_sheet, "write_reasons",
+                        lambda rs, *a, **k: (reasons.extend(rs), 0)[1])
+    monkeypatch.setattr(ln.upc_pool, "claim", lambda c, wants: [
+        None if w["asin"].startswith("B0NOUPC") else "19999" + w["asin"][-7:]
+        for w in wants])
+
+    def down(store, feed_type, items, workflow=None, defer_settle=False):
+        if store["name"] == "T2":
+            raise ProtocolError("Malformed reply")   # 补试也不好
+        yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", down)
+
+    out = ln.run({"execute": True})          # 不抛 = 不炸链
+    first = out.splitlines()[0]
+    assert "⚠ 缺席 1 店:T2(代理波动)" in first
+    assert "已串行补试仍失败" in first and "未上架行下轮重试" in first
+    # 逐店那行的字样一字不改
+    assert any(row.strip().startswith("⚠ T2:上架异常已跳过(代理波动:")
+               and row.endswith(",下轮重试") for row in out.splitlines()), out
+    # 半成品照原样入账:领不到号的行照旧计数、照旧写 N 列
+    assert "提交期:UPC池不足 1" in out
+    assert (3, "UPC池余量不足") in reasons
 
 
 def test_same_round_scrape_refreshes_all_candidates(monkeypatch):
@@ -1101,14 +1222,14 @@ def test_out_of_scope_store_skips_dedup_and_claim_gates(monkeypatch):
                                "brand": "SomeBrand"}}
     seen = _wire_execute_env(monkeypatch, rows, products)
     # 该 ASIN 已在别店在架 + 产品/品牌都被别店占用
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, {"B0AAAAAOK1"}, {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0AAAAAOK1": "A085"},
         {ln.brand_key.brand_key("SomeBrand", None): "A085"}))
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "谭总4"}, {"name": "T1"}])
-    monkeypatch.setattr(ln, "_load_multipliers",
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"}
                                  for s in ("谭总4", "T1")})
     out = ln.run({"execute": True})
@@ -1148,9 +1269,9 @@ def test_out_of_scope_holders_do_not_block_others(monkeypatch):
         lambda c, kind: ({"B0TANZHELD1": "谭总4", "B0NORMAL01": "A085"}
                          if kind == ln.claims.PRODUCT
                          else {"somebrand": "谭总4"}))
-    *_, owned_asin, owned_brand = ln._load_gate_state()
-    assert owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
-    assert owned_brand == {}
+    gs = ln._load_gate_state()
+    assert gs.owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
+    assert gs.owned_brand == {}
 
 
 # ── LLM 花费上报(所有者 2026-08-21:「上架我也希望可以输出花了多少钱」)────

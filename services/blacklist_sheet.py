@@ -79,7 +79,12 @@ class Shrink(Exception):
 
 
 def next_empty(sheet, start: int = 2) -> int:
-    """输入:登记条目 + 起扫行 → 输出:列 A 首个空行行号(1 行是表头)。"""
+    """输入:登记条目 + 起扫行 → 输出:列 A 首个空行行号(1 行是表头)。
+
+    **两处调用方共用**(blacklist_push 与 maint_sheet.append_records,后者
+    2026-08-27 从自带的同形拷贝改过来):整段扫不到空行时返回**网格末尾 +1**,
+    由调用方负责先扩行(sheet_ensure_rows)再写。
+    """
     grid = feishu.sheet_row_count(sheet)
     row = start
     while row <= grid:

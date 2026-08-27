@@ -378,7 +378,7 @@ catalog_sync(拉在线,已有,不动)
 
 | 位置 | 落地 |
 |---|---|
-| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空**(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。⚠ **表格里没有重审入口**(2026-08-17 更正,原文写的"重审的唯一入口 = 把 E 列清空"是错的,与同段的"非强审"自相矛盾):清空 E 列只让该行重新被**领取**,判不判由库里的 `audit_status` 定,已有结论的会被原样投影回同一格。真重审走 CLI 的 `-p asins=`(点名强审)、`-p rerule=<规则码>`(定点翻案),或 **`-p from_sheet=1 -p force=1`**(2026-08-21 加:E 列为空的一律重判)。⚠ `force` **只改库侧候选谓词,不改领任务口径** —— 所有者原话「不是对表格中所有的强制重审,而是其中还没填写审核结果的重审」,所以 E 列已填结论的表行一行都不会被捞回来。它存在的理由:`rerule` / `mode=nonpass` 的候选谓词都带 `audit_version IS DISTINCT FROM <当前版本>`(天然分页),**全量扫过一遍之后两条通道双双归零**;而飞书数据变了(`risk_sync` 全量重灌 `walmart_pt_meta`,R1/R3 判据整批换掉)并不会递增仓库侧的规则版本号 —— 2026-08-21 所有者手改类目表后实遇 `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道能重判受影响的存量。⚠ 贵:摘要会写明本轮进判定引擎多少条 |
+| 领任务 | `listing_sheet.audit_targets()` = **ASIN 有值且审核结果为空或 `pending`**(2026-08-17 起 pending 一并领回:它是中间态不是结论,写进 E 之后不再领就永久搁浅在表上)(⚠ 2026-08-16 所有者把 A/B 对调成 A=店铺 B=ASIN,读取一律按字段名走 `resources.LISTING_SHEET.columns`,不按列字母);`product_audit -p from_sheet=1` 走既有 `asins=` 路径进判定引擎(引擎仍只有一条实现),但**叠上默认候选谓词而非强审**(所有者纠正 2026-08-16「不是应该直接从库里读取结果吗」):E 列为空 ≠ 库里没结论,已有结论的零 LLM 直接投影,只有未审/pending 过退避的才真判;`LIMIT` 限制的是真判的那部分,ASIN 列表不截断(先截断的话已审过的会占满名额,新品永远排不上)。⚠ **表格里没有重审入口**(2026-08-17 更正,原文写的"重审的唯一入口 = 把 E 列清空"是错的,与同段的"非强审"自相矛盾):清空 E 列只让该行重新被**领取**,判不判由库里的 `audit_status` 定,已有结论的会被原样投影回同一格。真重审走 CLI 的 `-p asins=`(点名强审)、`-p rerule=<规则码>`(定点翻案),或 **`-p from_sheet=1 -p force=1`**(2026-08-21 加:E 列为空的一律重判)。⚠ `force` **只改库侧候选谓词,不改领任务口径** —— 所有者原话「不是对表格中所有的强制重审,而是其中还没填写审核结果的重审」,所以 E 列已填结论的表行一行都不会被捞回来。它存在的理由:`rerule` / `mode=nonpass` 的候选谓词都带 `audit_version IS DISTINCT FROM <当前版本>`(天然分页),**全量扫过一遍之后两条通道双双归零**;而飞书数据变了(`risk_sync` 全量重灌 `walmart_pt_meta`,R1/R3 判据整批换掉)并不会递增仓库侧的规则版本号 —— 2026-08-21 所有者手改类目表后实遇 `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道能重判受影响的存量。⚠ 贵:摘要会写明本轮进判定引擎多少条 |
 | 投影 | `_project_to_sheet()` 写 **C/D/E/F/G**(标题/PT/结论/理由/日期),一行一个 `C{r}:G{r}`。E 列写 `pass/reject/pending`(`listing_sheet.AUDIT_RESULT_CN`,**不是** `approved`)。库里没结论的行 **E 留空并在摘要里点名**——写 pending 会让人以为审过了,而且它下轮不会被重领。回填失败只告警(结论已在 PG,飞书只是界面) |
 | 上架闸 | `list_new.load_verdicts()` 查 `catalog.products`,只放 `audit_status='approved'`;未审核/判拒**逐类点名**(不点名的表现是"表里几百行一行也不上"而无任何提示)。`_retry_rows` 同闸 |
 | 类目 | `list_new._with_pt()`:**PT 也以库为准**(`walmart_pt`),库里没有才退回表 D 列。只读结论不读类目 = 手改 D 列即可绕过审核换类目 |
@@ -529,9 +529,13 @@ dry-run 核对;④ `--execute` 跑一轮;⑤ 次日 catalog_sync 之后再跑一
    的入口逻辑归 C 已就位);listing_sheet 口径注释改(D/E/F/G=审核链投影,仅展示);
    match_listing 的 D 列判定随 L1 跟卖试点时同步定;
 5. **开投影**:product_audit 尾部回填上架表 D/E/F/G(读表 ASIN→查库→批量回写);
-6. **挂新调度**:product_ingest 5 分钟级、product_audit 每小时(批复 #6),
-   顺序约束 catalog_sync → product_refresh → product_ingest → product_audit
-   → problem_scan → problem_product_cleanup --execute → list_new/maintenance;
+6. **挂新调度**(**接线以 `registry/schedule.py` 为准**;2026-08-26 现状与本条原
+   计划已不同:product_ingest 是独立长驻 launchd 每小时 :50、不是 5 分钟级;
+   product_audit 不是每小时,而是 product_chain 13:00 跑
+   `mode=online stages=L0 limit=1000000` + audit_sheet 18:10 跑 `from_sheet=1`),
+   顺序约束 catalog_sync → sources_backfill → product_refresh → product_audit
+   → maintenance_scan → problem_scan → maintenance
+   → problem_product_cleanup --execute → list_new(20:00);
    ⚠ **problem_scan 与 cleanup 之间的先后是硬约束**(批次 E 拆分后):
    scan 产建议、cleanup 消费建议,只跑 cleanup = 消费上一轮的陈旧建议或空转。
 7. **文档收官**:plan.md 总览增行、legacy_schedules.md 停旧清单增审核条目、

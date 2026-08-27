@@ -25,7 +25,8 @@ def _run(monkeypatch, rows, held):
     monkeypatch.setattr(ca.store_targets, "load_targets", lambda: CFG)
     monkeypatch.setattr(ca.claims, "load_active",
                         lambda conn, kind: held.get(kind, {}))
-    monkeypatch.setattr(ca.sku_asin, "extract_asin", lambda s: s)
+    # 装载走 sv.load_rows(2026-08-27 四链收口),抽 asin 那一跳在积木那侧
+    monkeypatch.setattr(ca.sv.sku_asin, "extract_asin", lambda s: s)
 
     class _Cur:
         def __enter__(self): return self

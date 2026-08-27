@@ -15,11 +15,9 @@
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 
-from api import _client
 from api import returns as returns_api
 from registry import db
 from services import order_center, store_retry
@@ -59,41 +57,21 @@ def run(params: dict) -> str:
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    results, dead, to_retry = [], [], []
-    by_name = {s["name"]: s for s in store_list}
-    with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futs = {pool.submit(_sync_one_store, s, created_start): s["name"]
-                for s in store_list}
-        for f in as_completed(futs):
-            name = futs[f]
-            try:
-                results.append(f.result())
-            except _client.StoreDeadError as e:
-                logger.error("店铺 %s 凭证失效跳过: %s", name, e)
-                dead.append(name)
-            except Exception as e:
-                # 代理故障/泛化异常先收着:跑完别人再串行补试一遍
-                # (店级重试标准①,所有者定稿 2026-08-26)
-                logger.exception("店铺 %s 售后同步失败(待串行补试): %s", name, e)
-                to_retry.append((by_name[name], e))
-
-    absent: list[tuple[str, str]] = []
-    gate_note = ""
-    if to_retry:
-        recovered, still, gate_note = store_retry.serial_second_pass(
-            to_retry, lambda s: _sync_one_store(s, created_start),
-            total_stores=len(store_list))
-        results.extend(r for _s, r in recovered)
-        for s, e in still:
-            cls = store_retry.diagnose(e)
-            if cls == "凭证失效":
-                dead.append(s["name"])
-            else:
-                absent.append((s["name"], cls))
+    # 店级重试标准①②(所有者定稿 2026-08-26):跨店并发 → 凭证死跳全店不补试
+    # → 代理故障/泛化异常先收着不判生死,跑完别人再串行补试一遍 → 仍失败按
+    # diagnose 归缺席。骨架在 services/store_retry.fan_out(补试跑的就是这里的
+    # 同一个 _sync_one_store)。
+    results, dead, absent, gate_note = store_retry.fan_out(
+        store_list, lambda s: _sync_one_store(s, created_start),
+        workers, log_label="售后同步")
 
     total = sum(r["lines"] for r in results)
     total_dropped = sum(r.get("dropped", 0) for r in results)
     # 首行 = 结论 + 缺席点名(链通知只发成功步骤的第一行)
+    # ⚠ 这条尾巴**不走** notify_fmt.absent_tail:那个模板固定拼「,本轮不炸链
+    # (处置)」,而本件现行字样是「,该店本轮售后缺口由下轮窗口覆盖」——
+    # 售后是窗口全量重拉,缺口下轮自然补上,没有"避让/重赛"这回事。进飞书的
+    # 字样逐字保留优先于收口(2026-08-27 收口时逐字对拍,拼不出即不接线)。
     lines = [f"returns_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),售后行入库 {total}"
              + (f";⚠ 缺席 {len(absent)} 店:"

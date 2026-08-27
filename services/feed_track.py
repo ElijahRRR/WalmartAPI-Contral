@@ -19,14 +19,39 @@ from services import blacklist, product_events, stores as stores_svc
 
 logger = logging.getLogger("services.feed_track")
 
-# 提交超过此小时数仍 pending(提交结局不确定)→ 告警升级(人工核对后清理)
-_PENDING_ALARM_HOURS = 6
-
 # feedType → 业务动作名(摘要展示;未登记的原样显示)
 _FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
                "MP_MAINTENANCE": "维护", "MP_ITEM": "上架",
                "PRICE_AND_PROMOTION": "改价", "price": "改价",
                "inventory": "改库存"}
+
+# SKU 台账状态 → 飞书表结果列文案。状态词只有一个出处(api/feeds.sku_outcome
+# 的 success/failed/processing/unknown,加台账自己的 submitted/missing),中文面
+# 此前有四份拷贝:clear_sheet:27 / maint_sheet:221 / maint_sheet:343(同一文件
+# 里又内联一份)/ match_sheet:104。本常量是四份的**并集**——processing/unknown
+# 两键只有 clear_sheet 那份有,而 product_clear 是 `RESULT_TEXT[outcome]` 直接
+# 下标取(不是 .get),少一键就是 KeyError,不许"看着重复"就删。
+RESULT_TEXT = {"success": "成功", "failed": "失败", "missing": "未查到",
+               "submitted": "处理中", "processing": "处理中",
+               "unknown": "处理中"}
+
+
+def text_of(status: str, err: str = "") -> str:
+    """输入:台账状态(+可选「码 | 人话」报错)→ 输出:飞书表结果列文案。
+
+    未登记的状态一律按未落定报「处理中」:不装成功也不装失败,下轮反哺器
+    还会再看一次(与 api/feeds.sku_outcome 对未知枚举的态度同口径)。
+    `err` 只在 failed 档拼进去,形状照跟卖表现行的「失败:{报错}」;其余档
+    给了 err 也不拼——成功/未查到后面挂一串报错码没有意义。
+
+    ⚠ maint_sheet 补写口径(:262)是 `.get(status, status)`:未登记状态**原样
+    落表**,给人看的是"台账里到底写了什么"。那一处与本函数的「处理中」不是
+    等价替换,接线时(P1c)要么保留原样落表、要么请所有者拍一次口径,别当
+    成同一件事悄悄改掉。
+    """
+    if err and status == "failed":
+        return f"失败:{err}"
+    return RESULT_TEXT.get(status, "处理中")
 
 
 def error_text(errs: list[dict]) -> str:

@@ -37,7 +37,7 @@
 ## 三、你要实现的功能
 
 采集服务**保持独立部署、保留自己的数据库**(高频写入自己扛,故障隔离)。
-沃尔玛侧会写一个 `catalog_sync` 工作流定期从你这里拉增量。你需要提供:
+沃尔玛侧会写一个 `product_ingest` 工作流定期从你这里拉增量。你需要提供:
 
 1. **可靠的增量导出能力**(核心):
    - 每条记录有单调递增的游标(自增 ID 或 updated_at,须保证不回跳);
@@ -60,7 +60,7 @@
    并存数月。新能力用新增接口/字段实现,不改动现有接口的行为和返回结构。
 2. **不要在你这边做去重或"清理历史"**。多条记录是特性;去重逻辑在沃尔玛侧的分层模型里。
 3. **不要直写沃尔玛侧的中心库**。你只负责把数据可靠地暴露出来,落库由沃尔玛侧的
-   catalog_sync 完成。这保证两边故障互不传染(将来若确有必要再评估直写)。
+   product_ingest 完成。这保证两边故障互不传染(将来若确有必要再评估直写)。
 4. **游标语义要经得起边界测试**:同游标值多条记录、乱序写入、重跑补采——
    任何情况下"从游标 X 拉起"不能漏数据(宁可重复,靠 source_id 去重兜底)。
 5. **审核服务的对接**(第二阶段,先知晓):未来审核服务将改为读 `catalog.products`
@@ -239,8 +239,11 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 
    `open` = 既不是 done 也不是 failed 的数量。**failed 算终态**,所以一张永远
    截不出来的图不会把批次卡死(实测 1 done + 1 failed → completed)。
-   本侧实现在 `services/scrape_batches.is_settled`,product_refresh 与
-   order_audit 共用同一份判据。
+   本侧 `services/scrape_batches.is_settled` **只看 `tasks.open == 0`**,
+   **不看 `screenshots.open`**(2026-08-10 实测后改:任务失败后它那张图永远
+   截不出来,`screenshots.open` 会永久停在 >0、批次于是永远落不定);截图
+   另由 `shots_open()` 单独看,不参与落定。product_refresh 与 order_audit
+   共用同一份判据。
 
    ⚠ **批次 completed 不等于我们库里有数据**:中间还隔着增量导出 →
    product_ingest 两跳。所以批次状态只用来判"还要不要等"和"失败原因是什么",
@@ -315,8 +318,9 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    - 本端点 404 **只有一个含义:批次名不存在**(与增量端点的 404 语义
      不同);没有 409——保留期裁老批次时照实回 200 + 不完整集合。
    - `/api/export/incremental` 仍是产品中心的**兜底全量补给线**
-     (product_chain 每天的 product_ingest),批次端点不替代它——
-     product_refresh 那条大流水仍靠全量泵摄入。
+     (product_ingest 已从 product_chain 里摘出,改成每小时长驻的独立任务),
+     批次端点不替代它——但 product_refresh 那条大流水 2026-08-19 起也在
+     同轮按批摄取自己推的批,全量泵只兜其余增量(超时批的尾巴、零散采集)。
 
 **另有两条实现语义,消费侧必须遵守**:
 
@@ -336,7 +340,7 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 
 ## 六、验收标准
 
-- 沃尔玛侧 catalog_sync 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
+- 沃尔玛侧 product_ingest 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
   无重复入库(source_id 冲突计数为 0)、products/snapshots 分层数据正确。
 - 现有旧系统(erpAPI)链路零感知、零故障。
 

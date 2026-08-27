@@ -461,7 +461,7 @@ RETIRE_SHEET = Spreadsheet(
 )
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
-# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+# product_clear 读「下架限制」,listing 链读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
 # A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
@@ -761,9 +761,6 @@ _SUPER_CATEGORY_OF = {
 # 会让 alloc_audit 去点名两个其实填得对的值,人就学会忽略那一栏了。
 _UNMAPPED_CATEGORIES = ("Safety & Emergency", "Everything Else")
 
-# 库里 26 个 `Walmart Category` 的全集(24 个有映射 + 上面两个不归)。
-WALMART_CATEGORIES = tuple(sorted(_SUPER_CATEGORY_OF)) + _UNMAPPED_CATEGORIES
-
 
 def _fold(v) -> str:
     """输入:任意填写值 → 输出:比对用的归一键(小写 + 内部空白压单空格)。
@@ -899,9 +896,6 @@ UPC_SHEET = Spreadsheet(
 
 # 维护记录(maintenance 流水账):与「在线产品总表」同一 spreadsheet 的
 # 另一工作表(所有者已建,2026-08-07;多维表格 5 万行上限装不下故用电子表格)。
-# 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
-# feed 路径 F 写真 feedid、H 由 feed_poll 反哺器回填;PUT 同步路径 F 写
-# "sync"、H 当场写 成功/失败。
 # 维护记录(流水账,只追加):A~K 十一列。
 # 2026-08-16 所有者在飞书加了「建议」「原因」两列(9 → 11),配合 maintenance
 # 拆成 scan(决策,写 建议/原因)+ 执行件(写 动作/feedid/结果/报错)。

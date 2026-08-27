@@ -170,6 +170,46 @@ def test_payload_key_order_independent():
         feeds.payload_key("RETIRE_ITEM", ["A"])
 
 
+def test_iter_result_slices_walks_the_cursor_without_off_by_one():
+    """submit_feed 只回 count 不回条目:对位全靠游标,错一位就是整批结局
+    落到别人行上,而且**不报错**(6 个工作流各手写过一遍这段游标)。"""
+    entries = [f"S{i}" for i in range(10)]
+    results = [{"count": 3, "outcome": "submitted"},
+               {"count": 1, "outcome": "dedup"},
+               {"count": 6, "outcome": "failed"}]
+    got = list(feeds.iter_result_slices(results, entries))
+
+    assert [r for r, _ in got] == results               # 结果原样带出
+    assert [len(b) for _, b in got] == [3, 1, 6]        # 逐片长度 = count
+    assert [e for _, b in got for e in b] == entries    # 切片总和 = entries
+    assert got[0][1] == ["S0", "S1", "S2"]
+    assert got[1][1] == ["S3"]                          # 下一片从上一片之后接上
+    assert got[2][1][0] == "S4" and got[2][1][-1] == "S9"
+    assert list(feeds.iter_result_slices([], entries)) == []
+    assert list(feeds.iter_result_slices([{"count": 0}], entries)) == \
+        [({"count": 0}, [])]                            # 空片不吃条目
+
+
+def test_iter_result_slices_reproduces_real_slicing(monkeypatch):
+    """与真实切片对拍:片数、逐片长度、拼回原序都要还原 _slices 的分法。"""
+    monkeypatch.setitem(feeds._SLICE_LIMITS, "DELETE_ITEM", (7, 350_000))
+    entries = [f"S{i}" for i in range(23)]
+    chunks = feeds._slices("DELETE_ITEM", entries)
+    results = [{"count": len(c), "outcome": "submitted"} for c in chunks]
+
+    assert [len(c) for c in chunks] == [7, 7, 7, 2]     # 末片不满也要对得上
+    assert [b for _, b in feeds.iter_result_slices(results, entries)] == chunks
+
+
+def test_iter_result_slices_takes_any_parallel_list():
+    """entries 不必是提交的载荷,只要同序等长——6 个工作流传的都是自己的
+    业务行(飞书行号 / (行, 载荷) 对 / 台账行)。"""
+    rows = [{"rownum": i} for i in range(5)]
+    results = [{"count": 2}, {"count": 3}]
+    assert [b for _, b in feeds.iter_result_slices(results, rows)] == [
+        rows[:2], rows[2:]]
+
+
 # ── 提交:防重/成功/被拒/反查三态 ─────────────────────────────────────────────
 
 def test_submit_dedup_refuses_resubmission(monkeypatch):

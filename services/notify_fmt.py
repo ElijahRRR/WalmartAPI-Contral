@@ -41,9 +41,13 @@
         warns=[f"⚠ UPC 池余量 {left} 个,不够明天(补池:cli.py upc_sync)"
                if left < 500 else ""],           # 空串自动消失
     )
-"""
 
-_UNSET = object()
+本模块同时是**通知文本公共积木之家**(所有者 2026-08-27 定稿:采纳标准件、
+按实际情况推行,不做全仓化妆式重写;新写/大改的工作流起用 head/summary)。
+已收口的成品尾巴:`feed_outcome_tail`(feed 四档计数)、`absent_tail`
+(缺席店点名),两者都只管排版,**字样由调用方给**——进飞书通知的字不由
+积木替所有者统一。
+"""
 
 
 def num(v, unit: str = "") -> str:
@@ -144,3 +148,62 @@ def first_line_of(text: str) -> str:
         if ln.strip():
             return ln.strip()
     return ""
+
+
+# ── 多工作流逐字重复的两段尾巴 ────────────────────────────────────────────────
+
+def feed_outcome_tail(submitted, dedup, failed, unknown, *,
+                      failed_word: str) -> str:
+    """输入:feed 四档计数 + 失败档字样 → 输出:摘要里「提交 N,…」那半句。
+
+    接在调用方自己的前缀后面(前缀说清是哪家店、哪种动作),三个执行件的
+    现行成品分别是:
+
+        f"  {name}:{label} feed " + tail   →   店A:标题 feed 提交 12,…
+        f"  {store_name}:跟卖"    + tail   →   店A:跟卖提交 12,…
+        f"  {store_name}:{label}" + tail   →   店A:删除提交 12,…
+
+    规矩 2 的原样落地:`提交 N` 是主指标**恒打印**(提交 0 是重要信息),
+    dedup/failed/unknown 是例外计数,恰好 0 才省。
+
+    ⚠ `failed_word` 必须由调用方给:maintenance 与 match_listing 现行写
+    「提交被拒」,problem_product_cleanup 写「提交失败」——进飞书通知的字样
+    收口时逐字保留三处现状,本函数不替所有者统一措辞。
+    ⚠ 数字不过 `num()`:这三处现行就是裸整数,有测试逐字钉着。
+    """
+    line = f"提交 {submitted}"
+    if dedup:
+        line += f",在途防重跳过 {dedup}"
+    if failed:
+        line += f",⚠ {failed_word} {failed}(查日志)"
+    if unknown:
+        line += f",⚠ 结局不确定留 pending {unknown}(待对账)"
+    return line
+
+
+def absent_tail(absent, gate_note: str, *, tail: str) -> str:
+    """输入:缺席店 [(店名, 归类词)] + 规模闸提示 + 下游处置句 → 输出:接在
+    摘要首行末尾的缺席点名(没有缺席店给空串)。
+
+    形态(与 catalog_sync / order_sync 现行首行逐字一致):
+
+        ;⚠ 缺席 2 店:A085(代理波动),81张三(网络未达)——已串行补试仍失败,本轮不炸链(下游按水位避让,链尾重赛)
+
+    店级重试标准③(conventions §四):缺席不炸整轮,但必须点名在**首行**——
+    链通知对成功步骤只发首行(cli.first_line_of),写在后面等于只写进日志。
+    `gate_note` 非空 = 补试规模闸拦下了整批,中段改说「超补试规模闸未补试
+    (疑似系统性故障)」。
+
+    ⚠ `tail` 是括号里那句"下游怎么办",由调用方给(规矩 3「每条 ⚠ 自带
+    处置」,各链的处置本来就不同):catalog_sync 传「下游按水位避让,链尾
+    重赛」(目录有水位,下游按 store_absence 避让),order_sync 传「下轮整点
+    自然重拉」(订单窗口全量重拉 + 幂等 upsert,不需要避让)。两句不许在
+    收口时被统一成一句。
+    """
+    if not absent:
+        return ""
+    return (f";⚠ 缺席 {len(absent)} 店:"
+            + ",".join(f"{n}({c})" for n, c in absent)
+            + ("——超补试规模闸未补试(疑似系统性故障)" if gate_note
+               else "——已串行补试仍失败")
+            + f",本轮不炸链({tail})")

@@ -126,6 +126,94 @@ def test_serial_second_pass_never_retries_dead_credentials(monkeypatch):
     assert still == [({"name": "T1"}, dead)]
 
 
+# ── ①② 跨店并发 → 补试 → 分流(catalog_sync/returns_sync 共用骨架)───────────
+
+def _scripted(plan):
+    """plan={店名: [第一轮产物, 补试产物]}(异常实例即抛)→ (每店调用次数, attempt)。"""
+    import threading
+    seen: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def attempt(store):
+        name = store["name"]
+        with lock:
+            n = seen[name] = seen.get(name, 0) + 1
+        script = plan[name]
+        out = script[min(n, len(script)) - 1]
+        if isinstance(out, Exception):
+            raise out
+        return out
+    return seen, attempt
+
+
+def test_fan_out_splits_dead_absent_and_recovered(monkeypatch, caplog):
+    """三路分流一次钉死:成功(含补试救回)→ results;凭证死 → dead(**补试中
+    才暴露的那种也归 dead 口径**);补试仍失败 → absent 带归类词。
+    凭证死一次都不补试(重试只会再死一次)。"""
+    _no_sleep(monkeypatch)
+    from socksio.exceptions import ProtocolError
+    names = ("好店", "救得回", "缺席店", "死店", "补试才死")
+    plan = {
+        "好店": [{"store": "好店"}],
+        "救得回": [ProtocolError("Malformed reply"), {"store": "救得回"}],
+        "缺席店": [ProtocolError("Malformed reply"),
+                ProtocolError("Malformed reply")],
+        "死店": [_client.StoreDeadError("死店", 401)],
+        "补试才死": [OSError("first"), _client.StoreDeadError("补试才死", 400)],
+    }
+    seen, attempt = _scripted(plan)
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": n} for n in names], attempt, 4, log_label="同步")
+    assert sorted(r["store"] for r in results) == sorted(["好店", "救得回"])
+    assert sorted(dead) == sorted(["死店", "补试才死"])
+    assert absent == [("缺席店", "代理波动")]      # 归类词唯一出处 = diagnose
+    assert gate == ""
+    assert seen["死店"] == 1                      # 凭证死:一次都不补
+    assert seen["救得回"] == seen["缺席店"] == 2   # 补试跑的是第一轮同一个函数
+    assert "同步失败(待串行补试)" in caplog.text   # log_label 只进日志
+
+
+def test_fan_out_reports_the_scale_gate_and_skips_second_pass(monkeypatch):
+    """规模闸命中时四元组照样自洽:一家都不补试,失败店全进 absent,
+    gate_note 非空交回调用方(它必须进摘要,否则「没补试」这件事无人知道)。"""
+    _no_sleep(monkeypatch)
+    plan = {f"店{i}": [OSError("x"), OSError("x")] for i in range(4)}
+    plan.update({f"店{i}": [{"store": f"店{i}"}] for i in range(4, 10)})
+    seen, attempt = _scripted(plan)
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": n} for n in plan], attempt, 4)
+    assert len(results) == 6 and dead == []
+    assert all(seen[f"店{i}"] == 1 for i in range(4))    # 4 > max(3, 10//5) → 全停
+    assert sorted(absent) == sorted((f"店{i}", "其他") for i in range(4))
+    assert "系统性故障" in gate
+
+
+def test_fan_out_is_a_noop_without_stores():
+    """零店不开线程池(min(workers,0) 会炸);「零店完成不许报成功」是调用方
+    各自的闸(catalog_sync/returns_sync 的 `if not results: raise`),不在这里判。"""
+    assert store_retry.fan_out([], lambda s: 1 / 0, 4) == ([], [], [], "")
+
+
+def test_fan_out_really_runs_stores_concurrently(monkeypatch):
+    """**跨店并发**是这个积木存在的理由,必须有断言钉住:每店有自己的固定出口
+    代理、沃尔玛按 (store, endpoint) 计配额(services/stores 头注),24 店串行
+    跑不完一轮链。用屏障判并发而不是掐表:三家店必须同时在场才放行 ——
+    退化成串行(或 workers 被写死收窄)时第一家就卡到屏障超时,一眼打红。
+    ⚠ 对抗校验 2026-08-27:上面三个用例对 `max_workers=1` 全绿,补此闸。"""
+    _no_sleep(monkeypatch)
+    import threading
+    barrier = threading.Barrier(3, timeout=10)
+
+    def attempt(store):
+        barrier.wait()          # 串行实现在这里 BrokenBarrierError
+        return {"store": store["name"]}
+
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": f"店{i}"} for i in range(3)], attempt, 3)
+    assert sorted(r["store"] for r in results) == ["店0", "店1", "店2"]
+    assert (dead, absent, gate) == ([], [], "")
+
+
 def test_classify_names_the_actual_culprit():
     """所有者要求(2026-08-26):出问题一眼看到是凭证失效、代理无效、
     代理波动还是沃尔玛侧 —— 六档词表,每档指一条不同的处置路。"""
@@ -220,6 +308,35 @@ def test_stale_stores_morning_dry_run_is_not_a_false_alarm(monkeypatch):
     assert store_absence.stale_stores(conn) == []
 
 
+def test_stale_or_note_normal_path_and_only_narrowing(monkeypatch):
+    """避让侧取数口:正常路 = 真判据(stale_stores)+ 空提示语;
+    带 only 时只报本范围内的缺席(范围外的店与本轮无关)。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    import services.stores as stores_svc
+    monkeypatch.setattr(stores_svc, "enabled_names",
+                        lambda: ["新鲜店", "缺席店"])
+    conn = _Conn([("新鲜店", now), ("缺席店", now - timedelta(hours=24))])
+    assert store_absence.stale_or_note(conn) == ({"缺席店"}, "")
+    assert store_absence.stale_or_note(conn, only="缺席店") == ({"缺席店"}, "")
+    assert store_absence.stale_or_note(conn, only="新鲜店") == (set(), "")
+
+
+def test_stale_or_note_degrades_with_the_exact_wording(monkeypatch):
+    """探测经 enabled_names 走飞书:一次抖动不许拦下整轮 —— 退成「不避让」
+    (= 加缺席避让之前的行为)并逐字交还那句提示语。四个工作流的摘要里
+    就是这一句,措辞归本函数唯一出处。"""
+    import services.stores as stores_svc
+
+    def boom():
+        raise RuntimeError("飞书 500")
+    monkeypatch.setattr(stores_svc, "enabled_names", boom)
+    absent, note = store_absence.stale_or_note(_Conn([]), only="任意店")
+    assert absent == set()
+    assert note == "⚠ 缺席探测失败(RuntimeError),本轮不避让"
+    assert not note.startswith(";")     # 分号由拼首行的调用方自己加
+
+
 # ── ④ 链尾重赛(cli._replay_absent)─────────────────────────────────────────────
 
 def _replay_wire(monkeypatch, absent, statuses, chronic=(), still=(),
@@ -242,7 +359,8 @@ def _replay_wire(monkeypatch, absent, statuses, chronic=(), still=(),
     def fake_run_step(name, module, params, dry_run, operator, logs_dir):
         ran.append((params.get("store"), name))
         st = statuses.get((params.get("store"), name), "success")
-        return st, f"{name} {st}\n第二行明细"
+        # 形状 = _run_step 真实产物:横幅行 + 摘要(折叠必须取摘要首行)
+        return st, f"{name} {st}\n{name}:{st} 摘要首行\n第二行明细"
     monkeypatch.setattr(cli, "_run_step", fake_run_step)
     mods = {
         "catalog_sync": types.SimpleNamespace(SUPPORTS_STORE=True),
@@ -265,8 +383,10 @@ def test_replay_runs_store_scoped_steps_once_per_absent_store(monkeypatch):
                    ("店A", "maintenance")]
     assert any("sources_backfill" in ln and "跳过" in ln for ln in lines)
     assert any(ln.startswith("✅ 店A:救回") for ln in lines)
-    # 每步摘要首行保留:重赛跑的是 DANGEROUS 步骤,发了多少不能只剩一个 ✅
-    assert any("maintenance success" in ln for ln in lines)
+    # 每步压的是**摘要首行**(不是「名 成功」横幅):重赛跑的是 DANGEROUS
+    # 步骤,发了多少 feed 不能只剩一个 ✅,更不能只剩横幅
+    assert any("maintenance:success 摘要首行" in ln for ln in lines)
+    assert not any(ln.strip().startswith("· maintenance success") for ln in lines)
 
 
 def test_replay_stops_that_store_on_first_failure_and_says_so(monkeypatch):
@@ -315,6 +435,32 @@ def test_replay_demotes_green_steps_when_watermark_did_not_advance(monkeypatch):
     lines, _ran = _replay_wire(monkeypatch, ["店A"], {}, still=["店A"])
     assert any("水位未推进" in ln for ln in lines)
     assert not any(ln.startswith("✅ 店A") for ln in lines)
+
+
+def test_replay_says_unverified_when_recheck_itself_fails(monkeypatch):
+    """水位复核探测失败 ≠ 都救回了(2026-08-26 审计实见:裸 except 落空 still
+    → 每家都发 ✅):按「未核实」报,不发假 ✅,也不炸重赛结果。"""
+    import contextlib
+    import types
+
+    import cli
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    from services import store_absence as sa
+    monkeypatch.setattr(sa, "split_stale", lambda conn, since: (["店A"], []))
+
+    def boom(conn, since=None, lag_hours=None):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(sa, "stale_stores", boom)
+    monkeypatch.setattr(cli, "_run_step",
+                        lambda name, module, params, dry_run, operator,
+                        logs_dir: ("success", f"{name} 成功\n{name}:摘要首行"))
+    mods = {"catalog_sync": types.SimpleNamespace(SUPPORTS_STORE=True)}
+    lines = cli._replay_absent(list(mods), mods, {"catalog_sync": {}},
+                               False, "test", None, since=None)
+    assert any("水位复核失败" in ln and "未核实" in ln for ln in lines)
+    assert not any(ln.startswith("✅ 店A:救回") for ln in lines)
 
 
 def test_main_wires_replay_after_a_successful_catalog_chain(monkeypatch,
@@ -402,9 +548,11 @@ def test_maint_settle_has_a_grace_period():
     assert ds.MAINT_SETTLE_GRACE_HOURS >= 1
 
 
-def test_order_sync_names_the_culprit_and_gates_zero_stores(monkeypatch):
-    """order_sync 的失败行带六档归类词;零店完成必须失败(2026-08-26 补齐,
-    与 returns_sync 同款闸 —— 此前同一条 order_chain 里两步不对称)。"""
+def test_order_sync_full_standard_and_zero_gate(monkeypatch):
+    """order_sync 走全套标准(2026-08-26 审计补齐:此前只做隔离+分诊,同链
+    returns_sync 是全套):失败店**串行补试**重调同一个 fetch_orders_bulk
+    (单店入参),仍失败以「⚠ 缺席」+ 归类词点名进摘要**首行**;补试救回的
+    照常入账;零店完成必须失败。"""
     import pytest as _pytest
 
     from workflows import order_sync as osw
@@ -413,16 +561,68 @@ def test_order_sync_names_the_culprit_and_gates_zero_stores(monkeypatch):
     monkeypatch.setattr(osw.order_center, "push_after",
                         lambda spec, days=90: "投影桩")
     from socksio.exceptions import ProtocolError
-    monkeypatch.setattr(
-        osw.orders_api, "fetch_orders_bulk",
-        lambda stores, **k: ([{"store": "T1", "lines": 3}], [],
-                             [("T2", ProtocolError("Malformed reply"))]))
+    calls = []
+
+    def fake_bulk(stores, **k):
+        calls.append([s["name"] for s in stores])
+        if len(stores) > 1:                     # 首轮:T2 断
+            return ([{"store": "T1", "lines": 3}], [],
+                    [("T2", ProtocolError("Malformed reply"))])
+        return ([], [], [(stores[0]["name"],    # 补试:同店再断
+                          ProtocolError("Malformed reply"))])
+
+    monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk", fake_bulk)
     out = osw.run({})
-    assert "T2(代理波动:Malformed reply)" in out       # 归类词指路
+    assert calls == [["T1", "T2"], ["T2"]]      # 补试 = 单店重调同一个函数
+    first = out.splitlines()[0]                 # 标准③:缺席点名在首行
+    assert "⚠ 缺席 1 店:T2(代理波动)" in first
+    assert "已串行补试仍失败" in first
+
+    calls.clear()                               # 补试救回:照常入账,无缺席
+
+    def fake_bulk_recover(stores, **k):
+        calls.append([s["name"] for s in stores])
+        if len(stores) > 1:
+            return ([{"store": "T1", "lines": 3}], [],
+                    [("T2", ProtocolError("Malformed reply"))])
+        return ([{"store": "T2", "lines": 7}], [], [])
+
+    monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk", fake_bulk_recover)
+    out = osw.run({})
+    assert "2/2 店完成" in out and "订单行入库 10" in out
+    assert "缺席" not in out
+
     monkeypatch.setattr(osw.orders_api, "fetch_orders_bulk",
                         lambda stores, **k: ([], ["T1", "T2"], []))
     with _pytest.raises(RuntimeError, match="零店完成"):
         osw.run({})
+
+
+def test_workflows_that_use_store_retry_import_it():
+    """调 store_retry.* 的 workflow 必须真的 import 它 —— 2026-08-26 审计实见
+    三个文件(daily_report/perf_problems/settlement_sync)复制了分诊块却漏了
+    import:店一失败 except 体先 NameError,单店隔离变成一店放倒整轮。
+    用 AST 判引用(文本 grep 会被注释里的字样骗过 —— order_sync 当初就是
+    这么漏网的)。"""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "workflows"
+    offenders = []
+    for py in sorted(root.glob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"))
+        uses = any(isinstance(n, ast.Attribute)
+                   and isinstance(n.value, ast.Name)
+                   and n.value.id == "store_retry" for n in ast.walk(tree))
+        if not uses:
+            continue
+        imported = any(
+            isinstance(n, ast.ImportFrom) and n.module == "services"
+            and any(a.name == "store_retry" for a in n.names)
+            for n in ast.walk(tree))
+        if not imported:
+            offenders.append(py.name)
+    assert not offenders, f"调 store_retry 却没 import:{offenders}"
 
 
 def test_withdraw_sql_carries_the_exclude_stores_clause():

@@ -125,7 +125,9 @@ def test_upc_sync_workflow_projection(monkeypatch):
                   ["212345678901", "2026-08-07", "", "", "", ""]]
     writes = []
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: 3)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     from datetime import datetime
@@ -144,6 +146,54 @@ def test_upc_sync_workflow_projection(monkeypatch):
     assert w["C2:F2"] == ["已用", "T1", "SKU9", "2026-08-07"]
     assert w["C3:F3"] == ["非法前缀", "", "", ""]
     assert "新入库 1" in out and "非法前缀 1" in out and "未用 5" in out
+
+
+def test_upc_rownum_comes_from_the_read_channel_not_from_hand_math(monkeypatch):
+    """跨块读时行号只能取读通道给的那个,手算 `i + 2` 会写到别人的号上。
+
+    表长过一块(4750 行)之后读通道分块发请求,而飞书只裁**范围尾部**的空行:
+    块尾一空,那一块少返几行,下一块的行号照旧从块首起算。按返回序号手算的
+    那版会把第二块整体上移,`project_to_sheet` 的 `C{行}:F{行}` 定点回写就把
+    "已用/店铺/SKU"盖到隔壁那个还没发出去的号上 —— 表里凭空多一个已用号,
+    真正用掉的那行还空着,两边都不报错。UPC 表本来就是几万行起步的常客。
+    """
+    monkeypatch.setattr(resources, "UPC_SHEET",
+                        Spreadsheet(name="UPC池", token="TOK", sheet_id="SID",
+                                    columns=resources.UPC_SHEET.columns))
+    block = feishu._SHEET_READ_BLOCK_ROWS
+    last = block + 5                        # 数据行 2..last,跨两块
+    holes = {block, block + 1}              # 第一块的最后两行是空的 → 被裁掉
+    grid = {r: [f"84256553{r:04d}", "2026-08-07", "", "", "", ""]
+            for r in range(2, last + 1) if r not in holes}
+
+    def fake_raw(sheet, rng):
+        head, tail = rng.split(":")
+        got = [grid.get(r, []) for r in range(int(head[1:]), int(tail[1:]) + 1)]
+        while got and not got[-1]:          # 只裁范围尾部,中段空行占位
+            got.pop()
+        return got
+
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_row_count", lambda s: last)
+    monkeypatch.setattr(feishu, "_values_raw", fake_raw)   # 真通道跑在假飞书上
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    monkeypatch.setattr(upc_pool, "sync_rows", lambda conn, rows: (0, 0))
+
+    from datetime import datetime
+    marked = {2: "T_HEAD", block + 2: "T_AFTER_HOLE", last: "T_LAST"}
+    monkeypatch.setattr(upc_pool, "lookup", lambda conn, upcs: {
+        upc_pool.normalize(grid[r][0]): ("used", store, f"SKU{r}",
+                                         datetime(2026, 8, 7))
+        for r, store in marked.items()})
+
+    got = upc_pool.sync_from_sheet(None)
+    assert [r["rownum"] for r in got["rows"]] == sorted(grid)   # 空行不占号
+    assert upc_pool.project_to_sheet(None, got["rows"]) == len(marked)
+    w = {rng: vals[0] for rng, vals in writes}
+    for r, store in marked.items():
+        assert w[f"C{r}:F{r}"] == ["已用", store, f"SKU{r}", "2026-08-07"]
+    assert all(f"C{r}:F{r}" not in w for r in holes)            # 空行一格未写
 
 
 # ── 定价 ─────────────────────────────────────────────────────────────────────

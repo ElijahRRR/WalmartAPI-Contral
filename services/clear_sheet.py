@@ -37,14 +37,18 @@ def read_rows() -> list[dict]:
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    values = feishu.sheet_values(sheet, f"A2:H{total}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(行方向分块 + 90221 对半兜底);
+    # 行号取通道返回的 rownum,不再 i+2 手算:飞书只裁**范围尾部**的空行
+    # (中段空行仍占位),所以块尾一空那块就少返几行,而下一块的行号照旧从
+    # 块首起算 —— 按返回序号手算会把后面每一块整体上移
+    pairs = feishu.sheet_values_rows(sheet, "A", "H", 2, total)
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 8
         store, sku, action, reason, feed_id, op_date, result, error = cells[:8]
         if not (store or sku):
             continue
-        rows.append({"rownum": i + 2, "store": store, "sku": sku,
+        rows.append({"rownum": rownum, "store": store, "sku": sku,
                      "action": action, "reason": reason, "feed_id": feed_id,
                      "op_date": op_date, "result": result, "error": error})
     return rows

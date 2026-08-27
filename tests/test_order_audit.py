@@ -509,7 +509,8 @@ def wired(monkeypatch):
     calls = {"updates": None, "uploaded": []}
 
     monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 10)
-    monkeypatch.setattr(wf.feishu, "sheet_values", lambda s, r: [["60606"]])
+    monkeypatch.setattr(wf.feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw: [(r1, ["60606"])])
     monkeypatch.setattr(wf.feishu, "list_records",
                         lambda t: [_rec(name="甲", m="FBA", lo=0, hi=1000, rate=1.0)])
 

@@ -43,7 +43,7 @@ def wired(monkeypatch):
         if start == 1:
             return []          # 表头行回读为空 → 回落 registry 登记列名
         return [[c] for c in cells[start - 2:]]
-    monkeypatch.setattr(wf.feishu, "sheet_values", values)
+    monkeypatch.setattr(wf.feishu, "sheet_values_small", values)
     monkeypatch.setattr(wf.feishu, "sheet_write_ranges",
                         lambda s, ups: calls["writes"].append((which(s), ups)) or 1)
     calls["overwritten"] = {}
@@ -325,12 +325,12 @@ def test_next_empty_scans_in_big_blocks(wired, monkeypatch):
     calls, cells = wired
     cells["asin"] = ["A%d" % i for i in range(12000)]      # 已填 12000 行
     ranges = []
-    real = wf.feishu.sheet_values
+    real = wf.feishu.sheet_values_small
 
     def spy(sheet, rng):
         ranges.append(rng)
         return real(sheet, rng)
-    monkeypatch.setattr(wf.feishu, "sheet_values", spy)
+    monkeypatch.setattr(wf.feishu, "sheet_values_small", spy)
     monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 20000)
 
     row = sheets.next_empty(wf.resources.ASIN_BLACKLIST_SHEET)

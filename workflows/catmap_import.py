@@ -67,7 +67,10 @@ def read_sheet() -> list[dict]:
         return []
     hdr = resources.CATMAP_SHEET_HEADER
     last = chr(ord("A") + len(hdr) - 1)
-    values = feishu.sheet_values(sheet, f"A1:{last}{total}")
+    # 表头行(第 1 行)一起读进来做列序校验;上界随表长增长 ⇒ 走唯一标准读通道
+    # (分块 + 90221 对半)。本函数按位置认表头、按列名取值,不认行号
+    values = [row for _rownum, row
+              in feishu.sheet_values_rows(sheet, "A", last, 1, total)]
     if not values:
         return []
     got = tuple((str(c).strip() if c else "") for c in values[0][:len(hdr)])

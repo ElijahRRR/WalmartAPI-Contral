@@ -78,7 +78,8 @@ def _probe() -> str:
             continue
         filled = sheets.next_empty(s) - 2
         width = chr(ord("A") + len(s.columns) - 1)
-        head = feishu.sheet_values(s, f"A2:{width}2") if filled else []
+        # 固定单行回读(行 2),上界不随表长走 ⇒ 小范围薄壳
+        head = feishu.sheet_values_small(s, f"A2:{width}2") if filled else []
         lines.append(f"「{s.name}」→ 子表「{titles[s.sheet_id]}」已填 {filled} 行"
                      + (f",行 2 回读 {head[0]}" if head else "")
                      + f";库侧已推 {pushed} / 自产共 {total}"

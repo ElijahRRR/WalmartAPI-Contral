@@ -372,7 +372,10 @@ def _load_config() -> tuple[set[str], list[rules.Supplier]]:
     # 范围按实际行数取,不写死上限:旧系统写死 A1:A500,黑名单超 500 条即
     # 静默截断——漏掉的钓鱼邮编会一路放行到通过
     n_rows = max(feishu.sheet_row_count(sheet), 1)
-    rows = feishu.sheet_values(sheet, f"A1:A{n_rows}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(分块 + 90221 对半);
+    # zip_blacklist 收的是一堆行、不认行号,rownum 丢掉
+    rows = [row for _rownum, row
+            in feishu.sheet_values_rows(sheet, "A", "A", 1, n_rows)]
     blacklist = rules.zip_blacklist(rows)
 
     table = resources.SUPPLIER_TABLE.require()

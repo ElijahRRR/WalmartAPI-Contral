@@ -22,6 +22,14 @@ feed 路径的结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 
 —— 键对不上,于是每一行都查不到、整行追加,而两边都不报错。
 连接键必须两端同一个函数算出来,不能各取各的字段。
 
+表格读取一律走 `feishu.sheet_values_rows`(唯一标准读通道:行方向分块 + 90221
+对半兜底,返回 `(行号, 行值)` 对)。本文件三处读(反哺器区间 / 补写存量 / 裁剪
+全表)的范围上界都随表长增长 —— 一天几千行,单发裸读在表长大后必撞飞书单响应
+10MB 上限(90221 data exceeded)。**2026-08-27 生产**:反哺器读整段炸在这里,
+水位一步不推 ⇒ 积压每轮重读、越读越大,靠下一轮自愈是不可能的,必须一次读完。
+⚠ 行号只用通道给的那个,不许拿区间起点 + enumerate 手算:飞书会裁掉**块尾**
+空行,手算会从那一块起整段错位(错位的后果是回填写到别人的行上)。
+
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":
 最早未落定行}。反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
 ⚠ 反哺器**跨过没有 feedid 的行**(它认为那些没有待办)。当前形态下每行都是提交
@@ -61,7 +69,7 @@ def _idx(name: str) -> int:
 _FIRST_COL = "A"
 
 
-def _span() -> str:
+def _span() -> tuple[str, str]:
     """输入:无 → 输出:整行范围的列字母对,如 ('A', 'K')。"""
     return _FIRST_COL, feishu._col_letter(len(resources.MAINT_SHEET.columns))
 
@@ -237,7 +245,9 @@ def resync_from_ledger() -> str:
     hi = int(cur_state.get("next_row", 2))
     have: set[tuple[str, str]] = set()
     if hi > 2:
-        for raw in feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}"):
+        first, last = _span()
+        for _rownum, raw in feishu.sheet_values_rows(
+                resources.MAINT_SHEET, first, last, 2, hi - 1):
             cells = ([(str(c).strip() if c is not None else "") for c in raw]
                      + [""] * len(resources.MAINT_SHEET.columns))
             # 按列名取下标(2026-08-16 加了「建议」「原因」两列;写死 5/1 的话
@@ -292,18 +302,19 @@ def sync_from_ledger() -> str | None:
     lo, hi = int(cur_state.get("unresolved_from", 2)), int(cur_state.get("next_row", 2))
     if lo >= hi:
         return None
-    values = feishu.sheet_values(resources.MAINT_SHEET,
-                                 f"A{lo}:{_span()[1]}{hi - 1}")
+    first, last = _span()
+    values = feishu.sheet_values_rows(resources.MAINT_SHEET, first, last,
+                                      lo, hi - 1)
     updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
     stale_cut, n_stale = _today() - timedelta(days=STALE_DAYS), 0
-    for i, raw in enumerate(values):
+    # 行号取通道给的(分块读,块尾空行会被飞书裁掉 —— 见模块头注)
+    for rownum, raw in values:
         cells = ([(str(c).strip() if c is not None else "") for c in raw]
                  + [""] * len(resources.MAINT_SHEET.columns))
         sku = cells[_idx("sku")]
         fid = cells[_idx("feed_id")]
         result = cells[_idx("result")]
-        rownum = lo + i
         # 超期兜底(所有者定稿 2026-08-09):一行永远悬着会把水位钉死,
         # 每轮 feed_poll 都要重读整段。超 STALE_DAYS 天判「未查到」放行——
         # **状态权威在 ops.feed_items,这里只是展示面板不再等它**。
@@ -387,11 +398,13 @@ def prune(days: int = RETAIN_DAYS) -> str:
     hi = int(cur_state.get("next_row", 2))
     if hi <= 2:
         return "维护记录:表内无数据行,无需裁剪"
-    values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}")
+    first, last = _span()
+    values = feishu.sheet_values_rows(resources.MAINT_SHEET, first, last,
+                                      2, hi - 1)
     cut = _today() - timedelta(days=days)
     ncol = len(resources.MAINT_SHEET.columns)
     kept = []
-    for raw in values:
+    for _rownum, raw in values:
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * ncol
         if not any(cells[:ncol]):
             continue                    # 空行不留

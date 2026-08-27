@@ -565,9 +565,13 @@ def upload_media(table: Bitable, file_name: str, content: bytes,
 #: 两层分工别混:
 #:   · 这一条(20000,超了**截断 + 告警**):采集来的标题/描述超两万字必是脏数据,
 #:     截掉照写,不因为一行脏数据把整轮写入炸掉;
-#:   · _SHEET_CELL_HARD_MAX_CHARS(40000,超了**直接抛**):通道最后一道硬闸,
-#:     对着官方原值定的;进到它那儿的东西根本不是「表格单元格」,截断只会掩盖 bug。
-#: 顺序也因此固定:先过硬闸(看原值)再截断,反过来硬闸就成了永不触发的死码。
+#:   · _SHEET_CELL_HARD_MAX_CHARS(40000,超了**直接抛**):通道硬闸,对着官方
+#:     自荐值定;它的岗位在**不清洗的 sheet_overwrite 路径**——那里超长本会被
+#:     飞书 90222/90227 整批拒,本地先抛是净收益。
+#: 顺序(总控裁决 2026-08-27):清洗路径 sheet_write_ranges **先截断后硬闸**——
+#: 脏数据截断+告警、轮次照走是既有能力,不许被硬闸炸掉;硬闸在该路上对字符长度
+#: 天然不触发,只剩列数闸。全文口径同 _scrub/_check_shape 两处 docstring 与
+#: docs/conventions.md §八。
 _SHEET_CELL_MAX_CHARS = 20000
 
 
@@ -675,21 +679,6 @@ def sheet_values_small(sheet: Spreadsheet, a1_range: str) -> list[list]:
     省掉一次没必要的分块循环。范围写成字面量,别拼变量上界。
     """
     return _values_raw(sheet, a1_range)
-
-
-# ⚠ 过渡转发,**F2 清除**:F1 把裸读降级为私有 _values_raw,但全仓十余处调用点
-# 还叫 sheet_values(services/maint_sheet、clear_sheet、match_sheet、
-# blacklist_sheet、upc_pool,workflows/risk_sync、catmap_import、order_audit、
-# blacklist_push、kpi_history_import)。本包只换通道不迁调用点,故留同名转发,
-# 免得 F1 单独落地就把这些调用方全炸掉。F2 把无界范围换到 sheet_values_rows、
-# 小范围换到 sheet_values_small 之后,连同这段注释一起删掉。
-def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
-    """输入:登记条目 + A1 范围 → 输出:值矩阵(转发给 sheet_values_small)。
-
-    ⚠ 已弃用(DeprecationWarning 级),F2 清除:等价于 sheet_values_small。
-    新代码不许用:无界范围走 sheet_values_rows,小范围走 sheet_values_small。
-    """
-    return sheet_values_small(sheet, a1_range)
 
 
 def sheet_values_rows(sheet: Spreadsheet, first_col: str, last_col: str,

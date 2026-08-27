@@ -6,7 +6,8 @@
   ② 唯一写通道 sheet_write_ranges:行/字节双预算切批、**当轮写完不留下一轮**、
      结构硬闸(列/单元格)直接抛、90227 对半重切一层兜底并记日志计数。
   ③ 唯一读通道 sheet_values_rows:块粒度取登记表;裸读降为私有 _values_raw,
-     对外只留 sheet_values_small(小范围)与 F2 待清的 sheet_values 转发。
+     对外只留 sheet_values_small(小范围)——F1 留的旧名 sheet_values 转发
+     已于 2026-08-27 F2 清完调用点后删除,不许复活。
 
 分批与限流的行为回归在 tests/test_feishu.py(token/退避/多维表格切块)那边,
 这里只管「限额从哪来」和「读写各只有一条路」。
@@ -325,6 +326,33 @@ def test_read_block_size_comes_from_the_registry(monkeypatch):
     assert asked == ["A2:C4751", "A4752:C4752"]
 
 
+def test_row_numbers_re_anchor_at_each_block_head(monkeypatch):
+    """块尾空行被裁掉之后,下一块的行号仍从**块首**起算 —— 这是回写的命根子。
+
+    飞书只裁**范围尾部**的空行(中段空行仍占位),所以块尾一空,那一块就少
+    返几行。调用方若按返回序号手算(旧的 `i + 2`),后面每一块会整体上移几行,
+    而 clear_sheet/match_sheet/upc_pool 拿这个号去拼 `C{行}:F{行}` 定点回写 ——
+    错一格就是把结果写到别人那一行上,两边都看不出报错。
+    """
+    block = feishu._SHEET_READ_BLOCK_ROWS
+    holes = {block, block + 1}                  # 第一块的**最后两行**是空的
+    grid = {r: [f"v{r}"] for r in range(2, block + 6) if r not in holes}
+
+    def fake_raw(sheet, rng):
+        head, tail = rng.split(":")
+        got = [grid.get(r, []) for r in range(int(head[1:]), int(tail[1:]) + 1)]
+        while got and not got[-1]:              # 只裁范围尾部
+            got.pop()
+        return got
+
+    monkeypatch.setattr(feishu, "_values_raw", fake_raw)
+    pairs = feishu.sheet_values_rows(SHEET, "A", "A", 2, block + 5)
+    assert [n for n, _row in pairs] == sorted(grid)          # 空行不占号,其余不漂
+    assert all(row == [f"v{n}"] for n, row in pairs)         # 号与内容一一对上
+    assert (block + 2, [f"v{block + 2}"]) in pairs           # 第二块首行不上移
+    assert [n for n, _ in pairs if n in holes] == []
+
+
 def test_raw_read_is_private_and_small_shell_is_the_only_public_shortcut(monkeypatch):
     """裸读降为私有 _values_raw;对外只有 sheet_values_small(且写明无界禁用)。"""
     got: list[str] = []
@@ -336,20 +364,34 @@ def test_raw_read_is_private_and_small_shell_is_the_only_public_shortcut(monkeyp
     assert "无界范围禁用" in doc and "sheet_values_rows" in doc
 
 
-def test_sheet_values_is_a_marked_transitional_forward(monkeypatch):
-    """旧名 sheet_values 暂留转发(F1 不迁调用点),但必须标着 F2 清除。
+def test_the_old_sheet_values_name_is_gone_for_good():
+    """旧名 sheet_values 已删,全仓零引用 —— 这条钉的是 F2 的完工线。
 
-    F2 把十余处调用点分别换到 sheet_values_rows / sheet_values_small 之后,
-    这个转发连同注释一起删;在那之前它必须还能用,否则 F1 单独落地就炸调用方。
+    F1 曾留一个同名转发(不迁调用点就落地,免得炸调用方),F2 把无界范围换到
+    sheet_values_rows、小范围换到 sheet_values_small 之后连同注释一并删除。
+    它一旦复活,「读只有一条通道」就又开了个后门:那个名字既不分块也不兜底,
+    却长得像正路(2026-08-19 上架表 21 列一把读撞 90221 就是这么来的)。
     """
-    got: list[str] = []
-    monkeypatch.setattr(feishu, "_values_raw",
-                        lambda sheet, rng: got.append(rng) or [["v"]])
-    assert feishu.sheet_values(SHEET, "A1:A1") == [["v"]]
-    assert got == ["A1:A1"]
-    src = _SRC[:_SRC.index("def sheet_values(sheet")]
-    assert "F2 清除" in src.rsplit("# ⚠", 1)[-1]
-    assert "DeprecationWarning" in feishu.sheet_values.__doc__
+    assert not hasattr(feishu, "sheet_values")
+    root = Path(__file__).resolve().parents[1]
+    # cli.py 也要扫:它同样 `from api import feishu`(通知那条路),
+    # 只扫四个目录会让"全仓零引用"这句话在唯一的顶层文件上落空
+    files = [root / "cli.py"]
+    for d in ("api", "services", "workflows", "registry"):
+        files += sorted((root / d).rglob("*.py"))
+    offenders = []
+    for py in files:
+        for n, line in enumerate(
+                py.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"\bsheet_values\s*\(", line):
+                offenders.append(f"{py.relative_to(root)}:{n}")
+    assert not offenders, f"旧名 sheet_values 复活:{offenders}"
+    # 反向对照:正则要抓得住旧名、抓不到两条新通道,否则这条就是永远绿的空断言
+    assert re.search(r"\bsheet_values\s*\(", "feishu.sheet_values(s, 'A1:A1')")
+    assert not re.search(r"\bsheet_values\s*\(",
+                         "feishu.sheet_values_rows(s, 'A', 'C', 2, 9)")
+    assert not re.search(r"\bsheet_values\s*\(",
+                         "feishu.sheet_values_small(s, 'A1:A1')")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

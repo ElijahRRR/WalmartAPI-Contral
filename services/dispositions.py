@@ -76,7 +76,7 @@ ACTIONS = ("relist", "delete", "retire", "title", "price", "inventory")
 # 序:删除 > 停用 > 反补 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
 # claim() 的取件顺序、摘要的列序。
 # 这条规则本来就在跑,只是关在 maintenance_intents 的**一轮内存**里
-# (`_ACTION_RANK` / `collect_all` 的 `doomed` 集合)——那份只看得见本轮
+# (`_ACTION_RANK`(已删)/ `collect_all` 的 `doomed` 集合)——那份只看得见本轮
 # 自己算出来的删除,看不见另一条链挂在库里的建议,于是跨链重复删了两次
 # (所有者 2026-08-24 实证)。提升作用域到"库里所有未落定建议"就是本常量。
 ACTION_RANK = {"delete": 0, "retire": 1, "relist": 2,
@@ -109,7 +109,6 @@ MAINT_ACTIONS = ("title", "price", "inventory")
 SOURCES = ("scan", "audit", "tro", "maint")
 PROBLEM_SOURCES = ("scan", "audit", "tro")
 MAINT_SOURCES = ("maint",)
-OPEN_STATUSES = ("suggested", "executing")
 
 # 幂等写:同 (店铺,SKU,动作) 已有未落定行 → 刷新依据与时间,不新增
 # (扫描件按调度反复跑,每轮堆一行会让建议表变成流水账)。
@@ -231,18 +230,11 @@ def suggest_many(conn, rows: list[dict]) -> int:
 # ⚠ 用**多参数 unnest + NOT EXISTS**,不要写成
 #   `(store, sku, action) <> ALL(%(keep)s::text[][])`
 # 那样是错的:左边是 record 类型,右边二维数组的元素类型是 text,PG 直接报
-# 类型不匹配。(2026-08-14 首版就这么写的,靠复查发现——当时的测试只断言 SQL
-# **文本**,跑不到类型检查,全绿也没用。)
+# 类型不匹配(2026-08-14 首版就这么写的,靠复查发现)。
 # 三个平行数组 + unnest(a,b,c) 是 PG 的标准写法,三列一一对位。
 #
-# ⚠ **同一段 SQL 因为类型问题炸过两次**(2026-08-14),两次都是测试全绿才在
-# 生产上炸的 —— 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到。
-#   第一次:`record <> ALL(text[][])` 类型不匹配;
-#   第二次:`%(store)s IS NULL OR d.store = %(store)s` —— 参数只出现在
-#           IS NULL 与一次比较里,PG 推不出它的类型,报
-#           "could not determine data type of parameter"。**必须显式 ::text**。
-# 结论不是"以后小心点",是:**这类 SQL 的唯一验证手段是连库跑一次**。
-# 改动本段后别信 pytest 绿,去 dry-run。
+# ⚠ 每个参数必须带 `::类型` 的事故史(连炸三次)见模块头注 —— 改动本段后
+# 别信 pytest 绿,这类 SQL 的唯一验证手段是连库 dry-run 跑一次。
 # 撤销 = **只删自己那一格**,全空才 withdrawn(2026-08-24 多来源支撑之后)。
 # 旧写法按标量 source 整行撤:一行只能记一个来源,另一条链既撤不掉它、也不
 # 知道自己那条理由还成不成立 —— 合并之后照旧写就会出现"维护链不再建议了,

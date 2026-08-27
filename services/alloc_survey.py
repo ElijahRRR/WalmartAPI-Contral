@@ -400,10 +400,6 @@ def channel_mismatch(prof, cfg):
     return out
 
 
-def _fmt_counter(c: Counter, top=4) -> str:
-    return ", ".join(f"{k}×{n}" for k, n in c.most_common(top))
-
-
 def suggest_categories(prof, cfg, top=2):
     """输入:店铺画像 + 配置 → 输出:每店一个 dict(见下)。
 

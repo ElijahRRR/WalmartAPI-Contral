@@ -20,7 +20,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
-                phase0_cats=frozenset(), brand_blacklist={},
+                brand_blacklist={},
                 pt_meta={}, ac_automaton=None, nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)

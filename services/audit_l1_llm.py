@@ -701,7 +701,10 @@ def open_candidates(conn, product: ProductInfo, *,
 
 def rerank(product: ProductInfo, cands: list[dict[str, Any]], pt_dict, *,
            chat_fn=None) -> L1Info | None:
-    """薄壳:只要结果不要原因(旧调用点与测试沿用)。"""
+    """输入:产品 + 候选列表 + PT 字典 → 输出:重排结果 L1Info(或 None)。
+
+    薄壳:只要结果不要原因(旧调用点与测试沿用),全文在 rerank_ex。
+    """
     return rerank_ex(product, cands, pt_dict, chat_fn=chat_fn)[0]
 
 

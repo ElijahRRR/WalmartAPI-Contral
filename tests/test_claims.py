@@ -414,7 +414,6 @@ def _wire_bf(monkeypatch, items, status, captured):
                                  "停用店": {"categories": [], "max_online": 500.0}})
     monkeypatch.setattr(bf.claims, "claim_many",
                         lambda conn, rows: (captured.extend(rows), (len(rows), []))[1])
-    monkeypatch.setattr(bf.claims, "counts_by_store", lambda conn: {})
 
 
 def test_backfill_claims_for_a_suspended_store_too(monkeypatch):

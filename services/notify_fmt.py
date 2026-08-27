@@ -43,8 +43,6 @@
     )
 """
 
-_UNSET = object()
-
 
 def num(v, unit: str = "") -> str:
     """输入:数字 → 输出:带千分位的串(None/空 → '—')。"""

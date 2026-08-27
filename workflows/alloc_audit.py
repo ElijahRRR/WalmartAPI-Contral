@@ -91,7 +91,6 @@ def run(params: dict) -> str:
     sales_days = int(params.get("sales_days", 365))
     win = sv.sales_window(str(params.get("as_of", "")), sales_days)
     export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
-    L: list[str] = []
 
     with db.pg_conn() as conn, conn.cursor() as cur:
         pool = sv._row(cur, sv._SQL_POOL)
@@ -166,7 +165,6 @@ def run(params: dict) -> str:
     live_rows = [r for r in rows if r["store"] not in skipped]
     oos_rows = sum(prof_all[s]["n"] for s in out_of_scope)
     prof = sv.store_profiles(live_rows)
-
 
     # ══ 报告拼装:控制台只放"一眼能扫完的结论 + 要做的事",明细全进 csv ══
     n = lambda v: f"{int(v):,}"                       # noqa: E731 千分位
@@ -385,8 +383,7 @@ def run(params: dict) -> str:
     if mism:
         body.append(("渠道有不符", f"{len(mism)} 家", f"共 {len(offenders)} 件待下架"))
     if cat_bad:
-        from collections import Counter as _C
-        by = _C(r["store"] for r in cat_bad)
+        by = Counter(r["store"] for r in cat_bad)
         body.append(("类目有不符", f"{len(by)} 家", f"共 {len(cat_bad)} 件待下架;"
                      + "、".join(f"{s}×{c}" for s, c in by.most_common(3))))
     L += ["", f"▍店铺(规划内有货 {len(prof)} 家)"]

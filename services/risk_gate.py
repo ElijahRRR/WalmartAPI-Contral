@@ -115,7 +115,7 @@ def sync_pt_meta(conn, rows: list[dict]) -> tuple[int, int, list[tuple]]:
     重灌不保。
 
     骤缩护栏:比库里现有行数少超 20% 就拒绝重灌 —— 飞书表删几行是常态,
-    删掉一半必是读漏/读错(与 `risk_sync._mirror` 同款纪律)。
+    删掉一半必是读漏/读错(与 `risk_sync._guard_shrink` 同款纪律)。
 
     ★ **顺带落变更台账**(2026-08-21):重灌前逐 PT 比对 R1/R3 真正读的三列,
     只把变了的写进 `audit.pt_meta_change_log`。这是"飞书数据变了"这条失效信号

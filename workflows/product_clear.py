@@ -154,6 +154,8 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
             limit = default_limit
         return limit
 
+    partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
+
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
         """输入:店铺 + 该店待提交行 → 输出:(店铺名, updates, lines, 提交数, 延后数)。
 
@@ -229,7 +231,6 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
         to_retry: list[tuple] = []
-        partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
             futs = {pool.submit(_one_store, n, s): (n, s) for n, s in todo}
@@ -277,8 +278,13 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
             deferred += defr
 
     if good or bad:
+        # 本轮行数:真跑报实际提交数,空跑按**各店自己的上限**截断后求和。
+        # ⚠ `_limit_of` 带"不在限额表"告警副作用,所以只在空跑分支算这一次
+        # (条件表达式短路,真跑那边一次都不多调)
+        planned = submitted if execute else min(
+            len(good), sum(min(len(v), _limit_of(k)) for k, v in by_store.items()))
         lines.append(f"提交:有效待提交 {len(good)} 行,本轮"
-                     f"{'提交' if execute else '将提交'} {submitted if execute else min(len(good), sum(min(len(v), _limit_of(k)) for k, v in by_store.items()))} 行,"
+                     f"{'提交' if execute else '将提交'} {planned} 行,"
                      f"超限延后 {deferred} 行,无效行 {len(bad)}")
     return updates, lines
 

@@ -19,9 +19,6 @@ from services import blacklist, product_events, stores as stores_svc
 
 logger = logging.getLogger("services.feed_track")
 
-# 提交超过此小时数仍 pending(提交结局不确定)→ 告警升级(人工核对后清理)
-_PENDING_ALARM_HOURS = 6
-
 # feedType → 业务动作名(摘要展示;未登记的原样显示)
 _FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
                "MP_MAINTENANCE": "维护", "MP_ITEM": "上架",

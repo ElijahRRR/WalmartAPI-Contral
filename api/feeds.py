@@ -211,16 +211,12 @@ def _log_update(log_id, status: str, feed_id: str | None = None) -> None:
             (status, feed_id, log_id))
 
 
-def query_pending(store_name: str | None = None) -> list[dict]:
-    """输入:可选店铺 → 输出:pending/submitted 的 feed_log 行(启动对账用)。"""
+def query_pending() -> list[dict]:
+    """输入:无 → 输出:pending/submitted 的 feed_log 行(启动对账用)。"""
     sql = ("SELECT id, workflow, store, feed_type, payload_key, feed_id, status, "
            "created_at FROM ops.feed_log WHERE status IN ('pending', 'submitted')")
-    args: tuple = ()
-    if store_name:
-        sql += " AND store = %s"
-        args = (store_name,)
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, args)
+        cur.execute(sql)
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 

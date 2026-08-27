@@ -329,9 +329,8 @@ def _plain_text(v) -> str:
 def _row_hash(fields: dict, hash_field: str) -> str:
     """输入:一行载荷 → 输出:内容指纹(排除指纹列自身,键序无关)。"""
     import hashlib
-    import json as _json
-    payload = _json.dumps({k: v for k, v in fields.items() if k != hash_field},
-                          ensure_ascii=False, sort_keys=True, default=str)
+    payload = json.dumps({k: v for k, v in fields.items() if k != hash_field},
+                         ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 

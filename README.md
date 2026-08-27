@@ -180,7 +180,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | **PostgreSQL 17** `walmart_data` | 五 schema、49 表、10 视图 | **唯一权威**。DDL 在 `refdata/schema.sql`,说明在 `docs/db_schema.md` |
 | **飞书表格** | 店铺凭证、运营填的驱动表、结果回写 | **人机界面**,不是权威。程序按**表头字段名**索引,字段名常量在 registry |
 | `<DATA_ROOT>/` | `.env`(密钥,chmod 600)、`specs/`、`cache/`、`logs/`、`backups/`、`locks/`、`reports/` | 不进 git;路径唯一出处 `registry/paths.py`,可用 `WALMART_DATA_ROOT` 覆盖 |
-| SQLite | 仅 `cache/` 下可重建缓存(WAL + busy_timeout) | 业务数据一律不放 SQLite |
+| SQLite | 仅 `cache/` 下可重建缓存(现无使用方,合规入口已随 2026-08-27 死件清理撤除——真要用先在 registry/db.py 加门) | 业务数据一律不放 SQLite |
 
 ### 五个 schema
 
@@ -272,7 +272,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | `product_query` | | 按产品 ID 查沃尔玛商品详情 |
 | `node_backfill` | | 从已存快照回填类目 ID 锚(零重采) |
 | `pt_backfill` | | 历史实证 PT 回填产品主档 |
-| `sources_backfill` | | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
+| `sources_backfill` | 调 | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
 | `pt_census` | | 沃尔玛类目(PT)四源对账:哪些 PT 真实存在 |
 | `sku_normalize` | | 事件账本 SKU→ASIN 清洗 |
 | `taxonomy_import` | | 亚马逊类目树入库(ID 主键) |

@@ -238,6 +238,16 @@ _DEFAULT_CANDIDATE = (
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
+    """输入:params → 输出:(候选谓词 SQL, 绑定参数)。
+
+    ⚠ **版本闸 = 天然分页**(机械只讲这一处,下面各分支只标"有/无"加本分支
+    特有后果):带 `audit_version IS DISTINCT FROM <当前版本>` 的分支,真跑判过
+    的行会盖上当前 `AUDIT_RULES_VERSION` 从而**自动退出候选集** —— limit 撞满
+    就再跑一轮接着判剩下的,不会每轮从头扫同一批;而 dry-run 不写版本号
+    ⇒ 候选集恒定,可重复抽样验证。
+    没有版本闸的分支(mode=pass / mode=online:未命中不落结论、不盖版本、
+    不退出候选)必须**一次给够 limit**,小批多轮只会每轮重扫同一批前缀。
+    """
     unknown = set(params) - _KNOWN_PARAMS - _CLI_INJECTED
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
@@ -310,9 +320,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 现在的口径(每条都是为了让 dry-run 与真跑说同一件事):
         #  · `audit_status = 'rejected'` —— 要翻的是**现行结论**,而 dry-run 碰
         #    不到这一列,所以反复 dry-run 候选集恒定,可重复验证;
-        #  · `audit_version IS DISTINCT FROM <当前版本>` —— 真跑判过的会盖上新
-        #    版本号,自动退出候选集。这同时是**天然分页**:limit 撞满就再跑一轮,
-        #    接着判剩下的,不会每轮都重判同一批(首版没有这条,真跑会原地打转);
+        #  · `audit_version IS DISTINCT FROM <当前版本>` —— **有天然分页**
+        #    (机械见 _pick_where 头注;首版没有这条,真跑会原地打转);
         #  · `EXISTS` 任意一轮命中过该规则 —— 不是"最近一轮"。理由同上:最近
         #    一轮会被 dry-run 覆盖掉。代价是"早年被它拒、后来改判别的原因仍是
         #    rejected"的行也会进来,那批重判一次结论不变,只多花一轮 LLM。
@@ -346,11 +355,10 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # ⚠ `IS DISTINCT FROM` 不是 `<>`:后者对 NULL 求值为 NULL,从没审过的
         # 会被整批漏掉,而且不报错。
         #
-        # 版本闸是**天然分页**,不是可选项:真跑判过的会盖上当前规则版本,
-        # 自动退出候选集,limit 撞满再跑一轮接着判。没有它的话每轮都从头扫
-        # 同一批(rejected 判完还是 rejected,状态不变 ⇒ 不退出候选)——
-        # 这正是 mode=pass 那条注释记着的坑,不要在这里重犯。
-        # dry-run 不写版本 ⇒ 候选集恒定,可重复抽样验证。
+        # **有天然分页**(机械见 _pick_where 头注),而且不是可选项:本分支
+        # 判完状态不变(rejected 判完还是 rejected ⇒ 不退出候选),没有版本闸
+        # 就每轮都从头扫同一批 —— 这正是 mode=pass 那条注释记着的坑,
+        # 不要在这里重犯。
         return ("p.audit_status IS DISTINCT FROM 'approved'"
                 " AND p.audit_version IS DISTINCT FROM %(nonpass_ver)s",
                 {"nonpass_ver": resources.AUDIT_RULES_VERSION})
@@ -366,8 +374,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 历史导入 approved 挂在"沃尔玛已下架"清单上就是这么来的
         # (audited_at 成批相同、audit_runs 无记录,L2/L3 从没碰过)。
         #
-        # 天然分页:真跑判过盖当前版本号,自动退出候选;dry-run 不写版本
-        # ⇒ 候选恒定,可重复抽样验证。历史导入行版本旧/空,
+        # **有天然分页**(机械见 _pick_where 头注)。历史导入行版本旧/空,
         # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
         return ("p.audit_status = 'approved'"
                 " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
@@ -377,9 +384,9 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
         # 行不重扫就等于黑名单只管新品。只与 stages=L0 连用(run() 钉死):
         # 全链重审全部 pass = 重烧全库 LLM,要那么干请 force_rerun=<版本>。
-        # ⚠ 本模式**没有天然分页**:命中翻案(status 变 rejected)会退出
-        # 候选,但未命中不落结论不盖版本(截断链没资格,#49 语义)、
-        # **不退出候选** —— 小批多轮每轮都从头扫同一批,必须一次大 limit
+        # ⚠ 本模式**没有天然分页**(机械见 _pick_where 头注):命中翻案
+        # (status 变 rejected)会退出候选,但未命中不落结论不盖版本
+        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一次大 limit
         # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
         return "p.audit_status = 'approved'", {}
     if mode == "online":
@@ -391,9 +398,9 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
         # 口径是 `missing_since IS NULL`(还在目录里),**不加**
         # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
-        # ⚠ 与 mode=pass 同样**没有天然分页**(未命中不落结论不盖版本、
-        # 不退出候选),所以调度里必须给一次能扫完的 limit,小 limit 会让
-        # 每天都从头扫同一批前缀,尾巴永远轮不到而且不报错。
+        # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
+        # 所以调度里必须给一次能扫完的 limit,小 limit 会让每天都从头扫
+        # 同一批前缀,尾巴永远轮不到而且不报错。
         return ("p.audit_status = 'approved' AND EXISTS ("
                 "SELECT 1 FROM catalog.walmart_items w "
                 "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})

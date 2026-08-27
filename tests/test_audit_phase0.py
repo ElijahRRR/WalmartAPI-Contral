@@ -34,7 +34,6 @@ def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=()):
     return SimpleNamespace(
         phase0_sellers=frozenset(sellers),
         phase0_asins=frozenset(asins),
-        phase0_cats=frozenset(cats),
         cat_rules=rules,
         brand_blacklist=dict(brands or {}),
     )
@@ -186,7 +185,7 @@ def test_category_rules_live_in_db_not_in_code():
     assert "Kindle Store" not in src and "Grocery & Gourmet Food" not in src
     # 空规则 = 不拦(判定件不自带兜底清单)
     empty = SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
-                            phase0_cats=frozenset(), cat_rules=cb.CatRules(),
+                            cat_rules=cb.CatRules(),
                             brand_blacklist={})
     assert audit_phase0.check(_p(amazon_category_path="Books"), empty).blocked is False
     # 判定件也不许自带种子清单(2026-08-20 所有者:一切以回传的标注文档为准)

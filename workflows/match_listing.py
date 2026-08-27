@@ -54,13 +54,6 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.match_listing")
 
-# F 列终态(不重复预检/提交;运营清空 F 即重新排队)。
-# "预检失败"**不是终态**(2026-08-12 旧仓对照纠正:那多半是 SPEC 接口网络
-# 抖动,旧系统每次跑批全新 xlsx 自然重试;当终态会把行永久停摆)——
-# 每轮自动重新预检,持续失败的行留在表上反复出现即是信号
-_TERMINAL = ("需完整建品", "目录无", "店铺不识别", "码无效",
-             "风控拦截", "ASIN黑名单", "数据无效")     # 后三类为前缀
-
 
 def _gate_reason(spec: dict, gate: dict, banned: dict) -> str | None:
     """输入:SPEC 预检结果 + 两道闸数据 → 输出:拦截原因(None=放行)。
@@ -117,7 +110,12 @@ def run(params: dict) -> str:
     now = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d %H:%M")
     mode = "" if execute else "🧪 [DRY-RUN] "
 
-    # 行分拣:在途(反哺器管)/终态/待处理(F 空或=可跟卖 且 I 空)
+    # 行分拣:在途(反哺器管)/终态/待处理(F 空或=可跟卖 且 I 空)。
+    # 待处理是**包含式白名单**,白名单之外的 F 值一律隐式终态(不重复预检/
+    # 提交;运营清空 F 即重新排队)。
+    # "预检失败"**不是终态**(2026-08-12 旧仓对照纠正:那多半是 SPEC 接口网络
+    # 抖动,旧系统每次跑批全新 xlsx 自然重试;当终态会把行永久停摆)——
+    # 每轮自动重新预检,持续失败的行留在表上反复出现即是信号
     inflight = [r for r in rows if r["feed_id"]]
     todo = [r for r in rows if not r["feed_id"]
             and (r["status"] in ("", "可跟卖")

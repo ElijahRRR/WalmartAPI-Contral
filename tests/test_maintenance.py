@@ -815,8 +815,13 @@ def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
              "marked": [], "marked_by": set(), "settled": 0,
              "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
+    # 打 stale_stores 这一层:执行件调的 stale_or_note 是它的降级外壳,
+    # 探测正常时 note 为空串(降级那条路由 store_absence 自己的用例钉)
     monkeypatch.setattr(mw.store_absence, "stale_stores",
                         lambda conn, **k: list(absent))
+    # 失败店串行补试每店前有 _client.backoff(0) 抖动等待:用例只钉行为,
+    # 不必真等(与 tests/test_store_retry_standard 同款)
+    monkeypatch.setattr(mw.store_retry.time, "sleep", lambda s: None)
     monkeypatch.setattr(mw.dispositions, "claim",
                         lambda conn, actions=None: [_disp(it, i)
                                                     for i, it in enumerate(intents)])
@@ -923,10 +928,111 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
     out = mw.run({"execute": True})
     assert "⚠ T1:提交异常已跳过" in out          # 标题 feed 炸了只跳过 T1
     assert calls["put_inv"] == [("T2", "B", 0)]   # T2 照常(1 条走 PUT)
-    # 炸掉那条也要留痕:动作空、结果写明为什么(否则表里完全看不见)
+    # 炸掉那条也要留痕:动作空、结果写明为什么(否则表里完全看不见)。
+    # 两轮都炸也**只写一行**:补试重跑同店时首轮写过的「未执行」不再写第二遍
     t1 = [r for r in calls["sheet"] if r[0] == "T1"]
     assert len(t1) == 1 and t1[0][_c("action")] == ""
     assert t1[0][_c("result")] == "未执行(提交异常)"
+
+
+def test_failed_store_is_retried_serially_once(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):跨店跑完之后失败店**串行补试
+    一遍**。所有者原话「某个店当时有问题,最后补一次」—— 此前本文件把这句
+    写在并发段的注释里,补一次的代码却没有(只 diagnose 一句「下轮重试」)。
+
+    补试跑的是第一轮同一个 _one_store(单一落地路径):重提由 feeds 的
+    payload_key 在途防重看护,首轮已发出去的片不会重复提交。
+    """
+    calls = _wire(monkeypatch, _zero(11))       # >10 → 走 feed
+    seen = {"n": 0}
+
+    def flaky_then_ok(store, ft, entries, *, workflow=""):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise ConnectionError("proxy down")
+        calls["feeds"].append((store["name"], ft, len(entries)))
+        return [{"feed_id": "F2", "count": len(entries), "outcome": "submitted"}]
+
+    monkeypatch.setattr(feeds, "submit_feed", flaky_then_ok)
+    out = mw.run({"execute": True})
+    assert seen["n"] == 2                       # 补一次即止,不是无限重试
+    assert calls["feeds"] == [("T1", "inventory", 11)]
+    assert calls["marked"] == [(list(range(100, 111)), "F2")]
+    assert "缺席" not in out                     # 救回来了就不点名
+    # 首轮的「未执行」行既不撤也不重写,补试成功的另起一行:
+    # 两行连起来正是这家店这一轮的经过
+    got = [(r[_c("action")], r[_c("result")]) for r in calls["sheet"]]
+    assert got.count(("", "未执行(提交异常)")) == 11
+    assert got.count(("库存", "处理中")) == 11
+    # 补试必须见人:摘要行每轮重置,首轮那句「⚠ 提交异常已跳过」被覆盖了,
+    # 而上面那 11 行「未执行(提交异常)」还留在维护记录表上 —— 摘要不说
+    # 一句,表上那几行就成了没出处的孤证(§六:兜底触发不许静默)
+    assert "店级补试 1 店(串行):T1,救回 1,仍失败 0" in out
+
+
+def test_put_route_second_pass_reuses_the_same_absolute_write(monkeypatch):
+    """小批量走 PUT 路由,**不进 feed 台账、没有在途防重**(api/prices 与
+    api/inventory 头注:「不产生 feed_id 不进 feed 台账」)—— 补试因此会把
+    首轮已成功的那几条再赋值一遍。
+
+    这仍然安全,但依据与 feed 路由**不是同一条**:两个端点都是绝对赋值
+    (quantity.amount / currentPrice.amount),重设同一个值终态不变;
+    CLAUDE.md「写操作永不自动兜底」禁的是*换方法*重试,补试走的还是这条路由。
+    钉住两件事:① 补试不许改走 feed(换方法 = 重复提交制造机);
+    ② 重发的值必须与首轮一模一样(绝对赋值,不是增量)。
+    """
+    calls = _wire(monkeypatch, _zero(3))         # ≤10 → 走 PUT
+    seen = {"n": 0}
+
+    def flaky(store, sku, qty):
+        seen["n"] += 1
+        calls["put_inv"].append((store["name"], sku, qty))
+        if sku == "S2" and seen["n"] <= 3:       # 首轮最后一条炸
+            raise ConnectionError("proxy down")
+        return True, ""
+
+    monkeypatch.setattr(inv_api, "put_inventory", flaky)
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0), ("T1", "S2", 0),
+                                ("T1", "S0", 0), ("T1", "S1", 0), ("T1", "S2", 0)]
+    assert calls["feeds"] == []                  # ① 没有偷偷改走 feed
+    assert "店级补试 1 店(串行):T1,救回 1,仍失败 0" in out
+    assert "缺席" not in out
+
+
+def test_store_that_fails_twice_is_named_in_the_first_line(monkeypatch):
+    """标准②③:补试仍失败**不炸整轮**,但必须点名在摘要**首行** ——
+    链通知对成功步骤只发首行(cli.first_line_of),写在后面等于只写进日志。
+    归类词唯一出处 store_retry.diagnose;尾句是本件的处置(领取只读,
+    没提交出去的建议行还是 suggested,下轮照样领得到)。"""
+    calls = _wire(monkeypatch, _zero(11))
+    monkeypatch.setattr(feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ConnectionError("proxy down")))
+    out = mw.run({"execute": True})
+    first = out.splitlines()[0]
+    assert "⚠ 缺席 1 店:T1(其他)" in first
+    assert "已串行补试仍失败" in first
+    assert "本轮不炸链(存量建议保留,下轮重试)" in first
+    assert calls["marked"] == []                # 一条都没提交出去
+
+
+def test_credential_death_is_never_retried(monkeypatch):
+    """凭证失效不补试(标准①):凭证死是确定性的,重试只会再死一次。
+    它也不进缺席点名 —— 那是「今天没轮到」,凭证死是「去修凭证表」。"""
+    from api import _client as client_api
+    calls = _wire(monkeypatch, _zero(11))
+    seen = {"n": 0}
+
+    def dead(store, ft, entries, *, workflow=""):
+        seen["n"] += 1
+        raise client_api.StoreDeadError("T1", 401)
+
+    monkeypatch.setattr(feeds, "submit_feed", dead)
+    out = mw.run({"execute": True})
+    assert seen["n"] == 1                       # 只试一次
+    assert "T1:凭证失效跳过" in out and "缺席" not in out
+    assert all(r[_c("result")] == "未执行(凭证失效)" for r in calls["sheet"])
 
 
 def test_maintenance_no_longer_deletes_anything(monkeypatch):
@@ -946,8 +1052,13 @@ def test_maintenance_no_longer_deletes_anything(monkeypatch):
 
     assert set(mw._KIND_ORDER) == set(ds.MAINT_ACTIONS)
     assert "delete" not in mw._KIND_ORDER and "retire" not in mw._KIND_ORDER
-    with pytest.raises(ValueError):
-        mw.group_by_store([{"store": "T1", "sku": "B0A", "kind": "delete"}])
+    # ② 分桶件 2026-08-27 上移 services.dispositions:按本执行件的接线
+    #   (key='kind' × _KIND_ORDER)喂一条删除行,照样宁炸不吞
+    assert 'key="kind", order=_KIND_ORDER' in inspect.getsource(mw.run)
+    with pytest.raises(ValueError, match="未知 kind"):
+        ds.group_by_store([{"store": "T1", "sku": "B0A", "kind": "delete"}],
+                          key="kind", order=mw._KIND_ORDER,
+                          id_field="disposition_id")
     assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
 
 
@@ -1288,10 +1399,15 @@ def test_two_chains_claim_disjoint_actions():
     # 破坏动作只有一个出口:maintenance 不再发任何删除 feed
     assert "delete" in ds.PROBLEM_ACTIONS and "delete" not in ds.MAINT_ACTIONS
     assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
-    # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)
+    # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)。
+    # 分桶件 2026-08-27 上移 services.dispositions:按问题链的接线喂
+    # (key='action' × _ACTION_ORDER),判据一字未改
     import pytest
-    with pytest.raises(ValueError):
-        ppc.group_by_store([{"id": 1, "store": "T1", "sku": "S", "action": "price"}])
+    assert 'key="action"' in inspect.getsource(ppc.run)
+    with pytest.raises(ValueError, match="未知 action"):
+        ds.group_by_store([{"id": 1, "store": "T1", "sku": "S",
+                            "action": "price"}],
+                          key="action", order=ppc._ACTION_ORDER, id_field="id")
 
 
 # ── product_refresh 的 wait(工作项 A;产品线一条链跑完的前提)────────────────

@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import _client, orders as orders_api
 from registry import db
-from services import order_center, store_retry
+from services import notify_fmt as nf, order_center, store_retry
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -91,12 +91,7 @@ def run(params: dict) -> str:
     # 订单窗口全量重拉 + 幂等 upsert,缺席店下轮整点自然补上,无需水位避让
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),订单行入库 {total_lines}"
-             + (f";⚠ 缺席 {len(absent)} 店:"
-                + ",".join(f"{n}({c})" for n, c in absent)
-                + ("——超补试规模闸未补试(疑似系统性故障)" if gate_note
-                   else "——已串行补试仍失败")
-                + ",本轮不炸链(下轮整点自然重拉)"
-                if absent else "")]
+             + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉")]
     if gate_note:
         lines.append(gate_note)
     if dead:

@@ -520,14 +520,10 @@ def run(params: dict) -> str:
     # 探测失败按"不避让"处理并在首行喊出来(preview 是纯 PG 查询,
     # 不该被一次飞书抖动整个拦下)。
     with db.pg_conn() as conn:
-        try:
-            absent = set(store_absence.stale_stores(conn))
-            absence_gap = ""
-        except Exception as e:
-            absent = set()
-            absence_gap = f";⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
-    if only:
-        absent &= {only}    # 只报本范围内的缺席
+        # 降级与 only 范围收敛都在 store_absence.stale_or_note 里(四处同形,
+        # 2026-08-27 收口);拼进首行的分号由调用方补
+        absent, absence_note = store_absence.stale_or_note(conn, only)
+    absence_gap = f";{absence_note}" if absence_note else ""
     # ⚠ 避让只挡**处置建议**(plan/audit_rows —— 会变成删除/反补 feed 的那些);
     # 观察面不连坐:黑名单收集、K 类聚集信号、归类事件都是只增不减的记录,
     # 静音一天会让 15:00 blacklist 链少一天的 ASIN/品牌(对抗校验 2026-08-26)

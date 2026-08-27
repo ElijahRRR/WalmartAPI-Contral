@@ -181,6 +181,7 @@ maintenance_scan → problem_scan → maintenance → problem_product_cleanup`�
 | `maintenance._load_stockzero` | `services.store_limits.stockzero_stores` | 同上;那张限额表已经有一个消费方模块了 |
 | `maintenance._load_multipliers` | `services.store_limits.price_multipliers` | 同上 |
 | `maintenance._load_delete_caps` | `services.store_limits.retire_caps` | 同上(2026-08-24 起只由执行件调,见六·三) |
+| `list_new._load_multipliers` / `product_clear._load_limits` | 同上两件(2026-08-27 双轨合并收编) | 三个 workflow 各写过一份的最后两份;倍率/下架上限自此只有一条读取路径 |
 | 破坏面明细(删除名单/清零原因/改价分布) | `maintenance_scan._preview_lines` | 决策在哪边,"为什么是这些商品"就该在哪边说 |
 
 ## 六·三、建议路由器(所有者定稿 2026-08-24)

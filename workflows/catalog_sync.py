@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import product_events, store_retry, stores as stores_svc, \
-    walmart_catalog
+from services import notify_fmt as nf, product_events, store_retry, \
+    stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -150,44 +150,15 @@ def run(params: dict) -> str:
     backfill_ids = str(params.get("item_ids", "")) in ("1", "true", "yes")
     run_at = datetime.now(timezone.utc)
 
-    results, dead, to_retry = [], [], []
-    by_name = {s["name"]: s for s in store_list}
-    with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futures = {pool.submit(_sync_one_store, s, run_at, skip_inventory, mode,
-                               backfill_ids): s["name"]
-                   for s in store_list}
-        for f in as_completed(futures):
-            name = futures[f]
-            try:
-                results.append(f.result())
-            except _client.StoreDeadError as e:
-                # 凭证死是确定性的:跳过全店,不补试(重试只会再死一次)
-                logger.error("%s", e)
-                dead.append(name)
-            except Exception as e:
-                # 代理故障(StoreProxyError/socksio)与泛化异常都先收着 ——
-                # 标准①(所有者定稿 2026-08-26):跑完别人再串行补试,
-                # 此刻不判生死。08-26 13:00 的事故正是在这里把两家店的
-                # SOCKS 报错直接判成 failed → 整轮 raise → 八步链全停
-                logger.exception("店铺 %s 同步失败(待串行补试): %s", name, e)
-                to_retry.append((by_name[name], e))
-
-    # 标准①:失败店串行补试一遍。单一落地路径 —— 补试跑的就是第一轮
-    # 同一个 _sync_one_store,不另写简化版
-    absent: list[tuple[str, str]] = []          # (店名, 归类词:代理/其他/凭证)
-    gate_note = ""
-    if to_retry:
-        recovered, still, gate_note = store_retry.serial_second_pass(
-            to_retry, lambda s: _sync_one_store(s, run_at, skip_inventory,
-                                                mode, backfill_ids),
-            total_stores=len(store_list))
-        results.extend(r for _s, r in recovered)
-        for s, e in still:
-            cls = store_retry.diagnose(e)
-            if cls == "凭证失效":                    # 补试中才暴露的凭证死,归 dead 口径
-                dead.append(s["name"])
-            else:
-                absent.append((s["name"], cls))
+    # 标准①②(所有者定稿 2026-08-26):跨店并发 → 凭证死跳全店不补试 → 其余
+    # 失败先收着**不判生死**,跑完别人再串行补试一遍 → 仍失败按 diagnose 归缺席。
+    # 骨架与「08-26 13:00 两家店 SOCKS 报错被直接判成 failed → 整轮 raise →
+    # 八步链全停」的事故背景都在 services/store_retry.fan_out;补试跑的就是
+    # 这里的同一个 _sync_one_store(单一落地路径,不另写简化版)。
+    results, dead, absent, gate_note = store_retry.fan_out(
+        store_list,
+        lambda s: _sync_one_store(s, run_at, skip_inventory, mode, backfill_ids),
+        workers, log_label="同步")
 
     total_written = sum(r["written"] for r in results)
     total_missing = sum(r["missing"] for r in results)
@@ -198,13 +169,8 @@ def run(params: dict) -> str:
     lines = [f"catalog_sync:{len(results)}/{len(store_list)} 店完成,"
              f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行,"
              f"回填 item_id {total_item_ids} 个"
-             + (f";⚠ 缺席 {len(absent)} 店:"
-                + ",".join(f"{n}({c})" for n, c in absent)
-                + ("——超补试规模闸未补试(疑似系统性故障)"
-                   if gate_note else
-                   "——已串行补试仍失败")
-                + ",本轮不炸链(下游按水位避让,链尾重赛)"
-                if absent else "")]
+             + nf.absent_tail(absent, gate_note,
+                              tail="下游按水位避让,链尾重赛")]
     if gate_note:
         lines.append(gate_note)
     if truncated:

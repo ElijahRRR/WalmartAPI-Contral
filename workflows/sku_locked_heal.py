@@ -78,11 +78,12 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
         out: list[str] = []
         skus = [r["asin"] for r in srows]        # 上架 sku=asin 约定
         n_ok = 0
-        i = 0
-        for res in feeds.submit_feed(store, "RETIRE_ITEM", skus,
-                                     workflow="sku_locked_heal"):
-            batch = srows[i:i + res["count"]]
-            i += res["count"]
+        # 逐切片结果与本店待退役行对位:游标走法是 submit_feed 返回契约的机械
+        # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
+        # 行上,而且不报错)
+        for res, batch in feeds.iter_result_slices(
+                feeds.submit_feed(store, "RETIRE_ITEM", skus,
+                                  workflow="sku_locked_heal"), srows):
             if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                 n_ok += len(batch)
                 with db.pg_conn() as conn:

@@ -33,10 +33,10 @@ cron(每天 15:00),新旧并跑 = 重复删除。
 import logging
 from datetime import datetime
 
-from api import _client, feeds, feishu
-from registry import db, resources
-from services import clear_sheet, feed_track, kpi, product_events, store_retry, \
-    stores as stores_svc
+from api import _client, feeds
+from registry import db
+from services import clear_sheet, feed_track, kpi, product_events, \
+    store_limits, store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -87,30 +87,6 @@ def _poll_feeds(rows: list[dict], stores_by_name: dict,
     if by_feed:
         lines.append(f"轮询:{len(by_feed)} 个 feed,{done} 行落定,{still} 行仍处理中")
     return updates, lines
-
-
-def _load_limits(default: int) -> tuple[dict[str, int], str]:
-    """输入:默认上限 → 输出:({店铺: 单日下架上限}, 摘要说明)。
-
-    读上下架限额表「下架限制」列;未登记时返回空表(全店走默认)。
-    """
-    t = resources.RETIRE_LIMITS
-    f = t.fields
-    try:
-        recs = feishu.list_records(t, field_names=[f.store, f.max_daily_retire])
-    except LookupError:
-        return {}, f"限额表未登记,全店统一上限 {default}"
-    limits: dict[str, int] = {}
-    for rec in recs:
-        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
-        try:
-            v = int(float(feishu._plain_text(rec["fields"].get(f.max_daily_retire))
-                          or 0))
-        except ValueError:
-            v = 0
-        if name and v > 0:
-            limits[name] = v
-    return limits, f"限额表生效({len(limits)} 店)"
 
 
 def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
@@ -190,10 +166,10 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 continue
             results = feeds.submit_feed(stores_by_name[store_name], feed_type,
                                         skus, workflow="product_clear")
-            i = 0
-            for res in results:
-                slice_rows = arows[i:i + res["count"]]
-                i += res["count"]
+            # 逐切片结果与本店待提交行对位:游标走法是 submit_feed 返回契约的
+            # 机械后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局
+            # 落到别人行上,而且不报错)
+            for res, slice_rows in feeds.iter_result_slices(results, arows):
                 if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                     submitted_s += len(slice_rows)
                     for r in slice_rows:
@@ -303,7 +279,12 @@ def run(params: dict) -> str:
 
     # 全量加载凭证(49 店,量小):店名对不上时诊断需要完整对照样本
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
-    limits, limits_note = _load_limits(default_limit)
+    # 「下架限制」列与 problem_product_cleanup **同一份读取**
+    # (services/store_limits):两个破坏类执行件读同一列走两条路,改一处漏
+    # 一处的那份会静默读空、全店回落默认值且不报错。摘要文案留在调用点
+    limits = store_limits.retire_caps()
+    limits_note = (f"限额表生效({len(limits)} 店)" if limits
+                   else f"限额表未登记,全店统一上限 {default_limit}")
 
     updates_a, lines_a = _poll_feeds(rows, stores_by_name, execute)
     updates_b, lines_b = _submit_new(rows, stores_by_name, limits,

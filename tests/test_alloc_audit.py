@@ -938,14 +938,14 @@ def test_claim_filter_and_channel_disposal_list_are_exactly_complementary():
 def test_backfill_loads_channel_or_the_gate_is_silently_dead():
     """回填必须**带渠道取数**,否则第五条筛法恒为假而且不报错。
 
-    `_fetch_meta(..., with_channel=False)` 时 rows 的 channel 全是 None,
+    `load_rows(..., with_channel=False)` 时 rows 的 channel 全是 None,
     `offends_channel` 一行都判不出来 —— 于是 alloc_audit 判一套、回填落另一套,
     正是 alloc_survey 这个模块存在要防的事。
     """
     import inspect
     from workflows import alloc_backfill as bf
     src = inspect.getsource(bf.run)
-    assert "_fetch_meta(cur, asins, True)" in src, \
+    assert "with_channel=True" in src, \
         "回填取数不能省掉渠道:省掉后渠道闸恒为假,与 alloc_audit 口径分叉"
 
 

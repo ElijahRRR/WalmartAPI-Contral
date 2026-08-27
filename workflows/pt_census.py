@@ -42,7 +42,7 @@ import csv
 import logging
 
 from registry import db, paths
-from services import pt_spec
+from services import pt_spec, report_csv
 
 DANGEROUS = False       # 纯只读:读 spec 文件 + 三条 SELECT
 
@@ -287,21 +287,19 @@ def run(params: dict) -> str:
         lines += [f"    {r['walmart_product_type']}(映射 {r['映射条数']} 条)"
                   for r in sorted(miss, key=lambda r: -r["映射条数"])[:15]]
         if export:
-            paths.reports_dir().mkdir(parents=True, exist_ok=True)
-            p = paths.reports_dir() / "pt_待补准入明细.csv"
-            with open(p, "w", encoding="utf-8-sig", newline="") as f:
-                w = csv.writer(f)
+            p = report_csv.write(
+                "pt_待补准入明细.csv",
                 # 表头与飞书那张表同序,填完准入两列直接粘回去
-                w.writerow(["Walmart Category", "Walmart PTG",
-                            "Walmart Product Type", "准入状态", "中国卖家可做",
-                            "映射条数", "建议依据"])
-                for r in sorted(miss, key=lambda r: -r["映射条数"]):
-                    # Category/PTG 给建议(同路径兄弟 PT 的,有依据);
-                    # 准入状态与中国卖家可做**只能人判**,留空
-                    w.writerow([r["建议Category"], r["建议PTG"],
-                                r["walmart_product_type"], "", "",
-                                r["映射条数"],
-                                r["建议依据"] or "同路径无兄弟,Category 待人填"])
+                ["Walmart Category", "Walmart PTG",
+                 "Walmart Product Type", "准入状态", "中国卖家可做",
+                 "映射条数", "建议依据"],
+                # Category/PTG 给建议(同路径兄弟 PT 的,有依据);
+                # 准入状态与中国卖家可做**只能人判**,留空
+                [[r["建议Category"], r["建议PTG"],
+                  r["walmart_product_type"], "", "",
+                  r["映射条数"],
+                  r["建议依据"] or "同路径无兄弟,Category 待人填"]
+                 for r in sorted(miss, key=lambda r: -r["映射条数"])])
             lines.append(f"    → 待补清单 {p}(准入两列留空,填完粘回飞书)")
         # 所有者的原话问题:「是 spec 里本来就没有还是我们没去补」——拿证据答
         has_cat, keys = probe_spec_category(miss[0]["walmart_product_type"])
@@ -327,16 +325,14 @@ def run(params: dict) -> str:
         lines += [f"    {r['walmart_product_type']}(映射 {r['映射条数']} 条)"
                   for r in sorted(dep, key=lambda r: -r["映射条数"])[:15]]
         if export:
-            paths.reports_dir().mkdir(parents=True, exist_ok=True)
-            p2 = paths.reports_dir() / "pt_待删准入明细.csv"
-            with open(p2, "w", encoding="utf-8-sig", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["Walmart Category", "Walmart PTG",
-                            "Walmart Product Type", "映射条数", "删除理由"])
-                for r in sorted(dep, key=lambda r: -r["映射条数"]):
-                    w.writerow([r["walmart_category"], r["walmart_ptg"],
-                                r["walmart_product_type"], r["映射条数"],
-                                "官方 MP_ITEM spec 里已无此 PT"])
+            p2 = report_csv.write(
+                "pt_待删准入明细.csv",
+                ["Walmart Category", "Walmart PTG",
+                 "Walmart Product Type", "映射条数", "删除理由"],
+                [[r["walmart_category"], r["walmart_ptg"],
+                  r["walmart_product_type"], r["映射条数"],
+                  "官方 MP_ITEM spec 里已无此 PT"]
+                 for r in sorted(dep, key=lambda r: -r["映射条数"])])
             lines.append(f"    → 待删清单 {p2}(按 PT 名在飞书表里找到并删行)")
             lines.append(f"    删完跑 `python cli.py risk_sync` 同步,"
                          f"再跑 `catmap_prune` 清掉指向它们的映射")

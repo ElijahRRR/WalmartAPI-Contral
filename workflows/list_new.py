@@ -94,9 +94,9 @@ from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
-    mp_mapper, pricing, product_events, product_ingest, pt_spec, risk_gate, \
-    scrape_batches, store_limits, store_targets, stores as stores_svc, \
-    upc_pool, variant_group, variant_remap, variant_title
+    mp_mapper, notify_fmt as nf, pricing, product_events, product_ingest, \
+    pt_spec, risk_gate, scrape_batches, store_limits, store_targets, \
+    stores as stores_svc, upc_pool, variant_group, variant_remap, variant_title
 from services import store_retry
 
 DANGEROUS = True
@@ -394,25 +394,6 @@ def _load_quota(default: int = 999) -> dict[str, int]:
             v = 0
         if name and v > 0:
             out[name] = v
-    return out
-
-
-def _load_multipliers() -> dict[str, dict]:
-    """限额表四个区间倍率列(services/pricing 消费)。"""
-    t = resources.RETIRE_LIMITS
-    f = t.fields
-    try:
-        recs = feishu.list_records(t, field_names=[
-            f.store, f.fba_range1, f.fba_range2, f.fbm_range1, f.fbm_range2])
-    except LookupError:
-        return {}
-    out: dict[str, dict] = {}
-    for rec in recs:
-        name = feishu._plain_text(rec["fields"].get(f.store)).strip()
-        if name:
-            out[name] = {k: feishu._plain_text(rec["fields"].get(getattr(f, k)))
-                         for k in ("fba_range1", "fba_range2",
-                                   "fbm_range1", "fbm_range2")}
     return out
 
 
@@ -1184,7 +1165,9 @@ def run(params: dict) -> str:
     (inactive, today_used, listed, banned, unexplained, gate,
      owned_asin, owned_brand) = _load_gate_state()
     quota = _load_quota()
-    mults = _load_multipliers()
+    # 四个区间倍率列与维护链**同一份读取**(services/store_limits):上架价与
+    # 维护价两套口径会自己跟自己打架 —— 本链此前另抄了一份 _load_multipliers
+    mults = store_limits.price_multipliers()
     lead_caps = store_limits.lead_day_caps()      # 按店「配送时长限制」
     store_chs = store_targets.store_channels()   # 按店「配送限制」(没标=不限)
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
@@ -1535,9 +1518,17 @@ def run(params: dict) -> str:
     for r in prep_ok:
         by_store2.setdefault(r["store"], []).append(r)
     gate = _AdaptiveGate(stores_svc.STORE_WORKERS)
+    # 店级失败时 _one_store 交出来的**半成品**(product_clear 同款):领号阶段
+    # 已经攒好的 no_upc 计数、N 列理由、已被 defer 的片子都是这一轮真发生过的
+    # 事,不能随异常一起蒸发 —— 补试仍失败时调用方照原样并进摘要与 N 列。
+    partial: dict[str, tuple] = {}
 
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
-        """输入:店铺 + 该店**已备好**的行 → 输出:(店铺名, 计数增量, reasons, lines)。
+        """输入:店铺 + 该店**已备好**的行 → 输出:(店铺名, 计数增量, reasons, lines, 待结算片)。
+
+        店级失败**往外抛**(不再就地吞成一行摘要):调用方收进 to_retry,
+        跑完别人后走 `store_retry.serial_second_pass` 串行补试一遍,补试跑的
+        就是本函数(单一落地路径)。抛之前把半成品存进 `partial`。
 
         提交期只剩三步:批量领号 → 真号回填占位号 → 同店打包提交。
         LLM 出参与 spec 一致化已在预备期做完(挂在 _visible/_orderable 上),
@@ -1597,7 +1588,6 @@ def run(params: dict) -> str:
             if not items:
                 return store_name, cnt, reasons_s, lines_s, deferred_s
             updates = []
-            i = 0
             gate.acquire()
             try:
                 results = feeds.submit_feed(store, "MP_ITEM", items,
@@ -1605,9 +1595,10 @@ def run(params: dict) -> str:
                                             defer_settle=True)
             finally:
                 gate.release()
-            for res in results:
-                batch = claimed[i:i + res["count"]]
-                i += res["count"]
+            # 逐切片结果与 (行, UPC) 对位:游标走法是 submit_feed 返回契约的
+            # 机械后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局
+            # 落到别人行上,而且不报错)
+            for res, batch in feeds.iter_result_slices(results, claimed):
                 if res["outcome"] == "deferred":
                     # 不确定态**当轮不写终态**:UPC 不回收、表不动、事件不落。
                     # 整轮跑完之后统一结算(所有者定稿 2026-08-26)——那时管子
@@ -1623,9 +1614,11 @@ def run(params: dict) -> str:
                 f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条"
                 + (f",⏸ {n_defer} 条不确定待整轮后结算" if n_defer else ""))
         except Exception as e:
-            logger.exception("店铺 %s 上架异常,跳过继续其它店: %s", store_name, e)
-            lines_s.append(f"  ⚠ {store_name}:上架异常已跳过"
-                           f"({store_retry.diagnose(e)}:{e}),下轮重试")
+            # 店级隔离 → **不当场判生死**:跑完别人再串行补试一遍(标准①,
+            # 所有者定稿 2026-08-26)。半成品先交出去再抛,仍失败时不丢账
+            logger.exception("店铺 %s 上架异常(待串行补试): %s", store_name, e)
+            partial[store_name] = (cnt, reasons_s, lines_s, deferred_s)
+            raise
         return store_name, cnt, reasons_s, lines_s, deferred_s
 
     todo2 = sorted(by_store2.items())
@@ -1639,13 +1632,55 @@ def run(params: dict) -> str:
             + ";不确定的片子留到整轮跑完再结算")
         from concurrent.futures import ThreadPoolExecutor, as_completed
         per_store: dict[str, tuple] = {}
+        to_retry: list[tuple] = []
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo2))) as pool:
-            futs = [pool.submit(_one_store, sn, sr) for sn, sr in todo2]
+            futs = {pool.submit(_one_store, sn, sr): (sn, sr)
+                    for sn, sr in todo2}
             for f in as_completed(futs):
-                sn, cnt, reasons_s, lines_s, deferred_s = f.result()
+                sn, sr = futs[f]
+                try:
+                    _sn, cnt, reasons_s, lines_s, deferred_s = f.result()
+                    per_store[sn] = (cnt, reasons_s, lines_s)
+                    deferred_all.extend(deferred_s)
+                except Exception as e:                      # noqa: BLE001
+                    to_retry.append(((sn, sr), e))
+        # 按店名定序再补试:收集序是 as_completed 的完成序(随机),而补试次序
+        # 与首行缺席点名的次序都不许跟着随机(同 todo2 合并那条纪律)
+        to_retry.sort(key=lambda t: t[0][0])
+        # 标准①(所有者定稿 2026-08-26):跑完别人再串行补试一遍,补试跑的是
+        # **同一个** _one_store(单一落地路径,不另写简化版);StoreDeadError
+        # 不补试。二次提交安全性由 feeds 的 payload_key 在途防重看护
+        # (同 (店,ASIN) 领号还是原号 —— upc_pool.claim「先复用后新领」,
+        # 载荷一字不差 ⇒ 真重了会被防重挡回 dedup,不会双上架)。
+        absent_stores: list[tuple[str, str]] = []
+        gate_note = ""
+        if to_retry:
+            recovered, still, gate_note = store_retry.serial_second_pass(
+                [({"name": sn, "_srows": sr}, e) for (sn, sr), e in to_retry],
+                lambda st: _one_store(st["name"], st["_srows"]),
+                total_stores=len(todo2))
+            for _st, (sn, cnt, reasons_s, lines_s, deferred_s) in recovered:
                 per_store[sn] = (cnt, reasons_s, lines_s)
                 deferred_all.extend(deferred_s)
+            for st, e in still:
+                sn = st["name"]
+                cls = store_retry.diagnose(e)
+                absent_stores.append((sn, cls))
+                # 半成品照原样入账:领到号/没领到号的理由都要落 N 列,
+                # 已 defer 的片子照旧进第二轮结算
+                cnt, reasons_s, lines_s, deferred_s = partial.get(
+                    sn, ({"no_upc": 0, "title_diff": 0}, [], [], []))
+                per_store[sn] = (
+                    cnt, reasons_s,
+                    lines_s + [f"  ⚠ {sn}:上架异常已跳过({cls}:{e}),下轮重试"])
+                deferred_all.extend(deferred_s)
+        # 标准②:缺席不炸整轮,但必须点名在摘要**首行** —— 链通知对成功步骤
+        # 只发首行(cli first_line_of),写在后面等于只写进日志
+        lines[0] += nf.absent_tail(absent_stores, gate_note,
+                                   tail="未上架行下轮重试")
+        if gate_note:
+            lines.append(gate_note)
         # 按店名排序合并:完成先后是随机的,摘要行序与 N 列理由的写入顺序不能跟着随机
         lines.extend(_settle_round(deferred_all, stores_by_name, gate, today))
         if gate.steps:

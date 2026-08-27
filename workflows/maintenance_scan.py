@@ -159,18 +159,15 @@ def run(params: dict) -> str:
         # (services/store_absence),不靠调度顺序、不靠链内传参。
         # 探测失败按"不避让"处理并在首行喊出来 —— 缺席探测靠 enabled_names
         # (飞书),不兜底的话本工作流的 preview 会被一次飞书抖动整个拦下
-        try:
-            absent = set(store_absence.stale_stores(conn))
-            absence_gap = ""
-        except Exception as e:
-            absent = set()
-            absence_gap = f";⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
+        # 降级与 only 范围收敛都在 store_absence.stale_or_note 里(四处同形,
+        # 2026-08-27 收口);拼进首行的分号由调用方补
+        absent, absence_note = store_absence.stale_or_note(conn, only)
+        absence_gap = f";{absence_note}" if absence_note else ""
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0))
     if only:
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
-        absent &= {only}    # 只报本范围内的缺席:范围外的店与本轮无关
     n_avoided = sum(1 for i in intents if i["store"] in absent)
     if absent:
         intents = [i for i in intents if i["store"] not in absent]

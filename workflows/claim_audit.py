@@ -25,10 +25,13 @@
 import logging
 from collections import Counter
 
-from registry import db, paths, resources
+from registry import db, resources
 from services import alloc_survey as sv
-from services import claims, sku_asin, store_targets, stores as stores_svc
+from services import claims, report_csv, store_targets, stores as stores_svc
 from services import textfmt
+# ⚠ 按名字导入:run() 的形参就叫 params,`from services import params` 会被它
+# 遮住,`params.flag(...)` 当场 AttributeError(services/params.py 头注)
+from services.params import flag
 
 DANGEROUS = False
 
@@ -85,22 +88,15 @@ def _join(rows, field) -> str:
 
 def run(params: dict) -> str:
     """输入:params(export)→ 输出:占用对账报告(+ 该释放清单 csv)。"""
-    export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
+    export = flag(params, "export", default=True)
 
     with db.pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sv._SQL_PT2CAT)
-            pt2cat = {pt: c for pt, c in cur.fetchall() if c}
-            cur.execute(sv._SQL_ONLINE)
-            items = cur.fetchall()
-            asins = sorted({a for a in (sku_asin.extract_asin(it[1])
-                                        for it in items) if a})
-            # 必须带渠道:渠道闸判不了的话这张表会漏掉一半问题,且不报错
-            meta = sv._fetch_meta(cur, asins, True)
+        # 必须带渠道:渠道闸判不了的话这张表会漏掉一半问题,且不报错
+        loaded = sv.load_rows(conn, with_channel=True)
         held = {k: claims.load_active(conn, k)
                 for k in (claims.BRAND, claims.PRODUCT)}
 
-    rows, _st = sv.enrich(items, meta, pt2cat)
+    rows = loaded.rows
     try:
         registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
@@ -172,22 +168,21 @@ def run(params: dict) -> str:
         L += ["", "(-p export=0:未落 csv)"]
         return "\n".join(L)
 
-    paths.reports_dir().mkdir(parents=True, exist_ok=True)
-    p = paths.reports_dir() / "alloc_该释放占用.csv"
-    import csv as _csv
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = _csv.writer(fh)
-        w.writerow(["类型", "占用键", "占用店", "原因", "该店在架件数",
-                    "大类(26类)", "品类(五大类)",
-                    "要下架的SKU", "要下架的ASIN", "释放命令"])
-        for k, key, store, why, n, here in stale:
-            arg = "brand" if k == claims.BRAND else "asin"
-            cats = sorted({r.get("category") or "" for r in here} - {""})
-            sups = sorted({resources.super_label(c) for c in cats})
-            w.writerow([k, key, store, why, n,
-                        "|".join(cats), "|".join(sups),
-                        _join(here, "sku"), _join(here, "asin"),
-                        _release_cmd(arg, key, store)])
+    out_rows = []
+    for k, key, store, why, n, here in stale:
+        arg = "brand" if k == claims.BRAND else "asin"
+        cats = sorted({r.get("category") or "" for r in here} - {""})
+        sups = sorted({resources.super_label(c) for c in cats})
+        out_rows.append([k, key, store, why, n,
+                         "|".join(cats), "|".join(sups),
+                         _join(here, "sku"), _join(here, "asin"),
+                         _release_cmd(arg, key, store)])
+    p = report_csv.write(
+        "alloc_该释放占用.csv",
+        ["类型", "占用键", "占用店", "原因", "该店在架件数",
+         "大类(26类)", "品类(五大类)",
+         "要下架的SKU", "要下架的ASIN", "释放命令"],
+        out_rows)
     n_sku = len({(r["store"], r["sku"]) for _k, _key, _s, _w, _n, here in stale
                  for r in here})
     L += ["", f"▍明细 → {p}",

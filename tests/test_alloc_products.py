@@ -87,7 +87,8 @@ def _wire(monkeypatch, tmp_path, cur=None):
     def _gen():
         yield conn
     monkeypatch.setattr(wf.db, "pg_conn", contextlib.contextmanager(_gen))
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    # 落盘走 services/report_csv(2026-08-27 六处收口),报告目录在积木那侧
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     return conn
 
 

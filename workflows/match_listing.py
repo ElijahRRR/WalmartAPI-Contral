@@ -47,7 +47,7 @@ from datetime import datetime
 from api import feeds, items as items_api
 from registry import db
 from services import blacklist, kpi, listing_sources, match_feed, \
-    match_sheet, product_events, risk_gate, store_retry, \
+    match_sheet, notify_fmt as nf, product_events, risk_gate, store_retry, \
     stores as stores_svc
 
 DANGEROUS = True
@@ -194,57 +194,102 @@ def run(params: dict) -> str:
         match_sheet.write_rows(updates, execute=False)
         return "\n".join(lines)
 
-    for store_name, pairs in sorted(by_store.items()):
+    def _one_store(store_name: str, pairs: list[tuple[dict, dict]]) -> list[str]:
+        """输入:店铺名 + 该店 (行, Item) 对 → 输出:该店的摘要行。
+
+        第一轮与串行补试共用**同一条**路径(单一落地纪律):补试跑的就是本
+        函数,不另写简化版。二次提交的安全性由 api/feeds 的 payload_key 在途
+        防重看护 —— 首轮已发出去的那几片回 dedup(不重发、不落事件),表格
+        那几行按同值再写一遍,写表幂等。
+        ⚠ 回写攒在**外层共享** `updates` 上(逐片就地追加,店间串行不打架):
+        抛异常时前几片的 I/J 列照样进 write_rows —— 表上有 feed_id 的行下一轮
+        不会被当「待处理」重新提交(product_clear._one_store 同款判据)。
+        """
         store = stores_by_name[store_name]
+        n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+        entries = [item for _, item in pairs]
+        # 逐切片结果与 (行, Item) 对位:游标走法是 submit_feed 返回契约的机械
+        # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
+        # 行上,而且不报错)
+        for res, batch in feeds.iter_result_slices(
+                feeds.submit_feed(store, "MP_ITEM_MATCH", entries,
+                                  workflow="match_listing"), pairs):
+            n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
+            if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
+                for r, _ in batch:
+                    r["feed_id"], r["list_time"] = res["feed_id"], now
+                    r["feed_result"] = "处理中"
+                    updates.append((r["rownum"], match_sheet.row_vals(r)))
+                if res["outcome"] == "submitted":
+                    with db.pg_conn() as conn:
+                        product_events.record_many(conn, [
+                            {"sku": r["sku"], "store": store_name,
+                             "event": product_events.MATCH_SUBMITTED,
+                             "source": "match_listing",
+                             "detail": {"feed_id": res["feed_id"],
+                                        "upc": r["upc"],
+                                        "price": r["price"]}}
+                            for r, _ in batch])
+                        # 来源登记簿(所有者定稿):跟卖品 sku≠asin,
+                        # 登记出身后 amz 驱动的自动流程不会误伤它们
+                        listing_sources.register(conn, [
+                            {"store": store_name, "sku": r["sku"],
+                             "source_type": listing_sources.SOURCE_MATCH,
+                             "source_key": r["gtin"] or r["upc"],
+                             "workflow": "match_listing"}
+                            for r, _ in batch])
+            elif res["outcome"] == "failed":
+                for r, _ in batch:
+                    r["feed_result"] = "提交被拒"
+                    updates.append((r["rownum"], match_sheet.row_vals(r)))
+        # 四档计数的尾巴走 notify_fmt 的成品件(三个执行件逐字重复过);
+        # failed 档字样由调用方给 —— 本件现行「提交被拒」,
+        # problem_product_cleanup 现行「提交失败」,收口时逐字保留两处现状
+        return [f"  {store_name}:跟卖"
+                + nf.feed_outcome_tail(n["submitted"], n["dedup"],
+                                       n["failed"], n["unknown"],
+                                       failed_word="提交被拒")]
+
+    todo_stores = sorted(by_store.items())
+    per_store: dict[str, list[str]] = {}
+    to_retry: list[tuple] = []
+    for store_name, pairs in todo_stores:
         try:    # 单店隔离(与 cleanup/maintenance 同款纪律)
-            i = 0
-            n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
-            entries = [item for _, item in pairs]
-            for res in feeds.submit_feed(store, "MP_ITEM_MATCH", entries,
-                                         workflow="match_listing"):
-                batch = pairs[i:i + res["count"]]
-                i += res["count"]
-                n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
-                if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
-                    for r, _ in batch:
-                        r["feed_id"], r["list_time"] = res["feed_id"], now
-                        r["feed_result"] = "处理中"
-                        updates.append((r["rownum"], match_sheet.row_vals(r)))
-                    if res["outcome"] == "submitted":
-                        with db.pg_conn() as conn:
-                            product_events.record_many(conn, [
-                                {"sku": r["sku"], "store": store_name,
-                                 "event": product_events.MATCH_SUBMITTED,
-                                 "source": "match_listing",
-                                 "detail": {"feed_id": res["feed_id"],
-                                            "upc": r["upc"],
-                                            "price": r["price"]}}
-                                for r, _ in batch])
-                            # 来源登记簿(所有者定稿):跟卖品 sku≠asin,
-                            # 登记出身后 amz 驱动的自动流程不会误伤它们
-                            listing_sources.register(conn, [
-                                {"store": store_name, "sku": r["sku"],
-                                 "source_type": listing_sources.SOURCE_MATCH,
-                                 "source_key": r["gtin"] or r["upc"],
-                                 "workflow": "match_listing"}
-                                for r, _ in batch])
-                elif res["outcome"] == "failed":
-                    for r, _ in batch:
-                        r["feed_result"] = "提交被拒"
-                        updates.append((r["rownum"], match_sheet.row_vals(r)))
-            line = f"  {store_name}:跟卖提交 {n['submitted']}"
-            if n["dedup"]:
-                line += f",在途防重跳过 {n['dedup']}"
-            if n["failed"]:
-                line += f",⚠ 提交被拒 {n['failed']}(查日志)"
-            if n["unknown"]:
-                line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
-            lines.append(line)
+            per_store[store_name] = _one_store(store_name, pairs)
         except Exception as e:
-            logger.exception("店铺 %s 跟卖提交异常,跳过继续其它店: %s",
+            # 店级隔离 → **不当场判生死**:跑完别人再串行补试一遍(标准①,
+            # 所有者定稿 2026-08-26)。此前这里只 diagnose 分诊、注释写着
+            # 「下轮重试」,补一次的代码没有
+            logger.exception("店铺 %s 跟卖提交异常(待串行补试): %s",
                              store_name, e)
-            lines.append(f"  ⚠ {store_name}:提交异常已跳过"
-                         f"({store_retry.diagnose(e)}:{e}),下轮重试")
+            to_retry.append(((store_name, pairs), e))
+
+    absent: list[tuple[str, str]] = []      # (店名, 归类词,唯一出处 diagnose)
+    gate_note = ""
+    if to_retry:
+        # 标准①:失败店**串行**补试一遍(services/store_retry 是唯一实现,
+        # 规模闸/退避阶梯/凭证死不补试三条判据都在里面,本文件不再另写)
+        recovered, still, gate_note = store_retry.serial_second_pass(
+            [({"name": sn, "_pairs": p}, e) for (sn, p), e in to_retry],
+            lambda st: _one_store(st["name"], st["_pairs"]),
+            total_stores=len(todo_stores))
+        for st, out in recovered:
+            per_store[st["name"]] = out
+        for st, e in still:
+            cls = store_retry.diagnose(e)
+            absent.append((st["name"], cls))
+            per_store[st["name"]] = [
+                f"  ⚠ {st['name']}:提交异常已跳过({cls}:{e}),下轮重试"]
+    # 按店名合并:补试是跑完别人之后才补的,摘要行序不跟着补试次序走
+    for store_name, _ in todo_stores:
+        lines.extend(per_store.get(store_name, []))
+    if absent:
+        # 标准③:缺席不炸整轮,但必须点名在**首行** —— 链通知对成功步骤
+        # 只发首行(cli.first_line_of),写在后面等于只写进日志。
+        # 尾句是本件的处置:没提交出去的行 I 列仍空,下一轮照样进待处理
+        lines[0] += nf.absent_tail(absent, gate_note, tail="未提交行下轮重试")
+    if gate_note:
+        lines.append(gate_note)
 
     written = match_sheet.write_rows(updates)
     lines.append(f"回写 {written} 行;feed 结果轮询走 feed_poll")

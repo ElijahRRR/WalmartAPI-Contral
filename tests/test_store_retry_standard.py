@@ -126,6 +126,94 @@ def test_serial_second_pass_never_retries_dead_credentials(monkeypatch):
     assert still == [({"name": "T1"}, dead)]
 
 
+# ── ①② 跨店并发 → 补试 → 分流(catalog_sync/returns_sync 共用骨架)───────────
+
+def _scripted(plan):
+    """plan={店名: [第一轮产物, 补试产物]}(异常实例即抛)→ (每店调用次数, attempt)。"""
+    import threading
+    seen: dict[str, int] = {}
+    lock = threading.Lock()
+
+    def attempt(store):
+        name = store["name"]
+        with lock:
+            n = seen[name] = seen.get(name, 0) + 1
+        script = plan[name]
+        out = script[min(n, len(script)) - 1]
+        if isinstance(out, Exception):
+            raise out
+        return out
+    return seen, attempt
+
+
+def test_fan_out_splits_dead_absent_and_recovered(monkeypatch, caplog):
+    """三路分流一次钉死:成功(含补试救回)→ results;凭证死 → dead(**补试中
+    才暴露的那种也归 dead 口径**);补试仍失败 → absent 带归类词。
+    凭证死一次都不补试(重试只会再死一次)。"""
+    _no_sleep(monkeypatch)
+    from socksio.exceptions import ProtocolError
+    names = ("好店", "救得回", "缺席店", "死店", "补试才死")
+    plan = {
+        "好店": [{"store": "好店"}],
+        "救得回": [ProtocolError("Malformed reply"), {"store": "救得回"}],
+        "缺席店": [ProtocolError("Malformed reply"),
+                ProtocolError("Malformed reply")],
+        "死店": [_client.StoreDeadError("死店", 401)],
+        "补试才死": [OSError("first"), _client.StoreDeadError("补试才死", 400)],
+    }
+    seen, attempt = _scripted(plan)
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": n} for n in names], attempt, 4, log_label="同步")
+    assert sorted(r["store"] for r in results) == sorted(["好店", "救得回"])
+    assert sorted(dead) == sorted(["死店", "补试才死"])
+    assert absent == [("缺席店", "代理波动")]      # 归类词唯一出处 = diagnose
+    assert gate == ""
+    assert seen["死店"] == 1                      # 凭证死:一次都不补
+    assert seen["救得回"] == seen["缺席店"] == 2   # 补试跑的是第一轮同一个函数
+    assert "同步失败(待串行补试)" in caplog.text   # log_label 只进日志
+
+
+def test_fan_out_reports_the_scale_gate_and_skips_second_pass(monkeypatch):
+    """规模闸命中时四元组照样自洽:一家都不补试,失败店全进 absent,
+    gate_note 非空交回调用方(它必须进摘要,否则「没补试」这件事无人知道)。"""
+    _no_sleep(monkeypatch)
+    plan = {f"店{i}": [OSError("x"), OSError("x")] for i in range(4)}
+    plan.update({f"店{i}": [{"store": f"店{i}"}] for i in range(4, 10)})
+    seen, attempt = _scripted(plan)
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": n} for n in plan], attempt, 4)
+    assert len(results) == 6 and dead == []
+    assert all(seen[f"店{i}"] == 1 for i in range(4))    # 4 > max(3, 10//5) → 全停
+    assert sorted(absent) == sorted((f"店{i}", "其他") for i in range(4))
+    assert "系统性故障" in gate
+
+
+def test_fan_out_is_a_noop_without_stores():
+    """零店不开线程池(min(workers,0) 会炸);「零店完成不许报成功」是调用方
+    各自的闸(catalog_sync/returns_sync 的 `if not results: raise`),不在这里判。"""
+    assert store_retry.fan_out([], lambda s: 1 / 0, 4) == ([], [], [], "")
+
+
+def test_fan_out_really_runs_stores_concurrently(monkeypatch):
+    """**跨店并发**是这个积木存在的理由,必须有断言钉住:每店有自己的固定出口
+    代理、沃尔玛按 (store, endpoint) 计配额(services/stores 头注),24 店串行
+    跑不完一轮链。用屏障判并发而不是掐表:三家店必须同时在场才放行 ——
+    退化成串行(或 workers 被写死收窄)时第一家就卡到屏障超时,一眼打红。
+    ⚠ 对抗校验 2026-08-27:上面三个用例对 `max_workers=1` 全绿,补此闸。"""
+    _no_sleep(monkeypatch)
+    import threading
+    barrier = threading.Barrier(3, timeout=10)
+
+    def attempt(store):
+        barrier.wait()          # 串行实现在这里 BrokenBarrierError
+        return {"store": store["name"]}
+
+    results, dead, absent, gate = store_retry.fan_out(
+        [{"name": f"店{i}"} for i in range(3)], attempt, 3)
+    assert sorted(r["store"] for r in results) == ["店0", "店1", "店2"]
+    assert (dead, absent, gate) == ([], [], "")
+
+
 def test_classify_names_the_actual_culprit():
     """所有者要求(2026-08-26):出问题一眼看到是凭证失效、代理无效、
     代理波动还是沃尔玛侧 —— 六档词表,每档指一条不同的处置路。"""
@@ -218,6 +306,35 @@ def test_stale_stores_morning_dry_run_is_not_a_false_alarm(monkeypatch):
     monkeypatch.setattr(stores_svc, "enabled_names", lambda: ["A", "B"])
     conn = _Conn([("A", yesterday), ("B", yesterday + timedelta(minutes=40))])
     assert store_absence.stale_stores(conn) == []
+
+
+def test_stale_or_note_normal_path_and_only_narrowing(monkeypatch):
+    """避让侧取数口:正常路 = 真判据(stale_stores)+ 空提示语;
+    带 only 时只报本范围内的缺席(范围外的店与本轮无关)。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    import services.stores as stores_svc
+    monkeypatch.setattr(stores_svc, "enabled_names",
+                        lambda: ["新鲜店", "缺席店"])
+    conn = _Conn([("新鲜店", now), ("缺席店", now - timedelta(hours=24))])
+    assert store_absence.stale_or_note(conn) == ({"缺席店"}, "")
+    assert store_absence.stale_or_note(conn, only="缺席店") == ({"缺席店"}, "")
+    assert store_absence.stale_or_note(conn, only="新鲜店") == (set(), "")
+
+
+def test_stale_or_note_degrades_with_the_exact_wording(monkeypatch):
+    """探测经 enabled_names 走飞书:一次抖动不许拦下整轮 —— 退成「不避让」
+    (= 加缺席避让之前的行为)并逐字交还那句提示语。四个工作流的摘要里
+    就是这一句,措辞归本函数唯一出处。"""
+    import services.stores as stores_svc
+
+    def boom():
+        raise RuntimeError("飞书 500")
+    monkeypatch.setattr(stores_svc, "enabled_names", boom)
+    absent, note = store_absence.stale_or_note(_Conn([]), only="任意店")
+    assert absent == set()
+    assert note == "⚠ 缺席探测失败(RuntimeError),本轮不避让"
+    assert not note.startswith(";")     # 分号由拼首行的调用方自己加
 
 
 # ── ④ 链尾重赛(cli._replay_absent)─────────────────────────────────────────────

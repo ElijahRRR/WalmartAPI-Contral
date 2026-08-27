@@ -5,10 +5,12 @@
 """
 
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
 from services import brand_key as bk
+from services import report_csv
 from services import store_targets
 from services import alloc_survey as sv
 from workflows import alloc_audit as wf
@@ -1010,3 +1012,94 @@ def test_report_leads_with_the_actionable_row_count(monkeypatch, tmp_path):
     col = head.split(",").index("处置")
     drop = sum(1 for ln in body if ln.split(",")[col] == "下架")
     assert f"要下架 {drop} 件" in out or f"要下架 {drop + 1} 件" in out
+
+
+# ── 装载积木 alloc_survey.load_rows(四条分配链的唯一装载口)──────────────
+
+class _RecCur(_FakeCur):
+    """_FakeCur + 记下每条真正跑过的 SQL(need 开关要能验"没点名就没查")。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sqls: list = []
+
+    def execute(self, sql, args=None):
+        self.sqls.append(sql)
+        super().execute(sql, args)
+
+
+def test_load_rows_core_is_the_four_chains_shared_skeleton():
+    """公共骨架:PT→大类字典 → 在线行 → 抽 asins → _fetch_meta → enrich。
+
+    这五步四条链逐字相同(alloc_plan / claim_audit 只要这一段)。
+    """
+    conn = _FakeConn(_RecCur())
+    got = sv.load_rows(conn)
+    assert [r["store"] for r in got.rows] == [i[0] for i in ITEMS]
+    assert got.pt2cat == PT2CAT
+    assert got.st["online"] == len(ITEMS)
+    # 富化确实跑过:三段式 sku 提出了 asin、DEAD1 的行也在(筛店是调用方的事)
+    assert got.rows[2]["asin"] == "B0BBBB0002"
+    assert got.rows[2]["category"] == "Fashion"
+
+
+def test_load_rows_need_gates_every_extra_query():
+    """没点名的一律**不查**,而且字段是 None ——「本轮没查」与「查了没有」
+    分得开(只要一半数据的链不该被多压几条全表 SQL)。"""
+    cur = _RecCur()
+    got = sv.load_rows(_FakeConn(cur))
+    for f in ("pool", "signal", "pt_dict", "pt_dict_err", "categories",
+              "status", "sales", "order_stores"):
+        assert getattr(got, f) is None, f
+    for feature in ("AS total", "n_rating", "n_risk", "store_kpi_daily",
+                    "orders.order_lines", "GROUP BY 1 ORDER BY 2 DESC"):
+        assert not any(feature in s for s in cur.sqls), feature
+
+    # 反向:点名了就查得到,取值与 alloc_audit 现行口径逐字一致
+    cur2 = _RecCur()
+    got2 = sv.load_rows(_FakeConn(cur2), win=sv.sales_window("2026-08-01"),
+                        need=sv.NEED_ALL)
+    assert got2.pool["total"] == 1_280_000
+    assert got2.signal["n_rating"] == 0
+    assert got2.pt_dict["n_risk"] == 7008 and got2.pt_dict_err is None
+    assert got2.categories == [("Fashion", 900), ("Home", 800)]
+    assert got2.status == {"A085": "ACTIVE", "A107": "", "DEAD1": "ACTIVE"}
+    assert got2.sales == {("A085", "B0AAAA0001"): (3, 120.0)}
+    assert got2.order_stores == [("A085", 30, 30), ("旧名店", 5, 5)]
+
+
+def test_load_rows_pt_dict_probe_degrades_but_the_load_goes_on():
+    """P3 是对拍探针不是主线:字典表出问题不该拖垮整份存量审计,
+    但必须先 rollback(事务已 aborted,后续查询否则全炸)。"""
+    cur = _RecCur(fail_pt_dict=True)
+    conn = _FakeConn(cur)
+    got = sv.load_rows(conn, need=("pt_dict",))
+    assert got.pt_dict is None
+    assert "product_type does not exist" in got.pt_dict_err
+    assert conn.rolled_back is True
+    assert got.rows and got.st["online"] == len(ITEMS)
+
+
+def test_load_rows_refuses_a_typo_need_and_a_missing_window():
+    """开关拼错就静默少查一整块,窗口忘传就是两条 SQL 拿不到参数:宁炸不吞。"""
+    conn = _FakeConn(_RecCur())
+    with pytest.raises(ValueError) as ei:
+        sv.load_rows(conn, need=("statuses",))
+    assert "statuses" in str(ei.value)
+    with pytest.raises(ValueError) as ei2:
+        sv.load_rows(conn, need=("sales",))
+    assert "win" in str(ei2.value)
+
+
+# ── 报告 csv 落盘积木(六个工作流共用的那一份)────────────────────────────
+
+def test_report_csv_keeps_bom_and_writes_no_blank_lines(monkeypatch, tmp_path):
+    """两个参数都是给所有者用 Excel 直接打开服务的,不许"顺手简化":
+    utf-8-sig 少了中文全乱码,newline='' 少了 Windows 上每行之间多空行。"""
+    monkeypatch.setattr(report_csv.paths, "reports_dir", lambda: tmp_path / "r")
+    p = report_csv.write("t.csv", ["店铺", "SKU"], [["A085", "B0AAAA0001"]])
+    raw = Path(p).read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")          # BOM
+    assert b"\r\n" in raw and b"\r\r\n" not in raw  # newline='' 不加倍 \r
+    assert raw.decode("utf-8-sig").splitlines() == ["店铺,SKU", "A085,B0AAAA0001"]
+    assert Path(p).parent == tmp_path / "r"         # 目录不存在也会先建

@@ -10,6 +10,8 @@
 import pathlib
 import re
 
+import pytest
+
 from services import dispositions as ds
 
 
@@ -283,3 +285,42 @@ def test_every_module_level_name_the_module_uses_is_actually_defined():
                     and n.id not in local and n.id not in defined):
                 missing.add(f"{fn.name} 用到未定义的 {n.id}")
     assert not missing, sorted(missing)
+
+
+# ── 分桶积木 group_by_store(2026-08-27 从两个执行件上移)──────────────────
+
+def test_group_by_store_buckets_by_action_in_the_given_order():
+    """两个执行件各传自己的键与顺序 —— 同一份 claim() 数据的两种分桶。"""
+    rows = [{"store": "A085", "action": "delete", "id": 1},
+            {"store": "A085", "action": "relist", "id": 2},
+            {"store": "A107", "action": "retire", "id": 3}]
+    got = ds.group_by_store(rows, key="action",
+                            order=("relist", "retire", "delete"), id_field="id")
+    # 桶序即发 feed 的顺序(先救活再删),空桶也要在
+    assert list(got["A085"]) == ["relist", "retire", "delete"]
+    assert [r["id"] for r in got["A085"]["delete"]] == [1]
+    assert [r["id"] for r in got["A085"]["relist"]] == [2]
+    assert got["A085"]["retire"] == []
+    assert [r["id"] for r in got["A107"]["retire"]] == [3]
+
+    # maintenance 那一侧:键叫 kind,顺序是维护三类,id 在 disposition_id 上
+    intents = [{"store": "A085", "kind": "price", "disposition_id": 9}]
+    got2 = ds.group_by_store(intents, key="kind", order=ds.MAINT_ACTIONS,
+                             id_field="disposition_id")
+    assert list(got2["A085"]) == list(ds.MAINT_ACTIONS)
+    assert got2["A085"]["price"][0]["disposition_id"] == 9
+
+
+def test_group_by_store_raises_on_unknown_action():
+    """**宁炸不吞**(conventions §三 的安全闸):抽取时不许改成静默丢弃。
+
+    静默丢掉的话,那条建议每轮都会被领走又消失,claim() 的取件数与实际提交数
+    长期对不上而两边都不报错 —— 破坏动作走的正是这条路。
+    """
+    rows = [{"store": "A085", "action": "nuke", "id": 7}]
+    with pytest.raises(ValueError) as ei:
+        ds.group_by_store(rows, key="action",
+                          order=("relist", "retire", "delete"), id_field="id")
+    msg = str(ei.value)
+    assert "未知 action='nuke'" in msg and "建议行 id=7" in msg
+

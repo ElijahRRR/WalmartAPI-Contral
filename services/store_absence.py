@@ -89,6 +89,40 @@ def stale_stores(conn, since=None, lag_hours: int = LAG_HOURS) -> list[str]:
     return out
 
 
+def stale_or_note(conn, only: str | None = None) -> tuple[set, str]:
+    """输入:连接(+ only 单店范围)→ 输出:(缺席店集合, 探测失败提示语或空串)。
+
+    下游避让侧的取数口(标准③,所有者定稿 2026-08-26):把 `stale_stores` 的
+    结果连同「探测失败怎么办」一起给出来。
+
+    **探测失败不炸本轮**:退成空集合(= 一家都不避让 = 加缺席避让之前的行为)
+    并把归因交回调用方喊出来 —— 缺席探测经 `_watermarks → enabled_names`
+    走飞书,不降级的话一次飞书抖动就能把整条工作流拦下(两个扫描件的原话:
+    「preview 是纯 PG 查询,不该被一次飞书抖动整个拦下」;两个执行件写的是
+    「不避让 = 改前行为」)。
+
+    提示语逐字:`⚠ 缺席探测失败({异常类名}),本轮不避让`(空串 = 探测正常)。
+    拼进摘要首行的调用方自己在前面补分号,落 lines 的直接 append。
+
+    ⚠ 本函数**只管这一句**,不替调用方做任何别的决定:`n_avoided` 计数、
+    按 absent 过滤哪个容器(intents/items/rows)、提示语落首行还是落 lines、
+    破坏件要不要把降级方向改成 fail-closed —— 四处本来就该不同,留在各自
+    工作流里。
+    """
+    try:
+        absent = set(stale_stores(conn))
+        note = ""
+    except Exception as e:      # noqa: BLE001 —— 降级是刻意的:见上,飞书抖动不该拦下整轮
+        absent = set()
+        note = f"⚠ 缺席探测失败({e.__class__.__name__}),本轮不避让"
+        # 兜底触发必须留痕(conventions §六):调用方只带走类名,异常正文
+        # 只有这里看得到
+        logger.warning("缺席探测失败,本轮不避让:%s: %s", e.__class__.__name__, e)
+    if only:
+        absent &= {only}        # 只报本范围内的缺席:范围外的店与本轮无关
+    return absent, note
+
+
 def split_stale(conn, since) -> tuple[list[str], list[str]]:
     """输入:连接 + 本轮链起点 → 输出:(今日缺席, 长期缺席)(各自排序)。
 

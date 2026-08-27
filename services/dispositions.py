@@ -542,6 +542,31 @@ def cap_destructive(rows: list[dict], caps: dict, default: int,
     return kept, over
 
 
+def group_by_store(rows: list[dict], *, key: str, order: tuple,
+                   id_field: str) -> dict[str, dict]:
+    """输入:领取到的行 + 分桶键名/桶内动作顺序/报错用 id 列名 → 输出:{店铺: {动作: [行]}}。
+
+    纯函数,可测。两个执行件共用(2026-08-27 上移):maintenance 按
+    `kind` × MAINT_ACTIONS 分桶,problem_product_cleanup 按 `action` ×
+    (relist, retire, delete) 分桶 —— 同一个 `claim()` 出来的同一份数据的两种
+    分桶写法,各写一份迟早只改一处(算法、判据、docstring 措辞本来就一字不差)。
+
+    ⚠ **未知动作即抛,宁炸不吞**(conventions §三的安全闸,抽取时不许顺手改成
+    静默丢弃):建议表里冒出一个不认识的动作 = 路由口径已经对不上了。静默丢掉
+    它,那条建议每轮都会被领走又消失,`claim()` 的取件数与实际提交数长期对不上
+    而两边都不报错 —— 破坏动作走的正是这条路。
+    """
+    out: dict[str, dict] = {}
+    for r in rows:
+        bucket = out.setdefault(r["store"], {k: [] for k in order})
+        if r[key] in bucket:
+            bucket[r[key]].append(r)
+        else:               # 建议表里出现了不认识的动作:宁炸不吞
+            raise ValueError(f"未知 {key}={r[key]!r}"
+                             f"(建议行 id={r.get(id_field)})")
+    return out
+
+
 def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
     """输入:连接 + 建议行 id 列表 + feed_id + 执行者 → 输出:转态行数。
 

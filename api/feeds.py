@@ -1,6 +1,7 @@
 """沃尔玛 feed 域:全项目唯一 feed 通道(蓝图 §5 定稿,矩阵 #10/#11/#12/#16/#17)。
 
   submit_feed(store, feed_type, entries, workflow) -> [切片结果 dict]
+  iter_result_slices(results, entries) -> (切片结果, 本片条目) 生成器
   get_feed_status(store, feed_id) -> 汇总 dict
   iter_feed_items(store, feed_id) -> 逐 SKU 明细生成器(50/页自动翻)
   find_recent_feed(store, feed_type, items_received) -> 反查三态
@@ -282,6 +283,30 @@ def submit_feed(store: dict, feed_type: str, entries: list, *,
         results.append(_submit_one(store, feed_type, chunk, log_id, workflow,
                                    defer_settle=defer_settle))
     return results
+
+
+def iter_result_slices(results: list[dict], entries: list):
+    """输入:submit_feed 的逐切片结果 + 与提交时同序等长的条目 → 输出:
+    逐片 (res, batch) 生成器(batch = 本片对应的那几条)。
+
+    submit_feed 按「条数+字节」双约束切片(`_slices`),每个结果只回 `count`
+    不回条目本身;调用方要把每片的结局落回自己那一行(飞书行号、台账行、
+    (行, 载荷) 对……)就得按 count 走一遍游标。这句
+    `batch = entries[i:i + res["count"]]; i += res["count"]` 是 submit_feed
+    返回契约的机械后果,6 个工作流(maintenance / problem_product_cleanup /
+    product_clear / sku_locked_heal / list_new / match_listing)逐字各写一遍,
+    错一位就是整批结局落到别人行上、而且不报错。与 build_payload/payload_key
+    同类:纯函数、零 I/O、零业务判断,只是把接口的返回形状还原成调用方要的
+    形状(不新增端点)。
+
+    `entries` 不必是提交上去的那份载荷,只要与它**同序等长**——上面 6 处传
+    的正是各自的业务行列表。
+    """
+    i = 0
+    for res in results:
+        n = res["count"]
+        yield res, entries[i:i + n]
+        i += n
 
 
 _PRE_FAIL = object()    # token/代理阶段失败的哨兵:feed 请求尚未发出,确定未达

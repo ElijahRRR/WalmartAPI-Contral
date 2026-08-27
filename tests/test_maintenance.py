@@ -1560,3 +1560,61 @@ def test_short_title_row_survives_delete_and_retitle(monkeypatch):
     assert [i["new"] for i in invs if i["sku"] == "B0SHORT"] == [7]  # ③ 照常跟库存
     prices = mi.price_intents(_Conn(rows=[]), _MULTS, [])
     assert [p["sku"] for p in prices] == ["B0SHORT"]                 # ③ 照常改价
+
+
+# ── 维护记录追加:起点先验空(2026-08-27 找空行归一到 blacklist_sheet 后补钉)──
+
+def test_append_records_starts_at_the_first_truly_empty_row(monkeypatch):
+    """水位漂了也不许覆盖已有流水:起点必须**先验空**再写。
+
+    这是 append_records 唯一的防覆盖手段(流水账只追加、程序是唯一写入方),
+    而 2026-08-27 把找空行换成 services/blacklist_sheet.next_empty 之后,这一跳
+    跨了模块 —— 传错东西(比如传 `.require()` 的产物而不是登记条目)在生产上
+    才炸。两边共用 api.feishu 同一个模块对象,所以这里 patch 一次就盖住两边。
+    """
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 5, "unresolved_from": 2}
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_row_count", lambda s: 100)
+    # 水位说第 5 行,可 5/6 两行还有流水(裁剪后行号整体上移就是这样)⇒ 真空行在 7
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
+                        lambda sheet, rng: [["x"], ["y"]])
+    ensured, written = [], []
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_ensure_rows",
+                        lambda sheet, n: ensured.append(n))
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges",
+                        lambda sheet, ups: written.extend(ups))
+    row = maint_sheet.build_row("T1", "B0A", "改价", "", "price", "F1",
+                                "2026-08-27", "处理中")
+
+    assert maint_sheet.append_records([row]) == 1
+    assert written[0][0].startswith("A7:")      # 5/6 有数据 → 从 7 起写,不覆盖
+    assert ensured == [8]                       # 网格不够先扩行(next_empty 的返回契约)
+    saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
+    assert '"next_row": 8' in saved[1]          # 水位落到真正写完的下一行
+
+
+def test_append_records_delegates_the_scan_to_the_shared_next_empty(monkeypatch):
+    """找空行**只有一条实现**(blacklist_sheet.next_empty),且传进去的是
+    登记条目本身 —— next_empty 内部还要拿它去 sheet_row_count/sheet_values,
+    传 `.require()` 的产物会当场坏掉。谁哪天又在本文件抄回一份,这条会红。
+    """
+    sheet_entry = Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                              columns=resources.MAINT_SHEET.columns)
+    monkeypatch.setattr(resources, "MAINT_SHEET", sheet_entry)
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 9, "unresolved_from": 2}
+    _fake_db(monkeypatch, conn)
+    seen = []
+    monkeypatch.setattr(maint_sheet.blacklist_sheet, "next_empty",
+                        lambda sheet, start: (seen.append((sheet, start)), 9)[1])
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_ensure_rows", lambda s, n: None)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges", lambda s, ups: None)
+    row = maint_sheet.build_row("T1", "B0A", "改价", "", "price", "F1",
+                                "2026-08-27", "处理中")
+
+    maint_sheet.append_records([row])
+    assert seen == [(sheet_entry, 9)]

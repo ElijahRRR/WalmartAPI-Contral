@@ -131,3 +131,69 @@ def test_single_run_notification_shape_is_untouched():
 def test_first_line_of_skips_leading_blanks():
     assert nf.first_line_of("\n\n  真正的第一行  \n后面") == "真正的第一行"
     assert nf.first_line_of("") == "" and nf.first_line_of(None) == ""
+
+
+# ── 收口的两段尾巴:feed 四档计数 / 缺席点名 ────────────────────────────────
+
+def test_feed_outcome_tail_prints_submitted_and_drops_zero_exceptions():
+    """规矩 2 原样落地:提交 0 也要看见,例外恰好 0 才省。"""
+    t = nf.feed_outcome_tail
+    assert t(0, 0, 0, 0, failed_word="提交被拒") == "提交 0"
+    assert t(12, 3, 0, 0, failed_word="提交被拒") == "提交 12,在途防重跳过 3"
+    assert t(12, 0, 1, 2, failed_word="提交被拒") == (
+        "提交 12,⚠ 提交被拒 1(查日志),"
+        "⚠ 结局不确定留 pending 2(待对账)")
+
+
+def test_feed_outcome_tail_keeps_each_owners_failed_word():
+    """「提交被拒」/「提交失败」是三个执行件各自的现行字样。进飞书通知的
+    字样收口时逐字保留,不由积木替所有者统一措辞。"""
+    assert "⚠ 提交被拒 1(查日志)" in nf.feed_outcome_tail(
+        0, 0, 1, 0, failed_word="提交被拒")
+    assert "⚠ 提交失败 1(查日志)" in nf.feed_outcome_tail(
+        0, 0, 1, 0, failed_word="提交失败")
+
+
+def test_feed_outcome_tail_reproduces_the_three_live_lines():
+    """与三个执行件现行成品逐字对拍(接线后摘要不许变形)。"""
+    n = {"submitted": 12, "dedup": 3, "failed": 1, "unknown": 2}
+    rest = ",在途防重跳过 3,⚠ {} 1(查日志),⚠ 结局不确定留 pending 2(待对账)"
+
+    maint = nf.feed_outcome_tail(n["submitted"], n["dedup"], n["failed"],
+                                 n["unknown"], failed_word="提交被拒")
+    assert f"  店A:标题 feed {maint}" == \
+        "  店A:标题 feed 提交 12" + rest.format("提交被拒")     # maintenance
+    assert f"  店A:跟卖{maint}" == \
+        "  店A:跟卖提交 12" + rest.format("提交被拒")           # match_listing
+
+    ppc = nf.feed_outcome_tail(n["submitted"], n["dedup"], n["failed"],
+                               n["unknown"], failed_word="提交失败")
+    assert f"  店A:删除{ppc}" == \
+        "  店A:删除提交 12" + rest.format("提交失败")   # problem_product_cleanup
+
+
+def test_absent_tail_matches_the_live_first_line():
+    """与 catalog_sync 现行首行逐字一致;一家都不缺席时整段消失。"""
+    assert nf.absent_tail([], "", tail="下游按水位避让,链尾重赛") == ""
+    assert nf.absent_tail([("A085", "代理波动"), ("81张三", "网络未达")], "",
+                          tail="下游按水位避让,链尾重赛") == (
+        ";⚠ 缺席 2 店:A085(代理波动),81张三(网络未达)"
+        "——已串行补试仍失败,本轮不炸链(下游按水位避让,链尾重赛)")
+
+
+def test_absent_tail_says_gate_held_the_batch_instead_of_retried():
+    """规模闸拦下整批时不许还说"已串行补试仍失败"——那是两种不同的处境。"""
+    got = nf.absent_tail([("A085", "代理波动")], "⚠ 补试规模闸:失败店过半",
+                         tail="下游按水位避让,链尾重赛")
+    assert "——超补试规模闸未补试(疑似系统性故障)" in got
+    assert "已串行补试仍失败" not in got
+
+
+def test_absent_tail_lets_each_chain_bring_its_own_next_step():
+    """规矩 3「每条 ⚠ 自带处置」:目录链按水位避让、订单链下轮自然重拉,
+    两句是各链自己的真实处置,不许收口时统一成一句。"""
+    a = [("A085", "代理波动")]
+    assert nf.absent_tail(a, "", tail="下轮整点自然重拉").endswith(
+        ",本轮不炸链(下轮整点自然重拉)")
+    assert nf.absent_tail(a, "", tail="下游按水位避让,链尾重赛").endswith(
+        ",本轮不炸链(下游按水位避让,链尾重赛)")

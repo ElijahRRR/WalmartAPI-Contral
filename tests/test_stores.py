@@ -1,6 +1,7 @@
 """services/stores.py 行为回归:过滤规则(沿用旧 load_stores)/ 代理 URL 编码 / 快照兜底。"""
 
 import json
+import logging
 
 import pytest
 
@@ -230,3 +231,74 @@ def test_disabled_store_is_not_registered_away(monkeypatch):
                         lambda *a, **k: [_cred("Z001", **{fl.enabled: False})])
     assert st.registered_names() == {"Z001"}
     assert st.enabled_names() == set()
+
+
+# ── 兜底的触发面:只补外部世界的缺陷,不补自己的不确定(conventions §六)──
+
+def test_local_parse_bug_does_not_masquerade_as_a_feishu_failure(monkeypatch):
+    """_normalize 抛 = **本仓自己的 bug**,必须照抛,不许静默退陈旧快照。
+
+    旧写法把解析与落盘一起包进 try:飞书完全健康、只是凭证表字段被改名或
+    单元格形状变了,同样会退到陈旧凭证快照,还报成「店铺凭证表读取失败」
+    —— 把本地 bug 伪装成远端故障,指错路。这条路直通整店下线判据。
+    """
+    snapshot = [{"name": "陈旧店", "client_id": "c", "client_secret": "s",
+                 "proxy": "http://h:1"}]
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text(json.dumps(snapshot), encoding="utf-8")
+    _live(monkeypatch, [_rec(store="A1", client_id="c1", client_secret="s",
+                             proxy_type="http", host="1.1.1.1", port=80)])
+
+    def boom(records):
+        raise KeyError("凭证表字段被改名了")
+
+    monkeypatch.setattr(stores_svc, "_normalize", boom)
+    with pytest.raises(KeyError):
+        stores_svc.load_stores()
+
+
+def test_feishu_failure_still_falls_back_after_narrowing(monkeypatch):
+    """收窄 try 之后,**飞书故障的兜底行为一字未变**(收窄的安全方向)。"""
+    snapshot = [{"name": "A1", "client_id": "c", "client_secret": "s",
+                 "proxy": "socks5://h:1"}]
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text(json.dumps(snapshot), encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise RuntimeError("feishu down")
+
+    monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
+    assert stores_svc.load_stores() == snapshot
+
+
+def test_corrupt_snapshot_says_so_instead_of_looking_like_no_snapshot(
+        monkeypatch, caplog):
+    """快照文件损坏 ≠ 没有快照:不记日志的话两种截然不同的故障合并成一句
+    「无本地快照可兜底」,人会去找一个其实就在那儿的文件。"""
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text("{ 这不是 json", encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise RuntimeError("feishu down")
+
+    monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
+    with caplog.at_level(logging.WARNING, logger="services.stores"):
+        with pytest.raises(RuntimeError):
+            stores_svc.load_stores()
+    assert "店铺凭证快照损坏,按无快照处理" in caplog.text
+
+
+def test_no_shadow_imports_of_feishu_left(monkeypatch):
+    """函数内影子 import(`from api import feishu as _feishu  # 惰性避免循环`)
+    在本文件已失效:第 13 行的模块级 import 早就把它拉进来了,什么循环也没避到。
+    留着比没有更糟 —— 下一个人会照它去别处也写惰性 import。
+    """
+    import inspect
+    for fn in (stores_svc.enabled_names, stores_svc.registered_names):
+        assert "_feishu" not in inspect.getsource(fn), fn.__name__
+    # 行为不变:两支都用模块级 feishu,现有 monkeypatch 写法照旧生效
+    f = resources.STORE_CREDENTIALS.fields
+    recs = [{"fields": {f.store: "A1"}}, {"fields": {f.store: "A2", f.enabled: False}}]
+    monkeypatch.setattr(stores_svc.feishu, "list_records", lambda *a, **k: recs)
+    assert stores_svc.enabled_names() == {"A1"}
+    assert stores_svc.registered_names() == {"A1", "A2"}

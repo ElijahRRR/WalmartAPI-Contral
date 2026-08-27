@@ -110,8 +110,9 @@ def test_risk_sync_workflow(monkeypatch):
         "S2": [["Nike", "商标库", "2026-08-07"]],
     }
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: 2)
-    monkeypatch.setattr(feishu, "sheet_values",
-                        lambda s, rng: sheets_data[s.sheet_id])
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheets_data[s.sheet_id], r1)))
     # 第一个 [] 是**变更比对**读的现有 pt_meta(空表 = 这次全是 added)
     conn = _Conn(fetch_seq=[[], [("Cups", "禁售", "")], [("nike",)]])
     from registry import db as _db

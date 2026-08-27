@@ -87,12 +87,15 @@ def sync_from_sheet(conn) -> dict:
     sheet = resources.UPC_SHEET
     sheet.require()
     total = feishu.sheet_row_count(sheet)
-    values = feishu.sheet_values(sheet, f"A2:F{total}") if total >= 2 else []
+    # 上界随表长增长 ⇒ 走唯一标准读通道;rownum 取通道返回值(project_to_sheet
+    # 拿它拼 C{rownum}:F{rownum} 回写,手算偏移错一格就写到别人的号上)
+    pairs = (feishu.sheet_values_rows(sheet, "A", "F", 2, total)
+             if total >= 2 else [])
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 6
         if cells[0]:
-            rows.append({"rownum": i + 2, "upc_raw": cells[0],
+            rows.append({"rownum": rownum, "upc_raw": cells[0],
                          "put_date": cells[1], "shown": cells[2:6]})
     if not rows:
         return {"rows": [], "new": 0, "bad": 0}

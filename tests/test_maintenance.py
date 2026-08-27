@@ -1103,14 +1103,19 @@ def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
     conn.cursor_value = {"next_row": 3, "unresolved_from": 3}
     _fake_db(monkeypatch, conn)
     # 表里已有 (F1,B0A) 那一行,只该补 B0B
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
-                        lambda sheet, rng: [
-                            _sheet_row("T1", "B0A", "价格", "", "", "F1",
-                                       "2026-08-09", "成功")])
+    asked = []
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            [(2, _sheet_row("T1", "B0A", "价格", "", "", "F1",
+                            "2026-08-09", "成功"))])[1])
     appended = []
     monkeypatch.setattr(maint_sheet, "append_records",
                         lambda rows: (appended.extend(rows), len(rows))[1])
     out = maint_sheet.resync_from_ledger()
+    # 存量识别走标准读通道,读的是整行宽(_span,不写死字母)的 [2, next_row) 区间
+    assert asked == [(*maint_sheet._span(), 2, 2)]
     assert "补写 1 行" in out
     assert appended[0][_c("sku")] == "B0B" and appended[0][_c("action")] == "库存"
     assert appended[0][_c("feed_id")] == "F2"
@@ -1129,10 +1134,14 @@ def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
     conn.cursor_value = {"next_row": 4, "unresolved_from": 2}
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
-        _sheet_row("T1", "B0OLD", "价格", "", "", "F1", "2026-08-01", "处理中"),
-        _sheet_row("T1", "B0NEW", "价格", "", "", "F2", "2026-08-09", "处理中"),
-    ])
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: [
+            (2, _sheet_row("T1", "B0OLD", "价格", "", "", "F1",
+                           "2026-08-01", "处理中")),
+            (3, _sheet_row("T1", "B0NEW", "价格", "", "", "F2",
+                           "2026-08-09", "处理中")),
+        ])
     monkeypatch.setattr(feed_track, "item_results", lambda fid: {"B0NEW": ("submitted", "")})
     monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
     written = []
@@ -1159,7 +1168,7 @@ def test_prune_keeps_recent_days_only(monkeypatch):
     # ⚠ 行必须按**真实的 11 列**给(店铺 SKU 建议 原因 动作 旧值 新值 feedid
     #   日期 结果 报错)。此前这里喂的是 9 列、日期在下标 6 —— 正好和 prune 里
     #   写死的 cells[6] 对齐,于是测试替 bug 背了书。
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
+    grid = [
         ["T1", "B0OLD", "价格", "涨价", "价格", "10", "12.5", "F1",
          "2026-07-01", "成功", ""],
         ["T1", "B0KEEP", "价格", "涨价", "价格", "10", "12.5", "F2",
@@ -1169,11 +1178,20 @@ def test_prune_keeps_recent_days_only(monkeypatch):
         # 读错列的那版会拿新值当日期,把这行当"早于保留期"删掉。
         ["T1", "B0TRAP", "标题", "标题不符", "标题", "旧标题", "2026-07-01",
          "F4", "2026-08-08", "成功", ""],
-    ])
+    ]
+    asked = []
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            list(enumerate(grid, start=rf)))[1])
     rewritten = []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_overwrite",
                         lambda sheet, rows: (rewritten.extend(rows), len(rows))[1])
     out = maint_sheet.prune(7)
+    # 裁剪的整表读也走标准读通道:整行宽(_span,不写死字母)× [2, next_row) 区间。
+    # 从第 1 行读起会把表头当数据行重写进去,少读一列会静默截掉结果/报错
+    assert asked == [(*maint_sheet._span(), 2, 5)]
     assert "删 1 行" in out and "留 3 行" in out
     assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE", "B0TRAP"]
     # 整表重写不许把行截短:结果/报错(J/K)是最后两列,截到 9 列就没了
@@ -1224,7 +1242,9 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
         _sheet_row("T1", "S4", "库存", "7", "0", "F2", today, "处理中"),
     ]
     writes = []
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, rf, rt, **kw:
+                        list(enumerate(sheet_rows, start=rf)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"S1": ("success", ""), "S2": ("failed", "ERR_P")},
@@ -1241,6 +1261,74 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     # 水位推进到第一个未落定行(第 5 行的 F2):unresolved_from=5
     saved = [a for s, a in conn.sqls if "INSERT INTO ops.cursors" in s]
     assert saved and '"unresolved_from": 5' in saved[-1][1]
+
+
+def test_big_backlog_is_read_in_blocks_and_cleared_in_one_round(monkeypatch):
+    """积压再大也**当轮清完**:分块读 + 行号对齐 + 水位一次推到底。
+
+    2026-08-27 生产事故:反哺器把 [unresolved_from, next_row) 整段一把裸读,
+    表长起来后撞飞书单响应 10MB 上限(90221 data exceeded)—— 读一次炸一次,
+    水位一步不推,积压每轮重读、越读越大,**自己好不了**。换标准读通道
+    (feishu.sheet_values_rows:行方向分块 + 90221 对半兜底)之后,一次
+    feed_poll 就必须把整段扫完、全部回填、水位推到区间末尾;这里刻意跑真
+    通道(只桩掉最底下的 _values_raw),分块循环本身也在射程内。
+
+    ⚠ 顺带钉行号:飞书只裁**范围尾部**的空行,中段空行仍占位。分块之后
+    每块各自被裁一次,`区间起点 + enumerate` 那种手算会从被裁的那一块起
+    整段错位 —— 回填写到别人的行上,而且两边都不报错。
+    """
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    lo, hi = 2, 50_002                  # 5 万行级积压(一天几千行,攒几天就这个量)
+    conn = _Conn()
+    conn.cursor_value = {"next_row": hi, "unresolved_from": lo}
+    _fake_db(monkeypatch, conn)
+    today = maint_sheet._today().isoformat()
+    block = feishu._SHEET_READ_BLOCK_ROWS
+    holes = {lo + block - 2, lo + block - 1}    # 首块最后两行是空的,会被飞书裁掉
+    first_after_hole = lo + block               # 第二块的首行:错位就写到 holes 上
+    rows = {r: _sheet_row("T1", f"S{r}", "库存", "5", "0", "F1", today, "处理中")
+            for r in range(lo, hi) if r not in holes}
+
+    asked = []
+
+    def fake_raw(sheet, rng):
+        head, tail = rng.split(":")
+        rf, rt = int(head[1:]), int(tail[1:])
+        asked.append((rf, rt))
+        got = [rows.get(r, []) for r in range(rf, rt + 1)]
+        while got and not got[-1]:      # 只裁范围尾部;中段空行返回空列表占位
+            got.pop()
+        return got
+
+    monkeypatch.setattr(feishu, "_values_raw", fake_raw)
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    # 错位那版会把第二块首行的结果写到 holes 里的空行上,所以它必须可分辨
+    results = {f"S{r}": ("success", "") for r in rows}
+    results[f"S{first_after_hole}"] = ("failed", "ERR_X")
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: results)
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+
+    out = maint_sheet.sync_from_ledger()
+
+    # ① 整段在**这一次调用里**读完:按 4750 行/块切,块首块尾都对得上
+    assert len(asked) == -(-(hi - lo) // block)
+    assert asked[0] == (lo, lo + block - 1) and asked[-1][1] == hi - 1
+    assert asked == sorted(asked)               # 没有回头重读,没有漏块
+    # ② 行号对齐:被裁掉的两行没人写,第二块首行落在自己的行上
+    _R, _E = maint_sheet._col("result"), maint_sheet._col("error")
+    w = {rng: vals[0] for rng, vals in writes}
+    assert w[f"{_R}{first_after_hole}:{_E}{first_after_hole}"] == ["失败", "ERR_X"]
+    assert all(f"{_R}{r}:{_E}{r}" not in w for r in holes)
+    assert w[f"{_R}{hi - 1}:{_E}{hi - 1}"] == ["成功", ""]     # 末块末行也回填了
+    # ③ 一轮清完:积压全部回填,水位推到区间末尾,不留给下一轮
+    assert len(writes) == (hi - lo) - len(holes)
+    assert f"维护记录回填 {(hi - lo) - len(holes)} 行(扫描区间 {lo}~{hi - 1})" == out
+    saved = [a for s, a in conn.sqls if "INSERT INTO ops.cursors" in s]
+    assert saved and f'"unresolved_from": {hi}' in saved[-1][1]
 
 
 def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
@@ -1696,7 +1784,8 @@ def test_append_records_starts_at_the_first_truly_empty_row(monkeypatch):
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet.feishu, "sheet_row_count", lambda s: 100)
     # 水位说第 5 行,可 5/6 两行还有流水(裁剪后行号整体上移就是这样)⇒ 真空行在 7
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
+    # (next_empty 扫的是 A 单列的固定小范围,走 sheet_values_small,不是大范围读通道)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values_small",
                         lambda sheet, rng: [["x"], ["y"]])
     ensured, written = [], []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_ensure_rows",
@@ -1715,7 +1804,7 @@ def test_append_records_starts_at_the_first_truly_empty_row(monkeypatch):
 
 def test_append_records_delegates_the_scan_to_the_shared_next_empty(monkeypatch):
     """找空行**只有一条实现**(blacklist_sheet.next_empty),且传进去的是
-    登记条目本身 —— next_empty 内部还要拿它去 sheet_row_count/sheet_values,
+    登记条目本身 —— next_empty 内部还要拿它去 sheet_row_count/sheet_values_small,
     传 `.require()` 的产物会当场坏掉。谁哪天又在本文件抄回一份,这条会红。
     """
     sheet_entry = Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",

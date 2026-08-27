@@ -35,7 +35,9 @@ _SCAN_BLOCK = 5000      # 找空行时每个 GET 读多少行(**只读列 A**,�
                         # 短串约 50KB,离飞书的响应上限很远)。
                         # 原值 200:ASIN 表已填 5.7 万行 ⇒ 每轮 285 个 GET、
                         # 每个约 0.3 秒 ≈ 一分半,而真正的写只有 3 个请求
-                        # (4000 行/块)。所有者 2026-08-17 实见"一次就写了
+                        # (当时 4000 行/块;2026-08-27 起写块由 api/feishu
+                        # 限额登记表出,官方 5000×95% = 4750 行/块)。
+                        # 所有者 2026-08-17 实见"一次就写了
                         # 200 行"——那不是写,是这里在逐段读。
                         # ⚠ 这一段是 O(表已填行数):表越长越慢,只是常数小了
                         # 24 倍。哪天 ASIN 表涨到几十万行,该换成二分探测
@@ -89,7 +91,10 @@ def next_empty(sheet, start: int = 2) -> int:
     row = start
     while row <= grid:
         end = min(row + _SCAN_BLOCK - 1, grid)
-        vals = feishu.sheet_values(sheet, f"A{row}:A{end}")
+        # 走小范围薄壳而不是标准读通道:每段行数由 _SCAN_BLOCK 固定封顶
+        # (不随表长增长),而且**要的就是逐段短路**——扫到空行立刻返回,
+        # 分块通道会把整表读完才交货,正好把这里省下的时间又赔回去。
+        vals = feishu.sheet_values_small(sheet, f"A{row}:A{end}")
         got = [(str(c[0]).strip() if c and c[0] is not None else "")
                for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]
         for i, v in enumerate(got):
@@ -117,7 +122,7 @@ def rewrite_sheet(sheet, all_sql: str, mark_sql: str,
     s = sheet.require()
     ncols = len(s.columns)
     width = chr(ord("A") + ncols - 1)
-    hdr = feishu.sheet_values(s, f"A1:{width}1")
+    hdr = feishu.sheet_values_small(s, f"A1:{width}1")   # 表头单行,上界不随表长走
     header = ((hdr[0] if hdr else []) + [""] * ncols)[:ncols]
     if not any(str(h or "").strip() for h in header):
         header = list(s.columns)

@@ -20,7 +20,9 @@ def _env(monkeypatch, sheet_rows, *, stores=(STORE,)):
                         lambda conn, rows: (calls["events"].extend(rows),
                                             len(rows))[1])
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (calls["write"].extend(ups), len(ups))[1])
     monkeypatch.setattr(dr.stores_svc, "load_stores",
@@ -127,7 +129,9 @@ def test_sync_from_ledger_backfills_without_walmart_calls(monkeypatch):
     ]
     writes = []
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"OK1": ("success", ""), "BAD1": ("failed", "ERR_Y")},

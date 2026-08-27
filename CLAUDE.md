@@ -59,6 +59,8 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
   日志计数、条件明确非 catch-all(§六)。
 - **services 新增积木前先通读现有函数查重**;docstring 首行写"输入→输出"。
 - **飞书字段名只准引用 registry 字段常量**,不写字面量(表头改名会静默坏)。
+- **飞书读写只准走 api/feishu 标准通道**;限额 = 官方 × 95%,常量只在其
+  「限额登记表」出生(§八;守门测试拦通道外直连)。
 - **动了表同步 `docs/db_schema.md`;改了 workflow 同步对应文档。**
 - 密钥永远不进 git:真值在 `<DATA_ROOT>/.env`(chmod 600),仓内只有变量名。
 

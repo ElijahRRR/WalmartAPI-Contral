@@ -72,8 +72,9 @@ class _Conn:
 def sheet(monkeypatch):
     def _set(rows):
         monkeypatch.setattr(ci.feishu, "sheet_row_count", lambda s: len(rows) + 1)
-        monkeypatch.setattr(ci.feishu, "sheet_values",
-                            lambda s, rng: [_HDR] + rows)
+        monkeypatch.setattr(ci.feishu, "sheet_values_rows",
+                            lambda s, c1, c2, r1, r2, **kw:
+                            list(enumerate([_HDR] + rows, r1)))
     return _set
 
 
@@ -83,8 +84,9 @@ def test_header_mismatch_stops_instead_of_misreading(sheet, monkeypatch):
     飞书表是人在维护的,插一列/改个名随时发生 —— 宁炸不吞。
     """
     monkeypatch.setattr(ci.feishu, "sheet_row_count", lambda s: 2)
-    monkeypatch.setattr(ci.feishu, "sheet_values",
-                        lambda s, rng: [["乱七八糟"] + _HDR[1:], _ROW1])
+    monkeypatch.setattr(ci.feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate([["乱七八糟"] + _HDR[1:], _ROW1], r1)))
     with pytest.raises(ValueError, match="表头与登记不符"):
         ci.run({"execute": True})
 

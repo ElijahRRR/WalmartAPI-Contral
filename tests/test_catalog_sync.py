@@ -336,8 +336,9 @@ def test_col_letter():
     assert feishu._col_letter(27) == "AA"
 
 
-def test_sheet_ensure_rows_chunks_at_5000(monkeypatch):
-    # dimension_range 单次上限 5000(90204 实证):扩 12794 行须分 5000/5000/2794 三次
+def test_sheet_ensure_rows_chunks_at_dimension_max(monkeypatch):
+    # dimension_range 单次上限:官方 5000 行(90204 实证 2026-08-05 也是这条),
+    # 本仓按 95% 红线取 _SHEET_DIMENSION_MAX=4750 → 扩 12794 行分 4750/4750/3294 三次
     from registry.resources import Spreadsheet
     sheet = Spreadsheet(name="测试表", token="TOK", sheet_id="SID", columns=("a",))
     adds = []
@@ -350,7 +351,9 @@ def test_sheet_ensure_rows_chunks_at_5000(monkeypatch):
 
     monkeypatch.setattr(feishu, "_call", fake_call)
     assert feishu.sheet_ensure_rows(sheet, 12795) == 12794
-    assert adds == [5000, 5000, 2794]
+    assert adds == [4750, 4750, 3294] == [feishu._SHEET_DIMENSION_MAX,
+                                          feishu._SHEET_DIMENSION_MAX,
+                                          12794 - 2 * feishu._SHEET_DIMENSION_MAX]
 
 
 def test_sheet_overwrite_blocks_and_trims(monkeypatch):
@@ -370,10 +373,15 @@ def test_sheet_overwrite_blocks_and_trims(monkeypatch):
     rows = [["h1", "h2"]] + [[i, i] for i in range(4999)]   # 5000 行 → 2 块
     assert feishu.sheet_overwrite(sheet, rows) == 5000
 
+    # 块大小 = _SHEET_WRITE_MAX_ROWS(官方 5000 行 ×95% = 4750),整表重写与定点
+    # 回写走同一套预算切批(唯一写通道),不再各有各的块大小
     writes = [c for c in calls if "values_batch_update" in c[1]]
     assert len(writes) == 2
-    assert writes[0][2]["valueRanges"][0]["range"] == "SID!A1:B4000"
-    assert writes[1][2]["valueRanges"][0]["range"] == "SID!A4001:B5000"
+    assert writes[0][2]["valueRanges"][0]["range"] == "SID!A1:B4750"
+    assert writes[1][2]["valueRanges"][0]["range"] == "SID!A4751:B5000"
+    # ⚠ 整表重写**不 scrub**:KPI 看板靠写数字型日期序列值 + formatter 才显示成
+    # 日期,把数字 str 化会让格式化当场失效
+    assert writes[0][2]["valueRanges"][0]["values"][1] == [0, 0]
     deletes = [c for c in calls if c[0] == "DELETE"]        # 9000 网格 - 5000 数据 → 删尾
     assert len(deletes) == 1
     dim = deletes[0][2]["dimension"]

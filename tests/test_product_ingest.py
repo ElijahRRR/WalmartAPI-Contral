@@ -294,7 +294,35 @@ def test_fetch_products_carries_true_values(monkeypatch):
     # 配送方式来自 raw.is_fba,归一化大写;采不到就是 None(调用方不许猜)
     assert out["B0A"]["channel"] == "FBA" and out["B0B"]["channel"] == "FBM"
     assert out["B0C"]["channel"] is None
+    # 定制品标记:这批行都没带 → 一律 False(未采到=不算定制,命中才拦)
+    assert all(out[a]["is_custom"] is False for a in out)
     assert amz_source.fetch_products([]) == {}
+
+
+def test_is_custom_only_on_explicit_truthy():
+    """定制判据(2026-08-28 定稿):**明确真值才算定制**。
+
+    键名唯一出处 registry.AMZ_CUSTOM_FLAG_KEY;身份层 slow 优先、raw 兜底
+    (raw 顶层与 raw.slow 都认,_rawget 同款)。未采到/假值/怪形态一律放行
+    ——错杀一个正常品是白丢一次上架机会,漏掉一个定制品有维护链兜着。"""
+    from registry import resources
+    key = resources.AMZ_CUSTOM_FLAG_KEY
+    assert key == "is_customized"       # 生产探针核实 2026-08-28(122 万行,Yes/No)
+    # 生产实际值形态:Yes/No 字符串
+    assert amz_source._is_custom({key: "Yes"}, None) is True
+    assert amz_source._is_custom({key: "No"}, None) is False
+    assert amz_source._is_custom({key: True}, None) is True
+    assert amz_source._is_custom({key: "true"}, None) is True
+    assert amz_source._is_custom({key: "1"}, None) is True
+    assert amz_source._is_custom({}, {key: "yes"}) is True          # raw 顶层
+    assert amz_source._is_custom({}, {"slow": {key: "Y"}}) is True  # raw.slow
+    assert amz_source._is_custom({key: False}, None) is False
+    assert amz_source._is_custom({key: "false"}, None) is False
+    assert amz_source._is_custom({key: "0"}, None) is False
+    assert amz_source._is_custom({}, None) is False                 # 没采到
+    assert amz_source._is_custom({}, {"slow": {}}) is False
+    # 身份层优先:slow 说不是,raw 说是 → 以身份层为准
+    assert amz_source._is_custom({key: "false"}, {key: "true"}) is False
 
 
 def test_list_new_stock_three_way(monkeypatch):

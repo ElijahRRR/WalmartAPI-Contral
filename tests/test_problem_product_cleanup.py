@@ -59,14 +59,15 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
 
 def test_run_buckets_rows_by_action(monkeypatch):
     """分桶件 2026-08-27 上移 services.dispositions —— 这里钉**接线**:
-    本工作流按 action × _ACTION_ORDER 分桶,三个动作各进各的桶。
+    本工作流按 action × _ACTION_ORDER 分桶,两个动作各进各的桶
+    (relist 2026-08-28 退役,见 test_legacy_relist_rows_blow_up_loudly)。
     (算法与「未知动作即抛」的单元用例在 tests/test_dispositions_router.py)"""
-    _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2", "relist"),
+    _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2", "retire"),
                         _row("T2", "S3", "retire")], stores=("T1", "T2"))
     out = ppc.run({"execute": False})
-    assert "反补 1,删除 1,顽固停用 1" in out
-    assert "T1:反补 1,删除 1" in out
-    assert "T2:反补 0,删除 0,顽固停用 1" in out
+    assert "删除 1,顽固停用 2" in out
+    assert "T1:删除 1,顽固停用 1" in out
+    assert "T2:删除 0,顽固停用 1" in out
 
 
 def test_run_rejects_unknown_action(monkeypatch):
@@ -163,33 +164,18 @@ def test_second_round_retry_after_network_failure(monkeypatch):
     assert "二轮重试 1 店(串行):T1" in out and "二轮仍失败" not in out
 
 
-def test_relist_uses_detail_not_a_second_db_read(monkeypatch):
-    """反补条目的 gtin/upc 由建议行 detail 带过来,执行件不回头查库
-    ——否则"决策看到的数据"与"执行用的数据"分处两个时间点,会不一致。"""
-    seen = _wire(monkeypatch, [_row("T1", "S1", "relist", rid=3,
-                                    gtin="123456789012", upc="")])
-    sent = []
-    monkeypatch.setattr(ppc.feeds, "submit_feed",
-                        lambda store, ft, entries, *, workflow="": (
-                            sent.append((ft, list(entries))),
-                            [{"feed_id": "FR", "count": 1,
-                              "outcome": "submitted"}])[1])
-    ppc.run({"execute": True})
-    ft, entries = sent[0]
-    assert ft == "MP_MAINTENANCE"
-    assert entries[0]["Orderable"]["sku"] == "S1"
-    assert [e["event"] for e in seen["events"]] == ["maintenance_submitted"]
+def test_legacy_relist_rows_blow_up_loudly(monkeypatch):
+    """反补 2026-08-28 退役后的两道防线,钉死第二道:
 
-
-def test_relist_without_product_id_is_reported_not_silent(monkeypatch):
-    """建议行 detail 里没有 gtin/upc → 组不出条目。静默少发比什么都不做更坏:
-    那些行会一直挂 suggested,而摘要里看不出少了什么。"""
-    _wire(monkeypatch, [_row("T1", "S1", "relist", gtin="", upc="")])
-    monkeypatch.setattr(ppc.feeds, "submit_feed",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("组不出条目就不该提交")))
-    out = ppc.run({"execute": True})
-    assert "缺 gtin/upc 组不出条目" in out
+    ① claim 不再领 relist(dispositions.PROBLEM_ACTIONS 收窄,存量 suggested
+       由扫描件 withdraw_stale 撤);
+    ② 万一一条 relist 行绕过①漏进来(排查用 actions=None 全领之类),分桶件
+       按「未知动作即抛」宁炸不吞 —— 绝不能静默把它当维护 feed 发出去。"""
+    assert "relist" not in ppc._ACTION_FEED
+    assert ppc._ACTION_ORDER == ("retire", "delete")
+    _wire(monkeypatch, [_row("T1", "S1", "relist", rid=9)])
+    with pytest.raises(ValueError, match=r"未知 action='relist'.*id=9"):
+        ppc.run({"execute": False})
 
 
 def test_settle_runs_before_claim_and_is_reported(monkeypatch):
@@ -280,15 +266,12 @@ def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
     assert seen["marked"] == [((0, 1), "F1")]
 
 
-def test_cap_does_not_touch_relist(monkeypatch):
-    """反补不烧下架配额:它是救活方向,不该被删除的刹车管住。"""
-    rows = ([_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
-            + [_row("T1", f"R{i}", action="relist", rid=10 + i, gtin="G",
-                    upc="U") for i in range(3)])
+def test_cap_caps_destructive_and_reports_leftover(monkeypatch):
+    """单店「下架限制」封顶破坏类(delete/retire),超额留到下轮且必须报出来
+    (静默截断读起来就是"全做完了")。"""
+    rows = [_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
     _wire(monkeypatch, rows)
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 1})
-    monkeypatch.setattr(ppc.pp, "build_relist_item",
-                        lambda sku, gtin, upc: {"sku": sku})
     sent = []
     monkeypatch.setattr(ppc.feeds, "submit_feed",
                         lambda store, ft, entries, workflow="": (
@@ -296,7 +279,7 @@ def test_cap_does_not_touch_relist(monkeypatch):
                             [{"feed_id": "F1", "count": len(entries),
                               "outcome": "submitted"}])[1])
     out = ppc.run({"execute": True})
-    assert ("MP_MAINTENANCE", 3) in sent and ("DELETE_ITEM", 1) in sent
+    assert ("DELETE_ITEM", 1) in sent and len(sent) == 1
     assert "T1×2" in out
 
 

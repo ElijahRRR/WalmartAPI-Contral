@@ -38,9 +38,10 @@
 
 「这条处置建议该谁执行」只看 `action`,不看 `source`。`ops.dispositions`
 一张表两条链共用:`source` 答"为什么建议"(maint/scan/audit/tro),`action`
-答"该谁干"——`PROBLEM_ACTIONS`(delete/retire/relist)归
+答"该谁干"——`PROBLEM_ACTIONS`(delete/retire)归
 `problem_product_cleanup`,`MAINT_ACTIONS`(title/price/inventory)归
-`maintenance`。**破坏动作只有一个出口**;破坏组存在即压制同 SKU 的维护组,
+`maintenance`(relist 2026-08-28 所有者定稿退役:非 PUBLISHED 一律删除,
+不再改 End Date 救商品;存量 relist 行不在任何领取集,由 withdraw/settle 收尾)。**破坏动作只有一个出口**;破坏组存在即压制同 SKU 的维护组,
 压制在 `dispositions.claim()` 里判,**与两个扫描件谁先跑无关**(调度顺序
 不许承载判据);破坏组内部**不合并**(retire+delete 同 SKU 是顽固件双 feed
 齐发,合成一条会让一个的落定覆盖另一个)。合并行的每个来源各占 `sources`

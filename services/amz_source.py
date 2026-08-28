@@ -8,6 +8,7 @@
    "stock": int|None,            # amz 可见库存(<5 淘汰,MIN_INVENTORY)
    "lead_days": int|None,        # 配送时长(>12 天上架但库存写 0)
    "channel": "FBA"|"FBM"|None,  # 定价区间路由
+   "is_custom": bool,            # 定制品(定制产品不上架,2026-08-28 定稿)
    "images": [url, ...],         # 已按防御性排序(来源侧 set() 去重打乱顺序)
    "attrs": {...}}               # 其余原始属性(LLM 映射输入)
 
@@ -22,7 +23,7 @@
 import logging
 import os
 
-from registry import db
+from registry import db, resources
 
 logger = logging.getLogger("services.amz_source")
 
@@ -101,6 +102,30 @@ def _rawget(raw, key: str) -> str | None:
     return s or None
 
 
+# 定制闸认下的"真值"写法(明确标了才算定制;其余一律不算——见 _is_custom)
+_TRUTHY = {"1", "true", "yes", "y"}
+
+
+def _is_custom(attrs: dict, raw) -> bool:
+    """输入:身份层 slow 段 + snapshot.raw → 输出:是否定制品(未采到=否)。
+
+    所有者定稿 2026-08-28:定制产品不上架。判据键唯一出处
+    `registry.resources.AMZ_CUSTOM_FLAG_KEY`(契约未登记、随采集载荷落库,
+    rating/review_count 同款先例)。取值顺序 = 身份层 slow 优先、snapshot.raw
+    兜底(attrs 的既有顺序)。**明确真值才算定制**:采不到/假值/形态怪都放行,
+    与黑名单同向(命中才拦);代价是错键名 = 闸恒放行,键名必须探针核实:
+      SELECT raw ->> '<键名>', count(*) FROM catalog.latest_snapshot
+      WHERE raw ? '<键名>' GROUP BY 1;
+    """
+    key = resources.AMZ_CUSTOM_FLAG_KEY
+    v = attrs.get(key) if isinstance(attrs, dict) else None
+    if v is None:
+        v = _rawget(raw, key)
+    if v is None or isinstance(v, bool):
+        return bool(v)
+    return str(v).strip().lower() in _TRUTHY
+
+
 def main_title(p: dict) -> str | None:
     """输入:fetch_products 的产品 dict → 输出:**主标题原文**;拆不出返回 None。
 
@@ -172,6 +197,7 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
             # ——调用方按"未知不定价"处理,绝不猜(猜错一档 = 拿错倍率)
             "channel": (str(fulfillment).strip().upper()
                         if fulfillment else None),
+            "is_custom": _is_custom(attrs, raw),
             "images": images, "attrs": attrs,
             # 变体三件原料(2026-08-15):**从 raw 取,不从 slow 取**。
             # 导出契约把 variant_attributes 压成了 slow.variant.theme,而那段

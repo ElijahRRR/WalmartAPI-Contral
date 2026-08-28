@@ -25,8 +25,10 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     只能上到配额的 60%)。额度 = 限额表「上架限制」- 今日已提交数
     (ops.feed_items MP_ITEM,北京日界);超配额行不写终态,次日自动续上
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
-  ④ 全局 ASIN 去重(catalog.walmart_items 在架任一店即拦——旧 server
-    cache 的正确替代)+ **占用闸**(catalog.claims:该 ASIN 或其品牌已被
+  ④ 本店 ASIN 去重(**同店**已在架才拦;所有者定稿 2026-08-28「取消全局
+    去重」——跨店不再互拦,跨店分布由分配链 + 占用闸治理。改因:2026-08-28
+    沃尔玛把全账号退市档案翻回 items 响应集,任何店的死档案行都会把该 ASIN
+    对全船队封死)+ **占用闸**(catalog.claims:该 ASIN 或其品牌已被
     **别的店**占用即拦;占用是决策台账,商品下架也不释放,这正是快照闸
     补不上的那半边——见 docs/allocation_plan.md §二)+ ASIN 黑名单
     (catalog.asin_blacklist 永久禁止六类 + 黑名单品牌,见③)。
@@ -288,6 +290,8 @@ WHERE feed_type = 'MP_ITEM'
       AT TIME ZONE 'Asia/Shanghai'
 GROUP BY store
 """
+# 本店去重的数据面:(店铺, SKU) 对。只拦"同一家店重复上同一 ASIN",
+# 跨店不互拦(2026-08-28 取消全局去重,见文件头 ④)
 _SQL_LISTED_ASINS = """
 SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NULL
 """
@@ -334,7 +338,7 @@ class _GateState(NamedTuple):
     中间插一个字段就会让后面全部错位 —— 而错位不报错(集合/字典长得都一样)。"""
     inactive: set               # ops.store_kpi_daily 里非 ACTIVE 的店名
     today_used: dict            # 店 → 今日已提交 MP_ITEM 条数(北京日界)
-    listed: set                 # 全局在架 SKU(规划外店的不入,见 SQL 处注)
+    listed_pairs: set           # 在架 (店铺, SKU) 对(本店去重,2026-08-28 起)
     banned: dict                # ASIN → (拉黑类别, 说明)
     unexplained: set            # 有"不明原因消失"史的 ASIN(只报警不拦)
     gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
@@ -351,11 +355,11 @@ def _load_gate_state() -> _GateState:
         cur.execute(_SQL_TODAY_LISTED)
         today_used = {s: int(n) for s, n in cur.fetchall()}
         cur.execute(_SQL_LISTED_ASINS)
-        # 规划范围外的店(店名含「谭总」等,registry.alloc_excluded_stores)
-        # **不参与全局去重**:所有者定稿 2026-08-15——其他店可以与它们重复
-        # 上同一产品。它们既不占用、也不拦别人
-        listed = {sku for store, sku in cur.fetchall()
-                  if not alloc_survey.is_excluded(store)}
+        # 全部店都进(含规划外店):去重改成**本店**语义(2026-08-28 取消全局
+        # 去重)后,这个集合只回答"这家店自己有没有这个 ASIN"——自己拦自己
+        # 防重复上架,与 2026-08-15「规划外店既不占用、也不拦别人」不冲突
+        # (那条定稿针对的是跨店互拦,现在跨店根本不拦了)
+        listed_pairs = {(store, sku) for store, sku in cur.fetchall()}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
@@ -372,8 +376,8 @@ def _load_gate_state() -> _GateState:
         owned_brand = {b: s for b, s in
                        claims.load_active(conn, claims.BRAND).items()
                        if not alloc_survey.is_excluded(s)}
-    return _GateState(inactive, today_used, listed, banned, unexplained, gate,
-                      owned_asin, owned_brand)
+    return _GateState(inactive, today_used, listed_pairs, banned, unexplained,
+                      gate, owned_asin, owned_brand)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -1155,7 +1159,7 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
     """输入:待上架行 + 闸门上下文 → 输出:`_StoreGate`(候选行/理由/计数/配额/报警/摘要行)。
 
     闸门链 ①③④ 的按店那半边:凭证 → 非 ACTIVE 店 → PT spec → 风控 →
-    全局去重 → 产品占用 → ASIN 黑名单 →(不明消失史只报警)。
+    本店去重 → 产品占用 → ASIN 黑名单 →(不明消失史只报警)。
     **判据顺序即业务语义,逐条不许挪**(顺序改了 N 列理由就换一个,
     运营看到的"为什么没上"跟着变)。
 
@@ -1185,9 +1189,10 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
             continue
         allow_by_store[store_name] = max(0, ctx.quota.get(store_name, 999)
                                          - st.today_used.get(store_name, 0))
-        # 规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
-        # (所有者定稿 2026-08-15「既不占用、也不拦别人」,2026-08-19 生产
-        # 实证补全行侧方向:此前它们上架仍被别店的在架/占用拦下)
+        # 规划外店(谭总系)**不受产品/品牌占用管**(所有者定稿 2026-08-15
+        # 「既不占用、也不拦别人」,2026-08-19 生产实证补全行侧方向)。
+        # 去重闸对它们照常生效:2026-08-28 起去重是**本店**语义(自己拦自己
+        # 防重复上架),不存在"被别人拦"的问题
         unplanned = alloc_survey.is_excluded(store_name)
         for r in srows:
             if pt_spec.load_pt(r["product_type"]) is None:
@@ -1199,9 +1204,11 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 counts["risk"] += 1
                 reasons.append((r["rownum"], why))
                 continue
-            if not unplanned and r["asin"] in st.listed:
+            if (store_name, r["asin"]) in st.listed_pairs:
+                # 本店已在架(2026-08-28 取消全局去重:只拦同店重复,
+                # 跨店同 ASIN 交给分配链 + 占用闸决定)
                 counts["dedup"] += 1
-                reasons.append((r["rownum"], "全局去重:该ASIN已在售"))
+                reasons.append((r["rownum"], "本店已在架:同店重复上架拦截"))
                 continue
             holder = None if unplanned else st.owned_asin.get(r["asin"])
             if holder and holder != store_name:
@@ -1231,8 +1238,9 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
 def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
     """输入:按店闸的候选行 + 采集数据 + 闸门上下文 → 输出:`_RowGate`(幸存行/理由/计数/回显)。
 
-    闸门链 ⑤⑥ 的按行那半边:数据源 → 库存三态 → 库存下限 → 品牌风控 →
-    品牌占用 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 → 配送时长 → 素材。
+    闸门链 ⑤⑥ 的按行那半边:数据源 → 定制品 → 库存三态 → 库存下限 →
+    品牌风控 → 品牌占用 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 →
+    配送时长 → 素材。
     **判据顺序即业务语义,逐条不许挪**(每道闸都假设前面那道已经拦掉了它
     处理不了的形状,例如店铺渠道闸靠"产品渠道未采到"上一行先拦)。
 
@@ -1262,6 +1270,13 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
         echo = [(p.get("title") or "")[:190], p.get("price") or "",
                 p.get("stock") if p.get("stock") is not None else "", ""]
         data_echo.append((r["rownum"], echo))
+        # 定制品闸(所有者定稿 2026-08-28:定制产品不上架)。放数据闸最前:
+        # 它是产品属性,与库存/价格无关。判据在 amz_source._is_custom
+        # (键 = registry.AMZ_CUSTOM_FLAG_KEY;明确真值才拦,未采到放行)
+        if p.get("is_custom"):
+            counts["custom"] += 1
+            reasons.append((r["rownum"], "定制品不上架"))
+            continue
         # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
         #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
         #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
@@ -1439,7 +1454,7 @@ def run(params: dict) -> str:
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
-         "lead_days": 0, "no_material": 0, "channel": 0}
+         "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0}
     # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
@@ -1510,10 +1525,10 @@ def run(params: dict) -> str:
     blocked = [(label, n[key]) for key, label in (
         ("inactive", "非 ACTIVE 店"), ("quota", "超配额"),
         ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
-        ("dedup", "全局去重"), ("blacklist", "黑名单"),
+        ("dedup", "本店已在架"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
         ("lead_days", "配送超时"), ("no_material", "素材不足"),
-        ("channel", "渠道不符本店")) if n[key]]
+        ("channel", "渠道不符本店"), ("custom", "定制品")) if n[key]]
     gate_line = ("闸门:" + ",".join(f"{lab} {v}" for lab, v in blocked)
                  if blocked else "闸门:一条都没拦")
     if n["stock_assumed"]:

@@ -1,12 +1,17 @@
-"""问题商品归类积木(problem_product_cleanup 用;规则逐字移植自旧
-feishu_sync.py/relisting.py,2026-08-06 从 erpAPI@d5237fb 提取,别优化)。
+"""问题商品归类积木(problem_scan 用;规则逐字移植自旧
+feishu_sync.py/relisting.py,2026-08-06 从 erpAPI@d5237fb 提取)。
 
 归类输入只有一个:unpublished_reasons 文本(多条以 " | " 拼接),小写子串匹配。
-"""
 
-NEW_END_DATE = "2049-12-31T00:00:00.000Z"   # 纯日期会被拒,必须 ISO datetime(旧实证)
-MAX_ATTEMPTS = 2            # 同 SKU 反补 N 次仍 UNPUBLISHED → 转 DELETE 兜底
-ATTEMPT_RESET_DAYS = 30     # 反补计数 30 天后重置(给 SKU 二次机会)
+⚠ **反补机制 2026-08-28 所有者定稿退役**:「publishedStatus 不是 PUBLISHED 的
+都进行删除,不再修改 End Date 救商品」。归类不再决定处置走向(一律删除),
+只服务三件事:病历(problem_categorized 事件)、黑名单收集(B/C/E/F/G/K)、
+摘要按类计数。反补构造器(build_relist_item/pick_product_id/NEW_END_DATE)
+与计数常量(MAX_ATTEMPTS/ATTEMPT_RESET_DAYS)、Stage 豁免(is_stage_pending)
+随之删除 —— 需要考古看 git;A 类反补当年的语病也一并留档:「end date has
+passed」同时是沃尔玛给退市商品打的标记(批量退市 = Site End Date 设为过去),
+把它当可修复故障反补,等于对退市档案走官方复活通道(2026-08-28 事件实证)。
+"""
 
 # 类别码 → (中文名, 判定函数)。匹配用旧系统原字符串,勿改。
 _RULES = {
@@ -50,34 +55,4 @@ def categorize(reason_text: str | None) -> tuple[str, str]:
     return "Z", "其他"
 
 
-def is_stage_pending(reason_text: str | None) -> bool:
-    """输入:下架原因文案 → 输出:是否 Stage 待发布。
-
-    不是错误,排除删除;独立于 categorize,旧 main() 同款。
-    """
-    return "stage status until you go live" in (reason_text or "").lower()
-
-
-def pick_product_id(gtin, upc) -> tuple[str, str] | None:
-    """输入:gtin/upc → 输出:(productId, productIdType) 或 None(不可反补)。
-
-    旧优先级:GTIN(补足14位)> UPC(补足12位);都不满足 8 位下限 → None。
-    """
-    g = str(gtin or "").strip()
-    if len(g) >= 8:
-        return g.zfill(14), "GTIN"
-    u = str(upc or "").strip()
-    if len(u) >= 8:
-        return u.zfill(12), "UPC"
-    return None
-
-
-def build_relist_item(sku: str, gtin, upc) -> dict | None:
-    """输入:sku/gtin/upc → 输出:反补(设置商品到期日期)MPItem;无 productId 返 None。"""
-    pid = pick_product_id(gtin, upc)
-    if pid is None:
-        return None
-    return {"Orderable": {"sku": str(sku),
-                          "productIdentifiers": {"productId": pid[0],
-                                                 "productIdType": pid[1]},
-                          "endDate": NEW_END_DATE}}
+# (反补构造器与 Stage 豁免原在此处,2026-08-28 退役删除 —— 见模块头注)

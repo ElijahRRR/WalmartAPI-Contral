@@ -70,17 +70,21 @@ logger = logging.getLogger("services.dispositions")
 
 # 动作取值。破坏组(delete/retire)与反补归 problem_product_cleanup,
 # 维护三类归 maintenance —— **按动作分工,不按来源**(理由见下面 PROBLEM_ACTIONS)。
-ACTIONS = ("relist", "delete", "retire", "title", "price", "inventory")
+# ⚠ relist(反补)2026-08-28 所有者定稿退役:「非 PUBLISHED 一律删除,不再改
+# End Date 救商品」。库里存量 relist 行不删:suggested 由扫描件 withdraw_stale
+# 自然撤掉,executing 由 settle 的 _SETTLE_RELIST_SQL 照旧落定 —— 但 claim
+# 不再领取(不在任何领取集),不会再有新的反补 feed 发出。
+ACTIONS = ("delete", "retire", "title", "price", "inventory")
 
 # ⚠ **动作优先级,全项目唯一出处**(所有者定稿 2026-08-24)。
-# 序:删除 > 停用 > 反补 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
+# 序:删除 > 停用 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
 # claim() 的取件顺序、摘要的列序。
 # 这条规则本来就在跑,只是关在 maintenance_intents 的**一轮内存**里
 # (`_ACTION_RANK`(已删)/ `collect_all` 的 `doomed` 集合)——那份只看得见本轮
 # 自己算出来的删除,看不见另一条链挂在库里的建议,于是跨链重复删了两次
 # (所有者 2026-08-24 实证)。提升作用域到"库里所有未落定建议"就是本常量。
-ACTION_RANK = {"delete": 0, "retire": 1, "relist": 2,
-               "inventory": 3, "title": 4, "price": 5}
+ACTION_RANK = {"delete": 0, "retire": 1,
+               "inventory": 2, "title": 3, "price": 4}
 ACTION_ORDER = tuple(sorted(ACTIONS, key=lambda a: ACTION_RANK[a]))
 
 # 破坏组:不可逆。**存在即压制该 SKU 的维护组建议** —— 要删的东西没必要再花
@@ -99,7 +103,7 @@ DESTRUCTIVE_PER_STORE = 300
 # 2026-08-19 生产实见一行 —— 维护链先落 delete 建议(source='maint'),审核链
 # 后来覆写了它的 reason,那行仍归维护链执行,于是维护记录表里写着维护链的
 # 「建议」、问题链的「原因」,谁也说不清是哪条链干的。按动作领之后不可能再错位。
-PROBLEM_ACTIONS = ("delete", "retire", "relist")
+PROBLEM_ACTIONS = ("delete", "retire")   # relist 已退役(2026-08-28,见 ACTIONS 注)
 # 维护链专属动作:它们的"生效"没有对应的核验事件,由 settle_maintenance()
 # 直接比对 catalog.walmart_items 的现值判定。**同时是 maintenance 的领取集**
 MAINT_ACTIONS = ("title", "price", "inventory")
@@ -142,6 +146,8 @@ WHERE ops.dispositions.status = 'suggested'
 # gone 侧(delete_verified)= 生效;still 侧(delete_not_effective)= 没生效。
 # 反补(relist)的生效信号不同:商品重新 PUBLISHED —— 直接看 walmart_items
 # 现状,不看事件(反补没有对应的核验事件流)。
+# ⚠ relist 动作已退役(2026-08-28,见 ACTIONS 注):_SETTLE_RELIST_SQL 保留
+# 只为给**存量** executing 行收尾,新建议不会再产生这个动作。
 _SETTLE_DELETE_SQL = """
 UPDATE ops.dispositions d
 SET status = CASE WHEN e.event = 'delete_verified'
@@ -440,8 +446,9 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
     ⚠ **actions 必须传**(默认 None = 全领,只留给排查用)。传的是
     `PROBLEM_ACTIONS` / `MAINT_ACTIONS`,别在工作流里手写字符串。
     领错动作的后果是白炸一轮:维护链的 'price' 落进
-    problem_product_cleanup.group_by_store 会直接抛,反过来 'relist' 落进
-    维护执行件同理。
+    problem_product_cleanup.group_by_store 会直接抛,反过来 'delete' 落进
+    维护执行件同理。库里的存量 'relist' 行不在任何领取集里,永远领不走
+    (退役动作,见 ACTIONS 注)。
 
     ⚠ **按动作领,不按来源领**(2026-08-24 改)。旧口径按 source 领,后果见
     PROBLEM_ACTIONS 的注释:一条被两条链先后建议过的删除,归谁执行取决于
@@ -451,7 +458,7 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
     截断(cap_destructive)因此总是先保住优先级高的那些。
 
     ⚠ **破坏组压制维护组**:同一 SKU 挂着未落定的 delete/retire 时,它的
-    title/price/inventory/relist 行一条都不返回 —— 要删的东西没必要再花配额去
+    title/price/inventory 行一条都不返回 —— 要删的东西没必要再花配额去
     改(批次 E 踩过:先花配额救活、再花配额删掉)。被压制的行留在 suggested
     不撤:删除若最终没生效,它们还在,不用等扫描件重算。压制了多少条由
     count_suppressed() 报,别让它静默。

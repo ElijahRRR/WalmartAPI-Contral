@@ -2,7 +2,7 @@
 
 用法:
   python cli.py problem_product_cleanup --dry-run      # 空跑:将执行哪些建议
-  python cli.py problem_product_cleanup                # 真跑(反补/删除/停用 + 落账)
+  python cli.py problem_product_cleanup                # 真跑(删除/停用 + 落账)
   python cli.py problem_product_cleanup -p store=A085朱丽霖
 
 **本工作流不再做任何决策**(批次 E,批复 #8)。它只做三件事:
@@ -10,7 +10,7 @@
   ② 领取 ops.dispositions 里 status='suggested' 的建议行;
   ③ 按 (店铺, 动作) 分桶发 feed,提交成功的转 executing 并落 feed_id。
 
-决策(查库 → 归类 → 该反补还是该删)在 `problem_scan`。为什么拆:原来一个
+决策(查库 → 归类 → 落建议)在 `problem_scan`。为什么拆:原来一个
 文件里既做只读的定性、又做不可逆的 DELETE_ITEM,想看看该删哪些就得跑一个
 DANGEROUS 工作流;而且建议不留痕,事后无从追"当初为什么删它"。
 
@@ -18,7 +18,7 @@ DANGEROUS 工作流;而且建议不留痕,事后无从追"当初为什么删它"
 没跑 scan 就跑本工作流 = 消费上一轮的陈旧建议(或者什么都没有)。
 
 去重与观测纪律(拆分后各归其位,一条没丢):
-  · 决策期预筛(在途 48h 封顶 / 反补 30 天计数 / 顽固代际)→ 归 problem_scan;
+  · 决策期预筛(在途 48h 封顶 / 顽固代际)→ 归 problem_scan;
   · **提交期权威防重** → api/feeds.submit_feed 的 ops.feed_log(返回
     outcome=dedup,本文件如实计数不落事件);
   · 建议行本身的防重 → ops.dispositions 的部分唯一索引(同 店铺/SKU/动作
@@ -49,7 +49,6 @@ from datetime import datetime
 from api import _client, feeds
 from registry import db
 from services import dispositions
-from services import problem_products as pp
 from services import kpi, maint_sheet, notify_fmt as nf
 from services import product_events, store_absence, store_limits, \
     store_retry, stores as stores_svc
@@ -59,18 +58,17 @@ SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重�
 
 logger = logging.getLogger("workflows.problem_product_cleanup")
 
-# 领取到的建议行按 (店铺, 动作) 分桶后,发 feed 要的载荷各不相同:
-# relist 需要 gtin/upc 重建 MP_MAINTENANCE 条目,delete/retire 只要 sku。
-# scan 把 gtin/upc 放在建议行的 detail 里带过来——执行件不再回头查库,
-# 避免"决策看到的数据"与"执行用的数据"在两个时间点上不一致。
+# 领取到的建议行按 (店铺, 动作) 分桶后发 feed,delete/retire 载荷都只要 sku。
+# ⚠ relist(反补)2026-08-28 所有者定稿退役(「非 PUBLISHED 一律删除,不再改
+# End Date 救商品」):本件不再领取也不再执行它(dispositions.PROBLEM_ACTIONS
+# 已收窄),存量 suggested 由扫描件 withdraw_stale 撤,executing 由 settle 收尾。
 _ACTION_FEED = {
-    "relist": ("MP_MAINTENANCE", product_events.MAINTENANCE_SUBMITTED, "反补"),
     "retire": ("RETIRE_ITEM", product_events.RETIRE_SUBMITTED, "顽固停用"),
     "delete": ("DELETE_ITEM", product_events.DELETE_SUBMITTED, "删除"),
 }
-# 发 feed 的顺序有讲究:先救活再删。同一 SKU 若同时被建议 retire 与 delete
-# (顽固双击),两条都要发;但 relist 与 delete 在正常路径上互斥,不会同现。
-_ACTION_ORDER = ("relist", "retire", "delete")
+# 同一 SKU 若同时被建议 retire 与 delete(顽固双击),两条都要发:
+# 先停用后删除,能删的删,删不掉的至少已经停用
+_ACTION_ORDER = ("retire", "delete")
 
 
 class _RetryNeeded(Exception):
@@ -95,8 +93,8 @@ class _RetryNeeded(Exception):
 
 def _record(conn, store: str, event: str, rows: list[dict], feed_id) -> None:
     """建议行 → 产品事件。source 保持 'problem_product_cleanup' 不变:
-    problem_scan 的 _SQL_ATTEMPTS 按 source 数反补次数,改名会让 30 天窗口内
-    的历史计数归零,"反补满 2 次转删"重新从 0 数起 ⇒ 商品被无限反补。"""
+    病历(product_events)按 source 追溯是谁提交的,批次 E 拆分前后与
+    反补退役(2026-08-28)前后必须连续,改名会把历史断代。"""
     product_events.record_many(conn, [
         {"sku": r["sku"], "store": store, "event": event,
          "source": "problem_product_cleanup",
@@ -197,7 +195,7 @@ def run(params: dict) -> str:
     # 已经是 executing,而通知开头写着 ✅ 成功,人会以为什么都没干。
     # 也不能说「已执行」:领取的行里有一部分会被单店上限/在途防重挡下。
     head = "待执行建议" if not execute else "本轮领取建议"
-    lines.insert(0, f"{mode}{head} {len(rows)} 条:反补 {tot['relist']},"
+    lines.insert(0, f"{mode}{head} {len(rows)} 条:"
                     f"删除 {tot['delete']},顽固停用 {tot['retire']}")
     if over_cap:
         # 截断必须见人(本仓口诀:静默截断读起来就是"全做完了")
@@ -206,22 +204,20 @@ def run(params: dict) -> str:
                      + f"(共 {sum(over_cap.values())} 条,**没有丢弃**)")
 
     if not execute:
-        # 按动作分开列样本(人眼闸门的判断依据:反补=救活方向,
+        # 按动作分开列样本(人眼闸门的判断依据:停用=可逆方向,
         # 删除=不可逆方向,混排会误导)
         for store, b in sorted(plans.items()):
             if not any(b[a] for a in _ACTION_ORDER):
                 continue
             cats: dict[str, int] = {}
-            for r in b["delete"] + b["relist"]:
+            for r in b["delete"]:
                 cats[r.get("category") or "-"] = cats.get(r.get("category") or "-", 0) + 1
-            line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
+            line = (f"  {store}:删除 {len(b['delete'])}"
                     + (f",顽固停用 {len(b['retire'])}" if b["retire"] else "")
                     + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
                     + "}")
             if b["delete"]:
                 line += f",删除样本={[(r['sku'], r.get('category')) for r in b['delete'][:5]]}"
-            if b["relist"]:
-                line += f",反补样本={[(r['sku'], r.get('category')) for r in b['relist'][:3]]}"
             lines.append(line)
         return "\n".join(lines + ["(dry-run:未提交任何 feed;确认无误后**去掉 --dry-run** 重跑)"])
 
@@ -340,7 +336,7 @@ def _sheet_row(store: str, r: dict, suggestion: str, action: str,
     """输入:店铺 + 建议行 + 实际动作 + 结果 → 输出:维护记录表的一行。
 
     造行走 `maint_sheet.build_row`(唯一造行处,与 maintenance 同一个函数)。
-    「旧值/新值」空:破坏/反补动作没有值的变化,那两列是维护三类用的。
+    「旧值/新值」空:破坏动作没有值的变化,那两列是维护三类用的。
     """
     return maint_sheet.build_row(store, r["sku"], suggestion,
                                  r.get("reason") or "", action,
@@ -353,8 +349,8 @@ def _submit_store(store_name: str, store: dict, b: dict,
 
     多切片滑窗对位记账(与 product_clear._submit_new 同款);**只有
     outcome=submitted 才落事件、才转 executing** —— dedup 携带旧 feed_id 但
-    什么都没提交,记了就是幽灵事件:反补计数被灌水会导致少一次真实反补就转
-    永久删除,而建议行会卡在 executing 等一个不存在的 feed 的判决。
+    什么都没提交,记了就是幽灵事件(病历灌水),而建议行会卡在 executing
+    等一个不存在的 feed 的判决。
     retryable=token/代理阶段确定未达;凭证失效(StoreDeadError)不重试。
 
     ⚠ records 是传进来的、不是返回的(与 maintenance._submit_kind 同款理由):
@@ -414,23 +410,7 @@ def _submit_store(store_name: str, store: dict, b: dict,
             rows = b.get(action) or []
             if not rows:
                 continue
-            if action == "relist":
-                # gtin/upc 由 problem_scan 放在建议行 detail 里带过来:
-                # 执行件不回头查库,免得"决策看到的"与"执行用的"两个时间点不一致
-                entries = [pp.build_relist_item(
-                    r["sku"], (r.get("detail") or {}).get("gtin"),
-                    (r.get("detail") or {}).get("upc")) for r in rows]
-                keep = [(e, r) for e, r in zip(entries, rows) if e]
-                if len(keep) != len(rows):
-                    # 建到建议时能组出条目、现在组不出 = detail 丢了 gtin/upc。
-                    # 静默少发几条比什么都不做更坏:那些行会一直挂 suggested
-                    lines.append(f"  ⚠ {store_name}:{len(rows) - len(keep)} 条反补"
-                                 f"建议缺 gtin/upc 组不出条目,跳过(重跑 problem_scan)")
-                if not keep:
-                    continue
-                _submit(action, [e for e, _ in keep], [r for _, r in keep])
-            else:
-                _submit(action, [r["sku"] for r in rows], rows)
+            _submit(action, [r["sku"] for r in rows], rows)
     except _client.StoreDeadError as e:
         logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
         lines.append(f"  {store_name}:凭证失效跳过")

@@ -111,9 +111,10 @@ def _is_custom(attrs: dict, raw) -> bool:
 
     所有者定稿 2026-08-28:定制产品不上架。判据键唯一出处
     `registry.resources.AMZ_CUSTOM_FLAG_KEY`(契约未登记、随采集载荷落库,
-    rating/review_count 同款先例)。取值顺序 = 身份层 slow 优先、snapshot.raw
+    rating/review_count 同款先例;键名 is_customized 已生产探针核实,
+    122 万行,值形态 Yes/No)。取值顺序 = 身份层 slow 优先、snapshot.raw
     兜底(attrs 的既有顺序)。**明确真值才算定制**:采不到/假值/形态怪都放行,
-    与黑名单同向(命中才拦);代价是错键名 = 闸恒放行,键名必须探针核实:
+    与黑名单同向(命中才拦);代价是错键名 = 闸恒放行,改键名必须重探:
       SELECT raw ->> '<键名>', count(*) FROM catalog.latest_snapshot
       WHERE raw ? '<键名>' GROUP BY 1;
     """

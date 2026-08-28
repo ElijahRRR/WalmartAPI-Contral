@@ -307,6 +307,10 @@ def test_is_custom_only_on_explicit_truthy():
     ——错杀一个正常品是白丢一次上架机会,漏掉一个定制品有维护链兜着。"""
     from registry import resources
     key = resources.AMZ_CUSTOM_FLAG_KEY
+    assert key == "is_customized"       # 生产探针核实 2026-08-28(122 万行,Yes/No)
+    # 生产实际值形态:Yes/No 字符串
+    assert amz_source._is_custom({key: "Yes"}, None) is True
+    assert amz_source._is_custom({key: "No"}, None) is False
     assert amz_source._is_custom({key: True}, None) is True
     assert amz_source._is_custom({key: "true"}, None) is True
     assert amz_source._is_custom({key: "1"}, None) is True

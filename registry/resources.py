@@ -97,9 +97,10 @@ def feishu_notify_to() -> str | None:
 # 可以从产品数据中拿到」)。值随采集载荷落库(products.slow / snapshots.raw),
 # 契约字段表未登记 —— rating/review_count 同款先例(allocation_plan §评分:
 # 契约没登记但采集侧确实随 raw 落库,探针实测后启用)。
-# ⚠ 键名以生产探针为准(amz_source._is_custom 有发现 SQL);错键名 = 恒放行
-# (闸是"明确真值才拦"方向),所以上线前必须对着真数据核一次这个名字。
-AMZ_CUSTOM_FLAG_KEY = "is_custom"
+# 键名生产探针已核实(所有者实跑 2026-08-28):latest_snapshot.raw 带
+# `is_customized` 共 1,225,423 行,值形态 Yes/No(_is_custom 的小写 truthy
+# 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
+AMZ_CUSTOM_FLAG_KEY = "is_customized"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)

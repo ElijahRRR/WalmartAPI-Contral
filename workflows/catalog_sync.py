@@ -69,11 +69,19 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
     inv_failed = False
     if not skip_inventory:
         try:
-            # expected_skus = 本轮扫到的全部 SKU(含截断补漏):bulk 漏掉的
-            # 走单品 GET 兜底(api 层内置,记日志计数;所有者 2026-08-26
-            # 拍板接上 —— 此前没传,蓝图 #22 的补漏在生产从未触发)
-            inventory = inv_api.list_inventories(
-                store, expected_skus={s["sku"] for s in summaries if s.get("sku")})
+            # ⚠ **不传 expected_skus,bulk 拉到什么就是什么**(所有者定稿
+            # 2026-08-28 撤线,推翻自己 08-26「拍板接上」)。撤的依据是接上后的
+            # **第一次生产触发**(08-28 06:42,A109):目录 6,976 - bulk 3,511 =
+            # 3,465 个"漏",逐个单查**全 404**,一店多烧 43 分钟 —— 因为 404 的
+            # 语义是「库存台账没有这一行」:退市/Stage 死档案永远不会有库存行,
+            # 部分**真在线**商品同样没有(所有者实见),单查对两者都问不出新
+            # 信息,只烧时长与 inventory 配额。"bulk 没给"≠"翻页漏了",
+            # 这正是蓝图 #22 那个假设在生产的证伪。
+            # bulk 真漏的行不会丢数:avail_qty 由 upsert 的 COALESCE 沿用
+            # 上一轮值(walmart_catalog.py,#93 之前生产一直如此)。
+            # api 层 list_inventories 的 expected_skus 能力**保留不删**,
+            # 只撤本调用方的接线 —— 将来有按名单精查的场景仍可用。
+            inventory = inv_api.list_inventories(store)
         except _client.StoreDeadError:
             raise                       # 凭证失效仍按跳店处理
         except Exception as e:

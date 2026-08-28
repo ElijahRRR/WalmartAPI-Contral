@@ -505,10 +505,17 @@ def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
     assert "⚠ 缺席 1 店:断店(代理波动)" in first     # 归类进首行,人知道去找代理商
 
 
-def test_sync_one_store_wires_scanned_skus_into_inventory_fallback(monkeypatch):
-    """工作流必须把本轮扫到的 SKU 集传给 list_inventories(所有者 2026-08-26
-    拍板接上保险丝)。此前调用没传 expected_skus,api 层的单查兜底(蓝图 #22)
-    在生产从未触发——bulk 漏数据时无人补。桩掉扫描与落库,只验传参与滤 None。"""
+def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
+    """工作流**不许**把扫描 SKU 集传给 list_inventories(所有者定稿 2026-08-28
+    撤线,推翻自己 08-26 的「拍板接上」)。
+
+    撤线依据是接上后的**第一次生产触发**(08-28,A109):目录 6,976 − bulk
+    3,511 = 3,465 个"漏",逐个单查**全 404**,一店多烧 43 分钟。404 = 「库存
+    台账没有这一行」——退市/Stage 死档案永远不会有,部分**真在线**商品同样
+    没有,单查问不出新信息。"bulk 没给"≠"翻页漏了",蓝图 #22 的假设被生产
+    证伪。bulk 真漏的行由 upsert 的 COALESCE 沿用上一轮值兜着。
+    ⚠ api 层 list_inventories 的 expected_skus **能力保留**(上面那条 api 级
+    用例继续钉它),撤的只是本调用方的接线 —— 别顺手删掉 api 能力。"""
     import contextlib
     from datetime import datetime, timezone
     from workflows import catalog_sync
@@ -516,9 +523,10 @@ def test_sync_one_store_wires_scanned_skus_into_inventory_fallback(monkeypatch):
     monkeypatch.setattr(catalog_sync.items, "iter_all_items",
                         lambda store, stats, mode: iter(
                             [{"sku": "A"}, {"sku": "B"}, {"sku": None}]))
-    seen: dict = {}
+    seen: dict = {"called": False}
 
     def fake_inv(store, expected_skus=None):
+        seen["called"] = True
         seen["skus"] = expected_skus
         return {"A": 3}
 
@@ -534,5 +542,6 @@ def test_sync_one_store_wires_scanned_skus_into_inventory_fallback(monkeypatch):
 
     r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc),
                                      False, "fast", False)
-    assert seen["skus"] == {"A", "B"}     # 扫描集原样传入;None SKU 滤掉不进单查
+    assert seen["called"] and seen["skus"] is None, \
+        "接线又被接回来了:扫描集不许进库存单查(2026-08-28 定稿)"
     assert r["inv"] == 1

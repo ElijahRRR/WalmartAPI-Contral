@@ -335,6 +335,37 @@ def test_store_channel_gate(monkeypatch):
     assert "配送方式(FBA/FBM)未采到" in out
 
 
+def test_silent_buckets_now_write_reasons(monkeypatch):
+    """所有者定稿 2026-08-28:除「配额排队」外的静默桶都要写明 N 列原因。
+
+    钉三路:审核判拒 / 审核未过(pending·未审)/ 店铺非 ACTIVE(整店跳过也
+    逐行写)。都只写理由**不写终态**——条件解除下一轮自动续上;配额排队
+    仍然故意不写(计划上架,还在队里)。"""
+    rows = [_sheet_row(2, audit_result="reject"),
+            _sheet_row(3, audit_result="pending"),
+            _sheet_row(4, audit_result=""),                  # 库里查不到=未审
+            _sheet_row(5, store="T_OFF")]                    # 非 ACTIVE 店
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        {"T_OFF"}, {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
+        {"name": "T1"}, {"name": "T_OFF"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda asins: {})
+
+    out = ln.run({"execute": False})
+    assert "第2行:审核判拒,不上架" in out
+    assert "第3行:审核未过:pending(过审后自动续上)" in out
+    assert "第4行:审核未过:未审(过审后自动续上)" in out
+    assert "第5行:店铺非ACTIVE,整店暂停上架" in out
+    assert "非 ACTIVE 店 1" in out          # 计数照旧
+
+
 def test_custom_product_gate(monkeypatch):
     """定制品不上架(所有者定稿 2026-08-28)。明确标了才拦;未采到照常走后面
     的闸(fail-open,与黑名单同向:命中才拦)。"""

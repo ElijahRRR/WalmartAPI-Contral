@@ -58,6 +58,17 @@ SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重�
 
 logger = logging.getLogger("workflows.problem_product_cleanup")
 
+# ⚠ 单店「下架限制」暂停开关(所有者定稿 2026-08-28:「暂时关闭这个限制」)。
+# 背景:08-28 沃尔玛档案可见性事件把万级退市死档案翻回响应集,反补退役后
+# 这批全走删除 —— 按日限额(限额表/缺省 300 每店)要削几十天,清理波期间
+# 不封顶,让积压当轮出清。True 期间:不读限额表、不按日记账、不截断,
+# 摘要**首行**点名(静默的闸没人记得它关着);缺席避让 fail-closed、
+# 在途防重、feed 速率桶(DELETE_ITEM 6/hour、单 feed ≤2500 条)**均不受
+# 此开关影响** —— 出闸节奏仍被速率桶天然限住,关的只是"每天最多删多少"。
+# 恢复:清理波结束后改回 False(title_mismatch 停闸同款先例:常量停闸、
+# 摘要点名、恢复即改回;有用例钉住 True 现状,改回时同步改用例)。
+RETIRE_CAP_PAUSED = True
+
 # 领取到的建议行按 (店铺, 动作) 分桶后发 feed,delete/retire 载荷都只要 sku。
 # ⚠ relist(反补)2026-08-28 所有者定稿退役(「非 PUBLISHED 一律删除,不再改
 # End Date 救商品」):本件不再领取也不再执行它(dispositions.PROBLEM_ACTIONS
@@ -153,10 +164,16 @@ def run(params: dict) -> str:
             n_fail_closed, rows = len(rows), []
         # 单店删除上限**只在这里施加一次**(2026-08-24 归一),且按**天**记账
         # (2026-08-26):当日已放行的先扣掉,链尾重赛/人工重跑不会把上限翻倍
-        executed_today = dispositions.destructive_executed_today(conn)
-    rows, over_cap = dispositions.cap_destructive(
-        rows, _retire_caps(), dispositions.DESTRUCTIVE_PER_STORE,
-        executed_today=executed_today)
+        executed_today = ({} if RETIRE_CAP_PAUSED
+                          else dispositions.destructive_executed_today(conn))
+    if RETIRE_CAP_PAUSED:
+        # 停闸期间不读限额表、不记账、不截断 —— 但必须在摘要**首行**点名
+        # (拼进 head 那一行,见下;静默的闸没人记得它关着)
+        over_cap = {}
+    else:
+        rows, over_cap = dispositions.cap_destructive(
+            rows, _retire_caps(), dispositions.DESTRUCTIVE_PER_STORE,
+            executed_today=executed_today)
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = []
@@ -195,8 +212,10 @@ def run(params: dict) -> str:
     # 已经是 executing,而通知开头写着 ✅ 成功,人会以为什么都没干。
     # 也不能说「已执行」:领取的行里有一部分会被单店上限/在途防重挡下。
     head = "待执行建议" if not execute else "本轮领取建议"
+    cap_note = (";⚠ 单店「下架限制」停用中(2026-08-28 暂时定稿,不封顶;"
+                "恢复改 RETIRE_CAP_PAUSED=False)" if RETIRE_CAP_PAUSED else "")
     lines.insert(0, f"{mode}{head} {len(rows)} 条:"
-                    f"删除 {tot['delete']},顽固停用 {tot['retire']}")
+                    f"删除 {tot['delete']},顽固停用 {tot['retire']}{cap_note}")
     if over_cap:
         # 截断必须见人(本仓口诀:静默截断读起来就是"全做完了")
         lines.append(f"  ⚠ 超单店「下架限制」留到下轮:"

@@ -1186,6 +1186,11 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
             continue
         if store_name in st.inactive:
             counts["inactive"] += len(srows)
+            # 所有者定稿 2026-08-28:整店跳过也**逐行**写明原因——此前静默,
+            # 表现是"行挂着好多天、理由空白"。只写理由不写终态,店铺回
+            # ACTIVE 下一轮自动续上
+            reasons.extend((r["rownum"], "店铺非ACTIVE,整店暂停上架")
+                           for r in srows)
             continue
         allow_by_store[store_name] = max(0, ctx.quota.get(store_name, 999)
                                          - st.today_used.get(store_name, 0))
@@ -1407,14 +1412,21 @@ def run(params: dict) -> str:
                  and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED",
                                               "CONTENT_REJECTED")]
     fresh, n_unaudited, n_rejected = [], 0, 0
+    # 审核闸逐行写 N 列理由(所有者定稿 2026-08-28:除「配额排队」外的静默桶
+    # 都要写明原因——配额不写是因为那是"计划上架"还在队里,写了反而像终态)。
+    # 只写理由**不写终态**:审核翻案/补审后下一轮自动续上,与闸门链同语义
+    audit_reasons: list[tuple[int, str]] = []
     for r in open_rows:
         st = (verdicts.get(r["asin"]) or (None, None))[0]
         if st == AUDIT_OK:
             fresh.append(_with_pt(r, verdicts))
         elif st in ("rejected",):
             n_rejected += 1
+            audit_reasons.append((r["rownum"], "审核判拒,不上架"))
         else:                       # 没结论 / pending
             n_unaudited += 1
+            audit_reasons.append(
+                (r["rownum"], f"审核未过:{st or '未审'}(过审后自动续上)"))
     retry, exhausted = _retry_rows(rows, verdicts)
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
@@ -1459,6 +1471,7 @@ def run(params: dict) -> str:
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
+    reasons.extend(audit_reasons)            # 审核闸的理由同渠道落 N 列
 
     sg = _gate_by_store(pending, ctx)
     candidates, allow_by_store = sg.survivors, sg.allow_by_store

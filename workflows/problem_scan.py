@@ -17,19 +17,20 @@
   problem_product_cleanup(DANGEROUS=True) 只消费建议行,自己不做任何决策
 
 两个来源(source 列):
-  scan   catalog.walmart_items 里 UNPUBLISHED/SYSTEM_PROBLEM 且未缺席的行
-         —— 归类规则逐字沿用 services/problem_products,一个字没改
+  scan   catalog.walmart_items 里 publishedStatus 非 PUBLISHED 且未缺席的行
+         —— **一律建议删除**(所有者定稿 2026-08-28:「不再修改 End Date 救
+         商品」,反补机制整体退役);归类(services/problem_products)保留,
+         但只进病历/黑名单/摘要,不再决定走向
   audit  审核链判 reject 但**还在架**的产品 —— 审核说不该卖、沃尔玛后台还挂着,
          这个缺口原来没有任何工作流盯着(批复 #8 要求补上)
 
 ⚠ **只建议,不动状态、不发 feed。** 本工作流写库的只有两处:产品事件(归类)
 与 ops.dispositions 建议行,都是可重跑的幂等写。
 
-去重口径全部沿用原实现(逐字迁移,注释一并搬来——它们记的是生产事故的教训):
+去重口径(2026-08-28 反补退役后剩两条,注释记的是生产事故的教训):
   ① 在途/待观测:feed_items 有 submitted 未落定(滚动 48h 封顶),或已落定
      success 但 catalog_sync 尚未重新观测 → 不建议
-  ② 反补计数:product_events 的 maintenance_submitted 30 天窗口计数
-  ③ 归类事件:同 (店铺,SKU) 类别未变不重复记
+  ② 归类事件:同 (店铺,SKU) 类别未变不重复记
 注:①在这里是**预筛**,不是最终闸门——真正的在途防重在 api/feeds.submit_feed
 的 ops.feed_log 里(提交时判,返回 outcome=dedup)。预筛只是省得把注定被拦下的
 行也建成建议。
@@ -45,9 +46,10 @@ import re
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
 from services import problem_products as pp
-from services import product_events
+from services import product_events, store_absence
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 # 审核判拒的删除:**单店单轮上限**(限额表「下架限制」列,与维护链删除、
 # product_clear 同一个配额口径)。
@@ -60,10 +62,23 @@ DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可�
 # 就是防"一次删光",读不到表就退回不限等于闸不存在。
 logger = logging.getLogger("workflows.problem_scan")
 
+# 扫描面 = **一切非 PUBLISHED**(所有者定稿 2026-08-28:「publishedStatus
+# 不是 PUBLISHED 的,都进行删除,不再修改 End Date 救商品」)。三个边界:
+#   · 范围从 UNPUBLISHED/SYSTEM_PROBLEM 扩到含 STAGE/READY_TO_PUBLISH/
+#     IN_PROGRESS:刚上架的行在发布管道里有几小时~48h 的过渡态,靠既有的
+#     在途预筛护住(上架 feed 在 feed_items 挂 submitted/待观测即跳过,
+#     QARTH 复审同一机制,见下)——过了 48h 还卡在过渡态的就是真卡死,照删。
+#   · published_status IS NULL(状态没采到)**不进扫描**:删除不可逆,
+#     判不准就判活,不拿未知赌。
+#   · Stage 不再按行豁免(旧 is_stage_pending 已退役):所有者定稿——
+#     『stage status until you go live』一般只在店铺非 ACTIVE 时出现(那时
+#     全店皆然),而店铺闸(_SQL_STATUS 非 ACTIVE 整店跳过)已经挡住那种店;
+#     ACTIVE 店里的 Stage 行 = 翻出来的老档(2026-08-28 事件实证),照删。
 _SQL_ITEMS = """
-SELECT store, sku, gtin, upc, unpublished_reasons
+SELECT store, sku, unpublished_reasons
 FROM catalog.walmart_items
-WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
+WHERE published_status IS NOT NULL
+  AND published_status <> 'PUBLISHED'
   AND missing_since IS NULL
 """
 # 防重口径(所有者拍板 2026-08-11,替代旧系统的"同一自然日"——那是一天
@@ -81,7 +96,9 @@ WHERE published_status IN ('UNPUBLISHED', 'SYSTEM_PROBLEM')
 # (最长 48h),复审期内追发 DELETE_ITEM 属于过早,复审通过它会自己恢复。
 # 但摘要必须分开报(处置在途 vs 上架/维护在途),否则"跳过 778"读不出
 # 里面有多少是等复审的新品(生产实遇 B018BDZQUQ 排查半天)。
-_DISPOSAL_FEEDS = ("DELETE_ITEM", "RETIRE_ITEM", "MP_MAINTENANCE")
+# MP_MAINTENANCE 不再列处置类(2026-08-28 反补退役):本链不再发它,在途的
+# MP_MAINTENANCE 都是维护链的标题/字段操作,按「上架/维护在途」分档报
+_DISPOSAL_FEEDS = ("DELETE_ITEM", "RETIRE_ITEM")
 _SQL_INFLIGHT = """
 SELECT f.store, f.sku,
        bool_or(f.feed_type = ANY(%(disposal)s::text[])) AS disposal
@@ -92,23 +109,6 @@ WHERE (f.status = 'submitted'
    OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 GROUP BY f.store, f.sku
 """
-# 事件名一律绑参传常量,不写字面量:读侧拼错 = 静默查空(计数恒 0,
-# "反补满 2 次转删"永不触发),和写侧拼错是同一类病,但更难发现。
-_SQL_ATTEMPTS = """
-SELECT store, sku, count(*) FROM catalog.product_events
-WHERE event = %s
-  AND source = ANY(%s)
-  AND occurred_at > now() - make_interval(days => %s)
-GROUP BY store, sku
-"""
-# source 过滤(2026-08-07):MP_MAINTENANCE 是通用部分更新 feed,未来
-# maintenance 工作流的标题/到期日期操作若记事件,不得污染反补转删计数。
-# ⚠ 批次 E 拆分后这里必须**同时认两个 source**:历史事件的 source 是
-# 'problem_product_cleanup'(拆分前),拆分后执行件仍用同一个 source 写事件
-# ——但万一将来改名,漏掉旧值会让 30 天窗口内的历史反补次数归零,
-# "反补满 2 次转删"重新从 0 数起,商品被无限反补。
-_ATTEMPT_SOURCES = ["problem_product_cleanup", "problem_scan"]
-
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
 FROM catalog.product_events WHERE event = %s
@@ -124,7 +124,8 @@ ORDER BY store, sku, occurred_at DESC
 # 顽固标记绑定当前上架代际(2026-08-07 审查修正):最新事件若是
 # item_appeared/item_reappeared,说明商品经历了消失→重上架,旧的
 # delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
-# (否则重上架的同 ASIN 首次出问题就被双 feed 直删,跳过反补机会)。
+# (否则重上架的同 ASIN 首次出问题就被双 feed 直删——顽固加压只该给
+# 本代际已实证「删除未生效」的行)。
 _SQL_STATUS = """
 SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
 ORDER BY store, data_date DESC
@@ -151,15 +152,12 @@ WHERE rejected_still_listed
 def _load_state():
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_ITEMS)
-        items = [dict(zip(("store", "sku", "gtin", "upc", "reasons"), r))
+        items = [dict(zip(("store", "sku", "reasons"), r))
                  for r in cur.fetchall()]
         cur.execute(_SQL_INFLIGHT, {"disposal": list(_DISPOSAL_FEEDS)})
         rows_if = cur.fetchall()
         inflight = {(st, sk) for st, sk, _ in rows_if}
         inflight_disposal = {(st, sk) for st, sk, d in rows_if if d}
-        cur.execute(_SQL_ATTEMPTS, (product_events.MAINTENANCE_SUBMITTED,
-                                    _ATTEMPT_SOURCES, pp.ATTEMPT_RESET_DAYS))
-        attempts = {(s, k): n for s, k, n in cur.fetchall()}
         cur.execute(_SQL_LAST_CAT, (product_events.PROBLEM_CATEGORIZED,))
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
         cur.execute(_SQL_STUBBORN)
@@ -168,32 +166,35 @@ def _load_state():
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
-    return (items, inflight, inflight_disposal, attempts, last_cat,
-            inactive, stubborn)
+    return (items, inflight, inflight_disposal, last_cat, inactive, stubborn)
 
 
-def plan(items, inflight, attempts, inactive, stubborn=frozenset(),
+def plan(items, inflight, inactive, stubborn=frozenset(),
          inflight_disposal=frozenset()):
     """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
-    计划形如 {店铺: {"relist": [item行], "delete": [item行], "retire": [...]}}
-    每行附 category/cat_name。**逐字迁自 problem_product_cleanup(批次 E 拆分)**
-    ——行为一个字没改,只是换了个住处:决策归扫描件,执行件不再自己决策。
+    计划形如 {店铺: {"delete": [item行], "retire": [item行]}},每行附
+    category/cat_name(归类只进病历/黑名单/摘要,不再决定走向)。
+
+    **一律删除**(所有者定稿 2026-08-28:「publishedStatus 不是 PUBLISHED 的,
+    都进行删除,不再修改 End Date 救商品」)。此前的 A/L 类反补通道、反补计数
+    30 天窗、Stage 按行豁免全部退役 —— A 类的语病见 problem_products 头注:
+    「end date has passed」本身就是退市标记,反补它 = 对退市档案走官方复活
+    通道。顽固双击(retire+delete 齐发)保留:那是对「删除未生效」的加压,
+    方向与本定稿一致。
     """
     out: dict[str, dict] = {}
-    n = {"stage": 0, "inflight": 0, "inflight_listing": 0, "inactive": 0,
-         "relist": 0, "delete": 0, "fallback": 0, "stubborn": 0}
+    n = {"inflight": 0, "inflight_listing": 0, "inactive": 0,
+         "delete": 0, "stubborn": 0}
     for it in items:
         key = (it["store"], it["sku"])
         if it["store"] in inactive:
             n["inactive"] += 1
             continue
-        if pp.is_stage_pending(it["reasons"]):
-            n["stage"] += 1
-            continue
         if key in inflight:
-            # 分开数:处置在途(我们的删/停/反补还没落定)vs 上架/维护在途
-            # (常见 = 新品在 QARTH 合规复审)。都跳过,但摘要必须分开报
+            # 分开数:处置在途(我们的删/停还没落定)vs 上架/维护在途
+            # (常见 = 新品在 QARTH 合规复审,最长 48h —— 复审期内追发
+            # DELETE_ITEM 属于过早,复审通过它会自己恢复)。都跳过,分开报
             if key in inflight_disposal:
                 n["inflight"] += 1
             else:
@@ -201,8 +202,7 @@ def plan(items, inflight, attempts, inactive, stubborn=frozenset(),
             continue
         code, name = pp.categorize(it["reasons"])
         it["category"], it["cat_name"] = code, name
-        bucket = out.setdefault(it["store"],
-                                {"relist": [], "delete": [], "retire": []})
+        bucket = out.setdefault(it["store"], {"delete": [], "retire": []})
         if key in stubborn:
             # 删除未生效的顽固 SKU(所有者定稿):
             # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
@@ -210,19 +210,6 @@ def plan(items, inflight, attempts, inactive, stubborn=frozenset(),
             bucket["delete"].append(it)
             n["stubborn"] += 1
             continue
-        if code in ("A", "L"):
-            # L 类(系统错误)并入反补通道(所有者定稿 2026-08-24):沃尔玛的
-            # 原话是 "internal error … **Resubmit** the item",而旧规则把它
-            # 直接判删 —— 生产实测一轮 186 条,先给一次重摄取的机会。
-            # 反补计数/30 天窗/满 2 次转删/无 productId 转删,全部复用 A 类
-            # 既有机械,不另建一套(A=过期、L=系统错误只是入口不同)。
-            if attempts.get(key, 0) >= pp.MAX_ATTEMPTS:
-                n["fallback"] += 1          # 反补满 2 次仍未恢复 → 转删除兜底
-            elif pp.build_relist_item(it["sku"], it["gtin"], it["upc"]):
-                bucket["relist"].append(it)
-                n["relist"] += 1
-                continue
-            # 无 productId 同样落到删除(旧规则)
         bucket["delete"].append(it)
         n["delete"] += 1
     return out, n
@@ -237,39 +224,15 @@ def to_dispositions(plans: dict) -> list[dict]:
     """
     rows = []
     for store, b in sorted(plans.items()):
-        for action in ("relist", "delete", "retire"):
+        for action in ("delete", "retire"):
             for it in b.get(action, []):
                 rows.append({
                     "store": store, "sku": it["sku"], "source": "scan",
                     "action": action, "category": it.get("category"),
                     "reason": it.get("reasons") or "",
-                    "detail": {"cat_name": it.get("cat_name"),
-                               "gtin": it.get("gtin"), "upc": it.get("upc")},
+                    "detail": {"cat_name": it.get("cat_name")},
                 })
     return rows
-
-
-def drop_conflicting_relists(rows: list[dict],
-                             audit_rows: list[dict]) -> tuple[list[dict], int]:
-    """输入:scan 建议 + audit 建议 → 输出:(去掉矛盾反补后的 scan 建议, 剔除数)。
-
-    纯函数,可测。⚠ **生产 dry-run 实遇(2026-08-14)**:同一个 SKU 同时被
-    scan 建议"反补"(A 类过期,救活)与 audit 建议"删除"(审核判拒)。两条
-    建议 action 不同 ⇒ 部分唯一索引不冲突 ⇒ 两条都落 ⇒ 执行件按
-    _ACTION_ORDER 先发 relist 再发 delete:**先花配额把它救活,再花配额把它
-    删掉**,两个 feed 都提交、结果还不确定。
-
-    优先级:**审核判拒压过一切救活动作**。审核说这产品不该卖,把它救活是反向
-    操作;而"过期"只是它当前不可售的一个技术原因,救活了照样该被删。
-    删除建议保留(该删还是要删),只砍掉同 SKU 的反补建议。
-    """
-    banned = {(r["store"], r["sku"]) for r in audit_rows
-              if r["action"] == "delete"}
-    if not banned:
-        return rows, 0
-    kept = [r for r in rows
-            if not (r["action"] == "relist" and (r["store"], r["sku"]) in banned)]
-    return kept, len(rows) - len(kept)
 
 
 def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
@@ -299,33 +262,29 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
     by_act: dict[str, int] = {}
     for r in allrows:
         by_act[r["action"]] = by_act.get(r["action"], 0) + 1
-    out = [f"problem_scan:问题商品 {n_items} 行 → 建议 反补 "
-           f"{by_act.get('relist', 0)},删除 {by_act.get('delete', 0)}"
-           f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}"
-           f",反补满额转删 {n['fallback']}),"
+    out = [f"problem_scan:非 PUBLISHED 商品 {n_items} 行 → 建议 删除 "
+           f"{by_act.get('delete', 0)}"
+           f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}),"
            f"顽固停用 {by_act.get('retire', 0)};"
-           f"Stage 排除 {n['stage']},处置在途/待观测跳过 {n['inflight']},"
+           f"处置在途/待观测跳过 {n['inflight']},"
            f"上架/维护在途跳过 {n['inflight_listing']}"
            f"(多为新品合规复审,复审完自动进扫描),"
            f"非 ACTIVE 店跳过 {n['inactive']}"]
     per_store: dict[str, dict] = {}
     for r in allrows:
-        b = per_store.setdefault(r["store"],
-                                 {"relist": [], "delete": [], "retire": []})
+        b = per_store.setdefault(r["store"], {"delete": [], "retire": []})
         b[r["action"]].append(r)
     for store, b in sorted(per_store.items()):
         cats: dict[str, int] = {}
-        for r in b["delete"] + b["relist"]:
+        for r in b["delete"]:
             k = r.get("category") or "-"
             cats[k] = cats.get(k, 0) + 1
-        line = (f"  {store}:反补 {len(b['relist'])},删除 {len(b['delete'])}"
+        line = (f"  {store}:删除 {len(b['delete'])}"
                 + (f",顽固停用 {len(b['retire'])}" if b["retire"] else "")
                 + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
                 + "}")
         if b["delete"]:
             line += f",删除样本={[(r['sku'], r.get('category')) for r in b['delete'][:5]]}"
-        if b["relist"]:
-            line += f",反补样本={[(r['sku'], r.get('category')) for r in b['relist'][:3]]}"
         out.append(line)
     return out
 
@@ -509,18 +468,39 @@ def run(params: dict) -> str:
     preview = (str(params.get("preview", "")).strip() == "1"
                or bool(params.get("dry_run")))
     only = params.get("store")
-    (items, inflight, inflight_disposal, attempts, last_cat,
+    (items, inflight, inflight_disposal, last_cat,
      inactive, stubborn) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
+    # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
+    # 停在上一轮,拿它判「仍在架 → 删」会对可能已变的现实开破坏 feed。
+    # 判据从库里水位派生(services/store_absence),与调度顺序无关。
+    # 探测失败按"不避让"处理并在首行喊出来(preview 是纯 PG 查询,
+    # 不该被一次飞书抖动整个拦下)。
+    with db.pg_conn() as conn:
+        # 降级与 only 范围收敛都在 store_absence.stale_or_note 里(四处同形,
+        # 2026-08-27 收口);拼进首行的分号由调用方补
+        absent, absence_note = store_absence.stale_or_note(conn, only)
+    absence_gap = f";{absence_note}" if absence_note else ""
+    # ⚠ 避让只挡**处置建议**(plan/audit_rows —— 会变成删除/停用 feed 的那些);
+    # 观察面不连坐:黑名单收集、K 类聚集信号、归类事件都是只增不减的记录,
+    # 静音一天会让 15:00 blacklist 链少一天的 ASIN/品牌(对抗校验 2026-08-26)
+    items_all = items
+    n_avoided = sum(1 for i in items if i["store"] in absent)
+    if absent:
+        items = [i for i in items if i["store"] not in absent]
 
-    plans, n = plan(items, inflight, attempts, inactive, stubborn,
-                    inflight_disposal)
+    plans, n = plan(items, inflight, inactive, stubborn, inflight_disposal)
     rows = to_dispositions(plans)
     lines: list[str] = []
 
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        if absent:
+            n_audit_avoided = sum(1 for r in audit_rows
+                                  if r["store"] in absent)
+            n_avoided += n_audit_avoided
+            audit_rows = [r for r in audit_rows if r["store"] not in absent]
         if audit_rows:
             late = sum(1 for r in audit_rows
                        if r["detail"].get("rejected_after_listing"))
@@ -532,21 +512,21 @@ def run(params: dict) -> str:
                     f"  其中 {late} 个是**先上架后被判拒** —— 上架时那道闸没拦住"
                     f"(或当时还没审)。这是审核链的漏拦线索,值得单看,"
                     f"与本轮该不该删是两个问题")
-        rows, n_conflict = drop_conflicting_relists(rows, audit_rows)
-        if n_conflict:
-            lines.append(
-                f"  ⚠ 剔除矛盾反补 {n_conflict} 条:这些 SKU 同时被判"
-                f"「审核拒→删」与「过期→救活」,审核判拒压过救活"
-                f"(否则会先花配额救活、再花配额删掉)")
         allrows = rows + audit_rows
-        # ⚠ 摘要在**剔矛盾之后**才生成,报的是真正会落库的数。首版在剔除之前
-        # 就把 plan() 的原始数打出来了(反补 10),而实际只落 8 —— 人眼闸门看的
-        # 就是这几个数,不该还要自己做减法。分店明细同理。
-        # 另:这里按建议行统计,不是按 plan() 的桶 —— n['delete'] 不含顽固双击
-        # 那 22 个(那支 continue 前没有 n['delete'] += 1),照它报会少 22。
+        # (2026-08-28 反补退役后,scan 与 audit 对同一 SKU 只可能都建议删除,
+        # 由部分唯一索引合并,不再存在「救活 vs 删除」的矛盾剔除段)
+        # 摘要按建议行统计,不是按 plan() 的桶 —— n['delete'] 不含顽固双击
+        # 那批(那支 continue 前没有 n['delete'] += 1),照它报会少一截。
         head = _summarize(allrows, audit_rows, n, len(items))
+        if absent:
+            # ⚠ 缺席避让要进**首行**:链通知只发成功步骤的第一行
+            head[0] += (f";⚠ 缺席避让 {len(absent)} 店:"
+                        f"{','.join(sorted(absent))}"
+                        f"({n_avoided} 条候选不参与本轮处置)")
+        head[0] += absence_gap
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
-        for note in (_k_cluster_note(items), _policy_gap_note(conn, items)):
+        # 观察面用 items_all(缺席不连坐,见上)
+        for note in (_k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
             if note:
                 lines.append(note)
         if preview:
@@ -554,8 +534,8 @@ def run(params: dict) -> str:
                          f"——实际落库可能更少:同 (店铺,SKU,动作) 被两个来源"
                          f"命中时按唯一索引合并)")
             return "\n".join(lines)
-        n_cat = _record_categories(conn, items, last_cat)
-        bl_note = _collect_blacklists(conn, items)
+        n_cat = _record_categories(conn, items_all, last_cat)
+        bl_note = _collect_blacklists(conn, items_all)
         n_sug = dispositions.suggest_many(conn, allrows)
         # 撤销本轮不再建议的陈旧行(按来源各撤各的):否则昨天建议删、今天
         # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删
@@ -563,15 +543,17 @@ def run(params: dict) -> str:
         for src, srows in (("scan", rows), ("audit", audit_rows)):
             # ⚠ store=only 不能省:`-p store=X` 那一轮只扫了一个店,keep 里
             # 只有该店的行,不限范围会把其余全部店铺的待执行建议一次清空
+            # exclude_stores=缺席店:它们的行不在 keep 里(本轮避让了),
+            # 不排除会被撤成"不再建议"——缺席 ≠ 恢复正常
             n_wd += dispositions.withdraw_stale(
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-                store=only or None)
+                store=only or None, exclude_stores=sorted(absent))
         # 限本链来源:维护链共用同一张建议表,不限的话摘要报的数会把它的
         # 待执行也算进来,与本链执行件领到的数对不上
         n_open = dispositions.count_open(
             conn, sources=dispositions.PROBLEM_SOURCES)
-        # ⚠ 本链**没有** expire_executing 那道兜底(删除/反补靠观测判定,
+        # ⚠ 本链**没有** expire_executing 那道兜底(删除/停用靠观测判定,
         # 粗暴时限会抢先判掉真正在途的删除)。所以卡住就是一直卡着,
         # 至少要让人看见 —— 否则每轮照常报"建议 N 条",看不出少了谁。
         stuck = dispositions.stuck_executing(

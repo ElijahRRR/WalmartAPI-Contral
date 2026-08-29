@@ -55,6 +55,62 @@ class StoreDeadError(Exception):
         self.status = status
         super().__init__(f"店铺 {store_name} 凭证失效(HTTP {status}),跳过全店")
 
+
+# SOCKS 代理栈自己的异常树。socksio 的 ProtocolError **直接继承 Exception**,
+# httpx 不映射它(httpcore 只在自判失败时抛 ProxyError;socksio 在解包阶段抛的
+# 原样穿透)—— 2026-08-26 13:00 生产实证:两家店 "Malformed reply" 落进
+# catalog_sync 的泛化异常桶,整链停摆。装不出 socksio 时给空元组,优雅退化。
+try:
+    from socksio.exceptions import SOCKSError as _SOCKSError
+    SOCKS_ERRORS: tuple = (_SOCKSError,)
+except ImportError:                                 # pragma: no cover
+    SOCKS_ERRORS = ()
+
+# 网络层桶:连接池该剔除、可退避重试的一整类。httpx.ProxyError ⊂ TransportError,
+# 不必单列;socksio 不在 httpx 树上,必须并列进来。
+_NET_ERRORS: tuple = (httpx.TransportError,) + SOCKS_ERRORS
+
+
+class StoreProxyError(httpx.ProxyError):
+    """店铺出口代理故障(SOCKS 握手/隧道层报错,或换 token 阶段传输层失败)。
+
+    **子类化 httpx.ProxyError 是刻意的**:全仓各处
+    `except (StoreDeadError, httpx.ProxyError)` 分类分支因此天然接住它,
+    一处都不用改。与 StoreDeadError 的语义分工:凭证死是**确定性**的
+    (重试只会再死一次),代理故障是**可重试**的(隧道抖动/代理商瞬断)——
+    店级重试标准(所有者定稿 2026-08-26)只补试后者。
+    """
+
+    def __init__(self, store_hint: str, cause: Exception):
+        self.cause = cause
+        super().__init__(f"店铺代理故障({store_hint}):"
+                         f"{cause.__class__.__name__}: {cause}")
+
+
+#: workflow 分类分支的唯一判据元组(「这是店级代理/网络故障」)。
+#: StoreProxyError ⊂ httpx.ProxyError,不必单列。
+PROXY_ERRORS: tuple = (httpx.ProxyError,) + SOCKS_ERRORS
+
+
+# ── 官方退避阶梯 + 抖动(#91 引入于 api/feeds,2026-08-26 上提到此作全项目
+# 唯一出处 —— 店级重试与 feed 补交共用一套,双轨禁止)。官方原文逐条:
+#   INVALID_SYSTEM_STATE/SYSTEM_ERROR (500) —— "retry with jitter"
+#   DOWNSTREAM_SYSTEM_TIME_OUT (504)        —— "retry with exponential backoff"
+#   平台可用性节                             —— "backoff and jitter";阶梯示例 2,4,8,16,32
+BACKOFF_LADDER = (2, 4, 8, 16, 32)
+
+
+def backoff(attempt: int) -> float:
+    """输入:第几次退避(0 起)→ 输出:**带抖动**的秒数(官方阶梯 × [0.5,1.0])。
+
+    抖动取"满阶梯的一半到满值"(AWS full-jitter 变体):既保证退避在长,
+    又保证同时失败的 N 家店**不会同时醒来** —— 没有它,退避只是把洪峰
+    整体平移,不是把它摊平。
+    """
+    import random
+    base = BACKOFF_LADDER[min(attempt, len(BACKOFF_LADDER) - 1)]
+    return base * (0.5 + random.random() * 0.5)
+
 # client_id → {"token": str, "expires_at": float, "secret": str, "proxy": str}
 # secret + proxy 保留是为了 401 时能就地刷新 token,不需要调用方再传一次。
 _token_cache: dict = {}
@@ -180,9 +236,11 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "feeds.post.MP_MAINTENANCE": (8, 3600.0),   # 官方 10/hour
     "feeds.post.MP_ITEM_MATCH": (15, 3600.0),   # 官方 20/hour(蓝图定稿 15)
     "feeds.post.MP_ITEM": (8, 3600.0),          # 官方 10/hour;同店打包单 feed
-    "feeds.post.price": (6, 86400.0),           # 价格三件套共享桶,CLAUDE.md 保守 6/天
+    "feeds.post.price": (8, 3600.0),            # 价格三件套共享桶官方 10/hour(2026-08-26
+                                                # 三处官方一致复核;6/day 只属 feedType=promo,
+                                                # 本仓不用。此前保守 6/天,维护链吞吐被它卡死)
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
-    "settings.partnerprofile": (40, 60.0),      # 官方 60/min,lru 缓存后每店仅首次调
+    "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
 }
@@ -308,7 +366,7 @@ def safe_get_raw(url, token, client_id, proxy, params=None, timeout=90,
         try:
             resp = _get_client(proxy).get(
                 url, headers=headers_out, params=params, timeout=timeout)
-        except (httpx.TransportError, httpx.ProxyError) as e:
+        except _NET_ERRORS as e:        # 含 socksio(不在 httpx 树上,单列进桶)
             _invalidate_client(proxy)
             if attempt < max_retries:
                 wait = min(2 ** attempt, 10)
@@ -334,8 +392,14 @@ def download_bytes(url: str, proxy: str | None, timeout: int = 180) -> bytes:
     """输入:URL(如报表预签名下载地址)+ 代理 → 输出:响应字节。
 
     走店铺固定出口代理(与所有沃尔玛流量同链路,铁律),非 2xx 抛异常。
+    传输/SOCKS 层失败同样抛(调用方自己兜),但先剔掉池里的坏连接 ——
+    收口清单别漏这一处(2026-08-26 对抗校验)。
     """
-    resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    try:
+        resp = _get_client(proxy).get(url, timeout=timeout, follow_redirects=True)
+    except _NET_ERRORS:
+        _invalidate_client(proxy)
+        raise
     resp.raise_for_status()
     return resp.content
 
@@ -364,19 +428,28 @@ def get_token(client_id, client_secret, proxy):
 
         cred = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         client = _get_client(proxy)
-        resp = client.post(
-            f"{base_url()}/v3/token",
-            headers={
-                "Authorization": f"Basic {cred}",
-                "WM_SVC.NAME": "Walmart Marketplace",
-                "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),
-                "WM_CONSUMER.ID": client_id,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            data={"grant_type": "client_credentials"},
-            timeout=30,
-        )
+        try:
+            resp = client.post(
+                f"{base_url()}/v3/token",
+                headers={
+                    "Authorization": f"Basic {cred}",
+                    "WM_SVC.NAME": "Walmart Marketplace",
+                    "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),
+                    "WM_CONSUMER.ID": client_id,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
+                data={"grant_type": "client_credentials"},
+                timeout=30,
+            )
+        except _NET_ERRORS as e:
+            # 换 token 是每家店的第一跳,此前对传输层零保护 —— 27 个调用点裸奔,
+            # SOCKS 报错原样穿到各 workflow 的泛化异常桶(2026-08-26 13:00 事故:
+            # "Malformed reply" 判成普通失败 → catalog_sync raise → 整链停摆)。
+            # 收口成 StoreProxyError(⊂ httpx.ProxyError),分类分支按"该店代理坏"
+            # 处理;连接池同步剔除,坏连接不留给下一家店
+            _invalidate_client(proxy)
+            raise StoreProxyError(f"client_id={client_id[:6]}…", e) from e
         # 换 token 阶段的 400/401/403 = 这套凭证被拒,与业务端点的 401/403 同类,
         # 一律转 StoreDeadError 交给调用方"跳过全店"。
         # ⚠ 沃尔玛在 client_credentials 授权失败时回的是 **400**(不是 401),
@@ -461,13 +534,13 @@ def _parse_retry_after(headers: dict) -> float:
     return 60.0  # 兜底
 
 
-def _log(msg: str, quiet: bool, level: int = logging.WARNING) -> None:
-    """quiet=True 时降为 DEBUG(替代旧版的 print + quiet 组合)。"""
-    logger.log(logging.DEBUG if quiet else level, msg)
+def _log(msg: str, level: int = logging.WARNING) -> None:
+    """统一日志出口(替代旧版的 print + quiet 组合)。"""
+    logger.log(level, msg)
 
 
 def _request_ex(method, url, token, client_id, proxy, *,
-                json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
+                json_body=None, params=None, timeout=30, max_retries=0):
     """
     统一的请求实现。返回 (status, headers, data)。
 
@@ -504,10 +577,11 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 params=params,
                 timeout=timeout,
             )
-        except (httpx.TransportError, httpx.ProxyError) as e:
-            # 连接级故障:池里这条连接很可能已坏,主动剔除让下次建新的
+        except _NET_ERRORS as e:
+            # 连接级故障(含 socksio 的 SOCKS 层报错,它不在 httpx 异常树上):
+            # 池里这条连接很可能已坏,主动剔除让下次建新的
             _invalidate_client(proxy)
-            _log(f"✗ {method} 网络失败(已剔除连接) {url}: {e}", quiet)
+            _log(f"✗ {method} 网络失败(已剔除连接) {url}: {e}")
             if attempt < max_retries:
                 attempt += 1
                 time.sleep(min(2 ** attempt, 10))
@@ -515,7 +589,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
             return None, {}, None
         except Exception as e:
             # 非网络层的其他异常(程序错误、JSON 序列化失败等):不动连接池
-            _log(f"✗ {method} 请求异常 {url}: {e}", quiet)
+            _log(f"✗ {method} 请求异常 {url}: {e}")
             return None, {}, None
 
         status = resp.status_code
@@ -530,23 +604,30 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 try:
                     token = get_token(client_id, secret, (cached or {}).get("proxy") or proxy)
                     refreshed_401 = True
-                    _log(f"⚠ {method} 401 → token 已刷新,重试 {url}", quiet)
+                    _log(f"⚠ {method} 401 → token 已刷新,重试 {url}")
                     continue
+                except _NET_ERRORS:
+                    # 刷新那一跳撞上代理/传输故障:**原样上抛**,不落回 401 流程
+                    # —— 落回去会被各 api 模块的 401→StoreDeadError 统一动作
+                    # 判成"凭证死"(不补试),而真正的病在代理(可补试)。
+                    # 一次 SOCKS 抖动被记成凭证失效,人被指去查凭证表
+                    # (2026-08-26 对抗校验:分诊口径的静默反例)
+                    raise
                 except Exception as e:
-                    _log(f"✗ {method} 401 后换 token 失败 {url}: {e}", quiet)
+                    _log(f"✗ {method} 401 后换 token 失败 {url}: {e}")
                     # 落回原 401 返回流程
 
         # 自动重试逻辑(opt-in)
         if attempt < max_retries:
             if status == 429:
                 wait = _parse_retry_after(headers)
-                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)", quiet)
+                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)")
                 time.sleep(wait)
                 attempt += 1
                 continue
             if 500 <= status < 600:
                 wait = min(2 ** attempt, 10)
-                _log(f"⚠ {method} {status} 服务端错误 {url},{wait}s 后重试 (第 {attempt+1}/{max_retries} 次)", quiet)
+                _log(f"⚠ {method} {status} 服务端错误 {url},{wait}s 后重试 (第 {attempt+1}/{max_retries} 次)")
                 time.sleep(wait)
                 attempt += 1
                 continue
@@ -561,7 +642,7 @@ def _request_ex(method, url, token, client_id, proxy, *,
                 try:
                     data = resp.json()
                 except Exception as e:
-                    _log(f"✗ {method} {status} 但 JSON 解析失败 {url}: {e}", quiet)
+                    _log(f"✗ {method} {status} 但 JSON 解析失败 {url}: {e}")
         else:
             # 500 截取,不是 200(2026-08-19):Akamai 错误页的 Reference #
             # 在 HTML 后半段,200 字符正好截在它前面——持续 5xx 要开沃尔玛
@@ -570,12 +651,12 @@ def _request_ex(method, url, token, client_id, proxy, *,
             msg = f"✗ {method} {status} {url}"
             if body_snip:
                 msg += f": {body_snip}"
-            _log(msg, quiet, level=logging.INFO)
+            _log(msg, level=logging.INFO)
 
         return status, headers, data
 
 
-def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, quiet=False, max_retries=0):
+def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, max_retries=0):
     """
     GET 请求,返回 (status, headers, data)。
 
@@ -589,10 +670,10 @@ def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, quiet=Fal
     可选 max_retries:>0 时启用自动 429/5xx 退避重试(默认 0 关闭)。
     """
     return _request_ex("GET", url, token, client_id, proxy,
-                       params=params, timeout=timeout, quiet=quiet, max_retries=max_retries)
+                       params=params, timeout=timeout, max_retries=max_retries)
 
 
-def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
+def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, max_retries=0):
     """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。
 
     ⚠ **默认 max_retries=0 是有意的** —— POST 非幂等,自动重试会造成重复提交
@@ -604,12 +685,17 @@ def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, time
     """
     return _request_ex("POST", url, token, client_id, proxy,
                        json_body=json_body, params=params, timeout=timeout,
-                       quiet=quiet, max_retries=max_retries)
+                       max_retries=max_retries)
 
 
-def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, quiet=False, max_retries=0):
-    """PUT 请求,返回 (status, headers, data)。用于 PUT /v3/price 和 PUT /v3/inventory。"""
+def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30):
+    """PUT 请求,返回 (status, headers, data)。用于 PUT /v3/price 和 PUT /v3/inventory。
+
+    没有 max_retries:两个调用方(prices.put_price / inventory.put_inventory)
+    从来没传过,2026-08-27 死件清理随 quiet 一并删(蓝图 §7 未收录 _client
+    的参数面,删前已核)。将来要开 429/5xx 自动重试,先按 safe_post_ex 里
+    那条幂等性判据想清楚再加。
+    """
     return _request_ex("PUT", url, token, client_id, proxy,
-                       json_body=json_body, params=params, timeout=timeout,
-                       quiet=quiet, max_retries=max_retries)
+                       json_body=json_body, params=params, timeout=timeout)
 

@@ -42,6 +42,13 @@ catalog_sync 连着几轮没扫到那家店。
 删除→标题→价格→库存 串行(同店 token 桶互挤);跨店顺序执行,单店异常隔离
 不炸整轮。
 
+容错走店级重试标准(所有者定稿 2026-08-26,展开 docs/conventions.md §四):
+单店异常隔离 → 失败店跑完别人后**串行补试一遍**(`services/store_retry`,
+凭证失效不补试)→ 仍失败不炸整轮、摘要**首行**点名缺席店与归类词。没提交
+出去的建议行留在 suggested(claim 只读),下一轮照样领得到。补试跑的是同一个
+_one_store,首轮已成功的部分会被在途防重(feed 路由)或绝对赋值(PUT 路由)
+接住,终态不变 —— 两条路由的依据各不相同,写在 run() 里补试那一段。
+
 去重与观测纪律(拆分后各归其位,一条没丢):
   · 决策期预筛(20 小时内已提交过同一件事)→ 归 maintenance_scan
     (services.maintenance_intents.drop_recent,生产实证 208 条 stale update);
@@ -79,9 +86,11 @@ from datetime import datetime
 from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
-    maintenance_intents as mi, stores as stores_svc
+    maintenance_intents as mi, notify_fmt as nf, store_absence, store_retry, \
+    stores as stores_svc
 
 DANGEROUS = True
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.maintenance")
 
@@ -92,19 +101,6 @@ _KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与扫描件�
 # services.dispositions.claim(),按库里所有未落定的破坏类建议压制,
 # 而不是只看本轮自己算出来的那些。
 _KIND_ORDER = dispositions.MAINT_ACTIONS
-
-
-def group_by_store(intents: list[dict]) -> dict[str, dict]:
-    """输入:意图列表 → 输出:{店铺: {动作: [意图]}}。纯函数,可测。"""
-    out: dict[str, dict] = {}
-    for it in intents:
-        bucket = out.setdefault(it["store"], {k: [] for k in _KIND_ORDER})
-        if it["kind"] in bucket:
-            bucket[it["kind"]].append(it)
-        else:               # 建议表里出现了不认识的动作:宁炸不吞
-            raise ValueError(f"未知 kind={it['kind']!r}"
-                             f"(建议行 id={it.get('disposition_id')})")
-    return out
 
 
 def _mark(items: list[dict], feed_id) -> None:
@@ -178,12 +174,13 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
         entries = [{"sku": it["sku"], "qty": it["new"]} for it in items]
         feed_type = "inventory"
 
-    i = 0
     n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
-    for res in feeds.submit_feed(store, feed_type, entries,
-                                 workflow="maintenance"):
-        batch = items[i:i + res["count"]]
-        i += res["count"]
+    # 切片结果与意图的对位游标走 api/feeds 的公共件:submit_feed 每片只回
+    # count 不回条目,手写 `batch = items[i:i+count]; i += count` 曾在 6 个
+    # 工作流里各一份,错一位就是整批结局落到别人行上而且不报错
+    for res, batch in feeds.iter_result_slices(
+            feeds.submit_feed(store, feed_type, entries,
+                              workflow="maintenance"), items):
         n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
         if res["outcome"] == "submitted":
             # 只记 submitted——dedup 挂的是旧 feed_id 但什么都没提交
@@ -201,14 +198,13 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
         else:                       # unknown:结局不确定,留 pending 待对账
             for it in batch:
                 _add(it, label, res["feed_id"] or "", "处理中")
-    line = f"  {name}:{label} feed 提交 {n['submitted']}"
-    if n["dedup"]:
-        line += f",在途防重跳过 {n['dedup']}"
-    if n["failed"]:
-        line += f",⚠ 提交被拒 {n['failed']}(查日志)"
-    if n["unknown"]:
-        line += f",⚠ 结局不确定留 pending {n['unknown']}(待对账)"
-    lines.append(line)
+    # 四档计数的尾巴走 notify_fmt 的成品件(三个执行件逐字重复过);
+    # failed 档字样由调用方给 —— 本件现行「提交被拒」,problem_product_cleanup
+    # 现行「提交失败」,收口时逐字保留两处现状,不替所有者统一措辞
+    lines.append(f"  {name}:{label} feed "
+                 + nf.feed_outcome_tail(n["submitted"], n["dedup"],
+                                        n["failed"], n["unknown"],
+                                        failed_word="提交被拒"))
 
 
 def _settle(lines: list[str]) -> None:
@@ -261,7 +257,29 @@ def run(params: dict) -> str:
         # 压制必须见人:claim 少返回几行是静默的,不报的话摘要写着"没有待执行
         # 的维护建议",人会以为扫描件没算出东西来
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
+        # 缺席避让(店级重试标准③补全,2026-08-26 对抗校验):扫描件避让了
+        # 缺席店、withdraw 还护住了它们的存量 suggested(cap 顺延/上轮提交
+        # 异常留下的)—— 执行件不避让的话,同一轮链里这批按**隔夜现值**算的
+        # 改价/清零照样被领走提交。缺席店的行留在 suggested 原地,等观测
+        # 刷新后重新定夺。
+        # ⚠ 探测失败**维持 fail-open**(不避让 = 加缺席避让之前的行为),
+        # 与 problem_product_cleanup 的 fail-closed **方向相反,是有意的**:
+        # 那边的最坏后果是按隔夜观测发 DELETE_ITEM(不可逆,且它是破坏动作
+        # 的唯一出口),这边最坏是按隔夜现值改一次价/库存 —— 下一轮
+        # catalog_sync 观测刷新后 maintenance_scan 会重新建议改回来,损失
+        # 一轮配额而已;反过来把维护三类也停掉,一次飞书抖动就能让全船队
+        # 的价格/库存整轮不更新,那个代价更大。
+        absent, absence_note = store_absence.stale_or_note(
+            conn, only=params.get("store"))
+        if absence_note:
+            lines.append(absence_note)
     intents = [mi.from_disposition(r) for r in rows]
+    if absent:
+        n_held = sum(1 for i in intents if i["store"] in absent)
+        if n_held:
+            intents = [i for i in intents if i["store"] not in absent]
+            lines.append(f"⚠ 缺席避让:{n_held} 条建议属于缺席店(目录未刷新),"
+                         f"留在 suggested 原地 —— 隔夜现值不配拿来改线上")
     if params.get("store"):
         intents = [i for i in intents if i["store"] == params["store"]]
     if only:
@@ -277,7 +295,10 @@ def run(params: dict) -> str:
                f"要删的东西不再花配额去改;执行归 problem_product_cleanup)"
                if n_sup else "")])
 
-    by_store = group_by_store(intents)
+    # 分桶件在 services.dispositions(两个执行件共用,2026-08-27 上移):
+    # 「未知动作即抛」的宁炸不吞判据原样在里面(conventions §三的安全闸)
+    by_store = dispositions.group_by_store(
+        intents, key="kind", order=_KIND_ORDER, id_field="disposition_id")
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
     # ⚠ 措辞随模式走(所有者 2026-08-17 实见):这一行在**提交之前**生成,
     # dry-run 说「待执行」是对的;真跑完再说「待执行」就是谎话——那些行此刻
@@ -313,17 +334,27 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
 
-    def _one_store(store_name: str, kinds: dict) -> tuple:
-        """输入:店铺名 + 该店四类意图 → 输出:(店铺名, 该店的行, 该店的记录)。
+    per_store: dict[str, list[str]] = {}    # 各店摘要行(补试重跑同店即覆盖)
+    records_by_store: dict[str, list[tuple]] = {}   # 各店维护记录行(跨补试累加)
+    done_by_store: dict[str, set] = {}      # 已写过记录的建议 id(同上,跨补试)
+
+    def _one_store(store_name: str, kinds: dict) -> str:
+        """输入:店铺名 + 该店三类意图 → 输出:店铺名;网络类失败**抛出**待补试。
 
         **各店各自的局部状态**,主线程再合并 —— 跨店并发之后不能再往共享
         list 上追加:追加本身在 GIL 下不会坏数据,但摘要的行序会按完成先后
         乱序交织,同一轮跑两次输出都不一样,没法对拍。
+
+        ⚠ 记录行与 done 按店存在 records_by_store/done_by_store 里、**跨补试
+        累加**(2026-08-27 接串行补试时定):局部列表随异常一起丢掉的话,首轮
+        已经提交出去的那几片在表上一个字都没有(_submit_kind 头注的老坑);
+        摘要行则每轮重置 —— 补试的叙述覆盖首轮,同一句话不报两遍。
         """
         lines_s: list[str] = []
-        records_s: list[tuple] = []
+        per_store[store_name] = lines_s     # 每轮重置:补试的叙述覆盖首轮
+        records_s = records_by_store.setdefault(store_name, [])
+        done = done_by_store.setdefault(store_name, set())
         pending = [it for k in _KIND_ORDER for it in kinds.get(k) or []]
-        done: set = set()
 
         def _unexecuted(why: str, err="") -> None:
             """领到了却没执行的建议**也要写表**(动作留空)。
@@ -331,53 +362,127 @@ def run(params: dict) -> str:
             否则这些行在飞书完全不可见,看起来像"扫描件没建议它",
             而它其实每天都在建议、每天都没做成 —— 这正是所有者要「建议」
             与「动作」两列分开的原因。
+
+            ⚠ 写过的记进 done:补试重跑同一家店时不再写第二遍「未执行」
+            (同一条建议一轮一行);补试真提交成功的会照常再写一行真实动作
+            —— 两行连起来正是这家店这一轮的经过。
             """
+            fresh = [it for it in pending
+                     if it.get("disposition_id") not in done]
             records_s.extend(_record(store_name, it, "", "", today, why, err)
-                             for it in pending
-                             if it.get("disposition_id") not in done)
+                             for it in fresh)
+            done.update(it.get("disposition_id") for it in fresh)
 
         store = stores_by_name.get(store_name)
         if store is None:
             lines_s.append(f"  {store_name}:凭证缺失,跳过")
             _unexecuted("未执行(凭证缺失)")
-            return store_name, lines_s, records_s
+            return store_name
         try:    # 单店隔离:单店代理/网络异常不炸整轮(与 cleanup 同款纪律)
             for kind in _KIND_ORDER:
                 if kinds.get(kind):
                     _submit_kind(store, kind, kinds[kind], today, lines_s,
                                  records_s, done)
         except _client.StoreDeadError as e:
+            # 凭证死是确定性的:就地点名写表,**不抛**(抛出去就进补试名单,
+            # 而重试只会再死一次 —— 标准①的「StoreDeadError 不补试」)
             logger.error("店铺 %s 凭证失效,跳过(不重试): %s", store_name, e)
             lines_s.append(f"  {store_name}:凭证失效跳过")
             _unexecuted("未执行(凭证失效)", str(e))
         except Exception as e:
             logger.exception("店铺 %s 维护提交异常,跳过继续其它店: %s",
                              store_name, e)
-            lines_s.append(f"  ⚠ {store_name}:提交异常已跳过({e}),下轮重试")
+            lines_s.append(f"  ⚠ {store_name}:提交异常已跳过"
+                           f"({store_retry.diagnose(e)}:{e}),下轮重试")
             _unexecuted("未执行(提交异常)", str(e))
-        return store_name, lines_s, records_s
+            raise       # 交给标准件串行补试(标准①,此刻不判生死)
+        return store_name
 
     # 跨店并发(所有者定稿 2026-08-17:「跨店都应该并发,某个店当时有问题,
     # 最后补一次,一个店失败又不能说整个工作流都失败」)。安全性:每店有自己
     # 的固定出口代理,沃尔玛配额按 (store, endpoint) 计,令牌桶也是这个维度
-    # —— 跨店并发不挤同一个桶。**店内四类动作仍然串行**(同店 token 桶互挤),
+    # —— 跨店并发不挤同一个桶。**店内三类动作仍然串行**(同店 token 桶互挤),
     # 那一层在 _submit_kind 里没动。
     # 单店失败隔离本来就有(上面的 try/except),并发只是让它们同时跑。
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    all_records: list[tuple] = []
-    per_store: dict[str, list[str]] = {}
     todo = sorted(by_store.items())
+    kinds_by_store = dict(todo)
+    to_retry: list[tuple] = []
     with ThreadPoolExecutor(
             max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
-        futs = [pool.submit(_one_store, n, k) for n, k in todo]
+        futs = {pool.submit(_one_store, n, k): n for n, k in todo}
         for f in as_completed(futs):
-            name, lines_s, records_s = f.result()
-            per_store[name] = lines_s
-            all_records.extend(records_s)
+            try:
+                f.result()
+            except Exception as e:      # noqa: BLE001 —— 归类与点名已在 _one_store
+                # 标准①(所有者定稿 2026-08-26):此刻**不判生死**,跑完
+                # 别人再串行补试。所有者原话「某个店当时有问题,最后补一次」
+                # —— 此前本文件只把注释写在这儿,补一次的代码没有
+                to_retry.append(({"name": futs[f]}, e))
+
+    # ⚠ 这批店与上面「缺席避让」那批**不是同一批人**:那批是目录水位早于本轮
+    # 的店(store_absence,本工作流作为下游要避让掉的);这批是本工作流自己
+    # 这一轮没跑通、标准③要点名的店。同一个「缺席」词、两种人群,别混
+    # (conventions §二 同款告诫),所以这里不复用 absent 这个名字。
+    absent_after_retry: list[tuple[str, str]] = []   # (店名, 归类词,出处 diagnose)
+    gate_note = ""
+    saved: list = []
+    if to_retry:
+        # 标准①:失败店**串行**补试一遍(services/store_retry 是唯一实现,
+        # 规模闸/退避阶梯/凭证死不补试三条判据都在里面,本文件不再另写)。
+        # 单一落地路径 —— 补试跑的就是第一轮同一个 _one_store,不另写简化版。
+        #
+        # 写操作二次提交的安全性,**两条路由各自成立**(CLAUDE.md「写操作永不
+        # 自动兜底」禁的是*换方法*重试;补试跑的是同一条路由、同一份载荷):
+        #   · feed 路由:同一批意图重建的载荷 payload_key 一致,首轮已发出去
+        #     的那几片被 api/feeds 的在途防重拦下(dedup 不重发、不落事件、
+        #     不转态),与 problem_product_cleanup 的二轮重提同款;
+        #   · PUT 路由(小批量价格/库存):**不进 feed 台账,没有在途防重**
+        #     (api/prices.put_price 与 api/inventory.put_inventory 头注原话
+        #     「不产生 feed_id 不进 feed 台账」)。它的安全性另有出处:两个
+        #     端点都是**绝对赋值**(currentPrice.amount / quantity.amount),
+        #     把同一个值重设一遍终态不变;转态侧也幂等(dispositions._MARK_SQL
+        #     带 `AND status = 'suggested'`,重复 mark 不改 executed_at)。
+        #     代价是首轮已成功的那几条会再花一次单品配额、并在维护记录表上
+        #     多一行同样的「成功」——所以补试这件事必须进摘要(见下)。
+        #     ⚠ 别为省这一次就在补试时按 done 跳过已成功的条目:feed 路由
+        #     一旦少发几条,payload_key 就变了,在途防重当场失效。
+        #
+        # 救回的店不用在这里收:_one_store 已经把它这一轮的行写进 per_store、
+        # 记录写进 records_by_store,补试成功与首轮成功走的是同一条落地路径
+        saved, still, gate_note = store_retry.serial_second_pass(
+            sorted(to_retry, key=lambda p: p[0]["name"]),
+            lambda st: _one_store(st["name"], kinds_by_store[st["name"]]),
+            total_stores=len(todo))
+        for st, e in still:
+            # 归类词唯一出处 diagnose。不像 catalog_sync 还分一路 dead:
+            # 凭证失效到不了这里(_one_store 就地接住、不抛,见上)
+            absent_after_retry.append((st["name"], store_retry.diagnose(e)))
     # 按店名排序合并:完成先后是随机的,摘要顺序不能跟着随机
     for name, _ in todo:
         lines.extend(per_store.get(name, []))
+    if to_retry and not gate_note:
+        # 补试必须见人(与 problem_product_cleanup 的「二轮重试 N 店(串行)」
+        # 同款):摘要行每轮重置,补试救回的店把首轮那句「⚠ 提交异常已跳过」
+        # 覆盖掉了,而维护记录表里首轮的「未执行(提交异常)」行**留着** ——
+        # 摘要一个字不说,表上那几行就成了没出处的孤证,"这一轮花了两份配额"
+        # 也没人看得见(conventions §六:兜底触发必须记日志计数,
+        # 静默常态化 = 主路径已坏没人知道)。规模闸那行自己说清了「本轮不
+        # 逐店补试」,不在它上面再造第二句
+        lines.append(f"店级补试 {len(to_retry)} 店(串行):"
+                     + ",".join(sorted(st["name"] for st, _e in to_retry))
+                     + f",救回 {len(saved)},仍失败 {len(absent_after_retry)}")
+    if absent_after_retry:
+        # 标准③:缺席不炸整轮,但必须点名在**首行** —— 链通知对成功步骤
+        # 只发首行(cli.first_line_of),写在后面等于只写进日志。
+        # 尾句是本件的处置:领取只读(claim 不转态),没提交出去的建议行还是
+        # suggested,下一轮照样领得到
+        lines[0] += nf.absent_tail(absent_after_retry, gate_note,
+                                   tail="存量建议保留,下轮重试")
+    if gate_note:
+        lines.append(gate_note)
 
+    all_records = [r for name, _ in todo for r in records_by_store.get(name, [])]
     _write_sheet(all_records, lines)
     lines.append("生效确认在下一轮本工作流开头(等 catalog_sync 重新观测)")
     return "\n".join(lines)

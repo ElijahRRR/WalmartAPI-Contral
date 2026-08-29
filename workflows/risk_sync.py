@@ -52,9 +52,11 @@ def _read_sheet(sheet) -> list[dict]:
     if total < 2:
         return []
     last_col = feishu._col_letter(len(sheet.columns))
-    values = feishu.sheet_values(sheet, f"A2:{last_col}{total}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(分块 + 90221 对半);本函数只按列名
+    # 取值、不认行号,rownum 丢掉即可
+    pairs = feishu.sheet_values_rows(sheet, "A", last_col, 2, total)
     rows = []
-    for raw in values:
+    for _rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] \
             + [""] * len(sheet.columns)
         d = dict(zip(sheet.columns, cells))
@@ -69,7 +71,7 @@ def _first_row(sheet) -> list[dict]:
     黑名单单列表的表头是条件式判定(单元格含「黑名单」才算表头)——
     _read_sheet 从 A2 起读,若首行其实是数据,会每天漏拦同一条。
     """
-    cells = (feishu.sheet_values(sheet, "A1:A1") or [[]])[0]
+    cells = (feishu.sheet_values_small(sheet, "A1:A1") or [[]])[0]
     vals = [(str(c).strip() if c is not None else "") for c in cells] + [""]
     # 类目表 2026-08-20 升成五列后表头首格是「类目」,不含「黑名单」——
     # 只认旧条件的话表头会被当成一条数据(它的「匹配方式」列是空的,

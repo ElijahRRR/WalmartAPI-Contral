@@ -22,7 +22,6 @@
 """
 
 import logging
-from collections import Counter
 
 from registry import db
 from services import sku_asin
@@ -35,42 +34,11 @@ _DISTINCT_SQL = """
 SELECT DISTINCT sku FROM catalog.product_events WHERE asin IS NULL
 """
 
-_ITEMID_SQL = """
-SELECT DISTINCT item_id, sku FROM catalog.walmart_items
-WHERE item_id = ANY(%s)
-"""
-
 _FILL_SQL = """
 UPDATE catalog.product_events e SET asin = m.asin
 FROM (SELECT unnest(%s::text[]) AS sku, unnest(%s::text[]) AS asin) m
 WHERE e.sku = m.sku AND e.asin IS NULL
 """
-
-
-def _resolve(conn, skus: list[str]) -> tuple[dict, dict]:
-    """输入:连接 + 待洗 sku 列表 → 输出:({sku: asin}, 形态计数)。
-    模式提取 + 纯数字倒查 item id 两跳;解析不了的不进映射。"""
-    mapping: dict = {}
-    buckets: Counter = Counter()
-    numeric: list = []
-    for s in skus:
-        kind = sku_asin.classify(s)
-        buckets[kind] += 1
-        a = sku_asin.extract_asin(s)
-        if a:
-            mapping[s] = a
-        elif kind == "numeric":
-            numeric.append(s)
-    if numeric:
-        with conn.cursor() as cur:
-            cur.execute(_ITEMID_SQL, (numeric,))
-            hits = dict(cur.fetchall())     # item_id → 沃尔玛订货号
-        for s in numeric:
-            a = sku_asin.extract_asin(hits.get(s))
-            if a:
-                mapping[s] = a
-                buckets["numeric_resolved"] += 1
-    return mapping, dict(buckets)
 
 
 def run(params: dict) -> str:
@@ -82,10 +50,9 @@ def run(params: dict) -> str:
             skus = [r[0] for r in cur.fetchall()]
         if not skus:
             return "SKU 清洗:事件账本无待洗行(asin 全已填)"
-        mapping, buckets = _resolve(conn, skus)
+        mapping, buckets = sku_asin.resolve_skus(conn, skus)
 
-        samples = {k: [s for s in skus if sku_asin.classify(s) == k][:5]
-                   for k in ("numeric", "other") if buckets.get(k)}
+        samples = sku_asin.samples(skus, buckets)
         shape = ",".join(f"{k}×{v}" for k, v in sorted(buckets.items()))
         if not apply:
             return (f"SKU 清洗预览:待洗 {len(skus)} 个不同 sku,形态 {shape};"

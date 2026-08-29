@@ -68,3 +68,67 @@ def test_record_many_autofills_asin_column():
     assert "asin" in conn.sql
     assert conn.rows[0][1] == "B0GXX75JN5"      # 三段式 → 提取
     assert conn.rows[1][1] is None              # item id → NULL 等倒查
+
+
+# ── 批量清洗两跳(2026-08-27 从两个清洗工作流收编)──────────────────────
+
+class _Cur:
+    def __init__(self, hits):
+        self.hits, self.sql, self.args = hits, None, None
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, args=None):
+        self.sql, self.args = sql, args
+
+    def fetchall(self):
+        return list(self.hits.items())
+
+
+class _Conn:
+    def __init__(self, hits=None):
+        self.cur = _Cur(hits or {})
+
+    def cursor(self):
+        return self.cur
+
+
+def test_resolve_skus_two_hops_and_leaves_the_rest_alone():
+    """模式提取 + 纯数字倒查 item id 两跳;**解析不了的不进映射**(留 NULL)。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"})
+    skus = ["B0GXX75JN5", "JTZW-D01027HVK3W-38", "102460018738",
+            "998877665544", "怪东西"]
+    mapping, buckets = sa.resolve_skus(conn, skus)
+    assert mapping == {"B0GXX75JN5": "B0GXX75JN5",
+                       "JTZW-D01027HVK3W-38": "D01027HVK3W",
+                       "102460018738": "B0GXX75JN5"}      # 倒查救回来的
+    # 倒查不到的那个纯数字不进映射(绝不猜),其余照原形态计数
+    assert "998877665544" not in mapping
+    assert buckets == {"asin": 1, "wrapped": 1, "numeric": 2, "other": 1,
+                       "numeric_resolved": 1}
+    # 倒查只对纯数字发一次,且只发那两个
+    assert "catalog.walmart_items" in conn.cur.sql
+    assert conn.cur.args == (["102460018738", "998877665544"],)
+
+
+def test_resolve_skus_skips_the_lookup_when_nothing_is_numeric():
+    conn = _Conn()
+    mapping, buckets = sa.resolve_skus(conn, ["B0GXX75JN5"])
+    assert mapping == {"B0GXX75JN5": "B0GXX75JN5"}
+    assert conn.cur.sql is None          # 一条 SQL 都不该发
+    assert buckets == {"asin": 1}
+
+
+def test_samples_only_reports_the_buckets_a_human_has_to_look_at():
+    """只报 numeric/other:asin/wrapped 是提得出的,不需要人认。
+    新形态先进「其他」桶带样本报出来,人认了再扩规则。"""
+    skus = [f"{i:012d}" for i in range(7)] + ["怪A", "怪B"]
+    _, buckets = sa.resolve_skus(_Conn(), skus)
+    got = sa.samples(skus, buckets)
+    assert set(got) == {"numeric", "other"}
+    assert len(got["numeric"]) == 5          # 每桶前 5 个
+    assert got["other"] == ["怪A", "怪B"]
+    # 桶为空就不出现(摘要里不印一行空样本)
+    assert sa.samples(["B0GXX75JN5"], {"asin": 1}) == {}

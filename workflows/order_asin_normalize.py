@@ -39,7 +39,6 @@
 """
 
 import logging
-from collections import Counter
 
 from registry import db
 from services import sku_asin
@@ -55,12 +54,6 @@ SELECT DISTINCT sku FROM orders.order_lines
 WHERE asin IS NULL AND sku IS NOT NULL AND btrim(sku) <> ''
 """
 
-# item_id → 订货号:纯数字形态那一跳(与 sku_normalize 同一张表同一口径)
-_ITEMID_SQL = """
-SELECT DISTINCT item_id, sku FROM catalog.walmart_items
-WHERE item_id = ANY(%s)
-"""
-
 _FILL_SQL = """
 UPDATE orders.order_lines o SET asin = m.asin
 FROM (SELECT unnest(%s::text[]) AS sku, unnest(%s::text[]) AS asin) m
@@ -72,41 +65,6 @@ SELECT count(*) AS total,
        count(*) FILTER (WHERE asin IS NOT NULL) AS filled
 FROM orders.order_lines
 """
-
-
-def _resolve(conn, skus: list[str]) -> tuple[dict, dict]:
-    """输入:连接 + 待洗 sku 列表 → 输出:({sku: asin}, 形态计数)。
-
-    模式提取 + 纯数字倒查 item id 两跳;解析不了的**不进映射**(留 NULL)。
-    与 `sku_normalize._resolve` 同一套路径 —— 两处都只调 services/sku_asin,
-    规则本身不在这里实现,所以不存在"两份规则飘掉"的问题。
-    """
-    mapping: dict = {}
-    buckets: Counter = Counter()
-    numeric: list = []
-    for s in skus:
-        buckets[sku_asin.classify(s)] += 1
-        a = sku_asin.extract_asin(s)
-        if a:
-            mapping[s] = a
-        elif sku_asin.classify(s) == "numeric":
-            numeric.append(s)
-    if numeric:
-        with conn.cursor() as cur:
-            cur.execute(_ITEMID_SQL, (numeric,))
-            hits = dict(cur.fetchall())        # item_id → 沃尔玛订货号
-        for s in numeric:
-            a = sku_asin.extract_asin(hits.get(s))
-            if a:
-                mapping[s] = a
-                buckets["numeric_resolved"] += 1
-    return mapping, dict(buckets)
-
-
-def _samples(skus: list[str], buckets: dict) -> dict:
-    """输入:待洗 sku + 形态计数 → 输出:{形态: 前 5 个样本}(只给没解析出的桶)。"""
-    return {k: [s for s in skus if sku_asin.classify(s) == k][:5]
-            for k in ("numeric", "other") if buckets.get(k)}
 
 
 def run(params: dict) -> str:
@@ -131,9 +89,9 @@ def run(params: dict) -> str:
         if not skus:
             return "订单 ASIN 清洗:无待洗行(asin 全已填)"
 
-        mapping, buckets = _resolve(conn, skus)
+        mapping, buckets = sku_asin.resolve_skus(conn, skus)
         shape = ",".join(f"{k}×{v}" for k, v in sorted(buckets.items()))
-        samples = _samples(skus, buckets)
+        samples = sku_asin.samples(skus, buckets)
         rate = len(mapping) / len(skus) if skus else 0.0
         head = (f"待洗 {len(skus)} 个不同 sku,形态 {shape};"
                 f"可解析 {len(mapping)} 个({rate:.1%})")

@@ -9,10 +9,16 @@
 文具类目的 `color_name=48 Color` 说的**不是颜色是件数**,该映到 `pieceCount`。
 这一类靠 `variant_group._DIM_MAP` 的字面映射永远映不上(名字压根不同族)。
 
-三层,越贵越靠后(与旧仓同序):
-  ① `needs_remap`   有维度不在枚举内才往下走,否则一分钱不花
-  ② `hardcoded`     (PT, 亚马逊维度名) 命中内置表且值能解析成数字 → 直接用
-  ③ `llm_remap`     整组一次决策,过 llm_cache;输出严格校验,不合格整份丢弃
+三层,越贵越靠后(与旧仓同序),**路由在调用方,不在本模块**:
+  ① 有维度不在枚举内才往下走,否则一分钱不花 —— **在调用方
+     (`workflows/list_new._remap_unmapped_dims`)判**:那里手上有
+     `variant_group.plan` 算出的 `unmapped_dims`,还要顺带过滤"本轮取值全同"
+     与"只看见 1 个成员"两种不该问 LLM 的情形(见下差异 2),判据本来就在那边
+  ②③ 本模块只提供 `hardcoded` / `llm_remap` **两个显式函数**,
+     由调用方显式路由(表不中且看得见 ≥2 个成员才开连接问 LLM)。
+     能力不同的两条路各自一个函数、调用方 if 分流,不做"试 A 失败自动落 B"
+     式的隐式降级入口(CLAUDE.md/conventions §六;2026-08-27 定案:
+     此前另有一个把两层串起来的 `remap_dim`,与接线侧的判据两套并存)
 
 ## 与旧仓的三处**有意**差异
 
@@ -64,18 +70,6 @@ _NUMERIC_RE = re.compile(
 _PURPOSE = "variant_remap"
 _TEMPERATURE = 0.1
 _MAX_TOKENS = 1024
-
-
-def needs_remap(dims, enum) -> bool:
-    """输入:亚马逊维度名集合 + PT 的变体维度枚举 → 输出:要不要往下走。
-
-    枚举为空 = 这个 PT 压根不支持变体分组,重映射也没归宿 → False
-    (旧仓同款:不浪费一次调用)。
-    """
-    allowed = {str(e) for e in (enum or ())}
-    if not allowed:
-        return False
-    return any(str(d) not in allowed for d in (dims or ()))
 
 
 def hardcoded(pt: str, dim: str, values: dict, enum) -> tuple | None:
@@ -166,18 +160,3 @@ def llm_remap(conn, pt: str, dim: str, values: dict, enum) -> tuple | None:
     logger.warning("变体维度重映射:%s 的 %s → %s(LLM,理由 %r)",
                    pt, dim, wm, (raw or {}).get("rationale"))
     return str(wm), dict(values)
-
-
-def remap_dim(conn, pt: str, dim: str, values: dict, enum) -> tuple | None:
-    """输入:同上 → 输出:(沃尔玛属性名, {asin: 值}) 或 None。三层的唯一入口。
-
-    ① 硬编码表(零成本)→ ② LLM 兜底。`conn` 为 None 时只走硬编码
-    (纯函数场景/测试),不静默去连库。
-    """
-    hit = hardcoded(pt, dim, values, enum)
-    if hit:
-        logger.info("变体维度重映射:%s 的 %s → %s(内置表)", pt, dim, hit[0])
-        return hit
-    if conn is None:
-        return None
-    return llm_remap(conn, pt, dim, values, enum)

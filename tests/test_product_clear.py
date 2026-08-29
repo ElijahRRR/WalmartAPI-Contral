@@ -20,7 +20,9 @@ def _env(monkeypatch, sheet_rows, *, stores=(STORE,)):
                         lambda conn, rows: (calls["events"].extend(rows),
                                             len(rows))[1])
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (calls["write"].extend(ups), len(ups))[1])
     monkeypatch.setattr(dr.stores_svc, "load_stores",
@@ -127,7 +129,9 @@ def test_sync_from_ledger_backfills_without_walmart_calls(monkeypatch):
     ]
     writes = []
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"OK1": ("success", ""), "BAD1": ("failed", "ERR_Y")},
@@ -155,6 +159,21 @@ def test_sync_from_ledger_skips_when_sheet_unregistered(monkeypatch):
     # 看起来像"回写过了但飞书没变"(所有者 2026-08-09 实遇)
     out = clear_sheet.sync_from_ledger()
     assert out and "未登记" in out
+
+
+def test_retire_cap_reads_the_shared_limits_service(monkeypatch):
+    """「下架限制」列的读取与 problem_product_cleanup **同一份**
+    (services/store_limits.retire_caps)—— 本件此前另抄了一份 _load_limits,
+    改一处漏一处的那份会静默读空、全店回落默认值且不报错。
+
+    两句摘要文案留在调用点按 caps 空否拼,逐字不变。
+    """
+    assert not hasattr(dr, "_load_limits")      # 第二份实现已删,不许回潮
+    _env(monkeypatch, [["T1", "S1", "删除", ""]])
+    monkeypatch.setattr(dr.store_limits, "retire_caps", lambda: {})
+    assert "限额表未登记,全店统一上限 300" in dr.run({"execute": True})
+    monkeypatch.setattr(dr.store_limits, "retire_caps", lambda: {"T1": 2})
+    assert "限额表生效(1 店)" in dr.run({"execute": True})
 
 
 def test_limits_table_per_store_cap(monkeypatch, caplog):

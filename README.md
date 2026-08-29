@@ -135,7 +135,7 @@ maintenance      (DANGEROUS=True,纯执行件,只消费建议行,自己不做决
 ## 三、执行入口 cli.py
 
 `cli.py` 是唯一的执行门。launchd 定时、智能体定时任务、手动触发、未来的网页按钮和
-MCP 工具,全部走这一条路径。它统一负责六件事:
+MCP 工具,全部走这一条路径。它统一负责七件事:
 
 1. 加载 `<DATA_ROOT>/.env`
 2. **flock 单实例锁**(`<DATA_ROOT>/locks/<工作流名>.lock`,整轮持有)
@@ -143,6 +143,12 @@ MCP 工具,全部走这一条路径。它统一负责六件事:
 4. 按 `importlib` 分发到 `workflows/<name>.run(params)`
 5. 飞书通知(成功/失败都发,链只发一条)
 6. 退出码
+7. **链尾缺席店重赛**(店级重试标准④,2026-08-26):主链全成且含
+   catalog_sync 的**全船**链,按目录水位找出缺席店,把链内声明
+   `SUPPORTS_STORE` 的步骤带 `store=X` 逐店重跑一次(逐步拿锁、写
+   ops.runs),再失败即止;结果拼进那条链通知,**不影响退出码**。
+   四道闸:主链带 store= 不重赛 / 长期缺席(>72h)只点名 / 今日缺席
+   超 5 店判系统性故障不重赛 / 重赛后按水位复核"救回"是否属实。
 
 ### 退出码
 
@@ -174,7 +180,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | **PostgreSQL 17** `walmart_data` | 五 schema、49 表、10 视图 | **唯一权威**。DDL 在 `refdata/schema.sql`,说明在 `docs/db_schema.md` |
 | **飞书表格** | 店铺凭证、运营填的驱动表、结果回写 | **人机界面**,不是权威。程序按**表头字段名**索引,字段名常量在 registry |
 | `<DATA_ROOT>/` | `.env`(密钥,chmod 600)、`specs/`、`cache/`、`logs/`、`backups/`、`locks/`、`reports/` | 不进 git;路径唯一出处 `registry/paths.py`,可用 `WALMART_DATA_ROOT` 覆盖 |
-| SQLite | 仅 `cache/` 下可重建缓存(WAL + busy_timeout) | 业务数据一律不放 SQLite |
+| SQLite | 仅 `cache/` 下可重建缓存(现无使用方,合规入口已随 2026-08-27 死件清理撤除——真要用先在 registry/db.py 加门) | 业务数据一律不放 SQLite |
 
 ### 五个 schema
 
@@ -198,7 +204,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 **`catalog.product_events` 产品病历。** 一个 SKU(= ASIN)从入库、审核、上架、
 观测、下架到删除核验的全部事件。它是"这个商品当初为什么被删/被拒"的唯一答案来源,
-也是若干判据的输入(如反补计数、顽固 SKU 判定)。
+也是若干判据的输入(如顽固 SKU 判定)。
 
 ---
 
@@ -266,7 +272,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | `product_query` | | 按产品 ID 查沃尔玛商品详情 |
 | `node_backfill` | | 从已存快照回填类目 ID 锚(零重采) |
 | `pt_backfill` | | 历史实证 PT 回填产品主档 |
-| `sources_backfill` | | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
+| `sources_backfill` | 调 | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
 | `pt_census` | | 沃尔玛类目(PT)四源对账:哪些 PT 真实存在 |
 | `sku_normalize` | | 事件账本 SKU→ASIN 清洗 |
 | `taxonomy_import` | | 亚马逊类目树入库(ID 主键) |
@@ -322,7 +328,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `list_new` | 危 调 | 上架主链。七道闸门(非 ACTIVE 店 / 配额 / 风控 / 黑名单 / 全局去重 / 防呆 / 数据过滤,含**店铺渠道闸**:限额表「配送限制」标了 fba/fbm 就只上该渠道的货,**没标不限制**;缺数据同轮闭环:推采集→等窗口→就地摄取→本轮续走)→ 预备期(LLM 属性映射 + spec 一致化,128 并发占位号,缺必填本地拦)→ **通过的行才领 UPC** → 按店打包提交 MP_ITEM feed → 回写上架表。**首尾各同步一次 UPC 池**,等于顺带跑了 `upc_sync`。变体自动成组(单维/多维)、组内标题差异化 摘要末尾报本轮 **LLM 用量与花费**(按用途分行,含每千条单价;dry-run 的 `check_spec` 预检同样报——那一步是真调 LLM 的)。|
+| `list_new` | 危 调 | 上架主链。七道闸门(非 ACTIVE 店 / 配额 / 风控 / 黑名单 / **本店去重**(2026-08-28 取消全局去重:同店重复才拦,跨店分布归分配链+占用闸)/ 防呆 / 数据过滤,含**店铺渠道闸**:限额表「配送限制」标了 fba/fbm 就只上该渠道的货,**没标不限制**;另有**定制品闸**:产品数据标为定制的不上架(2026-08-28 定稿);缺数据同轮闭环:推采集→等窗口→就地摄取→本轮续走)→ 预备期(LLM 属性映射 + spec 一致化,128 并发占位号,缺必填本地拦)→ **通过的行才领 UPC** → 按店打包提交 MP_ITEM feed(三条防线:起跑抖动 0~800ms 去同步 / 遇 5xx 并发按 24→16→12→8→4 降档、只降不升 / 不确定的片子**整轮跑完再结算**,退避走官方阶梯 2-4-8-16-32 + 抖动)→ 回写上架表。**首尾各同步一次 UPC 池**,等于顺带跑了 `upc_sync`。变体自动成组(单维/多维)、组内标题差异化 摘要末尾报本轮 **LLM 用量与花费**(按用途分行,含每千条单价;dry-run 的 `check_spec` 预检同样报——那一步是真调 LLM 的)。|
 | `match_listing` | 危 | 跟卖上架(MP_ITEM_MATCH) |
 | `upc_sync` | | UPC 池注入同步与投影回写(手动体检入口) |
 | `sku_locked_heal` | 危 | `SKU_LOCKED` 自愈链:RETIRE → 冷却 24h → 清列重上新 UPC |
@@ -338,8 +344,8 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 |---|---|---|
 | `maintenance_scan` | 调 | 扫描定性,产建议行(改价 / 改库存 / 改标题 / 删除)。判据全在 `services.maintenance_intents.classify()` —— 全项目唯一一处决定"这个在线商品该拿它怎么办" |
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
-| `problem_scan` | 调 | 问题商品扫描定性(沃尔玛后台 UNPUBLISHED/SYSTEM_PROBLEM + 审核判拒但仍在架)。尾段顺手收黑名单并投影飞书 |
-| `problem_product_cleanup` | 危 调 | 问题商品处置执行件(反补 / 删除 / 停用) |
+| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
+| `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
 
 **定价口径**:落地价 =(亚马逊单价 + 运费)× 区间倍率,按**配送方式**(FBA/FBM)
@@ -357,6 +363,10 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 ⚠ 三条链对"产品渠道**没采到**"口径一致:**不算不符**(放行/不动)。第三种值恒高
 说明采集侧 `is_fba` 解析坏了,那是要修采集,不是要动商品。
+⚠ **规划外店(谭总系)照判**(所有者定稿 2026-08-25):规划外排除的是「归属」,
+不是"这家店能不能卖这个渠道的货"。由此分配/审计与上架/维护在这一点上口径不同
+**且都对** —— 这些店的渠道不符行永远不进 `alloc_audit` 的下架清单,却照样被维护链
+清零与下架;`maintenance_scan` 用 ⚑ 旗标标出来,免得两份报告对不上被当成漏报。
 ⚠ 删除窗口是**向后看**的:某店刚把这一格填上,当轮就可能看见过去 15 天的另一渠道
 历史而给出整批删除建议 —— 填之前先 `maintenance_scan --dry-run` 看删除名单。
 

@@ -12,15 +12,10 @@ from services import variant_title as vt
 _ENUM = ["color", "count", "multipackQuantity", "pieceCount", "size"]
 
 
-# ── ① 枚举内检查:一分钱不花的那一层 ──────────────────────────────────────────
-
-def test_needs_remap_only_when_something_is_actually_unmapped():
-    assert vr.needs_remap(["color_name"], _ENUM) is True     # 不在枚举内
-    assert vr.needs_remap(["color"], _ENUM) is False         # 就在枚举内
-    # 枚举为空 = 这个 PT 压根不支持变体,重映射也没归宿 → 不往下走(旧仓同款)
-    assert vr.needs_remap(["color_name"], []) is False
-    assert vr.needs_remap([], _ENUM) is False
-
+# ── ① 枚举内检查在**调用方**(2026-08-27 定案):判据在
+#    `list_new._remap_unmapped_dims`(`unmapped_dims` + `if not enum: continue`
+#    + 全同/单成员两道过滤),本模块只留 ②③ 两个显式函数供它路由。
+#    钉这一层的用例见本文件末尾"接线:list_new 那一段"。
 
 # ── ② 内置错位表:四条件全满足才用 ───────────────────────────────────────────
 
@@ -119,19 +114,6 @@ def test_llm_cache_key_ignores_sample_values(monkeypatch):
     assert "Small" in calls[0][0]["content"]
 
 
-def test_remap_dim_prefers_the_table_and_never_dials_llm_without_conn(monkeypatch):
-    calls = []
-    _wire(monkeypatch, {"walmart_key": "size"}, calls=calls)
-    # 表命中:不问 LLM
-    assert vr.remap_dim(object(), "Crayons", "color_name",
-                        {"A": "24 Pack"}, _ENUM)[0] == "pieceCount"
-    assert not calls
-    # conn=None(纯函数场景/本轮只看见一个成员):只走表,不静默去连库
-    assert vr.remap_dim(None, "Gift Bags", "size_name", {"A": "S"},
-                        _ENUM) is None
-    assert not calls
-
-
 # ── 接线:list_new 那一段 ────────────────────────────────────────────────────
 
 def _lrow(asin, pt, attrs, pairs, unmapped, gid="vg_G"):
@@ -166,6 +148,29 @@ def test_wiring_keeps_mapped_dims_and_only_fills_the_unmapped(monkeypatch):
         assert names == ["color", "pieceCount"]      # 原有的还在,新的补上了
         assert r["_vplan"]["unmapped_dims"] == []
         assert r["_vplan"]["remapped_dims"] == ["color_name→pieceCount"]
+
+
+def test_wiring_table_hit_dials_neither_the_llm_nor_the_database(monkeypatch):
+    """表命中就到此为止:不问 LLM,**连接一次都不开**。
+
+    2026-08-27 定案(路由收归调用方、删掉 services 里那个把两层串起来的
+    `remap_dim`)之后,这条判据只剩接线侧一处 —— 原来由 remap_dim 的
+    `conn is None` 分支各守一半,两套并存。
+    """
+    from workflows import list_new as ln
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: _SPEC_ART)
+    monkeypatch.setattr(ln.variant_remap, "llm_remap",
+                        lambda *a, **k: pytest.fail("表命中了还问 LLM"))
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        lambda *a, **k: pytest.fail("表命中了还开连接"))
+    rows = [_lrow("A1", "Art Sets", "color_name=48 Color",
+                  [("color", "Red")], ["color_name"]),
+            _lrow("A2", "Art Sets", "color_name=12 Colors",
+                  [("color", "Navy")], ["color_name"])]
+    ln._remap_unmapped_dims(rows)
+    for r in rows:
+        assert [n for n, _ in r["_vplan"]["attr_pairs"]] == ["color",
+                                                             "pieceCount"]
 
 
 def test_wiring_never_dials_llm_for_a_degenerate_dimension(monkeypatch):

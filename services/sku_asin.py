@@ -16,6 +16,7 @@
 """
 
 import re
+from collections import Counter
 
 # 裸 ASIN:10 位大写字母数字、至少含一个字母(纯数字 10 位是 item id 不是 ASIN)
 _PLAIN = re.compile(r"^(?=.*[A-Z])[A-Z0-9]{10}$")
@@ -52,3 +53,58 @@ def classify(sku) -> str:
     if _NUMERIC.fullmatch(s):
         return "numeric"
     return "other"
+
+
+# ── 批量清洗:模式提取 + 纯数字倒查两跳(两个清洗工作流共用)──────────────
+# 纯数字形态那一跳:item_id → 沃尔玛订货号 → 再走 extract_asin。
+# ⚠ 这条 SQL 与 numeric_resolved 的记账此前在 order_asin_normalize 与
+# sku_normalize 各写一份(**字节相同**),而规则本身早就只在本模块 ——
+# 缺的正是"倒查那一跳"没跟着沉下来,于是两份拷贝各自演化(2026-08-27 收编)。
+_ITEMID_SQL = """
+SELECT DISTINCT item_id, sku FROM catalog.walmart_items
+WHERE item_id = ANY(%s)
+"""
+
+
+def resolve_skus(conn, skus: list[str]) -> tuple[dict, dict]:
+    """输入:连接 + 待洗 sku 列表 → 输出:({sku: asin}, 形态计数)。
+
+    模式提取 + 纯数字倒查 item id 两跳;**解析不了的不进映射**(调用方留 NULL,
+    绝不猜)。形态计数按 `classify` 的四个桶记,倒查成功的另记
+    `numeric_resolved` 一档 —— 它同时也进 `numeric` 桶,两者不是互斥关系
+    (摘要按"待洗形态分布 + 其中倒查救回多少"读)。
+
+    纯读一条 SQL,不改任何行;真正的 UPDATE 在各工作流自己的 `_FILL_SQL`
+    (打哪张表是两条链唯一的真差异)。
+    """
+    mapping: dict = {}
+    buckets: Counter = Counter()
+    numeric: list = []
+    for s in skus:
+        kind = classify(s)
+        buckets[kind] += 1
+        a = extract_asin(s)
+        if a:
+            mapping[s] = a
+        elif kind == "numeric":
+            numeric.append(s)
+    if numeric:
+        with conn.cursor() as cur:
+            cur.execute(_ITEMID_SQL, (numeric,))
+            hits = dict(cur.fetchall())     # item_id → 沃尔玛订货号
+        for s in numeric:
+            a = extract_asin(hits.get(s))
+            if a:
+                mapping[s] = a
+                buckets["numeric_resolved"] += 1
+    return mapping, dict(buckets)
+
+
+def samples(skus: list[str], buckets: dict) -> dict:
+    """输入:待洗 sku + 形态计数 → 输出:{形态: 前 5 个样本}(只给没解析出的桶)。
+
+    只报 numeric/other 两个桶:asin/wrapped 是提得出的,不需要人认。
+    "规则不全是常态"——新形态先进「其他」桶带样本报出来,人认了再扩规则。
+    """
+    return {k: [s for s in skus if classify(s) == k][:5]
+            for k in ("numeric", "other") if buckets.get(k)}

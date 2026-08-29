@@ -65,9 +65,12 @@ def clamp(text, limit: int, ellipsis: bool = False) -> str:
 
 
 def sort_images(urls: list) -> list[str]:
-    """保序去重(2026-08-12 旧仓对照纠正):旧系统保持亚马逊原序,
+    """输入:图片 URL list → 输出:保序去重后的 URL list(第一张即主图)。
+
+    保序去重(2026-08-12 旧仓对照纠正):旧系统保持亚马逊原序,
     mainImageUrl=原序第一张=亚马逊主图。此前的字典序排序会把主图换成
-    URL 最小的那张;来源真被 set() 打乱时保序也不比排序差。"""
+    URL 最小的那张;来源真被 set() 打乱时保序也不比排序差。
+    """
     return list(dict.fromkeys(str(u) for u in urls or [] if u))
 
 

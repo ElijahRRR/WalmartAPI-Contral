@@ -3,7 +3,7 @@
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync daily_report
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync daily_report -p catalog_sync:strict=1
 ```
 
 这条链跑的是:catalog_sync → daily_report。
@@ -17,7 +17,7 @@
 
 **顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
 
-备注:KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度
+备注:KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度;strict=1 保住本链「同步不全就不出日报」的闸(店级重试标准②让缺席不再炸链,唯独此链宁可不出产物,2026-08-26)
 
 ## 跑完怎么判
 

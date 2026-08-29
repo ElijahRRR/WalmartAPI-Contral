@@ -1,18 +1,24 @@
 """飞书开放平台客户端:多维表格(bitable)读写 + 群机器人 webhook 通知。
 
 多维表格是本系统的人机界面(docs/feishu_tables.md);旧仓库 lark_io 只支持电子表格,
-bitable 为全新实现,但重试/退避/切块参数照抄旧系统的实测值(docs/legacy_survey.md):
+bitable 为全新实现,但重试/退避参数照抄旧系统的实测值(docs/legacy_survey.md);
+切块参数 2026-08-27 起改由下面的「限额登记表」按官方限制 ×95% 出:
 
   - tenant_access_token:线程安全双检缓存,提前 300s 刷新,有效期兜底 7200s
   - 瞬时错误双轨判定:int code {90235, 90217, 50502, 99991400}
     + 小写子串兜底("data not ready" / "too many request" / "timeout")——
     新接口是否暴露 int code 未经全面验证,子串轨不可删
-  - 退避 1/2/4/8 秒,最多 4 次
+  - 退避 1/2/4/8 秒,最多 4 次;限流(99991400/90217)优先按官方
+    `x-ogw-ratelimit-reset` 响应头精确等待,无头才退回阶梯
   - token 失效码 99991663/99991664:清缓存换新 token 重试(与瞬时码分开处理)
-  - 批量写 ≤500 条/次(整批全成功或全失败),同表串行(锁)+ 批间节流(写 QPS≈10)
+  - 批量写按下面「限额登记表」切块(整批全成功或全失败),同表串行(锁)+ 批间节流
 
 错误模型(统一,修掉旧系统 cli/http 两后端不一致的陷阱):
   非瞬时业务错误一律抛 FeishuError(附 code/msg),绝不静默返回错误 envelope。
+
+限额规矩(所有者 2026-08-27 定稿):所有限额常量集中在本文件顶部的「限额登记表」,
+取值 = 官方限制 × 95%;读写各只有一条通道(读 sheet_values_rows /
+写 sheet_write_ranges),别的写法一律不新开。
 
 字段名规则:本层收发的 fields dict 由调用方用 registry 的字段常量构造,
 本层不出现任何具体表的字段名。
@@ -32,14 +38,91 @@ from registry.resources import Bitable, Spreadsheet
 
 logger = logging.getLogger("api.feishu")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  限额登记表(所有者 2026-08-27 定稿)——**全部**限额常量只在这里出生
+#
+#  三条规矩,新增常量照抄:
+#   ① 本仓取值 = 官方限制 × 95%,向下取整(官方 5000 行 → 本仓 4750 行)。
+#      官方另给了更严的自荐值时取更严者(单元格:硬上限 50000×95%=47500,
+#      但官方自荐 40000 → 取 40000)。
+#   ② 每条常量行内注释三件套:**官方**原值 | 官方 URL | 核对日期 2026-08-27。
+#   ③ 官方没给数字的用工程预算值,并明写「工程值,非官方」——不许假装有出处。
+#
+#  官方原句逐条对照(含「官方未说明」项)存档在 refdata/feishu_limits.tsv,
+#  与本表出自同一次调研(2026-08-27)、同一批 URL,改一处就同步另一处。
+#
+#  ⚠ 已知的**唯一例外**:list_fields 的 page_size=100 仍是就地字面量 ——
+#  2026-08-27 那轮调研只覆盖了「电子表格读/写、频控与配额、多维表格记录」四组,
+#  没查「列出字段」端点,写不出官方出处就不进表(规矩③:不许假装有出处)。
+#  该处已就地注明,补到官方原句后按规矩迁进来。
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 电子表格 v2 写(values / values_batch_update / values_append)─────────────
+_SHEET_WRITE_MAX_ROWS = 4750          # 官方 5000 行 | https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges?lang=zh-CN | 核对 2026-08-27
+#     官方原句「单次写入数据不得超过 5000 行、100列。」四个 values 写接口口径一致。
+_SHEET_WRITE_MAX_COLS = 95            # 官方 100 列 | https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges?lang=zh-CN | 核对 2026-08-27
+#     同一句原文的另一半;5000×100 是「与」不是「或」。列超限是**结构错误**:
+#     分批只切得出行、切不出列,所以直接抛,不假装还能救。
+_SHEET_CELL_HARD_MAX_CHARS = 40000    # 官方硬上限 50000、官方自荐 40000,取严 | https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges?lang=zh-CN | 核对 2026-08-27
+#     官方原句「每个单元格不超过 50,000 字符，由于服务端会增加控制字符，因此推荐
+#     每个单元格不超过 40,000 字符。」(sheets-faq 页另写 45,000,同站两页互斥,取小)
+#     ⚠ 与业务层 _SHEET_CELL_MAX_CHARS(20000 截断)**两层分工**,见那条注释。
+_SHEET_WRITE_BYTE_BUDGET = 9_000_000  # 工程值,非官方(官方写侧无字节上限,只有 90227 码)| https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges?lang=zh-CN | 核对 2026-08-27
+#     调研结论逐字:「【请求体字节上限 10MB】官方未说明……超量时只会拿到 90227
+#     TooLargeRequest，官方不给阈值。」网上流传的写侧 10MB 是把**读**侧的
+#     「该接口返回数据的最大限制为 10 MB。」张冠李戴。取读侧 10MB 的 ~86% 作预算,
+#     余量补偿 json.dumps 估算与服务端控制字符的误差。
+_SHEET_RANGES_PER_REQUEST = 100       # 工程值,非官方(官方未说明 valueRanges 数组长度上限)| https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/write-data-to-multiple-ranges?lang=zh-CN | 核对 2026-08-27
+#     调研结论逐字:「【values_batch_update 的 range 段数(valueRanges 数组长度)
+#     上限】官方未说明。」沿用现行 100(生产久经),不因为查不到就放开。
+_SHEET_DIMENSION_MAX = 4750           # 官方 5000 行/列 | https://open.feishu.cn/document/server-docs/docs/sheets-v3/sheet-rowcol/add-rows-or-columns?lang=zh-CN | 核对 2026-08-27
+#     官方原句「单次调用该接口，最多支持增加 5000 行或列。」删行同额:
+#     「单次调用该接口，最多支持删除 5000 行或列。」(.../-delete-rows-or-columns)
+#     ⚠ 90204 实证 2026-08-05:超量时飞书报的是 90204,不是超限码,别照码去猜阈值。
+_SHEET_WRITE_THROTTLE_SECS = 0.3      # 官方 100 次/秒 + 「单个文档只能串行调用」 | https://open.feishu.cn/document/server-docs/docs/sheets-v3/overview?lang=zh-CN | 核对 2026-08-27
+#     官方原句「向多个范围写入数据 | 单租户单应用100次/秒；单个文档只能串行调用」——
+#     后半句就是 _sheet_locks 那把同表串行锁的官方背书(并发不是慢,是被明令禁止)。
+#     0.3s 照抄旧系统实测值,远低于官方 100 次/秒,不动。
+
+# ── 电子表格 v2 读 ──────────────────────────────────────────────────────────
+_SHEET_READ_BLOCK_ROWS = 4750         # 工程值,非官方(官方读侧无行数限制)| https://open.feishu.cn/document/server-docs/docs/sheets-v3/data-operation/reading-a-single-range?lang=zh-CN | 核对 2026-08-27
+#     官方读侧唯一硬数字是原句「该接口返回数据的最大限制为 10 MB。」,按行分块 +
+#     90221 对半兜底管住它;块粒度与写侧对称取 4750,不另立数字。
+
+# ── 多维表格 v1(bitable)────────────────────────────────────────────────────
+_BITABLE_BATCH_CREATE_MAX = 950       # 官方 1,000 条/次 | https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_create?lang=zh-CN | 核对 2026-08-27
+#     官方原句「在多维表格数据表中新增多条记录，单次调用最多新增 1,000 条记录。」
+_BITABLE_BATCH_UPDATE_MAX = 950       # 官方 1,000 条/次 | https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_update?lang=zh-CN | 核对 2026-08-27
+#     官方原句「更新数据表中的多条记录，单次调用最多更新 1,000 条记录。」
+_BITABLE_BATCH_DELETE_MAX = 475       # 官方 500 条/次(**与增/改的 1000 不同**)| https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_delete?lang=zh-CN | 核对 2026-08-27
+#     官方原句「- 单次调用中最多删除 500 条记录。」删比写严一半,别照 create 外推。
+_BITABLE_PAGE_SIZE = 475              # 官方 500 行/页 | https://open.feishu.cn/document/docs/bitable-v1/app-table-record/search?lang=zh-CN | 核对 2026-08-27
+#     官方原句「该接口用于查询数据表中的现有记录，单次最多查询 500 行记录，支持分页获取。」
+_WRITE_THROTTLE_SECS = 0.15           # 官方 50 次/秒 + 「同一个数据表(table) 不支持并发调用写接口」 | https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_create?lang=zh-CN | 核对 2026-08-27
+#     官方原句(错误码 1254291)「同一个数据表(table) 不支持并发调用写接口」——
+#     _table_locks 那把同表串行锁的官方背书。0.15s 照抄旧系统实测(写 QPS≈10),不动。
+
+# ── 频控与配额(全域)────────────────────────────────────────────────────────
+_RATELIMIT_RESET_HEADER = "x-ogw-ratelimit-reset"  # 官方指定的退避依据头 | https://open.feishu.cn/document/server-docs/api-call-guide/frequency-control?lang=zh-CN | 核对 2026-08-27
+#     官方原句「x-ogw-ratelimit-reset: 52 //恢复 limit 周期，单位：秒」,以及
+#     「使用该响应头延迟请求是解除限频的最好方法。1. 等待 x-ogw-ratelimit-reset
+#     中指定的秒数。2. 重试请求。」⚠ 官方**没有** Retry-After,按那个头写读不到值。
+#     ⚠ 旧版 OpenAPI(本仓 sheets/v2 就是)限流时 HTTP 码是 400 不是 429,
+#     判据只能认 code=99991400,不能认状态码。
+_RATELIMIT_RESET_CAP_SECS = 60        # 工程值,非官方(官方未说明该头的取值范围/上界)| https://open.feishu.cn/document/server-docs/api-call-guide/frequency-control?lang=zh-CN | 核对 2026-08-27
+_QUOTA_EXHAUSTED_CODE = 99991403      # 官方:月度 API 调用量耗尽,**不是频控** | https://open.feishu.cn/document/server-docs/api-call-guide/generic-error-code?lang=zh-CN | 核对 2026-08-27
+#     官方原句「99991403 | This month's API call quota has been exceeded |
+#     本月 API 调用次数已达上限，请联系企业管理员升级飞书版本。」配额按自然月 1 号
+#     刷新,退避多久都不会好——所以它**不进**可重试集合,见 _QUOTA_EXHAUSTED_HINT。
+
 _TRANSIENT_CODES = {90235, 90217, 50502, 99991400}
+_RATELIMIT_CODES = {99991400, 90217}   # 频控码:优先读 reset 头精确等待
 _TOKEN_INVALID_CODES = {99991663, 99991664}
 _TRANSIENT_TEXTS = ("data not ready", "too many request", "timeout")
 _BACKOFF = (1, 2, 4, 8)
 _MAX_ATTEMPTS = 4
 _EARLY_REFRESH_SECS = 300
-_BATCH_LIMIT = 500          # 飞书批量增/改/删上限(整批原子)
-_WRITE_THROTTLE_SECS = 0.15  # 同表批间节流,压在写 QPS≈10 之下
+_QUOTA_EXHAUSTED_HINT = "月度 API 配额耗尽,不可重试,升级版本或等下月 1 号"
 
 _token_cache: dict = {}  # {"token": str, "expires_at": float}
 _token_lock = threading.Lock()
@@ -109,6 +192,43 @@ def _is_transient(code: int | None, msg: str) -> bool:
     return any(t in low for t in _TRANSIENT_TEXTS)
 
 
+def _check_quota(code: int | None, msg: str) -> None:
+    """输入:envelope 的 code/msg → 输出:无(命中月度配额耗尽即抛,不返回)。
+
+    99991403 **不是频控**,是自然月调用量配额打满(官方:「本月 API 调用次数已达
+    上限，请联系企业管理员升级飞书版本。」),下月 1 号才刷新——退避、换 token、
+    重试都不会好,继续重试只是把剩下的额度也烧掉。所以在两条重试轨(_is_transient
+    的 int 轨与子串轨)**之前**先手,明说不可重试。
+    """
+    if code == _QUOTA_EXHAUSTED_CODE:
+        raise FeishuError(code, f"{msg}({_QUOTA_EXHAUSTED_HINT})")
+
+
+def _ratelimit_wait(code: int | None, resp, attempt: int) -> float:
+    """输入:错误码 + 响应 + 第几次重试 → 输出:该等的秒数。
+
+    官方给的解法是读 `x-ogw-ratelimit-reset`(单位:秒)按它等,原句
+    「使用该响应头延迟请求是解除限频的最好方法」;头缺失/不是正整数时(官方
+    未承诺一定带,也未说明取值范围)退回本仓现行 1/2/4/8 阶梯,不新开第二套。
+    上限 _RATELIMIT_RESET_CAP_SECS 是工程值:等一分钟还不如让本轮失败、
+    交给调度下一轮,不能让一个工作流吊死在一个头上。
+    """
+    ladder = _BACKOFF[attempt]
+    if code not in _RATELIMIT_CODES:
+        return ladder
+    try:
+        secs = int(str((resp.headers or {}).get(_RATELIMIT_RESET_HEADER, "")).strip())
+    except (TypeError, ValueError):
+        return ladder
+    if secs <= 0:
+        return ladder
+    wait = min(secs, _RATELIMIT_RESET_CAP_SECS)
+    logger.warning("飞书限流 code=%s,按官方 %s=%ds 等待 %ds(第 %d/%d 次)",
+                   code, _RATELIMIT_RESET_HEADER, secs, wait,
+                   attempt + 1, _MAX_ATTEMPTS)
+    return wait
+
+
 def _tenant_token(force_refresh: bool = False) -> str:
     """输入:force_refresh → 输出:有效 tenant_access_token(缓存,提前 300s 刷新)。"""
     if not force_refresh:
@@ -165,14 +285,16 @@ def _call(method: str, path: str, *, json_body=None, params=None, timeout=60) ->
         if code == 0:
             return env.get("data") or {}
         msg = env.get("msg", "")
+        _check_quota(code, msg)
         if code in _TOKEN_INVALID_CODES:
             logger.warning("飞书 token 失效(code=%s),刷新后重试 %s", code, path)
             _tenant_token(force_refresh=True)
             continue
         if _is_transient(code, msg) and attempt < _MAX_ATTEMPTS - 1:
-            logger.warning("飞书瞬时错误 code=%s msg=%s,%ds 后重试(第 %d/%d 次)%s",
-                           code, msg, _BACKOFF[attempt], attempt + 1, _MAX_ATTEMPTS, path)
-            time.sleep(_BACKOFF[attempt])
+            wait = _ratelimit_wait(code, resp, attempt)
+            logger.warning("飞书瞬时错误 code=%s msg=%s,%gs 后重试(第 %d/%d 次)%s",
+                           code, msg, wait, attempt + 1, _MAX_ATTEMPTS, path)
+            time.sleep(wait)
             continue
         raise FeishuError(code, msg)
     raise FeishuError(None, f"exhausted retries: {last_err}")
@@ -190,7 +312,7 @@ def _records_path(table: Bitable, op: str) -> str:
 
 def list_records(table: Bitable, *, filter_: dict | None = None,
                  field_names: list[str] | None = None,
-                 page_size: int = 500) -> list[dict]:
+                 page_size: int = _BITABLE_PAGE_SIZE) -> list[dict]:
     """输入:Bitable(+可选服务端过滤条件/字段裁剪)→ 输出:记录列表 [{record_id, fields}]。
 
     走 records/search,服务端过滤 + 自动翻页;不要整表拉回自己扫。
@@ -205,7 +327,7 @@ def list_records(table: Bitable, *, filter_: dict | None = None,
     out: list[dict] = []
     page_token = None
     while True:
-        params = {"page_size": min(page_size, 500)}
+        params = {"page_size": min(page_size, _BITABLE_PAGE_SIZE)}
         if page_token:
             params["page_token"] = page_token
         data = _call("POST", _records_path(table, "/search"), json_body=body, params=params)
@@ -224,13 +346,14 @@ def _chunks(seq: list, n: int):
 def batch_create(table: Bitable, fields_list: list[dict]) -> list[str]:
     """输入:fields dict 列表 → 输出:新建 record_id 列表(顺序对应)。
 
-    自动按 500/批切块;同表串行 + 批间节流。单批失败即抛 FeishuError,
-    此时之前的批已写入飞书(飞书无跨批事务)——调用方按返回长度判断写到哪。
+    自动按登记表 _BITABLE_BATCH_CREATE_MAX 切块;同表串行 + 批间节流。
+    单批失败即抛 FeishuError,此时之前的批已写入飞书(飞书无跨批事务)——
+    调用方按返回长度判断写到哪。
     """
     t = table.require()
     ids: list[str] = []
     with _table_locks[(t.app_token, t.table_id)]:
-        for i, chunk in enumerate(_chunks(fields_list, _BATCH_LIMIT)):
+        for i, chunk in enumerate(_chunks(fields_list, _BITABLE_BATCH_CREATE_MAX)):
             if i:
                 time.sleep(_WRITE_THROTTLE_SECS)
             data = _call("POST", _records_path(table, "/batch_create"),
@@ -249,7 +372,7 @@ def batch_update(table: Bitable, updates: list[dict]) -> int:
     t = table.require()
     n = 0
     with _table_locks[(t.app_token, t.table_id)]:
-        for i, chunk in enumerate(_chunks(updates, _BATCH_LIMIT)):
+        for i, chunk in enumerate(_chunks(updates, _BITABLE_BATCH_UPDATE_MAX)):
             if i:
                 time.sleep(_WRITE_THROTTLE_SECS)
             data = _call("POST", _records_path(table, "/batch_update"),
@@ -265,11 +388,15 @@ def batch_update(table: Bitable, updates: list[dict]) -> int:
 # 真要删行前先想清楚:订单中心六表的纪律是**任何表都不删行**(主订单表是
 # 永久枢纽,行间有关联字段,删行断链),见 workflows/order_center_push.py 头注。
 def batch_delete(table: Bitable, record_ids: list[str]) -> int:
-    """输入:record_id 列表 → 输出:删除数。仅限展示类表重建;登记类表永不删人写的行。"""
+    """输入:record_id 列表 → 输出:删除数。仅限展示类表重建;登记类表永不删人写的行。
+
+    ⚠ 切块用 _BITABLE_BATCH_DELETE_MAX(官方删是 500 条/次,只有增/改的一半),
+    别照 batch_create 外推。
+    """
     t = table.require()
     n = 0
     with _table_locks[(t.app_token, t.table_id)]:
-        for i, chunk in enumerate(_chunks(record_ids, _BATCH_LIMIT)):
+        for i, chunk in enumerate(_chunks(record_ids, _BITABLE_BATCH_DELETE_MAX)):
             if i:
                 time.sleep(_WRITE_THROTTLE_SECS)
             _call("POST", _records_path(table, "/batch_delete"),
@@ -289,6 +416,10 @@ def list_fields(table: Bitable) -> list[dict]:
     out: list[dict] = []
     page_token = None
     while True:
+        # ⚠ 未进顶部「限额登记表」的唯一一处限额字面量:2026-08-27 那轮官方调研
+        # 没覆盖「列出字段」端点(refdata/feishu_limits.tsv 里没有这一行),
+        # 写不出官方原值/URL 就不硬塞进登记表冒充有出处。沿用现行 100 不动;
+        # 下一轮补到官方原句后,按登记表规矩迁进去并删掉这段注释。
         params = {"page_size": 100}
         if page_token:
             params["page_token"] = page_token
@@ -329,9 +460,8 @@ def _plain_text(v) -> str:
 def _row_hash(fields: dict, hash_field: str) -> str:
     """输入:一行载荷 → 输出:内容指纹(排除指纹列自身,键序无关)。"""
     import hashlib
-    import json as _json
-    payload = _json.dumps({k: v for k, v in fields.items() if k != hash_field},
-                          ensure_ascii=False, sort_keys=True, default=str)
+    payload = json.dumps({k: v for k, v in fields.items() if k != hash_field},
+                         ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -391,11 +521,12 @@ def _call_multipart(path: str, *, data: dict, files: dict, timeout=120) -> dict:
         if code == 0:
             return env.get("data") or {}
         msg = env.get("msg", "")
+        _check_quota(code, msg)            # 月度配额与 _call 同一条判据,不另开一套
         if code in _TOKEN_INVALID_CODES:
             _tenant_token(force_refresh=True)
             continue
         if _is_transient(code, msg) and attempt < _MAX_ATTEMPTS - 1:
-            time.sleep(_BACKOFF[attempt])
+            time.sleep(_ratelimit_wait(code, resp, attempt))
             continue
         raise FeishuError(code, msg)
     raise FeishuError(None, f"upload exhausted retries: {last_err}")
@@ -424,13 +555,24 @@ def upload_media(table: Bitable, file_name: str, content: bytes,
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  电子表格(sheets)——仅用于行数超 bitable 套餐上限的大表(如在线产品总表)
-#  切块/节流参数照抄旧系统实测:4000 行/块(20 列约 4MB,5000 行撞 90227)、块间 0.3s
+#  限额常量全在顶部「限额登记表」;这里只留**业务语义**的那一条(见下)。
+#  旧系统实测的 4000 行/块(20 列约 4MB,5000 行撞 90227)已被官方 95% 红线
+#  (_SHEET_WRITE_MAX_ROWS=4750 + _SHEET_WRITE_BYTE_BUDGET 字节预算)取代:
+#  行与字节两条预算任一先到即封批,不再靠一个凑出来的行数替字节数背锅。
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SHEET_WRITE_BLOCK_ROWS = 4000
-_SHEET_CELL_MAX_CHARS = 20000   # 飞书单元格上限 5 万,留余量(超长必是脏数据)
-_SHEET_WRITE_THROTTLE_SECS = 0.3
-_SHEET_DIMENSION_MAX = 5000     # dimension_range 增/删单次上限(90204 实证 2026-08-05)
+#: 业务层脏数据闸,**不是限额**(限额是 _SHEET_CELL_HARD_MAX_CHARS=40000)。
+#: 两层分工别混:
+#:   · 这一条(20000,超了**截断 + 告警**):采集来的标题/描述超两万字必是脏数据,
+#:     截掉照写,不因为一行脏数据把整轮写入炸掉;
+#:   · _SHEET_CELL_HARD_MAX_CHARS(40000,超了**直接抛**):通道硬闸,对着官方
+#:     自荐值定;它的岗位在**不清洗的 sheet_overwrite 路径**——那里超长本会被
+#:     飞书 90222/90227 整批拒,本地先抛是净收益。
+#: 顺序(总控裁决 2026-08-27):清洗路径 sheet_write_ranges **先截断后硬闸**——
+#: 脏数据截断+告警、轮次照走是既有能力,不许被硬闸炸掉;硬闸在该路上对字符长度
+#: 天然不触发,只剩列数闸。全文口径同 _scrub/_check_shape 两处 docstring 与
+#: docs/conventions.md §八。
+_SHEET_CELL_MAX_CHARS = 20000
 
 
 def _col_letter(n: int) -> str:
@@ -497,7 +639,7 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
             return 0
         add = need_rows - current
         remaining = add
-        while remaining > 0:      # 单次最多 5000 行(90204),分块扩
+        while remaining > 0:      # 单次上限见登记表 _SHEET_DIMENSION_MAX,分块扩
             step = min(remaining, _SHEET_DIMENSION_MAX)
             _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
                   json_body={"dimension": {"sheetId": s.sheet_id,
@@ -509,12 +651,16 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
         return add
 
 
-def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
+def _values_raw(sheet: Spreadsheet, a1_range: str) -> list[list]:
     """输入:登记条目 + A1 范围(如 'A2:G500',不带 sheet 前缀)→ 输出:值矩阵。
 
+    **私有裸调用**:一次 GET values/:range,没有任何分块与兜底。只准两个人用——
+    标准读通道 sheet_values_rows(它负责分块与 90221 对半)与薄壳
+    sheet_values_small(已知小范围)。外面直接用它 = 绕开唯一读通道。
+
     单元格统一 ToString 渲染(公式取结果,数字转文本),调用方拿到的都是 str/None。
-    ⚠ 单次读取响应体官方上限 10MB(超出返 90221 data exceeded),行列数本身
-    不设限——大范围读取用下面的 sheet_values_rows(行方向分块)。
+    ⚠ 单次读取响应体官方上限 10MB(原句「该接口返回数据的最大限制为 10 MB。」,
+    超出返 90221 data exceeded);行列数官方不设限,所以大范围只能按行分块。
     """
     s = sheet.require()
     data = _call("GET",
@@ -524,7 +670,15 @@ def sheet_values(sheet: Spreadsheet, a1_range: str) -> list[list]:
     return ((data.get("valueRange") or {}).get("values")) or []
 
 
-_SHEET_READ_BLOCK_ROWS = 5000   # 行方向分块粒度(与 maint_sheet 扫描块同量级)
+def sheet_values_small(sheet: Spreadsheet, a1_range: str) -> list[list]:
+    """输入:登记条目 + **已知小范围** A1(表头/单行/固定几行)→ 输出:值矩阵。
+
+    ⚠ **无界范围禁用**:范围随表长增长的读取(A2:U{总行数} 这类)一律走
+    sheet_values_rows —— 它按行分块 + 90221 对半兜底,是本仓唯一的大范围读通道。
+    这里是薄壳,不分块、不兜底:给 `A1:K1`、`A2:F2` 这种一眼看得出上界的场景用,
+    省掉一次没必要的分块循环。范围写成字面量,别拼变量上界。
+    """
+    return _values_raw(sheet, a1_range)
 
 
 def sheet_values_rows(sheet: Spreadsheet, first_col: str, last_col: str,
@@ -532,6 +686,10 @@ def sheet_values_rows(sheet: Spreadsheet, first_col: str, last_col: str,
                       block_rows: int = _SHEET_READ_BLOCK_ROWS
                       ) -> list[tuple[int, list]]:
     """输入:列区间 + 行区间 → 输出:[(行号, 该行值列表)](行方向分块拼接)。
+
+    **唯一标准读通道**:范围上界会随表长增长的读取一律走这里,不要自己拼
+    A2:U{总行数} 去调裸读。块粒度取登记表 _SHEET_READ_BLOCK_ROWS(4750,与写侧
+    对称;读侧官方无行数限制,10MB 响应上限靠分块 + 90221 兜底管)。
 
     2026-08-19 生产实证:上架表 21 列全量一把读,表长大后撞官方单响应
     10MB 上限(90221 data exceeded)。读取本身没有行列数限制,所以按行
@@ -545,7 +703,7 @@ def sheet_values_rows(sheet: Spreadsheet, first_col: str, last_col: str,
 
     def _read(rf: int, rt: int) -> None:
         try:
-            vals = sheet_values(sheet, f"{first_col}{rf}:{last_col}{rt}")
+            vals = _values_raw(sheet, f"{first_col}{rf}:{last_col}{rt}")
         except FeishuError as e:
             if e.code == 90221 and rt > rf:
                 mid = (rf + rt) // 2
@@ -574,6 +732,13 @@ def _scrub(v):
     采集来的标题/描述偶尔带 \\x00 一类控制字符,飞书直接返 90202
     validate RangeVal fail——报错里不会告诉你是哪个单元格。这里剔掉,
     **剔到了就记日志**(静默清洗 = 下次同样的坑没人知道)。
+
+    ⚠ 这里的 20000 是**业务脏数据闸**,不是限额;通道硬闸
+    (_SHEET_CELL_HARD_MAX_CHARS=40000)在 _check_shape 里。清洗路径
+    (sheet_write_ranges)**先截断后硬闸**(总控裁决 2026-08-27:脏数据
+    截断+告警、轮次照走是既有能力,不许被硬闸炸掉),故硬闸在该路上对
+    字符长度天然不触发,只剩列数闸;40000 硬闸的真正岗位在不清洗的
+    sheet_overwrite 路径。
     """
     s = "" if v is None else str(v)
     if len(s) > _SHEET_CELL_MAX_CHARS:
@@ -586,22 +751,92 @@ def _scrub(v):
     return s
 
 
+def _check_shape(rng: str, values: list[list]) -> None:
+    """输入:A1 范围 + 值矩阵 → 输出:无(结构超限即抛 ValueError)。
+
+    两条**分批救不了**的官方硬限,写通道入口一次性拦掉:
+      · 列数 > _SHEET_WRITE_MAX_COLS(官方 100 列 ×95%):切批只切得出行,
+        列宽是调用方给的形状,只能当成调用方的 bug 抛回去;
+      · 单元格 > _SHEET_CELL_HARD_MAX_CHARS(官方自荐 40000):超到这个量级的
+        「单元格」根本不是表格数据,截断只会把 bug 藏进飞书。
+    抛 ValueError 而不是 FeishuError:错在本仓调用方,不在飞书。
+    """
+    width = max((len(r) for r in values), default=0)
+    if width > _SHEET_WRITE_MAX_COLS:
+        raise ValueError(
+            f"写飞书范围 {rng} 有 {width} 列,超官方单次写入列上限"
+            f"(95% 红线 {_SHEET_WRITE_MAX_COLS} 列):列超限分批救不了,请裁列")
+    for i, row in enumerate(values):
+        for j, cell in enumerate(row):
+            n = len(cell) if isinstance(cell, str) else len("" if cell is None
+                                                            else str(cell))
+            if n > _SHEET_CELL_HARD_MAX_CHARS:
+                raise ValueError(
+                    f"写飞书范围 {rng} 第 {i + 1} 行第 {j + 1} 列单元格 {n} 字符,"
+                    f"超通道硬闸 {_SHEET_CELL_HARD_MAX_CHARS}(官方自荐上限):"
+                    f"这不是表格数据,上游先修")
+
+
+def _est_bytes(rng: str, values: list[list]) -> int:
+    """输入:一段 (A1范围, 值矩阵) → 输出:它进请求体的估算字节数。
+
+    按 UTF-8 实际字节算(ensure_ascii=False 后 encode),不是字符数:中文一字
+    三字节,按字符数算会低估三倍,而低估正是 90227 那一侧。估的是单段,批的
+    预算 = 各段之和 + 外层 {"valueRanges":[…]} 的壳(壳几十字节,忽略不计)。
+    """
+    return len(json.dumps({"range": rng, "values": values},
+                          ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _subrange(rng: str, offset: int, count: int) -> str | None:
+    """输入:A1 范围 + 行偏移 + 行数 → 输出:子范围(形状看不懂返 None)。"""
+    m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.strip().upper())
+    if not m or count <= 0:
+        return None
+    c1, r1, c2 = m.group(1), int(m.group(2)), m.group(3)
+    return f"{c1}{r1 + offset}:{c2}{r1 + offset + count - 1}"
+
+
 def _split_rows(rng: str, values: list[list]) -> list[tuple[str, list[list]]]:
-    """输入:A1 范围 + 值矩阵 → 输出:按 _SHEET_WRITE_BLOCK_ROWS 切开的子范围。
+    """输入:A1 范围 + 值矩阵 → 输出:行/字节两条预算都不超的子范围列表。
 
     单个范围裹着上千行会被飞书拒(90202);sheet_overwrite 早就按块切,
     这条定点回写路径此前漏了(所有者 2026-08-09 实遇:1000+ 行维护流水
     一次写,整轮 failed)。范围形如 A11:I1037,只切行不动列。
+
+    两条预算**任一先到即封段**:
+      · 行数 _SHEET_WRITE_MAX_ROWS(官方 5000 行 ×95%);
+      · 估算字节 _SHEET_WRITE_BYTE_BUDGET(工程值,官方写侧无字节上限)。
+    字节这条必须在**切段**这一步就管,不能只在批间累加时管:粘段之后一整段
+    可能就是几万行,批间累加时它是一个不可分的整体,再判也切不动了
+    (2026-08-18 audit_sheet 那次就是长文本行把单请求撑爆的)。
+    单行自身就超字节预算时它独占一段——切不动就如实发出去,不假装能救。
+    ⚠ 范围形状看不懂就原样放过(不猜),与 _coalesce 同一条纪律。
     """
     m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.strip().upper())
-    if not m or len(values) <= _SHEET_WRITE_BLOCK_ROWS:
+    if not m:
         return [(rng, values)]
-    c1, r1, c2, _r2 = m.group(1), int(m.group(2)), m.group(3), m.group(4)
-    out = []
-    for i in range(0, len(values), _SHEET_WRITE_BLOCK_ROWS):
-        block = values[i:i + _SHEET_WRITE_BLOCK_ROWS]
-        out.append((f"{c1}{r1 + i}:{c2}{r1 + i + len(block) - 1}", block))
-    return out
+    c1, r1, c2 = m.group(1), int(m.group(2)), m.group(3)
+    overhead = _est_bytes(rng, [])
+    cuts: list[tuple[int, int]] = []          # [(起, 止+1)]
+    start = n_rows = 0
+    n_bytes = overhead
+    for i, row in enumerate(values):
+        size = len(json.dumps(row, ensure_ascii=False,
+                              default=str).encode("utf-8")) + 1
+        if n_rows and (n_rows + 1 > _SHEET_WRITE_MAX_ROWS
+                       or n_bytes + size > _SHEET_WRITE_BYTE_BUDGET):
+            cuts.append((start, i))
+            start, n_rows, n_bytes = i, 0, overhead
+        n_rows += 1
+        n_bytes += size
+    cuts.append((start, len(values)))
+    if len(cuts) == 1:
+        # 一刀没切:**原样返回调用方给的 rng**。它可能声明得比数据宽
+        # (官方允许「range 所指定的范围需要大于等于写入的数据所占用的范围」),
+        # 那是调用方的形状,没切就不改——同 _coalesce 的「看不懂就不猜」。
+        return [(rng, values)]
+    return [(f"{c1}{r1 + s}:{c2}{r1 + e - 1}", values[s:e]) for s, e in cuts]
 
 
 def _coalesce(updates: list[tuple[str, list[list]]]
@@ -609,15 +844,15 @@ def _coalesce(updates: list[tuple[str, list[list]]]
     """输入:[(A1范围, 值矩阵)] → 输出:相邻同列的合成一段(**保持原序**)。
 
     定点回写的调用方几乎都是"一行一个 range"(`C{r}:G{r}`),而整表重写走的是
-    "一段 4000 行"。同一个接口,两条路径差了三个数量级:
+    "一大段"。同一个接口,两条路径差了三个数量级:
       · 一行一 range → 100 行/请求 + 0.3s 节流 ⇒ 28000 行要 280 个请求、~2 分钟
-      · 合成段     → 4000 行/range,每请求 ≤4000 行 ⇒ 同样 28000 行 8 个请求
+      · 合成段     → 一段占满行预算 ⇒ 同样 28000 行只要个位数请求
     这就是所有者 2026-08-16 问的「写飞书的速度怎么各处都不一样,有的 4000
     有的几十甚至逐行」—— 差别不在接口,在调用方给的形状。**在这里补齐**:
     调用方照旧一行一个 range,api 层负责把连号的粘起来(分批是 api 层职责)。
     ⚠ 粘完的段**不能**再 100 段合一个请求:2026-08-18 audit_sheet 回填
-    28,498 行 × C:G,8 段进同一请求被飞书 90227(request too large)整批拒。
-    每请求的行预算见 sheet_write_ranges。
+    28,498 行 × C:G,8 段(当时块大小 4000)进同一请求被飞书 90227
+    (request too large)整批拒。每请求的行/字节双预算见 sheet_write_ranges。
 
     只合并**紧邻的下一行**且列区间完全相同的:不排序、不去重、不跨空行,
     所以"同一行被写两次"的先后覆盖语义与逐行写时逐字一致。
@@ -640,18 +875,144 @@ def _coalesce(updates: list[tuple[str, list[list]]]
     return out
 
 
+_oversize_count = [0]
+
+
+def _oversize_retries(inc: int = 0) -> int:
+    """输入:增量 → 输出:90227 对半兜底的累计触发次数(进程内计数)。
+
+    §六 要件二「触发必须记日志计数」:光记日志不计数,查的时候分不清是偶发
+    一次还是每轮都在兜(兜底静默常态化 = 主路径已坏没人知道)。
+    """
+    _oversize_count[0] += inc
+    return _oversize_count[0]
+
+
+def _post_batch(s: Spreadsheet, chunk: list[tuple[str, list[list]]]) -> None:
+    """输入:登记条目 + 一批 [(A1范围, 值矩阵)] → 输出:无(发一次 values_batch_update)。
+
+    只管发,不管切也不管报错措辞:切批预算与 90227 兜底都在 _sheet_put,
+    报错补范围也在那儿(一处出口,免得两边各补一遍还补得不一样)。
+    """
+    _call("POST",
+          f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
+          json_body={"valueRanges": [
+              {"range": f"{s.sheet_id}!{rng}", "values": vals}
+              for rng, vals in chunk]})
+
+
+def _with_range(e: FeishuError, chunk: list[tuple[str, list[list]]]) -> FeishuError:
+    """输入:飞书错误 + 出错的那一批 → 输出:补上范围的同码错误。
+
+    飞书只说 validate RangeVal fail / request too large,不说是哪一块;
+    几万行回填时不带范围等于没报错。
+    """
+    return FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
+                               f"{sum(len(v) for _r, v in chunk)} 行)")
+
+
+def _halve_batch(chunk: list[tuple[str, list[list]]]
+                 ) -> tuple[list, list] | None:
+    """输入:一批 [(A1范围, 值矩阵)] → 输出:行数大致对半的两批(切不动返 None)。
+
+    按**行**对半,不是按段对半:一批可能就是一个几千行的大段,按段切等于没切。
+    段内切要重算 A1 子范围,形状看不懂(_subrange 返 None)就判切不动。
+    """
+    total = sum(len(v) for _r, v in chunk)
+    if total < 2:
+        return None
+    half = total // 2
+    first: list[tuple[str, list[list]]] = []
+    second: list[tuple[str, list[list]]] = []
+    acc = 0
+    for rng, vals in chunk:
+        if acc >= half:
+            second.append((rng, vals))
+            continue
+        room = half - acc
+        if len(vals) <= room:
+            first.append((rng, vals))
+            acc += len(vals)
+            continue
+        a, b = _subrange(rng, 0, room), _subrange(rng, room, len(vals) - room)
+        if not a or not b:
+            return None
+        first.append((a, vals[:room]))
+        second.append((b, vals[room:]))
+        acc += room
+    if not first or not second:
+        return None
+    return first, second
+
+
+def _sheet_put(s: Spreadsheet, segments: list[tuple[str, list[list]]], *,
+               total_rows: int | None = None) -> int:
+    """输入:登记条目 + 已切好行的段列表 → 输出:写入行数。**唯一写通道的底座**。
+
+    调用方须已持 _sheet_lock(s.token)——官方原句「单个文档只能串行调用」。
+
+    预算切批(所有者 2026-08-27 定稿):逐段累加,批内**总行数**满
+    _SHEET_WRITE_MAX_ROWS 或**估算字节**满 _SHEET_WRITE_BYTE_BUDGET 或段数满
+    _SHEET_RANGES_PER_REQUEST,任一先到即**封批提交**,剩余继续循环——
+    「当轮写完不留下一轮」(所有者原话):本次调用把 segments 全部写完才返回,
+    不把余量攒到下一轮。行与字节两条一起管,是因为官方只给了行列数,字节数
+    官方未说明、只有 90227 反馈;单靠行数会被长文本行整批打穿
+    (2026-08-18 audit_sheet 就是这么被拒的)。
+
+    90227 兜底(§六 三要件:同函数内 / 触发记日志计数 / 条件明确非 catch-all):
+    预算算错时对该批**对半重切一次**再发,并 logger.warning 计数;两半里再有
+    一半失败即抛。它是最后一根保险丝,不是主防线——主防线是上面的预算。
+    """
+    n = 0
+    cur: list[tuple[str, list[list]]] = []
+    cur_rows = 0
+    cur_bytes = 0
+
+    def _flush() -> None:
+        nonlocal n, cur, cur_rows, cur_bytes
+        if not cur:
+            return
+        try:
+            _post_batch(s, cur)
+        except FeishuError as e:
+            halves = _halve_batch(cur) if e.code == 90227 else None
+            if halves is None:
+                raise _with_range(e, cur) from None
+            logger.warning("写「%s」%d 行 %d 字节仍被 90227 拒(预算失算第 %d 次),"
+                           "对半重切一次再发", s.name, cur_rows, cur_bytes,
+                           _oversize_retries(1))
+            for half in halves:
+                try:
+                    _post_batch(s, half)   # 再失败即抛:兜底只兜一层
+                except FeishuError as again:
+                    raise _with_range(again, half) from None
+        n += cur_rows
+        if total_rows is not None:
+            logger.info("电子表格「%s」写入 %d/%d 行", s.name, n, total_rows)
+        cur, cur_rows, cur_bytes = [], 0, 0
+
+    for rng, vals in segments:
+        size = _est_bytes(rng, vals)
+        if cur and (len(cur) >= _SHEET_RANGES_PER_REQUEST
+                    or cur_rows + len(vals) > _SHEET_WRITE_MAX_ROWS
+                    or cur_bytes + size > _SHEET_WRITE_BYTE_BUDGET):
+            _flush()
+            time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        cur.append((rng, vals))
+        cur_rows += len(vals)
+        cur_bytes += size
+    _flush()
+    return n
+
+
 def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]) -> int:
     """输入:登记条目 + [(A1范围, 值矩阵)] → 输出:**写入的行数**。
 
-    定点回写(如逐行写 E{r}:G{r} 三列),与 sheet_overwrite 的整表重写互补。
-    三步:**连号的先粘成段**(否则一行一个请求位,几万行要跑几分钟)→
-    按行切开过大的段 → 分批 values_batch_update,批间节流。
-    每批两条上限,**先撞哪条哪条生效**:
-      · ≤100 个范围(飞书 valueRanges 数量限制);
-      · ≤ _SHEET_WRITE_BLOCK_ROWS 行(请求体大小限制:2026-08-18 audit_sheet
-        回填 28,498 行,8 个 4000 行段进同一请求被 90227 request too large
-        整批拒 —— 单请求的安全预算以整表重写路径久经生产的「一段 4000 行」
-        为准,不另立数字)。
+    **唯一写通道**:定点回写(如逐行写 E{r}:G{r} 三列)与整表重写
+    (sheet_overwrite)最后都落到这套预算切批,别的写法一律不新开。
+    四步:结构硬闸(列/单元格,分批救不了的先抛)→ **连号的先粘成段**
+    (否则一行一个请求位,几万行要跑几分钟)→ 按行切开过大的段 →
+    行/字节/段数三条预算切批提交(见 _sheet_put),批间节流 + 同表串行锁。
     逐行小段的老路径不受影响:100 个一行段合计 100 行,远在行预算之内。
 
     ⚠ 返回的是行数不是范围数。粘段之前两者恰好相等(调用方全是一行一 range),
@@ -661,68 +1022,45 @@ def sheet_write_ranges(sheet: Spreadsheet, updates: list[tuple[str, list[list]]]
     s = sheet.require()
     split: list[tuple[str, list[list]]] = []
     for rng, vals in _coalesce(updates):
-        split += _split_rows(rng, [[_scrub(c) for c in row] for row in vals])
-    batches: list[list[tuple[str, list[list]]]] = []
-    cur: list[tuple[str, list[list]]] = []
-    cur_rows = 0
-    for rng, vals in split:
-        if cur and (len(cur) >= 100
-                    or cur_rows + len(vals) > _SHEET_WRITE_BLOCK_ROWS):
-            batches.append(cur)
-            cur, cur_rows = [], 0
-        cur.append((rng, vals))
-        cur_rows += len(vals)
-    if cur:
-        batches.append(cur)
-    n = 0
+        # 顺序是刻意的:**先 _scrub 后硬闸**(总控裁决 2026-08-27)。清洗路径的
+        # 既有能力是「超长脏数据截断+告警,轮次照走」——硬闸放在截断前,一条
+        # 4 万字符的脏报错就能炸掉整轮回写(缺失既有能力,违反红线)。截断后
+        # 硬闸只剩查列数>95 的结构错误;40000 字符硬闸的真正岗位在不清洗的
+        # sheet_overwrite(那里超长会被飞书 90222/90227 整批拒,本地先抛=净收益)
+        scrubbed = [[_scrub(c) for c in row] for row in vals]
+        _check_shape(rng, scrubbed)
+        split += _split_rows(rng, scrubbed)
     with _sheet_lock(s.token):
-        for i, chunk in enumerate(batches):
-            try:
-                _call("POST",
-                      f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
-                      json_body={"valueRanges": [
-                          {"range": f"{s.sheet_id}!{rng}", "values": vals}
-                          for rng, vals in chunk]})
-            except FeishuError as e:
-                # 报错带上范围:飞书只说 validate RangeVal fail,不说哪一块
-                raise FeishuError(e.code, f"{e}(范围 {chunk[0][0]}~{chunk[-1][0]},"
-                                          f"{sum(len(v) for _r, v in chunk)} 行)") from None
-            n += sum(len(v) for _r, v in chunk)
-            if i + 1 < len(batches):
-                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
-    return n
+        return _sheet_put(s, split)
 
 
 def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     """输入:登记条目 + 全部数据行(含表头行)→ 输出:写入行数。整表重写语义。
 
-    分块 values_batch_update;写完后删除网格中多余的尾部行——
-    修掉旧系统"本次行数变少时残留旧行"的已知缺陷(plan.md #2 同款问题)。
+    走与 sheet_write_ranges 同一套预算切批(_sheet_put);写完后删除网格中多余的
+    尾部行——修掉旧系统"本次行数变少时残留旧行"的已知缺陷(plan.md #2 同款问题)。
+
+    ⚠ 这条路**不 _scrub**:KPI 看板靠写入日期序列值(数字)配 sheet_set_formatter
+    才显示成日期,scrub 会把数字变成字符串,格式化当场失效。脏数据清洗是采集侧
+    (定点回写)的职责,整表重写的行是本仓自己从库里拼的。
     """
     s = sheet.require()
     if not rows:
         return 0
     n_cols = max(len(r) for r in rows)
     last_col = _col_letter(n_cols)
+    rng = f"A1:{last_col}{len(rows)}"
+    _check_shape(rng, rows)
     # 锁把「扩行 → 整表写 → 删尾部残留」三步裹成一段:中间插进来一个别的写者,
     # 删尾部那一步会按**自己**算的 len(rows) 去删,把人家刚写的行删掉。
     with _sheet_lock(s.token):
         sheet_ensure_rows(s, len(rows))
 
-        written = 0
-        for i in range(0, len(rows), _SHEET_WRITE_BLOCK_ROWS):
-            block = rows[i:i + _SHEET_WRITE_BLOCK_ROWS]
-            rng = f"{s.sheet_id}!A{i + 1}:{last_col}{i + len(block)}"
-            _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/values_batch_update",
-                  json_body={"valueRanges": [{"range": rng, "values": block}]})
-            written += len(block)
-            logger.info("电子表格「%s」写入 %d/%d 行", s.name, written, len(rows))
-            if i + _SHEET_WRITE_BLOCK_ROWS < len(rows):
-                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        written = _sheet_put(s, _split_rows(rng, rows), total_rows=len(rows))
 
         surplus = sheet_row_count(s) - len(rows)
         trimmed = surplus
-        while surplus > 0:        # 从尾部分块删,单次 ≤5000(与扩行同限制)
+        while surplus > 0:        # 从尾部分块删,单次 ≤_SHEET_DIMENSION_MAX(与扩行同限制)
             step = min(surplus, _SHEET_DIMENSION_MAX)
             _call("DELETE", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
                   json_body={"dimension": {"sheetId": s.sheet_id, "majorDimension": "ROWS",
@@ -746,6 +1084,12 @@ def sheet_set_formatter(sheet: Spreadsheet, items: list[tuple[str, str]]) -> int
 
     设置单元格数字/日期显示格式(styles_batch_update)。日期列须配合写入
     日期序列值(1899-12-30 起算天数)才会显示为日期。
+
+    ⚠ 这条**不走值写通道的预算切批**:它发的是样式不是值,官方限额也是另一套
+    (单次 5000 行×100 列;带边框时单次单元格数还骤降到 30,000)。本仓的调用方
+    只传个位数个范围,远在任何一档之下,故不另立切批;官方原句存档见
+    refdata/feishu_limits.tsv「单次设置样式范围上限 / 设置边框样式时…」两行。
+    真要批量刷样式了再按那两行的数字 ×95% 加进登记表,别拿值写的行预算凑合。
     """
     s = sheet.require()
     if not items:

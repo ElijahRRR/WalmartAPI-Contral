@@ -70,17 +70,21 @@ logger = logging.getLogger("services.dispositions")
 
 # 动作取值。破坏组(delete/retire)与反补归 problem_product_cleanup,
 # 维护三类归 maintenance —— **按动作分工,不按来源**(理由见下面 PROBLEM_ACTIONS)。
-ACTIONS = ("relist", "delete", "retire", "title", "price", "inventory")
+# ⚠ relist(反补)2026-08-28 所有者定稿退役:「非 PUBLISHED 一律删除,不再改
+# End Date 救商品」。库里存量 relist 行不删:suggested 由扫描件 withdraw_stale
+# 自然撤掉,executing 由 settle 的 _SETTLE_RELIST_SQL 照旧落定 —— 但 claim
+# 不再领取(不在任何领取集),不会再有新的反补 feed 发出。
+ACTIONS = ("delete", "retire", "title", "price", "inventory")
 
 # ⚠ **动作优先级,全项目唯一出处**(所有者定稿 2026-08-24)。
-# 序:删除 > 停用 > 反补 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
+# 序:删除 > 停用 > 库存 > 标题 > 价格。三处依赖它:合并建议时谁压过谁、
 # claim() 的取件顺序、摘要的列序。
 # 这条规则本来就在跑,只是关在 maintenance_intents 的**一轮内存**里
-# (`_ACTION_RANK` / `collect_all` 的 `doomed` 集合)——那份只看得见本轮
+# (`_ACTION_RANK`(已删)/ `collect_all` 的 `doomed` 集合)——那份只看得见本轮
 # 自己算出来的删除,看不见另一条链挂在库里的建议,于是跨链重复删了两次
 # (所有者 2026-08-24 实证)。提升作用域到"库里所有未落定建议"就是本常量。
-ACTION_RANK = {"delete": 0, "retire": 1, "relist": 2,
-               "inventory": 3, "title": 4, "price": 5}
+ACTION_RANK = {"delete": 0, "retire": 1,
+               "inventory": 2, "title": 3, "price": 4}
 ACTION_ORDER = tuple(sorted(ACTIONS, key=lambda a: ACTION_RANK[a]))
 
 # 破坏组:不可逆。**存在即压制该 SKU 的维护组建议** —— 要删的东西没必要再花
@@ -99,7 +103,7 @@ DESTRUCTIVE_PER_STORE = 300
 # 2026-08-19 生产实见一行 —— 维护链先落 delete 建议(source='maint'),审核链
 # 后来覆写了它的 reason,那行仍归维护链执行,于是维护记录表里写着维护链的
 # 「建议」、问题链的「原因」,谁也说不清是哪条链干的。按动作领之后不可能再错位。
-PROBLEM_ACTIONS = ("delete", "retire", "relist")
+PROBLEM_ACTIONS = ("delete", "retire")   # relist 已退役(2026-08-28,见 ACTIONS 注)
 # 维护链专属动作:它们的"生效"没有对应的核验事件,由 settle_maintenance()
 # 直接比对 catalog.walmart_items 的现值判定。**同时是 maintenance 的领取集**
 MAINT_ACTIONS = ("title", "price", "inventory")
@@ -109,7 +113,6 @@ MAINT_ACTIONS = ("title", "price", "inventory")
 SOURCES = ("scan", "audit", "tro", "maint")
 PROBLEM_SOURCES = ("scan", "audit", "tro")
 MAINT_SOURCES = ("maint",)
-OPEN_STATUSES = ("suggested", "executing")
 
 # 幂等写:同 (店铺,SKU,动作) 已有未落定行 → 刷新依据与时间,不新增
 # (扫描件按调度反复跑,每轮堆一行会让建议表变成流水账)。
@@ -143,6 +146,8 @@ WHERE ops.dispositions.status = 'suggested'
 # gone 侧(delete_verified)= 生效;still 侧(delete_not_effective)= 没生效。
 # 反补(relist)的生效信号不同:商品重新 PUBLISHED —— 直接看 walmart_items
 # 现状,不看事件(反补没有对应的核验事件流)。
+# ⚠ relist 动作已退役(2026-08-28,见 ACTIONS 注):_SETTLE_RELIST_SQL 保留
+# 只为给**存量** executing 行收尾,新建议不会再产生这个动作。
 _SETTLE_DELETE_SQL = """
 UPDATE ops.dispositions d
 SET status = CASE WHEN e.event = 'delete_verified'
@@ -231,18 +236,11 @@ def suggest_many(conn, rows: list[dict]) -> int:
 # ⚠ 用**多参数 unnest + NOT EXISTS**,不要写成
 #   `(store, sku, action) <> ALL(%(keep)s::text[][])`
 # 那样是错的:左边是 record 类型,右边二维数组的元素类型是 text,PG 直接报
-# 类型不匹配。(2026-08-14 首版就这么写的,靠复查发现——当时的测试只断言 SQL
-# **文本**,跑不到类型检查,全绿也没用。)
+# 类型不匹配(2026-08-14 首版就这么写的,靠复查发现)。
 # 三个平行数组 + unnest(a,b,c) 是 PG 的标准写法,三列一一对位。
 #
-# ⚠ **同一段 SQL 因为类型问题炸过两次**(2026-08-14),两次都是测试全绿才在
-# 生产上炸的 —— 本仓的 SQL 用例只断言**文本子串**,PG 的类型推断根本跑不到。
-#   第一次:`record <> ALL(text[][])` 类型不匹配;
-#   第二次:`%(store)s IS NULL OR d.store = %(store)s` —— 参数只出现在
-#           IS NULL 与一次比较里,PG 推不出它的类型,报
-#           "could not determine data type of parameter"。**必须显式 ::text**。
-# 结论不是"以后小心点",是:**这类 SQL 的唯一验证手段是连库跑一次**。
-# 改动本段后别信 pytest 绿,去 dry-run。
+# ⚠ 每个参数必须带 `::类型` 的事故史(连炸三次)见模块头注 —— 改动本段后
+# 别信 pytest 绿,这类 SQL 的唯一验证手段是连库 dry-run 跑一次。
 # 撤销 = **只删自己那一格**,全空才 withdrawn(2026-08-24 多来源支撑之后)。
 # 旧写法按标量 source 整行撤:一行只能记一个来源,另一条链既撤不掉它、也不
 # 知道自己那条理由还成不成立 —— 合并之后照旧写就会出现"维护链不再建议了,
@@ -266,6 +264,7 @@ WHERE d.status = 'suggested'
   AND (jsonb_exists(d.sources, %(source)s::text)
        OR (d.sources = '{}'::jsonb AND d.source = %(source)s::text))
   AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
+  AND NOT (d.store = ANY(%(exclude)s::text[]))
   AND NOT EXISTS (
       SELECT 1 FROM unnest(%(stores)s::text[], %(skus)s::text[],
                            %(actions)s::text[]) AS k(store, sku, action)
@@ -277,8 +276,15 @@ RETURNING d.id, d.status
 
 
 def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
-                   store: str | None = None) -> int:
+                   store: str | None = None,
+                   exclude_stores: list[str] | None = None) -> int:
     """输入:连接 + 来源 + 本轮仍建议的 (店铺,SKU,动作) + 扫描范围 → 输出:撤销行数。
+
+    exclude_stores(2026-08-26 店级重试标准③配套):**本轮没扫**的缺席店。
+    它们的行既不在 keep 里(扫描件避让了),也**不许撤** —— 缺席 ≠ 恢复正常,
+    撤了会把待执行建议记成「商品自己恢复正常了」(错误取证),下轮又重建。
+    与 store 参数是两个正交的范围轴:store 答"这轮只扫了谁",
+    exclude_stores 答"这轮谁没被扫到"。
 
     **建议是有时效的**:今天建议删 A,明天 A 自己恢复正常了、扫描件不再建议它
     —— 但昨天那条 suggested 行还挂着,执行件照样会删。这个函数把"本轮不再
@@ -315,11 +321,14 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
                 "           AND d.source = %(source)s::text)) "
                 "  AND (%(store)s::text IS NULL "
                 "       OR d.store = %(store)s::text) "
+                "  AND NOT (d.store = ANY(%(exclude)s::text[])) "
                 "RETURNING d.status",
-                {"source": source, "store": store})
+                {"source": source, "store": store,
+                 "exclude": list(exclude_stores or [])})
             return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {
             "source": source, "why": why, "store": store,
+            "exclude": list(exclude_stores or []),
             "stores": [k[0] for k in keep],
             "skus": [k[1] for k in keep],
             "actions": [k[2] for k in keep]})
@@ -437,8 +446,9 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
     ⚠ **actions 必须传**(默认 None = 全领,只留给排查用)。传的是
     `PROBLEM_ACTIONS` / `MAINT_ACTIONS`,别在工作流里手写字符串。
     领错动作的后果是白炸一轮:维护链的 'price' 落进
-    problem_product_cleanup.group_by_store 会直接抛,反过来 'relist' 落进
-    维护执行件同理。
+    problem_product_cleanup.group_by_store 会直接抛,反过来 'delete' 落进
+    维护执行件同理。库里的存量 'relist' 行不在任何领取集里,永远领不走
+    (退役动作,见 ACTIONS 注)。
 
     ⚠ **按动作领,不按来源领**(2026-08-24 改)。旧口径按 source 领,后果见
     PROBLEM_ACTIONS 的注释:一条被两条链先后建议过的删除,归谁执行取决于
@@ -448,7 +458,7 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
     截断(cap_destructive)因此总是先保住优先级高的那些。
 
     ⚠ **破坏组压制维护组**:同一 SKU 挂着未落定的 delete/retire 时,它的
-    title/price/inventory/relist 行一条都不返回 —— 要删的东西没必要再花配额去
+    title/price/inventory 行一条都不返回 —— 要删的东西没必要再花配额去
     改(批次 E 踩过:先花配额救活、再花配额删掉)。被压制的行留在 suggested
     不撤:删除若最终没生效,它们还在,不用等扫描件重算。压制了多少条由
     count_suppressed() 报,别让它静默。
@@ -478,32 +488,90 @@ def count_suppressed(conn, actions: tuple | None = None) -> int:
         return cur.fetchone()[0]
 
 
-def cap_destructive(rows: list[dict], caps: dict, default: int
+_EXECUTED_TODAY_SQL = """
+SELECT store, count(*) FROM ops.dispositions
+WHERE action = ANY(%(destructive)s::text[])
+  AND executed_at IS NOT NULL
+  AND executed_at > now() - make_interval(hours => %(hours)s::int)
+GROUP BY store
+"""
+
+
+def destructive_executed_today(conn, hours: int = 20) -> dict[str, int]:
+    """输入:连接(+窗口小时)→ 输出:{店铺: 窗口内已放行的破坏类条数}。
+
+    「下架限制」是**按天**的语义,而 cap_destructive 只看单次运行 —— 同一天
+    第二次运行(链尾重赛缺席店、人工重跑)会把每店上限翻倍(2026-08-24 归一
+    消灭过"按来源翻倍",重赛把它换成"按轮次翻倍"带了回来)。本函数给
+    cap_destructive 提供当日已放行数,把上限做成真·按天。窗口 20h 与
+    drop_recent 同源(链一天一轮留余量)。已 executed 的行无论后来落定成
+    什么状态都占额度 —— 配额花掉了就是花掉了。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_EXECUTED_TODAY_SQL, {
+            "destructive": list(DESTRUCTIVE_ACTIONS), "hours": int(hours)})
+        return {s: int(n) for s, n in cur.fetchall()}
+
+
+def cap_destructive(rows: list[dict], caps: dict, default: int,
+                    executed_today: dict[str, int] | None = None
                     ) -> tuple[list[dict], dict]:
-    """输入:已领取的建议行 + {店铺:上限} + 缺省上限 → 输出:(截后的行, {店铺:超额})。
+    """输入:已领取的建议行 + {店铺:上限} + 缺省上限(+当日已放行数)→ 输出:(截后的行, {店铺:超额})。
 
     **单店删除上限的唯一施加点**(2026-08-24 归一)。此前两条链各自在扫描期
     按同一张限额表「下架限制」截一次 —— 应用两遍的结果是"每店最多 N 条"
     实际变成了最多 2N。现在扫描期一律不截(建议表如实反映待办),执行期截一次。
 
+    executed_today(2026-08-26,链尾重赛配套):同店**当日**已放行的破坏类
+    条数,先从上限里扣掉 —— 否则重赛/人工重跑一次,上限就翻一倍
+    (取数 destructive_executed_today,执行件领取时查一次传入)。
+
     只截破坏组:维护三类(标题/价格/库存)不烧下架配额,不该被这个上限管。
     超出的**留在 suggested 不动**,下轮继续领 —— 丢弃会让它们永远轮不到。
     """
+    used = dict(executed_today or {})
     kept, over, per_store = [], {}, {}
     for r in rows:
         if r["action"] not in DESTRUCTIVE_ACTIONS:
             kept.append(r)
             continue
         store = r["store"]
-        cap = int(caps.get(store, default))
+        cap = max(0, int(caps.get(store, default)) - int(used.get(store, 0)))
         per_store[store] = per_store.get(store, 0) + 1
         if per_store[store] > cap:
             over[store] = over.get(store, 0) + 1
             continue
         kept.append(r)
     if over:
-        logger.warning("破坏类建议超单店上限,本轮留到下轮:%s", over)
+        logger.warning("破坏类建议超单店上限(含当日已放行 %s),本轮留到下轮:%s",
+                       {k: v for k, v in used.items() if k in over} or "0",
+                       over)
     return kept, over
+
+
+def group_by_store(rows: list[dict], *, key: str, order: tuple,
+                   id_field: str) -> dict[str, dict]:
+    """输入:领取到的行 + 分桶键名/桶内动作顺序/报错用 id 列名 → 输出:{店铺: {动作: [行]}}。
+
+    纯函数,可测。两个执行件共用(2026-08-27 上移):maintenance 按
+    `kind` × MAINT_ACTIONS 分桶,problem_product_cleanup 按 `action` ×
+    (relist, retire, delete) 分桶 —— 同一个 `claim()` 出来的同一份数据的两种
+    分桶写法,各写一份迟早只改一处(算法、判据、docstring 措辞本来就一字不差)。
+
+    ⚠ **未知动作即抛,宁炸不吞**(conventions §三的安全闸,抽取时不许顺手改成
+    静默丢弃):建议表里冒出一个不认识的动作 = 路由口径已经对不上了。静默丢掉
+    它,那条建议每轮都会被领走又消失,`claim()` 的取件数与实际提交数长期对不上
+    而两边都不报错 —— 破坏动作走的正是这条路。
+    """
+    out: dict[str, dict] = {}
+    for r in rows:
+        bucket = out.setdefault(r["store"], {k: [] for k in order})
+        if r[key] in bucket:
+            bucket[r[key]].append(r)
+        else:               # 建议表里出现了不认识的动作:宁炸不吞
+            raise ValueError(f"未知 {key}={r[key]!r}"
+                             f"(建议行 id={r.get(id_field)})")
+    return out
 
 
 def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
@@ -554,8 +622,17 @@ FROM ops.dispositions d
 JOIN catalog.walmart_items w ON w.store = d.store AND w.sku = d.sku
 WHERE d.status = 'executing'
   AND d.action = ANY(%(actions)s::text[])
-  AND w.last_seen_at > d.executed_at
+  AND w.last_seen_at > d.executed_at + make_interval(hours => %(grace)s::int)
 """
+
+# 落定宽限(2026-08-26,链尾重赛引入的时间压缩):此前"提交"与"下一次重新
+# 观测"天然隔 16~24 小时,判据只需 last_seen_at > executed_at;链尾重赛把
+# 这个间隔压到十几分钟 —— 主链 14:50 刚提交的 MP_MAINTENANCE 还在沃尔玛
+# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance 落定,
+# 会把"太早看"谎报成 ineffective(销案后行卡 executing,该 SKU 白丢一天)。
+# 2 小时 > 价格 feed SLA(15 分钟)与 MP_MAINTENANCE 常规处理时长;正常
+# 隔日节奏(16~24h)完全不受影响。破坏侧本就有 48h 宽限(verify_deletions)。
+MAINT_SETTLE_GRACE_HOURS = 2
 
 _MAINT_SETTLE_SQL = """
 UPDATE ops.dispositions
@@ -591,11 +668,14 @@ def maint_effective(action: str, want, price, qty, name) -> bool:
 def settle_maintenance(conn) -> dict:
     """输入:连接 → 输出:{confirmed: n, ineffective: n}(维护三动作的落定)。
 
-    只判**已被 catalog_sync 重新观测过**的行(w.last_seen_at > d.executed_at)。
-    没重新观测的保持 executing —— 拿提交前的旧快照判,永远判成"没生效"。
+    只判**提交后过了宽限期、且已被 catalog_sync 重新观测过**的行
+    (w.last_seen_at > d.executed_at + 2h,见 MAINT_SETTLE_GRACE_HOURS)。
+    没重新观测的保持 executing —— 拿提交前的旧快照判,永远判成"没生效";
+    观测得太早同理 —— feed 还在沃尔玛队列里,判了就是把"太早看"报成"没执行"。
     """
     with conn.cursor() as cur:
-        cur.execute(_MAINT_OPEN_SQL, {"actions": list(MAINT_ACTIONS)})
+        cur.execute(_MAINT_OPEN_SQL, {"actions": list(MAINT_ACTIONS),
+                                      "grace": int(MAINT_SETTLE_GRACE_HOURS)})
         rows = cur.fetchall()
     ok, bad = [], []
     for rid, action, detail, price, qty, name in rows:

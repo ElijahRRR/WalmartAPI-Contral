@@ -222,7 +222,9 @@ def fetch_orders_bulk(stores: list[dict], *, created_start: str | None = None,
             dead.append(store["name"])
         elif isinstance(outcome, BaseException):
             logger.error("店铺 %s 订单拉取失败: %s", store["name"], outcome)
-            failed.append(f"{store['name']}({outcome})")
+            # (店名, 异常) 原样上交:归类词(store_retry.diagnose)由 workflow
+            # 层配 —— api 不准 import services(铁律 1)
+            failed.append((store["name"], outcome))
         else:
             results.append(outcome)
     return results, dead, failed

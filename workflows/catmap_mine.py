@@ -304,7 +304,10 @@ def run(params: dict) -> str:
                 cur.execute(_IN_MAP_PATH_SQL)
                 in_map = {}
                 for k, n_pt, pt in cur.fetchall():
-                    (ambiguous.add(k) if n_pt > 1 else in_map.__setitem__(k, pt))
+                    if n_pt > 1:
+                        ambiguous.add(k)
+                    else:
+                        in_map[k] = pt
                 # 别名路径视同已在映射表(catmap_align:中间层名漂移的假缺口),
                 # 否则会被当新映射挖出来、还可能与 canonical 行冲突刷屏
                 cur.execute("SELECT path, canonical_path "

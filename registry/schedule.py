@@ -108,8 +108,11 @@ JOBS = (
     # 且链的语义正好是要的 —— 同步失败就不出日报(拿旧数出报不如不出)。
     job("daily_report", ["catalog_sync", "daily_report"],
         batch=2, hour=6, minute=40, runner="gpt",
+        params=["catalog_sync:strict=1"],
         note="KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是"
-             "今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度"),
+             "今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度;"
+             "strict=1 保住本链「同步不全就不出日报」的闸(店级重试标准②"
+             "让缺席不再炸链,唯独此链宁可不出产物,2026-08-26)"),
     job("order_daily", ["perf_problems", "order_asin_normalize"],
         batch=2, hour=7, minute=30, runner="gpt",
         params=["order_asin_normalize:apply=1"],

@@ -23,9 +23,12 @@ logger = logging.getLogger("services.clear_sheet")
 POLLABLE = ("", "处理中")
 _WRITE_START = "E"
 
-# SKU 台账/轮询状态 → G 列文案(submitted/processing/unknown 均未落定)
-RESULT_TEXT = {"success": "成功", "failed": "失败", "missing": "未查到",
-               "submitted": "处理中", "processing": "处理中", "unknown": "处理中"}
+# SKU 台账/轮询状态 → G 列文案(submitted/processing/unknown 均未落定)。
+# **唯一出处在 feed_track**(2026-08-27 归一:此前四份拷贝 —— 本处 /
+# maint_sheet 两份 / match_sheet)。这里保留同名再导出,因为
+# workflows/product_clear:81 是 `RESULT_TEXT[outcome]` **直接下标**取
+# (不是 .get):少一键就是 KeyError,改名会当场炸那条链。
+RESULT_TEXT = feed_track.RESULT_TEXT
 
 
 def read_rows() -> list[dict]:
@@ -34,14 +37,18 @@ def read_rows() -> list[dict]:
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    values = feishu.sheet_values(sheet, f"A2:H{total}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(行方向分块 + 90221 对半兜底);
+    # 行号取通道返回的 rownum,不再 i+2 手算:飞书只裁**范围尾部**的空行
+    # (中段空行仍占位),所以块尾一空那块就少返几行,而下一块的行号照旧从
+    # 块首起算 —— 按返回序号手算会把后面每一块整体上移
+    pairs = feishu.sheet_values_rows(sheet, "A", "H", 2, total)
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * 8
         store, sku, action, reason, feed_id, op_date, result, error = cells[:8]
         if not (store or sku):
             continue
-        rows.append({"rownum": i + 2, "store": store, "sku": sku,
+        rows.append({"rownum": rownum, "store": store, "sku": sku,
                      "action": action, "reason": reason, "feed_id": feed_id,
                      "op_date": op_date, "result": result, "error": error})
     return rows
@@ -90,7 +97,7 @@ def sync_from_ledger() -> str | None:
         st = cache[fid].get(r["sku"])
         if st is None:
             continue        # 台账查无此 (feed, sku):不是本系统提交的,不动
-        result = RESULT_TEXT.get(st[0], "处理中")
+        result = feed_track.text_of(st[0])
         # 报错列写「码 | 人话」:数字码本身不含可修的信息
         code = feed_track.merge_error(
             st[1], descs.get(fid, {}).get(r["sku"])) if result == "失败" else ""

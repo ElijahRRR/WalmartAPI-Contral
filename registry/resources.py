@@ -93,6 +93,15 @@ def feishu_notify_to() -> str | None:
     return os.environ.get("FEISHU_NOTIFY_TO", "").strip() or None
 
 
+# 定制品判据键(所有者定稿 2026-08-28:「对于定制产品不上架,是否为定制产品
+# 可以从产品数据中拿到」)。值随采集载荷落库(products.slow / snapshots.raw),
+# 契约字段表未登记 —— rating/review_count 同款先例(allocation_plan §评分:
+# 契约没登记但采集侧确实随 raw 落库,探针实测后启用)。
+# 键名生产探针已核实(所有者实跑 2026-08-28):latest_snapshot.raw 带
+# `is_customized` 共 1,225,423 行,值形态 Yes/No(_is_custom 的小写 truthy
+# 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
+AMZ_CUSTOM_FLAG_KEY = "is_customized"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -461,7 +470,7 @@ RETIRE_SHEET = Spreadsheet(
 )
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
-# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+# product_clear 读「下架限制」,listing 链读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
 # A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
@@ -761,9 +770,6 @@ _SUPER_CATEGORY_OF = {
 # 会让 alloc_audit 去点名两个其实填得对的值,人就学会忽略那一栏了。
 _UNMAPPED_CATEGORIES = ("Safety & Emergency", "Everything Else")
 
-# 库里 26 个 `Walmart Category` 的全集(24 个有映射 + 上面两个不归)。
-WALMART_CATEGORIES = tuple(sorted(_SUPER_CATEGORY_OF)) + _UNMAPPED_CATEGORIES
-
 
 def _fold(v) -> str:
     """输入:任意填写值 → 输出:比对用的归一键(小写 + 内部空白压单空格)。
@@ -899,9 +905,6 @@ UPC_SHEET = Spreadsheet(
 
 # 维护记录(maintenance 流水账):与「在线产品总表」同一 spreadsheet 的
 # 另一工作表(所有者已建,2026-08-07;多维表格 5 万行上限装不下故用电子表格)。
-# 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
-# feed 路径 F 写真 feedid、H 由 feed_poll 反哺器回填;PUT 同步路径 F 写
-# "sync"、H 当场写 成功/失败。
 # 维护记录(流水账,只追加):A~K 十一列。
 # 2026-08-16 所有者在飞书加了「建议」「原因」两列(9 → 11),配合 maintenance
 # 拆成 scan(决策,写 建议/原因)+ 执行件(写 动作/feedid/结果/报错)。
@@ -951,6 +954,15 @@ RETIRE_LIMITS = Bitable(
         #   照搬分配那条会把没配置的店整店废掉:一件也上不了、在架的还全被清零)。
         # ⚠ 对"产品渠道没采到"三者口径一致:**不算不符**。第三种值恒高说明
         #   采集侧 is_fba 解析坏了,那是要修采集,不是要动商品。
+        # ⚠ **规划外店(谭总系)照判**(所有者定稿 2026-08-25「维护链对规划外店
+        #   不豁免」;上架链同):规划外排除的是「归属」——不给它们分货、不占
+        #   品牌与产品、不拦别人上架——**不是**"这家店能不能卖这个渠道的货",
+        #   后者是店铺自己的经营配置,填了就该生效。
+        #   由此**分配/审计两条链与上架/维护两条链在这一点上口径不同,且都对**:
+        #   `alloc_survey.claimable` 在判渠道之前就剔掉规划外店,所以这些店的
+        #   渠道不符行**永远不会**进 alloc_audit 的下架清单,而维护链照样清零、
+        #   照样走「渠道不符 N 天」下架。两份报告在这批行上对不上是预期的
+        #   (maintenance_scan 的 ⚑ 旗标就是为了让人别把它当成漏报)。
         channel_limit="配送限制",
         # 店铺准入大类目(所有者建列 2026-08-15):**只准入表里填的大类**,
         # 三列都空 = 该店不限制类目。这三列是类目档案的**唯一权威**——

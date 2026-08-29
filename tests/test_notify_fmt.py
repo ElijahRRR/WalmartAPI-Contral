@@ -74,20 +74,26 @@ _STEPS = ["a", "b", "c"]
 
 
 def _res(status_b="success"):
-    return [("a", "success", "a 完成:入库 100 行\n明细一\n明细二"),
-            ("b", status_b, "b 的摘要第一行\n第二行明细\n第三行明细"),
-            ("c", "success", "c 完成")]
+    # 文本形状 = _run_step 真实产物:首行是 cli 自造的「名 成功」横幅,
+    # 摘要从第二行起(2026-08-26 审计实见:旧夹具没带横幅,正好掩盖了
+    # 折叠取错行的 bug —— 生产里链通知只剩横幅,缺席点名整条被吃)
+    return [("a", "success", "a 成功\na:入库 100 行;⚠ 缺席 1 店:X(代理波动)\n明细一\n明细二"),
+            ("b", status_b, "b 成功\n窗口 45 天,入库 7 行\n第二行明细\n第三行明细"),
+            ("c", "success", "[EXECUTE] c 成功\n提交 feed 2 个")]
 
 
-def test_chain_folds_successful_steps_to_one_line():
-    """七步链每步铺全文 = 二十来行没层次的文字,人第三天就不看了。"""
+def test_chain_folds_successful_steps_to_summary_first_line():
+    """七步链每步铺全文 = 二十来行没层次的文字,人第三天就不看了。
+    折叠取的必须是**工作流摘要的首行**(缺席点名在那里,标准③),
+    不是 cli 的「名 成功」横幅;[EXECUTE] 标记从横幅继承。"""
     out = cli._chain_text(_STEPS, _res(), "success")
     assert out.splitlines() == [
         "✅ 链 [a → b → c]",
-        "✅ a 完成:入库 100 行",
-        "✅ b 的摘要第一行",
-        "✅ c 完成"]
+        "✅ a:入库 100 行;⚠ 缺席 1 店:X(代理波动)",   # 摘要已带名:不重复加
+        "✅ b:窗口 45 天,入库 7 行",                     # 摘要没带名:补上
+        "✅ [EXECUTE] c:提交 feed 2 个"]
     assert "明细一" not in out           # 全文在 ops.runs 与日志里,不在通知里
+    assert "a 成功" not in out           # 横幅不进链通知(它吃掉缺席点名)
 
 
 def test_chain_expands_the_failed_step_in_full():
@@ -96,7 +102,7 @@ def test_chain_expands_the_failed_step_in_full():
     assert out.startswith("❌ 链 [a → b → c]")
     assert "❌ b" in out
     assert "   第二行明细" in out and "   第三行明细" in out
-    assert "✅ a 完成:入库 100 行" in out      # 成功的仍然折叠
+    assert "✅ a:入库 100 行" in out         # 成功的仍然折叠(摘要首行)
     assert "全文见 ops.runs" in out
 
 
@@ -125,3 +131,69 @@ def test_single_run_notification_shape_is_untouched():
 def test_first_line_of_skips_leading_blanks():
     assert nf.first_line_of("\n\n  真正的第一行  \n后面") == "真正的第一行"
     assert nf.first_line_of("") == "" and nf.first_line_of(None) == ""
+
+
+# ── 收口的两段尾巴:feed 四档计数 / 缺席点名 ────────────────────────────────
+
+def test_feed_outcome_tail_prints_submitted_and_drops_zero_exceptions():
+    """规矩 2 原样落地:提交 0 也要看见,例外恰好 0 才省。"""
+    t = nf.feed_outcome_tail
+    assert t(0, 0, 0, 0, failed_word="提交被拒") == "提交 0"
+    assert t(12, 3, 0, 0, failed_word="提交被拒") == "提交 12,在途防重跳过 3"
+    assert t(12, 0, 1, 2, failed_word="提交被拒") == (
+        "提交 12,⚠ 提交被拒 1(查日志),"
+        "⚠ 结局不确定留 pending 2(待对账)")
+
+
+def test_feed_outcome_tail_keeps_each_owners_failed_word():
+    """「提交被拒」/「提交失败」是三个执行件各自的现行字样。进飞书通知的
+    字样收口时逐字保留,不由积木替所有者统一措辞。"""
+    assert "⚠ 提交被拒 1(查日志)" in nf.feed_outcome_tail(
+        0, 0, 1, 0, failed_word="提交被拒")
+    assert "⚠ 提交失败 1(查日志)" in nf.feed_outcome_tail(
+        0, 0, 1, 0, failed_word="提交失败")
+
+
+def test_feed_outcome_tail_reproduces_the_three_live_lines():
+    """与三个执行件现行成品逐字对拍(接线后摘要不许变形)。"""
+    n = {"submitted": 12, "dedup": 3, "failed": 1, "unknown": 2}
+    rest = ",在途防重跳过 3,⚠ {} 1(查日志),⚠ 结局不确定留 pending 2(待对账)"
+
+    maint = nf.feed_outcome_tail(n["submitted"], n["dedup"], n["failed"],
+                                 n["unknown"], failed_word="提交被拒")
+    assert f"  店A:标题 feed {maint}" == \
+        "  店A:标题 feed 提交 12" + rest.format("提交被拒")     # maintenance
+    assert f"  店A:跟卖{maint}" == \
+        "  店A:跟卖提交 12" + rest.format("提交被拒")           # match_listing
+
+    ppc = nf.feed_outcome_tail(n["submitted"], n["dedup"], n["failed"],
+                               n["unknown"], failed_word="提交失败")
+    assert f"  店A:删除{ppc}" == \
+        "  店A:删除提交 12" + rest.format("提交失败")   # problem_product_cleanup
+
+
+def test_absent_tail_matches_the_live_first_line():
+    """与 catalog_sync 现行首行逐字一致;一家都不缺席时整段消失。"""
+    assert nf.absent_tail([], "", tail="下游按水位避让,链尾重赛") == ""
+    assert nf.absent_tail([("A085", "代理波动"), ("81张三", "网络未达")], "",
+                          tail="下游按水位避让,链尾重赛") == (
+        ";⚠ 缺席 2 店:A085(代理波动),81张三(网络未达)"
+        "——已串行补试仍失败,本轮不炸链(下游按水位避让,链尾重赛)")
+
+
+def test_absent_tail_says_gate_held_the_batch_instead_of_retried():
+    """规模闸拦下整批时不许还说"已串行补试仍失败"——那是两种不同的处境。"""
+    got = nf.absent_tail([("A085", "代理波动")], "⚠ 补试规模闸:失败店过半",
+                         tail="下游按水位避让,链尾重赛")
+    assert "——超补试规模闸未补试(疑似系统性故障)" in got
+    assert "已串行补试仍失败" not in got
+
+
+def test_absent_tail_lets_each_chain_bring_its_own_next_step():
+    """规矩 3「每条 ⚠ 自带处置」:目录链按水位避让、订单链下轮自然重拉,
+    两句是各链自己的真实处置,不许收口时统一成一句。"""
+    a = [("A085", "代理波动")]
+    assert nf.absent_tail(a, "", tail="下轮整点自然重拉").endswith(
+        ",本轮不炸链(下轮整点自然重拉)")
+    assert nf.absent_tail(a, "", tail="下游按水位避让,链尾重赛").endswith(
+        ",本轮不炸链(下游按水位避让,链尾重赛)")

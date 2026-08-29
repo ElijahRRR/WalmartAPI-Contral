@@ -15,15 +15,12 @@
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-import httpx
 
-from api import _client
 from api import returns as returns_api
 from registry import db
-from services import order_center
+from services import order_center, store_retry
 from services import order_lines as ol
 from services import stores as stores_svc
 
@@ -60,31 +57,33 @@ def run(params: dict) -> str:
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    results, dead, failed = [], [], []
-    with ThreadPoolExecutor(max_workers=min(workers, len(store_list))) as pool:
-        futs = {pool.submit(_sync_one_store, s, created_start): s["name"]
-                for s in store_list}
-        for f in as_completed(futs):
-            name = futs[f]
-            try:
-                results.append(f.result())
-            except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                dead.append(name)
-            except Exception as e:
-                logger.exception("店铺 %s 售后同步失败: %s", name, e)
-                failed.append(f"{name}({e})")
+    # 店级重试标准①②(所有者定稿 2026-08-26):跨店并发 → 凭证死跳全店不补试
+    # → 代理故障/泛化异常先收着不判生死,跑完别人再串行补试一遍 → 仍失败按
+    # diagnose 归缺席。骨架在 services/store_retry.fan_out(补试跑的就是这里的
+    # 同一个 _sync_one_store)。
+    results, dead, absent, gate_note = store_retry.fan_out(
+        store_list, lambda s: _sync_one_store(s, created_start),
+        workers, log_label="售后同步")
 
     total = sum(r["lines"] for r in results)
     total_dropped = sum(r.get("dropped", 0) for r in results)
+    # 首行 = 结论 + 缺席点名(链通知只发成功步骤的第一行)
+    # ⚠ 这条尾巴**不走** notify_fmt.absent_tail:那个模板固定拼「,本轮不炸链
+    # (处置)」,而本件现行字样是「,该店本轮售后缺口由下轮窗口覆盖」——
+    # 售后是窗口全量重拉,缺口下轮自然补上,没有"避让/重赛"这回事。进飞书的
+    # 字样逐字保留优先于收口(2026-08-27 收口时逐字对拍,拼不出即不接线)。
     lines = [f"returns_sync:{len(results)}/{len(store_list)} 店完成"
-             f"(窗口 {days} 天),售后行入库 {total}"]
+             f"(窗口 {days} 天),售后行入库 {total}"
+             + (f";⚠ 缺席 {len(absent)} 店:"
+                + ",".join(f"{n}({c})" for n, c in absent)
+                + "——已串行补试仍失败,该店本轮售后缺口由下轮窗口覆盖"
+                if absent else "")]
     if total_dropped:
         lines[0] += f",订单不在库丢弃 {total_dropped}"
+    if gate_note:
+        lines.append(gate_note)
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
-    if failed:
-        lines.append(f"失败:{'; '.join(failed)}")
     if not results:
         # ⚠ 零店完成不许报成功(2026-08-17 补,与 catalog_sync 同款闸)。
         # 「凭证失效跳过」按设计不进 failed —— 一家店坏了不该拖垮整轮;但

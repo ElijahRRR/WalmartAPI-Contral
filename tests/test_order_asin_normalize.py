@@ -62,7 +62,8 @@ def test_resolves_the_four_sku_forms(monkeypatch):
               "102460018738",                # 纯数字 → 倒查
               "随便什么"],                    # 其他形态
         item_ids={"102460018738": "JTZW-B08M4D1GMT-38"}))
-    mapping, buckets = oan._resolve(_Conn(cur), [s for s in cur.skus])
+    mapping, buckets = oan.sku_asin.resolve_skus(_Conn(cur),
+                                                 [s for s in cur.skus])
     assert mapping == {"B0ABCDEFGH": "B0ABCDEFGH",
                        "XKJ-B0GXX75JN5-39.98": "B0GXX75JN5",
                        "102460018738": "B08M4D1GMT"}
@@ -118,7 +119,10 @@ def test_rules_are_not_reimplemented_here():
     """
     src = open(oan.__file__, encoding="utf-8").read()
     assert "re.compile" not in src and "import re" not in src
-    assert "sku_asin.extract_asin" in src and "sku_asin.classify" in src
+    # 连倒查那一跳(item_id → 订货号)与形态样本也在 services(2026-08-27 收编):
+    # 本工作流只剩 _DISTINCT_SQL / _FILL_SQL 这两条"打哪张表"的真差异
+    assert "sku_asin.resolve_skus" in src and "sku_asin.samples" in src
+    assert "_ITEMID_SQL" not in src        # 倒查那一跳的 SQL 也不许再有第二份
 
 
 def test_normalize_agrees_with_the_event_ledger_cleaner():
@@ -131,10 +135,13 @@ def test_normalize_agrees_with_the_event_ledger_cleaner():
     skus = ["B0ABCDEFGH", "XKJ-B0GXX75JN5-39.98", "A109-B08QF9XLMH-02",
             "102460018738", "随便什么"]
     ids = {"102460018738": "JTZW-B08M4D1GMT-38"}
-    mine, _ = oan._resolve(_Conn(_Cur(skus, ids)), skus)
-    theirs, _ = sn._resolve(_Conn(_Cur(skus, ids)), skus)
+    mine, _ = oan.sku_asin.resolve_skus(_Conn(_Cur(skus, ids)), skus)
+    theirs, _ = sn.sku_asin.resolve_skus(_Conn(_Cur(skus, ids)), skus)
     assert mine == theirs
     assert mine["A109-B08QF9XLMH-02"] == "B08QF9XLMH"   # 曾被过严规则冤枉的那 208 个
+    # 两个工作流走的是**同一个函数对象**(2026-08-27 起连倒查那一跳也在
+    # services):这才是"不会飘"的根据,各写一份再比对只能比中当天那一次
+    assert oan.sku_asin.resolve_skus is sn.sku_asin.resolve_skus
     # 两个工作流都只经由 sku_asin,没有各自的规则副本
     assert "re.compile" not in open(sn.__file__, encoding="utf-8").read()
 

@@ -78,6 +78,18 @@ def test_diff_catalog_transitions():
                                  "reasons": "价格问题"}
 
 
+def test_delete_verify_grace_is_46h():
+    # 所有者定稿 2026-08-29(48h → 46h):观测一天一轮(13:00 开链)而回执
+    # 落账必然晚于开链,48h 会让「未生效」判决结构性滑到第 3 轮(等效 ~72h);
+    # 46h 给次次日观测留 ~2h 漂移余量,回执当天 ~15:00-15:30 前落账的第 2 轮
+    # 即判。改这个数 = 改「后台处理上界」假设,先过所有者再同步这里。
+    assert pe.DELETE_VERIFY_GRACE_HOURS == 46
+    conn = _Conn()
+    pe.verify_deletions(conn)
+    _sql, args = conn.sqls[0]
+    assert args == (46,)            # 缺省值真的接线到 SQL 参数,不是死在签名里
+
+
 def test_verify_deletions_verdicts(caplog):
     import logging as _logging
     conn = _Conn(fetch=[("T1", "S_GONE", "gone"),

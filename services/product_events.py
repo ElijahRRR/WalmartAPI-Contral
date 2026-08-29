@@ -231,8 +231,25 @@ LEFT JOIN catalog.walmart_items w ON w.store = o.store AND w.sku = o.sku
 """
 
 
-def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
-    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数)。
+# 删除核验宽限:回执(delete_feed_success 落账)后**至少**等这么久,仍被扫到
+# 在架才判 delete_not_effective。48h → 46h(所有者定稿 2026-08-29)。
+# 为什么降:观测一天一轮(product_chain 13:00 开链),判据是
+# last_seen_at > 回执 + 宽限,而回执落账必然晚于开链(cleanup 在链尾
+# ~14:30-15:00 提交,feed_poll 每 30 分收终态)——48h 下第 2 天 13:0x 的观测
+# 永远差十几分钟到一两小时,「未生效」判决**结构性**滑到第 3 轮(等效 ~72h,
+# 顽固双击加压白等一天)。46h 给次次日观测留 ~2h 链内漂移余量:回执当天
+# ~15:00-15:30 前落账的(DELETE_ITEM 常规几分钟出终态,是大多数),第 2 轮
+# 观测即可判;更晚落账的照旧滑到第 3 轮,不比原来差。
+# 取舍方向:这是对「沃尔玛后台最长 48h」假设(api_blueprint 的 catalog 更新
+# 至多 48h 同源)收窄 2h,换加压提早一天;误判的上限 = 一次「未生效」告警 +
+# 一轮 retire/delete 双 feed。再动这个数先过所有者,并同步钉它的用例。
+DELETE_VERIFY_GRACE_HOURS = 46
+
+
+def verify_deletions(conn,
+                     grace_hours: int = DELETE_VERIFY_GRACE_HOURS
+                     ) -> tuple[int, int]:
+    """输入:连接 + 宽限小时数(缺省 DELETE_VERIFY_GRACE_HOURS)→ 输出:(核验生效数, 未生效数)。
 
     删除核验(不信回执,信观测):delete_feed_success 之后,
     - 商品从目录消失/标缺席/RETIRED → delete_verified;

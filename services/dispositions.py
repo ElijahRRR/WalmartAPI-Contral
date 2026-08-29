@@ -20,8 +20,9 @@
 
 ⚠ **生效判定不在本模块实现**。settle() 读的是 catalog.product_events 里
 catalog_sync 经 services/product_events.verify_deletions 落的
-delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 48h
-宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
+delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 46h
+宽限期(2026-08-29 由 48h 下调,理由见 product_events.DELETE_VERIFY_GRACE_HOURS)、
+RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
 真相。本模块只做"把已有判决登记到建议行上"。
 
 ⚠ **两条链共用一张表,交界处五条纪律**(2026-08-16 定,2026-08-24 大修)。
@@ -631,7 +632,7 @@ WHERE d.status = 'executing'
 # 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance 落定,
 # 会把"太早看"谎报成 ineffective(销案后行卡 executing,该 SKU 白丢一天)。
 # 2 小时 > 价格 feed SLA(15 分钟)与 MP_MAINTENANCE 常规处理时长;正常
-# 隔日节奏(16~24h)完全不受影响。破坏侧本就有 48h 宽限(verify_deletions)。
+# 隔日节奏(16~24h)完全不受影响。破坏侧本就有 46h 宽限(verify_deletions)。
 MAINT_SETTLE_GRACE_HOURS = 2
 
 _MAINT_SETTLE_SQL = """

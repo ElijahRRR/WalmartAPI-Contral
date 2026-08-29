@@ -249,9 +249,11 @@ def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
 
     此前两条扫描件各按同一张限额表截一次 ⇒ 每店实际可删 2N。截断静默的话,
     摘要读起来就是"今天就这么多",而其实还压着一批。
+    (2026-08-28 起限额暂停,这里打回 False 测机械还在——同 cap 用例。)
     """
     rows = [_row("T1", f"S{i}", action="delete", rid=i) for i in range(5)]
     seen = _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "RETIRE_CAP_PAUSED", False)
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 2})
     sent = []
     monkeypatch.setattr(ppc.feeds, "submit_feed",
@@ -268,9 +270,12 @@ def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
 
 def test_cap_caps_destructive_and_reports_leftover(monkeypatch):
     """单店「下架限制」封顶破坏类(delete/retire),超额留到下轮且必须报出来
-    (静默截断读起来就是"全做完了")。"""
+    (静默截断读起来就是"全做完了")。
+    ⚠ 2026-08-28 起限额**暂停**(RETIRE_CAP_PAUSED=True),这里显式打回
+    False 测的是**机械还在**:停用不等于拆除,恢复只需改常量。"""
     rows = [_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
     _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "RETIRE_CAP_PAUSED", False)
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 1})
     sent = []
     monkeypatch.setattr(ppc.feeds, "submit_feed",
@@ -281,6 +286,37 @@ def test_cap_caps_destructive_and_reports_leftover(monkeypatch):
     out = ppc.run({"execute": True})
     assert ("DELETE_ITEM", 1) in sent and len(sent) == 1
     assert "T1×2" in out
+
+
+def test_cap_pause_lets_everything_through_and_shouts(monkeypatch):
+    """限额暂停(所有者定稿 2026-08-28「暂时关闭这个限制」,08-28 档案清理波):
+
+    ① 钉住现状:开关就是 True(恢复时改回 False 并同步改这条——先例
+       title_mismatch 停闸,常量停闸、用例钉状态);
+    ② 不截断:限额表值再小也全量出闸,限额表与按日记账**根本不读**
+       (监-桩在这两处埋了雷,读了就炸);
+    ③ 摘要**首行**点名停用中——静默的闸没人记得它关着。
+    缺席避让 fail-closed 与在途防重不归这个开关管,各有用例。"""
+    assert ppc.RETIRE_CAP_PAUSED is True
+    rows = [_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
+    _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "_retire_caps",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("停闸期间不该读限额表")))
+    monkeypatch.setattr(ppc.dispositions, "destructive_executed_today",
+                        lambda conn, hours=20: (_ for _ in ()).throw(
+                            AssertionError("停闸期间不该按日记账")))
+    sent = []
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": (
+                            sent.append((ft, len(entries))),
+                            [{"feed_id": "F1", "count": len(entries),
+                              "outcome": "submitted"}])[1])
+    out = ppc.run({"execute": True})
+    assert ("DELETE_ITEM", 3) in sent          # 3 条全出闸,没有截断
+    assert "留到下轮" not in out
+    first = out.splitlines()[0]
+    assert "「下架限制」停用中" in first and "RETIRE_CAP_PAUSED" in first
 
 
 # ── 维护记录表(2026-08-24:删除归口到本工作流之后必须接上)──────────────

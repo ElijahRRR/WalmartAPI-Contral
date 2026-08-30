@@ -356,7 +356,10 @@ def _fetch(sql: str, args: tuple) -> list[dict]:
 
 
 def push_sales(days: int, reconcile: bool = False) -> tuple[str, set[str]]:
-    """返回 (结果行, 本窗口键集合)——键集合供主订单表/采购信息补齐。"""
+    """输入:窗口天数 + 是否全量对账 → 输出:(结果行, 本窗口键集合)。
+
+    键集合供主订单表/采购信息补齐。
+    """
     t = resources.ORDER_SALES
     f = t.fields
     desired = {}
@@ -475,8 +478,9 @@ def push_settlement(days: int, reconcile: bool = False) -> str:
 
 
 def push_keys(sales_keys: set[str], reconcile: bool = False) -> list[str]:
-    """主订单表/采购信息:补齐销售窗口内缺失的 order_line_id 行(只写键列)。
+    """输入:销售窗口键集合 + 是否全量对账 → 输出:结果行 list(每表一行)。
 
+    主订单表/采购信息:补齐销售窗口内缺失的 order_line_id 行(只写键列)。
     同样走本地状态:缺键按状态判断,不逐轮拉表;首轮/自愈时全量重建映射。
     """
     lines = []

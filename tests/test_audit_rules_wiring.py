@@ -20,7 +20,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
-                phase0_cats=frozenset(), brand_blacklist={},
+                brand_blacklist={},
                 pt_meta={}, ac_automaton=None, nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
@@ -1177,7 +1177,7 @@ def test_worker_cap_warns_instead_of_silently_clamping(caplog):
     用 workers=32 测吞吐,实际跑 16 而输出只字未提)。"""
     import logging
     import inspect
-    src = inspect.getsource(product_audit.run)
+    src = inspect.getsource(product_audit._parse_opts)   # 参数解析的家
     assert "_MAX_WORKERS" in src and "超上限,实际用" in src
     assert product_audit._MAX_WORKERS >= 32     # I/O 密集,远超核数是正常的
 
@@ -1243,16 +1243,16 @@ def test_seller_missing_denominator_is_the_judged_面_not_the_conclusion_count()
     那一小撮,而卖家缺失数的是全部候选行。这一列量的是"卖家闸对多大面积
     失效",那是候选面的属性,不是结论面的。"""
     import inspect
-    src = inspect.getsource(product_audit.run)
-    assert '卖家字段缺失 {seller_missing}/{todo_n}' in src
-    assert '卖家字段缺失 {seller_missing}/{judged}' not in src
+    src = inspect.getsource(product_audit._summary)      # 摘要拼装的家
+    assert '卖家字段缺失 {counts.seller_missing}/{counts.todo_n}' in src
+    assert '卖家字段缺失 {counts.seller_missing}/{judged}' not in src
 
 
 def test_retry_summary_only_calls_429_ratelimit():
     """只有 http_429 才叫撞限流(生产实测:19 次 other 被说成"已撞限流",
     把所有者引向降并发 —— 而网络抖动降并发毫无用处)。"""
     import inspect
-    src = inspect.getsource(product_audit.run)
+    src = inspect.getsource(product_audit._summary)      # 摘要拼装的家
     assert 'retries.get("http_429")' in src
     assert "降并发解决不了" in src
 
@@ -1306,7 +1306,8 @@ def test_audit_defaults_are_128_and_batched():
 
     from workflows import product_audit as pa
     assert pa._DEFAULT_WORKERS == 128 and pa._MAX_WORKERS >= 128
-    assert 'params.get("workers", _DEFAULT_WORKERS)' in inspect.getsource(pa.run)
+    assert 'params.get("workers", _DEFAULT_WORKERS)' in \
+        inspect.getsource(pa._parse_opts)
 
     src = inspect.getsource(pa.run)
     # 批量落库 + 失败退回逐行(已付费的 LLM 结果不能因为同批一行脏就陪葬)
@@ -1374,8 +1375,10 @@ def test_the_clamp_note_reaches_the_summary():
     """只写日志的话表现是"并发调了没效果" —— 摘要里必须有。"""
     import inspect
     src = inspect.getsource(product_audit.run)
-    assert "workers, conn_note = _cap_by_connections(workers)" in src
-    assert "lines.append(conn_note)" in src
+    assert "opts.workers, opts.conn_note = _cap_by_connections(opts.workers)" \
+        in src
+    assert "lines.append(opts.conn_note)" in \
+        inspect.getsource(product_audit._summary)
     # 钳制必须在建连接池**之前**发生(钳完才建,不然先炸了)
     assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")
 

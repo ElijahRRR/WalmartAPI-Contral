@@ -92,7 +92,10 @@ def run(params: dict) -> str:
     for sid, title in sheets:
         page = replace(book, sheet_id=sid)
         n_rows = feishu.sheet_row_count(page)
-        grid = feishu.sheet_values(page, f"A1:{_MAX_COL}{max(n_rows, 2)}")
+        # 表头行(第 1 行)一起读;上界随表长增长 ⇒ 走唯一标准读通道
+        # (分块 + 90221 对半)。按位置认表头、按表头映射取值,不认行号
+        grid = [row for _rownum, row in feishu.sheet_values_rows(
+            page, "A", _MAX_COL, 1, max(n_rows, 2))]
         if not grid:
             continue
         header, data_rows = grid[0], grid[1:]

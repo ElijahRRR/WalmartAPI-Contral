@@ -242,8 +242,9 @@ def _err_brief(e: BaseException) -> str:
 
     —— 整条消息里最没用的那一行。原因是取"最后一行"只对**单行**异常成立
     (那时最后一行正好是 `类型: 消息`);而本项目的失败摘要恰恰是多行的:
-    catalog_sync 明写着「有店失败 → 整体判失败,飞书通知会带明细」,那份明细
-    (几店完成/入库多少行/哪家店为什么失败)全长在前面几行,被这一刀切光了。
+    **当时的** catalog_sync 是「有店失败 → 整体判失败,通知带明细」(该语义
+    已于 2026-08-26 被店级重试标准替换成"缺席不炸整轮";多行失败摘要如今
+    出自零店闸/strict 闸),那份明细全长在前面几行,被这一刀切光了。
     httpx 的错误自身又是两行、第二行是 MDN 链接,于是越是需要细节的失败,
     通知越是只剩一句废话。
 
@@ -294,6 +295,11 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
     """
     from services import runlock
 
+    # 本地副本:此前就地改 per_step 的 dict(设 execute、pop lock_wait),
+    # 链尾重赛复制到的是被消费过的版本 —— lock_wait 静默丢失,配了等锁的
+    # 步骤在重赛里撞锁即退(2026-08-26 对抗校验)。原 dict 谁都不动。
+    params = dict(params)
+
     dangerous = bool(getattr(module, "DANGEROUS", False))
     # 缺省即真跑(所有者定稿 2026-08-16):调度里漏写 --execute 会让整条链每天
     # 空转而且报成功,比误跑更难发现。空跑改为显式 --dry-run。
@@ -331,6 +337,22 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
                 logger.error("workflow %s 失败:\n%s", name, err)
                 _record_finish(run_id, "failed", err[-2000:])
                 return "failed", f"{mode}{name} 失败\n{_err_brief(e)}"
+            # ★ **硬拒不是成功**。全仓十几处「前提不成立就别跑」的早退都是
+            # 普通的 `return "⛔ …"`而不抛异常 —— 那是对的，它不是崩溃，
+            # 不该打印 traceback。但原来 cli 原样记 status='success' 并发 ✅，
+            # 后果是 **ops.runs 对这几条工作流失去判别力**：
+            #   实测 2026-08-16 日志：`workflow alloc_plan 成功: ⛔ 限额表读不到…`
+            #   紧跟 `✅ [DRY-RUN] alloc_plan 成功` —— 飞书告警里「什么都没干」
+            #   和「分配了 2.8 万条」长得一模一样。
+            # 且串联模式说好了「前一个失败就不跑后面」，而拒跑计成成功
+            # 会让整条链带着“前提没满足”一路跑到底。
+            # 约定：摘要以 ⛔ 开头 = 前提不成立、**什么都没做**。
+            if summary.lstrip().startswith(REFUSED_MARK):
+                logger.error("workflow %s 硬拒:\n%s", name, summary,
+                             extra={"file_only": True})
+                print(summary)
+                _record_finish(run_id, "refused", summary)
+                return "refused", f"{mode}{name} 未执行(前提不成立)\n{summary}"
             # 摘要在终端上只出现一次(下面那句 print);全文进日志文件备查
             logger.info("workflow %s 成功:\n%s", name, summary,
                         extra={"file_only": True})
@@ -339,8 +361,32 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
             return "success", f"{mode}{name} 成功\n{summary}"
 
 
-_ICON = {"success": "✅", "failed": "❌", "locked": "⚠"}
-_EXIT = {"success": 0, "failed": 1, "locked": 3}
+#: 摘要以它开头 = 工作流自己判定「前提不成立,什么都没做」。
+#: 工作流写 `return "⛔ …"` 就行,不必招异常。
+REFUSED_MARK = "⛔"
+
+
+def _fold_success(name: str, text: str) -> str:
+    """输入:步骤名 + _run_step 成功文本(首行是「名 成功」横幅)→ 输出:折叠用一行。
+
+    链通知与链尾重赛把成功步骤压成一行时,必须跳过横幅取**工作流摘要的
+    首行** —— 缺席点名等关键信息按标准③写在摘要首行、指望这行被链通知
+    带出去;折横幅等于把它整条吃掉(2026-08-26 审计实见:飞书里只剩
+    「catalog_sync 成功」,⚠ 缺席一个字没出去)。摘要首行没带步骤名的
+    补上;[EXECUTE] 危险标记从横幅继承,不丢。
+    """
+    from services import notify_fmt as nf
+    parts = str(text).split("\n", 1)
+    first = nf.first_line_of(parts[1]) if len(parts) > 1 else ""
+    if not first:                       # 无摘要正文(不该发生)退回横幅
+        return nf.first_line_of(text)
+    prefix = "[EXECUTE] " if parts[0].startswith("[EXECUTE]") else ""
+    return prefix + (first if first.startswith(name) else f"{name}:{first}")
+
+_ICON = {"success": "✅", "failed": "❌", "refused": "⛔", "locked": "⚠"}
+#: 硬拒与失败同一个退出码:两者对调用方的意义一致 —— **活没干成**,
+#: `&&` 串起来的后续步骤都不该再跑。区分在 ops.runs.status 与通知图标上。
+_EXIT = {"success": 0, "failed": 1, "refused": 1, "locked": 3}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -362,6 +408,8 @@ def main(argv: list[str] | None = None) -> int:
 
     import os
     operator = os.environ.get("WALMART_OPERATOR", "manual")
+    from datetime import datetime, timezone
+    chain_started = datetime.now(timezone.utc)   # 链尾重赛的缺席判据锚点
 
     results: list[tuple[str, str, str]] = []        # (名, status, 文案)
     for i, name in enumerate(steps):
@@ -384,8 +432,124 @@ def main(argv: list[str] | None = None) -> int:
     # 串联:整链一条通知。三步链每小时发三条会把群刷废,而且看不出这几条
     # 属于同一次运行
     worst = next((s for _, s, _ in results if s != "success"), "success")
-    _notify(_chain_text(steps, results, worst))
+    text = _chain_text(steps, results, worst)
+    # 链尾缺席店重赛(店级重试标准④,所有者定稿 2026-08-26):主链全部成功
+    # 且链里含 catalog_sync(缺席判据锚定目录水位)时才有意义;主链没跑完
+    # 就重赛是拿半成品数据干活,不做。
+    if worst == "success" and "catalog_sync" in steps:
+        replay = _replay_absent(steps, modules, per_step, args.dry_run,
+                                operator, logs_dir, chain_started)
+        if replay:
+            text += "\n" + "\n".join(replay)
+    _notify(text)
     return _EXIT.get(worst, 1)
+
+
+#: 链尾重赛的规模闸:今日缺席超过这个数 = 系统性故障(代理商区域挂了/
+#: 网络出口出事),逐店重赛只会把工作量按店数放大、把破坏步骤拖进无人时段
+#: —— 止损点名,让人去修根因(2026-08-26 对抗校验定稿)。
+REPLAY_MAX_STORES = 5
+
+
+def _replay_absent(steps, modules, per_step, dry_run, operator, logs_dir,
+                   since) -> list[str]:
+    """输入:主链步骤与参数 + 本轮起点 → 输出:重赛结果行(无缺席店返回 [])。
+
+    店级重试标准④(所有者定稿 2026-08-26):主链跑完后,按目录水位
+    (services/store_absence,与调度顺序无关)找出本轮缺席的店,对每家把
+    链内**声明 SUPPORTS_STORE 的步骤**带 store=X 逐店重跑一次;某步失败即
+    终止该店的重赛(上游语义与主链一致),**再失败即止,不循环** ——
+    README 的「失败不要自动重跑」禁的是盲目整链重跑,这里是设计内的、
+    逐店限定、单次的重赛。全局步骤(sources_backfill/product_refresh/
+    product_audit)主链已全量跑过、不因单店缺席而陈旧,跳过。
+    防重不在这一层:各工作流自己的闸(feed_log 在途 / claim 只取 suggested /
+    dedupe 20h / cap_destructive 按日记账)照常起作用,重赛不绕任何入口。
+    每步照常拿 flock、写 ops.runs、进各自日志 —— 与主链同一段 _run_step。
+
+    四道闸(2026-08-26 对抗校验加,一道都不能少):
+      · **单店链不重赛**:主链任何一步带了 store= 范围参数,水位判据看的
+        却是全船 —— 会把"没被本次范围覆盖"误判成"缺席",对全船跑破坏步骤;
+      · **长期缺席不重赛**(split_stale):凭证死三天的店天天重赛=天天 ❌;
+      · **规模闸**:今日缺席 > REPLAY_MAX_STORES 判系统性故障,点名不重赛;
+      · **水位复核**:步骤全绿不等于救回,重赛后水位仍没跨过链起点的照实说。
+    """
+    from registry import db
+    from services import store_absence
+    if any("store" in (per_step.get(n) or {}) for n in steps):
+        return ["—— 缺席店重赛跳过:主链带了 store= 范围参数"
+                "(水位判据是全船的,单店链重赛会误伤其余店铺)——"]
+    try:
+        with db.pg_conn() as conn:
+            recent, chronic = store_absence.split_stale(conn, since=since)
+    except Exception as e:
+        logger.warning("缺席店探测失败,跳过链尾重赛: %s", e)
+        return [f"—— 缺席店重赛跳过:探测失败({e.__class__.__name__}),"
+                f"见 cli 日志 ——"]
+    lines: list[str] = []
+    if chronic:
+        lines.append(f"⚠ 长期缺席 {len(chronic)} 店(落后船队 >"
+                     f"{store_absence.CHRONIC_LAG_HOURS}h,不逐日重赛):"
+                     f"{','.join(chronic)} —— 修凭证/代理,或去凭证表取消「启用」")
+    if not recent:
+        return lines
+    if len(recent) > REPLAY_MAX_STORES:
+        lines.append(f"⚠ 今日缺席 {len(recent)} 店 > 规模闸 {REPLAY_MAX_STORES}"
+                     f",疑似系统性故障(代理商/网络出口),不逐店重赛:"
+                     f"{','.join(recent)} —— 修好根因后手动重跑整链")
+        return lines
+    replayable = [n for n in steps
+                  if getattr(modules[n], "SUPPORTS_STORE", False)]
+    skipped = [n for n in steps if n not in replayable]
+    lines.append(f"—— 缺席店重赛:{len(recent)} 店,逐店一次、再失败即止"
+                 f"(全局步骤跳过:{','.join(skipped) or '无'})——")
+    per_store_lines: dict[str, list[str]] = {}
+    failed_at: dict[str, tuple] = {}
+    for store in recent:
+        got: list[str] = []
+        for name in replayable:
+            params = dict(per_step[name])
+            params["store"] = store
+            status, text = _run_step(name, modules[name], params, dry_run,
+                                     operator, logs_dir)
+            if status != "success":
+                # 失败铺开全文(_chain_text 同款纪律):人要能从通知里直接
+                # 看出该修凭证表还是找代理商,而不是去翻 ops.runs
+                failed_at[store] = (name, status, text)
+                break
+            # 成功步骤压一行:重赛跑的是 DANGEROUS 步骤,发了多少 feed
+            # 不能只剩一个 ✅(「✅ 救回」读起来像补了个同步)
+            got.append(f"   · {_fold_success(name, text)}")
+        per_store_lines[store] = got
+    # 水位复核:步骤退出码全绿 ≠ 数据真回来了(例:该店返回 0 商品,
+    # upsert 一行不写、水位不前进)—— 按事实说话,不发假 ✅。
+    # 复核本身失败同理:探不到 ≠ 都救回了,按「未核实」报,不静默降级
+    recheck_failed = ""
+    try:
+        with db.pg_conn() as conn:
+            still = set(store_absence.stale_stores(conn, since=since))
+    except Exception as e:
+        logger.warning("链尾重赛水位复核失败:%s: %s", e.__class__.__name__, e)
+        still = set()
+        recheck_failed = e.__class__.__name__
+    for store in recent:
+        if store in failed_at:
+            name, status, text = failed_at[store]
+            body = "\n".join(f"   {ln}" for ln in str(text).splitlines()
+                             if ln.strip())
+            lines.append(f"❌ {store}:仍缺席 —— 重赛卡在 {name}({status});"
+                         f"今天到此为止,明天整链自然再试\n{body}")
+        elif store in still:
+            lines.append(f"⚠ {store}:重赛步骤全成但目录水位未推进"
+                         f"(在线 0 商品店?),仍按缺席处理")
+            lines.extend(per_store_lines[store])
+        elif recheck_failed:
+            lines.append(f"⚠ {store}:重赛步骤全成,但水位复核失败"
+                         f"({recheck_failed}),救回与否未核实 —— 明天整链自然复核")
+            lines.extend(per_store_lines[store])
+        else:
+            lines.append(f"✅ {store}:救回")
+            lines.extend(per_store_lines[store])
+    return lines
 
 
 def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:
@@ -402,13 +566,12 @@ def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:
 
     单跑的通知形态**逐字不动**(上面那个分支)—— 人和告警规则都认那个格式。
     """
-    from services import notify_fmt as nf
     icon = "✅" if worst == "success" else _ICON.get(worst, "❌")
     lines = [f"{icon} 链 [{' → '.join(steps)}]"]
     for name, status, text in results:
         mark = _ICON.get(status, "⏭")
         if status == "success":
-            lines.append(f"{mark} {nf.first_line_of(text)}")
+            lines.append(f"{mark} {_fold_success(name, text)}")
         else:
             # 失败/跳过:整段铺开(缩进两格,与折叠行区分开)
             body = "\n".join(f"   {ln}" for ln in str(text).splitlines()

@@ -26,7 +26,7 @@ import httpx
 from api import _client, reports
 from registry import db
 from services import order_center
-from services import order_lines, stores as stores_svc
+from services import order_lines, store_retry, stores as stores_svc
 
 DANGEROUS = False
 
@@ -83,11 +83,15 @@ def _sync(store_list: list[dict], periods_limit: int) -> str:
                 total_lines += written
                 total_no_sku += no_sku
             except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                failed.append(f"{name}(凭证)")
+                # 分诊词跟 store_retry.diagnose 同口径(2026-08-26):凭证死
+                # 与代理故障的处置完全不同(修凭证表 vs 找代理商),
+                # get_token 收口后 SOCKS 报错到这里是 StoreProxyError(代理)
+                cls = store_retry.diagnose(e)
+                logger.error("店铺 %s %s失效跳过: %s", name, cls, e)
+                failed.append(f"{name}({cls})")
             except Exception as e:
                 logger.exception("店铺 %s 对账明细失败: %s", name, e)
-                failed.append(name)
+                failed.append(f"{name}({store_retry.diagnose(e)})")
     line = (f"对账明细:{len(store_list) - len(failed)}/{len(store_list)} 店,"
             f"新账期 {total_periods} 个,入库 {total_lines} 行")
     if total_no_sku:

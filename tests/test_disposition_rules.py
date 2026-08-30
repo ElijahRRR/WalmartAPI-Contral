@@ -3,7 +3,7 @@
 import pytest
 
 from services import maintenance_intents as mi
-from services.maintenance_intents import TITLE_SIM_FLOOR, classify, pick_one
+from services.maintenance_intents import TITLE_SIM_FLOOR, classify
 
 
 @pytest.fixture
@@ -65,14 +65,6 @@ def test_delete_beats_everything(delete_on):
                     title_similarity=0.9, over_lead=True)[0] == "delete"
     # 标题不匹配也压过清零
     assert classify(title_similarity=0.3, stock_state="out_of_stock")[0] == "delete"
-
-
-def test_pick_one_ranks_delete_inventory_title():
-    assert pick_one([("title", "t", ""), ("delete", "d", ""),
-                     ("inventory", "i", "")])[0] == "delete"
-    assert pick_one([("title", "t", ""), ("inventory", "i", "")])[0] == "inventory"
-    assert pick_one([]) == (None, "", "")
-    assert pick_one([(None, "", ""), (None, "", "")]) == (None, "", "")
 
 
 def test_nothing_wrong_means_no_action():

@@ -21,7 +21,7 @@
 | 层 | 现状 | 位置 |
 |---|---|---|
 | 数据 | `walmart_items` 主键 `(store, sku)`,库存单列 `avail_qty`(**全节点合计**) | refdata/schema.sql:142,150 |
-| API 写侧 | `put_inventory` 无 node;inventory feed 载荷 `{sku, qty}` 无 node | api/inventory.py:94-97;api/feeds.py:120-127 |
+| API 写侧 | `put_inventory` 无 node;inventory feed 载荷 `{sku, qty}` 无 node | api/inventory.py:94-97;api/feeds.py:135-142 |
 | 上架载荷 | `inventory` 数组恒单元素,`fulfillmentCenterID` 恒 = partnerId | services/mp_mapper.py:684-685;api/settings.py:30-31 |
 
 读侧反而已消费多节点响应:`api/inventory.py:22-35` `_qty()` 对 `nodes[]` 求和
@@ -44,7 +44,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 
 ⚠ **数量字段名三套并存**,序列化器不能共用:读 `availToSellQty`,REST 写
 `inputQty`,feed 写 `quantity`;全部 `{unit, amount}` 对象(与 MPItem 里
-`inventory[].quantity` 必须是**裸 int** 又相反,mp_mapper.py:657-659)。
+`inventory[].quantity` 必须是**裸 int** 又相反,mp_mapper.py:656,685)。
 
 ### 2.2 feed 通道
 
@@ -145,9 +145,9 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 里该 shipNode 的 avail_qty;未配置店 → walmart_items.avail_qty(现状)`。
 
 1. 三个 provider 的比对基准换成受管仓现值:`inventory_intents`
-   (maintenance_intents.py:579)、`zero_intents`(:55-58)、
-   `match_inventory_intents`(:439)。
-2. 意图契约与 `_DETAIL_KEYS`(:799-800)加 `ship_node` 键(未配置店不带,
+   (maintenance_intents.py:660)、`zero_intents`(:538)、
+   `match_inventory_intents`(:569)。
+2. 意图契约与 `_DETAIL_KEYS`(:1003-1004)加 `ship_node` 键(未配置店不带,
    建议行与现状逐字节一致)。
 3. 写通道两条(配置店;`SYNC_THRESHOLDS` 分流语义与现状一致):
    - 小批量:`put_inventory(store, sku, qty, ship_node=None)`——带 node 走
@@ -158,10 +158,12 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
      恒单元素 = 受管仓;数量字段名 `quantity`)。切片按官方 1MB 上限保守配
      (字节封顶 + 条数封顶),令牌桶按 50/hour 进 `_client.py`;防重/回执
      走 ops.feed_log/feed_items 既有机械,feed_poll 零改动。
-     ⚠ 现有 `build_payload` 对 MP_INVENTORY 是显式 `raise`(登记不实现),
-     `tests/test_feeds.py:106-107` 钉着这个行为——批次 2 一并翻案。
+     ⚠ MP_INVENTORY 现在**哪儿都没登记**:`build_payload` 落到末尾的 catch-all
+     `raise`(api/feeds.py:143),`FEED_SPEC_VERSIONS` 没有版本串、`_SLICE_LIMITS`
+     没有切片、`_RATE_BUCKETS` 没有桶。两处测试钉着现状:`tests/test_feeds.py:106-107`
+     (raise)与 :367-371(桶未登记必抛 KeyError)——批次 2 四处一并补齐并翻案。
    未配置店两条路径原样不动(legacy PUT + inventory feed v1.4)。
-4. `settle_maintenance`(dispositions.py:552,585)对带 `ship_node` 的建议行
+4. `settle_maintenance`(dispositions.py:644;判据 `maint_effective`:625)对带 `ship_node` 的建议行
    按 `item_node_inventory` 判生效;未配置店按 `avail_qty`(现状)。
 5. stockzero:配置店清**受管仓**(运营语义=停售自发货;其它节点本就不归
    自动链管)。

@@ -30,15 +30,15 @@
 **只写占用,不碰沃尔玛。** 上架由 list_new 按自己的节奏执行。
 """
 
-import csv
 import logging
 import math
 from collections import Counter
 
-from registry import db, paths, resources
+from registry import db, resources
 from services import alloc_engine as ae
 from services import alloc_groups, alloc_survey as sv
 from services import claims, product_pool, product_score as ps
+from services import report_csv
 from services import store_perf, store_targets, stores as stores_svc
 from services import textfmt
 
@@ -88,16 +88,10 @@ def _pending_delist(conn, cfg, registered) -> dict:
     (两份清单同源于 `alloc_survey` 的共享谓词,去重后按店计数)。
     ⚠ 预支**只影响配额**,不放宽容量硬闸 —— 硬闸走 `room_now`。
     """
-    from services import sku_asin
-    with conn.cursor() as cur:
-        cur.execute(sv._SQL_PT2CAT)
-        pt2cat = {pt: c for pt, c in cur.fetchall() if c}
-        cur.execute(sv._SQL_ONLINE)
-        items = cur.fetchall()
-        asins = sorted({a for a in (sku_asin.extract_asin(it[1])
-                                    for it in items) if a})
-        meta = sv._fetch_meta(cur, asins, True)
-    rows, _ = sv.enrich(items, meta, pt2cat)
+    # 只要装载口的公共骨架(PT→大类 + 在线行 + meta),`need` 一项都不点名:
+    # 本件不看 pool/signal/status/sales,更不要 order_stores。
+    # 必须带渠道:`offends_channel` 判不了的话预支只剩类目那一半,且不报错
+    rows = sv.load_rows(conn, with_channel=True).rows
     slot = sv.claimable(rows, registered)
     out: Counter = Counter()
     for r in slot:
@@ -284,7 +278,7 @@ def run(params: dict) -> str:
     if same_rnd:
         grouped.append(("片内组队·同轮续发(品牌被切口切在两片)", len(same_rnd),
                         sum(x["size"] for x in same_rnd)))
-    # 画像在**剪之前**算:定向流会按件剪掉少数派(`_fit_to_store`),
+    # 画像在**剪之前**算:定向流会按件剪掉少数派(`ae._fit_to_store`),
     # 剪完再量等于量自己的处置结果,那个数永远好看
     brand_lines, brand_rows = _brand_profile(free, directed)
 
@@ -329,59 +323,8 @@ def run(params: dict) -> str:
         L.append(f"  ⚠ product_risk 读不到({data['risk_err']}):黑历史罚分全为 0")
     L += brand_lines
 
-    # ★ **真正的入场线是"最后发出去的那张牌的分",不是候选切口**。
-    #   实测 2026-08-16:切口 42,705 组(组分 43.0),但配额在第 6,517 张牌上
-    #   就填满了 —— 只报切口会让人以为 43 分的货都进来了,差着十几分。
-    #   所有者按"每层 23,000 个、要选两万多"推算时,用的就是那个错前提。
-    dealt = sorted((a["group"]["score"] for a in result["assign"]))
-    L += ["", f"▍发牌结果:{len(result['assign']):,} 组 / {placed_items:,} 个货位"
-          + (f";**实际入场线:组分 {dealt[0]:.1f}**(最后发出的那张牌),"
-             f"平均每组 {placed_items / len(dealt):.1f} 件" if dealt else "")]
-    dir_by_store: Counter = Counter()
-    for a in result["assign"]:
-        if a["group"].get("store"):
-            dir_by_store[a["store"]] += int(a["group"]["size"])
-    rows_tbl = []
-    for s in sorted(stores, key=lambda x: -result["by_store"].get(x, {}).get("items", 0)):
-        b, a = result["by_store"].get(s, {}), acc.get(s, {})
-        got = b.get("items", 0)
-        rows_tbl.append([s, f"{stores[s]['room']:,}", f"{stores[s]['quota']:,}",
-                         f"{got:,}", f"{dir_by_store[s]:,}",
-                         f"{stores[s]['room'] - got:,}",
-                         ("—" if a.get("top_ratio") is None
-                          else f"{a['top_ratio']:.2f}"),
-                         basis[s],
-                         "⚠ 独吞" if a.get("over_cap") else
-                         ("⚠ 顶层越界" if a.get("top_ratio") is not None
-                          and not 0.7 <= a["top_ratio"] <= 1.3 else "")])
-    L += textfmt.table(["店铺", "剩余容量", "本轮配额", "分到", "其中定向",
-                        "分完还剩", "顶层比值", "配额依据", ""],
-                       rows_tbl, align="<>>>>>><<")
-    L.append("  顶层比值 = 「这家店拿到的**自由流**货里顶层占多大比例」÷"
-             "「全体的同一比例」—— 1.0 = 质量构成与平均一致,1.5 = 好货比例是"
-             "平均的一倍半。**要落 [0.7, 1.3]**(§7.4b)")
-    L.append(f"  ⚠ 分母是**它自己拿到的自由流总量**,不是配额:定向流只有占用店"
-             f"能要、跳过排队,拿配额当分母会让被定向流填满的店比值趋近 0 而被"
-             f"误标越界。自由流不足 {ae.MIN_FREE_FOR_RATIO} 件、"
-             f"或不足自己配额 {ae.MIN_FREE_SHARE_OF_QUOTA:.0%} 的店不出比值(—):"
-             f"量太小时比值是数学假象(全落在 L1 就恒等于 1÷base),不是信号。"
-             f"总量独吞看「分到」与「本轮配额」两列")
-    # ⚠ 「顶层越界」只说了**有问题**,没说问题在哪。实测 2026-08-16:两家店
-    # 比值 0.00(自由流各 3,868 / 2,139 件,远超小样本门槛),而报告里查不出
-    # 它们的货究竟来自哪几层 —— 只能手工翻方案表的「层」列。越界的店直接把
-    # 自由流层分布摊开:**全堆在末尾几层 = 这家店过不了前面几层的闸**
-    # (类目/渠道/货期太窄,前面的牌它一张都要不了),不是运气。
-    bad = [s for s in stores
-           if acc.get(s, {}).get("top_ratio") is not None
-           and not 0.7 <= acc[s]["top_ratio"] <= 1.3]
-    if bad:
-        L.append("  越界店的自由流层分布(层号×件数,层号越小分越高;"
-                 "末位那层是发完所有层之后的兜底扫尾):")
-        for s in sorted(bad, key=lambda x: acc[x]["top_ratio"]):
-            hist = result["by_store"].get(s, {}).get("by_layer_free") or {}
-            L.append(f"    {s}(比值 {acc[s]['top_ratio']:.2f}):"
-                     + (" ".join(f"L{li}×{n:,}" for li, n
-                                 in sorted(hist.items())) or "无自由流"))
+    L += _report_deal(result, acc, stores, basis)
+    L += _report_ratio_gap(acc, result, stores)
     over = [s for s in stores if result["by_store"].get(s, {}).get("items", 0)
             > stores[s]["quota"]]
     if over:
@@ -391,31 +334,7 @@ def run(params: dict) -> str:
         L.append(f"  ({len(over)} 家分到的货位多于配额:组是原子的,配额在挑人**之前**判,"
                  f"最后一张牌可以顶过头;真正不许越的是剩余容量)")
 
-    if result["unplaced"]:
-        why = Counter(u["reason"] for u in result["unplaced"])
-        # ⚠ **组数与件数一起报**(所有者 2026-08-22 追问「只有 26,785 个货位
-        #   为什么取了 50,457 件」)。只报组数的话,这一行跟上面的「取货」
-        #   「实发」不同单位,账对不上,人只能自己去减
-        why_n = Counter()
-        for u in result["unplaced"]:
-            why_n[u["reason"]] += int(u["group"]["size"])
-        L.append(f"  未发出 {len(result['unplaced']):,} 组 / "
-                 f"{sum(why_n.values()):,} 件:"
-                 + " · ".join(f"{ae.REASON_LABEL[k]} {why_n[k]:,} 件"
-                              for k, _ in why.most_common()))
-        L += _unplaced_breakdown(result["unplaced"])
-    # ★ 「我那个高分品怎么没分出去」必须答得上来(所有者 2026-08-16 追问)。
-    # 分数最高的品也可能只是**排在切口之外** —— 它既不在方案表也不在未入选表,
-    # 哪儿都查不到。把切口位置显式报出来:低于这条线的就是"排队中",不是被闸挡了
-    if below_cut:
-        L.append(f"  候选 {len(live):,} 件,本轮取了 {taken:,} 件;"
-                 + (f"切口在产品分 {below_cut[0]['score']:.1f} —— "
-                    f"⚠ **这不是入场线**,配额早在那之前就填满了"
-                    f"(入场线见上一节);低于切口的 {len(below_cut):,} 件是"
-                    f"**排队中**(连片都没进,不是被闸挡了 —— 两者处置不同)"
-                    if taken else
-                    f"**本轮可分为 0,{len(below_cut):,} 件一件都没发** —— "
-                    f"所有店的剩余容量或缺口都是 0,先下架腾位"))
+    L += _report_unplaced(result, live, taken, below_cut)
     # ★ **「搭车上架」现在结构上不可能发生了**(2026-08-22 重排)。
     # 旧版的毛病:切口切在组这一层、组分取组内最高 ⇒ 一个 95 分的爆款能把
     # 同品牌四十个 41 分的货一起拉进牌堆,那些货位挤掉的是排队里更好的组。
@@ -427,43 +346,7 @@ def run(params: dict) -> str:
         L.append(f"  定向流按件筛掉 {dir_trim:,} 件(品牌的类目跨度或货期超出占用店的准入);"
                  f"**同组里占用店收得了的那些件照常发** —— 不因为组里多数派是别的"
                  f"大类就整组扔掉")
-    if dir_out:
-        L.append(f"  定向流淘汰 {len(dir_out):,} 组 / "
-                 f"{sum(x['size'] for x, _ in dir_out):,} 件"
-                 f"(品牌已被占,但**去不了**占用店):"
-                 + " · ".join(f"{k} {v}" for k, v in
-                              Counter(w for _, w in dir_out).most_common())
-                 + " —— 除「容量已满」外,这批要你去改配置或释放品牌,"
-                   "不是等下一批就能好;**满店那部分反过来**:配置一个字都不用改,"
-                   "下架腾出容量下一轮自然进来")
-        # 光给总数没法动手。按「店 × 缺的大类」摊开,所有者一眼看出
-        # "给 A085 开厨房能救回多少件" —— 那是他真能做的决定
-        # ⚠ 归因必须按**真实原因**分。三个闸的处置完全不同(开个大类 /
-        # 放宽货期 / 换渠道),混在一起报会把所有者送去改根本没用的那一项
-        blocked: Counter = Counter()
-        slow: Counter = Counter()
-        full: Counter = Counter()
-        for grp, w in dir_out:
-            if w == "占用店类目不符":
-                blocked[(grp["store"], grp["category"] or "(未归类)")] += grp["size"]
-            elif w == "占用店货期不符":
-                slow[grp["store"]] += grp["size"]
-            elif w == "占用店容量已满":
-                full[grp["store"]] += grp["size"]
-        if full:
-            L.append("  其中**容量已满**挡下的,按店:"
-                     + " · ".join(f"{s} {n:,} 件" for s, n in full.most_common(6))
-                     + " —— 这些店的剩余容量是 0,**开类目/放宽货期都救不回**,"
-                       "只能先下架腾位(它们的类目配置对不对,等有容量了再看)")
-        if blocked:
-            L.append("  其中**类目**挡下的,按「店 × 缺的大类」:"
-                     + " · ".join(f"{s} 缺「{c}」{n:,} 件"
-                                  for (s, c), n in blocked.most_common(6))
-                     + f"(共 {len(blocked)} 组合)—— 给该店开这个大类就能救回")
-        if slow:
-            L.append("  其中**货期**挡下的,按店:"
-                     + " · ".join(f"{s} {n:,} 件" for s, n in slow.most_common(6))
-                     + " —— 放宽该店「配送时长限制」或换货源才救得回,开类目没用")
+    L += _report_dir_out(dir_out)
     if bound:
         L.append(f"  其中 {len(bound):,} 个 ASIN 是**上一轮定了、还没上架**的,"
                  f"本轮照常参与(只能回占用店)—— 占位不等于上架,方案表始终是"
@@ -481,7 +364,6 @@ def run(params: dict) -> str:
         return "\n".join(L)
 
     if export:
-        paths.reports_dir().mkdir(parents=True, exist_ok=True)
         # ⚠ **要动手的**和**诊断用的**分两张表。合成一张的实测后果:批量 3,000
         # 却出了 48,816 行,其中 45,815 行是排队与淘汰 —— 那张表没法用,而所有者
         # 第一眼看到的就是那个总行数。摘要里两个数都报,不存在"藏起来"的问题
@@ -610,6 +492,165 @@ def _in_reach(cands: list, reach: dict) -> tuple[list, list]:
         else:
             kept.append(c)
     return kept, bad.most_common()
+
+
+def _report_deal(result: dict, acc: dict, stores: dict, basis: dict) -> list[str]:
+    """输入:发牌结果 + 验收指标 + 参与分配的店 + 配额依据 → 输出:▍发牌结果一节。"""
+    # ⚠ 与 run 里的 `placed_items` **同源同式**(`result["by_store"]` 各店 items
+    #   之和)。本节标题里的「个货位」与上面「实发 N 个货位」必须是同一个数,
+    #   两处不一致等于报告自己跟自己对不上 —— 改一处必须改两处
+    placed_items = sum(v["items"] for v in result["by_store"].values())
+    # ★ **真正的入场线是"最后发出去的那张牌的分",不是候选切口**。
+    #   实测 2026-08-16:切口 42,705 组(组分 43.0),但配额在第 6,517 张牌上
+    #   就填满了 —— 只报切口会让人以为 43 分的货都进来了,差着十几分。
+    #   所有者按"每层 23,000 个、要选两万多"推算时,用的就是那个错前提。
+    dealt = sorted((a["group"]["score"] for a in result["assign"]))
+    L = ["", f"▍发牌结果:{len(result['assign']):,} 组 / {placed_items:,} 个货位"
+         + (f";**实际入场线:组分 {dealt[0]:.1f}**(最后发出的那张牌),"
+            f"平均每组 {placed_items / len(dealt):.1f} 件" if dealt else "")]
+    dir_by_store: Counter = Counter()
+    for a in result["assign"]:
+        if a["group"].get("store"):
+            dir_by_store[a["store"]] += int(a["group"]["size"])
+    rows_tbl = []
+    for s in sorted(stores, key=lambda x: -result["by_store"].get(x, {}).get("items", 0)):
+        b, a = result["by_store"].get(s, {}), acc.get(s, {})
+        got = b.get("items", 0)
+        rows_tbl.append([s, f"{stores[s]['room']:,}", f"{stores[s]['quota']:,}",
+                         f"{got:,}", f"{dir_by_store[s]:,}",
+                         f"{stores[s]['room'] - got:,}",
+                         ("—" if a.get("top_ratio") is None
+                          else f"{a['top_ratio']:.2f}"),
+                         basis[s],
+                         "⚠ 独吞" if a.get("over_cap") else
+                         ("⚠ 顶层越界" if a.get("top_ratio") is not None
+                          and not 0.7 <= a["top_ratio"] <= 1.3 else "")])
+    L += textfmt.table(["店铺", "剩余容量", "本轮配额", "分到", "其中定向",
+                        "分完还剩", "顶层比值", "配额依据", ""],
+                       rows_tbl, align="<>>>>>><<")
+    L.append("  顶层比值 = 「这家店拿到的**自由流**货里顶层占多大比例」÷"
+             "「全体的同一比例」—— 1.0 = 质量构成与平均一致,1.5 = 好货比例是"
+             "平均的一倍半。**要落 [0.7, 1.3]**(§7.4b)")
+    L.append(f"  ⚠ 分母是**它自己拿到的自由流总量**,不是配额:定向流只有占用店"
+             f"能要、跳过排队,拿配额当分母会让被定向流填满的店比值趋近 0 而被"
+             f"误标越界。自由流不足 {ae.MIN_FREE_FOR_RATIO} 件、"
+             f"或不足自己配额 {ae.MIN_FREE_SHARE_OF_QUOTA:.0%} 的店不出比值(—):"
+             f"量太小时比值是数学假象(全落在 L1 就恒等于 1÷base),不是信号。"
+             f"总量独吞看「分到」与「本轮配额」两列")
+    return L
+
+
+def _report_ratio_gap(acc: dict, result: dict, stores: dict) -> list[str]:
+    """输入:验收指标 + 发牌结果 + 参与分配的店 → 输出:比值为空/越界的归因行。"""
+    L: list[str] = []
+    # ★ **全表 15 个「—」有两种完全不同的成因,不说破就分不出来**
+    #   (2026-08-16 生产实测:定向流 25,420 / 自由流 3,078 那一跑,15 家全是「—」):
+    #     ① 每家的自由流量都没过门槛 —— 那确实是"样本太小,别当信号";
+    #     ② **顶层(L1)一件自由流都没有** ⇒ 全体占比 base = 0 ⇒ 除法没有分母,
+    #        所有店一律 None。这时门槛过没过根本不影响结果。
+    #   ② 不是"看不出问题",而是**反堆积这一轮压根没被验证过** —— 牌堆顶部被
+    #   定向流吃光了。照 ① 去读会以为"量小而已,没事",那是读反了。
+    tot_top = sum(v.get("top_items", 0) for v in acc.values())
+    tot_own = sum(v.get("own_items", 0) for v in acc.values())
+    if tot_own and not tot_top:
+        L.append(f"  ⚠ **本轮全表无比值,原因是顶层一件自由流都没有**(自由流共 "
+                 f"{tot_own:,} 件,全落在 L1 以下)——不是样本太小。牌堆顶部被"
+                 f"定向流占满了,**反堆积这一轮没有被验证过**:好货有没有堆到"
+                 f"一家店,这份报告答不了。要它重新有效,得先把已占位的货上架"
+                 f"(占用消化掉,定向流才会退回去)")
+    # ⚠ 「顶层越界」只说了**有问题**,没说问题在哪。实测 2026-08-16:两家店
+    # 比值 0.00(自由流各 3,868 / 2,139 件,远超小样本门槛),而报告里查不出
+    # 它们的货究竟来自哪几层 —— 只能手工翻方案表的「层」列。越界的店直接把
+    # 自由流层分布摊开:**全堆在末尾几层 = 这家店过不了前面几层的闸**
+    # (类目/渠道/货期太窄,前面的牌它一张都要不了),不是运气。
+    bad = [s for s in stores
+           if acc.get(s, {}).get("top_ratio") is not None
+           and not 0.7 <= acc[s]["top_ratio"] <= 1.3]
+    if bad:
+        L.append("  越界店的自由流层分布(层号×件数,层号越小分越高;"
+                 "末位那层是发完所有层之后的兜底扫尾):")
+        for s in sorted(bad, key=lambda x: acc[x]["top_ratio"]):
+            hist = result["by_store"].get(s, {}).get("by_layer_free") or {}
+            L.append(f"    {s}(比值 {acc[s]['top_ratio']:.2f}):"
+                     + (" ".join(f"L{li}×{n:,}" for li, n
+                                 in sorted(hist.items())) or "无自由流"))
+    return L
+
+
+def _report_unplaced(result: dict, live: list, taken: int,
+                     below_cut: list) -> list[str]:
+    """输入:发牌结果 + 候选 + 本轮取货量 + 切口外的产品 → 输出:未发出与切口说明。"""
+    L: list[str] = []
+    if result["unplaced"]:
+        why = Counter(u["reason"] for u in result["unplaced"])
+        # ⚠ **组数与件数一起报**(所有者 2026-08-22 追问「只有 26,785 个货位
+        #   为什么取了 50,457 件」)。只报组数的话,这一行跟上面的「取货」
+        #   「实发」不同单位,账对不上,人只能自己去减
+        why_n = Counter()
+        for u in result["unplaced"]:
+            why_n[u["reason"]] += int(u["group"]["size"])
+        L.append(f"  未发出 {len(result['unplaced']):,} 组 / "
+                 f"{sum(why_n.values()):,} 件:"
+                 + " · ".join(f"{ae.REASON_LABEL[k]} {why_n[k]:,} 件"
+                              for k, _ in why.most_common()))
+        L += _unplaced_breakdown(result["unplaced"])
+    # ★ 「我那个高分品怎么没分出去」必须答得上来(所有者 2026-08-16 追问)。
+    # 分数最高的品也可能只是**排在切口之外** —— 它既不在方案表也不在未入选表,
+    # 哪儿都查不到。把切口位置显式报出来:低于这条线的就是"排队中",不是被闸挡了
+    if below_cut:
+        L.append(f"  候选 {len(live):,} 件,本轮取了 {taken:,} 件;"
+                 + (f"切口在产品分 {below_cut[0]['score']:.1f} —— "
+                    f"⚠ **这不是入场线**,配额早在那之前就填满了"
+                    f"(入场线见上一节);低于切口的 {len(below_cut):,} 件是"
+                    f"**排队中**(连片都没进,不是被闸挡了 —— 两者处置不同)"
+                    if taken else
+                    f"**本轮可分为 0,{len(below_cut):,} 件一件都没发** —— "
+                    f"所有店的剩余容量或缺口都是 0,先下架腾位"))
+    return L
+
+
+def _report_dir_out(dir_out: list) -> list[str]:
+    """输入:定向流淘汰的 (组, 原因) → 输出:总述 + 按真实拦路闸摊开的三段。"""
+    if not dir_out:
+        return []
+    L: list[str] = []
+    L.append(f"  定向流淘汰 {len(dir_out):,} 组 / "
+             f"{sum(x['size'] for x, _ in dir_out):,} 件"
+             f"(品牌已被占,但**去不了**占用店):"
+             + " · ".join(f"{k} {v}" for k, v in
+                          Counter(w for _, w in dir_out).most_common())
+             + " —— 除「容量已满」外,这批要你去改配置或释放品牌,"
+               "不是等下一批就能好;**满店那部分反过来**:配置一个字都不用改,"
+               "下架腾出容量下一轮自然进来")
+    # 光给总数没法动手。按「店 × 缺的大类」摊开,所有者一眼看出
+    # "给 A085 开厨房能救回多少件" —— 那是他真能做的决定
+    # ⚠ 归因必须按**真实原因**分。三个闸的处置完全不同(开个大类 /
+    # 放宽货期 / 换渠道),混在一起报会把所有者送去改根本没用的那一项
+    blocked: Counter = Counter()
+    slow: Counter = Counter()
+    full: Counter = Counter()
+    for grp, w in dir_out:
+        if w == "占用店类目不符":
+            blocked[(grp["store"], grp["category"] or "(未归类)")] += grp["size"]
+        elif w == "占用店货期不符":
+            slow[grp["store"]] += grp["size"]
+        elif w == "占用店容量已满":
+            full[grp["store"]] += grp["size"]
+    if full:
+        L.append("  其中**容量已满**挡下的,按店:"
+                 + " · ".join(f"{s} {n:,} 件" for s, n in full.most_common(6))
+                 + " —— 这些店的剩余容量是 0,**开类目/放宽货期都救不回**,"
+                   "只能先下架腾位(它们的类目配置对不对,等有容量了再看)")
+    if blocked:
+        L.append("  其中**类目**挡下的,按「店 × 缺的大类」:"
+                 + " · ".join(f"{s} 缺「{c}」{n:,} 件"
+                              for (s, c), n in blocked.most_common(6))
+                 + f"(共 {len(blocked)} 组合)—— 给该店开这个大类就能救回")
+    if slow:
+        L.append("  其中**货期**挡下的,按店:"
+                 + " · ".join(f"{s} {n:,} 件" for s, n in slow.most_common(6))
+                 + " —— 放宽该店「配送时长限制」或换货源才救得回,开类目没用")
+    return L
 
 
 def _unplaced_breakdown(unplaced: list) -> list[str]:
@@ -807,12 +848,7 @@ _BRAND_HEADER = ["流别", "去向店", "品牌", "组件数", "组分",
 def _write_brands(rows) -> tuple[str, int]:
     """输入:品牌组画像行 → 输出:(路径, 行数)。**只写有少数派的组** ——
     没有少数派的组在这张表上没有任何要处置的东西,写进来只会淹掉要看的那些。"""
-    p = paths.reports_dir() / "alloc_品牌组.csv"
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(_BRAND_HEADER)
-        w.writerows(rows)
-    return str(p), len(rows)
+    return report_csv.write("alloc_品牌组.csv", _BRAND_HEADER, rows), len(rows)
 
 
 # ⚠ 四列类目并排是有意的(所有者 2026-08-22:"我看不清晰")。组大类是**多数派**,
@@ -828,15 +864,11 @@ _HEADER = ["流别", "去向店", "层", "品牌组", "组分", "组件数",
 
 def _write_plan(assign) -> tuple[str, int]:
     """输入:发牌结果 → 输出:(路径, 产品行数)。**只放要上架的。**"""
-    p = paths.reports_dir() / "alloc_分配方案.csv"
-    n = 0
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(_HEADER)
-        for a in sorted(assign, key=lambda x: (x["layer"], -x["group"]["score"])):
-            flow = "定向流" if a["group"].get("store") else "自由流"
-            n += _rows(w, flow, a["store"], a["layer"], a["group"])
-    return str(p), n
+    rows: list = []
+    for a in sorted(assign, key=lambda x: (x["layer"], -x["group"]["score"])):
+        flow = "定向流" if a["group"].get("store") else "自由流"
+        rows += _rows(flow, a["store"], a["layer"], a["group"])
+    return report_csv.write("alloc_分配方案.csv", _HEADER, rows), len(rows)
 
 
 def _write_rejects(unplaced, dir_out, queued=()) -> tuple[str, int]:
@@ -851,38 +883,34 @@ def _write_rejects(unplaced, dir_out, queued=()) -> tuple[str, int]:
     也就没有"组"可言。不写的话,"我那个高分品怎么没分出去"在两张表里都查不到
     —— 那才是真的藏。全写又会把这张表撑到十万行,所以取头部并说明截断。
     """
-    p = paths.reports_dir() / "alloc_未入选.csv"
-    n = 0
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(_HEADER)
-        for grp, why in dir_out:
-            n += _rows(w, f"定向流淘汰({why})", grp["store"], "", grp)
-        for u in unplaced:
-            n += _rows(w, f"未发出({ae.REASON_LABEL[u['reason']]})", "", "",
-                       u["group"])
-        # ★ 排队的现在是**产品**不是组(2026-08-22 重排:切口在产品层)。
-        #   包成一件一组再走同一个写行函数 —— 表头只有一套,别为它另开一张表
-        for c in queued:
-            n += _rows(w, "排队(产品分排在本轮切口之外)", "", "",
-                       {"key": "(未组队)", "score": c["score"], "size": 1,
-                        "category": c.get("category"),
-                        "channel": c.get("channel"), "items": [c]})
-    return str(p), n
+    rows: list = []
+    for grp, why in dir_out:
+        rows += _rows(f"定向流淘汰({why})", grp["store"], "", grp)
+    for u in unplaced:
+        rows += _rows(f"未发出({ae.REASON_LABEL[u['reason']]})", "", "",
+                      u["group"])
+    # ★ 排队的现在是**产品**不是组(2026-08-22 重排:切口在产品层)。
+    #   包成一件一组再走同一个写行函数 —— 表头只有一套,别为它另开一张表
+    for c in queued:
+        rows += _rows("排队(产品分排在本轮切口之外)", "", "",
+                      {"key": "(未组队)", "score": c["score"], "size": 1,
+                       "category": c.get("category"),
+                       "channel": c.get("channel"), "items": [c]})
+    return report_csv.write("alloc_未入选.csv", _HEADER, rows), len(rows)
 
 
-def _rows(w, flow, store, layer, grp) -> int:
-    for it in grp["items"]:
-        w.writerow([flow, store, layer, grp["key"], round(grp["score"], 1),
-                    grp["size"], grp["category"],
-                    resources.super_label(grp["category"]), grp["channel"],
-                    it["asin"], it.get("category") or "",
-                    resources.super_label(it.get("category")),
-                    round(it["score"], 1), round(it["base"], 1),
-                    round(it["bonus"], 1), round(it["penalty"], 1), it["why"],
-                    it.get("price"), it.get("shipping"),
-                    None if it.get("price") is None or it.get("shipping") is None
-                    else round(it["price"] + it["shipping"], 2),
-                    it["sales"], round(it.get("gross") or 0, 2),
-                    it["rating"], it["reviews"], it["lead"]])
-    return len(grp["items"])
+def _rows(flow, store, layer, grp) -> list:
+    """输入:流别 + 去向店 + 层号 + 组 → 输出:该组逐产品一行的 csv 行。"""
+    return [[flow, store, layer, grp["key"], round(grp["score"], 1),
+             grp["size"], grp["category"],
+             resources.super_label(grp["category"]), grp["channel"],
+             it["asin"], it.get("category") or "",
+             resources.super_label(it.get("category")),
+             round(it["score"], 1), round(it["base"], 1),
+             round(it["bonus"], 1), round(it["penalty"], 1), it["why"],
+             it.get("price"), it.get("shipping"),
+             None if it.get("price") is None or it.get("shipping") is None
+             else round(it["price"] + it["shipping"], 2),
+             it["sales"], round(it.get("gross") or 0, 2),
+             it["rating"], it["reviews"], it["lead"]]
+            for it in grp["items"]]

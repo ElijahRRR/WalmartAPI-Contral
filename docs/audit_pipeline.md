@@ -2,7 +2,8 @@
 
 > 本文回答一件事:**一个 ASIN 从进入审核到落结论,中间到底发生了什么**。
 > 每一层做什么、每条规则的判据来自哪张表/哪份文件、判不出来怎么办,逐条写清。
-> 定稿日期 2026-08-20(规则集版本 `c.2026-08-20.1`)。
+> 定稿日期 2026-08-20;规则集版本以 `registry/resources.py` 的 `AUDIT_RULES_VERSION`
+> 为准(2026-08-26 核对为 `c.2026-08-24.1`)。
 >
 > 代码入口:`python cli.py product_audit`(`workflows/product_audit.py`)
 > 判定引擎:`services/audit_rules.audit_one`(门面)→ `audit_phase0` / `audit_l1_llm`
@@ -45,10 +46,14 @@
 |---|---|
 | 从没审过(`audit_status IS NULL`) | 会,**优先级最高** |
 | `pending` | 会,但有 **1 天退避**(`mode=pending` 可绕过退避) |
-| `approved` / `rejected` | **不会**自动重审 |
+| `approved` | 版本号落后当前 `AUDIT_RULES_VERSION` 的**会**(2026-08-24 起,`_DEFAULT_CANDIDATE` 第三支);版本一致的不会 |
+| `rejected` | **不会**自动重审 |
 
-要整批重审只有显式通道:`-p force_rerun=<旧版本号>`(按规则集版本翻新)、
-`-p rerule=<rule_code>`(只翻某一条规则的历史命中)、`-p mode=pending`。
+要整批重审只有显式通道:`-p force_rerun=<目标版本号>`(库里版本 ≠ 该值的全部重审,
+含 rejected)、`-p rerule=<rule_code>`(只翻某一条规则的历史命中)、`-p repts=1`
+(飞书类目表判据在我判过之后变过的那批 rejected)、`-p mode=pending` /
+`mode=nonpass`(非 approved 全量)/ `mode=stale`(approved 版本落后,必须全链)/
+`mode=pass`、`mode=online`(只与 `stages=L0` 连用)。
 
 排序契约:**没审过的永远先于重试的 pending** —— 否则 pending 存量一多,
 新入库的产品会被饿死。
@@ -167,10 +172,10 @@ Sheet Music, Autographed Collectibles}。
 
 ## 4. L2 —— 规则引擎(`services/audit_l2.py`)
 
-起始 100 分 → 先叠加 L1 的扣分 → 六条规则**按固定顺序全跑、不短路**
+起始 100 分 → 先叠加 L1 的扣分 → 七条规则**按固定顺序全跑、不短路**
 (命中 -100 后后面照跑,证据要收全)→ 下界 -1000。
 
-**两条会扣分**(硬规则),**四条恒 0 分**(软证据,只为喂 L3)。
+**三条会扣分**(硬规则:R1 / R3 硬分支 / R10),**四条恒 0 分**(软证据,只为喂 L3)。
 
 | 规则 | rule_code | penalty | 判据来源 |
 |---|---|---|---|
@@ -182,6 +187,7 @@ Sheet Music, Autographed Collectibles}。
 | R5 USPTO 在效商标 | `trademark_live` | 0 | uspto 库 `brand_nice_class`(**默认关**) |
 | R7 促销宣称 | `content_promotional` | 0 | 代码内短语表 |
 | R8 敏感/严格合规 | `walmart_strict_sensitive` | 0 | 代码内词表 |
+| **R10 Made in USA 声明** | `made_in_usa_claim` | **-100** | 代码内正则(扫 title + 全部五点 + 长描述;`not made in` 否定式排除) |
 
 > **R0 与 R2 已于 2026-08-20 删除**,详见第 6 节。
 > R6(`blacklist_compatible_for`)2026-04 删除,误伤率 90%,改由 L3 判。
@@ -231,7 +237,7 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 | **L2** | **PT 不在类目准入明细,判不了(待补 walmart_pt_meta)** | **没用**,要等明细补行(`pt_spec_sync`) |
 | L3 | LLM 全链路故障,待人工复核 | 有用 |
 
-### 4.2 R3:类目需证书(硬/软四分支)
+### 4.2 R3:类目需证书(硬/软两分支)
 
 **两个**分支互斥、依次判定(硬优先):
 
@@ -378,8 +384,9 @@ pending **不写 llm_cache**。
 **只对当前 verdict 仍为 pass 的产品跑**,且**只能把 pass 翻成 reject**
 (它根本不对 reject 产品运行)。开关:`-p l4=on`。
 
-图片来源:`catalog.snapshots` 最新一条含图快照的 `raw.slow.images[]`
-(首图=主图),不套 24h 新鲜度门槛(图不像价格易变)。
+图片来源:主源 `catalog.products.slow -> 'images'`(采集契约 v1 里 slow 是顶层必填段,
+product_ingest 落进来;首图=主图);主源无图才回落最新一条含图快照的
+`raw.slow.images[]` 并记一条兜底告警。不套 24h 新鲜度门槛(图不像价格易变)。
 
 判定确定性:温度必须 0.0;verdict **由本地 `image_issues` 重算,模型自报的
 verdict 字段完全忽略** —— 否则同一个 ASIN 一次 pass 一次 reject,无法闭环。
@@ -406,7 +413,7 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 | 3 | L4 判 reject | 按 issue 文本 → Offensive Content / Intellectual Property |
 | 4a | `publication_pt_forbidden` | Intellectual Property |
 | 4c | PT 关键词十组 | 对应政策 |
-| 4d | cert 三码 → 按 `walmart_category` 分桶 | 对应政策 |
+| 4d | cert 两码(`cat_requires_cert_hard` / `_soft`;`_small_part` 2026-08-21 已下线)→ 按 `walmart_category` 分桶 | 对应政策 |
 | 4e/4f | 商标 / 黑名单品牌 | Intellectual Property |
 | 4g | 全不中 | General-Use Products |
 
@@ -470,7 +477,7 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 ## 9. 排查一条结论:`audit_why`
 
 ```bash
-python cli.py audit_why -p asin=B0XXXXXXXX
+python cli.py audit_why -p asins=B0XXXXXXXX
 ```
 
 只读,输出这个 ASIN 停在哪一层、命中了哪些 rule_code、每条的判据来自

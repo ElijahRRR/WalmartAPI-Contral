@@ -25,7 +25,7 @@ import httpx
 from api import _client, insights
 from registry import db
 from services import order_center
-from services import kpi, order_lines, stores as stores_svc
+from services import kpi, order_lines, store_retry, stores as stores_svc
 
 DANGEROUS = False
 
@@ -110,11 +110,15 @@ def run(params: dict) -> str:
                 total_no_po += no_po
                 total_unlinked += unlinked
             except (_client.StoreDeadError, httpx.ProxyError) as e:
-                logger.error("店铺 %s 凭证/代理失效跳过: %s", name, e)
-                failed.append(f"{name}(凭证)")
+                # 分诊词跟 store_retry.diagnose 同口径(2026-08-26):凭证死
+                # 与代理故障的处置完全不同(修凭证表 vs 找代理商),
+                # get_token 收口后 SOCKS 报错到这里是 StoreProxyError(代理)
+                cls = store_retry.diagnose(e)
+                logger.error("店铺 %s %s失效跳过: %s", name, cls, e)
+                failed.append(f"{name}({cls})")
             except Exception as e:
                 logger.exception("店铺 %s 问题订单失败: %s", name, e)
-                failed.append(name)
+                failed.append(f"{name}({store_retry.diagnose(e)})")
 
     with db.pg_conn() as conn:
         linked = order_lines.backfill_perf_line_ids(conn)

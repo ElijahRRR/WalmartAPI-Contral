@@ -41,12 +41,11 @@
 """
 
 import collections
-import csv
 import json
 import logging
 
 from registry import db, paths, resources
-from services import pt_admission, pt_spec
+from services import pt_admission, pt_spec, report_csv
 
 DANGEROUS = False       # 只读本地 spec + 只写 audit.walmart_pt_spec
 
@@ -445,22 +444,19 @@ def run(params: dict) -> str:
                  f"需评估 {stat[pt_admission.EVAL]} / 否 {stat[pt_admission.BLOCK]}"
                  + (f";{no_spec} 个索引里有但读不到 spec(跳过)" if no_spec else ""))
     if rows:
-        out = paths.reports_dir() / "pt_admission_rebuilt.csv"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["Walmart Category", "Walmart PTG", "Walmart Product Type",
-                        "准入状态", "中国卖家可做", "必需认证", "特殊备注",
-                        "字段总数", "必填字段数", "必填字段清单"])
-            w.writerows(rows)
+        out = report_csv.write(
+            "pt_admission_rebuilt.csv",
+            ["Walmart Category", "Walmart PTG", "Walmart Product Type",
+             "准入状态", "中国卖家可做", "必需认证", "特殊备注",
+             "字段总数", "必填字段数", "必填字段清单"],
+            rows)
         lines.append(f"飞书粘贴表(列名同现表,10 列整齐):{out}")
-        rv = paths.reports_dir() / "pt_admission_review.csv"
-        with open(rv, "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["Walmart Product Type", "Walmart Category", "Walmart PTG",
-                        "现准入状态", "现中国卖家可做", "新判定", "变化",
-                        "现值证据类型", "必需认证", "判据(逐条溯源)", "人工"])
-            w.writerows(review)
+        rv = report_csv.write(
+            "pt_admission_review.csv",
+            ["Walmart Product Type", "Walmart Category", "Walmart PTG",
+             "现准入状态", "现中国卖家可做", "新判定", "变化",
+             "现值证据类型", "必需认证", "判据(逐条溯源)", "人工"],
+            review)
         lines.append(f"差异复核表(带判据溯源,不用于粘贴):{rv}")
         blank = sum(1 for r in rows if not r[3])
         tail = "就是上面那批新 PT,粘表时手填" if blank else "现表全都有值"

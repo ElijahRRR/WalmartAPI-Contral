@@ -135,7 +135,7 @@ def test_csv_sorted_by_five_super_minority_first():
 
 
 def test_csv_writes_header_and_rows(tmp_path, monkeypatch):
-    monkeypatch.setattr(wf.paths, "reports_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.report_csv.paths, "reports_dir", lambda: tmp_path)
     grp = _g("acme", [_c("B01", "Home"), _c("B02", "Home Improvement")],
              category="Home")
     _, rows = wf._brand_profile([grp], [])

@@ -1,14 +1,12 @@
 """数据库连接唯一入口(工程规范:禁止在其他任何文件自行 psycopg.connect / sqlite3.connect)。
 
 - 业务数据连本机 PostgreSQL 17 库 walmart_data(五 schema 见 docs/db_schema.md)。
-- 可重建缓存用 <DATA_ROOT>/cache 下的 SQLite(内置 WAL + busy_timeout)。
+- SQLite 缓存已整体 PG 化(旧 llm_cache.sqlite 见 docs/db_schema.md L2c),
+  本文件不再开 SQLite 门;上面那条禁令依旧有效,真要用先在这里加入口。
 """
 
 import contextlib
 import os
-import sqlite3
-
-from registry import paths
 
 
 def pg_dsn() -> str:
@@ -122,17 +120,3 @@ def uspto_conn():
         yield conn
     finally:
         conn.close()
-
-
-def sqlite_cache(name: str) -> sqlite3.Connection:
-    """输入:缓存库文件名(不含路径,如 'scraper_cache.db')→ 输出:sqlite3 连接。
-
-    库文件固定在 <DATA_ROOT>/cache/ 下;启用 WAL 与 30s busy_timeout,
-    避免旧项目多进程并发写 SQLite 的 database-is-locked 事故。
-    仅限可重建缓存 —— 业务数据一律进 PostgreSQL。
-    """
-    paths.cache_dir().mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(paths.cache_dir() / name, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn

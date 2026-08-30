@@ -244,6 +244,142 @@ def test_gated_row_terminal_not_submitted(monkeypatch):
     assert "ASIN黑名单" in out and "跟卖提交 1" in out
 
 
+_STORE2 = {"name": "T2", "client_id": "c2", "client_secret": "s", "proxy": None}
+_STORE_A = {"name": "A085", "client_id": "cA", "client_secret": "s", "proxy": None}
+_SPEC_2 = dict(_SPEC_OK, product_id="00012345678912")
+_SPECS_TWO = {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK,
+              "012345678912": _SPEC_2, "00012345678912": _SPEC_2}
+
+
+def test_multi_slice_results_line_up_and_keep_the_failed_wording(monkeypatch):
+    """submit_feed 只回 count 不回条目,对位走 api/feeds.iter_result_slices
+    —— 错一位就是整批结局落到别人行上,而且**不报错**。
+
+    四档计数尾巴走 notify_fmt.feed_outcome_tail:本件的 failed 档字样
+    「提交被拒」(problem_product_cleanup 是「提交失败」)逐字不变。
+    """
+    calls = _wire(monkeypatch, [_row(2, "012345678905"),
+                                _row(3, "012345678912")], _SPECS_TWO)
+
+    def sliced(store, ft, entries, *, workflow=""):
+        return [{"feed_id": "F_A", "count": 1, "outcome": "submitted"},
+                {"feed_id": None, "count": 1, "outcome": "failed"}]
+    monkeypatch.setattr(feeds, "submit_feed", sliced)
+
+    out = ml.run({"execute": True})
+    by_row = {r: vals for r, vals in calls["writes"]}
+    assert by_row[2][7] == "F_A" and by_row[2][8] == "处理中"   # 第一片 = 第 2 行
+    assert by_row[3][7] == "" and by_row[3][8] == "提交被拒"    # 第二片 = 第 3 行
+    assert len(calls["events"]) == 1                           # 被拒那片不入病历
+    assert "  T1:跟卖提交 1,⚠ 提交被拒 1(查日志)" in out
+
+
+def test_failed_store_gets_one_serial_second_pass(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):失败店跑完别人后串行补试一遍,
+    补试跑的是**同一个** _one_store(单一落地路径);救回了就不点名缺席。"""
+    from socksio.exceptions import ProtocolError
+    calls = _wire(monkeypatch, [_row(2, "012345678905"),
+                                _row(3, "012345678912", store="T2")],
+                  _SPECS_TWO, stores=(STORE, _STORE2))
+    monkeypatch.setattr(ml.store_retry.time, "sleep", lambda s: None)
+    tries = []
+
+    def flaky(store, ft, entries, *, workflow=""):
+        tries.append(store["name"])
+        if store["name"] == "T2" and tries.count("T2") == 1:
+            raise ProtocolError("Malformed reply")   # 08-26 事故同款,补试即好
+        calls["feeds"].append((store["name"], ft, len(entries)))
+        return [{"feed_id": f"F_{store['name']}", "count": len(entries),
+                 "outcome": "submitted"}]
+    monkeypatch.setattr(feeds, "submit_feed", flaky)
+
+    out = ml.run({"execute": True})
+    assert tries.count("T2") == 2          # 首轮 + 补试各一次,不多试
+    assert "⚠ 缺席" not in out              # 救回了就不点名
+    assert "  T2:跟卖提交 1" in out
+    by_row = {r: vals for r, vals in calls["writes"]}
+    assert by_row[3][7] == "F_T2"          # 补试的回写照常落表
+
+
+def test_still_failed_store_is_absent_in_the_first_line(monkeypatch):
+    """标准③:补试仍失败 ⇒ **不炸整轮**,缺席店带归类词点名在摘要**首行**
+    (链通知只发成功步骤的首行,写在后面等于只写进日志);逐店那行照旧。"""
+    from socksio.exceptions import ProtocolError
+    calls = _wire(monkeypatch, [_row(2, "012345678905"),
+                                _row(3, "012345678912", store="T2")],
+                  _SPECS_TWO, stores=(STORE, _STORE2))
+    monkeypatch.setattr(ml.store_retry.time, "sleep", lambda s: None)
+
+    def down(store, ft, entries, *, workflow=""):
+        if store["name"] == "T2":
+            raise ProtocolError("Malformed reply")   # 补试也不好
+        calls["feeds"].append((store["name"], ft, len(entries)))
+        return [{"feed_id": "F_M", "count": len(entries),
+                 "outcome": "submitted"}]
+    monkeypatch.setattr(feeds, "submit_feed", down)
+
+    out = ml.run({"execute": True})
+    first = out.splitlines()[0]
+    assert "⚠ 缺席 1 店:T2(代理波动)——已串行补试仍失败," \
+           "本轮不炸链(未提交行下轮重试)" in first
+    assert "  ⚠ T2:提交异常已跳过(代理波动:" in out and "下轮重试" in out
+    # 一家店的失败不吃掉别人的成果:好店照常提交、照常回写
+    assert calls["feeds"] == [("T1", "MP_ITEM_MATCH", 1)]
+    by_row = {r: vals for r, vals in calls["writes"]}
+    assert by_row[2][7] == "F_M" and 3 not in by_row
+
+
+def test_scale_gate_holds_the_second_pass_and_keeps_its_note(monkeypatch):
+    """规模闸(store_retry 2026-08-26 对抗校验):失败店超 max(3, 总数//5) 判
+    系统性故障,**一家都不补试** —— 串行补试只会把故障时长按店数放大。
+
+    止损原文必须落进摘要(调用方义务,见 serial_second_pass 第四条),
+    首行中段同时改说「超补试规模闸未补试」而不是「已串行补试仍失败」。
+    """
+    from socksio.exceptions import ProtocolError
+    stores = [dict(STORE, name=f"T{i}", client_id=f"c{i}") for i in range(1, 5)]
+    rows = [_row(2 + i, upc, store=f"T{i + 1}")
+            for i, upc in enumerate(("012345678905", "012345678912",
+                                     "012345678905", "012345678912"))]
+    _wire(monkeypatch, rows, _SPECS_TWO, stores=tuple(stores))
+    monkeypatch.setattr(ml.store_retry.time, "sleep", lambda s: None)
+    tries = []
+
+    def down(store, ft, entries, *, workflow=""):
+        tries.append(store["name"])
+        raise ProtocolError("Malformed reply")
+    monkeypatch.setattr(feeds, "submit_feed", down)
+
+    out = ml.run({"execute": True})
+    assert sorted(tries) == ["T1", "T2", "T3", "T4"]    # 4 > max(3, 4//5):一家都不补
+    assert "超补试规模闸未补试(疑似系统性故障)" in out.splitlines()[0]
+    assert "本轮不逐店补试" in out          # 止损原文进摘要,不是只进日志
+
+
+def test_summary_lines_stay_in_store_name_order_after_a_second_pass(monkeypatch):
+    """补试是**跑完别人之后**才补的,但摘要行序不许跟着补试次序走 ——
+    同一轮跑两次输出得一样,否则没法对拍(list_new 同款纪律)。"""
+    from socksio.exceptions import ProtocolError
+    _wire(monkeypatch, [_row(2, "012345678905", store="A085"),
+                        _row(3, "012345678912")],
+          _SPECS_TWO, stores=(_STORE_A, STORE))
+    monkeypatch.setattr(ml.store_retry.time, "sleep", lambda s: None)
+    seen = []
+
+    def flaky(store, ft, entries, *, workflow=""):
+        seen.append(store["name"])
+        if store["name"] == "A085" and seen.count("A085") == 1:
+            raise ProtocolError("Malformed reply")
+        return [{"feed_id": f"F_{store['name']}", "count": len(entries),
+                 "outcome": "submitted"}]
+    monkeypatch.setattr(feeds, "submit_feed", flaky)
+
+    out = ml.run({"execute": True}).splitlines()
+    assert seen == ["A085", "T1", "A085"]      # 先跑完别人,再回头补试
+    assert [ln for ln in out if "跟卖提交" in ln] == \
+        ["  A085:跟卖提交 1", "  T1:跟卖提交 1"]
+
+
 def test_match_sheet_sync_from_ledger(monkeypatch):
     monkeypatch.setattr(resources, "MATCH_SHEET",
                         Spreadsheet(name="跟卖表", token="TOK", sheet_id="SID",
@@ -258,7 +394,9 @@ def test_match_sheet_sync_from_ledger(monkeypatch):
     ]
     writes = []
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: len(sheet_rows) + 1)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"SKU_A": ("success", ""), "SKU_B": ("failed", "ERR_M")},

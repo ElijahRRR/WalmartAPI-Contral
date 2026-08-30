@@ -96,10 +96,9 @@ def enabled_names() -> set[str]:
     「缺代理的在营店」算成停用 —— 而这个名录直通整店下线。要么拿到当下真值,
     要么明说读不到。
     """
-    from api import feishu as _feishu       # 与 load_stores 同源,惰性避免循环
     f = resources.STORE_CREDENTIALS.fields
-    recs = _feishu.list_records(resources.STORE_CREDENTIALS,
-                                field_names=[f.store, f.enabled])
+    recs = feishu.list_records(resources.STORE_CREDENTIALS,
+                               field_names=[f.store, f.enabled])
     return {n for n in (_cell(r.get("fields", {}), f.store)
                         for r in recs if is_enabled(r.get("fields", {}))) if n}
 
@@ -122,17 +121,24 @@ def load_stores(filter_names: list[str] | None = None) -> list[dict]:
     程序从库里算出来的),所以抛错只可能在打错字时触发,不会误伤调度。
     """
     all_names = None            # 凭证表里的全部店名(未经过滤);快照兜底时无从得知
+    # ⚠ try 只包**飞书这一跳**(2026-08-27 收窄)。此前解析(_normalize / all_names)
+    # 与落盘(_write_snapshot)也在 try 里:飞书完全健康、只是凭证表字段被改名
+    # 或单元格形状变了导致 _normalize 抛,照样静默退到**陈旧凭证快照**,还报成
+    # 「店铺凭证表读取失败」—— 把本地 bug 伪装成远端故障,指错路。
+    # 兜底三要件里的"条件明确而非 catch-all"(conventions §六)指的就是这个:
+    # 兜底补的是外部世界的缺陷,不补自己的不确定。飞书故障的兜底行为一字未变。
     try:
         records = feishu.list_records(resources.STORE_CREDENTIALS)
-        f = resources.STORE_CREDENTIALS.fields
-        all_names = {n for n in (_cell(r.get("fields", {}), f.store) for r in records) if n}
-        stores = _normalize(records)
-        _write_snapshot(stores)
     except Exception as e:
         stores = _read_snapshot()
         if stores is None:
             raise RuntimeError(f"店铺凭证表读取失败且无本地快照可兜底: {e}") from e
         logger.warning("店铺凭证表读取失败,已回退本地快照(%d 家): %s", len(stores), e)
+    else:
+        f = resources.STORE_CREDENTIALS.fields
+        all_names = {n for n in (_cell(r.get("fields", {}), f.store) for r in records) if n}
+        stores = _normalize(records)
+        _write_snapshot(stores)
 
     if filter_names:
         wanted = list(dict.fromkeys(filter_names))        # 去重保序
@@ -180,9 +186,8 @@ def registered_names() -> set[str]:
 
     不做快照兜底:要么拿到当下真值,要么明说读不到。
     """
-    from api import feishu as _feishu       # 与 load_stores 同源,惰性避免循环
     f = resources.STORE_CREDENTIALS.fields
-    recs = _feishu.list_records(resources.STORE_CREDENTIALS, field_names=[f.store])
+    recs = feishu.list_records(resources.STORE_CREDENTIALS, field_names=[f.store])
     return {n for n in (_cell(r.get("fields", {}), f.store) for r in recs) if n}
 
 
@@ -254,5 +259,8 @@ def _read_snapshot() -> list[dict] | None:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        # 说出来:不记的话"快照文件损坏"会被上面报成「无本地快照可兜底」,
+        # 两种截然不同的故障合并成一句话,人按后者去找一个其实存在的文件
+        logger.warning("店铺凭证快照损坏,按无快照处理:%s", e)
         return None

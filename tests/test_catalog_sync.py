@@ -388,8 +388,9 @@ def test_col_letter():
     assert feishu._col_letter(27) == "AA"
 
 
-def test_sheet_ensure_rows_chunks_at_5000(monkeypatch):
-    # dimension_range 单次上限 5000(90204 实证):扩 12794 行须分 5000/5000/2794 三次
+def test_sheet_ensure_rows_chunks_at_dimension_max(monkeypatch):
+    # dimension_range 单次上限:官方 5000 行(90204 实证 2026-08-05 也是这条),
+    # 本仓按 95% 红线取 _SHEET_DIMENSION_MAX=4750 → 扩 12794 行分 4750/4750/3294 三次
     from registry.resources import Spreadsheet
     sheet = Spreadsheet(name="测试表", token="TOK", sheet_id="SID", columns=("a",))
     adds = []
@@ -402,7 +403,9 @@ def test_sheet_ensure_rows_chunks_at_5000(monkeypatch):
 
     monkeypatch.setattr(feishu, "_call", fake_call)
     assert feishu.sheet_ensure_rows(sheet, 12795) == 12794
-    assert adds == [5000, 5000, 2794]
+    assert adds == [4750, 4750, 3294] == [feishu._SHEET_DIMENSION_MAX,
+                                          feishu._SHEET_DIMENSION_MAX,
+                                          12794 - 2 * feishu._SHEET_DIMENSION_MAX]
 
 
 def test_sheet_overwrite_blocks_and_trims(monkeypatch):
@@ -422,10 +425,15 @@ def test_sheet_overwrite_blocks_and_trims(monkeypatch):
     rows = [["h1", "h2"]] + [[i, i] for i in range(4999)]   # 5000 行 → 2 块
     assert feishu.sheet_overwrite(sheet, rows) == 5000
 
+    # 块大小 = _SHEET_WRITE_MAX_ROWS(官方 5000 行 ×95% = 4750),整表重写与定点
+    # 回写走同一套预算切批(唯一写通道),不再各有各的块大小
     writes = [c for c in calls if "values_batch_update" in c[1]]
     assert len(writes) == 2
-    assert writes[0][2]["valueRanges"][0]["range"] == "SID!A1:B4000"
-    assert writes[1][2]["valueRanges"][0]["range"] == "SID!A4001:B5000"
+    assert writes[0][2]["valueRanges"][0]["range"] == "SID!A1:B4750"
+    assert writes[1][2]["valueRanges"][0]["range"] == "SID!A4751:B5000"
+    # ⚠ 整表重写**不 scrub**:KPI 看板靠写数字型日期序列值 + formatter 才显示成
+    # 日期,把数字 str 化会让格式化当场失效
+    assert writes[0][2]["valueRanges"][0]["values"][1] == [0, 0]
     deletes = [c for c in calls if c[0] == "DELETE"]        # 9000 网格 - 5000 数据 → 删尾
     assert len(deletes) == 1
     dim = deletes[0][2]["dimension"]
@@ -675,3 +683,95 @@ def test_inventories_cursor_death_restarts_the_whole_sweep(monkeypatch):
     with pytest.raises(inv_api._CursorExpired):
         inv_api.list_inventory_nodes(STORE)
     assert state2["n"] == 2                              # 恰好两轮,没有第三轮
+def test_failed_store_gets_one_serial_second_pass(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):失败店跑完别人后串行补试一遍,
+    救回的照常入账 —— 且补试跑的是**同一个** _sync_one_store(单一落地路径)。"""
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["好店", "抖店"])
+    calls = []
+
+    def one(store, *a, **kw):
+        calls.append(store["name"])
+        if store["name"] == "抖店" and calls.count("抖店") == 1:
+            raise OSError("proxy hiccup")           # 第一轮抖,补试即好
+        return _ok_result(store["name"])
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", one)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    summary = catalog_sync.run({"skip_feishu": "1"})
+    assert "2/2 店完成" in summary
+    assert "⚠ 缺席" not in summary       # 救回了就不点名(「缺席标记 N 行」是另一回事)
+    assert calls.count("抖店") == 2                  # 首轮 + 补试各一次,不多试
+
+
+def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
+    """标准②:补试仍失败 ⇒ **不炸整轮**(08-26 事故:两家店 SOCKS 报错放倒
+    八步链)。缺席店在摘要**首行**点名并带归类词 —— 链通知只发成功步骤的
+    第一行,放后面等于只写日志。"""
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["好店", "断店"])
+    from socksio.exceptions import ProtocolError
+
+    def one(store, *a, **kw):
+        if store["name"] == "断店":
+            raise ProtocolError("Malformed reply")   # 事故同款,补试也不好
+        return _ok_result(store["name"])
+
+    monkeypatch.setattr(catalog_sync, "_sync_one_store", one)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    summary = catalog_sync.run({"skip_feishu": "1"})     # 不抛 = 不炸链
+    first = summary.splitlines()[0]
+    assert "1/2 店完成" in first
+    assert "⚠ 缺席 1 店:断店(代理波动)" in first     # 归类进首行,人知道去找代理商
+
+
+def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
+    """工作流**不许**把扫描 SKU 集传给 list_inventories(所有者定稿 2026-08-28
+    撤线,推翻自己 08-26 的「拍板接上」)。
+
+    撤线依据是接上后的**第一次生产触发**(08-28,A109):目录 6,976 − bulk
+    3,511 = 3,465 个"漏",逐个单查**全 404**,一店多烧 43 分钟。404 = 「库存
+    台账没有这一行」——退市/Stage 死档案永远不会有,部分**真在线**商品同样
+    没有,单查问不出新信息。"bulk 没给"≠"翻页漏了",蓝图 #22 的假设被生产
+    证伪。bulk 真漏的行由 upsert 的 COALESCE 沿用上一轮值兜着。
+    ⚠ api 层 list_inventories 的 expected_skus **能力保留**(上面那条 api 级
+    用例继续钉它),撤的只是本调用方的接线 —— 别顺手删掉 api 能力。"""
+    import contextlib
+    from datetime import datetime, timezone
+    from workflows import catalog_sync
+
+    monkeypatch.setattr(catalog_sync.items, "iter_all_items",
+                        lambda store, stats, mode: iter(
+                            [{"sku": "A"}, {"sku": "B"}, {"sku": None}]))
+    seen: dict = {"called": False}
+
+    def fake_inv(store, expected_skus=None):
+        seen["called"] = True
+        seen["skus"] = expected_skus
+        return {"A": {"N1": 3}}
+
+    # 多仓批次 1 后工作流取节点明细版(list_inventory_nodes);
+    # 撤线口径不变:同样不许把扫描集传进去
+    monkeypatch.setattr(catalog_sync.inv_api, "list_inventory_nodes", fake_inv)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_node_inventory",
+                        lambda conn, name, inv, run_at: 0)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "merge_rows",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_items",
+                        lambda conn, rows: 0)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "mark_missing",
+                        lambda conn, name, run_at: 0)
+
+    r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc),
+                                     False, "fast", False)
+    assert seen["called"] and seen["skus"] is None, \
+        "接线又被接回来了:扫描集不许进库存单查(2026-08-28 定稿)"
+    assert r["inv"] == 1

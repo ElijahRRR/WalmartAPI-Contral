@@ -261,21 +261,16 @@ def write_audit_notes(updates: list[tuple[int, str]],
     return len(updates)
 
 
-def write_reason(rownum: int, reason: str, execute: bool = True) -> None:
-    """输入:行号 + 未上架理由 → 输出:无(只写 N 列,单行单请求)。
-
-    ⚠ 只给"确实只有一行要写"的调用方用;成批理由必须走 write_reasons ——
-    循环调本函数 = 一行一个飞书请求(2026-08-19 所有者实遇:几百行淘汰
-    理由逐行写,提交前白耗几分钟)。
-    """
-    write_reasons([(rownum, reason)], execute)
-
-
 def write_reasons(items: list[tuple[int, str]], execute: bool = True) -> int:
     """输入:[(行号, 理由)] → 输出:写入行数(N 列一次批量提交)。
 
-    切块交给 feishu.sheet_write_ranges(≤100 范围且 ≤4000 行/请求,
-    90227 修复后的双预算)——几百行理由从几百个请求收敛到几个。
+    切块交给 feishu.sheet_write_ranges(段数/行数/字节三条预算任一先到即封批,
+    当轮写完不留下一轮)——几百行理由从几百个请求收敛到几个。具体数字**不在
+    这里复述**:唯一出处是 api/feishu 顶部的限额登记表(官方值 ×95%),
+    此处抄一份就是第二个出处,旧版那句"≤4000 行/请求"正是这么漂掉的。
+
+    ⚠ 别退回逐行写:一行一个飞书请求 ~0.7s,几百行淘汰理由 = 提交前先白耗
+    几分钟(2026-08-19 所有者实遇)。只有一行要写就传 `[(行号, 理由)]`。
     """
     if not items:
         return 0
@@ -397,7 +392,9 @@ WHERE w.missing_since IS NULL
 
 
 def heal_unknown() -> str | None:
-    """feed_poll 反哺器:K=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
+    """输入:无(直接读上架表 + feed 台账 + 目录) → 输出:摘要行,无 Unknown 行时 None。
+
+    feed_poll 反哺器:K=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
 
     Unknown 是"提交结局不确定"的防重态(不重复提交防双上架),但没人收尾
     就永久卡死 + UPC 永久占用(claimed 不释放)。收尾三条路:
@@ -517,7 +514,10 @@ def heal_unknown() -> str | None:
 
 
 def sync_from_ledger() -> str | None:
-    """feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。"""
+    """输入:无(直接读上架表 + feed 台账) → 输出:摘要行,无在途行时 None。
+
+    feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。
+    """
     try:
         resources.LISTING_SHEET.require()
     except LookupError as e:

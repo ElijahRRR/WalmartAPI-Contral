@@ -131,6 +131,9 @@ from api import feishu, scraper
 from registry import db, resources
 from services import (kpi, order_audit as rules, product_ingest as ingest,
                       scrape_batches as batches)
+# ⚠ 按名字导入:run() 的形参就叫 params,`from services import params` 会被它
+# 遮住,`params.flag(...)` 当场 AttributeError(services/params.py 头注)
+from services.params import flag
 
 DANGEROUS = False
 
@@ -369,7 +372,10 @@ def _load_config() -> tuple[set[str], list[rules.Supplier]]:
     # 范围按实际行数取,不写死上限:旧系统写死 A1:A500,黑名单超 500 条即
     # 静默截断——漏掉的钓鱼邮编会一路放行到通过
     n_rows = max(feishu.sheet_row_count(sheet), 1)
-    rows = feishu.sheet_values(sheet, f"A1:A{n_rows}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(分块 + 90221 对半);
+    # zip_blacklist 收的是一堆行、不认行号,rownum 丢掉
+    rows = [row for _rownum, row
+            in feishu.sheet_values_rows(sheet, "A", "A", 1, n_rows)]
     blacklist = rules.zip_blacklist(rows)
 
     table = resources.SUPPLIER_TABLE.require()
@@ -466,6 +472,23 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
             want.append((asin, zip5))
         results.append((line, res))
     return results, want
+
+
+def _judge_save_tally(conn, lines: list[dict], blacklist, suppliers):
+    """输入:连接 + 待审行 + 配置 → 输出:(待采 [(asin, 邮编)], 落库行数, 结论计数)。
+
+    「判定 → 落库 → 计数」这五行在 run() 里出现两次(wait=1 重判那一遍原样
+    再走一次),收成一处免得两边飘。
+    ⚠ 第二遍**必须判同一批 lines** —— 别在这里顺手改成重新取行:第一遍它们
+    多半是"待采集/待人工",重取会换掉待判集合,重判就不是同一批了。
+    `results` 只喂 `_save` 与计数,两个调用点都不再用它,故不往外返。
+    """
+    results, want = _judge_all(conn, lines, blacklist, suppliers)
+    saved = _save(conn, results)
+    tally: dict[str, int] = {}
+    for _, res in results:
+        tally[res.status] = tally.get(res.status, 0) + 1
+    return want, saved, tally
 
 
 def _reap_batches(conn) -> tuple[int, int, list[str]]:
@@ -1095,12 +1118,12 @@ def run(params: dict) -> str:
     stores = [s.strip() for s in str(params.get("stores", "")).split(",") if s.strip()]
     line_id = str(params.get("line", "")).strip()
     recheck = _yes(params.get("recheck", ""))
-    do_push = str(params.get("push", "1")).lower() not in {"0", "false", "no"}
-    do_scrape = str(params.get("scrape", "1")).lower() not in {"0", "false", "no"}
+    do_push = flag(params, "push", default=True)
+    do_scrape = flag(params, "scrape", default=True)
     # **默认开**(所有者定稿 2026-08-10):手工跑时忘了加 -p wait=1 就只能看到
     # 上一轮的结论,而且不报错——"忘了就静默降级"的默认值不该留着。
     # 挂调度那天在 plist 里显式写 -p wait=0 是很自然的一步(参数本来就要逐条写)。
-    do_wait = str(params.get("wait", "1")).lower() not in {"0", "false", "no"}
+    do_wait = flag(params, "wait", default=True)
     refill_shots = _yes(params.get("refill_shots", ""))
 
     blacklist, suppliers = _load_config()
@@ -1132,11 +1155,7 @@ def run(params: dict) -> str:
         # ② 采集台账先对账(重启安全:pending 还在,能判断该不该重推)
         settled, gone, blocked, batch_notes = _settle_ledger(conn)
 
-        results, want = _judge_all(conn, lines, blacklist, suppliers)
-        saved = _save(conn, results)
-        tally: dict[str, int] = {}
-        for _, res in results:
-            tally[res.status] = tally.get(res.status, 0) + 1
+        want, saved, tally = _judge_save_tally(conn, lines, blacklist, suppliers)
 
         # ③ 推采集:一批混邮编,同一 ASIN 的多邮编拆波次
         scrape_note, sent = "", []
@@ -1168,11 +1187,8 @@ def run(params: dict) -> str:
             batch_notes.extend(notes2)
             # 重判的是**同一批行**:第一遍它们多半是"待采集/待人工",这遍才
             # 拿到真数据。已出终局结论的行 judge 会照常重算,不受影响。
-            results, _want2 = _judge_all(conn, lines, blacklist, suppliers)
-            saved = _save(conn, results)
-            tally = {}
-            for _, res in results:
-                tally[res.status] = tally.get(res.status, 0) + 1
+            _want2, saved, tally = _judge_save_tally(conn, lines, blacklist,
+                                                     suppliers)
 
         # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
         pushed = missing = 0

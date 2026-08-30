@@ -22,6 +22,14 @@ feed 路径的结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 
 —— 键对不上,于是每一行都查不到、整行追加,而两边都不报错。
 连接键必须两端同一个函数算出来,不能各取各的字段。
 
+表格读取一律走 `feishu.sheet_values_rows`(唯一标准读通道:行方向分块 + 90221
+对半兜底,返回 `(行号, 行值)` 对)。本文件三处读(反哺器区间 / 补写存量 / 裁剪
+全表)的范围上界都随表长增长 —— 一天几千行,单发裸读在表长大后必撞飞书单响应
+10MB 上限(90221 data exceeded)。**2026-08-27 生产**:反哺器读整段炸在这里,
+水位一步不推 ⇒ 积压每轮重读、越读越大,靠下一轮自愈是不可能的,必须一次读完。
+⚠ 行号只用通道给的那个,不许拿区间起点 + enumerate 手算:飞书会裁掉**块尾**
+空行,手算会从那一块起整段错位(错位的后果是回填写到别人的行上)。
+
 水位(ops.cursors,name='maint_sheet'):{"next_row": 下一空行, "unresolved_from":
 最早未落定行}。反哺器只扫 [unresolved_from, next_row) 区间,不做全表读。
 ⚠ 反哺器**跨过没有 feedid 的行**(它认为那些没有待办)。当前形态下每行都是提交
@@ -42,7 +50,7 @@ from datetime import datetime, timedelta
 
 from api import feishu
 from registry import db, resources
-from services import feed_track, kpi
+from services import blacklist_sheet, feed_track, kpi
 
 logger = logging.getLogger("services.maint_sheet")
 
@@ -61,7 +69,7 @@ def _idx(name: str) -> int:
 _FIRST_COL = "A"
 
 
-def _span() -> str:
+def _span() -> tuple[str, str]:
     """输入:无 → 输出:整行范围的列字母对,如 ('A', 'K')。"""
     return _FIRST_COL, feishu._col_letter(len(resources.MAINT_SHEET.columns))
 
@@ -77,7 +85,7 @@ RETAIN_DAYS = 7         # 飞书只留近这么多天(一天几千行,不裁很�
 
 
 def _row_date(text: str):
-    """输入:G 列日期串 → 输出:date(解析不了返 None,当作"没日期不裁不判")。"""
+    """输入:I 列(日期)串 → 输出:date(解析不了返 None,当作"没日期不裁不判")。"""
     try:
         return datetime.strptime(str(text).strip()[:10], "%Y-%m-%d").date()
     except (ValueError, TypeError):
@@ -102,28 +110,6 @@ def _save_cursor(conn, value: dict) -> None:
             "ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value, "
             "updated_at = now()",
             (_CURSOR, json.dumps(value)))
-
-
-_SCAN_BLOCK = 5000      # 找空行每个 GET 读多少行(只读 A 列,单列 5000 格很轻;
-                        # blacklist_sheet 同款先例)。此前 50 行/请求:有游标时
-                        # 只扫一两块无感,但首跑/游标丢失从第 2 行扫几千行历史
-                        # = 上百个串行请求(2026-08-19 全仓飞书逐行请求盘点)
-
-
-def _find_next_empty(start: int) -> int:
-    """输入:候选起始行 → 输出:确认为空的首行(防水位漂移覆盖已有数据)。"""
-    grid = feishu.sheet_row_count(resources.MAINT_SHEET)
-    row = start
-    while row <= grid:
-        end = min(row + _SCAN_BLOCK - 1, grid)
-        vals = feishu.sheet_values(resources.MAINT_SHEET, f"A{row}:A{end}")
-        got = [(str(c[0]).strip() if c and c[0] is not None else "")
-               for c in (vals + [[None]] * (end - row + 1))[:end - row + 1]]
-        for i, v in enumerate(got):
-            if not v:
-                return row + i
-        row = end + 1
-    return row      # 网格已满,append_records 会先扩行
 
 
 def build_row(store: str, sku: str, suggestion: str, reason: str, action: str,
@@ -180,14 +166,26 @@ def publish(rows: list[tuple], lines: list[str], *, prune_after=True) -> None:
 
 
 def append_records(rows: list[tuple]) -> int:
-    """输入:[(店铺, sku, 动作, 旧值, 新值, feedid, 日期, 结果, 报错)]
-    → 输出:写入行数。只追加;水位存 ops.cursors,起点先验空防覆盖。"""
+    """输入:[(店铺, SKU, 建议, 原因, 动作, 旧值, 新值, feedid, 日期, 结果, 报错)]
+    → 输出:写入行数。只追加;水位存 ops.cursors,起点先验空防覆盖。
+
+    行必须由 `build_row` 造(全项目唯一造行处,按 registry 列序)。本行元组
+    是 11 列:2026-08-16 加「建议」「原因」两列后,这条 docstring 还照旧
+    9 列写着(2026-08-27 订正)—— 照它手拼元组就是整行错位且不报错。"""
     if not rows:
         return 0
     sheet = resources.MAINT_SHEET.require()
     with db.pg_conn() as conn:
         cur_state = _load_cursor(conn)
-    start = _find_next_empty(int(cur_state.get("next_row", 2)))
+    # 找空行(防水位漂移覆盖已有数据)走 blacklist_sheet.next_empty —— **唯一
+    # 实现**(2026-08-27 归一:本文件此前抄了一份逐行同形的,连那边
+    # 「本算法 O(表已填行数)、涨到几十万行要换二分探测」的警告都没抄过来)。
+    # ⚠ 扫描块大小(_SCAN_BLOCK)也在那边:此前 50 行/请求 —— 有游标时只扫
+    #   一两块无感,但首跑/游标丢失要从第 2 行扫几千行历史 = 上百个串行请求
+    #   (2026-08-19 全仓飞书逐行请求盘点)。
+    # 返回值可能指到网格末尾之后:网格已满,下面 sheet_ensure_rows 会先扩行。
+    start = blacklist_sheet.next_empty(resources.MAINT_SHEET,
+                                       int(cur_state.get("next_row", 2)))
     feishu.sheet_ensure_rows(sheet, start + len(rows))
     cur_state.setdefault("unresolved_from", 2)
 
@@ -218,8 +216,6 @@ def append_records(rows: list[tuple]) -> int:
 
 _LABEL_BY_FEED = {"MP_MAINTENANCE": "标题", "price": "价格",
                   "inventory": "库存", "DELETE_ITEM": "删除"}
-_RESULT_BY_STATUS = {"success": "成功", "failed": "失败",
-                     "missing": "未查到", "submitted": "处理中"}
 
 _SQL_LEDGER = """
 SELECT store, sku, feed_type, feed_id, status, error_code, error_desc,
@@ -249,7 +245,9 @@ def resync_from_ledger() -> str:
     hi = int(cur_state.get("next_row", 2))
     have: set[tuple[str, str]] = set()
     if hi > 2:
-        for raw in feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}"):
+        first, last = _span()
+        for _rownum, raw in feishu.sheet_values_rows(
+                resources.MAINT_SHEET, first, last, 2, hi - 1):
             cells = ([(str(c).strip() if c is not None else "") for c in raw]
                      + [""] * len(resources.MAINT_SHEET.columns))
             # 按列名取下标(2026-08-16 加了「建议」「原因」两列;写死 5/1 的话
@@ -259,7 +257,15 @@ def resync_from_ledger() -> str:
     for store, sku, ftype, fid, status, code, desc, submitted in ledger:
         if (str(fid or ""), str(sku)) in have:
             continue
-        result = _RESULT_BY_STATUS.get(status, status)
+        # 中文面走 feed_track 的唯一出处,但**兜底仍是"原样落表"**:未登记的
+        # 状态照写台账里的原文,给人看的是"库里到底写了什么"。这与
+        # feed_track.text_of 的「处理中」不是等价替换,是补写口径的有意差异,
+        # 不当成同一件事悄悄改掉(2026-08-27 收编时按原口径保留)。
+        # ⚠ 本行与旧的 _RESULT_BY_STATUS 只在 processing/unknown 两键上不同,
+        #   而这两个值**进不了 ops.feed_items**:feed_track.poll_feed 的 _STATUS
+        #   (feed_track:137)落库前把它们归一成 'submitted',schema 也只登记
+        #   submitted/success/failed/missing —— 真实值域上逐值等价
+        result = feed_track.RESULT_TEXT.get(status, status)
         err = feed_track.merge_error(code, desc) if status == "failed" else ""
         label = _LABEL_BY_FEED.get(ftype, ftype)
         # 按列名拼(11 列):台账只有 SKU 级状态,建议/原因/旧值/新值补不回来
@@ -279,10 +285,10 @@ def sync_from_ledger() -> str | None:
     """输入:无 → 输出:回写摘要一行(无待回填区间才返 None)。
 
     ⚠ 只有 append_records 写过行、水位推进过,这里才有区间可扫。
-    maintenance 走 PUT 路由的行 F="sync"、H 当场落定,不参与回填。
+    maintenance 走 PUT 路由的行 H="sync"、J 当场落定,不参与回填。
 
-    feed_poll 反哺器:扫 [unresolved_from, next_row) 区间内 F=真 feedid 且
-    H 空/处理中的行,按 ops.feed_items 台账落 H(结果)/I(报错);
+    feed_poll 反哺器:扫 [unresolved_from, next_row) 区间内 H=真 feedid 且
+    J 空/处理中的行,按 ops.feed_items 台账落 J(结果)/K(报错);
     已全落定的前缀推进水位。纯读库,零沃尔玛调用。
     """
     try:
@@ -296,18 +302,19 @@ def sync_from_ledger() -> str | None:
     lo, hi = int(cur_state.get("unresolved_from", 2)), int(cur_state.get("next_row", 2))
     if lo >= hi:
         return None
-    values = feishu.sheet_values(resources.MAINT_SHEET,
-                                 f"A{lo}:{_span()[1]}{hi - 1}")
+    first, last = _span()
+    values = feishu.sheet_values_rows(resources.MAINT_SHEET, first, last,
+                                      lo, hi - 1)
     updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
     stale_cut, n_stale = _today() - timedelta(days=STALE_DAYS), 0
-    for i, raw in enumerate(values):
+    # 行号取通道给的(分块读,块尾空行会被飞书裁掉 —— 见模块头注)
+    for rownum, raw in values:
         cells = ([(str(c).strip() if c is not None else "") for c in raw]
                  + [""] * len(resources.MAINT_SHEET.columns))
         sku = cells[_idx("sku")]
         fid = cells[_idx("feed_id")]
         result = cells[_idx("result")]
-        rownum = lo + i
         # 超期兜底(所有者定稿 2026-08-09):一行永远悬着会把水位钉死,
         # 每轮 feed_poll 都要重读整段。超 STALE_DAYS 天判「未查到」放行——
         # **状态权威在 ops.feed_items,这里只是展示面板不再等它**。
@@ -340,8 +347,7 @@ def sync_from_ledger() -> str | None:
         if st[0] == "submitted":
             prefix_done = False         # feed 未落定,水位停在这里
             continue
-        text = {"success": "成功", "failed": "失败",
-                "missing": "未查到"}.get(st[0], "处理中")
+        text = feed_track.text_of(st[0])
         # 报错列写「码 | 人话」(改价/改库存/改标题/清库存共用这一列)
         err = feed_track.merge_error(
             st[1], descs.get(fid, {}).get(sku)) if text == "失败" else ""
@@ -392,11 +398,13 @@ def prune(days: int = RETAIN_DAYS) -> str:
     hi = int(cur_state.get("next_row", 2))
     if hi <= 2:
         return "维护记录:表内无数据行,无需裁剪"
-    values = feishu.sheet_values(resources.MAINT_SHEET, f"A2:{_span()[1]}{hi - 1}")
+    first, last = _span()
+    values = feishu.sheet_values_rows(resources.MAINT_SHEET, first, last,
+                                      2, hi - 1)
     cut = _today() - timedelta(days=days)
     ncol = len(resources.MAINT_SHEET.columns)
     kept = []
-    for raw in values:
+    for _rownum, raw in values:
         cells = [(str(c).strip() if c is not None else "") for c in raw] + [""] * ncol
         if not any(cells[:ncol]):
             continue                    # 空行不留

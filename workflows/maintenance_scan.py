@@ -36,14 +36,55 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 import logging
 
 from registry import db
-from services import dispositions, maintenance_intents as mi, store_limits
+from services import alloc_survey, dispositions, \
+    maintenance_intents as mi, store_absence, store_limits
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
+SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.maintenance_scan")
 
 _KIND_LABEL = mi.KIND_LABEL      # 唯一出处在 services(它是与执行件的连接键)
 _KIND_ORDER = ("delete", "title", "price", "inventory")
+
+
+def _channel_lines(zeroing: list[dict]) -> list[str]:
+    """输入:清零意图 → 输出:渠道不符那一档的**逐店**明细(不符就返空)。
+
+    为什么单独给它一行,而不是让它混在「清零合计」的原因码里:**补救动作是
+    逐店的**。其余四档(缺货/不可售/无 BuyBox/货期)的处置对象是商品,看总数
+    就够;渠道不符的处置对象是**这家店** —— 要么改它的「配送限制」,要么承认
+    这批货该换店。只报一个总数,人拿到手第一句话必然是"哪几家店",而这份
+    preview 是真提交之前唯一看得见破坏面的地方(与删除名单同一条理由)。
+
+    ⚠ **规划外店(谭总系)标出来的理由变了**(所有者定稿 2026-08-25:
+    「维护链对规划外店不豁免」)。分配链与审计链在判渠道**之前**就剔掉了这些店
+    (`alloc_survey.claimable` 先 is_excluded 再 offends_channel),维护链与上架链
+    则对所有店一视同仁 —— 这个差别**是有意的,不是待修的分歧**:规划外排除的是
+    「归属」(不给它们分货、不占品牌、不拦别人上架),不是「这家店能不能卖这个
+    渠道的货」,后者是店铺自己的经营配置,填了就该生效。
+
+    所以旗标现在只为一件事服务:**这些行不会出现在 `alloc_audit` 的渠道不符
+    下架清单里**。两份报告对不上是预期的 —— 不标的话,迟早有人拿两个数来问
+    "是不是漏了",而那时没人记得起这是定稿。
+    """
+    bad = [z for z in zeroing if z.get("code") == "channel_mismatch"]
+    if not bad:
+        return []
+    by: dict[str, int] = {}
+    for z in bad:
+        by[z["store"]] = by.get(z["store"], 0) + 1
+    n_out = sum(n for s, n in by.items() if alloc_survey.is_excluded(s))
+    cells = ",".join(f"{s}×{n}" + ("⚑" if alloc_survey.is_excluded(s) else "")
+                     for s, n in sorted(by.items(), key=lambda kv: (-kv[1], kv[0])))
+    out = [f"  ⚠ 其中渠道不符清零 {len(bad)} 行(本店渠道 ≠ 产品渠道):{cells}"]
+    if n_out:
+        out.append(f"    ⚑ = 规划外店,共 {n_out} 行 —— 所有者定稿 2026-08-25:"
+                   f"**维护链对规划外店不豁免**,照清零、照走「渠道不符 N 天」"
+                   f"下架。标出来只为一件事:这些行**不会**出现在 alloc_audit "
+                   f"的渠道不符下架清单里(那条链判渠道前就剔了规划外店),"
+                   f"两份报告对不上是预期的,不是漏了")
+    return out
 
 
 def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
@@ -88,9 +129,10 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
         codes: dict[str, int] = {}
         for z in zeroing:
             codes[z.get("code") or "-"] = codes.get(z.get("code") or "-", 0) + 1
-        # 四条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
+        # 五条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
         lines.append(f"  清零合计 {len(zeroing)} 条,原因:"
                      + ",".join(f"{c}×{n}" for c, n in sorted(codes.items())))
+        lines += _channel_lines(zeroing)
     by_store: dict[str, dict[str, int]] = {}
     for it in intents:
         by_store.setdefault(it["store"], {})[it["kind"]] = \
@@ -114,16 +156,51 @@ def run(params: dict) -> str:
     # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生
     managed, skipped_nodes = store_limits.managed_nodes()
     with db.pg_conn() as conn:
-        intents = mi.collect_all(conn, stockzero,
-                                 int(params.get("oos_days", 0) or 0),
-                                 managed=managed)
+        # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):catalog_sync 补试后
+        # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
+        # (生产老账:38 条改库存 + 30 条改价 not found)。判据从库里水位派生
+        # (services/store_absence),不靠调度顺序、不靠链内传参。
+        # 探测失败按"不避让"处理并在首行喊出来 —— 缺席探测靠 enabled_names
+        # (飞书),不兜底的话本工作流的 preview 会被一次飞书抖动整个拦下
+        # 降级与 only 范围收敛都在 store_absence.stale_or_note 里(四处同形,
+        # 2026-08-27 收口);拼进首行的分号由调用方补
+        absent, absence_note = store_absence.stale_or_note(conn, only)
+        absence_gap = f";{absence_note}" if absence_note else ""
+        intents, capped = mi.collect_all(conn, stockzero,
+                                         int(params.get("oos_days", 0) or 0),
+                                         managed=managed)
     if only:
         intents = [i for i in intents if i["store"] == only]
+        capped = [c for c in capped if c["store"] == only]
+    n_avoided = sum(1 for i in intents if i["store"] in absent)
+    if absent:
+        intents = [i for i in intents if i["store"] not in absent]
+        capped = [c for c in capped if c["store"] not in absent]
 
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
+    n_zero = sum(1 for i in intents
+                 if i["kind"] == "inventory" and i.get("new") == 0)
+    n_cut = sum(c["total"] - c["kept"] for c in capped)
+    # ⚠ 首行 = 结论 + 最要紧的数(notify_fmt 头注),而且**只有首行能到飞书**:
+    # 唯一调度路径是 product_chain 链,cli 对成功步骤只发 first_line_of。
+    # 清零规模与截断必须写在这一行 —— 放第 2 行等于只写日志,08-25 的
+    # "通知看起来一切正常"就会原样复现(对抗校验 2026-08-26 实跑证实)。
     lines = [f"维护意图 {len(intents)} 条:删除 {n_kind['delete']},"
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
-             f"库存 {n_kind['inventory']}(stockzero 店 {len(stockzero)} 家)"]
+             f"库存 {n_kind['inventory']}(清零 {n_zero};"
+             f"stockzero 店 {len(stockzero)} 家)"
+             + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")
+             + (f";⚠ 缺席避让 {len(absent)} 店:{','.join(sorted(absent))}"
+                f"(目录落后船队 >{store_absence.LAG_HOURS}h,"
+                f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
+                if absent else "")
+             + absence_gap]
+    for c in capped:
+        # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
+        lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
+                     f"{c['total']}→{c['kept']} 条(超单店单轮上限,按截断"
+                     f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
+                     f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     lines += _preview_lines(intents, stockzero)
     node_note = store_limits.managed_note(managed, skipped_nodes)
     if node_note:
@@ -146,17 +223,24 @@ def run(params: dict) -> str:
             f"(preview:未落建议行;本轮将写 {len(intents)} 条)"])
 
     rows = [mi.to_disposition(it) for it in intents]
+    keep = [(r["store"], r["sku"], r["action"]) for r in rows]
+    # 被配额截掉的落榜行**不是"不再建议"**:它们上一轮可能还挂着 suggested
+    # 行,不留在 keep 里就会被撤成「商品自己恢复正常了」(错误取证),
+    # 且下轮扫描又原样重建 —— 配额顺延要留在原地等下轮领取
+    keep += [k for c in capped for k in c.get("deferred_keys", ())]
     with db.pg_conn() as conn:
         n_sug = dispositions.suggest_many(conn, rows)
         # 撤销本轮不再建议的陈旧行:昨天建议清零、今天亚马逊回货了,扫描件
         # 不再建议它 —— 但昨天那条 suggested 还挂着,执行件照样会把它清零。
         # ⚠ store=only 不能省:`-p store=X` 那一轮 keep 里只有该店的行,
         # 不限范围会把**其余全部店铺**的待执行建议一次清空(批次 E 的坑)
+        # ⚠ exclude_stores=缺席店 不能省:缺席店的行不在 keep 里(本轮避让了),
+        # 不排除的话它们挂着的 suggested 会被撤成「商品自己恢复正常了」——
+        # 错误取证,且下轮又原样重建(缺席 ≠ 恢复正常)
         n_wd = dispositions.withdraw_stale(
-            conn, "maint",
-            [(r["store"], r["sku"], r["action"]) for r in rows],
+            conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-            store=only or None)
+            store=only or None, exclude_stores=sorted(absent))
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)

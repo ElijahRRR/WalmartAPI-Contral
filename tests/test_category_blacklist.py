@@ -107,7 +107,7 @@ def test_empty_rules_block_nothing():
 
 def _ctx(rules):
     return SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
-                           phase0_cats=frozenset(), cat_rules=rules,
+                           cat_rules=rules,
                            brand_blacklist={})
 
 

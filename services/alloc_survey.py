@@ -11,6 +11,7 @@
 
 import logging
 from collections import Counter, defaultdict, namedtuple
+from dataclasses import dataclass
 
 from registry import resources
 from services import brand_key as bk
@@ -48,10 +49,14 @@ def offends_channel(r, cfg) -> bool:
     第三种值,都不算——把"没采到"算成"货不对"会让无辜商品进下架清单;
     第三种值恒高说明采集侧 `is_fba` 解析坏了,那要修采集不是下架商品。
     店铺没填配送限制 = 不对拍(它另有报告点名补填)。
+
+    ⚠ 判定本身**不在这里**:2026-08-25 上架/维护两条链也要问同一个问题,
+    抽到 `store_targets.channel_conflict`(唯一出处)。本函数只负责把
+    「一行 + 配置」拆成它要的两个参数 —— 与 `alloc_engine` 把类目/货期
+    判定交还 store_targets 是同一条纪律。
     """
-    want = (cfg.get(r["store"]) or {}).get("channel")
-    ch = r.get("channel")
-    return bool(want) and ch in store_targets.CHANNELS and ch != want
+    return store_targets.channel_conflict(
+        (cfg.get(r["store"]) or {}).get("channel"), r.get("channel"))
 
 
 def claimable(rows, registered, cfg=None) -> list[dict]:
@@ -396,10 +401,6 @@ def channel_mismatch(prof, cfg):
     return out
 
 
-def _fmt_counter(c: Counter, top=4) -> str:
-    return ", ".join(f"{k}×{n}" for k, n in c.most_common(top))
-
-
 def suggest_categories(prof, cfg, top=2):
     """输入:店铺画像 + 配置 → 输出:每店一个 dict(见下)。
 
@@ -702,5 +703,104 @@ def _fetch_meta(cur, asins: list[str], with_channel: bool) -> dict:
 def _row(cur, sql) -> dict:
     cur.execute(sql)
     return dict(zip([d[0] for d in cur.description], cur.fetchone()))
+
+
+# ── 装载积木:四条分配链的公共入口 ───────────────────────────────────────
+# `need` 的可选项。**没点名的一律不查** —— 只要一半数据的链不该被多压几条
+# 全表 SQL(alloc_plan 不要 order_stores、claim_audit 不要 status)。
+NEED_ALL = ("pool", "signal", "pt_dict", "categories", "status",
+            "sales", "order_stores")
+
+
+@dataclass
+class Loaded:
+    """`load_rows` 的产物。
+
+    ⚠ `need` 没点名的字段是 **None**,与"查了但结果为空"(空 dict / 空 list)
+    不是一回事:报告拼装要分得开「本轮没查」与「查了确实没有」,合成一个值
+    就会把"没查"印成"没有"。
+    """
+    rows: list
+    st: Counter
+    pt2cat: dict
+    pool: dict | None = None
+    signal: dict | None = None
+    pt_dict: dict | None = None
+    pt_dict_err: str | None = None
+    categories: list | None = None
+    status: dict | None = None
+    sales: dict | None = None
+    order_stores: list | None = None
+
+
+def load_rows(conn, *, win=None, need=(), with_channel: bool = True) -> Loaded:
+    """输入:连接(+销量窗口 win、附加数据开关 need、是否带渠道)→ 输出:Loaded。
+
+    **四条分配链的唯一装载口**(2026-08-27 上移):alloc_audit / alloc_plan /
+    alloc_backfill / claim_audit 此前各自伸手进本模块的私有 `_SQL_*` /
+    `_fetch_meta` / `_row`,把同一段「装载 + enrich」抄了四遍 —— 下划线前缀
+    本来就说明服务侧不认为它们是对外接口。
+
+    公共骨架(四处逐字相同,不受 need 影响):PT→大类字典 → 在线行 →
+    抽 asins → `_fetch_meta` → `enrich`。
+
+    ⚠ `with_channel=False` 只有 alloc_audit 的 `-p channel=0` 用:省掉
+    latest_snapshot 那段 LATERAL 会让 rows 的 channel 全是 None,于是
+    `claimable` 的渠道闸恒为假 —— 回填/对账两条链**必须传 True**,否则
+    报告判一套、回填落另一套(alloc_backfill:86-91 记的就是这个洞)。
+
+    `pt_dict` 自带降级:P3 是对拍探针不是主线,字典表出问题不该拖垮整份
+    存量审计 —— 失败时 `pt_dict=None` 且 `pt_dict_err` 给首行原因,
+    并先 `conn.rollback()`(事务已 aborted,后续查询要先回滚)。
+    """
+    want = set(need)
+    unknown = want - set(NEED_ALL)
+    if unknown:     # 拼错一个开关就静默少查一整块,宁炸不吞
+        raise ValueError(f"load_rows 不认识的 need 项 {sorted(unknown)}"
+                         f"(可选:{list(NEED_ALL)})")
+    if want & {"sales", "order_stores"} and not win:
+        raise ValueError("load_rows 要 sales/order_stores 就必须传 win"
+                         "(sales_window() 的产物,两条 SQL 共用同一个窗口)")
+
+    pool = signal = pt_dict = pt_dict_err = None
+    categories = status = sales = order_stores = None
+    with conn.cursor() as cur:
+        if "pool" in want:
+            pool = _row(cur, _SQL_POOL)
+        if "signal" in want:
+            signal = _row(cur, _SQL_SIGNAL)
+        if "pt_dict" in want:
+            # P3 是对拍探针不是主线:字典表出问题不该拖垮整份存量审计
+            try:
+                pt_dict = _row(cur, _SQL_PT_DICT)
+            except Exception as e:              # noqa: BLE001 降级并明说
+                conn.rollback()                 # 事务已 aborted,后续查询要先回滚
+                pt_dict, pt_dict_err = None, str(e).strip().splitlines()[0]
+        if "categories" in want:
+            cur.execute(_SQL_CATEGORIES)
+            categories = cur.fetchall()
+        cur.execute(_SQL_PT2CAT)
+        pt2cat = {pt: c for pt, c in cur.fetchall() if c}
+        cur.execute(_SQL_ONLINE)
+        items = cur.fetchall()
+        if "status" in want:
+            cur.execute(_SQL_STATUS)
+            status = {s: (v or "").strip().upper() for s, v in cur.fetchall()}
+        if "sales" in want:
+            cur.execute(_SQL_SALES, win)
+            sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
+        if "order_stores" in want:
+            cur.execute(_SQL_ORDER_STORES, win)
+            order_stores = cur.fetchall()
+
+        asins = sorted({a for a in (sku_asin.extract_asin(it[1])
+                                    for it in items) if a})
+        meta = _fetch_meta(cur, asins, with_channel)
+
+    rows, st = enrich(items, meta, pt2cat)
+    return Loaded(rows=rows, st=st, pt2cat=pt2cat, pool=pool, signal=signal,
+                  pt_dict=pt_dict, pt_dict_err=pt_dict_err,
+                  categories=categories, status=status, sales=sales,
+                  order_stores=order_stores)
 
 

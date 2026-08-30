@@ -9,8 +9,8 @@
 
 | schema | 职责 | 写入者 |
 |---|---|---|
-| `catalog` | 产品主数据:产品身份 + 采集快照(与采集/审核服务共享的中心) | catalog_sync 工作流(未来:审核服务直写审核字段) |
-| `listing` | 上架域:上架任务、feed 明细、UPC 池 | listing / maintenance / upc 相关工作流 |
+| `catalog` | 产品主数据:产品身份 + 采集快照 + 黑名单中心 + 占用台账 | catalog_sync(在线商品)/ product_ingest(采集摄取)/ **product_audit 经 services.audit_store 直写 audit_* 五列(已落地,不再是「未来」)** / risk_sync·blacklist_push(黑名单中心)/ 分配链(claims) |
+| `listing` | 上架域:**现在只剩 `retire_cooldown`**(SKU_LOCKED 自愈冷却);tasks / upc_pool 已于 2026-08-12 退役删除,在用的 UPC 池是 `catalog.upc_pool` | sku_locked_heal |
 | `orders` | 订单域:订单、审核结果、结算、售后 | order_audit / returns_sync / settlement 相关工作流 |
 | `ops` | 运行域:运行记录、防重状态、游标 | cli.py 与各工作流 |
 | `audit` | 审核域:规则字典、审核结论明细(2026-08-13 批次 A 迁自 walmart-audit-system) | audit_import(一次性)/ risk_sync(镜像)/ product_audit(批次 B 起) |
@@ -42,6 +42,14 @@ CREATE TABLE catalog.products (
     audit_status    text,        -- pending / approved / rejected
     audit_reason    text,
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
+    pt_source       text,        -- PT 来历(2026-08-14 定稿):walmart_confirmed=沃尔玛
+                                 -- 真接受过 / audit_llm=审核链 LLM 推断。catmap_mine 只数
+                                 -- 前者,否则 LLM 猜的 PT 会被自己反复确认再放大到整类目
+    slow            jsonb,       -- 采集 slow 段全量留存(卖点/描述/重量/尺寸/变体);
+                                 -- 契约的 raw 是裁剪过的,只存 raw 会丢卖点与重量
+    browse_node_chain text,      -- 根→叶 browse node ID 链(采集 slow.category_id_chain)
+    browse_node_id  text,        -- 叶子 node;类目名会漂 ID 不会,类目闸与审核 L1 ②级
+                                 -- 优先按 ID 判(索引 products_browse_node_idx)
     audited_at      timestamptz,
     audit_version   text,        -- 审核规则版本,规则升级后可按版本批量重审
     -- (原"复用资产/归属"五列 assigned_upc/listing_attrs/last_feed_id/store/owner
@@ -208,7 +216,10 @@ CREATE TABLE catalog.brand_blacklist (brand_key PK, brand, source,
     added_date, synced_at);
 -- ↑ 黑名单品牌**总清单**镜像(risk_sync 飞书→PG)+ 否决闸数据源;
 --   cleanup 自产品牌 DO NOTHING 补进闸门。src_sku/biz_cn/pushed_at 三列为
---   2026-08-11 过渡遗留,不再被消费(投影改走 brand_err_hits)。
+--   2026-08-11 过渡遗留;2026-08-14 逐列复核订正:**src_sku 仍是活的**
+--   (risk_sync 把飞书总表 D 列 ASIN 镜像进来做溯源,services/risk_gate.sync_brands
+--   的 INSERT 列清单里),真正零消费的只有 biz_cn / pushed_at 两列 —— 两列未删,
+--   理由与「要删先连库自证」的判据见 schema.sql 该表注释。
 --   2026-08-13 起同时是审核 Phase0 品牌闸的数据源(黑名单中心统一)。
 
 -- 黑名单中心两张单列镜像表(所有者定稿 2026-08-13:审核四闸直读黑名单
@@ -224,9 +235,11 @@ CREATE TABLE catalog.seller_blacklist (seller_id PK, synced_at);
 --                 (**首选**;解决父级不覆盖子级 + 类目改名两个老毛病)
 --   top_name      按顶级类目名(亚马逊顶级 browse node 无 ID,只能按名字)
 --   path_exact    归一化完整路径等值(飞书镜像历史行,兼容保留)
--- source 列分家两个写入口:'feishu' 归 risk_sync 全量重灌(**只 DELETE 这一
--- 源**,否则每天同步一次就把清洗成果洗没了),'cleanup'/'seed' 归
--- category_blacklist_import。判定件 services/category_blacklist.py 零 DB。
+-- source 只记来源('feishu'/'cleanup'/'seed'),**不再按它分家**(2026-08-20 所有者
+-- 定稿:飞书那张五列表是本表的唯一维护面)—— risk_sync 是**整表镜像**:单事务
+-- TRUNCATE + 全量重灌,表里有什么库里就是什么;分家会让「飞书里删了库里还在拦」
+-- 的幽灵长期存在。代价是 category_blacklist_import 灌的行会被下次同步覆盖,
+-- 那个工作流从此只作首次灌种 / 应急。判定件 services/category_blacklist.py 零 DB。
 CREATE TABLE catalog.amazon_cat_blacklist (
     category_norm PK,   -- 归一化路径(audit_phase0.normalize_amazon_category,
                         -- 入库/查询两侧共用同一函数,读取端不再二次归一化)
@@ -246,6 +259,23 @@ CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
 ```
 
 ```sql
+-- 占用台账(分配 A1,docs/allocation_plan.md §五):品牌与产品的排他归属。
+-- **占用是决策不是观测**:只有「分配」和「释放」两个显式动作能改它,在线快照
+-- 怎么抖都不影响(店铺暂停、商品下架、从没上架成功,占用都不动)。排他性由
+-- 部分唯一索引 claims_active_uniq (kind, claim_key) WHERE status='active' 保证,
+-- 不靠代码自觉;released 行永久保留 —— 它是「这个品牌当初属于谁、什么时候为什么
+-- 放出来」的唯一答案。读写唯一出处 services/claims.py;消费方含 list_new 占用闸。
+CREATE TABLE catalog.claims (
+    id         bigint IDENTITY PRIMARY KEY,
+    kind       text NOT NULL,            -- brand / product
+    claim_key  text NOT NULL,            -- brand=services/brand_key 归一键;product=ASIN
+    store      text NOT NULL,
+    status     text NOT NULL DEFAULT 'active',   -- active / released
+    walmart_pt text, pt_source text, audit_version text,  -- 决策时快照(2026-08-15)
+    source     text NOT NULL,            -- 落它的工作流(alloc_backfill / allocate)
+    note text, claimed_at timestamptz, released_at timestamptz, released_reason text
+);
+
 -- 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪,"病历")
 CREATE TABLE catalog.product_events (
     id bigint IDENTITY PRIMARY KEY,
@@ -279,8 +309,10 @@ CREATE TABLE catalog.product_events (
 事件账本三条纪律:只追加永不改;**回执与观测分开记**(feed 回执 success 是
 沃尔玛的一面之词,删除以 catalog_sync 观测核验为准——回执成功但宽限期后仍
 在架 → delete_not_effective 告警,所有者实证的真实故障模式);写入点分布:
-catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/
-未来 listing·审核(入库/审核/上架)。
+catalog_sync(观测迁移)/ feed_track(回执)/ product_clear(提交)/ product_ingest(入库)/
+list_new·match_listing(上架)/ product_audit(审核)/ problem_scan(归类)/
+problem_product_cleanup(破坏动作)/ sku_locked_heal(退役)——「未来 listing·审核」
+那一档已在批次 B/E 全部接线,不再是待办。
 
 ## listing — 上架域
 
@@ -379,7 +411,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 |---|---|---|---|
 | `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流。**`asin`**(A1.5,2026-08-15):源头 ASIN,由 `order_asin_normalize` 按 `services/sku_asin` 补填,**提不出留 NULL**;分配引擎的产品/品牌销量维度按 `asin IS NOT NULL` 过滤,**不许拿 sku 原文当 asin** | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 + order_asin_normalize 补 asin |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
-| `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric)) | 绩效同步(daily_report problems 后续并轨) |
+| `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric))(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键,与 schema.sql 注释一致) | `perf_problems`(2026-08-08 从 daily_report 摘出独立成流,已落地;写库经 services/order_lines) |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
 
 视图:
@@ -426,13 +458,17 @@ CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作
     feed_type   text NOT NULL,
     status      text NOT NULL,      -- submitted / success / failed / missing
     error_code  text,
+    error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
+                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
     submitted_at timestamptz NOT NULL DEFAULT now(),
     resolved_at  timestamptz,
     PRIMARY KEY (feed_id, sku)
 );
 -- 终态由 services/feed_track 轮询回写(feed_poll 工作流全局扫,业务工作流也可
 -- 单 feed 轮询);SKU 级状态权威在此,飞书驱动表的"结果"列只是投影。
--- 停用/删除/设置到期日期 + 未来的上架/改价/改库存/改标题 feed 全走这一套。
+-- 停用/删除/设置到期日期 + 上架/改价/改库存/改标题 feed 全走这一套 —— 七种
+-- feedType 均已接线(DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE / MP_ITEM /
+-- MP_ITEM_MATCH / price / inventory),载荷构造唯一出处 api/feeds.py。
 
 CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
     table_id    text NOT NULL,      -- 飞书 table_id
@@ -509,6 +545,10 @@ CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不�
 CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一个 ASIN×邮编一行)
     asin text, zip text,            -- zip = 5 位标准邮编
     batch_name text, state text,    -- pending / done / failed
+    error_type text,                -- 采集侧失败类型,**单独成列不埋在 reason 文本里**:
+                                    -- 判定链按它分流 —— RETRYABLE 换时段重采可能就好;
+                                    -- variant_offset / parse_error / server_reject 重采
+                                    -- 多少次都一样,给终局结论并停止重推(免得白烧配额)
     reason text, requested_at timestamptz, settled_at timestamptz,
     first_requested_at timestamptz, -- 这一轮重试从什么时候开始(重推不刷新)
     attempts integer,               -- 只作运维观察
@@ -533,8 +573,9 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 **只收永久禁止类 B/C/E/F/G/K**(`services/blacklist.PERMANENT`;13 类词表只是
 飞书来源列的格式约定,不是入选范围——所有者拍板 2026-08-11)。入选按**当轮
 =最新**类别(历史实证类别翻动频繁,"曾命中过"不能作数)。一次入选不更新
-(DO NOTHING)。`biz_cn` 是独立维度(中国卖家专属禁售);`pushed_at` 是飞书
-投影水位(NULL=待推,投影到「黑名单ASIN」表,PG 权威)。
+(DO NOTHING)。`biz_cn` 是独立维度(中国卖家专属禁售);`pushed_at` 自 2026-08-17
+起**不再是待推水位** —— blacklist_push 已改成整表重写(库里有什么表里就是什么),
+这一列现在只表示「这行投影过了」,给探针与对账用(投影到「黑名单ASIN」表,PG 权威)。
 另收 **category='LEGACY'**(source='历史继承'):旧审核系统随迁的历史黑名单
 ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统一)。
 写入方 problem_scan 尾段(2026-08-14 批次 E 前是 problem_product_cleanup) + asin_blacklist_import(一次性);
@@ -556,6 +597,14 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
     PRIMARY KEY (scope, key)
 );
 ```
+
+本节未逐张列出、但**确实在库里也在用**的 ops 表与视图(DDL 与注释在
+`refdata/schema.sql`,别再当成「没有」而重复建表):`ops.scrape_batches`
+(采集推送批次台账,product_refresh 与 order_audit 共用一张,超时口径按批次名
+前缀各圈各的)、`ops.scrape_failures`(批次落定时拉 `/api/batches/{id}/failures`
+的逐 ASIN 真失败,与 `snapshots.outcome` 互补)、`ops.feed_item_errors`(一条
+ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.v_feed_error_stats`
+与 `ops.v_scrape_failure_stats`(**零程序读者是设计如此**,留给人与 AI 排障)。
 
 ### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
 
@@ -591,8 +640,11 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 | `blacklist_brand_ip_stats` | 品牌 IP precision 分层(**含人工 override 三列,重算永不覆盖**) | audit_import 搬入(不可重算) |
 | `violation_groundtruth` | 打标真值(批次 B 双跑校准黄金集) | audit_import 搬入 |
 | `walmart_error_records` | 错误商品日报 97k 行(precision 证据 + 实证类目反哺源) | audit_import 搬入;增量同步链批次 B 定 |
-| `walmart_pt_meta` / `walmart_pt_spec` / `walmart_prohibited_policy` | PT 元数据 7033 / 官方 spec 摘要 6942 / 禁售政策 43 类 | ⚠ 反推表(旧仓无 DDL):列类型按 sync 脚本推定,audit_import dry-run 与生产实表对照后才准导入 |
+| `walmart_pt_meta` / `walmart_pt_spec` / `walmart_prohibited_policy` | PT 元数据 7033 / 官方 spec 摘要 6942 / 禁售政策 43 类 | ⚠ 反推表(旧仓无 DDL):列类型按 sync 脚本推定,audit_import dry-run 与生产实表对照后才准导入。⚠ **`walmart_pt_meta` 已不是死快照**:risk_sync 每次同步 TRUNCATE + 全量重灌(services/risk_gate.sync_pt_meta,空读拒绝重灌 + 骤缩护栏),它是 R1 准入闸 / R3 认证闸唯一查的表,改前先看下面 `pt_meta_change_log` 那行;`walmart_pt_spec` 由 pt_spec_sync 重建,2026-08-21 起 R3 已不再读它 |
 | `audit_runs` / `audit_hits` | 逐次审核结论 + 逐条规则命中(reject 永久短路的依据) | audit_import 搬历史;product_audit 批次 B 起追加 |
+| `amazon_taxonomy` / `amazon_node_paths` | 亚马逊类目树:节点级属性按 node_id 一行 / **路径级**关系按 (node, parent, full_path) 三元组 —— browse tree 是 DAG,同一 node 可挂多个父,按 ID 去重会静默丢掉多路径 | taxonomy_import(文件段)+ taxonomy_derive(中间层反推,source=derived_products) |
+| `category_path_alias` | 类目路径别名(叶子相等 + 顶级相等 + 段集重叠 ≥0.5):映射精确匹配未命中时折到 canonical 再查 | catmap_align |
+| `category_map_suggestions` | 类目映射缺口建议 —— **纯建议、零消费**,人工确认后升级进 walmart_category_map 才生效 | catmap_suggest / catmap_mine |
 | `pt_meta_change_log` | **PT 判据变更台账**(2026-08-21 加,只追加):`sync_pt_meta` 每次全量重灌**前**逐 PT 比对 `access_state` / `zh_can_do` / `requirements` 三列,只落真变了的(前后值都记)。存在的理由:飞书类目表一改,R1 准入闸与 R3 认证闸的判据整批换掉,而 `products.audit_version` 是**仓库侧**的规则版本号,不会因为数据变了而递增 —— 于是 `rerule` / `mode=nonpass` 那两条带版本谓词的通道对数据变更完全无感(所有者 2026-08-21 实遇:全量扫过一遍之后双双报「共 0 个」)。有了它,`product_audit -p repts=1` 按`changed_at > products.audited_at` 精确取候选,既不依赖版本号也不用人记得加开关 | risk_sync(每次重灌时写) |
 
 **历史实证 PT 不设边表**(所有者定稿 2026-08-13):PT 是产品属性,直接回填

@@ -721,7 +721,8 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
 );
 CREATE INDEX IF NOT EXISTS perf_events_store_idx ON orders.perf_events (store, metric, period);
 CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
--- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (store,po_id,metric))
+-- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (po_id,metric))
+--(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键)
 
 -- 影响范围视图:每条违规的存续区间。still_active = 该违规出现在此(店铺,指标)
 -- 最近一次报表周期中,即"仍在拖当前绩效分";消失即代表滚出官方统计窗口——

@@ -77,7 +77,7 @@ _GATES = ("brand", "category", "lead", "channel")
 # 2026-08-21 实测:卡住的 6,490 件 FBA 里,**每一件的大类都有店在收**,真正
 # 拦路的是货期(已分配的货配送天数最大 7 天,一件超的都没有;卡住的 17.6% 超 7 天)。
 # 也就是说这个标签把所有者往"去开大类"上支了整整一批,而开大类一件也救不回来。
-# 定向流那边 2026-08-16 已经按真实原因拆过(见 alloc_plan._fit_to_store 的
+# 定向流那边 2026-08-16 已经按真实原因拆过(见本文件 _fit_to_store 的
 # docstring),自由流这边漏了 —— 这次补上。
 NO_BRAND, NO_CATEGORY, NO_LEAD, NO_CHANNEL = (
     "no_brand", "no_category", "no_lead", "no_channel")
@@ -539,8 +539,7 @@ MIN_FREE_FOR_RATIO = 20
 MIN_FREE_SHARE_OF_QUOTA = 0.10
 
 
-def acceptance(result: dict, top_layers: int = 1,
-               rotation_only: bool = True) -> dict:
+def acceptance(result: dict, top_layers: int = 1) -> dict:
     """输入:`deal()` 产物 → 输出:§7.4b 的验收指标(逐店)。
 
     **顶层比值 = 「这家店拿到的自由流货里,顶层占多大比例」÷「全体的同一比例」**
@@ -563,14 +562,13 @@ def acceptance(result: dict, top_layers: int = 1,
     `top_layers` 决定"好货"算到第几层(默认只算 L1)。
     """
     by = result["by_store"]
-    key = "by_layer_free" if rotation_only else "by_layer"
+    key = "by_layer_free"
     tot_q = sum(v["quota"] for v in by.values())
     tot_i = sum(v["items"] for v in by.values())
     top = {s: sum(n for li, n in (v.get(key) or {}).items() if li <= top_layers)
            for s, v in by.items()}
-    # 该店参与竞争的总量(默认口径:自由流全部层)
-    mine = {s: (sum((v.get(key) or {}).values()) if rotation_only else v["items"])
-            for s, v in by.items()}
+    # 该店参与竞争的总量(自由流全部层)
+    mine = {s: sum((v.get(key) or {}).values()) for s, v in by.items()}
     tot_top, tot_mine = sum(top.values()), sum(mine.values())
     base = (tot_top / tot_mine) if tot_mine else 0.0   # 全体的顶层占比
     out = {}

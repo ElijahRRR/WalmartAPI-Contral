@@ -176,7 +176,13 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 6. 摘要新增一行:「受管仓=<FC ID> 的店 N 家;校验失败跳过 M 家」——
    配置生效与否必须天天见人。
 
-## 7. 批次 3|上架链(最薄)+ 运维 runbook ✅ 代码完成(2026-08-24)
+## 7. 批次 3|上架链(最薄)+ 运维 runbook ✅ **生产验证通过(2026-08-30)**
+
+> 实证:谭总12 新上架 B0HCNJTHM8 → `GET /v3/inventories/{sku}` 回
+> `{"1011159562695573505": 20, "10003247367": 0}` —— 首铺库存 20 件直接进
+> 受管仓(中山),`fulfillmentCenterID` 生效,**新品无需任何人工动作**。
+> 附带观察:沃尔玛同时给 Virtual 建了一行 `0` —— 与本仓"缺节点行 = 那个仓
+> 没货 = 判 0"的口径一致(见 §6 `current_qty`)。
 
 代码:`list_new` 预取 `partners` 处改调 `store_limits.managed_nodes()` +
 `listing_fc()`;`build_orderable` 的 `fulfillmentCenterID` = 配置店 FC ID /

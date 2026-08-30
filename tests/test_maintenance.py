@@ -1463,3 +1463,28 @@ def test_listing_fc_prefers_the_managed_node(monkeypatch):
                         lambda s: "PARTNER")
     assert store_limits.listing_fc(_store("T1"), {"T1": "111"}) == "111"
     assert store_limits.listing_fc(_store("T2"), {"T1": "111"}) == "PARTNER"
+
+
+def test_match_restock_never_fires_into_an_unlinked_managed_node():
+    """⚠ 配置店而受管仓明细没扫到:跟卖铺货**跳过**,不当"没货要铺"。
+
+    这里的"未知"与未配置店的"未知"方向相反:后者是"读不到,保守铺上"
+    (2026-08-12 结构洞),前者是"SKU 还没与新仓建立关联"——当没货铺会给
+    全部跟卖品往新仓写保守值,存量货还在 Virtual Node 上,两节点同时有货。
+    所有者拍板 2026-08-30:配置店只维护受管仓,存量行等搬仓。
+    """
+    managed = {"T1": "N_NEW"}
+    # (store, sku, avail_qty, node_qty):存量跟卖品,合计 0、新仓无关联
+    conn = _Conn(rows=[("T1", "M0A", 0, None)])
+    assert mi.match_inventory_intents(conn, [], managed) == []
+
+    # 搬仓后(新仓关联建立,qty 0 也会出行):恢复铺货,且意图带 ship_node
+    conn = _Conn(rows=[("T1", "M0A", 0, 0)])
+    out = mi.match_inventory_intents(conn, [], managed)
+    assert [(i["sku"], i["new"], i["ship_node"]) for i in out] == [
+        ("M0A", mi.MATCH_INVENTORY_QTY, "N_NEW")]
+
+    # 未配置店的"未知"维持旧口径:照旧算要铺(不带 ship_node)
+    conn = _Conn(rows=[("T2", "M0B", None, None)])
+    out = mi.match_inventory_intents(conn, [], managed)
+    assert [(i["sku"], "ship_node" in i) for i in out] == [("M0B", False)]

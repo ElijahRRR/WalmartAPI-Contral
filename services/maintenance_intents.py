@@ -541,7 +541,18 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
                                      **managed_params(managed)})
         rows = cur.fetchall()
     out = []
+    skipped_no_node = 0
     for store, sku, avail, node_q in rows:
+        if store in (managed or {}) and node_q is None:
+            # ⚠ 配置店而受管仓明细没扫到:**跳过,不当"没货要铺"**。
+            # 这里的"未知"与下面那个"未知"方向相反:未配置店的未知是
+            # "旧口径读不到,保守铺上"(2026-08-12 结构洞);配置店的未知是
+            # "SKU 还没与新仓建立关联"——当没货铺会给全部跟卖品往新仓写
+            # 保守值,存量货还在 Virtual Node 上,两节点同时有货、合计翻倍。
+            # 与 inventory_intents 同一条 fail-closed 口径(所有者拍板
+            # 2026-08-30:配置店只维护受管仓,存量行等搬仓)。
+            skipped_no_node += 1
+            continue
         cur_q = current_qty(store, avail, node_q, managed)
         if cur_q:                       # 只铺 0/未知;None(未知)照旧算要铺
             continue
@@ -550,6 +561,10 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
                     "code": "match_restock",
                     "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})",
                     **_node_of(store, managed)})
+    if skipped_no_node:
+        logger.warning("跟卖铺货:%d 条受管仓明细未落库,本轮跳过"
+                       "(SKU 尚未与受管仓建立关联;搬仓后自动恢复)",
+                       skipped_no_node)
     return _cap(out, "inventory")
 
 
@@ -686,9 +701,13 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
         # 静默跳过 = "今天这批没差异"的假象。必须见人:它意味着受管仓的明细
         # 还没落库(新配的仓 / catalog_sync 没扫到),下一轮会自然恢复;
         # 长期非 0 说明配的 FC ID 在 GET /v3/inventories 里根本不出现
+        # 两种正当原因,别一见非 0 就当故障:① 新上架/刚搬仓的 SKU 等下轮
+        # catalog_sync;② **存量 SKU 还没搬仓**(所有者拍板 2026-08-30:配置店
+        # 只维护受管仓,存量行的库存维护暂停到搬仓为止,超卖风险知情接受)。
+        # 真正的故障信号是"搬完仓了这个数还不掉"——那才查 §2.4。
         logger.warning("受管仓明细未落库,本轮跳过 %d 条库存意图"
-                       "(下轮 catalog_sync 扫到即恢复;长期非 0 = 配的 FC ID "
-                       "在库存响应里不出现,查 docs/multi_node_plan.md §2.4)",
+                       "(未搬仓的存量行 = 预期暂停,所有者拍板 2026-08-30;"
+                       "搬完仓仍非 0 才查 docs/multi_node_plan.md §2.4)",
                        skipped_no_node)
     return _cap(out, "inventory")
 

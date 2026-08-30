@@ -2074,3 +2074,66 @@ def test_append_records_delegates_the_scan_to_the_shared_next_empty(monkeypatch)
 
     maint_sheet.append_records([row])
     assert seen == [(sheet_entry, 9)]
+
+
+# ── 旧节点清零(搬仓收尾,一次性)──────────────────────────────────────────
+
+def test_node_clear_refuses_to_clear_the_managed_node(monkeypatch):
+    """⚠ 拒绝清受管仓:自动链每轮都在维护它,清了下一轮就写回来。
+
+    两条规则互相拆台,而且没人看得出是谁在跟谁较劲 —— 停售整店走 stockzero。
+    """
+    from workflows import node_clear as nc
+
+    monkeypatch.setattr(nc.stores_svc, "load_stores",
+                        lambda filter_names=None: [_store("T1")])
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
+    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes",
+                        lambda s: (_ for _ in ()).throw(
+                            AssertionError("拒绝之前不该去读库存")))
+    out = nc.run({"store": "T1", "node": "N_NEW"})
+    assert "拒绝执行" in out and "受管仓" in out and "stockzero" in out
+
+
+def test_node_clear_dry_run_writes_nothing_and_lists_the_targets(monkeypatch):
+    """--dry-run 一件都不写,但要报出规模与最大的几个(人眼闸门)。"""
+    from workflows import node_clear as nc
+
+    monkeypatch.setattr(nc.stores_svc, "load_stores",
+                        lambda filter_names=None: [_store("T1")])
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
+    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
+        "B0A": {"N_OLD": 999, "N_NEW": 3},
+        "B0B": {"N_OLD": 5},
+        "B0C": {"N_NEW": 7},            # 旧节点没货 → 不在名单里
+        "B0D": {"N_OLD": 0},            # 旧节点是 0 → 不用清
+    })
+    monkeypatch.setattr(nc.inv_api, "put_inventory",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("dry-run 不许写")))
+    out = nc.run({"store": "T1", "node": "N_OLD", "dry_run": True})
+    assert "该节点上有货的 2 个,合计 1004 件" in out
+    assert "dry-run" in out and "2 个 SKU" in out
+
+
+def test_node_clear_names_the_failures(monkeypatch):
+    """失败必须点名:写 0 是幂等的,重跑即补;静默的话那批货还在旧节点上卖。"""
+    from workflows import node_clear as nc
+
+    monkeypatch.setattr(nc.stores_svc, "load_stores",
+                        lambda filter_names=None: [_store("T1")])
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {})
+    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
+        "B0A": {"N_OLD": 9}, "B0B": {"N_OLD": 8}})
+    seen = []
+
+    def put(store, sku, qty, node=None):
+        seen.append((sku, qty, node))
+        return (False, "节点 N_OLD status=FAILURE: 库存台账没有这一行") \
+            if sku == "B0B" else (True, "")
+
+    monkeypatch.setattr(nc.inv_api, "put_inventory", put)
+    out = nc.run({"store": "T1", "node": "N_OLD"})
+    assert seen == [("B0A", 0, "N_OLD"), ("B0B", 0, "N_OLD")]   # 都写 0,带节点
+    assert "清零成功 1/2" in out
+    assert "⚠ 失败 1 个" in out and "B0B" in out and "FAILURE" in out

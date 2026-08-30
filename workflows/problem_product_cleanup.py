@@ -50,8 +50,8 @@ from api import _client, feeds
 from registry import db
 from services import dispositions
 from services import kpi, maint_sheet, notify_fmt as nf
-from services import product_events, store_absence, store_limits, \
-    store_retry, stores as stores_svc
+from services import product_events, store_absence, store_events, \
+    store_limits, store_retry, stores as stores_svc
 
 DANGEROUS = True
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -243,6 +243,11 @@ def run(params: dict) -> str:
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
     today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
     records: list[tuple] = []       # 维护记录表的行(见文件末尾一次性写出)
+    # 各店动作计数(店铺事件账本用)。**就地填、跨两轮累加**,与 records 同一
+    # 条纪律:_RetryNeeded 一抛,返回值就没了,而"这几片其实发出去了"必须留下。
+    # 二轮重试的店天然只有一条事件(两轮的数加在同一个店的字典上)—— 分两条
+    # 记的话账本上那家店看起来这一轮删了两遍
+    cnt_by_store: dict[str, dict] = {}
 
     def _one(store_name: str) -> tuple:
         """输入:店铺名 → 输出:(店铺名, 该店的摘要行, 该店的记录行)。
@@ -266,7 +271,7 @@ def run(params: dict) -> str:
                               for r in plans[store_name].get(action) or [])
             return store_name, lines_s, recs_s
         if _submit_store(store_name, store, plans[store_name], lines_s,
-                         recs_s, today):
+                         recs_s, today, cnt_by_store.setdefault(store_name, {})):
             raise _RetryNeeded(store_name, lines_s, recs_s)
         return store_name, lines_s, recs_s
 
@@ -334,12 +339,20 @@ def run(params: dict) -> str:
         lines.append(gate_note or f"二轮重试 {len(retry_stores)} 店(串行):"
                                   f"{','.join(retry_stores)}")
         for name in retry_stores:
+            cnt_by_store.setdefault(name, {})["retried"] = True
             lines.extend(got2.get(name, []))
             if name in still_names:
                 lines.append(f"  ⚠ {name}:"
                              + ("未补试(疑似系统性故障)" if gate_note
                                 else "二轮仍失败")
                              + ",待下轮调度")
+
+    # 店铺事件账本(运营类):**两轮全跑完之后**才记,每店一条 —— 二轮重试的
+    # 店在这里已经把两轮的数加在同一个字典上了(分两条记的话,账本上那家店
+    # 看起来这一轮删了两遍)。记账失败只告警,不拖垮破坏链
+    store_events.record_round_safe("problem_product_cleanup",
+                                   store_events.CLEANUP_ROUND,
+                                   cnt_by_store, lines)
 
     # 维护记录表(2026-08-24):删除归口到本工作流之后不写表的话,所有者的
     # 这张面板就再也看不见删除流水了 —— 那是他每天看的东西。裁剪归 maintenance
@@ -363,7 +376,8 @@ def _sheet_row(store: str, r: dict, suggestion: str, action: str,
 
 
 def _submit_store(store_name: str, store: dict, b: dict,
-                  lines: list[str], records: list[tuple], today: str) -> bool:
+                  lines: list[str], records: list[tuple], today: str,
+                  cnt: dict | None = None) -> bool:
     """输入:店铺 + 按动作分桶的建议行 → 输出:是否需二轮重试(网络类失败)。
 
     多切片滑窗对位记账(与 product_clear._submit_new 同款);**只有
@@ -372,10 +386,11 @@ def _submit_store(store_name: str, store: dict, b: dict,
     等一个不存在的 feed 的判决。
     retryable=token/代理阶段确定未达;凭证失效(StoreDeadError)不重试。
 
-    ⚠ records 是传进来的、不是返回的(与 maintenance._submit_kind 同款理由):
-    提交到一半抛异常时,已经提交出去的那几片必须留下记录。返回局部列表的话,
-    异常一抛连同"这几条其实发出去了"一起丢掉,表里看起来什么都没干、
-    沃尔玛队列里却真在跑。
+    ⚠ records/cnt 是传进来的、不是返回的(与 maintenance._submit_kind 同款
+    理由):提交到一半抛异常时,已经提交出去的那几片必须留下记录。返回局部
+    列表的话,异常一抛连同"这几条其实发出去了"一起丢掉,表里看起来什么都
+    没干、沃尔玛队列里却真在跑。`cnt`(店铺事件账本用)同理,而且它还要
+    **跨两轮累加**:二轮重试的店记两条事件的话,账本上看起来它这一轮删了两遍。
     """
     need_retry = False
 
@@ -383,6 +398,7 @@ def _submit_store(store_name: str, store: dict, b: dict,
         nonlocal need_retry
         feed_type, event, label = _ACTION_FEED[action]
         n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+        bucket = cnt.setdefault(action, {}) if cnt is not None else {}
         # 多切片滑窗对位走 api/feeds 的公共游标(6 个工作流曾各写一遍
         # `rows[i:i+count]; i += count`,错一位就是整批结局落到别人行上)
         for res, rows_slice in feeds.iter_result_slices(
@@ -414,6 +430,8 @@ def _submit_store(store_name: str, store: dict, b: dict,
                                for r in rows_slice)
             if res.get("retryable"):
                 need_retry = True
+        for k, v in n.items():
+            bucket[k] = bucket.get(k, 0) + v
         # 四档计数的尾巴走 notify_fmt 的成品件(三个执行件逐字重复过);
         # failed 档字样由调用方给 —— 本件现行「提交失败」,maintenance 现行
         # 「提交被拒」,收口时逐字保留两处现状,不替所有者统一措辞

@@ -423,3 +423,49 @@ def test_absence_probe_failure_stops_every_destructive_action(monkeypatch):
     assert "⚠ 缺席探测失败,本轮破坏动作全停(fail-closed)" in first
     assert "2 条建议留在 suggested 原地" in first
     assert seen["marked"] == [] and seen["events"] == [] and seen["sheet"] == []
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    got: list = []
+    monkeypatch.setattr(ppc.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_the_two_rounds_are_summed_into_one_event(monkeypatch):
+    """★ 二轮重试的店只记**一条**,两轮计数相加。
+
+    分两条记的话,账本上那家店看起来这一轮删了两遍 —— 而二轮重提的那批
+    第一轮其实已经发出去了(被在途防重挡回 dedup),不是又删了一次。
+    """
+    _wire(monkeypatch, [_row("T1", "S1", rid=7)])
+    calls = {"n": 0}
+
+    def flaky_then_dedup(store, ft, entries, *, workflow=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{"feed_id": None, "count": 1, "outcome": "failed",
+                     "retryable": True}]
+        return [{"feed_id": "F_OLD", "count": 1, "outcome": "dedup"}]
+
+    monkeypatch.setattr(ppc.feeds, "submit_feed", flaky_then_dedup)
+    got = _capture_rounds(monkeypatch)
+    ppc.run({"execute": True})
+    assert len(got) == 1
+    per_store = got[0][2]
+    assert list(per_store) == ["T1"]
+    assert per_store["T1"]["delete"] == {"submitted": 0, "dedup": 1,
+                                         "failed": 1, "unknown": 0}
+    assert per_store["T1"]["retried"] is True
+    assert got[0][1] == ppc.store_events.CLEANUP_ROUND
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    _wire(monkeypatch, [_row("T1", "S1")])
+    got = _capture_rounds(monkeypatch)
+    ppc.run({"execute": False})
+    assert got == []

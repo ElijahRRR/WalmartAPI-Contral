@@ -539,6 +539,17 @@ CREATE TABLE ops.store_kpi_daily (
 --              (claim_released:整店 high、点名/csv mid)。
 --              治理类**与业务动作同事务**:台账落了而事件没落,事后按事件流
 --              回查"这个品牌当初什么时候归的它"会查不到。
+--   ops        五条执行链**每店每轮一条**(severity 恒 info):list_new /
+--              maintenance / problem_product_cleanup / product_clear /
+--              match_listing,detail = 该店本轮的计数字典。
+--              ⚠ **绝不逐 SKU**(逐 SKU 归 catalog.product_events 与
+--              ops.feed_items;五条链每天几万行,记几个月就是上千万行,
+--              而且会把风险/治理两类淹到查不出来);**计数全 0 的店不落行**
+--              (没活干不是事件);二轮重试的店两轮计数相加**只记一条**。
+--              运营类与业务动作**不同事务**(services/store_events.
+--              record_round_safe 自开连接 + 兜底):货已经提交出去了,
+--              账本缺一轮可以补,而记账炸掉整轮不可以 —— 与治理类方向相反,
+--              因为治理类的两半必须同生共死,运营类的账本只是事后对时间线。
 -- 防重不在本表(只追加、无唯一键),两条链各有各的办法:
 --   · TRO   ops.dedupe 两个 scope:'audit:tro_brand'(一个品牌一条源头)与
 --           'audit:tro_expand'(整品牌展开一次,**不按店**)。分开是为了让

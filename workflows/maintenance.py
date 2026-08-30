@@ -86,8 +86,8 @@ from datetime import datetime
 from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
-    maintenance_intents as mi, notify_fmt as nf, store_absence, store_retry, \
-    stores as stores_svc
+    maintenance_intents as mi, notify_fmt as nf, store_absence, \
+    store_events, store_retry, stores as stores_svc
 
 DANGEROUS = True
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -133,16 +133,20 @@ def _record(name: str, it: dict, action: str, feed_id, today: str,
 
 
 def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
-                 lines: list[str], records: list[tuple], done: set) -> None:
+                 lines: list[str], records: list[tuple], done: set,
+                 cnt: dict | None = None) -> None:
     """输入:店铺 + 类型 + 意图 → **就地** append 维护记录行。路由 PUT/feed(显式 if)。
 
-    ⚠ records/done 是传进来的、不是返回的:提交到一半抛异常时(单店代理断线),
-    已经提交出去的那几片必须留下记录。首版是 `return records` —— 异常一抛,
-    局部列表连同"这几条其实发出去了"一起丢掉,外层再给它们补一行「未执行」,
-    表里就写着未执行、沃尔玛队列里却真在跑。
+    ⚠ records/done/cnt 是传进来的、不是返回的:提交到一半抛异常时(单店代理
+    断线),已经提交出去的那几片必须留下记录。首版是 `return records` ——
+    异常一抛,局部列表连同"这几条其实发出去了"一起丢掉,外层再给它们补一行
+    「未执行」,表里就写着未执行、沃尔玛队列里却真在跑。
+    `cnt`(店铺事件账本用)同一条纪律,而且它还**跨补试累加** —— 补试是同一
+    轮里的第二次动作,两次加起来才是"这家店这一轮改了多少处"。
     """
     name = store["name"]
     label = _KIND_LABEL[kind]
+    bucket = cnt.setdefault(kind, {}) if cnt is not None else {}
 
     def _add(it: dict, action: str, feed_id, result: str, err="") -> None:
         records.append(_record(name, it, action, feed_id, today, result, err))
@@ -159,6 +163,10 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
             if ok:
                 _mark([it], "sync")
                 n_ok += 1
+        # PUT 路由的结局当场已知,记成 submitted/failed 两档(它不进 feed 台账,
+        # 没有 dedup/unknown 两档 —— 强行凑四档会让账本看起来两条路由同构)
+        bucket["submitted"] = bucket.get("submitted", 0) + n_ok
+        bucket["failed"] = bucket.get("failed", 0) + len(items) - n_ok
         lines.append(f"  {name}:{label} 同步 PUT {len(items)},成功 {n_ok}")
         return
 
@@ -201,6 +209,8 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
     # 四档计数的尾巴走 notify_fmt 的成品件(三个执行件逐字重复过);
     # failed 档字样由调用方给 —— 本件现行「提交被拒」,problem_product_cleanup
     # 现行「提交失败」,收口时逐字保留两处现状,不替所有者统一措辞
+    for k, v in n.items():
+        bucket[k] = bucket.get(k, 0) + v
     lines.append(f"  {name}:{label} feed "
                  + nf.feed_outcome_tail(n["submitted"], n["dedup"],
                                         n["failed"], n["unknown"],
@@ -337,6 +347,7 @@ def run(params: dict) -> str:
     per_store: dict[str, list[str]] = {}    # 各店摘要行(补试重跑同店即覆盖)
     records_by_store: dict[str, list[tuple]] = {}   # 各店维护记录行(跨补试累加)
     done_by_store: dict[str, set] = {}      # 已写过记录的建议 id(同上,跨补试)
+    cnt_by_store: dict[str, dict] = {}      # 各店动作计数(店铺事件账本,跨补试累加)
 
     def _one_store(store_name: str, kinds: dict) -> str:
         """输入:店铺名 + 该店三类意图 → 输出:店铺名;网络类失败**抛出**待补试。
@@ -354,6 +365,7 @@ def run(params: dict) -> str:
         per_store[store_name] = lines_s     # 每轮重置:补试的叙述覆盖首轮
         records_s = records_by_store.setdefault(store_name, [])
         done = done_by_store.setdefault(store_name, set())
+        cnt_s = cnt_by_store.setdefault(store_name, {})
         pending = [it for k in _KIND_ORDER for it in kinds.get(k) or []]
 
         def _unexecuted(why: str, err="") -> None:
@@ -372,6 +384,9 @@ def run(params: dict) -> str:
             records_s.extend(_record(store_name, it, "", "", today, why, err)
                              for it in fresh)
             done.update(it.get("disposition_id") for it in fresh)
+            # 领到了却没执行的也是这一轮的事实(账本上"领了 30 条、一条没动"
+            # 与"这轮没它的货"是两回事,后者压根不落行)
+            cnt_s["unexecuted"] = cnt_s.get("unexecuted", 0) + len(fresh)
 
         store = stores_by_name.get(store_name)
         if store is None:
@@ -382,7 +397,7 @@ def run(params: dict) -> str:
             for kind in _KIND_ORDER:
                 if kinds.get(kind):
                     _submit_kind(store, kind, kinds[kind], today, lines_s,
-                                 records_s, done)
+                                 records_s, done, cnt_s)
         except _client.StoreDeadError as e:
             # 凭证死是确定性的:就地点名写表,**不抛**(抛出去就进补试名单,
             # 而重试只会再死一次 —— 标准①的「StoreDeadError 不补试」)
@@ -481,6 +496,12 @@ def run(params: dict) -> str:
                                    tail="存量建议保留,下轮重试")
     if gate_note:
         lines.append(gate_note)
+
+    # 店铺事件账本(运营类):每店每轮一条,按动作类分桶(标题/价格/库存 ×
+    # 四档结局 + 领到没执行的)。补试跑的是同一个 _one_store,计数跨补试累加
+    # —— 一轮就是一轮,不因为补试记成两条。记账失败只告警,不拖垮维护链
+    store_events.record_round_safe("maintenance", store_events.MAINT_ROUND,
+                                   cnt_by_store, lines)
 
     all_records = [r for name, _ in todo for r in records_by_store.get(name, [])]
     _write_sheet(all_records, lines)

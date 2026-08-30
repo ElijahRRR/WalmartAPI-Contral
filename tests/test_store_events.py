@@ -150,6 +150,94 @@ class _Conn:
         return _Cur(self)
 
 
+class _RoundCur:
+    """收 executemany 的假游标(运营类走批量写,一轮一次)。"""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def executemany(self, sql, seq):
+        self.conn.batches.append((sql, list(seq)))
+
+    def execute(self, sql, args=None):
+        raise AssertionError("运营类只准走 executemany 批量写")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _RoundConn:
+    def __init__(self):
+        self.batches: list = []
+
+    def cursor(self):
+        return _RoundCur(self)
+
+
+def test_record_round_skips_stores_with_nothing_to_report():
+    """★ 计数全 0 的店不落行 —— 五条链每轮都遍历一批店,大半是"没它的货"。
+
+    不滤掉的话账本每天多几十条全零行,风险与治理两类会被淹到查不出来。
+    """
+    conn = _RoundConn()
+    n = se.record_round(conn, "list_new", se.LIST_ROUND, {
+        "T1": {"submitted": 3, "no_upc": 0},
+        "T2": {"submitted": 0, "no_upc": 0, "failed": 0},   # 没活干,不是事件
+        "T3": {"submitted": 0, "failed": 2},
+    })
+    assert n == 2
+    rows = conn.batches[0][1]
+    assert [r[0] for r in rows] == ["T1", "T3"]      # 按店名定序,T2 不落
+    assert {r[1] for r in rows} == {se.LIST_ROUND}
+    assert {r[2] for r in rows} == {"info"}          # 运营类一律 info
+    assert len(conn.batches) == 1, "多店必须一次 executemany,不是逐店 execute"
+
+
+def test_record_round_counts_nested_buckets_and_flags():
+    """维护/清理链按动作类分桶(计数嵌在第二层);match 的异常店没有计数,
+    只有一个 True —— 那也是"这一轮发生了什么",照落。"""
+    conn = _RoundConn()
+    n = se.record_round(conn, "maintenance", se.MAINT_ROUND, {
+        "T1": {"price": {"submitted": 0, "failed": 0}},          # 全零:不落
+        "T2": {"price": {"submitted": 0}, "title": {"dedup": 2}},
+        "T3": {"exception": True},
+        "T4": {"retried": False, "delete": {"submitted": 0}},    # 全假:不落
+    })
+    assert n == 2
+    assert [r[0] for r in conn.batches[0][1]] == ["T2", "T3"]
+
+
+def test_record_round_lands_nothing_for_an_empty_round():
+    conn = _RoundConn()
+    assert se.record_round(conn, "list_new", se.LIST_ROUND, {}) == 0
+    assert conn.batches == []
+
+
+def test_ops_round_codes_are_all_classed_ops():
+    for code in (se.LIST_ROUND, se.MAINT_ROUND, se.CLEANUP_ROUND,
+                 se.CLEAR_ROUND, se.MATCH_ROUND):
+        assert se.CLASS[code] == "ops"
+
+
+def test_record_round_safe_never_takes_the_chain_down(monkeypatch):
+    """★ 记账失败只告警 —— 货已经提交出去了,账本缺一轮可以补,整轮炸掉不行。
+
+    但**失败必须见人**:摘要里要有一行(兜底静默常态化 = 主路径已坏没人知道)。
+    """
+    import contextlib
+
+    from registry import db
+    monkeypatch.setattr(db, "pg_conn",
+                        contextlib.contextmanager(lambda **kw: iter([object()])))
+    lines: list[str] = []
+    assert se.record_round_safe("list_new", se.LIST_ROUND,
+                                {"T1": {"submitted": 1}}, lines) == 0
+    assert lines and "账本本轮没记上" in lines[0]
+
+
 def test_record_kpi_diff_dedups_same_day_rerun():
     """daily_report 一天多轮(影刀下午补刷):同一迁移只落一次;
     当天内 A→B→A 的来回因 old/new 不同仍各落各的。"""

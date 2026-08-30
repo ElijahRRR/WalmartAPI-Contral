@@ -67,6 +67,19 @@ STORE_SCOPE_CHANGED = "store_scope_changed"          # governance(规划外名�
 CLAIM_CREATED = "claim_created"                      # governance(按店按轮汇总)
 CLAIM_RELEASED = "claim_released"                    # governance(同上)
 
+# ── 运营类(五条执行链,**每店每轮一条**)──────────────────────────────────
+# 回答的是"这家店这一轮到底干了多少活":上了几条、清了几条、维护改了几处。
+# ⚠ **绝不逐 SKU**:逐 SKU 是 catalog.product_events / ops.feed_items 的职责,
+# 五条链每天几万行,逐条记几个月就是上千万行,而且把治理/风险两类淹没到
+# 查不出来。severity 一律 info —— 干活是常态,不叫醒任何人;它们存在的意义
+# 是**事后能按时间线对齐**:"封店那天这家店正在大批量删商品"这种事,
+# 只有把运营流水和风险事件放在同一张表上才看得出来。
+LIST_ROUND = "list_round"          # ops(list_new)
+MAINT_ROUND = "maint_round"        # ops(maintenance)
+CLEANUP_ROUND = "cleanup_round"    # ops(problem_product_cleanup)
+CLEAR_ROUND = "clear_round"        # ops(product_clear)
+MATCH_ROUND = "match_round"        # ops(match_listing)
+
 # 分类表:码 → risk/governance/ops(消费方按类过滤;码登记时必须同时归类)
 CLASS = {
     STORE_STATUS_CHANGED: "risk",
@@ -85,6 +98,11 @@ CLASS = {
     STORE_SCOPE_CHANGED: "governance",
     CLAIM_CREATED: "governance",
     CLAIM_RELEASED: "governance",
+    LIST_ROUND: "ops",
+    MAINT_ROUND: "ops",
+    CLEANUP_ROUND: "ops",
+    CLEAR_ROUND: "ops",
+    MATCH_ROUND: "ops",
 }
 
 EVENTS = frozenset(CLASS)
@@ -123,6 +141,63 @@ def record_many(conn, rows: list[dict]) -> int:
               if r.get("detail") is not None else None)
              for r in rows])
     return len(rows)
+
+
+# ── 运营类:每店每轮一条(五条执行链共用的薄封装)───────────────────────────
+
+def _has_activity(v) -> bool:
+    """输入:计数字典里的一个值 → 输出:它算不算"这一轮真发生了什么"。
+
+    数字按非零算,dict 递归下去(维护链按动作类分桶,计数嵌在第二层)。
+    True 也算(match_listing 的 `{"exception": True}` —— 整店炸掉本身就是
+    这一轮发生的事,而它一个计数都没有);0 / False / 空串不算。
+    """
+    if isinstance(v, dict):
+        return any(_has_activity(x) for x in v.values())
+    if isinstance(v, (list, tuple, set)):
+        return any(_has_activity(x) for x in v)
+    return bool(v)
+
+
+def record_round(conn, source: str, event: str,
+                 per_store: dict[str, dict]) -> int:
+    """输入:连接 + 来源 + 事件码 + {店铺: 计数字典} → 输出:落行数。
+
+    每店一条,detail = 计数字典**原样**(不复制任何流水:哪几个 SKU 归
+    catalog.product_events,哪几片 feed 归 ops.feed_items,这里只记数)。
+
+    ⚠ **计数全为 0 的店不落行**:五条链每轮都会遍历一批店,其中大半是
+    "领到 0 条建议""这轮没它的货"—— 没活干不是事件。不滤掉的话账本每天
+    多出几十条全零行,风险与治理两类会被淹到查不出来。
+    """
+    rows = [{"store": st, "event": event, "severity": "info",
+             "source": source, "detail": cnt}
+            for st, cnt in sorted(per_store.items())
+            if _has_activity(cnt)]
+    return record_many(conn, rows)
+
+
+def record_round_safe(source: str, event: str, per_store: dict[str, dict],
+                      lines: list[str] | None = None) -> int:
+    """输入:同 `record_round`(自开连接)+ 可选摘要行 → 输出:落行数。
+
+    **记账失败绝不拖垮业务链**(与 product_audit 的 TRO 接线同款纪律):
+    货已经提交出去了,账本缺一轮是可以补的,而整轮炸掉不可以。
+    但**失败必须见人** —— 告警 + 摘要一行(兜底静默常态化 = 主路径已坏
+    而没人知道,conventions §六)。连接本身也在 try 内:PG 连不上是这里
+    最可能的失败方式。
+    """
+    from registry import db
+    try:
+        with db.pg_conn() as conn:
+            return record_round(conn, source, event, per_store)
+    except Exception as e:                                      # noqa: BLE001
+        logger.error("%s 店铺事件账本本轮没记上(%d 店):%s",
+                     source, len(per_store), e)
+        if lines is not None:
+            lines.append(f"  ⚠ 店铺事件账本本轮没记上({e})——"
+                         f"业务动作已完成,只是这一轮的运营流水没进账本")
+        return 0
 
 
 # ── KPI 三状态列的迁移检测(纯函数,便于测试)──────────────────────────────────

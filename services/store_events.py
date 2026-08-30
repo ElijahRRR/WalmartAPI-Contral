@@ -53,6 +53,20 @@ TRO_BRAND_EXPOSURE = "tro_brand_exposure"          # risk(波及,逐店)
 PHISHING_ORDER = "phishing_order"                  # risk(收单店,逐订单行)
 PHISHING_BRAND_EXPOSURE = "phishing_brand_exposure"  # risk(波及,逐店)
 
+# ── 治理类(services/store_config 的配置快照 diff + 占用两个动作)────────────
+# 「谁把这家店的类目改了」「这个品牌什么时候归的它」——出事那天回查的就是这些。
+# 全部由**人的动作**产生,极低频:配置 diff 一天一轮多半零事件,占用只在
+# alloc_plan/alloc_backfill/store_release 三条链的真跑里落。
+STORE_LIMITS_CHANGED = "store_limits_changed"        # governance(一列一条)
+STORE_LIMITS_ROW_ADDED = "store_limits_row_added"    # governance(限额表新增店行)
+STORE_LIMITS_ROW_REMOVED = "store_limits_row_removed"  # governance(店行消失)
+STORE_ENABLED_CHANGED = "store_enabled_changed"      # governance(凭证表「启用」)
+STORE_REGISTERED = "store_registered"                # governance(凭证表新增店)
+STORE_DEREGISTERED = "store_deregistered"            # governance(凭证表删店)
+STORE_SCOPE_CHANGED = "store_scope_changed"          # governance(规划外名单,store=NULL)
+CLAIM_CREATED = "claim_created"                      # governance(按店按轮汇总)
+CLAIM_RELEASED = "claim_released"                    # governance(同上)
+
 # 分类表:码 → risk/governance/ops(消费方按类过滤;码登记时必须同时归类)
 CLASS = {
     STORE_STATUS_CHANGED: "risk",
@@ -62,6 +76,15 @@ CLASS = {
     TRO_BRAND_EXPOSURE: "risk",
     PHISHING_ORDER: "risk",
     PHISHING_BRAND_EXPOSURE: "risk",
+    STORE_LIMITS_CHANGED: "governance",
+    STORE_LIMITS_ROW_ADDED: "governance",
+    STORE_LIMITS_ROW_REMOVED: "governance",
+    STORE_ENABLED_CHANGED: "governance",
+    STORE_REGISTERED: "governance",
+    STORE_DEREGISTERED: "governance",
+    STORE_SCOPE_CHANGED: "governance",
+    CLAIM_CREATED: "governance",
+    CLAIM_RELEASED: "governance",
 }
 
 EVENTS = frozenset(CLASS)

@@ -33,6 +33,7 @@ from collections import Counter
 from registry import db
 from services import claims
 from services import alloc_survey as sv           # 判定口径与 alloc_audit 同一套
+from services import store_events as se
 from services import store_targets, stores as stores_svc
 
 DANGEROUS = True
@@ -158,7 +159,10 @@ def run(params: dict) -> str:
                 f"   确认后去掉 --dry-run 重跑")
 
     with db.pg_conn() as conn:
-        ok, conflicts = claims.claim_many(conn, to_claim)
+        ok, conflicts, landed = claims.claim_many(conn, to_claim)
+        # 店铺事件账本(治理类):**只数 landed**。本工作流天生幂等(每天重跑
+        # 同一批在线行),拿 `ok` 记账的话账本上会天天多一条"新占 N 千条"
+        se.record_many(conn, claims.claim_created_rows(landed, SOURCE))
     logger.warning("alloc_backfill 落库:成功 %d,已被别店占 %d", ok, len(conflicts))
     csample = "; ".join(f"{k}:{key} 想给 {want} 但属于 {has}"
                         for k, key, want, has in conflicts[:10])

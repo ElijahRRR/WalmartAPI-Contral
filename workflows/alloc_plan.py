@@ -39,6 +39,7 @@ from services import alloc_engine as ae
 from services import alloc_groups, alloc_survey as sv
 from services import claims, product_pool, product_score as ps
 from services import report_csv
+from services import store_events as se
 from services import store_perf, store_targets, stores as stores_svc
 from services import textfmt
 
@@ -394,7 +395,11 @@ def run(params: dict) -> str:
         return "\n".join(L)
 
     with db.pg_conn() as conn:
-        ok, conflicts = claims.claim_many(conn, to_claim)
+        ok, conflicts, landed = claims.claim_many(conn, to_claim)
+        # 店铺事件账本(治理类):每店一条,**同事务** —— 台账落了而事件没落
+        # 的话,事后按事件流回查"这个品牌当初什么时候归的它"会查不到。
+        # 计数只数 `landed`(真落库行):幂等重跑那些行本轮什么都没写
+        se.record_many(conn, claims.claim_created_rows(landed, SOURCE))
     logger.warning("alloc_plan 落库:成功 %d,已被别店占 %d", ok, len(conflicts))
     L += ["", f"✅ 已落占用 {ok:,} 条"
           + (f";与已有占用冲突 {len(conflicts)} 条(保持原归属不动)"

@@ -18,6 +18,11 @@ class _Cur:
     def __init__(self, online):
         self._online, self.rowcount, self._rows = online, 0, []
         self.marked = []
+        self.events: list = []          # ops.store_events 的落行(治理类)
+
+    def executemany(self, sql, seq):
+        if "INSERT INTO ops.store_events" in sql:
+            self.events.extend(seq)
 
     def execute(self, sql, args=None):
         if "GROUP BY store" in sql:

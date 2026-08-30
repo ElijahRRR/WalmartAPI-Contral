@@ -2137,3 +2137,19 @@ def test_node_clear_names_the_failures(monkeypatch):
     assert seen == [("B0A", 0, "N_OLD"), ("B0B", 0, "N_OLD")]   # 都写 0,带节点
     assert "清零成功 1/2" in out
     assert "⚠ 失败 1 个" in out and "B0B" in out and "FAILURE" in out
+
+
+def test_suppress_key_separates_nodes_but_leaves_legacy_keys_byte_identical():
+    """⚠ 受管仓意图的防重键要带 node;未配置店的键**一个字节都不许变**。
+
+    带 node:昨天写 Virtual、今天写受管仓,店铺/SKU/类型/新值全一样 ——
+    不区分就会被压掉,受管仓收不到(搬仓当天 = 两节点都 0 = 不可售)。
+    不动旧键:加个空段会让 ops.dedupe 存量键全部失配 ⇒ 全店一轮重发,
+    正是这道闸当初要防的 208 条 stale update(2026-08-09 生产实证)。
+    """
+    base = {"store": "T1", "sku": "B0A", "kind": "inventory", "new": 7}
+    assert mi._suppress_key(base) == "T1|B0A|inventory|7"          # 逐字节不变
+    assert mi._suppress_key({**base, "ship_node": "N1"}) == "T1|B0A|inventory|7|N1"
+    # 同一件事写不同节点 = 两件事
+    assert mi._suppress_key({**base, "ship_node": "N1"}) != \
+        mi._suppress_key({**base, "ship_node": "N2"})

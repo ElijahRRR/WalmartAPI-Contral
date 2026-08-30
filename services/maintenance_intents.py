@@ -509,7 +509,20 @@ SUPPRESS_HOURS = 20     # 同 (店铺,SKU,类型,新值) 多久内不重复提�
 
 
 def _suppress_key(it: dict) -> str:
-    return f"{it['store']}|{it['sku']}|{it['kind']}|{it.get('new')}"
+    """输入:意图 → 输出:防重键(store|sku|kind|new[|node])。
+
+    ⚠ **受管仓的意图要带 node**(多仓批次 2 补,2026-08-30 搬仓时发现):
+    昨天走 legacy 写到 Virtual 的意图,与今天要写到受管仓的同名意图,
+    店铺/SKU/类型/新值**全都一样** —— 不带节点就会被当成"同一件事再做一遍"
+    而压掉,受管仓于是收不到这一笔。平时只是晚一轮(20h 窗口),但搬仓那天
+    "充受管仓 → 清旧节点"紧挨着做,被压掉的那批两个节点都是 0 = **直接不可售**。
+
+    ⚠ 未配置店**一个字节都不加**(不是 `|` 空段):加了会让 ops.dedupe 里
+    全部存量键失配 ⇒ 全店一轮重发,正是这道闸当初要防的 208 条 stale update。
+    """
+    base = f"{it['store']}|{it['sku']}|{it['kind']}|{it.get('new')}"
+    node = it.get("ship_node")
+    return f"{base}|{node}" if node else base
 
 
 def drop_recent(conn, intents: list[dict],

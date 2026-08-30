@@ -523,10 +523,15 @@ CREATE TABLE ops.store_kpi_daily (
 -- severity 按迁移方向写入时定级(同一码两个方向级别不同):
 --   high = 任意→TERMINATED / store ACTIVE→SUSPENDED / payment ACTIVE→INACTIVE
 --   mid  = 可售→不可售(影刀列)及未知迁移;info = 恢复方向(入账不推送)
+-- 写入方(截至 2026-08-30):daily_report(三状态迁移)、product_audit
+-- (tro_brand_hit 源头 + tro_brand_exposure 波及)。防重不在本表(只追加、
+-- 无唯一键),在 ops.dedupe:'audit:tro_brand'(一个 TRO 品牌一条源头)与
+-- 'audit:tro_expand'(整品牌展开一次,**不按店**)——两个 scope 分开,是为了
+-- 让"先以未判身份报过、后被 L3 确认"的品牌仍能补做波及展开。
 CREATE TABLE ops.store_events (
     id bigint PK,
     store text,                  -- NULL = 全局源头事件(TRO 命中本体,波及店
-                                 -- 由追溯引擎展开成逐店行;二期)
+                                 -- 由 services/risk_trace 展开成逐店行)
     event text NOT NULL,         -- 合法值见 services/store_events.EVENTS
     severity text NOT NULL,      -- high / mid / info
     source text NOT NULL, detail jsonb,

@@ -69,7 +69,8 @@ def _ctx(monkeypatch, path_rows=_MAP_PATH, node_rows=_MAP_NODE):
         "SELECT amazon_category, walmart_product_type": path_rows,
         "SELECT browse_node_id, walmart_product_type": node_rows,
     }
-    monkeypatch.setattr(audit_rules, "_brand_map", lambda conn: ({}, set()))
+    # 三元组:(Phase0 dict, R4 词集, R4 键→来源原文)——第三项是 TRO 接线用的
+    monkeypatch.setattr(audit_rules, "_brand_map", lambda conn: ({}, set(), {}))
     monkeypatch.setattr(audit_rules, "_rows_dict",
                         lambda conn, sql, key: (
                             {r[0]: dict(zip(("walmart_product_type",

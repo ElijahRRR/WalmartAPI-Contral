@@ -39,12 +39,21 @@ logger = logging.getLogger("services.store_events")
 STORE_STATUS_CHANGED = "store_status_changed"      # risk
 PAYMENT_STATUS_CHANGED = "payment_status_changed"  # risk
 SALES_STATUS_CHANGED = "sales_status_changed"      # risk
+# TRO 品牌(product_audit 接线,2026-08-30):**源头一条 + 波及逐店**。
+# 源头 store=NULL —— 「这个 TRO 品牌被我们上过架」不属于任何一家店,它是
+# 全局事实;哪几家店挨着由 services/risk_trace 四证据源展开成 exposure 行。
+# 两个码分开,是为了让"发现了几个 TRO 品牌"与"波及了几家店"两个数各查各的
+# (合成一个码之后,按 store IS NULL 过滤才数得出源头,谁都会忘)。
+TRO_BRAND_HIT = "tro_brand_hit"                    # risk(源头,store=NULL)
+TRO_BRAND_EXPOSURE = "tro_brand_exposure"          # risk(波及,逐店)
 
 # 分类表:码 → risk/governance/ops(消费方按类过滤;码登记时必须同时归类)
 CLASS = {
     STORE_STATUS_CHANGED: "risk",
     PAYMENT_STATUS_CHANGED: "risk",
     SALES_STATUS_CHANGED: "risk",
+    TRO_BRAND_HIT: "risk",
+    TRO_BRAND_EXPOSURE: "risk",
 }
 
 EVENTS = frozenset(CLASS)

@@ -539,11 +539,16 @@ def _phase_push(data_date, do_push: bool) -> str:
         # 状态变化改读事件账本(2026-08-30):此前是现拼"严格比昨天"的 JOIN,
         # 只看 store_status 一列、跨空档(昨天没跑出来)会漏。检测已收口到
         # services/store_events.record_kpi_diff 一处,这里只是消费当日事件。
+        # ⚠ 只查三个状态码,不是 `CLASS` 全集:账本后续会登记治理/运营类的码
+        # (倍率变更、上架汇总),那些不该出现在"状态迁移"这一节里 ——
+        # 写成全集的话每登记一个新码,日报就悄悄多捞一类事件。
         cur.execute(
             "SELECT store, event, severity, detail FROM ops.store_events"
             " WHERE detail->>'data_date' = %s::text"
             "   AND event = ANY(%s::text[]) ORDER BY severity, store",
-            (str(data_date), list(store_events.CLASS)))
+            (str(data_date), [store_events.STORE_STATUS_CHANGED,
+                              store_events.PAYMENT_STATUS_CHANGED,
+                              store_events.SALES_STATUS_CHANGED]))
         status_changes = [
             {"store": s, "event": e, "severity": sev, "detail": d}
             for s, e, sev, d in cur.fetchall()]

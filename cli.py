@@ -379,11 +379,33 @@ def main(argv: list[str] | None = None) -> int:
     return _EXIT.get(worst, 1)
 
 
+def _fold_success(name: str, text: str) -> str:
+    """输入:步骤名 + `_run_step` 的成功文案 → 输出:折叠成的那一行(不含图标)。
+
+    ⚠ `_run_step` 的成功文案形状是 `f"{mode}{name} 成功\\n{summary}"`,**第一行是
+    「order_audit 成功」这句不含任何数字的废话**,摘要在第二行起。2026-08-30
+    之前这里直接取第一行,于是串联跑的每一条链通知里**摘要一个字都进不了飞书** ——
+    单跑发全文所以看不出来,而 order_audit 恰恰只挂在每小时链上,静默了整段。
+    所以取的是摘要的首行,前缀保留「模式 + 名字」:`[DRY-RUN]` 标记不能丢,
+    空跑报成功比误跑更难发现(CLAUDE.md 安全铁律)。
+    """
+    from services import notify_fmt as nf
+    head, _, body = str(text or "").partition("\n")
+    gist = nf.first_line_of(body)
+    if not gist:
+        # 没有换行 = 不是上面那个形状(locked 之类的一行文案),退回原样折叠
+        return nf.first_line_of(text)
+    label = head.strip()
+    if label.endswith(" 成功"):
+        label = label[:-len(" 成功")].strip()
+    return f"{label or name}:{gist}"
+
+
 def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:
     """输入:步骤名 + [(名, 状态, 摘要)] + 最坏状态 → 输出:整链那一条通知正文。
 
     排版规范见 `services/notify_fmt` 头注。这里落地的是第 5 条:
-    **成功的步骤压成一行(它自己摘要的第一行),失败/跳过的给全文。**
+    **成功的步骤压成一行(名字 + 它自己摘要的第一行),失败/跳过的给全文。**
 
     ⚠ 为什么不是全都给全文(2026-08-17 所有者要求整理通知形态):产品线七步
     每步都是一段密集中文,拼起来是二十来行没有层次的文字 —— 人第三天就不看了,
@@ -393,13 +415,12 @@ def _chain_text(steps: list[str], results: list[tuple], worst: str) -> str:
 
     单跑的通知形态**逐字不动**(上面那个分支)—— 人和告警规则都认那个格式。
     """
-    from services import notify_fmt as nf
     icon = "✅" if worst == "success" else _ICON.get(worst, "❌")
     lines = [f"{icon} 链 [{' → '.join(steps)}]"]
     for name, status, text in results:
         mark = _ICON.get(status, "⏭")
         if status == "success":
-            lines.append(f"{mark} {nf.first_line_of(text)}")
+            lines.append(f"{mark} {_fold_success(name, text)}")
         else:
             # 失败/跳过:整段铺开(缩进两格,与折叠行区分开)
             body = "\n".join(f"   {ln}" for ln in str(text).splitlines()

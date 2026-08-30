@@ -74,9 +74,18 @@ _STEPS = ["a", "b", "c"]
 
 
 def _res(status_b="success"):
-    return [("a", "success", "a 完成:入库 100 行\n明细一\n明细二"),
-            ("b", status_b, "b 的摘要第一行\n第二行明细\n第三行明细"),
-            ("c", "success", "c 完成")]
+    """⚠ 文案必须是 `_run_step` 的**生产真实形状** `f"{mode}{name} 成功\\n{summary}"`。
+
+    2026-08-30 之前这里喂的是「a 完成:入库 100 行\\n明细一」—— 摘要恰好落在
+    第一行,于是"折叠只取第一行"的写法在测试里怎么看都对,生产里折出来的却是
+    「order_audit 成功」这句废话,**摘要一个字进不了飞书**。fixture 与生产形状
+    不一致,掩盖的就是这种缺陷。
+    """
+    b_text = ("b 成功\nb 的摘要第一行\n第二行明细\n第三行明细" if status_b == "success"
+              else "b 失败\n第二行明细\n第三行明细")
+    return [("a", "success", "a 成功\na 完成:入库 100 行\n明细一\n明细二"),
+            ("b", status_b, b_text),
+            ("c", "success", "c 成功\nc 完成")]
 
 
 def test_chain_folds_successful_steps_to_one_line():
@@ -84,10 +93,31 @@ def test_chain_folds_successful_steps_to_one_line():
     out = cli._chain_text(_STEPS, _res(), "success")
     assert out.splitlines() == [
         "✅ 链 [a → b → c]",
-        "✅ a 完成:入库 100 行",
-        "✅ b 的摘要第一行",
-        "✅ c 完成"]
+        "✅ a:a 完成:入库 100 行",
+        "✅ b:b 的摘要第一行",
+        "✅ c:c 完成"]
     assert "明细一" not in out           # 全文在 ops.runs 与日志里,不在通知里
+
+
+def test_chain_fold_keeps_the_summary_not_the_word_success():
+    """折叠丢摘要的回归钉:链通知里出现的必须是数字,不是「x 成功」那句废话。"""
+    out = cli._chain_text(["a"], [("a", "success", "a 成功\n入库 100 行 / 74 店")],
+                          "success")
+    assert "✅ a:入库 100 行 / 74 店" in out
+    assert "a 成功" not in out
+
+
+def test_chain_fold_keeps_the_dry_run_marker():
+    """空跑报成功比误跑更难发现 —— [DRY-RUN] 前缀折叠后必须还在。"""
+    out = cli._chain_text(["a"], [("a", "success", "[DRY-RUN] a 成功\n将提交 3 件")],
+                          "success")
+    assert "✅ [DRY-RUN] a:将提交 3 件" in out
+
+
+def test_chain_fold_falls_back_when_text_has_no_summary_body():
+    """没有换行 = 不是 `_run_step` 那个形状,原样折叠(别折出个空行)。"""
+    assert cli._fold_success("a", "a 只有一行") == "a 只有一行"
+    assert cli._fold_success("a", "a 成功\n") == "a 成功"
 
 
 def test_chain_expands_the_failed_step_in_full():
@@ -96,7 +126,7 @@ def test_chain_expands_the_failed_step_in_full():
     assert out.startswith("❌ 链 [a → b → c]")
     assert "❌ b" in out
     assert "   第二行明细" in out and "   第三行明细" in out
-    assert "✅ a 完成:入库 100 行" in out      # 成功的仍然折叠
+    assert "✅ a:a 完成:入库 100 行" in out    # 成功的仍然折叠
     assert "全文见 ops.runs" in out
 
 

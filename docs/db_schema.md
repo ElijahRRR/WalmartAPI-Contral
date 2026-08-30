@@ -141,6 +141,10 @@ CREATE TABLE catalog.listing_sources (
     workflow    text,                -- 登记来源(backfill=格式回填)
     created_at  timestamptz
 );
+-- listing_sources_key_idx (source_key) WHERE source_key IS NOT NULL
+-- (2026-08-30 补):主键是 (store, sku),按 source_key 反查"这个 ASIN 被哪些店
+-- 登记过"用不上它,原本全表扫。风险追溯 services/risk_trace ②号证据源要按
+-- ASIN 反查,故补;局部条件是因为 self/自建行这一列本就空(索引更小)。
 ```
 
 ```sql

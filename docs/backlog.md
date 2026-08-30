@@ -281,3 +281,14 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 ## 九、文档失真待回写
 
 ✅ **2026-08-12 全部回写完成**:legacy_reference 状态迁移清单补 3 项且逐行更新拍板结果;db_schema 的 store_kpi_daily 32 列补全;feishu_tables 修 4 处(错误商品记录裁撤、补登 KPI_SHEET 旧 workbook、订单中心六表状态、STORE_CREDENTIALS 示例先前已含 enabled);scraper_migration_brief "127 个批次"遗留文字改为过去时收口;resources.py:271 / schema.sql:331 更早已修。
+
+## 十一、性能话头(先记着,**别顺手就建索引**)
+
+> 索引不是免费的:占空间、拖该表每一次写入。低频查询宁可顺序扫。
+> 本节记「哪天变高频就建它」,建之前先拿真实调用频率说话。
+
+- ⬜ `catalog.products ((lower(btrim(brand))))` 表达式索引:`services/risk_trace.asins_of_brand`
+  按品牌候选串等值查 products(约 128 万行,brand 列无索引)⇒ 顺序扫。**现在不建** ——
+  它只被 TRO / 钓鱼波及展开调用,一年几次,为此拖住 products 的每一次写入不值。
+  若哪天品牌反查进了高频链路(如每轮上架都查),再建它,并同步检查
+  `slow->>'manufacturer'` 那条兜底腿要不要一起建。

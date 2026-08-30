@@ -219,6 +219,12 @@ CREATE TABLE IF NOT EXISTS catalog.listing_sources (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, sku)
 );
+-- 反查索引(2026-08-30 补,风险追溯 services/risk_trace ②号证据源):主键是
+-- (store, sku),**按 source_key 反查"这个 ASIN 被哪些店登记过"用不上它**,
+-- 原本是全表扫。TRO/钓鱼波及展开要按 ASIN 反查,故补此索引;
+-- 局部条件 source_key IS NOT NULL 是因为 self/自建行这一列本来就空(索引更小)。
+CREATE INDEX IF NOT EXISTS listing_sources_key_idx
+    ON catalog.listing_sources (source_key) WHERE source_key IS NOT NULL;
 -- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
 -- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
 INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workflow)
@@ -379,6 +385,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS claims_active_uniq
     ON catalog.claims (kind, claim_key) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS claims_store_idx
     ON catalog.claims (store) WHERE status = 'active';
+-- 历史归属索引(2026-08-30 补,风险追溯 services/risk_trace ④号证据源):
+-- ⚠ 上面两个索引**都是 `WHERE status='active'` 的局部索引**,查 released 行
+-- 一条都用不上。而 released 行正是"这个品牌当初属于谁"的唯一答案,
+-- 波及展开必须读它 —— 这条全量索引就是为读历史建的。
+CREATE INDEX IF NOT EXISTS claims_key_all_idx ON catalog.claims (kind, claim_key);
 
 -- 风险档案:人工/AI SELECT 查询入口。**不是拦截条件**(所有者口径
 -- 2026-08-12:防呆=黑名单,按拉黑类别拦,不按删除史拦——因产品问题删过

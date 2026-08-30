@@ -444,6 +444,26 @@ CREATE TABLE ops.store_kpi_daily (
     PRIMARY KEY (store, data_date)
 );
 
+-- 店铺事件账本(2026-08-30 所有者需求:店铺维度病历,TRO 封店预警)。
+-- 与 catalog.product_events 同构不同表:只追加、事件码唯一出处
+-- services/store_events.py、record_many fail loud。与 store_kpi_daily 的
+-- 分工:KPI 表是日粒度截面,本表是变化流;事件 detail 只记 {old,new},
+-- 绝不复制 KPI 数值(要全貌按 store+日期回查 KPI 表)。
+-- severity 按迁移方向写入时定级(同一码两个方向级别不同):
+--   high = 任意→TERMINATED / store ACTIVE→SUSPENDED / payment ACTIVE→INACTIVE
+--   mid  = 可售→不可售(影刀列)及未知迁移;info = 恢复方向(入账不推送)
+CREATE TABLE ops.store_events (
+    id bigint PK,
+    store text,                  -- NULL = 全局源头事件(TRO 命中本体,波及店
+                                 -- 由追溯引擎展开成逐店行;二期)
+    event text NOT NULL,         -- 合法值见 services/store_events.EVENTS
+    severity text NOT NULL,      -- high / mid / info
+    source text NOT NULL, detail jsonb,
+    occurred_at timestamptz DEFAULT now(),
+    notified_at timestamptz      -- store_watch 已推送标记(六期);NULL=待扫描
+);  -- 索引:(store, occurred_at DESC) / (event, occurred_at DESC) /
+    -- 局部 (severity, occurred_at DESC) WHERE notified_at IS NULL
+
 CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不被覆盖
     id bigint, first_seen_date date, store text,
     sales_order_no / po_no / order_date / indicator(带 emoji 契约) /

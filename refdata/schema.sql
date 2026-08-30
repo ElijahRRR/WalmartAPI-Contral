@@ -994,6 +994,33 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     PRIMARY KEY (store, data_date)
 );
 
+-- ── 店铺事件账本(2026-08-30 所有者需求:店铺维度病历,TRO 封店预警)────────
+-- 与 catalog.product_events 同构不同表:三条纪律照搬(只追加永不改、事件码
+-- 唯一出处在 services/store_events.py、record_many 对未登记码抛错),但身份键
+-- 是 store 不是 coalesce(asin, sku),消费方式也不同(预警扫描 + 店铺档案)。
+-- 与 ops.store_kpi_daily 的分工:KPI 表是**日粒度截面**(当下是什么样),
+-- 本表是**变化流**(发生了什么)——事件里绝不重复存 KPI 数值,状态类事件只记
+-- {old,new},要看当时全貌按 (store, occurred_at::date) 回查 KPI 表。
+CREATE TABLE IF NOT EXISTS ops.store_events (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store       text,               -- NULL = 全局源头事件(如 TRO 品牌命中本体,
+                                    -- 波及店由追溯引擎展开成逐店行)
+    event       text NOT NULL,      -- 合法值见 services/store_events.EVENTS
+    severity    text NOT NULL,      -- high/mid/info;写入时按迁移方向定级
+                                    -- (同一事件码两个方向级别不同,必须落行)
+    source      text NOT NULL,      -- 来源工作流
+    detail      jsonb,
+    occurred_at timestamptz NOT NULL DEFAULT now(),
+    notified_at timestamptz         -- store_watch 已推送标记;NULL=待扫描
+);
+CREATE INDEX IF NOT EXISTS store_events_store_idx
+    ON ops.store_events (store, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS store_events_event_idx
+    ON ops.store_events (event, occurred_at DESC);
+-- 预警扫描的专用局部索引:store_watch 只看"高危且未通知",全表越大越划算
+CREATE INDEX IF NOT EXISTS store_events_unnotified_idx
+    ON ops.store_events (severity, occurred_at DESC) WHERE notified_at IS NULL;
+
 -- 绩效问题订单:永久累积,五字段唯一键,首次发现日期永不被覆盖(ON CONFLICT DO NOTHING)
 CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

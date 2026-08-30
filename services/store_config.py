@@ -325,14 +325,7 @@ def check_and_record(conn) -> tuple[list[dict], str | None]:
     return events, None
 
 
-def brief(e: dict) -> str:
-    """输入:治理事件行 → 输出:摘要用短句。"""
-    d = e.get("detail") or {}
-    who = e.get("store") or "全局"
-    if e["event"] == se.STORE_LIMITS_CHANGED:
-        return f"{who} {d.get('field')} 「{d.get('old')}」→「{d.get('new')}」"
-    if e["event"] == se.STORE_ENABLED_CHANGED:
-        return f"{who} 启用 {d.get('old')}→{d.get('new')}"
-    if e["event"] == se.STORE_SCOPE_CHANGED:
-        return (f"规划外名单 {d.get('old')}→{d.get('new')}")
-    return f"{who} {e['event']}"
+# 治理事件的摘要渲染在 `store_events.brief`(2026-08-30 收口):本模块原先自带
+# 一份 `brief`,而账本里另有一份管状态迁移的 —— 消费方(store_watch 的推送
+# 明细)一轮里同时拿到两族事件,按族分发渲染就是第三处路由。
+# 「每个能力只有一条实现路径」:码的唯一出处在 store_events,渲染跟着码走。

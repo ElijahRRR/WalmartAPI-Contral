@@ -375,9 +375,168 @@ def record_line_events(conn, rows: list[dict]) -> list[dict]:
     return landed
 
 
+# ── 预警扫描面(workflows/store_watch 消费;写入方一概不看这一段)────────────
+#
+# ⚠ severity 写成**等值**不是风格:局部索引 store_events_unnotified_idx 是
+# `(severity, occurred_at DESC) WHERE notified_at IS NULL`,首列 severity ——
+# 等值才能把它当前缀用上并顺着第二列拿到有序结果。写成 `= ANY(...)`
+# / `IN (...)` / `severity <> 'info'` 都退化成扫整个局部索引再排序,
+# 而且**不报错**(账本小的时候一样快,大了才慢下来,那时没人记得是这里)。
+#
+# `FOR UPDATE SKIP LOCKED` 是 flock 之外的**第二道保险**(upc_pool.claim 先例):
+# 手动跑一条、调度同时到点这种事,flock 挡得住;而 flock 是按工作流名的进程锁,
+# 换个入口(未来的网页按钮、MCP 工具)就绕过去了。行锁挡的是"两轮同时扫到
+# 同一批事件、各推一遍"。跳过被锁的行 = 那几条留给持锁的那一轮,不重不漏。
+_SCAN_SQL = """
+SELECT id, store, event, severity, source, detail, occurred_at
+FROM ops.store_events
+WHERE notified_at IS NULL
+  AND severity = %(sev)s::text
+  AND occurred_at >= now() - (%(hours)s::int * interval '1 hour')
+ORDER BY occurred_at
+LIMIT %(limit)s::int
+FOR UPDATE SKIP LOCKED
+"""
+
+# 窗口内待推 / 窗口外滞留,一次扫描两个数(都走同一个局部索引)。
+# 窗口外那个数**必须有人报**:时间窗是防"首轮上线被历史洪水刷屏"的闸,
+# 但它同时意味着**超过窗口还没推出去的高危就永远推不出去了**。恒 0 时不打,
+# 一旦 >0 就是"有漏网的",人该去看为什么(推送连着失败?限额一直吃不下?)。
+_COUNTS_SQL = """
+SELECT
+  count(*) FILTER (
+      WHERE occurred_at >= now() - (%(hours)s::int * interval '1 hour')),
+  count(*) FILTER (
+      WHERE occurred_at <  now() - (%(hours)s::int * interval '1 hour'))
+FROM ops.store_events
+WHERE notified_at IS NULL AND severity = %(sev)s::text
+"""
+
+# `AND notified_at IS NULL` 不是多余的:行锁只在本事务内挡得住并发,而这条
+# UPDATE 的语义是"把**我这轮真推出去的**那些标掉"。加上它,任何时序意外
+# (别处已标过)都只会少标一行,不会把别人的推送时间覆盖成我的。
+_MARK_SQL = """
+UPDATE ops.store_events SET notified_at = now()
+WHERE id = ANY(%(ids)s::bigint[]) AND notified_at IS NULL
+"""
+
+
+def scan_unnotified(conn, severity: str = "high", hours: int = 48,
+                    limit: int = 50) -> list[dict]:
+    """输入:连接 + 级别/时间窗/上限 → 输出:待推送事件行(锁在本事务内)。
+
+    行被 `FOR UPDATE SKIP LOCKED` 锁住,**必须在同一事务里推完并标记**:
+    连接一提交锁就没了,别的轮次立刻能扫到同一批。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SCAN_SQL, {"sev": severity, "hours": int(hours),
+                                "limit": int(limit)})
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def unnotified_counts(conn, severity: str = "high",
+                      hours: int = 48) -> tuple[int, int]:
+    """输入:连接 + 级别/时间窗 → 输出:(窗口内待推数, 窗口外滞留数)。"""
+    with conn.cursor() as cur:
+        cur.execute(_COUNTS_SQL, {"sev": severity, "hours": int(hours)})
+        n_in, n_out = cur.fetchone()
+    return int(n_in), int(n_out)
+
+
+def mark_notified(conn, ids: list[int]) -> int:
+    """输入:连接 + 事件 id 列表 → 输出:真标上的行数(空列表 0 次查询)。"""
+    if not ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(_MARK_SQL, {"ids": [int(i) for i in ids]})
+        return cur.rowcount
+
+
+def tro_stores(rows: list[dict]) -> list[str]:
+    """输入:同一轮扫到的事件行 → 输出:命中「疑似 TRO 封店」组合的店铺(排序)。
+
+    按 (店, detail.data_date) 分组再问 `tro_signature`:封店与资金冻结必须是
+    **同一店同一天**的两条 —— 跨店凑、跨日凑都不算(A 店周一被封 + B 店周三
+    冻结,合起来什么也不是)。store 为空的全局行(TRO 品牌源头)不参与分组,
+    它不属于任何一家店。
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        if not r.get("store"):
+            continue
+        groups.setdefault((r["store"], (r.get("detail") or {}).get("data_date")),
+                          []).append(r)
+    return sorted({st for (st, _day), evs in groups.items()
+                   if tro_signature(evs)})
+
+
+# ── 摘要渲染(**全事件码唯一出处**)──────────────────────────────────────────
+#
+# 一个码一句人话。收在这里而不是各消费方各写一份,是因为消费方已经有三个
+# (daily_report 的状态节、store_watch 的推送明细、将来的店铺档案页),
+# 而它们要说的是同一件事。
+# ⚠ **兜底一律不许渲染成 `None→None`**:治理/TRO/钓鱼三族的 detail 里根本
+# 没有 old/new 两个键,早先那版兜底 `f"{store} {event} {old}→{new}"` 对它们
+# 全部输出 `? tro_brand_hit None→None` —— 通知照发、字数照占,人一个字
+# 都读不出来。未登记特化的码退到"谁 + 码名",宁可干瘪不许骗人。
+
+_STATUS_LABEL = {STORE_STATUS_CHANGED: "店铺", PAYMENT_STATUS_CHANGED: "支付",
+                 SALES_STATUS_CHANGED: "销售"}
+
+_ROUND_LABEL = {LIST_ROUND: "上架", MAINT_ROUND: "维护", CLEANUP_ROUND: "清理",
+                CLEAR_ROUND: "下架", MATCH_ROUND: "跟卖"}
+
+
+def _brief_body(event: str, d: dict) -> str:
+    """输入:事件码 + detail → 输出:主体短句(不含店铺前缀);未特化返回空串。"""
+    if event in _STATUS_LABEL:
+        return f"{_STATUS_LABEL[event]} {d.get('old')}→{d.get('new')}"
+    # ── 风险类:TRO / 钓鱼 ──
+    if event == TRO_BRAND_HIT:
+        judged = "已判定" if d.get("judged") else "嫌疑未判"
+        return f"TRO 品牌「{d.get('brand')}」{judged}(首见 {d.get('first_asin')})"
+    if event == TRO_BRAND_EXPOSURE:
+        n = d.get("asin_total") or len(d.get("asins") or [])
+        listed = "在架" if d.get("still_listed") else "不在架"
+        return f"TRO 品牌「{d.get('brand')}」波及 {n} 品({listed})"
+    if event == PHISHING_ORDER:
+        who = d.get("po_id") or d.get("order_line_id")
+        return f"钓鱼订单 {who}(邮编 {d.get('zip')})"
+    if event == PHISHING_BRAND_EXPOSURE:
+        listed = "在架" if d.get("still_listed") else "不在架"
+        return (f"钓鱼品牌「{d.get('brand')}」波及({listed},"
+                f"源 {d.get('origin_store')})")
+    # ── 治理类 ──
+    if event == STORE_LIMITS_CHANGED:
+        return f"{d.get('field')}「{d.get('old')}」→「{d.get('new')}」"
+    if event == STORE_ENABLED_CHANGED:
+        return f"启用 {d.get('old')}→{d.get('new')}"
+    if event == STORE_SCOPE_CHANGED:
+        return f"规划外名单 {d.get('old')}→{d.get('new')}"
+    if event == STORE_LIMITS_ROW_ADDED:
+        return "限额表新增店行"
+    if event == STORE_LIMITS_ROW_REMOVED:
+        return "限额表店行消失(全表回落默认值)"
+    if event == STORE_REGISTERED:
+        return "凭证表新增在册"
+    if event == STORE_DEREGISTERED:
+        return "凭证表删店(不再在册)"
+    if event in (CLAIM_CREATED, CLAIM_RELEASED):
+        verb = "占用" if event == CLAIM_CREATED else "释放"
+        got = [f"{k} {d[k]}" for k in ("brand", "product") if d.get(k)]
+        scope = f",{d['scope']}" if d.get("scope") else ""
+        return f"{verb} {'/'.join(got) or '0'}{scope}"
+    # ── 运营类:detail 就是计数字典本身,原样摊平(键由各链自定,不在此登记)──
+    if event in _ROUND_LABEL:
+        got = ", ".join(f"{k} {v}" for k, v in sorted(d.items()))
+        return f"{_ROUND_LABEL[event]}轮" + (f"({got})" if got else "")
+    return ""
+
+
 def brief(e: dict) -> str:
-    """输入:事件行 → 输出:摘要用短句(店铺 列 old→new)。"""
-    col = {STORE_STATUS_CHANGED: "店铺", PAYMENT_STATUS_CHANGED: "支付",
-           SALES_STATUS_CHANGED: "销售"}.get(e["event"], e["event"])
-    d = e.get("detail") or {}
-    return f"{e.get('store') or '?'} {col} {d.get('old')}→{d.get('new')}"
+    """输入:事件行 → 输出:摘要用短句(`店铺 主体`;全事件码通用)。"""
+    body = _brief_body(e["event"], e.get("detail") or {})
+    who = e.get("store") or ("全局" if e["event"] in
+                             (TRO_BRAND_HIT, STORE_SCOPE_CHANGED) else "?")
+    return f"{who} {body or e['event']}"

@@ -1067,6 +1067,110 @@ CREATE INDEX IF NOT EXISTS store_events_event_idx
 CREATE INDEX IF NOT EXISTS store_events_unnotified_idx
     ON ops.store_events (severity, occurred_at DESC) WHERE notified_at IS NULL;
 
+-- 店铺时间线:一事件一行,把 jsonb 里最常看的三个键(old/new/data_date)摊平。
+-- 回答的是「**这家店身上按时间顺序发生过什么**」(定稿 2026-08-30):封店那天
+-- 前后它在干什么、配置是谁改的、上一次恢复是什么时候 —— 一条 WHERE 店铺=… 即可。
+-- ⚠ **零程序读者是设计如此**(防下次盘点被判死):与 ops.v_feed_error_stats /
+-- v_scrape_failure_stats / catalog.product_risk_store 同性质——留给人工与 AI
+-- 排查用的展开面,不是给代码 SELECT 的。判它死之前先连库:
+--   SELECT query, calls FROM pg_stat_statements
+--     WHERE query ILIKE '%v_store_timeline%';   "代码不读" ≠ "没人 SELECT"。
+-- 踩坑注:
+--   ① 三个键**摊平但不丢原文**:`明细` 列照旧给整个 jsonb —— TRO/钓鱼/治理
+--      三族的 detail 里根本没有 old/new(它们记的是 brand/field/order_line_id),
+--      只留摊平列的话那几族在这个视图里会显示成一片空,像是数据坏了。
+--   ② store 为 NULL 是**全局事件**(TRO 品牌源头、规划范围变更),不是缺数据。
+--      渲染成 '(全局)' 而不是留空:留空在表格里与"这一格没取到"长得一模一样。
+--   ③ CREATE OR REPLACE 且**不依赖任何 DROP+CREATE 的视图**(db_init 幂等:
+--      PG 不允许 DROP 一个还有依赖者的视图,依赖它们等于埋"第二次跑就报错")。
+CREATE OR REPLACE VIEW ops.v_store_timeline AS
+  SELECT coalesce(store, '(全局)')  AS 店铺,
+         occurred_at                AS 时间,
+         severity                   AS 级别,
+         event                      AS 事件,
+         source                     AS 来源,
+         detail->>'old'             AS 旧值,
+         detail->>'new'             AS 新值,
+         detail->>'data_date'       AS 数据日期,
+         detail                     AS 明细,
+         notified_at                AS 已推送
+  FROM ops.store_events
+  ORDER BY occurred_at DESC;
+
+-- 店铺档案:一行一店,把「当下什么样」(KPI 最新截面)与「最近发生过什么」
+-- (事件聚合)并到一行。回答的是**开会/出事时那一屏**(定稿 2026-08-30):
+-- 这家店此刻是不是好的、身上压着几条高危、有没有还没推出去的、五条运营链
+-- 上一次动它是什么时候。
+-- ⚠ **零程序读者是设计如此**,同上；判死前先查
+--   SELECT query, calls FROM pg_stat_statements
+--     WHERE query ILIKE '%v_store_profile%';
+-- 口径(**看之前必须知道**):
+--   · **店铺全集来自 ops.store_kpi_daily** —— 没跑过 daily_report 的店不出现
+--     在这里。新登记但还没进过日报的店、以及只在事件表里露过面的店(比如刚
+--     被 store_config 记了一条"凭证表新增"),在本视图里查不到,去
+--     v_store_timeline 查。选它当左表是因为"店铺全集"这个概念本仓只有 KPI 表
+--     答得上来(凭证表在飞书上,不在库里)。
+--   · store 为 NULL 的全局事件不属于任何一家店,本视图看不到它们(同上)。
+-- 踩坑注(两条都来自 catalog.audit_listing_conflicts 2026-08-14 那次查询挂死):
+--   ① **先把基集缩小再去碰事件表**:DISTINCT ON 先把 KPI 表压成"每店最新一行"
+--      (几十行),LATERAL 才对这几十行各查一次。反过来写(先 JOIN 全部 KPI
+--      历史再聚合)就是几万行 × 一次事件扫描。
+--   ② **LATERAL 的关联条件必须与索引表达式逐字一致**:这里写裸列
+--      `ev.store = k.store`,吃的是 store_events_store_idx (store, occurred_at DESC)
+--      的首列。包一层 coalesce/upper/btrim 都会让索引失效,而表现只是"慢",
+--      不报错。
+--   ③ 五个 round 码在这里是**字面量副本**(视图是 SQL,取不到 Python 常量)。
+--      唯一出处仍是 services/store_events.py 的常量;
+--      tests/test_store_watch.py 有一条用例把这五个字面量与常量对拍,漏改会红。
+CREATE OR REPLACE VIEW ops.v_store_profile AS
+  WITH latest_kpi AS (
+      SELECT DISTINCT ON (store)
+             store, data_date, store_status, payment_status, sales_status,
+             items_online, orders_count
+      FROM ops.store_kpi_daily
+      ORDER BY store, data_date DESC
+  )
+  SELECT k.store                          AS 店铺,
+         k.data_date                      AS 数据日期,
+         k.store_status                   AS 店铺状态,
+         k.payment_status                 AS 支付状态,
+         k.sales_status                   AS 销售状态,
+         k.items_online                   AS 在线商品,
+         k.orders_count                   AS 近日订单,
+         coalesce(e.high_n, 0)            AS 高危累计,
+         coalesce(e.mid_n, 0)             AS 中危累计,
+         coalesce(e.unnotified_high, 0)   AS 待推高危,
+         e.last_high_at                   AS 最近高危时间,
+         e.last_high                      AS 最近高危事件,
+         e.last_at                        AS 最近事件时间,
+         e.last_event                     AS 最近事件,
+         e.last_list                      AS 最近上架轮,
+         e.last_maint                     AS 最近维护轮,
+         e.last_cleanup                   AS 最近清理轮,
+         e.last_clear                     AS 最近下架轮,
+         e.last_match                     AS 最近跟卖轮
+  FROM latest_kpi k
+  LEFT JOIN LATERAL (
+      SELECT count(*) FILTER (WHERE ev.severity = 'high')            AS high_n,
+             count(*) FILTER (WHERE ev.severity = 'mid')             AS mid_n,
+             count(*) FILTER (WHERE ev.severity = 'high'
+                              AND ev.notified_at IS NULL)            AS unnotified_high,
+             max(ev.occurred_at) FILTER (WHERE ev.severity = 'high') AS last_high_at,
+             max(ev.occurred_at)                                     AS last_at,
+             (array_agg(ev.event ORDER BY ev.occurred_at DESC)
+              FILTER (WHERE ev.severity = 'high'))[1]                AS last_high,
+             (array_agg(ev.event ORDER BY ev.occurred_at DESC))[1]   AS last_event,
+             max(ev.occurred_at) FILTER (WHERE ev.event = 'list_round')    AS last_list,
+             max(ev.occurred_at) FILTER (WHERE ev.event = 'maint_round')   AS last_maint,
+             max(ev.occurred_at) FILTER (WHERE ev.event = 'cleanup_round') AS last_cleanup,
+             max(ev.occurred_at) FILTER (WHERE ev.event = 'clear_round')   AS last_clear,
+             max(ev.occurred_at) FILTER (WHERE ev.event = 'match_round')   AS last_match
+      FROM ops.store_events ev
+      WHERE ev.store = k.store
+  ) e ON true
+  ORDER BY coalesce(e.unnotified_high, 0) DESC, e.last_high_at DESC NULLS LAST,
+           k.store;
+
 -- 绩效问题订单:永久累积,五字段唯一键,首次发现日期永不被覆盖(ON CONFLICT DO NOTHING)
 CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (
     id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

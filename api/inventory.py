@@ -97,35 +97,52 @@ def list_inventory_nodes(store: dict,
     bulk 漏掉的 SKU 走单品兜底(真兜底:记日志计数,蓝图 #22 语义);
     **兜底与主路径同族同口径**(见模块头注),不再混进"默认节点"语义。
     读不到的 SKU **不进结果**(不是 0),由上层 COALESCE 保留上一轮值。
+
+    翻页中途 400 = 游标作废(生产实证 2026-08-30 谭总12:第 66 页代理断连,
+    重试同一个 nextCursor 即 400 —— 透明游标一次性,断连那刻就死了),
+    与 items 域同款自愈:**整轮重来一次**(result 从头攒,不能续接半截 ——
+    游标死了没法从断点继续,续接旧 result 也没错但重扫会覆盖,索性清零重扫)。
+    第一页就 400 不算游标问题,照旧抛错。
     """
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
-    result: dict[str, int] = {}
-    cursor = None
-    while True:
-        params: dict = {"limit": 50}
-        if cursor:
-            params["nextCursor"] = cursor
-        _client.rate_acquire("inventory.list", store["client_id"])
-        status, _, data = _client.safe_get_ex(
-            f"{_client.base_url()}/v3/inventories",
-            token, store["client_id"], store["proxy"], params=params, max_retries=3)
-        if status in (401, 403):
-            raise _client.StoreDeadError(store["name"], status)
-        if status == 404:       # 空库存店铺按零商品处理(与 items 的 404 语义对齐)
-            logger.info("GET /v3/inventories 404(店铺 %s),按空处理", store["name"])
-            break
-        if status != 200:
-            raise RuntimeError(f"GET /v3/inventories 返回 {status}(店铺 {store['name']}): {data}")
-        elements = (data or {}).get("elements") or {}
-        for entry in elements.get("inventories") or []:
-            sku = entry.get("sku")
-            if sku:
-                nodes = _nodes(entry, f"{store['name']} {sku} bulk")
-                if nodes is not None:
-                    result[sku] = nodes
-        cursor = ((data or {}).get("meta") or {}).get("nextCursor")
-        if not cursor:      # 终止只看 cursor,绝不看页长(历史 bug)
-            break
+
+    def _sweep() -> dict[str, dict[str, int]]:
+        result: dict[str, dict[str, int]] = {}
+        cursor = None
+        while True:
+            params: dict = {"limit": 50}
+            if cursor:
+                params["nextCursor"] = cursor
+            _client.rate_acquire("inventory.list", store["client_id"])
+            status, _, data = _client.safe_get_ex(
+                f"{_client.base_url()}/v3/inventories",
+                token, store["client_id"], store["proxy"], params=params, max_retries=3)
+            if status in (401, 403):
+                raise _client.StoreDeadError(store["name"], status)
+            if status == 404:   # 空库存店铺按零商品处理(与 items 的 404 语义对齐)
+                logger.info("GET /v3/inventories 404(店铺 %s),按空处理", store["name"])
+                return result
+            if status == 400 and cursor:
+                raise _CursorExpired()      # 游标作废,由外层整轮重来一次
+            if status != 200:
+                raise RuntimeError(f"GET /v3/inventories 返回 {status}(店铺 {store['name']}): {data}")
+            elements = (data or {}).get("elements") or {}
+            for entry in elements.get("inventories") or []:
+                sku = entry.get("sku")
+                if sku:
+                    nodes = _nodes(entry, f"{store['name']} {sku} bulk")
+                    if nodes is not None:
+                        result[sku] = nodes
+            cursor = ((data or {}).get("meta") or {}).get("nextCursor")
+            if not cursor:  # 终止只看 cursor,绝不看页长(历史 bug)
+                return result
+
+    try:
+        result = _sweep()
+    except _CursorExpired:
+        logger.info("GET /v3/inventories 游标作废(店铺 %s),重置整轮重试一次",
+                    store["name"])
+        result = _sweep()
 
     if expected_skus:
         missing = sorted(expected_skus - result.keys())
@@ -230,6 +247,10 @@ def put_inventory(store: dict, sku: str, qty: int,
     logger.warning("PUT /v3/inventory 失败(%s %s → %s): %s",
                    store["name"], sku, qty, why)
     return False, why
+
+
+class _CursorExpired(Exception):
+    """翻页中途游标作废(断连后重试同游标 400)—— 只在本模块内触发整轮重试。"""
 
 
 def _get_nodes_one(store: dict, sku: str) -> dict[str, int] | None:

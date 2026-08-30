@@ -615,3 +615,63 @@ def test_put_inventory_node_parses_partial_success(monkeypatch):
     # 形状认不出(字段改名/文档与实测不符)也判失败,绝不当成功
     _use(monkeypatch, lambda r: httpx.Response(200, json={"status": "OK"}))
     assert inv_api.put_inventory(STORE, "A", 7, "N1")[0] is False
+
+
+def test_inventories_cursor_death_restarts_the_whole_sweep(monkeypatch):
+    """翻页中途 400 = 游标作废(2026-08-30 生产实证:断连后重试同游标即 400)。
+
+    与 items 域同款自愈:整轮重来一次,result 从头攒。第二次还 400 就真抛
+    —— 无限重扫比失败更糟(一轮全店翻页不便宜)。
+    """
+    state = {"deaths": 0, "sweeps": 0}
+
+    def handler(request):
+        cur = request.url.params.get("nextCursor")
+        if cur is None:
+            state["sweeps"] += 1
+            return httpx.Response(200, json={
+                "elements": {"inventories": [
+                    {"sku": "A", "nodes": [
+                        {"shipNode": "N1", "availToSellQty": {"amount": 3}}]}]},
+                "meta": {"nextCursor": "C1"}})
+        if state["deaths"] == 0:
+            state["deaths"] += 1
+            return httpx.Response(400, json={"error": "cursor expired"})
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "B", "nodes": [
+                    {"shipNode": "N1", "availToSellQty": {"amount": 5}}]}]},
+            "meta": {}})
+
+    _use(monkeypatch, handler)
+    got = inv_api.list_inventory_nodes(STORE)
+    assert got == {"A": {"N1": 3}, "B": {"N1": 5}}      # 重扫后数据完整
+    assert state["sweeps"] == 2                          # 确实整轮重来了一次
+
+    def _reuse(handler):
+        # 连接池按 proxy 缓存 transport,同一用例内换 handler 必须先清池
+        for c in _client._client_pool.values():
+            c.close()
+        _client._client_pool.clear()
+        _use(monkeypatch, handler)
+
+    # 第一页(无游标)就 400 不是游标问题,照旧响亮失败
+    _reuse(lambda r: httpx.Response(400, json={}))
+    with pytest.raises(RuntimeError, match="返回 400"):
+        inv_api.list_inventory_nodes(STORE)
+
+    # 两轮都死:抛 _CursorExpired 会漏出去吗?不 —— 第二轮的异常原样上抛,
+    # 调用方(catalog_sync 单店 try)按同步失败处理,不无限重扫
+    state2 = {"n": 0}
+
+    def always_dead(request):
+        if request.url.params.get("nextCursor") is None:
+            return httpx.Response(200, json={
+                "elements": {"inventories": []}, "meta": {"nextCursor": "C1"}})
+        state2["n"] += 1
+        return httpx.Response(400, json={})
+
+    _reuse(always_dead)
+    with pytest.raises(inv_api._CursorExpired):
+        inv_api.list_inventory_nodes(STORE)
+    assert state2["n"] == 2                              # 恰好两轮,没有第三轮

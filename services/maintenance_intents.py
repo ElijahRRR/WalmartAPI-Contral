@@ -139,10 +139,23 @@ def current_qty(store: str, avail_qty, node_qty,
 
       未配置店 → walmart_items.avail_qty(全店合计,现状,逐字节不变)
       配置店   → item_node_inventory 里受管仓那一行的 avail_qty
-      配置店而明细还没扫到 → **None**(不回落合计,见 _MANAGED_NODE_JOIN 头注)
+      配置店而受管仓**没有那一行** → **0**(见下),不是 None、更不是合计
+
+    ⚠ 「受管仓没有这一行」= 该 SKU 在这个仓里就是没货,**0 才是它的真实现值**。
+    2026-08-30 生产实测定案(谭总12 B008LUW4CI):节点行是**第一次写库存时
+    创建的** —— 不需要先做 SKU×FC 关联(此前按"要先关联"推断编码,实测推翻)。
+    于是"缺行就跳过"会造成**死锁**:永远不写 → 永远没有行 → 永远跳过,
+    3663 条存量行一直卡着而日志只说"预期暂停"。
+
+    ⚠ 那"不回落合计"的原则还算数吗?算数,而且这里没有违反它:回落合计是拿
+    **别的节点的货**冒充受管仓的现值(多节点店永远判有差异 → 每轮重发);
+    判 0 是如实陈述"这个仓里没有" —— 两回事。
+    ⚠ "整店还没扫到"由**缺席避让**兜(store_absence:目录水位落后船队的店
+    整店不产意图),不该由这条判据兼职 —— 一条判据只答一个问题。
     """
-    q = node_qty if store in (managed or {}) else avail_qty
-    return int(q) if q is not None else None
+    if store in (managed or {}):
+        return int(node_qty or 0)
+    return int(avail_qty) if avail_qty is not None else None
 
 
 _SQL_ZERO = """
@@ -650,18 +663,10 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
                                      **managed_params(managed)})
         rows = cur.fetchall()
     out = []
-    skipped_no_node = 0
     for store, sku, avail, node_q in rows:
-        if store in (managed or {}) and node_q is None:
-            # ⚠ 配置店而受管仓明细没扫到:**跳过,不当"没货要铺"**。
-            # 这里的"未知"与下面那个"未知"方向相反:未配置店的未知是
-            # "旧口径读不到,保守铺上"(2026-08-12 结构洞);配置店的未知是
-            # "SKU 还没与新仓建立关联"——当没货铺会给全部跟卖品往新仓写
-            # 保守值,存量货还在 Virtual Node 上,两节点同时有货、合计翻倍。
-            # 与 inventory_intents 同一条 fail-closed 口径(所有者拍板
-            # 2026-08-30:配置店只维护受管仓,存量行等搬仓)。
-            skipped_no_node += 1
-            continue
+        # 配置店缺节点行 = 受管仓里没货 = 该铺(current_qty 判 0)。
+        # ⚠ 这会让受管仓与旧节点**同时有货**:旧节点的存量归人工清理,
+        # 自动链按定稿只碰受管仓(见 docs/multi_node_plan.md §6 末段)。
         cur_q = current_qty(store, avail, node_q, managed)
         if cur_q:                       # 只铺 0/未知;None(未知)照旧算要铺
             continue
@@ -670,10 +675,6 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
                     "code": "match_restock",
                     "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})",
                     **_node_of(store, managed)})
-    if skipped_no_node:
-        logger.warning("跟卖铺货:%d 条受管仓明细未落库,本轮跳过"
-                       "(SKU 尚未与受管仓建立关联;搬仓后自动恢复)",
-                       skipped_no_node)
     return out
 
 
@@ -776,7 +777,6 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
     lead_caps = store_limits.lead_day_caps()
     chans = store_channels or {}
     out = []
-    skipped_no_node = 0
     n_channel = n_zeroed = 0
     for r in _rows(conn, stockzero_stores, managed):
         store, sku = r["store"], r["sku"]
@@ -814,12 +814,6 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
         if act == "delete":
             continue        # 删除类归 delete_intents,这里不抢
         new_qty = 0 if act == "inventory" else int(stock_count)
-        if store in (managed or {}) and avail_qty is None:
-            # 配置店而受管仓明细还没扫到:**不回落合计**(回落就是拿合计跟
-            # 单仓目标比,正是多仓的核心故障)。跳过,下轮 catalog_sync 扫到
-            # 明细自然进来。计数见 collect_all 的告警。
-            skipped_no_node += 1
-            continue
         if avail_qty is not None and int(avail_qty) == new_qty:
             continue
         out.append({"store": store, "sku": sku, "kind": "inventory",
@@ -827,15 +821,6 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
                     "code": code, "reason": why,
                     **_node_of(store, managed)})
         n_zeroed += 1 if code == "channel_mismatch" else 0
-    if skipped_no_node:
-        # 两种正当原因,别一见非 0 就当故障:① 新上架/刚搬仓的 SKU 等下轮
-        # catalog_sync;② **存量 SKU 还没搬仓**(所有者拍板 2026-08-30:配置店
-        # 只维护受管仓,存量行的库存维护暂停到搬仓为止,超卖风险知情接受)。
-        # 真正的故障信号是"搬完仓了这个数还不掉"——那才查 §2.4。
-        logger.warning("受管仓明细未落库,本轮跳过 %d 条库存意图"
-                       "(未搬仓的存量行 = 预期暂停,所有者拍板 2026-08-30;"
-                       "搬完仓仍非 0 才查 docs/multi_node_plan.md §2.4)",
-                       skipped_no_node)
     if n_channel:
         # 渠道不符必须出声:它是结构性的(不像缺货会自己好),而且这批行
         # 会顺着删除链的窗口走到不可逆的删除 —— 一次大面积出现,多半是

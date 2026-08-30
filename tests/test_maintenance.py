@@ -1993,26 +1993,25 @@ def test_listing_fc_prefers_the_managed_node(monkeypatch):
     assert store_limits.listing_fc(_store("T2"), {"T1": "111"}) == "PARTNER"
 
 
-def test_match_restock_never_fires_into_an_unlinked_managed_node():
-    """⚠ 配置店而受管仓明细没扫到:跟卖铺货**跳过**,不当"没货要铺"。
+def test_match_restock_treats_a_missing_node_row_as_empty_not_as_skip():
+    """配置店缺节点行 = 受管仓里没货 = **该铺**(2026-08-30 实测定案)。
 
-    这里的"未知"与未配置店的"未知"方向相反:后者是"读不到,保守铺上"
-    (2026-08-12 结构洞),前者是"SKU 还没与新仓建立关联"——当没货铺会给
-    全部跟卖品往新仓写保守值,存量货还在 Virtual Node 上,两节点同时有货。
-    所有者拍板 2026-08-30:配置店只维护受管仓,存量行等搬仓。
+    ⚠ 曾经在这里判"跳过"(以为节点行要先做 SKU×FC 关联才出现),那会造成
+    死锁:永远不写 → 永远没有行 → 永远跳过。实测证明节点行是**第一次写库存
+    时创建的**(谭总12 B008LUW4CI:写入 Success,读回立刻多出该节点)。
     """
     managed = {"T1": "N_NEW"}
-    # (store, sku, avail_qty, node_qty):存量跟卖品,合计 0、新仓无关联
+    # (store, sku, avail_qty, node_qty):受管仓无行 ⇒ 现值 0 ⇒ 铺货
     conn = _Conn(rows=[("T1", "M0A", 0, None)])
-    assert mi.match_inventory_intents(conn, [], managed) == []
-
-    # 搬仓后(新仓关联建立,qty 0 也会出行):恢复铺货,且意图带 ship_node
-    conn = _Conn(rows=[("T1", "M0A", 0, 0)])
     out = mi.match_inventory_intents(conn, [], managed)
     assert [(i["sku"], i["new"], i["ship_node"]) for i in out] == [
         ("M0A", mi.MATCH_INVENTORY_QTY, "N_NEW")]
 
-    # 未配置店的"未知"维持旧口径:照旧算要铺(不带 ship_node)
+    # 受管仓已有货 ⇒ 不铺(哪怕合计是别的节点凑出来的,也只看受管仓)
+    conn = _Conn(rows=[("T1", "M0A", 99, 7)])
+    assert mi.match_inventory_intents(conn, [], managed) == []
+
+    # 未配置店维持旧口径:合计 0/未知都算要铺(不带 ship_node)
     conn = _Conn(rows=[("T2", "M0B", None, None)])
     out = mi.match_inventory_intents(conn, [], managed)
     assert [(i["sku"], "ship_node" in i) for i in out] == [("M0B", False)]

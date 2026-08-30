@@ -524,10 +524,16 @@ CREATE TABLE ops.store_kpi_daily (
 --   high = 任意→TERMINATED / store ACTIVE→SUSPENDED / payment ACTIVE→INACTIVE
 --   mid  = 可售→不可售(影刀列)及未知迁移;info = 恢复方向(入账不推送)
 -- 写入方(截至 2026-08-30):daily_report(三状态迁移)、product_audit
--- (tro_brand_hit 源头 + tro_brand_exposure 波及)。防重不在本表(只追加、
--- 无唯一键),在 ops.dedupe:'audit:tro_brand'(一个 TRO 品牌一条源头)与
--- 'audit:tro_expand'(整品牌展开一次,**不按店**)——两个 scope 分开,是为了
--- 让"先以未判身份报过、后被 L3 确认"的品牌仍能补做波及展开。
+-- (tro_brand_hit 源头 + tro_brand_exposure 波及)、order_audit
+-- (phishing_order 收单店 + phishing_brand_exposure 波及)。
+-- 防重不在本表(只追加、无唯一键),两条链各有各的办法:
+--   · TRO   ops.dedupe 两个 scope:'audit:tro_brand'(一个品牌一条源头)与
+--           'audit:tro_expand'(整品牌展开一次,**不按店**)。分开是为了让
+--           "先以未判身份报过、后被 L3 确认"的品牌仍能补做波及展开;
+--   · 钓鱼  身份键在 detail 里(store_events.record_line_events 的 NOT EXISTS:
+--           (event, store IS NOT DISTINCT FROM, detail->>'order_line_id')),
+--           不占 dedupe —— order_audit 每轮重判窗口内的行,写入口自己幂等,
+--           而且它还要**每轮重扫窗口补记**账本里漏掉的钓鱼行。
 CREATE TABLE ops.store_events (
     id bigint PK,
     store text,                  -- NULL = 全局源头事件(TRO 命中本体,波及店

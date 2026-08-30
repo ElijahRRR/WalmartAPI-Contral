@@ -46,6 +46,12 @@ SALES_STATUS_CHANGED = "sales_status_changed"      # risk
 # (合成一个码之后,按 store IS NULL 过滤才数得出源头,谁都会忘)。
 TRO_BRAND_HIT = "tro_brand_hit"                    # risk(源头,store=NULL)
 TRO_BRAND_EXPOSURE = "tro_brand_exposure"          # risk(波及,逐店)
+# 钓鱼订单(order_audit 接线,2026-08-30):**收单店一条 + 品牌波及逐店**。
+# 与 TRO 那对的形状故意不同 —— 钓鱼是**订单**级事件,收单店是确定的(货真发到
+# 那个黑名单邮编去了),所以源头行带 store;波及问的是"同品牌的货还在哪几家店
+# 挂着"(黑产盯的是品牌不是店)。身份键是 detail.order_line_id。
+PHISHING_ORDER = "phishing_order"                  # risk(收单店,逐订单行)
+PHISHING_BRAND_EXPOSURE = "phishing_brand_exposure"  # risk(波及,逐店)
 
 # 分类表:码 → risk/governance/ops(消费方按类过滤;码登记时必须同时归类)
 CLASS = {
@@ -54,6 +60,8 @@ CLASS = {
     SALES_STATUS_CHANGED: "risk",
     TRO_BRAND_HIT: "risk",
     TRO_BRAND_EXPOSURE: "risk",
+    PHISHING_ORDER: "risk",
+    PHISHING_BRAND_EXPOSURE: "risk",
 }
 
 EVENTS = frozenset(CLASS)
@@ -61,14 +69,8 @@ EVENTS = frozenset(CLASS)
 SEVERITIES = ("high", "mid", "info")
 
 
-def record_many(conn, rows: list[dict]) -> int:
-    """输入:连接 + 事件行 [{store, event, severity, source, detail?}] → 输出:写入数。
-
-    store 可为 None(全局源头事件);未登记的码 / 非法 severity 直接抛 ——
-    账本只追加、消费方按精确字符串过滤,写错的行是永远没人查的分叉,宁炸不吞。
-    """
-    if not rows:
-        return 0
+def _check(rows: list[dict]) -> None:
+    """输入:事件行 → 输出:无(码/severity 不合法直接抛;两个写入口共用)。"""
     bad = sorted({r["event"] for r in rows} - EVENTS)
     if bad:
         raise ValueError(f"未登记的店铺事件码 {bad}:先在 services/store_events.py "
@@ -76,6 +78,19 @@ def record_many(conn, rows: list[dict]) -> int:
     bad_sev = sorted({r["severity"] for r in rows} - set(SEVERITIES))
     if bad_sev:
         raise ValueError(f"非法 severity {bad_sev}(可用:{SEVERITIES})")
+
+
+def record_many(conn, rows: list[dict]) -> int:
+    """输入:连接 + 事件行 [{store, event, severity, source, detail?}] → 输出:写入数。
+
+    store 可为 None(全局源头事件);未登记的码 / 非法 severity 直接抛 ——
+    账本只追加、消费方按精确字符串过滤,写错的行是永远没人查的分叉,宁炸不吞。
+    **不去重**:调用方自己保证只喂新行(如 TRO 那条链先占 ops.dedupe 键)。
+    要按订单行去重的走 `record_line_events`。
+    """
+    if not rows:
+        return 0
+    _check(rows)
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO ops.store_events (store, event, severity, source, detail) "
@@ -206,6 +221,59 @@ def record_kpi_diff(conn, store: str, data_date, new_row: dict) -> list[dict]:
                 "day": d["data_date"], "old": d["old"], "new": d["new"]})
             if cur.rowcount:
                 landed.append(e)
+    return landed
+
+
+# ── 按订单行去重的落库(钓鱼订单接线;order_audit 每轮重判同一批行)──────────
+
+# 身份键 = (事件码, 店, detail.order_line_id)。三样都要:
+#   · 同一订单行会扇出**多家店**的波及行(店不同 = 不同的事实),所以 store
+#     必须进键;而收单店那条 store 非空、波及那些也非空,但**将来若有 store=NULL
+#     的行**,`=` 会静默变成 NULL 比较(永远不 TRUE)⇒ 每轮重复插一行。
+#     所以用 `IS NOT DISTINCT FROM` 而不是 `=`(TRO 源头行就是 store=NULL,
+#     那条链吃过这个亏才特意分了两个 dedupe scope)。
+#   · order_line_id 从 detail 里取:store_events 没有订单列,也不该为一条链加列。
+_INSERT_LINE_DEDUP_SQL = """
+INSERT INTO ops.store_events (store, event, severity, source, detail)
+SELECT %(store)s::text, %(event)s::text, %(severity)s::text, %(source)s::text,
+       %(detail)s::jsonb
+WHERE NOT EXISTS (
+    SELECT 1 FROM ops.store_events
+    WHERE event = %(event)s::text
+      AND store IS NOT DISTINCT FROM %(store)s::text
+      AND detail->>'order_line_id' = %(line)s::text)
+"""
+
+
+def record_line_events(conn, rows: list[dict]) -> list[dict]:
+    """输入:连接 + 事件行(detail 里**必须**有 order_line_id)→ 输出:真落库的行。
+
+    order_audit 每轮把窗口内的行重判一遍(`-p wait=1` 时同一批还判两遍),
+    所以这条写入口必须自己幂等:去重在 SQL 里做(NOT EXISTS),同一
+    (码, 店, 订单行) 只会有一行。返回的是**真落库的那些**,摘要按它报数 ——
+    报"本轮又发现 N 条"却每轮都是同一条,比不报还坏。
+
+    detail 缺 order_line_id 直接抛:那样的行会绕过去重每轮插一条,而且事后
+    没有任何办法把它们认出来(账本只追加)。
+    """
+    if not rows:
+        return []
+    _check(rows)
+    missing = [r for r in rows if not (r.get("detail") or {}).get("order_line_id")]
+    if missing:
+        raise ValueError(f"{len(missing)} 行 detail 缺 order_line_id:"
+                         f"record_line_events 的去重键靠它,缺了就是每轮重复插")
+    landed = []
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(_INSERT_LINE_DEDUP_SQL, {
+                "store": r.get("store"), "event": r["event"],
+                "severity": r["severity"], "source": r["source"],
+                "detail": json.dumps(r["detail"], ensure_ascii=False,
+                                     default=str),
+                "line": r["detail"]["order_line_id"]})
+            if cur.rowcount:
+                landed.append(r)
     return landed
 
 

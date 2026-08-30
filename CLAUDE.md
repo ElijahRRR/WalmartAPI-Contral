@@ -77,7 +77,8 @@ refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv 等)
 skills/         生成物:调度技能包,skill_export 渲染,不要手改
 docs/           conventions.md(规范全文) plan.md(计划与决策日志)
                 production_cutover.md(生产定稿) api_blueprint.md(端点/配额定稿)
-                db_schema.md feishu_tables.md feed_closure_audit.md
+                db_schema.md store_events.md(店铺事件账本:上线三步与排查)
+                feishu_tables.md feed_closure_audit.md
                 legacy_survey.md(旧仓摸底) category_mapping.md
                 multi_node_plan.md allocation_plan.md 等
 ```

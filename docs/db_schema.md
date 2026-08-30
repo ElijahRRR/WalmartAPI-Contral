@@ -533,7 +533,8 @@ CREATE TABLE ops.store_kpi_daily (
 --              tro_brand_exposure 波及)、order_audit(phishing_order 收单店 +
 --              phishing_brand_exposure 波及);
 --   governance services/store_config(限额表逐格 diff、凭证表在册/启用、规划外
---              名单;快照存 ops.cursors['store_config'])、alloc_plan /
+--              名单;快照存 ops.cursors['store_config'];**由 store_watch 每轮
+--              调用** —— 它是这个模块唯一的属主,别再从别处调)、alloc_plan /
 --              alloc_backfill(claim_created,**按 claim_many 的真落库行**计数,
 --              用"成功数"会把幂等重跑记成天天新占)、store_release
 --              (claim_released:整店 high、点名/csv mid)。
@@ -566,9 +567,35 @@ CREATE TABLE ops.store_events (
     severity text NOT NULL,      -- high / mid / info
     source text NOT NULL, detail jsonb,
     occurred_at timestamptz DEFAULT now(),
-    notified_at timestamptz      -- store_watch 已推送标记(六期);NULL=待扫描
+    notified_at timestamptz      -- store_watch 已推送标记;NULL=待扫描
 );  -- 索引:(store, occurred_at DESC) / (event, occurred_at DESC) /
     -- 局部 (severity, occurred_at DESC) WHERE notified_at IS NULL
+```
+
+事件码唯一出处 = `services/store_events.py` 的常量、`CLASS` 分类表与 `EVENTS`
+集合(`record_many` 对未登记码抛错);**本文档不复述清单**,照 `product_events`
+的老规矩 —— 三处清单必然各漂各的。上面按 risk/governance/ops 三类列的是
+**写入方**(谁在什么场景落行),不是码表;要看有哪些码、各归哪一类,读那份代码。
+一条码的摘要文案也在同一处(`store_events.brief`,全事件码唯一渲染出处)。
+
+**唯一消费方 = `store_watch`**(每小时 :45,launchd)。写入方一律只落行不发通知
+——谁发谁就得各自实现去重与限流,而同一次封店会从三个地方各响一次。
+`notified_at` 只由它写:扫「未推送 + 高危 + 窗口内」→ 一轮一条飞书 → 标已推;
+**推送失败一条都不标**(账本只追加,标了就是永久埋掉)。首次上线要先
+`python cli.py store_watch -p seed=1` 把存量标掉,上线三步见 `docs/store_events.md`。
+
+读侧视图 ×2(2026-08-30;**零程序读者是设计如此**,留给人工与 AI 排查,
+判死前先查 `pg_stat_statements`):
+
+| 视图 | 一行是什么 | 回答什么 |
+|---|---|---|
+| `ops.v_store_timeline` | 一事件 | 这家店身上按时间发生过什么。`old/new/data_date` 三个常看的 jsonb 键摊平,`明细` 列仍给整个 jsonb(TRO/钓鱼/治理三族的 detail 里根本没有 old/new,只留摊平列会显示成一片空);`store IS NULL` 渲染成 `(全局)` |
+| `ops.v_store_profile` | 一店 | 此刻什么样 + 身上压着几条高危 + 还有几条没推出去 + 五条运营链上次动它是什么时候。**店铺全集来自 `store_kpi_daily`**(没跑过 daily_report 的店不出现,全局事件也不在这里);DISTINCT ON 先把 KPI 压成每店最新一行再 LATERAL 聚合,关联条件用裸列吃 `store_events_store_idx` |
+
+⚠ `v_store_profile` 里五个 `*_round` 事件码是**唯一一处字面量副本**(视图是 SQL,
+取不到 Python 常量)。`tests/test_store_watch.py` 有一条用例把它们与常量对拍 ——
+漏改的表现是那五列永远为空,不报错。
+```
 
 CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不被覆盖
     id bigint, first_seen_date date, store text,

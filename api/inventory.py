@@ -174,8 +174,12 @@ def _node_result(data, sku: str, ship_node: str) -> tuple[bool, str]:
     for n in nodes:
         if not isinstance(n, dict):
             continue
-        # 只认目标节点那一条:一次只写一个节点,别的节点的 status 与本次无关
-        if str(n.get("shipNode") or "") not in (str(ship_node), ""):
+        # 只认目标节点那一条,**精确匹配**:一次只写一个节点,别的节点的 status
+        # 与本次无关。⚠ 这里曾经把"没带 shipNode 字段"也当成命中(兼容不回显
+        # 节点的响应)—— 那正是本函数 docstring 明令禁止的"认不出当成功":
+        # 2026-08-30 生产实测 (True,'') 但读回毫无变化,真假无从分辨。
+        # 不回显节点的响应现在落到函数末尾,判失败并把原始 nodes[] 报出来。
+        if str(n.get("shipNode") or "") != str(ship_node):
             continue
         st = str(n.get("status") or "")
         if st.upper() in ("SUCCESS", "SUCCESSFUL", "OK"):
@@ -183,7 +187,8 @@ def _node_result(data, sku: str, ship_node: str) -> tuple[bool, str]:
         errs = n.get("errors") or n.get("error") or ""
         return False, f"节点 {ship_node} status={st or '(空)'}: {str(errs)[:200]}"
     return False, (f"响应 nodes[] 里没有目标节点 {ship_node}"
-                   f"(有的是 {[n.get('shipNode') for n in nodes if isinstance(n, dict)]})")
+                   f"(有的是 {[n.get('shipNode') for n in nodes if isinstance(n, dict)]});"
+                   f"原始响应:{str(data)[:300]}")
 
 
 def _put_inventory_node(store: dict, sku: str, qty: int,

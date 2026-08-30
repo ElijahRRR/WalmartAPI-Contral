@@ -775,3 +775,17 @@ def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
     assert seen["called"] and seen["skus"] is None, \
         "接线又被接回来了:扫描集不许进库存单查(2026-08-28 定稿)"
     assert r["inv"] == 1
+
+
+def test_put_node_never_reads_a_nodeless_echo_as_success(monkeypatch):
+    """⚠ 响应里 node 不带 shipNode ⇒ **判失败**,不许当成目标节点成功。
+
+    2026-08-30 生产实测:写入报 (True,'') 而读回毫无变化 —— 当时 `_node_result`
+    把"没带 shipNode"也算命中(为兼容不回显节点的响应),于是真成功与假成功
+    长得一模一样,无从分辨。宁可多重发一轮。
+    """
+    _use(monkeypatch, lambda r: httpx.Response(200, json={
+        "sku": "A", "nodes": [{"status": "SUCCESS"}]}))          # 无 shipNode
+    ok, why = inv_api.put_inventory(STORE, "A", 7, "N1")
+    assert ok is False and "没有目标节点 N1" in why
+    assert "原始响应" in why          # 形状对不上时要把实物带出来给人看

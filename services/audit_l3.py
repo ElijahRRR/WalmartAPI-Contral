@@ -21,7 +21,8 @@ verdict 取值非法,**一律 verdict='pending'**(旧仓是 pass —— 故障�
 政策路由的 DB 查询(结果只用 category_en,退化为内存表)、跨供应商 failover /
 llm_router / reasoning_effort / usage_logger、strong 升级链(合同 L3-3:生产
 yaml 两链主节点同为 claude-sonnet-5,能力事实已死)、`_summarize_l2_hits` 的
-三条死分支(brand_blacklist / forbidden_mega_cat / cat_forbid_zh_seller)。
+死分支 brand_blacklist(已移 L0);forbidden_mega_cat / cat_forbid_zh_seller
+对应的 L2 R0/R2 已于 2026-08-20 整条删除。
 
 public:
   L3Result, judge_l3, load_policy_rows, load_reason_categories,
@@ -290,6 +291,25 @@ L1 类目映射经常因为亚马逊源头分类错误而漏判 (例如 "Baby Bo
    reason_text 必须明确指出: "<产品类别>属于儿童用品, 需 CPC + ASTM 认证, 卖家
    未提供 → 上架会被警告". 必须引用 title 原文证据.
 
+## 6. 整机电器 / NRTL 认证 (2026-08-21 从 L2 移上来 — 代码判不了这件事)
+背景: 美国市场的**整机电器**上架沃尔玛要 NRTL 挂牌 (UL / ETL / CSA), 搬运卖家
+拿不到. 但同一个类目下整机与非电产品是混着的: Coffee Tables 里既有普通木桌,
+也有带 USB 口/内置灯的电动升降桌. 所以这件事**只能看产品本身, 不能看类目名**.
+(此前由 L2 按 PT 名里有没有 "parts"/"accessor" 猜, 把一张实木咖啡桌判成
+"整机电器, 必须 NRTL 认证" — 所有者 2026-08-21 实见, 那条规则已下线.)
+
+判定步骤:
+1. 从 title / bullets / description 判断产品**本身**是不是整机电器:
+   - 是: 有独立电源 (插电或内置电池驱动) 且作为成品直接使用 —
+         电水壶 / 电动工具 / 取暖器 / 风扇 / 台灯 / 电动升降桌 / 电动按摩器
+   - 不是: 不带电 (纯木家具 / 纯布艺 / 纯五金) — 绝大多数产品属于这一类
+   - 不是: 电气**配件/替换件/耗材** (灯泡 / 线材 / 插头 / 滤网 / 刀头 / 电池本身)
+   - 不是: 仅含纽扣电池的低压小件 (电子表 / 发光贺卡 / LED 小挂灯)
+2. 只有第 1 步判为**整机电器**才 reject; reason_text 必须引用原文证据说明
+   "它带电且是成品" (如 "标题写 built-in USB charging port + power outlet").
+3. **拿不准一律 pass**. 这一维默认放行 — 绝大多数产品不带电, 宁可漏一个,
+   也不要重蹈"按类目名连坐整类"的覆辙.
+
 # 输出规范 (严格 JSON)
 
 {
@@ -436,16 +456,17 @@ MAX_NOTES_CHARS = 200
 def summarize_l2_for_l3(l2) -> tuple[str, list[str]]:
     """输入:L2Result → 输出:(L2 命中摘要文本, R4/R5 品牌词前 10 个)。
 
-    三条死分支不迁(旧仓 §8-15):brand_blacklist(R1 已移 Phase0,且 phase0
-    命中根本不进 L3)、forbidden_mega_cat / cat_forbid_zh_seller(penalty=-100,
-    L2 已 reject 不进 L3)。
+    死分支不迁(旧仓 §8-15):brand_blacklist(R1 已移 Phase0,且 phase0 命中根本
+    不进 L3);forbidden_mega_cat / cat_forbid_zh_seller 对应的 R0/R2 已于
+    2026-08-20 删除。
 
-    ⚠ 已知缺陷照迁(spec §4,合同 L3-1):R7 `content_promotional` 与 R8
-    `walmart_strict_sensitive` 两类软证据**没有分支,完全不进 prompt** ——
-    L2 在 detail 里标了 "L3 LLM 需判断…" 但 L3 从未收到,只能自己从原文重看。
-    ⚠ 已知缺陷照迁(spec §4,合同 L3-2):cert 分支取 `detail['requirements']`,
-    该键在 L2 三种 cert hit 里**都不存在**(实际键是 meta_requirements /
-    hard_cert_fields / soft_cert_fields),前两档退化成固定套话 note。
+    ⚠ 2026-08-20 补上两处丢证据(此前是"照迁旧缺陷"):
+      · R7 `content_promotional` 与 R8 `walmart_strict_sensitive` **原先完全不进
+        prompt** —— L2 在 detail 里写着"L3 LLM 需判断宣称词是否有事实依据",
+        而 L3 根本没收到,只能自己从原文重看一遍。承诺了没送到,比不承诺更糟。
+      · cert 分支取的是 `detail['requirements']`,这个键在 L2 三种 cert hit 里
+        **一个都不存在**(真实键是 meta_requirements / hard_cert_fields /
+        soft_cert_fields),于是前两档永远退化成一句固定套话 note。
     """
     lines: list[str] = []
     r4_brands: list[str] = []
@@ -457,14 +478,27 @@ def summarize_l2_for_l3(l2) -> tuple[str, list[str]]:
             pairs = [f"{m.get('brand')}(原文:{m.get('matched_phrase')})" for m in matches]
             lines.append(f"* 标题/描述命中黑名单(R4, 共{h.detail.get('count', len(matches))}个, 前10): {', '.join(pairs)}")
         elif h.rule_code.startswith("cat_requires_cert"):
-            lines.append(
-                f"* 类目需证书({h.rule_code}): "
-                f"{h.detail.get('requirements') or h.detail.get('soft_cert_fields') or h.detail.get('note')}"
-            )
+            d = h.detail
+            what = (d.get("meta_requirements") or d.get("hard_cert_fields")
+                    or d.get("soft_cert_fields") or d.get("note"))
+            lines.append(f"* 类目需证书({h.rule_code}): {what}")
         elif h.rule_code == "trademark_live":
             marks = h.detail.get("matched_marks", [])[:MAX_BRANDS]
             lines.append(f"* USPTO LIVE 商标(R5, 前10): {', '.join(marks)}")
             r4_brands.extend(m.lower() for m in marks if m)
+        elif h.rule_code == "content_promotional":
+            d = h.detail
+            phrases = (d.get("strong_phrases") or []) + (d.get("allcaps_runs") or [])
+            tag = "仅空洞形容词" if d.get("soft_only") else "含无据宣称/全大写滥用"
+            lines.append(
+                f"* 促销宣称(R7, {tag}): "
+                f"{', '.join((phrases or d.get('soft_phrases') or [])[:MAX_BRANDS])}")
+        elif h.rule_code == "walmart_strict_sensitive":
+            d = h.detail
+            subtypes = ", ".join(d.get("subtypes") or [])
+            phrases = (d.get("matched_phrases") or [])[:MAX_BRANDS]
+            lines.append(
+                f"* 敏感/严格合规(R8, {subtypes}): {', '.join(str(t) for t in phrases)}")
     return (
         ("\n".join(lines) if lines else "(L2 无命中)"),
         list(dict.fromkeys(r4_brands))[:MAX_BRANDS],

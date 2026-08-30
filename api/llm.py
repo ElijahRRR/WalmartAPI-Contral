@@ -19,9 +19,32 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-# 旧生产用 deepseek-v4-flash(thinking disabled);模型名可经 .env 切换,
-# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)
-_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# 全仓统一 **deepseek-v4-flash**(所有者定稿 2026-08-21:「LLM 都用
+# deepseek-v4-flash,审核和上架都是」)。模型名仍可经 .env 逐用途覆盖,
+# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)。
+#
+# ⚠ 2026-08-21 把缺省值从 `deepseek-chat` 改成正式模型名。原因不是洁癖:
+#   ① `deepseek-chat` 是官方**已宣布停用**的旧别名(2026-04-24 公告:三个月后
+#      即 2026-07-24 停用;改这行时是 08-21,过期近一个月还能用纯属宽限)。
+#      一旦切断,L1 rerank / L3 / 上架属性映射 / variant_remap **同时失败**;
+#   ② 下面 `if "flash" in model` 那道「thinking 必须永远显式 disabled」的旧铁律
+#      在别名下**整条失效** —— 至今没出事只因 deepseek-chat 恰好就是非思考模式,
+#      那道保险一直是空的。改成正式名后它才真正生效。
+#   生产实见:.env 里 DEEPSEEK_MODEL 没设,一直在吃这个缺省值,而注释却写着
+#   "所有者确认生产用 deepseek-v4-flash" —— 自述与实际不符,靠缺省值兜住才对。
+_DEFAULT_MODEL = "deepseek-v4-flash"
+
+
+def _default_model() -> str:
+    """输入:无 → 输出:缺省模型名(**call-time 求值**)。
+
+    不能在模块级 `os.environ.get(...)` 取:那是 import 时的快照,而 cli.py
+    的约定是「.env 先于一切业务 import 加载,registry 各函数 call-time 求值
+    即可拿到」。快照写法只在"import 恰好晚于 load_dotenv"时碰巧正确,
+    换个入口(测试、未来的网页/MCP 入口、任何提前 import 本模块的路径)
+    就会静默吃缺省值 —— 而且看不出来,只有账单和摘要里的模型名会变。
+    """
+    return os.environ.get("DEEPSEEK_MODEL", "").strip() or _DEFAULT_MODEL
 
 
 def model_for(purpose: str) -> str:
@@ -37,7 +60,7 @@ def model_for(purpose: str) -> str:
     if env is None:
         raise ValueError(f"未登记的 LLM 用途 {purpose!r}:先在 "
                          f"registry.LLM_PURPOSE_ENV 登记再使用")
-    return os.environ.get(env, "").strip() or _MODEL
+    return os.environ.get(env, "").strip() or _default_model()
 
 
 def _api_key() -> str:
@@ -96,6 +119,51 @@ def _bump_retry(key: str) -> None:
         RETRY_STATS[key] = RETRY_STATS.get(key, 0) + 1
 
 
+# ── token 用量记账(2026-08-21)────────────────────────────────────────────
+# 此前 chat_json 只取 choices[0].message.content,DeepSeek 同一个 JSON 里回的
+# `usage` **整块丢掉** —— 于是"这一轮花了多少钱"全仓答不出来(旧仓的
+# usage_logger 迁移时明确不迁,见 audit_l3 头注)。跑一次十几万条的重审之后
+# 再想知道花了多少,数据已经没了。
+#
+# 记的是 **token 不是钱**:token 是接口回的事实(api 层的活),单价是会变的
+# 业务参数(registry 存表、services 折算),换模型/换供应商只动后者。
+# 形态照抄同文件的 RETRY_STATS:线程安全累加 + 每轮 reset + 摘要渲染。
+USAGE_STATS: dict[tuple, dict] = {}
+_USAGE_LOCK = threading.Lock()
+
+
+def reset_usage_stats() -> None:
+    with _USAGE_LOCK:
+        USAGE_STATS.clear()
+
+
+def record_usage(model: str, purpose: str, usage: dict | None,
+                 at: "datetime.datetime | None" = None) -> None:
+    """输入:模型 + 用途 + 响应里的 usage 块 → 输出:无(按 (模型,用途,时段) 累加)。
+
+    **时段在调用当时就定死**(不是渲染时):DeepSeek 峰谷价差整整一倍,
+    一轮跑几小时会跨越峰谷分界,事后按"现在是什么时段"统一折算必然算错。
+    `usage` 缺失(供应商不回)只累加 calls,其余留 0 —— 少算不瞎算。
+    """
+    import datetime as _dt
+    from registry import resources
+    now = at or _dt.datetime.now(_dt.timezone.utc)
+    tier = resources.llm_price_tier(now)
+    u = usage or {}
+    key = (model, purpose, tier)
+    with _USAGE_LOCK:
+        row = USAGE_STATS.setdefault(
+            key, {"calls": 0, "prompt": 0, "completion": 0,
+                  "cache_hit": 0, "cache_miss": 0})
+        row["calls"] += 1
+        row["prompt"] += int(u.get("prompt_tokens") or 0)
+        row["completion"] += int(u.get("completion_tokens") or 0)
+        # DeepSeek 专有:命中前缀缓存的输入 token 便宜一个数量级,不分开记
+        # 就等于把 L3 那条"system prompt 逐字节相同"的缓存契约的收益抹平了
+        row["cache_hit"] += int(u.get("prompt_cache_hit_tokens") or 0)
+        row["cache_miss"] += int(u.get("prompt_cache_miss_tokens") or 0)
+
+
 def chat_json(messages: list[dict], *, temperature: float = 0.2,
               max_tokens: int = 4096, max_retries: int = 3,
               purpose: str = "default") -> dict:
@@ -113,7 +181,10 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
             resp = httpx.post(_BASE_URL, json=body, headers=headers,
                               timeout=httpx.Timeout(180, connect=10))
             if resp.status_code == 200:
-                content = (resp.json()["choices"][0]["message"]["content"])
+                payload = resp.json()
+                record_usage(body.get("model", ""), purpose,
+                             payload.get("usage"))
+                content = payload["choices"][0]["message"]["content"]
                 return _extract_json(content)
             if resp.status_code in (429, 500, 502, 503, 504):
                 _bump_retry("http_429" if resp.status_code == 429

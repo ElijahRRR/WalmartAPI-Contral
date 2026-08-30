@@ -1,9 +1,9 @@
 """alloc_products — 产品分体检(只读)。分配引擎动工前先看这张表。
 
 用法:
-  python cli.py alloc_products                     # 销量窗口默认近一年
-  python cli.py alloc_products -p days=90          # 换窗口
-  python cli.py alloc_products -p as_of=2026-08-15 # 钉住窗口右端
+  python cli.py alloc_products                          # 销量窗口默认近一年
+  python cli.py alloc_products -p sales_days=90         # 换窗口
+  python cli.py alloc_products -p as_of=2026-08-15      # 钉住窗口右端
   python cli.py alloc_products -p export=0         # 只看摘要不落 csv
 
 与 `alloc_stores` 同一路数:**引擎的产品侧决策全建在这套分数上,先摊开
@@ -28,15 +28,17 @@
 **只读**:不写任何表、不调沃尔玛、不调 LLM。
 """
 
-import csv
 import logging
 from collections import Counter
 
-from registry import db, paths
+from registry import db, resources
 from services import alloc_survey as sv
-from services import claims, sku_asin
+from services import claims, report_csv, sku_asin
 from services import product_pool as pool_svc, product_score as ps
 from services import textfmt
+# ⚠ 按名字导入:run() 的形参就叫 params,`from services import params` 会被它
+# 遮住,`params.flag(...)` 当场 AttributeError(services/params.py 头注)
+from services.params import flag
 
 DANGEROUS = False
 
@@ -66,13 +68,27 @@ def _pct(n, d):
 
 
 def run(params: dict) -> str:
-    """输入:params(days/as_of/export)→ 输出:产品分体检报告。"""
+    """输入:params(sales_days/as_of/export)→ 输出:产品分体检报告。"""
     # 产品侧销量窗口默认**近一年**(所有者定稿 2026-08-16)。
     # ⚠ 与 alloc_stores 的 90 天窗口是两码事:那边要"这家店现在什么水平",
     # 这边要"这个品到底卖没卖过" —— 窗口越短覆盖率越低(90 天只有 1.0%)
-    days = int(params.get("days", ps.SALES_WINDOW_DAYS))
+    #
+    # ★ 参数名叫 `sales_days` 而不是 `days`,与 `alloc_plan` 对齐。
+    #   原来这里也叫 `days`,于是同一个名字在两条工作流里装着不同的东西:
+    #   `alloc_stores -p days=90` 是店铺窗口(对),`alloc_products -p days=90`
+    #   却把**产品销量窗口从 365 砍到 90**。照文档 §12.4「两个窗口」的心智
+    #   模型给例行一跑统一加 `-p days=90`,前两条都对、这条**静默**跑偏,
+    #   而销量信号覆盖率本来就只有几个百分点,再砍窗口会把唯一有正面证据的
+    #   那批品抹平 —— 报告上只会写"近 90 天销量",看不出是配错了。
+    if "days" in params:
+        raise ValueError(
+            "alloc_products 的销量窗口参数叫 `sales_days`,不是 `days` ——"
+            "`days` 在 alloc_stores/alloc_plan 里是**店铺经营水平**那个 90 天窗口,"
+            "两者不是一回事(见 docs/allocation_plan.md 口径 #17a)。"
+            f"你大概想要:-p sales_days={params['days']}")
+    days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
     win = sv.sales_window(str(params.get("as_of", "")), days)
-    export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
+    export = flag(params, "export", default=True)
 
     with db.pg_conn() as conn:
         data = pool_svc.load(conn, win)
@@ -105,6 +121,7 @@ def run(params: dict) -> str:
         scores.append(c["score"])
         lf = life.get(c["asin"]) or {}
         rows.append((c["asin"], c["brand"] or "", c["category"],
+                     resources.super_label(c["category"]),
                      round(c["score"], 1), round(c["base"], 1),
                      round(c["bonus"], 1), round(c["penalty"], 1), c["why"],
                      # 配送方式(渠道):渠道闸的产品侧,决定这个品能去哪些店
@@ -177,19 +194,18 @@ def run(params: dict) -> str:
         L += ["", "(-p export=0:未落 csv)"]
         return "\n".join(L)
 
-    paths.reports_dir().mkdir(parents=True, exist_ok=True)
-    p = paths.reports_dir() / "alloc_产品分.csv"
-    rows.sort(key=lambda r: -r[3])
-    with p.open("w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
-        w.writerow(["ASIN", "品牌", "大类", "产品分", "口碑分", "销量加分",
-                    "罚分", "罚分原因",
-                    "配送方式", "售价", "运费", "落地价",
-                    f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
-                    "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
-                    "占用店", "在线店",
-                    "评分", "评论数", "配送天数", "缺失信号"])
-        w.writerows(rows)
+    header = ["ASIN", "品牌", "大类(26类)", "品类(五大类)",
+              "产品分", "口碑分", "销量加分", "罚分", "罚分原因",
+              "配送方式", "售价", "运费", "落地价",
+              f"近{days}天销量(件)", f"近{days}天销售额(毛额)",
+              "历史总销量(件)", "历史总销售额(毛额)", "首次售出", "最近售出",
+              "占用店", "在线店", "评分", "评论数", "配送天数", "缺失信号"]
+    # ⚠ 按**表头算下标**排序,不写死列号。2026-08-22 插「品类」那一列时,
+    #   原来的 `-r[3]` 正好排到了新插进来的字符串上 —— TypeError 还算走运,
+    #   要是插的是个数字列就会静默按错的列排。同一天在冲突明细的 `d[7]` 上
+    #   踩过同款(那次不报错,把「保留/下架」读成了一个数字)
+    rows.sort(key=lambda r: -r[header.index("产品分")])
+    p = report_csv.write("alloc_产品分.csv", header, rows)
     L += ["", f"▍明细 → {p}(按产品分降序,{len(rows):,} 行)",
           "  「缺失信号」列告诉你这一行的分是靠哪几项算出来的 ——"
           "分数说不清来源就没法推翻它",

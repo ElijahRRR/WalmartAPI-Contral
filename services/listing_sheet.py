@@ -39,25 +39,93 @@ from services import feed_track, kpi, upc_pool
 logger = logging.getLogger("services.listing_sheet")
 
 _COLS = 21          # A~U
+_APPEND_BLOCK = 500 # 单次写飞书的行数上限(一次裹上千行会被 90202 拒;
+                    # 与 maint_sheet 同值,那边是实遇被拒后定的)
 PENDING_O = ("", "处理中", "ASYNC_PENDING")   # O 列这些值反哺器继续跟
 
 
-def read_rows() -> list[dict]:
-    """输入:无 → 输出:表内全部数据行(键=registry columns,含 rownum)。"""
+def read_rows(upto: str | None = None) -> list[dict]:
+    """输入:可选「只读到某字段」→ 输出:表内数据行(键=registry columns,含 rownum)。
+
+    `upto` 给字段名(如 'audit_result')时只读 A 到该字段那一列——飞书单次
+    读取响应体官方上限 10MB(90221 data exceeded),行列数本身不设限;
+    21 列全量一把读在表长大后必炸(2026-08-19 生产实证,audit_sheet 当场
+    炸在这里)。只要前几列的调用方(audit_targets)别拉全宽;要全宽的
+    (list_new / 自愈 / 反哺器)靠行方向分块 + 90221 对半兜底
+    (api 层 feishu.sheet_values_rows)。
+    """
     sheet = resources.LISTING_SHEET
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    values = feishu.sheet_values(sheet, f"A2:U{total}")
+    cols = resources.LISTING_SHEET.columns
+    width = (cols.index(upto) + 1) if upto else _COLS
+    pairs = feishu.sheet_values_rows(sheet, "A", chr(ord("A") + width - 1),
+                                     2, total)
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] \
-            + [""] * _COLS
-        d = dict(zip(resources.LISTING_SHEET.columns, cells[:_COLS]))
+            + [""] * width
+        d = dict(zip(cols[:width], cells[:width]))
         if d["asin"] or d["store"]:
-            d["rownum"] = i + 2
+            d["rownum"] = rownum
             rows.append(d)
     return rows
+
+
+def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, int]:
+    """输入:[(店铺, ASIN)] → 输出:(写入行数, 起始行号)。**只写 A/B 两列。**
+
+    分配器把定好的货追加进上架表,E 列留空即「待审」—— 审核链下一轮
+    (`product_audit -p from_sheet=1`)自动领走。这是 §9.2 定的列权责:
+    **A/B 人工域的机器化**,分配器写完这两列就完事。
+    ⚠ **绝不许顺手写 E 列 `pass`**:那是伪造审核结论。而且伪造也没用 ——
+    上架闸读的是 `catalog.products`,只会骗到人眼。
+
+    ★ **不用 `ops.cursors` 水位,直接从表里算下一空行** —— 这里有意偏离
+    `maint_sheet.append_records` 的成例,理由是两张表的所有权不同:
+    维护记录表**程序是唯一写入方**,水位不会被别人动;上架表是**运营在手工
+    编辑**的,插行删行随时发生。存了水位反而危险:
+      · 有人删了几十行 ⇒ 水位停在表尾之外,追加会在中间留一片空行;
+      · 水位与表实际状态一旦不一致,谁也说不清该信哪个。
+    而这里本来就要**整读一遍 A/B 做去重**(同一个 ASIN 不能重复派工),
+    那一次读顺手就给出了"最后一个非空行" —— 一次读同时解决位置与去重,
+    还不用维护第二份状态。
+    ★ 附带的好处:**中途失败自愈**。写了三块挂在第四块时不用记账 ——
+    下次跑重新读表,已写进去的三块自然被去重掉,只补剩下的。
+    """
+    if not pairs:
+        return 0, 0
+    sheet = resources.LISTING_SHEET.require()
+    have = read_rows(upto="asin")
+    seen = {r["asin"] for r in have if r["asin"]}
+    todo = [(st, a) for st, a in pairs if a not in seen]
+    if not todo:
+        return 0, 0
+    start = (max((r["rownum"] for r in have), default=1)) + 1
+
+    if not execute:
+        for st, a in todo[:20]:
+            logger.info("[DRY-RUN] 将追加 第%d行 A=%s B=%s", start, st, a)
+        if len(todo) > 20:
+            logger.info("[DRY-RUN] …另有 %d 行省略", len(todo) - 20)
+        return len(todo), start
+
+    feishu.sheet_ensure_rows(sheet, start + len(todo))
+    written = 0
+    for i in range(0, len(todo), _APPEND_BLOCK):
+        block = todo[i:i + _APPEND_BLOCK]
+        row0 = start + i
+        try:
+            feishu.sheet_write_ranges(sheet, [
+                (f"A{row0}:B{row0 + len(block) - 1}",
+                 [[st, a] for st, a in block])])
+        except Exception:
+            logger.error("上架表追加到第 %d 行时失败,已写 %d 行 —— 重跑即可,"
+                         "已写的会被去重跳过", row0, written)
+            raise
+        written += len(block)
+    return written, start
 
 
 def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
@@ -135,8 +203,10 @@ def audit_targets() -> list[dict]:
     ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
     再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
     """
+    # 只读 A..E 五列(store/asin/标题/PT/审核结果):领任务用不着 F 之后的
+    # 理由/回显长文本,少读 3/4 的字节,离 10MB 上限远得多
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
-            for r in read_rows()
+            for r in read_rows(upto="audit_result")
             if r.get("asin")
             and str(r.get("audit_result") or "").strip().lower()
             in ("", "pending")]
@@ -191,13 +261,27 @@ def write_audit_notes(updates: list[tuple[int, str]],
     return len(updates)
 
 
-def write_reason(rownum: int, reason: str, execute: bool = True) -> None:
-    """输入:行号 + 未上架理由 → 输出:无(只写 N 列)。"""
+def write_reasons(items: list[tuple[int, str]], execute: bool = True) -> int:
+    """输入:[(行号, 理由)] → 输出:写入行数(N 列一次批量提交)。
+
+    切块交给 feishu.sheet_write_ranges(段数/行数/字节三条预算任一先到即封批,
+    当轮写完不留下一轮)——几百行理由从几百个请求收敛到几个。具体数字**不在
+    这里复述**:唯一出处是 api/feishu 顶部的限额登记表(官方值 ×95%),
+    此处抄一份就是第二个出处,旧版那句"≤4000 行/请求"正是这么漂掉的。
+
+    ⚠ 别退回逐行写:一行一个飞书请求 ~0.7s,几百行淘汰理由 = 提交前先白耗
+    几分钟(2026-08-19 所有者实遇)。只有一行要写就传 `[(行号, 理由)]`。
+    """
+    if not items:
+        return 0
     if not execute:
-        logger.info("[DRY-RUN] 将回写 第%d行 N=%s", rownum, reason)
-        return
-    feishu.sheet_write_ranges(resources.LISTING_SHEET,
-                              [(f"N{rownum}:N{rownum}", [[reason]])])
+        for rownum, reason in items[:20]:
+            logger.info("[DRY-RUN] 将回写 第%d行 N=%s", rownum, reason)
+        return 0
+    feishu.sheet_write_ranges(
+        resources.LISTING_SHEET,
+        [(f"N{rn}:N{rn}", [[reason]]) for rn, reason in items])
+    return len(items)
 
 
 def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
@@ -235,6 +319,11 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
         # 政策违禁(旧 O 列第五类,2026-08-12 抢救接线):永远不能上架,
         # 不进 FAILED 重试通道——重发也永远是拒,白烧 UPC 与配额
         return "PROHIBITED", code
+    if code in resources.WALMART_ERR_CONTENT:
+        # 内容标准拒(2026-08-19):文案图片取自亚马逊原文,原样重发必然
+        # 同拒,还触发/延长 QARTH 审查。不自动重试;人工改文案后清 O 列
+        # 可重回通道(语义与 PROHIBITED 的"永不"有别)
+        return "CONTENT_REJECTED", code
     if status == "success":
         return ("SUCCESS", "") if not code else ("SUCCESS_WITH_WARNING", code)
     if status == "failed":
@@ -303,7 +392,9 @@ WHERE w.missing_since IS NULL
 
 
 def heal_unknown() -> str | None:
-    """feed_poll 反哺器:K=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
+    """输入:无(直接读上架表 + feed 台账 + 目录) → 输出:摘要行,无 Unknown 行时 None。
+
+    feed_poll 反哺器:K=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
 
     Unknown 是"提交结局不确定"的防重态(不重复提交防双上架),但没人收尾
     就永久卡死 + UPC 永久占用(claimed 不释放)。收尾三条路:
@@ -423,7 +514,10 @@ def heal_unknown() -> str | None:
 
 
 def sync_from_ledger() -> str | None:
-    """feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。"""
+    """输入:无(直接读上架表 + feed 台账) → 输出:摘要行,无在途行时 None。
+
+    feed_poll 反哺器:L 有 feedid 且 O 在途的行,按台账落 O/P/Q。
+    """
     try:
         resources.LISTING_SHEET.require()
     except LookupError as e:

@@ -116,12 +116,20 @@ def _reset_prompt_cache():
 
 
 def test_s1_s3_literals_byte_pinned():
-    """S1/S3 逐字节等于旧仓 l3_llm.py:295-431 / :432-438(脚本切片 sha256)。"""
+    """S1/S3 字节钉死 —— 提示词是判定面,不许无声漂移。
+
+    S3 仍逐字节等于旧仓 l3_llm.py:432-438。
+    S1 原本也是逐字节移植(旧仓 :295-431,sha256 859aced1…,5233 字符),
+    **2026-08-21 有意改过一次**:补入判定维度 6「整机电器 / NRTL 认证」。
+    那是所有者定的 —— L2 里按 PT 名猜整机/小件的分类器同日下线,而"这个产品
+    是不是整机电器"必须有人接,不能留真空期(见 test_audit_l2_reason 里
+    `test_the_whole_appliance_call_moved_to_the_l3_prompt`)。
+    """
     assert hashlib.sha256(audit_l3._S1.encode()).hexdigest() == (
-        "859aced1d428641bc97b6712053ac586d7c6313d68ef3e12caa19a1bc896aee0")
+        "8248ff0c2c2ac2960625a6a14348a578e00efbc89410d390f45f4cee156dc1a3")
     assert hashlib.sha256(audit_l3._S3.encode()).hexdigest() == (
         "1564f179581b34ad5785caba6daa1b461e0624129c55cbec19e47c5025d2d409")
-    assert len(audit_l3._S1) == 5233
+    assert len(audit_l3._S1) == 6027
     assert audit_l3._S1.endswith("# 候选 reason_category (verdict=reject 时必选其一)\n")
     assert audit_l3._S3.startswith("\n\n# 沃尔玛 37 条 Prohibited Products Policy 全清单")
 
@@ -239,19 +247,36 @@ def test_L2摘要_R4前10去重保序_R5小写():
     assert b2 == ["acme"]
 
 
-def test_L2摘要_已知缺陷_R7R8不进prompt():
-    """已知缺陷照迁(spec §4,合同 L3-1):R7/R8 软证据无分支,L3 看不到。"""
+def test_L2摘要_R7R8证据现在真的进prompt了():
+    """2026-08-20 修(原 L3-1 缺陷):R7/R8 此前没有分支,L2 在 detail 里写着
+    "L3 LLM 需判断宣称词是否有事实依据",而 L3 一个字都收不到 ——
+    承诺了没送到,比不承诺更糟(L3 只能自己从原文重看一遍)。"""
     l2 = _l2([
         RuleHit(stage="L2", rule_code="content_promotional", penalty=0,
-                detail={"matched": ["best seller"], "note": "L3 LLM 需判断"}),
+                detail={"strong_phrases": ["best seller"], "allcaps_runs": [],
+                        "soft_phrases": [], "soft_only": False}),
         RuleHit(stage="L2", rule_code="walmart_strict_sensitive", penalty=0,
-                detail={"matched_phrases": ["sexy"], "note": "L3 LLM 需判断"}),
+                detail={"subtypes": ["adult"], "matched_phrases": ["sexy"]}),
     ])
-    assert audit_l3.summarize_l2_for_l3(l2) == ("(L2 无命中)", [])
+    txt, _ = audit_l3.summarize_l2_for_l3(l2)
+    assert "促销宣称(R7, 含无据宣称/全大写滥用): best seller" in txt
+    assert "敏感/严格合规(R8, adult): sexy" in txt
 
 
-def test_L2摘要_已知缺陷_cert键名bug退化成固定套话():
-    """已知缺陷照迁(spec §4,合同 L3-2):detail['requirements'] 三种 cert hit 都没有。"""
+def test_L2摘要_R7只命中软词时标明份量():
+    """软证据也要送到,但要让 LLM 看出它只是空洞形容词,不是无据宣称。"""
+    l2 = _l2([RuleHit(stage="L2", rule_code="content_promotional", penalty=0,
+                      detail={"strong_phrases": [], "allcaps_runs": [],
+                              "soft_phrases": ["high quality"],
+                              "soft_only": True})])
+    txt, _ = audit_l3.summarize_l2_for_l3(l2)
+    assert "促销宣称(R7, 仅空洞形容词): high quality" in txt
+
+
+def test_L2摘要_cert分支取真实键名():
+    """2026-08-20 修(原 L3-2 缺陷):分支取的是 detail['requirements'],
+    而这个键在三种 cert hit 里**一个都不存在**(真实键是 meta_requirements /
+    hard_cert_fields / soft_cert_fields),前两档永远退化成一句固定套话。"""
     small = RuleHit(stage="L2", rule_code="cat_requires_cert_small_part",
                     penalty=0, detail={"hard_cert_fields": ["UL"],
                                        "note": "电气小件/配件, 部分可填 No 上架, 需下游人工审核"})
@@ -263,9 +288,8 @@ def test_L2摘要_已知缺陷_cert键名bug退化成固定套话():
                         detail={"soft_cert_fields": ["prop65Warning"], "note": "n"})
     txt, _ = audit_l3.summarize_l2_for_l3(_l2([small, soft_meta, soft_spec]))
     lines = txt.split("\n")
-    assert lines[0] == ("* 类目需证书(cat_requires_cert_small_part): "
-                        "电气小件/配件, 部分可填 No 上架, 需下游人工审核")
-    assert "ASTM F963 测试报告" not in txt and "astm" not in txt   # meta_requirements 全丢
+    assert lines[0] == "* 类目需证书(cat_requires_cert_small_part): ['UL']"
+    assert "ASTM F963 测试报告" in txt          # meta_requirements 现在送得到
     assert lines[2] == "* 类目需证书(cat_requires_cert_soft): ['prop65Warning']"
 
 

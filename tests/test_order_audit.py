@@ -371,6 +371,23 @@ def test_plan_waves_skips_blocked():
     assert waves == [[("B1", "90210")]]
 
 
+def test_rescrape_window_tracks_the_audit_window():
+    """重采窗口 = 审核窗口(所有者定稿 2026-08-22:1 天 → 3 天)。
+
+    待审行按 `days`(默认 3)挑,重采只死磕 1 天的话,后两天那些行挂着
+    「待采集」而系统早就放弃了 —— 两个数必须同进同退。钉的是**关系**不是
+    数值:哪天改了 days 默认值,这条会红,提醒你一起想重采窗口。
+
+    ⚠ 与 `_SNAPSHOT_FRESH_HOURS` 是两件事:那个管"快照多久算陈旧",也是
+    「上次推送已过期 ⇒ 视为新需求、窗口重置」的判据。重采窗口拉长不该让
+    "新需求"的门槛跟着变,所以两者**故意不相等**。
+    """
+    from workflows import order_audit as aw
+    assert aw._RESCRAPE_WINDOW_HOURS == aw._DEFAULT_DAYS * 24 == 72
+    assert aw._SNAPSHOT_FRESH_HOURS == 24
+    assert aw._RESCRAPE_WINDOW_HOURS != aw._SNAPSHOT_FRESH_HOURS
+
+
 def test_plan_waves_all_blocked_gives_nothing():
     assert rules.plan_waves([("B1", "10001")], {("B1", "10001")}) == []
 
@@ -492,7 +509,8 @@ def wired(monkeypatch):
     calls = {"updates": None, "uploaded": []}
 
     monkeypatch.setattr(wf.feishu, "sheet_row_count", lambda s: 10)
-    monkeypatch.setattr(wf.feishu, "sheet_values", lambda s, r: [["60606"]])
+    monkeypatch.setattr(wf.feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw: [(r1, ["60606"])])
     monkeypatch.setattr(wf.feishu, "list_records",
                         lambda t: [_rec(name="甲", m="FBA", lo=0, hi=1000, rate=1.0)])
 
@@ -514,7 +532,7 @@ def wired(monkeypatch):
     # 轮询默认开(2026-08-10 起),但 run() 的用例关心的是判定与推送,不是等待。
     # 这里把等待与就地摄取打成空转:不打的话每个 run() 用例都要去连采集器,
     # 还要真 sleep —— 一次改默认值让整套用例慢了 10 秒就是这么来的。
-    # 专门测等待/摄取的用例在下面直接调 _wait_for_batches / _ingest_now。
+    # 专门测等待/摄取的用例在下面直接调 _wait_for_batches / _ingest_batches。
     calls["waited"] = []
     calls["ingested"] = 0
 
@@ -523,10 +541,11 @@ def wired(monkeypatch):
         return f"等采集:{len(names)} 批全部落定(假)", 0
     monkeypatch.setattr(wf, "_wait_for_batches", fake_wait)
 
-    def fake_ingest():
+    def fake_ingest(names):
         calls["ingested"] += 1
-        return "就地增量摄取:(假)"
-    monkeypatch.setattr(wf, "_ingest_now", fake_ingest)
+        calls.setdefault("ingested_names", []).append(list(names))
+        return "按批摄取:(假)"
+    monkeypatch.setattr(wf, "_ingest_batches", fake_ingest)
 
     # 批次台账走 services.scrape_batches(自己开连接),测试里不落库
     monkeypatch.setattr(wf.batches, "record",
@@ -907,32 +926,48 @@ def test_sql_selects_every_column_the_rules_read():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001")),
-               *, reapable=True, caught_up=True):
+               *, reapable=True):
     """在途批次 + 可认账批次两段分开喂。
 
-    `reapable=False` = 这批还没落定(或刚落定),不在可认账集合里;
-    `caught_up=False` = 已落定但 product_ingest 还没跑过 —— 数据可能正在
-    增量流里,**这时认账失败就是冤枉**(2026-08-10 实测 127 个组合全军覆没)。
+    `reapable=False` = 这批还没落定(或刚落定、稳定窗口未满),
+    不在可认账集合里。
     """
     return FakeConn({
         "ORDER BY b.submitted_at":
             (["batch_name", "batch_id", "asin_count"],
              [("wm-audit-10001-x", "7", 2)]),
-        "ingest_caught_up":
-            (["batch_name", "batch_id", "ingest_caught_up"],
-             [("wm-audit-10001-x", "7", caught_up)] if reapable else []),
+        "ORDER BY b.finished_at":
+            (["batch_name", "batch_id"],
+             [("wm-audit-10001-x", "7")] if reapable else []),
         "state = 'pending' AND batch_name": (["asin", "zip"], list(pending)),
     })
 
 
+def _stub_pump_batch(monkeypatch, wf, *, ok=True, gone=False, error=None):
+    """把 ingest.pump_batch 换成假的,返回被拉过的批次名列表。"""
+    pulled = []
+
+    def fake(scraper, db, name, **kw):
+        pulled.append(name)
+        return {"ok": ok, "batch": name, "pages": 1, "fetched": 2,
+                "totals": {"snapshots": 2, "dup": 0, "products": 2,
+                           "skipped_outcome": 0, "incomplete": 0, "invalid": 0},
+                "coverage": {"asin_total": 2, "asin_with_event": 2},
+                "gone": gone, "error": error}
+    monkeypatch.setattr(wf.ingest, "pump_batch", fake)
+    return pulled
+
+
 def test_reap_batches_blames_the_real_reason(wired, monkeypatch):
-    """批次采完了、这些组合却没快照 ⇒ 真失败,原因去 /failures 拿真值。
+    """批次采完了、事件流拉到底、这些组合却没快照 ⇒ 真失败,原因去
+    /failures 拿真值。
 
     一律记"超时未见快照"是不行的:验证码(换时段可重试)和 variant_offset
     (重试多少次都一样,该去人工看)的处置完全不同。
     """
     wf, _ = wired
     conn = _reap_conn()
+    pulled = _stub_pump_batch(monkeypatch, wf, ok=True)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 0, "done": 1, "failed": 1},
                                    "screenshots": {"open": 0, "done": 1}})
@@ -941,6 +976,14 @@ def test_reap_batches_blames_the_real_reason(wired, monkeypatch):
                                         {"B0A": "captcha"}))
     reaped, failed_pairs, notes = wf._reap_batches(conn)
     assert (reaped, failed_pairs) == (1, 2)
+    assert pulled == ["wm-audit-10001-x"]          # 认账前先把这批拉到底
+    # 拉到底之后、判失败之前,必须把刚到的快照落定一遍(_SETTLE_SQL 重跑)
+    # —— 顺序反了就是把采成功的判失败(127 条冤案的形状)
+    settle_at = [i for i, (s, _a) in enumerate(conn.executed)
+                 if "SET state = 'done'" in s]
+    pending_at = [i for i, (s, _a) in enumerate(conn.executed)
+                  if "state = 'pending' AND batch_name" in s]
+    assert settle_at and pending_at and settle_at[0] < pending_at[0]
     reasons = [a["reason"] for s, a in conn.executed
                if isinstance(a, dict) and "reason" in a]
     assert "采集失败:captcha" in reasons          # 有真实原因就写真实原因
@@ -979,7 +1022,7 @@ def test_reap_batches_settles_even_with_screenshots_open(wired, monkeypatch):
                         lambda n: {"stats": {"open": 0, "done": 2},
                                    "screenshots": {"open": 2, "done": 0}})
     settled, failed_pairs, _notes = wf._reap_batches(conn)
-    assert (settled, failed_pairs) == (1, 0)   # 落定了,但认账仍等摄取水位线
+    assert (settled, failed_pairs) == (1, 0)   # 落定了,但认账仍等稳定窗口
 
 
 def test_reap_batches_marks_vanished_batch_failed(wired, monkeypatch):
@@ -1008,34 +1051,51 @@ def test_reap_batches_survives_status_outage(wired, monkeypatch):
     assert wf._reap_batches(conn) == (0, 0, [])
 
 
-def test_reap_batches_waits_for_ingest_before_blaming(wired, monkeypatch):
-    """批次已落定但 product_ingest 还没跑过 → **一个组合都不许判失败**。
+def test_reap_batches_waits_when_batch_stream_unreachable(wired, monkeypatch):
+    """批次已落定但它的事件流这轮拉不到底(采集侧故障)→
+    **一个组合都不许判失败**,原样挂着等下轮。
 
-    2026-08-10 实测的原样重现:127 个组合被判「批次已采完但无快照」,
-    紧接着一次 product_ingest 就把这 127 条原样摄了进来——采集全成功,
-    是我们问早了。批次 completed 只说明采集侧干完了,数据还在增量导出流里。
-
-    代价不止台账写错:failed 不挡重推,下一轮会把这些组合再采一遍,
+    这是 2026-08-10 那 127 条冤案的同一条防线(当年凭据是全局摄取水位线,
+    2026-08-19 起换成按批拉到底):批次 completed 只说明采集侧干完了,
+    数据还在导出流里;没把这批的流看完就断言"无快照 ⇒ 失败",会把采成功
+    的整批冤枉掉。且 failed 不挡重推,下一轮会把这些组合再采一遍,
     每小时白烧一轮配额,而两侧都不报错。
     """
     wf, _ = wired
-    conn = _reap_conn(reapable=True, caught_up=False)
+    conn = _reap_conn(reapable=True)
+    _stub_pump_batch(monkeypatch, wf, ok=False, error="HTTP 503")
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 0, "done": 2},
                                    "screenshots": {"open": 0, "done": 2}})
     monkeypatch.setattr(wf.batches, "pull_failures",
-                        lambda n, bid: pytest.fail("摄取没追上就别去问失败原因"))
+                        lambda n, bid: pytest.fail("流没拉到底就别去问失败原因"))
     settled, failed_pairs, notes = wf._reap_batches(conn)
     assert failed_pairs == 0
-    assert any("等摄取" in n for n in notes)     # 摘要要能看出在等什么
+    assert any("下轮再认账" in n for n in notes)   # 摘要要能看出在等什么
     assert not [a for s_, a in conn.executed
                 if isinstance(a, dict) and "reason" in a]
 
 
-def test_reap_batches_blames_once_ingest_caught_up(wired, monkeypatch):
-    """摄取水位线越过落定时刻后仍无快照 → 这才是真失败,带真实原因认账。"""
+def test_reap_batches_leaves_vanished_batch_to_timeout(wired, monkeypatch):
+    """批次在采集侧已查不到(事件也拉不回来)→ 不判失败,交兜底超时收尾。"""
     wf, _ = wired
-    conn = _reap_conn(reapable=True, caught_up=True)
+    conn = _reap_conn(reapable=True)
+    _stub_pump_batch(monkeypatch, wf, ok=False, gone=True, error="批次不存在")
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 2},
+                                   "screenshots": {"open": 0, "done": 2}})
+    monkeypatch.setattr(wf.batches, "pull_failures",
+                        lambda n, bid: pytest.fail("批次都没了还问什么明细"))
+    _settled, failed_pairs, notes = wf._reap_batches(conn)
+    assert failed_pairs == 0
+    assert any("兜底超时" in n for n in notes)
+
+
+def test_reap_batches_blames_once_batch_stream_drained(wired, monkeypatch):
+    """这批自己的事件流拉到底、落定后仍无快照 → 这才是真失败,带真实原因认账。"""
+    wf, _ = wired
+    conn = _reap_conn(reapable=True)
+    _stub_pump_batch(monkeypatch, wf, ok=True)
     monkeypatch.setattr(wf.scraper, "batch_status",
                         lambda n: {"stats": {"open": 0, "done": 2},
                                    "screenshots": {"open": 0, "done": 2}})
@@ -1046,7 +1106,7 @@ def test_reap_batches_blames_once_ingest_caught_up(wired, monkeypatch):
     reasons = [a["reason"] for s_, a in conn.executed
                if isinstance(a, dict) and "reason" in a]
     assert "采集失败:captcha" in reasons          # 有明细的按明细
-    assert any("摄取已追上" in r for r in reasons)  # 没明细的说清是问过之后才判的
+    assert any("拉到底" in r for r in reasons)     # 没明细的说清是问过之后才判的
 
 
 
@@ -1214,41 +1274,24 @@ def test_wait_with_no_batches_is_a_noop(nosleep):
     assert nosleep._wait_for_batches([], 20) == ("", 0)
 
 
-def test_ingest_now_skips_when_product_ingest_holds_the_lock(monkeypatch):
-    """拿不到 product_ingest 的锁 = 它正在跑:跳过,别和它抢游标。
+def test_ingest_batches_pulls_only_its_own_batches(monkeypatch):
+    """就地摄取只拉本轮自己推的那几批(批次端点),不碰全局游标、不借锁。
 
-    两个进程同推游标,后写的会盖掉先写的,中间那段记录永远不会再被拉一次
-    —— 两侧都不报错,只是产品中心少了一批数据。
+    此前是借 product_ingest 的锁抽全库到当刻头部,整点的 order_chain 和
+    13:00 的 product_chain 一撞就是一场 15 分钟等锁;按批拉互不相干。
     """
-    import contextlib
-    from workflows import order_audit as wf        # 要真的 _ingest_now,不用 wired 的桩
-    monkeypatch.setattr(wf.runlock, "hold",
-                        lambda name: contextlib.nullcontext(False))
-    monkeypatch.setattr(wf.ingest, "pump",
-                        lambda *a, **k: pytest.fail("没拿到锁就不该摄取"))
-    note = wf._ingest_now()
-    assert "跳过" in note and "product_ingest" in note
+    from workflows import order_audit as wf        # 要真的 _ingest_batches
+    seen = []
 
-
-def test_ingest_now_pumps_under_the_lock(monkeypatch):
-    import contextlib
-    from workflows import order_audit as wf        # 同上
-    taken = []
-    monkeypatch.setattr(wf.runlock, "hold",
-                        lambda name: taken.append(name) or
-                        contextlib.nullcontext(True))
+    def fake_pump_batches(scraper, db, names, **kw):
+        seen.append(list(names))
+        return [], "按批摄取:1/1 批拉到底 / 拉取 2 条;观测入库 2(重复跳过 0),身份更新 2"
+    monkeypatch.setattr(wf.ingest, "pump_batches", fake_pump_batches)
     monkeypatch.setattr(wf.ingest, "pump",
-                        lambda sc, d, **k: {"ok": True, "pages": 1, "fetched": 2,
-                                            "cursor_from": 0, "cursor_to": 9,
-                                            "totals": {"snapshots": 2, "dup": 0,
-                                                       "products": 2,
-                                                       "skipped_outcome": 0,
-                                                       "incomplete": 0,
-                                                       "invalid": 0},
-                                            "error": None})
-    note = wf._ingest_now()
-    assert taken == ["product_ingest"]     # 借的是它的锁,不是自己开一把
-    assert "就地增量摄取" in note and "游标 0 → 9" in note
+                        lambda *a, **k: pytest.fail("就地摄取不该再抽全局流"))
+    note = wf._ingest_batches(["wm-audit-x"])
+    assert seen == [["wm-audit-x"]]
+    assert "按批摄取" in note
 
 
 def test_run_config_missing_suppliers_refuses(wired, monkeypatch):

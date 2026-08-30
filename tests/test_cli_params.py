@@ -200,3 +200,28 @@ def test_err_brief_empty_message_falls_back_to_type():
     """消息为空时不能发一条空通知——至少要说清是什么异常。"""
     assert cli._err_brief(KeyError()) == "KeyError"
     assert cli._err_brief(RuntimeError("")) == "RuntimeError"
+
+
+def test_non_dangerous_workflows_must_honor_dry_run():
+    """DANGEROUS=False 的工作流读 execute 时**必须同时认 dry_run**。
+
+    cli._run_step 对 DANGEROUS=False 恒给 `execute=True`(缺省即真跑,
+    2026-08-16 定稿),`--dry-run` 只体现在 `params["dry_run"]`。只判 execute
+    的工作流,敲了 `--dry-run` 照样写库、而且**报成功** —— 这正是
+    audit_reason_backfill / sources_backfill / category_blacklist_import
+    三个一次性刷全表的工作流最不能出的错(没有第二次机会)。
+    """
+    import pathlib
+    import re
+
+    bad = []
+    for f in sorted(pathlib.Path("workflows").glob("*.py")):
+        src = f.read_text(encoding="utf-8")
+        if "DANGEROUS = False" not in src:
+            continue
+        for m in re.finditer(r'^\s*execute\s*=\s*(.+)$', src, re.M):
+            expr = m.group(1)
+            if 'params.get("execute")' in expr and "dry_run" not in expr:
+                bad.append(f"{f.name}: {expr.strip()}")
+    assert not bad, ("这些 DANGEROUS=False 工作流的 --dry-run 是坏的(会照写不误):"
+                     + "; ".join(bad))

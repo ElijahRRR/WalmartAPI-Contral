@@ -29,7 +29,8 @@ delete 是唯一的**不可逆**类(采集永久偏移 / 商品不存在),由 de
 import logging
 import os
 
-from services import mp_mapper, order_audit, pricing, store_limits
+from services import mp_mapper, order_audit, pricing, store_limits, \
+    store_targets
 
 logger = logging.getLogger("services.maintenance_intents")
 
@@ -45,12 +46,57 @@ TITLE_PLACEHOLDERS = {"[商品不存在]"}
 PRICE_MIN_DELTA = 0.01
 PRICE_MIN_RATIO = 0.01          # 1%
 
-# 单轮每类意图上限(防某天采集侧大面积变动 → 一次几万条 feed)
-MAX_INTENTS_PER_KIND = 5000
+# 单店单轮每类意图上限(所有者定稿 2026-08-26:「上限做成按店,数字对齐真实
+# 配额」)。此前是全局 5000/类 —— 那道闸防的是"采集侧事故一次产出几万条",
+# 但它分不清事故与**故意的**大面积调整:08-25 倍率调整日 12,766 条改价被
+# 截成 5,000,谭总 7 家店拖了三天,且截断只进日志不见人。沃尔玛的配额全部
+# **按店**计,全局闸只会卡住合法的大改,废除。
+# 数字 =(该类 feed 的按店速率桶 **− 1**)× 单 feed 切片条数(api/_client.
+# _RATE_BUCKETS × api/feeds._SLICE_LIMITS,连同窗口一致有测试钉住;改桶/改
+# 切片先看那条测试)。**为什么 −1**:api/feeds 的"网络异常 → 双确认未达 →
+# 同一载荷补交一次"路径每次补交**多烧一个桶名额**,切片数吃满桶时一次补交
+# 就会在令牌桶上睡到窗口滑出(≈1 小时),整条链抱着 flock 陪等:
+#   price     (8−1)/小时 × 8000 条/feed = 56000
+#             (桶:官方 10/hour 三件套共享留余量,2026-08-26 复核后从 6/天
+#             上调,6/day 只属本仓不用的 feedType=promo;切片:官方硬限
+#             10000 条留两成,1000 只是建议值 —— 所有者定稿新鲜度优先,
+#             单店当天扫出多少当轮连发多少,15000 条 = 8000+7000 连续提交)
+#   inventory (8−1)/小时 × 4000 条/feed = 28000
+#   title     (8−1)/小时 × 1000 条/feed = 7000
+# 三个数都远大于单店在线目录(千级)——它们不再是吞吐规划,纯粹是失控护栏:
+# 真咬合的那天多半是采集/配置事故在疯狂产单,而下面的截断优先级恰恰会
+# **先放行事故本体**(错价越离谱越靠前、批量 NULL 清零全是 new=0),
+# 所以看到首行"⚠ 截断"先查原因再放行,别急着调大上限。
+# ⚠ 改价侧的数量兜底随全局闸一并消失(与库存侧"挡不住整店清零"同款代价):
+# 倍率误填/区间事故会一轮全量出闸,自动闸仅剩 PRICE_MIN_DELTA/RATIO
+# (下限闸,拦不住大偏差);涨跌幅闸在 plan.md 待办里,上量后需重议
+# (此前全局 5000 至少把错价面封在 5000 行/天,现在没有了)。
+# delete **不在表里**:破坏类的按店数量闸唯一在执行件(problem_product_cleanup
+# 领取时 cap_destructive 按限额表「下架限制」截),扫描件如实报待办
+# (2026-08-24 归一口径,扫描期再截一道就是"每店最多 N 实际 2N"的老坑)。
+MAX_INTENTS_PER_STORE = {"price": 56000, "inventory": 28000, "title": 7000}
+
+# 超上限时**截谁**(按店组内排序,升序取前 cap 条):
+#   price     偏差比例大的先走 —— 错得越离谱的价越该当天纠;
+#   inventory 清零(new=0)先走 —— "别卖错"优先于"补货上量";
+#   title     停闸期低相似度同步(title_mismatch_sync)先走 —— 抄错标题
+#             嫌疑最大的行最该当天见人。
+# 三类都以 SKU 为第二键:产出序来自无 ORDER BY 的 SQL,会随 VACUUM/HOT
+# 更新漂移,截断名单必须跨轮可预期(08-25 "随机截"的一半病根就在这)。
+# ⚠ 这套优先级的职责是"正常拥挤时先做最要紧的",不是事故过滤器 ——
+# 事故日它放行的正是事故本体(见上面护栏注释)。
+_TRUNC_PRIORITY = {
+    "price": lambda it: (-abs(it["new"] - it["old"])
+                         / max(float(it["old"] or 0), 0.01),
+                         str(it.get("sku") or "")),
+    "inventory": lambda it: (0 if it.get("new") == 0 else 1,
+                             str(it.get("sku") or "")),
+    "title": lambda it: (0 if it.get("code") == "title_mismatch_sync" else 1,
+                         str(it.get("sku") or "")),
+}
 
 # 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
-DELETE_PER_STORE = 300          # 限额表「下架限制」缺该店时的退路(会告警)
 LONG_OOS_DAYS = 15              # 连续这么多天没有库存 → 删除(所有者定稿)
 
 _SQL_ZERO = """
@@ -135,49 +181,88 @@ ORDER BY w.store, w.sku
 """
 
 
-# 连续 N 天没有库存 → 删除(所有者定稿 2026-08-09)。
-# 三道判据,缺一个都会误删:
-#   1. 窗口内**没有任何一条"有货"观测**(stock_count>0 或 stock_state='in_stock')
-#   2. **至少有一条明确的缺货观测**——防"这 15 天页面一直采不全、全是 unknown"
-#      被读成"一直缺货"(采不到 ≠ 没货,这是删除,不是清零,不能含糊)
+# 连续 N 天**本店渠道下**没有库存 → 删除(所有者定稿 2026-08-09;
+# 渠道那一维 2026-08-25 加)。三道判据,缺一个都会误删:
+#   1. 窗口内**没有任何一条"本店卖得了"的观测**(有货 ∧ 渠道不是确定的另一个)
+#   2. **至少有一条确定卖不了的观测**——明确缺货,或明确是另一个渠道。
+#      防"这 15 天页面一直采不全、全是 unknown"被读成"一直缺货"(采不到 ≠ 没货,
+#      这是删除,不是清零,不能含糊)
 #   3. 窗口**两端都有观测**(最早一条在窗口起点 36 小时内、最新一条在近 3 天内)
 #      ——防"15 天前采过一次、昨天采过一次,中间断 13 天"被当成连续观测
 # 只看 outcome=ok 的观测(降级采集的 fast 段基本是空的,拿它判缺货是冤案)。
+#
+# ★ **渠道这一维怎么进来的**(所有者定稿 2026-08-25:「该渠道下库存连续不足
+# N 天,下架」):限定了渠道的店,货源翻到另一个渠道 = 这家店卖不了,与缺货
+# **同一条阶梯** —— 库存 provider 先清零(可逆),窗口熬满 N 天才删(不可逆)。
+# 两个必须钉死的方向,写反了都不报错:
+#   · 渠道**采不到 / 采出第三种值** ⇒ 算"卖得了",**挡住删除**。把未知当成
+#     "渠道不对"会因为采集侧 is_fba 解析坏掉而整批删货 —— 那时该修采集。
+#   · 店**没标**「配送限制」⇒ want='',两个渠道条件恒假,判据逐字退回旧口径
+#     (`sellable_obs = in_stock_obs`、`wrong_ch_obs = 0`)。没标的店行为**一个
+#     字都不变**,这是所有者"没标就都能上"在删除侧的对应面。
+# ⚠ 窗口是**向后看**的:某店今天刚把「配送限制」填上,窗口立刻看见过去 15 天
+# 的另一渠道历史 ⇒ 当轮就能给出整批删除建议。破坏动作有两道人闸接着
+# (建议行落 ops.dispositions 给人看 + 执行件按「下架限制」逐店截断),
+# 但填这一列之前先跑一次 `maintenance_scan --dry-run` 看删除名单。
 _SQL_LONG_OOS = """
-WITH win AS (
-    SELECT asin,
-           min(scraped_at) AS first_seen,
-           max(scraped_at) AS last_seen,
+WITH req AS (
+    -- 店铺渠道要求。**没标的店不在这张表里** ⇒ 下面 LEFT JOIN 出 NULL ⇒
+    -- coalesce 成 '' ⇒ 所有渠道条件恒假 ⇒ 判据退回旧口径
+    SELECT store, upper(btrim(want)) AS want
+    FROM unnest(%(ch_stores)s::text[], %(ch_wants)s::text[]) AS t(store, want)
+), live AS (
+    SELECT w.store, w.sku, coalesce(req.want, '') AS want
+    FROM catalog.walmart_items w
+    JOIN catalog.listing_sources ls
+      ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+    LEFT JOIN (SELECT DISTINCT ON (store) store, store_status
+               FROM ops.store_kpi_daily
+               ORDER BY store, data_date DESC) st ON st.store = w.store
+    LEFT JOIN req ON req.store = w.store
+    WHERE w.missing_since IS NULL
+      AND w.published_status = 'PUBLISHED'
+      AND (st.store_status IS NULL OR upper(st.store_status) = 'ACTIVE')
+), obs AS (
+    -- ⚠ 三个派生值全部 coalesce 成**二值**:三值逻辑下 `NOT (… AND NULL)` 是
+    -- NULL,而 FILTER 把 NULL 当不命中 —— 渠道采不到的那批观测会因此从
+    -- "挡住删除"翻成"不挡",方向正好反了,且一个字的报错都没有
+    SELECT sn.asin, sn.scraped_at,
+           coalesce(sn.stock_count > 0
+                    OR sn.stock_state = 'in_stock', false) AS has_stock,
+           coalesce(sn.stock_state = 'out_of_stock'
+                    OR sn.stock_count = 0, false) AS no_stock,
+           coalesce(upper(btrim(sn.raw ->> 'is_fba')), '') AS channel
+    FROM catalog.snapshots sn
+    WHERE sn.scraped_at > now() - make_interval(days => %(days)s)
+      AND COALESCE(sn.outcome, 'ok') = 'ok'
+), win AS (
+    SELECT live.store, live.sku, live.want,
+           min(o.scraped_at) AS first_seen,
+           max(o.scraped_at) AS last_seen,
            count(*) AS obs,
-           count(*) FILTER (WHERE stock_count > 0
-                               OR stock_state = 'in_stock') AS in_stock_obs,
-           count(*) FILTER (WHERE stock_state = 'out_of_stock'
-                               OR stock_count = 0) AS oos_obs
-    FROM catalog.snapshots
-    WHERE scraped_at > now() - make_interval(days => %(days)s)
-      AND COALESCE(outcome, 'ok') = 'ok'
-    GROUP BY asin
-    HAVING count(*) FILTER (WHERE stock_count > 0
-                               OR stock_state = 'in_stock') = 0
-       AND count(*) FILTER (WHERE stock_state = 'out_of_stock'
-                               OR stock_count = 0) > 0
-       AND min(scraped_at) <= now() - make_interval(days => %(days)s)
-                            + interval '36 hours'
-       AND max(scraped_at) >= now() - interval '3 days'
-), latest_status AS (
-    SELECT DISTINCT ON (store) store, store_status
-    FROM ops.store_kpi_daily ORDER BY store, data_date DESC
+           -- 本店卖得了的观测:有货,且**不是确定的另一个渠道**
+           count(*) FILTER (
+               WHERE o.has_stock
+                 AND NOT (live.want <> ''
+                          AND o.channel IN ('FBA', 'FBM')
+                          AND o.channel <> live.want)) AS sellable_obs,
+           count(*) FILTER (WHERE o.no_stock) AS oos_obs,
+           -- 确定是另一个渠道的"有货"观测:它既不算卖得了,又是一条**明确**的
+           -- 卖不了证据(判据 2 认它,等价于缺货观测)
+           count(*) FILTER (
+               WHERE o.has_stock AND live.want <> ''
+                 AND o.channel IN ('FBA', 'FBM')
+                 AND o.channel <> live.want) AS wrong_ch_obs
+    FROM live JOIN obs o ON o.asin = live.sku
+    GROUP BY live.store, live.sku, live.want
 )
-SELECT w.store, w.sku, win.obs, win.first_seen, win.last_seen
+SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want
 FROM win
-JOIN catalog.walmart_items w ON w.sku = win.asin
-JOIN catalog.listing_sources ls
-  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
-LEFT JOIN latest_status s ON s.store = w.store
-WHERE w.missing_since IS NULL
-  AND w.published_status = 'PUBLISHED'
-  AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
-ORDER BY w.store, w.sku
+WHERE sellable_obs = 0
+  AND oos_obs + wrong_ch_obs > 0
+  AND first_seen <= now() - make_interval(days => %(days)s) + interval '36 hours'
+  AND last_seen >= now() - interval '3 days'
+ORDER BY store, sku
 """
 
 
@@ -186,6 +271,24 @@ ORDER BY w.store, w.sku
 # 不各判各的 —— 分开写迟早飘成"删除链按 A 判、库存链按 B 判"而两边都不报错。
 
 TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标题
+# 2026-08-19 所有者:「暂时关闭'删除(title_mismatch)'这个维护」。08-17/18
+# 两轮该原因的删除建议超两千条、占删除九成,而删除不可逆——先停闸观察
+# (采集标题质量/占位符干扰的嫌疑未排除)。恢复改回 True。
+#
+# ⚠ **2026-08-20 所有者修正停闸期口径**:「删除(title_mismatch)已停闸,
+# 那么就要对这批行同时改价改标题改库存」。停闸头一版顺手把这批行**冻结**了
+# (删除不发,价格/标题/库存也一律不动),那是最坏的一种状态:删除出口关着
+# 的时候冻结等于**没人管** —— 亚马逊涨价了不跟、缺货了不清零、标题错着不改,
+# 两百多条在架商品挂着错价错标题过夜,而日志只说一句"压制 N 条"。
+# 停闸的本意是"先别删",不是"先别管"。所以闸**只关删除这一个出口**:
+#   · 删除                → 不产出(本开关关着时)
+#   · 改价/改库存/改标题  → **照常产出**(与其余在架行同口径)
+# 判据本身一个字没动:开关改回 True 立刻回到"低相似度 → 删除、且不改价不改
+# 标题"的停闸前行为(两侧都有用例钉住)。
+# ⚠ 停闸期改标题 = 把亚马逊标题抄到一个"可能不是同一个商品"的在架行上,
+# 这是所有者知情后的取舍(标题改错可再改回,删除不可逆),但**必须见人**:
+# title_intents 单独计数并 warning,不许它混进"标题 N 条"里无声发生。
+TITLE_MISMATCH_DELETE = False
 
 def processed_title(slow) -> str:
     """输入:products.slow → 输出:过完上架文案处理的标题(去品牌/去符号/截 199)。
@@ -205,27 +308,85 @@ def processed_title(slow) -> str:
     ).get("productName") or ""
 
 
+def main_processed_title(slow) -> str:
+    """输入:products.slow → 输出:**主标题**过完同一套文案处理;拆不出返回 ""。
+
+    2026-08 亚马逊把标题拆两段,采集侧按 " | " 拼回 `slow.title` 并把后半段
+    单独放 `slow.subtitle`(采集契约 §slow.subtitle)。这里做**精确逆操作**:
+    removesuffix(" | " + subtitle)——不是按 "|" 猜切(契约明令禁止:标题
+    正文本来就可能含 |),结尾对不上(改版前老记录 subtitle 为 null)
+    一律返回 "",调用方退回单基准。
+    """
+    if not isinstance(slow, dict):
+        return ""
+    t, sub = str(slow.get("title") or ""), str(slow.get("subtitle") or "")
+    if not t or not sub or str(t).strip() in TITLE_PLACEHOLDERS:
+        return ""
+    tail = " | " + sub
+    if not t.endswith(tail) or not t[: -len(tail)].strip():
+        return ""
+    return mp_mapper.force_amazon_copy(
+        {}, {"title": t[: -len(tail)], "brand": slow.get("brand"),
+             "attrs": slow}
+    ).get("productName") or ""
+
+
+def title_sim_dual(wm_name, slow):
+    """输入:沃尔玛在线商品名 + products.slow → 输出:双基准相似度(None=算不了)。
+
+    基准一 = 完整拼接标题;基准二 = 主标题(subtitle 拆得出时)。取 **max**:
+    「像两种形态里的任何一种都算像」(所有者定稿 2026-08-19)。为什么:
+    上架默认口径是长标题,但**在架存量里有一批是主标题(短标题)上的**
+    ——单基准下这些行相似度只有 ~0.6,title_mismatch 会把它们当成串货删掉。
+    ⚠ 当初造这批短标题行的「内容拒捞回」通道已于 2026-08-23 撤除,但**行还在线**,
+    所以双基准不能跟着撤;将来整体切短标题口径也天然兼容,不用再改比对。
+    """
+    sims = [order_audit.title_similarity(wm_name, processed_title(slow))]
+    mt = main_processed_title(slow)
+    if mt:
+        sims.append(order_audit.title_similarity(wm_name, mt))
+    real = [s for s in sims if s is not None]
+    return max(real) if real else None
+
+
 # 无货三档的映射搬去 `order_audit.stock_block`(维护链与审核链的唯一出处);
 # 本模块已经 import order_audit,方向不变。
 
-# 动作优先级:删除 > 库存 > 标题。一个 SKU 一轮只出一个动作 ——
-# 既建议删除又建议改标题的话,执行件会先花配额改一个马上要删的商品。
-_ACTION_RANK = {"delete": 0, "inventory": 1, "title": 2}
+def title_mismatched(title_similarity) -> bool:
+    """输入:相似度(可为 None)→ 输出:是否算「标题不匹配」。
+
+    **唯一定义处**:classify 用它决定删不删,delete_intents 用它数停闸压了
+    多少条,title_intents 用它决定(停闸恢复后)跳不跳过。三处各写一遍
+    `x is not None and x < FLOOR` 的下场是改阈值时漏改一处,而且不报错。
+    None 不算不匹配:算不出来 ≠ 不像(有一边没标题是采集问题,不是证据)。
+    """
+    return title_similarity is not None and title_similarity < TITLE_SIM_FLOOR
 
 
 def classify(*, outcome=None, stock_status=None, stock_state=None,
-             title_similarity=None, over_lead=False, lead_note="") -> tuple:
+             title_similarity=None, over_lead=False, lead_note="",
+             channel_bad=False, channel_note="") -> tuple:
     """输入:一行在线商品的处置信号 → 输出:(动作, 原因码, 原因文案);无动作返回 (None,'','')。
 
     所有者定稿的判据,逐条对应他给的伪代码:
 
       outcome == 'not_found'                     → 删除(ASIN 已从亚马逊下架)
+      **本店渠道 ≠ 产品渠道**                     → 库存 0(所有者定稿 2026-08-25)
       stock_status == 'Currently unavailable'    → 库存 0(在架但不可售,拿不到价格库存)
       stock_status == 'No Featured Offer'        → 库存 0(无 Buy Box)
       stock_state == 'out_of_stock'              → 库存 0(普通缺货)
       配送超本店上限                              → 库存 0
-      标题相似度 < 0.70                           → 删除
+      标题相似度 < 0.70                           → 删除(**停闸中:见下**)
       标题相似度 ≥ 0.70 且标题有差异              → 改标题
+
+    ⚠ **渠道不符排在无货三档之前**(2026-08-25):两条都命中时动作一样(清零),
+    差别只在原因码 —— 而这两个原因的处置完全不同。「缺货」是暂时的、等回货;
+    「渠道不符」是结构性的,回了货也卖不了(这家店只做另一个渠道),运营要做的
+    是换店或改店铺配置。排在后面就会被「缺货」盖住,而那一栏天天都有几百条。
+
+    ⚠ `TITLE_MISMATCH_DELETE=False`(当前现状)时,"标题相似度 < 0.70 → 删除"
+    这一条**整条跳过**:不返回删除,继续往下判库存,该行照常改价/改标题/改
+    库存(停闸口径见 `TITLE_MISMATCH_DELETE` 头注)。
 
     ⚠ 顺序即优先级,**删除压过一切**:一个 SKU 一轮只出一个动作,否则执行件
     会先花配额去改一个马上要删的商品(批次 E 踩过同款坑:同一 SKU 既建议反补
@@ -236,9 +397,20 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     """
     if str(outcome or "").strip().lower() == "not_found":
         return ("delete", "not_found", "亚马逊已下架(采集 not_found)")
-    if title_similarity is not None and title_similarity < TITLE_SIM_FLOOR:
-        return ("delete", "title_mismatch",
-                f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
+    if title_mismatched(title_similarity):
+        if TITLE_MISMATCH_DELETE:
+            return ("delete", "title_mismatch",
+                    f"标题相似度 {title_similarity:.0%} < {TITLE_SIM_FLOOR:.0%}")
+        # 停闸中:**不判删除,也不早退**——早退回 (None,"","") 是另一种冻结,
+        # 缺货了也不清零,等于删除停闸顺手把库存链也关了。继续往下判无货三档
+        # 与货期(停闸口径见 `TITLE_MISMATCH_DELETE` 头注)。
+    if channel_bad:
+        # 本店只做一个渠道,而这个货现在是另一个渠道 ⇒ 在这家店卖不了。
+        # **清零不删除**:清零可逆(货源渠道翻回来自动回补),删除不可逆。
+        # 真要下架由删除链的「渠道不符 N 天」窗口收尾 —— 与"缺货清零 → 连续
+        # 无货 N 天才删"完全同一条阶梯(所有者定稿 2026-08-25)。
+        return ("inventory", "channel_mismatch",
+                channel_note or "本店渠道与产品渠道不符")
     # 无货三档的判据是**审核链共用的**(order_audit.stock_block 是唯一出处):
     # 维护链据此把库存写 0,审核链据此报「无货」而不是「采集缺字段」。
     # 各写一份的下场是同一个商品两条链说两种话,而且两边都不报错。
@@ -248,17 +420,6 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     if over_lead:
         return ("inventory", "lead_days", lead_note or "配送时长超本店上限")
     return (None, "", "")
-
-
-def pick_one(actions: list[tuple]) -> tuple:
-    """输入:同一 SKU 的多个 (动作,原因码,原因文案) → 输出:优先级最高的那个。
-
-    删除 > 库存 > 标题。空列表返回 (None,'','')。
-    """
-    real = [a for a in actions if a and a[0]]
-    if not real:
-        return (None, "", "")
-    return min(real, key=lambda a: _ACTION_RANK.get(a[0], 9))
 
 
 def _rows(conn, stockzero_stores: list[str]) -> list[dict]:
@@ -323,14 +484,39 @@ def record_submitted(conn, intents: list[dict]) -> int:
     return len(intents)
 
 
-def _cap(intents: list[dict], kind: str) -> list[dict]:
-    """输入:意图列表 → 输出:截到单轮上限(超出只告警,下轮继续)。"""
-    if len(intents) <= MAX_INTENTS_PER_KIND:
-        return intents
-    logger.warning("%s 意图 %d 条超单轮上限 %d,本轮只提交前 %d 条(其余下轮)",
-                   kind, len(intents), MAX_INTENTS_PER_KIND,
-                   MAX_INTENTS_PER_KIND)
-    return intents[:MAX_INTENTS_PER_KIND]
+def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
+    """输入:意图列表 → 输出:(截到单店单轮上限的列表, 截断报告)。
+
+    按 (店铺, 类型) 分组截断,组内先按 _TRUNC_PRIORITY 排序再取前 cap 条
+    (排序只在**真要截**的组里发生,不超限的组一个字不动 —— 平日零成本)。
+    截断报告一行一个被截的组:{"store","kind","total","kept","deferred_keys"},
+    调用方必须做两件事:
+      ① 把它带进运行摘要**首行**(链通知对成功步骤只发首行)—— 08-25 的
+        教训是截断只写日志 warning,通知看起来一切正常;
+      ② 把 deferred_keys 留在 withdraw_stale 的 keep 里 —— 配额顺延不是
+        "不再建议",撤掉落榜行上一轮挂着的 suggested 行会被记成
+        「商品自己恢复正常了」(错误取证),且下轮又重建。
+    """
+    by: dict[tuple, list[dict]] = {}
+    for it in intents:
+        by.setdefault((it["store"], it["kind"]), []).append(it)
+    out, report = [], []
+    for (store, kind), group in by.items():
+        cap = MAX_INTENTS_PER_STORE.get(kind)
+        if cap is None or len(group) <= cap:
+            out.extend(group)
+            continue
+        key = _TRUNC_PRIORITY.get(kind)
+        ranked = sorted(group, key=key) if key else group   # sorted 稳定
+        out.extend(ranked[:cap])
+        report.append({"store": store, "kind": kind,
+                       "total": len(group), "kept": cap,
+                       "deferred_keys": [(i["store"], i["sku"], i["kind"])
+                                         for i in ranked[cap:]]})
+        logger.warning("%s %s 意图 %d 条超单店单轮上限 %d,本轮只提交 %d 条"
+                       "(按截断优先级取,其余下轮)",
+                       store, kind, len(group), cap, cap)
+    return out, report
 
 
 def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
@@ -379,11 +565,11 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
     with conn.cursor() as cur:
         cur.execute(_SQL_MATCH_INV, (list(stockzero_stores or []),))
         rows = cur.fetchall()
-    return _cap([{"store": s, "sku": k, "kind": "inventory",
-                  "old": q, "new": MATCH_INVENTORY_QTY,
-                  "code": "match_restock",
-                  "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
-                 for s, k, q in rows], "inventory")
+    return [{"store": s, "sku": k, "kind": "inventory",
+             "old": q, "new": MATCH_INVENTORY_QTY,
+             "code": "match_restock",
+             "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
+            for s, k, q in rows]
 
 
 def price_intents(conn, multipliers: dict[str, dict],
@@ -393,7 +579,7 @@ def price_intents(conn, multipliers: dict[str, dict],
     新价 = services.pricing.walmart_price(**落地价(amz 现价 + 运费)** × 该店
     对应区间倍率),
     与上架用的是**同一套定价规则**(避免上架价与维护价两套口径)。
-    区间按**配送方式**分两套(FBA 0-30/30-75、FBM 15-80/80-1000),配送方式
+    区间按**配送方式**分两套(FBA 0-30/30-1000、FBM 15-80/80-1000),配送方式
     取 latest_snapshot 的 raw.is_fba(采集侧 parser 读 buybox 的 Ships from);
     **未知则不改价**——猜错一档就是拿错倍率改线上价。
     出界按 300% 兜底(所有者定稿 2026-08-09);只有**区间内倍率未配置**
@@ -406,12 +592,13 @@ def price_intents(conn, multipliers: dict[str, dict],
         store, sku = r["store"], r["sku"]
         wm_price, amz_price = r["wm_price"], r["amz_price"]
         fulfillment, shipping = r["fulfillment"], r["shipping"]
-        # 删除类压过改价:一个 SKU 一轮只出一个动作,否则先花配额改一个
-        # 马上要删的商品(pick_one 的同款理由)。两条删除判据都要判到。
+        # 删除类压过改价(序见 dispositions.ACTION_RANK):两条删除判据都要判到。
+        # ⚠ title_mismatch 停闸期间 classify 不再判它删,这批行于是照常改价
+        # (口径见 `TITLE_MISMATCH_DELETE` 头注)。这里**不要**另加相似度
+        # 判断:那就成了"删除关了、改价还自己关着"的第二把暗闸。
         if classify(outcome=r["outcome"],
-                    title_similarity=order_audit.title_similarity(
-                        r["product_name"], processed_title(r["slow"]))
-                    )[0] == "delete":
+                    title_similarity=title_sim_dual(
+                        r["product_name"], r["slow"]))[0] == "delete":
             continue
         if amz_price is None or wm_price is None:
             continue                    # 缺任一侧现值:没有可比基准,不动
@@ -450,14 +637,21 @@ def price_intents(conn, multipliers: dict[str, dict],
     if skipped_no_shipping:
         logger.warning("改价:%d 行运费未采到(采集侧 N/A),落地价算不出来,"
                        "本轮不改价——**绝不当免运费处理**", skipped_no_shipping)
-    return _cap(out, "price")
+    return out
 
 
-def inventory_intents(conn, stockzero_stores: list[str] | None = None
+def inventory_intents(conn, stockzero_stores: list[str] | None = None,
+                      store_channels: dict[str, str] | None = None
                       ) -> list[dict]:
-    """输入:连接 + stockzero 名单 → 输出:改库存意图。
+    """输入:连接 + stockzero 名单(+ {店铺: 限定渠道})→ 输出:改库存意图。
 
-    库存决策(所有者定稿 2026-08-09):
+    `store_channels` = 限额表「配送限制」标了 fba/fbm 的店(唯一取数口
+    `store_targets.store_channels()`,由 `collect_all` 取一次分发)。
+    **不传 = 不限制**:直接调本函数的测试与排查不会因此静默拿到一份 Feishu 读。
+
+    库存决策(所有者定稿 2026-08-09;渠道那条 2026-08-25 加):
+      · **本店渠道 ≠ 产品渠道 → 写 0**。清零可逆、删除不可逆,所以这里只清零;
+        真下架交给删除链的「渠道不符 N 天」窗口(与缺货走同一条阶梯)
       · stock_count 有值 → 同步该值(0 就是 0)
       · **stock_count 为 NULL(没采到)→ 也写 0**。采不到就不卖,是运营口径;
         库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在决策这一层
@@ -467,12 +661,16 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
         `MAX_LEAD_DAYS`(**7 天**,所有者两次收紧 12 →08-09→ 8 →08-15→ 7)。
         ⚠ 与上架侧口径不同:上架侧超限是**不上架**,这里已经在架了只能压库存
     ⚠ 血量提醒:采集服务中断一整轮会让大批行的 stock_count 变 NULL,
-    按本规则即全线清零。单轮上限 MAX_INTENTS_PER_KIND 是唯一刹车,
-    真跑前务必看 dry-run 的清零条数。
+    按本规则即全线清零。2026-08-26 起单轮上限改按店(所有者定稿:及时性
+    优先,配额是按店的,全局闸卡的全是合法大改),**这道闸挡不住整店清零**
+    (单店目录远小于单店上限)—— 防线只剩两道:扫描摘要里的「清零合计
+    (按原因码摊开)」必须有人看;AI 改完代码先 --dry-run 的纪律没有取消。
     """
     from services import amz_source
     lead_caps = store_limits.lead_day_caps()
+    chans = store_channels or {}
     out = []
+    n_channel = n_zeroed = 0
     for r in _rows(conn, stockzero_stores):
         store, sku, avail_qty = r["store"], r["sku"], r["avail_qty"]
         stock_count = r["stock_count"]
@@ -480,6 +678,12 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
             stock_count = 0             # 没采到 → 不卖(所有者定稿)
         cap = store_limits.cap_for(lead_caps, store, amz_source.MAX_LEAD_DAYS)
         over = store_limits.over_lead_cap(r["delivery_days"], cap)
+        # 渠道判定走 store_targets 唯一谓词(上架/分配/对账同一处):店没标
+        # 不算不符,产品渠道采不到或采出第三种值也不算 —— 把"没采到"当"货不对"
+        # 在这条链上的后果是无辜商品先被清零、再被删除链的窗口删掉
+        want_ch = chans.get(store)
+        bad_ch = store_targets.channel_conflict(want_ch, r["fulfillment"])
+        n_channel += 1 if bad_ch else 0
         # 处置判据集中在 classify():四条清零判据(不可售/无 BuyBox/缺货/超时)
         # 各自带原因码,飞书「原因」列靠它才分得清 —— 表里四条长得一模一样
         act, code, why = classify(
@@ -487,19 +691,38 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None
             stock_state=r["stock_state"], over_lead=over,
             # ⚠ 相似度也要给:不给的话"标题不匹配 → 删除"这条在本 provider 看不见,
             # 于是该删的行照样产一条库存意图,执行件先花配额清零再花配额删
-            # (2026-08-16 演练实见 B0MISMATCH 10 → 7)
-            title_similarity=order_audit.title_similarity(
-                r["product_name"], processed_title(r["slow"])),
-            lead_note=f"配送 {r['delivery_days']} 天 > 本店上限 {cap} 天")
+            # (2026-08-16 演练实见 B0MISMATCH 10 → 7)。
+            # ⚠ 用 title_sim_dual,与删除/改价/改标题**同一个算法**(2026-08-20
+            # 对齐):单基准把"在架的短标题存量行"算成 ~0.6,停闸恢复后
+            # 本 provider 会判它该删而删除链(双基准)不删 —— 那批行既不清零
+            # 也不删,悄悄脱管。四个 provider 问同一个判据,就得喂同样的数。
+            title_similarity=title_sim_dual(r["product_name"], r["slow"]),
+            lead_note=f"配送 {r['delivery_days']} 天 > 本店上限 {cap} 天",
+            channel_bad=bad_ch,
+            channel_note=(f"本店只做 {want_ch},该品现在是 "
+                          f"{str(r['fulfillment']).strip().upper()}")
+                         if bad_ch else "")
         if act == "delete":
-            continue        # 删除类归 delete_intents,这里不抢(一 SKU 一动作)
+            continue        # 删除类归 delete_intents,这里不抢
         new_qty = 0 if act == "inventory" else int(stock_count)
         if avail_qty is not None and int(avail_qty) == new_qty:
             continue
         out.append({"store": store, "sku": sku, "kind": "inventory",
                     "old": avail_qty, "new": new_qty,
                     "code": code, "reason": why})
-    return _cap(out, "inventory")
+        n_zeroed += 1 if code == "channel_mismatch" else 0
+    if n_channel:
+        # 渠道不符必须出声:它是结构性的(不像缺货会自己好),而且这批行
+        # 会顺着删除链的窗口走到不可逆的删除 —— 一次大面积出现,多半是
+        # 某家店的「配送限制」刚填上/刚改了,人要先知道再决定要不要放它跑
+        # ⚠ 两个数分开报,别拿"看见几行"当"清零几行":其余那些是**已经是 0**
+        # (上一轮清过)或**本轮要删**的 —— 混成一个数会让"闸在持续起作用"和
+        # "今天又新坏了一批"长得一模一样(本仓在进度日志上栽过这个跟头)
+        logger.warning("库存:%d 行**本店渠道与产品渠道不符**,其中 %d 行本轮"
+                       "清零(原因码 channel_mismatch;其余已经是 0 或本轮要删)"
+                       "——持续不符会被删除链的「渠道不符 N 天」窗口下架",
+                       n_channel, n_zeroed)
+    return out
 
 
 def title_intents(conn, stockzero_stores: list[str] | None = None
@@ -512,9 +735,13 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
 
     旧防线原样保留:占位符跳过;**productType / UPC / 标题三缺一跳过**
     (缺任一沃尔玛必退回)。标题相同则不产出。
+
+    相似度 < 70% 的行**跟着删除开关走**(停闸口径见 `TITLE_MISMATCH_DELETE` 头注):
+      · `TITLE_MISMATCH_DELETE=True`  → 跳过(交给删除链,停闸前的老行为)
+      · `TITLE_MISMATCH_DELETE=False` → 照改并计数告警
     """
     out = []
-    skipped_incomplete = skipped_mismatch = 0
+    skipped_incomplete = skipped_mismatch = paused_mismatch = 0
     for r in _rows(conn, stockzero_stores):
         store, sku = r["store"], r["sku"]
         product_name, product_type, upc = r["product_name"], r["product_type"], r["upc"]
@@ -526,37 +753,61 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
         # 70% 闸(所有者定稿 2026-08-16):相似度过低说明**采到的可能不是同一个
         # 商品**,那时把亚马逊标题抄过去是把错的抄进线上 —— 交给删除链处置。
         # 相似度算不出来(有一边没标题)不算不匹配,照旧走改标题。
-        sim = order_audit.title_similarity(product_name,
-                                           processed_title(slow))
-        if sim is not None and sim < TITLE_SIM_FLOOR:
+        # ⚠ 这道闸的前提是"交得出去" —— 删除链停闸时它交不出去,跳过就等于
+        # 把这批行冻结在错标题上。所以**闸随删除开关走**:删除开着才跳过,
+        # 删除关着照改、单独计数见人(口径见 `TITLE_MISMATCH_DELETE` 头注)。
+        sim = title_sim_dual(product_name, slow)
+        low = title_mismatched(sim)
+        if low and TITLE_MISMATCH_DELETE:
             skipped_mismatch += 1
             continue
         new_title = processed_title(slow)    # 与上架同款处理(去品牌/截 199)
         if not new_title or new_title == (product_name or ""):
             continue
+        if (product_name or "") == main_processed_title(slow):
+            # 在架标题 = 主标题(短标题存量行):**不改回长标题** —— 这批行当初
+            # 就是长标题被内容审查拒了才换的短标题,改回去等于自找再拒一遍
+            continue
         if not product_type or not upc:
             skipped_incomplete += 1     # 三缺一跳过(旧防线)
             continue
+        if sim is None:
+            why = "同步亚马逊标题(相似度算不出)"
+        elif low:
+            # 计数落在**真产出**这一步,不落在闸那一步:后面还有"标题没变/
+            # 三缺一"两道过滤,在闸上数会把没提交的也报成"改了"。
+            paused_mismatch += 1
+            why = f"相似度 {sim:.0%}(删除停闸,照常同步标题)"
+        else:
+            why = f"相似度 {sim:.0%},同步亚马逊标题"
         out.append({"store": store, "sku": sku, "kind": "title",
                     "old": product_name, "new": new_title,
                     "product_type": product_type, "product_id": upc,
-                    "code": "title_sync",
-                    "reason": f"相似度 {sim:.0%},同步亚马逊标题" if sim is not None
-                              else "同步亚马逊标题(相似度算不出)"})
+                    # 原因码分组(飞书「原因」列):停闸期照改的低相似度行与
+                    # 常规同步长得一模一样,不分码就数不出这个口径影响了多少行
+                    "code": "title_mismatch_sync" if low else "title_sync",
+                    "reason": why})
     if skipped_incomplete:
         logger.info("标题:%d 行缺 productType/UPC 跳过(三缺一防线)",
                     skipped_incomplete)
     if skipped_mismatch:
         logger.info("标题:%d 行相似度 < %.0f%% 不改标题(交给删除链)",
                     skipped_mismatch, TITLE_SIM_FLOOR * 100)
-    return _cap(out, "title")
+    if paused_mismatch:
+        # 抄的是"可能不是同一个商品"的标题,必须 warning 级别见人:
+        # 这是删除停闸期的临时口径,恢复删除后这批行会回到"跳过"
+        logger.warning("标题:%d 行相似度 < %.0f%% **仍改标题** —— 删除"
+                       "(title_mismatch)停闸期口径(所有者 2026-08-20:"
+                       "停闸不冻结),原因码 title_mismatch_sync 可单独查",
+                       paused_mismatch, TITLE_SIM_FLOOR * 100)
+    return out
 
 
 def delete_intents(conn, stockzero_stores: list[str] | None = None,
-                   caps: dict[str, int] | None = None,
                    min_batches: int = MIN_OFFSET_BATCHES,
-                   oos_days: int = LONG_OOS_DAYS) -> list[dict]:
-    """输入:连接(+单店上限表/批次数门槛/无货天数)→ 输出:删除意图(kind='delete')。
+                   oos_days: int = LONG_OOS_DAYS,
+                   store_channels: dict[str, str] | None = None) -> list[dict]:
+    """输入:连接(+批次数门槛/无货天数/{店铺: 限定渠道})→ 输出:删除意图(kind='delete')。
 
     三个原因(所有者定稿 2026-08-09),都是"这个产品已经不值得留在架上了":
 
@@ -574,11 +825,23 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
       库存 provider 早就把它清零了,清零后还这么久不回货 = 这个货源没了。
       ⚠ 采集接线于 2026-08-08,历史攒够 15 天之前这条恒返空,不是坏了。
 
-    单店单轮上限取限额表「下架限制」(caps,与 product_clear 同一列同一口径),
-    店铺不在表内退 DELETE_PER_STORE 并告警。
+    渠道不符 N 天(2026-08-25 新增,所有者:「该渠道下库存连续不足 N 天,下架」)
+      —— **同一个窗口、同一条阶梯**,只是"有货"要算成"本店渠道下有货":限定了
+      渠道的店,货源翻到另一个渠道就等于这家店没货。原因码单独一个
+      (`渠道不符N天`)而不是混进「连续无货」:两者的处置完全不同 —— 无货是
+      货源断了,渠道不符是这个货该换一家店(或者改这家店的「配送限制」),
+      而删除预览是按原因码分组给人看的。
+      店没标「配送限制」时这一档**恒不触发**,判据逐字退回旧口径。
+
+    ⚠ **本函数不设任何数量闸**(2026-08-24 归一;2026-08-26 连全局 5000 闸
+    一并废除)。限额表「下架限制」由执行件 `problem_product_cleanup` 在领取时
+    施加一次(services.dispositions.cap_destructive)。此前两条扫描件各截一次
+    同一张表,每店最多 N 条实际变成最多 2N —— 扫描件如实报待办、执行件按
+    配额取件,才只有一处上限。cap_per_store 的按店上限表也**刻意不含 delete**,
+    理由相同。
     """
-    caps = caps or {}
-    seen, out, per_store = set(), [], {}
+    seen, out = set(), []
+    paused_mismatch = 0
 
     def _take(store, sku, code, why="", extra=None):
         """code = 机器码(飞书「原因」列的分组依据 / 建议行 category);
@@ -586,10 +849,6 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         之后必须分开:`title_mismatch` 分得了组但读不出"低到什么程度"。"""
         if (store, sku) in seen:
             return          # 两个原因都命中只删一次
-        cap = int(caps.get(store, DELETE_PER_STORE))
-        per_store[store] = per_store.get(store, 0) + 1
-        if per_store[store] > cap:
-            return          # 超单店上限的留到下轮(下面统一告警)
         seen.add((store, sku))
         out.append({"store": store, "sku": sku, "kind": "delete",
                     "old": "在线", "new": "删除",
@@ -614,35 +873,67 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
         # 所有者定稿 2026-08-16 新增两条删除判据(judgement 在 classify):
         #   outcome == 'not_found'  → ASIN 已从亚马逊下架
         #   标题相似度 < 70%         → 采到的可能不是同一个商品,抄标题会抄错
-        act, code, why = classify(
-            outcome=r["outcome"],
-            title_similarity=order_audit.title_similarity(
-                r["product_name"], processed_title(slow)))
+        sim = title_sim_dual(r["product_name"], slow)
+        act, code, why = classify(outcome=r["outcome"], title_similarity=sim)
         if act == "delete":
-            _take(store, sku, code, why)
+            _take(store, sku, code, why)   # 停闸由 classify 拦,这里只管收
+        elif title_mismatched(sim) and (store, sku) not in seen:
+            # 停闸压制条数**必须见人**(静默关掉的闸没人记得它关着)。
+            # 报的是"因停闸少删了多少行",所以两类要排除:not_found 同时命中的
+            # (上面已按 not_found 删了)、以及已被 variant_offset 收走的
+            # ——它们照删不误,算进来会把"少删了多少"报大。
+            paused_mismatch += 1
 
+    chans = store_channels or {}
     with conn.cursor() as cur:
-        cur.execute(_SQL_LONG_OOS, {"days": int(oos_days)})
+        cur.execute(_SQL_LONG_OOS,
+                    {"days": int(oos_days),
+                     "ch_stores": list(chans.keys()),
+                     "ch_wants": [chans[k] for k in chans]})
         rows = cur.fetchall()
-    for store, sku, obs, first_seen, last_seen in rows:
-        _take(store, sku, f"连续无货{oos_days}天",
-              f"{oos_days} 天窗口内 {obs} 次观测无一有货,货源已断",
-              {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+    n_wrong_ch = 0
+    for store, sku, obs, first_seen, last_seen, wrong_ch_obs, want in rows:
+        if wrong_ch_obs:
+            # 窗口里出现过"有货但是另一个渠道" ⇒ 这行是渠道不符走到头的,
+            # 不是货源断了。两个原因码分开,删除预览按码分组才说得清
+            n_wrong_ch += 1
+            _take(store, sku, f"渠道不符{oos_days}天",
+                  f"{oos_days} 天窗口内 {obs} 次观测无一是本店渠道({want})"
+                  f"可售的货,其中 {wrong_ch_obs} 次确认为另一渠道",
+                  {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+        else:
+            _take(store, sku, f"连续无货{oos_days}天",
+                  f"{oos_days} 天窗口内 {obs} 次观测无一有货,货源已断",
+                  {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+    if n_wrong_ch:
+        # 向后看的窗口 ⇒ 某店刚填上「配送限制」的当轮就可能整批命中。
+        # 必须出声,别让它混在"删除 N 条"里跟着日常波动过去
+        logger.warning("删除:%d 行是**渠道不符满 %d 天**(不是货源断)。"
+                       "某家店刚填/刚改「配送限制」时会成批出现——窗口是"
+                       "向后看的,先看建议行再放执行件跑", n_wrong_ch, oos_days)
     if not rows:
         # 采集历史不足窗口长度时这条恒空——说出来,免得被读成"没有长期缺货的"
         logger.info("连续无货 %d 天:本轮 0 个候选(采集历史不足 %d 天时属正常)",
                     oos_days, oos_days)
 
-    over = {s: n - int(caps.get(s, DELETE_PER_STORE))
-            for s, n in per_store.items()
-            if n > int(caps.get(s, DELETE_PER_STORE))}
-    if over:
-        logger.warning("删除超单店上限,本轮留下:%s", over)
-    return _cap(out, "delete")
+    if paused_mismatch:
+        logger.warning("删除(title_mismatch)已停闸(所有者 2026-08-19),"
+                       "本轮压制 %d 条 —— 这批行照常改价/改标题/改库存"
+                       "(所有者 2026-08-20:停闸不冻结)", paused_mismatch)
+    return out
 
 
-def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
-    """输入:连接 + stockzero 名单(+无货天数)→ 输出:本轮全部维护意图。
+def collect_all(conn, stockzero: list[str], oos_days: int = 0
+                ) -> tuple[list[dict], list[dict]]:
+    """输入:连接 + stockzero 名单(+无货天数)→ 输出:(本轮全部维护意图, 截断报告)。
+
+    单店单轮上限(cap_per_store)在**最后**施加 —— 在 doomed 剔除与 drop_recent
+    之后,名额不浪费在注定不发的意图上(截在 provider 里的话,先截再被防重
+    压掉的部分等于白扔名额)。⚠ 但"进了名额 = 一定提交"不成立,cap 之后还有
+    三条泄漏:领取时的破坏组压制(claim 按库里**所有**未落定 delete/retire 判,
+    含别的链写的)、同键 executing 行挡新建议(摘要的"写入 < 意图"就是它)、
+    执行件缺凭证整店跳过 —— 将来调小上限时别按"名额=提交数"估算。
+    截断报告必须随摘要**首行**见人,不许只进日志(链通知只发成功步骤的首行)。
 
     ⚠ **住在 services 而不是 workflow 里**:2026-08-16 拆成
     maintenance_scan(建议)+ maintenance(执行)之后,只有扫描件调它;但铁律
@@ -651,15 +942,21 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
 
     stockzero 店整店排除在三个自动 provider 之外 —— 它们归 zero_intents,
     否则"跟随 amz 库存"会把刚清零的货又顶回去(两条规则打架)。
+
+    店铺渠道(限额表「配送限制」)在这里**取一次**分发给库存与删除两个
+    provider:两边问的是同一个问题(这家店做哪个渠道),各读一次飞书除了慢
+    还会漂 —— 一轮里前后两次读到不同的表,清零按新配置、删除按旧配置。
     """
     mults = store_limits.price_multipliers()
-    deletes = delete_intents(conn, stockzero, store_limits.retire_caps(),
-                             oos_days=oos_days or LONG_OOS_DAYS)
+    chans = store_targets.store_channels()
+    deletes = delete_intents(conn, stockzero,
+                             oos_days=oos_days or LONG_OOS_DAYS,
+                             store_channels=chans)
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)
     for it in (title_intents(conn, stockzero)
                + price_intents(conn, mults, stockzero)
-               + inventory_intents(conn, stockzero)
+               + inventory_intents(conn, stockzero, store_channels=chans)
                # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
                # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责
                + match_inventory_intents(conn, stockzero)
@@ -671,7 +968,7 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0) -> list[dict]:
     # 近期已提交过同一件事的压掉:提交成功后本地快照要等 catalog_sync 才更新,
     # 不压就会一轮轮重发同样的载荷(生产实证 208 条 stale update)
     intents, _n = drop_recent(conn, intents)
-    return intents
+    return cap_per_store(intents)
 
 
 # ── 意图 ⇄ 建议行(ops.dispositions)的互转 ────────────────────────────────────

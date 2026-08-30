@@ -12,22 +12,30 @@
   - 归一化 = `" ".join(raw.lower().split())`,与 `services/audit_phase0.
     _normalize_brand` 逐字同款——黑名单键就是这么规整的,占用键与黑名单
     键必须同算法,否则"品牌被拉黑"和"品牌被占用"对不上同一个字符串;
-  - 占位符表 = phase0 的 20 项 **∪ mp_mapper._BRAND_NOISE**(后者独有
-    `unknown` 一词——两表各漏对方几个词,占用键取并集才安全:漏一个词
-    就是一次大面积误锁,多一个词只是少占一个品牌)。
+  - 占位符表 = phase0 白名单 **∪ mp_mapper._BRAND_NOISE ∪ {generic, oem,
+    various}**(mp_mapper 独有 `unknown`——两表各漏对方几个词,占用键取并集
+    才安全:漏一个词就是一次大面积误锁,多一个词只是少占一个品牌)。
+    ⚠ **本表与 phase0 白名单已于 2026-08-23 分家,不再是"逐字同款"**:
+    所有者把 generic / oem / various 从 phase0 撤下交还黑名单裁决(飞书登记
+    了 GENERIC 却拦不住),但**这三个词在本表必须留着** —— 两张表方向相反,
+    那边多留一个词只是少拦一个黑名单品牌,本表少留一个词就是"Generic"变成
+    排他占用键、成千上万个无关产品锁进一家店,且占用没有自动释放。
+    `tests/test_alloc_audit` 用子集断言钉住方向:phase0 ⊆ 本表,反向不成立。
 
 品牌缺失时的兜底顺序(与风控闸 `risk_gate.check` 双字段实证同源):
 brand → manufacturer;两者都是占位符 = 真·无品牌,不占品牌只占产品。
 """
 
 PLACEHOLDERS = frozenset({
-    # 20 项逐字取自 services/audit_phase0._NON_BRAND_PLACEHOLDERS
+    # 17 项与 services/audit_phase0._NON_BRAND_PLACEHOLDERS 同源
     "n/a", "na", "n.a.", "n.a",
     "none", "null", "nil",
     "unbranded", "no brand", "no brand name", "no name",
-    "generic", "oem", "various",
     "不详", "无品牌", "无",
     "-", "--", "---",
+    # phase0 已于 2026-08-23 撤下这三项(交还品牌黑名单裁决),**本表保留**:
+    # 撤了就是把 Generic/OEM 当成排他占用键用,一次误锁没有自动释放
+    "generic", "oem", "various",
     # mp_mapper._BRAND_NOISE 独有(2026-08-15 测试发现两表互有缺项)
     "unknown",
 })

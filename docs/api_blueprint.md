@@ -26,7 +26,7 @@
 | 10 | POST /v3/feeds?feedType=MP_MAINTENANCE | feeds | 改标题/属性/endDate | safe_post_ex | 4 个模块 |
 | 11 | POST /v3/feeds?feedType=DELETE_ITEM | feeds | **永久删除**(最高危) | **裸 httpx×3 处** | 批量下架/问题清理 |
 | 12 | POST /v3/feeds?feedType=RETIRE_ITEM | feeds | 可恢复下架 | 混合 | 问题清理/auto_listing |
-| 13 | POST /v3/feeds?feedType=PRICE_AND_PROMOTION | feeds | 批量改价(6/天!) | safe_post_ex | auto_listing |
+| 13 | POST /v3/feeds?feedType=PRICE_AND_PROMOTION | feeds | 批量改价(三件套共享 10/hour) | safe_post_ex | auto_listing |
 | 14 | POST /v3/feeds?feedType=price | feeds | 批量改价(旧版) | safe_post_ex | 商品维护 |
 | 15 | POST /v3/feeds?feedType=inventory | feeds | 批量改库存 | safe_post_ex | 2 个模块 |
 | 16 | GET /v3/feeds | feeds | feed 列表(提交防重反查/轮询) | safe_get_ex | 2 个模块 |
@@ -64,14 +64,14 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 |---|---|---|
 | 1 product_query | 5(DEFAULT+SPEC), 6 | 全只读,零状态 |
 | 2 returns_sync | 24 | 支持真增量,时间窗成对下发(§4.3 实证;原记"不支持时间过滤"已于 2026-08-14 勘误) |
-| 3 daily_report | 4, 2, 23, 25, 26, 27, 28, 29 | 端点最多;29 是 xlsx 二进制 |
-| 4 order_audit | 23 | createdStartDate=now-179d 坑必须带上 |
-| 5 upc_generator | 5(upc=) | 复用 items.search;先落库再查的防重已同构 |
+| 3 daily_report | 23, 25, 26, 27, 28 | 29(xlsx 二进制)已分给 perf_problems;商品三列改读 catalog.walmart_items(靠链上前置的 catalog_sync),不再自己调 4/2 |
+| 4 order_sync | 23 | 窗口全量重拉(缺省 days=45,不走 lastModifiedStartDate 增量,故无 179d 坑);order_audit 只读 PG/采集器,零沃尔玛调用 |
+| 5 upc_sync | 无沃尔玛调用 | 号源由运营填「UPC池」表,注入/回写只走飞书 + catalog.upc_pool;计划中的 items.search 查重未实现(UPC 造号已定案不做) |
 | 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
-| 7 daily_retire | 11, 17, (2) | DELETE_ITEM;防重走 ops.feed_log |
-| 8 daily_cleanup | 2, 11, 12, 10, 25, 17 | 反补(MP_MAINTENANCE 改 endDate)+删除+停用 |
+| 7 product_clear | 11, 12, 17 | 消费飞书「停用/删除表」:停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM;防重走 ops.feed_log |
+| 8 problem_product_cleanup | 10, 11, 12, 17 | 反补(MP_MAINTENANCE)+删除+停用;定性决策拆在 problem_scan(零沃尔玛调用),删除是否生效靠 catalog_sync 的 2 观测,本工作流不调 2/25 |
 | 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
-| 10 listing | 7, 8, 9, 5(SPEC), 3, 16, 17, 18, 30, 19, 20, 13, 15, 12 | 最大;api 面在此全部收口 |
+| 10 list_new | 8, 30, 16 | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -113,13 +113,13 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | MP_ITEM | 10/hour | 25MB;≤10000 条 | 一致(大小旧记 10MB 过时) | 8/hour |
 | MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour |
 | DELETE_ITEM | 10/hour("代码零依据"的 10/hour 现已获官方背书) | **0.4MB(400KB)**;条数未单列(按 ≤10000 推定) | 旧 100KB 字节上限过于保守但方向对 | 6/hour;单 feed ≤350KB 且 ≤2500 条 |
-| RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | 10/day 保守 + **迁移前实测是否仍被接受** |
+| RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | **6/hour**(实际落地值:按 DELETE_ITEM 同档保守;原定稿 10/day 未进代码)+ **迁移前实测是否仍被接受** |
 | MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour |
-| PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | ≤10000 条;建议 1000 条/10MB | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | 6/day 保守沿用(官方页自相矛盾期间不放宽) |
-| price(Legacy) | 10/hour(三件套共享) | 10MB | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
-| inventory | 10/hour | 10MB;≤10000 item/ship node | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
+| PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | 硬限 10000 条;建议 1000 条/<10MB(413 口径官方标 Not applicable) | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | **8/hour**(2026-08-26 三源复核:三处官方一致 10/hour;6/day 确证只挂 feedType=promo 行且本仓无该路径;promo 行内矛盾官方未修,与三件套无关) |
+| price(Legacy) | 10/hour(三件套共享) | 10MB;硬限 10000 条(1000 条/<10MB 是官方 "we recommend" 建议值,2026-08-26 核) | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
+| inventory | 10/hour | 10MB(旧记 ≤10000 item/ship node 无美区官方出处——属 DSV 文档,2026-08-26 降级为自设批次上限) | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
 | MP_INVENTORY(BETA) | 50/hour | 1MB;多 ship node,JSON only | 旧未用;官方未废弃 inventory | 暂不用,盯 BETA 走向 |
-| PUT /v3/price | 100/hour(⚠官方 Deprecation Guide 列"Price management Sunset 2026",需另行核验) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
+| PUT /v3/price | 100/hour(2026-08-26 复核:被弃用的是 Price management **文档族**,端点级零弃用标记、仍列 100/hour;Sunset 栏只有"2026"无月日,按无预告断供防御——断供即改走价格 feed,函数面已双轨) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
 | PUT /v3/inventory | 200/min | — | 一致 | 160/min |
 
 **feed 轮询官方建议节奏**:INPROGRESS 时 15 分钟 → 1 小时 → 2 小时 → 此后每 4 小时;
@@ -161,17 +161,17 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 
 | feedType | header | version(旧系统实测在用) | item 结构 | 切片上限(实践值) |
 |---|---|---|---|---|
-| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260304-22_45_32-api(完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 单店单 feed 打包 |
-| MP_MAINTENANCE | 同上 | 同上 | 同上(Visible 可空) | 1000 条+25MB |
+| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260608-18_15_07-api(2026-08-20 换版,完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 2000 条+24MB(单店打包后按此切片) |
+| MP_MAINTENANCE | 同上 | 同上 | 同上(Visible 可空) | 1000 条+24MB |
 | MP_ITEM_MATCH | MPItemFeedHeader{processMode:REPLACE,subset:EXTERNAL,locale,sellingChannel:mpsetupbymatch,version} | 4.2(sellingChannel 制,与 v5 businessUnit 制不同套) | MPItem[{Item:{}}] | 1000 条 |
 | DELETE_ITEM | ItemFeedHeader{locale,version,businessUnit}(官方示例同名,已核验) | 5.0.20250919-16_45_47-api(**仍是官方现值**) | Item[{Deletable:{sku}}] | 官方 400KB;定稿 350KB+2500 条双约束 |
-| RETIRE_ITEM | RetireItemHeader{feedDate,version} | 1.0(不是 1.5;feedDate 必须真 UTC)⚠官方 guide 已消失,仅存枚举,**迁移前实测** | RetireItem[{sku}] | — |
+| RETIRE_ITEM | RetireItemHeader{feedDate,version} | 1.0(不是 1.5;feedDate 必须真 UTC)⚠官方 guide 已消失,仅存枚举,**迁移前实测** | RetireItem[{sku}] | 1000 条+350KB(按 DELETE_ITEM 同档保守) |
 | PRICE_AND_PROMOTION | MPItemFeedHeader | 2.0.20240126-12_25_52-api(独立版本线) | MPItem[{"Promo&Discount":{sku,price}}] | 10000 条 |
-| price(旧版) | PriceHeader{version} | 1.7 **无外层包装**(加 PriceFeed 包装→ERROR) | Price[{sku,pricing[]}] | 1000 条+10MB(旧代码 25MB **超官方上限**,收紧) |
-| inventory | InventoryHeader{version} | 1.4 **Inventory 首字母大写**(小写→ERR_EXT_DATA_0503009) | Inventory[{sku,quantity}] | 4000 条+10MB(旧代码 25MB **超官方上限**,收紧) |
+| price(旧版) | PriceHeader{version} | 1.7 **无外层包装**(加 PriceFeed 包装→ERROR) | Price[{sku,pricing[]}] | 8000 条+9.5MB(所有者定稿 2026-08-26:官方硬限 10000 条留两成,1000 条只是官方建议值,新鲜度优先——单店整量当轮连发;单条载荷约 130B 字节远不顶 10MB。旧代码 25MB 超官方上限已收紧) |
+| inventory | InventoryHeader{version} | 1.4 **Inventory 首字母大写**(小写→ERR_EXT_DATA_0503009) | Inventory[{sku,quantity}] | 4000 条+9.5MB(官方 10MB 留余量;旧代码 25MB **超官方上限**,收紧) |
 
 version 字符串全部进 registry(不准散落硬编码),且**必须定期核对**:官方版本表约 4-6 周滚动一版(观察值,官方无更新频率承诺),
-旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前推荐 5.0.20260608-18_15_07-api),
+旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前 5.0.20260608-18_15_07-api);**MP_MAINTENANCE 早已切,MP_ITEM 2026-08-20 切**。换版前用 `spec_split -p diff=1` 量过差集:PT 6951→6951 零增零减,Orderable 24→23(仅移除可选的 specProductType),顶层必填有变化的 PT 仅 48 个,**新增必填只有 center_bore、影响 1 个 PT**(轮毂中心孔径,汽车整顶级不做),其余 5 个字段全是「不再必填」。
 仅 DELETE_ITEM 的 5.0.20250919 仍是现值。来源:官方 Item spec versioning and diff reporting 页。
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。
@@ -221,7 +221,7 @@ Phase 0 已移植:token 缓存/每店代理/401 自愈/429 退避/连接池。�
    ——旧系统 rate_limiter 对未知键直接放行,RETIRE_ITEM 实际零限速就是这么漏的。
    自适应:消费 x-current-token-count / X-Next-Replenishment-Time
    (三格式:秒/epoch 毫秒/ISO,旧系统已踩全)。
-2. **raw/binary 响应模式**:safe_get_ex(..., raw=True) 返回 bytes——
+2. **raw/binary 响应模式**:落地成独立函数 safe_get_raw(...) → (status, headers, bytes)(可选 accept 覆盖),预签名 URL 另有 download_bytes(url, proxy);safe_get_ex 没有 raw 参数——
    errorReport CSV、insights xlsx、未来 reports 域全需要;旧系统因为没有这个,
    养出 2 处裸 httpx + 1 套重复退避实现。
 3. **async 变体**:仅 orders 拉取需要(30+ 店并发),做在 api/orders.py 内部
@@ -239,7 +239,8 @@ api/items.py
   list_items(store, *, published_status=None, lifecycle_status=None,
              limit=1000, max_offset=10000) -> (items, truncated)   # 分页模型1
   iter_all_items(store, stats=None, mode="full")
-      # 默认无参即全量(含 RETIRED 兜底轮);mode='fast' 走快档。
+      # mode='fast' = 无参全量 + RETIRED 兜底两轮(catalog_sync 缺省即此档);
+      # mode='full' = 逐状态 5 轮(api 层默认值,轮里仍含 STAGE),对拍/回退用。
       # ⚠ 2026-08-14 勘误:原写 5 轮组合器且列了 STAGE —— STAGE 状态已作废
       # (§3.1/§8.5 的枚举里都没有它),逐状态 5 轮也已按 §4.1 降级为对拍/回退用。
   get_item(store, sku)           # 单查;只作补漏,禁止用于批量拿 PT(旧教训:454 SKU=8min)
@@ -249,22 +250,26 @@ api/items.py
   catalog_search(store, field, value)                               # 本店目录(field=itemId 无效,用 sku)
   get_spec(store, product_types)  # ≤20 PT/批
 api/feeds.py
-  submit_feed(store, feed_type, items, **kw) -> feed_id   # 唯一提交口:schema 分发+切片+
+  submit_feed(store, feed_type, entries, *, workflow="", defer_settle=False)
+      -> [{"feed_id","count","outcome"}] 逐切片结果       # 唯一提交口:schema 分发+切片+
                                                           # sanitize+ops.feed_log 防重+反查三态
   get_feed_status(store, feed_id)                         # 汇总
   iter_feed_items(store, feed_id)                         # 逐 SKU 明细(50/页自动翻)
   get_error_report(store, feed_id) -> bytes               # CSV
-  find_recent_feed(store, feed_type, items_received, time_window)   # 反查
+  find_recent_feed(store, feed_type, items_received, window_minutes=30)   # 反查三态
+  settle_deferred(store, settle)   # defer_settle=True 的延后结算:先反查后补交,最多 3 轮
 api/prices.py
   put_price(store, sku, amount)                           # 单品(100/hour,慎用)
-  # 批量走 feeds.submit_feed(feed_type="price"|"PRICE_AND_PROMOTION")
+  # 批量走 feeds.submit_feed(feed_type="price");PRICE_AND_PROMOTION 尚未收录
+  # (_SLICE_LIMITS 与 FEED_SPEC_VERSIONS 里都没有它,传进去直接 ValueError)
 api/inventory.py
   put_inventory(store, sku, qty)
-  list_inventories(store)                                 # 分页模型4+单品兜底补漏内置
+  list_inventories(store, expected_skus=None) -> {sku: qty}   # 分页模型4;单品兜底(端点 22)只在传 expected_skus 时才跑
   get_inventory(store, sku)
 api/orders.py
-  iter_orders(store, *, last_modified_start, created_start=auto_179d, ...)  # 分页模型2;
-                                                          # 内部 async 并发多店由 services 组织
+  iter_orders(store, *, created_start=None, created_end=None,
+              last_modified_start=None, limit=200, stats=None)  # 分页模型2;
+                                                          # 多店 async 并发在 api 内部:fetch_orders_bulk(stores, ...) 同步门面(§6.3)
 api/returns.py
   iter_returns(store, *, created_start, created_end=None, limit=200)
       # 分页模型3;⚠ created_start 是**必填关键字参数**,时间窗必须成对下发
@@ -311,13 +316,45 @@ api/settings.py
 cursor+offset 翻页模型、DELETE_ITEM 三处同构与容量 2628 条实测、清库存不存在)。
 其中 C1 的严重性因官方枚举无 COMPLETE 而降级为"防御性设计要求"。
 
+### 8.1 补充核验(2026-08-26,「提交 5xx」专题)
+
+起因:2026-08-24/25 连续两晚,20:00 那一轮多家店的 MP_ITEM 提交被边缘 Akamai
+回「Internal Server Error - Read」。查了四页官方(feeds / api-integration-usage /
+rate-limiting / error-codes),四条结论:
+
+1. **请求体 gzip:官方一个字都没提。** 四页均无 `Content-Encoding` / 压缩相关
+   记载。→ **不做**。压缩几 MB 的 JSON 本可以把上传与源站读取时间同时打下来,
+   但写操作靠猜不得:万一半接受半不接受,就是一笔状态不明的提交。
+   要用先向 Partner Support 问明,或在**非破坏性** feedType 上实测。
+2. **5xx 的官方处置是「retry with jitter」,逐条有原文**:
+   `INVALID_SYSTEM_STATE(500)` = "Retry with jitter. If repeated, open a support
+   ticket with examples.";`SYSTEM_ERROR(500)` = "Confirm Content-Type and payload
+   format, then retry with jitter.";`DOWNSTREAM_SYSTEM_TIME_OUT(504)` =
+   "Retry with exponential backoff.";平台可用性节 = "Retry with exponential
+   backoff and jitter."。退避阶梯示例 **2/4/8/16/32 秒**,"Cap retries
+   (for example, 5 attempts)"。
+   ⚠ **抖动是官方明写的要求**。此前 `api/feeds` 只有一个**固定 30 秒**的二次
+   确认,零抖动 —— 一批同时失败的店会在 30 秒后**再次同时**打过去,把洪峰
+   原样复制一遍。已按官方阶梯 + 抖动重写(`feeds._backoff`)。
+3. **429 之后官方要求降速续跑**,不是停:"Sleep until `x-next-replenish-time`,
+   then **resume at a lower rate**"。→ `list_new._AdaptiveGate` 的降档阶梯
+   (24→16→12→8→4,只降不升)与此同源。
+4. **官方明确建议拆分大 feed**(feeds 页原文):"Keep your bulk files small
+   enough to process reliably. **Split very large submissions into multiple
+   feeds.**" —— 而 §5.1 现行策略是 MP_ITEM「单店单 feed 打包」、切片
+   `(2000 条, 24MB)` 贴着官方 25MB 上限。**这是与官方建议相左的一处**,
+   所有者 2026-08-26 暂未采纳切片(先上延后结算 + 降档看效果),
+   留档待议:切片同时能把单次 5xx 的影响面从"整店"降到"一片"。
+
 ### 遗留问题(官方文档查不到,按保守处理并择机实测)
 
 1. RETIRE_ITEM feed 是否仍被接受(guide 已消失、限流表无行、仅存枚举)——迁移 daily_cleanup 前实测。
 2. DELETE_ITEM 删除后同 SKU 能否重建/等待期(仅 1P 文档有"48h 后可重建",非 Marketplace 结论)。
-3. PRICE_AND_PROMOTION 官方页内自相矛盾(主表 10/hour vs promo* 行 6/day)——保守按 6/day 配置。
+3. **已结案**(2026-08-26 三源复核,四代理交叉裁决):价格三件套共享桶三处官方一致 = 10/hour(rate-limiting 页脚注 + update-bulk-prices 页 + update-promotional-pricing 页逐字相同);6/day 只挂 feedType=promo 行(本仓无该路径)。promo 行内矛盾(单元格 6/day vs 脚注共享 10/hour)官方仍未修,但与三件套无关。生产从 6/day 上调为 **8/hour** 留余量;⚠ 将来若引入 feedType=promo 路径,须单独按 6/day 限流,不得并入共享桶计数。
 4. GET /v3/feeds/{id} 明细 limit 50 vs 1000 官方两页矛盾——保守按 50。
-5. **官方 Deprecation Guide 列 "Price management – Sunset 2026"**,未细化端点——
-   迁移 maintenance/价格类工作流前必须单独核验,可能影响 PUT /v3/price 与 PRICE_AND_PROMOTION。
+5. **已核**(2026-08-26):被弃用的是 "Price management" **API 族/文档集**(Status 2025-10-24,
+   Sunset 栏只有光秃秃的"2026",官方至今未给月日;旧 overview 页的 EOL 08-31-2025 已过期一年
+   而端点未下线,属陈旧数据)。PUT /v3/price 端点页零弃用标记、仍列 100/hour,当下可用;
+   但族级迁移可能无预告带走它——防御:断供即改走价格 feed(单品 PUT 与批量 feed 已是双轨显式函数)。
 6. MP_MAINTENANCE 能否改价格/库存无官方明文——以 Get Spec 拉回的 schema 是否含相应字段为准。
 7. 提交过时 spec version 的后果官方未写——registry 登记 + 每次上架季度性核对版本表。

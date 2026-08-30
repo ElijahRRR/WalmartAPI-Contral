@@ -42,10 +42,28 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
         _sheet_row(5, audit_result="reject"),      # 审过了(判拒也是结论)
         _sheet_row(6, asin="", audit_result=""),   # 没 ASIN:不是待审行
     ]
-    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(listing_sheet, "read_rows",
+                        lambda upto=None: rows)
     got = listing_sheet.audit_targets()
     assert [r["rownum"] for r in got] == [2, 3]
     assert got[0]["asin"] and got[0]["store"] == "T1"
+
+
+def test_audit_targets_reads_only_first_five_columns(monkeypatch):
+    """领任务只读 A..E(store/asin/标题/PT/审核结果),不拉 F 之后的理由/
+    回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应 10MB 上限
+    (90221),audit_sheet 整链失败。行方向分块归 api 层。"""
+    asked = []
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_row_count", lambda s: 3)
+    monkeypatch.setattr(
+        listing_sheet.feishu, "sheet_values_rows",
+        lambda s, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            [(2, ["T1", "B0AAAAAAA1", "t", "pt", ""]),
+             (3, ["T1", "B0AAAAAAA2", "t", "pt", "pass"])])[1])
+    got = listing_sheet.audit_targets()
+    assert asked == [("A", "E", 2, 3)]        # 只读前五列,行区间对
+    assert [r["asin"] for r in got] == ["B0AAAAAAA1"]
 
 
 def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
@@ -60,7 +78,8 @@ def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
             _sheet_row(3, audit_result="Pending"),      # 大小写不该决定命运
             _sheet_row(4, audit_result="pass"),
             _sheet_row(5, audit_result="reject")]
-    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(listing_sheet, "read_rows",
+                        lambda upto=None: rows)
     assert [r["rownum"] for r in listing_sheet.audit_targets()] == [2, 3]
     # 而 pass 重新被领 = 已上架的行被反复重审,那是另一头的错
     assert ln.AUDIT_OK == "approved"                    # 上架闸判 PG 英文态
@@ -233,15 +252,95 @@ def test_from_sheet_reuses_the_asins_path(monkeypatch):
     assert "没有待审行" in out and "清空" in out
 
 
+def test_force_drops_the_db_side_predicate_but_not_the_claim_scope(monkeypatch):
+    """⚠ `-p from_sheet=1 -p force=1` 强审:**只改库侧候选谓词,不改领任务口径**。
+
+    所有者 2026-08-21 的原话:「对飞书上架表中需要审核的产品进行强制重审,
+    不是对表格中所有的强制重审,而是**其中还没填写审核结果的**重审」。
+    所以 E 列已填结论的表行一行都不许被捞回来 —— 那是 `audit_targets()` 的事,
+    这个开关碰不到它。
+    """
+    plain, _ = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1"})
+    forced, extra = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1",
+                                    "force": "1"})
+    assert extra["asins"] == ["B0A", "B0B"]
+    # 缺省口径带着"库里没结论才判"的谓词,强审把它整条丢掉
+    assert "audit_status IS NULL" in plain
+    assert "audit_status" not in forced
+    assert forced == "p.asin = ANY(%(asins)s)"
+    # 领任务口径由 audit_targets 决定,与 force 无关 —— 它只认 E 列
+    import inspect
+    src = inspect.getsource(pa._claim_from_sheet)
+    assert "listing_sheet.audit_targets()" in src
+
+
+def test_force_turns_off_the_24h_run_guard():
+    """强审 = 人点名要审,点了就得审 —— 不能被 24 小时复烧护栏挡回去。
+
+    挡回去的后果和 rerule 首版一样:dry-run 稳定报 0 候选,紧跟着真跑翻出
+    几千条,又是一次"dry-run 说没事、真跑吓一跳"。
+    """
+    assert pa._is_forced({"from_sheet": "1", "force": "1"},
+                         {"asins": ["B0A"]}) is True
+    assert pa._is_forced({"from_sheet": "1"}, {"asins": ["B0A"]}) is False
+
+
+def test_force_without_from_sheet_raises_instead_of_being_ignored():
+    """宁炸不吞:`force` 只对 from_sheet 那条路有意义。
+
+    静默忽略的话人以为强审了、实际按缺省口径跑,而摘要长得一模一样。
+    """
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="force=1"):
+        pa._pick_where({"force": "1", "asins": "B0A"})
+
+
+def test_force_summary_states_what_it_will_cost(monkeypatch):
+    """⚠ 强审比缺省贵好几倍,摘要必须把"本轮判几条"写出来。
+
+    不写的话摘要和平时一模一样,人不会意识到这轮把库里已有结论的那批
+    也一起烧了一遍 LLM。
+    """
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": 2, "asin": "B0AAAA0001", "store": "T1"},
+        {"rownum": 3, "asin": "B0BBBB0002", "store": "T1"},
+        {"rownum": 4, "asin": "B0CCCC0003", "store": "T1"},
+    ])
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **k): pass
+        # 3 个 ASIN:2 个库里已有结论、1 个待审
+        def fetchall(self): return [("approved", 1), ("rejected", 1), ("未审", 1)]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self, *a, **k): return _Cur()
+
+    monkeypatch.setattr(pa.db, "pg_conn", lambda *a, **k: _Conn())
+    _, _, head = pa._claim_from_sheet(500, force=True)
+    body = "\n".join(head)
+    assert "本轮进判定引擎 3 个 ASIN" in body      # 2 已有结论 + 1 待审
+    assert "缺省口径只判 1 个" in body
+    assert "一起重判" in body and "直接回填" not in body
+    # 领任务口径没变这句必须在 —— 那是所有者唯一关心的边界
+    assert "E 列已有结论的表行一行都不会被捞回来" in body
+    # 缺省口径下则是老话术
+    _, _, plain = pa._claim_from_sheet(500)
+    assert "**直接回填,不重审**" in "\n".join(plain)
+
+
 # ── ③④ 上架闸:读 PG,不读表 ─────────────────────────────────────────────
 
 def _stub_gates(monkeypatch, rows):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
@@ -394,8 +493,9 @@ def _stub(monkeypatch, states, *, pushed=None, notes=None, calls=None,
         trace.append("prioritize"), True)[1])
     monkeypatch.setattr(pa.scrape_batches, "wait_settled", lambda names, m: (
         trace.append(f"wait{m}"), settle)[1])
-    monkeypatch.setattr(pa, "_ingest_now",
-                        lambda: (trace.append("ingest"), "就地摄取:入库 2 行")[1])
+    monkeypatch.setattr(pa, "_ingest_batches",
+                        lambda names: (trace.append("ingest"),
+                                       "按批摄取:入库 2 行")[1])
     monkeypatch.setattr(pa.scrape_batches, "pull_failures",
                         lambda n, b: ("失败明细", failures or {}))
     monkeypatch.setattr(pa.listing_sheet, "write_audit_notes",
@@ -450,6 +550,19 @@ def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):
     assert notes == []          # 复查后一个都不缺 ⇒ 一行原因都不该写
 
 
+def test_rows_already_in_db_are_not_rescraped(monkeypatch):
+    """在库的待审行**不做**"先刷新再审"(所有者复议定稿 2026-08-19):
+    审核判的是"这个产品卖的是什么",第一次就定性了,改标题/描述不改变它
+    是什么——强刷带来的翻案更大可能是 LLM 随机性。缺口为空 ⇒ 零采集调用。
+    (上架链相反:必须先刷新,那边写的是真金白银的价格库存。)"""
+    have_all = [("B0GONE0001", False), ("B0HAVE0001", False),
+                ("B0THIN0001", False)]
+    calls = _stub(monkeypatch, [have_all, have_all], pushed=[], notes=[],
+                  calls=[])
+    pa._close_gap(_WANT, _ROWS, True, 20)
+    assert calls == []                       # 不推不等不摄取
+
+
 def test_gap_wait_zero_pushes_without_waiting(monkeypatch):
     """gap_wait=0 = 只推不等(采集侧病了时的退路),而且必须明说这一轮不等。"""
     calls = _stub(monkeypatch, [_BEFORE, _BEFORE], pushed=[], notes=[],
@@ -483,29 +596,19 @@ def test_scraper_outage_still_records_the_reason(monkeypatch):
     assert dict(notes)[3]                    # 理由照写
 
 
-def test_ingest_borrows_product_ingest_lock(monkeypatch):
-    """⚠ 借 product_ingest 的活就得借它的锁:两个进程同推增量游标,
-    后写的盖掉先写的,中间那段记录永远不会再被拉一次 —— 两侧都不报错。"""
+def test_ingest_pulls_only_own_batches_without_lock(monkeypatch):
+    """就地摄取只拉本轮自己推的那几批(批次端点,批内游标),不碰全局游标
+    也不借 product_ingest 的锁 —— 2026-08-19 起的形态,锁冲突从根上消失。"""
     import inspect
-    src = inspect.getsource(pa._ingest_now)
-    assert "runlock.hold(product_ingest.CURSOR_NAME)" in src
-    assert "if not got" in src               # 拿不到锁 = 跳过,不是失败
-    held = []
-    monkeypatch.setattr(pa.runlock, "hold",
-                        lambda n: (held.append(n), _NullCtx(False))[1])
-    assert "product_ingest 正在跑" in pa._ingest_now()
-    assert held == ["product_ingest"]
-
-
-class _NullCtx:
-    def __init__(self, got):
-        self._got = got
-
-    def __enter__(self):
-        return self._got
-
-    def __exit__(self, *a):
-        return False
+    src = inspect.getsource(pa._ingest_batches)
+    assert "pump_batches" in src
+    assert "runlock" not in src              # 无锁:批内游标互不相干
+    seen = []
+    monkeypatch.setattr(pa.product_ingest, "pump_batches",
+                        lambda sc, d, names, **kw: (seen.append(list(names)),
+                                                    ([], "按批摄取:0 批"))[1])
+    assert "按批摄取" in pa._ingest_batches(["audit_gap_x"])
+    assert seen == [["audit_gap_x"]]
 
 
 def test_dry_run_pushes_nothing_and_writes_nothing(monkeypatch):
@@ -602,3 +705,29 @@ def test_gap_batch_jumps_the_queue_and_says_so_when_it_cannot(monkeypatch):
     monkeypatch.setattr(pa.scrape_batches, "prioritize", lambda n, b: False)
     out2 = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
     assert "插队没成功" in out2 and "可能等不到" in out2
+
+
+def test_repts_takes_candidates_by_judgement_change_not_by_version():
+    """⚠ `-p repts=1` **不看 `audit_version`** —— 那正是它存在的理由。
+
+    `rerule` / `mode=nonpass` 的候选谓词都带
+    `audit_version IS DISTINCT FROM <当前版本>`(天然分页),而**飞书数据变了
+    不会递增仓库侧的规则版本号**。所有者 2026-08-21 手改类目表后实遇:全量扫过
+    一遍之后库里每条都盖着当前版本,两条通道双双报「共 0 个」,没有任何现成
+    路径能重判受影响的存量。
+    """
+    where, extra = pa._pick_where({"repts": "1"})
+    assert extra == {}
+    assert "audit_version" not in where            # ← 这条是全部要点
+    assert "pt_meta_change_log" in where
+    # 锚在时间上:判过的 audited_at 会推到变更之后,自动退出候选(分页照样有)
+    assert "c.changed_at > p.audited_at" in where
+    # 只翻**现结论 rejected** 的;从没审过的归 mode=backfill,混进来会把
+    # "补刷"和"翻案"两件事的数搅在一起
+    assert "p.audit_status = 'rejected'" in where
+    assert "p.audited_at IS NOT NULL" in where
+
+
+def test_repts_is_a_named_human_action_so_it_skips_the_24h_guard():
+    """与 rerule / force 同类:人点名要审的,点了就得审。"""
+    assert pa._is_forced({"repts": "1"}, {}) is True

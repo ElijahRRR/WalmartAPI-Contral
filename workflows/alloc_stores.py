@@ -84,7 +84,7 @@ def run(params: dict) -> str:
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 限额表读不到({e}):没有目标与容量就算不出缺口与配额"
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝出表"
 
@@ -111,6 +111,10 @@ def run(params: dict) -> str:
             "效率倍数": qq.get("eff"),
             "日均订单": m.get("daily_orders"),
             "当前在线": online_now.get(s, 0),
+            # 准入品类跟着经营水平一起给:看「这家店还能吃多少货」的时候,
+            # 紧接着的问题一定是"能吃哪类货" —— 分两张表看等于让人自己去 join
+            "准入品类(五大类)": "|".join(
+                sorted(store_targets.super_categories_of(cfg.get(s)))) or "(不限)",
             "容量上限": (cfg.get(s) or {}).get("max_online"),
             "剩余容量": qq.get("room_now"),
             "历史期占比": m.get("hist_share", 0.0),

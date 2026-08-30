@@ -101,7 +101,9 @@ def test_non_transient_error_raises():
     assert ei.value.code == 1254045
 
 
-def test_batch_create_chunks_at_500():
+def test_batch_create_chunks_at_registry_limit():
+    """切块取限额登记表 _BITABLE_BATCH_CREATE_MAX(官方 1000 条 ×95% = 950),
+    不是随手写的 500。"""
     batches = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -115,7 +117,8 @@ def test_batch_create_chunks_at_500():
 
     _use_handler(handler)
     ids = feishu.batch_create(TABLE, [{"字段A": i} for i in range(1200)])
-    assert batches == [500, 500, 200]
+    assert batches == [feishu._BITABLE_BATCH_CREATE_MAX,
+                       1200 - feishu._BITABLE_BATCH_CREATE_MAX] == [950, 250]
     assert len(ids) == 1200
 
 
@@ -167,7 +170,7 @@ def test_sheet_write_ranges_splits_big_range_and_scrubs(monkeypatch):
                         lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
     sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID",
                         columns=("a", "b"))
-    monkeypatch.setattr(feishu, "_SHEET_WRITE_BLOCK_ROWS", 2)
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_MAX_ROWS", 2)
     rows = [["v%d" % i, "x\x00y"] for i in range(5)]
     n = feishu.sheet_write_ranges(sheet, [("A11:B15", rows)])
     ranges = [vr["range"] for body in sent for vr in body["valueRanges"]]
@@ -274,3 +277,150 @@ def test_sheet_writes_serialize_per_spreadsheet(monkeypatch):
         list(ex.map(lambda s: feishu.sheet_write_ranges(s, [("A2:A2", [["v"]])]),
                     others))
     assert len(met_diff) == 4, f"不同表格之间互相挡住了({len(met_diff)}/4 会合)"
+
+
+# ── 电子表格写锁的取法(2026-08-17 实验反证)────────────────────────────────
+
+def test_sheet_lock_is_not_a_defaultdict_of_rlock():
+    """⚠ `defaultdict(threading.RLock)` 会给同一个 key 发出**两把不同的锁**。
+
+    `threading.RLock` 是 **Python 函数**(threading.py 里挑 _CRLock/_PyRLock 的
+    那个包装),所以 `defaultdict.__missing__` 调它时会执行 Python 字节码 ⇒
+    eval breaker 可能触发 ⇒ 线程切换 ⇒ 两个线程各造一把,只有一把落进字典,
+    **落空的那个线程拿着一把没人认的锁**。实测 64 线程同时首次取同一 key,
+    拿到 2 个不同的锁对象。
+
+    而这正是这把锁存在的那个场景(24 个店铺线程同时第一次写同一张表),
+    故障表现恰好就是它要防的那件事:一阵 90227 限流。
+
+    `dict.setdefault` 是 C 实现、原子 —— 多造出来的 RLock 直接被 GC。
+    ⚠ 对照:`_table_locks` 用的 `threading.Lock` 是 `_thread.allocate_lock`
+    (**C 工厂**,不执行 Python 字节码),那处 defaultdict 是安全的,别一起改。
+    """
+    import inspect
+    import threading
+    from collections import defaultdict
+    # 前提复核:RLock 是 Python 函数、Lock 不是。哪天 CPython 把 RLock 换成
+    # 纯 C 工厂,这条会红 —— 那时这个用例的理由消失了,可以连同 _sheet_lock 一起简化
+    assert inspect.isfunction(threading.RLock)
+    assert not inspect.isfunction(threading.Lock)
+
+    assert isinstance(feishu._sheet_locks, dict)
+    assert not isinstance(feishu._sheet_locks, defaultdict)
+    src = inspect.getsource(feishu._sheet_lock)
+    assert "setdefault" in src
+    # 同一 token 恒为同一把;不同 token 各自一把
+    a = feishu._sheet_lock("tok-A")
+    assert feishu._sheet_lock("tok-A") is a
+    assert feishu._sheet_lock("tok-B") is not a
+    # 必须可重入:sheet_overwrite 内部还会调 sheet_ensure_rows(同一把锁)
+    with a:
+        with a:
+            pass
+
+
+def test_every_sheet_write_goes_through_the_lock():
+    """四个写函数都得裹锁 —— 漏一个就是那张表的节流被跨店线程池整体绕过。"""
+    import inspect
+    for fn in (feishu.sheet_ensure_rows, feishu.sheet_write_ranges,
+               feishu.sheet_overwrite, feishu.sheet_set_formatter):
+        src = inspect.getsource(fn)
+        assert "_sheet_lock(" in src, fn.__name__
+        # 别退回下标取法(那就又是 defaultdict 的坑)
+        assert "_sheet_locks[" not in src, fn.__name__
+
+
+def test_write_ranges_caps_rows_per_request(monkeypatch):
+    """⚠ 2026-08-18 生产事故:audit_sheet 回填 28,498 行 × C:G,粘段后
+    8 个 4000 行段被塞进**同一个** values_batch_update,飞书 90227
+    (request too large)整批拒收。
+
+    每请求的行预算 = _SHEET_WRITE_MAX_ROWS(官方 5000 行 ×95% = 4750;
+    事故当时是旧值 4000)。这里把行预算缩小到 4 行来演同一形状:
+    18 个连号单行段 → 粘成一段 → 切成 5 个 ≤4 行的子段 → 必须发 5 个请求,
+    每个请求 ≤4 行,而不是 5 段合一个请求。
+    """
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_MAX_ROWS", 4)
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_THROTTLE_SECS", 0)
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID",
+                        columns=("a", "b"))
+    ups = [(f"C{r}:G{r}", [[f"v{r}"] * 5]) for r in range(2, 20)]   # 18 行连号
+    n = feishu.sheet_write_ranges(sheet, ups)
+    assert n == 18
+    rows_per_req = [sum(len(vr["values"]) for vr in body["valueRanges"])
+                    for body in sent]
+    assert len(sent) == 5                       # 4+4+4+4+2,不是一锅端
+    assert all(r <= 4 for r in rows_per_req), rows_per_req
+    # 顺序与覆盖语义不变:拼回去仍是 v2..v19
+    flat = [row[0] for body in sent for vr in body["valueRanges"]
+            for row in vr["values"]]
+    assert flat == [f"v{r}" for r in range(2, 20)]
+
+
+def test_write_ranges_still_caps_100_ranges_per_request(monkeypatch):
+    """不连号的小段照旧受「≤100 范围/请求」约束(_SHEET_RANGES_PER_REQUEST;
+    ⚠ 这条是**工程值不是官方限额** —— 2026-08-27 调研结论「valueRanges 数组
+    长度上限官方未说明」,沿用现行 100),行预算不该反过来把这条放宽。
+    120 个互不相邻的单行段 → 2 个请求。"""
+    sent = []
+    monkeypatch.setattr(feishu, "_call",
+                        lambda m, p, **kw: sent.append(kw.get("json_body")) or {})
+    monkeypatch.setattr(feishu, "_SHEET_WRITE_THROTTLE_SECS", 0)
+    sheet = Spreadsheet(name="X", token="TOK", sheet_id="SID", columns=("a",))
+    ups = [(f"A{r}:A{r}", [["v"]]) for r in range(2, 242, 2)]   # 120 段,行号隔一
+    n = feishu.sheet_write_ranges(sheet, ups)
+    assert n == 120
+    assert [len(b["valueRanges"]) for b in sent] == [100, 20]
+
+
+# ── 分块读(sheet_values_rows):单响应 10MB 上限的解法 ─────────────────────────
+
+def _rows_sheet():
+    return Spreadsheet(name="X", token="TOK", sheet_id="SID", columns=("a",))
+
+
+def test_values_rows_blocks_and_keeps_rownums(monkeypatch):
+    """行方向分块拼接,行号按块首偏移——飞书裁掉块尾空行也不许错位。"""
+    asked = []
+
+    def fake_values(sheet, rng):
+        asked.append(rng)
+        # A2:C6 返回 5 行;A7:C11 只回 3 行(尾部两行为空被飞书裁掉)
+        if rng == "A2:C6":
+            return [[f"r{i}"] for i in range(2, 7)]
+        return [[f"r{i}"] for i in range(7, 10)]
+    monkeypatch.setattr(feishu, "_values_raw", fake_values)
+    out = feishu.sheet_values_rows(_rows_sheet(), "A", "C", 2, 11,
+                                   block_rows=5)
+    assert asked == ["A2:C6", "A7:C11"]
+    assert [(n, r[0]) for n, r in out] == [(i, f"r{i}") for i in range(2, 10)]
+
+
+def test_values_rows_halves_on_90221(monkeypatch):
+    """单块仍超 10MB(90221)→ 对半再切,数据一行不丢;其他错误照抛。
+
+    2026-08-19 生产实证:上架表 21 列全量一把读撞 90221,audit_sheet 整链
+    失败——分块 + 对半兜底后同一张表怎么长都读得完。
+    """
+    asked = []
+
+    def fake_values(sheet, rng):
+        asked.append(rng)
+        if rng == "A2:U9":                    # 整块太大
+            raise feishu.FeishuError(90221, "data exceeded 10485760 bytes")
+        lo, hi = rng[1:].split(":U")
+        return [[f"r{i}"] for i in range(int(lo), int(hi) + 1)]
+    monkeypatch.setattr(feishu, "_values_raw", fake_values)
+    out = feishu.sheet_values_rows(_rows_sheet(), "A", "U", 2, 9,
+                                   block_rows=8)
+    assert asked == ["A2:U9", "A2:U5", "A6:U9"]      # 对半各读一次
+    assert [n for n, _ in out] == list(range(2, 10))  # 一行不丢
+
+    def always_401(sheet, rng):
+        raise feishu.FeishuError(401, "auth")
+    monkeypatch.setattr(feishu, "_values_raw", always_401)
+    with pytest.raises(feishu.FeishuError):           # 只兜 90221,不当 catch-all
+        feishu.sheet_values_rows(_rows_sheet(), "A", "U", 2, 9)

@@ -1,0 +1,145 @@
+"""category_blacklist_import — 类目黑名单规则录入(种子 / 离线 CSV)。
+
+用法:
+  python cli.py category_blacklist_import -p csv=<路径>              # 灌规则表
+  python cli.py category_blacklist_import -p csv=<路径> -p replace=1  # 先清同源旧行
+
+⚠ **2026-08-20 起飞书「黑名单亚马逊类目」表是这张库表的唯一维护面**
+(所有者定稿:「我把 233 条整个粘贴进飞书表格,你让黑名单中心按实际的读取」)。
+`risk_sync` 是整表镜像,**下一次同步会把本工作流灌进去的行一并覆盖**。
+所以本工作流的定位收窄成:首次灌种 / 飞书不可用时的应急录入 / 离线核对。
+日常增删类目 = 改飞书表,跑 risk_sync。
+
+CSV 列(与清洗表同构,多余列忽略):
+  类目               归一化路径或官方路径(写进 category_norm/category_raw)
+  browse_node_id     子树规则的判据
+  中文翻译           category_zh
+  建议               只有 `留-*` / `增-*` 开头的行才录入;`删-*` 一律跳过
+  原因               reason
+  匹配方式           **`子树` / `顶级名` / `路径等值` / 其它值一律跳过**
+
+行解析走 `services.category_blacklist.make_rule`,与 risk_sync 读飞书**共用同一件**
+—— 同一行在两条路径上必须录出一模一样的规则,否则"离线核对过了"就没有意义。
+"""
+
+import csv
+import logging
+
+from registry import db
+from services import category_blacklist as cb
+
+DANGEROUS = False       # 只写 catalog.amazon_cat_blacklist 一张表
+
+logger = logging.getLogger("workflows.category_blacklist_import")
+
+_SOURCE = "cleanup"     # 本工作流写入的行统一打这个来源,risk_sync 不碰
+
+_SQL_UPSERT = """
+INSERT INTO catalog.amazon_cat_blacklist
+    (category_norm, category_raw, match_type, match_value, browse_node_id,
+     category_zh, reason, walmart_policy, enabled, source, synced_at)
+VALUES (%(norm)s, %(raw)s, %(mt)s, %(mv)s, %(nid)s, %(zh)s, %(reason)s,
+        %(policy)s, true, %(source)s, now())
+ON CONFLICT (category_norm) DO UPDATE SET
+    category_raw = EXCLUDED.category_raw, match_type = EXCLUDED.match_type,
+    match_value = EXCLUDED.match_value, browse_node_id = EXCLUDED.browse_node_id,
+    category_zh = EXCLUDED.category_zh, reason = EXCLUDED.reason,
+    walmart_policy = EXCLUDED.walmart_policy, enabled = true,
+    source = EXCLUDED.source, synced_at = now()
+"""
+
+
+def _csv_rows(path: str) -> tuple[list[dict], dict]:
+    from services.audit_phase0 import normalize_amazon_category as norm
+    out, n = [], {"读入": 0, "跳过-删": 0, "跳过-无建议": 0, "跳过-匹配方式": 0,
+                  "子树": 0, "顶级名": 0, "路径等值": 0, "无匹配方式列-按ID推断": 0}
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f)
+        # 「建议」是**清洗表**才有的列(留/删由人判);飞书那张五列规则表没有
+        # 这一列,里面每一行都是已定稿的规则。整列不存在 ⇒ 不设这道闸,
+        # 否则同一份文件"能粘飞书却导不进库",两条路径就对不上了。
+        has_advice = "建议" in (rd.fieldnames or [])
+        for row in rd:
+            n["读入"] += 1
+            if has_advice:
+                advice = (row.get("建议") or "").strip()
+                if not advice:
+                    n["跳过-无建议"] += 1
+                    continue
+                if advice.startswith("删"):
+                    n["跳过-删"] += 1
+                    continue
+            cat = (row.get("类目") or "").strip()
+            if not cat:
+                continue
+            rule, note = cb.make_rule(
+                cat, browse_node_id=row.get("browse_node_id") or "",
+                category_zh=row.get("中文翻译") or "",
+                match_type=row.get("匹配方式") or "",
+                reason=(row.get("原因") or row.get("分析结果") or ""),
+                raw_path=row.get("官方完整路径") or "", source=_SOURCE)
+            if not rule:
+                n["跳过-匹配方式"] += 1
+                continue
+            if note:
+                n["无匹配方式列-按ID推断"] += 1
+            n[{cb.MATCH_NODE: "子树", cb.MATCH_TOP: "顶级名",
+               cb.MATCH_PATH: "路径等值"}[rule["mt"]]] += 1
+            out.append(rule)
+    return out, n
+
+
+def run(params: dict) -> str:
+    """输入:params(csv/replace/execute)→ 输出:写入摘要。"""
+    # ⚠ DANGEROUS=False ⇒ cli 恒给 execute=True(缺省即真跑),`--dry-run`
+    # 只走 dry_run 这一路;只看 execute 的话本工作流的 --dry-run 完全失效
+    execute = bool(params.get("execute")) and not params.get("dry_run")
+    replace = str(params.get("replace", "")).strip() == "1"
+    rows: list[dict] = []
+    lines: list[str] = []
+
+    path = str(params.get("csv", "")).strip()
+    if path:
+        got, n = _csv_rows(path)
+        rows += got
+        lines.append(f"CSV {path}:读入 {n['读入']} 行 → 录入 {len(got)} "
+                     f"(子树 {n['子树']} / 顶级名 {n['顶级名']} / "
+                     f"路径等值 {n['路径等值']});"
+                     f"跳过:建议为删 {n['跳过-删']}、无建议 {n['跳过-无建议']}、"
+                     f"匹配方式非录入 {n['跳过-匹配方式']}")
+        if n["无匹配方式列-按ID推断"]:
+            lines.append(f"  ⚠ 有 {n['无匹配方式列-按ID推断']} 行没有「匹配方式」列,"
+                         f"退回按 ID 推断子树 —— 回落匹配来的 ID 会整棵误拦,核一遍")
+    if not rows:
+        return "没给数据源:用 -p csv=<规则表路径>"
+
+    # 同一 category_norm 只留最后一条(CSV 里父子同名极少,但要有确定行为)
+    dedup = {r["norm"]: r for r in rows if r["norm"]}
+    rows = list(dedup.values())
+    n_node = sum(1 for r in rows if r["mt"] == cb.MATCH_NODE)
+    n_top = sum(1 for r in rows if r["mt"] == cb.MATCH_TOP)
+    lines.append(f"去重后 {len(rows)} 条:子树 {n_node} / 顶级 {n_top} / "
+                 f"路径等值 {len(rows) - n_node - n_top}")
+
+    if not execute:
+        for r in rows[:8]:
+            lines.append(f"  [DRY-RUN] {r['mt']:<12} {r['mv'][:56]}")
+        if len(rows) > 8:
+            lines.append(f"  …另有 {len(rows) - 8} 条")
+        return "\n".join(lines + ["(dry-run:一行未写)"])
+
+    with db.pg_conn() as conn:
+        if replace:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM catalog.amazon_cat_blacklist "
+                            "WHERE source = ANY(%s)", ([_SOURCE],))
+                n_del = cur.rowcount or 0
+            lines.append(f"重录模式:先清掉同源旧行 {n_del} 条"
+                         f"(飞书镜像的 source='feishu' 行**不动**)")
+        with conn.cursor() as cur:
+            cur.executemany(_SQL_UPSERT, rows)
+        conn.commit()
+        rules = cb.load(conn)
+    lines.append(f"写入完成;当前生效规则:子树 {len(rules.nodes)} / "
+                 f"顶级 {len(rules.tops)} / 路径等值 {len(rules.paths)}")
+    return "\n".join(lines)

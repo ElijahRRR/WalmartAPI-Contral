@@ -83,6 +83,70 @@ def test_export_limit_guard(monkeypatch):
         scraper.export_incremental(0, limit=1001)
 
 
+# ── api/scraper.export_batch_records:批次端点状态码分流(契约 §4.11)────────
+
+def test_batch_export_ok_carries_meta(monkeypatch):
+    """200:records/next_cursor/has_more 同增量端点,meta 透传 coverage 等。"""
+    _patch_http(monkeypatch, [(200, {
+        "contract_version": 1, "records": [{"asin": "B0A"}],
+        "next_cursor": 34567, "has_more": False,
+        "batch": {"id": 12, "name": "wm-audit-x", "status": "completed"},
+        "coverage": {"asin_total": 500, "asin_with_event": 498},
+        "retention_min_cursor": 676, "max_cursor": 34567})])
+    records, nxt, more, meta = scraper.export_batch_records("wm-audit-x")
+    assert records == [{"asin": "B0A"}] and nxt == 34567 and more is False
+    assert meta["coverage"] == {"asin_total": 500, "asin_with_event": 498}
+    assert meta["batch"]["status"] == "completed"
+
+
+def test_batch_export_404_batch_not_found_is_terminal(monkeypatch):
+    """本端点的 404 唯一含义:批次名不存在 → LookupError,不重试。"""
+    calls = _patch_http(monkeypatch,
+                        [(404, {"error": "batch_not_found",
+                                "detail": "批次不存在: wm-audit-x"})])
+    with pytest.raises(LookupError, match="批次不存在"):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+
+def test_batch_export_alien_404_is_not_batch_gone(monkeypatch):
+    """长得不像 batch_not_found 的 404(采集侧还是旧版本、端点没挂)→
+    按瞬时故障重试报错,**绝不当「批次没了」**——那会让调用方把一批
+    要得回来的数据判成要不回来。"""
+    monkeypatch.setattr(scraper.time, "sleep", lambda s: None)
+    _patch_http(monkeypatch, [(404, {"detail": "Not Found"})])
+    with pytest.raises(RuntimeError, match="未部署"):
+        scraper.export_batch_records("wm-audit-x", max_retries=2)
+
+
+def test_batch_export_terminal_codes_do_not_retry(monkeypatch):
+    calls = _patch_http(monkeypatch, [(401, {"error": "invalid_export_token"})])
+    with pytest.raises(scraper.ExportAuthError):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+    calls = _patch_http(monkeypatch, [(422, {"error": "invalid_parameter"})])
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("wm-audit-x")
+    assert calls["n"] == 1
+
+    monkeypatch.setenv("SCRAPER_BASE_URL", "http://127.0.0.1:8899")
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("wm-audit-x", limit=1001)
+    with pytest.raises(ValueError):
+        scraper.export_batch_records("")
+
+
+def test_batch_export_503_retries_then_succeeds(monkeypatch):
+    """503(事件流暂不可用)是瞬时故障:退避重试,好了就正常返回。"""
+    monkeypatch.setattr(scraper.time, "sleep", lambda s: None)
+    calls = _patch_http(monkeypatch, [
+        (503, {"error": "event_stream_unavailable"}),
+        (200, {"records": [], "next_cursor": 0, "has_more": False})])
+    records, _nxt, more, _meta = scraper.export_batch_records("wm-audit-x")
+    assert records == [] and more is False and calls["n"] == 2
+
+
 # ── services/product_ingest:三条硬规则 ──────────────────────────────────
 
 class _FakeCur:
@@ -230,7 +294,35 @@ def test_fetch_products_carries_true_values(monkeypatch):
     # 配送方式来自 raw.is_fba,归一化大写;采不到就是 None(调用方不许猜)
     assert out["B0A"]["channel"] == "FBA" and out["B0B"]["channel"] == "FBM"
     assert out["B0C"]["channel"] is None
+    # 定制品标记:这批行都没带 → 一律 False(未采到=不算定制,命中才拦)
+    assert all(out[a]["is_custom"] is False for a in out)
     assert amz_source.fetch_products([]) == {}
+
+
+def test_is_custom_only_on_explicit_truthy():
+    """定制判据(2026-08-28 定稿):**明确真值才算定制**。
+
+    键名唯一出处 registry.AMZ_CUSTOM_FLAG_KEY;身份层 slow 优先、raw 兜底
+    (raw 顶层与 raw.slow 都认,_rawget 同款)。未采到/假值/怪形态一律放行
+    ——错杀一个正常品是白丢一次上架机会,漏掉一个定制品有维护链兜着。"""
+    from registry import resources
+    key = resources.AMZ_CUSTOM_FLAG_KEY
+    assert key == "is_customized"       # 生产探针核实 2026-08-28(122 万行,Yes/No)
+    # 生产实际值形态:Yes/No 字符串
+    assert amz_source._is_custom({key: "Yes"}, None) is True
+    assert amz_source._is_custom({key: "No"}, None) is False
+    assert amz_source._is_custom({key: True}, None) is True
+    assert amz_source._is_custom({key: "true"}, None) is True
+    assert amz_source._is_custom({key: "1"}, None) is True
+    assert amz_source._is_custom({}, {key: "yes"}) is True          # raw 顶层
+    assert amz_source._is_custom({}, {"slow": {key: "Y"}}) is True  # raw.slow
+    assert amz_source._is_custom({key: False}, None) is False
+    assert amz_source._is_custom({key: "false"}, None) is False
+    assert amz_source._is_custom({key: "0"}, None) is False
+    assert amz_source._is_custom({}, None) is False                 # 没采到
+    assert amz_source._is_custom({}, {"slow": {}}) is False
+    # 身份层优先:slow 说不是,raw 说是 → 以身份层为准
+    assert amz_source._is_custom({key: "false"}, {key: "true"}) is False
 
 
 def test_list_new_stock_three_way(monkeypatch):
@@ -262,11 +354,11 @@ def test_list_new_stock_three_way(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: (
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln, "_load_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)

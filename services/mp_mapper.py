@@ -65,22 +65,44 @@ def clamp(text, limit: int, ellipsis: bool = False) -> str:
 
 
 def sort_images(urls: list) -> list[str]:
-    """保序去重(2026-08-12 旧仓对照纠正):旧系统保持亚马逊原序,
+    """输入:图片 URL list → 输出:保序去重后的 URL list(第一张即主图)。
+
+    保序去重(2026-08-12 旧仓对照纠正):旧系统保持亚马逊原序,
     mainImageUrl=原序第一张=亚马逊主图。此前的字典序排序会把主图换成
-    URL 最小的那张;来源真被 set() 打乱时保序也不比排序差。"""
+    URL 最小的那张;来源真被 set() 打乱时保序也不比排序差。
+    """
     return list(dict.fromkeys(str(u) for u in urls or [] if u))
 
 
-def apply_images(attrs: dict, urls: list) -> dict:
-    """输入:Visible 属性 + 图片 URL → 输出:写好图片字段的属性。"""
+def secondary_min(spec: dict | None) -> int:
+    """输入:PT spec → 输出:副图下限(该 PT 的 minItems;没写按 1)。
+
+    **唯一出处**:apply_images 与素材闸(material_gap)问同一个数,
+    否则又是"一处写死一处读表"。没有 minItems 时按 1:字段有值就比没有强。
+    """
+    return int((((spec or {}).get("properties") or {})
+                .get("productSecondaryImageURL") or {}).get("minItems") or 1)
+
+
+def apply_images(attrs: dict, urls: list, spec: dict | None = None) -> dict:
+    """输入:Visible 属性 + 图片 URL(+该 PT 的 spec)→ 输出:写好图片字段的属性。
+
+    ⚠ 副图下限**按该 PT 的 minItems 取,不写死**(2026-08-22 生产实证):
+    在用的 62 个 PT 里副图 minItems 是 1/2/3/4,**一个 5 都没有**;写死 5
+    的那版把 34/112 条**素材完全够**的行删成"必填缺失"——字段被 pop 掉,
+    而它在那些 PT 里是必填,于是本地 validate 必拒。与 keyFeatures 当年
+    写死 4 是同一个坑(见 force_amazon_copy 头注),这次一并按 spec 取。
+    """
     imgs = sort_images(urls)
     if not imgs:
         return attrs
     attrs["mainImageUrl"] = imgs[0]
     secondary = imgs[1:9]
-    if len(secondary) >= 5:      # schema minItems=5:不足整个字段不写
+    if len(secondary) >= secondary_min(spec):
         attrs["productSecondaryImageURL"] = secondary
     else:
+        # 不足该 PT 的 minItems:整个字段不写(必填的话由 validate 拦下,
+        # 选填的话少一个字段照样能上)
         attrs.pop("productSecondaryImageURL", None)
     return attrs
 
@@ -111,40 +133,78 @@ def scrub_brand(text: str, brands: list[str]) -> str:
     return re.sub(r"\s+([,.;:])", r"\1", out)
 
 
+# HTML 标签(采集侧的 description 有一部分是详情页原样 HTML)。
+# ⚠ 不剥的话标签会**原样进 keyFeatures / shortDescription 发到线上**:
+# 2026-08-22 实证有 `<p>…</p><ul><li>…` 整段被当成一条卖点(那次因为只凑出
+# 1 条被拦下,卖点本来就有 2 条的行就直接发出去了)。
+_HTML_TAG = re.compile(r"<[^<>]{0,200}>")
+
+
 def _clean_copy(value, brands: list[str]) -> str:
-    """输入:原始文案 → 输出:去品牌 + 去项目符号 + 折叠空白后的单行文本。"""
+    """输入:原始文案 → 输出:去品牌 + 去标签 + 去项目符号 + 折叠空白的单行文本。"""
     if value is None:
         return ""
     text = scrub_brand(str(value), brands).strip()
+    text = _HTML_TAG.sub(" ", text)
     text = re.sub(r"[•·▪▫]+", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _sentences(text: str, brands: list[str]) -> list[str]:
-    """输入:长文本 → 输出:可当卖点用的句子(≥25 字符;句号切不动就按长度切)。"""
+def _sentences(text: str, brands: list[str], want: int = 4) -> list[str]:
+    """输入:长文本(+想要几条)→ 输出:可当卖点用的句子(≥25 字符)。
+
+    `want` 只影响**切不动时**的按长度切块:块长按 `len/want` 自适应并夹在
+    60~200 字符之间。写死 120 的那版对 200 字左右的描述只切得出 2 条,
+    而 keyFeatures 的门槛是 3~4 条 —— 差一条和差十条一样上不了架。
+    """
     text = _clean_copy(text, brands)
     if not text:
         return []
     # 英文标点要求后随空白(防 "12.5 in" 被切开);中日文标点自带停顿,不要求
-    parts = [p.strip() for p in re.split(r"(?:\n+|[.;!?]\s+|[。;!?、])", text)
-             if len(p.strip()) >= 25]
-    if parts:
+    raw = [p.strip() for p in re.split(r"(?:\n+|[.;!?]\s+|[。;!?、])", text)
+           if len(p.strip()) >= 10]
+    parts = [p for p in raw if len(p) >= 25]     # 够长的句子优先
+    if len(parts) >= max(2, int(want or 4)):
         return parts
+    if len(raw) >= max(2, int(want or 4)):
+        # 长句不够条数,把 10~25 字符的短句按原序掺回来:
+        # "Rust proof." 这种是**真句子**,当卖点比按长度硬切的半截强
+        return raw
+    if len(parts) >= 2:
+        return parts
+    # ⚠ 只切出**一段** = 这段文本没有句读(规格表折行 / HTML / 中文连写),
+    # 必须往下走按长度切块。旧版这里写的是 `if parts: return parts` ——
+    # 整段原样返回、切块兜底成了死代码,于是再长的描述也只补得出一条,
+    # keyFeatures 的 3 条门槛永远过不去(2026-08-22 实证 11/112 行栽在这)。
     words = text.split()
-    if len(words) >= 24:
+    want = max(2, int(want or 4))
+    size = min(200, max(40, len(text) // want))   # 自适应块长(下限 40 字符)
+    # 闸改成"够不够切出两块"(旧版是词数 ≥24):一段 139 字符的详情页文案
+    # 只有 23 个词,旧闸不放行 → 整段原样成一条 → 3 条的门槛差一条过不去。
+    # 无空格文本(中文连写)split 后只有一个词,下面自然只出一块,不硬切字符。
+    if len(text) >= size * 2:
+        cap = max(4, want)
         chunks, cur = [], []
         for w in words:
             cur.append(w)
-            if len(" ".join(cur)) >= 120:
+            if len(" ".join(cur)) >= size:
                 chunks.append(" ".join(cur))
                 cur = []
-                if len(chunks) >= 4:
+                if len(chunks) >= cap:
                     break
-        if cur and len(chunks) < 4:
-            chunks.append(" ".join(cur))
+        tail = " ".join(cur)
+        if tail:
+            # 尾巴够长才单独成条;太短就并回上一块 —— 8 个字符的碎片当卖点
+            # 发上线是内容事故,而 Walmart 不会因为"短"报错
+            if len(tail) >= 25 and len(chunks) < cap:
+                chunks.append(tail)
+            elif chunks:
+                chunks[-1] = f"{chunks[-1]} {tail}"
+            else:
+                chunks.append(tail)
         if chunks:
             return chunks
-    return [text] if len(text) >= 10 else []
+    return parts or ([text] if len(text) >= 10 else [])
 
 
 def force_amazon_copy(attrs: dict, product: dict,
@@ -189,7 +249,7 @@ def force_amazon_copy(attrs: dict, product: dict,
             cleaned.append(c[:500])
     if len(cleaned) < min_features:     # 拆句补齐(少于 minItems 会被拒)
         for text in cleaned + [long_text, title]:
-            for p in _sentences(text, brands):
+            for p in _sentences(text, brands, want=min_features):
                 if p not in cleaned:
                     cleaned.append(p[:500])
                 if len(cleaned) >= min_features:
@@ -206,6 +266,36 @@ def force_amazon_copy(attrs: dict, product: dict,
     if paragraph:
         attrs["shortDescription"] = paragraph[:4000]
     return attrs
+
+
+def material_gap(spec: dict | None, product: dict) -> str | None:
+    """输入:PT spec + 产品数据 → 输出:素材凑不够必填数组的原因(够则 None)。
+
+    只查两项:`keyFeatures` 与 `productSecondaryImageURL` —— 它们**全由系统
+    从采集数据生成**(SYSTEM_OWNED_FIELDS 会把 LLM 写的这两项一律丢掉),
+    所以在取数这一步就能定论,用的还是 `mp_conform.validate` 的同一组数字,
+    结论不可能与它相左。
+
+    为什么要提前判(2026-08-22 实证):这两样不够的行一路走到预备期才被
+    validate 拦下,代价是**白打一次 LLM、白占一个当天配额名额**(配额切片
+    在预备期之前),而素材是产品的固定属性 —— 这批行天天重来、天天白烧。
+    结论完全一样(都是不上架),只是早说、说清楚、不花钱。
+    """
+    props, req = (spec or {}).get("properties") or {}, \
+        set((spec or {}).get("required") or [])
+    if "keyFeatures" in req:
+        need = int((props.get("keyFeatures") or {}).get("minItems") or 4)
+        got = len(force_amazon_copy({}, product, min_features=need)
+                  .get("keyFeatures") or [])
+        if got < need:
+            return (f"卖点凑不够:{got} 条 < 该类目需 {need} 条"
+                    f"(亚马逊卖点与描述都补不出来)")
+    if "productSecondaryImageURL" in req:
+        need = secondary_min(spec)
+        got = max(0, len(sort_images(product.get("images"))) - 1)
+        if got < need:
+            return f"副图不够:{got} 张 < 该类目需 {need} 张(主图另算)"
+    return None
 
 
 def _enum_of(spec: dict | None, field: str) -> list | None:
@@ -269,7 +359,7 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     if "manufacturer" in attrs:
         attrs["manufacturer"] = clamp(attrs["manufacturer"], 60)
     attrs["brand"] = FORCE_BRAND
-    return apply_images(attrs, images or [])
+    return apply_images(attrs, images or [], spec)
 
 
 def _field_block(name: str, meta: dict, required: bool) -> dict:
@@ -356,6 +446,102 @@ def _conditional_blocks(spec: dict | None, cap: int = 12) -> list[dict]:
     return out
 
 
+# 进提示词前从 attrs 剔掉的媒体键(2026-08-18 所有者定稿,治缓存 hash 脆):
+# 图片/视频是纯 URL,系统本就禁止 LLM 输出媒体字段(SYSTEM_OWNED_FIELDS,
+# 图片由 apply_images 从采集数据覆盖),进提示词纯粹是噪声——却让"慢采只
+# 刷新了图片列表"也打穿 llm_cache。
+# ⚠ 改这份清单 = 改 messages = 现有缓存整体失效一次,只许在接受重烧时动。
+PROMPT_DROP_KEYS = ("images", "image_url", "image_urls",
+                    "video", "videos", "video_url")
+
+
+def _prompt_attrs(attrs) -> dict:
+    """输入:采集 slow 段 attrs → 输出:进 LLM 提示词的属性(剔媒体键)。"""
+    if not isinstance(attrs, dict):
+        return {}
+    return {k: v for k, v in attrs.items() if k not in PROMPT_DROP_KEYS}
+
+
+def reuse_sig(pt: str, spec: dict | None, product: dict,
+              ospec: dict | None = None) -> str:
+    """输入:PT + spec + 产品数据(+Orderable spec)→ 输出:二级复用硬条件签名。
+
+    llm_cache 二级复用(2026-08-18 所有者定稿)的"不许复用"等值判断:
+    签名里任何一样变了,旧出参直接作废重打 LLM——
+      · spec 字段面 + 条件必填(spec 改版后旧出参可能给不出新必填);
+      · brand / category(语义地基);
+      · variant_attributes(变体属性 = 规格本体)。
+    **title 与 attrs 文案故意不进签名**:文案变化正是二级复用要跨过去的
+    那类变化;标题里可能藏规格,那一半风险由 title_spec_compatible 单验。
+    """
+    import hashlib as _hashlib
+    import json as _json
+    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
+    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10)
+    raw = _json.dumps(
+        {"pt": pt, "vr": v_req, "vo": v_opt, "onr": o_req, "ono": o_opt,
+         "cond": _conditional_blocks(spec),
+         "brand": product.get("brand"),
+         "category": product.get("category"),
+         "variant_attributes": product.get("variant_attributes")},
+        ensure_ascii=False, sort_keys=True, default=str)
+    return _hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _title_hit(value: str, title: str) -> bool:
+    """值是否按词边界出现在标题里(纯数字不许配进更长的数字:4 ≠ 48)。"""
+    v = str(value).strip()
+    if not v or len(v) > 40:
+        return False
+    if _NUM_RE.fullmatch(v):
+        return re.search(rf"(?<![\d.]){re.escape(v)}(?![\d.])",
+                         title) is not None
+    return re.search(rf"(?<!\w){re.escape(v)}(?!\w)", title,
+                     re.IGNORECASE) is not None
+
+
+def _response_scalars(node) -> list[str]:
+    """出参 JSON 里的全部标量值(str/数字;bool 不算——'No' 类枚举才有意义)。"""
+    out: list[str] = []
+    if isinstance(node, dict):
+        for v in node.values():
+            out.extend(_response_scalars(v))
+    elif isinstance(node, (list, tuple)):
+        for v in node:
+            out.extend(_response_scalars(v))
+    elif isinstance(node, (str, int, float)) and not isinstance(node, bool):
+        out.append(str(node))
+    return out
+
+
+def title_spec_compatible(old_title: str, new_title: str,
+                          response: dict) -> bool:
+    """输入:出参时标题 + 现标题 + 旧出参 → 输出:旧出参对新标题是否仍成立。
+
+    所有者的验证思路(2026-08-18:「llm取出来的参数在原来的标题里会有,
+    如果新的标题里这部分参数变了…再走llm重新输出」)+ 两处修正:
+
+    ① **对称验证,不是"值∈新标题"**:出参分两类——从标题抄/提取的
+      (件数/尺寸/颜色词)与推断/枚举归一的("Kraft"→material=Paper、"No")。
+      后者在旧标题里本来就找不到,拿去新标题验会全军覆没、复用率归零。
+      所以只验**在旧标题命中过**的值:旧有、新没了 ⇒ 规格变了,重打。
+    ② **数字 token 集合必须相等**(双向护栏):新标题**新增**的规格
+      (4 Pack → 48 Pack)在旧出参里没有值可验,①看不见;而规格变化
+      几乎总带数字(件数/尺寸/容量)。误伤方向是安全的——顶多多烧一次
+      LLM,绝不把旧规格发给新形态的产品。
+    """
+    old_t, new_t = str(old_title or ""), str(new_title or "")
+    if set(_NUM_RE.findall(old_t)) != set(_NUM_RE.findall(new_t)):
+        return False
+    for v in _response_scalars(response):
+        if _title_hit(v, old_t) and not _title_hit(v, new_t):
+            return False
+    return True
+
+
 def build_llm_messages(pt: str, spec: dict | None, product: dict,
                        ospec: dict | None = None) -> list[dict]:
     """输入:PT + 该 PT spec + 产品数据契约(+Orderable spec)→ 输出:messages。
@@ -398,7 +584,9 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict,
         "product": {"title": product.get("title"),
                     "brand": product.get("brand"),
                     "category": product.get("category"),
-                    "attrs": product.get("attrs") or {}},
+                    # 剔媒体键(PROMPT_DROP_KEYS):图片列表进提示词是噪声,
+                    # 还让"慢采只刷新了图片"也打穿缓存 hash
+                    "attrs": _prompt_attrs(product.get("attrs"))},
     }, ensure_ascii=False)
     return [{"role": "system", "content": sys},
             {"role": "user", "content": user}]
@@ -445,6 +633,9 @@ def shipping_weight(product: dict | None) -> float:
 
 # Orderable 段的**系统专属字段**(旧 mapper 的 10 项 force_overrides +
 # ShippingWeight/specProductType):LLM 不该填、填了也一律被系统值覆盖。
+# `specProductType` 官方 20260608 已移除,我们也不再写 —— 但**保留在这张表里**:
+# 它得继续挡住 LLM 往 Orderable 里塞这个字段(spec 外字段会让整条被拒,
+# EXT_DATA_ERROR_60670554076755),也继续不进 LLM 提示词。
 # 这些字段也不进 LLM 提示词(旧 _orderable_fields_for_llm 同款剔除)。
 ORDERABLE_SYSTEM_FIELDS = (
     "sku", "productIdentifiers", "price", "inventory", "startDate", "endDate",
@@ -469,7 +660,10 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         (EXT_DATA_ERROR_50716566635066 "'Inventory Quantity' … Enter a 'Number'")
       · **country_of_origin_substantial_transformation 必填**
         (EXT_DATA_ERROR_72600149546850,此前整个字段没给)
-      · specProductType / startDate 旧系统都写,此前漏
+      · startDate 旧系统都写,此前漏
+      · **specProductType 不再写**(2026-08-20 换 spec 到 20260608:官方把这个
+        可选字段移除了)。留着也会被 mp_conform.strip_unknown 按新 spec 剔掉,
+        但"写了再剔"白费一道工序,而且读代码的人会以为它还有用
       · endDate 必须 ISO DateTime(纯 yyyy-mm-dd 会被拒
         EXT_DATA_ERROR_00030257670757)
       · ShippingWeight 是 Orderable 必填:旧系统由 LLM 补,新系统从采集重量取
@@ -493,8 +687,6 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
                        "quantity": int(qty)}],
     })
-    if pt:
-        o["specProductType"] = str(pt)
     return o
 
 

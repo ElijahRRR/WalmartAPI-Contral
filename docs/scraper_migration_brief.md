@@ -37,7 +37,7 @@
 ## 三、你要实现的功能
 
 采集服务**保持独立部署、保留自己的数据库**(高频写入自己扛,故障隔离)。
-沃尔玛侧会写一个 `catalog_sync` 工作流定期从你这里拉增量。你需要提供:
+沃尔玛侧会写一个 `product_ingest` 工作流定期从你这里拉增量。你需要提供:
 
 1. **可靠的增量导出能力**(核心):
    - 每条记录有单调递增的游标(自增 ID 或 updated_at,须保证不回跳);
@@ -60,7 +60,7 @@
    并存数月。新能力用新增接口/字段实现,不改动现有接口的行为和返回结构。
 2. **不要在你这边做去重或"清理历史"**。多条记录是特性;去重逻辑在沃尔玛侧的分层模型里。
 3. **不要直写沃尔玛侧的中心库**。你只负责把数据可靠地暴露出来,落库由沃尔玛侧的
-   catalog_sync 完成。这保证两边故障互不传染(将来若确有必要再评估直写)。
+   product_ingest 完成。这保证两边故障互不传染(将来若确有必要再评估直写)。
 4. **游标语义要经得起边界测试**:同游标值多条记录、乱序写入、重跑补采——
    任何情况下"从游标 X 拉起"不能漏数据(宁可重复,靠 source_id 去重兜底)。
 5. **审核服务的对接**(第二阶段,先知晓):未来审核服务将改为读 `catalog.products`
@@ -239,8 +239,11 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 
    `open` = 既不是 done 也不是 failed 的数量。**failed 算终态**,所以一张永远
    截不出来的图不会把批次卡死(实测 1 done + 1 failed → completed)。
-   本侧实现在 `services/scrape_batches.is_settled`,product_refresh 与
-   order_audit 共用同一份判据。
+   本侧 `services/scrape_batches.is_settled` **只看 `tasks.open == 0`**,
+   **不看 `screenshots.open`**(2026-08-10 实测后改:任务失败后它那张图永远
+   截不出来,`screenshots.open` 会永久停在 >0、批次于是永远落不定);截图
+   另由 `shots_open()` 单独看,不参与落定。product_refresh 与 order_audit
+   共用同一份判据。
 
    ⚠ **批次 completed 不等于我们库里有数据**:中间还隔着增量导出 →
    product_ingest 两跳。所以批次状态只用来判"还要不要等"和"失败原因是什么",
@@ -250,6 +253,74 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
    `error_type` 是 11 类 + `unknown` 的封闭集,登记在
    `services/scrape_batches.ERROR_TYPES`——采集侧新增类型而本侧不知道时会告警,
    不会被静默当成普通失败。
+
+5b. **gzip 传输(采集侧 2026-08-21 上线,本侧零改动)**——
+   `/api/export/incremental` 与 `/api/export/batch/{批次名}/records` 同源同构,
+   两个端点一起受益。生产实测(一页 500 条):
+
+   | | 线上字节 | 耗时 |
+   |---|---|---|
+   | 未压缩 | 2,869 KB | 3.3 ~ 10.9s(波动大) |
+   | **gzip** | **694 KB** | **0.30s** |
+
+   压缩比 **4.1 : 1**,每条记录约 **5.7 KB**。按此,11.7 万条的补积压从十几分钟
+   降到两三分钟。⚠ **别拿"上完 0.30s vs 上完前 9.5s"当效果** —— 同一个请求在
+   半小时内已经在 9.5s / 3.33s 之间跳过一次,那个 9.5s 里掺着运气差;
+   坐实的部分是**字节少了 4.1 倍**。
+
+   **本侧为什么零改动**:httpx 默认发 `accept-encoding: gzip, deflate` 并自动
+   解压,而 `api/scraper._headers()` 只返回鉴权头、全仓没有一处手写
+   `Accept-Encoding`。⚠ 这也意味着**那个默认协商就是 gzip 生效的全部机制**,
+   谁在 `_headers()` 里加一个 Accept-Encoding,压缩就静默失效(见
+   `tests/test_scraper_gzip.py`)。
+
+   **数据准确性已实测核实**(所有者 2026-08-21 追问「能确保这么拿回来的数据也是
+   准确的吗」):同一页 identity 与 gzip 两次取回**逐字段完全相同**。更硬的保证
+   来自"整页是一个 JSON 文档":httpx 的解码器在流被截断时**不抛错**(跳过 gzip
+   尾部 CRC32),但半截字节不是合法 JSON ⇒ `json.loads` 抛 ⇒ `export_incremental`
+   记成"200 但不是 JSON"退避重试。单比特翻转 300 次实测 300 次全部报错,
+   零次静默出错。**没有"少几条但看着正常"这种中间态。**
+   ⚠⚠ **这条前提只在整页解析时成立**:哪天把它改成流式(逐条 yield / ijson),
+   截断就会变成"静默少几条",而少掉的那几条会被游标跳过、永不回头。
+   `tests/test_scraper_gzip.py` 里那条 parametrize 测试就是留给改的人的红灯。
+
+   **转告采集侧的三条**:① 用 gzip / deflate,别用 br / zstd(本仓 httpx 只装了
+   前两个解码器);② nginx 反代要 `gzip_proxied any;`(默认不压上游代理来的响应);
+   ③ 别双压(FastAPI 与 nginx 只压一次)。
+
+   ★ **由此作废两个曾经排上日程的优化**:`fields=` 字段投影(收益已被压缩吃掉,
+   而砍 `long_description` 会让 L3 只剩标题+五点判语义,代价还在)与
+   "预取流水线 / 批量 INSERT"(落库本来就只占 0.3s;gzip 后 HTTP 也是 0.3s,
+   流水线理论上省 40%,但绝对值是把两分钟变成一分半)。
+
+6. **按批次取记录端点(采集侧 #12,2026-08-19 本侧接入)**——
+   `GET /api/export/batch/{batch_name}/records?cursor=&limit=`:
+   与 `/api/export/incremental` 读同一张事件表、records 逐字段同构,
+   差别只在取行范围(`WHERE batch_id = ? AND seq > ?`)。它回答
+   「我刚推的这一批,到底采到了什么」——事件流里**没采成就没有行**,
+   不会拿旧行冒充本批结果(`/api/results?batch_id=` 那条老路的洞)。
+   响应带 `coverage {asin_total, asin_with_event}`(齐不齐,一个请求判断;
+   相等 ≠ 全成功,成功看逐条 `outcome`)与 `retention_min_cursor`
+   (老批次被保留期裁过时对账用)。
+
+   本侧接法(api/scraper.export_batch_records +
+   services/product_ingest.pump_batch):
+   - **批内游标与全局游标不可互换**(数值同源于 seq 但定义域不同,喂错
+     不报错、会静默跳过中间所有别的批次的事件)——批内游标只做单次调用
+     的翻页,**绝不落 ops.cursors**;
+   - 每次调用从 cursor=0 拉到 has_more=false,幂等靠 snapshots.source_id,
+     与全局泵重复摄取无害 ⇒ **不需要任何锁**;
+   - order_audit / product_audit / list_new 的同轮闭环 2026-08-19 起全部
+     改走本端点(此前借 product_ingest 的锁抽全库到当刻头部,整点
+     order_chain 与 13:00 product_chain 一撞就是 15 分钟等锁);
+     order_audit 的认账失败凭据也随之从"全局摄取水位线越过落定时刻"
+     升级为"该批自己的事件流已拉到底"(逐批确定性,127 条冤案的防线加强版);
+   - 本端点 404 **只有一个含义:批次名不存在**(与增量端点的 404 语义
+     不同);没有 409——保留期裁老批次时照实回 200 + 不完整集合。
+   - `/api/export/incremental` 仍是产品中心的**兜底全量补给线**
+     (product_ingest 已从 product_chain 里摘出,改成每小时长驻的独立任务),
+     批次端点不替代它——但 product_refresh 那条大流水 2026-08-19 起也在
+     同轮按批摄取自己推的批,全量泵只兜其余增量(超时批的尾巴、零散采集)。
 
 **另有两条实现语义,消费侧必须遵守**:
 
@@ -269,7 +340,7 @@ GET /api/export/incremental?cursor=<int>&limit=<int,≤1000,默认500>
 
 ## 六、验收标准
 
-- 沃尔玛侧 catalog_sync 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
+- 沃尔玛侧 product_ingest 每 N 分钟拉一次增量,连续运行一周:无漏采(抽样比对)、
   无重复入库(source_id 冲突计数为 0)、products/snapshots 分层数据正确。
 - 现有旧系统(erpAPI)链路零感知、零故障。
 

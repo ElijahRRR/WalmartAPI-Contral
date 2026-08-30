@@ -5,10 +5,12 @@
 """
 
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
 from services import brand_key as bk
+from services import report_csv
 from services import store_targets
 from services import alloc_survey as sv
 from workflows import alloc_audit as wf
@@ -71,11 +73,17 @@ def test_placeholder_list_is_superset_of_both_upstreams():
 
     漏一个词 = 一次大面积误锁(该词名下所有产品被锁进一家店,且占用无自动
     释放);多一个词只是少占一个品牌。方向明确,取并集。
+
+    ⚠ 断言是**单向子集**,不是相等:2026-08-23 所有者把 generic/oem/various
+    从 phase0 白名单撤下(交还品牌黑名单裁决),本表**不跟着撤** —— 两张表
+    自此分家,phase0 ⊆ 本表仍成立,反向不成立。
     """
     from services.audit_phase0 import _NON_BRAND_PLACEHOLDERS as P0
     from services.mp_mapper import _BRAND_NOISE
     assert P0 <= bk.PLACEHOLDERS
     assert {w for w in _BRAND_NOISE if w} <= bk.PLACEHOLDERS
+    # 分家的那三个词:本表留、phase0 不留(任一侧被顺手改回都会红)
+    assert {"generic", "oem", "various"} <= bk.PLACEHOLDERS - P0
 
 
 # ── enrich ─────────────────────────────────────────────────────────────
@@ -373,7 +381,7 @@ def _wire(monkeypatch, cur, *, registered=None, stores=None, cfg=None,
                         contextlib.contextmanager(lambda: iter([conn])))
     if reports is not None:
         monkeypatch.setattr(wf.paths, "reports_dir", lambda: reports)
-    monkeypatch.setattr(wf.stores_svc, "registered_names",
+    monkeypatch.setattr(wf.stores_svc, "enabled_names",
                         lambda: registered if registered is not None else {"A085", "A107"})
     monkeypatch.setattr(wf.stores_svc, "load_stores",
                         lambda: [{"name": n} for n in (stores if stores is not None
@@ -402,7 +410,7 @@ def test_run_end_to_end_report(monkeypatch):
     # 评分/评论探针为 0 → 必须点名删权重(禁止 or 0)
     assert "评分 ✗" in out and "v1 权重要删掉这两项" in out
     # DEAD1 不在册:其行被排除出冲突,且被点名
-    assert "不在册店冻结 1 家(DEAD1)" in out
+    assert "不在营店冻结 1 家(DEAD1)" in out
     # A107 状态为空串 → fail-open 视同 ACTIVE,不进非 ACTIVE 清单
     assert "非 ACTIVE" not in out
     # 订单里的"旧名店"不在凭证表 → 点名(它的销量进不了店×类目维度)
@@ -510,7 +518,7 @@ def test_store_overview_csv_carries_the_per_store_detail(monkeypatch, tmp_path):
     text = (tmp_path / "alloc_店铺总览.csv").read_text(encoding="utf-8-sig")
     rows = {ln.split(",")[0]: ln for ln in text.splitlines()[1:]}
     assert rows["谭总4"].split(",")[1] == "否(规划外)"
-    assert rows["DEAD1"].split(",")[1] == "否(不在册)"
+    assert rows["DEAD1"].split(",")[1] == "否(不在营)"
     assert rows["A085"].split(",")[1] == "是"
     assert "Fashion" in rows["A085"]          # 准入类目/大类分布都在行里
 
@@ -543,7 +551,7 @@ def test_run_warns_when_credential_table_unreadable(monkeypatch):
 
     def _boom():
         raise RuntimeError("飞书 500")
-    monkeypatch.setattr(wf.stores_svc, "registered_names", _boom)
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", _boom)
     out = wf.run({})
     assert "凭证表读不到" in out and "幻影店一个没排" in out
     assert "只可参考" in out
@@ -598,7 +606,7 @@ def test_category_admission_is_a_hard_gate_before_the_ladder():
     key, keep, _st, detail, level = sv.resolve_conflicts(
         rows, sales, "asin", sv.store_metrics(rows, sales), cfg)[0]
     assert keep == "A085" and level == sv.BY_CATEGORY
-    assert [d[7] for d in detail] == ["保留", "下架"]
+    assert [d.verdict for d in detail] == ["保留", "下架"]
 
 
 def test_category_gate_skipped_when_nobody_admits():
@@ -731,8 +739,11 @@ def test_needs_human_is_only_the_store_name_tier():
     所有者定稿 2026-08-15 晚:只有落到**店名**才是真打平(拿字典序当经营
     决策),那一级才需要人眼。
     """
-    assert sv.NEEDS_HUMAN == ("按店名",)
+    assert sv.LADDER[4] in sv.NEEDS_HUMAN
     assert sv.LADDER[3] == "按在线件数" and sv.LADDER[3] not in sv.NEEDS_HUMAN
+    # 阶梯里只有「按店名」那一级需要人;另一条(2026-08-22 加的)不是阶梯,
+    # 是"判出来的结论与已落的占用矛盾" —— 占用只能人来撤
+    assert set(sv.NEEDS_HUMAN) - {sv.CLAIM_STUCK} == {"按店名"}
 
 
 def test_store_gmv_comes_from_orders_not_from_what_is_still_online():
@@ -927,14 +938,14 @@ def test_claim_filter_and_channel_disposal_list_are_exactly_complementary():
 def test_backfill_loads_channel_or_the_gate_is_silently_dead():
     """回填必须**带渠道取数**,否则第五条筛法恒为假而且不报错。
 
-    `_fetch_meta(..., with_channel=False)` 时 rows 的 channel 全是 None,
+    `load_rows(..., with_channel=False)` 时 rows 的 channel 全是 None,
     `offends_channel` 一行都判不出来 —— 于是 alloc_audit 判一套、回填落另一套,
     正是 alloc_survey 这个模块存在要防的事。
     """
     import inspect
     from workflows import alloc_backfill as bf
     src = inspect.getsource(bf.run)
-    assert "_fetch_meta(cur, asins, True)" in src, \
+    assert "with_channel=True" in src, \
         "回填取数不能省掉渠道:省掉后渠道闸恒为假,与 alloc_audit 口径分叉"
 
 
@@ -981,11 +992,11 @@ def test_keep_and_drop_counts_are_not_expected_to_match():
                 "brand_key": "acme", "category": "Home", "published": True}])
     (key, keep, _s, detail, level) = sv.resolve_conflicts(
         rows, {}, "brand_key", sv.store_metrics(rows, {}))[0]
-    verdicts = Counter(d[7] for d in detail)
+    verdicts = Counter(d.verdict for d in detail)
     assert keep == "A" and level == "按在线件数"
     assert verdicts == {"保留": 4, "下架": 1}      # 4:1,不是 1:1
     # 不变量:每组恰好一个保留店,且两边都非空
-    assert {d[0] for d in detail if d[7] == "保留"} == {keep}
+    assert {d[0] for d in detail if d.verdict == "保留"} == {keep}
     assert verdicts["保留"] >= 1 and verdicts["下架"] >= 1
 
 
@@ -1001,3 +1012,143 @@ def test_report_leads_with_the_actionable_row_count(monkeypatch, tmp_path):
     col = head.split(",").index("处置")
     drop = sum(1 for ln in body if ln.split(",")[col] == "下架")
     assert f"要下架 {drop} 件" in out or f"要下架 {drop + 1} 件" in out
+
+
+# ── 装载积木 alloc_survey.load_rows(四条分配链的唯一装载口)──────────────
+
+class _RecCur(_FakeCur):
+    """_FakeCur + 记下每条真正跑过的 SQL(need 开关要能验"没点名就没查")。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sqls: list = []
+
+    def execute(self, sql, args=None):
+        self.sqls.append(sql)
+        super().execute(sql, args)
+
+
+def test_load_rows_core_is_the_four_chains_shared_skeleton():
+    """公共骨架:PT→大类字典 → 在线行 → 抽 asins → _fetch_meta → enrich。
+
+    这五步四条链逐字相同(alloc_plan / claim_audit 只要这一段)。
+    """
+    conn = _FakeConn(_RecCur())
+    got = sv.load_rows(conn)
+    assert [r["store"] for r in got.rows] == [i[0] for i in ITEMS]
+    assert got.pt2cat == PT2CAT
+    assert got.st["online"] == len(ITEMS)
+    # 富化确实跑过:三段式 sku 提出了 asin、DEAD1 的行也在(筛店是调用方的事)
+    assert got.rows[2]["asin"] == "B0BBBB0002"
+    assert got.rows[2]["category"] == "Fashion"
+
+
+def test_load_rows_need_gates_every_extra_query():
+    """没点名的一律**不查**,而且字段是 None ——「本轮没查」与「查了没有」
+    分得开(只要一半数据的链不该被多压几条全表 SQL)。"""
+    cur = _RecCur()
+    got = sv.load_rows(_FakeConn(cur))
+    for f in ("pool", "signal", "pt_dict", "pt_dict_err", "categories",
+              "status", "sales", "order_stores"):
+        assert getattr(got, f) is None, f
+    for feature in ("AS total", "n_rating", "n_risk", "store_kpi_daily",
+                    "orders.order_lines", "GROUP BY 1 ORDER BY 2 DESC"):
+        assert not any(feature in s for s in cur.sqls), feature
+
+    # 反向:点名了就查得到,取值与 alloc_audit 现行口径逐字一致
+    cur2 = _RecCur()
+    got2 = sv.load_rows(_FakeConn(cur2), win=sv.sales_window("2026-08-01"),
+                        need=sv.NEED_ALL)
+    assert got2.pool["total"] == 1_280_000
+    assert got2.signal["n_rating"] == 0
+    assert got2.pt_dict["n_risk"] == 7008 and got2.pt_dict_err is None
+    assert got2.categories == [("Fashion", 900), ("Home", 800)]
+    assert got2.status == {"A085": "ACTIVE", "A107": "", "DEAD1": "ACTIVE"}
+    assert got2.sales == {("A085", "B0AAAA0001"): (3, 120.0)}
+    assert got2.order_stores == [("A085", 30, 30), ("旧名店", 5, 5)]
+
+
+def test_load_rows_pt_dict_probe_degrades_but_the_load_goes_on():
+    """P3 是对拍探针不是主线:字典表出问题不该拖垮整份存量审计,
+    但必须先 rollback(事务已 aborted,后续查询否则全炸)。"""
+    cur = _RecCur(fail_pt_dict=True)
+    conn = _FakeConn(cur)
+    got = sv.load_rows(conn, need=("pt_dict",))
+    assert got.pt_dict is None
+    assert "product_type does not exist" in got.pt_dict_err
+    assert conn.rolled_back is True
+    assert got.rows and got.st["online"] == len(ITEMS)
+
+
+def test_load_rows_refuses_a_typo_need_and_a_missing_window():
+    """开关拼错就静默少查一整块,窗口忘传就是两条 SQL 拿不到参数:宁炸不吞。"""
+    conn = _FakeConn(_RecCur())
+    with pytest.raises(ValueError) as ei:
+        sv.load_rows(conn, need=("statuses",))
+    assert "statuses" in str(ei.value)
+    with pytest.raises(ValueError) as ei2:
+        sv.load_rows(conn, need=("sales",))
+    assert "win" in str(ei2.value)
+
+
+# ── 报告 csv 落盘积木(六个工作流共用的那一份)────────────────────────────
+
+def test_report_csv_keeps_bom_and_writes_no_blank_lines(monkeypatch, tmp_path):
+    """两个参数都是给所有者用 Excel 直接打开服务的,不许"顺手简化":
+    utf-8-sig 少了中文全乱码,newline='' 少了 Windows 上每行之间多空行。"""
+    monkeypatch.setattr(report_csv.paths, "reports_dir", lambda: tmp_path / "r")
+    p = report_csv.write("t.csv", ["店铺", "SKU"], [["A085", "B0AAAA0001"]])
+    raw = Path(p).read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf")          # BOM
+    assert b"\r\n" in raw and b"\r\r\n" not in raw  # newline='' 不加倍 \r
+    assert raw.decode("utf-8-sig").splitlines() == ["店铺,SKU", "A085,B0AAAA0001"]
+    assert Path(p).parent == tmp_path / "r"         # 目录不存在也会先建
+
+
+# ── run() 三段拆解:_collect / _sections / _export(2026-08-27)────────────
+
+def test_run_is_three_stages_over_one_ctx():
+    """run() 只剩三步:`_collect` → `_sections` → `_export`。
+
+    拆之前 run() 451 行、装载与六节报告与六份 csv 同体,中段二十多个局部量
+    被后两段交叉引用。⚠ **不许把这些量摊成参数** —— 那是把臃肿换成穿透,
+    所以判据是"三段各自只收一个对象"。
+    """
+    import inspect
+    from dataclasses import fields
+    assert list(inspect.signature(wf._collect).parameters) == ["params"]
+    for fn in (wf._sections, wf._export):
+        assert len(inspect.signature(fn).parameters) == 1
+    src = inspect.getsource(wf.run)
+    assert "_collect" in src and "_sections" in src and "_export" in src
+    assert len(src.splitlines()) <= 6           # run 里不该再有拼装
+    assert {"conflicts", "held", "rows", "cfg", "prof_all"} <= {
+        f.name for f in fields(wf.Ctx)}
+
+
+def test_conflicts_and_claims_are_computed_exactly_once():
+    """报告段与 csv 段读**同一份** conflicts/held,不许各算一遍(口径纪律 2)。
+
+    各算一遍就会漂:控制台说"留 A085"、csv 里写着另一家,而所有者是照 csv
+    动手的;占用读两遍还会出现"报告说没看占用、清单却按占用写"的自相矛盾。
+    判据落在源码上——两个调用点各自只出现一次。
+    """
+    import inspect
+    src = inspect.getsource(wf)
+    assert src.count("sv.resolve_conflicts(") == 1
+    assert src.count("sv.store_metrics(") == 1
+    assert src.count("claims.load_active(") == 2      # BRAND / PRODUCT 各一次
+
+
+def test_loading_and_csv_both_go_through_the_shared_blocks():
+    """装载走 `sv.load_rows`、落盘走 `report_csv.write`,本件不留第二条路。
+
+    两个积木的**原件都出自这个文件**(2026-08-27 上移):`_write_csv` 是六处
+    抄写的母本,私有 `sv._SQL_*` 则是四条分配链各自伸手进服务内部的那一段
+    ——下划线前缀本来就说明服务侧不认为它们是对外接口。
+    """
+    import inspect
+    src = inspect.getsource(wf)
+    assert "sv.load_rows(" in src and "sv._SQL_" not in src
+    assert "report_csv.write(" in src
+    assert "csv.writer" not in src and "def _write_csv" not in src

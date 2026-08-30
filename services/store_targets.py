@@ -3,7 +3,14 @@
 四列都是所有者在飞书人工维护(2026-08-12 / 08-13 建列),程序只读:
   目标销售额 / 目标订单  —— **日目标**(不是月目标,公式里别当月用)
   单店最大在线数        —— 总容量上限(≠「上架限制」列的日配额)
-  配送限制              —— fba / fbm,一店一渠道的权威(未填=不接自由流分配)
+  配送限制              —— fba / fbm,一店一渠道的权威。**一列三个消费方**,
+                         对"这一格没填"的解释各不相同、而且都是对的:
+                           · 分配 `alloc_engine._blocker` —— 未填=不接自由流
+                             (没有渠道就没法过硬闸,宁可不分)
+                           · 上架 `list_new`               —— 未填=不限制,什么渠道都能上
+                             (所有者定稿 2026-08-25:「没标就都能上」。这里若照
+                             搬分配的口径,没配置的店会被整店废掉)
+                           · 维护 `maintenance_intents`    —— 未填=不限制,同上架
   配送时长限制          —— 只分配 delivery_days ≤ 该值的产品(未填=不限)
 
 与 `workflows/list_new._load_quota` 的分工:那边读「上架限制」日配额,
@@ -88,34 +95,134 @@ def load_targets() -> dict[str, dict]:
     return out
 
 
+def store_channels() -> dict[str, str]:
+    """输入:无 → 输出:{店铺: 'FBA'|'FBM'}(只收**填了且认得出**的店)。
+
+    上架链与维护链的取数入口(分配链走 `load_targets()` 拿全套配置)。
+    不进字典的店 = 「没标」= **不限制**,两条链都放行 —— 与分配侧"未填不接
+    自由流"方向相反,见模块头注那三条。
+
+    表未登记(.env 缺 FEISHU_LIMITS_*)→ 空字典 + **告警**,等价于全放行。
+    这是有意的降级(飞书挂了不该把上架/维护整条链拖下水),但**必须出声**:
+    静默的兜底会让"渠道闸失效"看起来和"没有不符的行"一模一样。
+    """
+    try:
+        targets = load_targets()
+    except LookupError:
+        logger.warning("限额表未登记,渠道闸本轮**全放行**"
+                       "(等同每家店都没标「配送限制」)")
+        return {}
+    return {name: cfg["channel"] for name, cfg in targets.items()
+            if cfg.get("channel")}
+
+
+def channel_conflict(want: str | None, channel) -> bool:
+    """输入:本店渠道要求 + 产品渠道 → 输出:是不是**确定不符**(白名单口径)。
+
+    ★ **全项目唯一一处**判"这个货的渠道对不对得上这家店"。四个消费方
+    (分配审计 `alloc_survey.offends_channel` / 上架 `list_new` / 维护
+    `maintenance_intents` / 占用对账 `claim_audit`)都问它,不各写各的 ——
+    这个判定有两个方向都像对的坑,分开写迟早分叉:
+
+    1. **店没标 → 不冲突**(返回 False)。上架/维护侧「没标就都能上」。
+    2. **产品渠道不是另一个已知值 → 不冲突**。采集没采到(None)、采出第三种
+       值('N/A' 之类),都**不算不符** —— 把"没采到"当成"货不对",在上架侧是
+       无辜商品上不了架,在维护侧是无辜商品被清零然后删掉。第三种值恒高说明
+       采集侧 `is_fba` 解析坏了,那是要修采集,不是要动商品。
+
+    大小写与空白在这里归一(维护侧取的是 `raw->>'is_fba'` 原文,上架侧取的是
+    amz_source 已归一的值)—— 两边各 strip().upper() 一遍就是两份口径。
+    """
+    w = str(want or "").strip().upper()
+    if not w:
+        return False              # 店没标(含只填了空白)= 不限制
+    ch = str(channel or "").strip().upper()
+    return ch in CHANNELS and ch != w
+
+
+def super_categories_of(cfg_row: dict | None) -> set:
+    """输入:某店配置行 → 输出:该店准入的**品类桶**集合(五大品类 + 「其他」)。
+
+    ★ 2026-08-22 改判 `super_bucket`(所有者:建议列要「填写 5 大类和其他」)。
+    改之前填「其他 / Safety & Emergency / Everything Else」的店会折成**空集**
+    ⇒ 按「填了就只准入填的那几个」判 ⇒ **谁也接不了**,一家店被静默废掉。
+    改之后这类店的语义是"专收归不到五品类的货",与所有者 2026-08-21 那句
+    「不归,可以分配给没有确定类目的店」相容 —— 那是"可以给没填的店",
+    不是"只能给没填的店"。
+
+    ⚠ 由此 **空集 ⟺ 三列全空**(唯一来源),原来那条"两种空集不能混"的
+    警告随之消失:任何非空填写值都折得出一个桶(认不出的归「其他」)。
+    代价是拼写错不再"响亮地废掉一家店",而是让它静默变成只收「其他」——
+    所以 `alloc_audit` 必须逐店点名认不出的填写值(`known_category_literal`)。
+    """
+    cats = (cfg_row or {}).get("categories") or []
+    return {resources.super_bucket(c) for c in cats} - {None}
+
+
 def allowed(cfg_row: dict | None, category: str | None) -> bool:
     """输入:某店配置行 + 产品大类 → 输出:该店能不能接这个大类。
 
     两条口径(所有者 2026-08-15):**表里三列都空 = 不限制**(放行一切);
-    填了就**只准入填的那几个**。产品归不到大类(category 为 None)时,
-    受限店拒收(宁可不分也不错分),不限制店放行。
+    填了就**只准入填的那几个**。产品归不到大类时,受限店拒收(宁可不分也
+    不错分),不限制店放行。
+
+    ★ **判定在五大品类那一层**(所有者 2026-08-21 拍 Q1)。两边都折一次:
+    店填「Furniture」= 它做 Home 品类,产品是 Furniture 也是 Home 品类,
+    过。**准入类目列不用重填** —— 26 类与五品类的名字都认。
+    为什么改:按 26 类判时,品牌组内的少数派件 156,188 件(全池 24.2%)会
+    被锁死在做不了那个大类的店里(品牌排他要求整组同店);折到五品类是
+    105,571 件(16.3%)。⚠ 代价所有者已认:「一店最多两大类」在这一层几乎
+    失效 —— Home + Hardlines = 他 91% 的货。
+
+    ★ **「其他」是一等值**(所有者 2026-08-22)。归不到五品类的货
+    (Safety & Emergency / Everything Else)可以去**没填类目的店**,也可以去
+    **明确填了「其他」的店** —— 后者是 2026-08-22 新开的一条,此前填「其他」
+    会把店折成空集而废掉。两边都走 `super_bucket`,所以自洽。
+
+    ★ **一个绝不许合并的区分**:`category` 为**空**(大类没采到)返回 False,
+    而不是当成「其他」。空是数据缺口(处置是补采集),「其他」是业务归类
+    (处置是找一家收「其他」的店)。合并会让填了「其他」的店开始收一批
+    **我们根本不知道是什么**的货 —— 而且 `category_offenders` 那条
+    "不知道不算违规"的纪律也会跟着塌。
     """
     cats = (cfg_row or {}).get("categories") or []
     if not cats:
-        return True
-    return bool(category) and category in cats
+        return True                          # 三列全空 = 不限制(唯一的放行一切)
+    want = resources.super_bucket(category)
+    if want is None:
+        return False                         # 大类采不到 → 受限店一律拒收
+    return want in super_categories_of(cfg_row)
+
+
+def lead_cap_of(cfg_row: dict | None) -> int:
+    """输入:某店配置行 → 输出:该店**生效**的配送时长上限(天)。
+
+    未填 ⇒ 回落 `amz_source.MAX_LEAD_DAYS`(7),与上架链
+    `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 同一个回落。
+    """
+    from services import amz_source          # 惰性:避免 registry ← services 绕回
+    cap = (cfg_row or {}).get("lead_limit")
+    return int(amz_source.MAX_LEAD_DAYS if cap is None else cap)
 
 
 def lead_ok(cfg_row: dict | None, lead) -> bool:
     """输入:某店配置行 + 产品配送天数 → 输出:该店收不收这个货期。
 
-    两条口径(所有者 2026-08-16 建列):**未填 = 不限**(放行一切);
-    填了就只准入 `delivery_days <= 限制`。
-    ⚠ **产品没采到配送天数(lead 为 None)时受限店拒收**:与类目那条
-    「归不到大类的,受限店拒收」同一纪律 —— 宁可不分也不错分。所有者填了
-    这一列就是明确不要慢货,拿"没采到"当"够快"是替他做了他没做的决定。
-    ⚠ 与全局 `amz_source.MAX_LEAD_DAYS` 是**两回事**:那条管的是"上架但把
-    库存写 0"的既有链路(货照上、只是不卖),这一列管的是"这家店压根不要"。
+    口径(所有者 2026-08-16 建列,**2026-08-21 改了回落方向**):
+    填了就只准入 `delivery_days <= 限制`;**未填回落 7 天**,不是"不限"。
+
+    ★ 为什么改:同一列「配送时长限制」,两条链的"未填"回落**方向相反** ——
+    上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 未填回落 7,
+    分配这边原本未填就放行一切。所有者要求两边相互关联(2026-08-21),
+    统一到 7。影响面:只要有**一家店**空着这一列,原写法会让
+    `alloc_plan._pool_reach` 的并集变成"不限",慢货全池涌入 —— 而且不报错。
+
+    ⚠ **产品没采到配送天数(lead 为 None)时一律拒收**:与类目那条
+    「归不到大类的,受限店拒收」同一纪律 —— 宁可不分也不错分。拿"没采到"
+    当"够快"是替所有者做了他没做的决定。**现在没有"不限"的店了,所以这条
+    对每一家店都生效**(改回落之前,未填的店会把未知货期照单全收)。
     """
-    cap = (cfg_row or {}).get("lead_limit")
-    if cap is None:
-        return True
-    return lead is not None and float(lead) <= float(cap)
+    return lead is not None and float(lead) <= float(lead_cap_of(cfg_row))
 
 
 def accepts_allocation(cfg_row: dict | None) -> bool | None:

@@ -41,7 +41,7 @@ def test_missing_reputation_is_a_real_observation_not_a_data_gap():
     assert ps.gate({"price": None, "shipping": None, "stock": 99},
                    amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY)
     # 有快照、有价、没评价 ⇒ 过闸,口碑记 0
-    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 99},
+    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 99, "lead": 3},
                    amz_source.MIN_INVENTORY, amz_source.IN_STOCK_QTY) is None
     assert ps.score({})["base"] == 0.0
 
@@ -195,13 +195,14 @@ def test_landed_price_gate_is_a_gate_not_a_deduction():
     """落地价 = 单价 + 运费,任一 NULL 就**定不了价**,不是"便宜一点"。"""
     assert ps.gate({"price": None, "shipping": 0.0}, 5, 10)
     assert ps.gate({"price": 9.9, "shipping": None}, 5, 10)
-    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 10}, 5, 10) is None
+    assert ps.gate({"price": 9.9, "shipping": 0.0, "stock": 10, "lead": 3},
+                   5, 10) is None
 
 
 def test_stock_gate_never_overrides_a_confirmed_zero():
     """有货但没采到数量 → 用保守量;**stock=0 是确实缺货,不许被覆盖**。"""
     assert ps.gate({"price": 1.0, "shipping": 0.0, "stock": None,
-                    "stock_state": "in_stock"}, 5, 10) is None
+                    "stock_state": "in_stock", "lead": 3}, 5, 10) is None
     why = ps.gate({"price": 1.0, "shipping": 0.0, "stock": 0,
                    "stock_state": "in_stock"}, 5, 10)
     assert why and "库存不足" in why
@@ -321,3 +322,19 @@ def test_cutoff_is_calibrated_against_the_reputation_ceiling():
     assert ps.CUTOFF < good, (
         f"淘汰线 {ps.CUTOFF} 已经砍到「好口碑」({good:.1f})头上 —— 它该扫烂品,"
         f"不是砍正经货;多半是 BASE_MAX 调小了而线没跟着降")
+
+
+def test_the_hard_gate_judges_the_product_alone_never_a_store_condition():
+    """⚠ `gate()` 只判产品自身:定不了价 / 没库存。**逐店的条件不许写进来。**
+
+    2026-08-21 一度把「配送 >7 天」写在这里,当天撤回:货期是限额表
+    「配送时长限制」一店一填的,写死一个全局数两头错 —— 有店填 10 就白白丢掉
+    它能卖的货,全店都填 5 又让 6~7 天的货空占池子。落点是
+    `alloc_plan._pool_reach`(取参与分配的店的并集)。
+    """
+    ok = {"price": 9.9, "shipping": 0.0, "stock": 99}
+    for lead in (0, 3, 7, 12, 99, None):
+        assert ps.gate({**ok, "lead": lead}, 5, 10) is None
+    # 免罚线仍与上架链共用同一常量(打分归打分,闸归闸)
+    from services import amz_source
+    assert ps._LEAD_FREE == amz_source.MAX_LEAD_DAYS

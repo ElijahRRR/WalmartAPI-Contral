@@ -94,7 +94,9 @@ python cli.py taxonomy_derive -p apply=1
 
 ⚠ 映射这一项要先定**方向**再下发:现在 `catmap_mine -p promote=1` 直接写 PG,
 PG 是事实上的权威;若映射随类目树一起下发并重灌,挖出来的行会被文件冲掉。
-这就是「映射编辑权威(飞书 vs PG)」那条未决——下发前必须先定。
+「映射编辑权威(飞书 vs PG)」已于 2026-08-17 定下来:**PG 是权威,飞书
+「映射明细」是镜子**(`catmap_export` 库→飞书整表重写,`catmap_import` 反向补回)
+——所以映射**不随类目树下发重灌**,下发的映射快照只做对账。
 
 ## 2. 三段式维护顺序(所有者规划)
 
@@ -133,7 +135,8 @@ PG 是事实上的权威;若映射随类目树一起下发并重灌,挖出来的
 
 - **B 桶** 3,787 node / 44,781 件:有产品、无映射、无任何实证 PT → LLM
   (`catmap_suggest`,已实现但**仍按路径为键**,尚未跟着锚线改成 node 键;
-  产出是建议表里的死数据,升级通道等编辑权威定稿)或人工;
+  升级通道 2026-08-17 已建 = `catmap_promote`:只收 status='ok',缺省写
+  **中**置信(只进候选不直出),`-p as=高` 必须配 `-p paths=` 点名)或人工;
 - **C 桶** 2,759 node:产品带着这个 node,但类目树里根本没有 → 采集侧补抓
   (`python cli.py catmap_gap -p only=not_in_tree`);
 - **D 桶** 12,386 node:亚马逊有、我们没货 → **不处理**(别浪费 LLM)。
@@ -183,18 +186,28 @@ python cli.py catmap_gap -p only=not_in_tree      # C 桶:给采集侧的补抓�
 python cli.py catmap_mine                         # 挖(票≥5 优势≥80%,只报不改)
 python cli.py catmap_mine -p min_support=3 -p min_dominance=0.7
 python cli.py catmap_mine -p promote=1            # 把 mined_trusted 写进映射表
-python cli.py catmap_fix -p nodes=all_conflicts   # 冲突定点修正(危险,需 --execute)
+python cli.py catmap_fix -p nodes=all_conflicts   # 冲突定点修正(危险:**缺省即真跑**,空跑加 --dry-run)
 python cli.py taxonomy_import -p file=<路径>      # 导类目树(预览强制先验 JOIN)
 python cli.py taxonomy_derive                     # 反推树外 node(零采集)
 python cli.py node_backfill                       # 从存量快照回填 browse_node_id
 python cli.py pt_backfill                         # 历史实证 PT 回填产品主档
+python cli.py catmap_promote --dry-run            # LLM 建议升级进映射表(缺省写「中」,-p as=高 须配 -p paths=)
+python cli.py catmap_prune --dry-run              # 清掉指向 spec 里没有的 PT 的行(缺省真删)
+python cli.py catmap_export --dry-run             # 映射表 → 飞书「映射明细」镜子(整表重写)
+python cli.py catmap_import --dry-run             # 飞书 → 库补回(只增不改)
+python cli.py catmap_align                        # 路径别名对齐(无 ID 老行的兜底)
 ```
 
 ## 5. 未决
 
-- **映射编辑权威(飞书 vs PG)**:`catmap_mine -p promote=1` 直接写 PG;若最终
-  定飞书为权威,已升级行需回补进「映射明细」表。所有者待类目树补抓后再定。
-- **②段人工核对的载体**:目前只能 psql 看建议表,没有导出/回收工作流。
+- ~~**映射编辑权威(飞书 vs PG)**~~ **已定(2026-08-17):PG 是权威,飞书
+  「映射明细」是镜子** —— `catmap_export` 库→飞书整表重写(缩量超阈值停手),
+  `catmap_import` 反向补回(只增不改)。首版无护栏的导出净删过 1,847 行映射
+  (其中 1,695 行指向有效 PT),护栏已补。
+- **②段人工核对的载体**:建议表 `audit.category_map_suggestions` 本身仍只能
+  psql 看,没有导出工作流;**回收通道已有** —— LLM 建议走 `catmap_promote`
+  (只收 status='ok',回写 status='promoted'),`mined_review`/`map_conflict`
+  由 `catmap_mine -p promote=1` 按档位直接写进映射表。
 - **父链兜底本身还没接进审核链**:中间层补齐(`taxonomy_derive`)只是把
   数据备好,L1 里"叶子无映射 → 沿父链找已映射祖先"这一级还没加——
   加之前要先想清楚**退到第几级为止**(退到 L1 根类目等于瞎判)。

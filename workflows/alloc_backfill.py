@@ -33,7 +33,7 @@ from collections import Counter
 from registry import db
 from services import claims
 from services import alloc_survey as sv           # 判定口径与 alloc_audit 同一套
-from services import sku_asin, store_targets, stores as stores_svc
+from services import store_targets, stores as stores_svc
 
 DANGEROUS = True
 
@@ -74,27 +74,18 @@ def run(params: dict) -> str:
     sales_days = int(params.get("sales_days", 365))
     win = sv.sales_window(str(params.get("as_of", "")), sales_days)
 
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(sv._SQL_PT2CAT)
-        pt2cat = {pt: c for pt, c in cur.fetchall() if c}
-        cur.execute(sv._SQL_ONLINE)
-        items = cur.fetchall()
-        cur.execute(sv._SQL_SALES, win)
-        sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}
-        asins = sorted({a for a in (sku_asin.extract_asin(it[1])
-                                    for it in items) if a})
+    with db.pg_conn() as conn:
         # ⚠ **必须带渠道**(2026-08-16 改):渠道不符的行不产生占用,而这个
         # 判定要 latest_snapshot 里的 is_fba。这里省掉的话,`sv.claimable` 的
         # 渠道闸对回填恒为假(channel 全 None ⇒ 一行都不算不符),
         # 于是 alloc_audit 判一套、回填落另一套 —— 正是 alloc_survey 要防的事。
         # 代价是这段 LATERAL 慢一些;回填是一次性动作,值这个钱
-        meta = sv._fetch_meta(cur, asins, True)
-
-    rows, st = sv.enrich(items, meta, pt2cat)
+        loaded = sv.load_rows(conn, win=win, need=("sales",), with_channel=True)
+    rows, st, sales = loaded.rows, loaded.st, loaded.sales
 
     # 纪律 1:只认在册店的已发布行
     try:
-        registered = stores_svc.registered_names()
+        registered = stores_svc.enabled_names()
     except Exception as e:                            # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):无法判定哪些行是冻结快照,拒绝回填"
     try:

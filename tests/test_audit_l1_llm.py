@@ -76,19 +76,27 @@ def _clean_stats():
 # ── 1. 提示词字节钉住(合同 L1-3:不得改写/概括/顺手修数字)────────────────
 
 def test_system_prompt_bytes_pinned():
-    # 旧仓 pipelines/l1_category.py:450-540 的字符串字面量,ast 抽取后哈希
+    # 2026-08-20 重新钉:删掉「禁售品类」整节与 excluded_category_reason 输出字段
+    # (excluded 那条链已下线,类目准入只由 L2 R1 白名单判)。
+    # 提示词是判定面的一部分,改一个字都要在这里过一遍眼。
     assert hashlib.sha256(l1.L1_SYSTEM_PROMPT.encode()).hexdigest() == (
-        "d56b5d6e8b4621f23aa89132f9880fad9840f2215f8f32e9827fc26aaf1d5303")
-    assert len(l1.L1_SYSTEM_PROMPT) == 3435
+        "fbcf1c5c543bd03dce006dac599bc88a60acb440ea9c537d6ba475129de924d7")
+    assert len(l1.L1_SYSTEM_PROMPT) == 2713
 
 
 def test_system_prompt_keeps_known_number_mismatch():
     """已知缺陷照迁:正文 30 / user 段 top 15 / 实际截断 20,三处不一致。"""
     assert "若 30 个候选里没一个合理" in l1.L1_SYSTEM_PROMPT
     assert "# 候选 PT (top 15)" in l1.build_user_prompt(_product(), [])
-    # 输出 schema 允许 pt_source='excluded'(下游无任何分支消费它)——照迁
-    assert '"pt_source": "map_verified" | "llm_direct" | "excluded"' in \
-        l1.L1_SYSTEM_PROMPT
+
+
+def test_system_prompt_no_longer_asks_the_model_to_judge_admission():
+    """2026-08-20:提示词里的「禁售品类」清单与 excluded_category_reason
+    字段已删 —— 那是让模型凭标题猜类目禁令,而准入事实在 walmart_pt_meta 里。
+    模型只负责选 PT,类目能不能做归 L2 R1。"""
+    assert "excluded_category_reason" not in l1.L1_SYSTEM_PROMPT
+    assert "禁售品类" not in l1.L1_SYSTEM_PROMPT
+    assert '"pt_source": "map_verified" | "llm_direct",' in l1.L1_SYSTEM_PROMPT
 
 
 def test_user_prompt_template_verbatim():
@@ -305,13 +313,12 @@ def test_no_db_only_fallback_and_no_cache():
 
 def test_rerank_happy_path_and_request_params(monkeypatch):
     fn = _chat({"walmart_product_type": "GoodPT", "pt_confidence": "高",
-                "pt_source": "map_verified", "excluded_category_reason": None,
-                "reasoning": "候选契合"})
+                "pt_source": "map_verified", "reasoning": "候选契合"})
     cands = [{"walmart_product_type": "GoodPT", "confidence": "高"}]
     out = l1.rerank(_product(), cands, PT_DICT, chat_fn=fn)
     assert out.walmart_product_type == "GoodPT"
     assert (out.pt_confidence, out.pt_source) == ("高", "map_verified")
-    assert out.excluded_category_reason is None and out.hits == []
+    assert out.hits == []
     msgs = fn.calls[0]
     assert msgs[0]["role"] == "system" and msgs[0]["content"] == l1.L1_SYSTEM_PROMPT
     assert msgs[1]["content"] == l1.build_user_prompt(_product(), cands)
@@ -369,55 +376,23 @@ def test_dict_fallback_f3_takes_first_usable_candidate():
 
 # ── 5. excluded / seed / 出版物硬禁 ───────────────────────────────────────
 
-def test_llm_excluded_produces_minus_100_hit():
-    fn = _chat({"walmart_product_type": "GoodPT", "excluded_category_reason": "3C禁售",
-                "reasoning": "是耳机"})
-    cands = [{"walmart_product_type": "GoodPT", "confidence": "高"}]
-    out = l1.rerank(_product(), cands, PT_DICT, chat_fn=fn)
-    assert out.excluded_category_reason == "3C禁售"
-    hit = out.hits[0]
-    assert (hit.rule_code, hit.penalty) == ("excluded_category", -100)
-    assert hit.detail["from_seed_yaml"] is False
-    assert hit.detail["llm_reasoning"] == "是耳机"
+def test_excluded_chain_is_gone():
+    """2026-08-20 所有者定稿 A1:seed yaml 的「3C/服饰/汽配/带电禁售」整条链下线。
 
-
-@pytest.mark.parametrize("null_like", [None, "null", "None", "", "none"])
-def test_excluded_null_like_values_normalized(null_like):
+    它和 L2 R1 的类目准入白名单讲同一件事,而且是**猜**的那一份(按亚马逊路径
+    段名/标题词猜),还压在事实前面。现在模型只选 PT,能不能做由白名单判。
+    这条用例钉住入口全部消失 —— 想加回来,先在这里红。
+    """
+    for name in ("check_seed_excluded", "_load_excluded_rules"):
+        assert not hasattr(l1, name), name
+    assert "excluded_category_reason" not in l1.L1_SYSTEM_PROMPT
+    # 模型硬塞 excluded 字段也不再有任何效果:只按 PT 走正常出口
     fn = _chat({"walmart_product_type": "GoodPT",
-                "excluded_category_reason": null_like})
-    cands = [{"walmart_product_type": "GoodPT", "confidence": "高"}]
-    out = l1.rerank(_product(), cands, PT_DICT, chat_fn=fn)
-    assert out.excluded_category_reason is None and out.hits == []
-
-
-def test_seed_yaml_only_fills_when_llm_silent():
-    """seed 仅补位,LLM 的 excluded 优先(逐字 :967-969)。"""
-    p = _product(amazon_category_path="Consumer Electronics > Headphones")
-    assert l1.check_seed_excluded(p) == "3C 禁售"
-    fn = _chat({"walmart_product_type": "GoodPT"})
-    cands = [{"walmart_product_type": "GoodPT", "confidence": "高"}]
-    out = l1.rerank(p, cands, PT_DICT, chat_fn=fn)
-    assert out.excluded_category_reason == "3C 禁售"
-    assert out.hits[0].detail["from_seed_yaml"] is True
-    assert l1.STATS["seed_excluded"] == 1
-
-
-def test_seed_walmart_pt_scope_never_sees_llm_output():
-    """已知缺陷照迁(spec §3.1,合同 L1-1):seed 在 LLM 之前跑且不带 PT,
-    所以 LLM 输出 'Headphones' 这类 walmart_pt scope 的 PT 时 seed 不拦。"""
-    p = _product(amazon_category_path="Home > Audio", title="Earbuds")
-    assert l1.check_seed_excluded(p) is None
-    assert l1.check_seed_excluded(p, "Headphones") == "3C 禁售"   # 带 PT 才会拦
-    fn = _chat({"walmart_product_type": "Headphones"})
-    cands = [{"walmart_product_type": "Headphones", "confidence": "高"}]
-    out = l1.rerank(p, cands, {"Headphones"}, chat_fn=fn)
-    assert out.walmart_product_type == "Headphones"
-    assert out.excluded_category_reason is None                   # 不拦 —— 照迁
-
-
-def test_seed_first_hit_wins_and_scope_default():
-    p = _product(amazon_category_path="Clothing, Shoes & Jewelry > Men")
-    assert l1.check_seed_excluded(p) == "服饰禁售"     # Clothing 在 Shoes 之前
+                "excluded_category_reason": "3C禁售", "reasoning": "是耳机"})
+    out = l1.rerank(_product(), [{"walmart_product_type": "GoodPT",
+                                  "confidence": "高"}], PT_DICT, chat_fn=fn)
+    assert out.walmart_product_type == "GoodPT" and out.hits == []
+    assert not hasattr(out, "excluded_category_reason")
 
 
 @pytest.mark.parametrize("pt", sorted(l1.PUBLICATION_HARD_FORBID))
@@ -427,8 +402,6 @@ def test_publication_ban_pure_function(pt):
         "L1", "publication_pt_forbidden", -100)
     assert hit.detail["reason"] == "出版物类 PT 搬运无法合规 (数据验证 E 知产占比 ≥96%)"
     assert hit.detail["walmart_pt"] == pt
-    # 已有 excluded 理由时不叠加(旧仓条件逐字)→ 接线三级重复调用幂等
-    assert l1.check_publication_ban(pt, "3C禁售") is None
     assert l1.check_publication_ban("Planners") is None   # 误伤高的两类不含
 
 
@@ -436,8 +409,8 @@ def test_publication_ban_applies_to_rerank_output():
     fn = _chat({"walmart_product_type": "Books", "pt_confidence": "高"})
     cands = [{"walmart_product_type": "Books", "confidence": "高"}]
     out = l1.rerank(_product(), cands, PT_DICT, chat_fn=fn)
-    assert out.excluded_category_reason.startswith("出版物类 PT 搬运无法合规")
     assert [h.rule_code for h in out.hits] == ["publication_pt_forbidden"]
+    assert out.hits[0].detail["reason"].startswith("出版物类 PT 搬运无法合规")
     assert l1.STATS["publication_forbidden"] == 1
 
 

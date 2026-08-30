@@ -157,7 +157,7 @@ def test_poll_feed_not_terminal_returns_head_and_none(monkeypatch):
 
 def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
     import logging as _logging
-    monkeypatch.setattr(feeds, "query_pending", lambda store_name=None: [
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
         {"status": "submitted", "feed_id": "F1", "store": "T1",
          "feed_type": "DELETE_ITEM", "workflow": "", "created_at": "t"},
         {"status": "submitted", "feed_id": "F2", "store": "T_GONE",
@@ -217,6 +217,41 @@ def test_merge_error_shapes():
     assert m("", "坏了") == "坏了"              # 只有描述
     assert m(None, None) == ""
     assert len(m("C1", "x" * 2000)) == 900     # 截断
+
+
+def test_result_text_is_the_union_of_the_four_sheet_copies():
+    """「状态→中文」四份拷贝的并集,六个键一个都不能少。
+
+    processing/unknown 只有 clear_sheet 那份带,而 product_clear 是
+    `RESULT_TEXT[outcome]` **直接下标**取(不是 .get)——少一键就是 KeyError,
+    停用/删除表的整轮回写当场炸。missing 同理来自 poll_feed 的"台账里有、
+    终态明细里查无"。
+    """
+    assert feed_track.RESULT_TEXT == {
+        "success": "成功", "failed": "失败", "missing": "未查到",
+        "submitted": "处理中", "processing": "处理中", "unknown": "处理中"}
+
+
+def test_text_of_maps_status_and_never_fakes_a_verdict():
+    """未登记状态按未落定报「处理中」:不装成功也不装失败,下轮再看。"""
+    t = feed_track.text_of
+    assert t("success") == "成功"
+    assert t("failed") == "失败"
+    assert t("missing") == "未查到"
+    assert t("submitted") == t("processing") == t("unknown") == "处理中"
+    assert t("OFFICIAL_NEW_ENUM") == "处理中"
+    assert t("") == "处理中"
+
+
+def test_text_of_appends_error_only_on_the_failed_bucket():
+    """跟卖表现行形状「失败:{码 | 人话}」;成功/未查到后面不挂报错。"""
+    t = feed_track.text_of
+    want = "EXT_ERR_1 | [color] required"
+    assert t("failed", want) == f"失败:{want}"
+    assert t("failed", "") == "失败"
+    assert t("success", want) == "成功"
+    assert t("missing", want) == "未查到"
+    assert t("submitted", want) == "处理中"
 
 
 def test_all_reflectors_write_code_plus_desc(monkeypatch):
@@ -311,7 +346,7 @@ def test_poll_all_is_cross_store_concurrent_and_in_store_serial(monkeypatch):
     import threading
 
     stores = ["谭总2", "A085", "81张三"]
-    monkeypatch.setattr(feeds, "query_pending", lambda store_name=None: [
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
         {"status": "submitted", "feed_id": f"F{s}{i}", "store": s,
          "feed_type": "DELETE_ITEM", "workflow": "", "created_at": "t"}
         for s in stores for i in (1, 2)])

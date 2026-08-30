@@ -13,6 +13,7 @@ class _Conn:
     def __init__(self, state=()):
         self.sqls: list = []
         self._state = list(state)
+        self.rowcount = 1        # burn_for_retire 读 rowcount
 
     def cursor(self):
         return self
@@ -83,6 +84,37 @@ def test_retire_submits_and_starts_cooldown(monkeypatch):
     assert {e["event"] for e in recorded} == {heal.product_events.RETIRE_SUBMITTED}
     assert all(e["source"] == "sku_locked_heal" for e in recorded)
     assert "退役提交 2 条" in out
+
+
+def test_multi_slice_results_line_up_with_their_own_rows(monkeypatch):
+    """submit_feed 只回 count 不回条目,对位走 api/feeds.iter_result_slices
+    —— 错一位就是别人的 SKU 挂着这一片的 feed_id 起算冷却,而且**不报错**。
+
+    ⚠ 中间那片必须也是 submitted 且带**另一个** feed_id:只有落地的片子才
+    验得出游标。首片起点恒为 0,尾片若是 failed 又不碰行 —— 两头都验不出
+    错位,「切片对位」这条断言会变成摆设。
+    """
+    rows = [_row(2, asin="B0SLICE001"), _row(3, asin="B0SLICE002"),
+            _row(4, asin="B0SLICE003"), _row(5, asin="B0SLICE004")]
+    conn = _patch_common(monkeypatch, rows, state=[])
+    monkeypatch.setattr(
+        heal.feeds, "submit_feed",
+        lambda store, ft, skus, workflow: [
+            {"outcome": "submitted", "feed_id": "FR_A", "count": 1},
+            {"outcome": "submitted", "feed_id": "FR_B", "count": 2},
+            {"outcome": "failed", "feed_id": None, "count": 1}])
+    recorded = []
+    monkeypatch.setattr(heal.product_events, "record_many",
+                        lambda c, evs: (recorded.extend(evs), len(evs))[1])
+    out = heal.run({"execute": True})
+    inserts = [r for sql, rows_ in conn.sqls
+               if "INSERT INTO listing.retire_cooldown" in sql for r in rows_]
+    assert inserts == [("T1", "B0SLICE001", "FR_A"),
+                       ("T1", "B0SLICE002", "FR_B"),
+                       ("T1", "B0SLICE003", "FR_B")]    # 各片挂各片的 feed_id
+    assert [e["sku"] for e in recorded] == ["B0SLICE001", "B0SLICE002",
+                                            "B0SLICE003"]   # 被拒那片不入病历
+    assert "退役提交 3 条" in out and "一批 1 条提交被拒" in out
 
 
 def test_open_cooldown_not_resubmitted_and_failed_needs_human(monkeypatch):

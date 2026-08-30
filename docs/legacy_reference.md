@@ -14,14 +14,14 @@
    反查双确认未达(not_found)、4xx 被拒(rejected);**Unknown 永不回收**,
    conflict/bad_prefix 永久弃用。历史上因释放语义不一致出过重复使用事故。
    ⚠ 2026-08-14 勘误:原写「永不释放」并列在"必须原样保留"清单里——照它做会
-   把 `services/upc_pool.py:107 release()` 当违规实现删掉,**造成 UPC 池只出不进**。
+   把 `services/upc_pool.py:219 release()` 当违规实现删掉,**造成 UPC 池只出不进**。
 5. **DELETE_ITEM 只对 SFF 且不可恢复**;旧系统每店提交间隔 360s、单日上限从飞书表读取。
 6. **auto_listing 的 9 状态生命周期**与 reconcile(按 feed 结果回写)语义,
    迁移 listing 时先读旧仓库 `auto_listing/README.md` 和 `docs/closed_loop.md`。
 
 ## 飞书踩坑参数(api/feishu.py 必须内置)
 
-- 瞬时错误码 **90235 / 90217 / 50502** 需指数退避重试;其他错误码不重试
+- 瞬时错误码 **90235 / 90217 / 50502 / 99991400** 需指数退避重试(代码另有小写子串兜底轨:"data not ready" / "too many request" / "timeout");其他错误码不重试
   (`1204` 曾被批量下架当超时并列处理但未进 lark_io 白名单,新实现需实测定夺)。
 - **飞书调用必须显式绕开本机 HTTP 代理**(旧系统 `LARK_CLI_NO_PROXY=1` / no_proxy):
   2026-05-07 事故根因即本机代理 127.0.0.1:7897 拒连导致 14,610 个单元格写回失败。
@@ -35,10 +35,10 @@
 
 | 端点 | 配额 |
 |---|---|
-| PRICE_AND_PROMOTION feed | **6/天**(价格批量必须聚合,严禁高频提交) |
+| PRICE_AND_PROMOTION feed | **10/hour**(三件套共享桶,2026-08-26 官方复核;旧记 6/天只属本仓不用的 feedType=promo。代码按 8/hour 配置,见蓝图 §3.2) |
 | PUT /v3/price 单品 | 100/小时 |
 | GET /v3/items 带 query | 60/分钟(无 query 300/分钟) |
-| Insights 绩效类 22 个端点 | 全部 1/分钟 |
+| Insights performance/* 绩效端点 | 1/分钟(summary 与 report 各算独立端点);同类目下 unpublished items/counts 是 100/分钟、listingQuality score 是 10/小时,**不是**全部 1/分钟——权威见蓝图 §3.1 |
 | /v3/feeds 与 /v3/feeds/{id} | 共享 5000/分钟 |
 | WFS Inventory Reconciliation | 1/小时(必须缓存) |
 
@@ -65,12 +65,12 @@ itemNotReceived 六个端点不在官方限速表内,按 1/分钟保守节流。
   **价格三件套**。`errorReport` 下载另有 60/小时 独立限制。
   ⚠ 2026-08-14 勘误:原写「除特例外所有 feed 共享一个通用桶」——那是旧仓推断,
   已于 2026-08-05 官方核验作废(见 api_blueprint §3.2)。代码侧反证:
-  `api/_client.py:178-183` 逐 feedType 独立登记(DELETE_ITEM 6/3600、
-  MP_MAINTENANCE 8/3600、MP_ITEM_MATCH 15/3600、MP_ITEM 8/3600、inventory 8/3600),
-  只有 `feeds.post.price` 是共享桶。**按错的那条排期会把 5 个独立桶当成 1 个,
+  `api/_client.py:234-242` 逐 feedType 独立登记(DELETE_ITEM 6/3600、
+  RETIRE_ITEM 6/3600、MP_MAINTENANCE 8/3600、MP_ITEM_MATCH 15/3600、MP_ITEM 8/3600、
+  inventory 8/3600),只有 `feeds.post.price` 是共享桶。**按错的那条排期会把 6 个独立桶当成 1 个,
   严重低估 feed 吞吐。**
 - `DELETE_ITEM_VER = "5.0.20250919-16_45_47-api"` 之类版本常量被抄 3 份 →
-  唯一出处是 `registry/resources.py` 的 `FEED_SPEC_VERSIONS`,`api/feeds.py:79` 只取用
+  唯一出处是 `registry/resources.py:104` 的 `FEED_SPEC_VERSIONS`,`api/feeds.py:94` 只取用
   (2026-08-14 勘误:原写"只在 api/feeds.py",与铁律 3「一切表 ID/常量只准从 registry 取」相悖)。
 - 整表覆盖写飞书导致"新短旧长残留尾部旧行" → 多维表格按 record_id 更新,天然消灭。
 - 双重调度(订单同步同时被 launchd 每小时 + skill 13:30 触发)→ 新系统一条工作流

@@ -10,6 +10,9 @@ api 层只做接口适配:base_url/token 从 registry 取、超时、按状态�
   batch_status(batch_name)              -> {status, stats:{...}}
   batch_failures(batch_id)              -> [{asin, error_type, error_detail, ...}]
   export_incremental(cursor, limit)     -> (records, next_cursor, has_more)
+  export_batch_records(batch_name, cursor, limit)
+                                        -> (records, next_cursor, has_more, meta)
+                                           批内游标,与全局游标不可互换(§4.11)
 
 状态码分流(契约 §5.1,每一条都有来历,别简化):
   200 → 正常(**空结果也是 200**:records=[] + next_cursor 原样不推进)
@@ -56,6 +59,20 @@ _warned_no_token = False
 
 
 def _headers() -> dict:
+    """输入:无 → 输出:采集侧请求头(只有鉴权;没配 token 时空 dict)。
+
+    ⚠⚠ **绝不能在这里设 `Accept-Encoding`**(2026-08-21 采集侧上 gzip 后立的规矩)。
+    httpx 默认发 `accept-encoding: gzip, deflate` 并自动解压 —— gzip 生效**全靠
+    这个默认协商**,本仓一行代码都没为它改过。手写这个头(哪怕只是想加别的头时
+    顺手带一个 `identity`)会覆盖默认值,**gzip 静默失效、没有任何告警**,只是
+    每页从 0.3 秒退回 10 秒级,而那种慢是会被当成"采集侧又抖了"的。
+
+    生产实测(2026-08-21,`/api/export/incremental` 一页 500 条):
+        未压缩 2,869 KB / 3.3~10.9s   →   gzip 后 694 KB / 0.30s(压缩比 4.1:1)
+        每条记录约 5.7 KB
+    ⚠ 只声明 gzip / deflate:本仓 httpx 的解码器就这两个(外加 identity),
+    采集侧若改用 br / zstd 且不看协商直接压,我们拿到的是解不开的字节流。
+    """
     global _warned_no_token
     token = os.environ.get("SCRAPER_EXPORT_TOKEN", "").strip()
     if not token:
@@ -419,3 +436,87 @@ def export_incremental(cursor: int, limit: int = 500, *, max_retries: int = 4
                 logger.warning("增量导出失败(%s),%ds 后重试", e, wait)
                 time.sleep(wait)
     raise RuntimeError(f"增量导出连续 {max_retries} 次失败:{last}")
+
+
+def export_batch_records(batch_name: str, cursor: int = 0, limit: int = 500,
+                         *, max_retries: int = 4
+                         ) -> tuple[list[dict], int, bool, dict]:
+    """输入:批次名 + 批内游标(独占下界)→ 输出:(records, next_cursor,
+    has_more, meta)。
+
+    `GET /api/export/batch/{batch_name}/records`(采集侧 #12,契约 §4.11):
+    与 `/api/export/incremental` 读同一张事件表、records 逐字段同构,差别只在
+    取行范围(WHERE batch_id = ? AND seq > ?)。它回答的是「我刚推的这一批,
+    到底采到了什么」——事件流里**没采成就没有行**,不会拿旧行冒充本批结果
+    (`/api/results` 那条老路的洞)。
+
+    meta 原样透传 {"batch": {...}, "coverage": {asin_total, asin_with_event},
+    "retention_min_cursor": N, "max_cursor": N}:coverage 让调用方不发第二个
+    请求就能判断这批齐没齐(相等≠全成功,成功与否看逐条 outcome)。
+
+    ⚠ **批内游标与全局游标不可互换**(契约明示):数值同源于 seq,但本端点的
+    next_cursor 只在这个批次内部有意义,喂进 export_incremental 不报错、
+    会静默跳过中间所有别的批次的事件。所以这里的游标**只做本次调用的翻页**,
+    绝不落 ops.cursors。
+
+    状态码(与增量端点两处不同):404 在本端点**只有一个含义:批次名不存在**
+    (LookupError,别重试);没有 409——保留期裁掉老批次时照实回 200 +
+    不完整集合,靠 coverage 对不上 + retention_min_cursor 识别。
+    """
+    if limit < 1 or limit > LIMIT_MAX:
+        raise ValueError(f"limit 须在 1..{LIMIT_MAX}(收到 {limit})")
+    if not batch_name:
+        raise ValueError("export_batch_records:批次名为空")
+    url = f"{base_url()}/api/export/batch/{batch_name}/records"
+    params = {"cursor": int(cursor), "limit": int(limit)}
+    last: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            resp = httpx.get(url, params=params, headers=_headers(),
+                             timeout=httpx.Timeout(120, connect=10))
+            code = resp.status_code
+            if code == 200:
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    raise RuntimeError(f"批次导出响应非 JSON: {e}") from None
+                got = data.get("contract_version")
+                if got not in (None, CONTRACT_VERSION):
+                    logger.warning("采集侧契约版本 %s ≠ 本侧 %s:两侧需同步升版",
+                                   got, CONTRACT_VERSION)
+                records = data.get("records") or []
+                nxt = int(data.get("next_cursor", cursor))
+                meta = {k: data.get(k) for k in
+                        ("batch", "coverage", "retention_min_cursor",
+                         "max_cursor")}
+                return records, nxt, bool(data.get("has_more")), meta
+            if code == 401:
+                raise ExportAuthError(
+                    "采集服务拒绝导出鉴权(401):核对 SCRAPER_EXPORT_TOKEN "
+                    "与采集侧 EXPORT_TOKEN 是否一致")
+            if code == 404:
+                # 契约:本端点 404 唯一含义 = 批次名不存在。但采集侧若还是
+                # 旧版本(#12 未部署),框架 404 长相不同——按瞬时故障告警
+                # 重试,别把「端点没挂」误读成「批次没了」而放弃这批的数据
+                body = resp.text[:200]
+                if "batch_not_found" in body or "批次不存在" in body:
+                    raise LookupError(f"批次不存在:{batch_name}")
+                raise RuntimeError(
+                    f"批次导出 404 但不是 batch_not_found({body})——"
+                    f"采集侧可能未部署批次端点(#12)")
+            if code == 422:
+                raise ValueError(f"批次导出参数被拒(422):{resp.text[:200]}")
+            if code in (429, 500, 502, 503, 504):
+                raise RuntimeError(f"采集服务 HTTP {code}: {resp.text[:160]}")
+            raise RuntimeError(f"采集服务未知状态 {code}: {resp.text[:160]}")
+        except (ExportAuthError, LookupError, ValueError):
+            raise           # 终态错误(401/404/422):重试无意义
+        except (httpx.HTTPError, RuntimeError) as e:
+            last = e
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("批次 %s 导出失败(%s),%ds 后重试",
+                               batch_name, e, wait)
+                time.sleep(wait)
+    raise RuntimeError(f"批次 {batch_name} 导出连续 {max_retries} 次失败:{last}")

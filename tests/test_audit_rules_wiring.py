@@ -11,18 +11,17 @@ from types import SimpleNamespace
 import pytest
 
 from registry import resources
-from services import audit_rules, audit_store
+from services import audit_l2, audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
-from workflows.risk_sync import _sync_column_blacklist
+from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 
 
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
-                phase0_cats=frozenset(), brand_blacklist={},
-                pt_meta={}, pt_spec={}, ac_automaton=None, mega=[],
-                nrtl_small=[], nrtl_whole=[], nice_mapping={},
+                brand_blacklist={},
+                pt_meta={}, ac_automaton=None, nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
     return audit_rules.AuditContext(**base)
@@ -65,6 +64,26 @@ def test_audit_one_pending_when_pt_unresolved():
     ctx = _ctx(pt_meta=META)
     out = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx)
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"
+
+
+def test_audit_one_l2_pending_when_pt_not_in_meta():
+    """2026-08-20 P0:PT 解出来了但准入明细里没有这一行 ⇒ L2 R1 判不了。
+
+    此前这条路是**静默 100 分放行**;白名单是唯一的类目判据(R0/R2 已删),
+    没人兜底,必须停在 L2 转待人工。注意 stage 是 L2 不是 L1(PT 解出来了),
+    分数照样带出来(证据已收全),这两点与"L1 解不出 PT"的 pending 不同。
+    """
+    # 基准:PT 在明细里 → 正常放行
+    ctx = _ctx(pt_meta=dict(META), walmart_confirmed={"B0P": "GoodPT"})
+    assert audit_rules.audit_one(
+        ProductInfo(asin="B0P", title="w"), ctx).verdict == "pass"
+
+    # 产品行自带 PT(不经 resolve_pt 的 pt_meta 闸),而明细里没有这一行
+    ctx2 = _ctx(pt_meta=dict(META))
+    l1 = L1Info(walmart_product_type="GhostPT", pt_source="audit_cached")
+    l2 = audit_l2.evaluate(ProductInfo(asin="B0Q", title="w"), l1, ctx2)
+    assert l2.verdict == "pending" and l2.score_final == 100
+    assert [h.rule_code for h in l2.hits] == ["cat_gate_pt_not_in_meta"]
 
 
 def test_audit_one_phase0_blocked_stub():
@@ -123,6 +142,69 @@ def test_pick_where_four_states():
     w, _ = product_audit._pick_where({"mode": "pending"})
     # 待定专刷:只圈 pending,且**不带 1 天退避**(改完判定要立刻验证)
     assert w == "p.audit_status = 'pending'" and "interval" not in w
+    w, _ = product_audit._pick_where({"mode": "pass"})
+    # 现役 pass 全量重扫(2026-08-19 所有者:黑名单翻案要能覆盖放行过的行)
+    assert w == "p.audit_status = 'approved'"
+
+
+def test_pick_where_online_scopes_to_listed_rows():
+    """mode=online:**在架** pass 重过 L0(product_chain 每天 13:00 那条)。
+
+    与 mode=pass 只差范围。为什么要收窄:下游 problem_scan 只认在架行
+    (`audit_listing_conflicts.rejected_still_listed`),不在架的翻案产不出
+    任何动作 —— 白扫一遍还把 audit_runs 灌大。
+    口径是 `missing_since IS NULL`(还在目录里),**不加** published_status:
+    UNPUBLISHED 的行也占着账号、也删得掉。
+    """
+    w, e = product_audit._pick_where({"mode": "online"})
+    assert "p.audit_status = 'approved'" in w and e == {}
+    assert "catalog.walmart_items" in w and "missing_since IS NULL" in w
+    assert "published_status" not in w
+    assert "online" in product_audit._MODES
+
+
+def test_online_mode_is_pinned_to_l0(monkeypatch):
+    """mode=online 只准零 LLM:它挂在 product_chain 上天天跑。
+
+    忘了 stages=L0 就该**起不来**,而不是默默打一轮全库 LLM
+    (与 mode=pass 同款钉死)。
+    """
+    with pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "online"})
+    with pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "pass"})
+
+
+def test_pick_where_nonpass_covers_all_three_non_pass_states():
+    """非 pass 全量重判(所有者定稿 2026-08-21:判定标准改了就整批重认一次)。
+
+    两条钉死:
+    ① 用 `IS DISTINCT FROM 'approved'` 而**不是** `<> 'approved'` ——
+       后者对 NULL 求值为 NULL,**从没审过的会被整批漏掉且不报错**;
+    ② 必须带版本闸 —— rejected 判完还是 rejected,状态不变 ⇒ 不退出候选,
+       没有版本闸的话每轮 limit 都从头扫同一批,真跑原地打转
+       (mode=pass 那条注释记着的同款坑)。
+    """
+    w, e = product_audit._pick_where({"mode": "nonpass"})
+    assert "p.audit_status IS DISTINCT FROM 'approved'" in w
+    assert "<> 'approved'" not in w and "!= 'approved'" not in w
+    assert "audit_version IS DISTINCT FROM" in w
+    assert e["nonpass_ver"] == resources.AUDIT_RULES_VERSION
+    # 非 pass 重判是人工显式动作,不吃 24 小时 run 护栏(否则 dry-run 抽样漂移)
+    assert product_audit._is_forced({"mode": "nonpass"}, {})
+
+
+def test_mode_pass_requires_stages_l0():
+    """mode=pass 不带 stages=L0 必须炸:全链重审全部 pass = 重烧全库 LLM。
+
+    钉住的是 fail-loud —— 静默跑全链的话,几万个 approved 行进 L1/L3,
+    钱花完了才发现,而且部分行可能被 LLM 层改判(那是 force_rerun 的语义,
+    不是"黑名单翻案"的语义)。
+    """
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="stages=L0"):
+        product_audit.run({"mode": "pass", "limit": 10})
 
 
 def test_pick_where_rerule_targets_only_the_rejected_backlog():
@@ -216,13 +298,17 @@ class _BLConn:
 
 
 _SELLER_SHEET = SimpleNamespace(name="黑名单卖家店铺ID", columns=("seller_id",))
-_CAT_SHEET = SimpleNamespace(name="黑名单亚马逊类目", columns=("category",))
+# 类目表 2026-08-20 从单列升成五列(所有者把 233 条规则整个粘贴进飞书,
+# 黑名单中心要按实际列读)。列序即表头顺序,与 registry 一致。
+_CAT_SHEET = SimpleNamespace(
+    name="黑名单亚马逊类目",
+    columns=("category", "browse_node_id", "category_zh", "match_type", "reason"))
 
 
 def test_sync_blacklist_empty_read_never_truncates():
     conn = _BLConn(old_n=1314)
     msg = _sync_column_blacklist(conn, _SELLER_SHEET,
-                                 "catalog.seller_blacklist", [], False)
+                                 "catalog.seller_blacklist", [])
     assert "不重灌" in msg
     assert not any("TRUNCATE" in s for s in conn.sql)
 
@@ -233,7 +319,7 @@ def test_sync_blacklist_shrink_guard():
     rows = [{"seller_id": "S1"}]
     with pytest.raises(RuntimeError, match="骤缩"):
         _sync_column_blacklist(conn, _SELLER_SHEET,
-                               "catalog.seller_blacklist", rows, False)
+                               "catalog.seller_blacklist", rows)
     assert not any("TRUNCATE" in s for s in conn.sql)
 
 
@@ -242,22 +328,86 @@ def test_sync_blacklist_seller_refill_dedupes():
     rows = [{"seller_id": "S1"}, {"seller_id": "S2"},
             {"seller_id": "S1"}, {"seller_id": ""}]
     msg = _sync_column_blacklist(conn, _SELLER_SHEET,
-                                 "catalog.seller_blacklist", rows, False)
+                                 "catalog.seller_blacklist", rows)
     assert "全量重灌 2 条" in msg
     assert sum("TRUNCATE" in s for s in conn.sql) == 1
     assert conn.inserted == [("S1",), ("S2",)]
 
 
-def test_sync_blacklist_cat_refill_normalizes():
+# ── 类目表五列镜像(risk_sync._sync_amzcat_blacklist)────────────────────
+
+def _cat_row(cat, nid="", zh="", how="", reason=""):
+    return {"category": cat, "browse_node_id": nid, "category_zh": zh,
+            "match_type": how, "reason": reason}
+
+
+def test_sync_amzcat_keeps_match_type_from_sheet():
+    """三种匹配都要原样落库 —— 单列时代只能存 path_exact,子树规则会整批
+    退化成"只拦这一行",拦截面从两万个类目塌回几百条,而且不报错。"""
+    conn = _BLConn(old_n=3)
+    rows = [_cat_row("Toys & Games > Puzzles", "166057011", "拼图", "子树"),
+            _cat_row("Video Games", "", "电子游戏", "顶级名"),
+            _cat_row("A > B", "", "", "路径等值")]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    got = {r["mv"]: r for r in conn.inserted}
+    assert got["Toys & Games > Puzzles"]["mt"] == "node_subtree"
+    assert got["Toys & Games > Puzzles"]["nid"] == "166057011"
+    assert got["Video Games"]["mt"] == "top_name"
+    assert got["Video Games"]["nid"] is None          # 顶级无 ID
+    assert got["A > B"]["mt"] == "path_exact"
+    assert "子树 1" in msg and "顶级名 1" in msg and "路径等值 1" in msg
+    assert sum("TRUNCATE" in s for s in conn.sql) == 1
+
+
+def test_sync_amzcat_empty_read_never_truncates():
+    """读到 0 条可用规则(接口异常 / 表头列错位)绝不重灌 —— 空表重灌 =
+    类目闸整条失效,而且不报错。"""
+    conn = _BLConn(old_n=233)
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist",
+                                 [_cat_row("", "", "", "子树")])
+    assert "不重灌" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql)
+
+
+def test_sync_amzcat_shrink_needs_explicit_key():
+    """11,810 条精确路径换成 233 条子树规则是缩 98%,护栏必须拦下来;
+    确认要缩的人得显式敲 -p allow_shrink=1。"""
+    conn = _BLConn(old_n=11810)
+    rows = [_cat_row(f"T{i} > X", str(i), "", "子树") for i in range(233)]
+    with pytest.raises(RuntimeError, match="allow_shrink"):
+        _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                               "catalog.amazon_cat_blacklist", rows)
+    assert not any("TRUNCATE" in s for s in conn.sql)
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows,
+                                 allow_shrink=True)
+    assert "整表重灌 233 条" in msg
+
+
+def test_sync_amzcat_blank_match_type_falls_back_and_says_so():
+    """「匹配方式」列为空才按 ID 推断,而且必须报数 —— 名单里有一批 ID 是
+    回落匹配来的,当子树根用会整棵误拦,静默回落等于主路径坏了没人知道。"""
+    conn = _BLConn(old_n=1)
+    rows = [_cat_row("A > B", "123", "", ""), _cat_row("C > D", "", "", "")]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    got = {r["mv"]: r for r in conn.inserted}
+    assert got["A > B"]["mt"] == "node_subtree"
+    assert got["C > D"]["mt"] == "path_exact"
+    assert "2 行「匹配方式」列为空" in msg
+
+
+def test_sync_amzcat_normalizes_and_dedupes():
     """类目存归一化值(与查询侧共用 normalize_amazon_category),原文留档。"""
     conn = _BLConn(old_n=1)
-    rows = [{"category": "Toys > Games"},
-            {"category": "Toys>Games"},        # 归一化后与上一行同键 → 去重
-            {"category": ""}]
-    msg = _sync_column_blacklist(conn, _CAT_SHEET,
-                                 "catalog.amazon_cat_blacklist", rows, True)
-    assert "全量重灌 1 条" in msg
-    assert conn.inserted == [("Toys->Games", "Toys > Games")]  # 首见原文为准
+    rows = [_cat_row("Toys > Games", "", "", "路径等值"),
+            _cat_row("Toys>Games", "", "", "路径等值")]   # 归一后同键
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows)
+    assert "整表重灌 1 条" in msg
+    assert conn.inserted[0]["norm"] == "Toys->Games"
 
 
 # ── parse_asin_lines(历史继承 ASIN 导入)────────────────────────────────────
@@ -563,10 +713,14 @@ def test_pt_backfill_fold_rows():
 
 
 def test_rerank_exit_pt_meta_gate(monkeypatch):
-    """评审 P0:rerank 出口过 pt_meta 闸——spec-only PT 直出会让 L2 四闸失明
-    产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。"""
+    """评审 P0:rerank 出口过 pt_meta 闸 —— pt_meta 里没有的 PT 直出会让 L2 四闸
+    失明产假 pass,还把 meta 表没有的 PT 写进身份层。防御后转 pending。
+
+    ⚠ 这条原来叫「spec-only PT」:ctx 曾同时装 pt_meta 与 pt_spec 两本字典,
+    只在 spec 里的 PT 能绕过 meta 闸。2026-08-21 R3 收敛后 ctx 只剩 pt_meta,
+    但这道防御照旧要有 —— LLM 可以凭空回一个 meta 表里没有的 PT 名。"""
     from services import audit_l1_llm
-    ctx = _ctx(pt_meta=META, pt_spec={"SpecOnlyPT": {}})
+    ctx = _ctx(pt_meta=META)
     p = ProductInfo(asin="B0Z", title="widget", amazon_category_path="X > Y")
     seen = {}
     monkeypatch.setattr(audit_l1_llm, "candidates", lambda conn, pr: [
@@ -813,16 +967,18 @@ class _CountConn:
         return self.cur
 
 
-def test_rerule_head_says_how_many_are_left():
-    """摘要只说"候选 500"时看不出**是刚好 500 还是撞了 limit**。
+def test_batch_head_says_how_many_are_left():
+    """摘要只说"候选 200"时看不出**是刚好 200 还是撞了 limit**。
 
-    所有者 2026-08-17 首轮 dry-run 实遇:limit 缺省就是 500,而误杀规模正是他
-    决定要不要真跑的唯一依据。与 `_claim_from_sheet` 同款纪律。
+    两次实遇:2026-08-17 rerule 首轮 dry-run(limit 缺省 500,误杀规模是
+    要不要真跑的唯一依据);2026-08-21 mode=nonpass —— 所有者:「nonpass 的
+    看不出来有多少个呢?」。要跑几轮、要花多少钱全靠这个总量。
     """
     conn = _CountConn(3200)
-    head = product_audit._rerule_head(conn, "phase0_forbidden_category",
-                                      "p.audit_status = 'rejected'",
-                                      {"rerule": "x", "rerule_ver": "v"}, 500)
+    head = product_audit._batch_head(conn, "定点重审 rerule=x",
+                                     "p.audit_status = 'rejected'",
+                                     {"rerule": "x", "rerule_ver": "v"}, 500,
+                                     "规则码拼错?")
     assert "共 3200 个" in head[0]
     assert "只判 500 个,还剩 2700 个" in head[1]
     # 计数与取候选必须同一 where,否则"还剩多少"是另一件事的数
@@ -830,11 +986,11 @@ def test_rerule_head_says_how_many_are_left():
     assert "LIMIT" not in conn.cur.sql
 
     # 撞不到上限时不该出现"还剩"那行(它会让人以为没跑完)
-    assert len(product_audit._rerule_head(
-        _CountConn(12), "r", "w", {}, 500)) == 1
-    # 一个都没有:多半是规则码拼错,得说出来而不是静静报"候选 0"
-    assert "拼错" in product_audit._rerule_head(
-        _CountConn(0), "r", "w", {}, 500)[1]
+    assert len(product_audit._batch_head(
+        _CountConn(12), "w", "w", {}, 500, "hint")) == 1
+    # 一个都没有:得说出可能的原因,而不是静静报"候选 0"
+    assert "拼错" in product_audit._batch_head(
+        _CountConn(0), "w", "w", {}, 500, "规则码拼错?")[1]
 
 
 def test_is_forced_exempts_rerule_but_not_from_sheet():
@@ -849,6 +1005,12 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
     assert product_audit._is_forced({"rerule": "phase0_forbidden_category"}, {})
     assert not product_audit._is_forced({}, {})
     assert not product_audit._is_forced({"rerule": "  "}, {})   # 空串不算
+    # mode=pending 也是强审(2026-08-21):它自述「无 1 天退避,等一天等的是自己」,
+    # 而 24 小时 run 护栏让你等的正是一天 —— dry-run 也落 runs,抽样看过的那批
+    # 24 小时内捞不回来,真跑处理的是另一批。人工显式动作、不进调度,吃护栏无收益。
+    assert product_audit._is_forced({"mode": "pending"}, {})
+    assert not product_audit._is_forced({"mode": "backfill"}, {})
+    assert not product_audit._is_forced({"mode": "pass"}, {})
 
 
 def test_candidate_sql_recent_guard_shape():
@@ -1015,7 +1177,7 @@ def test_worker_cap_warns_instead_of_silently_clamping(caplog):
     用 workers=32 测吞吐,实际跑 16 而输出只字未提)。"""
     import logging
     import inspect
-    src = inspect.getsource(product_audit.run)
+    src = inspect.getsource(product_audit._parse_opts)   # 参数解析的家
     assert "_MAX_WORKERS" in src and "超上限,实际用" in src
     assert product_audit._MAX_WORKERS >= 32     # I/O 密集,远超核数是正常的
 
@@ -1054,15 +1216,43 @@ def test_run_commits_in_segments_with_progress():
     import inspect
     src = inspect.getsource(product_audit.run)
     assert "_COMMIT_EVERY" in src and "conn.commit()" in src
-    assert "进度 %d/%d" in src                     # 日志可见,不必查库
+    assert "进度 已取 %d" in src                    # 日志可见,不必查库
     assert 0 < product_audit._COMMIT_EVERY <= 2000  # 段太大就退化回老问题
+
+
+def test_progress_rate_measures_throughput_not_conclusions():
+    """速率必须量**吞吐**,而且是窗口速率(2026-08-21 所有者质疑后修)。
+
+    原式 `done_n ÷ (now - t0)` 两头都错:
+      · 分子只数**落了结论**的行 —— `stages=L0` 下绝大多数行返回 None
+        不落结论,于是报 75 条/秒而真实吞吐 4,900 条/秒(差 65 倍);
+      · 分母从 t0 起算,含启动装配那 80 多秒 —— 数字随时间单调爬升
+        (6→11→16→…→75),看着像"越跑越快",其实只是固定开销被摊薄。
+    """
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "(cand_n - last_cand)" in src, "分子必须是**本段已取**"
+    assert "now - last_t" in src, "分母必须是**本段耗时**,不是从 t0 起算"
+    assert "done_n / max(time.monotonic() - t0" not in src   # 旧式不许回来
+    assert product_audit._PROGRESS_MIN_SEC > 0
+
+
+def test_seller_missing_denominator_is_the_judged_面_not_the_conclusion_count():
+    """分母得是**进了判定的行数**。2026-08-21 生产实见「卖家字段缺失
+    97331/10147」—— 分子比分母还大:`stages=L0` 下 judged 只数 Phase0 命中的
+    那一小撮,而卖家缺失数的是全部候选行。这一列量的是"卖家闸对多大面积
+    失效",那是候选面的属性,不是结论面的。"""
+    import inspect
+    src = inspect.getsource(product_audit._summary)      # 摘要拼装的家
+    assert '卖家字段缺失 {counts.seller_missing}/{counts.todo_n}' in src
+    assert '卖家字段缺失 {counts.seller_missing}/{judged}' not in src
 
 
 def test_retry_summary_only_calls_429_ratelimit():
     """只有 http_429 才叫撞限流(生产实测:19 次 other 被说成"已撞限流",
     把所有者引向降并发 —— 而网络抖动降并发毫无用处)。"""
     import inspect
-    src = inspect.getsource(product_audit.run)
+    src = inspect.getsource(product_audit._summary)      # 摘要拼装的家
     assert 'retries.get("http_429")' in src
     assert "降并发解决不了" in src
 
@@ -1116,10 +1306,398 @@ def test_audit_defaults_are_128_and_batched():
 
     from workflows import product_audit as pa
     assert pa._DEFAULT_WORKERS == 128 and pa._MAX_WORKERS >= 128
-    assert 'params.get("workers", _DEFAULT_WORKERS)' in inspect.getsource(pa.run)
+    assert 'params.get("workers", _DEFAULT_WORKERS)' in \
+        inspect.getsource(pa._parse_opts)
 
     src = inspect.getsource(pa.run)
     # 批量落库 + 失败退回逐行(已付费的 LLM 结果不能因为同批一行脏就陪葬)
     assert "persist_runs" in src and "persist_run(" in src
     # 分段提交前必须先冲刷缓冲,否则"此刻之前判的都已持久"是谎话
     assert src.index("_flush(force=True)") < src.index("conn.commit()")
+
+
+# ── 并发受 PG 连接数约束(2026-08-17 补护栏)──────────────────────────────────
+
+def test_worker_count_is_capped_by_pg_connection_headroom(monkeypatch):
+    """⚠ 每个 worker 独占一条 PG 连接,默认 128 就是 **129 条**。
+
+    `db.pg_conn` 是一次 `psycopg.connect`(没有池),而连接在整个 `audit_one`
+    期间被握着(含那次几秒的 LLM 调用)—— 所以池子不能小于 worker 数,
+    唯一能做的是按库的实际余量往下钳 worker 数。
+
+    PostgreSQL 的 `max_connections` 缺省是 **100**:缺省配置的机器上建池建到
+    第 ~100 条就 `FATAL: sorry, too many clients already`,整轮审核起不来 ——
+    而且每天到点炸一次。
+
+    钳制**必须说出来**(2026-08-14 那次 workers=32 实跑 16 而输出只字未提)。
+    """
+    from workflows import product_audit as pa
+
+    def _fake(hard, used):
+        class _Cur:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def execute(self, sql, args=None): self._sql = sql
+            def fetchone(self):
+                return (hard,) if "max_connections" in self._sql else (used,)
+
+        class _Conn:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def cursor(self): return _Cur()
+        return lambda *a, **k: _Conn()
+
+    # 缺省 max_connections=100、已用 10 ⇒ 余量 100-10-20=70,减主线程那条 = 69
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(100, 10))
+    got, note = pa._cap_by_connections(128)
+    assert got == 69
+    assert "钳到" in note and "max_connections=100" in note
+    assert "workers=" in note          # 告诉人真正该调的是 PG 配置,不是 -p workers
+
+    # 库调大了就不钳,也不留噪声
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(500, 10))
+    assert pa._cap_by_connections(128) == (128, "")
+
+    # 余量被吃光也至少留 1(护栏不该把并发钳成 0)
+    monkeypatch.setattr(pa.db, "pg_conn", _fake(100, 95))
+    got, note = pa._cap_by_connections(128)
+    assert got == 1 and note
+
+    # ⚠ 查不到余量时**不猜不钳**:护栏本身不许成为新的故障点,但要说一句
+    def _boom(*a, **k):
+        raise RuntimeError("PG 连不上")
+    monkeypatch.setattr(pa.db, "pg_conn", _boom)
+    got, note = pa._cap_by_connections(128)
+    assert got == 128 and "未能查到" in note
+
+
+def test_the_clamp_note_reaches_the_summary():
+    """只写日志的话表现是"并发调了没效果" —— 摘要里必须有。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "opts.workers, opts.conn_note = _cap_by_connections(opts.workers)" \
+        in src
+    assert "lines.append(opts.conn_note)" in \
+        inspect.getsource(product_audit._summary)
+    # 钳制必须在建连接池**之前**发生(钳完才建,不然先炸了)
+    assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")
+
+
+def test_audit_one_only_l0_hits_reject_and_misses_return_none():
+    """stages=L0(所有者 2026-08-18):只跑 Phase0,纯查库零 LLM。
+
+    命中 → 正常 reject(与全链的 L0 短路逐字一致);
+    未命中 → **None = 不落结论**:截断的链没资格发 pass/pending
+    (不完整审核绝不当通过)。用途:配合 rerule 翻新黑名单历史行 ——
+    仍命中的拿到新理由映射,不再命中的保持原判,不被"复活"。
+    """
+    ctx = _ctx(pt_meta=META, phase0_asins=frozenset({"B0F"}))
+    hit = audit_rules.audit_one(ProductInfo(asin="B0F", title="w"), ctx,
+                                only_l0=True)
+    assert hit.verdict == "reject" and hit.stage_stopped_at == "L0"
+    miss = audit_rules.audit_one(ProductInfo(asin="B0E", title="widget"), ctx,
+                                 only_l0=True)
+    assert miss is None          # 不是 pending、更不是 pass —— 什么都不写
+
+
+def test_adopt_history_says_the_old_reason_from_hits():
+    """采用历史结论时「理由未留存」要去 audit_hits 反查旧命中说出旧结论
+    (所有者定稿 2026-08-19:「history_shortcut 的也需要输出旧结论」)——
+    runs 行的 l3_reason_category 为空 ≠ 当年没理由,hits 里躺着真实命中。"""
+
+    class _Cur:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            if "audit_hits" in sql:
+                self._rows = [(11, "phase0_brand_blacklist",
+                               {"matched_brand": "IKEA"})]
+            else:   # _HISTORY_SQL:两行 reject——一行 hits 有货,一行孤儿
+                self._rows = [
+                    ("B0AAAAAAA1", 11, "reject", 0, None, None, "L0",
+                     None, None),
+                    ("B0AAAAAAA2", 12, "reject", 0, None, None, "L2",
+                     None, None),
+                ]
+
+        def executemany(self, sql, rows):
+            self.conn.adopted = list(rows)
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        adopted = []
+
+        def cursor(self):
+            return _Cur(self)
+
+    conn = _Conn()
+    import unittest.mock as m
+    with m.patch.object(product_audit.product_events, "record_many"):
+        n, adopted = product_audit._adopt_history(
+            conn, ["B0AAAAAAA1", "B0AAAAAAA2"], execute=True)
+    assert n == 2 and adopted == {"B0AAAAAAA1", "B0AAAAAAA2"}
+    by = {r["asin"]: r["reason"] for r in conn.adopted}
+    assert "品牌黑名单" in by["B0AAAAAAA1"]        # 旧命中翻成人话
+    assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]
+    assert "理由未留存" in by["B0AAAAAAA2"]        # 连 hits 都没有才落这句
+
+
+def test_shrink_guard_message_says_what_you_are_installing():
+    """护栏拦下来时必须报出**将要装进去的是什么** —— 2026-08-20 生产实见:
+    它只说"11810→223",人被要求"人工核实"却无从核起;他要核的恰恰是那 223 条
+    里子树/顶级/路径各多少(列错位会让三个数全变样)。"""
+    conn = _BLConn(old_n=11810)
+    rows = ([_cat_row(f"T{i} > X", str(i), "", "子树") for i in range(200)]
+            + [_cat_row(f"P{i}", "", "", "顶级名") for i in range(23)])
+    with pytest.raises(RuntimeError) as e:
+        _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                               "catalog.amazon_cat_blacklist", rows)
+    msg = str(e.value)
+    assert "子树 200" in msg and "顶级名 23" in msg and "路径等值 0" in msg
+    assert "读入 223 行" in msg and "allow_shrink" in msg
+
+
+def test_amzcat_dry_run_writes_nothing():
+    """⚠ risk_sync 是 DANGEROUS=False,cli 恒给 execute=True —— `--dry-run`
+    只走 dry_run 这一路。2026-08-20 实见:所有者按"先 --dry-run 看摘要"敲下去,
+    四张 TRUNCATE 全量重灌的表**照样真写了**。"""
+    conn = _BLConn(old_n=200)
+    rows = [_cat_row(f"A{i} > B", str(i), "", "子树") for i in range(200)]
+    msg = _sync_amzcat_blacklist(conn, _CAT_SHEET,
+                                 "catalog.amazon_cat_blacklist", rows,
+                                 dry_run=True)
+    assert "[DRY-RUN]" in msg and "一行未写" in msg
+    assert not any("TRUNCATE" in s for s in conn.sql) and conn.inserted == []
+
+
+def test_seller_dry_run_writes_nothing():
+    conn = _BLConn(old_n=1314)
+    msg = _sync_column_blacklist(conn, _SELLER_SHEET, "catalog.seller_blacklist",
+                                 [{"seller_id": "S1"}, {"seller_id": "S2"}],
+                                 allow_shrink=True, dry_run=True)
+    assert "[DRY-RUN]" in msg and conn.inserted == []
+
+
+# ── LLM token 记账与成本折算(2026-08-21)──────────────────────────────────
+
+def test_record_usage_buckets_by_model_purpose_and_tier():
+    """token 是接口回的事实,记在 api 层;**时段在调用当时就定死**。
+
+    DeepSeek 峰谷价差整整一倍,一轮跑几小时会跨越分界 —— 事后按"现在是
+    什么时段"统一折算必然算错。
+    """
+    import datetime as dt
+    from api import llm as _llm
+
+    _llm.reset_usage_stats()
+    peak = dt.datetime(2026, 8, 21, 3, tzinfo=dt.timezone.utc)     # 01–04 UTC
+    off = dt.datetime(2026, 8, 21, 20, tzinfo=dt.timezone.utc)
+    u = {"prompt_tokens": 1000, "completion_tokens": 100,
+         "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "peak")] == {
+        "calls": 2, "prompt": 2000, "completion": 200,
+        "cache_hit": 1800, "cache_miss": 200}
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "offpeak")
+                            ]["calls"] == 1
+    # 供应商不回 usage:只累加次数,其余留 0 —— 少算不瞎算
+    _llm.record_usage("deepseek-v4-flash", "audit_l1", None, at=off)
+    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l1", "offpeak")] == {
+        "calls": 1, "prompt": 0, "completion": 0,
+        "cache_hit": 0, "cache_miss": 0}
+    _llm.reset_usage_stats()
+    assert _llm.USAGE_STATS == {}
+
+
+def test_llm_cost_never_invents_a_number_for_unpriced_models():
+    """不认识的模型**只报 token 不报钱**,并在摘要里点名。
+
+    按 0 计价会产出一个看着像钱、其实是编的数字 —— 比不报更糟。
+    """
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 1000, "completion": 100,
+           "cache_hit": 0, "cache_miss": 1000}
+    assert llm_cost.cost_of("no-such-model", "peak", row) is None
+    out = "\n".join(llm_cost.summarize(
+        {("no-such-model", "list_new", "peak"): row}))
+    assert "该模型无计价" in out and "未计价模型" in out
+    assert "$0.00" not in out
+
+
+def test_llm_cost_peak_is_exactly_double_offpeak():
+    """峰谷差一倍 —— 大重审排在谷时段直接省一半,这个结论要能被算出来。"""
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 500_000, "cache_miss": 500_000}
+    peak = llm_cost.cost_of("deepseek-v4-flash", "peak", row)
+    off = llm_cost.cost_of("deepseek-v4-flash", "offpeak", row)
+    assert abs(peak - 2 * off) < 1e-9
+
+
+def test_llm_cost_falls_back_to_miss_price_when_split_absent():
+    """供应商不拆缓存命中时,整块 prompt 按**未命中**(贵的那档)算 ——
+    偏贵不偏便宜,估出来的账不会让人以为花得比实际少。"""
+    from services import llm_cost
+
+    split = {"calls": 1, "prompt": 0, "completion": 0,
+             "cache_hit": 0, "cache_miss": 1_000_000}
+    nosplit = {"calls": 1, "prompt": 1_000_000, "completion": 0,
+               "cache_hit": 0, "cache_miss": 0}
+    assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
+            == llm_cost.cost_of("deepseek-v4-flash", "peak", split))
+
+
+def test_llm_cost_small_amounts_keep_enough_digits():
+    """固定两位小数在这里等于没报(2026-08-21 所有者实遇)。
+
+    一轮 200 条的抽样常常只花几厘钱,`:.2f` 打出来就是 `$0.00` ——
+    而"拿抽样推整轮预算"正是这行字存在的唯一理由,推不出来就白记了。
+    """
+    from services import llm_cost
+
+    row = {"calls": 9, "prompt": 70_000, "completion": 1_400,
+           "cache_hit": 64_400, "cache_miss": 5_600}
+    out = "\n".join(llm_cost.summarize(
+        {("deepseek-v4-flash", "audit_l3", "peak"): row}, items=200))
+    import re as _re
+    # 金额不能被四舍五入成正好 $0.00(后面还跟着位数的 $0.0052 才是要的)
+    assert not _re.search(r"\$0\.00(?!\d)", out), out
+    assert "/ 千条" in out          # 抽样直接给出可外推的单价
+    # 大额仍按两位小数,不会变成一串小数点后的噪声
+    big = {"calls": 1, "prompt": 0, "completion": 100_000_000,
+           "cache_hit": 0, "cache_miss": 0}
+    assert "$132.00" in "\n".join(llm_cost.summarize(
+        {("deepseek-v4-flash", "audit_l3", "peak"): big}))
+
+
+# ── 大批量不许把候选全装进内存(2026-08-21 生产 OOM 后加)────────────────
+
+class _FakeNamedCur:
+    """够用的 psycopg3 命名游标替身:记下建它时的参数,按块吐行。"""
+
+    def __init__(self, rows, name):
+        self._rows, self.name, self.itersize = list(rows), name, None
+        self.description = [("asin",), ("title",)]
+        self.executed = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.executed = (sql, params)
+
+    def fetchmany(self, n):
+        out, self._rows = self._rows[:n], self._rows[n:]
+        return out
+
+
+def test_candidates_are_streamed_through_a_server_cursor(monkeypatch):
+    """候选必须**流式**取,而且要另开一条连接。两条都是踩出来的:
+
+    ① psycopg3 普通游标 execute 时把整个结果集拉进客户端内存,fetchmany 只是
+       切已经拉完的缓冲 —— 省不了一个字节。78 万行带标题/五点/长描述就是几 GB
+       (2026-08-21 所有者跑 `mode=nonpass -p limit=1000000`,机器内存崩了);
+    ② 判定循环每 `_COMMIT_EVERY` 条要 commit,而 **COMMIT 会销毁服务端游标** ——
+       取数用主连接的话,跑到第一个提交点就炸。
+    """
+    made = {}
+
+    class _Conn:
+        def cursor(self, name=None):
+            made["name"] = name
+            return _FakeNamedCur([("B%03d" % i, "t") for i in range(7)], name)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _fake_conn(*a, **k):
+        made["opened"] = made.get("opened", 0) + 1
+        yield _Conn()
+
+    monkeypatch.setattr(product_audit.db, "pg_conn", _fake_conn)
+    chunks = list(product_audit._iter_candidates("SELECT 1", {}, chunk=3))
+    assert [len(c) for c in chunks] == [3, 3, 1]          # 按块吐,不是一次性
+    assert chunks[0][0] == {"asin": "B000", "title": "t"}
+    assert made["name"], "必须是**命名**游标(服务端),否则 psycopg3 会全拉进内存"
+    assert made["opened"] == 1, "取数走自己的连接,不跟会 commit 的主连接抢"
+
+
+def test_run_submits_futures_per_chunk_not_all_at_once():
+    """OOM 的另一半:78 万个 future 一次全提交。
+
+    每个 future 吊着入参(ProductInfo 带标题/五点/长描述),完成后还吊着
+    AuditOutcome —— 全量提交等于把整批数据再复制两份留在内存里。
+    分块提交只限制"在飞的量",线程池与连接池仍整轮共用一套,吞吐不受影响。
+    """
+    import inspect
+
+    src = inspect.getsource(product_audit.run)
+    chunk_loop = src.index("for chunk in chunks:")
+    submit = src.index("ex.submit(_judge, p)")
+    assert chunk_loop < submit, "ex.submit 必须在分块循环**内**"
+    # 候选取数不许再回到 fetchall
+    assert "_iter_candidates(" in src
+    assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"
+
+
+# ── mode=stale:版本重审(所有者定稿 2026-08-24)────────────────────────────
+
+def test_mode_stale_reaudits_approved_only_and_needs_full_chain():
+    """判据提版后 approved 存量按新版本全链重审;rejected 沿用不重审。
+
+    与 force_rerun=<版本> 的区别就是砍掉贵的那半:那条 approved+rejected
+    全量,为几千条可能翻案的 pass 烧掉全库 rejected 的 LLM 钱。
+    版本谓词是天然分页:真跑判过盖当前版本号,自动退出候选。
+    **不进调度**(所有者定稿 2026-08-24):手动批量消化的旁路。
+    """
+    from registry import resources, schedule
+
+    w, e = product_audit._pick_where({"mode": "stale"})
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w
+    assert e["stale_ver"] == resources.AUDIT_RULES_VERSION
+    assert "rejected" not in w      # rejected 沿用,不进候选
+    assert not any("stale" in " ".join(j["params"]) for j in schedule.JOBS)
+
+
+def test_default_candidate_reaudits_stale_approved():
+    """缺省谓词第三支(所有者定稿 2026-08-24):approved 而版本落后 → 重审
+    而不是投影。这样 from_sheet(上架前 18:10 那轮)走到这条谓词,**要上架的
+    品自动被新判据重过** —— 版本重审不进调度,靠的就是这一支。
+    rejected 仍不自动重审(沿用)。"""
+    from registry import resources
+
+    w, e = product_audit._pick_where({})
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(cand_ver)s" in w
+    assert e["cand_ver"] == resources.AUDIT_RULES_VERSION
+    assert "rejected" not in w
+    # from_sheet 那条同样带着这支(它就是 asins ∧ 缺省谓词)
+    w2, e2 = product_audit._pick_where({"asins": "B0AAAAAAAA",
+                                        "from_sheet": "1"})
+    assert "cand_ver" in e2 and "%(cand_ver)s" in w2
+
+
+def test_mode_stale_refuses_l0_only(monkeypatch):
+    """stale 不与 stages=L0 连用:L0 未命中不落结论不盖版本 → 候选永不收敛,
+    每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)。"""
+    import pytest
+
+    with pytest.raises(ValueError, match="stale"):
+        product_audit.run({"mode": "stale", "stages": "L0"})

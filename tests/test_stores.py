@@ -1,6 +1,7 @@
 """services/stores.py 行为回归:过滤规则(沿用旧 load_stores)/ 代理 URL 编码 / 快照兜底。"""
 
 import json
+import logging
 
 import pytest
 
@@ -159,3 +160,145 @@ def test_cross_store_concurrency_has_one_source():
     for mod in (perf_problems, settlement_sync):
         text = inspect.getsource(mod)
         assert "店铺级并发不要调高" not in text, mod.__name__
+
+
+# ── 在营判据:三层之间的边界(所有者定稿 2026-08-22)────────────────────
+
+def _cred(name, **f):
+    from registry import resources
+    fl = resources.STORE_CREDENTIALS.fields
+    fields = {fl.store: name, fl.client_id: "cid", fl.client_secret: "sec",
+              fl.proxy_type: "http", fl.proxy_host: "1.2.3.4",
+              fl.proxy_port: "8080"}
+    fields.update(f)
+    return {"fields": fields}
+
+
+def test_is_enabled_is_the_single_predicate():
+    """「启用」的判定只留一处 —— 此前埋在 `_normalize` 的循环里,
+    和 ClientId、代理两条过滤混成一体,没有函数单独回答得了"在不在营"。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    assert st.is_enabled({}) is True                      # 缺省视为启用(旧表无此列)
+    assert st.is_enabled({fl.enabled: True}) is True
+    assert st.is_enabled({fl.enabled: False}) is False
+    for no in ("否", "false", "0", " 否 "):
+        assert st.is_enabled({fl.enabled: no}) is False
+    for yes in ("是", "true", "1"):
+        assert st.is_enabled({fl.enabled: yes}) is True
+
+
+def test_enabled_names_ignores_client_id_and_proxy(monkeypatch):
+    """★ **在营 ≠ 能调 API。**
+
+    「启用」是所有者的**意图**开关,ClientId/代理是**技术就绪**。合并的后果:
+    「在营但代理没配」的店会被当成死店 —— 而死店名录直通整店下线。
+    """
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    recs = [_cred("A085朱丽霖"),
+            _cred("A102无代理", **{fl.proxy_host: "0"}),        # 在营,只是没配代理
+            _cred("A107无凭证", **{fl.client_id: "0"}),
+            _cred("Z001已停用", **{fl.enabled: False})]
+    monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
+    assert st.enabled_names() == {"A085朱丽霖", "A102无代理", "A107无凭证"}
+
+
+def test_load_stores_is_strictly_narrower_than_enabled_names(monkeypatch):
+    """三层是包含关系:能调 API ⊆ 在营 ⊆ 在册。任何一层拿去当另一层用都会出事。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    recs = [_cred("能调"), _cred("在营没代理", **{fl.proxy_host: "0"}),
+            _cred("已停用", **{fl.enabled: False})]
+    monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
+    monkeypatch.setattr(st, "_write_snapshot", lambda s: None)
+    api_ok = {s["name"] for s in st.load_stores()}
+    assert api_ok == {"能调"}
+    assert api_ok < st.enabled_names() == {"能调", "在营没代理"}
+    assert st.enabled_names() < st.registered_names()
+
+
+def test_disabled_store_is_not_registered_away(monkeypatch):
+    """停用**不等于**从凭证表删行 —— 历史凭证留着,`registered_names` 照样有它。
+    所以判在营只能看 `enabled_names`,看 `registered_names` 会把停用店当在营。"""
+    from registry import resources
+    from services import stores as st
+    fl = resources.STORE_CREDENTIALS.fields
+    monkeypatch.setattr("api.feishu.list_records",
+                        lambda *a, **k: [_cred("Z001", **{fl.enabled: False})])
+    assert st.registered_names() == {"Z001"}
+    assert st.enabled_names() == set()
+
+
+# ── 兜底的触发面:只补外部世界的缺陷,不补自己的不确定(conventions §六)──
+
+def test_local_parse_bug_does_not_masquerade_as_a_feishu_failure(monkeypatch):
+    """_normalize 抛 = **本仓自己的 bug**,必须照抛,不许静默退陈旧快照。
+
+    旧写法把解析与落盘一起包进 try:飞书完全健康、只是凭证表字段被改名或
+    单元格形状变了,同样会退到陈旧凭证快照,还报成「店铺凭证表读取失败」
+    —— 把本地 bug 伪装成远端故障,指错路。这条路直通整店下线判据。
+    """
+    snapshot = [{"name": "陈旧店", "client_id": "c", "client_secret": "s",
+                 "proxy": "http://h:1"}]
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text(json.dumps(snapshot), encoding="utf-8")
+    _live(monkeypatch, [_rec(store="A1", client_id="c1", client_secret="s",
+                             proxy_type="http", host="1.1.1.1", port=80)])
+
+    def boom(records):
+        raise KeyError("凭证表字段被改名了")
+
+    monkeypatch.setattr(stores_svc, "_normalize", boom)
+    with pytest.raises(KeyError):
+        stores_svc.load_stores()
+
+
+def test_feishu_failure_still_falls_back_after_narrowing(monkeypatch):
+    """收窄 try 之后,**飞书故障的兜底行为一字未变**(收窄的安全方向)。"""
+    snapshot = [{"name": "A1", "client_id": "c", "client_secret": "s",
+                 "proxy": "socks5://h:1"}]
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text(json.dumps(snapshot), encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise RuntimeError("feishu down")
+
+    monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
+    assert stores_svc.load_stores() == snapshot
+
+
+def test_corrupt_snapshot_says_so_instead_of_looking_like_no_snapshot(
+        monkeypatch, caplog):
+    """快照文件损坏 ≠ 没有快照:不记日志的话两种截然不同的故障合并成一句
+    「无本地快照可兜底」,人会去找一个其实就在那儿的文件。"""
+    paths.cache_dir().mkdir(parents=True, exist_ok=True)
+    paths.stores_snapshot_file().write_text("{ 这不是 json", encoding="utf-8")
+
+    def boom(*a, **kw):
+        raise RuntimeError("feishu down")
+
+    monkeypatch.setattr(stores_svc.feishu, "list_records", boom)
+    with caplog.at_level(logging.WARNING, logger="services.stores"):
+        with pytest.raises(RuntimeError):
+            stores_svc.load_stores()
+    assert "店铺凭证快照损坏,按无快照处理" in caplog.text
+
+
+def test_no_shadow_imports_of_feishu_left(monkeypatch):
+    """函数内影子 import(`from api import feishu as _feishu  # 惰性避免循环`)
+    在本文件已失效:第 13 行的模块级 import 早就把它拉进来了,什么循环也没避到。
+    留着比没有更糟 —— 下一个人会照它去别处也写惰性 import。
+    """
+    import inspect
+    for fn in (stores_svc.enabled_names, stores_svc.registered_names):
+        assert "_feishu" not in inspect.getsource(fn), fn.__name__
+    # 行为不变:两支都用模块级 feishu,现有 monkeypatch 写法照旧生效
+    f = resources.STORE_CREDENTIALS.fields
+    recs = [{"fields": {f.store: "A1"}}, {"fields": {f.store: "A2", f.enabled: False}}]
+    monkeypatch.setattr(stores_svc.feishu, "list_records", lambda *a, **k: recs)
+    assert stores_svc.enabled_names() == {"A1"}
+    assert stores_svc.registered_names() == {"A1", "A2"}

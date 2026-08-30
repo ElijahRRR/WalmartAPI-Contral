@@ -18,9 +18,9 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 | 任务 | 时间(台北) | cron(台北) | cron(UTC) | 跑什么 |
 |---|---|---|---|---|
 | `backup` | 每天 02:00 | `0 2 * * *` | `0 18 * * *` | backup |
-| `daily_report` | 每天 06:40 | `40 6 * * *` | `40 22 * * *` | daily_report |
+| `daily_report` | 每天 06:40 | `40 6 * * *` | `40 22 * * *` | catalog_sync → daily_report |
 | `order_daily` | 每天 07:30 | `30 7 * * *` | `30 23 * * *` | perf_problems → order_asin_normalize |
-| `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → product_refresh → product_ingest → maintenance_scan → maintenance → problem_scan → problem_product_cleanup |
+| `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → sources_backfill → product_refresh → product_audit → maintenance_scan → problem_scan → maintenance → problem_product_cleanup |
 | `blacklist` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | risk_sync → blacklist_push |
 | `product_clear` | 每天 15:00 | `0 15 * * *` | `0 7 * * *` | product_clear |
 | `audit_sheet` | 每天 18:10 | `10 18 * * *` | `10 10 * * *` | product_audit |
@@ -31,16 +31,40 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 
 每条任务的完整提示词在 `tasks/<任务名>.md`,注册定时任务时**整篇粘进去**。
 
+## ⚠ 跑之前:你得能写仓库**外面**那个目录
+
+本项目的状态目录不在仓库里,而是仓库的**同级**目录 `/Users/nextderboy/Projects/WalmartAPI_data` —— 锁、日志、备份、报告全在那儿。
+
+**沙箱默认只放行工作区(= 仓库目录),于是每条工作流在拿运行锁的第一步就死**,报 `PermissionError: [Errno 1] Operation not permitted: …/locks/<名>.lock`。
+
+⚠ 这个报错**长得像权限问题但不是**:文件属主和 mode 都是对的,errno 是 **EPERM(1)** 而不是 EACCES(13)。所以**别去 chmod/chown**,也**别** chmod 777、别改 `WALMART_DATA_ROOT`、别建软链接 —— 那几样都是把状态搬到别处,只会让两份状态各写各的。
+
+正确做法是给沙箱按目录授权。Codex 走项目级 `/Users/nextderboy/Projects/WalmartAPI-Contral/.codex/config.toml`(已在仓库里,拉下来即生效):
+
+```toml
+sandbox_mode = "workspace-write"
+[sandbox_workspace_write]
+network_access = true
+writable_roots = ["/Users/nextderboy/Projects/WalmartAPI_data"]
+```
+
+**跑第一条任务之前先自检**(能写 = 一切就绪;被拒就先修沙箱,别急着注册):
+
+```bash
+touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && echo OK
+```
+
 ## 这两条不进你的定时任务表,但**得有人管**
 
 | 任务 | 时间 | 跑什么 |
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
 | `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
+| `product_ingest` | 每小时 :50 | product_ingest |
 
 它们跑在**电脑自己的 launchd** 上,而不是你的定时任务里 —— 频率太细(每半小时 / 每小时固定分钟),你那边多半排不准,而排不准的后果不是报错,是悄悄少跑几轮。
 
-⚠ **别把这一节读成「不用管」。** 装 launchd 那一步本身**是要人做的**,做法在 `skills/walmart-schedule/REGISTER.md` 第 3 步(`launchd_install` → `launchctl load` → 回读校验)。**没装 = 这两条链从来不跑,而且没有任何东西会说一声** —— 表现是飞书上的「处理中」永远不消失(feed 回执没人反哺)、日报的订单列是空的(订单没人拉),而所有已注册的任务都报成功。拿不准装没装就去查:`launchctl list | grep com.walmartapi`,应当正好 2 行。
+⚠ **别把这一节读成「不用管」。** 装 launchd 那一步本身**是要人做的**,做法在 `skills/walmart-schedule/REGISTER.md` 第 3 步(`launchd_install` → `launchctl load` → 回读校验)。**没装 = 这两条链从来不跑,而且没有任何东西会说一声** —— 表现是飞书上的「处理中」永远不消失(feed 回执没人反哺)、日报的订单列是空的(订单没人拉),而所有已注册的任务都报成功。拿不准装没装就去查:`launchctl list | grep com.walmartapi`,应当正好 3 行。
 
 ⚠ **装好之后,你这边不要再挂一份 —— 两边都挂 = 撞锁**:同一条链被 launchd 和你同时拉起来,后到的那次拿不到锁直接退出码 3 空跑一轮 —— 看起来一切正常。
 

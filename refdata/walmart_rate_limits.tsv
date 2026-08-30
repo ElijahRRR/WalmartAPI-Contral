@@ -122,7 +122,7 @@ Payments	Entity Match	300/min	GET	/v3/settings/entitymatchprofile
 Payment Reports	Recon Report (Legacy)	100/min	GET	/v3/report/reconreport/reconFile
 Payment Reports	Payment Statement Report	15/min	GET	/v3/report/payment/statement
 Payment Reports	Performance Report	15/min	GET	/v3/report/payment/performance
-Price Management	Update pricing for multiple items in bulk (New)	10/hour (与 Legacy bulk price、bulk promo 三方共享;官方页内 promo* 行仍标 6/day 自相矛盾,代码按 6/day 保守配置)	POST	/v3/feeds?feedType=PRICE_AND_PROMOTION
+Price Management	Update pricing for multiple items in bulk (New)	10/hour (与 Legacy bulk price、bulk promo 三方共享;官方页内 promo* 行仍标 6/day 自相矛盾,2026-08-26 复核确认 6/day 只属 feedType=promo,代码按 8/hour 配置)	POST	/v3/feeds?feedType=PRICE_AND_PROMOTION
 Price Management	Update pricing for a single item	100/hour	PUT	/v3/price
 Price Management	Create Repricer Strategy	20/hour	POST	/v3/repricer/strategy
 Price Management	Update Repricer Strategy	10/hour	PUT	/v3/repricer/strategy/{strategyCollectionId}

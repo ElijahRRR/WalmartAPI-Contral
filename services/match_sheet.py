@@ -5,10 +5,15 @@
   H=上架时间 I=feedId J=feed结果 K=feed查询时间
   运营填 A/C/D/E;脚本填 B/F/G/H/I/J;J/K 由 feed_poll 反哺器按台账回填。
 
-行状态机:
+行状态机(**待处理是包含式白名单**,唯一实现在 workflows/match_listing.run
+的 todo 筛选;白名单之外的 F 值一律隐式终态):
   F 空 + I 空 + A 有 UPC → 待处理(SPEC 预检 → 可跟卖才提交)
   F=可跟卖 + I 空       → 预检过但上轮未提交成功,重新排队
-  F∈{需完整建品/目录无/预检失败/店铺不识别/…} → 终态跳过
+  F 以「预检失败」开头 + I 空 → **也是待处理**,每轮自动重新预检
+                          (2026-08-12 旧仓对照纠正:那多半是 SPEC 接口网络
+                           抖动,当终态会把行永久停摆。本行状态机此前把它
+                           列进终态档,与活的代码相反 —— 2026-08-27 照实改)
+  F∈{需完整建品/目录无/店铺不识别/…} → 终态跳过
                           (运营核对后清空 F 列即重新排队)
   I 有 + J 空/处理中    → 在途,反哺器按 ops.feed_items 回填 J/K
 """
@@ -32,16 +37,20 @@ def read_rows() -> list[dict]:
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    values = feishu.sheet_values(sheet, f"A2:K{total}")
+    # 上界随表长增长 ⇒ 走唯一标准读通道(行方向分块 + 90221 对半兜底);
+    # 行号取通道返回的 rownum,不再 i+2 手算:飞书只裁**范围尾部**的空行
+    # (中段空行仍占位),所以块尾一空那块就少返几行,而下一块的行号照旧从
+    # 块首起算 —— 按返回序号手算会把后面每一块整体上移
+    pairs = feishu.sheet_values_rows(sheet, "A", "K", 2, total)
     rows = []
-    for i, raw in enumerate(values):
+    for rownum, raw in pairs:
         cells = [(str(c).strip() if c is not None else "") for c in raw] \
             + [""] * _WRITE_COLS
         (upc, sku, price, weight, store, status, gtin,
          list_time, feed_id, feed_result, check_time) = cells[:_WRITE_COLS]
         if not (upc or sku):
             continue
-        rows.append({"rownum": i + 2, "upc": upc, "sku": sku, "price": price,
+        rows.append({"rownum": rownum, "upc": upc, "sku": sku, "price": price,
                      "weight": weight, "store": store, "status": status,
                      "gtin": gtin, "list_time": list_time, "feed_id": feed_id,
                      "feed_result": feed_result, "check_time": check_time})
@@ -101,8 +110,9 @@ def sync_from_ledger() -> str | None:
         if st is None or st[0] == "submitted":
             continue
         why = feed_track.merge_error(st[1], descs.get(fid, {}).get(r["sku"]))
-        text = {"success": "成功", "failed": f"失败:{why}" if why else "失败",
-                "missing": "未查到"}.get(st[0], "处理中")
+        # 状态→中文的唯一出处在 feed_track;报错拼进「失败:{why}」是本表特有
+        # 的形状(J 列一格既放结果又放报错,不像维护表另有报错列)
+        text = feed_track.text_of(st[0], why)
         if text in PENDING:
             continue
         r["feed_result"], r["check_time"] = text, now

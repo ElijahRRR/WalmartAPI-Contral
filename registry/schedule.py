@@ -90,9 +90,29 @@ JOBS = (
     job("order_chain", ["order_sync", "order_audit", "returns_sync"],
         batch=2, minute=20,
         note="每小时 :20;order_audit 默认 wait=1,最长阻塞 20 分钟等采集落定"),
-    job("daily_report", ["daily_report"], batch=2, hour=6, minute=40,
-        runner="gpt",
-        note="KPI 窗口锚 06:30,必须 ≥06:35;⚠ 开它之前先停旧 KPI 调度"),
+    # product_ingest 单独长驻(所有者定稿 2026-08-19:「product_ingest 现在的
+    # 主要功能是让本地产品库与采集器数据库对齐,单独配长驻定时任务」):
+    # 四条链(order_audit/product_audit/list_new/product_refresh)的同轮闭环
+    # 全部按批次自取(谁推的批谁拉,无锁),这条管的是**其余一切增量**
+    # (超时批次的尾巴、零散采集)——保中心库小时级对齐。全局游标从此只有
+    # 这一个属主;lock_wait 只防手动跑 product_ingest 撞上它(等而不空转)
+    job("product_ingest", ["product_ingest"], batch=2, minute=50,
+        params=["lock_wait=900"],
+        note="每小时 :50;全局增量泵:本地产品中心 ↔ 采集器数据库对齐"
+             "(各链按批自取之外的全部增量走这条)"),
+    # catalog_sync 打头(所有者定稿 2026-08-24):日报的「在线商品/有库存/
+    # 无库存」三列直接读 catalog.walmart_items,而 catalog_sync 此前只在 13:00
+    # 的 product_chain 里跑 —— 06:40 的日报拿到的是昨天 13 点的快照,产品数
+    # 永远差一天。前置一次同步,统计的就是今早的在架现状。
+    # 链式而不是在 daily_report 里调:workflow 不互相调用(铁律 1),
+    # 且链的语义正好是要的 —— 同步失败就不出日报(拿旧数出报不如不出)。
+    job("daily_report", ["catalog_sync", "daily_report"],
+        batch=2, hour=6, minute=40, runner="gpt",
+        params=["catalog_sync:strict=1"],
+        note="KPI 窗口锚 06:30,必须 ≥06:35;catalog_sync 打头让产品三列是"
+             "今早现状而非昨日 13 点快照;⚠ 开它之前先停旧 KPI 调度;"
+             "strict=1 保住本链「同步不全就不出日报」的闸(店级重试标准②"
+             "让缺席不再炸链,唯独此链宁可不出产物,2026-08-26)"),
     job("order_daily", ["perf_problems", "order_asin_normalize"],
         batch=2, hour=7, minute=30, runner="gpt",
         params=["order_asin_normalize:apply=1"],
@@ -108,17 +128,48 @@ JOBS = (
     # 产品维护线一条链跑完(所有者定稿:「这些我认为可以一次性做完」)。
     # ⚠ wait=1 不能省:不等采集落定就往下走,product_ingest 摄回来的是上一轮
     # 的数据,而且不报错。整条约 2 小时(采集 ~50 分钟是大头)。
+    # 链里不再单摆 product_ingest 一步(所有者定稿 2026-08-19:「product_chain
+    # 链也应该使用按批次拿」):product_refresh wait=1 等采完后**就地按批摄取**
+    # 自己推的批(批次端点,无锁),维护判据当轮就是刚采回的值;全局对齐归
+    # 单独长驻的 product_ingest(launchd 每小时)
+    # product_audit 排在 problem_scan **紧前面**(所有者定稿 2026-08-22):
+    # 在架 pass 重过 L0(纯查库零 LLM)→ 今天新拉黑/新禁售的东西当天翻成
+    # rejected → 紧接着 problem_scan 按 audit_listing_conflicts 建删除建议
+    # → problem_product_cleanup 执行。三步同一轮闭环,不用等第二天。
+    # ⚠ **建议期与执行期分开编排**(所有者定稿 2026-08-24):
+    #   两个扫描件(maintenance_scan / problem_scan)先跑完,再跑两个执行件
+    #   (maintenance / problem_product_cleanup)。理由是破坏类建议要能压制
+    #   同 SKU 的维护类建议 —— 旧序里 maintenance 排在 problem_scan 之前,
+    #   审核链上午刚判拒的东西,维护链已经先花配额去改标题/改价了。
+    #   **但压制不靠这个顺序**:压制在 dispositions.claim() 里按库里所有未落定
+    #   的破坏类建议判,与写入先后无关。顺序改了结果也不变 —— 这是有意的,
+    #   本仓吃过"顺序即语义"的亏,不再让调度表承载判据。
+    #   product_audit 跟着 problem_scan 一起前移,紧邻关系不变。
+    # ⚠ 三个参数一个都不能少:
+    #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
+    #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
+    #   limit 要一次扫得完 —— 这条**没有天然分页**(未命中不落结论不盖版本、
+    #   不退出候选),小 limit 会让每天都从头扫同一批前缀,尾巴永远轮不到
+    #   而且不报错
     job("product_chain",
-        ["catalog_sync", "product_refresh", "product_ingest",
-         "maintenance_scan", "maintenance",
-         "problem_scan", "problem_product_cleanup"],
+        ["catalog_sync", "sources_backfill", "product_refresh",
+         "product_audit", "maintenance_scan", "problem_scan",
+         "maintenance", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
-        params=["product_refresh:wait=1"],
+        params=["product_refresh:wait=1", "product_audit:mode=online",
+                "product_audit:stages=L0", "product_audit:limit=1000000"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
-             "(拿隔夜现值当判据会误伤)"),
+             "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
+             "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"
+             "当轮就能被维护;零缺口时零成本,摘要非零 = 有人绕过登记上架"),
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),
+    # 版本重审**不进调度**(所有者定稿 2026-08-24:「规则存在,上架时对要上架
+    # 的品起作用就够了,平常直接审核某一批产品也够」)。两条消化路径:
+    #   · from_sheet(audit_sheet 18:10 已有):_DEFAULT_CANDIDATE 含
+    #     「approved×旧版本」⇒ 要上架的品自动被新判据重过;
+    #   · 手动批量:python cli.py product_audit -p mode=stale [-p limit=N]
 
     # ── 批三·上架域(所有者定稿 2026-08-17 排进调度)────────────────────
     # 当天的次序是硬的:product_chain(13:00,problem_scan 产黑名单)

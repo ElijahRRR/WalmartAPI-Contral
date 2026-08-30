@@ -29,10 +29,10 @@ ERR_EXT_DATA_0101211 = 该 SKU 已绑死旧 UPC。旧实证(legacy_survey.md:166
 
 import logging
 
-from api import feeds
+from api import _client, feeds
 from registry import db
 from services import feed_track, listing_sheet, product_events, \
-    stores as stores_svc
+    store_retry, stores as stores_svc, upc_pool
 
 DANGEROUS = True
 
@@ -72,22 +72,18 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
     by_store: dict[str, list[dict]] = {}
     for r in todo:
         by_store.setdefault(r["store"], []).append(r)
-    for store_name, srows in sorted(by_store.items()):
-        store = stores_by_name.get(store_name)
-        if store is None:
-            lines.append(f"  {store_name}:凭证缺失,{len(srows)} 行跳过")
-            continue
+    def _retire_store(store: dict, store_name: str,
+                      srows: list[dict]) -> list[str]:
+        """单店提交(第一轮与串行补试共用**同一条**路径,单一落地纪律)。"""
+        out: list[str] = []
         skus = [r["asin"] for r in srows]        # 上架 sku=asin 约定
-        if not execute:
-            lines.append(f"  [DRY-RUN] {store_name} 将退役 {len(skus)} 个:"
-                         f"{','.join(skus[:8])}{' …' if len(skus) > 8 else ''}")
-            continue
         n_ok = 0
-        i = 0
-        for res in feeds.submit_feed(store, "RETIRE_ITEM", skus,
-                                     workflow="sku_locked_heal"):
-            batch = srows[i:i + res["count"]]
-            i += res["count"]
+        # 逐切片结果与本店待退役行对位:游标走法是 submit_feed 返回契约的机械
+        # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
+        # 行上,而且不报错)
+        for res, batch in feeds.iter_result_slices(
+                feeds.submit_feed(store, "RETIRE_ITEM", skus,
+                                  workflow="sku_locked_heal"), srows):
             if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                 n_ok += len(batch)
                 with db.pg_conn() as conn:
@@ -110,13 +106,52 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
                                         "reason": "sku_locked"}}
                             for r in batch])
             elif res["outcome"] == "failed":
-                lines.append(f"  ⚠ {store_name} RETIRE 一批 {res['count']} 条"
-                             f"提交被拒,下轮重试")
+                out.append(f"  ⚠ {store_name} RETIRE 一批 {res['count']} 条"
+                           f"提交被拒,下轮重试")
             else:
-                lines.append(f"  ⚠ {store_name} RETIRE 一批 {res['count']} 条"
-                             f"结局不确定,已留 pending 待对账,本轮不落冷却")
+                out.append(f"  ⚠ {store_name} RETIRE 一批 {res['count']} 条"
+                           f"结局不确定,已留 pending 待对账,本轮不落冷却")
         if n_ok:
-            lines.append(f"  {store_name}:退役提交 {n_ok} 条,进入 24h 冷却")
+            out.append(f"  {store_name}:退役提交 {n_ok} 条,进入 24h 冷却")
+        return out
+
+    to_retry: list[tuple] = []
+    for store_name, srows in sorted(by_store.items()):
+        store = stores_by_name.get(store_name)
+        if store is None:
+            lines.append(f"  {store_name}:凭证缺失,{len(srows)} 行跳过")
+            continue
+        if not execute:
+            skus = [r["asin"] for r in srows]
+            lines.append(f"  [DRY-RUN] {store_name} 将退役 {len(skus)} 个:"
+                         f"{','.join(skus[:8])}{' …' if len(skus) > 8 else ''}")
+            continue
+        try:
+            lines.extend(_retire_store(store, store_name, srows))
+        except _client.StoreDeadError as e:
+            logger.error("%s", e)
+            lines.append(f"  {store_name}:凭证失效跳过({len(srows)} 行下轮再试)")
+        except Exception as e:
+            # 店级隔离(标准①,2026-08-26):此前这是串行循环里的裸奔点 ——
+            # 第一家店抛异常,后面的店一家都轮不到(2026-08-07 cleanup 的
+            # 同款事故形态,那次修的是 cleanup,这里漏了)
+            logger.exception("店铺 %s RETIRE 提交异常(待串行补试): %s",
+                             store_name, e)
+            to_retry.append(({"name": store_name, "_store": store,
+                              "_srows": srows}, e))
+    if to_retry:
+        recovered, still, gate_note = store_retry.serial_second_pass(
+            to_retry,
+            lambda st: _retire_store(st["_store"], st["name"], st["_srows"]),
+            total_stores=len(by_store))
+        if gate_note:
+            lines.append(gate_note)
+        for _st, out in recovered:
+            lines.extend(out)
+        for st, e in still:
+            lines.append(f"  ⚠ {st['name']}:提交异常已跳过(串行补试仍失败,"
+                         f"{store_retry.diagnose(e)}:{e});已发出的分片已"
+                         f"逐片落冷却台账,下轮自动排除,未发出的下轮接续")
     return lines
 
 
@@ -132,6 +167,7 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
                      f"{len(ripe)} 条,回执成功即清列重上")
         return lines
     clear_rows, waiting, failed = [], 0, []
+    burn_pairs: list[tuple[str, str]] = []   # RETIRE 成功即烧旧号(标 conflict)
     receipts: dict[str, dict] = {}
     for store_name, sku, feed_id, _at in ripe:
         if feed_id not in receipts:
@@ -155,6 +191,10 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
         if st[0] == "success":
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("cleared", store_name, sku))
+            # 旧号永久弃用(2026-08-19,配 claim 的原号复用逻辑):SKU 绑死过
+            # 它,退役后谁也不能再用;不烧的话下一轮 claim 会把它复用回来,
+            # "清列重上领新号"就成了空话
+            burn_pairs.append((store_name, sku))
             if row is not None:
                 clear_rows.append(row["rownum"])
             else:
@@ -165,6 +205,11 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("failed", store_name, sku))
             failed.append(f"{store_name}/{sku}({st[1]})")
+    if burn_pairs:
+        with db.pg_conn() as conn:
+            n_burn = upc_pool.burn_for_retire(conn, burn_pairs)
+        if n_burn:
+            lines.append(f"  退役烧号 {n_burn} 个(标 conflict,重上必领新号)")
     n = listing_sheet.clear_for_relist(clear_rows, execute)
     if n:
         lines.append(f"  清列重上 {n} 行(下一轮 list_new 领新 UPC 重提交)")

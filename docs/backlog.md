@@ -17,8 +17,8 @@
 | ✅ | ~~清理→品牌黑名单自产回路~~(2026-08-11 生产验收:渠道独立表 brand_err_hits(不与总清单去重,修掉"总表已有品牌进不了渠道"的建模缺陷)→ beyKyi 整表重写 2,012 行(总表认领 2,011 + 时间线推导 1);缺品牌候选走 brand_scrape 推采集闭环(非标准过滤 + 尝试台账防循环);实时链路 cleanup 尾段双落库:渠道表 + 否决闸) | `services/blacklist.py` / `workflows/brand_scrape.py` |
 | ✅ | ~~BRAND_BAN_SHEET 缺 D 列~~(2026-08-11 已补登记;risk_sync 现把 D 列 ASIN 镜像进 src_sku,空不覆盖) | — |
 | ✅ | ~~ASIN 黑名单~~(2026-08-11 PG 侧+投影生产验收:按标准 asin 重灌 56,812 行;numeric 1,739 键原文兜底。**2026-08-12 上架拦截消费方接通**:blacklist.load_banned_asins → list_new 闸门链(去重后、防呆前)+ match_listing 三道闸,N/F 列写来源与类别) | `services/blacklist.py` |
-| 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合——**后置**(所有者 2026-08-12:等给出具体数据再考虑处理) | `services/blacklist.py:45` |
-| 🟡 | `risk_sync` 无调度、生产验证未做(env 模板已补齐 2026-08-11) | `docs/listing_plan.md:79` |
+| 🟡 | **BIZ-CN 独立维度:收集侧已单列**(两张黑名单表 biz_cn 布尔列,`blacklist.is_biz_cn` 独立判定)。余:PT 5 维度预警里的 BIZ-CN 聚合——**后置**(所有者 2026-08-12:等给出具体数据再考虑处理) | `services/blacklist.py:68` |
+| 🟡 | ~~`risk_sync` 无调度~~(2026-08-17 起进调度:`blacklist` 任务每天 15:00 跑 `risk_sync blacklist_push`)、生产验证未做(env 模板已补齐 2026-08-11) | `registry/schedule.py:78` / `docs/listing_plan.md:103` |
 | ✅ | ~~match_listing 不过风控闸与防呆~~(2026-08-12 接通两道闸:SPEC 交叉字段过 risk_gate(PT/品牌)+ asin_blacklist(交叉 ASIN);交叉不出的字段跳过该道闸;命中写 F 终态,清 F 重排队。同日曾附加"删除史/GTIN 删除史"拦截,**当日按所有者口径拆除**——防呆=黑名单,不看删除史) | `workflows/match_listing.py:_gate_reason` |
 | ✅ | ~~UPC `gs1_restricted_prefix` 6,665 条历史黑名单~~(所有者拍板 2026-08-12:**不需要管**,不导入) | — |
 | 🔴 | PT 5 维度风险表 / 禁售政策知识库 / TRO·商标黑名单 / 新审核系统三表(~25k 行):跨仓,迁移边界未定 | `docs/legacy_survey.md:2000-2001,1806,1915,1954,1963` |
@@ -84,7 +84,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 ## 三、产品事件账本(catalog.product_events)
 
 - ✅ ~~事件码清单不一致 / 无代码常量~~(2026-08-11 已修:常量 + EVENTS 成为唯一出处,record_many 对未登记码抛错,schema.sql/db_schema.md 清单降级为指路;发出点与读侧 SQL 全部改绑常量)
-- 🟡 **审核五列已接通(2026-08-12,分配 A0),入库/审核事件仍未接**:`workflows/audit_sync.py` 直连审核系统库(walmart_audit,registry/db.audit_conn 只读)回流 verdict/PT/理由/时间/run_id 进 `catalog.products` 五列,待生产验收(.env 配 WALMART_AUDIT_DSN → 全量跑一轮 → 抽查);product_ingest 仍不写账本,入库/审核**事件**保持休眠(接缝在 `services/product_events.py` docstring,届时补常量)
+- 🟡 **审核五列已接通(2026-08-12,分配 A0),入库/审核事件仍未接**:~~`workflows/audit_sync.py` 直连审核系统库回流五列,待生产验收~~ —— **audit_sync 已撤销**:审核系统迁入本仓后,审核结论由 `workflows/product_audit.py` 直写 `catalog.products` 的 audit_status/audit_reason/audited_at/audit_version 五列,全仓已无 audit_sync 引用;product_ingest 仍不写账本,入库/审核**事件**保持休眠(接缝在 `services/product_events.py` docstring,届时补常量)
 - ✅ ~~只写不读~~(2026-08-11:`status_changes` / `feed_failures` 两个读侧视图平铺 jsonb,AI/人工直接 SELECT;`list/match_submitted` 计入 risk 视图 submit_times;`retire_feed_success` 属回执流水,读侧走 feed_failures 之外的 ops.feed_items,不另建)
 - ✅ ~~product_risk 只按 sku 聚合~~(2026-08-11:**身份键修成 coalesce(asin, sku)**——原按订货号原文聚合,三段式 sku 名下的删除史拦不住同 ASIN 换号重上,而 list_new 拿 ASIN 查,防呆实际是漏的;新增 `product_risk_store` 店铺维度;list_new 防呆理由带证据列(计数+最近移除时间),listed_times/last_removed_at 有了读者。**拦截条件口径**(所有者两次拍板 2026-08-12,后者为准):**防呆=黑名单,不看删除史**——拦"出现过侵权/审查等拉黑类别"的(asin_blacklist/brand_blacklist),不拦"因产品问题删过"的(可修复类删除后重上是正常经营)。product_risk 视图降级为纯查询档案;曾短暂上过"有删除史即拦",当日拆除。"不明原因消失"史(item_missing 且从未提交删/停=疑似平台下架)只提示不拦截(unexplained_missing 标志,list_new 摘要报警)。"要不要拦停用史"之争随之消解——停用同样看拉黑类别,不看动作)
 - ✅ ~~旧库历史导入~~(2026-08-11 完成,见第二节:485,345 行 → 239,253 条时间线事件,occurred_at=旧 run_ts)
@@ -93,7 +93,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   原文兜底,等 walmart_items.item_id 覆盖扩大后重洗)
 
 > ✅ 已核实非缺口(防止再被误报):`maintenance_submitted` **有生产者**——
-> `problem_product_cleanup.py:293` 反补路径在发,"反补满 2 次转删"计数是通的。
+> `problem_product_cleanup.py:61` 反补路径在发(动作表里 "relist" 直接绑 `product_events.MAINTENANCE_SUBMITTED`),"反补满 2 次转删"计数是通的。
 > 2026-08-10 一次代码扫描曾误判为断链(grep 漏了作为参数传入的字面量)。
 
 ## 四、死表 / 死列 / 僵尸登记
@@ -101,11 +101,11 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~`listing` schema 架空双表~~(2026-08-12 workflow 逐一核证零代码引用后清理:`listing.tasks`/`listing.upc_pool` DROP,schema.sql 退役清理节;legacy_reference.md:74 落点同步改正——UPC 池已拍板不迁)
 - ✅ ~~orders.orders / order_center 视图~~(2026-08-12 清理:视图零读者直接 DROP;旧表带"仅空表才删"守卫防手滑)
 - ✅ ~~catalog.products 十列死列~~(2026-08-12 判定:**assigned_upc/listing_attrs/last_feed_id/store/owner 五列删除**(零读写,职责被 catalog.upc_pool/llm_cache/ops.feed_log/飞书上架表接管);**audit_* 五列保留**=二期审核接缝,三处登记一致,非遗忘死列——同日由分配 A0 的 audit_sync 接通写入,见第三节)
-- ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:372-373`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
+- ⬜ `LISTING_SHEET` R~U 四列(L3 暂缓遗留,`registry/resources.py:470-476`);listing_sheet 实际靠硬编码 range 坐标写列,columns 元组的"唯一权威"被绕过
 - 🟡 只写不读的列(2026-08-12 逐列核证,三种命运):`ops.perf_problem_orders` 14 业务列**留着**(所有者拍板 2026-08-13:已映射到飞书多维表格,是运营参考数据);`ops.scrape_failures.error_detail` **仍是零程序读者**(⚠ 2026-08-14 订正:上一版写它"有读者(v_scrape_failure_stats 视图)"——但那个视图**自己**全仓零引用,拿它当读者是循环论证,会一直给下次盘点提供假证据。视图与列都保留:视图是人工/AI 排查采集失败的聚合面,与 catalog.product_risk_store 等四个视图同性质;error_detail 是 variant_offset 的 `page=<实际ASIN>` 唯一载体),status/retry_count 零读方但为采集契约镜像,随上一条一并保留;`catalog.snapshots.completeness_ok` **保留**(db_schema 登记的人工排查维度+采集契约字段);`catalog.llm_cache.hit_count/last_hit_at` **保留**;清理器**暂不做**(所有者拍板 2026-08-13,上量后再议)
 - ⬜ `ops.cleanup_seen_categories`(20.7 万对):原定消费方是 Step 3/4/5 报表的累计数,报表不迁(2026-08-11 拍板)后**暂无消费方**——数据保留,AI 读库出数时可用,不删
 - ⚠ `ops.runs` 无程序读方——**设计如此**(人工/看板存档),不算缺口,记录在此防误报
-- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置已定稿归分配 A1:store_release 整店释放时同步标 missing_since(校正观测;`docs/allocation_plan.md` §十二.11);存量清单随 A0.5 审计出
+- 🟡 **死店 walmart_items 冻结行**(2026-08-12 核实):catalog_sync 只扫凭证表活店,店铺从凭证表停用/删除后其行**永久冻结为"在架"**(missing_since 恒 NULL)——当前污染三个消费方:①在线产品总表投影死店商品常驻 ②list_new 全局 ASIN 去重闸被死店 SKU 永久占位 ③maintenance 每轮对死店行生成意图再"凭证缺失跳过"。处置**已落代码**:`workflows/store_release.py` 整店释放时同步标 missing_since(缺省开,`-p mark_offline=0` 可关),并有 `-p dead=1` 批量清死店(所有者 2026-08-22);名录权威 = 凭证表「启用」勾选(`stores.enabled_names()`)。余存量清单核对(`docs/allocation_plan.md` §9.4「死店冻结行」)
 
 ## 五、决策未决汇总(等所有者拍板,阻塞下游)
 
@@ -131,7 +131,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 | ✅ | ~~换 token 的 400 判整轮失败~~(2026-08-17 修:沃尔玛凭证被拒回 **400** 不是 401,此前以 httpx 原生异常落进泛化 except ⇒ 一家店坏掉判整轮失败,而回 401 的同类店走"跳过、整轮成功"。已转 `StoreDeadError`;配套加"零店完成即判失败"防新静默口子) | `api/_client.py:get_token` / `workflows/catalog_sync.py` |
 | ✅ | ~~`StoreDeadError` 两处只传一个参数~~(2026-08-17 修:真触发时抛 `TypeError`,不被 `except StoreDeadError` 接住 ⇒ 整轮判失败而非跳过该店,消息里也没有店名和状态码。加了 AST 用例钉住参数个数) | `api/reports.py:160` / `api/returns.py:44` |
 | ⬜ | **`store=` 与 `stores=` 不统一,而 cli 不校验参数名**(所有者 2026-08-17:**记录,先不修**)。全项目只有 `ping_stores` 用复数 `stores=`,其余 17 条用单数 `store=`;参数名打错被静默吞掉 ⇒ `catalog_sync -p stores=A085` **跑全部店**、`ping_stores -p store=A085` **ping 全部店**,都不报错。在「缺省即真跑」下逐条测试尤其容易踩。规避:除 `ping_stores` 外一律 `-p store=`。三档修法(小:ping_stores 兼收单数 / 中:抽共用参数积木 18 处各一行 / 彻底:工作流声明参数名 + cli 层护栏)——彻底那档建议等 #36 落地再做,否则大面积冲突 | `workflows/ping_stores.py:38` vs 其余 17 条;`cli.py` 无未知参数校验 |
-| ⬜ | `catalog_sync` 在**凭证表一家可用店都没有**时 `return "店铺凭证未找到"` 报成功(与上面"零店完成"同一类,但走的是 pool 之前的早退分支,本轮未动) | `workflows/catalog_sync.py:132` |
+| ⬜ | `catalog_sync` 在**凭证表一家可用店都没有**时 `return "店铺凭证未找到"` 报成功(与上面"零店完成"同一类,但走的是 pool 之前的早退分支,本轮未动) | `workflows/catalog_sync.py:138` |
 | ⛔ | **`maintenance_scan` 不向飞书投影建议**(2026-08-17 做过一版又撤除,所有者:「已确认执行内容无误,不需要再向飞书写入」)。⚠ 撤除前生产实跑暴露一个真坑,**谁要重做必须先解决**:两端算「建议」的方式不一样 —— 扫描件按 kind 取 `KIND_LABEL["delete"]='删除'`,执行件 `_record` 取 `it.get("label")`,而删除意图在 `maintenance_intents:597` 被塞成 `删除(<原因码>)` ⇒ 键对不上、每行都查不到、整行追加,**两边都不报错**。连接键必须两端同一个函数算出来。第二个坑见 `maint_sheet` 头注(水位跨过没有 feedid 的半行) | `services/maint_sheet.py` 头注 |
 | ✅ | ~~审核把「无货」报成「采集缺字段」~~(2026-08-17 修:`stock_block` 三档 unavailable/no_buybox/out_of_stock 收成唯一出处,维护链与审核链共用**原因码**、措辞各归各链) | `services/order_audit.py:stock_block` |
 | ⛔ | **`problem_scan` 的逐行建议不投影**(所有者拍板 2026-08-17:**不需要进表,也不需要导出**)。⚠ 它与 `maintenance_scan` 形状相同(同产 `ops.dispositions`、同由危险执行件消费),后者做了飞书投影 —— **两者的差别是所有者的决定,不是遗漏**,别再当缺口提。要看明细直接读 `ops.dispositions`;原「错误商品记录」表 2026-08-11 已拍板裁撤 | `workflows/problem_scan.py` |
@@ -139,17 +139,20 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 
 ## 六、配置与安全(便宜,但都在裸奔)
 
-> **整节后置**(所有者拍板 2026-08-12):生产运维动作(盘旧调度/备份/配 env/挂调度)
-> 全部等迁移完成——功能做完、数据库到位、飞书表对接无缺失后再考虑。本节只留账不动工。
+> ~~**整节后置**(所有者拍板 2026-08-12)~~ —— **2026-08-17 这一节的主体已完成**
+> (备份、盘旧调度、挂调度全部做完,见 `docs/production_cutover.md` §九)。
+> 剩下的只有几个 env 值,标 ⚙ 那几行。
 
 | 状态 | 项 | 后果 |
 |---|---|---|
-| ⬜ | **backup 工作流零代码**(全仓 grep pg_dump 零命中;plan.md:104 "Phase 0 后尽早") | 生产库已装全部状态,无任何备份 |
-| ⚙ | **FEISHU_WEBHOOK_URL 未配**(plan.md:57) | 采集类型告警、feed 未知状态告警、邮编未采纳告警……**全部只进日志没人看** |
-| ⚙ | READONLY_DB_PASSWORD(plan.md:34)、SCRAPER_EXPORT_TOKEN(api/scraper.py 每轮告警)、FEISHU_LIMITS_*(maintenance 清零硬依赖,feishu_tables.md:55) | 各自阻塞一条链 |
-| 🔴 | **旧调度未盘清**:`autolisting.morning` 06:00 若仍 loaded = 每天无人值守提交 MP_ITEM + 烧 UPC(legacy_survey.md:1957 判为最大风险);daily_cleanup 的调度器至今没定位(:1958);14 条 skill 的 cron 注册处未导出(:1956) | **新旧并跑可能正在发生**,需生产 Mac `launchctl list` 导出权威清单 |
-| ⬜ | `docs/legacy_schedules/` 归档目录不存在(plan.md:153 回滚预案要求删除旧调度前先归档) | 切换时无回滚依据 |
-| ⬜ | 旧仓库 `类目映射/.git-archive` 内嵌 git 仓含 7 个未推送 commit,归档前必须处理(legacy_survey.md:2172);`active/extract_pt_templates.py` 不是归档脚本,plan.md:126 "留在旧仓库归档"措辞会切断 erp-core 链(:2171) | 归档动作有前置 |
+| ✅ | ~~**backup 工作流零代码**~~(2026-08-13 落地 `workflows/backup.py`:`-Fc` 先写 `.part` → `pg_restore --list` 校验 → 原子换名;2026-08-13 生产首跑 1554.5 MB 过校验;2026-08-17 起每天 02:00 自动跑) | 结案 |
+| ✅ | ~~**FEISHU_WEBHOOK_URL 未配** ⇒ 通知没人看~~ —— **这条早就不成立了,别再照它报**(所有者 2026-08-17 纠正)。`api/feishu.notify()` 的**第一条路是应用身份直发**(`FEISHU_NOTIFY_TO`,`im/v1/messages`),webhook 只是切换期的第二条退路;生产用的是应用直发,通知正常发出。⚠ 我在本轮把这条陈述从这里抄进 README 还加重了一遍 —— 教训:**"文档里写着没配"不是"没配"的证据**,证据是 `notify()` 的代码与生产日志 | 结案 |
+| ✅ | ~~**FEISHU_LIMITS_\*** 未配~~ —— **2026-08-17 所有者已配好**。它是「上下架限额表」的 app_token/table_id(`registry.RETIRE_LIMITS`),没配时最要紧的两处是**静默降级**:倍率读不到 ⇒ 区间内的产品一律定不出价、只有出界品能上(300% 兜底);`库存特殊要求=0` 名单为空 ⇒ 该清零的店一件没清。两者都不报错 | 结案 |
+| ⚙ | **READONLY_DB_PASSWORD** 未配(所有者 2026-08-17 确认) | ⚠ **不阻塞任何链**(此前这行写"各自阻塞一条链",不准)。它只在 `db_init` 里决定要不要建 PG 的 `readonly` 角色,给 Metabase/NocoDB/AI 的 MCP 只读连接用。想让 BI 或 AI 直连读库时填上再跑一次 `db_init` 即生效 |
+| ⚙ | **SCRAPER_EXPORT_TOKEN** 未配(所有者 2026-08-17 确认) | 采集侧契约是**鉴权可选**(采集侧没配 `EXPORT_TOKEN` 时放行),所以本地/内网现在正常工作,`api/scraper._headers` 每进程告警一次。⚠ **采集服务上公网/VPS 那天必须两侧同时配**同一个值 —— 不配就是导出接口对全网开放 |
+| ✅ | ~~**旧调度未盘清**~~(2026-08-17 所有者已停掉旧 erpAPI 的全部定时任务并核对:旧冲突的订单/KPI 调度原本已 `PAUSED`/`disabled`;`walmart-daily-cleanup` 那条也在 gpt 侧,随之一并停) | 结案。⚠ 旧上架/审核 worker **仍在跑**,是所有者的决定(不写表,留作备用),不是漏停 |
+| ⬜ | `docs/legacy_schedules/` 归档目录不存在(plan.md:231 回滚预案要求删除旧调度前先归档) | 切换已完成,这条降为"旧配置没留副本";真要回滚只能靠旧仓库 |
+| ⬜ | 旧仓库 `类目映射/.git-archive` 内嵌 git 仓含 7 个未推送 commit,归档前必须处理(legacy_survey.md:2172);`active/extract_pt_templates.py` 不是归档脚本,plan.md:202 "留在旧仓库归档"措辞会切断 erp-core 链(:2171) | 归档动作有前置 |
 | ✅ | 新仓库无 `.claude/settings.json`,旧仓的 bypassPermissions 未被继承(已核实) | 结案 |
 
 ## 七、就绪未验收 / 调度 / 切换(概览,细节在 plan.md 各行)
@@ -157,13 +160,13 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 > 调度/切换整体后置(见第六节批注)。验收进行中:**所有者 2026-08-12 起每日实测
 > 在线产品拉取(catalog_sync)、几种订单拉取、日报拉取**。
 
-- 生产验收:product_refresh(维护链前置,一次没跑过)、maintenance 清零、RETIRE_ITEM 实测(**registry :59-62 明写 spec 1.0 需先实测端点还活着**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
-- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §十二.10)
-- **涨跌幅闸**(maintenance.py:47,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议
-- 挂调度:全部工作流一条没挂;顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance`;feed_poll 高频
-- 停旧 cron 五条:15:00 retire / 0·6·12·18 cleanup / 12:00 maintenance(先收干净在途 feed)/ order_audit 双重调度 / walmart-kpi-daily(停之前严禁开影刀)
+- 生产验收:~~product_refresh(维护链前置,一次没跑过)~~(2026-08-13 生产实跑,此后每天随 `product_chain` 13:00 跑)、maintenance 清零、RETIRE_ITEM 实测(**`registry/resources.py:99-106` 明写 RETIRE_ITEM 的 spec 1.0 只是旧系统实测值,迁 daily_cleanup 前必须实测端点仍可用**)、risk_sync、upc_sync、match_listing(--execute 前置对拍)、kpi_history_import apply、KPI 看板建表首刷、returns_sync/catalog_sync 全店与对拍(**每日实测中**)、daily_report 双算对拍收口(**每日实测中**)
+- ⚠ **kpi_history_import 店名无核对**(2026-08-12 核实):导入店名=旧 workbook sheet 标题,原样入库零核对——若与现凭证表店名不同,(store, data_date) 主键下新旧名**静默分裂成两个店**。apply 前人工核对 72 分页标题与凭证表店名是否同套(样例形态 A085朱丽霖,大概率同套但从未核对过);order_history_import 的 excel 店名("1杨宜凡" 式)已确认是另一套,预览会列分布(维度化统计下旧名行只进全局视图,不污染店×类目,`docs/allocation_plan.md` §八「销量统计维度化」)
+- **涨跌幅闸**(`services/maintenance_intents.py:72`,所有者 2026-08-07"暂不需要"):改价安全阀,上量前建议重议 —— 2026-08-26 全局 5000/类闸废除后更该重议(错价面不再被数量闸封住)
+- ✅ ~~挂调度:全部工作流一条没挂~~(**2026-08-17 全部上线**:launchd 2 条 + 智能体 9 条,顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance` 收在 `product_chain` 一条链里;`feed_poll` 每半小时。唯一出处 `registry/schedule.py`)
+- ✅ ~~停旧 cron 五条~~(**2026-08-17 所有者已全停**并核对;旧上架/审核 worker 按所有者决定保留当备用,不写表)
 - 采集侧一周连续验收(scraper_migration_brief.md:245)未开始;两侧契约副本的定期对账机制未建(:113-116)
-- 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),届时复查(maintenance.py:24)
+- 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),**该日期已过,待复查**(判据搬到 `services/maintenance_intents.py:100` 的 `LONG_OOS_DAYS` 与 `delete_intents`;同一窗口 2026-08-25 起还分出了「渠道不符 N 天」一档)
 - Phase 1:✅ ~~令牌桶~~(2026-08-12 完成:稀缺桶落 ops.rate_events 跨进程共享,PG 不可达 fail hard——所有者拍板;详见 plan.md Phase 1)、✅ ~~async 订单拉取~~(2026-08-13 完成:fetch_orders_bulk 跨店并发,order_sync 已接线)、feeds errorReport 下载(P3 可选)
 - ✅ ~~历史数据迁移总批次~~(所有者逐项拍板 2026-08-12,**整批关闭**):
   上架表 26 列**不迁**;UPC 池 12 万行**不迁**(还有用的 UPC 所有者手动写入
@@ -211,7 +214,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
       我们的采集侧给真族主(生产实见 GustBuster 组),但改回去也能自愈;
     · list_new 摘要新增「其中多维 N」「有维度映不上 N」两栏做验收点。
   ✅ **Phase 0.8 维度错位重映射 + Feature B 组内标题差异化已补迁**(2026-08-17,
-  所有者批「都补」)。`services/variant_remap.py`(三层:枚举内检查 → 内置错位表 →
+  所有者批「都补」)。`services/variant_remap.py`(2026-08-27 定案:①枚举内检查在调用方 list_new;本模块只提供 ②内置错位表 →
   LLM 兜底,整组一次决策过 llm_cache)+ `services/variant_title.py`(同组
   productName 全同时追加 ` - <维度取值>`,199 字截 base 保 suffix,幂等)+
   `list_new._remap_unmapped_dims` / `_differentiate_titles` 接线。
@@ -261,10 +264,10 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 **上架验收与收尾待办(2026-08-12 晚定格;代码迁移已收官,以下全是验收/运维/后置)**
 - ✅ ~~L2d 端到端验收~~(2026-08-13:3/3 SUCCESS,六轮错误账 30 错→0 错收官;报告在 listing_plan「重跑验收通过」)
 - ✅ 三件生产验证:L2a/L2b 已验(2026-08-12);L1 跟卖试点后置(所有者:暂时用不上,启用前再验)
-- ⬜ 调度挂载(验收后):upc_sync/catalog_sync(早)→ maintenance → list_new(每日)、feed_poll(每 30 分钟)、sku_locked_heal(每日)、risk_sync(每日);**顺序硬约束 catalog_sync → maintenance/list_new**
-- ⬜ 切换清单执行:停旧 launchd 5 条 + AI skill 链 erp-online-products-track(**两条同停**,新旧并跑=重复领号重复上架);旧在途 pending feed 先收干净
+- ✅ ~~调度挂载(验收后)~~(**2026-08-17 全部上线**,唯一出处 `registry/schedule.py`):顺序硬约束收在 `product_chain` 13:00 一条链里,`list_new` 20:00 单挂、`feed_poll` 每 30 分、`risk_sync` 随 `blacklist` 15:00;`upc_sync` 按定稿并进 list_new(不单挂)、`sku_locked_heal` 按所有者定稿仍不挂调度(手动)
+- ✅ ~~切换清单执行~~(**2026-08-17 所有者已停旧全部定时任务并核对**,见本文件第六节「旧调度未盘清」与第七节「停旧 cron 五条」;旧上架/审核 worker 按所有者决定留作备用、不写表,不是漏停)
 - ✅ ~~L4~~ 全部关闭:upc_audit **不需要**(所有者拍板 2026-08-13);历史数据迁移批次已整批关闭(2026-08-12)
-- ⬜ FEISHU_WEBHOOK_URL 未配置(生产日志反复出现):配上后 cli 成功/失败通知才真发飞书
+- ✅ ~~FEISHU_WEBHOOK_URL 未配置~~ —— 通知走**应用直发**(`FEISHU_NOTIFY_TO`),webhook 只是退路,不配也正常发(所有者 2026-08-17 纠正;见 `api/feishu.notify`)
 
 **切换清单增补(归第六节后置,但必须记)**:旧系统有**第二条调度链**——AI skill 平台 erp-online-products-track(07:30,reconcile→sync_online_products→sync_status_track,写上架表 O/P/Q 与 R~W)。停旧时 launchd 5 条之外必须一起停,否则新旧双写同列
 **26→21 列迁移口径**:旧 V/W(真实UPC/UPC一致)左移至新 T/U——**按列名对齐,严禁按位对齐**;真丢语义仅旧 T/U(状态跟踪,已由 catalog.walmart_items+product_events 升级承接)与 AA(变体组,随变体后置)

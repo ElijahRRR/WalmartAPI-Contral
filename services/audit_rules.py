@@ -1,7 +1,7 @@
 """审核规则引擎门面(批次 B:零 LLM 纯规则层;全案 docs/audit_migration_plan.md)。
 
 组装三块积木:audit_phase0(四件套短路)→ PT 解析(本文件,批次 B 版三级的
-前两级)→ audit_l2(R0-R8)→ audit_reason(37 政策理由映射)。
+前两级)→ audit_l2(R1/R3-R8)→ audit_reason(37 政策理由映射)。
 
 PT 解析(架构 10.3 的批次 B 裁剪版,批次 C 接 LLM rerank 前只有两级):
   ① 沃尔玛实证:catalog.walmart_items.product_type(sku=asin,跨店唯一才采信)
@@ -21,7 +21,8 @@ import logging
 from dataclasses import dataclass, field
 
 from registry import paths
-from services import audit_l1_llm, audit_l2, audit_phase0, audit_reason
+from services import (audit_l1_llm, audit_l2, audit_phase0, audit_reason,
+                      category_blacklist)
 from services.audit_models import AuditOutcome, L1Info, RuleHit
 from services.audit_stopwords import is_stopword
 
@@ -33,14 +34,9 @@ class AuditContext:
     """规则引擎的全部数据依赖(load_context 一次装配,规则函数零 DB 访问)。"""
     phase0_sellers: frozenset
     phase0_asins: frozenset
-    phase0_cats: frozenset
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
-    pt_spec: dict                  # PT → row dict
     ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
-    mega: list
-    nrtl_small: list
-    nrtl_whole: list
     nice_mapping: dict
     nice_default: list
     uspto: object = None           # psycopg 连接或 None(R5 开关)
@@ -51,6 +47,9 @@ class AuditContext:
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
     node_map: dict = field(default_factory=dict)              # browse_node_id → PT(高置信唯一,已 pt_meta 闸)
+    # 类目黑名单(2026-08-20:代码里的类目常量搬进 DB)。三种匹配一次装配:
+    # 子树 node_id / 顶级名 / 完整路径等值,判定见 services.category_blacklist.check
+    cat_rules: object = None
 
 
 def _brand_map(conn) -> tuple[dict, set]:
@@ -135,7 +134,6 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     """
     brand, r4_keys = _brand_map(conn)
     nice_mapping, nice_default = audit_l2.load_nice_mapping()
-    nrtl_small, nrtl_whole = audit_l2.load_nrtl_keywords()
     pt_meta = _rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
                                "walmart_ptg, access_state, zh_can_do, requirements, "
                                "notes FROM audit.walmart_pt_meta",
@@ -196,19 +194,31 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # 四闸全部直读黑名单中心(所有者定稿 2026-08-13,一份数据):
     # 卖家/类目 = risk_sync 镜像的两张新表;ASIN = 自产黑名单(问题商品清理
     # + 违禁回执 + 历史继承导入,5.6 万+ 行)——比旧 Phase0 三列表覆盖大得多
+    p0_sellers = _frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist")
+    p0_asins = _frozen(conn, "SELECT asin FROM catalog.asin_blacklist")
+    # ⚠ p0_cats **只为报数,不进 ctx**:类目闸整体改吃下面装配的 cat_rules,
+    # 这条查询留着单纯是为了下面那行日志里的「类目 N」这个数字有出处。
+    p0_cats = _frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"
+                            " WHERE enabled")
+    # 类目闸的判据全在库里(2026-08-20 所有者定稿:代码里的类目搬进 DB):
+    # 子树 ID / 顶级名 / 路径等值三种匹配,一次装配
+    cat_rules = category_blacklist.load(conn)
+    # 报数与品牌黑名单同款(2026-08-19 所有者在运行日志里找不到这三张表的
+    # 加载痕迹——加载是真的,静默也是真的;三张表载成空集与没加载在行为上
+    # 无法区分,必须让数字见人)
+    logger.info("黑名单中心加载:卖家 %d / ASIN %d / 类目 %d",
+                len(p0_sellers), len(p0_asins), len(p0_cats))
     return AuditContext(
-        phase0_sellers=_frozen(conn, "SELECT seller_id FROM catalog.seller_blacklist"),
-        phase0_asins=_frozen(conn, "SELECT asin FROM catalog.asin_blacklist"),
-        phase0_cats=_frozen(conn, "SELECT category_norm FROM catalog.amazon_cat_blacklist"),
+        phase0_sellers=p0_sellers,
+        phase0_asins=p0_asins,
+        cat_rules=cat_rules,
         brand_blacklist=brand,
         pt_meta=pt_meta,
-        pt_spec=_rows_dict(conn, "SELECT walmart_product_type, has_real_cert, "
-                                 "real_cert_fields, has_soft_cert, soft_cert_fields "
-                                 "FROM audit.walmart_pt_spec",
-                           "walmart_product_type"),
+        # ⚠ 2026-08-21 起**不再取 audit.walmart_pt_spec**:R3 收敛成"只看飞书
+        # requirements"(所有者定稿),那张表是批次 A 搬来的死快照,而"整机 vs
+        # 小件"这类推断已移交 L3 判定维度 6。表本身不删(pt_spec_sync 仍写它、
+        # audit_why / pt_census 仍查它做诊断),只是审核链不再拿它当判据。
         ac_automaton=_build_automaton(r4_keys),
-        mega=audit_l2.load_mega_categories(),
-        nrtl_small=nrtl_small, nrtl_whole=nrtl_whole,
         nice_mapping=nice_mapping, nice_default=nice_default,
         uspto=uspto,
         walmart_confirmed=confirmed,
@@ -315,24 +325,21 @@ def resolve_pt(product, ctx: AuditContext) -> L1Info:
                               "不判死;交 L1 第三级候选+LLM 判定)",
                     "amazon_path": product.amazon_category_path}))
     if pt:
-        seed = audit_l1_llm.check_seed_excluded(product, pt)
-        if seed:
-            audit_l1_llm.bump("seed_excluded_direct")   # 直出级单独键(线程安全)
-            l1.excluded_category_reason = seed
-            l1.hits.append(RuleHit(
-                stage="L1", rule_code="excluded_category", penalty=-100,
-                detail={"reason": seed, "pt": pt, "from_seed_yaml": True}))
-        ban = audit_l1_llm.check_publication_ban(
-            pt, l1.excluded_category_reason)
+        # ⚠ 2026-08-20:此处原先还有一道 seed yaml 硬拦(3C/服饰/汽配/带电禁售),
+        # 已随 excluded 整条链下线(所有者定稿 A1)——类目能不能做只由 L2 R1
+        # 的准入白名单说了算,不再有第二份平行清单。出版物硬禁保留:它不是
+        # 类目准入判断,是拿 walmart_error_records 实证打出来的知产风险(E 占比 ≥96%)。
+        ban = audit_l1_llm.check_publication_ban(pt)
         if ban is not None:
-            l1.excluded_category_reason = ban.detail["reason"]
             l1.hits.append(ban)
     return l1
 
 
 def audit_one(product, ctx: AuditContext, conn=None, *,
-              run_l3: bool = True, run_l4: bool = False) -> AuditOutcome:
-    """输入:ProductInfo + 上下文(+连接与层开关)→ 输出:AuditOutcome。
+              run_l3: bool = True, run_l4: bool = False,
+              only_l0: bool = False) -> AuditOutcome | None:
+    """输入:ProductInfo + 上下文(+连接与层开关)→ 输出:AuditOutcome;
+    only_l0 且 Phase0 未命中时返回 **None**(见下)。
 
     批次 C 全链:phase0 → L1(实证→哨兵→映射→候选+rerank)→ L2 → [L3 → L4]。
     conn=None 时退化为批次 B 形态(L1 第三级与 L3/L4 需要查库/调 LLM,全跳过,
@@ -341,6 +348,14 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
     L4 仅 outcome pass 且开关开,只认 reject(默认关,批复 #2)。
     """
     p0 = audit_phase0.check(product, ctx)
+    if only_l0 and not p0.blocked:
+        # 只跑 L0(stages=L0,所有者 2026-08-18):纯查库、零 LLM。
+        # 未命中 ⇒ 返回 None = **不落结论**:不写 runs、不动 products、
+        # 不盖规则版本 —— 截断的链没资格发 pass/pending(不完整审核
+        # 绝不当通过,与「任一道给不出确定答案一律待人工」同一条纪律)。
+        # 用途:配合 rerule 零 LLM 翻新黑名单历史行 —— 仍命中的重判
+        # (拿到新版本的理由映射),不再命中的保持原判、不被"复活"。
+        return None
     if p0.blocked:
         # 旧仓字面量三件套照迁(orchestrator.py:340-343):score_final 硬写 0
         outcome = AuditOutcome(
@@ -401,9 +416,11 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
 
     l2 = audit_l2.evaluate(product, l1, ctx)
     verdict = l2.verdict
+    # L2 也会产 pending(R1 查不到这个 PT 的准入事实 ⇒ 判不了,2026-08-20):
+    # 与 reject 一样停在 L2,不再往下走 L3/L4 —— 类目都没定,语义与视觉判了也白判
     outcome = AuditOutcome(
         asin=product.asin, verdict=verdict, score_final=l2.score_final,
-        stage_stopped_at="L2" if verdict == "reject" else None,
+        stage_stopped_at="L2" if verdict in ("reject", "pending") else None,
         l1=l1, phase0=p0, l2=l2)
 
     # L3 语义(orchestrator.py:378-389):唯一条件 = l2 pass 且开关开;
@@ -469,4 +486,5 @@ def product_info_from_row(row: dict):
         known_pt=row.get("walmart_pt") or None,
         known_pt_source=row.get("pt_source") or None,
         browse_node_id=row.get("browse_node_id") or "",
+        browse_node_chain=row.get("browse_node_chain") or "",
     )

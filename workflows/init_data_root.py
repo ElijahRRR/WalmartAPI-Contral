@@ -29,6 +29,16 @@ FEISHU_WEBHOOK_URL=
 FEISHU_STORE_TABLE_APP_TOKEN=
 FEISHU_STORE_TABLE_ID=
 
+# 分配链两张表(2026-08-24 补:此前模板漏登,照 README 部署的新机器
+# 跑 alloc_* 会在 store_targets.require() 上抛 LookupError,报「限额表读不到」)
+# 上下架限额表(多维表格):准入类目 / 渠道 / 单店最大在线数 / 目标三列 /
+#   配送时长限制 —— 分配链**六条工作流的硬前提**,读不到就硬拒
+FEISHU_LIMITS_APP_TOKEN=
+FEISHU_LIMITS_TABLE_ID=
+# 上架表(电子表格):alloc_push 把已落占用追加进 A/B 两列。
+#   token 复用下面的 FEISHU_ONLINE_SHEET_TOKEN,这里只要 sheet_id
+FEISHU_LISTING_SHEET_ID=
+
 # 订单审核两张配置表
 # 黑名单邮编(wiki 电子表格:token=/wiki/ 后段,sheet_id=?sheet= 参数)
 FEISHU_ZIP_BLACKLIST_WIKI_TOKEN=
@@ -61,7 +71,10 @@ FEISHU_BRAND_SHEET_ID=
 # LLM(DeepSeek 单链;api/llm.py)。分用途覆盖模型可选(批复 #1,
 # 未配置回落 DEEPSEEK_MODEL 默认;registry.LLM_PURPOSE_ENV 登记)
 DEEPSEEK_API_KEY=
-#DEEPSEEK_MODEL=deepseek-chat
+# 全仓统一 deepseek-v4-flash(所有者定稿 2026-08-21:审核与上架都用它);
+# 不填即用这个缺省值。**别填 deepseek-chat/deepseek-reasoner** —— 官方已宣布
+# 停用的旧别名,切断当天全仓 LLM 调用会一起失败
+#DEEPSEEK_MODEL=deepseek-v4-flash
 #DEEPSEEK_MODEL_AUDIT_L1=
 #DEEPSEEK_MODEL_AUDIT_L3=
 # L4 视觉(豆包/火山方舟;api/llm_vision.py;默认关,-p l4=on 才用)

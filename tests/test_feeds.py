@@ -170,6 +170,46 @@ def test_payload_key_order_independent():
         feeds.payload_key("RETIRE_ITEM", ["A"])
 
 
+def test_iter_result_slices_walks_the_cursor_without_off_by_one():
+    """submit_feed 只回 count 不回条目:对位全靠游标,错一位就是整批结局
+    落到别人行上,而且**不报错**(6 个工作流各手写过一遍这段游标)。"""
+    entries = [f"S{i}" for i in range(10)]
+    results = [{"count": 3, "outcome": "submitted"},
+               {"count": 1, "outcome": "dedup"},
+               {"count": 6, "outcome": "failed"}]
+    got = list(feeds.iter_result_slices(results, entries))
+
+    assert [r for r, _ in got] == results               # 结果原样带出
+    assert [len(b) for _, b in got] == [3, 1, 6]        # 逐片长度 = count
+    assert [e for _, b in got for e in b] == entries    # 切片总和 = entries
+    assert got[0][1] == ["S0", "S1", "S2"]
+    assert got[1][1] == ["S3"]                          # 下一片从上一片之后接上
+    assert got[2][1][0] == "S4" and got[2][1][-1] == "S9"
+    assert list(feeds.iter_result_slices([], entries)) == []
+    assert list(feeds.iter_result_slices([{"count": 0}], entries)) == \
+        [({"count": 0}, [])]                            # 空片不吃条目
+
+
+def test_iter_result_slices_reproduces_real_slicing(monkeypatch):
+    """与真实切片对拍:片数、逐片长度、拼回原序都要还原 _slices 的分法。"""
+    monkeypatch.setitem(feeds._SLICE_LIMITS, "DELETE_ITEM", (7, 350_000))
+    entries = [f"S{i}" for i in range(23)]
+    chunks = feeds._slices("DELETE_ITEM", entries)
+    results = [{"count": len(c), "outcome": "submitted"} for c in chunks]
+
+    assert [len(c) for c in chunks] == [7, 7, 7, 2]     # 末片不满也要对得上
+    assert [b for _, b in feeds.iter_result_slices(results, entries)] == chunks
+
+
+def test_iter_result_slices_takes_any_parallel_list():
+    """entries 不必是提交的载荷,只要同序等长——6 个工作流传的都是自己的
+    业务行(飞书行号 / (行, 载荷) 对 / 台账行)。"""
+    rows = [{"rownum": i} for i in range(5)]
+    results = [{"count": 2}, {"count": 3}]
+    assert [b for _, b in feeds.iter_result_slices(results, rows)] == [
+        rows[:2], rows[2:]]
+
+
 # ── 提交:防重/成功/被拒/反查三态 ─────────────────────────────────────────────
 
 def test_submit_dedup_refuses_resubmission(monkeypatch):
@@ -369,3 +409,197 @@ def test_feed_rate_buckets_default_deny():
     _client.rate_acquire("feeds.get", "cid_bucket_test")
     with pytest.raises(KeyError, match="限速桶未登记"):
         _client.rate_acquire("feeds.post.MP_INVENTORY", "cid_bucket_test")
+
+
+def test_submit_5xx_found_adopts_instead_of_terminal_fail(monkeypatch):
+    """5xx ≠ 4xx(2026-08-19 官方核验 + 生产实证 Akamai 'Internal Server
+    Error - Read' = 边缘从源站读响应失败):请求可能已达、feed 可能已建成。
+    终态拒会把已达的 feed 弄丢台账 → 必须反查三态,查到就收编。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+    now_ms = int(time.time() * 1000)
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500, text="<HTML><HEAD>\n<TITLE>Internal "
+                                            "Server Error</TITLE></HEAD>")
+        return httpx.Response(200, json={"results": {"feed": [
+            {"feedId": "F_5XX", "itemsReceived": 1, "feedDate": now_ms}]}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0] == {"feed_id": "F_5XX", "count": 1, "outcome": "submitted"}
+    assert calls["post"] == 1                    # 反查已达 → 收编,不补交
+
+
+def test_submit_5xx_notfound_resubmits_once(monkeypatch):
+    """5xx 且双确认未达 → 同一载荷补交一次(官方口径 retry with backoff;
+    反查的 30s 双确认就是退避)。4xx 的"绝不重试"语义不变(上面老测试钉着)。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            if calls["post"] == 1:
+                return httpx.Response(500, text="<HTML>edge error</HTML>")
+            return httpx.Response(200, json={"feedId": "F_RETRY"})
+        return httpx.Response(200, json={"results": {"feed": []}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    assert out[0]["outcome"] == "submitted" and out[0]["feed_id"] == "F_RETRY"
+    assert calls["post"] == 2
+
+
+# ── 延后结算(所有者定稿 2026-08-26:重试等整轮跑完)──────────────────────────
+
+def test_defer_settle_hands_back_a_replayable_handle_and_writes_nothing(monkeypatch):
+    """`defer_settle=True` 遇 5xx:**当场什么终态都不写**,只交回重放句柄。
+
+    这是整件事的地基 —— 当轮写了终态(判 failed 回收 UPC / 判 unknown 写
+    K=Unknown)之后,第二轮就没得救了。
+    """
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0, "get": 0}
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500, text="Internal Server Error - Read")
+        calls["get"] += 1
+        return httpx.Response(200, json={"results": {"feed": []}})
+
+    _use(monkeypatch, handler)
+    out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t",
+                            defer_settle=True)
+    assert out[0]["outcome"] == "deferred" and out[0]["feed_id"] is None
+    # 当场既不反查也不补交:反查留到第二轮,那时索引才追得上
+    assert calls == {"post": 1, "get": 0}
+    # feed_log 停在 pending —— 一条 UPDATE 都不许有
+    assert _updates(logdb) == []
+    # 句柄够重放:载荷由 chunk 确定性重建,不扛几 MB 的 dict 过整轮
+    h = out[0]["_settle"]
+    assert h["chunk"] == ["A"] and h["feed_type"] == "DELETE_ITEM"
+    assert h["log_id"] == 1 and h["workflow"] == "t"
+
+
+def test_settle_found_adopts_without_resubmitting(monkeypatch):
+    """第二轮反查到了 ⇒ 收编,**一次补交都不发**。
+
+    生产实证 2026-08-24:那晚 4 家店就是这么救回来的 —— feed 其实建成了,
+    只是响应丢在边缘。拖过第一轮之后沃尔玛的索引也追上了,FOUND 的概率
+    比当场反查高得多,这正是"等整轮跑完"的头号收益。
+    """
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+    now_ms = int(time.time() * 1000)
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"results": {"feed": [
+            {"feedId": "F_LATE", "itemsReceived": 1, "feedDate": now_ms}]}})
+
+    _use(monkeypatch, handler)
+    h = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t",
+                          defer_settle=True)[0]["_settle"]
+    res = feeds.settle_deferred(STORE, h)
+    assert res == {"feed_id": "F_LATE", "count": 1, "outcome": "submitted"}
+    assert calls["post"] == 1          # 只有第一轮那一次,第二轮零补交
+
+
+def test_settle_probes_before_every_resubmit(monkeypatch):
+    """**每次补交之前都必须重新反查,一次都不许省** —— 防双上架的命门。
+
+    省掉的话,第二次补交就可能撞上第一次其实已经落地的 feed。反查本身不贵
+    (feeds.get 是 3000/min 的大桶),而每省一次都在赌一次双上架。
+    """
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    seq: list = []
+
+    def handler(request):
+        seq.append(request.method)
+        if request.method == "POST":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"results": {"feed": []}})
+
+    _use(monkeypatch, handler)
+    h = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t",
+                          defer_settle=True)[0]["_settle"]
+    feeds.settle_deferred(STORE, h)
+    # 第一轮那次 POST 之后,序列必须是 GET,GET(双确认) → POST → GET,GET → POST …
+    # 断言:**任意一次 POST 之前都紧邻着 GET**(除了第一轮那次开场的)
+    for i, m in enumerate(seq):
+        if m == "POST" and i > 0:
+            assert seq[i - 1] == "GET", f"第 {i} 次 POST 前面不是反查:{seq}"
+    assert seq.count("POST") == 1 + feeds.SETTLE_ATTEMPTS
+
+
+def test_settle_unknown_never_resubmits(monkeypatch):
+    """反查自己就查不动(UNKNOWN)⇒ **绝不补交**,保持 pending 交启动对账。
+
+    宁停不重:查不动时补交,等于在"可能已经上架了"的情况下再上一次。
+    """
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500, text="boom")
+        return httpx.Response(503, text="feeds 也挂了")   # 反查失败 ⇒ UNKNOWN
+
+    _use(monkeypatch, handler)
+    h = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t",
+                          defer_settle=True)[0]["_settle"]
+    res = feeds.settle_deferred(STORE, h)
+    assert res["outcome"] == "unknown" and res["feed_id"] is None
+    assert calls["post"] == 1                    # 只有第一轮那次,第二轮零补交
+    # UNKNOWN 不许把 feed_log 推向终态(pending 才是启动对账的入口)
+    assert _updates(logdb) == []
+
+
+def test_settle_4xx_stops_immediately(monkeypatch):
+    """补交撞 4xx ⇒ 载荷/权限问题,补多少次都是同一个拒 —— 立刻收手判 failed。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    calls = {"post": 0}
+
+    def handler(request):
+        if request.method == "POST":
+            calls["post"] += 1
+            return httpx.Response(500 if calls["post"] == 1 else 400,
+                                  json={"error": "bad payload"})
+        return httpx.Response(200, json={"results": {"feed": []}})
+
+    _use(monkeypatch, handler)
+    h = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t",
+                          defer_settle=True)[0]["_settle"]
+    res = feeds.settle_deferred(STORE, h)
+    assert res["outcome"] == "failed"
+    assert calls["post"] == 2            # 第一轮 + 第二轮第一次,不再往下试
+
+
+def test_backoff_follows_the_official_ladder_with_jitter():
+    """退避走**官方阶梯 + 抖动**(2026-08-26 核验 developer.walmart.com)。
+
+    官方对 500 的原文是「Retry with **jitter**」,阶梯示例 2/4/8/16/32。
+    抖动不是我们的发挥:没有它,一批同时失败的店会在同一秒**再次同时**
+    打过去,把第一次的洪峰原样复制一遍 —— 退避只平移了洪峰,没摊平它。
+    """
+    assert feeds._BACKOFF_LADDER == (2, 4, 8, 16, 32)
+    for i, base in enumerate(feeds._BACKOFF_LADDER):
+        vals = {feeds._backoff(i) for _ in range(40)}
+        assert all(base * 0.5 <= v <= base for v in vals), (i, sorted(vals)[:3])
+        assert len(vals) > 1, f"第 {i} 档没有抖动:{vals}"
+    # 超出阶梯长度取最后一档,不越界
+    assert 16 <= feeds._backoff(99) <= 32

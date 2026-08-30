@@ -28,6 +28,8 @@ class _Conn:
         self.sqls.append((sql, list(rows)))
 
     def fetchall(self):
+        if "DISTINCT ON (store, asin)" in self._last:
+            return getattr(self, "reuse", [])    # claim 的原号复用查询
         if "FOR UPDATE SKIP LOCKED" in self._last:
             return self.fetch
         if "GROUP BY status" in self._last:
@@ -73,12 +75,37 @@ def test_claim_uses_skip_locked_and_pads_none(caplog):
         got = upc_pool.claim(conn, [{"store": "T1", "asin": "B0X"},
                                     {"store": "T1", "asin": "B0Y"}])
     assert got == ["000000000017", None]                     # 池不足补 None
-    sel_sql = conn.sqls[0][0]
+    assert "DISTINCT ON (store, asin)" in conn.sqls[0][0]    # 先查可复用旧号
+    sel_sql = conn.sqls[1][0]
     assert "FOR UPDATE SKIP LOCKED" in sel_sql and "status = ''" in sel_sql
-    upd_sql, upd_rows = conn.sqls[1]
+    upd_sql, upd_rows = conn.sqls[2]
     assert "status = 'claimed'" in upd_sql
     assert upd_rows == [("T1", "B0X", "000000000017")]       # 只更新领到的
     assert any("余量不足" in m for m in caplog.messages)
+
+
+def test_claim_reuses_prior_upc_for_same_store_asin():
+    """O=FAILED 重试不换号(2026-08-19 生产实证 ERR_EXT_DATA_0101211):
+    SKU 在沃尔玛端绑死首个 UPC,换新号重发必败还白烧号。同 (店,ASIN)
+    已有 claimed/used 的号必须原号复用,新号只发给真正的新行。"""
+    conn = _Conn(fetch=[("000000000024",)])
+    conn.reuse = [("T1", "B0OLD", "000000000017")]
+    got = upc_pool.claim(conn, [{"store": "T1", "asin": "B0OLD"},
+                                {"store": "T1", "asin": "B0NEW"}])
+    assert got == ["000000000017", "000000000024"]           # 旧行复用,新行新号
+    upd_sql, upd_rows = conn.sqls[2]
+    assert upd_rows == [("T1", "B0NEW", "000000000024")]     # 复用行不再 UPDATE
+
+
+def test_burn_for_retire_marks_conflict():
+    """RETIRE 成功后旧号永久弃用(标 conflict):不烧的话 claim 的复用逻辑
+    会把旧号还给同 (店,ASIN),"清列重上领新号"就成了空话。"""
+    conn = _Conn()
+    assert upc_pool.burn_for_retire(conn, [("T1", "B0X")]) == 1
+    sql, _ = conn.sqls[0]
+    assert "status = 'conflict'" in sql
+    assert "status IN ('claimed', 'used')" in sql
+    assert upc_pool.burn_for_retire(conn, []) == 0
 
 
 def test_release_only_three_reasons():
@@ -98,7 +125,9 @@ def test_upc_sync_workflow_projection(monkeypatch):
                   ["212345678901", "2026-08-07", "", "", "", ""]]
     writes = []
     monkeypatch.setattr(feishu, "sheet_row_count", lambda s: 3)
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, r1, r2, **kw:
+                        list(enumerate(sheet_rows, r1)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     from datetime import datetime
@@ -119,13 +148,64 @@ def test_upc_sync_workflow_projection(monkeypatch):
     assert "新入库 1" in out and "非法前缀 1" in out and "未用 5" in out
 
 
+def test_upc_rownum_comes_from_the_read_channel_not_from_hand_math(monkeypatch):
+    """跨块读时行号只能取读通道给的那个,手算 `i + 2` 会写到别人的号上。
+
+    表长过一块(4750 行)之后读通道分块发请求,而飞书只裁**范围尾部**的空行:
+    块尾一空,那一块少返几行,下一块的行号照旧从块首起算。按返回序号手算的
+    那版会把第二块整体上移,`project_to_sheet` 的 `C{行}:F{行}` 定点回写就把
+    "已用/店铺/SKU"盖到隔壁那个还没发出去的号上 —— 表里凭空多一个已用号,
+    真正用掉的那行还空着,两边都不报错。UPC 表本来就是几万行起步的常客。
+    """
+    monkeypatch.setattr(resources, "UPC_SHEET",
+                        Spreadsheet(name="UPC池", token="TOK", sheet_id="SID",
+                                    columns=resources.UPC_SHEET.columns))
+    block = feishu._SHEET_READ_BLOCK_ROWS
+    last = block + 5                        # 数据行 2..last,跨两块
+    holes = {block, block + 1}              # 第一块的最后两行是空的 → 被裁掉
+    grid = {r: [f"84256553{r:04d}", "2026-08-07", "", "", "", ""]
+            for r in range(2, last + 1) if r not in holes}
+
+    def fake_raw(sheet, rng):
+        head, tail = rng.split(":")
+        got = [grid.get(r, []) for r in range(int(head[1:]), int(tail[1:]) + 1)]
+        while got and not got[-1]:          # 只裁范围尾部,中段空行占位
+            got.pop()
+        return got
+
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_row_count", lambda s: last)
+    monkeypatch.setattr(feishu, "_values_raw", fake_raw)   # 真通道跑在假飞书上
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    monkeypatch.setattr(upc_pool, "sync_rows", lambda conn, rows: (0, 0))
+
+    from datetime import datetime
+    marked = {2: "T_HEAD", block + 2: "T_AFTER_HOLE", last: "T_LAST"}
+    monkeypatch.setattr(upc_pool, "lookup", lambda conn, upcs: {
+        upc_pool.normalize(grid[r][0]): ("used", store, f"SKU{r}",
+                                         datetime(2026, 8, 7))
+        for r, store in marked.items()})
+
+    got = upc_pool.sync_from_sheet(None)
+    assert [r["rownum"] for r in got["rows"]] == sorted(grid)   # 空行不占号
+    assert upc_pool.project_to_sheet(None, got["rows"]) == len(marked)
+    w = {rng: vals[0] for rng, vals in writes}
+    for r, store in marked.items():
+        assert w[f"C{r}:F{r}"] == ["已用", store, f"SKU{r}", "2026-08-07"]
+    assert all(f"C{r}:F{r}" not in w for r in holes)            # 空行一格未写
+
+
 # ── 定价 ─────────────────────────────────────────────────────────────────────
 
 def test_price_bands_overlap_prefers_lower():
-    # 所有者定稿:FBA 0-30/30-75,FBM 15-80/80-1000;边界/重叠向下兼容
+    # 所有者定稿:FBA 0-30/30-1000,FBM 15-80/80-1000;边界/重叠向下兼容
     assert pricing.pick_band("FBA", 30) == "fba_range1"      # 30 用低区间
     assert pricing.pick_band("FBA", 30.01) == "fba_range2"
-    assert pricing.pick_band("FBA", 76) is None              # 出界(走默认倍率)
+    # 2026-08-21 所有者把 FBA 区间2 上界从 75 抬到 1000:76 此前出界走 300%,
+    # 现在吃 fba区间2 的倍率(该店没配那一格就变成不定价——见下面那条用例)
+    assert pricing.pick_band("FBA", 76) == "fba_range2"
+    assert pricing.pick_band("FBA", 1001) is None            # 出界(走默认倍率)
     assert pricing.pick_band("FBM", 80) == "fbm_range1"
     assert pricing.pick_band("FBM", 14) is None
     assert pricing.pick_band("FBM", 999) == "fbm_range2"
@@ -179,13 +259,30 @@ def test_out_of_band_falls_back_to_default_multiplier():
     """所有者定稿 2026-08-09:价格出界按 300% 定价,不再淘汰。"""
     mults = {"fba_range1": "275%", "fbm_range1": "200%"}
     assert pricing.OUT_OF_BAND_MULTIPLIER == 3.0
-    assert pricing.walmart_price("FBA", 200, mults, 0) == 600.0  # FBA 上界 75 外
+    assert pricing.walmart_price("FBA", 2000, mults, 0) == 6000.0  # FBA 上界 1000 外
     assert pricing.walmart_price("FBM", 10, mults, 0) == 30.0     # FBM 下界 15 外
     assert pricing.walmart_price("FBM", 2000, mults, 0) == 6000.0
     # 出界不查表:该店一个倍率都没配也照样出价
-    assert pricing.walmart_price("FBA", 200, {}, 0) == 600.0
+    assert pricing.walmart_price("FBA", 2000, {}, 0) == 6000.0
     # 在区间内但倍率没配 → 仍返 None(配置缺失不该拿默认值蒙混)
     assert pricing.walmart_price("FBA", 10, {}, 0) is None
+
+
+def test_fba_band2_upper_bound_moved_to_1000():
+    """2026-08-21 所有者:FBA 区间2 上界 75 → 1000。
+
+    **换版的代价钉在这里**:75~1000 这一段此前出界、走 300% 兜底照样出价;
+    现在它落进 fba区间2,该店那一格没填就变成**不定价**(上架不上、维护不改)。
+    这是"配置缺失不拿默认值蒙混"的正确表现,但换版当天会多出一批跳过,
+    别把它当成故障——去限额表把 fba区间2 填上就是了。
+    """
+    assert pricing.PRICE_BANDS["FBA"] == [(0, 30, "fba_range1"),
+                                          (30, 1000, "fba_range2")]
+    配了 = {"fba_range1": "275%", "fba_range2": "250%"}
+    没配 = {"fba_range1": "275%"}
+    assert pricing.walmart_price("FBA", 200, 配了, 0) == 500.0   # 200×250%
+    assert pricing.walmart_price("FBA", 200, 没配, 0) is None    # ← 换版的代价
+    assert pricing.walmart_price("FBA", 2000, 没配, 0) == 6000.0  # 1000 外仍兜底
 
 
 # ── 上架先注入 UPC(所有者定稿 2026-08-16)+ feed 闭环审计的两处修复 ──────────

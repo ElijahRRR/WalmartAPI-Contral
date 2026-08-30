@@ -108,7 +108,7 @@ def test_locked_step_stops_the_chain_with_exit_3(calls, notes, monkeypatch):
     import contextlib
 
     @contextlib.contextmanager
-    def fake_hold(name):
+    def fake_hold(name, wait_secs=0, holder=""):
         if name == "zz_busy":
             yield False
         else:
@@ -173,3 +173,51 @@ def test_each_step_logs_to_its_own_file(calls, notes, tmp_path):
     # 各进各的,不串味
     assert "zz_b 干活了" not in (tmp_path / "logs" / "zz_a.log").read_text(
         encoding="utf-8")
+
+
+# ── 硬拒 ≠ 成功 ────────────────────────────────────────────────────────
+
+def test_a_refusal_is_not_reported_as_success(notes):
+    """⚠ 「前提不成立就别跑」的早退**不是成功**。
+
+    全仓十几处硬拒都写成普通 `return "⛔ …"` 而不抛异常 —— 那是对的,它不是
+    崩溃,不该打印 traceback。但 cli 原来照单记 status='success' 并发 ✅,
+    实测 2026-08-16 的日志长这样:
+
+        INFO cli: workflow alloc_plan 成功:
+        ⛔ 限额表读不到(…尚未登记 app_token/table_id)
+        ✅ [DRY-RUN] alloc_plan 成功
+
+    后果是 `ops.runs.status` 对这几条工作流**失去判别力**:飞书告警里
+    「什么都没干」和「分配了 2.8 万条」长得一模一样。
+    """
+    _fake("zz_refuse", lambda p: "⛔ 限额表读不到:没有类目/渠道/容量就没法分配")
+    assert cli.main(["zz_refuse"]) == 1              # 退出码 = 活没干成
+    assert notes and notes[0].startswith("⛔ ")       # 图标与 ✅/❌ 都不同
+    assert "未执行(前提不成立)" in notes[0]
+    del sys.modules["workflows.zz_refuse"]
+
+
+def test_a_refusal_stops_the_chain(calls, notes):
+    """⚠ 硬拒必须停链,否则后面几步拿着「前提没满足」一路跑到底。
+
+    串联的约定是「前一个失败就不跑后面的」;拒跑计成功的话,这条约定对
+    **最常见的那种没跑成**(配置没填、表读不到)恰好失效。
+    """
+    _fake("zz_refuse2", lambda p: "⛔ 前提不成立")
+    calls("zz_after")
+    assert cli.main(["zz_refuse2", "zz_after"]) == 1
+    assert [n for n, _ in calls.seen] == []          # zz_after 一步没跑
+    assert "zz_after:上游 zz_refuse2 未成功,未执行" in notes[0]
+    del sys.modules["workflows.zz_refuse2"]
+
+
+def test_a_refusal_marker_only_counts_at_the_start_of_the_summary(calls, notes):
+    """⚠ 摘要**正文里**提到 ⛔ 不算硬拒 —— 报告里列举"哪些被拦下了"很常见。
+
+    判据必须是首字符,否则一份正常跑完、但内容里带 ⛔ 的报告会被判成没跑。
+    """
+    _fake("zz_mentions", lambda p: "分配完成\n  其中 3 家被 ⛔ 拦下,详见清单")
+    assert cli.main(["zz_mentions"]) == 0
+    assert notes[0].startswith("✅ ")
+    del sys.modules["workflows.zz_mentions"]

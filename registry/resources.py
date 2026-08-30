@@ -93,6 +93,15 @@ def feishu_notify_to() -> str | None:
     return os.environ.get("FEISHU_NOTIFY_TO", "").strip() or None
 
 
+# 定制品判据键(所有者定稿 2026-08-28:「对于定制产品不上架,是否为定制产品
+# 可以从产品数据中拿到」)。值随采集载荷落库(products.slow / snapshots.raw),
+# 契约字段表未登记 —— rating/review_count 同款先例(allocation_plan §评分:
+# 契约没登记但采集侧确实随 raw 落库,探针实测后启用)。
+# 键名生产探针已核实(所有者实跑 2026-08-28):latest_snapshot.raw 带
+# `is_customized` 共 1,225,423 行,值形态 Yes/No(_is_custom 的小写 truthy
+# 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
+AMZ_CUSTOM_FLAG_KEY = "is_customized"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -108,9 +117,18 @@ FEED_SPEC_VERSIONS = {
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
-    # 上架主链(L2;旧系统实测值,官方 4-6 周滚版,上线前需实测仍被接受;
-    # header version 必须完整时间戳,写 '5.0' 被拒 74597363510508 实证)
-    "MP_ITEM": "5.0.20260304-22_45_32-api",
+    # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
+    #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
+    # 改一处两边一起变 —— 两边错开就是拿一个版本的数据去过另一个版本的校验。
+    # header version 必须完整时间戳,写 '5.0' 被拒(74597363510508 旧实证)。
+    #
+    # 2026-08-20 从 5.0.20260304-22_45_32-api 切到 20260608(旧版停了五个月;
+    # MP_MAINTENANCE 早已在 20260608)。切换前用 `spec_split -p diff=1` 量过差集:
+    #   PT 6951 → 6951(零增零减);Orderable 24 → 23(只移除 specProductType);
+    #   顶层必填有变化的 PT 仅 48 个;**新增必填只有 center_bore、影响 1 个 PT**
+    #   (轮毂中心孔径,汽车整顶级不做,实际影响为零);其余 5 个字段全是
+    #   "不再必填"(partTerminologyID 24 / condition 20 / …),只放松不收紧。
+    "MP_ITEM": "5.0.20260608-18_15_07-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)
@@ -129,6 +147,12 @@ WALMART_ERR_PROHIBITED = frozenset({
 # 绝不能当失败重发,否则 duplicate listing)
 WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
                             "EXT_DATA_ERROR_66547201695750")
+# 内容标准拒(2026-08-19 生产实证 ~30 例:标题堆词/图文不符/描述自相矛盾)。
+# 文案图片全部取自亚马逊原文(系统的地盘,LLM 不碰),原样重发结果必然相同
+# ——进 FAILED 通道重试三次 = 纯烧 UPC 与配额,还会触发/延长 QARTH 合规
+# 审查。O 列写 CONTENT_REJECTED,list_new 不再自动领;文案人工改好后
+# 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
+WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -446,7 +470,7 @@ RETIRE_SHEET = Spreadsheet(
 )
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
-# daily_retire 读「下架限制」,未来 listing 读「上架限制」等)
+# product_clear 读「下架限制」,listing 链读「上架限制」等)
 # 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
 # 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
 # A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
@@ -494,11 +518,16 @@ SELLER_BLACKLIST_SHEET = Spreadsheet(
     columns=("seller_id",),
     wiki=True,
 )
+# ⚠ 2026-08-20 从单列升成五列(所有者定稿:「我把 233 条整个粘贴进飞书表格,
+# 你让黑名单中心按实际的读取」)。单列时代只能表达「这一条精确路径」,存不下
+# 子树规则的 browse_node_id —— 233 条里 189 条子树 + 30 条顶级名会全退化成
+# path_exact,拦截面从 2 万个类目塌回 233 条,等于把子树改造整个还原。
+# **列序即飞书表头顺序,一个字都不许改**(飞书按表头位置索引,改名/换位会静默错位)。
 AMZCAT_BLACKLIST_SHEET = Spreadsheet(
     name="黑名单亚马逊类目",
     token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_AMZCAT_BLACKLIST_SHEET_ID", ""),
-    columns=("category",),
+    columns=("category", "browse_node_id", "category_zh", "match_type", "reason"),
     wiki=True,
 )
 
@@ -537,10 +566,132 @@ PT_TEMPLATE_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# ── LLM 计价表(2026-08-21 加;单位 USD / 每 100 万 token)──────────────
+# **DeepSeek 没有任何端点能查到单价或某次调用的花费**(核过官方文档:
+# `/user/balance` 只回余额;`/chat/completions` 的 usage 只回 token 数),
+# 所以单价只能落在本地。放这里是铁律 3:一切配置从 registry 取。
+#
+# 数据来源:api-docs.deepseek.com/quick_start/pricing,**2026-08-21 核**。
+# 官方会调价,对不上账时先来这里核一遍日期。
+#
+# ⚠ **峰谷价差整整一倍**,峰值时段(UTC)01:00–04:00 与 06:00–10:00
+#   —— 换算成北京时间就是 **09:00–12:00 与 14:00–18:00**;其余时段半价。
+#   所以十几万条的大重审排在**北京时间晚 18:00 到次日早 08:00**跑,直接省一半。
+LLM_PRICING_SOURCE = "api-docs.deepseek.com/quick_start/pricing(2026-08-21 核)"
+
+# 峰值时段(UTC 小时,左闭右开)。谷时段 = 其余全部
+LLM_PEAK_HOURS_UTC = ((1, 4), (6, 10))
+
+# model → {tier: (cache_hit, cache_miss, output)},USD / 1M token。
+# 键是**定价页上的产品名**;请求里发的 `model` 可能是别名,先过 LLM_MODEL_ALIASES。
+LLM_PRICING = {
+    "deepseek-v4-flash": {"peak":    (0.014, 0.44, 1.32),
+                          "offpeak": (0.007, 0.22, 0.66)},
+    "deepseek-v4-pro":   {"peak":    (0.044, 1.32, 3.96),
+                          "offpeak": (0.022, 0.66, 1.98)},
+}
+
+# 旧别名 → 定价页产品名(2026-08-21 核官方更新日志)。
+# ⚠ `deepseek-chat` / `deepseek-reasoner` 是**官方已宣布停用的旧别名**
+#   (2026-04-24 公告:三个月后即 2026-07-24 停用),当前路由到 v4-flash 的
+#   非思考 / 思考模式。**停用日期已过**,还能用纯属宽限期 —— 一旦切断,
+#   全仓 LLM 调用会同时失败(L1 rerank / L3 / 上架属性映射 / variant_remap)。
+#   生产应在 .env 显式写 `DEEPSEEK_MODEL=deepseek-v4-flash`。
+LLM_LEGACY_ALIASES = {"deepseek-chat", "deepseek-reasoner"}
+LLM_MODEL_ALIASES = {
+    "deepseek-chat": "deepseek-v4-flash",       # 非思考模式
+    "deepseek-reasoner": "deepseek-v4-flash",   # 思考模式,同一张价表
+}
+
+
+def llm_priced_model(model: str) -> str:
+    """输入:请求里发的 model → 输出:LLM_PRICING 里的键(别名已折叠)。"""
+    return LLM_MODEL_ALIASES.get(model, model)
+
+
+# ── llm_cache 键空间锚点(2026-08-21)──────────────────────────────────────
+# 缓存键里**必须**含模型(换模型 = 换答案,不含就等于"换了模型还在吃旧模型的
+# 出参"且不报错),但**换个标签不算换模型**。
+#
+# `deepseek-chat` 与 `deepseek-v4-flash`(+ thinking disabled)是**同一个模型
+# 的同一个模式**——前者只是后者的旧别名。所以它俩必须共用一个键空间,
+# 否则把缺省值从别名改成正式名的那一刻,存量缓存全部作废、下一轮全额重付。
+#
+# ⚠ 锚点故意锚在**历史用过的那个串**上:键是哈希,存量行是按 'deepseek-chat'
+#   算出来的,想让它们继续命中就只能沿用这个串。它只是哈希输入,**永远不会
+#   发给接口**,别名被官方下线也不影响。
+# ⚠ `deepseek-reasoner` **不在这里** —— 它是 v4-flash 的**思考模式**,
+#   与非思考模式是两种输出行为,共用键空间就是拿思考模式的答案冒充非思考的。
+#   计价可以合并(同一张价表),缓存身份不行。
+LLM_CACHE_ANCHOR = {"deepseek-v4-flash": "deepseek-chat"}
+
+
+def llm_cache_model(model: str) -> str:
+    """输入:请求里发的 model → 输出:缓存键里用的模型身份串。"""
+    return LLM_CACHE_ANCHOR.get(model, model)
+
+
+def llm_price_tier(dt) -> str:
+    """输入:带时区的 datetime → 输出:'peak' 或 'offpeak'。
+
+    换模型/换供应商不改这里 —— 时段规则是 DeepSeek 的,新供应商加自己的表。
+    """
+    h = dt.astimezone(__import__("datetime").timezone.utc).hour
+    return "peak" if any(a <= h < b for a, b in LLM_PEAK_HOURS_UTC) else "offpeak"
+
+
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-AUDIT_RULES_VERSION = "c.2026-08-17.1"
+# 2026-08-24 提版:R10 Made in USA 硬规则上线(漏判反哺第一条)。提版即触发
+# mode=stale 版本重审:approved 存量(含历史导入的 1183 个"沃尔玛已下架仍
+# approved")按新判据全链重过,rejected 沿用。
+AUDIT_RULES_VERSION = "c.2026-08-24.1"
+# c.2026-08-21.1  **R3 收敛成单一判据**(所有者定稿):判类目要不要认证,从此
+#                 **只看飞书类目表的「必需认证」列**。同日下线两条链:
+#                 ① L2 R3 读 `audit.walmart_pt_spec` 的两条分支(硬 has_real_cert /
+#                    软 has_soft_cert)—— 那张表是批次 A 从旧审核库整表搬来的
+#                    **死快照**,`pt_spec_sync` 重建过但从没进调度;库里
+#                    `real_cert_fields` 存的还是原始 spec 字段名,而重建写的是
+#                    认证名称,两者口径相反(旧判硬、清洗判「需评估」);
+#                 ② NRTL 整机/小件分类器(`_classify_nrtl_pt` + nrtl_small_parts.yaml)
+#                    —— 拿 PT 名里有没有 `parts`/`accessor` 裸子串猜物理事实。
+#                    生产实见:一张实木咖啡桌被判「整机电器, 必须 NRTL 认证,
+#                    搬运做不了」,因为 `Coffee Tables` 的 spec 带着
+#                    `has_nrtl_listing_certification`(给带 USB 口的电动桌用的字段)。
+#                 所有者原话:「代码只判定确定性的,这种很明显不确定,应该交给
+#                 LLM 看这个产品是不是整机电器,而不是让代码从类目看是不是整机。
+#                 所以,旧的死快照不要了,死代码也不要了,以飞书源为准,以后我们
+#                 只更新这个」。
+#                 **先补后删,无真空期**:「整机电器」这一判定同批移入 L3 提示词
+#                 判定维度 6(`audit_l3._S1`,默认放行、拿不准 pass),不是删了拉倒。
+#                 删掉的 rule_code:`cat_requires_cert_small_part`(存量 hits 里
+#                 仍有,理由渲染保留兼容)。
+#                 影响面:曾被 spec 那条链判死的产品会翻案。**定点重审**:
+#                   python cli.py product_audit -p rerule=cat_requires_cert_hard
+#                   python cli.py product_audit -p rerule=cat_requires_cert_small_part
+# c.2026-08-20.1  **判定面大改**(所有者定稿:先补白名单、再删黑名单,无真空期):
+#                 ① 删 L2 R0(代码里 8 个 walmart_category 硬禁)、L2 R2
+#                    (yaml 18 条禁售大类)、L1 excluded(yaml 13 条 3C/服饰/
+#                    汽配/带电)——三份清单和 R1 类目准入白名单讲同一件事。
+#                    类目能不能做**从此只有 R1 一处判据**。
+#                 ② R1 两条静默放行改判 pending(PT 未知 / PT 不在 walmart_pt_meta):
+#                    此前"查不到 = 没问题"直接 100 分放行,删掉黑名单后再没人兜底。
+#                 ③ 修三条"看着在跑其实没跑":R3 裸子串(`ul` 命中 `regulation`)、
+#                    R4 中文紧邻不算词边界(中文品牌一条都拦不住)、R7 只命中软词
+#                    时整条证据丢掉;另修 _infer_walmart_policy 的 medical 分支
+#                    与 L3 提示词两处(R7/R8 不进 prompt、cert 取了不存在的键)。
+#                 影响面:曾被 R0/R2/excluded 拦下、而白名单放行的产品会翻成 pass;
+#                 曾因 R3 裸子串误判"要 UL 认证"的会翻案。**全量重审**:
+#                   python cli.py product_audit -p force_rerun=c.2026-08-18.1
+# c.2026-08-18.1  理由映射:黑名单中心三码(lark_blacklist_asin/seller/
+#                 amazon_cat)→ 政策 None(内部决策,不挂 [政策:General-Use
+#                 Products] 兜底尾巴)。判定本身零变化(仍 reject),只影响
+#                 audit_reason 与 F 列文案。历史行翻新(零 LLM,L0 短路):
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_asin
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller
+#                   python cli.py product_audit -p rerule=phase0_lark_blacklist_amazon_cat
+#                 ⚠ 别拿它跑 force_rerun —— 那是全量。
 # c.2026-08-17.1  Phase0 规则 2 摘掉批次 B 新增的 4 个 Amazon 顶级大类
 #                 (裁决 A,见 docs/audit_migration_plan.md 九节补批复)。
 #                 ⚠ 别拿它跑 force_rerun —— 那是**全量**(库里没有一条是新版本)。
@@ -558,7 +709,160 @@ LLM_PURPOSE_ENV = {
     # PT 枚举内时问一次"它实际表达什么"。调用极少(命中即缓存,键按
     # (PT, 维度名) 定案),未配置专用模型时回落 DEEPSEEK_MODEL
     "variant_remap": "DEEPSEEK_MODEL_VARIANT_REMAP",
+    # 上架出参(mp_mapper:把亚马逊产品映成沃尔玛 PT 的属性)。2026-08-21 建:
+    # 此前这条链**不传 purpose**,于是全落进 "default" 桶 —— 记是记了,但摘要里
+    # 和别的默认调用混成一坨,换模型时看不出"上架这一段到底花了多少"
+    "listing_attrs": "DEEPSEEK_MODEL_LISTING_ATTRS",
 }
+
+# ── 沃尔玛五大品类(Walmart Category 之上的一层)────────────────────────
+#
+# 来源:所有者 2026-08-21 提供的沃尔玛官方招商材料「五大品类多元商品」。
+# 这是沃尔玛自己的商品部门划分,坐在 `Walmart Category`(库里 26 个值)**之上**。
+#
+# ⚠ **两层都在用,别混**:附 A.1(2026-08-07)拍的「大类目 = Walmart Category」
+# 是**下层**(库里 26 个值,产品侧的事实);所有者心智里的"大类"是**上层**。
+# 2026-08-21 实测这个差异不是术语出入 —— 按下层判,品牌组内的少数派件
+# 156,188 件(全池 24.2%)会被锁死在做不了那个大类的店里;折到上层判是
+# 105,571 件(16.3%)。
+# **Q1 已拍板(2026-08-21):类目闸判上层。** 见 `store_targets.allowed`。
+# 下层不作废 —— 它仍是产品侧的事实来源,报告要拿它当佐证(说"缺 Home 品类"
+# 而不说是哪几个 26 类,所有者没法照着去开类目)。
+#
+# 归类由所有者 2026-08-21 逐条拍板,其中四条是他当天点名回的:
+#   Musical Instruments   → ETS
+#   Business & Industrial → Hardlines
+#   Safety & Emergency    → **不归**(None)
+#   Everything Else       → **不归**(None)
+# 「不归」不是漏填,是一条口径:这两类**只能分给没有确定类目的店**。它正好
+# 落在 `store_targets.allowed` 已有的两条规则上(「三列全空 = 不限制」+
+# 「归不到大类的,受限店拒收」),所以映成 None 就够了,不需要任何新逻辑。
+WALMART_SUPER_CATEGORIES = ("Fashion", "ETS", "Home", "FCHW", "Hardlines")
+
+# 「不归五品类」那一桶的**显示名与可填名**(所有者 2026-08-22:建议列要
+# 「填写 5 大类和其他」)。它是限额表「类目1/2/3」里的**一等值** —— 填了
+# 「其他」的店就是"专收归不到五品类的货"那种店。
+# ⚠ 有它之前,「其他」填进表里会把店废掉:折完是空集 ⇒ 按「填了就只准入填的
+# 那几个」判 ⇒ 谁也接不了。所以出建议之前必须先让它可填,否则那份建议
+# 是照着做就出事的。
+SUPER_OTHER = "其他"
+
+# 限额表「类目1/2/3」三列的**可填值全集**(建议列只从这里出)。
+SUPER_BUCKETS = (*WALMART_SUPER_CATEGORIES, SUPER_OTHER)
+
+# Walmart Category → 五大品类;**不在表里 = 归不到**(与映成 None 同义)。
+_SUPER_CATEGORY_OF = {
+    "Fashion": "Fashion",
+    "Electronics": "ETS", "Toys": "ETS", "Occasion & Seasonal": "ETS",
+    "Media": "ETS", "Photography": "ETS", "Musical Instruments": "ETS",
+    "Home": "Home", "Furniture": "Home", "Arts & Crafts": "Home",
+    "Beauty": "FCHW", "Health & Personal Care": "FCHW", "Animals": "FCHW",
+    "Baby": "FCHW", "Household": "FCHW", "Food & Beverage": "FCHW",
+    "Office": "Hardlines", "Sporting Goods": "Hardlines",
+    "Sports & Outdoors": "Hardlines", "Vehicles": "Hardlines",
+    "Automotive": "Hardlines", "Home Improvement": "Hardlines",
+    "Garden & Patio": "Hardlines", "Business & Industrial": "Hardlines",
+    # Safety & Emergency / Everything Else 刻意不列 —— 见上面「不归」那条
+}
+
+# 那两个**是**合法的 Walmart Category,只是不归五品类。单列出来是因为
+# 「认不认得这个填写值」与「归不归得到品类」是两个问题:把它们判成"认不出"
+# 会让 alloc_audit 去点名两个其实填得对的值,人就学会忽略那一栏了。
+_UNMAPPED_CATEGORIES = ("Safety & Emergency", "Everything Else")
+
+
+def _fold(v) -> str:
+    """输入:任意填写值 → 输出:比对用的归一键(小写 + 内部空白压单空格)。
+
+    限额表「类目1/2/3」是**人手填的**,而同一张表的「配送限制」列早就做了
+    `fba/FBA/Fba` 都认(`store_targets._channel` 的 `.upper()`)—— 类目这三列
+    漏了。2026-08-22 实测:所有者填「hardlines」,查不到规范名 `Hardlines`,
+    被静默兜进「其他」⇒ 这家店的准入从 Hardlines 变成了「只收归不到的货」,
+    **没有任何报错**。
+    ⚠ 只归一大小写与空白,**不做别的猜测**:不去标点、不认中文译名、不做
+    近似匹配。猜错一次就是一家店收错一批货,而占用撤不回。真填错了就让
+    `known_category_literal` 报出来,人改一格比代码猜一辈子强。
+    """
+    return " ".join(str(v or "").lower().split())
+
+
+# 归一键 → 规范值。26 类映到它的品类,五品类与「其他」映到自己。
+_BUCKET_INDEX = {
+    **{_fold(c): b for c, b in _SUPER_CATEGORY_OF.items()},
+    **{_fold(c): SUPER_OTHER for c in _UNMAPPED_CATEGORIES},
+    **{_fold(b): b for b in SUPER_BUCKETS},
+}
+
+# 认得的填写值(归一键)。与 `_BUCKET_INDEX` 同源 —— 两处各列一遍必然漂。
+_KNOWN_LITERALS = frozenset(_BUCKET_INDEX)
+
+
+def super_category(category: str | None) -> str | None:
+    """输入:Walmart Category → 输出:五大品类之一,或 None(**归不到**)。
+
+    ⚠ **闸门与报告都不要用这个,用 `super_bucket`。** 这一支只回答一个
+    很窄的问题:"这个 26 类映得到五品类吗" —— 它给 `Everything Else` 和
+    一个拼错的字符串**同样的 None**,分不清"业务上归不到"与"根本不认得"。
+    2026-08-22 之前闸门用的就是它,后果是填「其他」的店被折成空集而废掉。
+    现存的正当用途只有一处:`tests/test_alloc_registry` 拿它盘点**哪些 26 类
+    还没映射**(换成 `super_bucket` 那条测试就永远绿了,盘不出漏项)。
+    """
+    return _SUPER_CATEGORY_OF.get((category or "").strip())
+
+
+def super_bucket(category: str | None) -> str | None:
+    """输入:Walmart Category(或已经是品类名/「其他」)→ 输出:
+    五大品类之一 / `SUPER_OTHER`;**真·未知(空值)仍返回 None**。
+
+    与 `super_category` 的分工 —— 这是**总函数**版本,给闸门与报告用:
+    把"归不到"从 `None` 折成一个能显示、能填表、能进集合的值。
+
+    ⚠ **空 ≠ 其他,这条不许合并。** 「其他」是"我们知道它属于 Safety &
+    Emergency / Everything Else 这类"(一条业务归类);空是"我们不知道它
+    属于哪类"(一条数据缺口)。合并的后果:填了「其他」的店会开始收**大类
+    采不到**的货 —— 而那批货的处置是补采集,不是分给谁。`category_offenders`
+    也正是靠这条区分才没把"不知道"当成"违规"。
+
+    ⚠ **大小写与多余空白不算认不出**(`hardlines` = `Hardlines`)—— 这三列
+    是人手填的,与同表「配送限制」列的 `fba/FBA` 一视同仁。
+
+    ⚠ **认不出的字面量也归「其他」**,不再像原来那样被静默丢掉。丢掉时
+    表里一个拼写错误会让店变成"填了但空集 = 谁也接不了";归「其他」则是
+    "只收归不到的货"。两种都不对,但后者不会静默把一家店废掉,而且
+    `alloc_audit` 会把认不出的值单独点名(见 `known_category_literal`)。
+    """
+    key = _fold(category)
+    if not key:
+        return None
+    return _BUCKET_INDEX.get(key, SUPER_OTHER)
+
+
+# 报表里「大类采不到」那一格的显示值。**不是** SUPER_OTHER:「其他」是业务
+# 归类(Safety & Emergency / Everything Else),这个是数据缺口 —— 两者处置
+# 不同(找一家收「其他」的店 vs 补一次采集),在表上必须一眼分得开。
+UNKNOWN_SUPER = "(大类未知)"
+
+
+def super_label(category: str | None) -> str:
+    """输入:Walmart Category → 输出:**报表列**里那个品类值(总是有字)。
+
+    所有 csv 的「品类」列都走这一个函数 —— 每处各写一遍
+    `super_bucket(x) or "…"` 的话,兜底文案迟早分叉,而这一列是所有者用来
+    跟飞书限额表对照的,两张表写法不一样就对不上了。
+    """
+    return super_bucket(category) or UNKNOWN_SUPER
+
+
+def known_category_literal(value: str | None) -> bool:
+    """输入:限额表「类目1/2/3」里的一个填写值 → 输出:这个值认不认得。
+
+    认得的三种:26 个 `Walmart Category` 之一、五大品类之一、或「其他」;
+    **大小写与多余空白不算错**(`hardlines` = `Hardlines`,见 `_fold`)。
+    认不出的会被 `super_bucket` 折进「其他」——**不报出来就是静默改变准入**,
+    所以 `alloc_audit` 必须逐店点名(拼写错、旧类目名、随手写的中文都在此列)。
+    """
+    return _fold(value) in _KNOWN_LITERALS
+
 
 # 风控·沃尔玛类目表(wiki 承载;拦截条件沿旧实证:准入状态='禁售' 或
 # 中国卖家可做 以'否'开头;risk_sync 同步入 PG,闸门读库不读表——
@@ -601,9 +905,6 @@ UPC_SHEET = Spreadsheet(
 
 # 维护记录(maintenance 流水账):与「在线产品总表」同一 spreadsheet 的
 # 另一工作表(所有者已建,2026-08-07;多维表格 5 万行上限装不下故用电子表格)。
-# 列序即契约:A=店铺 B=SKU C=动作 D=旧值 E=新值 F=feedid G=日期 H=结果 I=报错
-# feed 路径 F 写真 feedid、H 由 feed_poll 反哺器回填;PUT 同步路径 F 写
-# "sync"、H 当场写 成功/失败。
 # 维护记录(流水账,只追加):A~K 十一列。
 # 2026-08-16 所有者在飞书加了「建议」「原因」两列(9 → 11),配合 maintenance
 # 拆成 scan(决策,写 建议/原因)+ 执行件(写 动作/feedid/结果/报错)。
@@ -639,7 +940,29 @@ RETIRE_LIMITS = Bitable(
         target_orders_daily="目标订单",
         max_online="单店最大在线数",
         # 一店一配送方式的权威列(所有者建列 2026-08-13):填 fba/fbm,
-        # 填什么就只给该店分配该渠道的产品;未填=不接自由流分配(引擎报告提示)
+        # 填什么就只给该店**分配 / 上架 / 维护**该渠道的产品。
+        # ⚠ **一列,三个消费方**(2026-08-25 从一个扩到三个;取数唯一口
+        # `services.store_targets.store_channels`,判定唯一谓词
+        # `store_targets.channel_conflict` —— 别在消费方那边另写):
+        #   · 分配 alloc_engine._blocker      —— 只把该渠道的组发给它
+        #   · 上架 list_new                    —— 只上该渠道的货
+        #   · 维护 maintenance_intents         —— 货翻成另一个渠道 ⇒ 库存写 0,
+        #     连续 N 天卖不了 ⇒ 走删除链「渠道不符 N 天」下架(与缺货同一阶梯)
+        # ⚠ 三者对"这一格没填"的解释**不同,而且都是对的**(与 lead_limit 同款):
+        #   分配 = 不接自由流(没渠道就过不了硬闸,宁可不分);
+        #   上架/维护 = **不限制**(所有者定稿 2026-08-25「没标就都能上」——
+        #   照搬分配那条会把没配置的店整店废掉:一件也上不了、在架的还全被清零)。
+        # ⚠ 对"产品渠道没采到"三者口径一致:**不算不符**。第三种值恒高说明
+        #   采集侧 is_fba 解析坏了,那是要修采集,不是要动商品。
+        # ⚠ **规划外店(谭总系)照判**(所有者定稿 2026-08-25「维护链对规划外店
+        #   不豁免」;上架链同):规划外排除的是「归属」——不给它们分货、不占
+        #   品牌与产品、不拦别人上架——**不是**"这家店能不能卖这个渠道的货",
+        #   后者是店铺自己的经营配置,填了就该生效。
+        #   由此**分配/审计两条链与上架/维护两条链在这一点上口径不同,且都对**:
+        #   `alloc_survey.claimable` 在判渠道之前就剔掉规划外店,所以这些店的
+        #   渠道不符行**永远不会**进 alloc_audit 的下架清单,而维护链照样清零、
+        #   照样走「渠道不符 N 天」下架。两份报告在这批行上对不上是预期的
+        #   (maintenance_scan 的 ⚑ 旗标就是为了让人别把它当成漏报)。
         channel_limit="配送限制",
         # 店铺准入大类目(所有者建列 2026-08-15):**只准入表里填的大类**,
         # 三列都空 = 该店不限制类目。这三列是类目档案的**唯一权威**——

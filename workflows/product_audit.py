@@ -7,12 +7,34 @@
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
+  python cli.py product_audit -p mode=nonpass -p limit=5000
+                                                    # **非 pass 全量重判**(rejected+pending+
+                                                    # 未审):判定标准改了就整批用新标准重认一次
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
+  python cli.py product_audit -p repts=1                   # 改了**飞书类目表**之后重审:
+                                                    # 判据(准入状态/中国卖家可做/必需认证)
+                                                    # 在我判过之后变过的那批 rejected;
+                                                    # 变更由 risk_sync 落台账,不看版本号
+  python cli.py product_audit -p stages=L0                 # 只跑 Phase0:纯查库零 LLM;
+                                                    # 未命中的不落结论不盖版本(不"复活")
+  python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
+                                                    # 零 LLM 翻新黑名单历史行的标准姿势
+  python cli.py product_audit -p mode=pass -p stages=L0 -p limit=1000000
+                                                    # 现役 pass 全量重过 L0(黑名单翻案);
+                                                    # 未命中不退出候选,**一次大 limit 扫完**
+  python cli.py product_audit -p mode=online -p stages=L0 -p limit=1000000
+                                                    # **在架** pass 重过 L0(product_chain
+                                                    # 每天 13:00 跑这一条);翻成 rejected 的
+                                                    # 由紧随其后的 problem_scan 建删除建议
   python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
   python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
+  python cli.py product_audit -p from_sheet=1 -p force=1   # 同上,但 E 列为空的**一律重判**
+                                                    # (库里已有结论的也重判,不是回填);
+                                                    # E 列已填结论的表行仍然不领。飞书类目表
+                                                    # 改过之后翻存量走这条
   python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
   python cli.py product_audit -p from_sheet=1 -p gap_wait=0    # 缺数据只推采集不等(采集侧病了时)
@@ -23,7 +45,8 @@ L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑�
 products.audit_* 五列与审核事件(空跑用 --dry-run)。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 
-⚠ `from_sheet` **不是强审**:表 E 列为空只说明表里没有结论,库里可能早就有。
+⚠ `from_sheet` **缺省不是强审**(要强审加 `-p force=1`,见下):
+表 E 列为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
 领取口径含 **E=pending**(2026-08-17):pending 是中间态不是结论,写进 E 之后
@@ -33,9 +56,13 @@ C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结�
 等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
 表里轮到审、但库里压根没有(或有行无标题=采集降级)的 ASIN → 推采集批次
 `audit_gap_<日界>` → **轮询等它采完**(缺省 20 分钟,`-p gap_wait=N` 调,0=只推
-不等)→ **就地增量摄取**(借 product_ingest 的锁)→ 采回来的**这一轮就判掉**。
+不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的**这一轮就判掉**。
 仍缺的把采集侧真实 `error_type` 写进表格 **F 列、E 列留空**(留空才会被下轮重领)。
 整段跑在候选查询**之前**,所以不需要第二遍判定循环。见 `_close_gap`。
+⚠ **在库的待审行不做"先刷新再审"**(所有者复议定稿 2026-08-19):审核判的是
+"这个产品卖的是什么",第一次就定性了,改标题/描述不改变它是什么——
+强刷带来的翻案更大可能是 LLM 随机性(上架链相反,**必须**先刷新:价格库存
+是要写到沃尔玛的真金白银)。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
 五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
@@ -63,12 +90,14 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_reason, audit_rules, audit_store, kpi, \
-    listing_sheet, product_events, product_ingest, runlock, scrape_batches
+from services import audit_reason, audit_rules, audit_store, db_guard, \
+    kpi, \
+    listing_sheet, product_events, product_ingest, scrape_batches
 
 DANGEROUS = True
 
@@ -82,6 +111,8 @@ _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 # 事务里 —— 外部查不到任何进度、Ctrl-C 全部回滚、长事务还挡住 vacuum)。
 # 每 N 行提交一次 + 打一行进度,判定结果就变成"跑到哪算到哪"。
 _COMMIT_EVERY = 500
+# 两次进度日志之间至少隔这么久(秒)。按块报,块小时不刷屏、块大时不失联
+_PROGRESS_MIN_SEC = 5.0
 
 # 判定并发:线程等的是 HTTP 不是 CPU,所以远超核数是正常的;真正的天花板在
 # LLM 侧(撞限流只会静默退避变慢,看 RETRY_STATS 判断)。
@@ -103,6 +134,7 @@ SELECT p.asin,
        p.walmart_pt,
        p.pt_source,
        p.browse_node_id,
+       p.browse_node_chain,
        p.amazon_category AS amazon_category_path,
        p.slow -> 'bullet_points' AS bullet_points,
        coalesce(p.slow ->> 'description',
@@ -176,14 +208,16 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
-                 "l3", "l4", "workers", "adopt_only", "from_sheet",
-                 "gap_wait"}
+                 "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
+                 "gap_wait", "force", "repts"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
-# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避)
-_MODES = {"backfill", "pending"}
+# mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
+# pass=现役 pass 重过 L0;online=**在架** pass 重过 L0(链上那条);
+# nonpass=非 pass 全量重判
+_MODES = {"backfill", "pending", "pass", "online", "nonpass", "stale"}
 
 # **什么才算"待审"**(所有者定稿的重审政策,唯一出处):
 #   · 没结论(新品 / 从没审过)             → 审
@@ -192,27 +226,53 @@ _MODES = {"backfill", "pending"}
 #     `slow_hash` 变了(产品本身改了)时由 product_ingest 翻回 pending;
 #     rejected 永不自动重审(45 天 TTL 那套已废除)
 #   · 要整批重审只有一条路:`-p force_rerun=<规则版本>`(人工显式)
+# 2026-08-24 起第三支:approved 而 audit_version 落后于当前判据版本的,
+# **重审而不是投影**(所有者定稿:「就算 hash 没变,审核版本号变了也完整重审」,
+# 且不进调度 —— 上架前的 from_sheet 走到这条谓词,要上架的品自然被新判据
+# 重过一遍;平时手动 mode=stale 批量消化)。rejected 不在此列:沿用旧结论
+# (reject 粘性),要翻案走 rerule/mode=nonpass。
 _DEFAULT_CANDIDATE = (
     "(p.audit_status IS NULL OR (p.audit_status = 'pending' "
-    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day')))")
+    "AND (p.audited_at IS NULL OR p.audited_at < now() - interval '1 day'))"
+    " OR (p.audit_status = 'approved'"
+    " AND p.audit_version IS DISTINCT FROM %(cand_ver)s))")
 
 
 def _pick_where(params: dict) -> tuple[str, dict]:
+    """输入:params → 输出:(候选谓词 SQL, 绑定参数)。
+
+    ⚠ **版本闸 = 天然分页**(机械只讲这一处,下面各分支只标"有/无"加本分支
+    特有后果):带 `audit_version IS DISTINCT FROM <当前版本>` 的分支,真跑判过
+    的行会盖上当前 `AUDIT_RULES_VERSION` 从而**自动退出候选集** —— limit 撞满
+    就再跑一轮接着判剩下的,不会每轮从头扫同一批;而 dry-run 不写版本号
+    ⇒ 候选集恒定,可重复抽样验证。
+    没有版本闸的分支(mode=pass / mode=online:未命中不落结论、不盖版本、
+    不退出候选)必须**一次给够 limit**,小批多轮只会每轮重扫同一批前缀。
+    """
     unknown = set(params) - _KNOWN_PARAMS - _CLI_INJECTED
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
+    if _forced_sheet(params) and not params.get("from_sheet"):
+        # 宁炸不吞:`force` 只对 from_sheet 那条路有意义(别的通道要么本就强审、
+        # 要么有自己的候选谓词)。静默忽略的话,人以为强审了、实际按缺省口径跑,
+        # 摘要还长得一模一样 —— 与 `_pick_where` 顶上那条未识别参数同款纪律
+        raise ValueError("-p force=1 只能与 -p from_sheet=1 连用;"
+                         "点名强审用 -p asins=<逗号分隔>,"
+                         "按规则翻案用 -p rerule=<规则码>")
     asins = [a.strip() for a in str(params.get("asins", "")).split(",")
              if a.strip()]
     if asins:
-        if params.get("from_sheet"):
-            # ⚠ 上架表驱动**不是强审**(所有者纠正 2026-08-16:「按我们的运行
+        if params.get("from_sheet") and not _forced_sheet(params):
+            # ⚠ 上架表驱动**缺省不是强审**(所有者纠正 2026-08-16:「按我们的运行
             # 逻辑,不是应该直接从库里读取结果吗」)。E 列为空只说明**表里**
             # 没有结论,不说明库里没有 —— 库里已有结论的直接投影回表(零 LLM),
-            # 只有真待审的才进判定引擎。当成强审的后果是每轮把已审过的几万个
+            # 只有真待审的才进判定引擎。缺省当成强审的后果是每轮把已审过的几万个
             # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
+            # `-p force=1` 显式打开强审见 `_forced_sheet`。
             return f"p.asin = ANY(%(asins)s) AND {_DEFAULT_CANDIDATE}", \
-                {"asins": asins}
+                {"asins": asins,
+                 "cand_ver": resources.AUDIT_RULES_VERSION}
         # 指定 ASIN = 无视现有结论强审(与旧仓 force_rerun 不同:这里没有
         # 运行时短路可绕,绕的是 audit_status 候选谓词)
         return "p.asin = ANY(%(asins)s)", {"asins": asins}
@@ -222,6 +282,26 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 含已 approved/rejected 的存量
         return "p.audit_version IS DISTINCT FROM %(force_rerun)s", \
             {"force_rerun": fr}
+    if str(params.get("repts", "")).strip() == "1":
+        # 按**判据变更**取候选(2026-08-21 加)。触发场景:所有者改了飞书类目表,
+        # `risk_sync` 全量重灌 `walmart_pt_meta` 时把真变了的 PT 落进
+        # `audit.pt_meta_change_log`,这里按"这个 PT 的判据在我判过之后变过"取。
+        #
+        # ⚠ **不看 `audit_version`**,这是它和 `rerule` / `mode=nonpass` 的根本
+        # 区别,也是它存在的全部理由:那两条的版本谓词是天然分页,而**飞书数据
+        # 变了不会递增仓库侧的规则版本号** —— 全量扫过一遍之后库里每条都盖着
+        # 当前版本,两条通道双双归零(所有者 2026-08-21 实遇「共 0 个」)。
+        #
+        # ⚠ 用 `changed_at > p.audited_at` 而不是"最近一批变更":
+        #  · 真跑判过的 `audited_at` 会推到变更之后,**自动退出候选**——天然分页
+        #    照样有,只是锚在时间上不是版本上,而时间是数据变更自己带的;
+        #  · 同一个 PT 被改过好几轮也只重判一次,不会每轮都从头扫;
+        #  · `audited_at IS NULL` 的(压根没审过)不在这条通道里 —— 那是
+        #    `mode=backfill` 的活,混进来会把"补刷"和"翻案"两件事的数搅在一起。
+        return ("p.audit_status = 'rejected' AND p.audited_at IS NOT NULL"
+                " AND EXISTS (SELECT 1 FROM audit.pt_meta_change_log c"
+                "             WHERE c.walmart_product_type = p.walmart_pt"
+                "               AND c.changed_at > p.audited_at)", {})
     rule = str(params.get("rerule", "")).strip()
     if rule:
         # 按**规则码**定点重审(2026-08-17 加):改了一条规则之后,要动的只有
@@ -241,9 +321,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 现在的口径(每条都是为了让 dry-run 与真跑说同一件事):
         #  · `audit_status = 'rejected'` —— 要翻的是**现行结论**,而 dry-run 碰
         #    不到这一列,所以反复 dry-run 候选集恒定,可重复验证;
-        #  · `audit_version IS DISTINCT FROM <当前版本>` —— 真跑判过的会盖上新
-        #    版本号,自动退出候选集。这同时是**天然分页**:limit 撞满就再跑一轮,
-        #    接着判剩下的,不会每轮都重判同一批(首版没有这条,真跑会原地打转);
+        #  · `audit_version IS DISTINCT FROM <当前版本>` —— **有天然分页**
+        #    (机械见 _pick_where 头注;首版没有这条,真跑会原地打转);
         #  · `EXISTS` 任意一轮命中过该规则 —— 不是"最近一轮"。理由同上:最近
         #    一轮会被 dry-run 覆盖掉。代价是"早年被它拒、后来改判别的原因仍是
         #    rejected"的行也会进来,那批重判一次结论不变,只多花一轮 LLM。
@@ -265,12 +344,73 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 待定专刷:**无 1 天退避**——判定逻辑刚改过时要立刻拿存量 pending
         # 验证效果,等一天等的是自己。人工显式动作,不进任何定时调度
         return "p.audit_status = 'pending'", {}
+    if mode == "nonpass":
+        # **非 pass 全量重判**(所有者定稿 2026-08-21:「对于库里面非 pass 的,
+        # 我全部重跑一次就可以了。以前 reject 的自然会用新的标准确认真实情况」)。
+        # 判定标准整体改过之后(如 2026-08-20 类目判据收敛到 R1 白名单),按
+        # rule_code 一条一条 rerule 既漏又重:漏的是"没被这条规则拒、但被别的
+        # 规则误拒"的行,重的是同一批产品在多条 rerule 里反复出现。
+        #
+        # 口径 = `audit_status IS DISTINCT FROM 'approved'` —— 一次覆盖
+        # rejected + pending + **NULL(从没审过)**,三种非 pass 状态全收。
+        # ⚠ `IS DISTINCT FROM` 不是 `<>`:后者对 NULL 求值为 NULL,从没审过的
+        # 会被整批漏掉,而且不报错。
+        #
+        # **有天然分页**(机械见 _pick_where 头注),而且不是可选项:本分支
+        # 判完状态不变(rejected 判完还是 rejected ⇒ 不退出候选),没有版本闸
+        # 就每轮都从头扫同一批 —— 这正是 mode=pass 那条注释记着的坑,
+        # 不要在这里重犯。
+        return ("p.audit_status IS DISTINCT FROM 'approved'"
+                " AND p.audit_version IS DISTINCT FROM %(nonpass_ver)s",
+                {"nonpass_ver": resources.AUDIT_RULES_VERSION})
+    if mode == "stale":
+        # **版本重审**(所有者定稿 2026-08-24):判据更新(AUDIT_RULES_VERSION
+        # 提版)后,approved 的存量按新版本**全链**重审;rejected 沿用不重审
+        # (reject 粘性,与双跑校准同口径)。这是 force_rerun=<版本> 砍掉贵的
+        # 那半:那条 approved+rejected 全量,为几千条可能翻案的 pass 烧掉全库
+        # rejected 的 LLM 钱(rerule 的注释记着这个痛)。
+        #
+        # 解决的问题是「判据更新了,产品审核结论滞后」:此前 approved 只有
+        # slow_hash 变了才回炉,判据变了内容没变的永远不重审 —— 1183 个
+        # 历史导入 approved 挂在"沃尔玛已下架"清单上就是这么来的
+        # (audited_at 成批相同、audit_runs 无记录,L2/L3 从没碰过)。
+        #
+        # **有天然分页**(机械见 _pick_where 头注)。历史导入行版本旧/空,
+        # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
+        return ("p.audit_status = 'approved'"
+                " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
+                {"stale_ver": resources.AUDIT_RULES_VERSION})
+    if mode == "pass":
+        # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
+        # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
+        # 行不重扫就等于黑名单只管新品。只与 stages=L0 连用(run() 钉死):
+        # 全链重审全部 pass = 重烧全库 LLM,要那么干请 force_rerun=<版本>。
+        # ⚠ 本模式**没有天然分页**(机械见 _pick_where 头注):命中翻案
+        # (status 变 rejected)会退出候选,但未命中不落结论不盖版本
+        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一次大 limit
+        # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
+        return "p.audit_status = 'approved'", {}
+    if mode == "online":
+        # **在架** pass 重过 L0(所有者定稿 2026-08-22:接进 product_chain,
+        # 排在 problem_scan 之前 —— 今天新拉黑的东西当天就能变成删除建议)。
+        # 与 mode=pass 只差范围:那条扫全库 approved(几十万行),这条只扫
+        # 此刻还挂在沃尔玛上的。下游 problem_scan 只认在架行
+        # (audit_listing_conflicts.rejected_still_listed),不在架的翻案
+        # 产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
+        # 口径是 `missing_since IS NULL`(还在目录里),**不加**
+        # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
+        # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
+        # 所以调度里必须给一次能扫完的 limit,小 limit 会让每天都从头扫
+        # 同一批前缀,尾巴永远轮不到而且不报错。
+        return ("p.audit_status = 'approved' AND EXISTS ("
+                "SELECT 1 FROM catalog.walmart_items w "
+                "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
-    return _DEFAULT_CANDIDATE, {}
+    return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
 
 
-# 定点重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+# 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
 _RERULE_COUNT_SQL = """
 SELECT count(*) FROM catalog.products p
 WHERE p.marketplace = %(marketplace)s AND ({where})
@@ -278,35 +418,93 @@ WHERE p.marketplace = %(marketplace)s AND ({where})
 """
 
 
-def _rerule_head(conn, rule: str, where: str, extra: dict,
-                 limit: int) -> list[str]:
-    """输入:连接 + 规则码 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
+def _batch_head(conn, what: str, where: str, extra: dict,
+                limit: int, empty_hint: str) -> list[str]:
+    """输入:连接 + 这批是什么 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
 
-    没有这一行的话,摘要只会说"候选 500",而 500 正是 limit ——**看不出是刚好
-    500 个还是撞了上限**(所有者 2026-08-17 首轮 dry-run 实遇)。误杀规模是他
-    决定要不要真跑的唯一依据,必须报出来。与 `_claim_from_sheet` 同款纪律。
+    没有这一行的话,摘要只会说"候选 200",而 200 正是 limit ——**看不出是刚好
+    200 个还是撞了上限**(所有者 2026-08-17 用 rerule 首轮 dry-run 实遇;
+    2026-08-21 用 mode=nonpass 又遇一次:「nonpass 的看不出来有多少个呢?」)。
+    要跑几轮、要花多少钱,全靠这个总量,必须报出来。
+    与 `_claim_from_sheet` 同款纪律。
     """
     with conn.cursor() as cur:
         cur.execute(_RERULE_COUNT_SQL.format(where=where),
                     {"marketplace": "US", **extra})
         total = int(cur.fetchone()[0])
-    head = [f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 rejected**、"
-            f"且未按当前规则版本判过的,共 {total} 个"]
+    head = [f"{what},共 {total} 个"]
     if total > limit:
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
                     f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
                     f"再跑一次接着判(或 -p limit=N 加大)")
     if not total:
-        head.append("  (一个都没有:规则码拼错?或这批已经全部按当前版本判过了)")
+        head.append(f"  ({empty_hint})")
     return head
+
+
+# 一次从服务端游标取多少行(内存与往返次数的折中)。
+# ⚠ 这个数**不是**判定批量,只影响内存驻留:每块判完就释放。
+_STREAM_CHUNK = 2000
+
+
+def _iter_candidates(sql: str, query_params: dict, chunk: int = _STREAM_CHUNK):
+    """输入:候选 SQL + 参数 → 输出:逐块产出候选行 dict 的生成器。
+
+    ⚠ **必须走服务端游标,而且必须另开一条连接**,两条都是踩出来的:
+
+    ① psycopg3 的普通游标 `execute` 时把整个结果集拉进客户端内存,`fetchmany`
+       只是从已经拉完的缓冲里切片 —— 省不了一个字节。78 万行带 title/五点/
+       长描述,单行几 KB 就是几 GB(2026-08-21 生产实测:所有者跑
+       `mode=nonpass -p limit=1000000`,机器内存崩了)。命名游标才是流式。
+    ② 主连接在判定循环里每 `_COMMIT_EVERY` 条要 `commit()`,而 **COMMIT 会
+       销毁服务端游标**。所以取数必须用独立连接,不然跑到第一个提交点就炸。
+       这条连接只读,判完即关。
+    """
+    import uuid
+    name = f"audit_cand_{uuid.uuid4().hex[:12]}"
+    with db.pg_conn() as c:
+        with c.cursor(name=name) as cur:
+            cur.itersize = chunk
+            cur.execute(sql, query_params)
+            cols = [d[0] for d in cur.description]
+            while True:
+                batch = cur.fetchmany(chunk)
+                if not batch:
+                    return
+                yield [dict(zip(cols, r)) for r in batch]
+
+
+def _forced_sheet(params: dict) -> bool:
+    """输入:params → 输出:上架表驱动这一轮要不要**强审**(`-p force=1`)。
+
+    所有者 2026-08-21 提的口径:「对飞书上架表中需要审核的产品进行强制重审,
+    **不是对表格中所有的**强制重审,而是其中**还没填写审核结果的**重审」。
+
+    所以强审只改**库侧**的候选谓词(丢掉 `_DEFAULT_CANDIDATE`),**领任务的
+    口径一个字不动** —— 仍然是 `listing_sheet.audit_targets()` 的「ASIN 有值
+    且审核结果为空(或 pending)」。E 列已经填了结论的行**不会**被这个开关捞回来。
+
+    为什么需要它:`rerule` / `mode=nonpass` 的候选谓词都带
+    `audit_version IS DISTINCT FROM <当前版本>`(天然分页)。全量扫过一遍之后
+    库里每一条都盖着当前版本,两条通道双双归零 —— 而**飞书数据变了**
+    (`risk_sync` 全量重灌 `walmart_pt_meta`,R1/R3 的判据整批换掉)并不会
+    递增仓库侧的规则版本号。2026-08-21 所有者手改类目表后实遇:
+    `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道
+    能重判受影响的存量。这个开关是那种时候的出口。
+
+    ⚠ **贵**:打开之后 E 列为空的每一行都进判定引擎(含库里早有结论的),
+    而 `from_sheet` 又会把 limit 顶到 ASIN 总数、不截断。摘要里必须把
+    "本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    """
+    return str(params.get("force", "")).strip() == "1"
 
 
 def _is_forced(params: dict, extra: dict) -> bool:
     """输入:params + _pick_where 产出的 extra → 输出:本轮算不算**强审**。
 
     只用来决定要不要挂 `_RECENT_RUN_GUARD`(dry-run 复烧护栏)。强审 = 人点名
-    要审的,点了就得审,哪怕 24 小时内刚审过。两种:
+    要审的,点了就得审,哪怕 24 小时内刚审过。三种:
 
     · `asins=` 点名 —— 但 **`from_sheet` 不算**:它也往 extra 塞 asins,走的却是
       默认候选谓词(E 列为空 ≠ 库里没结论),该吃护栏。
@@ -314,12 +512,49 @@ def _is_forced(params: dict, extra: dict) -> bool:
       全在 24 小时内。吃了护栏的话 dry-run 稳定报"0 候选",紧跟着真跑翻出几千
       条,又是一次"dry-run 说没事、真跑吓一跳"(所有者 2026-08-16 被 from_sheet
       坑过一次,那次差异在回填行数,这次会差在候选数)。
+    · `mode=pending` 待定专刷(2026-08-21 补)—— 它自述「**无 1 天退避**……
+      判定逻辑刚改过时要立刻拿存量 pending 验证效果,等一天等的是自己」,
+      而 24 小时 run 护栏让你等的**正是一天**:自述与实现直接打架。
+      具体表现(所有者实遇):`-p mode=pending --dry-run` 抽 200 条看效果,
+      **dry-run 也落 runs**,于是这 200 条接下来 24 小时被护栏挡在候选集外
+      —— 紧跟着真跑处理的是另外 200 条,想"拿同一批验证完再真跑"做不到,
+      而且每 dry-run 一次就把一批 pending 推迟一天,排空 16k 存量时尤其伤。
+      它与 rerule 同类:人工显式动作、**不进任何定时调度**,吃护栏无收益。
+    · `mode=nonpass` 非 pass 全量重判 —— 同上,而且它翻的多半就是刚被拒的那批;
+      版本闸已经保证真跑不重判,护栏只会让 dry-run 抽样漂移。
 
     代价说清:强审下重复 dry-run 会重复烧 LLM —— 这是点名的固有代价,不是 bug。
     """
     if str(params.get("rerule", "")).strip():
         return True
-    return bool(extra.get("asins")) and not params.get("from_sheet")
+    if str(params.get("mode", "")).strip() in ("pending", "nonpass"):
+        return True
+    return (_forced_sheet(params)
+            or str(params.get("repts", "")).strip() == "1"
+            or (bool(extra.get("asins")) and not params.get("from_sheet")))
+
+
+# 采用历史结论时反查旧 run 的命中明细(所有者定稿 2026-08-19:「history_shortcut
+# 的也需要输出旧结论」——"理由未留存"只是 runs 行的 l3_reason_category 为空,
+# **audit_hits 里躺着当年真实的命中**,拿最重的那条把旧结论说出来)。
+# penalty ASC = 最狠的排最前;同分取先落库的
+_HIT_OF_RUN_SQL = """
+SELECT DISTINCT ON (run_id) run_id, rule_code, detail
+FROM audit.audit_hits
+WHERE run_id = ANY(%s)
+ORDER BY run_id, penalty ASC, hit_id ASC
+"""
+
+
+def _hits_of_runs(conn, run_ids: list) -> dict:
+    """输入:run_id 列表 → 输出:{run_id: (rule_code, detail)}(分块防超大 ANY)。"""
+    out: dict = {}
+    for i in range(0, len(run_ids), 10_000):
+        with conn.cursor() as cur:
+            cur.execute(_HIT_OF_RUN_SQL, (run_ids[i:i + 10_000],))
+            for rid, code, detail in cur.fetchall():
+                out[rid] = (code, detail if isinstance(detail, dict) else {})
+    return out
 
 
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
@@ -334,6 +569,9 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL, (asins,))
         rows = cur.fetchall()
+    # reject 且 runs 行没留理由的,去 hits 反查旧命中(只查需要的那批)
+    need_hits = [r[1] for r in rows if r[2] == "reject" and not r[5]]
+    old_hits = _hits_of_runs(conn, need_hits) if need_hits else {}
     adopted = set()
     events = []
     adopt_rows = []
@@ -344,9 +582,17 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             continue
         status = "approved" if verdict == "pass" else "rejected"
         if verdict == "reject":
-            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——不留空
-            # (rejected 说不出理由 = 排查断线),也不迁旧'history_shortcut'字面量
-            reason = reason_cat or f"历史结论(阶段 {stage or '未知'},理由未留存)"
+            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——先拿
+            # runs 行的理由;没有就反查 hits 把旧结论说出来;连 hits 都
+            # 没有(极老的孤儿 run)才落"理由未留存"
+            reason = reason_cat
+            if not reason:
+                hit = old_hits.get(run_id)
+                if hit:
+                    reason = (f"历史结论(阶段 {stage or '未知'}):"
+                              f"{audit_reason.explain_hit(hit[0], hit[1])}")
+                else:
+                    reason = f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
             reason = None
         adopt_rows.append({
@@ -387,14 +633,16 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 
 
 _SQL_SHEET_STATE = """
-SELECT coalesce(audit_status, '未审') AS st, count(*)
+SELECT CASE WHEN audit_status = 'approved'
+             AND audit_version IS DISTINCT FROM %s THEN '版本过期'
+       ELSE coalesce(audit_status, '未审') END AS st, count(*)
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 GROUP BY 1
 """
 
 
-def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
+def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
     """输入:本轮 limit → 输出:(上架表待审行, 交给候选谓词的 ASIN, 摘要前言)。
 
     所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
@@ -432,22 +680,36 @@ def _claim_from_sheet(limit: int) -> tuple[list[dict], list[str], list[str]]:
     head = [f"上架表 E 列为空 {len(want)} 个 ASIN"
             f"({len(rows)} 行,同 ASIN 多店铺算多行)"]
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_SHEET_STATE, (want,))
+        cur.execute(_SQL_SHEET_STATE,
+                    (resources.AUDIT_RULES_VERSION, want))
         st = {k: int(n) for k, n in cur.fetchall()}
     absent = len(want) - sum(st.values())        # 库里压根没有这个 ASIN
     done = st.get("approved", 0) + st.get("rejected", 0)
-    todo = st.get("未审", 0) + st.get("pending", 0)
+    todo = st.get("未审", 0) + st.get("pending", 0) + st.get("版本过期", 0)
     # 这三个数是"为什么这轮还在审"的全部答案,必须在摘要里(只写日志的话
     # 飞书通知看着像"审完了")
     head.append(
         f"  库里已有结论 {done}(过 {st.get('approved', 0)}/拒 "
-        f"{st.get('rejected', 0)})→ **直接回填,不重审**"
-        f";待审 {todo}(未审 {st.get('未审', 0)}/待定 {st.get('pending', 0)})"
+        f"{st.get('rejected', 0)})→ "
+        + ("⚡ **force=1:连同它们一起重判**(不是回填)" if force
+           else "**直接回填,不重审**")
+        + f";待审 {todo}(未审 {st.get('未审', 0)}/待定 "
+        f"{st.get('pending', 0)}/判据提版重审 {st.get('版本过期', 0)})"
         # ⚠ 这个数是**补采之前**的快照(补采跑在它后面)。别写成"本轮审不了"
         # —— 同轮闭环正是为了把它们救回来,救回来多少看下面那段
         + (f";⚠ 不在库 {absent}(补采前口径,见下方补采段:"
            f"推采集 → 等采完 → 摄取,救回来的本轮就审)" if absent else ""))
-    if todo > limit:
+    if force:
+        # ⚠ 这一行是**成本告知**,不是装饰。缺省口径只判 todo 条,强审要判
+        # todo+done 条,差的就是 done 那部分实打实的 LLM 钱。不写出来的话
+        # 摘要看着和平时一模一样,人不会意识到这轮贵了几倍
+        head.append(
+            f"  ⚡ **强审(-p force=1)**:本轮进判定引擎 {done + todo} 个 ASIN"
+            f"(缺省口径只判 {todo} 个,多出的 {done} 个是库里已有结论、"
+            f"被这个开关重新打开的)—— **LLM 花费按 {done + todo} 算**。"
+            f"⚠ 领任务口径没变:仍然只领 **E 列为空或 pending** 的行,"
+            f"E 列已有结论的表行一行都不会被捞回来")
+    elif todo > limit:
         logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{todo - limit} 个**待审;再跑一次接着判"
@@ -548,6 +810,13 @@ def _find_gap(want: list[str]) -> tuple[list[str], list[str]]:
             sorted(a for a, no_title in got.items() if no_title))
 
 
+# ⚠ 审核**不做**"先推采集刷新拿最新数据"(所有者定稿 2026-08-19,当天曾
+# 短暂加过又按所有者复议撤回):审核判的是**这个产品卖的是什么**(标题里的
+# 品牌词是不是真品牌、是否碰沃尔玛政策)——第一次审核就定性了,改标题/描述
+# 不改变它是什么,重采+重审带来的"翻案"更大可能只是 LLM 的随机性。
+# 缺口(不在库/无标题)照旧同轮补采——那是"审不了",不是"数据旧"。
+
+
 def _push_gap(gap: list[str], day: str,
               out: list[str]) -> list[tuple[str, object]]:
     """输入:缺口 ASIN + 日界 → 输出:[(批次名, batch_id)];摘要写进 out。
@@ -586,24 +855,17 @@ def _push_gap(gap: list[str], day: str,
     return sent
 
 
-def _ingest_now() -> str:
-    """输入:无 → 输出:就地增量摄取摘要(拿不到锁则说明原因)。
+def _ingest_batches(names: list[str]) -> str:
+    """输入:本轮推的批次名 → 输出:按批摄取摘要。
 
-    **借的是 product_ingest 的活,就得借它的锁**(与 order_audit._ingest_now
-    逐字同款纪律):增量游标 `ops.cursors` name='product_ingest' 是独占推进的,
-    两个进程同时拉 `/api/export/incremental` 并各自落 next_cursor,后写的会盖掉
-    先写的,中间那段记录**永远不会再被拉一次**(游标只前进不回头)——
-    两侧都不报错,只是产品中心少了一批数据。
-
-    拿不到锁不是失败:说明 product_ingest 正在跑,数据照样会进来,
-    只是本轮这批可能来不及,退回"下一轮审"。
+    2026-08-19 起走采集侧批次端点(`export_batch_records`,契约 §4.11):
+    只拉**自己这批**的事件,批内游标每次从 0 拉到底,不碰全局游标、
+    **不需要 product_ingest 的锁**——此前是借锁抽全库到当刻头部,与
+    product_chain / order_chain 的抽水互相排队。幂等靠 snapshots.source_id,
+    与全局泵重复摄取无害。没拉到底的批次摘要里点名,那部分退回下轮审。
     """
-    with runlock.hold(product_ingest.CURSOR_NAME) as got:
-        if not got:
-            return ("就地摄取:跳过(product_ingest 正在跑,别和它抢游标);"
-                    "数据仍会由它摄入,这批退回下轮审")
-        res = product_ingest.pump(scraper, db)
-    return "就地" + product_ingest.pump_summary(res)
+    _, note = product_ingest.pump_batches(scraper, db, names)
+    return note
 
 
 def _gap_reasons(sent: list[tuple[str, object]]) -> dict[str, str]:
@@ -645,10 +907,12 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
     五步:
 
-      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。
+      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。**只推缺口**:在库的
+         待审行不做"先刷新再审"(所有者复议定稿 2026-08-19,理由见模块头注
+         ——审核判的是"它是什么",第一次就定性了)。
       ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
-      ③ **就地摄取**(借 product_ingest 的锁,见 `_ingest_now`)——
-         批次 completed **不等于**我们库里有数据,中间还隔着一次增量导出。
+      ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
+         批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
       ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
          (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
@@ -723,7 +987,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
             + (f" / 采集降级无标题 {len(degraded)}" if degraded else ""))
     if not execute:
         out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
-                   f"等它采完(最多 {wait_min} 分钟)、就地摄取,"
+                   f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
                    f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 F 列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
@@ -744,7 +1008,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
         if stuck:
             out.append(f"  ⚠ {stuck} 个批次超时仍在跑:这部分退回下轮审"
                        f"(已采到的下面就摄进来)")
-        out.append(f"  {_ingest_now()}")
+        out.append(f"  {_ingest_batches([n for n, _ in sent])}")
 
     # ④ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
     #    刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉
@@ -790,8 +1054,32 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
         out.append(f"  ⚠ 原因回写飞书失败:{e}(采集已推,下轮重试回写)")
 
 
-def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+# 连接余量钳制已抽到 services/db_guard(list_new 的 LLM 出参期共用同一护栏);
+# 这里留同名别名:调用点、docstring 指路、tests 里按名字钉住的断言全都不动。
+_cap_by_connections = db_guard.cap_workers
+
+
+@dataclass
+class Opts:
+    """一轮 run() 的入参定案(值域与四条互斥校验都在 _parse_opts 里做完)。"""
+    execute: bool
+    limit: int
+    backfill: bool
+    adopt_only: bool
+    r5_on: bool
+    run_l3: bool
+    run_l4: bool
+    only_l0: bool
+    workers: int
+    conn_note: str = ""       # 连接余量钳制的说明(_cap_by_connections 回填)
+
+
+def _parse_opts(params: dict) -> Opts:
+    """输入:params → 输出:Opts;四条互斥校验与值域校验都在这一处。
+
+    ⚠ **未识别参数/未识别 mode 的闸不在这里**,在 `_pick_where` —— 它挡的是
+    "静默吞参数"(评审 P1-4),与候选谓词同处一地,别顺手挪过来。
+    """
     execute = bool(params.get("execute"))
     limit = int(params.get("limit", 500))
     backfill = str(params.get("mode", "")).strip() == "backfill"
@@ -803,6 +1091,26 @@ def run(params: dict) -> str:
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
     run_l4 = str(params.get("l4", "")).strip().lower() == "on"
+    # stages=L0:只跑 Phase0,纯查库零 LLM(所有者 2026-08-18)。
+    # 命中 → 正常 reject 落库;未命中 → 不落结论不盖版本(见 audit_one)。
+    # 值域先只放 L0 —— L1 起每一层都可能要 LLM,"指定到哪层"再扩时
+    # 必须逐层想清楚"没走完的行算什么",不预开口子。
+    stages = str(params.get("stages", "")).strip().upper()
+    if stages not in ("", "L0"):
+        raise ValueError(f"stages 只支持 L0(收到 {stages!r});"
+                         f"L3/L4 已有独立开关 -p l3=off / -p l4=on")
+    only_l0 = stages == "L0"
+    if str(params.get("mode", "")).strip() in ("pass", "online") and not only_l0:
+        # pass/online 重扫只准走零 LLM 的 L0(黑名单翻案场景);全链重审全部
+        # pass = 重烧全库 LLM,真要做请用 force_rerun=<版本> 显式来。
+        # online 那条还挂在 product_chain 上天天跑,更不能让它打 LLM
+        raise ValueError("mode=pass / mode=online 只与 stages=L0 连用"
+                         "(加 -p stages=L0;全链重审请用 force_rerun)")
+    if str(params.get("mode", "")).strip() == "stale" and only_l0:
+        # 方向与上面相反:版本重审必须全链 —— L0 未命中不落结论不盖版本,
+        # 候选永不退出,每轮从头扫同一批而且不报错(mode=pass 那条坑的镜像)
+        raise ValueError("mode=stale 不与 stages=L0 连用:版本重审必须全链,"
+                         "否则未命中的行不盖版本号,候选集永不收敛")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
     # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
     # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
@@ -815,12 +1123,160 @@ def run(params: dict) -> str:
                        "侧承受力定,不是本机核数)", want_workers, workers)
     if r5_on:
         workers = 1
+    return Opts(execute=execute, limit=limit, backfill=backfill,
+                adopt_only=adopt_only, r5_on=r5_on, run_l3=run_l3,
+                run_l4=run_l4, only_l0=only_l0, workers=workers)
+
+
+@dataclass
+class Counts:
+    """一轮判定的全部计数(摘要读这一个容器,不摊 20 个散量)。"""
+    verdicts: dict          # pass/reject/pending 三态(判定循环就地累加的那本)
+    cand_n: int             # 从候选流里取到的行数
+    todo_n: int             # **进了判定**的行数 —— 卖家缺失那行的分母
+    l0_untouched: int       # stages=L0 未命中、保持原结论的行
+    adopted_n: int
+    no_title: int
+    seller_missing: int
+    policy_unknown: int
+    row_errors: int
+    asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
+    uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
+    uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
+
+
+def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
+             l4_fail: dict, pending_total: int,
+             sheet_head: list[str]) -> list[str]:
+    """输入:一轮的入参与计数 → 输出:摘要行(纯拼装,零 I/O)。
+
+    ⚠ 这些字样逐字进飞书通知(cli.py 发的就是 run() 的返回值),
+    每一行都是某次事故/复盘留下的可见性,改字面量前先想清楚谁在读它。
+    """
+    judged = sum(counts.verdicts.values())
+    lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
+    lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
+              f"{',补刷' if opts.backfill else ''}"
+              f"{',R5开' if opts.r5_on else ''}"
+              f"{',只跑L0' if opts.only_l0 else ''}"
+              f"{',L3关' if not opts.run_l3 and not opts.only_l0 else ''}"
+              f"{',L4开' if opts.run_l4 else ''}):"
+              f"候选 {counts.cand_n},判定 {judged}"
+              f"(过 {counts.verdicts['pass']}/拒 {counts.verdicts['reject']}"
+              f"/待定 {counts.verdicts['pending']})"]
+    if opts.only_l0:
+        lines.append(
+            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原结论**"
+            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
+    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
+        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
+                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
+                     f"unknown→待定 {l1s.get('unknown', 0)},"
+                     f"字典回落 {l1s.get('dict_fallback', 0)},"
+                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
+                     f"低置信采纳 {l1s.get('conf_low', 0)}")
+        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
+        picked = {k[len("picked_"):]: v for k, v in l1s.items()
+                  if k.startswith("picked_") and v}
+        if picked:
+            lines.append("  选中候选来自:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(picked.items(),
+                                              key=lambda kv: -kv[1])))
+        opened = {k: v for k, v in l1s.items()
+                  if k.startswith("open_") and v}
+        if opened:
+            lines.append("  零参考两阶段:" + " / ".join(
+                f"{k} {v}" for k, v in sorted(opened.items())))
+        if l1s.get("unknown_retry_called", 0):
+            called = l1s["unknown_retry_called"]
+            saved = l1s.get("unknown_retry_saved", 0)
+            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
+                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
+    # token / 成本(2026-08-21):跑完才想知道"这一轮花了多少"就晚了 ——
+    # usage 只在响应里存在一次,不当场记就永远没了
+    from services import llm_cost as _cost
+    from api import llm as _llm2
+    lines.extend(_cost.summarize(_llm2.USAGE_STATS, items=judged))
+    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
+    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
+    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
+    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
+    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
+    if retries.get("http_429"):
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + " ⚠ **已撞限流**,再加并发只会更慢")
+    elif retries:
+        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
+                                          in sorted(retries.items()))
+                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
+                  "降并发解决不了)")
+    else:
+        tail = ",LLM 零退避(未撞限流,可继续加并发)"
+    lines.append(f"并发 {opts.workers}{tail}")
+    if opts.conn_note:
+        # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
+        lines.append(opts.conn_note)
+    # 2026-08-20:seed/LLM 的 excluded 三个计数键随 excluded 链下线,L1 硬拦
+    # 现在只剩出版物一条(类目能不能做已全部归 L2 R1 白名单)
+    if l1s.get("publication_forbidden", 0):
+        lines.append(f"L1 硬拦:出版物 {l1s.get('publication_forbidden', 0)}")
+    if stage_stats["L3_ran"]:
+        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
+                     f"(拒 {stage_stats['L3_reject']}/"
+                     f"LLM 故障待定 {stage_stats['L3_pending']})")
+    if stage_stats["L4_ran"]:
+        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
+                     f"(拒 {stage_stats['L4_reject']})")
+    if l4_fail:
+        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
+        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
+        lines.append(f"⚠ L4 故障回落 pass:{detail}"
+                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
+    if counts.row_errors:
+        lines.append(f"⚠ 单行失败跳过 {counts.row_errors}(savepoint 隔离,详见日志)")
+    if counts.asked_asins and counts.cand_n < counts.asked_asins:
+        lines.append(f"⚠ 指定 ASIN {counts.asked_asins} 个,"
+                     f"库中命中 {counts.cand_n}——缺的 "
+                     f"{counts.asked_asins - counts.cand_n} 个不在 catalog.products")
+    if counts.adopted_n:
+        lines.append(f"历史结论采用 {counts.adopted_n}(不写新 run,detail 指回原 run_id)")
+    if counts.no_title:
+        lines.append(f"无标题跳过 {counts.no_title}(采集降级,不够格判定)")
+    if counts.seller_missing:
+        # ⚠ 分母是**进了判定的行数**不是 judged。2026-08-21 生产实见
+        # 「卖家字段缺失 97331/10147」—— 分子比分母还大:stages=L0 下 judged
+        # 只数 Phase0 命中的那一小撮,而卖家缺失数的是全部候选行。
+        # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
+        lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
+                     f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
+    if counts.policy_unknown:
+        lines.append(f"⚠ 理由映射落 37 政策外 {counts.policy_unknown} 条(详见日志,只记不改判)")
+    if opts.r5_on and counts.uspto_failures:
+        lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
+                     f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
+    lines.append(f"全库 pending 存量 {pending_total}")
+    return lines
+
+
+def run(params: dict) -> str:
+    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+    opts = _parse_opts(params)
+    opts.workers, opts.conn_note = _cap_by_connections(opts.workers)
+    # 中段判定主体与 _to_todo/_judge/_flush 三层闭包沿用这些名字:本次拆解只
+    # 搬走两头(参数解析进 _parse_opts、摘要拼装进 _summary),主体一字未动
+    execute, limit, backfill, adopt_only = (opts.execute, opts.limit,
+                                            opts.backfill, opts.adopt_only)
+    r5_on, run_l3, run_l4, only_l0, workers = (opts.r5_on, opts.run_l3,
+                                               opts.run_l4, opts.only_l0,
+                                               opts.workers)
     # ── 上架表驱动(所有者定稿 2026-08-16;领任务在 _claim_from_sheet)──────
     sheet_rows: list[dict] = []
     sheet_head: list[str] = []
     sheet_want: list[str] = []
     if params.get("from_sheet"):
-        sheet_rows, sheet_want, sheet_head = _claim_from_sheet(limit)
+        sheet_rows, sheet_want, sheet_head = _claim_from_sheet(
+            limit, force=_forced_sheet(params))
         if not sheet_want:
             return sheet_head[0]
         # ⚠ 补采闭环必须在**候选查询之前**(所有者定稿 2026-08-17:「产品审核
@@ -852,28 +1308,48 @@ def run(params: dict) -> str:
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
             else _RECENT_RUN_GUARD
-        if str(params.get("rerule", "")).strip():
-            sheet_head = _rerule_head(conn, params["rerule"].strip(),
-                                      where, extra, limit) + sheet_head
-        with conn.cursor() as cur:
-            cur.execute(_CANDIDATE_SQL.format(where=where,
-                                              recent_guard=guard),
-                        query_params)
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        rule_ = str(params.get("rerule", "")).strip()
+        mode_ = str(params.get("mode", "")).strip()
+        if rule_:
+            sheet_head = _batch_head(
+                conn, f"定点重审 rerule={rule_}:命中过该规则且**现结论仍是 "
+                      f"rejected**、且未按当前规则版本判过的",
+                where, extra, limit,
+                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了") \
+                + sheet_head
+        elif mode_ == "nonpass":
+            sheet_head = _batch_head(
+                conn, "非 pass 全量重判:rejected + pending + 未审过、"
+                      "且未按当前规则版本判过的",
+                where, extra, limit,
+                "一个都没有:这批已经全部按当前版本判过了") + sheet_head
+        elif mode_ == "stale":
+            sheet_head = _batch_head(
+                conn, f"版本重审:approved 且未按当前规则版本"
+                      f"({resources.AUDIT_RULES_VERSION})判过的"
+                      f"(rejected 沿用不重审)",
+                where, extra, limit,
+                "一个都没有:approved 存量已全部按当前版本判过") + sheet_head
+        # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
+        # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
+        cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)
+        chunks = _iter_candidates(cand_sql, query_params)
 
-        adopted_n, adopted = (0, set())
-        if backfill:
-            adopted_n, adopted = _adopt_history(
-                conn, [r["asin"] for r in rows], execute)
         if adopt_only:
             # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
             # 再单独安排要真判的那批)。86 万可采用 vs 33 万要真判,混在
             # 一起跑等于为了采用而顺带付 33 万次 LLM
-            return (f"product_audit(仅采用历史,零 LLM):候选 {len(rows)} → "
+            # ⚠ 逐块采用:`_adopt_history` 是按 asin 独立的,分块与整批等价,
+            #   而整批意味着把 86 万个 asin 塞进一个 `= ANY(%s)`(又一处 OOM)
+            cand_n = adopted_n = 0
+            for chunk in chunks:
+                cand_n += len(chunk)
+                n, _ = _adopt_history(conn, [r["asin"] for r in chunk], execute)
+                adopted_n += n
+            return (f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
                     f"采用 {adopted_n}"
                     + ("" if execute else "(dry-run:未写库)")
-                    + f";其余 {len(rows) - adopted_n} 条无历史,需另跑判定")
+                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定")
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = policy_unknown = 0
@@ -883,20 +1359,41 @@ def run(params: dict) -> str:
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
+        _llm.reset_usage_stats()                 # token 记账同样每轮从零
         events = []
         row_errors, consec_errors = 0, 0
+        l0_untouched = 0
         done_n = 0
+        cand_n = 0                   # 累计取到的候选行数(摘要报它,取代 len(rows))
+        todo_n = 0                   # 累计**进了判定**的行数(≠ 落结论数,见下)
+        adopted_n = 0
         t0 = time.monotonic()
-        todo = []
-        for row in rows:
-            if row["asin"] in adopted:
-                continue
-            if not row.get("title"):
-                no_title += 1        # 采集降级无标题:不够格判定,跳过不写结论
-                continue
-            if not row.get("seller_id"):
-                seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
-            todo.append((row["asin"], audit_rules.product_info_from_row(row)))
+        last_t, last_cand = t0, 0    # 窗口速率的锚点
+
+        def _to_todo(chunk: list) -> list:
+            """输入:一块候选行 → 输出:[(asin, ProductInfo)](并累计三个计数)。
+
+            与原来那个一次性 for 循环逐字同语义,只是按块调用 —— 行对象
+            出了这一块就没人引用,可以被回收(OOM 修复的另一半)。
+            """
+            nonlocal no_title, seller_missing, adopted_n
+            out = []
+            adopted: set = set()
+            if backfill:
+                n, adopted = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute)
+                adopted_n += n
+            for row in chunk:
+                if row["asin"] in adopted:
+                    continue
+                if not row.get("title"):
+                    no_title += 1    # 采集降级无标题:不够格判定,跳过不写结论
+                    continue
+                if not row.get("seller_id"):
+                    seller_missing += 1  # 卖家闸未生效面(契约外字段,摘要必亮)
+                out.append((row["asin"],
+                            audit_rules.product_info_from_row(row)))
+            return out
 
         # 判定并发:worker 各领一条 autocommit 连接跑 audit_one(LLM 秒级,
         # 是墙钟大头);结果按完成序回主线程,落库/计数全在主线程单连接上
@@ -914,12 +1411,13 @@ def run(params: dict) -> str:
                 c = pool.get()
                 try:
                     return audit_rules.audit_one(product, ctx, c,
-                                                 run_l3=run_l3, run_l4=run_l4)
+                                                 run_l3=run_l3, run_l4=run_l4,
+                                                 only_l0=only_l0)
                 finally:
                     pool.put(c)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                futs: dict = {}
                 # 落库缓冲:判定并发调到 128 之后,主线程"逐行 savepoint +
                 # 逐行 INSERT"就是新的瓶颈(所有者定稿 2026-08-17:批量落库)。
                 # 攒够 _PERSIST_BATCH 一次 executemany 落 runs+hits。
@@ -966,60 +1464,90 @@ def run(params: dict) -> str:
                                          oc.asin, e2)
                     return bad
 
-                for fut in as_completed(futs):
-                    asin = futs[fut]
-                    try:
-                        outcome = fut.result()
-                        buf.append(outcome)
-                        bad = _flush()
-                        if bad:
-                            row_errors += bad
-                    except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
-                        row_errors += 1
-                        consec_errors += 1
-                        logger.error("单行审核失败 asin=%s:%s", asin, e)
-                        if consec_errors >= 5:
-                            for f in futs:
-                                f.cancel()
-                            raise RuntimeError(
-                                f"连续 {consec_errors} 行失败(共 {row_errors}),"
-                                f"疑似系统性故障,停批。最后错误:{e}") from e
-                        continue
-                    consec_errors = 0
-                    done_n += 1
-                    if done_n % _COMMIT_EVERY == 0:
-                        # 分段落定:此刻之前判的都已持久,中断只丢最后一段
-                        # ⚠ 先把缓冲冲干净再 commit —— 缓冲里还压着没落库的行时
-                        # 提交,那句"都已持久"就是谎话(它们要等下一批才落)
-                        row_errors += _flush(force=True)
-                        conn.commit()
-                        if events:
-                            product_events.record_many(conn, events)
+                for chunk in chunks:
+                    cand_n += len(chunk)
+                    todo = _to_todo(chunk)
+                    # ⚠ **一块一提交**,不是一次把 78 万个 future 全丢进去
+                    #   (2026-08-21 生产 OOM 的另一半:每个 future 吊着入参,
+                    #   完成后还吊着 AuditOutcome,78 万份同时在内存里)。
+                    #   线程池与连接池仍是整轮共用一套 —— 分块的是"在飞的量",
+                    #   不是并发度,吞吐不受影响。
+                    todo_n += len(todo)
+                    futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                    for fut in as_completed(futs):
+                        asin = futs[fut]
+                        try:
+                            outcome = fut.result()
+                            if outcome is None:     # stages=L0 未命中:保持原结论
+                                l0_untouched += 1
+                                consec_errors = 0
+                                continue
+                            buf.append(outcome)
+                            bad = _flush()
+                            if bad:
+                                row_errors += bad
+                        except Exception as e:  # noqa: BLE001 —— 单行隔离,计数亮出
+                            row_errors += 1
+                            consec_errors += 1
+                            logger.error("单行审核失败 asin=%s:%s", asin, e)
+                            if consec_errors >= 5:
+                                for f in futs:
+                                    f.cancel()
+                                raise RuntimeError(
+                                    f"连续 {consec_errors} 行失败(共 {row_errors}),"
+                                    f"疑似系统性故障,停批。最后错误:{e}") from e
+                            continue
+                        consec_errors = 0
+                        done_n += 1
+                        if done_n % _COMMIT_EVERY == 0:
+                            # 分段落定:此刻之前判的都已持久,中断只丢最后一段
+                            # ⚠ 先把缓冲冲干净再 commit —— 缓冲里还压着没落库的行时
+                            # 提交,那句"都已持久"就是谎话(它们要等下一批才落)
+                            row_errors += _flush(force=True)
                             conn.commit()
-                            events = []
-                        rate = done_n / max(time.monotonic() - t0, 1e-6)
-                        logger.info("进度 %d/%d(%.0f 条/秒,已提交)",
-                                    done_n, len(todo), rate)
-                    if outcome.l3 is not None:
-                        stage_stats["L3_ran"] += 1
-                        if outcome.l3.verdict == "reject":
-                            stage_stats["L3_reject"] += 1
-                        elif outcome.l3.verdict == "pending":
-                            stage_stats["L3_pending"] += 1
-                    if outcome.l4 is not None:
-                        stage_stats["L4_ran"] += 1
-                        if outcome.l4.verdict == "reject":
-                            stage_stats["L4_reject"] += 1
-                        for h in outcome.l4.hits:
-                            if h.penalty == 0 and h.rule_code.startswith("l4_"):
-                                l4_fail[h.rule_code] = \
-                                    l4_fail.get(h.rule_code, 0) + 1
-                    counts[outcome.verdict] += 1
-                    if (outcome.verdict == "reject" and ctx.known_policies
-                            and not audit_reason.known_policies_check(
-                                outcome.final_reason_category,
-                                ctx.known_policies)):
-                        policy_unknown += 1
+                            if events:
+                                product_events.record_many(conn, events)
+                                conn.commit()
+                                events = []
+                            # 进度日志不在这儿 —— 它按**块**报(见 chunk 末尾)。
+                            # 这里只管持久化:两件事混在一行的后果是 stages=L0
+                            # 那种"绝大多数行不落结论"的模式几乎不打日志
+                        if outcome.l3 is not None:
+                            stage_stats["L3_ran"] += 1
+                            if outcome.l3.verdict == "reject":
+                                stage_stats["L3_reject"] += 1
+                            elif outcome.l3.verdict == "pending":
+                                stage_stats["L3_pending"] += 1
+                        if outcome.l4 is not None:
+                            stage_stats["L4_ran"] += 1
+                            if outcome.l4.verdict == "reject":
+                                stage_stats["L4_reject"] += 1
+                            for h in outcome.l4.hits:
+                                if h.penalty == 0 and h.rule_code.startswith("l4_"):
+                                    l4_fail[h.rule_code] = \
+                                        l4_fail.get(h.rule_code, 0) + 1
+                        counts[outcome.verdict] += 1
+                        if (outcome.verdict == "reject" and ctx.known_policies
+                                and not audit_reason.known_policies_check(
+                                    outcome.final_reason_category,
+                                    ctx.known_policies)):
+                            policy_unknown += 1
+                    # 一块判完报一次进度。三个数各说各的,别混:
+                    #   已取   = 从候选流里拉了多少行(进度)
+                    #   落结论 = 其中多少条真写了结论(stages=L0 只有命中的算)
+                    #   速率   = **本段**已取 ÷ 本段耗时
+                    # ⚠ 2026-08-21 所有者质疑「这个速度显示和进度是准确的吗」——
+                    #   不准。原式是 `done_n ÷ (now - t0)`:分子只数落了结论的,
+                    #   分母含启动装配那 80 多秒,于是 L0 模式下报 75 条/秒而实际
+                    #   吞吐 4,900 条/秒(差 65 倍),而且数字单调爬升
+                    #   (启动开销被摊薄),看着像"越跑越快"其实什么都不是。
+                    now = time.monotonic()
+                    if now - last_t >= _PROGRESS_MIN_SEC:
+                        rate = (cand_n - last_cand) / max(now - last_t, 1e-6)
+                        logger.info("进度 已取 %d(落结论 %d),%.0f 条/秒",
+                                    cand_n, done_n, rate)
+                        last_t, last_cand = now, cand_n
+
                 # 收尾冲刷:最后不满一批的那些也要落库,漏了就是"判了没存"
                 row_errors += _flush(force=True)
         if execute and events:
@@ -1033,94 +1561,16 @@ def run(params: dict) -> str:
                         "WHERE marketplace = 'US' AND audit_status = 'pending'")
             (pending_total,) = cur.fetchone()
 
-    judged = sum(counts.values())
-    lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
-    lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
-              f"{',补刷' if backfill else ''}{',R5开' if r5_on else ''}"
-              f"{',L3关' if not run_l3 else ''}{',L4开' if run_l4 else ''}):"
-              f"候选 {len(rows)},判定 {judged}"
-              f"(过 {counts['pass']}/拒 {counts['reject']}/待定 {counts['pending']})"]
     l1s = audit_rules.audit_l1_llm.STATS
-    if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
-        lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
-                     f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"
-                     f"unknown→待定 {l1s.get('unknown', 0)},"
-                     f"字典回落 {l1s.get('dict_fallback', 0)},"
-                     f"无候选→待定 {l1s.get('no_candidate', 0)},"
-                     f"低置信采纳 {l1s.get('conf_low', 0)}")
-        # 候选路归因:哪一路把最终 PT 送进来的(新加的祖先/字典两路是否有用)
-        picked = {k[len("picked_"):]: v for k, v in l1s.items()
-                  if k.startswith("picked_") and v}
-        if picked:
-            lines.append("  选中候选来自:" + " / ".join(
-                f"{k} {v}" for k, v in sorted(picked.items(),
-                                              key=lambda kv: -kv[1])))
-        opened = {k: v for k, v in l1s.items()
-                  if k.startswith("open_") and v}
-        if opened:
-            lines.append("  零参考两阶段:" + " / ".join(
-                f"{k} {v}" for k, v in sorted(opened.items())))
-        if l1s.get("unknown_retry_called", 0):
-            called = l1s["unknown_retry_called"]
-            saved = l1s.get("unknown_retry_saved", 0)
-            lines.append(f"  候选都不合适的二次机会:重判 {called},救回 {saved}"
-                         f"({called - saved} 条换开放候选面仍解不出 → 待定)")
-    # 限流观测:退避是静默的,不亮出来就只能靠耗时反推"是不是加并发没用"
-    from api import llm as _llm2
-    retries = {k: v for k, v in _llm2.RETRY_STATS.items() if v}
-    # 只有 http_429 才叫撞限流:other=网络/解析抖动、5xx=对端故障,三者
-    # 处置完全不同(生产实测 2026-08-14:19 次 other 被这行说成"已撞限流",
-    # 把所有者引向了错误的结论——降并发对网络抖动毫无用处)
-    if retries.get("http_429"):
-        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
-                                          in sorted(retries.items()))
-                + " ⚠ **已撞限流**,再加并发只会更慢")
-    elif retries:
-        tail = (",LLM 退避 " + " / ".join(f"{k} {v}" for k, v
-                                          in sorted(retries.items()))
-                + "(无 429 = 没撞限流;other/5xx 是网络抖动与对端故障,"
-                  "降并发解决不了)")
-    else:
-        tail = ",LLM 零退避(未撞限流,可继续加并发)"
-    lines.append(f"并发 {workers}{tail}")
-    l1_blocked = (l1s.get("seed_excluded_direct", 0)
-                  + l1s.get("llm_excluded", 0) + l1s.get("seed_excluded", 0)
-                  + l1s.get("publication_forbidden", 0))
-    if l1_blocked:
-        lines.append(f"L1 硬拦:直出级 seed {l1s.get('seed_excluded_direct', 0)}"
-                     f" / rerank 级 excluded {l1s.get('llm_excluded', 0)}"
-                     f"(seed 补位 {l1s.get('seed_excluded', 0)})"
-                     f" / 出版物 {l1s.get('publication_forbidden', 0)}")
-    if stage_stats["L3_ran"]:
-        lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
-                     f"(拒 {stage_stats['L3_reject']}/"
-                     f"LLM 故障待定 {stage_stats['L3_pending']})")
-    if stage_stats["L4_ran"]:
-        lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
-                     f"(拒 {stage_stats['L4_reject']})")
-    if l4_fail:
-        # 层死与层净必须长得不一样(评审 P1-2):故障回落 pass 逐码亮出
-        detail = ", ".join(f"{k}×{v}" for k, v in sorted(l4_fail.items()))
-        lines.append(f"⚠ L4 故障回落 pass:{detail}"
-                     f"(全故障=层未生效,先查 ARK_API_KEY/取图)")
-    if row_errors:
-        lines.append(f"⚠ 单行失败跳过 {row_errors}(savepoint 隔离,详见日志)")
-    if "asins" in extra and len(rows) < len(extra["asins"]):
-        lines.append(f"⚠ 指定 ASIN {len(extra['asins'])} 个,库中命中 {len(rows)}"
-                     f"——缺的 {len(extra['asins']) - len(rows)} 个不在 catalog.products")
-    if adopted_n:
-        lines.append(f"历史结论采用 {adopted_n}(不写新 run,detail 指回原 run_id)")
-    if no_title:
-        lines.append(f"无标题跳过 {no_title}(采集降级,不够格判定)")
-    if seller_missing:
-        lines.append(f"⚠ 卖家字段缺失 {seller_missing}/{judged}"
-                     f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
-    if policy_unknown:
-        lines.append(f"⚠ 理由映射落 37 政策外 {policy_unknown} 条(详见日志,只记不改判)")
-    if r5_on and getattr(ctx, "uspto_failures", 0):
-        lines.append(f"⚠ R5 查询失败 {ctx.uspto_failures} 次"
-                     f"{'(≥5 已自动关停本轮 R5)' if ctx.uspto is None else ''}")
-    lines.append(f"全库 pending 存量 {pending_total}")
+    tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
+                   l0_untouched=l0_untouched, adopted_n=adopted_n,
+                   no_title=no_title, seller_missing=seller_missing,
+                   policy_unknown=policy_unknown, row_errors=row_errors,
+                   asked_asins=len(extra.get("asins", ())),
+                   uspto_failures=getattr(ctx, "uspto_failures", 0),
+                   uspto_off=getattr(ctx, "uspto", None) is None)
+    lines = _summary(opts, tally, stage_stats, l1s, l4_fail,
+                     pending_total, sheet_head)
     if sheet_rows:
         # ⚠ 投影必须在补采**之后**跑(它在 _close_gap 之前就跑了的话,
         # 这一轮刚补采回来、刚判出结论的那些行还写不进表格)

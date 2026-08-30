@@ -7,7 +7,7 @@ from api import feeds, feishu, inventory as inv_api, prices
 from registry import resources
 from registry.resources import Spreadsheet
 from services import feed_track, maint_sheet, \
-    maintenance_intents as mi, store_limits
+    maintenance_intents as mi, store_limits, store_targets as st
 from workflows import maintenance as mw
 
 STORE = {"name": "T1", "client_id": "c", "client_secret": "s", "proxy": None}
@@ -88,6 +88,22 @@ def test_zero_intents_only_positive_known_qty():
 # 2026-08-16 起 price/inventory 两个 provider 都会判"标题相似度 < 70% → 该删",
 # 该删的行不再产改价/清零意图。默认值若是随手写的两个不相干字符串,
 # 全部用例会集体空转而看起来只是"没有意图"。
+class _DelConn(_Conn):
+    """删除链假连接:偏移件与「连续无货/渠道不符」两条 SQL **列数不同**。
+
+    ⚠ 2026-08-25 之前两条都返 5 列,测试就用一份 rows 喂两边 —— 那是巧合不是
+    契约。渠道维加进来之后 LONG_OOS 返 7 列,共用一份 rows 会当场 ValueError
+    (这次就是这么发现的),而列数万一又撞上就会**静默错位**。按 SQL 分开给。
+    """
+
+    def __init__(self, offset=None, oos=None):
+        super().__init__()
+        self.offset, self.oos = offset or [], oos or []
+
+    def fetchall(self):
+        return self.offset if "variant_offset" in self._last else self.oos
+
+
 def _row(store="T1", sku="B0A", name="Steel Cup", pt="Cups", upc="012345678905",
          wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
          delivery_days=3, slow=None, fulfillment="FBM", shipping=0.0,
@@ -168,6 +184,56 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
                    "B0LEAD8": 0, "B0LEAD7": 50}
 
 
+def test_channel_mismatch_zeroes_the_inventory(monkeypatch):
+    """本店 FBA、货变成 FBM ⇒ 这家店卖不了 ⇒ 库存写 0(所有者定稿 2026-08-25)。
+
+    **清零不删除**:清零可逆(渠道翻回来自动回补),删除不可逆。真下架由删除链
+    的「渠道不符 N 天」窗口收尾 —— 与"缺货清零 → 连续无货 N 天才删"同一条阶梯。
+    """
+    rows = [
+        _row(sku="B0FBM", avail_qty=9, stock_count=50, fulfillment="FBM"),
+        _row(sku="B0FBA", avail_qty=9, stock_count=50, fulfillment="FBA"),
+    ]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = {i["sku"]: (i["new"], i["code"])
+           for i in mi.inventory_intents(_Conn(), [],
+                                         store_channels={"T1": "FBA"})}
+    # 本店只做 FBA:FBM 的货清零并带自己的原因码,FBA 的货照常同步(无原因码)
+    assert out == {"B0FBM": (0, "channel_mismatch"), "B0FBA": (50, "")}
+
+
+def test_channel_unknown_or_unmarked_store_never_zeroes(monkeypatch):
+    """两个方向都不许猜(写反了都不报错,而且是"无辜商品被清零再删掉")。
+
+    · 店**没标**「配送限制」→ 什么渠道都能卖(所有者:「没标就都能上」);
+    · 产品渠道**采不到 / 采出第三种值** → 不算不符(那说明采集侧 is_fba 坏了,
+      要修的是采集,不是把货清零)。
+    """
+    rows = [_row(sku="B0UNK", avail_qty=9, stock_count=50, fulfillment=None),
+            _row(sku="B0JUNK", avail_qty=9, stock_count=50, fulfillment="N/A"),
+            _row(sku="B0FBM", avail_qty=9, stock_count=50, fulfillment="FBM")]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    # ① 店限定 FBA:未知与第三种值照常同步 50,只有确定的 FBM 清零
+    got = {i["sku"]: i["new"] for i in mi.inventory_intents(
+        _Conn(), [], store_channels={"T1": "FBA"})}
+    assert got == {"B0UNK": 50, "B0JUNK": 50, "B0FBM": 0}
+    # ② 店没标:一行都不因渠道清零(不传 = 不限制,与传空字典同义)
+    assert {i["sku"]: i["new"] for i in mi.inventory_intents(_Conn(), [])} \
+        == {"B0UNK": 50, "B0JUNK": 50, "B0FBM": 50}
+
+
+def test_channel_mismatch_outranks_out_of_stock_as_a_reason(monkeypatch):
+    """两条都命中时动作一样(清零),原因码要报**渠道不符**。
+
+    「缺货」是暂时的(等回货),「渠道不符」是结构性的(回了货也卖不了)。
+    排在缺货后面就会被盖住,而缺货那一栏天天几百条。
+    """
+    act, code, _ = mi.classify(stock_state="out_of_stock", channel_bad=True)
+    assert (act, code) == ("inventory", "channel_mismatch")
+    # 删除仍然压过一切:一个 SKU 一轮只出一个动作
+    assert mi.classify(outcome="not_found", channel_bad=True)[0] == "delete"
+
+
 def test_title_intents_reuses_listing_copy_rules(monkeypatch):
     rows = [
         # 处理后 "Steel Cup" vs 现值 "Steel Cup 500ml":相似度 82% ≥ 70% → 改标题
@@ -209,8 +275,8 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
     assert mi.MIN_OFFSET_BATCHES == 1
 
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
-    conn = _Conn(rows=[("T1", "B0A", 1, None, None),
-                       ("T1", "B0B", 2, None, None)])
+    conn = _DelConn(offset=[("T1", "B0A", 1, None, None),
+                            ("T1", "B0B", 2, None, None)])
     out = mi.delete_intents(conn)
     # code = 机器码(分组用),reason = 人读文案 —— 2026-08-16 起分开两列
     assert [(i["store"], i["sku"], i["kind"], i["old"], i["new"], i["code"])
@@ -219,12 +285,13 @@ def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
         ("T1", "B0B", "delete", "在线", "删除", "variant_offset")]
     assert all(i["reason"] and i["reason"] != i["code"] for i in out)
 
-    # 单店上限取限额表「下架限制」;不在表内退 DELETE_PER_STORE(所有者问来源)
+    # ⚠ 2026-08-24 归一:扫描件**不再截**单店上限,如实报待办。上限只在
+    # 执行件领取时施加一次(dispositions.cap_destructive)——此前两条链各截
+    # 一次同一张限额表,每店最多 N 条实际变成了最多 2N。
     rows3 = [("T1", "B0A", 1, None, None), ("T1", "B0B", 1, None, None),
              ("T2", "B0C", 1, None, None)]
-    assert len(mi.delete_intents(_Conn(rows=rows3), caps={"T1": 1})) == 2
-    monkeypatch.setattr(mi, "DELETE_PER_STORE", 1)
-    assert len(mi.delete_intents(_Conn(rows=rows3))) == 2    # 每店各留 1
+    assert len(mi.delete_intents(_DelConn(offset=rows3))) == 3
+    assert not hasattr(mi, "DELETE_PER_STORE")   # 唯一出处搬去 dispositions
 
 
 def test_delete_intents_also_take_title_placeholder(monkeypatch):
@@ -235,7 +302,7 @@ def test_delete_intents_also_take_title_placeholder(monkeypatch):
         _row(sku="B0DUP", slow={"title": "[商品不存在]"}),
     ])
     # B0DUP 同时是偏移件:两个原因命中只删一次
-    out = mi.delete_intents(_Conn(rows=[("T1", "B0DUP", 1, None, None)]))
+    out = mi.delete_intents(_DelConn(offset=[("T1", "B0DUP", 1, None, None)]))
     got = {i["sku"]: i["code"] for i in out}
     assert got == {"B0DUP": "variant_offset", "B0GONE": "商品不存在"}
     assert [i["label"] for i in out if i["sku"] == "B0GONE"] == ["删除(商品不存在)"]
@@ -244,36 +311,79 @@ def test_delete_intents_also_take_title_placeholder(monkeypatch):
 def test_long_oos_delete_sql_guards():
     """连续无货 N 天 → 删除。三道判据缺一个都会误删(所有者定稿 2026-08-09)。"""
     q = mi._SQL_LONG_OOS
-    # 1. 窗口内一条"有货"观测都没有
+    # 1. 窗口内一条"本店卖得了"的观测都没有
     assert "stock_count > 0" in q and "stock_state = 'in_stock'" in q
-    # 2. 至少一条明确缺货观测——防"15 天全是 unknown(采不全)"被当成缺货
+    assert "sellable_obs = 0" in q
+    # 2. 至少一条**明确**卖不了的观测(缺货 或 确定是另一个渠道)
+    #    ——防"15 天全是 unknown(采不全)"被当成缺货
     assert "stock_state = 'out_of_stock'" in q
+    assert "oos_obs + wrong_ch_obs > 0" in q
     # 3. 窗口两端都有观测——防"两头各采一次、中间断 13 天"被当连续
-    assert "interval '36 hours'" in q and "max(scraped_at) >= now()" in q
+    assert "interval '36 hours'" in q and "last_seen >= now()" in q
     # 降级采集的 fast 段基本是空的,拿它判缺货是冤案
-    assert "COALESCE(outcome, 'ok') = 'ok'" in q
+    assert "COALESCE(sn.outcome, 'ok') = 'ok'" in q
     # 破坏动作守路由铁律 + 在架 + 店铺 ACTIVE
     assert "ls.source_type = 'amz'" in q
     assert "published_status = 'PUBLISHED'" in q
-    assert "upper(s.store_status) = 'ACTIVE'" in q
+    assert "upper(st.store_status) = 'ACTIVE'" in q
     assert mi.LONG_OOS_DAYS == 15
+
+
+def test_long_oos_window_is_evaluated_per_channel():
+    """「该渠道下库存连续不足 N 天,下架」(所有者定稿 2026-08-25)。
+
+    三个方向写反了都不报错,逐条钉住:
+      · 渠道来自快照 raw.is_fba,**且必须 coalesce 成二值** —— 三值逻辑下
+        `NOT (… AND NULL)` 是 NULL,FILTER 当不命中,于是"渠道采不到"的观测
+        会从"挡住删除"翻成"不挡",正好反了;
+      · 店没标(want='')时两个渠道条件恒假 ⇒ 判据逐字退回旧口径;
+      · 确定是另一个渠道的"有货"观测,既不算卖得了、又算一条明确证据。
+    """
+    q = mi._SQL_LONG_OOS
+    assert "raw ->> 'is_fba'" in q
+    assert "coalesce(upper(btrim(sn.raw ->> 'is_fba')), '')" in q
+    assert "coalesce(sn.stock_count > 0" in q and "false) AS has_stock" in q
+    # 店铺渠道要求从**参数**进来(硬编码进 SQL 就等于代码里写死配置)
+    assert "%(ch_stores)s::text[]" in q and "%(ch_wants)s::text[]" in q
+    assert "coalesce(req.want, '') AS want" in q
+    # 没标的店:want='' ⇒ 这两处条件恒假 ⇒ sellable_obs 退回 in_stock_obs
+    assert q.count("live.want <> ''") == 2
+    assert "o.channel <> live.want" in q
 
 
 def test_long_oos_intents_carry_reason(monkeypatch):
     monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
-
-    class _TwoQueries(_Conn):
-        """第一条 SQL(偏移)无结果,第二条(连续无货)返回一行。"""
-
-        def fetchall(self):
-            return [] if "variant_offset" in self._last else [
-                ("T1", "B0DEAD", 15, None, None)]
-
-    out = mi.delete_intents(_TwoQueries(), oos_days=15)
+    out = mi.delete_intents(
+        _DelConn(oos=[("T1", "B0DEAD", 15, None, None, 0, "")]), oos_days=15)
     assert [(i["sku"], i["code"], i["label"]) for i in out] == [
         ("B0DEAD", "连续无货15天", "删除(连续无货15天)")]
     # 「原因」列要读得出"低到什么程度",机器码读不出来
     assert out[0]["reason"] == "15 天窗口内 15 次观测无一有货,货源已断"
+
+
+def test_wrong_channel_delete_has_its_own_reason_code(monkeypatch):
+    """渠道不符走到头 ≠ 货源断了:原因码分开,删除预览按码分组才说得清。"""
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
+    out = mi.delete_intents(
+        _DelConn(oos=[("T1", "B0WRONG", 15, None, None, 12, "FBA"),
+                      ("T1", "B0DEAD", 15, None, None, 0, "FBA")]),
+        oos_days=15)
+    assert {i["sku"]: i["code"] for i in out} == {
+        "B0WRONG": "渠道不符15天", "B0DEAD": "连续无货15天"}
+    why = {i["sku"]: i["reason"] for i in out}
+    assert "本店渠道(FBA)" in why["B0WRONG"] and "12 次确认为另一渠道" in why["B0WRONG"]
+
+
+def test_delete_intents_actually_binds_the_store_channels(monkeypatch):
+    """渠道闸最容易的死法:参数没绑,SQL 里 want 恒空,闸**永远不触发且不报错**。"""
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: [])
+    conn = _DelConn()
+    mi.delete_intents(conn, store_channels={"T1": "FBA", "T2": "FBM"})
+    args = [a for sql, a in conn.sqls if "ch_stores" in sql][0]
+    assert args["ch_stores"] == ["T1", "T2"]
+    # 两个数组按位对齐 —— 错位就是把 T1 的渠道要求安到 T2 头上
+    assert dict(zip(args["ch_stores"], args["ch_wants"])) == {"T1": "FBA",
+                                                              "T2": "FBM"}
 
 
 def test_drop_recent_suppresses_same_intent_within_window(monkeypatch):
@@ -339,23 +449,29 @@ def test_collect_all_lives_in_services_not_in_a_workflow():
 def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
     """将被删除的行不再改价/改库存:它们的 amz 数据本来就是陈旧的。"""
     conn = _Conn()
-    monkeypatch.setattr(mi, "delete_intents", lambda c, sz, caps, oos_days=0: [
-        {"store": "T1", "sku": "B0A", "kind": "delete", "old": "在线",
-         "new": "删除", "code": "variant_offset"}])
+    monkeypatch.setattr(mi, "delete_intents",
+                        lambda c, sz, oos_days=0, store_channels=None: [
+                            {"store": "T1", "sku": "B0A", "kind": "delete",
+                             "old": "在线", "new": "删除",
+                             "code": "variant_offset"}])
     monkeypatch.setattr(mi.store_limits, "retire_caps", lambda: {})
     monkeypatch.setattr(mi.store_limits, "price_multipliers", lambda: {})
+    monkeypatch.setattr(st, "store_channels", lambda: {"T1": "FBA"})
     monkeypatch.setattr(mi, "title_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "price_intents", lambda c, m, sz: [
         {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
         {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
-    monkeypatch.setattr(mi, "inventory_intents", lambda c, sz: [
-        {"store": "T1", "sku": "B0A", "kind": "inventory", "old": 5, "new": 0}])
+    monkeypatch.setattr(mi, "inventory_intents",
+                        lambda c, sz, store_channels=None: [
+                            {"store": "T1", "sku": "B0A", "kind": "inventory",
+                             "old": 5, "new": 0}])
     monkeypatch.setattr(mi, "zero_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "match_inventory_intents", lambda c, sz: [])
     monkeypatch.setattr(mi, "drop_recent", lambda c, i: (i, 0))
-    out = mi.collect_all(conn, [])
+    out, capped = mi.collect_all(conn, [])
     assert [(i["sku"], i["kind"]) for i in out] == [("B0A", "delete"),
                                                     ("B0B", "price")]
+    assert capped == []          # 没超单店上限就一个组都不该进截断报告
 
 
 def test_intent_disposition_roundtrip_keeps_the_title_payload():
@@ -393,24 +509,158 @@ def test_delete_detail_datetimes_survive_json():
     assert "default=str" in inspect.getsource(ds.suggest_many)
 
 
+# ── 单店单轮上限(cap_per_store,2026-08-26 按店化)──────────────────────────
+# 08-25 生产实证的病根:全局 5000/类闸把 7 家店的**合法**倍率调整截成随机零头
+# (SQL 无 ORDER BY,[:5000] 取的是物理序),截断只进日志,飞书摘要看起来一切
+# 正常。按店化后配额才对得上沃尔玛的计法(全部按店),截谁也不再随机。
+
+
+def _price_intent(store, sku, old, new):
+    return {"store": store, "sku": sku, "kind": "price", "old": old, "new": new}
+
+
+def test_cap_is_per_store_not_global():
+    """一家店超限只截这一家;别家一个不少;全局总量允许超旧 5000 闸。"""
+    cap = mi.MAX_INTENTS_PER_STORE["price"]
+    big = [_price_intent("A", f"S{i}", 10.0, 12.0) for i in range(cap + 100)]
+    small = [_price_intent("B", f"T{i}", 10.0, 15.0) for i in range(300)]
+    out, report = mi.cap_per_store(big + small)
+    n = {}
+    for i in out:
+        n[i["store"]] = n.get(i["store"], 0) + 1
+    assert n == {"A": cap, "B": 300}
+    assert len(out) > 5000                    # 全局旧闸已废
+    assert len(report) == 1
+    r = report[0]
+    assert (r["store"], r["kind"], r["total"], r["kept"]) == \
+        ("A", "price", cap + 100, cap)
+    # 落榜行的键要给全:扫描件靠它把落榜行留在 withdraw keep 里
+    assert len(r["deferred_keys"]) == 100
+    assert all(k[0] == "A" and k[2] == "price" for k in r["deferred_keys"])
+
+
+def test_price_truncation_keeps_the_biggest_mispricing(monkeypatch):
+    """截谁不是随机的:偏差比例大的先走 —— 错得越离谱的价越该当天纠。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "price", 2)
+    out, report = mi.cap_per_store([
+        _price_intent("A", "S1", 10.0, 10.2),     # +2%
+        _price_intent("A", "S2", 10.0, 15.0),     # +50%
+        _price_intent("A", "S3", 10.0, 8.0),      # -20%(跌也按幅度算)
+    ])
+    assert {i["sku"] for i in out} == {"S2", "S3"}
+    assert report[0]["total"] == 3 and report[0]["kept"] == 2
+    assert report[0]["deferred_keys"] == [("A", "S1", "price")]
+
+
+def test_title_truncation_keeps_mismatch_sync_first(monkeypatch):
+    """标题也有截断优先级:停闸期低相似度同步(抄错标题嫌疑最大)先走;
+    第二键 SKU —— 产出序是无 ORDER BY 的物理序,会随 VACUUM 漂移,
+    截断名单必须跨轮可预期(08-25 "随机截"的一半病根)。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "title", 2)
+    out, _ = mi.cap_per_store([
+        {"store": "A", "sku": "T3", "kind": "title", "old": "a", "new": "b",
+         "code": "title_sync"},
+        {"store": "A", "sku": "T2", "kind": "title", "old": "a", "new": "b",
+         "code": "title_mismatch_sync"},
+        {"store": "A", "sku": "T1", "kind": "title", "old": "a", "new": "b",
+         "code": "title_sync"},
+    ])
+    assert [i["sku"] for i in out] == ["T2", "T1"]
+
+
+def test_inventory_truncation_keeps_zeroing_first(monkeypatch):
+    """清零(new=0)优先于补货:「别卖错」压过「上量」;同档保持产出序。"""
+    monkeypatch.setitem(mi.MAX_INTENTS_PER_STORE, "inventory", 2)
+    out, _ = mi.cap_per_store([
+        {"store": "A", "sku": "R1", "kind": "inventory", "old": 0, "new": 10},
+        {"store": "A", "sku": "Z1", "kind": "inventory", "old": 5, "new": 0},
+        {"store": "A", "sku": "Z2", "kind": "inventory", "old": 3, "new": 0},
+    ])
+    assert [i["sku"] for i in out] == ["Z1", "Z2"]
+
+
+def test_delete_is_never_capped_at_scan():
+    """破坏类数量闸唯一在执行件(2026-08-24 归一);扫描件如实报待办。"""
+    dels = [{"store": "A", "sku": f"D{i}", "kind": "delete",
+             "old": "在线", "new": "删除"} for i in range(9000)]
+    out, report = mi.cap_per_store(dels)
+    assert len(out) == 9000 and report == []
+
+
+def test_store_caps_align_with_feed_quota_and_slice():
+    """上限 =(按店速率桶 − 1)× 单 feed 切片条数,三处必须钉在一起。
+
+    **−1 是补交余量**:api/feeds 的"双确认未达 → 同一载荷补交一次"每次
+    多烧一个桶名额,切片数吃满桶时一次补交就会在令牌桶上睡到窗口滑出
+    (≈1 小时),整条链抱着 flock 陪等。
+    **窗口那一维也要钉**:把 (8,3600) 改成 (8,86400) 条数断言照样过,
+    而单轮吞吐掉到 1/24、"×小时"的六处文档全部变假话。
+    谁要改桶/切片/上限表任何一处,先改到全部同时成立。
+    """
+    from api import _client, feeds
+    for kind, bucket, slice_key in (
+            ("price", "feeds.post.price", "price"),
+            ("inventory", "feeds.post.inventory", "inventory"),
+            ("title", "feeds.post.MP_MAINTENANCE", "MP_MAINTENANCE")):
+        n, window = _client._RATE_BUCKETS[bucket]
+        assert window == 3600.0, bucket       # 单轮 = 一小时桶
+        assert mi.MAX_INTENTS_PER_STORE[kind] == \
+            (n - 1) * feeds._SLICE_LIMITS[slice_key][0], kind
+
+
 # ── 扫描件(maintenance_scan)────────────────────────────────────────────────
 
-def _scan_wire(monkeypatch, intents, sz=("T1",)):
+def _scan_wire(monkeypatch, intents, sz=("T1",), capped=(), absent=()):
     from workflows import maintenance_scan as ms
     calls = {"suggest": [], "withdraw": []}
     monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
+    monkeypatch.setattr(ms.store_absence, "stale_stores",
+                        lambda conn, since=None, hours=None: list(absent))
     monkeypatch.setattr(ms.mi, "collect_all",
-                        lambda conn, s, oos=0: list(intents))
+                        lambda conn, s, oos=0: (list(intents), list(capped)))
     _fake_db(monkeypatch, _Conn())
     monkeypatch.setattr(ms.dispositions, "suggest_many",
                         lambda conn, rows: (calls["suggest"].extend(rows),
                                             len(rows))[1])
     monkeypatch.setattr(ms.dispositions, "withdraw_stale",
-                        lambda conn, src, keep, why, store=None: (
-                            calls["withdraw"].append((src, keep, store)), 0)[1])
+                        lambda conn, src, keep, why, store=None,
+                        exclude_stores=None: (
+                            calls["withdraw"].append(
+                                (src, keep, store, exclude_stores)), 0)[1])
     monkeypatch.setattr(ms.dispositions, "count_open",
                         lambda conn, sources=None: len(calls["suggest"]))
+    monkeypatch.setattr(ms.dispositions, "count_suppressed",
+                        lambda conn, actions=None: calls.get("suppressed", 0))
     return ms, calls
+
+
+def test_scan_breaks_channel_clears_down_by_store():
+    """1600 行清零只报一个总数没用:渠道不符的**补救动作是逐店的**。
+
+    规划外店(谭总系)带旗标,但**照判不豁免**(所有者定稿 2026-08-25)。旗标的
+    用途是提醒:这些行永远不会进 `alloc_audit` 的渠道不符下架清单(那条链在判
+    渠道之前就剔了规划外店),两份报告对不上是预期的,不是漏报。
+    """
+    zeroing = ([{"store": "A085朱丽霖", "sku": f"B0A{i}", "kind": "inventory",
+                 "new": 0, "code": "channel_mismatch"} for i in range(3)]
+               + [{"store": "谭总6", "sku": f"B0T{i}", "kind": "inventory",
+                   "new": 0, "code": "channel_mismatch"} for i in range(9)]
+               + [{"store": "A085朱丽霖", "sku": "B0OOS", "kind": "inventory",
+                   "new": 0, "code": "out_of_stock"}])
+    from workflows import maintenance_scan as ms
+    got = "\n".join(ms._channel_lines(zeroing))
+    # 按条数降序,规划外店带旗标;缺货那条不算进来(它的处置对象是商品不是店)
+    assert "渠道不符清零 12 行" in got
+    assert "谭总6×9⚑" in got and "A085朱丽霖×3" in got
+    assert "A085朱丽霖×3⚑" not in got          # 在册店不许被标成规划外
+    assert "规划外店,共 9 行" in got
+    # 旗标记的是**定稿**(所有者 2026-08-25),不是待办 —— 不许退回"要对齐
+    # 就把这一闸也对规划外店豁免"那种悬案文案:悬案会被人当成"这里还没做完"
+    assert "不豁免" in got
+    assert "要对齐" not in got
+    # 一行渠道不符都没有时不占版面(排版规范规矩 2:只报真的发生了的)
+    assert ms._channel_lines([z for z in zeroing
+                              if z["code"] != "channel_mismatch"]) == []
 
 
 def test_scan_lists_delete_names_separately(monkeypatch):
@@ -427,6 +677,24 @@ def test_scan_lists_delete_names_separately(monkeypatch):
     assert "清零合计 2 条,原因:out_of_stock×2" in out
     assert [r["action"] for r in calls["suggest"]] == ["delete", "inventory",
                                                        "inventory"]
+
+
+def test_scan_says_the_pause_only_stops_deletion(monkeypatch):
+    """停闸摘要要说清"只停删除",并把低相似度改标题的条数单独摊开。
+
+    所有者 2026-08-20:「删除(title_mismatch)已停闸,那么就要对这批行同时
+    改价改标题改库存」。改的是"可能不是同一个商品"的标题 —— 混在"标题 N"
+    里等于没说,人眼闸门看不到条数就没法判断今天要不要拦。
+    """
+    assert mi.TITLE_MISMATCH_DELETE is False        # 停闸是当前现状
+    intents = [{"store": "T1", "sku": "B0M", "kind": "title", "old": "A",
+                "new": "B", "code": "title_mismatch_sync"},
+               {"store": "T1", "sku": "B0N", "kind": "title", "old": "A",
+                "new": "B", "code": "title_sync"}]
+    ms, _calls = _scan_wire(monkeypatch, intents)
+    out = ms.run({})
+    assert "只停删除" in out and "照常改价/改标题/改库存" in out
+    assert "低相似度改标题 1 条" in out             # 另一条是常规同步,不算
 
 
 def test_scan_writes_no_feed_and_is_not_dangerous(monkeypatch):
@@ -447,7 +715,7 @@ def test_scan_withdraw_is_scoped_to_the_store_it_scanned(monkeypatch):
                 "new": 0, "code": "out_of_stock"}]
     ms, calls = _scan_wire(monkeypatch, intents)
     ms.run({"store": "T1"})
-    src, keep, store = calls["withdraw"][0]
+    src, keep, store, _excl = calls["withdraw"][0]
     assert src == "maint" and store == "T1"
     assert keep == [("T1", "A", "inventory")]       # 只保留本店本轮的
     assert [r["store"] for r in calls["suggest"]] == ["T1"]
@@ -461,6 +729,80 @@ def test_scan_preview_writes_nothing(monkeypatch):
     assert "preview" in out and "将写 1 条" in out
 
 
+def test_scan_surfaces_truncation_in_summary_first_line(monkeypatch):
+    """截断必须进摘要**首行**,不许只进日志或第 2 行。
+
+    08-25 生产实证:全局闸截掉 7,766 条改价只写了一行日志 warning,飞书通知
+    报的全是截断后的数,看起来一切正常。而且唯一调度路径(product_chain 链)
+    对成功步骤**只发首行**(cli first_line_of)—— 截断放第 2 行等于只写日志
+    (对抗校验 2026-08-26 实跑证实)。逐店明细留在后续行。
+    """
+    ms, _calls = _scan_wire(monkeypatch, [], capped=[
+        {"store": "谭总12", "kind": "price", "total": 8000, "kept": 6000}])
+    out = ms.run({"preview": "1"})
+    first = out.splitlines()[0]
+    assert "⚠ 截断 1 组共 2000 条顺延" in first
+    assert "谭总12" in out and "8000→6000" in out
+
+
+def test_scan_first_line_carries_zeroing_count(monkeypatch):
+    """清零规模也必须在首行:全局刹车废除后它是整店误清零的唯一人眼防线,
+    而链通知只发成功步骤的首行 —— 放 _preview_lines 里等于没人看见。"""
+    ms, _calls = _scan_wire(monkeypatch, [
+        {"store": "T1", "sku": "A", "kind": "inventory", "old": 3, "new": 0,
+         "code": "out_of_stock", "reason": "亚马逊缺货"},
+        {"store": "T1", "sku": "B", "kind": "inventory", "old": 0, "new": 7,
+         "code": "match_restock", "reason": "跟卖铺货"}])
+    out = ms.run({"preview": "1"})
+    assert "清零 1" in out.splitlines()[0]     # 补货那条不算清零
+
+
+def test_scan_store_filter_scopes_the_truncation_report_too(monkeypatch):
+    """-p store=X 那一轮,别家的截断行不该混进本店摘要。
+
+    ⚠ 店名别用 stockzero 名单里的:_scan_wire 缺省 sz=("T1",) 会让
+    「stockzero 名单:T1」恒出现,断言 'T1' in out 就是空断言(变异实测:
+    把 store 过滤整个删掉照样绿)。断言只认截断行才会出现的片段。
+    """
+    ms, _calls = _scan_wire(monkeypatch, [], sz=(), capped=[
+        {"store": "甲店", "kind": "price", "total": 7000, "kept": 6000},
+        {"store": "乙店", "kind": "price", "total": 9000, "kept": 6000}])
+    out = ms.run({"preview": "1", "store": "甲店"})
+    assert "7000→6000" in out and "9000→6000" not in out
+
+
+def test_scan_avoids_absent_stores_and_shields_their_rows(monkeypatch):
+    """缺席避让(店级重试标准③):catalog_sync 补试后仍缺席的店,本轮
+    ①不产任何意图(拿陈旧现值算差异会误伤 —— 38 条 not found 的老账);
+    ②首行点名(链通知只发首行);③它挂着的 suggested 行不许被撤
+    (缺席 ≠ 恢复正常,withdraw 走 exclude_stores)。"""
+    intents = [
+        {"store": "缺席店", "sku": "A", "kind": "price", "old": 9.9, "new": 11.0},
+        {"store": "正常店", "sku": "B", "kind": "price", "old": 9.9, "new": 11.0}]
+    ms, calls = _scan_wire(monkeypatch, intents, absent=["缺席店"])
+    out = ms.run({})
+    first = out.splitlines()[0]
+    assert "⚠ 缺席避让 1 店:缺席店" in first and "1 条意图不产出" in first
+    assert [r["store"] for r in calls["suggest"]] == ["正常店"]   # ①
+    _src, keep, _store, excl = calls["withdraw"][0]
+    assert keep == [("正常店", "B", "price")]
+    assert excl == ["缺席店"]                                     # ③
+
+
+def test_scan_keeps_deferred_rows_out_of_withdraw(monkeypatch):
+    """被配额截掉 ≠ 不再建议:落榜行的旧 suggested 行不许被 withdraw_stale
+    撤成「商品自己恢复正常了」—— 错误取证,且下轮扫描又原样重建。"""
+    intents = [{"store": "T1", "sku": "A", "kind": "price",
+                "old": 9.9, "new": 11.0}]
+    ms, calls = _scan_wire(monkeypatch, intents, capped=[
+        {"store": "T1", "kind": "price", "total": 3, "kept": 1,
+         "deferred_keys": [("T1", "B", "price"), ("T1", "C", "price")]}])
+    ms.run({})
+    _src, keep, _store, _excl = calls["withdraw"][0]
+    assert ("T1", "A", "price") in keep          # 入选的照常在
+    assert ("T1", "B", "price") in keep and ("T1", "C", "price") in keep
+
+
 # ── 执行件(maintenance)────────────────────────────────────────────────────
 
 def _disp(it, i):
@@ -468,23 +810,36 @@ def _disp(it, i):
     return {"id": 100 + i, **mi.to_disposition(it)}
 
 
-def _wire(monkeypatch, intents, stores=(STORE,)):
+def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
-             "marked": [], "settled": 0}
+             "marked": [], "marked_by": set(), "settled": 0,
+             "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
+    # 打 stale_stores 这一层:执行件调的 stale_or_note 是它的降级外壳,
+    # 探测正常时 note 为空串(降级那条路由 store_absence 自己的用例钉)
+    monkeypatch.setattr(mw.store_absence, "stale_stores",
+                        lambda conn, **k: list(absent))
+    # 失败店串行补试每店前有 _client.backoff(0) 抖动等待:用例只钉行为,
+    # 不必真等(与 tests/test_store_retry_standard 同款)
+    monkeypatch.setattr(mw.store_retry.time, "sleep", lambda s: None)
     monkeypatch.setattr(mw.dispositions, "claim",
-                        lambda conn, sources=None: [_disp(it, i)
+                        lambda conn, actions=None: [_disp(it, i)
                                                     for i, it in enumerate(intents)])
     monkeypatch.setattr(mw.dispositions, "settle",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("maintenance 不该落定破坏类"
+                                           "——归 problem_product_cleanup")))
+    monkeypatch.setattr(mw.dispositions, "settle_maintenance",
                         lambda conn: (calls.__setitem__("settled",
                                                         calls["settled"] + 1),
                                       {"confirmed": 0, "ineffective": 0})[1])
-    monkeypatch.setattr(mw.dispositions, "settle_maintenance",
-                        lambda conn: {"confirmed": 0, "ineffective": 0})
     monkeypatch.setattr(mw.dispositions, "expire_executing", lambda conn: 0)
+    monkeypatch.setattr(mw.dispositions, "count_suppressed",
+                        lambda conn, actions=None: calls["suppressed"])
     monkeypatch.setattr(mw.dispositions, "mark_executing",
-                        lambda conn, ids, fid: calls["marked"].append(
-                            (list(ids), fid)))
+                        lambda conn, ids, fid, by="": (
+                            calls["marked"].append((list(ids), fid)),
+                            calls["marked_by"].add(by))[0])
     monkeypatch.setattr(mi, "record_submitted", lambda conn, items: len(items))
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
@@ -573,41 +928,138 @@ def test_title_always_feed_and_store_isolation(monkeypatch):
     out = mw.run({"execute": True})
     assert "⚠ T1:提交异常已跳过" in out          # 标题 feed 炸了只跳过 T1
     assert calls["put_inv"] == [("T2", "B", 0)]   # T2 照常(1 条走 PUT)
-    # 炸掉那条也要留痕:动作空、结果写明为什么(否则表里完全看不见)
+    # 炸掉那条也要留痕:动作空、结果写明为什么(否则表里完全看不见)。
+    # 两轮都炸也**只写一行**:补试重跑同店时首轮写过的「未执行」不再写第二遍
     t1 = [r for r in calls["sheet"] if r[0] == "T1"]
     assert len(t1) == 1 and t1[0][_c("action")] == ""
     assert t1[0][_c("result")] == "未执行(提交异常)"
 
 
-def test_delete_kind_routes_to_delete_item_and_lands_events(monkeypatch):
-    """删除走 DELETE_ITEM;只有 submitted 落病历(dedup 记了是幽灵事件)。"""
-    intents = [{"store": "T1", "sku": s, "kind": "delete", "old": "在线",
-                "new": "删除", "code": "variant_offset",
-                "reason": "采集永久偏移(拿不到新数据)",
-                "label": "删除(variant_offset)", "batches": 1}
-               for s in ("B0A", "B0B", "B0C")]
-    calls = _wire(monkeypatch, intents)
-    events = []
-    monkeypatch.setattr(mw, "_record_deletes",
-                        lambda store, rows, fid: events.append(
-                            (store, [r["sku"] for r in rows], fid)))
-    monkeypatch.setattr(feeds, "submit_feed",
-                        lambda store, ft, entries, workflow="": [
-                            {"feed_id": "F1", "count": 2, "outcome": "submitted"},
-                            {"feed_id": "OLD", "count": 1, "outcome": "dedup"}])
+def test_failed_store_is_retried_serially_once(monkeypatch):
+    """店级重试标准①(所有者定稿 2026-08-26):跨店跑完之后失败店**串行补试
+    一遍**。所有者原话「某个店当时有问题,最后补一次」—— 此前本文件把这句
+    写在并发段的注释里,补一次的代码却没有(只 diagnose 一句「下轮重试」)。
+
+    补试跑的是第一轮同一个 _one_store(单一落地路径):重提由 feeds 的
+    payload_key 在途防重看护,首轮已发出去的片不会重复提交。
+    """
+    calls = _wire(monkeypatch, _zero(11))       # >10 → 走 feed
+    seen = {"n": 0}
+
+    def flaky_then_ok(store, ft, entries, *, workflow=""):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise ConnectionError("proxy down")
+        calls["feeds"].append((store["name"], ft, len(entries)))
+        return [{"feed_id": "F2", "count": len(entries), "outcome": "submitted"}]
+
+    monkeypatch.setattr(feeds, "submit_feed", flaky_then_ok)
     out = mw.run({"execute": True})
-    assert events == [("T1", ["B0A", "B0B"], "F1")]
-    assert "删除 feed 提交 2" in out
-    # 维护记录三行都出(dedup 挂旧 feedid 照样能被反哺器落定)
-    assert [r[1] for r in calls["sheet"]] == ["B0A", "B0B", "B0C"]
-    # 建议列恒是 scan 定的;动作列前两条是"删除",第三条在途防重是"跳过"
-    assert all(r[_c("suggestion")] == "删除(variant_offset)"
-               for r in calls["sheet"])
-    # 动作列只说做了什么(删除/跳过),原因码归「建议」与「原因」两列
-    assert [r[_c("action")] for r in calls["sheet"]] == ["删除", "删除", "跳过"]
-    assert calls["sheet"][2][_c("result")] == "在途防重"
-    # 只有 submitted 才转 executing:dedup 什么都没提交
-    assert calls["marked"] == [([100, 101], "F1")]
+    assert seen["n"] == 2                       # 补一次即止,不是无限重试
+    assert calls["feeds"] == [("T1", "inventory", 11)]
+    assert calls["marked"] == [(list(range(100, 111)), "F2")]
+    assert "缺席" not in out                     # 救回来了就不点名
+    # 首轮的「未执行」行既不撤也不重写,补试成功的另起一行:
+    # 两行连起来正是这家店这一轮的经过
+    got = [(r[_c("action")], r[_c("result")]) for r in calls["sheet"]]
+    assert got.count(("", "未执行(提交异常)")) == 11
+    assert got.count(("库存", "处理中")) == 11
+    # 补试必须见人:摘要行每轮重置,首轮那句「⚠ 提交异常已跳过」被覆盖了,
+    # 而上面那 11 行「未执行(提交异常)」还留在维护记录表上 —— 摘要不说
+    # 一句,表上那几行就成了没出处的孤证(§六:兜底触发不许静默)
+    assert "店级补试 1 店(串行):T1,救回 1,仍失败 0" in out
+
+
+def test_put_route_second_pass_reuses_the_same_absolute_write(monkeypatch):
+    """小批量走 PUT 路由,**不进 feed 台账、没有在途防重**(api/prices 与
+    api/inventory 头注:「不产生 feed_id 不进 feed 台账」)—— 补试因此会把
+    首轮已成功的那几条再赋值一遍。
+
+    这仍然安全,但依据与 feed 路由**不是同一条**:两个端点都是绝对赋值
+    (quantity.amount / currentPrice.amount),重设同一个值终态不变;
+    CLAUDE.md「写操作永不自动兜底」禁的是*换方法*重试,补试走的还是这条路由。
+    钉住两件事:① 补试不许改走 feed(换方法 = 重复提交制造机);
+    ② 重发的值必须与首轮一模一样(绝对赋值,不是增量)。
+    """
+    calls = _wire(monkeypatch, _zero(3))         # ≤10 → 走 PUT
+    seen = {"n": 0}
+
+    def flaky(store, sku, qty):
+        seen["n"] += 1
+        calls["put_inv"].append((store["name"], sku, qty))
+        if sku == "S2" and seen["n"] <= 3:       # 首轮最后一条炸
+            raise ConnectionError("proxy down")
+        return True, ""
+
+    monkeypatch.setattr(inv_api, "put_inventory", flaky)
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0), ("T1", "S2", 0),
+                                ("T1", "S0", 0), ("T1", "S1", 0), ("T1", "S2", 0)]
+    assert calls["feeds"] == []                  # ① 没有偷偷改走 feed
+    assert "店级补试 1 店(串行):T1,救回 1,仍失败 0" in out
+    assert "缺席" not in out
+
+
+def test_store_that_fails_twice_is_named_in_the_first_line(monkeypatch):
+    """标准②③:补试仍失败**不炸整轮**,但必须点名在摘要**首行** ——
+    链通知对成功步骤只发首行(cli.first_line_of),写在后面等于只写进日志。
+    归类词唯一出处 store_retry.diagnose;尾句是本件的处置(领取只读,
+    没提交出去的建议行还是 suggested,下轮照样领得到)。"""
+    calls = _wire(monkeypatch, _zero(11))
+    monkeypatch.setattr(feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ConnectionError("proxy down")))
+    out = mw.run({"execute": True})
+    first = out.splitlines()[0]
+    assert "⚠ 缺席 1 店:T1(其他)" in first
+    assert "已串行补试仍失败" in first
+    assert "本轮不炸链(存量建议保留,下轮重试)" in first
+    assert calls["marked"] == []                # 一条都没提交出去
+
+
+def test_credential_death_is_never_retried(monkeypatch):
+    """凭证失效不补试(标准①):凭证死是确定性的,重试只会再死一次。
+    它也不进缺席点名 —— 那是「今天没轮到」,凭证死是「去修凭证表」。"""
+    from api import _client as client_api
+    calls = _wire(monkeypatch, _zero(11))
+    seen = {"n": 0}
+
+    def dead(store, ft, entries, *, workflow=""):
+        seen["n"] += 1
+        raise client_api.StoreDeadError("T1", 401)
+
+    monkeypatch.setattr(feeds, "submit_feed", dead)
+    out = mw.run({"execute": True})
+    assert seen["n"] == 1                       # 只试一次
+    assert "T1:凭证失效跳过" in out and "缺席" not in out
+    assert all(r[_c("result")] == "未执行(凭证失效)" for r in calls["sheet"])
+
+
+def test_maintenance_no_longer_deletes_anything(monkeypatch):
+    """删除的唯一出口是 problem_product_cleanup(所有者定稿 2026-08-24)。
+
+    两个执行件都能发 DELETE_ITEM 的时候,配额、在途防重、病历口径各有一套,
+    同一个 SKU 被两条链先后删两次是生产实证过的。这里钉三件事:
+      ① 维护链的领取集不含 delete/retire;
+      ② 真有一条删除行混进来(领取集写错),分桶直接抛,不会静默删掉;
+      ③ 本文件不再产出任何 DELETE_ITEM 载荷。
+    """
+    import inspect
+
+    import pytest
+
+    from services import dispositions as ds
+
+    assert set(mw._KIND_ORDER) == set(ds.MAINT_ACTIONS)
+    assert "delete" not in mw._KIND_ORDER and "retire" not in mw._KIND_ORDER
+    # ② 分桶件 2026-08-27 上移 services.dispositions:按本执行件的接线
+    #   (key='kind' × _KIND_ORDER)喂一条删除行,照样宁炸不吞
+    assert 'key="kind", order=_KIND_ORDER' in inspect.getsource(mw.run)
+    with pytest.raises(ValueError, match="未知 kind"):
+        ds.group_by_store([{"store": "T1", "sku": "B0A", "kind": "delete"}],
+                          key="kind", order=mw._KIND_ORDER,
+                          id_field="disposition_id")
+    assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
 
 
 def test_unexecuted_suggestions_still_get_a_row(monkeypatch):
@@ -651,14 +1103,19 @@ def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
     conn.cursor_value = {"next_row": 3, "unresolved_from": 3}
     _fake_db(monkeypatch, conn)
     # 表里已有 (F1,B0A) 那一行,只该补 B0B
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values",
-                        lambda sheet, rng: [
-                            _sheet_row("T1", "B0A", "价格", "", "", "F1",
-                                       "2026-08-09", "成功")])
+    asked = []
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            [(2, _sheet_row("T1", "B0A", "价格", "", "", "F1",
+                            "2026-08-09", "成功"))])[1])
     appended = []
     monkeypatch.setattr(maint_sheet, "append_records",
                         lambda rows: (appended.extend(rows), len(rows))[1])
     out = maint_sheet.resync_from_ledger()
+    # 存量识别走标准读通道,读的是整行宽(_span,不写死字母)的 [2, next_row) 区间
+    assert asked == [(*maint_sheet._span(), 2, 2)]
     assert "补写 1 行" in out
     assert appended[0][_c("sku")] == "B0B" and appended[0][_c("action")] == "库存"
     assert appended[0][_c("feed_id")] == "F2"
@@ -677,10 +1134,14 @@ def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
     conn.cursor_value = {"next_row": 4, "unresolved_from": 2}
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
-        _sheet_row("T1", "B0OLD", "价格", "", "", "F1", "2026-08-01", "处理中"),
-        _sheet_row("T1", "B0NEW", "价格", "", "", "F2", "2026-08-09", "处理中"),
-    ])
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: [
+            (2, _sheet_row("T1", "B0OLD", "价格", "", "", "F1",
+                           "2026-08-01", "处理中")),
+            (3, _sheet_row("T1", "B0NEW", "价格", "", "", "F2",
+                           "2026-08-09", "处理中")),
+        ])
     monkeypatch.setattr(feed_track, "item_results", lambda fid: {"B0NEW": ("submitted", "")})
     monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
     written = []
@@ -707,7 +1168,7 @@ def test_prune_keeps_recent_days_only(monkeypatch):
     # ⚠ 行必须按**真实的 11 列**给(店铺 SKU 建议 原因 动作 旧值 新值 feedid
     #   日期 结果 报错)。此前这里喂的是 9 列、日期在下标 6 —— 正好和 prune 里
     #   写死的 cells[6] 对齐,于是测试替 bug 背了书。
-    monkeypatch.setattr(maint_sheet.feishu, "sheet_values", lambda sheet, rng: [
+    grid = [
         ["T1", "B0OLD", "价格", "涨价", "价格", "10", "12.5", "F1",
          "2026-07-01", "成功", ""],
         ["T1", "B0KEEP", "价格", "涨价", "价格", "10", "12.5", "F2",
@@ -717,11 +1178,20 @@ def test_prune_keeps_recent_days_only(monkeypatch):
         # 读错列的那版会拿新值当日期,把这行当"早于保留期"删掉。
         ["T1", "B0TRAP", "标题", "标题不符", "标题", "旧标题", "2026-07-01",
          "F4", "2026-08-08", "成功", ""],
-    ])
+    ]
+    asked = []
+    monkeypatch.setattr(
+        maint_sheet.feishu, "sheet_values_rows",
+        lambda sheet, c1, c2, rf, rt, **kw: (
+            asked.append((c1, c2, rf, rt)),
+            list(enumerate(grid, start=rf)))[1])
     rewritten = []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_overwrite",
                         lambda sheet, rows: (rewritten.extend(rows), len(rows))[1])
     out = maint_sheet.prune(7)
+    # 裁剪的整表读也走标准读通道:整行宽(_span,不写死字母)× [2, next_row) 区间。
+    # 从第 1 行读起会把表头当数据行重写进去,少读一列会静默截掉结果/报错
+    assert asked == [(*maint_sheet._span(), 2, 5)]
     assert "删 1 行" in out and "留 3 行" in out
     assert [r[1] for r in rewritten] == ["SKU", "B0KEEP", "B0NODATE", "B0TRAP"]
     # 整表重写不许把行截短:结果/报错(J/K)是最后两列,截到 9 列就没了
@@ -772,7 +1242,9 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
         _sheet_row("T1", "S4", "库存", "7", "0", "F2", today, "处理中"),
     ]
     writes = []
-    monkeypatch.setattr(feishu, "sheet_values", lambda s, rng: sheet_rows)
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, rf, rt, **kw:
+                        list(enumerate(sheet_rows, start=rf)))
     monkeypatch.setattr(feishu, "sheet_write_ranges",
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"S1": ("success", ""), "S2": ("failed", "ERR_P")},
@@ -789,6 +1261,74 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     # 水位推进到第一个未落定行(第 5 行的 F2):unresolved_from=5
     saved = [a for s, a in conn.sqls if "INSERT INTO ops.cursors" in s]
     assert saved and '"unresolved_from": 5' in saved[-1][1]
+
+
+def test_big_backlog_is_read_in_blocks_and_cleared_in_one_round(monkeypatch):
+    """积压再大也**当轮清完**:分块读 + 行号对齐 + 水位一次推到底。
+
+    2026-08-27 生产事故:反哺器把 [unresolved_from, next_row) 整段一把裸读,
+    表长起来后撞飞书单响应 10MB 上限(90221 data exceeded)—— 读一次炸一次,
+    水位一步不推,积压每轮重读、越读越大,**自己好不了**。换标准读通道
+    (feishu.sheet_values_rows:行方向分块 + 90221 对半兜底)之后,一次
+    feed_poll 就必须把整段扫完、全部回填、水位推到区间末尾;这里刻意跑真
+    通道(只桩掉最底下的 _values_raw),分块循环本身也在射程内。
+
+    ⚠ 顺带钉行号:飞书只裁**范围尾部**的空行,中段空行仍占位。分块之后
+    每块各自被裁一次,`区间起点 + enumerate` 那种手算会从被裁的那一块起
+    整段错位 —— 回填写到别人的行上,而且两边都不报错。
+    """
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    lo, hi = 2, 50_002                  # 5 万行级积压(一天几千行,攒几天就这个量)
+    conn = _Conn()
+    conn.cursor_value = {"next_row": hi, "unresolved_from": lo}
+    _fake_db(monkeypatch, conn)
+    today = maint_sheet._today().isoformat()
+    block = feishu._SHEET_READ_BLOCK_ROWS
+    holes = {lo + block - 2, lo + block - 1}    # 首块最后两行是空的,会被飞书裁掉
+    first_after_hole = lo + block               # 第二块的首行:错位就写到 holes 上
+    rows = {r: _sheet_row("T1", f"S{r}", "库存", "5", "0", "F1", today, "处理中")
+            for r in range(lo, hi) if r not in holes}
+
+    asked = []
+
+    def fake_raw(sheet, rng):
+        head, tail = rng.split(":")
+        rf, rt = int(head[1:]), int(tail[1:])
+        asked.append((rf, rt))
+        got = [rows.get(r, []) for r in range(rf, rt + 1)]
+        while got and not got[-1]:      # 只裁范围尾部;中段空行返回空列表占位
+            got.pop()
+        return got
+
+    monkeypatch.setattr(feishu, "_values_raw", fake_raw)
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    # 错位那版会把第二块首行的结果写到 holes 里的空行上,所以它必须可分辨
+    results = {f"S{r}": ("success", "") for r in rows}
+    results[f"S{first_after_hole}"] = ("failed", "ERR_X")
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: results)
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+
+    out = maint_sheet.sync_from_ledger()
+
+    # ① 整段在**这一次调用里**读完:按 4750 行/块切,块首块尾都对得上
+    assert len(asked) == -(-(hi - lo) // block)
+    assert asked[0] == (lo, lo + block - 1) and asked[-1][1] == hi - 1
+    assert asked == sorted(asked)               # 没有回头重读,没有漏块
+    # ② 行号对齐:被裁掉的两行没人写,第二块首行落在自己的行上
+    _R, _E = maint_sheet._col("result"), maint_sheet._col("error")
+    w = {rng: vals[0] for rng, vals in writes}
+    assert w[f"{_R}{first_after_hole}:{_E}{first_after_hole}"] == ["失败", "ERR_X"]
+    assert all(f"{_R}{r}:{_E}{r}" not in w for r in holes)
+    assert w[f"{_R}{hi - 1}:{_E}{hi - 1}"] == ["成功", ""]     # 末块末行也回填了
+    # ③ 一轮清完:积压全部回填,水位推到区间末尾,不留给下一轮
+    assert len(writes) == (hi - lo) - len(holes)
+    assert f"维护记录回填 {(hi - lo) - len(holes)} 行(扫描区间 {lo}~{hi - 1})" == out
+    saved = [a for s, a in conn.sqls if "INSERT INTO ops.cursors" in s]
+    assert saved and f'"unresolved_from": {hi}' in saved[-1][1]
 
 
 def test_price_intents_include_shipping_and_skip_when_missing(monkeypatch):
@@ -927,20 +1467,35 @@ def test_expire_executing_unblocks_the_partial_unique_index():
     assert "delete" not in ds.MAINT_ACTIONS
 
 
-def test_two_chains_claim_disjoint_sources():
-    """⚠ 两条链共用一张建议表:不限来源就会领到对方的建议行。"""
+def test_two_chains_claim_disjoint_actions():
+    """⚠ 两条链共用一张建议表,按**动作**分工领取(2026-08-24 改)。
+
+    旧口径按 source 领。后果 08-19 生产实见:一条 (店铺,SKU,delete) 被维护链
+    先建议(source='maint')、审核链后覆写 reason,那行仍归维护链执行 —— 表里
+    写着维护链的「建议」、问题链的「原因」,谁也说不清是哪条链干的。
+    source 回答"为什么建议",action 回答"该谁干",不能互相顶替。
+    """
     import inspect
 
     from services import dispositions as ds
     from workflows import problem_product_cleanup as ppc
 
-    assert set(ds.PROBLEM_SOURCES) & set(ds.MAINT_SOURCES) == set()
-    assert "dispositions.PROBLEM_SOURCES" in inspect.getsource(ppc.run)
-    assert "dispositions.MAINT_SOURCES" in inspect.getsource(mw.run)
-    # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)
+    assert set(ds.PROBLEM_ACTIONS) & set(ds.MAINT_ACTIONS) == set()
+    assert set(ds.PROBLEM_ACTIONS) | set(ds.MAINT_ACTIONS) == set(ds.ACTIONS)
+    assert "dispositions.PROBLEM_ACTIONS" in inspect.getsource(ppc.run)
+    assert "dispositions.MAINT_ACTIONS" in inspect.getsource(mw.run)
+    # 破坏动作只有一个出口:maintenance 不再发任何删除 feed
+    assert "delete" in ds.PROBLEM_ACTIONS and "delete" not in ds.MAINT_ACTIONS
+    assert "DELETE_ITEM" not in inspect.getsource(mw._submit_kind)
+    # 维护链的动作若落进问题商品链的分桶,那边会直接抛(宁炸不吞)。
+    # 分桶件 2026-08-27 上移 services.dispositions:按问题链的接线喂
+    # (key='action' × _ACTION_ORDER),判据一字未改
     import pytest
-    with pytest.raises(ValueError):
-        ppc.group_by_store([{"id": 1, "store": "T1", "sku": "S", "action": "price"}])
+    assert 'key="action"' in inspect.getsource(ppc.run)
+    with pytest.raises(ValueError, match="未知 action"):
+        ds.group_by_store([{"id": 1, "store": "T1", "sku": "S",
+                            "action": "price"}],
+                          key="action", order=ppc._ACTION_ORDER, id_field="id")
 
 
 # ── product_refresh 的 wait(工作项 A;产品线一条链跑完的前提)────────────────
@@ -1103,3 +1658,168 @@ def test_summary_order_does_not_depend_on_which_store_finishes_first():
     src = inspect.getsource(mw.run)
     merge = src[src.index("as_completed"):]
     assert "per_store" in merge and "for name, _ in todo" in merge
+
+
+def test_title_mismatch_delete_is_paused_but_rows_stay_maintained(monkeypatch):
+    """2026-08-19 所有者停闸「删除(title_mismatch)」;2026-08-20 所有者定停闸
+    期口径:「删除(title_mismatch)已停闸,那么就要对这批行同时改价改标题改库存」。
+
+    闸只关**删除**这一个出口:not_found 的删除照发;被压下来的低相似度行
+    不是被冻结,而是与其余在架行同口径地改价/改标题/改库存。头一版顺手冻结
+    了它们(三类维护也一并停),那是最坏的一种状态 —— 两百多条在架商品挂着
+    错价错标题过夜,日志只说一句"压制 N 条"。
+    恢复 = TITLE_MISMATCH_DELETE 改回 True,整段行为回到停闸前(下面钉住)。
+    """
+    assert mi.TITLE_MISMATCH_DELETE is False        # 停闸是当前现状
+    rows = [_row(sku="B0MISMATCH", name="Walmart Title AAA", wm_price=20.0,
+                 amz_price=20.0, avail_qty=10, stock_count=7,
+                 slow={"title": "Totally Different ZZZ"}),
+            _row(sku="B0GONE2", outcome="not_found",
+                 name="X", slow={"title": "X"})]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    out = mi.delete_intents(_Conn(rows=[]))
+    got = {i["sku"]: i["code"] for i in out}
+    assert "B0MISMATCH" not in got                  # 停闸:不出删除建议
+    assert got.get("B0GONE2") == "not_found"        # 别的删除原因不受影响
+
+    # 停闸 = 先别删,**不是**先别管:三类维护照常产出(所有者 2026-08-20)
+    assert {i["sku"]: i["new"]
+            for i in mi.price_intents(_Conn(), _MULTS, [])} \
+        .get("B0MISMATCH") == 40.0                          # 落地价 20×200%
+    assert {i["sku"]: i["new"]
+            for i in mi.inventory_intents(_Conn(), [])} \
+        .get("B0MISMATCH") == 7                             # 跟 amz 库存
+    titled = {i["sku"]: i for i in mi.title_intents(_Conn(), [])}
+    assert titled["B0MISMATCH"]["new"] == "Totally Different ZZZ"
+    # 原因码与常规同步分开:飞书「原因」列要数得出停闸期照改了多少行
+    assert titled["B0MISMATCH"]["code"] == "title_mismatch_sync"
+
+    monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)
+    out2 = mi.delete_intents(_Conn(rows=[]))
+    assert {i["sku"]: i["code"] for i in out2}.get("B0MISMATCH") \
+        == "title_mismatch"                          # 恢复开关即回到旧行为
+    # 恢复后这批行重新交给删除链:不改价、不改标题(停闸前的防呆)
+    assert mi.classify(title_similarity=0.42)[:2] == ("delete", "title_mismatch")
+    assert [i for i in mi.price_intents(_Conn(), _MULTS, [])
+            if i["sku"] == "B0MISMATCH"] == []
+    assert [i for i in mi.title_intents(_Conn(), [])
+            if i["sku"] == "B0MISMATCH"] == []
+
+
+# ── 双基准标题相似度(2026-08-19 所有者定稿:亚马逊标题拆两段之后)──────────
+
+_LONG = "River Dream Waffle Shower Curtain with Liner Graphite Grey 71x74"
+_SUB = "Snap-in Liner Heavy Duty Hotel Grade Mesh Top Window Standard Size"
+_SLOW_SPLIT = {"title": f"{_LONG} | {_SUB}", "subtitle": _SUB, "brand": None}
+
+
+def test_main_processed_title_exact_removesuffix():
+    """主标题 = 精确剥掉 " | "+subtitle 尾段;不按 "|" 猜切。
+
+    改版前老记录(subtitle 空、title 是拼好的长串)返回 "" —— 拆不出就说
+    拆不出,不猜(契约明令禁止按分隔符切,正文本来就可能含 |)。
+    """
+    assert mi.main_processed_title(_SLOW_SPLIT).startswith("River Dream")
+    assert _SUB.split()[0] not in mi.main_processed_title(_SLOW_SPLIT)
+    assert mi.main_processed_title(
+        {"title": f"{_LONG} | {_SUB}", "subtitle": None}) == ""   # 老记录不猜
+    assert mi.main_processed_title(
+        {"title": "尾巴对不上 | X", "subtitle": "Y"}) == ""       # 结尾不匹配
+    assert mi.main_processed_title(None) == ""
+
+
+def test_title_sim_dual_takes_the_better_basis():
+    """双基准取 max:在架标题=主标题(在架的短标题存量行)时,
+    单基准 ~0.6 会误判"不是同一个商品",双基准 = 1.0。"""
+    wm = mi.processed_title({"title": _LONG, "brand": None})    # 短标题在架
+    single = mi.order_audit.title_similarity(wm, mi.processed_title(_SLOW_SPLIT))
+    assert single is not None and single < mi.TITLE_SIM_FLOOR   # 单基准会误杀
+    dual = mi.title_sim_dual(wm, _SLOW_SPLIT)
+    assert dual is not None and dual > 0.99                     # 双基准救回
+
+
+def test_short_title_row_survives_delete_and_retitle(monkeypatch):
+    """在架的短标题存量行:①删除判据(即使停闸恢复后)不再命中
+    title_mismatch;②改标题 provider 不把它改回长标题(这批行当初就是长标题
+    被内容审查拒了才换的短标题,改回去 = 自找再拒一遍);③库存/改价
+    provider 也认双基准。
+
+    ⚠ 造出这批行的「内容拒捞回」通道已于 2026-08-23 撤除,**但行还在线**,
+    所以这三条防线一条都不能跟着撤 —— 撤了就是维护链自己把它们删掉/改坏。
+
+    ③ 是 2026-08-20 补的:库存链此前拿**单基准**相似度问 classify,短标题行
+    在它眼里 ~0.6 = 该删,于是不产库存意图;而删除链用双基准不删它 ——
+    这批行既不清零也不删除,悄悄脱管而两边都不报错。四个 provider 问同一个
+    判据,就必须喂同样的数。
+    """
+    monkeypatch.setattr(mi, "TITLE_MISMATCH_DELETE", True)      # 按停闸恢复后验
+    wm = mi.processed_title({"title": _LONG, "brand": None})
+    rows = [_row(sku="B0SHORT", name=wm, slow=_SLOW_SPLIT)]
+    monkeypatch.setattr(mi, "_rows", lambda conn, sz: rows)
+    dels = mi.delete_intents(_Conn(rows=[]))
+    assert [d for d in dels if d["sku"] == "B0SHORT"] == []     # ① 不删
+    titles = mi.title_intents(_Conn(rows=[]))
+    assert [t for t in titles if t["sku"] == "B0SHORT"] == []   # ② 不改回长
+    invs = mi.inventory_intents(_Conn(rows=[]), [])
+    assert [i["new"] for i in invs if i["sku"] == "B0SHORT"] == [7]  # ③ 照常跟库存
+    prices = mi.price_intents(_Conn(rows=[]), _MULTS, [])
+    assert [p["sku"] for p in prices] == ["B0SHORT"]                 # ③ 照常改价
+
+
+# ── 维护记录追加:起点先验空(2026-08-27 找空行归一到 blacklist_sheet 后补钉)──
+
+def test_append_records_starts_at_the_first_truly_empty_row(monkeypatch):
+    """水位漂了也不许覆盖已有流水:起点必须**先验空**再写。
+
+    这是 append_records 唯一的防覆盖手段(流水账只追加、程序是唯一写入方),
+    而 2026-08-27 把找空行换成 services/blacklist_sheet.next_empty 之后,这一跳
+    跨了模块 —— 传错东西(比如传 `.require()` 的产物而不是登记条目)在生产上
+    才炸。两边共用 api.feishu 同一个模块对象,所以这里 patch 一次就盖住两边。
+    """
+    monkeypatch.setattr(resources, "MAINT_SHEET",
+                        Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                                    columns=resources.MAINT_SHEET.columns))
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 5, "unresolved_from": 2}
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_row_count", lambda s: 100)
+    # 水位说第 5 行,可 5/6 两行还有流水(裁剪后行号整体上移就是这样)⇒ 真空行在 7
+    # (next_empty 扫的是 A 单列的固定小范围,走 sheet_values_small,不是大范围读通道)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_values_small",
+                        lambda sheet, rng: [["x"], ["y"]])
+    ensured, written = [], []
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_ensure_rows",
+                        lambda sheet, n: ensured.append(n))
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges",
+                        lambda sheet, ups: written.extend(ups))
+    row = maint_sheet.build_row("T1", "B0A", "改价", "", "price", "F1",
+                                "2026-08-27", "处理中")
+
+    assert maint_sheet.append_records([row]) == 1
+    assert written[0][0].startswith("A7:")      # 5/6 有数据 → 从 7 起写,不覆盖
+    assert ensured == [8]                       # 网格不够先扩行(next_empty 的返回契约)
+    saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
+    assert '"next_row": 8' in saved[1]          # 水位落到真正写完的下一行
+
+
+def test_append_records_delegates_the_scan_to_the_shared_next_empty(monkeypatch):
+    """找空行**只有一条实现**(blacklist_sheet.next_empty),且传进去的是
+    登记条目本身 —— next_empty 内部还要拿它去 sheet_row_count/sheet_values_small,
+    传 `.require()` 的产物会当场坏掉。谁哪天又在本文件抄回一份,这条会红。
+    """
+    sheet_entry = Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
+                              columns=resources.MAINT_SHEET.columns)
+    monkeypatch.setattr(resources, "MAINT_SHEET", sheet_entry)
+    conn = _Conn()
+    conn.cursor_value = {"next_row": 9, "unresolved_from": 2}
+    _fake_db(monkeypatch, conn)
+    seen = []
+    monkeypatch.setattr(maint_sheet.blacklist_sheet, "next_empty",
+                        lambda sheet, start: (seen.append((sheet, start)), 9)[1])
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_ensure_rows", lambda s, n: None)
+    monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges", lambda s, ups: None)
+    row = maint_sheet.build_row("T1", "B0A", "改价", "", "price", "F1",
+                                "2026-08-27", "处理中")
+
+    maint_sheet.append_records([row])
+    assert seen == [(sheet_entry, 9)]

@@ -1,4 +1,4 @@
-"""店铺准入大类:三列取值 + "空=不限制" 判定(所有者口径 2026-08-15)。"""
+"""店铺准入大类 + 配送限制渠道:取值与"空=不限制"判定(所有者口径 2026-08-15/25)。"""
 
 from services import store_targets as st
 
@@ -14,11 +14,77 @@ def test_allowed_empty_means_unrestricted():
         assert st.allowed(row, None) is True          # 归不到大类也放行
 
 
-def test_allowed_filled_admits_only_listed():
-    row = _cfg(["Home", "Office"])
+def test_allowed_filled_admits_only_the_super_categories_listed():
+    """填了就只准入填的那几个 —— 但**判定在五大品类那一层**(所有者拍 Q1)。
+
+    ⚠ 这是一次**有意的放宽**,不是 bug:店填「Office」= 它做 Hardlines,
+    于是同属 Hardlines 的 Sporting Goods 也收得了。改的理由见 `allowed`
+    的 docstring(按 26 类判会锁死全池 24.2% 的货)。
+    别的品类照旧拒 —— 放宽的是"同品类内",不是"什么都收"。
+    """
+    row = _cfg(["Home", "Office"])                    # Home / Hardlines
     assert st.allowed(row, "Home") is True
     assert st.allowed(row, "Office") is True
-    assert st.allowed(row, "Sporting Goods") is False
+    assert st.allowed(row, "Sporting Goods") is True  # 同属 Hardlines
+    assert st.allowed(row, "Furniture") is True       # 同属 Home
+    assert st.allowed(row, "Animals") is False        # FCHW,没填
+    assert st.allowed(row, "Toys") is False           # ETS,没填
+
+
+def test_a_store_that_filled_other_becomes_the_store_that_takes_other():
+    """★ 2026-08-22 改口径:填「其他」的店 = **专收归不到五品类的货**。
+
+    改之前这三种填法都折成空集 ⇒ 按「填了就只准入填的那几个」判 ⇒ 谁也
+    接不了,一家店被静默废掉 —— 而所有者要的建议列正是「填写 5 大类和其他」,
+    照着填就会踩这个坑。所以出建议之前先让它可填。
+    """
+    for row in (_cfg(["其他"]), _cfg(["Safety & Emergency"]),
+                _cfg(["Everything Else"])):
+        assert st.super_categories_of(row) == {"其他"}
+        assert st.allowed(row, "Safety & Emergency") is True
+        assert st.allowed(row, "Everything Else") is True
+        assert st.allowed(row, "Home") is False          # 五品类的货照旧拒
+
+
+def test_other_store_still_rejects_goods_whose_category_is_unknown():
+    """⚠ **空 ≠ 其他,这条不许合并。**
+
+    「其他」是业务归类(处置:找一家收「其他」的店);大类采不到是数据缺口
+    (处置:补采集)。合并会让填了「其他」的店开始收一批**我们根本不知道
+    是什么**的货,而且 `category_offenders` 那条"不知道不算违规"也会跟着塌。
+    """
+    row = _cfg(["其他"])
+    assert st.allowed(row, None) is False
+    assert st.allowed(row, "") is False
+
+
+def test_unmapped_goods_go_to_no_category_stores_or_to_other_stores():
+    """「不归」的两类能去**没填类目**的店,也能去**明确填了「其他」**的店。
+
+    所有者 2026-08-21 原话是「不归,可以分配给没有确定类目的店」——
+    那是"可以给没填的店",不是"只能给没填的店"(2026-08-22 补开后一条)。
+    """
+    for cat in ("Safety & Emergency", "Everything Else"):
+        assert st.allowed(_cfg([]), cat) is True          # 没填类目的店:收
+        assert st.allowed(_cfg(["其他"]), cat) is True     # 明确填「其他」:收
+        assert st.allowed(_cfg(["Home"]), cat) is False   # 填了别的:一律拒
+
+
+def test_an_unrecognised_literal_folds_into_other_not_into_nothing():
+    """表里写错字(「Hoem」)折进「其他」,而不是被丢掉变成空集。
+
+    两种都不对,但丢掉会**静默废掉一家店**;折进「其他」只是让它收错一批货,
+    而且 `alloc_audit` 会拿 `known_category_literal` 把这个值点名出来。
+    这条测试同时是那条点名的理由 —— 没有点名,这就成了静默改准入。
+    """
+    from registry import resources
+    row = _cfg(["Hoem"])
+    assert st.super_categories_of(row) == {"其他"}
+    assert st.allowed(row, "Home") is False
+    assert resources.known_category_literal("Hoem") is False
+    assert resources.known_category_literal("Home") is True
+    assert resources.known_category_literal("其他") is True
+    assert resources.known_category_literal("Everything Else") is True
 
 
 def test_allowed_restricted_store_rejects_unclassified():
@@ -48,3 +114,90 @@ def test_load_targets_reads_three_category_columns(monkeypatch):
     assert out["A085"]["categories"] == ["Home", "Office"]
     assert out["A107"]["categories"] == []
     assert out["A085"]["max_online"] == 500.0
+
+
+# ── 配送时长:未填回落 7 天(所有者 2026-08-21 统一到上架链)──────────────
+
+def test_unset_lead_limit_falls_back_to_seven_not_unlimited():
+    """⚠ 同一列「配送时长限制」,两条链的"未填"回落方向曾经**相反**。
+
+    上架链 `store_limits.cap_for(caps, store, MAX_LEAD_DAYS)` 未填回落 7;
+    分配这边原本未填就放行一切。所有者 2026-08-21 拍板统一到 7。
+    影响面不小:只要有**一家店**空着这列,`alloc_plan._pool_reach` 的并集
+    就变成"不限",慢货与未知货期全池涌入 —— 而且不报错。
+    """
+    from services import amz_source
+    unset = {"lead_limit": None}
+    assert st.lead_cap_of(unset) == amz_source.MAX_LEAD_DAYS
+    assert st.lead_cap_of({}) == amz_source.MAX_LEAD_DAYS
+    assert st.lead_ok(unset, amz_source.MAX_LEAD_DAYS) is True
+    assert st.lead_ok(unset, amz_source.MAX_LEAD_DAYS + 1) is False
+    # 填了的照旧只认自己填的那个数(可松可严)
+    assert st.lead_ok({"lead_limit": 3}, 5) is False
+    assert st.lead_ok({"lead_limit": 30}, 20) is True
+
+
+def test_unmeasured_lead_is_refused_by_every_store_including_unset_ones():
+    """采不到货期 = 拒收。**现在没有"不限"的店了,所以每一家都拒。**
+
+    拿"没采到"当"够快"是替所有者做了他没做的决定 —— 与类目那条
+    「归不到大类的,受限店拒收」同一纪律。
+    """
+    for row in ({"lead_limit": 5}, {"lead_limit": None}, {}, None):
+        assert st.lead_ok(row, None) is False
+
+
+# ── 配送限制(渠道):四条链共用的唯一谓词 ─────────────────────────────────────
+
+def test_channel_conflict_needs_both_sides_to_be_known():
+    """只有"店标了 ∧ 货确实是另一个已知渠道"才算不符 —— 其余一律不算。
+
+    两个方向写反了都不报错,但后果不同向:
+      · 把"店没标"算成不符 ⇒ 没配置的店整店废掉(上架一件也上不了);
+      · 把"货渠道没采到"算成不符 ⇒ 无辜商品上不了架、在架的先清零再被删。
+    """
+    assert st.channel_conflict("FBA", "FBM") is True
+    assert st.channel_conflict("FBM", "FBA") is True
+    assert st.channel_conflict("FBA", "FBA") is False
+    # 店没标:什么货都行(所有者 2026-08-25「没标就都能上」)
+    for want in (None, "", "  "):
+        assert st.channel_conflict(want, "FBM") is False
+    # 货的渠道未知 / 第三种值:**不猜**(第三种值恒高 = 采集侧 is_fba 坏了)
+    for ch in (None, "", "N/A", "unknown", 0):
+        assert st.channel_conflict("FBA", ch) is False
+
+
+def test_channel_conflict_normalizes_both_sides():
+    """归一收在谓词里:维护侧喂的是 raw->>'is_fba' 原文,上架侧喂的是已归一值。
+
+    两边各 strip().upper() 一遍就是两份口径,迟早只改一处。
+    """
+    assert st.channel_conflict("fba", " fbm ") is True
+    assert st.channel_conflict("fba", "FBA") is False
+    assert st.channel_conflict("FBA", "fba") is False
+
+
+def test_store_channels_only_returns_stores_that_marked_one(monkeypatch):
+    """没标 / 填了认不出的值 ⇒ **不进字典** = 不限制(而不是被当成某个渠道)。"""
+    monkeypatch.setattr(st, "load_targets", lambda: {
+        "T_FBA": {"channel": "FBA", "channel_raw": "fba"},
+        "T_FBM": {"channel": "FBM", "channel_raw": "FBM"},
+        "T_BLANK": {"channel": None, "channel_raw": ""},
+        "T_TYPO": {"channel": None, "channel_raw": "fbaa"},
+    })
+    assert st.store_channels() == {"T_FBA": "FBA", "T_FBM": "FBM"}
+
+
+def test_store_channels_degrades_loudly_when_the_sheet_is_unregistered(caplog):
+    """表未登记 ⇒ 全放行,但**必须出声**:静默兜底会让"闸失效"和"没有不符的行"
+    在摘要里长得一模一样。"""
+    def _boom():
+        raise LookupError("限额表未登记")
+    import logging
+    _orig, st.load_targets = st.load_targets, _boom
+    try:
+        with caplog.at_level(logging.WARNING, logger="services.store_targets"):
+            assert st.store_channels() == {}
+        assert any("全放行" in r.message for r in caplog.records)
+    finally:
+        st.load_targets = _orig

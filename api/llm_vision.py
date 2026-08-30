@@ -147,8 +147,15 @@ def vision_json(images_b64: list[str], *, system_prompt: str, user_prompt: str,
             resp = httpx.post(_endpoint(), json=body, headers=headers,
                               timeout=_TIMEOUT)
             if resp.status_code == 200:
+                payload = resp.json()
+                # token 记账与文本链共用一个累加器(2026-08-21):L4 走的是另一个
+                # 供应商,单价不在 registry.LLM_PRICING 里 ⇒ 摘要只报 token 并
+                # 点名"该模型无计价",不会编一个金额出来
+                from api.llm import record_usage
+                record_usage(body.get("model", ""), "audit_l4",
+                             payload.get("usage"))
                 return _extract_json(
-                    resp.json()["choices"][0]["message"]["content"])
+                    payload["choices"][0]["message"]["content"])
             if resp.status_code in (429, 500, 502, 503, 504):
                 raise RuntimeError(f"视觉 LLM HTTP {resp.status_code}")
             raise ValueError(f"视觉 LLM 请求被拒 HTTP {resp.status_code}: "

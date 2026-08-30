@@ -33,12 +33,14 @@
   四态 28/0/10/9);**L2b 已验**(825 禁售 + 42102 品牌 + ASIN 黑名单
   5.6 万自产回路在库);**L1 跟卖试点后置**(所有者:功能暂时用不上,
   启用前再验)。
-- **运维面(验收后)**:调度挂载(catalog_sync→maintenance→list_new 顺序
-  硬约束;feed_poll 高频)→ 切换清单(**旧 launchd 5 条 + AI skill 链
+- **运维面(验收后)**:调度挂载(**2026-08-17 已挂**:product_chain 13:00 →
+  blacklist 15:00 → audit_sheet 18:10 → list_new 20:00,当天次序硬约束;
+  feed_poll 每 30 分)→ 切换清单(**旧 launchd 5 条 + AI skill 链
   两条调度必须同停**,新旧并跑=重复领号重复上架)→ L4 收尾(历史数据
   迁移批次/upc_audit)。
-- **刻意后置**:变体分组(等采集 variation 三字段提顶层)、update_listed
-  五字段集(归 maintenance)、健康仪表盘。
+- **刻意后置**:update_listed 五字段集(归 maintenance)、健康仪表盘。
+  (变体分组已于 2026-08-15 落地,且**不需要**采集侧把三字段提顶层 ——
+  `services/variant_group` 直接读 `catalog.snapshots.raw`,详见「已知未做」节。)
 
 ## 阶段划分
 
@@ -75,9 +77,10 @@
 1. UPC 池表 6 列定稿(UPC/放入日期|状态/店铺/SKU/上架日期);
 2. 领用状态机照搬旧实证语义,按新架构重写(领→用;回收仅三类,Unknown
    永不回收;冲突/非法前缀永久弃用);
-3. **定价区间定稿**(表格不可见,口述定稿):FBA 区间1=0~30、区间2=30~75;
-   FBM 区间1=15~80、区间2=80~1000;amz 价 × 限额表对应倍率;
-   **重叠/边界向下兼容**(30 美金用 0-30 倍数);出界不上架;
+3. **定价区间定稿**(表格不可见,口述定稿):FBA 区间1=0~30、区间2=**30~1000**
+   (上界 2026-08-21 由 75 抬到 1000,所有者);FBM 区间1=15~80、区间2=80~1000;
+   **落地价**(单价+运费)× 限额表对应倍率;**重叠/边界向下兼容**(30 美金用
+   0-30 倍数);出界按 300% 定价(2026-08-09 改,此前是不上架);
 4. 风控表(类目映射/禁止品牌)仍在维护,**须入 PG**(表格随时会停用);
 5. LLM 映射继续 DeepSeek(key 入 .env);
 6. 产品数据源暂时不可用 → L2c/d 端到端验收顺延,先建地基。
@@ -254,12 +257,26 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 
 #### 已知未做(续做时的清单)
 
-- 多变体分组(依赖采集 `slow.variant`;当前单品口径已够用)
+- ~~多变体分组(依赖采集 `slow.variant`)~~(已过时勘误:2026-08-15 落地
+  `services/variant_group` —— 数据直接读 `catalog.snapshots.raw` 的 parent_asin /
+  variation_asins / variation_attributes,**采集侧零改动**;slow.variant.theme 那段
+  按 ':' 切而实际是 '=',只解析出 0.1% 全是垃圾,已绕开)
 - ~~channel 一律走 FBM~~(已过时勘误:采集侧后来产出 `raw->>'is_fba'`,
   list_new 现行=读 is_fba 分 FBA/FBM 两套区间、**采不到不定价不上架**——
   所有者 2026-08-12 确认现行代码口径为定稿,与 maintenance"未知不猜"同源)
+- [x] **店铺渠道闸**(2026-08-25 所有者定稿:「上架侧也补一下,读取配送限制列,
+  我会在其中标记 fba/fbm,没标就都能上」)。此前上架链只用产品渠道选定价区间,
+  **不看这家店做哪个渠道** —— 渠道硬闸只在分配链有,而 A/B 是人工域(运营可以
+  直接填任意店+ASIN 绕过分配),且分配→上架之间货源渠道会翻转(list_new 按
+  2026-08-19 定稿强制重采一轮再取数)。补法:限额表「配送限制」→
+  `store_targets.store_channels()`,判定走唯一谓词 `channel_conflict`;
+  **没标 = 不限制**(与分配侧"未填不接自由流"相反,照搬会把没配置的店整店废掉)。
+  同批把维护侧接上:货翻成另一个渠道 ⇒ 库存写 0(`channel_mismatch`)⇒
+  连续 N 天卖不了 ⇒ 删除链「渠道不符 N 天」下架,**与缺货同一条阶梯**。
 - `AMZ_IN_STOCK_QTY`:仅在 `stock_count` 采不到时用;**终值=10**(所有者拍板 2026-08-12)
-- [ ] 变体分组:后置(依赖采集 variation 数据)
+- [x] 变体分组:2026-08-15 落地(`variant_group.plan()` 增量归组、组大小上限
+  `MAX_FAMILY=20` 超了退单品口径;`variant_remap` 补维度重映射、`variant_title`
+  做标题差异化;同轮同族多主变体按 ASIN 字母序降级定序)
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 
@@ -297,7 +314,8 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       ——2026-08-12 `sku_locked_heal` 落地(所有者纠正:SKU_LOCKED 不是永久
       跳过;旧实证不先退役换 UPC 重发也失败,legacy_survey.md:1667)。危险
       工作流缺省即真跑(空跑加 `--dry-run`,2026-08-16 口径反转);回执失败标
-      failed 人工处置不自动重试;需每日调度
+      failed 人工处置不自动重试;**未进调度**(手动跑 —— registry/schedule.py:24-26
+      把自愈类明确列进「不在表里的一律手动」,:5 记着它是被移出去的)
 - [x] 状态跟踪:旧 sync_status_track 的"反查真实状态"由 catalog_sync 承接;
       "K=Unknown 自愈"已由 listing_sheet.heal_unknown 落地(2026-08-12,
       feed 台账终态双向 + 目录在线双源,挂 feed_poll 反哺器)
@@ -307,8 +325,11 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 - [ ] upc_audit(全站 UPC 冲突审计,只读)
 - ~~历史数据迁移批次~~(2026-08-12 所有者整批关闭:26 列/UPC 池 12 万行/
       pending_feeds/retry_state 全部不迁;防重拉已死 ASIN 由黑名单承担)
-- [ ] 切换清单:停 launchd 4 条(morning/reconcile_hourly/retire_daily/
-      health_4x)+ scheduled-tasks 的 dedup_sync(前端不迁,此任务作废)
+- [ ] 切换清单:**停旧清单与顺序以 docs/legacy_schedules.md §D 为准** ——
+      launchd 上架 **5 条**(morning/store_status_hourly/reconcile_hourly/
+      health_4x/retire_daily)+ erp_worker×20 + AI skill 07:30
+      erp-online-products-track + 14:02 dedup-sync(dedup 是旧上架栈的去重命脉,
+      **与旧上架栈同停**,erp_worker 还在跑就不能单停,不是「作废」)
 
 ## 确认记录(所有者 2026-08-07)
 

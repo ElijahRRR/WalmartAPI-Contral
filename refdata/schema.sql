@@ -264,6 +264,15 @@ CREATE TABLE IF NOT EXISTS catalog.llm_cache (
     created_at  timestamptz NOT NULL DEFAULT now(),
     last_hit_at timestamptz
 );
+-- 二级复用元数据(2026-08-18 所有者定稿,详见 db_schema.md llm_cache 节):
+-- hash miss 时按 (asin, pt) 反查最近出参,reuse_sig 相等 + 新旧标题规格
+-- token 验证通过才复用。仅 list_new 出参路径写入,其它用途留 NULL。
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS asin      text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS pt        text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS src_title text;
+ALTER TABLE catalog.llm_cache ADD COLUMN IF NOT EXISTS reuse_sig text;
+CREATE INDEX IF NOT EXISTS llm_cache_asin_pt_idx
+    ON catalog.llm_cache (asin, pt) WHERE asin IS NOT NULL;
 
 -- ── 风控库(L2b,2026-08-07 所有者定稿:两张飞书表镜像入 PG,闸门读库
 -- 不读表——表格随时会停用;同步只增改不删,未来产品中心黑名单增量以
@@ -335,6 +344,31 @@ CREATE TABLE IF NOT EXISTS catalog.amazon_cat_blacklist (
     category_raw  text,              -- 飞书原文(调试用)
     synced_at     timestamptz NOT NULL DEFAULT now()
 );
+-- 类目闸判据全部住在这张表(所有者定稿 2026-08-20「代码里面的类目可以拿到
+-- 数据库里来」):原 audit_phase0.FORBIDDEN_AMAZON_TOPS 四个硬编码顶级已迁进来。
+--   match_type='node_subtree' + browse_node_id → **拦整棵子树**(首选)
+--     产品的 catalog.products.browse_node_chain(根→叶 ID 链)里出现该 ID 即拦。
+--     解决两个老毛病:①父级不覆盖子级(名单写 Puzzles 拦不住 3-D Puzzles,
+--     1.18 万条名单里 56% 是为补这个洞逐层枚举的);②名字会漂(名单写
+--     Wall Art,官方树叫 Wall Décor,按名字一条都拦不住)。
+--   match_type='top_name'     → 按顶级类目名(亚马逊顶级 browse node 无 ID)
+--   match_type='path_exact'   → 归一化完整路径等值(飞书镜像的历史行)
+-- source 记来源('feishu' / 'cleanup' / 'seed')。⚠ 2026-08-20 起飞书那张五列
+-- 表是本表的**唯一维护面**(所有者定稿),risk_sync 是**整表镜像**:表里有什么
+-- 库里就是什么,不再按 source 分家——分家会让"飞书里删了库里还在拦"的幽灵长期
+-- 存在。代价:category_blacklist_import 灌的行会被下次同步覆盖,那个工作流从此
+-- 只作首次灌种 / 应急。
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_type text NOT NULL DEFAULT 'path_exact';
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS match_value text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS browse_node_id text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS category_zh text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS reason text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS walmart_policy text;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true;
+ALTER TABLE catalog.amazon_cat_blacklist ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'feishu';
+CREATE INDEX IF NOT EXISTS idx_amzcat_node ON catalog.amazon_cat_blacklist(browse_node_id)
+    WHERE browse_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_amzcat_type ON catalog.amazon_cat_blacklist(match_type) WHERE enabled;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS biz_cn boolean NOT NULL DEFAULT false;
 ALTER TABLE catalog.brand_blacklist ADD COLUMN IF NOT EXISTS pushed_at timestamptz;
@@ -698,7 +732,8 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
 );
 CREATE INDEX IF NOT EXISTS perf_events_store_idx ON orders.perf_events (store, metric, period);
 CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
--- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (store,po_id,metric))
+-- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (po_id,metric))
+--(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键)
 
 -- 影响范围视图:每条违规的存续区间。still_active = 该违规出现在此(店铺,指标)
 -- 最近一次报表周期中,即"仍在拖当前绩效分";消失即代表滚出官方统计窗口——
@@ -1114,9 +1149,41 @@ CREATE TABLE IF NOT EXISTS ops.dispositions (
     settled_at   timestamptz,
     detail       jsonb NOT NULL DEFAULT '{}'
 );
+-- 执行者(2026-08-24):建议按动作分工之后,"这条最终是谁干的"必须在库里有
+-- 答案。此前只能从 source 反推执行件,而 source 是"谁先建议"不是"谁执行"
+-- ——08-19 生产实见一行维护链执行、审核链原因的记录,就是这么来的。
+ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS executed_by text;
+
+-- ── 多来源支撑(2026-08-24 路由器)────────────────────────────────────────
+-- 一条未落定建议可以同时被多条链支撑(同一个 SKU,维护链说"标题对不上该删"、
+-- 审核链说"判拒了还在架该删")。**必须把每个来源各自的依据都留住**:
+--   {"maint": {"action":"delete","code":"title_mismatch","reason":"…","at":…},
+--    "audit": {"action":"delete","code":null,"reason":"审核判拒仍在架:…","at":…}}
+-- 为什么不能只留一个 source 标量(旧形态):
+--   ① 查"当初为什么删它"只看得到后写的那一方(08-19 生产实见);
+--   ② withdraw_stale 每条链只撤自己建的 —— 一行只有一个 source 时,另一条链
+--      既撤不掉它、也不知道自己那条理由还成不成立。
+-- 撤销时只删自己那一格,**全空才 withdrawn**。
+ALTER TABLE ops.dispositions ADD COLUMN IF NOT EXISTS sources jsonb
+    NOT NULL DEFAULT '{}'::jsonb;
+-- 存量行一次性回填(幂等):按旧的标量 source 造出单来源的那一格
+UPDATE ops.dispositions
+SET sources = jsonb_build_object(
+        source, jsonb_build_object('action', action, 'code', category,
+                                   'reason', reason))
+WHERE sources = '{}'::jsonb AND status IN ('suggested', 'executing');
+
 -- 同一 (店铺,SKU,动作) **同时只能有一条未落定的建议**:扫描件每轮重跑要幂等,
 -- 不能每跑一次就堆一行;而已落定(confirmed/ineffective)的行是病历,必须留着,
 -- 所以用**部分**唯一索引只约束未落定态。
+--
+-- ⚠ **动作在键里,不能去掉**(2026-08-24 复核)。所有者提的"破坏组一 SKU 一条"
+-- 会打掉一条现存的有意设计:problem_scan 对**顽固 SKU**(上一轮 delete 观测到
+-- 没生效)同时建议 retire 与 delete —— 停用+删除双 feed 齐发,"能删的删,
+-- 删不掉的至少停用"。两条是两个 feed、两次独立的生效判定,合成一条会让其中
+-- 一个的落定结果覆盖另一个。
+-- 「破坏组存在即压制该 SKU 的维护组」不靠索引实现,靠 dispositions.claim()
+-- ——索引管不了跨行的条件,而且压制必须与两个扫描件谁先跑无关。
 CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     ON ops.dispositions (store, sku, action)
     WHERE status IN ('suggested', 'executing');
@@ -1374,6 +1441,34 @@ CREATE TABLE IF NOT EXISTS audit.walmart_pt_meta (
     raw                  jsonb,
     synced_at            timestamptz DEFAULT now()
 );
+
+-- PT 元数据变更台账(2026-08-21 加):`sync_pt_meta` 每次全量重灌前逐 PT 比对
+-- access_state / zh_can_do / requirements 三列,只把**真的变了**的落进来。
+--
+-- 为什么需要它:飞书类目表一改,R1 准入闸与 R3 认证闸的判据就整批换掉,而
+-- `products.audit_version` 是**仓库侧**的规则版本号,不会因为数据变了而递增。
+-- 于是 `rerule` / `mode=nonpass` 那两条带 `audit_version IS DISTINCT FROM` 的
+-- 通道对数据变更完全无感 —— 所有者 2026-08-21 手改类目表后实遇:全量扫过一遍
+-- 之后两条通道双双报「共 0 个」,没有任何现成路径能重判受影响的存量。
+-- 有了这张台账,`product_audit -p repts=1` 就能按「PT 的判据在我判过之后变过」
+-- 精确取候选,既不依赖版本号,也不需要人记得加开关。
+--
+-- ⚠ 只追加,不清理:它同时是"这个类目什么时候被谁改成什么样"的审计轨迹。
+CREATE TABLE IF NOT EXISTS audit.pt_meta_change_log (
+    id                   bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    walmart_product_type text NOT NULL,
+    change_kind          text NOT NULL,   -- 'added' / 'removed' / 'changed'
+    before_access        text,
+    after_access         text,
+    before_zh            text,
+    after_zh             text,
+    before_req           text,
+    after_req            text,
+    changed_at           timestamptz NOT NULL DEFAULT now()
+);
+-- 取候选的主查询是「某 PT 在某时刻之后变过没有」,复合索引正好覆盖
+CREATE INDEX IF NOT EXISTS pt_meta_change_pt_at_idx
+    ON audit.pt_meta_change_log (walmart_product_type, changed_at DESC);
 
 -- PT 官方 spec 摘要(6942 行;R3a 硬认证字段判定)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照;

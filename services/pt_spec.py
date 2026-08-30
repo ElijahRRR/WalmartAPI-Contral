@@ -15,7 +15,32 @@ from registry import paths
 logger = logging.getLogger("services.pt_spec")
 
 
+_OVERRIDE_DIR: str | None = None      # 换版对账用:指向另一份 spec 目录
+
+
+def use_spec_dir(path: str | None) -> None:
+    """输入:spec 目录(None=恢复默认)→ 输出:无(切换本模块读哪一份 spec)。
+
+    只给**换版对账**用(pt_spec_sync -p spec_dir=<新版目录>):新版 spec 拉下来
+    之后,要先量出"新版加了哪些必填、mapper 给不出哪些",再决定改不改
+    registry 的版本串 —— 切完再发现上架量掉,那是静悄悄掉的
+    (validate 不过就不提交,省 UPC 和配额,设计如此)。
+
+    ⚠ 上架链**不许**用它:feed header 报的 version 取自 registry,与 spec 目录
+    必须同源,两边错开就是拿一个版本的数据去过另一个版本的校验。
+    """
+    global _OVERRIDE_DIR
+    _OVERRIDE_DIR = path
+    clear_caches()
+
+
 def _spec_dir():
+    from pathlib import Path
+    if _OVERRIDE_DIR:
+        d = Path(_OVERRIDE_DIR).expanduser()
+        if not (d / "_pt_index.json").exists():
+            raise FileNotFoundError(f"指定的 spec 目录缺 _pt_index.json:{d}")
+        return d
     d = paths.mp_item_spec_dir()
     if not (d / "_pt_index.json").exists():
         raise FileNotFoundError(

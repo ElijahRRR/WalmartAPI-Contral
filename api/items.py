@@ -381,3 +381,4 @@ def summarize_catalog_item(h: dict) -> dict:
         "lifecycle_status": h.get("lifecycleStatus"),
         "unpublished_reasons": "; ".join(reasons) if isinstance(reasons, list) else reasons,
     }
+

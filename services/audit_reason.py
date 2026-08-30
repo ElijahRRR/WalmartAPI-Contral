@@ -9,13 +9,14 @@
 
   0.  verdict != 'reject'(含 outcome 为 None)          → None(pass/pending 恒为 None)
   1.  hits 中 rule_code ∈ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
+  1.2 hits 含黑名单中心三码(lark_blacklist_asin/seller/amazon_cat)→ **None**
+      (内部黑名单决策,不对应任何 Walmart 政策;2026-08-18 修,此前漏到 4g)
   2.  l3 存在且 l3.verdict=='reject' 且归一化后的 reason_category 非 None → 归一化值
   1.5 hits 中 rule_code ∉ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
   3.  l4 存在且 l4.verdict=='reject' → 第一条 confidence=='high' 的 dict issue:
       issue 文本含 'offensive' → 'Offensive Content',否则 'Intellectual Property'
   4a. hit_codes 含 publication_pt_forbidden                  → 'Intellectual Property'
-  4b. l1 有 excluded 信号 → 对 excluded_category_reason 做子串判断(四组关键词);
-      **四组都不中则不返回,继续往下**(进了分支也可能不出,是易错边界)
+  4b. (已删)L1 excluded 按 reason 推政策 —— 2026-08-20 随 excluded 链下线
   4c. _pt_to_policy(PT, title[:80]) 非 None                  → 该值
   4d. l1 存在且 hit_codes ∩ cert 三码 → 按 walmart_category 子串四选一(必返回)
   4e. hit_codes 含 trademark_live / title_desc_blacklist     → 'Intellectual Property'
@@ -156,8 +157,8 @@ def compute_final_reason(
 
     仅在 verdict='reject' 时有意义;pass/pending(以及 outcome 为 None)恒返回 None。
     完整顺序见模块 docstring —— 注意实现顺序是 0→1→2→1.5→3→4a..4g,
-    **L2/L0 硬规则优先于 L3**(L2 forbidden_mega_cat 已直接对齐 37 条政策的 category_en;
-    L3 常因标题里的知名品牌词把"大类禁售"误判成 IP,让对齐率退化),
+    **L0 硬规则优先于 L3**(phase0_forbidden_category 已直接对齐 37 条政策的
+    category_en;L3 常因标题里的知名品牌词把"大类禁售"误判成 IP,让对齐率退化),
     其余带 walmart_policy 的规则则排在 L3 **之后**(步 1.5)。
     `product` 可为 None(此时步 4c 只按 PT 判)。
     """
@@ -165,9 +166,10 @@ def compute_final_reason(
         return None
 
     # 分 hard/soft hit:
-    #   hard = forbidden_mega_cat / phase0_forbidden_category — 大类禁售精确对齐 Walmart 37 条政策
+    #   hard = phase0_forbidden_category — 大类禁售精确对齐 Walmart 37 条政策
     #   soft = cert / brand / trademark 等 — 只标 L2 有命中, 实际原因要靠 L3 判
-    HARD_RULE_CODES = {'forbidden_mega_cat', 'phase0_forbidden_category'}
+    # ⚠ 2026-08-20:原集合里的 forbidden_mega_cat(L2 R2)已随 R2 删除。
+    HARD_RULE_CODES = {'phase0_forbidden_category'}
 
     # (1) hard 规则 walmart_policy — 最优先
     for h in outcome.all_hits:
@@ -175,6 +177,20 @@ def compute_final_reason(
             policy = (h.detail or {}).get('walmart_policy')
             if policy:
                 return policy
+
+    # (1.2) 黑名单中心三码(ASIN / 卖家 / 亚马逊类目)→ **None,不挂政策**。
+    # 这是我们自己的内部黑名单决策,不对应任何一条 Walmart 政策;此前无分支
+    # 会一路漏到 4g 兜底,F 列写出「ASIN 在黑名单中心 [政策:General-Use
+    # Products]」这种自相矛盾的话(所有者 2026-08-18 实遇,B0F2ZS3M31 一张
+    # 床头柜)。拿兜底政策去申诉口径也是错的 —— 没有政策就是没有政策。
+    # ⚠ 品牌黑名单(phase0_brand_blacklist)不在此列:品牌拉黑多因知产风险,
+    # 4f 归 Intellectual Property 是既定口径,别顺手改。
+    # 这三码都是 Phase0 短路(单 hit 即终局),不会与政策规则同轮并存。
+    _INTERNAL_BLACKLIST = {'phase0_lark_blacklist_asin',
+                           'phase0_lark_blacklist_seller',
+                           'phase0_lark_blacklist_amazon_cat'}
+    if any(h.rule_code in _INTERNAL_BLACKLIST for h in outcome.all_hits):
+        return None
 
     # (2) L3 语义判 (硬规则没给时, L3 最准)
     if outcome.l3 and outcome.l3.verdict == 'reject':
@@ -205,17 +221,10 @@ def compute_final_reason(
     if 'publication_pt_forbidden' in hit_codes:
         return 'Intellectual Property'
 
-    # L1 excluded_category / unmapped_amazon_path — 按 reason 推
-    if outcome.l1 and (outcome.l1.excluded_category_reason or 'excluded_category' in hit_codes):
-        reason = (outcome.l1.excluded_category_reason or '').lower()
-        if '3c' in reason or '电子' in reason or 'electroni' in reason:
-            return 'Electronics & RF'
-        if '服饰' in reason or 'apparel' in reason or 'clothing' in reason:
-            return 'Textiles & Apparel'
-        if '汽配' in reason or 'automotive' in reason:
-            return 'Auto & Motor Vehicles'
-        if '带电' in reason or 'battery' in reason:
-            return 'Hazardous Items'
+    # ⚠ 2026-08-20 删掉「L1 excluded_category 按 reason 推政策」一段:
+    # 那条链(seed yaml 的 3C/服饰/汽配/带电禁售)已整体下线,四组关键词
+    # 再没有输入来源。现在这类产品由 L2 R1 白名单判死,政策走下面的
+    # PT 关键词 / walmart_category 两条兜底。
 
     # PT 关键词兜底 (常用于 cert/禁售没命中大类但 PT 能推)
     pt = outcome.l1.walmart_product_type if outcome.l1 else None
@@ -227,7 +236,7 @@ def compute_final_reason(
     # cat_requires_cert_* 按 walmart_category 推
     if outcome.l1:
         wc = (outcome.l1.walmart_category or '').lower()
-        if {'cat_requires_cert_hard', 'cat_requires_cert_small_part',
+        if {'cat_requires_cert_hard',
             'cat_requires_cert_soft'} & hit_codes:
             if 'baby' in wc or 'children' in wc:
                 return "Children's Products"
@@ -274,18 +283,17 @@ _RULE_CN = {
     "phase0_forbidden_category":      "禁售大类",
     "phase0_brand_blacklist":         "品牌黑名单",
     "phase0_trademark_symbol":        "标题含 ®/™ 商标符号",
+    "phase0_patent_claim":            "文案自述专利保护",
     "phase0_lark_blacklist_asin":     "ASIN 在黑名单中心",
     "phase0_lark_blacklist_seller":   "卖家在黑名单中心",
     "phase0_lark_blacklist_amazon_cat": "亚马逊类目在黑名单中心",
-    "forbidden_mega_cat":             "禁售大类",
-    "zh_seller_mega_cat_forbidden":   "中国卖家禁售大类",
     "cat_zh_blocked":                 "该类目不对中国卖家开放",
     "cat_access_blocked":             "该类目未开通",
+    "cat_gate_pt_unknown":            "类目没定下来,判不了(待人工)",
+    "cat_gate_pt_not_in_meta":        "该类目不在准入明细里,判不了(待人工)",
     "cat_requires_cert_hard":         "**该类目要求认证**(搬运模式提供不了)",
-    "cat_requires_cert_small_part":   "电气小件,需人工确认能否免认证",
     "cat_requires_cert_soft":         "该类目要软合规(可填披露)",
     "walmart_strict_sensitive":       "沃尔玛敏感类目",
-    "excluded_category":              "类目被排除",
     "publication_pt_forbidden":       "出版物类目禁售",
     "title_desc_blacklist":           "标题/描述命中黑名单词",
     "trademark_live":                 "命中在效商标",

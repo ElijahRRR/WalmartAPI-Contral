@@ -73,13 +73,27 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 - **运费模板是 (SKU × 模板 × FC) 三元组绑定**;新建 FC/模板后**须等 4 小时**
   才能挂 SKU,不等会静默回落默认模板 → 建仓与挂 SKU 必须拆两步(见 §7)。
 
-### 2.4 必须实测的官方文档空白(批次 1 验收项,不许按推断编码)
+### 2.4 必须实测的官方文档空白 ✅ 已实测(2026-08-30,谭总12,`node_probe`)
 
-1. Virtual Node 会不会出现在 `GET shipnodes` 列表里(决定校验逻辑对未配置店怎么写)。
-2. `GET /v3/inventories/{sku}` 的真实响应结构(官方样例是错的)。
-3. 多自发货仓时订单行 `shipNode.id` 是否回填(官方仅 3PL 样例带 id;决定按仓
-   对账靠订单接口还是靠自建 SKU→FC 映射)。
-4. 新建 PHYSICAL 节点后 `GET /v3/inventories` 多久出现该节点。
+1. **Virtual Node 会出现在 `GET shipnodes` 列表里**(官方页面自述只覆盖
+   physical/3PL,实测多了 `nodeType: "VIRTUAL"` 一档,shipNode = Partner ID
+   10003247367)。校验口径不用改:`resolve_node` 按"填的值在不在列表里"判,
+   Virtual 在列表里只是让"有人把 Partner ID 填进维护仓库列"也能通过 ——
+   语义等价于没填,无害。
+2. **`GET /v3/inventories/{sku}` 真实响应**(官方 PUT 风格样例确认是文档错误):
+   `{"sku": ..., "nodes": [{"shipNode": ..., "availToSellQty": {unit, amount},
+   "inputQty": {...}, "reservedQty": {...}}]}` —— 与 bulk 同族,
+   `api/inventory._nodes()` 现有解析分支即命中,零改动。
+3. **订单行带 `shipNode`**:`{"id": "10003247367", "name": "...",
+   "type": "SellerFulfilled"}`(官方仅 3PL 样例带 id,实测自发货也带)——
+   按仓对账**可以走订单接口**,不需要自建 SKU→FC 映射。
+4. **新建 PHYSICAL 节点不会自动出现在 `GET /v3/inventories`**:建仓当天
+   shipnodes 已在册(ACTIVE),但全店 3710 SKU 的库存响应仍只有 Virtual Node
+   —— 节点要等**有 SKU 在该节点持有库存**才进响应(几分钟的索引延迟是伪问题,
+   真门槛是"有没有货")。⚠ 这条直接引出 §6.5 的存量行路由问题。
+
+另:同日实证透明游标是一次性的 —— 翻页中途断连后重试同 cursor 即 400,
+`list_inventory_nodes` 已加 items 域同款"整轮重来一次"自愈。
 
 ## 3. 配置定义(所有者方案)
 
@@ -123,8 +137,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   seen_at, PRIMARY KEY (store, sku, ship_node))`;`catalog_sync` 停止只求和:
   合计仍写 `walmart_items.avail_qty`(全部现有消费方零改动),节点明细同轮
   落新表。
-- ⏳ §2.4 四条实测**待所有者建好第二个仓后跑**,结果回填本文档 ——
-  这是批次 1 唯一未完项(建仓是人工前置,代码这边等它)。
+- ✅ §2.4 四条实测已完成(2026-08-30,`node_probe` 工作流),结果见上。
 
 ## 6. 批次 2|维护链切受管仓(核心)✅ 代码完成(2026-08-24)
 

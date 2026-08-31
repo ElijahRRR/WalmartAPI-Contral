@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     variant_group_info jsonb,        -- 变体组详情(isPrimary/分组维度等,原样存)
     price        numeric,
     currency     text,
-    avail_qty    integer,            -- GET /v3/inventories 合并进来
+    avail_qty    integer,            -- GET /v3/inventories **全节点合计**
     published_status    text,
     lifecycle_status    text,
     unpublished_reasons text,
@@ -1149,6 +1149,34 @@ WHERE sources = '{}'::jsonb AND status IN ('suggested', 'executing');
 CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     ON ops.dispositions (store, sku, action)
     WHERE status IN ('suggested', 'executing');
+-- ── 分节点库存(2026-08-24,多仓批次 1)────────────────────────────────────
+-- walmart_items.avail_qty 是**全节点合计**,这张表是它的明细。为什么要分开
+-- 而不是把 avail_qty 改成分节点:合计有几十个消费方(日报/KPI/分配/审核/
+-- 三个库存 provider),动主键会牵动全仓;而真正需要"某个节点多少货"的只有
+-- 维护链的受管仓那一条判据。合计留原样、明细另开一张,是改动面最小的切法。
+--
+-- ⚠ 本轮没扫到的行**不删**(与 walmart_items 的 missing_since 同精神):
+-- 沃尔玛分页漏 SKU 是常态,删了下轮又建,中间那一轮维护链会读到"该节点没货"
+-- 而把库存重推一遍。要判"这个节点还在不在",看 seen_at 跟不跟得上本轮。
+CREATE TABLE IF NOT EXISTS catalog.item_node_inventory (
+    store       text NOT NULL,
+    sku         text NOT NULL,
+    ship_node   text NOT NULL,       -- 官方 shipNode;空串 = 响应未带节点身份
+    avail_qty   integer,
+    seen_at     timestamptz NOT NULL,
+    PRIMARY KEY (store, sku, ship_node)
+);
+CREATE INDEX IF NOT EXISTS item_node_inventory_node_idx
+    ON catalog.item_node_inventory (store, ship_node);
+
+-- 多仓探测(2026-08-24,批次 0):这个 SKU 的库存分布在几个发货节点上。
+-- 现状全店单节点(每店一个 Virtual Node),所以这一列**恒 1** —— 它的价值全在
+-- "什么时候不再是 1":所有者自建第二个仓之后,catalog_sync 第一轮就会把它变成 2,
+-- 摘要里那行告警随即出现。没有它的话多仓是**静默**发生的:avail_qty 变成合计、
+-- 维护链按合计比对却只写单仓,一路错到底都不报错(见 docs/multi_node_plan.md §1)。
+-- 本轮没拿到库存时保留上一轮值(与 avail_qty 同款 COALESCE),不刷成 NULL。
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS node_count smallint;
+
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
 

@@ -152,6 +152,9 @@ def run(params: dict) -> str:
     only = params.get("store")
 
     stockzero = store_limits.stockzero_stores()
+    # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
+    # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生
+    managed, skipped_nodes = store_limits.managed_nodes()
     with db.pg_conn() as conn:
         # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):catalog_sync 补试后
         # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
@@ -164,7 +167,8 @@ def run(params: dict) -> str:
         absent, absence_note = store_absence.stale_or_note(conn, only)
         absence_gap = f";{absence_note}" if absence_note else ""
         intents, capped = mi.collect_all(conn, stockzero,
-                                         int(params.get("oos_days", 0) or 0))
+                                         int(params.get("oos_days", 0) or 0),
+                                         managed=managed)
     if only:
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
@@ -198,6 +202,9 @@ def run(params: dict) -> str:
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     lines += _preview_lines(intents, stockzero)
+    node_note = store_limits.managed_note(managed, skipped_nodes)
+    if node_note:
+        lines.append("  " + node_note)
 
     if not mi.TITLE_MISMATCH_DELETE:
         # 停闸必须天天见人(本仓口诀:静默关闭 = 没人记得它关着)。

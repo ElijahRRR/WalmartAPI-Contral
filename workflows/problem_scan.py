@@ -109,6 +109,26 @@ WHERE (f.status = 'submitted'
    OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 GROUP BY f.store, f.sku
 """
+# WFS 件删不掉(2026-08-24,多仓批次 0)。沃尔玛回执原话:
+# "The item you are trying to delete is WFS eligible. At this time, you can not
+#  delete WFS eligible items." —— 官方也记着 DELETE_ITEM 仅 SFF/FBM 支持
+# (docs/legacy_survey.md:1265)。这类件**每天重建议、每天重发、每天同一个错**,
+# 生产实见 11 条(L001/A152/A154/A170)连着几轮空烧配额。
+# 口径:取该 (店铺,SKU) **最近一次**删除回执,是这个错误码才拦 —— 不是"历史上
+# 出现过就永久拉黑":商品转出 WFS 之后就该能删了,下一次删除尝试的回执会把它
+# 放出来。没有时间窗(WFS 状态不会自己变,靠人在 Seller Center 转出)。
+# ⚠ **拦掉不等于改判 retire**:RETIRE_ITEM 对 WFS 件行不行官方没有明文
+# (docs/multi_node_plan.md §2.4 的同款空白),按本仓纪律不许按推断编码 ——
+# 这里只跳过并**响亮报数**,把"要不要转出 WFS"交回给人。
+_WFS_BLOCKED_CODE = "ERR_EXT_DATA_0101218"
+_SQL_WFS_BLOCKED = """
+SELECT store, sku FROM (
+    SELECT DISTINCT ON (store, sku) store, sku, error_code
+    FROM ops.feed_items
+    WHERE feed_type = 'DELETE_ITEM' AND status IN ('failed', 'missing')
+    ORDER BY store, sku, submitted_at DESC
+) t WHERE error_code = %s
+"""
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
 FROM catalog.product_events WHERE event = %s
@@ -166,11 +186,14 @@ def _load_state():
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
-    return (items, inflight, inflight_disposal, last_cat, inactive, stubborn)
+        cur.execute(_SQL_WFS_BLOCKED, (_WFS_BLOCKED_CODE,))
+        wfs_blocked = {(st, k) for st, k in cur.fetchall()}
+    return (items, inflight, inflight_disposal, last_cat,
+            inactive, stubborn, wfs_blocked)
 
 
 def plan(items, inflight, inactive, stubborn=frozenset(),
-         inflight_disposal=frozenset()):
+         inflight_disposal=frozenset(), wfs_blocked=frozenset()):
     """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
     计划形如 {店铺: {"delete": [item行], "retire": [item行]}},每行附
@@ -185,7 +208,7 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
     """
     out: dict[str, dict] = {}
     n = {"inflight": 0, "inflight_listing": 0, "inactive": 0,
-         "delete": 0, "stubborn": 0}
+         "delete": 0, "stubborn": 0, "wfs": 0}
     for it in items:
         key = (it["store"], it["sku"])
         if it["store"] in inactive:
@@ -206,10 +229,21 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
         if key in stubborn:
             # 删除未生效的顽固 SKU(所有者定稿):
             # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
+            if key in wfs_blocked:
+                n["wfs"] += 1       # 顽固件里的 WFS 件同样删不掉,见下
+                continue
             bucket["retire"].append(it)
             bucket["delete"].append(it)
             n["stubborn"] += 1
             continue
+        if key in wfs_blocked:
+            # WFS 件:上一次删除回执明说删不掉(见 _SQL_WFS_BLOCKED)。
+            # 反补通道 2026-08-28 已随「一律删除」定稿退役,本函数产出的全部
+            # 是破坏动作 —— WFS 件一条都发不出去,跳过并报数,把"要不要转出
+            # WFS"交回给人。
+            n["wfs"] += 1
+            continue
+
         bucket["delete"].append(it)
         n["delete"] += 1
     return out, n
@@ -266,6 +300,7 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
            f"{by_act.get('delete', 0)}"
            f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}),"
            f"顽固停用 {by_act.get('retire', 0)};"
+           f"WFS 删不掉跳过 {n['wfs']},"
            f"处置在途/待观测跳过 {n['inflight']},"
            f"上架/维护在途跳过 {n['inflight_listing']}"
            f"(多为新品合规复审,复审完自动进扫描),"
@@ -429,7 +464,8 @@ def _push_sheets() -> str:
 
 
 def _audit_rejected_rows(conn, inflight: set, inactive: set,
-                         only: str | None) -> list[dict]:
+                         only: str | None,
+                         wfs_blocked: set = frozenset()) -> list[dict]:
     """输入:连接 + 去重状态 → 输出:判拒仍在架的建议行。
 
     与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
@@ -451,6 +487,11 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             continue
         if store in inactive or (store, sku) in inflight:
             continue
+        if (store, sku) in wfs_blocked:
+            # 审核说该删,但 WFS 件照样删不掉(与 scan 来源同一道闸)。
+            # 这里不单独计数:摘要那行报的是总数,分不分来源无碍于"要人去
+            # Seller Center 转出 WFS"这个唯一动作
+            continue
         out.append({
             "store": store, "sku": sku, "asin": asin, "source": "audit",
             "action": "delete", "category": None,
@@ -469,7 +510,7 @@ def run(params: dict) -> str:
                or bool(params.get("dry_run")))
     only = params.get("store")
     (items, inflight, inflight_disposal, last_cat,
-     inactive, stubborn) = _load_state()
+     inactive, stubborn, wfs_blocked) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
     # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
@@ -490,12 +531,14 @@ def run(params: dict) -> str:
     if absent:
         items = [i for i in items if i["store"] not in absent]
 
-    plans, n = plan(items, inflight, inactive, stubborn, inflight_disposal)
+    plans, n = plan(items, inflight, inactive, stubborn,
+                    inflight_disposal, wfs_blocked)
     rows = to_dispositions(plans)
     lines: list[str] = []
 
     with db.pg_conn() as conn:
-        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only)
+        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only,
+                                          wfs_blocked)
         if absent:
             n_audit_avoided = sum(1 for r in audit_rows
                                   if r["store"] in absent)

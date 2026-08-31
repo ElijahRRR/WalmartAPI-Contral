@@ -616,10 +616,25 @@ def settle(conn) -> dict:
 # 因为 PG 推不出参数类型在生产上连炸三次,而 `(detail->>'new')::numeric` 这种
 # 从 jsonb 里取值再强转,遇到一条脏 detail 就炸掉**整条 UPDATE**(不是跳过那
 # 一行,是整轮落定失败)。取回来在 Python 里逐行比,脏行只影响它自己。
+# ⚠ 受管仓的库存建议(多仓批次 2)判据换成**该节点**的现值:`w.avail_qty` 是
+# 全节点合计,拿它跟单仓目标比,多节点店永远判 ineffective —— 下轮重新建议、
+# 再发一遍,循环不会自己停(这是多仓故障清单里的 P1)。
+# 新鲜度也一并放进 JOIN 条件(`ni.seen_at > d.executed_at`):没重新扫到的节点
+# 明细返回 NULL,由 Python 那边**跳过不落判**(与 w.last_seen_at 那条同语义,
+# 拿提交前的旧值判必然判成没生效)。
 _MAINT_OPEN_SQL = """
-SELECT d.id, d.action, d.detail, w.price, w.avail_qty, w.product_name
+SELECT d.id, d.action, d.detail, w.price, w.avail_qty, w.product_name,
+       nq.avail_qty AS node_qty
 FROM ops.dispositions d
 JOIN catalog.walmart_items w ON w.store = d.store AND w.sku = d.sku
+LEFT JOIN LATERAL (
+    SELECT ni.avail_qty
+    FROM catalog.item_node_inventory ni
+    WHERE ni.store = d.store AND ni.sku = d.sku
+      AND ni.ship_node = d.detail->>'ship_node'
+      AND ni.seen_at > d.executed_at
+    LIMIT 1
+) nq ON true
 WHERE d.status = 'executing'
   AND d.action = ANY(%(actions)s::text[])
   AND w.last_seen_at > d.executed_at + make_interval(hours => %(grace)s::int)
@@ -678,8 +693,18 @@ def settle_maintenance(conn) -> dict:
                                       "grace": int(MAINT_SETTLE_GRACE_HOURS)})
         rows = cur.fetchall()
     ok, bad = [], []
-    for rid, action, detail, price, qty, name in rows:
-        want = (detail or {}).get("new")
+    waiting = 0
+    for rid, action, detail, price, qty, name, node_qty in rows:
+        detail = detail or {}
+        want = detail.get("new")
+        if detail.get("ship_node"):
+            if node_qty is None:
+                # 受管仓的行,但该节点的明细本轮还没重新扫到 —— 保持 executing。
+                # 回落 w.avail_qty(全店合计)就是拿合计跟单仓目标比,那正是
+                # 本改造要修的故障;判成 ineffective 则白重发一轮
+                waiting += 1
+                continue
+            qty = node_qty
         (ok if maint_effective(action, want, price, qty, name) else bad).append(rid)
     with conn.cursor() as cur:
         for ids, status, by in ((ok, "confirmed", "observed"),
@@ -690,6 +715,11 @@ def settle_maintenance(conn) -> dict:
     if bad:
         logger.warning("维护建议落定:%d 条**未生效**(catalog_sync 重新扫过,"
                        "线上值仍不是我们提交的值)——下轮扫描会重新建议", len(bad))
+    if waiting:
+        # 长期非 0 = 配的 FC ID 在 GET /v3/inventories 的响应里根本不出现,
+        # 那批行会一路挂到超期放行 —— 必须见人,不能只是"今天少落定几条"
+        logger.info("维护建议落定:%d 条受管仓行等节点明细重新扫到再判"
+                    "(长期非 0 见 docs/multi_node_plan.md §2.4)", waiting)
     return {"confirmed": len(ok), "ineffective": len(bad)}
 
 

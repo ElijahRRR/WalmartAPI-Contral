@@ -99,10 +99,75 @@ _TRUNC_PRIORITY = {
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
 LONG_OOS_DAYS = 15              # 连续这么多天没有库存 → 删除(所有者定稿)
 
-_SQL_ZERO = """
-SELECT store, sku, avail_qty FROM catalog.walmart_items
-WHERE store = ANY(%s) AND missing_since IS NULL AND avail_qty > 0
+# ── 受管发货节点(多仓批次 2)────────────────────────────────────────────────
+# 三个库存 provider 的比对基准从「全店合计」改成「受管仓现值」。**只改配置了
+# 「维护仓库」的店**,其余店逐字节维持现状。
+#
+# 为什么必须改:`walmart_items.avail_qty` 是 GET /v3/inventories 的**全节点
+# 合计**,而写只写一个节点。多节点店里 `合计 == 单仓目标值` 永远不成立 ⇒
+# 每轮都判「有差异」⇒ 每轮全量重发(drop_recent 的 20h 窗口比日跑间隔还短,
+# 压不住),而 settle 又永远判 ineffective —— 三条故障同一个根。
+#
+# ⚠ **配置店而节点明细还没扫到时不回落合计**:回落就是拿合计跟单仓目标比,
+# 正是上面那条故障本身。这种行本轮**跳过并计数**(见 current_qty 返回 None)。
+# 多参数 unnest 的写法与 dispositions._WITHDRAW_SQL 同款(record <> ALL 那种
+# 写法 PG 直接报类型不匹配,别改回去)。
+_MANAGED_NODE_JOIN = """
+LEFT JOIN LATERAL (
+    SELECT ni.avail_qty
+    FROM unnest(%(mn_stores)s::text[], %(mn_nodes)s::text[]) AS mn(store, node)
+    JOIN catalog.item_node_inventory ni
+      ON ni.store = w.store AND ni.sku = w.sku AND ni.ship_node = mn.node
+    WHERE mn.store = w.store
+    LIMIT 1
+) nq ON true
 """
+
+
+def managed_params(managed: dict[str, str] | None) -> dict:
+    """输入:{店铺: 受管仓} → 输出:_MANAGED_NODE_JOIN 要的两个平行数组参数。"""
+    m = managed or {}
+    return {"mn_stores": list(m), "mn_nodes": [m[k] for k in m]}
+
+
+def current_qty(store: str, avail_qty, node_qty,
+                managed: dict[str, str] | None) -> int | None:
+    """输入:店铺 + 合计 + 受管仓值 + 配置表 → 输出:该行的"线上现值";未知 None。
+
+    **三个库存 provider 的唯一比对基准出处**(散在各处写一遍就是本仓反复踩的
+    "一条判据散在多处":改了其中一处,另外几处不报错、只是悄悄按旧规矩办事)。
+
+      未配置店 → walmart_items.avail_qty(全店合计,现状,逐字节不变)
+      配置店   → item_node_inventory 里受管仓那一行的 avail_qty
+      配置店而受管仓**没有那一行** → **0**(见下),不是 None、更不是合计
+
+    ⚠ 「受管仓没有这一行」= 该 SKU 在这个仓里就是没货,**0 才是它的真实现值**。
+    2026-08-30 生产实测定案(谭总12 B008LUW4CI):节点行是**第一次写库存时
+    创建的** —— 不需要先做 SKU×FC 关联(此前按"要先关联"推断编码,实测推翻)。
+    于是"缺行就跳过"会造成**死锁**:永远不写 → 永远没有行 → 永远跳过,
+    3663 条存量行一直卡着而日志只说"预期暂停"。
+
+    ⚠ 那"不回落合计"的原则还算数吗?算数,而且这里没有违反它:回落合计是拿
+    **别的节点的货**冒充受管仓的现值(多节点店永远判有差异 → 每轮重发);
+    判 0 是如实陈述"这个仓里没有" —— 两回事。
+    ⚠ "整店还没扫到"由**缺席避让**兜(store_absence:目录水位落后船队的店
+    整店不产意图),不该由这条判据兼职 —— 一条判据只答一个问题。
+    """
+    if store in (managed or {}):
+        return int(node_qty or 0)
+    return int(avail_qty) if avail_qty is not None else None
+
+
+_SQL_ZERO = """
+SELECT w.store, w.sku, w.avail_qty, nq.avail_qty AS node_qty
+FROM catalog.walmart_items w
+""" + _MANAGED_NODE_JOIN + """
+WHERE w.store = ANY(%(stores)s::text[]) AND w.missing_since IS NULL
+"""
+# ⚠ 「> 0」的判定**从 SQL 挪到 Python**(多仓批次 2):配置店要看的是受管仓
+# 那个数,而它可能为 NULL(明细没扫到)——写在 SQL 里就得在 WHERE 里区分
+# 「配置店 NULL = 跳过」与「未配置店 NULL = 未知不动」,两条 NULL 语义相反,
+# 混在一个表达式里没人读得懂。判定见 current_qty。
 # avail_qty > 0 是显式条件:旧系统 `None != 0` 也触发清零是坑(库存未知的行
 # 被盲清)——新规矩:未知库存不动,只清确知有货的行。
 
@@ -114,7 +179,7 @@ WHERE store = ANY(%s) AND missing_since IS NULL AND avail_qty > 0
 #   · stockzero 店整店排除(它们归 zero_intents,不能被自动同步顶回去)
 _SQL_AMZ_JOIN = """
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
-       w.price AS wm_price, w.avail_qty,
+       w.price AS wm_price, w.avail_qty, nq.avail_qty AS node_qty,
        s.price AS amz_price, s.stock_count, s.delivery_days,
        p.slow, s.fulfillment, s.shipping,
        -- 处置三信号(所有者定稿 2026-08-16):采集结局 / 亚马逊在架状态 /
@@ -138,9 +203,10 @@ LEFT JOIN LATERAL (
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
     ORDER BY l.scraped_at DESC LIMIT 1
 ) s ON true
+""" + _MANAGED_NODE_JOIN + """
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
-  AND NOT (w.store = ANY(%s))
+  AND NOT (w.store = ANY(%(stores)s::text[]))
 """
 
 
@@ -422,7 +488,8 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
     return (None, "", "")
 
 
-def _rows(conn, stockzero_stores: list[str]) -> list[dict]:
+def _rows(conn, stockzero_stores: list[str],
+          managed: dict[str, str] | None = None) -> list[dict]:
     """输入:连接 + stockzero 名单 → 输出:在线商品行(**dict,不是元组**)。
 
     ⚠ 2026-08-16 从元组改成 dict:SQL 加了 outcome/stock_status/stock_state 三列,
@@ -430,7 +497,9 @@ def _rows(conn, stockzero_stores: list[str]) -> list[dict]:
     字段(元组长度对得上、字段错位时不报错)。按名字取之后,加列只改 SQL。
     """
     with conn.cursor() as cur:
-        cur.execute(_SQL_AMZ_JOIN, (list(stockzero_stores or []),))
+        cur.execute(_SQL_AMZ_JOIN,
+                    {"stores": list(stockzero_stores or []),
+                     **managed_params(managed)})
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -440,7 +509,20 @@ SUPPRESS_HOURS = 20     # 同 (店铺,SKU,类型,新值) 多久内不重复提�
 
 
 def _suppress_key(it: dict) -> str:
-    return f"{it['store']}|{it['sku']}|{it['kind']}|{it.get('new')}"
+    """输入:意图 → 输出:防重键(store|sku|kind|new[|node])。
+
+    ⚠ **受管仓的意图要带 node**(多仓批次 2 补,2026-08-30 搬仓时发现):
+    昨天走 legacy 写到 Virtual 的意图,与今天要写到受管仓的同名意图,
+    店铺/SKU/类型/新值**全都一样** —— 不带节点就会被当成"同一件事再做一遍"
+    而压掉,受管仓于是收不到这一笔。平时只是晚一轮(20h 窗口),但搬仓那天
+    "充受管仓 → 清旧节点"紧挨着做,被压掉的那批两个节点都是 0 = **直接不可售**。
+
+    ⚠ 未配置店**一个字节都不加**(不是 `|` 空段):加了会让 ops.dedupe 里
+    全部存量键失配 ⇒ 全店一轮重发,正是这道闸当初要防的 208 条 stale update。
+    """
+    base = f"{it['store']}|{it['sku']}|{it['kind']}|{it.get('new')}"
+    node = it.get("ship_node")
+    return f"{base}|{node}" if node else base
 
 
 def drop_recent(conn, intents: list[dict],
@@ -519,16 +601,40 @@ def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
     return out, report
 
 
-def zero_intents(conn, stockzero_stores: list[str]) -> list[dict]:
-    """输入:连接 + stockzero 店名单 → 输出:整店清零意图(库存 → 0)。"""
+def zero_intents(conn, stockzero_stores: list[str],
+                 managed: dict[str, str] | None = None) -> list[dict]:
+    """输入:连接 + stockzero 店名单(+受管仓表)→ 输出:整店清零意图(→ 0)。
+
+    ⚠ 多仓下清的是**受管仓**(所有者定稿:自动链只管自建自发货仓)。按合计选
+    行、只清一个节点的话,合计永远 > 0 ⇒ 每轮重选重清,而"这家店停售"从未真
+    达成 —— 摘要还一直显示"清零 N 条"。这是多仓故障清单里唯一后果是钱在漏的。
+    """
     if not stockzero_stores:
         return []
     with conn.cursor() as cur:
-        cur.execute(_SQL_ZERO, (list(stockzero_stores),))
+        cur.execute(_SQL_ZERO, {"stores": list(stockzero_stores),
+                                **managed_params(managed)})
         rows = cur.fetchall()
-    return [{"store": s, "sku": k, "kind": "inventory", "old": q, "new": 0,
-             "code": "stockzero", "reason": "整店清零(限额表「库存特殊要求」=0)"}
-            for s, k, q in rows]
+    out = []
+    for store, sku, avail, node_q in rows:
+        cur_q = current_qty(store, avail, node_q, managed)
+        if not cur_q or cur_q <= 0:     # None(未知/明细没扫到)与 0 都不动
+            continue
+        out.append({"store": store, "sku": sku, "kind": "inventory",
+                    "old": cur_q, "new": 0, "code": "stockzero",
+                    "reason": "整店清零(限额表「库存特殊要求」=0)",
+                    **_node_of(store, managed)})
+    return out
+
+
+def _node_of(store: str, managed: dict[str, str] | None) -> dict:
+    """输入:店铺 + 受管仓表 → 输出:{"ship_node": ...} 或 {}(未配置店)。
+
+    未配置店**不带这个键** —— 建议行的 detail 与改造前逐字节一致,
+    执行件也就走原来那条 legacy 路径,行为零变化。
+    """
+    node = (managed or {}).get(store)
+    return {"ship_node": node} if node else {}
 
 
 # 跟卖品铺货量:跟卖无 amz 侧库存可跟,固定保守值(与 AMZ_IN_STOCK_QTY
@@ -539,19 +645,22 @@ MATCH_INVENTORY_QTY = int(os.environ.get("MATCH_INVENTORY_QTY", "10"))
 # 0 库存本身就可能导致 UNPUBLISHED(reason=Inventory),要求已发布会死锁
 # (没库存→不发布→不给库存)。RETIRED/ARCHIVED 不碰。
 _SQL_MATCH_INV = """
-SELECT w.store, w.sku, w.avail_qty
+SELECT w.store, w.sku, w.avail_qty, nq.avail_qty AS node_qty
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'match'
+""" + _MANAGED_NODE_JOIN + """
 WHERE w.missing_since IS NULL
   AND coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'
-  AND coalesce(w.avail_qty, 0) = 0
-  AND NOT (w.store = ANY(%s))
+  AND NOT (w.store = ANY(%(stores)s::text[]))
 """
+# ⚠ 「库存为 0/未知」的判定同样挪到 Python(理由见 _SQL_ZERO 那处注释)。
+# 多仓下这条尤其要紧:受管仓为 0 而别的节点有货时,合计非 0 会让**该铺的行
+# 选不出来、永远不铺**,且完全静默。
 
 
-def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
-                            ) -> list[dict]:
+def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
+                            managed: dict[str, str] | None = None) -> list[dict]:
     """输入:连接 + stockzero 名单 → 输出:跟卖品铺货意图(0/未知 → 保守值)。
 
     补结构洞(所有者批复 2026-08-12):跟卖 offer 建成即 0 库存不可售,
@@ -563,13 +672,23 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None
     整店停售走 stockzero,清零不是停售手段。
     """
     with conn.cursor() as cur:
-        cur.execute(_SQL_MATCH_INV, (list(stockzero_stores or []),))
+        cur.execute(_SQL_MATCH_INV, {"stores": list(stockzero_stores or []),
+                                     **managed_params(managed)})
         rows = cur.fetchall()
-    return [{"store": s, "sku": k, "kind": "inventory",
-             "old": q, "new": MATCH_INVENTORY_QTY,
-             "code": "match_restock",
-             "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})"}
-            for s, k, q in rows]
+    out = []
+    for store, sku, avail, node_q in rows:
+        # 配置店缺节点行 = 受管仓里没货 = 该铺(current_qty 判 0)。
+        # ⚠ 这会让受管仓与旧节点**同时有货**:旧节点的存量归人工清理,
+        # 自动链按定稿只碰受管仓(见 docs/multi_node_plan.md §6 末段)。
+        cur_q = current_qty(store, avail, node_q, managed)
+        if cur_q:                       # 只铺 0/未知;None(未知)照旧算要铺
+            continue
+        out.append({"store": store, "sku": sku, "kind": "inventory",
+                    "old": cur_q, "new": MATCH_INVENTORY_QTY,
+                    "code": "match_restock",
+                    "reason": f"跟卖品铺货(库存 0/未知 → {MATCH_INVENTORY_QTY})",
+                    **_node_of(store, managed)})
+    return out
 
 
 def price_intents(conn, multipliers: dict[str, dict],
@@ -641,6 +760,7 @@ def price_intents(conn, multipliers: dict[str, dict],
 
 
 def inventory_intents(conn, stockzero_stores: list[str] | None = None,
+                      managed: dict[str, str] | None = None,
                       store_channels: dict[str, str] | None = None
                       ) -> list[dict]:
     """输入:连接 + stockzero 名单(+ {店铺: 限定渠道})→ 输出:改库存意图。
@@ -671,8 +791,10 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
     chans = store_channels or {}
     out = []
     n_channel = n_zeroed = 0
-    for r in _rows(conn, stockzero_stores):
-        store, sku, avail_qty = r["store"], r["sku"], r["avail_qty"]
+    for r in _rows(conn, stockzero_stores, managed):
+        store, sku = r["store"], r["sku"]
+        # 比对基准 = 受管仓现值(配置店)/ 全店合计(未配置店),唯一出处
+        avail_qty = current_qty(store, r["avail_qty"], r.get("node_qty"), managed)
         stock_count = r["stock_count"]
         if stock_count is None:
             stock_count = 0             # 没采到 → 不卖(所有者定稿)
@@ -709,7 +831,8 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
             continue
         out.append({"store": store, "sku": sku, "kind": "inventory",
                     "old": avail_qty, "new": new_qty,
-                    "code": code, "reason": why})
+                    "code": code, "reason": why,
+                    **_node_of(store, managed)})
         n_zeroed += 1 if code == "channel_mismatch" else 0
     if n_channel:
         # 渠道不符必须出声:它是结构性的(不像缺货会自己好),而且这批行
@@ -923,9 +1046,11 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     return out
 
 
-def collect_all(conn, stockzero: list[str], oos_days: int = 0
+def collect_all(conn, stockzero: list[str], oos_days: int = 0,
+                managed: dict[str, str] | None = None
                 ) -> tuple[list[dict], list[dict]]:
-    """输入:连接 + stockzero 名单(+无货天数)→ 输出:(本轮全部维护意图, 截断报告)。
+    """输入:连接 + stockzero 名单(+无货天数 +受管仓表)→ 输出:
+    (本轮全部维护意图, 截断报告)。
 
     单店单轮上限(cap_per_store)在**最后**施加 —— 在 doomed 剔除与 drop_recent
     之后,名额不浪费在注定不发的意图上(截在 provider 里的话,先截再被防重
@@ -954,13 +1079,17 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0
                              store_channels=chans)
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)
+    # ⚠ 三个**库存** provider 都要收 managed:比对基准是受管仓现值。
+    # 漏传一个的表现不是报错,而是那一路照旧拿全店合计比单仓目标 ⇒ 每轮重发。
+    # 标题/价格与仓库无关,不传(传了也没有用武之地,别加无意义的参数)。
     for it in (title_intents(conn, stockzero)
                + price_intents(conn, mults, stockzero)
-               + inventory_intents(conn, stockzero, store_channels=chans)
+               + inventory_intents(conn, stockzero, managed,
+                                   store_channels=chans)
                # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
                # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责
-               + match_inventory_intents(conn, stockzero)
-               + zero_intents(conn, stockzero)):
+               + match_inventory_intents(conn, stockzero, managed)
+               + zero_intents(conn, stockzero, managed)):
         # 将被删除的行不再改价/改库存/改标题:它们的 amz 数据本来就是陈旧的
         # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上
         if (it["store"], it["sku"]) not in doomed:
@@ -982,8 +1111,12 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0
 #   category = code      → 「原因」列的分组依据
 #   reason   = 人读原因   → 「原因」列正文
 #   detail   = 其余全部   → 旧值/新值/标题载荷/删除证据
+# ⚠ `ship_node`(多仓批次 2)必须在这里:它决定执行件走哪条写通道
+# (带 node → PUT /v3/inventories/{sku} 的 body nodes;不带 → legacy)。
+# 漏登记的表现是**扫描件判对了受管仓、执行件却写到默认节点**,而且两边
+# 都不报错 —— 正是本注释顶上那段说的"只改了写侧读侧静默丢键"。
 _DETAIL_KEYS = ("old", "new", "label", "product_type", "product_id",
-                "batches", "first_seen", "last_seen", "obs")
+                "batches", "first_seen", "last_seen", "obs", "ship_node")
 
 #: kind → 「建议」列的中文标签。**全项目唯一出处。**
 #: 2026-08-17 起它不再只是显示文案,而是 maintenance_scan 与 maintenance 之间

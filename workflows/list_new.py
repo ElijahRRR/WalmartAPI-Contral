@@ -572,7 +572,7 @@ _UPC_PLACEHOLDER = "000000000000"
 
 def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
                ) -> tuple[list[dict], list[tuple[int, str]], dict]:
-    """输入:待提交行 + {店: partner_id} + 并发数 → 输出:(备好行, 理由, 计数)。
+    """输入:待提交行 + {店: 上架仓 FC ID} + 并发数 → 输出:(备好行, 理由, 计数)。
 
     预备期(所有者定稿 2026-08-18 新流程):LLM 出参 + spec 一致化**前置到
     领号之前**、全行跨店并发 —— 缓存优先,miss 才打 DeepSeek,高并发把墙钟
@@ -1610,23 +1610,35 @@ def run(params: dict) -> str:
 
     # ── 预备期(所有者定稿 2026-08-18 新流程)──────────────────────────────
     # LLM 出参 + spec 一致化前置到领号之前、跨店高并发(缓存优先,miss 才打
-    # DeepSeek);占位号跑 conform,**通过的行才有资格领号**。Partner ID 预取:
+    # DeepSeek);占位号跑 conform,**通过的行才有资格领号**。FC ID 预取:
     # build_orderable 要它,而取不到凭证的店整店提交不了 —— 提前拦,
     # 别让它的行进预备期白烧 LLM。
+    # 多仓批次 3:上架仓 = 配置了「维护仓库」的店填那个 FC ID,其余店仍是
+    # Partner ID(Virtual Node)。**校验失败的店整店跳过、不回落 Partner ID**
+    # —— 回落等于把本该进新仓的货上到旧节点,而且全程不报错
+    managed_ok, managed_bad = store_limits.managed_nodes(
+        list(stores_by_name.values()))
+    node_note = store_limits.managed_note(managed_ok, managed_bad)
+    if node_note:
+        lines.append("  " + node_note)
     partners: dict[str, str] = {}
     prep_in: list[dict] = []
     by_store_pre: dict[str, list[dict]] = {}
     for r in ready:
         by_store_pre.setdefault(r["store"], []).append(r)
     for store_name, srows in sorted(by_store_pre.items()):
+        if store_name in managed_bad:
+            lines.append(f"  ⚠ {store_name}:「维护仓库」校验失败整店跳过"
+                         f"(不回落 Virtual Node),修好配置后下轮自动恢复")
+            continue
         try:
-            partners[store_name] = settings_api.get_partner_id(
-                stores_by_name[store_name])
+            partners[store_name] = store_limits.listing_fc(
+                stores_by_name[store_name], managed_ok)
             prep_in.extend(srows)
         except Exception as e:                                  # noqa: BLE001
-            logger.warning("店铺 %s 取 Partner ID 失败,整店本轮跳过: %s",
+            logger.warning("店铺 %s 取上架仓 FC ID 失败,整店本轮跳过: %s",
                            store_name, e)
-            lines.append(f"  ⚠ {store_name}:取 Partner ID 失败整店跳过"
+            lines.append(f"  ⚠ {store_name}:取上架仓 FC ID 失败整店跳过"
                          f"({e}),下轮重试")
     prep_ok: list[dict] = []
     invalid_by_store: dict[str, int] = {}

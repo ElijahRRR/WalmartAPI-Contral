@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import notify_fmt as nf, product_events, store_retry, \
-    stores as stores_svc, walmart_catalog
+from services import notify_fmt as nf, product_events, store_limits, \
+    store_retry, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -102,8 +102,8 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
     backfilled = _backfill_item_ids(store) if backfill_ids else 0
-    # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。现状恒 0 —— 它的
-    # 价值全在"什么时候不再是 0"(见 refdata/schema.sql 的 node_count 列注释)
+    # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。谭总12 自建中山仓
+    # 之后它不再是 0 —— 摘要按"该店配没配「维护仓库」"分两种措辞(见 run())
     multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
@@ -199,13 +199,28 @@ def run(params: dict) -> str:
     # 多仓探测必须见人(批次 0):多仓一旦发生而没人知道,维护链会按"全节点合计"
     # 比对却只写单个节点 —— 清零永久失效、库存每轮重写、生效永久判未生效,
     # 三条全是静默的(docs/multi_node_plan.md §1)。这一行是它的唯一告警面。
+    # ⚠ 措辞按**该店配没配「维护仓库」**分两种(2026-08-31 改):批次 2 之后
+    # 配置店的维护链已按受管仓写,再喊"仍按单仓写、库存会漂"是**过时告警**
+    # ——它出现在搬仓当天的摘要里,读起来像"改造没生效",正好把人引向反面。
     multi = {r["store"]: r["multi_node"] for r in results if r.get("multi_node")}
     if multi:
+        managed = store_limits.maint_nodes()
+        done = {s: n for s, n in multi.items() if s in managed}
+        todo = {s: n for s, n in multi.items() if s not in managed}
         lines.append(
-            f"⚠ **发现多发货节点**:{sum(multi.values())} 个 SKU 铺在 2 个及以上"
-            f"节点(" + ",".join(f"{s}×{n}" for s, n in sorted(multi.items()))
-            + ")。**维护链现在仍按单仓写**,配置「维护仓库」之前这些店的库存"
-              "维护会漂 —— 见 docs/multi_node_plan.md 批次 1/2")
+            f"多发货节点:{sum(multi.values())} 个 SKU 铺在 2 个及以上节点("
+            + ",".join(f"{s}×{n}" for s, n in sorted(multi.items())) + ")")
+        if done:
+            lines.append(
+                "  已配「维护仓库」的店按受管仓维护(其余节点自动链不碰):"
+                + ",".join(f"{s}={managed[s]}" for s in sorted(done))
+                + " —— 旧节点的存量货归 `node_clear` 收尾")
+        if todo:
+            lines.append(
+                f"  ⚠ **未配「维护仓库」的店库存维护会漂**:"
+                + ",".join(sorted(todo))
+                + "(按全节点合计比对却只写单节点 —— 清零失效/每轮重写/"
+                  "生效永判未生效,见 docs/multi_node_plan.md §1)")
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
 

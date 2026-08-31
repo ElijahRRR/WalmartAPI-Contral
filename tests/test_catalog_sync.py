@@ -789,3 +789,31 @@ def test_put_node_never_reads_a_nodeless_echo_as_success(monkeypatch):
     ok, why = inv_api.put_inventory(STORE, "A", 7, "N1")
     assert ok is False and "没有目标节点 N1" in why
     assert "原始响应" in why          # 形状对不上时要把实物带出来给人看
+
+
+def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
+    """⚠ 多节点告警的措辞按**该店配没配「维护仓库」**分两种(2026-08-31)。
+
+    批次 2 之后配置店的维护链已按受管仓写,再对它喊"仍按单仓写、库存会漂"
+    是**过时告警** —— 它正好出现在搬仓当天的摘要里,读起来像"改造没生效",
+    把人引向反面。未配置店那句必须原样保留:那才是真的会漂。
+    """
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["谭总12", "没配的店"])
+    monkeypatch.setattr(catalog_sync.store_limits, "maint_nodes",
+                        lambda: {"谭总12": "N_NEW"})
+    monkeypatch.setattr(catalog_sync, "_sync_one_store",
+                        lambda store, *a, **kw: {**_ok_result(store["name"]),
+                                                 "multi_node": 3568})
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    out = catalog_sync.run({"skip_feishu": "1"})
+
+    assert "谭总12=N_NEW" in out and "自动链不碰" in out   # 配置店:已按受管仓维护
+    assert "node_clear" in out                            # 指向旧节点收尾工具
+    assert "没配的店" in out and "会漂" in out             # 未配置店:原样告警
+    # 配置店不许再被扣上"会漂"的帽子
+    warn = [l for l in out.splitlines() if "会漂" in l][0]
+    assert "谭总12" not in warn

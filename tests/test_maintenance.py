@@ -2113,7 +2113,10 @@ def test_node_clear_dry_run_writes_nothing_and_lists_the_targets(monkeypatch):
                             AssertionError("dry-run 不许写")))
     out = nc.run({"store": "T1", "node": "N_OLD", "dry_run": True})
     assert "该节点上有货的 2 个,合计 1004 件" in out
-    assert "dry-run" in out and "2 个 SKU" in out
+    # B0B 在受管仓没有行 ⇒ 未接管 ⇒ 跳过(只有 B0A 可清)
+    assert "尚未接管** 1 个" in out and "B0B" in out
+    assert "本轮待清 1 个" in out
+    assert "dry-run" in out and "1 个 SKU" in out
 
 
 def test_node_clear_names_the_failures(monkeypatch):
@@ -2122,9 +2125,9 @@ def test_node_clear_names_the_failures(monkeypatch):
 
     monkeypatch.setattr(nc.stores_svc, "load_stores",
                         lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {})
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
     monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
-        "B0A": {"N_OLD": 9}, "B0B": {"N_OLD": 8}})
+        "B0A": {"N_OLD": 9, "N_NEW": 1}, "B0B": {"N_OLD": 8, "N_NEW": 2}})
     seen = []
 
     def put(store, sku, qty, node=None):
@@ -2153,3 +2156,56 @@ def test_suppress_key_separates_nodes_but_leaves_legacy_keys_byte_identical():
     # 同一件事写不同节点 = 两件事
     assert mi._suppress_key({**base, "ship_node": "N1"}) != \
         mi._suppress_key({**base, "ship_node": "N2"})
+
+
+def test_node_clear_only_clears_what_the_managed_node_took_over(monkeypatch):
+    """⚠ 只清**受管仓已接管**的 SKU:受管仓有库存行 = 维护链写过它 = 清完仍可售。
+
+    谭总12 搬仓当天实见:3680 个 SKU 里 112 个受管仓还没有行、83 个旧节点
+    还有货、107 个是 PUBLISHED —— 一把清完这批在两个节点都是 0,**直接断售**。
+    两类成因都不是"等下一轮"就能好的:非 amz 出身的行维护链根本不碰;
+    amz 行没产意图的有的下轮回来、有的不会。都不该由"清空旧仓"替它们决定。
+    """
+    from workflows import node_clear as nc
+
+    monkeypatch.setattr(nc.stores_svc, "load_stores",
+                        lambda filter_names=None: [_store("T1")])
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
+    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
+        "TAKEN": {"N_OLD": 999, "N_NEW": 3},    # 已接管 → 清
+        "UNTAKEN": {"N_OLD": 50},               # 受管仓没有行 → 跳过
+    })
+    wrote = []
+    monkeypatch.setattr(nc.inv_api, "put_inventory",
+                        lambda st, sku, qty, nd=None: (
+                            wrote.append((sku, qty, nd)), (True, ""))[1])
+    out = nc.run({"store": "T1", "node": "N_OLD"})
+    assert wrote == [("TAKEN", 0, "N_OLD")]          # UNTAKEN 一个字节都没碰
+    assert "尚未接管** 1 个" in out and "UNTAKEN" in out
+    assert "sources_backfill" in out                 # 给出补救路径,不只是拒绝
+
+    # 显式要清整个节点:放行,但把"两个节点都是 0 = 断售"摆在摘要里
+    wrote.clear()
+    out = nc.run({"store": "T1", "node": "N_OLD", "include_untaken": "1"})
+    assert sorted(s for s, _, _ in wrote) == ["TAKEN", "UNTAKEN"]
+    assert "照清" in out and "断售" in out
+
+
+def test_node_clear_refuses_when_takeover_cannot_be_judged(monkeypatch):
+    """没配「维护仓库」⇒ 判不出"接管与否" ⇒ **拒绝**,除非显式 include_untaken。
+
+    判不准就判活(CLAUDE.md 开工前两问):清空一个判不出接管状态的节点,
+    等于拿全店可售性赌一个没依据的假设。
+    """
+    from workflows import node_clear as nc
+
+    monkeypatch.setattr(nc.stores_svc, "load_stores",
+                        lambda filter_names=None: [_store("T1")])
+    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {})
+    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes",
+                        lambda s: {"B0A": {"N_OLD": 9}})
+    monkeypatch.setattr(nc.inv_api, "put_inventory",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("拒绝时不许写")))
+    out = nc.run({"store": "T1", "node": "N_OLD"})
+    assert "拒绝执行" in out and "include_untaken=1" in out

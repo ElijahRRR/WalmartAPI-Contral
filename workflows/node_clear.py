@@ -8,6 +8,11 @@
   python cli.py node_clear -p store=谭总12 -p node=10003247367 --dry-run
   python cli.py node_clear -p store=谭总12 -p node=10003247367            # 真跑
 
+⚠ **只清「受管仓已接管」的 SKU**(受管仓有库存行 = 维护链写过它 = 清完仍
+可售)。未接管的跳过并点名 —— 一把清完会让那批在两个节点都是 0,直接断售
+(谭总12 搬仓当天实见 112 个未接管、其中 83 个旧节点还有货)。
+确实要清整个节点用 `-p include_untaken=1`。
+
 ⚠ **拒绝清受管仓**:那是自动链正在维护的节点,清了它下一轮维护链又写回来
 (两条规则打架,而且没人看得出是谁在跟谁较劲)。要停售整店走 stockzero。
 
@@ -52,16 +57,52 @@ def run(params: dict) -> str:
                 f"   要停售整店走 stockzero(限额表「库存特殊要求」=0);"
                 f"要换仓先改「维护仓库」再清旧仓。")
 
+    include_untaken = str(params.get("include_untaken", "")).strip() == "1"
+
     nodes = inv_api.list_inventory_nodes(store)
-    targets = {sku: nd[node] for sku, nd in nodes.items()
-               if nd.get(node, 0) > 0}
-    total_qty = sum(targets.values())
+    has_stock = {sku: nd[node] for sku, nd in nodes.items()
+                 if nd.get(node, 0) > 0}
     lines = [f"节点清零 · {name} · 节点 {node}"
              f"(受管仓={managed or '(未配置)'})",
-             f"  全店 {len(nodes)} SKU,该节点上有货的 {len(targets)} 个,"
-             f"合计 {total_qty} 件"]
+             f"  全店 {len(nodes)} SKU,该节点上有货的 {len(has_stock)} 个,"
+             f"合计 {sum(has_stock.values())} 件"]
+
+    # ⚠ **只清受管仓已接管的 SKU**(2026-08-31 生产实测后补的闸)。
+    # 判据:该 SKU 在受管仓有库存行 = 维护链已经写过它 = 清旧节点之后它仍可售。
+    # 谭总12 搬仓当天实见:3680 个 SKU 里 112 个受管仓还没有行,其中 83 个
+    # 旧节点还有货、107 个是 PUBLISHED —— 一把清完就是这批**直接断售**。
+    # 没接管的两类成因都不是"等下一轮"就能好的:
+    #   · `source_type != 'amz'` 的行维护链按路由铁律根本不碰(谭总12 有 28 个
+    #     unknown)—— 不先跑 sources_backfill 的话,它们永远等不到;
+    #   · amz 行但本轮没产意图(亚马逊侧断货/待删/防重压制)—— 有的下轮就回来,
+    #     有的不会。
+    # 两类都不该由"清空旧仓"这个动作替它们做决定。
+    if not managed and not include_untaken:
+        return "\n".join(lines + [
+            f"  ⚠ 拒绝执行:{name} 没配「维护仓库」,判不出"
+            f"「受管仓是否已接管」——清空这个节点可能让商品直接断售。",
+            f"     确实要清整个节点:加 -p include_untaken=1(**先想清楚**)。"])
+    taken = {sku for sku, nd in nodes.items() if managed and managed in nd}
+    untaken = {sku: q for sku, q in has_stock.items() if sku not in taken}
+    targets = ({**has_stock} if include_untaken
+               else {sku: q for sku, q in has_stock.items() if sku in taken})
+    if untaken:
+        lines.append(
+            f"  ⚠ 受管仓**尚未接管** {len(untaken)} 个(合计 {sum(untaken.values())} 件):"
+            + ("**照清**(-p include_untaken=1;清完这批在两个节点都是 0 = 断售)"
+               if include_untaken else
+               "本轮**跳过不清**(清了会断售)。样本:"
+               f"{sorted(untaken)[:5]}")
+            )
+        if not include_untaken:
+            lines.append(
+                "     成因两类:① 非 amz 出身的行维护链不碰 → 先跑 "
+                "`sources_backfill` 认领;② amz 行本轮没产意图(断货/待删/"
+                "防重)→ 多数下轮自愈。补完再跑本工作流收尾。")
+    total_qty = sum(targets.values())
+    lines.append(f"  本轮待清 {len(targets)} 个,合计 {total_qty} 件")
     if not targets:
-        return "\n".join(lines + ["  该节点已经是空的,无事可做"])
+        return "\n".join(lines + ["  没有可清的 SKU,无事可做"])
 
     order = sorted(targets.items(), key=lambda kv: (-kv[1], kv[0]))
     if len(order) > limit:

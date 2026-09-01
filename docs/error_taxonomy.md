@@ -60,7 +60,7 @@
 
 ```python
 # ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
-ERROR_TAXONOMY_VERSION = "t.2026-09-01.1"   # 码表/判据变更时手动递增
+ERROR_TAXONOMY_VERSION = "t.2026-09-01.2"   # 码表/判据变更时手动递增
 ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
     "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
     "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
@@ -112,17 +112,17 @@ WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
 | 3 | `RECALL` | 含 `cpsc recall` 或 `safety warning` |
 | 4 | `FLAGGED` | 含 `flagged by our internal team` |
 | 5 | `IP` | 含 `intellectual property` 或 `copyright`,或正则 `\bip\b\s+(policy|claim|related)` |
-| 6 | `BRAND` | 含 `brand restrictions` 或 `not authorized to list this brand` |
+| 6 | `BRAND` | 含 `brand restrictions` / `not authorized to list this brand` / `partnered with select brands` / `biz-cn`(旧 C 口径;biz-cn 行在处置层单独标 biz_cn 维度、只拉 ASIN 不拉品牌 —— 第二步细化) |
 | 7 | `GATED` | 含 `requires? pre-approval`(正则,单复数皆收 —— 生产原文有 "these categories **require** pre-approval")/ `restricted to certain sellers` / `request approval to sell` / `enhanced vetting program` / `health & compliance page` |
 | 8 | `PRICE` | 含 `pricing rule` / `price gouging` / `unintended price` |
-| 9 | `CONTENT` | 含 `content issues` / `does not meet our content standards` / `content quality standards` / `image guidelines` / `placeholder images` —— ⚠ 不许用裸 `content standards`:政策文本里有 "do not meet **offensive** content standards"(sex toys 条),裸串会把政策拒误抢成内容问题(语料有反例钉死) |
+| 9 | `CONTENT` | 含 `content issues` / `content policy` / `does not meet our content standards` / `content quality standards` / `image guidelines` / `placeholder images` / `missing a primary image` / `main image url` / `authenticity claims` —— ⚠ 不许用裸 `content standards`:政策文本里有 "do not meet **offensive** content standards"(sex toys 条),裸串会把政策拒误抢成内容问题(语料有反例钉死) |
 | 10 | `SPECIAL` | 含 `resold program` / `preorder program` / `pre-owned` / `restored program` |
-| 11 | `INFO` | 含 `no price was found` / `shipping information was not added` / `active distribution center` / `missing required logistics` |
+| 11 | `INFO` | 含 `no price was found` / `shipping information was not added` / `active distribution center` / `missing required logistics` / `tax code` |
 | 12 | `SYSTEM` | 含 `internal error occurred` / `glitch` |
 | 13 | `STAGE` | 含 `stage status until you go live` |
 | 14 | `EXPIRED` | 含 `end date has passed` |
 | 15 | `POLICY` | 含 `prohibited product` 且含 `policy`(覆盖 Products/Product 两形、缺首字母 typo) |
-| 16 | `OTHER`(显式) | 含 `business decision` / `trust & safety` —— 计入 `unlisted` 清单,不进 unknown 告警 |
+| 16 | `OTHER`(显式) | 含 `business decision` / `trust & safety` / `currently under review`(审查中会自愈,不造码)—— 计入 `unlisted` 清单,不进 unknown 告警 |
 | 17 | `OTHER`(未识别) | 兜底 —— **必进 unknown 告警清单,原文全文保留** |
 
 判据纪律:**不锚句首、不依赖 "This"**(缺首字母 `his item…` 的 29 条 typo 免疫);
@@ -142,7 +142,7 @@ WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
    "Policy: X, please review…" 恰是小写续句形态;
 3. 主/子类拆分:候选含逗号已被截,子类形态 `Offensive Content, Halloween Items` 由
    截断前先查:若逗号后文本 ∈ 已知子类词形(Halloween/Inappropriate/Intolerance/
-   Violence/Sex Toys 家族)则 `policy_sub` 收下、主名取逗号前;否则按 2 截断;
+   Violence/Sex Toys/Politics 家族)则 `policy_sub` 收下、主名取逗号前;否则按 2 截断;
 4. 无候选的兜底:原子命中 `POLICY` 词根但抽不出类别名(通用政策拒 3,363 条的常态)
    → `policy_name=None`,合法,不告警;
 5. 抽出候选但**与政策表 join 不上** → 保留候选原文,进"政策表缺口"清单(报告显示,
@@ -268,3 +268,17 @@ feed status 走 feed_items JOIN(§3.6)—— **四处全部核准**,以语料与
 3. feed 政策族正文全不命中 → 落 `OTHER`,报告单列"政策族判不出码"一节提醒补判据。
 4. 别名表只收词形差,不做语义合并;政策表缺口由首跑报告自证,不预判。
 5. README §11 文档索引本就非全集,不动。
+
+## 十、首轮生产对照的判据补丁(2026-09-01 轮次二,t.2026-09-01.2)
+
+生产全量对照(28,637 + 11,485 + 216,723 条)结论:事件面 unknown=0;在架面 unknown
+316 条共 7 种文本,其中 5 种是**旧判据有、新判据漏收**的(content policy / 主图缺失 /
+authenticity claims / tax code / BIZ-CN+partnered brands),已按上表补进 §3.3;
+`currently under review`(2 条,自愈态)进 OTHER 显式清单;政策子类词形补 Politics。
+版本随判据递增为 t.2026-09-01.2。
+
+待所有者数据确认的两件事(引擎外):
+1. **政策表疑似缺武器族**:Firearms/Firearm Accessories/Knives/Firearm Ammunition/
+   Jewelry 合计 ~70 条政策名 join 不上 37 行表 —— 若表里真没有,这是 L3 的判据盲区
+   (第三步输入),该补的是**政策表数据**,不是引擎;
+2. `Cosmetics Products`(1 条)待确认是否表内 `Cosmetic Products` 的词形差,是则加别名。

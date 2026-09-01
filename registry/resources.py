@@ -161,7 +161,7 @@ WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 # ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
 # 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
 # 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
-ERROR_TAXONOMY_VERSION = "t.2026-09-01.1"   # 码表/判据变更时手动递增
+ERROR_TAXONOMY_VERSION = "t.2026-09-01.2"   # 码表/判据变更时手动递增
 ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
     "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
     "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",

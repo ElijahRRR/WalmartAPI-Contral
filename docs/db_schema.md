@@ -118,7 +118,11 @@ CREATE TABLE catalog.walmart_items (
     variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)
     variant_group_info jsonb,                -- 变体组详情(isPrimary/分组维度,原样存)
     price numeric, currency text,
-    avail_qty integer,                       -- GET /v3/inventories 合并
+    avail_qty integer,                       -- GET /v3/inventories 合并(**全节点合计**)
+    node_count smallint,                     -- 该 SKU 铺在几个发货节点(多仓批次 0)。
+                                             -- 现状恒 1;价值全在"什么时候不再是"
+                                             -- ——catalog_sync 摘要按它告警。
+                                             -- 与 avail_qty 同源于 merge_rows 的一份入参
     published_status text, lifecycle_status text, unpublished_reasons text,
     last_seen_at timestamptz NOT NULL,       -- 最近一次全量扫描见到它的时间
     missing_since timestamptz,               -- 连续缺席起点;NULL=最近一轮仍在
@@ -136,6 +140,23 @@ CREATE TABLE catalog.walmart_items (
 不丢病历,但拍板保守留行,13 万行 PG 无压力)。飞书「在线产品总表」投影只写在架行
 (missing_since IS NULL),缺席商品不进表;last_seen_at/missing_since
 两列也不投影(追踪在 PG 与事件账本,表只给人看在架现状)。
+
+```sql
+-- 分节点库存明细(多仓批次 1):每 (店铺, SKU, 发货节点) 一行,
+-- catalog_sync 与 walmart_items 同轮落库(同一份 GET /v3/inventories 响应)。
+-- ⚠ 存在的理由是 walmart_items.avail_qty 是**合计**,而写只写一个节点:
+-- 多节点店里"合计 == 单仓目标值"永远不成立 ⇒ 每轮判有差异 ⇒ 每轮全量重发,
+-- 而 settle 又永远判 ineffective。维护链的比对基准与落定判据都改读这张表
+-- (受管仓 = 限额表「维护仓库」填的 FC ID;未填的店不碰这张表,行为零变化)。
+CREATE TABLE catalog.item_node_inventory (
+    store text NOT NULL, sku text NOT NULL,
+    ship_node text NOT NULL,                 -- FC ID(17-18 位数字);Virtual Node 时为空串
+    avail_qty integer NOT NULL,              -- 该节点 availToSellQty
+    seen_at timestamptz NOT NULL,            -- 本轮观测时刻;落定判据靠它比 executed_at
+    PRIMARY KEY (store, sku, ship_node)
+);
+CREATE INDEX item_node_inventory_node_idx ON catalog.item_node_inventory (ship_node);
+```
 
 ```sql
 -- 产品来源登记簿(2026-08-07 所有者定稿):每个上架产品登记"出身"
@@ -391,6 +412,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 | `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流。**`asin`**(A1.5,2026-08-15):源头 ASIN,由 `order_asin_normalize` 按 `services/sku_asin` 补填,**提不出留 NULL**;分配引擎的产品/品牌销量维度按 `asin IS NOT NULL` 过滤,**不许拿 sku 原文当 asin** | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 + order_asin_normalize 补 asin |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric))(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键,与 schema.sql 注释一致) | `perf_problems`(2026-08-08 从 daily_report 摘出独立成流,已落地;写库经 services/order_lines) |
+| `ops.store_settlements` | (store, report_date) | **结算账期台账**(2026-08-31):一个账期一行,存该期 PaymentSummary 的 Total Payable。**累计回款 = SUM(total_payable)**。⚠ 不能用 `settlement_lines` 求和代替(它按订单行聚合、过滤掉订单不在库的行、不含账期级费用);也不能按天求和 `store_kpi_daily.payout`(那是"当前待打款"快照,打款前天天出现 ⇒ 同一笔重复计)。另一半价值:沃尔玛的 `availableReconFiles` 只保留有限期,落库之后就永远留着 —— 这份累计随运行时间**越来越完整** | 结算同步 |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
 
 视图:
@@ -505,7 +527,12 @@ CREATE TABLE ops.store_kpi_daily (
     payout_date      text,
     payment_processor text, settle_cycle text,
     no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
-    prev_payout      numeric,        -- 严格 -14 天账期,无则 0(业务规则)
+    prev_payout      numeric,        -- **已停用**(所有者 2026-08-31「这个字段
+                                     -- 不需要」)。原口径 = 严格 -14 天那一期。
+                                     -- 列不删(历史行的值是当时的真实观测),
+                                     -- 日报不再写、看板不再投影
+    total_payout     numeric,        -- **累计回款**:沃尔玛总共已付的钱
+                                     -- = ops.store_settlements 各账期之和
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
@@ -598,6 +625,7 @@ ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.
 | `source` | 谁**首先**建议的(maint/scan/audit/tro) | **不是执行者**。拿它反推谁干的,就会读出 08-19 那条「维护链执行 + 审核链原因」的记录 |
 | `action` | **该谁干**:delete/retire/relist → `problem_product_cleanup`;title/price/inventory → `maintenance` | 执行件按它领取(`claim(actions=…)`),与 source 无关 |
 | `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
+| `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:

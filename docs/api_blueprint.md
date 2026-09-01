@@ -35,7 +35,7 @@
 | 19 | PUT /v3/price | prices | 单品改价(同步快路径) | safe_put_ex | 3 个模块 |
 | 20 | PUT /v3/inventory | inventory | 单品改库存(同步快路径) | safe_put_ex | 4 个模块 |
 | 21 | GET /v3/inventories | inventory | 全店库存分页(bulk) | safe_get_ex | sync_online_products |
-| 22 | GET /v3/inventory?sku= | inventory | 单品库存(bulk 漏数据兜底) | safe_get_ex | sync_online_products |
+| 22 | GET /v3/inventories/{sku} | inventory | 单品库存(bulk 漏数据兜底,**全节点合计**) | safe_get_ex | sync_online_products |
 | 23 | GET /v3/orders | orders | 订单增量拉取/销量统计 | **裸 httpx(async)** | 订单审核/店铺日报 |
 | 24 | GET /v3/returns | returns | 售后单全量拉取 | safe_get_ex | 售后同步 |
 | 25 | GET /v3/report/payment/statement | reports | 结算摘要/店铺状态/sellerId | 混合(裸×1) | 3 个模块 |
@@ -43,14 +43,28 @@
 | 27 | GET /v3/report/reconreport/reconFileJson | reports | 对账明细 JSON | 混合 | 2 个模块 |
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
-| 30 | GET /v3/settings/partnerprofile | settings | Partner ID(上架注入 shipNode) | safe_get_ex | auto_listing |
+| 30 | GET /v3/settings/partnerprofile | settings | Partner ID(**无自建仓时**的上架 shipNode) | safe_get_ex | auto_listing |
+| 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
+| 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
 | 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
+POST /v3/settings/shipping/shipnodes(**建仓**,人工 runbook,不自动化)、
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
 GET /v3/insights/items/unpublished/items|counts(被下架商品清单,清理工作流可换用)、
 GET /v3/insights/items/buybox 类(旧系统承认缺失)、DELETE /v3/items/{sku}(单品 retire,全仓未用过)、
 GET /v3/items/taxonomy、GET /v3/token/detail(ping_stores 已用)。
+
+**⚠ 单仓假设(2026-08-24 由无意识默认转为有意识决策)。** 此前 inventory 域的
+函数面 `(store, sku, qty)` 把 `(店铺, SKU)` 当成库存的完整主键,而沃尔玛的库存
+主键是 `(店铺, SKU, 发货节点)`。这不是当初权衡过的取舍——本仓决策留痕密度极高
+而此事零留痕,分节点端点连"预留"都没进(现已补上)。它成立的业务依据是
+`api/settings.py:30-31` 记的那句:当时全部卖家"无实体仓 → 每店一个 Virtual
+Node",一店一节点。**该依据正在失效**(所有者 2026-08-24 起自建第二个自发货仓),
+改造范围/批次/官方端点形状全部定稿在 `docs/multi_node_plan.md`。
+读侧已于批次 0 统一为"全节点合计"(#22 换端点);写侧已于批次 2 切换
+(#32 分节点 PUT + MP_INVENTORY feed,按「维护仓库」显式路由,未配置的店
+逐字节维持 legacy 单仓路径)。
 
 **明确不做:** Walmart Affiliate API(非 marketplace 域,需独立资质)、
 marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁移)、
@@ -67,11 +81,11 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 3 daily_report | 23, 25, 26, 27, 28 | 29(xlsx 二进制)已分给 perf_problems;商品三列改读 catalog.walmart_items(靠链上前置的 catalog_sync),不再自己调 4/2 |
 | 4 order_sync | 23 | 窗口全量重拉(缺省 days=45,不走 lastModifiedStartDate 增量,故无 179d 坑);order_audit 只读 PG/采集器,零沃尔玛调用 |
 | 5 upc_sync | 无沃尔玛调用 | 号源由运营填「UPC池」表,注入/回写只走飞书 + catalog.upc_pool;计划中的 items.search 查重未实现(UPC 造号已定案不做) |
-| 6 maintenance | 10, 14, 15, 19, 20, 17 | 同步/feed 双路由是 services 层职责 |
+| 6 maintenance | 10, 14, 15, 19, 20, 17, (32, 33) | 同步/feed 双路由是 services 层职责;配了「维护仓库」的店走 32 + MP_INVENTORY feed(多仓批次 2) |
 | 7 product_clear | 11, 12, 17 | 消费飞书「停用/删除表」:停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM;防重走 ops.feed_log |
 | 8 problem_product_cleanup | 10, 11, 12, 17 | 反补(MP_MAINTENANCE)+删除+停用;定性决策拆在 problem_scan(零沃尔玛调用),删除是否生效靠 catalog_sync 的 2 观测,本工作流不调 2/25 |
 | 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
-| 10 list_new | 8, 30, 16 | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
+| 10 list_new | 8, 30, 16, (33) | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);上架仓 FC ID 走 33 校验(未配置店仍用 30,多仓批次 3);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -118,7 +132,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | 硬限 10000 条;建议 1000 条/<10MB(413 口径官方标 Not applicable) | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | **8/hour**(2026-08-26 三源复核:三处官方一致 10/hour;6/day 确证只挂 feedType=promo 行且本仓无该路径;promo 行内矛盾官方未修,与三件套无关) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB;硬限 10000 条(1000 条/<10MB 是官方 "we recommend" 建议值,2026-08-26 核) | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
 | inventory | 10/hour | 10MB(旧记 ≤10000 item/ship node 无美区官方出处——属 DSV 文档,2026-08-26 降级为自设批次上限) | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
-| MP_INVENTORY(BETA) | 50/hour | 1MB;多 ship node,JSON only | 旧未用;官方未废弃 inventory | 暂不用,盯 BETA 走向 |
+| MP_INVENTORY | 50/hour | 1MB;多 ship node(spec 1.5,JSON only) | 旧未用;**官方站点已无 BETA 标记**(2026-08-24 核验),与 legacy inventory 中立并列,未见弃用/推荐表述 | ✅ **多仓批次 2 已实现**(2026-08-24):`build_payload` v1.5 小写 key、每 SKU `shipNodes[]`(恒单元素=受管仓)、切片 1000 条/950KB、桶 `feeds.post.MP_INVENTORY` 40/hour;缺 `ship_node` 直接报错不发。见 docs/multi_node_plan.md |
 | PUT /v3/price | 100/hour(2026-08-26 复核:被弃用的是 Price management **文档族**,端点级零弃用标记、仍列 100/hour;Sunset 栏只有"2026"无月日,按无预告断供防御——断供即改走价格 feed,函数面已双轨) | — | 一致;维护 README 的 200/min 是错的 | 80/hour |
 | PUT /v3/inventory | 200/min | — | 一致 | 160/min |
 
@@ -263,9 +277,10 @@ api/prices.py
   # 批量走 feeds.submit_feed(feed_type="price");PRICE_AND_PROMOTION 尚未收录
   # (_SLICE_LIMITS 与 FEED_SPEC_VERSIONS 里都没有它,传进去直接 ValueError)
 api/inventory.py
-  put_inventory(store, sku, qty)
-  list_inventories(store, expected_skus=None) -> {sku: qty}   # 分页模型4;单品兜底(端点 22)只在传 expected_skus 时才跑
-  get_inventory(store, sku)
+  put_inventory(store, sku, qty, ship_node=None)          # 不带 node = legacy 单仓;带 node 走端点 32(多仓批次 2,逐节点解析 status)
+  list_inventory_nodes(store, expected_skus=None)         # {sku:{节点:数量}};分页模型4;单品兜底(端点 22)只在传 expected_skus 时才跑(catalog_sync 已撤接线,2026-08-28)
+  list_inventories(store, expected_skus=None)             # ↑ 的求和包装({sku: 合计})
+  get_inventory(store, sku)                               # 全节点合计(GET /v3/inventories/{sku})
 api/orders.py
   iter_orders(store, *, created_start=None, created_end=None,
               last_modified_start=None, limit=200, stats=None)  # 分页模型2;
@@ -308,7 +323,7 @@ api/settings.py
 5. **枚举核验**:items/count 的 status 枚举含 SYSTEM_PROBLEM/IN_PROGRESS 但**无 STAGE**;
    getAllItems 响应 publishedStatus 文档描述 6 值(含 READY_TO_PUBLISH)但无机器可读 enum
    → api 层对未知 status 容错,不做白名单硬校验。
-6. **inventory feed = 10/hour**(10MB),旧代码 50/hr 登记值是错的;MP_INVENTORY(BETA)才是 50/hour。
+6. **inventory feed = 10/hour**(10MB),旧代码 50/hr 登记值是错的;MP_INVENTORY 才是 50/hour(**已无 BETA 标记**,2026-08-24 核验;本仓桶按 40/hour 保守配)。
 7. **nextCursor 官方口径与实证一致**:"cursor 在所有翻页请求中保持不变,有效 2 分钟,
    过期返回 400 Invalid Cursor";offset ≤10000 官方明文。
 

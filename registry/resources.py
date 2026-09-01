@@ -116,6 +116,10 @@ FEED_SPEC_VERSIONS = {
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
+    # 分节点批量库存(多仓批次 2 启用)。⚠ **1.5 的 key 小写**
+    # (inventoryHeader/inventory)与 1.4 大写恰好相反 —— 两套模板不能共用,
+    # 混用的表现是整批 ERR_EXT_DATA_0503009 退回(1.4 小写时的同款错误码)
+    "MP_INVENTORY": "1.5",
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
     # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
     #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
@@ -463,7 +467,10 @@ _KPI_BOARD_COLUMNS = (
     "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
     "refund_amount", "closing_balance", "reserve_to_date", "payout",
     "payout_date", "payment_processor", "settle_cycle", "no_hold",
-    "prev_payout")
+    # 末列 2026-08-31 由 prev_payout(上期回款)换成 total_payout(累计回款,
+    # 所有者:「我需要累计回款,就沃尔玛总共已经付给我的钱」)。旧列在 PG 里
+    # 保留不删(历史行的值仍是当时的真实观测),只是不再投影到看板
+    "total_payout")
 
 KPI_BOARD_OVERVIEW = Spreadsheet(
     name="KPI看板-总览",
@@ -1008,6 +1015,14 @@ RETIRE_LIMITS = Bitable(
         #   分配侧拒收(宁可不分也不错分),上架/维护侧放行
         #   (不拿"未知"当"超限"去删/清零)。方向不同是因为动作不同。
         lead_limit="配送时长限制",
+        # 受管发货节点(所有者建列 2026-08-24,多仓改造)。填 Seller Center →
+        # Shipping Profile → Seller Fulfillment 里的 **FC ID**(即官方 shipNode,
+        # 17-18 位数字)。**留空 = 该店走 Virtual Node**,行为与改造前逐字节一致。
+        # 谁在读:上架(list_new 的 fulfillmentCenterID)、维护(库存读写的节点)。
+        # ⚠ 填错不回落:认不出的 FC ID 会让该店**整店跳过并告警**——静默回落
+        # Virtual Node 等于把新仓的货写到旧节点,比不动更坏(见
+        # docs/multi_node_plan.md §3)。
+        maint_node="维护仓库",
     ),
 )
 

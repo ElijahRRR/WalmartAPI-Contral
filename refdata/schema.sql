@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS catalog.walmart_items (
     variant_group_info jsonb,        -- 变体组详情(isPrimary/分组维度等,原样存)
     price        numeric,
     currency     text,
-    avail_qty    integer,            -- GET /v3/inventories 合并进来
+    avail_qty    integer,            -- GET /v3/inventories **全节点合计**
     published_status    text,
     lifecycle_status    text,
     unpublished_reasons text,
@@ -1023,10 +1023,32 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     payout_date      text,
     payment_processor text, settle_cycle text,
     no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
-    prev_payout      numeric,        -- 严格 -14 天账期,无则 0(业务规则)
+    prev_payout      numeric,        -- **已停用**(所有者 2026-08-31:「这个字段
+                                     -- 不需要」)。原口径 = 严格 -14 天那一期的
+                                     -- Total Payable。列**不删**(DROP 不可回滚,
+                                     -- 且历史行里的值仍是当时的真实观测);
+                                     -- daily_report 不再写它,看板不再投影它。
+    total_payout     numeric,        -- **累计回款**:沃尔玛总共已付的钱
+                                     -- = ops.store_settlements 该店各账期之和。
+                                     -- 由 settlement_sync 维护台账,本表只存快照
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
+);
+
+-- 结算账期台账(2026-08-31,所有者要「累计回款」):**一个账期一行,只增不改**。
+-- 累计回款 = SUM(total_payable),不是把每天的 payout 加起来(那是"当前待打款"
+-- 快照,天天重复计同一笔)。
+-- ⚠ 台账存在的另一半理由是**沃尔玛只保留有限期的对账文件**:
+-- availableReconFiles 里的账期会随时间滚出去。落到本表之后就永远留下,
+-- 所以这份累计**会随运行时间越来越完整**,而不是随沃尔玛的保留期缩水。
+-- 首次同步要把全部可下载账期拉一遍(每期一个 ZIP);之后每两周才多一期。
+CREATE TABLE IF NOT EXISTS ops.store_settlements (
+    store         text NOT NULL,
+    report_date   text NOT NULL,      -- 官方账期标识 MMDDYYYY(原样存,不转 date)
+    total_payable numeric NOT NULL,   -- 该期 PaymentSummary 行的 Total Payable
+    fetched_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, report_date)
 );
 
 -- 绩效问题订单:永久累积,五字段唯一键,首次发现日期永不被覆盖(ON CONFLICT DO NOTHING)
@@ -1149,6 +1171,34 @@ WHERE sources = '{}'::jsonb AND status IN ('suggested', 'executing');
 CREATE UNIQUE INDEX IF NOT EXISTS dispositions_open_uidx
     ON ops.dispositions (store, sku, action)
     WHERE status IN ('suggested', 'executing');
+-- ── 分节点库存(2026-08-24,多仓批次 1)────────────────────────────────────
+-- walmart_items.avail_qty 是**全节点合计**,这张表是它的明细。为什么要分开
+-- 而不是把 avail_qty 改成分节点:合计有几十个消费方(日报/KPI/分配/审核/
+-- 三个库存 provider),动主键会牵动全仓;而真正需要"某个节点多少货"的只有
+-- 维护链的受管仓那一条判据。合计留原样、明细另开一张,是改动面最小的切法。
+--
+-- ⚠ 本轮没扫到的行**不删**(与 walmart_items 的 missing_since 同精神):
+-- 沃尔玛分页漏 SKU 是常态,删了下轮又建,中间那一轮维护链会读到"该节点没货"
+-- 而把库存重推一遍。要判"这个节点还在不在",看 seen_at 跟不跟得上本轮。
+CREATE TABLE IF NOT EXISTS catalog.item_node_inventory (
+    store       text NOT NULL,
+    sku         text NOT NULL,
+    ship_node   text NOT NULL,       -- 官方 shipNode;空串 = 响应未带节点身份
+    avail_qty   integer,
+    seen_at     timestamptz NOT NULL,
+    PRIMARY KEY (store, sku, ship_node)
+);
+CREATE INDEX IF NOT EXISTS item_node_inventory_node_idx
+    ON catalog.item_node_inventory (store, ship_node);
+
+-- 多仓探测(2026-08-24,批次 0):这个 SKU 的库存分布在几个发货节点上。
+-- 现状全店单节点(每店一个 Virtual Node),所以这一列**恒 1** —— 它的价值全在
+-- "什么时候不再是 1":所有者自建第二个仓之后,catalog_sync 第一轮就会把它变成 2,
+-- 摘要里那行告警随即出现。没有它的话多仓是**静默**发生的:avail_qty 变成合计、
+-- 维护链按合计比对却只写单仓,一路错到底都不报错(见 docs/multi_node_plan.md §1)。
+-- 本轮没拿到库存时保留上一轮值(与 avail_qty 同款 COALESCE),不刷成 NULL。
+ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS node_count smallint;
+
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
 

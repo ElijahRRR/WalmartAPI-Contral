@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **73 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **75 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **2262 个单元测试**。
+- **2306 个单元测试**。
 
 ---
 
@@ -231,7 +231,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 已宣布停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期):切断当天
 **全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
 `"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
-| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`) |
+| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
 | **USPTO 商标库** | 审核 R5 商标反查 | 跨库只读,默认关 |
 
 ---
@@ -348,6 +348,8 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
 | `error_reclass_report` | | 报错归类新旧对照(只读排查,手动跑):现行 `problem_products.categorize()` 的 A-L 码 vs 新引擎 `services.error_taxonomy` 的 16 码,出迁移矩阵 / unknown 全文 / 政策表缺口 / feed 政策族分类。方案 `docs/error_taxonomy.md`,所有者过完这份账才换轨 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
+| `node_clear` | 危 调 | 把**指定发货节点**的库存整节点清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。**拒绝清受管仓**(自动链正在维护它,清了下轮写回来);写 0 幂等,失败重跑即补 |
+| `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |
 
 **定价口径**:落地价 =(亚马逊单价 + 运费)× 区间倍率,按**配送方式**(FBA/FBM)
 选区间。⚠ 运费没采到(NULL)一律不改价不上架 —— 当 0 用会定出偏低的价,而两侧都不报错。

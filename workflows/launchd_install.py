@@ -24,6 +24,7 @@
 """
 
 import logging
+import os
 from pathlib import Path
 
 from registry import paths, schedule
@@ -98,4 +99,34 @@ def run(params: dict) -> str:
     lines += ["", "⚠ 批二开之前先停旧 KPI 与旧订单同步(两条同停,见 "
               "docs/legacy_schedules.md);批三每条先手动 --dry-run 人眼确认",
               "看某条跑没跑:launchctl list | grep com.walmartapi"]
+    lines += _yingdao_lines(dest, log_dir)
     return "\n".join(lines)
+
+
+def _yingdao_lines(dest: Path, log_dir: Path) -> list[str]:
+    """影刀启动代理:落盘 + 给出 load 命令(**不定时**,只等 kickstart)。
+
+    它不在调度表里 —— 它没有时间点,是 daily_report 写完 input.json 之后
+    按需 kickstart 的一个跳板。存在的唯一理由是**跨越进程上下文**:
+    日报链跑在智能体上下文里,那里没有 Aqua session,直接 spawn 影刀
+    必崩(2026-09-01 崩溃报告实证);launchd 的 gui/<uid> 有,所以让它代劳。
+    """
+    uuid = os.environ.get("YINGDAO_ROBOT_UUID", "").strip()
+    app = paths.yingdao_app()
+    out = ["", "── 影刀启动代理(不定时,只等 daily_report 按需 kickstart)──"]
+    if not uuid:
+        return out + ["  ⚠ YINGDAO_ROBOT_UUID 未配置,跳过 —— 配好再跑一次本工作流"]
+    p = Path(dest) / f"{launchd.YINGDAO_LABEL}.plist"
+    p.write_bytes(launchd.render_yingdao(str(app), uuid, log_dir))
+    logger.info("写 %s", p)
+    if not app.exists():
+        out.append(f"  ⚠ 影刀主程序不在 {app}(装在别处就设 env YINGDAO_APP "
+                   f"后重跑本工作流;plist 里那条路径是写死的)")
+    return out + [
+        f"  已写 {p}",
+        f"  launchctl load -w {p}",
+        "  ⚠ **必须在图形登录会话里 load**(plist 声明 LimitLoadToSessionType=Aqua):",
+        "     ssh 进去 load 会装不上,而症状是日报那边 kickstart 退非 0。",
+        f"  自检:launchctl kickstart -k gui/$(id -u)/{launchd.YINGDAO_LABEL}"
+        " —— 影刀应当弹出 Runner 窗口",
+    ]

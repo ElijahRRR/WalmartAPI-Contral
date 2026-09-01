@@ -9,11 +9,18 @@
 连库,它在任何时刻都能读到任意一天的数据,而 cli.py 的 flock 管不到它。
 
 旧系统实证规则全部照搬(docs/legacy_survey.md #daily_report):
-- spawn 用 shadowbot:Run?robot-uuid=<uuid> 协议 URL 非阻塞启动,**拿影刀主
-  程序绝对路径直启**(registry.paths.yingdao_app(),env YINGDAO_APP 覆盖)。
-  ⚠ 不走 `open <协议URL>`:调度沙箱里 open 要经 Launch Services 分发,被沙箱
-  边界拦下退 1(2026-08-24 生产实证);旧 walmart-kpi-daily 直启主程序是
-  日志验证过的路。应用必须已在「我获取的应用」跑过一次(首次有授权弹窗)
+- spawn **交给 launchd**:`launchctl kickstart -k gui/<uid>/com.walmartapi.yingdao`
+  拉起一个只等触发的 LaunchAgent(services/launchd.render_yingdao 生成,
+  launchd_install 落盘)。协议 URL 与 UUID 写在那份 plist 的 ProgramArguments 里。
+  ⚠ **为什么不能由本进程直接 spawn**(2026-09-01 崩溃报告实证,incident
+  6B391891):日报链 runner=gpt,进程在智能体上下文里(coalitionName=
+  com.openai.codex、responsibleProc=ChatGPT、procRole=Unspecified),没有 Aqua
+  GUI session;影刀是 Electron/AppKit 应用,启动要向 LaunchServices 注册,
+  于是 `_RegisterApplication` → abort() → SIGABRT。同一条命令在终端手敲正常。
+  ⚠ 2026-08-24 那次 `open` 退 1 是**同一个根因的另一种表现**;当时换成直启
+  主程序 = 换汤不换药,从"起不来"变成"崩溃"。argv 怎么写都救不了 ——
+  启动必须由本来就在 Aqua session 里的东西发起,launchd 的 gui/<uid> 就是它。
+  应用仍须已在「我获取的应用」跑过一次(首次有授权弹窗)
 - 新鲜度校验:latest.json 的 scraped_at 必须晚于本次触发时刻,旧数据继续等
   (这同时是防重:影刀已在跑时绝不能再 spawn,两次互抢会让校验反复失败到超时)
 - 超时 600s / 轮询 15s(env YINGDAO_TIMEOUT_SEC / YINGDAO_POLL_INTERVAL 可调);
@@ -33,7 +40,7 @@ import time
 from datetime import datetime, timezone
 
 from registry import paths
-from services import kpi, stores
+from services import kpi, launchd, stores
 
 logger = logging.getLogger("services.yingdao")
 
@@ -119,11 +126,11 @@ def write_input(rows: list[dict]) -> dict[str, int]:
 def spawn() -> bool:
     """输入:无 → 输出:是否成功发出启动指令(非阻塞,不代表 RPA 跑完)。
 
-    直启主程序、协议 URL 作 argv,与旧 walmart-kpi-daily 同款(旧日志实证
-    能拉起 Runner 窗口)。**不做 `open` 兜底**:两条启动路只会让"哪条路
-    在跑"变成猜谜,沙箱里 open 恒失败,兜它等于每天多一次注定失败的调用。
-    Popen 不 wait:影刀是独立应用,跑完与否由 wait_fresh() 按 latest.json
-    的新鲜度判,不看进程退出码。
+    交给 launchd 的 gui/<uid> 域拉起(理由见模块头注:本进程所在的上下文
+    没有 Aqua session,直接 spawn 必崩)。**不做任何兜底**:两条启动路只会
+    让"哪条路在跑"变成猜谜,而直启那条在调度里恒崩,兜它等于每天多制造
+    一份崩溃报告。跑完与否由 wait_fresh() 按 latest.json 的新鲜度判,
+    不看退出码 —— kickstart 成功只代表"指令发出去了"。
     """
     uuid = _robot_uuid()
     if not uuid:
@@ -133,13 +140,24 @@ def spawn() -> bool:
     if not app.exists():
         logger.warning("影刀主程序不存在:%s(装在别处就设 env YINGDAO_APP)", app)
         return False
+    target = f"gui/{os.getuid()}/{launchd.YINGDAO_LABEL}"
     try:
-        subprocess.Popen([str(app), f"shadowbot:Run?robot-uuid={uuid}"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception as e:
-        logger.warning("影刀启动失败: %s", e)
+        # -k:已在跑就先杀再起。影刀已在跑时重复 spawn 会让 wait_fresh 的
+        # 新鲜度校验反复失败到超时(旧系统 perf.py:1113 同款教训),
+        # 与其两个实例互抢,不如明确地重来一次
+        r = subprocess.run(["launchctl", "kickstart", "-k", target],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:                                  # noqa: BLE001
+        logger.warning("影刀启动失败(launchctl 调不动): %s", e)
         return False
+    if r.returncode != 0:
+        # 最常见是 agent 没装:`python cli.py launchd_install` 后
+        # `launchctl load -w ~/Library/LaunchAgents/<label>.plist`
+        logger.warning("影刀启动失败:launchctl kickstart %s 退 %d(%s)。"
+                       "多半是代理没装 —— 跑 launchd_install 并 load 那份 plist",
+                       target, r.returncode, (r.stderr or "").strip()[:200])
+        return False
+    return True
 
 
 def is_fresh(data: dict, trigger_utc: datetime) -> bool:

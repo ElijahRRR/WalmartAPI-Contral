@@ -5,9 +5,11 @@
   ② **缺键约定**:上一版没有这一列 ⇒ 不产事件;键在而值被清空 ⇒ 产事件;
   ③ **列在所有店同时消失** ⇒ 表结构变化,只告警不逐店刷屏;
   ④ **飞书失败不产事件、不覆盖快照**(把"读不到"记成"被清空"会造两轮假事件);
-  ⑤ severity 按列(类目/渠道 high、限额/倍率 mid、目标值 info、未知列 mid),
+  ⑤ severity 按列(类目/渠道 high、限额/倍率 mid、目标值 info、登记但未分档 mid),
      0 与非 0 之间在容量/清零两列上是**开关**,单独一档;
-  ⑥ `enabled=None` 是"列没读到"不是状态,null↔值 不产事件。
+  ⑥ `enabled=None` 是"列没读到"不是状态,null↔值 不产事件;
+  ⑦ **未登记列只记列名不记值**(2026-09-01 生产实跑):飞书 `SourceID` 的值里
+     含行内容的哈希,整表入快照 = 谁动一格就刷一批假 `store_limits_changed`。
 
 沙箱 PG 集成用例在文件末尾:连不上就 skip。
 """
@@ -24,9 +26,20 @@ from services import store_events as se
 F = resources.RETIRE_LIMITS.fields
 
 
-def _snap(limits=None, stores=None, scope=()):
+def _snap(limits=None, stores=None, scope=(), extra_cols=()):
     return {"v": sc.SNAPSHOT_VERSION, "limits": limits or {},
+            "limits_extra_cols": list(extra_cols),
             "stores": stores or {}, "scope_excluded": list(scope)}
+
+
+#: 飞书内部字段 `SourceID` 的**真实形状**(生产原样):base64 复合键,解开是
+#: `7670866633484766507:H006詹松涛:a02d434c87d03739c341c5cb8996d719:1` ——
+#: 第三段是**行内容的哈希**,行被编辑就变。它就是这次改口径的现场。
+_SOURCE_ID = ("NzY3MDg2NjYzMzQ4NDc2NjUwNzpIMDA26Km55p2+5rabOmEwMmQ0MzRjODdkMD"
+              "M3MzljMzQxYzVjYjg5OTZkNzE5OjE=")
+#: 同一行被人编辑之后(只有哈希那一段变了)—— 配置一个字没改,它却变了
+_SOURCE_ID_AFTER_EDIT = ("NzY3MDg2NjYzMzQ4NDc2NjUwNzpIMDA26Km55p2+5rabOmZmZmZm"
+                         "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmOjE=")
 
 
 # ── ① 首次快照 ────────────────────────────────────────────────────────────
@@ -42,6 +55,22 @@ def test_snapshot_version_bump_is_treated_as_first():
     """形状换了就当首次:两套形状硬比会产出满屏假事件。"""
     old = {"v": 0, "limits": {"A085": {F.category1: "Home"}}}
     assert sc.diff(old, _snap(limits={"A085": {F.category1: "Toys"}})) == []
+
+
+def test_v1_snapshot_with_unregistered_values_produces_nothing():
+    """★ v1→v2 的现场陷阱:生产库里那份 v1 快照**存着 SourceID 等未登记列的值**。
+
+    v2 只存登记列,拿两版硬比的话那些列会被判成"在所有店上整体消失",刷出一批
+    假的表结构/清空事件。没有可比的上一版就不是变化 —— 与首次快照同一条铁规。
+    """
+    v1 = {"v": 1,
+          "limits": {"A085": {F.category1: "Home", "SourceID": _SOURCE_ID,
+                              "序号": "1"}},
+          "stores": {"A085": {"enabled": True}}, "scope_excluded": []}
+    cur = _snap(limits={"A085": {F.category1: "Toys"}},
+                stores={"A085": {"enabled": False}},
+                extra_cols=("SourceID", "序号"))
+    assert sc.diff(v1, cur) == []
 
 
 # ── ② 缺键约定 ────────────────────────────────────────────────────────────
@@ -126,10 +155,11 @@ def test_zero_is_a_switch_on_two_columns_only():
     assert _one(F.max_online, "3000", "")["severity"] == "mid"
 
 
-def test_unknown_column_is_mid_not_info():
-    """将来有人往表里加一列(多半是新加的闸):不知道就按 mid,
-    当成"不值一提"会让它第一次生效时没人知道。"""
-    assert _one("将来某一列", "a", "b")["severity"] == "mid"
+def test_registered_but_ungraded_column_is_mid_not_info():
+    """登记进 registry 了、但没在 `_SEV_BY_ATTR` 分档的列(维护仓库就是一个,
+    将来新加的闸同理):不知道就按 mid,当成"不值一提"会让它第一次生效时没人
+    知道。**未登记列走不到这里** —— 它们压根不进快照的值字典。"""
+    assert _one(F.maint_node, "1234", "5678")["severity"] == "mid"
 
 
 # ── 行级事件 ──────────────────────────────────────────────────────────────
@@ -274,6 +304,36 @@ def test_check_and_record_lands_events_and_saves_the_new_snapshot(monkeypatch):
     assert conn.saved is not None and "Toys" in conn.saved
 
 
+def test_version_migration_skips_the_diff_but_still_saves_and_says_so(
+        monkeypatch):
+    """★ v1(存着未登记列的值)→ v2:不产事件、**但快照要覆盖**(与飞书失败
+    那条路径正好相反),而且摘要必须**明说**这一轮为什么没比对。
+
+    静默的话摘要上只显示"无变更",而这一轮真发生的配置改动确实丢了一轮。
+    """
+    v1 = {"v": 1, "limits": {"A085": {F.category1: "Home",
+                                      "SourceID": _SOURCE_ID}},
+          "stores": {"A085": {"enabled": True}}, "scope_excluded": []}
+    cur = _snap(limits={"A085": {F.category1: "Toys"}},
+                stores={"A085": {"enabled": False}}, extra_cols=("SourceID",))
+    conn = _Conn(stored=v1)
+    monkeypatch.setattr(sc, "take_snapshot", lambda: cur)
+    events, warn = sc.check_and_record(conn)
+    assert events == [] and conn.events == []
+    assert conn.saved is not None and '"v": 2' in conn.saved
+    assert _SOURCE_ID not in conn.saved, "新快照里不许再有未登记列的值"
+    assert warn and "没比对" in warn and "v1" in warn and "v2" in warn
+    # 下一轮(两版都是 v2)恢复正常比对
+    conn2 = _Conn(stored=cur)
+    monkeypatch.setattr(sc, "take_snapshot",
+                        lambda: _snap(limits={"A085": {F.category1: "Baby"}},
+                                      stores={"A085": {"enabled": False}},
+                                      extra_cols=("SourceID",)))
+    events2, warn2 = sc.check_and_record(conn2)
+    assert warn2 is None
+    assert [e["event"] for e in events2] == [se.STORE_LIMITS_CHANGED]
+
+
 def test_first_run_saves_the_snapshot_without_events(monkeypatch):
     """首轮:一条事件都不产,但快照必须落 —— 不落的话永远停在"首次"。"""
     conn = _Conn(stored=None)
@@ -320,22 +380,91 @@ def test_enabled_is_none_when_the_column_is_gone_from_the_whole_sheet(monkeypatc
                                      "A107": {"enabled": True}}
 
 
-def test_limits_snapshot_takes_the_whole_row_uncropped(monkeypatch):
-    """不传 field_names:裁剪了就只看得见今天登记过的列,将来有人加一列时
-    它的第一次生效永远进不了事件流。值存**原文**(空串≠没填≠垃圾值)。"""
+def _limits_rows(monkeypatch, rows):
+    """输入:飞书记录的 fields 列表 → 输出:seen(记下 field_names 传了没)。"""
     seen = {}
 
     def _list(table, *, field_names=None, **kw):
         seen["fields"] = field_names
-        return [{"fields": {F.store: " A085 ", F.category1: [{"text": "Home"}],
-                            F.max_online: 3000, "将来某一列": ""}},
-                {"fields": {F.store: ""}}]         # 无店名的行整行丢掉
+        return [{"fields": f} for f in rows]
 
     monkeypatch.setattr(sc.feishu, "list_records", _list)
-    out = sc._limits_snapshot()
-    assert seen["fields"] is None
-    assert out == {"A085": {F.category1: "Home", F.max_online: "3000",
-                            "将来某一列": ""}}
+    return seen
+
+
+def test_limits_snapshot_keeps_registered_columns_and_only_names_the_rest(
+        monkeypatch):
+    """★ 整表照拉(要看得见多出来的列),但**值只收登记列**。
+
+    未登记列只留列名 —— 记了值就等于把噪音换个地方存。值存**原文**
+    (空串≠没填≠垃圾值)。
+    """
+    seen = _limits_rows(monkeypatch, [
+        {F.store: " A085 ", F.category1: [{"text": "Home"}],
+         F.max_online: 3000, "SourceID": _SOURCE_ID, "序号": 1},
+        {F.store: ""},                              # 无店名的行整行丢掉
+    ])
+    limits, extra = sc._limits_snapshot()
+    assert seen["fields"] is None, "裁剪在 API 那一步 = 看不见多出来的列"
+    assert limits == {"A085": {F.category1: "Home", F.max_online: "3000"}}
+    assert extra == ["SourceID", "序号"]
+    assert _SOURCE_ID not in str(limits), "未登记列的值绝不许进快照"
+
+
+def test_registered_column_list_comes_from_registry_not_a_copy():
+    """白名单必须遍历 registry 登记项(`_fields` 造的是 SimpleNamespace,
+    取全部值只能走 vars());抄一份清单会跟 registry 各漂各的。"""
+    cols = sc._registered_limits_cols()
+    assert F.store not in cols, "店铺列是键,不进值字典"
+    assert {F.category1, F.channel_limit, F.max_online, F.maint_node} <= cols
+    assert "SourceID" not in cols
+
+
+def test_unregistered_column_value_change_produces_no_event(monkeypatch):
+    """★ 本次改口径的现场:`SourceID` 的值里含**行内容的哈希**,谁动一下那张
+    表的任何一格它就跟着变。整表入快照的后果是凭空刷出一批 store_limits_changed
+    (所有者实跑第一轮 4 条变更里 2 条是这种噪音)。
+
+    口径:未登记列**没有任何代码消费它**,改了系统行为一个字节都不变 ——
+    不是治理事件。
+    """
+    _limits_rows(monkeypatch, [{F.store: "A085", F.category1: "Home",
+                                "SourceID": _SOURCE_ID}])
+    limits1, extra1 = sc._limits_snapshot()
+    _limits_rows(monkeypatch, [{F.store: "A085", F.category1: "Home",
+                                "SourceID": _SOURCE_ID_AFTER_EDIT}])
+    limits2, extra2 = sc._limits_snapshot()
+    assert limits1 == limits2 and extra1 == extra2 == ["SourceID"]
+    assert sc.diff(_snap(limits=limits1, extra_cols=extra1),
+                   _snap(limits=limits2, extra_cols=extra2)) == []
+
+
+def test_new_unregistered_column_is_one_schema_event_not_per_cell():
+    """"有人往表里加了一列"本身值得知道 —— 但只此**一条**,store=NULL、info、
+    detail 里只有列名没有值。"""
+    prev = _snap(limits={"A085": {F.category1: "Home"},
+                         "A107": {F.category1: "Toys"}},
+                 extra_cols=("SourceID",))
+    cur = _snap(limits={"A085": {F.category1: "Home"},
+                        "A107": {F.category1: "Toys"}},
+                extra_cols=("SourceID", "备注", "序号"))
+    evs = sc.diff(prev, cur)
+    assert len(evs) == 1
+    e = evs[0]
+    assert e["store"] is None
+    assert e["event"] == se.STORE_LIMITS_COLUMNS_CHANGED
+    assert e["severity"] == "info"
+    assert e["detail"] == {"added": ["备注", "序号"], "removed": []}
+
+
+def test_unregistered_column_gone_is_the_same_one_event():
+    evs = sc.diff(_snap(extra_cols=("SourceID", "备注")),
+                  _snap(extra_cols=("SourceID",)))
+    assert [(e["store"], e["event"], e["detail"]) for e in evs] == [
+        (None, se.STORE_LIMITS_COLUMNS_CHANGED,
+         {"added": [], "removed": ["备注"]})]
+    # 没动就没事件(列名集合按集合比,顺序不算变化)
+    assert sc.diff(_snap(extra_cols=("b", "a")), _snap(extra_cols=("a", "b"))) == []
 
 
 # ── 沙箱 PG 集成 ──────────────────────────────────────────────────────────

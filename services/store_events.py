@@ -58,6 +58,13 @@ PHISHING_BRAND_EXPOSURE = "phishing_brand_exposure"  # risk(波及,逐店)
 # 全部由**人的动作**产生,极低频:配置 diff 一天一轮多半零事件,占用只在
 # alloc_plan/alloc_backfill/store_release 三条链的真跑里落。
 STORE_LIMITS_CHANGED = "store_limits_changed"        # governance(一列一条)
+# 限额表**表结构**变化(未登记列首次出现 / 整体消失,2026-09-01 接线):
+# store=NULL —— 一张表多出一列不属于任何一家店,与 STORE_SCOPE_CHANGED 同款。
+# 一次变化**一条**(不是每列一条):列是一起加的,报成 N 条只是同一件事刷 N 遍。
+# 它与 STORE_LIMITS_CHANGED 的分工是硬的:未登记列**没有任何代码消费它**,
+# 值改了系统行为一个字节都不变(所以不产逐格事件);但"有人往表里加了一列"
+# 本身值得知道(所以单独记一条)。见 services/store_config._limits_snapshot。
+STORE_LIMITS_COLUMNS_CHANGED = "store_limits_columns_changed"   # governance
 STORE_LIMITS_ROW_ADDED = "store_limits_row_added"    # governance(限额表新增店行)
 STORE_LIMITS_ROW_REMOVED = "store_limits_row_removed"  # governance(店行消失)
 STORE_ENABLED_CHANGED = "store_enabled_changed"      # governance(凭证表「启用」)
@@ -90,6 +97,7 @@ CLASS = {
     PHISHING_ORDER: "risk",
     PHISHING_BRAND_EXPOSURE: "risk",
     STORE_LIMITS_CHANGED: "governance",
+    STORE_LIMITS_COLUMNS_CHANGED: "governance",
     STORE_LIMITS_ROW_ADDED: "governance",
     STORE_LIMITS_ROW_REMOVED: "governance",
     STORE_ENABLED_CHANGED: "governance",
@@ -514,6 +522,13 @@ def _brief_body(event: str, d: dict) -> str:
         return f"启用 {d.get('old')}→{d.get('new')}"
     if event == STORE_SCOPE_CHANGED:
         return f"规划外名单 {d.get('old')}→{d.get('new')}"
+    if event == STORE_LIMITS_COLUMNS_CHANGED:
+        # 只报列名,**绝不报值** —— 未登记列的值正是本事件要挡掉的那种噪音
+        parts = [f"{w} {'、'.join(cols)}"
+                 for w, cols in (("新增", d.get("added") or []),
+                                 ("消失", d.get("removed") or []))
+                 if cols]
+        return "限额表未登记列变化" + (f":{';'.join(parts)}" if parts else "")
     if event == STORE_LIMITS_ROW_ADDED:
         return "限额表新增店行"
     if event == STORE_LIMITS_ROW_REMOVED:
@@ -534,9 +549,13 @@ def _brief_body(event: str, d: dict) -> str:
     return ""
 
 
+#: store 恒为 NULL 的码(全局事实,不属于任何一家店):渲染成「全局」而不是「?」
+_GLOBAL_EVENTS = frozenset({TRO_BRAND_HIT, STORE_SCOPE_CHANGED,
+                            STORE_LIMITS_COLUMNS_CHANGED})
+
+
 def brief(e: dict) -> str:
     """输入:事件行 → 输出:摘要用短句(`店铺 主体`;全事件码通用)。"""
     body = _brief_body(e["event"], e.get("detail") or {})
-    who = e.get("store") or ("全局" if e["event"] in
-                             (TRO_BRAND_HIT, STORE_SCOPE_CHANGED) else "?")
+    who = e.get("store") or ("全局" if e["event"] in _GLOBAL_EVENTS else "?")
     return f"{who} {body or e['event']}"

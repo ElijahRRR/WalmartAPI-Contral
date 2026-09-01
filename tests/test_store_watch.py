@@ -168,6 +168,9 @@ def _all_families():
          "detail": {"old": True, "new": False}},
         {"store": None, "event": se.STORE_SCOPE_CHANGED, "severity": "mid",
          "detail": {"old": [], "new": ["谭总"]}},
+        # 限额表表结构:store=NULL,detail 里只有列名(未登记列的值绝不入账)
+        {"store": None, "event": se.STORE_LIMITS_COLUMNS_CHANGED,
+         "severity": "info", "detail": {"added": ["备注"], "removed": []}},
         {"store": "A085", "event": se.STORE_DEREGISTERED, "severity": "high",
          "detail": {"enabled": True}},
         {"store": "A085", "event": se.CLAIM_RELEASED, "severity": "high",
@@ -202,6 +205,7 @@ def test_brief_keeps_the_three_status_lines_unchanged():
 def test_brief_labels_global_rows_instead_of_a_question_mark():
     assert se.brief(_all_families()[1]).startswith("全局 TRO 品牌「ACME」")
     assert se.brief(_all_families()[7]).startswith("全局 规划外名单")
+    assert se.brief(_all_families()[8]) == "全局 限额表未登记列变化:新增 备注"
 
 
 # ── 一轮:推送 / 标记的因果 ─────────────────────────────────────────────────

@@ -494,10 +494,17 @@ CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧�
 -- recon_done:<店铺> = 已处理对账账期数组(台账):烂账入库过滤后某期可能
 -- 0 行落库,只看 settlement_lines DISTINCT period 会把它当缺失账期无限重拉
 -- store_config = 治理配置快照(services/store_config,2026-08-30):上下架限额表
---   整表原文 + 凭证表「启用」+ 规划外名单,与上一版逐格比,变化落 ops.store_events
---   的治理类事件。**只留最近一版**(整份覆盖);飞书读失败时既不产事件也不覆盖
---   —— 把"读不到"记成"被清空"会造两轮假事件,而账本只追加、删不掉。
+--   的**登记列**原文 + 凭证表「启用」+ 规划外名单,与上一版逐格比,变化落
+--   ops.store_events 的治理类事件。**只留最近一版**(整份覆盖);飞书读失败时
+--   既不产事件也不覆盖 —— 把"读不到"记成"被清空"会造两轮假事件,而账本只追加、
+--   删不掉。形状带版本号 `v`,**版本不同一律当首次快照**(不产事件、只覆盖)。
 --   ⚠ 密钥列绝不进快照:凭证表只点名取「店铺」「启用」两列(本表无 chmod 600)
+--   ⚠ v2(2026-09-01 生产实跑改口径):限额表**未登记列只存列名不存值**
+--   (`limits_extra_cols`)。v1 存的是整表原文,里面有飞书内部字段 `SourceID`——
+--   它的值是 base64 复合键、**含行内容的哈希**,谁动一格就全表跟着变,于是
+--   凭空刷出一批 store_limits_changed 把真信号淹掉。口径:未登记列没有任何代码
+--   消费它,改了系统行为一个字节都不变 ⇒ 不产逐格事件;只在**首次出现/整体
+--   消失**时产一条 store_limits_columns_changed(store=NULL,表结构级)
 
 -- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
 CREATE TABLE ops.rate_events (           -- 跨进程限速事件(api/_client 稀缺桶)
@@ -553,9 +560,10 @@ CREATE TABLE ops.store_kpi_daily (
 --   risk       daily_report(三状态迁移)、product_audit(tro_brand_hit 源头 +
 --              tro_brand_exposure 波及)、order_audit(phishing_order 收单店 +
 --              phishing_brand_exposure 波及);
---   governance services/store_config(限额表逐格 diff、凭证表在册/启用、规划外
---              名单;快照存 ops.cursors['store_config'];**由 store_watch 每轮
---              调用** —— 它是这个模块唯一的属主,别再从别处调)、alloc_plan /
+--   governance services/store_config(限额表**登记列**逐格 diff + 未登记列的
+--              表结构 diff、凭证表在册/启用、规划外名单;快照存
+--              ops.cursors['store_config'];**由 store_watch 每轮调用** ——
+--              它是这个模块唯一的属主,别再从别处调)、alloc_plan /
 --              alloc_backfill(claim_created,**按 claim_many 的真落库行**计数,
 --              用"成功数"会把幂等重跑记成天天新占)、store_release
 --              (claim_released:整店 high、点名/csv mid)。

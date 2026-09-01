@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **75 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **76 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **2322 个单元测试**。
+- **2385 个单元测试**。
 
 ---
 
@@ -307,6 +307,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 | `spec_split` | | 把官方 **450MB 单文件** MP_ITEM spec 流式拆成按 PT 的目录(`_pt_index`/`_orderable`/`_header`/`{PT}.json`)。mmap + 括号配对,**整份 JSON 从不变成 Python 对象**(旧仓 json.load 膨胀 1.3GB 触发 OOM);与在用版**并排放**不覆盖,`-p diff=1` 出换版差集(新增顶层必填 × 影响 PT 数);已拆好的目录用 `-p out=<目录> -p diff=1` 只对账不重拆 |
 | `pt_spec_sync` | | 用**本地官方 spec**(`<DATA_ROOT>/specs/MP_ITEM/<版本>/`,上架链同一份)重建类目准入明细:由 spec 必填字段推「要什么认证」→「中国搬运能不能做」(是/需评估/否),落 `audit.walmart_pt_spec`,导出**飞书粘贴表(10 列整齐)+ 差异复核表(带判据溯源)**;顺带对账「spec 有、准入明细没有」的类目,并与现表逐条比出收紧/放松。`-p pt=<名字>` 单点看证据链;`-p explain=<PT>` 对表字段读法;`-p sheet=<现表CSV>` 逐 PT 逐字段比现表与 spec 的差异(双向);`-p spec_dir=<新版目录>` 换版对账(不动 registry)。**不调接口** |
 | `audit_reason_backfill` | 一 | 存量「理由未留存」批量刷成旧 run 真实命中,顺带产出规则码分布(挑误伤类型的输入) |
+| `policy_sync` | 危 | 官方禁售政策转录件 → `audit.walmart_prohibited_policy`(手动跑,不进调度)。来源是 **`refdata/policy_pages/en/*.md`**(skill `policy-refresh` 派子代理逐页忠实转录进仓,**不是爬虫**;git diff 即政策变更审计记录)。只动机器六列(`full_policy`/`official_url`/`policy_updated_at`/`synced_at`/`raw`,存量 `category_en` 不改名),**中文人工列一律不读不写**;官方有表无 → 新增(id 从 max+1 连续),表有官方无 → **不删行**只报告,对不上的**不猜**、进「未对上清单」等所有者裁决。逐类别 diff 落 `<DATA_ROOT>/reports/policy_sync.txt`。⚠ **首轮真跑前置**:旧仓存量 7 行用缩写名(`Drugs & Paraphernalia`、`Electronics & RF` 一族),按「不猜」口径对不上官方全称 —— 必须先按 dry-run「未对上清单」逐条裁决(改名/新增/忽略),否则会产生**同概念双行**;报告在「未对上」与「官方已不含」之间给出「疑似改名对」提示。⚠ **dry-run 必须人眼核对两处**:①「未对上」清单逐条裁决;②「对上」清单里带 `←官方名` 标记的行(表内名与官方拼写不同)。⚠ 真跑连带后果三条(摘要会逐条提醒):①手动递增 `AUDIT_RULES_VERSION`(政策表变 = L3 输入变,版本号不会自己动);②新增行人工中文列全 NULL,S4 现渲染为**空壳标题**待运营补中文;③`services/audit_l3.py` 的 S1/S3 提示词硬写「37 条」将与实际行数不符,是否随第三步 L3 批修改由所有者定(本工作流不动它)|
 
 **重审政策**(唯一出处 `product_audit._DEFAULT_CANDIDATE`):没结论的审;
 `pending` 隔天重试;`approved`/`rejected` **不自动重审**。要整批重审只有显式通道:

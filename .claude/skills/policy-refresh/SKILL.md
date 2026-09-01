@@ -68,10 +68,25 @@ description: 沃尔玛官方禁售政策全量刷新流程:总览页核对 → �
 
 ## 第 5 步 · 入库(先 --dry-run,人眼确认再真跑)
 
+```bash
+python cli.py policy_sync --dry-run     # 先跑这个,报告落 <DATA_ROOT>/reports/policy_sync.txt
+python cli.py policy_sync               # 人眼确认后才跑真的(缺省即真跑)
+```
+
 - `refdata/policy_pages/en/*.md` → `audit.walmart_prohibited_policy`,
   upsert 口径见 `docs/policy_sync.md` §二:存量行不改名、人工中文列一律不碰、
   缺席页不刷新、官方已不含的行不删只报告;
+- **首跑 dry-run 必须人眼核对两处**(报告打了标记,但没人看 = 白打):
+  ①「未对上」清单——生产表存量 7 行用旧缩写名(Drugs & Paraphernalia、
+  Electronics & RF 一族),按「不猜」口径对不上官方全称,**逐条裁决改名/新增/忽略**,
+  直接真跑会写出**同概念双行**并污染 S2 候选(报告在「未对上」与「官方已不含」
+  之间给出「疑似改名对」提示,顺着它判);
+  ②「对上」清单里带 `←官方名` 标记的行 —— 表内名与官方拼写不同,本轮**不改名**
+  (改名随 L3 提版批做),确认这些行确实指的是同一个类别;
 - **真跑同批手动递增 `AUDIT_RULES_VERSION`**(政策表内容变化 = L3 判定输入变化);
+- 真跑摘要还会点名另两条连带后果:新增行人工中文列全 NULL(S4 现渲染为空壳标题,
+  待运营补中文)、`services/audit_l3.py` S1/S3 提示词硬写「37 条」将与实际行数不符
+  (是否修改随第三步 L3 批由所有者定);
 - 喂 LLM 的"机器喂入版"不落库,由渲染层从 full_policy 派生(剥 URL/导览/免责声明/头注/chrome,
   详见 `docs/policy_sync.md` §十)。
 

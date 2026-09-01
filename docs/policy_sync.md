@@ -4,10 +4,9 @@
 > 数据库政策表与 LLM prompt 的政策段都必须从官方同步;②**先重塑政策表,再跑分类
 > 对照**。本方案即第①条的落地;分工照旧:规划侧定稿本文,执行侧照 §七清单实现。
 >
-> ⚠ 本定稿**撤销** `docs/api_blueprint.md`「明确不做」里的
-> 「marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁移)」一条
-> (那是迁移期决定,如今政策表成为归类 join 与 L3 判定的权威源,必须可同步)。
-> 执行侧同步修改蓝图并注明本定稿出处。
+> ⚠ 本定稿曾**撤销** `docs/api_blueprint.md`「明确不做」里的政策页爬虫一条 ——
+> **该撤销已被 §九/§十 收回**(2026-09-01):仓内**不实现爬虫**,蓝图该条保留并加注,
+> 政策来源改为 refdata 转录件(`.claude/skills/policy-refresh` 流程)。
 
 ## 〇、事实基础(2026-09-01 实查)
 
@@ -39,17 +38,17 @@
 | `category_en` | **存量 37 行不改名**(audit_reason/L3 存量对齐挂在现值上,改名随 L3 提版批);新类别行用**官方拼写**插入,`id = max(id)+1` 起 |
 | `full_policy` | **官方类别页正文全文**(html→纯文本,保留段落),每次同步全量刷新 |
 | `official_url` | 官方页 URL,刷新 |
-| `policy_updated_at` | 官方页 "Last Updated" 日期(解析不到用抓取日,并在 raw 里标注) |
+| `policy_updated_at` | 官方页 "Last Updated" 日期(修订 2026-09-01:解析不到**置 NULL**,原文存 `raw.last_updated_raw` 并在摘要与报告点名 —— **不拿抓取日顶替**,否则「官方没改过」与「我们没读懂日期」不可区分) |
 | `synced_at` | now() |
 | `raw` | 抓取元数据 jsonb:{fetched_at, http_status, page_title, last_updated_raw, content_sha256, chars} |
-| `prohibited_items` / `conditional_items` / `preapproval_items` / `preapproval` / `legal_refs` / `category_zh` / `zh_seller_risk` / `zh_seller_notes` | **一律不读不写**(修订 2026-09-01:这些是给人看的中文/人工列,英文要点句填进去会中英混列 —— 原「空时填要点句」条款作废);新行这些列留 NULL,进报告等人工 |
+| `prohibited_items` / `conditional_items` / `preapproval_items` / `preapproval` / `legal_refs` / `category_zh` / `zh_seller_risk` / `zh_seller_notes` / `overall_status` | **一律不读不写**(修订 2026-09-01:这些是给人看的中文/人工列,英文要点句填进去会中英混列 —— 原「空时填要点句」条款作废);新行这些列留 NULL,进报告等人工。**overall_status 为本节初稿漏列补正**(2026-09-01 执行侧发现:实表第 9 列,中文总述,S4 现用 —— 同属人工区) |
 
 **官方名 ↔ 表内名的对行**:归一化匹配(casefold + `&`↔`and` + 去逗号/括号后缀
 `(Covered Goods)` + 空白折叠)自动对上;对不上的**不猜**,进 dry-run 报告的
 「未对上清单」由所有者裁决(改名/新增/忽略)。官方页存在而表里没有 → 计划新增;
 表里存在而官方页没有 → **不删行**,报告标「官方总览已不含该类别」待人工。
 
-## 三、工作流 `workflows/policy_sync.py`
+## 三、工作流 `workflows/policy_sync.py`(⚠ 抓取侧描述已被 §九/§十 取代:来源=refdata 转录件,无抓取;dry-run/upsert/隔离等行为条款仍有效)
 
 - `DANGEROUS = True`(写判定数据;缺省即真跑是仓规,但**首次必须先 --dry-run**);
 - `--dry-run`:抓全部页面,输出逐类别 diff —— 新增行清单 / 未对上清单 / 每行
@@ -60,7 +59,7 @@
 - 网络失败单类别隔离:一页抓不到不炸整轮,摘要点名缺席页,**缺席页对应行本轮
   不刷新**(绝不写空值覆盖)。
 
-## 四、api 层 `api/policy_pages.py`(外部接口适配,零业务判断)
+## 四、api 层 `api/policy_pages.py`(⚠ 本节整体已被 §九/§十 作废:不实现抓取,api 层无此模块;仅存历史)
 
 - `fetch_overview() -> list[{name, url}]`:总览页链接清单解析(嵌套的 Weapons
   子项摊平收录;父级 "Weapons" 本身若无独立正文页则不成行);
@@ -81,7 +80,7 @@
 3. 归类对照报告的政策名 join 在表重塑 + 词形归一后预期接近 100%,**所有者重跑
    `error_reclass_report` 的时点 = 政策表真跑之后**(先重塑再跑分类,定稿顺序)。
 
-## 六、测试
+## 六、测试(⚠ HTML 夹具条款已被 §九/§十 取代:解析对象是 refdata md,测试直接用仓内 42 份真实转录件;其余口径条款仍有效)
 
 - 解析器用**本地 HTML 夹具**(执行侧抓总览页 + 2 个类别页,裁剪到正文骨架
   <50KB/页存 `tests/fixtures/policy_pages/`,标注抓取日期与 URL;测试不打真网);
@@ -90,7 +89,7 @@
   不删行 —— 全部用假连接钉死;
 - dry-run 零写库守门。
 
-## 七、执行侧清单
+## 七、执行侧清单(⚠ 第 1、3 项抓取侧内容已被 §九/§十 取代;实际交付以 §十.6 落地记录为准)
 
 1. `api/policy_pages.py`(§四);
 2. `workflows/policy_sync.py`(§三,upsert SQL 走 registry/db);
@@ -179,3 +178,19 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
 5. **政策段连续且挨在一起**(所有者定稿):全部政策渲染为提示词中**单一连续块**、
    固定排序(ORDER BY id),产品信息只出现在其后 —— 这同时是前缀缓存命中的硬前提
    (缓存经济账:政策前缀 ~5.5 万 token,命中价下 DS ≈0.0076 元/条、GLM ≈0.0154 元/条)。
+6. **执行侧落地记录(2026-09-01,经对抗复核后定稿)**:
+   - 报告口径:「未对上 K」= 计划新增 N + 歧义扣留(表内两行归一化同名/两官方页指向同一行,
+     一行不动等人裁决),常态 K==N;「官方已不含」与「未对上」间做疑似改名配对提示;
+     解析失败单列一节,不混入「官方已不含」;
+   - 归一化在 §二 四条之外补两条:去撇号、削词尾单复数 s(否则 Cosmetic↔Cosmetics 词形差
+     打不平);已用测试钉死 42 个官方名两两归一化不碰撞;
+   - **首轮真跑前置**:生产表存量 7 行用旧缩写名(Drugs & Paraphernalia、Electronics & RF、
+     Auto & Motor Vehicles、Textiles & Apparel、Military & Law Enforcement、
+     Ride-Ons & Micromobility、Tobacco & Vaping 一族),按「不猜」口径对不上官方全称,
+     直接真跑会产生**同概念双行**并污染 S2 候选 —— 所有者必须先按 dry-run
+     「未对上清单」逐条裁决(改名/新增/忽略;改名随本批 AUDIT_RULES_VERSION 提版一起做);
+   - 真跑连带后果三条(摘要强制提醒):①AUDIT_RULES_VERSION 手动递增;②新增行人工列
+     全 NULL,S4 现渲染为空壳标题待运营补中文;③`services/audit_l3.py` S1/S3 提示词
+     硬写「37 条」将与实际行数不符,是否修改随第三步 L3 批由所有者定;
+   - 喂入版渲染件(`services/policy_feed.render_feed_text`)已落地进测试,
+     **S4 接线随第三步 L3 批**,当前 S4 仍读中文人工列。

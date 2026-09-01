@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **75 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **76 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
-- **PostgreSQL 17** 单库五 schema(49 表 / 12 视图)为唯一权威状态;
-- **1880 个单元测试**。
+- **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
+- **2465 个单元测试**。
 
 ---
 
@@ -346,6 +346,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
 | `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
+| `error_reclass_report` | | 报错归类新旧对照(只读排查,手动跑):现行 `problem_products.categorize()` 的 A-L 码 vs 新引擎 `services.error_taxonomy` 的 16 码,出迁移矩阵 / unknown 全文 / 政策表缺口 / feed 政策族分类。方案 `docs/error_taxonomy.md`,所有者过完这份账才换轨 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
 | `node_clear` | 危 调 | 把**指定发货节点**的库存整节点清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。**拒绝清受管仓**(自动链正在维护它,清了下轮写回来);写 0 幂等,失败重跑即补 |
 | `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |

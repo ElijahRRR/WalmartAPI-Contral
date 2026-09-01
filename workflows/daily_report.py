@@ -372,8 +372,11 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 highs = [e for e in landed if e["severity"] == "high"]
                 if highs:
                     note = ";".join(store_events.brief(e) for e in highs)
-                    if store_events.tro_signature(landed):
-                        note += "(封店+资金冻结同日出现,**疑似 TRO 封店**)"
+                    # TRO 判据要「店铺当前状态」的真值(所有者 2026-09-01:
+                    # 店被停、钱跟着冻是后果,只有"店还开着钱却被冻住"才反常)
+                    # —— 本轮这一行正在 upsert,值就在手上,零额外查询
+                    if store_events.tro_signature(landed, row["store_status"]):
+                        note += "(店铺仍 ACTIVE 而资金被冻结,**疑似 TRO**)"
                     alerts.append(note)
                 rows_ok.append(row)
                 ok.append(name)

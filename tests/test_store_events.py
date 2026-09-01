@@ -72,16 +72,50 @@ def test_three_columns_diff_independently():
         assert set(e["detail"]) == {"old", "new", "data_date"}
 
 
-def test_tro_signature_needs_both_high_legs():
-    """封店 + 资金冻结**同日同店**才是疑似 TRO;单腿不算,恢复方向更不算。"""
-    both = _ev({"store_status": "ACTIVE", "payment_status": "ACTIVE"},
-               {"store_status": "SUSPENDED", "payment_status": "INACTIVE"})
-    assert se.tro_signature(both)
+def test_tro_signature_is_money_frozen_while_the_store_is_still_active():
+    """★ 判据 2026-09-01 **整个反转**(所有者看生产日报当场指出旧判据是错的)。
+
+    旧判据是「封店 + 资金冻结同日出现」;新判据是「**支付被冻,而店铺仍
+    ACTIVE**」—— 反常之处在于"店还开着、钱却被冻住",那才是法院冻结令的形状。
+    店被停了钱跟着冻是**后果**,不是独立信号,那只是一次普通的店铺暂停。
+
+    这一条钉的是 2026-09-01 日报里 82杨乾良 的**真实形状**:同日三条
+    (店铺 ACTIVE→SUSPENDED、支付 ACTIVE→INACTIVE、销售 可售→不可售),
+    旧判据报了「疑似 TRO 封店」——**不许再报**。
+    """
+    # 情形一(82杨乾良 那次的原样):店铺被停,支付与销售跟着塌 → 不是 TRO
+    yang = _ev({"store_status": "ACTIVE", "payment_status": "ACTIVE",
+                "sales_status": "可售"},
+               {"store_status": "SUSPENDED", "payment_status": "INACTIVE",
+                "sales_status": "不可售"})
+    assert len(yang) == 3                       # 三条事件照记三条,只是不叫 TRO
+    assert not se.tro_signature(yang, "SUSPENDED")
+    # 情形二:只有支付那条腿,店铺仍 ACTIVE → 是 TRO(唯一该报的形状)
+    frozen = _ev({"payment_status": "ACTIVE"}, {"payment_status": "INACTIVE"})
+    assert se.tro_signature(frozen, "ACTIVE")
+    # 情形三:本轮事件与情形二**逐字相同**,差别只在店铺早就停了 → 不是 TRO
+    #         (旧暂停的延迟后果)。这就是签名必须多收一个真值入参的原因
+    assert not se.tro_signature(frozen, "SUSPENDED")
+    assert not se.tro_signature(frozen, "TERMINATED")
+    # 情形四:只有店铺事件,没有支付那条腿 → 任何店铺状态下都不是 TRO
     only_store = _ev({"store_status": "ACTIVE"}, {"store_status": "SUSPENDED"})
-    assert not se.tro_signature(only_store)
-    recovery = _ev({"store_status": "SUSPENDED", "payment_status": "INACTIVE"},
-                   {"store_status": "ACTIVE", "payment_status": "ACTIVE"})
-    assert not se.tro_signature(recovery)
+    assert not se.tro_signature(only_store, "SUSPENDED")
+    assert not se.tro_signature(only_store, "ACTIVE")
+
+
+def test_tro_signature_reads_the_direction_not_just_the_event_code():
+    """恢复方向(INACTIVE→ACTIVE)是好消息,不是冻结 —— 只看事件码会把它算进去。"""
+    recovery = _ev({"payment_status": "INACTIVE"}, {"payment_status": "ACTIVE"})
+    assert [e["event"] for e in recovery] == [se.PAYMENT_STATUS_CHANGED]
+    assert not se.tro_signature(recovery, "ACTIVE")
+
+
+def test_tro_signature_says_no_when_the_store_status_is_unknown():
+    """状态没抓到(空)= 判不出"店还开着",宁可漏报不误报。"""
+    frozen = _ev({"payment_status": "ACTIVE"}, {"payment_status": "INACTIVE"})
+    for unknown in (None, "", "  "):
+        assert not se.tro_signature(frozen, unknown)
+    assert se.tro_signature(frozen, " ACTIVE ")      # 但空白照 _norm 归一
 
 
 def test_record_many_rejects_unregistered_code_and_bad_severity():

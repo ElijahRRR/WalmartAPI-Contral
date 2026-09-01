@@ -260,15 +260,43 @@ def kpi_status_events(store: str, data_date, prev: dict, new: dict) -> list[dict
     return events
 
 
-def tro_signature(events: list[dict]) -> bool:
-    """输入:同一店同一轮的事件行 → 输出:是否命中「疑似 TRO 封店」组合。
+def tro_signature(events: list[dict], store_status) -> bool:
+    """输入:同一店同一轮的事件行 + 该店**当天实际的** store_status → 输出:是否疑似 TRO。
 
-    封店(store ACTIVE→SUSPENDED/TERMINATED)与资金冻结(payment
-    ACTIVE→INACTIVE)**同时**出现 = TRO 冻结的典型形状(所有者定稿
-    2026-08-30)。两条事件照记两条,这里只负责认出组合、让通知把话说重。
+    判据(所有者 2026-09-01 定稿,**推翻** 08-30 那版「封店 + 资金冻结同日」):
+    **支付从 ACTIVE 跌落(资金冻结),而店铺状态仍然是 ACTIVE**。
+    反常之处在于「店还开着、钱却被冻住」—— 那才是法院冻结令的形状;
+    **店被停了钱跟着冻是后果,不是独立信号**(支付冻结只是店铺暂停的连带)。
+
+    | 本轮事件 | 店铺当前状态 | 判定 |
+    |---|---|---|
+    | 支付 ACTIVE→INACTIVE + 店铺 ACTIVE→SUSPENDED/TERMINATED | 非 ACTIVE | **不是**(普通店铺暂停) |
+    | 支付 ACTIVE→INACTIVE,本轮无店铺事件 | ACTIVE | **是** |
+    | 支付 ACTIVE→INACTIVE,本轮无店铺事件 | 早就是 SUSPENDED | **不是**(旧暂停的延迟后果) |
+    | 只有店铺事件,无支付事件 | 任意 | **不是** |
+
+    起因:2026-09-01 日报实跑,82杨乾良 同日三条(店铺 ACTIVE→SUSPENDED、
+    支付 ACTIVE→INACTIVE、销售 可售→不可售)被旧判据报成「疑似 TRO 封店」,
+    所有者看日报当场指出 —— 那就是一次普通的店铺暂停。
+
+    ⚠ 第二与第三种情形**本轮事件长得一模一样**(两者本轮都只有支付那条腿),
+    只有店铺状态的**真值**分得开 —— 所以状态必须由调用方喂进来:事件流只记
+    「变了什么」,答不出「现在是什么」(截面在 ops.store_kpi_daily)。
+    方向从 detail 的 old/new 读,不是只看事件码:INACTIVE→ACTIVE 是恢复,不算。
+    `store_status` 空(没抓到)一律判否 —— 宁可漏报,不误报。
     """
-    kinds = {e["event"] for e in events if e["severity"] == "high"}
-    return (STORE_STATUS_CHANGED in kinds and PAYMENT_STATUS_CHANGED in kinds)
+    _, store_active = _STATUS_COLS["store_status"]
+    _, pay_active = _STATUS_COLS["payment_status"]
+    if _norm(store_status) != store_active:
+        return False
+    for e in events:
+        if e["event"] != PAYMENT_STATUS_CHANGED:
+            continue
+        d = e.get("detail") or {}
+        old, cur = _norm(d.get("old")), _norm(d.get("new"))
+        if old == pay_active and cur is not None and cur != pay_active:
+            return True
+    return False
 
 
 # ── 落库(带同日去重:daily_report 一天可跑多轮,影刀下午还会补刷)────────────
@@ -461,22 +489,53 @@ def mark_notified(conn, ids: list[int]) -> int:
         return cur.rowcount
 
 
-def tro_stores(rows: list[dict]) -> list[str]:
-    """输入:同一轮扫到的事件行 → 输出:命中「疑似 TRO 封店」组合的店铺(排序)。
+# 按 (店, KPI 日) 回查那天那家店的 store_status 截面。参数全带显式铸型
+# (services/dispositions 生产实炸三次的教训,tests 有 lint 用例同款盯法)。
+_KPI_STATUS_SQL = """
+SELECT k.store, k.data_date::text, k.store_status
+FROM ops.store_kpi_daily k
+JOIN unnest(%(stores)s::text[], %(days)s::date[]) AS want(store, day)
+  ON k.store = want.store AND k.data_date = want.day
+"""
 
-    按 (店, detail.data_date) 分组再问 `tro_signature`:封店与资金冻结必须是
-    **同一店同一天**的两条 —— 跨店凑、跨日凑都不算(A 店周一被封 + B 店周三
-    冻结,合起来什么也不是)。store 为空的全局行(TRO 品牌源头)不参与分组,
-    它不属于任何一家店。
+
+def _kpi_store_status(conn, keys: list[tuple]) -> dict[tuple, str | None]:
+    """输入:连接 + [(店, KPI 日)] → 输出:{(店, 日): 那天的 store_status}(查不到的键不出现)。"""
+    with conn.cursor() as cur:
+        cur.execute(_KPI_STATUS_SQL, {"stores": [k[0] for k in keys],
+                                      "days": [k[1] for k in keys]})
+        return {(s, d): v for s, d, v in cur.fetchall()}
+
+
+def tro_stores(conn, rows: list[dict]) -> list[str]:
+    """输入:连接 + 同一轮扫到的事件行 → 输出:疑似 TRO 的店铺(排序)。
+
+    按 (店, detail.data_date) 分组,**每组回查 ops.store_kpi_daily 拿那天那家
+    店 store_status 的真值**,再连同该组事件问 `tro_signature`。
+
+    ⚠ 为什么非查库不可(2026-09-01 判据改版):判据的第二、三种情形
+    (「支付被冻 + 店还开着」= 是 / 「支付被冻 + 店早就停了」= 不是)在事件流
+    里**长得一模一样** —— 两者本轮都只有支付那条腿。截面值只有 KPI 表答得上
+    来,而本函数的调用方 store_watch 手上只有事件行(它是扫账本扫出来的),
+    自己变不出这个值。高危事件每天个位数,分组数就是这个量级,一轮一次查询。
+
+    分组键带日期是老性质,照旧:跨店凑、跨日凑都不算 —— A 店的冻结不许拿 B 店
+    的状态去判,08-30 的冻结不许拿 08-29 的状态去判。
+    store 为空的全局行(TRO 品牌源头)不属于任何一家店,不参与分组;
+    没有 KPI 日期的行(治理/TRO/钓鱼三族的 detail 里没有 data_date)同理跳过
+    —— 查不到截面就判不了,而它们本来也不带支付那条腿。
     """
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
-        if not r.get("store"):
+        day = (r.get("detail") or {}).get("data_date")
+        if not r.get("store") or not day:
             continue
-        groups.setdefault((r["store"], (r.get("detail") or {}).get("data_date")),
-                          []).append(r)
-    return sorted({st for (st, _day), evs in groups.items()
-                   if tro_signature(evs)})
+        groups.setdefault((r["store"], str(day)), []).append(r)
+    if not groups:
+        return []
+    status = _kpi_store_status(conn, list(groups))
+    return sorted({st for (st, day), evs in groups.items()
+                   if tro_signature(evs, status.get((st, day)))})
 
 
 # ── 摘要渲染(**全事件码唯一出处**)──────────────────────────────────────────

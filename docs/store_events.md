@@ -29,6 +29,32 @@
 → 一轮一条飞书 → 标 `notified_at`。**推送失败一条都不标**(账本只追加,
 标了就是永久埋掉),摘要会明说"未发出,下轮重试"。
 
+### TRO 判据(所有者 2026-09-01 定稿,**推翻**了 08-30 那版)
+
+**疑似 TRO = 支付被冻结(ACTIVE→INACTIVE),而店铺状态仍然是 ACTIVE。**
+反常之处在于「店还开着、钱却被冻住」—— 那才是法院冻结令的形状。
+**店被停了、钱跟着冻,那是后果,不是独立信号**,只是一次普通的店铺暂停。
+
+| 本轮事件 | 店铺当前状态 | 判定 |
+|---|---|---|
+| 支付 ACTIVE→INACTIVE **+ 店铺 ACTIVE→SUSPENDED/TERMINATED** | 非 ACTIVE | **不是**(普通店铺暂停) |
+| 支付 ACTIVE→INACTIVE,本轮无店铺事件 | ACTIVE | **是** |
+| 支付 ACTIVE→INACTIVE,本轮无店铺事件 | 早就是 SUSPENDED | **不是**(旧暂停的延迟后果) |
+| 只有店铺事件,无支付事件 | 任意 | **不是** |
+
+起因是一次生产误报:2026-09-01 日报实跑,82杨乾良 同日三条(店铺
+ACTIVE→SUSPENDED、支付 ACTIVE→INACTIVE、销售 可售→不可售)被旧判据
+(「封店 + 资金冻结同日出现」)报成「疑似 TRO 封店」,所有者看日报当场指出
+那就是一次普通的店铺暂停。
+
+⚠ 第二、三种情形**本轮事件长得一模一样**(两者本轮都只有支付那条腿),
+只有 `ops.store_kpi_daily` 里**那天那家店的 `store_status` 真值**分得开 ——
+事件流只记「变了什么」,答不出「现在是什么」。所以:
+`daily_report` 在 upsert 那一行时值就在手上,直接传给 `tro_signature`(零额外
+查询);`store_watch` 手上只有事件行,由 `tro_stores(conn, rows)` 按 (店, 日)
+回查截面表(高危每天个位数,一轮一次查询)。**状态拿不到就不报** —— 判据的
+唯一出处是 `services/store_events.tro_signature` 的 docstring。
+
 ---
 
 ## 二、上线三步
@@ -102,6 +128,7 @@ launchctl list | grep com.walmartapi     # 应当有 store_watch 这一行
 | **预警一条都不来** | ① 调度没装;② `seed` 被写进了调度参数;③ 飞书没配 | `launchctl list \| grep com.walmartapi`;`registry/schedule.py` 里那条的 `params` 应当是空的;摘要里若写着「seed 标记 N 条」就是 ② |
 | 每轮都说「**未发出**,下轮重试」 | `FEISHU_NOTIFY_TO` / `FEISHU_WEBHOOK_URL` 没配,或推送被拒 | 事件**没丢**(一条都没标),配好之后下一轮自动补推 |
 | 「窗口外滞留 N 条」不为 0 | 连着几天没推成功,或高危产出速度长期超过 `limit=50` | `-p hours=N` 放宽窗口补推一次;先弄清为什么积压,再放宽 |
+| **资金明明被冻结,却没报「疑似 TRO」** | ① 那天店铺状态本来就不是 ACTIVE —— 判据如此(见「一、TRO 判据」那张表的第一、三行),不是漏报;② KPI 表里那天那家店没有行或 `store_status` 为空,判不出就不报 | `SELECT store_status FROM ops.store_kpi_daily WHERE store = '…' AND data_date = '…'`;空/无行就是 ② |
 | 明细行是干瘪的事件码 | 新登记了事件码却没在 `store_events._brief_body` 写渲染 | `tests/test_store_watch.py::test_brief_covers_every_registered_event_code` 会在提交期挡住,红了就是漏了 |
 | 「还有 N 条待推」每轮都在 | 高危产出速度超过单轮上限 | 调 `-p limit=N`;但持续几十条高危本身就该有人看,不是调大上限能解决的 |
 | 治理快照每轮都报「本轮没比对」 | 飞书读不到(表未登记 / 权限 / 网络) | 摘要里带着原因;**不产事件也不覆盖快照**,修好之后接着比上一版,不会漏 |

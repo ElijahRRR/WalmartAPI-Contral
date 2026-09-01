@@ -1,4 +1,4 @@
-"""store_watch 回归:扫描面、推送-标记的因果、seed/dry-run、TRO 组合、滞留计数。
+"""store_watch 回归:扫描面、推送-标记的因果、seed/dry-run、TRO 判据、滞留计数。
 
 钉的全是"预警看起来在跑,其实没人被叫醒"那一类故障:
 推送失败却把事件标掉(永久埋掉)、dry-run 悄悄写库、明细渲染成 `None→None`、
@@ -103,7 +103,7 @@ def test_scan_returns_dicts_keyed_by_column_name():
     assert conn.calls[0][1] == {"sev": "high", "hours": 48, "limit": 50}
 
 
-# ── TRO 组合:同店同日两条腿 ────────────────────────────────────────────────
+# ── TRO 判据:支付被冻 + 店铺仍 ACTIVE(2026-09-01 定稿)────────────────────
 
 _NEXT_ID = [0]
 
@@ -121,23 +121,92 @@ def _row(store, event, severity="high", day="2026-08-30", **detail):
             "occurred_at": day}
 
 
-def test_tro_stores_needs_both_legs_same_store_same_day():
-    """跨店凑、跨日凑都不算 —— A 店周一被封 + B 店周三冻结合起来什么也不是。"""
-    same = [_row("A085", se.STORE_STATUS_CHANGED),
-            _row("A085", se.PAYMENT_STATUS_CHANGED)]
-    assert se.tro_stores(same) == ["A085"]
-    cross_store = [_row("A085", se.STORE_STATUS_CHANGED),
-                   _row("谭总9", se.PAYMENT_STATUS_CHANGED)]
-    assert se.tro_stores(cross_store) == []
-    cross_day = [_row("A085", se.STORE_STATUS_CHANGED, day="2026-08-29"),
-                 _row("A085", se.PAYMENT_STATUS_CHANGED, day="2026-08-30")]
-    assert se.tro_stores(cross_day) == []
+def _frozen(store, day="2026-08-30"):
+    """资金冻结那条腿(ACTIVE→INACTIVE)—— 新判据里唯一必需的事件。"""
+    return _row(store, se.PAYMENT_STATUS_CHANGED, day=day, new="INACTIVE")
 
 
-def test_tro_stores_ignores_global_rows():
-    """store 为空的全局行(TRO 品牌源头)不属于任何一家店,不参与分组。"""
-    rows = [_row(None, se.TRO_BRAND_HIT), _row(None, se.STORE_STATUS_CHANGED)]
-    assert se.tro_stores(rows) == []
+class _KpiCur:
+    """假游标:只回答 tro_stores 回查 KPI 截面那一条(其余查询在别处被打桩)。"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self._rows: list = []
+
+    def execute(self, sql, args=None):
+        assert "ops.store_kpi_daily" in sql, sql
+        self.conn.kpi_calls.append(sorted(zip(args["stores"], args["days"])))
+        self._rows = [(st, day, self.conn.kpi[(st, day)])
+                      for st, day in zip(args["stores"], args["days"])
+                      if (st, day) in self.conn.kpi]
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _KpiConn:
+    """假连接:`{(店, KPI 日): store_status}` 就是那天那家店的截面真值。"""
+
+    def __init__(self, kpi=None):
+        self.kpi = dict(kpi or {})
+        self.kpi_calls: list = []
+
+    def cursor(self):
+        return _KpiCur(self)
+
+
+def test_tro_stores_reports_only_the_store_that_is_still_active():
+    """★ 第二种与第三种情形**事件行逐字相同**,只有 KPI 截面分得开。
+
+    两家店本轮都只有支付那条腿(ACTIVE→INACTIVE):开着的那家是疑似 TRO,
+    早就被停的那家只是旧暂停的延迟后果 —— 事件流答不出"现在是什么",
+    所以 tro_stores 必须拿连接回查 ops.store_kpi_daily。
+    """
+    rows = [_frozen("A085"), _frozen("谭总9")]
+    conn = _KpiConn({("A085", "2026-08-30"): "ACTIVE",
+                     ("谭总9", "2026-08-30"): "SUSPENDED"})
+    assert se.tro_stores(conn, rows) == ["A085"]
+
+
+def test_tro_stores_never_calls_a_plain_suspension_a_tro():
+    """82杨乾良 2026-09-01 的真实形状:店被停 → 钱跟着冻 → 销售跟着不可售。
+    旧判据(封店 + 资金冻结同日)在这里报了 TRO,所有者当场指出那是错的。"""
+    rows = [_row("82杨乾良", se.STORE_STATUS_CHANGED),
+            _frozen("82杨乾良"),
+            _row("82杨乾良", se.SALES_STATUS_CHANGED, severity="mid",
+                 old="可售", new="不可售")]
+    conn = _KpiConn({("82杨乾良", "2026-08-30"): "SUSPENDED"})
+    assert se.tro_stores(conn, rows) == []
+
+
+def test_tro_stores_never_borrows_another_store_or_another_day_status():
+    """跨店凑、跨日凑都不算(老性质,判据改版后落在 KPI 回查的分组键上):
+    A 店的冻结不许拿 B 店的 ACTIVE 去判,08-30 的冻结不许拿 08-29 的去判。"""
+    rows = [_frozen("A085"), _frozen("谭总9", day="2026-08-31")]
+    conn = _KpiConn({("A085", "2026-08-30"): "ACTIVE",
+                     ("谭总9", "2026-08-30"): "ACTIVE",     # 隔壁日,不该被借用
+                     ("谭总9", "2026-08-31"): "SUSPENDED"})
+    assert se.tro_stores(conn, rows) == ["A085"]
+    assert conn.kpi_calls == [[("A085", "2026-08-30"),
+                               ("谭总9", "2026-08-31")]]
+
+
+def test_tro_stores_ignores_global_rows_and_rows_without_a_kpi_day():
+    """store 为空的全局行(TRO 品牌源头)不属于任何一家店,不参与分组;
+    detail 里没有 data_date 的行(治理/TRO/钓鱼三族)查不到截面,同样跳过
+    —— 一个分组都没有时连库都不查。"""
+    conn = _KpiConn()
+    rows = [_row(None, se.TRO_BRAND_HIT), _row(None, se.STORE_STATUS_CHANGED),
+            {"id": 99, "store": "A085", "event": se.STORE_LIMITS_ROW_ADDED,
+             "severity": "high", "source": "store_watch", "detail": {}}]
+    assert se.tro_stores(conn, rows) == []
+    assert conn.kpi_calls == []
 
 
 # ── brief:全事件码都得说人话,一条也不许 None→None ──────────────────────────
@@ -214,11 +283,13 @@ def test_brief_labels_global_rows_instead_of_a_question_mark():
 def wired(monkeypatch):
     """把 store_watch 的四个外沿(库/治理/扫描/飞书)换成可编程夹具。"""
     state = {"marked": [], "sent": [], "notify_ok": True, "rows": [],
-             "counts": (0, 0), "gov": ([], None), "gov_called": 0}
+             "counts": (0, 0), "gov": ([], None), "gov_called": 0, "kpi": {}}
 
     @contextlib.contextmanager
     def _conn():
-        yield object()
+        # tro_stores 会拿这条连接回查 KPI 截面(店铺状态的真值);用例往
+        # state["kpi"] 里放 {(店, 日): store_status} 就是在编程那张截面表
+        yield _KpiConn(state["kpi"])
 
     def _check(conn):
         state["gov_called"] += 1
@@ -297,13 +368,26 @@ def test_dry_run_lists_but_touches_nothing(wired):
     assert "A085 店铺 ACTIVE→SUSPENDED" in out    # 但明细照列(这就是 dry-run 的用处)
 
 
-def test_tro_combination_reaches_the_push_text(wired):
-    wired["rows"] = [_row("A085", se.STORE_STATUS_CHANGED),
-                     _row("A085", se.PAYMENT_STATUS_CHANGED)]
+def test_tro_judgement_reaches_the_push_text(wired):
+    """支付被冻 + 截面仍 ACTIVE:结论行点数,明细第一行说清反常在哪。"""
+    wired["rows"] = [_frozen("A085")]
+    wired["kpi"][("A085", "2026-08-30")] = "ACTIVE"
+    wired["counts"] = (1, 0)
+    out = sw.run(dict(_EXEC))
+    assert "(1 店疑似 TRO 冻结)" in out.splitlines()[0]
+    assert "🚨 疑似 TRO 冻结:A085(店铺仍 ACTIVE 而资金被冻结)" in wired["sent"][0]
+
+
+def test_a_plain_store_suspension_never_reaches_the_push_text_as_tro(wired):
+    """★ 生产误报的整轮回归(82杨乾良 2026-09-01):店被停、钱跟着冻,
+    两条 high 照推,但一个 TRO 字都不许出现 —— 那只是普通店铺暂停。"""
+    wired["rows"] = [_row("82杨乾良", se.STORE_STATUS_CHANGED),
+                     _frozen("82杨乾良")]
+    wired["kpi"][("82杨乾良", "2026-08-30")] = "SUSPENDED"
     wired["counts"] = (2, 0)
     out = sw.run(dict(_EXEC))
-    assert "(1 店疑似 TRO 封店)" in out.splitlines()[0]
-    assert "🚨 疑似 TRO 封店:A085" in wired["sent"][0]
+    assert out.splitlines()[0].endswith("1 店 2 条高危 —— 已推送并标记 2 条")
+    assert "TRO" not in out and "TRO" not in wired["sent"][0]
 
 
 def test_global_rows_are_counted_separately_from_stores(wired):
@@ -473,15 +557,23 @@ def _seed_events(conn, store="ZQX预警店"):
 @needs_pg
 def test_pg_one_real_round_pushes_marks_and_leaves_the_stale_one(pg,
                                                                 monkeypatch):
-    """真库上跑一整轮:窗口内两条推出去并标掉,90 天前那条留在滞留计数里。"""
+    """真库上跑一整轮:窗口内两条推出去并标掉,90 天前那条留在滞留计数里。
+
+    种下的正是 82杨乾良 那次的形状(店被停 + 钱跟着冻),截面里店铺已是
+    SUSPENDED —— 判据改版后**不许**再报 TRO(2026-09-01 生产误报回归)。
+    """
     _seed_events(pg)
+    with pg.cursor() as cur:
+        cur.execute("INSERT INTO ops.store_kpi_daily (store, data_date,"
+                    " store_status) VALUES (%s, '2026-08-30', 'SUSPENDED')",
+                    ("ZQX预警店",))
     sent = []
     monkeypatch.setattr(sw.feishu, "notify",
                         lambda t: bool(sent.append(t)) or True)
     out = sw.run({"execute": True, "dry_run": False})
 
     assert "🚨 店铺预警:" in out and "已推送并标记 2 条" in out
-    assert "(1 店疑似 TRO 封店)" in out          # 封店 + 冻结同日
+    assert "TRO" not in out                      # 店被停 → 钱跟着冻 = 普通暂停
     assert "⚠ 窗口外滞留 1 条未推送高危" in out
     assert "ZQX预警店 店铺 ACTIVE→SUSPENDED" in sent[0]
     with pg.cursor() as cur:
@@ -501,6 +593,23 @@ def test_pg_one_real_round_pushes_marks_and_leaves_the_stale_one(pg,
     sent.clear()
     again = sw.run({"execute": True, "dry_run": False})
     assert sent == [] and again.startswith("店铺预警:无待推送高危")
+
+
+@needs_pg
+def test_pg_tro_stores_reads_the_status_from_the_kpi_table(pg):
+    """★ 判据的第二 / 第三种情形在真库上跑一遍:两家店的事件行逐字相同
+    (都只有支付 ACTIVE→INACTIVE 那条腿),只有 ops.store_kpi_daily 里那天的
+    store_status 分得开 —— 这条 SQL 真跑过一次,拼错的列名/铸型才藏不住。"""
+    with pg.cursor() as cur:
+        cur.execute("INSERT INTO ops.store_kpi_daily (store, data_date,"
+                    " store_status) VALUES"
+                    " (%s, '2026-08-30', 'ACTIVE'),"      # 店还开着 → 是 TRO
+                    " (%s, '2026-08-29', 'ACTIVE'),"      # 隔壁日,不该被借用
+                    " (%s, '2026-08-30', 'SUSPENDED')",   # 早就停了 → 不是
+                    ("ZQX开着的店", "ZQX早停的店", "ZQX早停的店"))
+    rows = [_frozen("ZQX开着的店"), _frozen("ZQX早停的店"),
+            _frozen("ZQX没进过日报的店")]      # 查不到截面:判不了就不报
+    assert se.tro_stores(pg, rows) == ["ZQX开着的店"]
 
 
 @needs_pg

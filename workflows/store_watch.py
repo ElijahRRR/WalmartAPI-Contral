@@ -34,8 +34,11 @@ DANGEROUS = False 的依据:不碰沃尔玛任何写接口;写库只有两处 �
      没人看。明细行进同一条消息;超过 `limit` 的在摘要里报"还有 N 条待推",
      下一轮(每小时)接着推。
 
-TRO 组合(`store_events.tro_signature`):同店同日出现「封店」+「资金冻结」两条
-high 是 TRO 冻结的典型形状 —— 两条事件照记两条,这里只负责认出组合、把话说重。
+TRO 判据(`store_events.tro_signature`,所有者 2026-09-01 定稿):**支付被冻结
+(ACTIVE→INACTIVE)而店铺状态仍是 ACTIVE** —— 「店还开着、钱却被冻住」才是法院
+冻结令的形状;店被停了钱跟着冻是**后果**,是普通店铺暂停,不报 TRO。
+⚠ 因此 `tro_stores` 要连接:光看事件行分不出"店还开着"与"店早就停了"(两者
+本轮都只有支付那条腿),店铺状态的真值得回查 ops.store_kpi_daily。
 """
 
 import logging
@@ -120,7 +123,7 @@ def _headline(rows: list[dict], tro: list[str], severity: str) -> str:
         # 人按这两个数去库里对,永远对不上
         body += f",全局 {n_global} 条"
     if tro:
-        body += f"({len(tro)} 店疑似 TRO 封店)"
+        body += f"({len(tro)} 店疑似 TRO 冻结)"
     return body
 
 
@@ -128,7 +131,8 @@ def _detail_lines(rows: list[dict], tro: list[str]) -> list[str]:
     """输入:本轮扫到的行 + TRO 命中店 → 输出:结论行之后的明细行。"""
     lines = []
     if tro:
-        lines.append(f"🚨 疑似 TRO 封店:{'、'.join(tro)}(封店 + 资金冻结同日出现)")
+        lines.append(f"🚨 疑似 TRO 冻结:{'、'.join(tro)}"
+                     "(店铺仍 ACTIVE 而资金被冻结)")
     return lines + [f"· {store_events.brief(r)}" for r in rows]
 
 
@@ -153,7 +157,7 @@ def run(params: dict) -> str:
         # 治理段刚落的 high 事件,下面这一扫就扫得到(同一事务,同一轮推出去)
         rows = store_events.scan_unnotified(conn, severity, hours, limit)
         n_window, n_stale = store_events.unnotified_counts(conn, severity, hours)
-        tro = store_events.tro_stores(rows)
+        tro = store_events.tro_stores(conn, rows)
 
         if not rows:
             head = f"店铺预警:无待推送{word}(窗口 {hours}h)"

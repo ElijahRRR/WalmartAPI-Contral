@@ -42,8 +42,7 @@
 | `policy_updated_at` | 官方页 "Last Updated" 日期(解析不到用抓取日,并在 raw 里标注) |
 | `synced_at` | now() |
 | `raw` | 抓取元数据 jsonb:{fetched_at, http_status, page_title, last_updated_raw, content_sha256, chars} |
-| `prohibited_items` | **仅当该行此列为空时** best-effort 填官方页的政策要点句("Walmart's policy prohibits/restricts …" 首段);非空(人工整理过的存量)一律不动 |
-| `category_zh` / `zh_seller_risk` / `zh_seller_notes` / `conditional_items` / `preapproval_items` / `preapproval` / `legal_refs` | **一律不覆盖**(人工/历史整理,coalesce 保旧 —— risk_gate.sync_brands 先例);新行留空进报告等人工 |
+| `prohibited_items` / `conditional_items` / `preapproval_items` / `preapproval` / `legal_refs` / `category_zh` / `zh_seller_risk` / `zh_seller_notes` | **一律不读不写**(修订 2026-09-01:这些是给人看的中文/人工列,英文要点句填进去会中英混列 —— 原「空时填要点句」条款作废);新行这些列留 NULL,进报告等人工 |
 
 **官方名 ↔ 表内名的对行**:归一化匹配(casefold + `&`↔`and` + 去逗号/括号后缀
 `(Covered Goods)` + 空白折叠)自动对上;对不上的**不猜**,进 dry-run 报告的
@@ -54,7 +53,7 @@
 
 - `DANGEROUS = True`(写判定数据;缺省即真跑是仓规,但**首次必须先 --dry-run**);
 - `--dry-run`:抓全部页面,输出逐类别 diff —— 新增行清单 / 未对上清单 / 每行
-  full_policy 的 sha 变化与字数变化 / prohibited_items 将填充的行及内容预览 /
+  full_policy 的 sha 变化与字数变化 /
   官方已不含清单;**不写库**;
 - 真跑:upsert 按 §二;摘要首行给「新增 N / 刷新 M / 未对上 K / 官方缺席 J」;
 - 手动跑,不进调度(官方页低频变更;所有者按需重跑);
@@ -102,3 +101,50 @@
    人工列」分界;
 6. README 工作流计数 +1、测试计数同步;
 7. `python -m pytest -q` 全绿;不做 git 操作;冲突停下记录。
+
+## 八、修订(2026-09-01 所有者定稿):语言原则 + 表格人机分区重设计
+
+**旧格式的病**:旧清洗把政策压成中文摘要喂 L3,而产品文案是英文 —— 跨语言、有翻译
+损耗、还是二手信息。所有者定稿:**不按原格式来,重新设计**。
+
+### 8.1 语言原则(全链适用)
+
+> **给 LLM 的 = 官方英文原文;给人的 = 中文。两区永不混写。**
+
+- L3 的政策输入 = PG 英文区的 `full_policy`(官方全文,第三步 L3 批接线);
+  现 S4 喂的中文摘要列(overall_status/zh_risk/prohibited_items 截断)**整体退出
+  LLM 输入**,降级为人看的留档;
+- policy_sync 只维护英文机器区六列(category_en/full_policy/official_url/
+  policy_updated_at/synced_at/raw),对中文/人工八列**不读不写**(§二已改)。
+
+### 8.2 飞书表『沃尔玛禁售政策』两区设计(v2,待所有者确认列布局并建表)
+
+**机器投影区(程序写,人只读)** —— PG 英文区 → 飞书:
+| 列 | 内容 |
+|---|---|
+| A | 官方类别名(EN,category_en) |
+| B | 官方页 Last Updated |
+| C | 我方同步时间 |
+| D | 全文字数(变化 = 官方改了政策的信号) |
+| E | 官方页链接 |
+
+(full_policy 全文不进表格 —— 飞书单元格不适合几千词长文,全文只在 PG,人看点 E 列链接)
+
+**人工区(运营写,回同步 PG 中文列)** —— 飞书 → PG:
+| 列 | 内容 | 落 PG 列 |
+|---|---|---|
+| F | 中文类别名 | category_zh |
+| G | 风险等级(红/黄/绿:这类我们能不能碰) | zh_seller_risk |
+| H | 中文速览(一句话:要什么证/哪些细分做不了) | zh_seller_notes(或新列,建表时定) |
+| I | 运营备注(案例/处置口径) | 与 H 合并或另列,建表时定 |
+
+数据流定稿:
+```
+官方页面 ──policy_sync──► PG 英文区 ──投影──► 飞书 A-E(人只读)
+运营填飞书 F-I ──回同步──► PG 中文区(人区权威在飞书,类目表同款模式)
+L3 只读 PG 英文区(full_policy 全文);中文列永不进 prompt
+```
+
+v2 前置:所有者建飞书表并给 token/table id → registry 登记(表与字段常量)→
+投影与回同步两条通道(走 api/feishu 标准通道、限额 95%、字段引用常量)。
+v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文只需要 PG。

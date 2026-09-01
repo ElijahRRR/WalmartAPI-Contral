@@ -113,7 +113,7 @@ WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
 | 4 | `FLAGGED` | 含 `flagged by our internal team` |
 | 5 | `IP` | 含 `intellectual property` 或 `copyright`,或正则 `\bip\b\s+(policy|claim|related)` |
 | 6 | `BRAND` | 含 `brand restrictions` 或 `not authorized to list this brand` |
-| 7 | `GATED` | 含 `requires pre-approval` / `restricted to certain sellers` / `request approval to sell` / `enhanced vetting program` / `health & compliance page` |
+| 7 | `GATED` | 含 `requires? pre-approval`(正则,单复数皆收 —— 生产原文有 "these categories **require** pre-approval")/ `restricted to certain sellers` / `request approval to sell` / `enhanced vetting program` / `health & compliance page` |
 | 8 | `PRICE` | 含 `pricing rule` / `price gouging` / `unintended price` |
 | 9 | `CONTENT` | 含 `content issues` / `does not meet our content standards` / `content quality standards` / `image guidelines` / `placeholder images` —— ⚠ 不许用裸 `content standards`:政策文本里有 "do not meet **offensive** content standards"(sex toys 条),裸串会把政策拒误抢成内容问题(语料有反例钉死) |
 | 10 | `SPECIAL` | 含 `resold program` / `preorder program` / `pre-owned` / `restored program` |
@@ -136,7 +136,10 @@ WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
    类别在标记外、`Children's Products Prohibited Products Policy` 结构反置 —— 都不猜);
    `*…*` 星号包裹形态(feed 侧)与 `||…||` 链文本形态经 §3.2 已剥,统一落这个正则;
 2. 候选清洗:去两端标点/空白;剥前置停用词 {`Walmart`, `Walmart's`, `Our`, `The`, `This`};
-   截断在首个 `.` `;` `,`(**逗号也截**:"Policy: X, please review…" 的续句不吞);
+   截断在首个 `.` `;`;**逗号截断有条件**:仅当逗号后是续句(小写起头且首词非
+   and/or/&)才截 —— 政策名自身带逗号是常态("Jewelry, Watches, …Precious Metals"、
+   "Tobacco, E-Cigarettes, and Vaping Products"),无条件截会腰斩;要防的
+   "Policy: X, please review…" 恰是小写续句形态;
 3. 主/子类拆分:候选含逗号已被截,子类形态 `Offensive Content, Halloween Items` 由
    截断前先查:若逗号后文本 ∈ 已知子类词形(Halloween/Inappropriate/Intolerance/
    Violence/Sex Toys 家族)则 `policy_sub` 收下、主名取逗号前;否则按 2 截断;
@@ -176,6 +179,9 @@ Result = namedtuple("Result",
 
 ⚠ `status=="failed"` 这道闸是硬的:生产契约里 SUCCESS 回执可以同时带
 ingestionErrors(带警告的成功),field 锚不许把它们判成政策拒。
+`ops.feed_item_errors` 本身**没有 status 列** —— SKU 级终态权威在
+`ops.feed_items.status`,报告用 `(feed_id, sku)` LEFT JOIN 供数;JOIN 不上按
+非 failed 处理(判不准就不判成政策拒,方向保守)。
 本步 `classify_feed_error` 只被对照报告消费,**不接 `classify_receipt`**。
 
 ## 四、模块与接口
@@ -222,8 +228,10 @@ classify_feed_error / RULES`(RULES = 可枚举判据表,供守门测试断言全
   3. 守门:`RULES` 覆盖全部 16 码;`ERROR_CATEGORY_SEVERITY` 与码表集合一致;
      别名表目标值 ⊆ 注入字典(用夹具附的 37 行 category_en 清单);
      normalize 边角(`&amp;` 双转义 / `<p>` / `- )` 残标记 / 缺首字母)逐一钉死。
-- ⚠ 我方连不上生产库:37 行 `category_en` 对照清单先按夹具附带值(取自政策表实查
-  样例与回执原文),**报告首跑时与生产表比对,不一致以生产为准回填夹具**。
+- ⚠ 我方连不上生产库:`category_en` 对照清单以仓内唯一权威出处兜底(`services/
+  audit_l3` 政策路由表 + `audit_reason._L3_NORMALIZE` 目标值,合计 30 条,写在测试
+  `KNOWN_POLICIES`),**报告首跑时与生产表(37 行)比对,不一致以生产为准回填**;
+  join 不上的候选进"政策表缺口"清单由报告显示,不判错。
 
 ## 七、验收(第一步完成的定义)
 
@@ -245,3 +253,18 @@ classify_feed_error / RULES`(RULES = 可枚举判据表,供守门测试断言全
 7. 同步 `README.md` 测试计数;**不动** docs/db_schema.md(没动表)、不跑 skill_export
    (没动调度);
 8. 不做任何 git 操作(提交/推送由主会话统一处理)。
+
+## 九、执行核准记录(2026-09-01,规划侧验收)
+
+执行侧上报 4 处方案与语料/仓库现状的冲突,裁决如下(均已回写上文对应节):
+序 7 单复数(§3.3)、逗号截断条件化(§3.4)、政策清单出处退 30 条仓内权威(§六)、
+feed status 走 feed_items JOIN(§3.6)—— **四处全部核准**,以语料与判例定稿为准。
+
+疑点处置(决定权记录):
+1. 政策名正则**维持大小写敏感**(方案字面)。生产存在小写 "Prohibited Product
+   policy" 写法,但当前无"小写+冒号+类别名"实例;首跑报告若见再议 IGNORECASE。
+2. `classify_reasons` 的 `policy_names` 参数本步只服务 join(`policy_join`/
+   `alias_gaps` 供报告);第二步若要把"join 上/没上"带进病历,`Result` 需扩字段。
+3. feed 政策族正文全不命中 → 落 `OTHER`,报告单列"政策族判不出码"一节提醒补判据。
+4. 别名表只收词形差,不做语义合并;政策表缺口由首跑报告自证,不预判。
+5. README §11 文档索引本就非全集,不动。

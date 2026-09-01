@@ -154,6 +154,28 @@ WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
 # 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
 WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 
+# ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
+# 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
+# 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
+ERROR_TAXONOMY_VERSION = "t.2026-09-01.1"   # 码表/判据变更时手动递增
+ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
+    "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
+    "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
+    "PRICE": "价格规则", "GATED": "类目需预审批", "INFO": "信息缺失",
+    "EXPIRED": "过期下架", "STAGE": "未上线", "FLAGGED": "内部标记",
+    "RECALL": "安全召回", "SPECIAL": "特殊计划", "SYSTEM": "系统错误",
+    "OTHER": "未识别",
+}
+# 记录级主码序:终局优先,非中性永远压过中性(J 吃 42.9%、A 盖 641 条的病根按性质钉死)
+ERROR_CATEGORY_SEVERITY = (
+    "PROHIBITED_FINAL", "IP", "BRAND", "RECALL", "PT_WRONG", "POLICY",
+    "GATED", "FLAGGED", "CONTENT", "PRICE", "SPECIAL", "INFO",
+    "SYSTEM", "OTHER", "STAGE", "EXPIRED",
+)
+# feed 报错的政策族锚:field 稳定、error_code 一次性(生产实证:Offensive 171 次
+# 散在 35 个互不相同的码上)。QARTH/OFFER/sku 等多义 field 不入此集合。
+WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  类目树来源标记(audit.amazon_taxonomy.source)

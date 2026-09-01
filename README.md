@@ -231,7 +231,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 已宣布停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期):切断当天
 **全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
 `"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
-| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`) |
+| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
 | **USPTO 商标库** | 审核 R5 商标反查 | 跨库只读,默认关 |
 
 ---

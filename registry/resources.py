@@ -445,7 +445,10 @@ _KPI_BOARD_COLUMNS = (
     "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
     "refund_amount", "closing_balance", "reserve_to_date", "payout",
     "payout_date", "payment_processor", "settle_cycle", "no_hold",
-    "prev_payout")
+    # 末列 2026-08-31 由 prev_payout(上期回款)换成 total_payout(累计回款,
+    # 所有者:「我需要累计回款,就沃尔玛总共已经付给我的钱」)。旧列在 PG 里
+    # 保留不删(历史行的值仍是当时的真实观测),只是不再投影到看板
+    "total_payout")
 
 KPI_BOARD_OVERVIEW = Spreadsheet(
     name="KPI看板-总览",

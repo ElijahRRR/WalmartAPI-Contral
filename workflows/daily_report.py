@@ -54,8 +54,8 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, store_retry, stores as stores_svc, \
-    yingdao
+from services import kpi, order_lines, settlements, store_retry, \
+    stores as stores_svc, yingdao
 
 DANGEROUS = False
 
@@ -70,7 +70,7 @@ INSERT INTO ops.store_kpi_daily (
     orders_count, sales_amount, otd_rate, cancel_rate, vtr_rate, srr_rate,
     refund_rate, negative_rate, return_rate, inr_rate, period_sales, commission,
     refund_amount, closing_balance, reserve_to_date, payout, payout_date,
-    payment_processor, settle_cycle, no_hold, prev_payout, updated_at)
+    payment_processor, settle_cycle, no_hold, total_payout, updated_at)
 VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s,
         %(store_status)s, %(payment_status)s, %(sales_status)s, %(items_online)s,
         %(items_in_stock)s, %(items_out_stock)s, %(orders_count)s, %(sales_amount)s,
@@ -78,7 +78,7 @@ VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s
         %(negative_rate)s, %(return_rate)s, %(inr_rate)s, %(period_sales)s,
         %(commission)s, %(refund_amount)s, %(closing_balance)s, %(reserve_to_date)s,
         %(payout)s, %(payout_date)s, %(payment_processor)s, %(settle_cycle)s,
-        %(no_hold)s, %(prev_payout)s, now())
+        %(no_hold)s, %(total_payout)s, now())
 ON CONFLICT (store, data_date) DO UPDATE SET
     -- 影刀两列:本轮为空不覆盖旧值(旧系统 A-H 保护语义的 PG 等价)
     seller_name = COALESCE(EXCLUDED.seller_name, ops.store_kpi_daily.seller_name),
@@ -98,7 +98,7 @@ ON CONFLICT (store, data_date) DO UPDATE SET
     payout_date = EXCLUDED.payout_date,
     payment_processor = EXCLUDED.payment_processor,
     settle_cycle = EXCLUDED.settle_cycle, no_hold = EXCLUDED.no_hold,
-    prev_payout = EXCLUDED.prev_payout, updated_at = now()
+    total_payout = EXCLUDED.total_payout, updated_at = now()
 """
 
 
@@ -180,8 +180,15 @@ def _pg_order_stats(store_name: str, win_start: str, win_end: str) -> tuple[int,
 
 
 def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
-                       names: dict, statuses: dict, last_names: dict) -> dict:
-    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map + 历史名称 map → 输出:一行 KPI dict。"""
+                       names: dict, statuses: dict, last_names: dict,
+                       payouts: dict) -> dict:
+    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map + 历史名称 map + 累计回款 map
+    → 输出:一行 KPI dict。
+
+    ⚠ `payouts` 由调用方**一次查好**传进来(`services.settlements.totals`),
+    本函数不自己查库:49 家店各查一次是 49 个来回,而且逐店查会让"这轮的累计
+    到底截止到哪一刻"变得说不清(中途 settlement_sync 写入就前后不一致)。
+    """
     name = store["name"]
 
     # 8 项绩效并发(端点桶互相独立,同店同端点才是 1/min)
@@ -198,16 +205,6 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
                 rates[m] = None
 
     settle = kpi.extract_settlement(reports.payment_statement(store))
-
-    prev_payout = 0.0
-    recon_date = kpi.prev_recon_date(settle["payout_date"])
-    if recon_date:
-        try:
-            if recon_date in reports.available_recon_dates(store):
-                prev_payout = kpi.payment_summary_total(
-                    reports.iter_recon_records(store, recon_date))
-        except Exception as e:
-            logger.warning("店铺 %s 上期回款查询失败(按 0 计): %s", name, e)
 
     stats: dict = {}
     sales = 0.0
@@ -261,7 +258,10 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         "payout_date": settle["payout_date"],
         "payment_processor": settle["payment_processor"],
         "settle_cycle": settle["settle_cycle"], "no_hold": settle["no_hold"],
-        "prev_payout": prev_payout,
+        # 累计回款 = 结算台账各账期之和(settlement_sync 维护)。
+        # ⚠ 台账里没有这家店 ⇒ **留空,不写 0**:那是"还没同步过账期",
+        # 与"确实一分钱没回"是两件事,写 0 会让人以为查过了。
+        "total_payout": payouts.get(name),
     }
 
 
@@ -341,10 +341,15 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
     win_start, win_end = kpi.sales_window_utc()
     names, statuses = _load_frontend()
     last_names = _last_seller_names()
+    # 累计回款一次查全(台账在 PG,不调沃尔玛);台账空 = settlement_sync
+    # 还没跑过,该列整列留空 —— 不是 0,见 settlements.totals 头注
+    with db.pg_conn() as conn:
+        payouts = settlements.totals(conn, [s["name"] for s in store_list])
     ok, failed, diffs, rows_ok = [], [], [], []
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
-                            names, statuses, last_names): s["name"] for s in store_list}
+                            names, statuses, last_names, payouts): s["name"]
+                for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:
@@ -388,7 +393,7 @@ _BOARD_HEADER = ["店铺", "日期", "卖家名称", "partnerId", "sellerId", "�
                  "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
                  "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
                  "账期销售额($)", "佣金", "退款金额", "期末余额", "迄今备用金($)",
-                 "回款", "回款日", "收款方", "结算周期", "无Hold", "上期回款"]
+                 "回款", "回款日", "收款方", "结算周期", "无Hold", "累计回款"]
 
 
 _DATE_EPOCH = datetime(1899, 12, 30).date()     # 飞书/Excel 日期序列起点
@@ -457,7 +462,7 @@ def _board_formats(n_rows: int) -> list[tuple[str, str]]:
                    "srr_rate", "refund_rate", "negative_rate", "return_rate",
                    "inr_rate", "period_sales", "commission", "refund_amount",
                    "closing_balance", "reserve_to_date", "payout",
-                   "prev_payout"):
+                   "total_payout"):
             items.append((f"{letter}2:{letter}{end}", "#,##0.00"))
     return items
 

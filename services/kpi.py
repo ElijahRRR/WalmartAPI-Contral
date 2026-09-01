@@ -360,6 +360,9 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
 _HIST_HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
     # 具体在前,泛化在后:「上期回款」>「回款日期」>「回款」;「退款率」>「退款」;
     # 「店铺状态」>「店铺」;「本期销售」>「销售额」;「回款日期」必须先于「日期」
+    # 旧「店铺KPI」表的历史行里是「上期回款」,照旧映射到 prev_payout ——
+    # 那是当时的真实观测,导入不该改写历史。新看板的「累计回款」另映一列
+    ("total_payout", ("累计回款",)),
     ("prev_payout", ("上期回款",)),
     ("payout_date", ("回款日期", "回款日")),
     ("refund_rate", ("退款率",)),
@@ -399,7 +402,8 @@ _HIST_INT_FIELDS = {"items_online", "items_in_stock", "items_out_stock",
 _HIST_NUM_FIELDS = {"sales_amount", "otd_rate", "cancel_rate", "vtr_rate",
                     "srr_rate", "refund_rate", "negative_rate", "return_rate",
                     "inr_rate", "period_sales", "commission", "refund_amount",
-                    "closing_balance", "reserve_to_date", "payout", "prev_payout"}
+                    "closing_balance", "reserve_to_date", "payout",
+                    "prev_payout", "total_payout"}
 
 _HIST_FIELDS = tuple(f for f, _ in _HIST_HEADER_MAP if f not in ("data_date", "store"))
 

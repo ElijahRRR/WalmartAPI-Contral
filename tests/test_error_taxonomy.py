@@ -2,9 +2,12 @@
 
 方案定稿 `docs/error_taxonomy.md`;本文件是它的**机器可验形式**,三段:
 
-  ① 语料逐行断言 —— `tests/fixtures/reason_corpus.jsonl`(70 行)与
-     `feed_error_corpus.jsonl`(20 行),原文全部取自 2026-08-31 生产实查,
-     **一行不许跳**。语料是验收标准:引擎迁就语料,不是语料迁就引擎。
+  ① 语料逐行断言 —— `tests/fixtures/reason_corpus.jsonl`(77 行)与
+     `feed_error_corpus.jsonl`(20 行),原文全部取自生产实查(前 70 行
+     2026-08-31 全量实查;#71-#77 是 2026-09-01 首轮对照报告的 unknown 清单
+     补收,`provenance:"prod-2026-09-01-report"`,标 `truncated` 的是报告展示
+     截断、判据只用可见段),**一行不许跳**。语料是验收标准:引擎迁就语料,
+     不是语料迁就引擎。
   ② 旧行为快照 —— 同一批 reason 语料跑现行 `problem_products.categorize()`,
      把它**现在**的输出冻死在这里。第二步换轨时 diff 一目了然:哪些条从
      A/J/Z 翻成了真问题,是有账可查的,不是"看起来变好了"。
@@ -104,7 +107,7 @@ def test_feed_error_corpus_row(row):
 
 def test_the_whole_corpus_is_covered_not_a_subset():
     """夹具是验收标准 —— 行数少了说明有人删了语料(只许读不许改)。"""
-    assert len(REASONS) == 70 and len(FEED_ERRORS) == 20
+    assert len(REASONS) == 77 and len(FEED_ERRORS) == 20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,6 +145,13 @@ _OLD_SNAPSHOT = {
     61: ("D", "价格"), 62: ("B", "禁售"), 63: ("A", "过期"), 64: ("J", "特殊"),
     65: ("J", "特殊"), 66: ("J", "特殊"), 67: ("D", "价格"), 68: ("A", "过期"),
     69: ("B", "禁售"), 70: ("J", "特殊"),
+    # #71-#77:2026-09-01 首轮对照报告补收的 7 种文本(轮次二)。这一批的看点
+    # 与前 70 行相反 —— **旧引擎判得出、新引擎当时漏了**(在架面 unknown 316 条
+    # 就是它们),补完判据后新旧同指一处;只有 #77 两边都落杂项(旧 Z / 新
+    # OTHER 显式清单)。⚠ #77 旧码是 **Z 其他**不是 K:旧 K 的判据是
+    # `flagged by our internal team`(problem_products._RULES),与"审查中"无关。
+    71: ("I", "内容"), 72: ("C", "品牌"), 73: ("I", "内容"), 74: ("C", "品牌"),
+    75: ("I", "内容"), 76: ("H", "信息"), 77: ("Z", "其他"),
 }
 
 
@@ -228,6 +238,29 @@ def test_no_rule_uses_the_bare_content_standards_needle():
     """
     for rule in et.RULES:
         assert "content standards" not in rule.needles
+
+
+def test_the_content_policy_needle_never_steals_a_policy_rejection():
+    """⚠ `content policy`(序 9)排在政策词根(序 15)前面 —— 靠的是连续子串。
+
+    2026-09-01 轮次二补收 `content policy` 时当场核过的风险:政策原文里
+    "Offensive Content" 后面永远紧跟句号或逗号,再另起 "Walmart's policy
+    prohibits…",两词拼不出连续的 `content policy`。这条守门把它钉死 ——
+    以后谁把判据放宽成 `content` + `polic` 的松匹配,整批政策拒会当场翻码。
+    """
+    hits = [i for i, row in enumerate(REASONS, 1)
+            if any("content policy" in et.normalize_atom(a).fold
+                   for a in et.split_reasons(row["text"]))]
+    assert hits == [71], f"除 #71 外还有行含 content policy:{hits}"
+    assert REASONS[70]["expect_code"] == "CONTENT"
+    for row in REASONS:
+        if row["expect_code"] == "POLICY":
+            for atom in et.split_reasons(row["text"]):
+                assert "content policy" not in et.normalize_atom(atom).fold
+    for row in FEED_ERRORS:
+        if row.get("expect_code") == "POLICY":
+            assert "content policy" not in et.normalize_atom(
+                row["description"]).fold
 
 
 def test_normalize_unescapes_double_encoded_entities():
@@ -317,6 +350,24 @@ def test_extract_policy_keeps_commas_that_belong_to_the_name():
     assert et.extract_policy(
         "Prohibited Product Policy: Offensive Content, Halloween Items."
     ) == ("Offensive Content", "Halloween Items")
+
+
+def test_extract_policy_splits_the_politics_subcategory():
+    """子类词形家族补 Politics(方案 §3.4.3,2026-09-01 轮次二)。
+
+    ⚠ 本条用的是 **synthetic 拟造串**:语料里没有 Politics 的生产全文,
+    所以它只配待在单元测试段,**不许写进 fixtures**(夹具全部是生产原文)。
+    钉的是拆分行为本身:家族词命中 → 逗号前是主名、逗号后进 policy_sub;
+    没命中家族又不是小写续句的逗号,照旧整串留给主名(#32/#45 那类)。
+    """
+    assert et.extract_policy(                       # synthetic
+        "Prohibited Product Policy: Offensive Content, Politics."
+    ) == ("Offensive Content", "Politics")
+    res = et.classify_reasons(et.split_reasons(     # synthetic
+        "This item was unpublished for violating Walmart's Marketplace "
+        "Prohibited Products Policy: Offensive Content, Politics."))
+    assert (res.code, res.policy_name, res.policy_sub) == \
+        ("POLICY", "Offensive Content", "Politics")
 
 
 def test_classify_reasons_on_nothing_does_not_explode():

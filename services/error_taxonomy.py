@@ -130,8 +130,13 @@ RULES: tuple[Rule, ...] = (
          ("flagged by our internal team",)),
     Rule(5, "IP", "知识产权", ("intellectual property", "copyright"),
          pattern=re.compile(r"\bip\b\s+(?:policy|claim|related)")),
+    # 序 6:⚠ 后两串是 **2026-09-01 首轮生产对照补收**(旧 C 口径漏在新判据外):
+    # `partnered with select brands`(生产 7 条,语料 #74)与 `biz-cn`(生产 87 条,
+    # 语料 #72 —— 沃尔玛只给一个工单代码,正文里没有 brand 字样)。
+    # biz-cn 行在处置层单独标 biz_cn 维度、只拉 ASIN 不拉品牌(第二步细化)。
     Rule(6, "BRAND", "品牌未授权",
-         ("brand restrictions", "not authorized to list this brand")),
+         ("brand restrictions", "not authorized to list this brand",
+          "partnered with select brands", "biz-cn")),
     # 序 7:资质门优先于政策(判例定稿:Jewelry…Covered Goods 与 Textiles
     # 那两条正文都是"要预审批/限特定卖家",病根是没资质不是商品违禁)。
     # ⚠ requires? —— 生产原文两种人称都有:"category that **requires**
@@ -145,23 +150,39 @@ RULES: tuple[Rule, ...] = (
     # 序 9:内容问题。⚠ **不许用裸 `content standards`** —— 政策正文里有
     # "do not meet **offensive** content standards"(sex toys 那条,语料 #34),
     # 裸串会把政策拒误抢成内容问题。判据必须带主语("our"/"quality")。
+    # 后四串是 **2026-09-01 首轮生产对照补收**(旧 I 口径漏在新判据外):
+    # `content policy`(生产 200 条,语料 #71)/ 主图缺失两串(11 条,语料 #73)/
+    # `authenticity claims`(5 条,语料 #75)。
+    # ⚠ `content policy` 与序 15 的政策词根隔着六个表序,靠的是"连续子串":
+    # 政策原文一律是 "…Offensive Content." / "…Offensive Content, Halloween
+    # Items." 后另起一句 "Walmart's policy prohibits…",Content 与 policy 之间
+    # 永远隔着句号/逗号,拼不出 `content policy`(语料 #14/#21/#34/#44 + feed
+    # #13 逐条验过)。**别把这串放宽成 `content` + `polic` 的松匹配。**
     Rule(9, "CONTENT", "内容/图片不合标准",
          ("content issues", "does not meet our content standards",
-          "content quality standards", "image guidelines", "placeholder images")),
+          "content quality standards", "image guidelines", "placeholder images",
+          "content policy", "missing a primary image", "main image url",
+          "authenticity claims")),
     Rule(10, "SPECIAL", "特殊计划(Resold/Preorder/Pre-owned/Restored)",
          ("resold program", "preorder program", "pre-owned", "restored program")),
+    # 序 11:⚠ `tax code` 是 **2026-09-01 首轮生产对照补收**(旧 H 口径,生产
+    # 4 条,语料 #76:"Tax code information was not added during item setup")。
     Rule(11, "INFO", "信息缺失",
          ("no price was found", "shipping information was not added",
-          "active distribution center", "missing required logistics")),
+          "active distribution center", "missing required logistics",
+          "tax code")),
     Rule(12, "SYSTEM", "沃尔玛系统错误", ("internal error occurred", "glitch")),
     Rule(13, "STAGE", "Stage 未上线(中性)", ("stage status until you go live",)),
     Rule(14, "EXPIRED", "End Date 过期", ("end date has passed",)),
     # 序 15:通用政策拒。覆盖 Products/Product 两形与缺首字母 typo。
     Rule(15, "POLICY", "违反禁售政策(通用)",
          all_of=("prohibited product", "policy")),
-    # 序 16:显式杂项清单 —— 计入 unlisted,**不进 unknown 告警**(已知就这两种)。
-    Rule(16, "OTHER", "显式杂项(business decision / trust & safety)",
-         ("business decision", "trust & safety")),
+    # 序 16:显式杂项清单 —— 计入 unlisted,**不进 unknown 告警**(已知就这三种)。
+    # `currently under review` 是 **2026-09-01 首轮生产对照补收**(生产 2 条,
+    # 语料 #77):审查中是**自愈态**(24 小时内自动复架),不造码、也不该进
+    # unknown 告警把人叫起来。
+    Rule(16, "OTHER", "显式杂项(business decision / trust & safety / 审查中)",
+         ("business decision", "trust & safety", "currently under review")),
     # 序 17:兜底 —— **必进 unknown 告警清单,原文全文保留**。
     Rule(17, "OTHER", "未识别(兜底)", catch_all=True),
 )
@@ -206,8 +227,11 @@ _POLICY_RE = re.compile(
 _TRIM = " \t\r\n.,;:!?()[]{}<>\"'`*|-–—_/\\"
 # 前置停用词(方案 §3.4.2)
 _STOPWORDS = frozenset({"walmart", "walmart's", "our", "the", "this"})
-# 已知子类词形家族(方案 §3.4.3):逗号后文本命中即收进 policy_sub
-_SUB_FAMILY = ("halloween", "inappropriate", "intolerance", "violence", "sex toy")
+# 已知子类词形家族(方案 §3.4.3):逗号后文本命中即收进 policy_sub。
+# `politics` 是 2026-09-01 轮次二补的家族成员(方案 §3.4.3 更新);语料里没有
+# Politics 全文,单元测试用拟造串钉行为(标 synthetic,不进 fixtures)。
+_SUB_FAMILY = ("halloween", "inappropriate", "intolerance", "violence",
+               "sex toy", "politics")
 # 逗号后的连接词:政策名自己带的逗号(Tobacco, E-Cigarettes, **and** Vaping…)
 _JOINERS = frozenset({"and", "or", "&"})
 

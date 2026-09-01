@@ -1034,7 +1034,14 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     payout_date      text,
     payment_processor text, settle_cycle text,
     no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
-    prev_payout      numeric,        -- 严格 -14 天账期,无则 0(业务规则)
+    prev_payout      numeric,        -- **已停用**(所有者 2026-08-31:「这个字段
+                                     -- 不需要」)。原口径 = 严格 -14 天那一期的
+                                     -- Total Payable。列**不删**(DROP 不可回滚,
+                                     -- 且历史行里的值仍是当时的真实观测);
+                                     -- daily_report 不再写它,看板不再投影它。
+    total_payout     numeric,        -- **累计回款**:沃尔玛总共已付的钱
+                                     -- = ops.store_settlements 该店各账期之和。
+                                     -- 由 settlement_sync 维护台账,本表只存快照
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
@@ -1170,6 +1177,21 @@ CREATE OR REPLACE VIEW ops.v_store_profile AS
   ) e ON true
   ORDER BY coalesce(e.unnotified_high, 0) DESC, e.last_high_at DESC NULLS LAST,
            k.store;
+
+-- 结算账期台账(2026-08-31,所有者要「累计回款」):**一个账期一行,只增不改**。
+-- 累计回款 = SUM(total_payable),不是把每天的 payout 加起来(那是"当前待打款"
+-- 快照,天天重复计同一笔)。
+-- ⚠ 台账存在的另一半理由是**沃尔玛只保留有限期的对账文件**:
+-- availableReconFiles 里的账期会随时间滚出去。落到本表之后就永远留下,
+-- 所以这份累计**会随运行时间越来越完整**,而不是随沃尔玛的保留期缩水。
+-- 首次同步要把全部可下载账期拉一遍(每期一个 ZIP);之后每两周才多一期。
+CREATE TABLE IF NOT EXISTS ops.store_settlements (
+    store         text NOT NULL,
+    report_date   text NOT NULL,      -- 官方账期标识 MMDDYYYY(原样存,不转 date)
+    total_payable numeric NOT NULL,   -- 该期 PaymentSummary 行的 Total Payable
+    fetched_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, report_date)
+);
 
 -- 绩效问题订单:永久累积,五字段唯一键,首次发现日期永不被覆盖(ON CONFLICT DO NOTHING)
 CREATE TABLE IF NOT EXISTS ops.perf_problem_orders (

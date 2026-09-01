@@ -391,3 +391,71 @@ def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):
                                 "store_status": None, "payment_status": None}],
                               "2026-08-15")
     assert "输入清单 0 店" in out and "no_seller_id 1" in out
+
+
+# ── 累计回款(所有者 2026-08-31:撤「上期回款」)────────────────────────────
+
+def test_cumulative_payout_is_summed_per_period_not_per_day():
+    """⚠ 累计回款的单位是**账期**,不是天。
+
+    按天把 `payout` 加起来是错的:那是"当前待打款"的快照,同一笔钱在打款
+    之前天天出现在那一列,求和 = 同一笔重复计几十次。结算按账期发生,
+    一个账期只结算一次,所以台账的主键是 (店铺, 账期)。
+    """
+    from services import settlements
+
+    rows = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args=None): rows.append((sql, args))
+        def fetchall(self): return [("T1", 300.0), ("T2", 50.0)]
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    settlements.record(_Conn(), "T1", "06022026", 100.0149)
+    sql, args = rows[-1]
+    assert "ops.store_settlements" in sql
+    assert "ON CONFLICT (store, report_date) DO UPDATE" in sql   # 幂等,可重跑
+    assert args["total_payable"] == 100.01                       # 金额 round2
+
+    assert settlements.totals(_Conn()) == {"T1": 300.0, "T2": 50.0}
+
+
+def test_missing_store_is_absent_not_zero():
+    """⚠ 台账里没有这家店 ⇒ **不在字典里**,调用方写空不写 0。
+
+    「还没同步过账期」与「确实一分钱没回」是两件事;写 0 会让人以为查过了。
+    """
+    from services import settlements
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args=None): pass
+        def fetchall(self): return [("T1", 300.0)]
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    got = settlements.totals(_Conn(), ["T1", "T2"])
+    assert got == {"T1": 300.0}
+    assert "T2" not in got          # 缺席,不是 0
+    assert settlements.totals(_Conn(), []) == {}    # 空名单不查库
+
+
+def test_board_last_column_is_cumulative_not_previous_period():
+    """看板末列换成「累计回款」,PG 里的 prev_payout 列保留但不再投影。"""
+    from registry import resources
+    from workflows import daily_report as dr
+
+    assert resources._KPI_BOARD_COLUMNS[-1] == "total_payout"
+    assert "prev_payout" not in resources._KPI_BOARD_COLUMNS
+    assert dr._BOARD_HEADER[-1] == "累计回款"
+    assert len(dr._BOARD_HEADER) == len(resources._KPI_BOARD_COLUMNS)
+    # 日报不再自己拉 -14 天那一期(那是 settlement_sync 的活)
+    import inspect
+    src = inspect.getsource(dr)
+    assert "prev_recon_date" not in src

@@ -199,7 +199,11 @@ def judge(product_type: str, required: set, *, conditional: set | None = None,
     (`Garden & Patio` 下既有园艺耙也有禁售的活体种苗),PT 级套政策只会误杀整类。
     `audit_l2` R2 段早就写过同一条结论:"walmart_category 层级太粗…直接按
     walmart_category 匹配政策会误杀,政策只用作 L3 LLM 上下文"。
-    政策的落点是**产品级**(L2 `_infer_walmart_policy` → L3 上下文),不在这里。
+    政策的落点是**产品级**:硬拒规则在 `hit.detail["category"]` 里**自报**
+    类别(规格 `docs/audit_step3_spec.md` §二),其余由 L3 拿产品正文与 44 篇
+    官方英文全文逐条核对 —— 2026-09-03 C 批之后代码里再没有"从类目/PT 名
+    推一个政策标签"的地方(`audit_l2._infer_walmart_policy` 已随 R3/R5/R7/R8
+    一起删除)。
     """
     order = {OK: 0, EVAL: 1, BLOCK: 2}
     certs, reasons, worst = [], [], OK

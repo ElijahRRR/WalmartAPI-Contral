@@ -426,7 +426,9 @@ def _check_brand(product: ProductInfo, ctx: Any) -> Phase0Result:
     ("IKEA Furniture" 放行);占位符白名单只作用于产品侧且在规整之后
     ("N/A" 放行,"N / A" 不在白名单会继续查表)。
     只扫 brand 字段,**不扫 title** —— 旧仓 title_fallback 已废弃(死代码不迁),
-    title 里的品牌词是模糊信号,留给 L2 R4。
+    title 里的品牌词是模糊信号,留给**同层的软规则** `_scan_brand_mentions`
+    (2026-09-03 C 批自 L2 R4 迁入本模块):同一份黑名单,等值即硬拒、
+    文案提到只当 0 分证据送 L3。
     黑名单含 PRS/Wen/Wilson 等通用词,误伤是现状不是 bug,双跑校准会看到。
     """
     brand_raw = (product.brand or "").strip()
@@ -490,18 +492,24 @@ def _is_word_boundary_char(c: str) -> bool:
 def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
     """输入:产品 + ctx(用 ctx.brand_mention_automaton) → 输出:软证据 hit(0 或 1 条)。
 
-    扫 product.searchable_text(title + 全部五点 + 长描述)。自动机未构建(None)
-    → 返回 [](未装 pyahocorasick / 词表为空 / 手搓 ctx 没给这个字段)。
+    扫 product.searchable_text(title + 全部五点 + 长描述)。自动机为 None
+    → 返回 [](未装 pyahocorasick / 黑名单词表为空,那是"没有词可扫")。
     AC 不自带词边界,命中后手动检查前后字符;**自品牌豁免是精确等值**
     (brand strip+lower 后与命中词完全相等才跳过);同一个 brand 只报第一次。
     判定逻辑逐字迁自 audit_l2._rule_title_desc_blacklist(rule_code 与层次变了,
     判法一个字没变 —— 迁层不是改判据)。
+
+    ⚠ **属性直取,不用 `getattr(..., None)` 兜底**(2026-09-03 复核修订):
+    `AuditContext` 把这个字段声明成**无默认值**的必填项,所以生产上它一定在;
+    而写成 getattr 兜底的话,哪天字段再改一次名,这条规则会**静默返回空**
+    —— 表现是"品牌证据从此一条不出、TRO 命中从此不报警",而判定照样跑完、
+    摘要照样漂亮,没有任何东西会红。少一个字段就该当场 AttributeError。
     """
     hay = product.searchable_text
     if not hay:
         return []
-    A = getattr(ctx, "brand_mention_automaton", None)
-    if A is None:
+    A = ctx.brand_mention_automaton
+    if A is None:      # 词表为空 / 未装 pyahocorasick ⇒ 没有词可扫,不是接线坏了
         return []
     own_brand = (product.brand or "").strip().lower()
     hay_lower = hay.lower()

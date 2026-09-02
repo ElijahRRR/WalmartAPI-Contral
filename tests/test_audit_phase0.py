@@ -518,12 +518,37 @@ def test_brand_mention_reports_each_brand_once_and_scans_all_bullets():
 
 
 def test_brand_mention_without_an_automaton_just_skips():
-    """未装 pyahocorasick / 词表为空 / 手搓 ctx 没给这个字段 → 整条规则跳过。"""
+    """自动机为 None(未装 pyahocorasick / 黑名单词表为空)→ 整条规则跳过。
+
+    ⚠ 与"ctx 上根本没有这个字段"**不是一回事**,见下一条:前者是"没有词可扫",
+    后者是接线坏了。
+    """
     assert audit_phase0.check(_p(title="Fender strap"), _ctx()).evidence == []
-    assert audit_phase0.check(_p(title="Fender strap"),
-                              SimpleNamespace(phase0_sellers=frozenset(),
-                                              phase0_asins=frozenset(),
-                                              brand_blacklist={})).evidence == []
+    assert audit_phase0.check(
+        _p(title="Fender strap"),
+        SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                        brand_blacklist={},
+                        brand_mention_automaton=None)).evidence == []
+
+
+def test_a_missing_automaton_field_raises_instead_of_silently_skipping():
+    """⚠ ctx 上**少了这个字段**必须当场炸(2026-09-03 复核修订)。
+
+    `AuditContext` 把它声明成无默认值的必填项,所以生产上一定在;规则里若写成
+    `getattr(ctx, "brand_mention_automaton", None)` 兜底,哪天字段再改一次名
+    就会**静默返回空** —— 品牌证据从此一条不出、TRO 命中从此不报警,而判定
+    照样跑完、摘要照样漂亮,没有任何东西会红。宁炸不吞。
+    """
+    from services import audit_rules
+    naked = SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                            brand_blacklist={})          # 少了自动机字段
+    with pytest.raises(AttributeError, match="brand_mention_automaton"):
+        audit_phase0.check(_p(title="Fender strap"), naked)
+    # 字段在 AuditContext 里是**必填**(无默认值)—— 兜底的前提本就不成立
+    f = audit_rules.AuditContext.__dataclass_fields__["brand_mention_automaton"]
+    import dataclasses
+    assert f.default is dataclasses.MISSING
+    assert f.default_factory is dataclasses.MISSING
 
 
 # ── 双输出契约(C 批,规格 §4.1)──────────────────────────────────────────────

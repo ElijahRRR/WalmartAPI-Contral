@@ -337,7 +337,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 
 > **落地状态**:§4.1 / §4.2 / §4.3 全部实现,判据版本
 > `AUDIT_RULES_VERSION = c.2026-09-03.1`;与本规格的差异逐条见本节末尾的
-> 「C 落地记录」。测试 2,685 收集(2,662 跑 + 23 跳过)全绿。
+> 「C 落地记录」。测试 2,687 收集(2,664 跑 + 23 跳过)全绿。
 
 ### 4.1 L0 双输出
 
@@ -381,8 +381,19 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 
 **C 落地记录(2026-09-03,与本规格的差异逐条)**:
 
-- `AUDIT_RULES_VERSION` = **`c.2026-09-03.1`**;提示词一字未动 ⇒
-  `llm_cache` 命中不受本批影响(B1 那次已经全量重建过);
+- `AUDIT_RULES_VERSION` = **`c.2026-09-03.1`**;
+- ⚠ **缓存口径改正**(复核指出,初版写的"提示词未动 ⇒ 缓存不受影响"是错的):
+  system prompt 确实一字未动,但 `llm_cache.cache_key` 哈希的是**整段 messages
+  (system + user)**(`services/llm_cache.py:28-44`),而 C 批**动了 user 段**:
+  「上游证据」里的品牌行换了措辞(`* 标题/描述命中黑名单(R4, 共N个…)` →
+  `* 文案提到黑名单品牌(共N个…)`),R3 软 / R5 / R7 / R8 四类证据行整体消失
+  —— 原来只有这几类证据的产品,那一段现在塌成一行「(上游无证据)」。
+  于是缓存分成两半:
+    · **本来就没有任何软证据的产品**:user 段逐字节不变 ⇒ 照旧命中,零成本;
+    · **有品牌命中、或曾有 R3 软/R5/R7/R8 证据的产品**:未命中 ⇒ 按 L3 全价
+      重付(谷时段减半)。
+  与 B1 那次"全库全量未命中"**不是一回事**:这次是**按产品分的部分未命中**,
+  账要按"有多少产品带软证据"估,不能按 0 估;
 - **ctx 字段随判定方改名** `ac_automaton` → `brand_mention_automaton`
   (规格只说"挪到 L0 使用"):字段名带着已删规则的编号,下一个人会照着去找 R4;
   自动机仍在 `audit_rules._build_automaton` 一处构建。**`r4_source` 不改名**
@@ -420,6 +431,26 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   那一半量的是别名桥本身,桥拆了它就只会把退役的东西焊回来;官方表那一半
   (16/19 → 19/19)原样保留。
 
+**C 对抗复核修订(2026-09-03,ACCEPT-WITH-FIXES 逐条)**:
+
+1. **缓存账算错了**:见上条「缓存口径改正」—— 初版按"提示词没动"写成零成本,
+   实际是**按产品分的部分未命中**(带软证据的全价重付)。三处措辞同改:
+   `registry.resources` 的版本变更块、本节、§五的排量提示;
+2. **`_scan_brand_mentions` 不许 getattr 兜底**:`AuditContext` 把
+   `brand_mention_automaton` 声明成无默认值的必填项,兜底只会让"字段再改一次名"
+   变成**静默无证据 + TRO 从此不报警**。改为属性直取(`None` 仍表示"词表为空,
+   没有词可扫"),补一条用例钉死"少字段必须 AttributeError";
+3. **`compute_final_reason` 补扣分闸**:C 批让 penalty=0 的证据行排在
+   `all_hits` **最前面**,而原实现"第一条带 `category` 的就用它"没有扣分闸 ——
+   给软证据顺手加个 `category` 就能把整条产品的类别劫走,而判定结果一字不变、
+   没有任何东西会红。改为 `if cat and h.penalty < 0`(L3 的类别在结构化输出里,
+   不走这条路,不受影响),补回归用例;
+4. **两处注释指着已删的代码**:`audit_phase0._check_brand` 的「留给 L2 R4」改指
+   同层的 `_scan_brand_mentions`;`pt_admission` 的「L2 `_infer_walmart_policy`
+   → L3 上下文」改指规则自报类别(§二)与 L3;
+5. **README 的 policy_sync 行不再写死版本号**(`c.2026-09-02.1`)—— 那个数由
+   工作流摘要按实时 `AUDIT_RULES_VERSION` 渲染,文档里写死就是第二份会漂的真相。
+
 ## 五、切换手册(A+B+C 都合并后,一次做完)
 
 > **B2 已落地**:下面 `audit_replay` 与 `mode=stale -p active_days` 两条命令
@@ -437,6 +468,7 @@ python cli.py policy_sync
 python cli.py audit_replay --dry-run        # 样本规模 + 预估成本
 python cli.py audit_replay -p neg=600 -p pos=400   # 谷时段;看报告再决定下一步
 python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 90 天有动销的一批,谷时段分晚跑;pending/rejected 走 mode=nonpass
+                                            # ⚠ 带软证据的产品缓存未命中要全价重付(见下条),别按"零成本"排量
 ```
 
 - 回放报告不达标(§六第 5 条的线:**正例误伤率不高于旧链**)→ 不跑 `mode=stale`,
@@ -456,6 +488,12 @@ python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 9
   基线就变成新链自己的结论 —— 自己跟自己比,而数字看着完全正常。
 - 回放会写 `catalog.llm_cache`(判定链自己写)—— 那**不是**浪费:紧接着的
   `mode=stale` 重审命中同一批缓存,回放的钱等于预付了一部分。
+- **本次重审的缓存账不是零**(2026-09-03 C 批复核修正):C 批没动 system prompt,
+  但**动了 user 段**(证据行的措辞与条目),而缓存键哈希的是整段 messages ⇒
+  **带软证据的产品一律未命中、按全价重付**(带品牌命中的,以及从前吃 R3 软 /
+  R5 / R7 / R8 那几类证据的);**完全没有软证据的产品照旧命中**。
+  估算 `mode=stale` 那一晚的账时按这两半分开算 —— 按"提示词没动所以不花钱"
+  排量,会在谷时段跑到一半才发现钱不够。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。
 - `error_reclass_report` 不受影响;`audit_sheet` 的 `limit=500` 在切换周可临时调低控成本。
 

@@ -14,7 +14,8 @@
 **新顺序**(规格 §3.5,首个命中即出):
 
   0. verdict != 'reject'(含 outcome 为 None)   → None
-  1. all_hits 按 phase0 → l1 → l2 → l3 顺序,第一条 detail 带 `category` 的 → 该值
+  1. all_hits 按 phase0 → l1 → l2 → l3 顺序,第一条**扣分且** detail 带
+     `category` 的 hit → 该值(软证据不当判据:它没判死任何东西)
   2. l3 判 reject                               → l3.policy(解析层已对表)
   3. 都没有                                     → None + `STATS['reason_missing']` + warning
 
@@ -98,13 +99,20 @@ def compute_final_reason(outcome: Any) -> str | None:
         return None
 
     # (1) 规则自报(顺序 = all_hits 的 phase0 → l1 → l2 → l3,首个命中即出)。
-    #     只有硬拒规则写这个键;软 hit 是证据不是判据,本来就不带。
+    #     ⚠ **只认扣分的 hit**(2026-09-03 C 批复核修订):软 hit 是证据不是判据,
+    #     按约定本来就不写这个键 —— 但"按约定"不是护栏。C 批的 L0 双输出让
+    #     penalty=0 的证据行**排在 all_hits 最前面**,哪天有人给某条软证据的
+    #     detail 顺手加个 `category`(它读起来只是"这条证据关于哪类"),
+    #     整条产品的类别就会被那一条**没判死任何东西**的证据劫走,而判定结果
+    #     一个字都没变、没有任何东西会红。类别只能来自**判死它的那条规则**。
+
     for h in outcome.all_hits:
         cat = (h.detail or {}).get(CATEGORY_KEY)
-        if cat:
+        if cat and h.penalty < 0:
             return cat
 
-    # (2) L3 语义判(它的类别在自己的结构化输出里,不在 hit.detail["category"])
+    # (2) L3 语义判(它的类别在自己的结构化输出里,不在 hit.detail["category"];
+    #     L3 的 hit penalty 恒 0,所以上面那道扣分闸不会误伤它)
     l3 = outcome.l3
     if l3 is not None and getattr(l3, "verdict", None) == "reject":
         policy = getattr(l3, "policy", None)

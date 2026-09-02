@@ -709,7 +709,16 @@ AUDIT_RULES_VERSION = "c.2026-09-03.1"
 #                 (近 90 天有动销的那批;定点翻案:
 #                   python cli.py product_audit -p rerule=cat_requires_cert_hard
 #                   python cli.py product_audit -p rerule=made_in_usa_claim)。
-#                 ⚠ 提示词未动 ⇒ `llm_cache` 命中不受本批影响(B1 那次已全量重建)。
+#                 ⚠ **缓存口径说清**(别照抄"提示词没动所以不影响"):system
+#                 prompt 确实一字未动,但 `llm_cache.cache_key` 哈希的是**整段
+#                 messages**(system + user),而本批**改了 user 段** ——
+#                 「上游证据」那一段的品牌行换了措辞(`标题/描述命中黑名单(R4…)`
+#                 → `文案提到黑名单品牌(…)`),R3 软/R5/R7/R8 三类证据行整体消失
+#                 (原来有它们的产品现在多半塌成一行「(上游无证据)」)。所以:
+#                   · **本来就没有任何软证据的产品** → user 段逐字节不变,照旧命中;
+#                   · **有品牌命中、或曾有 R3 软/R5/R7/R8 证据的产品** → 未命中,
+#                     按 L3 全价重付(谷时段减半,见 LLM_PRICING)。
+#                 与 B1 那次"全库全量未命中"不同:这次是**按产品分的部分未命中**。
 # c.2026-09-02.2  **第三步 B1 批:L3 换喂 + 输出规范化 + 理由映射去猜测**
 #                 (规格 `docs/audit_step3_spec.md` §三,所有者八项定稿 §六):
 #                 ① S4 政策块改喂**官方英文全文**(`full_policy` 经

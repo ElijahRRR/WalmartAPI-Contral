@@ -249,6 +249,35 @@ def test_reason_取第一条自报category的hit():
     assert audit_reason.compute_final_reason(o2) == "Intellectual Property"
 
 
+def test_reason_软证据带category也不当判据():
+    """⚠ 2026-09-03 C 批复核修订:类别只能来自**判死它的那条规则**。
+
+    C 批的 L0 双输出让 penalty=0 的证据行排在 `all_hits` **最前面**。原实现
+    "第一条 detail 带 category 的就用它"没有扣分闸 —— 哪天有人给某条软证据的
+    detail 顺手加个 `category`(读起来只是"这条证据关于哪类"),整条产品的类别
+    就会被一条**没判死任何东西**的证据劫走:判定结果一个字不变、落库成功、
+    飞书 G 列照样有值,没有任何东西会红。
+    """
+    audit_reason.reset_stats()
+    o = _outcome(hits=[RuleHit("L2", "cat_access_blocked", -100,
+                               {"category": "类目准入"})])
+    o.phase0 = Phase0Result(blocked=False, evidence=[
+        RuleHit("L0", "phase0_brand_mention", 0,
+                {"category": "Intellectual Property",   # 软证据不该带,但挡得住
+                 "matches": [{"brand": "nike", "matched_phrase": "Nike"}]})])
+    assert audit_reason.compute_final_reason(o) == "类目准入"
+    # 只有软证据带 category、没有任何硬拒 ⇒ 没有类别(不兜底),计数 + warning
+    o2 = _outcome(hits=[])
+    o2.phase0 = o.phase0
+    assert audit_reason.compute_final_reason(o2) is None
+    assert audit_reason.STATS["reason_missing"] == 1
+    # L3 判拒不受这道闸影响(它的 hit penalty 恒 0,类别在结构化输出里)
+    o3 = _outcome(hits=[])
+    o3.phase0 = o.phase0
+    o3.l3 = SimpleNamespace(verdict="reject", hits=[], policy="Alcohol")
+    assert audit_reason.compute_final_reason(o3) == "Alcohol"
+
+
 def test_reason_规则没自报就轮到L3的policy():
     o = _outcome(hits=[RuleHit("L2", "some_soft_hit", 0, {})])
     o.l3 = SimpleNamespace(verdict="reject", hits=[],

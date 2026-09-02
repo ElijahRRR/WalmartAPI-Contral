@@ -192,3 +192,40 @@ def test_limits_table_per_store_cap(monkeypatch, caplog):
     assert subs[("T2", "DELETE_ITEM")] == ["X1"]            # 不在表内走默认
     assert any("不在限额表" in m for m in caplog.messages)   # 兜底必须告警
     assert "限额表生效" in out
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    got: list = []
+    monkeypatch.setattr(dr.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_execute_records_one_round_event_per_store(monkeypatch):
+    _env(monkeypatch, [["T1", "S1", "删除", ""], ["T1", "S2", "停用", ""]])
+    got = _capture_rounds(monkeypatch)
+    dr.run({"execute": True, "limit": "3"})
+    assert len(got) == 1
+    source, event, per_store = got[0]
+    assert (source, event) == ("product_clear", dr.store_events.CLEAR_ROUND)
+    assert per_store == {"T1": {"submitted": 2, "deferred": 0, "limit": 3}}
+
+
+def test_over_limit_rows_show_up_as_deferred(monkeypatch):
+    _env(monkeypatch, [["T1", f"S{i}", "删除", ""] for i in range(5)])
+    got = _capture_rounds(monkeypatch)
+    dr.run({"execute": True, "limit": "3"})
+    assert got[0][2]["T1"] == {"submitted": 3, "deferred": 2, "limit": 3}
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    """★ 本件是五条链里**唯一没有 dry-run 早退**的 —— 合并循环空跑也会走到,
+    不显式 `if execute` 就会给空跑记一整轮假流水。"""
+    _env(monkeypatch, [["T1", "S1", "删除", ""]])
+    got = _capture_rounds(monkeypatch)
+    dr.run({"execute": False})
+    assert got == []

@@ -2076,6 +2076,34 @@ def test_append_records_delegates_the_scan_to_the_shared_next_empty(monkeypatch)
     assert seen == [(sheet_entry, 9)]
 
 
+# ── 店铺事件账本(运营类:每店每轮一条,按动作类分桶)──────────────────────
+
+def _capture_rounds(monkeypatch):
+    got: list = []
+    monkeypatch.setattr(mw.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_execute_records_one_round_event_bucketed_by_kind(monkeypatch):
+    """PUT 路由记 submitted/failed 两档(它不进 feed 台账,没有 dedup/unknown
+    —— 强行凑四档会让账本看起来两条路由同构)。"""
+    _wire(monkeypatch, _zero(2))
+    got = _capture_rounds(monkeypatch)
+    mw.run({"execute": True})
+    assert len(got) == 1
+    source, event, per_store = got[0]
+    assert (source, event) == ("maintenance", mw.store_events.MAINT_ROUND)
+    assert per_store == {"T1": {"inventory": {"submitted": 2, "failed": 0}}}
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    _wire(monkeypatch, _zero(2))
+    got = _capture_rounds(monkeypatch)
+    mw.run({"execute": False})
+    assert got == []
 # ── 旧节点清零(搬仓收尾,一次性)──────────────────────────────────────────
 
 def test_node_clear_refuses_to_clear_the_managed_node(monkeypatch):

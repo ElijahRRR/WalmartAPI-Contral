@@ -1476,3 +1476,48 @@ def test_missing_limits_table_is_logged_not_silent(monkeypatch, caplog):
         assert ln._load_quota() == {}
     # getMessage() 才是格式化后的整句(message 是模板,args 还没代入)
     assert any("所有店按不限量上架" in r.getMessage() for r in caplog.records)
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    """输入:monkeypatch → 输出:收 record_round 调用的列表。
+
+    盯 `record_round` 而不是 `record_round_safe`:后者把一切异常吞掉(那是
+    它的职责),用它当探针的话"根本没调"与"调了但炸了"分不开。
+    """
+    got: list = []
+    monkeypatch.setattr(ln.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_execute_records_one_round_event_per_store(monkeypatch):
+    """真跑:每店一条,detail 是这一轮的计数(不复制任何流水)。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T1", asin="B0AAAAABAD"),   # 必填缺失(预备期)
+            _sheet_row(4, store="T2", asin="B0BBBBBOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    got = _capture_rounds(monkeypatch)
+    ln.run({"execute": True})
+    assert len(got) == 1
+    source, event, per_store = got[0]
+    assert (source, event) == ("list_new", ln.store_events.LIST_ROUND)
+    assert sorted(per_store) == ["T1", "T2"]
+    assert per_store["T1"]["submitted"] == 1
+    assert per_store["T1"]["invalid"] == 1      # 预备期拦下的按店记
+    assert per_store["T2"]["submitted"] == 1 and "invalid" not in per_store["T2"]
+    assert per_store["T1"]["failed"] == 0 and per_store["T1"]["unknown"] == 0
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    """★ 空跑一条都不许记:dry-run 什么都没提交,记了就是一整轮假流水。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    got = _capture_rounds(monkeypatch)
+    ln.run({"execute": False})
+    assert got == []

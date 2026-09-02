@@ -47,8 +47,8 @@ from datetime import datetime
 from api import feeds, items as items_api
 from registry import db
 from services import blacklist, kpi, listing_sources, match_feed, \
-    match_sheet, notify_fmt as nf, product_events, risk_gate, store_retry, \
-    stores as stores_svc
+    match_sheet, notify_fmt as nf, product_events, risk_gate, store_events, \
+    store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -194,6 +194,8 @@ def run(params: dict) -> str:
         match_sheet.write_rows(updates, execute=False)
         return "\n".join(lines)
 
+    round_cnt: dict[str, dict] = {}     # 各店本轮四档计数(店铺事件账本)
+
     def _one_store(store_name: str, pairs: list[tuple[dict, dict]]) -> list[str]:
         """输入:店铺名 + 该店 (行, Item) 对 → 输出:该店的摘要行。
 
@@ -207,6 +209,11 @@ def run(params: dict) -> str:
         """
         store = stores_by_name[store_name]
         n = {"submitted": 0, "dedup": 0, "failed": 0, "unknown": 0}
+        # 账本计数**就地填进外层 round_cnt**、逐片追加(与 updates 同一条纪律):
+        # 抛异常时前几片其实已经发出去了,局部计数随异常一丢那几条在账本上
+        # 就成了零。摘要那行仍用局部 n —— 补试的叙述覆盖首轮,行里说的是
+        # 这一次尝试;账本要的是整轮的和,两个口径故意不同
+        bucket = round_cnt.setdefault(store_name, {})
         entries = [item for _, item in pairs]
         # 逐切片结果与 (行, Item) 对位:游标走法是 submit_feed 返回契约的机械
         # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
@@ -215,6 +222,7 @@ def run(params: dict) -> str:
                 feeds.submit_feed(store, "MP_ITEM_MATCH", entries,
                                   workflow="match_listing"), pairs):
             n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
+            bucket[res["outcome"]] = bucket.get(res["outcome"], 0) + len(batch)
             if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
                 for r, _ in batch:
                     r["feed_id"], r["list_time"] = res["feed_id"], now
@@ -257,6 +265,9 @@ def run(params: dict) -> str:
         try:    # 单店隔离(与 cleanup/maintenance 同款纪律)
             per_store[store_name] = _one_store(store_name, pairs)
         except Exception as e:
+            # 异常店也要在账本上留一条:计数可能全 0(第一片就炸),而
+            # "这家店这一轮炸了"本身就是要能按时间线对齐的事实
+            round_cnt.setdefault(store_name, {})["exception"] = True
             # 店级隔离 → **不当场判生死**:跑完别人再串行补试一遍(标准①,
             # 所有者定稿 2026-08-26)。此前这里只 diagnose 分诊、注释写着
             # 「下轮重试」,补一次的代码没有
@@ -290,6 +301,10 @@ def run(params: dict) -> str:
         lines[0] += nf.absent_tail(absent, gate_note, tail="未提交行下轮重试")
     if gate_note:
         lines.append(gate_note)
+    # 店铺事件账本(运营类):每店每轮一条(本段只在真跑走到 —— dry-run 在
+    # write_rows 那里就 return 了)。记账失败只告警,不拖垮跟卖链
+    store_events.record_round_safe("match_listing", store_events.MATCH_ROUND,
+                                   round_cnt, lines)
 
     written = match_sheet.write_rows(updates)
     lines.append(f"回写 {written} 行;feed 结果轮询走 feed_poll")

@@ -100,7 +100,7 @@ from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     mp_mapper, notify_fmt as nf, pricing, product_events, product_ingest, \
     pt_spec, risk_gate, scrape_batches, store_limits, store_targets, \
     stores as stores_svc, upc_pool, variant_group, variant_remap, variant_title
-from services import store_retry
+from services import store_events, store_retry
 
 DANGEROUS = True
 
@@ -182,8 +182,9 @@ class _AdaptiveGate:
                        "就是 resume at a lower rate", old, nxt, why)
 
 
-def _settle_round(deferred: list, stores_by_name: dict, gate, today: str) -> list:
-    """输入:整轮攒下的不确定片 + 店表 + 并发闸 → 输出:摘要行。
+def _settle_round(deferred: list, stores_by_name: dict, gate, today: str,
+                  cnt_by_store: dict | None = None) -> list:
+    """输入:整轮攒下的不确定片 + 店表 + 并发闸(+ 计数回填)→ 输出:摘要行。
 
     **第二轮**(所有者定稿 2026-08-26:「重试的等到完整跑完一轮再尝试」)。
     第一轮内联结算的老毛病是:补交在失败后 30 秒发出,而那时另外二十几家店
@@ -194,6 +195,10 @@ def _settle_round(deferred: list, stores_by_name: dict, gate, today: str) -> lis
 
     走 `gate`:第二轮的并发已经被第一轮的降档压过一档 —— 第一轮既然证明了
     这个时段拥堵,重试就没有理由再按顶格冲。
+
+    `cnt_by_store` 给了就把这一轮的三个结局**加**进各店的计数(店铺事件账本
+    的一轮 = 首轮 + 延后结算,不是只有首轮):这些片子在首轮是"不确定"、
+    一条都没算进 submitted,不加回去的话账本上的提交数会长期偏少。
     """
     if not deferred:
         return []
@@ -227,6 +232,10 @@ def _settle_round(deferred: list, stores_by_name: dict, gate, today: str) -> lis
             sn, outcome, n = f.result()
             tally.setdefault(outcome, {}).setdefault(sn, 0)
             tally[outcome][sn] += n
+            if cnt_by_store is not None and outcome in ("submitted", "failed",
+                                                        "unknown"):
+                c = cnt_by_store.setdefault(sn, {})
+                c[outcome] = c.get(outcome, 0) + n
     label = {"submitted": "✅ 补上", "failed": "❌ 判未达(UPC 已回收,次日重试)",
              "unknown": "⚠ 仍不确定(保持 pending,交启动对账)"}
     for outcome in ("submitted", "failed", "unknown"):
@@ -626,6 +635,9 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
             results = list(ex.map(_judge, ready))
 
     cnt = {"invalid": 0, "title_short": 0, "llm_failed": 0}
+    # 必填缺失**按店**再留一份(店铺事件账本要每店一条):全局那个数回答
+    # "这一轮坏了多少行",答不了"是哪家店的货一直组不出合规载荷"
+    by_store: dict[str, int] = {}
     ok: list[dict] = []
     reasons: list[tuple[int, str]] = []
     for kind, r, why, payload in results:
@@ -634,10 +646,13 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
             ok.append({**r, "_visible": v, "_orderable": o})
         else:
             cnt[kind] += 1
+            if kind == "invalid":
+                by_store[r["store"]] = by_store.get(r["store"], 0) + 1
             reasons.append((r["rownum"], why))
     ok.sort(key=lambda x: x["rownum"])
     reasons.sort(key=lambda t: t[0])
     cnt["llm_stats"] = llm_stats
+    cnt["invalid_by_store"] = by_store
     return ok, reasons, cnt
 
 
@@ -1626,6 +1641,7 @@ def run(params: dict) -> str:
             lines.append(f"  ⚠ {store_name}:取上架仓 FC ID 失败整店跳过"
                          f"({e}),下轮重试")
     prep_ok: list[dict] = []
+    invalid_by_store: dict[str, int] = {}
     if prep_in:
         workers, clamp_note = db_guard.cap_workers(
             min(prep_workers, max(1, len(prep_in))))
@@ -1634,6 +1650,7 @@ def run(params: dict) -> str:
         prep_ok, prep_reasons, pc = _prep_rows(prep_in, partners, workers)
         reasons.extend(prep_reasons)
         n["invalid"] += pc["invalid"]
+        invalid_by_store = pc.get("invalid_by_store") or {}
         prep_post = [(lab, v) for lab, v in (
             ("必填缺失", pc["invalid"]),
             ("标题不足10字符", pc["title_short"]),
@@ -1686,7 +1703,10 @@ def run(params: dict) -> str:
         「listed=No 且无 feed_id」就会重发一遍。让每个店的表写紧跟自己的提交,
         别的店炸了也带不走它。(并发下的写节流由 api.feishu 的 _sheet_locks 兜。)
         """
-        cnt = {"no_upc": 0, "title_diff": 0}
+        # submitted/failed/unknown 也进 cnt(2026-08-30 接店铺事件账本):此前
+        # 「提交 N 条」是就地 sum 出来拼进摘要字符串的,数字一出这一行就没了
+        cnt = {"no_upc": 0, "title_diff": 0,
+               "submitted": 0, "failed": 0, "unknown": 0}
         reasons_s: list[tuple[int, str]] = []
         lines_s: list[str] = []
         # 不确定待结算的片子:**本店局部**(跨店并发之后不能往共享 list 上
@@ -1747,9 +1767,12 @@ def run(params: dict) -> str:
                 _apply_submit_result(store_name, res, batch, updates, today)
             if updates:
                 listing_sheet.write_submit_cols(updates)
+            # K 列三态就是这一轮的三个结局(Yes=提交 / No=被拒 / Unknown=不确定)
+            for _rn, v in updates:
+                cnt[{"Yes": "submitted", "No": "failed"}.get(v[4], "unknown")] += 1
             n_defer = sum(len(b) for _, _, b in deferred_s)
             lines_s.append(
-                f"  {store_name}:提交 {sum(1 for _, v in updates if v[4] == 'Yes')} 条"
+                f"  {store_name}:提交 {cnt['submitted']} 条"
                 + (f",⏸ {n_defer} 条不确定待整轮后结算" if n_defer else ""))
         except Exception as e:
             # 店级隔离 → **不当场判生死**:跑完别人再串行补试一遍(标准①,
@@ -1808,7 +1831,8 @@ def run(params: dict) -> str:
                 # 半成品照原样入账:领到号/没领到号的理由都要落 N 列,
                 # 已 defer 的片子照旧进第二轮结算
                 cnt, reasons_s, lines_s, deferred_s = partial.get(
-                    sn, ({"no_upc": 0, "title_diff": 0}, [], [], []))
+                    sn, ({"no_upc": 0, "title_diff": 0, "submitted": 0,
+                          "failed": 0, "unknown": 0}, [], [], []))
                 per_store[sn] = (
                     cnt, reasons_s,
                     lines_s + [f"  ⚠ {sn}:上架异常已跳过({cls}:{e}),下轮重试"])
@@ -1819,8 +1843,12 @@ def run(params: dict) -> str:
                                    tail="未上架行下轮重试")
         if gate_note:
             lines.append(gate_note)
+        # 店铺事件账本(运营类)的本轮计数:首轮的三个结局在 per_store 的 cnt
+        # 里,延后结算那批**加**在这里(一轮 = 首轮 + 延后结算)
+        round_cnt: dict[str, dict] = {}
         # 按店名排序合并:完成先后是随机的,摘要行序与 N 列理由的写入顺序不能跟着随机
-        lines.extend(_settle_round(deferred_all, stores_by_name, gate, today))
+        lines.extend(_settle_round(deferred_all, stores_by_name, gate, today,
+                                   round_cnt))
         if gate.steps:
             lines.append(
                 "  提交并发降档:" + " → ".join(
@@ -1832,6 +1860,18 @@ def run(params: dict) -> str:
             n_var["标题加维度后缀"] += cnt["title_diff"]
             reasons.extend(reasons_s)
             lines.extend(lines_s)
+            c = round_cnt.setdefault(sn, {})
+            for k in ("submitted", "failed", "unknown"):
+                c[k] = c.get(k, 0) + cnt[k]
+            c["no_upc"] = cnt["no_upc"]
+            c["title_diff"] = cnt["title_diff"]
+        # 预备期的必填缺失也按店记:一家店的货老是组不出合规载荷,只有把它
+        # 按店摆出来才看得见(全局那个数只说"这一轮坏了多少行")
+        for sn, v in (invalid_by_store or {}).items():
+            round_cnt.setdefault(sn, {})["invalid"] = v
+        # 每店每轮一条(全 0 的店不落行);记账失败只告警,不拖垮上架链
+        store_events.record_round_safe("list_new", store_events.LIST_ROUND,
+                                       round_cnt, lines)
 
     # 提交期计数曾经**只加不看**:gate_line 是字符串,在提交循环之前就拼死了
     # (2026-08-17 修 n_var 那一处时同一个坑没扫干净)。逐行理由确实写进了 N 列,

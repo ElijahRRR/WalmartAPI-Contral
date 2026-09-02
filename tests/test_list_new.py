@@ -240,7 +240,8 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()},
-        {}, {}))                       # 占用台账为空 = 占用闸恒放行
+        {}, {},                        # 占用台账为空 = 占用闸恒放行
+        {}, set()))                    # 冷却/代际两道码闸也恒放行
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
@@ -393,7 +394,8 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -425,7 +427,8 @@ def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T_A": {"fbm_range1": "200%"},
@@ -469,7 +472,8 @@ def test_store_channel_gate(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {
         "T_FBA": {"fba_range1": "300%", "fbm_range1": "200%"},
@@ -504,7 +508,8 @@ def test_silent_buckets_now_write_reasons(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         {"T_OFF"}, {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
@@ -536,7 +541,8 @@ def test_custom_product_gate(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -564,7 +570,8 @@ def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, {("A109", "B0FREE0001"), ("A102", "B0FREE0001")},
-        {}, set(), {"banned_pts": set(), "brands": set()}, {}, {}))
+        {}, set(), {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -597,7 +604,8 @@ def test_quota_slices_after_filters(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -645,7 +653,8 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -773,7 +782,8 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
@@ -802,7 +812,8 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
-        {"acme": "OTHER"}))                                 # 品牌占用
+        {"acme": "OTHER"},                                  # 品牌占用
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
@@ -1126,7 +1137,8 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
@@ -1149,6 +1161,11 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
         None if w["asin"].endswith("NOUPC") else "0" + w["asin"] for w in wants])
     monkeypatch.setattr(ln.upc_pool, "release", lambda *a, **k: 0)
     monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
+    # 抽码桩(码尾保留 ASIN 后 6 位,好让下面的 BAD 判据还认得出行)
+    monkeypatch.setattr(
+        ln.sku_codec, "mint",
+        lambda conn, store, st_, key, *, workflow:
+            "A" + key[-6:].upper().rjust(11, "X"))
     monkeypatch.setattr(ln, "_map_llm",
                         lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
     monkeypatch.setattr(ln.mp_mapper, "build_orderable", lambda *a, **k: {})
@@ -1200,7 +1217,19 @@ def _wire_execute_env(monkeypatch, rows, products):
     """
     stores = sorted({r["store"] for r in rows})
     seen = {"claim_wants": [], "released": [], "orderable_upcs": [],
-            "assembled_upcs": [], "submitted": []}
+            "assembled_upcs": [], "submitted": [], "minted": [],
+            "orderable_skus": [], "conform_skus": [], "submit_vals": [],
+            "registered": [], "events": [], "marked_used": []}
+    # 抽码桩:返回**可预测**的码(不是随机),否则断言只写得出"不等于 ASIN",
+    # 写不出"载荷里那个就是登记簿里那个"。签名跟着 sku_codec.mint 的定死签名
+    # 走(workflow 是关键字参):漏了它真代码调用会 TypeError 而桩不会,
+    # 那种差异只在生产暴露
+    def fake_mint(conn, store, source_type, source_key, *, workflow):
+        seen["minted"].append((store, source_type, source_key, workflow))
+        # 码尾保留 ASIN 的后 6 位,只是为了让夹具还能分得清哪行是哪行
+        # (…BAD 行仍要在预备期被 conform 拦下);真码是纯随机的
+        return "A" + source_key[-6:].upper().rjust(11, "X")
+    monkeypatch.setattr(ln.sku_codec, "mint", fake_mint)
     # 起跑抖动在单元测试里一律关掉(缺省 0~800ms × 每店会让多店用例真睡几秒)。
     # 关的是**常量默认值**;要测抖动的用例自己传 submit_jitter_ms
     monkeypatch.setattr(ln, "SUBMIT_JITTER_MS", 0)
@@ -1208,7 +1237,8 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
@@ -1238,7 +1268,8 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln.upc_pool, "claim", claim)
     monkeypatch.setattr(ln.upc_pool, "release",
                         lambda c, upcs, reason: seen["released"].extend(upcs))
-    monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
+    monkeypatch.setattr(ln.upc_pool, "mark_used",
+                        lambda c, pairs: seen["marked_used"].extend(pairs))
     monkeypatch.setattr(ln, "_map_llm",
                         lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
     seen["orderable_fcs"] = []
@@ -1246,22 +1277,31 @@ def _wire_execute_env(monkeypatch, rows, products):
         ln.mp_mapper, "build_orderable",
         lambda sku, upc, price, qty, partner, **k: (
             seen["orderable_upcs"].append(str(upc)),
+            seen["orderable_skus"].append(str(sku)),
             seen["orderable_fcs"].append(str(partner)),
-            {"productIdentifiers": {"productId": str(upc),
-                                    "productIdType": "UPC"}})[2])
-    # 每店第二类行(…BAD)必填缺失 → 预备期本地拦下
-    monkeypatch.setattr(ln.mp_conform, "conform", lambda *a, **k: (
-        a[2], a[3], [],
-        ["brand"] if str(k.get("sku", "")).endswith("BAD") else []))
+            {"sku": str(sku),
+             "productIdentifiers": {"productId": str(upc),
+                                    "productIdType": "UPC"}})[3])
+    # 每店第二类行(…BAD)必填缺失 → 预备期本地拦下(批次 2 起 conform 收到的
+    # 是不透明码,靠 fake_mint 保留的 ASIN 码尾仍分得出来)
+    def _conform(*a, **k):
+        seen["conform_skus"].append(str(k.get("sku", "")))
+        bad = str(k.get("sku", "")).endswith("BAD")
+        return a[2], a[3], [], ["brand"] if bad else []
+    monkeypatch.setattr(ln.mp_conform, "conform", _conform)
     monkeypatch.setattr(
         ln.mp_mapper, "assemble_mp_item",
         lambda o, pt, v: (seen["assembled_upcs"].append(
             o["productIdentifiers"]["productId"]), {"pt": pt})[1])
-    monkeypatch.setattr(ln.listing_sources, "register", lambda *a, **k: None)
-    monkeypatch.setattr(ln.product_events, "record_many", lambda *a, **k: None)
+    # register 保留桩是为了断言它**零调用**(登记已在 mint 里做完,双轨禁止)
+    monkeypatch.setattr(ln.listing_sources, "register",
+                        lambda c, rows_: seen["registered"].extend(rows_))
+    monkeypatch.setattr(ln.product_events, "record_many",
+                        lambda c, rows_: seen["events"].extend(rows_))
     monkeypatch.setattr(ln.listing_sheet, "write_reasons", lambda *a, **k: 0)
     monkeypatch.setattr(ln.listing_sheet, "write_data_cols", lambda *a, **k: 0)
-    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols", lambda u: len(u))
+    monkeypatch.setattr(ln.listing_sheet, "write_submit_cols",
+                        lambda u: (seen["submit_vals"].extend(u), len(u))[1])
 
     def fake_submit(store, feed_type, items, workflow=None, defer_settle=False):
         seen["submitted"].append((store["name"], len(items)))
@@ -1388,6 +1428,10 @@ def test_second_pass_resubmits_a_byte_identical_payload(monkeypatch):
     ln.run({"execute": True})
     assert len(sent) == 2
     assert sent[0] == sent[1], (sent[0], sent[1])
+    # 批次 2:两次发的是**同一个码**(抽码在 _prep_rows,补试不二次抽码);
+    # 同码 ⇒ 同 payload_key ⇒ 在途防重把真重复挡回 dedup,不会双上架
+    assert sent[0][0]["Orderable"]["sku"] == sent[1][0]["Orderable"]["sku"]
+    assert sent[0][0]["Orderable"]["sku"] != rows[0]["asin"]
 
 
 def test_still_failed_store_is_absent_in_first_line_and_keeps_its_half_work(
@@ -1585,7 +1629,8 @@ def test_out_of_scope_store_skips_claim_gates(monkeypatch):
         set(), {}, {("A085", "B0AAAAAOK1")}, {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0AAAAAOK1": "A085"},
-        {ln.brand_key.brand_key("SomeBrand", None): "A085"}))
+        {ln.brand_key.brand_key("SomeBrand", None): "A085"},
+        {}, set()))
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "谭总4"}, {"name": "T1"}])
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -1784,3 +1829,386 @@ def test_dry_run_records_no_round_event(monkeypatch):
     got = _capture_rounds(monkeypatch)
     ln.run({"execute": False})
     assert got == []
+
+
+# ── SKU 改造批次 2:写侧切换(mint / 载荷 / 回写 / 两道码闸 / limit)───────────
+#
+# 本批是整个 SKU 改造里唯一有行为变化的一批。下面的用例分四组盯四件事:
+#   ① 码在**预备期**抽、每行一次、挂 r["_sku"](挪进 _one_store = 双上架);
+#   ② 载荷 / mark_used / 事件 / 上架表 SKU 列写的都是那个码,不是 ASIN;
+#   ③ dry-run 一次都不抽码(写库函数不设 dry_run 开关,靠调用方分路);
+#   ④ 两道新闸(代际上限 / 退役冷却)与试点 limit 的命中、放行与顺序。
+
+
+def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None, over_gen=()):
+    """dry-run 路径的标准桩:闸门数据面可注入,**mint 一被调到就当场炸**。
+
+    "空跑不写库"这条红线在 list_new 里靠位置保证(`if not execute:` 早于
+    `_prep_rows` return),但位置是会被挪的 —— 所以这里把 mint 桩成抛断言,
+    哪天有人把抽码挪到闸门段,红的是这一整组用例而不是生产。
+    """
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    stores = sorted({r["store"] for r in rows})
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        set(), {}, set(listed), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        dict(cooling or {}), set(over_gen)))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
+                        lambda: {s: {"fbm_range1": "200%"} for s in stores})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": s} for s in stores])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+    monkeypatch.setattr(ln, "_push_scrape", lambda want, execute: (None, []))
+    monkeypatch.setattr(ln, "_sync_upc", lambda execute, lines: None)
+
+    def _no(*a, **k):
+        raise AssertionError("dry-run 不许写库/不许提交")
+    monkeypatch.setattr(ln.sku_codec, "mint", _no)
+    monkeypatch.setattr(ln.upc_pool, "claim", _no)
+    monkeypatch.setattr(ln.listing_sources, "register", _no)
+    monkeypatch.setattr(ln.feeds, "submit_feed", _no)
+    return products
+
+
+def test_mint_happens_in_prep_not_in_one_store(monkeypatch):
+    """★ 抽码在 `_prep_rows`,**不在** `_one_store`:串行补试重跑的是后者。
+
+    抽码若在 _one_store 里,补试会抽出第二个码 ⇒ 载荷不再一字不差 ⇒
+    api/feeds.payload_key 的在途防重不命中 ⇒ 首轮已发出去的那片被真的再发
+    一次 = 双上架,而且全程不报错。这里钉的就是"补试没有二次抽码"。
+    """
+    from socksio.exceptions import ProtocolError
+    rows = [_sheet_row(2, store="T1", asin="B0GOOD0001"),
+            _sheet_row(3, store="T2", asin="B0SHAKY001")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_retry.time, "sleep", lambda s: None)
+    tries = []
+
+    def flaky(store, feed_type, items, workflow=None, defer_settle=False):
+        tries.append(store["name"])
+        if store["name"] == "T2" and tries.count("T2") == 1:
+            raise ProtocolError("Malformed reply")
+        yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", flaky)
+
+    ln.run({"execute": True})
+    assert tries.count("T2") == 2                  # _one_store 真跑了两遍
+    assert len(seen["minted"]) == len(rows)        # 而码只抽了行数次
+    assert [m[3] for m in seen["minted"]] == ["list_new"] * len(rows)
+    assert [m[1] for m in seen["minted"]] == \
+        [ln.listing_sources.SOURCE_AMZ] * len(rows)
+
+
+def test_code_is_committed_before_any_feed_call(monkeypatch):
+    """★ 全部抽码都早于第一次 submit_feed(防重状态先落库再调接口)。
+
+    码在任何一次外部调用之前就已经 commit,进程半路死掉重跑拿到的是同一个码
+    (mint 的复用语义),不会每轮换码白烧一个 UPC。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T2", asin="B0BBBBBOK2")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    trace = []
+    real_mint = ln.sku_codec.mint
+
+    def traced_mint(*a, **k):
+        trace.append("mint")
+        return real_mint(*a, **k)
+    monkeypatch.setattr(ln.sku_codec, "mint", traced_mint)
+
+    def traced_submit(store, feed_type, items, workflow=None,
+                      defer_settle=False):
+        trace.append("submit")
+        yield {"outcome": "submitted", "feed_id": "F-1", "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", traced_submit)
+
+    ln.run({"execute": True})
+    assert trace.count("mint") == 2 and trace.count("submit") == 2
+    assert trace[:2] == ["mint", "mint"], trace   # 抽码全在提交之前
+
+
+def test_duplicate_rows_reusing_one_code_are_counted_out_loud(
+        monkeypatch, caplog):
+    """同 (店, ASIN) 在上架表贴了两行 ⇒ mint 复用同一个码,**必须数出来**。
+
+    两个随机码相同不像两个 ASIN 相同那样扎眼,不数出来没人看得见。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0SAMEASIN"),
+            _sheet_row(3, store="T1", asin="B0SAMEASIN")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    with caplog.at_level("INFO", logger="workflows.list_new"):
+        ln.run({"execute": True})
+    assert "本轮 2 行只用了 1 个码" in caplog.text
+
+
+def test_payload_sku_is_the_minted_code_not_the_asin(monkeypatch):
+    """★ 发给沃尔玛的 Orderable.sku 是登记簿里那个码,不是 ASIN。
+
+    同一个值也进 mp_conform 的 sku=(单品占位 variantGroupId):只改一处会出现
+    「Orderable.sku 是新码、variantGroupId 还是 ASIN」的半身像,而
+    variantGroupId 也是发出去的,等于把 ASIN 从后门递出去。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    ln.run({"execute": True})
+    code = "A" + "B0AAAAAOK1"[-6:].rjust(11, "X")
+    assert seen["orderable_skus"] == [code]        # 载荷主键
+    assert seen["conform_skus"] == [code]          # 单品 variantGroupId 同源
+    assert code != rows[0]["asin"]
+
+
+def test_mark_used_and_events_carry_the_code_not_the_asin(monkeypatch):
+    """upc_pool.sku 与 product_events.sku 写的都是真发出去的码;
+
+    事件 detail 另带一份 asin —— 不透明码在 product_events.asin 列里提不出来,
+    而这里 ASIN 本来就在手边。upc_pool 的复用键 (store, asin) 不受影响。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    ln.run({"execute": True})
+    code = "A" + "B0AAAAAOK1"[-6:].rjust(11, "X")
+    assert [sku for _upc, sku in seen["marked_used"]] == [code]
+    assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]
+    ev = seen["events"][0]
+    assert ev["sku"] == code and ev["event"] == ln.product_events.LIST_SUBMITTED
+    assert ev["detail"]["asin"] == "B0AAAAAOK1"
+
+
+def test_registration_happens_at_mint_not_after_submit(monkeypatch):
+    """★ 提交成功后**不再** listing_sources.register:登记已在 mint 里做完。
+
+    留着 register 就是同一能力两条实现路径(双轨禁止),而且会让下一个人以为
+    登记发生在提交之后,进而把 mint 挪到提交后去 —— 那正是双上架的入口。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    ln.run({"execute": True})
+    assert seen["registered"] == []
+    assert len(seen["minted"]) == 1
+    # 源码级(AST,不看注释与文档串):list_new 里一个 register 调用都不许剩
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(ln))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "register"
+             and isinstance(n.func.value, ast.Name)
+             and n.func.value.id == "listing_sources"]
+    assert calls == []
+
+
+def test_submit_writes_the_code_into_the_sku_column(monkeypatch):
+    """三种结局都把码作为第 9 值写进 SKU 列。
+
+    SKU 列的语义是「这一行当前持有的码」而不是「已成功上架的码」:
+    failed / unknown 的行下一轮用同一个码重来,运营要能从表上看到那个串;
+    三分支同写也让回写只有一条路径,没有"哪些结局写码"这种要记的规则。
+    """
+    rows = [_sheet_row(2, store="TOK", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="TNO", asin="B0BBBBBNO1"),
+            _sheet_row(4, store="TUN", asin="B0CCCCCUN1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    outcome = {"TOK": "submitted", "TNO": "failed", "TUN": "unknown"}
+
+    def by_store(store, feed_type, items, workflow=None, defer_settle=False):
+        yield {"outcome": outcome[store["name"]], "feed_id": "F-1",
+               "count": len(items)}
+    monkeypatch.setattr(ln.feeds, "submit_feed", by_store)
+
+    ln.run({"execute": True})
+    got = {rn: vals for rn, vals in seen["submit_vals"]}
+    assert sorted(got) == [2, 3, 4]
+    for rownum, asin in ((2, "B0AAAAAOK1"), (3, "B0BBBBBNO1"),
+                         (4, "B0CCCCCUN1")):
+        vals = got[rownum]
+        assert len(vals) == 9, vals
+        assert vals[8] == "A" + asin[-6:].rjust(11, "X")
+    assert [got[2][4], got[3][4], got[4][4]] == ["Yes", "No", "Unknown"]
+
+
+def test_dry_run_uses_a_placeholder_code_and_writes_nothing(monkeypatch):
+    """★ 空跑一次都不抽码、不领号、不登记(桩里这三个一被调到就抛)。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    _wire_dry_env(monkeypatch, rows)
+    out = ln.run({"execute": False})
+    assert "[DRY-RUN] 共 1 行将进入" in out
+
+
+def test_spec_precheck_payload_uses_the_placeholder_code(monkeypatch):
+    """check_spec 预检用 `sku_codec.DRYRUN_PLACEHOLDER`,不 mint。
+
+    占位码含 `0`(不在字母表里)⇒ is_opaque 恒 False,形态上就不可能与任何一个
+    真 mint 出来的码相撞;抬头行说破它是占位的,免得被当成真发出去的串。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    _wire_dry_env(monkeypatch, rows)
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([object()])))
+    monkeypatch.setattr(ln, "_map_llm",
+                        lambda c, pt, spec, p, stats=None:
+                            ({"productName": p["title"]}, {}))
+    monkeypatch.setattr(ln, "_variant_plan", lambda *a, **k: None)
+    skus = []
+    monkeypatch.setattr(ln.mp_mapper, "build_orderable",
+                        lambda sku, upc, *a, **k: (skus.append(str(sku)), {})[1])
+
+    def _conform(*a, **k):
+        skus.append("conform:" + str(k.get("sku", "")))
+        return a[2], a[3], [], []
+    monkeypatch.setattr(ln.mp_conform, "conform", _conform)
+
+    out = ln.run({"execute": False, "check_spec": "1"})
+    ph = ln.sku_codec.DRYRUN_PLACEHOLDER
+    assert skus == [ph, "conform:" + ph], skus
+    assert not ln.sku_codec.is_opaque(ph)          # 形态上就不是真码
+    assert f"sku 用占位码 {ph}" in out
+
+
+def test_gate_state_fields_are_appended_not_inserted():
+    """两个新字段**追加在末尾**:_GateState 是按位置构造的,插中间全部错位,
+
+    而错位不报错(集合与字典长得都一样)。
+    """
+    assert ln._GateState._fields[:8] == (
+        "inactive", "today_used", "listed_pairs", "banned", "unexplained",
+        "gate", "owned_asin", "owned_brand")
+    assert ln._GateState._fields[8:] == ("cooling", "over_gen")
+
+
+def test_cooldown_sql_scopes_the_registry_join_to_amz():
+    """冷却键按 (店, **ASIN**) 建,且登记簿 JOIN 限定 amz。
+
+    不限 amz 的话跟卖行的 source_key 是 GTIN,冷却键按 GTIN 建、与闸判用的
+    r["asin"] 永远对不上 ⇒ 跟卖品的冷却恒不生效且不报错。
+    事件码走常量:回执码是 {kind}_feed_{status} 派生的,写字面量的话
+    _FEED_KIND 一改取值,这条 SQL 会静默返回空集。
+    """
+    q = ln._SQL_RETIRE_COOLDOWN
+    assert "ls.source_type = 'amz'" in q
+    assert "coalesce(ls.source_key, e.sku)" in q
+    assert "LEFT JOIN catalog.listing_sources ls" in q
+    assert "'retire_feed_success'" not in q and "%(event)s" in q
+    assert ln.product_events.RETIRE_FEED_SUCCESS == "retire_feed_success"
+    assert ln.product_events.RETIRE_FEED_SUCCESS in ln.product_events.EVENTS
+    # 代际计数按 source_key 分组:按 sku 分组每行恒 1,闸永不命中
+    g = ln._SQL_ABANDONED_GEN
+    assert "GROUP BY 1, 2" in g and "HAVING count(*) >= %(cap)s" in g
+    assert "abandoned_at IS NOT NULL" in g
+
+
+def test_cooldown_and_generation_thresholds_come_from_sku_codec():
+    """两个阈值的唯一出处是 services/sku_codec,list_new 只引用常量名。"""
+    assert ln.sku_codec.RETIRE_COOLDOWN_HOURS == 24
+    assert ln.sku_codec.MAX_SKU_GENERATIONS == 3
+    import inspect
+    src = inspect.getsource(ln._load_gate_state)
+    assert "sku_codec.RETIRE_COOLDOWN_HOURS" in src
+    assert "sku_codec.MAX_SKU_GENERATIONS" in src
+
+
+def test_generation_cap_stops_the_code_churn_loop(monkeypatch):
+    """★ 换码次数达上限的 (店, ASIN) 不再自动重上,写 N 理由点名待人工。
+
+    堵的是「弃码 → 新码 → 再弃码」这个闭环:每转一圈白烧一个 UPC 与一个
+    MP_ITEM 配额名额,而且重试上限/在途防重/原号复用三条护栏跟着码重新计数。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0CHURN001"),
+            _sheet_row(3, store="T1", asin="B0AAAAAOK1")]
+    _wire_dry_env(monkeypatch, rows, over_gen={("T1", "B0CHURN001")})
+    out = ln.run({"execute": False})
+    assert "第2行:换码次数达上限,待人工" in out
+    assert "换码达上限 1" in out
+    assert "[DRY-RUN] 共 1 行将进入" in out      # 另一行照常放行
+
+
+def test_retire_cooldown_gate_holds_the_row_and_names_it(monkeypatch):
+    """★ 刚退役成功的 (店, ASIN) 冷却期内不重上;冷却期满(不在快照里)放行。
+
+    命中只写 N 理由**不写终态** —— 冷却期满下一轮自动续上,与既有闸门同语义。
+    """
+    from datetime import datetime
+    rows = [_sheet_row(2, store="T1", asin="B0COOL0001")]
+    _wire_dry_env(monkeypatch, rows,
+                  cooling={("T1", "B0COOL0001"): datetime(2026, 9, 2)})
+    out = ln.run({"execute": False})
+    assert "第2行:退役冷却中" in out and "退役冷却中 1" in out
+    assert "将进入 领UPC→LLM→提交" not in out
+    # 冷却期满:_SQL_RETIRE_COOLDOWN 的时间窗把它筛掉 ⇒ 快照里没有 ⇒ 放行
+    _wire_dry_env(monkeypatch, rows)
+    out2 = ln.run({"execute": False})
+    assert "退役冷却中" not in out2
+    assert "[DRY-RUN] 共 1 行将进入" in out2
+
+
+def test_new_gates_sit_between_dedup_and_claims(monkeypatch):
+    """顺序即语义:一行同时命中在架/代际/冷却,N 列写的是「本店已在架」。
+
+    已在架的行压根不是"再上架",不该走到这两道闸;两道之间代际在前,因为它
+    是要人介入的终局判断,冷却只是等一等。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0ALL3HIT1")]
+    from datetime import datetime
+    _wire_dry_env(monkeypatch, rows, listed={("T1", "B0ALL3HIT1")},
+                  over_gen={("T1", "B0ALL3HIT1")},
+                  cooling={("T1", "B0ALL3HIT1"): datetime(2026, 9, 2)})
+    out = ln.run({"execute": False})
+    assert "第2行:本店已在架:同店重复上架拦截" in out
+    assert "换码次数达上限" not in out and "退役冷却中" not in out
+    # 去掉在架事实之后,先命中的是代际(要人做的那条),不是冷却
+    _wire_dry_env(monkeypatch, rows, over_gen={("T1", "B0ALL3HIT1")},
+                  cooling={("T1", "B0ALL3HIT1"): datetime(2026, 9, 2)})
+    out2 = ln.run({"execute": False})
+    assert "第2行:换码次数达上限,待人工" in out2
+    assert "退役冷却中" not in out2
+
+
+def test_limit_truncates_after_the_gates_not_before(monkeypatch):
+    """★ `-p limit=` 在**全部闸门与数据过滤之后**切:被淘汰行不占名额。
+
+    切在前面的话 -p limit=1 可能一行都上不了(名额被注定淘汰的那行占了),
+    人会以为功能坏了。与配额切片同一条纪律。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0LISTED01"),   # 去重闸拦掉
+            _sheet_row(3, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(4, store="T1", asin="B0BBBBBOK2")]
+    _wire_dry_env(monkeypatch, rows, listed={("T1", "B0LISTED01")})
+    out = ln.run({"execute": False, "limit": 1})
+    assert "[DRY-RUN] T1 B0AAAAAOK1" in out       # 名额给了幸存者
+    assert "B0BBBBBOK2 定价" not in out
+    assert "[DRY-RUN] 共 1 行将进入" in out
+
+
+def test_limit_says_how_many_it_left_behind(monkeypatch):
+    """截断必须说出留了多少行给下一轮(不写 N 理由不写终态)。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T1", asin="B0BBBBBOK2"),
+            _sheet_row(4, store="T1", asin="B0CCCCCOK3")]
+    _wire_dry_env(monkeypatch, rows)
+    out = ln.run({"execute": False, "limit": 1})
+    assert "人工上限 -p limit=1:本轮只做前 1 行,其余 2 行留到下一轮" in out
+
+
+def test_limit_absent_means_no_truncation(monkeypatch):
+    """不传 limit ⇒ 与今天逐字一致:一行都不截,摘要里没有那句话。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T1", asin="B0BBBBBOK2")]
+    _wire_dry_env(monkeypatch, rows)
+    out = ln.run({"execute": False})
+    assert "[DRY-RUN] 共 2 行将进入" in out
+    assert "人工上限" not in out
+    # -p limit=0 与不传等价(`or None`):0 不是"一行都不做"的开关
+    out0 = ln.run({"execute": False, "limit": 0})
+    assert "[DRY-RUN] 共 2 行将进入" in out0 and "人工上限" not in out0

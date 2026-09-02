@@ -115,6 +115,11 @@ AUDIT_REJECTED = "audit_rejected"
 #   sku_replaced :{old_sku, new_sku, reason, source_type, source_key, burned_upcs}
 SKU_ABANDONED = "sku_abandoned"
 SKU_REPLACED = "sku_replaced"
+# 回执码具名常量:回执事件码由 `{kind}_feed_{status}` 派生(见下面 EVENTS 的
+# 推导式),本身没有名字 —— SQL 里需要它时引用本常量,**不写字面量**:
+# _FEED_KIND 一改取值,写字面量的那条 SQL 会静默返回空集(闸门形同虚设,
+# 而且不报错)。list_new 的退役冷却闸读它。
+RETIRE_FEED_SUCCESS = f"{_FEED_KIND['RETIRE_ITEM']}_feed_success"
 
 # 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
 # record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。

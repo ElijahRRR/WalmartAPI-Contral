@@ -66,6 +66,19 @@ _MAX_DRAWS = 5                  # 撞码重抽上限:仍撞 = 随机源坏了,�
 #: 当成真码,也永远落不进那两条部分唯一索引。与 list_new 的 UPC 占位同纪律。
 DRYRUN_PLACEHOLDER = "DRYRUN000000"
 
+# ── 码的生命周期常量(**全仓唯一之家**;workflows 只许写常量名,不写字面量)──
+#: 退役后的冷却小时数。官方无明文,取旧仓实证(legacy_survey.md:1649):
+#: RETIRE 回执成功之后沃尔玛侧那条记录不是立刻可复用,不等就重上必然再失败。
+#: 两个消费方共用同一个数:SKU_LOCKED 自愈链(RETIRE→冷却→清列重上)与
+#: list_new 的退役冷却闸。**此前它长在 sku_locked_heal 的 params 默认值里**,
+#: 泛化成闸门后必然出现第二份,两份一漂就没人说得清冷却到底几小时。
+RETIRE_COOLDOWN_HOURS = 24
+#: 同 (店, 来源, 源头键) 允许的**已弃码代数上限**:达到它就不再自动换码重上,
+#: 交人工看。堵的是「弃码 → 新码 → 再弃码」这个闭环 —— 每转一圈白烧一个 UPC
+#: 与一个 MP_ITEM 配额名额,而且每换一次码,重试上限/在途防重/原号复用三条
+#: 护栏都跟着重新计数(护栏跟码走,见 list_new._SQL_ATTEMPTS 头注)。
+MAX_SKU_GENERATIONS = 3
+
 # ── 弃码原因词表(**只有这四个**;新增即改动四个弃码点的定义)────────────────
 ABANDON_DELETE_VERIFIED = "delete_verified"   # DELETE 经观测核验
 ABANDON_SKU_LOCKED = "sku_locked"             # SKU_LOCKED 自愈退役 + 冷却期满

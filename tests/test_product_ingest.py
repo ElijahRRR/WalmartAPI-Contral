@@ -356,7 +356,8 @@ def test_list_new_stock_three_way(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])

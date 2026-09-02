@@ -134,18 +134,29 @@ def run(params: dict) -> str:
     # 标准③:缺席店点名进摘要**首行**(链通知只发成功步骤的首行);
     # 订单窗口全量重拉 + 幂等 upsert,缺席店下轮整点自然补上,无需水位避让
     counts = {k: sum(1 for a in anomalies if a["kind"] == k) for k in _ANOMALY_KINDS}
-    tally = " / ".join(f"{k} {n}" for k, n in counts.items() if n)
+    # 首行只放要人看的:改判(库值真的变了)/ 拒写(未来日期);沃尔玛回错但被
+    # 挡住的(冲突/待定)只报一个数——生产实测每轮都有十来条,逐条上首行会把
+    # 通知训练成"看见 ⚠ 就划走"
+    acted = " / ".join(f"{k} {counts[k]}" for k in ("改判", "拒写") if counts[k])
+    blocked = counts["冲突"] + counts["待定"]
+    tail = ""
+    if acted:
+        tail += f";⚠ 下单时间:{acted}"
+    if blocked or counts["存疑"]:
+        tail += (f";沃尔玛下单时间回错 {blocked} 条已挡" if blocked else "") \
+            + (f";下单时间存疑 {counts['存疑']} 条" if counts["存疑"] else "")
+    if tail and repair:
+        tail += "(修复模式:已按 API 值改写)"
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),订单行入库 {total_lines}"
-             + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉")
-             + (f";⚠ 下单时间:{tally}"
-                + ("(修复模式:已按 API 值改写)" if repair else "(详见日志)")
-                if tally else "")]
+             + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉") + tail]
     if anomalies:
-        # 前几条给人看:类别/PO/库值/API 值,一眼能对
+        # 第二行给人看细节:按 改判/拒写/冲突/待定/存疑 的轻重排,前 5 条
+        rank = {k: i for i, k in enumerate(("改判", "拒写", "冲突", "待定", "存疑"))}
+        shown = sorted(anomalies, key=lambda a: rank[a["kind"]])[:5]
         lines.append("  " + ";".join(
             f"{a['store']} PO {a['po']}[{a['kind']}]:库 {_fmt(a['db'])} / API {_fmt(a['api'])}"
-            for a in anomalies[:5]) + (" …" if len(anomalies) > 5 else ""))
+            for a in shown) + (" …" if len(anomalies) > 5 else "") + "(详见日志)")
     if gate_note:
         lines.append(gate_note)
     if dead:

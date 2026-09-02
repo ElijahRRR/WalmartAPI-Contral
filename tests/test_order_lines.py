@@ -520,6 +520,10 @@ def test_order_date_later_than_status_is_flagged_not_rejected(caplog):
     assert rows[0]["order_date"] is not None and rows[0].get("_order_date_suspect") is True
     assert "存疑" in caplog.text
     assert "_order_date_suspect" not in ol.extract_order_lines("T1", _ORDER)[0]
+    # 沃尔玛 statusDate 的垃圾值(1970/0001/2026-01-01)不当参照,否则整批误标
+    o = copy.deepcopy(_ORDER)
+    o["orderLines"]["orderLine"][0]["statusDate"] = 10000          # 1970-01-01
+    assert "_order_date_suspect" not in ol.extract_order_lines("T1", o)[0]
 
 
 def test_future_order_date_is_rejected_with_warning(caplog):

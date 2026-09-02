@@ -241,8 +241,14 @@ def _order_envelope(order: dict, rows: list[dict]) -> dict:
 
 
 def _later_than_status(od, sd) -> bool:
-    """输入:下单时间 + 状态时间 → 输出:下单时间是否晚于状态时间超过余量。"""
-    return bool(od and sd and (od - sd).total_seconds() > _ORDER_DATE_TOLERANCE_SECS)
+    """输入:下单时间 + 状态时间 → 输出:下单时间是否晚于状态时间超过余量。
+
+    沃尔玛的 statusDate 本身会回垃圾值(生产实见 0001-01-01 / 1970-01-01 /
+    2026-01-01 00:00),拿它当参照会把整批行误标存疑,早于 2020 的一律不参照。
+    """
+    if not od or not sd or sd.year < 2020:
+        return False
+    return (od - sd).total_seconds() > _ORDER_DATE_TOLERANCE_SECS
 
 
 # ── 源 2:GET /v3/returns → return_lines 行 ───────────────────────────────────

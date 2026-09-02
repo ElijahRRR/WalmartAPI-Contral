@@ -44,7 +44,7 @@
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
 | 30 | GET /v3/settings/partnerprofile | settings | Partner ID(**无自建仓时**的上架 shipNode) | safe_get_ex | auto_listing |
-| 31 | GET /v3/orders/{purchaseOrderId} | orders | 单单详情:**下单时间定稿的第二来源**(新单首见 / 列表值与库不一致时单查;2026-09-02 新增,旧系统未用;探针 4 实证 550 单详情全对) | safe_get_ex | order_sync |
+| 31 | GET /v3/orders/{purchaseOrderId} | orders | 单单详情:**下单时间的真相来源**(新单首见查;没被详情核对过的存量行每轮查直到定稿;定稿后不再查。2026-09-02 新增,旧系统未用;探针 4 实证 550 单详情全对) | safe_get_ex | order_sync |
 | 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
 | 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
 | 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
@@ -288,7 +288,7 @@ api/orders.py
               last_modified_start=None, limit=200, stats=None)  # 分页模型2;
                                                           # 多店 async 并发在 api 内部:fetch_orders_bulk(stores, ...) 同步门面(§6.3)
   get_order(store, po) -> dict | None       # #31 单单详情(replacementInfo=true);404 返 None。
-                                            # 下单时间定稿的第二来源(2026-09-02),只在新单首见/列表值与库不一致时调
+                                            # 下单时间的真相来源(2026-09-02):新单首见查;未经详情核对的存量行每轮查直到定稿
 api/returns.py
   iter_returns(store, *, created_start, created_end=None, limit=200)
       # 分页模型3;⚠ created_start 是**必填关键字参数**,时间窗必须成对下发

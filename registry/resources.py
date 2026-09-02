@@ -675,9 +675,31 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-# 2026-09-02 提版:政策表官方同步 v1(见下方 POLICY_LEGACY_NAMES 与
-# docs/policy_sync.md §十.7)。提版即触发 mode=stale 版本重审。
-AUDIT_RULES_VERSION = "c.2026-09-02.1"
+# 2026-09-02 提版两次:政策表官方同步 v1(见下方 POLICY_LEGACY_NAMES 与
+# docs/policy_sync.md §十.7)+ 第三步 B1 批(L3 换喂官方全文 + 输出三段化,
+# docs/audit_step3_spec.md §三)。提版即触发 mode=stale 版本重审。
+AUDIT_RULES_VERSION = "c.2026-09-02.2"
+# c.2026-09-02.2  **第三步 B1 批:L3 换喂 + 输出规范化 + 理由映射去猜测**
+#                 (规格 `docs/audit_step3_spec.md` §三,所有者八项定稿 §六):
+#                 ① S4 政策块改喂**官方英文全文**(`full_policy` 经
+#                    `policy_feed.render_feed_text` 渲染,ORDER BY id),六个中文
+#                    人工列与 50/30/240/80 截断整体删除;S1 重写为"只认下面的
+#                    官方英文原文";S2 枚举追加两条非政策类别、删 brand_misuse;
+#                 ② L3 输出三段化:`verdict` / `policy`(枚举逐字)/ `detail`
+#                    (中文 ≤120 字,引原文片段),外加 brand_verdicts 与
+#                    confidence;政策名解析不到 → **pending**(旧版降级猜 IP,删);
+#                 ③ 类别**由规则自报**(hit.detail 的 `category` 键),
+#                    `compute_final_reason` 收敛为查表:查不到 = None + 计数 +
+#                    warning,**没有 `General-Use Products` 兜底**;
+#                 ④ `catalog.products` 新增 `audit_detail` 列(类别与具体内容
+#                    分列,飞书上架表 G/H 两列同口径);
+#                 ⑤ 证据通道泛化(读 L0/L1/L2 三层软 hit)、政策路由提示整体删除。
+#                 ⚠ 提示词与政策表一起决定 `llm_cache` 键 ⇒ purpose=audit_l3 的
+#                 存量缓存**全量未命中**,重审全额重付(谷时段减半,见 LLM_PRICING)。
+#                 ⚠ **B 与 C 只切换一次**(规格 §一):生产机等 C 批合并后再 pull。
+#                 影响面:reject 行的 `audit_reason` 改为类别枚举、`audit_detail`
+#                 新列写具体内容。**按需重审为主**(`audit_sheet` 走 from_sheet),
+#                 批量走 `mode=stale`(近 90 天有动销的那批,B2 批加 active_days)。
 # c.2026-09-02.1  **政策表官方同步 v1 + 官方类别名成为全链唯一键**(所有者
 #                 2026-09-02 定稿 §十.7,三件事同批,判定输入三处一起变):
 #                 ① `policy_sync` 真跑:补武器族 5 行 + 42 页全文刷新 +
@@ -792,6 +814,26 @@ POLICY_LEGACY_NAMES: dict[str, str] = {
     "Restricted/Illegal":         "Restricted/Illegal Products",
     "Biodegradable Plastic":      "Product claims",
 }
+
+
+# ── 审核类别词表:非政策类别与代码写死的政策名(2026-09-02 §二 定稿)───────
+#
+# 「类别」= 判定落在哪一类,**只许两种来源、零推断**(`docs/audit_step3_spec.md` §二):
+#   ① 官方政策类别名 —— `audit.walmart_prohibited_policy.category_en` 实时集合
+#      (44 条:42 类禁售 + 内容族两页),不在本文件里写死;
+#   ② 下面这两条**非政策类别** —— 它们不对应任何一条沃尔玛政策,政策表怎么改
+#      都影响不到,所以只能是常量。别再往这个元组里加第三条:每加一条就是给
+#      "判不清就新造一个类别"开一道门(旧链的 `General-Use Products` 兜底
+#      就是这么长出来的,所有者 2026-08-16 实遇「这是什么意思」)。
+AUDIT_CAT_INTERNAL_BLACKLIST = "内部黑名单"   # 卖家/ASIN/亚马逊类目黑名单命中(内部决策)
+AUDIT_CAT_ACCESS = "类目准入"                 # 类目白名单拦下 / 出版物硬禁 / 需证而无
+AUDIT_NONPOLICY_CATEGORIES = (AUDIT_CAT_INTERNAL_BLACKLIST, AUDIT_CAT_ACCESS)
+
+# 规则代码里**唯一写死的政策类别名**:品牌黑名单 / 商标符号 / 专利自述三条硬拒
+# 与 L3 的品牌翻拒都判它(§二 表「现状不变」那三行)。它是政策表里的一行,
+# 拼写必须与表内一致 —— `services/audit_rules.load_context` 装配时对表解析一次,
+# 解析不到或拼写不同**启动即 RuntimeError**(表改名了而代码没跟上,不许静默)。
+AUDIT_IP_POLICY = "Intellectual Property"
 
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;

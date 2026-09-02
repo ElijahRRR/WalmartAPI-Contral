@@ -18,7 +18,7 @@ L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 44 篇官�
 |---|---|---|
 | **A 转录** | 内容族两页按 policy-refresh 纪律转录 en/zh 进 `refdata/policy_pages/`(**2026-09-02 已落地**:43 `Content standards: Overview` 所有者粘贴、44 `Product details policy` 公开页结构化数据 + 粘贴交叉核对);`policy-refresh` 技能补第二来源;喂入层补两条规则(图片整删、表尾空行不算数据行) | **不跑** `policy_sync`(跑了会再让 L3 缓存全量失效一次,白付);等 C 合并后随切换一起跑 |
 | **B1 换喂 + 规范化**(**2026-09-02 已落地**) | S4 换官方全文;user 段扩容;输出 schema 三段化;`audit_detail` 落库;理由映射去猜测;证据通道泛化;路由提示删除 | 生产机**不 pull**(见 §五) |
-| **B2 回放 + 重审面** | `audit_replay` 回放工作流;`mode=stale` 的 `active_days=90`;首条串行预热 | 同上 |
+| **B2 回放 + 重审面**(**2026-09-02 已落地**) | `audit_replay` 回放工作流;`mode=stale` 的 `active_days=90`;首条串行预热 | 同上 |
 | **C 瘦身 + 清理** | L0 双输出(品牌文案扫描迁入)+ Made in USA 迁入;L2 = R1;删 R3 硬拒/R4/R5/R7/R8/R10 及其数据;删 `POLICY_LEGACY_NAMES` / `POLICY_ALIASES` / `to_official` / `_L3_NORMALIZE` / `_pt_to_policy` / 路由表 | 生产机 pull A+B+C → 按 §五 切换 |
 
 顺序理由:§10「先换喂后删 R7/R8」;B、C 分两批是为了对抗复核可读,但**只切换一次**
@@ -63,7 +63,8 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 
 > **落地状态(2026-09-02)**:§3.1–§3.7 与 §3.10 的测试/文档/版本部分 **B1 批
 > 已落地**(判据版本 `c.2026-09-02.2`);§3.8 回放工作流、§3.9 的首条串行预热、
-> §六.8 的 `mode=stale -p active_days` 属 **B2 批,未做**。
+> §六.8 的 `mode=stale -p active_days` **B2 批已落地**(**不提版** ——
+> B2 一个字都没动判定,提版只会让全库 approved 白重审一轮)。
 
 ### 3.1 system prompt(S1–S4,仍是单一连续静态前缀)—— **B1 已落地**
 
@@ -185,7 +186,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 锁在 ≤5 篇上。回放评估(§3.8)顺带验证删了之后类别准确率没掉。
 (若所有者要保留:改成只读官方名的常量表,不再走 `to_official`。见 §六。)
 
-### 3.8 回放评估 `workflows/audit_replay.py` —— **B2,未做**
+### 3.8 回放评估 `workflows/audit_replay.py` —— **B2 已落地**
 
 - 性质:`DANGEROUS = False`;只写自己的表 `audit.replay_results` 与报告文件
   `<DATA_ROOT>/reports/audit_replay.txt`;**不写** `catalog.products` / `audit_runs` / `audit_hits` /
@@ -213,7 +214,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   got_category, got_detail, stage_stopped_at, old_verdict, old_category, confidence, created_at)`,
   `PRIMARY KEY (run_tag, asin)`。
 
-### 3.9 成本与缓存(首条串行预热属 **B2,未做**)
+### 3.9 成本与缓存(首条串行预热 **B2 已落地**)
 
 - 政策表或提示词模板任何一字变化 ⇒ `catalog.llm_cache`(purpose=audit_l3)全量未命中(键含整段
   messages,`services/llm_cache.py:28-44`);本批必然全量,只付一次 —— 所以 A 批不单独跑
@@ -267,6 +268,44 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   (§一:B、C 只切换一次,生产机等 C 合并后再 pull);验收信号 =
   **C 批合并后、L4 关闭时该计数应回到 0**。
 
+**B2 落地记录(2026-09-02,与本规格的差异逐条)**:
+
+- **不提版**:`AUDIT_RULES_VERSION` 仍是 `c.2026-09-02.2`。B2 一个字都没动判定
+  (回放只读、`active_days` 只筛候选、预热只改发请求的次序),提版会让全库
+  approved 白重审一轮 —— 版本号是判据的身份,不是"改过代码"的流水号;
+- **抽样在库里做**(规格没写机制):`ORDER BY md5(sku || seed) LIMIT` 是伪随机
+  且同 seed 恒定,进 Python 的行数因此**封顶**(`_POOL_MAX = 50,000`)。
+  下架原因表几十万行带长文本,全拉回来是 2026-08-21 那次 OOM 的同款走法。
+  代价是"池里没抽到"的类别进不了样本 —— 所以**漏斗四道全部计数进报告**
+  (扫描 → 主码在集 → sku 提得出 asin → 库里有产品行),哪一道吃掉最多一眼可见;
+- **内容族两名互认落在 `registry.resources.AUDIT_CONTENT_POLICIES`**:期望类别
+  记规范名(43 索引页),判在 43 或 44 都算对(`category_ok`)。报错正文只说
+  "内容不合规",不说是索引页还是明细页;
+- **POLICY 的两种"没类别"分开计数**:抽不出政策名是**常态**(生产 3,363 条,
+  `extract_policy` 头注)、抽出了但 join 不上才是**政策表缺口**。都不进本集,
+  但混成一个数会让人以为政策表烂了;
+- **报告头三条局限**(规格只点了两条):第三条「沃尔玛裁决是参照不是金标」
+  在规格的「三方对照」那行里,读数的人最容易忽略的恰恰是它,一并写进报告头;
+- **判定失败的行照样落库**(`got_verdict` 为 NULL):一条判炸了记下来继续 ——
+  整轮停掉的话前面几百条已付费的 LLM 结果一起白付;"这条判不出来"本身也是
+  回放结果,漏掉它样本量就对不上;
+- **`old_category` 只有走过 L3 的老行才有值**(它是 `audit_runs.l3_reason_category`,
+  规则拒的老行这一列是空的)—— 所以报告只拿旧链比**判定**(误伤率、一致率),
+  不拿它算类别准确率;
+- **第三处写面:`catalog.llm_cache`**(判定链自己写,L3 判完缓存出参)。那是缓存
+  不是结论,而且与生产共用一份(回放付过的钱随后真重审直接命中),但头注与
+  README 都写明 —— 一条自称"只写两处"的工作流,漏说第三处就是在骗读它的人;
+- **两处共用件下沉**:首条串行预热 → `services/audit_pool.submit_chunk`(生产判定
+  与回放发的是同一段前缀);审核输入行的形状 → `services/audit_rules.
+  PRODUCT_ROW_COLUMNS/_FROM`(回放喂进去的产品正文必须与生产**同一份**,少一个
+  `seller_id` 就等于卖家闸在回放里恒不命中,而两边结论看着都正常);
+  并发缺省/上限 → `registry.resources.AUDIT_WORKERS_DEFAULT/MAX`(两条工作流同一个数);
+- **报告文件名登记在 `registry/paths.audit_replay_report()`**(铁律 3:切换手册
+  与所有者按这个路径找报告,改名得只有一处);
+- **`active_days` 的校验前置**到 `_pick_where` 顶部并**只与 `mode=stale` 连用**
+  (配错 mode 直接抛):静默忽略的话人以为只判了有动销的、实际整批重付,
+  而摘要长得一模一样。摘要**首行**点名「近 N 天有动销」/「不限动销」。
+
 ## 四、C 批规格:瘦身 + 清理
 
 ### 4.1 L0 双输出
@@ -311,6 +350,13 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 
 ## 五、切换手册(A+B+C 都合并后,一次做完)
 
+> **B2 已落地**:下面 `audit_replay` 与 `mode=stale -p active_days` 两条命令
+> 现在真的存在(工作流 `workflows/audit_replay.py`;报告落
+> `paths.audit_replay_report()` = `<DATA_ROOT>/reports/audit_replay.txt`)。
+> 顺序不变 —— `db_init` 建 `replay_results` 在前,`policy_sync` 刷政策表在中间
+> (回放的期望类别要 join 它),回放在 `mode=stale` **之前**:报告不达标就别开
+> 那条最贵的。
+
 ```bash
 git pull                                    # 看钟:18:10 之前 pull,当晚 audit_sheet 就用新链
 python cli.py db_init                       # audit_detail 列 + replay_results 表(幂等)
@@ -321,7 +367,13 @@ python cli.py audit_replay -p neg=600 -p pos=400   # 谷时段;看报告再决�
 python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 90 天有动销的一批,谷时段分晚跑;pending/rejected 走 mode=nonpass
 ```
 
-- 回放报告不达标(§六第 5 条的线)→ 不跑 `mode=stale`,先修提示词/规则再回放;修改 = 再提版。
+- 回放报告不达标(§六第 5 条的线:**正例误伤率不高于旧链**)→ 不跑 `mode=stale`,
+  先修提示词/规则再回放;修改 = 再提版。报告里那一行会自己说话
+  (达标写「底线达标」,不达标写「⚠ 新链误伤高于旧链……别开 mode=stale」)。
+- 回放**同 tag 重跑覆盖**:改完提示词用同一个 `-p seed=` 与 `-p tag=` 再跑一次,
+  就是同一批样本的前后对照(`audit.replay_results` 按 `(run_tag, asin)` 主键)。
+- 回放会写 `catalog.llm_cache`(判定链自己写)—— 那**不是**浪费:紧接着的
+  `mode=stale` 重审命中同一批缓存,回放的钱等于预付了一部分。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。
 - `error_reclass_report` 不受影响;`audit_sheet` 的 `limit=500` 在切换周可临时调低控成本。
 

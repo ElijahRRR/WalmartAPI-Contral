@@ -660,10 +660,12 @@ python cli.py audit_why -p asins=B0XXXXXXXX
 背景:L3 换喂官方英文政策全文(`refdata/policy_pages/en`,44 篇)之后,L2 里
 "硬代码代 LLM 判语义"的规则失去存在理由;黑名单能力只许有一处实现。
 
-**进度(2026-09-02)**:A 批(内容族两页转录)与 **B1 批已落地**(见下表
-「已落地」列与 §5 / §7);B2(回放工作流 `audit_replay`、`mode=stale` 的
-`active_days`、首条串行预热)与 C 批(L0 双输出 / L2 只剩 R1 / 删 R3 硬拒、
-R4、R5、R7、R8、R10 与 `POLICY_LEGACY_NAMES` 一族)未做。
+**进度(2026-09-02)**:A 批(内容族两页转录)、**B1 批**(见下表「已落地」列与
+§5 / §7)与 **B2 批**(回放工作流 `audit_replay`、`mode=stale` 的 `active_days`、
+首条串行预热)**已落地**;C 批(L0 双输出 / L2 只剩 R1 / 删 R3 硬拒、R4、R5、
+R7、R8、R10 与 `POLICY_LEGACY_NAMES` 一族)未做。
+⚠ **B2 不提版**:它一个字都没动判定(回放只读、`active_days` 只筛候选、预热只改
+发请求的次序),提版会让全库 approved 白重审一轮。
 ⚠ **B 与 C 只切换一次**:两批各自递增 `AUDIT_RULES_VERSION`,生产机等 C 合并
 后再 `git pull` —— pull 的时机就是切换的时机(`audit_sheet` 18:10 当晚就会用
 新链重审上架表里的品)。定稿:
@@ -699,8 +701,11 @@ L3 那一行 **B1 已落地**(§5);L0 的双输出与 L2 的瘦身留给 C 批�
   `catalog.products.audit_detail` 新列与飞书 G/H 分列、政策路由整体删除;
 - ✅ **B1 已落地** —— 证据进 L3 的通道泛化为「读取上游**所有阶段**的软 hit」
   (`summarize_evidence(phase0, l1, l2)`,按 rule_code 查渲染表,未登记的也不丢);
-- ⬜ B2 —— `audit_replay` 回放工作流、`mode=stale` 的 `active_days=90`、
-  首条串行预热(省一批前缀缓存 miss);
+- ✅ **B2 已落地** —— `audit_replay` 回放工作流(拿沃尔玛裁决考这条链:反例召回 /
+  类别准确率 + 混淆表 / **正例误伤新旧并排**(所有者底线:新链不高于旧链)/ 新旧
+  一致率 / 按置信分层错误率 / pending 分层 / 成本与耗时;只写 `audit.replay_results`
+  与 `<DATA_ROOT>/reports/audit_replay.txt`)、`mode=stale` 的 `active_days=90`
+  (§1)、首条串行预热(`services/audit_pool`,省一批前缀缓存 miss);
 - ⬜ C 批 —— L0 契约从「命中即终止」改为「**硬命中终止、软命中带证据前行**」
   (`audit_hits` 可落多行;`stage_stopped_at` 语义不变,只有硬拒才停);
   R4/R10 迁入 L0、L2 只剩 R1、删 R3 硬拒 / R5 / R7 / R8 与

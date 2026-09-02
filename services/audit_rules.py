@@ -521,6 +521,39 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
     return outcome
 
 
+#: **审核输入行的形状**(唯一出处,2026-09-02 B2 从 product_audit 抽出)。
+#: `SELECT {PRODUCT_ROW_COLUMNS} {PRODUCT_ROW_FROM} WHERE …` 取出来的一行,
+#: 恰好是下面 `product_info_from_row` 认的那一行。
+#: 两个消费方:`workflows/product_audit`(生产候选)与 `workflows/audit_replay`
+#: (回放取数)。**各写一份的后果不报错** —— 回放喂进同一条链的产品正文与生产
+#: 不是同一份(少一个 `seller_id` 就等于卖家闸在回放里恒不命中),而两边的结论
+#: 看着都正常,回放报告于是变成"评估了另一条链"。
+#: WHERE / ORDER BY / LIMIT 各自拼:那才是两条链真正的差异。
+PRODUCT_ROW_COLUMNS = """p.asin,
+       p.title,
+       p.brand,
+       p.walmart_pt,
+       p.pt_source,
+       p.browse_node_id,
+       p.browse_node_chain,
+       p.amazon_category AS amazon_category_path,
+       p.slow -> 'bullet_points' AS bullet_points,
+       coalesce(p.slow ->> 'description',
+                p.slow ->> 'long_description',
+                p.slow ->> 'product_description') AS long_description,
+       sn.buybox ->> 'buybox_seller_id' AS seller_id,
+       sn.buybox ->> 'buybox_seller'    AS seller_name"""
+
+#: 同上的 FROM 段:买盒卖家取**最近一次成功采集**的快照(卖家黑名单闸的入参)。
+PRODUCT_ROW_FROM = """FROM catalog.products p
+LEFT JOIN LATERAL (
+    SELECT s.buybox FROM catalog.snapshots s
+    WHERE s.marketplace = p.marketplace AND s.asin = p.asin
+      AND s.outcome = 'ok'
+    ORDER BY s.scraped_at DESC LIMIT 1
+) sn ON true"""
+
+
 def product_info_from_row(row: dict):
     """输入:product_audit 取数行 dict → 输出:ProductInfo(空值/形态归一)。
 

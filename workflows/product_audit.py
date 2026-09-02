@@ -133,33 +133,17 @@ _MAX_WORKERS = resources.AUDIT_WORKERS_MAX
 # 批太大则一次失败要退回逐行的代价也大,200 是速度与隔离代价的折中。
 _PERSIST_BATCH = 200
 
-_CANDIDATE_SQL = """
-SELECT p.asin,
-       p.title,
-       p.brand,
-       p.walmart_pt,
-       p.pt_source,
-       p.browse_node_id,
-       p.browse_node_chain,
-       p.amazon_category AS amazon_category_path,
-       p.slow -> 'bullet_points' AS bullet_points,
-       coalesce(p.slow ->> 'description',
-                p.slow ->> 'long_description',
-                p.slow ->> 'product_description') AS long_description,
-       sn.buybox ->> 'buybox_seller_id' AS seller_id,
-       sn.buybox ->> 'buybox_seller'    AS seller_name
-FROM catalog.products p
-LEFT JOIN LATERAL (
-    SELECT s.buybox FROM catalog.snapshots s
-    WHERE s.marketplace = p.marketplace AND s.asin = p.asin
-      AND s.outcome = 'ok'
-    ORDER BY s.scraped_at DESC LIMIT 1
-) sn ON true
+# ⚠ 行的**形状**(SELECT 列表 + 买盒卖家 LATERAL)在
+# `services/audit_rules.PRODUCT_ROW_COLUMNS/_FROM` —— 回放工作流
+# `audit_replay` 吃同一份(2026-09-02 B2)。这里只拼本链特有的
+# WHERE / ORDER BY / LIMIT。
+_CANDIDATE_SQL = ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
+                  + audit_rules.PRODUCT_ROW_FROM + """
 WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
   AND p.title IS NOT NULL AND p.title <> ''
 ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
-"""
+""")
 # ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
 #   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
 #   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,

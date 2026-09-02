@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **77 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **78 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 12 视图)为唯一权威状态;
-- **2638 个单元测试**(2615 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
+- **2677 个单元测试**(2654 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
 
 ---
 
@@ -305,6 +305,7 @@ L3 语义(LLM,读 **44 篇沃尔玛官方英文政策全文**)→ L4 视觉(LLM,
 |---|---|---|
 | `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
+| `audit_replay` | | **回放评估**(手动跑,不进调度):拿沃尔玛自己的裁决考现在这条链。反例 = `walmart_items.unpublished_reasons` 归类主码 ∈ POLICY/IP/CONTENT/BRAND/PROHIBITED_FINAL 的下架品(期望 reject,期望类别按 `error_taxonomy` 抽出的政策名 join 政策表;PT_WRONG/GATED 不进集),正例 = 在架在售且从没给过下架原因的品(期望 pass);`sku→asin` 走 `services/sku_asin`。每个样本调**与生产同一条** `audit_rules.audit_one`,与沃尔玛裁决 / 旧链最近一次 `audit_runs` 三方对照,出召回、类别准确率 + 混淆表、**正例误伤新旧并排**(所有者底线:新链不高于旧链)、新旧一致率、按置信分层错误率、pending 分层、成本与耗时。⚠ **只写** `audit.replay_results` 与 `<DATA_ROOT>/reports/audit_replay.txt`(判定链自己会写 `llm_cache`,那是缓存);`catalog.products`/`audit_runs`/`audit_hits`/事件/飞书**一个字都不碰**。`--dry-run` = 抽样 + 规模 + 预估成本,零 LLM。参数 `neg`(600)/`pos`(400)/`seed`/`tag`/`workers`/`limit_per_category` |
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |
 | `audit_history_fold` | 一 | 历史审核结论折叠进产品事件账本 |

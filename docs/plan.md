@@ -145,6 +145,28 @@ maintenance/list_new)→ 按域停旧切换。
 截断的行,收口后会扩大自动删除面);`ops.feed_items` 里同 (店, 身份键) 挂着
 多个不同 sku 的组数必须为 0(否则重试计数会归并、原本还能重试的行提前触顶)。
 
+### 2026-09-02 SKU 改造批次 3:存量改码(SkuUpdate 三态状态机 + 新工作流)
+
+**做了什么**(三块,见 `docs/sku_plan.md` §7 批次 3 与 `docs/sku_workplan/batch_3.md`):
+第一块地基(commit `cc08210`:schema 两列 / 过程账 `listing.sku_migrations` /
+别名视图 `catalog.sku_aliases` / 订单双算体检视图 / `mint_replacement` +
+`settle_replacement` + `OPAQUE_SQL_PREDICATE` / `retag_sku` / SkuUpdate 载荷);
+第二块观测侧抑制与继承(commit `5565691`:改码期间不记假代际、旧码不记缺席、
+四段历史判据经别名链继承一跳、销量归属继承、回执不入病历);
+第三块**工作流** `workflows/sku_migrate.py`(本次)。
+
+**决策日志在 `docs/sku_plan.md` §9**(plan.md 本身没有决策日志段,它的记录方式是
+Phase 小节里的 `[x] + 日期`)。那里记着:三处与工作包/synthesis 的**有意出入**
+(POST `outcome=unknown` 不回滚 / `cleanup_seen_categories` 不迁 / 活码唯一索引由
+0a 一次建到位而非批次 3 收紧)、九个决策点 A~I 的默认取值与拍板留白、本次评审
+**驳回或转出**的五条意见、以及四条已知缺口(其中「confirmed 之后没有撤销弃码的
+代码路径」是所有者要知道的那一条)。
+
+**上线注意**:`sku_migrate` **永不进调度**(`registry/schedule.py` 头注的手动清单
+里点了名,守门测试钉住),`-p store=` 必填,节奏硬闸 1 → 10 → 一店 → 全店。
+**六件单品实测(sku_plan §4)全部通过之前只许 `--dry-run`**;它与 13:00 的
+`product_chain` 抢同一个 MP_MAINTENANCE 桶,不许并跑。本批**不跑就对生产零影响**。
+
 ### 2026-09-02 SKU 改造批次 2:写侧切换(唯一有行为变化的批次)
 
 **做了什么**(两块,见 `docs/sku_plan.md` §7 批次 2 与 `docs/sku_workplan/batch_2.md`):

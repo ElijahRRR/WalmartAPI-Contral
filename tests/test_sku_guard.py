@@ -107,6 +107,10 @@ _REGISTRY_SQL_OK: dict[str, tuple[str, str]] = {
         "改码生效窗口内旧码会被观测成非 PUBLISHED 且未缺席,正好落进扫描面被建议 "
         "DELETE_ITEM(不可逆)。它问的是 replaced_by 这一列的**状态**,不是"
         "身份反查、也不是代际继承(那条走 catalog.sku_aliases 视图)"),
+    "workflows/sku_migrate.py": (
+        "permanent",
+        "批次 3 W4:改码候选要同时问登记簿的出身(source_type/source_key)与状态"
+        "(活码、未在改)—— 它是**登记簿自己的写侧发起方**,不是身份反查"),
 }
 
 #: ③ 允许出现 `abandoned_at` 的**消费方** .py。
@@ -120,13 +124,21 @@ _ABANDONED_AT_OK: dict[str, tuple[str, str]] = {
                      "该放行(_FAMILY_LISTED_SQL 有意不带这个谓词,见那处头注)"),
     "workflows/alloc_push.py": (
         "permanent", "_SQL_ONLINE:派工的「已在架」按活码算"),
+    "workflows/sku_migrate.py": (
+        "permanent",
+        "批次 3 W4:_SQL_CANDIDATES 的候选选取(白名单第四处,conventions §九②)——"
+        "改码只改**活码**;已弃码的行沃尔玛侧我们已经当它不存在了,再改一次码"
+        "既改不动也会把一个死码重新拉回自动化"),
 }
 
 #: ⑦ **四个弃码点**:允许出现 `sku_codec.abandon(...)` 调用的文件(批次 2)。
 #: 多一个点 = 沃尔玛侧还活着的记录被我们当成死的,下一轮新码新 UPC 去上同一个
 #: item(同店重复 listing,沃尔玛不会替你拦);少一个点 = 僵尸行永远挡着新码。
 #: 两种都是**静默**的 —— 没有任何回执会告诉你"你不该弃这个码"。
-#: 批次 3 会加第五行 workflows/sku_migrate.py(改码 SkuUpdate,弃码点 4)。
+#: ⚠ 批次 3 落地后**这张表仍然只有四行**:弃码点 4(改码 SkuUpdate)的入口是
+#: `sku_codec.settle_replacement`,workflows/sku_migrate.py **不直接调 abandon** ——
+#: 「弃码只有一个实现」的落地方式就是让跨域编排(UPC 改标 / 上架表 / 处置迁键 /
+#: 节点库存)留在工作流,而身份两端的改写只在 sku_codec 里发生。
 _ABANDON_CALLERS_OK: dict[str, tuple[str, str]] = {
     "services/sku_codec.py": (
         "permanent", "abandon 的定义之家(弃码唯一实现;烧号分派表也在这里)"),
@@ -371,12 +383,12 @@ def test_destructive_workflows_never_abandon():
 
 
 def test_sku_update_reason_has_no_caller_yet():
-    """`REASON_SKU_UPDATE`(改码)在本批**全仓零调用**:唯一调用方是批次 3 的
-    workflows/sku_migrate.py。
+    """改码弃码原因常量**只在 sku_codec 里出现**(批次 3 落地后仍然成立)。
 
-    常量与"不烧号"分支现在就存在且被测试覆盖,是为了批次 3 不另开第二条弃码
-    实现(双轨禁止)。批次 3 启用时必须**显式改掉这条断言** —— 改不掉就说明
-    有人提前接了线,而那会在没有迁码闭环的情况下把旧行标死。
+    批次 3 的 workflows/sku_migrate.py 走的是 `settle_replacement(verdict=...)`,
+    传的是判词 'confirmed' / 'rolled_back',**不碰** ABANDON_SKU_UPDATE 这个常量
+    —— 弃码原因是身份层的事,工作流只说"观测判了什么"。这条断言因此不必放宽:
+    它红了就说明有人绕过 settle_replacement 自己在弃码(双轨禁止)。
     """
     offenders = [f"{rel}:{n}" for rel, path in _prod_files()
                  if rel != "services/sku_codec.py"

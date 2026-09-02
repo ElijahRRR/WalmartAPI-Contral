@@ -125,6 +125,19 @@ DROP TABLE/COLUMN/VIEW 不可回滚,**未连库核对 `pg_stat_user_tables` /
 - **写操作永不自动兜底**:失败只走 ops.feed_log 反查三态 → 确认未达 → 同一方法
   补交。换方法重试 = 重复提交制造机。
 
+- **POST 的 `outcome=unknown` 一律保持 pending**(SKU 改造批次 3 补,2026-09-02):
+  不回滚、也不补交,留给 `api/feeds` 的启动对账与下一轮的观测定案。unknown 的语义
+  是「不知道到没到」——「写操作永不自动兜底」管的是**不许换姿势重发**,这一条管的
+  是**不许把不确定当成失败去撤销自己这边的状态**:沃尔玛若其实已经受理,回滚就造出
+  一条我们这边没有记录的孤儿状态,而且全程不报错。**人不在环时宁停不重。**
+  (与"确认未达"要分清:4xx 与 token/代理阶段失败是 `api/feeds` 已经判定的确认未达,
+  那种可以安全回滚;`_PRE_FAIL` 与 4xx 都落 `outcome='failed'`,unknown 是第三态。)
+- **`abandoned_at IS NULL` 的允许出现处**:规则正文在 §九②(消费方 .py 四处:
+  `sku_codec.mint` / `list_new` 去重闸 / `alloc_push._SQL_ONLINE` / 批次 3 起的
+  `sku_migrate._SQL_CANDIDATES`;`refdata/schema.sql` 的部分索引条件是 DDL 不计入)。
+  **规则的家只有一个** —— 这里只留指针,守门白名单(`tests/test_sku_guard.py`)的条目
+  与 §九② 的文字必须逐字对得上,否则就是"三种口径互相判红"。
+
 口诀:兜底是补偿外部世界的缺陷,不是补偿自己的不确定。
 
 **通知排版标准件的定位**(所有者定稿 2026-08-27):`services/notify_fmt`

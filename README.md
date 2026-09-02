@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **76 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **77 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
@@ -332,6 +332,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 | `match_listing` | 危 | 跟卖上架(MP_ITEM_MATCH) |
 | `upc_sync` | | UPC 池注入同步与投影回写(手动体检入口) |
 | `sku_locked_heal` | 危 | `SKU_LOCKED` 自愈链:RETIRE → 冷却 24h → 清列重上新 UPC |
+| `sku_migrate` | 危 | **存量改码**(SKU 改造批次 3,手动、永不进调度):把存量 SKU(裸 ASIN / 三段式)迁到 12 位不透明码。先落库并 **commit**(新码行指回旧码 + 旧行 `replaced_by`)→ 发 `SkuUpdate=Yes` 的 MP_MAINTENANCE feed → **回执成功不定案**,等 `catalog_sync` 观测到「新码在架且旧码缺席」才 confirmed(旧行弃码、UPC 改标、上架表 SKU 列回写、处置迁键、节点库存清行);观测反证或回执失败 ⇒ rolled_back;判不准超期 ⇒ stalled 点名人工。`-p store=` **必填**,节奏硬闸 1 → 10 → 按 limit,`-p settle_only=1` 只定案 |
 | `variant_probe` | | 变体维度为什么没发?(只读三路诊断) |
 
 **提交结局三态**(UPC 回收只发生在其中一态):`submitted` → 上架表 K=Yes、

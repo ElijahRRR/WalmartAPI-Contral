@@ -212,15 +212,24 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
   按 Product ID 找 item;「SKU Update」与「Product ID Update」互斥;同 SKU 换
   UPC 报 "This SKU is already set up with a different Product ID";处理要几小时。
 
-**待单品实测的三件事**(官方文档没写,本仓纪律"不按推断编码"):
+**待单品实测的六件事**(官方文档没写,本仓纪律"不按推断编码";批次 3 从三件扩到
+六件,全部通过之前 `sku_migrate` 只许 --dry-run):
 1. `SkuUpdate` 在本地 spec 的哪份里:`grep -rl SkuUpdate <DATA_ROOT>/specs/MP_ITEM/5.0.20260608-18_15_07-api/`
-   (MP_MAINTENANCE 与 MP_ITEM 同版同布局)。若 MP_MAINTENANCE 收 `{sku 新码,
-   GTIN 现号, SkuUpdate: Yes}` 最小载荷就能改 ⇒ **不用重发内容**;若只有 MP_ITEM
-   全量载荷才行 ⇒ 改码 = 重发全部内容(标题/属性会被我们再生成的内容覆盖,
-   这是副作用,要所有者接受)。
-2. 改码后库存、价格、item_id/wpid、变体组是否原样保留(`node_probe` + `GET
+   (MP_MAINTENANCE 与 MP_ITEM 同版同布局)。**十分钟内能出结果,建议最先做** ——
+   它同时决定形态 A/B(决策 E)与「mp_conform 放行 SkuUpdate」是保险还是必需(决策 I)。
+2. MP_MAINTENANCE 收 `{sku 新码, GTIN/UPC 现号, SkuUpdate: Yes}` **最小载荷**能否改码
+   ⇒ 能则**不用重发内容**(形态 A,当前实现);只有 MP_ITEM 全量载荷才行 ⇒ 改码 =
+   重发全部内容(标题/属性会被我们再生成的内容覆盖,这是副作用,要所有者接受)。
+3. 改码后库存、价格、item_id/wpid、变体组是否原样保留(`node_probe` + `GET
    /v3/items/{新sku}` 前后对比)。
-3. 旧 SKU 串改码后能否再次使用(不打算复用,只为知道撞库风险)。
+4. 旧 SKU 串改码后能否再次使用(不打算复用,只为知道撞库风险)。
+5. **对 lifecycle=RETIRED 的 item 是否可用**(存量里有停用未删的品;不可用的话
+   `sku_migrate` 的候选面要再加一条 lifecycle 条件,而现在它只按"在架 = missing_since
+   IS NULL"取)。
+6. **改码之前的 PO 日后返回旧码还是新码**(官方零文档)。返回新码 ⇒
+   `orders.order_lines` 会因 UNIQUE(po_id, sku) 插出第二行而旧行不删 ⇒ 销量/产品分/
+   日报/对账全部多算且不报错。这一件决定 `orders.v_order_line_dupes` 体检的严重级别
+   ——体检只能**发现**不能阻止,发现之后要人工决定合并口径。
 
 **下架后 SKU 的状态(官方查证 2026-09-02,§5 生命周期的依据)**:
 - RETIRE(停用):SKU **保留**。item 留在目录,lifecycle=RETIRED,内容/历史/评论
@@ -548,32 +557,95 @@ dry-run 用 `DRYRUN_PLACEHOLDER` 不写库;**两道新闸**(退役冷却 / 代�
 6. 对该行人为制造一次 FAILED 重试,确认复用同一 SKU、同一 UPC;
 7. 通过后全店按常规节奏上。
 
-**批次 3|存量产品改码(所有者 2026-09-02 拍板:要做)**
-前置:批次 0/1/2 全部合并且新码在生产跑过至少一轮(读侧对两种码都认、上架表
-V 列在位);§4 三件事单品实测通过。
-机制:对每个存量 SKU(裸 ASIN / 三段式;跟卖 `PHUMWMT…` 不含 ASIN,是否迁 §8
-定)——`mint` 抽新码并在登记簿写 `replaces=旧sku`,旧行标 `replaced_by=新sku`(pending;观测确认后 `abandoned_at`)+
-`replaced_by=新sku`(**先落库再调接口**)→ 提交 `SkuUpdate=Yes` feed(载荷形态
-按实测结果:MP_MAINTENANCE 最小载荷或 MP_ITEM 全量)→ 回执成功后:上架表 V 列
-回写新码、`upc_pool.sku` 改新码、`walmart_items` 由 `catalog_sync` 自然出现新行;
-旧行的缺席**不得**产生缺席事件/处置(按 `replaced_by` 压制)。
-节奏:一店一批、按 MP_ITEM/MP_MAINTENANCE 10/hour × 2000 条/feed 的配额走;
-先 1 个品 → 10 个 → 一家店 → 其它店;每一级都跑 `maintenance_scan preview`
-与 `node_probe` 对比改码前后意图集合与库存。
-受牵连的 (store, sku) 键表:`ops.dispositions` 在途行(改码前该店必须无
-executing 行)、`maintenance` 的 drop_recent 防重键(自然过期)、
-`ops.cleanup_seen_categories`(按 replaced_by 迁一次)、`listing.retire_cooldown`、
-`catalog.item_node_inventory`(sync 重建)、`ops.feed_items`(历史,不动)、
-**`catalog.product_events` 按 (store, sku) 读的三段 SQL**(problem_scan 的
-`_SQL_STUBBORN` / `_SQL_LAST_CAT` / `_SQL_WFS_BLOCKED`,对抗验证发现):改码后
-新码行在 `diff_catalog` 眼里 `prev is None` ⇒ 记 ITEM_APPEARED = **制造一次没有
-重上架事实的假代际**,已实证 `delete_not_effective` 的顽固件会静默丢掉双 feed
-加压。处理:diff_catalog 对 `replaced_by` 指向的新码行记 `sku_replaced` 而非
-`item_appeared`;顽固判定改经登记簿按 ASIN 归并,或改码时把顽固标记随
-replaced_by 迁到新码。
-订单侧:改码后新单带新码;若沃尔玛对**改码前的 PO** 日后返回新码,会被当成
-新行插入(旧行不删)⇒ 双算——切换前加一条"同 (store, po_id, line_number) 多个
-order_line_id"的体检告警兜住。
+**批次 3|存量产品改码(所有者 2026-09-02 拍板:要做)** —— ✅ **已实现**(三块)
+
+**目标改写为「止血」**(必须先说清,否则后续风险判断建立在错误前提上):存量改码
+**收不回**沃尔玛已经掌握的旧 SKU=ASIN 关联 —— SkuUpdate feed 本身就是「旧串 → 新码」
+的显式映射,历史订单与历史 feed 记录里的关联也还在。它只让**切换之后**的记录干净。
+
+前置:批次 0/1/2 全部合并且新码在生产跑过至少一轮(读侧对两种码都认、上架表 SKU 列
+在位);§4 **六件**单品实测通过;改码期间该店无人手工改 SKU/Product ID;**旧仓
+product_clear / daily_cleanup / auto_listing 调度已停**(安全红线「新旧系统严禁对同一
+破坏性任务并跑」)。
+
+第一块(commit `cc08210`)**地基**:schema 加 `replaces` / `replaced_at` 与两个局部反查
+索引、过程账 `listing.sku_migrations`、别名视图 `catalog.sku_aliases`、体检视图
+`orders.v_order_line_dupes`、`product_risk` 加改码两列;`sku_codec.mint_replacement` /
+`settle_replacement` / `OPAQUE_SQL_PREDICATE`;`listing_sources.replacement_map` /
+`replaced_skus`;`upc_pool.retag_sku`;`mp_mapper.build_sku_update_item`(形态 A 最小载荷)
+与 `ORDERABLE_SYSTEM_FIELDS` 登记 SkuUpdate;`mp_conform` 放行系统开关(决策 I);
+`order_lines.duplicate_po_lines` 退化成读视图的薄壳。**api/feeds 零代码改动**(两个
+feedType 与两个桶都已收录,只补注释与测试)。
+
+第二块(commit `5565691`)**观测侧抑制/继承**:改码期间不记假代际(`diff_catalog` 对
+新码首次被扫到不记 `item_appeared`)、旧码不记缺席(`mark_missing` 照标 `missing_since`
+但不记 `item_missing`)、`problem_scan` 的扫描面排除在途改码旧码 + 顽固/归类/WFS/在途
+四段判据经 `catalog.sku_aliases` **继承一跳**、`alloc_survey` 销量归属同样继承(决策 H)、
+`sku_migrate` 的回执不进病历也不反哺黑名单;`dispositions.open_executing_count` /
+`rekey_suggested`、`walmart_catalog.drop_node_rows` 两个积木。
+
+第三块(本次)**工作流** `workflows/sku_migrate.py`(DANGEROUS=True、SUPPORTS_STORE=True、
+`-p store=` **必填**、**永不进调度**):
+
+- **三态判据表**(定案只信观测,回执成功单独不定案):
+
+  | 判词 | 证据组合 | 后果 |
+  |---|---|---|
+  | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + 上架表 SKU 列回写 + `dispositions.rekey_suggested` + `drop_node_rows` + 台账 confirmed |
+  | `rolled_back` | 回执 `failed`;或**观测新鲜**且新码超 `OBSERVE_HOURS`(24h)仍未出现;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
+  | `stalled` | 超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错) |
+  | (不定案) | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:只告警不处置,摘要**首行**点名。节奏闸是它的主要防线 |
+  | (不定案) | POST `outcome=unknown` | **保持 pending 不回滚**(决策 F) |
+  | (不定案) | pending 但 `submitted_at` 为空(**落库未提交**) | 进程死在 POST 前后、或提交当场抛异常。**只点名不自动定案**:从台账上分不出「确定没发」与「不知道到没到」。人工核:先 `feed_poll` 让 `ops.feed_log` 那条落定,再去后台看这个 Product ID 现在挂的是哪个 SKU |
+
+- **节奏硬闸**(`_stage_cap`,把口头节奏变成代码):该店还有 pending/stalled ⇒ 本轮
+  上限 0(只定案不提交);零 confirmed ⇒ 1;<10 ⇒ 10;≥10 ⇒ 按 `-p limit`。
+  **`-p limit=` 只能收紧**;再叠一层配额留量硬顶 `FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED`。
+- **五道整店前置闸 + 一道逐候选闸**:在营 / 目录水位新鲜 / 该店 `executing` 处置为 0 /
+  `retire_cooldown` 无 pending / 本工作流无在途 feed;逐候选再看旧码上有没有 48h 内的
+  在途 feed(不整店拦,跳过并点名)。任一不过**不抛异常**,在摘要里点名"为什么不能改"。
+- **事务边界**:`mint_replacement` + pending 台账在一个事务里写完并 **commit**,
+  **之后**才组载荷、才 POST。在未提交事务里 POST = 进程一死就是"沃尔玛已受理、我们
+  这边零记录"的孤儿码。
+- **dry-run 三纪律**:`_settle` 与 `_migrate` **都**零写(不 mint、不定案、不提交、
+  不写飞书、不改处置、不删节点库存),摘要用占位码打印将改的前 N 行与载荷样例;
+  `🧪 [DRY-RUN]` 前缀拼在**首行行首**(cli 的链通知只取首行)。
+- **上架表 SKU 列回写在事务之外**,写成功才盖 `sheet_synced_at`;每轮开头先补写
+  `status='confirmed' AND sheet_synced_at IS NULL` 的行(一次写失败之后该行已是
+  confirmed、不再进 pending 判决面,没有补写路径它就永远停在旧码而且不报错)。
+- **形态 A**(决策 E 默认):`FEED_TYPE = "MP_MAINTENANCE"` + `build_sku_update_item`
+  最小载荷,**不重发内容**;切形态 B 只改 `FEED_TYPE` 与 `_build_items` 两处,但
+  **必须先**确认 `mp_conform` 放行 SkuUpdate(被剔掉 ⇒ 每一行都退化成普通上架 =
+  每一行都双挂,而且回执一片成功)。**不提供参数覆盖**(双轨禁止)。
+
+**受牵连的 (store, sku) 键表 —— 逐条结论**(2026-09-02 复核,结论与依据都留下,
+免得下一轮盘点又把它们当待办):
+
+| 键 | 结论 | 依据 |
+|---|---|---|
+| `ops.dispositions` 未落定建议 | **迁**(`rekey_suggested`,撞唯一索引的动作不迁不删、点名人工) | 建议是"这个 item 怎么处置",item 没变、只是身份列换了 |
+| `ops.dispositions` executing 行 | **不迁**,改由前置闸③挡住(该店有 executing 就不许改码) | 搬键 = 把已提交 feed 的判决对象换掉 |
+| `catalog.item_node_inventory` | **删旧码行**(`drop_node_rows`) | 旧码在沃尔玛侧已不存在,留着是永不更新的幽灵行,而维护链的受管仓判据照读不误 |
+| `catalog.upc_pool` | **改标**(只动 `sku` 列;`asin`/`status`/`used_at` 不动) | 改码不是一次新消耗;领号复用键仍是 (店, ASIN) |
+| `listing.retire_cooldown` | **不迁**,改由前置闸④挡住 | 冷却表里存的是旧码,pending 期间不许改码 |
+| `ops.feed_items`(历史) | **不动** | 历史台账按提交时的码记账;新码的回执按新码落账(`_chunk_skus` 头注) |
+| `ops.cleanup_seen_categories` | **不迁** | 全仓只有 `cleanup_history_import` 写它、**零读者**(2026-09-02 grep 复核);主键是 (sku, category) 唯一对、是累计计数的真值来源,复制会多算、重命名会偷走别店历史(表无 store 维度) |
+| `ops.dedupe` scope=`maintenance:submitted` | **不迁,自然过期** | 键含 sku,但窗口 `SUPPRESS_HOURS=20` < 一轮观测期 24h;最坏是定案后多发一次同值维护意图(可能收到 0101198 stale update,非破坏) |
+| `ops.dedupe` scope=`cleanup:brand_asin` / `cleanup:brand_scrape` | **不受影响** | 键是 ASIN |
+| `catalog.claims.claim_key` | **不受影响** | 键是 ASIN 或品牌归一键 |
+| `catalog.product_events` 的四段历史判据 | **经 `catalog.sku_aliases` 继承一跳** | 顽固代际 / 问题归类 / WFS 拦截 / 在途防重(第二块已落地) |
+| `services/alloc_survey._SQL_SALES` | **经 `sku_aliases` 继承**(决策 H) | 不映射的话迁过码的品销量/GMV 恒 0,而且不报错 |
+| `workflows/problem_scan._SQL_INFLIGHT` | **经 `sku_aliases` 继承** | 在途防重的代际跟着码走,断链 = 同一个品被重复加压 |
+
+订单侧:改码后新单带新码;若沃尔玛对**改码前的 PO** 日后返回新码,会被当成新行插入
+(旧行不删)⇒ 双算。判据只有一处:`orders.v_order_line_dupes` 视图
+(`services/order_lines.duplicate_po_lines` 是读它的薄壳,`sku_migrate` 每轮跑一次并把
+非零结果点在摘要首行)。**体检只能发现不能阻止**:改码前跑一次存档基线,改码后必须一致。
+
+节奏(所有者定):**1 个品 → 10 个 → 一家店 → 其它店**,每一级之间至少隔一轮
+`catalog_sync`,并跑 `maintenance_scan --dry-run -p preview=1`、`node_probe`、
+`alloc_survey --dry-run` 三项前后对比(意图集合只应该有 SKU 串变了;销量不得掉到 0)。
+
 
 **批次 4|另议**:`sku_locked_heal` 简化(有了"退役 ⇒ 新码",24h 冷却可能不
 需要;官方无明文,留待实测)。
@@ -584,7 +656,8 @@ order_line_id"的体检告警兜住。
       更早看到码,代价是幽灵行)。
 - [x] **码的寿命**:复用到显式弃码(§5.3 四个弃码点,2026-09-02 工作流定稿)。若坚持"每次重上新码",
       须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
-- [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3。
+- [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3 —— **三块全部实现**
+      (工作流 `workflows/sku_migrate.py`);**生产投放尚未开始**,等六件单品实测。
 - [ ] **决策 A|停用要不要成为真正可恢复态**(批次 2 按默认实现:**RETIRE 不弃码**,
       守门反向钉死 `product_clear` 不得调 abandon;problem_scan 豁免仍未拍板,
       `workflows/product_clear.py` 头注已写明「可恢复窗口 ≈ 到下一轮 problem_scan」):给 problem_scan 加「lifecycle=RETIRED
@@ -604,9 +677,27 @@ order_line_id"的体检告警兜住。
       新建(官方无明文,本仓与旧仓无一条实测);MP_MAINTENANCE 最小载荷改 endDate
       能否单独复活;RETIRE_ITEM feed 是否仍被受理;人为制造 0101119 看码与 UPC
       同换、代际上限生效。
-- [ ] **§4 三件事单品实测**(所有者机器):`grep -rl SkuUpdate` 定 feed 类型与
-      最小载荷;改码后库存/价格/item_id 是否保留;旧串能否复用。
-- [ ] **跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。
+- [ ] **§4 六件事单品实测**(所有者机器,**批次 3 的关键路径**;全部通过前
+      `sku_migrate` 只许 --dry-run):`grep -rl SkuUpdate` 定 feed 类型(十分钟可出,
+      建议最先做);MP_MAINTENANCE 最小载荷能否改码;改码后库存/价格/item_id/变体组
+      是否保留;旧串能否复用;**对 lifecycle=RETIRED 的 item 是否可用**;
+      **改码之前的 PO 日后返回旧码还是新码**(决定订单双算体检的严重级别)。
+- [ ] **决策 D|跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。
+      【批次 3 按默认实现:**不迁** —— `sku_migrate.SOURCE_TYPES = ('amz',)`,候选 SQL
+      天然排除 match 行。理由:PHUMWMT 串本就不含 ASIN,货源隐匿收益为零;match 行的
+      source_key 是匹配 GTIN,改码后 `upc_pool` 的 (店, ASIN) 键无从对上。要迁需追加
+      一轮单品实测(MP_ITEM_MATCH v4.2 是否也认 SkuUpdate,官方零文档)+ 一个
+      `_build_items` 分支,**状态机不用改**】
+- [ ] **决策 E|SkuUpdate 的 feed 形态**:A(MP_MAINTENANCE 最小载荷)还是
+      B(MP_ITEM 全量)。【批次 3 按默认实现 **A**,常量 `sku_migrate.FEED_TYPE`;
+      由六件实测第 1、2 件裁定。**形态 B 有一个所有者必须先接受的副作用**:改码 =
+      重发全部内容,标题与属性会被我们再生成的内容覆盖;而且它吃 list_new 的
+      MP_ITEM 桶。若实测判定只有 B 可行,建议**回到计划层让所有者拍板**再动手】
+- [ ] **决策 H|改码后的历史销量归属**:经 `catalog.sku_aliases` 映射(已实现),
+      还是把聚合键整体改成 ASIN(更根本,但要改三个消费点的键形状,属另一个批次)。
+- [ ] **决策 I|形态 B 下 SkuUpdate 如何穿过 `mp_conform.strip_unknown`**:
+      【按默认实现:`ORDERABLE_SYSTEM_SWITCHES` 显式登记 + 放行。形态 A 用不到它,
+      但**仍必须先做** —— 决策 E 一旦翻到 B,没有它就是每一行都双挂而且回执全绿】
 - [ ] **沃尔玛 SKU 规格**:本地 spec Orderable.sku 的长度上限、字符集。
 - [x] **飞书建列**(所有者 2026-09-02 已建):上架表 R「SKU」;销售订单「来源码」;
       售后订单「来源码」;在线产品总表 Q「来源码」。统一叫「来源码」。
@@ -623,4 +714,132 @@ order_line_id"的体检告警兜住。
 - [x] **跟卖旧续号**(`PHUMWMT+日期+序号`)**已于批次 2 停用并删除**:B 列人工优先
       不变(人工号在提交前 register 进登记簿),留空的行由 `sku_codec.mint` 发码。
       存量 PHUMWMT 行不受影响(读路径全格式通吃)。
-- [ ] **退役表 B 列**:运营从此填的是随机码,是否要程序回显来源码。
+- [ ] **退役表 B 列**(§3.5 建议 1,**未做,仍在待办**):运营从此填的是随机码,
+      是否要程序回显来源码。
+- [ ] **维护记录表是否加「来源码」展示列**(§3.5 建议 2,**未做,仍在待办**):
+      与上一条同源 —— 运营在表上只看得到一串随机码时,"这是哪个品"要能一眼看出来。
+- [ ] **`variant_group.group_id` 仍把 ASIN 递给沃尔玛**(批次 3 评审转出的目标级
+      漏洞):改码把 SKU 里的 ASIN 摘掉了,变体组 ID 这条线还在往外递。属编码规则层,
+      不属批次 3;要单独定口径(换成不透明组号 = 变体组的身份也要过登记簿)。
+
+### 8.1 批次 3 待验收清单(所有者动作;代码已就绪,**生产投放尚未开始**)
+
+**① 六件单品实测**(见 §4;全部通过前 `sku_migrate` 只许 `--dry-run`):
+第 1 件十分钟可出结果、且同时决定形态 A/B 与 `mp_conform` 放行的必要性,**先做它**。
+
+```bash
+grep -rl SkuUpdate <DATA_ROOT>/specs/MP_ITEM/5.0.20260608-18_15_07-api/   # 实测 1
+```
+
+**② 体检 SQL(改码前跑一次存档基线,每一级投放之后再跑一次对比)**:
+
+```bash
+DSN="$(python -c 'from registry import db;print(db.pg_dsn())')"
+# 订单双算:改码前后必须一致(这是"改码后销量双算"唯一能被发现的手段)
+psql "$DSN" -c "SELECT count(*) FROM orders.v_order_line_dupes;"
+# 别名链:改码前恒为 0
+psql "$DSN" -c "SELECT count(*) FROM catalog.sku_aliases;"
+# 活码部分唯一索引只有一条,且条件已含 replaced_by IS NULL(0a 交付,这里只核验)
+psql "$DSN" -c "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname='catalog' AND tablename='listing_sources';"
+# 过程账三态分布(每一级投放之后看)
+psql "$DSN" -c "SELECT status, count(*) FROM listing.sku_migrations WHERE store='<试点店>' GROUP BY 1;"
+# 已定案的行必须都回写过上架表 SKU 列(非空);为空的下一轮会自动补写
+psql "$DSN" -c "SELECT id, new_sku, sheet_synced_at FROM listing.sku_migrations WHERE store='<试点店>' AND status='confirmed';"
+# 定案后的身份两端 + UPC(号不动、只换挂在它名下的 SKU)
+psql "$DSN" -c "SELECT sku, replaced_by, replaced_at, abandoned_at, abandoned_reason FROM catalog.listing_sources WHERE store='<试点店>' AND sku='<旧码>';"
+psql "$DSN" -c "SELECT sku, status, asin, used_at FROM catalog.upc_pool WHERE store='<试点店>' AND asin='<试点 ASIN>';"
+# 事件账本:必须有 sku_replaced,必须**没有** item_appeared / item_missing
+psql "$DSN" -c "SELECT event, count(*) FROM catalog.product_events WHERE store='<试点店>' AND sku IN ('<旧码>','<新码>') GROUP BY 1;"
+```
+
+**③ dry-run(人眼确认之后才跑真的;这是纪律,没有默认值替你挡)**:
+
+```bash
+python cli.py db_init && python cli.py db_init          # 连跑两次验幂等
+python cli.py sku_migrate --dry-run -p store=<试点店> -p limit=1
+#   人眼确认:六道闸的结论、候选、载荷 sku 是占位码、productIdentifiers 是该品**现挂**的号、零写库
+python cli.py sku_migrate -p store=<试点店> -p limit=1  # 第一级:1 个品(节奏闸会把任何 limit 压到 1)
+python cli.py catalog_sync -p store=<试点店>            # 等一轮完整观测
+python cli.py sku_migrate -p store=<试点店> -p settle_only=1 --dry-run   # 先空跑看判决
+python cli.py sku_migrate -p store=<试点店> -p settle_only=1             # 定案
+# 三项前后对比(意图集合只应该有 SKU 串变了;销量不得掉到 0;被改码的 SKU 不得出现在任何建议里)
+python cli.py maintenance_scan --dry-run -p preview=1 -p store=<试点店>
+python cli.py node_probe -p store=<试点店>
+python cli.py alloc_survey --dry-run
+python cli.py problem_scan --dry-run
+# 前两级全部 confirmed 之后再往上走
+python cli.py sku_migrate -p store=<试点店> -p limit=10       # 第二级
+python cli.py sku_migrate -p store=<试点店> -p limit=100000   # 第三级:整店
+```
+
+**④ 运行纪律**:改码只在 13:00 的 `product_chain` 之外跑(共享 MP_MAINTENANCE 桶);
+改码期间该店不得有人在 Seller Center 手工改同一批 item 的 SKU/Product ID;
+**旧仓 `product_clear` / `daily_cleanup` / `auto_listing` 调度必须已停**
+(`crontab -l | grep -Ei 'auto_listing|retire_and_relist|product_clear|daily_cleanup'` 输出为空)。
+
+## 9. 决策日志(SKU 改造批次 3,2026-09-02)
+
+> 本仓的记录纪律是「跑过的都有 [x]、决策都有日期与依据」(conventions §五)。
+> 三处**有意出入**若不写在这里,下一次复核会把它们当成实现漏洞改回去。
+> `docs/plan.md` 没有决策日志段(它的记录方式是 Phase 小节里的 `[x] + 日期`),
+> 所以批次 3 的决策记在这里,plan.md 只留一行指针。
+
+### 9.1 与工作包 / synthesis 的三处有意出入
+
+| # | 出入 | 采用的做法与依据 |
+|---|---|---|
+| 1 | POST `outcome=unknown` 是否回滚 | **不回滚,保持 pending**。synthesis 里「failed/未达/Unknown ⇒ rolled_back」说的是**回执**三态(`_settle` 的输入),与 POST 的 outcome 是两件事。unknown 的语义是「不知道到没到」,`api/feeds` 对它的既定处置就是保持 pending 待启动对账;若沃尔玛其实已改成新码而我们回滚了登记簿,新码就成了没有出身的孤儿行(`sources_backfill` 判 unknown ⇒ 退出全部自动化),而且不报错。写进了 `workflows/sku_migrate` 的头注与两条测试 |
+| 2 | `ops.cleanup_seen_categories` 是否按 `replaced_by` 迁 | **不迁**。2026-09-02 grep 复核:全仓只有 `cleanup_history_import` 写它、**零读者**;它的主键是 (sku, category) 唯一对、是累计计数的真值来源 —— 复制一份会多算,重命名又会偷走别店历史(表无 store 维度)。将来若接报表消费方,键应走登记簿 `source_key` 而不是原文 sku |
+| 3 | 活码部分唯一索引由谁收紧 | **批次 0a 一次建成最终条件**(含 `replaced_by IS NULL`),批次 3 **只核验、不 DROP、不重建**,另加两个**局部**反查索引。原稿让批次 3 去 `DROP INDEX IF EXISTS` 再裸建同名唯一索引:那三个索引名谁都没建过 ⇒ DROP 静默 no-op(收紧根本没发生),而不带局部条件的 `CREATE UNIQUE` 会在存量重复活行上失败 —— `db_init` 是整份 schema.sql 一次 execute,一条失败整份回滚 ⇒ 生产建库当场停摆 |
+
+### 9.2 九个决策点的默认取值(所有者拍板结果留白)
+
+| 决策 | 默认(已按此实现) | 所有者裁决 |
+|---|---|---|
+| A|`product_clear` 停用(RETIRE)是否弃码 / problem_scan 是否加豁免 | **RETIRE 不弃码**;豁免另议。批次 3 的 `_SQL_ITEMS` NOT EXISTS 与将来的 lifecycle 豁免是并列的两条独立条件,先加哪条都不冲突 | ☐ |
+| B|UPC 撞库 0101119 时码与 UPC 是否一起换 | **一起换**(批次 2 已落地)。改码 confirmed 的 `abandon(reason='sku_update')` 必须**不烧号**,与撞库那支走不同分支,分支由 reason 决定 | ☐ |
+| C|`alloc_push` 派工口径是否对齐去重闸 | **对齐**(批次 2 已落地)。pending 期间旧码行 `abandoned_at IS NULL` 且在架,按对齐后的口径仍算「已在架」⇒ 不会被重新派工,**不需要**在 `_SQL_ONLINE` 里额外加 `replaced_by` 条件(别好心补一条冗余条件) | ☐ |
+| D|跟卖存量是否也迁 | **不迁**(`SOURCE_TYPES = ('amz',)`) | ☐ |
+| E|feed 形态 A 还是 B | **A**(`FEED_TYPE = "MP_MAINTENANCE"`),由六件实测第 1、2 件裁定 | ☐ |
+| F|POST `outcome=unknown` 是否回滚 | **不回滚,保持 pending**(见 9.1-1) | ☐ |
+| G|`cleanup_seen_categories` / `ops.dedupe` / `catalog.claims` 是否随改码迁 | **三者都不迁**(逐条依据见 §7 批次 3 的键表) | ☐ |
+| H|改码后历史销量归属 | **经 `catalog.sku_aliases` 映射**,返回键形状不变、三个消费点一字不改 | ☐ |
+| I|形态 B 下 SkuUpdate 如何穿过 `strip_unknown` | **显式登记 `ORDERABLE_SYSTEM_SWITCHES` 并放行**(名单穷举、触发记日志、条件明确,满足 §六 真兜底三要件);形态 A 用不到但仍先做 | ☐ |
+
+### 9.3 本次评审驳回或转出的意见(不静默丢弃)
+
+- **驳回归属,不驳回内容**:「批次 3 顺手给 `list_new` 加 `-p limit`」—— 那是批次 2 的
+  止损闸,写进批次 3 会让一个 DANGEROUS 的一次性工作流去改上架主链。**已在批次 2
+  落地**(照 `_stage_cap` 的形状)。
+- **驳回**:「POST `outcome=unknown` 按 synthesis 字面回滚」—— 理由见 9.1-1。
+- **转出**:`workflows/product_clear.py` 头注关于「可恢复窗口」的措辞更正 —— 属决策 A
+  的落地面(批次 2 或横切),批次 3 加了扫描面排除之后并不改变停用品的命运。
+- **转出**:`services/blacklist.py` 的「黑名单键被灌随机码」—— 真问题,但它在**批次 2
+  新码上线当天**就会发生,不能等批次 3;归 0b 的 `or sku` 兜底口径(§8 待决项)。
+- **转出**:`variant_group.group_id` 仍把 ASIN 递给沃尔玛 —— 目标级漏洞,属编码规则层,
+  已进 §8 待决清单。
+
+### 9.4 已知缺口(记在案,等所有者定)
+
+- **`abandon` 单向不可逆,全套工作包没有「撤销弃码」的人工入口**。中间窗口内运营在
+  Seller Center 手工改 Site End Date、或形态实测推翻判据时,只能靠人裸 UPDATE 登记簿
+  —— 而所有守门都禁止 `sku_codec` 之外的 UPDATE。本批次的缓解是:`rolled_back` 弃的是
+  **新码**(免费),旧码只在 `confirmed` 时才弃;**confirmed 之后要撤销只能靠人工 +
+  一次反向 SkuUpdate,这条路径没有代码支持**。
+- **`catalog.sku_aliases` 只继承一跳**。设计前提是「旧码改码后立即弃码、永不再改码」,
+  没有任何东西**强制**它 —— 靠 `sku_migrations` 的 `(store, old_sku) WHERE status='pending'`
+  唯一索引与候选 SQL 的 `NOT EXISTS … status IN ('pending','confirmed','stalled')` 两道软闸。
+  若将来允许连改两次,视图必须改成递归 CTE,否则五处历史判据在第二跳静默断链。
+- **「落库未提交」的行没有自动出路**:`mint` + pending 台账已 commit、feed 却没发出去
+  (进程死在 POST 前后)时,那条行既不进定案判据面(`submitted_at` 为空),又让节奏闸
+  永远看见 pending ⇒ 整店发不出下一批。这是**有意的**(判不准就判活),摘要每轮点名并
+  给出人工核的两步(`feed_poll` 落定 `ops.feed_log` → 后台看 Product ID 现挂哪个 SKU),
+  但**收尾动作没有代码路径**,要人裸改台账。所有者若要自动化,得先给出「怎么判定它
+  确实没发出去」的口径。
+- **跟卖默认不迁 ⇒ 仓内长期并存两种码形态**(不透明码 + PHUMWMT 串)。这不是缺陷,
+  但会让「按形态分流」的直觉失效:形态判断一律走 `sku_codec.is_opaque` /
+  `OPAQUE_SQL_PREDICATE` / 登记簿,不许有人写第二处正则(守门钉住)。
+- **最贵的一条**:改码生效有 15 分钟到 4 小时的窗口,窗口内旧码可能被观测成非
+  PUBLISHED 且未缺席,正好落进 `problem_scan` 的扫描面被建议 DELETE_ITEM —— 一次成功的
+  改码被自己的自动链当场永久删掉。止损全靠第二块那条 `NOT EXISTS`,它**必须先于任何
+  一次真跑合并**,并且有反向守门测试钉住。

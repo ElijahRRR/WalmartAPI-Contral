@@ -771,8 +771,11 @@ AUDIT_RULES_VERSION = "c.2026-09-02.1"
 # ⚠ 键是**表内旧名的精确字面量**(不归一化匹配:旧名是历史事实,不是词形);
 #   值必须与 `refdata/policy_pages/en/*.md` 的头注 H1 **逐字一致**(含
 #   Tobacco 那条**没有牛津逗号**、Children’s 的弯撇号 —— 官方怎么写就怎么抄)。
-# ⚠ 下面 7 条来自生产存量实证(§十.6)。所有者 dry-run 看到「未对上」里还有
-#   别的拼写差时,**在这里追加**,不要另起第二张表(双轨禁止)。
+# ⚠ 前 7 条来自生产存量实证(§十.6);后 4 条来自 2026-09-02 首跑 dry-run 报告的
+#   「官方已不含」清单 —— 3 条由报告「疑似改名对」点名,第 4 条 Biodegradable Plastic
+#   ↔ Product claims 按页面内容判定(官方 Product claims 页正文逐条列出
+#   Biodegradable / Degradable / Compostable 宣称,是同一政策页改名扩写)。
+#   所有者 dry-run 看到「未对上」里还有别的拼写差时,**在这里追加**,不要另起第二张表(双轨禁止)。
 POLICY_LEGACY_NAMES: dict[str, str] = {
     "Auto & Motor Vehicles":      "Auto and Motor Vehicles",
     "Textiles & Apparel":         "Textiles and Apparel",
@@ -781,6 +784,10 @@ POLICY_LEGACY_NAMES: dict[str, str] = {
     "Electronics & RF":           "Electronics and Radio Frequency Devices",
     "Ride-Ons & Micromobility":   "Ride-Ons and Micromobility Devices",
     "Tobacco & Vaping":           "Tobacco, E-Cigarettes and Vaping Products",
+    "Jewelry/Precious Metals":    "Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals (Covered Goods)",
+    "Pet Products":               "Pet Foods, Supplements, Medicines and Other Products",
+    "Restricted/Illegal":         "Restricted/Illegal Products",
+    "Biodegradable Plastic":      "Product claims",
 }
 
 

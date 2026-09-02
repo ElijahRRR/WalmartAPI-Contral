@@ -253,22 +253,23 @@ def test_the_alias_table_is_derived_not_hand_written():
 def test_alias_gaps_go_from_empty_to_mostly_gone_when_the_rename_lands():
     """别名的目标值(表内旧名)指不到表 = 那条别名失效 —— 但**有两种读法**。
 
-    改名前(过渡态)7 条必须条条指得到,指不到就是映射表写错了;
+    改名前(过渡态)11 条必须条条指得到,指不到就是映射表写错了;
     改名后(目标态)大部分指不到 —— 那不是故障,是这张别名表功成身退的信号
     (此时直接键已命中),该做的是随第三步 L3 批把它整体删掉。
 
-    ⚠ 改名后**不是 7 条全指不到,是 5 条**:`Auto & Motor Vehicles` 与
+    ⚠ 改名后**不是 11 条全指不到,是 9 条**:`Auto & Motor Vehicles` 与
     `Textiles & Apparel` 两条旧名与官方名只差 `&`↔`and`,而 `_norm_key`
     2026-09-02 起就是 `policy_names.norm_category`(那四条词形规则里正好有它)
     —— 归一化后旧名与官方名同键,于是"指得到表",别名本身也已多余。
-    剩下 5 条是**真的语义缩写**(`Electronics & RF` ↔ `Electronics and Radio
-    Frequency Devices` 那种),归一化永远打不平,只能靠映射表。
+    剩下 9 条是**真的语义缩写**(`Electronics & RF` ↔ `Electronics and Radio
+    Frequency Devices` 那种;2026-09-02 首跑又补了 Jewelry/Pet/Restricted/
+    Biodegradable 四条),归一化永远打不平,只能靠映射表。
     """
     assert et.alias_gaps(LEGACY_POLICIES) == ()
     assert et.alias_gaps(KNOWN_POLICIES) == (
-        "Drugs & Paraphernalia", "Electronics & RF",
-        "Military & Law Enforcement", "Ride-Ons & Micromobility",
-        "Tobacco & Vaping")
+        "Biodegradable Plastic", "Drugs & Paraphernalia", "Electronics & RF",
+        "Jewelry/Precious Metals", "Military & Law Enforcement", "Pet Products",
+        "Restricted/Illegal", "Ride-Ons & Micromobility", "Tobacco & Vaping")
     # 掉出清单的那两条是"归一化已经够用",不是别名丢了
     still_mapped = set(resources.POLICY_LEGACY_NAMES) - set(
         et.alias_gaps(KNOWN_POLICIES))
@@ -348,11 +349,10 @@ def test_widening_the_join_key_never_loses_ground_on_the_corpus():
     assert len(official) >= _BASELINE_JOINS["official"]
     # 改名落地后一条都不该剩(剩下的会进对照报告的「政策表缺口」清单)
     assert sorted(set(wanted) - set(official)) == []
-    # 改名前仍差三条 —— 那三个类别**表里真的没有**(武器族 + Jewelry 后缀),
-    # 是政策表的缺口,不是 join 的锅;改名批补齐武器族之后自动消失
+    # 改名前仍差两条 —— 武器族**表里真的没有**,是政策表的缺口,不是 join 的锅;
+    # 改名批补齐武器族之后自动消失(Jewelry 那条 2026-09-02 进映射表后已能 join)
     assert sorted(set(wanted) - set(today)) == [
         "Firearm Accessories",
-        "Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals",
         "Knives and other Melee Weapons",
     ]
 

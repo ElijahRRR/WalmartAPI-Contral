@@ -280,7 +280,9 @@ _LEGACY = frozenset(resources.POLICY_LEGACY_NAMES)
 # 归一化也打不平 —— `Pet Products` 官方叫 `Pet Foods, Supplements, Medicines and
 # Other Products`,`Jewelry/Precious Metals` 是旧仓自造的斜杠写法。它们记 warning
 # 计数,改法随「L3 输出规范化」一起定(docs/audit_pipeline.md §6 点名)。
-_DEAD_ROUTES = ("Jewelry/Precious Metals", "Pet Products")
+# 2026-09-02 首跑 dry-run 后这两条也进了 POLICY_LEGACY_NAMES(官方名各是一长串),
+# 路由表里**不再有**对不上的条目 —— 空元组是有意的,别删这个守门。
+_DEAD_ROUTES: tuple[str, ...] = ()
 
 
 def test_路由表的政策名改名前后都对得上政策表():
@@ -294,14 +296,14 @@ def test_路由表的政策名改名前后都对得上政策表():
     names = _route_names()
     assert len(names) == 29
     dead = sorted(n for n in names if policy_names.resolve(n, _OFFICIAL) is None)
-    assert dead == list(_DEAD_ROUTES)          # 只剩本来就不存在的那两条
+    assert dead == list(_DEAD_ROUTES)          # 映射表补齐后一条不剩
     # 那 7 个旧缩写名:改名后解析到官方名,改名前(表里还是旧名)解析到旧名
     for legacy, official in resources.POLICY_LEGACY_NAMES.items():
         if legacy not in names:
             continue
         assert policy_names.resolve(legacy, _OFFICIAL) == official, legacy
         assert policy_names.resolve(legacy, _LEGACY) == legacy, legacy
-    assert len({n for n in names} & set(resources.POLICY_LEGACY_NAMES)) == 7
+    assert len({n for n in names} & set(resources.POLICY_LEGACY_NAMES)) == 9
 
 
 def test_路由_返回表内原拼写而不是路由表写的名字():
@@ -326,9 +328,11 @@ def test_路由_解析不到的条目记warning与计数(caplog):
     audit_l3.reset_stats()
     assert audit_l3.STATS["route_unresolved"] == 0
     with caplog.at_level("WARNING", logger="services.audit_l3"):
+        # 表里缺 Pet 那一行(模拟官方删类/表未同步)⇒ 路由条目解析不到
+        table = _OFFICIAL - {"Pet Foods, Supplements, Medicines and Other Products"}
         for _ in range(3):
             got = audit_l3.route_policy_hints("animals", "pet food",
-                                              known=_OFFICIAL)
+                                              known=table)
     assert "Pet Products" not in got and "Animals" in got
     assert audit_l3.STATS["route_unresolved"] == 3          # 逐次计数
     assert audit_l3.STATS["route_unresolved:Pet Products"] == 3

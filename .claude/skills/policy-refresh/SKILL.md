@@ -30,7 +30,9 @@ description: 沃尔玛官方禁售政策全量刷新流程:总览页核对 → �
 4. **内容族第二来源**(不在禁售总览页上,2026-09-02 起收录,同样进 diff):
    `guides/Item setup/Item content, imagery, and media/Content-standards:-Overview`(登录墙,
    所有者粘贴)与 `…/Product-Detail-Page:-overview`(公开)。它们是「violates Walmart's
-   content policy」/「unverified authenticity claims」两类下架原因所指页面。
+   content policy」/「unverified authenticity claims」两类下架原因所指页面。Overview 页链接的
+   21 个分类风格指南(每页再按产品类型挂 View Content Standards 深链)**不收**(所有者定稿
+   2026-09-02:体量与层级不适合喂 LLM,是写内容的规范不是判违规的判据)。
 
 ## 第 1 步 · 逐页转录(workflow 派子代理,每代理 ≤3 页)
 

@@ -133,9 +133,13 @@ def test_only_the_high_frequency_chains_live_on_this_machine():
     唯一属主),四条链的同轮闭环全部按批次自取(无锁)——两个 runner 之间
     重新回到零交集。它自带 lock_wait(防手动跑同名工作流撞上它:等而不是
     退 3 空转),这个前提也钉死。
+
+    2026-08-30 加入 `store_watch`(每小时 :45):店铺事件账本的唯一推送出口,
+    同样是"每小时一次"这一档 —— 智能体的定时任务排不准这个频率,而**预警
+    悄悄少跑几轮**正是这条链最不能出的故障。
     """
     assert {j["label"] for j in _LAUNCHD} == {"feed_poll", "order_chain",
-                                              "product_ingest"}
+                                              "product_ingest", "store_watch"}
     mine = {w for j in _LAUNCHD for w in j["workflows"]}
     theirs = {w for j in schedule.jobs_for("gpt") for w in j["workflows"]}
     assert mine & theirs == set()

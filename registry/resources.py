@@ -920,6 +920,16 @@ BRAND_BAN_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# TRO 品牌的判据(2026-08-30 建,product_audit 的 TRO 命中接线用)。
+# 上面这张总表的「来源」列是**自由文本**,由所有者手填、risk_sync 原样镜像进
+# catalog.brand_blacklist.source。生产实证取值三种:「TRO品牌」(22,527 行)/
+# 「TRO」/「tro」——所以判据是 `source.strip().lower().startswith(前缀)`,
+# 前缀匹配三种全中,且没有别的来源词以 tro 开头,零误伤。
+# ⚠ 常量登记在此、判定写在 services(services/audit_store.tro_hits 收前缀参数):
+# registry 只登记外部资源的取值口径,不替业务判。改这个前缀 = 改「谁算 TRO」,
+# 改之前先看 product_audit 日志里那行「R4 品牌来源:TRO 前缀 N 词」还非不非零。
+TRO_BRAND_SOURCE_PREFIX = "tro"
+
 
 # UPC 池(L2a,所有者建表 2026-08-07,6 列 A~F):PG(catalog.upc_pool)权威,
 # 此表 = 运营注入口 + 投影。运营填 A=UPC B=放入日期;脚本填 C=状态

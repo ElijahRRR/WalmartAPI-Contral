@@ -54,8 +54,8 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, settlements, store_retry, \
-    stores as stores_svc, yingdao
+from services import kpi, order_lines, settlements, store_events, \
+    store_retry, stores as stores_svc, yingdao
 
 DANGEROUS = False
 
@@ -327,6 +327,11 @@ def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
             new_status = statuses.get(row["seller_id"] or "")
             if not (new_name or new_status):
                 continue
+            if new_status:
+                # 影刀回填是 sales_status 的第二条写入路径,状态 diff 也得跟着
+                # (只给这一列,另两列 new 为空会被 diff 跳过;同日去重兜重复)
+                store_events.record_kpi_diff(conn, row["store"], data_date,
+                                             {"sales_status": new_status})
             cur.execute(
                 "UPDATE ops.store_kpi_daily SET"
                 " seller_name = COALESCE(%s, seller_name),"
@@ -346,6 +351,7 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
     with db.pg_conn() as conn:
         payouts = settlements.totals(conn, [s["name"] for s in store_list])
     ok, failed, diffs, rows_ok = [], [], [], []
+    alerts: list[str] = []      # high 状态事件的摘要短句(店铺被封/资金冻结)
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
                             names, statuses, last_names, payouts): s["name"]
@@ -357,7 +363,21 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 if row.pop("_orders_diff"):
                     diffs.append(name)
                 with db.pg_conn() as conn:
+                    # 状态 diff 在 upsert **之前**取上一条非空观测(同一事务里
+                    # 顺序其实无所谓:_PREV_SQL 按 data_date < 今天 过滤,
+                    # 今天这行怎么写都进不了"上一条")
+                    landed = store_events.record_kpi_diff(conn, name,
+                                                          data_date, row)
                     conn.execute(_KPI_UPSERT, row)
+                highs = [e for e in landed if e["severity"] == "high"]
+                if highs:
+                    note = ";".join(store_events.brief(e) for e in highs)
+                    # TRO 判据要「店铺当前状态」的真值(所有者 2026-09-01:
+                    # 店被停、钱跟着冻是后果,只有"店还开着钱却被冻住"才反常)
+                    # —— 本轮这一行正在 upsert,值就在手上,零额外查询
+                    if store_events.tro_signature(landed, row["store_status"]):
+                        note += "(店铺仍 ACTIVE 而资金被冻结,**疑似 TRO**)"
+                    alerts.append(note)
                 rows_ok.append(row)
                 ok.append(name)
             except (_client.StoreDeadError, httpx.ProxyError) as e:
@@ -371,6 +391,10 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 logger.exception("店铺 %s KPI 采集失败: %s", name, e)
                 failed.append(f"{name}({store_retry.diagnose(e)})")
     line = f"KPI:{len(ok)}/{len(store_list)} 店入库(窗口 {win_start}~{win_end})"
+    if alerts:
+        # 高危状态迁移必须在摘要点名(店铺事件账本 2026-08-30):飞书通知是
+        # 人的第一入口,"写进库等 store_watch 扫"不算第一时间
+        line += "\n🚨 " + " | ".join(sorted(alerts))
     if diffs:
         line += f",订单列对拍差异 {len(diffs)} 店(详见日志):{','.join(diffs)}"
     if failed:
@@ -518,19 +542,33 @@ def _phase_push(data_date, do_push: bool) -> str:
             "WHERE first_seen_date=%s GROUP BY store ORDER BY count(*) DESC LIMIT 5",
             (data_date,))
         top_problems = cur.fetchall()
+        # 状态变化改读事件账本(2026-08-30):此前是现拼"严格比昨天"的 JOIN,
+        # 只看 store_status 一列、跨空档(昨天没跑出来)会漏。检测已收口到
+        # services/store_events.record_kpi_diff 一处,这里只是消费当日事件。
+        # ⚠ 只查三个状态码,不是 `CLASS` 全集:账本后续会登记治理/运营类的码
+        # (倍率变更、上架汇总),那些不该出现在"状态迁移"这一节里 ——
+        # 写成全集的话每登记一个新码,日报就悄悄多捞一类事件。
         cur.execute(
-            "SELECT t.store, t.store_status, y.store_status"
-            " FROM ops.store_kpi_daily t JOIN ops.store_kpi_daily y"
-            "   ON y.store = t.store AND y.data_date = t.data_date - 1"
-            " WHERE t.data_date=%s AND t.store_status IS DISTINCT FROM y.store_status",
-            (data_date,))
-        status_changes = cur.fetchall()
+            "SELECT store, event, severity, detail FROM ops.store_events"
+            " WHERE detail->>'data_date' = %s::text"
+            "   AND event = ANY(%s::text[]) ORDER BY severity, store",
+            (str(data_date), [store_events.STORE_STATUS_CHANGED,
+                              store_events.PAYMENT_STATUS_CHANGED,
+                              store_events.SALES_STATUS_CHANGED]))
+        status_changes = [
+            {"store": s, "event": e, "severity": sev, "detail": d}
+            for s, e, sev, d in cur.fetchall()]
 
     lines = [f"📊 沃尔玛店铺日报 {data_date}",
              f"店铺 {n_stores} 家 | 24h 订单 {int(n_orders)} 单 | 销售额 ${float(n_sales):,.2f}"]
-    if status_changes:
-        lines.append("⚠ 店铺状态变化:" + "; ".join(
-            f"{s}: {old or '?'}→{new or '?'}" for s, new, old in status_changes))
+    highs = [e for e in status_changes if e["severity"] == "high"]
+    others = [e for e in status_changes if e["severity"] != "high"]
+    if highs:
+        lines.append("🚨 高危状态迁移:" + "; ".join(
+            store_events.brief(e) for e in highs))
+    if others:
+        lines.append("⚠ 其余状态变化:" + "; ".join(
+            store_events.brief(e) for e in others))
     if top_problems:
         lines.append("🆕 今日新增问题订单 TOP:" + "; ".join(
             f"{s} {c} 条" for s, c in top_problems))

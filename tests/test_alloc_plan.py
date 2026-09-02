@@ -193,6 +193,7 @@ class _Cur:
     def __exit__(self, *a): return False
     def execute(self, sql, args=None):
         self._r = [(s, n) for s, n in self.online.items()] if "count(*)" in sql else []
+    def executemany(self, sql, seq): pass       # ops.store_events 落行
     def fetchall(self): return list(self._r)
 
 
@@ -225,8 +226,8 @@ def _wire(monkeypatch, pool, held_brand=None, held_prod=None, claimed=None):
                         lambda *a, **k: __import__("contextlib").nullcontext(_Conn(online)))
     if claimed is not None:
         monkeypatch.setattr(wf.claims, "claim_many",
-                            lambda conn, rows: (claimed.extend(rows), [])[1] and (0, [])
-                            or (len(rows), []))
+                            lambda conn, rows: (claimed.extend(rows), [])[1]
+                            and (0, [], []) or (len(rows), [], rows))
 
 
 def test_run_dry_run_writes_nothing_and_reports_the_funnel(monkeypatch, tmp_path):
@@ -342,7 +343,8 @@ def test_capacity_is_never_exceeded_even_by_directed_groups(monkeypatch, tmp_pat
     _wire_directed(monkeypatch, pool, held, room=20)
     landed = []
     monkeypatch.setattr(wf.claims, "claim_many",
-                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
+                        lambda conn, rows: (landed.extend(rows),
+                                            (len(rows), [], rows))[1])
     wf.run({"execute": True})
     assert len(landed) <= 20, "定向流突破了剩余容量"
 
@@ -359,7 +361,8 @@ def test_directed_and_free_compete_in_one_deck_by_score(monkeypatch, tmp_path):
     _wire_directed(monkeypatch, pool, {"held0": "A"}, room=3)
     landed = []
     monkeypatch.setattr(wf.claims, "claim_many",
-                        lambda conn, rows: (landed.extend(rows), (len(rows), []))[1])
+                        lambda conn, rows: (landed.extend(rows),
+                                            (len(rows), [], rows))[1])
     wf.run({"execute": True})
     keys = {r["claim_key"] for r in landed if r["kind"] == wf.claims.PRODUCT}
     # 容量只有 3:分高的自由流先上,分 50 的定向流轮不到

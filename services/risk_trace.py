@@ -17,7 +17,10 @@ TRO / 钓鱼订单的第一件事是**波及展开** —— 一家店中招,同�
   a. `missing_since IS NULL`         —— 最近一轮全量扫描仍见到它;
   b. `coalesce(upper(lifecycle_status),'ACTIVE') = 'ACTIVE'` —— ⚠ **退市品的
      missing_since 也是 NULL**(catalog_sync 显式扫一轮 RETIRED,它没缺席,
-     只是退市了;services/alloc_survey._SQL_ONLINE 同款判法与教训);
+     只是退市了;services/alloc_survey._SQL_ONLINE 同款判法与教训。
+     ⚠ workflows/alloc_push._SQL_ONLINE 自 2026-09-02(SKU 改造批次 2)起
+     **改按「码是否弃用」判、不再筛 lifecycle**,与本处口径不同:那条答的是
+     "该不该派新活",本处答的是"它还在不在架上";别拿它当先例改这里);
   c. **店还在册** —— 已从凭证表删掉的死店,它的 walmart_items 行永久冻结为
      "在架"(docs/allocation_plan.md §9.4)。这一条本模块**不自己查**:
      在册集合要调飞书凭证表,services 层不该每次追溯都去敲外部接口。

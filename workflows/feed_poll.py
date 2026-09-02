@@ -15,6 +15,9 @@ ops.feed_item_errors(type/code/**field**/description),各业务表的报错列
 职责:扫 feed_log 的 submitted 行 → 查沃尔玛终态 → SKU 级结果落
 ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
 (提交结局不确定)告警待人工。只读沃尔玛 + 记账,非危险。
+⚠ 但**反哺器会写 PG**(UPC 池状态、登记簿弃码,两者都不可逆),空跑必须
+用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
+并把 execute 透传给五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
 
 轮询完执行**反哺器列表**(所有者定稿 2026-08-07:一切 feed 结果的表格
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
@@ -35,6 +38,11 @@ from registry import db
 from services import clear_sheet, feed_track, listing_sheet, maint_sheet, \
     match_sheet, stores as stores_svc
 
+# ⚠ DANGEROUS 保持 False(本工作流不调沃尔玛写接口),于是 cli.py 恒传
+# execute=True;**本工作流的 --dry-run 靠自己读 params["dry_run"]**,不靠
+# DANGEROUS(与 sources_backfill / store_watch 等扫描类同一形态)。
+# 反哺器里有不可逆的 PG 写(弃码 + 烧号),漏认这一句 --dry-run 就完全失效,
+# 而 feed_poll 挂在 product_chain 里每轮自动跑。
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.feed_poll")
@@ -131,7 +139,13 @@ def _error_stats(days: int, feed_type: str = "") -> str:
 
 
 def run(params: dict) -> str:
-    """输入:params(store / feed_id 诊断 / stats 排行)→ 输出:摘要。"""
+    """输入:params(store / feed_id 诊断 / stats 排行 / dry_run)→ 输出:摘要。
+
+    ⚠ execute 取的是 `not params["dry_run"]`:cli 对 DANGEROUS=False 的工作流
+    恒传 execute=True(缺省即真跑),--dry-run 只体现在单独透传的 dry_run 上。
+    """
+    # 反哺器的空跑闸:五个反哺器都收这个关键字,execute=False 时一行都不写
+    execute = bool(params.get("execute")) and not params.get("dry_run")
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
                             str(params.get("feed_type", "")))
@@ -157,11 +171,11 @@ def run(params: dict) -> str:
                 + "\n(诊断模式:不动 ops.feed_items 台账、不回写飞书;"
                   "要落定并回写请跑不带 -p feed_id 的 python cli.py feed_poll)")
     lines = [feed_track.poll_all(stores_by_name)]
-    lines.extend(_run_reflectors())
+    lines.extend(_run_reflectors(execute))
     return "\n".join(lines)
 
 
-def _one_chain(chain: list) -> list[str]:
+def _one_chain(chain: list, execute: bool = True) -> list[str]:
     """输入:一条反哺链 → 输出:该链的摘要行(链内按登记顺序串行)。
 
     单个反哺器失败**只吃掉它自己那一行**,同链后面的照跑 —— 与并发之前逐个
@@ -171,7 +185,7 @@ def _one_chain(chain: list) -> list[str]:
     out: list[str] = []
     for label, sync in chain:
         try:
-            line = sync()
+            line = sync(execute=execute)
         except Exception as e:
             # 反哺失败不拖垮轮询本体:台账已落定,下轮或业务工作流补写
             logger.warning("%s 回写失败(台账已落定,下轮补写): %s", label, e)
@@ -181,8 +195,8 @@ def _one_chain(chain: list) -> list[str]:
     return out
 
 
-def _run_reflectors() -> list[str]:
-    """输入:无 → 输出:全部反哺器的摘要行(链间并发,链内串行)。
+def _run_reflectors(execute: bool = True) -> list[str]:
+    """输入:是否真跑 → 输出:全部反哺器的摘要行(链间并发,链内串行)。
 
     ⚠ 摘要按 `_REFLECTOR_CHAINS` 的**登记顺序**拼,不按完成先后:五张表快慢
     差得远(上架表几万行、跟卖表几十行),按完成序拼的话每轮通知里的段落顺序
@@ -192,7 +206,7 @@ def _run_reflectors() -> list[str]:
 
     done: dict[int, list[str]] = {}
     with ThreadPoolExecutor(max_workers=len(_REFLECTOR_CHAINS)) as pool:
-        futs = {pool.submit(_one_chain, c): i
+        futs = {pool.submit(_one_chain, c, execute): i
                 for i, c in enumerate(_REFLECTOR_CHAINS)}
         for f in as_completed(futs):
             done[futs[f]] = f.result()

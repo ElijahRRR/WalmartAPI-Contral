@@ -44,7 +44,7 @@ from datetime import datetime
 
 from api import feishu
 from registry import db, resources
-from services import feed_track, kpi, upc_pool
+from services import feed_track, kpi, sku_asin, sku_codec, upc_pool
 
 logger = logging.getLogger("services.listing_sheet")
 
@@ -520,47 +520,78 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     return "处理中", ""
 
 
-def _mark_upc_conflicts(pairs: list[tuple[str, str]]) -> int:
-    """输入:撞库的 [(店铺, ASIN)] → 输出:标记数。
+def _mark_upc_conflicts(pairs: list[tuple[str, str]],
+                        execute: bool = True) -> int:
+    """输入:撞库的 [(店铺, **该行当前 SKU**)] + 是否真跑 → 输出:弃码数。
 
-    ERR_EXT_DATA_0101119:该 UPC 号在沃尔玛目录里已被占用——**UPC 永久弃用**
-    (旧 upc_pool 实证),重上时领新号。
+    ERR_EXT_DATA_0101119:该 UPC 号在沃尔玛目录里已被占用。**所有者定稿
+    2026-09-02(决策 B):码与 UPC 一起换** —— 一次 `sku_codec.abandon(
+    reason=upc_conflict)` 把码弃掉,号由 abandon 内部按分派表烧成 conflict
+    (烧号只有 upc_pool.burn 一条实现路径,本函数不再自己写池状态)。
+    下一轮 list_new 的 mint 给新码、claim 给新号,拆掉旧链路那个
+    「撞库 → 同 SKU 换 UPC → 0101211 SKU_LOCKED → 自愈链」的死循环。
 
-    ⚠ 反查键是 **(店铺, ASIN)**,不是 `upc_pool.sku`(2026-09 SKU 改造修):
-    ① `sku` 列批次 2 起存真码,按它反查会**静默归零** —— 撞库的号永不标
-       conflict,claim 一轮轮把同一个坏号领回来(sku_plan §3.4);
-    ② 领号键本来就是 (店, ASIN)(services/upc_pool.claim),不受切码影响;
-    ③ 顺带修掉跨店误伤:旧写法不带店维度,A 店某 ASIN 撞库会把 B 店同 ASIN
-       名下的号一起烧掉(同 ASIN 多店在架是常态,本仓 2026-08-28 起「跨店
-       不互拦」)。
-    missing 按**没找到号的 (店,ASIN) 对**数,不再拿"标记数"去减对数
-    (一对多个号时旧算法会算出负数)。
+    ⚠ 入参第二元是**行上的 SKU(row_sku)不是 ASIN**:弃码要按 (店, SKU) 定位
+    登记簿行;ASIN 由 abandon 从登记簿的 source_key 拿(那一跳是它的活)。
+    本函数自己也翻一次 SKU→ASIN,但只为**告警统计**:按 (店, ASIN) 查池
+    (领号键,services/upc_pool.claim 同源)看有没有对应的号,查不到就报数
+    —— 状态条件与 `upc_pool.burn` 逐字对齐(claimed/used),不对齐会把已经
+    烧过的号数成"找不到"。
+
+    ⚠ **登记簿没有活行的对弃不掉**(abandon 返 False:未登记的存量行、或已
+    弃过的码),这批只记警告与计数,**不另开一条烧号路径**兜底:那正是本批
+    要消灭的双轨,而且"烧了号没弃码"就是死循环的上半截。要救它们走
+    sources_backfill 把出身补上。
 
     ⚠ 所有者澄清 2026-08-09:撞库**只说明这个 UPC 号被占了**,与"我们的产品
     是否已在沃尔玛上架"无关(UPC 被他人用掉是常态)。连撞多次只是运气差,
-    照常领新号重试,不得据此推断该走跟卖。
+    照常领新码新号重试,不得据此推断该走跟卖。
+
+    `execute=False`(feed_poll --dry-run 透传下来)只打印将弃码的对,**PG 一行
+    都不写** —— 弃码与烧号都不可逆,没有撤销路径。
     """
     if not pairs:
         return 0
     want = sorted(set(pairs))
-    n = 0
+    if not execute:
+        for store, sku in want[:20]:
+            logger.info("[DRY-RUN] 将弃码并烧号 %s/%s(撞库 0101119,码与 UPC 同换)",
+                        store, sku)
+        if len(want) > 20:
+            logger.info("[DRY-RUN] …另有 %d 对省略", len(want) - 20)
+        return 0
+    n_ab, dead = 0, []
     with db.pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT p.upc, p.asin, p.store FROM catalog.upc_pool p "
-                "JOIN unnest(%s::text[], %s::text[]) AS t(s, a) "
-                "  ON p.store = t.s AND p.asin = t.a "
-                "WHERE p.status <> 'conflict'",
-                ([s for s, _ in want], [a for _, a in want]))
-            found = cur.fetchall()
-        for upc, asin, _store in found:
-            upc_pool.mark_conflict(conn, upc, asin)
-            n += 1
-    missing = len(want) - len({(store, asin) for _u, asin, store in found})
-    if missing:
-        logger.warning("UPC 撞库 %d 个 (店铺,ASIN) 在池中找不到对应 UPC"
-                       "(无法标冲突)", missing)
-    return n
+        # ① 先按 (店, ASIN) 查池:abandon 之后号已被烧成 conflict,再查必然空
+        asin_of = sku_asin.resolve_many(conn, want)
+        probe = sorted({(s, asin_of[(s, k)]) for s, k in want
+                        if (s, k) in asin_of})
+        found: set[tuple[str, str]] = set()
+        if probe:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT p.store, p.asin FROM catalog.upc_pool p "
+                    "JOIN unnest(%s::text[], %s::text[]) AS t(s, a) "
+                    "  ON p.store = t.s AND p.asin = t.a "
+                    "WHERE p.status IN ('claimed', 'used')",
+                    ([s for s, _ in probe], [a for _, a in probe]))
+                found = {(s, a) for s, a in cur.fetchall()}
+        # ② 逐对弃码(烧号在 abandon 内部,与弃码同一事务)
+        for store, sku in want:
+            if sku_codec.abandon(conn, store, sku,
+                                 sku_codec.ABANDON_UPC_CONFLICT):
+                n_ab += 1
+            else:
+                dead.append((store, sku))
+    missing = len(probe) - len(found)
+    if missing > 0:
+        logger.warning("UPC 撞库 %d 个 (店铺,ASIN) 在池中找不到 claimed/used 的号"
+                       "(无号可烧,只弃码)", missing)
+    if dead:
+        logger.warning("UPC 撞库 %d 对在登记簿里没有活码,未弃码也未烧号"
+                       "(未登记的存量行或已弃过的码),样本=%s;要救走 "
+                       "sources_backfill 补出身", len(dead), dead[:5])
+    return n_ab
 
 
 # Unknown 自愈的两个判定源(所有者批复 2026-08-12,替代旧 sync_status_track
@@ -593,10 +624,14 @@ WHERE w.missing_since IS NULL
 """
 
 
-def heal_unknown() -> str | None:
-    """输入:无(直接读上架表 + feed 台账 + 目录) → 输出:摘要行,无 Unknown 行时 None。
+def heal_unknown(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:摘要行,无 Unknown 行时 None。
 
     feed_poll 反哺器:是否上架=Unknown 的行按 feed 台账 + 沃尔玛目录自愈。
+
+    ⚠ `execute=False`(`cli.py feed_poll --dry-run`)只报数:飞书不写,UPC 池的
+    mark_used / release 也不写(号一旦标 used 就永久消耗,回收更是只许走那三条
+    合法路径)。
 
     Unknown 是"提交结局不确定"的防重态(不重复提交防双上架),但没人收尾
     就永久卡死 + UPC 永久占用(claimed 不释放)。收尾三条路:
@@ -703,6 +738,16 @@ def heal_unknown() -> str | None:
             continue
         n_stay += 1
 
+    if not execute:
+        # 空跑:一行飞书、一行 PG 都不写(UPC 标已用是永久消耗,回收也不可乱走)
+        line = (f"[DRY-RUN] 上架表自愈:Unknown {len(unknown)} 行 → 将确认在线 "
+                f"{n_yes},将确认失败重排 {n_no};将标已用 {len(upc_used)} 个 UPC、"
+                f"回收 {len(upc_release)} 个")
+        if n_locked:
+            line += f",SKU_LOCKED 移交自愈链 {n_locked}"
+        if n_stay:
+            line += f",继续观察 {n_stay}"
+        return line
     if upc_used or upc_release:
         with db.pg_conn() as conn:
             if upc_used:
@@ -724,10 +769,14 @@ def heal_unknown() -> str | None:
     return line
 
 
-def sync_from_ledger() -> str | None:
-    """输入:无(直接读上架表 + feed 台账) → 输出:摘要行,无在途行时 None。
+def sync_from_ledger(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:摘要行,无在途行时 None。
 
     feed_poll 反哺器:有 feedid 且 上架结果 在途的行,按台账落回执三列。
+
+    ⚠ `execute=False`(`cli.py feed_poll --dry-run`)**一行飞书、一行 PG 都不写**:
+    本函数的撞库处置会弃码 + 烧号,两者都不可逆、没有撤销路径。这条 --dry-run
+    通路是批次 2 补的(此前 feed_poll 根本不读 params["dry_run"],空跑照样真烧号)。
 
     ⚠ 台账三个 dict(item_results / item_errors / item_codes)的键是
     **ops.feed_items.sku = 沃尔玛侧真 SKU**,所以按 `row_sku(r)` 取;拿 ASIN 去
@@ -748,7 +797,9 @@ def sync_from_ledger() -> str | None:
     updates, cache = [], {}
     descs: dict[str, dict[str, str]] = {}
     codes: dict[str, dict[str, set]] = {}
-    conflicts: list[tuple[str, str]] = []       # [(店铺, ASIN)] → 正交标 UPC 池
+    # [(店铺, 该行 SKU)] → 正交弃码(码与 UPC 一起换,决策 B)。第二元必须
+    # 走 row_sku:弃码按 (店, SKU) 定位登记簿行,拿 ASIN 去弃切码后必然落空。
+    conflicts: list[tuple[str, str]] = []
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
@@ -769,14 +820,23 @@ def sync_from_ledger() -> str | None:
         # UPC 撞库**正交处置**(旧 reconcile 实证:与主分类独立,多错并存也要标)
         if resources.WALMART_ERR_UPC_CONFLICT in codes.get(fid, {}).get(
                 sku, set()):
-            conflicts.append((r["store"], r["asin"]))
+            conflicts.append((r["store"], sku))      # sku = row_sku(r),同源
         updates += _ranges(r["rownum"], _RECEIPT_FIELDS, [[o, p, today]])
-    n_conflict = _mark_upc_conflicts(conflicts)
+    n_conflict = _mark_upc_conflicts(conflicts, execute)
+    tag = "" if execute else "[DRY-RUN] "
     if not updates:
-        line = f"上架表:在途 {len(pollable)} 行,台账尚无新终态"
+        line = f"{tag}上架表:在途 {len(pollable)} 行,台账尚无新终态"
+        if not execute and conflicts:
+            return line + f";将弃码 {len(conflicts)} 个(撞库)"
         return line + (f";UPC 撞库标记 {n_conflict}" if n_conflict else "")
+    if not execute:
+        line = (f"[DRY-RUN] 上架表:将回填 {len(updates)} 段(在途 "
+                f"{len(pollable)} 行)")
+        if conflicts:
+            line += f";将弃码 {len(conflicts)} 个(撞库,码与 UPC 一起换)"
+        return line
     n = feishu.sheet_write_ranges(resources.LISTING_SHEET, updates)
     line = f"上架表回填 {n} 行(在途 {len(pollable)})"
     if n_conflict:
-        line += f";⚠ UPC 撞库 {n_conflict} 个已标冲突(永久弃用,重上会领新号)"
+        line += f";⚠ UPC 撞库 {n_conflict} 个已弃码(码与 UPC 一起换,重上新码新号)"
     return line

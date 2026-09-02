@@ -246,3 +246,58 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 
 **⑥ 三个同名异义,别混**:「码弃用(abandoned)」≠「沃尔玛 lifecycle RETIRED」
 ≠「product_clear 停用」。登记簿列名故意用 abandoned 不用 retired。
+
+**⑦ 码的寿命与四个弃码点**(批次 2 接线,2026-09-02):
+
+- **码的寿命** = 沃尔玛侧那条 (店, SKU) 记录对我们还有用的寿命,**不是上架/下架
+  次数**。登记簿的行**永不 DELETE**;`abandoned_at IS NULL` 的行叫**活码**。
+- **弃码只有一个实现**:`services/sku_codec.abandon(conn, store, sku, reason)`。
+  它在同一事务里做三件事:标登记簿三列 → 按分派表烧号 → 记码级事件
+  (`sku_abandoned` / `sku_replaced`,detail 必带 `source_key`)。
+- **弃码点只有四个**(守门 `_ABANDON_CALLERS_OK` 逐条登记,多一个即红):
+
+  | # | 在哪 | 触发 | 烧号状态 |
+  |---|---|---|---|
+  | 1 | `workflows/catalog_sync.py` | DELETE 经**观测核验** `delete_verified` | `burned_delete` |
+  | 2 | `workflows/sku_locked_heal.py` | SKU_LOCKED 自愈 RETIRE **回执成功 + 冷却期满** | `burned_lock` |
+  | 3 | `services/listing_sheet.py` | UPC 撞库 `ERR_EXT_DATA_0101119`(决策 B:码与 UPC 一起换) | `conflict` |
+  | 4 | 批次 3 `workflows/sku_migrate.py` | 改码 SkuUpdate 经观测确认 | **不烧**(item 还在、UPC 还绑着) |
+
+  第 1 点**不按回执弃**:「回执成功但后台没删」是所有者实证过的故障模式;
+  第 2 点是四点中唯一绑回执的一个(锁死的 SKU 可能从未进过 walmart_items,
+  没有观测可等)。烧号唯一写入函数 `upc_pool.burn(conn, pairs, status)`,
+  状态只由 `sku_codec._BURN_STATUS` 给(决策 D)。
+- **其余一切「下架」都不弃码**(五项,守门 `_ABANDON_FORBIDDEN` 反向钉死):
+  `product_clear` 停用(RETIRE)、库存归零、缺席 `missing_since`、被沃尔玛
+  unpublish、提交失败/被拒/Unknown/PROHIBITED —— 沃尔玛侧记录仍在、仍绑着我们的
+  UPC,抽新码 = 同店两条同内容记录 + 白烧一个 UPC。
+- **mint 的复用语义**:同 (店, 来源, 源头键) 有活码就复用它(依据是沃尔玛
+  「一个 Product ID 只能挂一个 SKU」),所以失败行下一轮拿到的是同一个码,载荷
+  一字不差 ⇒ `api/feeds` 的 payload_key 在途防重仍然有效。
+- **三条护栏跟码走**:重试上限、在途防重、UPC 原号复用都按当前活码计数 ——
+  每换一次码,三条全部重新开始。这正是**代际上限闸**(同 (店, 来源, 源头键)
+  已弃码行数 ≥ `MAX_SKU_GENERATIONS`)与**退役冷却闸**
+  (`RETIRE_COOLDOWN_HOURS`)要堵的闭环;两个常量的唯一之家是
+  `services/sku_codec.py`(守门 `test_cooldown_and_generation_constants_have_one_home`)。
+- **跨店永不复用码**:同一个码串在两家店合法,但那正是"两家店有关联"的信号,
+  而关联就是封号线(schema.sql 的 `listing_sources_opaque_sku_uidx` 拦它)。
+- **发码只有一条路**:`sku_codec.mint`。跟卖侧旧的 `PHUMWMT + 日期 + 序号`
+  生成器已于批次 2 删除(守门 `test_no_second_sku_generator_survives`),
+  跟卖表 B 列人工号仍然优先,人工号走 `listing_sources.register` 在**提交前**登记。
+
+**⑧ 回执事件码不写字面量**:`{kind}_feed_{status}` 是推导出来的,具名常量在
+`services/product_events.py`(`RETIRE_FEED_SUCCESS` / `DELETE_FEED_SUCCESS`)。
+`_FEED_KIND` 一改取值,写字面量的那条 SQL 会**静默返回空集** —— 闸门形同虚设
+而且不报错。守门 `test_no_receipt_code_literals_in_business_sql` 扫 services/ 与
+workflows/。
+
+**⑨ 派工闸与去重闸同口径,占用口径故意不同**(决策 C,2026-09-02):
+`workflows/alloc_push._SQL_ONLINE` 与 `list_new` 的去重闸都判「没缺席 + 码还
+活着」,**不筛 lifecycle**;`services/alloc_survey._SQL_ONLINE` 保持筛 RETIRED
+不变(它答的是"有没有活货位")。两处都有反向守门,**不要顺手统一**。
+
+**⑩ 不可逆的写必须认 `--dry-run`**:弃码与烧号都没有撤销路径。`feed_poll` 的
+`DANGEROUS=False`(不调沃尔玛写接口)⇒ cli 恒传 `execute=True`,所以它**自己读
+`params["dry_run"]`** 并把 `execute` 透传给五个反哺器;五个反哺器一律带
+`execute: bool = True` 关键字(守门 `test_every_reflector_takes_an_execute_flag`),
+`execute=False` 时一行飞书、一行 PG 都不写。

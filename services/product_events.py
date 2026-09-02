@@ -118,8 +118,12 @@ SKU_REPLACED = "sku_replaced"
 # 回执码具名常量:回执事件码由 `{kind}_feed_{status}` 派生(见下面 EVENTS 的
 # 推导式),本身没有名字 —— SQL 里需要它时引用本常量,**不写字面量**:
 # _FEED_KIND 一改取值,写字面量的那条 SQL 会静默返回空集(闸门形同虚设,
-# 而且不报错)。list_new 的退役冷却闸读它。
+# 而且不报错)。RETIRE:list_new 的退役冷却闸 + sku_locked_heal;
+# DELETE:本模块 _VERIFY_SQL 的删除核验起点(批次 3 还要再用一次)。
+# 守门 tests/test_sku_guard.py 扫 services/ 与 workflows/ 下的 `_feed_success`
+# 字面量,白名单只有本文件。
 RETIRE_FEED_SUCCESS = f"{_FEED_KIND['RETIRE_ITEM']}_feed_success"
+DELETE_FEED_SUCCESS = f"{_FEED_KIND['DELETE_ITEM']}_feed_success"
 
 # 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
 # record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。
@@ -237,18 +241,20 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
     return events
 
 
-_VERIFY_SQL = """
+#: 事件码一律由常量拼进来(B2-32):写字面量的话 _FEED_KIND 一改取值,
+#: 这条 SQL 会静默返回空集 —— 删除核验从此不产出任何判定,而且不报错。
+_VERIFY_SQL = f"""
 WITH last_ok AS (
     SELECT DISTINCT ON (store, sku) store, sku, occurred_at
     FROM catalog.product_events
-    WHERE event = 'delete_feed_success'
+    WHERE event = '{DELETE_FEED_SUCCESS}'
     ORDER BY store, sku, occurred_at DESC),
 open_ok AS (
     SELECT l.* FROM last_ok l
     WHERE NOT EXISTS (
         SELECT 1 FROM catalog.product_events v
         WHERE v.store = l.store AND v.sku = l.sku
-          AND v.event IN ('delete_verified', 'delete_not_effective')
+          AND v.event IN ('{DELETE_VERIFIED}', '{DELETE_NOT_EFFECTIVE}')
           AND v.occurred_at >= l.occurred_at))
 SELECT o.store, o.sku,
        CASE WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
@@ -261,23 +267,33 @@ LEFT JOIN catalog.walmart_items w ON w.store = o.store AND w.sku = o.sku
 """
 
 
-def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
-    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数)。
+def verify_deletions(conn, grace_hours: int = 48
+                     ) -> tuple[int, int, list[tuple[str, str]]]:
+    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数, 生效的 (店, SKU) 列表)。
 
     删除核验(不信回执,信观测):delete_feed_success 之后,
     - 商品从目录消失/标缺席/RETIRED → delete_verified;
     - 宽限期后 catalog_sync 仍扫到它在架 → delete_not_effective + 告警
       (回执说成了但后台没删,所有者实证的真实故障模式);
     - 还没等到下一轮扫描 → 保持待核验,不落判。
+
+    第三元 = 本次判定为 gone 的 (店, SKU),与写进账本的 delete_verified 行
+    **一一对应**,交给调用方(workflows/catalog_sync)去弃码(弃码点 1)。
+    ⚠ 本模块**不 import sku_codec**:sku_codec 要写产品事件(sku_abandoned),
+    反过来再 import 就是循环;而且账本的职责是记录事实,弃码是决策,决策由
+    workflow 层组合(铁律 1 的方向 workflows → services)。返名单而不是让
+    catalog_sync 另写一条同样的 SQL 去捞 —— 那是第二份判据,迟早与这份漂开。
     """
     with conn.cursor() as cur:
         cur.execute(_VERIFY_SQL, (grace_hours,))
         rows = cur.fetchall()
     events = []
+    gone_pairs: list[tuple[str, str]] = []
     gone = still = 0
     for store, sku, verdict in rows:
         if verdict == "gone":
             gone += 1
+            gone_pairs.append((store, sku))
             events.append({"sku": sku, "store": store, "event": DELETE_VERIFIED,
                            "source": "catalog_sync"})
         elif verdict == "still":
@@ -290,4 +306,4 @@ def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
                        "样本=%s,请人工处置",
                        still, [(s, k) for s, k, v in rows if v == "still"][:5])
     record_many(conn, events)
-    return gone, still
+    return gone, still, gone_pairs

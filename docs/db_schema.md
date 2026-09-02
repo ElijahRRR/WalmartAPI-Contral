@@ -197,6 +197,13 @@ CREATE TABLE catalog.listing_sources (
 --   WHERE abandoned_at IS NULL AND replaced_by IS NULL
 --   给 sku_codec.mint 的复用查询用(要看得见**存量活行**,故不限形态);
 --   局部条件与 mint 的 WHERE 逐字对齐,不对齐 = 用不上索引。
+-- listing_sources_abandoned_idx (store, source_type, source_key)
+--   WHERE abandoned_at IS NOT NULL(2026-09-02,SKU 改造批次 2 唯一新增的索引)
+--   给 list_new 的**代际上限闸**用:每轮一次 GROUP BY 数同 (店, 来源, 源头键)
+--   的已弃码行数,达 sku_codec.MAX_SKU_GENERATIONS 就转人工。不带它就是每轮
+--   全表扫;局部条件取 IS NOT NULL 是因为活码行是绝大多数,装进这个索引没有
+--   任何查询会用到。与守门那条「abandoned_at IS NULL 只许出现在三处 .py」不
+--   冲突:DDL 的局部条件不计入那张白名单。
 --
 -- 纪律两条:① abandoned_at / abandoned_reason / replaced_by 三列**只由
 -- services/sku_codec 写**(abandon;批次 3 的改码替换),其它模块与工作流一律
@@ -218,7 +225,11 @@ CREATE TABLE catalog.listing_sources (
 -- 同寿命,弃码时连号一起烧(delete=DELETE 经观测核验,lock=SKU_LOCKED 自愈退役)。
 -- 与 conflict 的分工:conflict **只表示撞库**(全站已存在该 UPC),烧号不再复用
 -- 这个语义,否则池表投影与 pool_stats 里分不清"撞库废的"与"我们烧的"。
--- 写入点在批次 2 随 services/sku_codec.abandon 接线一起改(0a 只登记取值)。
+-- 写入点**已于批次 2 接线**:三个烧号状态的唯一写入函数是
+-- `services/upc_pool.burn(conn, pairs, status)`,唯一调用方 `sku_codec.abandon`
+-- (状态由它的弃码原因分派表给:delete_verified→burned_delete、
+-- sku_locked→burned_lock、upc_conflict→conflict)。旧的 burn_for_retire 与
+-- 按单号写 conflict 的 mark_conflict 已删(单一实现路径)。
 CREATE TABLE catalog.upc_pool (
     upc text PRIMARY KEY,            -- 规范化 12 位
     status text NOT NULL DEFAULT '', -- ''/claimed/used/conflict/bad_prefix

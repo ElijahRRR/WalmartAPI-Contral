@@ -43,20 +43,26 @@ DANGEROUS = True
 
 logger = logging.getLogger("workflows.alloc_push")
 
-# 该店此刻在架的 (店, ASIN)。判"在架"与 alloc_survey._SQL_ONLINE 同口径:
-# 排 RETIRED —— 退市行不算活货位,它对应的占用是待重上的,该派工。
+# 该店此刻在架的 (店, ASIN)。**判据 = 与 list_new 去重闸同一句话:没缺席、
+# 码还活着**(所有者决策 C,2026-09-02 批次 2 落地)。
 # ⚠ ASIN 走身份键(登记簿 amz 键优先,模式提取兜存量),唯一规则出处
 # services/sku_asin.pick_asin:裸提取在切码后会让"已在架"集合恒空 ⇒ 已在架
 # 的品被重新派工、重复上架(本工作流 DANGEROUS=True,直接写飞书上架表)。
-# `ls.abandoned_at IS NULL` 在批次 2 之前**恒真**(全库该列为 NULL,而且这是
-# LEFT JOIN,未登记行同样是 NULL),提前落地是为了让写侧切换只改一处。
+# ⚠ **lifecycle 条件已于批次 2 去掉**(0a 先落地了恒真的 abandoned_at 谓词,
+# 这一步才是真行为变化):派工闸与去重闸必须同一口径 —— 退市但未弃码的 ASIN
+# 若在这里算"不在架",分配链每天派一次、上架链每天拦一次,运营看到的是一堆
+# 永远上不去的行。反向的坑更贵:排 RETIRED + mint 复用旧码 + 载荷自带 2028
+# endDate = 对退市档案批量走官方 unretire 通道(plan.md:166 事故重演),所以
+# lifecycle 判据从派工侧拿掉,由「码还活着」承担。
+# ⚠ services/alloc_survey._SQL_ONLINE **故意不跟着改**:它答的是"占用/冲突里
+# 这家店有没有活货位",退市行不是活货位(2026-08-15 所有者质疑与查证结论)。
+# 两个口径故意不同,不要顺手统一(两处都有反向守门钉住)。
 _SQL_ONLINE = """
 SELECT w.store, w.sku, ls.source_key
 FROM catalog.walmart_items w
 LEFT JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 WHERE w.missing_since IS NULL
-  AND coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'
   AND ls.abandoned_at IS NULL
 """
 

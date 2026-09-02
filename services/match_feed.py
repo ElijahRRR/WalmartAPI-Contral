@@ -1,21 +1,26 @@
-"""跟卖(MP_ITEM_MATCH)业务积木:SPEC 预检候选、跟卖 Item 构造、SKU 规则。
+"""跟卖(MP_ITEM_MATCH)业务积木:SPEC 预检候选与跟卖 Item 构造。
 
 Item 结构 2026-08-07 与旧系统真实 feed 备份对拍定稿(所有者提供样本):
-  {"sku": "PHUMWMT202606280001", "condition": "New",
+  {"sku": "<12 位不透明码>", "condition": "New",
    "productIdentifiers": {"productIdType": "GTIN", "productId": 14位},
    "ShippingWeight": 0.4, "price": 14.76}
-五字段;price/ShippingWeight 裸 number。SKU 规则(所有者澄清 2026-08-07:
-旧系统 SKU 是人工编号填入):新系统 B 列**人工优先,留空自动生成**——
-沿用其编号格式 PHUMWMT + 提交日期 YYYYMMDD + 当日 4 位序号,序号从
-ops.feed_items 已用最大值续(重启/重跑不重号)。
+五字段;price/ShippingWeight 裸 number。
 构造基底 = SPEC 响应预填的 MPItem[0].Item(官方模板),叠加我方字段。
+
+**本模块不生成 SKU**(2026-09-02,SKU 改造批次 2):跟卖 SKU 由
+`services/sku_codec.mint` 抽 12 位不透明码(跟卖表 B 列人工号优先不变,
+人工号走 `listing_sources.register` 登记)。旧的 `SKU_PREFIX` / `make_sku` /
+`next_serial_start`(PHUMWMT + 提交日期 + 当日 4 位序号,从 ops.feed_items
+续号)**已删**:① 把上架日期写进 SKU,与货源隐匿目标直接冲突;② 每轮重发
+取到新序号 ⇒ 载荷漂 ⇒ api/feeds 的 payload_key 在途防重失效;③ 留着它就是
+第二条发码路径(conventions §六:一个能力一条实现路径),而误用不会报错。
+存量 PHUMWMT 行不受影响:读路径全格式通吃,它们只在飞书 B 列与
+ops.feed_items 历史里。
 """
 
 import logging
 
 logger = logging.getLogger("services.match_feed")
-
-SKU_PREFIX = "PHUMWMT"      # 跟卖 SKU 固定前缀(旧系统实证样本)
 
 
 def spec_candidates(code: str) -> list[tuple[str, str]]:
@@ -34,28 +39,6 @@ def spec_candidates(code: str) -> list[tuple[str, str]]:
     else:
         out.append(("gtin", v.zfill(14)))
     return out
-
-
-def next_serial_start(conn, date_str: str) -> int:
-    """输入:连接 + YYYYMMDD → 输出:今日下一个可用序号(跨店全局)。
-
-    从 ops.feed_items 已提交的跟卖 SKU 续号(权威台账,重启/重跑不重号;
-    序号有缺口无害,重号才致命——MP_ITEM_MATCH 按 sku REPLACE)。
-    """
-    with conn.cursor() as cur:
-        cur.execute("SELECT max(right(sku, 4)) FROM ops.feed_items "
-                    "WHERE feed_type = 'MP_ITEM_MATCH' AND sku LIKE %s",
-                    (f"{SKU_PREFIX}{date_str}%",))
-        row = cur.fetchone()
-    try:
-        return int(row[0]) + 1 if row and row[0] else 1
-    except (TypeError, ValueError):
-        return 1
-
-
-def make_sku(date_str: str, serial: int) -> str:
-    """输入:YYYYMMDD + 序号 → 输出:跟卖 SKU(旧系统实证格式)。"""
-    return f"{SKU_PREFIX}{date_str}{serial:04d}"
 
 
 def build_match_item(spec_raw: dict | None, sku: str, price, weight,

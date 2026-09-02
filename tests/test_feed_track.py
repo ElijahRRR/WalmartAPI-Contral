@@ -394,7 +394,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
     lock = threading.Lock()
 
     def _mk(label, first=False):
-        def _f():
+        def _f(execute=True):                    # 五个反哺器统一收 execute
             if first:                            # 每条链的头一个反哺器上会合
                 gate.wait()
             with lock:
@@ -402,7 +402,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
             return f"{label}:回写 1 行"
         return _f
 
-    def _boom():
+    def _boom(execute=True):
         gate.wait()          # 也要会合:秒退的话剩下三条永远凑不齐四个
         raise RuntimeError("飞书 90227")
 

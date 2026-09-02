@@ -245,27 +245,33 @@ def test_abandon_is_idempotent():
 def test_abandon_burns_only_for_amz_rows_and_only_for_burning_reasons():
     """码与 UPC 同寿命,但只有 amz 行的 source_key 才是 ASIN。
 
-    match 行的 source_key 是匹配 GTIN,拿它当 (店, ASIN) 去烧号会误伤别人的号;
-    upc_conflict 不烧是因为该号已被撞库处置标成 conflict,再烧一次会把"撞库"
-    这个真相盖掉。
+    match 行的 source_key 是匹配 GTIN,拿它当 (店, ASIN) 去烧号会误伤别人的号。
+    烧成什么状态**只看 _BURN_STATUS 这一张分派表**(批次 2 决策 D):
+    sku_locked→burned_lock、delete_verified→burned_delete、
+    upc_conflict→conflict(那个值的语义就是"号被别人占了",写 burned_* 反而把
+    "是谁先占了号"这条排障线索盖掉);sku_update 不烧。
     """
     conn = _Conn(abandon_row=("amz", "B0ABCDEFGH"))
     assert sku_codec.abandon(conn, "T1", "AK7QM2X9RT4W",
                              sku_codec.ABANDON_SKU_LOCKED) is True
-    assert conn.burns() and conn.burns()[0][1][1] == ["B0ABCDEFGH"]
+    assert conn.burns() and conn.burns()[0][1] == (
+        upc_pool.BURN_LOCK, ["T1"], ["B0ABCDEFGH"])
 
     match = _Conn(abandon_row=("match", "00842565531441"))
     assert sku_codec.abandon(match, "T1", "BK7QM2X9RT4W",
                              sku_codec.ABANDON_DELETE_VERIFIED) is True
     assert match.burns() == []                            # 只标不烧
 
+    # 撞库:批次 2 起**也烧**(决策 B:码与 UPC 一起换),状态写 conflict
     conflict = _Conn(abandon_row=("amz", "B0ABCDEFGH"))
-    sku_codec.abandon(conflict, "T1", "AK7QM2X9RT4W", sku_codec.ABANDON_UPC_CONFLICT)
-    assert conflict.burns() == []
+    sku_codec.abandon(conflict, "T1", "AK7QM2X9RT4W",
+                      sku_codec.ABANDON_UPC_CONFLICT)
+    assert conflict.burns()[0][1] == (upc_pool.CONFLICT, ["T1"], ["B0ABCDEFGH"])
     assert set(sku_codec._BURN_STATUS) == {sku_codec.ABANDON_DELETE_VERIFIED,
-                                           sku_codec.ABANDON_SKU_LOCKED}
-    assert set(sku_codec._BURN_STATUS.values()) == {upc_pool.BURN_DELETE,
-                                                    upc_pool.BURN_LOCK}
+                                           sku_codec.ABANDON_SKU_LOCKED,
+                                           sku_codec.ABANDON_UPC_CONFLICT}
+    assert set(sku_codec._BURN_STATUS.values()) == {
+        upc_pool.BURN_DELETE, upc_pool.BURN_LOCK, upc_pool.CONFLICT}
 
 
 def test_abandon_never_burns_on_sku_update():

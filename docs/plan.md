@@ -145,6 +145,49 @@ maintenance/list_new)→ 按域停旧切换。
 截断的行,收口后会扩大自动删除面);`ops.feed_items` 里同 (店, 身份键) 挂着
 多个不同 sku 的组数必须为 0(否则重试计数会归并、原本还能重试的行提前触顶)。
 
+### 2026-09-02 SKU 改造批次 2:写侧切换(唯一有行为变化的批次)
+
+**做了什么**(两块,见 `docs/sku_plan.md` §7 批次 2 与 `docs/sku_workplan/batch_2.md`):
+第一块 `list_new` 预备期 mint 真码 + 退役冷却 / 代际上限两道闸 + `-p limit=N`
+试点闸(commit `50a76a4`);第二块 **四个弃码点接线 + 跟卖侧换 mint + 决策 C/D
+落地 + feed_poll 认 --dry-run**。
+
+**所有者决策的最终取值**:
+
+- **A|停用(RETIRE)不弃码** —— 取默认。守门反向钉死 `product_clear` 不得调
+  `abandon`;problem_scan 的豁免仍未拍板,`product_clear` 头注已写明「可恢复窗口
+  ≈ 到下一轮 problem_scan 为止」,届时走弃码点 1 正常收尾。
+- **B|UPC 撞库 0101119 时码与 UPC 一起换** —— 取默认「换」。
+  `listing_sheet._mark_upc_conflicts` 一次 `abandon(reason=upc_conflict)`,拆掉
+  「撞库 → 同 SKU 换 UPC → 0101211 SKU_LOCKED → 自愈链」这个死循环;代价最坏
+  只是多耗一个免费的码(码空间 30^11),不换的代价是重演死循环 —— 代价不对称。
+- **C|派工闸对齐去重闸** —— 取默认「对齐」,但**只改 `alloc_push`**
+  (去掉 lifecycle 条件),`alloc_survey` 一个字不改(它答的是"有没有活货位",
+  2026-08-15 定稿仍成立)。两处都有反向守门,防的是"顺手统一"。
+- **D|烧号状态值与函数签名** —— 一次做完:`upc_pool.burn_for_retire` 与
+  `mark_conflict` 删除,烧号唯一函数 `burn(conn, pairs, status)`,状态只由
+  `sku_codec._BURN_STATUS` 给(delete_verified→`burned_delete`、
+  sku_locked→`burned_lock`、upc_conflict→`conflict`)。
+
+**顺手修掉的既有破口(定级最高的一条)**:`cli.py feed_poll --dry-run`
+**此前会真的烧号**。链路:`feed_poll` 的 `DANGEROUS=False` ⇒ cli 恒传
+`execute=True`;它另行透传的 `params["dry_run"]` 从来没人读;五个反哺器也没有
+`execute` 形参。而本批还要往这条路上加**不可逆的弃码**。现在 `feed_poll` 自己读
+`dry_run`,五个反哺器统一收 `execute` 关键字,空跑一行飞书、一行 PG 都不写
+(守门 `test_every_reflector_takes_an_execute_flag` 拦"新增反哺器忘了加")。
+
+**跟卖侧的两个结构改动**:① `match_listing` 分两趟 —— 第一趟逐行 SPEC 预检
+(纯网络,**不开事务**),第二趟短事务里发码与登记、commit 早于 `submit_feed`
+(原工作包要求把整个循环包进一个事务,那会把几百次沃尔玛往返吊在一个 PG 事务上,
+mint 的行锁到整轮结束才释放);② B 列人工号**在提交前**登记 —— 提交成功才登记
+会让被拒的人工号成为维护链眼里的孤儿(落进 unknown,而 unknown 不参与任何自动
+动作 = 这批货永久退出自动化)。旧的 `PHUMWMT + 日期 + 序号` 生成器已删。
+
+**上线注意**:本批**改变生产行为**,试点按 `sku_plan.md` §7 批次 2 的七步走
+(先 `--dry-run` 人眼确认载荷,再 `list_new -p store=<店> -p limit=1` 真跑一个品);
+`feed_poll --dry-run` 也要先跑一次确认输出全带 `[DRY-RUN]`、PG 与飞书零写。
+新 DDL 一条:`listing_sources_abandoned_idx`(代际上限闸的 GROUP BY 用,幂等)。
+
 ## 1. 阶段划分
 
 ### Phase 0 — 地基(一次性)

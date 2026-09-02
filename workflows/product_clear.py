@@ -17,13 +17,19 @@
   G=失败/未查到 的行    → **不自动重试**(高危写操作;运营核对原因后清空 E 列
                           即重新排队——feeds 层 failed 记录允许同载荷重占)
 
-动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复);
+动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复窗口,见下);
 删除或 **C 列留空 → DELETE_ITEM**(永久,仅自发货)。提交走 api/feeds 唯一通道
-⚠「可恢复」在本系统里目前只是一个**窗口**(2026-09-02 记):problem_scan 的扫描面
-是 published_status 非 PUBLISHED 且 missing_since IS NULL、**无 lifecycle 豁免**,
+⚠「可恢复」在本系统里目前只是一个**窗口 ≈ 到下一轮 problem_scan 为止**
+(2026-09-02 记):problem_scan._SQL_ITEMS(workflows/problem_scan.py:77-83)按
+published_status 非 PUBLISHED 且 missing_since IS NULL 扫、**无 lifecycle 豁免**,
 在途只挡 48h,而退市档案的观测形态正是 UNPUBLISHED + end date has passed ⇒ 停用的品
-一到两轮就会被自动链建议 DELETE。要让停用真正可恢复,须给 problem_scan 加豁免
-(SKU 改造决策 A,尚未拍板;默认值 = RETIRE 不弃码、豁免另议,即本注所述情形)。
+一到两轮就会被自动链建议 DELETE;届时走弃码点 1(DELETE 经观测核验)正常收尾。
+要让停用真正长期可恢复,须给 problem_scan 加豁免(SKU 改造决策 A,尚未拍板;
+默认值 = 豁免另议)。
+⚠ **RETIRE 本身不弃码**(决策 A 默认,conventions §九):码与 UPC 都还活着,
+登记簿 abandoned_at 保持 NULL —— 沃尔玛侧那条记录仍在、仍绑着我们的 UPC,
+抽新码去重上 = 同店两条同内容记录 + 白烧一个 UPC。守门测试反向钉死本工作流
+**不得**调 services/sku_codec.abandon(弃码点只有四个,这里不是其中之一)。
 
 单店单日上限:优先读上下架限额表(registry.RETIRE_LIMITS,按店铺分行,
 「下架限制」列);店铺不在表内退 -p limit 默认值并**告警**(旧系统静默兜底

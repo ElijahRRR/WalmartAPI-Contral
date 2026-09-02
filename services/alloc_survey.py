@@ -188,6 +188,13 @@ GROUP BY 1 ORDER BY 2 DESC, 1
 # 反查:全表级取数拿十万对去 unnest 是另一回事(分工写在
 # services/sku_asin 的模块 docstring 里)。存量 amz 行 source_key = sku,
 # 未登记行与非 amz 行都回落裸 sku,enrich 的结果逐行不变。
+# ⚠ **本条 SQL 在 SKU 改造批次 2 一个字都没改**(所有者决策 C 拍死):
+# workflows/alloc_push._SQL_ONLINE 自 2026-09-02 起改按「码是否弃用」判、
+# 去掉了 lifecycle 条件,本函数**不跟**。两条答的不是一个问题:alloc_push 答
+# "该不该给运营派新活"(那里的危险是复活退市档案),本函数答"占用/冲突里
+# 这家店有没有活货位"(退市行不是活货位,把它算成活货位会让占用组与冲突组
+# 凭空多出一批)。两处都不触发破坏动作,判据分开是安全的,合并才会打破
+# 2026-08-15 的定稿 —— 不要顺手统一。
 _SQL_ONLINE = """
 SELECT w.store, w.sku, w.product_type, w.published_status, ls.source_key
 FROM catalog.walmart_items w

@@ -4,6 +4,8 @@
 重发同一 SKU 也失败——所以链路必须是 RETIRE → 24h 冷却 → 清列 → 新行重上。
 """
 
+import pytest
+
 from workflows import sku_locked_heal as heal
 
 
@@ -13,7 +15,7 @@ class _Conn:
     def __init__(self, state=()):
         self.sqls: list = []
         self._state = list(state)
-        self.rowcount = 1        # burn_for_retire 读 rowcount
+        self.rowcount = 1        # upc_pool.burn 读 rowcount
 
     def cursor(self):
         return self
@@ -133,8 +135,15 @@ def test_open_cooldown_not_resubmitted_and_failed_needs_human(monkeypatch):
     assert "人工处置" in out and "B0FAILED" in out
 
 
-def test_ripe_success_clears_row_failed_marks(monkeypatch):
-    """冷却期满:回执成功清列重上;回执失败标 failed;未到继续等。"""
+def test_ripe_success_abandons_the_code_and_burns_the_upc(monkeypatch):
+    """冷却期满:回执成功 ⇒ **弃码**(reason=sku_locked)+ 清列重上;
+    回执失败标 failed 不弃码;未到继续等。
+
+    弃码点 2 是四点中唯一绑回执的一个(锁死的 SKU 可能从未进过 walmart_items,
+    没有观测可等)。烧号在 abandon 内部:它按登记簿把码翻回 ASIN 再烧 ——
+    裸烧的话第二元是冷却表里的 SKU 码,切码后与 upc_pool 的 (店, ASIN) 领号键
+    匹配恒空、**静默失效**,下一轮 claim 把旧号原样复用回来必撞 0101119。
+    """
     rows = [_row(2, asin="B0DONE"), _row(3, asin="B0BAD"),
             _row(4, asin="B0WAIT")]
     state = [("T1", "B0DONE", "FR1", None, "pending", True),
@@ -155,12 +164,65 @@ def test_ripe_success_clears_row_failed_marks(monkeypatch):
     monkeypatch.setattr(heal.feeds, "submit_feed",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("在途冷却不该再提交")))
+    abandoned = []
+    monkeypatch.setattr(heal.sku_codec, "abandon",
+                        lambda c, store, sku, reason: (
+                            abandoned.append((store, sku, reason)), True)[1])
     out = heal.run({"execute": True})
     assert cleared == [2]                       # 只有回执成功的行被清列
     closes = [args for sql, args in conn.sqls if "UPDATE listing.retire_cooldown" in sql]
     assert ("cleared", "T1", "B0DONE") in closes
     assert ("failed", "T1", "B0BAD") in closes
+    # 弃码只发生在回执成功那一行,原因 = sku_locked(四个弃码点各有各的词)
+    assert abandoned == [("T1", "B0DONE", heal.sku_codec.ABANDON_SKU_LOCKED)]
+    assert "弃码 1 个" in out and "burned_lock" in out
     assert "清列重上 1 行" in out and "回执未到 1 条" in out and "回执失败 1 条" in out
+
+
+def test_failed_receipt_never_abandons(monkeypatch):
+    """回执失败:标 failed 点名人工,**零弃码零烧号、不清列**。
+
+    写操作永不自动兜底 —— RETIRE 没成功就说明沃尔玛侧那条记录还在、还绑着
+    我们的 UPC,弃了码下一轮就是拿新码新号去上一个还活着的 item。
+    """
+    rows = [_row(2, asin="B0BAD")]
+    conn = _patch_common(monkeypatch, rows,
+                         state=[("T1", "B0BAD", "FR2", None, "pending", True)])
+    monkeypatch.setattr(heal.feed_track, "item_results",
+                        lambda fid: {"B0BAD": ("failed", "ERR_X")})
+    monkeypatch.setattr(heal.feed_track, "poll_feed",
+                        lambda store, fid: (None, None))
+    monkeypatch.setattr(heal.listing_sheet, "clear_for_relist",
+                        lambda rownums, execute: pytest.fail("失败回执不许清列")
+                        if rownums else 0)
+    monkeypatch.setattr(heal.sku_codec, "abandon",
+                        lambda *a, **k: pytest.fail("失败回执不许弃码"))
+    monkeypatch.setattr(heal.feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("冷却中不该再提交")))
+    out = heal.run({"execute": True})
+    assert "回执失败 1 条" in out and "弃码" not in out
+    assert ("failed", "T1", "B0BAD") in [
+        args for sql, args in conn.sqls if "UPDATE listing.retire_cooldown" in sql]
+
+
+def test_cooldown_hours_comes_from_the_codec_constant(monkeypatch):
+    """不传 -p cooldown_hours 时用的是 `sku_codec.RETIRE_COOLDOWN_HOURS`。
+
+    此前这个数长在 params 默认值里;list_new 的退役冷却闸泛化出第二个消费方
+    之后,两处各写一个 24 就是两份真相,一漂就没人说得清冷却到底几小时。
+    """
+    conn = _patch_common(monkeypatch, [_row(2)], state=[])
+    monkeypatch.setattr(heal.feeds, "submit_feed",
+                        lambda *a, **k: [{"outcome": "submitted",
+                                          "feed_id": "FR1", "count": 1}])
+    monkeypatch.setattr(heal.product_events, "record_many", lambda c, evs: len(evs))
+    heal.run({"execute": True})
+    opens = [args for sql, args in conn.sqls if "retire_cooldown WHERE status" in sql]
+    assert opens == [(heal.sku_codec.RETIRE_COOLDOWN_HOURS,)]
+    heal.run({"execute": True, "cooldown_hours": "6"})      # 显式传仍然生效
+    assert (6,) in [args for sql, args in conn.sqls
+                    if "retire_cooldown WHERE status" in sql]
 
 
 # ── (店铺, SKU) 五个键同源(2026-09 SKU 改造批次 1)────────────────────────
@@ -213,13 +275,15 @@ def test_cooldown_keys_and_row_lookup_share_one_source(monkeypatch):
     monkeypatch.setattr(heal.listing_sheet, "clear_for_relist",
                         lambda rownums, execute: (cleared.extend(rownums),
                                                   len(rownums))[1])
-    burned = []
-    monkeypatch.setattr(heal.upc_pool, "burn_for_retire",
-                        lambda c, pairs: (burned.extend(pairs), len(pairs))[1])
+    abandoned = []
+    monkeypatch.setattr(heal.sku_codec, "abandon",
+                        lambda c, store, sku, reason: (
+                            abandoned.append((store, sku)), True)[1])
     monkeypatch.setattr(heal.feeds, "submit_feed",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("两行都在冷却中,不该再提交")))
     out = heal.run({"execute": True})
     assert cleared == [2]                    # 按真码找回了自己那一行
-    assert burned == [("T1", "A0X1Y2Z3W4V5")]   # 烧号键 = 冷却表里那个键,同源
+    # 弃码键 = 冷却表里那个键(同源);ASIN 那一跳在 abandon 内部走登记簿
+    assert abandoned == [("T1", "A0X1Y2Z3W4V5")]
     assert "冷却中 2" in out

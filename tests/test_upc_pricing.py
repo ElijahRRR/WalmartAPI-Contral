@@ -97,15 +97,27 @@ def test_claim_reuses_prior_upc_for_same_store_asin():
     assert upd_rows == [("T1", "B0NEW", "000000000024")]     # 复用行不再 UPDATE
 
 
-def test_burn_for_retire_marks_conflict():
-    """RETIRE 成功后旧号永久弃用(标 conflict):不烧的话 claim 的复用逻辑
-    会把旧号还给同 (店,ASIN),"清列重上领新号"就成了空话。"""
+def test_burn_writes_the_status_it_is_given_and_refuses_anything_else():
+    """烧号**只有 `burn(conn, pairs, status)` 一条实现路径**(批次 2 决策 D:
+    旧 burn_for_retire 与按单号写 conflict 的 mark_conflict 都已删)。
+
+    状态由 sku_codec 的弃码原因分派表给,本函数不猜;传个没登记的字样进来
+    直接抛 —— 池表投影与 pool_stats 里多出一支没人认识的状态是静默的。
+    不烧的后果:claim 的原号复用把旧号还给同 (店,ASIN),"清列重上领新号"
+    就成了空话。
+    """
+    import pytest as _pytest
     conn = _Conn()
-    assert upc_pool.burn_for_retire(conn, [("T1", "B0X")]) == 1
-    sql, _ = conn.sqls[0]
-    assert "status = 'conflict'" in sql
+    assert upc_pool.burn(conn, [("T1", "B0X")], upc_pool.BURN_LOCK) == 1
+    sql, args = conn.sqls[0]
+    assert "SET status = %s" in sql                       # 状态是参数,不写死
+    assert args[0] == upc_pool.BURN_LOCK
     assert "status IN ('claimed', 'used')" in sql
-    assert upc_pool.burn_for_retire(conn, []) == 0
+    assert upc_pool.burn(conn, [], upc_pool.BURN_DELETE) == 0
+    with _pytest.raises(ValueError):
+        upc_pool.burn(conn, [("T1", "B0X")], "used")      # 非法状态 fail loud
+    assert not hasattr(upc_pool, "burn_for_retire")       # 单一路径:旧名已删
+    assert not hasattr(upc_pool, "mark_conflict")
 
 
 def test_burn_statuses_are_registered_in_schema_and_labels():
@@ -120,7 +132,7 @@ def test_burn_statuses_are_registered_in_schema_and_labels():
     assert upc_pool.BURN_LOCK == "burned_lock"
     assert upc_pool.STATUS_CN[upc_pool.BURN_DELETE] == "删除烧号"
     assert upc_pool.STATUS_CN[upc_pool.BURN_LOCK] == "锁死烧号"
-    assert upc_pool.STATUS_CN["conflict"] == "冲突"          # 撞库的语义没被挪用
+    assert upc_pool.STATUS_CN[upc_pool.CONFLICT] == "冲突"   # 撞库的语义没被挪用
     schema = _p.Path("refdata/schema.sql").read_text(encoding="utf-8")
     pool = schema[schema.index("CREATE TABLE IF NOT EXISTS catalog.upc_pool"):]
     assert "burned_delete/burned_lock" in pool.splitlines()[2]   # status 行内注释

@@ -258,6 +258,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_live_uidx
 CREATE INDEX IF NOT EXISTS listing_sources_live_key_idx
     ON catalog.listing_sources (store, source_type, source_key)
     WHERE abandoned_at IS NULL AND replaced_by IS NULL;
+-- 代际上限闸用(SKU 改造批次 2):list_new 每轮按 (店, 来源, 源头键) 数**已弃码
+-- 行数**,达 sku_codec.MAX_SKU_GENERATIONS 就不再自动换码重上、交人工。不带索引
+-- 就是每轮全表扫 listing_sources。局部条件写 IS NOT NULL 而不是全表索引:活码行
+-- 是绝大多数,把它们装进这个索引没有任何查询会用到。幂等(与上面三条索引一样,
+-- 名字与条件一处定死,后续批次一律引用、不许 DROP/CREATE)。
+CREATE INDEX IF NOT EXISTS listing_sources_abandoned_idx
+    ON catalog.listing_sources (store, source_type, source_key)
+    WHERE abandoned_at IS NOT NULL;
 -- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
 -- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
 -- ⚠ 本处判型与 workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串

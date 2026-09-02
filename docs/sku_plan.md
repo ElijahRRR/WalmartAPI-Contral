@@ -153,7 +153,7 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
 | `workflows/list_new.py:705-731` `_FAMILY_LISTED_SQL` | 变体组查同族已在架 | 变体组决策退化 | 批次 2 |
 | `services/listing_sheet.sync_from_ledger` 台账三个 dict | 回执找回行 | 回执三列永不回填 | ✅ 批次 1:改 `row_sku` |
 | `services/listing_sheet.heal_unknown` | 是否上架=Unknown 自愈 | 行永久卡 Unknown,UPC 永久占用 | ✅ 批次 1:台账/目录按 `row_sku`,UPC 池按 (店, ASIN),键已拆开 |
-| `services/listing_sheet._mark_upc_conflicts` | UPC 撞库标记 | 撞库的号永不标 conflict,反复领到坏号 | ✅ 批次 1:反查键改 **(店铺, ASIN)**(本批唯一有意的差异) |
+| `services/listing_sheet._mark_upc_conflicts` | UPC 撞库标记 | 撞库的号永不标 conflict,反复领到坏号 | ✅ 批次 1:池反查键改 **(店铺, ASIN)**;✅ 批次 2(决策 B):入参改 (店, **行上 SKU**),一次 `abandon(reason=upc_conflict)` 弃码 + 烧号,SKU→ASIN 那一跳由 abandon 走登记簿 |
 | `workflows/sku_locked_heal.py` 五个 (店, SKU) 键 | RETIRE 用 `r["asin"]` 当 SKU | **退役发的是 ASIN,退不到/退错** | ✅ 批次 1:五处同源走 `row_sku`;烧号键取自冷却表 |
 | `workflows/list_new.py` + `listing_sheet.heal_unknown` 的 `mark_used` | UPC 池 `sku` 列 | 列名叫 SKU 实际存 ASIN(现状已如此,切换后必须定口径) | ✅ 批次 1:改传 `row_sku`(批次 1 值仍是 ASIN) |
 | `workflows/list_new.py:603/608/1053/1057` | 载荷 `sku=r["asin"]`(真跑 + check_spec 预检两条路) | 这是原点,两条路必须一起改 | 批次 2 |
@@ -310,10 +310,14 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
   `missing_since IS NULL AND abandoned_at IS NULL`,键 `coalesce(source_key, sku)`;
   **不加 lifecycle 条件**——RETIRED 行只要码未弃就拦,退市档案不由 list_new 复活
   (2026-08-28 定稿:退市档案不许被自动链批量复活,plan.md:166)。
-  `alloc_push._SQL_ONLINE` 排 RETIRED 的口径与去重闸不一致,但对抗验证指出派工
-  去重键是**全表 ASIN 单列、不带店铺**(`append_assignments`),表里出现过的 ASIN
-  不会被重复写入,所以不一致的实际后果只是"新 ASIN 被派、list_new 拦"——
-  **决策 C** 降为建议对齐、非阻塞;派工去重不带店铺是既有口径差,另记。
+  `alloc_push._SQL_ONLINE` **已于批次 2 对齐**(决策 C):去掉 lifecycle 条件,
+  判据同为「没缺席 + 码还活着」——两处不同口径的可见后果是"退市未弃码的 ASIN
+  被分配链每天派一次、被上架链每天拦一次";反向的坑更贵(排 RETIRED + 复用
+  旧码 + 2028 endDate = 批量复活退市档案,plan.md:166)。
+  `services/alloc_survey._SQL_ONLINE` **明确不改**:它答的是"占用/冲突里这家店
+  有没有活货位",退市行不是活货位(2026-08-15 定稿);两处各有反向守门。
+  派工去重键是**全表 ASIN 单列、不带店铺**(`append_assignments`),是既有口径差,
+  另记。
 - **护栏跟码走**:`_SQL_ATTEMPTS` 改按 (店, ASIN) 经登记簿 JOIN、按代际计(只数
   最近一次弃码之后的提交;无弃码事件则跨码累计);**代际上限**:同 (store,
   source_type, source_key) 弃码行数 ≥ 3 ⇒ list_new 写 N「换码次数达上限,待人工」;
@@ -494,17 +498,49 @@ source_key 就是回填的 asin,等号右边换成它结果相同)。
 不在批次 1 范围内。)
 存量行 SKU 列为空 ⇒ 回落 ASIN ⇒ 行为不变。
 
-**批次 2|写侧切换(唯一有行为变化的批次)**
-`SKU_SOURCE_LETTERS` 常量;`list_new._prep_rows` mint 挂 `r["_sku"]`,载荷/
-`mark_used`/事件/登记/V 列回写全改 `r["_sku"]`(两条路:真跑 + check_spec);
-`match_listing` 的 `make_sku` 换 mint(B 列人工优先保留);dry-run 占位码;
-四个弃码点接 `codec.abandon`(§5.3);24h 冷却泛化为 list_new 闸门;代际上限;
-守门测试反向钉死非弃码点不得调 abandon;测试钉"载荷 sku ≠ asin 且 = 登记簿里
-那个"、"串行补试两次载荷一字不差"。
+**批次 2|写侧切换(唯一有行为变化的批次)** —— ✅ **已实现**(两块)
+
+第一块(commit `50a76a4`):`SKU_SOURCE_LETTERS` 常量;`list_new._prep_rows`
+在 ThreadPoolExecutor 之前单事务顺序 mint 挂 `r["_sku"]`,载荷 / `mark_used` /
+事件 / 登记 / SKU 列回写全改 `r["_sku"]`(真跑 + check_spec 两条路);
+dry-run 用 `DRYRUN_PLACEHOLDER` 不写库;**两道新闸**(退役冷却 / 代际上限,
+阈值唯一出处 `sku_codec.RETIRE_COOLDOWN_HOURS` 与 `MAX_SKU_GENERATIONS`);
+**`-p limit=N` 试点闸**(缺省 None = 与改造前逐字一致;截断在全部闸门与数据
+过滤之后,被淘汰行不占名额)。
+
+第二块(本次):
+- **四个弃码点全部接 `sku_codec.abandon`**(§5.3):
+  ① `catalog_sync` —— `product_events.verify_deletions` 返回第三元
+  (生效的 (店, SKU) 名单),弃码与 `delete_verified` 事件**同一事务**;
+  ② `sku_locked_heal` —— RETIRE 回执成功 + 冷却期满处,`burn_pairs` 改
+  `abandon_pairs`(冷却表里存的是 SKU 码,ASIN 那一跳由 abandon 走登记簿完成;
+  裸烧号在切码后匹配恒空、静默失效),`cooldown_hours` 默认值改读常量;
+  ③ `listing_sheet._mark_upc_conflicts` —— **决策 B 落地**:入参第二元改成
+  `row_sku(r)`,一次 abandon 把码弃掉、号由分派表烧成 `conflict`,不再另调
+  `mark_conflict`;④ 改码留给批次 3(常量与"不烧号"分支已在位且被守门钉着
+  零调用)。
+- **决策 D 落地**:`upc_pool.burn_for_retire` 与 `mark_conflict` **删除**,烧号
+  唯一函数 `burn(conn, pairs, status)`,状态只由 `sku_codec._BURN_STATUS` 给
+  (delete_verified→burned_delete、sku_locked→burned_lock、upc_conflict→conflict)。
+- **`match_listing` 分两趟**:第一趟纯网络(逐行 SPEC 预检 + 两道闸,**不开
+  事务**),第二趟短事务里发码与登记(B 列人工号优先并在**提交前** register,
+  留空的行 mint),commit 早于 `submit_feed`;提交成功后不再登记。
+  `match_feed` 的 `SKU_PREFIX` / `make_sku` / `next_serial_start` **已删**
+  (守门钉住第二条发码路径不许复活)。
+- **决策 C 落地**:`alloc_push._SQL_ONLINE` 去掉 lifecycle 条件、与去重闸同口径;
+  `alloc_survey._SQL_ONLINE` **一个字不改**(两处都有反向守门)。
+- **修既有破口**:`feed_poll` 从此认 `--dry-run` —— 它 `DANGEROUS=False`、cli 恒
+  传 `execute=True`,而反哺器里有不可逆的 PG 写(弃码 + 烧号 + UPC 标已用)。
+  五个反哺器统一加 `execute` 关键字,空跑一行飞书、一行 PG 都不写。
+- DDL:`listing_sources_abandoned_idx`(部分索引,代际上限闸的 GROUP BY 用)。
+- 守门四组新断言:弃码调用点白名单 = 四处、五个破坏/清理链反向零弃码、
+  `sku_update` 零调用且不烧号、冷却与代际两个常量各只有一个出生地;另加
+  第二条发码路径零复活、回执码零字面量、新索引在位。
+
 切换是全店同时的(码里没有店维配置),**试点靠 dry-run + 单店单品**:
 1. `list_new --dry-run -p check_spec=1` 看载荷 sku 是占位码、其余字段正常;
-2. 挑一家店、上架表只留一行待上,真跑 1 个品(`list_new` 目前无 limit 参数,
-   要么加 `-p limit=`,要么手工只留一行);
+2. 挑一家店真跑 1 个品:`list_new -p store=<店> -p limit=1`(`-p limit=N`
+   由本批交付,不必再手工删行);
 3. `catalog_sync -p store=<店>` → 在线产品总表看到新 SKU 与来源码;上架表 V 列有值;
 4. **`maintenance_scan -p preview=1 -p store=<店>` 必须能看见这个品**——批次 0
    的 SQL 收口做没做对的唯一实测;
@@ -549,16 +585,20 @@ order_line_id"的体检告警兜住。
 - [x] **码的寿命**:复用到显式弃码(§5.3 四个弃码点,2026-09-02 工作流定稿)。若坚持"每次重上新码",
       须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
 - [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3。
-- [ ] **决策 A|停用要不要成为真正可恢复态**:给 problem_scan 加「lifecycle=RETIRED
+- [ ] **决策 A|停用要不要成为真正可恢复态**(批次 2 按默认实现:**RETIRE 不弃码**,
+      守门反向钉死 `product_clear` 不得调 abandon;problem_scan 豁免仍未拍板,
+      `workflows/product_clear.py` 头注已写明「可恢复窗口 ≈ 到下一轮 problem_scan」):给 problem_scan 加「lifecycle=RETIRED
       且本仓提交过 retire_submitted」豁免(推翻 08-28「非 PUBLISHED 一律删除」的一
       部分)+ RETIRE 不弃码(推荐);或不豁免、改采「停用回执成功即弃码」简化版
       (永久失去可恢复,每次停用烧一个 UPC,且违背"不信回执信观测")。
-- [ ] **决策 B|撞库 0101119 时码与 UPC 一起换**(推荐换):改变 08-09「撞库只是
+- [x] **决策 B|撞库 0101119 时码与 UPC 一起换**(取默认「换」,**批次 2 已落地**):
+      `listing_sheet._mark_upc_conflicts` 一次 `abandon(reason=upc_conflict)`,
+      号仍烧成 `conflict`(那个值的语义就是"号被别人占了")。改变 08-09「撞库只是
       UPC 被占、照常领新号重试」的机制;不换有重演 SKU_LOCKED 死循环的风险,换最坏
-      只是多耗一个免费的码。
-- [ ] **决策 C|alloc_push 派工口径对齐去重闸**(建议对齐,非阻塞):退市且未弃码
-      的 ASIN 从「该派工」变「等 delete_verified 后派工」;不对齐则新 ASIN 被派、
-      list_new 每轮拦并写理由(派工去重键是全表 ASIN,已在表里的不会重复写入)。
+      只是多耗一个免费的码(码空间 30^11)。
+- [x] **决策 C|alloc_push 派工口径对齐去重闸**(取默认「对齐」,**批次 2 已落地**):
+      只改 `alloc_push`(去掉 lifecycle 条件),`alloc_survey` 明确不改 —— 两条答的
+      不是一个问题,两处都有反向守门钉着。
 - [ ] **批次 2 前单品实测**(所有者机器):停用后该 SKU 在 GET items 里是缺席还是
       RETIRED 可见;缺席/退役后同码同 UPC 重发 MP_ITEM 是复活同一 item、被拒还是
       新建(官方无明文,本仓与旧仓无一条实测);MP_MAINTENANCE 最小载荷改 endDate
@@ -573,10 +613,14 @@ order_line_id"的体检告警兜住。
       【0b:代码分第二个 PR,建完列再合 —— 建列前程序载荷里没有这一列,
       零 WARNING 零重推;合并后第一次 push 全量重推一次是预告不是故障】
 - [ ] **UPC 池表 E 列「SKU」口径**:改存真 SKU(ASIN 另列)还是保持现状。
+      【默认 (a) 不加列:E 列 = `catalog.upc_pool.sku` 的投影,批次 2 起显示真码;
+      领号复用键仍是 `upc_pool.asin`。烧号新增两个状态文案「删除烧号/锁死烧号」】
 - [x] **四个来源字母**(所有者 2026-09-02):amz=A、跟卖 match=B、1688=C、自建 self=H。
 - [ ] **黑名单 `or sku` 兜底口径**:订单链是"提不出留 NULL",黑名单链是"原文
       兜底"。切换后原文兜底 = 往黑名单灌随机码;建议统一到"登记簿查不到就
       不入选",但这会改变拦截行为,要你拍板。
       【0b 默认:保持原文兜底,加日志计数 + 回填侧 `opaque` 只读计数;见 D-0b-1】
-- [ ] **跟卖旧续号**(`PHUMWMT+日期+序号`)停用是否影响运营习惯(B 列人工优先不变)。
+- [x] **跟卖旧续号**(`PHUMWMT+日期+序号`)**已于批次 2 停用并删除**:B 列人工优先
+      不变(人工号在提交前 register 进登记簿),留空的行由 `sku_codec.mint` 发码。
+      存量 PHUMWMT 行不受影响(读路径全格式通吃)。
 - [ ] **退役表 B 列**:运营从此填的是随机码,是否要程序回显来源码。

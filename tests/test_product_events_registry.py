@@ -73,3 +73,22 @@ def test_no_stray_event_literals_in_emitters():
             if re.search(r"\"event\":\s*\"[a-z_]+\"", line):
                 bad.append(f"{f}:{i}: {line.strip()}")
     assert not bad, "事件名用 product_events 常量,别写字面量:\n" + "\n".join(bad)
+
+
+def test_receipt_code_constants_match_the_derived_set():
+    """回执码具名常量 == `{kind}_feed_{status}` 推导出来的那两个串(B2-32)。
+
+    回执事件码在仓内是推导出来的、本身没有名字,于是「事件码常量唯一出处」
+    这条纪律在这一处天然破功 —— 而 _FEED_KIND 一改取值,写字面量的那条 SQL
+    会**静默返回空集**(list_new 的退役冷却闸、本模块的删除核验起点都读它)。
+    补两个具名常量是最小修法:不新增能力,只给已经存在的字符串一个名字。
+    """
+    from services import product_events as pe
+
+    assert pe.RETIRE_FEED_SUCCESS == f"{pe._FEED_KIND['RETIRE_ITEM']}_feed_success"
+    assert pe.DELETE_FEED_SUCCESS == f"{pe._FEED_KIND['DELETE_ITEM']}_feed_success"
+    assert pe.RETIRE_FEED_SUCCESS in pe.EVENTS
+    assert pe.DELETE_FEED_SUCCESS in pe.EVENTS
+    # 删除核验的 SQL 由常量拼成,三处事件码一个字面量都不剩
+    assert f"event = '{pe.DELETE_FEED_SUCCESS}'" in pe._VERIFY_SQL
+    assert f"'{pe.DELETE_VERIFIED}', '{pe.DELETE_NOT_EFFECTIVE}'" in pe._VERIFY_SQL

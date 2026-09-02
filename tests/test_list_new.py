@@ -304,7 +304,11 @@ def test_feed_track_error_text_shape():
 
 
 def test_upc_conflict_marked_orthogonally(monkeypatch):
-    """ERR_EXT_DATA_0101119:UPC 全站撞库 → 池标冲突永久弃用(与主分类正交)。"""
+    """ERR_EXT_DATA_0101119:UPC 全站撞库 → **码与 UPC 一起换**(与主分类正交)。
+
+    反查键是 (店铺, **该行 SKU**):弃码按 (店, SKU) 定位登记簿行,拿 ASIN 去弃
+    切码后必然落空(登记簿主键是 (store, sku))。SKU 列为空的存量行回落 ASIN。
+    """
     monkeypatch.setattr(resources, "LISTING_SHEET",
                         Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
                                     columns=resources.LISTING_SHEET.columns))
@@ -320,10 +324,69 @@ def test_upc_conflict_marked_orthogonally(monkeypatch):
                         lambda fid: {asin: {"EXT_DATA_ERROR_9", "ERR_EXT_DATA_0101119"}})
     marked = []
     monkeypatch.setattr(listing_sheet, "_mark_upc_conflicts",
-                        lambda a: (marked.extend(a), len(a))[1])
+                        lambda a, ex=True: (marked.extend(a), len(a))[1])
     out = listing_sheet.sync_from_ledger()
-    assert marked == [("T1", asin)]     # 反查键 = (店铺, ASIN),不是 SKU
-    assert "UPC 撞库 1 个已标冲突" in out
+    assert marked == [("T1", asin)]     # 存量行 SKU 列空 ⇒ row_sku 回落 ASIN
+    assert "UPC 撞库 1 个已弃码" in out
+
+    # SKU 列有值的行:台账/报错码按真码找,传下去的也是**真码**,不是 B 列 ASIN
+    marked.clear()
+    code = "A0X1Y2Z3W4V5"
+    rows[0]["sku"] = code
+    rows[0]["list_result"] = "处理中"
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {code: ("failed", "ERR_EXT_DATA_0101119")})
+    monkeypatch.setattr(feed_track, "item_codes",
+                        lambda fid: {code: {"ERR_EXT_DATA_0101119"}})
+    listing_sheet.sync_from_ledger()
+    assert marked == [("T1", code)]
+
+
+def test_upc_conflict_swaps_both_the_code_and_the_number(monkeypatch):
+    """决策 B(所有者定稿 2026-09-02):撞库时**一次 abandon 把码弃掉、号顺手烧掉**
+    (烧号在 abandon 内部,本函数不再自己写池状态)。
+
+    拆的是「撞库 → 同 SKU 换 UPC → 0101211 SKU_LOCKED → 自愈链」这个死循环:
+    沃尔玛端 SKU 绑死首个 UPC,同码换号重发必败(2026-08-19 生产实证)。
+    """
+    calls, burns = [], []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            self.sql = sql
+
+        def fetchall(self):
+            return [("T1", "B0ASIN0002")]      # 池里有它的号
+
+    monkeypatch.setattr(listing_sheet.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(listing_sheet.sku_asin, "resolve_many",
+                        lambda conn, pairs: {p: "B0ASIN0002" for p in pairs})
+    monkeypatch.setattr(listing_sheet.sku_codec, "abandon",
+                        lambda c, store, sku, reason: (
+                            calls.append((store, sku, reason)), True)[1])
+    n = listing_sheet._mark_upc_conflicts([("T1", "A0X1Y2Z3W4V5")])
+    assert n == 1
+    assert calls == [("T1", "A0X1Y2Z3W4V5",
+                      listing_sheet.sku_codec.ABANDON_UPC_CONFLICT)]
+    assert burns == []                 # 本函数不自己烧号(唯一路径在 abandon 内)
+
+
+def test_upc_conflict_dry_run_writes_nothing(monkeypatch):
+    """空跑只打印将弃码的对:弃码与烧号都不可逆,没有撤销路径。"""
+    monkeypatch.setattr(listing_sheet.db, "pg_conn",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("dry-run 不许连库")))
+    assert listing_sheet._mark_upc_conflicts([("T1", "A0X1Y2Z3W4V5")],
+                                             execute=False) == 0
 
 
 def test_failed_rows_requeue_until_cap(monkeypatch):
@@ -762,6 +825,111 @@ def test_heal_unknown_three_paths(monkeypatch):
     assert "M6:S6" not in w and "M6:P6" not in w  # 非 Unknown 不碰
     assert used == [("0011", a2)] and released == ["0022"]
     assert "确认在线 2" in out and "确认失败重排 1" in out and "继续观察 1" in out
+
+
+# ── feed_poll 认 --dry-run(批次 2 修既有破口)────────────────────────────────
+
+def _wire_feed_poll(monkeypatch):
+    """输入:无 → 输出:(feed_poll 模块, 写调用记录 dict)。
+
+    只留上架链(两个反哺器都真跑):不可逆的 PG 写(弃码 + 烧号 + UPC 标已用)
+    全在这条链上,另外三条只写飞书。
+    """
+    from workflows import feed_poll
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns,
+                                    headers=resources.LISTING_SHEET.headers))
+    monkeypatch.setattr(feed_poll, "_REFLECTOR_CHAINS", [
+        [("上架表", listing_sheet.sync_from_ledger),
+         ("上架表自愈", listing_sheet.heal_unknown)]])
+    monkeypatch.setattr(feed_poll.feed_track, "poll_all", lambda by: "轮询完毕")
+    monkeypatch.setattr(feed_poll.stores_svc, "load_stores",
+                        lambda names=None: [])
+    rows = [_sheet_row(2, feed_id="F1", listed="Yes", list_result="处理中",
+                       sku="A0X1Y2Z3W4V5"),
+            _sheet_row(3, listed="Unknown", sku="A0AAAABBBBCC")]
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda upto=None: rows)
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid: {"A0X1Y2Z3W4V5":
+                                     ("failed", "ERR_EXT_DATA_0101119")})
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+    monkeypatch.setattr(feed_track, "item_codes",
+                        lambda fid: {"A0X1Y2Z3W4V5": {"ERR_EXT_DATA_0101119"}})
+
+    class _C:
+        def cursor(self): return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def execute(self, sql, args=None):
+            self.sql = sql
+
+        def fetchone(self): return (1,)
+
+        def fetchall(self):
+            if "ops.feed_items" in self.sql:
+                return [("T1", "A0AAAABBBBCC", "F2", "success", "", None)]
+            if "SELECT store, asin, upc" in self.sql:      # 自愈:查 claimed
+                return [("T1", rows[1]["asin"], "0011")]
+            if "upc_pool" in self.sql:                     # 撞库:告警统计用
+                return [("T1", rows[0]["asin"])]
+            return []
+
+    monkeypatch.setattr(listing_sheet.db, "pg_conn",
+                        lambda: contextlib.nullcontext(_C()))
+    calls: dict[str, list] = {"sheet": [], "abandon": [], "used": [],
+                              "released": []}
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (calls["sheet"].extend(ups), len(ups))[1])
+    monkeypatch.setattr(listing_sheet.sku_codec, "abandon",
+                        lambda c, st, sk, why: (calls["abandon"].append((st, sk)),
+                                                True)[1])
+    monkeypatch.setattr(listing_sheet.sku_asin, "resolve_many",
+                        lambda conn, pairs: {p: rows[0]["asin"] for p in pairs})
+    monkeypatch.setattr(listing_sheet.upc_pool, "mark_used",
+                        lambda c, pairs: calls["used"].extend(pairs))
+    monkeypatch.setattr(listing_sheet.upc_pool, "release",
+                        lambda c, upcs, reason: calls["released"].extend(upcs))
+    return feed_poll, calls
+
+
+def test_feed_poll_dry_run_writes_nothing_anywhere(monkeypatch):
+    """`cli.py feed_poll --dry-run`:飞书零写、PG 零写(弃码/烧号/标已用全零)。
+
+    这是**修既有破口**:feed_poll 的 DANGEROUS=False ⇒ cli 恒传 execute=True,
+    而它此前根本不读 params["dry_run"],反哺器也没有 execute 形参 —— 于是
+    `feed_poll --dry-run` 会真的烧号,批次 2 还要往这条路上加不可逆的弃码。
+    """
+    feed_poll, calls = _wire_feed_poll(monkeypatch)
+    out = feed_poll.run({"execute": True, "dry_run": True})
+    assert calls == {"sheet": [], "abandon": [], "used": [], "released": []}
+    assert "[DRY-RUN]" in out and "将弃码 1 个" in out
+
+
+def test_feed_poll_real_run_still_writes(monkeypatch):
+    """反向钉住「别把闸装成常闭」:不带 --dry-run 时该写的一样都不少。"""
+    feed_poll, calls = _wire_feed_poll(monkeypatch)
+    out = feed_poll.run({"execute": True})
+    assert calls["abandon"] == [("T1", "A0X1Y2Z3W4V5")]     # 撞库弃码照发
+    assert calls["used"] == [("0011", "A0AAAABBBBCC")]      # UPC 标已用照发
+    assert calls["sheet"] and "[DRY-RUN]" not in out
+
+
+def test_every_reflector_takes_an_execute_flag():
+    """五个登记在册的反哺器**都收 execute 关键字**。
+
+    _one_chain 用统一调用形态 `sync(execute=execute)`;新增反哺器忘了加会在
+    这里被点名,而不是在生产上悄悄绕过 --dry-run(靠 inspect 判断谁认 execute
+    才是新的隐式约定)。
+    """
+    import inspect
+
+    from workflows import feed_poll
+    missing = [f"{label}:{fn.__module__}.{fn.__name__}"
+               for chain in feed_poll._REFLECTOR_CHAINS for label, fn in chain
+               if "execute" not in inspect.signature(fn).parameters]
+    assert not missing, "这些反哺器没有 execute 形参:" + ", ".join(missing)
 
 
 def test_prohibited_receipt_never_requeues():

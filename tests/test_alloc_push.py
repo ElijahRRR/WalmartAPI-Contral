@@ -91,15 +91,44 @@ def test_online_set_reads_the_registry_key(monkeypatch):
     assert "将追加 1 行" in out and "已在架 1" in out
 
 
-def test_online_set_still_excludes_retired(monkeypatch):
-    """反向钉死:0a **不做**决策 C 的第二步(去掉 lifecycle 过滤)。
+def test_online_set_matches_the_dedup_gate_wording():
+    """决策 C 落地(批次 2):派工闸与 list_new 去重闸**同一句判据** ——
+    没缺席 + 码还活着,**不筛 lifecycle**。
 
-    去掉它在存量数据上就立刻生效(catalog_sync 显式扫一轮 RETIRED,那批行
-    missing_since 为 NULL),是真行为变化,随批次 2 的弃码点接线一起上。
-    批次 2 对齐口径时再翻转这条断言。
+    两处不同口径的后果:退市但未弃码的 ASIN 被分配链每天派一次、被上架链
+    每天拦一次,运营看到一堆永远上不去的行。反向的坑更贵:排 RETIRED +
+    mint 复用旧码 + 载荷自带 2028 endDate = 对退市档案批量走官方 unretire
+    通道(plan.md:166 事故重演)。
     """
-    assert "coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'" \
-        in wf._SQL_ONLINE
+    from workflows import list_new as ln
+    assert "lifecycle" not in wf._SQL_ONLINE            # 判据从派工侧拿掉
+    for cond in ("missing_since IS NULL", "abandoned_at IS NULL"):
+        assert cond in wf._SQL_ONLINE and cond in ln._SQL_LISTED_ASINS, cond
+
+
+def test_alloc_survey_keeps_its_lifecycle_condition():
+    """反向钉死:alloc_survey **不跟着改**(所有者决策 C 拍死,两个口径故意不同)。
+
+    它答的是"占用/冲突里这家店有没有活货位",退市行不是活货位
+    (2026-08-15 所有者质疑与查证结论);顺手统一会让占用组与冲突组凭空多
+    出一批。
+    """
+    from services import alloc_survey as sv
+    assert "coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'" \
+        in sv._SQL_ONLINE
+
+
+def test_retired_but_unabandoned_asin_is_dispatched(monkeypatch):
+    """退市未弃码的行**照常算"已在架"**(不再因 lifecycle 被排掉)。
+
+    数据面用 online 桩表达:_SQL_ONLINE 现在会把这行选出来,于是它不进待派工。
+    """
+    _wire(monkeypatch,
+          held={"B0RETIRED1": "A085", "B0TODO0001": "A085"},
+          live={"A085"},
+          online=[("A085", "AZZZZ234567", "B0RETIRED1")])   # 退市但码还活着
+    out = wf.run({"execute": False})
+    assert "已在架 1" in out and "将追加 1 行" in out
 
 
 def test_abandoned_predicate_is_inert_while_no_code_is_abandoned(monkeypatch):

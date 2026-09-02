@@ -11,8 +11,11 @@ ERR_EXT_DATA_0101211 = 该 SKU 已绑死旧 UPC。旧实证(legacy_survey.md:166
 **不先退役直接换新 UPC 重发同一 SKU 也会失败**,唯一解是三步链:
   ① 对上架表 O=SKU_LOCKED 的行提交 RETIRE_ITEM(退役旧 offer)
   ② 24h 冷却(listing.retire_cooldown 表,状态权威在库)
-  ③ 回执成功 + 冷却期满 → 清列(K~M/O~Q 清空,N 写自愈标记)——
-     行变"新行",下一轮 list_new 按正常闸门链领**新 UPC** 重上
+  ③ 回执成功 + 冷却期满 → 清列(是否上架/feedid/上架日期/上架结果/报错/
+     feed查询日期 清空,未上架理由写自愈标记)+ **弃码**(唯一实现
+     services/sku_codec.abandon,reason=sku_locked:登记簿标 abandoned_at,
+     旧 UPC 同时烧成 burned_lock)—— 行变"新行",下一轮 list_new 领到的是
+     **新码 + 新 UPC**(码与 UPC 同寿命;SKU 列上的旧码已经死了)
 旧系统由 launchd retire_daily 23:30 干 ①,清列重上在 retire_and_relist;
 新系统合成一个 workflow,每天跑一次即可(① 与 ③ 同轮各自推进)。
 
@@ -21,7 +24,9 @@ ERR_EXT_DATA_0101211 = 该 SKU 已绑死旧 UPC。旧实证(legacy_survey.md:166
     产品事件 / 冷却期满回表找行,全部走 `listing_sheet.row_sku(r)`
     (上架表 SKU 列,为空回落 ASIN)。两侧不同源 = 同一 SKU 每轮重复提交
     RETIRE_ITEM,或冷却期满找不到行、行永久卡死 —— 两种都不报错。
-    烧号 `burn_pairs` 用的是冷却表里存下来的那个 SKU,同源自然成立。
+    弃码 `abandon_pairs` 用的是冷却表里存下来的那个 SKU,同源自然成立
+    (烧号在 abandon 内部按登记簿的 source_key 反查 ASIN 再烧 —— 冷却表里
+    存的是 SKU 码,直接拿它当 ASIN 去烧号在切码后匹配恒空、静默失效)。
   - 同 (店铺,SKU) 只允许一条在途冷却(retire_cooldown 部分唯一索引);
     crash 在提交后/落库前 → 下轮 feeds 层同载荷 dedup 返回同 feed_id 补落库
   - RETIRE 回执**失败**的冷却记录标 failed,**不自动重试**(写操作永不
@@ -36,8 +41,8 @@ import logging
 
 from api import _client, feeds
 from registry import db
-from services import feed_track, listing_sheet, product_events, \
-    store_retry, stores as stores_svc, upc_pool
+from services import feed_track, listing_sheet, product_events, sku_codec, \
+    store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -175,7 +180,9 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
                      f"{len(ripe)} 条,回执成功即清列重上")
         return lines
     clear_rows, waiting, failed = [], 0, []
-    burn_pairs: list[tuple[str, str]] = []   # RETIRE 成功即烧旧号(标 conflict)
+    # RETIRE 成功 + 冷却期满即**弃码**(码与 UPC 同寿命,唯一实现
+    # services/sku_codec.abandon);第二元是冷却表里那个 SKU,与清列/回执同源
+    abandon_pairs: list[tuple[str, str]] = []
     receipts: dict[str, dict] = {}
     for store_name, sku, feed_id, _at in ripe:
         if feed_id not in receipts:
@@ -199,10 +206,14 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
         if st[0] == "success":
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("cleared", store_name, sku))
-            # 旧号永久弃用(2026-08-19,配 claim 的原号复用逻辑):SKU 绑死过
-            # 它,退役后谁也不能再用;不烧的话下一轮 claim 会把它复用回来,
-            # "清列重上领新号"就成了空话
-            burn_pairs.append((store_name, sku))
+            # 弃码点 2(四点中唯一绑回执的一个:锁死的 SKU 可能从未进过
+            # walmart_items,没有观测可等)。旧号也永久弃用(2026-08-19,配
+            # claim 的原号复用逻辑):SKU 绑死过它,退役后谁也不能再用;不烧
+            # 的话下一轮 claim 会把它复用回来,"清列重上领新号"就成了空话。
+            # 烧号由 abandon 内部完成:它按登记簿把码翻回 ASIN 再烧,这一跳
+            # 是必须的 —— UPC 池的领号键是 (店, ASIN),拿不透明码去烧匹配
+            # 恒空,而且不报错。
+            abandon_pairs.append((store_name, sku))
             if row is not None:
                 clear_rows.append(row["rownum"])
             else:
@@ -213,11 +224,14 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("failed", store_name, sku))
             failed.append(f"{store_name}/{sku}({st[1]})")
-    if burn_pairs:
+    if abandon_pairs:
         with db.pg_conn() as conn:
-            n_burn = upc_pool.burn_for_retire(conn, burn_pairs)
-        if n_burn:
-            lines.append(f"  退役烧号 {n_burn} 个(标 conflict,重上必领新号)")
+            n_ab = sum(sku_codec.abandon(conn, s, k,
+                                         sku_codec.ABANDON_SKU_LOCKED)
+                       for s, k in abandon_pairs)
+        if n_ab:
+            lines.append(f"  弃码 {n_ab} 个(登记簿标 abandoned_at,旧 UPC 烧号 "
+                         f"burned_lock,重上必新码新号)")
     n = listing_sheet.clear_for_relist(clear_rows, execute)
     if n:
         lines.append(f"  清列重上 {n} 行(下一轮 list_new 领新 UPC 重提交)")
@@ -232,7 +246,10 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
 def run(params: dict) -> str:
     """输入:params(execute/store/cooldown_hours)→ 输出:退役+清列摘要。"""
     execute = bool(params.get("execute"))
-    cooldown_hours = int(params.get("cooldown_hours", 24))
+    # 冷却小时数的唯一出处是 sku_codec(list_new 的退役冷却闸读同一个常量);
+    # 此前它长在这行的默认值里,泛化成闸门后两处各写一个 24 就是两份真相
+    cooldown_hours = int(params.get("cooldown_hours",
+                                    sku_codec.RETIRE_COOLDOWN_HOURS))
 
     rows = listing_sheet.read_rows()
     locked = [r for r in rows if r["list_result"] == "SKU_LOCKED"]

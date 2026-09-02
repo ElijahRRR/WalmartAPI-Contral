@@ -116,6 +116,51 @@ _ABANDONED_AT_OK: dict[str, tuple[str, str]] = {
         "permanent", "_SQL_ONLINE:派工的「已在架」按活码算"),
 }
 
+#: ⑦ **四个弃码点**:允许出现 `sku_codec.abandon(...)` 调用的文件(批次 2)。
+#: 多一个点 = 沃尔玛侧还活着的记录被我们当成死的,下一轮新码新 UPC 去上同一个
+#: item(同店重复 listing,沃尔玛不会替你拦);少一个点 = 僵尸行永远挡着新码。
+#: 两种都是**静默**的 —— 没有任何回执会告诉你"你不该弃这个码"。
+#: 批次 3 会加第五行 workflows/sku_migrate.py(改码 SkuUpdate,弃码点 4)。
+_ABANDON_CALLERS_OK: dict[str, tuple[str, str]] = {
+    "services/sku_codec.py": (
+        "permanent", "abandon 的定义之家(弃码唯一实现;烧号分派表也在这里)"),
+    "workflows/catalog_sync.py": (
+        "permanent",
+        "弃码点 1:DELETE 经**观测核验**(delete_verified)后弃码,与事件同一"
+        "事务。**不是按回执弃**:「回执成功但后台没删」是所有者实证过的故障"
+        "模式(delete_not_effective),按回执弃码 = 下一轮拿新码新 UPC 去上一个"
+        "还活着的 item"),
+    "workflows/sku_locked_heal.py": (
+        "permanent",
+        "弃码点 2:SKU_LOCKED 自愈链 RETIRE 回执成功 + 冷却期满。四个点里唯一"
+        "绑回执的一个 —— 锁死的 SKU 可能从未进过 walmart_items,没有观测可等"),
+    "services/listing_sheet.py": (
+        "permanent",
+        "弃码点 3:ERR_EXT_DATA_0101119 撞库,码与 UPC 一起换(决策 B)。"
+        "拆的是「撞库 → 同 SKU 换 UPC → 0101211 → 自愈链」这个死循环"),
+}
+
+#: ⑧ **反向名单**:这些文件里 abandon 必须零出现(每条写清为什么绝不许弃码)。
+#: 它们全是"下架/清理/失明"类动作 —— 沃尔玛侧记录仍在、仍绑着我们的 UPC。
+_ABANDON_FORBIDDEN: dict[str, str] = {
+    "workflows/product_clear.py":
+        "停用(RETIRE)不弃码(决策 A 默认):可恢复,码与 UPC 都还活着;"
+        "真删了也要等 catalog_sync 的观测核验(弃码点 1)才算数",
+    "workflows/problem_product_cleanup.py":
+        "破坏动作的唯一出口,但它提交的 DELETE 同样按观测核验收尾 —— "
+        "在这里按回执弃码就是把弃码点 1 的判据搬到了回执上",
+    "workflows/maintenance.py":
+        "改价/改库存/清库存/改标题都不改变「这条记录还在不在」,与码的寿命无关",
+    "services/walmart_catalog.py":
+        "mark_missing 记的是**本轮没扫到**(缺席),不是删除:缺席行随时会"
+        "reappear(item_reappeared 是账本里的常规事件),弃了码它回来时就成了"
+        "同店两条同内容记录",
+    "services/feed_track.py":
+        "回执入账只记事实。提交失败/被拒/Unknown/PROHIBITED 一律不弃码:"
+        "沃尔玛侧那条记录可能已经建好了(Unknown 的定义就是不知道),"
+        "换码重上 = 白烧一个 UPC + 可能的重复 listing",
+}
+
 #: ④ 允许 UPDATE 登记簿的文件(弃码三列只有一个写者)。
 _LISTING_SOURCES_UPDATE_OK: dict[str, tuple[str, str]] = {
     "services/sku_codec.py": (
@@ -269,6 +314,181 @@ def test_the_registry_table_has_exactly_two_insert_sites():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ⑦⑧ 四个弃码点(批次 2 接线):正向白名单 + 反向名单
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _calls_abandon(path: Path) -> bool:
+    """输入:.py 路径 → 输出:**代码里**是否调用/导入了 abandon(不扫注释文档)。
+
+    射程只能是 AST:四个弃码点的邻居文件里到处都在**解释**为什么自己不弃码
+    (那正是我们要的文档),文本扫会把这些解释判成违规,于是白名单只能越写
+    越长,最后没人看得懂它守的是什么。
+    """
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == "abandon":
+            return True                      # 定义之家(sku_codec)也算"在场"
+        if isinstance(node, ast.Attribute) and node.attr == "abandon":
+            return True
+        if isinstance(node, ast.Name) and node.id == "abandon":
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+                a.name == "abandon" for a in node.names):
+            return True
+    return False
+
+
+def test_abandon_callers_are_the_four_points_only():
+    """弃码点**只有四个**,而且都在白名单里写清了判据(conventions §九)。
+
+    第五个弃码点出现时应该是有人在讨论后加进这张表,而不是某条链顺手调了一次
+    —— 弃码不可逆(登记簿没有撤销弃码的路径),而且错了不报错。
+    """
+    offenders = [rel for rel, path in _prod_files()
+                 if rel not in _ABANDON_CALLERS_OK and _calls_abandon(path)]
+    assert not offenders, _fmt(
+        offenders, "sku_codec.abandon 只允许在四个弃码点调用(conventions §九):")
+    # 反过来:白名单里登记的四个点必须真的还在调,否则那一条是该删的历史
+    stale = [rel for rel in _ABANDON_CALLERS_OK
+             if not _calls_abandon(ROOT / rel)]
+    assert not stale, _fmt(stale, "白名单登记了弃码点,但那个文件已经不调 abandon:")
+
+
+def test_destructive_workflows_never_abandon():
+    """反向钉死:停用/清理/维护/缺席/回执五条链**永不**弃码。
+
+    它们全是"下架"类动作 —— 沃尔玛侧记录仍在、仍绑着我们的 UPC,抽新码 =
+    同店两条同内容记录 + 白烧一个 UPC(sku_codec 模块头注 ②)。
+    """
+    offenders = [f"{rel}({why})" for rel, why in _ABANDON_FORBIDDEN.items()
+                 if _calls_abandon(ROOT / rel)]
+    assert not offenders, _fmt(offenders, "这些文件绝不许调 abandon:")
+
+
+def test_sku_update_reason_has_no_caller_yet():
+    """`REASON_SKU_UPDATE`(改码)在本批**全仓零调用**:唯一调用方是批次 3 的
+    workflows/sku_migrate.py。
+
+    常量与"不烧号"分支现在就存在且被测试覆盖,是为了批次 3 不另开第二条弃码
+    实现(双轨禁止)。批次 3 启用时必须**显式改掉这条断言** —— 改不掉就说明
+    有人提前接了线,而那会在没有迁码闭环的情况下把旧行标死。
+    """
+    offenders = [f"{rel}:{n}" for rel, path in _prod_files()
+                 if rel != "services/sku_codec.py"
+                 for n, line in enumerate(
+                     path.read_text(encoding="utf-8").splitlines(), 1)
+                 if "ABANDON_SKU_UPDATE" in line]
+    assert not offenders, _fmt(
+        offenders, "sku_update 是批次 3 的弃码原因,本批全仓零调用:")
+
+
+def test_sku_update_never_burns_a_upc():
+    """改码时 item 还在、UPC 还绑着 —— 烧号等于白烧一个号,还得再领一个。"""
+    assert sku_codec.ABANDON_SKU_UPDATE not in sku_codec._BURN_STATUS
+    assert set(sku_codec._BURN_STATUS) == {
+        sku_codec.ABANDON_DELETE_VERIFIED, sku_codec.ABANDON_SKU_LOCKED,
+        sku_codec.ABANDON_UPC_CONFLICT}
+
+
+def test_cooldown_and_generation_constants_have_one_home():
+    """退役冷却小时数与代际上限**各只有一个出生地**(services/sku_codec.py)。
+
+    两个消费方各写一个 24,一漂就没人说得清冷却到底几小时(而闸门看起来
+    照常工作)。此前 24 长在 sku_locked_heal 的 params 默认值里,list_new 的
+    退役冷却闸是第二个消费方 —— 泛化的那一刻必须收口。
+    """
+    home = "services/sku_codec.py"
+    assert sku_codec.RETIRE_COOLDOWN_HOURS == 24
+    assert sku_codec.MAX_SKU_GENERATIONS == 3
+    born = re.compile(r"^\s*(RETIRE_COOLDOWN_HOURS|MAX_SKU_GENERATIONS)\s*=")
+    offenders = [f"{rel}:{n} {line.strip()}" for rel, path in _prod_files()
+                 if rel != home
+                 for n, line in enumerate(
+                     path.read_text(encoding="utf-8").splitlines(), 1)
+                 if born.search(line)]
+    assert not offenders, _fmt(offenders, f"这两个常量只准在 {home} 出生:")
+    heal = (ROOT / "workflows" / "sku_locked_heal.py").read_text(encoding="utf-8")
+    assert 'params.get("cooldown_hours",\n' in heal or \
+        'params.get("cooldown_hours", sku_codec.RETIRE_COOLDOWN_HOURS)' in heal
+    assert '"cooldown_hours", 24' not in heal        # 旧的第二份真相
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ⑨ 跟卖侧的第二条发码路径已死(批次 2 删)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DEAD_GENERATORS = ("make_sku", "next_serial_start", "SKU_PREFIX")
+
+
+def _second_generator_hits(path: Path) -> list[str]:
+    """输入:.py 路径 → 输出:命中旧发码器的证据(模块 docstring 不计)。
+
+    模块 docstring 里写"旧生成器已删、为什么删"正是要留的文档;命中判据是
+    **代码里用到了那些名字**,或字符串字面量里还留着 PHUMWMT 前缀。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    body = tree.body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]                       # 掐掉模块 docstring
+    hits: list[str] = []
+    for top in body:
+        for node in ast.walk(top):
+            if isinstance(node, ast.Name) and node.id in _DEAD_GENERATORS:
+                hits.append(node.id)
+            elif isinstance(node, ast.Attribute) and node.attr in _DEAD_GENERATORS:
+                hits.append(node.attr)
+            elif isinstance(node, ast.ImportFrom):
+                hits += [a.name for a in node.names if a.name in _DEAD_GENERATORS]
+            elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                  and "PHUMWMT" in node.value):
+                hits.append("PHUMWMT 字面量")
+    return hits
+
+
+def test_no_second_sku_generator_survives():
+    """跟卖 SKU 的生成从此**只有 mint 一条路**(conventions §六)。
+
+    旧的 PHUMWMT + 提交日期 + 当日 4 位序号生成器已在批次 2 删除:① 把上架
+    日期写进 SKU,与货源隐匿目标直接冲突;② 每轮重发取新序号 ⇒ 载荷漂 ⇒
+    api/feeds 的 payload_key 在途防重失效;③ 留着就是一条随时会被误用的第二
+    路径,而误用不报错。存量 PHUMWMT 行不受影响(读路径全格式通吃)。
+    """
+    from services import match_feed
+    for gone in _DEAD_GENERATORS:
+        assert not hasattr(match_feed, gone), gone
+    offenders = [f"{rel}:{sorted(set(hits))}" for rel, path in _prod_files()
+                 if (hits := _second_generator_hits(path))]
+    assert not offenders, _fmt(offenders, "第二条发码路径复活了(只准 sku_codec.mint):")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ⑩ 回执码不写字面量(B2-32)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: 回执事件码 `{kind}_feed_{status}` 的具名常量之家。
+_RECEIPT_CODE_HOME = "services/product_events.py"
+
+
+def test_no_receipt_code_literals_in_business_sql():
+    """回执码只准由 product_events 的常量拼进 SQL,**不写字面量**。
+
+    _FEED_KIND 一改取值,写字面量的那条 SQL 会**静默返回空集** —— 闸门形同
+    虚设而且不报错(list_new 的退役冷却闸、product_events 的删除核验起点都
+    读它)。回执码是推导出来的,所以纪律在这里天然破功,补两个具名常量是
+    最小修法。
+    """
+    pat = re.compile(r"_feed_(success|failed)")
+    offenders = [f"{rel}:{n} {line.strip()[:80]}"
+                 for rel, path in _prod_files() if rel != _RECEIPT_CODE_HOME
+                 for n, line in enumerate(
+                     path.read_text(encoding="utf-8").splitlines(), 1)
+                 if pat.search(line)]
+    assert not offenders, _fmt(
+        offenders, f"回执码字面量:改引用 {_RECEIPT_CODE_HOME} 的具名常量:")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ⑥ 编码规则:一份字母表,一条活码索引,一条回填口径
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -332,6 +552,23 @@ def test_the_live_unique_index_is_named_once_and_carries_replaced_by():
     key_idx = key_idx[:key_idx.index(";")]
     assert "WHERE abandoned_at IS NULL AND replaced_by IS NULL" in key_idx
     assert "abandoned_at IS NULL AND replaced_by IS NULL" in sku_codec._SQL_LIVE
+
+
+def test_generation_index_exists_in_schema():
+    """代际上限闸的索引必须在 schema.sql 里(批次 2 唯一新增的一条)。
+
+    list_new 每轮按 (店, 来源, 源头键) 数已弃码行数;没有它就是每轮全表扫
+    listing_sources。局部条件取 IS NOT NULL 而不是全表索引:活码行是绝大多数,
+    把它们装进这个索引没有任何查询会用到。
+    """
+    name = "listing_sources_abandoned_idx"
+    assert _SCHEMA.count(name) == 1, "新索引名在 schema.sql 里出现了不止一次"
+    stmt = _SCHEMA[_SCHEMA.index(f"CREATE INDEX IF NOT EXISTS {name}"):]
+    stmt = stmt[:stmt.index(";")]
+    assert "(store, source_type, source_key)" in stmt   # 与 GROUP BY 同键
+    assert "WHERE abandoned_at IS NOT NULL" in stmt
+    # 与守门③不冲突:DDL 的局部条件不计入 `abandoned_at IS NULL` 那张白名单
+    assert "abandoned_at IS NULL" not in stmt
 
 
 def test_backfill_regex_agrees_with_sources_backfill():
@@ -699,6 +936,7 @@ _ALL_WHITELISTS = {
     "_ABANDONED_AT_OK": _ABANDONED_AT_OK,
     "_LISTING_SOURCES_UPDATE_OK": _LISTING_SOURCES_UPDATE_OK,
     "_LISTING_SOURCES_INSERT_OK": _LISTING_SOURCES_INSERT_OK,
+    "_ABANDON_CALLERS_OK": _ABANDON_CALLERS_OK,
 }
 
 
@@ -717,6 +955,11 @@ def test_the_whitelists_do_not_rot():
             assert batch.strip(), f"{wl_name}[{rel}] 没写预期收口批次"
             if not (ROOT / rel).exists():
                 stale.append(f"{wl_name}: {rel} 文件已不在")
+    # 反向名单是 {路径: 理由} 的扁平形状,单独核一遍(指空了同样是该删的历史)
+    for rel, why in _ABANDON_FORBIDDEN.items():
+        assert why.strip(), f"_ABANDON_FORBIDDEN[{rel}] 没写理由"
+        if not (ROOT / rel).exists():
+            stale.append(f"_ABANDON_FORBIDDEN: {rel} 文件已不在")
     assert not stale, "白名单有失效条目,删掉它们:\n  " + "\n  ".join(stale)
 
 

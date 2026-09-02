@@ -515,7 +515,7 @@ def test_partial_dead_store_still_succeeds(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
 
     summary = catalog_sync.run({"skip_feishu": "1"})      # 不碰飞书
     assert "1/2 店完成" in summary
@@ -733,7 +733,7 @@ def test_failed_store_gets_one_serial_second_pass(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     summary = catalog_sync.run({"skip_feishu": "1"})
     assert "2/2 店完成" in summary
     assert "⚠ 缺席" not in summary       # 救回了就不点名(「缺席标记 N 行」是另一回事)
@@ -757,7 +757,7 @@ def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     summary = catalog_sync.run({"skip_feishu": "1"})     # 不抛 = 不炸链
     first = summary.splitlines()[0]
     assert "1/2 店完成" in first
@@ -841,7 +841,7 @@ def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     out = catalog_sync.run({"skip_feishu": "1"})
 
     assert "谭总12=N_NEW" in out and "自动链不碰" in out   # 配置店:已按受管仓维护

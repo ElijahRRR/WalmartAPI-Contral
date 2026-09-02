@@ -164,8 +164,8 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 | 2 | — | `50716566635066` `swatchImages` 要 JSONObject | 缺"LLM 不该输出的系统后处理字段"清单 | `SYSTEM_OWNED_FIELDS` 主动丢弃 |
 | 2 | — | (预检拦下)`ShippingWeight` / 卖点全空 | **`slow` 段没入库**——契约的 `raw` 是裁剪过的 | `catalog.products.slow` jsonb 全量留存 |
 | 3 | 3 | `50716566635066` `[color]` 要 **String** 却给了数组 | **上一轮提示词改动的副作用**(LLM 过度套用"数组字段包数组") | 反向类型强制:标量字段收到数组取首元素 |
-| 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标) |
-| 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位 |
+| 3 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×1 | 业务现实,非缺陷 | 池标 conflict 永久弃用 + 正交处置(多码并存也标)。**2026-09-02 起(SKU 改造决策 B)码与 UPC 一起换**:一次 `sku_codec.abandon(reason=upc_conflict)`,下一轮 mint 给新码、claim 给新号 |
+| 4 | 3 | `05570905585050` 变体三件套不完整 | **我们自己造成**:必填兜底填了 `variantAttributeNames` 没配套另两件 | `ensure_variant_bag`:单品 `isPrimaryVariant=Yes`,groupId 用 SKU 占位(**2026-09-02 起那个 SKU 是 12 位不透明码**;变体品的组 ID 仍从 parent ASIN 派生,与码无关) |
 | 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
 | 5 | 3 | `00030257670757` `[releaseDate]` 要 YYYY-MM-DD(批次二重跑,2026-08-12) | **批次二自伤**:新加的 Orderable 条件必填兜底把日期字段当普通字符串填了 'Not Available' | 日期字段感知(`_date_kind`:format 显式严格/名字推断两格式都认——endDate 要 DateTime 是同码反向实证)+ fix_type_mismatches 日期硬闸 + 提示词送 format |
 
@@ -355,10 +355,15 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
       15/hour 桶);SPEC 预检复用 api/items.search_walmart_spec
 - [x] workflow match_listing:行状态机(待处理/可跟卖重排队/终态清 F 重试)
       + SPEC 候选(位数路由+zfill+退化码拒查)+ 按店打包 + 单店隔离
-      + match_submitted/回执进事件账本(sku≠asin 登记例外)
+      + match_submitted/回执进事件账本(sku≠asin 登记例外 —— 批次 2 之后
+      **amz 侧也 sku≠asin 了**,身份一律经登记簿 `catalog.listing_sources`)
 - [x] feed_poll 反哺器第三行:跟卖表 J/K 回填
 - [x] **对拍定稿**(2026-08-07,所有者提供旧 feed 备份):header 与五字段
       全部命中;condition 缺省补 New;SKU=旧系统人工编号(所有者澄清)→
-      新系统 B 列人工优先、留空按其格式 PHUMWMT+YYYYMMDD+序号 自动续号
-      (序号自 ops.feed_items 续,人工行不占号)
+      新系统 B 列人工优先、留空自动发码。
+      ⚠ **2026-09-02(SKU 改造批次 2)改口**:留空的行改由 `sku_codec.mint` 抽
+      12 位不透明码,旧的 `PHUMWMT+YYYYMMDD+序号` 续号器**已删** —— 它把上架
+      日期写进 SKU(与货源隐匿目标冲突),而且每轮重发取新序号让载荷漂、
+      `payload_key` 在途防重失效。发码与人工号登记都在**提交前**的短事务里,
+      提交成功后不再登记(登记是"这个串归谁"的事实,与提交成不成功无关)
 - [ ] 生产验收:.env 两 sheet_id → dry-run → 单店试点 → feed_poll 回填 → 验收

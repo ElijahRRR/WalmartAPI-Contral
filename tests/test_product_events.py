@@ -120,8 +120,11 @@ def test_verify_deletions_verdicts(caplog):
                         ("T1", "S_STILL", "still"),
                         ("T1", "S_WAIT", "wait")])
     with caplog.at_level(_logging.WARNING, logger="services.product_events"):
-        gone, still = pe.verify_deletions(conn)
+        gone, still, gone_pairs = pe.verify_deletions(conn)
     assert (gone, still) == (1, 1)
+    # 第三元 = 判定为 gone 的 (店, SKU),与写进账本的 delete_verified 行一一
+    # 对应 —— catalog_sync 拿它去弃码(弃码点 1)。still 与 wait 都不在里面。
+    assert gone_pairs == [("T1", "S_GONE")]
     ins_sql, rows = conn.sqls[-1]
     events = {(r[0], r[3]) for r in rows}
     assert ("S_GONE", "delete_verified") in events

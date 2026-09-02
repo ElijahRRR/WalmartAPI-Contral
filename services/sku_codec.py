@@ -89,16 +89,20 @@ ABANDON_REASONS = frozenset({
     ABANDON_UPC_CONFLICT, ABANDON_SKU_UPDATE,
 })
 
-#: 弃码原因 → 烧号状态。**在表里 = 这个原因要烧号**;不在表里的两个各有理由:
-#:   upc_conflict —— 号已由 listing_sheet 的撞库处置标成 conflict,再烧一次是
-#:                   重复动作(而且会把「撞库」这个真相盖掉);
-#:   sku_update   —— 码换了但 item 还在、UPC 还绑着,烧号等于白烧。
-#: ⚠ 状态值本身在批次 2 才真正写进库:upc_pool.burn_for_retire 现在仍写
-#: conflict(0a 是零行为变化批次),批次 2 接线时它改成 burn(conn, pairs, status)
-#: 并由本表传值 —— 到那时改的是一处,不留双轨(决策 D)。
+#: 弃码原因 → 烧号状态(批次 2 接线,决策 D:唯一写入函数 upc_pool.burn)。
+#: **在表里 = 这个原因要烧号**,状态值由本表给,别处不许写状态字面量:
+#:   delete_verified —— DELETE 经观测核验,号随码一起死(burned_delete);
+#:   sku_locked      —— SKU_LOCKED 自愈退役,不烧就会被 claim 原号复用回来,
+#:                      "清列重上领新号"成空话(burned_lock);
+#:   upc_conflict    —— 撞库(决策 B:码与 UPC 一起换)。状态仍写 conflict,
+#:                      因为那个值的语义就是「全站已存在该 UPC」—— 写成
+#:                      burned_* 反而把"是谁先占了号"这条排障线索盖掉。
+#: 不在表里的只剩一个:
+#:   sku_update      —— 码换了但 item 还在、UPC 还绑着,烧号等于白烧。
 _BURN_STATUS = {
     ABANDON_DELETE_VERIFIED: upc_pool.BURN_DELETE,
     ABANDON_SKU_LOCKED: upc_pool.BURN_LOCK,
+    ABANDON_UPC_CONFLICT: upc_pool.CONFLICT,
 }
 
 # 模块级计数(排障用:两个分支各记各的,合成一条就分不清并发与随机源故障)
@@ -235,6 +239,17 @@ def abandon(conn, store: str, sku: str, reason: str, *, replaced_by=None) -> boo
 
     reason 不在 ABANDON_REASONS 里直接抛 ValueError:弃码点只有四个,第五个
     出现时应该是有人在讨论后加进词表,而不是随手传个字符串进来。
+
+    **烧不烧号、烧成什么状态,只看 `_BURN_STATUS` 这一张分派表**(决策 D):
+    三个原因各配一个状态、sku_update 不烧;写入走 upc_pool.burn 唯一函数。
+    只烧 amz 行:match 行的 source_key 是 GTIN,而 UPC 池的领号键是
+    (店, ASIN),拿 GTIN 去烧匹配恒空 —— 那不是"烧不到",是"根本不该烧"。
+
+    ⚠ `REASON_SKU_UPDATE`(改码)本批**全仓零调用**,只留接口与"不烧号"
+    分支:唯一调用方是批次 3 的 workflows/sku_migrate.py。守门
+    tests/test_sku_guard.py::test_sku_update_reason_has_no_caller_yet 钉住这一点
+    —— 批次 3 启用时那条断言必须显式改掉,改不掉就说明有人提前接了线。
+    现在就把常量与分支放好,是为了批次 3 不另开第二条弃码实现(双轨禁止)。
     """
     if reason not in ABANDON_REASONS:
         raise ValueError(
@@ -249,7 +264,8 @@ def abandon(conn, store: str, sku: str, reason: str, *, replaced_by=None) -> boo
     burned = 0
     if _BURN_STATUS.get(reason) and source_type == listing_sources.SOURCE_AMZ \
             and source_key:
-        burned = upc_pool.burn_for_retire(conn, [(store, source_key)])
+        burned = upc_pool.burn(conn, [(store, source_key)],
+                               _BURN_STATUS[reason])
     detail = {"old_sku": sku, "reason": reason, "source_type": source_type,
               "source_key": source_key, "burned_upcs": burned}
     if replaced_by:

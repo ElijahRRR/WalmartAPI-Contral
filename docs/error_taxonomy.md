@@ -60,7 +60,7 @@
 
 ```python
 # ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
-ERROR_TAXONOMY_VERSION = "t.2026-09-01.2"   # 码表/判据变更时手动递增
+ERROR_TAXONOMY_VERSION = "t.2026-09-02.1"   # 码表/判据变更时手动递增
 ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
     "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
     "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
@@ -131,11 +131,12 @@ WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
 ### 3.4 政策名抽取 `extract_policy(atom_raw)`(对每个原子独立跑,填 `policy_name`,与码正交)
 
 1. 正则(对原大小写副本):
-   `Prohibited\s+Products?\s+Polic(?:y|ies)\s*:\s*([^.;|@*]{2,80})` —— **冒号必需**,
+   `Prohibited\s+Products?\s+Polic(?:y|ies)\s*:\s*([^.;|@*]{2,160})` —— **冒号必需**,
    冒号后取候选;无冒号 = 无候选(生产反例:`*Prohibited Product Policy* for Toys`
    类别在标记外、`Children's Products Prohibited Products Policy` 结构反置 —— 都不猜);
    `*…*` 星号包裹形态(feed 侧)与 `||…||` 链文本形态经 §3.2 已剥,统一落这个正则;
-2. 候选清洗:去两端标点/空白;剥前置停用词 {`Walmart`, `Walmart's`, `Our`, `The`, `This`};
+2. 候选清洗:去两端标点/空白(**配对的尾 `)` 保留**,孤 `)` 才剥 —— 官方名自带括号
+   后缀 `…(Covered Goods)`,§十一);剥前置停用词 {`Walmart`, `Walmart's`, `Our`, `The`, `This`};
    截断在首个 `.` `;`;**逗号截断有条件**:仅当逗号后是续句(小写起头且首词非
    and/or/&)才截 —— 政策名自身带逗号是常态("Jewelry, Watches, …Precious Metals"、
    "Tobacco, E-Cigarettes, and Vaping Products"),无条件截会腰斩;要防的
@@ -302,3 +303,19 @@ authenticity claims / tax code / BIZ-CN+partnered brands),已按上表补进 §3
    Jewelry 合计 ~70 条政策名 join 不上当时那张 37 行表 —— 若表里真没有,这是 L3 的判据盲区
    (第三步输入),该补的是**政策表数据**,不是引擎;
 2. `Cosmetics Products`(1 条)待确认是否表内 `Cosmetic Products` 的词形差,是则加别名。
+
+## 十一、真跑改名后首份对照的补丁(2026-09-02,t.2026-09-02.1)
+
+`policy_sync` 真跑落地(表 42 条、17 行改为官方拼写)后的对照:事件面 46/46、feed 226/226
+join 全中,在架面 715/729 —— 剩 14 条全是同一个名字被截成
+`Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals (Cover`。
+根因两处都在引擎、不在数据:
+
+1. §3.4 正则候选上限 80 字符,而官方最长政策名 89 字符 → 上限提到 160;
+2. 候选两端剥标点把配对的尾 `)` 也剥了(`_TRIM` 原含 `)`),`(Covered Goods)` 剥成
+   `(Covered Goods`,`norm_category` 的括号后缀削不掉 → `_strip_edges`:右括号比左括号
+   多才算孤 `)`。
+
+同批把报告头的别名表告警分成两种读法(`alias_gaps` 文档早写了,报告没照做):旧名指不到
+表但官方名已在表里 = 改名落地、别名退役(平述,不打 ⚠);官方名也不在才是真失效。
+§十第 1 条(武器族)已由政策表数据补齐,第 2 条(Cosmetics)由 `norm_category` 单复数归一吃掉。

@@ -224,12 +224,14 @@ def _first_hit(fold: str, rules: Iterable[Rule]) -> Rule | None:
 #   · `*Prohibited Product Policy* for Toys`      —— 类别在标记外
 #   · `Children's Products Prohibited Products Policy` —— 结构反置
 # 候选字符集排除 . ; | @ *:句号/分号断句,`*…*`(feed 侧星号包裹)与残留
-# 标记自然成为右边界。
+# 标记自然成为右边界。候选长度上限 160:官方最长政策名 89 字符(`Jewelry, …
+# Precious Metals (Covered Goods)`),旧上限 80 把它截成 `…(Cover`,2026-09-02
+# 真跑改名后的首份报告里 14 条因此 join 不上政策表。
 _POLICY_RE = re.compile(
-    r"Prohibited\s+Products?\s+Polic(?:y|ies)\s*:\s*([^.;|@*]{2,80})")
+    r"Prohibited\s+Products?\s+Polic(?:y|ies)\s*:\s*([^.;|@*]{2,160})")
 
 # 候选两端要剥的标点(残缺标记会留下 `)`、feed 侧会留下 `*`)
-_TRIM = " \t\r\n.,;:!?()[]{}<>\"'`*|-–—_/\\"
+_TRIM = " \t\r\n.,;:!?([]{}<>\"'`*|-–—_/\\"   # 无 `)`:配对尾括号要留,见 _strip_edges
 # 前置停用词(方案 §3.4.2)
 _STOPWORDS = frozenset({"walmart", "walmart's", "our", "the", "this"})
 # 已知子类词形家族(方案 §3.4.3):逗号后文本命中即收进 policy_sub。
@@ -272,6 +274,20 @@ def _norm_key(name: str | None) -> str:
 _STOPWORD_KEYS = frozenset(_norm_key(w) for w in _STOPWORDS)
 
 
+def _strip_edges(cand: str) -> str:
+    """输入:候选串 → 输出:两端剥标点,**配对的尾 `)` 保留**,孤 `)` 照剥。
+
+    残缺标记会留下孤 `)`(要剥);可官方名自己带括号后缀 —— `…Precious Metals
+    (Covered Goods)` —— 一律剥就成了 `…(Covered Goods`,`norm_category` 的括号
+    后缀削不掉,join 不上(2026-09-02 真跑改名后首份报告的 14 条,与正则 80 字
+    上限是同一批)。判据:右括号比左括号多才是孤的。
+    """
+    s = cand.strip(_TRIM)
+    while s.endswith(")") and s.count(")") > s.count("("):
+        s = s[:-1].rstrip(_TRIM)
+    return s
+
+
 def _strip_stopwords(cand: str) -> str:
     while cand:
         head, _, rest = cand.partition(" ")
@@ -294,7 +310,7 @@ def _split_main_sub(cand: str) -> PolicyName:
     """
     if "," not in cand:
         return PolicyName(cand or None, None)
-    head, tail = (p.strip(_TRIM) for p in cand.split(",", 1))
+    head, tail = (_strip_edges(p) for p in cand.split(",", 1))
     if head and any(k in tail.casefold() for k in _SUB_FAMILY):
         return PolicyName(head, tail or None)
     out, pos = cand, 0
@@ -305,7 +321,7 @@ def _split_main_sub(cand: str) -> PolicyName:
             out = out[:i]
             break
         pos = i + 1
-    out = out.strip(_TRIM)
+    out = _strip_edges(out)
     return PolicyName(out or None, None)
 
 
@@ -319,7 +335,7 @@ def extract_policy(atom_raw: str | None) -> PolicyName:
     m = _POLICY_RE.search(normalize_atom(atom_raw).text)
     if not m:
         return PolicyName(None, None)
-    cand = _strip_stopwords(m.group(1).strip(_TRIM))
+    cand = _strip_stopwords(_strip_edges(m.group(1)))
     if len(cand) < 2:
         return PolicyName(None, None)
     return _split_main_sub(cand)

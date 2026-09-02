@@ -639,7 +639,9 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
                         f"(池上限 {st.get('pool_cap', 0)})"
                         + (f" → 主码在本集 {st['coded']}" if "coded" in st else "")
                         + f" → sku 提不出 asin {st.get('no_asin', 0)}"
-                        + f" / 库里无产品行或无标题 {st.get('no_product', 0)}")
+                        + f" / 库里无产品行或无标题 {st.get('no_product', 0)}"
+                        + (f" / 已被反例占用 {st['dup_neg']}"
+                           if st.get("dup_neg") else ""))
     ns = meta.get("neg_stats") or {}
     if ns.get("policy_noname"):
         body.append(f"  通用政策拒**抽不出类别名** {ns['policy_noname']} 条不进本集"
@@ -657,13 +659,19 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
              f" / 判定失败 {sum(1 for r in neg if r['error'])}"]
 
     # ② 类别准确率 + 混淆表
-    hit = [r for r in labelled
-           if r["got_verdict"] == "reject"
-           and category_ok(r["expected_category"], r["got_category"])]
-    body += ["", f"▍类别准确率(带类别反例 {len(labelled)} 条,枚举精确等值,"
-                 f"内容族两名互认):{_pct(len(hit), len(labelled))}"]
-    if labelled:
-        body += _confusion(labelled, limit)
+    # ⚠ 两个分母都要给:只报端到端(分母 = 全部带类别反例)会把"没判拒"的
+    # 失败算进类别账上,改提示词的人分不清是召回问题还是类别问题;只报
+    # "判拒的那些里"又会把召回的窟窿藏起来。混淆表只画**判拒的**那些 ——
+    # 没判拒的行画进去全是「→ (无类别)」,那说的是召回不是类别。
+    rej_lab = [r for r in labelled if r["got_verdict"] == "reject"]
+    hit = [r for r in rej_lab
+           if category_ok(r["expected_category"], r["got_category"])]
+    body += ["", f"▍类别准确率(枚举精确等值,内容族两名互认):"
+                 f"判拒的带类别反例里 {_pct(len(hit), len(rej_lab))};"
+                 f"端到端(判拒且类别对 ÷ 全部带类别反例 {len(labelled)} 条)"
+                 f"{_pct(len(hit), len(labelled))}"]
+    if rej_lab:
+        body += _confusion(rej_lab, limit)
 
     # ③ 正例误伤:新旧并排(所有者的底线)
     new_fp = [r for r in pos if r["got_verdict"] == "reject"]

@@ -480,12 +480,18 @@ def test_report_metrics_add_up():
     ]
     text = "\n".join(ar.report(rows, _META)[0])
     assert "反例召回(沃尔玛拒了,我们也拒):2/4 = 50.0%" in text
-    assert "类别准确率(带类别反例 4 条" in text and "1/4 = 25.0%" in text
+    # 类别准确率给两个分母:判拒的那些里 1/2,端到端 1/4
+    # (只报端到端会把"没判拒"的窟窿算进类别账上,反之则把召回的窟窿藏起来)
+    assert "判拒的带类别反例里 1/2 = 50.0%" in text
+    assert "端到端(判拒且类别对 ÷ 全部带类别反例 4 条)1/4 = 25.0%" in text
     assert "新链 1/3 = 33.3%" in text and "旧链 2/3 = 66.7%" in text
     assert "底线达标" in text                      # 新 ≤ 旧
     assert "pending(判不了,不是判过了):1/7" in text
     assert "llm_bad_json" in text                  # pending 按来源分层
     assert "混淆表" in text and "Offensive Content" in text
+    # 混淆表只画**判拒的**那些:没判拒的行画进去全是「→ (无类别)」,
+    # 那说的是召回不是类别
+    assert "→  得到 (无类别)" not in text
     assert "high" in text and "low" in text        # confidence 分层
     assert "预估成本 ≈ $0.12" in text
 

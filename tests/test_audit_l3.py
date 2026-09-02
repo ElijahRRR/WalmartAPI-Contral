@@ -14,6 +14,7 @@ import hashlib
 
 import pytest
 
+from registry import paths, resources
 from services import audit_l3
 from services.audit_models import L1Info, L2Result, ProductInfo, RuleHit
 
@@ -118,20 +119,58 @@ def _reset_prompt_cache():
 def test_s1_s3_literals_byte_pinned():
     """S1/S3 字节钉死 —— 提示词是判定面,不许无声漂移。
 
-    S3 仍逐字节等于旧仓 l3_llm.py:432-438。
+    S3 仍逐字节等于旧仓 l3_llm.py:432-438(除计数占位符)。
     S1 原本也是逐字节移植(旧仓 :295-431,sha256 859aced1…,5233 字符),
-    **2026-08-21 有意改过一次**:补入判定维度 6「整机电器 / NRTL 认证」。
-    那是所有者定的 —— L2 里按 PT 名猜整机/小件的分类器同日下线,而"这个产品
-    是不是整机电器"必须有人接,不能留真空期(见 test_audit_l2_reason 里
-    `test_the_whole_appliance_call_moved_to_the_l3_prompt`)。
+    此后**有意改过两次**,两次都是所有者定的:
+
+      · 2026-08-21:补入判定维度 6「整机电器 / NRTL 认证」—— L2 里按 PT 名猜
+        整机/小件的分类器同日下线,而"这个产品是不是整机电器"必须有人接,
+        不能留真空期(见 test_audit_l2_reason 里
+        `test_the_whole_appliance_call_moved_to_the_l3_prompt`);
+      · 2026-09-02(§十.7):S1/S3 各一处硬写的「37 条」换成 `{N}` 占位符,
+        由 `build_system_prompt` 按实时政策条数渲染。**除这一个 token 外
+        两段一个字节都没动** —— 下一条测试拿"填回 37"逐字节证明。
     """
     assert hashlib.sha256(audit_l3._S1.encode()).hexdigest() == (
-        "8248ff0c2c2ac2960625a6a14348a578e00efbc89410d390f45f4cee156dc1a3")
+        "05a955e4331012ee564fd2ffd96c38f35813b560b536eaf19fcca26043e98412")
     assert hashlib.sha256(audit_l3._S3.encode()).hexdigest() == (
-        "1564f179581b34ad5785caba6daa1b461e0624129c55cbec19e47c5025d2d409")
-    assert len(audit_l3._S1) == 6027
+        "52edf07f5c85262fe03e827f9e6d4fcabdbf8fe622fa648e90d674ec69551d68")
+    assert len(audit_l3._S1) == 6028
     assert audit_l3._S1.endswith("# 候选 reason_category (verdict=reject 时必选其一)\n")
-    assert audit_l3._S3.startswith("\n\n# 沃尔玛 37 条 Prohibited Products Policy 全清单")
+    assert audit_l3._S3.startswith("\n\n# 沃尔玛 {N} 条 Prohibited Products Policy 全清单")
+
+
+def test_only_the_policy_count_token_moved_in_2026_09_02():
+    """⚠ 动态化只许动**计数 token**:把 `{N}` 填回 `37`,两段必须逐字节回到旧值。
+
+    这条测试是那次改动的边界证明 —— 提示词是判定面,"顺手改一句措辞"不会报错,
+    只会让判定悄悄漂;有了它,任何夹带都会在这里露出来。
+    """
+    assert audit_l3._COUNT_SLOT == "{N}"
+    assert hashlib.sha256(
+        audit_l3._fill_count(audit_l3._S1, 37).encode()).hexdigest() == (
+        "8248ff0c2c2ac2960625a6a14348a578e00efbc89410d390f45f4cee156dc1a3")
+    assert hashlib.sha256(
+        audit_l3._fill_count(audit_l3._S3, 37).encode()).hexdigest() == (
+        "1564f179581b34ad5785caba6daa1b461e0624129c55cbec19e47c5025d2d409")
+
+
+def test_the_policy_count_follows_the_table_not_a_literal():
+    """⚠ 提示词自称的条数 = 紧随其后的 S4 全清单行数,不是写死的「37 条」。
+
+    写死的后果不报错:政策表补了武器族之后,提示词还在说"沃尔玛 37 条全清单",
+    而下面列着 42 条 —— LLM 拿那个数当"我应该看到多少条"的锚。
+    """
+    cats = [c for (c,) in CATEGORY_ROWS]
+    rows = [dict(zip(POLICY_COLS, r)) for r in POLICY_ROWS]
+    p = audit_l3.build_system_prompt(cats, rows)
+    assert f"沃尔玛 {len(rows)} 条 Prohibited Products Policy 全清单" in p
+    assert p.count(f"沃尔玛 {len(rows)} 条") == 2       # S1 一处 + S3 一处
+    assert "{N}" not in p and "沃尔玛 37 条" not in p
+    # 多一行政策,两处数字一起跟着走
+    more = rows + [dict(zip(POLICY_COLS,
+                            (99, "Firearms", "枪支", "禁售", "枪", "红", "")))]
+    assert f"沃尔玛 {len(more)} 条" in audit_l3.build_system_prompt(cats, more)
 
 
 def test_system_prompt_二次构造字节相同且进程内只查一次库():
@@ -152,7 +191,7 @@ def test_system_prompt_四段顺序():
     p = audit_l3.system_prompt(FakeConn())
     i1 = p.index("你是沃尔玛 Marketplace 合规审核 AI")
     i2 = p.index("  - Alcohol\n")
-    i3 = p.index("# 沃尔玛 37 条 Prohibited Products Policy 全清单")
+    i3 = p.index(f"# 沃尔玛 {len(POLICY_ROWS)} 条 Prohibited Products Policy 全清单")
     i4 = p.index("## 1. Alcohol (酒精)")
     assert i1 < i2 < i3 < i4
 
@@ -219,6 +258,85 @@ def test_路由_先截断后按库内政策过滤():
     assert got == ["Intellectual Property", "Offensive Content",
                    "Children's Products", "PFAS Chemicals"]
     assert audit_l3.route_policy_hints("toys", None, known=frozenset()) == []
+
+
+def _route_names() -> set[str]:
+    """路由两张表里出现过的全部政策名(去重)。"""
+    names = set(audit_l3._ALWAYS_INCLUDE)
+    for v in audit_l3._CATEGORY_ROUTES.values():
+        names.update(v)
+    for _kws, v in audit_l3._PT_KEYWORD_ROUTES:
+        names.update(v)
+    return names
+
+
+# 政策表的两种形态:改名后(官方 42 名)/ 改名前那 7 行(存量缩写名)
+_OFFICIAL = frozenset(
+    f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
+    for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
+_LEGACY = frozenset(resources.POLICY_LEGACY_NAMES)
+
+# 路由表里**本来就对不上政策表**的两条(2026-09-02 实测):官方没有这两个类别名,
+# 归一化也打不平 —— `Pet Products` 官方叫 `Pet Foods, Supplements, Medicines and
+# Other Products`,`Jewelry/Precious Metals` 是旧仓自造的斜杠写法。它们记 warning
+# 计数,改法随「L3 输出规范化」一起定(docs/audit_pipeline.md §6 点名)。
+_DEAD_ROUTES = ("Jewelry/Precious Metals", "Pet Products")
+
+
+def test_路由表的政策名改名前后都对得上政策表():
+    """⚠ 路由表写死的是**旧缩写名**(`Electronics & RF` 一族),政策表 2026-09-02
+    改成官方拼写。旧写法 `c in known` 会**静默丢掉 7 条**:提示词照旧漂亮,
+    L3 少拿到 7 类政策提示,判据悄悄变窄,而没有任何东西会红。
+
+    现在两级都走 `policy_names.resolve`,同一份路由表在两种表形态下都活。
+    """
+    from services import policy_names
+    names = _route_names()
+    assert len(names) == 29
+    dead = sorted(n for n in names if policy_names.resolve(n, _OFFICIAL) is None)
+    assert dead == list(_DEAD_ROUTES)          # 只剩本来就不存在的那两条
+    # 那 7 个旧缩写名:改名后解析到官方名,改名前(表里还是旧名)解析到旧名
+    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
+        if legacy not in names:
+            continue
+        assert policy_names.resolve(legacy, _OFFICIAL) == official, legacy
+        assert policy_names.resolve(legacy, _LEGACY) == legacy, legacy
+    assert len({n for n in names} & set(resources.POLICY_LEGACY_NAMES)) == 7
+
+
+def test_路由_返回表内原拼写而不是路由表写的名字():
+    """命中回**表里那一个串** —— 下游(user prompt 的 routed_cats)与 S2 候选块
+    必须是同一套拼写,否则 LLM 看到的候选与提示对不上。"""
+    got = audit_l3.route_policy_hints("electronics", None, known=_OFFICIAL)
+    assert got == ["Intellectual Property", "Offensive Content",
+                   "Electronics and Radio Frequency Devices",
+                   "Hazardous Items", "Digital Goods"]
+    # 改名落地前(表里还是缩写名)照样命中,回的是缩写名
+    old_table = _LEGACY | {"Intellectual Property", "Offensive Content",
+                           "Hazardous Items", "Digital Goods"}
+    assert audit_l3.route_policy_hints("electronics", None, known=old_table) == \
+        ["Intellectual Property", "Offensive Content", "Electronics & RF",
+         "Hazardous Items", "Digital Goods"]
+
+
+def test_路由_解析不到的条目记warning与计数(caplog):
+    """⚠ 兜底三要件:解析不到 = 少给一条政策提示,**必须记日志计数**
+    (debug 不算 —— 没人看得见的信号等于不存在)。同一个名字一轮只警告一次,
+    78 万行不该被刷屏,但计数照旧逐次累加。"""
+    audit_l3.reset_stats()
+    assert audit_l3.STATS["route_unresolved"] == 0
+    with caplog.at_level("WARNING", logger="services.audit_l3"):
+        for _ in range(3):
+            got = audit_l3.route_policy_hints("animals", "pet food",
+                                              known=_OFFICIAL)
+    assert "Pet Products" not in got and "Animals" in got
+    assert audit_l3.STATS["route_unresolved"] == 3          # 逐次计数
+    assert audit_l3.STATS["route_unresolved:Pet Products"] == 3
+    assert audit_l3.unresolved_route_names() == ["Pet Products"]
+    hits = [r for r in caplog.records if "Pet Products" in r.getMessage()]
+    assert len(hits) == 1                                   # 只警告一次
+    audit_l3.reset_stats()
+    assert audit_l3.unresolved_route_names() == []
 
 
 # ---------------------------------------------------------------- L2 软证据

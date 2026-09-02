@@ -163,7 +163,8 @@ class AuditOutcome:
     l3: Any = None                     # 批次 B 无 L3(留槽位保证 all_hits 顺序)
     l4: Any = None                     # 批次 B 无 L4
 
-    # 对齐 Walmart 37 条政策 category_en 的最终拒绝原因(verdict=reject 时有意义)。
+    # 对齐 Walmart 政策表 category_en 的最终拒绝原因(verdict=reject 时有意义;
+    # 条数随 audit.walmart_prohibited_policy 实时变化,2026-09-02 起是官方 42 类)。
     # 注意:旧仓与新仓 audit.audit_runs 都没有这一列,它只活在内存/返回摘要里。
     final_reason_category: str | None = None
 

@@ -7,10 +7,19 @@ L3 只对 L2 pass(score≥60)的产品跑,补 L2 硬规则抓不到的两类问�
 判定不动分数(RuleHit penalty 恒 0,旧仓 l3_llm.py:690),只决定 verdict:
 `reject` → 整品拒;`pending` → 待人工复核;`pass` → 交 L4(若开)。
 
-**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对所有产品
-**逐字节相同**(S1 字面量 + S2 候选类目 + S3 分隔段 + S4 37 条政策压缩块),
-进程内只构造一次。任何把产品信息拼进 system 的写法都会打散 DeepSeek 前缀缓存,
-命中率从 ~95% 掉回 ~63%(旧仓 l3_llm.py:193-198 / :285-289 实测)。
+**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对**同一轮
+的所有产品**逐字节相同(S1 字面量 + S2 候选类目 + S3 分隔段 + S4 政策压缩块 ——
+后三段全部由政策表实时渲染,**全部**行,条数不写死),进程内只构造一次。
+任何把产品信息拼进 system 的写法都会打散 DeepSeek 前缀缓存,命中率从 ~95%
+掉回 ~63%(旧仓 l3_llm.py:193-198 / :285-289 实测)。
+
+⚠ **2026-09-02 契约退役**(定稿 `docs/policy_sync.md` §十.7):原文写的是
+"对所有产品逐字节相同",实际含义一直是"同一轮内相同" —— 政策表一改(新增行 /
+改名 / 刷新正文),S2/S4 就跟着变,这是**设计如此**(政策表就是 L3 的判定输入)。
+S1/S3 里那句硬写的「37 条」也随本批改为按实时条数渲染:库里早就不是 37 行,
+提示词自称的数目与紧随其后的清单对不上。缓存的前提是"每个产品都一样",
+不是"永远一样";政策表变更后前缀缓存一次性重建属预期成本,同批递增
+`AUDIT_RULES_VERSION`。
 
 失败语义(计划 10.2 + 批次 C 合同全局节,与旧仓相反):LLM 重试尽 / 坏 JSON /
 verdict 取值非法,**一律 verdict='pending'**(旧仓是 pass —— 故障窗口漏审违规
@@ -34,10 +43,12 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from collections import Counter
 from dataclasses import dataclass, field
 
 from api import llm as _llm_api
-from services import llm_cache
+from services import llm_cache, policy_names
 from services.audit_models import RuleHit
 
 logger = logging.getLogger("services.audit_l3")
@@ -53,8 +64,16 @@ L3_PURPOSE = "audit_l3"          # registry.LLM_PURPOSE_ENV 登记项
 # 政策路由(旧仓 l3_policy_router.py:30-103,退化为纯内存表)
 #
 # 旧仓 pick() 逐条 `SELECT 8 列` 只为拿回主键 category_en(政策正文一字未用,
-# 全 37 条已在 system prompt 静态段),故新仓不查库。合同 L3-4:保留两张表,
+# 全部政策已在 system prompt 静态段),故新仓不查库。合同 L3-4:保留两张表,
 # hint_line 照产(提示词字节稳定 > 省 token)。
+#
+# ⚠ 两张表里的政策名是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),而
+#   政策表 2026-09-02 起用官方拼写(§十.7:官方类别名 = 全链唯一键)。**不逐条
+#   改字面量**:改名是数据侧的事,路由表跟着改一遍只会在下次改名时再坏一次。
+#   对齐交给 `services/policy_names.resolve(名字, known)` —— 改名前(表内是缩写
+#   名)按精确等值命中、改名后按词形/旧名映射命中,两边都活。解析不到的条目
+#   **记 warning + 计数**(见 STATS),因为"路由静默少给几条政策提示"正是
+#   L3 判据悄悄变窄的样子:提示词还在、答案变了,没有任何东西会红。
 # =============================================================
 
 # 每个产品都扫(L3 的核心任务)——永远排在最前,截断也挤不掉
@@ -135,6 +154,40 @@ _PT_KEYWORD_ROUTES: list[tuple[tuple[str, ...], list[str]]] = [
 ROUTE_MAX_POLICIES = 5   # 旧仓 pick 默认 6,唯一调用点传 5(l3_llm.py:724-728)
 
 
+# ── 本轮计数(惯例照 `services/audit_l1_llm.STATS`:单进程累加,run 摘要读它)──
+#
+# 只收一件事:路由表里的政策名在政策表里**解析不到**。它是"L3 判据悄悄变窄"的
+# 唯一可见信号 —— 少给的是提示,不是报错。`reset_stats()` 每轮开始由
+# `workflows/product_audit` 调;`workers>1` 时裸 `+=` 会丢计数,故上锁。
+STATS: Counter = Counter()
+_STATS_KEYS = ("route_unresolved",)          # 另有动态键 `route_unresolved:<名字>`
+_STATS_LOCK = threading.Lock()
+
+
+def bump(key: str) -> int:
+    """输入:计数键 → 输出:累加后的值(线程安全;调用方拿它决定要不要打日志)。"""
+    with _STATS_LOCK:
+        STATS[key] += 1
+        return STATS[key]
+
+
+def reset_stats() -> None:
+    """输入:无 → 输出:无(清零并补齐固定键,便于摘要直接取)。"""
+    with _STATS_LOCK:
+        STATS.clear()
+        STATS.update({k: 0 for k in _STATS_KEYS})
+
+
+reset_stats()
+
+
+def unresolved_route_names() -> list[str]:
+    """输入:无 → 输出:本轮解析不到的路由政策名(名字序;摘要点名用)。"""
+    pre = "route_unresolved:"
+    return sorted(k[len(pre):] for k, v in STATS.items()
+                  if k.startswith(pre) and v)
+
+
 def route_policy_hints(walmart_category: str | None, walmart_pt: str | None,
                        *, max_policies: int = ROUTE_MAX_POLICIES,
                        known: frozenset | set | None = None) -> list[str]:
@@ -142,8 +195,15 @@ def route_policy_hints(walmart_category: str | None, walmart_pt: str | None,
 
     顺序 = always_include(IP + Offensive)→ category 等值路由 → PT 子串路由;
     去重保序,**先截断再过滤**(旧仓 l3_policy_router.py:193 截断发生在读 DB 之前,
-    always_include 永不被挤掉)。`known` 传入时,表里写了但库里没有的 category_en
-    静默跳过(旧仓 `_load_policy` 返回 None 即跳过,l3_policy_router.py:196-198)。
+    always_include 永不被挤掉)。
+
+    `known`(实时 `category_en` 集合)传入时,每个条目经
+    `policy_names.resolve` 对到**表内原拼写**再返回:两张路由表写的是旧缩写名,
+    政策表 2026-09-02 起是官方拼写,直接拿 `c in known` 过滤会**静默丢掉 7 条**
+    (§十.7)。解析不到的照旧跳过(旧仓 `_load_policy` 返回 None 即跳过,
+    l3_policy_router.py:196-198),但**记 warning + 计数**(同一名字一轮只警告
+    一次,免得 78 万行刷屏;计数进 run 摘要)—— 少给提示不会报错,只会让 L3
+    的判据悄悄变窄。`known=None` = 不过滤,原样返回路由表写的名字。
     """
     cat_norm = (walmart_category or "").strip().lower()
     pt_norm = (walmart_pt or "").strip().lower()
@@ -168,10 +228,18 @@ def route_policy_hints(walmart_category: str | None, walmart_pt: str | None,
     ordered = ordered[:max_policies]
     if known is None:
         return ordered
-    out = [c for c in ordered if c in known]
-    if len(out) != len(ordered):
-        logger.debug("L3 路由跳过库中不存在的政策:%s",
-                     [c for c in ordered if c not in known])
+    out: list[str] = []
+    for c_en in ordered:
+        hit = policy_names.resolve(c_en, known)
+        if hit is None:
+            bump("route_unresolved")
+            if bump(f"route_unresolved:{c_en}") == 1:
+                logger.warning("L3 路由政策名在政策表里解析不到,本条提示跳过:"
+                               "%s —— 路由表与政策表拼写脱节(判定不受影响,"
+                               "但 L3 少拿到一条政策提示)", c_en)
+            continue
+        if hit not in out:       # 两条路由解析到同一行时不重复给
+            out.append(hit)
     return out
 
 
@@ -179,7 +247,22 @@ def route_policy_hints(walmart_category: str | None, walmart_pt: str | None,
 # system prompt(S1 字面量 + S2 候选类目 + S3 分隔段 + S4 政策块)
 # =============================================================
 
-# S1:旧仓 l3_llm.py:295-431 `base` 字面量,逐字节移植(脚本切片,勿手改)。
+# 计数占位符:S1/S3 各有一处"沃尔玛 N 条 …全清单",N = **实时**政策条数
+# (= 下方 S4 全清单的行数)。2026-09-02 定稿 §十.7 之前这里硬写「37 条」,
+# 而库里早就不是 37 行了 —— 提示词自称的数目与紧随其后的清单对不上,LLM 拿它
+# 当"我应该看到 37 条"的锚。改成渲染时填,**同一版本内 DB 不变则字节稳定**,
+# 前缀缓存不受影响(缓存的前提是"每个产品都一样",不是"永远一样")。
+# ⚠ 用 str.replace 而不是 str.format:S1 正文里有 JSON 示例的 `{}`。
+_COUNT_SLOT = "{N}"
+
+
+def _fill_count(text: str, n: int) -> str:
+    """输入:带占位符的提示词段 + 实时政策条数 → 输出:填好数的那一段。"""
+    return text.replace(_COUNT_SLOT, str(n))
+
+
+# S1:旧仓 l3_llm.py:295-431 `base` 字面量,逐字节移植(脚本切片,勿手改;
+# 2026-09-02 唯一的有意改动是把「37 条」换成 `{N}` 占位符,见上)。
 _S1 = """你是沃尔玛 Marketplace 合规审核 AI (站在沃尔玛官方立场)。
 卖家是中国搬运模式、无任何证书/认证、每日数万产品。
 你只输出严格 JSON, 不要任何解释文字或 markdown 前后缀。
@@ -192,7 +275,7 @@ _S1 = """你是沃尔玛 Marketplace 合规审核 AI (站在沃尔玛官方立�
 
 # 政策匹配的两类 (重要)
 
-判 reject 时, 与下方"沃尔玛 37 条 Prohibited Products Policy 全清单"做语义匹配,
+判 reject 时, 与下方"沃尔玛 {N} 条 Prohibited Products Policy 全清单"做语义匹配,
 按下面两类来判 — **不要把"严格证据"误读为"标题必须明示违规用途"**:
 
 ## A. 品类/设备/物料整体禁售 (政策直接禁该物本身, 不论用途)
@@ -337,10 +420,11 @@ L1 类目映射经常因为亚马逊源头分类错误而漏判 (例如 "Baby Bo
 # 候选 reason_category (verdict=reject 时必选其一)
 """
 
-# S3:旧仓 l3_llm.py:432-438 分隔字面量(首行是空行),逐字节移植。
+# S3:旧仓 l3_llm.py:432-438 分隔字面量(首行是空行),逐字节移植
+# (2026-09-02 同样只把「37 条」换成 `{N}` 占位符)。
 _S3 = """
 
-# 沃尔玛 37 条 Prohibited Products Policy 全清单 (LLM 训练数据外的内部规则)
+# 沃尔玛 {N} 条 Prohibited Products Policy 全清单 (LLM 训练数据外的内部规则)
 
 判产品是否违规时与下面清单做语义匹配, 命中任一 → reason_category 填对应 category_en.
 不命中 → 默认 verdict=pass.
@@ -360,7 +444,7 @@ REASON_CATEGORIES_SQL = (
 
 
 def load_policy_rows(conn) -> list[dict]:
-    """输入:中心库连接 → 输出:37 条政策行 dict 列表(ORDER BY id,给 S4)。"""
+    """输入:中心库连接 → 输出:**全部**政策行 dict 列表(ORDER BY id,给 S4)。"""
     with conn.cursor() as cur:
         cur.execute(POLICY_ROWS_SQL)
         cols = [d[0] for d in cur.description]
@@ -379,7 +463,7 @@ def load_reason_categories(conn) -> list[str]:
 
 
 def format_reason_categories(categories: list[str]) -> str:
-    """输入:37 条 category_en(库序)→ 输出:S2 候选块(每行 `  - {c}`)。
+    """输入:全部 category_en(库序)→ 输出:S2 候选块(每行 `  - {c}`)。
 
     末尾固定追加 brand_misuse / none 两项(旧仓 l3_llm.py:276)。
     """
@@ -420,8 +504,17 @@ def build_system_prompt(categories: list[str], policy_rows: list[dict]) -> str:
 
     零产品入参 —— 旧仓 `get_system_prompt(cat, pt, hint)` 的三个参数全被
     `_blocks_for` 吞掉(恒 (True, True)),新仓不保留死签名。
+
+    S1/S3 里的政策条数按 `len(policy_rows)` 渲染:那两处话说的都是**紧随其后的
+    S4 全清单**("与下方…全清单做语义匹配" / 清单自己的标题),所以数的就是它。
+    S2 候选块出自同一张表的另一条查询(`ORDER BY category_en`,外加固定的
+    brand_misuse / none 两项),条数只在 `category_en IS NULL` 时才会不同 ——
+    真差了也不该把 S4 的标题写成 S2 的条数。
     """
-    return _S1 + format_reason_categories(categories) + _S3 + format_full_policy_block(policy_rows)
+    return (_fill_count(_S1, len(policy_rows))
+            + format_reason_categories(categories)
+            + _fill_count(_S3, len(policy_rows))
+            + format_full_policy_block(policy_rows))
 
 
 _SYSTEM_PROMPT: str | None = None
@@ -608,10 +701,13 @@ _LEGACY_CATEGORY_MAP = {
 
 
 def valid_reason_categories(known_policies) -> set[str]:
-    """输入:37 条政策 category_en 集合 → 输出:reason_category 白名单(小写)。
+    """输入:实时政策 category_en 集合 → 输出:reason_category 白名单(小写)。
 
-    全 37 条 + brand_misuse + none,**与路由结果无关**(旧仓
+    **全部**政策 + brand_misuse + none,**与路由结果无关**(旧仓
     `_valid_reason_categories(routed_policies)` 的入参 docstring 自述已不使用)。
+    ⚠ 这里本来就是从实时集合构建的(§十.7 只确认不改):它与
+    `audit_reason._normalize_l3_cat(known=…)` 吃的是同一个 `ctx.known_policies`,
+    表改名后两边同时跟着变 —— 拼写永远同源。
     """
     return {str(c).lower() for c in known_policies} | {"brand_misuse", "none"}
 
@@ -797,6 +893,9 @@ __all__ = [
     "summarize_l2_for_l3",
     "route_policy_hints",
     "valid_reason_categories",
+    "STATS",
+    "reset_stats",
+    "unresolved_route_names",
     "parse_l3_reply",
     "reset_prompt_cache",
 ]

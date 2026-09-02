@@ -195,6 +195,10 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
    - 真跑连带后果三条(摘要强制提醒):①AUDIT_RULES_VERSION 手动递增;②新增行人工列
      全 NULL,S4 现渲染为空壳标题待运营补中文;③`services/audit_l3.py` S1/S3 提示词
      硬写「37 条」将与实际行数不符,是否修改随第三步 L3 批由所有者定;
+     **⚠ 旧口径已作废(2026-09-02),留档勿照做**:①的版本号**已由改名批递增**至
+     `c.2026-09-02.1`(再手动提一版 = 白白触发第二轮全量重审);③的「37 条」已
+     **动态化**(S1/S3 按实时政策条数渲染,不再有对不上的字面量),连带后果因此
+     只剩两条 —— 现行口径见 §十.7 落地记录与 `workflows/policy_sync.py` 摘要;
    - 喂入版渲染件(`services/policy_feed.render_feed_text`)已落地进测试,
      **S4 接线随第三步 L3 批**,当前 S4 仍读中文人工列。
 7. **四修订(2026-09-02 所有者定稿):官方政策类别名 = 全链唯一键**
@@ -215,3 +219,65 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
      (限定官方 42 名枚举)/ 具体内容」三段;结构化枚举输出后不再需要任何模糊归一化。
      **落地设计待政策表完成后再议**;
    - **飞书回同步通道取消**(§八.2 已改)。
+   - **执行侧落地记录(2026-09-02,本批已实现)**:
+     · `registry/resources.POLICY_LEGACY_NAMES` = 仓内**唯一一份**「表内旧名 → 官方名」
+       映射(先收 §十.6 那 7 条;所有者 dry-run 发现新拼写差时在这里追加,**不许另起第二张表**);
+       仅供过渡期,生产改名落地后随第三步 L3 批与 `POLICY_ALIASES` 一起删;
+     · `policy_sync` 两级对行(`norm_category` 词形 + 旧名精确等值)+ 「将改名」清单 +
+       独立 `_RENAME_SQL`(同一事务、机器列 upsert **之前**、只 SET `category_en`、id 不变)+
+       「改名冲突」扣留(目标名已被另一行占用 → 不改名也不刷新);摘要首行加「改名 R」;
+       「疑似改名对」保留 —— 它现在提示的是**还没进映射表**的拼写差,是追加映射的入口;
+       ⚠ **两级不是 if/else**(2026-09-02 补批修正):旧名那一级必须照查,哪怕词形已经
+       命中了别的行 —— 否则"旧名认领成功、但目标官方名已被表内另一行占用"(表里同时
+       有 `Drugs & Paraphernalia` 与 `Drugs and Drug Paraphernalia`)那一行谁也没点到,
+       会掉进「官方已不含」,报成"官方删了这个类别",而真相是**一对同概念双行等着合并**
+       (判反的方向:人会去动库删行)。现在它落「改名冲突」、计入 touched、零写库;
+       「两行登记同一旧名」同样归「改名冲突」,且那张官方页**不新增**(在一对待合并的
+       行旁边再添第三行是把问题变三倍)。报告小节标题相应改为「未对上/不敢动」;
+     · `error_taxonomy.POLICY_ALIASES` 改为从 `POLICY_LEGACY_NAMES` 反向派生(不再手写);
+     · `audit_reason._L3_NORMALIZE` 删掉 20 条政策名(只留 brand_misuse / content standards
+       两族**非政策伪类目**),`_normalize_l3_cat(cat, known=())` 改为对实时 `category_en`
+       集合解析、命中回**表内原拼写**(解析规则走 `policy_names.resolve`,不在本文件
+       另写一份);`compute_final_reason` 增 `known` 入参,两个调用点传
+       `ctx.known_policies` —— 与 `audit_l3.valid_reason_categories` 同源同拼写;
+     · `audit_l3` 的 S1/S3「37 条」改为 `{N}` 占位符 + 渲染时按实时政策条数填(**除这一个
+       token 外两段一字节未动**,测试用"填回 37"逐字节证明);「逐字节相同」契约退役为
+       "同一轮内逐字节相同";
+     · `AUDIT_RULES_VERSION` → `c.2026-09-02.1`(**首跑无需再手动递增**,摘要已改口径);
+     · **成本口径(真跑摘要已点名)**:政策表是 S2/S4 的唯一数据源 ⇒ L3 的 system prompt
+       逐字节变化 ⇒ `catalog.llm_cache`(purpose=`audit_l3`)的存量**全量未命中**
+       —— 缓存键含整段 messages(`services/llm_cache.cache_key`),不是"少省一点",
+       是一条都不命中;**与本批要求的全量重审叠加 = 那批产品全额重付**
+       (DeepSeek 前缀缓存同样一次性重建,按 miss 价另算)。口径与
+       `registry/resources.LLM_CACHE_ANCHOR` 那段同源:大批重审排北京时间
+       18:00–次日 08:00 谷时段,单价减半;
+     · **`services/policy_names.py`(2026-09-02 补批)= 政策名归一化与旧名翻译的唯一模块**:
+       `norm_category`(从 policy_sync 原样搬入,规则不变)/ `to_official`(查
+       `POLICY_LEGACY_NAMES` 精确等值)/ `resolve(name, known)`(精确 → casefold →
+       词形键 → 旧名翻译后重试,命中回**表内原拼写**,认不出给 None)。
+       改名前后同一份代码都活,**写死旧缩写名的地方不必跟着改名批改字面量**;
+       只 import `re` 与 `registry`(铁律 1:services 不许 import workflows);
+     · 跟着改走它的四处:`policy_sync`(import 而非自带一份)、
+       `audit_l3.route_policy_hints`(两张路由表的 29 个政策名逐个 resolve ——
+       旧写法 `c in known` 改名后**静默丢 7 条**政策提示)、
+       `audit_reason._normalize_l3_cat` 与**步 1.5**(`audit_l2._infer_walmart_policy`
+       那批旧缩写名的唯一出口)、`error_taxonomy._norm_key`;
+     · 遗留(本批不动,已在代码里标注):
+       ① `audit_reason._pt_to_policy`(步 4c)与 4d cert 分桶里写死的旧缩写名 ——
+          那两步是 PT/类目关键词**兜底推断**,输入不是政策名,对表反而会把"推断"
+          伪装成"表里查到的";改名后它们落在表外(只多几条 warning 计数,判定不变),
+          改法随「L3 输出规范化」一起定;
+       ② `audit_l3` 路由表里 `Pet Products` 与 `Jewelry/Precious Metals` 两条 ——
+          官方 42 名里根本没有这两个类别名(官方是 `Pet Foods, Supplements,
+          Medicines and Other Products`;Jewelry 那条是旧仓自造的斜杠写法),
+          归一化也打不平。**改名前就是死的**,不是本批改坏的;现在每次命中记
+          warning + 计数并进 run 摘要(旧写法只记 debug,等于没人看得见);
+       ③ `audit_l2._infer_walmart_policy` 的常量仍是旧缩写名 —— **不逐条改**,
+          由步 1.5 单一出口解析(常量的枚举化随「L3 输出规范化」一起定)。
+     · **已解决(与上一版记录相反,勿照旧引用)**:`error_taxonomy._norm_key` 已归并为
+       `policy_names.norm_category`(不再是"只折叠空白 + casefold"),于是
+       `Plants & Seeds` / 牛津逗号 Tobacco / 无 `(Covered Goods)` 的 Jewelry 三种报错
+       写法改名后**都 join 得上**(语料 19 个 distinct 政策名:改名前 16/19、
+       改名后 19/19;旧手写实现是 15/19 与 16/19,测试钉住"只许升不许降")。
+       连带:`alias_gaps()` 在目标态报的是 **5 条**不是 7 条 —— `Auto & Motor Vehicles`
+       与 `Textiles & Apparel` 只差 `&`↔`and`,归一化已经够用,别名本身多余。

@@ -20,7 +20,7 @@
                                                      ↓ pass 才继续
                                               L4 视觉(LLM,默认关)
                                                      ↓
-                              verdict(pass / reject / pending)+ 37 政策理由
+                              verdict(pass / reject / pending)+ 政策理由
 ```
 
 三条贯穿全链的纪律:
@@ -350,13 +350,49 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 判定**不动分数**(hit penalty 恒 0),只决定 verdict:
 `reject` → 整品拒(stage=L3);`pending` → 待人工;`pass` → 交 L4(若开)。
 
-**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对所有
-产品**逐字节相同**(政策静态段 + 37 条政策压缩块),进程内只构造一次。
-任何把产品信息拼进 system 的写法都会打散前缀缓存,命中率从 ~95% 掉回 ~63%。
+**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对**同一轮
+的所有产品**逐字节相同(政策静态段 + 政策压缩块 —— 候选块与压缩块都由政策表
+**全部**行实时渲染),进程内只构造一次。任何把产品信息拼进 system 的写法都会
+打散前缀缓存,命中率从 ~95% 掉回 ~63%。
+
+⚠ **2026-09-02 契约退役**(`docs/policy_sync.md` §十.7):"对所有产品逐字节相同"
+的实际含义一直是"同一轮内相同" —— 政策表一改(新增行 / 改名 / 刷新正文),
+提示词就跟着变,这是**设计如此**(政策表就是 L3 的判定输入)。提示词里那句
+硬写的「37 条」同批改为按实时条数渲染(库里早就不是 37 行,自称的数目与紧随
+其后的清单对不上)。政策表变更后前缀缓存一次性重建属预期成本,同批递增
+`AUDIT_RULES_VERSION`。
 
 **失败语义与旧系统相反**:LLM 重试尽 / 坏 JSON / verdict 取值非法,
 **一律 pending**(旧仓是 pass)—— 故障窗口漏审违规商品的代价远大于人工复核。
 pending **不写 llm_cache**。
+
+### 5.0 政策路由:哪几条政策会被点名送进 user 段
+
+`route_policy_hints(walmart_category, walmart_pt, known=…)` 用两张内存表
+(`_CATEGORY_ROUTES` 等值 + `_PT_KEYWORD_ROUTES` 裸子串)挑 ≤5 条最相关政策,
+永远以 `Intellectual Property` + `Offensive Content` 打头(截断也挤不掉)。
+**这只是提示**,不是判据白名单 —— 白名单是全表(`valid_reason_categories`)。
+
+两张路由表里写的是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),而政策表
+2026-09-02 起用官方拼写。所以每个条目都过一次
+`services/policy_names.resolve(名字, known)` 再返回:精确 → casefold → 词形
+(`&`↔`and` / 逗号 / 括号后缀 / 单复数)→ 旧名映射,**命中回表内原拼写**。
+改名前后同一张路由表都活,不必跟着改名批改字面量。
+
+> ⚠ 旧写法是 `c in known` 直接过滤 —— 改名后会**静默丢掉 7 条**政策提示:
+> 提示词照旧漂亮、判定照旧返回,只是 L3 少看了 7 类政策。没有任何东西会红。
+
+**两条本来就是死的**(不是改名改坏的,官方 42 名里根本没有这两个类别名):
+
+| 路由表写的 | 政策表里的实际情况 |
+|---|---|
+| `Pet Products` | 官方是 `Pet Foods, Supplements, Medicines and Other Products`,归一化打不平 |
+| `Jewelry/Precious Metals` | 旧仓自造的斜杠写法,官方那条是 `Jewelry, Watches, … (Covered Goods)` |
+
+它们每次命中记 **warning + 计数**(同名一轮只警告一次,计数逐次累加),
+进 `product_audit` 摘要的「⚠ L3 政策路由解析不到 N 次」那行 —— 旧写法只记
+debug,等于没人看得见。改法(补映射 / 改路由表 / 枚举化)随
+`docs/policy_sync.md` §十.7 的「L3 输出规范化」一起定。
 
 ### 5.1 L2 证据怎么送进 L3
 
@@ -401,15 +437,16 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 
 ## 7. 理由映射:reject 之后说人话(`services/audit_reason.py`)
 
-`verdict=reject` 时算一个 **Walmart 37 条政策的 `category_en`**,按顺序:
+`verdict=reject` 时算一个 **Walmart 政策表的 `category_en`**(条数随表,
+2026-09-02 起是官方 42 类),按顺序:
 
 | 步 | 判据 | 结果 |
 |---|---|---|
 | 0 | 不是 reject | None |
 | 1 | hit 是 `phase0_forbidden_category` 且 detail 有 `walmart_policy` | 该 policy 原样 |
 | 1.2 | 黑名单中心三码(asin/seller/amazon_cat) | **None**(内部决策,不对应任何沃尔玛政策) |
-| 2 | L3 判 reject 且给了 reason_category | 归一化值 |
-| 1.5 | 其余带 `walmart_policy` 的 hit | 该 policy 原样 |
+| 2 | L3 判 reject 且给了 reason_category | 归一化值(**随表**:`policy_names.resolve` 对实时 `category_en` 集合解析,命中回表内原拼写;2026-09-02 §十.7) |
+| 1.5 | 其余带 `walmart_policy` 的 hit | 该 policy **对表解析后**的表内拼写(解析不到才原样) |
 | 3 | L4 判 reject | 按 issue 文本 → Offensive Content / Intellectual Property |
 | 4a | `publication_pt_forbidden` | Intellectual Property |
 | 4c | PT 关键词十组 | 对应政策 |
@@ -417,7 +454,20 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 | 4e/4f | 商标 / 黑名单品牌 | Intellectual Property |
 | 4g | 全不中 | General-Use Products |
 
-落在 37 条之外时**只记 warning 不改判**(兜底触发必须留痕)。
+步 2 与步 1.5 都走 `services/policy_names.resolve(名字, ctx.known_policies)`
+(仓内唯一一份政策名归一化),命中回**表内原拼写**:
+
+- 步 2 吃的是 L3 答出的 `reason_category`;
+- 步 1.5 是 **`services/audit_l2._infer_walmart_policy` 那批写死的旧缩写名**
+  (`Military & Law Enforcement` / `Electronics & RF` / `Drugs & Paraphernalia`
+  …)进 `final_reason_category` 的**唯一出口** —— 在这一处解析就够了,
+  不逐条改 audit_l2 的常量(那是 §十.7「L3 输出规范化」那一步的事)。
+
+落在政策表之外时**只记 warning 不改判**(兜底触发必须留痕)。已知会落在表外的:
+`Restricted/Illegal` / `Jewelry/Precious Metals` / `.title()` 变形值,以及
+2026-09-02 表改官方拼写之后,**4c/4d 两步**里写死的旧缩写名(`Military & Law
+Enforcement` 一族)—— 那两步是 PT/类目关键词**兜底推断**,输入根本不是政策名,
+对表反而会把"推断"伪装成"表里查到的";改法随 §十.7 的「L3 输出规范化」一起定。
 
 ---
 

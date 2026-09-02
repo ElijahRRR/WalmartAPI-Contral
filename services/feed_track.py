@@ -176,8 +176,11 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁,归既有
         # B=禁售类(PERMANENT,DO NOTHING 幂等)——list_new/match_listing
         # 的黑名单闸下次自动拦,同一产品不再烧 UPC 与配额。
-        # 只收 kind=list(sku=asin 约定);跟卖 sku 是自编号提不出 ASIN,
-        # 其行内终态由跟卖表 F/J 列承担
+        # 只收 kind=list(MP_ITEM)。黑名单键由 blacklist.record_asins 经登记簿
+        # 按 (店,sku) 反查 —— 本函数只负责把 store + sku 原样递过去,
+        # **不许在这里自己解 ASIN**(那就是第二份规则,conventions §六)。
+        # 跟卖走 MP_ITEM_MATCH ⇒ kind=match ⇒ 天然不进这个桶,
+        # 其行内终态由跟卖表 F/J 列承担。
         prohibited = [
             {"store": store["name"], "sku": sku, "category": "B",
              "reasons": f"上架回执违禁 {(code or '').strip()}|"

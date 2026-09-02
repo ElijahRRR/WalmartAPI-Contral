@@ -61,6 +61,8 @@ _HARD_EQUALITY_OK: dict[str, tuple[str, str]] = {
 #: ⚠ **不扫 is_standard_asin**:workflows/brand_scrape.py 与
 #: workflows/product_refresh.py 用它做「合法 ASIN 形态闸」,与 SKU→ASIN 是两个
 #: 能力(推一个非标准码去采集只会永远采不到 → 永远缺品牌 → 永远再推)。
+#: ⚠ PR-0b-1 已合:order_lines / blacklist / order_audit(工作流)/
+#: order_asin_normalize 四条**已删** —— 它们从此出现即红。
 _EXTRACT_ASIN_OK: dict[str, tuple[str, str]] = {
     "services/sku_asin.py": (
         "permanent", "规则自身之家:extract_asin 与 pick_asin 都长在这里"),
@@ -68,11 +70,37 @@ _EXTRACT_ASIN_OK: dict[str, tuple[str, str]] = {
         "permanent", "只导旧库历史数据,那批行的 SKU 永远是存量形态"),
     "workflows/pt_backfill.py": (
         "permanent", "只读旧 walmart_cleanup 库,同上"),
-    "services/order_lines.py": ("0b", "订单行身份收口在批次 0b"),
-    "services/product_events.py": ("0b", "record_many 写 asin 列,收口在批次 0b"),
-    "services/blacklist.py": ("0b", "ASIN 黑名单键,收口在批次 0b"),
-    "workflows/order_audit.py": ("0b", "审核取 ASIN,收口在批次 0b"),
-    "workflows/order_asin_normalize.py": ("0b", "只在 docstring 里提及,随 0b 一起改"),
+    "services/product_events.py": (
+        "permanent",
+        "record_many **仅 store 为空的平台级事件分支**:登记簿主键是 (store, sku),"
+        "没有店就没得查(product_ingest 那一刻根本没有店铺)。四个平台级来源 —— "
+        "product_ingest / audit_store.event_row / product_audit 补采,外加 "
+        "audit_history_fold 的直插 SQL(绕过本函数,asin 列直填)。带 store 的行"
+        "(含 cleanup_history_import)走登记簿腿"),
+    "services/order_audit.py": (
+        "permanent",
+        "line_asin 的**兜底腿**:订单链以 order_lines.asin 列为准,登记簿那一跳在"
+        "写入侧;asin 为 NULL 的存量行才回落形态提取。订单链取 ASIN 只此一处"),
+}
+
+#: ⑥ 允许在 workflows/ 里出现 `catalog.listing_sources` 的文件。
+#: ⚠ 判据是**怎么用**:全表级取数按 services/sku_asin 模块头的纪律走 SQL 侧
+#: `LEFT JOIN` 取 `coalesce(ls.source_key, w.sku)`(PR-0a-2 的 15 处读侧收口),
+#: 那是身份表达式的唯一写法,不是第二条反查路径;Python 逐对反查(resolve_many)
+#: 则一律只准住在 services —— 后者由 test_registry_hop_lives_in_services_only 拦。
+#: 射程不含模块 docstring:文档里写清"这一跳查的是登记簿"正是我们要的东西。
+_REGISTRY_SQL_OK: dict[str, tuple[str, str]] = {
+    "workflows/sources_backfill.py": (
+        "permanent", "_SQL_GAP 就是登记簿的补给线本身(在架却未登记的那批)"),
+    "workflows/list_new.py": (
+        "permanent", "PR-0a-2:去重闸 / 代际口径 / 家族在架三条全表级 LEFT JOIN"),
+    "workflows/product_audit.py": (
+        "permanent", "PR-0a-2:mode=online 的第二条腿(走 listing_sources_key_idx)"),
+    "workflows/product_refresh.py": (
+        "permanent", "PR-0a-2:推采集目标取身份键"),
+    "workflows/alloc_plan.py": ("permanent", "PR-0a-2:「已在架」集合"),
+    "workflows/alloc_products.py": ("permanent", "PR-0a-2:「已在架」集合"),
+    "workflows/alloc_push.py": ("permanent", "PR-0a-2:「已在架」集合"),
 }
 
 #: ③ 允许出现 `abandoned_at` 的**消费方** .py。
@@ -326,12 +354,146 @@ def test_backfill_regex_agrees_with_sources_backfill():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ⑦ 登记簿那一跳的归属与订单链的唯一取数口(批次 0b)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _body(path: Path) -> str:
+    """输入:.py 路径 → 输出:去掉**模块 docstring** 之后的源码。
+
+    射程是代码不是文档:清洗工作流的模块头必须写清"这一跳查的是登记簿"
+    (那正是我们要的文档),扫那个词本身没有意义 —— 与 abandoned_at 那条
+    "判它被当条件用还是被写文档"同一条纪律。
+    """
+    src = path.read_text(encoding="utf-8")
+    doc = ast.get_docstring(ast.parse(src))
+    return src.replace(doc, "", 1) if doc else src
+
+
+def test_registry_hop_lives_in_services_only():
+    """钉的是:**Python 逐对反查(resolve_many)只准住在 services**。
+
+    违反了会这样静默出事:清洗/审核工作流各写一份 JOIN 或各调一次 resolve_many,
+    规则扩充时漏改没人调的那份不报错 —— 摘要正常、功能悄悄没了。
+    全表级取数走 SQL 侧 LEFT JOIN 是**另一件事**(见 _REGISTRY_SQL_OK 的说明)。
+    """
+    offenders: list[str] = []
+    for rel, path in _prod_files():
+        if not rel.startswith("workflows/"):
+            continue
+        body = _body(path)
+        if "resolve_many" in body:
+            offenders.append(f"{rel}(resolve_many:工作流只准用 resolve_pairs)")
+        if "catalog.listing_sources" in body and rel not in _REGISTRY_SQL_OK:
+            offenders.append(f"{rel}(catalog.listing_sources)")
+    assert not offenders, _fmt(
+        offenders, "登记簿那一跳只准住在 services(工作流走 sku_asin.resolve_pairs):")
+
+
+def test_only_cleaner_workflows_call_resolve_pairs():
+    """钉的是:resolve_pairs 是**清洗类**工作流的入口,不是通用便利函数。
+
+    违反了会这样静默出事:它比 resolve_many 多一跳查 walmart_items 的倒查,
+    在实时链路上逐行调等于每行两条 SQL —— 功能对、账单和延迟悄悄翻倍。
+    """
+    allowed = {"workflows/sku_normalize.py", "workflows/order_asin_normalize.py"}
+    offenders = [rel for rel, path in _prod_files()
+                 if rel.startswith("workflows/") and rel not in allowed
+                 and "resolve_pairs" in _body(path)]
+    assert not offenders, _fmt(
+        offenders, f"resolve_pairs 只给这两条清洗工作流:{sorted(allowed)}:")
+
+
+def test_both_cleaners_fill_sql_carry_store():
+    """钉的是:两条清洗器的 _FILL_SQL 都按 (店, sku) 定位行。
+
+    违反了会这样静默出事:同一串 sku 在两家店切码后指向不同产品,不带 store
+    的 UPDATE 会把 A 店的 asin 写到 B 店的行上;而 `=` 写法会漏掉
+    product_events 的 store=NULL 行(平台级事件),两种都不报错。
+    """
+    from workflows import order_asin_normalize as oan
+    from workflows import sku_normalize as sn
+    for wf in (sn, oan):
+        assert "DISTINCT store, sku" in wf._DISTINCT_SQL, wf.__name__
+        assert "unnest(%s::text[]) AS store" in wf._FILL_SQL, wf.__name__
+        assert "IS NOT DISTINCT FROM" in wf._FILL_SQL, wf.__name__
+
+
+def test_order_chain_derives_the_asin_in_exactly_one_place():
+    """钉的是:订单链上"这一行的 ASIN 是什么"只有一份实现(rules.line_asin)。
+
+    违反了会这样静默出事:_snapshots / _scrape_fails / _judge_all / _phish_record
+    四处各算各的,want 清单里的键与 judge 算出的键对不上 —— 快照取回来了但
+    判定说没有,行永远挂"待采集"等一个不会来的快照,每轮还烧一次配额。
+    """
+    from services import order_audit as rules
+    order_chain = [(rel, path) for rel, path in _prod_files()
+                   if "order_audit" in rel or "order_lines" in rel]
+    offenders = [rel for rel, path in order_chain
+                 if rel != "services/order_audit.py"
+                 and re.search(r"\^B\[0-9A-Z\]\{9\}\$", path.read_text(encoding="utf-8"))]
+    assert not offenders, _fmt(offenders, "ASIN 形态闸只准长在 services/order_audit:")
+    wf_src = (ROOT / "workflows" / "order_audit.py").read_text(encoding="utf-8")
+    assert "extract_asin" not in wf_src and "sku_asin" not in wf_src
+    assert callable(rules.line_asin)
+
+
+def test_feed_track_does_not_resolve_asin_itself():
+    """钉的是:违禁回执只把 store + sku 原样递给 blacklist.record_asins。
+
+    违反了会这样静默出事:在 feed_track 再解一次 ASIN 就是第二份规则,
+    两处口径一旦分叉,黑名单键与拦截闸查的键对不上 —— 违禁品照样上架。
+    """
+    src = (ROOT / "services" / "feed_track.py").read_text(encoding="utf-8")
+    for banned in ("resolve_many", "extract_asin", "listing_sources"):
+        assert banned not in src, banned
+
+
+class _EmptyReg:
+    """登记簿一行都查不到(= 今天库里未登记 / 非 amz 的存量行)。"""
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, args=None): self.sql = sql
+
+    def fetchall(self): return []
+
+    def cursor(self): return self
+
+
+#: 仓内已知的全部存量形态(裸 ASIN / 三段式 / 前缀含数字的三段式 / 纯数字
+#: item id / PHUMWMT 人工号 / 认不出的怪东西 / 空)。
+_LEGACY_SHAPES = ("B0GXX75JN5", "XKJ-B0GXX75JN5-39.98", "A109-B08QF9XLMH-02",
+                  "102460018738", "PHUMWMT20240815001", "怪东西", "")
+
+
+def test_legacy_shapes_resolve_identically():
+    """钉的是:**本批次「零行为变化」的机器证明** —— 未登记的存量行经
+    resolve_many 与 extract_asin 输出逐字相同,两个方向都钉。
+
+    违反了会这样静默出事:若 resolve_many 对已登记的非 amz 行直接返 None
+    (今天 sources_backfill 把三段式 sku 登记成 unknown、source_key=NULL),
+    那些行的 asin 会在事件账本 / 黑名单 / 订单三处同时变 NULL —— 三条链一起
+    失明,而且全部不报错。
+    """
+    from services import sku_asin
+    got = sku_asin.resolve_many(_EmptyReg(), [("T1", s) for s in _LEGACY_SHAPES])
+    for s in _LEGACY_SHAPES:                       # 正向:每一个形态同值
+        assert got.get(("T1", s)) == sku_asin.extract_asin(s), s
+    # 反向:extract_asin 提得出的,resolve_many 一个不少(也一个不多)
+    assert {k for _st, k in got} == {s for s in _LEGACY_SHAPES
+                                     if sku_asin.extract_asin(s)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  白名单不许烂掉
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ALL_WHITELISTS = {
     "_HARD_EQUALITY_OK": _HARD_EQUALITY_OK,
     "_EXTRACT_ASIN_OK": _EXTRACT_ASIN_OK,
+    "_REGISTRY_SQL_OK": _REGISTRY_SQL_OK,
     "_ABANDONED_AT_OK": _ABANDONED_AT_OK,
     "_LISTING_SOURCES_UPDATE_OK": _LISTING_SOURCES_UPDATE_OK,
     "_LISTING_SOURCES_INSERT_OK": _LISTING_SOURCES_INSERT_OK,

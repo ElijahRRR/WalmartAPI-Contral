@@ -123,6 +123,29 @@ def test_record_asins_key_is_cleaned_asin():
     assert conn.asin_rows["B0GXX75JN5"][6] == "XKJ-B0GXX75JN5-39.98"
 
 
+def test_record_asins_key_comes_from_the_registry_first(monkeypatch):
+    """切码后形态提取对 12 位随机码恒返 None ⇒ 黑名单键被灌随机码 ⇒
+    list_new 的黑名单闸拦不住违禁品(钱和合规双输)。登记簿是主路。"""
+    conn = _Conn()
+    monkeypatch.setattr(bl.sku_asin, "resolve_many",
+                        lambda c, pairs: {("店A", "AK7QM2X9RT4W"): "B0REGISTER"})
+    bl.record_asins(conn, [_it("AK7QM2X9RT4W", "B")])
+    assert "B0REGISTER" in conn.asin_rows
+    assert conn.asin_rows["B0REGISTER"][6] == "AK7QM2X9RT4W"   # 原文进 src_sku
+
+
+def test_record_asins_raw_fallback_is_counted_and_logged(caplog):
+    """`or sku` 原文兜底保持现状(D-0b-1),但**不许再静默**:
+    2026-08-11「2,702 个 C/E 品牌 0 命中」正是这种静默的产物,
+    加一条计数告警让下次不用等三个月才发现。"""
+    conn = _Conn()
+    with caplog.at_level("WARNING"):
+        bl.record_asins(conn, [_it("MANUAL-001", "B"), _it("MANUAL-002", "B")])
+    assert "MANUAL-001" in conn.asin_rows           # 宁可键不标准也不丢行
+    msg = [r.getMessage() for r in caplog.records if "黑名单" in r.getMessage()]
+    assert msg and "2 个 sku" in msg[0]
+
+
 # ── 品牌收集 ──────────────────────────────────────────────────────────────────
 
 def test_collect_brands_only_c_and_e():
@@ -184,6 +207,41 @@ def test_collect_brands_looks_up_products_by_cleaned_asin():
     assert conn.channel_rows["nike"][3] == "B0GXX75JN5"
 
 
+def test_collect_brands_uses_registry_source_key(monkeypatch):
+    """品牌收集按 catalog.products.asin 查,键错 ⇒ 0 命中 ⇒ 每轮空转、
+    品牌黑名单永远长不出来,而摘要里只显示 no_brand 这个看着很正常的数字。"""
+    conn = _Conn(brands={"B0REGISTER": "Nike"})
+    monkeypatch.setattr(bl.sku_asin, "resolve_many",
+                        lambda c, pairs: {("店A", "AK7QM2X9RT4W"): "B0REGISTER"})
+    st = bl.collect_brands(conn, [_it("AK7QM2X9RT4W", "C")])
+    assert st["brand_new"] == 1
+    assert conn.channel_rows["nike"][3] == "B0REGISTER"
+
+
+def test_collect_brands_dedupe_key_is_still_the_sku():
+    """去重键保持 sku 原文(D-0b-3):改成 asin 会改变存量三段式行的去重
+    粒度,那是行为变化,不该混进零行为变化批次。"""
+    conn = _Conn(brands={"B0GXX75JN5": "Nike"})
+    bl.collect_brands(conn, [_it("XKJ-B0GXX75JN5-39.98", "C")])
+    assert conn.marked == ["XKJ-B0GXX75JN5-39.98"]
+
+
+def test_collect_brands_resolution_does_not_depend_on_which_store_survived_the_collapse(
+        monkeypatch):
+    """cands 把同 sku 多店折叠成**任意一家**(后写覆盖先写)—— 拿"谁活下来"
+    那个 store 去查登记簿,结果就取决于 items 的顺序。按该 sku 出现过的
+    全部店排序后逐个试,两种顺序必须得到同一个品牌键。"""
+    monkeypatch.setattr(bl.sku_asin, "resolve_many",
+                        lambda c, pairs: {("T1", "SKU-X"): "B0REGISTER"})
+    got = []
+    for items in ([_it("SKU-X", "C", store="T1"), _it("SKU-X", "C", store="T2")],
+                  [_it("SKU-X", "C", store="T2"), _it("SKU-X", "C", store="T1")]):
+        conn = _Conn(brands={"B0REGISTER": "Nike"})
+        bl.collect_brands(conn, items)
+        got.append(conn.channel_rows["nike"][3])
+    assert got == ["B0REGISTER", "B0REGISTER"]
+
+
 def test_channel_known_brand_counts_known():
     """渠道里已有的品牌,第二个 SKU 撞见 → brand_known,不重复入渠道。"""
     conn = _Conn(brands={"B0B": "Nike"}, channel_rows={"nike": ("已在渠道",)})
@@ -234,3 +292,58 @@ def test_inflight_sql_caps_submitted_at_48h():
     assert "interval" not in success_leg
     assert "resolved_at > w.last_seen_at" in success_leg
     assert "'failed'" not in sql
+
+
+# ── 回填/重建那条腿(2026-09-02 补:_LATEST_CTE 此前漏在收口清单外)───────────
+
+def test_latest_cte_takes_the_key_from_the_registry_first():
+    """切码后凡是 product_events.asin 为空的行,coalesce 会回落成 12 位随机码
+    ⇒ **随机码被写成黑名单键**,而 rebuild_asin_blacklist 是一次性把好键换成
+    坏键。实时那条腿(record_asins)收了口,这条不收等于白改。"""
+    assert "LEFT JOIN catalog.listing_sources" in bl._LATEST_CTE
+    assert "source_type = 'amz'" in bl._LATEST_CTE
+    assert "coalesce(ls.source_key, e.asin, e.sku)" in bl._LATEST_CTE
+
+
+def test_latest_cte_consumers_are_unchanged():
+    """三个消费方拼在 _LATEST_CTE 之后,列名与语义一个不变 —— 改前的文本
+    硬编码在这里:身份键换了源头,取数不许跟着漂。"""
+    body = bl._BACKFILL_ASIN_SQL[len(bl._LATEST_CTE):]
+    assert body == """
+INSERT INTO catalog.asin_blacklist
+    (asin, category, source, reason, src_store, biz_cn, src_sku, created_at)
+SELECT asin, cat,
+       '沃尔玛-' || CASE cat WHEN 'B' THEN '禁售' WHEN 'C' THEN '品牌'
+                             WHEN 'E' THEN '知产' WHEN 'F' THEN '限类'
+                             WHEN 'G' THEN '药品' WHEN 'K' THEN '审查' END,
+       left(reason, 200), store,
+       (lower(coalesce(reason, '')) LIKE '%%biz-cn%%'
+        OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%'),
+       sku, occurred_at
+FROM latest WHERE cat = ANY(%(perm)s)
+ON CONFLICT (asin) DO NOTHING
+"""
+    assert bl._CHANNEL_COUNT_SQL[len(bl._LATEST_CTE):] == """
+SELECT count(*) FILTER (WHERE coalesce(btrim(p.brand), '') <> ''),
+       count(*) FILTER (WHERE coalesce(btrim(p.brand), '') = ''),
+       count(DISTINCT lower(btrim(p.brand)))
+           FILTER (WHERE coalesce(btrim(p.brand), '') <> '')
+FROM latest l
+LEFT JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.asin
+WHERE l.cat = ANY(%(brandcats)s)
+"""
+    # 计数腿只多了一档只读的 opaque,前三档一字不改
+    count_body = bl._BACKFILL_COUNT_SQL[len(bl._LATEST_CTE):]
+    assert count_body.startswith("""
+SELECT count(*) FILTER (WHERE cat = ANY(%(perm)s)) AS permanent,
+       count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
+       count(*) AS total,""")
+    assert count_body.rstrip().endswith("FROM latest")
+
+
+def test_opaque_key_alphabet_comes_from_sku_codec():
+    """字符类不许手写字面量:字母表的唯一之家是 services/sku_codec,
+    抄一份出来就是第二份口径,剔掉 0/O/1/I/L/U 那条纪律漏改一处即失效。"""
+    from services import sku_codec
+    assert f"'^[{sku_codec._ALPHABET}]{{{sku_codec._LEN}}}$'" in bl._BACKFILL_COUNT_SQL
+    assert "AND asin ~ '[A-Z]'" in bl._BACKFILL_COUNT_SQL   # 「至少一个字母」半条

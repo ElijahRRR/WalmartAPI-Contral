@@ -18,6 +18,17 @@
 
 原则:提得出就提,提不出**保留原文并可报告**——绝不猜。规则不全是常态
 (所有者:偶尔清洗一次),新形态先进「其他」桶报出来,人认了再扩规则。
+
+三个批量/单条入口,分工不许混(2026-09-02 定):
+  · resolve(conn, store, sku)      单条壳,只给零星调用点(services 内部)
+  · resolve_many(conn, pairs)      **纯登记簿 + 形态兜底**的批量反查;
+                                   services 内部消费方(order_lines /
+                                   product_events / blacklist)用它
+  · resolve_pairs(conn, pairs)     **清洗类工作流的唯一批量入口**,在
+                                   resolve_many 之上多一跳纯数字 item_id
+                                   倒查(要查 walmart_items),并产出形态计数
+workflows/ 只准用 resolve_pairs;直接用 resolve_many / 拼 listing_sources
+的 SQL 由 tests/test_sku_guard.py 拦(守门白名单)。
 """
 
 import re
@@ -65,54 +76,105 @@ def classify(sku) -> str:
 # ⚠ 这条 SQL 与 numeric_resolved 的记账此前在 order_asin_normalize 与
 # sku_normalize 各写一份(**字节相同**),而规则本身早就只在本模块 ——
 # 缺的正是"倒查那一跳"没跟着沉下来,于是两份拷贝各自演化(2026-08-27 收编)。
+# 2026-09-02 拆两级:第一级带 store(切码后同一 item_id 反查出的订货号还要再过
+# 店维登记簿),第二级仍是这条全局 SQL —— **它是既有行为,不许删**:今天订单行
+# 落在 T2 店、item_id 只在 T1 店的 walmart_items 里有行时,靠的就是它。
+_ITEMID_STORE_SQL = """
+SELECT DISTINCT store, item_id, sku FROM catalog.walmart_items
+WHERE store = ANY(%s) AND item_id = ANY(%s)
+"""
+
 _ITEMID_SQL = """
 SELECT DISTINCT item_id, sku FROM catalog.walmart_items
 WHERE item_id = ANY(%s)
 """
 
 
-def resolve_skus(conn, skus: list[str]) -> tuple[dict, dict]:
-    """输入:连接 + 待洗 sku 列表 → 输出:({sku: asin}, 形态计数)。
+def resolve_pairs(conn, pairs: list[tuple[str | None, str]]) -> tuple[dict, dict]:
+    """输入:连接 + [(店铺, sku)] → 输出:({(店铺,sku): asin}, 计数)。
 
-    模式提取 + 纯数字倒查 item id 两跳;**解析不了的不进映射**(调用方留 NULL,
-    绝不猜)。形态计数按 `classify` 的四个桶记,倒查成功的另记
-    `numeric_resolved` 一档 —— 它同时也进 `numeric` 桶,两者不是互斥关系
-    (摘要按"待洗形态分布 + 其中倒查救回多少"读)。
+    ⚠ **计数混着两种单位,别读串**(摘要最容易被误读的地方):
+    `asin`/`wrapped`/`numeric`/`other`/`numeric_resolved` 五档按 **distinct sku**
+    计(与 2026-08-27 的 resolve_skus 逐字同口径,所以摘要与改前对得上);
+    `pairs`/`registry_differs`/`numeric_cross_store` 三档按 **(店,sku) 组合** 计。
 
-    纯读一条 SQL,不改任何行;真正的 UPDATE 在各工作流自己的 `_FILL_SQL`
+    三跳:① 登记簿(`resolve_many`:amz 行给 source_key,其余一律回落
+    `extract_asin`);② 仍没解出的纯数字按 (店, item_id) 倒查 walmart_items,
+    反查出的订货号**再过一次登记簿**(切码后它本身就是不透明码);③ 还没解出的
+    按 item_id **全局**倒查一次(既有行为,保住跨店补齐的覆盖面)再走
+    `extract_asin`。**解析不了的不进映射**(调用方留 NULL,绝不猜)。
+
+    纯读,不改任何行;真正的 UPDATE 在各工作流自己的 `_FILL_SQL`
     (打哪张表是两条链唯一的真差异)。
     """
+    pairs = list(dict.fromkeys(pairs))          # 去重保序
     mapping: dict = {}
     buckets: Counter = Counter()
-    numeric: list = []
-    for s in skus:
-        kind = classify(s)
-        buckets[kind] += 1
-        a = extract_asin(s)
-        if a:
-            mapping[s] = a
-        elif kind == "numeric":
-            numeric.append(s)
-    if numeric:
-        with conn.cursor() as cur:
-            cur.execute(_ITEMID_SQL, (numeric,))
-            hits = dict(cur.fetchall())     # item_id → 沃尔玛订货号
-        for s in numeric:
-            a = extract_asin(hits.get(s))
-            if a:
-                mapping[s] = a
-                buckets["numeric_resolved"] += 1
+    for k in dict.fromkeys(k for _s, k in pairs):
+        buckets[classify(k)] += 1
+    buckets["pairs"] = len(pairs)
+
+    reg = resolve_many(conn, pairs)
+    mapping.update(reg)
+    # 登记簿给出的答案与形态提取不同的组合数 —— **切换前它必须是 0**:非 0 说明
+    # 登记簿里有 source_key ≠ sku 的存量 amz 行(schema.sql 回填正则缺右锚那批)
+    buckets["registry_differs"] = sum(
+        1 for (_s, k), a in reg.items() if a != extract_asin(k))
+
+    still = [(s, k) for (s, k) in pairs
+             if (s, k) not in mapping and classify(k) == "numeric"]
+    if still:
+        got: set = set()                        # 倒查救回的 distinct sku
+        cross = 0                               # 只靠第二级救回的组合数
+        scoped = [(s, k) for s, k in still if s is not None]
+        if scoped:
+            with conn.cursor() as cur:
+                cur.execute(_ITEMID_STORE_SQL,
+                            ([s for s, _ in scoped], [k for _, k in scoped]))
+                hits = {(st, iid): sku for st, iid, sku in cur.fetchall()}
+            back = resolve_many(conn, [(s, hits[(s, k)])
+                                       for s, k in scoped if (s, k) in hits])
+            for s, k in scoped:
+                a = back.get((s, hits.get((s, k))))
+                if a:
+                    mapping[(s, k)] = a
+                    got.add(k)
+        rest = [(s, k) for s, k in still if (s, k) not in mapping]
+        if rest:
+            with conn.cursor() as cur:
+                cur.execute(_ITEMID_SQL, ([k for _s, k in rest],))
+                hits2 = dict(cur.fetchall())    # item_id → 沃尔玛订货号
+            for s, k in rest:
+                a = extract_asin(hits2.get(k))
+                if a:
+                    mapping[(s, k)] = a
+                    got.add(k)
+                    cross += 1
+        if got:
+            buckets["numeric_resolved"] = len(got)
+        if cross:
+            buckets["numeric_cross_store"] = cross
     return mapping, dict(buckets)
 
 
-def samples(skus: list[str], buckets: dict) -> dict:
-    """输入:待洗 sku + 形态计数 → 输出:{形态: 前 5 个样本}(只给没解析出的桶)。
+def samples(pairs: list[tuple[str | None, str]], buckets: dict) -> dict:
+    """输入:待洗 (店, sku) 对 + 形态计数 → 输出:{形态: 前 5 个样本}(只给没解析出的桶)。
 
     只报 numeric/other 两个桶:asin/wrapped 是提得出的,不需要人认。
     "规则不全是常态"——新形态先进「其他」桶带样本报出来,人认了再扩规则。
+    样本**先按 sku 去重再取前 5**,且只放 sku 串不放店名:样本的全部作用是让人
+    认新形态,同一个 sku 跨 5 家店就能把 5 个样本位全占满,那等于把它废掉。
     """
-    return {k: [s for s in skus if classify(s) == k][:5]
-            for k in ("numeric", "other") if buckets.get(k)}
+    def _five(kind):
+        seen, out = set(), []
+        for _st, s in pairs:
+            if classify(s) == kind and s not in seen:
+                seen.add(s)
+                out.append(s)
+                if len(out) == 5:
+                    break
+        return out
+    return {k: _five(k) for k in ("numeric", "other") if buckets.get(k)}
 
 
 # ── 登记簿那一跳(SKU 改造批次 0a,2026-09-02)────────────────────────────────
@@ -123,8 +185,8 @@ def samples(skus: list[str], buckets: dict) -> dict:
 #   · resolve(conn, store, sku)   单条薄壳,内部就是 resolve_many。
 # ⚠ **全表级取数一律在 SQL 里 LEFT JOIN 登记簿再取 coalesce(ls.source_key, w.sku)**,
 #   不要拿十万对 (store, sku) 去 unnest —— 那是把一次 JOIN 换成一次巨型数组传参。
-# ⚠ 批次 0b 若要给清洗工作流做 resolve_pairs(含纯数字倒查那一跳),必须**建在
-#   resolve_many 之上**,不许在旁边另起一条批量入口(conventions §六单路径)。
+# ⚠ 批次 0b 的 resolve_pairs(清洗工作流的唯一批量入口,含纯数字倒查那两级)
+#   **建在 resolve_many 之上**,不是旁边另起的第二条批量入口(conventions §六)。
 
 #: 登记簿只按 (store, sku) 反查 amz 身份键。**不按 abandoned_at 过滤**:旧码
 #: 带着订单/售后回来时必须还查得到(消费方契约,sku_plan §5.3)。
@@ -155,14 +217,21 @@ def resolve_many(conn, pairs) -> dict:
     """输入:连接 + [(store, sku)] → 输出:{(store, sku): asin}(有界批量反查)。
 
     一条 SQL 取登记簿键,逐对过 `pick_asin`;**提不出的不进映射**(与
-    resolve_skus 同纪律:调用方留 NULL,绝不猜)。纯读,不改任何行。
+    resolve_pairs 同纪律:调用方留 NULL,绝不猜)。纯读,不改任何行。
+
+    ⚠ store 为 None 的对(product_events 的平台级事件行)**原样进出**:返回的键
+    与传进来的对逐字相同,不是 "None" 字符串。登记簿主键是 (store, sku),
+    store 为空压根查不到 —— 这批对直接走形态腿,一次往返都不占。
     """
-    want = [(str(st), str(sk)) for st, sk in pairs]
+    want = [(st if st is None else str(st), str(sk)) for st, sk in pairs]
     if not want:
         return {}
-    with conn.cursor() as cur:
-        cur.execute(_REG_SQL, ([p[0] for p in want], [p[1] for p in want]))
-        keys = {(st, sk): key for st, sk, key in cur.fetchall()}
+    keys: dict = {}
+    probe = [p for p in want if p[0] is not None]
+    if probe:
+        with conn.cursor() as cur:
+            cur.execute(_REG_SQL, ([p[0] for p in probe], [p[1] for p in probe]))
+            keys = {(st, sk): key for st, sk, key in cur.fetchall()}
     out = {}
     for pair in want:
         a = pick_asin(keys.get(pair), pair[1])

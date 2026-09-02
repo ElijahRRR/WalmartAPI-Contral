@@ -70,68 +70,154 @@ def test_record_many_autofills_asin_column():
     assert conn.rows[1][1] is None              # item id → NULL 等倒查
 
 
-# ── 批量清洗两跳(2026-08-27 从两个清洗工作流收编)──────────────────────
+# ── 批量清洗三跳(2026-08-27 从两个清洗工作流收编;2026-09-02 倒查拆两级)──
 
 class _Cur:
-    def __init__(self, hits):
-        self.hits, self.sql, self.args = hits, None, None
+    """按 (店, item_id) / item_id 两级倒查的夹具。
+
+    `hits` 喂全局那级(item_id → 订货号),`store_hits` 喂店内那级
+    ((店, item_id) → 订货号);登记簿那条 SELECT 一律返空行(未登记 ⇒ 回落形态)。
+    """
+
+    def __init__(self, hits, store_hits=None, reg=()):
+        self.hits, self.store_hits = hits, store_hits or {}
+        self.reg = list(reg)
+        self.sql, self.args, self.rows, self.n = None, None, [], 0
 
     def __enter__(self): return self
 
     def __exit__(self, *a): return False
 
     def execute(self, sql, args=None):
-        self.sql, self.args = sql, args
+        self.sql, self.args, self.n = sql, args, self.n + 1
+        if "catalog.listing_sources" in sql:
+            self.rows = list(self.reg)
+        elif "store = ANY" in sql:
+            stores, ids = set(args[0]), set(args[1])
+            self.rows = [(st, i, v) for (st, i), v in self.store_hits.items()
+                         if st in stores and i in ids]
+        else:
+            self.rows = [(k, v) for k, v in self.hits.items()
+                         if k in set(args[0])]
 
     def fetchall(self):
-        return list(self.hits.items())
+        return list(self.rows)
 
 
 class _Conn:
-    def __init__(self, hits=None):
-        self.cur = _Cur(hits or {})
+    def __init__(self, hits=None, store_hits=None, reg=()):
+        self.cur = _Cur(hits or {}, store_hits, reg)
 
     def cursor(self):
         return self.cur
 
 
-def test_resolve_skus_two_hops_and_leaves_the_rest_alone():
-    """模式提取 + 纯数字倒查 item id 两跳;**解析不了的不进映射**(留 NULL)。"""
+def test_resolve_pairs_two_hops_and_leaves_the_rest_alone():
+    """模式提取 + 纯数字倒查两跳;**解析不了的不进映射**(留 NULL)。"""
     conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"})
     skus = ["B0GXX75JN5", "JTZW-D01027HVK3W-38", "102460018738",
             "998877665544", "怪东西"]
-    mapping, buckets = sa.resolve_skus(conn, skus)
-    assert mapping == {"B0GXX75JN5": "B0GXX75JN5",
-                       "JTZW-D01027HVK3W-38": "D01027HVK3W",
-                       "102460018738": "B0GXX75JN5"}      # 倒查救回来的
+    pairs = [(None, s) for s in skus]
+    mapping, buckets = sa.resolve_pairs(conn, pairs)
+    assert mapping == {(None, "B0GXX75JN5"): "B0GXX75JN5",
+                       (None, "JTZW-D01027HVK3W-38"): "D01027HVK3W",
+                       (None, "102460018738"): "B0GXX75JN5"}   # 倒查救回来的
     # 倒查不到的那个纯数字不进映射(绝不猜),其余照原形态计数
-    assert "998877665544" not in mapping
+    assert (None, "998877665544") not in mapping
     assert buckets == {"asin": 1, "wrapped": 1, "numeric": 2, "other": 1,
-                       "numeric_resolved": 1}
-    # 倒查只对纯数字发一次,且只发那两个
+                       "pairs": 5, "registry_differs": 0,
+                       "numeric_resolved": 1, "numeric_cross_store": 1}
+    # 第二级仍是那条**一字未改**的全局 SQL,且对全部剩余对都跑 —— 这行断言
+    # 就是「今天补得上的行改后一行不少」的字面凭据
     assert "catalog.walmart_items" in conn.cur.sql
     assert conn.cur.args == (["102460018738", "998877665544"],)
 
 
-def test_resolve_skus_skips_the_lookup_when_nothing_is_numeric():
+def test_resolve_pairs_skips_the_lookup_when_nothing_is_numeric():
     conn = _Conn()
-    mapping, buckets = sa.resolve_skus(conn, ["B0GXX75JN5"])
-    assert mapping == {"B0GXX75JN5": "B0GXX75JN5"}
+    mapping, buckets = sa.resolve_pairs(conn, [(None, "B0GXX75JN5")])
+    assert mapping == {(None, "B0GXX75JN5"): "B0GXX75JN5"}
     assert conn.cur.sql is None          # 一条 SQL 都不该发
-    assert buckets == {"asin": 1}
+    assert buckets == {"asin": 1, "pairs": 1, "registry_differs": 0}
+
+
+def test_numeric_itemid_hop_prefers_the_store_scoped_row():
+    """两家店同一个 item_id 各自反查出自己那行 —— 切码后同一串数字在两家店
+    指向不同产品,不带 store 就会串味(而且不报错)。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"},
+                 store_hits={("T1", "102460018738"): "XKJ-B0GXX75JN5-39.98",
+                             ("T2", "102460018738"): "YP-B09TDMGVRW-188.88"})
+    mapping, buckets = sa.resolve_pairs(
+        conn, [("T1", "102460018738"), ("T2", "102460018738")])
+    assert mapping == {("T1", "102460018738"): "B0GXX75JN5",
+                       ("T2", "102460018738"): "B09TDMGVRW"}
+    assert buckets["numeric_resolved"] == 1        # 按 distinct sku 计
+    assert "numeric_cross_store" not in buckets    # 全在第一级解出
+
+
+def test_numeric_itemid_hop_falls_back_to_the_global_lookup():
+    """订单行落在 T2、item_id 只在 T1 的 walmart_items 里有行 —— 今天靠全局
+    那条 SQL 补得上,改后必须**一行不少**;差额单列 numeric_cross_store。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"},
+                 store_hits={("T1", "102460018738"): "XKJ-B0GXX75JN5-39.98"})
+    mapping, buckets = sa.resolve_pairs(conn, [("T2", "102460018738")])
+    assert mapping == {("T2", "102460018738"): "B0GXX75JN5"}
+    assert buckets["numeric_cross_store"] == 1
+
+
+def test_numeric_itemid_hop_still_runs_for_store_null_pairs():
+    """store 为 None 的平台级事件行**不许整条跳过** —— 跳过就是少补,
+    而且是让 asin 变空的那个方向(静默)。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"})
+    mapping, _ = sa.resolve_pairs(conn, [(None, "102460018738")])
+    assert mapping == {(None, "102460018738"): "B0GXX75JN5"}
+
+
+def test_numeric_itemid_hop_goes_through_the_registry_again():
+    """第一级反查出的订货号本身就可能是不透明码 —— 必须再过一次登记簿,
+    直接 extract_asin 的话纯数字这条路在切码后永远解不出来。"""
+    code = "AK7QM2X9RT4W"
+    conn = _Conn({}, store_hits={("T1", "102460018738"): code},
+                 reg=[("T1", code, "B0ABCDEFGH")])
+    mapping, _ = sa.resolve_pairs(conn, [("T1", "102460018738")])
+    assert mapping == {("T1", "102460018738"): "B0ABCDEFGH"}
+
+
+def test_bucket_units_are_documented_and_stable():
+    """五档形态计数按 **distinct sku** 计(与改前逐字同口径),组合数另起三档 ——
+    混单位的话摘要里的「可解析率」会随店数漂,而没人看得出来。"""
+    one = [(None, "102460018738"), (None, "怪东西")]
+    many = [(s, k) for s in ("T1", "T2", "T3") for _, k in one]
+    _, b1 = sa.resolve_pairs(_Conn(), one)
+    _, b3 = sa.resolve_pairs(_Conn(), many)
+    for k in ("asin", "wrapped", "numeric", "other"):
+        assert b1.get(k) == b3.get(k), k
+    assert b1["pairs"] == 2 and b3["pairs"] == 6
+    # docstring 必须写死单位,否则下一个人一定读串
+    assert "distinct sku" in sa.resolve_pairs.__doc__
 
 
 def test_samples_only_reports_the_buckets_a_human_has_to_look_at():
     """只报 numeric/other:asin/wrapped 是提得出的,不需要人认。
     新形态先进「其他」桶带样本报出来,人认了再扩规则。"""
     skus = [f"{i:012d}" for i in range(7)] + ["怪A", "怪B"]
-    _, buckets = sa.resolve_skus(_Conn(), skus)
-    got = sa.samples(skus, buckets)
+    pairs = [(None, s) for s in skus]
+    _, buckets = sa.resolve_pairs(_Conn(), pairs)
+    got = sa.samples(pairs, buckets)
     assert set(got) == {"numeric", "other"}
     assert len(got["numeric"]) == 5          # 每桶前 5 个
     assert got["other"] == ["怪A", "怪B"]
     # 桶为空就不出现(摘要里不印一行空样本)
-    assert sa.samples(["B0GXX75JN5"], {"asin": 1}) == {}
+    assert sa.samples([(None, "B0GXX75JN5")], {"asin": 1}) == {}
+
+
+def test_samples_dedupes_a_sku_that_spans_stores():
+    """样本先按 sku 去重:同一个 numeric sku 在 3 家店会把 5 个样本位占掉 3 个,
+    而样本的全部作用就是让人认**新形态**。"""
+    pairs = [(s, k) for k in ("102460018738", "998877665544")
+             for s in ("T1", "T2", "T3")]
+    got = sa.samples(pairs, {"numeric": 6})
+    assert got["numeric"] == ["102460018738", "998877665544"]
 
 
 # ── 登记簿那一跳(SKU 改造批次 0a)────────────────────────────────────────────

@@ -163,10 +163,8 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(order.get("customerOrderId") or ""),
             "sku": sku,
-            # A1.5:落库当场清洗,不留给后台补(2026-08-15)。规则唯一出处
-            # services/sku_asin;纯数字 item_id 形态这里提不出(要查库),
-            # 由 order_asin_normalize 扫尾——所以下面的 upsert 用 COALESCE 守着
-            "asin": sku_asin.extract_asin(sku),
+            # asin 不在这里算 —— 它要查登记簿(要连接),统一由
+            # upsert_order_lines 落库当场补(唯一实现路径,见 _fill_asins)
             "product_name": str((ol.get("item") or {}).get("productName") or ""),
             "qty": int(_num((ol.get("orderLineQuantity") or {}).get("amount"), 1) or 1),
             "sale_status": st.get("status", ""),
@@ -371,7 +369,9 @@ def settle_status(net: float, gross: float) -> str:
 # **全 0 不覆盖已有的真电话**——旧系统的「电话全 0 保护」,legacy_survey 明列为
 # 必须照搬的防线,此前漏了。覆盖掉就找不回来:raw 也是每次一起被覆盖的。
 # 反向不设防:真电话覆盖全 0 是正常修复。
-# 算不出就别覆盖:order_sync 拿纯数字 sku 提不出 asin,而扫尾工作流查库能填出来
+# 算不出就别覆盖:order_sync 对**纯数字 item_id 形态**仍提不出 asin(那一跳要按
+# (店, item_id) 查 walmart_items,写入路径上做不了),由 order_asin_normalize
+# 扫尾 —— 登记簿接上以后这条守卫**照样不能拆**
 _ASIN_GUARD = "COALESCE(EXCLUDED.asin, t.asin)"
 
 _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
@@ -448,8 +448,27 @@ _SETTLEMENT_COLS = [
     "original_commission", "commission_saving", "incentive", "settle_date", "raw"]
 
 
+def _fill_asins(conn, rows: list[dict]) -> int:
+    """输入:连接 + order_lines 行 → 输出:补出 asin 的行数(规则唯一出处 services/sku_asin)。
+
+    一批一条 SELECT(order_sync 是每店一批),**不许退化成逐行往返**。
+    解不出写 None:订单链的口径是「提不出留 NULL」,拿 sku 原文兜底会让三段式/
+    纯数字形态在采集库里永远查空,看起来像"这个产品一单没卖过"(静默错信号)。
+    """
+    if not rows:
+        return 0
+    m = sku_asin.resolve_many(
+        conn, [(r.get("store"), r.get("sku")) for r in rows if r.get("sku")])
+    n = 0
+    for r in rows:
+        r["asin"] = m.get((r.get("store"), r.get("sku")))
+        n += 1 if r["asin"] else 0
+    return n
+
+
 def upsert_order_lines(conn, rows: list[dict]) -> int:
     """输入:连接 + extract_order_lines 产出 → 输出:写入行数。审核列不在此覆盖。"""
+    _fill_asins(conn, rows)
     for r in rows:
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)

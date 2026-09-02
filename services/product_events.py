@@ -83,7 +83,7 @@ status_changed 观测自动入账(动作不记,生死后果必记)。
 import json
 import logging
 
-from services.sku_asin import extract_asin
+from services import sku_asin
 
 logger = logging.getLogger("services.product_events")
 
@@ -166,14 +166,26 @@ def record_many(conn, rows: list[dict]) -> int:
     if bad:
         raise ValueError(f"未登记的事件码 {bad}:先在 services/product_events.py "
                          f"的常量与 EVENTS 登记,再使用(唯一出处纪律)")
+    # asin 两条路:带 store 的走登记簿(切码后唯一通路);store 为空的**平台级
+    # 事件**没有店维度可查(登记簿主键是 (store, sku)),保持形态提取 —— 它们的
+    # sku 本来就是 asin,extract_asin 恒等返回。平台级来源共四处:
+    #   services/product_ingest.py(product_ingested)
+    #   services/audit_store.py event_row(audit_passed/rejected)
+    #   workflows/product_audit.py(audit_backfill 补采)
+    #   workflows/audit_history_fold.py(**直插 SQL,绕过本函数**,asin 列直填)
+    # ⚠ cleanup_history_import **带 store**(services/cleanup_history.py),
+    #   走登记簿腿,不在平台级之列。两条路都提不出存 NULL,消费方 coalesce(asin, sku)。
+    asin_of = sku_asin.resolve_many(
+        conn, [(r["store"], r["sku"]) for r in rows if r.get("store")])
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.product_events "
             "(sku, asin, store, event, source, error_code, detail, occurred_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
-            # asin 由 sku 清洗得出(services/sku_asin 唯一规则出处);提不出
-            # 存 NULL——消费方用 coalesce(asin, sku),等规则扩了跑 sku_normalize 补
-            [(r["sku"], extract_asin(r["sku"]), r.get("store"), r["event"],
+            [(r["sku"],
+              (asin_of.get((r["store"], r["sku"])) if r.get("store")
+               else sku_asin.extract_asin(r["sku"])),
+              r.get("store"), r["event"],
               r["source"], r.get("error_code"),
               json.dumps(r["detail"], ensure_ascii=False, default=str)
               if r.get("detail") is not None else None,

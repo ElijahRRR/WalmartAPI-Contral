@@ -110,6 +110,17 @@ def _rebuild_brand(do_apply: bool) -> str:
             f" + 时间线推导 {st['derived']} 个;beyKyi 整表重写 {n} 行")
 
 
+def _opaque_note(c: dict) -> str:
+    """输入:backfill_counts 结果 → 输出:不透明码键告警(零时返空串)。
+
+    零时返空串是硬要求:摘要要与加这一档之前逐字相同(生产库里今天不该有
+    不透明码)。非零 = 那批键登记簿查不到,拦不住任何东西(见 D-0b-1)。
+    """
+    n = c.get("opaque") or 0
+    return (f";⚠ 其中 {n} 个键形如不透明码(登记簿查不到 ⇒ 拦不住任何东西),"
+            f"见 D-0b-1") if n else ""
+
+
 def _rebuild_asin(do_apply: bool) -> str:
     """输入:是否 apply → 输出:ASIN 黑名单重建摘要。先跑 sku_normalize
     清洗事件账本,再来重建——否则重灌出来的键还是订货号原文。"""
@@ -121,7 +132,8 @@ def _rebuild_asin(do_apply: bool) -> str:
             return (f"ASIN 黑名单重建预览:时间线按标准 asin 归并后共 "
                     f"{c['total']} 个,永久禁止 {c['permanent']} 个;"
                     f"ASIN 表现有 {filled} 行将被整表重写为 {c['permanent']} 行"
-                    f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行")
+                    f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行"
+                    + _opaque_note(c))
         st = blacklist.rebuild_asin_blacklist(conn)
     n = sheets.rewrite_sheet(sheet, sheets.ASIN_ALL,
                              sheets.ASIN_MARK_ALL,
@@ -156,7 +168,8 @@ def run(params: dict) -> str:
                 return (f"历史回填预览:时间线共 {c['total']} 个 ASIN,"
                         f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单);"
                         f"品牌渠道的历史重建走 -p rebuild_brand=1;"
-                        f"加 -p apply=1 真写并顺路投影")
+                        f"加 -p apply=1 真写并顺路投影"
+                        + _opaque_note(c))
             st = blacklist.backfill_from_events(conn)
         lines.append(f"历史回填:ASIN +{st['asin_new']}")
 

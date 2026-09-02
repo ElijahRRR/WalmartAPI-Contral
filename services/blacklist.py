@@ -48,7 +48,7 @@ PG 权威,飞书只是人机界面。
 import json
 import logging
 
-from services.sku_asin import extract_asin
+from services import sku_asin, sku_codec
 
 logger = logging.getLogger("services.blacklist")
 
@@ -88,20 +88,32 @@ def record_asins(conn, items: list[dict]) -> int:
     """输入:连接 + 当轮已归类 item(store/sku/category/reasons)
     → 输出:新入选数。永久禁止 = 一次入选,已在名单的不更新(DO NOTHING)。
 
-    黑名单键 = 清洗后的标准 asin(sku_asin 规则;提不出用订货号原文兜底,
-    宁可键不标准也不丢行),订货号原文存 src_sku 溯源。"""
+    黑名单键 = 登记簿反查出的 source_key(切码后唯一通路),查不到回落形态提取,
+    再不行用订货号原文兜底并**告警计数**,宁可键不标准也不丢行(口径见 D-0b-1);
+    订货号原文永远存 src_sku 溯源。"""
+    asin_of = sku_asin.resolve_many(
+        conn, [(it.get("store"), it["sku"]) for it in items
+               if it.get("category") in PERMANENT])
+    fell_back: list[str] = []
     added = 0
     with conn.cursor() as cur:
         for it in items:
             code = it.get("category")
             if code not in PERMANENT:
                 continue
-            asin = extract_asin(it["sku"]) or it["sku"]
+            asin = asin_of.get((it.get("store"), it["sku"]))
+            if not asin:
+                asin = it["sku"]
+                fell_back.append(it["sku"])
             cur.execute(_ASIN_SQL, (
                 asin, code, source_label(code),
                 (it.get("reasons") or "")[:200] or None,
                 it.get("store"), is_biz_cn(it.get("reasons")), it["sku"]))
             added += cur.rowcount or 0
+    if fell_back:
+        logger.warning("ASIN 黑名单:%d 个 sku 登记簿与形态都解不出,按订货号原文"
+                       "入键(键不标准,按 ASIN 的重上架拦截对它们不生效):%s",
+                       len(fell_back), fell_back[:5])
     return added
 
 
@@ -141,6 +153,11 @@ def collect_brands(conn, items: list[dict]) -> dict:
     等 product_ingest 补上后下一轮自然重试,标了就永远漏了。
     """
     stats = {"brand_new": 0, "brand_known": 0, "no_brand": 0, "skipped": 0}
+    # 去重键是 sku 不是 asin:切码后 sku 全局唯一 ⇒ 同一 ASIN 在两家店各收一次
+    # 品牌(渠道表/闸门表都 DO NOTHING 幂等,只多一次查库);改成 asin 会改变
+    # 存量三段式行的去重粒度,不在本批次范围(见 D-0b-3)。
+    # ⚠ 折叠后的 it["store"] 只是**任意一家**(同 sku 多店时后写覆盖先写),
+    #   只准用于溯源列,**不得当查询键** —— 下面按「该 sku 出现过的全部店」反查。
     cands = {it["sku"]: it for it in items
              if it.get("category") in BRAND_CATEGORIES}
     if not cands:
@@ -152,9 +169,21 @@ def collect_brands(conn, items: list[dict]) -> dict:
         todo = {a: it for a, it in cands.items() if a not in done}
         if not todo:
             return stats
-        # 采集库按**清洗后的标准 asin** 查(订货号原文直接查必然全空——
-        # 2026-08-11 生产实证:2,702 个 C/E 品牌 0 命中,教训在此)
-        asin_of = {sku: (extract_asin(sku) or sku) for sku in todo}
+        # 登记簿反查是主路,形态提取只是存量兜底;采集库按**清洗后的标准 asin**
+        # 查(订货号原文直接查必然全空——2026-08-11 生产实证:2,702 个 C/E 品牌
+        # 0 命中,教训在此)
+        stores_of: dict[str, list] = {}
+        for it in items:
+            if it.get("category") in BRAND_CATEGORIES:
+                stores_of.setdefault(it["sku"], []).append(it.get("store"))
+        for sku in stores_of:                      # 定序:与 items 顺序无关
+            stores_of[sku] = sorted(set(stores_of[sku]),
+                                    key=lambda s: (s is None, s or ""))
+        resolved = sku_asin.resolve_many(
+            conn, [(st, sku) for sku in todo for st in stores_of.get(sku, [])])
+        asin_of = {sku: next((resolved[(st, sku)] for st in stores_of.get(sku, [])
+                              if (st, sku) in resolved), None) or sku
+                   for sku in todo}
         cur.execute(_BRAND_OF_SQL, (list(set(asin_of.values())),))
         brand_of = {a: b for a, b in cur.fetchall()}
         for sku, it in todo.items():
@@ -202,22 +231,37 @@ def load_banned_asins(conn) -> dict:
 # 最新:同一 ASIN 在 A 店旧类别 B、B 店新类别 A(过期)⇒ 最新是可修复类,
 # 不入选。来源标签的 CASE 必须与 source_label 同表(有测试钉住,别漂)。
 
-# 身份 = coalesce(asin, sku):清洗出的标准码优先,提不出用订货号原文兜底。
-# 多个订货号(不同店同一产品)归并到同一 asin,最新类别看**产品级**全局最新。
+# 身份 = coalesce(登记簿 source_key, asin, sku):登记簿是切码后的唯一通路,
+# 其次是 record_many 清洗出的标准码,再不行才用订货号原文兜底(口径与
+# record_asins 一致,见 D-0b-1)。多个订货号(不同店同一产品)归并到同一
+# asin,最新类别看**产品级**全局最新。
+# ⚠ LEFT JOIN 且限 source_type='amz':非 amz 行的 source_key 是 GTIN/offer_id,
+#   拿它当 ASIN 黑名单键是错的类型(与 0a 全部收口点的身份表达式同形)。
 _LATEST_CTE = """
-WITH latest AS (
-    SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku) AS asin,
+WITH ev AS (
+    SELECT e.*, coalesce(ls.source_key, e.asin, e.sku) AS ident
+    FROM catalog.product_events e
+    LEFT JOIN catalog.listing_sources ls
+           ON ls.store = e.store AND ls.sku = e.sku AND ls.source_type = 'amz'
+    WHERE e.event = 'problem_categorized'),
+latest AS (
+    SELECT DISTINCT ON (ident) ident AS asin,
            sku, store, occurred_at,
            detail->>'category' AS cat, detail->>'reason' AS reason
-    FROM catalog.product_events
-    WHERE event = 'problem_categorized'
-    ORDER BY coalesce(asin, sku), occurred_at DESC)
+    FROM ev
+    ORDER BY ident, occurred_at DESC)
 """
 
-_BACKFILL_COUNT_SQL = _LATEST_CTE + """
+# `opaque` 是**只读告警计数**:键形如 12 位不透明码 = 登记簿查不到那批,拦不住
+# 任何东西(它匹配不到任何真 ASIN,也不误伤)。只计数不过滤 —— 过滤会丢行,
+# 那是 D-0b-1 要拍板的口径,不混进零行为变化批次。字符类**不许手写字面量**:
+# 从 services.sku_codec 的字母表常量拼进来(字母表唯一之家)。
+_BACKFILL_COUNT_SQL = _LATEST_CTE + f"""
 SELECT count(*) FILTER (WHERE cat = ANY(%(perm)s)) AS permanent,
        count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
-       count(*) AS total
+       count(*) AS total,
+       count(*) FILTER (WHERE asin ~ '^[{sku_codec._ALPHABET}]{{{sku_codec._LEN}}}$'
+                          AND asin ~ '[A-Z]') AS opaque
 FROM latest
 """
 
@@ -245,8 +289,9 @@ def backfill_counts(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute(_BACKFILL_COUNT_SQL,
                     {"perm": sorted(PERMANENT), "brandcats": sorted(BRAND_CATEGORIES)})
-        permanent, brand_cand, total = cur.fetchone()
-    return {"permanent": permanent, "brand_cand": brand_cand, "total": total}
+        permanent, brand_cand, total, opaque = cur.fetchone()
+    return {"permanent": permanent, "brand_cand": brand_cand, "total": total,
+            "opaque": opaque}
 
 
 def backfill_from_events(conn) -> dict:

@@ -14,13 +14,17 @@ catalog.listing_sources 里 source_type='amz' 的行——没登记来源的在�
 「存量按 SKU 格式一次性回填」的落地件)。
 
 2026-08-19 所有者定稿**常驻 product_chain**(紧跟 catalog_sync):新发现的
-在架商品当轮补关联、当轮就能被维护。零缺口时零成本(一次 SELECT);
-旧系统调度停干净后,摘要长期应为 0 行 —— **非零本身就是报警**
-(有人绕过「谁上架谁登记」的规矩把商品弄上架了)。
+在架商品当轮补关联、当轮就能被维护。零缺口时零成本(一次 SELECT)。
+摘要按两桶分开读(2026-09-02 起,切码后原来那句「非零即报警」当场作废):
+**旧格式存量**非零 = 旧系统还在产出(已知噪声,不报警);
+**疑似新码漏登记**非零 = 上架主链被绕过(真报警——不透明码只能由
+sku_codec.mint 发码即登记,在架却查不到登记行说明有人绕过了它,或 mint 的
+写库事务回滚过)。
 
 规则(与设计定稿一致,一条不加):
   · sku 形如 ASIN(B+9 位大写字母数字)→ source_type='amz',source_key=sku
-    (sku=asin 约定,与 list_new 登记的行完全同构);
+    (sku=asin 约定**仅对存量成立**;新码由 mint 登记,不走本工作流,
+    与 list_new 登记的行完全同构);
   · 其余 → 'unknown':**不参与任何自动破坏动作**(路由铁律),等人工归类;
   · ON CONFLICT DO NOTHING:绝不覆盖 list_new / match_listing 已登记的行;
   · workflow 列写 'backfill'(格式回填的统一记号,出身可审计)。
@@ -35,7 +39,7 @@ import logging
 import re
 
 from registry import db
-from services import listing_sources
+from services import listing_sources, sku_codec
 
 DANGEROUS = False   # 只写登记簿一张表(DO NOTHING 幂等),不发 feed 不动状态
 
@@ -64,20 +68,34 @@ def run(params: dict) -> str:
             cur.execute(_SQL_GAP)
             gap = cur.fetchall()
         amz = [(s, k) for s, k in gap if _ASIN_RE.fullmatch(k or "")]
-        other = [(s, k) for s, k in gap if not _ASIN_RE.fullmatch(k or "")]
+        rest = [(s, k) for s, k in gap if not _ASIN_RE.fullmatch(k or "")]
+        # 旧格式存量(三段式/纯数字/跟卖号/人工号)vs 疑似新码漏登记 ——
+        # 后者才是报警:不透明码只能由 sku_codec.mint 在同一事务里发+登记,
+        # 在架却查不到登记行 = 「谁上架谁登记」被绕过了(或 mint 写库回滚过)。
+        # 形态判据不在本文件复制:唯一之家是 services/sku_codec(D-0b-8)
+        orphan = [(s, k) for s, k in rest if sku_codec.is_opaque(k or "")]
+        legacy = [(s, k) for s, k in rest if not sku_codec.is_opaque(k or "")]
         by_store: dict[str, int] = {}
         for s, _k in gap:
             by_store[s] = by_store.get(s, 0) + 1
         mode = "" if execute else "🧪 [DRY-RUN] "
         lines = [f"{mode}在架未登记来源(维护链盲区):{len(gap)} 行 —— "
                  f"格式像 ASIN(登记 amz){len(amz)},"
-                 f"其余(登记 unknown,不自动维护){len(other)}"]
+                 f"旧格式存量(登记 unknown,不自动维护){len(legacy)}"]
+        # ⚠ insert(1,...) 不是 insert(0,...):本工作流常驻 product_chain,
+        # 链通知只取首行 —— 顶掉 🧪 抬头会让一次 dry-run 的告警以真跑的面目
+        # 出现在飞书里。告警行自带 mode 前缀,单独看也认得出是不是空跑。
+        if orphan:
+            lines.insert(1, f"{mode}⚠ 疑似新码漏登记 {len(orphan)} 行 —— "
+                            f"不透明码只能由 sku_codec.mint 发码即登记,"
+                            f"在架却无登记行说明有人绕过了上架主链或 mint 事务回滚过;"
+                            f"样本={[k for _s, k in orphan[:5]]}")
         if gap:
             top = sorted(by_store.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
             lines.append("  分店:" + ",".join(f"{s}×{n}" for s, n in top)
                          + (" …" if len(by_store) > 8 else ""))
-        if other:
-            lines.append(f"  unknown 样本:{[k for _s, k in other[:8]]}")
+        if legacy:
+            lines.append(f"  unknown 样本:{[k for _s, k in legacy[:8]]}")
         if not execute:
             if gap:
                 lines.append("  真跑将写 catalog.listing_sources(DO NOTHING "

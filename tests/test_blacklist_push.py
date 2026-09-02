@@ -158,12 +158,28 @@ def test_backfill_case_labels_match_source_label():
 def test_backfill_selects_latest_category_only():
     """入选按**最新**类别(DISTINCT ON + occurred_at DESC)——历史里类别
     翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。身份 =
-    coalesce(asin, sku):清洗出的标准码优先、订货号原文兜底(2026-08-11
-    实证 sku≠asin,多店订货号须归并到产品级)。SQL 文本钉死。"""
+    coalesce(登记簿 source_key, asin, sku):登记簿是切码后的唯一通路,其次是
+    record_many 清洗出的标准码,再不行才用订货号原文(2026-08-11 实证 sku≠asin,
+    多店订货号须归并到产品级)。SQL 文本钉死。"""
     from services import blacklist as bl
-    assert "DISTINCT ON (coalesce(asin, sku))" in bl._LATEST_CTE
-    assert "ORDER BY coalesce(asin, sku), occurred_at DESC" in bl._LATEST_CTE
+    assert "DISTINCT ON (ident) ident AS asin" in bl._LATEST_CTE
+    assert "ORDER BY ident, occurred_at DESC" in bl._LATEST_CTE
     assert "ON CONFLICT (asin) DO NOTHING" in bl._BACKFILL_ASIN_SQL
+
+
+def test_backfill_preview_is_byte_identical_when_no_opaque_keys(wired, monkeypatch):
+    """opaque=0 时预览文案里不许出现 ⚠ —— 这一档是**新加的只读告警**,
+    生产库今天不该有不透明码,摘要必须与加它之前逐字相同。"""
+    monkeypatch.setattr(wf.blacklist, "backfill_counts",
+                        lambda conn: {"total": 20, "permanent": 10,
+                                      "brand_cand": 3, "opaque": 0})
+    out = wf.run({"backfill": "1"})
+    assert "⚠" not in out and "永久禁止 10 个" in out
+
+    monkeypatch.setattr(wf.blacklist, "backfill_counts",
+                        lambda conn: {"total": 20, "permanent": 10,
+                                      "brand_cand": 3, "opaque": 7})
+    assert "⚠ 其中 7 个键形如不透明码" in wf.run({"backfill": "1"})
 
 
 def test_rebuild_asin_apply_overwrites_and_marks_all(wired, monkeypatch):
@@ -207,7 +223,7 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def execute(self, sql, args=None):
             if "INSERT" in sql:
                 wrote.append(sql)
-        def fetchone(self): return (10, 3, 20)
+        def fetchone(self): return (10, 3, 20, 0)   # 末位 = opaque 告警计数
         def fetchall(self): return []
 
     class _Conn:

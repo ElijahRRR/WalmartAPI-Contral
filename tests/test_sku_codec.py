@@ -40,6 +40,10 @@ class _Cur:
     def fetchone(self):
         return self.conn.next_row
 
+    def fetchall(self):
+        # record_many 的登记簿反查(批次 0b):本夹具不造登记行 ⇒ 走形态腿
+        return []
+
 
 class _Conn:
     """脚本化的假连接:按 SQL 形状路由,每种查询的返回值由构造参数排队给出。"""

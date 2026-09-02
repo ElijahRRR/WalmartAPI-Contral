@@ -35,12 +35,48 @@ def test_record_many_serializes_detail():
         {"sku": "S2", "event": "item_missing", "source": "catalog_sync"},
     ])
     assert n == 2
-    sql, rows = conn.sqls[0]
+    # 第一行带 store=T1 ⇒ INSERT 之前多一条登记簿 SELECT(批次 0b)
+    sql, rows = conn.sqls[-1]
     assert "INSERT INTO catalog.product_events" in sql
     assert rows[0][0] == "S1" and '"feed_id"' in rows[0][6]
     assert rows[0][1] is None          # 'S1' 提不出标准码 → asin 存 NULL
     assert rows[1][1] is None and rows[1][5] is None      # store/detail 可空
     assert pe.record_many(conn, []) == 0                  # 空集不发 SQL
+
+
+def test_record_many_resolves_asin_via_registry_when_store_present():
+    """带 store 的行走登记簿:切码后 sku 是 12 位随机码,形态提取恒返 None ⇒
+    事件账本的身份退化成按码分叉,product_risk 四个视图的 coalesce(asin, sku)
+    全部失效,时间线断成一段一段(而且不报错)。"""
+    conn = _Conn(fetch=[("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    pe.record_many(conn, [{"sku": "AK7QM2X9RT4W", "store": "T1",
+                           "event": "item_missing", "source": "catalog_sync"}])
+    reg_sql, _ = conn.sqls[0]
+    assert "catalog.listing_sources" in reg_sql
+    _, rows = conn.sqls[-1]
+    assert rows[0][1] == "B0ABCDEFGH"
+
+
+def test_record_many_falls_back_to_shape_for_platform_events():
+    """store 为空的**平台级事件**没有店维度可查(登记簿主键是 (store, sku)),
+    保持形态提取 —— 它们的 sku 本来就是 asin,extract_asin 恒等返回。
+    这批行**一条 SELECT 都不该发**。"""
+    conn = _Conn()
+    pe.record_many(conn, [{"sku": "XKJ-B0GXX75JN5-39.98",
+                           "event": "item_missing", "source": "catalog_sync"}])
+    assert len(conn.sqls) == 1                      # 只有那条 INSERT
+    _, rows = conn.sqls[-1]
+    assert rows[0][1] == "B0GXX75JN5"
+
+
+def test_record_many_issues_one_lookup_per_call():
+    """一次调用一条批量 SELECT:最坏调用方 cleanup_history_import 每批 1 万行
+    且**带 store**,逐行往返会把历史导入拖成天级。"""
+    conn = _Conn()
+    pe.record_many(conn, [{"sku": f"B0AAAAAA{i:02d}", "store": "T1",
+                           "event": "item_missing", "source": "catalog_sync"}
+                          for i in range(200)])
+    assert len(conn.sqls) == 2                      # 一条 SELECT + 一条 INSERT
 
 
 def test_receipt_in_ledger_whitelist():

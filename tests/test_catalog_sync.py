@@ -266,6 +266,10 @@ class _FakeCursor:
             self.rows = [("S1",), ("S2",)]
         elif "SELECT sku, published_status" in sql:
             self.rows = []
+        elif "catalog.listing_sources" in sql:
+            # record_many 的登记簿反查(批次 0b):这个夹具里没有登记行,
+            # 不清空的话上一条 RETURNING 的行会被当成登记簿结果喂回去
+            self.rows = []
 
     def executemany(self, sql, seq):
         batch = list(seq)

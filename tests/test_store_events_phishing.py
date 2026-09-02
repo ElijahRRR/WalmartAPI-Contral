@@ -163,6 +163,17 @@ def test_normal_path_records_origin_store_and_expands(monkeypatch):
     assert d["brand"] == "Zqx Phish" and d["asin"] == "B0PHISH0001"
 
 
+def test_phish_record_uses_line_asin(monkeypatch):
+    """钓鱼落账取 ASIN 收编到 services/order_audit.line_asin —— 订单链上
+    "怎么算出 ASIN"只准有一份实现,否则守门测试钉不住,漏改一处不报错。"""
+    conn = _Conn(_products([("B0PHISH0001", "Zqx Phish", None)]))
+    landed, _ = _record(monkeypatch, conn, oa._phish_cands(
+        [(_line(sku="AK7QM2X9RT4W", asin="B0PHISH0001"), _Res())]))
+    assert landed[0]["detail"]["asin"] == "B0PHISH0001"
+    src = open(oa.__file__, encoding="utf-8").read()
+    assert "sku_asin" not in src and "rules.line_asin" in src
+
+
 def test_asin_missing_records_origin_store_only(monkeypatch):
     """订单行没 ASIN 列、SKU 也解不出标准码 → 只记收单店。"""
     conn = _Conn(_products([]))

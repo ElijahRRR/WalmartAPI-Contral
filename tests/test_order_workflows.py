@@ -119,7 +119,9 @@ def test_order_sync_end_to_end(monkeypatch):
 
     out = order_sync.run({"days": "7"})
     assert "1/1 店完成" in out and "订单行入库 2" in out
-    kind, sql, rows = calls[0]
+    # calls[0] 是 upsert_order_lines 落库前那条登记簿反查(批次 0b 起 asin 在
+    # 写入侧补),真正的写在第一条 executemany 上
+    kind, sql, rows = next(c for c in calls if c[0] == "many")
     assert kind == "many" and "orders.order_lines" in sql
     assert {r["sku"] for r in rows} == {"A", "B"}
     # 审核列绝不在 upsert 列内(重拉不得冲掉审核结论)

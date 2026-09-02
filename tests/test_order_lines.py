@@ -269,14 +269,20 @@ def test_aggregate_settlement_sku_lookup_fallback_and_skip():
 # ── upsert SQL 形态 ──────────────────────────────────────────────────────────
 
 class _FakeCursor:
-    def __init__(self):
+    def __init__(self, reg=()):
         self.calls, self.rowcount = [], 3
+        self.reg = list(reg)
 
     def executemany(self, sql, rows):
         self.calls.append((sql, list(rows)))
 
     def execute(self, sql, args=None):
         self.calls.append((sql, args))
+
+    def fetchall(self):
+        # 批次 0b:upsert_order_lines 落库前先查一次登记簿(_fill_asins)。
+        # 没有这个方法的话新增的那条 SELECT 会当场 AttributeError
+        return list(self.reg)
 
     def __enter__(self):
         return self
@@ -286,18 +292,22 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self):
-        self.cur = _FakeCursor()
+    def __init__(self, reg=()):
+        self.cur = _FakeCursor(reg)
 
     def cursor(self):
         return self.cur
+
+    def _many(self):
+        """输入:无 → 输出:第一条 executemany 的 (sql, rows)(跳过登记簿 SELECT)。"""
+        return next(c for c in self.cur.calls if isinstance(c[1], list))
 
 
 def test_upserts_build_conflict_sql():
     conn = _FakeConn()
     n = ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
     assert n == 1
-    sql, rows = conn.cur.calls[0]
+    sql, rows = conn._many()
     assert "ON CONFLICT (order_line_id)" in sql and "updated_at = now()" in sql
     assert rows[0]["po_id"] == "108000000001"
 
@@ -311,6 +321,59 @@ def test_upserts_build_conflict_sql():
     assert isinstance(rows2[0]["detail"], str)                 # dict 已序列化
 
 
+def test_extract_order_lines_no_longer_computes_asin():
+    """asin 不在纯函数里算 —— 它要查登记簿(要连接),统一由唯一写入口
+    upsert_order_lines 落库当场补。留一份 extract 时点的算法 = 两条实现路径。"""
+    rows = ol.extract_order_lines("T1", _ORDER)
+    assert rows and "asin" not in rows[0]
+
+
+def test_upsert_fills_asin_from_the_registry():
+    """登记簿有 amz 行 ⇒ 键取 source_key(切码后这是唯一通路:不透明码对
+    形态提取恒返 None,不接这一跳 order_lines.asin 就恒 NULL,产品分的
+    销量/退货率维度整个退出,而且不报错)。"""
+    rows = ol.extract_order_lines("T1", _ORDER)
+    sku = rows[0]["sku"]
+    conn = _FakeConn(reg=[("T1", sku, "B0REGISTER")])
+    ol.upsert_order_lines(conn, rows)
+    _, written = conn._many()
+    assert written[0]["asin"] == "B0REGISTER"
+
+
+def test_upsert_leaves_asin_null_when_unresolvable():
+    """两条腿都提不出就留 None,**绝不写 sku 原文**:订单链的口径是
+    「提不出留 NULL」(所有者 2026-08-15),原文兜底在采集库永远查空,
+    看起来像"这个产品一单没卖过"——一个静默的错误信号。"""
+    conn = _FakeConn()
+    rows = [{"order_line_id": "L1", "store": "T1", "sku": "102460018738"}]
+    ol.upsert_order_lines(conn, rows)
+    _, written = conn._many()
+    assert written[0]["asin"] is None
+
+
+def test_upsert_asin_guard_still_coalesces():
+    """纯数字 item_id 形态是本批次唯一没被登记簿补掉的口子(那一跳要查
+    walmart_items),由 order_asin_normalize 扫尾 —— 这条守卫**不能拆**,
+    拆了每轮同步都会把扫尾填好的值冲回 NULL。"""
+    assert ol._ASIN_GUARD == "COALESCE(EXCLUDED.asin, t.asin)"
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
+    sql, _ = conn._many()
+    assert "asin = COALESCE(EXCLUDED.asin, t.asin)" in sql
+
+
+def test_fill_asins_is_one_query_per_batch():
+    """一批一条 SELECT(order_sync 是每店一批):退化成逐行往返的话,
+    cleanup/同步这类万级批量会把连接打满,而功能看起来完全正常。"""
+    conn = _FakeConn()
+    rows = [{"order_line_id": f"L{i}", "store": "T1", "sku": f"B0ABCDEF{i:02d}"}
+            for i in range(50)]
+    assert ol._fill_asins(conn, rows) == 50
+    assert len(conn.cur.calls) == 1
+    assert ol._fill_asins(conn, []) == 0        # 空批不开游标
+    assert len(conn.cur.calls) == 1
+
+
 def test_upsert_skips_write_when_nothing_changed():
     """内容没变就整行不写——updated_at 才能表示"这行什么时候变的"。
 
@@ -321,7 +384,7 @@ def test_upsert_skips_write_when_nothing_changed():
     """
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
-    sql, _ = conn.cur.calls[0]
+    sql, _ = conn._many()
     body = sql.split("DO UPDATE")[1]
     assert "IS DISTINCT FROM" in body, "没有变更检测 = 每轮全窗口重写"
     # 变更检测比的是**生效后的值**,不是 EXCLUDED——否则被 guard 挡下的
@@ -338,7 +401,7 @@ def test_upsert_phone_all_zero_never_overwrites_real_number():
     """
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
-    sql, _ = conn.cur.calls[0]
+    sql, _ = conn._many()
     guard = [seg for seg in sql.split(",") if "phone =" in seg]
     assert guard, "phone 列必须走保护表达式而不是裸 EXCLUDED"
     assert "^0*$" in sql and "THEN t.phone" in sql

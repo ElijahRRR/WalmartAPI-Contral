@@ -536,7 +536,7 @@ def test_garbage_timestamps_from_walmart_become_null(caplog):
     o["orderDate"] = 907
     o["orderLines"]["orderLine"][0]["statusDate"] = 1     # 0 会回退到 statusSetDate,那是另一条路
     o["orderLines"]["orderLine"][0]["fulfillment"] = {"estimatedDeliveryDate": -18000000,
-                                                     "estimatedShipDate": 0}
+                                                     "estimatedShipDate": 1}   # 0 会回退到 shipDateTime
     with caplog.at_level("WARNING"):
         r = ol.extract_order_lines("T1", o)[0]
     assert r["order_date"] is None and r.get("_order_date_rejected") is True

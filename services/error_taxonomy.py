@@ -15,7 +15,8 @@
 
 公开面:`split_reasons / normalize_atom / extract_policy / classify_atom /
 classify_reasons / classify_feed_error / RULES`;另有报告侧消费的
-`POLICY_ALIASES / policy_join / alias_gaps`(只做政策表 join,不参与判定)。
+`policy_join`(只做政策表 join,不参与判定;2026-09-03 C 批随改名落地删掉了
+它背后的旧名别名表 —— 词形对不上就是缺口,不做语义合并)。
 """
 
 from __future__ import annotations
@@ -27,8 +28,8 @@ from typing import Iterable, NamedTuple
 from registry import resources
 # ⚠ 政策名归一化只有一份实现(`services/policy_names`);这里 import 的是**那一份**,
 #   不是抄一份进来 —— 两份归一化各自漂移不会报错,只会让同一个名字在报告侧与
-#   同步侧对到不同的行(见 `_norm_key`)。`policy_join` / `alias_gaps` 的形参
-#   恰好也叫 policy_names,故只引入函数本身,不引入模块名,免得同名两义。
+#   同步侧对到不同的行(见 `_norm_key`)。`policy_join` 的形参恰好也叫
+#   policy_names,故只引入函数本身,不引入模块名,免得同名两义。
 from services.policy_names import norm_category
 
 # 主码序 → 名次(记录级取"名次最小"的原子码,方案 §3.5)
@@ -343,29 +344,20 @@ def extract_policy(atom_raw: str | None) -> PolicyName:
 
 # ── 政策表 join(报告侧消费;**不参与判定**,policy_name 一律保留原文)──────
 #
-# **过渡期产物,生产改名落地后随第三步 L3 批删除**(定稿 §十.7:官方政策类别名
-# = 全链唯一键)。它存在的唯一理由是:报错正文里的政策名一直是**官方全称**,
-# 而政策表存量行用的是旧仓搬迁时的缩写名 —— 两边对不上,报告会把一堆真实存在的
-# 政策算成"政策表缺口"。`policy_sync` 把表内名改成官方拼写之后,直接键就命中了,
-# 这张表连同 `registry.resources.POLICY_LEGACY_NAMES` 一起退役。
-#
-# ⚠ **不手写**:从 `registry.resources.POLICY_LEGACY_NAMES`(仓内唯一一份旧名↔官方名映射,
-#   铁律 3)反向派生 —— {归一化(官方名): 表内旧名}。手抄第二份的后果不报错:
-#   所有者往映射表里追加一条,这边不知道,那条别名就静默不存在。
-# ⚠ 派生键跟着**官方拼写**走(旧手写表抄的是报错正文里的写法,例如 Tobacco 那条
-#   多一个牛津逗号)。2026-09-02 `_norm_key` 归并到 `norm_category` 之后,逗号与
-#   `&`↔`and` 本来就被归一化吃掉了,这个差别不再有影响 —— 但键仍以官方为准:
-#   别名指向的是政策表,而政策表以官方拼写为准。
-# ⚠ 别名只收「词形差」(and↔&、Radio Frequency↔RF 这类),**不做语义合并**:
-#   `Knives and other Melee Weapons`、`Firearm Accessories` 这种表里没有对应行的,
-#   该进"政策表缺口"清单让人看见,不许在这儿偷偷归到别的政策上。
-POLICY_ALIASES = {_norm_key(official): legacy
-                  for legacy, official in resources.POLICY_LEGACY_NAMES.items()}
-
-
+# ⚠ **别名表 `POLICY_ALIASES` / `alias_gaps` 已于 2026-09-03 C 批退役**
+#   (连同 `registry.resources.POLICY_LEGACY_NAMES` 与 `policy_names.to_official`)。
+#   它是改名过渡期的桥:报错正文里的政策名一直是**官方全称**,而政策表存量行
+#   用的是旧仓搬迁时的缩写名,两边对不上会把一堆真实存在的政策算成"政策表缺口"。
+#   2026-09-02 `policy_sync` 真跑把表内名全部改成官方拼写之后,**直接键就命中**,
+#   这座桥的两头连的是同一个地方 —— 留着 = 一份永远不会再被验证的历史映射。
+#   今后报错正文里出现表里没有的政策名,它就该进「政策表缺口」清单让人看见
+#   (那正是这张表原本明令禁止用来做语义合并的那一类)。
 def policy_join(candidate: str | None,
                 policy_names: Iterable[str] | None) -> str | None:
     """输入:政策名候选 + 政策表 category_en 集合 → 输出:命中的 category_en(不中给 None)。
+
+    只走词形归一(`policy_names.norm_category`)—— 缩写差这类**语义合并**不做:
+    对不上就是对不上,进「政策表缺口」清单等人裁决。
 
     ⚠ 表按**名字序**构造:入参常是 set,而归一化后两行撞同一个键时"谁赢"由
     迭代序决定 —— 不定序会让同一份报错语料在两次进程里 join 到不同的行,
@@ -374,31 +366,7 @@ def policy_join(candidate: str | None,
     if not candidate or not policy_names:
         return None
     table = {_norm_key(n): n for n in sorted(policy_names) if n}
-    key = _norm_key(candidate)
-    if key in table:
-        return table[key]
-    target = POLICY_ALIASES.get(key)
-    if target and _norm_key(target) in table:
-        return table[_norm_key(target)]
-    return None
-
-
-def alias_gaps(policy_names: Iterable[str] | None) -> tuple[str, ...]:
-    """输入:政策表 category_en 集合 → 输出:别名表里指不到表的目标值。
-
-    方案 §3.4.5 的运行时校验:别名的目标值(= 表内旧名)必须在注入字典里 ——
-    指不到 = 别名写错或政策表改名,那条别名等于静默失效。
-
-    ⚠ 2026-09-02 起这个信号**有两种读法**,别看见非空就当故障:改名落地前指不到
-    = 映射表写错了;`policy_sync` 把表内名改成官方拼写之后,7 个旧名里的 **5 个**
-    会指不到 —— 那不是失效,是这张别名表**功成身退**的信号(此时直接键已命中),
-    该做的是随第三步 L3 批把它与 `registry.resources.POLICY_LEGACY_NAMES` 一起删掉。
-    (另 2 个 —— `Auto & Motor Vehicles` / `Textiles & Apparel` —— 与官方名只差
-    `&`↔`and`,归一化后同键,所以"指得到";它们的别名同样已经多余。)
-    """
-    table = {_norm_key(n) for n in (policy_names or ()) if n}
-    return tuple(sorted({t for t in POLICY_ALIASES.values()
-                         if _norm_key(t) not in table}))
+    return table.get(_norm_key(candidate))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -778,42 +778,20 @@ AUDIT_RULES_VERSION = "c.2026-09-02.2"
 # c.2026-08-13.1  批次 C:L1 rerank + L3 语义 + L4 视觉接线
 
 
-# ── 政策表旧名 → 官方名(一次性迁移映射,2026-09-02)────────────────────────
+# ── 政策表旧名 → 官方名:**已退役**(2026-09-03 C 批)────────────────────
 #
-# 定稿 `docs/policy_sync.md` §十.7:**官方政策类别名 = 全链唯一键**。生产表
-# `audit.walmart_prohibited_policy` 的存量行用的是旧仓搬迁时的缩写名,按
-# `policy_sync.norm_category` 的词形归一化(&↔and / 逗号 / 括号后缀 / 单复数)
-# **故意对不上**官方全称 —— 缩写差是**语义合并**,不许在归一化里偷偷做。
-# 这张表就是那一步人工裁决的**落纸**:哪个旧名是哪个官方类别,由所有者认。
+# `POLICY_LEGACY_NAMES`(11 条旧缩写名 → 官方名)是 2026-09-02 那一次改名的
+# **一次性迁移映射**:`policy_sync` 凭它认领存量行把 `category_en` 改成官方
+# 拼写,`error_taxonomy.POLICY_ALIASES` 从它反向派生让改名落地前的报错 join
+# 照旧对得上。真跑当天两件事都做完了 —— 表内从此就是官方拼写,这张表指向的
+# 是**表里已经不存在的旧名**,留着 = 一份永远不会再被验证的历史映射,还多给
+# 了一条"归一化认不出就翻译一下再试"的暗道(`policy_names.to_official`)。
 #
-# 用途只有两处,都在过渡期内:
-#   · `policy_sync` 真跑时凭它认领存量行,把 `category_en` 改成官方拼写;
-#   · `services/error_taxonomy.POLICY_ALIASES` 从它**派生**(反向:官方名 →
-#     旧名),让改名落地前的报错文本 join 照旧对得上。
-#
-# ⚠ **仅为一次性迁移用**:生产改名落地后,这张表与 POLICY_ALIASES 一起
-#   随第三步 L3 批**整体删除**(留着 = 一份永远不会再被验证的历史映射)。
-# ⚠ 键是**表内旧名的精确字面量**(不归一化匹配:旧名是历史事实,不是词形);
-#   值必须与 `refdata/policy_pages/en/*.md` 的头注 H1 **逐字一致**(含
-#   Tobacco 那条**没有牛津逗号**、Children’s 的弯撇号 —— 官方怎么写就怎么抄)。
-# ⚠ 前 7 条来自生产存量实证(§十.6);后 4 条来自 2026-09-02 首跑 dry-run 报告的
-#   「官方已不含」清单 —— 3 条由报告「疑似改名对」点名,第 4 条 Biodegradable Plastic
-#   ↔ Product claims 按页面内容判定(官方 Product claims 页正文逐条列出
-#   Biodegradable / Degradable / Compostable 宣称,是同一政策页改名扩写)。
-#   所有者 dry-run 看到「未对上」里还有别的拼写差时,**在这里追加**,不要另起第二张表(双轨禁止)。
-POLICY_LEGACY_NAMES: dict[str, str] = {
-    "Auto & Motor Vehicles":      "Auto and Motor Vehicles",
-    "Textiles & Apparel":         "Textiles and Apparel",
-    "Drugs & Paraphernalia":      "Drugs and Drug Paraphernalia",
-    "Military & Law Enforcement": "Military and Law Enforcement Products",
-    "Electronics & RF":           "Electronics and Radio Frequency Devices",
-    "Ride-Ons & Micromobility":   "Ride-Ons and Micromobility Devices",
-    "Tobacco & Vaping":           "Tobacco, E-Cigarettes and Vaping Products",
-    "Jewelry/Precious Metals":    "Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals (Covered Goods)",
-    "Pet Products":               "Pet Foods, Supplements, Medicines and Other Products",
-    "Restricted/Illegal":         "Restricted/Illegal Products",
-    "Biodegradable Plastic":      "Product claims",
-}
+# 同批退役的三处:`policy_names.to_official` 与 `resolve` 的第 4 级、
+# `error_taxonomy.POLICY_ALIASES` / `alias_gaps`、`policy_sync` 对行的
+# 「经旧名认领」那一级。**改名从此是人工入口**:`policy_sync` 报告的
+# 「疑似改名对」把「未对上」与「官方已不含」里同概念的两条并排点名,由人裁决
+# 改名还是新增(代码不许偷偷做语义合并 —— 合错了是把 A 政策的正文写进 B 行)。
 
 
 # ── 审核类别词表:非政策类别与代码写死的政策名(2026-09-02 §二 定稿)───────

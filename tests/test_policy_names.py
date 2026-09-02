@@ -1,14 +1,16 @@
-"""政策名归一化与旧名翻译(services/policy_names)—— 仓内唯一那一份的守门。
+"""政策名归一化(services/policy_names)—— 仓内唯一那一份的守门。
 
-这个模块自己不写库、不判定,但它是**四条链的共同判据**:policy_sync 拿它对行、
-audit_l3 拿它把路由表对到政策表、audit_reason 拿它把 L3/规则给的政策名对回表内
-拼写、error_taxonomy 拿它 join 报错正文。所以它错了不会有人报错,只会:
+这个模块自己不写库、不判定,但它是**三条链的共同判据**:policy_sync 拿它对行、
+audit 侧拿它把 L3/规则给的政策名对回表内拼写、error_taxonomy 拿它 join 报错
+正文。所以它错了不会有人报错,只会:
 
   · 归一化**太松** → 两条真不同的政策被当成同一条(policy_sync 那边是覆盖正文);
-  · 归一化**太紧** → 路由条目/理由映射静默落空(判据悄悄变窄,提示词照旧漂亮)。
+  · 归一化**太紧** → 类别/join 静默落空(判据悄悄变窄,报告照旧漂亮)。
 
-两条守门就是这两个方向:42 个官方名两两不撞(太松会红)、7 条旧缩写名改名前后
-都 resolve 得到(太紧会红)。
+两条守门就是这两个方向:44 个官方名两两不撞(太松会红)、实证词形差全部打平
+(太紧会红)。
+⚠ 2026-09-03 C 批删掉了第 4 级 `to_official`(旧缩写名认领):改名已落地,
+表内就是官方拼写;语义缩写从此**解析不到就是解析不到**(见文件末尾那条守门)。
 """
 
 import inspect
@@ -18,17 +20,25 @@ import pytest
 from registry import paths, resources
 from services import policy_names as pn
 
-# 官方 42 名 = `refdata/policy_pages/en/*.md` 的头注 H1(权威判据源,逐字取)
+# 官方 44 名 = `refdata/policy_pages/en/*.md` 的头注 H1(权威判据源,逐字取)
 OFFICIAL = tuple(f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
                  for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
-# 改名落地前的生产表里,那 7 行长这样(所有者逐条裁决过的旧缩写名)
-LEGACY = tuple(resources.POLICY_LEGACY_NAMES)
+# 2026-09-02 改名落地**之前**生产表里那一族旧缩写名(历史事实,不是当前状态):
+# 留着它们是为了钉"这类语义缩写今天解析不到"—— 它们已经不在任何代码里。
+LEGACY_ABBREVIATIONS = (
+    ("Drugs & Paraphernalia", "Drugs and Drug Paraphernalia"),
+    ("Electronics & RF", "Electronics and Radio Frequency Devices"),
+    ("Military & Law Enforcement", "Military and Law Enforcement Products"),
+    ("Ride-Ons & Micromobility", "Ride-Ons and Micromobility Devices"),
+    ("Pet Products", "Pet Foods, Supplements, Medicines and Other Products"),
+    ("Restricted/Illegal", "Restricted/Illegal Products"),
+)
 
 
 # ── 归一化:词形可以削,语义不许合 ─────────────────────────────────────────
 
 def test_the_official_names_never_collide_after_normalization():
-    """⚠ 42 个官方名两两不撞 —— 这是归一化敢削词形的**前提**。
+    """⚠ 44 个官方名两两不撞 —— 这是归一化敢削词形的**前提**。
 
     撞了的后果不报错:policy_sync 会把两个官方页认成表里同一行(A 政策的正文
     写进 B 行),audit 侧会把两条政策的理由认成一条。
@@ -58,45 +68,48 @@ def test_the_word_form_gaps_all_fold_together(a, b):
 
 
 def test_normalization_still_refuses_to_merge_abbreviations():
-    """⚠ 缩写差是**语义合并**,归一化一个字都不许沾 —— 认领它们的是
-    `to_official`(所有者裁决过的落纸),不是词形规则。"""
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        if pn.norm_category(legacy) == pn.norm_category(official):
-            continue        # `&`↔`and` 那两条本来就是纯词形差,不算语义合并
+    """⚠ 缩写差是**语义合并**,归一化一个字都不许沾 —— 那要人裁决
+    (policy_sync 报告的「疑似改名对」),不是词形规则。"""
+    for legacy, official in LEGACY_ABBREVIATIONS:
         assert pn.norm_category(legacy) != pn.norm_category(official), legacy
-    assert pn.norm_category("Drugs and Drug Paraphernalia") != \
-        pn.norm_category("Drugs & Paraphernalia")
-    assert pn.norm_category("Electronics and Radio Frequency Devices") != \
-        pn.norm_category("Electronics & RF")
 
 
-# ── 旧名翻译 ──────────────────────────────────────────────────────────────
+# ── 旧名翻译:已退役 ──────────────────────────────────────────────────────
 
-def test_to_official_translates_only_the_adjudicated_literals():
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        assert pn.to_official(legacy) == official
-        assert official in OFFICIAL, f"{legacy} 的目标值不在 42 份转录件里"
-    # 没登记的原样回(调用方要的是"翻译一下再试",不是"这是不是旧名")
-    assert pn.to_official("Food Products") == "Food Products"
-    assert pn.to_official("  Alcohol  ") == "Alcohol"
-    assert pn.to_official(None) is None
-    assert pn.to_official("") is None
+def test_the_legacy_name_translation_is_retired():
+    """⚠ 2026-09-03 C 批:`to_official` 与它查的
+    `registry.resources.POLICY_LEGACY_NAMES` 一起删除。
 
-
-# ── resolve:改名前后都要认得 ──────────────────────────────────────────────
-
-def test_the_seven_legacy_names_resolve_across_the_rename():
-    """⚠ 本模块存在的理由就是这一条:写死旧缩写名的地方(audit_l3 路由表、
-    audit_l2 推出来的 walmart_policy)**不必**跟着改名批改字面量,也不会静默失效。
-
-    改名后表里是官方名 → 解析到官方名;改名落地前表里还是旧名 → 解析到旧名。
-    同一份代码,两种表形态都活。
+    它是 2026-09-02 那一次改名的**过渡桥**:表内还是旧缩写名时,写死官方名的
+    代码靠它对得上。改名真跑落地后,桥的两头连的是同一个地方 —— 留着 = 一份
+    永远不会再被验证的历史映射,还多给一条"归一化认不出就翻译一下再试"的暗道。
     """
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        assert pn.resolve(legacy, OFFICIAL) == official, legacy
-        assert pn.resolve(legacy, LEGACY) == legacy, legacy
-        # 官方名在官方表里当然也认得(改名后 L3 答出的就是它)
+    assert not hasattr(pn, "to_official")
+    assert not hasattr(resources, "POLICY_LEGACY_NAMES")
+    from services import error_taxonomy
+    assert not hasattr(error_taxonomy, "POLICY_ALIASES")
+    assert not hasattr(error_taxonomy, "alias_gaps")
+    assert pn.__all__ == ["norm_category", "resolve"]
+
+
+# ── resolve:三级,认不出就说不认识 ───────────────────────────────────────
+
+def test_semantic_abbreviations_no_longer_resolve_and_that_is_the_answer():
+    """⚠ C 批之后 `resolve` 只有三级(精确 / casefold / 词形键)。
+
+    语义缩写(`Electronics & RF` ↔ `Electronics and Radio Frequency Devices`)
+    **解析不到就是解析不到** —— 那是正确答案:它要人来裁决是改名还是新增,
+    不是代码替它选一个(选错 = 把 A 政策的结论挂到 B 政策名下,没人会红)。
+    纯词形差(`&`↔`and`)照旧打得平,那一级没动。
+    """
+    for legacy, official in LEGACY_ABBREVIATIONS:
+        assert pn.resolve(legacy, OFFICIAL) is None, legacy
+        assert official in OFFICIAL, official
         assert pn.resolve(official, OFFICIAL) == official
+    # 纯词形差不受影响:这两条 2026-09-02 之前也在旧名表里,靠的却是词形那一级
+    assert pn.resolve("Auto & Motor Vehicles", OFFICIAL) == \
+        "Auto and Motor Vehicles"
+    assert pn.resolve("Textiles & Apparel", OFFICIAL) == "Textiles and Apparel"
 
 
 def test_resolve_returns_the_spelling_that_is_in_the_table():
@@ -130,11 +143,12 @@ def test_resolve_is_deterministic_when_the_table_has_near_duplicates():
 
 # ── 分层纪律 ──────────────────────────────────────────────────────────────
 
-def test_the_module_only_imports_re_and_registry():
+def test_the_module_only_imports_re():
     """⚠ 铁律 1:services 不许 import workflows。归一化搬到这里,正是为了让
-    audit 侧用得上它 —— 反过来 import 回 workflows 就把依赖方向倒过来了。"""
+    audit 侧用得上它 —— 反过来 import 回 workflows 就把依赖方向倒过来了。
+    (旧名表退役后连 registry 都不需要了:这个模块现在是纯字符串规则。)"""
     src = inspect.getsource(pn)
     # 只看**行首**的 import 语句(docstring 正文里会提到这条纪律本身)
     imports = [ln.rstrip() for ln in src.splitlines()
                if ln.startswith(("import ", "from "))]
-    assert imports == ["import re", "from registry import resources"], imports
+    assert imports == ["import re"], imports

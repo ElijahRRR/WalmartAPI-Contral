@@ -626,6 +626,9 @@ def _adopt_category(reason_cat, known) -> str | None:
     `.title()` 变过形的自由值都有。三段分列后 `products.audit_reason` 只装
     类别枚举 —— 原样搬进去等于把旧世界的脏值洗进新列,而且不会报错。
     对不上就是**没有类别**(None):采用历史本来就不重判,编一个更糟。
+    ⚠ 2026-09-03 C 批之后连**旧缩写名**也对不上了(`policy_names` 的旧名认领
+    那一级随 `POLICY_LEGACY_NAMES` 退役):那批老行的类别留空 + 计数进摘要,
+    等它们被重审时按新链写 —— 拿一张已经没人维护的历史映射猜一个更糟。
     """
     if not reason_cat:
         return None

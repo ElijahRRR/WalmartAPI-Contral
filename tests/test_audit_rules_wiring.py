@@ -1728,14 +1728,16 @@ def test_adopt_history_resolves_the_legacy_category_or_leaves_it_null():
     assert bad_cat == 2                             # 'none' 与 Ghost 各一条
     # 具体内容照旧写(类别空 ≠ 什么都不说)
     assert all(r["detail"] for r in conn.adopted)
-    # 旧缩写名(需要 POLICY_LEGACY_NAMES 精确等值认领)小写后认不出 ——
-    # 那是 `to_official` 的既定口径(旧名是历史事实,不做词形归一),
-    # 落 None + 计数,不猜
-    assert product_audit._adopt_category("drugs & paraphernalia", known) is None
+    # ⚠ 2026-09-03 C 批:旧缩写名**不再被认领**(`policy_names` 的第 4 级与
+    # `POLICY_LEGACY_NAMES` 一起退役)。老 run 里那些缩写名从此落 None + 计数
+    # —— 采用历史本来就不重判,类别留空等这条产品被重审时按新链写,比拿一张
+    # 已经没人维护的历史映射猜一个强。纯词形差(&↔and)照旧认得出。
+    legacy_table = audit_l3.policy_enum(
+        frozenset({"Drugs and Drug Paraphernalia", "Plants and Seeds"}))
     assert product_audit._adopt_category("Drugs & Paraphernalia",
-                                         audit_l3.policy_enum(frozenset(
-                                             {"Drugs and Drug Paraphernalia"}))) \
-        == "Drugs and Drug Paraphernalia"
+                                         legacy_table) is None
+    assert product_audit._adopt_category("plants & seeds", legacy_table) == \
+        "Plants and Seeds"
 
 
 def test_shrink_guard_message_says_what_you_are_installing():

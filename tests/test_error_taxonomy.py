@@ -75,9 +75,11 @@ KNOWN_POLICIES = (
     "Content standards: Overview", "Product details policy",
 )
 
-# 过渡态:`policy_sync` 改名落地**之前**的生产表长这样(存量缩写名那一族)。
-# 只用于证明"改名前后 join 都不断"—— 别拿它当真值。
-LEGACY_POLICIES = tuple(resources.POLICY_LEGACY_NAMES)
+# 2026-09-02 改名落地**之前**生产表里那一族旧缩写名(历史事实,不是当前状态)。
+# 只用于证明"这类语义缩写今天 join 不上、该进政策表缺口清单"—— 别拿它当真值。
+LEGACY_ABBREVIATIONS = ("Drugs & Paraphernalia", "Electronics & RF",
+                        "Military & Law Enforcement", "Pet Products",
+                        "Restricted/Illegal", "Ride-Ons & Micromobility")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -240,49 +242,40 @@ def test_known_policies_are_verbatim_official_names():
     assert len(set(KNOWN_POLICIES)) == 44
 
 
-def test_the_alias_table_is_derived_not_hand_written():
-    """⚠ 别名表是从 `registry.resources.POLICY_LEGACY_NAMES` **派生**的(仓内唯一一份
-    旧名↔官方名映射)。手抄第二份的后果不报错:所有者往映射表里追加一条,
-    这边不知道,那条别名就静默不存在。"""
-    assert et.POLICY_ALIASES, "别名表空了说明有人删光了词形差映射"
-    assert set(et.POLICY_ALIASES.values()) == set(resources.POLICY_LEGACY_NAMES)
-    # 键过的是**归一化那一份实现**(services/policy_names),不是这里手抄的公式 ——
-    # 抄一份进测试,归一化改了测试还绿,那就等于没守门
-    assert et.POLICY_ALIASES == {policy_names.norm_category(v): k
-                                 for k, v in resources.POLICY_LEGACY_NAMES.items()}
-    assert len(et.POLICY_ALIASES) == len(resources.POLICY_LEGACY_NAMES)  # 键不撞
+def test_the_legacy_alias_table_is_retired():
+    """⚠ 2026-09-03 C 批:`POLICY_ALIASES` / `alias_gaps` 连同
+    `registry.resources.POLICY_LEGACY_NAMES` 一起删除。
 
-
-def test_alias_gaps_go_from_empty_to_mostly_gone_when_the_rename_lands():
-    """别名的目标值(表内旧名)指不到表 = 那条别名失效 —— 但**有两种读法**。
-
-    改名前(过渡态)11 条必须条条指得到,指不到就是映射表写错了;
-    改名后(目标态)大部分指不到 —— 那不是故障,是这张别名表功成身退的信号
-    (此时直接键已命中),该做的是随第三步 L3 批把它整体删掉。
-
-    ⚠ 改名后**不是 11 条全指不到,是 9 条**:`Auto & Motor Vehicles` 与
-    `Textiles & Apparel` 两条旧名与官方名只差 `&`↔`and`,而 `_norm_key`
-    2026-09-02 起就是 `policy_names.norm_category`(那四条词形规则里正好有它)
-    —— 归一化后旧名与官方名同键,于是"指得到表",别名本身也已多余。
-    剩下 9 条是**真的语义缩写**(`Electronics & RF` ↔ `Electronics and Radio
-    Frequency Devices` 那种;2026-09-02 首跑又补了 Jewelry/Pet/Restricted/
-    Biodegradable 四条),归一化永远打不平,只能靠映射表。
+    它是改名过渡期的桥:报错正文里的政策名一直是官方全称,而政策表存量行是
+    旧仓搬迁时的缩写名。2026-09-02 `policy_sync` 真跑把表内名全改成官方拼写
+    之后,**直接键就命中**,桥的两头连的是同一个地方。
+    留着的代价不是多几行代码,是多一条"对不上就翻译一下再试"的暗道 ——
+    而报错正文里出现表里没有的政策名,本来就该进「政策表缺口」让人看见。
     """
-    assert et.alias_gaps(LEGACY_POLICIES) == ()
-    assert et.alias_gaps(KNOWN_POLICIES) == (
-        "Biodegradable Plastic", "Drugs & Paraphernalia", "Electronics & RF",
-        "Jewelry/Precious Metals", "Military & Law Enforcement", "Pet Products",
-        "Restricted/Illegal", "Ride-Ons & Micromobility", "Tobacco & Vaping")
-    # 掉出清单的那两条是"归一化已经够用",不是别名丢了
-    still_mapped = set(resources.POLICY_LEGACY_NAMES) - set(
-        et.alias_gaps(KNOWN_POLICIES))
-    assert still_mapped == {"Auto & Motor Vehicles", "Textiles & Apparel"}
-    for legacy in still_mapped:
-        official = resources.POLICY_LEGACY_NAMES[legacy]
-        assert et.policy_join(official, KNOWN_POLICIES) == official
+    for gone in ("POLICY_ALIASES", "alias_gaps"):
+        assert not hasattr(et, gone), gone
+    assert not hasattr(resources, "POLICY_LEGACY_NAMES")
+    from workflows import error_reclass_report as wf
+    assert not hasattr(wf, "_alias_notes")
 
 
-def test_policy_join_uses_aliases_but_never_rewrites_the_extracted_name():
+def test_semantic_abbreviations_now_land_in_the_policy_gap_list():
+    """⚠ 别名退役后,语义缩写 join 不上 —— **那是正确答案**。
+
+    这些串今天只会出现在两种地方:改名前的历史报告,或政策表被人改回旧拼写。
+    前者与今天无关,后者正该在「政策表缺口」清单上显形,而不是被一张历史
+    映射表悄悄接住(归一化打得平的纯词形差 `&`↔`and` 不在此列,见下)。
+    """
+    for legacy in LEGACY_ABBREVIATIONS:
+        assert et.policy_join(legacy, KNOWN_POLICIES) is None, legacy
+    # 纯词形差照旧打得平(那一级没动)
+    assert et.policy_join("Auto & Motor Vehicles", KNOWN_POLICIES) == \
+        "Auto and Motor Vehicles"
+    assert et.policy_join("Textiles & Apparel", KNOWN_POLICIES) == \
+        "Textiles and Apparel"
+
+
+def test_policy_join_never_rewrites_the_extracted_name():
     """join 归 join,policy_name 归 policy_name:抽出什么保留什么(语料 #26 钉死)。"""
     assert et.policy_join("Auto and Motor Vehicles", KNOWN_POLICIES) == \
         "Auto and Motor Vehicles"
@@ -301,33 +294,9 @@ def test_policy_join_uses_aliases_but_never_rewrites_the_extracted_name():
     assert res.policy_name == "Auto and Motor Vehicles"
 
 
-def test_the_derived_alias_still_joins_while_the_table_is_still_abbreviated():
-    """⚠ 过渡态守门:生产表**还没改名**时(存量缩写名),报错正文里的官方全称
-    经派生别名照旧对得上 —— 别名表要活到改名落地那一刻,不是提前退休。"""
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        assert et.policy_join(official, LEGACY_POLICIES) == legacy, official
-
-
-# 改名**落地之前**的生产表(37 行)在仓内的唯一近似:`services/audit_l3` 政策
-# 路由表 + 旧 `audit_reason._L3_NORMALIZE` 的目标值,30 条,逐字取自本文件
-# 2026-09-01 版的 KNOWN_POLICIES。留着它是为了证明"放宽归一化不是拿今天换明天"
-# —— 两种形态下 join 都不能比旧手写实现差。**不是真值**,别拿它做别的断言。
-_TODAY_TABLE = (
-    "Alcohol", "Animals", "Art", "Auto & Motor Vehicles", "Baby Products",
-    "Children's Products", "Content Standards", "Cosmetic Products",
-    "Dietary Supplements", "Digital Goods", "Drugs & Paraphernalia",
-    "Electronics & RF", "Food Products", "General-Use Products",
-    "Hazardous Items", "Home Goods", "Intellectual Property",
-    "Jewelry/Precious Metals", "Medical Devices", "Medical Foods",
-    "Military & Law Enforcement", "Offensive Content", "PFAS Chemicals",
-    "Pet Products", "Plants & Seeds", "Recalled Products",
-    "Ride-Ons & Micromobility", "Software", "Textiles & Apparel",
-    "Tobacco & Vaping",
-)
-
 # 旧手写 `_norm_key`(折叠空白 + casefold + 弯引号归直)在语料上的实测命中数,
 # 2026-09-02 归并前跑出来的。新实现**只许升不许降**:归一化放宽的理由就是它。
-_BASELINE_JOINS = {"today": 15, "official": 16}
+_BASELINE_OFFICIAL_JOINS = 16
 
 
 def test_widening_the_join_key_never_loses_ground_on_the_corpus():
@@ -335,40 +304,33 @@ def test_widening_the_join_key_never_loses_ground_on_the_corpus():
 
     放宽是判定面之外的事(`policy_join` 只喂报告,`policy_name` 一律保留原文),
     但"放宽"这种改动天然可疑:它可能在补上一处缺口的同时悄悄丢掉另一处。
-    所以这条守门量的是**两种表形态下的命中数**,与旧手写实现的实测值比:
-
-      · 「今天的表」= 改名落地前的 30 行近似(仓内唯一的那份);
-      · 「官方 42 名」= `policy_sync` 真跑后的目标态。
-
-    旧实现 15/19 与 16/19;新实现两边都必须 ≥,且改名后应当**一条不剩**——
+    所以这条守门量的是**语料里 19 个政策名在官方表上的命中数**,与旧手写实现
+    的实测值(16/19)比:只许升不许降,且改名落地后应当**一条不剩** ——
     `Plants & Seeds`(& vs and)、牛津逗号 Tobacco、不带 `(Covered Goods)` 的
     Jewelry 这三种报错写法,正是归并前白白进"政策表缺口"清单的那些。
+
+    ⚠ 2026-09-03 C 批删掉了这条用例的另一半(改名落地**前**那张 30 行近似表
+    上的命中数):那一半量的是旧名别名表这座桥,而桥与它的两头
+    (`POLICY_ALIASES` / `POLICY_LEGACY_NAMES`)已经拆了。今天的生产表就是
+    官方拼写,再钉一个"改名前也能对上"只会把退役的东西又焊回来。
     """
     wanted = sorted({r["expect_policy"] for r in REASONS if r.get("expect_policy")})
     assert len(wanted) == 19
-    today = [v for v in wanted if et.policy_join(v, _TODAY_TABLE)]
     official = [v for v in wanted if et.policy_join(v, KNOWN_POLICIES)]
-    assert len(today) >= _BASELINE_JOINS["today"], sorted(set(wanted) - set(today))
-    assert len(official) >= _BASELINE_JOINS["official"]
+    assert len(official) >= _BASELINE_OFFICIAL_JOINS
     # 改名落地后一条都不该剩(剩下的会进对照报告的「政策表缺口」清单)
     assert sorted(set(wanted) - set(official)) == []
-    # 改名前仍差两条 —— 武器族**表里真的没有**,是政策表的缺口,不是 join 的锅;
-    # 改名批补齐武器族之后自动消失(Jewelry 那条 2026-09-02 进映射表后已能 join)
-    assert sorted(set(wanted) - set(today)) == [
-        "Firearm Accessories",
-        "Knives and other Melee Weapons",
-    ]
 
 
 def test_the_join_key_still_refuses_to_merge_two_different_policies():
-    """⚠ 放宽的边界:词形可以削,语义不许合 —— 42 个官方名两两不撞
+    """⚠ 放宽的边界:词形可以削,语义不许合 —— 44 个官方名两两不撞
     (`policy_names` 那份实现自带守门,这里从**报告侧**再证一次:
     任意两个官方名之间不许 join 到对方)。"""
     keys = {et._norm_key(n) for n in KNOWN_POLICIES}
     assert len(keys) == len(KNOWN_POLICIES)
     for name in KNOWN_POLICIES:
         assert et.policy_join(name, KNOWN_POLICIES) == name
-    # 缩写差照旧不许自己合并(那是 POLICY_LEGACY_NAMES 的活)
+    # 缩写差照旧不许自己合并(那要人裁决,见 policy_sync 的「疑似改名对」)
     assert et._norm_key("Electronics & RF") != \
         et._norm_key("Electronics and Radio Frequency Devices")
 
@@ -606,13 +568,17 @@ def test_extract_policy_keeps_the_longest_official_name_whole():
         ("Alcohol", None)                            # synthetic
 
 
-def test_report_alias_notes_tell_retired_from_broken():
-    """真跑改名后别名指不到表是退役信号,不是故障;官方名也不在才告警(§十一)。"""
+def test_the_report_no_longer_carries_the_alias_health_line():
+    """报告头的「别名表健康」两行随别名表一起退役(2026-09-03 C 批)。
+
+    2026-09-02 真跑改名后的首份报告曾把 9 条已退役别名印成「静默失效」告警,
+    误导读数的人去核对政策表命名 —— 现在那张表没了,那两行也就没有了。
+    政策名对不上照旧在「政策表缺口」清单里显形,那才是它该待的地方。
+    """
+    import inspect
+
     from workflows import error_reclass_report as wf
 
-    official = set(resources.POLICY_LEGACY_NAMES.values()) | {"Alcohol"}
-    notes = wf._alias_notes(official)
-    assert len(notes) == 1 and "退役" in notes[0] and "⚠" not in notes[0]
-    assert wf._alias_notes(set(resources.POLICY_LEGACY_NAMES) | {"Alcohol"}) == []
-    notes = wf._alias_notes({"Alcohol"})
-    assert len(notes) == 1 and notes[0].startswith("⚠") and "静默失效" in notes[0]
+    src = inspect.getsource(wf)
+    assert "_alias_notes" not in src and "别名表" not in src
+    assert "政策表缺口" in src

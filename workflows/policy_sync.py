@@ -17,9 +17,13 @@
 - **表内名一律改为官方拼写**(2026-09-02 所有者定稿 §十.7:官方政策类别名 =
   全链唯一键,**旧脚本跟随新流程变动**,不是新流程迁就旧脚本)。对上但
   `category_en` 与官方拼写不同的行 → 进「将改名」清单,真跑在同一事务里由
-  **独立一条 `_RENAME_SQL`**(只 SET category_en,id 不变)先改名再刷新;
-  存量缩写名(`Drugs & Paraphernalia` 那一族)靠 `registry.resources.POLICY_LEGACY_NAMES`
-  认领 —— 那是所有者裁决的落纸,不是归一化偷偷做的语义合并;
+  **独立一条 `_RENAME_SQL`**(只 SET category_en,id 不变)先改名再刷新。
+  ⚠ **对行只认词形**(`norm_category`):2026-09-02 那批存量缩写名
+  (`Drugs & Paraphernalia` 一族)由 `POLICY_LEGACY_NAMES` 认领改名的那一级
+  已随 C 批**整体退役** —— 改名落地后表内就是官方拼写,那张映射表指向的是
+  表里已经不存在的旧名。今后再改名走**人工入口**:报告的「疑似改名对」把
+  「未对上」与「官方已不含」里同概念的两条并排点出来,由人裁决改名还是新增
+  (代码不许偷偷合并语义,§二「对不上的不猜」);
 - **人工列一律不读不写**(category_zh / zh_seller_risk / zh_seller_notes /
   prohibited_items / conditional_items / preapproval_items / preapproval /
   legal_refs,以及同为人写的 overall_status)。它们是给人看的中文列,
@@ -303,48 +307,37 @@ def _raw_json(page: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 
 def plan_upsert(pages: list[dict], rows: list[tuple], next_id: int,
-                broken_names=(), legacy: dict | None = None) -> dict:
+                broken_names=()) -> dict:
     """输入:官方页记录 + 表内行 `(id, category_en, full_policy)` + 起始 id
-    + 解析失败件的标题(+ 旧名映射)→ 输出:{refresh, insert, held, absent,
+    + 解析失败件的标题 → 输出:{refresh, insert, held, absent,
     stale, rename, rename_conflict}(纯函数)。
 
-    **以行为中心的两级对行**(§十.7):每一张官方页先按 `norm_category` 取词形
-    命中的行,**再**取"登记了旧名、且旧名指向本页官方名"的行
-    (`registry.resources.POLICY_LEGACY_NAMES`,**表内名精确等值** → 官方名 →
-    归一键)。第二级认的是所有者已裁决过的缩写名,不是把归一化放宽 —— 归一化
-    仍然只做词形,`Drugs & Paraphernalia` 这种缩写差照旧不许自己合并。
+    **以行为中心的对行**(§十.7):每一张官方页按 `norm_category` 取词形命中的
+    行 —— 只认词形(casefold / `&`↔`and` / 逗号 / 括号后缀 / 撇号 / 单复数),
+    `Drugs & Paraphernalia` ↔ `Drugs and Drug Paraphernalia` 这种**语义缩写差
+    照旧对不上**,那要人裁决。
 
-    ⚠ 两级**不是 if/else**:旧名那一级必须照查,哪怕词形已经命中了别的行。
-    早先的写法是"词形没命中才查旧名",于是"旧名认领成功、但目标官方名已被
-    表内另一行占用"这种情形(表里同时存在 `Drugs & Paraphernalia` 与
-    `Drugs and Drug Paraphernalia`)根本走不到「改名冲突」—— 那一行谁也没点到,
-    直接掉进「官方已不含」,报成"官方删了这个类别"。判反的方向:人会去动库
-    删行,而真相是**表里有一对同概念双行等着合并**。
+    ⚠ 2026-09-03 C 批删掉了第二级「经旧名认领」(查
+    `registry.resources.POLICY_LEGACY_NAMES`):它是 2026-09-02 那一次改名的
+    过渡桥,改名落地后表内就是官方拼写,映射表指向的是表里已不存在的旧名。
+    今后的改名走**人工入口** —— 报告的「疑似改名对」会把「未对上」与
+    「官方已不含」里同概念的两条并排点名,由人决定改名还是新增。
+    ⚠ 那一级同时带走的两种冲突场景(旧名认领成功但官方名已被另一行占用 /
+    两行登记同一个旧名)现在**不可能发生**:词形命中天然是"同一个归一化键",
+    表里若真有两行撞同一个键,走的是下面的 `held`(表内同名歧义,不猜)。
 
     `held` = 对上了但**不敢动**的(表里同名歧义 / 两个官方页指向同一行):
     宁可少写一行让人来判,也不许猜——猜错就是把 A 政策的正文写进 B 行。
 
-    `rename_conflict` 在这一步就会产生(见 `plan_renames` 的说明):
-      · 旧名认领成功,但目标官方名已被表内**另一行**占用 → 该行不改名不刷新;
-      · **两行登记同一个旧名**(映射表被追错)→ 两行都不动。
-    两种都计入 `touched`,**绝不落「官方已不含」** —— 官方明明点到了名,
-    只是我们不敢动。
+    `rename_conflict` 见 `plan_renames`:目标官方名已被表内另一行占用 →
+    该行不改名不刷新,**绝不落「官方已不含」**(官方明明点到了名,只是不敢动)。
 
     `stale` = 官方页解析失败、但**标题还认得出**的那些表内行:本轮不刷新,
     却也**不是「官方已不含」**——转录件坏了而已,官方并没有删这一类。
     """
-    legacy = resources.POLICY_LEGACY_NAMES if legacy is None else legacy
-
     table: dict[str, list[tuple]] = {}
-    alias: dict[str, list[tuple]] = {}
     for rid, cat, full in rows:
-        row = (rid, cat, full or "")
-        table.setdefault(norm_category(cat), []).append(row)
-        # ⚠ 旧名**精确等值**匹配:旧名是历史字面量(所有者逐条认过的那 7 个),
-        #   拿归一化去套等于又把语义合并塞回归一化里
-        official = legacy.get(cat)
-        if official:
-            alias.setdefault(norm_category(official), []).append(row)
+        table.setdefault(norm_category(cat), []).append((rid, cat, full or ""))
 
     refresh, insert, held = [], [], []
     conflict: list[tuple[int, str, str, list[int]]] = []
@@ -352,29 +345,7 @@ def plan_upsert(pages: list[dict], rows: list[tuple], next_id: int,
     touched: set[int] = set()       # 官方点到了名的行(含歧义/冲突未动的)
     for page in pages:
         key = norm_category(page["category_en"])
-        word_hits = table.get(key, [])
-        word_ids = {h[0] for h in word_hits}
-        # 同一行两级都命中(`Auto & Motor Vehicles` 那种 `&`↔`and` 差,词形本来
-        # 就打得平)不是冲突,是同一件事 —— 去重,别把自己判成占位的"另一行"
-        alias_hits = [h for h in alias.get(key, []) if h[0] not in word_ids]
-
-        if alias_hits and (word_hits or len(alias_hits) > 1):
-            # 旧名认领成功,但这个官方名已经**有主**了(词形对上的另一行,或
-            # 另一个也登记着同一旧名的行)。改下去就是同名双行:S4 会渲染两份
-            # 讲同一件事的政策,S2 候选也跟着脏。宁可一行不动,等人裁决合并/删行。
-            alias_ids = {h[0] for h in alias_hits}
-            for rid, cat, _full in alias_hits:
-                others = sorted((word_ids | alias_ids) - {rid})
-                conflict.append((rid, cat, page["category_en"], others))
-            touched.update(alias_ids)
-            alias_hits = []
-            if not word_hits:
-                # 官方点到了名,只是没有一行敢动 —— **不新增**(新增就是在一对
-                # 待合并的同概念行旁边再添第三行)
-                continue
-
-        hits = word_hits or alias_hits
-        via = "词形" if word_hits else "旧名"
+        hits = table.get(key, [])
         if len(hits) > 1:
             touched.update(h[0] for h in hits)
             held.append((page, f"表内有 {len(hits)} 行同名(id "
@@ -390,7 +361,7 @@ def plan_upsert(pages: list[dict], rows: list[tuple], next_id: int,
             held.append((page, f"与 {claimed[rid]} 同时指向 id {rid},不猜"))
             continue
         claimed[rid] = page["file"]
-        refresh.append({"id": rid, "table_name": cat, "page": page, "via": via,
+        refresh.append({"id": rid, "table_name": cat, "page": page,
                         "old_sha": _sha(full), "old_chars": len(full)})
 
     rename, late_conflict = plan_renames(refresh, rows)
@@ -416,19 +387,17 @@ def plan_upsert(pages: list[dict], rows: list[tuple], next_id: int,
 def plan_renames(refresh: list[dict], rows: list[tuple]) -> tuple[list, list]:
     """输入:对上清单 + 表内全行 → 输出:([(id, 旧名, 新名)], [(id, 旧名, 新名, 占位 id)])。
 
-    对上(含经旧名对上)但 `category_en` ≠ 官方拼写的行 → 「将改名」。
+    对上但 `category_en` ≠ 官方拼写的行 → 「将改名」(词形差:官方名多个
+    `(Covered Goods)` 后缀、少个牛津逗号那一类)。
 
     **冲突扣留**:目标官方名已被表内**另一行**占用(精确同名或归一化后同名)
     → 该行不改名、不刷新,进「改名冲突」等人裁决。改下去的后果不报错,是表里
     多出一对同名行:S4 会渲染两份讲同一件事的政策,S2 候选也跟着脏。
 
-    ⚠ 这是一道**后置断言**,不是常规通路。所有者追错映射表的那两种情形
-    (两个旧名指到同一个官方名、旧名指到表里已有的另一类)现在由
-    `plan_upsert` 的对行循环当场识别 —— 那里才看得见"谁和谁抢同一个名字";
-    到了这一步,`refresh` 里每一行的目标名按构造已经**只可能**被它自己占用
-    (归一化撞键的行早就进了 `held`,抢名字的行早就进了 `rename_conflict`),
-    所以正常输入下这张清单恒空。留着它是因为写库前的最后一道墙不该依赖
-    上游的正确性:哪天有人换了对行写法,同名双行也不该悄悄写进表里。
+    ⚠ 这是一道**后置断言**,不是常规通路:`refresh` 里每一行的目标名按构造
+    已经**只可能**被它自己占用(归一化撞键的行早就进了 `held`),所以正常
+    输入下这张清单恒空。留着它是因为写库前的最后一道墙不该依赖上游的正确性
+    —— 哪天有人换了对行写法,同名双行也不该悄悄写进表里。
     """
     taken_exact: dict[str, list[int]] = {}
     taken_norm: dict[str, list[int]] = {}
@@ -605,8 +574,7 @@ def _report(plan: dict, broken: list[tuple], undated: list[dict],
                    f"  sha {item['old_sha'][:8]}→{p['sha'][:8]}"
                    f"  {item['old_chars']}→{p['chars']} 字"
                    + ("" if item["table_name"] == p["category_en"] else
-                      f"  ←官方名「{p['category_en']}」(将改名)")
-                   + ("  (经旧名认领)" if item.get("via") == "旧名" else ""))
+                      f"  ←官方名「{p['category_en']}」(将改名)"))
 
     out.append("")
     out.append("▍将改名(对上但表内名 ≠ 官方拼写 → UPDATE category_en,**id 不变**;"
@@ -629,9 +597,9 @@ def _report(plan: dict, broken: list[tuple], undated: list[dict],
 
     out.append("")
     out.append(f"▍未对上/不敢动(官方页有、表里没有对应行,或对上了但有歧义 —— "
-               f"所有者裁决:新增/忽略;拼写差请补进 "
-               f"registry.resources.POLICY_LEGACY_NAMES 再重跑。"
-               f"⚠ 与官方名撞车的旧名行在上面「改名冲突」里,不在这儿)"
+               f"所有者裁决:新增/忽略。⚠ 只是**词形**差(&↔and / 逗号 / 括号"
+               f"后缀 / 撇号 / 单复数)的行不会出现在这儿,对行时就打平了;"
+               f"这里剩下的是**语义**对不上的,看下面「疑似改名对」)"
                f":{len(plan['insert']) + len(plan['held'])} 条")
     for item in plan["insert"]:
         name = item["page"]["category_en"]
@@ -643,9 +611,10 @@ def _report(plan: dict, broken: list[tuple], undated: list[dict],
                       if page["category_en"] in paired_names else ""))
 
     out.append("")
-    out.append("▍疑似改名对(**不是**新增+删除:同一概念的两种写法 —— 且是"
-               "**还没进 registry.resources.POLICY_LEGACY_NAMES** 的那些。按新增裁决会写出"
-               f"同概念双行,S4 会拿到两份互相矛盾的政策文本):{len(pairs)} 对")
+    out.append("▍疑似改名对(**不是**新增+删除:同一概念的两种写法 —— 官方改名的"
+               "**人工入口**。按新增裁决会写出同概念双行,S4 会拿到两份互相矛盾的"
+               f"政策文本;确认是改名就人工 UPDATE 那一行的 category_en):"
+               f"{len(pairs)} 对")
     for name, rid, cat, why in pairs:
         out.append(f"    官方「{name}」  ↔  表内 id {rid}「{cat}」  ({why})")
     if not pairs:
@@ -803,7 +772,7 @@ def run(params: dict) -> str:
         lines.append("(dry-run:一行未写库;去掉 --dry-run 才 upsert)")
         lines.append("⚠ 首跑必须人眼核对报告两处:①「将改名」清单(表内名会被改成"
                      "官方拼写,逐条确认确实是同一个政策类别 —— 「对上」清单里带 "
-                     "`←官方名` 标记的就是它们)、②「未对上」清单(真正对不上的"
-                     "逐条裁决新增/忽略;若只是拼写差,补进 "
-                     "registry.resources.POLICY_LEGACY_NAMES 再重跑,别按新增裁决)")
+                     "`←官方名` 标记的就是它们)、②「未对上」清单(逐条裁决"
+                     "新增/忽略;先看「疑似改名对」有没有点到它 —— 官方改了名而"
+                     "按新增裁决,写出来的是同概念双行)")
     return "\n".join(lines)

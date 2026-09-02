@@ -35,7 +35,8 @@ _ALL_COLS = tuple(_COL_TYPES)
 
 # 表内存量样本:六组词形差各占一行(§〇 实证)+ 一行官方已不含的幽灵。
 # ⚠ 六组词形差在 2026-09-02 之后**都要改名**(表内名 := 官方拼写);
-#   旧缩写名(POLICY_LEGACY_NAMES)另有 _LEGACY_TABLE 一组专测。
+#   语义缩写(`Drugs & Paraphernalia` 一族)对行时**故意对不上**,进「疑似
+#   改名对」等人裁决 —— 自动认领那一级 2026-09-03 C 批退役。
 _TABLE = [
     (1, "Alcohol", "旧正文"),
     (2, "Cosmetics Products", "旧正文"),                       # 官方 Cosmetic
@@ -255,29 +256,19 @@ def test_normalization_never_merges_two_different_official_names():
 
 
 def test_normalization_still_refuses_to_merge_abbreviations_by_itself():
-    """⚠ 缩写差是**语义合并**,归一化一个字都不许沾 —— 认领它们的是
-    `registry.resources.POLICY_LEGACY_NAMES`(所有者逐条裁决过的落纸),不是词形规则。
+    """⚠ 缩写差是**语义合并**,归一化一个字都不许沾 —— 那要人裁决
+    (报告的「疑似改名对」清单),不是词形规则。
 
     这条守门是为了让"顺手把缩写也归一化了"的改法当场撞墙:归一化一旦放宽到
     语义,`Electronics & RF` 与 `Electronics and Radio Frequency Devices` 之外的
     别的缩写也会被无声吞掉,而那正是"把 A 政策正文写进 B 行"的入口。
+    (2026-09-03 C 批:靠 `POLICY_LEGACY_NAMES` 认领旧名的那一级已退役,
+    所以今天这类缩写差**只有**「疑似改名对」这一条人工出路。)
     """
     assert ps.norm_category("Drugs and Drug Paraphernalia") != \
         ps.norm_category("Drugs & Paraphernalia")
     assert ps.norm_category("Electronics and Radio Frequency Devices") != \
         ps.norm_category("Electronics & RF")
-
-
-def test_the_legacy_map_targets_are_verbatim_official_names():
-    """⚠ 映射表的值必须与 refdata 头注 H1 **逐字一致** —— 差一个字符,改名就把
-    表内名改成了一个官方并不存在的拼写,而全链拿它当唯一键。"""
-    official = {ps.parse_policy_file(f)["category_en"]
-                for f in sorted(_EN.glob("*.md"))}
-    missing = sorted(v for v in resources.POLICY_LEGACY_NAMES.values()
-                     if v not in official)
-    assert missing == [], f"这些目标值不在 44 份转录件的 H1 里:{missing}"
-    # 旧名本身不许与官方名撞车(撞了就说明它已经不是"旧"名了)
-    assert not (set(resources.POLICY_LEGACY_NAMES) & official)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -359,26 +350,6 @@ def test_renaming_keeps_the_id_and_matches_the_official_spelling(monkeypatch):
     assert 8 not in got
 
 
-def test_legacy_abbreviations_are_claimed_and_renamed(monkeypatch):
-    """⚠ 存量旧名(§十.6 的 7 行 + 首跑补的 4 行)经 POLICY_LEGACY_NAMES 认领 → 改名,
-    **不再**走"新增一行 + 官方已不含一行"那条会写出同概念双行的路。"""
-    rows = [(i + 1, legacy, "旧正文") for i, legacy
-            in enumerate(sorted(resources.POLICY_LEGACY_NAMES))]
-    conn = _wire(monkeypatch, _Conn(rows=rows))
-    out = ps.run({"execute": True})
-    got = {p["id"]: p["category_en"] for _s, p in _renames(conn)}
-    assert got == {i + 1: resources.POLICY_LEGACY_NAMES[legacy]
-                   for i, legacy in enumerate(sorted(resources.POLICY_LEGACY_NAMES))}
-    n = len(resources.POLICY_LEGACY_NAMES)
-    assert len(_refreshes(conn)) == n               # 认领了就照常刷新正文
-    assert out.splitlines()[0].startswith(
-        f"新增 {44 - n} / 刷新 {n} / 改名 {n} / 未对上 {44 - n} / 官方缺席 0")
-    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
-    block = text.split("▍将改名")[1].split("▍改名冲突")[0]
-    assert "「Drugs & Paraphernalia」 → 「Drugs and Drug Paraphernalia」" in block
-    assert "(经旧名认领)" in text
-
-
 def test_an_unmatched_official_page_is_neither_renamed_nor_double_inserted(
         monkeypatch):
     """未对上的官方页只新增一行:不借道改名去动别的行,也不重复插。"""
@@ -431,81 +402,6 @@ def test_a_rename_conflict_is_held_and_writes_nothing(monkeypatch):
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍改名冲突")[1].split("▍未对上")[0]
     assert "id 9 占用" in block
-
-
-def test_a_legacy_row_whose_official_name_is_taken_lands_in_rename_conflict(
-        monkeypatch):
-    """⚠ 复核场景 A:表里**同时**有旧缩写名与官方名两行(同一个政策)。
-
-    旧写法是"词形没对上才查旧名":官方页先被 `Drugs and Drug Paraphernalia`
-    那一行按词形认走,于是登记了旧名的 `Drugs & Paraphernalia` 那一行**谁也没
-    点到**,直接掉进「官方已不含」—— 报告等于在说"官方删掉了这个类别",而真相
-    是**表里有一对同概念双行等着合并**。判反的方向:人会去动库删行。
-
-    正确形态:它进「改名冲突」(目标官方名已被 id 2 占用),不改名不刷新,
-    也**不算官方缺席**;另一行照常刷新。
-    """
-    rows = [(1, "Drugs & Paraphernalia", "旧正文"),
-            (2, "Drugs and Drug Paraphernalia", "旧正文")]
-    conn = _wire(monkeypatch, _Conn(rows=rows))
-    out = ps.run({"execute": True})
-
-    assert _renames(conn) == []                       # 一个名字都没改
-    assert [p["id"] for _s, p in _refreshes(conn)] == [2]   # 冲突行不刷新
-    assert "改名冲突 1 条" in out and "不改名也不刷新" in out
-    assert "官方已不含" not in out                     # ← 旧写法就是错在这里
-    assert out.splitlines()[0].startswith("新增 43 / 刷新 1 / 改名 0 / "
-                                          "未对上 43 / 官方缺席 0")
-    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
-    block = text.split("▍改名冲突")[1].split("▍未对上")[0]
-    assert "「Drugs & Paraphernalia」 ↛ 「Drugs and Drug Paraphernalia」" in block
-    assert "id 2 占用" in block
-    assert "Drugs & Paraphernalia" not in \
-        text.split("▍官方已不含")[1].split("▍解析失败(本轮不刷新)")[0]
-
-
-def test_a_legacy_mapping_pointing_at_an_existing_row_lands_in_rename_conflict(
-        monkeypatch):
-    """⚠ 复核场景 C:映射表被追错 —— 某个旧名指到了表里**已经存在的另一类**。
-
-    这正是 `POLICY_LEGACY_NAMES` 那句"所有者可追加"的风险面:追错一条不会报错,
-    改下去就是把 A 政策的行改名成 B 政策(表里从此两行 Alcohol)。必须在写库
-    **之前**撞墙 —— 而撞墙的位置就是对行那一步,不是事后在表里发现。
-    """
-    monkeypatch.setitem(resources.POLICY_LEGACY_NAMES, "Weird Old Name",
-                        "Alcohol")
-    rows = [(1, "Weird Old Name", "旧正文"), (2, "Alcohol", "旧正文")]
-    conn = _wire(monkeypatch, _Conn(rows=rows))
-    out = ps.run({"execute": True})
-
-    assert _renames(conn) == []
-    assert [p["id"] for _s, p in _refreshes(conn)] == [2]
-    assert "改名冲突 1 条" in out
-    assert out.splitlines()[0].startswith("新增 43 / 刷新 1 / 改名 0 / "
-                                          "未对上 43 / 官方缺席 0")
-    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
-    block = text.split("▍改名冲突")[1].split("▍未对上")[0]
-    assert "「Weird Old Name」 ↛ 「Alcohol」" in block and "id 2 占用" in block
-
-
-def test_two_rows_registering_the_same_legacy_name_are_both_held(monkeypatch):
-    """⚠ 两行登记同一个旧名(映射表把两个旧名指到同一个官方名,或表里本就有
-    两行同名)→ **两行都不动**,进「改名冲突」;那张官方页也**不新增** ——
-    在一对待合并的同概念行旁边再添第三行,是把问题变成三倍。"""
-    rows = [(1, "Drugs & Paraphernalia", "a"), (5, "Drugs & Paraphernalia", "b")]
-    conn = _wire(monkeypatch, _Conn(rows=rows))
-    out = ps.run({"execute": True, "dry_run": True})
-
-    assert set(_verbs(conn)) == {"SELECT"}
-    assert "改名冲突 2 条" in out
-    assert out.splitlines()[0].startswith("新增 43 / 刷新 0 / 改名 0 / "
-                                          "未对上 43 / 官方缺席 0")
-    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
-    block = text.split("▍改名冲突")[1].split("▍未对上")[0]
-    assert "id 5 占用" in block and "id 1 占用" in block
-    # 官方页没被当成"未对上 → 新增"(41 条新增里没有它)
-    assert "Drugs and Drug Paraphernalia" not in \
-        text.split("▍新增")[1].split("▍对上")[0]
 
 
 def test_a_rename_conflict_never_writes_the_held_row_even_on_a_real_run(
@@ -685,10 +581,9 @@ def test_rename_candidates_are_flagged_between_the_two_lists(monkeypatch):
     当成"新增一条 + 删掉一条"处理的后果不报错,是**同概念双行**:S4 会拿到
     两份讲同一件事的政策文本。判定不变(仍然不猜),但必须**点名**给人看。
 
-    ⚠ 2026-09-02 起这张清单提示的是**还没进 `POLICY_LEGACY_NAMES`** 的拼写差
-    (已进映射表的缩写名会直接被认领改名,见
-    `test_legacy_abbreviations_are_claimed_and_renamed`)—— 它是所有者往映射表
-    里追加条目的入口,不是被改名口径取代的旧提示。
+    ⚠ 2026-09-03 C 批之后这张清单是**改名的唯一人工入口**:靠
+    `POLICY_LEGACY_NAMES` 自动认领旧名那一级已经退役(改名 2026-09-02 已落地,
+    映射表指向的是表里不存在的旧名)。今天的口径是"代码点名、人来裁决"。
     """
     rows = [(1, "Knives & Melee", "旧正文"),
             (2, "Firearms Ammo", "旧正文")]
@@ -705,6 +600,67 @@ def test_rename_candidates_are_flagged_between_the_two_lists(monkeypatch):
     assert _verbs(conn) == ["SELECT"] * 3
     assert out.splitlines()[0].startswith("新增 44 / 刷新 0 / 改名 0 / "
                                           "未对上 44 / 官方缺席 2")
+
+
+def test_a_legacy_abbreviation_row_is_now_flagged_for_a_human_not_claimed(
+        monkeypatch):
+    """⚠ 2026-09-03 C 批:「经旧名认领」那一级退役后,存量缩写名会怎么走。
+
+    2026-09-02 那一次改名(表内名 → 官方拼写)已经真跑落地,
+    `POLICY_LEGACY_NAMES` 从此指向的是**表里不存在的旧名** —— 留着 = 一份
+    永远不会再被验证的历史映射。所以现在的口径是「代码点名、人来裁决」:
+
+      · 官方页按词形对不上任何一行 ⇒ 进「未对上」(本轮按新增处理);
+      · 那一行缩写名没被任何官方页点到 ⇒ 进「官方已不含」(**不删行**);
+      · 两张清单同时点到同一个概念 ⇒ **「疑似改名对」把它们并排点名**,
+        摘要首行之后就喊一声。
+
+    这一步**不能省**:当成"新增一条 + 官方删了一条"处理的后果不报错,是表里
+    多出一对同概念双行,S4 会拿到两份讲同一件事的政策文本。
+    """
+    conn = _wire(monkeypatch, _Conn(rows=[(1, "Drugs & Paraphernalia", "旧正文")]))
+    out = ps.run({"execute": True, "dry_run": True})
+    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
+
+    assert set(_verbs(conn)) == {"SELECT"}
+    assert _renames(conn) == []                      # 一个名字都没自动改
+    assert out.splitlines()[0].startswith("新增 44 / 刷新 0 / 改名 0 / "
+                                          "未对上 44 / 官方缺席 1")
+    assert out.splitlines()[1].startswith("⚠ 疑似改名对")
+    block = text.split("▍疑似改名对")[1].split("▍官方已不含")[0]
+    assert "Drugs and Drug Paraphernalia" in block and "id 1" in block
+
+
+def test_a_legacy_row_next_to_its_official_row_is_left_alone_and_listed(
+        monkeypatch):
+    """⚠ 表里**同时**有旧缩写名与官方名两行(同一个政策)时的现口径。
+
+    官方页按词形认走官方名那一行、照常刷新;缩写名那一行谁也没点到 ⇒ 进
+    「官方已不含」(**不删行**,待人工)。安全边界不变:那一行**一个字都不写**
+    —— 不改名、不刷新、不删。
+
+    ⚠ **与 C 批之前的差别,写在这里免得下次有人当成 bug**:那时这一行会被旧名
+    认领,再因为目标官方名已被占用而进「改名冲突」,报告里带一句"该名已被 id 2
+    占用";现在它只出现在「官方已不含」里,也**不会**进「疑似改名对」——
+    那张清单比的是「未对上的官方页」×「官方已不含的行」,而这一轮官方页已经
+    对上了别的行,配不成对。代价是报告少一句提示;换来的是不再养一张
+    永远不会再被验证的历史映射表。真要合并这对同概念双行,人工删掉旧行即可
+    (报告已经把它列出来了,而且明说不删行)。
+    """
+    rows = [(1, "Drugs & Paraphernalia", "旧正文"),
+            (2, "Drugs and Drug Paraphernalia", "旧正文")]
+    conn = _wire(monkeypatch, _Conn(rows=rows))
+    out = ps.run({"execute": True})
+
+    assert _renames(conn) == []
+    assert [p["id"] for _s, p in _refreshes(conn)] == [2]     # 官方名那行照常刷新
+    assert 1 not in [p.get("id") for _s, p in _writes(conn)]  # 缩写名那行零写
+    assert out.splitlines()[0].startswith("新增 43 / 刷新 1 / 改名 0 / "
+                                          "未对上 43 / 官方缺席 1")
+    text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
+    absent = text.split("▍官方已不含")[1].split("▍解析失败(本轮不刷新)")[0]
+    assert "Drugs & Paraphernalia" in absent
+    assert "**不删行**" in text.split("▍官方已不含")[1][:200]
 
 
 def test_rename_pairing_stays_quiet_when_nothing_overlaps(monkeypatch):
@@ -795,7 +751,7 @@ def test_dry_run_tells_the_operator_what_to_eyeball(monkeypatch):
     out = ps.run({"execute": True, "dry_run": True})
     assert "人眼核对" in out
     assert "将改名" in out and "←官方名" in out
-    assert "未对上" in out and "POLICY_LEGACY_NAMES" in out
+    assert "未对上" in out and "疑似改名对" in out
 
 
 def test_report_lands_in_reports_dir_on_both_paths(monkeypatch):

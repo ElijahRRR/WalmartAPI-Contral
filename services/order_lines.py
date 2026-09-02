@@ -24,6 +24,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from api import _client
 from services import sku_asin
 
 logger = logging.getLogger("services.order_lines")
@@ -461,7 +462,9 @@ _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
 #   ④ 未来日期不是下单时间,拒写(留 NULL,后续轮次补上);晚于本行状态时间的
 #      记"存疑"告警但不拒(避免误伤把全部新单藏起来);
 #   ⑤ 每一次不一致都逐条记日志并进摘要首行,不静默;首见信封摘要落 order_meta 取证。
-# 修复已定稿的错行走 repair_order_date 显式模式。表达式里 t = 目标表别名,
+# 详情接口(所有者方案 2026-09-02)是第二来源:新单以详情首次落库并定稿,列表值与
+# 库值不同时查详情复核,详情定稿(order_date_source=detail)后列表永不覆盖;详情
+# 不可用才退回上面的两轮机制。修复已定稿的错行走 repair_order_date 显式模式。表达式里 t = 目标表别名,
 # 与 _ORDER_DATE_STATE_SQL 配对(先 upsert 定值,再记录本轮观测)。
 _ORDER_DATE_GUARD = (
     "CASE WHEN t.order_date_confirmed THEN t.order_date"
@@ -554,9 +557,10 @@ _ORDER_LINE_COLS = [
     # 值**冲回 NULL**——每轮同步抹一次,那一列永远填不满。COALESCE 保留旧值。
     "asin",
     # 下单时间定稿状态三列:只在插入时写(skip_update),更新走 _ORDER_DATE_STATE_SQL
-    "order_date_seen", "order_date_confirmed", "order_meta", "order_date_streak"]
+    "order_date_seen", "order_date_confirmed", "order_meta", "order_date_streak",
+    "order_date_source"]
 _ORDER_DATE_STATE_COLS = ("order_date_seen", "order_date_confirmed", "order_meta",
-                          "order_date_streak")
+                          "order_date_streak", "order_date_source")
 
 HISTORY_SOURCE = "历史数据"      # order_history_import 写;push 侧按它排除
 
@@ -575,46 +579,136 @@ _SETTLEMENT_COLS = [
 
 _ORDER_DATE_EXISTING_SQL = ("SELECT order_line_id, po_id, sku, order_date,"
                             " order_date_seen, order_date_confirmed, created_at,"
-                            " order_date_streak"
+                            " order_date_streak, order_date_source"
                             " FROM orders.order_lines"
                             " WHERE order_line_id = ANY(%(ids)s::text[])")
 
+# 详情接口改判/定稿的落地语句(在 upsert 之后、观测记账之前):定稿依据记 detail,
+# 计数归零;只有下单时间真变了才动 updated_at(飞书投影据此重推)
+_ORDER_DATE_DETAIL_SQL = (
+    "UPDATE orders.order_lines t SET"
+    " updated_at = CASE WHEN t.order_date IS DISTINCT FROM %(od)s::timestamptz"
+    "                   THEN now() ELSE t.updated_at END,"
+    " order_date = %(od)s::timestamptz, order_date_confirmed = true,"
+    " order_date_source = 'detail', order_date_seen = %(od)s::timestamptz,"
+    " order_date_streak = 0"
+    " WHERE t.order_line_id = %(id)s")
+_DETAIL_SOURCE = "detail"
 
-def screen_order_dates(conn, rows: list[dict]) -> list[dict]:
-    """输入:连接 + 待写行 → 输出:[{kind, po, sku, db, api}] 异常清单;并把不可能的 API 值置空(本轮不写)。
 
-    在 upsert **之前**按库里现状逐行筛(2026-09-02 原文实证:沃尔玛一轮里就有
-    十来张订单的 orderDate 是别的订单的、加了整数天的、甚至 907/未来日期):
-      拒写  API 值晚于本行**首次入库**时刻——订单不可能在我们第一次看见它之后才
-            下单;置空不入库,也不算一次观测(守卫/记账都把 NULL 当"本轮没看到")
-      冲突  已定稿,库值保留(写一次)
-      疑错  已定稿,但同一个不同值已连续 _ORDER_DATE_SUSPECT_STREAK 轮 ⇒ 定稿值几乎
-            可断定是错的(沃尔玛的错值不粘、下轮就变);库值仍不动,首行报并给修复命令
-      改判  未定稿且 API 值与上轮观测一致 ⇒ 本轮 upsert 会改成 API 值(连续两轮)
-      待定  未定稿且 API 值是新出现的 ⇒ 库值保留,等下一轮再看
-    每条都记 warning 并带信封摘要——这是抓证据的口子,不许静默。
-    只比两边都非空的:库空 = 首见/此前拒写,API 空 = 解析阶段已拒写。
+def screen_order_dates(conn, rows: list[dict], *, detail=None) -> list[dict]:
+    """输入:连接 + 待写行(+ 详情查询钩子)→ 输出:[{kind, po, sku, db, api}] 异常清单;并按详情/库况改写行。
+
+    所有者方案(2026-09-02,探针 4 实证详情接口可信:A142 550 单逐单对比,列表错
+    6 条、详情全对且二次稳定):
+      · 新单首见:以**详情**的 orderDate 首次落库并直接定稿(source=detail);
+        详情不可用时退回列表候选,走连续两轮一致定稿(source=list)
+      · 列表值明显异常(未来/远古/晚于本行首次入库):拒写,能查详情就用详情补正
+      · 已存在的行,列表值与库值不同:查详情复核 ——
+          库值由详情定稿:详情=库值 ⇒ 冲突(列表回错,忽略);详情≠库值 ⇒ 疑错(报人,不动)
+          库值只靠列表定稿:详情可信 ⇒ 改判为详情值并升级为 detail 定稿
+          库值未定稿:详情可信 ⇒ 按详情定稿(与库值不同记 改判)
+        详情不可用时退回原逻辑:冲突/疑错(连续同一异值三轮)/改判/待定
+      · 详情定稿后视为不可变,列表永不覆盖(_ORDER_DATE_GUARD)
+    每条异常都记 warning 并带信封摘要;detail(po) 返回订单对象(404 返 None),
+    网络类异常在这里吞成"不可用"并计入 kind=详情失败 —— 凭证死店例外,原样上抛。
     """
-    api_by_id = {r["order_line_id"]: r for r in rows if r.get("order_date") is not None}
-    if not api_by_id:
-        return []
-    with conn.cursor() as cur:
-        cur.execute(_ORDER_DATE_EXISTING_SQL, {"ids": list(api_by_id)})
-        existing = cur.fetchall()
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    ids = [r["order_line_id"] for r in rows]
+    api_by_id = {r["order_line_id"]: r for r in rows}
+    existing: dict = {}
+    if ids:
+        with conn.cursor() as cur:
+            cur.execute(_ORDER_DATE_EXISTING_SQL, {"ids": ids})
+            existing = {row[0]: row for row in cur.fetchall()}
     out: list[dict] = []
-    for lid, po, sku, db_od, seen, confirmed, created, streak in existing:
-        row = api_by_id[lid]
-        api_od = row["order_date"]
-        env = json.dumps(row.get("_envelope"), ensure_ascii=False)
+    detail_cache: dict[str, object] = {}
+
+    def _detail_od(row: dict, created) -> datetime | None:
+        """查详情并做同样的可信度检查;不可用/不可信返 None(已记日志)。"""
+        if detail is None:
+            return None
+        po = row["po_id"]
+        if po not in detail_cache:
+            try:
+                detail_cache[po] = detail(po)
+            except _client.StoreDeadError:
+                raise
+            except Exception as e:      # 网络/限速/5xx:退回列表逻辑,不炸整店
+                logger.warning("PO %s 详情查询失败,退回列表逻辑: %s", po, e)
+                out.append({"kind": "详情失败", "po": po, "sku": row["sku"],
+                            "db": None, "api": row.get("order_date")})
+                detail_cache[po] = None
+        d = detail_cache[po]
+        if not isinstance(d, dict):
+            return None
+        env = row.get("_envelope")
+        if isinstance(env, dict):
+            env["detail"] = {"orderDate": d.get("orderDate"), "orderType": d.get("orderType"),
+                             "originalCustomerOrderID": d.get("originalCustomerOrderID")}
+        od = _ts(d.get("orderDate"))
+        if od is None or od < _TS_FLOOR or od.timestamp() * 1000 > now_ms + _ORDER_DATE_TOLERANCE_SECS * 1000 \
+                or (created is not None and (od - created).total_seconds() > _ORDER_DATE_TOLERANCE_SECS):
+            logger.warning("PO %s 详情给的 orderDate=%r 也不可信(首次入库 %s),不采用",
+                           po, d.get("orderDate"), created.isoformat() if created else "-")
+            return None
+        return od
+
+    for lid, row in api_by_id.items():
+        api_od = row.get("order_date")
+        env = json.dumps(row.get("_envelope"), ensure_ascii=False, default=str)
+        po, sku = row["po_id"], row["sku"]
+        ex = existing.get(lid)
+        if ex is None:                                   # ── 新单首见 ──
+            d_od = _detail_od(row, None)
+            if d_od is not None:
+                if api_od is not None and api_od != d_od:
+                    logger.warning("PO %s SKU %s 首见:列表 %s / 详情 %s,以详情落库;信封 %s",
+                                   po, sku, api_od.isoformat(), d_od.isoformat(), env)
+                    out.append({"kind": "详情补正", "po": po, "sku": sku, "db": None, "api": api_od})
+                elif api_od is None:
+                    out.append({"kind": "详情补正", "po": po, "sku": sku, "db": None, "api": None})
+                row["order_date"] = d_od
+                row["order_date_confirmed"] = True
+                row["order_date_source"] = _DETAIL_SOURCE
+            continue
+        _lid, _po, _sku, db_od, seen, confirmed, created, streak, source = ex
+        po, sku = _po or po, _sku or sku          # 报库里的身份(与此前口径一致)
+        if api_od is None:                               # 列表值解析阶段已拒写
+            if db_od is None:
+                d_od = _detail_od(row, created)
+                if d_od is not None:
+                    row["_order_date_fix"] = d_od
+                    out.append({"kind": "详情补正", "po": po, "sku": sku, "db": None, "api": None})
+            continue
         if created is not None and (api_od - created).total_seconds() > _ORDER_DATE_TOLERANCE_SECS:
             row["order_date"] = None
             out.append({"kind": "拒写", "po": po, "sku": sku, "db": db_od, "api": api_od})
             logger.warning("PO %s SKU %s 沃尔玛给的下单时间 %s 晚于本行首次入库 %s,不是下单时间,"
                            "拒写;信封 %s", po, sku, api_od.isoformat(), created.isoformat(), env)
+            if db_od is None:
+                d_od = _detail_od(row, created)
+                if d_od is not None:
+                    row["_order_date_fix"] = d_od
             continue
         if db_od is None or db_od == api_od:
             continue
-        if confirmed and seen == api_od and (streak or 0) + 1 >= _ORDER_DATE_SUSPECT_STREAK:
+        # ── 列表值与库值不同:先问详情 ──
+        d_od = _detail_od(row, created)
+        if d_od is not None:
+            if confirmed and source == _DETAIL_SOURCE:
+                if d_od == db_od:
+                    kind, verdict = "冲突", "详情=库值,列表回错,忽略"
+                else:
+                    kind, verdict = "疑错", (f"详情 {d_od.isoformat()} 也不认定稿值,请核对;"
+                                           f"修复:order_sync -p repair_order_date={po}")
+            elif d_od == db_od:
+                row["_order_date_fix"] = d_od          # 升级为详情定稿,值不变
+                kind, verdict = "冲突", "详情=库值,列表回错;按详情定稿"
+            else:
+                row["_order_date_fix"] = d_od
+                kind, verdict = "改判", "详情值与库值不同,按详情改判并定稿"
+        elif confirmed and seen == api_od and (streak or 0) + 1 >= _ORDER_DATE_SUSPECT_STREAK:
             kind, verdict = "疑错", (f"同一异值已连续 {(streak or 0) + 1} 轮,定稿值疑错;"
                                    f"修复:order_sync -p repair_order_date={po}")
         elif confirmed:
@@ -624,7 +718,7 @@ def screen_order_dates(conn, rows: list[dict]) -> list[dict]:
         else:
             kind, verdict = "待定", "库值保留,等下一轮"
         out.append({"kind": kind, "po": po, "sku": sku, "db": db_od, "api": api_od})
-        logger.warning("PO %s SKU %s 下单时间%s:库 %s / API %s —— %s;信封 %s",
+        logger.warning("PO %s SKU %s 下单时间%s:库 %s / 列表 %s —— %s;信封 %s",
                        po, sku, kind, db_od.isoformat(), api_od.isoformat(), verdict, env)
     return out
 
@@ -642,10 +736,12 @@ def upsert_order_lines(conn, rows: list[dict], *,
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)
         env = r.pop("_envelope", None)
-        # 三列只在**插入**时生效(skip_update):首见未定稿、留信封取证;
+        # 状态列只在**插入**时生效(skip_update):首见默认未定稿(screen_order_dates
+        # 以详情定稿的行已把 confirmed/source 放进行里)、留信封取证;
         # order_date_seen 随后由 _record_order_date_observations 记成本轮观测值
         r["order_date_seen"] = None
-        r["order_date_confirmed"] = False
+        r.setdefault("order_date_confirmed", False)
+        r.setdefault("order_date_source", _DETAIL_SOURCE if r["order_date_confirmed"] else None)
         r["order_date_streak"] = 0
         r["order_meta"] = json.dumps(env, ensure_ascii=False, default=str) if env else None
     guards = {"phone": _PHONE_GUARD, "asin": _ASIN_GUARD,
@@ -655,8 +751,19 @@ def upsert_order_lines(conn, rows: list[dict], *,
     n = _upsert(conn, "orders.order_lines", _ORDER_LINE_COLS,
                 ["order_line_id"], rows, skip_update=_ORDER_DATE_STATE_COLS,
                 guards=guards)
+    _apply_detail_verdicts(conn, rows)
     _record_order_date_observations(conn, rows)
     return n
+
+
+def _apply_detail_verdicts(conn, rows: list[dict]) -> None:
+    """输入:连接 + 已 upsert 的行 → 输出:无(把 screen_order_dates 的详情定稿/改判落库)。"""
+    fixes = [{"id": r["order_line_id"], "od": r["_order_date_fix"]}
+             for r in rows if r.get("_order_date_fix") is not None]
+    if not fixes:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(_ORDER_DATE_DETAIL_SQL, fixes)
 
 
 def _record_order_date_observations(conn, rows: list[dict]) -> None:

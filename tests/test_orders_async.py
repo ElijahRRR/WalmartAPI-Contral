@@ -225,3 +225,27 @@ def test_correlation_id_echo_mismatch_is_logged(monkeypatch, caplog):
                 handler=lambda s, orders: len(orders))
         assert not dead and not failed and results[0]["lines"] == 1
         assert ("响应相关 ID 与请求不符" in caplog.text) is expect_warn, echo
+
+
+def test_get_order_detail_endpoint(monkeypatch):
+    """蓝图 #31 单单详情:带 replacementInfo=true;404 返 None;401 判凭证死;
+    走 orders.get 限速桶(未登记的桶会 KeyError,这里顺便证明它登记了)。"""
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(str(req.url))
+        if req.url.path.endswith("/PO404"):
+            return httpx.Response(404, json={})
+        if req.url.path.endswith("/PODEAD"):
+            return httpx.Response(401, json={})
+        return httpx.Response(200, json={"order": {"purchaseOrderId": "PO1",
+                                                   "orderDate": 1754300000000,
+                                                   "orderType": "REGULAR"}})
+    _seam(monkeypatch, handler)
+    o = orders_api.get_order(_store("T1"), "PO1")
+    assert o["orderDate"] == 1754300000000 and o["orderType"] == "REGULAR"
+    assert seen[-1].endswith("/v3/orders/PO1?replacementInfo=true&productInfo=false")
+    assert orders_api.get_order(_store("T1"), "PO404") is None
+    import pytest as _pt
+    with _pt.raises(_client.StoreDeadError):
+        orders_api.get_order(_store("T1"), "PODEAD")

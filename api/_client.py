@@ -228,6 +228,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
     "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
     "orders.list": (3000, 60.0),                # GET /v3/orders(官方 5000/min)
+    "orders.get": (3000, 60.0),                 # GET /v3/orders/{po}(官方 5000/min;下单时间定稿的第二来源)
     # feeds 域(蓝图 §3/§6 定稿):GET 全家共享桶;POST 各 feedType 独立桶,
     # 未登记的 feedType 默认拒绝——旧系统 RETIRE_ITEM 零限速就是未知键放行漏的
     "feeds.get": (3000, 60.0),                  # GET /v3/feeds 与 /{feedId}(官方 5000/min 共享)

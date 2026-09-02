@@ -44,6 +44,7 @@
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
 | 29 | GET /v3/insights/performance/{8 项}/report | insights | 问题订单明细 **xlsx 二进制** | 裸 httpx | 店铺日报 |
 | 30 | GET /v3/settings/partnerprofile | settings | Partner ID(**无自建仓时**的上架 shipNode) | safe_get_ex | auto_listing |
+| 31 | GET /v3/orders/{purchaseOrderId} | orders | 单单详情:**下单时间定稿的第二来源**(新单首见 / 列表值与库不一致时单查;2026-09-02 新增,旧系统未用;探针 4 实证 550 单详情全对) | safe_get_ex | order_sync |
 | 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
 | 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
 | 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
@@ -79,7 +80,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 1 product_query | 5(DEFAULT+SPEC), 6 | 全只读,零状态 |
 | 2 returns_sync | 24 | 支持真增量,时间窗成对下发(§4.3 实证;原记"不支持时间过滤"已于 2026-08-14 勘误) |
 | 3 daily_report | 23, 25, 26, 27, 28 | 29(xlsx 二进制)已分给 perf_problems;商品三列改读 catalog.walmart_items(靠链上前置的 catalog_sync),不再自己调 4/2 |
-| 4 order_sync | 23 | 窗口全量重拉(缺省 days=45,不走 lastModifiedStartDate 增量,故无 179d 坑);order_audit 只读 PG/采集器,零沃尔玛调用 |
+| 4 order_sync | 23, 31 | 窗口全量重拉(缺省 days=45,不走 lastModifiedStartDate 增量,故无 179d 坑);order_audit 只读 PG/采集器,零沃尔玛调用 |
 | 5 upc_sync | 无沃尔玛调用 | 号源由运营填「UPC池」表,注入/回写只走飞书 + catalog.upc_pool;计划中的 items.search 查重未实现(UPC 造号已定案不做) |
 | 6 maintenance | 10, 14, 15, 19, 20, 17, (32, 33) | 同步/feed 双路由是 services 层职责;配了「维护仓库」的店走 32 + MP_INVENTORY feed(多仓批次 2) |
 | 7 product_clear | 11, 12, 17 | 消费飞书「停用/删除表」:停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM;防重走 ops.feed_log |
@@ -109,6 +110,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/feeds/{id}/errorReport | 60/hour;**官方仅支持 FITMENT 类 feed**;响应是 zip(内含 CSV);204=无错误 | 旧代码用在 MP_ITEM 上,官方现文不支持 | 50/hour;api 层限定 fitment |
 | GET /v3/inventories | 200/min | 一致;"单店 cursor 强制串行"是生产实证(2026-05-15 起),非官方文档结论 | 180/min,串行翻页 |
 | GET /v3/orders | 5000/min | 一致 | 3000/min |
+| GET /v3/orders/{purchaseOrderId} | 5000/min(tsv:119「An order」) | 新登记(2026-09-02) | 3000/min,与列表分桶(orders.get);探针 4:并发 8、550 次/69s 无 429 |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
 | reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min;**明细只准走 CSV 端点 reconFile**(ZIP 包,Accept: application/octet-stream,text/csv 406)——reconFileJson 每账期硬截断 1000 行且 offset 只收 0,nextOffset 是字节偏移,超千行账期必丢数据(订单中心v1 2026-08-04 实证) |
@@ -285,6 +287,8 @@ api/orders.py
   iter_orders(store, *, created_start=None, created_end=None,
               last_modified_start=None, limit=200, stats=None)  # 分页模型2;
                                                           # 多店 async 并发在 api 内部:fetch_orders_bulk(stores, ...) 同步门面(§6.3)
+  get_order(store, po) -> dict | None       # #31 单单详情(replacementInfo=true);404 返 None。
+                                            # 下单时间定稿的第二来源(2026-09-02),只在新单首见/列表值与库不一致时调
 api/returns.py
   iter_returns(store, *, created_start, created_end=None, limit=200)
       # 分页模型3;⚠ created_start 是**必填关键字参数**,时间窗必须成对下发

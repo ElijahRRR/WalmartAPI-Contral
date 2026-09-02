@@ -6,6 +6,7 @@
   python cli.py order_sync -p days=90          # 自定窗口
   python cli.py order_sync -p workers=8        # 跨店并发
   python cli.py order_sync -p repair_order_date=PO1,PO2   # 显式修复:只对列出的 PO 允许 API 下单时间覆盖库值
+                                                         #(详情接口定稿后列表永不覆盖;详情不可用时退回连续两轮一致)
 
 每店:GET /v3/orders(createdStartDate=now-days)→ 展开订单行 → upsert
 orders.order_lines。窗口全量重拉而非游标增量:订单状态在创建后持续变化
@@ -41,17 +42,17 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.order_sync")
 
 
-_ANOMALY_KINDS = ("疑错", "改判", "拒写", "冲突", "待定", "存疑")
+_ANOMALY_KINDS = ("疑错", "改判", "拒写", "详情补正", "详情失败", "冲突", "待定", "存疑")
 
 
 def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
-             repair: frozenset = frozenset()) -> int:
-    """输入:店铺 + 该店全部订单(+异常收集器/修复开关)→ 输出:入库行数(fetch_orders_bulk 回调)。
+             repair: frozenset = frozenset(), detail_stats: dict | None = None) -> int:
+    """输入:店铺 + 该店全部订单(+异常收集器/修复 PO 集/详情计数器)→ 输出:入库行数(fetch_orders_bulk 回调)。
 
-    下单时间观测→定稿(所有者定稿 2026-09-02):入库前按库里现状把 API 值与库值
-    不一致的行分成 冲突/改判/待定,加上 拒写(未来/远古日期、晚于本行首次入库)
-    /存疑(晚于状态时间),逐条记日志并收进 anomalies(进摘要首行);默认模式由守卫决定取舍,
-    只有 PO 在 repair 集合里的行才允许 API 值直接覆盖(显式修复已定稿的错行)。
+    下单时间(所有者方案 2026-09-02):新单首见以**详情接口**的值落库并定稿;列表值
+    与库值不同、或列表值明显异常时查详情复核;详情定稿后列表永不覆盖。详情不可用
+    时退回观测→定稿两轮机制。每类异常(疑错/改判/拒写/详情补正/详情失败/冲突/待定/
+    存疑)逐条记日志并收进 anomalies(进摘要);repair 里的 PO 才允许 API 值直接覆盖。
     """
     rows: list[dict] = []
     for order in orders:
@@ -62,9 +63,15 @@ def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
             if r.get(mark):
                 found.append({"kind": kind, "po": r["po_id"], "sku": r["sku"],
                               "db": None, "api": r.get("order_date")})
+
+    def detail(po: str):
+        if detail_stats is not None:
+            detail_stats["calls"] = detail_stats.get("calls", 0) + 1
+        return orders_api.get_order(store, po)
+
     try:
         with db.pg_conn() as conn:
-            found.extend(ol.screen_order_dates(conn, rows))   # 可能把不可能的 API 值置空
+            found.extend(ol.screen_order_dates(conn, rows, detail=detail))
             fix = [r for r in rows if r["po_id"] in repair]
             rest = [r for r in rows if r["po_id"] not in repair]
             n = ol.upsert_order_lines(conn, rest) if rest else 0
@@ -111,7 +118,9 @@ def run(params: dict) -> str:
         .strftime("%Y-%m-%dT%H:%M:%SZ")
     repair = _repair_pos(params)
     anomalies: list[dict] = []
-    persist = functools.partial(_persist, anomalies=anomalies, repair=repair)
+    detail_stats: dict = {}
+    persist = functools.partial(_persist, anomalies=anomalies, repair=repair,
+                                detail_stats=detail_stats)
 
     results, dead, failed = orders_api.fetch_orders_bulk(
         store_list, created_start=created_start, concurrency=workers,
@@ -154,13 +163,16 @@ def run(params: dict) -> str:
     # 挡住的(冲突/待定)只报一个数——生产实测每轮都有十来条,逐条上首行会把
     # 通知训练成"看见 ⚠ 就划走"
     acted = " / ".join(f"{k} {counts[k]}" for k in ("疑错", "改判", "拒写") if counts[k])
-    blocked = counts["冲突"] + counts["待定"]
+    blocked = counts["冲突"] + counts["待定"] + counts["详情补正"]
     tail = ""
     if acted:
         tail += f";⚠ 下单时间:{acted}"
     if blocked or counts["存疑"]:
         tail += (f";沃尔玛下单时间回错 {blocked} 条已挡" if blocked else "") \
             + (f";下单时间存疑 {counts['存疑']} 条" if counts["存疑"] else "")
+    if detail_stats.get("calls"):
+        tail += f";详情复核 {detail_stats['calls']} 次" \
+            + (f"(失败 {counts['详情失败']})" if counts["详情失败"] else "")
     if repair:
         tail += f"(修复模式:{len(repair)} 个 PO 已按 API 值改写)"
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"

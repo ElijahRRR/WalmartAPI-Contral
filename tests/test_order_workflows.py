@@ -102,7 +102,13 @@ def _fake_stores(monkeypatch, module):
 def test_order_sync_end_to_end(monkeypatch):
     from workflows import order_sync
 
+    detail_calls = []
+
     def handler(request):
+        if request.url.path == "/v3/orders/PO1":          # 新单首见:详情定稿
+            detail_calls.append(str(request.url))
+            return httpx.Response(200, json={"order": {
+                "purchaseOrderId": "PO1", "orderDate": 1754300000000}})
         assert request.url.path == "/v3/orders"
         assert "createdStartDate" in str(request.url)
         return httpx.Response(200, json={"list": {
@@ -123,9 +129,12 @@ def test_order_sync_end_to_end(monkeypatch):
     out = order_sync.run({"days": "7"})
     assert "1/1 店完成" in out and "订单行入库 2" in out
     assert "下单时间冲突" not in out       # 库里没有 = 首见,不是冲突
+    assert len(detail_calls) == 1 and "replacementInfo=true" in detail_calls[0]
+    assert ";详情复核 1 次" in out.splitlines()[0]
     kind, sql, rows = next(c for c in calls if c[0] == "many")
     assert "orders.order_lines" in sql
     assert {r["sku"] for r in rows} == {"A", "B"}
+    assert all(r["order_date_confirmed"] and r["order_date_source"] == "detail" for r in rows)
     # 审核列绝不在 upsert 列内(重拉不得冲掉审核结论)
     assert "audit_status" not in sql
     # 下单时间观测→定稿:默认模式 upsert 走状态守卫,不是裸 EXCLUDED
@@ -142,6 +151,8 @@ def _order_sync_with_conflict(monkeypatch, params):
     db_dt = datetime(2026, 9, 9, 4, 12, tzinfo=timezone.utc)
 
     def handler(request):
+        if request.url.path == "/v3/orders/PO1":          # 详情:本用例让它不可用(404)
+            return httpx.Response(404, json={})
         return httpx.Response(200, json={"list": {
             "elements": {"order": [{
                 "purchaseOrderId": "PO1", "orderDate": api_ts,
@@ -154,7 +165,7 @@ def _order_sync_with_conflict(monkeypatch, params):
         def fetchall(self):
             sql, args = self._last
             if isinstance(args, dict):     # 在库比对:PO1/A 已有另一个值(首见未定稿)
-                return [(lid, "PO1", "A", db_dt, None, False, None, 0) for lid in args["ids"]]
+                return [(lid, "PO1", "A", db_dt, None, False, None, 0, None) for lid in args["ids"]]
             return super().fetchall()
 
     class _Conn(_FakeConn):

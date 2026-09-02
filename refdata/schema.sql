@@ -704,6 +704,10 @@ ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_meta jsonb;
 --                         若同一异值连续三轮不变,几乎可断定是定稿值错了)。到 3 即在
 --                         order_sync 摘要首行报「疑错」并给出修复命令;定稿值本身不动
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_streak smallint NOT NULL DEFAULT 0;
+--   order_date_source     定稿依据:'detail' = 详情接口 GET /v3/orders/{po} 给的
+--                         (探针 4 实证可信,定稿即锁死);'list' = 只靠列表连续两轮
+--                         一致定稿(详情当时不可用),之后详情给出不同值可改判为详情值
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_source text;
 
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号

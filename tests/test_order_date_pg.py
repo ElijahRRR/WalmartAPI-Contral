@@ -102,11 +102,13 @@ def _order(po: str, order_ms, status_ms=STATUS_MS) -> dict:
                 "orderLineStatuses": {"orderLineStatus": [{"status": "Shipped"}]}}]}}
 
 
-def _sync(pg, po: str, order_ms, *, repair=False) -> list[dict]:
-    """模拟 order_sync._persist 的一轮:先比对(取证)再 upsert;返回冲突分类。"""
+def _sync(pg, po: str, order_ms, *, repair=False, detail=None) -> list[dict]:
+    """模拟 order_sync._persist 的一轮:先筛(取证/详情)再 upsert;返回异常分类。
+    detail=None 表示详情接口不可用(退回两轮机制);传毫秒值表示详情给这个值。"""
     rows = ol.extract_order_lines(STORE, _order(po, order_ms))
+    hook = None if detail is None else (lambda _po: {"purchaseOrderId": _po, "orderDate": detail})
     with pg.pg_conn() as conn:
-        found = ol.screen_order_dates(conn, rows)
+        found = ol.screen_order_dates(conn, rows, detail=hook)
         ol.upsert_order_lines(conn, rows, repair_order_date=repair)
     return found
 
@@ -115,7 +117,7 @@ def _state(pg, po: str) -> tuple:
     with pg.pg_conn() as conn:
         return conn.execute(
             "SELECT order_date, order_date_seen, order_date_confirmed, updated_at,"
-            " order_meta->>'orderDate', source, order_date_streak"
+            " order_meta->>'orderDate', source, order_date_streak, order_date_source"
             " FROM orders.order_lines WHERE po_id = %s", (po,)).fetchone()
 
 
@@ -125,7 +127,7 @@ def _dt(ms) -> datetime:
 
 def test_first_sight_is_candidate_and_second_identical_read_confirms(pg):
     assert _sync(pg, "P1", X_MS) == []
-    od, seen, confirmed, upd1, meta_raw, source, _k = _state(pg, "P1")
+    od, seen, confirmed, upd1, meta_raw, source, _k, _src = _state(pg, "P1")
     assert (od, seen, confirmed) == (_dt(X_MS), _dt(X_MS), False)   # 候选 + 本轮观测,未定稿
     assert meta_raw == str(X_MS) and source is None       # 首见信封落 order_meta 取证
     assert _sync(pg, "P1", X_MS) == []
@@ -187,7 +189,7 @@ def test_history_import_midnight_row_yields_to_api_after_two_reads(pg):
                      (ol.make_order_line_id("P6", SKU), STORE, "P6", SKU, midnight,
                       ol.HISTORY_SOURCE))
     _sync(pg, "P6", X_MS)
-    od, _s, _c, _u, _m, source, _k = _state(pg, "P6")
+    od, _s, _c, _u, _m, source, _k, _src = _state(pg, "P6")
     assert od == midnight and source is None      # 真行到了:历史标记摘掉,下单时间先保留
     _sync(pg, "P6", X_MS)
     assert _state(pg, "P6")[0] == _dt(X_MS)
@@ -275,3 +277,47 @@ def test_confirmed_but_wrong_value_self_reports_after_three_identical_disagreeme
     assert _state(pg, "P13")[6] == 0
     _sync(pg, "P13", X_MS, repair=True)          # 人工点名修复
     assert _state(pg, "P13")[:3] == (_dt(X_MS), _dt(X_MS), True)
+
+
+def test_detail_commits_new_order_at_first_sight_and_list_never_overrides(pg):
+    """所有者方案:新单以详情值首次落库并定稿(source=detail);之后列表怎么抖都不动;
+    列表≠库时详情复核:详情=库 ⇒ 冲突;详情≠库 ⇒ 疑错(不动)。"""
+    assert [c["kind"] for c in _sync(pg, "P20", Y_MS, detail=X_MS)] == ["详情补正"]
+    st = _state(pg, "P20")
+    assert (st[0], st[2], st[7]) == (_dt(X_MS), True, "detail")
+    assert st[4] == str(Y_MS)                     # 信封仍记列表原值(取证)
+    assert [c["kind"] for c in _sync(pg, "P20", Y_MS, detail=X_MS)] == ["冲突"]
+    assert _state(pg, "P20")[0] == _dt(X_MS)
+    assert [c["kind"] for c in _sync(pg, "P20", Y_MS, detail=Y_MS)] == ["疑错"]
+    assert _state(pg, "P20")[0] == _dt(X_MS)      # 详情也翻供:报人,不自动改
+    assert _sync(pg, "P20", X_MS, detail=X_MS) == []
+
+
+def test_detail_upgrades_list_only_confirmation_and_fixes_it(pg):
+    """详情当时不可用、靠列表两轮定稿的行(source=list),详情一旦可用且给出不同值
+    ⇒ 改判为详情值并升级为 detail 定稿;updated_at 因下单时间真变而更新。"""
+    _sync(pg, "P21", Y_MS)
+    _sync(pg, "P21", Y_MS)
+    st = _state(pg, "P21")
+    assert (st[0], st[2], st[7]) == (_dt(Y_MS), True, None)
+    upd = st[3]
+    assert [c["kind"] for c in _sync(pg, "P21", Y_MS + 1, detail=X_MS)] == ["改判"]
+    st = _state(pg, "P21")
+    assert (st[0], st[2], st[7], st[6]) == (_dt(X_MS), True, "detail", 1)
+    assert st[3] > upd
+    _sync(pg, "P21", Y_MS + 2, detail=X_MS)      # 以后列表再错:冲突,不动
+    assert _state(pg, "P21")[0] == _dt(X_MS)
+
+
+def test_rejected_list_value_is_filled_from_detail(pg):
+    """列表值明显异常(未来)⇒ 拒写,详情可用就当场补正,不用等下一轮。"""
+    future = int((datetime.now(timezone.utc) + timedelta(days=2)).timestamp() * 1000)
+    assert [c["kind"] for c in _sync(pg, "P22", future, detail=X_MS)] == ["详情补正"]
+    st = _state(pg, "P22")
+    assert (st[0], st[2], st[7]) == (_dt(X_MS), True, "detail")
+    # 已存在但下单时间为空的行(此前拒写且详情不可用),详情可用时补上
+    with pg.pg_conn() as conn:
+        conn.execute("INSERT INTO orders.order_lines (order_line_id, store, po_id, line_number, sku)"
+                     " VALUES (%s, %s, %s, '1', %s)", (ol.make_order_line_id("P23", SKU), STORE, "P23", SKU))
+    assert [c["kind"] for c in _sync(pg, "P23", future, detail=X_MS)] == ["详情补正"]
+    assert _state(pg, "P23")[0] == _dt(X_MS)

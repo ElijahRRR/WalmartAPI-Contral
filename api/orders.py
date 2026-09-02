@@ -2,6 +2,8 @@
 
   iter_orders()        订单生成器,分页模型 2(蓝图 §4):meta.nextCursor 返回带
                        '?' 的完整 query 串,直接拼在 /v3/orders 后;单店内必须串行翻页。
+  get_order()          单单详情(蓝图矩阵 #30,2026-09-02):下单时间定稿的第二来源,
+                       新单首见 / 列表值与库不一致时单查;404 返 None。
   fetch_orders_bulk()  多店并发拉取(蓝图 §6.3 async 变体,2026-08-13 落地):
                        同步门面,内部 asyncio + httpx.AsyncClient——单店内翻页
                        仍串行(cursor 语义),**店与店之间并发**;async 只藏在
@@ -288,6 +290,30 @@ def fetch_orders_bulk(stores: list[dict], *, created_start: str | None = None,
         else:
             results.append(outcome)
     return results, dead, failed
+
+
+def get_order(store: dict, po: str) -> dict | None:
+    """输入:店铺 + purchaseOrderId → 输出:详情接口的订单对象;404 返 None,其它失败抛 RuntimeError。
+
+    蓝图矩阵 #30(2026-09-02 登记):下单时间定稿的**第二来源**。探针 4 实证
+    (A142 550 单逐单对比):列表 orderDate 错 6 条,详情全对且二次查询稳定;
+    官方 5000/min,与列表分桶(orders.get)。带 replacementInfo=true,把
+    orderType / originalCustomerOrderID 一并带回(取证:换货/预售单是否集中出错)。
+    只做接口适配,不做业务判断(铁律 2);凭证死店抛 StoreDeadError 交调用方。
+    """
+    _client.rate_acquire("orders.get", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    status, _, data = _client.safe_get_ex(
+        f"{_client.base_url()}/v3/orders/{po}", token, store["client_id"], store["proxy"],
+        params={"replacementInfo": "true", "productInfo": "false"}, max_retries=3)
+    if status == 404:
+        return None
+    if status in (401, 403):
+        raise _client.StoreDeadError(store["name"], status)
+    if status != 200 or data is None:
+        raise RuntimeError(f"GET /v3/orders/{po} 返回 {status}(店铺 {store['name']})")
+    order = data.get("order") if isinstance(data, dict) else None
+    return order if isinstance(order, dict) else None
 
 
 def order_product_sales(order: dict) -> float:

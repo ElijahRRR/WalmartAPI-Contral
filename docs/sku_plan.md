@@ -5,7 +5,8 @@
 > 按所有者四问做全仓二次调研(四路并行:数据流全景 / 上架链与生成时点 /
 > 订单财务飞书侧 / 仓内沃尔玛硬约束),本版为整体计划;09-02 深夜按所有者
 > 三条批复改稿(多店多码可处理 / 波及面一次做完 / **存量产品迁到新码**,官方
-> 支持改 SKU,见 §4)。
+> 支持改 SKU,见 §4);09-02 生命周期工作流(官方/仓内/社区三路 → 三方案评审 →
+> 对抗验证)定稿 §5.3 四个弃码点与复用规则。
 > 所有者定稿:「沃尔玛侧通过 SKU 倒查产品来源,我不想让沃尔玛知道我的货源
 > 是哪里来的」+ 多源共存(amz / 1688 / 自建)+「前缀不要店铺,我需要让我们
 > 内部可以看出来这个产品是怎么来的」。
@@ -13,8 +14,9 @@
 ## 0. 一句话模型
 
 **SKU = 12 位连写:`<1 位来源字母><11 位随机不透明码>`;身份唯一出处 =
-`catalog.listing_sources`;在 list_new 预备期抽码登记,提交前已落库;同一
-(店, 来源类型, 来源码) 的码复用到显式退役为止。**
+`catalog.listing_sources`;在 list_new 预备期抽码登记,提交前已落库;**码的寿命 =
+沃尔玛侧那条 (店, SKU) 记录对我们还有用的寿命**——同一 (店, 来源类型, 来源码)
+的码复用到显式弃码为止,弃码只在四个点发生(§5)。**
 
 对沃尔玛:一串 12 位随机串,看不出 ASIN、看不出上架日期。对内部:首字母一眼
 看出来源(amz / 跟卖 / 1688 / 自建),细节靠登记簿反查。
@@ -212,15 +214,34 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
    /v3/items/{新sku}` 前后对比)。
 3. 旧 SKU 串改码后能否再次使用(不打算复用,只为知道撞库风险)。
 
+**下架后 SKU 的状态(官方查证 2026-09-02,§5 生命周期的依据)**:
+- RETIRE(停用):SKU **保留**。item 留在目录,lifecycle=RETIRED,内容/历史/评论
+  保留,本质是 end date 置过去;"To unretire an item, change the end date to the
+  future … this API only retires the item, it does not delete it"
+  ([Item inventory FAQ](https://developer.walmart.com/us-marketplace/docs/item-inventory));
+  Seller Center 复活 = Site End Date 改未来。退役 item 的 SKU 与 Product ID 不能给
+  别的 item 用("You can't reuse the SKU or Product ID from a retired item",
+  [CA retireanitem](https://developer.walmart.com/ca-marketplace/reference/retireanitem))。
+  蓝图 §retire 里"API 无 reactivate"应更正为"无专用端点,unretire = endDate 改未来"。
+- DELETE:SKU **不保留**,永久;48h 内删、最多 72h 从目录消失;GTIN 24h 后可复用;
+  同一 SKU 串 48h 后可重新 setup("wait for a 48-hour interval, and then set up a
+  new item … using the same or a different SKU number",
+  [Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items),
+  是 Marketplace 文档——蓝图 §遗留 2 写的"仅 1P"应更正)。
+- 库存归零:SKU 完全不变,官方把它列为 DELETE 的可逆替代。
+- unpublish:发布状态不是生命周期,item 与 SKU 原样在;连续 unpublished 超 90 天
+  沃尔玛自动 retire([duplicate listings policy](https://marketplacelearn.walmart.com/guides/Policies%20&%20standards/Product%20listings/duplicate-listings-policy))。
+- 沃尔玛侧自然缺席(missing_since):官方无此概念,不是 SKU 状态本身。
+
 其余可确认(仓内有记载):SKU_LOCKED = SKU 绑死首次提交的 UPC,不先退役换 UPC
-重发必败;退役后旧 UPC 永久烧号;官方 retire = `DELETE /v3/items/{sku}`,API 无
-reactivate;24h 冷却是旧系统实证,官方无明文;订单行只给 `item.sku` +
+重发必败;退役后旧 UPC 永久烧号(本仓保守策略,非官方规则);24h 冷却是旧系统
+实证,官方无明文;订单行只给 `item.sku` +
 `productName`,行身份 = sha256(PO+SKU) ⇒ **订单只能靠 SKU 对到产品**,登记簿
 反查是订单侧唯一通路;`walmart_items` 身份列 sku(PK)/wpid/item_id/upc/gtin。
 
 仍待核(§8):SKU 长度上限与字符集(本地 spec Orderable.sku 定义)。
 
-## 5. 生成时点与生命周期(问 1 的展开)
+## 5. 生成时点与生命周期(问 1 的展开;2026-09-02 生命周期工作流定稿)
 
 ### 5.1 三个候选时点
 
@@ -230,72 +251,108 @@ reactivate;24h 冷却是旧系统实证,官方无明文;订单行只给 `item.sk
 | B. `alloc_push` 派工(写上架表 A/B) | 有 | 可行但不推荐:派工与上架之间隔着审核 + 12 道闸,历史淘汰率 40%,登记簿会留大量幽灵行 |
 | C. `list_new._prep_rows` 预备期 | 有,且是"确定要发"的最后一道 | **推荐**:与现有 `_UPC_PLACEHOLDER`"预备期占位、提交期回填"同构;跟卖已经是提交前生成 |
 
-如果所有者想要的其实是"派工时运营就能在上架表看到码",B 是折中;代价是幽灵
-行(维护链同时 JOIN walmart_items,幽灵行不会产生动作,但 risk_trace 会算进
-波及面)。
+### 5.2 两条硬约束(缺一条就静默出事)
 
-### 5.2 两条硬约束(调研发现,缺一条就静默出事)
-
-1. **mint 必须在 `_prep_rows`,不能在 `_one_store` 内**。`list_new` 的串行补试
-   (`store_retry.serial_second_pass`)会重跑 `_one_store`;若抽码在里面,第二
-   次抽出新码 ⇒ 载荷不再一字不差 ⇒ `feeds.payload_key` 在途防重不命中 ⇒
-   首轮已发出的片子被真的再发一次 = **双上架**。初稿 §5 写的"领号 → 抽码 →
-   组载荷 → 提交"落在 `_one_store` 内,**本版改正**:预备期抽码挂到 `r["_sku"]`,
+1. **mint 必须在 `_prep_rows`,不能在 `_one_store` 内**。串行补试
+   (`store_retry.serial_second_pass`)会重跑 `_one_store`;若抽码在里面,第二次
+   抽出新码 ⇒ 载荷不再一字不差 ⇒ `feeds.payload_key` 在途防重不命中 ⇒ 首轮已
+   发出的片子被真的再发一次 = **双上架**。预备期抽码挂到 `r["_sku"]`,
    `_one_store` 只回填不抽码。
-2. **同一 (店, 来源类型, 来源码) 的码复用到显式退役为止**,不是"每次重上抽新码"
-   (初稿 §3"没有序号段,重上 = 再抽一个码"**本版推翻**)。理由是三条现存护栏
-   全绑在"同一个品同一个 SKU"上:FAILED 重试上限 `_SQL_ATTEMPTS`、`payload_key`
-   防重、UPC 池 `claim` 的先复用后新领(键 (store, asin),存在理由就是 SKU 绑死
-   首个 UPC)。每次重上抽新码会让 `claim` 把旧 item 已占的 UPC 发给新 SKU ⇒
-   必撞 ERR_EXT_DATA_0101119 ⇒ 每次重上白烧一个号,而且看起来像"运气差"。
-   退役点复用现成的 `burn_for_retire` 位置:RETIRE/DELETE 成功 ⇒ 登记簿该行
-   标 `retired_at` ⇒ 下次 mint 抽新码。
+2. **码复用到显式弃码,不是"每次重上抽新码"**。三条现存护栏全绑在"同一个品
+   同一个 SKU"上:FAILED 重试上限 `_SQL_ATTEMPTS`、`payload_key` 防重、UPC 池
+   `claim` 的先复用后新领(键 (store, asin),存在理由就是 SKU 绑死首个 UPC)。
+   每次重上抽新码会让 `claim` 把旧 item 已占的 UPC 发给新 SKU ⇒ 必撞
+   ERR_EXT_DATA_0101119 ⇒ 每次重上白烧一个号,而且看起来像"运气差"。
 
-### 5.3 生命周期定稿
+### 5.3 生命周期规则(工作流三方案评审 + 对抗验证,20 票中 19 票未被驳)
 
-```
-派工(上架表 A/B)→ 审核 → list_new 闸门 → 配额切片
-→ 预备期 mint(store, source_type, source_key):
-     登记簿有未退役行 → 复用该 SKU
-     没有 → 抽码 + 全局查重 + INSERT(同一函数,同一事务)
-→ 组载荷(sku = r["_sku"])→ 领 UPC(键仍 (store, asin))→ 提交
-→ 提交成功:写 K/L/M + V(SKU)列;事件记 sku=真码 + asin
-→ 提交失败/拒:码留着,下次重试复用(重试上限、防重、UPC 复用三条护栏照旧)
-→ RETIRE/DELETE 成功:登记簿 retired_at + burn_for_retire;下次上架抽新码
-```
+**码的寿命 = 沃尔玛侧那条 (店, SKU) 记录对我们还有用的寿命,不是上架/下架次数。**
 
-dry-run:**不抽真码,用占位码**(与 `_UPC_PLACEHOLDER` 同一纪律:dry-run 不写
-库;dry-run 是 AI 改完代码必跑项,频次高,抽真码 = 登记簿灌垃圾)。代价是
-dry-run 看到的 sku 不是真跑那个,与 UPC 占位的处境相同,已被接受过一次。
-默认 dry-run 不组载荷,要看 sku 字段用 `-p check_spec=1`。
+- 登记簿一行一码,**永不删除**;加列 `abandoned_at` / `abandoned_reason` /
+  `replaced_by`。列名用 abandoned 不用 retired——"码弃用 ≠ 沃尔玛 lifecycle
+  RETIRED ≠ product_clear 停用"三个同名异义,docstring 钉死。`abandoned_at IS NULL`
+  的行叫活码。
+- **弃码只有一个实现** `sku_codec.abandon(conn, store, sku, reason)`,同一事务
+  内 UPDATE 登记簿 + 对 amz 行烧掉该 (店, ASIN) 名下 claimed/used 的 UPC(码与
+  UPC 同寿命;烧号用独立状态值 `burned_delete` / `burned_lock`,不复用语义为
+  "撞库"的 conflict);match 行只标不烧;reason=sku_update 不烧。
+- **四个弃码点,只有四个**:
+  1. DELETE 经 catalog_sync 观测核验 `delete_verified` 时(不是回执——"回执成功
+     但后台没删"是所有者实证过的故障模式;若按回执弃码,下次新码新 UPC 去上一个
+     还活着的 item = 同店重复 listing,沃尔玛不会替你拦);
+  2. SKU_LOCKED 自愈链 RETIRE 回执成功 + 冷却期满(唯一绑回执的弃码点:锁死的
+     SKU 可能从未进过 walmart_items,无观测可等);
+  3. UPC 撞库 ERR_EXT_DATA_0101119 时码与 UPC 一起换(**决策 B**);
+  4. 改码 SkuUpdate 经观测确认后旧行 `abandoned_at` + `replaced_by`。
+- **其余一切"下架"都不弃码**:product_clear 停用(RETIRE)、库存归零、缺席
+  `missing_since`、被沃尔玛 unpublish、提交失败/被拒/Unknown/PROHIBITED——沃尔玛侧
+  记录仍在、仍绑着我们的 UPC,抽新码等于同店两条同内容记录 + 白烧一个 UPC。
+  守门测试反向钉死:product_clear / problem_product_cleanup / maintenance /
+  catalog_sync.mark_missing / feed_track 不得调用 abandon。
+- **mint(store, source_type, source_key)**:先查活行 ⇒ 复用同一码(UPC 池 claim
+  按 (店, ASIN) 复用原号)⇒ 同码同 UPC 重发 MP_ITEM(载荷本就带 2028 年 endDate,
+  对沃尔玛 = 同一记录的再提交 / 官方 unretire 语义);无活行 ⇒ 抽码 + 全局查重 +
+  INSERT(同函数同事务),新码必配新 UPC。dry-run 用占位码不写库。
+- **本店去重闸** `_SQL_LISTED_ASINS` 改为 walmart_items LEFT JOIN 登记簿,
+  `missing_since IS NULL AND abandoned_at IS NULL`,键 `coalesce(source_key, sku)`;
+  **不加 lifecycle 条件**——RETIRED 行只要码未弃就拦,退市档案不由 list_new 复活
+  (2026-08-28 定稿;alloc_push 排 RETIRED + mint 复用 + endDate 2028 = 对 7,342
+  行退市档案批量走官方复活通道,plan.md:166 事故重演)。`alloc_push._SQL_ONLINE`
+  对齐同一口径(**决策 C**)。
+- **护栏跟码走**:`_SQL_ATTEMPTS` 改按 (店, ASIN) 经登记簿 JOIN、按代际计(只数
+  最近一次弃码之后的提交;无弃码事件则跨码累计);**代际上限**:同 (store,
+  source_type, source_key) 弃码行数 ≥ 3 ⇒ list_new 写 N「换码次数达上限,待人工」;
+  24h 冷却从 sku_locked_heal 自管泛化为 list_new 闸门(常量单一出处,官方无明文
+  按旧实证保留)。
+- **消费方契约**:resolve / 维护链 JOIN / 事件归并 / 订单反查对 (store, sku)
+  一律不按 abandoned_at 过滤;全仓 SQL 里 `abandoned_at IS NULL` 只允许出现在
+  `sku_codec.mint`、list_new 去重闸、`alloc_push._SQL_ONLINE` 三处(守门测试)。
+  码级事件 `sku_abandoned` / `sku_replaced` 进 product_events。
+- **跨店永不复用**:码全局唯一(含已弃码行),UPC 按店领。
+
+### 5.4 同店同 ASIN 再上架:复用还是新抽(问答速查)
+
+| 之前发生了什么 | 再上架时 | 依据 |
+|---|---|---|
+| 库存归零 / 被 unpublish | 不是"再上架":item 在架,恢复 = 推库存/修条件;去重闸拦 | 沃尔玛侧记录、码、UPC 全在 |
+| 沃尔玛侧缺席(missing_since) | **复用**同码同 UPC(24h 冷却闸后) | 抽新码撞 Product ID |
+| product_clear 停用(RETIRE) | 记录仍被扫到 ⇒ 去重闸拦(恢复走显式动作);从响应集消失 ⇒ 按缺席复用 | 退市档案不由 list_new 复活 |
+| 提交失败 / 被拒 / Unknown | **复用**,重试上限 3 次照旧 | 三条护栏 |
+| DELETE 经观测核验 | **新码 + 新 UPC** | 沃尔玛侧无物可复活 |
+| SKU_LOCKED 自愈链退役成功 | **新码 + 新 UPC** | 旧码绑死坏 UPC |
+| UPC 撞库 0101119 | **新码 + 新 UPC**(决策 B) | 拆"撞库 → 同 SKU 换 UPC → 0101211"死循环 |
+| 改码 SkuUpdate 后 | 不是再上架;旧串永不复用 | 一个 Product ID 只挂一个 SKU |
+
+### 5.5 调研顺带发现的现状问题(与编码无关,要所有者定)
+
+`problem_scan` 的扫描面是"一切非 PUBLISHED 且未缺席",没有 lifecycle 豁免;退役
+item 的观测形态正是 UNPUBLISHED +「end date has passed」。所以 product_clear
+停用一个品,**一到两轮后它就会被自动链当问题商品 DELETE 掉**,"停用可恢复"在本
+系统里只是个窗口(**决策 A**)。同理,若 0 库存真会触发 UNPUBLISHED(reason=
+Inventory,仅代码注释无生产记录),可逆清零也会被升级成永久删除。
 
 ## 6. 身份积木
 
-- `catalog.listing_sources`:加 `retired_at timestamptz`、`replaced_by text`
-  (存量改码:旧行指向新码,两码 resolve 到同一 source_key;缺席压制用);加索引
-  `(store, source_type, source_key) WHERE retired_at IS NULL`(反查 + 复用);
-  加全局 `sku` 索引(查重)。表结构其余不变。
-- `services/sku_codec.py`(新):
-  - `mint(conn, store, source_type, source_key, workflow) -> sku`:先查未退役
-    行复用;否则查来源字母 → 抽 11 位 → 全局查重 + INSERT → 撞了重抽(≤5)。
-    **抽码与登记同一函数**,不存在"抽了没登记"。
-  - `retire(conn, store, sku)`:标 retired_at(由 sku_locked_heal / product_clear
-    /problem_product_cleanup 的成功回执调用)。
-  - `is_opaque(sku)`、`source_of(sku)`:形态判定 / 首字母反查来源。
-  - 与现有 `listing_sources.register`(批量 DO NOTHING)的关系:register 保留
-    给 backfill 与跟卖 B 列人工号;自动抽码只走 mint。
+- `catalog.listing_sources`:加 `abandoned_at timestamptz`、`abandoned_reason text`、
+  `replaced_by text`;部分唯一索引 `(store, source_type, source_key) WHERE
+  abandoned_at IS NULL`(反查 + 复用 + 并发双 mint 靠它拦);全局 `sku` 唯一只能
+  对新码生效(存量 sku=asin 跨店重复是既成事实,约束形态由批次 0a 工作包定);
+  行永不 DELETE。同步 `docs/db_schema.md`。
+- `services/sku_codec.py`(新):`mint` / `abandon` / `is_opaque` / `source_of`,
+  语义见 §5.3。与现有 `listing_sources.register`(批量 DO NOTHING)的关系:
+  register 保留给 backfill 与跟卖 B 列人工号,自动抽码只走 mint。
 - `services/sku_asin.resolve(conn, store, sku)` / `resolve_many(conn, pairs)`:
   登记簿优先(amz → source_key;其它来源 → None),查不到再 `extract_asin`
-  模式提取(**只为存量兜底**)。放在 `services/sku_asin`,守门测试
-  `test_rules_are_not_reimplemented_here` 才不会拦。
-- `upc_pool.claim` 复用键保持 (store, asin) 不动(§5.2 的结论:码复用到退役,
-  UPC 也复用到退役,两者同寿命);`mark_used` 改传真 SKU,`upc_pool.asin` 列
-  继续存 ASIN。
+  (只为存量兜底)。放在 `services/sku_asin` 内,守门测试
+  `test_rules_are_not_reimplemented_here` 才不会拦。对 abandoned 行照常返回
+  source_key(订单/售后带旧码回来必须查得到)。
+- `upc_pool`:`claim` 复用键保持 (store, asin) 不动;`mark_used` 改传真 SKU,
+  `asin` 列继续存 ASIN;新增状态值 `burned_delete` / `burned_lock`。
 
 ## 7. 批次(整体计划)
 
 **批次 0|身份积木 + 读侧收口(零行为变化)**
-codec/retire/resolve + 登记簿索引与 retired_at + §3.2 六处 SQL 收口 +
+codec(mint/abandon)/resolve + 登记簿索引与 abandoned_at/replaced_by + §3.2 六处 SQL 收口 +
 §3.3 十四处消费方收口 + §3.4 里不依赖 V 列的四处(去重闸、重试上限、变体组、
 UPC 撞库标记改按 (store, asin))+ 两条清洗工作流接 resolve_many +
 sources_backfill 摘要分桶。存量 SKU 走的路一个字节不变(登记簿里存量行的
@@ -319,7 +376,9 @@ order_audit + 飞书 ASIN 列)。
 `SKU_SOURCE_LETTERS` 常量;`list_new._prep_rows` mint 挂 `r["_sku"]`,载荷/
 `mark_used`/事件/登记/V 列回写全改 `r["_sku"]`(两条路:真跑 + check_spec);
 `match_listing` 的 `make_sku` 换 mint(B 列人工优先保留);dry-run 占位码;
-退役回执处调 `codec.retire`;测试钉"载荷 sku ≠ asin 且 = 登记簿里那个"。
+四个弃码点接 `codec.abandon`(§5.3);24h 冷却泛化为 list_new 闸门;代际上限;
+守门测试反向钉死非弃码点不得调 abandon;测试钉"载荷 sku ≠ asin 且 = 登记簿里
+那个"、"串行补试两次载荷一字不差"。
 切换是全店同时的(码里没有店维配置),**试点靠 dry-run + 单店单品**:
 1. `list_new --dry-run -p check_spec=1` 看载荷 sku 是占位码、其余字段正常;
 2. 挑一家店、上架表只留一行待上,真跑 1 个品(`list_new` 目前无 limit 参数,
@@ -335,7 +394,7 @@ order_audit + 飞书 ASIN 列)。
 前置:批次 0/1/2 全部合并且新码在生产跑过至少一轮(读侧对两种码都认、上架表
 V 列在位);§4 三件事单品实测通过。
 机制:对每个存量 SKU(裸 ASIN / 三段式;跟卖 `PHUMWMT…` 不含 ASIN,是否迁 §8
-定)——`mint` 抽新码并在登记簿写 `replaces=旧sku`,旧行标 `retired_at` +
+定)——`mint` 抽新码并在登记簿写 `replaces=旧sku`,旧行标 `replaced_by=新sku`(pending;观测确认后 `abandoned_at`)+
 `replaced_by=新sku`(**先落库再调接口**)→ 提交 `SkuUpdate=Yes` feed(载荷形态
 按实测结果:MP_MAINTENANCE 最小载荷或 MP_ITEM 全量)→ 回执成功后:上架表 V 列
 回写新码、`upc_pool.sku` 改新码、`walmart_items` 由 `catalog_sync` 自然出现新行;
@@ -346,7 +405,14 @@ V 列在位);§4 三件事单品实测通过。
 受牵连的 (store, sku) 键表:`ops.dispositions` 在途行(改码前该店必须无
 executing 行)、`maintenance` 的 drop_recent 防重键(自然过期)、
 `ops.cleanup_seen_categories`(按 replaced_by 迁一次)、`listing.retire_cooldown`、
-`catalog.item_node_inventory`(sync 重建)、`ops.feed_items`(历史,不动)。
+`catalog.item_node_inventory`(sync 重建)、`ops.feed_items`(历史,不动)、
+**`catalog.product_events` 按 (store, sku) 读的三段 SQL**(problem_scan 的
+`_SQL_STUBBORN` / `_SQL_LAST_CAT` / `_SQL_WFS_BLOCKED`,对抗验证发现):改码后
+新码行在 `diff_catalog` 眼里 `prev is None` ⇒ 记 ITEM_APPEARED = **制造一次没有
+重上架事实的假代际**,已实证 `delete_not_effective` 的顽固件会静默丢掉双 feed
+加压。处理:diff_catalog 对 `replaced_by` 指向的新码行记 `sku_replaced` 而非
+`item_appeared`;顽固判定改经登记簿按 ASIN 归并,或改码时把顽固标记随
+replaced_by 迁到新码。
 订单侧:改码后新单带新码;若沃尔玛对**改码前的 PO** 日后返回新码,会被当成
 新行插入(旧行不删)⇒ 双算——切换前加一条"同 (store, po_id, line_number) 多个
 order_line_id"的体检告警兜住。
@@ -358,9 +424,22 @@ order_line_id"的体检告警兜住。
 
 - [ ] **生成时点**:C(list_new 预备期,推荐)还是 B(alloc_push 派工时,运营
       更早看到码,代价是幽灵行)。
-- [ ] **码的寿命**:复用到显式退役(推荐,§5.2)。若坚持"每次重上新码",
+- [x] **码的寿命**:复用到显式弃码(§5.3 四个弃码点,2026-09-02 工作流定稿)。若坚持"每次重上新码",
       须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
 - [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3。
+- [ ] **决策 A|停用要不要成为真正可恢复态**:给 problem_scan 加「lifecycle=RETIRED
+      且本仓提交过 retire_submitted」豁免(推翻 08-28「非 PUBLISHED 一律删除」的一
+      部分)+ RETIRE 不弃码(推荐);或不豁免、改采「停用回执成功即弃码」简化版
+      (永久失去可恢复,每次停用烧一个 UPC,且违背"不信回执信观测")。
+- [ ] **决策 B|撞库 0101119 时码与 UPC 一起换**(推荐换):改变 08-09「撞库只是
+      UPC 被占、照常领新号重试」的机制;不换有重演 SKU_LOCKED 死循环的风险,换最坏
+      只是多耗一个免费的码。
+- [ ] **决策 C|alloc_push 派工口径对齐去重闸**(推荐对齐):退市且未弃码的 ASIN
+      从「该派工」变「等 delete_verified 后派工」;不对齐则分配链派、list_new 每轮拦。
+- [ ] **批次 2 前单品实测**(所有者机器):停用后该 SKU 在 GET items 里是缺席还是
+      RETIRED 可见;同码同 UPC 重发能否复活同一 item(官方与六家第三方都说能,本仓
+      与旧仓无一条实测);RETIRE_ITEM feed 是否仍被受理;人为制造 0101119 看码与
+      UPC 同换、代际上限生效。
 - [ ] **§4 三件事单品实测**(所有者机器):`grep -rl SkuUpdate` 定 feed 类型与
       最小载荷;改码后库存/价格/item_id 是否保留;旧串能否复用。
 - [ ] **跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。

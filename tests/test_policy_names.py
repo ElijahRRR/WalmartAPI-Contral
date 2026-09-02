@@ -33,7 +33,7 @@ def test_the_official_names_never_collide_after_normalization():
     撞了的后果不报错:policy_sync 会把两个官方页认成表里同一行(A 政策的正文
     写进 B 行),audit 侧会把两条政策的理由认成一条。
     """
-    assert len(OFFICIAL) == 42
+    assert len(OFFICIAL) == 44
     keys = [pn.norm_category(c) for c in OFFICIAL]
     assert len(set(keys)) == len(keys), \
         [k for k in keys if keys.count(k) > 1]

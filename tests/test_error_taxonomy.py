@@ -41,7 +41,7 @@ REASONS = _load("reason_corpus.jsonl")
 FEED_ERRORS = _load("feed_error_corpus.jsonl")
 
 # 政策表 category_en 对照清单 —— **目标态**(2026-09-02 定稿 §十.7:官方政策
-# 类别名 = 全链唯一键)。`policy_sync` 真跑后生产表就长这样:官方 42 名,
+# 类别名 = 全链唯一键)。`policy_sync` 真跑后生产表就长这样:官方 44 名(42 禁售 + 2 内容族),
 # 逐字取自 `refdata/policy_pages/en/*.md` 的头注 H1(下面 `test_known_policies_
 # are_verbatim_official_names` 守门,漂了当场红)。
 #
@@ -70,6 +70,9 @@ KNOWN_POLICIES = (
     "Air Powered Guns, BB Guns, Toy Guns and Imitation Firearms", "Firearms",
     "Firearm Accessories", "Firearm Ammunition",
     "Knives and Other Melee Weapons",
+    # 内容族两页(2026-09-02,A 批):不是禁售类别,是「content policy」/
+    # 「authenticity claims」两类下架原因所指页面;同表同枚举
+    "Content standards: Overview", "Product details policy",
 )
 
 # 过渡态:`policy_sync` 改名落地**之前**的生产表长这样(存量缩写名那一族)。
@@ -232,9 +235,9 @@ def test_known_policies_are_verbatim_official_names():
     下面所有 join 断言就都在拿一个官方并不存在的拼写当标准答案。"""
     heads = tuple(f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
                   for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
-    assert len(heads) == 42
+    assert len(heads) == 44
     assert set(KNOWN_POLICIES) == set(heads)
-    assert len(set(KNOWN_POLICIES)) == 42
+    assert len(set(KNOWN_POLICIES)) == 44
 
 
 def test_the_alias_table_is_derived_not_hand_written():

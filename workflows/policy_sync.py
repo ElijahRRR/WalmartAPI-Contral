@@ -118,7 +118,11 @@ _DATE_RE = re.compile(
 # 双行**:S4 会拿到两份讲同一件事的政策文本,S2 候选也跟着脏。
 # ⚠ 只提示、不合并 —— §二「对不上的不猜」照旧,合不合并是所有者的裁决。
 _PAIR_STOPWORDS = frozenset({"and", "or", "the", "of", "for", "with",
-                             "other", "product", "item", "good"})
+                             "other", "product", "item", "good",
+                             # 2026-09-02 内容族两页进表后加:Product details policy /
+                             # Content standards: Overview 带 policy / overview,
+                             # 靠这两个词配出来的"疑似改名对"全是噪声(product 早在)
+                             "policy", "policie", "overview"})
 
 # ── SQL(全部经 registry/db,不自行 connect)────────────────────────────────
 _COLS_SQL = ("SELECT column_name, data_type FROM information_schema.columns "

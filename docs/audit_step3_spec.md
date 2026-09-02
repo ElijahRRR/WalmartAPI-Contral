@@ -8,7 +8,7 @@
 
 ## 〇、一句话
 
-L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 43 篇官方英文全文 + 上游**确定性**证据」,
+L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 44 篇官方英文全文 + 上游**确定性**证据」,
 输出统一为**判定结果 / 类别 / 具体内容**三段;L0/L2 只留确定性规则(黑名单、符号、白名单准入);
 用后台报错记录做回放评估;`POLICY_LEGACY_NAMES` 一族与所有"关键词猜政策"的代码退役。
 
@@ -16,7 +16,7 @@ L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 43 篇官�
 
 | 批 | 内容 | 合并后生产动作 |
 |---|---|---|
-| **A 转录** | Content Standards 页(登录墙,所有者粘贴)按 policy-refresh 纪律转录 en/zh,进 `refdata/policy_pages/`;`policy-refresh` 技能补第二来源 | **不跑** `policy_sync`(跑了会再让 L3 缓存全量失效一次,白付);等 C 合并后随切换一起跑 |
+| **A 转录** | 内容族两页按 policy-refresh 纪律转录 en/zh 进 `refdata/policy_pages/`(**2026-09-02 已落地**:43 `Content standards: Overview` 所有者粘贴、44 `Product details policy` 公开页结构化数据 + 粘贴交叉核对);`policy-refresh` 技能补第二来源;喂入层补两条规则(图片整删、表尾空行不算数据行) | **不跑** `policy_sync`(跑了会再让 L3 缓存全量失效一次,白付);等 C 合并后随切换一起跑 |
 | **B 换喂 + 规范化 + 回放** | S4 换官方全文;user 段扩容;输出 schema 三段化;`audit_detail` 落库;理由映射去猜测;证据通道泛化;路由提示删除;`audit_replay` 回放工作流 | 生产机**不 pull**(见 §五) |
 | **C 瘦身 + 清理** | L0 双输出(品牌文案扫描迁入)+ Made in USA 迁入;L2 = R1;删 R3 硬拒/R4/R5/R7/R8/R10 及其数据;删 `POLICY_LEGACY_NAMES` / `POLICY_ALIASES` / `to_official` / `_L3_NORMALIZE` / `_pt_to_policy` / 路由表 | 生产机 pull A+B+C → 按 §五 切换 |
 
@@ -31,7 +31,9 @@ L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 43 篇官�
 「类别」= 判定落在哪一类,**只许两种来源、零推断**:
 
 1. **官方政策类别名**:`audit.walmart_prohibited_policy.category_en` 实时集合(42 条禁售 +
-   Content Standards,共 43;S2 枚举、L3 白名单、落库、飞书全用**表内原拼写**);
+   内容族 2 页 `Content standards: Overview` / `Product details policy`,共 44;S2 枚举、
+   L3 白名单、落库、飞书全用**表内原拼写**);内容规则(促销宣称 / 真伪宣称 / 竞品独家 /
+   非英文 / URL 等)全在 44 那页的四张「允许 / 禁止」表里,43 是索引页;
 2. **非政策类别**(registry 常量 `AUDIT_NONPOLICY_CATEGORIES`,固定两条):
    - `内部黑名单` —— 卖家 / ASIN / 亚马逊类目黑名单命中(内部决策,不对应沃尔玛政策;
      现步 1.2 已把它们排除在政策映射外,`services/audit_reason.py:232-234`);
@@ -73,7 +75,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
   (保留原语言)+ 触犯的条款要点;品牌证据的判法(提到 ≠ 卖的就是:兼容/适配/对比提及不是
   品牌误用);本 PT 准入要求的判法(先判"这个具体产品要不要这张证",要而 listing 无 → 拒,
   类别 = 覆盖它的政策,没有政策覆盖 → `类目准入`);输出严格 JSON。`{N}` 占位符保留,
-  措辞改为「{N} 篇沃尔玛政策全文(Prohibited Products Policy 各类别 + Content Standards)」。
+  措辞改为「{N} 篇沃尔玛政策全文(Prohibited Products Policy 各类别 + 内容标准两页)」。
 - 体量:S1+S3 约 6K 字符不变;S4 由现上界 ≈17.6K 字符变为 ≈199K 字符(42 篇
   `render_feed_text` 后实测 199,123;Content Standards 另加),≈ 5–5.5 万 token;
   deepseek-v4-flash 1M 上下文内,前缀缓存命中的硬前提(顺序固定、逐字节稳定)不变。
@@ -185,7 +187,8 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
     `error_taxonomy.classify_reasons` 得主码 ∈ {POLICY, IP, CONTENT, BRAND, PROHIBITED_FINAL},
     按 `services/sku_asin` 规则关联 `catalog.products`(**不用裸 `sku = asin`**,
     `refdata/schema.sql:122-123` 已废该约定);期望 = reject,期望类别:POLICY → join 上的
-    官方名;IP → `Intellectual Property`;CONTENT → `Content Standards`;BRAND / PROHIBITED_FINAL
+    官方名;IP → `Intellectual Property`;CONTENT → 内容族两名之一(`Content standards: Overview` /
+    `Product details policy`,命中任一即算对);BRAND / PROHIBITED_FINAL
     → 只比判定不比类别。按期望类别分层抽样,每类封顶;
   - 正例 = 在架在售品:`published_status='PUBLISHED'` 且 `missing_since IS NULL` 且
     `unpublished_reasons` 为空,随机抽;期望 = pass;
@@ -274,7 +277,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 ```bash
 git pull                                    # 看钟:18:10 之前 pull,当晚 audit_sheet 就用新链
 python cli.py db_init                       # audit_detail 列 + replay_results 表(幂等)
-python cli.py policy_sync --dry-run         # 预期 新增 1(Content Standards, id 43)/ 刷新 42 / 改名 0
+python cli.py policy_sync --dry-run         # 预期 新增 2(id 43/44 内容族)/ 刷新 42 / 改名 0
 python cli.py policy_sync
 python cli.py audit_replay --dry-run        # 样本规模 + 预估成本
 python cli.py audit_replay -p neg=600 -p pos=400   # 谷时段;看报告再决定下一步
@@ -295,9 +298,8 @@ python cli.py product_audit -p mode=stale -p limit=N   # 谷时段分晚跑;pend
    (下游要再拆,不推荐)。
 5. **回放集与验收线**:反例 600(按期望类别分层封顶)+ 正例 400;验收线建议 —— 正例误伤率
    不高于旧链、带类别反例的类别准确率作为主指标报出(先看数,不预设阈值)。
-6. **Content Standards 范围**:只转 Overview(所有者登录粘贴,含其「In this guide」子页若有);
-   旁边公开的 Product details policy 页(错误码 authenticity claims 指向它)是否一并进前缀 —— 建议
-   本批不进,下次刷新再议。
+6. ~~Content Standards 范围~~ **已定(2026-09-02)**:所有者把两页都给了,两页都进(43 索引页 +
+   44 规则页);43 的 H1 与 FAQ 段待所有者补核。Overview 页链接的 21 个分类风格指南本批不进。
 7. **描述截断 600 → 3000**(§3.2)。
 8. **全量重审规模**:approved 存量全部走 `mode=stale`,还是只让 `audit_sheet` 按需重审
    (§10 原话:「规则存在,上架时对要上架的品起作用就够了」)—— 建议后者为主、`mode=stale`

@@ -509,7 +509,7 @@ def test_b7_every_official_policy_name_normalizes_back_to_itself():
     `Children’s Products` / `Product claims` 那几个大小写特殊的),就是
     `audit_reason` 与政策表之间的一道静默错位。
     """
-    assert len(_OFFICIAL_TABLE) == 42
+    assert len(_OFFICIAL_TABLE) == 44
     bad = [c for c in _OFFICIAL_TABLE
            if audit_reason._normalize_l3_cat(c, _OFFICIAL_TABLE) != c]
     assert bad == [], bad

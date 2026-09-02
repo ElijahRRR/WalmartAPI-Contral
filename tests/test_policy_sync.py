@@ -130,13 +130,13 @@ def _refreshes(conn) -> list[tuple]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  一、解析(打在 42 份真实转录件上)
+#  一、解析(打在 44 份真实转录件上)
 # ══════════════════════════════════════════════════════════════════════════
 
 def test_every_transcript_parses():
-    """42 份逐个解析成功,类别名 / URL / 正文都非空 —— 一份坏了就点名。"""
+    """44 份逐个解析成功,类别名 / URL / 正文都非空 —— 一份坏了就点名。"""
     files = sorted(_EN.glob("*.md"))
-    assert len(files) == 42, f"转录件份数变了({len(files)}),先核对 refdata"
+    assert len(files) == 44, f"转录件份数变了({len(files)}),先核对 refdata"
     bad = []
     for p in files:
         try:
@@ -275,7 +275,7 @@ def test_the_legacy_map_targets_are_verbatim_official_names():
                 for f in sorted(_EN.glob("*.md"))}
     missing = sorted(v for v in resources.POLICY_LEGACY_NAMES.values()
                      if v not in official)
-    assert missing == [], f"这些目标值不在 42 份转录件的 H1 里:{missing}"
+    assert missing == [], f"这些目标值不在 44 份转录件的 H1 里:{missing}"
     # 旧名本身不许与官方名撞车(撞了就说明它已经不是"旧"名了)
     assert not (set(resources.POLICY_LEGACY_NAMES) & official)
 
@@ -305,9 +305,9 @@ def test_real_run_updates_the_matched_rows_and_inserts_the_rest(monkeypatch):
     assert len(_refreshes(conn)) == 7
     assert len(_renames(conn)) == 6
     assert verbs.count("UPDATE") == 7 + 6
-    assert verbs.count("INSERT") == 42 - 7
-    assert out.splitlines()[0].startswith("新增 35 / 刷新 7 / 改名 6 / "
-                                          "未对上 35 / 官方缺席 1")
+    assert verbs.count("INSERT") == 44 - 7
+    assert out.splitlines()[0].startswith("新增 37 / 刷新 7 / 改名 6 / "
+                                          "未对上 37 / 官方缺席 1")
 
 
 def test_rename_runs_before_the_machine_column_upsert(monkeypatch):
@@ -372,7 +372,7 @@ def test_legacy_abbreviations_are_claimed_and_renamed(monkeypatch):
     n = len(resources.POLICY_LEGACY_NAMES)
     assert len(_refreshes(conn)) == n               # 认领了就照常刷新正文
     assert out.splitlines()[0].startswith(
-        f"新增 {42 - n} / 刷新 {n} / 改名 {n} / 未对上 {42 - n} / 官方缺席 0")
+        f"新增 {44 - n} / 刷新 {n} / 改名 {n} / 未对上 {44 - n} / 官方缺席 0")
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍将改名")[1].split("▍改名冲突")[0]
     assert "「Drugs & Paraphernalia」 → 「Drugs and Drug Paraphernalia」" in block
@@ -388,7 +388,7 @@ def test_an_unmatched_official_page_is_neither_renamed_nor_double_inserted(
     assert _refreshes(conn) == []
     ins = [p["category_en"] for s, p in _writes(conn)
            if s.split()[0].upper() == "INSERT"]
-    assert len(ins) == 42 and len(set(ins)) == 42
+    assert len(ins) == 44 and len(set(ins)) == 44
 
 
 def test_dry_run_never_leaks_a_rename(monkeypatch):
@@ -454,8 +454,8 @@ def test_a_legacy_row_whose_official_name_is_taken_lands_in_rename_conflict(
     assert [p["id"] for _s, p in _refreshes(conn)] == [2]   # 冲突行不刷新
     assert "改名冲突 1 条" in out and "不改名也不刷新" in out
     assert "官方已不含" not in out                     # ← 旧写法就是错在这里
-    assert out.splitlines()[0].startswith("新增 41 / 刷新 1 / 改名 0 / "
-                                          "未对上 41 / 官方缺席 0")
+    assert out.splitlines()[0].startswith("新增 43 / 刷新 1 / 改名 0 / "
+                                          "未对上 43 / 官方缺席 0")
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍改名冲突")[1].split("▍未对上")[0]
     assert "「Drugs & Paraphernalia」 ↛ 「Drugs and Drug Paraphernalia」" in block
@@ -481,8 +481,8 @@ def test_a_legacy_mapping_pointing_at_an_existing_row_lands_in_rename_conflict(
     assert _renames(conn) == []
     assert [p["id"] for _s, p in _refreshes(conn)] == [2]
     assert "改名冲突 1 条" in out
-    assert out.splitlines()[0].startswith("新增 41 / 刷新 1 / 改名 0 / "
-                                          "未对上 41 / 官方缺席 0")
+    assert out.splitlines()[0].startswith("新增 43 / 刷新 1 / 改名 0 / "
+                                          "未对上 43 / 官方缺席 0")
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍改名冲突")[1].split("▍未对上")[0]
     assert "「Weird Old Name」 ↛ 「Alcohol」" in block and "id 2 占用" in block
@@ -498,8 +498,8 @@ def test_two_rows_registering_the_same_legacy_name_are_both_held(monkeypatch):
 
     assert set(_verbs(conn)) == {"SELECT"}
     assert "改名冲突 2 条" in out
-    assert out.splitlines()[0].startswith("新增 41 / 刷新 0 / 改名 0 / "
-                                          "未对上 41 / 官方缺席 0")
+    assert out.splitlines()[0].startswith("新增 43 / 刷新 0 / 改名 0 / "
+                                          "未对上 43 / 官方缺席 0")
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍改名冲突")[1].split("▍未对上")[0]
     assert "id 5 占用" in block and "id 1 占用" in block
@@ -519,7 +519,7 @@ def test_a_rename_conflict_never_writes_the_held_row_even_on_a_real_run(
 
 
 def test_the_real_transcripts_produce_no_rename_conflict(monkeypatch):
-    """常态:42 份官方页 + 存量表,冲突清单恒空(有值就是映射表被追错了)。"""
+    """常态:44 份官方页 + 存量表,冲突清单恒空(有值就是映射表被追错了)。"""
     _wire(monkeypatch, _Conn())
     out = ps.run({"execute": True, "dry_run": True})
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
@@ -571,7 +571,7 @@ def test_new_rows_take_consecutive_ids_from_max(monkeypatch):
     conn = _wire(monkeypatch, _Conn())
     ps.run({"execute": True})
     ids = [p["id"] for s, p in _writes(conn) if s.split()[0].upper() == "INSERT"]
-    assert ids == list(range(9, 9 + 35))
+    assert ids == list(range(9, 9 + 37))
 
 
 def test_inserted_rows_carry_official_spelling_and_null_human_columns(monkeypatch):
@@ -598,8 +598,8 @@ def test_ambiguous_table_names_are_held_not_guessed(monkeypatch):
     assert "表内有 2 行同名" in out
     assert _renames(conn) == []                  # 不敢动 = 连名字也不动
     # 歧义行不算「官方已不含」——那是"点到了但不敢动",不是官方删了这个类别
-    assert out.splitlines()[0].startswith("新增 41 / 刷新 0 / 改名 0 / "
-                                          "未对上 42 / 官方缺席 0")
+    assert out.splitlines()[0].startswith("新增 43 / 刷新 0 / 改名 0 / "
+                                          "未对上 44 / 官方缺席 0")
 
 
 def test_parse_failure_is_isolated_and_named(monkeypatch, tmp_path):
@@ -703,8 +703,8 @@ def test_rename_candidates_are_flagged_between_the_two_lists(monkeypatch):
     assert "Firearm Ammunition" in block and "id 2" in block
     # 判定本身**不变**:两行都没被认领,照旧进新增 + 官方已不含,一行都不改名
     assert _verbs(conn) == ["SELECT"] * 3
-    assert out.splitlines()[0].startswith("新增 42 / 刷新 0 / 改名 0 / "
-                                          "未对上 42 / 官方缺席 2")
+    assert out.splitlines()[0].startswith("新增 44 / 刷新 0 / 改名 0 / "
+                                          "未对上 44 / 官方缺席 2")
 
 
 def test_rename_pairing_stays_quiet_when_nothing_overlaps(monkeypatch):

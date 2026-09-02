@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from registry import paths
+from registry import paths, resources
 from services.audit_models import L2Result, RuleHit
 from services.audit_stopwords import is_stopword
 
@@ -237,7 +237,10 @@ def _rule_category_gate(l1: L1Info, ctx: Any) -> list[RuleHit]:
                 detail={
                     "walmart_pt": pt,
                     "walmart_category": row.get("walmart_category"),
-                    "walmart_policy": "Restricted/Illegal",
+                    # 规则自报类别(§二):这是"类目没开/做不了",不是禁售政策。
+                    # ⚠ 原先写死的 `walmart_policy="Restricted/Illegal"` 是**猜的**
+                    #   ——白名单拦下与那条政策没有关系,2026-09-02 B1 删
+                    "category": resources.AUDIT_CAT_ACCESS,
                     "access_state": access or "(空)",
                     "zh_can_do": zh or "(空)",
                     "rule": "access_state 不在白名单 {普通商品, 附条件允许}",
@@ -257,7 +260,7 @@ def _rule_category_gate(l1: L1Info, ctx: Any) -> list[RuleHit]:
                 detail={
                     "walmart_pt": pt,
                     "walmart_category": row.get("walmart_category"),
-                    "walmart_policy": "Restricted/Illegal",
+                    "category": resources.AUDIT_CAT_ACCESS,   # 同上,§二
                     "access_state": access,   # 注意: 这里没有 or "(空)", 照迁
                     "zh_can_do": zh or "(空)",
                     "rule": "zh_can_do 不在白名单 {是, 需评估*}",

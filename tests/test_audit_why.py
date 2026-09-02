@@ -55,7 +55,8 @@ _AT = dt.datetime(2026, 8, 16, 20, 21)
 _HAMMER = {
     "FROM catalog.products": [
         ("B00004Z4HQ", "Goldblatt G15813 Corner Clincher and Mallet", "Goldblatt",
-         "Hammers", "map_direct", "rejected", "General-Use Products", _AT, "v1"),
+         "Hammers", "map_direct", "rejected", "General-Use Products", _AT, "v1",
+         None),   # 末列 audit_detail:老行没有(B1 之前的结论),打出来是 None
     ],
     "FROM audit.audit_runs": [
         (77, "B00004Z4HQ", "Hammers", "map_direct", "高", 0, "reject",
@@ -96,6 +97,27 @@ def test_shows_both_the_rule_and_the_cell_it_read(monkeypatch):
     assert "普通商品" in out and "'是'" in out
 
 
+def test_prints_the_three_columns_verdict_category_detail(monkeypatch):
+    """2026-09-02 B1:结论是**三段**(判定结果 / 类别 / 具体内容),排查要三段都见人。
+
+    老行(B1 之前审的)`audit_detail` 是 NULL,打出来就是 None —— 那正是
+    "这一行还没被新链重审过"的样子,不是查询坏了。
+    """
+    data = dict(_HAMMER)
+    data["FROM catalog.products"] = [
+        ("B00004Z4HQ", "锤子", "Goldblatt", "Hammers", "map_direct", "rejected",
+         "Intellectual Property", _AT, "c.2026-09-02.2",
+         "商标符号(命中:XYZ®)"),
+    ]
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(data))
+    out = audit_why.run({"asins": "B00004Z4HQ"})
+    assert "结论 rejected  类别 'Intellectual Property'" in out
+    assert "具体内容 '商标符号(命中:XYZ®)'" in out
+    # 老行:具体内容打 None
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(_HAMMER))
+    assert "具体内容 None" in audit_why.run({"asins": "B00004Z4HQ"})
+
+
 def test_says_so_when_the_asin_was_never_audited(monkeypatch):
     data = {"FROM catalog.products": _HAMMER["FROM catalog.products"]}
     monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(data))
@@ -132,7 +154,7 @@ _BLACKLISTED = {
     "FROM catalog.products": [
         ("B00004YOG7", "Shepherd Hardware 9124 Rubber Leg Tips", "Shepherd",
          "Furniture Grippers, Pads & Sliders", "audit_llm", "rejected",
-         "General-Use Products", _AT, "c.2026-08-13.1"),
+         "General-Use Products", _AT, "c.2026-08-13.1", None),
     ],
     "FROM audit.audit_runs": [
         (2395753, "B00004YOG7", "(phase0_blocked)", "skipped", "低", 0,

@@ -201,6 +201,7 @@ _HAS_HISTORY_SQL = """EXISTS (
 _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
+    audit_detail = %(detail)s,
     walmart_pt = CASE WHEN pt_source = 'walmart_confirmed' THEN walmart_pt
                       ELSE COALESCE(%(pt)s, walmart_pt) END,
     pt_source = CASE WHEN pt_source = 'walmart_confirmed' THEN pt_source
@@ -564,7 +565,7 @@ def _hits_of_runs(conn, run_ids: list) -> dict:
 def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     """输入:候选 ASIN 列表 → 输出:(采用数, 已采用 ASIN 集)。
 
-    方案 A(spec_shortcut §1.6,待所有者追认):历史结论直接写五列+事件,
+    方案 A(spec_shortcut §1.6,待所有者追认):历史结论直接写审核六列+事件,
     不写新 run。读库失败让异常冒泡整轮停——静默按"无历史"重审会把
     rejected 产品翻出来(spec_shortcut §6.1)。
     """
@@ -573,8 +574,9 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL, (asins,))
         rows = cur.fetchall()
-    # reject 且 runs 行没留理由的,去 hits 反查旧命中(只查需要的那批)
-    need_hits = [r[1] for r in rows if r[2] == "reject" and not r[5]]
+    # 判拒的行都去 hits 反查旧命中:三段分列后**具体内容**那一列要它
+    # (2026-09-02 B1 之前只在 runs 行没留理由时才查,那时两样东西挤一列)
+    need_hits = [r[1] for r in rows if r[2] == "reject"]
     old_hits = _hits_of_runs(conn, need_hits) if need_hits else {}
     adopted = set()
     events = []
@@ -586,22 +588,24 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             continue
         status = "approved" if verdict == "pass" else "rejected"
         if verdict == "reject":
-            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——先拿
-            # runs 行的理由;没有就反查 hits 把旧结论说出来;连 hits 都
-            # 没有(极老的孤儿 run)才落"理由未留存"
+            # 三段分列(2026-09-02 B1):类别取 runs 行留档的
+            # `l3_reason_category`(老行可能是旧拼写甚至 NULL —— 历史就是
+            # 这样,采用不改写历史);具体内容反查 hits 把旧结论说出来,
+            # 连 hits 都没有(极老的孤儿 run)才落"理由未留存"。
+            # ⚠ 别把"历史结论(阶段 X)…"那句写进类别列:那一列从此只装枚举
             reason = reason_cat
-            if not reason:
-                hit = old_hits.get(run_id)
-                if hit:
-                    reason = (f"历史结论(阶段 {stage or '未知'}):"
-                              f"{audit_reason.explain_hit(hit[0], hit[1])}")
-                else:
-                    reason = f"历史结论(阶段 {stage or '未知'},理由未留存)"
+            hit = old_hits.get(run_id)
+            if hit:
+                detail = (f"历史结论(阶段 {stage or '未知'}):"
+                          f"{audit_reason.explain_hit(hit[0], hit[1])}")
+            else:
+                detail = f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
-            reason = None
+            reason = detail = None
         adopt_rows.append({
             "status": status,
             "reason": reason,
+            "detail": detail,
             "pt": (pt if pt and not pt.startswith("(") else None),
             # 旧结论的 PT 来源照搬 runs 记录;非实证一律记 audit_llm
             # (来历不明的 PT 不当实证——它会被 catmap_mine 投票放大)
@@ -630,7 +634,8 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
 
 
 _SQL_VERDICT = """
-SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at
+SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at,
+       audit_detail
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 """
@@ -743,12 +748,13 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
                 got = {r[0]: r for r in cur.fetchall()}
-            # G 列写类别、H 列写**人话**(所有者 2026-09-02 改表头,三段输出:
-            # 判定 / 类别 / 具体内容)。热修期口径:G = `products.audit_reason`
-            # 现值(拒绝时是政策类别名,其中 `General-Use Products` 仍是兜底,
-            # 第三步 B 批改为枚举 + 零兜底),H = 命中规则翻成的人话(不再带
-            # 「[政策:X]」尾巴,类别已单列);pending 的句子落 H、G 留空;
-            # approved 两列都空
+            # 三段输出分列(2026-09-02 B1 落地):F = 判定结果、
+            # G = `products.audit_reason`(**类别**枚举,pass/pending 为空)、
+            # H = `products.audit_detail`(**具体内容**)。
+            # ⚠ H 的**老行兜底**:B1 之前的结论没有 audit_detail 列值,
+            #   照旧按命中规则渲染成人话(`explain_hits`,不带「[政策:X]」
+            #   尾巴)。不兜底的话,存量几十万行在表上会一夜变成空白 ——
+            #   看起来像"审核把理由弄丢了"。老行被重审时自然写上新格式。
             reasons = audit_store.reject_reasons(conn, asins)
         updates, absent = [], 0
         for r in sheet_rows:
@@ -756,9 +762,12 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
                 absent += 1
                 continue
-            _, title, pt, status, reason, at = row
-            why = (audit_reason.human_reason(reasons.get(r["asin"], []), None)
-                   if status == "rejected" else (reason or ""))
+            _, title, pt, status, reason, at, detail = row
+            why = detail or ""
+            if not why and status == "rejected":     # 老行:按命中规则渲染
+                why = audit_reason.explain_hits(reasons.get(r["asin"], []))
+            elif not why and status == "pending":    # 老行:待定原因在类别列里
+                why = reason or ""
             updates.append((r["rownum"], [
                 title or "", pt or "",
                 listing_sheet.AUDIT_RESULT_CN.get(status, status),
@@ -1106,7 +1115,9 @@ def _tro_claim(conn, scope: str, key: str, meta: dict) -> bool:
 
 def _tro_l3_evidence(outcome, brand: str) -> str | None:
     """输入:判定结果 + r4 键 → 输出:L3 对该词的简短理由(没有则 None)。"""
-    for v in (getattr(outcome.l3, "blacklist_brand_verdict", None) or ()):
+    # 字段名随 L3 输出三段化改名(2026-09-02 B1):blacklist_brand_verdict
+    # → brand_verdicts;口径不变(与 audit_store.tro_hits 读的是同一个属性)
+    for v in (getattr(outcome.l3, "brand_verdicts", None) or ()):
         if isinstance(v, dict) and \
                 str(v.get("brand") or "").strip().lower() == brand:
             ev = str(v.get("evidence") or "").strip()
@@ -1271,7 +1282,6 @@ class Counts:
     adopted_n: int
     no_title: int
     seller_missing: int
-    policy_unknown: int
     row_errors: int
     asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
     uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
@@ -1364,15 +1374,24 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"
                      f"LLM 故障待定 {stage_stats['L3_pending']})")
-    # 路由表写的政策名在政策表里对不上 = L3 少拿到一条政策提示。判定不受影响、
-    # 不报错,只会让判据悄悄变窄(2026-09-02 改名后尤其要看得见,§十.7)
-    if stage_stats.get("L3_route_unresolved"):
-        names = stage_stats.get("L3_route_unresolved_names") or []
-        lines.append(f"⚠ L3 政策路由解析不到 {stage_stats['L3_route_unresolved']} 次"
+    # 政策表里有这一行、却没有可喂的全文 ⇒ S4 里没有它的原文,而 S2 候选里有
+    # 它的名字:LLM 选得到一个引不出条款的类别。不报错、不红,只有这个数看得见
+    if stage_stats.get("L3_policy_no_full_text"):
+        names = stage_stats.get("L3_policy_no_full_text_names") or []
+        lines.append(f"⚠ L3 政策全文缺失 {stage_stats['L3_policy_no_full_text']} 篇"
                      + (f"(条目:{'、'.join(names)})" if names else "")
-                     + " —— 路由表的政策名在政策表里找不到,那几条提示本轮没给"
-                       "(只记不改判;补进 registry.resources.POLICY_LEGACY_NAMES "
-                       "或修路由表)")
+                     + " —— 这几类在 S2 候选里有名字、S4 里没有原文,"
+                       "LLM 选得到却引不出条款(补 full_policy:policy_sync)")
+    # LLM 答出的类别名对不上枚举 ⇒ 整条转 pending(不猜类别)。零星几条是
+    # 模型抽风,成批出现 = 提示词/政策表出了问题,不是单品的事
+    if stage_stats.get("L3_bad_policy"):
+        lines.append(f"⚠ L3 类别对不上枚举 {stage_stats['L3_bad_policy']} 条 → "
+                     f"pending 待人工(不降级猜类别;详见日志)")
+    # 判拒却没有类别 = 代码 bug 信号(硬拒规则没自报 `category`,或 L3 那条
+    # 路没走到)。**不兜底**:落 NULL + 计数,别编一个政策名出来
+    if stage_stats.get("reason_missing"):
+        lines.append(f"⚠ 判拒但没有类别 {stage_stats['reason_missing']} 条 "
+                     f"—— 类别列写 NULL(规则没自报 category?详见日志 warning)")
     # TRO:非零才打印(notify_fmt 规矩 2 —— 例外计数为 0 是噪声)。
     # 这三个数不是同一件事:命中 = 本轮认出几个 TRO 品牌;首报 = 其中几个是
     # 头一回见(真落了源头事件);波及 = 展开出几家店(一个品牌能扇出好几家)
@@ -1410,9 +1429,6 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
         lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
-    if counts.policy_unknown:
-        lines.append(f"⚠ 理由映射落政策表之外 {counts.policy_unknown} 条"
-                     "(详见日志,只记不改判)")
     if opts.r5_on and counts.uspto_failures:
         lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
                      f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
@@ -1513,13 +1529,14 @@ def run(params: dict) -> str:
                     + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定")
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
-        no_title = seller_missing = policy_unknown = 0
+        no_title = seller_missing = 0
         stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
                        "L4_ran": 0, "L4_reject": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
         from services import audit_l3 as _audit_l3
-        _audit_l3.reset_stats()                  # L3 政策路由解析不到的计数同样
+        _audit_l3.reset_stats()                  # L3 缺全文/坏类别的计数同样
+        audit_reason.reset_stats()               # 判拒无类别的计数同样
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         _llm.reset_usage_stats()                 # token 记账同样每轮从零
@@ -1705,11 +1722,6 @@ def run(params: dict) -> str:
                                     l4_fail[h.rule_code] = \
                                         l4_fail.get(h.rule_code, 0) + 1
                         counts[outcome.verdict] += 1
-                        if (outcome.verdict == "reject" and ctx.known_policies
-                                and not audit_reason.known_policies_check(
-                                    outcome.final_reason_category,
-                                    ctx.known_policies)):
-                            policy_unknown += 1
                     # 一块判完报一次进度。三个数各说各的,别混:
                     #   已取   = 从候选流里拉了多少行(进度)
                     #   落结论 = 其中多少条真写了结论(stages=L0 只有命中的算)
@@ -1740,13 +1752,18 @@ def run(params: dict) -> str:
             (pending_total,) = cur.fetchone()
 
     l1s = audit_rules.audit_l1_llm.STATS
-    # L3 政策路由解析不到的条目走 stage_stats 这条既有通道(L3 的数都在里面)
-    stage_stats["L3_route_unresolved"] = _audit_l3.STATS.get("route_unresolved", 0)
-    stage_stats["L3_route_unresolved_names"] = _audit_l3.unresolved_route_names()
+    # L3 侧两个"判据悄悄变窄"的计数走 stage_stats 这条既有通道(L3 的数都在
+    # 里面);判拒无类别的计数在 audit_reason(理由映射零兜底的 bug 信号)
+    stage_stats["L3_policy_no_full_text"] = _audit_l3.STATS.get(
+        "policy_no_full_text", 0)
+    stage_stats["L3_policy_no_full_text_names"] = \
+        _audit_l3.policies_without_full_text()
+    stage_stats["L3_bad_policy"] = _audit_l3.STATS.get("llm_bad_policy", 0)
+    stage_stats["reason_missing"] = audit_reason.STATS.get("reason_missing", 0)
     tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
                    l0_untouched=l0_untouched, adopted_n=adopted_n,
                    no_title=no_title, seller_missing=seller_missing,
-                   policy_unknown=policy_unknown, row_errors=row_errors,
+                   row_errors=row_errors,
                    asked_asins=len(extra.get("asins", ())),
                    uspto_failures=getattr(ctx, "uspto_failures", 0),
                    uspto_off=getattr(ctx, "uspto", None) is None,

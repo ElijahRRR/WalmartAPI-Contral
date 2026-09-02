@@ -1,334 +1,124 @@
-"""最终拒绝理由映射(旧仓 `pipelines/reason_mapper.py` 逐字迁入),纯函数、零 DB、零 LLM。
+"""最终拒绝理由(类别)映射 + 命中规则的人话渲染。纯函数、零 DB、零 LLM。
 
-作用:从 AuditOutcome 的全部 hits 推一个统一的 final_reason_category,
-对齐 Walmart Prohibited Product Policy **全部**类别的 category_en(条数随
-`audit.walmart_prohibited_policy` 实时变化,2026-09-02 起是官方 42 类),用于告诉卖家
-"按哪条 Walmart 政策被拒"。落 `catalog.products.audit_reason`(runs 表无此列,旧仓同)。
+作用两件,别混:
 
-**真实执行顺序**(以旧仓代码为准,首个 return 即出;旧仓模块 docstring 那份
-"L3 第 1 / L4 第 2"的九级清单与代码不符,**没有迁**,照抄会误导后人):
+  · `compute_final_reason` —— 从 AuditOutcome 取**类别**(落
+    `catalog.products.audit_reason`、飞书上架表 G 列)。2026-09-02 B1 起它是
+    **查表**,不是推断:类别只有两种来源(`docs/audit_step3_spec.md` §二)——
+    硬拒规则在自己的 `hit.detail["category"]` 里**自报**,L3 在结构化输出的
+    `policy` 里给。查不到就是 None,**不许编一个**;
+  · `explain_hit` / `explain_hits` —— 把命中的规则翻成给人看的一句
+    (落 `catalog.products.audit_detail`、上架表 H 列的规则拒那一路,
+    以及存量老行的渲染)。
 
-  0.  verdict != 'reject'(含 outcome 为 None)          → None(pass/pending 恒为 None)
-  1.  hits 中 rule_code ∈ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
-  1.2 hits 含黑名单中心三码(lark_blacklist_asin/seller/amazon_cat)→ **None**
-      (内部黑名单决策,不对应任何 Walmart 政策;2026-08-18 修,此前漏到 4g)
-  2.  l3 存在且 l3.verdict=='reject' 且归一化后的 reason_category 非 None → 归一化值
-  1.5 hits 中 rule_code ∉ HARD_RULE_CODES 且 detail 有 walmart_policy → 该 policy 原样
-  3.  l4 存在且 l4.verdict=='reject' → 第一条 confidence=='high' 的 dict issue:
-      issue 文本含 'offensive' → 'Offensive Content',否则 'Intellectual Property'
-  4a. hit_codes 含 publication_pt_forbidden                  → 'Intellectual Property'
-  4b. (已删)L1 excluded 按 reason 推政策 —— 2026-08-20 随 excluded 链下线
-  4c. _pt_to_policy(PT, title[:80]) 非 None                  → 该值
-  4d. l1 存在且 hit_codes ∩ cert 三码 → 按 walmart_category 子串四选一(必返回)
-  4e. hit_codes 含 trademark_live / title_desc_blacklist     → 'Intellectual Property'
-  4f. hit_codes 含 phase0_brand_blacklist                    → 'Intellectual Property'
-  4g. 以上全不中                                             → 'General-Use Products'
+**新顺序**(规格 §3.5,首个命中即出):
 
-`all_hits` 遍历顺序(决定步 1/1.5 谁先命中,**第一个命中即胜出,无优先级比较**):
-phase0.hits → l1.hits → l2.hits → l3.hits → l4.hits,层内按 append 顺序。
+  0. verdict != 'reject'(含 outcome 为 None)   → None
+  1. all_hits 按 phase0 → l1 → l2 → l3 顺序,第一条 detail 带 `category` 的 → 该值
+  2. l3 判 reject                               → l3.policy(解析层已对表)
+  3. 都没有                                     → None + `STATS['reason_missing']` + warning
 
-批次 B(零 LLM)下 l3/l4 恒为 None ⇒ 步 2、步 3 恒不触发,`_normalize_l3_cat` 也用不上;
-但**整段原样迁入**,批次 C 接上 LLM 时零改动(删了批次 C 会重写出一份不一致的)。
+⚠ **删掉的九步在这里留个墓碑**(2026-09-02 B1,规格 §3.5),免得有人照着旧
+文档再写回来:步 1/1.5 的 `walmart_policy` 读取(规则改为自报 `category`)、
+步 1.2 内部黑名单特判(改为自报 `内部黑名单`)、步 2 的 `_normalize_l3_cat`
+归一化(L3 输出在解析层就对表了)、步 3 的 L4 关键词猜测、步 4a–4g 全部
+(`_pt_to_policy` 十组裸子串、cert 分桶、以及那个把一把螺丝刀说成
+`General-Use Products` 的兜底)、`known_policies_check`(枚举在解析层保证)。
 
-已知缺陷(**照迁不修**):
-  - `_normalize_l3_cat` 第 1 步 `cat.lower() in ('none','null','')` **未 strip**,
-    `" none "` 不会被判空,会落到查表 → `.title()` 变形;
-  - 查表未命中时的 `cat.strip().title()` 会把 `PFAS Chemicals` 变 `Pfas Chemicals`、
-    `Children's Products` 变 `Children'S Products`(**传了 `known` 就轮不到它** ——
-    实时集合里对得上的一律回表内原拼写,这是 2026-09-02 之后的常规路径);
-  - `_pt_to_policy` 一律是**裸子串**判断,无词边界:`'ring'` 会被 "watering can" 命中。
+**为什么零兜底**:兜底出来的类别会一路落库、进飞书 G 列、进申诉口径,
+而没有任何东西会红 —— 所有者 2026-08-16 实遇「理由是 General-Use Products,
+这是什么意思」。判拒而没有类别只可能是代码 bug(某条硬拒规则忘了自报),
+落 NULL + 计数 + warning,让它自己现形。
 
-不迁:旧仓 orchestrator 的 `'history_shortcut'` 兜底(新仓不迁历史短路,outcome 无该形态)。
-落在政策集合外的已知取值:`'Restricted/Illegal'`(R1 两条 hit 的常量,经步 1.5 会直接
-成为最终理由)、`'Jewelry/Precious Metals'`(本文件第 10 组)、以及 `.title()` 变形值——
-用 `known_policies_check` 记日志计数,**不改判定**(理由映射不是放行/拒绝依据)。
-
-⚠ **旧缩写名的三个来源,处置不同**(政策表 2026-09-02 已改成官方拼写,§十.7):
-
-  · **已解决** —— `services/audit_l2._infer_walmart_policy` 返回的那批缩写名
-    (`Military & Law Enforcement` / `Electronics & RF` / `Drugs & Paraphernalia`
-    / `Tobacco & Vaping` …)。它们经规则 detail 的 `walmart_policy` 进来,**只有
-    步 1.5 一个出口**,那里已用 `services/policy_names.resolve` 对回表内拼写;
-    不逐条改 audit_l2 的常量 —— 那是「L3 输出规范化」那一步的事;
-  · **未解决(本批不动)** —— 步 4c `_pt_to_policy` 与步 4d cert 分桶里写死的
-    旧缩写名(同一批名字 + `Children's Products` 直撇号)。那两步是 PT/类目关键词
-    **兜底推断**,不是政策表的下游,输入根本不是政策名,对表反而会把"推断"伪装
-    成"表里查到的";改法(枚举化 / 随表)随 §十.7 的「L3 输出规范化」一起定。
-    后果与上面三种已知缺陷同级:只多几条 warning 计数,判定一个字不变(F 列的
-    政策口径与政策表拼写不一致,人看得懂)。
+⚠ **已知缺口(B1 → C 批之间)**:`cat_requires_cert_hard`(R3 硬拒)与
+`made_in_usa_claim`(R10)这两条硬拒规则**不在** §二 的自报表里 —— C 批一条
+降为证据、一条迁进 L0 带 `Product claims`。在 C 合并之前,它们拒掉的产品会走
+第 3 步:类别 NULL + `reason_missing` 计数。这是**有意的**(规格 §一:B、C 只
+切换一次,生产机等 C 合并后再 pull),不是漏改;C 批合并后这个计数应回到 0。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+from collections import Counter
 from typing import Any
-
-from services import policy_names
 
 logger = logging.getLogger("services.audit_reason")
 
+#: 硬拒规则自报类别的 detail 键(§二 表)。规则写它,本模块读它,别的谁都别碰。
+CATEGORY_KEY = "category"
 
-# L3 reject reason_category → 非政策伪类目的落点。
+
+# ── 本轮计数(惯例照 `services/audit_l3.STATS`)────────────────────────────────
 #
-# ⚠ **2026-09-02 大改**(所有者定稿 `docs/policy_sync.md` §十.7):原表里那
-# 20 条**政策名**条目(intellectual property / drugs & paraphernalia / …)
-# **整体删除**,归一化改为**随表**——见 `_normalize_l3_cat` 的 `known` 参数。
-# 理由是那 20 条写死的是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),
-# 而 `policy_sync` 已把表内名改成官方拼写(`Electronics and Radio Frequency
-# Devices`)。写死的映射不会报错,它会把 L3 答出的官方名**改写回**一个表里
-# 已经不存在的缩写名 —— 结果是 `audit_reason` 与政策表、与 L3 的
-# reason_category 白名单(`audit_l3.valid_reason_categories`,从实时
-# category_en 集合构建)三处对不上,而三处都不会红。
-# **旧脚本跟随新流程变动,不是新流程迁就旧脚本。**
-#
-# 留下的只有**非政策伪类目**:L3 提示词里 `brand_misuse` 是判定维度 4 的固定
-# 标签、content standards 一族是旧标签兼容 —— 它们**不是**政策表里的行,
-# 表怎么改名都影响不到,所以只能写死在这里。
-_L3_NORMALIZE = {
-    'brand_misuse':               'Intellectual Property',     # brand 伪装归到 IP
-    'brand misuse':               'Intellectual Property',
-    # Walmart Content Standards (promotional claims, all-caps abuse 等)
-    'content standards':          'Content Standards',
-    'content_standards':          'Content Standards',
-    'promotional content':        'Content Standards',
-    'promotional':                'Content Standards',
-    'content policy':             'Content Standards',
-}
+# 只收一件事:**判拒却给不出类别**。它是"某条硬拒规则忘了自报 category"的
+# 唯一可见信号 —— 判定照样是 reject、落库照样成功,只是类别列空着。
+STATS: Counter = Counter()
+_STATS_KEYS = ("reason_missing",)
+_STATS_LOCK = threading.Lock()
 
 
-def _normalize_l3_cat(cat: str | None, known=()) -> str | None:
-    """输入:L3 给的 reason_category(+ 实时 category_en 集合)→ 输出:政策名或 None。
-
-    四步,顺序即语义:
-
-      1. 判空(**此处未 strip**,故 " none " 会漏过判空 —— 照迁的已知缺陷);
-      2. 交给 `services/policy_names.resolve(cat, known)` 对表 —— 命中**返回表内
-         原拼写**。这一步就是"归一化随表":表里叫什么,这里就回什么,改名前后
-         都成立,且与 `audit_l3.valid_reason_categories` **同源同拼写**(两边吃的
-         都是 `ctx.known_policies`,即 `SELECT category_en FROM
-         audit.walmart_prohibited_policy`)。**归一化规则不在本文件实现** ——
-         仓内只有 `policy_names` 一处懂"两个政策名是不是同一个"(铁律:每个能力
-         只有一条实现路径),它同时管定序(表里若真有只差大小写的两行,不定序会
-         让同一输入在两次进程里给出不同答案,而那种漂移不会报错);
-      3. 查非政策伪类目表(brand_misuse / content standards 一族);
-      4. 都不中 → 沿用 `cat.strip().title()` 回退(**保持旧行为**,不扩大改动面;
-         已知会把 `PFAS Chemicals` 变 `Pfas Chemicals`,由 `known_policies_check`
-         记日志计数,不改判定)。
-
-    `known` 缺省为空 = 退化成"只认伪类目 + .title()":调用方拿不到政策表时
-    (纯函数单测、批次 B 零 LLM)行为与改动前一致。
-    """
-    if not cat or cat.lower() in ('none', 'null', ''):
-        return None
-    s = cat.strip()
-    hit = policy_names.resolve(s, known)
-    if hit is not None:
-        return hit
-    return _L3_NORMALIZE.get(s.lower(), s.title())
+def bump(key: str) -> int:
+    """输入:计数键 → 输出:累加后的值(线程安全;判定并发 128,裸 += 会丢数)。"""
+    with _STATS_LOCK:
+        STATS[key] += 1
+        return STATS[key]
 
 
-def _pt_to_policy(pt: str | None, title: str = '') -> str | None:
-    """输入:walmart PT 名(+ 标题)→ 输出:推出的 Walmart 政策名,无明确映射返回 None。
-
-    归一化 `((pt or '') + ' ' + (title or '')[:80]).lower()` —— 只取**标题前 80 字符**;
-    判定一律是 `k in p` 裸子串包含(无词边界,已知精度缺陷),按下列顺序首组命中即返回。
-    """
-    p = ((pt or '') + ' ' + (title or '')[:80]).lower()
-    # 优先级从具体到宽泛
-    if any(k in p for k in [
-        'firearm', 'ammo', 'ammunition', 'crossbow', 'gun cleaning',
-        'pistol', 'rifle', 'bb gun', 'pellet', 'airsoft', 'tactical knife',
-        'pocket knife', 'throwing knife', 'switchblade', 'brass knuckle',
-        'pepper spray', 'taser', 'stun gun',
-    ]):
-        return 'Military & Law Enforcement'
-    if any(k in p for k in [
-        'homeopathic', 'herbal', 'supplement', 'vitamin', 'drug test',
-        'melatonin', 'prescription', 'otc drug', 'pharmaceutical',
-    ]):
-        return 'Dietary Supplements'
-    if any(k in p for k in [
-        'cosmetic', 'lipstick', 'makeup', 'nail polish', 'perfume',
-        'fragrance', 'deodorant', 'tampon', 'essential oil',
-        'body moisturizer', 'hand sanitizer', 'dry shampoo',
-        'nail care', 'hair oil', 'teeth whitening',
-    ]):
-        return 'Cosmetic Products'
-    if any(k in p for k in [
-        'medical', 'thermometer', 'catheter', 'heating pad',
-        'blood pressure', 'glucose meter', 'pulse oximeter',
-        'nebulizer', 'cpap', 'syringe', 'diagnostic', 'surgical',
-        'eye drop', 'spirometer', 'compression glove',
-    ]):
-        return 'Medical Devices'
-    if any(k in p for k in [
-        'pet food', 'dog food', 'cat food', 'animal feed', 'bird food',
-        'pet treat', 'pet vitamin', 'pet supplement', 'animal supplement',
-        'pet repellent',
-    ]):
-        return 'Pet Products'
-    if any(k in p for k in ['alcohol', 'wine', 'beer', 'spirit', 'liquor', 'distill']):
-        return 'Alcohol'
-    if any(k in p for k in ['tobacco', 'cigarette', 'cigar', 'vape', 'e-cigarette', 'nicotine']):
-        return 'Tobacco & Vaping'
-    if any(k in p for k in ['baby', 'infant', 'toddler', 'crib', 'stroller', 'diaper']):
-        return 'Baby Products'
-    if any(k in p for k in ['apparel', 'clothing', 'shirt', 'pants', 'jeans', 'dress',
-                             'sweater', 'jacket', 'underwear', 'bra', 'sock', 'footwear', 'shoe']):
-        return 'Textiles & Apparel'
-    if any(k in p for k in ['coin', 'currency', 'bullion', 'precious metal', 'jewelry', 'ring',
-                             'necklace', 'bracelet']):
-        return 'Jewelry/Precious Metals'
-    return None
+def reset_stats() -> None:
+    """输入:无 → 输出:无(清零并补齐固定键,便于摘要直接取)。"""
+    with _STATS_LOCK:
+        STATS.clear()
+        STATS.update({k: 0 for k in _STATS_KEYS})
 
 
-def compute_final_reason(
-    outcome: Any,
-    product: Any | None = None,
-    known=(),
-) -> str | None:
-    """输入:AuditOutcome(+ 可选 ProductInfo + 实时 category_en 集合)
-    → 输出:Walmart 政策 category_en 或 None。
+reset_stats()
 
-    仅在 verdict='reject' 时有意义;pass/pending(以及 outcome 为 None)恒返回 None。
-    完整顺序见模块 docstring —— 注意实现顺序是 0→1→2→1.5→3→4a..4g,
-    **L0 硬规则优先于 L3**(phase0_forbidden_category 已直接对齐政策表的
-    category_en;L3 常因标题里的知名品牌词把"大类禁售"误判成 IP,让对齐率退化),
-    其余带 walmart_policy 的规则则排在 L3 **之后**(步 1.5)。
-    `product` 可为 None(此时步 4c 只按 PT 判)。
 
-    `known` = 实时 `category_en` 集合(`ctx.known_policies`),喂给**两处对表**:
-    步 2 的 `_normalize_l3_cat`(L3 答出的政策名必须按表内拼写回来,不能被一张
-    写死的旧缩写映射改写)与步 1.5(规则 detail 里写死的旧缩写名解析回表内拼写)
-    —— 两处都走 `services/policy_names.resolve`,§十.7。缺省空 = 退化成改动前的
-    行为(伪类目表 + `.title()`,规则 detail 原样返回)。
-    ⚠ 步 4a-4g 的兜底常量**没有对表**:那几步是 PT/类目关键词推断,不是政策表的
-    下游,改法随「L3 输出规范化」一起定(见模块 docstring 末尾的遗留清单)。
+def compute_final_reason(outcome: Any) -> str | None:
+    """输入:AuditOutcome → 输出:类别(政策名枚举 / 两条非政策类别)或 None。
+
+    仅在 verdict='reject' 时有意义;pass/pending(以及 outcome 为 None)恒 None。
+    完整顺序见模块 docstring —— **全部是查表**:硬拒规则自报的 `category`
+    (`services/audit_phase0` / `audit_l1_llm` / `audit_l2` 各自在 detail 里写,
+    §二 表),或 L3 结构化输出的 `policy`(`services/audit_l3.parse_l3_reply`
+    已对政策表解析过,回的是表内原拼写)。
+
+    ⚠ 本函数**不做任何归一化、不查政策表**:那两件事分别在解析层与装配层
+    做过了(`policy_names.resolve`),在这里再来一遍就是第二条实现路径 ——
+    两处口径哪天不一致,谁也不会红。
     """
     if outcome is None or outcome.verdict != "reject":
         return None
 
-    # 分 hard/soft hit:
-    #   hard = phase0_forbidden_category — 大类禁售精确对齐 Walmart 政策表
-    #   soft = cert / brand / trademark 等 — 只标 L2 有命中, 实际原因要靠 L3 判
-    # ⚠ 2026-08-20:原集合里的 forbidden_mega_cat(L2 R2)已随 R2 删除。
-    HARD_RULE_CODES = {'phase0_forbidden_category'}
-
-    # (1) hard 规则 walmart_policy — 最优先
+    # (1) 规则自报(顺序 = all_hits 的 phase0 → l1 → l2 → l3,首个命中即出)。
+    #     只有硬拒规则写这个键;软 hit 是证据不是判据,本来就不带。
     for h in outcome.all_hits:
-        if h.rule_code in HARD_RULE_CODES:
-            policy = (h.detail or {}).get('walmart_policy')
-            if policy:
-                return policy
-
-    # (1.2) 黑名单中心三码(ASIN / 卖家 / 亚马逊类目)→ **None,不挂政策**。
-    # 这是我们自己的内部黑名单决策,不对应任何一条 Walmart 政策;此前无分支
-    # 会一路漏到 4g 兜底,F 列写出「ASIN 在黑名单中心 [政策:General-Use
-    # Products]」这种自相矛盾的话(所有者 2026-08-18 实遇,B0F2ZS3M31 一张
-    # 床头柜)。拿兜底政策去申诉口径也是错的 —— 没有政策就是没有政策。
-    # ⚠ 品牌黑名单(phase0_brand_blacklist)不在此列:品牌拉黑多因知产风险,
-    # 4f 归 Intellectual Property 是既定口径,别顺手改。
-    # 这三码都是 Phase0 短路(单 hit 即终局),不会与政策规则同轮并存。
-    _INTERNAL_BLACKLIST = {'phase0_lark_blacklist_asin',
-                           'phase0_lark_blacklist_seller',
-                           'phase0_lark_blacklist_amazon_cat'}
-    if any(h.rule_code in _INTERNAL_BLACKLIST for h in outcome.all_hits):
-        return None
-
-    # (2) L3 语义判 (硬规则没给时, L3 最准)
-    if outcome.l3 and outcome.l3.verdict == 'reject':
-        cat = _normalize_l3_cat(outcome.l3.reason_category, known)
+        cat = (h.detail or {}).get(CATEGORY_KEY)
         if cat:
             return cat
 
-    # (1.5) 其他带 walmart_policy 的规则 (未来扩展用, 兜底放这)
-    #
-    # ⚠ 这是 `audit_l2._infer_walmart_policy` 那批**写死的旧缩写名**
-    #   (`Military & Law Enforcement` / `Electronics & RF` / `Drugs &
-    #   Paraphernalia` …)进入 final_reason_category 的**唯一出口**,所以对表
-    #   在这里做一次就够了(不逐条改 audit_l2 的常量 —— 那是 §十.7「L3 输出
-    #   规范化」那一步的事)。改名后表里已经没有那些拼写,不解析就是每条 reject
-    #   都落在政策表之外:只多几条 warning 计数,判定不变,但 F 列的政策口径
-    #   会与政策表对不上,申诉时报的名字沃尔玛那边查无此类。
-    #   解析不到的**原样返回**(绝不编一个表里没有的名字),由调用方既有的
-    #   `known_policies_check` 记 warning 计数。
-    for h in outcome.all_hits:
-        if h.rule_code not in HARD_RULE_CODES:
-            policy = (h.detail or {}).get('walmart_policy')
-            if policy:
-                return policy_names.resolve(policy, known) or policy
+    # (2) L3 语义判(它的类别在自己的结构化输出里,不在 hit.detail["category"])
+    l3 = outcome.l3
+    if l3 is not None and getattr(l3, "verdict", None) == "reject":
+        policy = getattr(l3, "policy", None)
+        if policy and policy != "none":
+            return policy
 
-    # (3) L4 视觉
-    if outcome.l4 and outcome.l4.verdict == 'reject':
-        for issue in (outcome.l4.image_issues or []):
-            if isinstance(issue, dict) and issue.get('confidence') == 'high':
-                t = (issue.get('issue') or '').lower()
-                if 'offensive' in t:
-                    return 'Offensive Content'
-                return 'Intellectual Property'
-
-    # (4) 兜底
-    hit_codes = {h.rule_code for h in outcome.all_hits}
-
-    # 出版物 IP
-    if 'publication_pt_forbidden' in hit_codes:
-        return 'Intellectual Property'
-
-    # ⚠ 2026-08-20 删掉「L1 excluded_category 按 reason 推政策」一段:
-    # 那条链(seed yaml 的 3C/服饰/汽配/带电禁售)已整体下线,四组关键词
-    # 再没有输入来源。现在这类产品由 L2 R1 白名单判死,政策走下面的
-    # PT 关键词 / walmart_category 两条兜底。
-
-    # PT 关键词兜底 (常用于 cert/禁售没命中大类但 PT 能推)
-    pt = outcome.l1.walmart_product_type if outcome.l1 else None
-    title = product.title if product else None
-    by_pt = _pt_to_policy(pt, title or '')
-    if by_pt:
-        return by_pt
-
-    # cat_requires_cert_* 按 walmart_category 推
-    if outcome.l1:
-        wc = (outcome.l1.walmart_category or '').lower()
-        if {'cat_requires_cert_hard',
-            'cat_requires_cert_soft'} & hit_codes:
-            if 'baby' in wc or 'children' in wc:
-                return "Children's Products"
-            if 'health' in wc or 'medical' in wc or 'personal care' in wc:
-                return 'Medical Devices'
-            if 'electronics' in wc:
-                return 'Electronics & RF'
-            return 'General-Use Products'
-
-    # IP 兜底
-    if 'trademark_live' in hit_codes or 'title_desc_blacklist' in hit_codes:
-        return 'Intellectual Property'
-    if 'phase0_brand_blacklist' in hit_codes:
-        return 'Intellectual Property'
-
-    return 'General-Use Products'
-
-
-def known_policies_check(reason: str | None, known: frozenset) -> bool:
-    """输入:理由字符串 + 实时政策 category_en 集合 → 输出:该理由是否落在集合内。
-
-    纯校验,**不改任何判定**:调用方拿 False 去记日志计数即可(项目铁律:兜底触发
-    必须记日志计数),绝不能因为映射不到就放行——理由映射不是放行/拒绝的依据。
-    reason 为 None/空串表示"没有理由可校验"(pass/pending 的正常形态),回 True。
-    已知会回 False 的值:'Restricted/Illegal'、'Jewelry/Precious Metals'、
-    `.title()` 变形后的自由值。
-    """
-    if not reason:
-        return True
-    return reason in known
+    # (3) 没有类别 —— 不兜底。计数进 run 摘要,warning 点名 ASIN 与命中的规则码
+    bump("reason_missing")
+    logger.warning("判拒但没有类别:asin=%s 停在 %s,命中 %s —— 类别列写 NULL"
+                   "(硬拒规则忘了自报 detail['category']?见 audit_reason "
+                   "模块头注的已知缺口)", getattr(outcome, "asin", "?"),
+                   getattr(outcome, "stage_stopped_at", "?"),
+                   [h.rule_code for h in outcome.all_hits])
+    return None
 
 
 # ── 人话理由(给人看的那一面)───────────────────────────────────────────────
 #
-# ⚠ `final_reason_category` 回答的是「按 Walmart 禁售政策的哪一条被拒」——
-# 那是**平台口径**,不是原因。其中 `General-Use Products` 更是第 4g 步的兜底
-# (以上全不中),落在一把螺丝刀、一个土豆压泥器上时,人只会看得一头雾水
-# (所有者 2026-08-16:「理由是 General-Use Products,这是什么意思」)。
-#
+# ⚠ 类别回答的是「按沃尔玛的哪一条政策被拒」—— 那是**平台口径**,不是原因。
 # **真正的原因在命中的规则里**,而且 hit.detail 里本来就写着中文 note
 # (「飞书维护的合规要求(含实验室证书/官方注册号),搬运模式做不了」)——
 # 只是此前一个字都没露给人看。下面这层就是把它翻出来。
@@ -360,6 +150,16 @@ _RULE_CN = {
 # 这几条不是"被拒的原因",只是过程留痕。它们单独出现时不该当理由显示
 _NOT_A_REASON = {"pt_dict_fallback", "l4_images_partial", "l4_bad_schema"}
 
+#: `explain_hit` 找"命中的是哪一个值"时按序试的键(照着各规则**真实写进
+#: detail 的那些**取,不能想当然:首版只认 brand/category/keyword/matched 四个,
+#: 而 Phase0 三表写的是 seller_id / asin / normalized —— 于是"黑名单命中"那一栏
+#: 一个字都没有,人还是不知道命中的是哪一条,所有者 2026-08-16 实遇)。
+#: ⚠ 2026-09-02 B1 **摘掉 `category`**:那个键现在是规则自报的**政策类别**
+#: (§二),不是命中值;留着会让专利自述那条渲染成「命中:Intellectual Property」。
+_HIT_VALUE_KEYS = ("brand", "matched_brand", "normalized",
+                   "amazon_category_path", "seller_name", "seller_id", "asin",
+                   "keyword", "matched")
+
 
 def explain_hit(rule_code: str, detail: dict | None) -> str:
     """输入:命中的规则码 + detail → 输出:给人看的一句话(纯函数,零 DB)。
@@ -369,14 +169,7 @@ def explain_hit(rule_code: str, detail: dict | None) -> str:
     """
     d = detail or {}
     base = _RULE_CN.get(rule_code, rule_code)
-    # ⚠ 键名必须**照着各规则真实写进 detail 的那些**取,不能想当然。
-    # 首版只认 brand/category/keyword/matched 四个,而 Phase0 三表写的是
-    # seller_id / asin / normalized —— 于是"黑名单命中"那一栏一个字都没有,
-    # 人还是不知道命中的是哪一条(所有者 2026-08-16 实遇)。
-    hit_val = next((d[k] for k in (
-        "brand", "matched_brand", "normalized", "amazon_category_path",
-        "seller_name", "seller_id", "asin", "category", "keyword", "matched",
-    ) if d.get(k)), None)
+    hit_val = next((d[k] for k in _HIT_VALUE_KEYS if d.get(k)), None)
     bits = [b for b in (
         d.get("note"),
         d.get("reason"),
@@ -391,20 +184,17 @@ def explain_hit(rule_code: str, detail: dict | None) -> str:
     return f"{base}({';'.join(str(b) for b in bits)})" if bits else base
 
 
-def human_reason(hits: list[tuple[str, dict]], policy: str | None) -> str:
-    """输入:[(规则码, detail)] + 政策类目 → 输出:上架表 F 列写的那句话。
+def explain_hits(hits: list[tuple[str, dict]]) -> str:
+    """输入:[(规则码, detail)] → 输出:「人话1;人话2」(最多三条)。
 
-    形态:`人话1;人话2 [政策:General-Use Products]`。
-    政策类目留在方括号里 —— 它是与沃尔玛对话时的口径(申诉/开类目要报它),
-    丢掉不对;但它不该是**唯一**能看到的东西。
-    一条规则都没有(理论上不该发生)时只剩政策,并明说"未记录命中规则"。
+    2026-09-02 B1 取代 `human_reason`:类别已经单列(products.audit_reason /
+    上架表 G 列),这一句只说**规则说了什么**,不再拖一条「[政策:X]」尾巴。
+    一条规则都没有(理论上不该发生)时明说"未记录命中规则",别给空白 ——
+    空白让人以为"没写进来",而事实是"没有命中记录"。
     """
     said = [explain_hit(c, d) for c, d in hits if c not in _NOT_A_REASON]
-    tail = f"[政策:{policy}]" if policy else ""
-    if not said:
-        return (f"未记录命中规则{tail}" if tail else "未记录命中规则")
-    return ";".join(said[:3]) + (f" {tail}" if tail else "")
+    return ";".join(said[:3]) if said else "未记录命中规则"
 
 
-__all__ = ["compute_final_reason", "known_policies_check",
-           "explain_hit", "human_reason"]
+__all__ = ["CATEGORY_KEY", "STATS", "bump", "reset_stats",
+           "compute_final_reason", "explain_hit", "explain_hits"]

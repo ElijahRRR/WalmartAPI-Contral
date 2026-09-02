@@ -45,7 +45,8 @@ def _outcome(r4_brands, l3=None, asin="B0TRO00001", verdict="pass"):
 
 
 def _l3(verdict="pass", brands=()):
-    return L3Result(verdict=verdict, blacklist_brand_verdict=list(brands))
+    # 2026-09-02 B1:字段随输出三段化改名 blacklist_brand_verdict → brand_verdicts
+    return L3Result(verdict=verdict, brand_verdicts=list(brands))
 
 
 def _hits(outcome):
@@ -86,7 +87,7 @@ def test_l3_brand_is_an_llm_string_so_case_is_normalized():
 
 
 def test_r5_words_in_the_verdict_are_cut_by_intersecting_with_r4():
-    """⚠ blacklist_brand_verdict 里**混着 R5(USPTO 商标)的词**。
+    """⚠ brand_verdicts 里**混着 R5(USPTO 商标)的词**。
 
     不与 R4 命中集取交集的话,一个只在 R5 出现、恰好也在黑名单里标着 TRO 的词
     会被当成"本产品命中了 TRO 品牌"报上去 —— 而 R4 根本没在标题里见到它。
@@ -118,6 +119,19 @@ def test_explicitly_judged_generic_word_is_dropped_not_unjudged():
         {"brand": "top", "is_real_brand": False, "evidence": "常见形容词"}])))
     assert res["confirmed"] == [] and res["unjudged"] == []
     assert res["reason"] is None
+
+
+def test_l3_evidence_reads_the_same_attribute_as_tro_hits():
+    """⚠ 源头事件里的 `l3_evidence` 与 `tro_hits` 读的**必须是同一个属性**。
+
+    2026-09-02 B1 把 L3Result 的 `blacklist_brand_verdict` 改名成
+    `brand_verdicts`;`_tro_l3_evidence` 用的是 `getattr(..., None) or ()`,
+    漏改一处不会报错 —— 只会让每一条 TRO 源头事件的证据栏永远是空的。
+    """
+    o = _outcome(["dyson"], _l3(brands=[
+        {"brand": "DYSON", "is_real_brand": True, "evidence": "真空吸尘器品牌"}]))
+    assert pa._tro_l3_evidence(o, "dyson") == "真空吸尘器品牌"
+    assert pa._tro_l3_evidence(o, "nike") is None
 
 
 # ── unjudged 的三种成因 ─────────────────────────────────────────────────────
@@ -330,7 +344,7 @@ def _summary_lines(**kw):
     counts = pa.Counts(
         verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
         l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
-        policy_unknown=0, row_errors=0, asked_asins=0, uspto_failures=0,
+        row_errors=0, asked_asins=0, uspto_failures=0,
         uspto_off=True, **kw)
     opts = pa.Opts(execute=True, limit=1, backfill=False, adopt_only=False,
                    r5_on=False, run_l3=True, run_l4=False, only_l0=False,

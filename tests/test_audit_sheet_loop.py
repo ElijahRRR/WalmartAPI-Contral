@@ -141,10 +141,24 @@ class _Conn:
 
 
 def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
+    """三段输出分列(2026-09-02 B1):F 判定结果 / G 类别 / H 具体内容。
+
+    H 取 `products.audit_detail`;**老行(还没有这一列值的)按命中规则渲染**
+    —— 不兜底的话,存量几十万行在表上会一夜变成空白,看起来像"审核把理由
+    弄丢了"。老行被重审时自然写上新格式。
+    """
     at = dt.datetime(2026, 8, 16, 9, 30)
     monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn(
-        [("B0OK", "沃标题", "Cups", "approved", "", at),
-         ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at)],
+        [("B0OK", "沃标题", "Cups", "approved", "", at, None),
+         # 新行:类别是枚举,具体内容来自 audit_detail
+         ("B0NEW", "沃标题3", "Pans", "rejected", "Intellectual Property", at,
+          "标题写 \"Nike Air\",IP 政策禁未授权引用品牌"),
+         # 老行:没有 audit_detail ⇒ 按命中规则渲染
+         ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at,
+          None),
+         # 老行 pending:待定原因当年写在 audit_reason 里,H 照旧显示它
+         ("B0PEND", "沃标题4", "Pots", "pending", "待类目判定(候选/rerank 均解不出)",
+          at, None)],
         # B0NONE 在库里查不到 → 不出现在结果集
         [("B0NO", None, "phase0_brand_blacklist", {"brand": "Nike"}, -100)]))
     writes = []
@@ -155,17 +169,20 @@ def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
         {"rownum": 3, "asin": "B0NO"},
         {"rownum": 4, "asin": "B0NONE"},
         {"rownum": 5, "asin": "B0OK"},        # 同 ASIN 多行(不同店铺)都要写
+        {"rownum": 6, "asin": "B0NEW"},
+        {"rownum": 7, "asin": "B0PEND"},
     ], True)
     by_row = dict(writes)
-    assert set(by_row) == {2, 3, 5}                 # 4 行留空,一格没动
+    assert set(by_row) == {2, 3, 5, 6, 7}          # 第 4 行留空,一格没动
     assert by_row[2] == ["沃标题", "Cups", "pass", "", "", "2026-08-16"]
-    # 三段输出分列(2026-09-02 表头):G 类别 = 政策类目名,H 具体内容 = 人话
-    # (不再带「[政策:X]」尾巴,类别已单列)
-    assert by_row[3][2] == "reject"
-    assert by_row[3][3] == "General-Use Products"
-    assert by_row[3][4] == "品牌黑名单(命中:Nike)"
+    assert by_row[6] == ["沃标题3", "Pans", "reject", "Intellectual Property",
+                         "标题写 \"Nike Air\",IP 政策禁未授权引用品牌",
+                         "2026-08-16"]
+    assert by_row[3][2:5] == ["reject", "General-Use Products",
+                              "品牌黑名单(命中:Nike)"]     # 老行兜底渲染
+    assert by_row[7][2:5] == ["pending", "", "待类目判定(候选/rerank 均解不出)"]
     assert by_row[5] == by_row[2]
-    assert "回填 3 行" in out
+    assert "回填 5 行" in out
     assert "1 行库里没有结论" in out and "F 列留空" in out
 
 

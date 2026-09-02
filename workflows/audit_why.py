@@ -27,7 +27,7 @@ logger = logging.getLogger("workflows.audit_why")
 
 _SQL_PRODUCT = """
 SELECT asin, title, brand, walmart_pt, pt_source,
-       audit_status, audit_reason, audited_at, audit_version
+       audit_status, audit_reason, audited_at, audit_version, audit_detail
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 """
@@ -340,10 +340,14 @@ def run(params: dict) -> str:
             out.append("  ⚠ 不在 catalog.products —— 采集还没摄进来,"
                        "既审不了也回填不了(先跑 product_ingest)")
             continue
-        _a, title, brand, wpt, psrc, status, reason, at, ver = p
+        _a, title, brand, wpt, psrc, status, reason, at, ver, adetail = p
+        # 三段分列(2026-09-02 B1):判定结果 / 类别 / 具体内容。老行没有
+        # audit_detail(那时两样东西挤在 audit_reason 一列里),打出来是 None
+        # —— 那正是"这一行还没被新链重审过"的样子,不是查询坏了
         out += [f"  标题 {(title or '')[:70]}",
                 f"  品牌 {brand!r}",
-                f"  结论 {status}  理由 {reason!r}",
+                f"  结论 {status}  类别 {reason!r}",
+                f"  具体内容 {adetail!r}",
                 f"  类目 {wpt!r}(来源 {psrc},审于 {at} 规则版本 {ver})"]
         m = meta.get(wpt)
         if m:

@@ -31,7 +31,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from services import category_blacklist
+from registry import resources
+from services import category_blacklist, policy_names
 from services.audit_models import Phase0Result, ProductInfo, RuleHit
 
 # =============================================================
@@ -90,6 +91,9 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                         "seller_id": seller,
                         "seller_name": product.seller_name or None,   # 空串转 None
                         "source": "blacklist_center",
+                        # 规则自报类别(§二):内部黑名单是**我们自己的决策**,
+                        # 不对应任何一条沃尔玛政策 —— 别再给它挂政策名
+                        "category": resources.AUDIT_CAT_INTERNAL_BLACKLIST,
                     },
                 )],
             )
@@ -107,6 +111,7 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
                     detail={
                         "asin": asin,
                         "source": "blacklist_center",
+                        "category": resources.AUDIT_CAT_INTERNAL_BLACKLIST,
                     },
                 )],
             )
@@ -139,8 +144,17 @@ def _check_lark_blacklist(product: ProductInfo, ctx: Any) -> Phase0Result:
         if hit.matched_by == category_blacklist.MATCH_TOP:
             detail["amazon_top_category"] = hit.matched_value
             detail["full_path"] = product.amazon_category_path
+        # 规则自报类别(§二):黑名单行自带 `walmart_policy` 且**能对到政策表**
+        # → 用那条政策;对不上(空 / 旧拼写 / 自造名)→ `内部黑名单`。
+        # 两个键都留:`walmart_policy` 是黑名单行的**原值**(数据溯源),
+        # `category` 是本条判定落的类别(解析后的表内拼写)——不是双轨。
+        detail["category"] = resources.AUDIT_CAT_INTERNAL_BLACKLIST
         if hit.walmart_policy:
-            detail["walmart_policy"] = hit.walmart_policy   # 理由映射第 1 优先级
+            detail["walmart_policy"] = hit.walmart_policy   # 黑名单行原值
+            known = getattr(ctx, "known_policies", None) or ()
+            resolved = policy_names.resolve(hit.walmart_policy, known)
+            if resolved:
+                detail["category"] = resolved
         return Phase0Result(
             blocked=True,
             matched_category=hit.matched_value,
@@ -235,7 +249,7 @@ def _check_trademark(product: ProductInfo) -> Phase0Result:
         detail={
             "matches": matches,
             "count": len(matches),
-            "walmart_policy": "Intellectual Property",
+            "category": resources.AUDIT_IP_POLICY,   # 规则自报类别(§二)
             "matched_brand": matches[0]["brand_phrase"],
             # 品牌与符号之间不留空格,无论原文有没有
             "matched_phrase": f"{matches[0]['brand_phrase']}{matches[0]['symbol']}",
@@ -280,7 +294,7 @@ def _check_patent(product: ProductInfo) -> Phase0Result:
         detail={
             "matched_phrase": m.group(0),
             "context": hay[max(0, m.start() - 30): m.end() + 30].strip(),
-            "walmart_policy": "Intellectual Property",
+            "category": resources.AUDIT_IP_POLICY,   # 规则自报类别(§二)
             "note": "文案自述专利保护(Patent No./Patented/Patent Pending 等),"
                     "搬运卖家无授权;patent leather(漆皮)已豁免",
         },
@@ -355,6 +369,9 @@ def _check_brand(product: ProductInfo, ctx: Any) -> Phase0Result:
             "matched_brand": matched,        # 黑名单原文(first-wins)
             "match_type": "exact",
             "source": "blacklist_center",    # 单源:catalog.brand_blacklist
+            # 规则自报类别(§二):品牌拉黑多因知产风险,归 IP 是既定口径
+            # (与内部黑名单三码有意不同,别顺手改)
+            "category": resources.AUDIT_IP_POLICY,
         },
     )
     return Phase0Result(blocked=True, matched_brand=matched, hits=[hit])

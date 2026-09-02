@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
     audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
+    audit_reason    text,        -- **类别**(官方政策名 / 内部黑名单 / 类目准入)
+    audit_detail    text,        -- **具体内容**(原文片段 + 条款要点 / 规则人话)
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
     --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
@@ -204,6 +205,17 @@ CREATE INDEX IF NOT EXISTS products_browse_node_idx
 -- 存量无从区分的一律留 NULL,由下一轮审核按新口径补写(NULL 视同推断,
 -- 保守:不把来历不明的 PT 当实证喂给挖掘)。
 ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
+
+-- 审核三段输出分列(2026-09-02 第三步 B1 批,docs/audit_step3_spec.md §3.4):
+-- 判定结果 audit_status / **类别** audit_reason / **具体内容** audit_detail。
+-- 此前两样东西挤在 audit_reason 一列里(拒绝时是政策名、待定时是一句中文),
+-- 于是"按类别统计被拒原因"这件事永远做不了,飞书上架表也只能塞一格人话。
+-- audit_reason 从此只装类别枚举(官方政策名 / 内部黑名单 / 类目准入),
+-- pass 与 pending 一律 NULL;audit_detail 装那一句具体内容(L3 给的原文片段
+-- + 条款要点,或规则命中翻成的人话,或待定原因)。
+-- ⚠ 存量行不迁移:老行的 audit_reason 里还混着中文句子/旧政策名,被重审前
+--   原样留着(飞书投影按"有 audit_detail 用新格式,没有就用老格式"渲染)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS audit_detail text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688

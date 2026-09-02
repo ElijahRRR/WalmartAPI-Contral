@@ -9,12 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from registry import resources
 from services import audit_phase0
 from services.audit_models import ProductInfo
 from services.audit_stopwords import is_stopword
 
 
-def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=()):
+def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=(),
+         known=frozenset()):
     """cats=归一化完整路径(飞书历史行);tops=顶级名;nodes=子树根 node_id。
 
     2026-08-20 起类目闸判据全在库里(catalog.amazon_cat_blacklist),
@@ -36,6 +38,7 @@ def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=()):
         phase0_asins=frozenset(asins),
         cat_rules=rules,
         brand_blacklist=dict(brands or {}),
+        known_policies=known,     # 类目黑名单行的 walmart_policy 按它对表
     )
 
 
@@ -139,9 +142,20 @@ def test_forbidden_category_vectors(path, blocked, top):
 
 
 def test_forbidden_category_policy_books():
+    """黑名单行自带的 `walmart_policy` 是**行原值**;类别按它对政策表解析。
+
+    ⚠ 2026-09-02 B1 §二:能解析到表 → 用那条政策;解析不到(空 / 旧拼写 /
+    自造名)→ `内部黑名单`(内部决策不挂政策名,别再兜底编一个)。
+    """
+    known = frozenset({"Intellectual Property"})
     r = audit_phase0.check(_p(amazon_category_path="Books"),
-                           _ctx(tops=_LEGACY_TOPS))
+                           _ctx(tops=_LEGACY_TOPS, known=known))
     assert r.hits[0].detail["walmart_policy"] == "Intellectual Property"
+    assert r.hits[0].detail["category"] == "Intellectual Property"
+    # 没有政策表可对(或对不上)⇒ 落内部黑名单
+    r2 = audit_phase0.check(_p(amazon_category_path="Books"),
+                            _ctx(tops=_LEGACY_TOPS))
+    assert r2.hits[0].detail["category"] == resources.AUDIT_CAT_INTERNAL_BLACKLIST
 
 
 # ── B2b 摘掉批次 B 新增的 4 个大类(2026-08-17 裁决 A)──────────────────────
@@ -207,7 +221,9 @@ def test_trademark_symbol_vectors(title, blocked, brand_phrase):
         h = r.hits[0]
         assert h.rule_code == "phase0_trademark_symbol"
         assert h.detail["matched_brand"] == brand_phrase
-        assert h.detail["walmart_policy"] == "Intellectual Property"
+        # 规则自报类别(2026-09-02 B1 §二):键从 walmart_policy 改名 category,
+        # 语义从"顺手记一个政策名"变成"这条规则判的就是这个类别"
+        assert h.detail["category"] == resources.AUDIT_IP_POLICY
 
 
 def test_trademark_no_own_brand_exemption():
@@ -274,6 +290,29 @@ def test_lark_seller_asin_cat_priority():
     assert r3.hits[0].detail["amazon_category_path"] == "Video Games > Xbox"
     assert r3.hits[0].detail["matched_by"] == "path_exact"
     assert r3.matched_category == "VideoGames->Xbox"
+
+
+def test_每条硬拒规则自报类别():
+    """⚠ 类别**只许两种来源、零推断**:规则在 detail 里自报,或 L3 结构化输出。
+
+    这条钉的是 §二 那张表在 L0 的四行:卖家 / ASIN 黑名单 = 内部黑名单
+    (我们自己的决策,不对应任何沃尔玛政策 —— 所有者 2026-08-18 实遇
+    「ASIN 在黑名单中心 [政策:General-Use Products]」那种自相矛盾的话);
+    品牌黑名单 / 商标符号 / 专利自述 = Intellectual Property。
+    漏了自报的后果不报错:`compute_final_reason` 查不到就落 NULL。
+    """
+    internal = resources.AUDIT_CAT_INTERNAL_BLACKLIST
+    ctx = _ctx(sellers={"S1"}, asins={"B0BLACK0001"}, brands=BRANDS)
+    assert audit_phase0.check(_p(seller_id="S1"), ctx).hits[0] \
+        .detail["category"] == internal
+    assert audit_phase0.check(_p(asin="B0BLACK0001"), ctx).hits[0] \
+        .detail["category"] == internal
+    assert audit_phase0.check(_p(brand="IKEA"), ctx).hits[0] \
+        .detail["category"] == resources.AUDIT_IP_POLICY
+    assert audit_phase0.check(_p(title="LEGO® Bricks"), ctx).hits[0] \
+        .detail["category"] == resources.AUDIT_IP_POLICY
+    assert audit_phase0.check(_p(title="Patented Shelf"), ctx).hits[0] \
+        .detail["category"] == resources.AUDIT_IP_POLICY
 
 
 def test_lark_blank_seller_skipped():
@@ -348,7 +387,7 @@ def test_patent_claim_vectors(title, blocked):
     if blocked:
         h = r.hits[0]
         assert h.rule_code == "phase0_patent_claim" and h.penalty == -100
-        assert h.detail["walmart_policy"] == "Intellectual Property"
+        assert h.detail["category"] == resources.AUDIT_IP_POLICY
 
 
 def test_patent_scans_bullets_and_desc_same_window_as_trademark():

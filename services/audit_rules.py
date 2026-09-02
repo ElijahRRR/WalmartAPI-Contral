@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 from registry import paths, resources
 from services import (audit_l1_llm, audit_l2, audit_phase0, audit_reason,
-                      category_blacklist)
+                      category_blacklist, policy_names)
 from services.audit_models import AuditOutcome, L1Info, RuleHit
 from services.audit_stopwords import is_stopword
 
@@ -139,6 +139,37 @@ def _build_automaton(brand_keys) -> object:
 
 _UNMAPPED_SENTINEL = audit_l1_llm.UNMAPPED_SENTINEL   # 单一出处
 
+#: 规则代码里**写死的政策类别名**(`docs/audit_step3_spec.md` §二 表:品牌
+#: 黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的品牌翻拒,四处判同一个 IP)。
+#: 它们不经政策表查询就写进 `hit.detail["category"]` 并一路落库、进飞书 G 列、
+#: 进申诉口径 —— 所以拼写必须**就是**表内那一行。
+RULE_POLICIES = (resources.AUDIT_IP_POLICY,)
+
+
+def check_rule_policies(known_policies) -> None:
+    """输入:政策表 category_en 实时集合 → 输出:无(对不上直接 RuntimeError)。
+
+    装配时**只查一次**。政策表改名而代码没跟上时的正确表现是**启动即炸**:
+    静默的话,那几条硬拒会一直往 `audit_reason` 里写一个表里已经不存在的
+    类别名,飞书 G 列、申诉口径、报错 join 三处一起对不上,而没有任何东西会红。
+    空集合(测试/离线路径没给政策表)跳过检查 —— 那是"没有表可对",不是"对不上"。
+    """
+    if not known_policies:
+        return
+    for name in RULE_POLICIES:
+        hit = policy_names.resolve(name, known_policies)
+        if hit is None:
+            raise RuntimeError(
+                f"规则代码写死的政策类别 {name!r} 在 audit.walmart_prohibited_policy "
+                f"里解析不到 —— 政策表改名了而代码没跟上。改 "
+                f"registry.resources.AUDIT_IP_POLICY(别让规则往库里写一个"
+                f"表里没有的类别名)")
+        if hit != name:
+            raise RuntimeError(
+                f"规则代码写死的政策类别 {name!r} 与表内拼写 {hit!r} 不一致 —— "
+                f"落库的类别必须是表内原拼写。改 "
+                f"registry.resources.AUDIT_IP_POLICY 为 {hit!r}")
+
 
 def load_context(conn, *, uspto=None) -> AuditContext:
     """输入:中心库连接(+可选 uspto 只读连接)→ 输出:装配完成的 AuditContext。
@@ -237,6 +268,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # 无法区分,必须让数字见人)
     logger.info("黑名单中心加载:卖家 %d / ASIN %d / 类目 %d",
                 len(p0_sellers), len(p0_asins), len(p0_cats))
+    known_policies = _frozen(conn, "SELECT category_en FROM "
+                                   "audit.walmart_prohibited_policy "
+                                   "WHERE category_en IS NOT NULL")
+    check_rule_policies(known_policies)
     return AuditContext(
         phase0_sellers=p0_sellers,
         phase0_asins=p0_asins,
@@ -253,9 +288,7 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         uspto=uspto,
         walmart_confirmed=confirmed,
         catmap=catmap,
-        known_policies=_frozen(conn, "SELECT category_en FROM "
-                                     "audit.walmart_prohibited_policy "
-                                     "WHERE category_en IS NOT NULL"),
+        known_policies=known_policies,
         # 批次 C:Layer 0 哨兵路径集(①b 历史实证改读产品行 walmart_pt,
         # 经 pt_backfill 回填,不再装配证据 map——所有者定稿 2026-08-13)
         # btrim 与 catmap 的 cat.strip() 对称(评审 P2:带尾空白的哨兵行漏拦,
@@ -394,8 +427,7 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
             l1=L1Info(walmart_product_type="(phase0_blocked)",
                       pt_confidence="低", pt_source="skipped"),
             phase0=p0)
-        outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product, ctx.known_policies)
+        outcome.final_reason_category = audit_reason.compute_final_reason(outcome)
         return outcome
 
     l1 = resolve_pt(product, ctx)
@@ -457,7 +489,10 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
     # reject/pending 改判 + stage='L3',分数保留 L2 值(L3 不动分)
     if verdict == "pass" and run_l3 and conn is not None:
         from services import audit_l3
-        l3 = audit_l3.judge_l3(product, l1, l2, ctx, conn)
+        # phase0 一并传进去:上游证据通道(summarize_evidence)读 L0/L1/L2
+        # 三层的软 hit —— C 批把品牌文案扫描迁进 L0 后,证据源就在 p0 里,
+        # 这条接线现在给上,迁层那天不用再改判定链(规格 §3.6)
+        l3 = audit_l3.judge_l3(product, l1, l2, ctx, conn, phase0=p0)
         outcome.l3 = l3
         if l3.verdict == "reject":
             outcome.verdict = "reject"
@@ -477,17 +512,12 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
             outcome.stage_stopped_at = "L4"
 
     if outcome.verdict == "reject":
-        # ⚠ `ctx.known_policies` 同时喂两处,**必须同源**:这里让 L3 答出的
-        #   政策名按表内原拼写回来(2026-09-02 §十.7 归一化随表),以及下面那道
-        #   校验;`audit_l3.valid_reason_categories` 吃的也是它 —— 三处同一个
-        #   `SELECT category_en`,表改名后一起变,不会有谁掉队。
-        outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product, ctx.known_policies)
-        if ctx.known_policies and not audit_reason.known_policies_check(
-                outcome.final_reason_category, ctx.known_policies):
-            # 兜底触发必须记日志计数(铁律):落在政策表之外只记不改判
-            logger.warning("理由映射落在政策表之外:%s(asin=%s)",
-                           outcome.final_reason_category, product.asin)
+        # 类别 = **查表**(2026-09-02 B1,规格 §3.5):硬拒规则在 detail 里自报,
+        # L3 在结构化输出里给,两者都在产出的那一刻就对过政策表了 ——
+        # 这里不再传 `known_policies`,也不再有第二道"落表外"校验:
+        # 归一化只有一条实现路径(`policy_names.resolve`),不在这儿再来一遍。
+        # 查不到 = None + `audit_reason.STATS['reason_missing']` + warning。
+        outcome.final_reason_category = audit_reason.compute_final_reason(outcome)
     return outcome
 
 

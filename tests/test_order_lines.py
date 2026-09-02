@@ -465,6 +465,7 @@ def test_order_date_observe_then_confirm_guard_and_repair_mode():
     assert "order_date_seen = EXCLUDED" not in sql and "order_date_confirmed = EXCLUDED" not in sql
     assert "order_meta = EXCLUDED" not in sql          # 三列只插入不更新
     assert sent[0]["order_date_seen"] is None and sent[0]["order_date_confirmed"] is False
+    assert sent[0]["order_date_streak"] == 0 and "order_date_streak = EXCLUDED" not in sql
     meta = json.loads(sent[0]["order_meta"])
     assert meta["orderDate"] == _ORDER["orderDate"]
     assert meta["lines"][0]["sku"] == rows[0]["sku"] and "seenAt" in meta
@@ -492,19 +493,25 @@ def test_order_date_screening_classifies_and_never_silences(caplog):
     other = datetime(2026, 9, 2, 4, 12, tzinfo=timezone.utc)
     with caplog.at_level("WARNING"):
         got = ol.screen_order_dates(
-            _ConflictConn([(lid, "108000000001", "B0A", other, None, True, None)]), rows)
+            _ConflictConn([(lid, "108000000001", "B0A", other, None, True, None, 0)]), rows)
     assert got == [{"kind": "冲突", "po": "108000000001", "sku": "B0A",
                     "db": other, "api": api_od}]
     assert "下单时间冲突" in caplog.text and "108000000001" in caplog.text
     assert '"customerOrderId"' in caplog.text          # 信封摘要进日志取证
     assert ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", other, api_od, False, None)]), rows)[0]["kind"] == "改判"
+        _ConflictConn([(lid, "p", "s", other, api_od, False, None, 0)]), rows)[0]["kind"] == "改判"
     assert ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", other, None, False, None)]), rows)[0]["kind"] == "待定"
+        _ConflictConn([(lid, "p", "s", other, None, False, None, 0)]), rows)[0]["kind"] == "待定"
     assert ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", other, other, False, None)]), rows)[0]["kind"] == "待定"
-    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", api_od, None, False, None)]), rows) == []
-    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", None, None, False, None)]), rows) == []
+        _ConflictConn([(lid, "p", "s", other, other, False, None, 0)]), rows)[0]["kind"] == "待定"
+    # 已定稿 + 同一异值已连续两轮(streak=2)+ 本轮又是它 ⇒ 疑错,并给修复命令
+    got = ol.screen_order_dates(
+        _ConflictConn([(lid, "108000000001", "B0A", other, api_od, True, None, 2)]), rows)
+    assert got[0]["kind"] == "疑错" and "repair_order_date=108000000001" in caplog.text
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", other, api_od, True, None, 1)]), rows)[0]["kind"] == "冲突"
+    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", api_od, None, False, None, 0)]), rows) == []
+    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", None, None, False, None, 0)]), rows) == []
     assert ol.screen_order_dates(_ConflictConn([]), []) == []
 
 
@@ -518,13 +525,13 @@ def test_api_order_date_after_first_sight_is_rejected_not_written(caplog):
     created = api_od - timedelta(days=5)             # 五天前就见过这单
     with caplog.at_level("WARNING"):
         got = ol.screen_order_dates(
-            _ConflictConn([(lid, "p", "s", created - timedelta(hours=1), None, False, created)]), rows)
+            _ConflictConn([(lid, "p", "s", created - timedelta(hours=1), None, False, created, 0)]), rows)
     assert got[0]["kind"] == "拒写" and rows[0]["order_date"] is None
     assert "晚于本行首次入库" in caplog.text and '"customerOrderId"' in caplog.text
     # 首次入库晚于下单时间(正常)不拦
     rows = ol.extract_order_lines("T1", _ORDER)
     assert ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", api_od, None, False, api_od + timedelta(hours=2))]),
+        _ConflictConn([(lid, "p", "s", api_od, None, False, api_od + timedelta(hours=2), 0)]),
         rows) == [] and rows[0]["order_date"] == api_od
 
 

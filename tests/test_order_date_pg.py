@@ -115,8 +115,8 @@ def _state(pg, po: str) -> tuple:
     with pg.pg_conn() as conn:
         return conn.execute(
             "SELECT order_date, order_date_seen, order_date_confirmed, updated_at,"
-            " order_meta->>'orderDate', source FROM orders.order_lines WHERE po_id = %s",
-            (po,)).fetchone()
+            " order_meta->>'orderDate', source, order_date_streak"
+            " FROM orders.order_lines WHERE po_id = %s", (po,)).fetchone()
 
 
 def _dt(ms) -> datetime:
@@ -125,7 +125,7 @@ def _dt(ms) -> datetime:
 
 def test_first_sight_is_candidate_and_second_identical_read_confirms(pg):
     assert _sync(pg, "P1", X_MS) == []
-    od, seen, confirmed, upd1, meta_raw, source = _state(pg, "P1")
+    od, seen, confirmed, upd1, meta_raw, source, _k = _state(pg, "P1")
     assert (od, seen, confirmed) == (_dt(X_MS), _dt(X_MS), False)   # 候选 + 本轮观测,未定稿
     assert meta_raw == str(X_MS) and source is None       # 首见信封落 order_meta 取证
     assert _sync(pg, "P1", X_MS) == []
@@ -187,7 +187,7 @@ def test_history_import_midnight_row_yields_to_api_after_two_reads(pg):
                      (ol.make_order_line_id("P6", SKU), STORE, "P6", SKU, midnight,
                       ol.HISTORY_SOURCE))
     _sync(pg, "P6", X_MS)
-    od, _s, _c, _u, _m, source = _state(pg, "P6")
+    od, _s, _c, _u, _m, source, _k = _state(pg, "P6")
     assert od == midnight and source is None      # 真行到了:历史标记摘掉,下单时间先保留
     _sync(pg, "P6", X_MS)
     assert _state(pg, "P6")[0] == _dt(X_MS)
@@ -254,3 +254,24 @@ def test_api_value_after_first_sight_is_rejected_and_not_an_observation(pg):
     _sync(pg, "P12", X_MS)
     _sync(pg, "P12", X_MS)
     assert _state(pg, "P12")[2] is True
+
+
+def test_confirmed_but_wrong_value_self_reports_after_three_identical_disagreements(pg):
+    """探针 3 实证:沃尔玛的错值不粘、下轮就变。已定稿的值若被同一个不同值连续顶
+    三轮,几乎可断定定稿值错了 ⇒ 报「疑错」并给修复命令;定稿值本身仍不动。
+    正确值一出现,计数归零。"""
+    _sync(pg, "P13", Y_MS)
+    _sync(pg, "P13", Y_MS)                       # 错值 Y 被定稿(两轮一致)
+    assert _state(pg, "P13")[6] == 0
+    assert [c["kind"] for c in _sync(pg, "P13", X_MS)] == ["冲突"]
+    assert _state(pg, "P13")[6] == 1
+    assert [c["kind"] for c in _sync(pg, "P13", X_MS)] == ["冲突"]
+    assert _state(pg, "P13")[6] == 2
+    got = _sync(pg, "P13", X_MS)
+    assert [c["kind"] for c in got] == ["疑错"]
+    assert _state(pg, "P13")[:3] == (_dt(Y_MS), _dt(X_MS), True)   # 定稿值不自动动
+    assert _state(pg, "P13")[6] == 3
+    _sync(pg, "P13", Y_MS)                       # 定稿值又出现:计数归零
+    assert _state(pg, "P13")[6] == 0
+    _sync(pg, "P13", X_MS, repair=True)          # 人工点名修复
+    assert _state(pg, "P13")[:3] == (_dt(X_MS), _dt(X_MS), True)

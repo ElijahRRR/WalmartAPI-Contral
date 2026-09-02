@@ -475,6 +475,8 @@ _ORDER_DATE_GUARD = (
 # order_date_seen 永远是"最近一轮观测到的值";定稿条件 = 本轮值 == 生效值 ==
 # 上轮观测值(连续两轮一致)。本轮拒写(NULL)不动上轮观测。不碰 updated_at:
 # 观测记账不是业务行变化,不许触发飞书重推。
+# order_date_streak:定稿后同一异值连续出现的轮数(SET 里的 t.* 都是更新前的旧值,
+# 所以能同时读上一轮观测、写本轮计数);到 _ORDER_DATE_SUSPECT_STREAK 即报「疑错」
 _ORDER_DATE_STATE_SQL = (
     "UPDATE orders.order_lines t SET"
     " order_date_confirmed = CASE"
@@ -483,8 +485,16 @@ _ORDER_DATE_STATE_SQL = (
     "   WHEN t.order_date = %(observed)s::timestamptz"
     "    AND t.order_date_seen = %(observed)s::timestamptz THEN true"
     "   ELSE false END,"
+    " order_date_streak = CASE"
+    "   WHEN %(observed)s::timestamptz IS NULL THEN t.order_date_streak"
+    "   WHEN NOT t.order_date_confirmed OR %(observed)s::timestamptz = t.order_date THEN 0"
+    "   WHEN t.order_date_seen = %(observed)s::timestamptz THEN t.order_date_streak + 1"
+    "   ELSE 1 END,"
     " order_date_seen = COALESCE(%(observed)s::timestamptz, t.order_date_seen)"
     " WHERE t.order_line_id = %(id)s")
+
+# 已定稿的行,同一个不同值连续这么多轮 ⇒ 摘要首行报「疑错」(定稿值不动,给修复命令)
+_ORDER_DATE_SUSPECT_STREAK = 3
 
 # 时间余量:晚于当前时刻超过它的 orderDate 拒写;晚于本行状态时间超过它的记存疑
 _ORDER_DATE_TOLERANCE_SECS = 3600
@@ -544,8 +554,9 @@ _ORDER_LINE_COLS = [
     # 值**冲回 NULL**——每轮同步抹一次,那一列永远填不满。COALESCE 保留旧值。
     "asin",
     # 下单时间定稿状态三列:只在插入时写(skip_update),更新走 _ORDER_DATE_STATE_SQL
-    "order_date_seen", "order_date_confirmed", "order_meta"]
-_ORDER_DATE_STATE_COLS = ("order_date_seen", "order_date_confirmed", "order_meta")
+    "order_date_seen", "order_date_confirmed", "order_meta", "order_date_streak"]
+_ORDER_DATE_STATE_COLS = ("order_date_seen", "order_date_confirmed", "order_meta",
+                          "order_date_streak")
 
 HISTORY_SOURCE = "历史数据"      # order_history_import 写;push 侧按它排除
 
@@ -563,7 +574,8 @@ _SETTLEMENT_COLS = [
 
 
 _ORDER_DATE_EXISTING_SQL = ("SELECT order_line_id, po_id, sku, order_date,"
-                            " order_date_seen, order_date_confirmed, created_at"
+                            " order_date_seen, order_date_confirmed, created_at,"
+                            " order_date_streak"
                             " FROM orders.order_lines"
                             " WHERE order_line_id = ANY(%(ids)s::text[])")
 
@@ -576,6 +588,8 @@ def screen_order_dates(conn, rows: list[dict]) -> list[dict]:
       拒写  API 值晚于本行**首次入库**时刻——订单不可能在我们第一次看见它之后才
             下单;置空不入库,也不算一次观测(守卫/记账都把 NULL 当"本轮没看到")
       冲突  已定稿,库值保留(写一次)
+      疑错  已定稿,但同一个不同值已连续 _ORDER_DATE_SUSPECT_STREAK 轮 ⇒ 定稿值几乎
+            可断定是错的(沃尔玛的错值不粘、下轮就变);库值仍不动,首行报并给修复命令
       改判  未定稿且 API 值与上轮观测一致 ⇒ 本轮 upsert 会改成 API 值(连续两轮)
       待定  未定稿且 API 值是新出现的 ⇒ 库值保留,等下一轮再看
     每条都记 warning 并带信封摘要——这是抓证据的口子,不许静默。
@@ -588,7 +602,7 @@ def screen_order_dates(conn, rows: list[dict]) -> list[dict]:
         cur.execute(_ORDER_DATE_EXISTING_SQL, {"ids": list(api_by_id)})
         existing = cur.fetchall()
     out: list[dict] = []
-    for lid, po, sku, db_od, seen, confirmed, created in existing:
+    for lid, po, sku, db_od, seen, confirmed, created, streak in existing:
         row = api_by_id[lid]
         api_od = row["order_date"]
         env = json.dumps(row.get("_envelope"), ensure_ascii=False)
@@ -600,7 +614,10 @@ def screen_order_dates(conn, rows: list[dict]) -> list[dict]:
             continue
         if db_od is None or db_od == api_od:
             continue
-        if confirmed:
+        if confirmed and seen == api_od and (streak or 0) + 1 >= _ORDER_DATE_SUSPECT_STREAK:
+            kind, verdict = "疑错", (f"同一异值已连续 {(streak or 0) + 1} 轮,定稿值疑错;"
+                                   f"修复:order_sync -p repair_order_date={po}")
+        elif confirmed:
             kind, verdict = "冲突", "已定稿,库值保留"
         elif seen is not None and seen == api_od:
             kind, verdict = "改判", "连续两轮一致,改为 API 值"
@@ -629,6 +646,7 @@ def upsert_order_lines(conn, rows: list[dict], *,
         # order_date_seen 随后由 _record_order_date_observations 记成本轮观测值
         r["order_date_seen"] = None
         r["order_date_confirmed"] = False
+        r["order_date_streak"] = 0
         r["order_meta"] = json.dumps(env, ensure_ascii=False, default=str) if env else None
     guards = {"phone": _PHONE_GUARD, "asin": _ASIN_GUARD,
               "order_date": _ORDER_DATE_GUARD}

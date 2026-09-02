@@ -41,7 +41,7 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.order_sync")
 
 
-_ANOMALY_KINDS = ("冲突", "改判", "待定", "拒写", "存疑")
+_ANOMALY_KINDS = ("疑错", "改判", "拒写", "冲突", "待定", "存疑")
 
 
 def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
@@ -153,7 +153,7 @@ def run(params: dict) -> str:
     # 首行只放要人看的:改判(库值真的变了)/ 拒写(未来日期);沃尔玛回错但被
     # 挡住的(冲突/待定)只报一个数——生产实测每轮都有十来条,逐条上首行会把
     # 通知训练成"看见 ⚠ 就划走"
-    acted = " / ".join(f"{k} {counts[k]}" for k in ("改判", "拒写") if counts[k])
+    acted = " / ".join(f"{k} {counts[k]}" for k in ("疑错", "改判", "拒写") if counts[k])
     blocked = counts["冲突"] + counts["待定"]
     tail = ""
     if acted:
@@ -168,11 +168,16 @@ def run(params: dict) -> str:
              + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉") + tail]
     if anomalies:
         # 第二行给人看细节:按 改判/拒写/冲突/待定/存疑 的轻重排,前 5 条
-        rank = {k: i for i, k in enumerate(("改判", "拒写", "冲突", "待定", "存疑"))}
+        rank = {k: i for i, k in enumerate(_ANOMALY_KINDS)}
         shown = sorted(anomalies, key=lambda a: rank[a["kind"]])[:5]
         lines.append("  " + ";".join(
             f"{a['store']} PO {a['po']}[{a['kind']}]:库 {_fmt(a['db'])} / API {_fmt(a['api'])}"
             for a in shown) + (" …" if len(anomalies) > 5 else "") + "(详见日志)")
+    suspect = [a["po"] for a in anomalies if a["kind"] == "疑错"]
+    if suspect:
+        # 定稿值几乎可断定是错的:给出可直接复制的修复命令,定稿值本身不自动动
+        lines.append("  修复疑错(核对后执行):python cli.py order_sync -p repair_order_date="
+                     + ",".join(dict.fromkeys(suspect)))
     if gate_note:
         lines.append(gate_note)
     if dead:

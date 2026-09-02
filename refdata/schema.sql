@@ -699,6 +699,11 @@ CREATE INDEX IF NOT EXISTS order_lines_asin_idx ON orders.order_lines (asin)
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_seen timestamptz;
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_confirmed boolean NOT NULL DEFAULT false;
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_meta jsonb;
+--   order_date_streak     已定稿后,连续多少轮观测到**同一个**与定稿值不同的值
+--                         (探针 3 实证:沃尔玛每轮约 2% 的订单回错,错值不粘、下轮就变;
+--                         若同一异值连续三轮不变,几乎可断定是定稿值错了)。到 3 即在
+--                         order_sync 摘要首行报「疑错」并给出修复命令;定稿值本身不动
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_streak smallint NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号

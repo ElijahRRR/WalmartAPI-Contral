@@ -1,193 +1,317 @@
-# SKU 编码规则:货源隐匿 + 多源共存
+# SKU 编码规则:货源隐匿 + 多源共存 —— 影响范围全景与整体计划
 
-> 状态:**计划待所有者批准,未动生产代码**(2026-09-01 初稿,2026-09-02 按所有者改稿:去店铺前缀、加来源字母)。
-> 所有者定稿:「沃尔玛侧通过 SKU 倒查产品来源,我不想让沃尔玛知道我的货源是
-> 哪里来的」+ 多源共存(amz / 1688 / 自建)。SKU 里**不能看得出 ASIN**,
-> 身份靠登记簿反查。
-> 调研:仓库侧全量 grep(硬等号残留 / 模式提取调用点 / 登记时机),2026-09-01。
+> 状态:**计划待所有者批准,未动生产代码**。
+> 2026-09-01 初稿;09-02 按所有者改稿(去店铺前缀、加来源字母);09-02 晚
+> 按所有者四问做全仓二次调研(四路并行:数据流全景 / 上架链与生成时点 /
+> 订单财务飞书侧 / 仓内沃尔玛硬约束),本版为整体计划。
+> 所有者定稿:「沃尔玛侧通过 SKU 倒查产品来源,我不想让沃尔玛知道我的货源
+> 是哪里来的」+ 多源共存(amz / 1688 / 自建)+「前缀不要店铺,我需要让我们
+> 内部可以看出来这个产品是怎么来的」。
 
 ## 0. 一句话模型
 
-**SKU = 12 位码:`<1 位来源字母><11 位随机不透明码>`,身份唯一出处 =
-`catalog.listing_sources`,先登记再提交。** 对沃尔玛:一串 12 位随机串,看不出
-ASIN、看不出上架日期;同一产品在两家店是两个毫无共性的码。对内部:第一个字母
-一眼看出"这个品是怎么来的"(amz / 跟卖 / 1688 / 自建),字母表只在 registry
-登记,细节(哪个 ASIN、哪个 1688 货源)靠登记簿反查。
+**SKU = 12 位连写:`<1 位来源字母><11 位随机不透明码>`;身份唯一出处 =
+`catalog.listing_sources`;在 list_new 预备期抽码登记,提交前已落库;同一
+(店, 来源类型, 来源码) 的码复用到显式退役为止。**
 
-> 2026-09-02 所有者改稿:**不要店铺前缀**("前缀不要店铺,我需要让我们内部
-> 可以看出来这个产品是怎么来的")。第一版是 `<店铺代号>-<12 位码>`,已废。
+对沃尔玛:一串 12 位随机串,看不出 ASIN、看不出上架日期。对内部:首字母一眼
+看出来源(amz / 跟卖 / 1688 / 自建),细节靠登记簿反查。
 
-## 1. 现状定稿(2026-09-01 摸底)
+## 1. 所有者四问的答案(先给结论,依据在后面各节)
 
-「sku ≠ asin」在**读方向**早已是既定事实(所有者 2026-08-11 定稿):
-`services/sku_asin.extract_asin` 认三种形态(裸 ASIN / 旧三段式
-`前缀-源头码-价格` / 纯数字 item id),`catalog.listing_sources` 登记簿也在
-(「谁上架谁登记」,2026-08-07)。**写方向还是 sku = asin**:
+**问 1|SKU 什么时候生成:入库还是上架?** → **上架时**,具体是 `list_new`
+预备期(`_prep_rows`,所有闸门与配额切片之后、组载荷之前),跟卖对应
+`match_listing` 的逐行循环。理由只有一条硬的:**本仓的"入库"(`product_ingest`
+→ `catalog.products`)那一刻没有店铺**,而沃尔玛 SKU 是按 seller 唯一的对象,
+`(店, 品)` 维度在入库时根本不存在。硬要在入库抽码,要么全店共用一个码(跨店
+同码 = 关联信号,与本计划目标冲突),要么给 `catalog.products` 加回 2026-08-12
+刚退役的 store 类列,并给几十万个永不上架的空壳行发码。详见 §5。
 
-| 层 | 现状 | 位置 |
-|---|---|---|
-| 生成 | `list_new` 四处直接拿 `r["asin"]` 当 SKU | list_new.py:252/257/599/1042 |
-| 登记时机 | **提交成功之后**才 `listing_sources.register` | list_new.py:240-262 `_apply_submit_result` |
-| 跟卖 | 自有规则 `PREFIX+YYYYMMDD+4 位序号`,B 列人工优先 | match_feed.make_sku / match_listing.py:170 |
-| SQL 硬等号 | `p.asin = w.sku` 等 **5 处** | maintenance_intents.py:192/202/233/322;product_audit.py:407 |
-| 模式提取 | `extract_asin(sku)` **7 个调用点**只看形态、不查登记簿 | order_lines/product_events/audit_rules/alloc_survey×2/blacklist×2 |
-| 人看的表 | 上架表**没有 SKU 列**;在线产品总表有 sku 无来源码 | resources.LISTING_SHEET / ONLINE_ITEMS |
+**问 2|波及面有多广?** → 全仓穷举后:**没有一处会报错,全部是静默失效**。
+SQL 硬等号 5 处 + 1 个视图;按 SKU 形态倒推 ASIN 的调用点 **14 处**(初稿写 7
+处,漏了一半);上架链里以 ASIN 当 SKU 对账的点 **9 处**(去重闸、重试上限、
+回执找行、Unknown 自愈、UPC 撞库标记、SKU_LOCKED 退役、UPC 池写入……);飞书
+表 6 张受影响。全景表在 §3。最危险的三条:本店去重闸失效(同店重复上架,烧
+UPC 烧配额)、黑名单键被灌随机码(违禁品拦不住)、订单审核把每一单判"待人工"。
 
-三条会静默出事的地方(规则一改立刻发作):
-1. **登记在提交之后**:sku=asin 时映射可从 SKU 本身恢复,所以无害;换成不透明码
-   后,提交成功与登记之间崩溃 = 沃尔玛上有一个谁也不知道是什么的 SKU,永远
-   进不了任何自动链(catalog_sync 扫到它 → sources_backfill 按格式猜 → unknown)。
-2. **5 处 SQL 硬等号**:新 SKU 的品在维护链/审核复审眼里**整体不存在**——不报错,
-   只是永远不改价、不清零、不删。
-3. **7 处模式提取**:订单行/事件/黑名单/分配的 asin 列对新 SKU 全部 NULL——
-   消费方按 `asin IS NOT NULL` 过滤,这批货**退出销量维度**且看起来像"一单没卖"。
+**问 3|存量产品过渡期怎么办?改了在线产品的 SKU,旧订单会不会跟着变?**
+→ 分三句:
+- **在线产品的 SKU 改不了。** 沃尔玛 SKU 建后不可编辑(仓内无一手记载,是行业
+  常识,§8 要你按 Seller Center 核一眼)。所以"把存量产品改成新 SKU"在沃尔玛
+  侧唯一的路是 **退役旧 SKU + 新码重上**:烧一个 UPC、24h 冷却、listing 历史
+  归零、在途订单身份断裂。**建议不迁存量,永久双轨**(存量 SKU 里的 ASIN
+  已经泄露,追不回;新上的品从此不泄露)。真要迁,另立计划按店分批。
+- **旧订单不会变。** `orders.order_lines.sku` 是下单当时沃尔玛返回的快照,
+  行标识 = sha256(PO + SKU),全仓没有任何一条 SQL 会改历史订单行的 sku;
+  asin 列只在原来为空时补填,永不覆盖。
+- **飞书订单表加 ASIN 列:对。** 销售订单表、售后订单表现在只有「SKU」列;
+  加「ASIN」列从 `order_lines.asin` 投影(登记簿反查后新旧码都有值)。一次性
+  代价:加列 ⇒ 行指纹全变 ⇒ 下一次 push 把 90 天窗口全量重推一遍,预告不是
+  故障。
 
-## 2. 约束与不做的事
+**问 4|上架表要加 SKU 列。** → 对,加在 **V 列(U 之后)**,提交时与 K/L/M
+同一次写回;回执反哺、Unknown 自愈、SKU_LOCKED 退役从此读 V 列(V 为空的
+存量行回落 B 列 ASIN)。加在末尾是硬要求:`listing_sheet` 里所有写入 range
+都是字母硬编码的连续段(`C{r}`、`H{r}:N{r}`、`K{r}:Q{r}`……),插在中间全体
+错位。同理:在线产品总表加「来源码」列、UPC 池表 E 列「SKU」改存真 SKU
+(现在存的是 ASIN)、退役表 B 列运营手填 SKU 从此要先查登记簿(§8 决定)。
 
-- **目标只有一个:SKU 不让沃尔玛倒查出来源。** 不含 ASIN、不含"像 ASIN 的
-  10 位码"、不含 1688 offer id、不含日期(日期泄露上架节奏)。来源**类型**只以
-  一个无助记字母出现,那是给内部看的(下一条)。
-- **不带店铺段**(2026-09-02 所有者改稿):店铺是登记簿的主键列,不需要写进
-  码里;同一产品在两家店的码本来就是两次独立随机,不靠店铺段区分。少了店铺段
-  也就不需要「SKU前缀」凭证列和 fail-closed 整店跳过——来源字母由工作流自己知道
-  (list_new = amz、match_listing = 跟卖……),不用人填任何东西。
-- **来源字母是给内部看的,不是给沃尔玛看的**:一个字母、映射只在 registry,
-  沃尔玛拿到 `NK7QM2X9RT4W` 这种串没有解读的钥匙。诚实地说:同一来源的品
-  首字母相同,这是一个**弱模式**(比店名前缀弱得多,店名前缀本来就把店暴露给
-  同一模式);所有者权衡后要内部可读,接受这一点。字母**不做助记**(不用 A=amz),
-  内部对照表只有四行,记得住;沃尔玛就少一条线索。
-- **不改存量 SKU**:沃尔玛 SKU 建后不可改。旧三段式(A109-B08QF9XLMH-02 这类)
-  已经泄露了 ASIN,无法追回,不在本计划范围。存量与新规则**永久双轨并存**——
-  所以读侧必须两种都认(登记簿优先,模式提取只给存量兜底)。
-- **不做可逆码**(HMAC/加密):可逆意味着"拿到密钥就能批量倒推",而登记簿反查
-  本来就要做,可逆性没有第二个消费者。随机码 + 登记簿是最简且最强的组合。
-- 沃尔玛约束(**待所有者机器上按本地 MP_ITEM spec 核验**,§8):SKU 上限 50 字符、
-  按 seller 唯一、不可变;字母数字安全。本规则固定 12 位,不含任何标点。
-
-## 3. 编码规则
+## 2. 编码规则(2026-09-02 定稿,未变)
 
 ```
 <来源字母><11 位随机码>      共 12 位,无分隔符
 NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
 ```
 
-**来源字母**(第 1 位):registry 一张常量表 `SKU_SOURCE_LETTERS`,
-`{amz: ?, match: ?, 1688: ?, self: ?}`,四个字母由所有者定(§8),要求互不相同、
-来自下面的字母表、**不助记**。抽码时由工作流按自己的 `source_type` 查表,
-没人手填。反向 `letter → source_type` 也在同一张表,给 `is_opaque` / 清洗分桶用。
-**不用分隔符**:`N-K7QM…` 会把"前面有个分类段"这件事写在脸上;12 位连写就是
-一串随机码。
+- **来源字母**(第 1 位):registry 常量表 `SKU_SOURCE_LETTERS`
+  `{amz, match, 1688, self}` 四个字母由所有者定(§8),互不相同、来自下面的
+  字母表、**不助记**(不用 A=amz)。工作流按自己的 `source_type` 查表,没人
+  手填。不用分隔符:`N-K7QM…` 会把"前面有个分类段"写在脸上。
+- **随机码**(后 11 位):`secrets.choice`(操作系统密码学随机源)从字母表
+  `23456789ABCDEFGHJKMNPQRSTVWXYZ`(30 符号,剔除 0/O、1/I/L、U)逐位独立抽
+  11 次。不含时间戳/序号/机器号,没有任何可被学习的生成规律。
+- **重复**:空间 30^11 ≈ 1.77×10^16;累计 100 万个码出现过任何一次撞码的总
+  概率约 3×10^-5。但**不靠概率**:`mint` INSERT 前先全局(不分店)查重,撞了
+  重抽,5 次仍撞抛错(随机源坏了,不是运气)。全局唯一而非按店唯一:两家店
+  同一 SKU 串在沃尔玛合法,但那正是"两家店有关联"的信号。
+- **12 位不是 10 位**:10 位正是 ASIN 长度;12 位与全部存量形态都对不上,
+  `extract_asin` 必返 None,调用方于是走登记簿——形态本身就是分流器。
+- 沃尔玛约束待核(§8):长度上限、字符集、按 seller 唯一、不可变。本规则
+  12 位纯大写字母数字,任何合理上限都在内。
 
-**随机码**(后 11 位):怎么来的——Python 标准库 `secrets.choice`(操作系统的
-密码学随机源,不是 `random`),从字母表 `23456789ABCDEFGHJKMNPQRSTVWXYZ`
-(30 个符号:剔除 0/O、1/I/L、U 防抄错与念错)逐位独立抽 11 次。不含时间戳、
-不含序号、不含机器号——所以码里没有任何可倒推的东西,也就**没有任何"生成
-规律"可被沃尔玛学习**。
+## 3. 影响范围全景(2026-09-02 四路调研合并)
 
-**会不会重复**:
-- 空间 30^11 ≈ 1.77×10^16。同一来源字母下攒到 N 个码时,再抽一个撞上已有码的
-  概率 ≈ N / 1.77×10^16:N = 100 万时约 6×10^-11;整个系统一生累计 100 万个码,
-  出现过任何一次撞码的总概率(生日问题 N²/2M)约 3×10^-5。可以当零。
-- **但不靠概率**:抽码与登记是同一个函数(§4 `mint`),INSERT 登记簿前先查
-  **全局**(不分店)`sku` 是否已存在,存在就重抽;最多 5 次仍撞则抛错——
-  那说明随机源坏了(比如被 mock 成常数),不是运气,必须人看。
-- **为什么要全局唯一而不只是按店唯一**:沃尔玛的唯一性是按 seller 的,两家店
-  同一个 SKU 串在沃尔玛那里合法,但那正是"两家店有关联"的信号。随机码本来
-  就不会跨店重复,`mint` 再查一遍只是把"不会"变成"不能"。存量 sku=asin 的行
-  跨店重复是既成事实,不受此约束(只管新码)。
+### 3.1 总判断
 
-**为什么 12 位不是 10 位**:10 位字母数字正是 ASIN 的长度,任何"像不像 ASIN"
-的启发式(沃尔玛的、我们自己的 `_PLAIN` 正则)都以此为特征;12 位与所有存量
-形态都对不上,`extract_asin` 对它必然返 None,调用方于是走登记簿——形态本身
-就是分流器。
+全仓**没有一处会抛异常**;全部是"不报错、摘要看起来正常、功能悄悄没了"。
+这是最危险的形态,也是为什么必须先做读侧收口(批次 0)、写侧最后切。
 
-**同一条规则覆盖全部来源**:amz / 跟卖 / 1688 / 自建。跟卖保留「B 列人工优先」,
-自动续号改走本规则(旧 `PREFIX+日期+序号` 停用——它泄露上架日期与批量节奏)。
+### 3.2 SQL 硬等号(sku 与 asin 直接比)—— 6 处,必改
 
-**没有序号段**:同店同产品重上(SKU_LOCKED / 删后重上)= 再抽一个码。登记簿允许
-同 (店铺, 来源类型, 来源码) 对应多个 SKU;"现役"那个 = 仍在 `walmart_items`
-且未缺席的那个,不在编码里表达。
+| 位置 | 现状 | 失效后果 | 改法 |
+|---|---|---|---|
+| `services/maintenance_intents.py:192` | `p.asin = w.sku`(amz 三 provider 共用取数) | **维护链对新品永久失明**:不改价、不清零 | 该 SQL 已 JOIN `listing_sources ls`,右边换 `ls.source_key` |
+| `services/maintenance_intents.py:202` | `l.asin = w.sku`(latest_snapshot) | 同上 | 同上 |
+| `services/maintenance_intents.py:233` | `w.sku = vo.asin`(变体偏移删除) | 永久偏移的品删不掉 | 经 `listing_sources` 反查 (store, sku) |
+| `services/maintenance_intents.py:322` | `o.asin = live.sku`(连续缺货删除) | 长期缺货删除失明 | `live` CTE 带出 source_key |
+| `workflows/product_audit.py:411` | `w.sku = p.asin`(mode=online 候选) | 在架 pass 复审候选恒空 | EXISTS 改经 `listing_sources` |
+| `refdata/schema.sql:527` 视图 `audit_listing_conflicts` | `p.asin = w.sku` | `problem_scan` 的审核来源建议归零 | 视图改 JOIN 登记簿(同步 `tests/test_problem_scan.py:301`) |
 
-## 4. 身份:登记簿升级
+范本:`maintenance_intents.py:649-654` `_SQL_MATCH_INV`(跟卖 provider)已经是
+正确写法。
 
-- `catalog.listing_sources` 加索引 `(store, source_type, source_key)`(反查用)。
-  表结构不变:它已经是「SKU → 来源」的正表,缺的只是反向索引。
-- 新积木 `services/sku_codec.py`:
-  - `mint(conn, store, source_type, source_key, workflow) -> sku`:
-    查来源字母 → 抽 11 位 → 全局查重 + INSERT 登记簿 → 撞了重抽(最多 5 次,
-    超过抛错——那说明字母表或随机源坏了,不是运气)。**抽码与登记是一个函数**,
-    不存在"抽了没登记"。
-  - `is_opaque(sku) -> bool`:形态判定(12 位、首位是登记过的来源字母、其余
-    全在字母表内),给清洗/分类用。
-  - `source_of(sku) -> str | None`:首字母反查来源类型(内部一眼看的那件事,
-    程序化的版本)。
-- `services/sku_asin` 加 `resolve(conn, store, sku)` / `resolve_many(conn, pairs)`:
-  **登记簿优先**(source_type=amz → source_key;其它来源 → None,它们本来就
-  没有 ASIN),查不到再走 `extract_asin` 模式提取(**只为存量兜底**)。
-  规则写死在 docstring:模式提取是存量的遗产,新码永远走登记簿。
-- SQL 收口(5 处):`p.asin = w.sku` → `p.asin = ls.source_key`。`_SQL_AMZ_JOIN`
-  已经 JOIN 了 `listing_sources ls … source_type='amz'`,只是比对时没用它——
-  改的是一个等号右边。变体偏移删除、连续无货删除、product_audit mode=pass 同款。
+### 3.3 按 SKU 形态倒推 ASIN —— 14 处(初稿只列 7 处)
 
-## 5. 上架链:先登记再提交
-
-`list_new` / `match_listing` 的顺序改成:**领号 → 抽码登记(mint)→ 组载荷 → 提交**。
-CLAUDE.md 铁律「防重状态先落库再调接口」在这里的落地。
-
-- 提交失败/被拒的行,登记簿里那个 SKU 留着(沃尔玛上从未存在,无害);下次
-  重上再抽一个新码。不复用——复用要先判"上次到底成没成",那是又一套状态机。
-- 载荷里 `sku` 字段、回执按 sku 找回行、UPC 池 `mark_used`、事件记录:全部
-  从 `r["asin"]` 改成 `r["_sku"]`(预备期挂到行上)。**这些点一处漏了就是**
-  「SKU 是新码、事件记的是 ASIN」这种对不上的账,所以要有测试钉住"载荷 sku
-  ≠ asin 且 = 登记簿里那个"。
-- 上架表加一列「SKU」(所有者建列,registry 登记),提交时回写——运营看到
-  ASIN 就要能看到它在沃尔玛叫什么;在线产品总表投影加「来源码」列
-  (从登记簿 JOIN),反过来看 SKU 也能对到 ASIN。
-
-## 6. 消费方收口(7 处模式提取)
-
-| 调用点 | 手里有什么 | 改法 |
+| 调用点 | 后果 | 改法 |
 |---|---|---|
-| order_lines(订单落库) | store + conn | `resolve_many` 批量,落库当场填 asin |
-| product_events.record_many | store + conn | 同上 |
-| audit_rules(同 ASIN 跨店多 PT) | cur | 改查登记簿 JOIN |
-| alloc_survey ×2 | items 含 store,cur 在手 | `resolve_many` |
-| blacklist ×2 | conn | `resolve_many` |
+| `services/order_audit.py:358-361` `judge`(**直接正则 `^B[0-9A-Z]{9}$`,不调 extract_asin,最容易漏**) | **新品每一单判"待人工",订单审核链事实停摆** | 先用 `line["asin"]`(`_PICK_SQL` 已查出),NULL 才回落 |
+| `workflows/order_audit.py:423/461-462/479/1239` | 同上,采集推不出去、钓鱼波及不展开 | 同上 |
+| `services/blacklist.py:99` `extract_asin(sku) or sku` | **黑名单键被灌随机码 ⇒ list_new 的黑名单闸拦不住** | 键取 `listing_sources.source_key`;`or sku` 兜底口径待定(§8) |
+| `services/blacklist.py:157` | 品牌收集 0 命中,每轮空转 | 同上 |
+| `services/order_lines.py:169` | `order_lines.asin` 恒 NULL ⇒ 产品分退出销量/退货率维度 | `resolve_many(conn, [(store, sku)])` 登记簿优先 |
+| `services/product_events.py:167` | 事件身份退化成随机码,同产品跨店/重上不归并 | 同上(store 可空的平台级事件保持 NULL) |
+| `services/audit_rules.py:176-181` | 实证 PT 对新品失明 | JOIN 登记簿 |
+| `services/alloc_survey.py:291 / 796` | 全落 `no_asin`,冲突判定/品牌占用失明 | `_SQL_ONLINE` LEFT JOIN 登记簿直接取 source_key |
+| `workflows/alloc_push.py:72`、`alloc_plan.py:127`、`alloc_products.py:101` | **"已在架"集合恒空 ⇒ 已上架的品被重新派工、重复上架** | 同上 |
+| `services/feed_track.py:179-190` | 违禁回执反哺黑名单写错键 | 传 source_key |
+| `workflows/product_refresh.py:58/89` `_ASIN_RE` | **推采集目标静默归零 ⇒ 维护链新鲜度源头断** | 改查登记簿 amz 行的 source_key |
+| `workflows/sources_backfill.py:46/66/90` | 新 SKU 全判 unknown;"非零即报警"语义作废 | 摘要分两桶:旧格式存量 / 新码漏登记(后者才报警) |
+| `workflows/sku_normalize.py` / `order_asin_normalize.py` | 变空转,"可解析 0 个"只增不减 | 接同一个 `resolve_many`;`_FILL_SQL` 加 store 维度 |
 
-原则:**登记簿优先、模式兜底、提不出留 NULL 绝不猜**(与 A1.5 定稿口径一致)。
-两条清洗工作流(`sku_normalize` / `order_asin_normalize`)换成同一个 `resolve_many`,
-存量行里凡是登记簿能查到的一并补齐。
+不改的(语义是"过滤非标准码",新码天然不是 ASIN,行为恰好正确):
+`order_history_import.py:167`(只导旧数据)、`pt_backfill.py:96`(旧库)、
+`brand_scrape.py:91`(输入来自 products.asin)、`asin_blacklist_import.py:57`
+(校验导入值)、`product_query.py:47`(判用户输入)。
 
-## 7. 批次
+### 3.4 上架链里以 ASIN 当 SKU 对账 —— 9 处(初稿完全没列)
 
-**批次 0|读侧就绪(零行为变化)**:codec + 反查索引 + `resolve` + 5 处 SQL 收口 +
-7 处消费方收口 + 两条清洗工作流接 `resolve_many`。存量 SKU 走的路一个字节不变
-(登记簿里存量行 source_key 就是当年按格式回填的 asin,等号右边换成它结果相同)。
-测试钉:三种存量形态经 `resolve` 结果与 `extract_asin` 逐字相同;不透明码经
-`extract_asin` 必返 None、经 `resolve` 能查到。
+| 位置 | 角色 | 失效后果 |
+|---|---|---|
+| `workflows/list_new.py:304-306` + `:1227` `_SQL_LISTED_ASINS` | **本店去重闸** | **同店同 ASIN 反复上架,烧 UPC 烧 MP_ITEM 配额,不报错** |
+| `workflows/list_new.py:662-669` + `:695` `_SQL_ATTEMPTS` | FAILED 重试上限 3 次 | 每次新码 count 恒 0 ⇒ 无限重试(→ 这是"码复用到退役"的理由之一,§5) |
+| `workflows/list_new.py:705-731` `_FAMILY_LISTED_SQL` | 变体组查同族已在架 | 变体组决策退化 |
+| `services/listing_sheet.py:542` `cache[fid].get(r["asin"])` | 回执找回行 | O/P/Q 永不回填 |
+| `services/listing_sheet.py:376-391 / 428-431` `heal_unknown` | K=Unknown 自愈 | 行永久卡 Unknown,UPC 永久占用 |
+| `services/listing_sheet.py:351-352` `_mark_upc_conflicts` | UPC 撞库标记 | 撞库的号永不标 conflict,反复领到坏号 |
+| `workflows/sku_locked_heal.py:79/102` | RETIRE 用 `r["asin"]` 当 SKU | **退役发的是 ASIN,退不到/退错** |
+| `workflows/list_new.py:259` + `listing_sheet.py:498` `mark_used(upc, r["asin"])` | UPC 池 `sku` 列 | 列名叫 SKU 实际存 ASIN(现状已如此,切换后必须定口径) |
+| `workflows/list_new.py:603/608/1053/1057` | 载荷 `sku=r["asin"]`(真跑 + check_spec 预检两条路) | 这是原点,两条路必须一起改 |
 
-**批次 1|写侧切换**:registry `SKU_SOURCE_LETTERS` 常量;`list_new` /
-`match_listing` 改「抽码登记 → 提交」;上架表「SKU」列回写;在线产品总表
-「来源码」列。切换是全店同时的(码里没有店维配置,没有"只开一家店"的开关),
-所以**试点靠 dry-run 与单品**:
-1. `list_new --dry-run` 看载荷里 `sku` 是 12 位码、首字母对得上来源、与登记簿
-   里那行一致(dry-run 不登记:预备期抽码只挂在行上,不落库);
-2. 用 `-p limit=1`(或等价的单品参数)真上 1 个品;
-3. `catalog_sync -p store=<店>` → 在线产品总表看到新 SKU 与来源码;
-4. **`maintenance_scan -p preview=1 -p store=<店>` 必须能看见这个品**——这是
-   批次 0 的 SQL 收口有没有做对的唯一实测;
-5. 该品出一单后查 `orders.order_lines.asin` 有值;
-6. 通过后放开 limit,全店按常规节奏上。
+### 3.5 飞书表
 
-**批次 2|顺手的简化(另议,不在本计划内)**:`sku_locked_heal` 目前 RETIRE →
-24h 冷却 → 清列重上同一 SKU;有了"重上 = 新码",冷却可能整个不需要。
-但 RETIRE 对锁死 offer 的处置官方无明文,按本仓纪律不按推断编码,留待实测。
+| 表 | 现状 | 要做的 |
+|---|---|---|
+| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **加 V 列「SKU」**,`columns` 末尾追加、`_COLS` 改 22、新增只写 `V{r}` 的函数;提交时回写 |
+| 订单中心-销售订单 `ORDER_SALES` | 有「SKU」无 ASIN | **加「ASIN」**:registry 常量 + `_SALES_SQL` + 投影 + 测试夹具 |
+| 订单中心-售后订单 `ORDER_RETURNS` | 有「SKU」无 ASIN;`return_lines` 表无 asin 列 | 加「ASIN」,SQL 已 LEFT JOIN order_lines,顺手 `SELECT l.asin` |
+| 在线产品总表 `ONLINE_PRODUCTS_SHEET` | 有 sku 无来源码 | 加「来源码」(登记簿 JOIN),反向可对 |
+| UPC 池表 `UPC_SHEET` E 列「SKU」 | 实存 ASIN | 定口径:E 列存真 SKU,ASIN 另列或不投影(§8) |
+| 退役表 `RETIRE_SHEET` B 列 | 运营手填 SKU | 手动通道全格式通吃不用改;但运营从"贴 ASIN"变"先查登记簿",建议读表后回显来源码 |
+| 维护记录表 `MAINT_SHEET` | 逐 SKU | 不改;建议加来源码展示列 |
+| 绩效/对账/主订单表 | 无 sku 无 asin | 不动 |
 
-## 8. 待核验 / 待所有者决定
+### 3.6 表与工作流受影响程度
 
-- [ ] 沃尔玛 SKU 字符集与上限:所有者机器上 `<DATA_ROOT>/specs/MP_ITEM/<版本>` 的
-      Orderable.sku 定义(本容器没有 spec)。
-- [ ] 上架表建「SKU」列——所有者建列后我登记常量。
-- [ ] 四个来源字母的取值(amz / 跟卖 / 1688 / 自建),从
+| 程度 | 表 | 工作流 |
+|---|---|---|
+| **高** | listing_sources(锚点)、walmart_items、product_events + 4 视图、asin_blacklist、upc_pool | list_new、maintenance_scan/maintenance、sku_locked_heal、feed_poll(回执/自愈)、sources_backfill、product_refresh、product_audit(online)、problem_scan(audit 来源)、blacklist_push/brand_scrape、alloc_push/plan/products/backfill、order_audit |
+| **中** | order_lines(asin 列)、dispositions(asin 列)、cleanup_seen_categories、ops.dedupe、claims | sku_normalize、order_asin_normalize、alloc_audit、claim_audit、risk_sync |
+| **低/无** | feed_items、return_lines、perf_events、settlement_lines、item_node_inventory、retire_cooldown | catalog_sync、daily_report、settlement_sync、returns_sync、perf_problems、order_sync、order_center_push、match_listing、product_clear、node_* |
+
+### 3.7 会失效的测试(改造时一并处理,不列全)
+
+钉住"按形态可解析"的:`test_sku_asin.py`、`test_sources_backfill.py:42`、
+`test_product_ingest.py:603`、`test_order_audit.py:1334`、`test_alloc_audit.py:91-105`、
+`test_order_asin_normalize.py`(含守门测试 `test_rules_are_not_reimplemented_here`
+——登记簿那一跳必须放在 `services/sku_asin`,不能放工作流)、`test_blacklist.py:116/177`。
+钉住 SQL 文本的:`test_problem_scan.py:301`、`test_blacklist_push.py:164`、
+`test_risk_trace.py:123`。夹具里 sku=asin 同值的:`test_list_new.py:570/689`、
+`test_sku_locked_heal.py`、`test_claims.py:372`、`test_alloc_plan.py:122`。
+
+## 4. 沃尔玛侧硬约束(仓内证据 + 待核)
+
+可确认(仓内有记载):
+- SKU_LOCKED(ERR_EXT_DATA_0101211)= SKU 绑死首次提交的 UPC;不先退役直接换
+  UPC 重发同一 SKU 必败(旧系统实证)。退役后旧 UPC 永久烧号(`burn_for_retire`)。
+- 官方 retire = `DELETE /v3/items/{sku}`"permanently retire",API 无 reactivate;
+  DELETE_ITEM"Deletions are permanent"。24h 冷却是旧系统实证,官方无明文。
+- 订单行只给 `item.sku` + `productName`,无 itemId/gtin;行身份 = sha256(PO+SKU)。
+  → **订单只能靠 SKU 对到产品**,所以登记簿反查是订单侧唯一通路。
+- `walmart_items` 身份列:sku(PK)、wpid、item_id(报表回填,默认关)、upc、gtin。
+
+仓内无记载、需所有者核(§8):SKU 是否可编辑(本计划按"不可"设计)、长度
+上限与字符集、同一 GTIN 挂两个 SKU 是否被拒、换 SKU 对 listing 历史的影响。
+
+## 5. 生成时点与生命周期(问 1 的展开)
+
+### 5.1 三个候选时点
+
+| 时点 | 那时有店铺吗 | 判断 |
+|---|---|---|
+| A. `product_ingest` 入库 | 没有 | **出局**:维度不匹配;要给几十万空壳行发码 |
+| B. `alloc_push` 派工(写上架表 A/B) | 有 | 可行但不推荐:派工与上架之间隔着审核 + 12 道闸,历史淘汰率 40%,登记簿会留大量幽灵行 |
+| C. `list_new._prep_rows` 预备期 | 有,且是"确定要发"的最后一道 | **推荐**:与现有 `_UPC_PLACEHOLDER`"预备期占位、提交期回填"同构;跟卖已经是提交前生成 |
+
+如果所有者想要的其实是"派工时运营就能在上架表看到码",B 是折中;代价是幽灵
+行(维护链同时 JOIN walmart_items,幽灵行不会产生动作,但 risk_trace 会算进
+波及面)。
+
+### 5.2 两条硬约束(调研发现,缺一条就静默出事)
+
+1. **mint 必须在 `_prep_rows`,不能在 `_one_store` 内**。`list_new` 的串行补试
+   (`store_retry.serial_second_pass`)会重跑 `_one_store`;若抽码在里面,第二
+   次抽出新码 ⇒ 载荷不再一字不差 ⇒ `feeds.payload_key` 在途防重不命中 ⇒
+   首轮已发出的片子被真的再发一次 = **双上架**。初稿 §5 写的"领号 → 抽码 →
+   组载荷 → 提交"落在 `_one_store` 内,**本版改正**:预备期抽码挂到 `r["_sku"]`,
+   `_one_store` 只回填不抽码。
+2. **同一 (店, 来源类型, 来源码) 的码复用到显式退役为止**,不是"每次重上抽新码"
+   (初稿 §3"没有序号段,重上 = 再抽一个码"**本版推翻**)。理由是三条现存护栏
+   全绑在"同一个品同一个 SKU"上:FAILED 重试上限 `_SQL_ATTEMPTS`、`payload_key`
+   防重、UPC 池 `claim` 的先复用后新领(键 (store, asin),存在理由就是 SKU 绑死
+   首个 UPC)。每次重上抽新码会让 `claim` 把旧 item 已占的 UPC 发给新 SKU ⇒
+   必撞 ERR_EXT_DATA_0101119 ⇒ 每次重上白烧一个号,而且看起来像"运气差"。
+   退役点复用现成的 `burn_for_retire` 位置:RETIRE/DELETE 成功 ⇒ 登记簿该行
+   标 `retired_at` ⇒ 下次 mint 抽新码。
+
+### 5.3 生命周期定稿
+
+```
+派工(上架表 A/B)→ 审核 → list_new 闸门 → 配额切片
+→ 预备期 mint(store, source_type, source_key):
+     登记簿有未退役行 → 复用该 SKU
+     没有 → 抽码 + 全局查重 + INSERT(同一函数,同一事务)
+→ 组载荷(sku = r["_sku"])→ 领 UPC(键仍 (store, asin))→ 提交
+→ 提交成功:写 K/L/M + V(SKU)列;事件记 sku=真码 + asin
+→ 提交失败/拒:码留着,下次重试复用(重试上限、防重、UPC 复用三条护栏照旧)
+→ RETIRE/DELETE 成功:登记簿 retired_at + burn_for_retire;下次上架抽新码
+```
+
+dry-run:**不抽真码,用占位码**(与 `_UPC_PLACEHOLDER` 同一纪律:dry-run 不写
+库;dry-run 是 AI 改完代码必跑项,频次高,抽真码 = 登记簿灌垃圾)。代价是
+dry-run 看到的 sku 不是真跑那个,与 UPC 占位的处境相同,已被接受过一次。
+默认 dry-run 不组载荷,要看 sku 字段用 `-p check_spec=1`。
+
+## 6. 身份积木
+
+- `catalog.listing_sources`:加 `retired_at timestamptz`;加索引
+  `(store, source_type, source_key) WHERE retired_at IS NULL`(反查 + 复用);
+  加全局 `sku` 索引(查重)。表结构其余不变。
+- `services/sku_codec.py`(新):
+  - `mint(conn, store, source_type, source_key, workflow) -> sku`:先查未退役
+    行复用;否则查来源字母 → 抽 11 位 → 全局查重 + INSERT → 撞了重抽(≤5)。
+    **抽码与登记同一函数**,不存在"抽了没登记"。
+  - `retire(conn, store, sku)`:标 retired_at(由 sku_locked_heal / product_clear
+    /problem_product_cleanup 的成功回执调用)。
+  - `is_opaque(sku)`、`source_of(sku)`:形态判定 / 首字母反查来源。
+  - 与现有 `listing_sources.register`(批量 DO NOTHING)的关系:register 保留
+    给 backfill 与跟卖 B 列人工号;自动抽码只走 mint。
+- `services/sku_asin.resolve(conn, store, sku)` / `resolve_many(conn, pairs)`:
+  登记簿优先(amz → source_key;其它来源 → None),查不到再 `extract_asin`
+  模式提取(**只为存量兜底**)。放在 `services/sku_asin`,守门测试
+  `test_rules_are_not_reimplemented_here` 才不会拦。
+- `upc_pool.claim` 复用键保持 (store, asin) 不动(§5.2 的结论:码复用到退役,
+  UPC 也复用到退役,两者同寿命);`mark_used` 改传真 SKU,`upc_pool.asin` 列
+  继续存 ASIN。
+
+## 7. 批次(整体计划)
+
+**批次 0|身份积木 + 读侧收口(零行为变化)**
+codec/retire/resolve + 登记簿索引与 retired_at + §3.2 六处 SQL 收口 +
+§3.3 十四处消费方收口 + §3.4 里不依赖 V 列的四处(去重闸、重试上限、变体组、
+UPC 撞库标记改按 (store, asin))+ 两条清洗工作流接 resolve_many +
+sources_backfill 摘要分桶。存量 SKU 走的路一个字节不变(登记簿里存量行的
+source_key 就是回填的 asin,等号右边换成它结果相同)。
+测试钉:三种存量形态经 `resolve` 与 `extract_asin` 逐字相同;不透明码经
+`extract_asin` 必返 None、经 `resolve` 能查到;`maintenance_scan -p preview=1`
+在切换前后意图集合相同。
+可以分两个 PR 合:0a(积木 + 维护/审核/分配 SQL)、0b(订单/事件/黑名单/
+order_audit + 飞书 ASIN 列)。
+
+**批次 1|飞书列与回执自愈链(仍零行为变化)**
+上架表 V 列「SKU」+ registry 常量 + `_COLS=22` + 单列写函数;`listing_sheet.542`
+/ `heal_unknown` / `sku_locked_heal` 改读 `r["sku"] or r["asin"]`;销售/售后
+订单表「ASIN」列;在线产品总表「来源码」列;UPC 池表 E 列口径。
+存量行 V 为空 ⇒ 回落 B 列 ⇒ 行为不变。
+
+**批次 2|写侧切换(唯一有行为变化的批次)**
+`SKU_SOURCE_LETTERS` 常量;`list_new._prep_rows` mint 挂 `r["_sku"]`,载荷/
+`mark_used`/事件/登记/V 列回写全改 `r["_sku"]`(两条路:真跑 + check_spec);
+`match_listing` 的 `make_sku` 换 mint(B 列人工优先保留);dry-run 占位码;
+退役回执处调 `codec.retire`;测试钉"载荷 sku ≠ asin 且 = 登记簿里那个"。
+切换是全店同时的(码里没有店维配置),**试点靠 dry-run + 单店单品**:
+1. `list_new --dry-run -p check_spec=1` 看载荷 sku 是占位码、其余字段正常;
+2. 挑一家店、上架表只留一行待上,真跑 1 个品(`list_new` 目前无 limit 参数,
+   要么加 `-p limit=`,要么手工只留一行);
+3. `catalog_sync -p store=<店>` → 在线产品总表看到新 SKU 与来源码;上架表 V 列有值;
+4. **`maintenance_scan -p preview=1 -p store=<店>` 必须能看见这个品**——批次 0
+   的 SQL 收口做没做对的唯一实测;
+5. 该品出一单后查 `orders.order_lines.asin` 有值、飞书销售订单表 ASIN 列有值;
+6. 对该行人为制造一次 FAILED 重试,确认复用同一 SKU、同一 UPC;
+7. 通过后全店按常规节奏上。
+
+**批次 3|另议,不在本计划内**
+- `sku_locked_heal` 简化:有了"退役 ⇒ 新码",24h 冷却可能不需要;官方无明文,
+  留待实测。
+- 存量在线产品迁移(若所有者坚持):按店分批"退役 + 新码重上",另立计划;
+  代价见 §1 问 3。
+
+## 8. 待所有者决定 / 核验
+
+- [ ] **生成时点**:C(list_new 预备期,推荐)还是 B(alloc_push 派工时,运营
+      更早看到码,代价是幽灵行)。
+- [ ] **码的寿命**:复用到显式退役(推荐,§5.2)。若坚持"每次重上新码",
+      须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
+- [ ] **存量产品**:不迁、永久双轨(推荐);还是另立"退役 + 重上"迁移计划。
+- [ ] **沃尔玛 SKU 规格**:Seller Center 或本地 `<DATA_ROOT>/specs/MP_ITEM/<版本>`
+      的 Orderable.sku 定义:是否可编辑、长度上限、字符集。
+- [ ] **飞书建列**(所有者建,我登记常量):上架表 V「SKU」;销售订单「ASIN」;
+      售后订单「ASIN」;在线产品总表「来源码」。建之前用 `list_fields` 确认
+      表里没有同名人工列(有的话程序一登记就开始覆盖它)。
+- [ ] **UPC 池表 E 列「SKU」口径**:改存真 SKU(ASIN 另列)还是保持现状。
+- [ ] **四个来源字母**取值(amz / 跟卖 / 1688 / 自建),从
       `23456789ABCDEFGHJKMNPQRSTVWXYZ` 里挑、互不相同、建议不助记。
-- [ ] 跟卖旧续号规则停用是否影响运营现有习惯(B 列人工优先不变)。
+- [ ] **黑名单 `or sku` 兜底口径**:订单链是"提不出留 NULL",黑名单链是"原文
+      兜底"。切换后原文兜底 = 往黑名单灌随机码;建议统一到"登记簿查不到就
+      不入选",但这会改变拦截行为,要你拍板。
+- [ ] **跟卖旧续号**(`PHUMWMT+日期+序号`)停用是否影响运营习惯(B 列人工优先不变)。
+- [ ] **退役表 B 列**:运营从此填的是随机码,是否要程序回显来源码。

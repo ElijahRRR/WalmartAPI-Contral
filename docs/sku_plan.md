@@ -120,23 +120,24 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
 范本:`maintenance_intents.py:649-654` `_SQL_MATCH_INV`(跟卖 provider)已经是
 正确写法。
 
-### 3.3 按 SKU 形态倒推 ASIN —— 14 处(初稿只列 7 处)
+### 3.3 按 SKU 形态倒推 ASIN —— 15 处(初稿只列 7 处;第 15 处 `_LATEST_CTE` 是 0b 执行时补的)
 
 | 调用点 | 后果 | 改法 |
 |---|---|---|
-| `services/order_audit.py:358-361` `judge`(**直接正则 `^B[0-9A-Z]{9}$`,不调 extract_asin,最容易漏**) | **新品每一单判"待人工",订单审核链事实停摆** | 先用 `line["asin"]`(`_PICK_SQL` 已查出),NULL 才回落 |
-| `workflows/order_audit.py:423/461-462/479/1239` | 同上,采集推不出去、钓鱼波及不展开 | 同上 |
-| `services/blacklist.py:99` `extract_asin(sku) or sku` | **黑名单键被灌随机码 ⇒ list_new 的黑名单闸拦不住** | 键取 `listing_sources.source_key`;`or sku` 兜底口径待定(§8) |
-| `services/blacklist.py:157` | 品牌收集 0 命中,每轮空转 | 同上 |
-| `services/order_lines.py:169` | `order_lines.asin` 恒 NULL ⇒ 产品分退出销量/退货率维度 | `resolve_many(conn, [(store, sku)])` 登记簿优先 |
-| `services/product_events.py:167` | 事件身份退化成随机码,同产品跨店/重上不归并 | 同上(store 可空的平台级事件保持 NULL) |
+| `services/order_audit.py:358-361` `judge`(**直接正则 `^B[0-9A-Z]{9}$`,不调 extract_asin,最容易漏**) | **新品每一单判"待人工",订单审核链事实停摆** | 收口成 `services/order_audit.line_asin`(asin 列优先、形态兜底),judge 与工作流四处共用【0b 已闭合】|
+| `workflows/order_audit.py:423/461-462/479/1239` | 同上,采集推不出去、钓鱼波及不展开 | 同上(含 `_phish_record`)【0b 已闭合】|
+| `services/blacklist.py:99` `extract_asin(sku) or sku` | **黑名单键被灌随机码 ⇒ list_new 的黑名单闸拦不住** | 键取 `listing_sources.source_key`;`or sku` 原文兜底保留但加日志计数(D-0b-1)【0b 已闭合】|
+| `services/blacklist.py:157` | 品牌收集 0 命中,每轮空转 | 同上【0b 已闭合】|
+| `services/blacklist.py:205-215` `_LATEST_CTE`(回填/重建侧取键) | ASIN 黑名单被整表重灌成随机码键,拦不住任何东西 | 经登记簿 LEFT JOIN 取 `coalesce(ls.source_key, e.asin, e.sku)`【0b 已闭合,见工作包 0b-14】|
+| `services/order_lines.py:169` | `order_lines.asin` 恒 NULL ⇒ 产品分退出销量/退货率维度 | 落库当场由 `upsert_order_lines._fill_asins` 每批一条 SELECT 经登记簿补【0b 已闭合】|
+| `services/product_events.py:167` | 事件身份退化成随机码,同产品跨店/重上不归并 | 同上;store 为空的平台级事件保持形态提取(D-0b-7)【0b 已闭合】|
 | `services/audit_rules.py:176-181` | 实证 PT 对新品失明 | JOIN 登记簿 |
 | `services/alloc_survey.py:291 / 796` | 全落 `no_asin`,冲突判定/品牌占用失明 | `_SQL_ONLINE` LEFT JOIN 登记簿直接取 source_key |
 | `workflows/alloc_push.py:72`、`alloc_plan.py:127`、`alloc_products.py:101` | **"已在架"集合恒空 ⇒ 已上架的品被重新派工、重复上架** | 同上 |
-| `services/feed_track.py:179-190` | 违禁回执反哺黑名单写错键 | 传 source_key |
+| `services/feed_track.py:179-190` | 违禁回执反哺黑名单写错键 | 传 source_key(键的推导在 blacklist 侧)【0b 已闭合】|
 | `workflows/product_refresh.py:58/89` `_ASIN_RE` | **推采集目标静默归零 ⇒ 维护链新鲜度源头断** | 改查登记簿 amz 行的 source_key |
-| `workflows/sources_backfill.py:46/66/90` | 新 SKU 全判 unknown;"非零即报警"语义作废 | 摘要分两桶:旧格式存量 / 新码漏登记(后者才报警) |
-| `workflows/sku_normalize.py` / `order_asin_normalize.py` | 变空转,"可解析 0 个"只增不减 | 接同一个 `resolve_many`;`_FILL_SQL` 加 store 维度 |
+| `workflows/sources_backfill.py:46/66/90` | 新 SKU 全判 unknown;"非零即报警"语义作废 | 摘要分三桶:amz / 旧格式存量 / 新码漏登记(后者才报警,不透明码判据调 `sku_codec.is_opaque`)【0b 已闭合】|
+| `workflows/sku_normalize.py` / `order_asin_normalize.py` | 变空转,"可解析 0 个"只增不减 | 两条共用 `sku_asin.resolve_pairs`(带 store,倒查两级);`_DISTINCT_SQL`/`_FILL_SQL` 加 store 维度【0b 已闭合】|
 
 不改的(语义是"过滤非标准码",新码天然不是 ASIN,行为恰好正确):
 `order_history_import.py:167`(只导旧数据)、`pt_backfill.py:96`(旧库)、
@@ -443,16 +444,39 @@ source_key 就是回填的 asin,等号右边换成它结果相同)。
 测试钉:三种存量形态经 `resolve` 与 `extract_asin` 逐字相同;不透明码经
 `extract_asin` 必返 None、经 `resolve` 能查到;`maintenance_scan -p preview=1`
 在切换前后意图集合相同。
-可以分两个 PR 合:0a(积木 + 维护/审核/分配 SQL)、0b(订单/事件/黑名单/
-order_audit + 飞书 ASIN 列)。
+> **批次 0b:已实现。** 工作包 `docs/sku_workplan/batch_0b.md`,两个 PR:
+> · **PR-0b-1「订单/事件/黑名单/审核链收口」**(items 0b-01~0b-23)—— commit
+>   `153741c`。订单行落库当场补 asin(`upsert_order_lines._fill_asins`)、
+>   `product_events.record_many` 带 store 走登记簿、黑名单实时侧
+>   (`record_asins`/`collect_brands`)与**回填/重建侧 `_LATEST_CTE`**(原表漏列的
+>   第 15 处,见 §3.3)身份键经登记簿、`feed_track` 传 source_key、
+>   两条清洗工作流接 `resolve_pairs`、`sources_backfill` 三桶分类、守门七条。
+> · **PR-0b-2「飞书列接线 + 文档」**(items 0b-24~0b-31)—— registry 三处列常量
+>   (销售/售后订单「来源码」、在线产品总表第 17 列 `source_key`)、
+>   `order_center` 两条 SQL 与两处载荷、`walmart_catalog._PROJECTION_SQL`
+>   LEFT JOIN 登记簿。**所有者先建列、代码后合**(D-0b-4),窗口期为零。
+>   ⚠ **验收预告**:加列 ⇒ 行指纹全变 ⇒ 合并后**第一次** order_center push 会把
+>   90 天窗口(销售 + 售后各一次)全量重推一遍,这是**一次性的,不是故障**;
+>   第二次跑必须回到「跳过 N」。在线产品总表同理,但所有者须先把该工作表列数
+>   扩到 ≥17,否则 catalog_sync 撞 90204 拖累 product_chain 整链。
+>
+> **本工作包新增/撤回的三件事**:新增积木 `services/sku_asin.resolve_pairs`
+> (两条清洗工作流共用的批量入口,带 store、倒查两级)与
+> `services/order_audit.line_asin`(订单链取 ASIN 的唯一出处,四个调用点共用);
+> **撤回**「0b 自建不透明码形态判据」—— 字母表唯一之家是 `services/sku_codec`,
+> 守门测试唯一之家是 `tests/test_sku_guard.py`。
+> **本批唯一的判定口径变化**(D-0b-2):`order_audit.judge` 改读 `line_asin` 后,
+> 存量三段式 / 纯数字 item_id 形态的订单行从「待人工、不推采集」转入正常判定链。
+
 **波及面一次做完(所有者 2026-09-02):** §3 全部条目在批次 0/1 内闭合,不留
 "切换后再补";并加一条守门测试:`extract_asin` 的调用点与 `= w.sku`/`= sku`
 形态的 SQL 硬等号只允许出现在白名单文件里,新增即红——防止切换后又长出新洞。
 
 **批次 1|飞书列与回执自愈链(仍零行为变化)**
 上架表 V 列「SKU」+ registry 常量 + `_COLS=22` + 单列写函数;`listing_sheet.542`
-/ `heal_unknown` / `sku_locked_heal` 改读 `r["sku"] or r["asin"]`;销售/售后
-订单表「ASIN」列;在线产品总表「来源码」列;UPC 池表 E 列口径。
+/ `heal_unknown` / `sku_locked_heal` 改读 `r["sku"] or r["asin"]`;UPC 池表 E 列口径。
+(销售/售后订单表与在线产品总表的「来源码」列**已随批次 0b 的第二个 PR 落地**,
+不在批次 1 范围内。)
 存量行 V 为空 ⇒ 回落 B 列 ⇒ 行为不变。
 
 **批次 2|写侧切换(唯一有行为变化的批次)**
@@ -469,7 +493,7 @@ order_audit + 飞书 ASIN 列)。
 3. `catalog_sync -p store=<店>` → 在线产品总表看到新 SKU 与来源码;上架表 V 列有值;
 4. **`maintenance_scan -p preview=1 -p store=<店>` 必须能看见这个品**——批次 0
    的 SQL 收口做没做对的唯一实测;
-5. 该品出一单后查 `orders.order_lines.asin` 有值、飞书销售订单表 ASIN 列有值;
+5. 该品出一单后查 `orders.order_lines.asin` 有值、飞书销售订单表「来源码」列有值;
 6. 对该行人为制造一次 FAILED 重试,确认复用同一 SKU、同一 UPC;
 7. 通过后全店按常规节奏上。
 
@@ -531,10 +555,13 @@ order_line_id"的体检告警兜住。
 - [ ] **沃尔玛 SKU 规格**:本地 spec Orderable.sku 的长度上限、字符集。
 - [x] **飞书建列**(所有者 2026-09-02 已建):上架表 R「SKU」;销售订单「来源码」;
       售后订单「来源码」;在线产品总表 Q「来源码」。统一叫「来源码」。
+      【0b:代码分第二个 PR,建完列再合 —— 建列前程序载荷里没有这一列,
+      零 WARNING 零重推;合并后第一次 push 全量重推一次是预告不是故障】
 - [ ] **UPC 池表 E 列「SKU」口径**:改存真 SKU(ASIN 另列)还是保持现状。
 - [x] **四个来源字母**(所有者 2026-09-02):amz=A、跟卖 match=B、1688=C、自建 self=H。
 - [ ] **黑名单 `or sku` 兜底口径**:订单链是"提不出留 NULL",黑名单链是"原文
       兜底"。切换后原文兜底 = 往黑名单灌随机码;建议统一到"登记簿查不到就
       不入选",但这会改变拦截行为,要你拍板。
+      【0b 默认:保持原文兜底,加日志计数 + 回填侧 `opaque` 只读计数;见 D-0b-1】
 - [ ] **跟卖旧续号**(`PHUMWMT+日期+序号`)停用是否影响运营习惯(B 列人工优先不变)。
 - [ ] **退役表 B 列**:运营从此填的是随机码,是否要程序回显来源码。

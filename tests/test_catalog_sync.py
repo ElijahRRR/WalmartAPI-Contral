@@ -266,9 +266,10 @@ class _FakeCursor:
             self.rows = [("S1",), ("S2",)]
         elif "SELECT sku, published_status" in sql:
             self.rows = []
-        elif "catalog.listing_sources" in sql:
+        elif "catalog.listing_sources" in sql and "catalog.walmart_items w" not in sql:
             # record_many 的登记簿反查(批次 0b):这个夹具里没有登记行,
-            # 不清空的话上一条 RETURNING 的行会被当成登记簿结果喂回去
+            # 不清空的话上一条 RETURNING 的行会被当成登记簿结果喂回去。
+            # ⚠ 排除投影 SQL —— 它也 JOIN 登记簿,但要的是构造函数给的夹具行
             self.rows = []
 
     def executemany(self, sql, seq):
@@ -315,12 +316,19 @@ def test_projection_rows_cell_conversion():
     from decimal import Decimal
     conn = _FakeConn(rows=[("T1", "A", None, "00123", None, "P", None, None,
                             Decimal("9.90"), "USD", 4, "PUBLISHED", "ACTIVE", "",
-                            datetime(2026, 8, 5, 1, 2, 3), None)])
+                            datetime(2026, 8, 5, 1, 2, 3), None, "B0AAAAAAA1")])
     rows = walmart_catalog.projection_rows(conn)
     assert rows[0][3] == "00123"                      # 前导零保住
     assert rows[0][8] == pytest.approx(9.9)           # Decimal → float
     assert rows[0][14] == "2026-08-05 01:02:03"       # 时间格式化
     assert rows[0][2] == "" and rows[0][15] == ""     # None → 空串
+    assert rows[0][16] == "B0AAAAAAA1"                # 末列 source_key(来源码)
+
+    # 未登记的在架行:LEFT JOIN 取空,_cell 转空串(不是漏行、也不是 None)
+    conn2 = _FakeConn(rows=[("T1", "A", None, None, None, None, None, None,
+                             None, None, None, None, None, None, None, None,
+                             None)])
+    assert walmart_catalog.projection_rows(conn2)[0][16] == ""
 
 
 def test_item_id_backfill_helpers():
@@ -373,7 +381,28 @@ def test_mark_missing_clears_status_columns():
 
 def test_projection_excludes_missing_rows():
     # 飞书「在线产品总表」只写在架商品,缺席行不进表
-    assert "WHERE missing_since IS NULL" in walmart_catalog._PROJECTION_SQL
+    assert "WHERE w.missing_since IS NULL" in walmart_catalog._PROJECTION_SQL
+
+
+def test_projection_left_joins_the_registry():
+    """钉的是:末列 source_key 走 LEFT JOIN 登记簿,且不带 abandoned_at 条件。
+
+    改成 INNER JOIN,未登记的在架行会静默从飞书表里消失(表变短不报错);
+    加 abandoned_at 条件,已弃码却还在架的僵尸行会看不见 —— 那正是要看的行。
+    """
+    sql = walmart_catalog._PROJECTION_SQL
+    assert "LEFT JOIN catalog.listing_sources ls" in sql
+    assert "ls.store = w.store AND ls.sku = w.sku" in sql
+    assert "abandoned_at" not in sql
+    # 不限 source_type:amz=ASIN、match=匹配 GTIN,展示都要
+    assert "source_type" not in sql
+
+
+def test_online_sheet_last_column_is_source_key():
+    """钉的是:来源码只准**追加在末尾**(电子表格按 range 坐标写,插中间全体错位)。"""
+    from registry import resources
+    assert resources.ONLINE_PRODUCTS_SHEET.columns[-1] == "source_key"
+    assert len(resources.ONLINE_PRODUCTS_SHEET.columns) == 17     # A~Q
 
 
 def test_projection_columns_match_registry():

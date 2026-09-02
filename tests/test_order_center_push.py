@@ -11,6 +11,7 @@ from services import order_center as ocp
 from workflows import order_center_push as ocw
 
 F_SALES = resources.ORDER_SALES.fields
+F_RETURNS = resources.ORDER_RETURNS.fields
 F_PERF = resources.ORDER_PERF.fields
 F_SETTLE = resources.ORDER_SETTLE.fields
 
@@ -48,7 +49,8 @@ def _capture_sync(monkeypatch):
 
 _SALES_ROW = {
     "order_line_id": "ol_abc", "store": "T1", "po_id": "PO1",
-    "line_number": "1", "sku": "SKU1", "product_name": "商品", "qty": 2,
+    "line_number": "1", "sku": "SKU1", "asin": "B0AAAAAAA1",
+    "product_name": "商品", "qty": 2,
     "sale_status": "Shipped", "audit_status": None,
     "status_date": datetime(2026, 8, 1, 3, 0, tzinfo=timezone.utc),
     "order_date": datetime(2026, 8, 1, 3, 0, tzinfo=timezone.utc),
@@ -75,6 +77,8 @@ def test_push_sales_row_shape_and_no_delete(monkeypatch):
     assert d[F_SALES.order_date] == int(_SALES_ROW["order_date"].timestamp() * 1000)
     assert d[F_SALES.product_amount] == 19.99
     assert d[F_SALES.pulled_at] == int(_SALES_ROW["updated_at"].timestamp() * 1000)
+    # 来源码列(0b-24/25/26):值 = order_lines.asin,列名从 registry 取
+    assert d[F_SALES.source_key] == "B0AAAAAAA1"
     # None 字段必须保留在载荷里(省略=飞书保留旧值,送 null 才是清空)
     assert F_SALES.cancel_reason in d and d[F_SALES.cancel_reason] is None
     # 人工/采集列(脚本审核、亚马逊单价、主订单表…)绝不出现在载荷里
@@ -88,7 +92,8 @@ def test_push_returns_key_is_rma_plus_line(monkeypatch):
         "refund_status", "return_method", "refund_mode", "is_keep_it",
         "refund_total", "return_reason", "return_comment", "return_by",
         "return_created", "last_modified", "customer_name", "customer_email",
-        "qty", "refunded_qty", "carrier", "tracking_no", "order_date")}
+        "qty", "refunded_qty", "carrier", "tracking_no", "order_date",
+        "asin")}
     row.update({"return_order_id": "RMA1", "order_line_id": "ol_x",
                 "store": "T1", "po_id": "PO1"})
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
@@ -98,6 +103,72 @@ def test_push_returns_key_is_rma_plus_line(monkeypatch):
     assert cap["key_field"] == "唯一键"
     assert set(cap["desired"]) == {"RMA1|ol_x"}
     assert cap["desired"]["RMA1|ol_x"]["order_line_id"] == "ol_x"
+    # 借来的 asin 为 NULL 时也必须留在载荷里(省略=飞书保留旧值)
+    assert F_RETURNS.source_key in cap["desired"]["RMA1|ol_x"]
+    assert cap["desired"]["RMA1|ol_x"][F_RETURNS.source_key] is None
+
+
+def test_sales_registry_has_asin_field():
+    """钉的是:销售订单的来源码列名只在 registry 出生(飞书列名「来源码」)。"""
+    assert F_SALES.source_key == "来源码"
+
+
+def test_returns_registry_has_asin_field():
+    """钉的是:售后订单同一列同一个名字 —— 两表列名漂了,运营对不上账。"""
+    assert F_RETURNS.source_key == "来源码"
+
+
+def test_sales_sql_selects_asin():
+    # 载荷里的来源码来自 order_lines.asin(不在 SQL 里取 = 载荷永远 KeyError)
+    assert "line_number, sku, asin, product_name" in ocp._SALES_SQL
+
+
+def test_returns_sql_borrows_asin_from_order_lines():
+    """钉的是:售后表的 asin 从 order_lines 借,且那一跳必须是 LEFT JOIN。
+
+    改成 INNER JOIN 会静默丢掉「订单行滚出窗口/孤儿退货」的售后行 ——
+    行数变少不报错,飞书那边只是"这几单不见了"。
+    """
+    assert "l.order_date, l.asin" in ocp._RETURNS_SQL
+    assert "LEFT JOIN orders.order_lines l USING (order_line_id)" in ocp._RETURNS_SQL
+    # return_lines 自己不加 asin 列(D-0b-6:两份真值会飘)
+    assert "r.asin" not in ocp._RETURNS_SQL
+
+
+def test_asin_is_sent_even_when_null(monkeypatch):
+    """钉的是:asin 为 NULL 时那一格也要送 null(清空),不是省略。
+
+    省略 = 飞书保留旧值 ⇒ 订单行滚出窗口后,售后行会永远留着一个过时的来源码。
+    """
+    captured = _capture_sync(monkeypatch)
+    row = dict(_SALES_ROW, asin=None)
+    monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
+
+    ocp.push_sales(90)
+    d = captured["订单中心-销售订单"]["desired"]["ol_abc"]
+    assert F_SALES.source_key in d and d[F_SALES.source_key] is None
+
+
+def test_missing_asin_column_is_skipped_not_written(monkeypatch):
+    """钉的是:飞书表里没有「来源码」列时整列跳过、指纹与不含它时一致。
+
+    这是"建列前零重推"的机器证明:_adapt_rows 丢掉表里没有的列,
+    而指纹是在 _adapt_rows **之后**算的 ⇒ 没建列的表一行都不会被重推。
+    """
+    monkeypatch.setattr(feishu, "create_field", lambda table, name, ftype=1: None)
+    monkeypatch.setattr(feishu, "list_fields", lambda table: [
+        {"field_name": F_SALES.key, "type": 1},
+        {"field_name": F_SALES.sku, "type": 1},
+        {"field_name": ocp._HASH_FIELD, "type": 1},
+    ])
+    with_asin = {"k1": {F_SALES.key: "k1", F_SALES.sku: "SKU1",
+                        F_SALES.source_key: "B0AAAAAAA1"}}
+    without = {"k1": {F_SALES.key: "k1", F_SALES.sku: "SKU1"}}
+    a = ocp._adapt_rows(resources.ORDER_SALES, with_asin)["k1"]
+    b = ocp._adapt_rows(resources.ORDER_SALES, without)["k1"]
+    assert F_SALES.source_key not in a and a == b
+    assert feishu._row_hash(a, ocp._HASH_FIELD) == \
+        feishu._row_hash(b, ocp._HASH_FIELD)
 
 
 def test_push_perf_shaping(monkeypatch):

@@ -325,10 +325,19 @@ CREATE TABLE catalog.product_events (
     sku text NOT NULL,              -- 沃尔玛侧订货号**原文**(2026-08-11 推翻
                                     -- 旧约定 sku=asin:三段式订货号/纯数字
                                     -- item id 实证)
-    asin text,                      -- 产品源头侧标准码,record_many 按
-                                    -- services/sku_asin 规则自动清洗;提不出
+    asin text,                      -- 产品源头侧标准码,record_many 补填:
+                                    -- **带 store 的走 catalog.listing_sources
+                                    -- 反查(切码后唯一通路)**;store 为空的
+                                    -- **平台级事件**按 services/sku_asin 形态
+                                    -- 提取(四个来源:product_ingest /
+                                    -- audit_store.event_row / product_audit
+                                    -- 补采 / audit_history_fold 直插 SQL,绕过
+                                    -- record_many、asin 列直填)。两条都提不出
                                     -- 存 NULL,消费方 coalesce(asin, sku);
-                                    -- 存量补洗走 sku_normalize 工作流
+                                    -- 存量补洗走 sku_normalize 工作流(其
+                                    -- _FILL_SQL 带 store 维度,并用
+                                    -- IS NOT DISTINCT FROM 兼容 store=NULL 的
+                                    -- 平台级行)
     store text,                     -- 平台级事件可空
     event text NOT NULL,            -- 事件码唯一出处 services/product_events.py:
 事件码唯一出处 = `services/product_events.py` 的常量与 `EVENTS` 集合(`record_many` 对未登记码抛错);本文档不再复述清单——三处清单曾各漂各的,`maintenance_submitted`/`problem_categorized` 发了大半个月没登记就是这么漏的。
@@ -452,7 +461,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 
 | 表 | 主键 | 内容 | 写入者 |
 |---|---|---|---|
-| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流。**`asin`**(A1.5,2026-08-15):源头 ASIN,由 `order_asin_normalize` 按 `services/sku_asin` 补填,**提不出留 NULL**;分配引擎的产品/品牌销量维度按 `asin IS NOT NULL` 过滤,**不许拿 sku 原文当 asin** | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 + order_asin_normalize 补 asin |
+| `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流。**`asin`**(A1.5,2026-08-15):源头 ASIN,由 `order_lines.upsert_order_lines` 落库当场经登记簿反查补填(`_fill_asins`,每批一条 SELECT);**纯数字 item_id 形态**由 `order_asin_normalize` 扫尾(那一跳要按 (店, item_id) 查 walmart_items,写入路径上做不了,且带一级按 item_id 全局兜底的反查);**提不出留 NULL**,不许拿 sku 原文当 asin;分配引擎的产品/品牌销量维度按 `asin IS NOT NULL` 过滤,**不许拿 sku 原文当 asin** | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 + order_asin_normalize 补 asin |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
 | `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric))(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键,与 schema.sql 注释一致) | `perf_problems`(2026-08-08 从 daily_report 摘出独立成流,已落地;写库经 services/order_lines) |
 | `ops.store_settlements` | (store, report_date) | **结算账期台账**(2026-08-31):一个账期一行,存该期 PaymentSummary 的 Total Payable。**累计回款 = SUM(total_payable)**。⚠ 不能用 `settlement_lines` 求和代替(它按订单行聚合、过滤掉订单不在库的行、不含账期级费用);也不能按天求和 `store_kpi_daily.payout`(那是"当前待打款"快照,打款前天天出现 ⇒ 同一笔重复计)。另一半价值:沃尔玛的 `availableReconFiles` 只保留有限期,落库之后就永远留着 —— 这份累计随运行时间**越来越完整** | 结算同步 |
@@ -719,6 +728,11 @@ CREATE TABLE ops.audit_scrape (     -- 订单审核的按邮编采集台账(一�
 ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统一)。
 写入方 problem_scan 尾段(2026-08-14 批次 E 前是 problem_product_cleanup) + asin_blacklist_import(一次性);
 消费方:上架拦截 + 审核 Phase0 ASIN 闸(全表,不分类别)。
+
+**键的推导**(2026-09-02):实时侧 `blacklist.record_asins`、回填/重建侧
+`blacklist._LATEST_CTE`,**两条都经 `catalog.listing_sources`(source_type='amz')
+反查 `source_key`**,查不到回落 `product_events.asin` / 订货号原文并告警计数
+(原文兜底口径见 sku_workplan batch_0b D-0b-1)。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
 

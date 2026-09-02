@@ -48,7 +48,7 @@ from services import kpi, order_lines
 logger = logging.getLogger("services.order_center")
 
 _SALES_SQL = """
-SELECT order_line_id, store, po_id, line_number, sku, product_name, qty,
+SELECT order_line_id, store, po_id, line_number, sku, asin, product_name, qty,
        sale_status, audit_status, status_date, order_date, est_ship_date,
        est_delivery_date, product_amount, shipping_amount, cancel_reason,
        refund_amount, refund_comments, carrier, tracking_no, tracking_url,
@@ -63,13 +63,15 @@ WHERE order_date >= now() - make_interval(days => %s)
   AND source IS DISTINCT FROM %s
 """
 
+# asin 从 order_lines 借(return_lines 没这一列;订单行滚出库或孤儿退货时为
+# NULL,飞书那格空着 —— 不猜)
 _RETURNS_SQL = """
 SELECT r.return_order_id, r.order_line_id, r.store, r.po_id, r.line_number,
        r.customer_order_id, r.sku, r.return_status, r.refund_status,
        r.return_method, r.refund_mode, r.is_keep_it, r.refund_total,
        r.return_reason, r.return_comment, r.return_by, r.return_created,
        r.last_modified, r.customer_name, r.customer_email, r.qty,
-       r.refunded_qty, r.carrier, r.tracking_no, l.order_date
+       r.refunded_qty, r.carrier, r.tracking_no, l.order_date, l.asin
 FROM orders.return_lines r
 LEFT JOIN orders.order_lines l USING (order_line_id)
 WHERE r.return_created >= now() - make_interval(days => %s)
@@ -368,6 +370,7 @@ def push_sales(days: int, reconcile: bool = False) -> tuple[str, set[str]]:
             f.key: r["order_line_id"], f.order_date: _cell(r["order_date"]),
             f.store: r["store"], f.po_id: r["po_id"],
             f.line_number: r["line_number"], f.sku: r["sku"],
+            f.source_key: r["asin"],
             f.product_name: r["product_name"], f.qty: _cell(r["qty"]),
             f.sale_status: r["sale_status"], f.audit_status: r["audit_status"],
             f.status_date: _cell(r["status_date"]),
@@ -402,7 +405,8 @@ def push_returns(days: int, reconcile: bool = False) -> str:
             f.rma: r["return_order_id"],
             f.customer_order_id: r["customer_order_id"],
             f.po_id: r["po_id"], f.line_number: r["line_number"],
-            f.sku: r["sku"], f.return_status: r["return_status"],
+            f.sku: r["sku"], f.source_key: r["asin"],
+            f.return_status: r["return_status"],
             f.refund_status: r["refund_status"],
             f.return_method: r["return_method"],
             f.refund_mode: r["refund_mode"],

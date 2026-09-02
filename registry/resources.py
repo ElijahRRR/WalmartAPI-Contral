@@ -267,6 +267,9 @@ class Spreadsheet:
 # 在线产品总表(新):catalog_sync 写,PG 权威、此表是人看的投影,可随时整表重建。
 # 行数约 13 万,超 bitable 5 万行套餐上限,故用电子表格。
 # 列序 = catalog.walmart_items 的字段序,改列序必须两处同步。
+# 2026-09-02 起末尾多一个投影列 source_key(catalog.listing_sources.source_key,
+# LEFT JOIN 取,未登记行空),它不是 walmart_items 的字段;人读名「来源码」。
+# 追加在末尾是硬要求 —— 电子表格按 range 坐标写,插中间全体错位。
 ONLINE_PRODUCTS_SHEET = Spreadsheet(
     name="在线产品总表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
@@ -276,7 +279,8 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
     columns=("store", "sku", "itemId", "upc", "gtin", "productName", "shelf",
              "productType", "variantGroupId", "variantGroupInfo",
              "price", "currency", "availToSellQty",
-             "publishedStatus", "lifecycleStatus", "unpublishedReasons"),
+             "publishedStatus", "lifecycleStatus", "unpublishedReasons",
+             "source_key"),
 )
 
 
@@ -312,6 +316,10 @@ ORDER_SALES = Bitable(
     fields=_fields(
         key="order_line_id", order_date="下单时间", store="店铺",
         po_id="采购订单号", line_number="行号", sku="SKU",
+        # source_key=源头标准码(飞书列名「来源码」),orders.order_lines.asin 投影
+        # (登记簿反查后新旧码都有值);列由所有者建(2026-09-02 已建),
+        # 建列前本条目不许进载荷(见 sku_workplan batch_0b D-0b-4)
+        source_key="来源码",
         product_name="商品名称", qty="数量", sale_status="销售状态",
         audit_status="审核状态", status_date="状态更新时间",
         est_ship_date="预计发货时间", est_delivery_date="预计送达时间",
@@ -351,6 +359,10 @@ ORDER_RETURNS = Bitable(
         key="唯一键", order_line_id="order_line_id", order_date="下单时间",
         store="店铺", rma="RMA号", customer_order_id="客户订单ID",
         po_id="采购订单号", line_number="行号", sku="SKU",
+        # source_key=源头标准码(飞书列名「来源码」),从 orders.order_lines 借
+        # (return_lines 没这一列;登记簿反查后新旧码都有值);列由所有者建
+        # (2026-09-02 已建),建列前本条目不许进载荷(见 batch_0b D-0b-4/D-0b-6)
+        source_key="来源码",
         return_status="售后状态", refund_status="退款状态",
         return_method="退货方式", refund_mode="退款方式",
         refund_total="总退款金额", return_reason="退货原因",

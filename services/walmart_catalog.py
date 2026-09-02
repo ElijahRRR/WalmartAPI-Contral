@@ -137,14 +137,18 @@ def mark_missing(conn, store_name: str, run_at) -> int:
 
 
 _PROJECTION_SQL = """
-SELECT store, sku, item_id, upc, gtin, product_name, shelf, product_type,
-       variant_group_id, variant_group_info::text,
-       price, currency, avail_qty, published_status, lifecycle_status,
-       unpublished_reasons
-FROM catalog.walmart_items
-WHERE missing_since IS NULL
-ORDER BY store, sku
+SELECT w.store, w.sku, w.item_id, w.upc, w.gtin, w.product_name, w.shelf,
+       w.product_type, w.variant_group_id, w.variant_group_info::text,
+       w.price, w.currency, w.avail_qty, w.published_status, w.lifecycle_status,
+       w.unpublished_reasons, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls ON ls.store = w.store AND ls.sku = w.sku
+WHERE w.missing_since IS NULL
+ORDER BY w.store, w.sku
 """  # 列序与 registry.resources.ONLINE_PRODUCTS_SHEET.columns 一一对应,改必同步
+# 最后一列 source_key 来自登记簿 LEFT JOIN(不限 source_type:amz=ASIN、
+# match=匹配 GTIN),未登记行为空;LEFT JOIN 是硬要求 —— 未登记的在架行照样
+# 要进表。**不加 abandoned_at 条件**:投影是展示,已弃码的在架僵尸行更要看得见
 # (wpid 不投影:用户明确不需要;PG 仍保留该列供 API 场景用)
 # 缺席行不投影、last_seen_at/missing_since 两列不投影(所有者定稿 2026-08-07):
 # 飞书表只展示在架商品;追踪与历史在 PG(两列仍是缺席标记/删除核验的依据)+ 事件账本

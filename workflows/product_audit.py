@@ -137,13 +137,26 @@ _PERSIST_BATCH = 200
 # `services/audit_rules.PRODUCT_ROW_COLUMNS/_FROM` —— 回放工作流
 # `audit_replay` 吃同一份(2026-09-02 B2)。这里只拼本链特有的
 # WHERE / ORDER BY / LIMIT。
-_CANDIDATE_SQL = ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
-                  + audit_rules.PRODUCT_ROW_FROM + """
+_CANDIDATE_TAIL = """
 WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
   AND p.title IS NOT NULL AND p.title <> ''
 ORDER BY p.audited_at NULLS FIRST, p.updated_at
 LIMIT %(limit)s
-""")
+"""
+
+
+def _candidate_sql(where: str, recent_guard: str) -> str:
+    """输入:候选谓词 + 复烧护栏 → 输出:完整候选 SQL。
+
+    ⚠ **只 `format` 尾段**,共享前缀事后拼:`PRODUCT_ROW_COLUMNS/_FROM` 是
+    `services/audit_rules` 的文本,哪天那边多一个 `{`(jsonb 字面量、格式串)
+    就会把本工作流炸在 `KeyError`,而吃同一份文本的 `audit_replay` 一点事没有
+    —— 这种耦合从两边的代码上都看不出来。format 面收窄到本文件自己的尾段,
+    共享文本走纯拼接,谁也炸不到谁。
+    """
+    return ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
+            + audit_rules.PRODUCT_ROW_FROM
+            + _CANDIDATE_TAIL.format(where=where, recent_guard=recent_guard))
 # ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
 #   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
 #   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,
@@ -462,7 +475,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
 
 
-# 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+# 批量重审的"还剩多少"计数(与 _candidate_sql 同一 where,去掉 JOIN 与 LIMIT)
 _RERULE_COUNT_SQL = """
 SELECT count(*) FROM catalog.products p
 WHERE p.marketplace = %(marketplace)s AND ({where})
@@ -1597,7 +1610,7 @@ def run(params: dict) -> str:
                 + (f",或近 {days_} 天没有动销" if days_ else "")) + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
-        cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)
+        cand_sql = _candidate_sql(where, guard)
         chunks = _iter_candidates(cand_sql, query_params)
         # 采用历史时把老 `l3_reason_category` 对回枚举用的那份集合 ——
         # 与判定链同源(`ctx.known_policies` + 两条非政策类别),不另查一次库

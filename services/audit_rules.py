@@ -139,11 +139,18 @@ def _build_automaton(brand_keys) -> object:
 
 _UNMAPPED_SENTINEL = audit_l1_llm.UNMAPPED_SENTINEL   # 单一出处
 
-#: 规则代码里**写死的政策类别名**(`docs/audit_step3_spec.md` §二 表:品牌
-#: 黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的品牌翻拒,四处判同一个 IP)。
-#: 它们不经政策表查询就写进 `hit.detail["category"]` 并一路落库、进飞书 G 列、
-#: 进申诉口径 —— 所以拼写必须**就是**表内那一行。
-RULE_POLICIES = (resources.AUDIT_IP_POLICY,)
+#: 代码里**写死的政策类别名** → 它出生的那个 registry 常量名(报错要指得出改哪儿)。
+#: 两族(`docs/audit_step3_spec.md` §二 表 + §3.8):
+#:   · `AUDIT_IP_POLICY` —— 品牌黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的
+#:     品牌翻拒,四处判同一个 IP。不经政策表查询就写进 `hit.detail["category"]`
+#:     并一路落库、进飞书 G 列、进申诉口径;
+#:   · `AUDIT_CONTENT_POLICIES` —— 内容族两页(2026-09-02 B2 补进本闸):回放
+#:     评估拿它当 CONTENT 反例的期望类别。**同样是写死的拼写**,漂了的表现是
+#:     "内容族那一类的类别准确率一夜归零",而没有任何东西会红。
+#: 所以拼写必须**就是**表内那一行 —— 装配时一次性对表,对不上启动即炸。
+RULE_POLICIES = ((resources.AUDIT_IP_POLICY, "AUDIT_IP_POLICY"),
+                 *((n, "AUDIT_CONTENT_POLICIES")
+                   for n in resources.AUDIT_CONTENT_POLICIES))
 
 
 def check_rule_policies(known_policies) -> None:
@@ -156,19 +163,19 @@ def check_rule_policies(known_policies) -> None:
     """
     if not known_policies:
         return
-    for name in RULE_POLICIES:
+    for name, const in RULE_POLICIES:
         hit = policy_names.resolve(name, known_policies)
         if hit is None:
             raise RuntimeError(
-                f"规则代码写死的政策类别 {name!r} 在 audit.walmart_prohibited_policy "
+                f"代码写死的政策类别 {name!r} 在 audit.walmart_prohibited_policy "
                 f"里解析不到 —— 政策表改名了而代码没跟上。改 "
-                f"registry.resources.AUDIT_IP_POLICY(别让规则往库里写一个"
+                f"registry.resources.{const}(别让代码往库里写、或拿去对表一个"
                 f"表里没有的类别名)")
         if hit != name:
             raise RuntimeError(
-                f"规则代码写死的政策类别 {name!r} 与表内拼写 {hit!r} 不一致 —— "
-                f"落库的类别必须是表内原拼写。改 "
-                f"registry.resources.AUDIT_IP_POLICY 为 {hit!r}")
+                f"代码写死的政策类别 {name!r} 与表内拼写 {hit!r} 不一致 —— "
+                f"落库与对表的类别必须是表内原拼写。改 "
+                f"registry.resources.{const} 为 {hit!r}")
 
 
 def load_context(conn, *, uspto=None) -> AuditContext:

@@ -725,7 +725,7 @@ def test_gap_closure_runs_before_the_candidate_query(monkeypatch):
     src = inspect.getsource(pa.run)
     assert "sheet_head += _close_gap(sheet_want, sheet_rows, execute" in src
     # 必须早于候选查询那一行
-    assert src.index("_close_gap(") < src.index("_CANDIDATE_SQL.format")
+    assert src.index("_close_gap(") < src.index("_candidate_sql(")
     # 交的是整批 sheet_want,不是被 limit 截过的候选 —— 交候选的话超出 limit 的
     # 缺数据行永远排不上,也就永远不会被推去采集
     assert "_close_gap(rows" not in src and "_close_gap(todo" not in src

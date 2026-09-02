@@ -38,12 +38,18 @@ _PENDING_REASON_L3 = "LLM 全链路故障, 待人工复核"   # 旧仓字面量(
 # 这种要等 walmart_pt_meta 补行(pt_spec_sync),重刷一百遍也不会自己好。
 _PENDING_REASON_L2 = "PT 不在类目准入明细,判不了(待补 walmart_pt_meta)"
 
+# ⚠ `audit_version` 是 2026-09-02 B2 补的列(`refdata/schema.sql`):这张表原本
+# 没有任何"这一行是哪一版判据判的"的痕迹,于是**回放评估分不清新旧链** ——
+# `mode=stale` 一跑,每个 asin 的"最近一次 run"就变成了新链自己的结论,
+# 再拿它当"旧链基线"就是自己跟自己比,而且数字看着完全正常。
+# 存量 204 万行这一列是 NULL = 旧链(回放按 `IS DISTINCT FROM 当前版本` 取基线)。
 _RUN_SQL = """
 INSERT INTO audit.audit_runs
   (asin, walmart_product_type, pt_confidence, pt_source,
    score_start, score_final, verdict, stage_stopped_at,
-   l3_verdict, l3_reason_category, l3_reason_text, l4_verdict, l4_issues)
-VALUES (%s, %s, %s, %s, 100, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+   l3_verdict, l3_reason_category, l3_reason_text, l4_verdict, l4_issues,
+   audit_version)
+VALUES (%s, %s, %s, %s, 100, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
 RETURNING run_id
 """
 
@@ -95,6 +101,7 @@ def _run_params(outcome: AuditOutcome) -> tuple:
         l4.verdict if l4 else "skip",
         json.dumps(l4.image_issues, ensure_ascii=False, default=str)
         if l4 else "[]",
+        resources.AUDIT_RULES_VERSION,   # 这一行是哪一版判据判的(回放分新旧链靠它)
     )
 
 

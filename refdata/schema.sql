@@ -1724,6 +1724,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_asin    ON audit.audit_runs(asin);
 CREATE INDEX IF NOT EXISTS idx_audit_verdict ON audit.audit_runs(verdict);
 CREATE INDEX IF NOT EXISTS idx_audit_stage   ON audit.audit_runs(stage_stopped_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit.audit_runs(created_at);
+-- 判据版本(2026-09-02 B2 补列):这一行是哪一版规则判的。
+-- 存在的理由是**回放评估分不清新旧链**:这张表原本没有任何版本痕迹,
+-- `product_audit -p mode=stale` 一跑,每个 asin 的"最近一次 run"就变成新链
+-- 自己的结论,再拿它当"旧链基线"就是自己跟自己比,而且数字看着完全正常。
+-- 存量 204 万行为 NULL = 旧链;`workflows/audit_replay` 取基线的谓词是
+-- `audit_version IS DISTINCT FROM <当前 AUDIT_RULES_VERSION>`(NULL 也算旧)。
+-- 写入方唯一出处 services/audit_store._RUN_SQL。
+ALTER TABLE audit.audit_runs ADD COLUMN IF NOT EXISTS audit_version text;
 
 -- 逐条规则命中明细(理由码账本)
 CREATE TABLE IF NOT EXISTS audit.audit_hits (

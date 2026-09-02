@@ -252,7 +252,11 @@ class _Cur:
     def execute(self, sql, args=None):
         self.conn.sql.append(sql)
         c = self.conn
-        if "published_status = 'PUBLISHED'" in sql:
+        if sql.lstrip().startswith("SELECT asin, expected_verdict"):
+            self._rows = list(c.tag_rows)          # 同 tag 既有样本
+        elif sql.lstrip().startswith("SELECT DISTINCT sku FROM catalog"):
+            self._rows = [(k,) for k in c.rejected]   # 曾被拒的 sku(asin 级判据)
+        elif "published_status = 'PUBLISHED'" in sql:
             self._rows = list(c.pos)        # ⚠ 先判:正例 SQL 的 NOT EXISTS
         elif "unpublished_reasons, '') <> ''" in sql and "md5" in sql:
             self._rows = list(c.neg)        #    里同样带着下架原因那一句
@@ -287,11 +291,14 @@ class _Cur:
 
 
 class _Conn:
-    def __init__(self, neg=(), pos=(), products=None, old=None, item_ids=None):
+    def __init__(self, neg=(), pos=(), products=None, old=None, item_ids=None,
+                 tag_rows=(), rejected=()):
         self.neg, self.pos = list(neg), list(pos)
         self.products = products or {}
         self.old = old or {}
         self.item_ids = item_ids or {}
+        self.tag_rows = list(tag_rows)
+        self.rejected = list(rejected)
         self.sql: list = []
         self.written: list = []
         self.commits = 0
@@ -307,6 +314,7 @@ class _Conn:
 
     def commit(self):
         self.commits += 1
+        self.sql.append("COMMIT")      # 顺序留痕:判定前必须已经提交过
 
 
 _REASON_IP = "Removed for an intellectual property claim."
@@ -358,14 +366,41 @@ def test_negatives_count_the_funnel_by_reason_not_by_lump():
     assert st["off_set"] == 1 and st["coded"] == 0
 
 
-def test_positives_exclude_asins_already_taken_by_negatives():
-    """同一个 asin 可能既有在架 sku 又有被拒 sku(不同店/不同订货号)——
-    两边都收就是拿同一个产品既当正例又当反例。"""
+def test_positives_exclude_the_whole_negative_pool_not_just_the_picked():
+    """⚠ 排除面是**整个反例池**,不是抽中的那 600 条。
+
+    只排抽中的:池里另外几千个"沃尔玛拒过"的 asin 照样能以正例身份进样本,
+    新链判拒它们反而被算成"误伤" —— 直接污染所有者唯一的底线指标。
+    """
     conn = _Conn(pos=[("B0PLAIN001",), ("B0PLAIN002",)],
                  products={"B0PLAIN001": "t", "B0PLAIN002": "t"})
     got, st = ar._positives(conn, ar._parse_params({"pos": "10"}),
-                            exclude={"B0PLAIN001"})
+                            {"B0PLAIN001"}, set())
     assert got == ["B0PLAIN002"] and st["dup_neg"] == 1
+    # 接线:run() 传的是**池**而不是 picked
+    src = _source()
+    assert "{s.asin for s in neg_pool}" in src
+    assert "rejected_asins(conn)" in src
+
+
+def test_a_positive_sku_whose_asin_was_rejected_in_another_store_is_dropped():
+    """⚠ `_POS_SQL` 的 NOT EXISTS 是 **sku 级**,而身份是 **asin 级**。
+
+    同一个产品:A 店订货号 `XKJ-B0GXX75JN5-39.98` 在架、B 店订货号
+    `YP-B0GXX75JN5-88.00` 被沃尔玛拒过 —— 两条行的 sku 根本不相等,SQL 自己
+    比不出来。比不出来的后果不是报错:那个品会以正例身份进样本,新链判拒它
+    反而被算成误伤。
+    """
+    conn = _Conn(pos=[("XKJ-B0GXX75JN5-39.98",), ("AB-B0CLEAN0001-9.9",)],
+                 products={"B0GXX75JN5": "t", "B0CLEAN0001": "t"},
+                 rejected=["YP-B0GXX75JN5-88.00"])
+    rejected = ar.rejected_asins(conn)
+    assert rejected == {"B0GXX75JN5"}          # 走 sku_asin,不是裸等值
+    got, st = ar._positives(conn, ar._parse_params({"pos": "10"}),
+                            set(), rejected)
+    assert got == ["B0CLEAN0001"] and st["ever_rejected"] == 1
+    # 判据面不许封顶(抽样面才可以):漏一行就是把被拒的品当成好品去算误伤率
+    assert "LIMIT" not in ar._REJECTED_SKU_SQL
 
 
 def test_the_sampling_sql_is_seeded_in_the_database_not_in_python():
@@ -383,7 +418,8 @@ def test_product_rows_have_the_same_shape_as_production_candidates():
     assert audit_rules.PRODUCT_ROW_COLUMNS in ar._PRODUCT_SQL
     assert audit_rules.PRODUCT_ROW_FROM in ar._PRODUCT_SQL
     from workflows import product_audit
-    assert audit_rules.PRODUCT_ROW_COLUMNS in product_audit._CANDIDATE_SQL
+    assert audit_rules.PRODUCT_ROW_COLUMNS in product_audit._candidate_sql(
+        "x", "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -563,6 +599,7 @@ def wired(monkeypatch):
 
     def _fake_audit_one(product, ctx, c, **kw):
         calls.append(product.asin)
+        conn.sql.append("JUDGE")        # 顺序留痕(提交必须在这之前)
         return _outcome(product.asin)
 
     monkeypatch.setattr(ar.audit_rules, "audit_one", _fake_audit_one)
@@ -610,7 +647,8 @@ def test_real_run_writes_only_replay_results_and_the_report(wired):
     out = ar.run({"neg": "5", "pos": "5", "tag": "T9", "execute": True})
     assert sorted(calls) == ["B0NEG00001", "B0NEG00002",
                             "B0POS00001", "B0POS00002"]
-    assert len(conn.written) == 4 and conn.commits == 1
+    # 两次提交:抽样/打标读完一次(判定前撒手,见下面那条),落库后一次
+    assert len(conn.written) == 4 and conn.commits == 2
     one = [w for w in conn.written if w["asin"] == "B0NEG00001"][0]
     assert one["run_tag"] == "T9"
     assert one["expected_verdict"] == "reject"
@@ -668,3 +706,176 @@ def test_an_empty_sample_says_which_funnel_ate_everything(monkeypatch, wired):
     out = ar.run({"execute": True})
     assert "一条样本都没抽到" in out and "反例漏斗" in out and "正例漏斗" in out
     assert calls == [] and conn.written == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ⑧ 复核修订(2026-09-02 对抗复核 ACCEPT-WITH-FIXES)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_old_chain_baseline_excludes_rows_the_new_chain_wrote():
+    """⚠ 命门:`audit_runs` 里没有版本痕迹时,`mode=stale` 一跑,每个 asin 的
+    "最近一次 run"就是**新链自己刚写的那一行** —— 回放于是拿新链跟新链比,
+    误伤率、一致率全部漂亮,而没有任何东西会红。
+
+    所以基线 = 最近一次 `audit_version IS DISTINCT FROM <当前版本>` 的行
+    (NULL = 存量老行,算旧链)。
+    """
+    assert "audit_version IS DISTINCT FROM %(current)s" in ar._OLD_SQL
+    assert "IS DISTINCT FROM 'SHORTCUT'" in ar._OLD_SQL      # 影子行照旧排除
+    assert "ORDER BY asin, created_at DESC" in ar._OLD_SQL
+
+    seen = {}
+
+    class _C(_Conn):
+        def cursor(self, *a, **k):
+            outer = self
+
+            class _X(_Cur):
+                def execute(self, sql, args=None):
+                    if "FROM audit.audit_runs" in sql:
+                        seen.update(args)
+                        # 假库照谓词过滤:当前版本的那一行不该被选中
+                        self._rows = [("B0A", "pass", None)]
+                        return
+                    super().execute(sql, args)
+            return _X(outer)
+
+    conn = _C()
+    got = ar._old_runs(conn, ["B0A"])
+    assert got == {"B0A": ("pass", None)}
+    assert seen["current"] == resources.AUDIT_RULES_VERSION   # 谓词真的带了值
+    # 落库侧把版本盖上了,基线才排得掉(services/audit_store 唯一出处)
+    from services import audit_store
+    assert "audit_version" in audit_store._RUN_SQL
+
+
+def test_report_header_states_the_baseline_rule():
+    """读数的人必须知道"旧链"是怎么取的 —— 否则 mode=stale 跑过之后的报告
+    看起来和之前一模一样,而基线已经换成了新链自己。"""
+    text = "\n".join(ar.report([_row()], _META)[0])
+    assert "旧链基线" in text and "audit_version" in text
+    assert resources.AUDIT_RULES_VERSION in text
+
+
+def test_bottom_line_is_judged_on_the_shared_subset():
+    """⚠ 两个分母不能比大小(400/40 场景):
+
+    新链在**全部 400 条**正例上误伤 20(5%),旧链只在**其中 40 条**上有结论、
+    误伤 5(12.5%)—— 首版会得出"新链更好、底线达标"。可在那共同的 40 条上
+    新链误伤 12(30%),真相是**更差**。底线只判在同一批产品上。
+    """
+    rows = []
+    for i in range(400):
+        has_old = i < 40
+        # 共同子集里新链误伤 12;子集外再误伤 8(全库合计 20)
+        new_rej = (i < 12) or (100 <= i < 108)
+        rows.append(_row(asin=f"B0P{i:05d}", source="pos", stratum="正例",
+                         expected_verdict="pass", expected_category=None,
+                         got_verdict="reject" if new_rej else "pass",
+                         got_category="Alcohol" if new_rej else None,
+                         old_verdict=("reject" if i < 5 else "pass")
+                         if has_old else None,
+                         confidence="medium", reason=""))
+    text = "\n".join(ar.report(rows, _META)[0])
+    assert "共同子集" in text and "底线判这里" in text
+    assert "新链 12/40 = 30.0%" in text and "旧链 5/40 = 12.5%" in text
+    assert "新链误伤高于旧链" in text and "底线达标" not in text
+    # 全库水位另行单列(它不是对照)
+    assert "全部正例上的新链误伤" in text and "20/400 = 5.0%" in text
+
+
+def test_bottom_line_says_so_when_there_is_nothing_to_compare_with():
+    """正例一条旧链结论都没有时,不许默认"达标"——那是没比过,不是比赢了。"""
+    rows = [_row(asin="B0P1", source="pos", stratum="正例",
+                 expected_verdict="pass", expected_category=None,
+                 got_verdict="reject", got_category="Alcohol",
+                 old_verdict=None, confidence="low", reason="")]
+    text = "\n".join(ar.report(rows, _META)[0])
+    assert "一条旧链结论都没有" in text and "底线达标" not in text
+
+
+def test_content_family_names_are_guarded_against_the_policy_table():
+    """内容族两页与 `AUDIT_IP_POLICY` 一样是**代码里写死的拼写**:政策表改了
+    而常量没跟上,表现是"内容族那一类的类别准确率一夜归零",没有任何东西会红。
+    所以走同一道装配期守门,对不上直接 RuntimeError。"""
+    from services import audit_rules as ru
+
+    names = {n for n, _ in ru.RULE_POLICIES}
+    assert set(resources.AUDIT_CONTENT_POLICIES) <= names
+    assert resources.AUDIT_IP_POLICY in names
+    ok = frozenset({resources.AUDIT_IP_POLICY,
+                    *resources.AUDIT_CONTENT_POLICIES})
+    ru.check_rule_policies(ok)                       # 对得上:不抛
+    # 43 那一页在表里被改成了别的拼写 → 装配即炸,并点名该改哪个常量
+    drifted = frozenset({resources.AUDIT_IP_POLICY,
+                         "Content standards overview (renamed)",
+                         resources.AUDIT_CONTENT_POLICIES[1]})
+    with pytest.raises(RuntimeError, match="AUDIT_CONTENT_POLICIES"):
+        ru.check_rule_policies(drifted)
+    # 空集合 = 没有表可对(离线/测试路径),不是"对不上"
+    ru.check_rule_policies(frozenset())
+
+
+def test_content_expected_category_uses_the_table_spelling():
+    """期望类别取**表内原拼写**(judge 侧落库的就是表内拼写);表里没有内容族
+    两页时不进集,不拿常量硬凑一个。"""
+    res = _res("This item has content issues.")
+    # 表里是另一种大小写写法 → 期望值跟表走
+    got = ar.label(res, ["Content Standards: OVERVIEW", "Alcohol"])
+    assert got == ("Content Standards: OVERVIEW", "内容族")
+    assert ar.label(res, ["Alcohol"]) is None        # 表里没有 → 不进集
+    # 互认按归一化键比,拼写差不算"类别判错"
+    assert ar.category_ok("Content Standards: OVERVIEW",
+                          "Product details policy")
+
+
+def test_same_tag_replays_the_stored_asins_instead_of_resampling(wired):
+    """⚠ 同 seed ≠ 同样本:候选面 `catalog.walmart_items` 每天被 catalog_sync
+    重写,`md5(sku || seed) LIMIT` 的窗口跟着天天变 —— 隔天"同 seed 对比"
+    已经不是同一批产品了,而两份报告长得一模一样。
+
+    所以样本身份是 **run_tag**:该 tag 已有行就重放那一批。
+    """
+    conn, calls = wired
+    conn.tag_rows = [("B0OLD00001", "reject", "Alcohol"),
+                     ("B0OLD00002", "pass", None)]
+    conn.products.update({"B0OLD00001": "t", "B0OLD00002": "t"})
+    out = ar.run({"tag": "T7", "execute": True})
+    assert sorted(calls) == ["B0OLD00001", "B0OLD00002"]     # 只判既有那批
+    assert not any("md5" in s for s in conn.sql), "重放不许再抽样"
+    one = [w for w in conn.written if w["asin"] == "B0OLD00001"][0]
+    assert one["expected_verdict"] == "reject"               # 期望值原样取回
+    assert one["expected_category"] == "Alcohol"
+    assert "未重新抽样" in out and "重放既有样本" in out
+
+
+def test_a_fresh_tag_still_samples(wired):
+    """新 tag 才抽样(否则第一次跑什么都拿不到)。"""
+    conn, calls = wired
+    conn.tag_rows = []
+    out = ar.run({"tag": "全新的tag", "execute": True})
+    assert len(calls) == 4 and any("md5" in s for s in conn.sql)
+    assert "之后同 tag 再跑会**重放这一批**" in out
+
+
+def test_the_sampling_transaction_is_committed_before_judging_starts(wired):
+    """⚠ 判定要跑几十分钟(几百条 × 几秒 LLM)。抽样那几条查询的事务若一直
+    挂着,这条连接就是几十分钟的 idle in transaction:它按住一个老快照,
+    vacuum 清不掉这期间的死行,而回放期间生产链正往同几张表写。"""
+    conn, calls = wired
+    ar.run({"execute": True})
+    assert "COMMIT" in conn.sql and "JUDGE" in conn.sql
+    assert conn.sql.index("COMMIT") < conn.sql.index("JUDGE")
+    # 落库之后还要再提交一次(不然结果吊在事务里等 with 退出)
+    assert conn.commits >= 2
+
+
+def test_limit_per_category_zero_is_an_error_not_the_default():
+    """`opts.cap or default_cap(...)` 会把 0 和"没传"当成同一件事 ——
+    人以为这轮不封顶,实际按 neg/类别数 封了,而摘要长得一模一样。"""
+    with pytest.raises(ValueError, match="limit_per_category"):
+        ar._parse_params({"limit_per_category": "0"})
+    with pytest.raises(ValueError, match="不能为负"):
+        ar._parse_params({"limit_per_category": "-3"})
+    assert ar._parse_params({}).cap is None                  # 没传 = 现算
+    assert ar._parse_params({"limit_per_category": "7"}).cap == 7

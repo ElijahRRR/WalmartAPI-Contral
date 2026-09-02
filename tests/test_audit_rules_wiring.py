@@ -761,7 +761,10 @@ def test_persist_run_l3_l4_columns():
                 stage_stopped_at=None,
                 l1=L1Info(walmart_product_type="GoodPT"))
     audit_store.persist_run(_Conn(), AuditOutcome(**base))
-    assert captured[0][7:] == ("skip", None, None, "skip", "[]")
+    # 末列是 audit_version(2026-09-02 B2):没有它,回放的"旧链基线"会在
+    # mode=stale 跑过之后变成新链自己的结论 —— 自己跟自己比,数字还看着正常
+    assert captured[0][7:] == ("skip", None, None, "skip", "[]",
+                               resources.AUDIT_RULES_VERSION)
     o = AuditOutcome(**{**base, "verdict": "reject", "stage_stopped_at": "L3"})
     o.l3 = _l3_result("reject", policy="Offensive Content", detail="bad")
     o.l4 = L4Result(verdict="pass", image_issues=[{"image_index": 1}])
@@ -769,6 +772,10 @@ def test_persist_run_l3_l4_columns():
     # 两列列名不改,语义 = 类别 / 具体内容(2026-09-02 B1)
     assert captured[1][7:11] == ("reject", "Offensive Content", "bad", "pass")
     assert json.loads(captured[1][11]) == [{"image_index": 1}]
+    assert captured[1][12] == resources.AUDIT_RULES_VERSION
+    # 列数与 SQL 占位符数必须对得上(元组长度对不上时 psycopg 才会报错,
+    # 而"少写一列"在这里表现为静默写错列)
+    assert audit_store._RUN_SQL.count("%s") == len(captured[1])
 
 
 def test_write_conclusion_pending_reason_by_stage():
@@ -1143,11 +1150,33 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
 
 def test_candidate_sql_recent_guard_shape():
     """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
-    sql = product_audit._CANDIDATE_SQL.format(
-        where="x", recent_guard=product_audit._RECENT_RUN_GUARD)
+    sql = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD)
     assert "NOT EXISTS" in sql and "interval '24 hours'" in sql
-    plain = product_audit._CANDIDATE_SQL.format(where="x", recent_guard="")
+    plain = product_audit._candidate_sql("x", "")
     assert "NOT EXISTS" not in plain
+
+
+def test_candidate_sql_only_formats_its_own_tail(monkeypatch):
+    """⚠ `format` 面必须收窄到本文件的尾段。
+
+    列清单与 LATERAL 是 `services/audit_rules` 的文本;哪天那边多一个 `{`
+    (jsonb 字面量、格式串),`.format()` 整段就会 KeyError 炸在 product_audit,
+    而吃同一份文本的 `audit_replay` 一点事没有 —— 这种耦合两边都看不出来。
+    """
+    # ① 拼出来的 SQL 与"前缀 + 尾段替换"逐字节相同(改写不许动 SQL 一个字)
+    got = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD)
+    want = ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
+            + audit_rules.PRODUCT_ROW_FROM
+            + product_audit._CANDIDATE_TAIL.format(
+                where="x", recent_guard=product_audit._RECENT_RUN_GUARD))
+    assert got == want
+    assert "WHERE p.marketplace = %(marketplace)s AND (x)" in got
+    assert "LIMIT %(limit)s" in got
+    # ② 共享文本里出现花括号也不炸(这就是改写的全部理由)
+    monkeypatch.setattr(audit_rules, "PRODUCT_ROW_COLUMNS",
+                        "p.asin, p.slow -> '{a}' AS x")
+    braced = product_audit._candidate_sql("y", "")
+    assert "{a}" in braced and "AND (y)" in braced
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────

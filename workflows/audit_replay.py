@@ -4,8 +4,9 @@
   python cli.py audit_replay --dry-run                # 只抽样 + 报规模与预估成本,零 LLM
   python cli.py audit_replay                          # 真跑:反例 600 / 正例 400
   python cli.py audit_replay -p neg=200 -p pos=100    # 小样本先看形态(便宜)
-  python cli.py audit_replay -p seed=7                # 换一批样本(同 seed 恒同一批)
-  python cli.py audit_replay -p tag=20260902-改提示词后 # 自定义 run_tag(同 tag 重跑覆盖)
+  python cli.py audit_replay -p seed=7                # 换一批样本(新 tag 才会抽样)
+  python cli.py audit_replay -p tag=改提示词前         # 首次:抽样 + 落库
+  python cli.py audit_replay -p tag=改提示词前         # 再跑:**重放同一批 asin**,原地覆盖
   python cli.py audit_replay -p limit_per_category=30 # 每个期望类别的封顶
 
 **它回答一个问题**:换了判据之后,这条链对"沃尔玛已经裁决过的商品"判得对不对,
@@ -21,8 +22,11 @@
     PROHIBITED_FINAL 的算反例(期望 reject);在架在售且从没有过下架原因的算
     正例(期望 pass)。PT_WRONG / GATED **不进本集**:前者是 L1 的题(类目选错),
     后者的沃尔玛语义(要预审批)与我方"中国卖家能不能做"不对齐;
-  · **旧链**:`audit.audit_runs` 每个 asin **最近一次**的 verdict 与
-    l3_reason_category(历史,已落库,不重跑旧代码);
+  · **旧链**:`audit.audit_runs` 每个 asin 最近一次 **`audit_version` 不是当前
+    `AUDIT_RULES_VERSION`** 的 verdict 与 l3_reason_category(历史,已落库,
+    不重跑旧代码;NULL 也算旧链)。⚠ 那道版本谓词是命门:`mode=stale` 一跑,
+    "最近一次 run"就是新链自己刚写的行,不排掉就是自己跟自己比,而且数字
+    看着完全正常(`audit_version` 列 2026-09-02 B2 为此补进 audit_runs);
   · **新链**:本轮 `audit_one` 的输出。
 
 ⚠ **写什么、不写什么**(这条工作流的全部写面):
@@ -39,7 +43,13 @@
      文本)—— 被拒之后改过 listing 的品会失真;
   ② 沃尔玛裁决时的**政策版本与今天不同**;
   ③ 沃尔玛裁决是**参照不是金标**(申诉成功、自愈态都存在)。
-所以指标要横向比(改判据前后同 seed 同样本对比),不要拿绝对值当准确率。
+所以指标要横向比(改判据前后**同 tag** 重放同一批),不要拿绝对值当准确率。
+
+⚠ **样本身份是 `run_tag`,不是 `seed`**:seed 只保证"同一份候选面上抽同一批",
+而候选面 `catalog.walmart_items` 每天被 `catalog_sync` 重写(上下架、缺席、新店),
+`ORDER BY md5(sku || seed) LIMIT` 的窗口跟着天天变 —— 隔天同 seed 已经不是同一批,
+而两份报告长得一模一样。所以:**同 tag 已有行 ⇒ 重放那一批 asin(不重新抽样)**,
+换一批就换 tag。
 """
 
 import logging
@@ -54,6 +64,9 @@ from registry import db, paths, resources
 from services import (audit_l3, audit_pool, audit_reason, audit_rules,
                       audit_store, db_guard, error_taxonomy, llm_cost,
                       sku_asin)
+# ⚠ 只引函数不引模块名:本文件里 `policy_names` 是**政策表名字列表**这个局部
+#   变量(与 error_taxonomy 的形参同名),模块名撞上去会同名两义
+from services.policy_names import norm_category, resolve as resolve_policy
 
 DANGEROUS = False       # 只写自己的表与报告文件(判定链另写 llm_cache,见头注)
 
@@ -143,14 +156,38 @@ WHERE p.marketplace = %(marketplace)s AND p.asin = ANY(%(asins)s)
   AND p.title IS NOT NULL AND p.title <> ''
 """)
 
-# 旧链最近一次结论(历史,不重跑)。排 SHORTCUT 影子行:那是历史短路留下的,
-# 不是判过一次(与 product_audit._HISTORY_SQL 同一条理由)
+# 旧链基线 = 每个 asin **最近一次「不是当前判据版本」的** run(历史,不重跑)。
+#
+# ⚠ `audit_version IS DISTINCT FROM %(current)s` 这一条是命门(2026-09-02 B2
+# 补的列):没有它,`product_audit -p mode=stale` 跑过之后每个 asin 的"最近
+# 一次 run"就是**新链自己刚写的那一行** —— 回放于是拿新链跟新链比,误伤率
+# 一致率全部漂亮,而没有任何东西会红。`NULL` 也算旧链(204 万存量行没有版本)。
+# 排 SHORTCUT 影子行:那是历史短路留下的,不是判过一次(与
+# product_audit._HISTORY_SQL 同一条理由)。
 _OLD_SQL = """
 SELECT DISTINCT ON (asin) asin, verdict, l3_reason_category
 FROM audit.audit_runs
 WHERE asin = ANY(%(asins)s)
   AND stage_stopped_at IS DISTINCT FROM 'SHORTCUT'
+  AND audit_version IS DISTINCT FROM %(current)s
 ORDER BY asin, created_at DESC
+"""
+
+# 同 tag 重放:样本直接读既有行(见 `_stored_samples` 头注)
+_TAG_ROWS_SQL = """
+SELECT asin, expected_verdict, expected_category
+FROM audit.replay_results
+WHERE run_tag = %(tag)s
+ORDER BY asin
+"""
+
+# **任何一家店给过下架原因**的 sku(只取 sku 一列,不带长文本)。
+# ⚠ 这里**不设上限**,而且不许设:它是正例的"干净"判据,漏一行就是把一个
+# 沃尔玛拒过的品当成在架好品去算误伤率 —— 抽样面可以封顶(抽不到就是没抽到),
+# 判据面不行。只取一列 text,生产是几万行的量级,内存与拉全表带正文不是一回事。
+_REJECTED_SKU_SQL = """
+SELECT DISTINCT sku FROM catalog.walmart_items
+WHERE coalesce(unpublished_reasons, '') <> ''
 """
 
 _INSERT_SQL = """
@@ -224,8 +261,15 @@ def _parse_params(params: dict) -> Opts:
     neg, pos = _int("neg", _DEFAULT_NEG), _int("pos", _DEFAULT_POS)
     if not neg and not pos:
         raise ValueError("neg 与 pos 不能同时为 0(那是一轮什么都不做的回放)")
-    cap = params.get("limit_per_category")
-    cap = _int("limit_per_category", None) if cap not in (None, "") else None
+    raw_cap = params.get("limit_per_category")
+    cap = None
+    if raw_cap not in (None, ""):
+        cap = _int("limit_per_category", None)
+        if cap == 0:
+            # 静默落回缺省 = 人以为"这轮不封顶",实际按 neg/类别数 封了
+            # (`opts.cap or default_cap(...)` 把 0 和"没传"当成同一件事)
+            raise ValueError("limit_per_category 要 ≥1(每类至少留一条);"
+                             "不想被封顶砍到就把 neg 调大,别传 0")
     workers = max(1, _int("workers", resources.AUDIT_WORKERS_DEFAULT))
     workers = min(workers, resources.AUDIT_WORKERS_MAX)
     tag = str(params.get("tag", "")).strip() or (
@@ -246,7 +290,10 @@ def label(res, policy_names) -> tuple[str | None, str] | None:
         **不进集**(没有可比的类别名;硬凑一个等于给自己送分);
       · IP → `Intellectual Property`(规则侧同一个常量,装配时已对过表);
       · CONTENT → 内容族两页之一(报错正文只说"内容不合规",不说是索引页还是
-        明细页)—— 期望值记规范名,判在**任一页**都算对(`category_ok`);
+        明细页)—— 期望值取**表内原拼写**(`policy_names.resolve` 对
+        `ctx.known_policies` 解一次,不把常量原样吐出来:判定链落库的是表内
+        拼写,期望值拿常量拼写去比就会整类归零),判在**任一页**都算对
+        (`category_ok`);表里没有这两页 → 不进集(没有可比的类别名);
       · BRAND / PROHIBITED_FINAL → 期望类别 None,**只比判定**:沃尔玛这两类
         正文里没有可对表的政策名(品牌授权是账号面的事,不可申诉是终局标记)。
     """
@@ -259,7 +306,12 @@ def label(res, policy_names) -> tuple[str | None, str] | None:
     if code == "IP":
         return resources.AUDIT_IP_POLICY, resources.AUDIT_IP_POLICY
     if code == "CONTENT":
-        return resources.AUDIT_CONTENT_POLICIES[0], "内容族"
+        known = set(policy_names)
+        for name in resources.AUDIT_CONTENT_POLICIES:
+            hit = resolve_policy(name, known)
+            if hit:
+                return hit, "内容族"
+        return None
     return None, code
 
 
@@ -274,8 +326,11 @@ def category_ok(expected: str | None, got: str | None) -> bool:
         return True
     if got == expected:
         return True
-    fam = set(resources.AUDIT_CONTENT_POLICIES)
-    return expected in fam and (got in fam)
+    # 两名互认按**归一化键**比(`policy_names.norm_category`,全仓唯一一份):
+    # 期望值来自政策表、`got` 来自判定链,两边都是表内拼写,但大小写/词形的
+    # 差别不该被算成"类别判错"
+    fam = {norm_category(n) for n in resources.AUDIT_CONTENT_POLICIES}
+    return norm_category(expected) in fam and norm_category(got or "") in fam
 
 
 # ── 抽样(纯函数,给定 seed 恒定)────────────────────────────────────────────
@@ -397,22 +452,74 @@ def _negatives(conn, opts: Opts, policy_names: list) -> tuple[list, dict]:
     return out, st
 
 
-def _positives(conn, opts: Opts, exclude: set) -> tuple[list, dict]:
-    """输入:连接 + 入参 + 要排除的 asin → 输出:(正例候选 asin, 漏斗计数)。
+def rejected_asins(conn) -> set:
+    """输入:连接 → 输出:**任何一家店给过下架原因**的全部 asin(经 sku_asin 规则)。
 
-    `exclude` 是反例已占的 asin:同一个 asin 可能既有在架的 sku、又有被拒的
-    sku(不同店/不同订货号),两边都收就是拿同一个产品既当正例又当反例。
+    正例的"干净"判据,`_POS_SQL` 里那条 `NOT EXISTS` 挡不住的那一半:
+    身份是 **asin 级**,而 `walmart_items` 的行是 **sku 级** —— 同一个产品在
+    A 店的订货号 `XKJ-B0X-39.98` 在架、在 B 店的 `YP-B0X-88.00` 被拒,两条行
+    的 `sku` 根本不相等,SQL 自己比不出来。比不出来的后果不是报错:那个品会
+    以正例身份进样本,新链判拒它反而被算成"误伤",直接污染所有者唯一的底线指标。
+
+    所以在 Python 里按**唯一那份规则**(`services/sku_asin`)把下架侧的 sku
+    全量折成 asin。只取 `sku` 一列(不带下架原因长文本),生产是几万行的量级。
+    ⚠ **不设上限,也不许设**:抽样面可以封顶(抽不到就是没抽到),判据面封顶
+    等于随机漏掉几个"其实被拒过"的品,而且不会报错。
+    """
+    rows = _rows(conn, _REJECTED_SKU_SQL, {})
+    skus = [r[0] for r in rows if r[0]]
+    mapping, _ = sku_asin.resolve_skus(conn, skus)
+    return set(mapping.values())
+
+
+def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, dict]:
+    """输入:连接 + 入参 + 反例池 asin + 曾被拒 asin → 输出:(正例候选, 漏斗计数)。
+
+    两道排除各记各的账(合成一个数就看不出哪一道在起作用):
+      · `neg_asins` = **整个反例池**(不只是抽中的那 600 条)—— 同一个 asin
+        既当正例又当反例是自相矛盾的样本;
+      · `rejected` = 任何一家店给过下架原因的 asin(见 `rejected_asins`)。
     """
     pool = _pool_size(opts.pos, _POS_POOL_FACTOR)
     raw = _rows(conn, _POS_SQL, {"seed": str(opts.seed), "pool": pool})
     skus = [r[0] for r in raw]
     mapping, _ = sku_asin.resolve_skus(conn, skus)
-    cand = {a for a in mapping.values() if a not in exclude}
+    cand = set(mapping.values())
+    st = {"scanned": len(raw), "pool_cap": pool,
+          "no_asin": len(skus) - len(mapping),
+          "dup_neg": len(cand & neg_asins)}
+    cand -= neg_asins
+    st["ever_rejected"] = len(cand & rejected)
+    cand -= rejected
     have = _with_product(conn, sorted(cand))
-    st = {"scanned": len(raw), "pool_cap": pool, "no_asin": len(skus) - len(mapping),
-          "dup_neg": len({a for a in mapping.values()} & exclude),
-          "no_product": len(cand - have)}
+    st["no_product"] = len(cand - have)
     return sorted(have), st
+
+
+def _stored_samples(conn, tag: str) -> list:
+    """输入:连接 + run_tag → 输出:该 tag 已有的样本(期望值原样取回;没有给空)。
+
+    **同 tag 重放 = 重放同一批 asin,不重新抽样**(2026-09-02 B2 复核修订)。
+    理由:`seed` 只保证"同一份候选面上抽同一批",而候选面是
+    `catalog.walmart_items` —— `catalog_sync` 每天重写它(上下架、缺席、新店),
+    `ORDER BY md5(sku || seed) LIMIT` 的那个窗口跟着天天变。于是"改判据前后
+    同 seed 对比"在**隔天**就不成立了,而两份报告长得一模一样,没有任何提示。
+
+    有了这条:第一次跑某个 tag 抽样并落库,之后同 tag 再跑就按库里那批 asin
+    逐条重判、原地覆盖结果 —— 前后两份报告比的确实是同一批产品。
+    要换一批就换 tag(或换 seed 配新 tag)。
+    """
+    rows = _rows(conn, _TAG_ROWS_SQL, {"tag": tag})
+    out = []
+    for asin, exp_v, exp_c in rows:
+        out.append(Sample(
+            asin=asin, expected_verdict=exp_v,
+            expected_category=exp_c,
+            # 分层键库里没存(它只是报告的分组维度):带类别的按类别归堆,
+            # 只比判定的两档归一堆,正例归正例
+            stratum=("正例" if exp_v == "pass" else (exp_c or "(只比判定)")),
+            source=("pos" if exp_v == "pass" else "neg")))
+    return out
 
 
 def _load_products(conn, asins: list) -> dict:
@@ -428,10 +535,15 @@ def _load_products(conn, asins: list) -> dict:
 
 
 def _old_runs(conn, asins: list) -> dict:
-    """输入:连接 + asin → 输出:{asin: (旧判定, 旧类别)}(最近一次,历史)。"""
+    """输入:连接 + asin → 输出:{asin: (旧判定, 旧类别)}(最近一次**旧链**行)。
+
+    "旧链"= `audit_version` 不是当前 `AUDIT_RULES_VERSION` 的行(NULL 也算)。
+    见 `_OLD_SQL` 头注:不排掉当前版本就是新链自己跟自己比。
+    """
     if not asins:
         return {}
-    rows = _rows(conn, _OLD_SQL, {"asins": sorted(set(asins))})
+    rows = _rows(conn, _OLD_SQL, {"asins": sorted(set(asins)),
+                                  "current": resources.AUDIT_RULES_VERSION})
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
@@ -590,7 +702,8 @@ _LIMITS = [
     "大文本)—— 被拒之后改过 listing 的品会失真;",
     "  ② 沃尔玛裁决时的**政策版本与今天不同**;",
     "  ③ 沃尔玛裁决是**参照不是金标**(申诉成功、自愈态都存在)。",
-    "  ⇒ 指标要**横向比**(改判据前后同 seed 同样本),别拿绝对值当准确率。",
+    "  ⇒ 指标要**横向比**(改判据前后拿**同一个 run_tag** 重放同一批样本),"
+    "别拿绝对值当准确率。",
 ]
 
 
@@ -600,7 +713,6 @@ def _pct(a: int, b: int) -> str:
 
 def _confusion(rows: list, limit: int) -> list:
     """输入:带类别的反例行 → 输出:混淆表文本行(期望 × 得到,按量降序)。"""
-    from collections import Counter
     pairs: Counter = Counter()
     for r in rows:
         pairs[(r["expected_category"], r["got_category"] or "(无类别)")] += 1
@@ -618,11 +730,18 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
     pos = [r for r in rows if r["source"] == "pos"]
     labelled = [r for r in neg if r["expected_category"]]
     judged = [r for r in rows if r["got_verdict"]]
+    origin = ("样本取自 run_tag 既有行(**未重新抽样**,与上一次同 tag 的报告"
+              "逐条可比)" if meta.get("reused")
+              else f"样本本轮抽样(seed={meta['seed']};每类封顶 {meta['cap']})")
     head = [
         f"回放评估 audit_replay(run_tag={meta['tag']};判据版本 "
-        f"{resources.AUDIT_RULES_VERSION};seed={meta['seed']})",
+        f"{resources.AUDIT_RULES_VERSION})",
         f"样本:反例 {len(neg)}(带类别 {len(labelled)})/ 正例 {len(pos)};"
-        f"每类封顶 {meta['cap']};耗时 {meta.get('elapsed', 0):.0f}s",
+        f"{origin};耗时 {meta.get('elapsed', 0):.0f}s",
+        f"旧链基线 = 每个 asin 最近一次 **audit_version 不是 "
+        f"{resources.AUDIT_RULES_VERSION}** 的 `audit.audit_runs` 行"
+        f"(NULL 也算旧链;不排掉当前版本的话,mode=stale 跑过之后就是"
+        f"新链自己跟自己比,而数字看着完全正常)",
         *_LIMITS,
     ]
 
@@ -673,22 +792,33 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
     if rej_lab:
         body += _confusion(rej_lab, limit)
 
-    # ③ 正例误伤:新旧并排(所有者的底线)
-    new_fp = [r for r in pos if r["got_verdict"] == "reject"]
-    pos_old = [r for r in pos if r["old_verdict"]]
-    old_fp = [r for r in pos_old if r["old_verdict"] == "reject"]
-    new_rate = len(new_fp) / len(pos) if pos else 0.0
-    old_rate = len(old_fp) / len(pos_old) if pos_old else 0.0
-    verdict_line = "新链 ≤ 旧链 ✓(所有者定稿的底线达标)"
-    if pos and pos_old and new_rate > old_rate:
+    # ③ 正例误伤:**共同子集**上新旧并排(所有者的底线)
+    # ⚠ 两个分母不能拿来比大小(首版就是那么写的):新链的分母是全部正例、
+    # 旧链的分母是"其中有旧链结论的那些",两批产品根本不一样,比出来的
+    # "新链更好"可能纯粹是因为没有旧结论的那批本来就更干净。底线只判在
+    # **同一批产品**上;全部正例上的新链误伤率另行单列(那是绝对水位,
+    # 不是对照)。
+    new_fp_all = [r for r in pos if r["got_verdict"] == "reject"]
+    shared = [r for r in pos if r["old_verdict"]]
+    new_fp = [r for r in shared if r["got_verdict"] == "reject"]
+    old_fp = [r for r in shared if r["old_verdict"] == "reject"]
+    if not shared:
+        verdict_line = ("⚠ 本批正例**一条旧链结论都没有** —— 底线无从比起"
+                        "(先确认 audit_runs 里有历史行,或换一批正例)")
+    elif len(new_fp) > len(old_fp):
         verdict_line = ("⚠ **新链误伤高于旧链** —— 所有者定稿 §六.5 的底线是"
                         "「正例误伤率不高于旧链」,不达标就先修判据再回放,"
                         "别开 mode=stale")
-    body += ["", f"▍正例误伤(在架在售却被判拒):"
-                 f"新链 {_pct(len(new_fp), len(pos))};"
-                 f"旧链 {_pct(len(old_fp), len(pos_old))}"
-                 f"(旧链分母 = 正例里有历史 run 的那些)",
-             f"    {verdict_line}"]
+    else:
+        verdict_line = "新链 ≤ 旧链 ✓(所有者定稿的底线达标)"
+    body += ["", "▍正例误伤(在架在售却被判拒)",
+             f"  **共同子集**(正例里有旧链结论的 {len(shared)} 条,底线判这里):"
+             f"新链 {_pct(len(new_fp), len(shared))};"
+             f"旧链 {_pct(len(old_fp), len(shared))}",
+             f"    {verdict_line}",
+             f"  全部正例上的新链误伤(绝对水位;旧链在另外 "
+             f"{len(pos) - len(shared)} 条上没有可比结论):"
+             f"{_pct(len(new_fp_all), len(pos))}"]
 
     # ④ 新旧一致率
     both = [r for r in rows if r["got_verdict"] and r["old_verdict"]]
@@ -770,22 +900,46 @@ def run(params: dict) -> str:
                                "category_en —— 回放的期望类别全靠它 join,"
                                "空表跑出来的类别准确率是假的(先跑 policy_sync)")
 
-        neg_pool, neg_stats = _negatives(conn, opts, policy_names)
-        cap = opts.cap or default_cap(
-            opts.neg, len({s.stratum for s in neg_pool}))
-        picked = stratify(neg_pool, opts.neg, cap, opts.seed)
-        pos_pool, pos_stats = _positives(
-            conn, opts, exclude={s.asin for s in picked})
-        pos_asins = sample_asins(pos_pool, opts.pos, opts.seed)
-        samples = picked + [Sample(asin=a, expected_verdict="pass",
-                                   expected_category=None, stratum="正例",
-                                   source="pos") for a in pos_asins]
+        # **同 tag 有行 = 重放那一批**(不重新抽样,见 `_stored_samples` 头注):
+        # seed 只保证"同一份候选面上抽同一批",而候选面 `catalog.walmart_items`
+        # 每天被 catalog_sync 重写 —— 隔天同 seed 就不是同一批了,而两份报告
+        # 长得一模一样。想换样本就换 tag。
+        stored = _stored_samples(conn, opts.tag)
+        neg_stats: dict = {}
+        pos_stats: dict = {}
+        cap = opts.cap or 0
+        if stored:
+            samples = stored
+            picked = [s for s in stored if s.source == "neg"]
+            pos_asins = [s.asin for s in stored if s.source == "pos"]
+            neg_pool, pos_pool = picked, pos_asins
+        else:
+            neg_pool, neg_stats = _negatives(conn, opts, policy_names)
+            cap = opts.cap or default_cap(
+                opts.neg, len({s.stratum for s in neg_pool}))
+            picked = stratify(neg_pool, opts.neg, cap, opts.seed)
+            # 正例的两道排除(2026-09-02 B2 复核修订):
+            #  ① **整个反例池**的 asin(不只是抽中的那批)—— 同一个 asin 两边
+            #     都收就是自相矛盾的样本;
+            #  ② 任何一家店给过下架原因的 asin —— `_POS_SQL` 的 NOT EXISTS 是
+            #     **sku 级**的,而身份是 asin 级:同一产品 A 店订货号在架、
+            #     B 店订货号被拒,SQL 自己比不出来(见 `rejected_asins`)
+            pos_pool, pos_stats = _positives(
+                conn, opts, {s.asin for s in neg_pool}, rejected_asins(conn))
+            pos_asins = sample_asins(pos_pool, opts.pos, opts.seed)
+            samples = picked + [Sample(asin=a, expected_verdict="pass",
+                                       expected_category=None, stratum="正例",
+                                       source="pos") for a in pos_asins]
         products = _load_products(conn, [s.asin for s in samples])
         samples = [s for s in samples if s.asin in products]
         if not samples:
             # 一条样本都没有:空报告只会让人以为"跑过了"。把两条漏斗打出来 ——
             # 是库里没有下架记录、还是 sku 全都提不出 asin、还是产品行没采回来,
             # 三种情况的下一步完全不同
+            if stored:
+                return (f"audit_replay:run_tag={opts.tag} 的 {len(stored)} 条"
+                        f"既有样本**在 catalog.products 里一条都找不到**"
+                        f"(产品行被清过?)—— 本轮什么都没做")
             return ("audit_replay:**一条样本都没抽到**,本轮什么都没做。\n"
                     f"  反例漏斗:{neg_stats}\n"
                     f"  正例漏斗:{pos_stats}\n"
@@ -807,13 +961,16 @@ def run(params: dict) -> str:
                      f"大批回放排北京 18:00–次日 08:00)")
 
         if opts.dry_run:
+            how = (f"样本:反例 {len(picked)} / 正例 {len(pos_asins)}"
+                   f"(**取自 run_tag 既有行,不重新抽样**)" if stored else
+                   f"样本:反例 {len(picked)} / 正例 {len(pos_asins)}"
+                   f"(每类封顶 {cap};反例池 {neg_stats['scanned']} 行 → 合格 "
+                   f"{len(neg_pool)},正例池 {pos_stats['scanned']} 行 → 合格 "
+                   f"{len(pos_pool)})")
             lines = [
                 "🧪 audit_replay --dry-run(零 LLM、零落库、不写报告文件)",
                 f"run_tag={opts.tag};seed={opts.seed};并发 {opts.workers}",
-                f"样本:反例 {len(picked)} / 正例 {len(pos_asins)}"
-                f"(每类封顶 {cap};反例池 {neg_stats['scanned']} 行 → 合格 "
-                f"{len(neg_pool)},正例池 {pos_stats['scanned']} 行 → 合格 "
-                f"{len(pos_pool)})",
+                how,
                 cost_head,
             ]
             if opts.conn_note:
@@ -824,6 +981,12 @@ def run(params: dict) -> str:
             lines.append("真跑:去掉 --dry-run(会调 LLM 并落 "
                          "audit.replay_results;结论表一个字都不碰)")
             return "\n".join(lines)
+
+        # ⚠ **判定之前先提交**:抽样与打标那几条查询开的事务,如果一直挂到
+        # 判定跑完(几百条 × 几秒 LLM = 几十分钟),这条连接就是几十分钟的
+        # idle in transaction —— 它按住一个老快照,vacuum 清不掉那段时间里
+        # 产生的死行,而回放期间生产链正在往同几张表写。读完就撒手。
+        conn.commit()
 
         # 真跑:计数器每轮清零(跨轮累加的数字读起来像"这一轮坏了这么多")
         _llm.reset_retry_stats()
@@ -841,13 +1004,15 @@ def run(params: dict) -> str:
                                                  items=len(rows))]
     meta = {"tag": opts.tag, "seed": opts.seed, "cap": cap,
             "elapsed": elapsed, "neg_stats": neg_stats, "pos_stats": pos_stats,
-            "cost_lines": cost_lines}
+            "cost_lines": cost_lines, "reused": bool(stored)}
     summary, full = report(rows, meta)
     paths.reports_dir().mkdir(parents=True, exist_ok=True)
     path = paths.audit_replay_report()
     path.write_text("\n".join(full) + "\n", encoding="utf-8")
-    tail = [f"落库 audit.replay_results {written} 行(run_tag={opts.tag},"
-            f"同 tag 重跑覆盖);**结论表一个字都没碰**",
+    tail = [f"落库 audit.replay_results {written} 行(run_tag={opts.tag};"
+            + ("**重放既有样本**,原地覆盖" if stored else
+               "首次使用该 tag —— 之后同 tag 再跑会**重放这一批**,不重新抽样")
+            + ");**结论表一个字都没碰**",
             f"▍全文报告(含逐条错判清单)→ {path}"]
     if opts.conn_note:
         tail.insert(0, opts.conn_note)

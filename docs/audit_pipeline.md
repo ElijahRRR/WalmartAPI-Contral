@@ -704,8 +704,10 @@ L3 那一行 **B1 已落地**(§5);L0 的双输出与 L2 的瘦身留给 C 批�
 - ✅ **B2 已落地** —— `audit_replay` 回放工作流(拿沃尔玛裁决考这条链:反例召回 /
   类别准确率 + 混淆表 / **正例误伤新旧并排**(所有者底线:新链不高于旧链)/ 新旧
   一致率 / 按置信分层错误率 / pending 分层 / 成本与耗时;只写 `audit.replay_results`
-  与 `<DATA_ROOT>/reports/audit_replay.txt`)、`mode=stale` 的 `active_days=90`
-  (§1)、首条串行预热(`services/audit_pool`,省一批前缀缓存 miss);
+  与 `<DATA_ROOT>/reports/audit_replay.txt`;样本身份 = `run_tag`,同 tag 重放
+  同一批;旧链基线按新列 `audit_runs.audit_version` 排掉新链自己写的行)、
+  `mode=stale` 的 `active_days=90`(§1)、首条串行预热(`services/audit_pool`,
+  省一批前缀缓存 miss);
 - ⬜ C 批 —— L0 契约从「命中即终止」改为「**硬命中终止、软命中带证据前行**」
   (`audit_hits` 可落多行;`stage_stopped_at` 语义不变,只有硬拒才停);
   R4/R10 迁入 L0、L2 只剩 R1、删 R3 硬拒 / R5 / R7 / R8 与

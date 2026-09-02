@@ -306,6 +306,33 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   (配错 mode 直接抛):静默忽略的话人以为只判了有动销的、实际整批重付,
   而摘要长得一模一样。摘要**首行**点名「近 N 天有动销」/「不限动销」。
 
+**B2 对抗复核修订(2026-09-02,ACCEPT-WITH-FIXES 逐条)**:
+
+1. **正例必须干净到 asin 级**:`_POS_SQL` 的 `NOT EXISTS` 是 **sku 级**,而身份是
+   asin 级(A 店订货号在架、B 店订货号被拒,两行 sku 不相等,SQL 比不出来)。
+   改为:排除**整个反例池**的 asin(不只是抽中的那批)+ 排除
+   `rejected_asins()`(下架侧 sku 全量经 `services/sku_asin` 折成 asin)。
+   漏斗分档记账。⚠ 判据面**不封顶**:抽样面抽不到就是没抽到,判据面漏一行
+   就是把被拒的品当成好品去算误伤率;
+2. **旧链基线不许含新链自己的行**:`audit.audit_runs` 补 `audit_version` 列
+   (`audit_store` 落库时盖当前版本),基线 = 最近一次
+   `audit_version IS DISTINCT FROM <当前版本>`(NULL 算旧)。没有它,跑过一轮
+   `mode=stale` 之后就是新链跟新链比;报告头逐字写明这条口径;
+3. **底线判在共同子集**:新链分母原是全部正例、旧链分母是"其中有旧结论的",
+   两批产品不一样,比出来的"新链更好"可能只是因为另一批本来更干净。
+   现在共同子集上新旧并排(底线判这里),全库水位另行单列;
+4. **内容族两页进 `check_rule_policies`**:与 `AUDIT_IP_POLICY` 同一道装配期
+   守门(对不上 RuntimeError,报错点名该改哪个常量);回放的期望类别改经
+   `policy_names.resolve` 取**表内原拼写**,不把常量原样吐出来;
+5. **样本身份 = `run_tag`**(见 §五):同 tag 有行就重放那一批,不重新抽样;
+6. **判定前先提交**:抽样/打标的事务不许挂满整轮判定(几十分钟
+   idle in transaction 按住老快照,vacuum 清不掉生产链这期间的死行);
+7. **`limit_per_category=0` 报错**而不是静默落回缺省(`or` 把 0 和"没传"当成
+   同一件事);
+8. **`_CANDIDATE_SQL` 只 format 自己的尾段**:列清单是 `audit_rules` 的文本,
+   那边哪天多一个 `{` 就会把 `product_audit` 炸在 KeyError,而吃同一份文本的
+   `audit_replay` 一点事没有 —— 两边都看不出来的耦合。
+
 ## 四、C 批规格:瘦身 + 清理
 
 ### 4.1 L0 双输出
@@ -359,7 +386,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 
 ```bash
 git pull                                    # 看钟:18:10 之前 pull,当晚 audit_sheet 就用新链
-python cli.py db_init                       # audit_detail 列 + replay_results 表(幂等)
+python cli.py db_init                       # audit_detail 列 + audit_runs.audit_version 列 + replay_results 表(幂等)
 python cli.py policy_sync --dry-run         # 预期 新增 2(id 43/44 内容族)/ 刷新 42 / 改名 0
 python cli.py policy_sync
 python cli.py audit_replay --dry-run        # 样本规模 + 预估成本
@@ -370,8 +397,18 @@ python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 9
 - 回放报告不达标(§六第 5 条的线:**正例误伤率不高于旧链**)→ 不跑 `mode=stale`,
   先修提示词/规则再回放;修改 = 再提版。报告里那一行会自己说话
   (达标写「底线达标」,不达标写「⚠ 新链误伤高于旧链……别开 mode=stale」)。
-- 回放**同 tag 重跑覆盖**:改完提示词用同一个 `-p seed=` 与 `-p tag=` 再跑一次,
-  就是同一批样本的前后对照(`audit.replay_results` 按 `(run_tag, asin)` 主键)。
+- 回放的**样本身份是 `run_tag`,不是 `seed`**(2026-09-02 B2 复核修订):
+  某个 tag 在 `audit.replay_results` 里已经有行,就**重放那一批 asin**(期望值
+  原样取回、结果原地覆盖),不重新抽样;换一批样本 = 换 tag。
+  理由:`seed` 只保证"同一份候选面上抽同一批",而候选面 `catalog.walmart_items`
+  每天被 `catalog_sync` 重写 —— `ORDER BY md5(sku || seed) LIMIT` 的窗口跟着天天变,
+  隔天"同 seed 对比"已经不是同一批产品,而两份报告长得一模一样。
+  ⇒ 改完提示词的正确姿势:`python cli.py audit_replay -p tag=<上一次那个 tag>`。
+- **旧链基线排掉新链自己写的行**:`audit.audit_runs` 2026-09-02 B2 补了
+  `audit_version` 列(`services/audit_store` 落库时盖当前 `AUDIT_RULES_VERSION`),
+  回放取的是每个 asin 最近一次 `audit_version IS DISTINCT FROM <当前版本>` 的行
+  (NULL = 存量老行,算旧链)。没有这道谓词的话,**跑过一轮 `mode=stale` 之后**
+  基线就变成新链自己的结论 —— 自己跟自己比,而数字看着完全正常。
 - 回放会写 `catalog.llm_cache`(判定链自己写)—— 那**不是**浪费:紧接着的
   `mode=stale` 重审命中同一批缓存,回放的钱等于预付了一部分。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。

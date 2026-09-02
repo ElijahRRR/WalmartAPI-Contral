@@ -1904,13 +1904,16 @@ def test_run_submits_futures_per_chunk_not_all_at_once():
     每个 future 吊着入参(ProductInfo 带标题/五点/长描述),完成后还吊着
     AuditOutcome —— 全量提交等于把整批数据再复制两份留在内存里。
     分块提交只限制"在飞的量",线程池与连接池仍整轮共用一套,吞吐不受影响。
+
+    ⚠ 2026-09-02 B2:提交改走 `audit_pool.submit_chunk`(首条串行预热),
+    钉的仍是同一件事 —— **提交在分块循环内**。
     """
     import inspect
 
     src = inspect.getsource(product_audit.run)
     chunk_loop = src.index("for chunk in chunks:")
-    submit = src.index("ex.submit(_judge, p)")
-    assert chunk_loop < submit, "ex.submit 必须在分块循环**内**"
+    submit = src.index("audit_pool.submit_chunk(")
+    assert chunk_loop < submit, "提交必须在分块循环**内**"
     # 候选取数不许再回到 fetchall
     assert "_iter_candidates(" in src
     assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"
@@ -1961,3 +1964,105 @@ def test_mode_stale_refuses_l0_only(monkeypatch):
 
     with pytest.raises(ValueError, match="stale"):
         product_audit.run({"mode": "stale", "stages": "L0"})
+
+
+# ── 首条串行预热(2026-09-02 B2,规格 §3.9)────────────────────────────────
+
+class _FakeEx:
+    """记录 submit 顺序的假线程池(不起线程:预热要验的是**调用次序**)。"""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, fn, arg):
+        self.submitted.append(arg)
+        from concurrent.futures import Future
+        f = Future()
+        f.set_result(("pooled", arg))
+        return f
+
+
+def test_warmup_judges_the_first_item_before_the_pool_gets_anything():
+    """L3 开且候选 >1 时,第一条**同步**判完再开池(规格 §3.9)。
+
+    为什么要有它:128 并发起跑,前一批会**同时**看到"这段 6 万 token 的前缀
+    还没被缓存过",一批全按未命中价付 —— 单条未命中约是命中价的十几倍。
+    先串行送一条进去,后面的才有前缀缓存可命中。
+
+    钉两件事:① 池子只拿到 n-1 条;② 第一条在**任何** submit 之前就判完了
+    (顺序反了的话预热等于没做,而且成本差异只体现在账单上,不会报错)。
+    """
+    from services import audit_pool
+
+    ex = _FakeEx()
+    order = []
+
+    def judge(arg):
+        order.append(("judged", arg, len(ex.submitted)))
+        return ("warm", arg)
+
+    todo = [(f"B0{i}", f"p{i}") for i in range(5)]
+    futs, warmed = audit_pool.submit_chunk(ex, todo, judge, warm=True)
+
+    assert warmed == 1
+    assert ex.submitted == ["p1", "p2", "p3", "p4"]      # 池子只拿到 n-1 条
+    assert order == [("judged", "p0", 0)]                # 判完时池子还是空的
+    assert len(futs) == 5                                # 预热那条也进 futs
+    assert sorted(futs.values()) == ["B00", "B01", "B02", "B03", "B04"]
+    assert [f.result() for f in futs if futs[f] == "B00"] == [("warm", "p0")]
+
+
+def test_warmup_is_skipped_when_off_or_single_item():
+    """`warm=False`(L3 关 / 已经预热过)与"本块只有一条"都不预热 ——
+    一条产品谈不上"省一批 miss":它自己就是那一次未命中。"""
+    from services import audit_pool
+
+    ex = _FakeEx()
+    calls = []
+    futs, warmed = audit_pool.submit_chunk(
+        ex, [("A", 1), ("B", 2)], lambda a: calls.append(a), warm=False)
+    assert warmed == 0 and calls == [] and ex.submitted == [1, 2]
+    assert len(futs) == 2
+
+    ex2 = _FakeEx()
+    futs2, warmed2 = audit_pool.submit_chunk(
+        ex2, [("A", 1)], lambda a: calls.append(a), warm=True)
+    assert warmed2 == 0 and calls == [] and ex2.submitted == [1]
+    assert len(futs2) == 1
+
+
+def test_warmup_failure_travels_in_the_future_not_as_a_raise():
+    """预热那条判炸了,异常必须**装进 future** —— 调用方的单行隔离
+    (savepoint / 连续失败计数)才管得着它。就地抛的话整轮直接崩,
+    而其余候选一条都还没提交。"""
+    from services import audit_pool
+
+    ex = _FakeEx()
+
+    def boom(arg):
+        raise RuntimeError("判定炸了")
+
+    futs, warmed = audit_pool.submit_chunk(
+        ex, [("A", 1), ("B", 2), ("C", 3)], boom, warm=True)
+    assert warmed == 1 and ex.submitted == [2, 3]        # 其余照常提交
+    first = [f for f, k in futs.items() if k == "A"][0]
+    with pytest.raises(RuntimeError, match="判定炸了"):
+        first.result()
+
+
+def test_run_wires_the_warmup_once_per_round_and_says_so():
+    """接线三条(改动很小,漏一条就静默失效):
+
+    ① 走的是 `audit_pool.submit_chunk`(预热规则只有一份实现,回放工作流吃同一份);
+    ② `warm=` 带 `not warmup_n` —— 整轮只预热一次,不是每块一次;
+    ③ 条数进摘要 —— 预热是**省钱动作**,不亮出来没人知道它有没有真发生。
+    """
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "audit_pool.submit_chunk(" in src
+    assert "warm=(not warmup_n) and run_l3 and not only_l0" in src
+    assert "warmup_n += warmed" in src
+    assert "ex.submit(_judge, p)" not in src, "提交只准走 submit_chunk 一条路"
+    assert "前缀预热" in inspect.getsource(product_audit._summary)
+    # L0 只跑 Phase0(零 LLM),预热在那条路上纯属白判一条
+    assert "not only_l0" in src

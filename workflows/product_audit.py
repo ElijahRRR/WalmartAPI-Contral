@@ -98,8 +98,8 @@ from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_l3, audit_reason, audit_rules, audit_store, \
-    db_guard, kpi, \
+from services import audit_l3, audit_pool, audit_reason, audit_rules, \
+    audit_store, db_guard, kpi, \
     listing_sheet, policy_names, product_events, product_ingest, risk_trace, \
     scrape_batches, store_events, stores
 
@@ -1309,6 +1309,7 @@ class Counts:
     asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
     uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
     uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
+    warmup_n: int = 0       # 首条串行预热的条数(0/1;规格 §3.9,见 audit_pool)
     # TRO 命中(2026-08-30;dry-run 恒 0 —— 那一路根本不跑,见 _tro_hook 调用点)
     tro_n: int = 0          # 本轮命中的 TRO 品牌数(含早就报过的)
     tro_new: int = 0        # 其中**首报**的(dedupe rowcount==1),真落了源头事件
@@ -1386,6 +1387,12 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
     else:
         tail = ",LLM 零退避(未撞限流,可继续加并发)"
     lines.append(f"并发 {opts.workers}{tail}")
+    if counts.warmup_n:
+        # 预热是**省钱动作**,不亮出来就没人知道它有没有真的发生(它唯一的
+        # 表现是"这一轮的缓存命中率高一点",而那个数本身就在波动)
+        lines.append(f"前缀预热 {counts.warmup_n} 条(第一条串行判完再开池:"
+                     f"并发起跑会让前一批同时未命中 DeepSeek 前缀缓存,"
+                     f"单条未命中约是命中价的十几倍)")
     if opts.conn_note:
         # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
         lines.append(opts.conn_note)
@@ -1584,6 +1591,7 @@ def run(params: dict) -> str:
                "new": 0, "expo": 0, "errors": 0}
         row_errors, consec_errors = 0, 0
         l0_untouched = 0
+        warmup_n = 0                 # 首条串行预热(整轮最多一次,见 audit_pool)
         done_n = 0
         cand_n = 0                   # 累计取到的候选行数(摘要报它,取代 len(rows))
         todo_n = 0                   # 累计**进了判定**的行数(≠ 落结论数,见下)
@@ -1696,7 +1704,14 @@ def run(params: dict) -> str:
                     #   线程池与连接池仍是整轮共用一套 —— 分块的是"在飞的量",
                     #   不是并发度,吞吐不受影响。
                     todo_n += len(todo)
-                    futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                    # 首条串行预热(2026-09-02 B2,规格 §3.9):L3 开且候选 >1
+                    # 时,第一条**同步**判完再开池 —— 128 并发起跑会让前一批
+                    # 同时未命中 DeepSeek 的前缀缓存,一批全按未命中价付。
+                    # 整轮只预热一次(`warmup_n` 非零之后不再预热)。
+                    futs, warmed = audit_pool.submit_chunk(
+                        ex, todo, _judge,
+                        warm=(not warmup_n) and run_l3 and not only_l0)
+                    warmup_n += warmed
                     for fut in as_completed(futs):
                         asin = futs[fut]
                         try:
@@ -1802,6 +1817,7 @@ def run(params: dict) -> str:
     stage_stats["reason_missing"] = audit_reason.STATS.get("reason_missing", 0)
     tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
                    l0_untouched=l0_untouched, adopted_n=adopted_n,
+                   warmup_n=warmup_n,
                    no_title=no_title, seller_missing=seller_missing,
                    row_errors=row_errors,
                    asked_asins=len(extra.get("asins", ())),

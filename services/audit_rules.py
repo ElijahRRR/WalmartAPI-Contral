@@ -36,7 +36,9 @@ class AuditContext:
     phase0_asins: frozenset
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
-    ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
+    brand_mention_automaton: object   # ahocorasick.Automaton 或 None
+                                   # (L0 品牌文案扫描;2026-09-03 C 批随 R4
+                                   #  迁入 L0 从 ac_automaton 改名)
     nice_mapping: dict
     nice_default: list
     uspto: object = None           # psycopg 连接或 None(R5 开关)
@@ -50,20 +52,22 @@ class AuditContext:
     # 类目黑名单(2026-08-20:代码里的类目常量搬进 DB)。三种匹配一次装配:
     # 子树 node_id / 顶级名 / 完整路径等值,判定见 services.category_blacklist.check
     cat_rules: object = None
-    # R4 键 → 黑名单来源原文(2026-08-30,TRO 命中接线)。**带默认值**:
+    # 品牌黑名单键 → 来源原文(2026-08-30,TRO 命中接线;键形同文案扫描词集,
+    # 字段名沿用 `r4_source` —— 存量接线与事件账本按它认)。**带默认值**:
     # 测试里手搓的 ctx 不给它也照跑,TRO 那一路自然退化成"一个都不命中"。
     r4_source: dict = field(default_factory=dict)
 
 
 def _brand_map(conn) -> tuple[dict, set, dict]:
-    """输入:连接 → 输出:(Phase0 品牌 dict, R4 词集, R4 键→来源原文)——同源三套口径。
+    """输入:连接 → 输出:(品牌等值 dict, 文案扫描词集, 词→来源原文)——同源三套口径。
 
     源 = **catalog.brand_blacklist**(黑名单中心品牌总表镜像;所有者定稿
     2026-08-13:黑名单只维护一份,不再读 audit.blacklist_brands 快照,也不再
     合并 compat yaml 的 34 个手补牌子——要补进飞书品牌总表,单源)。
-    Phase0 dict(规整小写→原文):strip → lower → 空白压单空格。
-    R4 词集:只 strip+lower(保留词内空白,旧 l2 加载器口径)。
-    R4 来源 dict:**键与 R4 词集同型**(strip+lower),值是 `source` 列原文 ——
+    等值 dict(规整小写→原文):strip → lower → 空白压单空格(L0 规则 4 查它)。
+    文案扫描词集:只 strip+lower(保留词内空白,旧 l2 加载器口径;
+    2026-09-03 C 批前叫「R4 词集」,判定随规则迁进 L0,取数口径一字未改)。
+    来源 dict(`r4_source`,名字沿用存量接线):**键与词集同型**(strip+lower),值是 `source` 列原文 ——
     TRO 命中接线按它认「这个黑名单词是不是 TRO 品牌」(判据在
     services/audit_store.tro_hits,前缀常量在 registry)。
     ⚠ 同一个键多行时 **setdefault 先到先得**:总表按 brand_key 主键去重,同键
@@ -88,7 +92,7 @@ def _brand_map(conn) -> tuple[dict, set, dict]:
             norm = " ".join(key.split())
             if norm and norm not in phase0:
                 phase0[norm] = raw
-    logger.info("品牌黑名单加载(黑名单中心):Phase0 %d 键 / R4 %d 键",
+    logger.info("品牌黑名单加载(黑名单中心):等值 %d 键 / 文案扫描 %d 键",
                 len(phase0), len(r4))
     return phase0, r4, r4_source
 
@@ -120,9 +124,11 @@ def _rows_dict(conn, sql: str, key: str) -> dict:
 
 
 def _build_automaton(brand_keys) -> object:
-    """输入:规整小写品牌键 → 输出:Aho-Corasick 自动机(R4;逐字迁 spec_l2 §5.3)。
+    """输入:规整小写品牌键 → 输出:Aho-Corasick 自动机(逐字迁 spec_l2 §5.3)。
 
     过滤:len<2 跳过、is_stopword 剔除(min_len=4 默认)——42,726 → 有效词数记日志。
+    消费方是 L0 的品牌文案扫描(`audit_phase0._scan_brand_mentions`,2026-09-03
+    C 批前是 L2 R4);**只在这里构建一次**,ctx 装配期。
     """
     import ahocorasick
     a = ahocorasick.Automaton()
@@ -133,22 +139,26 @@ def _build_automaton(brand_keys) -> object:
         a.add_word(b, b)
         kept += 1
     a.make_automaton()
-    logger.info("R4 品牌自动机:%d/%d 词(停用词过滤后)", kept, len(brand_keys))
+    logger.info("L0 品牌文案自动机:%d/%d 词(停用词过滤后)", kept, len(brand_keys))
     return a
 
 
 _UNMAPPED_SENTINEL = audit_l1_llm.UNMAPPED_SENTINEL   # 单一出处
 
 #: 代码里**写死的政策类别名** → 它出生的那个 registry 常量名(报错要指得出改哪儿)。
-#: 两族(`docs/audit_step3_spec.md` §二 表 + §3.8):
+#: 三族(`docs/audit_step3_spec.md` §二 表 + §3.8 + §4.1):
 #:   · `AUDIT_IP_POLICY` —— 品牌黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的
 #:     品牌翻拒,四处判同一个 IP。不经政策表查询就写进 `hit.detail["category"]`
 #:     并一路落库、进飞书 G 列、进申诉口径;
+#:   · `AUDIT_PRODUCT_CLAIMS_POLICY` —— L0 的 Made in USA 硬拒(2026-09-03 C 批
+#:     自 L2 R10 迁入)自报的类别,同样直接落库进飞书;
 #:   · `AUDIT_CONTENT_POLICIES` —— 内容族两页(2026-09-02 B2 补进本闸):回放
 #:     评估拿它当 CONTENT 反例的期望类别。**同样是写死的拼写**,漂了的表现是
 #:     "内容族那一类的类别准确率一夜归零",而没有任何东西会红。
 #: 所以拼写必须**就是**表内那一行 —— 装配时一次性对表,对不上启动即炸。
 RULE_POLICIES = ((resources.AUDIT_IP_POLICY, "AUDIT_IP_POLICY"),
+                 (resources.AUDIT_PRODUCT_CLAIMS_POLICY,
+                  "AUDIT_PRODUCT_CLAIMS_POLICY"),
                  *((n, "AUDIT_CONTENT_POLICIES")
                    for n in resources.AUDIT_CONTENT_POLICIES))
 
@@ -185,7 +195,7 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     'Office Chairs' 已改名 'Desk Chairs'——直出会让 R0/R1/R2/R3 四闸集体失明
     产出假 pass;旧仓 l1_category.py:605-620 用 INNER JOIN pt_meta 防的正是它)。
     """
-    brand, r4_keys, r4_source = _brand_map(conn)
+    brand, brand_keys, r4_source = _brand_map(conn)
     # TRO 口径守夜(2026-08-30):source 是**自由文本**,而且由飞书同步整列覆盖
     # (risk_sync)。所有者哪天把「TRO品牌」改成别的写法,这里会静默变成 0,
     # 而 TRO 接线的表现是"从此再也不报警"——最难发现的那种坏法。恒 0 就是
@@ -193,10 +203,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     tro_n = sum(1 for s in r4_source.values()
                 if str(s).strip().lower().startswith(
                     resources.TRO_BRAND_SOURCE_PREFIX))
-    logger.info("R4 品牌来源:带来源 %d 词,其中 TRO 前缀 %d 词",
+    logger.info("品牌黑名单来源:带来源 %d 词,其中 TRO 前缀 %d 词",
                 len(r4_source), tro_n)
     if not tro_n:
-        logger.warning("R4 品牌来源里 **TRO 前缀 0 词** —— 生产实证应有两万余条,"
+        logger.warning("品牌黑名单来源里 **TRO 前缀 0 词** —— 生产实证应有两万余条,"
                        "多半是黑名单总表「来源」列改了写法(前缀常量:"
                        "registry.resources.TRO_BRAND_SOURCE_PREFIX);"
                        "在此之前 TRO 命中接线整条不会报警")
@@ -289,7 +299,7 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         # requirements"(所有者定稿),那张表是批次 A 搬来的死快照,而"整机 vs
         # 小件"这类推断已移交 L3 判定维度 6。表本身不删(pt_spec_sync 仍写它、
         # audit_why / pt_census 仍查它做诊断),只是审核链不再拿它当判据。
-        ac_automaton=_build_automaton(r4_keys),
+        brand_mention_automaton=_build_automaton(brand_keys),
         r4_source=r4_source,
         nice_mapping=nice_mapping, nice_default=nice_default,
         uspto=uspto,

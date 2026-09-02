@@ -1,14 +1,26 @@
-"""Phase 0 精准前置拦截:黑名单(卖家/ASIN/类目)/ 商标符号 / 专利声明 / 品牌。
+"""Phase 0 前置拦截:黑名单(卖家/ASIN/类目)/ 商标符号 / 专利声明 /
+Made in USA / 品牌,外加一条软证据(品牌黑名单文案扫描)。
 
 移植自旧仓 pipelines/phase0.py + phase0_lark_blacklist.py + phase0_category.py
 + phase0_trademark.py + phase0_brand.py 五个文件(a565d95),合并为一个模块。
 
-设计原则(旧仓 phase0.py:3-13 原文):Phase0 只处理"100% 确定不能上"的情况,
-不做文本级启发式;title 含品牌词这类模糊信号交 L2 R4 / L3 判。
+设计原则(旧仓 phase0.py:3-13 原文):Phase0 的**硬拒**只处理"100% 确定不能上"
+的情况,不做文本级启发式 —— 判据要么是库里的等值查表,要么是字面声明的正则。
 
-四条规则**串行短路**,任一命中即整条流水线终止,每条最多产出 1 条 RuleHit,
-penalty 恒 -100,stage 恒 "L0"。所以同一产品即便同时踩飞书黑名单和禁售类目,
-audit_hits 也只有 1 行 —— 这是旧仓行为,照迁。
+**五硬一软,双输出**(2026-09-03 C 批,规格 §4.1;旧形态是"四条硬规则串行短路"):
+
+  硬拒(penalty -100,串行短路,任一命中即整条流水线终止、`blocked=True`):
+    1. 黑名单三表(卖家 / ASIN / 亚马逊类目)  2. 商标符号 ®/™/℠/©
+    3. 文案自述专利                          4. Made in USA 声明(原 L2 R10)
+    5. 品牌字段精确等值黑名单
+  软证据(penalty 0,**全部硬规则未命中才跑**,落 `Phase0Result.evidence`):
+    · 品牌黑名单**文案**扫描(原 L2 R4)—— 命中不终止,随产品进 L3 由 LLM 判
+      "提到 ≠ 卖的就是"(R6 误伤率 90% 的教训)。
+
+所以一次 run 的 L0 行数是:硬拒 1 行,**或**软证据 n 行(两者互斥);
+`stage_stopped_at='L0'` 的语义不变 —— **只有硬拒才停**。
+黑名单能力从此只在 L0 一处实现、共用 `catalog.brand_blacklist` 一份数据
+(所有者定稿 `docs/audit_pipeline.md` §10)。
 
 与旧仓的结构性差异(只改取数方式,不改判定):
   - 旧仓四个 check() 各自 lru_cache + psycopg.connect 直连 DB;新仓禁止 services
@@ -29,11 +41,17 @@ public:
 from __future__ import annotations
 
 import re
+import threading
 from typing import Any
 
 from registry import resources
 from services import category_blacklist, policy_names
 from services.audit_models import Phase0Result, ProductInfo, RuleHit
+
+# 品牌文案扫描的自动机锁(product_audit workers>1 共享同一个 ctx;
+# pyahocorasick 只读迭代的线程安全没有官方保证,锁住扫描段 —— µs 级,
+# 相对秒级 LLM 调用零成本)。逐字迁自 audit_l2(R4 迁入时随迁)。
+_AC_LOCK = threading.Lock()
 
 # =============================================================
 # 规则 1 —— 飞书黑名单(seller_id / asin / amazon 类目)
@@ -303,6 +321,66 @@ def _check_patent(product: ProductInfo) -> Phase0Result:
 
 
 # =============================================================
+# 规则 3.6 —— Made in USA 声明(原 L2 R10,2026-09-03 C 批迁入 L0)
+# =============================================================
+#
+# 生产实证:沃尔玛按 "Prohibited Product Policy on Made in USA claims" 下架,
+# 理由是 FTC 对 Made in USA 声明要求卖家能实证 —— 搬运模式下文案来自亚马逊,
+# 我们**永远无法实证**,声明本身即违规,与商品真实产地无关。
+# 硬拒(-100):判据是**字面声明**,不是推断 —— 与"专利自述"同类(文案自己
+# 写下来的东西就是铁证),所以 2026-09-03 与它并排住进 L0;这与"儿童品不进
+# L2"(误伤面大、只能语义判)方向相反且都是对的。
+# 词边界防误伤:"usa" 必须独立成词("Jerusalem"/"thousand" 不命中);
+# 只认肯定式声明,"not made in usa" 由否定前置词排除。
+# 正则与否定式排除逐字迁自 audit_l2._R10_MADE_IN_USA / _R10_NEGATION。
+_MADE_IN_USA_RE = re.compile(
+    r"\b(?:made|manufactured|built|produced|crafted)\s+in\s+"
+    r"(?:the\s+)?(?:usa|u\.s\.a\.?|u\.s\.|united states)(?:\s+of\s+america)?\b"
+    r"|\b(?:usa|american)[- ]made\b",
+    re.IGNORECASE)
+_MADE_IN_USA_NEGATION = re.compile(r"\b(?:not|isn't|isnt)\s+(?:made|manufactured)\b",
+                                   re.IGNORECASE)
+
+
+def _check_made_in_usa(product: ProductInfo) -> Phase0Result:
+    """输入:产品 → 输出:Phase0Result(文案声明 Made in USA 即 blocked)。
+
+    扫描面 = 标题 + **全部**五点 + 长描述(声明可能只出现在长描述里)——
+    与同层的商标/专利两条**有意不同**:那两条沿用旧仓的 5 条五点 / 1000 字符
+    窗口(逐字迁移契约),这条是漏判反哺加的硬拒,漏了就是漏判,全文都扫。
+    类别自报 `Product claims`(官方第 29 节里的 Made in the USA 专段);
+    旧 R10 detail 里那个自造的 `Made in USA claims` 政策名已删 —— 政策表里
+    没有那一行,写进去就是往全链唯一键上塞一个 join 不上的串。
+    """
+    parts = [product.title or ""]
+    parts += list(product.bullet_points or [])
+    parts.append(product.long_description or "")
+    scan = "\n".join(x for x in parts if x)
+    if not scan.strip():
+        return Phase0Result(blocked=False)
+    mt = _MADE_IN_USA_RE.search(scan)
+    if not mt:
+        return Phase0Result(blocked=False)
+    # 否定式排除:命中点前 40 字符内出现 not made/manufactured 视为反声明
+    ctx_before = scan[max(0, mt.start() - 40):mt.start()]
+    if _MADE_IN_USA_NEGATION.search(ctx_before + mt.group(0)):
+        return Phase0Result(blocked=False)
+
+    hit = RuleHit(
+        stage="L0",
+        rule_code="phase0_made_in_usa",
+        penalty=-100,
+        detail={
+            "matched": mt.group(0),
+            "category": resources.AUDIT_PRODUCT_CLAIMS_POLICY,  # 规则自报类别(§二)
+            "note": "FTC 要求卖家实证 Made in USA 声明;搬运文案无法实证,"
+                    "声明本身即违规(生产实证下架原因)",
+        },
+    )
+    return Phase0Result(blocked=True, hits=[hit])
+
+
+# =============================================================
 # 规则 4 —— 品牌精准黑名单(brand 字段等值,不扫 title)
 # =============================================================
 
@@ -378,17 +456,107 @@ def _check_brand(product: ProductInfo, ctx: Any) -> Phase0Result:
 
 
 # =============================================================
+# 软规则 —— 品牌黑名单**文案**扫描(原 L2 R4,2026-09-03 C 批迁入 L0)
+# =============================================================
+#
+# 与规则 4 是**同一份数据的两种判法**(所有者定稿:黑名单能力只在 L0 一处
+# 实现、一份数据 `catalog.brand_blacklist`):
+#   · brand 字段精确等值 → 硬拒(规则 4);
+#   · 标题/五点/描述里扫到黑名单词 → **0 分证据不终止**,送 L3 由 LLM 判它是
+#     真品牌还是通用英文词 / "兼容·适配"式提及(R6 硬拦误伤率 90% 的教训:
+#     提到 ≠ 卖的就是)。
+# 自动机在 ctx 装配期**只构建一处**(services/audit_rules._build_automaton)。
+
+# 中日韩 + 全角:这些文字之间不写空格,"紧邻"就是词与词的分界
+_CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff"
+                     r"\ufe30-\ufe4f\uff00-\uffef]")
+
+
+def _is_word_boundary_char(c: str) -> bool:
+    """输入:单个字符 → 输出:它是否算词边界。
+
+    ⚠ 2026-08-20 修:`c.isalnum()` 对中文/全角返回 True,于是"耐克运动鞋"里
+    黑名单词「耐克」左右都被判成非边界 —— **中文品牌一个都拦不住**,而且不报错。
+    中日韩与全角字符不写分词空格,紧邻即边界,单独判掉;拉丁带音标字母
+    (café 的 é)仍按词内字符处理,免得把 "Caf" 这种前缀切出来误命中。
+    """
+    if not c:
+        return True
+    if _CJK_RE.match(c):
+        return True
+    return not (c.isalnum() or c == '_')
+
+
+def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
+    """输入:产品 + ctx(用 ctx.brand_mention_automaton) → 输出:软证据 hit(0 或 1 条)。
+
+    扫 product.searchable_text(title + 全部五点 + 长描述)。自动机未构建(None)
+    → 返回 [](未装 pyahocorasick / 词表为空 / 手搓 ctx 没给这个字段)。
+    AC 不自带词边界,命中后手动检查前后字符;**自品牌豁免是精确等值**
+    (brand strip+lower 后与命中词完全相等才跳过);同一个 brand 只报第一次。
+    判定逻辑逐字迁自 audit_l2._rule_title_desc_blacklist(rule_code 与层次变了,
+    判法一个字没变 —— 迁层不是改判据)。
+    """
+    hay = product.searchable_text
+    if not hay:
+        return []
+    A = getattr(ctx, "brand_mention_automaton", None)
+    if A is None:
+        return []
+    own_brand = (product.brand or "").strip().lower()
+    hay_lower = hay.lower()
+    n = len(hay_lower)
+
+    matches: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # AC iter 返回 (end_index, value), end_index 是命中末字符的位置 (inclusive)。
+    # workers>1 时共享一个自动机:pyahocorasick 只读迭代的线程安全没有官方
+    # 保证,锁住扫描段(µs 级,相对秒级 LLM 调用零成本)
+    with _AC_LOCK:
+        ac_matches = list(A.iter(hay_lower))
+    for end_idx, brand in ac_matches:
+        if brand in seen or brand == own_brand:
+            continue
+        start_idx = end_idx - len(brand) + 1
+        # 手动 word boundary 检查 (AC 不自带)
+        left_ok = (start_idx == 0) or _is_word_boundary_char(hay_lower[start_idx - 1])
+        right_ok = (end_idx == n - 1) or _is_word_boundary_char(hay_lower[end_idx + 1])
+        if not (left_ok and right_ok):
+            continue
+        seen.add(brand)
+        # 还原原始大小写显示给审核员
+        matches.append({"brand": brand, "matched_phrase": hay[start_idx:end_idx + 1]})
+
+    if not matches:
+        return []
+    return [RuleHit(
+        stage="L0",
+        rule_code="phase0_brand_mention",
+        penalty=0,
+        detail={
+            "matches": matches,
+            "count": len(matches),
+            "note": "L3 LLM 需判断每个词是真品牌还是通用词",
+        },
+    )]
+
+
+# =============================================================
 # 主入口
 # =============================================================
 
 
 def check(product: ProductInfo, ctx: Any) -> Phase0Result:
-    """输入:产品 + 上下文 → 输出:Phase0Result(四规则串行短路,最多 1 条 hit)。
+    """输入:产品 + 上下文 → 输出:Phase0Result(五硬规则短路,或软证据继续)。
 
-    顺序:类目/卖家/ASIN 黑名单(规则 1,类目三种匹配已并入)→ 商标符号 →
-    专利声明 → 品牌黑名单。
-    最后一条无 if 直接 return,所以全不命中时返回的是品牌规则那个
-    Phase0Result(blocked=False)(空 hits、空 matched_*)。
+    硬拒顺序(串行短路,命中即 blocked=True 返回,最多 1 条 hit):
+    类目/卖家/ASIN 黑名单(规则 1,类目三种匹配已并入)→ 商标符号 →
+    专利声明 → Made in USA → 品牌字段精确等值。
+
+    **全部硬规则未命中**才跑软规则(品牌文案扫描),命中进 `evidence`、
+    `blocked=False`,判定继续往 L1 走 —— 软证据**不终止流水线**
+    (2026-09-03 C 批双输出,规格 §4.1)。
 
     命中后上层处置(orchestrator.py:336-348,现由 audit_rules.audit_one 承接):
     verdict="reject"、score_final 硬写 0、stage_stopped_at="L0"、l1 用桩值。
@@ -408,9 +576,19 @@ def check(product: ProductInfo, ctx: Any) -> Phase0Result:
     if r_pat.blocked:
         return r_pat
 
+    # 2.6 Made in USA 声明硬拦 (2026-09-03 自 L2 R10 迁入,扫全文)
+    r_usa = _check_made_in_usa(product)
+    if r_usa.blocked:
+        return r_usa
+
     # 3. 品牌黑名单 (精准 brand == blacklist, DB 全量 + yaml 手工补)
     r_brand = _check_brand(product, ctx)
-    return r_brand
+    if r_brand.blocked:
+        return r_brand
+
+    # 4. 软证据:品牌黑名单文案扫描 (0 分,不终止;送 L3 判"提到还是卖的就是")
+    return Phase0Result(blocked=False,
+                        evidence=_scan_brand_mentions(product, ctx))
 
 
 __all__ = ["check", "normalize_amazon_category"]

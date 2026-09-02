@@ -15,7 +15,8 @@ import pytest
 
 from registry import resources
 from services import audit_l2, audit_reason
-from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
+from services.audit_models import (AuditOutcome, L1Info, Phase0Result,
+                                   ProductInfo, RuleHit)
 
 
 def _ctx(pt_meta=None, ac=None):
@@ -261,55 +262,6 @@ def test_soft_evidence_also_comes_only_from_feishu_now():
     assert h.penalty == 0
 
 
-# ── R4 品牌黑名单扫描(小自动机)──────────────────────────────────────────────
-
-def _ac(words):
-    import ahocorasick
-    a = ahocorasick.Automaton()
-    for w in words:
-        a.add_word(w, w)
-    a.make_automaton()
-    return a
-
-
-def test_r4_hit_and_boundary_and_own_brand():
-    ac = _ac(["fender", "ninja foodi"])
-    res = audit_l2.evaluate(_p(title="Ninja Foodi grill basket"),
-                            _l1(pt=None), _ctx(ac=ac))
-    h = [x for x in res.hits if x.rule_code == "title_desc_blacklist"][0]
-    assert h.penalty == 0
-    assert h.detail["matches"][0]["brand"] == "ninja foodi"
-    assert h.detail["matches"][0]["matched_phrase"] == "Ninja Foodi"
-    # 词边界:Fenderish 不命中
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Fenderish style"), _l1(), _ctx(ac=ac)))
-    # 自品牌豁免
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Fender strap", brand="Fender"),
-                          _l1(), _ctx(ac=ac)))
-
-
-def test_r4_chinese_neighbours_are_boundaries():
-    """2026-08-20:`c.isalnum()` 对汉字返回 True,于是「耐克运动鞋」里的
-    黑名单词「耐克」左右都被判成词内字符 —— **中文品牌一个都拦不住**,
-    而且不报错。中日韩不写分词空格,紧邻即边界。"""
-    ac = _ac(["耐克", "小米"])
-    res = audit_l2.evaluate(_p(title="耐克运动鞋 男款"), _l1(pt="Widgets"),
-                            _ctx(pt_meta=_ok_meta(), ac=ac))
-    h = [x for x in res.hits if x.rule_code == "title_desc_blacklist"][0]
-    assert h.detail["matches"][0]["brand"] == "耐克"
-    # 拉丁词边界不受影响(带音标字母仍算词内字符,不切出假前缀)
-    ac2 = _ac(["caf"])
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Café table"), _l1(pt="Widgets"),
-                          _ctx(pt_meta=_ok_meta(), ac=ac2)))
-
-
-def test_r4_none_automaton_skips():
-    res = audit_l2.evaluate(_p(title="Fender strap"), _l1(), _ctx(ac=None))
-    assert "title_desc_blacklist" not in _codes(res)
-
-
 # ── R7 促销宣称 ──────────────────────────────────────────────────────────────
 
 def test_r7_strong_and_softonly_and_allcaps():
@@ -407,8 +359,9 @@ def test_reason_取第一条自报category的hit():
     # 多条自报时按 all_hits 顺序取第一条(L0 在 L2 之前)
     o2 = _outcome(hits=[RuleHit("L2", "cat_access_blocked", -100,
                                 {"category": "类目准入"})])
-    o2.phase0 = SimpleNamespace(hits=[RuleHit("L0", "phase0_brand_blacklist",
-                                              -100, {"category": "Intellectual Property"})])
+    o2.phase0 = Phase0Result(blocked=True, hits=[
+        RuleHit("L0", "phase0_brand_blacklist", -100,
+                {"category": "Intellectual Property"})])
     assert audit_reason.compute_final_reason(o2) == "Intellectual Property"
 
 
@@ -428,8 +381,11 @@ def test_reason_查不到不兜底_落None加计数加warning(caplog):
     `General-Use Products` —— 一把螺丝刀、一个土豆压泥器都挂着它,人只会
     一头雾水(所有者 2026-08-16 实遇)。现在:None + 计数 + warning。
 
-    这条同时是 R3 硬拒 / R10 那两条**还没自报类别**的规则的现状钉子
-    (C 批把它们一条降为证据、一条迁进 L0 带 `Product claims`)。
+    ⚠ 2026-09-03 C 批之后这条计数是**纯 bug 信号**(L4 关闭时应恒为 0):
+    曾经占着它的两条已知缺口都消化了 —— R3 硬拒整条删除(本 PT 的
+    requirements 随产品进 L3),R10 迁进 L0 并自报 `Product claims`。
+    用例里那个 `cat_requires_cert_hard` 现在只是"某条忘了自报的硬拒规则"的
+    替身(存量 hits 里还有这个码)。
     """
     audit_reason.reset_stats()
     o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
@@ -555,50 +511,3 @@ def test_r0_and_r2_are_gone_whitelist_is_the_only_category_judge():
                                 _ctx(pt_meta=_ok_meta(pt, cat)))
         assert res.verdict == "pass", pt
         assert _codes(res) == [], pt
-
-
-# ── R10 Made in USA 声明(2026-08-24,漏判反哺第一条硬规则)──────────────────
-
-def _p10(title="", bullets=None, desc=""):
-    from services.audit_models import ProductInfo
-    return ProductInfo(asin="B0T", title=title,
-                       bullet_points=bullets or [], long_description=desc)
-
-
-def test_r10_made_in_usa_claim_hard_rejects():
-    """字面声明即铁证:FTC 要求卖家实证,搬运文案永远实证不了。
-
-    生产实证下架原因 "Prohibited Product Policy on Made in USA claims"。
-    与"儿童品不进 L2"方向相反且都对:声明在文本里就是证据,儿童品要靠理解。
-    """
-    from services import audit_l2
-
-    hits = audit_l2._rule_made_in_usa(_p10("Steel Bracket Made in USA"))
-    assert len(hits) == 1 and hits[0].penalty == -100
-    assert hits[0].rule_code == "made_in_usa_claim"
-    # 长描述里的声明也要拦(R7/R8 只扫前 3 条五点,这条是硬拒,全文都扫)
-    assert audit_l2._rule_made_in_usa(
-        _p10("Table", desc="Proudly manufactured in the United States"))
-    assert audit_l2._rule_made_in_usa(_p10("USA-Made leather belt"))
-    assert audit_l2._rule_made_in_usa(_p10("American made blanket"))
-
-
-def test_r10_word_boundary_and_negation_do_not_fire():
-    """词边界防误伤 + 否定式排除 + 非声明语境不命中。"""
-    from services import audit_l2
-
-    assert not audit_l2._rule_made_in_usa(
-        _p10("Jerusalem artichoke, thousand pieces"))
-    assert not audit_l2._rule_made_in_usa(
-        _p10("Made in China, not made in USA"))
-    assert not audit_l2._rule_made_in_usa(_p10("Trip to USA travel guide"))
-    assert not audit_l2._rule_made_in_usa(_p10(""))
-
-
-def test_r10_is_wired_into_evaluate():
-    """规则必须真挂进 evaluate 的规则列表 —— 单测函数绿而没接线是静默漏判。"""
-    import inspect
-
-    from services import audit_l2
-
-    assert "_rule_made_in_usa" in inspect.getsource(audit_l2.evaluate)

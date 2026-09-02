@@ -30,15 +30,16 @@
 这是什么意思」。判拒而没有类别只可能是代码 bug(某条硬拒规则忘了自报),
 落 NULL + 计数 + warning,让它自己现形。
 
-⚠ **已知缺口(三条硬拒规则还没自报类别)**:
-  · `cat_requires_cert_hard`(L2 R3 硬拒)—— C 批降为证据;
-  · `made_in_usa_claim`(L2 R10)—— C 批迁进 L0 并带 `Product claims`;
+⚠ **已知缺口只剩一条**(2026-09-03 C 批消化了另外两条):
   · `l4_vision_violation`(L4 视觉,penalty -100)—— **§二 的类别表没有它**:
     "图上有什么"映到哪条政策要所有者裁决,**不许在这里替它编一个**
     (L4 默认关 `-p l4=on` 才跑,面很小)。
-在这三条被处理之前,它们拒掉的产品走第 3 步:类别 NULL + `reason_missing`
-计数。这是**有意的**(规格 §一:B、C 只切换一次,生产机等 C 合并后再 pull),
-不是漏改;验收信号 = **C 批合并后、L4 关闭时该计数应回到 0**。
+  已消化:`cat_requires_cert_hard`(L2 R3 硬拒)整条删除,本 PT 的
+  `requirements` 随产品进 L3 由 LLM 判;`made_in_usa_claim`(L2 R10)迁进
+  L0 成 `phase0_made_in_usa`,自报 `Product claims`。
+所以 **L4 关闭时 `reason_missing` 应恒为 0** —— 它现在是纯 bug 信号:
+非 0 就是某条硬拒规则忘了自报 `detail['category']`,照旧落 NULL + 计数 +
+warning,让它自己现形,不许兜底。
 """
 
 from __future__ import annotations
@@ -111,7 +112,7 @@ def compute_final_reason(outcome: Any) -> str | None:
             return policy
 
     # (3) 没有类别 —— 不兜底。计数进 run 摘要,warning 点名 ASIN 与命中的规则码。
-    # ⚠ **同一组规则码一轮只警告一次**:已知缺口(R3 硬拒 / R10)每轮能拒掉成千
+    # ⚠ **同一组规则码一轮只警告一次**:一条忘了自报的硬拒规则每轮能拒掉成千
     #   上万条,逐条打 warning 会把日志淹掉,而信息量只有第一条;计数照旧逐次累加
     codes = ",".join(sorted(h.rule_code for h in outcome.all_hits
                             if h.penalty < 0)) or "(无扣分规则)"
@@ -136,6 +137,8 @@ _RULE_CN = {
     "phase0_brand_blacklist":         "品牌黑名单",
     "phase0_trademark_symbol":        "标题含 ®/™ 商标符号",
     "phase0_patent_claim":            "文案自述专利保护",
+    "phase0_made_in_usa":             "文案声明 Made in USA(无法实证)",
+    "phase0_brand_mention":           "标题/描述提到黑名单品牌",
     "phase0_lark_blacklist_asin":     "ASIN 在黑名单中心",
     "phase0_lark_blacklist_seller":   "卖家在黑名单中心",
     "phase0_lark_blacklist_amazon_cat": "亚马逊类目在黑名单中心",
@@ -148,6 +151,7 @@ _RULE_CN = {
     "walmart_strict_sensitive":       "沃尔玛敏感类目",
     "publication_pt_forbidden":       "出版物类目禁售",
     "title_desc_blacklist":           "标题/描述命中黑名单词",
+    "made_in_usa_claim":              "文案声明 Made in USA(无法实证)",
     "trademark_live":                 "命中在效商标",
     "content_promotional":            "标题含促销用语",
     "unmapped_amazon_path":           "亚马逊类目映射不出沃尔玛类目",

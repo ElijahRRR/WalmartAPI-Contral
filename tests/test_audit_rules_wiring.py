@@ -22,7 +22,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 brand_blacklist={},
-                pt_meta={}, ac_automaton=None, nice_mapping={},
+                pt_meta={}, brand_mention_automaton=None, nice_mapping={},
                 nice_default=[], uspto=None)
     base.update(kw)
     return audit_rules.AuditContext(**base)

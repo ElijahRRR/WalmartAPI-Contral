@@ -89,16 +89,24 @@ class RuleHit:
 
 @dataclass
 class Phase0Result:
-    """Phase 0 精准前置过滤结果(飞书黑名单 / 类目禁售 / 商标符号 / 品牌黑名单)。
+    """Phase 0 前置过滤结果(黑名单三表 / 商标符号 / 专利自述 / Made in USA / 品牌)。
 
-    blocked=True 时整个流程直接终止,不进 L1/L2。
-    四条规则串行短路,所以 hits 最多只有 1 条。
+    **双输出**(2026-09-03 C 批,规格 §4.1):
+      · `hits`   —— 硬拒(penalty -100)。任一命中即 blocked=True、整条流水线终止,
+        串行短路所以最多 1 条;
+      · `evidence` —— 软证据(penalty 0)。**只在全部硬规则未命中时**才跑出来,
+        blocked=False,判定继续往 L1 走,证据随产品进 L3(`summarize_evidence`)。
+
+    所以 `blocked=True` 的结果里 `evidence` 恒空(硬拒当场返回,软规则没跑),
+    `audit_hits` 一次 run 可以落多条 L0 行(硬 1 条,或软 n 条),
+    但 `stage_stopped_at='L0'` 的语义不变 —— **只有硬拒才停**。
     """
 
     blocked: bool = False
     matched_brand: str | None = None      # 品牌/商标短语命中
     matched_category: str | None = None   # Amazon 类目命中(飞书表或 8 大类)
     hits: list[RuleHit] = field(default_factory=list)
+    evidence: list[RuleHit] = field(default_factory=list)   # 软证据(penalty 0)
 
 
 @dataclass
@@ -178,6 +186,9 @@ class AuditOutcome:
         bag: list[RuleHit] = []
         if self.phase0 is not None:
             bag.extend(self.phase0.hits)
+            # L0 软证据(C 批双输出):硬拒 hits 在前、软证据在后 —— 两者互斥
+            # (硬命中当场返回,软规则不跑),这个顺序只是把落库序写死
+            bag.extend(self.phase0.evidence)
         if self.l1 is not None:
             bag.extend(self.l1.hits)
         for r in (self.l2, self.l3, self.l4):

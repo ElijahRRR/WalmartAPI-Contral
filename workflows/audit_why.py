@@ -163,9 +163,15 @@ _RULE_SOURCE = {
     # 是被命中的子树根)、path_exact 归一化完整路径等值(飞书镜像历史行)
     "phase0_lark_blacklist_amazon_cat": "catalog.amazon_cat_blacklist "
                                     "match_type='node_subtree'/'path_exact'",
-    "title_desc_blacklist":         "catalog.brand_blacklist(扫标题/描述)",
-    "trademark_live":               "uspto 商标库",
+    "phase0_brand_mention":         "catalog.brand_blacklist(扫标题/五点/描述,"
+                                    "0 分软证据 → 送 L3 判)",
+    "phase0_made_in_usa":           "正则扫标题/全部五点/描述(声明即硬拒)",
     "phase0_trademark_symbol":      "正则扫标题/bullets/描述",
+    # 存量老行的判据出处(规则本身已下线,2026-09-03 C 批;渲染保留兼容)
+    "title_desc_blacklist":         "catalog.brand_blacklist(扫标题/描述;"
+                                    "旧 L2 R4,已迁 L0 phase0_brand_mention)",
+    "made_in_usa_claim":            "正则(旧 L2 R10,已迁 L0 phase0_made_in_usa)",
+    "trademark_live":               "uspto 商标库(旧 L2 R5,已删除)",
 }
 
 

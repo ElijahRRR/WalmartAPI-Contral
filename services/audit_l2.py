@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import logging
 import re
-import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -61,9 +60,6 @@ if TYPE_CHECKING:  # 仅供阅读/类型工具;运行期不依赖,避免与 audi
     from services.audit_models import L1Info, ProductInfo
 
 logger = logging.getLogger("services.audit_l2")
-
-_AC_LOCK = threading.Lock()   # R4 自动机扫描锁(product_audit workers>1 共享 ctx)
-
 
 # =============================================================
 # yaml 加载(三个 refdata/audit 种子文件;结果由调用方塞进 ctx)
@@ -581,88 +577,6 @@ def _rule_cat_requires_cert(l1: L1Info, ctx: Any) -> list[RuleHit]:
 
 
 # =============================================================
-# R4: title/五点/描述 命中黑名单品牌 (Aho-Corasick) → penalty 0 (纯证据)
-# =============================================================
-
-
-R4_PENALTY = 0   # v3 用户 2026-04-27: 软证据不扣分, 只标记 detail 传 L3 判通用词/真品牌
-
-
-# 中日韩 + 全角:这些文字之间不写空格,"紧邻"就是词与词的分界
-_CJK_RE = re.compile(r"[\u2e80-\u9fff\uac00-\ud7ff\uf900-\ufaff"
-                     r"\ufe30-\ufe4f\uff00-\uffef]")
-
-
-def _is_word_boundary_char(c: str) -> bool:
-    """输入:单个字符 → 输出:它是否算词边界。
-
-    ⚠ 2026-08-20 修:`c.isalnum()` 对中文/全角返回 True,于是"耐克运动鞋"里
-    黑名单词「耐克」左右都被判成非边界 —— **中文品牌一个都拦不住**,而且不报错。
-    中日韩与全角字符不写分词空格,紧邻即边界,单独判掉;拉丁带音标字母
-    (café 的 é)仍按词内字符处理,免得把 "Caf" 这种前缀切出来误命中。
-    """
-    if not c:
-        return True
-    if _CJK_RE.match(c):
-        return True
-    return not (c.isalnum() or c == '_')
-
-
-def _rule_title_desc_blacklist(product: ProductInfo, ctx: Any) -> list[RuleHit]:
-    """输入:产品 + ctx(用 ctx.ac_automaton) → 输出:R4 命中的 hit(0 或 1 条,penalty 0)。
-
-    扫 product.searchable_text(title + 全部五点 + 长描述)。自动机未构建(None)→ 返回 []。
-    AC 不自带词边界,命中后手动检查前后字符;**自品牌豁免是精确等值**
-    (brand strip+lower 后与命中词完全相等才跳过);同一个 brand 只报第一次。
-    """
-    hay = product.searchable_text
-    if not hay:
-        return []
-    A = ctx.ac_automaton
-    if A is None:   # 未装 pyahocorasick / 词表为空 → 本条规则整体跳过
-        return []
-    own_brand = (product.brand or "").strip().lower()
-    hay_lower = hay.lower()
-    n = len(hay_lower)
-
-    matches: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    # AC iter 返回 (end_index, value), end_index 是命中末字符的位置 (inclusive)。
-    # workers>1 时共享一个自动机:pyahocorasick 只读迭代的线程安全没有官方
-    # 保证,锁住扫描段(µs 级,相对秒级 LLM 调用零成本)
-    with _AC_LOCK:
-        ac_matches = list(A.iter(hay_lower))
-    for end_idx, brand in ac_matches:
-        if brand in seen or brand == own_brand:
-            continue
-        start_idx = end_idx - len(brand) + 1
-        # 手动 word boundary 检查 (AC 不自带)
-        left_ok = (start_idx == 0) or _is_word_boundary_char(hay_lower[start_idx - 1])
-        right_ok = (end_idx == n - 1) or _is_word_boundary_char(hay_lower[end_idx + 1])
-        if not (left_ok and right_ok):
-            continue
-        seen.add(brand)
-        # 还原原始大小写显示给审核员
-        matches.append({"brand": brand, "matched_phrase": hay[start_idx:end_idx + 1]})
-
-    if not matches:
-        return []
-    return [
-        RuleHit(
-            stage="L2",
-            rule_code="title_desc_blacklist",
-            penalty=R4_PENALTY,
-            detail={
-                "matches": matches,
-                "count": len(matches),
-                "note": "L3 LLM 需判断每个词是真品牌还是通用词",
-            },
-        )
-    ]
-
-
-# =============================================================
 # R5: title/desc 命中 USPTO LIVE 商标 (按 Nice Class 过滤) → penalty 0
 # =============================================================
 
@@ -1157,59 +1071,6 @@ def _rule_walmart_strict_sensitive(product: ProductInfo) -> list[RuleHit]:
 
 
 # =============================================================
-# R10: Made in USA 声明(2026-08-24 所有者定稿,漏判反哺第一条硬规则)
-# =============================================================
-# 生产实证:沃尔玛按 "Prohibited Product Policy on Made in USA claims" 下架,
-# 理由是 FTC 对 Made in USA 声明要求卖家能实证 —— 搬运模式下文案来自亚马逊,
-# 我们**永远无法实证**,声明本身即违规,与商品真实产地无关。
-# 硬拒(-100):判据是字面声明,不是推断 —— 这与"儿童品不进 L2"(误伤面大,
-# 只能语义判)方向相反且都是对的:声明在文本里就是铁证,儿童品要靠理解。
-# 词边界防误伤:"usa" 必须独立成词("Jerusalem"/"thousand" 不命中);
-# 只认肯定式声明,"not made in usa" 由否定前置词排除。
-_R10_MADE_IN_USA = re.compile(
-    r"\b(?:made|manufactured|built|produced|crafted)\s+in\s+"
-    r"(?:the\s+)?(?:usa|u\.s\.a\.?|u\.s\.|united states)(?:\s+of\s+america)?\b"
-    r"|\b(?:usa|american)[- ]made\b",
-    re.IGNORECASE)
-_R10_NEGATION = re.compile(r"\b(?:not|isn't|isnt)\s+(?:made|manufactured)\b",
-                           re.IGNORECASE)
-R10_PENALTY = -100
-
-
-def _rule_made_in_usa(product: ProductInfo) -> list[RuleHit]:
-    """输入:产品 → 输出:R10 命中的 hit(0 或 1 条,-100 硬拒)。
-
-    扫 title + 全部 bullets + description(声明可能只出现在长描述里;
-    与 R7/R8 只扫前 3 条五点不同 —— 那两条是软证据,漏了有 L3 兜,
-    这条是硬拒,漏了就是漏判)。
-    """
-    parts = [product.title or ""]
-    parts += list(product.bullet_points or [])
-    parts.append(product.long_description or "")
-    scan = "\n".join(x for x in parts if x)
-    if not scan.strip():
-        return []
-    m = _R10_MADE_IN_USA.search(scan)
-    if not m:
-        return []
-    # 否定式排除:命中点前 40 字符内出现 not made/manufactured 视为反声明
-    ctx_before = scan[max(0, m.start() - 40):m.start()]
-    if _R10_NEGATION.search(ctx_before + m.group(0)):
-        return []
-    return [RuleHit(
-        stage="L2",
-        rule_code="made_in_usa_claim",
-        penalty=R10_PENALTY,
-        detail={
-            "matched": m.group(0),
-            "walmart_policy": "Made in USA claims",
-            "note": "FTC 要求卖家实证 Made in USA 声明;搬运文案无法实证,"
-                    "声明本身即违规(生产实证下架原因)",
-        },
-    )]
-
-
-# =============================================================
 # public entry
 # =============================================================
 
@@ -1246,11 +1107,9 @@ def evaluate(product: ProductInfo, l1: L1Info, ctx: Any) -> L2Result:
     rules = [
         _rule_category_gate(l1, ctx),                       # R1 PT 准入双白名单(唯一类目判据)
         _rule_cat_requires_cert(l1, ctx),                   # R3 类目需证书 (硬/软四分支)
-        _rule_title_desc_blacklist(product, ctx),           # R4 黑名单品牌 (证据)
         _rule_trademark_live(product, l1, ctx),             # R5 USPTO LIVE 商标 (证据)
         _rule_content_promotional(product),                 # R7 内容宣称 (证据)
         _rule_walmart_strict_sensitive(product),            # R8 严格合规敏感词 (证据)
-        _rule_made_in_usa(product),                         # R10 Made in USA 声明 (硬拒)
     ]
     pending_reason = None
     for hits in rules:

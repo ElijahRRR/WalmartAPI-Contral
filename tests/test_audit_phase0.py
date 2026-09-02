@@ -1,8 +1,14 @@
-"""Phase0 四件套判定向量(spec_vectors B1~B5/B9;旧仓判定层零测试,全部新钉)。
+"""Phase0 判定向量(spec_vectors B1~B5/B9;旧仓判定层零测试,全部新钉)。
 
 向量出处:批次 B 移植规格(四路取证),每条对应旧仓实现行号——断言的是
 "与旧仓逐字节同判",不是"理想行为"。已知缺陷(B2-5 漏拦/B2-6 口径不一/
 全角不折叠)按现状钉死,修复须先过所有者。
+
+⚠ 2026-09-03 C 批:L0 从"四条硬规则串行短路"变成**五硬一软的双输出**
+(规格 §4.1)。迁进来的两条(Made in USA = 旧 L2 R10 硬拒、品牌文案扫描 =
+旧 L2 R4 软证据)连同它们在 `tests/test_audit_l2_reason.py` 里的向量一起搬到
+本文件末尾 —— 判定逐字随迁,所以**断言也逐字随迁**:改了值就说明迁的时候
+判据变了。
 """
 
 from types import SimpleNamespace
@@ -16,7 +22,7 @@ from services.audit_stopwords import is_stopword
 
 
 def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=(),
-         known=frozenset()):
+         known=frozenset(), ac=None):
     """cats=归一化完整路径(飞书历史行);tops=顶级名;nodes=子树根 node_id。
 
     2026-08-20 起类目闸判据全在库里(catalog.amazon_cat_blacklist),
@@ -39,6 +45,7 @@ def _ctx(sellers=(), asins=(), cats=(), brands=None, tops=(), nodes=(),
         cat_rules=rules,
         brand_blacklist=dict(brands or {}),
         known_policies=known,     # 类目黑名单行的 walmart_policy 按它对表
+        brand_mention_automaton=ac,   # 品牌文案扫描(C 批自 L2 R4 迁入)
     )
 
 
@@ -402,3 +409,150 @@ def test_patent_scans_bullets_and_desc_same_window_as_trademark():
                                          "patented design"]),
         _ctx())
     assert r2.blocked is False
+
+
+# ── Made in USA 声明(旧 L2 R10,2026-09-03 C 批迁入 L0)──────────────────────
+#
+# 向量逐字搬自 tests/test_audit_l2_reason.py 的三条 R10 用例:判据一个字没改,
+# 变的只是层次与 rule_code(`made_in_usa_claim` → `phase0_made_in_usa`)与
+# **自报类别**(旧版写死自造名 `Made in USA claims`,政策表里没有那一行)。
+
+def _p10(title="", bullets=None, desc=""):
+    return _p(asin="B0T", title=title, bullet_points=bullets or [],
+              long_description=desc)
+
+
+def test_made_in_usa_claim_hard_rejects():
+    """字面声明即铁证:FTC 要求卖家实证,搬运文案永远实证不了。
+
+    生产实证下架原因 "Prohibited Product Policy on Made in USA claims"。
+    与"儿童品不进 L2"方向相反且都对:声明在文本里就是证据,儿童品要靠理解。
+    """
+    r = audit_phase0.check(_p10("Steel Bracket Made in USA"), _ctx())
+    assert r.blocked and len(r.hits) == 1 and r.hits[0].penalty == -100
+    assert r.hits[0].rule_code == "phase0_made_in_usa"
+    assert r.hits[0].detail["matched"] == "Made in USA"
+    # 长描述与全部五点都扫(硬拒漏了就是漏判,不像软证据有 L3 兜)
+    assert audit_phase0.check(
+        _p10("Table", desc="Proudly manufactured in the United States"),
+        _ctx()).blocked
+    assert audit_phase0.check(
+        _p10("Table", bullets=["a", "b", "c", "d", "e", "usa-made frame"]),
+        _ctx()).blocked
+    assert audit_phase0.check(_p10("USA-Made leather belt"), _ctx()).blocked
+    assert audit_phase0.check(_p10("American made blanket"), _ctx()).blocked
+
+
+def test_made_in_usa_word_boundary_and_negation_do_not_fire():
+    """词边界防误伤 + 否定式排除 + 非声明语境不命中(正则逐字随迁)。"""
+    for title in ("Jerusalem artichoke, thousand pieces",
+                  "Made in China, not made in USA",
+                  "Trip to USA travel guide", ""):
+        assert audit_phase0.check(_p10(title), _ctx()).blocked is False, title
+
+
+def test_made_in_usa_reports_the_official_policy_not_an_invented_one():
+    """⚠ 类别自报的是**政策表里那一行**:官方第 29 节 `Product claims` 的
+    Made in the USA 专段。旧 R10 写死的 `Made in USA claims` 是自造名 ——
+    政策表里没有,落库就是往全链唯一键上塞一个谁也 join 不上的串。
+    拼写由 `audit_rules.check_rule_policies` 在装配期对表(对不上启动即炸)。
+    """
+    h = audit_phase0.check(_p10("Steel Bracket Made in USA"), _ctx()).hits[0]
+    assert h.detail["category"] == resources.AUDIT_PRODUCT_CLAIMS_POLICY
+    assert "walmart_policy" not in h.detail
+    from services import audit_rules
+    assert (resources.AUDIT_PRODUCT_CLAIMS_POLICY,
+            "AUDIT_PRODUCT_CLAIMS_POLICY") in audit_rules.RULE_POLICIES
+
+
+# ── 品牌黑名单文案扫描(旧 L2 R4,2026-09-03 C 批迁入 L0 当软证据)────────────
+
+def _ac(words):
+    import ahocorasick
+    a = ahocorasick.Automaton()
+    for w in words:
+        a.add_word(w, w)
+    a.make_automaton()
+    return a
+
+
+def test_brand_mention_hit_and_boundary_and_own_brand():
+    """命中 → 0 分证据(**不 blocked**);词边界与自品牌精确豁免逐字随迁。"""
+    ctx = _ctx(ac=_ac(["fender", "ninja foodi"]))
+    r = audit_phase0.check(_p(title="Ninja Foodi grill basket"), ctx)
+    assert r.blocked is False and r.hits == []      # 软证据不终止流水线
+    h = r.evidence[0]
+    assert h.stage == "L0" and h.penalty == 0
+    assert h.rule_code == "phase0_brand_mention"
+    assert h.detail["matches"][0]["brand"] == "ninja foodi"
+    assert h.detail["matches"][0]["matched_phrase"] == "Ninja Foodi"
+    assert h.detail["count"] == 1 and h.detail["note"]
+    # 词边界:Fenderish 不命中
+    assert audit_phase0.check(_p(title="Fenderish style"), ctx).evidence == []
+    # 自品牌豁免(精确等值)
+    assert audit_phase0.check(_p(title="Fender strap", brand="Fender"),
+                              ctx).evidence == []
+
+
+def test_brand_mention_chinese_neighbours_are_boundaries():
+    """2026-08-20 修:`c.isalnum()` 对汉字返回 True,于是「耐克运动鞋」里的
+    黑名单词「耐克」左右都被判成词内字符 —— **中文品牌一个都拦不住**,
+    而且不报错。中日韩不写分词空格,紧邻即边界。"""
+    r = audit_phase0.check(_p(title="耐克运动鞋 男款"),
+                           _ctx(ac=_ac(["耐克", "小米"])))
+    assert r.evidence[0].detail["matches"][0]["brand"] == "耐克"
+    # 拉丁词边界不受影响(带音标字母仍算词内字符,不切出假前缀)
+    assert audit_phase0.check(_p(title="Café table"),
+                             _ctx(ac=_ac(["caf"]))).evidence == []
+
+
+def test_brand_mention_reports_each_brand_once_and_scans_all_bullets():
+    """同一个品牌只报第一次;扫描面 = searchable_text(标题 + 全部五点 + 描述)。"""
+    ctx = _ctx(ac=_ac(["dyson", "bose"]))
+    r = audit_phase0.check(
+        _p(title="Dyson filter for dyson vacuum",
+           bullet_points=["a", "b", "c", "d", "e", "fits Bose speakers"]),
+        ctx)
+    brands = [m["brand"] for m in r.evidence[0].detail["matches"]]
+    assert brands == ["dyson", "bose"] and r.evidence[0].detail["count"] == 2
+
+
+def test_brand_mention_without_an_automaton_just_skips():
+    """未装 pyahocorasick / 词表为空 / 手搓 ctx 没给这个字段 → 整条规则跳过。"""
+    assert audit_phase0.check(_p(title="Fender strap"), _ctx()).evidence == []
+    assert audit_phase0.check(_p(title="Fender strap"),
+                              SimpleNamespace(phase0_sellers=frozenset(),
+                                              phase0_asins=frozenset(),
+                                              brand_blacklist={})).evidence == []
+
+
+# ── 双输出契约(C 批,规格 §4.1)──────────────────────────────────────────────
+
+def test_hard_hit_returns_immediately_and_carries_no_evidence():
+    """⚠ 硬拒当场返回 ⇒ 软规则**没跑**,`evidence` 恒空。
+
+    反过来说也成立:一条结果里既有硬拒又有软证据,就是有人把顺序改错了 ——
+    那种产品会在 L0 停下,而证据永远送不到 L3(送也没用,它已经被拒了)。
+    """
+    ctx = _ctx(brands={"ikea": "IKEA"}, ac=_ac(["fender"]))
+    r = audit_phase0.check(_p(brand="IKEA", title="Fender style shelf"), ctx)
+    assert r.blocked and r.hits[0].rule_code == "phase0_brand_blacklist"
+    assert r.evidence == []
+
+
+def test_made_in_usa_is_judged_before_the_exact_brand_match():
+    """硬拒顺序(§4.1):黑名单三表 → 商标符号 → 专利自述 → Made in USA →
+    品牌精确等值。两条都踩时报更靠前的那条。"""
+    r = audit_phase0.check(_p(brand="IKEA", title="Shelf, Made in USA"),
+                           _ctx(brands={"ikea": "IKEA"}))
+    assert r.hits[0].rule_code == "phase0_made_in_usa"
+
+
+def test_soft_evidence_travels_in_all_hits_so_it_reaches_the_ledger():
+    """L0 软证据要真进 `all_hits` —— 否则它既不落 audit_hits 也进不了 L3。"""
+    from services.audit_models import AuditOutcome, L1Info
+    p0 = audit_phase0.check(_p(title="Ninja Foodi grill"),
+                            _ctx(ac=_ac(["ninja foodi"])))
+    out = AuditOutcome(asin="B0", verdict="pass", score_final=100,
+                       stage_stopped_at=None, l1=L1Info(), phase0=p0)
+    assert [h.rule_code for h in out.all_hits] == ["phase0_brand_mention"]

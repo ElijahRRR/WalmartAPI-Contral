@@ -835,6 +835,13 @@ AUDIT_NONPOLICY_CATEGORIES = (AUDIT_CAT_INTERNAL_BLACKLIST, AUDIT_CAT_ACCESS)
 # 解析不到或拼写不同**启动即 RuntimeError**(表改名了而代码没跟上,不许静默)。
 AUDIT_IP_POLICY = "Intellectual Property"
 
+# Made in USA 声明硬拒(2026-09-03 C 批从 L2 R10 迁进 L0)判的政策类别。
+# 官方第 29 节「Product claims」页里专段写 Made in the USA(转录件
+# `refdata/policy_pages/en/29-product-claims.md`)—— 旧 R10 在 detail 里写死的
+# `Made in USA claims` 是**自造名**,政策表里没有这一行,拿它当类别落库就是
+# 全链唯一键上多出一个谁也 join 不上的串。同 AUDIT_IP_POLICY 一道装配期对表。
+AUDIT_PRODUCT_CLAIMS_POLICY = "Product claims"
+
 # 内容族两页(2026-09-02 A 批随政策表进库,id 43/44)。沃尔玛下架原因里的
 # CONTENT 码(`content policy` / `authenticity claims` / 图片不合标准)指的
 # 就是这两页,而**不是**某一类禁售商品:43 是索引页、44 是四张允许/禁止表。

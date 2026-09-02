@@ -803,11 +803,15 @@ def test_content_family_names_are_guarded_against_the_policy_table():
     names = {n for n, _ in ru.RULE_POLICIES}
     assert set(resources.AUDIT_CONTENT_POLICIES) <= names
     assert resources.AUDIT_IP_POLICY in names
+    # 2026-09-03 C 批:L0 的 Made in USA 也自报一个写死的政策名,同一道闸
+    assert resources.AUDIT_PRODUCT_CLAIMS_POLICY in names
     ok = frozenset({resources.AUDIT_IP_POLICY,
+                    resources.AUDIT_PRODUCT_CLAIMS_POLICY,
                     *resources.AUDIT_CONTENT_POLICIES})
     ru.check_rule_policies(ok)                       # 对得上:不抛
     # 43 那一页在表里被改成了别的拼写 → 装配即炸,并点名该改哪个常量
     drifted = frozenset({resources.AUDIT_IP_POLICY,
+                         resources.AUDIT_PRODUCT_CLAIMS_POLICY,
                          "Content standards overview (renamed)",
                          resources.AUDIT_CONTENT_POLICIES[1]})
     with pytest.raises(RuntimeError, match="AUDIT_CONTENT_POLICIES"):

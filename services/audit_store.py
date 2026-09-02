@@ -278,22 +278,28 @@ def event_row(outcome: AuditOutcome, run_id: int | None,
 
 # ── TRO 品牌命中(2026-08-30 接线;纯函数,零 DB)────────────────────────────
 
-#: L3 只对 R4/R5 命中词的**前 10 个**给判定(services/audit_l3.MAX_BRANDS),
+#: L3 只对品牌命中词的**前 10 个**给判定(services/audit_l3.MAX_BRANDS),
 #: 第 11 个之后的词永远拿不到 is_real_brand —— 那是 unjudged 的第三种成因。
 _L3_BRAND_CAP_NOTE = "L3 未给该词判定(多半在前 10 词截断之外)"
 
+#: 品牌文案扫描的 rule_code。2026-09-03 C 批**判定从 L2 R4 迁到 L0**
+#: (`title_desc_blacklist` → `phase0_brand_mention`),TRO 这条链吃的就是它的
+#: 命中词 —— 迁层时忘了改这里的后果不报错:TRO 命中从此恒空,而摘要照样漂亮。
+_BRAND_MENTION_CODE = "phase0_brand_mention"
 
-def _r4_brands(outcome: AuditOutcome) -> set:
-    """输入:判定结果 → 输出:L2 R4 命中的黑名单词集合(r4 键形,天然 strip+lower)。
 
-    R4 的 `detail.matches[].brand` 装的就是自动机的键(audit_l2
-    `_rule_title_desc_blacklist`:命中值即键),与 ctx.r4_source 同型;
+def _mentioned_brands(outcome: AuditOutcome) -> set:
+    """输入:判定结果 → 输出:文案扫描命中的黑名单词集合(键形,天然 strip+lower)。
+
+    `detail.matches[].brand` 装的就是自动机的键(audit_phase0
+    `_scan_brand_mentions`:命中值即键),与 ctx.r4_source 同型;
     这里仍再 strip+lower 一道,免得哪天 detail 形状变了静默漏。
+    **按 rule_code 认、不按层认**(读 `all_hits`):软证据现在住在
+    `phase0.evidence` 里,写死"从 outcome.l2 取"就是把这条链焊在旧位置上。
     """
     out: set = set()
-    l2 = outcome.l2
-    for h in (l2.hits if l2 is not None else ()):
-        if h.rule_code != "title_desc_blacklist":
+    for h in outcome.all_hits:
+        if h.rule_code != _BRAND_MENTION_CODE:
             continue
         for m in (h.detail or {}).get("matches") or ():
             b = str((m or {}).get("brand") or "").strip().lower()
@@ -303,17 +309,18 @@ def _r4_brands(outcome: AuditOutcome) -> set:
 
 
 def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
-    """输入:判定结果 + R4 键→来源原文 + TRO 来源前缀 → 输出:
+    """输入:判定结果 + 品牌键→来源原文 + TRO 来源前缀 → 输出:
     `{confirmed, unjudged, sources, reason}`(四步口径,顺序不能反)。
 
-    ① **A = L2 R4 命中词**(黑名单自动机认出来的词,已过词边界与自品牌豁免);
+    ① **A = 品牌文案扫描命中词**(黑名单自动机认出来的词,已过词边界与自品牌
+       豁免;2026-09-03 C 批前这条规则在 L2 叫 R4,现在是 L0 的软证据);
     ② **B = A ∩ TRO 来源词** —— 黑名单里两万余个 TRO 品牌只是名单,命中了才
        算事;B 空则整件事到此为止(绝大多数产品走的就是这条);
     ③ **C = L3 判 `is_real_brand is True` 的词**,strip+lower 归一后
-       **必须与 A 取交集**:L3 回传的 brand 是 LLM 复述的字符串,而且那份
-       verdict 里混着 R5(USPTO 商标)的词 —— 不取交集就会把 R5 的词当成
-       R4 的 TRO 命中报上去。严格 `is True`(与 audit_l3 强制翻拒同一口径,
-       字符串 "true" 不算);
+       **必须与 A 取交集**:L3 回传的 brand 是 LLM 复述的字符串,与命中集
+       未必一一对应(历史上那份 verdict 里还混着已删的 R5 商标词)——
+       不取交集就会把别处的词当成 TRO 命中报上去。严格 `is True`
+       (与 audit_l3 强制翻拒同一口径,字符串 "true" 不算);
     ④ confirmed = B∩C(真品牌,可展开波及);unjudged = B **减去拿到过判定的
        词**(不是 B-C):被 L3 明确判 `is_real_brand=false` 的是通用英文词,
        那是"判过了、不是品牌",既不报也不展开;剩下的三种情形才叫拿不到判定 ——
@@ -328,7 +335,7 @@ def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
     (2026-09-02 B1 字段随输出三段化改名 `blacklist_brand_verdict` → `brand_verdicts`,
     口径一字未变。)
     """
-    a = _r4_brands(outcome)
+    a = _mentioned_brands(outcome)
     if not a:
         return {"confirmed": [], "unjudged": [], "sources": {}, "reason": None}
     b = {k for k in a

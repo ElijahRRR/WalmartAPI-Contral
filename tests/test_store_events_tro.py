@@ -19,7 +19,8 @@ import pytest
 from registry import resources
 from services import audit_store, store_events as se
 from services.audit_l3 import L3Result
-from services.audit_models import AuditOutcome, L1Info, L2Result, RuleHit
+from services.audit_models import (AuditOutcome, L1Info, L2Result,
+                                   Phase0Result, RuleHit)
 from workflows import product_audit as pa
 
 _PREFIX = resources.TRO_BRAND_SOURCE_PREFIX
@@ -30,18 +31,25 @@ _SRC = {"dyson": "TRO品牌", "nike": "TRO", "bose": "tro",
         "hammer": "产品清理报错扫描"}  # 非 TRO 来源:不该被这条链碰
 
 
-def _outcome(r4_brands, l3=None, asin="B0TRO00001", verdict="pass"):
-    """输入:R4 命中词 + 可选 L3 结果 → 输出:一条 AuditOutcome。"""
-    hits = []
-    if r4_brands:
-        hits.append(RuleHit(
-            stage="L2", rule_code="title_desc_blacklist", penalty=0,
+def _outcome(brands, l3=None, asin="B0TRO00001", verdict="pass"):
+    """输入:品牌文案扫描命中词 + 可选 L3 结果 → 输出:一条 AuditOutcome。
+
+    ⚠ 2026-09-03 C 批:这条软证据从 L2 R4(`title_desc_blacklist`)迁到
+    L0(`phase0_brand_mention`,落 `Phase0Result.evidence`)。TRO 这条链
+    按 **rule_code** 认命中词、读 `all_hits` —— 焊在"从 outcome.l2 取"上的话,
+    迁层当天 TRO 命中会静默归零而摘要照样漂亮。
+    """
+    ev = []
+    if brands:
+        ev.append(RuleHit(
+            stage="L0", rule_code="phase0_brand_mention", penalty=0,
             detail={"matches": [{"brand": b, "matched_phrase": b}
-                                for b in r4_brands],
-                    "count": len(r4_brands)}))
+                                for b in brands],
+                    "count": len(brands)}))
     return AuditOutcome(asin=asin, verdict=verdict, score_final=100,
                         stage_stopped_at=None, l1=L1Info(),
-                        l2=L2Result(score_final=100, hits=hits), l3=l3)
+                        phase0=Phase0Result(blocked=False, evidence=ev),
+                        l2=L2Result(score_final=100, hits=[]), l3=l3)
 
 
 def _l3(verdict="pass", brands=()):
@@ -217,7 +225,7 @@ def test_context_default_keeps_hand_built_ctx_working():
     from services import audit_rules
     ctx = audit_rules.AuditContext(
         phase0_sellers=frozenset(), phase0_asins=frozenset(),
-        brand_blacklist={}, pt_meta={}, ac_automaton=None,
+        brand_blacklist={}, pt_meta={}, brand_mention_automaton=None,
         nice_mapping={}, nice_default=[])
     assert ctx.r4_source == {}
     assert audit_store.tro_hits(_outcome(["dyson"]), ctx.r4_source,

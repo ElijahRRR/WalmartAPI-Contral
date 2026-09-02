@@ -69,6 +69,17 @@ def reports_dir() -> Path:
     return data_root() / "reports"
 
 
+def audit_replay_report() -> Path:
+    """输入:无 → 输出:回放评估报告全文路径(<DATA_ROOT>/reports/audit_replay.txt)。
+
+    `workflows/audit_replay` 的**唯一文件写出口**(另一个写是
+    `audit.replay_results` 表)。文件名登记在这里而不是工作流里:切换手册
+    (`docs/audit_step3_spec.md` §五)与所有者都按这个路径找报告,
+    改名得只有一处(铁律 3:路径只准从 registry 取)。
+    """
+    return reports_dir() / "audit_replay.txt"
+
+
 def frontend_scrape_file() -> Path:
     """输入:无 → 输出:影刀 RPA 抓取结果 latest.json 路径。
 

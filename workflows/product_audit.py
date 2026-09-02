@@ -123,8 +123,10 @@ _PROGRESS_MIN_SEC = 5.0
 # 默认 128(所有者定稿 2026-08-17:「审核默认设置为 128,之前已经实测调大
 # 并发是有效果的」)。此前默认 4 而上限 64 —— 不显式传 -p workers= 就只跑 4,
 # "上限 64"看着高其实从没生效过。
-_DEFAULT_WORKERS = 128
-_MAX_WORKERS = 256
+# ⚠ 数字的出处在 registry(2026-09-02 B2):`audit_replay` 吃同一个并发口径,
+# 各写一份的话调大一处不调另一处,而两边都不会报错。这里只是本模块别名。
+_DEFAULT_WORKERS = resources.AUDIT_WORKERS_DEFAULT
+_MAX_WORKERS = resources.AUDIT_WORKERS_MAX
 
 # 落库批大小:并发调到 128 之后,主线程"逐行 savepoint + 逐行 INSERT"成了
 # 新瓶颈,改成攒一批 executemany(见 audit_store.persist_runs)。

@@ -1738,3 +1738,28 @@ CREATE TABLE IF NOT EXISTS audit.audit_hits (
 CREATE INDEX IF NOT EXISTS idx_hits_run   ON audit.audit_hits(run_id);
 CREATE INDEX IF NOT EXISTS idx_hits_rule  ON audit.audit_hits(rule_code);
 CREATE INDEX IF NOT EXISTS idx_hits_stage ON audit.audit_hits(stage);
+
+-- 回放评估结果(2026-09-02 第三步 B2,规格 docs/audit_step3_spec.md §3.8)。
+-- `workflows/audit_replay` 拿沃尔玛已裁决的下架品(反例)与在架在售品(正例)
+-- 重跑**当前生产链**(services.audit_rules.audit_one),与沃尔玛裁决、旧链
+-- 最近一次 audit_runs 三方对照。**这张表是回放工作流唯一写的表** ——
+-- 结论权威仍在 catalog.products / audit_runs,回放一个字都不碰它们。
+-- 一次回放 = 一个 run_tag(缺省 <日期>-<AUDIT_RULES_VERSION>);同 tag 重跑
+-- 按 (run_tag, asin) 覆盖,便于"改完提示词再回放一次"对同一批样本比。
+-- expected_category 为 NULL = 只比判定不比类别(BRAND / PROHIBITED_FINAL:
+-- 沃尔玛没给出可对表的政策名);内容族两名互认见 registry.AUDIT_CONTENT_POLICIES。
+CREATE TABLE IF NOT EXISTS audit.replay_results (
+    run_tag           text NOT NULL,   -- 一次回放的标签(同 tag 重跑覆盖)
+    asin              text NOT NULL,
+    expected_verdict  text,            -- 沃尔玛裁决推出的期望:reject / pass
+    expected_category text,            -- 期望类别(政策表原拼写);NULL=只比判定
+    got_verdict       text,            -- 本次新链判定:pass / reject / pending
+    got_category      text,            -- 本次类别(audit_reason.compute_final_reason)
+    got_detail        text,            -- 本次具体内容(audit_store.conclusion_detail)
+    stage_stopped_at  text,            -- 停在哪一层(L0/L1/L2/L3)
+    old_verdict       text,            -- 旧链最近一次 audit_runs 的判定(历史,不重跑)
+    old_category      text,            -- 同上的 l3_reason_category(只有 L3 判过的行才有)
+    confidence        text,            -- L3 自报置信 high/medium/low(没走 L3 为 NULL)
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_tag, asin)
+);

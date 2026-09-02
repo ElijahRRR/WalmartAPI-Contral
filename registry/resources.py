@@ -835,6 +835,24 @@ AUDIT_NONPOLICY_CATEGORIES = (AUDIT_CAT_INTERNAL_BLACKLIST, AUDIT_CAT_ACCESS)
 # 解析不到或拼写不同**启动即 RuntimeError**(表改名了而代码没跟上,不许静默)。
 AUDIT_IP_POLICY = "Intellectual Property"
 
+# 内容族两页(2026-09-02 A 批随政策表进库,id 43/44)。沃尔玛下架原因里的
+# CONTENT 码(`content policy` / `authenticity claims` / 图片不合标准)指的
+# 就是这两页,而**不是**某一类禁售商品:43 是索引页、44 是四张允许/禁止表。
+# 回放评估(`workflows/audit_replay`)拿 CONTENT 反例对表时**两名互认** ——
+# 报错正文只说"内容不合规",不说是索引页还是明细页,判在哪一页都算对。
+# ⚠ 拼写必须与政策表内一致(同 AUDIT_IP_POLICY 的理由);它们同样是
+# `audit_l3.policy_enum` 的合法取值,只是不由规则代码写死进 hit。
+AUDIT_CONTENT_POLICIES = ("Content standards: Overview",
+                          "Product details policy")
+
+# 判定并发的缺省与上限(2026-08-17 所有者定稿 128;上限 256)。放 registry 是
+# 因为**两条工作流吃同一个数**:`product_audit`(生产判定)与 `audit_replay`
+# (回放评估)—— 各写一份的话调大一处不调另一处,而两边都不会报错。
+# 线程等的是 LLM 的 HTTP 不是 CPU,所以远超核数是正常的;真正的天花板在
+# LLM 侧,实际值还要过 `services/db_guard.cap_workers` 的连接余量钳制。
+AUDIT_WORKERS_DEFAULT = 128
+AUDIT_WORKERS_MAX = 256
+
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
 # 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose

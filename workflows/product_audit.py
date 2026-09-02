@@ -2,7 +2,7 @@
 
 用法(2026-08-16 起**缺省即真跑**,空跑加 `--dry-run`;`--execute` 是兼容别名):
   python cli.py product_audit                       # 真跑:判定 + 落 runs/hits + 写结论
-  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 五列
+  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 审核六列
   python cli.py product_audit -p limit=2000
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
@@ -319,7 +319,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 首版就是锚最近一轮(verdict='reject' 且该轮有这条 hit),所有者第一次
         # dry-run 当场炸出问题:**dry-run 也落 runs/hits**,于是那 500 条的
         # "最近一轮"变成了本次 dry-run 的结果 —— 被救回来的 45 条新一轮判 pass、
-        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 五列,
+        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 审核六列,
         # 它们的 audit_status 还是 rejected。净效果:45 条产品被"验证"了一次就
         # 永久搁浅,任何通道都不会再捞它们,而且全程不报错。
         #
@@ -739,7 +739,7 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
 
-    回填失败只告警不失败:结论已经落 PG 了(products 五列 + audit_runs),
+    回填失败只告警不失败:结论已经落 PG 了(products 审核六列 + audit_runs),
     飞书只是人机界面 —— 与订单中心那条同款纪律。
     """
     try:
@@ -1778,6 +1778,6 @@ def run(params: dict) -> str:
         # 这一轮刚补采回来、刚判出结论的那些行还写不进表格)
         lines.append(_project_to_sheet(sheet_rows, execute))
     if not execute:
-        lines.append("(dry-run:runs/hits 已落,products 五列与事件"
+        lines.append("(dry-run:runs/hits 已落,products 审核六列与事件"
                      "(含 TRO 品牌命中)未写)")
     return "\n".join(lines)

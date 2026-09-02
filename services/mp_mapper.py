@@ -638,17 +638,22 @@ def shipping_weight(product: dict | None) -> float:
 # 它得继续挡住 LLM 往 Orderable 里塞这个字段(spec 外字段会让整条被拒,
 # EXT_DATA_ERROR_60670554076755),也继续不进 LLM 提示词。
 # 这些字段也不进 LLM 提示词(旧 _orderable_fields_for_llm 同款剔除)。
+# `SkuUpdate` 是沃尔玛的**系统专属开关字段**(不是内容字段):只有改码
+# (workflows/sku_migrate,批次 3)才允许写,值一律由 build_orderable 的
+# sku_update 形参给。LLM 填了一律剔除 —— 后果不是报错,而是**沃尔玛把一次
+# 普通上架当成改码请求**,这是本仓能想到的最贵的静默失效。
 ORDERABLE_SYSTEM_FIELDS = (
     "sku", "productIdentifiers", "price", "inventory", "startDate", "endDate",
     "MustShipAlone", "fulfillmentLagTime",
     "country_of_origin_substantial_transformation", "specProductType",
-    "ShippingWeight", "brand", "productName",
+    "ShippingWeight", "brand", "productName", "SkuUpdate",
 )
 
 
 def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
                     pt: str = "", product: dict | None = None,
-                    llm_fields: dict | None = None) -> dict:
+                    llm_fields: dict | None = None, *,
+                    sku_update: bool = False) -> dict:
     """输入:sku/upc/沃尔玛价/库存/**上架仓 FC ID**/PT/产品数据(+LLM 填的
     Orderable 字段)→ 输出:Orderable 段。
 
@@ -677,6 +682,12 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
       · **不发 brand / countryOfOriginAssembly**(2026-08-12 旧仓对照删除:
         旧金样从未发过这两个字段,Orderable 多发字段与 productName 同一血统
         EXT_DATA_ERROR_60670554076755)
+
+    `sku_update=True`(**关键字参数,默认 False**)只给 workflows/sku_migrate 的
+    **形态 B**(MP_ITEM 全量重发)用:含义是「按 productIdentifiers 找到现有 item,
+    把它的 SKU 改成 Orderable.sku」。**普通上架永远不传** —— 传了就是把一次上架
+    变成一次改码,而沃尔玛不会替你拦。字段名只在这里出生(与 productIdentifiers /
+    endDate 同款纪律),形态 A 的最小载荷走 build_sku_update_item。
     """
     end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
     o = {k: v for k, v in (llm_fields or {}).items()
@@ -694,7 +705,34 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
         "inventory": [{"fulfillmentCenterID": str(partner_id),
                        "quantity": int(qty)}],
     })
+    if sku_update:
+        o["SkuUpdate"] = "Yes"
     return o
+
+
+def build_sku_update_item(new_sku: str, product_id: str,
+                          product_id_type: str = "UPC") -> dict:
+    """输入:新码 + 现有 Product ID → 输出:MP_MAINTENANCE 改码 MPItem(形态 A 最小载荷)。
+
+    四条写死的口径:
+      ① **匹配键是 Product ID 不是 SKU**(官方 Update my existing items:
+         "Enter the correct SKU for that Product ID")—— 沃尔玛按 GTIN/UPC 找到
+         那条 item,再把它的 SKU 换成这里给的新码;
+      ② 一个 Product ID 只允许挂一个 SKU,所以**同一批里不得对同一个 productId
+         发两条**(调用方去重,本函数只管一条的形状);
+      ③ MP_MAINTENANCE 官方必填**仅 SKU + GTIN**,其余可选
+         (docs/api_blueprint.md §5.4),所以不带 Visible 段、不带价格库存 ——
+         最小载荷 = 不重发内容 = 标题/属性不会被我们再生成的文案覆盖;
+      ④ **形态待所有者机器单品实测确认**(决策 E),实测前只许 dry-run。
+
+    product_id_type 由调用方从 catalog.walmart_items 的 upc/gtin 决定,**不在这里猜**。
+    """
+    return {"Orderable": {
+        "sku": str(new_sku),
+        "productIdentifiers": {"productId": str(product_id),
+                               "productIdType": str(product_id_type)},
+        "SkuUpdate": "Yes",
+    }}
 
 
 def assemble_mp_item(orderable: dict, pt: str, visible_attrs: dict) -> dict:

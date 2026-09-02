@@ -235,6 +235,15 @@ CREATE INDEX IF NOT EXISTS listing_sources_key_idx
 ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_at     timestamptz;
 ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_reason text;
 ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaced_by      text;
+-- 改码两列(2026-09-02,SKU 改造批次 3 地基):同样可空无默认,落地时全库为 NULL
+-- (写侧唯一入口是 services/sku_codec.mint_replacement / settle_replacement,
+--  接线在批次 3 的 workflows/sku_migrate.py;地基这一块零调用 ⇒ 零行为变化)。
+--   replaces    —— **新码行**指回被它替换的旧码,与旧行的 replaced_by 互为反向指针;
+--   replaced_at —— **旧行**进入在途改码(pending)的时刻,定案超时判据的唯一时间源。
+-- 三列的读法(全仓唯一口径):replaced_by 非空 = 该行正在被替换(在途 pending);
+-- abandoned_at 非空且 abandoned_reason='sku_update' = 改码已定案(旧行退休)。
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaces         text;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaced_at      timestamptz;
 -- 全局 sku 唯一:**只对不透明新码生效**。存量 sku=asin 跨店重复是既成事实,
 -- 无条件唯一在存量上一定建不起来,而 db_init 是把整份 schema.sql 一次 execute
 -- (workflows/db_init.py),一条索引建失败整份回滚 ⇒ 生产建库直接停摆。
@@ -266,6 +275,27 @@ CREATE INDEX IF NOT EXISTS listing_sources_live_key_idx
 CREATE INDEX IF NOT EXISTS listing_sources_abandoned_idx
     ON catalog.listing_sources (store, source_type, source_key)
     WHERE abandoned_at IS NOT NULL;
+-- 改码两个反查索引(SKU 改造批次 3 地基)。两条都是**局部**索引:改码前
+-- replaced_by / replaces 全库为 NULL,零行为命中,建索引不会被存量脏数据卡住
+-- (db_init 一次 execute 整份 schema.sql,一条失败整份回滚)。
+-- ⚠ 本批**不动**上面那条活码部分唯一索引:它由批次 0a 一次建成最终条件
+-- (已含 replaced_by IS NULL),这里只核验 indexdef、不 DROP 不重建
+-- (索引名与条件全文只出生一次,守门测试按"名字只出现一次"钉住)。
+-- 第一条(replaced_by 反查):mark_missing / diff_catalog / problem_scan 每轮都要问
+--   「这行是不是在途被替换」,没有它就是每轮全表扫登记簿。
+-- 第二条(replaces 唯一):**唯一**堵住「两个**活着的**新码抢同一个旧码」——
+--   这种脏状态只在并发重跑里出现,出现之后无法自动分辨哪个码才是真的。
+--   ⚠ 条件必须带 `abandoned_at IS NULL`:改码回滚(sku_update_failed)之后,那个
+--   作废的新码行**保留 replaces 作为病历**(行永不 DELETE),但它不该再占着旧码的
+--   认领位 —— 不带这一条,同一个旧码这辈子只能改一次码,回滚之后再改必然撞唯一
+--   索引,而 mint_replacement 会把它误诊成"随机撞码"连抽 5 次后报错
+--   (2026-09-02 沙箱 PG 实测到,已修)。
+-- 两条的名字与条件同样**一处定死**,后续批次一律引用、不许 DROP/CREATE。
+CREATE INDEX IF NOT EXISTS listing_sources_replaced_by_idx
+    ON catalog.listing_sources (store, replaced_by) WHERE replaced_by IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_replaces_uidx
+    ON catalog.listing_sources (store, replaces)
+    WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
 -- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
 -- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
 -- ⚠ 本处判型与 workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串
@@ -280,6 +310,26 @@ SELECT store, sku,
        'backfill'
 FROM catalog.walmart_items
 ON CONFLICT (store, sku) DO NOTHING;
+
+-- 代际继承的**唯一出处**(2026-09-02,SKU 改造批次 3 地基):
+-- 「这个新码继承那个旧码的历史」只在这里定义。改码之后新码在 product_events /
+-- ops.feed_items / orders.order_lines 里一条历史都没有,五处按 (store, sku) 读历史
+-- 的判据会同时失明(顽固件代际、问题归类最近类别、WFS 删除拦截、在途防重、
+-- 分配链销量归属)。消费方一律经本视图取别名,**不许各自现写 replaces 的 JOIN**
+-- (conventions §六:判据只能有一处出生;守门 tests/test_sku_guard.py 钉住)。
+-- ⚠ 只继承**一跳**,前提是「旧码改码后立即弃码、永不再改码」。若将来允许对同一个
+--   品连续改两次码,本视图必须改成递归 CTE,否则第二跳静默断链。
+-- ⚠ 它是视图不是表:改码前恒为空集,所有消费方的 UNION ALL / LEFT JOIN 在改码前
+--   都是「加一个空集」⇒ 结果集逐行不变(批次 3 零行为变化论证的地基)。
+-- ⚠ 只出**活着的**认领(abandoned_at IS NULL):改码回滚作废的新码行保留 replaces
+--   当病历,但它没有历史可继承。不排除它,同一个旧码会在本视图里出现多行,
+--   而消费方的 LEFT JOIN 会因此把同一笔历史**算两次**(alloc_survey 的销量归属
+--   首当其冲,且不报错)。条件与上面那条「replaces 认领唯一索引」同源 ⇒ 本视图里
+--   (store, alias_sku) 至多一行,这是消费方可以放心 LEFT JOIN 的前提。
+CREATE OR REPLACE VIEW catalog.sku_aliases AS
+  SELECT store, sku, replaces AS alias_sku
+  FROM catalog.listing_sources
+  WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
 
 -- ── UPC 池(L2a,2026-08-07 所有者定稿:PG 权威,飞书表=注入口+投影)────
 -- 领号并发安全靠单事务 FOR UPDATE SKIP LOCKED(旧系统文件锁/本地声明簿/
@@ -499,6 +549,15 @@ CREATE VIEW catalog.product_risk AS
               ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         -- 改码维度(2026-09-02,SKU 改造批次 3 地基):所有者要能答"这个 ASIN 在
+         -- 这家店用过哪些码、为什么换"。身份键已是 coalesce(asin, sku),新旧码经
+         -- 登记簿都解析到同一个 ASIN,所以改码天然落在同一条时间线上。不加这两列,
+         -- sku_replaced 就是"写了没人看"——与 2026-08-14 audit_passed/audit_rejected
+         -- 零读者是同一个坑(教训写在下面那段注释里)。
+         -- ⚠ 一次改码在同一 ASIN 上留**两条** sku_replaced:旧码一条(sku_codec.abandon
+         --   带 replaced_by 时记)、新码一条(settle_replacement 给新码的出生事件)。
+         count(*) FILTER (WHERE event = 'sku_replaced')          AS sku_replaced_times,
+         max(occurred_at) FILTER (WHERE event = 'sku_replaced')  AS last_sku_replaced_at,
          -- 审核维度(2026-08-14 接消费端):在此之前 audit_passed/audit_rejected
          -- **零读者** —— 全库 119 万条事件写了没人看,而"审核拒了但还在架"
          -- 这类跨域问题却要靠 JOIN 两张表现拼。病历的价值本就是把审核结论、
@@ -634,6 +693,44 @@ CREATE TABLE IF NOT EXISTS listing.retire_cooldown (
 CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
     ON listing.retire_cooldown (store, sku) WHERE status = 'pending';
 
+-- 改码过程台账(2026-09-02,SKU 改造批次 3;写侧是 workflows/sku_migrate.py)。
+-- **分工写死**:身份权威在 catalog.listing_sources(replaces / replaced_by /
+-- abandoned_at),本表只是 sku_migrate 的**过程账** —— feed_id、提交时刻、失败原因、
+-- 重跑幂等键、飞书同步态,这四样都不属于一张被十几个消费方 JOIN 的身份表。
+-- 两者的状态迁移必须在**同一事务**里完成(与 listing.retire_cooldown 之于
+-- catalog.upc_pool 同款分工,见上面那张表)。
+-- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
+-- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
+-- sheet_synced_at:上架表 SKU 列已回写新码的时刻;NULL = 待补写。没有这一列,
+-- 一次飞书写失败(频控 99991400 / 行号找不到)之后该行已 confirmed、不再进定案集,
+-- SKU 列永远停在旧码,而回执找行与退役从此对不上且不报错
+-- (conventions §八「当轮写完,攒到下一轮 = 悄悄少写」)。
+CREATE TABLE IF NOT EXISTS listing.sku_migrations (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store          text NOT NULL,
+    old_sku        text NOT NULL,
+    new_sku        text NOT NULL,
+    source_type    text NOT NULL,
+    source_key     text,
+    feed_type      text NOT NULL,    -- MP_MAINTENANCE(形态 A)/ MP_ITEM(形态 B)
+    feed_id        text,             -- 提交成功后落;NULL = 还没发出去
+    status         text NOT NULL DEFAULT 'pending',  -- pending/confirmed/rolled_back/stalled
+    submitted_at   timestamptz,
+    settled_at     timestamptz,
+    sheet_synced_at timestamptz,     -- 上架表 SKU 列已回写新码的时刻;NULL = 待补写
+    error          text,
+    detail         jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at     timestamptz NOT NULL DEFAULT now()
+);
+-- 同 (店, 旧码) 只允许一条在途改码:崩溃重入的防重键(先落库再调接口)
+CREATE UNIQUE INDEX IF NOT EXISTS sku_migrations_open_uidx
+    ON listing.sku_migrations (store, old_sku) WHERE status = 'pending';
+-- 新码全表唯一:一个不透明码这辈子只允许被用来替换一次
+CREATE UNIQUE INDEX IF NOT EXISTS sku_migrations_new_uidx
+    ON listing.sku_migrations (new_sku);
+CREATE INDEX IF NOT EXISTS sku_migrations_status_idx
+    ON listing.sku_migrations (status, created_at);
+
 -- ── 退役清理(2026-08-12 所有者批准:确认无用即清;证据=全仓零代码引用)──
 -- listing.tasks:上架状态权威在飞书上架表 + catalog.upc_pool + retire_cooldown,
 --   从未经过此表。listing.upc_pool:在用的是 catalog.upc_pool,两者状态机定义
@@ -744,6 +841,26 @@ CREATE INDEX IF NOT EXISTS order_lines_source_idx ON orders.order_lines (source)
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS asin text;
 CREATE INDEX IF NOT EXISTS order_lines_asin_idx ON orders.order_lines (asin)
     WHERE asin IS NOT NULL;
+
+-- 订单双算体检的**唯一判据**(2026-09-02,SKU 改造批次 3 地基)。
+-- orders.order_lines 的主键是 order_line_id = sha256(PO + SKU),唯一约束是
+-- (po_id, sku):改码之后,若沃尔玛对**改码之前的 PO** 返回新码,那一行会被当成
+-- 新行插入而旧行不删 ⇒ 同一笔销售算两次(销量、产品分、日报、对账全受影响),
+-- **而且不报错**。官方没有一个字说改码后旧 PO 会返回哪个码,所以只能用体检兜住。
+-- 口径取 count(DISTINCT order_line_id) 而不是 count(*):要问的正是"同一个 PO 行
+-- 底下有几个不同的行 id"。
+-- **谁都不许再写一遍这段 GROUP BY/HAVING**:services/order_lines.duplicate_po_lines、
+-- catalog_health、手工 psql 全部读本视图(判据只有一处出生)。窗口不在这里 ——
+-- 由消费方自己加 `WHERE first_order_date > …`。
+CREATE OR REPLACE VIEW orders.v_order_line_dupes AS
+  SELECT store, po_id, line_number,
+         count(DISTINCT order_line_id)   AS n,
+         array_agg(sku ORDER BY sku)     AS skus,
+         min(order_date)                 AS first_order_date
+  FROM orders.order_lines
+  WHERE line_number IS NOT NULL
+  GROUP BY store, po_id, line_number
+  HAVING count(DISTINCT order_line_id) > 1;
 
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号

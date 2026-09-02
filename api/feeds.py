@@ -59,6 +59,11 @@ _backoff = _client.backoff
 # 次日的 FAILED 重试通道兜着,不必在当轮把配额榨干
 SETTLE_ATTEMPTS = 3
 
+# 改码(SkuUpdate,SKU 改造批次 3)在本层**零改动**,核对结论写在这里,免得
+# 下一个人照着计划再登记一遍变成双轨:形态 A 复用 MP_MAINTENANCE(切片 1000 条 /
+# 24MB,见下),形态 B 复用 MP_ITEM(2000 条 / 24MB);两个桶
+# `feeds.post.MP_MAINTENANCE` = 8/hour 与 `feeds.post.MP_ITEM` = 8/hour 都已在
+# api/_client.py 登记。**不新增 feedType、不新增桶、不加业务判断**(铁律 2)。
 # 切片双约束:(最大条数, 最大字节)。RETIRE_ITEM 官方无现值,按 DELETE 同档保守;
 # price/inventory 官方 10MB(旧代码 25MB 超官方上限,蓝图 §5.4 收紧)。
 # price 条数 8000(所有者定稿 2026-08-26:官方**硬限 10000 条**留两成余量,
@@ -258,6 +263,9 @@ def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
     if feed_type in ("MP_MAINTENANCE", "price", "inventory",
                      "MP_ITEM_MATCH", "MP_ITEM"):
         # dict 条目:sku 在顶层或嵌在 Orderable 里(反补载荷是后者)
+        # ⚠ 改码载荷的 Orderable.sku 是**新码**,故 ops.feed_items 台账按新码落账
+        #    —— sku_migrate 的回执反查、feed_poll 的反哺都按新码找行,**这是有意的**
+        #    (改成取旧码,回执就永远查不到而且不报错)。
         return [str(e.get("sku") or (e.get("Orderable") or {}).get("sku") or "")
                 for e in chunk]
     return [str(s) for s in chunk]

@@ -684,12 +684,24 @@ def ensure_variant_bag(spec: dict, visible: dict, sku: str = "",
     return visible, notes0 + notes
 
 
+#: Orderable 里的**系统开关字段**(不是内容字段):spec 里有没有它取决于版本,
+#: 但它一旦被裁掉,一条**改码 feed 会静默退化成一条普通上架** —— 沃尔玛按新 sku
+#: 建第二条 listing,旧 listing 原样活着,而且是每一行都双挂,不是偶发。
+#: 这不是 catch-all 豁免(conventions §六 真兜底三要件):名单是**穷举的一元组**、
+#: 触发记日志、条件明确。名单要长第二个条目,先问一句"它到底是不是开关字段"。
+ORDERABLE_SYSTEM_SWITCHES = ("SkuUpdate",)
+
+
 def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
                   ) -> tuple[dict, dict, list[str]]:
     """输入:两 spec + 两段 → 输出:(裁剪后 visible, orderable, 说明)。
 
     spec 的 additionalProperties=false:多一个字段整条被拒
     (EXT_DATA_ERROR_60670554076755,如 Orderable.productName)。
+
+    唯一的例外是 `ORDERABLE_SYSTEM_SWITCHES`(见上):它们**不看 spec 放行**,
+    因为 spec 里没有它不代表沃尔玛不认它,而剔掉它的后果是静默改语义
+    (改码 → 普通上架 → 同店双挂),不是被拒。放行时记一条 info。
     """
     vkeys, okeys = set(_props(spec)), set(_props(ospec))
     dropped: list[str] = []
@@ -703,6 +715,10 @@ def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
     for k, v in orderable.items():
         if k in okeys:
             no[k] = v
+        elif k in ORDERABLE_SYSTEM_SWITCHES:
+            no[k] = v
+            logger.info("Orderable 系统开关字段 %s=%r 放行(spec 里没有它,"
+                        "但剔掉会让改码退化成普通上架)", k, v)
         else:
             dropped.append(f"orderable.{k}")
     return nv, no, dropped

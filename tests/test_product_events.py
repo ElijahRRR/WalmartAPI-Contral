@@ -131,3 +131,23 @@ def test_verify_deletions_verdicts(caplog):
     assert ("S_STILL", "delete_not_effective") in events
     assert not any(r[0] == "S_WAIT" for r in rows)        # 未到期不落判
     assert any("仍在架" in m for m in caplog.messages)
+
+
+def test_product_risk_view_exposes_sku_replaced_columns():
+    """改码维度进 product_risk(SKU 改造批次 3 地基,S4)。
+
+    所有者要能答"这个 ASIN 在这家店用过哪些码、为什么换"。不加这两列,
+    sku_replaced 就是写了没人看 —— 与 2026-08-14 audit_passed/audit_rejected
+    「零读者」是同一个坑。身份键仍是 coalesce(asin, sku)(新旧码经登记簿都解析到
+    同一个 ASIN),所以改码天然落在同一条时间线上,不必改身份键。
+    """
+    import pathlib
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    view = ddl.split("CREATE VIEW catalog.product_risk AS")[1]
+    view = view.split(";")[0]
+    assert "count(*) FILTER (WHERE event = 'sku_replaced')" in view
+    assert "AS sku_replaced_times" in view
+    assert "max(occurred_at) FILTER (WHERE event = 'sku_replaced')" in view
+    assert "AS last_sku_replaced_at" in view
+    assert "coalesce(asin, sku) AS asin" in view       # 身份键没被动过
+    assert "sku_replaced" in pe.EVENTS                 # 事件码早已登记(批次 2)

@@ -850,3 +850,52 @@ def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
     # 配置店不许再被扣上"会漂"的帽子
     warn = [l for l in out.splitlines() if "会漂" in l][0]
     assert "谭总12" not in warn
+
+
+# ── 在途改码的两个反向指针(SKU 改造批次 3 地基,只读积木)────────────────────
+
+class _RowsConn:
+    """只回放一组行的假连接(本节两条都是纯查询,不写库)。"""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.sqls = []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sqls.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_replacement_map_only_returns_rows_with_replaces():
+    """{新码: 旧码} —— catalog_sync 用它回答「本轮新出现的这个 sku 是不是某个
+    旧码的替身」。SQL 必须带 `replaces IS NOT NULL`:不带就是把全店登记行都拉回来,
+    而且每一行的值都是 None(改码前那一列全库为 NULL)。"""
+    from services import listing_sources
+    conn = _RowsConn([("AN3WC0DE2345", "B0ABCDEFGH")])
+    assert listing_sources.replacement_map(conn, "T1") == {
+        "AN3WC0DE2345": "B0ABCDEFGH"}
+    sql, args = conn.sqls[0]
+    assert "replaces IS NOT NULL" in sql and args == ("T1",)
+    assert listing_sources.replacement_map(_RowsConn([]), "T1") == {}   # 改码前空
+
+
+def test_replaced_skus_only_returns_rows_with_replaced_by():
+    """{正在被替换的旧码} —— 本轮缺席的这个 sku 若在集合里,缺席是我们自己造成的,
+    不该记 item_missing、不该产删除建议。改码前恒为空集(零行为变化)。"""
+    from services import listing_sources
+    conn = _RowsConn([("B0ABCDEFGH",)])
+    assert listing_sources.replaced_skus(conn, "T1") == {"B0ABCDEFGH"}
+    sql, args = conn.sqls[0]
+    assert "replaced_by IS NOT NULL" in sql and args == ("T1",)
+    assert listing_sources.replaced_skus(_RowsConn([]), "T1") == set()

@@ -554,6 +554,111 @@ def test_the_live_unique_index_is_named_once_and_carries_replaced_by():
     assert "abandoned_at IS NULL AND replaced_by IS NULL" in sku_codec._SQL_LIVE
 
 
+def test_mint_live_row_filter_matches_the_index_condition():
+    """mint 的活行 WHERE 片段与 schema.sql 里活码索引的 WHERE 片段**逐字一致**。
+
+    S1 修订后批次 3 不再动任何索引,唯一的保护就剩这条断言:两边一旦不同,
+    「索引允许插入的状态,代码查得出两行」,而这类不一致在本仓一律是静默的
+    (改码 pending 期间 mint 会把正在退休的旧码当活码返回,再发一次 MP_ITEM)。
+    """
+    frag = "abandoned_at IS NULL AND replaced_by IS NULL"
+    key_idx = _SCHEMA[_SCHEMA.index("listing_sources_live_key_idx"):]
+    key_idx = key_idx[:key_idx.index(";")]
+    live_idx = _SCHEMA[_SCHEMA.index("listing_sources_live_uidx"):]
+    live_idx = live_idx[:live_idx.index(";")]
+    assert f"WHERE {frag}" in key_idx           # 复用查询的索引:条件逐字相同
+    assert f"WHERE {frag}" in live_idx          # 活码唯一索引:同一条前缀
+    assert frag in sku_codec._SQL_LIVE
+    # 反向:代码侧不许悄悄多一条(多了就用不上索引,而且判据从此有两份)
+    where = sku_codec._SQL_LIVE.split("WHERE", 1)[1]
+    assert where.strip().splitlines()[1].strip() == f"AND {frag}"
+
+
+_OPAQUE_REGEX_RE = re.compile(r"~\s*'\^\[[^\]]+\]\{\d+\}\$'")
+
+
+def test_no_second_opaque_regex_in_the_repo():
+    """12 位字符集正则只允许出现在 **schema.sql 的两条部分索引条件**里。
+
+    .py 侧一份都不许有:SQL 要用就 `sku_codec.OPAQUE_SQL_PREDICATE.format(col=…)`
+    (由 _ALPHABET 派生)。手打第二份 = 第二个字母表之家,两份一漂,SQL 判据与
+    is_opaque 会对"什么是新码"给出不同答案,而且全程不报错。
+    """
+    offenders = [f"{rel}:{n} {line.strip()[:80]}" for rel, path in _prod_files()
+                 for n, line in enumerate(
+                     path.read_text(encoding="utf-8").splitlines(), 1)
+                 if _OPAQUE_REGEX_RE.search(line)]
+    assert not offenders, _fmt(
+        offenders, "不透明码正则只准由 sku_codec.OPAQUE_SQL_PREDICATE 拼出来:")
+    assert len(_OPAQUE_REGEX_RE.findall(_SCHEMA)) == 2, "schema.sql 的两条索引条件"
+    # 派生常量与 schema 的字符类同源(拼出来的谓词能在 schema 文本里找到)
+    assert (f"sku ~ '^[{sku_codec._ALPHABET}]{{{sku_codec._LEN}}}$'"
+            in _SCHEMA)
+    assert sku_codec.OPAQUE_SQL_PREDICATE.format(col="sku").strip("()").split(
+        " AND ")[0] in _SCHEMA
+
+
+#: 代际继承链(replaces)只准在这两个模块里写 SQL:视图 catalog.sku_aliases 是
+#: 「这个新码继承那个旧码的历史」的唯一出处,消费方一律经视图取别名。
+_REPLACES_SQL_OK: dict[str, tuple[str, str]] = {
+    "services/sku_codec.py": (
+        "permanent", "mint_replacement 写 replaces 那一列(改码的写侧唯一之家)"),
+    "services/listing_sources.py": (
+        "permanent",
+        "replacement_map / replaced_skus:catalog_sync 逐店取反向指针,"
+        "是登记簿自己的知识(不是代际继承判据)"),
+}
+
+
+def test_only_sku_aliases_expresses_the_replacement_chain():
+    """「新码继承旧码的历史」这条判据只有一处出生:视图 catalog.sku_aliases。
+
+    五处按 (store, sku) 读历史的判据(顽固件代际 / 问题归类 / WFS 拦截 /
+    在途防重 / 分配链销量)都要沿 replaces 链继承一跳。各自现写一遍
+    `listing_sources … replaces` 的 JOIN,就是五份会各自漂移的判据 ——
+    而漂了不报错,只是某一处从此看不见历史。
+    """
+    offenders = _offenders(re.compile(r"\breplaces\b"), _REPLACES_SQL_OK)
+    assert not offenders, _fmt(
+        offenders, "代际继承只准经 catalog.sku_aliases 视图(judgement 只有一处出生):")
+    assert "CREATE OR REPLACE VIEW catalog.sku_aliases" in _SCHEMA
+    view = _SCHEMA[_SCHEMA.index("CREATE OR REPLACE VIEW catalog.sku_aliases"):]
+    view = view[:view.index(";")]
+    assert "replaces AS alias_sku" in view
+    # 只出活着的认领:回滚作废的新码行留着 replaces 当病历,但没有历史可继承 ——
+    # 不排除它,同一个旧码会出现多行,消费方 LEFT JOIN 就把同一笔历史算两次
+    assert "WHERE replaces IS NOT NULL AND abandoned_at IS NULL" in view
+    idx = _SCHEMA[_SCHEMA.index("listing_sources_replaces_uidx"):]
+    assert "WHERE replaces IS NOT NULL AND abandoned_at IS NULL" in idx[:idx.index(";")]
+
+
+def test_batch3_ground_objects_are_idempotent_and_named_once():
+    """批次 3 地基的每个新对象:名字在 schema.sql 只出现一次,建法幂等。
+
+    db_init 是把整份 schema.sql 一次 execute,一条失败整份回滚 ⇒ 生产建库停摆。
+    两个反查索引都是**局部**索引(改码前零行命中),表与视图分别是
+    IF NOT EXISTS 与 OR REPLACE —— 连跑两次必须无事发生。
+    """
+    for name in ("listing_sources_replaced_by_idx", "listing_sources_replaces_uidx",
+                 "sku_migrations_open_uidx", "sku_migrations_new_uidx",
+                 "sku_migrations_status_idx"):
+        assert _SCHEMA.count(name) == 1, name
+        stmt = _SCHEMA[_SCHEMA.index(name) - 60:]
+        stmt = stmt[stmt.index("CREATE"):]
+        assert "IF NOT EXISTS" in stmt[:stmt.index(";")], name
+    assert "ADD COLUMN IF NOT EXISTS replaces" in _SCHEMA
+    assert "ADD COLUMN IF NOT EXISTS replaced_at" in _SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS listing.sku_migrations" in _SCHEMA
+    for view in ("catalog.sku_aliases", "orders.v_order_line_dupes"):
+        assert f"CREATE OR REPLACE VIEW {view}" in _SCHEMA
+        assert _SCHEMA.count(view) >= 1
+    # 两个反查索引必须是局部索引:全表唯一会在存量脏数据上让 db_init 整份回滚
+    for name, cond in (("listing_sources_replaced_by_idx", "replaced_by IS NOT NULL"),
+                       ("listing_sources_replaces_uidx", "replaces IS NOT NULL")):
+        stmt = _SCHEMA[_SCHEMA.index(name):]
+        assert f"WHERE {cond}" in stmt[:stmt.index(";")], name
+
+
 def test_generation_index_exists_in_schema():
     """代际上限闸的索引必须在 schema.sql 里(批次 2 唯一新增的一条)。
 
@@ -986,7 +1091,9 @@ def _pg_up() -> bool:
 needs_pg = pytest.mark.skipif(not _pg_up(),
                               reason=f"沙箱 PG {_PG_HOST}:{_PG_PORT} 未启动")
 
-_LEGACY, _OPAQUE = "B0GUARD0001", "AGUARD234567"
+# ⚠ 夹具里的"新码"必须真的过 is_opaque:U 不在字母表里(旧值 AGUARD234567 含 U,
+#   落不进那两条部分唯一索引,于是这两条用例在真 PG 上永远 DID NOT RAISE)。
+_LEGACY, _OPAQUE = "B0GUARD0001", "AG4ARD234567"
 
 
 @pytest.fixture
@@ -1035,7 +1142,77 @@ def test_pg_two_live_rows_may_share_a_legacy_key_but_never_a_minted_one(pg):
     _insert(pg, "GUARD_C", "B0GUARD0002", source_key="B0SHAREKEY")
     with pg.transaction():                      # 存量形态:同键两活行允许
         _insert(pg, "GUARD_C", "B0GUARD0003", source_key="B0SHAREKEY")
-    _insert(pg, "GUARD_C", "AGUARD234568", source_key="B0MINTEDKEY")
+    _insert(pg, "GUARD_C", "AG4ARD234568", source_key="B0MINTEDKEY")
     with pytest.raises(psycopg.errors.UniqueViolation):
         with pg.transaction():
-            _insert(pg, "GUARD_C", "AGUARD234569", source_key="B0MINTEDKEY")
+            _insert(pg, "GUARD_C", "AG4ARD234569", source_key="B0MINTEDKEY")
+
+
+@needs_pg
+def test_pending_replacement_two_active_rows_pass_the_partial_unique_index(pg):
+    """在途改码期间,同一个 (店, 来源, 源头键) 底下**允许**两条未弃码的行:
+    旧行(replaced_by 非空)+ 新码行(活)。
+
+    活码唯一索引的条件含 `replaced_by IS NULL`,旧行因此退出索引 —— 不含这一条
+    的话,mint_replacement 的 INSERT 会当场撞唯一索引,整个改码链走不通。
+    """
+    key = "B0PENDINGKEY"
+    _insert(pg, "GUARD_P", "AG4ARDPEND23", source_key=key)      # 旧码(不透明形态)
+    with pg.cursor() as cur:
+        cur.execute("UPDATE catalog.listing_sources SET replaced_by = %s, "
+                    "replaced_at = now() WHERE store = %s AND sku = %s",
+                    ("AG4ARDPEND24", "GUARD_P", "AG4ARDPEND23"))
+        cur.execute(
+            "INSERT INTO catalog.listing_sources "
+            "(store, sku, source_type, source_key, workflow, replaces) "
+            "VALUES ('GUARD_P', 'AG4ARDPEND24', 'amz', %s, 'test_sku_guard', "
+            "        'AG4ARDPEND23')", (key,))
+        cur.execute("SELECT count(*) FROM catalog.listing_sources "
+                    "WHERE store = 'GUARD_P' AND abandoned_at IS NULL")
+        assert cur.fetchone()[0] == 2
+
+
+@needs_pg
+def test_two_new_codes_cannot_claim_the_same_old_sku(pg):
+    """认领位唯一:两个**活着的**新码抢同一个旧码,是并发重跑才会出现的脏状态,
+    出现之后**无法自动分辨**哪个码才是真的。
+
+    但作废的认领必须让位(条件带 `abandoned_at IS NULL`):改码回滚之后那个新码行
+    保留 replaces 当病历、行永不 DELETE —— 不让位的话同一个旧码这辈子只能改一次,
+    回滚之后再改必然撞索引,而 mint_replacement 会把它误诊成"随机撞码"。
+    """
+    import psycopg
+
+    def _claim(new_sku, source_key):
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO catalog.listing_sources "
+                "(store, sku, source_type, source_key, workflow, replaces) "
+                "VALUES ('GUARD_R', %s, 'amz', %s, 'test_sku_guard', 'B0OLDCODE01')",
+                (new_sku, source_key))
+
+    # 两个新码给不同的 source_key:这样撞的一定是 (store, replaces) 那条唯一索引,
+    # 而不是活码键唯一索引 —— 否则这条用例证明不了它想证明的东西
+    _claim("AG4ARDNEW223", "B0KEYRA")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with pg.transaction():
+            _claim("AG4ARDNEW224", "B0KEYRB")
+    # 回滚(新码弃码)之后,认领位必须放开,同一个旧码可以再改一次
+    with pg.cursor() as cur:
+        cur.execute("UPDATE catalog.listing_sources SET abandoned_at = now(), "
+                    "abandoned_reason = %s WHERE store = 'GUARD_R' AND sku = %s",
+                    (sku_codec.ABANDON_SKU_UPDATE_FAILED, "AG4ARDNEW223"))
+    _claim("AG4ARDNEW224", "B0KEYRB")
+
+
+@needs_pg
+def test_is_opaque_and_the_sql_predicate_agree(pg):
+    """Python 侧 `is_opaque` 与 SQL 侧 `OPAQUE_SQL_PREDICATE` 对同一组样本
+    **逐条一致**:两套判据一漂,索引收的行与代码认的码就不是同一批。"""
+    samples = ["B0GXX75JN5", "XKJ-B0GXX75JN5-39.98", "PHUMWMT12345",
+               "102460018738", "234567892345", "AK7QM2X9RT4W", "DRYRUN000000"]
+    pred = sku_codec.OPAQUE_SQL_PREDICATE.format(col="s")
+    with pg.cursor() as cur:
+        cur.execute(f"SELECT s, {pred} FROM unnest(%s::text[]) AS s", (samples,))
+        got = dict(cur.fetchall())
+    assert got == {s: sku_codec.is_opaque(s) for s in samples}

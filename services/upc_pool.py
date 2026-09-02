@@ -255,6 +255,36 @@ def mark_used(conn, pairs: list[tuple[str, str]]) -> int:
     return len(pairs)
 
 
+def retag_sku(conn, triples: list[tuple[str, str, str]]) -> int:
+    """输入:连接 + [(店, ASIN, 新 SKU)] → 输出:改标行数(改码后号还是那个号,
+    只是它现在挂在新 SKU 名下)。
+
+    `sku` 列的语义是「这个号现在被哪个沃尔玛 SKU 占着」(schema.sql 的列注)。
+    改码后不改它,列里存的就是一个**已经不存在于沃尔玛的串**;而
+    listing_sheet._mark_upc_conflicts 与 UPC 池表投影都按它反查 —— 反查不到就是
+    撞库标不上、运营在表上看到的归属是错的,**而且不报错**。
+
+    **不复用 mark_used**(那是"新消耗"):mark_used 会把 status 推成 'used' 并刷
+    used_at;改码不是一次新消耗,时间戳不该被改写。本函数只动 sku 一列,
+    asin(领号复用键)/ status / used_at 一律不动。
+    状态条件 `status IN ('claimed','used')` 与 burn 逐字一致 —— 两个改池表的出口
+    口径不一致本身就是漂移源。
+    """
+    if not triples:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE catalog.upc_pool SET sku = t.new_sku "
+            "FROM unnest(%s::text[], %s::text[], %s::text[]) AS t(s, a, new_sku) "
+            "WHERE store = t.s AND asin = t.a "
+            "  AND status IN ('claimed', 'used')",
+            ([t[0] for t in triples], [t[1] for t in triples],
+             [t[2] for t in triples]))
+        n = cur.rowcount
+    logger.info("UPC 改标 %d 个(改码:号不动,只换挂在它名下的 SKU)", n)
+    return n
+
+
 def release(conn, upcs: list[str], reason: str) -> int:
     """输入:连接 + UPC 列表 + 回收原因 → 输出:回收数(claimed → 未用)。
 

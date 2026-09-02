@@ -140,6 +140,37 @@ def test_burn_statuses_are_registered_in_schema_and_labels():
         assert v in schema
 
 
+def test_retag_sku_moves_the_code_without_touching_asin_status_or_used_at():
+    """改码后号还是那个号,只是它现在挂在新 SKU 名下(SKU 改造批次 3 地基)。
+
+    `sku` 列的语义是"这个号现在被哪个沃尔玛 SKU 占着"。不改它,列里存的就是一个
+    已经不存在于沃尔玛的串,而撞库标记与池表投影都按它反查 —— 反查不到就是标不上、
+    归属显示错,**而且不报错**。
+    """
+    conn = _Conn()
+    assert upc_pool.retag_sku(conn, [("T1", "B0X", "AN3WC0DE2345")]) == 1
+    sql, args = conn.sqls[0]
+    assert "SET sku = t.new_sku" in sql
+    assert "status =" not in sql and "used_at" not in sql   # 不是新消耗,时间戳不动
+    assert "asin = t.a" in sql and "SET asin" not in sql    # asin 是领号复用键,不动
+    assert args == (["T1"], ["B0X"], ["AN3WC0DE2345"])
+    assert upc_pool.retag_sku(conn, []) == 0
+
+
+def test_retag_sku_skips_rows_that_are_not_claimed_or_used():
+    """状态条件与 `burn` **逐字一致**:两个改池表的出口口径不一致本身就是漂移源。
+
+    未用('')/撞库/烧掉的号不该被改标 —— 它们根本没挂在任何在架 SKU 名下。
+    """
+    conn = _Conn()
+    upc_pool.retag_sku(conn, [("T1", "B0X", "AN3WC0DE2345")])
+    assert "status IN ('claimed', 'used')" in conn.sqls[0][0]
+    burn_conn = _Conn()
+    upc_pool.burn(burn_conn, [("T1", "B0X")], upc_pool.BURN_LOCK)
+    cond = "status IN ('claimed', 'used')"
+    assert cond in burn_conn.sqls[0][0] and cond in conn.sqls[0][0]
+
+
 def test_claim_reuse_ignores_burned_rows():
     """领号的原号复用是**白名单** status IN ('claimed','used') —— 烧掉的号
     天然被排除,不需要为新状态值再补一条排除条件(补了就是第二处口径)。"""

@@ -51,3 +51,29 @@ def register(conn, rows: list[dict]) -> int:
             [(r["store"], r["sku"], r["source_type"],
               r.get("source_key"), r.get("workflow")) for r in rows])
     return len(rows)
+
+
+def replacement_map(conn, store: str) -> dict[str, str]:
+    """输入:连接 + 店 → 输出:{新码: 旧码}(在途改码的反向指针,catalog_sync 用)。
+
+    只读。回答的是「本轮**新出现**的这个 sku 是不是某个旧码的替身」——
+    是的话它不该被记成 item_appeared(那是"这个店多了一个品"),而是改码的另一面。
+    改码前本店恒返回空字典 ⇒ 消费方的分支一次都不会走到(零行为变化)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku, replaces FROM catalog.listing_sources "
+                    "WHERE store = %s AND replaces IS NOT NULL", (store,))
+        return {sku: old for sku, old in cur.fetchall()}
+
+
+def replaced_skus(conn, store: str) -> set[str]:
+    """输入:连接 + 店 → 输出:{正在被替换的旧码}(在途改码的旧码集合)。
+
+    只读。回答的是「本轮**缺席**的这个 sku 是不是正在被替换」—— 是的话它的缺席
+    是我们自己造成的,不该记 item_missing、不该产删除建议。
+    改码前本店恒返回空集合 ⇒ 消费方的分支一次都不会走到(零行为变化)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku FROM catalog.listing_sources "
+                    "WHERE store = %s AND replaced_by IS NOT NULL", (store,))
+        return {r[0] for r in cur.fetchall()}

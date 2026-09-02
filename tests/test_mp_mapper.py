@@ -296,3 +296,64 @@ def test_split_llm_output_two_part_and_legacy_flat():
     assert v == {"color": "Red"} and o == {"netContent": {}}
     v2, o2 = m.split_llm_output({"color": "Red"})      # 旧缓存平铺形态
     assert v2 == {"color": "Red"} and o2 == {}
+
+
+# ── SkuUpdate:系统专属开关字段(SKU 改造批次 3 地基,M1/M2/M3)───────────────
+
+def test_sku_update_is_a_system_field_and_never_reaches_the_llm():
+    """SkuUpdate 在 ORDERABLE_SYSTEM_FIELDS 里 ⇒ 既不进 LLM 提示词,也不许 LLM 填。
+
+    它一旦被 LLM 塞进普通上架载荷,后果不是报错,而是**沃尔玛把一次普通上架当成
+    改码请求** —— 本仓能想到的最贵的静默失效。
+    """
+    assert "SkuUpdate" in m.ORDERABLE_SYSTEM_FIELDS
+    ospec = {"required": [], "properties": {
+        "SkuUpdate": {"type": "string"}, "sku": {"type": "string"},
+        "netContent": {"type": "object"}}}
+    msgs = m.build_llm_messages("Cups", {"properties": {}}, {"title": "x"},
+                                ospec=ospec)
+    assert all("SkuUpdate" not in msg["content"] for msg in msgs)
+
+
+def test_llm_supplied_sku_update_is_stripped_from_orderable():
+    """LLM 填的 SkuUpdate 一律被剔掉(系统专属字段由 sku_update 形参给,不由 LLM)。"""
+    o = m.build_orderable("B0X", "012345678905", 10, 3, "P1",
+                          llm_fields={"SkuUpdate": "Yes"})
+    assert "SkuUpdate" not in o
+
+
+def test_build_orderable_without_sku_update_is_byte_identical_to_before():
+    """默认 False:三个存量调用点的载荷**逐字节不变**(零行为变化的落脚点)。"""
+    import inspect
+    import json
+    a = m.build_orderable("B0X", "012345678905", 10, 3, "P1")
+    b = m.build_orderable("B0X", "012345678905", 10, 3, "P1", sku_update=False)
+    assert "SkuUpdate" not in json.dumps(a)
+    assert set(a) == set(b)
+    p = inspect.signature(m.build_orderable).parameters["sku_update"]
+    assert p.default is False and p.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_build_orderable_with_sku_update_emits_yes():
+    """形态 B(MP_ITEM 全量重发)靠这一个字段把"上架"变成"改码";值只有 'Yes'。"""
+    o = m.build_orderable("AN3WC0DE2345", "012345678905", 10, 3, "P1",
+                          sku_update=True)
+    assert o["SkuUpdate"] == "Yes"
+    assert o["sku"] == "AN3WC0DE2345"          # 改成的新码就写在 Orderable.sku
+
+
+def test_build_sku_update_item_shape_matches_the_minimal_maintenance_payload():
+    """形态 A 最小载荷:SKU + Product ID + SkuUpdate,**没有 Visible 段**。
+
+    最小载荷 = 不重发内容 = 标题/属性不会被我们再生成的文案覆盖。匹配键是
+    Product ID 不是 SKU(官方:Enter the correct SKU for that Product ID)。
+    """
+    item = m.build_sku_update_item("AN3WC0DE2345", "012345678905")
+    assert item == {"Orderable": {
+        "sku": "AN3WC0DE2345",
+        "productIdentifiers": {"productId": "012345678905",
+                               "productIdType": "UPC"},
+        "SkuUpdate": "Yes"}}
+    assert "Visible" not in item
+    gtin = m.build_sku_update_item("AN3WC0DE2345", "00012345678905", "GTIN")
+    assert gtin["Orderable"]["productIdentifiers"]["productIdType"] == "GTIN"

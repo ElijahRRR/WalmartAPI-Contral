@@ -314,3 +314,42 @@ def test_clamp_max_length_local_gate():
     assert any("tags" in n for n in notes)          # 截断必须见 notes
     out2, notes2 = mc.clamp_max_length(spec, {"envelopeSize": "small"})
     assert out2["envelopeSize"] == "small" and notes2 == []
+
+
+# ── SkuUpdate 必须活着穿过 strip_unknown(SKU 改造批次 3 地基,M5)────────────
+
+def test_sku_update_survives_strip_unknown_when_absent_from_the_spec(caplog):
+    """SkuUpdate 不在 Orderable spec 里(版本决定)也**必须放行**。
+
+    被剔掉的后果不是被拒,而是静默改语义:发出去的是一条普通 MP_ITEM,沃尔玛按新
+    sku **建一条新 listing**,旧 listing 原样活着 —— 每一行都双挂,不是偶发。
+    名单穷举、触发记日志、条件明确(conventions §六 真兜底三要件),不是 catch-all。
+    """
+    import logging
+    assert "SkuUpdate" not in _OSPEC["properties"]        # spec 里确实没有它
+    assert mc.ORDERABLE_SYSTEM_SWITCHES == ("SkuUpdate",)
+    with caplog.at_level(logging.INFO, logger="services.mp_conform"):
+        _v, o, dropped = mc.strip_unknown(
+            _SPEC, _OSPEC, {"productName": "T"},
+            {"sku": "S1", "price": 1.0, "SkuUpdate": "Yes"})
+    assert o["SkuUpdate"] == "Yes"
+    assert not any("SkuUpdate" in d for d in dropped)
+    assert any("SkuUpdate" in msg for msg in caplog.messages)   # 放行必须留痕
+
+
+def test_strip_unknown_is_byte_identical_for_payloads_without_sku_update():
+    """不带 SkuUpdate 的普通上架载荷逐字节不变(零行为变化的落脚点)。"""
+    args = (_SPEC, _OSPEC, {"productName": "T", "bogusField": 1},
+            {"sku": "S1", "price": 1.0, "productName": "T"})
+    v, o, dropped = mc.strip_unknown(*args)
+    assert o == {"sku": "S1", "price": 1.0}
+    assert v == {"productName": "T"}
+    assert dropped == ["visible.bogusField", "orderable.productName"]
+
+
+def test_no_other_unknown_orderable_field_survives():
+    """反向:随便塞一个 spec 外字段仍被剔 —— 放行名单是穷举的一元组,不是开闸。"""
+    _v, o, dropped = mc.strip_unknown(
+        _SPEC, _OSPEC, {}, {"sku": "S1", "SkuUpdateNow": "Yes", "whatever": 1})
+    assert "SkuUpdateNow" not in o and "whatever" not in o
+    assert set(dropped) == {"orderable.SkuUpdateNow", "orderable.whatever"}

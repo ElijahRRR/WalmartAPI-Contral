@@ -676,3 +676,27 @@ def backfill_perf_line_ids(conn) -> int:
               AND p.po_id = l.po_id
         """)
         return by_sku + cur.rowcount
+
+
+def duplicate_po_lines(conn, days: int | None = 120) -> list[dict]:
+    """输入:连接(+回看天数,None=不限)→ 输出:同 (store, po_id, line_number)
+    出现多个 order_line_id 的行组。
+
+    **判据在视图里**(`orders.v_order_line_dupes`,refdata/schema.sql):本函数只是
+    加窗口与排序的薄壳,**不许在这里重写 GROUP BY/HAVING** —— 同一条体检两份实现、
+    口径还不同的话,两边数字对不上时没有判据说该信哪个,而这正是「改码后销量双算」
+    唯一能被发现的手段(order_line_id = sha256(PO + SKU):沃尔玛若对改码之前的 PO
+    返回新码,那一行会被当成新行插入而旧行不删,同一笔销售算两次且不报错)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT store, po_id, line_number, n, skus
+            FROM orders.v_order_line_dupes
+            WHERE %(days)s IS NULL
+               OR first_order_date > now() - make_interval(days => %(days)s)
+            ORDER BY n DESC, store, po_id
+            LIMIT 200
+        """, {"days": days})
+        return [{"store": s, "po_id": p, "line_number": ln,
+                 "n": int(n), "skus": list(skus or [])}
+                for s, p, ln, n, skus in cur.fetchall()]

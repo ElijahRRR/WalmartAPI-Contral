@@ -235,9 +235,16 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 索引的字符类与该模块常量由守门测试逐字对齐。理由:铁律 3 管的是路径 / token /
 表 ID / 服务器地址这类**外部资源**,12 位码的字母表是**内部编码规则**。
 
+**③′ SQL 侧的形态判据也只有一处** `sku_codec.OPAQUE_SQL_PREDICATE`(由字母表与
+长度**派生**,消费方 `.format(col="w.sku")` 拼进自己的 SQL)。任何 `.py` 里再手打
+一份 12 位字符集正则即违规(守门 `test_no_second_opaque_regex_in_the_repo`);
+`refdata/schema.sql` 的两条部分索引条件是同源的另一半,由守门逐字对齐。
+
 **④ 登记簿的写入出口**:INSERT 只有 `listing_sources.register` 与
-`sku_codec.mint` 家族两个;`abandoned_at` / `abandoned_reason` / `replaced_by`
-三列只准 `services/sku_codec` 写。行永不 DELETE。
+`sku_codec.mint` 家族两个(批次 3 起 mint 家族含 `mint_replacement`);
+`abandoned_at` / `abandoned_reason` / `replaced_by` / `replaces` / `replaced_at`
+**五列**只准 `services/sku_codec` 写(`abandon` / `mint_replacement` /
+`settle_replacement`)。行永不 DELETE。
 
 **⑤ 守门只有一份** `tests/test_sku_guard.py`:白名单 dict 在文件顶部,每条写清
 理由与**预期收口批次**,永久豁免显式标 permanent。后续批次只准增删这里的白名单
@@ -281,6 +288,19 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
   `services/sku_codec.py`(守门 `test_cooldown_and_generation_constants_have_one_home`)。
 - **跨店永不复用码**:同一个码串在两家店合法,但那正是"两家店有关联"的信号,
   而关联就是封号线(schema.sql 的 `listing_sources_opaque_sku_uidx` 拦它)。
+- **改码(批次 3 地基,2026-09-02)三个函数、两条指针、三态**:
+  `mint_replacement`(先落库:新码行 `replaces`=旧码 + 旧行 `replaced_by`=新码,
+  同一事务,**commit 归调用方**;幂等 —— 崩溃重入拿回同一个码,换码 = 载荷变了 =
+  payload_key 防重不命中 = 同一个 item 被改两次)、`settle_replacement('confirmed')`
+  (旧行走 `abandon(reason='sku_update')`,**不烧 UPC**,并给新码记一条出生事件)、
+  `settle_replacement('rolled_back')`(清旧行指针 + 新码 `abandon('sku_update_failed')`)。
+  `sku_update_failed` 是词表里的**第五个原因但不是第五个弃码点** —— 它弃的是我们
+  自己刚抽、从未上过沃尔玛的新码。回滚作废的新码行**保留 `replaces` 当病历**,但
+  不再占旧码的认领位(索引与视图 `catalog.sku_aliases` 的条件都带 `abandoned_at
+  IS NULL`);不这样的话同一个旧码这辈子只能改一次码,而失败会被误诊成"随机撞码"。
+- **代际继承只有一处出生**:视图 `catalog.sku_aliases`(新码 → 它继承的旧码,
+  **只继承一跳**)。五处按 (店, SKU) 读历史的判据一律经它取别名,不许各自现写
+  `replaces` 的 JOIN(守门 `test_only_sku_aliases_expresses_the_replacement_chain`)。
 - **发码只有一条路**:`sku_codec.mint`。跟卖侧旧的 `PHUMWMT + 日期 + 序号`
   生成器已于批次 2 删除(守门 `test_no_second_sku_generator_survives`),
   跟卖表 B 列人工号仍然优先,人工号走 `listing_sources.register` 在**提交前**登记。

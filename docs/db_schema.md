@@ -10,7 +10,7 @@
 | schema | 职责 | 写入者 |
 |---|---|---|
 | `catalog` | 产品主数据:产品身份 + 采集快照 + 黑名单中心 + 占用台账 | catalog_sync(在线商品)/ product_ingest(采集摄取)/ **product_audit 经 services.audit_store 直写 audit_* 五列(已落地,不再是「未来」)** / risk_sync·blacklist_push(黑名单中心)/ 分配链(claims) |
-| `listing` | 上架域:**现在只剩 `retire_cooldown`**(SKU_LOCKED 自愈冷却);tasks / upc_pool 已于 2026-08-12 退役删除,在用的 UPC 池是 `catalog.upc_pool` | sku_locked_heal |
+| `listing` | 上架域:`retire_cooldown`(SKU_LOCKED 自愈冷却)+ `sku_migrations`(2026-09-02 改码过程台账,批次 3);tasks / upc_pool 已于 2026-08-12 退役删除,在用的 UPC 池是 `catalog.upc_pool` | sku_locked_heal / sku_migrate |
 | `orders` | 订单域:订单、审核结果、结算、售后 | order_audit / returns_sync / settlement 相关工作流 |
 | `ops` | 运行域:运行记录、防重状态、游标 | cli.py 与各工作流 |
 | `audit` | 审核域:规则字典、审核结论明细(2026-08-13 批次 A 迁自 walmart-audit-system) | audit_import(一次性)/ risk_sync(镜像)/ product_audit(批次 B 起) |
@@ -171,7 +171,10 @@ CREATE TABLE catalog.listing_sources (
     created_at  timestamptz,
     abandoned_at     timestamptz,    -- 弃码时刻;NULL = 活码(2026-09-02 批次 0a)
     abandoned_reason text,           -- delete_verified/sku_locked/upc_conflict/sku_update
-    replaced_by      text            -- 改码后的新 SKU(批次 3 的 SkuUpdate 写)
+                                     -- /sku_update_failed(改码回滚时弃掉那个新码)
+    replaced_by      text,           -- 改码后的新 SKU;非空 = 在途改码(pending)
+    replaces         text,           -- **新码行**指回被它替换的旧码(批次 3)
+    replaced_at      timestamptz     -- 旧行进入 pending 的时刻(定案超时判据的唯一时间源)
 );
 -- listing_sources_key_idx (source_key) WHERE source_key IS NOT NULL
 -- (2026-08-30 补):主键是 (store, sku),按 source_key 反查"这个 ASIN 被哪些店
@@ -205,8 +208,25 @@ CREATE TABLE catalog.listing_sources (
 --   任何查询会用到。与守门那条「abandoned_at IS NULL 只许出现在三处 .py」不
 --   冲突:DDL 的局部条件不计入那张白名单。
 --
--- 纪律两条:① abandoned_at / abandoned_reason / replaced_by 三列**只由
--- services/sku_codec 写**(abandon;批次 3 的改码替换),其它模块与工作流一律
+--
+-- 改码两列 + 两条反查索引(2026-09-02,SKU 改造批次 3 地基;**名字与条件同样一处
+-- 定死**,后续批次一律引用、不许 DROP/CREATE):
+-- listing_sources_replaced_by_idx (store, replaced_by) WHERE replaced_by IS NOT NULL
+--   mark_missing / diff_catalog / problem_scan 每轮都要问「这行是不是在途被替换」,
+--   不带它就是每轮全表扫登记簿。
+-- listing_sources_replaces_uidx UNIQUE (store, replaces)
+--   WHERE replaces IS NOT NULL AND abandoned_at IS NULL
+--   堵住「两个**活着的**新码抢同一个旧码」(只在并发重跑里出现,出现后无法自动
+--   分辨哪个码是真的)。⚠ `abandoned_at IS NULL` 不能省:改码回滚后那个作废的新码行
+--   保留 replaces 当病历(行永不 DELETE),但不该再占旧码的认领位 —— 不带这一条,
+--   同一个旧码这辈子只能改一次码,回滚之后再改必然撞索引,而 mint_replacement 会把
+--   它误诊成"随机撞码"连抽 5 次报错(2026-09-02 沙箱 PG 实测到)。同一个条件也是
+--   视图 catalog.sku_aliases 的条件 ⇒ 该视图里 (store, alias_sku) 至多一行。
+-- 两列都可空无默认,落地时全库为 NULL(写侧接线在批次 3 的 workflows/sku_migrate)。
+--
+-- 纪律两条:① abandoned_at / abandoned_reason / replaced_by / replaces /
+-- replaced_at 五列**只由 services/sku_codec 写**(abandon / mint_replacement /
+-- settle_replacement),其它模块与工作流一律
 -- 不得 UPDATE;行**永不 DELETE**(旧码带着订单/售后回来必须还查得到)。
 -- ② 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义,
 -- 列名故意用 abandoned 不用 retired。
@@ -214,6 +234,25 @@ CREATE TABLE catalog.listing_sources (
 -- workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串匹配、右锚),
 -- 改一处必须同步另一处;缺右锚会把 B0XXXXXXXX-2 这类 SKU 判成 amz 并把
 -- source_key 截成前 10 位,那批行会因此第一次进入删除意图产出面(2026-09-02 修)。
+```
+
+```sql
+-- 代际继承的**唯一出处**(视图,2026-09-02 SKU 改造批次 3 地基)
+-- 「这个新码继承那个旧码的历史」只在这里定义:改码之后新码在 product_events /
+-- ops.feed_items / orders.order_lines 里一条历史都没有,五处按 (store, sku) 读历史
+-- 的判据会同时失明(顽固件代际 / 问题归类 / WFS 删除拦截 / 在途防重 / 分配链销量)。
+-- 消费方一律经本视图取别名,**不许各自现写 replaces 的 JOIN**(判据一处出生;
+-- 守门 tests/test_sku_guard.py::test_only_sku_aliases_expresses_the_replacement_chain)。
+CREATE VIEW catalog.sku_aliases AS
+  SELECT store, sku, replaces AS alias_sku      -- sku=新码,alias_sku=它继承的旧码
+  FROM catalog.listing_sources
+  WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
+-- ⚠ 三条前提:① 只继承**一跳**(旧码改码后立即弃码、永不再改码;将来要连改两次
+--   必须改成递归 CTE,否则第二跳静默断链);② 只出活着的认领 ⇒ (store, alias_sku)
+--   至多一行,消费方可以放心 LEFT JOIN(回滚作废的新码行留着 replaces 当病历,
+--   若也出现在视图里,LEFT JOIN 会把同一笔历史算两次,且不报错);
+--   ③ 它是视图不是表 —— 改码前恒为空集,所有消费方的 UNION ALL / LEFT JOIN 在
+--   改码前都是"加一个空集",结果集逐行不变(批次 3 零行为变化的地基)。
 ```
 
 ```sql
@@ -230,6 +269,13 @@ CREATE TABLE catalog.listing_sources (
 -- (状态由它的弃码原因分派表给:delete_verified→burned_delete、
 -- sku_locked→burned_lock、upc_conflict→conflict)。旧的 burn_for_retire 与
 -- 按单号写 conflict 的 mark_conflict 已删(单一实现路径)。
+-- 改码只改 `sku` 一列(2026-09-02 批次 3 地基):唯一函数
+-- `services/upc_pool.retag_sku(conn, [(店, ASIN, 新 SKU)])` —— 号还是那个号,只是
+-- 它现在挂在新 SKU 名下。**asin / status / used_at 一律不动**(asin 是领号复用键;
+-- 改码不是一次新消耗,时间戳不该被改写,所以不复用 mark_used);状态条件
+-- `status IN ('claimed','used')` 与 burn 逐字一致。不改这一列的话,列里存的就是一个
+-- 已经不存在于沃尔玛的串,而撞库标记与池表投影都按它反查 —— 标不上、归属显示错,
+-- 且不报错。
 CREATE TABLE catalog.upc_pool (
     upc text PRIMARY KEY,            -- 规范化 12 位
     status text NOT NULL DEFAULT '', -- ''/claimed/used/conflict/bad_prefix
@@ -358,7 +404,13 @@ CREATE TABLE catalog.product_events (
 -- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
 -- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
 --   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
---                       最近移除时间)——**只是查询档案,不是拦截条件**
+--                       最近移除时间;2026-09-02 批次 3 加**改码维度**两列
+--                       sku_replaced_times / last_sku_replaced_at —— 身份键是
+--                       coalesce(asin, sku),新旧码经登记簿都解析到同一个 ASIN,
+--                       所以"这个 ASIN 用过哪些码、什么时候换的"就在同一条时间线上。
+--                       ⚠ 一次改码留**两条** sku_replaced:旧码一条(abandon 记)、
+--                       新码一条(settle_replacement 给新码的出生事件))
+--                       ——**只是查询档案,不是拦截条件**
 --                       (所有者口径 2026-08-12:防呆=黑名单,按拉黑类别拦,
 --                       不按删除史拦);list_new 仅消费 unexplained_missing
 --                       (消失过且从未提交删/停=疑似平台下架)做报警,不拦截
@@ -391,6 +443,33 @@ CREATE TABLE listing.retire_cooldown (  -- SKU_LOCKED 自愈链状态(sku_locked
 );  -- 部分唯一索引 (store, sku) WHERE pending:同对只许一条在途冷却,防重复退役
 -- 链路(旧实证:SKU 绑死旧 UPC,不先退役换 UPC 重发也失败):
 -- RETIRE_ITEM → 24h 冷却 → 回执成功才清列(K~M/O~Q)→ list_new 领新 UPC 重上
+
+CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改造批次 3)
+    id bigint IDENTITY PRIMARY KEY,
+    store text NOT NULL, old_sku text NOT NULL, new_sku text NOT NULL,
+    source_type text NOT NULL, source_key text,
+    feed_type text NOT NULL,            -- MP_MAINTENANCE(形态 A)/ MP_ITEM(形态 B)
+    feed_id text,                       -- 提交成功后落;NULL = 还没发出去
+    status text DEFAULT 'pending',      -- pending / confirmed / rolled_back / stalled
+    submitted_at / settled_at timestamptz,
+    sheet_synced_at timestamptz,        -- 上架表 SKU 列已回写新码的时刻;NULL = 待补写
+    error text, detail jsonb DEFAULT '{}', created_at timestamptz DEFAULT now()
+);
+-- 索引:sku_migrations_open_uidx UNIQUE (store, old_sku) WHERE status='pending'
+--       (同 (店,旧码) 只允许一条在途改码 = 崩溃重入的防重键)、
+--       sku_migrations_new_uidx UNIQUE (new_sku)(一个码一辈子只替换一次)、
+--       sku_migrations_status_idx (status, created_at)。
+-- **分工写死**:身份权威在 catalog.listing_sources(replaces / replaced_by /
+-- abandoned_at),本表只是 sku_migrate 的**过程账**(feed_id / 时刻 / 失败原因 /
+-- 飞书同步态)—— 把这四样塞进身份表,会让一张被十几个消费方 JOIN 的表长出五个
+-- 只有一个工作流看的过程列。两者的状态迁移必须**同一事务**完成(与
+-- retire_cooldown 之于 catalog.upc_pool 同款分工)。
+-- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
+-- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
+-- sheet_synced_at 的由来:一次飞书写失败(频控 99991400 / 行号找不到)之后该行已
+-- confirmed、不再进定案集,上架表 SKU 列就永远停在旧码,而回执找行与退役从此对不上
+-- **且不报错**(conventions §八「当轮写完,攒到下一轮 = 悄悄少写」)。写侧接线在
+-- 批次 3 的 workflows/sku_migrate.py;地基这一块只建表,零写入。
 
 -- (listing.tasks 与 listing.upc_pool 已于 2026-08-12 退役删除:全仓零代码
 --  引用——上架状态权威 = 飞书上架表 + catalog.upc_pool + retire_cooldown,
@@ -481,6 +560,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 视图:
 - `orders.settlement_by_line` — 跨账期合并 + 入账状态推导(net>0 已入账 / net<0 已冲销 / net=0 且 gross>0 已退款 / 其余待入账;金额 round6 吸收浮点相消误差——实证 +52.68-52.68 = 4.44e-16 会误判);
 - ~~`orders.order_center` 主视图~~(2026-08-12 退役删除:order_center_push 直连三张明细表与两个在用视图,主视图零读者)。
+- `orders.v_order_line_dupes`(2026-09-02,SKU 改造批次 3 地基)— **订单双算体检的唯一判据**:按 (store, po_id, line_number) 分组、`HAVING count(DISTINCT order_line_id) > 1`,输出 store / po_id / line_number / n / skus / first_order_date,**不带时间窗口**(窗口由消费方自己加 `WHERE first_order_date > …`)。为什么需要它:`order_line_id = sha256(PO + SKU)`、唯一约束是 (po_id, sku) —— 改码之后若沃尔玛对**改码之前的 PO** 返回新码,那一行会被当成新行插入而旧行不删 ⇒ 同一笔销售算两次(销量、产品分、日报、对账全受影响)**且不报错**;官方对"改码后旧 PO 返回哪个码"零文档,只能用体检兜住。口径取 `count(DISTINCT order_line_id)` 而非 `count(*)`。消费方:`services/order_lines.duplicate_po_lines(conn, days=120)`(只加窗口与排序的**薄壳**,不许在函数里重写 GROUP BY/HAVING)、catalog_health、手工 psql。改码前的基线必须为 0 行,存档后与改码后对比。
 
 完整列清单见 `refdata/schema.sql`。旧 po 级表 `orders.orders` 已于 2026-08-12 退役(schema.sql 的退役清理节:确认为空表才 DROP,防手滑)。
 

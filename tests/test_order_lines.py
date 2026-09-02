@@ -480,3 +480,70 @@ def test_perf_last_seen_at_has_no_judgement_reader():
     assert "still_active" in span
     assert "max(e.period) = m.latest_period" in span
     assert "last_seen_at" not in span, "still_active 开始依赖 last_seen_at 了"
+
+
+# ── 订单双算体检(SKU 改造批次 3 地基,X1;判据在 orders.v_order_line_dupes)──
+
+class _ViewConn:
+    """只回放视图行的假连接(体检函数是纯只读薄壳)。"""
+
+    def __init__(self, rows):
+        self.rows, self.sqls = rows, []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sqls.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_duplicate_po_lines_flags_two_skus_under_one_po_line():
+    """同 (store, po_id, line_number) 出现两个 order_line_id = 同一笔销售算两次。
+
+    order_line_id = sha256(PO + SKU):改码后若沃尔玛对改码之前的 PO 返回新码,
+    那一行会被当成新行插入而旧行不删 —— 销量、产品分、日报、对账全受影响,
+    **而且不报错**。官方对"改码后旧 PO 返回哪个码"一个字都没有,只能靠体检。
+    """
+    conn = _ViewConn([("T1", "PO1", "1", 2, ["AN3WC0DE2345", "B0ABCDEFGH"])])
+    got = ol.duplicate_po_lines(conn)
+    assert got == [{"store": "T1", "po_id": "PO1", "line_number": "1", "n": 2,
+                    "skus": ["AN3WC0DE2345", "B0ABCDEFGH"]}]
+    assert conn.sqls[0][1] == {"days": 120}          # 默认回看窗口
+    assert ol.duplicate_po_lines(_ViewConn([]), days=None)[:] == []
+    assert conn.sqls[0][1] != {"days": None}
+
+
+def test_duplicate_po_lines_is_empty_on_healthy_data():
+    """健康数据下必须是空列表:这是改码前要存档的基线,改码后必须一致。"""
+    assert ol.duplicate_po_lines(_ViewConn([])) == []
+
+
+def test_duplicate_po_lines_reads_the_view_not_a_local_group_by():
+    """判据只有一处出生(refdata/schema.sql 的 orders.v_order_line_dupes)。
+
+    在这里重写一遍 GROUP BY/HAVING 就是同一条体检两份实现、口径还可能不同 ——
+    两边数字对不上时没有判据说该信哪个,而这条体检正是发现"改码后销量双算"的
+    唯一手段。窗口(days)是消费方的事,判据不是。
+    """
+    import pathlib
+    conn = _ViewConn([])
+    ol.duplicate_po_lines(conn)
+    sql = conn.sqls[0][0]
+    assert "orders.v_order_line_dupes" in sql
+    assert "GROUP BY" not in sql.upper() and "HAVING" not in sql.upper()
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    view = ddl.split("CREATE OR REPLACE VIEW orders.v_order_line_dupes")[1]
+    view = view.split(";")[0]
+    assert "count(DISTINCT order_line_id)" in view      # 不是 count(*)
+    assert "HAVING count(DISTINCT order_line_id) > 1" in view
+    assert "orders.order_lines" not in sql              # 薄壳只读视图,不碰明细表
+    assert "first_order_date" in sql                    # 窗口用视图给的那一列

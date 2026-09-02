@@ -48,24 +48,41 @@ class _Cur:
 class _Conn:
     """脚本化的假连接:按 SQL 形状路由,每种查询的返回值由构造参数排队给出。"""
 
-    def __init__(self, live=None, minted=None, abandon_row=None, rowcount=1):
+    def __init__(self, live=None, minted=None, abandon_row=None, rowcount=1,
+                 old_row=None, pending=None, marked=True, cleared=True):
         self.live = list(live or [])          # 每次复用查询的返回值(元组或 None)
         self.minted = list(minted or [])      # 每次 INSERT 是否拿到行(bool)
         self.abandon_row = abandon_row        # UPDATE ... RETURNING 的那一行
+        self.old_row = old_row                # 改码:旧行现状(replaced_by, abandoned_at, 来源, 源头键)
+        self.pending = list(pending or [])    # 改码:在途新码查询的返回值(元组或 None)
+        self.marked = marked                  # 改码:旧行进入 pending 是否改到了行
+        self.cleared = cleared                # 回滚:旧行指针是否清到了行
         self.rowcount = rowcount
         self.calls: list = []
+        self.commits = 0                      # 积木不许自己 commit(归调用方)
         self.next_row = None
 
     def cursor(self):
         return _Cur(self)
 
+    def commit(self):
+        self.commits += 1
+
     def route(self, sql, args):
         s = sql.strip()
         if s.startswith("SELECT sku FROM catalog.listing_sources"):
             self.next_row = self.live.pop(0) if self.live else None
+        elif s.startswith("SELECT replaced_by"):
+            self.next_row = self.old_row
+        elif s.startswith("SELECT n.sku"):
+            self.next_row = self.pending.pop(0) if self.pending else None
         elif "INSERT INTO catalog.listing_sources" in s:
             ok = self.minted.pop(0) if self.minted else True
             self.next_row = (args[1],) if ok else None
+        elif "SET replaced_by = NULL" in s:
+            self.next_row = (args[1],) if self.cleared else None
+        elif "SET replaced_by = %s" in s:
+            self.next_row = (args[2],) if self.marked else None
         elif "UPDATE catalog.listing_sources" in s:
             self.next_row = self.abandon_row
         else:
@@ -74,6 +91,11 @@ class _Conn:
     def inserts(self):
         return [args for sql, args in self.calls
                 if isinstance(sql, str) and "INSERT INTO catalog.listing_sources" in sql]
+
+    def updates(self, needle: str):
+        return [args for sql, args in self.calls
+                if isinstance(sql, str) and "UPDATE catalog.listing_sources" in sql
+                and needle in sql]
 
     def burns(self):
         return [(sql, args) for sql, args in self.calls
@@ -84,6 +106,11 @@ class _Conn:
             if isinstance(sql, str) and "catalog.product_events" in sql:
                 return rows
         return []
+
+    def event_calls(self):
+        """每一次 record_many 各算一次(改码定案会写两条:旧码一条、新码一条)。"""
+        return [rows for sql, rows in self.calls
+                if isinstance(sql, str) and "catalog.product_events" in sql]
 
 
 # ── 形态判据 ─────────────────────────────────────────────────────────────────
@@ -312,3 +339,166 @@ def test_the_two_code_events_are_registered_in_the_ledger():
     接线的那一天才会炸(而那天是在生产上)。"""
     assert product_events.SKU_ABANDONED in product_events.EVENTS
     assert product_events.SKU_REPLACED in product_events.EVENTS
+
+
+# ── 改码:mint_replacement(批次 3 地基,C1/C3)────────────────────────────────
+
+def test_mint_replacement_writes_both_pointers_in_one_transaction():
+    """新码行 replaces=旧码、旧行 replaced_by=新码,**同一事务两条指针一次写完**。
+
+    只写一头的后果是静默的:只写新行 ⇒ 旧行仍是活码,下一轮 mint 把它当活码复用,
+    改码从没发生过;只写旧行 ⇒ 新码没有出身,sources_backfill 判 unknown、
+    整条自动化对它退出。commit **不在这里**:先落库再调接口是调用方的动作。
+    """
+    conn = _Conn(old_row=(None, None, "amz", "B0ABCDEFGH"), pending=[None])
+    code = sku_codec.mint_replacement(conn, "T1", "B0ABCDEFGH", "amz", "B0ABCDEFGH")
+    assert sku_codec.is_opaque(code)
+    assert code[0] == resources.SKU_SOURCE_LETTERS["amz"]
+    assert conn.inserts() == [("T1", code, "amz", "B0ABCDEFGH",
+                               "sku_migrate", "B0ABCDEFGH")]
+    assert conn.updates("SET replaced_by = %s") == [(code, "T1", "B0ABCDEFGH")]
+    assert conn.commits == 0        # 积木不自己 commit(事务边界归调用方)
+
+
+def test_mint_replacement_is_idempotent_and_returns_the_same_code():
+    """pending 行已落库、feed 还没发就崩了 ⇒ 下一轮必须拿回**同一个码**。
+
+    换码 = 载荷变了 = feeds.payload_key 防重不命中 = 同一个 item 被改两次码。
+    """
+    conn = _Conn(old_row=("AN3WC0DE2345", None, "amz", "B0ABCDEFGH"),
+                 pending=[("AN3WC0DE2345",)])
+    got = sku_codec.mint_replacement(conn, "T1", "B0ABCDEFGH", "amz", "B0ABCDEFGH")
+    assert got == "AN3WC0DE2345"
+    assert conn.inserts() == []                      # 一次都没抽
+    assert conn.updates("SET replaced_by = %s") == []
+
+
+def test_mint_replacement_never_reuses_the_live_row():
+    """与 mint 语义相反:明知有活行也要新码 —— 所以它**根本不跑**复用查询。
+
+    给 mint 加一个 force 开关就是同一个能力两条语义分支(conventions §六);
+    真跑了复用查询,改码会把旧码原样返回,一整轮改码静默变成空操作。
+    """
+    conn = _Conn(old_row=(None, None, "amz", "B0ABCDEFGH"), pending=[None],
+                 live=[("B0ABCDEFGH",)])
+    code = sku_codec.mint_replacement(conn, "T1", "B0ABCDEFGH", "amz", "B0ABCDEFGH")
+    assert code != "B0ABCDEFGH" and sku_codec.is_opaque(code)
+    assert not any(str(sql).strip().startswith("SELECT sku FROM catalog.listing_sources")
+                   for sql, _ in conn.calls)
+
+
+def test_mint_replacement_returns_the_other_process_code_on_live_key_conflict(caplog):
+    """并发双改码:INSERT 落空后重跑在途查询,查到就返回**对方那个码**。
+
+    合成一个 catch-all 重抽分支的话,这里会连撞 5 次(对方的 replaces 键一直在)
+    最后抛"随机源坏了",排障方向全错 —— 与 mint 同款分支纪律。
+    """
+    import logging
+    before = sku_codec._concurrent_mint
+    conn = _Conn(old_row=(None, None, "amz", "B0ABCDEFGH"),
+                 pending=[None, ("AOTHER234567",)], minted=[False])
+    with caplog.at_level(logging.WARNING, logger="services.sku_codec"):
+        got = sku_codec.mint_replacement(conn, "T1", "B0ABCDEFGH", "amz",
+                                         "B0ABCDEFGH")
+    assert got == "AOTHER234567"
+    assert len(conn.inserts()) == 1                  # 只抽了一次就认输复用
+    assert sku_codec._concurrent_mint == before + 1
+    assert any("并发改码" in m for m in caplog.messages)
+
+
+def test_mint_replacement_refuses_an_unregistered_or_abandoned_old_sku():
+    """旧码没登记 / 已弃码 ⇒ **fail loud**,不猜。
+
+    没登记就改码 = 新码继承了一个我们说不清出身的品(sources_backfill 判 unknown,
+    自动化对它全线退出);对已弃码的行再改码 = 把一条我们已经当它不存在的沃尔玛
+    记录又改了一次。
+    """
+    with pytest.raises(ValueError, match="不在登记簿"):
+        sku_codec.mint_replacement(_Conn(old_row=None), "T1", "B0X", "amz", "B0X")
+    import datetime
+    gone = _Conn(old_row=(None, datetime.datetime(2026, 9, 1), "amz", "B0X"))
+    with pytest.raises(ValueError, match="已弃码"):
+        sku_codec.mint_replacement(gone, "T1", "B0X", "amz", "B0X")
+
+
+def test_mint_skips_a_row_that_is_being_replaced():
+    """mint 的复用查询带 `replaced_by IS NULL`:在途改码的旧行**不算活码**。
+
+    不带这一条,pending 期间 list_new 对同一 (店, 来源, 源头键) 调 mint 会拿回
+    那个已经宣告要退休的旧码,把它再发一次 MP_ITEM。条件必须与活码部分唯一索引
+    逐字相同(守门 test_mint_live_row_filter_matches_the_index_condition)。
+    """
+    assert "abandoned_at IS NULL AND replaced_by IS NULL" in sku_codec._SQL_LIVE
+    conn = _Conn(live=[None])          # 旧行被 replaced_by 谓词滤掉 ⇒ 查不到活码
+    code = sku_codec.mint(conn, "T1", "amz", "B0ABCDEFGH", workflow="list_new")
+    assert sku_codec.is_opaque(code) and code != "B0ABCDEFGH"
+
+
+# ── 改码:settle_replacement(批次 3 地基,C2)────────────────────────────────
+
+_OLD, _NEW = "B0ABCDEFGH", "AN3WC0DE2345"
+
+
+def test_confirmed_abandons_old_row_with_sku_update_and_does_not_burn_upc():
+    """定案 confirmed:旧行走**唯一的弃码出口** abandon(reason='sku_update'),
+    **不烧 UPC**(GTIN 仍挂在同一个 item 上,烧了下次 claim 会去领新号 =
+    自造 SKU_LOCKED),并给新码补一条 sku_replaced 出生事件。"""
+    import json
+    conn = _Conn(abandon_row=("amz", _OLD))
+    sku_codec.settle_replacement(conn, "T1", _OLD, _NEW, "confirmed",
+                                 reason="observed")
+    assert conn.burns() == []                       # sku_update 不在烧号分派表里
+    (reason, replaced_by, store, sku) = conn.updates("SET abandoned_at")[0]
+    assert (reason, replaced_by, store, sku) == (
+        sku_codec.ABANDON_SKU_UPDATE, _NEW, "T1", _OLD)
+    old_ev, new_ev = conn.event_calls()             # 旧码一条、新码一条
+    assert old_ev[0][0] == _OLD and old_ev[0][3] == product_events.SKU_REPLACED
+    assert new_ev[0][0] == _NEW and new_ev[0][3] == product_events.SKU_REPLACED
+    assert json.loads(new_ev[0][6])["old_sku"] == _OLD
+
+
+def test_rolled_back_clears_replaced_by_and_abandons_the_new_code():
+    """定案 rolled_back:旧行的 replaced_by/replaced_at 清空(回到活码,下轮可重来),
+    新码显式弃掉(reason='sku_update_failed')而不是删行 —— 登记簿的行永不 DELETE,
+    弃掉的码从此不会被任何人抽到,这就是"码是免费的、失败就换一个"。"""
+    conn = _Conn(abandon_row=("amz", _OLD))
+    sku_codec.settle_replacement(conn, "T1", _OLD, _NEW, "rolled_back",
+                                 reason="feed rejected")
+    assert conn.updates("SET replaced_by = NULL") == [("T1", _OLD, _NEW)]
+    (reason, replaced_by, store, sku) = conn.updates("SET abandoned_at")[0]
+    assert reason == sku_codec.ABANDON_SKU_UPDATE_FAILED
+    assert (replaced_by, store, sku) == (None, "T1", _NEW)
+    assert conn.burns() == []                       # 新码从来没配过 UPC
+    assert conn.event_calls()[0][0][3] == product_events.SKU_ABANDONED
+
+
+def test_settle_replacement_is_idempotent():
+    """两支都幂等:已定案再调 = no-op(不重复记事件、不重复烧号)。
+
+    定案会被重放:_settle 每轮跑一次,崩溃重入也会再跑一次。
+    """
+    done = _Conn(abandon_row=None)                  # 旧行早已弃码
+    sku_codec.settle_replacement(done, "T1", _OLD, _NEW, "confirmed")
+    assert done.event_calls() == [] and done.burns() == []
+    back = _Conn(abandon_row=None, cleared=False)   # 指针早已清、新码早已弃
+    sku_codec.settle_replacement(back, "T1", _OLD, _NEW, "rolled_back")
+    assert back.event_calls() == []
+    with pytest.raises(ValueError, match="改码判词"):
+        sku_codec.settle_replacement(_Conn(), "T1", _OLD, _NEW, "stalled")
+
+
+# ── SQL 侧的形态判据(C6)─────────────────────────────────────────────────────
+
+def test_opaque_sql_predicate_is_derived_from_the_alphabet():
+    """SQL 侧的不透明码谓词由 `_ALPHABET` / `_LEN` **派生**,不是手打的第二份正则。
+
+    手打就是第二个字母表之家:两份一漂,SQL 判据与 is_opaque 会对"什么是新码"
+    给出不同答案,而且全程不报错。
+    """
+    expected = ("({col} ~ '^[" + sku_codec._ALPHABET + "]{{"
+                + str(sku_codec._LEN) + "}}$' AND {col} ~ '[A-Z]')")
+    assert sku_codec.OPAQUE_SQL_PREDICATE == expected
+    sql = sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku")
+    assert f"w.sku ~ '^[{sku_codec._ALPHABET}]{{12}}$'" in sql
+    assert "w.sku ~ '[A-Z]'" in sql          # 「至少一个字母」那半条不能漏
+    assert "{col}" not in sql

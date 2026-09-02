@@ -64,16 +64,16 @@ UPC 烧配额)、黑名单键被灌随机码(违禁品拦不住)、订单审核�
   代价:加列 ⇒ 行指纹全变 ⇒ 下一次 push 把 90 天窗口全量重推一遍,预告不是
   故障。
 
-**问 4|上架表要加 SKU 列。** → 对。**所有者 2026-09-02 已建在 R 列**(原 R~U
-「真实标题 / 真实PT / 真实UPC / UPC是否一致」四列顺延为 S~V;这四列全仓没有任何
-代码读写,只是 columns 元组里的占位,所以插在 R 不会错位——`listing_sheet` 的
-写入 range `C{r}` / `H{r}:N{r}` / `K{r}:Q{r}` / `A{r}:B{r}` / `F{r}` 全在 R 之前)。
-`columns` 元组在 `feed_check_date` 之后插入 `sku`(第 18 位),`_COLS` 改 22
-(读 A~V),新增只写 `R{r}` 的函数;提交时与 K/L/M 同一次写回;回执反哺、
-Unknown 自愈、SKU_LOCKED 退役从此读 R 列(R 为空的存量行回落 B 列 ASIN)。
-同理:在线产品总表 **Q 列「来源码」**、销售/售后订单表**「来源码」**(所有者已
-建,统一用这个名,不叫 ASIN)、UPC 池表 E 列「SKU」改存真 SKU(现在存的是
-ASIN)、退役表 B 列运营手填 SKU 从此要先查登记簿(§8 决定)。
+**问 4|上架表要加 SKU 列。** → 对。**所有者 2026-09-02 已重排表头,SKU 在 C 列**
+(21 列:店铺 / ASIN / SKU / walmart上架标题 / walmart_product_type / 审核结果 / 类别 /
+具体内容 / 审核日期 / amz价格 / 库存 / walmart价格 / 是否上架 / 上架feedid / 上架日期 /
+未上架理由 / 上架结果 / 报错 / feed查询日期 / 登记日期 / 查询编码)。旧「理由」拆成
+「类别」(37 政策类目)+「具体内容」(人话);旧尾部四列删除;「登记日期 / 查询编码」
+是所有者新列,程序不读不写。`listing_sheet` 的所有写入 range 从写死字母改为按
+`columns` 元组算列字母,此后再挪列只改元组。提交时与 是否上架/feedid/上架日期 同一次
+写回 SKU;回执反哺、Unknown 自愈、SKU_LOCKED 退役从此读 C 列(C 为空的存量行回落
+B 列 ASIN)。同理:在线产品总表 **Q 列「来源码」**、销售/售后订单表**「来源码」**
+(已建)、UPC 池表 E 列「SKU」改存真 SKU、退役表 B 列运营手填 SKU 从此要先查登记簿。
 
 ## 2. 编码规则(2026-09-02 定稿,未变)
 
@@ -162,7 +162,7 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
 
 | 表 | 现状 | 要做的 |
 |---|---|---|
-| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **R 列「SKU」已建**(原 R~U 顺延 S~V,无代码读写):`columns` 第 18 位插 `sku`、`_COLS` 改 22、新增只写 `R{r}` 的函数;提交时回写 |
+| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **表头已重排,SKU 在 C 列**(理由拆 类别/具体内容,尾部换 登记日期/查询编码):`columns` 按新序重排、写入 range 改按元组算字母、新增只写 SKU 列的函数;提交时回写 |
 | 订单中心-销售订单 `ORDER_SALES` | 有「SKU」无来源码 | **「来源码」已建**:registry 常量(值 `order_lines.asin`)+ `_SALES_SQL` + 投影 + 测试夹具 |
 | 订单中心-售后订单 `ORDER_RETURNS` | 有「SKU」无来源码;`return_lines` 表无 asin 列 | **「来源码」已建**,SQL 已 LEFT JOIN order_lines,顺手 `SELECT l.asin` |
 | 在线产品总表 `ONLINE_PRODUCTS_SHEET` | 有 sku 无来源码 | **Q 列「来源码」已建**(第 17 列,登记簿 JOIN `source_key`),反向可对 |

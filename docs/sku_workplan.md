@@ -10,11 +10,27 @@
 > acceptance_commands。执行者按 item id 领活,一个 PR 对应 `estimated_pr_split`。
 
 > ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
-> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
->    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
->    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
->    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
->    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 1. **上架表表头已由所有者重排(2026-09-02 第二次),SKU 在 C 列,不是 V 也不是 R**。
+>    新 21 列(A~U)按顺序:店铺 / ASIN / **SKU** / walmart上架标题 / walmart_product_type /
+>    审核结果 / **类别** / **具体内容** / 审核日期 / amz价格 / 库存 / walmart价格 / 是否上架 /
+>    上架feedid / 上架日期 / 未上架理由 / 上架结果 / 报错 / feed查询日期 / **登记日期** / **查询编码**。
+>    对应元组:store, asin, **sku**, list_title, product_type, audit_result, **audit_category**,
+>    **audit_reason**, audit_date, amz_price, stock, walmart_price, listed, feed_id, list_date,
+>    not_listed_reason, list_result, list_fail_reason, feed_check_date, **registered_date**,
+>    **query_code**(旧尾部 real_title / real_pt / real_upc / upc_match 四列已被所有者删除)。
+>    与旧布局的差异:① SKU 插在 C ⇒ 旧 C~E 右移一列(标题 D、PT E、审核结果 F);② 旧 F「理由」
+>    拆成 G「类别」+ H「具体内容」⇒ 旧 G 之后全部右移两列(审核日期 I、amz价格 J、库存 K、
+>    walmart价格 L、是否上架 M、feedid N、上架日期 O、未上架理由 P、上架结果 Q、报错 R、
+>    feed查询日期 S);③ T「登记日期」、U「查询编码」是所有者新列,**程序不读不写**(语义待所有者
+>    说明),只在元组里占位。`_COLS` 仍为 21。
+>    **所有硬编码 range 必须按新布局重排**(listing_sheet 里 `C{r}`→`D{r}`、`H{r}:N{r}`→`J{r}:P{r}`、
+>    `C{r}:G{r}`→`D{r}:I{r}`、`F{r}`→`H{r}`、`N{rn}`→`P{rn}`、`K{r}:Q{r}`→`M{r}:S{r}`、`O:Q`→`Q:S`、
+>    `K:N`→`M:P`、`A{r}:B{r}` 不变),并**改成由 columns 元组算列字母**(`col_letter("sku")`)而不是
+>    再写死字母,这是本次重排最大的教训。审核链的「类别」写 `products.audit_reason`(37 政策类目),
+>    「具体内容」写 `audit_reason.human_reason` 的人话(pass 行留空);`write_audit_notes` 的一句
+>    人话写「具体内容」。工作包 item 文本里的 `V{r}` / 「V 列」/ `R{r}` 一律按此表换算。
+>    ⚠ 生产上旧代码仍按旧布局写:表头改完到本分支上线之间,product_audit / list_new / feed_poll /
+>    sku_locked_heal 任何一次真跑都会写错列(标题会盖掉 SKU 列)。
 > 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
 >    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
 >    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。

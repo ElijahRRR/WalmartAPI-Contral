@@ -509,18 +509,21 @@ RETIRE_SHEET = Spreadsheet(
 # (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
 # ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
 # `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
-# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里。
-# 写入侧一律用显式 range(C:G / O:Q / …),不受本次对调影响。
+# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里 **+ services/listing_sheet
+# 里的显式 range 字母**(写入侧按字母写,表头一动它们也得跟着挪)。
+# ⚠ **2026-09-02 所有者再改表头**(第三步输出规范化):C 插入 SKU;「审核理由」
+# 拆成 G=类别 + H=具体内容;尾部四列 真实标题/真实PT/真实UPC/UPC匹配 换成
+# T=登记日期 U=查询编码(运营域,脚本不写)。仍 21 列 A~U。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
-    columns=("store", "asin", "list_title", "product_type", "audit_result",
-             "audit_reason", "audit_date", "amz_price", "stock",
-             "walmart_price", "listed", "feed_id", "list_date",
-             "not_listed_reason", "list_result", "list_fail_reason",
-             "feed_check_date", "real_title", "real_pt", "real_upc",
-             "upc_match"),
+    columns=("store", "asin", "sku", "list_title", "product_type",
+             "audit_result", "audit_category", "audit_detail", "audit_date",
+             "amz_price", "stock", "walmart_price", "listed", "feed_id",
+             "list_date", "not_listed_reason", "list_result",
+             "list_fail_reason", "feed_check_date", "register_date",
+             "query_code"),
 )
 
 # 跟卖表(match_listing 驱动表,替代旧 xlsx 输入,所有者定稿 2026-08-07

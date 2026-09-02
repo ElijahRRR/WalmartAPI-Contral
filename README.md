@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
-- **2628 个单元测试**(2605 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
+- **2629 个单元测试**(2606 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
 
 ---
 
@@ -300,7 +300,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 政策理由映射(政策类别名
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 C~G;缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 E 列为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
+| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |
@@ -557,7 +557,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 | 某个 ASIN 为什么被拒 | `python cli.py audit_why -p asins=B0XXXXXXXX` |
 | 变体没成组 / 维度没发出去 | `python cli.py variant_probe -p asins=…` |
 | feed 提交了没结果 | `ops.feed_log` 找 `submitted` 行 → `ops.feed_items` 看 SKU 级结果 → `ops.feed_item_errors` 看报错码 |
-| 上架表某行一直空着 | F 列的原因 → `ops.dispositions` / `catalog.products.audit_status` |
+| 上架表某行一直空着 | H 列(具体内容)的原因 → `ops.dispositions` / `catalog.products.audit_status` |
 | 某商品当初为什么被删 | `catalog.product_events` 按 SKU 查时间线 |
 | 采集为什么没数据 | `ops.scrape_batches`(批次状态)+ `ops.scrape_failures`(逐 ASIN 真实 `error_type`) |
 | 黑名单表格没更新 | 闸门读 PG 已经生效了;表格投影跑 `cli.py blacklist_push -p probe=1` 体检 |

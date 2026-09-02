@@ -722,14 +722,14 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
 
 
 def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
-    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 C/D/E/F/G。
+    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 D~I(标题/PT/结果/类别/具体内容/日期)。
 
     所有者定稿 2026-08-16。⚠ 三条:
 
-    · **E 列写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
+    · **F 列写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
       `audit_result.lower() == "pass"`。写别的那行永远上不去,而且不报错。
       映射收在 `listing_sheet.AUDIT_RESULT_CN`。
-    · **库里没有的 ASIN 一行都不写**(留 E 空)。写个 pending 会让人以为审过了;
+    · **库里没有的 ASIN 一行都不写**(留 F 空)。写个 pending 会让人以为审过了;
       留空则下轮自动重领,而且 `list_new` 只认 pass,留空绝不会误上架。
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
@@ -743,10 +743,12 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
                 got = {r[0]: r for r in cur.fetchall()}
-            # F 列写**人话**:`products.audit_reason` 存的是沃尔玛政策表的
-            # 类目名,而其中 `General-Use Products` 是"以上全不中"的兜底 ——
-            # 落在一把锤子、一个土豆压泥器上时人只会一头雾水(所有者
-            # 2026-08-16)。真正的原因在命中的规则里,翻出来放前面
+            # G 列写类别、H 列写**人话**(所有者 2026-09-02 改表头,三段输出:
+            # 判定 / 类别 / 具体内容)。热修期口径:G = `products.audit_reason`
+            # 现值(拒绝时是政策类别名,其中 `General-Use Products` 仍是兜底,
+            # 第三步 B 批改为枚举 + 零兜底),H = 命中规则翻成的人话(不再带
+            # 「[政策:X]」尾巴,类别已单列);pending 的句子落 H、G 留空;
+            # approved 两列都空
             reasons = audit_store.reject_reasons(conn, asins)
         updates, absent = [], 0
         for r in sheet_rows:
@@ -755,11 +757,12 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
                 absent += 1
                 continue
             _, title, pt, status, reason, at = row
-            why = (audit_reason.human_reason(reasons.get(r["asin"], []), reason)
+            why = (audit_reason.human_reason(reasons.get(r["asin"], []), None)
                    if status == "rejected" else (reason or ""))
             updates.append((r["rownum"], [
                 title or "", pt or "",
                 listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                (reason or "") if status == "rejected" else "",
                 why[:500],
                 at.strftime("%Y-%m-%d") if at else ""]))
         listing_sheet.write_audit_cols(updates, execute)
@@ -767,11 +770,11 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
         # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
         # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
         # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
-        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行 C~G"
+        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行 D~I"
                f"(整表已有结论的都投影,不只本轮判的那些)"
                f"{'' if execute else ';dry-run 一格未写'}")
         if absent:
-            out += (f";⚠ {absent} 行库里没有结论,**E 列留空**"
+            out += (f";⚠ {absent} 行库里没有结论,**F 列留空**"
                     f"(下轮自动重领;没数据的那些见下方补采段,已推采集)")
         return out
     except Exception as e:                                      # noqa: BLE001
@@ -918,7 +921,7 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
       ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
          批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
-      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 F 列
+      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 H 列(具体内容)
          (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
       ⑤ **落定台账**(`check_open`)。
 
@@ -992,7 +995,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
     if not execute:
         out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
                    f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
-                   f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 F 列"
+                   f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 H 列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
         return
@@ -1022,7 +1025,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
     if rescued:
         out.append(f"  ✅ 补采回来 {rescued} 个,**本轮就审**(已进候选)")
     if still:
-        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格 F 列,下轮重试")
+        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格 H 列,下轮重试")
     _note_gap(sheet_rows, still, set(still_absent),
               _gap_reasons(sent) if still else {}, day, True, out)
 
@@ -1030,9 +1033,9 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
 def _note_gap(sheet_rows: list[dict], still: set, absent: set,
               reasons: dict[str, str], day: str, execute: bool,
               out: list[str]) -> None:
-    """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写表格 F 列,摘要进 out)。
+    """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写表格 H 列「具体内容」,摘要进 out)。
 
-    ⚠ **只写 F,E 列一个字不动**。E 一有值这行就不再被 `audit_targets` 领走,
+    ⚠ **只写 H,F 列一个字不动**。F 一有值这行就不再被 `audit_targets` 领走,
     往里写个"未采集"就等于这行从此退出审核通道 —— 采回来了也没人再审它,
     而表面上"表里写着原因呢"。
     """
@@ -1050,9 +1053,9 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
                       else f"{why},已推采集但本轮没等到,下轮重试({day})"))
     try:
         n = listing_sheet.write_audit_notes(notes, execute)
-        out.append(f"  表格 F 列{'已写' if execute else '**将**写'} "
+        out.append(f"  表格 H 列{'已写' if execute else '**将**写'} "
                    f"{n if execute else len(notes)} 行原因"
-                   f"(**E 列留空**,下轮照样重新领取)")
+                   f"(**F 列留空**,下轮照样重新领取)")
     except Exception as e:                                      # noqa: BLE001
         logger.warning("缺数据原因回写失败(不影响本轮): %s", e)
         out.append(f"  ⚠ 原因回写飞书失败:{e}(采集已推,下轮重试回写)")

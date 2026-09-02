@@ -131,7 +131,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 | `audit.audit_runs` | `verdict` / `l3_verdict` | `l3_reason_category`(列名不改,语义 = policy 枚举) | `l3_reason_text`(列名不改,语义 = detail) |
 | `catalog.products` | `audit_status` | `audit_reason` := 类别(枚举 / `none` 不写,pass 与 pending 为 NULL) | **新列 `audit_detail text`** |
 | `catalog.product_events`(`audit_rejected`) | event | `detail.reason`(键名不改,兼容 `audit_history_fold`) | 新键 `detail.detail` |
-| 飞书上架表 | E 列(pass/reject/pending,不变) | F 列 = `【类别】具体内容`(一个单元格) | 同左 |
+| 飞书上架表(2026-09-02 新表头) | F 列 审核结果(pass/reject/pending) | G 列 类别 | H 列 具体内容 |
 
 - `audit_detail` 的确定性来源:L3 拒 → `l3.detail`;规则拒 → `audit_reason.explain_hit(rule_code,
   detail)`(它本来就是"具体内容"形态,如 `商标符号(命中:XYZ®)`);pending → 现三条固定句
@@ -281,30 +281,33 @@ python cli.py policy_sync --dry-run         # 预期 新增 2(id 43/44 内容族
 python cli.py policy_sync
 python cli.py audit_replay --dry-run        # 样本规模 + 预估成本
 python cli.py audit_replay -p neg=600 -p pos=400   # 谷时段;看报告再决定下一步
-python cli.py product_audit -p mode=stale -p limit=N   # 谷时段分晚跑;pending/rejected 走 mode=nonpass
+python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 90 天有动销的一批,谷时段分晚跑;pending/rejected 走 mode=nonpass
 ```
 
 - 回放报告不达标(§六第 5 条的线)→ 不跑 `mode=stale`,先修提示词/规则再回放;修改 = 再提版。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。
 - `error_reclass_report` 不受影响;`audit_sheet` 的 `limit=500` 在切换周可临时调低控成本。
 
-## 六、待所有者裁决(默认值 = 我的建议;同意即按此开工)
+## 六、所有者裁决(2026-09-02 定稿,八项全部落定)
 
-1. **类别词表**:43 官方名 + `内部黑名单` / `类目准入` 两条非政策类别;pending 类别为空;
-   零兜底(§二)。
-2. **路由提示删除**(§3.7);备选:保留但改成官方名常量表。
-3. **飞书 F 列**:`【类别】具体内容` 一格;备选:拆两列(运营在上架表加一列 + registry 加字段)。
-4. **`catalog.products` 新列 `audit_detail`**(§3.4);备选:不加列、拼进 `audit_reason`
-   (下游要再拆,不推荐)。
-5. **回放集与验收线**:反例 600(按期望类别分层封顶)+ 正例 400;验收线建议 —— 正例误伤率
-   不高于旧链、带类别反例的类别准确率作为主指标报出(先看数,不预设阈值)。
-6. ~~Content Standards 范围~~ **已定(2026-09-02)**:所有者把两页都给了,两页都进(43 索引页 +
-   44 规则页);43 的 H1 已由所有者确认,FAQ 段待补录。Overview 页链接的 21 个分类风格指南**不进**(所有者定稿 2026-09-02:每页按产品类型再挂深链,
-   拿不完也放不下,是写内容的规范不是判违规的判据;将来做内容生产时参考)。
-7. **描述截断 600 → 3000**(§3.2)。
-8. **全量重审规模**:approved 存量全部走 `mode=stale`,还是只让 `audit_sheet` 按需重审
-   (§10 原话:「规则存在,上架时对要上架的品起作用就够了」)—— 建议后者为主、`mode=stale`
-   只跑近 90 天有动销的一批。
+1. **类别词表**:44 官方名 + `内部黑名单` / `类目准入`;pending 类别为空;零兜底(§二)。
+2. **路由提示整体删除**(§3.7)。
+3. **飞书上架表**:所有者已改表头为 21 列 `店铺 / ASIN / SKU / walmart上架标题 /
+   walmart_product_type / 审核结果 / 类别 / 具体内容 / 审核日期 / amz价格 / 库存 / walmart价格 /
+   是否上架 / 上架feedid / 上架日期 / 未上架理由 / 上架结果 / 报错 / feed查询日期 / 登记日期 /
+   查询编码`;审核域 = D~I 六列,G 类别、H 具体内容分列。**热修已接线**(同日,PR #109):
+   registry 列序 + `services/listing_sheet` 全部区间**按表头名推导字母**(与 maint_sheet 同路,
+   所有者定稿「统一为按表头名定位写表」)+ 读表前核验第 1 行表头(对不上即停并点名列)+
+   审核投影六列;热修期 G = `audit_reason` 现值、H = 人话;B 批改为 G = 类别枚举、
+   H = `audit_detail`;T/U 运营域脚本不写。
+4. **`catalog.products` 新增 `audit_detail`**,`audit_reason` 专放类别(§3.4)。
+5. **回放集**反例 600 + 正例 400,先看数不预设阈值;底线 = 正例误伤率不高于旧链(§3.8)。
+6. **内容族**:44 `Product details policy` 进提示词(所有者明示);43 索引页已进表随之进
+   (1.2K 字符);21 个分类风格指南不进。
+7. **长描述截断 600 → 3000**(§3.2)。
+8. **重审规模**:以 `audit_sheet` 按需重审为主;`mode=stale` 只跑近 90 天有动销的一批 ——
+   B 批给 `mode=stale` 加 `active_days=N`(缺省 90)参数,按订单表近 N 天有订单行的 SKU
+   过滤候选(表名按 `docs/db_schema.md` 定),不再全量重付;§五 手册随之改。
 
 ## 七、事实依据(本文引用的现状,已核到 file:line)
 

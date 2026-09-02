@@ -1,26 +1,28 @@
 """上架表(registry.LISTING_SHEET)读写积木(list_new 与 feed_poll 共用)。
 
-列契约(21 列 A~U,所有者建表 2026-08-07):
-  A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
-  G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
-  M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
-  R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
+列契约(21 列 A~U;所有者建表 2026-08-07,2026-09-02 改表头):
+  A=店铺 B=ASIN C=SKU D=walmart上架标题 E=walmart_product_type F=审核结果
+  G=类别 H=具体内容 I=审核日期 J=amz价格 K=库存 L=walmart价格 M=是否上架
+  N=上架feedid O=上架日期 P=未上架理由 Q=上架结果 R=报错 S=feed查询日期
+  T=登记日期 U=查询编码
 
-⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺,现 A=店铺 B=ASIN)。
+⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺,现 A=店铺 B=ASIN);
+**2026-09-02 所有者再改表头**(第三步输出规范化):C 插入 SKU,「审核理由」拆成
+G=类别 + H=具体内容,尾部 真实标题/真实PT/真实UPC/UPC匹配 四列换成 T/U(运营域)。
 代码里没有一处按字母取 ASIN —— 列序的唯一出处是 `resources.LISTING_SHEET.columns`,
-`read_rows()` 按它 zip;写入侧一律显式 range。表头再动只改 registry 那一条元组。
+`read_rows()` 按它 zip;写入侧一律显式 range(表头一动,本文件里的字母得跟着挪,
+`tests/test_audit_sheet_loop.py` 钉着审核域的区间)。
 
-列权责(旧系统纪律,跨界写就是 bug):**A/B 人工域**(运营填店铺与 ASIN);
-**C/D/E/F/G 审核域**(`product_audit -p from_sheet=1` 写,2026-08-16 所有者定稿
-「审核直接读取上架表的 ASIN 与审核结果两列(结果为空就审核),然后回填 C、D、E、F、G」——
-此前 D/E/F/G 记在人工域,那是并跑期旧审核链在填,现在由新审核链接管;
-**F 还有一条单列通道** `write_audit_notes` —— 审不了的行(库里没数据)在
-E 留空的前提下只写 F 说明原因,见那个函数的头注);
-list_new 写 C/H/I/J(数据回显)与 K/L/M/N(提交结果);回执反哺器只写 O/P/Q;
-L3 状态跟踪写 R~U。**唯一例外**:heal_unknown 自愈反哺器对 K=Unknown
-的行可写 K~Q(所有者批复 2026-08-12——Unknown 是 list_new 自己写的
-中间态,自愈是同一职责的收尾,不算跨界)。K 三态语义:Yes(已提交)/Unknown(结局不确定,
-也算已上架不重复提交)/空或 No(待上架);O=SKU_LOCKED 由 sku_locked_heal
+列权责(旧系统纪律,跨界写就是 bug):**A/B/C 人工域**(运营填店铺、ASIN、SKU);
+**D~I 审核域**(`product_audit -p from_sheet=1` 写:D 标题 E PT F 结果 G 类别
+H 具体内容 I 日期;2026-08-16 所有者定稿「审核直接读取上架表的 ASIN 与审核结果两列
+(结果为空就审核),然后回填」;**H 还有一条单列通道** `write_audit_notes` ——
+审不了的行(库里没数据)在 F 留空的前提下只写 H 说明原因,见那个函数的头注);
+list_new 写 D/J/K/L(数据回显)与 M/N/O/P(提交结果);回执反哺器只写 Q/R/S;
+T/U 运营域,脚本不写。**唯一例外**:heal_unknown 自愈反哺器对 M=Unknown
+的行可写 M~S(所有者批复 2026-08-12——Unknown 是 list_new 自己写的
+中间态,自愈是同一职责的收尾,不算跨界)。M 三态语义:Yes(已提交)/Unknown(结局不确定,
+也算已上架不重复提交)/空或 No(待上架);Q=SKU_LOCKED 由 sku_locked_heal
 自愈链处理(RETIRE→24h→清列重上新 UPC;所有者纠正 2026-08-12:不是
 永久跳过——但旧实证不先退役直接换 UPC 重发也失败,legacy_survey.md:1667)。
 
@@ -38,10 +40,68 @@ from services import feed_track, kpi, upc_pool
 
 logger = logging.getLogger("services.listing_sheet")
 
-_COLS = 21          # A~U
+_COLS = len(resources.LISTING_SHEET.columns)   # 21,A~U
 _APPEND_BLOCK = 500 # 单次写飞书的行数上限(一次裹上千行会被 90202 拒;
                     # 与 maint_sheet 同值,那边是实遇被拒后定的)
-PENDING_O = ("", "处理中", "ASYNC_PENDING")   # O 列这些值反哺器继续跟
+PENDING_O = ("", "处理中", "ASYNC_PENDING")   # 「上架结果」列这些值反哺器继续跟
+
+
+# 列字母**从 registry.LISTING_SHEET.columns 的下标推导**,不再硬编码(与 maint_sheet
+# 同一套路,所有者定稿 2026-09-02「统一为按表头名定位写表」):表头再动,只改
+# registry 那条元组 + 下面的 _HEADER_NAMES,本文件一个字母都不用碰。
+# 2026-09-02 实证:所有者改了表头(C 插 SKU、理由拆两列),硬编码那版按旧字母
+# 写了半天 —— 读出来的字段整体错位、结论落在别人的列上,而且全程不报错。
+def _col(name: str) -> str:
+    return feishu._col_letter(resources.LISTING_SHEET.columns.index(name) + 1)
+
+
+def _rng(first: str, last: str, row: int) -> str:
+    """输入:首/末字段名 + 行号 → 输出:同一行的 A1 区间,如 'D7:I7'。"""
+    return f"{_col(first)}{row}:{_col(last)}{row}"
+
+
+# 与 registry 列序一一对应的飞书表头文字(所有者 2026-09-02 给的表头原文)。
+# ⚠ 与 `resources.LISTING_SHEET.columns` 同增同减:少一条 _header() 就 KeyError。
+_HEADER_NAMES = {
+    "store": "店铺", "asin": "ASIN", "sku": "SKU",
+    "list_title": "walmart上架标题", "product_type": "walmart_product_type",
+    "audit_result": "审核结果", "audit_category": "类别",
+    "audit_detail": "具体内容", "audit_date": "审核日期",
+    "amz_price": "amz价格", "stock": "库存", "walmart_price": "walmart价格",
+    "listed": "是否上架", "feed_id": "上架feedid", "list_date": "上架日期",
+    "not_listed_reason": "未上架理由", "list_result": "上架结果",
+    "list_fail_reason": "报错", "feed_check_date": "feed查询日期",
+    "register_date": "登记日期", "query_code": "查询编码",
+}
+
+
+def _header() -> tuple:
+    """输入:无 → 输出:与 registry 列序一一对应的中文表头。"""
+    return tuple(_HEADER_NAMES[c] for c in resources.LISTING_SHEET.columns)
+
+
+def _norm_head(s) -> str:
+    return "".join(str(s or "").split()).casefold()
+
+
+def verify_header() -> None:
+    """输入:无 → 输出:无;第 1 行表头与 registry 对不上就 ValueError,点名哪一列。
+
+    表头是运营的领地,随时会再动(2026-08-16 对调 A/B、2026-09-02 插 SKU 拆理由);
+    按位读、按名推字母写,两边都以 registry 为准 —— 所以读写之前先对一遍第 1 行,
+    对不上就停,而不是错位着跑完还不报错。比对忽略大小写与空白。
+    """
+    sheet = resources.LISTING_SHEET
+    got = feishu.sheet_values_small(sheet, f"A1:{feishu._col_letter(_COLS)}1")
+    row = [_norm_head(c) for c in (got[0] if got else [])] + [""] * _COLS
+    want = _header()
+    bad = [f"{feishu._col_letter(i + 1)} 应为「{w}」实为「{row[i] or '(空)'}」"
+           for i, w in enumerate(want) if row[i] != _norm_head(w)]
+    if bad:
+        raise ValueError(
+            "上架表表头与 registry.resources.LISTING_SHEET.columns 对不上,停止读写"
+            "(改了表头就先改 registry 的列序与 listing_sheet._HEADER_NAMES):"
+            + ";".join(bad))
 
 
 def read_rows(upto: str | None = None) -> list[dict]:
@@ -55,12 +115,13 @@ def read_rows(upto: str | None = None) -> list[dict]:
     (api 层 feishu.sheet_values_rows)。
     """
     sheet = resources.LISTING_SHEET
+    verify_header()                      # 表头一动就停,不错位着跑
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
     cols = resources.LISTING_SHEET.columns
     width = (cols.index(upto) + 1) if upto else _COLS
-    pairs = feishu.sheet_values_rows(sheet, "A", chr(ord("A") + width - 1),
+    pairs = feishu.sheet_values_rows(sheet, "A", feishu._col_letter(width),
                                      2, total)
     rows = []
     for rownum, raw in pairs:
@@ -118,7 +179,7 @@ def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, i
         row0 = start + i
         try:
             feishu.sheet_write_ranges(sheet, [
-                (f"A{row0}:B{row0 + len(block) - 1}",
+                (f"{_col('store')}{row0}:{_col('asin')}{row0 + len(block) - 1}",
                  [[st, a] for st, a in block])])
         except Exception:
             logger.error("上架表追加到第 %d 行时失败,已写 %d 行 —— 重跑即可,"
@@ -129,34 +190,34 @@ def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, i
 
 
 def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
-    """输入:[(行号, [C,H,I,J] + [K,L,M,N] 八值)] → 输出:写入行数。
+    """输入:[(行号, [D,J,K,L] + [M,N,O,P] 八值)] → 输出:写入行数。
 
-    list_new 专用:一次写 C:D 之外的两段?列不连续,拆两个 range:
-    C{r}(标题)与 H{r}:N{r}(H amz价 I 库存 J walmart价 K L M N)。
+    list_new 专用:标题与数据/提交域不连续,拆两个 range:
+    D{r}(标题)与 J{r}:P{r}(J amz价 K 库存 L walmart价 M 是否上架 N feedid O 上架日期 P 未上架理由)。
     """
     if not updates:
         return 0
     if not execute:
         for rownum, vals in updates[:20]:
-            logger.info("[DRY-RUN] 将回写 第%d行 C+H:N=%s", rownum, vals)
+            logger.info("[DRY-RUN] 将回写 第%d行 D+J:P=%s", rownum, vals)
         if len(updates) > 20:
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
     ranges = []
     for r, vals in updates:
         title, rest = vals[0], vals[1:]
-        ranges.append((f"C{r}:C{r}", [[title]]))
-        ranges.append((f"H{r}:N{r}", [rest]))
+        ranges.append((_rng("list_title", "list_title", r), [[title]]))
+        ranges.append((_rng("amz_price", "not_listed_reason", r), [rest]))
     feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
     return len(updates)
 
 
 def write_data_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
-    """输入:[(行号, [C 标题, H amz价, I 库存, J walmart价])] → 输出:写入行数。
+    """输入:[(行号, [D 标题, J amz价, K 库存, L walmart价])] → 输出:写入行数。
 
     淘汰行数据回显(2026-08-12 旧仓对照接线):旧系统对拉到过数据的淘汰行
     也写标题与价库,运营在表上直接看到"为什么这行没上"的数字;
-    只动 C 与 H:J,不碰 K~N(提交结果域)。
+    只动 D 与 J:L,不碰 M~P(提交结果域)。
     """
     if not updates:
         return 0
@@ -164,13 +225,13 @@ def write_data_cols(updates: list[tuple[int, list]], execute: bool = True) -> in
         return 0
     ranges = []
     for r, vals in updates:
-        ranges.append((f"C{r}:C{r}", [[vals[0]]]))
-        ranges.append((f"H{r}:J{r}", [vals[1:4]]))
+        ranges.append((_rng("list_title", "list_title", r), [[vals[0]]]))
+        ranges.append((_rng("amz_price", "walmart_price", r), [vals[1:4]]))
     feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
     return len(updates)
 
 
-# 审核结论 → 上架表 E 列的取值。
+# 审核结论 → 上架表 F 列(审核结果)的取值。
 # ⚠ **必须是 "pass"**:`list_new` 的领任务闸判的是
 # `r["audit_result"].lower() == "pass"`。写 "approved" 那行就永远不会被上架领走,
 # 而且不报错 —— 表面上"审过了",实际上再也上不去。
@@ -184,7 +245,7 @@ def audit_targets() -> list[dict]:
     所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
     (结果为空就审核)」。
 
-    ⚠ **清空 E 列 ≠ 重审**(2026-08-17 更正:原注释写的"这是唯一的重审入口"
+    ⚠ **清空 F 列 ≠ 重审**(2026-08-17 更正:原注释写的"这是唯一的重审入口"
     是错的,与同日定稿的"from_sheet 非强审"直接打架)。清空只是让这行重新被
     **领取**;判不判由库里的 `audit_status` 说了算,已有结论的零 LLM 原样投影
     回来 —— 净效果是那格被填回同一个结论,看起来"重审了一遍",其实一次判定
@@ -193,7 +254,7 @@ def audit_targets() -> list[dict]:
     `-p rerule=<规则码>`(改了某条规则后定点翻案)。
 
     ⚠ **`pending` 也算待审**(2026-08-17 修一处静默搁浅):`_project_to_sheet`
-    会把 pending 结论照实写进 E 列,而"E 有值"原本就等于"这行不用再领" ——
+    会把 pending 结论照实写进 F 列,而"F 有值"原本就等于"这行不用再领" ——
     净效果是 **L1 解不出类目 / L3 LLM 故障的那批,写进 E 那一刻就永久退出了
     上架表通道**,库里的一天退避重判照跑、结论也在更新,但表上那一格永远停在
     `pending`,谁也不会再看它一眼,而且全程不报错(与 rerule 首版同一种搁浅)。
@@ -203,7 +264,7 @@ def audit_targets() -> list[dict]:
     ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
     再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
     """
-    # 只读 A..E 五列(store/asin/标题/PT/审核结果):领任务用不着 F 之后的
+    # 只读 A..F 六列(store/asin/SKU/标题/PT/审核结果):领任务用不着 G 之后的
     # 理由/回显长文本,少读 3/4 的字节,离 10MB 上限远得多
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
             for r in read_rows(upto="audit_result")
@@ -213,56 +274,57 @@ def audit_targets() -> list[dict]:
 
 
 def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
-    """输入:[(行号, [C 标题, D PT, E 结果, F 理由, G 日期])] → 输出:写入行数。
+    """输入:[(行号, [D 标题, E PT, F 结果, G 类别, H 具体内容, I 日期])] → 输出:写入行数。
 
-    C~G 连续一段,一行一个 range。⚠ 只动这五列 —— H 之后是 list_new 与
+    D~I 连续一段,一行一个 range。⚠ 只动这六列 —— J 之后是 list_new 与
     反哺器的域,跨界写就是 bug(见模块头注的列权责)。
     """
     if not updates:
         return 0
     if not execute:
         for rownum, vals in updates[:20]:
-            logger.info("[DRY-RUN] 将回写 第%d行 C:G=%s", rownum, vals)
+            logger.info("[DRY-RUN] 将回写 第%d行 D:I=%s", rownum, vals)
         if len(updates) > 20:
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
     feishu.sheet_write_ranges(resources.LISTING_SHEET, [
-        (f"C{r}:G{r}", [[("" if v is None else str(v)) for v in vals]])
+        (_rng("list_title", "audit_date", r),
+         [[("" if v is None else str(v)) for v in vals]])
         for r, vals in updates])
     return len(updates)
 
 
 def write_audit_notes(updates: list[tuple[int, str]],
                       execute: bool = True) -> int:
-    """输入:[(行号, 一句人话)] → 输出:写入行数。**只写 F 列**。
+    """输入:[(行号, 一句人话)] → 输出:写入行数。**只写 H 列(具体内容)**。
 
     给"审核轮到它了、但判不了"的行用(所有者定稿 2026-08-17:「不能因为没有
     产品就静默失败……需要把理由记录到表格中」)。典型是这行的 ASIN 压根没采集
     过 —— 库里没有它,审核引擎无从下手。
 
-    ⚠ **绝不碰 E 列**,这是本函数存在的全部理由。E 一有值这行就不再被
+    ⚠ **绝不碰 F 列**,这是本函数存在的全部理由。F 一有值这行就不再被
     `audit_targets` 领走(`pending` 除外),往里写个"未采集"就等于**这行从此
     退出审核通道**:采集回来了也不会有人再审它,而表面上"表里写着原因呢"。
-    E 留空 + F 写原因 = 运营看得见为什么卡着,而下一轮照样重新领取。
+    F 留空 + H 写原因 = 运营看得见为什么卡着,而下一轮照样重新领取。
 
-    也不碰 C/D/G:那三列是有结论时 `write_audit_cols` 的域,没结论时本来就空,
+    也不碰 D/E/G/I:那四列是有结论时 `write_audit_cols` 的域,没结论时本来就空,
     顺手写进去(哪怕写空串)就是跨界写。
     """
     if not updates:
         return 0
     if not execute:
         for rownum, note in updates[:20]:
-            logger.info("[DRY-RUN] 将回写 第%d行 F=%s", rownum, note)
+            logger.info("[DRY-RUN] 将回写 第%d行 H=%s", rownum, note)
         if len(updates) > 20:
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
     feishu.sheet_write_ranges(resources.LISTING_SHEET, [
-        (f"F{r}:F{r}", [[note]]) for r, note in updates])
+        (_rng("audit_detail", "audit_detail", r), [[note]]) for r, note in updates])
     return len(updates)
 
 
 def write_reasons(items: list[tuple[int, str]], execute: bool = True) -> int:
-    """输入:[(行号, 理由)] → 输出:写入行数(N 列一次批量提交)。
+    """输入:[(行号, 理由)] → 输出:写入行数(P 列「未上架理由」一次批量提交)。
 
     切块交给 feishu.sheet_write_ranges(段数/行数/字节三条预算任一先到即封批,
     当轮写完不留下一轮)——几百行理由从几百个请求收敛到几个。具体数字**不在
@@ -276,20 +338,21 @@ def write_reasons(items: list[tuple[int, str]], execute: bool = True) -> int:
         return 0
     if not execute:
         for rownum, reason in items[:20]:
-            logger.info("[DRY-RUN] 将回写 第%d行 N=%s", rownum, reason)
+            logger.info("[DRY-RUN] 将回写 第%d行 P=%s", rownum, reason)
         return 0
     feishu.sheet_write_ranges(
         resources.LISTING_SHEET,
-        [(f"N{rn}:N{rn}", [[reason]]) for rn, reason in items])
+        [(_rng("not_listed_reason", "not_listed_reason", rn), [[reason]])
+         for rn, reason in items])
     return len(items)
 
 
 def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
-    """输入:行号列表 → 输出:清列行数(K~M 与 O~Q 清空,N 写自愈标记)。
+    """输入:行号列表 → 输出:清列行数(M~O 与 Q~S 清空,P 写自愈标记)。
 
     sku_locked_heal 专用:RETIRE 回执成功 + 24h 冷却后把行恢复成"新行",
-    下一轮 list_new 按正常闸门链领**新 UPC** 重上。N 列留一句人话,
-    运营看得出这行为什么 K/L 突然空了。
+    下一轮 list_new 按正常闸门链领**新 UPC** 重上。P 列留一句人话,
+    运营看得出这行为什么 M/N 突然空了。
     """
     if not rownums:
         return 0
@@ -299,13 +362,14 @@ def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
     mark = "SKU_LOCKED已退役,冷却完毕待重上(自愈链)"
     ranges = []
     for r in rownums:
-        ranges.append((f"K{r}:Q{r}", [["", "", "", mark, "", "", ""]]))
+        ranges.append((_rng("listed", "feed_check_date", r),
+                       [["", "", "", mark, "", "", ""]]))
     feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
     return len(rownums)
 
 
 def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
-    """输入:feed_items 的 (status, error_code) → 输出:(O 上架结果, P 失败理由)。
+    """输入:feed_items 的 (status, error_code) → 输出:(Q 上架结果, R 报错)。
 
     四集合+优先级(旧 reconcile 实证):SKU_LOCKED > 真SUCCESS > ASYNC >
     失败;SUCCESS 可以同时带 ingestionErrors——必须先看码再看状态。
@@ -443,12 +507,13 @@ def heal_unknown() -> str | None:
             if p and desc:
                 p = f"{p} | {desc}"[:900]
             if o == "SKU_LOCKED":
-                # 只落 O,K 保持 Unknown:行交给 sku_locked_heal 自愈链
-                ranges.append((f"O{rn}:Q{rn}", [[o, p, today]]))
+                # 只落 Q,M 保持 Unknown:行交给 sku_locked_heal 自愈链
+                ranges.append((_rng("list_result", "feed_check_date", rn),
+                               [[o, p, today]]))
                 n_locked += 1
                 continue
             if o == "FAILED":
-                ranges.append((f"K{rn}:Q{rn}", [[
+                ranges.append((_rng("listed", "feed_check_date", rn), [[
                     "No", "", r["list_date"],
                     "自愈:feed回执FAILED,重新排队", o, p, today]]))
                 if key in claimed:
@@ -456,8 +521,8 @@ def heal_unknown() -> str | None:
                 n_no += 1
                 continue
             if o == "PROHIBITED":
-                # 政策违禁:K=No 但 O=PROHIBITED 让 list_new 永不再领
-                ranges.append((f"K{rn}:Q{rn}", [[
+                # 政策违禁:M=No 但 Q=PROHIBITED 让 list_new 永不再领
+                ranges.append((_rng("listed", "feed_check_date", rn), [[
                     "No", "", r["list_date"],
                     "自愈:政策违禁,永不重试", o, p, today]]))
                 if key in claimed:
@@ -466,16 +531,16 @@ def heal_unknown() -> str | None:
                 continue
             # SUCCESS / SUCCESS_WITH_WARNING / ASYNC_PENDING / MISSING?
             # MISSING(feed 终态但明细查无此 SKU)= 高置信未达:按旧
-            # RolledBack 语义当"没提交过"——K=No 且 O 留 MISSING 供追查
+            # RolledBack 语义当"没提交过"——M=No 且 Q 留 MISSING 供追查
             if o == "MISSING":
-                ranges.append((f"K{rn}:Q{rn}", [[
+                ranges.append((_rng("listed", "feed_check_date", rn), [[
                     "No", "", r["list_date"],
                     "自愈:feed终态但明细无此SKU,按未达重排", o, p, today]]))
                 if key in claimed:
                     upc_release.append(claimed[key])
                 n_no += 1
                 continue
-            ranges.append((f"K{rn}:Q{rn}", [[
+            ranges.append((_rng("listed", "feed_check_date", rn), [[
                 "Yes", fid, r["list_date"] or today,
                 f"自愈:feed回执{o}", o, p, today]]))
             if key in claimed:
@@ -483,7 +548,7 @@ def heal_unknown() -> str | None:
             n_yes += 1
             continue
         if key in online:
-            ranges.append((f"K{rn}:N{rn}", [[
+            ranges.append((_rng("listed", "not_listed_reason", rn), [[
                 "Yes", r["feed_id"], r["list_date"] or today,
                 "自愈:沃尔玛目录在线(catalog_sync)"]]))
             if key in claimed:
@@ -553,7 +618,8 @@ def sync_from_ledger() -> str | None:
         if resources.WALMART_ERR_UPC_CONFLICT in codes.get(fid, {}).get(
                 r["asin"], set()):
             conflicts.append(r["asin"])
-        updates.append((f"O{r['rownum']}:Q{r['rownum']}", [[o, p, today]]))
+        updates.append((_rng("list_result", "feed_check_date", r["rownum"]),
+                        [[o, p, today]]))
     n_conflict = _mark_upc_conflicts(conflicts)
     if not updates:
         line = f"上架表:在途 {len(pollable)} 行,台账尚无新终态"

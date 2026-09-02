@@ -3,7 +3,9 @@
 > 状态:**计划待所有者批准,未动生产代码**。
 > 2026-09-01 初稿;09-02 按所有者改稿(去店铺前缀、加来源字母);09-02 晚
 > 按所有者四问做全仓二次调研(四路并行:数据流全景 / 上架链与生成时点 /
-> 订单财务飞书侧 / 仓内沃尔玛硬约束),本版为整体计划。
+> 订单财务飞书侧 / 仓内沃尔玛硬约束),本版为整体计划;09-02 深夜按所有者
+> 三条批复改稿(多店多码可处理 / 波及面一次做完 / **存量产品迁到新码**,官方
+> 支持改 SKU,见 §4)。
 > 所有者定稿:「沃尔玛侧通过 SKU 倒查产品来源,我不想让沃尔玛知道我的货源
 > 是哪里来的」+ 多源共存(amz / 1688 / 自建)+「前缀不要店铺,我需要让我们
 > 内部可以看出来这个产品是怎么来的」。
@@ -26,6 +28,14 @@
 `(店, 品)` 维度在入库时根本不存在。硬要在入库抽码,要么全店共用一个码(跨店
 同码 = 关联信号,与本计划目标冲突),要么给 `catalog.products` 加回 2026-08-12
 刚退役的 store 类列,并给几十万个永不上架的空壳行发码。详见 §5。
+**"多店多码指向同一 ASIN,系统能处理吗?"——能,而且现在就是这样。**
+`walmart_items` / `listing_sources` 主键都是 (store, sku),一个 ASIN 在库里本来
+就可以有多行;存量 sku=asin 时同一 ASIN 在两家店是**同一个 SKU 串**,改码后
+变成两个不同串,差别只在"从 SKU 认 ASIN"这一步——由登记簿按 (store, sku) 反查
+承担。产品级归并(事件视图 `coalesce(asin, sku)`、黑名单键、销量维度、分配的
+"已在架"集合)全部按 ASIN 归并,不看 SKU 串。需要注意的只有两条:两条清洗
+工作流的 `_FILL_SQL` 目前只按 sku 不带 store,换登记簿反查后必须带 store;
+规划内店的"一 ASIN 一店"是 `claims` 占用闸压出来的业务规则,与编码无关。
 
 **问 2|波及面有多广?** → 全仓穷举后:**没有一处会报错,全部是静默失效**。
 SQL 硬等号 5 处 + 1 个视图;按 SKU 形态倒推 ASIN 的调用点 **14 处**(初稿写 7
@@ -35,15 +45,16 @@ SQL 硬等号 5 处 + 1 个视图;按 SKU 形态倒推 ASIN 的调用点 **14 �
 UPC 烧配额)、黑名单键被灌随机码(违禁品拦不住)、订单审核把每一单判"待人工"。
 
 **问 3|存量产品过渡期怎么办?改了在线产品的 SKU,旧订单会不会跟着变?**
-→ 分三句:
-- **在线产品的 SKU 改不了。** 沃尔玛 SKU 建后不可编辑(仓内无一手记载,是行业
-  常识,§8 要你按 Seller Center 核一眼)。所以"把存量产品改成新 SKU"在沃尔玛
-  侧唯一的路是 **退役旧 SKU + 新码重上**:烧一个 UPC、24h 冷却、listing 历史
-  归零、在途订单身份断裂。**建议不迁存量,永久双轨**(存量 SKU 里的 ASIN
-  已经泄露,追不回;新上的品从此不泄露)。真要迁,另立计划按店分批。
+→ 分三句(2026-09-02 所有者拍板:**存量产品要迁到新码**;官方查证结果见 §4):
+- **在线产品的 SKU 可以改,官方支持。** Seller Center 单品编辑或批量模板
+  「SKU Update = Yes」,按 Product ID(UPC/GTIN)匹配现有 item,评价与评分保留;
+  API 侧对应 feed 里的 `SkuUpdate` 属性(CA 文档明文,US 文档指向"Maintain an
+  item / Bulk create/update items")。WFS 品不能改(本仓 WFS 一律删除,无影响)。
+  迁移作为**批次 3**,机制与代价见 §7;做之前必须单品实测三件事(§4)。
 - **旧订单不会变。** `orders.order_lines.sku` 是下单当时沃尔玛返回的快照,
   行标识 = sha256(PO + SKU),全仓没有任何一条 SQL 会改历史订单行的 sku;
-  asin 列只在原来为空时补填,永不覆盖。
+  asin 列只在原来为空时补填,永不覆盖。改码后新订单带新码、旧订单带旧码,
+  登记簿里旧行标 `replaced_by`,两个码 `resolve` 到同一个 ASIN,销量不断档。
 - **飞书订单表加 ASIN 列:对。** 销售订单表、售后订单表现在只有「SKU」列;
   加「ASIN」列从 `order_lines.asin` 投影(登记簿反查后新旧码都有值)。一次性
   代价:加列 ⇒ 行指纹全变 ⇒ 下一次 push 把 90 天窗口全量重推一遍,预告不是
@@ -76,8 +87,8 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
   同一 SKU 串在沃尔玛合法,但那正是"两家店有关联"的信号。
 - **12 位不是 10 位**:10 位正是 ASIN 长度;12 位与全部存量形态都对不上,
   `extract_asin` 必返 None,调用方于是走登记簿——形态本身就是分流器。
-- 沃尔玛约束待核(§8):长度上限、字符集、按 seller 唯一、不可变。本规则
-  12 位纯大写字母数字,任何合理上限都在内。
+- 沃尔玛约束:按 seller 唯一、**可改**(官方「SKU Update」,§4);长度上限与
+  字符集待本地 spec 核(§8)。本规则 12 位纯大写字母数字,任何合理上限都在内。
 
 ## 3. 影响范围全景(2026-09-02 四路调研合并)
 
@@ -168,19 +179,46 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
 `test_risk_trace.py:123`。夹具里 sku=asin 同值的:`test_list_new.py:570/689`、
 `test_sku_locked_heal.py`、`test_claims.py:372`、`test_alloc_plan.py:122`。
 
-## 4. 沃尔玛侧硬约束(仓内证据 + 待核)
+## 4. 沃尔玛侧硬约束(仓内证据 + 官方查证 2026-09-02)
 
-可确认(仓内有记载):
-- SKU_LOCKED(ERR_EXT_DATA_0101211)= SKU 绑死首次提交的 UPC;不先退役直接换
-  UPC 重发同一 SKU 必败(旧系统实证)。退役后旧 UPC 永久烧号(`burn_for_retire`)。
-- 官方 retire = `DELETE /v3/items/{sku}`"permanently retire",API 无 reactivate;
-  DELETE_ITEM"Deletions are permanent"。24h 冷却是旧系统实证,官方无明文。
-- 订单行只给 `item.sku` + `productName`,无 itemId/gtin;行身份 = sha256(PO+SKU)。
-  → **订单只能靠 SKU 对到产品**,所以登记簿反查是订单侧唯一通路。
-- `walmart_items` 身份列:sku(PK)、wpid、item_id(报表回填,默认关)、upc、gtin。
+**SKU 可以改(官方,推翻初稿"建后不可改")**:
+- Seller Center 批量:`Catalog → Add items → Upload in bulk → 全量 item setup
+  模板`,填新 SKU + 其余必填字段,Optional 段「SKU Update」选 Yes,上传;
+  15 分钟至 4 小时生效。"You can't change SKUs for items fulfilled through WFS."
+  "To update a SKU using API, refer to the steps listed under Maintain an item."
+  ([Update SKUs in bulk in Seller Center](https://marketplacelearn.walmart.com/guides/Catalog%20management/Item%20management/Update-SKUs-in-bulk-in-Seller-Center))
+- 匹配键 = Product ID:"Enter the correct SKU for that Product ID. Enter Yes in
+  the SKU Update column … The item will retain all of its ratings and reviews."
+  "You are not allowed to submit two SKUs with the same Product Identifier."
+  ([Update an item's SKU](https://marketplacelearn.walmart.com/ca/guides/Catalog%20management/Item%20management/update-an-item-s-sku))
+- API:"look for the SkuUpdate attribute in the payload and set it to Yes …
+  provide the new SKU … when the feed is successfully processed, the item will
+  have the new SKU."([Manage items, CA](https://developer.walmart.com/ca-marketplace/docs/manage-items))
+  US 侧 [Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items)
+  只讲 MP_MAINTENANCE 做部分更新("requires only the SKU and GTIN attributes"),
+  未点名 SkuUpdate。
+- 第三方实操一致([GeekSeller](https://support.geekseller.com/knowledgebase/how-to-change-sku-on-walmart-seller-center/)、
+  [Zentail](https://help.zentail.com/en/articles/1118297-walmart-product-id-or-sku-update)):
+  按 Product ID 找 item;「SKU Update」与「Product ID Update」互斥;同 SKU 换
+  UPC 报 "This SKU is already set up with a different Product ID";处理要几小时。
 
-仓内无记载、需所有者核(§8):SKU 是否可编辑(本计划按"不可"设计)、长度
-上限与字符集、同一 GTIN 挂两个 SKU 是否被拒、换 SKU 对 listing 历史的影响。
+**待单品实测的三件事**(官方文档没写,本仓纪律"不按推断编码"):
+1. `SkuUpdate` 在本地 spec 的哪份里:`grep -rl SkuUpdate <DATA_ROOT>/specs/MP_ITEM/5.0.20260608-18_15_07-api/`
+   (MP_MAINTENANCE 与 MP_ITEM 同版同布局)。若 MP_MAINTENANCE 收 `{sku 新码,
+   GTIN 现号, SkuUpdate: Yes}` 最小载荷就能改 ⇒ **不用重发内容**;若只有 MP_ITEM
+   全量载荷才行 ⇒ 改码 = 重发全部内容(标题/属性会被我们再生成的内容覆盖,
+   这是副作用,要所有者接受)。
+2. 改码后库存、价格、item_id/wpid、变体组是否原样保留(`node_probe` + `GET
+   /v3/items/{新sku}` 前后对比)。
+3. 旧 SKU 串改码后能否再次使用(不打算复用,只为知道撞库风险)。
+
+其余可确认(仓内有记载):SKU_LOCKED = SKU 绑死首次提交的 UPC,不先退役换 UPC
+重发必败;退役后旧 UPC 永久烧号;官方 retire = `DELETE /v3/items/{sku}`,API 无
+reactivate;24h 冷却是旧系统实证,官方无明文;订单行只给 `item.sku` +
+`productName`,行身份 = sha256(PO+SKU) ⇒ **订单只能靠 SKU 对到产品**,登记簿
+反查是订单侧唯一通路;`walmart_items` 身份列 sku(PK)/wpid/item_id/upc/gtin。
+
+仍待核(§8):SKU 长度上限与字符集(本地 spec Orderable.sku 定义)。
 
 ## 5. 生成时点与生命周期(问 1 的展开)
 
@@ -233,7 +271,8 @@ dry-run 看到的 sku 不是真跑那个,与 UPC 占位的处境相同,已被接
 
 ## 6. 身份积木
 
-- `catalog.listing_sources`:加 `retired_at timestamptz`;加索引
+- `catalog.listing_sources`:加 `retired_at timestamptz`、`replaced_by text`
+  (存量改码:旧行指向新码,两码 resolve 到同一 source_key;缺席压制用);加索引
   `(store, source_type, source_key) WHERE retired_at IS NULL`(反查 + 复用);
   加全局 `sku` 索引(查重)。表结构其余不变。
 - `services/sku_codec.py`(新):
@@ -266,6 +305,9 @@ source_key 就是回填的 asin,等号右边换成它结果相同)。
 在切换前后意图集合相同。
 可以分两个 PR 合:0a(积木 + 维护/审核/分配 SQL)、0b(订单/事件/黑名单/
 order_audit + 飞书 ASIN 列)。
+**波及面一次做完(所有者 2026-09-02):** §3 全部条目在批次 0/1 内闭合,不留
+"切换后再补";并加一条守门测试:`extract_asin` 的调用点与 `= w.sku`/`= sku`
+形态的 SQL 硬等号只允许出现在白名单文件里,新增即红——防止切换后又长出新洞。
 
 **批次 1|飞书列与回执自愈链(仍零行为变化)**
 上架表 V 列「SKU」+ registry 常量 + `_COLS=22` + 单列写函数;`listing_sheet.542`
@@ -289,11 +331,28 @@ order_audit + 飞书 ASIN 列)。
 6. 对该行人为制造一次 FAILED 重试,确认复用同一 SKU、同一 UPC;
 7. 通过后全店按常规节奏上。
 
-**批次 3|另议,不在本计划内**
-- `sku_locked_heal` 简化:有了"退役 ⇒ 新码",24h 冷却可能不需要;官方无明文,
-  留待实测。
-- 存量在线产品迁移(若所有者坚持):按店分批"退役 + 新码重上",另立计划;
-  代价见 §1 问 3。
+**批次 3|存量产品改码(所有者 2026-09-02 拍板:要做)**
+前置:批次 0/1/2 全部合并且新码在生产跑过至少一轮(读侧对两种码都认、上架表
+V 列在位);§4 三件事单品实测通过。
+机制:对每个存量 SKU(裸 ASIN / 三段式;跟卖 `PHUMWMT…` 不含 ASIN,是否迁 §8
+定)——`mint` 抽新码并在登记簿写 `replaces=旧sku`,旧行标 `retired_at` +
+`replaced_by=新sku`(**先落库再调接口**)→ 提交 `SkuUpdate=Yes` feed(载荷形态
+按实测结果:MP_MAINTENANCE 最小载荷或 MP_ITEM 全量)→ 回执成功后:上架表 V 列
+回写新码、`upc_pool.sku` 改新码、`walmart_items` 由 `catalog_sync` 自然出现新行;
+旧行的缺席**不得**产生缺席事件/处置(按 `replaced_by` 压制)。
+节奏:一店一批、按 MP_ITEM/MP_MAINTENANCE 10/hour × 2000 条/feed 的配额走;
+先 1 个品 → 10 个 → 一家店 → 其它店;每一级都跑 `maintenance_scan preview`
+与 `node_probe` 对比改码前后意图集合与库存。
+受牵连的 (store, sku) 键表:`ops.dispositions` 在途行(改码前该店必须无
+executing 行)、`maintenance` 的 drop_recent 防重键(自然过期)、
+`ops.cleanup_seen_categories`(按 replaced_by 迁一次)、`listing.retire_cooldown`、
+`catalog.item_node_inventory`(sync 重建)、`ops.feed_items`(历史,不动)。
+订单侧:改码后新单带新码;若沃尔玛对**改码前的 PO** 日后返回新码,会被当成
+新行插入(旧行不删)⇒ 双算——切换前加一条"同 (store, po_id, line_number) 多个
+order_line_id"的体检告警兜住。
+
+**批次 4|另议**:`sku_locked_heal` 简化(有了"退役 ⇒ 新码",24h 冷却可能不
+需要;官方无明文,留待实测)。
 
 ## 8. 待所有者决定 / 核验
 
@@ -301,9 +360,11 @@ order_audit + 飞书 ASIN 列)。
       更早看到码,代价是幽灵行)。
 - [ ] **码的寿命**:复用到显式退役(推荐,§5.2)。若坚持"每次重上新码",
       须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
-- [ ] **存量产品**:不迁、永久双轨(推荐);还是另立"退役 + 重上"迁移计划。
-- [ ] **沃尔玛 SKU 规格**:Seller Center 或本地 `<DATA_ROOT>/specs/MP_ITEM/<版本>`
-      的 Orderable.sku 定义:是否可编辑、长度上限、字符集。
+- [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3。
+- [ ] **§4 三件事单品实测**(所有者机器):`grep -rl SkuUpdate` 定 feed 类型与
+      最小载荷;改码后库存/价格/item_id 是否保留;旧串能否复用。
+- [ ] **跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。
+- [ ] **沃尔玛 SKU 规格**:本地 spec Orderable.sku 的长度上限、字符集。
 - [ ] **飞书建列**(所有者建,我登记常量):上架表 V「SKU」;销售订单「ASIN」;
       售后订单「ASIN」;在线产品总表「来源码」。建之前用 `list_fields` 确认
       表里没有同名人工列(有的话程序一登记就开始覆盖它)。

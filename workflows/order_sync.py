@@ -49,8 +49,8 @@ def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
     """输入:店铺 + 该店全部订单(+异常收集器/修复开关)→ 输出:入库行数(fetch_orders_bulk 回调)。
 
     下单时间观测→定稿(所有者定稿 2026-09-02):入库前按库里现状把 API 值与库值
-    不一致的行分成 冲突/改判/待定,加上解析阶段的 拒写(未来日期)/存疑(晚于状态
-    时间),逐条记日志并收进 anomalies(进摘要首行);默认模式由守卫决定取舍,
+    不一致的行分成 冲突/改判/待定,加上 拒写(未来/远古日期、晚于本行首次入库)
+    /存疑(晚于状态时间),逐条记日志并收进 anomalies(进摘要首行);默认模式由守卫决定取舍,
     只有 PO 在 repair 集合里的行才允许 API 值直接覆盖(显式修复已定稿的错行)。
     """
     rows: list[dict] = []
@@ -64,7 +64,7 @@ def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
                               "db": None, "api": r.get("order_date")})
     try:
         with db.pg_conn() as conn:
-            found.extend(ol.order_date_conflicts(conn, rows))
+            found.extend(ol.screen_order_dates(conn, rows))   # 可能把不可能的 API 值置空
             fix = [r for r in rows if r["po_id"] in repair]
             rest = [r for r in rows if r["po_id"] not in repair]
             n = ol.upsert_order_lines(conn, rest) if rest else 0

@@ -154,7 +154,7 @@ def _order_sync_with_conflict(monkeypatch, params):
         def fetchall(self):
             sql, args = self._last
             if isinstance(args, dict):     # 在库比对:PO1/A 已有另一个值(首见未定稿)
-                return [(lid, "PO1", "A", db_dt, None, False) for lid in args["ids"]]
+                return [(lid, "PO1", "A", db_dt, None, False, None) for lid in args["ids"]]
             return super().fetchall()
 
     class _Conn(_FakeConn):

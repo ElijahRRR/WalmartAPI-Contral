@@ -106,7 +106,7 @@ def _sync(pg, po: str, order_ms, *, repair=False) -> list[dict]:
     """模拟 order_sync._persist 的一轮:先比对(取证)再 upsert;返回冲突分类。"""
     rows = ol.extract_order_lines(STORE, _order(po, order_ms))
     with pg.pg_conn() as conn:
-        found = ol.order_date_conflicts(conn, rows)
+        found = ol.screen_order_dates(conn, rows)
         ol.upsert_order_lines(conn, rows, repair_order_date=repair)
     return found
 
@@ -238,3 +238,19 @@ def test_order_meta_is_written_once_and_business_updates_still_flow(pg):
             " WHERE po_id = 'P10'").fetchone()
     assert status == "Delivered" and upd2 > upd1
     assert meta2 == meta1 == str(X_MS)            # 信封只在插入时写
+
+
+def test_api_value_after_first_sight_is_rejected_and_not_an_observation(pg):
+    """原文实证:沃尔玛把别的订单/加了整数天的时间当 orderDate 回来。这行三天前就
+    见过(created_at),API 现在说它是昨天下的单 → 拒写:库值不动、上轮观测不动。"""
+    with pg.pg_conn() as conn:
+        conn.execute("INSERT INTO orders.order_lines (order_line_id, store, po_id, line_number,"
+                     " sku, order_date, created_at) VALUES (%s, %s, %s, '1', %s, %s, now() - interval '3 days')",
+                     (ol.make_order_line_id("P12", SKU), STORE, "P12", SKU, _dt(X_MS)))
+    yesterday = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp() * 1000)
+    assert [c["kind"] for c in _sync(pg, "P12", yesterday)] == ["拒写"]
+    od, seen, confirmed, *_ = _state(pg, "P12")
+    assert (od, seen, confirmed) == (_dt(X_MS), None, False)
+    _sync(pg, "P12", X_MS)
+    _sync(pg, "P12", X_MS)
+    assert _state(pg, "P12")[2] is True

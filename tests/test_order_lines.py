@@ -481,7 +481,7 @@ def test_order_date_observe_then_confirm_guard_and_repair_mode():
     assert "order_date = EXCLUDED.order_date" in sql and "t.order_date_confirmed" not in sql
 
 
-def test_order_date_conflicts_are_classified_and_never_silent(caplog):
+def test_order_date_screening_classifies_and_never_silences(caplog):
     """API 值与库值不一致必须逐条记 warning(带信封摘要)并按库里状态分三类交给
     调用方进摘要:已定稿=冲突(库值保留)/ 未定稿且等于上轮观测=改判 / 其余=待定。
     库空(首见)/相同不算冲突。"""
@@ -491,21 +491,57 @@ def test_order_date_conflicts_are_classified_and_never_silent(caplog):
     api_od = rows[0]["order_date"]
     other = datetime(2026, 9, 2, 4, 12, tzinfo=timezone.utc)
     with caplog.at_level("WARNING"):
-        got = ol.order_date_conflicts(
-            _ConflictConn([(lid, "108000000001", "B0A", other, None, True)]), rows)
+        got = ol.screen_order_dates(
+            _ConflictConn([(lid, "108000000001", "B0A", other, None, True, None)]), rows)
     assert got == [{"kind": "冲突", "po": "108000000001", "sku": "B0A",
                     "db": other, "api": api_od}]
     assert "下单时间冲突" in caplog.text and "108000000001" in caplog.text
     assert '"customerOrderId"' in caplog.text          # 信封摘要进日志取证
-    assert ol.order_date_conflicts(
-        _ConflictConn([(lid, "p", "s", other, api_od, False)]), rows)[0]["kind"] == "改判"
-    assert ol.order_date_conflicts(
-        _ConflictConn([(lid, "p", "s", other, None, False)]), rows)[0]["kind"] == "待定"
-    assert ol.order_date_conflicts(
-        _ConflictConn([(lid, "p", "s", other, other, False)]), rows)[0]["kind"] == "待定"
-    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", api_od, None, False)]), rows) == []
-    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", None, None, False)]), rows) == []
-    assert ol.order_date_conflicts(_ConflictConn([]), []) == []
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", other, api_od, False, None)]), rows)[0]["kind"] == "改判"
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", other, None, False, None)]), rows)[0]["kind"] == "待定"
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", other, other, False, None)]), rows)[0]["kind"] == "待定"
+    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", api_od, None, False, None)]), rows) == []
+    assert ol.screen_order_dates(_ConflictConn([(lid, "p", "s", None, None, False, None)]), rows) == []
+    assert ol.screen_order_dates(_ConflictConn([]), []) == []
+
+
+def test_api_order_date_after_first_sight_is_rejected_not_written(caplog):
+    """原文实证(2026-09-02):沃尔玛会把别的订单/加了整数天的时间当 orderDate 回来。
+    订单不可能在我们第一次看见它之后才下单:晚于本行 created_at 的 API 值置空不写,
+    也不算一次观测;归类 拒写 并带信封进日志。"""
+    from datetime import timedelta
+    rows = ol.extract_order_lines("T1", _ORDER)
+    lid, api_od = rows[0]["order_line_id"], rows[0]["order_date"]
+    created = api_od - timedelta(days=5)             # 五天前就见过这单
+    with caplog.at_level("WARNING"):
+        got = ol.screen_order_dates(
+            _ConflictConn([(lid, "p", "s", created - timedelta(hours=1), None, False, created)]), rows)
+    assert got[0]["kind"] == "拒写" and rows[0]["order_date"] is None
+    assert "晚于本行首次入库" in caplog.text and '"customerOrderId"' in caplog.text
+    # 首次入库晚于下单时间(正常)不拦
+    rows = ol.extract_order_lines("T1", _ORDER)
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", api_od, None, False, api_od + timedelta(hours=2))]),
+        rows) == [] and rows[0]["order_date"] == api_od
+
+
+def test_garbage_timestamps_from_walmart_become_null(caplog):
+    """原文实证:orderDate=907、estimatedDeliveryDate=-18000000/0、statusDate=0。
+    早于 2020 的一律当没有:下单时间拒写并告警,状态/预计时间静默归 NULL。"""
+    import copy
+    o = copy.deepcopy(_ORDER)
+    o["orderDate"] = 907
+    o["orderLines"]["orderLine"][0]["statusDate"] = 1     # 0 会回退到 statusSetDate,那是另一条路
+    o["orderLines"]["orderLine"][0]["fulfillment"] = {"estimatedDeliveryDate": -18000000,
+                                                     "estimatedShipDate": 0}
+    with caplog.at_level("WARNING"):
+        r = ol.extract_order_lines("T1", o)[0]
+    assert r["order_date"] is None and r.get("_order_date_rejected") is True
+    assert r["status_date"] is None and r["est_delivery_date"] is None and r["est_ship_date"] is None
+    assert "早于 2020" in caplog.text and "907" in caplog.text
 
 
 def test_order_date_later_than_status_is_flagged_not_rejected(caplog):

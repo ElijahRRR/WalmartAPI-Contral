@@ -283,7 +283,7 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
        与 `Textiles & Apparel` 只差 `&`↔`and`,归一化已经够用,别名本身多余。
 
 8. **内容族两页入表(2026-09-02,A 批)**:`refdata/policy_pages/en/` 从 42 份增至 44 份 ——
-   43 `Content standards: Overview`(登录墙,所有者粘贴;H1 与 FAQ 段待补核)与 44
+   43 `Content standards: Overview`(登录墙,所有者粘贴;H1 已确认,FAQ 段待补录)与 44
    `Product details policy`(公开页,页面结构化数据渲染 + 粘贴交叉核对)。它们不是
    Prohibited Products Policy 类别,是沃尔玛「violates Walmart's content policy」/「unverified
    authenticity claims」两类下架原因所指页面;进同一张表、同一条 S4 块、同一个类别枚举

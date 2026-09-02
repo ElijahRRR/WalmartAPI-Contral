@@ -25,8 +25,8 @@ claims」两类下架原因所指的页面(入表理由 `docs/audit_step3_spec.m
    照录未删,入库清洗时处理;
 4. 各节标题层级 / Notes 呈现形式 / In-this-guide 有无 / 日期格式在官方各页间本就不一致,
    转录不做跨节统一,归一化在入库清洗层做;
-5. **Content standards: Overview**(43)在登录墙内,正文由所有者粘贴;粘贴件不含 H1(按 URL
-   路径段写,待核)与 FAQ 段(折叠面板未展开,待补录,不占位);「Additional guidelines」的
+5. **Content standards: Overview**(43)在登录墙内,正文由所有者粘贴;H1 已由所有者核对确认;粘贴件不含 FAQ 段(折叠面板未展开,
+   待补录,不占位);「Additional guidelines」的
    21 个分类名原是两栏链接网格,按粘贴顺序照录;
 6. **Product details policy**(44)公开页,由页面结构化数据渲染并与所有者粘贴交叉核对:
    「Product title」表末尾一空数据行、「Description」表条目在源码拆成四个列表、一张无文字

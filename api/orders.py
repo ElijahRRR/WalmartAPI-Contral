@@ -21,6 +21,32 @@ from api import _client
 
 logger = logging.getLogger("api.orders")
 
+_MAX_PAGES = 500        # 与 api/returns 同款翻页闸(蓝图 §8.7:cursor 家族同一契约)
+
+
+def _order_list(data) -> list[dict]:
+    """输入:一页响应体 → 输出:订单对象列表(单元素不包 list 的形状也归一)。"""
+    v = ((data or {}).get("list") or {}).get("elements") or {}
+    v = v.get("order") or []
+    return v if isinstance(v, list) else [v]
+
+
+def _page_should_stop(cursor, page_orders, seen_cursors: set, store: dict, page: int) -> bool:
+    """输入:本页 nextCursor/订单数/已见游标集 → 输出:是否停止翻页(带告警)。
+
+    三道闸照抄 api/returns(2026-09-02 补齐,此前只看 cursor 是否为空):
+    无 cursor 或空页即止;**同 cursor 重复 = 服务端未推进,立即停**——否则同一页
+    会被反复 extend 进结果,后到的对象静默覆盖先到的(下单时间事故的通道之一)。
+    """
+    if not cursor or not page_orders:
+        return True
+    if cursor in seen_cursors:
+        logger.warning("GET /v3/orders nextCursor 重复,停止翻页(店铺 %s 第 %d 页)",
+                       store.get("name"), page)
+        return True
+    seen_cursors.add(cursor)
+    return False
+
 
 def iter_orders(store: dict, *, created_start: str | None = None,
                 created_end: str | None = None,
@@ -39,7 +65,8 @@ def iter_orders(store: dict, *, created_start: str | None = None,
     url = f"{_client.base_url()}/v3/orders"
     cursor_suffix: str | None = None
     first_page = True
-    while True:
+    seen_cursors: set[str] = set()
+    for page in range(1, _MAX_PAGES + 1):
         _client.rate_acquire("orders.list", store["client_id"])
         if cursor_suffix:
             # 分页模型 2:nextCursor 就是完整 query 串(含 '?'),直接拼 URL,不再带 params
@@ -57,16 +84,17 @@ def iter_orders(store: dict, *, created_start: str | None = None,
         if status != 200 or data is None:
             raise RuntimeError(f"GET /v3/orders 返回 {status}(店铺 {store['name']})")
 
-        lst = (data or {}).get("list") or {}
-        meta = lst.get("meta") or {}
+        meta = ((data or {}).get("list") or {}).get("meta") or {}
         if first_page and stats is not None:
             stats["total"] = int(meta.get("totalCount") or 0)
         first_page = False
-        for order in (lst.get("elements") or {}).get("order") or []:
-            yield order
+        page_orders = _order_list(data)
+        yield from page_orders
         cursor_suffix = meta.get("nextCursor")
-        if not cursor_suffix:
+        if _page_should_stop(cursor_suffix, page_orders, seen_cursors, store, page):
             return
+    logger.warning("GET /v3/orders 触达翻页上限 %d 页,可能未拉全(店铺 %s)",
+                   _MAX_PAGES, store.get("name"))
 
 
 # ── async 变体(蓝图 §6.3;只服务多店订单拉取,勿在别处复用)──────────────────
@@ -106,7 +134,9 @@ async def _get_async(client: httpx.AsyncClient, url: str, store: dict,
             resp = await client.get(
                 url, params=params,
                 headers=_client.make_headers(token, store["client_id"]))
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, *_client.SOCKS_ERRORS) as e:
+            # SOCKS 层异常不在 httpx 异常树上(08-26 事故根因),必须并列接住,
+            # 否则一次 "Malformed reply" 直接穿出去、拿不到退避重试
             logger.warning("GET %s 网络失败(店铺 %s): %s", url, store["name"], e)
             if attempt < max_retries:
                 attempt += 1
@@ -159,13 +189,18 @@ async def _fetch_store(store: dict, sem: asyncio.Semaphore, *,
         total = 0
         cursor_suffix: str | None = None
         first_page = True
+        seen_cursors: set[str] = set()
         client = _build_async_client(store["proxy"])
         try:
-            while True:
+            for page in range(1, _MAX_PAGES + 1):
                 # orders.list = 进程内高频桶(3000/min/店),to_thread 防它
                 # 罕见节流时睡死事件循环
                 await asyncio.to_thread(_client.rate_acquire, "orders.list",
                                         store["client_id"])
+                # _get_async 的 401 自愈只刷新了它自己的形参:第 2 页起必须从
+                # 缓存取新 token,否则整店拿死 token 翻页 → 被误判凭证失效
+                token = (_client._token_cache.get(store["client_id"]) or {}
+                         ).get("token") or token
                 if cursor_suffix:   # 分页模型 2:nextCursor 是完整 query 串
                     status, _, data = await _get_async(
                         client, url + cursor_suffix, store, token)
@@ -179,17 +214,26 @@ async def _fetch_store(store: dict, sem: asyncio.Semaphore, *,
                 if status != 200 or data is None:
                     raise RuntimeError(
                         f"GET /v3/orders 返回 {status}(店铺 {store['name']})")
-                lst = (data or {}).get("list") or {}
-                meta = lst.get("meta") or {}
+                meta = ((data or {}).get("list") or {}).get("meta") or {}
                 if first_page:
                     total = int(meta.get("totalCount") or 0)
                     first_page = False
-                orders.extend((lst.get("elements") or {}).get("order") or [])
+                page_orders = _order_list(data)
+                orders.extend(page_orders)
                 cursor_suffix = meta.get("nextCursor")
-                if not cursor_suffix:
+                if _page_should_stop(cursor_suffix, page_orders, seen_cursors,
+                                     store, page):
                     break
+            else:
+                logger.warning("GET /v3/orders 触达翻页上限 %d 页,可能未拉全(店铺 %s)",
+                               _MAX_PAGES, store.get("name"))
         finally:
             await client.aclose()
+        # 服务端 totalCount 与实拉对象数不符 = 翻页重放或对象重复的指纹
+        # (2026-09-02 下单时间事故后补的口子),必须响亮
+        if total and len(orders) > total:
+            logger.warning("店铺 %s 拉到 %d 个订单对象 > 服务端 totalCount %d,"
+                           "疑似翻页重放/对象重复", store["name"], len(orders), total)
         lines = None
         if handler is not None:     # 持久化回调注入(依赖铁律:api 不碰 services)
             lines = await asyncio.to_thread(handler, store, orders)
@@ -200,8 +244,9 @@ def fetch_orders_bulk(stores: list[dict], *, created_start: str | None = None,
                       created_end: str | None = None,
                       last_modified_start: str | None = None,
                       limit: int = 200, concurrency: int = 12,
-                      handler=None) -> tuple[list[dict], list[str], list[str]]:
-    """输入:店铺列表 + 时间窗(+ 每店持久化回调)→ 输出:(结果, 凭证死店, 失败店)。
+                      handler=None
+                      ) -> tuple[list[dict], list[str], list[tuple[str, Exception]]]:
+    """输入:店铺列表 + 时间窗(+ 每店持久化回调)→ 输出:(结果, 凭证死店, [(失败店, 异常)])。
 
     同步门面:内部 asyncio.run 跑 30+ 店并发(蓝图 §6.3),调用方无感。
     handler(store, orders)->int 在线程池执行(网络与入库重叠),返回值记入

@@ -5,11 +5,16 @@
   python cli.py order_sync -p store=A085朱丽霖  # 单店
   python cli.py order_sync -p days=90          # 自定窗口
   python cli.py order_sync -p workers=8        # 跨店并发
+  python cli.py order_sync -p repair_order_date=1   # 显式修复:允许 API 下单时间覆盖库值
 
 每店:GET /v3/orders(createdStartDate=now-days)→ 展开订单行 → upsert
 orders.order_lines。窗口全量重拉而非游标增量:订单状态在创建后持续变化
 (Created→Shipped→Delivered/Cancelled),按创建时间增量会漏老订单的状态迁移,
 窗口重拉 + 幂等 upsert 天然覆盖(旧系统同样按日全刷 45 天)。
+
+下单时间例外(所有者定稿 2026-09-02):order_date 是事实字段,**写一次**,
+重拉不覆盖;API 值与库值不一致逐条告警并点名进摘要首行;只有显式
+repair_order_date=1 才按 API 值改写(先跑默认模式看清冲突清单再开)。
 
 并发形态(2026-08-13,蓝图 §6.3 async 变体落地):跨店并发由
 api/orders.fetch_orders_bulk 承担(asyncio 藏在 api 层内部,默认 12 店
@@ -19,6 +24,7 @@ api/orders.fetch_orders_bulk 承担(asyncio 藏在 api 层内部,默认 12 店
 重拉不会冲掉审核结论——审核规则与采集对接后由 order_audit 补全。
 """
 
+import functools
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -27,19 +33,29 @@ from registry import db
 from services import notify_fmt as nf, order_center, store_retry
 from services import order_lines as ol
 from services import stores as stores_svc
+from services.params import flag
 
 DANGEROUS = False
 
 logger = logging.getLogger("workflows.order_sync")
 
 
-def _persist(store: dict, orders: list[dict]) -> int:
-    """输入:店铺 + 该店全部订单 → 输出:入库行数(fetch_orders_bulk 回调)。"""
+def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
+             repair: bool = False) -> int:
+    """输入:店铺 + 该店全部订单(+冲突收集器/修复开关)→ 输出:入库行数(fetch_orders_bulk 回调)。
+
+    下单时间写一次(所有者定稿 2026-09-02):先比对 API 值与库值,不一致的
+    逐条记日志并收进 anomalies(进摘要首行);默认模式库值保留,
+    repair=True 才允许 API 值覆盖(显式修复已写坏的行)。
+    """
     rows: list[dict] = []
     for order in orders:
         rows.extend(ol.extract_order_lines(store["name"], order))
     with db.pg_conn() as conn:
-        return ol.upsert_order_lines(conn, rows)
+        conflicts = ol.order_date_conflicts(conn, rows)
+        if anomalies is not None:
+            anomalies.extend({"store": store["name"], **c} for c in conflicts)
+        return ol.upsert_order_lines(conn, rows, repair_order_date=repair)
 
 
 def run(params: dict) -> str:
@@ -52,10 +68,15 @@ def run(params: dict) -> str:
     workers = int(params.get("workers", stores_svc.STORE_WORKERS))
     created_start = (datetime.now(timezone.utc) - timedelta(days=days)) \
         .strftime("%Y-%m-%dT%H:%M:%SZ")
+    # -p repair_order_date=1:显式修复模式,允许 API 的下单时间覆盖库值。
+    # 先跑一遍默认模式看摘要里的冲突清单,确认 API 值可信再开
+    repair = flag(params, "repair_order_date")
+    anomalies: list[dict] = []
+    persist = functools.partial(_persist, anomalies=anomalies, repair=repair)
 
     results, dead, failed = orders_api.fetch_orders_bulk(
         store_list, created_start=created_start, concurrency=workers,
-        handler=_persist)
+        handler=persist)
 
     # 标准②(所有者定稿 2026-08-26,补齐:此前本文件只做隔离+分诊,同链
     # returns_sync 是全套):失败店跑完别人后串行补试一遍。单一落地路径 ——
@@ -68,7 +89,7 @@ def run(params: dict) -> str:
         def _retry_one(store):
             r2, dead2, failed2 = orders_api.fetch_orders_bulk(
                 [store], created_start=created_start, concurrency=1,
-                handler=_persist)
+                handler=persist)
             if dead2:   # 补试中才暴露的凭证死:还原成异常交标准件归类
                 raise _client.StoreDeadError(store["name"], "401/403(补试)")
             if failed2:
@@ -91,7 +112,16 @@ def run(params: dict) -> str:
     # 订单窗口全量重拉 + 幂等 upsert,缺席店下轮整点自然补上,无需水位避让
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),订单行入库 {total_lines}"
-             + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉")]
+             + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉")
+             + (f";⚠ 下单时间冲突 {len(anomalies)} 条"
+                + ("(修复模式:已按 API 值改写)" if repair
+                   else "(库值保留,来源待查,详见日志)")
+                if anomalies else "")]
+    if anomalies:
+        # 前几条给人看:PO/库值/API 值,一眼能对
+        lines.append("  " + ";".join(
+            f"{a['store']} PO {a['po']}:库 {a['db']:%m/%d %H:%M} / API {a['api']:%m/%d %H:%M}"
+            for a in anomalies[:5]) + (" …" if len(anomalies) > 5 else ""))
     if gate_note:
         lines.append(gate_note)
     if dead:

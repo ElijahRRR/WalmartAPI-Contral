@@ -53,6 +53,9 @@ class _FakeCursor:
 
     def fetchall(self):
         sql, args = self._last
+        # 下单时间写一次守卫的在库比对:假装库里没有(首见行,冲突路径有专门单测)
+        if isinstance(args, dict):
+            return []
         # 烂账过滤的在库查询:假装全部在库(过滤行为有专门单测)
         if "= ANY(" in sql and args:
             return [(x,) for x in args[0]]
@@ -119,11 +122,90 @@ def test_order_sync_end_to_end(monkeypatch):
 
     out = order_sync.run({"days": "7"})
     assert "1/1 店完成" in out and "订单行入库 2" in out
-    kind, sql, rows = calls[0]
-    assert kind == "many" and "orders.order_lines" in sql
+    assert "下单时间冲突" not in out       # 库里没有 = 首见,不是冲突
+    kind, sql, rows = next(c for c in calls if c[0] == "many")
+    assert "orders.order_lines" in sql
     assert {r["sku"] for r in rows} == {"A", "B"}
     # 审核列绝不在 upsert 列内(重拉不得冲掉审核结论)
     assert "audit_status" not in sql
+    # 下单时间写一次:默认模式 upsert 只在库值为空时接受 API 值
+    assert "COALESCE(t.order_date, EXCLUDED.order_date)" in sql
+
+
+def _order_sync_with_conflict(monkeypatch, params):
+    """跑一次 order_sync,库里 PO1/A 已有另一个下单时间 → 返回 (摘要, upsert 收到的 kwargs)。"""
+    from datetime import datetime, timezone
+
+    from workflows import order_sync
+
+    api_ts = 1754300000000
+    db_dt = datetime(2026, 9, 9, 4, 12, tzinfo=timezone.utc)
+
+    def handler(request):
+        return httpx.Response(200, json={"list": {
+            "elements": {"order": [{
+                "purchaseOrderId": "PO1", "orderDate": api_ts,
+                "orderLines": {"orderLine": [
+                    {"lineNumber": "1", "item": {"sku": "A"},
+                     "orderLineQuantity": {"amount": "1"}}]}}]},
+            "meta": {"totalCount": 1}}})
+
+    class _Cur(_FakeCursor):
+        def fetchall(self):
+            sql, args = self._last
+            if isinstance(args, dict):     # 写一次守卫的在库比对:PO1/A 已有另一个值
+                return [(lid, "PO1", "A", db_dt) for lid in args["ids"]]
+            return super().fetchall()
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _Cur(self.store)
+
+    from registry import db
+
+    calls: list = []
+
+    @contextlib.contextmanager
+    def fake_conn():
+        yield _Conn(calls)
+    monkeypatch.setattr(db, "pg_conn", fake_conn)
+    _use(monkeypatch, handler)
+    _fake_stores(monkeypatch, order_sync)
+    monkeypatch.setattr(order_sync.order_center, "push_after",
+                        lambda *a, **k: "订单中心:0 行")
+
+    seen_kwargs: dict = {}
+    real_upsert = ol.upsert_order_lines
+
+    def spy_upsert(conn, rows, **kw):
+        seen_kwargs.update(kw)
+        return real_upsert(conn, rows, **kw)
+    monkeypatch.setattr(order_sync.ol, "upsert_order_lines", spy_upsert)
+    return order_sync.run(params), seen_kwargs, calls
+
+
+def test_order_sync_conflict_is_named_in_first_line_and_db_value_kept(monkeypatch):
+    """所有者定稿 2026-09-02:下单时间是事实,库值不得被静默改写;不一致必须
+    点名进摘要首行(链通知只发首行),默认模式 upsert 走 COALESCE 守卫。"""
+    out, kw, calls = _order_sync_with_conflict(monkeypatch, {"days": "7"})
+    first = out.splitlines()[0]
+    assert "⚠ 下单时间冲突 1 条(库值保留,来源待查,详见日志)" in first
+    assert "T1 PO PO1:库 09/09 04:12 / API 08/04" in out
+    assert kw == {"repair_order_date": False}
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "COALESCE(t.order_date, EXCLUDED.order_date)" in sql
+
+
+def test_order_sync_repair_mode_is_explicit_and_overrides(monkeypatch):
+    """-p repair_order_date=1 才允许 API 值覆盖:摘要标明修复模式,
+    upsert 去掉 COALESCE 守卫改成整列覆盖。"""
+    out, kw, calls = _order_sync_with_conflict(
+        monkeypatch, {"days": "7", "repair_order_date": "1"})
+    assert "⚠ 下单时间冲突 1 条(修复模式:已按 API 值改写)" in out.splitlines()[0]
+    assert kw == {"repair_order_date": True}
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "COALESCE(t.order_date" not in sql
+    assert "order_date = EXCLUDED.order_date" in sql
 
 
 def test_returns_sync_end_to_end(monkeypatch):

@@ -417,3 +417,103 @@ def test_perf_last_seen_at_has_no_judgement_reader():
     assert "still_active" in span
     assert "max(e.period) = m.latest_period" in span
     assert "last_seen_at" not in span, "still_active 开始依赖 last_seen_at 了"
+
+
+# ── 下单时间写一次(所有者定稿 2026-09-02)──────────────────────────────────────
+
+class _ConflictCur:
+    """带 fetchall 的假游标:模拟库里已有行。"""
+    def __init__(self, existing):
+        self.existing, self.calls = existing, []
+
+    def execute(self, sql, args=None):
+        self.calls.append((sql, args))
+
+    def executemany(self, sql, rows):
+        self.calls.append((sql, list(rows)))
+
+    def fetchall(self):
+        return self.existing
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _ConflictConn:
+    def __init__(self, existing):
+        self.cur = _ConflictCur(existing)
+
+    def cursor(self):
+        return self.cur
+
+
+def test_order_date_is_write_once_and_repair_mode_overrides():
+    """下单时间是事实字段:库里已有值,后续拉取一律不覆盖(2026-09-02 事故:
+    一轮 order_sync 把若干行的 order_date 写成别的订单的下单时间)。
+    repair_order_date=True 是显式修复模式,才允许 API 值覆盖。"""
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
+    sql, _ = conn.cur.calls[0]
+    assert "order_date = COALESCE(t.order_date, EXCLUDED.order_date)" in sql
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER),
+                          repair_order_date=True)
+    sql, _ = conn.cur.calls[0]
+    assert "order_date = EXCLUDED.order_date" in sql
+
+
+def test_order_date_conflicts_are_reported_not_silenced(caplog):
+    """API 值与库值不一致必须逐条记 warning 并返回给调用方进摘要——
+    错值来源未明,这是抓证据的口子,不许静默。库空(首见)/相同不算冲突。"""
+    from datetime import datetime, timezone
+    rows = ol.extract_order_lines("T1", _ORDER)
+    lid = rows[0]["order_line_id"]
+    api_od = rows[0]["order_date"]
+    other = datetime(2026, 9, 2, 4, 12, tzinfo=timezone.utc)
+    with caplog.at_level("WARNING"):
+        got = ol.order_date_conflicts(
+            _ConflictConn([(lid, "108000000001", "B0A", other)]), rows)
+    assert got == [{"po": "108000000001", "sku": "B0A", "db": other, "api": api_od}]
+    assert "下单时间冲突" in caplog.text and "108000000001" in caplog.text
+    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", api_od)]), rows) == []
+    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", None)]), rows) == []
+    assert ol.order_date_conflicts(_ConflictConn([]), []) == []
+
+
+def test_future_order_date_is_rejected_with_warning(caplog):
+    """晚于当前时刻的 orderDate 不是下单时间(生产实见 09/09 未来值):拒写留 NULL
+    ——配合写一次守卫不会抹掉库里已有值——并告警。"""
+    order = dict(_ORDER, orderDate=4102444800000)          # 2100-01-01
+    with caplog.at_level("WARNING"):
+        rows = ol.extract_order_lines("T1", order)
+    assert rows[0]["order_date"] is None
+    assert "晚于当前时刻" in caplog.text
+    assert ol.extract_order_lines("T1", _ORDER)[0]["order_date"] is not None
+
+
+def test_order_without_po_is_skipped_not_collapsed_to_literal_none(caplog):
+    """"purchaseOrderId": null 时 dict.get 默认值不生效,str(None) 会造出字面量
+    'None' 当 PO,让所有缺 PO 的订单跨店塌进同一行(对抗审查实证)。
+    没有 PO 的订单没有身份:跳过 + 告警,不入库。"""
+    with caplog.at_level("WARNING"):
+        assert ol.extract_order_lines("T1", dict(_ORDER, purchaseOrderId=None)) == []
+        assert ol.extract_order_lines("T1", dict(_ORDER, purchaseOrderId="")) == []
+    assert "没有 purchaseOrderId" in caplog.text
+    assert "None" not in ol.make_order_line_id("108000000001", "B0A")
+
+
+def test_duplicate_order_line_id_in_one_batch_first_wins_and_warns(caplog):
+    """两张信封给出同一 (PO, SKU):此前 executemany 静默后写覆盖先写、返回值还是
+    塌缩前行数。现在先到者胜(与写一次守卫同向)、告警、返回真实行数。"""
+    a = ol.extract_order_lines("T1", _ORDER)[0]
+    b = dict(a, order_date=None, customer_order_id="OTHER")
+    conn = _FakeConn()
+    with caplog.at_level("WARNING"):
+        n = ol.upsert_order_lines(conn, [a, b])
+    assert n == 1
+    _sql, rows = conn.cur.calls[0]
+    assert len(rows) == 1 and rows[0]["customer_order_id"] == "200000001"
+    assert "出现两个订单对象" in caplog.text

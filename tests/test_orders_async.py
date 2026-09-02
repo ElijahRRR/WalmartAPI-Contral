@@ -1,8 +1,26 @@
 """api/orders async 变体(蓝图 §6.3)回归:多店并发拉取的同步门面。"""
 
 import httpx
+import pytest
 
 from api import _client, orders as orders_api
+
+
+@pytest.fixture(autouse=True)
+def _clean_client_state():
+    """换 token 走的是 _client 的同步连接池(按代理维度缓存 transport),
+    上一个用例装的 MockTransport 会留在池里,本用例的桩根本接不到 /v3/token。"""
+    _client._token_cache.clear()
+    _client._rate_state.clear()
+    for c in _client._client_pool.values():
+        c.close()
+    _client._client_pool.clear()
+    yield
+    for c in _client._client_pool.values():
+        c.close()
+    _client._client_pool.clear()
+    _client._token_cache.clear()
+    _client._rate_state.clear()
 
 
 def _seam(monkeypatch, handler):
@@ -104,3 +122,78 @@ def test_bulk_429_retries_then_succeeds(monkeypatch):
         [_store("T1")], created_start="2026-08-01T00:00:00Z")
     assert not dead and not failed
     assert results[0]["orders"] == 1 and hits["n"] == 2
+
+
+# ── 2026-09-02 下单时间事故后补的三道口子 ──────────────────────────────────────
+
+async def _nosleep(_s):
+    return None
+
+
+def test_bulk_stops_on_repeated_cursor_and_flags_overcount(monkeypatch, caplog):
+    """同 cursor 重复 = 服务端未推进,立即停(照抄 api/returns 三道闸);
+    实拉对象数 > totalCount 是翻页重放/对象重复的指纹,必须响亮。"""
+    calls = []
+
+    def handler(req: httpx.Request):
+        calls.append(str(req.url))
+        return _page([{"purchaseOrderId": "PO1"}], next_cursor="?cursor=same", total=1)
+
+    _seam(monkeypatch, handler)
+    got = {}
+    with caplog.at_level("WARNING"):
+        results, dead, failed = orders_api.fetch_orders_bulk(
+            [_store("T1")], created_start="2026-08-01T00:00:00Z",
+            handler=lambda s, orders: got.setdefault("n", len(orders)))
+    assert len(calls) == 2 and not failed          # 第 2 页 cursor 重复即停
+    assert got["n"] == 2                            # api 层不去重,交 services 先到者胜
+    assert "nextCursor 重复" in caplog.text
+    assert "> 服务端 totalCount 1" in caplog.text
+
+
+def test_async_socks_error_is_retried_not_fatal(monkeypatch):
+    """SOCKS 层异常不在 httpx 异常树上(08-26 事故根因):异步路径此前只接
+    httpx.HTTPError,一次 Malformed reply 直接穿出去。现在与同步路径同口径退避重试。"""
+    from socksio.exceptions import ProtocolError
+    state = {"n": 0}
+
+    def handler(req: httpx.Request):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ProtocolError("Malformed reply")
+        return _page([{"purchaseOrderId": "PO1"}], total=1)
+
+    _seam(monkeypatch, handler)
+    monkeypatch.setattr(orders_api.asyncio, "sleep", _nosleep)
+    results, dead, failed = orders_api.fetch_orders_bulk(
+        [_store("T1")], created_start="2026-08-01T00:00:00Z",
+        handler=lambda s, orders: len(orders))
+    assert not failed and not dead and results[0]["lines"] == 1
+
+
+def test_async_refreshed_token_is_reused_on_next_page(monkeypatch):
+    """401 自愈刷新的 token 此前只活在 _get_async 的形参里,第 2 页起整店拿死 token
+    翻页 → 被误判凭证失效。现在每页从缓存取新 token。"""
+    _client._token_cache.clear()
+    tokens = {"n": 0}
+    seen_tokens = []
+
+    def full(req: httpx.Request):
+        if req.url.path == "/v3/token":
+            tokens["n"] += 1
+            return httpx.Response(200, json={"access_token": f"tok-{tokens['n']}",
+                                             "expires_in": 900})
+        seen_tokens.append(req.headers.get("WM_SEC.ACCESS_TOKEN"))
+        if "cursor=p2" in str(req.url):
+            return _page([{"purchaseOrderId": "PO2"}])
+        if seen_tokens.count("tok-1") == 1 and len(seen_tokens) == 1:
+            return httpx.Response(401, json={})        # 首页第一次:token 死了
+        return _page([{"purchaseOrderId": "PO1"}], next_cursor="?cursor=p2", total=2)
+
+    monkeypatch.setattr(_client, "_build_transport",
+                        lambda proxy: httpx.MockTransport(full))
+    results, dead, failed = orders_api.fetch_orders_bulk(
+        [_store("T1")], created_start="2026-08-01T00:00:00Z",
+        handler=lambda s, orders: len(orders))
+    assert not dead and not failed and results[0]["lines"] == 2
+    assert seen_tokens == ["tok-1", "tok-2", "tok-2"]   # 刷新后第 2 页用的是新 token

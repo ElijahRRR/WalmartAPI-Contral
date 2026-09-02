@@ -126,13 +126,33 @@ def tracking_url(carrier: str, tracking: str) -> str | None:
     return f"https://t.17track.net/en#nums={tracking}"
 
 
+def _order_date_of(order: dict, store_name: str, po: str) -> datetime | None:
+    """输入:订单对象 + 店铺/PO(报错用)→ 输出:下单时间;未来日期拒写返 None 并告警。"""
+    od = _ts(order.get("orderDate"))
+    if od is None:
+        return None
+    limit = datetime.now(timezone.utc).timestamp() + _ORDER_DATE_FUTURE_TOLERANCE_SECS
+    if od.timestamp() > limit:
+        logger.warning("店铺 %s PO %s 的 orderDate=%s 晚于当前时刻,不是下单时间,拒写",
+                       store_name, po, od.isoformat())
+        return None
+    return od
+
+
 def extract_order_lines(store_name: str, order: dict) -> list[dict]:
     """输入:店铺名 + 单个 Walmart 订单 → 输出:order_lines 行 dict 列表。
 
     踩坑(实证):已发货订单不返回 estimated* 字段,est_ship 回退
     trackingInfo.shipDateTime,est_delivery 回退 fulfillment.pickUpDateTime。
     """
-    po = str(order.get("purchaseOrderId", ""))
+    # `or ""`而不是 get 默认值:信封里 "purchaseOrderId": null 时 dict.get 的默认值
+    # 不生效,str(None) 会造出字面量 'None' 当 PO,让所有缺 PO 的订单跨店塌进同一行
+    # (2026-09-02 对抗审查实证)。没有 PO 的订单没有身份,跳过并告警
+    po = str(order.get("purchaseOrderId") or "")
+    if not po:
+        logger.warning("店铺 %s 一张订单没有 purchaseOrderId(customerOrderId=%s),"
+                       "无身份不入库", store_name, order.get("customerOrderId"))
+        return []
     addr = (order.get("shippingInfo") or {}).get("postalAddress") or {}
     phone = (order.get("shippingInfo") or {}).get("phone") or ""
 
@@ -173,7 +193,7 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             # 实证(2026-08-06 生产 raw):时间戳叫 statusDate 且在 orderLine 层,
             # PLAN 文档写的 orderLineStatus.statusSetDate 线上不存在,留作回退
             "status_date": _ts(ol.get("statusDate") or st.get("statusSetDate")),
-            "order_date": _ts(order.get("orderDate")),
+            "order_date": _order_date_of(order, store_name, po),
             "est_ship_date": _ts(fulfil.get("estimatedShipDate") or ti.get("shipDateTime")),
             "est_delivery_date": _ts(fulfil.get("estimatedDeliveryDate")
                                      or fulfil.get("pickUpDateTime")),
@@ -378,6 +398,19 @@ _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
                 "AND coalesce(t.phone, '') !~ '^0*$' "
                 "THEN t.phone ELSE EXCLUDED.phone END")
 
+# 下单时间是**事实字段,写一次就不再动**(所有者定稿 2026-09-02)。
+# 事故:09-02 13:20 一轮 order_sync 把三家店若干行的 order_date 写成了别的订单
+# 的下单时间(一条甚至是未来日期),同一行的 raw/status_date 却是本单自己的;
+# 事后四轮同步/异步对拍 API 返回全部正确稳定,错值来源未明。在来源查清之前,
+# 系统本身不该给任何来源改写这一列的机会——此前它和物流状态一样被 45 天窗口
+# 全量重拉无差别覆盖。API 值与库值不一致由 order_date_conflicts 记日志并进
+# 摘要(不静默),修复已写坏的行走 repair_order_date 显式模式。
+_ORDER_DATE_GUARD = "COALESCE(t.order_date, EXCLUDED.order_date)"
+
+# 未来日期不是下单时间:晚于当前时刻超过这个余量的 orderDate 拒写(留 NULL,
+# 配合写一次守卫不会抹掉库里已有值),并告警
+_ORDER_DATE_FUTURE_TOLERANCE_SECS = 3600
+
 
 def _upsert(conn, table: str, cols: list[str], key_cols: list[str], rows: list[dict],
             skip_update: tuple = (), guards: dict | None = None) -> int:
@@ -448,14 +481,74 @@ _SETTLEMENT_COLS = [
     "original_commission", "commission_saving", "incentive", "settle_date", "raw"]
 
 
-def upsert_order_lines(conn, rows: list[dict]) -> int:
-    """输入:连接 + extract_order_lines 产出 → 输出:写入行数。审核列不在此覆盖。"""
+_ORDER_DATE_EXISTING_SQL = ("SELECT order_line_id, po_id, sku, order_date"
+                            " FROM orders.order_lines"
+                            " WHERE order_line_id = ANY(%(ids)s::text[])")
+
+
+def order_date_conflicts(conn, rows: list[dict]) -> list[dict]:
+    """输入:连接 + 待写行 → 输出:[{po, sku, db, api}] 库里已有下单时间且与 API 不一致的行。
+
+    写一次守卫会把这些行的库值留住;这里把不一致**逐条记 warning** 并交给调用方
+    进摘要——事故(2026-09-02)的来源未明,这是抓证据的口子,不许静默。
+    只比两边都非空的:库空 = 首见,API 空 = 未来日期已被拒写。
+    """
+    ids = [r["order_line_id"] for r in rows if r.get("order_date") is not None]
+    if not ids:
+        return []
+    api_by_id = {r["order_line_id"]: r for r in rows if r.get("order_date") is not None}
+    with conn.cursor() as cur:
+        cur.execute(_ORDER_DATE_EXISTING_SQL, {"ids": ids})
+        existing = cur.fetchall()
+    out: list[dict] = []
+    for lid, po, sku, db_od in existing:
+        api_od = api_by_id[lid]["order_date"]
+        if db_od is None or db_od == api_od:
+            continue
+        out.append({"po": po, "sku": sku, "db": db_od, "api": api_od})
+        logger.warning("PO %s SKU %s 下单时间冲突:库 %s / API %s —— 库值保留,来源待查",
+                       po, sku, db_od.isoformat(), api_od.isoformat())
+    return out
+
+
+def upsert_order_lines(conn, rows: list[dict], *,
+                       repair_order_date: bool = False) -> int:
+    """输入:连接 + extract_order_lines 产出 → 输出:写入行数。审核列不在此覆盖。
+
+    order_date 写一次(_ORDER_DATE_GUARD);repair_order_date=True 是显式修复模式,
+    本次调用允许 API 值覆盖库值(调用方须先跑一遍默认模式看清冲突清单)。
+    """
+    rows = _dedupe_order_lines(rows)
     for r in rows:
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)
+    guards = {"phone": _PHONE_GUARD, "asin": _ASIN_GUARD,
+              "order_date": _ORDER_DATE_GUARD}
+    if repair_order_date:
+        guards.pop("order_date")
     return _upsert(conn, "orders.order_lines", _ORDER_LINE_COLS,
-                   ["order_line_id"], rows,
-                   guards={"phone": _PHONE_GUARD, "asin": _ASIN_GUARD})
+                   ["order_line_id"], rows, guards=guards)
+
+
+def _dedupe_order_lines(rows: list[dict]) -> list[dict]:
+    """输入:一批待写行 → 输出:按 order_line_id 去重后的行(**先到者胜**),重复即告警。
+
+    extract_order_lines 内的撞键告警只看得见同一张订单内部;两张信封给出同一
+    (PO, SKU) 时,此前 executemany 按顺序静默后写覆盖先写,返回值还是塌缩前的
+    行数,摘要看不出少了几行(2026-09-02 对抗审查实证)。先到者胜与写一次守卫
+    同向:库里首见的下单时间是权威。
+    """
+    seen: dict[str, dict] = {}
+    for r in rows:
+        lid = r["order_line_id"]
+        first = seen.get(lid)
+        if first is None:
+            seen[lid] = r
+            continue
+        logger.warning("同批内 PO %s SKU %s 出现两个订单对象(下单时间 %s vs %s),"
+                       "后到的整行丢弃,请核查沃尔玛返回", r.get("po_id"), r.get("sku"),
+                       first.get("order_date"), r.get("order_date"))
+    return list(seen.values())
 
 
 def upsert_return_lines(conn, rows: list[dict]) -> int:

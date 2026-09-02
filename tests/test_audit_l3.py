@@ -355,8 +355,12 @@ def _r4_hit(n=12, code="title_desc_blacklist"):
 
 def test_证据通道_跨三层且按rule_code渲染():
     """⚠ B1 的通道泛化:读 L0/L1/L2 三层的软 hit,按 rule_code 查渲染表 ——
-    与它出自哪一层无关(C 批把品牌扫描迁进 L0 时不用再改这里)。"""
-    p0 = Phase0Result(blocked=False, hits=[
+    与它出自哪一层无关(C 批把品牌扫描迁进 L0 时不用再改这里)。
+
+    ⚠ **L0 的软证据在 `evidence` 槽里**(C 批双输出),不在 `hits`:通道每层
+    读两个槽 —— 只读 `hits` 的话品牌命中一条都送不到 L3,而提示词照样漂亮。
+    """
+    p0 = Phase0Result(blocked=False, evidence=[
         _r4_hit(2, code="phase0_brand_mention")])
     l1 = L1Info(hits=[RuleHit(stage="L1", rule_code="some_new_soft_rule",
                               penalty=0, detail={"reason": "将来某条软规则"})])
@@ -371,6 +375,41 @@ def test_证据通道_跨三层且按rule_code渲染():
     assert brands == ["nike0", "nike1"]
     # 三层都空 ⇒ 明说没有证据(别让 LLM 以为这一段丢了)
     assert audit_l3.summarize_evidence() == ("(上游无证据)", [])
+
+
+def test_证据通道_L0双输出端到端_软证据真的送到了():
+    """⚠ 端到端接线钉子(2026-09-03 C 批):`audit_phase0.check` 产出的软证据
+    要**真的**出现在 L3 的 user 段里。
+
+    这条用真规则跑一遍(不手搓 hit):品牌文案扫描的命中落在
+    `Phase0Result.evidence`,通道读它、渲染成一行、品牌词进「待评估的品牌/
+    商标词」段。漏接的表现不是报错,是提示词里那两段变成"(上游无证据)"——
+    R7/R8 曾经整整两个月一个字都没进提示词,就是这么发生的。
+    """
+    from types import SimpleNamespace
+
+    import ahocorasick
+
+    from services import audit_phase0
+    from services.audit_models import ProductInfo
+
+    ac = ahocorasick.Automaton()
+    ac.add_word("ninja foodi", "ninja foodi")
+    ac.make_automaton()
+    ctx = SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                          brand_blacklist={}, brand_mention_automaton=ac)
+    p0 = audit_phase0.check(
+        ProductInfo(asin="B0EV", title="Ninja Foodi 兼容配件"), ctx)
+    assert p0.blocked is False and p0.hits == []          # 软证据不终止
+    assert [h.rule_code for h in p0.evidence] == ["phase0_brand_mention"]
+
+    txt, brands = audit_l3.summarize_evidence(p0, None, None)
+    assert txt.startswith("* 文案提到黑名单品牌(共1个, 前10): ninja foodi")
+    assert brands == ["ninja foodi"]
+    out = audit_l3.build_user_prompt(_product(title="Ninja Foodi 兼容配件"),
+                                     _l1(), _l2(), phase0=p0)
+    assert "文案提到黑名单品牌" in out
+    assert "ninja foodi" in out.split("# 待评估的品牌/商标词")[1]
 
 
 def test_证据通道_过程留痕不当证据():

@@ -402,7 +402,7 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 
 | rule_code | 送什么 |
 |---|---|
-| **`phase0_brand_mention`(L0,现役唯一一条)** | 前 10 个命中品牌 + 原文片段 |
+| **`phase0_brand_mention`(L0,现役唯一一条;读的是 `Phase0Result.evidence` 槽)** | 前 10 个命中品牌 + 原文片段 |
 | **未登记的任何 rule_code** | `* {rule_code}: {detail 摘要}` —— **不丢** |
 | `audit_reason.NOT_A_REASON` 里的(`pt_dict_fallback` / `unmapped_amazon_path` / `l4_images_partial` / `l4_bad_schema`) | **不送** —— 见下 |
 | 存量老码(`title_desc_blacklist` / `cat_requires_cert*` / `trademark_live` / `content_promotional` / `walmart_strict_sensitive`) | 渲染表**保留**:新链不再产生,但 `audit_why` 与回放读老行时还要认得它们 |

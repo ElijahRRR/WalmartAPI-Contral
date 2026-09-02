@@ -466,8 +466,12 @@ def summarize_evidence(phase0=None, l1=None, l2=None) -> tuple[str, list[str]]:
     看到的是同一个顺序)。
 
     ⚠ 2026-09-02 B1 起通道**跨三层**(原 `summarize_l2_for_l3` 只读 L2):
-    C 批把品牌文案扫描迁进 L0 之后,证据源就在 L0;通道现在按 rule_code 查
-    渲染表,与它出自哪一层无关,迁层不用再改这里。
+    C 批把品牌文案扫描迁进 L0 之后,证据源就在 L0;通道按 rule_code 查渲染表,
+    与它出自哪一层无关。
+    ⚠ **每层读两个槽**:`hits` 与 `evidence`。L0 的双输出(C 批)把软证据放在
+    `Phase0Result.evidence` 里 —— 只读 `hits` 的话,品牌命中一条都送不到 L3,
+    而提示词照样漂亮、没有任何东西会红(「承诺了没送到」的第二次)。L1/L2 没有
+    `evidence` 槽,`getattr` 取空,行为不变。
     ⚠ **未登记的 rule_code 不丢**,按通用形态打一行:漏掉一条软证据不会报错,
     只会让 L3 少看一样东西 —— 那正是"承诺了没送到"的老毛病(R7/R8 曾经
     整整两个月一个字都没进提示词)。
@@ -480,7 +484,8 @@ def summarize_evidence(phase0=None, l1=None, l2=None) -> tuple[str, list[str]]:
     lines: list[str] = []
     brands: list[str] = []
     for res in (phase0, l1, l2):
-        for h in (getattr(res, "hits", None) or ()):
+        for h in [*(getattr(res, "hits", None) or ()),
+                  *(getattr(res, "evidence", None) or ())]:
             if h.penalty != 0 or h.rule_code in audit_reason.NOT_A_REASON:
                 continue
             render = _EVIDENCE_LINES.get(h.rule_code)

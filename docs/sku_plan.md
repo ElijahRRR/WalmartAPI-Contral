@@ -264,7 +264,7 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
    每次重上抽新码会让 `claim` 把旧 item 已占的 UPC 发给新 SKU ⇒ 必撞
    ERR_EXT_DATA_0101119 ⇒ 每次重上白烧一个号,而且看起来像"运气差"。
 
-### 5.3 生命周期规则(工作流三方案评审 + 对抗验证,20 票中 19 票未被驳)
+### 5.3 生命周期规则(工作流三方案评审 + 对抗验证:8 条支撑断言 5 条站住、3 条被驳,已按驳回改稿)
 
 **码的寿命 = 沃尔玛侧那条 (店, SKU) 记录对我们还有用的寿命,不是上架/下架次数。**
 
@@ -290,15 +290,22 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
   守门测试反向钉死:product_clear / problem_product_cleanup / maintenance /
   catalog_sync.mark_missing / feed_track 不得调用 abandon。
 - **mint(store, source_type, source_key)**:先查活行 ⇒ 复用同一码(UPC 池 claim
-  按 (店, ASIN) 复用原号)⇒ 同码同 UPC 重发 MP_ITEM(载荷本就带 2028 年 endDate,
-  对沃尔玛 = 同一记录的再提交 / 官方 unretire 语义);无活行 ⇒ 抽码 + 全局查重 +
-  INSERT(同函数同事务),新码必配新 UPC。dry-run 用占位码不写库。
+  按 (店, ASIN) 复用原号);无活行 ⇒ 抽码 + 全局查重 + INSERT(同函数同事务),
+  新码必配新 UPC。dry-run 用占位码不写库。**复用的理由是"一个 Product ID 只能挂
+  一个 SKU"这条官方约束**(抽新码必撞),不是"同码重发能复活"——后者官方无
+  明文,对抗验证 3/3 驳回:官方 reactivate 全走更新通道(Seller Center 改 Site
+  End Date / MP_MAINTENANCE 最小载荷改 endDate,旧仓反补实证形态),MP_ITEM
+  载荷里的 2028 endDate 只是格式实证留下的遗留常量。缺席/退役后同码重发 MP_ITEM
+  到底是复活、被拒还是新建,**批次 2 前单品实测**(§8);显式"恢复"动作若要做,
+  走 MP_MAINTENANCE `{sku, productIdentifiers, endDate}`,不走 MP_ITEM。
 - **本店去重闸** `_SQL_LISTED_ASINS` 改为 walmart_items LEFT JOIN 登记簿,
   `missing_since IS NULL AND abandoned_at IS NULL`,键 `coalesce(source_key, sku)`;
   **不加 lifecycle 条件**——RETIRED 行只要码未弃就拦,退市档案不由 list_new 复活
-  (2026-08-28 定稿;alloc_push 排 RETIRED + mint 复用 + endDate 2028 = 对 7,342
-  行退市档案批量走官方复活通道,plan.md:166 事故重演)。`alloc_push._SQL_ONLINE`
-  对齐同一口径(**决策 C**)。
+  (2026-08-28 定稿:退市档案不许被自动链批量复活,plan.md:166)。
+  `alloc_push._SQL_ONLINE` 排 RETIRED 的口径与去重闸不一致,但对抗验证指出派工
+  去重键是**全表 ASIN 单列、不带店铺**(`append_assignments`),表里出现过的 ASIN
+  不会被重复写入,所以不一致的实际后果只是"新 ASIN 被派、list_new 拦"——
+  **决策 C** 降为建议对齐、非阻塞;派工去重不带店铺是既有口径差,另记。
 - **护栏跟码走**:`_SQL_ATTEMPTS` 改按 (店, ASIN) 经登记簿 JOIN、按代际计(只数
   最近一次弃码之后的提交;无弃码事件则跨码累计);**代际上限**:同 (store,
   source_type, source_key) 弃码行数 ≥ 3 ⇒ list_new 写 N「换码次数达上限,待人工」;
@@ -315,7 +322,7 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
 | 之前发生了什么 | 再上架时 | 依据 |
 |---|---|---|
 | 库存归零 / 被 unpublish | 不是"再上架":item 在架,恢复 = 推库存/修条件;去重闸拦 | 沃尔玛侧记录、码、UPC 全在 |
-| 沃尔玛侧缺席(missing_since) | **复用**同码同 UPC(24h 冷却闸后) | 抽新码撞 Product ID |
+| 沃尔玛侧缺席(missing_since) | **复用**同码同 UPC(24h 冷却闸后);沃尔玛怎么处理这次重发待实测 | 抽新码撞 Product ID |
 | product_clear 停用(RETIRE) | 记录仍被扫到 ⇒ 去重闸拦(恢复走显式动作);从响应集消失 ⇒ 按缺席复用 | 退市档案不由 list_new 复活 |
 | 提交失败 / 被拒 / Unknown | **复用**,重试上限 3 次照旧 | 三条护栏 |
 | DELETE 经观测核验 | **新码 + 新 UPC** | 沃尔玛侧无物可复活 |
@@ -324,6 +331,15 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
 | 改码 SkuUpdate 后 | 不是再上架;旧串永不复用 | 一个 Product ID 只挂一个 SKU |
 
 ### 5.5 调研顺带发现的现状问题(与编码无关,要所有者定)
+
+- **`SITE_END_DATE = "2028-12-31"` 是写死的日历日**(mp_mapper.py:32,注释自称
+  "旧值"),全仓没有任何守门断言它相对提交时刻在未来;2028-12-31 之后同一段代码
+  发出的就是过去的 endDate = 上架即退役。另立待办:改为"提交时刻 + N 年"并加
+  守门测试。
+- **维护类 feed 回执只有 `problem_product_cleanup` 来源才记事件**
+  (`receipt_in_ledger`):stockzero / 维护链清零的回执不进病历,与"清零不入病历"
+  口径一致,但意味着 24h 冷却闸只能依赖 `retire_feed_success`(kind=retire 恒记),
+  不能依赖维护类回执。
 
 `problem_scan` 的扫描面是"一切非 PUBLISHED 且未缺席",没有 lifecycle 豁免;退役
 item 的观测形态正是 UNPUBLISHED +「end date has passed」。所以 product_clear
@@ -434,12 +450,14 @@ order_line_id"的体检告警兜住。
 - [ ] **决策 B|撞库 0101119 时码与 UPC 一起换**(推荐换):改变 08-09「撞库只是
       UPC 被占、照常领新号重试」的机制;不换有重演 SKU_LOCKED 死循环的风险,换最坏
       只是多耗一个免费的码。
-- [ ] **决策 C|alloc_push 派工口径对齐去重闸**(推荐对齐):退市且未弃码的 ASIN
-      从「该派工」变「等 delete_verified 后派工」;不对齐则分配链派、list_new 每轮拦。
+- [ ] **决策 C|alloc_push 派工口径对齐去重闸**(建议对齐,非阻塞):退市且未弃码
+      的 ASIN 从「该派工」变「等 delete_verified 后派工」;不对齐则新 ASIN 被派、
+      list_new 每轮拦并写理由(派工去重键是全表 ASIN,已在表里的不会重复写入)。
 - [ ] **批次 2 前单品实测**(所有者机器):停用后该 SKU 在 GET items 里是缺席还是
-      RETIRED 可见;同码同 UPC 重发能否复活同一 item(官方与六家第三方都说能,本仓
-      与旧仓无一条实测);RETIRE_ITEM feed 是否仍被受理;人为制造 0101119 看码与
-      UPC 同换、代际上限生效。
+      RETIRED 可见;缺席/退役后同码同 UPC 重发 MP_ITEM 是复活同一 item、被拒还是
+      新建(官方无明文,本仓与旧仓无一条实测);MP_MAINTENANCE 最小载荷改 endDate
+      能否单独复活;RETIRE_ITEM feed 是否仍被受理;人为制造 0101119 看码与 UPC
+      同换、代际上限生效。
 - [ ] **§4 三件事单品实测**(所有者机器):`grep -rl SkuUpdate` 定 feed 类型与
       最小载荷;改码后库存/价格/item_id 是否保留;旧串能否复用。
 - [ ] **跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。

@@ -108,6 +108,38 @@ def test_burn_for_retire_marks_conflict():
     assert upc_pool.burn_for_retire(conn, []) == 0
 
 
+def test_burn_statuses_are_registered_in_schema_and_labels():
+    """主动烧号有**独立状态值**,不复用语义为「撞库」的 conflict。
+
+    复用的话,UPC 池表投影与 pool_stats 里永远分不清"这号是撞库废的"还是
+    "我们弃码时主动烧的" —— 两者的处置完全不同(前者要查是谁先占了号)。
+    三处口径必须齐:常量 / 表格文案 / schema.sql 的状态机注释。
+    """
+    import pathlib as _p
+    assert upc_pool.BURN_DELETE == "burned_delete"
+    assert upc_pool.BURN_LOCK == "burned_lock"
+    assert upc_pool.STATUS_CN[upc_pool.BURN_DELETE] == "删除烧号"
+    assert upc_pool.STATUS_CN[upc_pool.BURN_LOCK] == "锁死烧号"
+    assert upc_pool.STATUS_CN["conflict"] == "冲突"          # 撞库的语义没被挪用
+    schema = _p.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    pool = schema[schema.index("CREATE TABLE IF NOT EXISTS catalog.upc_pool"):]
+    assert "burned_delete/burned_lock" in pool.splitlines()[2]   # status 行内注释
+    for v in ("burned_delete", "burned_lock"):
+        assert v in schema
+
+
+def test_claim_reuse_ignores_burned_rows():
+    """领号的原号复用是**白名单** status IN ('claimed','used') —— 烧掉的号
+    天然被排除,不需要为新状态值再补一条排除条件(补了就是第二处口径)。"""
+    conn = _Conn(fetch=[("000000000024",)])
+    upc_pool.claim(conn, [{"store": "T1", "asin": "B0X"}])
+    reuse_sql = conn.sqls[0][0]
+    assert "status IN ('claimed', 'used')" in reuse_sql
+    for burned in (upc_pool.BURN_DELETE, upc_pool.BURN_LOCK):
+        assert burned not in reuse_sql
+    assert "status = ''" in conn.sqls[1][0]                  # 新号只从未用态里领
+
+
 def test_release_only_three_reasons():
     conn = _Conn()
     assert upc_pool.release(conn, ["u1"], "not_found") == 1

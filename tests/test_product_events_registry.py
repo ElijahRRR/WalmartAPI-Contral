@@ -55,6 +55,10 @@ def test_constants_match_ledger_strings():
     assert pe.DELETE_VERIFIED == "delete_verified"
     assert pe.DELETE_NOT_EFFECTIVE == "delete_not_effective"
     assert pe.ITEM_MISSING == "item_missing"
+    # 码级事件(SKU 改造批次 0a 登记,写入点 services/sku_codec.abandon 在批次 2)
+    assert pe.SKU_ABANDONED == "sku_abandoned"
+    assert pe.SKU_REPLACED == "sku_replaced"
+    assert {pe.SKU_ABANDONED, pe.SKU_REPLACED} <= pe.EVENTS
 
 
 def test_no_stray_event_literals_in_emitters():

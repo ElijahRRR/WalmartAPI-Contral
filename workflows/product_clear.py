@@ -19,6 +19,11 @@
 
 动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复);
 删除或 **C 列留空 → DELETE_ITEM**(永久,仅自发货)。提交走 api/feeds 唯一通道
+⚠「可恢复」在本系统里目前只是一个**窗口**(2026-09-02 记):problem_scan 的扫描面
+是 published_status 非 PUBLISHED 且 missing_since IS NULL、**无 lifecycle 豁免**,
+在途只挡 48h,而退市档案的观测形态正是 UNPUBLISHED + end date has passed ⇒ 停用的品
+一到两轮就会被自动链建议 DELETE。要让停用真正可恢复,须给 problem_scan 加豁免
+(SKU 改造决策 A,尚未拍板;默认值 = RETIRE 不弃码、豁免另议,即本注所述情形)。
 
 单店单日上限:优先读上下架限额表(registry.RETIRE_LIMITS,按店铺分行,
 「下架限制」列);店铺不在表内退 -p limit 默认值并**告警**(旧系统静默兜底

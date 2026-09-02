@@ -1,5 +1,10 @@
 """SKU → ASIN 清洗规则(**唯一出处**,Python 单实现,批量清洗也走这里)。
 
+⚠ 2026-09-02(SKU 改造批次 0a)起,身份有**两条腿**:登记簿 catalog.listing_sources
+里 source_type='amz' 行的 source_key 是权威身份键,模式提取(extract_asin)只为存量
+兜底。两条腿的优先级与形态闸收在本模块的 `pick_asin` 里(**唯一出处**),批量反查
+是 `resolve_many` / 单条壳 `resolve`,三个入口的分工见文件末尾那一段。
+
 沃尔玛侧 sku 是订货号,与产品源头侧 asin **不保证相等**(所有者给样
 2026-08-11,推翻了"sku=asin"的全局约定;跟卖行早已是已知例外):
 
@@ -108,3 +113,64 @@ def samples(skus: list[str], buckets: dict) -> dict:
     """
     return {k: [s for s in skus if classify(s) == k][:5]
             for k in ("numeric", "other") if buckets.get(k)}
+
+
+# ── 登记簿那一跳(SKU 改造批次 0a,2026-09-02)────────────────────────────────
+# 三个入口的分工(**别在旁边另起第四条**):
+#   · pick_asin(source_key, sku)  纯函数,一对一;五个调用点共用的优先级规则,
+#     谁也别再各写一遍 `key or extract_asin(sku)`。
+#   · resolve_many(conn, pairs)   services 内部的**有界批量反查**(几十~几百对)。
+#   · resolve(conn, store, sku)   单条薄壳,内部就是 resolve_many。
+# ⚠ **全表级取数一律在 SQL 里 LEFT JOIN 登记簿再取 coalesce(ls.source_key, w.sku)**,
+#   不要拿十万对 (store, sku) 去 unnest —— 那是把一次 JOIN 换成一次巨型数组传参。
+# ⚠ 批次 0b 若要给清洗工作流做 resolve_pairs(含纯数字倒查那一跳),必须**建在
+#   resolve_many 之上**,不许在旁边另起一条批量入口(conventions §六单路径)。
+
+#: 登记簿只按 (store, sku) 反查 amz 身份键。**不按 abandoned_at 过滤**:旧码
+#: 带着订单/售后回来时必须还查得到(消费方契约,sku_plan §5.3)。
+_REG_SQL = """
+SELECT store, sku, source_key FROM catalog.listing_sources
+JOIN unnest(%s::text[], %s::text[]) AS t(s, k) ON store = t.s AND sku = t.k
+WHERE source_type = 'amz' AND source_key IS NOT NULL
+"""
+
+
+def pick_asin(source_key, sku) -> str | None:
+    """输入:登记簿 amz 行的 source_key(可空)+ sku → 输出:ASIN(登记簿优先但
+    要过形态闸,两条腿都提不出返 None)。
+
+    **登记簿只是优先级,不是免检通道**:source_key 是运营在上架表里手填、由
+    list_new 原样落库的(读表只 strip 不 upper),裸取会把一个小写 ASIN 变成
+    下游集合里的垃圾键 —— 而真 ASIN 仍然缺席,于是"已在架"被判成"不在架",
+    已上架的品被重新派工。故这条腿与 extract_asin 同口径:先归一(strip+upper)
+    再过裸 ASIN 形态闸,不过就落回模式提取。
+    """
+    k = str(source_key or "").strip().upper()
+    if k and is_standard_asin(k):
+        return k
+    return extract_asin(sku)
+
+
+def resolve_many(conn, pairs) -> dict:
+    """输入:连接 + [(store, sku)] → 输出:{(store, sku): asin}(有界批量反查)。
+
+    一条 SQL 取登记簿键,逐对过 `pick_asin`;**提不出的不进映射**(与
+    resolve_skus 同纪律:调用方留 NULL,绝不猜)。纯读,不改任何行。
+    """
+    want = [(str(st), str(sk)) for st, sk in pairs]
+    if not want:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(_REG_SQL, ([p[0] for p in want], [p[1] for p in want]))
+        keys = {(st, sk): key for st, sk, key in cur.fetchall()}
+    out = {}
+    for pair in want:
+        a = pick_asin(keys.get(pair), pair[1])
+        if a:
+            out[pair] = a
+    return out
+
+
+def resolve(conn, store, sku) -> str | None:
+    """输入:连接 + 店铺 + sku → 输出:ASIN(提不出返 None)。resolve_many 的单条壳。"""
+    return resolve_many(conn, [(store, sku)]).get((str(store), str(sku)))

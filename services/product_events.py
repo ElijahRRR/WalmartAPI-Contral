@@ -107,6 +107,14 @@ DELETE_NOT_EFFECTIVE = "delete_not_effective"
 PRODUCT_INGESTED = "product_ingested"
 AUDIT_PASSED = "audit_passed"
 AUDIT_REJECTED = "audit_rejected"
+# 码级事件(SKU 改造批次 0a 登记;写入点是 services/sku_codec.abandon,批次 2 接线)。
+# 提前登记零副作用:EVENTS 只是 record_many 的入参校验白名单,不登记就会在批次 2
+# 当场抛 ValueError。detail 结构约定(**必须带 source_key** —— 不透明码在 asin
+# 列里提不出来,list_new 的代际过滤读的是 detail->>'source_key'):
+#   sku_abandoned:{old_sku, reason, source_type, source_key, burned_upcs}
+#   sku_replaced :{old_sku, new_sku, reason, source_type, source_key, burned_upcs}
+SKU_ABANDONED = "sku_abandoned"
+SKU_REPLACED = "sku_replaced"
 
 # 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
 # record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。
@@ -116,6 +124,7 @@ EVENTS = frozenset({
     MATCH_SUBMITTED, LIST_SUBMITTED, PROBLEM_CATEGORIZED,
     DELETE_VERIFIED, DELETE_NOT_EFFECTIVE,
     PRODUCT_INGESTED, AUDIT_PASSED, AUDIT_REJECTED,
+    SKU_ABANDONED, SKU_REPLACED,
 } | {f"{k}_feed_{st}" for k in _FEED_KIND.values()
      for st in ("success", "failed")})
 

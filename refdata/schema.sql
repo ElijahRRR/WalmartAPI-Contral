@@ -210,6 +210,12 @@ ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
 -- 各有身份。谁上架谁登记;自动化按出身路由(路由铁律:由"源数据缺失"驱动的
 -- 自动破坏动作必须限定 source_type 匹配,unknown 一律不自动动),
 -- 手动通道(product_clear 表等)不受限全格式通吃。调整=UPDATE 一行数据。
+-- 弃码三列(2026-09-02,SKU 改造批次 0a):列名故意用 abandoned 不用 retired ——
+-- 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义。
+-- 行**永不 DELETE**(旧码带着订单/售后回来必须还查得到);abandoned_at /
+-- abandoned_reason / replaced_by 三列只准由 services/sku_codec 写(abandon;
+-- 批次 3 的 mint_replacement),本表的 INSERT 只有 services/listing_sources.register
+-- 与 services/sku_codec.mint 两个合法出口(守门 tests/test_sku_guard.py)。
 CREATE TABLE IF NOT EXISTS catalog.listing_sources (
     store       text NOT NULL,
     sku         text NOT NULL,
@@ -225,12 +231,44 @@ CREATE TABLE IF NOT EXISTS catalog.listing_sources (
 -- 局部条件 source_key IS NOT NULL 是因为 self/自建行这一列本来就空(索引更小)。
 CREATE INDEX IF NOT EXISTS listing_sources_key_idx
     ON catalog.listing_sources (source_key) WHERE source_key IS NOT NULL;
+-- 弃码三列(SKU 改造批次 0a):全部可空无默认;写侧接线在批次 2,落地时全库为 NULL。
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_at     timestamptz;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_reason text;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaced_by      text;
+-- 全局 sku 唯一:**只对不透明新码生效**。存量 sku=asin 跨店重复是既成事实,
+-- 无条件唯一在存量上一定建不起来,而 db_init 是把整份 schema.sql 一次 execute
+-- (workflows/db_init.py),一条索引建失败整份回滚 ⇒ 生产建库直接停摆。
+-- 字符类必须与 services.sku_codec._ALPHABET 逐字一致(守门测试钉住);末尾
+-- sku ~ '[A-Z]' 与 sku_codec.is_opaque 的「至少一个字母」同口径,防 12 位纯数字
+-- 沃尔玛 item id 混进「新码」索引。⚠ 名字与条件由批次 0a 定死,后续批次一律引用、
+-- 不许 DROP/CREATE。
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_opaque_sku_uidx
+    ON catalog.listing_sources (sku)
+    WHERE sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]';
+-- 活码键唯一:拦并发双 mint。同样只对新码生效 —— 存量 match 行同一 GTIN 可能挂过
+-- 多个人工号,存量 amz 行也可能因旧回填截断撞键;mint 只 INSERT 不透明码,限定形态
+-- 后对 mint 的保护是完整的。**replaced_by IS NULL 本批就带上**(该列全库 NULL,
+-- 谓词恒真,零行为变化),这样批次 3 一条索引都不必重建,只核验 indexdef。
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_live_uidx
+    ON catalog.listing_sources (store, source_type, source_key)
+    WHERE abandoned_at IS NULL AND replaced_by IS NULL AND source_key IS NOT NULL
+      AND sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]';
+-- mint 的复用查询用(要能看见**存量活行**,故不限形态);局部条件与
+-- services/sku_codec.mint 的 WHERE 逐字对齐,不对齐 = 用不上索引。
+CREATE INDEX IF NOT EXISTS listing_sources_live_key_idx
+    ON catalog.listing_sources (store, source_type, source_key)
+    WHERE abandoned_at IS NULL AND replaced_by IS NULL;
 -- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
 -- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
+-- ⚠ 本处判型与 workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串
+-- 匹配的裸 ASIN 形态),改一处必须同步另一处(conventions §六:一个能力一条实现路径)。
+-- ⚠ 右锚是硬要求:缺右锚会把 B0XXXXXXXX-2 这类「重上后缀」SKU 判成 amz 并把
+-- source_key 截成前 10 位,身份键与 SKU 从此不等 —— 而这批行会因此第一次进入
+-- 维护链/审核链的**删除意图产出面**(2026-09-02 批次 0a 修的存量双轨)。
 INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workflow)
 SELECT store, sku,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN 'amz' ELSE 'unknown' END,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN left(sku, 10) END,
+       CASE WHEN sku ~ '^B0[A-Z0-9]{8}$' THEN 'amz' ELSE 'unknown' END,
+       CASE WHEN sku ~ '^B0[A-Z0-9]{8}$' THEN sku END,
        'backfill'
 FROM catalog.walmart_items
 ON CONFLICT (store, sku) DO NOTHING;
@@ -241,9 +279,14 @@ ON CONFLICT (store, sku) DO NOTHING;
 --   ''(未用)→ claimed(已领:分配未提交)→ used(已用:feed 已提交,永久消耗)
 --   回收仅三类(提交前失败/双确认未达/4xx 被拒)claimed→'';Unknown 永不回收
 --   conflict(全站已存在)/bad_prefix(首位非 016789 白名单)永久弃用
+--   burned_delete(DELETE 经观测核验后弃码同时烧号)/ burned_lock(SKU_LOCKED
+--   自愈退役后烧号)—— 2026-09-02 SKU 改造批次 0a 登记。与 conflict 的分工:
+--   **conflict 只表示「全站已存在该 UPC」(撞库)**,主动烧号不再复用这个语义,
+--   否则池表投影与 pool_stats 里永远分不清「这号是撞库废的」还是「我们烧的」。
+--   写入点在批次 2 随 sku_codec.abandon 接线一起改(0a 只登记取值,不改写入)。
 CREATE TABLE IF NOT EXISTS catalog.upc_pool (
     upc         text PRIMARY KEY,           -- 规范化 12 位(zfill 补前导零)
-    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix
+    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix/burned_delete/burned_lock
     asin        text,                       -- 领用归属
     store       text,
     sku         text,                       -- 已用时的沃尔玛 SKU
@@ -524,7 +567,14 @@ CREATE VIEW catalog.audit_listing_conflicts AS
       SELECT w.store, w.sku, w.published_status, w.last_seen_at,
              p.asin, p.audit_status, p.audit_reason, p.audited_at, p.audit_version
       FROM catalog.walmart_items w
-      JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
+      -- 身份键收口(2026-09-02 批次 0a):SKU 不再恒等 ASIN,amz 行的身份在登记簿。
+      -- 保留 source_type='amz':match 行的 source_key 是 GTIN,拿它去撞 products.asin
+      -- 是语义更弱的写法。存量下 amz 行 source_key = sku、未登记/非 amz 行回落
+      -- w.sku ⇒ 逐行同集合。
+      LEFT JOIN catalog.listing_sources ls
+             ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+      JOIN catalog.products p ON p.asin = coalesce(ls.source_key, w.sku)
+                            AND p.marketplace = 'US'
       WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
         AND p.audit_status = 'rejected'
   )

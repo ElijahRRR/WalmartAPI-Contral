@@ -102,6 +102,20 @@ def feishu_notify_to() -> str | None:
 # 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
 AMZ_CUSTOM_FLAG_KEY = "is_customized"
 
+# SKU 身份|来源字母登记(所有者定稿 2026-09-02;sku_plan §2)。
+# ① 这里登记的是**所有者要拍的取值**(source_type → 12 位不透明码的首位字母),
+#    属外部配置,按铁律 3 收在 registry;工作流按自己的 source_type 查表,没人手填。
+# ② **编码规则本身不在 registry**:字母表 / 长度 / 随机段长 / 重抽次数 / 占位码 /
+#    is_opaque 判据的唯一之家是 services/sku_codec.py(批次 0a 决策 E:铁律 3 管的是
+#    路径/token/表 ID/服务器地址这类外部资源,12 位码的字母表是内部编码规则)。
+#    registry 不许再抄一份 —— 抄一份就配出两条互斥的守门断言
+#    (tests/test_sku_guard.py::test_the_opaque_alphabet_is_born_only_in_sku_codec 会红)。
+# ③ 字母必须来自 sku_codec._ALPHABET、互不相同、**不助记**(码不许把货源写在脸上;
+#    分隔符同理不用)。跟卖的 B 与 ASIN 的 `B0`+10 位形态不冲突:新码恒 12 位。
+SKU_SOURCE_LETTERS: dict[str, str] = {
+    "amz": "A", "match": "B", "1688": "C", "self": "H",
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
 # ══════════════════════════════════════════════════════════════════════════════

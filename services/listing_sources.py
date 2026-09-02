@@ -12,6 +12,17 @@ title provider 做实时必须带上这条(services/maintenance_intents.py 契�
 
 调整成本:出身是数据不是代码——改归类 = UPDATE 一行;新增来源 = 新
 source_type 取值 + 对应 provider,管道零改动。
+
+消费方契约(SKU 改造批次 0a,2026-09-02):
+  ① 本模块的 `register` 只负责**首次登记**(存量 backfill 与跟卖 B 列人工号);
+     **自动抽码一律走 services/sku_codec.mint** —— 抽码与登记必须同一函数同一
+     事务,不存在"抽了没登记"。
+  ② `abandoned_at` / `abandoned_reason` / `replaced_by` 三列**只准由
+     services/sku_codec 写**(0a 的 abandon;批次 3 的改码替换),本模块与任何
+     工作流都不得 UPDATE 它们。
+  ③ 本表的 INSERT 只有**两个**合法出口:本模块的 register 与 sku_codec.mint
+     家族。新增第三个即违规(conventions §六:一个能力一条实现路径),守门
+     tests/test_sku_guard.py 全仓扫本表的 INSERT / UPDATE 语句钉死 ② 与 ③。
 """
 
 import logging

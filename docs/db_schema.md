@@ -168,22 +168,61 @@ CREATE TABLE catalog.listing_sources (
     source_type text NOT NULL,       -- amz / match / self / 1688 / unknown
     source_key  text,                -- amz=asin;match=匹配GTIN;1688=offer_id
     workflow    text,                -- 登记来源(backfill=格式回填)
-    created_at  timestamptz
+    created_at  timestamptz,
+    abandoned_at     timestamptz,    -- 弃码时刻;NULL = 活码(2026-09-02 批次 0a)
+    abandoned_reason text,           -- delete_verified/sku_locked/upc_conflict/sku_update
+    replaced_by      text            -- 改码后的新 SKU(批次 3 的 SkuUpdate 写)
 );
 -- listing_sources_key_idx (source_key) WHERE source_key IS NOT NULL
 -- (2026-08-30 补):主键是 (store, sku),按 source_key 反查"这个 ASIN 被哪些店
 -- 登记过"用不上它,原本全表扫。风险追溯 services/risk_trace ②号证据源要按
 -- ASIN 反查,故补;局部条件是因为 self/自建行这一列本就空(索引更小)。
+--
+-- 弃码三列 + 三条索引(2026-09-02,SKU 改造批次 0a 唯一交付;**名字与条件本批
+-- 定死,后续批次一律引用、不许 DROP/CREATE**):
+-- listing_sources_opaque_sku_uidx UNIQUE (sku)
+--   WHERE sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]'
+--   全局 sku 唯一,**只对 12 位不透明新码生效**:存量 sku=asin 跨店重复是既成
+--   事实,无条件唯一在存量上建不起来,而 db_init 一次 execute 整份 schema.sql,
+--   一条索引失败整份回滚。字符类与 services.sku_codec._ALPHABET 逐字一致,
+--   末段 sku ~ '[A-Z]' 与 is_opaque 的「至少一个字母」同口径(防 12 位纯数字
+--   沃尔玛 item id 混进来);守门 tests/test_sku_guard.py 钉住两者一致。
+-- listing_sources_live_uidx UNIQUE (store, source_type, source_key)
+--   WHERE abandoned_at IS NULL AND replaced_by IS NULL AND source_key IS NOT NULL
+--     AND sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]'
+--   活码键唯一,拦并发双 mint;同样只对新码生效(存量同 GTIN 多个人工号、
+--   存量 amz 行旧回填截断都可能撞键)。**replaced_by IS NULL 批次 0a 就带上**
+--   (该列彼时全库 NULL,谓词恒真、零行为变化),批次 3 因此不必重建索引。
+-- listing_sources_live_key_idx (store, source_type, source_key)
+--   WHERE abandoned_at IS NULL AND replaced_by IS NULL
+--   给 sku_codec.mint 的复用查询用(要看得见**存量活行**,故不限形态);
+--   局部条件与 mint 的 WHERE 逐字对齐,不对齐 = 用不上索引。
+--
+-- 纪律两条:① abandoned_at / abandoned_reason / replaced_by 三列**只由
+-- services/sku_codec 写**(abandon;批次 3 的改码替换),其它模块与工作流一律
+-- 不得 UPDATE;行**永不 DELETE**(旧码带着订单/售后回来必须还查得到)。
+-- ② 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义,
+-- 列名故意用 abandoned 不用 retired。
+-- 存量回填的判型正则(schema.sql 的 INSERT ... SELECT)与
+-- workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串匹配、右锚),
+-- 改一处必须同步另一处;缺右锚会把 B0XXXXXXXX-2 这类 SKU 判成 amz 并把
+-- source_key 截成前 10 位,那批行会因此第一次进入删除意图产出面(2026-09-02 修)。
 ```
 
 ```sql
 -- UPC 池(L2a,2026-08-07 定稿):PG 权威,飞书「UPC池」表=注入口+投影
 -- 领号=单事务 FOR UPDATE SKIP LOCKED(旧三层并发补丁消灭);状态机:
 -- ''未用→claimed已领→used已用;回收仅三类(提交前失败/双确认未达/4xx),
--- Unknown 永不回收;conflict/bad_prefix(首位非 016789)永久弃用
+-- Unknown 永不回收;conflict/bad_prefix(首位非 016789)永久弃用;
+-- burned_delete / burned_lock(2026-09-02 批次 0a 登记)= **主动烧号**:码与 UPC
+-- 同寿命,弃码时连号一起烧(delete=DELETE 经观测核验,lock=SKU_LOCKED 自愈退役)。
+-- 与 conflict 的分工:conflict **只表示撞库**(全站已存在该 UPC),烧号不再复用
+-- 这个语义,否则池表投影与 pool_stats 里分不清"撞库废的"与"我们烧的"。
+-- 写入点在批次 2 随 services/sku_codec.abandon 接线一起改(0a 只登记取值)。
 CREATE TABLE catalog.upc_pool (
     upc text PRIMARY KEY,            -- 规范化 12 位
     status text NOT NULL DEFAULT '', -- ''/claimed/used/conflict/bad_prefix
+                                     -- /burned_delete/burned_lock
     asin text, store text, sku text,
     put_date text,                   -- 运营注入日期(表格 B 列原样)
     claimed_at / used_at / created_at timestamptz

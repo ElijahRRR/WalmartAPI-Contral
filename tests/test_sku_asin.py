@@ -132,3 +132,103 @@ def test_samples_only_reports_the_buckets_a_human_has_to_look_at():
     assert got["other"] == ["怪A", "怪B"]
     # 桶为空就不出现(摘要里不印一行空样本)
     assert sa.samples(["B0GXX75JN5"], {"asin": 1}) == {}
+
+
+# ── 登记簿那一跳(SKU 改造批次 0a)────────────────────────────────────────────
+#
+# 身份从此有两条腿:登记簿 amz 行的 source_key 是权威键,模式提取只兜存量。
+# 两条腿**必须同口径** —— 一条归一一条不归一,下游集合里就会同时存在
+# 'B0ABCDEFGH' 与 'b0abcdefgh' 两个键,而"已在架"的判定正是按键取交集的。
+
+class _RegCur:
+    def __init__(self, rows):
+        self.rows, self.sql, self.args, self.n = rows, None, None, 0
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, args=None):
+        self.sql, self.args, self.n = sql, args, self.n + 1
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _RegConn:
+    def __init__(self, rows=()):
+        self.cur = _RegCur(rows)
+
+    def cursor(self):
+        return self.cur
+
+
+def test_resolve_agrees_with_extract_asin_on_every_legacy_shape():
+    """未登记的存量行,resolve 必须与 extract_asin 逐个同值 —— 收口那天全仓
+    十几处读侧一起换口径,只要这条不成立就是一次静默的全量行为变化。"""
+    for sku in ("B0GXX75JN5", "XKJ-B0GXX75JN5-39.98", "A109-B08QF9XLMH-02",
+                "102460018738", "怪东西", ""):
+        assert sa.pick_asin(None, sku) == sa.extract_asin(sku), sku
+        assert sa.resolve(_RegConn(), "T1", sku) == sa.extract_asin(sku), sku
+
+
+def test_registry_key_wins_over_the_pattern():
+    """登记簿优先:跟卖/自建/未来的不透明码,模式提不出的靠它;两者都在时
+    以登记簿为准(它是上架时写下的事实,模式只是猜)。"""
+    assert sa.pick_asin("B0REGISTER", "XKJ-B0GXX75JN5-39.98") == "B0REGISTER"
+
+
+def test_a_lowercase_registry_key_is_normalized_like_the_pattern_does():
+    """source_key 是运营在上架表里手填、原样落库的(读表只 strip 不 upper)。
+    裸取会让一个小写 ASIN 变成下游集合里的垃圾键 —— 而真 ASIN 仍然缺席,
+    于是"已在架"被判成"不在架",已上架的品被重新派工写回上架表。"""
+    assert sa.pick_asin(" b0abcdefgh ", "SOMESKU") == "B0ABCDEFGH"
+    assert sa.pick_asin("b0abcdefgh", "B0ABCDEFGH") == sa.extract_asin("B0ABCDEFGH")
+
+
+def test_a_malformed_registry_key_falls_back_to_the_pattern():
+    """**登记簿只是优先级,不是免检通道**:形态不对的键一律不当身份用。"""
+    for bad in ("B0XXXXXXXX-2", "   ", "00842565531441", "1024600187", None, ""):
+        assert sa.pick_asin(bad, "XKJ-B0GXX75JN5-39.98") == "B0GXX75JN5", bad
+    assert sa.pick_asin("B0XXXXXXXX-2", "怪东西") is None      # 都提不出就是提不出
+
+
+def test_unregistered_and_non_amz_rows_fall_back_to_the_pattern():
+    """只认 source_type='amz':match 行的 source_key 是匹配 GTIN,拿它当 ASIN
+    用会把一个 GTIN 灌进按 ASIN 建的所有集合里。"""
+    conn = _RegConn()                       # 一行都查不到 = 未登记 / 非 amz
+    got = sa.resolve_many(conn, [("T1", "B0GXX75JN5"), ("T1", "怪东西")])
+    assert got == {("T1", "B0GXX75JN5"): "B0GXX75JN5"}      # 提不出的不进映射
+    assert "source_type = 'amz'" in conn.cur.sql
+
+
+def test_resolve_still_answers_for_an_abandoned_row():
+    """**不按 abandoned_at 过滤**(消费方契约):旧码带着订单、售后回来时
+    必须还查得到,查不到 = 那笔订单永远归不到产品上。"""
+    assert "abandoned_at" not in sa._REG_SQL
+    conn = _RegConn([("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    assert sa.resolve(conn, "T1", "AK7QM2X9RT4W") == "B0ABCDEFGH"
+
+
+def test_resolve_many_is_one_query_for_many_pairs():
+    """有界批量反查发**一条** SQL;十万对那种全表级取数不走这里(走 SQL 里的
+    LEFT JOIN),不然就是把一次 JOIN 换成一次巨型数组传参。"""
+    conn = _RegConn([("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    pairs = [("T1", "AK7QM2X9RT4W"), ("T1", "B0GXX75JN5"), ("T2", "怪东西")]
+    got = sa.resolve_many(conn, pairs)
+    assert got == {("T1", "AK7QM2X9RT4W"): "B0ABCDEFGH",
+                   ("T1", "B0GXX75JN5"): "B0GXX75JN5"}
+    assert conn.cur.n == 1
+    assert conn.cur.args == (["T1", "T1", "T2"],
+                             ["AK7QM2X9RT4W", "B0GXX75JN5", "怪东西"])
+    assert sa.resolve_many(_RegConn(), []) == {}             # 空入参一条都不发
+
+
+def test_an_opaque_code_is_invisible_to_extract_asin_but_resolvable():
+    """12 位不透明码对模式提取必返 None —— **形态本身就是分流器**:提不出
+    就说明该走登记簿了,不会有"猜出一个假 ASIN"的中间态。"""
+    from services import sku_codec
+    code = "AK7QM2X9RT4W"
+    assert sku_codec.is_opaque(code) and sa.extract_asin(code) is None
+    assert sa.pick_asin(None, code) is None
+    assert sa.resolve(_RegConn([("T1", code, "B0ABCDEFGH")]), "T1", code) == "B0ABCDEFGH"

@@ -14,6 +14,12 @@ SELECT … FOR UPDATE SKIP LOCKED,数据库层面杜绝双领):
   **Unknown(结局不确定)永不回收**——沃尔玛可能已收单,回收再分配
   = 同 UPC 双上架(旧系统生死规则)。
   conflict(全站已存在该 UPC)/ bad_prefix 永久弃用。
+  burned_delete / burned_lock(2026-09-02,SKU 改造批次 0a 登记):**主动烧号**
+  —— 码与 UPC 同寿命,弃码时把该 (店, ASIN) 名下的号一起烧掉
+  (delete=DELETE 经观测核验;lock=SKU_LOCKED 自愈退役)。与 conflict 的分工:
+  **conflict 只表示「全站已存在该 UPC」(撞库)**,烧号不再复用这个语义,否则
+  池表投影与 pool_stats 里永远分不清「这号是撞库废的」还是「我们主动烧的」。
+  ⚠ 写入点在批次 2 随 services/sku_codec.abandon 接线一起改(0a 只登记取值)。
 """
 
 import logging
@@ -22,9 +28,15 @@ logger = logging.getLogger("services.upc_pool")
 
 _SAFE_PREFIX = "016789"     # 首位白名单(旧系统实证:2/3/4/5 开头被沃尔玛拒)
 
+# 主动烧号的两个状态值(SKU 改造批次 0a 登记;写入点在批次 2)。
+# 不复用 conflict:那个值的语义是「撞库」,两件事混在一个值里就再也分不开。
+BURN_DELETE = "burned_delete"   # DELETE 经观测核验后弃码,同时烧号
+BURN_LOCK = "burned_lock"       # SKU_LOCKED 自愈退役后弃码,同时烧号
+
 # PG 状态值 → 表格「状态」列文案
 STATUS_CN = {"": "", "claimed": "已领", "used": "已用",
-             "conflict": "冲突", "bad_prefix": "非法前缀"}
+             "conflict": "冲突", "bad_prefix": "非法前缀",
+             BURN_DELETE: "删除烧号", BURN_LOCK: "锁死烧号"}
 
 
 def normalize(upc) -> str:
@@ -191,6 +203,11 @@ def burn_for_retire(conn, pairs: list[tuple[str, str]]) -> int:
     自愈链清列重上要的是**新号**(SKU 已绑死旧号,不退役换号必败;退役后
     旧号也不能再给任何人用)。标成 conflict 之后,claim 的同 (店,ASIN)
     复用查询摸不到它,下一轮 list_new 自然领新号——两条语义各归其位。
+
+    ⚠ 批次 2 待办:接 services/sku_codec.abandon 时本函数改成
+    burn(conn, pairs, status),由 abandon 按弃码原因传 BURN_DELETE / BURN_LOCK。
+    0a 是零行为变化批次,改写入值会改动 UPC 池表投影里的字样,故推迟到那时
+    一次做完(同一处改一次,不留双轨)。
     """
     if not pairs:
         return 0

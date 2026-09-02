@@ -289,6 +289,22 @@ def test_suggest_many_rejects_unknown_enums(bad):
         dispositions.suggest_many(object(), [row])
 
 
+def test_conflicts_view_reads_identity_through_the_registry():
+    """身份键收口(SKU 改造批次 0a):SKU 不再恒等 ASIN,amz 行的身份在登记簿。
+
+    视图失效 = problem_scan 的「审核来源」建议归零,而且不报错 —— 它只是
+    再也匹配不上任何一行。**source_type='amz' 不许省**:match 行的 source_key
+    是匹配 GTIN,拿它去撞 products.asin 语义上就是错的。
+    """
+    import pathlib as _p
+    sql = _p.Path("refdata/schema.sql").read_text()
+    view = sql[sql.index("CREATE VIEW catalog.audit_listing_conflicts"):]
+    view = view[:view.index(") e ON true;")]
+    assert "ls.source_type = 'amz'" in view
+    assert "p.asin = coalesce(ls.source_key, w.sku)" in view
+    assert "p.asin = w.sku" not in view              # 硬等号已灭
+
+
 def test_conflicts_view_join_matches_its_index():
     """⚠ 生产事故的锁(2026-08-14):audit_listing_conflicts 的 LATERAL 用
     `coalesce(asin, sku)` 关联 product_events,而表达式索引必须与它**逐字一致**

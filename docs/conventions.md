@@ -198,3 +198,51 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 | 99991403 | **月度 API 配额耗尽**,不是频控 | **不可重试**:自然月 1 号才刷新,退避/换 token 都不会好,继续重试只是把剩下的额度也烧掉 —— 直接抛并提示升级版本或等下月 |
 
 ⚠ 90204 实证 2026-08-05:增/删行列超量时飞书报的是 90204,不是超限码。
+
+## 九、SKU 身份口径(SKU 改造批次 0a 建立,2026-09-02;后续批次只补条目)
+
+背景:SKU 从「就是 ASIN」变成 12 位不透明码之后,「这条 walmart_items 记录对应
+哪个源头产品」不再能从 SKU 本身看出来,身份必须过登记簿
+`catalog.listing_sources`。收口只值钱一次,**守不守得住**才决定它三个月后还在不在
+(守门 `tests/test_sku_guard.py`,与 `tests/test_feishu_guard.py` 同族同形态)。
+
+**① 身份表达式只有两条可复制的字面量**(别再发明第三种写法):
+
+- SQL 侧:`coalesce(ls.source_key, w.sku)`,其中 ls 是
+  `... JOIN catalog.listing_sources ls ON ls.store = w.store AND ls.sku = w.sku
+  AND ls.source_type = 'amz'`(按取数语义选 LEFT / INNER)。
+  - `source_type = 'amz'` **不许省**:match 行的 source_key 是匹配 GTIN,拿它去撞
+    `products.asin` 语义上就是错的(存量下结论碰巧相同,不构成等价性论证)。
+  - 用 `coalesce` 不用裸 `ls.source_key`:register 允许 source_key 缺省,NULL 键的
+    amz 行今天靠 `p.asin = w.sku` 命中,裸取会把它们静默丢掉。
+  - **相关子查询里不要写 coalesce**:对 products 每行做的 EXISTS 用不上
+    `walmart_items_sku_idx`,几十万行候选会退化成逐行全表扫(2026-08-14 视图挂死
+    同一类事故)。那种位置改写成两条腿的 OR,各走各的索引。
+- Python 侧:`sku_asin.pick_asin(source_key, sku)`。**两条腿同口径**:登记簿键也要
+  先 strip+upper 再过裸 ASIN 形态闸,不过就落回 `extract_asin(sku)` ——
+  「登记簿只是优先级,不是免检通道」。全表级取数一律在 SQL 里 JOIN 取键,别拿
+  十万对 (store, sku) 去 `unnest`。
+
+**② `abandoned_at IS NULL` 的权威白名单**:消费方 .py **只有三处** ——
+`sku_codec.mint` 的复用查询、`list_new` 的本店去重闸、`alloc_push._SQL_ONLINE`
+(批次 3 起增 `sku_migrate` 的候选选取为第四处)。`refdata/schema.sql` 里那几条
+部分索引条件是 DDL,不计入这张白名单。**resolve / 维护链 JOIN / 事件归并 /
+订单反查一律不按它过滤** —— 旧码带着订单、售后回来时必须还查得到。
+
+**③ 不透明码编码规则的唯一之家是 `services/sku_codec.py`**:字母表 / 长度 /
+随机段长 / 重抽上限 / 占位码 / `is_opaque` 判据都在那里出生;registry 只登记
+`SKU_SOURCE_LETTERS`(所有者要拍的取值,属外部配置)。schema.sql 两条部分唯一
+索引的字符类与该模块常量由守门测试逐字对齐。理由:铁律 3 管的是路径 / token /
+表 ID / 服务器地址这类**外部资源**,12 位码的字母表是**内部编码规则**。
+
+**④ 登记簿的写入出口**:INSERT 只有 `listing_sources.register` 与
+`sku_codec.mint` 家族两个;`abandoned_at` / `abandoned_reason` / `replaced_by`
+三列只准 `services/sku_codec` 写。行永不 DELETE。
+
+**⑤ 守门只有一份** `tests/test_sku_guard.py`:白名单 dict 在文件顶部,每条写清
+理由与**预期收口批次**,永久豁免显式标 permanent。后续批次只准增删这里的白名单
+条目,**不许再建第二份守门文件**(四份并存正是 §六要禁的形态,而且白名单一定会
+互相打架)。
+
+**⑥ 三个同名异义,别混**:「码弃用(abandoned)」≠「沃尔玛 lifecycle RETIRED」
+≠「product_clear 停用」。登记簿列名故意用 abandoned 不用 retired。

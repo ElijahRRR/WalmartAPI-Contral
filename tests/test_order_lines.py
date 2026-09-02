@@ -597,46 +597,56 @@ def test_new_order_is_committed_from_detail_and_locked(caplog):
         ol.screen_order_dates(_ConflictConn([]), ol.extract_order_lines("T1", _ORDER), detail=dead)
 
 
-def test_detail_arbitrates_disagreements_by_confirmation_source(caplog):
-    """列表值与库值不同时查详情:详情定稿的行 —— 详情=库值记冲突、详情≠库值报疑错、
-    库值不动;只靠列表定稿/未定稿的行 —— 按详情改判并升级为详情定稿。"""
+def test_detail_verified_rows_ignore_list_noise_and_unverified_rows_get_checked(caplog):
+    """所有者定稿(2026-09-02 简化):详情定过稿的行,列表再不一致只计冲突、不查详情、
+    不改;没被详情核对过的行(存量/首见查失败)每轮必查详情,查到就按详情定稿。"""
     from datetime import datetime, timezone
     rows = ol.extract_order_lines("T1", _ORDER)
     lid, api_od = rows[0]["order_line_id"], rows[0]["order_date"]
     other = datetime(2026, 8, 20, 4, 12, tzinfo=timezone.utc)
     other_ms = int(other.timestamp() * 1000)
-    # 详情定稿 + 详情=库值 ⇒ 冲突(列表回错),不改
+    # 详情定稿 + 列表≠库 ⇒ 冲突,详情一次都不查,行不动
+    d = _detail(other_ms)
     with caplog.at_level("WARNING"):
         got = ol.screen_order_dates(
-            _ConflictConn([(lid, "p", "s", other, None, True, None, 0, "detail")]), rows,
-            detail=_detail(other_ms))
-    assert got[0]["kind"] == "冲突" and "_order_date_fix" not in rows[0]
-    # 详情定稿 + 详情≠库值 ⇒ 疑错,不改,给修复命令
+            _ConflictConn([(lid, "p", "s", other, None, True, None, 0, "detail")]), rows, detail=d)
+    assert got[0]["kind"] == "冲突" and d.calls == [] and "_order_date_fix" not in rows[0]
+    # 保险:同一异值已连续两轮(streak=2)再来第三轮 ⇒ 补查一次详情;详情也不认库值 ⇒ 疑错
     rows = ol.extract_order_lines("T1", _ORDER)
+    d = _detail(_ORDER["orderDate"])
     got = ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", other, None, True, None, 0, "detail")]), rows,
-        detail=_detail(_ORDER["orderDate"]))
-    assert got[0]["kind"] == "疑错" and "_order_date_fix" not in rows[0]
+        _ConflictConn([(lid, "p", "s", other, api_od, True, None, 2, "detail")]), rows, detail=d)
+    assert got[0]["kind"] == "疑错" and d.calls == [rows[0]["po_id"]] and "_order_date_fix" not in rows[0]
     assert "repair_order_date=" in caplog.text
-    # 列表两轮定稿(source=list)+ 详情≠库值 ⇒ 改判为详情值
+    # 同样三轮,但详情仍认库值 ⇒ 冲突
     rows = ol.extract_order_lines("T1", _ORDER)
     got = ol.screen_order_dates(
-        _ConflictConn([(lid, "p", "s", other, None, True, None, 0, "list")]), rows,
-        detail=_detail(_ORDER["orderDate"]))
-    assert got[0]["kind"] == "改判" and rows[0]["_order_date_fix"] == api_od
-    # 未定稿 + 详情=库值 ⇒ 冲突并升级为详情定稿(值不变)
+        _ConflictConn([(lid, "p", "s", other, api_od, True, None, 2, "detail")]), rows,
+        detail=_detail(other_ms))
+    assert got[0]["kind"] == "冲突"
+    # 没被详情核对过(列表两轮定稿,source=list)+ 列表与库一致 ⇒ 照样查详情;详情≠库 ⇒ 改判
+    rows = ol.extract_order_lines("T1", _ORDER)
+    d = _detail(other_ms)
+    got = ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", api_od, None, True, None, 0, "list")]), rows, detail=d)
+    assert got[0]["kind"] == "改判" and rows[0]["_order_date_fix"] == other and d.calls
+    # 未定稿(source 空)+ 详情=库值 ⇒ 静默升级为详情定稿,不进异常清单
     rows = ol.extract_order_lines("T1", _ORDER)
     got = ol.screen_order_dates(
         _ConflictConn([(lid, "p", "s", other, None, False, None, 0, None)]), rows,
         detail=_detail(other_ms))
-    assert got[0]["kind"] == "冲突" and rows[0]["_order_date_fix"] == other
-    # 详情给的值本身不可信(未来)⇒ 当不可用,退回两轮逻辑(待定)
+    assert got == [] and rows[0]["_order_date_fix"] == other
+    # 详情给的值本身不可信(未来)⇒ 当不可用,列表≠库时退回两轮逻辑(待定)
     rows = ol.extract_order_lines("T1", _ORDER)
     got = ol.screen_order_dates(
         _ConflictConn([(lid, "p", "s", other, None, False, None, 0, None)]), rows,
         detail=_detail(4102444800000))
     assert got[0]["kind"] == "待定" and "_order_date_fix" not in rows[0]
-
+    # 详情不可用且列表=库 ⇒ 什么都不做
+    rows = ol.extract_order_lines("T1", _ORDER)
+    assert ol.screen_order_dates(
+        _ConflictConn([(lid, "p", "s", api_od, None, False, None, 0, None)]), rows,
+        detail=lambda po: None) == []
 
 def test_order_date_later_than_status_is_flagged_not_rejected(caplog):
     """下单时间晚于本行状态时间 = 不可能的事实:标记存疑并告警,但不拒写——

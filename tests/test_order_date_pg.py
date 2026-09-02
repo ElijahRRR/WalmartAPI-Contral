@@ -286,10 +286,13 @@ def test_detail_commits_new_order_at_first_sight_and_list_never_overrides(pg):
     st = _state(pg, "P20")
     assert (st[0], st[2], st[7]) == (_dt(X_MS), True, "detail")
     assert st[4] == str(Y_MS)                     # 信封仍记列表原值(取证)
-    assert [c["kind"] for c in _sync(pg, "P20", Y_MS, detail=X_MS)] == ["冲突"]
+    # 详情定过稿:列表回错只计冲突,不查详情(detail=None 也行),不动
+    assert [c["kind"] for c in _sync(pg, "P20", Y_MS)] == ["冲突"]
     assert _state(pg, "P20")[0] == _dt(X_MS)
+    assert [c["kind"] for c in _sync(pg, "P20", Y_MS)] == ["冲突"]
+    # 同一异值第三轮:补查一次详情;详情也翻供 ⇒ 疑错,报人不自动改
     assert [c["kind"] for c in _sync(pg, "P20", Y_MS, detail=Y_MS)] == ["疑错"]
-    assert _state(pg, "P20")[0] == _dt(X_MS)      # 详情也翻供:报人,不自动改
+    assert _state(pg, "P20")[0] == _dt(X_MS)
     assert _sync(pg, "P20", X_MS, detail=X_MS) == []
 
 
@@ -301,7 +304,8 @@ def test_detail_upgrades_list_only_confirmation_and_fixes_it(pg):
     st = _state(pg, "P21")
     assert (st[0], st[2], st[7]) == (_dt(Y_MS), True, None)
     upd = st[3]
-    assert [c["kind"] for c in _sync(pg, "P21", Y_MS + 1, detail=X_MS)] == ["改判"]
+    # 列表值与库值一致也照样查详情(没被详情核对过的行每轮必查)
+    assert [c["kind"] for c in _sync(pg, "P21", Y_MS, detail=X_MS)] == ["改判"]
     st = _state(pg, "P21")
     assert (st[0], st[2], st[7], st[6]) == (_dt(X_MS), True, "detail", 1)
     assert st[3] > upd
@@ -321,3 +325,21 @@ def test_rejected_list_value_is_filled_from_detail(pg):
                      " VALUES (%s, %s, %s, '1', %s)", (ol.make_order_line_id("P23", SKU), STORE, "P23", SKU))
     assert [c["kind"] for c in _sync(pg, "P23", future, detail=X_MS)] == ["详情补正"]
     assert _state(pg, "P23")[0] == _dt(X_MS)
+
+
+def test_unverified_rows_are_verified_every_round_until_detail_confirms(pg):
+    """上线前的存量行(三列默认值)= 没被详情核对过:列表与库一致也查详情;详情=库值
+    ⇒ 静默升级为详情定稿(不进异常清单);之后不再查。"""
+    with pg.pg_conn() as conn:
+        conn.execute("INSERT INTO orders.order_lines (order_line_id, store, po_id, line_number,"
+                     " sku, order_date) VALUES (%s, %s, %s, '1', %s, %s)",
+                     (ol.make_order_line_id("P24", SKU), STORE, "P24", SKU, _dt(X_MS)))
+    assert _sync(pg, "P24", X_MS, detail=X_MS) == []
+    st = _state(pg, "P24")
+    assert (st[0], st[2], st[7]) == (_dt(X_MS), True, "detail")
+    calls = []
+
+    rows = ol.extract_order_lines(STORE, _order("P24", X_MS))
+    with pg.pg_conn() as conn:
+        ol.screen_order_dates(conn, rows, detail=lambda po: calls.append(po))
+    assert calls == []                           # 定稿后不再查详情

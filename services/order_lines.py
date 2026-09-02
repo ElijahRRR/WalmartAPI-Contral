@@ -462,9 +462,9 @@ _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
 #   ④ 未来日期不是下单时间,拒写(留 NULL,后续轮次补上);晚于本行状态时间的
 #      记"存疑"告警但不拒(避免误伤把全部新单藏起来);
 #   ⑤ 每一次不一致都逐条记日志并进摘要首行,不静默;首见信封摘要落 order_meta 取证。
-# 详情接口(所有者方案 2026-09-02)是第二来源:新单以详情首次落库并定稿,列表值与
-# 库值不同时查详情复核,详情定稿(order_date_source=detail)后列表永不覆盖;详情
-# 不可用才退回上面的两轮机制。修复已定稿的错行走 repair_order_date 显式模式。表达式里 t = 目标表别名,
+# 详情接口(所有者定稿 2026-09-02)是真相来源:新单以详情首次落库并定稿;没被详情
+# 核对过的存量行每轮查详情直到定稿;详情定稿(order_date_source=detail)后列表永不
+# 覆盖、不再查;详情不可用才退回上面的两轮机制。修复走 repair_order_date 显式模式。表达式里 t = 目标表别名,
 # 与 _ORDER_DATE_STATE_SQL 配对(先 upsert 定值,再记录本轮观测)。
 _ORDER_DATE_GUARD = (
     "CASE WHEN t.order_date_confirmed THEN t.order_date"
@@ -604,11 +604,11 @@ def screen_order_dates(conn, rows: list[dict], *, detail=None) -> list[dict]:
       · 新单首见:以**详情**的 orderDate 首次落库并直接定稿(source=detail);
         详情不可用时退回列表候选,走连续两轮一致定稿(source=list)
       · 列表值明显异常(未来/远古/晚于本行首次入库):拒写,能查详情就用详情补正
-      · 已存在的行,列表值与库值不同:查详情复核 ——
-          库值由详情定稿:详情=库值 ⇒ 冲突(列表回错,忽略);详情≠库值 ⇒ 疑错(报人,不动)
-          库值只靠列表定稿:详情可信 ⇒ 改判为详情值并升级为 detail 定稿
-          库值未定稿:详情可信 ⇒ 按详情定稿(与库值不同记 改判)
-        详情不可用时退回原逻辑:冲突/疑错(连续同一异值三轮)/改判/待定
+      · 没被详情核对过的行(上线前的存量、首见时详情查失败的):**每轮都查详情**,
+        查到就按详情定稿(与库值不同记 改判,相同静默升级);详情不可用时只在
+        列表值与库值不同时退回两轮机制(冲突/疑错/改判/待定)
+      · 详情定过稿的行:列表再不一致只计 冲突(列表回错),不查详情、不改;唯一保险:
+        同一异值连续 _ORDER_DATE_SUSPECT_STREAK 轮才补查一次详情,详情也不认库值才报 疑错
       · 详情定稿后视为不可变,列表永不覆盖(_ORDER_DATE_GUARD)
     每条异常都记 warning 并带信封摘要;detail(po) 返回订单对象(404 返 None),
     网络类异常在这里吞成"不可用"并计入 kind=详情失败 —— 凭证死店例外,原样上抛。
@@ -691,23 +691,31 @@ def screen_order_dates(conn, rows: list[dict], *, detail=None) -> list[dict]:
                 if d_od is not None:
                     row["_order_date_fix"] = d_od
             continue
+        if source != _DETAIL_SOURCE:                     # ── 没被详情核对过:每轮必查 ──
+            d_od = _detail_od(row, created)
+            if d_od is not None:
+                row["_order_date_fix"] = d_od
+                if db_od is not None and d_od != db_od:
+                    out.append({"kind": "改判", "po": po, "sku": sku, "db": db_od, "api": api_od})
+                    logger.warning("PO %s SKU %s 下单时间改判:库 %s → 详情 %s(列表 %s);信封 %s",
+                                   po, sku, db_od.isoformat(), d_od.isoformat(),
+                                   api_od.isoformat(), env)
+                continue
         if db_od is None or db_od == api_od:
             continue
-        # ── 列表值与库值不同:先问详情 ──
-        d_od = _detail_od(row, created)
-        if d_od is not None:
-            if confirmed and source == _DETAIL_SOURCE:
-                if d_od == db_od:
-                    kind, verdict = "冲突", "详情=库值,列表回错,忽略"
-                else:
-                    kind, verdict = "疑错", (f"详情 {d_od.isoformat()} 也不认定稿值,请核对;"
+        # ── 列表值与库值不同 ──
+        if source == _DETAIL_SOURCE:
+            # 详情定过稿:列表回错只计数;同一异值连续三轮才补查一次详情(零成本保险)
+            if seen == api_od and (streak or 0) + 1 >= _ORDER_DATE_SUSPECT_STREAK:
+                d_od = _detail_od(row, created)
+                if d_od is not None and d_od != db_od:
+                    kind, verdict = "疑错", (f"同一异值连续 {(streak or 0) + 1} 轮且详情 "
+                                           f"{d_od.isoformat()} 也不认定稿值,请核对;"
                                            f"修复:order_sync -p repair_order_date={po}")
-            elif d_od == db_od:
-                row["_order_date_fix"] = d_od          # 升级为详情定稿,值不变
-                kind, verdict = "冲突", "详情=库值,列表回错;按详情定稿"
+                else:
+                    kind, verdict = "冲突", "详情定稿值保留,列表回错"
             else:
-                row["_order_date_fix"] = d_od
-                kind, verdict = "改判", "详情值与库值不同,按详情改判并定稿"
+                kind, verdict = "冲突", "详情定稿值保留,列表回错"
         elif confirmed and seen == api_od and (streak or 0) + 1 >= _ORDER_DATE_SUSPECT_STREAK:
             kind, verdict = "疑错", (f"同一异值已连续 {(streak or 0) + 1} 轮,定稿值疑错;"
                                    f"修复:order_sync -p repair_order_date={po}")

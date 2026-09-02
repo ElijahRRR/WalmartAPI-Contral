@@ -1,7 +1,7 @@
 """审核规则引擎门面(批次 B:零 LLM 纯规则层;全案 docs/audit_migration_plan.md)。
 
-组装三块积木:audit_phase0(四件套短路)→ PT 解析(本文件,批次 B 版三级的
-前两级)→ audit_l2(R1/R3-R8)→ audit_reason(政策理由映射)。
+组装三块积木:audit_phase0(五硬一软的双输出)→ PT 解析(本文件,批次 B 版
+三级的前两级)→ audit_l2(只剩 R1 类目准入)→ audit_reason(类别映射)。
 
 PT 解析(架构 10.3 的批次 B 裁剪版,批次 C 接 LLM rerank 前只有两级):
   ① 沃尔玛实证:catalog.walmart_items.product_type(sku=asin,跨店唯一才采信)
@@ -39,13 +39,9 @@ class AuditContext:
     brand_mention_automaton: object   # ahocorasick.Automaton 或 None
                                    # (L0 品牌文案扫描;2026-09-03 C 批随 R4
                                    #  迁入 L0 从 ac_automaton 改名)
-    nice_mapping: dict
-    nice_default: list
-    uspto: object = None           # psycopg 连接或 None(R5 开关)
     walmart_confirmed: dict = field(default_factory=dict)   # asin → PT(跨店唯一,已 pt_meta 闸)
     catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
     known_policies: frozenset = frozenset()   # 政策表 category_en 实时集合(全部)
-    uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
     node_map: dict = field(default_factory=dict)              # browse_node_id → PT(高置信唯一,已 pt_meta 闸)
@@ -188,8 +184,8 @@ def check_rule_policies(known_policies) -> None:
                 f"registry.resources.{const} 为 {hit!r}")
 
 
-def load_context(conn, *, uspto=None) -> AuditContext:
-    """输入:中心库连接(+可选 uspto 只读连接)→ 输出:装配完成的 AuditContext。
+def load_context(conn) -> AuditContext:
+    """输入:中心库连接 → 输出:装配完成的 AuditContext。
 
     实证/映射两级 PT 源在装配期就过 pt_meta 闸(评审 P0-1:废弃 PT——如
     'Office Chairs' 已改名 'Desk Chairs'——直出会让 R0/R1/R2/R3 四闸集体失明
@@ -210,7 +206,6 @@ def load_context(conn, *, uspto=None) -> AuditContext:
                        "多半是黑名单总表「来源」列改了写法(前缀常量:"
                        "registry.resources.TRO_BRAND_SOURCE_PREFIX);"
                        "在此之前 TRO 命中接线整条不会报警")
-    nice_mapping, nice_default = audit_l2.load_nice_mapping()
     pt_meta = _rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
                                "walmart_ptg, access_state, zh_can_do, requirements, "
                                "notes FROM audit.walmart_pt_meta",
@@ -301,8 +296,6 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         # audit_why / pt_census 仍查它做诊断),只是审核链不再拿它当判据。
         brand_mention_automaton=_build_automaton(brand_keys),
         r4_source=r4_source,
-        nice_mapping=nice_mapping, nice_default=nice_default,
-        uspto=uspto,
         walmart_confirmed=confirmed,
         catmap=catmap,
         known_policies=known_policies,

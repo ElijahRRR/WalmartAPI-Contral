@@ -27,7 +27,6 @@
                                                     # **在架** pass 重过 L0(product_chain
                                                     # 每天 13:00 跑这一条);翻成 rejected 的
                                                     # 由紧随其后的 problem_scan 建删除建议
-  python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
   python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
@@ -85,8 +84,6 @@ L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
 
-R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/1400 万,
-先离线抽样出数据再决定常开;开时全程复用一个只读连接。
 """
 
 import json
@@ -211,7 +208,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
+_KNOWN_PARAMS = {"asins", "limit", "mode", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
                  "gap_wait", "force", "repts", "active_days"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
@@ -1291,7 +1288,6 @@ class Opts:
     limit: int
     backfill: bool
     adopt_only: bool
-    r5_on: bool
     run_l3: bool
     run_l4: bool
     only_l0: bool
@@ -1312,7 +1308,6 @@ def _parse_opts(params: dict) -> Opts:
     if adopt_only and not backfill:
         raise ValueError("adopt_only=1 只在 mode=backfill 下有意义"
                          "(它采用的是 audit_runs 里的历史结论)")
-    r5_on = str(params.get("r5", "")).strip().lower() == "on"
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
     run_l4 = str(params.get("l4", "")).strip().lower() == "on"
@@ -1337,8 +1332,7 @@ def _parse_opts(params: dict) -> Opts:
         raise ValueError("mode=stale 不与 stages=L0 连用:版本重审必须全链,"
                          "否则未命中的行不盖版本号,候选集永不收敛")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
-    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
-    # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
+    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义不变)
     want_workers = max(1, int(params.get("workers", _DEFAULT_WORKERS)))
     workers = min(want_workers, _MAX_WORKERS)
     if workers != want_workers:
@@ -1346,10 +1340,8 @@ def _parse_opts(params: dict) -> Opts:
         # workers=32 测吞吐,实际跑的是 16 而输出只字未提)
         logger.warning("workers=%d 超上限,实际用 %d(I/O 密集,上限由 LLM "
                        "侧承受力定,不是本机核数)", want_workers, workers)
-    if r5_on:
-        workers = 1
     return Opts(execute=execute, limit=limit, backfill=backfill,
-                adopt_only=adopt_only, r5_on=r5_on, run_l3=run_l3,
+                adopt_only=adopt_only, run_l3=run_l3,
                 run_l4=run_l4, only_l0=only_l0, workers=workers)
 
 
@@ -1365,8 +1357,6 @@ class Counts:
     seller_missing: int
     row_errors: int
     asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
-    uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
-    uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
     warmup_n: int = 0       # 首条串行预热的条数(0/1;规格 §3.9,见 audit_pool)
     # TRO 命中(2026-08-30;dry-run 恒 0 —— 那一路根本不跑,见 _tro_hook 调用点)
     tro_n: int = 0          # 本轮命中的 TRO 品牌数(含早就报过的)
@@ -1388,7 +1378,6 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
     lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
     lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
               f"{',补刷' if opts.backfill else ''}"
-              f"{',R5开' if opts.r5_on else ''}"
               f"{',只跑L0' if opts.only_l0 else ''}"
               f"{',L3关' if not opts.run_l3 and not opts.only_l0 else ''}"
               f"{',L4开' if opts.run_l4 else ''}):"
@@ -1523,24 +1512,20 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
         lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
-    if opts.r5_on and counts.uspto_failures:
-        lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
-                     f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
     lines.append(f"全库 pending 存量 {pending_total}")
     return lines
 
 
 def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+    """输入:params(asins/limit/mode/execute/from_sheet)→ 输出:判定统计摘要。"""
     opts = _parse_opts(params)
     opts.workers, opts.conn_note = _cap_by_connections(opts.workers)
     # 中段判定主体与 _to_todo/_judge/_flush 三层闭包沿用这些名字:本次拆解只
     # 搬走两头(参数解析进 _parse_opts、摘要拼装进 _summary),主体一字未动
     execute, limit, backfill, adopt_only = (opts.execute, opts.limit,
                                             opts.backfill, opts.adopt_only)
-    r5_on, run_l3, run_l4, only_l0, workers = (opts.r5_on, opts.run_l3,
-                                               opts.run_l4, opts.only_l0,
-                                               opts.workers)
+    run_l3, run_l4, only_l0, workers = (opts.run_l3, opts.run_l4,
+                                        opts.only_l0, opts.workers)
     # ── 上架表驱动(所有者定稿 2026-08-16;领任务在 _claim_from_sheet)──────
     sheet_rows: list[dict] = []
     sheet_head: list[str] = []
@@ -1570,10 +1555,8 @@ def run(params: dict) -> str:
         # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
         limit = max(limit, len(extra["asins"]))
 
-    import contextlib
-    uspto_cm = db.uspto_conn() if r5_on else contextlib.nullcontext()
-    with db.pg_conn() as conn, uspto_cm as uspto:
-        ctx = audit_rules.load_context(conn, uspto=uspto)
+    with db.pg_conn() as conn:
+        ctx = audit_rules.load_context(conn)
         query_params = {"marketplace": "US", "limit": limit, **extra}
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
@@ -1886,8 +1869,6 @@ def run(params: dict) -> str:
                    no_title=no_title, seller_missing=seller_missing,
                    row_errors=row_errors,
                    asked_asins=len(extra.get("asins", ())),
-                   uspto_failures=getattr(ctx, "uspto_failures", 0),
-                   uspto_off=getattr(ctx, "uspto", None) is None,
                    tro_n=len(tro["brands"]), tro_new=tro["new"],
                    tro_expo=tro["expo"],
                    tro_unjudged=len(tro["unjudged_brands"]),

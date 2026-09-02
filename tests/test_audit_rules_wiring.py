@@ -22,8 +22,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 brand_blacklist={},
-                pt_meta={}, brand_mention_automaton=None, nice_mapping={},
-                nice_default=[], uspto=None)
+                pt_meta={}, brand_mention_automaton=None)
     base.update(kw)
     return audit_rules.AuditContext(**base)
 
@@ -1564,14 +1563,13 @@ def test_the_l3_gap_counters_are_reset_and_reach_the_summary():
     stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
              "L4_ran": 0, "L4_reject": 0}
     opts = product_audit.Opts(execute=True, limit=1, backfill=False,
-                              adopt_only=False, r5_on=False, run_l3=True,
+                              adopt_only=False, run_l3=True,
                               run_l4=False, only_l0=False, workers=1,
                               conn_note="")
     counts = product_audit.Counts(
         verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
         l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
-        row_errors=0, asked_asins=0, uspto_failures=0,
-        uspto_off=True)
+        row_errors=0, asked_asins=0)
     def _lines(st):
         return product_audit._summary(opts, counts, st, {}, {}, 0, [])
 

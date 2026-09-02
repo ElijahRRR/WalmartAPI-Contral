@@ -192,8 +192,6 @@ def test_zero_tro_prefix_words_raises_a_warning(monkeypatch, caplog):
     monkeypatch.setattr(audit_rules, "_frozen", lambda conn, sql: frozenset())
     monkeypatch.setattr(audit_rules, "_pairs", lambda conn, sql: {})
     monkeypatch.setattr(audit_rules, "_build_automaton", lambda w: None)
-    monkeypatch.setattr(audit_rules.audit_l2, "load_nice_mapping",
-                        lambda *a, **k: ({}, []))
     monkeypatch.setattr(audit_rules.category_blacklist, "load",
                         lambda conn: None)
 
@@ -225,8 +223,7 @@ def test_context_default_keeps_hand_built_ctx_working():
     from services import audit_rules
     ctx = audit_rules.AuditContext(
         phase0_sellers=frozenset(), phase0_asins=frozenset(),
-        brand_blacklist={}, pt_meta={}, brand_mention_automaton=None,
-        nice_mapping={}, nice_default=[])
+        brand_blacklist={}, pt_meta={}, brand_mention_automaton=None)
     assert ctx.r4_source == {}
     assert audit_store.tro_hits(_outcome(["dyson"]), ctx.r4_source,
                                 _PREFIX)["confirmed"] == []
@@ -352,10 +349,9 @@ def _summary_lines(**kw):
     counts = pa.Counts(
         verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
         l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
-        row_errors=0, asked_asins=0, uspto_failures=0,
-        uspto_off=True, **kw)
+        row_errors=0, asked_asins=0, **kw)
     opts = pa.Opts(execute=True, limit=1, backfill=False, adopt_only=False,
-                   r5_on=False, run_l3=True, run_l4=False, only_l0=False,
+                   run_l3=True, run_l4=False, only_l0=False,
                    workers=1, conn_note="")
     stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
              "L4_ran": 0, "L4_reject": 0}

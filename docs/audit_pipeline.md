@@ -2,8 +2,10 @@
 
 > 本文回答一件事:**一个 ASIN 从进入审核到落结论,中间到底发生了什么**。
 > 每一层做什么、每条规则的判据来自哪张表/哪份文件、判不出来怎么办,逐条写清。
-> 定稿日期 2026-08-20;规则集版本以 `registry/resources.py` 的 `AUDIT_RULES_VERSION`
-> 为准(2026-08-26 核对为 `c.2026-08-24.1`)。
+> 定稿日期 2026-08-20;**2026-09-02 第三步 B1 批**改写 §5(L3 换喂官方全文 +
+> 输出三段化)与 §7(类别自报 + 理由映射查表),执行规格
+> `docs/audit_step3_spec.md` §三。规则集版本以 `registry/resources.py` 的
+> `AUDIT_RULES_VERSION` 为准(2026-09-02 核对为 `c.2026-09-02.2`)。
 >
 > 代码入口:`python cli.py product_audit`(`workflows/product_audit.py`)
 > 判定引擎:`services/audit_rules.audit_one`(门面)→ `audit_phase0` / `audit_l1_llm`
@@ -20,7 +22,7 @@
                                                      ↓ pass 才继续
                                               L4 视觉(LLM,默认关)
                                                      ↓
-                              verdict(pass / reject / pending)+ 政策理由
+              verdict(pass / reject / pending)+ 类别 + 具体内容
 ```
 
 三条贯穿全链的纪律:
@@ -83,6 +85,10 @@
 | 2 | 商标符号 ®/™/℠/© | `phase0_trademark_symbol` | 正则 | 大写开头 ≥3 字符的词紧邻符号 |
 | 3 | 文案自述专利 | `phase0_patent_claim` | 正则 | "patented / 专利保护"等;漆皮(patent leather)豁免 |
 | 4 | 品牌黑名单 | `phase0_brand_blacklist` | `catalog.brand_blacklist` | `brand` 字段**精确等值**(不是子串) |
+
+每条硬拒规则在 `hit.detail["category"]` 里**自报类别**(2026-09-02 B1,§7.2):
+黑名单三码 = `内部黑名单`(类目那条若行内 `walmart_policy` 能对到政策表则用
+该政策)、商标符号 / 专利自述 / 品牌黑名单 = `Intellectual Property`。
 
 ### 2.1 亚马逊类目黑名单的三种匹配(2026-08-20 定稿)
 
@@ -204,6 +210,10 @@ Sheet Music, Autographed Collectibles}。
 2. `zh_can_do == '是'` 或以 `'需评估'` 开头
 
 任一不满足 → -100 → reject。两条都不满足时**只报更上游的** `cat_access_blocked`。
+
+两条 hit 的类别都是 `类目准入`(2026-09-02 B1 在 detail 的 `category` 里自报)。
+此前写死的 `walmart_policy="Restricted/Illegal"` 是**猜的** —— 白名单拦下与那条
+禁售政策没有关系 —— 已删。
 
 这张表由 `pt_spec_sync` 按沃尔玛官方 MP_ITEM spec 重建、飞书维护:
 spec 的顶层必填字段 → 推"要什么认证" → 推"中国搬运做不做得了"。
@@ -331,87 +341,112 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 
 ## 5. L3 —— 语义审核(LLM,`services/audit_l3.py`)
 
-**只对 L2 pass 的产品跑。** 补 L2 硬规则抓不到的问题,提示词里是**六个判定维度**:
-
-| # | 维度 | 判什么 |
-|---|---|---|
-| 1 | 品牌真伪 | R4 命中的词是真品牌还是通用英文词 |
-| 2 | 冒犯性内容 | 色情 / 仇恨象征 / 仿真武器 |
-| 3 | 知识产权 | 商标 / 版权 IP / 专利 / Trade Dress / 肖像权 |
-| 4 | 品牌字段伪装 | brand 填 Unbranded 但文案暗示大牌 |
-| 5 | 儿童产品 CPC 兜底 | L1 类目漏判时从文案兜 |
-| **6** | **整机电器 / NRTL**(2026-08-21 新增) | 产品**本身**带不带电、是不是成品 |
-
-**维度 6 是从 L2 移上来的**,不是新加的判定 —— L2 原来按 PT 名猜整机/小件的
-分类器同日下线(见 §4 R3 那节)。移上来的理由是所有者定的:「代码只判定确定性
-的,这种很明显不确定」。**默认放行、拿不准 pass** —— 绝大多数产品不带电,宁可
-漏一个也不要重蹈"按类目名连坐整类"的覆辙。
+**只对 L2 pass 的产品跑。** 2026-09-02 第三步 B1 批换喂:L3 面前不再是六列
+中文人工摘要 + 代码猜出来的政策路由,而是 **44 篇沃尔玛官方英文政策全文** +
+上游三层的确定性证据 + 本 PT 的准入要求。
 
 判定**不动分数**(hit penalty 恒 0),只决定 verdict:
 `reject` → 整品拒(stage=L3);`pending` → 待人工;`pass` → 交 L4(若开)。
 
-**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对**同一轮
-的所有产品**逐字节相同(政策静态段 + 政策压缩块 —— 候选块与压缩块都由政策表
-**全部**行实时渲染),进程内只构造一次。任何把产品信息拼进 system 的写法都会
-打散前缀缓存,命中率从 ~95% 掉回 ~63%。
+### 5.1 提示词四段(S1 指令 / S2 类别枚举 / S3 分隔 / S4 政策全文)
 
-⚠ **2026-09-02 契约退役**(`docs/policy_sync.md` §十.7):"对所有产品逐字节相同"
-的实际含义一直是"同一轮内相同" —— 政策表一改(新增行 / 改名 / 刷新正文),
-提示词就跟着变,这是**设计如此**(政策表就是 L3 的判定输入)。提示词里那句
-硬写的「37 条」同批改为按实时条数渲染(库里早就不是 37 行,自称的数目与紧随
-其后的清单对不上)。政策表变更后前缀缓存一次性重建属预期成本,同批递增
+| 段 | 内容 | 来源 |
+|---|---|---|
+| S1 | 指令:判据只认末尾原文、`policy` 逐字抄枚举、`detail` 的写法、品牌证据怎么判、本 PT 准入要求怎么判、严格 JSON | 代码字面量(`_S1`) |
+| S2 | 候选类别清单 | `SELECT category_en … ORDER BY category_en` + `registry.resources.AUDIT_NONPOLICY_CATEGORIES` + `none` |
+| S3 | 分隔段(自称的篇数 = S4 实际渲染出的篇数) | 代码字面量(`_S3`) |
+| S4 | **44 篇官方英文全文**,每篇 `## 类别名` + 喂入版正文 | `SELECT id, category_en, full_policy … WHERE full_policy IS NOT NULL ORDER BY id`,经 `services/policy_feed.render_feed_text` 渲染 |
+
+- **喂入版渲染件不落库**:库里存官方原文,喂 LLM 的版本渲染时派生(清洗只有
+  一条路径,`docs/policy_sync.md` §十.3);剥掉链接 / 页内导览 / 免责声明 /
+  页面 chrome,单行数据表转成「列名 + 条目清单」。
+- **没有全文的行整条跳过并计数**(`STATS["policy_no_full_text"]`,进 run 摘要):
+  只剩一个 `## 标题` 的空壳等于没给判据,却会让 LLM 以为"这一类我看过了"。
+  它仍在 S2 候选里 —— 那正是要人去补 `full_policy` 的信号。
+- **篇数按真正渲染出来的段数填**,不是政策表行数,也不能数 `## ` ——
+  官方正文自己带 `## Overview` 一类小标题(实测 251 个),数出来的是假数。
+- 体量:S1+S3 约 2.6K 字符,S4 约 21 万字符 ⇒ 整段 system prompt ≈ 6 万 token。
+
+**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对**同一轮
+的所有产品**逐字节相同,进程内只构造一次。任何把产品信息拼进 system 的写法都会
+打散前缀缓存(命中率 ~95% → ~63%)。政策表一改(新增行 / 改名 / 刷新正文),
+S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入):缓存的前提是
+"每个产品都一样",不是"永远一样";变更后一次性重建属预期成本,同批递增
 `AUDIT_RULES_VERSION`。
 
-**失败语义与旧系统相反**:LLM 重试尽 / 坏 JSON / verdict 取值非法,
-**一律 pending**(旧仓是 pass)—— 故障窗口漏审违规商品的代价远大于人工复核。
+### 5.2 user 段:产品 + 上游证据 + 本 PT 准入要求
+
+```
+# 产品信息      ASIN / 标题 / 品牌字段 / Amazon 类目 / 沃尔玛 PT / Category
+               (+ 飞书人工标注 pt_meta.notes,≤200 字符)
+               五点描述(≤10 条)+ 长描述(≤3000 字符)
+# 本 PT 的沃尔玛准入要求    walmart_pt_meta.requirements[:500](没有则整段不出)
+# 上游证据                  L0/L1/L2 三层 penalty==0 的软 hit
+# 待评估的品牌/商标词        同一通道里的品牌词,前 10 个
+```
+
+三处与 2026-09-02 之前不同:
+
+- **长描述 600 → 3000 字符**(所有者定稿 §六.7):判违规靠的是正文,600 字
+  砍掉的正是宣称最密的那一段;每品多 ≈1K token,与 6 万 token 前缀比可忽略。
+- **删「原产国」行**:采集契约里根本没有这个值,给 LLM 一个恒空字段只会
+  诱导它把"原产国未知"当证据。
+- **新增「本 PT 的沃尔玛准入要求」**:R3 硬拒的替身。"这个类目要什么证"是
+  事实(飞书维护),"**这个具体产品**要不要"是判断 —— 后者交 LLM,拿不准
+  一律 pass(2026-08-21 咖啡桌教训的彻底版:不许按类目名连坐整类)。
+
+### 5.3 上游证据通道(`summarize_evidence`)
+
+读 **L0 / L1 / L2 三层**里 `penalty == 0` 的软 hit(扣了分的是硬拒,那种产品
+根本进不了 L3),按 `rule_code` 查一张渲染表出一行:
+
+| rule_code | 送什么 |
+|---|---|
+| `title_desc_blacklist`(R4) | 前 10 个命中品牌 + 原文片段 |
+| `cat_requires_cert*`(R3) | `meta_requirements` / `hard_cert_fields` / `soft_cert_fields` |
+| `trademark_live`(R5) | 前 10 个 USPTO mark |
+| `content_promotional`(R7) | strong + allcaps 短语;只有软词时标「仅空洞形容词」 |
+| `walmart_strict_sensitive`(R8) | subtypes + 命中短语 |
+| `phase0_brand_mention`(C 批迁入 L0) | 前 10 个命中品牌 + 原文片段 |
+| **未登记的任何 rule_code** | `* {rule_code}: {detail 摘要}` —— **不丢** |
+
+通道按 rule_code 查表,与证据出自哪一层无关 —— C 批把品牌文案扫描迁进 L0
+时,判定链一个字都不用改。品牌词清单(≤10)出自同一通道。
+
+> ⚠ 这条通道的合同是"上游软证据一条不丢"。漏掉一条不会报错,只会让 L3 少看
+> 一样东西 —— R7/R8 曾经整整两个月一个字都没进提示词,而 L2 的 detail 里
+> 写着"L3 LLM 需判断宣称词是否有事实依据"。承诺了没送到,比不承诺更糟。
+
+### 5.4 输出三段与解析
+
+```json
+{"verdict": "pass|reject",
+ "policy": "<候选类别之一,逐字;pass 时 none>",
+ "detail": "<中文 ≤120 字:原文片段 + 条款要点>",
+ "brand_verdicts": [{"brand": "…", "is_real_brand": true, "evidence": "…"}],
+ "confidence": "high|medium|low"}
+```
+
+解析顺序(`parse_l3_reply`),**零模糊归一化**:
+
+1. 非 JSON / verdict 取值非法 → pending `llm_bad_json`(绝不默认放行);
+2. **品牌翻拒**:任一 `brand_verdicts[].is_real_brand is True` 且 LLM 自述
+   pass → 改判 reject + `Intellectual Property` + detail「未授权引用品牌名 X」
+   (严格 `is True`,字符串 "true" 不算);
+3. pass → `policy` 强制 `none`(pass 没有类别);
+4. reject → `policy` 经 `services/policy_names.resolve` 对枚举解析,命中回
+   **表内原拼写**;**对不上 → pending `llm_bad_policy` + 计数**;
+5. reject 落 1 条 L3 hit:`rule_code = llm_<policy slug>`,detail 五键定序
+   `{policy, detail, confidence, brand_verdicts, prompt_version}`。
+
+> ⚠ 第 4 步是 B1 最要紧的一处删除。旧版认不出类别就降级猜 `intellectual
+> property` —— 猜出来的类别会一路落库、进飞书 G 列、进申诉口径,而没有任何
+> 东西会红。现在它转 pending,并且计数进 run 摘要:成批出现 = 提示词或政策表
+> 出了问题,不是单品的事。
+
+**失败语义与旧系统相反**:LLM 重试尽 / 坏 JSON / verdict 非法 / 类别对不上,
+**一律 pending** —— 故障窗口漏审违规商品的代价远大于人工复核。
 pending **不写 llm_cache**。
-
-### 5.0 政策路由:哪几条政策会被点名送进 user 段
-
-`route_policy_hints(walmart_category, walmart_pt, known=…)` 用两张内存表
-(`_CATEGORY_ROUTES` 等值 + `_PT_KEYWORD_ROUTES` 裸子串)挑 ≤5 条最相关政策,
-永远以 `Intellectual Property` + `Offensive Content` 打头(截断也挤不掉)。
-**这只是提示**,不是判据白名单 —— 白名单是全表(`valid_reason_categories`)。
-
-两张路由表里写的是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),而政策表
-2026-09-02 起用官方拼写。所以每个条目都过一次
-`services/policy_names.resolve(名字, known)` 再返回:精确 → casefold → 词形
-(`&`↔`and` / 逗号 / 括号后缀 / 单复数)→ 旧名映射,**命中回表内原拼写**。
-改名前后同一张路由表都活,不必跟着改名批改字面量。
-
-> ⚠ 旧写法是 `c in known` 直接过滤 —— 改名后会**静默丢掉 7 条**政策提示:
-> 提示词照旧漂亮、判定照旧返回,只是 L3 少看了 7 类政策。没有任何东西会红。
-
-**两条本来就是死的**(不是改名改坏的,官方 42 名里根本没有这两个类别名):
-
-| 路由表写的 | 政策表里的实际情况 |
-|---|---|
-| `Pet Products` | 官方是 `Pet Foods, Supplements, Medicines and Other Products`,归一化打不平 |
-| `Jewelry/Precious Metals` | 旧仓自造的斜杠写法,官方那条是 `Jewelry, Watches, … (Covered Goods)` |
-
-它们每次命中记 **warning + 计数**(同名一轮只警告一次,计数逐次累加),
-进 `product_audit` 摘要的「⚠ L3 政策路由解析不到 N 次」那行 —— 旧写法只记
-debug,等于没人看得见。改法(补映射 / 改路由表 / 枚举化)随
-`docs/policy_sync.md` §十.7 的「L3 输出规范化」一起定。
-
-### 5.1 L2 证据怎么送进 L3
-
-`summarize_l2_for_l3` 把 L2 的软 hit 摘成几行文本进 user 段:
-
-| L2 hit | 送什么 |
-|---|---|
-| `title_desc_blacklist` | 前 10 个命中品牌 + 原文片段 |
-| `cat_requires_cert_*` | `meta_requirements` / `hard_cert_fields` / `soft_cert_fields` |
-| `trademark_live` | 前 10 个 USPTO mark |
-| `content_promotional` | strong + allcaps 短语;只有软词时标「仅空洞形容词」 |
-| `walmart_strict_sensitive` | subtypes + 命中短语 |
-
-> **2026-08-20 补上两处丢证据**(此前是"照迁旧缺陷"):
-> ① R7/R8 **原先完全没有分支**,一个字都进不了提示词 —— L2 在 detail 里
-> 写着"L3 LLM 需判断宣称词是否有事实依据",L3 却只能自己从原文重看一遍。
-> ② cert 分支取的是 `detail['requirements']`,这个键在三种 cert hit 里
-> **一个都不存在**(真实键是 `meta_requirements` / `hard_cert_fields` /
-> `soft_cert_fields`),于是前两档永远退化成一句固定套话。
 
 ---
 
@@ -435,39 +470,84 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 
 ---
 
-## 7. 理由映射:reject 之后说人话(`services/audit_reason.py`)
+## 7. 类别与具体内容:reject 之后说什么(`services/audit_reason.py`)
 
-`verdict=reject` 时算一个 **Walmart 政策表的 `category_en`**(条数随表,
-2026-09-02 起是官方 42 类),按顺序:
+结论是**三段**(2026-09-02 第三步 B1 定稿,`docs/audit_step3_spec.md` §二/§3.4):
+
+| 段 | 是什么 | 落点 |
+|---|---|---|
+| 判定结果 | pass / reject / pending | `products.audit_status`、上架表 F 列 |
+| **类别** | 判定落在哪一类 | `products.audit_reason`、上架表 G 列、事件 `detail.reason` |
+| **具体内容** | 那一句话:原文片段 + 条款要点,或规则命中翻成的人话 | `products.audit_detail`、上架表 H 列、事件 `detail.detail` |
+
+### 7.1 类别词表:只许两种来源、零推断
+
+1. **官方政策类别名** —— `audit.walmart_prohibited_policy.category_en` 实时集合
+   (44 条:42 类禁售 + 内容族两页),用**表内原拼写**;
+2. **两条非政策类别**(`registry.resources.AUDIT_NONPOLICY_CATEGORIES`):
+   - `内部黑名单` —— 卖家 / ASIN / 亚马逊类目黑名单命中(我们自己的决策,
+     不对应任何沃尔玛政策);
+   - `类目准入` —— 类目白名单拦下、出版物硬禁、以及 L3 判"需证而无"却没有
+     任何政策覆盖它。
+
+pass → 类别 NULL;pending → 类别 NULL(待定原因写在**具体内容**里)。
+
+### 7.2 每条硬拒规则**自带**类别(在 detail 的 `category` 键里自报)
+
+| 规则 | 类别 |
+|---|---|
+| `phase0_lark_blacklist_seller` / `_asin` | `内部黑名单` |
+| `phase0_lark_blacklist_amazon_cat` / `phase0_forbidden_category` | 黑名单行的 `walmart_policy` 能 `policy_names.resolve` 到政策表 → 该政策;否则 `内部黑名单` |
+| `phase0_brand_blacklist` / `phase0_trademark_symbol` / `phase0_patent_claim` | `Intellectual Property` |
+| `publication_pt_forbidden`(L1) | `类目准入` |
+| `cat_access_blocked` / `cat_zh_blocked`(L2 R1) | `类目准入` |
+| L3 reject | LLM 输出的 `policy`(解析层已对枚举校验) |
+
+规则代码里写死的政策名只有一个(`registry.resources.AUDIT_IP_POLICY`),
+`audit_rules.load_context` 装配时对表解析一次:解析不到、或与表内拼写不同,
+**启动即 RuntimeError**(表改名而代码没跟上时,静默的后果是那几条硬拒一直往
+库里写一个表里不存在的类别名,而三处口径对不上都不会红)。
+
+### 7.3 `compute_final_reason` = 查表,四步
 
 | 步 | 判据 | 结果 |
 |---|---|---|
 | 0 | 不是 reject | None |
-| 1 | hit 是 `phase0_forbidden_category` 且 detail 有 `walmart_policy` | 该 policy 原样 |
-| 1.2 | 黑名单中心三码(asin/seller/amazon_cat) | **None**(内部决策,不对应任何沃尔玛政策) |
-| 2 | L3 判 reject 且给了 reason_category | 归一化值(**随表**:`policy_names.resolve` 对实时 `category_en` 集合解析,命中回表内原拼写;2026-09-02 §十.7) |
-| 1.5 | 其余带 `walmart_policy` 的 hit | 该 policy **对表解析后**的表内拼写(解析不到才原样) |
-| 3 | L4 判 reject | 按 issue 文本 → Offensive Content / Intellectual Property |
-| 4a | `publication_pt_forbidden` | Intellectual Property |
-| 4c | PT 关键词十组 | 对应政策 |
-| 4d | cert 两码(`cat_requires_cert_hard` / `_soft`;`_small_part` 2026-08-21 已下线)→ 按 `walmart_category` 分桶 | 对应政策 |
-| 4e/4f | 商标 / 黑名单品牌 | Intellectual Property |
-| 4g | 全不中 | General-Use Products |
+| 1 | all_hits(phase0 → l1 → l2 → l3 序)第一条 detail 带 `category` 的 | 该值 |
+| 2 | l3 判 reject | `l3.policy` |
+| 3 | 都没有 | **None** + `STATS["reason_missing"]` + warning |
 
-步 2 与步 1.5 都走 `services/policy_names.resolve(名字, ctx.known_policies)`
-(仓内唯一一份政策名归一化),命中回**表内原拼写**:
+**没有兜底**。判拒而没有类别只可能是代码 bug(某条硬拒规则忘了自报),
+落 NULL + 计数 + warning,让它自己现形 —— 而不是编一个
+`General-Use Products` 出来(所有者 2026-08-16:「理由是 General-Use
+Products,这是什么意思」)。
 
-- 步 2 吃的是 L3 答出的 `reason_category`;
-- 步 1.5 是 **`services/audit_l2._infer_walmart_policy` 那批写死的旧缩写名**
-  (`Military & Law Enforcement` / `Electronics & RF` / `Drugs & Paraphernalia`
-  …)进 `final_reason_category` 的**唯一出口** —— 在这一处解析就够了,
-  不逐条改 audit_l2 的常量(那是 §十.7「L3 输出规范化」那一步的事)。
+> ⚠ **已知缺口(B1 → C 批之间)**:`cat_requires_cert_hard`(R3 硬拒)与
+> `made_in_usa_claim`(R10)这两条硬拒规则还没有自报类别 —— C 批一条降为
+> 证据、一条迁进 L0 并带 `Product claims`。在 C 合并之前,它们拒掉的产品走
+> 第 3 步:类别 NULL + 计数。**这是有意的**(§10:B、C 只切换一次,生产机等
+> C 合并后再 pull),C 批合并后这个计数应回到 0。
 
-落在政策表之外时**只记 warning 不改判**(兜底触发必须留痕)。已知会落在表外的:
-`Restricted/Illegal` / `Jewelry/Precious Metals` / `.title()` 变形值,以及
-2026-09-02 表改官方拼写之后,**4c/4d 两步**里写死的旧缩写名(`Military & Law
-Enforcement` 一族)—— 那两步是 PT/类目关键词**兜底推断**,输入根本不是政策名,
-对表反而会把"推断"伪装成"表里查到的";改法随 §十.7 的「L3 输出规范化」一起定。
+2026-09-02 B1 **删掉**的九步推断(别照着旧文档写回来):步 1/1.5 读
+`walmart_policy`、步 1.2 内部黑名单特判、步 2 的 `_normalize_l3_cat` 归一化
+(L3 输出在解析层就对表了)、步 3 的 L4 issue 关键词猜测、步 4a–4g
+(`_pt_to_policy` 十组裸子串 / cert 分桶 / `General-Use Products` 兜底)、
+`known_policies_check`。政策名归一化从此只有 `services/policy_names` 一处实现。
+
+### 7.4 具体内容怎么来(`audit_store.conclusion_detail`)
+
+- reject + L3 判的 → `l3.detail`(LLM 给的中文一句:原文片段 + 条款要点);
+- reject + 规则判的 → **判死那条 hit** 的 `explain_hit`(它本来就是"具体内容"
+  形态,如 `商标符号(命中:XYZ®)`);
+- pending → 三句固定句之一(按停在哪一层分,重试口径不同:L1 类目解不出
+  隔天重试有意义 / L2 要等 `walmart_pt_meta` 补行,重刷无用 / L3 LLM 故障
+  重试有意义);
+- pass → NULL。
+
+`explain_hit`(一条 hit)与 `explain_hits`(最多三条,取代退役的
+`human_reason`)保留:飞书上架表 H 列渲染**存量老行**(还没有 `audit_detail`
+的那些)靠它 —— 不兜底的话,几十万行会在表上一夜变成空白,看起来像"审核把
+理由弄丢了"。
 
 ---
 
@@ -515,12 +595,16 @@ Enforcement` 一族)—— 那两步是 PT/类目关键词**兜底推断**,输�
 
 全量重审:`python cli.py product_audit -p force_rerun=c.2026-08-18.1`
 
-### 8.5 关于那 46 条沃尔玛禁售政策
+### 8.5 关于那 44 篇沃尔玛官方政策
 
-**不接进类目判定。** 那 46 条是**按产品**写的概述,不是按类目写的:
-同一个 PT 底下既有能卖的也有不能卖的(`Garden & Patio` 下既有园艺耙也有
-禁售的活体种苗),PT 级套政策必然误杀整类。
-政策的落点在**产品级**:L2 `_infer_walmart_policy` 推出政策标签 → 给 L3 当上下文。
+**不接进类目判定。** 政策是**按产品**写的,不是按类目写的:同一个 PT 底下
+既有能卖的也有不能卖的(`Garden & Patio` 下既有园艺耙也有禁售的活体种苗),
+PT 级套政策必然误杀整类。
+
+政策的落点在**产品级**:2026-09-02 第三步 B1 起,**44 篇官方英文全文整段进
+L3 的 system prompt**(§5.1),由 LLM 拿产品正文与原文条款逐条核对 ——
+不再由 L2 的 `_infer_walmart_policy` 用类目关键词推一个政策标签当上下文
+(那张表 C 批随 R3/R7/R8 一起删)。
 
 ---
 
@@ -534,17 +618,29 @@ python cli.py audit_why -p asins=B0XXXXXXXX
 **哪张表哪一列**。看到不认识的 rule_code 先查 `workflows/audit_why.py`
 里的判据出处表。
 
+结论那几行按**三段**打印(2026-09-02 B1):`结论 <判定> 类别 <类别>` +
+`具体内容 <那一句>`。老行(B1 之前审的)`audit_detail` 是 NULL,打出来就是
+`None` —— 那是"这一行还没被新链重审过"的样子,不是查询坏了。
+
 ---
 
 ## 10. 2026-09-02 所有者定稿:审核链瘦身(随第三步 L3 批实施)
 
-背景:L3 换喂官方英文政策全文(`refdata/policy_pages/en`,42 条)之后,L2 里
-"硬代码代 LLM 判语义"的规则失去存在理由;黑名单能力只许有一处实现。定稿:
+背景:L3 换喂官方英文政策全文(`refdata/policy_pages/en`,44 篇)之后,L2 里
+"硬代码代 LLM 判语义"的规则失去存在理由;黑名单能力只许有一处实现。
+
+**进度(2026-09-02)**:A 批(内容族两页转录)与 **B1 批已落地**(见下表
+「已落地」列与 §5 / §7);B2(回放工作流 `audit_replay`、`mode=stale` 的
+`active_days`、首条串行预热)与 C 批(L0 双输出 / L2 只剩 R1 / 删 R3 硬拒、
+R4、R5、R7、R8、R10 与 `POLICY_LEGACY_NAMES` 一族)未做。
+⚠ **B 与 C 只切换一次**:两批各自递增 `AUDIT_RULES_VERSION`,生产机等 C 合并
+后再 `git pull` —— pull 的时机就是切换的时机(`audit_sheet` 18:10 当晚就会用
+新链重审上架表里的品)。定稿:
 
 | 规则 | 处置 | 说明 |
 |---|---|---|
 | R1 类目准入 | **保留,成为 L2 的全部** | 拿 L1 的 PT 查白名单 `access_state` + `zh_can_do`;PT 查不到 → pending(判不了 ≠ 判过了) |
-| R3 类目需证书 | 硬拒分支**降为证据** | 该 PT 的 `requirements` 一行随产品送 L3,由 LLM 判"这个具体产品要不要这张证"(2026-08-21 咖啡桌教训的彻底版);硬闸只留白名单 `zh_can_do` |
+| R3 类目需证书 | 硬拒分支**降为证据**(C 批);**替身已在 B1 落地** | 该 PT 的 `requirements` 一行随产品送 L3(§5.2),由 LLM 判"这个具体产品要不要这张证"(2026-08-21 咖啡桌教训的彻底版);硬闸只留白名单 `zh_can_do`。⚠ B1 → C 之间 R3 硬拒仍在,而它**没有自报类别** ⇒ 那批 reject 的类别落 NULL + `reason_missing` 计数(§7.3 已知缺口) |
 | R4 品牌黑名单扫文案 | **移入 L0,双输出** | 黑名单能力只在 L0 一处实现、一份数据:`brand` 字段精确等值 → 硬拒终止(现规则 4);标题/五点/描述扫到黑名单词 → **0 分证据不终止**,送 L3 由 LLM 判是品牌还是"兼容/提及"(R6 误伤 90% 的教训:提到 ≠ 卖的就是)。词边界 / 中文紧邻即边界 / 自品牌精确豁免 / 同品牌只报一次的逻辑随迁 |
 | R5 USPTO 在效商标 | **删除** | 默认关、覆盖率 2.6 万/1400 万,死重;将来需要按新流程重建 |
 | R7 促销宣称 | **退役,前置条件先满足** | 其判据(#1 / best seller / premium quality / FDA approved)属沃尔玛 **Content Standards**,不在 42 条禁售政策内 —— 先用 policy-refresh 流程把 Content Standards 页转录进 L3 前缀,再删 R7(先补后删,无真空期) |
@@ -558,15 +654,26 @@ L0  库黑名单精确拦截(卖家/ASIN/亚马逊类目/品牌)+ 商标符号 +
     + 品牌黑名单文案扫描 → 0 分证据,不终止
 L1  定 PT(是什么;LLM 只在候选 rerank 出场)
 L2  = R1 白名单准入(能不能;代码查表,确定性)
-L3  产品全文 + 42 条政策英文全文 + Content Standards + 本 PT 的 requirements 行 + L0 品牌证据
-    → 判定结果 / 政策类别(官方 42 名枚举)/ 具体内容
+L3  产品全文 + 44 篇政策英文全文(含内容族两页)+ 本 PT 的 requirements 行 + L0 品牌证据
+    → 判定结果 / 类别(官方类别名 + 内部黑名单 / 类目准入)/ 具体内容
 ```
 
-工程要点(执行规格:`docs/audit_step3_spec.md`,2026-09-02 草案待定稿):
+L3 那一行 **B1 已落地**(§5);L0 的双输出与 L2 的瘦身留给 C 批。
 
-- L0 契约从「命中即终止」改为「**硬命中终止、软命中带证据前行**」;`audit_hits` 可落多行;
-  `stage_stopped_at` 语义不变(只有硬拒才停);
-- 证据进 L3 的通道泛化为「读取上游**所有阶段**的软 hit」(现 `summarize_l2_for_l3` 只读 L2);
+工程要点(执行规格:`docs/audit_step3_spec.md` §三,所有者八项定稿 §六):
+
+- ✅ **B1 已落地** —— S4 换官方英文全文、S2 枚举补两条非政策类别、S1 重写、
+  user 段扩容(描述 3000 / 五点全给 / 本 PT 准入要求 / 删原产国与路由提示)、
+  输出三段化与解析零猜测、类别由规则自报、`compute_final_reason` 收敛为查表、
+  `catalog.products.audit_detail` 新列与飞书 G/H 分列、政策路由整体删除;
+- ✅ **B1 已落地** —— 证据进 L3 的通道泛化为「读取上游**所有阶段**的软 hit」
+  (`summarize_evidence(phase0, l1, l2)`,按 rule_code 查渲染表,未登记的也不丢);
+- ⬜ B2 —— `audit_replay` 回放工作流、`mode=stale` 的 `active_days=90`、
+  首条串行预热(省一批前缀缓存 miss);
+- ⬜ C 批 —— L0 契约从「命中即终止」改为「**硬命中终止、软命中带证据前行**」
+  (`audit_hits` 可落多行;`stage_stopped_at` 语义不变,只有硬拒才停);
+  R4/R10 迁入 L0、L2 只剩 R1、删 R3 硬拒 / R5 / R7 / R8 与
+  `POLICY_LEGACY_NAMES` / `to_official` / `POLICY_ALIASES`;
 - 存量 `audit_hits` 的 rule_code(`title_desc_blacklist` / `cat_requires_cert_*` / `content_promotional`
   / `walmart_strict_sensitive` …)保留兼容渲染,新链不再产生;
 - **顺序:先换喂(L3 读英文全文 + Content Standards),后删 R7/R8**;`AUDIT_RULES_VERSION` 同批递增;

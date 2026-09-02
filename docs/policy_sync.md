@@ -262,18 +262,49 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
        旧写法 `c in known` 改名后**静默丢 7 条**政策提示)、
        `audit_reason._normalize_l3_cat` 与**步 1.5**(`audit_l2._infer_walmart_policy`
        那批旧缩写名的唯一出口)、`error_taxonomy._norm_key`;
-     · 遗留(本批不动,已在代码里标注):
+       ⚠ 前三处**已随 2026-09-02 第三步 B1 批退役**(路由表整删、理由映射收敛为
+       查表),`resolve` 现在的消费方是 `audit_l3.parse_l3_reply`(L3 答出的类别
+       对枚举)、`audit_phase0`(黑名单行的 `walmart_policy` 对表)、
+       `audit_rules.check_rule_policies`(装配期守门)与 `error_taxonomy`;
+     · 遗留(改名批不动,已在代码里标注;**①②已随 B1 消化**,见下条):
        ① `audit_reason._pt_to_policy`(步 4c)与 4d cert 分桶里写死的旧缩写名 ——
           那两步是 PT/类目关键词**兜底推断**,输入不是政策名,对表反而会把"推断"
           伪装成"表里查到的";改名后它们落在表外(只多几条 warning 计数,判定不变),
-          改法随「L3 输出规范化」一起定;
+          改法随「L3 输出规范化」一起定 → **B1 整段删除**(理由映射收敛为查表);
        ② `audit_l3` 路由表里 `Pet Products` 与 `Jewelry/Precious Metals` 两条 ——
           官方 42 名里根本没有这两个类别名(官方是 `Pet Foods, Supplements,
           Medicines and Other Products`;Jewelry 那条是旧仓自造的斜杠写法),
-          归一化也打不平。**改名前就是死的**,不是本批改坏的;现在每次命中记
-          warning + 计数并进 run 摘要(旧写法只记 debug,等于没人看得见);
-       ③ `audit_l2._infer_walmart_policy` 的常量仍是旧缩写名 —— **不逐条改**,
-          由步 1.5 单一出口解析(常量的枚举化随「L3 输出规范化」一起定)。
+          归一化也打不平。**改名前就是死的**,不是改名批改坏的 → **B1 整张路由表
+          删除**(政策类别 ≠ 类目,换全文后提示只会把注意力锁在 ≤5 篇上);
+       ③ `audit_l2._infer_walmart_policy` 的常量仍是旧缩写名 —— **不逐条改**;
+          B1 后理由映射不再读 `walmart_policy`,该函数随 C 批删 R3/R7/R8 一起退役。
+
+     · **「L3 输出规范化」落地口径(2026-09-02 第三步 B1 批,规格
+       `docs/audit_step3_spec.md` §二/§3.3/§3.4/§3.5)** —— §十.7 第四条
+       「审核输出与最终结果统一为三段」的落纸:
+
+       · **类别词表**:官方 `category_en` 实时集合(44)+ registry 常量
+         `AUDIT_NONPOLICY_CATEGORIES`(`内部黑名单` / `类目准入`)+ pass 的
+         `none`。**零兜底**:判拒而没有类别 = 代码 bug,落 NULL + 计数 +
+         warning,不许再有 `General-Use Products` 那样的兜底值;
+       · **来源只有两处**:硬拒规则在 `hit.detail["category"]` 里**自报**
+         (§二 表),L3 在结构化输出的 `policy` 里给。规则代码里写死的政策名
+         只剩一个(`resources.AUDIT_IP_POLICY`),`audit_rules.load_context`
+         装配时对表解析一次 —— 解析不到或拼写不同**启动即 RuntimeError**;
+       · **解析层对表**:`parse_l3_reply` 用 `policy_names.resolve(policy,
+         枚举)` 回表内原拼写;**对不上 → pending `llm_bad_policy` + 计数**
+         (旧版降级猜 `intellectual property`,已删)。于是下游一层归一化都
+         不需要:`audit_reason._normalize_l3_cat` / `_L3_NORMALIZE` /
+         `known_policies_check` 随之退役;
+       · **落库三段**:`catalog.products` 新增 `audit_detail`;`audit_reason`
+         专放类别(pass 与 pending 为 NULL);`audit_runs.l3_reason_category`
+         / `l3_reason_text` **列名不改、语义 = 类别 / 具体内容**;
+         `product_events.audit_rejected` 的 `detail.reason` 键名不改,新增
+         `detail.detail`;飞书上架表 F/G/H 三列对齐同一口径(老行按有没有
+         `audit_detail` 决定用新格式还是老格式渲染);
+       · **提示词侧**:S4 改喂 `full_policy` 的 `render_feed_text` 渲染件
+         (人工中文列不再进提示词);全文为空的行整条跳过并计数;S2 枚举
+         删 `brand_misuse`(品牌误用归 IP,由确定性翻拒规则落地)。
      · **已解决(与上一版记录相反,勿照旧引用)**:`error_taxonomy._norm_key` 已归并为
        `policy_names.norm_category`(不再是"只折叠空白 + casefold"),于是
        `Plants & Seeds` / 牛津逗号 Tobacco / 无 `(Covered Goods)` 的 Jewelry 三种报错

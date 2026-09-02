@@ -17,7 +17,8 @@ L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 44 篇官�
 | 批 | 内容 | 合并后生产动作 |
 |---|---|---|
 | **A 转录** | 内容族两页按 policy-refresh 纪律转录 en/zh 进 `refdata/policy_pages/`(**2026-09-02 已落地**:43 `Content standards: Overview` 所有者粘贴、44 `Product details policy` 公开页结构化数据 + 粘贴交叉核对);`policy-refresh` 技能补第二来源;喂入层补两条规则(图片整删、表尾空行不算数据行) | **不跑** `policy_sync`(跑了会再让 L3 缓存全量失效一次,白付);等 C 合并后随切换一起跑 |
-| **B 换喂 + 规范化 + 回放** | S4 换官方全文;user 段扩容;输出 schema 三段化;`audit_detail` 落库;理由映射去猜测;证据通道泛化;路由提示删除;`audit_replay` 回放工作流 | 生产机**不 pull**(见 §五) |
+| **B1 换喂 + 规范化**(**2026-09-02 已落地**) | S4 换官方全文;user 段扩容;输出 schema 三段化;`audit_detail` 落库;理由映射去猜测;证据通道泛化;路由提示删除 | 生产机**不 pull**(见 §五) |
+| **B2 回放 + 重审面** | `audit_replay` 回放工作流;`mode=stale` 的 `active_days=90`;首条串行预热 | 同上 |
 | **C 瘦身 + 清理** | L0 双输出(品牌文案扫描迁入)+ Made in USA 迁入;L2 = R1;删 R3 硬拒/R4/R5/R7/R8/R10 及其数据;删 `POLICY_LEGACY_NAMES` / `POLICY_ALIASES` / `to_official` / `_L3_NORMALIZE` / `_pt_to_policy` / 路由表 | 生产机 pull A+B+C → 按 §五 切换 |
 
 顺序理由:§10「先换喂后删 R7/R8」;B、C 分两批是为了对抗复核可读,但**只切换一次**
@@ -60,7 +61,11 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 
 ## 三、B 批规格:L3 换喂 + 输出规范化 + 回放
 
-### 3.1 system prompt(S1–S4,仍是单一连续静态前缀)
+> **落地状态(2026-09-02)**:§3.1–§3.7 与 §3.10 的测试/文档/版本部分 **B1 批
+> 已落地**(判据版本 `c.2026-09-02.2`);§3.8 回放工作流、§3.9 的首条串行预热、
+> §六.8 的 `mode=stale -p active_days` 属 **B2 批,未做**。
+
+### 3.1 system prompt(S1–S4,仍是单一连续静态前缀)—— **B1 已落地**
 
 - **S4 = 官方英文全文**:`POLICY_ROWS_SQL` 改为 `SELECT id, category_en, full_policy FROM
   audit.walmart_prohibited_policy WHERE full_policy IS NOT NULL ORDER BY id`;每行渲染为
@@ -76,11 +81,15 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
   品牌误用);本 PT 准入要求的判法(先判"这个具体产品要不要这张证",要而 listing 无 → 拒,
   类别 = 覆盖它的政策,没有政策覆盖 → `类目准入`);输出严格 JSON。`{N}` 占位符保留,
   措辞改为「{N} 篇沃尔玛政策全文(Prohibited Products Policy 各类别 + 内容标准两页)」。
-- 体量:S1+S3 约 6K 字符不变;S4 由现上界 ≈17.6K 字符变为 ≈199K 字符(42 篇
-  `render_feed_text` 后实测 199,123;Content Standards 另加),≈ 5–5.5 万 token;
-  deepseek-v4-flash 1M 上下文内,前缀缓存命中的硬前提(顺序固定、逐字节稳定)不变。
+- 体量(**B1 实测**):S1+S3 = 2,372 + 181 字符(重写后比旧版 6K 短 —— 旧版
+  一半篇幅是关键词清单与判定维度,换全文后由原文承担);整段 system prompt
+  212,556 字符 ≈ 6.1 万 token(44 篇渲染件);deepseek-v4-flash 1M 上下文内,
+  前缀缓存命中的硬前提(顺序固定、同轮逐字节稳定)不变。
+- **篇数按真正渲染出来的段数填**(B1 实现修订):官方正文自己带 `## Overview`
+  一类小标题(实测 251 个),按 `## ` 数出来的是假数;`policy_parts()` 返回
+  列表,`len()` 即篇数。
 
-### 3.2 user 段
+### 3.2 user 段 —— **B1 已落地**
 
 在现模板(`services/audit_l3.py:638-661`)上改四处:
 
@@ -96,7 +105,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 `原产国` 行恒 `(空)`(采集契约无此值,`:637`)—— 本批不动,删这一行(给 LLM 一个恒空字段
 只会诱导它把"原产国未知"当证据)。
 
-### 3.3 输出 schema 与解析
+### 3.3 输出 schema 与解析 —— **B1 已落地**
 
 ```json
 {
@@ -124,7 +133,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
      `AUDIT_RULES_VERSION`,给回放与 audit_why 对版本)。
 - `L3Result` 字段随 schema 改名;`raw` 仍不落库;pending 不写 `llm_cache`(不变)。
 
-### 3.4 三段落库与投影
+### 3.4 三段落库与投影 —— **B1 已落地**
 
 | 落点 | 判定结果 | 类别 | 具体内容 |
 |---|---|---|---|
@@ -144,7 +153,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 - 存量结论不迁移:旧行 `audit_reason` 里的中文句子 / 旧政策名在被重审前原样留着,
   飞书投影按"有 `audit_detail` 用新格式,无则旧格式"渲染,不出现半新半旧。
 
-### 3.5 理由映射:`compute_final_reason` 收敛为查表
+### 3.5 理由映射:`compute_final_reason` 收敛为查表 —— **B1 已落地**
 
 新顺序(首个命中即出,全部是**规则自报**或 **LLM 结构化输出**):
 
@@ -159,7 +168,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 `'General-Use Products'` 兜底)、`_L3_NORMALIZE`、`_normalize_l3_cat`(含 `.title()` 与
 未 strip 的已知缺陷)、`known_policies_check`(枚举在解析层已保证)。
 
-### 3.6 证据通道泛化
+### 3.6 证据通道泛化 —— **B1 已落地**
 
 `summarize_l2_for_l3(l2)`(`services/audit_l3.py:549-598`,只读 L2)→
 `summarize_evidence(outcome_partial)`:读 phase0 / l1 / l2 三层里 `penalty == 0` 的软 hit,
@@ -167,7 +176,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
 不丢。B 批渲染表 = 现五分支(R4 品牌 / R3 证书 / R5 商标 / R7 促销 / R8 敏感);C 批删到只剩
 L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取。
 
-### 3.7 路由提示:删除
+### 3.7 路由提示:删除 —— **B1 已落地**
 
 `route_policy_hints` 与 `_CATEGORY_ROUTES`(31 键)/ `_PT_KEYWORD_ROUTES`(13 组裸子串)/
 `_ALWAYS_INCLUDE` / `ROUTE_MAX_POLICIES` / `STATS["route_unresolved"]` / product_audit 摘要第 10 行
@@ -176,7 +185,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 锁在 ≤5 篇上。回放评估(§3.8)顺带验证删了之后类别准确率没掉。
 (若所有者要保留:改成只读官方名的常量表,不再走 `to_official`。见 §六。)
 
-### 3.8 回放评估 `workflows/audit_replay.py`
+### 3.8 回放评估 `workflows/audit_replay.py` —— **B2,未做**
 
 - 性质:`DANGEROUS = False`;只写自己的表 `audit.replay_results` 与报告文件
   `<DATA_ROOT>/reports/audit_replay.txt`;**不写** `catalog.products` / `audit_runs` / `audit_hits` /
@@ -204,7 +213,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   got_category, got_detail, stage_stopped_at, old_verdict, old_category, confidence, created_at)`,
   `PRIMARY KEY (run_tag, asin)`。
 
-### 3.9 成本与缓存
+### 3.9 成本与缓存(首条串行预热属 **B2,未做**)
 
 - 政策表或提示词模板任何一字变化 ⇒ `catalog.llm_cache`(purpose=audit_l3)全量未命中(键含整段
   messages,`services/llm_cache.py:28-44`);本批必然全量,只付一次 —— 所以 A 批不单独跑
@@ -217,7 +226,7 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   每品约 0.01–0.02 元,谷时段减半;首条(未命中)约十几倍。
 - 全量重审规模由所有者定(§六);`mode=stale` 有天然分页,`limit` 分晚跑,排北京 18:00–08:00。
 
-### 3.10 测试、文档、版本
+### 3.10 测试、文档、版本 —— **B1 部分已落地**
 
 - 测试(新增/改写):S4 接线(43 名全在、无 URL、按 id 序、同轮逐字节稳定)、S1 `{N}`
   填充、user 段(无路由行、有准入要求行、描述 3000 截断)、解析(新 schema、resolve 容错、
@@ -229,6 +238,30 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
   `docs/db_schema.md`(`audit_detail`、`replay_results`);`docs/policy_sync.md` §十.7 补
   「输出规范化落地口径」;README 工作流数 / 测试数。
 - `AUDIT_RULES_VERSION` → `c.<合并日>.1`。
+
+**B1 落地记录(2026-09-02,与本规格的差异逐条)**:
+
+- `AUDIT_RULES_VERSION` = **`c.2026-09-02.2`**(当天已被改名批用掉 `.1`);
+- 测试 2,626 收集(2,603 跑 + 23 跳过)全绿;S4 接线的断言打在**真实转录件**上
+  (44 名全在、无 URL、每段首行是类别名、同轮逐字节稳定、缺全文计数);
+- **S1 比规格估的 6K 短**(2,372 字符):旧 S1 有一半篇幅是关键词清单与六个判定
+  维度(儿童 CPC 词表、冒犯性清单、整机电器判法),换全文后这些判据由官方原文
+  承担,再抄一份就是第二处判据。**唯一保留的一句**是「整机电器/NRTL」的形态提示
+  —— 它 2026-08-21 从 L2 迁上来时是「先补后删、无真空期」的那个补,归进
+  「本 PT 准入要求怎么判」那一节(拿不准一律 pass 的口径逐字保留);
+- **篇数不能数 `## `**:官方正文自己带 `## Overview` 一类小标题(实测 251 个),
+  改为按 `policy_parts()` 返回的段数填(见 §3.1);
+- **`explain_hit` 的 hit_val 键表摘掉 `category`**:那个键现在是规则自报的**类别**,
+  留着会把专利自述那条渲染成「文案自述专利保护(…;命中:Intellectual Property)」
+  —— 把类别名说成命中的原文,人照着去搜根本搜不到;
+- **`human_reason` 退役后的替身是 `explain_hits(hits)`**(同一份渲染,只是不再拖
+  「[政策:X]」尾巴):飞书 H 列渲染**存量老行**要它 —— 老行没有 `audit_detail`,
+  不兜底的话几十万行会在表上一夜变成空白;
+- **已知缺口**:`cat_requires_cert_hard`(R3 硬拒)与 `made_in_usa_claim`(R10)
+  不在 §二 的自报表里(C 批一条降证据、一条迁 L0 带 `Product claims`),
+  B1 → C 之间它们拒掉的产品走「类别 NULL + `reason_missing` 计数」那一路。
+  **这是有意的**(§一:B、C 只切换一次,生产机等 C 合并后再 pull),
+  C 批合并后这个计数应回到 0 —— 它同时是"C 批做完没有"的验收信号。
 
 ## 四、C 批规格:瘦身 + 清理
 

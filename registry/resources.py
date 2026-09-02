@@ -8,7 +8,7 @@
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -254,6 +254,13 @@ class Spreadsheet:
     columns: tuple[str, ...]
     wiki: bool = False      # True=token 是知识库节点 token(wiki/ 链接),
                             # api/feishu 会先解析成真实 spreadsheet_token
+    #: 字段名 → **表头行里的中文列名**(所有者在飞书里看到的那一格文字)。
+    #: 登记了 headers 的表,读写一律**按表头名定位列**(见
+    #: services/listing_sheet.layout):所有者再调列顺序也能写对列,
+    #: 而 columns 只剩「有哪些字段」这一层含义。飞书字段名只在这里出生
+    #: (CLAUDE.md 铁律 3 / conventions §八),业务代码不许写中文表头字面量。
+    #: 空 = 这张表还是老规矩(columns 的顺序**就是**列序,写入按字母硬编码)。
+    headers: dict[str, str] = field(default_factory=dict)
 
     def require(self) -> "Spreadsheet":
         if not self.token or not self.sheet_id:
@@ -526,27 +533,53 @@ RETIRE_SHEET = Spreadsheet(
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
 # product_clear 读「下架限制」,listing 链读「上架限制」等)
-# 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
-# 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
-# A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
-# G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
-# M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
-# R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
-# (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
-# ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
-# `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
-# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里。
-# 写入侧一律用显式 range(C:G / O:Q / …),不受本次对调影响。
+# 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,**表头 2026-09-02
+# 第二次重排**:21 列 A~U,旧尾部四列 真实标题/真实PT/真实UPC/UPC是否一致
+# 已被所有者删除,旧「理由」拆成「类别」+「具体内容」,新增 SKU/登记日期/查询编码):
+# A=店铺 B=ASIN C=SKU D=walmart上架标题 E=walmart_product_type F=审核结果
+# G=类别 H=具体内容 I=审核日期 J=amz价格 K=库存 L=walmart价格 M=是否上架
+# N=上架feedid O=上架日期 P=未上架理由 Q=上架结果 R=报错 S=feed查询日期
+# T=登记日期 U=查询编码
+# ⚠ **列字母只是「今天长这样」,不是契约**:读写一律**按表头名定位**
+# (services/listing_sheet.layout 每进程读一次表头行,按下面的 headers 建
+# 字段→列字母的映射)。所以所有者再挪一次列顺序,**代码一行都不用改** ——
+# 只在挪动同时改了表头文字时才需要动 headers。这是 2026-09 重排的最大教训:
+# 此前写入侧全是硬编码字母,插一列就全体静默错位(A/B 对调那次同款)。
+# ⚠ **T「登记日期」/ U「查询编码」是人工填写列,程序永不读写**(语义待所有者
+# 说明),只在 columns 里占位,免得被当成"没人要的列"顺手清掉。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
-    columns=("store", "asin", "list_title", "product_type", "audit_result",
-             "audit_reason", "audit_date", "amz_price", "stock",
-             "walmart_price", "listed", "feed_id", "list_date",
-             "not_listed_reason", "list_result", "list_fail_reason",
-             "feed_check_date", "real_title", "real_pt", "real_upc",
-             "upc_match"),
+    columns=("store", "asin", "sku", "list_title", "product_type",
+             "audit_result", "audit_category", "audit_reason", "audit_date",
+             "amz_price", "stock", "walmart_price", "listed", "feed_id",
+             "list_date", "not_listed_reason", "list_result",
+             "list_fail_reason", "feed_check_date", "registered_date",
+             "query_code"),
+    headers={
+        "store": "店铺",
+        "asin": "ASIN",
+        "sku": "SKU",
+        "list_title": "walmart上架标题",
+        "product_type": "walmart_product_type",
+        "audit_result": "审核结果",
+        "audit_category": "类别",
+        "audit_reason": "具体内容",
+        "audit_date": "审核日期",
+        "amz_price": "amz价格",
+        "stock": "库存",
+        "walmart_price": "walmart价格",
+        "listed": "是否上架",
+        "feed_id": "上架feedid",
+        "list_date": "上架日期",
+        "not_listed_reason": "未上架理由",
+        "list_result": "上架结果",
+        "list_fail_reason": "报错",
+        "feed_check_date": "feed查询日期",
+        "registered_date": "登记日期",
+        "query_code": "查询编码",
+    },
 )
 
 # 跟卖表(match_listing 驱动表,替代旧 xlsx 输入,所有者定稿 2026-08-07

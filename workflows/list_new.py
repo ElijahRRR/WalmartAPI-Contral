@@ -10,8 +10,9 @@
   python cli.py list_new -p submit_jitter_ms=0  # 提交期起跑抖动(毫秒,默认 800;
                                              # 0=关。去同步,不降并发)
 
-驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 E 审核结果=pass
-且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
+驱动表 = 上架表(registry.LISTING_SHEET,21 列;**列按表头名定位**,见
+services/listing_sheet.layout,列顺序随所有者调整,代码不跟着改):领任务条件
+审核结果=pass 且 是否上架 空/No 且 无 feedid;是否上架∈{Yes,Unknown} 跳过(Unknown 也算
 已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
 O=FAILED 走重试通道(≤3 次);O=SKU_LOCKED 本工作流不碰——由
 sku_locked_heal 自愈链处理(RETIRE→24h 冷却→清列,行变新行后回到
@@ -256,7 +257,10 @@ def _apply_submit_result(store_name: str, res: dict, batch: list,
     """
     with db.pg_conn() as conn:
         if res["outcome"] == "submitted" and res["feed_id"]:
-            upc_pool.mark_used(conn, [(u, r["asin"]) for r, u in batch])
+            # 写进 upc_pool.sku 的是**行上的 SKU**(上架表 SKU 列;批次 1 仍
+            # 回落 ASIN,批次 2 起是真码)——列名叫 sku 就该存 sku
+            upc_pool.mark_used(
+                conn, [(u, listing_sheet.row_sku(r)) for r, u in batch])
             listing_sources.register(conn, [
                 {"store": store_name, "sku": r["asin"],
                  "source_type": listing_sources.SOURCE_AMZ,
@@ -1465,7 +1469,7 @@ def run(params: dict) -> str:
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里 E 列是投影,
+    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里「审核结果」是投影,
     # 可能被人手改、可能滞后;PG 是权威,而且快。
     verdicts = load_verdicts([r["asin"] for r in rows if r.get("asin")])
     open_rows = [r for r in rows
@@ -1498,10 +1502,10 @@ def run(params: dict) -> str:
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
              + (f"(其中重试 {len(retry)})" if retry else "")]
     if n_unaudited or n_rejected:
-        # ⚠ 必须点名:审核闸从"读表 E 列"改成"读库"之后,**没审过的行会静默
+        # ⚠ 必须点名:审核闸从"读表「审核结果」"改成"读库"之后,**没审过的行会静默
         # 消失在待上架里**。不说的话表现是"表里明明有几百行却一行也不上"
         lines.append(
-            f"  审核闸(读 catalog.products,不读表 E 列):"
+            f"  审核闸(读 catalog.products,不读表「审核结果」):"
             + (f"**未审核 {n_unaudited} 行**"
                f"(先跑 `python cli.py product_audit -p from_sheet=1`)"
                if n_unaudited else "")

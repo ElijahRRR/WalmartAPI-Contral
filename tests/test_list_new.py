@@ -24,8 +24,11 @@ def test_classify_receipt_priority():
     assert c("submitted", "")[0] == "处理中"
 
 
+# 宽度从 registry 取:zip 在最短处截断,写死数字的话加了列的那天夹具行里
+# 根本不会出现新键(row_sku 之类走 .get 的地方就静默看不到它)。
 def _sheet_row(rownum, **kw):
-    d = dict(zip(resources.LISTING_SHEET.columns, [""] * 21))
+    d = dict(zip(resources.LISTING_SHEET.columns,
+                 [""] * len(resources.LISTING_SHEET.columns)))
     d.update({"rownum": rownum, "asin": f"B0ASIN{rownum:04d}", "store": "T1",
               "product_type": "Cups", "audit_result": "pass"})
     d.update(kw)
@@ -64,9 +67,158 @@ def test_listing_reflector_writes_opq(monkeypatch):
     monkeypatch.setattr(feed_track, "item_codes", lambda fid: {})
     out = listing_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
-    assert w["O2:Q2"][0] == "SUCCESS"
-    assert w["O3:Q3"][0] == "SUCCESS"        # ASYNC 转正
+    # 回执三列 = 上架结果/报错/feed查询日期,range 由 layout 按表头名算
+    assert w["Q2:S2"][0] == "SUCCESS"
+    assert w["Q3:S3"][0] == "SUCCESS"        # ASYNC 转正
     assert "回填 2 行" in out
+
+
+# ── 上架表 SKU 列(所有者 2026-09-02 表头重排,批次 1)───────────────────────
+
+def test_row_sku_falls_back_to_the_asin_byte_for_byte():
+    """SKU 列为空的存量行:`row_sku` 逐字节 = B 列 ASIN(与旧 sku=asin 约定同)。
+
+    批次 1 只加列不写值,所以全表都走这条回落腿 —— 它一旦不等价,回执找行、
+    退役载荷、mark_used 全部换了键,而且不报错。
+    """
+    asin = "B0GXX75JN5"
+    assert listing_sheet.row_sku({"asin": asin}) == asin
+    assert listing_sheet.row_sku({"sku": "", "asin": asin}) == asin
+    assert listing_sheet.row_sku({"sku": "   ", "asin": asin}) == asin  # 空白=空
+    assert listing_sheet.row_sku({}) == ""            # 窄读的行连键都没有
+    # 有值就用它(批次 2 起的形态)
+    assert listing_sheet.row_sku({"sku": "A0X1Y2Z3W4V5", "asin": asin}) \
+        == "A0X1Y2Z3W4V5"
+
+
+def test_write_submit_cols_ninth_value_writes_the_sku_column(monkeypatch):
+    """八值 = 改造前同形;第 9 值 = 与 是否上架/feedid 同一次写出的 SKU。
+
+    SKU 与提交结果必须同一次落地:分两次写、中间崩掉就留下「已提交但无码」
+    的行,而回执反哺器正是靠 SKU 找行,那一行永远回填不上。
+    """
+    sent = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (sent.extend(ups), len(ups))[1])
+    eight = ["标题", "9.9", 3, "19.9", "Yes", "F1", "2026-09-02", ""]
+    listing_sheet.write_submit_cols([(2, eight)])
+    assert [r for r, _ in sent] == ["D2:D2", "J2:P2"]      # 标题 + 提交七列
+    assert sent[1][1] == [eight[1:]]
+    sent.clear()
+    listing_sheet.write_submit_cols([(3, eight + ["A0X1Y2Z3W4V5"])])
+    # SKU 与标题在今天的表里相邻 ⇒ 粘成一段,值仍各归各位
+    assert [r for r, _ in sent] == ["C3:D3", "J3:P3"]
+    assert sent[0][1] == [["A0X1Y2Z3W4V5", "标题"]]
+    sent.clear()
+    listing_sheet.write_submit_cols([(4, eight + [""])])   # 空第 9 值不写
+    assert [r for r, _ in sent] == ["D4:D4", "J4:P4"]
+
+
+def test_clear_for_relist_never_clears_the_sku_column(monkeypatch):
+    """清列恢复成"新行"时**不碰 SKU**:清列不是弃码点(弃码只有一个出口)。
+
+    清掉 SKU 会让回执与退役都找不回这一行;而码的寿命由登记簿的
+    abandoned_at 说了算(sku_plan §5.3)。
+    """
+    sent = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (sent.extend(ups), len(ups))[1])
+    n = listing_sheet.clear_for_relist([2, 3])
+    lay = listing_sheet.layout()
+    assert n == 2 and [r for r, _ in sent] == ["M2:S2", "M3:S3"]
+    assert all(not r.startswith(lay["sku"]) for r, _ in sent)
+    assert sent[0][1] == [["", "", "", "SKU_LOCKED已退役,冷却完毕待重上(自愈链)",
+                           "", "", ""]]
+
+
+def test_read_rows_maps_cells_by_header_position(monkeypatch):
+    """读取按**物理列号**回填字段名:所有者挪了列顺序也对得上。"""
+    monkeypatch.setattr(feishu, "sheet_row_count", lambda s: 2)
+    # 表头顺序打乱:SKU 挪到末列
+    order = [c for c in resources.LISTING_SHEET.columns if c != "sku"] + ["sku"]
+    monkeypatch.setattr(listing_sheet, "_LAYOUT",
+                        {f: i for i, f in enumerate(order, 1)})
+    cells = [""] * 21
+    cells[0], cells[1], cells[20] = "T1", "B0AAAA0001", "A0X1Y2Z3W4V5"
+    monkeypatch.setattr(feishu, "sheet_values_rows",
+                        lambda s, c1, c2, rf, rt, **kw: [(2, cells)])
+    got = listing_sheet.read_rows()
+    assert got[0]["store"] == "T1" and got[0]["asin"] == "B0AAAA0001"
+    assert got[0]["sku"] == "A0X1Y2Z3W4V5"
+    assert listing_sheet.row_sku(got[0]) == "A0X1Y2Z3W4V5"
+
+
+def test_receipt_lookup_uses_the_sku_column_when_present(monkeypatch):
+    """回执找行按 `row_sku`:SKU 有值的行按真码找,存量行仍按 ASIN 找。"""
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns,
+                                    headers=resources.LISTING_SHEET.headers))
+    rows = [_sheet_row(2, feed_id="F1", listed="Yes", list_result="处理中",
+                       sku="A0X1Y2Z3W4V5"),
+            _sheet_row(3, feed_id="F1", listed="Yes", list_result="处理中")]
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: rows)
+    writes = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (writes.extend(ups), len(ups))[1])
+    ledger = {"F1": {"A0X1Y2Z3W4V5": ("success", ""),
+                     rows[1]["asin"]: ("success", "")}}
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
+    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+    monkeypatch.setattr(feed_track, "item_codes", lambda fid: {})
+    out = listing_sheet.sync_from_ledger()
+    assert {rng for rng, _ in writes} == {"Q2:S2", "Q3:S3"}   # 两行都回填上了
+    assert "回填 2 行" in out
+
+
+def test_heal_unknown_splits_the_ledger_key_from_the_upc_pool_key(monkeypatch):
+    """自愈两个键各查各的表:台账/目录按 row_sku,UPC 池按 (店, ASIN)。
+
+    批次 2 一通电两者就分叉,不拆键要么自愈永远查不到台账(行永久卡 Unknown、
+    UPC 永久占用),要么拿真码去查 UPC 池查不到号。
+    """
+    monkeypatch.setattr(resources, "LISTING_SHEET",
+                        Spreadsheet(name="上架表", token="TOK", sheet_id="SID",
+                                    columns=resources.LISTING_SHEET.columns,
+                                    headers=resources.LISTING_SHEET.headers))
+    row = _sheet_row(2, listed="Unknown", sku="A0X1Y2Z3W4V5")
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda: [row])
+    seen = {}
+
+    class _C:
+        def cursor(self): return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def execute(self, sql, args=None):
+            self.sql = sql
+            if "feed_items" in sql:
+                seen["receipt"] = args
+            elif "walmart_items w" in sql:
+                seen["online"] = args
+            elif "upc_pool" in sql:
+                seen["pool"] = args
+
+        def fetchone(self): return (1,)
+
+        def fetchall(self):
+            if "feed_items" in self.sql:
+                return [("T1", "A0X1Y2Z3W4V5", "F9", "success", "", "")]
+            if "upc_pool" in self.sql:
+                return [("T1", row["asin"], "0011")]
+            return []
+
+    monkeypatch.setattr(listing_sheet.db, "pg_conn",
+                        lambda: contextlib.nullcontext(_C()))
+    monkeypatch.setattr(feishu, "sheet_write_ranges", lambda s, ups: len(ups))
+    used = []
+    monkeypatch.setattr(listing_sheet.upc_pool, "mark_used",
+                        lambda c, pairs: used.extend(pairs))
+    listing_sheet.heal_unknown()
+    assert seen["receipt"][1] == ["A0X1Y2Z3W4V5"]      # 台账按真码
+    assert seen["online"][1] == ["A0X1Y2Z3W4V5"]       # 目录按真码
+    assert seen["pool"] == ([row["asin"]],)            # UPC 池按 ASIN
+    assert used == [("0011", "A0X1Y2Z3W4V5")]          # 池的 sku 列存真码
 
 
 def test_list_new_dry_run_gate_chain(monkeypatch):
@@ -169,7 +321,7 @@ def test_upc_conflict_marked_orthogonally(monkeypatch):
     monkeypatch.setattr(listing_sheet, "_mark_upc_conflicts",
                         lambda a: (marked.extend(a), len(a))[1])
     out = listing_sheet.sync_from_ledger()
-    assert marked == [asin]
+    assert marked == [("T1", asin)]     # 反查键 = (店铺, ASIN),不是 SKU
     assert "UPC 撞库 1 个已标冲突" in out
 
 
@@ -591,13 +743,14 @@ def test_heal_unknown_three_paths(monkeypatch):
 
     out = listing_sheet.heal_unknown()
     w = {rng: vals[0] for rng, vals in writes}
-    assert w["K2:Q2"][0] == "Yes" and w["K2:Q2"][1] == "F1"
-    assert w["K2:Q2"][2] == "2026-08-10"          # 原上架日期不被覆盖
-    assert w["K3:Q3"][0] == "No" and w["K3:Q3"][4] == "FAILED"
-    assert "ERR_X | 字段坏了" in w["K3:Q3"][5]     # P 列码+人话
-    assert w["K4:N4"][0] == "Yes"                 # 目录在线只写 K~N,不碰 O/P/Q
-    assert "K5:Q5" not in w and "K5:N5" not in w  # 无依据绝不负向写
-    assert "K6:Q6" not in w and "K6:N6" not in w  # 非 Unknown 不碰
+    # 提交结果四列 + 回执三列 = 今天的 M:S(range 由 layout 算,不是硬编码)
+    assert w["M2:S2"][0] == "Yes" and w["M2:S2"][1] == "F1"
+    assert w["M2:S2"][2] == "2026-08-10"          # 原上架日期不被覆盖
+    assert w["M3:S3"][0] == "No" and w["M3:S3"][4] == "FAILED"
+    assert "ERR_X | 字段坏了" in w["M3:S3"][5]     # 报错列码+人话
+    assert w["M4:P4"][0] == "Yes"                 # 目录在线只写提交结果四列
+    assert "M5:S5" not in w and "M5:P5" not in w  # 无依据绝不负向写
+    assert "M6:S6" not in w and "M6:P6" not in w  # 非 Unknown 不碰
     assert used == [("0011", a2)] and released == ["0022"]
     assert "确认在线 2" in out and "确认失败重排 1" in out and "继续观察 1" in out
 
@@ -1396,7 +1549,7 @@ def test_write_reasons_is_one_batched_call(monkeypatch):
                         lambda t, ranges: (calls.append(ranges), len(ranges))[1])
     n = ls.write_reasons([(2, "理由A"), (5, "理由B"), (9, "理由C")])
     assert n == 3 and len(calls) == 1               # 三行一次请求
-    assert calls[0][0] == ("N2:N2", [["理由A"]])
+    assert calls[0][0] == ("P2:P2", [["理由A"]])   # 未上架理由列(layout 算)
     assert ls.write_reasons([], True) == 0 and len(calls) == 1
     assert ls.write_reasons([(3, "x")], execute=False) == 0   # dry-run 不写
     assert len(calls) == 1

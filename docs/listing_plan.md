@@ -335,14 +335,22 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 
 1. ✅ 上架表**新建**于在线产品表格,21 列 A~U(砍掉 状态跟踪/最近跟踪日期,
    产品事件账本承接);已进 registry(LISTING_SHEET)。
-2. ✅ 「UPC是否一致」按代码实际行为登记 = 核验的 UPC 一致性。
+   ⚠ **2026-09-02 所有者第二次重排表头**:仍是 21 列,但内容换成
+   店铺/ASIN/**SKU**/标题/PT/审核结果/**类别**/**具体内容**/审核日期/amz价格/
+   库存/walmart价格/是否上架/上架feedid/上架日期/未上架理由/上架结果/报错/
+   feed查询日期/**登记日期**/**查询编码**(旧尾部四列 真实标题/真实PT/真实UPC/
+   UPC是否一致 已删)。同时**列定位改为按表头名**(services/listing_sheet.layout),
+   写入 range 全部由它算 —— 以后再挪列顺序代码不用改,详见 docs/feishu_tables.md。
+2. ✅ 「UPC是否一致」按代码实际行为登记 = 核验的 UPC 一致性(该列 2026-09-02 已被所有者删除)。
 3. ✅ L1 match_listing 先行;跟卖表 = 驱动表(单路飞书读,替代旧 xlsx;
    以后要 xlsx 再加)。UPC 池列初案(UPC/放入日期|状态/店铺/SKU/上架日期)
    待 L2 做 UPC 读取使用逻辑时专题讨论定稿。
 
 ## L1 实施状态(2026-08-07)
 
-- [x] registry:LISTING_SHEET(21 列)/MATCH_SHEET(11 列)
+- [x] registry:LISTING_SHEET(21 列 + `headers` 表头名,2026-09-02 重排)/
+      MATCH_SHEET(11 列;**本次不动** —— 它的 B 列本来就是 SKU 列,
+      services/match_sheet.py 按 `r["sku"]` 找行,不走上架表的 row_sku)
 - [x] api/feeds:MP_ITEM_MATCH v4.2(sellingChannel 制 header,REPLACE 幂等,
       15/hour 桶);SPEC 预检复用 api/items.search_walmart_spec
 - [x] workflow match_listing:行状态机(待处理/可跟卖重排队/终态清 F 重试)

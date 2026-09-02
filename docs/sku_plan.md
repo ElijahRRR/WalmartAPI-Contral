@@ -146,23 +146,23 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
 
 ### 3.4 上架链里以 ASIN 当 SKU 对账 —— 9 处(初稿完全没列)
 
-| 位置 | 角色 | 失效后果 |
-|---|---|---|
-| `workflows/list_new.py:304-306` + `:1227` `_SQL_LISTED_ASINS` | **本店去重闸** | **同店同 ASIN 反复上架,烧 UPC 烧 MP_ITEM 配额,不报错** |
-| `workflows/list_new.py:662-669` + `:695` `_SQL_ATTEMPTS` | FAILED 重试上限 3 次 | 每次新码 count 恒 0 ⇒ 无限重试(→ 这是"码复用到退役"的理由之一,§5) |
-| `workflows/list_new.py:705-731` `_FAMILY_LISTED_SQL` | 变体组查同族已在架 | 变体组决策退化 |
-| `services/listing_sheet.py:542` `cache[fid].get(r["asin"])` | 回执找回行 | O/P/Q 永不回填 |
-| `services/listing_sheet.py:376-391 / 428-431` `heal_unknown` | K=Unknown 自愈 | 行永久卡 Unknown,UPC 永久占用 |
-| `services/listing_sheet.py:351-352` `_mark_upc_conflicts` | UPC 撞库标记 | 撞库的号永不标 conflict,反复领到坏号 |
-| `workflows/sku_locked_heal.py:79/102` | RETIRE 用 `r["asin"]` 当 SKU | **退役发的是 ASIN,退不到/退错** |
-| `workflows/list_new.py:259` + `listing_sheet.py:498` `mark_used(upc, r["asin"])` | UPC 池 `sku` 列 | 列名叫 SKU 实际存 ASIN(现状已如此,切换后必须定口径) |
-| `workflows/list_new.py:603/608/1053/1057` | 载荷 `sku=r["asin"]`(真跑 + check_spec 预检两条路) | 这是原点,两条路必须一起改 |
+| 位置 | 角色 | 失效后果 | 状态 |
+|---|---|---|---|
+| `workflows/list_new.py:304-306` + `:1227` `_SQL_LISTED_ASINS` | **本店去重闸** | **同店同 ASIN 反复上架,烧 UPC 烧 MP_ITEM 配额,不报错** | 批次 2 |
+| `workflows/list_new.py:662-669` + `:695` `_SQL_ATTEMPTS` | FAILED 重试上限 3 次 | 每次新码 count 恒 0 ⇒ 无限重试(→ 这是"码复用到退役"的理由之一,§5) | 批次 2 |
+| `workflows/list_new.py:705-731` `_FAMILY_LISTED_SQL` | 变体组查同族已在架 | 变体组决策退化 | 批次 2 |
+| `services/listing_sheet.sync_from_ledger` 台账三个 dict | 回执找回行 | 回执三列永不回填 | ✅ 批次 1:改 `row_sku` |
+| `services/listing_sheet.heal_unknown` | 是否上架=Unknown 自愈 | 行永久卡 Unknown,UPC 永久占用 | ✅ 批次 1:台账/目录按 `row_sku`,UPC 池按 (店, ASIN),键已拆开 |
+| `services/listing_sheet._mark_upc_conflicts` | UPC 撞库标记 | 撞库的号永不标 conflict,反复领到坏号 | ✅ 批次 1:反查键改 **(店铺, ASIN)**(本批唯一有意的差异) |
+| `workflows/sku_locked_heal.py` 五个 (店, SKU) 键 | RETIRE 用 `r["asin"]` 当 SKU | **退役发的是 ASIN,退不到/退错** | ✅ 批次 1:五处同源走 `row_sku`;烧号键取自冷却表 |
+| `workflows/list_new.py` + `listing_sheet.heal_unknown` 的 `mark_used` | UPC 池 `sku` 列 | 列名叫 SKU 实际存 ASIN(现状已如此,切换后必须定口径) | ✅ 批次 1:改传 `row_sku`(批次 1 值仍是 ASIN) |
+| `workflows/list_new.py:603/608/1053/1057` | 载荷 `sku=r["asin"]`(真跑 + check_spec 预检两条路) | 这是原点,两条路必须一起改 | 批次 2 |
 
 ### 3.5 飞书表
 
 | 表 | 现状 | 要做的 |
 |---|---|---|
-| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **表头已重排,SKU 在 C 列**(理由拆 类别/具体内容,尾部换 登记日期/查询编码):`columns` 按新序重排、写入 range 改按元组算字母、新增只写 SKU 列的函数;提交时回写 |
+| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | ✅ **批次 1 已实现**:`columns` 按新序重排 + 新增 `headers`(字段→中文表头);写入 range 改为**按表头名**经 `layout()` 算(源码零硬编码字母,fail-closed);新增 `row_sku` / `write_sku_col` / `write_submit_cols` 可选第 9 值。**本批只加列不写值**(写入随批次 2 通电) |
 | 订单中心-销售订单 `ORDER_SALES` | 有「SKU」无来源码 | **「来源码」已建**:registry 常量(值 `order_lines.asin`)+ `_SALES_SQL` + 投影 + 测试夹具 |
 | 订单中心-售后订单 `ORDER_RETURNS` | 有「SKU」无来源码;`return_lines` 表无 asin 列 | **「来源码」已建**,SQL 已 LEFT JOIN order_lines,顺手 `SELECT l.asin` |
 | 在线产品总表 `ONLINE_PRODUCTS_SHEET` | 有 sku 无来源码 | **Q 列「来源码」已建**(第 17 列,登记簿 JOIN `source_key`),反向可对 |
@@ -472,12 +472,27 @@ source_key 就是回填的 asin,等号右边换成它结果相同)。
 "切换后再补";并加一条守门测试:`extract_asin` 的调用点与 `= w.sku`/`= sku`
 形态的 SQL 硬等号只允许出现在白名单文件里,新增即红——防止切换后又长出新洞。
 
-**批次 1|飞书列与回执自愈链(仍零行为变化)**
-上架表 V 列「SKU」+ registry 常量 + `_COLS=22` + 单列写函数;`listing_sheet.542`
-/ `heal_unknown` / `sku_locked_heal` 改读 `r["sku"] or r["asin"]`;UPC 池表 E 列口径。
+**批次 1|上架表按表头定位列 + SKU 列 + 回执自愈链(✅ 已实现,零行为变化)**
+- **按表头名定位列**(所有者 2026-09-02:「以后再调整列顺序也能准确写入」):
+  `registry.LISTING_SHEET.headers`(字段名→中文表头,21 项)是飞书表头名的
+  唯一出生地;`services/listing_sheet.layout()` 每进程读一次表头行认列,
+  **本文件所有 range 由它算,源码里一个写死的列字母都没有**
+  (守门 `tests/test_sku_guard.py::test_listing_sheet_has_no_hardcoded_column_letters`)。
+  fail-closed:登记的表头缺失/重复 → 抛错拒绝一切读写;多出的列只告警。
+  相邻字段仍粘成一段,不相邻自动拆段(审核五列因中间夹着「类别」拆成两段)。
+- **SKU 列(C)**:唯一出处 `listing_sheet.row_sku(r)`(SKU 列,空则回落 ASIN,
+  逐字节等价);只写 SKU 列的 `write_sku_col`;`write_submit_cols` 收可选第 9 值
+  (与 是否上架/feedid/上架日期 同一次写出);`clear_for_relist` **不清 SKU**。
+- **五个 (店, SKU) 键 + 回执/自愈链**改读 `row_sku`:`sync_from_ledger` 的台账
+  三个 dict、`heal_unknown` 的台账/目录腿、`sku_locked_heal` 的 todo 过滤 /
+  RETIRE 载荷 / 冷却表 / 病历 / 回表找行(烧号键取自冷却表,天然同源)、
+  `list_new` 的 `mark_used`。UPC 池那一腿仍按领号键 (店, ASIN)。
+- **唯一有意的差异**:`_mark_upc_conflicts` 反查键由 `upc_pool.sku` 改为
+  **(店铺, ASIN)**(见 §3.4;顺带修掉跨店误烧号与 missing 计数可为负)。
+- **本批不写的三列**:「类别」归另一条 PR;「登记日期」「查询编码」人工填,程序永不读写。
 (销售/售后订单表与在线产品总表的「来源码」列**已随批次 0b 的第二个 PR 落地**,
 不在批次 1 范围内。)
-存量行 V 为空 ⇒ 回落 B 列 ⇒ 行为不变。
+存量行 SKU 列为空 ⇒ 回落 ASIN ⇒ 行为不变。
 
 **批次 2|写侧切换(唯一有行为变化的批次)**
 `SKU_SOURCE_LETTERS` 常量;`list_new._prep_rows` mint 挂 `r["_sku"]`,载荷/

@@ -48,3 +48,23 @@ def _reports_never_touch_the_real_data_root(monkeypatch, tmp_path):
         return d
 
     monkeypatch.setattr(paths, "reports_dir", _dir)
+
+
+@pytest.fixture(autouse=True)
+def _listing_sheet_layout_matches_the_registry(monkeypatch):
+    """上架表列布局在单测里默认 = registry 登记的列序(= 飞书表头没被人挪过)。
+
+    `services.listing_sheet.layout()` 每进程首次使用会真读一次表头行
+    (`A1:…1`)去认列;单测里没有飞书,不预置的话**任何**读写上架表的用例
+    都会发起真请求(而且是在 fail-closed 的路径上,报的还是"表头对不上")。
+
+    这里直接把进程内缓存塞成"表头顺序 = registry.LISTING_SHEET.columns 顺序",
+    与生产上表头没被动过时算出来的映射逐字相同。要测表头定位本身
+    (顺序打乱 / 缺列 / 重复)的用例,自己调 `listing_sheet.reset_layout_cache()`
+    再打桩表头行 —— 本夹具 monkeypatch 设值,用例里的重置不会漏回来。
+    """
+    from registry import resources
+    from services import listing_sheet
+    monkeypatch.setattr(
+        listing_sheet, "_LAYOUT",
+        {f: i for i, f in enumerate(resources.LISTING_SHEET.columns, 1)})

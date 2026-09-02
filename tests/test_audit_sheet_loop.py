@@ -50,19 +50,20 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
 
 
 def test_audit_targets_reads_only_first_five_columns(monkeypatch):
-    """领任务只读 A..E(store/asin/标题/PT/审核结果),不拉 F 之后的理由/
-    回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应 10MB 上限
-    (90221),audit_sheet 整链失败。行方向分块归 api 层。"""
+    """领任务只读到「审核结果」那一列(店铺/ASIN/SKU/标题/PT/审核结果),
+    不拉后面的理由/回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应
+    10MB 上限(90221),audit_sheet 整链失败。行方向分块归 api 层。
+    末列字母由 layout() 按表头名算,所有者挪列后这个断言会跟着动,值不会串。"""
     asked = []
     monkeypatch.setattr(listing_sheet.feishu, "sheet_row_count", lambda s: 3)
     monkeypatch.setattr(
         listing_sheet.feishu, "sheet_values_rows",
         lambda s, c1, c2, rf, rt, **kw: (
             asked.append((c1, c2, rf, rt)),
-            [(2, ["T1", "B0AAAAAAA1", "t", "pt", ""]),
-             (3, ["T1", "B0AAAAAAA2", "t", "pt", "pass"])])[1])
+            [(2, ["T1", "B0AAAAAAA1", "", "t", "pt", ""]),
+             (3, ["T1", "B0AAAAAAA2", "", "t", "pt", "pass"])])[1])
     got = listing_sheet.audit_targets()
-    assert asked == [("A", "E", 2, 3)]        # 只读前五列,行区间对
+    assert asked == [("A", "F", 2, 3)]        # 只读到「审核结果」列,行区间对
     assert [r["asin"] for r in got] == ["B0AAAAAAA1"]
 
 
@@ -157,7 +158,7 @@ def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
     assert by_row[3][3] == "品牌黑名单(命中:Nike) [政策:General-Use Products]"
     assert by_row[5] == by_row[2]
     assert "回填 3 行" in out
-    assert "1 行库里没有结论" in out and "E 列留空" in out
+    assert "1 行库里没有结论" in out and "「审核结果」留空" in out
 
 
 def test_project_failure_only_warns(monkeypatch):
@@ -170,14 +171,19 @@ def test_project_failure_only_warns(monkeypatch):
     assert "from_sheet=1" in out            # 告诉人怎么补写
 
 
-def test_write_audit_cols_stays_inside_cg(monkeypatch):
-    """⚠ 只准动 C~G。越界写会覆盖 list_new 的 H~N 与反哺器的 O~Q。"""
+def test_write_audit_cols_stays_inside_the_audit_columns(monkeypatch):
+    """⚠ 只准动审核那五列。越界写会覆盖 list_new 的提交列与反哺器的回执列。
+
+    「类别」夹在 审核结果 与 具体内容 中间且**归另一条 PR 写**,所以这五个值
+    必然拆成两段(今天 D:F + H:I),中间那一格一个字都不许被碰。
+    """
     sent = []
     monkeypatch.setattr(listing_sheet.feishu, "sheet_write_ranges",
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
     n = listing_sheet.write_audit_cols([(7, ["T", "Cups", "pass", "", "d"])])
-    assert n == 1 and sent[0][0] == "C7:G7"
-    assert sent[0][1] == [["T", "Cups", "pass", "", "d"]]
+    assert n == 1 and [r for r, _ in sent] == ["D7:F7", "H7:I7"]
+    assert sent[0][1] == [["T", "Cups", "pass"]]
+    assert sent[1][1] == [["", "d"]]
     # dry-run 一格不写
     sent.clear()
     assert listing_sheet.write_audit_cols([(7, ["T"] * 5)], execute=False) == 0
@@ -228,7 +234,7 @@ def test_backlog_breakdown_reaches_the_summary_not_just_the_log(monkeypatch):
     rows, asins, head = pa._claim_from_sheet(3)
     # ⚠ 不截断:整批交给候选谓词,LIMIT 只限制**真要判的**那部分
     assert len(rows) == 10 and len(asins) == 10
-    assert "E 列为空 10 个 ASIN" in head[0]
+    assert "审核结果为空 10 个 ASIN" in head[0]
     assert "已有结论 4" in head[1] and "不重审" in head[1]
     assert "待审 4" in head[1]
     assert "不在库 2" in head[1]                      # 10 - (3+1+2+2)
@@ -326,7 +332,7 @@ def test_force_summary_states_what_it_will_cost(monkeypatch):
     assert "缺省口径只判 1 个" in body
     assert "一起重判" in body and "直接回填" not in body
     # 领任务口径没变这句必须在 —— 那是所有者唯一关心的边界
-    assert "E 列已有结论的表行一行都不会被捞回来" in body
+    assert "已有结论的表行一行都不会被捞回来" in body
     # 缺省口径下则是老话术
     _, _, plain = pa._claim_from_sheet(500)
     assert "**直接回填,不重审**" in "\n".join(plain)
@@ -400,14 +406,22 @@ def test_columns_contract():
 
     A/B 已经被所有者对调过一次(2026-08-16:原 A=ASIN B=店铺 → 现 A=店铺 B=ASIN)。
     读取全程按字段名,所以那次对调只动了这条元组;**但写入用的是字母 range**,
-    所以 C~G 这一段一旦位移,`write_audit_cols` 会把审核结论写进别人的列里
-    —— 而且不报错。
+    2026-09-02 所有者第二次重排表头之后**列字母不再是契约**:写入 range 由
+    services/listing_sheet.layout() 按表头名算,所以这里钉的是「有哪些字段、
+    谁排在谁前面、表头名一一对应且不重名」,字母交给 layout 与守门测试。
     """
     cols = resources.LISTING_SHEET.columns
+    heads = resources.LISTING_SHEET.headers
     assert cols[0] == "store" and cols[1] == "asin"      # A/B 对调后的现状
-    assert cols[2:7] == ("list_title", "product_type", "audit_result",
-                         "audit_reason", "audit_date")   # C~G 审核域
-    assert len(cols) == 21                               # A~U
+    assert cols[2] == "sku"                              # 2026-09-02 插进 C 列
+    assert cols[3:9] == ("list_title", "product_type", "audit_result",
+                         "audit_category", "audit_reason",
+                         "audit_date")                   # 审核域(类别另一条 PR 写)
+    assert cols[-2:] == ("registered_date", "query_code")  # 人工填,程序不读写
+    assert len(cols) == 21
+    # 表头名是列定位的唯一依据:每个字段都要有,且中文名互不重复
+    assert tuple(heads) == cols
+    assert len(set(heads.values())) == len(cols)
 
 
 
@@ -538,7 +552,7 @@ def test_still_missing_gets_the_real_scraper_error_in_the_sheet(monkeypatch):
     assert set(by_row) == {3, 5}              # 补上的第 4 行不写;同 ASIN 两行都写
     assert "captcha" in by_row[3] and "验证码" in by_row[3]
     assert by_row[5] == by_row[3]
-    assert "E 列留空" in out
+    assert "「审核结果」留空" in out
 
 
 def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):

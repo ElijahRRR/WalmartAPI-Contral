@@ -17,6 +17,11 @@ ERR_EXT_DATA_0101211 = 该 SKU 已绑死旧 UPC。旧实证(legacy_survey.md:166
 新系统合成一个 workflow,每天跑一次即可(① 与 ③ 同轮各自推进)。
 
 防重与安全:
+  - **五个 (店铺, SKU) 键必须同源**:todo 过滤 / RETIRE 载荷 / 冷却表落库 /
+    产品事件 / 冷却期满回表找行,全部走 `listing_sheet.row_sku(r)`
+    (上架表 SKU 列,为空回落 ASIN)。两侧不同源 = 同一 SKU 每轮重复提交
+    RETIRE_ITEM,或冷却期满找不到行、行永久卡死 —— 两种都不报错。
+    烧号 `burn_pairs` 用的是冷却表里存下来的那个 SKU,同源自然成立。
   - 同 (店铺,SKU) 只允许一条在途冷却(retire_cooldown 部分唯一索引);
     crash 在提交后/落库前 → 下轮 feeds 层同载荷 dedup 返回同 feed_id 补落库
   - RETIRE 回执**失败**的冷却记录标 failed,**不自动重试**(写操作永不
@@ -59,9 +64,12 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
             stores_by_name: dict, execute: bool) -> list[str]:
     """① 对未在冷却/未标失败的 SKU_LOCKED 行提交 RETIRE_ITEM。"""
     lines = []
+    def _key(r: dict) -> tuple[str, str]:
+        """输入:上架表一行 → 输出:(店铺, SKU) 冷却键(与落库/回表同源)。"""
+        return (r["store"], listing_sheet.row_sku(r))
+
     todo = [r for r in locked
-            if (r["store"], r["asin"]) not in open_pairs
-            and (r["store"], r["asin"]) not in failed_pairs]
+            if _key(r) not in open_pairs and _key(r) not in failed_pairs]
     if failed_pairs:
         lines.append(f"  ⚠ {len(failed_pairs)} 个 (店铺,SKU) 此前 RETIRE 回执失败,"
                      f"不自动重试,请人工处置:"
@@ -76,7 +84,7 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
                       srows: list[dict]) -> list[str]:
         """单店提交(第一轮与串行补试共用**同一条**路径,单一落地纪律)。"""
         out: list[str] = []
-        skus = [r["asin"] for r in srows]        # 上架 sku=asin 约定
+        skus = [listing_sheet.row_sku(r) for r in srows]
         n_ok = 0
         # 逐切片结果与本店待退役行对位:游标走法是 submit_feed 返回契约的机械
         # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
@@ -89,8 +97,8 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
                 with db.pg_conn() as conn:
                     with conn.cursor() as cur:
                         cur.executemany(_SQL_INSERT, [
-                            (store_name, r["asin"], res["feed_id"])
-                            for r in batch])
+                            (store_name, listing_sheet.row_sku(r),
+                             res["feed_id"]) for r in batch])
                     # ⚠ 事件**只在 submitted 时记**(2026-08-16 feed 闭环审计):
                     # dedup 挂的是旧 feed_id、这一轮什么都没提交,记了就是幽灵
                     # 事件 —— catalog.product_risk 的 retire_times 直接数它,
@@ -99,7 +107,7 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
                     # 而且 dedup 说明 RETIRE 确实在途,冷却本来就该起算。
                     if res["outcome"] == "submitted":
                         product_events.record_many(conn, [
-                            {"sku": r["asin"], "store": store_name,
+                            {"sku": listing_sheet.row_sku(r), "store": store_name,
                              "event": product_events.RETIRE_SUBMITTED,
                              "source": "sku_locked_heal",
                              "detail": {"feed_id": res["feed_id"],
@@ -122,7 +130,7 @@ def _retire(locked: list[dict], open_pairs: set, failed_pairs: set,
             lines.append(f"  {store_name}:凭证缺失,{len(srows)} 行跳过")
             continue
         if not execute:
-            skus = [r["asin"] for r in srows]
+            skus = [listing_sheet.row_sku(r) for r in srows]
             lines.append(f"  [DRY-RUN] {store_name} 将退役 {len(skus)} 个:"
                          f"{','.join(skus[:8])}{' …' if len(skus) > 8 else ''}")
             continue
@@ -230,7 +238,8 @@ def run(params: dict) -> str:
     locked = [r for r in rows if r["list_result"] == "SKU_LOCKED"]
     if params.get("store"):
         locked = [r for r in locked if r["store"] == params["store"]]
-    locked_by_pair = {(r["store"], r["asin"]): r for r in locked}
+    locked_by_pair = {(r["store"], listing_sheet.row_sku(r)): r
+                      for r in locked}
 
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_OPEN, (cooldown_hours,))

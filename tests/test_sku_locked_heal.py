@@ -34,9 +34,11 @@ class _Conn:
         return False
 
 
-def _row(rownum, store="T1", asin=None, list_result="SKU_LOCKED"):
+# 默认 SKU 列为空 = 存量行形态(全链回落 B 列 ASIN);传 sku= 即模拟
+# 批次 2 之后「C 列是真码」的行。
+def _row(rownum, store="T1", asin=None, list_result="SKU_LOCKED", sku=""):
     return {"rownum": rownum, "store": store,
-            "asin": asin or f"B0LOCK{rownum:04d}",
+            "asin": asin or f"B0LOCK{rownum:04d}", "sku": sku,
             "list_result": list_result, "feed_id": "F0", "listed": "Yes"}
 
 
@@ -159,3 +161,65 @@ def test_ripe_success_clears_row_failed_marks(monkeypatch):
     assert ("cleared", "T1", "B0DONE") in closes
     assert ("failed", "T1", "B0BAD") in closes
     assert "清列重上 1 行" in out and "回执未到 1 条" in out and "回执失败 1 条" in out
+
+
+# ── (店铺, SKU) 五个键同源(2026-09 SKU 改造批次 1)────────────────────────
+
+def test_retire_uses_the_sku_column_when_present(monkeypatch):
+    """SKU 列有值的行:RETIRE 载荷 / 冷却表 / 病历三处**都**发真码,不是 ASIN。
+
+    sku_plan §3.4 点名最危险的一条:退役发的是 ASIN 就退不到,而沃尔玛只会
+    回一个"查无此 SKU",链路照常往下走,行永远卡在 SKU_LOCKED。
+    """
+    rows = [_row(2, asin="B0LEGACY01"), _row(3, asin="B0NEWCODE1",
+                                             sku="A0X1Y2Z3W4V5")]
+    conn = _patch_common(monkeypatch, rows, state=[])
+    submitted = {}
+    monkeypatch.setattr(
+        heal.feeds, "submit_feed",
+        lambda store, ft, skus, workflow: (
+            submitted.update({"skus": list(skus)}),
+            [{"outcome": "submitted", "feed_id": "FR1", "count": len(skus)}],
+        )[1])
+    recorded = []
+    monkeypatch.setattr(heal.product_events, "record_many",
+                        lambda c, evs: (recorded.extend(evs), len(evs))[1])
+    heal.run({"execute": True})
+    # 存量行仍是 ASIN(逐字节等价),新码行是真码 —— 三处同源
+    assert submitted["skus"] == ["B0LEGACY01", "A0X1Y2Z3W4V5"]
+    inserts = [r for sql, rows_ in conn.sqls
+               if "INSERT INTO listing.retire_cooldown" in sql for r in rows_]
+    assert [r[1] for r in inserts] == ["B0LEGACY01", "A0X1Y2Z3W4V5"]
+    assert [e["sku"] for e in recorded] == ["B0LEGACY01", "A0X1Y2Z3W4V5"]
+
+
+def test_cooldown_keys_and_row_lookup_share_one_source(monkeypatch):
+    """冷却表里存的键 = 回表找行用的键 = `row_sku`。
+
+    两侧不同源的后果:在途冷却拦不住(同一 SKU 每轮重复提交 RETIRE_ITEM,
+    直接烧配额),或冷却期满找不到行 → 走"只关冷却不清列"降级路径 → 行永久
+    卡在 SKU_LOCKED、UPC 永久占用,日志只有一条 info,没人看得见。
+    """
+    rows = [_row(2, asin="B0NEWCODE1", sku="A0X1Y2Z3W4V5"),
+            _row(3, asin="B0COOLING1", sku="A0AAAABBBBCC")]
+    state = [("T1", "A0X1Y2Z3W4V5", "FR1", None, "pending", True),
+             ("T1", "A0AAAABBBBCC", "FR2", None, "pending", False)]
+    conn = _patch_common(monkeypatch, rows, state)
+    monkeypatch.setattr(heal.feed_track, "item_results",
+                        lambda fid: {"A0X1Y2Z3W4V5": ("success", "")})
+    monkeypatch.setattr(heal.feed_track, "poll_feed",
+                        lambda store, fid: (None, None))
+    cleared = []
+    monkeypatch.setattr(heal.listing_sheet, "clear_for_relist",
+                        lambda rownums, execute: (cleared.extend(rownums),
+                                                  len(rownums))[1])
+    burned = []
+    monkeypatch.setattr(heal.upc_pool, "burn_for_retire",
+                        lambda c, pairs: (burned.extend(pairs), len(pairs))[1])
+    monkeypatch.setattr(heal.feeds, "submit_feed",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("两行都在冷却中,不该再提交")))
+    out = heal.run({"execute": True})
+    assert cleared == [2]                    # 按真码找回了自己那一行
+    assert burned == [("T1", "A0X1Y2Z3W4V5")]   # 烧号键 = 冷却表里那个键,同源
+    assert "冷却中 2" in out

@@ -448,6 +448,208 @@ def test_feed_track_does_not_resolve_asin_itself():
         assert banned not in src, banned
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ⑦ 上架表:列字母不许写死,"这一行的 SKU 是什么"只许有一个出处
+#
+#  所有者 2026-09-02 第二次重排上架表表头(SKU 插进 C 列、理由拆两列、尾部
+#  换两列人工列),要求「以后再调整列顺序也能准确写入」。做法是
+#  services/listing_sheet.layout():读一次表头行,按 registry 登记的中文表头
+#  认列,所有 range 由它算。守门要钉死的就是这条路径不许被绕过。
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: 上架表读写积木本体 —— 列字母只准在它内部由 layout 算出来。
+_LISTING = "services/listing_sheet.py"
+#: 会问"这一行的 SKU 是什么"的三个文件。
+_ROW_SKU_CONSUMERS = (_LISTING, "workflows/list_new.py",
+                      "workflows/sku_locked_heal.py")
+
+#: f-string 里紧挨着插值的列字母(`f"K{r}:Q{r}"` 这种)。前面必须是非字母,
+#: 免得把 "Unknown {n}" 里的 n 当成列字母。
+_HARDCODED_COL_RE = re.compile(r"(?<![A-Za-z])[A-Z]{1,2}\{\}")
+#: 整串就是一个 A1 范围的字面量(`"K2:Q2"` / `"C7"`)。
+_LITERAL_RANGE_RE = re.compile(r"^[A-Z]{1,2}\d+(:[A-Z]{1,2}\d+)?$")
+
+
+def _string_literals(path: Path) -> list[tuple[int, str]]:
+    """输入:.py 路径 → 输出:[(行号, 字面量文本)];f-string 的插值段记成 `{}`。"""
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.JoinedStr):
+            out.append((node.lineno, "".join(
+                part.value if isinstance(part, ast.Constant)
+                and isinstance(part.value, str) else "{}"
+                for part in node.values)))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.append((node.lineno, node.value))
+    return out
+
+
+def test_listing_sheet_has_no_hardcoded_column_letters():
+    """上架表的列字母只准由 `layout()` 算,源码里一个写死的都不许有。
+
+    这是 2026-09-02 重排的直接教训:此前写入侧全是 `f"K{行}:Q{行}"` 这类
+    硬编码段,所有者在中间插一列,**全体静默错位**(标题盖掉 SKU 列),
+    一行报错都不会有。改成按表头名定位之后,唯一还允许出现的字母是读取
+    起点 "A"(表格左边界)与表头行的 `A1:…1`,两者都不随列序变。
+    """
+    offenders = []
+    for lineno, text in _string_literals(ROOT / _LISTING):
+        if _HARDCODED_COL_RE.search(text) or _LITERAL_RANGE_RE.match(text):
+            offenders.append(f"{_LISTING}:{lineno} {text[:60]!r}")
+    assert not offenders, _fmt(
+        offenders, "上架表写死了列字母(改用 layout()/_ranges 算):")
+
+
+def test_the_row_sku_fallback_lives_in_exactly_one_place():
+    """「SKU 列为空就回落 ASIN」这句话只准写一次(`listing_sheet.row_sku`)。
+
+    回执找行、Unknown 自愈、退役载荷、冷却键、mark_used 问的是同一个问题。
+    散着写五份 `r["sku"] or r["asin"]`,批次 2 切码时漏改任何一份都是静默
+    失效:回执永不回填、退役发错码退不到,摘要还一切正常。
+    """
+    offenders = []
+    for rel in _ROW_SKU_CONSUMERS:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        skip = range(0)                       # row_sku 自身(连同它的头注)不算
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.FunctionDef) and node.name == "row_sku":
+                skip = range(node.lineno, (node.end_lineno or node.lineno) + 1)
+        for n, line in enumerate(text.splitlines(), 1):
+            if n in skip:
+                continue
+            if re.search(r'\["sku"\]\s*or|\.get\("sku"\)\s*or', line):
+                offenders.append(f"{rel}:{n} {line.strip()[:80]}")
+    assert not offenders, _fmt(
+        offenders, "第二份「SKU 空则回落 ASIN」表达式(改调 listing_sheet.row_sku):")
+
+
+# ── 列定位的行为面:fail-closed、顺序打乱、永不碰所有者的三列 ──────────────
+
+_HEADERS = ["店铺", "ASIN", "SKU", "walmart上架标题", "walmart_product_type",
+            "审核结果", "类别", "具体内容", "审核日期", "amz价格", "库存",
+            "walmart价格", "是否上架", "上架feedid", "上架日期", "未上架理由",
+            "上架结果", "报错", "feed查询日期", "登记日期", "查询编码"]
+
+#: 程序永不写的三列:「类别」归另一条 PR,「登记日期」「查询编码」人工填。
+_NEVER_WRITTEN = ("audit_category", "registered_date", "query_code")
+
+
+def _wire_header(monkeypatch, header_row):
+    """输入:表头行 → 输出:无。让 listing_sheet 认这一行表头(清缓存后重读)。"""
+    from registry.resources import Spreadsheet
+    from registry import resources
+    from services import listing_sheet
+    monkeypatch.setattr(resources, "LISTING_SHEET", Spreadsheet(
+        name="上架表", token="TOK", sheet_id="SID",
+        columns=resources.LISTING_SHEET.columns,
+        headers=dict(resources.LISTING_SHEET.headers)))
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
+                        lambda sheet, rng: [list(header_row)])
+    monkeypatch.setattr(listing_sheet, "_LAYOUT", None)
+
+
+def _col_num(letter: str) -> int:
+    n = 0
+    for ch in letter:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+
+def _all_writes(monkeypatch) -> list[tuple[str, list]]:
+    """输入:无 → 输出:上架表全部写函数各跑一次产出的 [(range, 值矩阵)]。"""
+    from services import listing_sheet as ls
+    sent: list[tuple[str, list]] = []
+    monkeypatch.setattr(ls.feishu, "sheet_write_ranges",
+                        lambda s, ups: (sent.extend(ups), len(ups))[1])
+    monkeypatch.setattr(ls.feishu, "sheet_ensure_rows", lambda s, n: 0)
+    monkeypatch.setattr(ls, "read_rows", lambda upto=None: [])
+    ls.append_assignments([("T1", "B0AAAA0001")])
+    ls.write_submit_cols([(2, ["标题", "9.9", 3, "19.9", "Yes", "F1", "d", ""])])
+    ls.write_submit_cols([(3, ["标题", "9.9", 3, "19.9", "Yes", "F1", "d", "",
+                               "A0X1Y2Z3W4V5"])])
+    ls.write_sku_col([(4, "A0X1Y2Z3W4V5")])
+    ls.write_data_cols([(5, ["标题", "9.9", 3, "19.9"])])
+    ls.write_audit_cols([(6, ["标题", "Cups", "pass", "", "2026-09-02"])])
+    ls.write_audit_notes([(7, "未采集")])
+    ls.write_reasons([(8, "价格不合适")])
+    ls.clear_for_relist([9])
+    return sent
+
+
+def test_listing_writes_never_touch_the_owner_only_columns(monkeypatch):
+    """全部写函数的 range 一律避开 类别 / 登记日期 / 查询编码 三列。
+
+    「类别」由另一条 PR 写(两处都写 = 互相覆盖);「登记日期」「查询编码」
+    是所有者手填的列,程序碰一下就是把人工数据擦掉,而且没人会发现。
+    """
+    from services import listing_sheet as ls
+    _wire_header(monkeypatch, _HEADERS)
+    banned = {ls._index_map()[f] for f in _NEVER_WRITTEN}
+    hit = []
+    for rng, _vals in _all_writes(monkeypatch):
+        a, _, b = rng.partition(":")
+        lo = _col_num(re.match(r"[A-Z]+", a).group())
+        hi = _col_num(re.match(r"[A-Z]+", b or a).group())
+        hit += [f"{rng} 覆盖第 {c} 列" for c in banned if lo <= c <= hi]
+    assert not hit, _fmt(hit, "写入范围碰了不许碰的列:")
+
+
+def test_listing_writes_follow_a_shuffled_header(monkeypatch):
+    """所有者把列顺序打乱,写入照样落到对的列 —— 代码一行都不用改。
+
+    这就是「按表头名定位」的全部目的。这里把 SKU 挪到最后一列、把
+    「未上架理由」挪到最前面,断言每个值都还在自己那一格。
+    """
+    from services import listing_sheet as ls
+    shuffled = (["未上架理由"] + [h for h in _HEADERS if h != "未上架理由"
+                                  and h != "SKU"] + ["SKU"])
+    _wire_header(monkeypatch, shuffled)
+    lay = ls.layout()
+    assert lay["not_listed_reason"] == "A" and lay["sku"] == "U"
+    sent: list = []
+    monkeypatch.setattr(ls.feishu, "sheet_write_ranges",
+                        lambda s, ups: (sent.extend(ups), len(ups))[1])
+    ls.write_reasons([(4, "价格不合适")])
+    ls.write_sku_col([(4, "A0X1Y2Z3W4V5")])
+    assert sent == [("A4:A4", [["价格不合适"]]),
+                    ("U4:U4", [["A0X1Y2Z3W4V5"]])]
+
+
+@pytest.mark.parametrize("bad, why", [
+    ([h for h in _HEADERS if h != "SKU"], "缺列"),
+    (_HEADERS + ["ASIN"], "重复"),
+])
+def test_listing_layout_is_fail_closed_on_a_broken_header(monkeypatch, bad, why):
+    """表头缺一列或有重名 → 抛错拒绝读写,**一格都不写**。
+
+    宁可这一轮不跑:列认不准就会把值写进别人的列,而且不报错(2026-09-02
+    重排前那套硬编码字母正是这么错位的)。
+    """
+    from services import listing_sheet as ls
+    _wire_header(monkeypatch, bad)
+    monkeypatch.setattr(ls.feishu, "sheet_write_ranges",
+                        lambda s, ups: pytest.fail(f"{why} 的表头还敢写"))
+    with pytest.raises(LookupError):
+        ls.layout()
+    with pytest.raises(LookupError):
+        ls.write_reasons([(2, "理由")])
+
+
+def test_listing_layout_only_warns_about_columns_it_does_not_know(caplog):
+    """所有者自己加的列不算错:只告警,照常工作(多出的列程序看不见)。"""
+    from services import listing_sheet as ls
+    import logging
+    mp = pytest.MonkeyPatch()
+    try:
+        _wire_header(mp, _HEADERS + ["所有者自己加的列"])
+        with caplog.at_level(logging.WARNING, logger="services.listing_sheet"):
+            lay = ls.layout()
+        assert lay["query_code"] == "U"          # 登记的列一个没错位
+        assert "所有者自己加的列" in caplog.text
+    finally:
+        mp.undo()
+
+
 class _EmptyReg:
     """登记簿一行都查不到(= 今天库里未登记 / 非 amz 的存量行)。"""
 

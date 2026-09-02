@@ -41,7 +41,7 @@
 
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
-L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
+L4 视觉] → 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
 products.audit_* 五列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
 L2 R4 扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
 (源头一条 + 波及逐店,展开走 services/risk_trace),dry-run 一条不写。**`-p from_sheet=1` 时另把结论投影回上架表
@@ -743,7 +743,7 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
                 got = {r[0]: r for r in cur.fetchall()}
-            # F 列写**人话**:`products.audit_reason` 存的是 37 条沃尔玛政策的
+            # F 列写**人话**:`products.audit_reason` 存的是沃尔玛政策表的
             # 类目名,而其中 `General-Use Products` 是"以上全不中"的兜底 ——
             # 落在一把锤子、一个土豆压泥器上时人只会一头雾水(所有者
             # 2026-08-16)。真正的原因在命中的规则里,翻出来放前面
@@ -1361,6 +1361,15 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"
                      f"LLM 故障待定 {stage_stats['L3_pending']})")
+    # 路由表写的政策名在政策表里对不上 = L3 少拿到一条政策提示。判定不受影响、
+    # 不报错,只会让判据悄悄变窄(2026-09-02 改名后尤其要看得见,§十.7)
+    if stage_stats.get("L3_route_unresolved"):
+        names = stage_stats.get("L3_route_unresolved_names") or []
+        lines.append(f"⚠ L3 政策路由解析不到 {stage_stats['L3_route_unresolved']} 次"
+                     + (f"(条目:{'、'.join(names)})" if names else "")
+                     + " —— 路由表的政策名在政策表里找不到,那几条提示本轮没给"
+                       "(只记不改判;补进 registry.resources.POLICY_LEGACY_NAMES "
+                       "或修路由表)")
     # TRO:非零才打印(notify_fmt 规矩 2 —— 例外计数为 0 是噪声)。
     # 这三个数不是同一件事:命中 = 本轮认出几个 TRO 品牌;首报 = 其中几个是
     # 头一回见(真落了源头事件);波及 = 展开出几家店(一个品牌能扇出好几家)
@@ -1399,7 +1408,8 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
     if counts.policy_unknown:
-        lines.append(f"⚠ 理由映射落 37 政策外 {counts.policy_unknown} 条(详见日志,只记不改判)")
+        lines.append(f"⚠ 理由映射落政策表之外 {counts.policy_unknown} 条"
+                     "(详见日志,只记不改判)")
     if opts.r5_on and counts.uspto_failures:
         lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
                      f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
@@ -1505,6 +1515,8 @@ def run(params: dict) -> str:
                        "L4_ran": 0, "L4_reject": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
+        from services import audit_l3 as _audit_l3
+        _audit_l3.reset_stats()                  # L3 政策路由解析不到的计数同样
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         _llm.reset_usage_stats()                 # token 记账同样每轮从零
@@ -1725,6 +1737,9 @@ def run(params: dict) -> str:
             (pending_total,) = cur.fetchone()
 
     l1s = audit_rules.audit_l1_llm.STATS
+    # L3 政策路由解析不到的条目走 stage_stats 这条既有通道(L3 的数都在里面)
+    stage_stats["L3_route_unresolved"] = _audit_l3.STATS.get("route_unresolved", 0)
+    stage_stats["L3_route_unresolved_names"] = _audit_l3.unresolved_route_names()
     tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
                    l0_untouched=l0_untouched, adopted_n=adopted_n,
                    no_title=no_title, seller_missing=seller_missing,

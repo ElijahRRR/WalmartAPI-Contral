@@ -1,7 +1,8 @@
 """最终拒绝理由映射(旧仓 `pipelines/reason_mapper.py` 逐字迁入),纯函数、零 DB、零 LLM。
 
 作用:从 AuditOutcome 的全部 hits 推一个统一的 final_reason_category,
-对齐 Walmart 37 条 Prohibited Product Policy 的 category_en,用于告诉卖家
+对齐 Walmart Prohibited Product Policy **全部**类别的 category_en(条数随
+`audit.walmart_prohibited_policy` 实时变化,2026-09-02 起是官方 42 类),用于告诉卖家
 "按哪条 Walmart 政策被拒"。落 `catalog.products.audit_reason`(runs 表无此列,旧仓同)。
 
 **真实执行顺序**(以旧仓代码为准,首个 return 即出;旧仓模块 docstring 那份
@@ -26,20 +27,35 @@
 `all_hits` 遍历顺序(决定步 1/1.5 谁先命中,**第一个命中即胜出,无优先级比较**):
 phase0.hits → l1.hits → l2.hits → l3.hits → l4.hits,层内按 append 顺序。
 
-批次 B(零 LLM)下 l3/l4 恒为 None ⇒ 步 2、步 3 恒不触发,`_L3_NORMALIZE` 也用不上;
+批次 B(零 LLM)下 l3/l4 恒为 None ⇒ 步 2、步 3 恒不触发,`_normalize_l3_cat` 也用不上;
 但**整段原样迁入**,批次 C 接上 LLM 时零改动(删了批次 C 会重写出一份不一致的)。
 
 已知缺陷(**照迁不修**):
-  - `_normalize_l3_cat` 第 2 步 `cat.lower() in ('none','null','')` **未 strip**,
+  - `_normalize_l3_cat` 第 1 步 `cat.lower() in ('none','null','')` **未 strip**,
     `" none "` 不会被判空,会落到查表 → `.title()` 变形;
   - 查表未命中时的 `cat.strip().title()` 会把 `PFAS Chemicals` 变 `Pfas Chemicals`、
-    `Children's Products` 变 `Children'S Products`(表内已收的键不受影响);
+    `Children's Products` 变 `Children'S Products`(**传了 `known` 就轮不到它** ——
+    实时集合里对得上的一律回表内原拼写,这是 2026-09-02 之后的常规路径);
   - `_pt_to_policy` 一律是**裸子串**判断,无词边界:`'ring'` 会被 "watering can" 命中。
 
 不迁:旧仓 orchestrator 的 `'history_shortcut'` 兜底(新仓不迁历史短路,outcome 无该形态)。
-落在 37 政策集合外的已知取值:`'Restricted/Illegal'`(R1 两条 hit 的常量,经步 1.5 会直接
+落在政策集合外的已知取值:`'Restricted/Illegal'`(R1 两条 hit 的常量,经步 1.5 会直接
 成为最终理由)、`'Jewelry/Precious Metals'`(本文件第 10 组)、以及 `.title()` 变形值——
 用 `known_policies_check` 记日志计数,**不改判定**(理由映射不是放行/拒绝依据)。
+
+⚠ **旧缩写名的三个来源,处置不同**(政策表 2026-09-02 已改成官方拼写,§十.7):
+
+  · **已解决** —— `services/audit_l2._infer_walmart_policy` 返回的那批缩写名
+    (`Military & Law Enforcement` / `Electronics & RF` / `Drugs & Paraphernalia`
+    / `Tobacco & Vaping` …)。它们经规则 detail 的 `walmart_policy` 进来,**只有
+    步 1.5 一个出口**,那里已用 `services/policy_names.resolve` 对回表内拼写;
+    不逐条改 audit_l2 的常量 —— 那是「L3 输出规范化」那一步的事;
+  · **未解决(本批不动)** —— 步 4c `_pt_to_policy` 与步 4d cert 分桶里写死的
+    旧缩写名(同一批名字 + `Children's Products` 直撇号)。那两步是 PT/类目关键词
+    **兜底推断**,不是政策表的下游,输入根本不是政策名,对表反而会把"推断"伪装
+    成"表里查到的";改法(枚举化 / 随表)随 §十.7 的「L3 输出规范化」一起定。
+    后果与上面三种已知缺陷同级:只多几条 warning 计数,判定一个字不变(F 列的
+    政策口径与政策表拼写不一致,人看得懂)。
 """
 
 from __future__ import annotations
@@ -47,31 +63,28 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from services import policy_names
+
 logger = logging.getLogger("services.audit_reason")
 
 
-# L3 reject reason_category → Walmart 37 条政策标准名
+# L3 reject reason_category → 非政策伪类目的落点。
+#
+# ⚠ **2026-09-02 大改**(所有者定稿 `docs/policy_sync.md` §十.7):原表里那
+# 20 条**政策名**条目(intellectual property / drugs & paraphernalia / …)
+# **整体删除**,归一化改为**随表**——见 `_normalize_l3_cat` 的 `known` 参数。
+# 理由是那 20 条写死的是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),
+# 而 `policy_sync` 已把表内名改成官方拼写(`Electronics and Radio Frequency
+# Devices`)。写死的映射不会报错,它会把 L3 答出的官方名**改写回**一个表里
+# 已经不存在的缩写名 —— 结果是 `audit_reason` 与政策表、与 L3 的
+# reason_category 白名单(`audit_l3.valid_reason_categories`,从实时
+# category_en 集合构建)三处对不上,而三处都不会红。
+# **旧脚本跟随新流程变动,不是新流程迁就旧脚本。**
+#
+# 留下的只有**非政策伪类目**:L3 提示词里 `brand_misuse` 是判定维度 4 的固定
+# 标签、content standards 一族是旧标签兼容 —— 它们**不是**政策表里的行,
+# 表怎么改名都影响不到,所以只能写死在这里。
 _L3_NORMALIZE = {
-    'intellectual property':      'Intellectual Property',
-    'offensive content':          'Offensive Content',
-    'military & law enforcement': 'Military & Law Enforcement',
-    'drugs & paraphernalia':      'Drugs & Paraphernalia',
-    'cosmetic products':          'Cosmetic Products',
-    'medical devices':            'Medical Devices',
-    'baby products':              'Baby Products',
-    "children's products":        "Children's Products",
-    'pet products':               'Pet Products',
-    'dietary supplements':        'Dietary Supplements',
-    'alcohol':                    'Alcohol',
-    'tobacco & vaping':           'Tobacco & Vaping',
-    'food products':              'Food Products',
-    'hazardous items':            'Hazardous Items',
-    'electronics & rf':           'Electronics & RF',
-    'textiles & apparel':         'Textiles & Apparel',
-    'auto & motor vehicles':      'Auto & Motor Vehicles',
-    'digital goods':              'Digital Goods',
-    'general-use products':       'General-Use Products',
-    'pfas chemicals':              'PFAS Chemicals',
     'brand_misuse':               'Intellectual Property',     # brand 伪装归到 IP
     'brand misuse':               'Intellectual Property',
     # Walmart Content Standards (promotional claims, all-caps abuse 等)
@@ -83,15 +96,35 @@ _L3_NORMALIZE = {
 }
 
 
-def _normalize_l3_cat(cat: str | None) -> str | None:
-    """输入:L3 给的 reason_category → 输出:归一化后的 Walmart 政策名(或 None)。
+def _normalize_l3_cat(cat: str | None, known=()) -> str | None:
+    """输入:L3 给的 reason_category(+ 实时 category_en 集合)→ 输出:政策名或 None。
 
-    先判空(**此处未 strip**,故 " none " 会漏过判空),再 strip+lower 等值查表;
-    查不到则 `cat.strip().title()`。
+    四步,顺序即语义:
+
+      1. 判空(**此处未 strip**,故 " none " 会漏过判空 —— 照迁的已知缺陷);
+      2. 交给 `services/policy_names.resolve(cat, known)` 对表 —— 命中**返回表内
+         原拼写**。这一步就是"归一化随表":表里叫什么,这里就回什么,改名前后
+         都成立,且与 `audit_l3.valid_reason_categories` **同源同拼写**(两边吃的
+         都是 `ctx.known_policies`,即 `SELECT category_en FROM
+         audit.walmart_prohibited_policy`)。**归一化规则不在本文件实现** ——
+         仓内只有 `policy_names` 一处懂"两个政策名是不是同一个"(铁律:每个能力
+         只有一条实现路径),它同时管定序(表里若真有只差大小写的两行,不定序会
+         让同一输入在两次进程里给出不同答案,而那种漂移不会报错);
+      3. 查非政策伪类目表(brand_misuse / content standards 一族);
+      4. 都不中 → 沿用 `cat.strip().title()` 回退(**保持旧行为**,不扩大改动面;
+         已知会把 `PFAS Chemicals` 变 `Pfas Chemicals`,由 `known_policies_check`
+         记日志计数,不改判定)。
+
+    `known` 缺省为空 = 退化成"只认伪类目 + .title()":调用方拿不到政策表时
+    (纯函数单测、批次 B 零 LLM)行为与改动前一致。
     """
     if not cat or cat.lower() in ('none', 'null', ''):
         return None
-    return _L3_NORMALIZE.get(cat.strip().lower(), cat.strip().title())
+    s = cat.strip()
+    hit = policy_names.resolve(s, known)
+    if hit is not None:
+        return hit
+    return _L3_NORMALIZE.get(s.lower(), s.title())
 
 
 def _pt_to_policy(pt: str | None, title: str = '') -> str | None:
@@ -152,21 +185,31 @@ def _pt_to_policy(pt: str | None, title: str = '') -> str | None:
 def compute_final_reason(
     outcome: Any,
     product: Any | None = None,
+    known=(),
 ) -> str | None:
-    """输入:AuditOutcome(+ 可选 ProductInfo)→ 输出:Walmart 政策 category_en 或 None。
+    """输入:AuditOutcome(+ 可选 ProductInfo + 实时 category_en 集合)
+    → 输出:Walmart 政策 category_en 或 None。
 
     仅在 verdict='reject' 时有意义;pass/pending(以及 outcome 为 None)恒返回 None。
     完整顺序见模块 docstring —— 注意实现顺序是 0→1→2→1.5→3→4a..4g,
-    **L0 硬规则优先于 L3**(phase0_forbidden_category 已直接对齐 37 条政策的
+    **L0 硬规则优先于 L3**(phase0_forbidden_category 已直接对齐政策表的
     category_en;L3 常因标题里的知名品牌词把"大类禁售"误判成 IP,让对齐率退化),
     其余带 walmart_policy 的规则则排在 L3 **之后**(步 1.5)。
     `product` 可为 None(此时步 4c 只按 PT 判)。
+
+    `known` = 实时 `category_en` 集合(`ctx.known_policies`),喂给**两处对表**:
+    步 2 的 `_normalize_l3_cat`(L3 答出的政策名必须按表内拼写回来,不能被一张
+    写死的旧缩写映射改写)与步 1.5(规则 detail 里写死的旧缩写名解析回表内拼写)
+    —— 两处都走 `services/policy_names.resolve`,§十.7。缺省空 = 退化成改动前的
+    行为(伪类目表 + `.title()`,规则 detail 原样返回)。
+    ⚠ 步 4a-4g 的兜底常量**没有对表**:那几步是 PT/类目关键词推断,不是政策表的
+    下游,改法随「L3 输出规范化」一起定(见模块 docstring 末尾的遗留清单)。
     """
     if outcome is None or outcome.verdict != "reject":
         return None
 
     # 分 hard/soft hit:
-    #   hard = phase0_forbidden_category — 大类禁售精确对齐 Walmart 37 条政策
+    #   hard = phase0_forbidden_category — 大类禁售精确对齐 Walmart 政策表
     #   soft = cert / brand / trademark 等 — 只标 L2 有命中, 实际原因要靠 L3 判
     # ⚠ 2026-08-20:原集合里的 forbidden_mega_cat(L2 R2)已随 R2 删除。
     HARD_RULE_CODES = {'phase0_forbidden_category'}
@@ -194,16 +237,26 @@ def compute_final_reason(
 
     # (2) L3 语义判 (硬规则没给时, L3 最准)
     if outcome.l3 and outcome.l3.verdict == 'reject':
-        cat = _normalize_l3_cat(outcome.l3.reason_category)
+        cat = _normalize_l3_cat(outcome.l3.reason_category, known)
         if cat:
             return cat
 
     # (1.5) 其他带 walmart_policy 的规则 (未来扩展用, 兜底放这)
+    #
+    # ⚠ 这是 `audit_l2._infer_walmart_policy` 那批**写死的旧缩写名**
+    #   (`Military & Law Enforcement` / `Electronics & RF` / `Drugs &
+    #   Paraphernalia` …)进入 final_reason_category 的**唯一出口**,所以对表
+    #   在这里做一次就够了(不逐条改 audit_l2 的常量 —— 那是 §十.7「L3 输出
+    #   规范化」那一步的事)。改名后表里已经没有那些拼写,不解析就是每条 reject
+    #   都落在政策表之外:只多几条 warning 计数,判定不变,但 F 列的政策口径
+    #   会与政策表对不上,申诉时报的名字沃尔玛那边查无此类。
+    #   解析不到的**原样返回**(绝不编一个表里没有的名字),由调用方既有的
+    #   `known_policies_check` 记 warning 计数。
     for h in outcome.all_hits:
         if h.rule_code not in HARD_RULE_CODES:
             policy = (h.detail or {}).get('walmart_policy')
             if policy:
-                return policy
+                return policy_names.resolve(policy, known) or policy
 
     # (3) L4 视觉
     if outcome.l4 and outcome.l4.verdict == 'reject':
@@ -256,7 +309,7 @@ def compute_final_reason(
 
 
 def known_policies_check(reason: str | None, known: frozenset) -> bool:
-    """输入:理由字符串 + 37 条政策 category_en 集合 → 输出:该理由是否落在集合内。
+    """输入:理由字符串 + 实时政策 category_en 集合 → 输出:该理由是否落在集合内。
 
     纯校验,**不改任何判定**:调用方拿 False 去记日志计数即可(项目铁律:兜底触发
     必须记日志计数),绝不能因为映射不到就放行——理由映射不是放行/拒绝的依据。
@@ -271,7 +324,7 @@ def known_policies_check(reason: str | None, known: frozenset) -> bool:
 
 # ── 人话理由(给人看的那一面)───────────────────────────────────────────────
 #
-# ⚠ `final_reason_category` 回答的是「按 Walmart 37 条政策的哪一条被拒」——
+# ⚠ `final_reason_category` 回答的是「按 Walmart 禁售政策的哪一条被拒」——
 # 那是**平台口径**,不是原因。其中 `General-Use Products` 更是第 4g 步的兜底
 # (以上全不中),落在一把螺丝刀、一个土豆压泥器上时,人只会看得一头雾水
 # (所有者 2026-08-16:「理由是 General-Use Products,这是什么意思」)。
@@ -339,7 +392,7 @@ def explain_hit(rule_code: str, detail: dict | None) -> str:
 
 
 def human_reason(hits: list[tuple[str, dict]], policy: str | None) -> str:
-    """输入:[(规则码, detail)] + 37 政策类目 → 输出:上架表 F 列写的那句话。
+    """输入:[(规则码, detail)] + 政策类目 → 输出:上架表 F 列写的那句话。
 
     形态:`人话1;人话2 [政策:General-Use Products]`。
     政策类目留在方括号里 —— 它是与沃尔玛对话时的口径(申诉/开类目要报它),

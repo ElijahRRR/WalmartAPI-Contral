@@ -1662,8 +1662,14 @@ CREATE TABLE IF NOT EXISTS audit.walmart_pt_spec (
     synced_at            timestamptz DEFAULT now()
 );
 
--- 沃尔玛禁售政策(43 类;L3 理由映射与 policy 提示行来源)
+-- 沃尔玛禁售政策(L3 理由映射与 policy 提示行来源;官方实解 42 类)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
+-- ⚠ 一表两区,维护方不同(定稿 docs/policy_sync.md §二,列注见 docs/db_schema.md):
+--    ① 机器区 category_en / full_policy / official_url / policy_updated_at /
+--      synced_at / raw —— workflows/policy_sync 从 refdata/policy_pages/en 同步;
+--    ② 人工区 category_zh / overall_status / preapproval / zh_seller_risk /
+--      prohibited_items / conditional_items / preapproval_items / legal_refs /
+--      zh_seller_notes —— 运营维护,policy_sync 一律不读不写。
 CREATE TABLE IF NOT EXISTS audit.walmart_prohibited_policy (
     id                integer PRIMARY KEY,
     category_en       text,

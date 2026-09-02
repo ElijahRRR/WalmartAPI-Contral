@@ -71,6 +71,14 @@ Node",一店一节点。**该依据正在失效**(所有者 2026-08-24 起自建
 marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁移)、
 影刀 RPA 抓前台页(保持原样,只改数据落点)。
 
+> 政策页爬虫这条**继续不做**(2026-09-01,出处 `docs/policy_sync.md` §十):
+> 政策表如今是 L3 判定与归类 join 的权威源、必须可同步,但**来源不是爬虫** ——
+> html.parser 抓回来的是拍平纯文本,标题/列表/表格结构全丢。定稿改为 skill
+> `.claude/skills/policy-refresh/` 派子代理逐页忠实转录进
+> `refdata/policy_pages/en|zh/`,工作流 `policy_sync` 读转录件入库
+> (`git diff` 即政策变更审计记录)。**仓内不实现政策页爬虫**,`api/` 层不新增
+> 任何 marketplacelearn 端点。
+
 ## 2. 工作流 × 端点矩阵
 
 计划中的每条工作流(docs/plan.md Phase 2)开工前,先查此表确认 api 层函数已就绪。

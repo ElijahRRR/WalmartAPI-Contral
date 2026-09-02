@@ -1383,6 +1383,48 @@ def test_the_clamp_note_reaches_the_summary():
     assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")
 
 
+def test_the_l3_route_gap_counter_is_reset_and_reaches_the_summary():
+    """⚠ 计数只加不看 = 看不见(README「测试钉的是哪些接缝」第三条)。
+
+    L3 路由的政策名在政策表里解析不到 → 那一条政策提示本轮没给。判定不受影响、
+    不报错,所以它**只能**靠摘要被人看见;而每轮必须清零,否则跨轮累加的数字
+    读起来像"这一轮坏了这么多"。
+    """
+    import inspect
+    from services import audit_l3
+    src = inspect.getsource(product_audit.run)
+    assert "_audit_l3.reset_stats()" in src                  # 每轮清零
+    assert 'stage_stats["L3_route_unresolved"]' in src       # 走既有通道
+
+    stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
+             "L4_ran": 0, "L4_reject": 0}
+    opts = product_audit.Opts(execute=True, limit=1, backfill=False,
+                              adopt_only=False, r5_on=False, run_l3=True,
+                              run_l4=False, only_l0=False, workers=1,
+                              conn_note="")
+    counts = product_audit.Counts(
+        verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
+        l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
+        policy_unknown=0, row_errors=0, asked_asins=0, uspto_failures=0,
+        uspto_off=True)
+    # 零 = 一个字都不打印(notify_fmt 规矩 2:例外计数为 0 是噪声)
+    assert not [ln for ln in product_audit._summary(opts, counts, stage, {}, {},
+                                                    0, [])
+                if "政策路由" in ln]
+    stage["L3_route_unresolved"] = 4
+    stage["L3_route_unresolved_names"] = ["Pet Products"]
+    line = [ln for ln in product_audit._summary(opts, counts, stage, {}, {},
+                                                0, [])
+            if "政策路由" in ln]
+    assert len(line) == 1
+    assert "4 次" in line[0] and "Pet Products" in line[0]
+    assert "只记不改判" in line[0]
+
+    # STATS 的形状:总计 + 逐名字(摘要点名靠它)
+    audit_l3.reset_stats()
+    assert dict(audit_l3.STATS) == {"route_unresolved": 0}
+
+
 def test_audit_one_only_l0_hits_reject_and_misses_return_none():
     """stages=L0(所有者 2026-08-18):只跑 Phase0,纯查库零 LLM。
 

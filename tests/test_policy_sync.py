@@ -360,7 +360,7 @@ def test_renaming_keeps_the_id_and_matches_the_official_spelling(monkeypatch):
 
 
 def test_legacy_abbreviations_are_claimed_and_renamed(monkeypatch):
-    """⚠ 存量缩写名(§十.6 那 7 行)经 POLICY_LEGACY_NAMES 认领 → 改名,
+    """⚠ 存量旧名(§十.6 的 7 行 + 首跑补的 4 行)经 POLICY_LEGACY_NAMES 认领 → 改名,
     **不再**走"新增一行 + 官方已不含一行"那条会写出同概念双行的路。"""
     rows = [(i + 1, legacy, "旧正文") for i, legacy
             in enumerate(sorted(resources.POLICY_LEGACY_NAMES))]
@@ -369,9 +369,10 @@ def test_legacy_abbreviations_are_claimed_and_renamed(monkeypatch):
     got = {p["id"]: p["category_en"] for _s, p in _renames(conn)}
     assert got == {i + 1: resources.POLICY_LEGACY_NAMES[legacy]
                    for i, legacy in enumerate(sorted(resources.POLICY_LEGACY_NAMES))}
-    assert len(_refreshes(conn)) == 7               # 认领了就照常刷新正文
-    assert out.splitlines()[0].startswith("新增 35 / 刷新 7 / 改名 7 / "
-                                          "未对上 35 / 官方缺席 0")
+    n = len(resources.POLICY_LEGACY_NAMES)
+    assert len(_refreshes(conn)) == n               # 认领了就照常刷新正文
+    assert out.splitlines()[0].startswith(
+        f"新增 {42 - n} / 刷新 {n} / 改名 {n} / 未对上 {42 - n} / 官方缺席 0")
     text = (paths.reports_dir() / ps._REPORT_FILE).read_text(encoding="utf-8")
     block = text.split("▍将改名")[1].split("▍改名冲突")[0]
     assert "「Drugs & Paraphernalia」 → 「Drugs and Drug Paraphernalia」" in block

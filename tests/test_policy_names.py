@@ -110,8 +110,8 @@ def test_resolve_returns_the_spelling_that_is_in_the_table():
 def test_resolve_says_no_instead_of_inventing_a_name():
     """认不出来给 None —— 编一个表里没有的名字,下游一路都对不上还不报错。"""
     assert pn.resolve("Weapons", OFFICIAL) is None
-    assert pn.resolve("Pet Products", OFFICIAL) is None      # 官方名是另一串
-    assert pn.resolve("Jewelry/Precious Metals", OFFICIAL) is None
+    assert pn.resolve("Pet Supplies (old)", OFFICIAL) is None   # 映射表里也没有
+    assert pn.resolve("Jewelry/Gems", OFFICIAL) is None
     assert pn.resolve(None, OFFICIAL) is None
     assert pn.resolve("Alcohol", ()) is None
     assert pn.resolve("Alcohol", None) is None

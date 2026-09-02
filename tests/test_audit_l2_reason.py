@@ -564,10 +564,10 @@ def test_b7_step15_keeps_a_name_it_cannot_resolve_instead_of_inventing_one():
     落在表外由调用方既有的 `known_policies_check` 记 warning 计数(不改判定)。
     """
     o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
-                               {"walmart_policy": "Restricted/Illegal"})])
+                               {"walmart_policy": "Ghost Policy (old)"})])
     assert audit_reason.compute_final_reason(o, None, _OFFICIAL_TABLE) == \
-        "Restricted/Illegal"
-    assert not audit_reason.known_policies_check("Restricted/Illegal",
+        "Ghost Policy (old)"
+    assert not audit_reason.known_policies_check("Ghost Policy (old)",
                                                  frozenset(_OFFICIAL_TABLE))
 
 

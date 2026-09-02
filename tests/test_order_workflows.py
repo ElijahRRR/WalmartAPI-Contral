@@ -191,7 +191,7 @@ def test_order_sync_conflict_is_named_in_first_line_and_db_value_kept(monkeypatc
     first = out.splitlines()[0]
     assert ";沃尔玛下单时间回错 1 条已挡" in first and "⚠ 下单时间" not in first
     assert "T1 PO PO1[待定]:库 09/09 04:12 / API 08/04" in out
-    assert kw == {"repair_order_date": False}
+    assert kw == {}                      # 默认路径不带修复开关
     _k, sql, _rows = next(c for c in calls if c[0] == "many")
     assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
     # upsert 之后另发观测记账,且不碰 updated_at
@@ -199,16 +199,26 @@ def test_order_sync_conflict_is_named_in_first_line_and_db_value_kept(monkeypatc
     assert len(state) == 1 and "updated_at" not in state[0][1]
 
 
-def test_order_sync_repair_mode_is_explicit_and_overrides(monkeypatch):
-    """-p repair_order_date=1 才允许 API 值覆盖:摘要标明修复模式,
-    upsert 去掉 COALESCE 守卫改成整列覆盖。"""
+def test_order_sync_repair_mode_needs_explicit_po_list(monkeypatch):
+    """-p repair_order_date=<PO 列表> 才允许 API 值覆盖,且只覆盖列出的 PO:摘要标明
+    修复模式,该 PO 的 upsert 去掉状态守卫改成整列覆盖;裸开关一律报错(沃尔玛每轮
+    都回错十来条,整库改写等于把错值抄进来)。"""
     out, kw, calls = _order_sync_with_conflict(
-        monkeypatch, {"days": "7", "repair_order_date": "1"})
-    assert "沃尔玛下单时间回错 1 条已挡(修复模式:已按 API 值改写)" in out.splitlines()[0]
+        monkeypatch, {"days": "7", "repair_order_date": "PO1, PO9"})
+    assert "(修复模式:2 个 PO 已按 API 值改写)" in out.splitlines()[0]
     assert kw == {"repair_order_date": True}
     _k, sql, _rows = next(c for c in calls if c[0] == "many")
     assert "t.order_date_confirmed" not in sql
     assert "order_date = EXCLUDED.order_date" in sql
+    # 没点名的 PO 走默认守卫
+    out, kw, calls = _order_sync_with_conflict(
+        monkeypatch, {"days": "7", "repair_order_date": "PO9"})
+    assert "修复模式" in out.splitlines()[0] and kw == {}
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
+    for bare in ("1", "true", "yes"):
+        with pytest.raises(ValueError, match="需要 PO 列表"):
+            _order_sync_with_conflict(monkeypatch, {"days": "7", "repair_order_date": bare})
 
 
 def test_returns_sync_end_to_end(monkeypatch):

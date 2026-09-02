@@ -19,7 +19,7 @@ L3 从「读 6 列中文人工摘要 + 代码猜路由」改为「读 44 篇官�
 | **A 转录** | 内容族两页按 policy-refresh 纪律转录 en/zh 进 `refdata/policy_pages/`(**2026-09-02 已落地**:43 `Content standards: Overview` 所有者粘贴、44 `Product details policy` 公开页结构化数据 + 粘贴交叉核对);`policy-refresh` 技能补第二来源;喂入层补两条规则(图片整删、表尾空行不算数据行) | **不跑** `policy_sync`(跑了会再让 L3 缓存全量失效一次,白付);等 C 合并后随切换一起跑 |
 | **B1 换喂 + 规范化**(**2026-09-02 已落地**) | S4 换官方全文;user 段扩容;输出 schema 三段化;`audit_detail` 落库;理由映射去猜测;证据通道泛化;路由提示删除 | 生产机**不 pull**(见 §五) |
 | **B2 回放 + 重审面**(**2026-09-02 已落地**) | `audit_replay` 回放工作流;`mode=stale` 的 `active_days=90`;首条串行预热 | 同上 |
-| **C 瘦身 + 清理** | L0 双输出(品牌文案扫描迁入)+ Made in USA 迁入;L2 = R1;删 R3 硬拒/R4/R5/R7/R8/R10 及其数据;删 `POLICY_LEGACY_NAMES` / `POLICY_ALIASES` / `to_official` / `_L3_NORMALIZE` / `_pt_to_policy` / 路由表 | 生产机 pull A+B+C → 按 §五 切换 |
+| **C 瘦身 + 清理**(**2026-09-03 已落地**) | L0 双输出(品牌文案扫描迁入)+ Made in USA 迁入;L2 = R1;删 R3 硬拒/R4/R5/R7/R8/R10 及其数据;删 `POLICY_LEGACY_NAMES` / `POLICY_ALIASES` / `to_official` / `_L3_NORMALIZE` / `_pt_to_policy` / 路由表 | 生产机 pull A+B+C → 按 §五 切换 |
 
 顺序理由:§10「先换喂后删 R7/R8」;B、C 分两批是为了对抗复核可读,但**只切换一次**
 (两批各自递增 `AUDIT_RULES_VERSION`,生产只看到最终版;pull 一次)。
@@ -333,7 +333,11 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
    那边哪天多一个 `{` 就会把 `product_audit` 炸在 KeyError,而吃同一份文本的
    `audit_replay` 一点事没有 —— 两边都看不出来的耦合。
 
-## 四、C 批规格:瘦身 + 清理
+## 四、C 批规格:瘦身 + 清理 —— **2026-09-03 已落地**
+
+> **落地状态**:§4.1 / §4.2 / §4.3 全部实现,判据版本
+> `AUDIT_RULES_VERSION = c.2026-09-03.1`;与本规格的差异逐条见本节末尾的
+> 「C 落地记录」。测试 2,684 收集(2,661 跑 + 23 跳过)全绿。
 
 ### 4.1 L0 双输出
 
@@ -374,6 +378,42 @@ L0 品牌文案扫描一条。品牌词清单(`MAX_BRANDS=10`)从同一通道取
 - 文档:`docs/audit_pipeline.md` §2 / §4 / §8.5 重写,§10 标全部落地;`docs/conventions.md`
   若有 R5/R7/R8 的规则引用同步;`services/audit_l2.py` 模块头「六条规则」措辞随之消失。
 - `AUDIT_RULES_VERSION` 再递增。
+
+**C 落地记录(2026-09-03,与本规格的差异逐条)**:
+
+- `AUDIT_RULES_VERSION` = **`c.2026-09-03.1`**;提示词一字未动 ⇒
+  `llm_cache` 命中不受本批影响(B1 那次已经全量重建过);
+- **ctx 字段随判定方改名** `ac_automaton` → `brand_mention_automaton`
+  (规格只说"挪到 L0 使用"):字段名带着已删规则的编号,下一个人会照着去找 R4;
+  自动机仍在 `audit_rules._build_automaton` 一处构建。**`r4_source` 不改名**
+  —— 它是 TRO 命中接线与事件账本的既有口径(`audit_store.tro_hits` 的形参、
+  测试、店铺事件),改它属于另一件事,注释里写明"旧称 R4 键";
+- **TRO 命中接线跟着搬**(规格没点名):`audit_store._r4_brands` 原先写死
+  "从 `outcome.l2` 里找 `title_desc_blacklist`",规则迁进 L0 后它会**静默归零**
+  —— TRO 从此再也不报警,而摘要照样漂亮。改为 `_mentioned_brands`:按
+  rule_code 读 `all_hits`,与证据出自哪一层无关;
+- **`made_in_usa_claim` 补进 `_RULE_CN`**:它 2026-08-24 上线时就没登记过中文名
+  (存量老行一直渲染成裸 rule_code),迁走之后更没人管,一并补上;
+- **`registry/paths.audit_seed_file` 保留、只改登记**:规格写的是"删 registry/paths
+  里的登记"。函数本身留着 —— `refdata/audit/` 目录仍在(`l3_keywords.yaml` 是
+  参考资料,代码从不加载),而铁律 3 要求取那个目录的路径必须经它;docstring
+  改成"当前零消费方 + 三份种子各自何时下线";
+- **`registry/db.uspto_conn` / `uspto_dsn` 保留**(本仓已无消费方,README 外部
+  资源行与两处 docstring 都写明):库与外部灌库链路都还在,§10 定稿写的是
+  "将来需要按新流程重建"。删掉它等于把重建的入口也删了;
+- **`policy_join` 的两处行为差**(旧名别名表退役的连带,都不是 bug):
+  ① 老 run 里 `l3_reason_category` 装着旧缩写名的行,`_adopt_history` 从此
+  解析不到 → 类别留空 + 计数(采用历史本来就不重判);
+  ② 报错正文里的语义缩写 join 不上 → 进「政策表缺口」清单(那正是它该待的地方);
+- **`policy_sync` 少一句提示**:表里同时留着「旧缩写名 + 官方名」两行时,旧行
+  只进「官方已不含」(不删行、零写),不再带「该名已被 id N 占用」——
+  「疑似改名对」比的是「未对上的官方页」×「官方已不含的行」,而这一轮官方页
+  已经对上了别的行,配不成对。**代价写在测试里**
+  (`test_a_legacy_row_next_to_its_official_row_is_left_alone_and_listed`),
+  换掉的是一张永远不会再被验证的历史映射表;
+- **`test_error_taxonomy` 删掉「改名前那张 30 行近似表」上的 join 基线**:
+  那一半量的是别名桥本身,桥拆了它就只会把退役的东西焊回来;官方表那一半
+  (16/19 → 19/19)原样保留。
 
 ## 五、切换手册(A+B+C 都合并后,一次做完)
 

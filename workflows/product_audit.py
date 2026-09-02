@@ -38,11 +38,12 @@
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
   python cli.py product_audit -p from_sheet=1 -p gap_wait=0    # 缺数据只推采集不等(采集侧病了时)
 
-链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
-L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
-L4 视觉] → 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
-products.audit_* 五列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
-L2 R4 扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
+链路(2026-09-03 C 批瘦身后):领 catalog.products 待审行 → L0(五条硬拒
+短路 + 一条 0 分软证据「品牌黑名单扫文案」,软的不终止)→
+L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2(只剩 R1 类目准入)→
+[L3 语义 → L4 视觉] → 类别映射 → 落 audit.audit_runs/audit_hits;真跑才写
+products.audit_* 六列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
+L0 品牌文案扫描扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
 (源头一条 + 波及逐店,展开走 services/risk_trace),dry-run 一条不写。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 

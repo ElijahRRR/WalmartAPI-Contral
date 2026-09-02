@@ -675,10 +675,41 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-# 2026-09-02 提版两次:政策表官方同步 v1(见下方 POLICY_LEGACY_NAMES 与
-# docs/policy_sync.md §十.7)+ 第三步 B1 批(L3 换喂官方全文 + 输出三段化,
-# docs/audit_step3_spec.md §三)。提版即触发 mode=stale 版本重审。
-AUDIT_RULES_VERSION = "c.2026-09-02.2"
+# 2026-09-02 提版两次(政策表官方同步 v1 + 第三步 B1 批),2026-09-03 第三步
+# C 批再提一次。提版即触发 mode=stale 版本重审。
+AUDIT_RULES_VERSION = "c.2026-09-03.1"
+# c.2026-09-03.1  **第三步 C 批:审核链瘦身 + 旧名一族清理**
+#                 (规格 `docs/audit_step3_spec.md` §四,链路定稿
+#                 `docs/audit_pipeline.md` §10):
+#                 ① **L0 双输出**:硬拒(黑名单三表 → 商标符号 → 专利自述 →
+#                    **Made in USA** → 品牌等值)命中即终止不变;全未中则跑软规则
+#                    **品牌黑名单扫文案**(`phase0_brand_mention`,penalty 0)进
+#                    `Phase0Result.evidence`,**不终止**判定、随产品进 L3。
+#                    一次 run 的 L0 行数因此可能 >1(硬 1 或软 n);
+#                 ② **R4 / R10 迁入 L0**(判定逐字随迁,rule_code 换成
+#                    `phase0_brand_mention` / `phase0_made_in_usa`);Made in USA
+#                    的类别改自报 **`Product claims`**(官方第 29 节专段;旧
+#                    `Made in USA claims` 是自造名,政策表里没有那一行);
+#                 ③ **L2 = R1**:删 R3(类目需证书,替身是 B1 已落地的
+#                    「本 PT requirements 进 L3」)、R5(USPTO 商标,连同
+#                    `pt_nice_class.yaml` 与 ctx 的 uspto/nice 字段)、R7(促销
+#                    宣称)、R8(敏感合规)与 `_infer_walmart_policy` 四张字面量表;
+#                    `product_audit -p r5=on` 随之下线;
+#                 ④ **旧名一族退役**:`POLICY_LEGACY_NAMES` / `policy_names.
+#                    to_official`(resolve 第 4 级)/ `error_taxonomy.
+#                    POLICY_ALIASES` / `alias_gaps` / policy_sync 的「经旧名认领」
+#                    —— 改名 2026-09-02 已真跑落地,表内就是官方拼写;今后改名
+#                    走人工入口(policy_sync 报告的「疑似改名对」);
+#                 ⑤ 类别缺口从三条降到**一条**(只剩 L4 `l4_vision_violation`
+#                    等所有者裁决)⇒ **L4 关闭时 `reason_missing` 应恒为 0**。
+#                 判定面变化:曾被 R3 硬拒(该类目要认证)与 R10 拒掉的产品会
+#                 分别翻案/改由 L0 拒;R4/R5/R7/R8 的软 hit 不再产生(证据面
+#                 只剩 L0 品牌命中 + 官方全文)。**按需重审为主**
+#                 (`audit_sheet` 走 from_sheet),批量走 `mode=stale`
+#                 (近 90 天有动销的那批;定点翻案:
+#                   python cli.py product_audit -p rerule=cat_requires_cert_hard
+#                   python cli.py product_audit -p rerule=made_in_usa_claim)。
+#                 ⚠ 提示词未动 ⇒ `llm_cache` 命中不受本批影响(B1 那次已全量重建)。
 # c.2026-09-02.2  **第三步 B1 批:L3 换喂 + 输出规范化 + 理由映射去猜测**
 #                 (规格 `docs/audit_step3_spec.md` §三,所有者八项定稿 §六):
 #                 ① S4 政策块改喂**官方英文全文**(`full_policy` 经
@@ -696,7 +727,8 @@ AUDIT_RULES_VERSION = "c.2026-09-02.2"
 #                 ⑤ 证据通道泛化(读 L0/L1/L2 三层软 hit)、政策路由提示整体删除。
 #                 ⚠ 提示词与政策表一起决定 `llm_cache` 键 ⇒ purpose=audit_l3 的
 #                 存量缓存**全量未命中**,重审全额重付(谷时段减半,见 LLM_PRICING)。
-#                 ⚠ **B 与 C 只切换一次**(规格 §一):生产机等 C 批合并后再 pull。
+#                 ⚠ **B 与 C 只切换一次**(规格 §一):生产机等 C 批合并后再 pull
+#                 —— C 批 2026-09-03 已合并,切换手册见规格 §五。
 #                 影响面:reject 行的 `audit_reason` 改为类别枚举、`audit_detail`
 #                 新列写具体内容。**按需重审为主**(`audit_sheet` 走 from_sheet),
 #                 批量走 `mode=stale`(近 90 天有动销的那批,B2 批加 active_days)。

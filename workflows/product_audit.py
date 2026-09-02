@@ -216,7 +216,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
-                 "gap_wait", "force", "repts"}
+                 "gap_wait", "force", "repts", "active_days"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
@@ -245,6 +245,52 @@ _DEFAULT_CANDIDATE = (
     " AND p.audit_version IS DISTINCT FROM %(cand_ver)s))")
 
 
+# 近 N 天有动销(2026-09-02 B2,所有者定稿 §六.8:「`mode=stale` 只跑近 90 天
+# 有动销的一批」)。**口径与 `services/alloc_survey._SQL_SALES` 逐条对齐**,
+# 那是全仓"动销"的唯一口径,不许在这里另立一套:
+#   · 窗口打在 `order_date` 上(不是 status_date:那是状态变更时刻,退款/发货
+#     都会把它推到今天,拿它算动销 = 把老单算成新单);
+#   · 只排 `Cancelled`(取消的不算卖过),其余状态一律算 —— 未发货也是真需求;
+#   · 用 **`asin` 列**,由 `order_asin_normalize` 按 `services/sku_asin` 规则补填。
+#     `asin IS NULL` 的行自然不算动销(提不出源头码的少量残行),**绝不拿
+#     `sku` 当 asin**:三段式订货号与纯数字 item id 直接等值永远查空,
+#     表现是"这批产品全都没动销过",而且不报错(schema.sql:694-699 的原话)。
+_ACTIVE_SALES = """
+ AND EXISTS (SELECT 1 FROM orders.order_lines o
+             WHERE o.asin = p.asin
+               AND o.order_date >= now() - make_interval(days => %(active_days)s)
+               AND coalesce(o.sale_status, '') <> 'Cancelled')"""
+
+_ACTIVE_DAYS_DEFAULT = 90       # 所有者定稿 §六.8
+
+
+def _active_days(params: dict) -> int:
+    """输入:params → 输出:动销窗口天数(0 = 显式不过滤);非法值直接抛。
+
+    只对 `mode=stale` 有意义(唯一的批量重审通道)。给别的 mode 传它一律炸
+    —— 静默忽略的话人以为"这轮只判了有动销的",实际把 approved 存量整批
+    重付了一遍 LLM,而摘要长得一模一样(与 `force` 那条同款纪律)。
+
+    `0` 是**显式**的"不过滤":缺省 90 天,想跑全量得自己写出来。
+    非整数 / 负数一律抛 —— `int("90天")` 抛的是 ValueError 没错,但错误信息
+    说不出"这个参数是干什么的",而这条参数决定的是一轮要花多少钱。
+    """
+    raw = params.get("active_days")
+    if raw is None or str(raw).strip() == "":
+        return _ACTIVE_DAYS_DEFAULT
+    if str(params.get("mode", "")).strip() != "stale":
+        raise ValueError("-p active_days=N 只与 -p mode=stale 连用"
+                         "(它筛的是版本重审的候选;别的通道各有自己的候选谓词)")
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"active_days 要整数天数(收到 {raw!r});"
+                         f"0 = 不按动销过滤") from None
+    if days < 0:
+        raise ValueError(f"active_days 不能为负(收到 {days});0 = 不按动销过滤")
+    return days
+
+
 def _pick_where(params: dict) -> tuple[str, dict]:
     """输入:params → 输出:(候选谓词 SQL, 绑定参数)。
 
@@ -260,6 +306,10 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
+    # 取值/搭配校验前置(与下面 `force` 那条同款纪律):`active_days` 只对
+    # mode=stale 有意义,而它**不在** stale 分支里校验就等于"传错了静默忽略"
+    # —— 人以为这轮只判了有动销的,实际把 approved 存量整批重付了一遍
+    _active_days(params)
     if _forced_sheet(params) and not params.get("from_sheet"):
         # 宁炸不吞:`force` 只对 from_sheet 那条路有意义(别的通道要么本就强审、
         # 要么有自己的候选谓词)。静默忽略的话,人以为强审了、实际按缺省口径跑,
@@ -384,9 +434,20 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         #
         # **有天然分页**(机械见 _pick_where 头注)。历史导入行版本旧/空,
         # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
-        return ("p.audit_status = 'approved'"
-                " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
-                {"stale_ver": resources.AUDIT_RULES_VERSION})
+        #
+        # **近 N 天有动销**(2026-09-02 B2,所有者定稿 §六.8:「`mode=stale`
+        # 只跑近 90 天有动销的一批,不再全量重付」)。全库 approved 几十万行
+        # 全链重审 = 一笔谁也不想付两次的账;真正要紧的是**还在卖的那批**
+        # 判据别过期。`active_days=0` 显式关掉这道闸(要跑全量得自己写出来)。
+        # 口径见 `_ACTIVE_SALES`(与 alloc_survey 的动销口径同一条)。
+        days = _active_days(params)
+        where = ("p.audit_status = 'approved'"
+                 " AND p.audit_version IS DISTINCT FROM %(stale_ver)s")
+        extra = {"stale_ver": resources.AUDIT_RULES_VERSION}
+        if days:
+            where += _ACTIVE_SALES
+            extra["active_days"] = days
+        return where, extra
     if mode == "pass":
         # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
@@ -1537,12 +1598,19 @@ def run(params: dict) -> str:
                 where, extra, limit,
                 "一个都没有:这批已经全部按当前版本判过了") + sheet_head
         elif mode_ == "stale":
+            # 首行必须点名动销口径(2026-09-02 B2):同一条命令带不带
+            # `active_days` 差的是一个数量级的候选量与账单,而摘要其余部分
+            # 长得一模一样 —— 看不出这轮圈的是哪一批
+            days_ = _active_days(params)
+            scope_ = (f"、**近 {days_} 天有动销**" if days_
+                      else "、**不限动销**(active_days=0,全量 approved)")
             sheet_head = _batch_head(
                 conn, f"版本重审:approved 且未按当前规则版本"
-                      f"({resources.AUDIT_RULES_VERSION})判过的"
+                      f"({resources.AUDIT_RULES_VERSION})判过的{scope_}"
                       f"(rejected 沿用不重审)",
                 where, extra, limit,
-                "一个都没有:approved 存量已全部按当前版本判过") + sheet_head
+                "一个都没有:这批已全部按当前版本判过"
+                + (f",或近 {days_} 天没有动销" if days_ else "")) + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
         cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)

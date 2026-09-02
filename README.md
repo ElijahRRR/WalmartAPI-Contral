@@ -324,6 +324,7 @@ L3 语义(LLM,读 **44 篇沃尔玛官方英文政策全文**)→ L4 视觉(LLM,
 | `-p rerule=<规则码>` | 历史命中过某条规则、现仍 rejected | 只改了一条规则,定点翻案 |
 | `-p force_rerun=<旧版本>` | `audit_version` ≠ 该值的**全部**(含 pass) | 全链全库重审,最贵 |
 | `-p mode=pending` | 只重刷 pending,无退避 | LLM 故障恢复后排空待定存量 |
+| `-p mode=stale -p active_days=90` | `approved` 且版本落后、**且近 N 天有动销** | 判据提版后消化存量;`active_days` 缺省 90,`=0` 显式不按动销过滤(全量 approved,最贵)。动销口径 = `orders.order_lines` 上按 `asin` 列、窗口打 `order_date`、只排 `Cancelled`(与 `alloc_survey` 同一条口径)|
 
 `mode=nonpass` / `mode=pass` / `mode=pending` / `rerule` 都带**版本闸做天然分页**
 (`mode=pass` 除外,它未命中不盖版本,须一次大 limit 扫完):真跑判过的自动

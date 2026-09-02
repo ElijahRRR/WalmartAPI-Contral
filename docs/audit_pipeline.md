@@ -57,6 +57,16 @@
 `mode=nonpass`(非 approved 全量)/ `mode=stale`(approved 版本落后,必须全链)/
 `mode=pass`、`mode=online`(只与 `stages=L0` 连用)。
 
+**`mode=stale` 还带一道动销闸**(2026-09-02 B2,所有者定稿
+`docs/audit_step3_spec.md` §六.8:「只跑近 90 天有动销的一批,不再全量重付」):
+`-p active_days=N` 缺省 **90**,追加谓词「`orders.order_lines` 里近 N 天有非
+`Cancelled` 的行」;`-p active_days=0` **显式**关掉这道闸(全量 approved,最贵)。
+口径与 `services/alloc_survey._SQL_SALES` 同源(全仓动销只有那一份):窗口打
+`order_date`、只排 `Cancelled`、关联用 **`asin` 列**(由 `order_asin_normalize`
+按 `services/sku_asin` 规则补填,提不出的留 NULL 自然不算动销)——
+⚠ 绝不拿 `sku` 当 asin:三段式订货号与纯数字 item id 直接等值永远查空,
+表现是"这批产品全都没动销过",而且不报错。摘要**首行**点名圈的是哪一批。
+
 排序契约:**没审过的永远先于重试的 pending** —— 否则 pending 存量一多,
 新入库的产品会被饿死。
 

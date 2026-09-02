@@ -2066,3 +2066,66 @@ def test_run_wires_the_warmup_once_per_round_and_says_so():
     assert "前缀预热" in inspect.getsource(product_audit._summary)
     # L0 只跑 Phase0(零 LLM),预热在那条路上纯属白判一条
     assert "not only_l0" in src
+
+
+# ── mode=stale 的近 N 天动销闸(2026-09-02 B2,所有者定稿 §六.8)────────────
+
+def test_stale_filters_by_recent_sales_with_the_one_sanctioned_predicate():
+    """「`mode=stale` 只跑近 90 天有动销的一批,不再全量重付」(§六.8)。
+
+    口径必须与 `services/alloc_survey._SQL_SALES` 逐条同源(全仓动销只有
+    那一份口径):窗口打 `order_date`、只排 `Cancelled`、用 **`asin` 列**。
+    ⚠ 拿 `sku` 当 asin 是这条链上最容易犯又最不会报错的错:三段式订货号与
+    纯数字 item id 直接等值永远查空,表现是"这批产品全都没动销过"。
+    """
+    from services import alloc_survey
+
+    w, e = product_audit._pick_where({"mode": "stale"})
+    assert e["active_days"] == 90                      # 缺省 90 天
+    assert "orders.order_lines" in w and "o.asin = p.asin" in w
+    assert "make_interval(days => %(active_days)s)" in w
+    assert "coalesce(o.sale_status, '') <> 'Cancelled'" in w
+    assert "o.sku" not in w, "动销只认 asin 列(order_asin_normalize 补填)"
+    # 与唯一口径同源:三个要件在 alloc_survey 那条 SQL 里长一个样
+    sales = alloc_survey._SQL_SALES
+    assert "order_date >=" in sales and "make_interval(days =>" in sales
+    assert "coalesce(sale_status, '') <> 'Cancelled'" in sales
+    # 版本闸(天然分页)一个字都没丢
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w
+
+
+def test_stale_active_days_zero_turns_the_gate_off_explicitly():
+    """`0` = 显式不过滤(要跑全量得自己写出来),谓词与绑定参数一起消失。"""
+    w, e = product_audit._pick_where({"mode": "stale", "active_days": "0"})
+    assert "orders.order_lines" not in w
+    assert "active_days" not in e and "%(active_days)s" not in w
+    assert "p.audit_status = 'approved'" in w
+
+
+def test_stale_active_days_rejects_junk_and_wrong_mode():
+    """宁炸不吞:这条参数决定一轮要花多少钱。
+
+    · 非整数 / 负数 → 抛(错误信息要说得出"这个参数是干什么的");
+    · 配错 mode → 抛。静默忽略的后果是人以为只判了有动销的,实际把
+      approved 存量整批重付了一遍,而摘要长得一模一样(同 `force` 那条)。
+    """
+    with pytest.raises(ValueError, match="active_days"):
+        product_audit._pick_where({"mode": "stale", "active_days": "90天"})
+    with pytest.raises(ValueError, match="不能为负"):
+        product_audit._pick_where({"mode": "stale", "active_days": "-1"})
+    with pytest.raises(ValueError, match="mode=stale"):
+        product_audit._pick_where({"mode": "nonpass", "active_days": "90"})
+    with pytest.raises(ValueError, match="mode=stale"):
+        product_audit._pick_where({"active_days": "90"})     # 缺省通道也不行
+    # 参数白名单登记了才不会被"未识别参数"那道闸拦掉
+    assert "active_days" in product_audit._KNOWN_PARAMS
+
+
+def test_stale_summary_first_line_names_the_sales_window():
+    """摘要**首行**必须点名圈的是哪一批:带不带 `active_days` 差的是一个
+    数量级的候选量与账单,而摘要其余部分长得一模一样。"""
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "天有动销" in src and "不限动销" in src
+    assert "days_ = _active_days(params)" in src

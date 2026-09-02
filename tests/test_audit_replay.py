@@ -652,3 +652,13 @@ def test_empty_policy_table_stops_the_round_instead_of_faking_accuracy(
     monkeypatch.setattr(ar.audit_rules, "load_context", lambda c, **k: _Empty())
     with pytest.raises(RuntimeError, match="policy_sync"):
         ar.run({"execute": True})
+
+
+def test_an_empty_sample_says_which_funnel_ate_everything(monkeypatch, wired):
+    """一条样本都没抽到时,空报告只会让人以为"跑过了" —— 两条漏斗必须打出来
+    (库是空的 / sku 提不出 asin / 产品行没采回来,下一步完全不同)。"""
+    conn, calls = wired
+    conn.neg, conn.pos = [], []
+    out = ar.run({"execute": True})
+    assert "一条样本都没抽到" in out and "反例漏斗" in out and "正例漏斗" in out
+    assert calls == [] and conn.written == []

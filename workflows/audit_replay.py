@@ -774,6 +774,15 @@ def run(params: dict) -> str:
                                    source="pos") for a in pos_asins]
         products = _load_products(conn, [s.asin for s in samples])
         samples = [s for s in samples if s.asin in products]
+        if not samples:
+            # 一条样本都没有:空报告只会让人以为"跑过了"。把两条漏斗打出来 ——
+            # 是库里没有下架记录、还是 sku 全都提不出 asin、还是产品行没采回来,
+            # 三种情况的下一步完全不同
+            return ("audit_replay:**一条样本都没抽到**,本轮什么都没做。\n"
+                    f"  反例漏斗:{neg_stats}\n"
+                    f"  正例漏斗:{pos_stats}\n"
+                    "  (catalog.walmart_items 是空的?先跑 catalog_sync;"
+                    "sku 提不出 asin 看 sku_normalize;产品行缺看 product_ingest)")
 
         # 前缀 token 用**实际渲染出来的** system prompt 折算(政策表一改就变);
         # 顺带在主线程把提示词构建完,省得 128 个线程同时抢那把锁

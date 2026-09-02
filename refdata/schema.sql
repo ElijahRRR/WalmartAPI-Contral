@@ -687,6 +687,19 @@ ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS asin text;
 CREATE INDEX IF NOT EXISTS order_lines_asin_idx ON orders.order_lines (asin)
     WHERE asin IS NOT NULL;
 
+-- 下单时间定稿状态(2026-09-02 事故后,所有者定稿"下单时间不应该被修改"):
+-- 沃尔玛 GET /v3/orders 的 orderDate **单次读取不可信**(偶发给出别的订单的
+-- 时间、甚至未来日期;本仓从解析到 upsert 全程按名取值,不存在串位通道),
+-- 拉取这一步改为"观测→定稿"两段:首见只写候选,**连续两轮一致才定稿**,定稿后
+-- 锁死不再改。语义唯一出处 services/order_lines._ORDER_DATE_GUARD / _ORDER_DATE_STATE_SQL。
+--   order_date_seen       最近一轮拉取观测到的 orderDate(定稿判据的对照值)
+--   order_date_confirmed  连续两轮观测一致后置 true;此后 order_date 写一次不再动
+--   order_meta            首见时的订单级信封摘要(orderDate 原值 / customerOrderId /
+--                         预计发货送达 / 各行状态时间),事故取证用;只在插入时写
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_seen timestamptz;
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_confirmed boolean NOT NULL DEFAULT false;
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_meta jsonb;
+
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号
     order_line_id   text NOT NULL,

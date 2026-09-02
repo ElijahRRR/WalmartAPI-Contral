@@ -12,9 +12,11 @@ orders.order_lines。窗口全量重拉而非游标增量:订单状态在创建�
 (Created→Shipped→Delivered/Cancelled),按创建时间增量会漏老订单的状态迁移,
 窗口重拉 + 幂等 upsert 天然覆盖(旧系统同样按日全刷 45 天)。
 
-下单时间例外(所有者定稿 2026-09-02):order_date 是事实字段,**写一次**,
-重拉不覆盖;API 值与库值不一致逐条告警并点名进摘要首行;只有显式
-repair_order_date=1 才按 API 值改写(先跑默认模式看清冲突清单再开)。
+下单时间例外(所有者定稿 2026-09-02,语义唯一出处 services/order_lines):
+沃尔玛的 orderDate 单次读取不可信,拉取这一步按"观测→定稿"两段走——首见只写
+候选,**连续两轮一致才定稿**,定稿后锁死;每一次不一致(冲突/改判/待定)与
+拒写/存疑都点名进摘要首行;只有显式 repair_order_date=1 才按 API 值直接改写
+(先跑默认模式看清冲突清单再开)。
 
 并发形态(2026-08-13,蓝图 §6.3 async 变体落地):跨店并发由
 api/orders.fetch_orders_bulk 承担(asyncio 藏在 api 层内部,默认 12 店
@@ -40,22 +42,43 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.order_sync")
 
 
+_ANOMALY_KINDS = ("冲突", "改判", "待定", "拒写", "存疑")
+
+
 def _persist(store: dict, orders: list[dict], *, anomalies: list | None = None,
              repair: bool = False) -> int:
-    """输入:店铺 + 该店全部订单(+冲突收集器/修复开关)→ 输出:入库行数(fetch_orders_bulk 回调)。
+    """输入:店铺 + 该店全部订单(+异常收集器/修复开关)→ 输出:入库行数(fetch_orders_bulk 回调)。
 
-    下单时间写一次(所有者定稿 2026-09-02):先比对 API 值与库值,不一致的
-    逐条记日志并收进 anomalies(进摘要首行);默认模式库值保留,
-    repair=True 才允许 API 值覆盖(显式修复已写坏的行)。
+    下单时间观测→定稿(所有者定稿 2026-09-02):入库前按库里现状把 API 值与库值
+    不一致的行分成 冲突/改判/待定,加上解析阶段的 拒写(未来日期)/存疑(晚于状态
+    时间),逐条记日志并收进 anomalies(进摘要首行);默认模式由守卫决定取舍,
+    repair=True 才允许 API 值直接覆盖(显式修复已定稿的错行)。
     """
     rows: list[dict] = []
     for order in orders:
         rows.extend(ol.extract_order_lines(store["name"], order))
-    with db.pg_conn() as conn:
-        conflicts = ol.order_date_conflicts(conn, rows)
-        if anomalies is not None:
-            anomalies.extend({"store": store["name"], **c} for c in conflicts)
-        return ol.upsert_order_lines(conn, rows, repair_order_date=repair)
+    found: list[dict] = []
+    for r in rows:
+        for mark, kind in (("_order_date_rejected", "拒写"), ("_order_date_suspect", "存疑")):
+            if r.get(mark):
+                found.append({"kind": kind, "po": r["po_id"], "sku": r["sku"],
+                              "db": None, "api": r.get("order_date")})
+    try:
+        with db.pg_conn() as conn:
+            found.extend(ol.order_date_conflicts(conn, rows))
+            n = ol.upsert_order_lines(conn, rows, repair_order_date=repair)
+    except Exception as e:
+        if type(e).__name__ == "UndefinedColumn":   # 表没跟上代码:说人话,别让人猜
+            raise RuntimeError("orders.order_lines 缺下单时间定稿列(order_date_seen 等):"
+                               "请先执行 python cli.py db_init 再跑") from e
+        raise
+    if anomalies is not None:
+        anomalies.extend({"store": store["name"], **c} for c in found)
+    return n
+
+
+def _fmt(dt) -> str:
+    return f"{dt:%m/%d %H:%M}" if dt else "-"
 
 
 def run(params: dict) -> str:
@@ -110,17 +133,18 @@ def run(params: dict) -> str:
     total_lines = sum(r["lines"] for r in results)
     # 标准③:缺席店点名进摘要**首行**(链通知只发成功步骤的首行);
     # 订单窗口全量重拉 + 幂等 upsert,缺席店下轮整点自然补上,无需水位避让
+    counts = {k: sum(1 for a in anomalies if a["kind"] == k) for k in _ANOMALY_KINDS}
+    tally = " / ".join(f"{k} {n}" for k, n in counts.items() if n)
     lines = [f"order_sync:{len(results)}/{len(store_list)} 店完成"
              f"(窗口 {days} 天),订单行入库 {total_lines}"
              + nf.absent_tail(absent, gate_note, tail="下轮整点自然重拉")
-             + (f";⚠ 下单时间冲突 {len(anomalies)} 条"
-                + ("(修复模式:已按 API 值改写)" if repair
-                   else "(库值保留,来源待查,详见日志)")
-                if anomalies else "")]
+             + (f";⚠ 下单时间:{tally}"
+                + ("(修复模式:已按 API 值改写)" if repair else "(详见日志)")
+                if tally else "")]
     if anomalies:
-        # 前几条给人看:PO/库值/API 值,一眼能对
+        # 前几条给人看:类别/PO/库值/API 值,一眼能对
         lines.append("  " + ";".join(
-            f"{a['store']} PO {a['po']}:库 {a['db']:%m/%d %H:%M} / API {a['api']:%m/%d %H:%M}"
+            f"{a['store']} PO {a['po']}[{a['kind']}]:库 {_fmt(a['db'])} / API {_fmt(a['api'])}"
             for a in anomalies[:5]) + (" …" if len(anomalies) > 5 else ""))
     if gate_note:
         lines.append(gate_note)

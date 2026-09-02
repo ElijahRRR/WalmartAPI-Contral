@@ -7,6 +7,7 @@ import time
 import zipfile
 
 import httpx
+import json
 import pytest
 
 from api import _client, reports, returns as returns_api
@@ -450,24 +451,40 @@ class _ConflictConn:
         return self.cur
 
 
-def test_order_date_is_write_once_and_repair_mode_overrides():
-    """下单时间是事实字段:库里已有值,后续拉取一律不覆盖(2026-09-02 事故:
-    一轮 order_sync 把若干行的 order_date 写成别的订单的下单时间)。
-    repair_order_date=True 是显式修复模式,才允许 API 值覆盖。"""
+def test_order_date_observe_then_confirm_guard_and_repair_mode():
+    """下单时间观测→定稿(所有者定稿 2026-09-02):upsert 的 order_date 走状态
+    守卫(定稿锁死 / 首见接受 / 连续两轮一致才改判),三列状态只在插入时写
+    (skip_update),upsert 之后另发一条不碰 updated_at 的观测记账。
+    repair_order_date=True 是显式修复模式,才允许 API 值直接覆盖。"""
     conn = _FakeConn()
-    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
-    sql, _ = conn.cur.calls[0]
-    assert "order_date = COALESCE(t.order_date, EXCLUDED.order_date)" in sql
+    rows = ol.extract_order_lines("T1", _ORDER)
+    ol.upsert_order_lines(conn, rows)
+    sql, sent = conn.cur.calls[0]
+    assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
+    assert "WHEN EXCLUDED.order_date = t.order_date_seen THEN EXCLUDED.order_date" in sql
+    assert "order_date_seen = EXCLUDED" not in sql and "order_date_confirmed = EXCLUDED" not in sql
+    assert "order_meta = EXCLUDED" not in sql          # 三列只插入不更新
+    assert sent[0]["order_date_seen"] is None and sent[0]["order_date_confirmed"] is False
+    meta = json.loads(sent[0]["order_meta"])
+    assert meta["orderDate"] == _ORDER["orderDate"]
+    assert meta["lines"][0]["sku"] == rows[0]["sku"] and "seenAt" in meta
+    assert "_envelope" not in sent[0]
+    state_sql, state_rows = conn.cur.calls[1]
+    assert state_sql.startswith("UPDATE orders.order_lines t SET order_date_confirmed")
+    assert "updated_at" not in state_sql             # 观测记账不许触发飞书重推
+    assert "t.order_date_seen = %(observed)s::timestamptz THEN true" in state_sql
+    assert state_rows == [{"id": rows[0]["order_line_id"], "observed": rows[0]["order_date"]}]
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER),
                           repair_order_date=True)
     sql, _ = conn.cur.calls[0]
-    assert "order_date = EXCLUDED.order_date" in sql
+    assert "order_date = EXCLUDED.order_date" in sql and "t.order_date_confirmed" not in sql
 
 
-def test_order_date_conflicts_are_reported_not_silenced(caplog):
-    """API 值与库值不一致必须逐条记 warning 并返回给调用方进摘要——
-    错值来源未明,这是抓证据的口子,不许静默。库空(首见)/相同不算冲突。"""
+def test_order_date_conflicts_are_classified_and_never_silent(caplog):
+    """API 值与库值不一致必须逐条记 warning(带信封摘要)并按库里状态分三类交给
+    调用方进摘要:已定稿=冲突(库值保留)/ 未定稿且等于上轮观测=改判 / 其余=待定。
+    库空(首见)/相同不算冲突。"""
     from datetime import datetime, timezone
     rows = ol.extract_order_lines("T1", _ORDER)
     lid = rows[0]["order_line_id"]
@@ -475,12 +492,34 @@ def test_order_date_conflicts_are_reported_not_silenced(caplog):
     other = datetime(2026, 9, 2, 4, 12, tzinfo=timezone.utc)
     with caplog.at_level("WARNING"):
         got = ol.order_date_conflicts(
-            _ConflictConn([(lid, "108000000001", "B0A", other)]), rows)
-    assert got == [{"po": "108000000001", "sku": "B0A", "db": other, "api": api_od}]
+            _ConflictConn([(lid, "108000000001", "B0A", other, None, True)]), rows)
+    assert got == [{"kind": "冲突", "po": "108000000001", "sku": "B0A",
+                    "db": other, "api": api_od}]
     assert "下单时间冲突" in caplog.text and "108000000001" in caplog.text
-    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", api_od)]), rows) == []
-    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", None)]), rows) == []
+    assert '"customerOrderId"' in caplog.text          # 信封摘要进日志取证
+    assert ol.order_date_conflicts(
+        _ConflictConn([(lid, "p", "s", other, api_od, False)]), rows)[0]["kind"] == "改判"
+    assert ol.order_date_conflicts(
+        _ConflictConn([(lid, "p", "s", other, None, False)]), rows)[0]["kind"] == "待定"
+    assert ol.order_date_conflicts(
+        _ConflictConn([(lid, "p", "s", other, other, False)]), rows)[0]["kind"] == "待定"
+    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", api_od, None, False)]), rows) == []
+    assert ol.order_date_conflicts(_ConflictConn([(lid, "p", "s", None, None, False)]), rows) == []
     assert ol.order_date_conflicts(_ConflictConn([]), []) == []
+
+
+def test_order_date_later_than_status_is_flagged_not_rejected(caplog):
+    """下单时间晚于本行状态时间 = 不可能的事实:标记存疑并告警,但不拒写——
+    拒写会让整单从所有按下单时间取数的口子里消失。"""
+    import copy
+    o = copy.deepcopy(_ORDER)
+    o["orderDate"] = 1754400000000                      # 晚于行 statusDate 一天以上
+    o["orderLines"]["orderLine"][0]["statusDate"] = 1754300000000
+    with caplog.at_level("WARNING"):
+        rows = ol.extract_order_lines("T1", o)
+    assert rows[0]["order_date"] is not None and rows[0].get("_order_date_suspect") is True
+    assert "存疑" in caplog.text
+    assert "_order_date_suspect" not in ol.extract_order_lines("T1", _ORDER)[0]
 
 
 def test_future_order_date_is_rejected_with_warning(caplog):

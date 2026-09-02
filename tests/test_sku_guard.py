@@ -41,7 +41,10 @@ _SCHEMA = (ROOT / "refdata" / "schema.sql").read_text(encoding="utf-8")
 #  白名单(**要改守门,先改这里,别删断言**)
 #
 #  值 = (预期收口批次, 理由)。`permanent` = 这不是待办,是有理由的永久豁免。
-#  `PR-0a-2` = 批次 0a 的第二个 PR(15 处读侧收口)合并时必须消失。
+#  批次号(如 `0b`)= 那个批次合并时这一条必须消失。
+#  ⚠ PR-0a-2(15 处读侧收口)已合:它带进来的六条临时条目全部删除,
+#  维护链 / audit_rules / alloc_survey / alloc_push / alloc_plan / alloc_products
+#  从此**出现即红**。
 # ══════════════════════════════════════════════════════════════════════════════
 
 #: ① 允许出现 `x.asin = y.sku` 硬等号的文件。
@@ -52,12 +55,6 @@ _HARD_EQUALITY_OK: dict[str, tuple[str, str]] = {
         "每行做的相关子查询,写成 coalesce 表达式就用不上 walmart_items_sku_idx,"
         "几十万行候选退化成逐行全表扫(2026-08-14 视图挂死同一类事故)。新码由"
         "第二条腿(走 listing_sources_key_idx)覆盖,两条腿 OR 起来各走各的索引"),
-    "services/maintenance_intents.py": (
-        "PR-0a-2",
-        "维护链四处身份键(_SQL_AMZ_JOIN 的 products JOIN 与 latest_snapshot "
-        "LATERAL、_SQL_VARIANT_OFFSET 的 vo JOIN、_SQL_LONG_OOS 的 obs JOIN)"
-        "由 items 0a-12~0a-15 收口,与另外十一处同一个 PR 一起改 —— 拆开会出现"
-        "「一半按登记簿、一半按裸 sku」的中间态,那是最难发现的一类"),
 }
 
 #: ② 允许直接调 `extract_asin` 的文件(收口后应改成 pick_asin / SQL 侧 coalesce)。
@@ -76,13 +73,6 @@ _EXTRACT_ASIN_OK: dict[str, tuple[str, str]] = {
     "services/blacklist.py": ("0b", "ASIN 黑名单键,收口在批次 0b"),
     "workflows/order_audit.py": ("0b", "审核取 ASIN,收口在批次 0b"),
     "workflows/order_asin_normalize.py": ("0b", "只在 docstring 里提及,随 0b 一起改"),
-    "services/audit_rules.py": (
-        "PR-0a-2", "实证 PT 的键(item 0a-19)改走 pick_asin"),
-    "services/alloc_survey.py": (
-        "PR-0a-2", "enrich / load_rows 的键(item 0a-20)改走 pick_asin"),
-    "workflows/alloc_push.py": ("PR-0a-2", "在架集合(item 0a-21)"),
-    "workflows/alloc_plan.py": ("PR-0a-2", "已在架 ASIN 集合(item 0a-22)"),
-    "workflows/alloc_products.py": ("PR-0a-2", "在架字典(item 0a-23)"),
 }
 
 #: ③ 允许出现 `abandoned_at` 的**消费方** .py。
@@ -92,9 +82,10 @@ _ABANDONED_AT_OK: dict[str, tuple[str, str]] = {
     "services/sku_codec.py": (
         "permanent", "mint 的复用查询要的就是活码;abandon 自己写这三列"),
     "workflows/list_new.py": (
-        "PR-0a-2", "本店去重闸(item 0a-24):码已弃 = 沃尔玛侧无物可撞,该放行"),
+        "permanent", "_SQL_LISTED_ASINS 本店去重闸:码已弃 = 沃尔玛侧无物可撞,"
+                     "该放行(_FAMILY_LISTED_SQL 有意不带这个谓词,见那处头注)"),
     "workflows/alloc_push.py": (
-        "PR-0a-2", "_SQL_ONLINE(item 0a-21):派工的「已在架」按活码算"),
+        "permanent", "_SQL_ONLINE:派工的「已在架」按活码算"),
 }
 
 #: ④ 允许 UPDATE 登记簿的文件(弃码三列只有一个写者)。

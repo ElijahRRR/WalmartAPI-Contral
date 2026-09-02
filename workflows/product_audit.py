@@ -406,9 +406,21 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
         # 所以调度里必须给一次能扫完的 limit,小 limit 会让每天都从头扫
         # 同一批前缀,尾巴永远轮不到而且不报错。
-        return ("p.audit_status = 'approved' AND EXISTS ("
+        # 身份两条腿 OR,**不写成 coalesce**(conventions §九对本处的例外,
+        # 理由是索引):这是对 products 每一行做的相关子查询,写成
+        # coalesce(ls.source_key, w.sku) = p.asin 就用不上 walmart_items_sku_idx,
+        # 几十万行候选退化成逐行全表扫(2026-08-14 视图挂死同一类事故)。
+        # 第一条腿逐字保留今天的语义(走 walmart_items_sku_idx),第二条腿经
+        # 登记簿(走 listing_sources_key_idx)**只覆盖新码** —— 存量 amz 行
+        # source_key = sku,是第一条腿的子集,切换后才开始起作用。
+        return ("p.audit_status = 'approved' AND (EXISTS ("
                 "SELECT 1 FROM catalog.walmart_items w "
-                "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
+                "WHERE w.sku = p.asin AND w.missing_since IS NULL) OR EXISTS ("
+                "SELECT 1 FROM catalog.listing_sources ls "
+                "JOIN catalog.walmart_items w "
+                "ON w.store = ls.store AND w.sku = ls.sku "
+                "WHERE ls.source_type = 'amz' AND ls.source_key = p.asin "
+                "AND w.missing_since IS NULL))", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}

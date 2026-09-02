@@ -45,11 +45,19 @@ logger = logging.getLogger("workflows.alloc_push")
 
 # 该店此刻在架的 (店, ASIN)。判"在架"与 alloc_survey._SQL_ONLINE 同口径:
 # 排 RETIRED —— 退市行不算活货位,它对应的占用是待重上的,该派工。
-# ⚠ ASIN 从 SKU 提,走 services/sku_asin 唯一规则(占用键就是 ASIN)。
+# ⚠ ASIN 走身份键(登记簿 amz 键优先,模式提取兜存量),唯一规则出处
+# services/sku_asin.pick_asin:裸提取在切码后会让"已在架"集合恒空 ⇒ 已在架
+# 的品被重新派工、重复上架(本工作流 DANGEROUS=True,直接写飞书上架表)。
+# `ls.abandoned_at IS NULL` 在批次 2 之前**恒真**(全库该列为 NULL,而且这是
+# LEFT JOIN,未登记行同样是 NULL),提前落地是为了让写侧切换只改一处。
 _SQL_ONLINE = """
-SELECT store, sku FROM catalog.walmart_items
-WHERE missing_since IS NULL
-  AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'
+SELECT w.store, w.sku, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.missing_since IS NULL
+  AND coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'
+  AND ls.abandoned_at IS NULL
 """
 
 
@@ -69,7 +77,8 @@ def run(params: dict) -> str:
         held = claims.load_active(conn, claims.PRODUCT)
         with conn.cursor() as cur:
             cur.execute(_SQL_ONLINE)
-            online = {(s, sku_asin.extract_asin(sku)) for s, sku in cur.fetchall()}
+            online = {(s, sku_asin.pick_asin(k, sku))
+                      for s, sku, k in cur.fetchall()}
     online = {(s, a) for s, a in online if a}
 
     rows, off, listed = [], 0, 0

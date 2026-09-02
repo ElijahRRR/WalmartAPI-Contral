@@ -280,9 +280,46 @@ def test_pt_meta_column_name_in_sql():
 
 
 def test_online_query_is_ordered_and_carries_published():
-    """固定 ORDER BY:样例截断要可复现;带 published_status:下架判定只看已发布。"""
-    assert "ORDER BY store, sku" in sv._SQL_ONLINE
+    """固定 ORDER BY:样例截断要可复现;带 published_status:下架判定只看已发布。
+
+    JOIN 登记簿之后 store / sku 两列有歧义,ORDER BY 必须限定(0a-20)。
+    """
+    assert "ORDER BY w.store, w.sku" in sv._SQL_ONLINE
     assert "published_status" in sv._SQL_ONLINE
+
+
+def test_online_query_carries_the_registry_key():
+    """身份键那一列在 SQL 里 LEFT JOIN 拿(全表级取数不许回头 unnest 反查)。
+
+    少了它,enrich 只能拿裸 SKU 去做模式提取 —— 切码后全落 no_asin,冲突判定、
+    品牌占用、类目建议整片失明,而且一个字的报错都没有。
+    """
+    assert "ls.source_key" in sv._SQL_ONLINE
+    assert "ls.source_type = 'amz'" in sv._SQL_ONLINE
+    assert "LEFT JOIN catalog.listing_sources" in sv._SQL_ONLINE
+
+
+def test_enrich_prefers_the_registry_key_over_the_pattern():
+    """5 元组带 source_key 时,身份键**以登记簿为准**;模式提取只兜存量。
+
+    防的是切码后的静默失明:不透明码经 extract_asin 必返 None,而登记簿里
+    明明记着它的来源 ASIN。
+    """
+    items = [("A085", "AZZZZ234567", "Socks", "PUBLISHED", "B0AAAA0001")]
+    rows, st = sv.enrich(items, META, {"Socks": "Fashion"})
+    assert rows[0]["asin"] == "B0AAAA0001"
+    assert rows[0]["sku"] == "AZZZZ234567"          # 输出的仍是真 SKU
+    assert st["no_asin"] == 0
+
+
+def test_enrich_still_accepts_four_tuples_without_a_registry_key():
+    """4 元组(无 source_key)必须补位成 None 并回落模式提取 —— 逐字等于收口前。
+
+    补位写法是这条锁:删了它,老调用方喂 4 元组会当场 ValueError。
+    """
+    rows, _ = sv.enrich([("A085", "A109-B0BBBB0002-02", "Hats", "PUBLISHED")],
+                        META, {})
+    assert rows[0]["asin"] == "B0BBBB0002"
 
 
 def test_pool_query_gates_on_category_lookup():

@@ -181,12 +181,21 @@ GROUP BY 1 ORDER BY 2 DESC, 1
 # 判法照抄仓内既有先例(maintenance_intents._SQL_MATCH_INV、
 # product_events 把 RETIRED 记 'gone'):**coalesce 到 ACTIVE 是 fail-open**
 # ——这一列没采到不算退市,判不准就判活。
+# ⚠ WHERE 两行**故意不加 w. 限定**:listing_sources 没有同名列,不歧义;而
+# tests/test_alloc_audit.py 与 tests/test_store_perf.py 的两条反向守门钉的是
+# 这两行的逐字文本(「退市行不算活货位」这条结论不许被顺手统一掉)。
+# 身份键那一列(ls.source_key)在 SQL 里 LEFT JOIN 拿,不在 Python 里回头
+# 反查:全表级取数拿十万对去 unnest 是另一回事(分工写在
+# services/sku_asin 的模块 docstring 里)。存量 amz 行 source_key = sku,
+# 未登记行与非 amz 行都回落裸 sku,enrich 的结果逐行不变。
 _SQL_ONLINE = """
-SELECT store, sku, product_type, published_status
-FROM catalog.walmart_items
+SELECT w.store, w.sku, w.product_type, w.published_status, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 WHERE missing_since IS NULL
   AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'
-ORDER BY store, sku
+ORDER BY w.store, w.sku
 """
 
 # 一次拿齐品牌/PT/渠道:渠道那段是 amz_source._SQL 的 LATERAL 口径
@@ -277,18 +286,21 @@ def sales_window(as_of: str = "", days: int = 365) -> dict:
 # ── 纯函数(逻辑都在这里,好测)────────────────────────────────────────────
 
 def enrich(items, meta, pt2cat):
-    """输入:在线行 [(store, sku, product_type, published_status)] +
+    """输入:在线行 [(store, sku, product_type, published_status, source_key)] +
     {asin: 元数据} + {PT: 大类} → 输出:(富化行 list, 统计 Counter)。
 
     每行补:asin(提不出为 None)、品牌占用键、大类、大类来源、渠道、是否已发布。
     大类主路取在线 PT(沃尔玛认过的),兜底取产品审核 PT——两条来源分开计数,
     因为兜底那部分可能是 LLM 推断的(pt_source),开新类目时不能当实证用。
+
+    ⚠ **补位到 5 列的写法不能删**:调用方喂 4 元组(无 source_key)时补成
+    None ⇒ pick_asin 回落模式提取 = 收口之前的行为,一个字不差。
     """
     rows, st = [], Counter()
     for it in items:
-        store, sku, pt, published = (list(it) + [None] * 4)[:4]
+        store, sku, pt, published, src_key = (list(it) + [None] * 5)[:5]
         st["online"] += 1
-        asin = sku_asin.extract_asin(sku)
+        asin = sku_asin.pick_asin(src_key, sku)
         if asin is None:
             st["no_asin"] += 1
             st[f"form_{sku_asin.classify(sku)}"] += 1
@@ -793,8 +805,9 @@ def load_rows(conn, *, win=None, need=(), with_channel: bool = True) -> Loaded:
             cur.execute(_SQL_ORDER_STORES, win)
             order_stores = cur.fetchall()
 
-        asins = sorted({a for a in (sku_asin.extract_asin(it[1])
-                                    for it in items) if a})
+        asins = sorted({a for a in (
+            sku_asin.pick_asin(it[4] if len(it) > 4 else None, it[1])
+            for it in items) if a})
         meta = _fetch_meta(cur, asins, with_channel)
 
     rows, st = enrich(items, meta, pt2cat)

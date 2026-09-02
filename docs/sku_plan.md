@@ -356,21 +356,47 @@ Inventory,仅代码注释无生产记录),可逆清零也会被升级成永久�
 
 ## 6. 身份积木
 
+> **状态:已实现(批次 0a)。** 积木与 schema 随 PR-0a-1(commit `4e27789`)落地,
+> 十五处读侧收口随 PR-0a-2 落地。下面三条索引的**名字与局部条件由批次 0a 一次
+> 建到位,批次 2/3 与横切包一律引用、不许 DROP/CREATE**(批次 3 只做 indexdef
+> 核验)。守门:`tests/test_sku_guard.py`(全套改造唯一一份)。
+
 - `catalog.listing_sources`:加 `abandoned_at timestamptz`、`abandoned_reason text`、
-  `replaced_by text`;部分唯一索引 `(store, source_type, source_key) WHERE
-  abandoned_at IS NULL`(反查 + 复用 + 并发双 mint 靠它拦);全局 `sku` 唯一只能
-  对新码生效(存量 sku=asin 跨店重复是既成事实,约束形态由批次 0a 工作包定);
-  行永不 DELETE。同步 `docs/db_schema.md`。
-- `services/sku_codec.py`(新):`mint` / `abandon` / `is_opaque` / `source_of`,
-  语义见 §5.3。与现有 `listing_sources.register`(批量 DO NOTHING)的关系:
-  register 保留给 backfill 与跟卖 B 列人工号,自动抽码只走 mint。
-- `services/sku_asin.resolve(conn, store, sku)` / `resolve_many(conn, pairs)`:
-  登记簿优先(amz → source_key;其它来源 → None),查不到再 `extract_asin`
-  (只为存量兜底)。放在 `services/sku_asin` 内,守门测试
-  `test_rules_are_not_reimplemented_here` 才不会拦。对 abandoned 行照常返回
-  source_key(订单/售后带旧码回来必须查得到)。
+  `replaced_by text`(三列只由 `services/sku_codec` 写);行永不 DELETE。
+  三条索引(**定名定条件**,DDL 全文见 `refdata/schema.sql` 与
+  `docs/sku_workplan/batch_0a.md` 的 ddl 段):
+  · `listing_sources_opaque_sku_uidx` —— 全局 `(sku)` 唯一,局部条件 =
+    不透明码形态 `AND sku ~ '[A-Z]'`。**只能对新码生效**:存量 sku=asin 跨店重复
+    是既成事实,无条件唯一在存量上一定建不起来,而 db_init 一次 execute 整份
+    schema.sql,一条失败全份回滚 ⇒ 生产建库停摆。
+  · `listing_sources_live_uidx` —— `(store, source_type, source_key)` 唯一,局部条件 =
+    `abandoned_at IS NULL AND replaced_by IS NULL AND source_key IS NOT NULL` +
+    不透明码形态。**`replaced_by IS NULL` 批次 0a 就带上**(该列全库 NULL,谓词
+    恒真),批次 3 因此一条索引都不必重建。拦并发双 mint 的就是它。
+  · `listing_sources_live_key_idx` —— 非唯一 `(store, source_type, source_key)
+    WHERE abandoned_at IS NULL AND replaced_by IS NULL`,给 mint 的复用查询用
+    (要看得见存量活行,故不限形态;条件与 mint 的 WHERE 逐字对齐)。
+  同步 `docs/db_schema.md`。
+- `services/sku_codec.py`(新,批次 0a **只建不接线**,接线在批次 2):
+  `mint` / `abandon` / `is_opaque` / `source_of`,语义见 §5.3。**它是 12 位不透明码
+  编码规则的唯一之家**(字母表 / 长度 / 随机段长 / 重抽上限 / 占位码 / is_opaque
+  判据都在这里出生);`registry` 只登记 `SKU_SOURCE_LETTERS`(所有者拍的取值,
+  已定稿 `{amz: A, match: B, 1688: C, self: H}`)。schema.sql 两条唯一索引的字符类
+  与本模块 `_ALPHABET` 由守门测试逐字对齐。与现有 `listing_sources.register`
+  (批量 DO NOTHING)的关系:register 保留给 backfill 与跟卖 B 列人工号,
+  自动抽码只走 mint —— 登记簿的 INSERT 出口只有这两个,守门钉住。
+- `services/sku_asin.pick_asin(source_key, sku)` / `resolve(conn, store, sku)` /
+  `resolve_many(conn, pairs)`:登记簿优先(amz → source_key;其它来源 → None),
+  查不到再 `extract_asin`(只为存量兜底)。**登记簿那条腿不是免检通道** ——
+  归一(strip+upper)后仍要过 `is_standard_asin`,两条腿同口径,否则运营在上架表
+  B 列填的小写 ASIN 会变成垃圾键(后果:已在架的品被 alloc_push 重新派工)。
+  放在 `services/sku_asin` 内,守门测试 `test_rules_are_not_reimplemented_here`
+  才不会拦。对 abandoned 行照常返回 source_key(订单/售后带旧码回来必须查得到)。
+  **分工**:`resolve` / `resolve_many` 是 services 内部的**有界批量反查**(几十几百对);
+  **全表级取数一律在 SQL 里 LEFT JOIN 登记簿再调 `pick_asin`**,不要拿十万对去 unnest。
 - `upc_pool`:`claim` 复用键保持 (store, asin) 不动;`mark_used` 改传真 SKU,
-  `asin` 列继续存 ASIN;新增状态值 `burned_delete` / `burned_lock`。
+  `asin` 列继续存 ASIN;新增状态值 `burned_delete` / `burned_lock`(批次 0a 只登记
+  取值与中文标签,**不改任何写入点** —— 改写入点随批次 2 接 abandon 一起做,决策 D)。
 
 ## 7. 批次(整体计划)
 
@@ -380,6 +406,40 @@ codec(mint/abandon)/resolve + 登记簿索引与 abandoned_at/replaced_by + §3.
 UPC 撞库标记改按 (store, asin))+ 两条清洗工作流接 resolve_many +
 sources_backfill 摘要分桶。存量 SKU 走的路一个字节不变(登记簿里存量行的
 source_key 就是回填的 asin,等号右边换成它结果相同)。
+
+> **批次 0a:已实现。** 工作包 `docs/sku_workplan/batch_0a.md`,两个 PR:
+> · **PR-0a-1「积木 + schema + 守门」**(items 0a-01~0a-11、0a-27、0a-28)——
+>   commit `4e27789`。交付:`services/sku_codec.py`(编码规则唯一之家,零接线)、
+>   `sku_asin.pick_asin/resolve/resolve_many`、登记簿弃码三列 + 三条定名索引、
+>   `audit_listing_conflicts` 视图身份键经登记簿、db_init 存量回填正则右锚
+>   (与 `sources_backfill._ASIN_RE` 同口径,修掉一处会在 db_init 当场制造
+>   `source_key ≠ sku` 行的双轨)、`upc_pool` 两个烧号状态值、事件码
+>   `sku_abandoned`/`sku_replaced`、`registry.SKU_SOURCE_LETTERS`、守门文件
+>   `tests/test_sku_guard.py`、`conventions §九`。
+> · **PR-0a-2「十五处读侧收口」**(items 0a-12~0a-26)—— 维护链四处
+>   (`_SQL_AMZ_JOIN` 的 products JOIN 与 latest_snapshot LATERAL、
+>   `_SQL_VARIANT_OFFSET`、`_SQL_LONG_OOS` 的 live CTE)、`product_audit`
+>   mode=online 候选(两条腿 OR,**不写 coalesce**:相关子查询要走索引)、
+>   `risk_trace._ITEMS_SQL`(UNION 两条腿)、`product_refresh._SQL_TARGETS`、
+>   `audit_rules` 实证 PT(走 Python 侧 `pick_asin`,纯 SQL coalesce 会破坏
+>   三段式 SKU 的取中段口径)、`alloc_survey` / `alloc_push` / `alloc_plan` /
+>   `alloc_products` 四处「已在架」、`list_new` 的去重闸 / 重试上限 / 变体同族。
+>   守门里 PR-0a-1 留的六条临时白名单条目**已全部删除**,这六个文件从此
+>   出现硬等号或 `extract_asin` 即红。
+>
+> **批次 0a 的两处有意保留(不是遗漏)**:
+> · `workflows/product_audit.py` mode=online 的**第一条腿**故意保留
+>   `w.sku = p.asin`(守门白名单里唯一的**永久**豁免):那是对 products 每行做的
+>   相关子查询,写成 coalesce 就用不上 `walmart_items_sku_idx`,几十万行候选退化
+>   成逐行全表扫(2026-08-14 视图挂死同一类事故)。新码由第二条腿覆盖。
+> · `services/alloc_survey._SQL_ONLINE` 的 `lifecycle` 条件**不动** —— 这是对
+>   synthesis required_changes #6 后半句(「也对齐、不再排 RETIRED」)的**显式驳回**:
+>   ① 它管的是占用与冲突口径,不是派工口径,2026-08-15「退市行不算活货位」
+>   仍成立;② 仓内两条守门钉着它(`test_alloc_audit::test_online_sql_excludes_retired_rows`、
+>   `test_store_perf`);③ 去掉它是真行为变化,不属零变化批次。
+>   `alloc_push` 的口径对齐(去掉 lifecycle 那一行)同样**不在 0a**,随批次 2 上
+>   (决策 C 第二步),`test_alloc_push::test_online_set_still_excludes_retired`
+>   反向钉着它。
 测试钉:三种存量形态经 `resolve` 与 `extract_asin` 逐字相同;不透明码经
 `extract_asin` 必返 None、经 `resolve` 能查到;`maintenance_scan -p preview=1`
 在切换前后意图集合相同。

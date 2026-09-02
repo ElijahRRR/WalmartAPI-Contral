@@ -177,6 +177,11 @@ WHERE w.store = ANY(%(stores)s::text[]) AND w.missing_since IS NULL
 #   · 只取在架行(missing_since IS NULL)
 #   · zip_verify='mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)
 #   · stockzero 店整店排除(它们归 zero_intents,不能被自动同步顶回去)
+#   · **身份键经登记簿**:products / latest_snapshot 两处都按
+#     coalesce(ls.source_key, w.sku) 接(conventions §九的唯一写法)。SKU 不再
+#     是 ASIN 之后,把 p.asin 直接跟裸 w.sku 比会**静默**匹配不上任何一行:
+#     不报错,只是维护链对新码永久失明(不改价、不清零)。存量 amz 行
+#     source_key = sku,结果逐行相同。
 _SQL_AMZ_JOIN = """
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        w.price AS wm_price, w.avail_qty, nq.avail_qty AS node_qty,
@@ -189,7 +194,8 @@ SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
-JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = w.sku
+JOIN catalog.products p
+  ON p.marketplace = 'US' AND p.asin = coalesce(ls.source_key, w.sku)
 LEFT JOIN LATERAL (
     -- 配送方式(FBA/FBM)决定用哪套定价区间。采集契约的 fast 段没把它列成
     -- 一等字段,但 raw 是"裁剪后的原样载荷",is_fba 就在里面(采集侧
@@ -199,7 +205,7 @@ LEFT JOIN LATERAL (
            -- 亚马逊在架状态原文(采集侧存 raw,契约未列为一等字段)
            raw ->> 'stock_status' AS stock_status
     FROM catalog.latest_snapshot l
-    WHERE l.marketplace = 'US' AND l.asin = w.sku
+    WHERE l.marketplace = 'US' AND l.asin = coalesce(ls.source_key, w.sku)
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
     ORDER BY l.scraped_at DESC LIMIT 1
 ) s ON true
@@ -215,6 +221,9 @@ WHERE w.missing_since IS NULL
 # · 店铺 ACTIVE 才删(无 KPI 记录 fail-open,与其他闸同口径)
 # · snapshots.outcome 在补列之前的历史行是 NULL,那些都是成功采集,按 ok 处理
 #   ——否则老 SKU 会因为"查不到 ok 快照"被误判该删
+# · 驱动表是 walmart_items(不是 vo):要让 ls 先就位,才接得上身份键
+#   coalesce(ls.source_key, w.sku)。ls 本来就是 INNER JOIN(未登记行今天已被
+#   排除),存量 amz 行 source_key = sku ⇒ 与旧写法(裸 w.sku 接 vo.asin)同集合
 _SQL_VARIANT_OFFSET = """
 WITH vo AS (
     SELECT asin,
@@ -229,10 +238,10 @@ WITH vo AS (
     FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 )
 SELECT w.store, w.sku, vo.batches, vo.first_seen, vo.last_seen
-FROM vo
-JOIN catalog.walmart_items w ON w.sku = vo.asin
+FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+JOIN vo ON vo.asin = coalesce(ls.source_key, w.sku)
 LEFT JOIN latest_status s ON s.store = w.store
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
@@ -277,7 +286,11 @@ WITH req AS (
     SELECT store, upper(btrim(want)) AS want
     FROM unnest(%(ch_stores)s::text[], %(ch_wants)s::text[]) AS t(store, want)
 ), live AS (
-    SELECT w.store, w.sku, coalesce(req.want, '') AS want
+    -- catalog.snapshots 按 ASIN 存,live 必须把身份键带出来才接得上 obs
+    -- (conventions §九);存量 amz 行 source_key = sku,窗口逐行不变。
+    -- 输出的仍是真 SKU:意图行照旧按 (store, sku) 走。
+    SELECT w.store, w.sku, coalesce(ls.source_key, w.sku) AS asin,
+           coalesce(req.want, '') AS want
     FROM catalog.walmart_items w
     JOIN catalog.listing_sources ls
       ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
@@ -319,8 +332,8 @@ WITH req AS (
                WHERE o.has_stock AND live.want <> ''
                  AND o.channel IN ('FBA', 'FBM')
                  AND o.channel <> live.want) AS wrong_ch_obs
-    FROM live JOIN obs o ON o.asin = live.sku
-    GROUP BY live.store, live.sku, live.want
+    FROM live JOIN obs o ON o.asin = live.asin
+    GROUP BY live.store, live.sku, live.asin, live.want
 )
 SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want
 FROM win

@@ -79,6 +79,72 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
+
+**立项**(所有者 2026-09-02):沃尔玛 SKU 从今天的「就是 ASIN / 三段式含 ASIN」
+改成 **12 位不透明码**(来源字母 + 11 位随机段),让沃尔玛侧的订货号不再泄露
+亚马逊货源。设计与决策 `docs/sku_plan.md`;逐批次执行工作包
+`docs/sku_workplan.md` + `docs/sku_workplan/`;身份口径规范
+`docs/conventions.md` §九。分五批合:**0a → 0b → 1 → 2 → 3**,只有批次 2
+(写侧切换)是有行为变化的那一批。
+
+**为什么先做读侧**:全仓**没有一处会抛异常** —— 「拿 SKU 当 ASIN 用」的地方
+切码后一律是"不报错、摘要看起来正常、功能悄悄没了"(维护链不改价不清零、
+去重闸失效导致同店重复上架烧配额、已在架的品被重新派工、订单判定全走人工)。
+所以读侧收口必须走在写侧切换前面,而且**整块一起合**:拆开会出现「一半按
+登记簿、一半按裸 sku」的中间态,那是最难发现的一类。
+
+**批次 0a 落地**(零行为变化,两个 PR):
+
+- **PR-0a-1「积木 + schema + 守门」**(commit `4e27789`):`services/sku_codec.py`
+  新建(mint / abandon / is_opaque / source_of;**12 位码编码规则的唯一之家**,
+  本批只建不接线,接线在批次 2)、`sku_asin.pick_asin/resolve/resolve_many`、
+  `catalog.listing_sources` 加弃码三列 + **三条一次建到位的索引**
+  (`listing_sources_opaque_sku_uidx` / `live_uidx`(含 `replaced_by IS NULL`)/
+  `live_key_idx`;名字与局部条件由 0a 定死,批次 2/3 与横切包一律引用**不许
+  重建** —— 原稿里三个包三个名字,批次 3 的 `DROP INDEX IF EXISTS` 会打空、
+  接着裸建的无条件唯一索引会让 db_init 整份回滚)、`audit_listing_conflicts`
+  视图身份键经登记簿、**db_init 存量回填正则右锚**(`^B0[A-Z0-9]{8}$` 并去掉
+  `left(sku,10)`,与生产在跑的 `sources_backfill._ASIN_RE` 同口径 —— 不修的话
+  0a 验收跑 db_init 当场就会把 `source_key ≠ sku` 的行造出来,那批行会第一次
+  进入维护链的删除意图产出面)、`upc_pool` 两个烧号状态值、事件码
+  `sku_abandoned` / `sku_replaced`、`registry.SKU_SOURCE_LETTERS`
+  (`{amz: A, match: B, 1688: C, self: H}`,所有者定稿)。
+- **PR-0a-2「十五处读侧收口」**:身份表达式统一成 **SQL 侧
+  `coalesce(ls.source_key, w.sku)`**(ls = `source_type='amz'` 的 JOIN)、
+  **Python 侧 `sku_asin.pick_asin(source_key, sku)`**,覆盖维护链四处、
+  `product_audit` mode=online 候选、`risk_trace` ①号证据源、`product_refresh`
+  采集目标、`audit_rules` 实证 PT、分配四件(`alloc_survey` / `alloc_push` /
+  `alloc_plan` / `alloc_products`)、`list_new` 的去重闸 / 重试上限 / 变体同族。
+  存量 amz 行 `source_key = sku`、未登记行回落裸 sku ⇒ 结果集逐行相同。
+
+**本批定死的四条规矩**(后续批次只准引用,不许各写一份):
+
+1. **身份表达式只有两条可复制字面量**(SQL / Python 各一条),写在 conventions §九。
+2. **`abandoned_at IS NULL` 是危险谓词**:写进 resolve / 维护链 JOIN / 事件归并 /
+   订单反查,就会让旧码带回来的订单查不到产品。只准出现在三处 —— `sku_codec.mint`
+   的复用查询、`list_new` 去重闸、`alloc_push._SQL_ONLINE`(批次 3 起加
+   `sku_migrate` 候选选取为第四处;schema.sql 的部分索引条件是 DDL,不计入)。
+3. **编码规则的唯一之家是 `services/sku_codec.py`**,registry 只登记
+   `SKU_SOURCE_LETTERS`(所有者要拍的取值才算外部配置,12 位码的字母表是内部
+   编码规则)。schema.sql 两条唯一索引的字符类与它逐字对齐,守门测试钉住。
+4. **守门只有一份 `tests/test_sku_guard.py`**(与既有 `test_feishu_guard.py`
+   同族:白名单 dict + `test_the_whitelists_do_not_rot`)。0b/1/2/3 与横切包
+   只准增删这里的白名单条目 —— 原稿四个包各建一份,同一张白名单重复三处、
+   数目三种口径、字母表断言两条互斥,守门测试自己犯了它要守的规矩。
+
+**两处有意保留(不是遗漏,各有守门反向钉着)**:
+`product_audit` mode=online 的第一条腿保留 `w.sku = p.asin`(相关子查询,
+写成 coalesce 就用不上 `walmart_items_sku_idx`,几十万行退化成全表扫);
+`alloc_survey._SQL_ONLINE` 的 lifecycle 条件**不动**(它管占用与冲突口径,
+不是派工口径,2026-08-15「退市行不算活货位」仍成立),`alloc_push` 的口径
+对齐是真行为变化,随批次 2 上(决策 C 第二步)。
+
+**合并前的两条硬闸**(需要连生产 PG):`listing_sources` 里
+`source_type='amz' AND source_key <> sku` 的行数必须为 0(非 0 = 存在被旧回填
+截断的行,收口后会扩大自动删除面);`ops.feed_items` 里同 (店, 身份键) 挂着
+多个不同 sku 的组数必须为 0(否则重试计数会归并、原本还能重试的行提前触顶)。
+
 ## 1. 阶段划分
 
 ### Phase 0 — 地基(一次性)

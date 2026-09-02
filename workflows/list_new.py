@@ -299,10 +299,28 @@ WHERE feed_type = 'MP_ITEM'
       AT TIME ZONE 'Asia/Shanghai'
 GROUP BY store
 """
-# 本店去重的数据面:(店铺, SKU) 对。只拦"同一家店重复上同一 ASIN",
-# 跨店不互拦(2026-08-28 取消全局去重,见文件头 ④)
+# 本店去重的数据面:(店铺, **身份键**) 对。只拦"同一家店重复上同一 ASIN",
+# 跨店不互拦(2026-08-28 取消全局去重,见文件头 ④)。
+# ① 第二列是**身份键**(coalesce(ls.source_key, w.sku)),不是 SKU 串:切码后
+#    拿裸 SKU 去比闸就恒不命中 ⇒ 同店同 ASIN 反复上架,烧 UPC 烧 MP_ITEM 配额,
+#    而且不报错。
+# ② 本闸**只按 amz 身份键去重**(LEFT JOIN 带 source_type='amz'):match 行的
+#    码寿命由 match_listing 自己的通道管。这是与 synthesis 规则 4 字面写法
+#    (不带 source_type)的一处**有意偏差** —— 后果是「已弃码的 match 僵尸行
+#    仍会挡新码」,对只处理 amz 行的 list_new 无实害(正向测试钉住)。
+# ③ **必须 LEFT JOIN**:未登记的在架行也要拦,否则两次回填之间新出现的行会
+#    静默漏闸。
+# ④ **不加 lifecycle 条件**(别照抄 alloc_push 的排 RETIRED):RETIRED 行只要
+#    码未弃就拦,退市档案不由 list_new 复活(2026-08-28 定稿;plan.md 的
+#    7,342 行批量复活事故)。
+# ⑤ `ls.abandoned_at IS NULL` 在批次 2 之前恒真(全库该列 NULL + LEFT JOIN),
+#    提前落地是为了让写侧切换只改一处。
 _SQL_LISTED_ASINS = """
-SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NULL
+SELECT DISTINCT w.store, coalesce(ls.source_key, w.sku)
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.missing_since IS NULL AND ls.abandoned_at IS NULL
 """
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
@@ -347,7 +365,7 @@ class _GateState(NamedTuple):
     中间插一个字段就会让后面全部错位 —— 而错位不报错(集合/字典长得都一样)。"""
     inactive: set               # ops.store_kpi_daily 里非 ACTIVE 的店名
     today_used: dict            # 店 → 今日已提交 MP_ITEM 条数(北京日界)
-    listed_pairs: set           # 在架 (店铺, SKU) 对(本店去重,2026-08-28 起)
+    listed_pairs: set           # 在架 (店铺, **身份键**) 对(本店去重,2026-08-28 起)
     banned: dict                # ASIN → (拉黑类别, 说明)
     unexplained: set            # 有"不明原因消失"史的 ASIN(只报警不拦)
     gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
@@ -367,8 +385,10 @@ def _load_gate_state() -> _GateState:
         # 全部店都进(含规划外店):去重改成**本店**语义(2026-08-28 取消全局
         # 去重)后,这个集合只回答"这家店自己有没有这个 ASIN"——自己拦自己
         # 防重复上架,与 2026-08-15「规划外店既不占用、也不拦别人」不冲突
-        # (那条定稿针对的是跨店互拦,现在跨店根本不拦了)
-        listed_pairs = {(store, sku) for store, sku in cur.fetchall()}
+        # (那条定稿针对的是跨店互拦,现在跨店根本不拦了)。
+        # 第二列是**身份键**(见 _SQL_LISTED_ASINS 头注),闸判那头拿的是
+        # r["asin"],两边同一个口径。
+        listed_pairs = {(store, key) for store, key in cur.fetchall()}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
@@ -656,16 +676,36 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
     return ok, reasons, cnt
 
 
-MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
+MAX_LIST_ATTEMPTS = 3       # 同 (店铺,身份键) 自动重上次数上限(旧 retry_state 阈值淘汰)
 
-# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对
+# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对。
+# 计数键是 (店铺, **身份键**):切码后按裸 SKU 数每次新码 count 恒 0 ⇒ FAILED
+# 无限重试(烧 UPC、烧 MP_ITEM 配额,不报错)。
+# **代际口径**(LATERAL 那段):
+#   · 无弃码事件 ⇒ g.since IS NULL ⇒ 谓词恒真 ⇒ 退化成今天的**跨码累计**;
+#   · 有弃码事件 ⇒ 只数最近一次弃码之后的提交(换了码就重新给三次)。
+# 认弃码事件读的是 abandon 自己写进 detail 的 source_key,**不是
+# product_events.asin 列**(那一列要到批次 0b 才经登记簿反查,在「0a 已合、
+# 0b 未合」的窗口里恒为 NULL ⇒ 代际过滤永不命中)。
+# 代际**上限**(同 (store, source_type, source_key) 弃码行数 ≥ 阈值即拦)属批次 2。
+# ⚠ 参数全部具名:psycopg3 不许位置占位符与具名占位符混用。
 _SQL_ATTEMPTS = """
-SELECT f.store, f.sku, count(*)
+SELECT t.store, t.asin, count(*)
 FROM ops.feed_items f
-JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
-  ON f.store = t.store AND f.sku = t.sku
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = f.store AND ls.sku = f.sku AND ls.source_type = 'amz'
+JOIN unnest(%(stores)s::text[], %(asins)s::text[]) AS t(store, asin)
+  ON f.store = t.store AND coalesce(ls.source_key, f.sku) = t.asin
+LEFT JOIN LATERAL (
+    SELECT max(occurred_at) AS since
+    FROM catalog.product_events e
+    WHERE e.store = t.store
+      AND e.event = %(abandoned)s
+      AND e.detail ->> 'source_key' = t.asin
+) g ON true
 WHERE f.feed_type = 'MP_ITEM'
-GROUP BY f.store, f.sku
+  AND (g.since IS NULL OR f.submitted_at > g.since)
+GROUP BY t.store, t.asin
 """
 
 
@@ -675,8 +715,9 @@ def _retry_rows(rows: list[dict], verdicts: dict
 
     O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
     字段问题改完 mapper 即可),旧系统靠 main 看 N=DATA_ERROR 接回重试。
-    但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
-    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
+    但不能无限重试——按 ops.feed_items 里同 (店铺,身份键) 的 MP_ITEM 提交次数
+    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物);换过码的品
+    只数最近一次弃码之后的提交(代际口径见 _SQL_ATTEMPTS 头注)。
 
     ⚠ SKU_LOCKED 不进本通道:不先 RETIRE 换 UPC 重发也会失败(旧实证),
     走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
@@ -687,8 +728,10 @@ def _retry_rows(rows: list[dict], verdicts: dict
     if not cand:
         return [], []
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_ATTEMPTS, ([r["store"] for r in cand],
-                                    [r["asin"] for r in cand]))
+        cur.execute(_SQL_ATTEMPTS,
+                    {"stores": [r["store"] for r in cand],
+                     "asins": [r["asin"] for r in cand],
+                     "abandoned": product_events.SKU_ABANDONED})
         tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
     retry, exhausted = [], []
     for r in cand:
@@ -701,12 +744,19 @@ def _retry_rows(rows: list[dict], verdicts: dict
     return retry, exhausted
 
 
+# 同族已在架成员(按**身份键**匹配,传进来的一直是同族 ASIN)。
+# ⚠ 本条**有意不加 abandoned_at 谓词**:变体同族查的是「这家店此刻还挂着哪些
+# 同族成员」这个在架事实,与码是否已弃用无关。abandoned_at 只出现在 mint 的
+# 复用查询、list_new 去重闸、alloc_push._SQL_ONLINE 三处(消费方契约,
+# conventions §九)。
 _FAMILY_LISTED_SQL = """
-SELECT sku, variant_group_id,
-       coalesce(variant_group_info->>'isPrimary', '') AS is_primary
-FROM catalog.walmart_items
-WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
-  AND missing_since IS NULL
+SELECT w.sku, w.variant_group_id,
+       coalesce(w.variant_group_info->>'isPrimary', '') AS is_primary
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.store = %(store)s AND w.missing_since IS NULL
+  AND coalesce(ls.source_key, w.sku) = ANY(%(asins)s::text[])
 """
 
 
@@ -727,8 +777,8 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
         try:
             with conn.cursor() as cur:
                 cur.execute(_FAMILY_LISTED_SQL,
-                            {"store": store, "skus": [a for a in fam
-                                                      if a != r["asin"]]})
+                            {"store": store, "asins": [a for a in fam
+                                                       if a != r["asin"]]})
                 for _sku, g, prim in cur.fetchall():
                     gid = gid or (str(g) if g else "")
                     has_primary = has_primary or str(prim).lower() in ("yes", "true")

@@ -196,10 +196,13 @@ def test_failed_rows_requeue_until_cap(monkeypatch):
 
         def execute(self, sql, args):
             # 假游标抓不到 SQL 语法错(2026-08-09 踩过:psycopg3 不支持
-            # `(a,b) IN %s`),至少钉住参数形状是两个等长数组
+            # `(a,b) IN %s`),至少钉住参数形状:两个等长数组 + 事件名。
+            # ⚠ 参数改成具名字典是硬要求:0a-25 的代际过滤要传事件名,而
+            # psycopg3 **不许位置占位符与具名占位符混用**。
             assert "IN %s" not in sql, "psycopg3 不支持元组序列 IN"
-            assert isinstance(args, tuple) and len(args) == 2
-            assert isinstance(args[0], list) and len(args[0]) == len(args[1])
+            assert isinstance(args, dict) and set(args) == {
+                "stores", "asins", "abandoned"}
+            assert len(args["stores"]) == len(args["asins"])
             self.args = args
 
         def fetchall(self):
@@ -713,6 +716,113 @@ def test_listed_pairs_cover_every_store_for_self_dedup(monkeypatch):
     assert ("谭总4", "B0TANZONG1") in pairs   # 规划外店也进:自己拦自己
     # 集合是对,不是裸 ASIN:别的店在架不构成任何拦截依据
     assert "B0MINE0001" not in pairs
+
+
+# ── 去重闸的身份口径(0a-24)────────────────────────────────────────────
+
+def test_dedup_gate_reads_the_registry_key():
+    """闸的第二列是**身份键**(coalesce(ls.source_key, w.sku)),不是 SKU 串。
+
+    这是切换后最贵的一条:失效不报错,后果是同店同 ASIN 反复上架 ——
+    烧 UPC、烧 MP_ITEM 配额,而摘要一切正常。闸判那头拿的是 r["asin"],
+    两边必须同一个口径。
+    """
+    q = ln._SQL_LISTED_ASINS
+    assert "coalesce(ls.source_key, w.sku)" in q
+    assert "ls.source_type = 'amz'" in q
+    assert "SELECT DISTINCT w.store" in q
+
+
+def test_dedup_gate_has_no_lifecycle_condition():
+    """**不加** lifecycle 条件 —— 别照抄 alloc_push 的排 RETIRED 写法。
+
+    RETIRED 行只要码未弃就得拦:退市档案不由 list_new 复活(2026-08-28 定稿;
+    plan.md 记着那次 7,342 行批量复活事故)。
+    """
+    assert "lifecycle" not in ln._SQL_LISTED_ASINS
+
+
+def test_dedup_gate_still_blocks_unregistered_rows():
+    """必须 **LEFT** JOIN 登记簿:未登记的在架行也要拦。
+
+    写成 INNER JOIN 的话,两次回填之间新出现的行会静默漏闸 —— 而漏闸的表现
+    就是重复上架。
+    """
+    q = ln._SQL_LISTED_ASINS
+    assert "LEFT JOIN catalog.listing_sources ls" in q
+
+
+def test_dedup_gate_ignores_non_amz_registry_rows():
+    """闸**只按 amz 身份键**去重(ON 条件带 source_type='amz')。
+
+    这是与 synthesis 规则 4 字面写法(不带 source_type)的一处**有意偏差**:
+    match 行的码寿命由 match_listing 自己的通道管,后果是「已弃码的 match
+    僵尸行仍会挡新码」,对只处理 amz 行的 list_new 无实害。写在这里是为了让
+    契约与实现的差有东西钉着,而不是靠谁记得。
+    """
+    q = ln._SQL_LISTED_ASINS
+    assert "ls.sku = w.sku AND ls.source_type = 'amz'" in q
+
+
+def test_dedup_gate_lets_abandoned_codes_through():
+    """`ls.abandoned_at IS NULL`:码已弃 = 沃尔玛侧无物可撞,该放行。
+
+    批次 2 之前它**恒真**(全库该列 NULL,而且是 LEFT JOIN,未登记行同样
+    是 NULL)⇒ 拦截集合逐个不变;提前落地是为了让写侧切换只改一处。
+    """
+    assert "ls.abandoned_at IS NULL" in ln._SQL_LISTED_ASINS
+
+
+# ── 重试上限的代际口径(0a-25)──────────────────────────────────────────
+
+def test_retry_cap_is_still_three():
+    """上限 3 次不变(旧 retry_state 永久淘汰名单的等价物)。"""
+    assert ln.MAX_LIST_ATTEMPTS == 3
+
+
+def test_attempts_are_counted_per_store_and_identity_key():
+    """计数键是 (店铺, **身份键**),不是 (店铺, SKU)。
+
+    按裸 SKU 数的话每次新码 count 恒 0 ⇒ FAILED 无限重试(烧 UPC、烧配额,
+    不报错)。这也是"码复用到退役"那条定稿的理由之一。
+    """
+    q = ln._SQL_ATTEMPTS
+    assert "coalesce(ls.source_key, f.sku) = t.asin" in q
+    assert "GROUP BY t.store, t.asin" in q
+    assert "SELECT t.store, t.asin, count(*)" in q
+    assert "f.feed_type = 'MP_ITEM'" in q
+
+
+def test_attempts_fall_back_to_cross_code_counting_without_an_abandon_event():
+    """没有弃码事件 ⇒ LATERAL 返 NULL ⇒ 谓词恒真 ⇒ 退化成今天的跨码累计。
+
+    这就是本批"零行为变化"在这一处的落点:全库此刻没有任何 sku_abandoned
+    事件(abandon 零接线),所以代际过滤一行都不筛。
+    """
+    assert "g.since IS NULL OR f.submitted_at > g.since" in ln._SQL_ATTEMPTS
+
+
+def test_attempts_only_count_after_the_last_abandon_event():
+    """有弃码事件 ⇒ 只数**最近一次**弃码之后的提交(换了码就重新给三次)。"""
+    q = ln._SQL_ATTEMPTS
+    assert "max(occurred_at) AS since" in q
+    assert "FROM catalog.product_events e" in q
+    assert "e.store = t.store" in q
+
+
+def test_attempts_generation_filter_reads_the_event_detail_not_the_asin_column():
+    """代际过滤读 abandon 自己写进 detail 的 source_key,**不读 asin 列**。
+
+    product_events.asin 要到批次 0b 才经登记簿反查;在「0a 已合、0b 未合」的
+    窗口里 abandon 写出的事件 asin 恒为 NULL、sku 是不透明码 —— 按 asin 认
+    弃码事件会永不命中。改读 detail 之后本批不依赖 0b 的落地时序。
+    事件名走 product_events 常量,不写字面量(registry / 常量唯一出处纪律)。
+    """
+    q = ln._SQL_ATTEMPTS
+    assert "e.detail ->> 'source_key' = t.asin" in q
+    assert "coalesce(e.asin, e.sku)" not in q
+    assert "%(abandoned)s" in q
+    assert ln.product_events.SKU_ABANDONED == "sku_abandoned"
 
 
 def test_submit_jitter_desynchronizes_the_starts(monkeypatch):

@@ -279,6 +279,49 @@ def test_amz_join_honors_routing_and_stockzero():
     assert "zip_verify" in mi._SQL_AMZ_JOIN
 
 
+def test_amz_join_reads_the_identity_key_not_the_raw_sku():
+    """三个 amz provider 共用的取数按**身份键**接 products 与 latest_snapshot。
+
+    切码之后把 ASIN 列直接跟裸 SKU 比会**静默**匹配不上任何一行 —— 不报错,
+    只是维护链对新码永久失明(不改价、不清零)。唯一写法见 conventions §九。
+    ls 已经是 INNER JOIN 且限 source_type='amz',顺序在前可直接引用;用
+    coalesce 而不是裸 ls.source_key,是因为 register 允许 source_key 缺省,
+    那些行今天靠回落裸 sku 命中。
+    """
+    q = mi._SQL_AMZ_JOIN
+    assert "p.asin = coalesce(ls.source_key, w.sku)" in q       # 0a-12
+    assert "l.asin = coalesce(ls.source_key, w.sku)" in q       # 0a-13
+    assert "p.asin = w.sku" not in q and "l.asin = w.sku" not in q
+
+
+def test_variant_offset_joins_scrape_failures_through_the_registry():
+    """变体偏移的删除面按身份键接 ops.scrape_failures(0a-14)。
+
+    驱动表换成 walmart_items 是为了让 ls 先就位;ls 本来就是 INNER JOIN
+    (未登记行今天已被排除),存量 amz 行 source_key = sku ⇒ 同一个集合。
+    """
+    q = mi._SQL_VARIANT_OFFSET
+    assert "JOIN vo ON vo.asin = coalesce(ls.source_key, w.sku)" in q
+    assert "w.sku = vo.asin" not in q
+    assert "FROM catalog.walmart_items w" in q
+
+
+def test_long_oos_live_cte_carries_the_identity_key():
+    """catalog.snapshots 按 ASIN 存,live CTE 必须把身份键带出来才接得上 obs。
+
+    带不出来 ⇒ 连续缺货删除对新码失明。输出的仍是真 SKU:意图行照旧按
+    (store, sku) 走,GROUP BY 里多带一列不改分组粒度(同一 (store,sku) 只有
+    一个身份键)。
+    """
+    q = mi._SQL_LONG_OOS
+    assert "coalesce(ls.source_key, w.sku) AS asin" in q
+    assert "JOIN obs o ON o.asin = live.asin" in q
+    assert "o.asin = live.sku" not in q
+    assert "GROUP BY live.store, live.sku, live.asin, live.want" in q
+    # 最终输出仍是 (store, sku, …):身份键只用来接快照,不外泄
+    assert "SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want" in q
+
+
 def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
     """采集永久偏移 → 删除意图。门槛 1(所有者:偏移了就不会恢复)。"""
     q = mi._SQL_VARIANT_OFFSET

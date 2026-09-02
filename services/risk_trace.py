@@ -5,7 +5,8 @@ TRO / 钓鱼订单的第一件事是**波及展开** —— 一家店中招,同�
 删干净的只剩占用台账的 released 行。所以本模块**四证据源取并集**,
 宁可多追出一家店让人去看,也不能漏掉一家还在挂货的店:
 
-  ① catalog.walmart_items    在架/曾在架的截面(唯一能判"还在架"的源)
+  ① catalog.walmart_items    在架/曾在架的截面(唯一能判"还在架"的源);
+                             身份按登记簿 amz 键与裸 sku 取**并集**
   ② catalog.listing_sources  上架时登记的出身(source_type='amz' 时 key=ASIN)
   ③ catalog.product_events   一生的病历(提交上架/下架/删除都留痕,行删了也在)
   ④ catalog.claims           占用台账,**含 released 行** —— 货和记录都清干净之后,
@@ -120,16 +121,30 @@ def asins_of_brand(conn, brand_raw) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
-# ① 在架表:命中 walmart_items_sku_idx。still_listed 的 a+b 两条件在 SQL 里
-# 逐店 bool_or —— 同一店可能既有在架的又有已缺席的,只要还有一件在架就是在架。
+# ① 在架表:两条腿取**并集**再逐店聚合 —— 裸 sku 命中 walmart_items_sku_idx,
+# 经登记簿那条命中 listing_sources_key_idx。⚠ 写成一条 OR 两个索引都用不上
+# (与 ③ 号源同一条教训);UNION 而不是 UNION ALL,是因为同一行可能两边都命中。
+# 存量下第二条腿是第一条腿的子集(amz 行 source_key = sku),并集不变。
+# still_listed 的 a+b 两条件在 SQL 里逐店 bool_or —— 同一店可能既有在架的
+# 又有已缺席的,只要还有一件在架就是在架。
 _ITEMS_SQL = """
+WITH hit AS (
+    SELECT store, sku, missing_since, lifecycle_status, created_at, last_seen_at
+    FROM catalog.walmart_items
+    WHERE sku = ANY(%(asins)s::text[])
+    UNION
+    SELECT w.store, w.sku, w.missing_since, w.lifecycle_status,
+           w.created_at, w.last_seen_at
+    FROM catalog.listing_sources ls
+    JOIN catalog.walmart_items w ON w.store = ls.store AND w.sku = ls.sku
+    WHERE ls.source_type = 'amz' AND ls.source_key = ANY(%(asins)s::text[])
+)
 SELECT store,
        bool_or(missing_since IS NULL
                AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'),
        array_agg(DISTINCT sku),
        min(created_at), max(last_seen_at)
-FROM catalog.walmart_items
-WHERE sku = ANY(%(asins)s::text[])
+FROM hit
 GROUP BY store
 """
 

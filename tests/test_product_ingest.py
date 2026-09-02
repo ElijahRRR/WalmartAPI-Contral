@@ -596,8 +596,23 @@ def test_refresh_targets_sql_gates():
     assert "missing_since IS NULL" in pr._SQL_TARGETS
     assert "published_status = 'PUBLISHED'" in pr._SQL_TARGETS
     assert "s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE'" in pr._SQL_TARGETS
-    assert "SELECT DISTINCT w.sku" in pr._SQL_TARGETS
+    assert "SELECT DISTINCT" in pr._SQL_TARGETS
+    assert "coalesce(ls.source_key, w.sku)" in pr._SQL_TARGETS
     assert pr.TIMEOUT_HOURS == 1 and pr.DANGEROUS is True
+
+
+def test_refresh_targets_come_from_the_registry_key():
+    """推采集的目标是**身份键**,不是裸 SKU(0a-18)。
+
+    切码之后裸 SKU 一个都过不了 `_ASIN_RE` 形态闸 ⇒ 推送集合**静默归零** ⇒
+    维护链新鲜度的源头断掉,而摘要只会写"本轮 0 个目标"。
+    """
+    from workflows import product_refresh as pr
+    assert "LEFT JOIN catalog.listing_sources ls" in pr._SQL_TARGETS
+    assert "ls.source_type = 'amz'" in pr._SQL_TARGETS
+    # LEFT JOIN:未登记的在架行照旧回落裸 sku(存量覆盖面)
+    assert "JOIN catalog.listing_sources ls" in pr._SQL_TARGETS
+    assert "ORDER BY 1" in pr._SQL_TARGETS      # 输出列是表达式,按序号排
 
 
 def test_refresh_filters_non_asin_skus(monkeypatch):

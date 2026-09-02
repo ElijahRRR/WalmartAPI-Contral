@@ -587,3 +587,29 @@ def test_taxonomy_version_is_registered():
     """码表/判据变更时手动递增 —— 版本串是报告上唯一能对上"哪一版判的"的东西。"""
     assert re.fullmatch(r"t\.\d{4}-\d{2}-\d{2}\.\d+",
                         resources.ERROR_TAXONOMY_VERSION)
+
+
+def test_extract_policy_keeps_the_longest_official_name_whole():
+    """官方最长政策名 89 字符:旧正则上限 80 把它截成 "…(Cover";候选两端剥标点又把
+    配对的尾 `)` 剥掉 —— 两处都让珠宝政策 join 不上(2026-09-02 真跑改名后首份报告
+    14 条,§十一)。孤 `)`(残缺标记留下的)照旧剥。"""
+    name = ("Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious "
+            "Metals (Covered Goods)")
+    assert et.extract_policy(                       # synthetic
+        f"Prohibited Products Policy: {name}. For more details, create a case."
+    ) == (name, None)
+    assert et.policy_join(name, [name]) == name
+    assert et.extract_policy("Prohibited Products Policy: Alcohol).") == \
+        ("Alcohol", None)                            # synthetic
+
+
+def test_report_alias_notes_tell_retired_from_broken():
+    """真跑改名后别名指不到表是退役信号,不是故障;官方名也不在才告警(§十一)。"""
+    from workflows import error_reclass_report as wf
+
+    official = set(resources.POLICY_LEGACY_NAMES.values()) | {"Alcohol"}
+    notes = wf._alias_notes(official)
+    assert len(notes) == 1 and "退役" in notes[0] and "⚠" not in notes[0]
+    assert wf._alias_notes(set(resources.POLICY_LEGACY_NAMES) | {"Alcohol"}) == []
+    notes = wf._alias_notes({"Alcohol"})
+    assert len(notes) == 1 and notes[0].startswith("⚠") and "静默失效" in notes[0]

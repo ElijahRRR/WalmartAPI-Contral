@@ -53,13 +53,14 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 - **不要自己合并任务。** 同一时间的两条(15:00 有两条)也分开注册 —— 合起来跑会撞锁,后到的那条直接空跑一轮还报成功。
 - **读不到文件就停下来问苏里要**,不要凭任务名自己编一段提示词。(他这一行就能把九份全导出来给你:`cat skills/walmart-schedule/tasks/*.md`,每份以 `# 沃尔玛定时任务:<任务名>` 开头,按这行切开即可。)
 
-## 第 3 步:这两条**不要注册成你的定时任务**,改用电脑的 launchd
+## 第 3 步:这 4 条**不要注册成你的定时任务**,改用电脑的 launchd
 
-`feed_poll`, `order_chain`, `product_ingest` 是高频链:
+`feed_poll`, `store_watch`, `order_chain`, `product_ingest` 是高频链:
 
 | 任务 | 频率 | 跑什么 |
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | feed_poll |
+| `store_watch` | 每小时 :45 | store_watch |
 | `order_chain` | 每小时 :20 | order_sync → order_audit → returns_sync |
 | `product_ingest` | 每小时 :50 | product_ingest |
 
@@ -81,7 +82,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 #    形如:launchctl load -w ~/Library/LaunchAgents/com.walmartapi.<任务名>.plist
 ```
 
-⚠ **① 必须给苏里看过再做 ②**:`launchd_install` 装完就是真调度,而这两条链会写沃尔玛、写数据库。
+⚠ **① 必须给苏里看过再做 ②**:`launchd_install` 装完就是真调度,而这些链会写沃尔玛、写数据库。
 ⚠ **③ 的命令照抄 ② 的输出,不要自己拼路径**(plist 名带前缀 `com.walmartapi.`,拼错的表现是 launchctl 说找不到文件)。
 
 装完**回读校验**,和第 5 步一样的道理:
@@ -90,7 +91,7 @@ touch /Users/nextderboy/Projects/WalmartAPI_data/locks/_probe && rm /Users/nextd
 launchctl list | grep com.walmartapi
 ```
 
-应当正好 3 行。然后**等到下一个整点/半点再确认它真的跑了** —— 装上了不等于跑得起来(解释器路径错、venv 被删这类问题只会出现在 launchd 自己的日志里,不会有人通知你):
+应当正好 4 行。然后**等到下一个整点/半点再确认它真的跑了** —— 装上了不等于跑得起来(解释器路径错、venv 被删这类问题只会出现在 launchd 自己的日志里,不会有人通知你):
 
 ```bash
 cd /Users/nextderboy/Projects/WalmartAPI-Contral && tail -n 30 "$(/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 -c 'from registry import paths; print(paths.logs_dir())')/launchd/"*.log

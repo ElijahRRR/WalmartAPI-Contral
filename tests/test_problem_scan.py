@@ -1,7 +1,10 @@
-"""problem_scan 回归:归类规则、优先级、反补路由、四层去重、建议行产出。
+"""problem_scan 回归:归类规则、优先级、一律删除路由、去重、建议行产出。
 
 批次 E 拆分前这些用例住在 test_problem_product_cleanup.py —— **决策逻辑搬到
 哪,钉它的测试就跟到哪**。执行侧(消费建议行 + 发 feed)的用例留在原文件。
+
+2026-08-28 所有者定稿「非 PUBLISHED 一律删除,不再改 End Date 救商品」:
+反补/Stage 豁免/反补计数的用例换成反向钉死(不许回来),路由用例改为全删。
 """
 
 import pathlib
@@ -21,34 +24,50 @@ def test_categorize_rules_and_priority():
     assert pp.categorize("Intellectual Property complaint") == ("E", "知产")
     assert pp.categorize("完全无关的文本") == ("Z", "其他")
     assert pp.categorize(None) == ("Z", "其他")
-    assert pp.is_stage_pending("in Stage status until you go live.")
-    assert not pp.is_stage_pending("end date has passed")
 
 
-def test_pick_product_id_and_relist_item():
-    assert pp.pick_product_id("123456789012", "") == ("00123456789012", "GTIN")
-    assert pp.pick_product_id("", "12345678") == ("000012345678", "UPC")
-    assert pp.pick_product_id("1234567", "1234") is None      # 都不足 8 位
-    item = pp.build_relist_item("SKU1", "123456789012", "")
-    assert item["Orderable"]["sku"] == "SKU1"
-    assert item["Orderable"]["endDate"] == pp.NEW_END_DATE
-    assert item["Orderable"]["productIdentifiers"]["productIdType"] == "GTIN"
-    assert pp.build_relist_item("S", "", "") is None
+def test_relist_machinery_is_retired_for_good():
+    """反向钉死(2026-08-28 所有者定稿):反补机制退役,不许被接回来。
+
+    「end date has passed」本身就是沃尔玛给退市商品打的标记(批量退市 =
+    Site End Date 设为过去),把它当可修复故障反补 = 对退市档案走官方复活
+    通道 —— 2026-08-28 沃尔玛把全账号档案翻回响应集那天,这条旧规则差点
+    把上万条死档案批量救活。"""
+    import inspect
+
+    from services import dispositions as ds
+    for name in ("build_relist_item", "pick_product_id", "is_stage_pending",
+                 "NEW_END_DATE", "MAX_ATTEMPTS", "ATTEMPT_RESET_DAYS"):
+        assert not hasattr(pp, name), f"problem_products.{name} 又被接回来了"
+    assert not hasattr(scan, "drop_conflicting_relists")
+    assert not hasattr(scan, "_SQL_ATTEMPTS")
+    assert "relist" not in ds.PROBLEM_ACTIONS and "relist" not in ds.ACTIONS
+    assert "relist" not in inspect.getsource(scan.plan)
 
 
-def _item(store, sku, reasons, gtin="123456789012"):
-    return {"store": store, "sku": sku, "gtin": gtin, "upc": "", "reasons": reasons}
+def test_scan_sql_covers_everything_not_published():
+    """扫描面 = 一切非 PUBLISHED(所有者定稿 2026-08-28),两个边界一起钉:
+    NULL(状态未采到)不进——删除不可逆,不拿未知赌;Stage 不再按行豁免
+    (店铺闸挡非 ACTIVE 店;ACTIVE 店里的 Stage = 翻出来的老档,照删)。"""
+    assert "published_status IS NOT NULL" in scan._SQL_ITEMS
+    assert "published_status <> 'PUBLISHED'" in scan._SQL_ITEMS
+    assert "missing_since IS NULL" in scan._SQL_ITEMS
+    assert "IN ('UNPUBLISHED'" not in scan._SQL_ITEMS   # 旧白名单口径不许回来
+    import inspect
+    assert "is_stage_pending" not in inspect.getsource(scan.plan)
+
+
+def _item(store, sku, reasons):
+    return {"store": store, "sku": sku, "reasons": reasons}
 
 
 def test_plan_routing_and_dedup():
-    """⚠ 逐字迁自拆分前的 test_problem_product_cleanup —— 断言一个字没改。
-    批次 E 的验收标准就是"重排不改行为",这条用例是那把锁。"""
+    """一律删除(2026-08-28 定稿):A 类过期、Stage、其他类别全部进删除桶;
+    在途/非 ACTIVE 店照旧跳过;顽固双击照旧。"""
     items = [
-        _item("T1", "S_A", "end date has passed"),            # → 反补
-        _item("T1", "S_A2", "end date has passed", gtin=""),  # A 无 productId → 删除
-        _item("T1", "S_AMAX", "end date has passed"),         # 反补满 2 次 → 删除
+        _item("T1", "S_A", "end date has passed"),            # 过期 → 删除
         _item("T1", "S_B", "prohibited product policy"),      # → 删除
-        _item("T1", "S_STAGE", "stage status until you go live"),   # 排除
+        _item("T1", "S_STAGE", "stage status until you go live"),  # → 删除(不再豁免)
         _item("T1", "S_FLY", "intellectual property"),        # 处置在途 → 跳过
         _item("T1", "S_NEW", "prohibited product policy"),    # 上架在途 → 跳过
         _item("T_OFF", "S_X", "prohibited product policy"),   # 非 ACTIVE 店 → 跳过
@@ -57,39 +76,39 @@ def test_plan_routing_and_dedup():
     # 2026-08-24 起在途计数拆两桶(跳过行为不变):处置在途 vs 上架/维护在途
     plans, n = scan.plan(items,
                          inflight={("T1", "S_FLY"), ("T1", "S_NEW")},
-                         attempts={("T1", "S_AMAX"): 2},
                          inactive={"T_OFF"},
                          stubborn={("T1", "S_ZOMBIE")},
                          inflight_disposal={("T1", "S_FLY")})
-    assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_A"]
-    # 顽固 SKU 停用+删除双 feed
+    # 顽固 SKU 停用+删除双 feed;其余(含过期与 Stage)全进删除桶
     assert {r["sku"] for r in plans["T1"]["delete"]} == \
-        {"S_A2", "S_AMAX", "S_B", "S_ZOMBIE"}
+        {"S_A", "S_B", "S_STAGE", "S_ZOMBIE"}
     assert [r["sku"] for r in plans["T1"]["retire"]] == ["S_ZOMBIE"]
+    assert "relist" not in plans["T1"]          # 反补桶不存在了
     assert n["stubborn"] == 1
     assert "T_OFF" not in plans
-    assert (n["stage"], n["inflight"], n["inactive"]) == (1, 1, 1)
+    assert (n["inflight"], n["inactive"]) == (1, 1)
     assert n["inflight_listing"] == 1        # S_NEW:上架 feed 在途,单列一桶
-    assert n["fallback"] == 1 and n["relist"] == 1 and n["delete"] == 3
+    assert n["delete"] == 3                  # 双击那条不计在 delete(摘要按行重算)
+    # Stage 行照常归类(J 类进病历/摘要),只是不再改变走向
+    stage_row = [r for r in plans["T1"]["delete"] if r["sku"] == "S_STAGE"][0]
+    assert stage_row["category"] == "J"
 
 
 def test_to_dispositions_splits_double_hit():
     """顽固双击 = **两条**建议行,不是一条。它们是两个 feed、两次独立的生效
     判定,合成一行会让其中一个的落定结果覆盖另一个。"""
     plans, _ = scan.plan([_item("T1", "S_Z", "prohibited product policy")],
-                         inflight=set(), attempts={}, inactive=set(),
+                         inflight=set(), inactive=set(),
                          stubborn={("T1", "S_Z")})
     rows = scan.to_dispositions(plans)
     assert sorted(r["action"] for r in rows) == ["delete", "retire"]
     assert all(r["store"] == "T1" and r["sku"] == "S_Z" for r in rows)
     assert all(r["source"] == "scan" for r in rows)
-    # gtin/upc 随建议行带走:执行件不回头查库,免得决策与执行看到的数据不一致
-    assert rows[0]["detail"]["gtin"] == "123456789012"
 
 
 def test_to_dispositions_carries_category_and_reason():
     plans, _ = scan.plan([_item("T1", "S_B", "violates Prohibited Product Policy")],
-                         inflight=set(), attempts={}, inactive=set())
+                         inflight=set(), inactive=set())
     (row,) = scan.to_dispositions(plans)
     assert (row["action"], row["category"]) == ("delete", "B")
     assert "Prohibited" in row["reason"]
@@ -102,13 +121,10 @@ def test_stubborn_sql_binds_to_listing_generation():
     assert "item_reappeared" in scan._SQL_STUBBORN
 
 
-def test_attempts_sql_counts_both_sources():
-    """⚠ 拆分后必须同时认两个 source。历史反补事件的 source 是
-    'problem_product_cleanup',漏掉它会让 30 天窗口内的历史计数归零,
-    "反补满 2 次转删"重新从 0 数起 ⇒ 商品被无限反补。"""
-    assert "source = ANY(%s)" in scan._SQL_ATTEMPTS
-    assert "problem_product_cleanup" in scan._ATTEMPT_SOURCES
-    assert "problem_scan" in scan._ATTEMPT_SOURCES
+def test_disposal_feeds_no_longer_include_maintenance():
+    """反补退役后本链不再发 MP_MAINTENANCE:在途的 MP_MAINTENANCE 都是维护链
+    的字段操作,必须按「上架/维护在途」分档报,不能算处置在途。"""
+    assert scan._DISPOSAL_FEEDS == ("DELETE_ITEM", "RETIRE_ITEM")
 
 
 def test_inflight_sql_blocks_unobserved_success():
@@ -197,12 +213,12 @@ def test_preview_writes_nothing(monkeypatch):
     """preview=1 只打印:一条建议行都不许落(与危险工作流的 dry-run 同精神)。"""
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, {}, set(), set()))
+        set(), set(), {}, set(), set(), set()))
     monkeypatch.setattr(scan.dispositions, "suggest_many",
                         lambda conn, rows: (_ for _ in ()).throw(
                             AssertionError("preview 不许写建议行")))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only: [])
+                        lambda conn, inflight, inactive, only, wfs=None: [])
 
     import contextlib
     from registry import db as _db
@@ -226,9 +242,9 @@ def test_absence_probe_failure_does_not_stop_the_scan(monkeypatch):
     """
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, {}, set(), set()))
+        set(), set(), {}, set(), set(), set()))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only: [])
+                        lambda conn, inflight, inactive, only, wfs=None: [])
 
     import contextlib
     from registry import db as _db
@@ -289,29 +305,16 @@ def test_conflicts_view_join_matches_its_index():
     assert "WHERE" not in tail.split("LEFT JOIN LATERAL")[0]
 
 
-def test_audit_reject_beats_relist():
-    """⚠ 生产 dry-run 实遇(2026-08-14):同一个 SKU 同时被 scan 建议"反补"
-    (A 类过期救活)与 audit 建议"删除"(审核判拒)。两条 action 不同 ⇒ 部分
-    唯一索引不冲突 ⇒ 都落 ⇒ 执行件按 _ACTION_ORDER **先花配额救活、再花配额
-    删掉**,两个 feed 都提交且结果不确定。审核判拒必须压过一切救活动作。"""
-    scan_rows = [
-        {"store": "T1", "sku": "S_X", "action": "relist", "source": "scan"},
-        {"store": "T1", "sku": "S_X", "action": "delete", "source": "scan"},
-        {"store": "T1", "sku": "S_OK", "action": "relist", "source": "scan"},
-    ]
-    audit_rows = [{"store": "T1", "sku": "S_X", "action": "delete",
-                   "source": "audit"}]
-    kept, n = scan.drop_conflicting_relists(scan_rows, audit_rows)
-    assert n == 1
-    # 砍掉的只有那条**反补**;删除建议保留(该删还是要删)
-    assert [(r["sku"], r["action"]) for r in kept] == [
-        ("S_X", "delete"), ("S_OK", "relist")]
-
-
-def test_no_audit_rows_changes_nothing():
-    rows = [{"store": "T1", "sku": "S1", "action": "relist", "source": "scan"}]
-    kept, n = scan.drop_conflicting_relists(rows, [])
-    assert kept == rows and n == 0
+def test_scan_and_audit_can_only_agree_on_delete():
+    """反补退役后「救活 vs 删除」的矛盾在源头就不存在了:scan 与 audit 对
+    同一 SKU 只可能都建议删除,由部分唯一索引合并(2026-08-14 那类矛盾剔除
+    段随之删除)。这里钉的是 scan 侧产出的动作面。"""
+    plans, _ = scan.plan([_item("T1", "S_A", "end date has passed"),
+                          _item("T1", "S_Z", "prohibited product policy")],
+                         inflight=set(), inactive=set(),
+                         stubborn={("T1", "S_Z")})
+    actions = {r["action"] for r in scan.to_dispositions(plans)}
+    assert actions <= {"delete", "retire"}
 
 
 def test_withdraw_only_touches_own_source_and_suggested():
@@ -442,10 +445,8 @@ def test_every_sql_param_is_cast():
 def test_summarize_counts_the_rows_that_actually_land():
     """⚠ 摘要必须报**真正会落库**的数(2026-08-14 生产实遇)。
 
-    两个坑各钉一条:
-      ① 剔矛盾之后才生成 —— 首版报 plan() 的原始数(反补 10)而实际落 8;
-      ② 按建议行统计,不按 plan() 的桶 —— n['delete'] 不含顽固双击那批
-         (那支 continue 前没有 n['delete'] += 1),照它报会少一大截。
+    钉一条老坑:按建议行统计,不按 plan() 的桶 —— n['delete'] 不含顽固双击
+    那批(那支 continue 前没有 n['delete'] += 1),照它报会少一大截。
     """
     allrows = [
         {"store": "T1", "sku": "S1", "action": "delete", "category": "B",
@@ -454,16 +455,14 @@ def test_summarize_counts_the_rows_that_actually_land():
          "source": "audit"},
         {"store": "T1", "sku": "S3", "action": "retire", "category": "B",
          "source": "scan"},
-        {"store": "T2", "sku": "S4", "action": "relist", "category": "A",
-         "source": "scan"},
     ]
     audit_rows = [allrows[1]]
-    n = {"fallback": 0, "stage": 1, "inflight": 2, "inflight_listing": 0,
-         "inactive": 3, "delete": 1}
+    n = {"inflight": 2, "inflight_listing": 0, "inactive": 3, "delete": 1,
+         "wfs": 0}
     head = _summ(allrows, audit_rows, n, 99)
-    # 删除报 2(含 retire 之外的全部 delete 行),不是 n['delete'] 的 1
-    assert "删除 2" in head[0] and "反补 1" in head[0]
-    assert "问题商品 99 行" in head[0]
+    # 删除报 2(retire 之外的全部 delete 行),不是 n['delete'] 的 1
+    assert "删除 2" in head[0]
+    assert "非 PUBLISHED 商品 99 行" in head[0]
     assert "顽固停用 1" in head[0]
     assert "其中审核判拒 1" in head[0]
     # 分店明细按建议行重建,audit 来源没有 category → 显示 '-'
@@ -514,6 +513,7 @@ def test_summarize_dedupes_like_the_unique_index():
          "category": "B", "source": "scan"},
     ]
     n = {"fallback": 0, "stage": 0, "inflight": 0, "inflight_listing": 0,
+         "wfs": 0,
          "inactive": 0}
     head = scan._summarize(allrows, [allrows[1]], n, 3)
     assert "删除 2" in head[0]          # 不是 3
@@ -523,21 +523,20 @@ def test_summarize_dedupes_like_the_unique_index():
     assert "-:1" in t1 and "B:1" in t1  # 后写的赢 ⇒ SDUP 的 category 是 None
 
 
-# ── L 类反补 + K 聚集 + 政策名缺口(2026-08-24 审核反哺批)─────────────────────
+# ── L 类 + K 聚集 + 政策名缺口(2026-08-24 审核反哺批;L 类 2026-08-28 改删)──
 
-def test_l_system_error_goes_through_relist_channel():
-    """L 类(internal error)沃尔玛原话是 Resubmit,先反补一次;满 2 次转删。
-    复用 A 类全部机械:计数/30 天窗/无 productId 转删。"""
+def test_l_system_error_now_deletes_like_everything_else():
+    """L 类(internal error)2026-08-24 曾走反补(沃尔玛原话 Resubmit);
+    2026-08-28 所有者定稿推翻:非 PUBLISHED 一律删除,L 类不再例外。
+    归类仍是 L(病历/摘要照记),只是走向统一成删除。"""
     items = [
         _item("T1", "S_L1", "an internal error occurred while publishing"),
-        _item("T1", "S_LMAX", "an internal error occurred while publishing"),
-        _item("T1", "S_LNOID", "an internal error occurred", gtin=""),
+        _item("T1", "S_L2", "an internal error occurred"),
     ]
-    plans, n = scan.plan(items, inflight=set(),
-                         attempts={("T1", "S_LMAX"): 2}, inactive=set())
-    assert [r["sku"] for r in plans["T1"]["relist"]] == ["S_L1"]
-    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_LMAX", "S_LNOID"}
-    assert n["fallback"] == 1
+    plans, n = scan.plan(items, inflight=set(), inactive=set())
+    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_L1", "S_L2"}
+    assert all(r["category"] == "L" for r in plans["T1"]["delete"])
+    assert n["delete"] == 2
 
 
 def test_k_cluster_note_fires_on_concentration():
@@ -582,3 +581,53 @@ def test_policy_gap_note_reports_unknown_policy_names():
     class _ConnAll(_Conn2):
         def cursor(self): return _CurAll()
     assert scan._policy_gap_note(_ConnAll(), items) == ""
+
+
+# ── WFS 删不掉的闸(多仓批次 0)──────────────────────────────────────────────
+
+def test_wfs_blocked_skus_are_skipped_not_re_deleted_every_round():
+    """WFS 件删不掉 → 跳过并计数,**不再每天空发一次注定被拒的 DELETE_ITEM**。
+
+    生产实证 11 条(L001/A152/A154/A170)连着几轮同一个 ERR_EXT_DATA_0101218。
+    ⚠ 只拦破坏动作:反补走 MP_MAINTENANCE,对 WFS 件照常可用。
+    """
+    items = [_item("T1", "S_DEL", "prohibited product policy"),   # → 删除
+             _item("T1", "S_OK", "prohibited product policy")]
+    plans, n = scan.plan(items, set(), {}, set(),
+                         wfs_blocked={("T1", "S_DEL")})
+    assert n["wfs"] == 1
+    assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_OK"]
+
+
+def test_wfs_gate_blocks_the_delete_and_counts_it():
+    """WFS 件在「一律删除」口径下(2026-08-28 反补退役)一条都发不出去:
+    跳过并报数,把"要不要转出 WFS"交回给人 —— 不跳的话每天空发一次注定
+    被拒的 DELETE_ITEM(生产实见 11 条连烧多轮)。"""
+    it = _item("T1", "S_EXP", "end date has passed")
+    plans, n = scan.plan([it], set(), set(), wfs_blocked={("T1", "S_EXP")})
+    assert n["wfs"] == 1 and n["delete"] == 0
+    assert plans.get("T1", {"delete": []})["delete"] == []
+
+
+def test_wfs_gate_also_blocks_stubborn_double_feed():
+    """顽固件的 retire+delete 双发同样拦:delete 注定被拒,而 retire 对 WFS
+    件行不行官方没有明文 —— 按本仓纪律不按推断编码,整条跳过并报数。"""
+    items = [_item("T1", "S_Z", "prohibited product policy")]
+    plans, n = scan.plan(items, set(), set(), stubborn={("T1", "S_Z")},
+                         wfs_blocked={("T1", "S_Z")})
+    assert n["wfs"] == 1 and n["stubborn"] == 0
+    assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
+
+
+def test_wfs_blocked_sql_reads_only_the_latest_attempt():
+    """口径是**最近一次**删除回执,不是"历史上出现过就永久拉黑"。
+
+    商品转出 WFS 之后就该能删了 —— 下一次尝试的回执会把它放出来。
+    写成 EXISTS(任意一轮命中过)的话,转出 WFS 的件永远删不了,而且没人
+    看得出来是被自己的闸拦着。
+    """
+    q = scan._SQL_WFS_BLOCKED
+    assert "DISTINCT ON (store, sku)" in q
+    assert "ORDER BY store, sku, submitted_at DESC" in q
+    assert "feed_type = 'DELETE_ITEM'" in q
+    assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"

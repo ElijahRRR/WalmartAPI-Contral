@@ -47,13 +47,16 @@ class _Conn:
 
 
 def test_action_rank_is_the_single_source_and_matches_the_owner_sequence():
-    """删除 > 停用 > 反补 > 库存 > 标题 > 价格(所有者定稿 2026-08-24)。
+    """删除 > 停用 > 库存 > 标题 > 价格(2026-08-24 定序;2026-08-28 反补退役)。
 
     这条序此前只活在 maintenance_intents._ACTION_RANK 的**一轮内存**里
     (删除 > 库存 > 标题,三个动作),看不见另一条链挂在库里的建议 —— 跨链
-    重复删两次就是这么来的。提升作用域之后它必须覆盖全部六个动作。
+    重复删两次就是这么来的。提升作用域之后它必须覆盖全部在役动作。
+    relist 2026-08-28 所有者定稿退役(非 PUBLISHED 一律删,不再救),
+    **不许回到任何领取集**:存量行只走 withdraw/settle 收尾。
     """
-    assert ds.ACTION_ORDER == ("delete", "retire", "relist",
+    assert "relist" not in ds.ACTIONS and "relist" not in ds.PROBLEM_ACTIONS
+    assert ds.ACTION_ORDER == ("delete", "retire",
                                "inventory", "title", "price")
     assert set(ds.ACTION_RANK) == set(ds.ACTIONS)     # 一个都不能漏
     assert len(set(ds.ACTION_RANK.values())) == len(ds.ACTIONS)   # 不许并列

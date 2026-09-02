@@ -14,12 +14,12 @@ _UPSERT_SQL = """
 INSERT INTO catalog.walmart_items
     (store, sku, wpid, upc, gtin, product_name, shelf, product_type,
      variant_group_id, variant_group_info,
-     price, currency, avail_qty, published_status, lifecycle_status,
+     price, currency, avail_qty, node_count, published_status, lifecycle_status,
      unpublished_reasons, last_seen_at, missing_since, updated_at)
 VALUES (%(store)s, %(sku)s, %(wpid)s, %(upc)s, %(gtin)s, %(product_name)s,
         %(shelf)s, %(product_type)s,
         %(variant_group_id)s, %(variant_group_info)s::jsonb,
-        %(price)s, %(currency)s, %(avail_qty)s,
+        %(price)s, %(currency)s, %(avail_qty)s, %(node_count)s,
         %(published_status)s, %(lifecycle_status)s, %(unpublished_reasons)s,
         %(seen_at)s, NULL, now())
 ON CONFLICT (store, sku) DO UPDATE SET
@@ -32,6 +32,7 @@ ON CONFLICT (store, sku) DO UPDATE SET
     currency = EXCLUDED.currency,
     -- 本轮没拿到库存(接口失败/skip_inventory/该 SKU 缺席响应)时保留上一轮值,不刷成 NULL
     avail_qty = COALESCE(EXCLUDED.avail_qty, catalog.walmart_items.avail_qty),
+    node_count = COALESCE(EXCLUDED.node_count, catalog.walmart_items.node_count),
     published_status = EXCLUDED.published_status,
     lifecycle_status = EXCLUDED.lifecycle_status,
     unpublished_reasons = EXCLUDED.unpublished_reasons,
@@ -54,15 +55,52 @@ RETURNING sku
 
 
 def merge_rows(store_name: str, item_summaries: list[dict],
-               inventory: dict[str, int], seen_at) -> list[dict]:
-    """输入:店铺名 + summarize_item 列表 + {sku:数量} + 本轮时间 → 输出:待 upsert 行列表。"""
+               inventory: dict[str, dict[str, int]], seen_at) -> list[dict]:
+    """输入:店铺名 + summarize_item 列表 + {sku:{节点:数量}} + 本轮时间
+    → 输出:待 upsert 行列表。
+
+    ⚠ 入参从 `{sku: 合计}` 改成 `{sku: {节点: 数量}}`(2026-08-24,多仓批次 0):
+    合计与节点数都从这一份算,**不能让调用方各算各的** —— 那正是"一条判据散在
+    多处"的老病(改了其中一处,另外几处不报错、只是悄悄按旧规矩办事)。
+    读不到库存的 SKU 在字典里根本不出现,两列都落 None 走 COALESCE 保旧值。
+    """
     rows = []
     for s in item_summaries:
         if not s.get("sku"):
             continue
-        rows.append({**s, "store": store_name,
-                     "avail_qty": inventory.get(s["sku"]), "seen_at": seen_at})
+        nodes = inventory.get(s["sku"])
+        rows.append({**s, "store": store_name, "seen_at": seen_at,
+                     "avail_qty": sum(nodes.values()) if nodes else None,
+                     "node_count": len(nodes) if nodes else None})
     return rows
+
+
+_NODE_UPSERT_SQL = """
+INSERT INTO catalog.item_node_inventory (store, sku, ship_node, avail_qty, seen_at)
+VALUES (%(store)s, %(sku)s, %(ship_node)s, %(avail_qty)s, %(seen_at)s)
+ON CONFLICT (store, sku, ship_node) DO UPDATE SET
+    avail_qty = EXCLUDED.avail_qty, seen_at = EXCLUDED.seen_at
+"""
+
+
+def upsert_node_inventory(conn, store_name: str,
+                          inventory: dict[str, dict[str, int]], seen_at) -> int:
+    """输入:连接 + 店铺 + {sku:{节点:数量}} + 本轮时间 → 输出:写入行数。
+
+    `walmart_items.avail_qty`(合计)的明细面,给维护链的"受管仓现值"用。
+    ⚠ **本轮没扫到的行不删**(见 refdata/schema.sql 的表头注释):沃尔玛分页
+    漏 SKU 是常态,删了下轮又建,中间那轮维护链会读成"该节点没货"而重推库存。
+    过期与否由 `seen_at` 说了算,不由"在不在表里"说了算。
+    """
+    payload = [{"store": store_name, "sku": sku, "ship_node": node,
+                "avail_qty": qty, "seen_at": seen_at}
+               for sku, nodes in inventory.items()
+               for node, qty in nodes.items()]
+    if not payload:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(_NODE_UPSERT_SQL, payload)
+    return len(payload)
 
 
 def upsert_items(conn, rows: list[dict]) -> int:

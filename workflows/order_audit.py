@@ -39,6 +39,14 @@ product_refresh 那条链(维护/上架用的快照)还是靠它摄。
   唯一一列,但两边取的都是 order_lines.audit_status 同一个值,不会打架。
 - **钓鱼行不可覆盖**(旧系统语义):结论含「钓鱼」二字的行,后续轮次一律跳过,
   复审须人工清空审核状态。
+- **钓鱼入账**(2026-08-30):判成钓鱼的行记进 ops.store_events —— 收单店一条
+  `phishing_order`(high),再按商品品牌调 services/risk_trace 展开"同品牌的货
+  还在/曾在哪几家店"逐店记 `phishing_brand_exposure`(mid);黑产盯的是品牌
+  不是店,一家中招往往意味着另外几家也挂着同样的货。钩子在 results **终版**
+  之后、推送之前(放判定函数里会让 `-p wait=1` 那条路记两遍),去重键含
+  order_line_id,每轮**另扫一遍窗口补记**账本里漏掉的行(_save 自己 commit,
+  事件在它之后,中间崩一次就静默丢失)。摘要首行带 `🚨 钓鱼命中 N` 短标记
+  ——首行是链通知折叠的唯一出口。
 - 配置(黑名单邮编 / 采购方表)每次运行现读飞书,读不到直接失败——
   拿旧配置继续算钱比不出结论危险得多。
 
@@ -129,8 +137,12 @@ import httpx
 
 from api import feishu, scraper
 from registry import db, resources
-from services import (kpi, order_audit as rules, product_ingest as ingest,
-                      scrape_batches as batches)
+from services import (brand_key, kpi, order_audit as rules,
+                      product_ingest as ingest, risk_trace,
+                      scrape_batches as batches, sku_asin, store_events,
+                      stores as stores_svc)
+# ⚠ `stores as stores_svc` 是同一个坑的预防:run() 里的局部 `stores` 是店铺
+# 过滤参数,同名导入迟早被谁在 run() 内引用一次然后当场 AttributeError。
 # ⚠ 按名字导入:run() 的形参就叫 params,`from services import params` 会被它
 # 遮住,`params.flag(...)` 当场 AttributeError(services/params.py 头注)
 from services.params import flag
@@ -163,10 +175,14 @@ _SHOT_GRACE_SEC = 180          # 数据采完后额外等截图的上限(所有�
                                # 好,当闸会永久卡住),只是"顺手多等一会儿能这轮
                                # 就贴上"。到点照常出结论,图下轮补
 
-# 待审:窗口内、未取消、还没结论的行。sku 即 ASIN(catalog 侧同一约定)。
+# 待审:窗口内、未取消、还没结论的行。sku 即订货号(catalog 侧 ASIN 另有一列)。
+# ⚠ asin/order_date/po_id 三列**判定链本身不用**(judge/_save 全按列名取值,
+# 多给无碍),是钓鱼订单入账要的:asin 免得每条都从 SKU 现解、po_id 与下单
+# 时间是事件 detail 的溯源锚(单号后 8 位进摘要,人一眼能在飞书里对上)。
 _PICK_SQL = """
-SELECT order_line_id, store, sku, product_name, qty, product_amount,
-       shipping_amount, postal_code, sale_status, audit_status, audit_detail
+SELECT order_line_id, store, sku, asin, po_id, order_date, product_name, qty,
+       product_amount, shipping_amount, postal_code, sale_status, audit_status,
+       audit_detail
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %(days)s)
   AND coalesce(sale_status, '') <> 'Cancelled'
@@ -176,8 +192,9 @@ ORDER BY order_date DESC
 """
 
 _ONE_SQL = """
-SELECT order_line_id, store, sku, product_name, qty, product_amount,
-       shipping_amount, postal_code, sale_status, audit_status, audit_detail
+SELECT order_line_id, store, sku, asin, po_id, order_date, product_name, qty,
+       product_amount, shipping_amount, postal_code, sale_status, audit_status,
+       audit_detail
 FROM orders.order_lines WHERE order_line_id = %(line)s
 """
 
@@ -475,20 +492,21 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
 
 
 def _judge_save_tally(conn, lines: list[dict], blacklist, suppliers):
-    """输入:连接 + 待审行 + 配置 → 输出:(待采 [(asin, 邮编)], 落库行数, 结论计数)。
+    """输入:连接 + 待审行 + 配置 → 输出:(判定结果, 待采 [(asin, 邮编)], 落库行数, 结论计数)。
 
     「判定 → 落库 → 计数」这五行在 run() 里出现两次(wait=1 重判那一遍原样
     再走一次),收成一处免得两边飘。
     ⚠ 第二遍**必须判同一批 lines** —— 别在这里顺手改成重新取行:第一遍它们
     多半是"待采集/待人工",重取会换掉待判集合,重判就不是同一批了。
-    `results` 只喂 `_save` 与计数,两个调用点都不再用它,故不往外返。
+    `results` 往外返(2026-08-30):钓鱼入账要拿**终版**结论,而"终版"就是
+    最后一次调用它的产出 —— 在这里面记事件会让 wait=1 那条路记两遍。
     """
     results, want = _judge_all(conn, lines, blacklist, suppliers)
     saved = _save(conn, results)
     tally: dict[str, int] = {}
     for _, res in results:
         tally[res.status] = tally.get(res.status, 0) + 1
-    return want, saved, tally
+    return results, want, saved, tally
 
 
 def _reap_batches(conn) -> tuple[int, int, list[str]]:
@@ -1108,6 +1126,195 @@ def _payload(conn, rows: list[dict]) -> tuple[dict[str, dict], dict]:
     return out, tally
 
 
+# ── 钓鱼订单入账(2026-08-30)────────────────────────────────────────────────
+#
+# 判定链本来就在认钓鱼单(黑名单邮编,命中即终局),而"钓鱼"是店铺一生里最该
+# 留痕的事之一:同一批黑产盯的是**品牌**不是店,一家店收到钓鱼单,同品牌的货
+# 往往还挂在另外几家店上。这一段把结论记进店铺事件账本并展开波及:
+#   phishing_order            收单店一条(high),身份键 detail.order_line_id
+#   phishing_brand_exposure   同品牌还在/曾在哪几家店(mid),一单扇 N 店 N 行
+#
+# 三条降级(**都只记收单店那条,不展开**)—— 拿不准品牌就展开,等于随机标店:
+#   asin_missing      订单行没 ASIN 列、SKU 也解不出标准码
+#   brand_missing     产品中心没有这个 ASIN(还没采回来)
+#   brand_placeholder brand/manufacturer 都是占位符(Generic/OEM/无品牌);
+#                     按 "OEM" 展开 = 一次成千上万个不相干产品的大面积误标
+_PHISH_ASIN_CAP = 10     # 波及 detail 里最多带几个 ASIN
+_PHISH_SHOW = 5          # 摘要里点名几条(其余用 … 收尾)
+_PHISH_MARK_LIKE = f"%{rules.PHISHING_MARK}%"
+
+_PROD_BRAND_SQL = """
+SELECT asin, brand, slow->>'manufacturer'
+FROM catalog.products
+WHERE marketplace = 'US' AND asin = ANY(%(asins)s::text[])
+"""
+
+# 补记自愈:窗口内**已标钓鱼、但账本里没有对应 phishing_order 行**的订单行。
+# 为什么要它:_save 是自己 commit 的,事件写在它之后 —— 中间崩一次,那条钓鱼
+# 结论就永远留在订单表里而账本一无所知(静默丢失,没有任何报错)。每轮重扫一遍
+# 窗口,漏掉的下一轮自己补上;去重复用同一条 NOT EXISTS,天然幂等。
+# ⚠ 判据与 `_marked_phishing` 同款(audit_status 或 detail.note 含「钓鱼」):
+# 历史导入的钓鱼行没有 rules.phishing 结构,只认 note 才捞得回来。
+_SELFHEAL_SQL = """
+SELECT order_line_id, store, sku, asin, po_id, order_date, postal_code,
+       audit_detail
+FROM orders.order_lines o
+WHERE {scope}
+  AND (coalesce(audit_status, '') LIKE %(mark)s::text
+       OR coalesce(audit_detail->>'note', '') LIKE %(mark)s::text)
+  AND NOT EXISTS (
+      SELECT 1 FROM ops.store_events e
+      WHERE e.event = %(event)s::text
+        AND e.detail->>'order_line_id' = o.order_line_id)
+ORDER BY order_date DESC
+"""
+
+
+def _phish_zip(detail: dict, postal_code) -> str:
+    """输入:审核 detail + 收件邮编 → 输出:钓鱼邮编。
+
+    优先取 judge 已经算好的那个(`rules.phishing.zip`),**不重算** —— 重算就是
+    第二套归一,哪天 norm_zip 改了口径,账本里的邮编与结论里的会各说各的。
+    历史导入的行没有 rules 结构,才回落到收件邮编现算。
+    """
+    z = ((detail.get("rules") or {}).get("phishing") or {}).get("zip")
+    return str(z or "") or rules.norm_zip(postal_code)
+
+
+def _phish_cands(results: list) -> list[dict]:
+    """输入:[(行, 结论)] → 输出:本轮判成钓鱼的候选(统一形状)。"""
+    return [{"order_line_id": line["order_line_id"], "store": line.get("store"),
+             "sku": line.get("sku"), "asin": line.get("asin"),
+             "po_id": line.get("po_id"), "order_date": line.get("order_date"),
+             "zip": _phish_zip(res.detail, line.get("postal_code"))}
+            for line, res in results if res.is_phishing]
+
+
+def _phish_selfheal_cands(conn, days: int, stores_filter: list,
+                          line_id: str = "") -> list[dict]:
+    """输入:连接 + 窗口 + 店铺过滤(+单行)→ 输出:已标钓鱼但账本里没有的行。
+
+    扫描面**与本轮判定的面一致**:`-p line=` 时只看那一行(单行模式的语义就是
+    "忽略窗口"),否则看整个窗口。单行模式尤其需要它 —— 已标钓鱼的行会被
+    `_marked_phishing` 从待判集合里滤掉,判定那一路根本产不出候选,补记是那
+    一行唯一的入账通道。
+    """
+    scope = ("order_line_id = %(line)s::text" if line_id else
+             "order_date >= now() - make_interval(days => %(days)s::int)"
+             + (" AND store = ANY(%(stores)s::text[])" if stores_filter else ""))
+    with conn.cursor() as cur:
+        cur.execute(_SELFHEAL_SQL.format(scope=scope),
+                    {"days": days, "stores": stores_filter, "line": line_id,
+                     "mark": _PHISH_MARK_LIKE,
+                     "event": store_events.PHISHING_ORDER})
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return [{"order_line_id": r["order_line_id"], "store": r.get("store"),
+             "sku": r.get("sku"), "asin": r.get("asin"),
+             "po_id": r.get("po_id"), "order_date": r.get("order_date"),
+             "zip": _phish_zip(_detail(r), r.get("postal_code"))}
+            for r in rows]
+
+
+def _phish_brands(conn, asins: list) -> dict:
+    """输入:连接 + ASIN 列表 → 输出:{asin: (brand, manufacturer)}。"""
+    if not asins:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(_PROD_BRAND_SQL, {"asins": sorted(set(asins))})
+        return {a: (b, m) for a, b, m in cur.fetchall()}
+
+
+def _phish_record(conn, cands: list[dict], source: str) -> tuple[list[dict], int]:
+    """输入:连接 + 候选行 + 来源标 → 输出:(真落库的收单店事件行, 波及行数)。
+
+    在册店集合要敲飞书,所以**只在真要展开时取一次**;取不到按 registered=None
+    展开并逐行标 registered_unchecked(risk_trace 只算 a+b 两条件,还差"店在不
+    在册"那一条,看的人得知道自己拿到的不是终判)。
+    """
+    if not cands:
+        return [], 0
+    asin_of = {c["order_line_id"]:
+               (str(c.get("asin") or "").strip().upper()
+                or sku_asin.extract_asin(c.get("sku") or "") or "")
+               for c in cands}
+    brands = _phish_brands(conn, [a for a in asin_of.values() if a])
+    reg: dict = {}
+    order_rows: list[dict] = []
+    expo_rows: list[dict] = []
+    for c in cands:
+        asin = asin_of[c["order_line_id"]]
+        detail = {"order_line_id": c["order_line_id"], "po_id": c.get("po_id"),
+                  "sku": c.get("sku"), "asin": asin or None, "zip": c["zip"],
+                  "order_date": c.get("order_date")}
+        brand = manu = None
+        if not asin:
+            detail["asin_missing"] = True
+        elif asin not in brands:
+            detail["brand_missing"] = True      # 产品中心还没这行,等采回来
+        else:
+            brand, manu = brands[asin]
+            if brand_key.brand_key(brand, manu) is None:
+                detail["brand_placeholder"] = True
+            else:
+                # 记**产出品牌键的那个字段原文**(brand 是占位符时键来自
+                # manufacturer);记成 "Generic" 就等于把展开依据记错了
+                detail["brand"] = (manu if brand_key.is_placeholder(brand)
+                                   else brand)
+        order_rows.append({"store": c.get("store"),
+                           "event": store_events.PHISHING_ORDER,
+                           "severity": "high", "source": source,
+                           "detail": detail})
+        if "brand" not in detail:
+            continue
+        if "registered" not in reg:
+            try:
+                reg["registered"] = stores_svc.registered_names()
+            except Exception as e:                              # noqa: BLE001
+                logger.warning("钓鱼波及展开取不到在册店集合(按未校验展开):"
+                               "%s: %s", e.__class__.__name__, e)
+                reg["registered"] = None
+        _bkey, _asins, hit = risk_trace.stores_of_brand(
+            conn, brand, manu, registered=reg["registered"])
+        for store, rec in hit.items():
+            ex = {"order_line_id": c["order_line_id"], "brand": detail["brand"],
+                  "origin_store": c.get("store"), "evidence": rec["evidence"],
+                  "still_listed": rec["still_listed"],
+                  "asins": rec["asins"][:_PHISH_ASIN_CAP]}
+            if reg["registered"] is None:
+                ex["registered_unchecked"] = True
+            expo_rows.append({"store": store,
+                              "event": store_events.PHISHING_BRAND_EXPOSURE,
+                              "severity": "mid", "source": source,
+                              "detail": ex})
+    landed = store_events.record_line_events(conn, order_rows)
+    n_expo = len(store_events.record_line_events(conn, expo_rows))
+    return landed, n_expo
+
+
+def _phish_mark(landed: list[dict]) -> str:
+    """输入:真落库的收单店事件行 → 输出:并进摘要首行的短标记(空则空串)。
+
+    首行是折叠的唯一出口(notify_fmt 规矩 1 / cli._fold_success):明细行排在
+    parts 尾部时,前面任何一段带换行的 note 都会把它挡在飞书之外。
+    """
+    return f"🚨 钓鱼命中 {len(landed)}" if landed else ""
+
+
+def _phish_note(landed: list[dict], n_expo: int) -> str:
+    """输入:真落库的收单店事件行 + 波及行数 → 输出:摘要明细行(空则空串)。"""
+    if not landed:
+        return ""
+    bits = []
+    for r in landed[:_PHISH_SHOW]:
+        d = r["detail"]
+        po = str(d.get("po_id") or "")[-8:] or "?"
+        bits.append(f"{r.get('store') or '?'}/{po}(邮编 {d.get('zip') or '?'})")
+    tail = "…" if len(landed) > _PHISH_SHOW else ""
+    out = f"🚨 钓鱼命中 {len(landed)} 行:" + "、".join(bits) + tail
+    return out + (f";品牌波及 {n_expo} 店" if n_expo else "")
+
+
 def _yes(v) -> bool:
     return str(v).lower() in {"1", "true", "yes"}
 
@@ -1155,7 +1362,8 @@ def run(params: dict) -> str:
         # ② 采集台账先对账(重启安全:pending 还在,能判断该不该重推)
         settled, gone, blocked, batch_notes = _settle_ledger(conn)
 
-        want, saved, tally = _judge_save_tally(conn, lines, blacklist, suppliers)
+        results, want, saved, tally = _judge_save_tally(conn, lines, blacklist,
+                                                        suppliers)
 
         # ③ 推采集:一批混邮编,同一 ASIN 的多邮编拆波次
         scrape_note, sent = "", []
@@ -1187,8 +1395,32 @@ def run(params: dict) -> str:
             batch_notes.extend(notes2)
             # 重判的是**同一批行**:第一遍它们多半是"待采集/待人工",这遍才
             # 拿到真数据。已出终局结论的行 judge 会照常重算,不受影响。
-            _want2, saved, tally = _judge_save_tally(conn, lines, blacklist,
-                                                     suppliers)
+            results, _want2, saved, tally = _judge_save_tally(
+                conn, lines, blacklist, suppliers)
+
+        # ③″ 钓鱼入账:**results 终版之后、推送之前**。放这儿不是随手放的 ——
+        # 放进 _judge_save_tally 里的话,`-p wait=1` 那条路会把同一批行记两遍
+        # (第二遍才是终版结论)。事件写在主连接上,与 _save 同边(order_audit
+        # 判定/落库本来就真跑,没有 execute 语义,DANGEROUS=False)。
+        # 补记自愈紧随其后:_save 自己 commit,事件在它之后 —— 中间崩一次那条
+        # 结论就永远留在订单表里而账本一无所知。每轮重扫窗口把漏的捞回来。
+        phish_mark = phish_note = ""
+        try:
+            landed, n_expo = _phish_record(conn, _phish_cands(results),
+                                           "order_audit")
+            healed, n_expo2 = _phish_record(
+                conn, _phish_selfheal_cands(conn, days, stores, line_id),
+                "order_audit:selfheal")
+            conn.commit()
+            phish_mark = _phish_mark(landed + healed)
+            phish_note = _phish_note(landed + healed, n_expo + n_expo2)
+        except Exception as e:                                  # noqa: BLE001
+            # 风险侧入账不该把审核整轮拖死;但失败必须见人(兜底静默常态化 =
+            # 主路径坏了没人知道),而且漏掉的下一轮补记自愈会捞回来
+            conn.rollback()
+            logger.error("钓鱼入账失败(判定与落库不受影响,下轮补记):%s: %s",
+                         e.__class__.__name__, e)
+            phish_note = f"⚠ 钓鱼入账失败({e.__class__.__name__}),下轮补记"
 
         # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
         pushed = missing = 0
@@ -1212,6 +1444,13 @@ def run(params: dict) -> str:
                 missing = len(miss_keys)
 
     parts = [f"{audit_note}待审 {len(lines)} 行,落库 {saved}"]
+    # 钓鱼是这条链里唯一"要人当场看一眼"的东西,所以短标记**并进首行**:
+    # 链通知只把成功步骤折成摘要的第一行(notify_fmt 规矩 1 / cli._fold_success),
+    # 明细行排在 parts 尾部时,前面任何一段带换行的 note 都会把它挡在飞书之外。
+    if phish_mark:
+        parts[0] = f"{phish_mark};" + parts[0]
+    if phish_note:
+        parts.append(phish_note)
     if tally:
         parts.append("结论:" + " / ".join(f"{k} {v}" for k, v in sorted(tally.items())))
     if want:

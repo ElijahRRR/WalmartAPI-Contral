@@ -52,8 +52,11 @@ from collections import Counter
 
 from registry import db
 from services import claims
+from services import store_events as se
 
 DANGEROUS = True
+
+_SOURCE = "store_release"
 
 logger = logging.getLogger("workflows.store_release")
 
@@ -208,6 +211,11 @@ def run(params: dict) -> str:
             with conn.cursor() as cur:
                 cur.execute(_MARK_OFFLINE_SQL, (store,))
                 marked = cur.rowcount or 0
+        # 店铺事件账本(治理类,**同事务**):整店释放 high、点名 mid。
+        # 标缺席行数一起带进 detail —— 它是同一个动作的另一半后果
+        se.record_many(conn, claims.released_rows(
+            freed, source=_SOURCE, scope="store" if whole_store else "named",
+            reason=reason, marked={store: marked} if mark_offline else None))
 
     logger.warning("store_release 已执行:%s,释放 %d 条,标缺席 %d 行,原因=%s",
                    store or key, len(freed), marked, reason)
@@ -301,12 +309,22 @@ def _run_dead(params: dict, execute: bool, mark_offline: bool) -> str:
         reason = (str(params.get("reason") or "").strip()
                   or "store_release:批量清死店(不在凭证表)")
         freed = marked = 0
+        freed_rows: list[tuple] = []
+        marked_by_store: dict[str, int] = {}
         for st in sorted(dead):
-            freed += len(claims.release(conn, reason=reason, store=st))
+            got = claims.release(conn, reason=reason, store=st)
+            freed_rows.extend(got)
+            freed += len(got)
             if mark_offline:
                 with conn.cursor() as cur:
                     cur.execute(_MARK_OFFLINE_SQL, (st,))
-                    marked += cur.rowcount or 0
+                    marked_by_store[st] = cur.rowcount or 0
+                    marked += marked_by_store[st]
+        # 逐店各一条(**同事务**):批量清死店就是整店释放对每家各跑一遍,
+        # 事件也照这个形状 —— 一条汇总行事后没法回答"哪一家什么时候被清的"
+        se.record_many(conn, claims.released_rows(
+            freed_rows, source=_SOURCE, scope="store", reason=reason,
+            marked=marked_by_store if mark_offline else None))
 
     logger.warning("store_release 清死店:%d 家,释放 %d 条,标缺席 %d 行,原因=%s",
                    len(dead), freed, marked, reason)
@@ -357,9 +375,15 @@ def _run_csv(params: dict, path: str, execute: bool) -> str:
                  "     刚跑出来的,不是几天前的。",
                  "   确认后去掉 --dry-run 重跑"]))
         freed = 0
+        freed_rows: list[tuple] = []
         for kind, key, st in hit:
-            freed += len(claims.release(conn, reason=reason, store=st,
-                                        kind=kind, key=key))
+            got = claims.release(conn, reason=reason, store=st,
+                                 kind=kind, key=key)
+            freed_rows.extend(got)
+            freed += len(got)
+        # csv 批量 = 逐条归属调整(货还在架上),按店汇总一条,mid
+        se.record_many(conn, claims.released_rows(
+            freed_rows, source=_SOURCE, scope="csv", reason=reason))
     logger.warning("store_release 批量:csv=%s,释放 %d 条,未命中 %d,原因=%s",
                    path, freed, len(miss), reason)
     return (f"✅ 批量释放完成:{head};实际释放 {freed} 条;原因={reason}"

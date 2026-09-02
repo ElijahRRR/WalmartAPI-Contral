@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **72 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **76 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
-- **12 条自动任务**在生产运行(电脑 launchd 3 条高频 + 智能体定时任务 9 条每日/每周);
-- **PostgreSQL 17** 单库五 schema(49 表 / 10 视图)为唯一权威状态;
-- **1880 个单元测试**。
+- **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
+- **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
+- **2465 个单元测试**。
 
 ---
 
@@ -177,7 +177,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 | 存储 | 内容 | 说明 |
 |---|---|---|
-| **PostgreSQL 17** `walmart_data` | 五 schema、49 表、10 视图 | **唯一权威**。DDL 在 `refdata/schema.sql`,说明在 `docs/db_schema.md` |
+| **PostgreSQL 17** `walmart_data` | 五 schema、49 表、12 视图 | **唯一权威**。DDL 在 `refdata/schema.sql`,说明在 `docs/db_schema.md` |
 | **飞书表格** | 店铺凭证、运营填的驱动表、结果回写 | **人机界面**,不是权威。程序按**表头字段名**索引,字段名常量在 registry |
 | `<DATA_ROOT>/` | `.env`(密钥,chmod 600)、`specs/`、`cache/`、`logs/`、`backups/`、`locks/`、`reports/` | 不进 git;路径唯一出处 `registry/paths.py`,可用 `WALMART_DATA_ROOT` 覆盖 |
 | SQLite | 仅 `cache/` 下可重建缓存(现无使用方,合规入口已随 2026-08-27 死件清理撤除——真要用先在 registry/db.py 加门) | 业务数据一律不放 SQLite |
@@ -204,7 +204,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 **`catalog.product_events` 产品病历。** 一个 SKU(= ASIN)从入库、审核、上架、
 观测、下架到删除核验的全部事件。它是"这个商品当初为什么被删/被拒"的唯一答案来源,
-也是若干判据的输入(如反补计数、顽固 SKU 判定)。
+也是若干判据的输入(如顽固 SKU 判定)。
 
 ---
 
@@ -231,7 +231,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 已宣布停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期):切断当天
 **全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
 `"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
-| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`) |
+| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
 | **USPTO 商标库** | 审核 R5 商标反查 | 跨库只读,默认关 |
 
 ---
@@ -328,7 +328,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `list_new` | 危 调 | 上架主链。七道闸门(非 ACTIVE 店 / 配额 / 风控 / 黑名单 / 全局去重 / 防呆 / 数据过滤,含**店铺渠道闸**:限额表「配送限制」标了 fba/fbm 就只上该渠道的货,**没标不限制**;缺数据同轮闭环:推采集→等窗口→就地摄取→本轮续走)→ 预备期(LLM 属性映射 + spec 一致化,128 并发占位号,缺必填本地拦)→ **通过的行才领 UPC** → 按店打包提交 MP_ITEM feed(三条防线:起跑抖动 0~800ms 去同步 / 遇 5xx 并发按 24→16→12→8→4 降档、只降不升 / 不确定的片子**整轮跑完再结算**,退避走官方阶梯 2-4-8-16-32 + 抖动)→ 回写上架表。**首尾各同步一次 UPC 池**,等于顺带跑了 `upc_sync`。变体自动成组(单维/多维)、组内标题差异化 摘要末尾报本轮 **LLM 用量与花费**(按用途分行,含每千条单价;dry-run 的 `check_spec` 预检同样报——那一步是真调 LLM 的)。|
+| `list_new` | 危 调 | 上架主链。七道闸门(非 ACTIVE 店 / 配额 / 风控 / 黑名单 / **本店去重**(2026-08-28 取消全局去重:同店重复才拦,跨店分布归分配链+占用闸)/ 防呆 / 数据过滤,含**店铺渠道闸**:限额表「配送限制」标了 fba/fbm 就只上该渠道的货,**没标不限制**;另有**定制品闸**:产品数据标为定制的不上架(2026-08-28 定稿);缺数据同轮闭环:推采集→等窗口→就地摄取→本轮续走)→ 预备期(LLM 属性映射 + spec 一致化,128 并发占位号,缺必填本地拦)→ **通过的行才领 UPC** → 按店打包提交 MP_ITEM feed(三条防线:起跑抖动 0~800ms 去同步 / 遇 5xx 并发按 24→16→12→8→4 降档、只降不升 / 不确定的片子**整轮跑完再结算**,退避走官方阶梯 2-4-8-16-32 + 抖动)→ 回写上架表。**首尾各同步一次 UPC 池**,等于顺带跑了 `upc_sync`。变体自动成组(单维/多维)、组内标题差异化 摘要末尾报本轮 **LLM 用量与花费**(按用途分行,含每千条单价;dry-run 的 `check_spec` 预检同样报——那一步是真调 LLM 的)。|
 | `match_listing` | 危 | 跟卖上架(MP_ITEM_MATCH) |
 | `upc_sync` | | UPC 池注入同步与投影回写(手动体检入口) |
 | `sku_locked_heal` | 危 | `SKU_LOCKED` 自愈链:RETIRE → 冷却 24h → 清列重上新 UPC |
@@ -344,9 +344,12 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 |---|---|---|
 | `maintenance_scan` | 调 | 扫描定性,产建议行(改价 / 改库存 / 改标题 / 删除)。判据全在 `services.maintenance_intents.classify()` —— 全项目唯一一处决定"这个在线商品该拿它怎么办" |
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
-| `problem_scan` | 调 | 问题商品扫描定性(沃尔玛后台 UNPUBLISHED/SYSTEM_PROBLEM + 审核判拒但仍在架)。尾段顺手收黑名单并投影飞书 |
-| `problem_product_cleanup` | 危 调 | 问题商品处置执行件(反补 / 删除 / 停用) |
+| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
+| `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
+| `error_reclass_report` | | 报错归类新旧对照(只读排查,手动跑):现行 `problem_products.categorize()` 的 A-L 码 vs 新引擎 `services.error_taxonomy` 的 16 码,出迁移矩阵 / unknown 全文 / 政策表缺口 / feed 政策族分类。方案 `docs/error_taxonomy.md`,所有者过完这份账才换轨 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
+| `node_clear` | 危 调 | 把**指定发货节点**的库存整节点清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。**拒绝清受管仓**(自动链正在维护它,清了下轮写回来);写 0 幂等,失败重跑即补 |
+| `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |
 
 **定价口径**:落地价 =(亚马逊单价 + 运费)× 区间倍率,按**配送方式**(FBA/FBM)
 选区间。⚠ 运费没采到(NULL)一律不改价不上架 —— 当 0 用会定出偏低的价,而两侧都不报错。
@@ -418,6 +421,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | 工作流 | | 做什么 |
 |---|---|---|
 | `daily_report` | 调 | 店铺日报:KPI 指标 + 影刀店铺状态 + 看板两页 + 真发日报。`-p yingdao=0` / `-p push=0` 可关 |
+| `store_watch` | 调 | 店铺事件账本(`ops.store_events`)的**唯一推送出口**:每小时扫未推送高危 → 一轮一条飞书 → 标已推;顺带比对治理配置快照。`-p seed=1` 首次上线吞存量,`-p hours` / `-p limit` 调窗口与单轮上限 |
 | `kpi_history_import` | 一 | 旧「店铺KPI」飞书历史 → `ops.store_kpi_daily` |
 
 ### 6.10 基础设施
@@ -442,7 +446,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 两个 runner,按频率分工:
 
-### 电脑 launchd(高频,3 条)
+### 电脑 launchd(高频,4 条)
 
 写死在电脑上最稳,不依赖任何智能体在不在线。装载:`cli.py launchd_install`。
 
@@ -450,6 +454,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 |---|---|---|
 | `feed_poll` | 每小时 :00/:30 | `feed_poll` |
 | `order_chain` | 每小时 :20 | `order_sync` → `order_audit` → `returns_sync` |
+| `store_watch` | 每小时 :45 | `store_watch`(店铺高危事件扫描 → 飞书 → 标已推;顺带比对治理配置快照。**首次上线先手动 `-p seed=1`**) |
 | `product_ingest` | 每小时 :50 | `product_ingest`(全局增量泵:本地产品中心 ↔ 采集器对齐;各链已按批自取,这条管其余一切增量) |
 
 ### 智能体定时任务(每日/每周,9 条)

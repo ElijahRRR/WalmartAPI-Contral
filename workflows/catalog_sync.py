@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import notify_fmt as nf, product_events, store_retry, \
-    stores as stores_svc, walmart_catalog
+from services import notify_fmt as nf, product_events, store_limits, \
+    store_retry, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -65,15 +65,25 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
                     summaries.append(items.summarize_item(item))
                     filled += 1
 
-    inventory: dict[str, int] = {}
+    # {sku: {发货节点: 可售数量}} —— 合计与节点数都由 merge_rows 从这一份算
+    inventory: dict[str, dict[str, int]] = {}
     inv_failed = False
     if not skip_inventory:
         try:
-            # expected_skus = 本轮扫到的全部 SKU(含截断补漏):bulk 漏掉的
-            # 走单品 GET 兜底(api 层内置,记日志计数;所有者 2026-08-26
-            # 拍板接上 —— 此前没传,蓝图 #22 的补漏在生产从未触发)
-            inventory = inv_api.list_inventories(
-                store, expected_skus={s["sku"] for s in summaries if s.get("sku")})
+            # ⚠ **不传 expected_skus,bulk 拉到什么就是什么**(所有者定稿
+            # 2026-08-28 撤线,推翻自己 08-26「拍板接上」)。撤的依据是接上后的
+            # **第一次生产触发**(08-28 06:42,A109):目录 6,976 - bulk 3,511 =
+            # 3,465 个"漏",逐个单查**全 404**,一店多烧 43 分钟 —— 因为 404 的
+            # 语义是「库存台账没有这一行」:退市/Stage 死档案永远不会有库存行,
+            # 部分**真在线**商品同样没有(所有者实见),单查对两者都问不出新
+            # 信息,只烧时长与 inventory 配额。"bulk 没给"≠"翻页漏了",
+            # 这正是蓝图 #22 那个假设在生产的证伪。
+            # bulk 真漏的行不会丢数:avail_qty 由 upsert 的 COALESCE 沿用
+            # 上一轮值(walmart_catalog.py,#93 之前生产一直如此)。
+            # api 层的 expected_skus 能力**保留不删**,只撤本调用方的接线。
+            # 取节点明细版(多仓批次 1):合计口径与 list_inventories 一致
+            # (它就是本函数的求和包装),多出来的节点身份供 upsert_node_inventory
+            inventory = inv_api.list_inventory_nodes(store)
         except _client.StoreDeadError:
             raise                       # 凭证失效仍按跳店处理
         except Exception as e:
@@ -84,13 +94,21 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
     rows = walmart_catalog.merge_rows(name, summaries, inventory, run_at)
     with db.pg_conn() as conn:
         written = walmart_catalog.upsert_items(conn, rows)
+        # 分节点明细(多仓批次 1):合计仍在 walmart_items.avail_qty,这里落
+        # 每个节点各多少 —— 维护链的"受管仓现值"读它。与 upsert_items 同事务:
+        # 合计与明细必须是同一轮观测,分两个事务会出现"合计已更新、明细还是
+        # 上一轮"的窗口,而维护链正好在那个窗口里比对就会误判
+        walmart_catalog.upsert_node_inventory(conn, name, inventory, run_at)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
     backfilled = _backfill_item_ids(store) if backfill_ids else 0
+    # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。谭总12 自建中山仓
+    # 之后它不再是 0 —— 摘要按"该店配没配「维护仓库」"分两种措辞(见 run())
+    multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
             "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
-            "item_ids": backfilled}
+            "item_ids": backfilled, "multi_node": multi}
 
 
 def _backfill_item_ids(store: dict) -> int:
@@ -178,6 +196,31 @@ def run(params: dict) -> str:
     inv_failed = [r["store"] for r in results if r.get("inv_failed")]
     if inv_failed:
         lines.append(f"库存拉取失败(沿用旧值,目录已更新):{','.join(inv_failed)}")
+    # 多仓探测必须见人(批次 0):多仓一旦发生而没人知道,维护链会按"全节点合计"
+    # 比对却只写单个节点 —— 清零永久失效、库存每轮重写、生效永久判未生效,
+    # 三条全是静默的(docs/multi_node_plan.md §1)。这一行是它的唯一告警面。
+    # ⚠ 措辞按**该店配没配「维护仓库」**分两种(2026-08-31 改):批次 2 之后
+    # 配置店的维护链已按受管仓写,再喊"仍按单仓写、库存会漂"是**过时告警**
+    # ——它出现在搬仓当天的摘要里,读起来像"改造没生效",正好把人引向反面。
+    multi = {r["store"]: r["multi_node"] for r in results if r.get("multi_node")}
+    if multi:
+        managed = store_limits.maint_nodes()
+        done = {s: n for s, n in multi.items() if s in managed}
+        todo = {s: n for s, n in multi.items() if s not in managed}
+        lines.append(
+            f"多发货节点:{sum(multi.values())} 个 SKU 铺在 2 个及以上节点("
+            + ",".join(f"{s}×{n}" for s, n in sorted(multi.items())) + ")")
+        if done:
+            lines.append(
+                "  已配「维护仓库」的店按受管仓维护(其余节点自动链不碰):"
+                + ",".join(f"{s}={managed[s]}" for s in sorted(done))
+                + " —— 旧节点的存量货归 `node_clear` 收尾")
+        if todo:
+            lines.append(
+                f"  ⚠ **未配「维护仓库」的店库存维护会漂**:"
+                + ",".join(sorted(todo))
+                + "(按全节点合计比对却只写单节点 —— 清零失效/每轮重写/"
+                  "生效永判未生效,见 docs/multi_node_plan.md §1)")
     if dead:
         lines.append(f"凭证失效跳过:{','.join(dead)}")
 

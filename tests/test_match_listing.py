@@ -420,3 +420,50 @@ def test_match_weight_defaults_to_one_pound():
     assert item["ShippingWeight"] == 1.0
     item2 = match_feed.build_match_item({}, "SKU1", "9.99", "2.5")
     assert item2["ShippingWeight"] == 2.5
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    got: list = []
+    monkeypatch.setattr(ml.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_execute_records_one_round_event_per_store(monkeypatch):
+    _wire(monkeypatch, [_row(2, "012345678905")],
+          {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
+    got = _capture_rounds(monkeypatch)
+    ml.run({"execute": True})
+    assert len(got) == 1
+    source, event, per_store = got[0]
+    assert (source, event) == ("match_listing", ml.store_events.MATCH_ROUND)
+    assert per_store == {"T1": {"submitted": 1}}
+
+
+def test_a_store_that_blew_up_still_leaves_a_row(monkeypatch):
+    """★ 异常店也留一条:计数可能全 0(第一片就炸),而"这家店这一轮炸了"
+    本身就是要能按时间线对齐的事实(封店那天它是不是也在炸)。"""
+    from socksio.exceptions import ProtocolError
+    _wire(monkeypatch, [_row(2, "012345678905")],
+          {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
+    monkeypatch.setattr(ml.store_retry.time, "sleep", lambda s: None)
+
+    def boom(store, ft, entries, *, workflow=""):
+        raise ProtocolError("Malformed reply")
+
+    monkeypatch.setattr(feeds, "submit_feed", boom)
+    got = _capture_rounds(monkeypatch)
+    ml.run({"execute": True})
+    assert got[0][2] == {"T1": {"exception": True}}
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    _wire(monkeypatch, [_row(2, "012345678905")],
+          {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
+    got = _capture_rounds(monkeypatch)
+    ml.run({"execute": False})
+    assert got == []

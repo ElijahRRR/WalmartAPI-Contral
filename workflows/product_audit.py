@@ -42,7 +42,9 @@
 链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
 L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
 L4 视觉] → 37 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
-products.audit_* 五列与审核事件(空跑用 --dry-run)。**`-p from_sheet=1` 时另把结论投影回上架表
+products.audit_* 五列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
+L2 R4 扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
+(源头一条 + 波及逐店,展开走 services/risk_trace),dry-run 一条不写。**`-p from_sheet=1` 时另把结论投影回上架表
 C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
 
 ⚠ `from_sheet` **缺省不是强审**(要强审加 `-p force=1`,见下):
@@ -87,6 +89,7 @@ R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/14
 先离线抽样出数据再决定常开;开时全程复用一个只读连接。
 """
 
+import json
 import logging
 import re
 import time
@@ -97,7 +100,8 @@ from api import scraper
 from registry import db, resources
 from services import audit_reason, audit_rules, audit_store, db_guard, \
     kpi, \
-    listing_sheet, product_events, product_ingest, scrape_batches
+    listing_sheet, product_events, product_ingest, risk_trace, scrape_batches, \
+    store_events, stores
 
 DANGEROUS = True
 
@@ -1059,6 +1063,132 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
 _cap_by_connections = db_guard.cap_workers
 
 
+# ── TRO 品牌命中接线(2026-08-30)────────────────────────────────────────────
+#
+# 判定链本来就在扫黑名单品牌(L2 R4),而黑名单里有两万余个来源标着「TRO品牌」
+# 的牌子 —— 也就是说"我们上过一个 TRO 品牌的货"这件事,每天都在审核链里被算
+# 出来又被丢掉。这一段只做一件事:把算出来的东西记进店铺事件账本,并调
+# services/risk_trace 展开"同品牌还散在哪几家店"。
+#
+# 两条纪律:
+#   ① **先写 ops.dedupe 再写事件**,rowcount==1 才继续。事件表是只追加的账本,
+#      重复行不可撤;去重键先落库则并发/重跑都只有一个赢家(同 blacklist 的
+#      brand_asin 三件套先例)。
+#   ② **绝不放进 _flush 的事务**。_flush 一炸整批回滚(它就是这么设计的),
+#      TRO 行跟着没了却已经占着 dedupe 键 = 永久静默漏报。写在循环的主事务上,
+#      随 _COMMIT_EVERY 的 commit 一起落定。
+_TRO_SCOPE = "audit:tro_brand"        # 源头事件去重:一个品牌一辈子报一次
+_TRO_EXPAND_SCOPE = "audit:tro_expand"  # 波及展开去重:整品牌一次,**不按店**
+_TRO_ASIN_CAP = 10                    # 波及 detail 里最多带几个 ASIN(够溯源即可)
+_TRO_EVIDENCE_CAP = 200               # l3_evidence 截断长度(LLM 自由文本)
+
+_TRO_CLAIM_SQL = """
+INSERT INTO ops.dedupe (scope, key, meta)
+VALUES (%(scope)s::text, %(key)s::text, %(meta)s::jsonb)
+ON CONFLICT DO NOTHING
+"""
+
+
+def _tro_claim(conn, scope: str, key: str, meta: dict) -> bool:
+    """输入:连接 + 去重域 + 键 + 备注 → 输出:这一轮是不是**第一个**拿到它的。
+
+    False = 别人(或上一轮)已经报过,本次什么都不该写。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_TRO_CLAIM_SQL, {
+            "scope": scope, "key": key,
+            "meta": json.dumps(meta, ensure_ascii=False, default=str)})
+        return bool(cur.rowcount)
+
+
+def _tro_l3_evidence(outcome, brand: str) -> str | None:
+    """输入:判定结果 + r4 键 → 输出:L3 对该词的简短理由(没有则 None)。"""
+    for v in (getattr(outcome.l3, "blacklist_brand_verdict", None) or ()):
+        if isinstance(v, dict) and \
+                str(v.get("brand") or "").strip().lower() == brand:
+            ev = str(v.get("evidence") or "").strip()
+            return ev[:_TRO_EVIDENCE_CAP] or None
+    return None
+
+
+def _tro_expand(conn, brand: str, state: dict) -> int:
+    """输入:连接 + r4 键 + 本轮状态 → 输出:写下的波及行数。
+
+    在册店集合(`stores.registered_names`)要敲飞书,所以**整轮只取一次**并缓存
+    在 state 里;取不到时按 `registered=None` 展开(risk_trace 只算 a+b 两条件)
+    并在每行 detail 标 `registered_unchecked` —— 少了"店还在不在册"这一条,
+    still_listed 可能把死店的冻结行算成在架,看的人得知道自己拿到的不是终判。
+    """
+    if "registered" not in state:
+        try:
+            state["registered"] = stores.registered_names()
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("TRO 波及展开取不到在册店集合(按未校验展开):%s: %s",
+                           e.__class__.__name__, e)
+            state["registered"] = None
+    registered = state["registered"]
+    _bkey, _asins, hit = risk_trace.stores_of_brand(conn, brand,
+                                                    registered=registered)
+    rows = []
+    for store, rec in hit.items():
+        detail = {"brand": brand, "evidence": rec["evidence"],
+                  "still_listed": rec["still_listed"],
+                  "asins": rec["asins"][:_TRO_ASIN_CAP],
+                  "asin_total": len(rec["asins"])}
+        if registered is None:
+            detail["registered_unchecked"] = True
+        rows.append({"store": store, "event": store_events.TRO_BRAND_EXPOSURE,
+                     "severity": "mid", "source": "product_audit",
+                     "detail": detail})
+    if rows:
+        store_events.record_many(conn, rows)
+    return len(rows)
+
+
+def _tro_hook(conn, outcome, ctx, state: dict) -> None:
+    """输入:主线程连接 + 一条判定结果 + 上下文 + 本轮状态 → 输出:无(就地落库计数)。
+
+    state 累加四个数给摘要:`brands`(本轮命中的 TRO 品牌)/ `new`(其中首报的,
+    = dedupe rowcount)/ `expo`(波及行数)/ `unjudged`(嫌疑未判的品牌)。
+
+    ⚠ **不带 run_id**:run_id 要等 `_flush` 攒够一批落 audit_runs 才有,而本钩子
+    刻意跑在那之外(见上面纪律 ②)。溯源靠 detail.first_asin —— 拿它去
+    audit.audit_runs 按 asin 查最近一轮,信息一条不少。
+    """
+    res = audit_store.tro_hits(outcome, ctx.r4_source,
+                               resources.TRO_BRAND_SOURCE_PREFIX)
+    if not res["confirmed"] and not res["unjudged"]:
+        return
+    for brand in res["confirmed"]:
+        state["brands"].add(brand)
+        src = res["sources"].get(brand)
+        if _tro_claim(conn, _TRO_SCOPE, brand,
+                      {"asin": outcome.asin, "judged": True}):
+            state["new"] += 1
+            store_events.record_many(conn, [{
+                "store": None, "event": store_events.TRO_BRAND_HIT,
+                "severity": "high", "source": "product_audit",
+                "detail": {"brand": brand, "source": src,
+                           "first_asin": outcome.asin, "judged": True,
+                           "l3_evidence": _tro_l3_evidence(outcome, brand)}}])
+        # 展开**独立占键**:同一个品牌可能先以"未判"身份报过(那时不展开),
+        # 后来才被 L3 确认 —— 此时源头事件被上面的键挡下是对的(一个品牌一条
+        # 源头),但波及展开还一次都没做过,不能跟着被挡掉。
+        if _tro_claim(conn, _TRO_EXPAND_SCOPE, brand, {"asin": outcome.asin}):
+            state["expo"] += _tro_expand(conn, brand, state)
+    for brand in res["unjudged"]:
+        state["unjudged_brands"].add(brand)
+        if _tro_claim(conn, _TRO_SCOPE, brand,
+                      {"asin": outcome.asin, "judged": False}):
+            store_events.record_many(conn, [{
+                "store": None, "event": store_events.TRO_BRAND_HIT,
+                "severity": "mid", "source": "product_audit",
+                "detail": {"brand": brand, "source": res["sources"].get(brand),
+                           "first_asin": outcome.asin, "judged": False,
+                           "reason": res["reason"]}}])
+    # 展开不做:没判定就展开 = 拿一个可能是通用英文词的"品牌"去标一批店
+
+
 @dataclass
 class Opts:
     """一轮 run() 的入参定案(值域与四条互斥校验都在 _parse_opts 里做完)。"""
@@ -1143,6 +1273,12 @@ class Counts:
     asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
     uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
     uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
+    # TRO 命中(2026-08-30;dry-run 恒 0 —— 那一路根本不跑,见 _tro_hook 调用点)
+    tro_n: int = 0          # 本轮命中的 TRO 品牌数(含早就报过的)
+    tro_new: int = 0        # 其中**首报**的(dedupe rowcount==1),真落了源头事件
+    tro_expo: int = 0       # 波及行数(逐店一行)
+    tro_unjudged: int = 0   # 嫌疑但拿不到 L3 判定的品牌数
+    tro_errors: int = 0     # 接线本身失败的次数(兜底触发必须见人)
 
 
 def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
@@ -1225,6 +1361,18 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"
                      f"LLM 故障待定 {stage_stats['L3_pending']})")
+    # TRO:非零才打印(notify_fmt 规矩 2 —— 例外计数为 0 是噪声)。
+    # 这三个数不是同一件事:命中 = 本轮认出几个 TRO 品牌;首报 = 其中几个是
+    # 头一回见(真落了源头事件);波及 = 展开出几家店(一个品牌能扇出好几家)
+    if counts.tro_n:
+        lines.append(f"🚨 TRO 品牌命中 {counts.tro_n}"
+                     f"(首报 {counts.tro_new},波及 {counts.tro_expo} 店)")
+    if counts.tro_unjudged:
+        lines.append(f"⚠ TRO 嫌疑未判 {counts.tro_unjudged}"
+                     f"(L2判死/LLM故障/超10词,已入账未展开)")
+    if counts.tro_errors:
+        lines.append(f"⚠ TRO 接线失败 {counts.tro_errors} 次(详见日志;"
+                     f"判定与落库不受影响,漏掉的下轮同品牌再来会补上)")
     if stage_stats["L4_ran"]:
         lines.append(f"L4 视觉:判 {stage_stats['L4_ran']}"
                      f"(拒 {stage_stats['L4_reject']})")
@@ -1361,6 +1509,10 @@ def run(params: dict) -> str:
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         _llm.reset_usage_stats()                 # token 记账同样每轮从零
         events = []
+        # TRO 接线的本轮状态(见 _tro_hook):registered 键**惰性**加进来,
+        # 一轮最多敲一次飞书;没有 TRO 命中时永远不敲
+        tro = {"brands": set(), "unjudged_brands": set(),
+               "new": 0, "expo": 0, "errors": 0}
         row_errors, consec_errors = 0, 0
         l0_untouched = 0
         done_n = 0
@@ -1518,6 +1670,17 @@ def run(params: dict) -> str:
                                 stage_stats["L3_reject"] += 1
                             elif outcome.l3.verdict == "pending":
                                 stage_stats["L3_pending"] += 1
+                        # TRO 品牌命中入账(与 product_events 同边:dry-run 不写
+                        # 事件 —— 见摘要末行「事件未写」)。整段包一层 except:
+                        # 78 万行的审核不该因为风险侧的附加动作整轮停,但**失败
+                        # 计数进摘要**(兜底静默常态化 = 主路径坏了没人知道)
+                        if execute:
+                            try:
+                                _tro_hook(conn, outcome, ctx, tro)
+                            except Exception as e:              # noqa: BLE001
+                                tro["errors"] += 1
+                                logger.error("TRO 接线失败 asin=%s:%s",
+                                             outcome.asin, e)
                         if outcome.l4 is not None:
                             stage_stats["L4_ran"] += 1
                             if outcome.l4.verdict == "reject":
@@ -1568,7 +1731,11 @@ def run(params: dict) -> str:
                    policy_unknown=policy_unknown, row_errors=row_errors,
                    asked_asins=len(extra.get("asins", ())),
                    uspto_failures=getattr(ctx, "uspto_failures", 0),
-                   uspto_off=getattr(ctx, "uspto", None) is None)
+                   uspto_off=getattr(ctx, "uspto", None) is None,
+                   tro_n=len(tro["brands"]), tro_new=tro["new"],
+                   tro_expo=tro["expo"],
+                   tro_unjudged=len(tro["unjudged_brands"]),
+                   tro_errors=tro["errors"])
     lines = _summary(opts, tally, stage_stats, l1s, l4_fail,
                      pending_total, sheet_head)
     if sheet_rows:
@@ -1576,5 +1743,6 @@ def run(params: dict) -> str:
         # 这一轮刚补采回来、刚判出结论的那些行还写不进表格)
         lines.append(_project_to_sheet(sheet_rows, execute))
     if not execute:
-        lines.append("(dry-run:runs/hits 已落,products 五列与事件未写)")
+        lines.append("(dry-run:runs/hits 已落,products 五列与事件"
+                     "(含 TRO 品牌命中)未写)")
     return "\n".join(lines)

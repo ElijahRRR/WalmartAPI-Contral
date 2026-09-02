@@ -73,7 +73,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     rows = [
         _sheet_row(2),                                    # 走到"待数据源"
         _sheet_row(3, product_type="BannedPT"),           # 风控拦截
-        _sheet_row(4, asin="B0LISTED01"),                 # 全局去重
+        _sheet_row(4, asin="B0LISTED01"),                 # 本店已在架(本店去重)
         _sheet_row(5, asin="B0RISKY001"),                 # 有删除史:不拦(口径)
         _sheet_row(6, product_type="NoSpecPT"),           # PT 无 spec
         _sheet_row(7, store="T_OFF"),                     # 非 ACTIVE 店
@@ -84,7 +84,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
-        {"T_OFF"}, {}, {"B0LISTED01"},
+        {"T_OFF"}, {}, {("T1", "B0LISTED01")},
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()},
@@ -108,7 +108,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     # 标签也加了空格更好读 —— 这里跟着改,顺便断言那些 0 确实不出现
     assert "非 ACTIVE 店 1" in out and "风控拦截 1" in out
     assert "配送超时 0" not in out and "黑名单 0" not in out
-    assert "全局去重 1" in out and "PT 无 spec 1" in out
+    assert "本店已在架 1" in out and "PT 无 spec 1" in out
     assert "黑名单 1" in out and "待数据源 2" in out
     # 黑名单理由带来源与类别(收集侧建好,拦截侧在此接通)
     assert any("ASIN黑名单:沃尔玛-知产(E类)" in why for _, why in
@@ -333,6 +333,95 @@ def test_store_channel_gate(monkeypatch):
     # 没标的店照上 FBM;本店渠道相符的照上;第三种值走"未采到"那一档不重复计数
     assert "共 2 行将进入" in out
     assert "配送方式(FBA/FBM)未采到" in out
+
+
+def test_silent_buckets_now_write_reasons(monkeypatch):
+    """所有者定稿 2026-08-28:除「配额排队」外的静默桶都要写明 N 列原因。
+
+    钉三路:审核判拒 / 审核未过(pending·未审)/ 店铺非 ACTIVE(整店跳过也
+    逐行写)。都只写理由**不写终态**——条件解除下一轮自动续上;配额排队
+    仍然故意不写(计划上架,还在队里)。"""
+    rows = [_sheet_row(2, audit_result="reject"),
+            _sheet_row(3, audit_result="pending"),
+            _sheet_row(4, audit_result=""),                  # 库里查不到=未审
+            _sheet_row(5, store="T_OFF")]                    # 非 ACTIVE 店
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        {"T_OFF"}, {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
+    monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
+        {"name": "T1"}, {"name": "T_OFF"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda asins: {})
+
+    out = ln.run({"execute": False})
+    assert "第2行:审核判拒,不上架" in out
+    assert "第3行:审核未过:pending(过审后自动续上)" in out
+    assert "第4行:审核未过:未审(过审后自动续上)" in out
+    assert "第5行:店铺非ACTIVE,整店暂停上架" in out
+    assert "非 ACTIVE 店 1" in out          # 计数照旧
+
+
+def test_custom_product_gate(monkeypatch):
+    """定制品不上架(所有者定稿 2026-08-28)。明确标了才拦;未采到照常走后面
+    的闸(fail-open,与黑名单同向:命中才拦)。"""
+    rows = [_sheet_row(rownum=2, store="T1", asin="B0CUSTOM01"),
+            _sheet_row(rownum=3, store="T1", asin="B0NORMAL01")]
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
+    products = {
+        "B0CUSTOM01": {**base, "asin": "B0CUSTOM01", "is_custom": True},
+        "B0NORMAL01": {**base, "asin": "B0NORMAL01", "is_custom": False},
+    }
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "定制品 1" in out
+    assert "第2行:定制品不上架" in out
+    assert "共 1 行将进入" in out
+
+
+def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
+    """取消全局去重(所有者定稿 2026-08-28)的正面钉死:该 ASIN 在**别的店**
+    在架(含死档案行)不再拦本店上架 —— 2026-08-28 事件里任何店的退市档案
+    都会把 ASIN 对全船队封死,这正是要拆掉的那半边。跨店纪律归占用闸。"""
+    rows = [_sheet_row(rownum=2, store="T1", asin="B0FREE0001")]
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
+    products = {"B0FREE0001": {**base, "asin": "B0FREE0001"}}
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        set(), {}, {("A109", "B0FREE0001"), ("A102", "B0FREE0001")},
+        {}, set(), {"banned_pts": set(), "brands": set()}, {}, {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "本店已在架" not in out
+    assert "共 1 行将进入" in out
 
 
 def test_quota_slices_after_filters(monkeypatch):
@@ -582,10 +671,12 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
     assert "共 2 行将进入" in out
 
 
-def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
-    """规划范围外的店(店名含「谭总」)在架的产品**不拦**别的店上架。
+def test_listed_pairs_cover_every_store_for_self_dedup(monkeypatch):
+    """去重集合 = (店铺, SKU) 对,**全部店都进**(含规划外店)。
 
-    所有者定稿 2026-08-15:那些店不在分配规划内,其他店可以与它们重复。
+    2026-08-28 所有者定稿「取消全局去重」:集合只回答"这家店自己有没有这个
+    ASIN"(自己拦自己防重复上架),不再承载跨店互拦 —— 于是 2026-08-15
+    「规划外店不拦别人」不再需要在这里把它们的行剔掉。
     """
     seen = {}
 
@@ -617,9 +708,11 @@ def test_dedup_gate_ignores_out_of_scope_stores(monkeypatch):
                         lambda c: {"banned_pts": set(), "brands": set()})
     monkeypatch.setattr(ln.claims, "load_active", lambda c, k: {})
 
-    listed = ln._load_gate_state().listed
-    assert "B0MINE0001" in listed          # 规划内的店照样拦
-    assert "B0TANZONG1" not in listed      # 范围外的店不拦
+    pairs = ln._load_gate_state().listed_pairs
+    assert ("A085", "B0MINE0001") in pairs
+    assert ("谭总4", "B0TANZONG1") in pairs   # 规划外店也进:自己拦自己
+    # 集合是对,不是裸 ASIN:别的店在架不构成任何拦截依据
+    assert "B0MINE0001" not in pairs
 
 
 def test_submit_jitter_desynchronizes_the_starts(monkeypatch):
@@ -885,12 +978,14 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln.upc_pool, "mark_used", lambda *a, **k: 0)
     monkeypatch.setattr(ln, "_map_llm",
                         lambda c, pt, spec, p, stats=None: ({"productName": p["title"]}, {}))
+    seen["orderable_fcs"] = []
     monkeypatch.setattr(
         ln.mp_mapper, "build_orderable",
         lambda sku, upc, price, qty, partner, **k: (
             seen["orderable_upcs"].append(str(upc)),
+            seen["orderable_fcs"].append(str(partner)),
             {"productIdentifiers": {"productId": str(upc),
-                                    "productIdType": "UPC"}})[1])
+                                    "productIdType": "UPC"}})[2])
     # 每店第二类行(…BAD)必填缺失 → 预备期本地拦下
     monkeypatch.setattr(ln.mp_conform, "conform", lambda *a, **k: (
         a[2], a[3], [],
@@ -1210,20 +1305,21 @@ def test_main_title_three_shapes():
     assert az.main_title({"title": "", "attrs": {"subtitle": "Y"}}) is None
 
 
-def test_out_of_scope_store_skips_dedup_and_claim_gates(monkeypatch):
-    """规划外店(谭总系)上架**不进全局去重、不受产品/品牌占用管**
-    (所有者定稿 2026-08-15「既不占用、也不拦别人」;2026-08-19 生产实证
-    补全这个方向——此前只豁免了"它不拦别人",它自己上架仍被拦)。
-    同一现状下规划内的店照旧被拦,豁免不外溢。
+def test_out_of_scope_store_skips_claim_gates(monkeypatch):
+    """规划外店(谭总系)上架**不受产品/品牌占用管**(所有者定稿 2026-08-15
+    「既不占用、也不拦别人」;2026-08-19 生产实证补全这个方向)。
+    同一现状下规划内的店照旧被占用闸拦,豁免不外溢。
+    2026-08-28 取消全局去重后,「别店在架」本身不再拦任何人 —— T1 被拦
+    只因占用闸(跨店纪律由 claims 台账独自承担)。
     """
     rows = [_sheet_row(2, store="谭总4", asin="B0AAAAAOK1"),
             _sheet_row(3, store="T1", asin="B0AAAAAOK1")]
     products = {"B0AAAAAOK1": {**_PRODUCT_OK, "asin": "B0AAAAAOK1",
                                "brand": "SomeBrand"}}
     seen = _wire_execute_env(monkeypatch, rows, products)
-    # 该 ASIN 已在别店在架 + 产品/品牌都被别店占用
+    # 该 ASIN 已在**别店**在架(不构成拦截)+ 产品/品牌都被别店占用(拦 T1)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
-        set(), {}, {"B0AAAAAOK1"}, {}, set(),
+        set(), {}, {("A085", "B0AAAAAOK1")}, {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0AAAAAOK1": "A085"},
         {ln.brand_key.brand_key("SomeBrand", None): "A085"}))
@@ -1233,9 +1329,11 @@ def test_out_of_scope_store_skips_dedup_and_claim_gates(monkeypatch):
                         lambda: {s: {"fbm_range1": "200%"}
                                  for s in ("谭总4", "T1")})
     out = ln.run({"execute": True})
+    # T1 被**占用闸**拦在领号之前(claimed 计数历来不进闸门行,理由走 N 列),
+    # 谭总4 豁免占用照常提交 —— 两个可观测面共同证明拦截发生在占用闸:
     assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]  # 只有谭总
     assert seen["submitted"] == [("谭总4", 1)]
-    assert "全局去重" in out                    # T1 那行被拦,理由照写
+    assert "本店已在架" not in out              # 别店在架不再是拦截理由
 
 
 def test_out_of_scope_holders_do_not_block_others(monkeypatch):
@@ -1328,6 +1426,39 @@ def test_denominator_is_rows_that_entered_prep_not_rows_that_succeeded():
     assert "_llm_cost_lines(len(prep_ok))" not in src
 
 
+# ── 多仓:上架仓(批次 3)────────────────────────────────────────────────────
+
+def test_listing_uses_the_managed_node_as_fulfillment_center(monkeypatch):
+    """配置了「维护仓库」的店:MP_ITEM 的 fulfillmentCenterID = 那个 FC ID。
+
+    ⚠ 恒填 Partner ID 是**退化写法**:对已建实体仓的店铺是错的 —— 货上到
+    Virtual Node,而运费模板挂在新仓上,回执一切正常。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_limits, "managed_nodes",
+                        lambda stores=None: ({"T1": "91539778610008065"}, {}))
+    ln.run({"execute": True})
+    assert seen["orderable_fcs"] == ["91539778610008065"]
+
+
+def test_listing_skips_the_store_when_the_node_fails_validation(monkeypatch):
+    """校验失败**整店跳过,不回落 Virtual Node**。
+
+    回落等于把本该进新仓的货上到旧节点,而且全程不报错 —— 比"这店今天没上架"
+    坏得多(与 services/store_limits.resolve_node 同一条口径)。
+    """
+    rows = [_sheet_row(2, asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    seen = _wire_execute_env(monkeypatch, rows, products)
+    monkeypatch.setattr(ln.store_limits, "managed_nodes",
+                        lambda stores=None: ({}, {"T1": "填的 999 认不出"}))
+    out = ln.run({"execute": True})
+    assert seen["claim_wants"] == [] and seen["submitted"] == []
+    assert "整店跳过" in out and "不回落 Virtual Node" in out
+
+
 def test_missing_limits_table_is_logged_not_silent(monkeypatch, caplog):
     """⚠ 同一张限额表,本链与分配链的降级方向**相反**,所以降级必须留痕。
 
@@ -1345,3 +1476,48 @@ def test_missing_limits_table_is_logged_not_silent(monkeypatch, caplog):
         assert ln._load_quota() == {}
     # getMessage() 才是格式化后的整句(message 是模板,args 还没代入)
     assert any("所有店按不限量上架" in r.getMessage() for r in caplog.records)
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    """输入:monkeypatch → 输出:收 record_round 调用的列表。
+
+    盯 `record_round` 而不是 `record_round_safe`:后者把一切异常吞掉(那是
+    它的职责),用它当探针的话"根本没调"与"调了但炸了"分不开。
+    """
+    got: list = []
+    monkeypatch.setattr(ln.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_execute_records_one_round_event_per_store(monkeypatch):
+    """真跑:每店一条,detail 是这一轮的计数(不复制任何流水)。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1"),
+            _sheet_row(3, store="T1", asin="B0AAAAABAD"),   # 必填缺失(预备期)
+            _sheet_row(4, store="T2", asin="B0BBBBBOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    got = _capture_rounds(monkeypatch)
+    ln.run({"execute": True})
+    assert len(got) == 1
+    source, event, per_store = got[0]
+    assert (source, event) == ("list_new", ln.store_events.LIST_ROUND)
+    assert sorted(per_store) == ["T1", "T2"]
+    assert per_store["T1"]["submitted"] == 1
+    assert per_store["T1"]["invalid"] == 1      # 预备期拦下的按店记
+    assert per_store["T2"]["submitted"] == 1 and "invalid" not in per_store["T2"]
+    assert per_store["T1"]["failed"] == 0 and per_store["T1"]["unknown"] == 0
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    """★ 空跑一条都不许记:dry-run 什么都没提交,记了就是一整轮假流水。"""
+    rows = [_sheet_row(2, store="T1", asin="B0AAAAAOK1")]
+    products = {r["asin"]: {**_PRODUCT_OK, "asin": r["asin"]} for r in rows}
+    _wire_execute_env(monkeypatch, rows, products)
+    got = _capture_rounds(monkeypatch)
+    ln.run({"execute": False})
+    assert got == []

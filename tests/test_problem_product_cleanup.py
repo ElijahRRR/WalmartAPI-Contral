@@ -59,14 +59,15 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
 
 def test_run_buckets_rows_by_action(monkeypatch):
     """分桶件 2026-08-27 上移 services.dispositions —— 这里钉**接线**:
-    本工作流按 action × _ACTION_ORDER 分桶,三个动作各进各的桶。
+    本工作流按 action × _ACTION_ORDER 分桶,两个动作各进各的桶
+    (relist 2026-08-28 退役,见 test_legacy_relist_rows_blow_up_loudly)。
     (算法与「未知动作即抛」的单元用例在 tests/test_dispositions_router.py)"""
-    _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2", "relist"),
+    _wire(monkeypatch, [_row("T1", "S1"), _row("T1", "S2", "retire"),
                         _row("T2", "S3", "retire")], stores=("T1", "T2"))
     out = ppc.run({"execute": False})
-    assert "反补 1,删除 1,顽固停用 1" in out
-    assert "T1:反补 1,删除 1" in out
-    assert "T2:反补 0,删除 0,顽固停用 1" in out
+    assert "删除 1,顽固停用 2" in out
+    assert "T1:删除 1,顽固停用 1" in out
+    assert "T2:删除 0,顽固停用 1" in out
 
 
 def test_run_rejects_unknown_action(monkeypatch):
@@ -163,33 +164,18 @@ def test_second_round_retry_after_network_failure(monkeypatch):
     assert "二轮重试 1 店(串行):T1" in out and "二轮仍失败" not in out
 
 
-def test_relist_uses_detail_not_a_second_db_read(monkeypatch):
-    """反补条目的 gtin/upc 由建议行 detail 带过来,执行件不回头查库
-    ——否则"决策看到的数据"与"执行用的数据"分处两个时间点,会不一致。"""
-    seen = _wire(monkeypatch, [_row("T1", "S1", "relist", rid=3,
-                                    gtin="123456789012", upc="")])
-    sent = []
-    monkeypatch.setattr(ppc.feeds, "submit_feed",
-                        lambda store, ft, entries, *, workflow="": (
-                            sent.append((ft, list(entries))),
-                            [{"feed_id": "FR", "count": 1,
-                              "outcome": "submitted"}])[1])
-    ppc.run({"execute": True})
-    ft, entries = sent[0]
-    assert ft == "MP_MAINTENANCE"
-    assert entries[0]["Orderable"]["sku"] == "S1"
-    assert [e["event"] for e in seen["events"]] == ["maintenance_submitted"]
+def test_legacy_relist_rows_blow_up_loudly(monkeypatch):
+    """反补 2026-08-28 退役后的两道防线,钉死第二道:
 
-
-def test_relist_without_product_id_is_reported_not_silent(monkeypatch):
-    """建议行 detail 里没有 gtin/upc → 组不出条目。静默少发比什么都不做更坏:
-    那些行会一直挂 suggested,而摘要里看不出少了什么。"""
-    _wire(monkeypatch, [_row("T1", "S1", "relist", gtin="", upc="")])
-    monkeypatch.setattr(ppc.feeds, "submit_feed",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("组不出条目就不该提交")))
-    out = ppc.run({"execute": True})
-    assert "缺 gtin/upc 组不出条目" in out
+    ① claim 不再领 relist(dispositions.PROBLEM_ACTIONS 收窄,存量 suggested
+       由扫描件 withdraw_stale 撤);
+    ② 万一一条 relist 行绕过①漏进来(排查用 actions=None 全领之类),分桶件
+       按「未知动作即抛」宁炸不吞 —— 绝不能静默把它当维护 feed 发出去。"""
+    assert "relist" not in ppc._ACTION_FEED
+    assert ppc._ACTION_ORDER == ("retire", "delete")
+    _wire(monkeypatch, [_row("T1", "S1", "relist", rid=9)])
+    with pytest.raises(ValueError, match=r"未知 action='relist'.*id=9"):
+        ppc.run({"execute": False})
 
 
 def test_settle_runs_before_claim_and_is_reported(monkeypatch):
@@ -263,9 +249,11 @@ def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
 
     此前两条扫描件各按同一张限额表截一次 ⇒ 每店实际可删 2N。截断静默的话,
     摘要读起来就是"今天就这么多",而其实还压着一批。
+    (2026-08-28 起限额暂停,这里打回 False 测机械还在——同 cap 用例。)
     """
     rows = [_row("T1", f"S{i}", action="delete", rid=i) for i in range(5)]
     seen = _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "RETIRE_CAP_PAUSED", False)
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 2})
     sent = []
     monkeypatch.setattr(ppc.feeds, "submit_feed",
@@ -280,15 +268,15 @@ def test_per_store_cap_is_applied_once_here_and_is_visible(monkeypatch):
     assert seen["marked"] == [((0, 1), "F1")]
 
 
-def test_cap_does_not_touch_relist(monkeypatch):
-    """反补不烧下架配额:它是救活方向,不该被删除的刹车管住。"""
-    rows = ([_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
-            + [_row("T1", f"R{i}", action="relist", rid=10 + i, gtin="G",
-                    upc="U") for i in range(3)])
+def test_cap_caps_destructive_and_reports_leftover(monkeypatch):
+    """单店「下架限制」封顶破坏类(delete/retire),超额留到下轮且必须报出来
+    (静默截断读起来就是"全做完了")。
+    ⚠ 2026-08-28 起限额**暂停**(RETIRE_CAP_PAUSED=True),这里显式打回
+    False 测的是**机械还在**:停用不等于拆除,恢复只需改常量。"""
+    rows = [_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
     _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "RETIRE_CAP_PAUSED", False)
     monkeypatch.setattr(ppc, "_retire_caps", lambda: {"T1": 1})
-    monkeypatch.setattr(ppc.pp, "build_relist_item",
-                        lambda sku, gtin, upc: {"sku": sku})
     sent = []
     monkeypatch.setattr(ppc.feeds, "submit_feed",
                         lambda store, ft, entries, workflow="": (
@@ -296,8 +284,39 @@ def test_cap_does_not_touch_relist(monkeypatch):
                             [{"feed_id": "F1", "count": len(entries),
                               "outcome": "submitted"}])[1])
     out = ppc.run({"execute": True})
-    assert ("MP_MAINTENANCE", 3) in sent and ("DELETE_ITEM", 1) in sent
+    assert ("DELETE_ITEM", 1) in sent and len(sent) == 1
     assert "T1×2" in out
+
+
+def test_cap_pause_lets_everything_through_and_shouts(monkeypatch):
+    """限额暂停(所有者定稿 2026-08-28「暂时关闭这个限制」,08-28 档案清理波):
+
+    ① 钉住现状:开关就是 True(恢复时改回 False 并同步改这条——先例
+       title_mismatch 停闸,常量停闸、用例钉状态);
+    ② 不截断:限额表值再小也全量出闸,限额表与按日记账**根本不读**
+       (监-桩在这两处埋了雷,读了就炸);
+    ③ 摘要**首行**点名停用中——静默的闸没人记得它关着。
+    缺席避让 fail-closed 与在途防重不归这个开关管,各有用例。"""
+    assert ppc.RETIRE_CAP_PAUSED is True
+    rows = [_row("T1", f"D{i}", action="delete", rid=i) for i in range(3)]
+    _wire(monkeypatch, rows)
+    monkeypatch.setattr(ppc, "_retire_caps",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("停闸期间不该读限额表")))
+    monkeypatch.setattr(ppc.dispositions, "destructive_executed_today",
+                        lambda conn, hours=20: (_ for _ in ()).throw(
+                            AssertionError("停闸期间不该按日记账")))
+    sent = []
+    monkeypatch.setattr(ppc.feeds, "submit_feed",
+                        lambda store, ft, entries, workflow="": (
+                            sent.append((ft, len(entries))),
+                            [{"feed_id": "F1", "count": len(entries),
+                              "outcome": "submitted"}])[1])
+    out = ppc.run({"execute": True})
+    assert ("DELETE_ITEM", 3) in sent          # 3 条全出闸,没有截断
+    assert "留到下轮" not in out
+    first = out.splitlines()[0]
+    assert "「下架限制」停用中" in first and "RETIRE_CAP_PAUSED" in first
 
 
 # ── 维护记录表(2026-08-24:删除归口到本工作流之后必须接上)──────────────
@@ -404,3 +423,49 @@ def test_absence_probe_failure_stops_every_destructive_action(monkeypatch):
     assert "⚠ 缺席探测失败,本轮破坏动作全停(fail-closed)" in first
     assert "2 条建议留在 suggested 原地" in first
     assert seen["marked"] == [] and seen["events"] == [] and seen["sheet"] == []
+
+
+# ── 店铺事件账本(运营类:每店每轮一条)────────────────────────────────────
+
+def _capture_rounds(monkeypatch):
+    got: list = []
+    monkeypatch.setattr(ppc.store_events, "record_round",
+                        lambda conn, source, event, per_store:
+                        (got.append((source, event, dict(per_store))),
+                         len(per_store))[1])
+    return got
+
+
+def test_the_two_rounds_are_summed_into_one_event(monkeypatch):
+    """★ 二轮重试的店只记**一条**,两轮计数相加。
+
+    分两条记的话,账本上那家店看起来这一轮删了两遍 —— 而二轮重提的那批
+    第一轮其实已经发出去了(被在途防重挡回 dedup),不是又删了一次。
+    """
+    _wire(monkeypatch, [_row("T1", "S1", rid=7)])
+    calls = {"n": 0}
+
+    def flaky_then_dedup(store, ft, entries, *, workflow=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{"feed_id": None, "count": 1, "outcome": "failed",
+                     "retryable": True}]
+        return [{"feed_id": "F_OLD", "count": 1, "outcome": "dedup"}]
+
+    monkeypatch.setattr(ppc.feeds, "submit_feed", flaky_then_dedup)
+    got = _capture_rounds(monkeypatch)
+    ppc.run({"execute": True})
+    assert len(got) == 1
+    per_store = got[0][2]
+    assert list(per_store) == ["T1"]
+    assert per_store["T1"]["delete"] == {"submitted": 0, "dedup": 1,
+                                         "failed": 1, "unknown": 0}
+    assert per_store["T1"]["retried"] is True
+    assert got[0][1] == ppc.store_events.CLEANUP_ROUND
+
+
+def test_dry_run_records_no_round_event(monkeypatch):
+    _wire(monkeypatch, [_row("T1", "S1")])
+    got = _capture_rounds(monkeypatch)
+    ppc.run({"execute": False})
+    assert got == []

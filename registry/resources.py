@@ -93,6 +93,15 @@ def feishu_notify_to() -> str | None:
     return os.environ.get("FEISHU_NOTIFY_TO", "").strip() or None
 
 
+# 定制品判据键(所有者定稿 2026-08-28:「对于定制产品不上架,是否为定制产品
+# 可以从产品数据中拿到」)。值随采集载荷落库(products.slow / snapshots.raw),
+# 契约字段表未登记 —— rating/review_count 同款先例(allocation_plan §评分:
+# 契约没登记但采集侧确实随 raw 落库,探针实测后启用)。
+# 键名生产探针已核实(所有者实跑 2026-08-28):latest_snapshot.raw 带
+# `is_customized` 共 1,225,423 行,值形态 Yes/No(_is_custom 的小写 truthy
+# 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
+AMZ_CUSTOM_FLAG_KEY = "is_customized"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -107,6 +116,10 @@ FEED_SPEC_VERSIONS = {
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
+    # 分节点批量库存(多仓批次 2 启用)。⚠ **1.5 的 key 小写**
+    # (inventoryHeader/inventory)与 1.4 大写恰好相反 —— 两套模板不能共用,
+    # 混用的表现是整批 ERR_EXT_DATA_0503009 退回(1.4 小写时的同款错误码)
+    "MP_INVENTORY": "1.5",
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
     # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
     #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
@@ -144,6 +157,28 @@ WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
 # 审查。O 列写 CONTENT_REJECTED,list_new 不再自动领;文案人工改好后
 # 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
 WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
+
+# ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
+# 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
+# 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
+ERROR_TAXONOMY_VERSION = "t.2026-09-01.1"   # 码表/判据变更时手动递增
+ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
+    "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
+    "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
+    "PRICE": "价格规则", "GATED": "类目需预审批", "INFO": "信息缺失",
+    "EXPIRED": "过期下架", "STAGE": "未上线", "FLAGGED": "内部标记",
+    "RECALL": "安全召回", "SPECIAL": "特殊计划", "SYSTEM": "系统错误",
+    "OTHER": "未识别",
+}
+# 记录级主码序:终局优先,非中性永远压过中性(J 吃 42.9%、A 盖 641 条的病根按性质钉死)
+ERROR_CATEGORY_SEVERITY = (
+    "PROHIBITED_FINAL", "IP", "BRAND", "RECALL", "PT_WRONG", "POLICY",
+    "GATED", "FLAGGED", "CONTENT", "PRICE", "SPECIAL", "INFO",
+    "SYSTEM", "OTHER", "STAGE", "EXPIRED",
+)
+# feed 报错的政策族锚:field 稳定、error_code 一次性(生产实证:Offensive 171 次
+# 散在 35 个互不相同的码上)。QARTH/OFFER/sku 等多义 field 不入此集合。
+WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,7 +467,10 @@ _KPI_BOARD_COLUMNS = (
     "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
     "refund_amount", "closing_balance", "reserve_to_date", "payout",
     "payout_date", "payment_processor", "settle_cycle", "no_hold",
-    "prev_payout")
+    # 末列 2026-08-31 由 prev_payout(上期回款)换成 total_payout(累计回款,
+    # 所有者:「我需要累计回款,就沃尔玛总共已经付给我的钱」)。旧列在 PG 里
+    # 保留不删(历史行的值仍是当时的真实观测),只是不再投影到看板
+    "total_payout")
 
 KPI_BOARD_OVERVIEW = Spreadsheet(
     name="KPI看板-总览",
@@ -882,6 +920,16 @@ BRAND_BAN_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# TRO 品牌的判据(2026-08-30 建,product_audit 的 TRO 命中接线用)。
+# 上面这张总表的「来源」列是**自由文本**,由所有者手填、risk_sync 原样镜像进
+# catalog.brand_blacklist.source。生产实证取值三种:「TRO品牌」(22,527 行)/
+# 「TRO」/「tro」——所以判据是 `source.strip().lower().startswith(前缀)`,
+# 前缀匹配三种全中,且没有别的来源词以 tro 开头,零误伤。
+# ⚠ 常量登记在此、判定写在 services(services/audit_store.tro_hits 收前缀参数):
+# registry 只登记外部资源的取值口径,不替业务判。改这个前缀 = 改「谁算 TRO」,
+# 改之前先看 product_audit 日志里那行「R4 品牌来源:TRO 前缀 N 词」还非不非零。
+TRO_BRAND_SOURCE_PREFIX = "tro"
+
 
 # UPC 池(L2a,所有者建表 2026-08-07,6 列 A~F):PG(catalog.upc_pool)权威,
 # 此表 = 运营注入口 + 投影。运营填 A=UPC B=放入日期;脚本填 C=状态
@@ -977,6 +1025,14 @@ RETIRE_LIMITS = Bitable(
         #   分配侧拒收(宁可不分也不错分),上架/维护侧放行
         #   (不拿"未知"当"超限"去删/清零)。方向不同是因为动作不同。
         lead_limit="配送时长限制",
+        # 受管发货节点(所有者建列 2026-08-24,多仓改造)。填 Seller Center →
+        # Shipping Profile → Seller Fulfillment 里的 **FC ID**(即官方 shipNode,
+        # 17-18 位数字)。**留空 = 该店走 Virtual Node**,行为与改造前逐字节一致。
+        # 谁在读:上架(list_new 的 fulfillmentCenterID)、维护(库存读写的节点)。
+        # ⚠ 填错不回落:认不出的 FC ID 会让该店**整店跳过并告警**——静默回落
+        # Virtual Node 等于把新仓的货写到旧节点,比不动更坏(见
+        # docs/multi_node_plan.md §3)。
+        maint_node="维护仓库",
     ),
 )
 

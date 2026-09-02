@@ -1,5 +1,18 @@
 ## 横切|批次 0a/0b/1/2/3 共用(DDL + docs 同步 + 守门测试总表 + registry 登记 + 调度 + 测试策略 + 依赖图 + 验收模板 + 回滚)
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 > ⚠ 本包为**未经修订的初稿**(修订代理输出超长失败)。执行前先按附录 A 中点名本包的 findings 修订。
 
 **目标**:把 SKU 改造里「不属于任何单条业务链、但每条链都依赖」的那一层做实并冻结:登记簿三列与两个索引的幂等 DDL(含存量脏数据下不炸 db_init 的写法)、六份文档的同步点(db_schema / feishu_tables / api_blueprint §retire 语义更正 / conventions 新增 §九 / CLAUDE.md / README)与 skills 生成物、一张守门测试总表(extract_asin 调用点 / ASIN 形态正则 / `= w.sku` 硬等号 / `abandoned_at IS NULL` 三处 / abandon 调用点 / 不透明码正则两处一致 / 飞书字段常量)、registry 新常量与字段登记清单、调度不新增任务与 sources_backfill 报警语义变更、测试策略、批次依赖图与合并顺序、每批 PR 验收模板、逐批回滚方案。

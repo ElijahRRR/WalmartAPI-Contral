@@ -1,5 +1,18 @@
 ## 批次 2|写侧切换(唯一有行为变化的批次):list_new / match_listing 预备期 mint 不透明码 + 四个弃码点接 sku_codec.abandon + 退役冷却与代际上限两道新闸 + 试点上限闸 + 守门反向钉死
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 **目标**:把「SKU = ASIN」这条隐含约定从写侧彻底摘掉:上架提交的 sku 从此是 registry 定值来源字母 + 11 位不透明随机码,身份唯一出处 catalog.listing_sources,码在 list_new 预备期 _prep_rows 抽、提交前已 commit、复用到显式弃码为止;弃码只在四个点发生且只有 sku_codec.abandon 一个实现;list_new 增加「退役冷却中」「换码次数达上限,待人工」两道闸把「弃码→新码→再弃码」的烧号烧配额循环堵死,并新增 limit 参数让「一店一品 → 10 个 → 全店」的试点节奏成为代码闸而不是口头纪律。批次 0/1 已把读侧全部收口(登记簿反查 + 上架表 V 列),本批是那些收口第一次真正被用到的一批 —— 验收重点不是「新码发出去了」,而是「新码发出去之后,维护链 / 订单链 / 回执自愈链一个都没瞎」。本次修订相对原稿的五处实质变化:(1) 弃码点 3 所在的 listing_sheet.sync_from_ledger 走的是 feed_poll 反哺链,而 feed_poll 现在完全不认 --dry-run(DANGEROUS=False ⇒ cli.py:307 恒 execute=True,run() 也不读 params["dry_run"]),把不可逆的 abandon 放进去等于 `cli.py feed_poll --dry-run` 会真弃码真烧号 —— 新增 B2-29 把 execute 贯通五个反哺器;(2) 新增 B2-30 给 list_new 加 limit,原稿把试点节奏写在验收命令的括号里而 `-p limit=` 是个不存在的功能;(3) 守门测试合并进全项目唯一一份 tests/test_sku_guard.py(0a 建),本批只增删白名单,不再新建第四个守门文件;(4) match_listing 的 mint 事务不再包住逐行的沃尔玛 _precheck 调用;(5) alloc_survey._SQL_ONLINE 显式不改并写明理由,把原稿 change 正文与 decisions C 自相矛盾的地方拍平。
 
 **零行为变化**:否

@@ -1,5 +1,18 @@
 ## 批次 0a|身份积木 + 维护/审核/分配侧 SQL 收口(零行为变化)【第 2 版,已按四位审查者意见修订;行号 2026-09-02 逐条重开文件核对】
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 **目标**:建立 SKU 身份三块积木(services/sku_codec.py 为编码规则唯一之家 / services/sku_asin.pick_asin+resolve+resolve_many / registry 只登记 SKU_SOURCE_LETTERS)、登记簿弃码三列 + 三条**本批一次建到位、后续批次不许重建**的索引、upc_pool 两个烧号状态值;并把维护链、审核候选、冲突视图、风险追溯、采集推送、实证 PT、分配三件、上架去重/重试/变体组这 15 处「拿 SKU 当 ASIN 用」的读侧口径统一收口到唯一身份表达式:SQL 侧 coalesce(ls.source_key, w.sku)(ls = source_type='amz' 的 LEFT JOIN),Python 侧 sku_asin.pick_asin(source_key, sku)。同批修掉 schema.sql 存量回填正则缺右锚这一处**会在 db_init 当场制造 source_key≠sku 行**的双轨(审查者三 F1),并建**全套 SKU 改造唯一的一份守门文件** tests/test_sku_guard.py。mint/abandon 本批只建不接线(接线在批次 2),abandoned_at / replaced_by 全库为 NULL,故新加谓词天然恒真。
 
 **零行为变化**:是

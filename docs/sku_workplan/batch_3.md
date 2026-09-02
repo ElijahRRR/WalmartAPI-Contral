@@ -1,5 +1,18 @@
 ## 批次 3|存量改码(SkuUpdate 三态状态机 + 新工作流 workflows/sku_migrate.py,DANGEROUS=True)
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 **目标**:把存量在架商品的沃尔玛 SKU(裸 ASIN / 三段式)迁到批次 2 的 12 位不透明码:提交前先落库并 **commit**(新码行 replaces + 旧行 replaced_by = pending)→ 发 SkuUpdate feed → 回执成功不定案 → catalog_sync 观测到「新码在架且旧码缺席」才 confirmed(旧行 abandon('sku_update'),不烧 UPC)→ 观测反证或回执失败则 rolled_back(新码 abandon('sku_update_failed'),旧行 replaced_by 清空)→ 判不准超期落 stalled 点名人工。同批把在途期与改码后的静默塌陷全部堵住:缺席事件/问题商品建议对 replaced_by 旧行免疫、新码不被记成 item_appeared、顽固/归类/WFS/在途防重四段代际经 catalog.sku_aliases 沿 replaces 链继承、分配链销量归属跟着继承、upc_pool.sku 与上架表 V 列跟着改(带 sheet_synced_at 补写)、订单侧「同 (store,po_id,line_number) 多 order_line_id」有唯一一处体检视图。节奏(1→10→一店→全店)由 _stage_cap 硬闸承载而不是纪律。目标是**止血**:改码只让切换后的记录干净,收不回沃尔玛已掌握的旧 SKU=ASIN 关联(SkuUpdate feed 本身就是显式映射)。
 
 **零行为变化**:否

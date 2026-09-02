@@ -64,24 +64,29 @@ UPC 烧配额)、黑名单键被灌随机码(违禁品拦不住)、订单审核�
   代价:加列 ⇒ 行指纹全变 ⇒ 下一次 push 把 90 天窗口全量重推一遍,预告不是
   故障。
 
-**问 4|上架表要加 SKU 列。** → 对,加在 **V 列(U 之后)**,提交时与 K/L/M
-同一次写回;回执反哺、Unknown 自愈、SKU_LOCKED 退役从此读 V 列(V 为空的
-存量行回落 B 列 ASIN)。加在末尾是硬要求:`listing_sheet` 里所有写入 range
-都是字母硬编码的连续段(`C{r}`、`H{r}:N{r}`、`K{r}:Q{r}`……),插在中间全体
-错位。同理:在线产品总表加「来源码」列、UPC 池表 E 列「SKU」改存真 SKU
-(现在存的是 ASIN)、退役表 B 列运营手填 SKU 从此要先查登记簿(§8 决定)。
+**问 4|上架表要加 SKU 列。** → 对。**所有者 2026-09-02 已建在 R 列**(原 R~U
+「真实标题 / 真实PT / 真实UPC / UPC是否一致」四列顺延为 S~V;这四列全仓没有任何
+代码读写,只是 columns 元组里的占位,所以插在 R 不会错位——`listing_sheet` 的
+写入 range `C{r}` / `H{r}:N{r}` / `K{r}:Q{r}` / `A{r}:B{r}` / `F{r}` 全在 R 之前)。
+`columns` 元组在 `feed_check_date` 之后插入 `sku`(第 18 位),`_COLS` 改 22
+(读 A~V),新增只写 `R{r}` 的函数;提交时与 K/L/M 同一次写回;回执反哺、
+Unknown 自愈、SKU_LOCKED 退役从此读 R 列(R 为空的存量行回落 B 列 ASIN)。
+同理:在线产品总表 **Q 列「来源码」**、销售/售后订单表**「来源码」**(所有者已
+建,统一用这个名,不叫 ASIN)、UPC 池表 E 列「SKU」改存真 SKU(现在存的是
+ASIN)、退役表 B 列运营手填 SKU 从此要先查登记簿(§8 决定)。
 
 ## 2. 编码规则(2026-09-02 定稿,未变)
 
 ```
 <来源字母><11 位随机码>      共 12 位,无分隔符
-NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
+AK7QM2X9RT4W                 A = amz(映射只在 registry)
 ```
 
-- **来源字母**(第 1 位):registry 常量表 `SKU_SOURCE_LETTERS`
-  `{amz, match, 1688, self}` 四个字母由所有者定(§8),互不相同、来自下面的
-  字母表、**不助记**(不用 A=amz)。工作流按自己的 `source_type` 查表,没人
-  手填。不用分隔符:`N-K7QM…` 会把"前面有个分类段"写在脸上。
+- **来源字母**(第 1 位):registry 常量表 `SKU_SOURCE_LETTERS`,**所有者定稿
+  2026-09-02**:`{"amz": "A", "match": "B", "1688": "C", "self": "H"}`。工作流按
+  自己的 `source_type` 查表,没人手填。不用分隔符:`A-K7QM…` 会把"前面有个分类
+  段"写在脸上。注:跟卖码以 B 开头、12 位,与 ASIN 的 `B0` + 10 位形态不冲突
+  (`extract_asin` / `sources_backfill` 的正则都锚定 10 位)。
 - **随机码**(后 11 位):`secrets.choice`(操作系统密码学随机源)从字母表
   `23456789ABCDEFGHJKMNPQRSTVWXYZ`(30 符号,剔除 0/O、1/I/L、U)逐位独立抽
   11 次。不含时间戳/序号/机器号,没有任何可被学习的生成规律。
@@ -156,10 +161,10 @@ NK7QM2X9RT4W                 N = 某来源(映射只在 registry)
 
 | 表 | 现状 | 要做的 |
 |---|---|---|
-| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **加 V 列「SKU」**,`columns` 末尾追加、`_COLS` 改 22、新增只写 `V{r}` 的函数;提交时回写 |
-| 订单中心-销售订单 `ORDER_SALES` | 有「SKU」无 ASIN | **加「ASIN」**:registry 常量 + `_SALES_SQL` + 投影 + 测试夹具 |
-| 订单中心-售后订单 `ORDER_RETURNS` | 有「SKU」无 ASIN;`return_lines` 表无 asin 列 | 加「ASIN」,SQL 已 LEFT JOIN order_lines,顺手 `SELECT l.asin` |
-| 在线产品总表 `ONLINE_PRODUCTS_SHEET` | 有 sku 无来源码 | 加「来源码」(登记簿 JOIN),反向可对 |
+| 上架表 `LISTING_SHEET`(21 列 A~U) | 无 SKU 列;B 列 ASIN 兼作 SKU 全链对账 | **R 列「SKU」已建**(原 R~U 顺延 S~V,无代码读写):`columns` 第 18 位插 `sku`、`_COLS` 改 22、新增只写 `R{r}` 的函数;提交时回写 |
+| 订单中心-销售订单 `ORDER_SALES` | 有「SKU」无来源码 | **「来源码」已建**:registry 常量(值 `order_lines.asin`)+ `_SALES_SQL` + 投影 + 测试夹具 |
+| 订单中心-售后订单 `ORDER_RETURNS` | 有「SKU」无来源码;`return_lines` 表无 asin 列 | **「来源码」已建**,SQL 已 LEFT JOIN order_lines,顺手 `SELECT l.asin` |
+| 在线产品总表 `ONLINE_PRODUCTS_SHEET` | 有 sku 无来源码 | **Q 列「来源码」已建**(第 17 列,登记簿 JOIN `source_key`),反向可对 |
 | UPC 池表 `UPC_SHEET` E 列「SKU」 | 实存 ASIN | 定口径:E 列存真 SKU,ASIN 另列或不投影(§8) |
 | 退役表 `RETIRE_SHEET` B 列 | 运营手填 SKU | 手动通道全格式通吃不用改;但运营从"贴 ASIN"变"先查登记簿",建议读表后回显来源码 |
 | 维护记录表 `MAINT_SHEET` | 逐 SKU | 不改;建议加来源码展示列 |
@@ -464,12 +469,10 @@ order_line_id"的体检告警兜住。
       最小载荷;改码后库存/价格/item_id 是否保留;旧串能否复用。
 - [ ] **跟卖存量**(`PHUMWMT+日期+序号`,不含 ASIN)是否也迁。
 - [ ] **沃尔玛 SKU 规格**:本地 spec Orderable.sku 的长度上限、字符集。
-- [ ] **飞书建列**(所有者建,我登记常量):上架表 V「SKU」;销售订单「ASIN」;
-      售后订单「ASIN」;在线产品总表「来源码」。建之前用 `list_fields` 确认
-      表里没有同名人工列(有的话程序一登记就开始覆盖它)。
+- [x] **飞书建列**(所有者 2026-09-02 已建):上架表 R「SKU」;销售订单「来源码」;
+      售后订单「来源码」;在线产品总表 Q「来源码」。统一叫「来源码」。
 - [ ] **UPC 池表 E 列「SKU」口径**:改存真 SKU(ASIN 另列)还是保持现状。
-- [ ] **四个来源字母**取值(amz / 跟卖 / 1688 / 自建),从
-      `23456789ABCDEFGHJKMNPQRSTVWXYZ` 里挑、互不相同、建议不助记。
+- [x] **四个来源字母**(所有者 2026-09-02):amz=A、跟卖 match=B、1688=C、自建 self=H。
 - [ ] **黑名单 `or sku` 兜底口径**:订单链是"提不出留 NULL",黑名单链是"原文
       兜底"。切换后原文兜底 = 往黑名单灌随机码;建议统一到"登记簿查不到就
       不入选",但这会改变拦截行为,要你拍板。

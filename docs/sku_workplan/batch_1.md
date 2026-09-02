@@ -1,5 +1,18 @@
 ## 批次 1|上架表 V 列「SKU」+ 回执/自愈链读 V 列 + UPC 池口径(修订版 2026-09-02,已吸收四位审查者意见并逐条回仓核对行号)
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 **目标**:给上架表加末列 V「SKU」,并把「这一行的 SKU 是什么」收口成唯一函数 services/listing_sheet.row_sku(V 列;空则回落 B 列 ASIN),让回执反哺器(sync_from_ledger)、Unknown 自愈器(heal_unknown)、SKU_LOCKED 自愈链(sku_locked_heal 的五个键)、UPC 池 mark_used 从「上架 sku=asin 约定」切到「读行上的 SKU」;同时把 UPC 撞库反查从 upc_pool.sku(批次 2 起将存真码)改成领号键 (store, asin),并顺带修掉它的跨店误烧号与 missing 计数可为负两个既有缺陷。本批只加能力不写 V:list_new 仍传八值 ⇒ V 全表为空 ⇒ 全链回落 B 列 ⇒ 除一处有意的修复外行为不变。批次 2 的 mint 只需改 row_sku 一行 + 给 write_submit_cols 传第 9 值即可通电。
 
 **零行为变化**:否

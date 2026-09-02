@@ -1,5 +1,18 @@
 ## 0b|订单/事件/黑名单/审核侧收口 + 飞书 ASIN 列(零行为变化,一处例外)
 
+> ## ⚠ 所有者定稿覆盖(2026-09-02,优先级高于下文任何 item)
+> 1. **上架表 SKU 列在 R 列,不是 V**:所有者已建 R「SKU」,原 R~U(real_title /
+>    real_pt / real_upc / upc_match,全仓无代码读写)顺延为 S~V。`LISTING_SHEET.columns`
+>    在 `feed_check_date` 之后**插入** `sku`(第 18 位,不是末尾追加);`_COLS` 仍改 22
+>    (读 A~V);写函数只写 `R{r}`;所有 item 文本里的 `V{r}` / 「V 列」一律读作 `R{r}` /
+>    「R 列」;acceptance 里 `A1:V1` 表头核验保留(应看到第 18 格 = SKU)。
+> 2. **飞书列名统一叫「来源码」**:销售订单表、售后订单表新增字段是「来源码」(不是
+>    「ASIN」),值仍取 `order_lines.asin`;在线产品总表「来源码」在 **Q 列**(第 17 列),
+>    元组元素名 `source_key`。四列所有者均已建好,飞书列接线 PR 不再等建列。
+> 3. **来源字母定稿**:`SKU_SOURCE_LETTERS = {"amz": "A", "match": "B", "1688": "C", "self": "H"}`,
+>    批次 0a 落 registry 时直接填值,不再留空。
+>
+
 **目标**:把「从 SKU 认 ASIN」这件事在订单链、事件账本、黑名单链(含**回填/重建**那条,原工作包漏列)、审核判定链、两条清洗工作流、sources_backfill 七处全部改成「登记簿 catalog.listing_sources 优先、形态提取只作存量兜底」;并把飞书 ORDER_SALES / ORDER_RETURNS 加「ASIN」列、ONLINE_PRODUCTS_SHEET 加 source_key 列(拆成第二个 PR,在所有者建完列之后再合)。存量数据(sku=asin / 三段式 / 纯数字 / PHUMWMT)走的路必须与今天逐字节相同;切到 12 位不透明码后这七处仍然认得出产品。本批次不产生任何 DDL、不新增任何形态判据常量(不透明码字母表唯一之家是批次 0a 的 services/sku_codec),唯一的判定口径变化见 decision D-0b-2。
 
 **零行为变化**:否

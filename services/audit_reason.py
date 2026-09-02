@@ -30,11 +30,15 @@
 这是什么意思」。判拒而没有类别只可能是代码 bug(某条硬拒规则忘了自报),
 落 NULL + 计数 + warning,让它自己现形。
 
-⚠ **已知缺口(B1 → C 批之间)**:`cat_requires_cert_hard`(R3 硬拒)与
-`made_in_usa_claim`(R10)这两条硬拒规则**不在** §二 的自报表里 —— C 批一条
-降为证据、一条迁进 L0 带 `Product claims`。在 C 合并之前,它们拒掉的产品会走
-第 3 步:类别 NULL + `reason_missing` 计数。这是**有意的**(规格 §一:B、C 只
-切换一次,生产机等 C 合并后再 pull),不是漏改;C 批合并后这个计数应回到 0。
+⚠ **已知缺口(三条硬拒规则还没自报类别)**:
+  · `cat_requires_cert_hard`(L2 R3 硬拒)—— C 批降为证据;
+  · `made_in_usa_claim`(L2 R10)—— C 批迁进 L0 并带 `Product claims`;
+  · `l4_vision_violation`(L4 视觉,penalty -100)—— **§二 的类别表没有它**:
+    "图上有什么"映到哪条政策要所有者裁决,**不许在这里替它编一个**
+    (L4 默认关 `-p l4=on` 才跑,面很小)。
+在这三条被处理之前,它们拒掉的产品走第 3 步:类别 NULL + `reason_missing`
+计数。这是**有意的**(规格 §一:B、C 只切换一次,生产机等 C 合并后再 pull),
+不是漏改;验收信号 = **C 批合并后、L4 关闭时该计数应回到 0**。
 """
 
 from __future__ import annotations
@@ -152,8 +156,14 @@ _RULE_CN = {
     "l4_images_partial":              "图片没取全",
     "l4_bad_schema":                  "视觉层返回坏 JSON",
 }
-# 这几条不是"被拒的原因",只是过程留痕。它们单独出现时不该当理由显示
-_NOT_A_REASON = {"pt_dict_fallback", "l4_images_partial", "l4_bad_schema"}
+#: 这几条不是"被拒的原因",只是**过程留痕**:记的是我们自己链路里发生了什么
+#: (类目靠字典回落、映射表曾标注无对应 PT、图没取全、视觉层返回坏 JSON),
+#: 与产品违不违规无关。两个消费方共用这一张表,别各列各的:
+#:   · `explain_hits` —— 单独出现时不当理由显示;
+#:   · `audit_l3.summarize_evidence` —— 不送进 L3 的「上游证据」段
+#:     (送了只会诱导 LLM 拿"内部没把类目定准"当拒绝理由)。
+NOT_A_REASON = frozenset({"pt_dict_fallback", "unmapped_amazon_path",
+                          "l4_images_partial", "l4_bad_schema"})
 
 #: `explain_hit` 找"命中的是哪一个值"时按序试的键(照着各规则**真实写进
 #: detail 的那些**取,不能想当然:首版只认 brand/category/keyword/matched 四个,
@@ -197,9 +207,9 @@ def explain_hits(hits: list[tuple[str, dict]]) -> str:
     一条规则都没有(理论上不该发生)时明说"未记录命中规则",别给空白 ——
     空白让人以为"没写进来",而事实是"没有命中记录"。
     """
-    said = [explain_hit(c, d) for c, d in hits if c not in _NOT_A_REASON]
+    said = [explain_hit(c, d) for c, d in hits if c not in NOT_A_REASON]
     return ";".join(said[:3]) if said else "未记录命中规则"
 
 
-__all__ = ["CATEGORY_KEY", "STATS", "bump", "reset_stats",
+__all__ = ["CATEGORY_KEY", "NOT_A_REASON", "STATS", "bump", "reset_stats",
            "compute_final_reason", "explain_hit", "explain_hits"]

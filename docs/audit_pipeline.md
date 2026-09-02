@@ -360,9 +360,13 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 - **喂入版渲染件不落库**:库里存官方原文,喂 LLM 的版本渲染时派生(清洗只有
   一条路径,`docs/policy_sync.md` §十.3);剥掉链接 / 页内导览 / 免责声明 /
   页面 chrome,单行数据表转成「列名 + 条目清单」。
-- **没有全文的行整条跳过并计数**(`STATS["policy_no_full_text"]`,进 run 摘要):
+- **没有全文的行整条跳过并记账**(`audit_l3.missing_full_text()`,进 run 摘要):
   只剩一个 `## 标题` 的空壳等于没给判据,却会让 LLM 以为"这一类我看过了"。
   它仍在 S2 候选里 —— 那正是要人去补 `full_policy` 的信号。
+  ⚠ 记的是**构建期状态**不是每轮计数:提示词一个进程只构造一次,而
+  `reset_stats()` 每轮开头调 —— 放进 STATS 的净效果是"第一轮报了、后面每轮
+  都报 0",而缺失一直都在。构建本身在 `_PROMPT_LOCK` 下做(并发 128 起跑时
+  不加锁就是每个线程各渲染一遍 44 篇全文)。
 - **篇数按真正渲染出来的段数填**,不是政策表行数,也不能数 `## ` ——
   官方正文自己带 `## Overview` 一类小标题(实测 251 个),数出来的是假数。
 - 体量:S1+S3 约 2.6K 字符,S4 约 21 万字符 ⇒ 整段 system prompt ≈ 6 万 token。
@@ -409,6 +413,7 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 | `walmart_strict_sensitive`(R8) | subtypes + 命中短语 |
 | `phase0_brand_mention`(C 批迁入 L0) | 前 10 个命中品牌 + 原文片段 |
 | **未登记的任何 rule_code** | `* {rule_code}: {detail 摘要}` —— **不丢** |
+| `audit_reason.NOT_A_REASON` 里的(`pt_dict_fallback` / `unmapped_amazon_path` / `l4_images_partial` / `l4_bad_schema`) | **不送** —— 见下 |
 
 通道按 rule_code 查表,与证据出自哪一层无关 —— C 批把品牌文案扫描迁进 L0
 时,判定链一个字都不用改。品牌词清单(≤10)出自同一通道。
@@ -416,6 +421,12 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 > ⚠ 这条通道的合同是"上游软证据一条不丢"。漏掉一条不会报错,只会让 L3 少看
 > 一样东西 —— R7/R8 曾经整整两个月一个字都没进提示词,而 L2 的 detail 里
 > 写着"L3 LLM 需判断宣称词是否有事实依据"。承诺了没送到,比不承诺更糟。
+
+> ⚠ **过程留痕不是证据**(2026-09-02 复核补):`pt_dict_fallback`(类目靠
+> 字典回落)、`unmapped_amazon_path`(映射表曾标注无对应 PT)记的是**我们
+> 自己链路里发生了什么**,与产品违不违规无关 —— 送进去等于请 LLM 拿"内部
+> 没把类目定准"当拒绝理由。判据唯一出处是 `services/audit_reason.NOT_A_REASON`
+> (人话渲染那边用的是同一张表),别在通道里另列一份。
 
 ### 5.4 输出三段与解析
 
@@ -522,11 +533,17 @@ pass → 类别 NULL;pending → 类别 NULL(待定原因写在**具体内容**�
 `General-Use Products` 出来(所有者 2026-08-16:「理由是 General-Use
 Products,这是什么意思」)。
 
-> ⚠ **已知缺口(B1 → C 批之间)**:`cat_requires_cert_hard`(R3 硬拒)与
-> `made_in_usa_claim`(R10)这两条硬拒规则还没有自报类别 —— C 批一条降为
-> 证据、一条迁进 L0 并带 `Product claims`。在 C 合并之前,它们拒掉的产品走
-> 第 3 步:类别 NULL + 计数。**这是有意的**(§10:B、C 只切换一次,生产机等
-> C 合并后再 pull),C 批合并后这个计数应回到 0。
+> ⚠ **已知缺口:三条硬拒规则还没自报类别**
+>
+> | 规则 | 现状 | 去向 |
+> |---|---|---|
+> | `cat_requires_cert_hard`(L2 R3 硬拒) | 拒了但没类别 | C 批降为证据(本 PT requirements 进 L3) |
+> | `made_in_usa_claim`(L2 R10) | 同上 | C 批迁进 L0,带 `Product claims` |
+> | `l4_vision_violation`(L4 视觉,-100) | 同上 | **§二 的类别表没有它**:"图上有什么"映到哪条政策要所有者裁决,**不许替它编一个**;L4 默认关(`-p l4=on` 才跑),面很小 |
+>
+> 在这三条被处理之前,它们拒掉的产品走第 3 步:类别 NULL + `reason_missing`
+> 计数。**这是有意的**(§10:B、C 只切换一次,生产机等 C 合并后再 pull),
+> 验收信号 = **C 批合并后、L4 关闭时该计数应回到 0**。
 
 2026-09-02 B1 **删掉**的九步推断(别照着旧文档写回来):步 1/1.5 读
 `walmart_policy`、步 1.2 内部黑名单特判、步 2 的 `_normalize_l3_cat` 归一化
@@ -537,8 +554,12 @@ Products,这是什么意思」)。
 ### 7.4 具体内容怎么来(`audit_store.conclusion_detail`)
 
 - reject + L3 判的 → `l3.detail`(LLM 给的中文一句:原文片段 + 条款要点);
+  **LLM 没给(或只回了空白)时** → `违反「<类别>」(LLM 未引用原文片段)`;
 - reject + 规则判的 → **判死那条 hit** 的 `explain_hit`(它本来就是"具体内容"
   形态,如 `商标符号(命中:XYZ®)`);
+- ⚠ **判拒这一格永远不留空**:留空的后果不是"少一格" —— 飞书 H 列会走老行
+  兜底渲染,把 `llm_alcohol` 这种规则码原样打给运营看(`_RULE_CN` 里没有
+  `llm_*` 条目,也不该有:它是随政策名生成的);
 - pending → 三句固定句之一(按停在哪一层分,重试口径不同:L1 类目解不出
   隔天重试有意义 / L2 要等 `walmart_pt_meta` 补行,重刷无用 / L3 LLM 故障
   重试有意义);
@@ -674,6 +695,10 @@ L3 那一行 **B1 已落地**(§5);L0 的双输出与 L2 的瘦身留给 C 批�
   (`audit_hits` 可落多行;`stage_stopped_at` 语义不变,只有硬拒才停);
   R4/R10 迁入 L0、L2 只剩 R1、删 R3 硬拒 / R5 / R7 / R8 与
   `POLICY_LEGACY_NAMES` / `to_official` / `POLICY_ALIASES`;
+- ⬜ **类别缺口三条**(§7.3):`cat_requires_cert_hard` / `made_in_usa_claim`
+  随 C 批消化;`l4_vision_violation` 的类别**等所有者裁决**("图上有什么"
+  映到哪条政策),在那之前 L4 判拒一律类别 NULL + 计数。验收信号:
+  **C 批合并后、L4 关闭时 `reason_missing` 应回到 0**;
 - 存量 `audit_hits` 的 rule_code(`title_desc_blacklist` / `cat_requires_cert_*` / `content_promotional`
   / `walmart_strict_sensitive` …)保留兼容渲染,新链不再产生;
 - **顺序:先换喂(L3 读英文全文 + Content Standards),后删 R7/R8**;`AUDIT_RULES_VERSION` 同批递增;

@@ -140,8 +140,9 @@ def test_S4_喂的是44篇官方英文全文而不是中文人工列():
     判据句子要真的在里面(抽三条互不相干的验)。
     """
     rows = _official_rows()
-    parts = audit_l3.policy_parts(rows)
+    parts, missing = audit_l3.policy_parts(rows)
     block = audit_l3.format_policy_block(rows)
+    assert missing == []                          # 44 篇全有原文
     assert len(_OFFICIAL_NAMES) == 44
     for name in _OFFICIAL_NAMES:
         assert f"## {name}\n" in block, name
@@ -173,7 +174,7 @@ def test_S4_剥掉URL并按id序拼接():
     """喂入版由 policy_feed 渲染:URL 一条不留(对判定零贡献、徒耗 token),
     顺序 = 入参顺序(SQL 是 ORDER BY id)—— 顺序即前缀缓存命中率。"""
     rows = _official_rows()
-    parts = audit_l3.policy_parts(rows)
+    parts, _ = audit_l3.policy_parts(rows)
     block = audit_l3.format_policy_block(rows)
     assert "https://" not in block and "http://" not in block
     # 每段的**首行**就是这一篇的类别名(篇内小标题不算)
@@ -181,7 +182,7 @@ def test_S4_剥掉URL并按id序拼接():
         [f"## {r['category_en']}" for r in rows]
     # 打乱入参 ⇒ 输出跟着乱(证明这里不自作主张排序,顺序由 SQL 保证)
     shuffled = list(reversed(rows))
-    assert [p.split("\n", 1)[0] for p in audit_l3.policy_parts(shuffled)] == \
+    assert [p.split("\n", 1)[0] for p in audit_l3.policy_parts(shuffled)[0]] == \
         [f"## {r['category_en']}" for r in shuffled]
 
 
@@ -194,23 +195,61 @@ def test_S4_同一轮内逐字节稳定():
         audit_l3.build_system_prompt(cats, rows)
 
 
-def test_S4_没有全文的行整条跳过并计数(caplog):
+def test_S4_没有全文的行整条跳过并记进构建期状态(caplog):
     """空壳标题给 LLM 等于没给,却会让它以为"这一类我看过了"。
 
-    ⚠ 兜底三要件:跳过 = 判据变窄,**必须记日志计数**(同名一轮只警告一次,
-    计数逐次累加,进 run 摘要)。
+    ⚠ **这件事记在构建期状态里,不记在每轮清零的 STATS 里**(2026-09-02 复核):
+    提示词一个进程只构造一次,而 `reset_stats()` 每轮开头调 —— 记在 STATS 里
+    的净效果是"第一轮报了、后面每一轮都报 0",而缺失一直都在。
     """
     rows = [{"id": 1, "category_en": "Alcohol", "full_policy": "Prohibited: x"},
             {"id": 2, "category_en": "Animals", "full_policy": None},
             {"id": 3, "category_en": "Art", "full_policy": "   \n\n"}]
     with caplog.at_level("WARNING", logger="services.audit_l3"):
         block = audit_l3.format_policy_block(rows)
-        audit_l3.format_policy_block(rows)          # 再来一轮:计数累加
     assert "## Alcohol" in block
     assert "Animals" not in block and "Art" not in block
-    assert audit_l3.STATS["policy_no_full_text"] == 4
-    assert audit_l3.policies_without_full_text() == ["Animals", "Art"]
     assert len([r for r in caplog.records if "Animals" in r.getMessage()]) == 1
+    # 构建才记账(纯渲染函数不写模块状态)
+    audit_l3.build_system_prompt(["Alcohol"], rows)
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    # 每轮清零的 STATS **不再**装这件事 —— 换个说法:清零抹不掉它
+    audit_l3.reset_stats()
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    assert "policy_no_full_text" not in audit_l3.STATS
+    # 连续两次构建报同一份清单(不累加、不漂移)
+    audit_l3.build_system_prompt(["Alcohol"], rows)
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    audit_l3.reset_prompt_cache()
+    assert audit_l3.missing_full_text() == ()      # 重置连它一起清
+
+
+def test_system_prompt_并发只构建一次():
+    """⚠ `product_audit` 并发 128 起跑,第一批线程会同时看到缓存为空 ——
+    不加锁就是每个线程各渲染一遍 44 篇全文,还把缺全文清单反复覆写,
+    而且没有任何东西会红。"""
+    import threading
+    conn = FakeConn()
+    out, errs = [], []
+    barrier = threading.Barrier(8)
+
+    def _go():
+        try:
+            barrier.wait()
+            out.append(audit_l3.system_prompt(conn))
+        except Exception as e:                      # noqa: BLE001
+            errs.append(e)
+
+    threads = [threading.Thread(target=_go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errs and len(out) == 8
+    assert all(x is out[0] for x in out)            # 同一个对象 = 只建了一次
+    # 只查了一次库(类别 + 政策各一条 SQL)
+    assert len([q for q in conn.sql_log
+                if "walmart_prohibited_policy" in q]) == 2
 
 
 # ---------------------------------------------------------------- S1/S2/S3
@@ -319,19 +358,52 @@ def test_证据通道_跨三层且按rule_code渲染():
     与它出自哪一层无关(C 批把品牌扫描迁进 L0 时不用再改这里)。"""
     p0 = Phase0Result(blocked=False, hits=[
         _r4_hit(2, code="phase0_brand_mention")])
-    l1 = L1Info(hits=[RuleHit(stage="L1", rule_code="unmapped_amazon_path",
-                              penalty=0, detail={"reason": "映射表曾标注"})])
+    l1 = L1Info(hits=[RuleHit(stage="L1", rule_code="some_new_soft_rule",
+                              penalty=0, detail={"reason": "将来某条软规则"})])
     l2 = _l2([RuleHit(stage="L2", rule_code="walmart_strict_sensitive",
                       penalty=0,
                       detail={"subtypes": ["adult"], "matched_phrases": ["sexy"]})])
     txt, brands = audit_l3.summarize_evidence(p0, l1, l2)
     lines = txt.split("\n")
     assert lines[0].startswith("* 文案提到黑名单品牌(共2个, 前10): nike0")
-    assert lines[1] == "* unmapped_amazon_path: reason=映射表曾标注"   # 未登记也不丢
+    assert lines[1] == "* some_new_soft_rule: reason=将来某条软规则"   # 未登记也不丢
     assert lines[2] == "* 敏感/严格合规(R8, adult): sexy"
     assert brands == ["nike0", "nike1"]
     # 三层都空 ⇒ 明说没有证据(别让 LLM 以为这一段丢了)
     assert audit_l3.summarize_evidence() == ("(上游无证据)", [])
+
+
+def test_证据通道_过程留痕不当证据():
+    """⚠ `pt_dict_fallback`(类目靠字典回落)与 `unmapped_amazon_path`
+    (映射表曾标注无对应 PT)记的是**我们自己链路里发生了什么**,与产品违不
+    违规无关。送进去只会诱导 LLM 拿"内部没把类目定准"当拒绝理由。
+
+    判据唯一出处 = `audit_reason.NOT_A_REASON`(人话渲染那边用的是同一张表),
+    别在证据通道里另列一份。
+    """
+    from services import audit_reason
+    assert {"pt_dict_fallback", "unmapped_amazon_path"} <= audit_reason.NOT_A_REASON
+    l1 = L1Info(hits=[
+        RuleHit(stage="L1", rule_code="pt_dict_fallback", penalty=0,
+                detail={"reason": "LLM 输出 PT 不在字典, 回落候选首条"}),
+        RuleHit(stage="L1", rule_code="unmapped_amazon_path", penalty=0,
+                detail={"reason": "映射表曾标注 '无对应Walmart PT'"})])
+    assert audit_l3.summarize_evidence(None, l1, None) == ("(上游无证据)", [])
+    # 还在的那条软证据照旧出行(不是把 L1 整层丢掉)
+    l1.hits.append(RuleHit(stage="L1", rule_code="future_soft_rule", penalty=0,
+                           detail={"note": "x"}))
+    txt, _ = audit_l3.summarize_evidence(None, l1, None)
+    assert txt == "* future_soft_rule: note=x"
+
+
+def test_证据通道_cert四个键都没有时不打字面量None():
+    """`{what}` 直接插 None 的话,提示词里会出现「类目需证书(…): None」——
+    LLM 会拿它当"要求就是 None"这条事实读。"""
+    hit = RuleHit(stage="L2", rule_code="cat_requires_cert_hard", penalty=0,
+                  detail={"walmart_pt": "Widgets"})      # 四个键一个都没有
+    txt, _ = audit_l3.summarize_evidence(None, None, _l2([hit]))
+    assert txt == "* 类目需证书(cat_requires_cert_hard): (无要求文本)"
+    assert "None" not in txt
 
 
 def test_证据通道_只收软hit_硬拒不进():
@@ -517,6 +589,36 @@ def test_解析_is_real_brand强制翻拒_严格is_True():
     r3 = audit_l3.parse_l3_reply({"verdict": "pass", "brand_verdicts": "nope"},
                                  ALLOWED)
     assert r3.brand_verdicts == [] and r3.verdict == "pass"
+
+
+def test_解析_品牌翻拒不回头解析枚举():
+    """⚠ 翻拒是**确定性后处理**,不是 LLM 的答案:再对一次枚举的话,枚举取
+    不到(政策表读空 / 离线路径)就会把"确认是真品牌"降级成 pending,
+    而合同写的是 reject + Intellectual Property。"""
+    raw = {"verdict": "pass", "policy": "none",
+           "brand_verdicts": [{"brand": "Dyson", "is_real_brand": True}]}
+    for allowed in (audit_l3.policy_enum(frozenset()), frozenset(), ALLOWED):
+        r = audit_l3.parse_l3_reply(raw, allowed)
+        assert r.verdict == "reject", allowed
+        assert r.policy == resources.AUDIT_IP_POLICY
+        assert r.detail == "未授权引用品牌名 Dyson"
+        (hit,) = r.hits
+        assert hit.rule_code == "llm_intellectual_property"
+        assert list(hit.detail) == ["policy", "detail", "confidence",
+                                    "brand_verdicts", "prompt_version"]
+
+
+@pytest.mark.parametrize("raw", [["not", "a", "dict"], "plain string", 42,
+                                 None, ("t",)])
+def test_解析_非dict输入按坏JSON处置(raw):
+    """⚠ 可达路径,不是防御性编程:`llm_cache` 里躺着一行坏值(历史脏数据 /
+    手工改过的 JSON)时,`cached` 拿回来的就可能是 list/str —— 旧写法在
+    `raw.get(...)` 上抛 AttributeError,把"一行坏缓存"变成整轮崩。"""
+    r = audit_l3.parse_l3_reply(raw, ALLOWED)
+    assert r.verdict == "pending" and r.policy == "none"
+    (hit,) = r.hits
+    assert hit.rule_code == "llm_bad_json"
+    assert r.raw == {}                       # 非 dict 不往下游传
 
 
 def test_解析_非法verdict与坏JSON全部pending():

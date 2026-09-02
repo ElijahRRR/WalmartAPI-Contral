@@ -188,6 +188,10 @@ def conclusion_detail(outcome: AuditOutcome) -> str | None:
     三段输出的第三段(规格 §3.4),来源**确定**、按 verdict 分道:
 
       · reject + L3 判的  → `l3.detail`(LLM 给的中文一句:原文片段 + 条款要点);
+        **LLM 没给 detail 时不留空**,退成一句确定的话
+        `违反「<类别>」(LLM 未引用原文片段)` —— 空着的后果是飞书 H 列走
+        老行兜底渲染,把 `llm_alcohol` 这种规则码原样打给运营看(`_RULE_CN`
+        里没有 llm_* 条目,也不该有:那是随政策名生成的);
       · reject + 规则判的 → 判死那条 hit 的 `explain_hit`(它本来就是"具体内容"
         形态,如 `商标符号(命中:XYZ®)`)。取的是 all_hits 里**第一条扣分的**
         —— 硬拒是短路的,那一条就是判死它的那条;
@@ -204,7 +208,14 @@ def conclusion_detail(outcome: AuditOutcome) -> str | None:
         return None
     l3 = outcome.l3
     if l3 is not None and getattr(l3, "verdict", None) == "reject":
-        return getattr(l3, "detail", None)
+        detail = (getattr(l3, "detail", None) or "").strip()
+        if detail:
+            return detail
+        # 判拒必须说得出一句话:LLM 漏了 detail(或只回了空白)时,
+        # 用它自己给的类别拼一句确定的 —— 不许把这一格留空
+        policy = (getattr(l3, "policy", None) or "").strip()
+        return (f"违反「{policy}」(LLM 未引用原文片段)" if policy
+                else "L3 判拒但未给出具体内容(待人工复核)")
     for h in outcome.all_hits:
         if h.penalty < 0:
             return audit_reason.explain_hit(h.rule_code, h.detail)

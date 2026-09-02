@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from registry import paths, resources
-from services import audit_l2, audit_rules, audit_store
+from services import audit_l2, audit_l3, audit_rules, audit_store
 from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
@@ -172,6 +172,22 @@ def test_三段落库_类别与具体内容分列():
     got2 = _cap_conclusion(o2)
     assert got2["reason"] == "Intellectual Property"
     assert got2["detail"] == "标题含 ®/™ 商标符号(命中:XYZ)"
+
+
+def test_三段落库_L3没给具体内容时也不留空():
+    """⚠ 判拒必须说得出一句话。留空的后果不是"少一格":飞书 H 列会走
+    老行兜底渲染,把 `llm_alcohol` 这种**规则码**原样打给运营看
+    (`_RULE_CN` 里没有 llm_* 条目,也不该有 —— 它是随政策名生成的)。"""
+    from services.audit_l3 import L3Result
+    for empty in (None, "", "   "):
+        o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                         stage_stopped_at="L3",
+                         l1=L1Info(walmart_product_type="GoodPT"))
+        o.l3 = L3Result(verdict="reject", policy="Alcohol", detail=empty)
+        o.final_reason_category = "Alcohol"
+        assert audit_store.conclusion_detail(o) == \
+            "违反「Alcohol」(LLM 未引用原文片段)", empty
+        assert _cap_conclusion(o)["detail"].startswith("违反「Alcohol」")
 
 
 def test_三段落库_两条写库路径都带上了新列():
@@ -1504,13 +1520,17 @@ def test_the_l3_gap_counters_are_reset_and_reach_the_summary():
     数字读起来像"这一轮坏了这么多"。
     """
     import inspect
-    from services import audit_l3, audit_reason
+    from services import audit_reason
     src = inspect.getsource(product_audit.run)
-    assert "_audit_l3.reset_stats()" in src                  # 每轮清零
+    assert "audit_l3.reset_stats()" in src                   # 每轮清零
     assert "audit_reason.reset_stats()" in src
     assert 'stage_stats["L3_policy_no_full_text"]' in src    # 走既有通道
     assert 'stage_stats["L3_bad_policy"]' in src
     assert 'stage_stats["reason_missing"]' in src
+    # ⚠ 缺全文读的是**构建期状态**,不是每轮清零的 STATS(读计数的话第二轮
+    #   起永远报 0,而缺失一直都在)
+    assert "audit_l3.missing_full_text()" in src
+    assert "policy_no_full_text" not in dict(audit_l3.STATS)
 
     stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
              "L4_ran": 0, "L4_reject": 0}
@@ -1534,7 +1554,10 @@ def test_the_l3_gap_counters_are_reset_and_reach_the_summary():
     stage["L3_policy_no_full_text_names"] = ["Art"]
     stage["L3_bad_policy"] = 3
     stage["reason_missing"] = 5
+    stage["adopt_cat_unresolved"] = 7
     lines = _lines(stage)
+    adopt = [ln for ln in lines if "历史结论类别不可解析" in ln]
+    assert len(adopt) == 1 and "7 条" in adopt[0] and "留空" in adopt[0]
     gap = [ln for ln in lines if "政策全文缺失" in ln]
     assert len(gap) == 1 and "2 篇" in gap[0] and "Art" in gap[0]
     bad = [ln for ln in lines if "对不上枚举" in ln]
@@ -1542,10 +1565,9 @@ def test_the_l3_gap_counters_are_reset_and_reach_the_summary():
     miss = [ln for ln in lines if "判拒但没有类别" in ln]
     assert len(miss) == 1 and "5 条" in miss[0] and "NULL" in miss[0]
 
-    # STATS 的形状:两个固定键(总计)+ 逐名字动态键(摘要点名靠它)
+    # STATS 只剩"每个产品都可能发生"的那一件事;缺全文是构建期事实,不在这里
     audit_l3.reset_stats()
-    assert dict(audit_l3.STATS) == {"policy_no_full_text": 0,
-                                    "llm_bad_policy": 0}
+    assert dict(audit_l3.STATS) == {"llm_bad_policy": 0}
     audit_reason.reset_stats()
     assert dict(audit_reason.STATS) == {"reason_missing": 0}
 
@@ -1609,9 +1631,10 @@ def test_adopt_history_says_the_old_reason_from_hits():
     conn = _Conn()
     import unittest.mock as m
     with m.patch.object(product_audit.product_events, "record_many"):
-        n, adopted = product_audit._adopt_history(
+        n, adopted, bad_cat = product_audit._adopt_history(
             conn, ["B0AAAAAAA1", "B0AAAAAAA2"], execute=True)
     assert n == 2 and adopted == {"B0AAAAAAA1", "B0AAAAAAA2"}
+    assert bad_cat == 0                    # 这两行的老类别本来就是 NULL
     # 三段分列(2026-09-02 B1):类别列写 runs 行留档的 l3_reason_category
     # (这两行老结论都是 NULL),"历史结论(阶段 X):…"那句进**具体内容**列
     by = {r["asin"]: r for r in conn.adopted}
@@ -1619,6 +1642,73 @@ def test_adopt_history_says_the_old_reason_from_hits():
     assert "品牌黑名单" in by["B0AAAAAAA1"]["detail"]        # 旧命中翻成人话
     assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]["detail"]
     assert "理由未留存" in by["B0AAAAAAA2"]["detail"]        # 连 hits 都没有
+
+
+def test_adopt_history_resolves_the_legacy_category_or_leaves_it_null():
+    """⚠ 存量 `audit_runs.l3_reason_category` 装的是**旧语义**:`'none'`、
+    小写旧缩写名、`.title()` 变形值都有。三段分列后 `products.audit_reason`
+    只装类别枚举 —— 原样搬进去就是把旧世界的脏值洗进新列,而且不报错。
+
+    对得上就回**表内原拼写**;对不上(含 `'none'`)就是没有类别(None),
+    并计数进摘要 —— 采用历史本来就不重判,编一个更糟。
+    """
+    # 四种存量形态:pass 的占位 / **小写官方名**(旧解析层就是这么存的) /
+    # 表里没有的自由值 / 非政策类别
+    rows = [("B0A1", 11, "reject", 0, None, "none", "L3", None, None),
+            ("B0A2", 12, "reject", 0, None, "offensive content", "L3",
+             None, None),
+            ("B0A3", 13, "reject", 0, None, "Ghost Policy", "L3", None, None),
+            ("B0A4", 14, "reject", 0, None, "内部黑名单", "L0", None, None)]
+
+    class _Cur:
+        def __init__(self, conn):
+            self.conn = conn
+            self._rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            self._rows = [] if "audit_hits" in sql else rows
+
+        def executemany(self, sql, r):
+            self.conn.adopted = list(r)
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        adopted = []
+
+        def cursor(self):
+            return _Cur(self)
+
+    conn = _Conn()
+    known = audit_l3.policy_enum(frozenset({"Offensive Content"}))
+    import unittest.mock as m
+    with m.patch.object(product_audit.product_events, "record_many"):
+        n, _adopted, bad_cat = product_audit._adopt_history(
+            conn, ["B0A1", "B0A2", "B0A3", "B0A4"], execute=True, known=known)
+    by = {r["asin"]: r["reason"] for r in conn.adopted}
+    assert n == 4
+    assert by["B0A1"] is None                       # 'none' 不是类别
+    assert by["B0A2"] == "Offensive Content"        # 小写 → **表内原拼写**
+    assert by["B0A3"] is None                       # 表里没有 ⇒ 不编一个
+    assert by["B0A4"] == "内部黑名单"                # 非政策类别也在枚举里
+    assert bad_cat == 2                             # 'none' 与 Ghost 各一条
+    # 具体内容照旧写(类别空 ≠ 什么都不说)
+    assert all(r["detail"] for r in conn.adopted)
+    # 旧缩写名(需要 POLICY_LEGACY_NAMES 精确等值认领)小写后认不出 ——
+    # 那是 `to_official` 的既定口径(旧名是历史事实,不做词形归一),
+    # 落 None + 计数,不猜
+    assert product_audit._adopt_category("drugs & paraphernalia", known) is None
+    assert product_audit._adopt_category("Drugs & Paraphernalia",
+                                         audit_l3.policy_enum(frozenset(
+                                             {"Drugs and Drug Paraphernalia"}))) \
+        == "Drugs and Drug Paraphernalia"
 
 
 def test_shrink_guard_message_says_what_you_are_installing():

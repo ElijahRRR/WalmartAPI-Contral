@@ -98,10 +98,10 @@ from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_reason, audit_rules, audit_store, db_guard, \
-    kpi, \
-    listing_sheet, product_events, product_ingest, risk_trace, scrape_batches, \
-    store_events, stores
+from services import audit_l3, audit_reason, audit_rules, audit_store, \
+    db_guard, kpi, \
+    listing_sheet, policy_names, product_events, product_ingest, risk_trace, \
+    scrape_batches, store_events, stores
 
 DANGEROUS = True
 
@@ -562,15 +562,33 @@ def _hits_of_runs(conn, run_ids: list) -> dict:
     return out
 
 
-def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
-    """输入:候选 ASIN 列表 → 输出:(采用数, 已采用 ASIN 集)。
+def _adopt_category(reason_cat, known) -> str | None:
+    """输入:老 run 的 `l3_reason_category` + 类别枚举 → 输出:类别或 None。
+
+    ⚠ 存量 `audit_runs` 里那一列装的是**旧语义**:`'none'`、小写的旧缩写名、
+    `.title()` 变过形的自由值都有。三段分列后 `products.audit_reason` 只装
+    类别枚举 —— 原样搬进去等于把旧世界的脏值洗进新列,而且不会报错。
+    对不上就是**没有类别**(None):采用历史本来就不重判,编一个更糟。
+    """
+    if not reason_cat:
+        return None
+    s = str(reason_cat).strip()
+    if not s or s.lower() == "none":
+        return None
+    return policy_names.resolve(s, known)
+
+
+def _adopt_history(conn, asins: list[str], execute: bool,
+                   known=frozenset()) -> tuple[int, set, int]:
+    """输入:候选 ASIN 列表(+ 类别枚举)→ 输出:(采用数, 已采用 ASIN 集,
+    类别解析不到的条数)。
 
     方案 A(spec_shortcut §1.6,待所有者追认):历史结论直接写审核六列+事件,
     不写新 run。读库失败让异常冒泡整轮停——静默按"无历史"重审会把
     rejected 产品翻出来(spec_shortcut §6.1)。
     """
     if not asins:
-        return 0, set()
+        return 0, set(), 0
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL, (asins,))
         rows = cur.fetchall()
@@ -581,6 +599,7 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
     adopted = set()
     events = []
     adopt_rows = []
+    cat_unresolved = 0
     for (asin, run_id, verdict, _score, pt, reason_cat, stage, created,
          src) in rows:
         adopted.add(asin)
@@ -593,7 +612,9 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             # 这样,采用不改写历史);具体内容反查 hits 把旧结论说出来,
             # 连 hits 都没有(极老的孤儿 run)才落"理由未留存"。
             # ⚠ 别把"历史结论(阶段 X)…"那句写进类别列:那一列从此只装枚举
-            reason = reason_cat
+            reason = _adopt_category(reason_cat, known)
+            if reason_cat and reason is None:
+                cat_unresolved += 1      # 老值对不上枚举 ⇒ 类别留空(见摘要)
             hit = old_hits.get(run_id)
             if hit:
                 detail = (f"历史结论(阶段 {stage or '未知'}):"
@@ -630,7 +651,7 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             cur.executemany(_ADOPT_SQL, adopt_rows)
     if execute and events:
         product_events.record_many(conn, events)
-    return len(adopted), adopted
+    return len(adopted), adopted, cat_unresolved
 
 
 _SQL_VERDICT = """
@@ -1387,6 +1408,12 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
     if stage_stats.get("L3_bad_policy"):
         lines.append(f"⚠ L3 类别对不上枚举 {stage_stats['L3_bad_policy']} 条 → "
                      f"pending 待人工(不降级猜类别;详见日志)")
+    # 采用历史时老结论的类别对不上枚举 ⇒ 类别列留空(具体内容照旧写)。
+    # 存量老值是旧语义(`none` / 小写旧缩写名 / `.title()` 变形),原样搬进
+    # 收窄后的类别列 = 把旧世界的脏值洗进新列,而且不会报错
+    if stage_stats.get("adopt_cat_unresolved"):
+        lines.append(f"⚠ 历史结论类别不可解析 {stage_stats['adopt_cat_unresolved']} 条"
+                     f" —— 类别列留空(老值是旧语义/旧拼写;重审时自然写上新值)")
     # 判拒却没有类别 = 代码 bug 信号(硬拒规则没自报 `category`,或 L3 那条
     # 路没走到)。**不兜底**:落 NULL + 计数,别编一个政策名出来
     if stage_stats.get("reason_missing"):
@@ -1511,6 +1538,9 @@ def run(params: dict) -> str:
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
         cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)
         chunks = _iter_candidates(cand_sql, query_params)
+        # 采用历史时把老 `l3_reason_category` 对回枚举用的那份集合 ——
+        # 与判定链同源(`ctx.known_policies` + 两条非政策类别),不另查一次库
+        adopt_known = audit_l3.policy_enum(ctx.known_policies)
 
         if adopt_only:
             # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
@@ -1518,24 +1548,29 @@ def run(params: dict) -> str:
             # 一起跑等于为了采用而顺带付 33 万次 LLM
             # ⚠ 逐块采用:`_adopt_history` 是按 asin 独立的,分块与整批等价,
             #   而整批意味着把 86 万个 asin 塞进一个 `= ANY(%s)`(又一处 OOM)
-            cand_n = adopted_n = 0
+            cand_n = adopted_n = cat_unresolved = 0
             for chunk in chunks:
                 cand_n += len(chunk)
-                n, _ = _adopt_history(conn, [r["asin"] for r in chunk], execute)
+                n, _, bad_cat = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute,
+                    known=adopt_known)
                 adopted_n += n
+                cat_unresolved += bad_cat
             return (f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
                     f"采用 {adopted_n}"
                     + ("" if execute else "(dry-run:未写库)")
-                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定")
+                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定"
+                    + (f";⚠ 历史结论类别不可解析 {cat_unresolved}"
+                       f"(老值是旧语义/旧拼写,类别列留空,具体内容照旧写)"
+                       if cat_unresolved else ""))
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = 0
         stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
-                       "L4_ran": 0, "L4_reject": 0}
+                       "L4_ran": 0, "L4_reject": 0, "adopt_cat_unresolved": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
-        from services import audit_l3 as _audit_l3
-        _audit_l3.reset_stats()                  # L3 缺全文/坏类别的计数同样
+        audit_l3.reset_stats()                   # L3 坏类别的计数同样
         audit_reason.reset_stats()               # 判拒无类别的计数同样
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
@@ -1564,9 +1599,11 @@ def run(params: dict) -> str:
             out = []
             adopted: set = set()
             if backfill:
-                n, adopted = _adopt_history(
-                    conn, [r["asin"] for r in chunk], execute)
+                n, adopted, bad_cat = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute,
+                    known=adopt_known)
                 adopted_n += n
+                stage_stats["adopt_cat_unresolved"] += bad_cat
             for row in chunk:
                 if row["asin"] in adopted:
                     continue
@@ -1754,11 +1791,12 @@ def run(params: dict) -> str:
     l1s = audit_rules.audit_l1_llm.STATS
     # L3 侧两个"判据悄悄变窄"的计数走 stage_stats 这条既有通道(L3 的数都在
     # 里面);判拒无类别的计数在 audit_reason(理由映射零兜底的 bug 信号)
-    stage_stats["L3_policy_no_full_text"] = _audit_l3.STATS.get(
-        "policy_no_full_text", 0)
-    stage_stats["L3_policy_no_full_text_names"] = \
-        _audit_l3.policies_without_full_text()
-    stage_stats["L3_bad_policy"] = _audit_l3.STATS.get("llm_bad_policy", 0)
+    # ⚠ 缺全文读的是**构建期状态**不是 STATS:提示词一个进程只构造一次,而
+    #   STATS 每轮清零 —— 读计数的话第二轮起永远报 0,而缺失一直都在
+    missing = audit_l3.missing_full_text()
+    stage_stats["L3_policy_no_full_text"] = len(missing)
+    stage_stats["L3_policy_no_full_text_names"] = list(missing)
+    stage_stats["L3_bad_policy"] = audit_l3.STATS.get("llm_bad_policy", 0)
     stage_stats["reason_missing"] = audit_reason.STATS.get("reason_missing", 0)
     tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
                    l0_untouched=l0_untouched, adopted_n=adopted_n,

@@ -36,7 +36,7 @@ L3 只对 L2 pass 的产品跑,判 L0/L2 的确定性规则抓不到的那一类
 
 public:
   L3Result, judge_l3, load_policy_rows, load_reason_categories,
-  system_prompt, build_system_prompt, build_user_prompt,
+  system_prompt, build_system_prompt, build_user_prompt, missing_full_text,
   summarize_evidence, parse_l3_reply, policy_enum
 """
 
@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 
 from api import llm as _llm_api
 from registry import resources
-from services import llm_cache, policy_feed, policy_names
+from services import audit_reason, llm_cache, policy_feed, policy_names
 from services.audit_models import RuleHit
 
 logger = logging.getLogger("services.audit_l3")
@@ -64,15 +64,18 @@ L3_PURPOSE = "audit_l3"          # registry.LLM_PURPOSE_ENV 登记项
 
 # ── 本轮计数(惯例照 `services/audit_l1_llm.STATS`:单进程累加,run 摘要读它)──
 #
-# 两件事都属于"判据悄悄变窄/变形"那一类:不报错、不红,只有计数能让人看见。
-#   · policy_no_full_text —— 政策表里有这一行(进了 S2 枚举),但 `full_policy`
-#     是空的 ⇒ S4 里**没有它的原文**。LLM 会看到一个能选的类别名,却找不到
-#     任何可引用的条款(空壳标题等于没给,故不渲染)。
+# 只收一件"判据悄悄变形"的事:不报错、不红,只有计数能让人看见。
 #   · llm_bad_policy —— LLM 答的政策名在枚举里对不上 ⇒ 整条转 pending。
+#     零星几条是模型抽风,成批出现 = 提示词/政策表出了问题。
 # `reset_stats()` 每轮开始由 `workflows/product_audit` 调;`workers>1` 时裸
 # `+=` 会丢计数,故上锁。
+#
+# ⚠ **「政策缺全文」不在这里**(2026-09-02 复核修正):它是**构建期**的事实,
+#   一个进程只发生一次(提示词只构造一次),而 `reset_stats()` 每轮清零 ——
+#   两者叠加的结果是"第一轮报了、后面每轮都报 0",而缺失一直都在。
+#   改由 `missing_full_text()` 从模块状态读(见 `_MISSING_FULL_TEXT`)。
 STATS: Counter = Counter()
-_STATS_KEYS = ("policy_no_full_text", "llm_bad_policy")   # 另有动态键 `policy_no_full_text:<名字>`
+_STATS_KEYS = ("llm_bad_policy",)
 _STATS_LOCK = threading.Lock()
 
 
@@ -91,13 +94,6 @@ def reset_stats() -> None:
 
 
 reset_stats()
-
-
-def policies_without_full_text() -> list[str]:
-    """输入:无 → 输出:本进程渲染时缺全文的政策名(名字序;摘要点名用)。"""
-    pre = "policy_no_full_text:"
-    return sorted(k[len(pre):] for k, v in STATS.items()
-                  if k.startswith(pre) and v)
 
 
 # =============================================================
@@ -261,8 +257,9 @@ def format_reason_categories(categories: list[str]) -> str:
     return "\n".join(f"  - {c}" for c in cats)
 
 
-def policy_parts(rows: list[dict]) -> list[str]:
-    """输入:政策行(ORDER BY id,含 full_policy)→ 输出:每篇一段的 S4 文本。
+def policy_parts(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """输入:政策行(ORDER BY id,含 full_policy)→ 输出:(每篇一段的 S4 文本,
+    缺全文而被跳过的类别名)。
 
     每篇渲染成 `## {category_en}` + 空行 + 喂入版全文。喂入版由
     `services/policy_feed.render_feed_text` 从 `full_policy` **渲染时派生**
@@ -276,26 +273,27 @@ def policy_parts(rows: list[dict]) -> list[str]:
       `## Overview` / `## Prohibited Products Policy: X` 这类小标题,数
       `"\\n## "` 出来的是 251 而不是 44(2026-09-02 实测),提示词自称的篇数
       会瞬间变成一个假数。
+    第二个返回值 = 被跳过的类别名:交给 `missing_full_text()` 记账(进 run 摘要)。
     """
     parts: list[str] = []
+    missing: list[str] = []
     for r in rows:
         cat_en = (r.get("category_en") or "").strip()
         body = policy_feed.render_feed_text(r.get("full_policy") or "").strip()
         if not cat_en or not body:
             name = cat_en or f"id={r.get('id')}"
-            bump("policy_no_full_text")
-            if bump(f"policy_no_full_text:{name}") == 1:
-                logger.warning("政策表 %r 没有可喂的全文,S4 跳过这一篇 —— "
-                               "它仍在 S2 候选里,LLM 选得到却引不出条款"
-                               "(补 full_policy:policy_sync)", name)
+            missing.append(name)
+            logger.warning("政策表 %r 没有可喂的全文,S4 跳过这一篇 —— "
+                           "它仍在 S2 候选里,LLM 选得到却引不出条款"
+                           "(补 full_policy:policy_sync)", name)
             continue
         parts.append(f"## {cat_en}\n\n{body}")
-    return parts
+    return parts, missing
 
 
 def format_policy_block(rows: list[dict]) -> str:
     """输入:政策行 → 输出:S4 官方全文块(各篇之间空行分隔)。"""
-    return "\n\n".join(policy_parts(rows))
+    return "\n\n".join(policy_parts(rows)[0])
 
 
 def build_system_prompt(categories: list[str], policy_rows: list[dict]) -> str:
@@ -306,8 +304,14 @@ def build_system_prompt(categories: list[str], policy_rows: list[dict]) -> str:
 
     S1/S3 里的篇数按 **S4 真正渲染出来的篇数**填(不是政策表行数):没有全文的
     行不进 S4,自称 44 篇却只给 42 篇,那个数就成了假的。
+
+    ⚠ **副作用一处**:把"哪几篇缺全文"记进模块状态(`missing_full_text()` 读
+    它)。那是**构建期**的事实,不是每轮的计数 —— 提示词一个进程只构造一次,
+    塞进每轮清零的 STATS 里等于"第一轮报了、后面每轮都报 0"。
     """
-    parts = policy_parts(policy_rows)          # 只渲染一次(计数也只加一轮)
+    global _MISSING_FULL_TEXT
+    parts, missing = policy_parts(policy_rows)   # 只渲染一次
+    _MISSING_FULL_TEXT = tuple(missing)
     return (_fill_count(_S1, len(parts))
             + format_reason_categories(categories)
             + _fill_count(_S3, len(parts))
@@ -315,22 +319,47 @@ def build_system_prompt(categories: list[str], policy_rows: list[dict]) -> str:
 
 
 _SYSTEM_PROMPT: str | None = None
+#: 本次构建里**缺全文**的政策类别名(构建时写一次,`reset_prompt_cache` 才清)。
+#: 摘要读它、不读 STATS —— 理由见 `build_system_prompt` 的副作用说明。
+_MISSING_FULL_TEXT: tuple[str, ...] = ()
+#: 构建锁:`product_audit` 并发 128 起跑时第一批线程会同时看到
+#: `_SYSTEM_PROMPT is None` —— 不上锁就是**每个线程各构建一次**(44 篇全文
+#: 各渲染一遍,`_MISSING_FULL_TEXT` 被反复覆写),而且没有任何东西会红。
+_PROMPT_LOCK = threading.Lock()
+
+
+def missing_full_text() -> tuple[str, ...]:
+    """输入:无 → 输出:本次构建里缺全文、没进 S4 的政策类别名(入参序)。
+
+    空元组 = 每篇都有原文(或这个进程还没构造过提示词)。
+    """
+    return _MISSING_FULL_TEXT
 
 
 def system_prompt(conn) -> str:
-    """输入:中心库连接 → 输出:进程级缓存的 system prompt(只查一次 DB)。"""
+    """输入:中心库连接 → 输出:进程级缓存的 system prompt(只查一次 DB)。
+
+    双重检查 + 锁:并发起跑时只构建一次(见 `_PROMPT_LOCK`)。
+    """
     global _SYSTEM_PROMPT
-    if _SYSTEM_PROMPT is None:
-        _SYSTEM_PROMPT = build_system_prompt(load_reason_categories(conn),
-                                             load_policy_rows(conn))
-        logger.info("L3 system prompt 构造完成:%d 字符", len(_SYSTEM_PROMPT))
+    if _SYSTEM_PROMPT is not None:
+        return _SYSTEM_PROMPT
+    with _PROMPT_LOCK:
+        if _SYSTEM_PROMPT is None:       # 等锁期间别人可能已经建好了
+            prompt = build_system_prompt(load_reason_categories(conn),
+                                         load_policy_rows(conn))
+            logger.info("L3 system prompt 构造完成:%d 字符(缺全文 %d 篇)",
+                        len(prompt), len(_MISSING_FULL_TEXT))
+            _SYSTEM_PROMPT = prompt
     return _SYSTEM_PROMPT
 
 
 def reset_prompt_cache() -> None:
     """输入:无 → 输出:无(清空 system prompt 进程缓存,仅测试/长驻进程刷新用)。"""
-    global _SYSTEM_PROMPT
-    _SYSTEM_PROMPT = None
+    global _SYSTEM_PROMPT, _MISSING_FULL_TEXT
+    with _PROMPT_LOCK:
+        _SYSTEM_PROMPT = None
+        _MISSING_FULL_TEXT = ()
 
 
 # =============================================================
@@ -363,7 +392,10 @@ def _line_cert(h) -> tuple[str, list[str]]:
     """
     d = h.detail or {}
     what = (d.get("meta_requirements") or d.get("hard_cert_fields")
-            or d.get("soft_cert_fields") or d.get("note"))
+            or d.get("soft_cert_fields") or d.get("note")
+            # 四个键一个都没有(detail 形状变了/老行)⇒ 别把字面量 `None`
+            # 送进提示词:LLM 会拿它当"要求就是 None"这条事实读
+            or "(无要求文本)")
     return (f"* 类目需证书({h.rule_code}): {what}", [])
 
 
@@ -439,12 +471,17 @@ def summarize_evidence(phase0=None, l1=None, l2=None) -> tuple[str, list[str]]:
     ⚠ **未登记的 rule_code 不丢**,按通用形态打一行:漏掉一条软证据不会报错,
     只会让 L3 少看一样东西 —— 那正是"承诺了没送到"的老毛病(R7/R8 曾经
     整整两个月一个字都没进提示词)。
+    ⚠ **过程留痕不是证据**:`pt_dict_fallback`(类目靠字典回落)、
+    `unmapped_amazon_path`(映射表曾标注无对应 PT)这类 0 分 hit 记的是**我们
+    自己链路里发生了什么**,与产品违不违规无关。送进去只会诱导 LLM 拿"内部
+    没把类目定准"当拒绝理由。判据唯一出处 = `audit_reason.NOT_A_REASON`
+    (同一张表也管人话渲染时"哪些 hit 不当理由显示"),别在这儿另列一份。
     """
     lines: list[str] = []
     brands: list[str] = []
     for res in (phase0, l1, l2):
         for h in (getattr(res, "hits", None) or ()):
-            if h.penalty != 0:
+            if h.penalty != 0 or h.rule_code in audit_reason.NOT_A_REASON:
                 continue
             render = _EVIDENCE_LINES.get(h.rule_code)
             if render is None and h.rule_code.startswith(_CERT_PREFIX):
@@ -587,6 +624,35 @@ def _pending(detail_text: str | None, rule_code: str, detail: dict,
     )
 
 
+def _reject(policy: str, detail: str | None, brand_verdicts: list,
+            confidence: str, raw: dict) -> L3Result:
+    """输入:类别 + 具体内容 + 品牌判定 + 置信 + 原始 dict → 输出:reject 形态。
+
+    两条 reject 出口(LLM 答的类别对上枚举 / 品牌翻拒)共用**同一份**落库形状:
+    hit 五键定序是落库契约,分两处写就是加一个键漏改一处。
+    """
+    return L3Result(
+        verdict="reject",
+        policy=policy,
+        detail=detail,
+        brand_verdicts=brand_verdicts,
+        confidence=confidence,
+        raw=raw,
+        hits=[RuleHit(
+            stage="L3",
+            rule_code=f"llm_{_slug_category(policy)}",
+            penalty=0,   # L3 不扣分, 直接决定 verdict
+            detail={     # 五键定序是落库契约
+                "policy": policy,
+                "detail": detail,
+                "confidence": confidence,
+                "brand_verdicts": brand_verdicts,
+                "prompt_version": resources.AUDIT_RULES_VERSION,
+            },
+        )],
+    )
+
+
 def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
     """输入:LLM JSON dict + 类别枚举(表内原拼写)→ 输出:规范化 L3Result。
 
@@ -594,8 +660,10 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
 
       1. 非 JSON / verdict 取值非法 → pending `llm_bad_json`(绝不默认放行);
       2. 品牌翻拒:任一 `brand_verdicts[].is_real_brand is True` 且 LLM 自述
-         pass → 改判 reject + `Intellectual Property`(确定性后处理,严格
-         `is True`,字符串 "true" 不算);
+         pass → **直接**改判 reject + `Intellectual Property` + detail
+         「未授权引用品牌名 X」(确定性后处理,严格 `is True`,字符串 "true"
+         不算;**不回头走第 4 步的枚举解析** —— 那会让枚举取不到时把确定的
+         reject 降级成 pending);
       3. pass → `policy` 强制 `none`(pass 没有类别);
       4. reject → `policy` 经 `policy_names.resolve` 对枚举解析,命中回**表内
          原拼写**;**对不上 → pending `llm_bad_policy`**(不猜、不降级:猜出来
@@ -603,10 +671,15 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
       5. reject 落 1 条 L3 hit,rule_code = `llm_<policy slug>`,detail 五键定序
          `{policy, detail, confidence, brand_verdicts, prompt_version}`。
     """
-    if not raw or "_raw" in raw:
+    # ⚠ 非 dict 也走这条路(不是防御性编程,是**可达路径**):`llm_cache` 里
+    # 若躺着一行坏值(历史脏数据 / 手工改过的 JSON),`cached` 拿回来的可能是
+    # list/str/None —— 旧写法在 `raw.get(...)` 上抛 AttributeError,把"坏缓存"
+    # 变成整轮崩,而正确处置与坏 JSON 完全一样:pending 待人工。
+    if not isinstance(raw, dict) or not raw or "_raw" in raw:
         logger.warning("L3 LLM 返回非法 JSON:%r", str(raw)[:200])
         return _pending("L3 LLM 返回格式异常", "llm_bad_json",
-                        {"raw": str(raw)[:MAX_RAW_SNIPPET]}, raw or {})
+                        {"raw": str(raw)[:MAX_RAW_SNIPPET]},
+                        raw if isinstance(raw, dict) else {})
 
     verdict = str(raw.get("verdict") or "").strip().lower()
     if verdict not in _VALID_VERDICTS:
@@ -630,16 +703,18 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
 
     # ⭐ 品牌翻拒(合同 L3-7 照迁):任一命中词被判 is_real_brand=true → 整品
     # reject,即使 LLM 自己输出 pass。类别恒 `Intellectual Property` ——
-    # 它是规则代码里唯一写死的政策名,装配时已对表(audit_rules.load_context)
+    # 它是规则代码里唯一写死的政策名,装配时已对表(audit_rules.load_context)。
+    # ⚠ **直接产出 reject,不回头走下面的枚举解析**:那是**确定性后处理**,
+    #   不是 LLM 的答案 —— 再解析一次的话,枚举拿不到(测试里的空表、政策表
+    #   临时读空)就会把"确认是真品牌"降级成 pending,而合同写的是 reject。
     real_brand_hits = [v for v in brand_verdicts
                        if isinstance(v, dict) and v.get("is_real_brand") is True]
     if verdict == "pass" and real_brand_hits:
         first = real_brand_hits[0].get("brand") or "?"
         logger.info("L3 verdict override: pass→reject, is_real_brand=true: %s",
                     [v.get("brand") for v in real_brand_hits])
-        verdict = "reject"
-        policy = resources.AUDIT_IP_POLICY
-        detail = f"未授权引用品牌名 {first}"
+        return _reject(resources.AUDIT_IP_POLICY, f"未授权引用品牌名 {first}",
+                       brand_verdicts, confidence, raw)
 
     if verdict == "pass":            # pass 没有类别(prompt 也这么要求)
         return L3Result(verdict="pass", policy=NO_POLICY, detail=detail,
@@ -656,26 +731,7 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
                         {"policy": policy[:MAX_RAW_SNIPPET],
                          "detail": detail}, raw)
 
-    return L3Result(
-        verdict="reject",
-        policy=hit_policy,
-        detail=detail,
-        brand_verdicts=brand_verdicts,
-        confidence=confidence,
-        raw=raw,
-        hits=[RuleHit(
-            stage="L3",
-            rule_code=f"llm_{_slug_category(hit_policy)}",
-            penalty=0,   # L3 不扣分, 直接决定 verdict
-            detail={     # 五键定序是落库契约
-                "policy": hit_policy,
-                "detail": detail,
-                "confidence": confidence,
-                "brand_verdicts": brand_verdicts,
-                "prompt_version": resources.AUDIT_RULES_VERSION,
-            },
-        )],
-    )
+    return _reject(hit_policy, detail, brand_verdicts, confidence, raw)
 
 
 # =============================================================
@@ -756,7 +812,7 @@ __all__ = [
     "format_reason_categories",
     "summarize_evidence",
     "policy_enum",
-    "policies_without_full_text",
+    "missing_full_text",
     "STATS",
     "reset_stats",
     "parse_l3_reply",

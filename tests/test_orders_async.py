@@ -197,3 +197,31 @@ def test_async_refreshed_token_is_reused_on_next_page(monkeypatch):
         handler=lambda s, orders: len(orders))
     assert not dead and not failed and results[0]["lines"] == 2
     assert seen_tokens == ["tok-1", "tok-2", "tok-2"]   # 刷新后第 2 页用的是新 token
+
+
+def test_correlation_id_echo_mismatch_is_logged(monkeypatch, caplog):
+    """沃尔玛回显的 WM_QOS.CORRELATION_ID 与请求不符 = 响应错配的唯一现场证据,
+    必须告警(先不拒收);回显一致或没回显都安静。"""
+    mode = {"echo": "same"}
+
+    def handler(req: httpx.Request):
+        sent = req.headers.get("WM_QOS.CORRELATION_ID")
+        hdr = {}
+        if mode["echo"] == "same":
+            hdr["WM_QOS.CORRELATION_ID"] = sent
+        elif mode["echo"] == "other":
+            hdr["WM_QOS.CORRELATION_ID"] = "00000000-0000-0000-0000-000000000000"
+        r = _page([{"purchaseOrderId": "PO1"}], total=1)
+        r.headers.update(hdr)
+        return r
+
+    _seam(monkeypatch, handler)
+    for echo, expect_warn in (("same", False), ("none", False), ("other", True)):
+        mode["echo"] = echo
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            results, dead, failed = orders_api.fetch_orders_bulk(
+                [_store("T1")], created_start="2026-08-01T00:00:00Z",
+                handler=lambda s, orders: len(orders))
+        assert not dead and not failed and results[0]["lines"] == 1
+        assert ("响应相关 ID 与请求不符" in caplog.text) is expect_warn, echo

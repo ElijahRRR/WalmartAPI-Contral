@@ -162,11 +162,26 @@ async def _get_async(client: httpx.AsyncClient, url: str, store: dict,
             continue
         data = None
         if 200 <= status < 300:
+            _check_correlation_echo(resp, store, url)
             try:
                 data = resp.json()
             except ValueError:
                 data = None
         return status, headers, data
+
+
+def _check_correlation_echo(resp: httpx.Response, store: dict, url: str) -> None:
+    """输入:响应 → 输出:无(沃尔玛回显的 WM_QOS.CORRELATION_ID 与请求不符即告警)。
+
+    下单时间事故(2026-09-02)取证口子:每个请求都带一个新 uuid,沃尔玛在响应头
+    原样回显;若哪一层(httpx/h2/代理)把别的请求的响应配给了本请求,这里是唯一
+    能当场看见的地方。先只告警计数,生产确认回显稳定后再升级为拒收该页。
+    """
+    sent = resp.request.headers.get("WM_QOS.CORRELATION_ID")
+    got = resp.headers.get("WM_QOS.CORRELATION_ID")
+    if sent and got and sent != got:
+        logger.warning("响应相关 ID 与请求不符(店铺 %s %s):请求 %s / 响应 %s —— 疑似响应错配",
+                       store.get("name"), url, sent, got)
 
 
 async def _fetch_store(store: dict, sem: asyncio.Semaphore, *,

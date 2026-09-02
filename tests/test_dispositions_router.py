@@ -327,3 +327,206 @@ def test_group_by_store_raises_on_unknown_action():
     msg = str(ei.value)
     assert "未知 action='nuke'" in msg and "建议行 id=7" in msg
 
+
+
+# ── 改码要的两个积木(SKU 改造批次 3,O9/O10)────────────────────────────────
+#
+# 处置状态机的判据与写入必须出生在**所有权模块**里:工作流里现写一句
+# `UPDATE ops.dispositions SET sku = …` 就是第二条处置写路径 —— 它绕过状态机、
+# 撞得上 dispositions_open_uidx、还漏掉 asin 列。
+
+class _ScriptedCur:
+    """按 SQL 关键字回放不同结果的假游标(rekey 一次 with 里跑两条语句)。"""
+
+    def __init__(self, log, taken=(), moved=0):
+        self.log, self.taken, self.moved = log, list(taken), moved
+        self.rowcount = 0
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, params=None):
+        self.log.append((sql, params))
+        self.rowcount = self.moved if sql.strip().startswith("UPDATE") else 0
+        return self
+
+    def fetchall(self):
+        return [(a,) for a in self.taken]
+
+    def fetchone(self):
+        return (len(self.taken),)
+
+
+class _ScriptedConn:
+    def __init__(self, taken=(), moved=0):
+        self.log: list = []
+        self._cur = _ScriptedCur(self.log, taken, moved)
+
+    def cursor(self): return self._cur
+
+
+def test_open_executing_count_only_counts_executing_rows_of_that_store():
+    """改码前置闸的读侧:该店有没有在途处置,只问 0 还是非 0。
+
+    executing 意味着某条 feed 已提交、正等观测判决;改码会把它等的那个
+    (店, SKU) 键换掉 —— 判决从此永远等不到,行卡在 executing 里堵住同
+    (店,SKU,动作) 的一切新建议(部分唯一索引挡着)。
+    """
+    conn = _ScriptedConn(taken=("delete", "retire"))
+    assert ds.open_executing_count(conn, "T1") == 2
+    sql, params = conn.log[0]
+    assert "count(*)" in sql and "ops.dispositions" in sql
+    assert "status = 'executing'" in sql
+    assert "store = %(store)s::text" in sql          # 别店的 executing 不算数
+    assert params == {"store": "T1"}
+    assert "UPDATE" not in sql.upper()               # 只读
+
+
+def test_rekey_suggested_moves_only_suggested_rows():
+    """迁的是**未落定的建议**(suggested),executing 行本函数不碰。
+
+    executing 已经提交了 feed、正等观测判决,搬键等于把判决对象换掉;前置闸
+    (open_executing_count)保证这一刻该店没有 executing 行,所以这里只需要
+    不碰、不需要分支。asin 列跟着补(coalesce 只填不覆盖)—— 不透明码在 sku
+    列里提不出 ASIN,那一列是它与产品中心/黑名单对齐的唯一线索。
+    """
+    conn = _ScriptedConn(taken=(), moved=3)
+    moved, taken = ds.rekey_suggested(conn, "T1", "B0OLD00001", "AN3WC0DE2345",
+                                      asin="B0OLD00001")
+    assert (moved, taken) == (3, [])
+    upd_sql, upd_params = conn.log[1]
+    assert "status = 'suggested'" in upd_sql
+    assert "executing" not in upd_sql                     # 只 suggested,不碰在途
+    assert "asin = coalesce(asin, %(asin)s::text)" in upd_sql
+    assert upd_params["asin"] == "B0OLD00001"
+    assert upd_params["taken"] == []
+
+
+def test_rekey_suggested_skips_and_reports_action_collisions(caplog):
+    """新码名下已有同动作的未落定建议 ⇒ 那些动作**不迁、不删、不合并**,点名人工。
+
+    dispositions_open_uidx 是 (store, sku, action) WHERE status IN
+    ('suggested','executing'),撞上直接抛;而两条同动作的建议合成一条会让其中
+    一个的落定结果覆盖另一个(schema.sql 的索引注释明写这条设计)。
+    判不准就判活 —— 返回 action 列表让调用方点名。
+    """
+    import logging
+    conn = _ScriptedConn(taken=("delete", "delete", "retire"), moved=1)
+    with caplog.at_level(logging.WARNING, logger="services.dispositions"):
+        moved, taken = ds.rekey_suggested(conn, "T1", "B0OLD00001", "AN3WC0DE2345")
+    assert (moved, taken) == (1, ["delete", "retire"])     # 去重且定序
+    sel_sql, sel_params = conn.log[0]
+    assert "status IN ('suggested', 'executing')" in sel_sql   # 在途也算占位
+    assert sel_params == {"store": "T1", "new_sku": "AN3WC0DE2345"}
+    upd_sql, upd_params = conn.log[1]
+    assert "action <> ALL(%(taken)s::text[])" in upd_sql
+    assert upd_params["taken"] == ["delete", "retire"]
+    assert any("人工" in m for m in caplog.messages)
+
+
+def test_rekey_suggested_never_touches_executing_rows():
+    """反向钉死:UPDATE 的 WHERE 里只能出现 suggested 这一个状态。"""
+    assert "status = 'suggested'" in ds._REKEY_SQL
+    assert ds._REKEY_SQL.count("status") == 1
+    assert "DELETE" not in ds._REKEY_SQL.upper()      # 撞车的行不删
+
+
+# ── 沙箱 PG 集成:迁键真的绕开了那条部分唯一索引 ─────────────────────────────
+#
+# ⚠ 地址是**测试夹具**,不是生产资源(生产走 registry/db.pg_dsn());固定在非
+# 标准端口 55432 上正是为了不可能连到生产库,造的数据全在最后回滚的事务里。
+# 假连接证明不了"UPDATE 会不会撞 dispositions_open_uidx" —— 那正是本条要挡的
+# 事故(原稿在工作流里裸写 UPDATE,撞上直接抛,而且没有分支)。
+import os
+import socket
+
+_PG_HOST, _PG_PORT = "127.0.0.1", 55432
+_DSN = os.environ.get(
+    "WALMART_TEST_PG_DSN",
+    f"host={_PG_HOST} port={_PG_PORT} user=postgres dbname=walmart_data")
+
+
+def _pg_up() -> bool:
+    try:
+        with socket.create_connection((_PG_HOST, _PG_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+needs_pg = pytest.mark.skipif(not _pg_up(),
+                              reason=f"沙箱 PG {_PG_HOST}:{_PG_PORT} 未启动")
+
+_DSTORE, _DOLD, _DNEW = "DISP_T1", "B0DISPOLD01", "ADISP1234567"
+
+
+@pytest.fixture
+def pg(monkeypatch):
+    """输入:无 → 输出:沙箱 PG 连接(整场事务**最后一律回滚**)。"""
+    monkeypatch.setenv("WALMART_PG_DSN", _DSN)
+    from registry import db
+    with db.pg_conn() as conn:
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+
+
+def _row(conn, sku, action, status, asin=None):
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO ops.dispositions (store, sku, asin, source,"
+                    " action, status) VALUES (%s, %s, %s, 'scan', %s, %s)",
+                    (_DSTORE, sku, asin, action, status))
+
+
+def _state(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku, action, status, asin FROM ops.dispositions "
+                    "WHERE store = %s ORDER BY sku, action", (_DSTORE,))
+        return cur.fetchall()
+
+
+@needs_pg
+def test_rekey_suggested_survives_the_open_unique_index(pg):
+    """撞车的动作**不迁**,不撞的照迁 —— 全程不抛 UniqueViolation。
+
+    dispositions_open_uidx 是 (store, sku, action) WHERE status IN
+    ('suggested','executing')。裸 UPDATE 撞上就抛,而抛在改码定案的事务里
+    = 整笔定案回滚,pending 行原地不动、下一轮再撞一次。
+    """
+    _row(pg, _DOLD, "delete", "suggested")
+    _row(pg, _DOLD, "retire", "suggested")
+    _row(pg, _DNEW, "delete", "suggested")          # 新码名下已占了 delete
+    moved, taken = ds.rekey_suggested(pg, _DSTORE, _DOLD, _DNEW,
+                                      asin="B0DISPOLD01")
+    assert (moved, taken) == (1, ["delete"])
+    assert _state(pg) == [
+        (_DNEW, "delete", "suggested", None),        # 新码原有的那条,原样不动
+        (_DNEW, "retire", "suggested", "B0DISPOLD01"),   # 迁过来的,asin 补上
+        (_DOLD, "delete", "suggested", None)]        # 撞车的:不迁、不删,等人工
+
+
+@needs_pg
+def test_rekey_suggested_never_touches_executing_or_settled_rows(pg):
+    """executing(正等观测判决)与已落定(病历)都不许被搬。"""
+    _row(pg, _DOLD, "delete", "executing")
+    _row(pg, _DOLD, "retire", "confirmed")
+    moved, taken = ds.rekey_suggested(pg, _DSTORE, _DOLD, _DNEW)
+    assert (moved, taken) == (0, [])
+    assert _state(pg) == [(_DOLD, "delete", "executing", None),
+                          (_DOLD, "retire", "confirmed", None)]
+
+
+@needs_pg
+def test_open_executing_count_is_scoped_to_the_store_and_the_status(pg):
+    """前置闸只数**本店**的 executing:别店卡着不该拦住这家店改码。"""
+    _row(pg, _DOLD, "delete", "executing")
+    _row(pg, _DOLD, "retire", "suggested")
+    with pg.cursor() as cur:
+        cur.execute("INSERT INTO ops.dispositions (store, sku, source, action,"
+                    " status) VALUES ('DISP_T2', %s, 'scan', 'delete',"
+                    " 'executing')", (_DOLD,))
+    assert ds.open_executing_count(pg, _DSTORE) == 1
+    assert ds.open_executing_count(pg, "DISP_T2") == 1
+    assert ds.open_executing_count(pg, "DISP_NOBODY") == 0

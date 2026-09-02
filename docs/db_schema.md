@@ -156,6 +156,10 @@ CREATE TABLE catalog.item_node_inventory (
     PRIMARY KEY (store, sku, ship_node)
 );
 CREATE INDEX item_node_inventory_node_idx ON catalog.item_node_inventory (ship_node);
+-- ⚠ 删除只有**一个出口** services/walmart_catalog.drop_node_rows(2026-09-02
+-- 批次 3 O11),而且只给改码定案用:那时该 SKU 在沃尔玛侧已不存在,留着就是一条
+-- 永不更新的幽灵节点库存(维护链的受管仓判据照读不误)。与上面「本轮没扫到的行
+-- 不删」不冲突 —— 那条讲分页漏 SKU(行还在),这条讲我们自己把 SKU 改没了。
 ```
 
 ```sql
@@ -409,7 +413,16 @@ CREATE TABLE catalog.product_events (
 --                       coalesce(asin, sku),新旧码经登记簿都解析到同一个 ASIN,
 --                       所以"这个 ASIN 用过哪些码、什么时候换的"就在同一条时间线上。
 --                       ⚠ 一次改码留**两条** sku_replaced:旧码一条(abandon 记)、
---                       新码一条(settle_replacement 给新码的出生事件))
+--                       新码一条(settle_replacement 给新码的出生事件)。
+--                       **观测侧只抑制、不补记**(2026-09-02 批次 3 O1/O3):
+--                       diff_catalog 对新码不记 item_appeared(记了就是一次没有
+--                       重上架事实的**假代际**,problem_scan 的顽固判定当场丢掉
+--                       双 feed 加压;listed_times 同时灌水),mark_missing 对
+--                       在途改码的旧码不记 item_missing(它的消失是我们自己造成
+--                       的,记了 unexplained_missing 会对每个改过码的品置真)。
+--                       抑制的是**事件**不是观测:missing_since 照标,它正是
+--                       sku_migrate 判 confirmed 的证据。两处都只在 replaced_by/
+--                       replaces 非空时改变行为,故改码前逐字节零行为变化)
 --                       ——**只是查询档案,不是拦截条件**
 --                       (所有者口径 2026-08-12:防呆=黑名单,按拉黑类别拦,
 --                       不按删除史拦);list_new 仅消费 unexplained_missing
@@ -832,7 +845,20 @@ ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统�
 写入方:`cleanup_history_import`(历史)+ 未来 cleanup 报表尾段(增量);
 `category` 是 A~L/Z 类别码。主键 (sku, category),ON CONFLICT DO NOTHING。
 
+**改码不迁这张表**(2026-09-02 批次 3 决策 G,零代码):全仓只有
+`cleanup_history_import` 写它、**零读者**(2026-09-02 grep 复核),而它是「错误
+统计」累计数的真值来源 —— 复制一份到新码会多算 N 对;重命名(UPDATE sku)在跨店
+同串时会偷走另一家店的历史(表没有 store 维度)。将来接报表消费方时,正解是改按
+登记簿 `source_key` 读写,而不是在改码时搬键。
 
+
+-- ⚠ **改码不迁这张表**(2026-09-02 批次 3 决策 G,零代码):`maintenance:submitted`
+-- 的键含 sku(services/maintenance_intents),改码后旧键失配,但窗口只有
+-- SUPPRESS_HOURS=20h、短于一轮观测期 ⇒ **自然过期**,最坏是定案后多发一次同值
+-- 维护意图(可能收到 0101198 stale update,非破坏)。`cleanup:brand_asin` /
+-- `cleanup:brand_scrape` 两个 scope 的键是 ASIN,不受影响;catalog.claims 的
+-- claim_key 是 ASIN 或品牌归一键,同理不受影响。顺手 UPDATE 这张表:多一处写,
+-- 收益只是省一次 stale update,不值。
 CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json)
     scope       text NOT NULL,      -- 如 'cleanup:submitted_sku'
     key         text NOT NULL,
@@ -865,6 +891,13 @@ ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.
 | `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
 | `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
+
+改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
+(前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,
+从此永远等不到)与 `dispositions.rekey_suggested`(把 `suggested` 行从旧码搬到
+新码,`asin` 列 coalesce 补上;新码名下已有同动作未落定行的**不迁不删只点名**,
+`executing` 行一概不碰)。工作流里裸写 `UPDATE ops.dispositions SET sku = …`
+即违规:它绕过状态机、撞得上下面那条部分唯一索引、还漏掉 asin 列。
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:
 `problem_scan` 对顽固件同时建议 retire 与 delete(双 feed 齐发),合成一条会让

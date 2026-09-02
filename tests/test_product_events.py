@@ -151,3 +151,32 @@ def test_product_risk_view_exposes_sku_replaced_columns():
     assert "AS last_sku_replaced_at" in view
     assert "coalesce(asin, sku) AS asin" in view       # 身份键没被动过
     assert "sku_replaced" in pe.EVENTS                 # 事件码早已登记(批次 2)
+
+
+def test_sku_migrate_receipts_never_enter_the_ledger_in_either_feed_form():
+    """改码回执**两种形态都不进病历**(SKU 改造批次 3,O7)。
+
+    改码的事实由观测定案(sku_replaced / sku_abandoned 两条码级事件),不是
+    沃尔玛回执。形态 A 走 MP_MAINTENANCE(kind=maintenance)本就不入账;形态 B
+    走 MP_ITEM(kind=list)却是**恒入账**的 —— 不在这个唯一收口点挡住,形态一
+    切换病历就多出一串 list_feed_success,把「上架」时间线与 product_risk 的
+    submit_times 一起灌水,而且静默。
+    """
+    for kind in ("list", "maintenance", "delete", "retire", "match"):
+        assert pe.receipt_in_ledger(kind, "sku_migrate") is False
+    # 反向:既有来源一个都不受影响(改码前逐字节零行为变化)
+    assert pe.receipt_in_ledger("list", "list_new") is True
+    assert pe.receipt_in_ledger("delete", "problem_product_cleanup") is True
+    assert pe.receipt_in_ledger("maintenance", "problem_product_cleanup") is True
+    assert pe.receipt_in_ledger("maintenance", "maintenance") is False
+    assert pe.receipt_in_ledger("maintenance", None) is False
+
+
+def test_the_two_ledger_workflow_tables_never_overlap():
+    """两张表问的是相反的问题,取值重叠就说明有人把"不入账"写成了"要入账"。
+
+    _MAINT_LEDGER_WORKFLOWS = maintenance 里**谁要**入账(登记制白名单);
+    _NEVER_LEDGER_WORKFLOWS = 谁**一律不**入账(工作流级例外)。
+    """
+    assert not (pe._MAINT_LEDGER_WORKFLOWS & pe._NEVER_LEDGER_WORKFLOWS)
+    assert pe._NEVER_LEDGER_WORKFLOWS == {"sku_migrate"}

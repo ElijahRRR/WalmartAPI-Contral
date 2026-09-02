@@ -148,13 +148,32 @@ def feed_kind(feed_type: str) -> str:
     return _FEED_KIND.get(feed_type, feed_type.lower())
 
 
+#: 回执**永不**入账的提交来源(与 kind 无关的整条工作流级例外)。
+#: sku_migrate(SKU 改造批次 3):改码的**事实**由观测定案(sku_replaced /
+#: sku_abandoned 两条码级事件,services/sku_codec 记),不是沃尔玛回执。
+#: 形态 A 走 MP_MAINTENANCE(kind=maintenance)本就不入账,形态 B 走 MP_ITEM
+#: (kind=list)却是恒入账的 —— 不在这里挡,一换形态病历就多出一串
+#: list_feed_success,把「上架」这条时间线与 product_risk.submit_times 一起
+#: 灌水,而且**静默**。挡在 receipt_in_ledger 这个唯一收口点(唯一调用方
+#: services/feed_track)两种形态就都覆盖了。
+#: ⚠ 它不是 _MAINT_LEDGER_WORKFLOWS 的反面:那张表是"maintenance 里谁**要**
+#: 入账"的登记制白名单,这张是"谁一律不入账",两张表的取值不许重叠。
+_NEVER_LEDGER_WORKFLOWS = {"sku_migrate"}
+
+
 def receipt_in_ledger(kind: str, workflow: str | None) -> bool:
     """输入:feed 业务类别 + 提交来源工作流 → 输出:该回执是否进病历。
 
     维护事件入账定稿(所有者 2026-08-07):改价/改库存/改标题/清库存的
     回执不进 product_events(流水已在 ops.feed_items);delete/retire 恒进;
     maintenance 仅反补来源进(反补计数依赖其提交/回执链)。
+
+    工作流级例外(SKU 改造批次 3,O7):`_NEVER_LEDGER_WORKFLOWS` 里的来源
+    **两种 feed 形态都不入账** —— 改码不是上架也不是维护,它的事实由观测定案。
+    既有工作流名一个都不命中这张表 ⇒ 改码前逐字节零行为变化。
     """
+    if (workflow or "") in _NEVER_LEDGER_WORKFLOWS:
+        return False
     if kind in _RECEIPT_KINDS:
         return True
     return kind == "maintenance" and (workflow or "") in _MAINT_LEDGER_WORKFLOWS
@@ -204,16 +223,36 @@ def record_many(conn, rows: list[dict]) -> int:
 
 
 def diff_catalog(old: dict, new_rows: list[dict], store: str,
-                 source: str = "catalog_sync") -> list[dict]:
+                 source: str = "catalog_sync",
+                 replaced: dict | None = None) -> list[dict]:
     """输入:旧状态 {sku: (published_status, missing_since)} + 本轮行 + 店铺
-    → 输出:状态迁移事件列表(纯函数,便于测试)。
+    (+ 在途改码的 {新码: 旧码})→ 输出:状态迁移事件列表(纯函数,便于测试)。
 
     - 旧表没有 → item_appeared
     - 旧表标缺席又出现 → item_reappeared
     - published_status 变化 → status_changed(detail 含官方 unpublished 原因,
       这就是"平台把它下架了、为什么"的观测记录)
+
+    ⚠ **改码的新码第一次被观测到时不记 item_appeared**(SKU 改造批次 3,O1)。
+    `replaced` 由调用方从登记簿取(services/listing_sources.replacement_map,
+    纯函数自己不查库);缺省 None ⇒ 与改码前逐字节相同的行为。
+    为什么必须抑制:新码在这张表里是新行,而 `prev is None` 的字面含义是"这个店
+    多了一个品" —— 记下去就是**一次没有重上架事实的假代际**,而
+    workflows/problem_scan._SQL_STUBBORN 正是拿"最新事件是不是 item_appeared/
+    item_reappeared"决定要不要清掉上一代的 delete_not_effective:假代际一记,
+    已实证「删除未生效」的顽固件就静默丢掉双 feed 加压,回到每天删一次删不掉的
+    循环;catalog.product_risk.listed_times 同时被灌水。
+    为什么**只抑制、不在这里补记 sku_replaced**:改码的身份事件由
+    services/sku_codec 一处出生 —— 一次改码固定留**两条** sku_replaced(旧码
+    一条,abandon 记;新码一条,settle_replacement 记),而 settle 的定案证据
+    正是"新码在架且旧码缺席",必然发生在本函数观测到新码**之后**。在这里再记
+    一条只会变成同一次改码的第三条事件(product_risk.sku_replaced_times 的
+    口径当场作废),且回滚时它还是条假事件。分工因此写死:
+    **观测侧只做抑制,身份事件归 sku_codec**(mark_missing 的 item_missing
+    抑制是同一条纪律的另一半)。
     """
     events = []
+    replaced = replaced or {}
     for r in new_rows:
         sku = r.get("sku")
         if not sku:
@@ -221,6 +260,11 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
         prev = old.get(sku)
         new_st = r.get("published_status")
         if prev is None:
+            if sku in replaced:
+                logger.info("改码新码 %s/%s 首次被观测到(替换 %s):不记 "
+                            "item_appeared —— 身份事件由 sku_codec 记",
+                            store, sku, replaced[sku])
+                continue
             events.append({"sku": sku, "store": store, "event": ITEM_APPEARED,
                            "source": source,
                            "detail": {"published_status": new_st}})

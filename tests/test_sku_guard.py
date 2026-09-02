@@ -101,6 +101,12 @@ _REGISTRY_SQL_OK: dict[str, tuple[str, str]] = {
     "workflows/alloc_plan.py": ("permanent", "PR-0a-2:「已在架」集合"),
     "workflows/alloc_products.py": ("permanent", "PR-0a-2:「已在架」集合"),
     "workflows/alloc_push.py": ("permanent", "PR-0a-2:「已在架」集合"),
+    "workflows/problem_scan.py": (
+        "permanent",
+        "批次 3 O4:_SQL_ITEMS 的 NOT EXISTS 把**在途改码的旧码**挡在扫描面外 —— "
+        "改码生效窗口内旧码会被观测成非 PUBLISHED 且未缺席,正好落进扫描面被建议 "
+        "DELETE_ITEM(不可逆)。它问的是 replaced_by 这一列的**状态**,不是"
+        "身份反查、也不是代际继承(那条走 catalog.sku_aliases 视图)"),
 }
 
 #: ③ 允许出现 `abandoned_at` 的**消费方** .py。

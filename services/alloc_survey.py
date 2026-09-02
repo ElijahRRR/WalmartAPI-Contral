@@ -249,15 +249,27 @@ FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 # 2. ⚠ **历史行里的退款单算进了销量**:源表的「统计状态」列没有被导入,
 #    退款/无效行与有效销售一起进来了。对"留销量大的店"这类相对比较影响
 #    很小(各店同样口径),但绝对额会偏高;真要精确得让导入侧补这一列。
+# 3. **改码后销量沿改码链继承一跳**(SKU 改造批次 3,O12,决策 H):
+#    定案之后 catalog.walmart_items.sku 是新码,而 orders.order_lines 的历史行
+#    仍是旧码 —— 不映射的话迁过码的品销量/GMV **恒 0**,而且不报错:店铺产出、
+#    resolve_conflicts 按销量选冲突赢家、alloc_audit 明细三处一起对这些品失真。
+#    别名走 catalog.sku_aliases(代际继承的唯一出处,与 problem_scan 四段判据
+#    同源),视图在改码前是空集 ⇒ LEFT JOIN 全落 NULL、coalesce 取回 o.sku,
+#    结果集逐行不变。
+#    ⚠ **返回键的形状不变**((store, sku)):改成按 order_lines.asin 聚合口径更
+#    根本(services/product_pool.py 已是那个写法),但要连带改三个消费点的键
+#    形状 —— 那是行为变化,另立批次(决策 H 的备选)。
 _SQL_SALES = """
-SELECT store, sku,
-       count(*)                                   AS orders,
-       coalesce(sum(product_amount), 0)::numeric  AS gmv
-FROM orders.order_lines
-WHERE order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
-  AND order_date <  %(as_of)s::timestamptz
-  AND coalesce(sale_status, '') <> 'Cancelled'
-GROUP BY store, sku
+SELECT o.store AS store, coalesce(a.sku, o.sku) AS sku,
+       count(*)                                     AS orders,
+       coalesce(sum(o.product_amount), 0)::numeric  AS gmv
+FROM orders.order_lines o
+LEFT JOIN catalog.sku_aliases a
+       ON a.store = o.store AND a.alias_sku = o.sku
+WHERE o.order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
+  AND o.order_date <  %(as_of)s::timestamptz
+  AND coalesce(o.sale_status, '') <> 'Cancelled'
+GROUP BY 1, 2
 """
 
 # 订单侧店名 vs 凭证表:对不上的店,其销量进不了"店×类目"维度

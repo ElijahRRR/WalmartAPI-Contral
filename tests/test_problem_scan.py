@@ -7,7 +7,9 @@
 反补/Stage 豁免/反补计数的用例换成反向钉死(不许回来),路由用例改为全删。
 """
 
+import os
 import pathlib
+import socket
 
 import pytest
 
@@ -647,3 +649,297 @@ def test_wfs_blocked_sql_reads_only_the_latest_attempt():
     assert "ORDER BY store, sku, submitted_at DESC" in q
     assert "feed_type = 'DELETE_ITEM'" in q
     assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  在途改码:扫描面排除(O4)+ 四段历史判据沿改码链继承一跳(O5/O6)
+#
+#  这一节是本批次**唯一能造成不可逆损失**的路径的回归:改码生效有 15 分钟到
+#  4 小时的窗口(官方),窗口内旧码可能被观测成非 PUBLISHED 且未缺席,正好落进
+#  扫描面被建议 DELETE_ITEM —— 一次**成功**的改码被自己的自动链当场永久删掉。
+#  四段历史判据则相反:新码在 product_events / ops.feed_items 里一条历史都没有,
+#  不继承就同时失明(顽固加压丢失、归类每次当第一次见、WFS 拦截失效每天空烧
+#  DELETE_ITEM 配额、在途防重拦不住)。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_items_sql_column_order_is_unchanged():
+    """三列的**位置顺序**是契约:_load_state 按位置解包成 store/sku/reasons。
+
+    加表别名时把列序动了,不报错 —— 只是从此每一行的 sku 里装着
+    unpublished_reasons,归类全错、建议全错。
+    """
+    head = scan._SQL_ITEMS.strip().splitlines()[0]
+    assert head == "SELECT w.store, w.sku, w.unpublished_reasons"
+    src = pathlib.Path("workflows/problem_scan.py").read_text(encoding="utf-8")
+    assert '("store", "sku", "reasons")' in src
+
+
+def test_replaced_rows_are_excluded_by_a_not_exists_not_a_join():
+    """排除写成 NOT EXISTS 而不是 JOIN:扫描面的行数不许被登记簿改变。
+
+    JOIN 登记簿会顺手把**未登记**的在架问题行也一起丢掉(存量有一批),
+    那是静默缩小扫描面 —— 与本条要挡的事完全无关。
+    """
+    q = scan._SQL_ITEMS
+    assert "NOT EXISTS (SELECT 1 FROM catalog.listing_sources ls" in q
+    assert "ls.replaced_by IS NOT NULL" in q
+    assert "JOIN catalog.listing_sources" not in q
+    # 改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,三条既有条件一字未动
+    assert "w.published_status IS NOT NULL" in q
+    assert "w.published_status <> 'PUBLISHED'" in q
+    assert "w.missing_since IS NULL" in q
+
+
+def test_three_history_sqls_and_inflight_go_through_sku_aliases_only():
+    """四段一律经 catalog.sku_aliases 取别名 —— 判据只能有一处出生。
+
+    各自现写一遍登记簿指针的 JOIN 就是四份会各自漂移的实现,而漂了不报错:
+    只是某一处从此看不见历史(守门 test_sku_guard 那条从源码层面钉同一件事)。
+    """
+    for name in ("_SQL_STUBBORN", "_SQL_LAST_CAT", "_SQL_WFS_BLOCKED",
+                 "_SQL_INFLIGHT"):
+        q = getattr(scan, name)
+        assert "catalog.sku_aliases a" in q, name
+        assert q.count("UNION ALL") == 1, name          # 只继承一跳
+        assert "f.sku = a.alias_sku" in q or "e.sku = a.alias_sku" in q, name
+        assert "listing_sources" not in q, name         # 只准经视图
+
+
+def test_history_sql_placeholders_are_named_not_positional():
+    """UNION 之后同一个值要用两次 ⇒ `%s` 位置参数给不了两遍(照抄会 ProgrammingError)。
+
+    两个消费点的实参必须同步改成 dict —— 只改 SQL 不改调用点,是本批次最容易
+    漏的一处,而它当场炸(这条测试只是让它在 pytest 里炸,不在生产里炸)。
+    """
+    assert "%(ev)s" in scan._SQL_LAST_CAT and "%s" not in scan._SQL_LAST_CAT
+    assert "%(code)s" in scan._SQL_WFS_BLOCKED
+    assert "%s" not in scan._SQL_WFS_BLOCKED
+    src = pathlib.Path("workflows/problem_scan.py").read_text(encoding="utf-8")
+    assert '_SQL_LAST_CAT, {"ev": product_events.PROBLEM_CATEGORIZED}' in src
+    assert '_SQL_WFS_BLOCKED, {"code": _WFS_BLOCKED_CODE}' in src
+
+
+# ── 沙箱 PG 集成:四段 SQL 的真实语义 ────────────────────────────────────────
+#
+# ⚠ 地址是**测试夹具**,不是生产资源(生产走 registry/db.pg_dsn())。固定在
+# 非标准端口 55432 上正是为了不可能连到生产库;造的数据全在一个最后回滚的
+# 事务里,不留残渣。文本断言证明不了"UNION ALL 加空集结果不变"这类事,只有
+# 真库能。
+_PG_HOST, _PG_PORT = "127.0.0.1", 55432
+_DSN = os.environ.get(
+    "WALMART_TEST_PG_DSN",
+    f"host={_PG_HOST} port={_PG_PORT} user=postgres dbname=walmart_data")
+
+
+def _pg_up() -> bool:
+    try:
+        with socket.create_connection((_PG_HOST, _PG_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+needs_pg = pytest.mark.skipif(not _pg_up(),
+                              reason=f"沙箱 PG {_PG_HOST}:{_PG_PORT} 未启动")
+
+_STORE = "PSCAN_T1"
+_OLD, _NEW = "B0PSCANOLD1", "APSCAN234567"      # 旧码 = 裸 ASIN 形态;新码 = 不透明码
+
+
+@pytest.fixture
+def pg(monkeypatch):
+    """输入:无 → 输出:沙箱 PG 连接(整场事务**最后一律回滚**)。
+
+    连接只准走 registry/db(工程规范:禁止自行 psycopg.connect)。
+    """
+    monkeypatch.setenv("WALMART_PG_DSN", _DSN)
+    from registry import db
+    with db.pg_conn() as conn:
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+
+
+def _seed_pair(conn, *, replaced: bool):
+    """输入:连接 + 是否已建立改码指针 → 输出:无。
+
+    造一对新旧码:旧码在架(改码窗口内被观测成 UNPUBLISHED)、新码在架,
+    历史(顽固/归类/WFS/在途)**全挂在旧码名下**。
+    replaced=False 时两行毫无关系,正是"改码前"的对照组。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO catalog.walmart_items "
+            "(store, sku, published_status, missing_since, last_seen_at) VALUES "
+            "(%s, %s, 'UNPUBLISHED', NULL, now() - interval '1 hour'),"
+            "(%s, %s, 'PUBLISHED',   NULL, now() - interval '1 hour')",
+            (_STORE, _OLD, _STORE, _NEW))
+        cur.execute(
+            "INSERT INTO catalog.listing_sources (store, sku, source_type,"
+            " source_key, workflow, replaces, replaced_by) VALUES "
+            "(%s, %s, 'amz', %s, 'test', NULL, %s),"
+            "(%s, %s, 'amz', %s, 'test', %s, NULL)",
+            (_STORE, _OLD, _OLD, _NEW if replaced else None,
+             _STORE, _NEW, _OLD, _OLD if replaced else None))
+        cur.execute(
+            "INSERT INTO catalog.product_events (sku, store, event, source,"
+            " detail, occurred_at) VALUES "
+            "(%s, %s, 'delete_not_effective', 'test', NULL, now() - interval '2 days'),"
+            "(%s, %s, 'problem_categorized', 'test', '{\"category\": \"L\"}'::jsonb,"
+            " now() - interval '2 days')",
+            (_OLD, _STORE, _OLD, _STORE))
+        cur.execute(
+            "INSERT INTO ops.feed_items (feed_id, sku, workflow, store, feed_type,"
+            " status, error_code, submitted_at) VALUES "
+            "('F_WFS', %s, 'problem_product_cleanup', %s, 'DELETE_ITEM',"
+            " 'failed', %s, now() - interval '3 days'),"
+            "('F_INF', %s, 'list_new', %s, 'MP_ITEM', 'submitted', NULL, now())",
+            (_OLD, _STORE, scan._WFS_BLOCKED_CODE, _OLD, _STORE))
+
+
+def _read(conn):
+    """输入:连接 → 输出:四段判据对 (店, 新码) 的结论 + 扫描面里的 SKU 集合。"""
+    from services import product_events
+    with conn.cursor() as cur:
+        cur.execute(scan._SQL_ITEMS)
+        surface = {sku for st, sku, _ in cur.fetchall() if st == _STORE}
+        cur.execute(scan._SQL_STUBBORN)
+        stubborn = {(st, k) for st, k, ev in cur.fetchall()
+                    if ev == 'delete_not_effective'}
+        cur.execute(scan._SQL_LAST_CAT, {"ev": product_events.PROBLEM_CATEGORIZED})
+        last_cat = {(s, k): c for s, k, c in cur.fetchall()}
+        cur.execute(scan._SQL_WFS_BLOCKED, {"code": scan._WFS_BLOCKED_CODE})
+        wfs = {(st, k) for st, k in cur.fetchall()}
+        cur.execute(scan._SQL_INFLIGHT, {"disposal": list(scan._DISPOSAL_FEEDS)})
+        inflight = {(st, k): d for st, k, d in cur.fetchall()}
+    return surface, stubborn, last_cat, wfs, inflight
+
+
+@needs_pg
+def test_rows_being_replaced_are_out_of_the_scan_surface(pg):
+    """在途改码的旧码**不进扫描面**(O4)—— 本批次唯一的不可逆损失路径。
+
+    改码窗口内旧码被观测成 UNPUBLISHED 且 missing_since 仍为 NULL,三条既有
+    条件全部命中;不排除的话当轮就建议 DELETE_ITEM,而 DELETE 不可逆:我们
+    **正在**改的那个 item 会被自己的自动链删掉。
+    """
+    _seed_pair(pg, replaced=True)
+    surface, *_ = _read(pg)
+    assert _OLD not in surface
+    # 新码在架且 PUBLISHED,本来就不该在扫描面里(排除的是旧码,不是整对)
+    assert _NEW not in surface
+
+
+@needs_pg
+def test_ordinary_unpublished_rows_still_enter_the_scan_surface(pg):
+    """对照组:没有改码指针的同一行照进扫描面(排除的判据只有 replaced_by)。"""
+    _seed_pair(pg, replaced=False)
+    surface, *_ = _read(pg)
+    assert _OLD in surface
+
+
+@needs_pg
+def test_stubborn_marker_follows_the_replacement_chain(pg):
+    """顽固代际继承一跳:旧码的 delete_not_effective 要算在新码头上(O5)。
+
+    不继承 = 新码是一张白纸 ⇒ 顽固件的双 feed 加压静默丢失,回到"每天删一次
+    删不掉"的循环(注释记着这条已实证的故障模式)。
+    """
+    _seed_pair(pg, replaced=True)
+    _, stubborn, _, _, _ = _read(pg)
+    assert (_STORE, _NEW) in stubborn
+    assert (_STORE, _OLD) in stubborn          # 旧码自己的结论不受影响
+
+
+@needs_pg
+def test_last_category_follows_the_replacement_chain(pg):
+    """问题归类的最近类别继承一跳:不继承的话每一轮都当第一次见,重复记事件。"""
+    _seed_pair(pg, replaced=True)
+    _, _, last_cat, _, _ = _read(pg)
+    assert last_cat[(_STORE, _NEW)] == "L"
+    assert last_cat[(_STORE, _OLD)] == "L"
+
+
+@needs_pg
+def test_wfs_block_follows_the_replacement_chain(pg):
+    """WFS 删不掉的拦截继承一跳:不继承就每天重建议、重发、同一个错、白烧
+    DELETE_ITEM 的 6/hour 桶(生产实见 11 条)。"""
+    _seed_pair(pg, replaced=True)
+    _, _, _, wfs, _ = _read(pg)
+    assert (_STORE, _NEW) in wfs
+
+
+@needs_pg
+def test_inflight_follows_the_replacement_chain(pg):
+    """在途防重继承一跳(O6):旧码上没落定的上架/维护/处置 feed 指着的是
+    **同一个 item**,新码不该被当成"从没提交过任何东西"。
+
+    在途口径**有意不分 feed 类型**(QARTH 复审期内追发 DELETE_ITEM 属于过早),
+    所以继承过来的 MP_ITEM 也算在途,只是 disposal=False(分档报数不受影响)。
+    """
+    _seed_pair(pg, replaced=True)
+    *_, inflight = _read(pg)
+    assert inflight.get((_STORE, _NEW)) is False    # 在途,但不是处置类
+    assert inflight.get((_STORE, _OLD)) is False
+
+
+@needs_pg
+def test_four_history_sqls_are_unchanged_when_sku_aliases_is_empty(pg):
+    """**零行为变化的正面证据**:sku_aliases 为空集时四段结论与改码前逐行相同。
+
+    UNION ALL 加空集 = 原结果集;LEFT JOIN 空视图 = 全落 NULL。文本断言证明
+    不了这件事,只有真库能。
+    """
+    _seed_pair(pg, replaced=False)
+    with pg.cursor() as cur:
+        cur.execute("SELECT count(*) FROM catalog.sku_aliases")
+        assert cur.fetchone()[0] == 0              # 改码前恒空集
+    surface, stubborn, last_cat, wfs, inflight = _read(pg)
+    assert surface == {_OLD}
+    assert stubborn == {(_STORE, _OLD)}
+    assert last_cat == {(_STORE, _OLD): "L"}
+    assert wfs == {(_STORE, _OLD)}
+    assert inflight == {(_STORE, _OLD): False}     # 新码一条都没继承到
+
+
+@needs_pg
+def test_item_appeared_on_the_new_code_would_clear_the_generation(pg):
+    """反向钉住 O1:**假如**新码那边记了 item_appeared,顽固标记当场丢失。
+
+    这正是 diff_catalog 必须抑制它的理由 —— 顽固判定取的是"最新事件",
+    一条比 delete_not_effective 更晚的 item_appeared 就把上一代的加压清掉了。
+    """
+    _seed_pair(pg, replaced=True)
+    _, stubborn, _, _, _ = _read(pg)
+    assert (_STORE, _NEW) in stubborn              # 抑制生效时:代际保住
+    with pg.cursor() as cur:
+        cur.execute("INSERT INTO catalog.product_events (sku, store, event,"
+                    " source, occurred_at) VALUES (%s, %s, 'item_appeared',"
+                    " 'test', now())", (_NEW, _STORE))
+    _, stubborn2, _, _, _ = _read(pg)
+    assert (_STORE, _NEW) not in stubborn2         # 假代际一记:加压静默丢失
+
+
+@needs_pg
+def test_load_state_runs_every_sql_and_never_surfaces_a_replaced_row(pg,
+                                                                    monkeypatch):
+    """整段 `_load_state` 打在真库上跑一遍:五条 SQL + **实参形状**都对。
+
+    O5 把两条 SQL 的占位符从 `%s` 改成命名式,消费点的实参必须同步改成 dict ——
+    只改 SQL 不改调用点会 ProgrammingError,而纯文本断言看不出来。这条用例让它
+    在 pytest 里炸,不在 13:00 那一轮生产里炸。
+    """
+    import contextlib
+    _seed_pair(pg, replaced=True)
+    monkeypatch.setattr(scan.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(pg))
+    (items, inflight, inflight_disposal, last_cat,
+     inactive, stubborn, wfs_blocked) = scan._load_state()
+    ours = [i for i in items if i["store"] == _STORE]
+    assert ours == []                                   # 旧码不在扫描面,新码 PUBLISHED
+    assert (_STORE, _NEW) in stubborn                   # 顽固代际继承到位
+    assert last_cat[(_STORE, _NEW)] == "L"
+    assert (_STORE, _NEW) in wfs_blocked
+    assert (_STORE, _NEW) in inflight
+    assert (_STORE, _NEW) not in inflight_disposal      # 继承来的是上架 feed

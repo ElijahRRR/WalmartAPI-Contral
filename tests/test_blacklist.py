@@ -282,15 +282,23 @@ def test_inflight_sql_caps_submitted_at_48h():
     ② success 待观测拦到重扫为止,重扫仍在 = 删除没生效,直接重发不等 48h
        (条件里**不许**出现对 success 的时间限制);
     ③ failed 不拦(WHERE 里根本不出现)。
+
+    ⚠ 批次 3(O6)之后这段 SQL 是**两支 UNION ALL**(本码 + 经 catalog.sku_aliases
+    继承的别名码),三个半条对**每一支**都必须成立 —— 逐支查而不是查整段:
+    整段查会被另一支的 48h 窗口误判(改前的写法就是取第一个 'success' 之后的
+    全文,加了第二支当场判红,而口径其实一字没变)。
     """
     from workflows import problem_scan as wf     # 批次 E:防重预筛随决策搬到扫描件
     sql = wf._SQL_INFLIGHT
-    assert "f.status = 'submitted'" in sql
-    assert "interval '48 hours'" in sql
-    # ② success 那一支不带时间窗:它的解除条件是"被重扫",不是"过了多久"
-    success_leg = sql[sql.index("'success'"):]
-    assert "interval" not in success_leg
-    assert "resolved_at > w.last_seen_at" in success_leg
+    legs = sql.split("UNION ALL")
+    assert len(legs) == 2                        # 本码一支 + 别名码一支
+    for leg in legs:
+        assert "f.status = 'submitted'" in leg
+        assert "interval '48 hours'" in leg
+        # ② success 那一支不带时间窗:它的解除条件是"被重扫",不是"过了多久"
+        success_leg = leg[leg.index("'success'"):]
+        assert "interval" not in success_leg
+        assert "resolved_at > w.last_seen_at" in success_leg
     assert "'failed'" not in sql
 
 

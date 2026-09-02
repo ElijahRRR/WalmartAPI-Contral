@@ -435,9 +435,14 @@ def test_reason_查不到不兜底_落None加计数加warning(caplog):
     o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
                                {"walmart_policy": "Electronics & RF"})])
     with caplog.at_level("WARNING", logger="services.audit_reason"):
-        assert audit_reason.compute_final_reason(o) is None
-    assert audit_reason.STATS["reason_missing"] == 1
-    assert any("判拒但没有类别" in r.getMessage() for r in caplog.records)
+        for _ in range(3):                 # 同一组规则码来三次
+            assert audit_reason.compute_final_reason(o) is None
+    assert audit_reason.STATS["reason_missing"] == 3          # 计数逐次累加
+    # ⚠ 但 warning **一轮只打一次**:已知缺口每轮能拒成千上万条,逐条打会把
+    #   日志淹掉,而信息量只有第一条(与 audit_l3 那两个计数同款口径)
+    assert len([r for r in caplog.records
+                if "判拒但没有类别" in r.getMessage()]) == 1
+    assert audit_reason.STATS["reason_missing:cat_requires_cert_hard"] == 3
     # ⚠ 旧的 `walmart_policy` 键**不再被读**:类别只认自报的 `category`
     assert audit_reason.compute_final_reason(
         _outcome(hits=[RuleHit("L0", "phase0_forbidden_category", -100,

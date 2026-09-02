@@ -55,7 +55,7 @@ CATEGORY_KEY = "category"
 # 只收一件事:**判拒却给不出类别**。它是"某条硬拒规则忘了自报 category"的
 # 唯一可见信号 —— 判定照样是 reject、落库照样成功,只是类别列空着。
 STATS: Counter = Counter()
-_STATS_KEYS = ("reason_missing",)
+_STATS_KEYS = ("reason_missing",)      # 另有动态键 `reason_missing:<规则码组>`
 _STATS_LOCK = threading.Lock()
 
 
@@ -106,13 +106,18 @@ def compute_final_reason(outcome: Any) -> str | None:
         if policy and policy != "none":
             return policy
 
-    # (3) 没有类别 —— 不兜底。计数进 run 摘要,warning 点名 ASIN 与命中的规则码
+    # (3) 没有类别 —— 不兜底。计数进 run 摘要,warning 点名 ASIN 与命中的规则码。
+    # ⚠ **同一组规则码一轮只警告一次**:已知缺口(R3 硬拒 / R10)每轮能拒掉成千
+    #   上万条,逐条打 warning 会把日志淹掉,而信息量只有第一条;计数照旧逐次累加
+    codes = ",".join(sorted(h.rule_code for h in outcome.all_hits
+                            if h.penalty < 0)) or "(无扣分规则)"
     bump("reason_missing")
-    logger.warning("判拒但没有类别:asin=%s 停在 %s,命中 %s —— 类别列写 NULL"
-                   "(硬拒规则忘了自报 detail['category']?见 audit_reason "
-                   "模块头注的已知缺口)", getattr(outcome, "asin", "?"),
-                   getattr(outcome, "stage_stopped_at", "?"),
-                   [h.rule_code for h in outcome.all_hits])
+    if bump(f"reason_missing:{codes}") == 1:
+        logger.warning("判拒但没有类别:asin=%s 停在 %s,命中 %s —— 类别列写 NULL"
+                       "(硬拒规则忘了自报 detail['category']?见 audit_reason "
+                       "模块头注的已知缺口;同组规则码本轮只警告这一次)",
+                       getattr(outcome, "asin", "?"),
+                       getattr(outcome, "stage_stopped_at", "?"), codes)
     return None
 
 

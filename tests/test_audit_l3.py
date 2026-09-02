@@ -155,6 +155,20 @@ def test_S4_喂的是44篇官方英文全文而不是中文人工列():
     assert "## Product details policy" in block                   # 44 内容族
 
 
+def test_S4_两条SQL的形状是契约():
+    """`ORDER BY id` / `ORDER BY category_en` 都不可省 —— 顺序即前缀缓存命中率;
+    `full_policy IS NOT NULL` 是"空壳不进 S4"的第一道闸(第二道在渲染层)。"""
+    assert audit_l3.POLICY_ROWS_SQL == (
+        "SELECT id, category_en, full_policy "
+        "FROM audit.walmart_prohibited_policy "
+        "WHERE full_policy IS NOT NULL ORDER BY id")
+    assert audit_l3.REASON_CATEGORIES_SQL.endswith("ORDER BY category_en")
+    # 中文人工列一列都不读了(B1 换喂:判据以官方英文原文为准)
+    for col in ("category_zh", "overall_status", "prohibited_items",
+                "zh_seller_risk", "zh_seller_notes"):
+        assert col not in audit_l3.POLICY_ROWS_SQL, col
+
+
 def test_S4_剥掉URL并按id序拼接():
     """喂入版由 policy_feed 渲染:URL 一条不留(对判定零贡献、徒耗 token),
     顺序 = 入参顺序(SQL 是 ORDER BY id)—— 顺序即前缀缓存命中率。"""

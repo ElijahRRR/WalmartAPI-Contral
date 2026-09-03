@@ -19,6 +19,7 @@ class _Claims:
         self.online = online
         self._last: list = []
         self.sql: list = []
+        self.events: list = []      # ops.store_events 的 executemany 落行
 
     # --- cursor 协议 ---
     def cursor(self):
@@ -63,6 +64,11 @@ class _Claims:
         else:
             self._last = []
 
+    def executemany(self, sql, seq):
+        self.sql.append(sql)
+        if "INSERT INTO ops.store_events" in sql:
+            self.events.extend(seq)
+
     def _active(self, kind, key):
         return [r for r in self.rows if r["status"] == "active"
                 and r["kind"] == kind and r["claim_key"] == key]
@@ -95,19 +101,64 @@ def test_claim_is_idempotent_for_same_store():
     c = _Claims()
     claims.try_claim(c, claims.PRODUCT, "B0X", "A085", "t")
     assert claims.try_claim(c, claims.PRODUCT, "B0X", "A085", "t") == "A085"
-    ok, conflicts = claims.claim_many(
+    ok, conflicts, landed = claims.claim_many(
         c, [{"kind": claims.PRODUCT, "claim_key": "B0X", "store": "A085"}])
     assert (ok, conflicts) == (1, [])          # 同店重复 = 成功,不是冲突
+    # ★ 但**本轮没有落库**:事件账本按 landed 记,否则天天重跑天天记一条
+    assert landed == []
 
 
 def test_claim_many_separates_ok_and_conflicts():
     c = _Claims(seed=[("brand", "acme", "A085")])
-    ok, conflicts = claims.claim_many(c, [
+    ok, conflicts, landed = claims.claim_many(c, [
         {"kind": "brand", "claim_key": "acme", "store": "A107"},
         {"kind": "brand", "claim_key": "beta", "store": "A107"},
     ])
     assert ok == 1
     assert conflicts == [("brand", "acme", "A107", "A085")]
+    assert [r["claim_key"] for r in landed] == ["beta"]
+
+
+def test_claim_created_rows_counts_only_real_inserts():
+    """★ 幂等重跑零新增:同一批喂两遍,第二遍一条事件都不该产。
+
+    `ok` 把"早就占在自己名下"也算成功(摘要口径,不动);拿它记账的话
+    alloc_backfill(天生幂等,每天重跑同一批在线行)会在账本上天天多一条
+    "新占 N 千条"的假事件 —— 而账本是只追加的,假事件删不掉。
+    """
+    c = _Claims()
+    rows = [{"kind": claims.BRAND, "claim_key": "acme", "store": "A085"},
+            {"kind": claims.PRODUCT, "claim_key": "B0X", "store": "A085"},
+            {"kind": claims.PRODUCT, "claim_key": "B0Y", "store": "A107"}]
+    ok, _c, landed = claims.claim_many(c, rows)
+    evs = claims.claim_created_rows(landed, "alloc_plan")
+    assert ok == 3 and len(landed) == 3
+    assert [(e["store"], e["severity"]) for e in evs] == [
+        ("A085", "info"), ("A107", "info")]
+    assert evs[0]["detail"]["brand"] == 1 and evs[0]["detail"]["product"] == 1
+    assert evs[0]["detail"]["sample"] == ["brand:acme", "product:B0X"]
+    # 第二遍:ok 照样是 3(幂等成功),但真落库行为 0 ⇒ 零事件
+    ok2, _c2, landed2 = claims.claim_many(c, rows)
+    assert ok2 == 3 and landed2 == []
+    assert claims.claim_created_rows(landed2, "alloc_plan") == []
+
+
+def test_released_rows_severity_by_scope():
+    """整店释放 high、点名/csv mid;标缺席行数进 detail(同一动作的另一半后果)。"""
+    freed = [("brand", "acme", "A085"), ("product", "B0X", "A085")]
+    whole = claims.released_rows(freed, source="store_release", scope="store",
+                                 reason="清死店", marked={"A085": 120})
+    assert len(whole) == 1 and whole[0]["severity"] == "high"
+    assert whole[0]["detail"]["marked_offline"] == 120
+    assert whole[0]["detail"]["scope"] == "store"
+    named = claims.released_rows(freed, source="store_release", scope="named",
+                                 reason="归属调整")
+    assert named[0]["severity"] == "mid"
+    assert "marked_offline" not in named[0]["detail"]
+    csv_rows = claims.released_rows(freed, source="store_release", scope="csv",
+                                    reason="批量")
+    assert csv_rows[0]["severity"] == "mid"
+    assert claims.released_rows([], source="x", scope="store", reason="r") == []
 
 
 def test_kind_and_empty_key_are_rejected():
@@ -254,6 +305,37 @@ def test_store_release_execute_frees_and_marks_offline(monkeypatch):
     assert any("UPDATE catalog.walmart_items" in s for s in c.sql)
 
 
+def test_store_release_records_a_high_governance_event_for_a_whole_store(monkeypatch):
+    """★ 整店释放 = high,且**与释放同一个事务**。
+
+    整店释放通常紧跟"这家店没了";下一轮分配就会把这些品牌发给别的店,
+    那一步不可逆。台账落了而事件没落的话,事后按事件流回查这家店的一生
+    会缺掉最重的那一笔。标缺席行数一起带进 detail(同一动作的另一半后果)。
+    """
+    import json
+    c = _Claims(seed=[("brand", "acme", "A085"), ("product", "B0X", "A085")])
+    _wire_rel(monkeypatch, c)
+    rel.run({"store": "A085", "execute": True})
+    assert len(c.events) == 1
+    store, event, severity, source, detail = c.events[0]
+    assert (store, event, severity) == ("A085", "claim_released", "high")
+    assert source == "store_release"
+    d = json.loads(detail)
+    assert d["brand"] == 1 and d["product"] == 1 and d["scope"] == "store"
+    assert "marked_offline" in d               # 在线快照校正的行数(假游标 0 行)
+    assert "reason" in d and len(d["sample"]) == 2
+
+
+def test_a_named_release_is_only_mid(monkeypatch):
+    """点名释放:货还在架上、店还在正常经营 —— 是个别归属调整,不是 high。"""
+    import json
+    c = _Claims(seed=[("brand", "acme", "A085")])
+    _wire_rel(monkeypatch, c)
+    rel.run({"brand": "acme", "execute": True})
+    assert len(c.events) == 1 and c.events[0][2] == "mid"
+    assert json.loads(c.events[0][4])["scope"] == "named"
+
+
 def test_store_release_can_skip_offline_marking(monkeypatch):
     c = _Claims(seed=[("brand", "acme", "A085")])
     _wire_rel(monkeypatch, c)
@@ -370,6 +452,11 @@ class _BfCur:
 
     def __init__(self, items, status):
         self.items, self.status, self._rows = items, status, []
+        self.events: list = []
+
+    def executemany(self, sql, seq):
+        if "INSERT INTO ops.store_events" in sql:
+            self.events.extend(seq)
 
     def execute(self, sql, args=None):
         if "product_type, btrim" in sql:
@@ -412,8 +499,9 @@ def _wire_bf(monkeypatch, items, status, captured):
     monkeypatch.setattr(bf.store_targets, "load_targets",
                         lambda: {"在营店": {"categories": [], "max_online": 500.0},
                                  "停用店": {"categories": [], "max_online": 500.0}})
-    monkeypatch.setattr(bf.claims, "claim_many",
-                        lambda conn, rows: (captured.extend(rows), (len(rows), []))[1])
+    monkeypatch.setattr(
+        bf.claims, "claim_many",
+        lambda conn, rows: (captured.extend(rows), (len(rows), [], rows))[1])
 
 
 def test_backfill_claims_for_a_suspended_store_too(monkeypatch):

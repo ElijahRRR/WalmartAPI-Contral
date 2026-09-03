@@ -36,7 +36,7 @@ from datetime import datetime
 from api import _client, feeds
 from registry import db
 from services import clear_sheet, feed_track, kpi, product_events, \
-    store_limits, store_retry, stores as stores_svc
+    store_events, store_limits, store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -131,6 +131,9 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         return limit
 
     partial: dict[str, list] = {}     # 各店逐片追加的 updates(异常也不丢)
+    limit_by_store: dict[str, int] = {}   # 各店本轮生效上限(_limit_of 带告警
+    # 副作用,只在 _one_store 里调那一次;账本要它才能回答"这轮是被上限截的
+    # 还是本来就只有这么多")
 
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
         """输入:店铺 + 该店待提交行 → 输出:(店铺名, updates, lines, 提交数, 延后数)。
@@ -151,7 +154,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
         updates_s: list = partial.setdefault(store_name, [])
         lines_s: list[str] = []
         submitted_s = 0
-        limit = _limit_of(store_name)
+        limit = limit_by_store[store_name] = _limit_of(store_name)
         take, defer = srows[:limit], srows[limit:]
         by_action: dict[str, list[dict]] = {}
         for r in take:
@@ -246,12 +249,22 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
             if gate_note:
                 lines.append(gate_note)
         # 按店名排序合并:完成先后随机,updates 与摘要的顺序不能跟着随机
+        round_cnt: dict[str, dict] = {}
         for name, _ in todo:
             u, ls, sub, defr = per_store[name]
             updates.extend(u)
             lines.extend(ls)
             submitted += sub
             deferred += defr
+            round_cnt[name] = {"submitted": sub, "deferred": defr,
+                               "limit": limit_by_store.get(name, default_limit)}
+        # ⚠ **必须显式 `if execute`**:本件是五条链里唯一没有 dry-run 早退的
+        #   —— dry-run 也会走到这儿(只是 _one_store 里不提交),不套这层判断
+        #   就会给空跑记一整轮假的运营流水
+        if execute:
+            store_events.record_round_safe("product_clear",
+                                           store_events.CLEAR_ROUND,
+                                           round_cnt, lines)
 
     if good or bad:
         # 本轮行数:真跑报实际提交数,空跑按**各店自己的上限**截断后求和。

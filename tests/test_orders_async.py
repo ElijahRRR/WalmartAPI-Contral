@@ -1,8 +1,26 @@
 """api/orders async 变体(蓝图 §6.3)回归:多店并发拉取的同步门面。"""
 
 import httpx
+import pytest
 
 from api import _client, orders as orders_api
+
+
+@pytest.fixture(autouse=True)
+def _clean_client_state():
+    """换 token 走的是 _client 的同步连接池(按代理维度缓存 transport),
+    上一个用例装的 MockTransport 会留在池里,本用例的桩根本接不到 /v3/token。"""
+    _client._token_cache.clear()
+    _client._rate_state.clear()
+    for c in _client._client_pool.values():
+        c.close()
+    _client._client_pool.clear()
+    yield
+    for c in _client._client_pool.values():
+        c.close()
+    _client._client_pool.clear()
+    _client._token_cache.clear()
+    _client._rate_state.clear()
 
 
 def _seam(monkeypatch, handler):
@@ -104,3 +122,130 @@ def test_bulk_429_retries_then_succeeds(monkeypatch):
         [_store("T1")], created_start="2026-08-01T00:00:00Z")
     assert not dead and not failed
     assert results[0]["orders"] == 1 and hits["n"] == 2
+
+
+# ── 2026-09-02 下单时间事故后补的三道口子 ──────────────────────────────────────
+
+async def _nosleep(_s):
+    return None
+
+
+def test_bulk_stops_on_repeated_cursor_and_flags_overcount(monkeypatch, caplog):
+    """同 cursor 重复 = 服务端未推进,立即停(照抄 api/returns 三道闸);
+    实拉对象数 > totalCount 是翻页重放/对象重复的指纹,必须响亮。"""
+    calls = []
+
+    def handler(req: httpx.Request):
+        calls.append(str(req.url))
+        return _page([{"purchaseOrderId": "PO1"}], next_cursor="?cursor=same", total=1)
+
+    _seam(monkeypatch, handler)
+    got = {}
+    with caplog.at_level("WARNING"):
+        results, dead, failed = orders_api.fetch_orders_bulk(
+            [_store("T1")], created_start="2026-08-01T00:00:00Z",
+            handler=lambda s, orders: got.setdefault("n", len(orders)))
+    assert len(calls) == 2 and not failed          # 第 2 页 cursor 重复即停
+    assert got["n"] == 2                            # api 层不去重,交 services 先到者胜
+    assert "nextCursor 重复" in caplog.text
+    assert "> 服务端 totalCount 1" in caplog.text
+
+
+def test_async_socks_error_is_retried_not_fatal(monkeypatch):
+    """SOCKS 层异常不在 httpx 异常树上(08-26 事故根因):异步路径此前只接
+    httpx.HTTPError,一次 Malformed reply 直接穿出去。现在与同步路径同口径退避重试。"""
+    from socksio.exceptions import ProtocolError
+    state = {"n": 0}
+
+    def handler(req: httpx.Request):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ProtocolError("Malformed reply")
+        return _page([{"purchaseOrderId": "PO1"}], total=1)
+
+    _seam(monkeypatch, handler)
+    monkeypatch.setattr(orders_api.asyncio, "sleep", _nosleep)
+    results, dead, failed = orders_api.fetch_orders_bulk(
+        [_store("T1")], created_start="2026-08-01T00:00:00Z",
+        handler=lambda s, orders: len(orders))
+    assert not failed and not dead and results[0]["lines"] == 1
+
+
+def test_async_refreshed_token_is_reused_on_next_page(monkeypatch):
+    """401 自愈刷新的 token 此前只活在 _get_async 的形参里,第 2 页起整店拿死 token
+    翻页 → 被误判凭证失效。现在每页从缓存取新 token。"""
+    _client._token_cache.clear()
+    tokens = {"n": 0}
+    seen_tokens = []
+
+    def full(req: httpx.Request):
+        if req.url.path == "/v3/token":
+            tokens["n"] += 1
+            return httpx.Response(200, json={"access_token": f"tok-{tokens['n']}",
+                                             "expires_in": 900})
+        seen_tokens.append(req.headers.get("WM_SEC.ACCESS_TOKEN"))
+        if "cursor=p2" in str(req.url):
+            return _page([{"purchaseOrderId": "PO2"}])
+        if seen_tokens.count("tok-1") == 1 and len(seen_tokens) == 1:
+            return httpx.Response(401, json={})        # 首页第一次:token 死了
+        return _page([{"purchaseOrderId": "PO1"}], next_cursor="?cursor=p2", total=2)
+
+    monkeypatch.setattr(_client, "_build_transport",
+                        lambda proxy: httpx.MockTransport(full))
+    results, dead, failed = orders_api.fetch_orders_bulk(
+        [_store("T1")], created_start="2026-08-01T00:00:00Z",
+        handler=lambda s, orders: len(orders))
+    assert not dead and not failed and results[0]["lines"] == 2
+    assert seen_tokens == ["tok-1", "tok-2", "tok-2"]   # 刷新后第 2 页用的是新 token
+
+
+def test_correlation_id_echo_mismatch_is_logged(monkeypatch, caplog):
+    """沃尔玛回显的 WM_QOS.CORRELATION_ID 与请求不符 = 响应错配的唯一现场证据,
+    必须告警(先不拒收);回显一致或没回显都安静。"""
+    mode = {"echo": "same"}
+
+    def handler(req: httpx.Request):
+        sent = req.headers.get("WM_QOS.CORRELATION_ID")
+        hdr = {}
+        if mode["echo"] == "same":
+            hdr["WM_QOS.CORRELATION_ID"] = sent
+        elif mode["echo"] == "other":
+            hdr["WM_QOS.CORRELATION_ID"] = "00000000-0000-0000-0000-000000000000"
+        r = _page([{"purchaseOrderId": "PO1"}], total=1)
+        r.headers.update(hdr)
+        return r
+
+    _seam(monkeypatch, handler)
+    for echo, expect_warn in (("same", False), ("none", False), ("other", True)):
+        mode["echo"] = echo
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            results, dead, failed = orders_api.fetch_orders_bulk(
+                [_store("T1")], created_start="2026-08-01T00:00:00Z",
+                handler=lambda s, orders: len(orders))
+        assert not dead and not failed and results[0]["lines"] == 1
+        assert ("响应相关 ID 与请求不符" in caplog.text) is expect_warn, echo
+
+
+def test_get_order_detail_endpoint(monkeypatch):
+    """蓝图 #31 单单详情:带 replacementInfo=true;404 返 None;401 判凭证死;
+    走 orders.get 限速桶(未登记的桶会 KeyError,这里顺便证明它登记了)。"""
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append(str(req.url))
+        if req.url.path.endswith("/PO404"):
+            return httpx.Response(404, json={})
+        if req.url.path.endswith("/PODEAD"):
+            return httpx.Response(401, json={})
+        return httpx.Response(200, json={"order": {"purchaseOrderId": "PO1",
+                                                   "orderDate": 1754300000000,
+                                                   "orderType": "REGULAR"}})
+    _seam(monkeypatch, handler)
+    o = orders_api.get_order(_store("T1"), "PO1")
+    assert o["orderDate"] == 1754300000000 and o["orderType"] == "REGULAR"
+    assert seen[-1].endswith("/v3/orders/PO1?replacementInfo=true&productInfo=false")
+    assert orders_api.get_order(_store("T1"), "PO404") is None
+    import pytest as _pt
+    with _pt.raises(_client.StoreDeadError):
+        orders_api.get_order(_store("T1"), "PODEAD")

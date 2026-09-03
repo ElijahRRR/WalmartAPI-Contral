@@ -8,6 +8,11 @@
 > `docs/ebay_plan.md`、`docs/ebay_api_blueprint.md` 冲突处本文胜(08-25
 > 两文档的已知错误集中在 §9 勘误清单,P1-1 首任务统一回改)。一期不做的域
 > (订单/售后/结算/维护巡检/变体)仍以 ebay_plan 批次 5~11 为纲。
+> **2026-09-03 对齐 main #85/#99/#100~#110**(一店多仓、店铺事件账本+风险
+> 追溯、报错归类、下单时间、绩效归因):新增 §4.4(risk_trace 四证据源平台
+> 谓词,blocker)、§2.1 事件桥跳过 eBay、§6.1 多仓与报错归类两条边界;
+> claims/load_active 调用面已现场重核。⚠ 本文引用的仓库行号以 **2026-09-03
+> 的 main** 为快照,批次实施时现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
 
@@ -49,7 +54,7 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 - 唯一索引:`claims_active_uniq (kind, claim_key) WHERE active` →
   **`claims_active_platform_uniq (platform, kind, claim_key) WHERE active`**
   (schema.sql 原行原地替换 + `DROP INDEX IF EXISTS claims_active_uniq`,
-  迁移块按 §4.6 纪律)。加 `platform text NOT NULL DEFAULT 'walmart'` 列
+  迁移块按 §4.5 纪律)。加 `platform text NOT NULL DEFAULT 'walmart'` 列
   (SQL DEFAULT 里的字面量是唯一例外;代码一律引 `registry.platforms` 常量,
   §3.3)。
 - `services/claims.py` 现为**五条 SQL**(#93 已删 `_BY_STORE`/`owner_of`/
@@ -61,15 +66,25 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   platform 谓词**。`load_active(conn, kind, *, platform)` 的 platform 做成
   **必填关键字参数**;每平台唯一后 `_LOAD` 的 `dict(cur.fetchall())` 塌陷坑
   真实存在(同 key 两平台各一行),谓词本身就是修复。
-- **调用面全量**(P1-2 验收写明"以下红/改是预期内的"):读侧
-  `load_active` **6 文件 9 处**(alloc_plan:192,193 / alloc_audit:187,188 /
-  list_new:374,377 各两处 / alloc_products:96 / alloc_push:69 /
-  claim_audit:96)全部显式传 walmart 常量;写侧 `claim_many` 2 处
-  (alloc_plan:397、alloc_backfill:161);测试替身 8 处(test_alloc_push:43、
-  test_alloc_plan:220/264/325/474、test_list_new:709/1364、test_claim_audit:26)
-  与 test_claims:135 位置调用。**`try_claim` 仍返回 store 字符串**(同平台性
-  由 `_OWNER` 的 platform 谓词保证,"同时比 platform"冗余;Owner 具名改形
-  留二期)——`alloc_backfill:164` 的四元组解包因此不动。
+- **调用面全量**(2026-09-03 对齐 main #85/#99 后现场重核;P1-2 验收写明
+  "以下红/改是预期内的"):读侧 `load_active` **6 文件 9 处**
+  (alloc_push:69 / alloc_plan:193,194 / claim_audit:96 / alloc_audit:187,188 /
+  alloc_products:96 / list_new:383,386)全部显式传 walmart 常量;写侧
+  `claim_many` 2 处(alloc_plan:398、alloc_backfill:162)——⚠ 它在 #85 后
+  **返回三元组 `(ok, conflicts, landed)`**,两处调用点已按三元组解包,平台化
+  不改这个形态;测试替身 test_alloc_push:43、test_alloc_plan:221/265/326…、
+  test_claims:104/186 等。**`try_claim` 仍返回 store 字符串**(同平台性由
+  `_OWNER` 的 platform 谓词保证;Owner 具名改形留二期)。
+- 🔴 **事件桥必须显式跳过 eBay(#99 新增,本设计原稿完全没有)**:`claims`
+  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:402、
+  alloc_backfill:165)与 `released_rows`(store_release:216/325/385),它们把
+  占用/释放写进 **`ops.store_events`**——而那张账本的身份键是 `store`、
+  语义是**沃尔玛店铺状态迁移与 TRO 封店预警**(`store_watch` 按 store 扫描
+  并分级)。eBay 账号名写进去 = 账本里出现一家**不存在的沃尔玛店**,其占用
+  事件还会混进沃尔玛店的封店预警计数,**两个方向都不报错**。一期定稿:
+  **eBay 上架链不记 `store_events`**(eBay 没有对位的店铺状态迁移语义),
+  在 eBay 领用分支显式不调这两个桥并写明理由;二期若要给 eBay 建店铺账本,
+  `ops.store_events` 需要自己的平台维度,不许直接混写。
 - `_RELEASE/_PREVIEW` 的 platform 对 **store_release 必填**:它支持
   `-p asin=`/`-p brand=` 不带 store 的手工释放,每平台唯一后按 key 释放会把
   **另一平台的占用一起放掉且不报错**(r3 当时按旧口径判"不触发"的豁免已随
@@ -241,9 +256,9 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   (⚠ 按名导入,模块名会被 run(params) 形参遮住);摘要一律
   `notify_fmt.head/summary`。八条新 workflow 统一,不许各自手搓。
 
-## 四、P1-2 库批次(约 6 人日)
+## 四、P1-2 库批次(约 7 人日)
 
-### 4.1 DDL 清单(照 §4.6 迁移纪律)
+### 4.1 DDL 清单(照 §4.5 迁移纪律)
 
 | 对象 | 动作 |
 |---|---|
@@ -251,8 +266,8 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 | `catalog.upc_usage` | 新表(§2.2)+ 存量回填 + 三条索引 |
 | `ops.feed_log` | + `platform`;`feed_log_dedupe_uidx` → `feed_log_dedupe_v2_uidx (platform, feed_type, store, payload_key)` 原地替换 |
 | `ops.feed_items` / `feed_item_errors` | + `platform` 标注列(主键不动——**该论证只覆盖 offer/publish 两阶段**:eBay 台账 `feed_items` 只落这两阶段的行,`feed_id` 分别存 offerId/listingId,`(feed_id, sku)` 不撞;**ebay_item 阶段不落 feed_items**,由 `feed_log` pending/submitted 承接——PUT 幂等可重放、204 无 id 可记,硬造 feed_id=sku 会在换账号重上时撞主键静默丢行) |
-| `catalog.product_events` | + `platform` + 5 视图 DROP 重建(`audit_listing_conflicts` 的 EXPLAIN 必须仍走 `product_events_identity_idx`);**非视图消费方(blacklist/_LATEST_CTE、problem_scan 三条、sku_normalize、audit_history_fold、cleanup_history_import、dispositions._SETTLE_DELETE_SQL)一期不改,依据=eBay 事件码与沃尔玛零重合(逐条列名进实现注释);二期给沃尔玛加任何同名事件码前必须先补谓词** |
-| `catalog.listing_sources` | + `platform` 标注列;schema.sql 存量回填 INSERT 显式补 walmart(三处消费方都锚在 walmart_items 上,JOIN 即天然谓词) |
+| `catalog.product_events` | + `platform` + 5 视图 DROP 重建(`audit_listing_conflicts` 的 EXPLAIN 必须仍走 `product_events_identity_idx`);**按事件码过滤的非视图消费方(blacklist/_LATEST_CTE、problem_scan 三条、sku_normalize、audit_history_fold、cleanup_history_import、dispositions._SETTLE_DELETE_SQL)一期不改,依据=eBay 事件码与沃尔玛零重合(逐条列名进实现注释);二期给沃尔玛加任何同名事件码前必须先补谓词**。🔴 **例外:`services/risk_trace` 不按事件码过滤,必须补平台谓词——见 §4.4** |
+| `catalog.listing_sources` | + `platform` 标注列;schema.sql 存量回填 INSERT 显式补 walmart。⚠ 原稿"三处消费方都锚在 walmart_items 上,JOIN 即天然谓词"**已被 #99 推翻**:`risk_trace` 按 `source_key` 反查、不 JOIN 任何平台表(`listing_sources_key_idx` 就是为它建的)——见 §4.4 |
 | `catalog.ebay_items` | 新表(一期空表;状态列 **text 不加 CHECK**——沙箱 C3 卡的是 submit_poll 的 withdraw 后判据与状态字面量首次落 SQL,**不卡建表**) |
 | `catalog.ebay_accounts` | 新表:account, marketplace_id, 三 policyId, merchant_location_key, opted_in_at, privileges_json, sampled_at,PK (account, marketplace_id) |
 | `ops.ebay_tokens` | 新表(§3.4,含 REVOKE 守卫) |
@@ -280,7 +295,36 @@ CHAINS`),同表串行纪律照抄。
 专属规则,eBay SKU 口径将来会变;一期 SKU=ASIN 时两种写法碰巧同值,不许
 以此当依据)。eBay 事件码同批进 `EVENTS` 与 `_FEED_KIND`。
 
-### 4.6 迁移块纪律(订正 ebay_plan §3.6)
+### 4.4 🔴 风险追溯四证据源的平台谓词(P1-2 同批,blocker 级)
+
+**2026-09-03 合并 main #99 后新增,原稿完全没有这一节。** `services/risk_trace`
+是店铺事件账本(`ops.store_events`)的波及展开引擎,四证据源里**三个直接读
+共享表且既不带平台谓词、也不 JOIN 任何平台专属表**——`claims_key_all_idx`
+与 `listing_sources_key_idx` 这两条新索引就是为它建的:
+
+| 证据源 | SQL 形态 | eBay 行进表后的后果 |
+|---|---|---|
+| ① `catalog.walmart_items` | 按 sku 查 | 平台专属表,**天然安全** |
+| ② `catalog.listing_sources` | `WHERE source_type='amz' AND source_key = ANY(...)` | eBay 的登记行被算成沃尔玛店的波及范围 |
+| ③ `catalog.product_events` | `WHERE coalesce(asin,sku) = ANY(...) AND store IS NOT NULL` — **不按事件码过滤** | §4.1 的"eBay 事件码零重合"论证对它**不成立**,eBay 事件行全被捞进来 |
+| ④ `catalog.claims` | `WHERE kind=? AND claim_key = ANY(...)`,**含 released 行** | eBay 占用/历史归属混进沃尔玛追溯 |
+
+消费方是**生产在跑的风控链**:`workflows/order_audit`(钓鱼单按品牌展开)、
+`workflows/product_audit`(TRO 波及逐店)、`services/store_events`(exposure
+行)。后果形状:波及展开报出一家**不存在的沃尔玛店**(store 列装的是 eBay
+账号名),运营照着它去停店/清货,而**两个方向都不报错**——正是 CLAUDE.md
+点名的那类事故。
+
+**定稿**:②③④ 三条 SQL 在 P1-2 同批补 `platform = 'walmart'` 谓词(常量引
+`registry.platforms`);`stores_of_brand` 等入口签名加 `platform` **必填关键字
+参数不给默认值**,逼 order_audit / product_audit / store_events 三个调用点
+显式声明意图。⚠ 加谓词后 ④ 的 `claims_key_all_idx (kind, claim_key)` 仍可用
+(前导列匹配、platform 回表过滤),**不要**顺手把它改成带 platform 的三列索引
+——它的存在理由是读 released 行做历史归属,与 active 唯一索引是两回事。
+验收:P1-2 加一格「造一条 eBay claims + listing_sources + product_events 行,
+`risk_trace` 展开结果必须一行不含该 eBay 账号」。
+
+### 4.5 迁移块纪律(订正 ebay_plan §3.6)
 
 schema.sql 现有**四处** `DO $$`(:66/:579/:608/:1300),**:579-589 是嵌套 IF
 范例**,注释逐字:"平铺 AND 会在计划期解析表名,重跑必炸 UndefinedTable
@@ -368,6 +412,14 @@ sku) 计次上限 3(对位沃尔玛 `MAX_LIST_ATTEMPTS=3`;没有它,永久失败
 SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 逐行闸:brand_key 黑名单/库存三态/渠道/运费/落地价/lead/定制品闸
 `is_customized`/图片全 https(services 层预校验)。
+⚠ **两条与 main #85/#102 的边界(2026-09-03 补)**:① `list_new` 在 #85 后按
+**受管仓节点**切 shipNode、`catalog.walmart_items` 有 `node_count`、库存读
+`avail_qty` 全节点合计——eBay 一期是**单 `merchantLocationKey`**,不做多节点,
+对位的是"一个仓位常量",不许照抄多仓分配那段(二期若上多仓需另设计);
+② 沃尔玛报错归类引擎(`services/error_taxonomy` + `refdata/policy_pages/`
+42 类中英语料)是**沃尔玛政策页专属**,eBay 错误码走 `registry` 常量 +
+`docs/ebay_phase1_reference.md` §1 的官方码表,**一期不接入 error_taxonomy**
+(语料与判据不同源,接进去就是双轨);二期若要 eBay 报错归类,另立语料。
 
 ### 6.2 双闸配额与熔断
 
@@ -470,12 +522,12 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
-| P1-2 | 全部 DDL+claims/upc 改造+台账谓词补全+events 契约 | 6 | db_init 两跑+六格对拍+读 SQL count·md5 对拍/沃尔玛上架与分配链 --dry-run 摘要逐字一致(9+2 处调用点改动预期红清单)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数 |
+| P1-2 | 全部 DDL+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑+六格对拍+读 SQL count·md5 对拍/沃尔玛上架与分配链 --dry-run 摘要逐字一致(9+2 处调用点改动预期红清单)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |
 
-合计 **≈36 人日 + 2 周试点观察**。P1-3 的 taxonomy 半批**编码**可与 P1-2
+合计 **≈37 人日 + 2 周试点观察**。P1-3 的 taxonomy 半批**编码**可与 P1-2
 并行,**跑通与验收必须等 P1-2 的三张 audit 表落地**(ebay_plan §5.0 同款
 前置教训)。**一期全部 eBay workflow 不进 `registry/schedule.JOBS`**(手动
 跑,`ebay_authorize` 同 store_release 归"不在表里=手动"清单;上调度随二期

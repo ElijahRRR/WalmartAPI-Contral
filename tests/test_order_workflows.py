@@ -53,6 +53,9 @@ class _FakeCursor:
 
     def fetchall(self):
         sql, args = self._last
+        # 下单时间写一次守卫的在库比对:假装库里没有(首见行,冲突路径有专门单测)
+        if isinstance(args, dict):
+            return []
         # 烂账过滤的在库查询:假装全部在库(过滤行为有专门单测)
         if "= ANY(" in sql and args:
             return [(x,) for x in args[0]]
@@ -99,7 +102,13 @@ def _fake_stores(monkeypatch, module):
 def test_order_sync_end_to_end(monkeypatch):
     from workflows import order_sync
 
+    detail_calls = []
+
     def handler(request):
+        if request.url.path == "/v3/orders/PO1":          # 新单首见:详情定稿
+            detail_calls.append(str(request.url))
+            return httpx.Response(200, json={"order": {
+                "purchaseOrderId": "PO1", "orderDate": 1754300000000}})
         assert request.url.path == "/v3/orders"
         assert "createdStartDate" in str(request.url)
         return httpx.Response(200, json={"list": {
@@ -119,11 +128,108 @@ def test_order_sync_end_to_end(monkeypatch):
 
     out = order_sync.run({"days": "7"})
     assert "1/1 店完成" in out and "订单行入库 2" in out
-    kind, sql, rows = calls[0]
-    assert kind == "many" and "orders.order_lines" in sql
+    assert "下单时间冲突" not in out       # 库里没有 = 首见,不是冲突
+    assert len(detail_calls) == 1 and "replacementInfo=true" in detail_calls[0]
+    assert ";详情复核 1 次" in out.splitlines()[0]
+    kind, sql, rows = next(c for c in calls if c[0] == "many")
+    assert "orders.order_lines" in sql
     assert {r["sku"] for r in rows} == {"A", "B"}
+    assert all(r["order_date_confirmed"] and r["order_date_source"] == "detail" for r in rows)
     # 审核列绝不在 upsert 列内(重拉不得冲掉审核结论)
     assert "audit_status" not in sql
+    # 下单时间观测→定稿:默认模式 upsert 走状态守卫,不是裸 EXCLUDED
+    assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
+
+
+def _order_sync_with_conflict(monkeypatch, params):
+    """跑一次 order_sync,库里 PO1/A 已有另一个下单时间 → 返回 (摘要, upsert 收到的 kwargs)。"""
+    from datetime import datetime, timezone
+
+    from workflows import order_sync
+
+    api_ts = 1754300000000
+    db_dt = datetime(2026, 9, 9, 4, 12, tzinfo=timezone.utc)
+
+    def handler(request):
+        if request.url.path == "/v3/orders/PO1":          # 详情:本用例让它不可用(404)
+            return httpx.Response(404, json={})
+        return httpx.Response(200, json={"list": {
+            "elements": {"order": [{
+                "purchaseOrderId": "PO1", "orderDate": api_ts,
+                "orderLines": {"orderLine": [
+                    {"lineNumber": "1", "item": {"sku": "A"},
+                     "orderLineQuantity": {"amount": "1"}}]}}]},
+            "meta": {"totalCount": 1}}})
+
+    class _Cur(_FakeCursor):
+        def fetchall(self):
+            sql, args = self._last
+            if isinstance(args, dict):     # 在库比对:PO1/A 已有另一个值(首见未定稿)
+                return [(lid, "PO1", "A", db_dt, None, False, None, 0, None) for lid in args["ids"]]
+            return super().fetchall()
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _Cur(self.store)
+
+    from registry import db
+
+    calls: list = []
+
+    @contextlib.contextmanager
+    def fake_conn():
+        yield _Conn(calls)
+    monkeypatch.setattr(db, "pg_conn", fake_conn)
+    _use(monkeypatch, handler)
+    _fake_stores(monkeypatch, order_sync)
+    monkeypatch.setattr(order_sync.order_center, "push_after",
+                        lambda *a, **k: "订单中心:0 行")
+
+    seen_kwargs: dict = {}
+    real_upsert = ol.upsert_order_lines
+
+    def spy_upsert(conn, rows, **kw):
+        seen_kwargs.update(kw)
+        return real_upsert(conn, rows, **kw)
+    monkeypatch.setattr(order_sync.ol, "upsert_order_lines", spy_upsert)
+    return order_sync.run(params), seen_kwargs, calls
+
+
+def test_order_sync_conflict_is_named_in_first_line_and_db_value_kept(monkeypatch):
+    """所有者定稿 2026-09-02:下单时间是事实,库值不得被静默改写;不一致必须
+    点名进摘要首行(链通知只发首行),默认模式 upsert 走 COALESCE 守卫。"""
+    out, kw, calls = _order_sync_with_conflict(monkeypatch, {"days": "7"})
+    first = out.splitlines()[0]
+    assert ";沃尔玛下单时间回错 1 条已挡" in first and "⚠ 下单时间" not in first
+    assert "T1 PO PO1[待定]:库 09/09 04:12 / API 08/04" in out
+    assert kw == {}                      # 默认路径不带修复开关
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
+    # upsert 之后另发观测记账,且不碰 updated_at
+    state = [c for c in calls if c[0] == "many" and c[1].startswith("UPDATE orders.order_lines t SET order_date_confirmed")]
+    assert len(state) == 1 and "updated_at" not in state[0][1]
+
+
+def test_order_sync_repair_mode_needs_explicit_po_list(monkeypatch):
+    """-p repair_order_date=<PO 列表> 才允许 API 值覆盖,且只覆盖列出的 PO:摘要标明
+    修复模式,该 PO 的 upsert 去掉状态守卫改成整列覆盖;裸开关一律报错(沃尔玛每轮
+    都回错十来条,整库改写等于把错值抄进来)。"""
+    out, kw, calls = _order_sync_with_conflict(
+        monkeypatch, {"days": "7", "repair_order_date": "PO1, PO9"})
+    assert "(修复模式:2 个 PO 已按 API 值改写)" in out.splitlines()[0]
+    assert kw == {"repair_order_date": True}
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "t.order_date_confirmed" not in sql
+    assert "order_date = EXCLUDED.order_date" in sql
+    # 没点名的 PO 走默认守卫
+    out, kw, calls = _order_sync_with_conflict(
+        monkeypatch, {"days": "7", "repair_order_date": "PO9"})
+    assert "修复模式" in out.splitlines()[0] and kw == {}
+    _k, sql, _rows = next(c for c in calls if c[0] == "many")
+    assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
+    for bare in ("1", "true", "yes"):
+        with pytest.raises(ValueError, match="需要 PO 列表"):
+            _order_sync_with_conflict(monkeypatch, {"days": "7", "repair_order_date": bare})
 
 
 def test_returns_sync_end_to_end(monkeypatch):
@@ -176,7 +282,8 @@ def test_returns_sync_all_stores_dead_is_not_success(monkeypatch):
 
 def test_perf_rows_from_problems():
     rows = [
-        {"po_no": "PO1", "sku": "B0X", "accountable": "✅ 是", "raw": "{}"},
+        {"po_no": "PO1", "sku": "B0X", "accountable": "✅ 是", "raw": "{}",
+         "sub_category": "No Carrier Scan"},
         {"po_no": "PO1", "sku": "", "accountable": "⚪ 否", "raw": "{}"},
         {"po_no": "", "sales_order_no": "SO9", "accountable": "✅ 是", "raw": "{}"},
     ]
@@ -187,9 +294,12 @@ def test_perf_rows_from_problems():
                       "period": "2026-08-06", "sku": "B0X", "accountable": True,
                       # v3:带 SKU 的事件写入时直接建键,订单不在库里也成立
                       "order_line_id": ol.make_order_line_id("PO1", "B0X"),
+                      # 缺陷桶名跟着事件走:问题描述的归因主线索(services/perf_reason)
+                      "sub_category": "No Carrier Scan",
                       "status": "违规", "detail": "{}"}
     assert out[1]["accountable"] is False and out[1]["status"] == "不计入"
     assert out[1]["sku"] is None and out[1]["order_line_id"] is None
+    assert out[1]["sub_category"] is None     # 报表没给分类就是 None,不填空串
 
 
 def test_perf_rows_line_no_resolves_sku_via_lookup():

@@ -144,6 +144,12 @@
 `UNIQUE (kind, claim_key) WHERE status='active'`(部分唯一索引),
 并发领用与 UPC 池同款事务纪律。
 
+⚠ **读历史归属另有一条全量索引**(`claims_key_all_idx (kind, claim_key)`,
+2026-08-30 补):上面那两个索引都带 `WHERE status='active'`,查 released 行
+一条都用不上,而 released 行正是"这个品牌当初属于谁"的唯一答案。
+风险追溯(`services/risk_trace` ④号证据源)按 (kind, claim_key) **不带 status
+过滤**地读,走的就是它。
+
 **没有 store_categories 表、也没有 store_channel 表**(2026-08-15 定稿):
 店铺档案的两项约束——准入大类与配送方式——**权威都在飞书限额表的列里**
 (类目1/2/3、配送限制),引擎只读不写。这样定的三个理由:

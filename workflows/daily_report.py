@@ -54,8 +54,8 @@ import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, store_retry, stores as stores_svc, \
-    yingdao
+from services import kpi, order_lines, settlements, store_events, \
+    store_retry, stores as stores_svc, yingdao
 
 DANGEROUS = False
 
@@ -70,7 +70,7 @@ INSERT INTO ops.store_kpi_daily (
     orders_count, sales_amount, otd_rate, cancel_rate, vtr_rate, srr_rate,
     refund_rate, negative_rate, return_rate, inr_rate, period_sales, commission,
     refund_amount, closing_balance, reserve_to_date, payout, payout_date,
-    payment_processor, settle_cycle, no_hold, prev_payout, updated_at)
+    payment_processor, settle_cycle, no_hold, total_payout, updated_at)
 VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s,
         %(store_status)s, %(payment_status)s, %(sales_status)s, %(items_online)s,
         %(items_in_stock)s, %(items_out_stock)s, %(orders_count)s, %(sales_amount)s,
@@ -78,7 +78,7 @@ VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s
         %(negative_rate)s, %(return_rate)s, %(inr_rate)s, %(period_sales)s,
         %(commission)s, %(refund_amount)s, %(closing_balance)s, %(reserve_to_date)s,
         %(payout)s, %(payout_date)s, %(payment_processor)s, %(settle_cycle)s,
-        %(no_hold)s, %(prev_payout)s, now())
+        %(no_hold)s, %(total_payout)s, now())
 ON CONFLICT (store, data_date) DO UPDATE SET
     -- 影刀两列:本轮为空不覆盖旧值(旧系统 A-H 保护语义的 PG 等价)
     seller_name = COALESCE(EXCLUDED.seller_name, ops.store_kpi_daily.seller_name),
@@ -98,7 +98,7 @@ ON CONFLICT (store, data_date) DO UPDATE SET
     payout_date = EXCLUDED.payout_date,
     payment_processor = EXCLUDED.payment_processor,
     settle_cycle = EXCLUDED.settle_cycle, no_hold = EXCLUDED.no_hold,
-    prev_payout = EXCLUDED.prev_payout, updated_at = now()
+    total_payout = EXCLUDED.total_payout, updated_at = now()
 """
 
 
@@ -180,8 +180,15 @@ def _pg_order_stats(store_name: str, win_start: str, win_end: str) -> tuple[int,
 
 
 def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
-                       names: dict, statuses: dict, last_names: dict) -> dict:
-    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map + 历史名称 map → 输出:一行 KPI dict。"""
+                       names: dict, statuses: dict, last_names: dict,
+                       payouts: dict) -> dict:
+    """输入:店铺 + 日期 + 24h 窗口 + 影刀两 map + 历史名称 map + 累计回款 map
+    → 输出:一行 KPI dict。
+
+    ⚠ `payouts` 由调用方**一次查好**传进来(`services.settlements.totals`),
+    本函数不自己查库:49 家店各查一次是 49 个来回,而且逐店查会让"这轮的累计
+    到底截止到哪一刻"变得说不清(中途 settlement_sync 写入就前后不一致)。
+    """
     name = store["name"]
 
     # 8 项绩效并发(端点桶互相独立,同店同端点才是 1/min)
@@ -198,16 +205,6 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
                 rates[m] = None
 
     settle = kpi.extract_settlement(reports.payment_statement(store))
-
-    prev_payout = 0.0
-    recon_date = kpi.prev_recon_date(settle["payout_date"])
-    if recon_date:
-        try:
-            if recon_date in reports.available_recon_dates(store):
-                prev_payout = kpi.payment_summary_total(
-                    reports.iter_recon_records(store, recon_date))
-        except Exception as e:
-            logger.warning("店铺 %s 上期回款查询失败(按 0 计): %s", name, e)
 
     stats: dict = {}
     sales = 0.0
@@ -261,7 +258,10 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         "payout_date": settle["payout_date"],
         "payment_processor": settle["payment_processor"],
         "settle_cycle": settle["settle_cycle"], "no_hold": settle["no_hold"],
-        "prev_payout": prev_payout,
+        # 累计回款 = 结算台账各账期之和(settlement_sync 维护)。
+        # ⚠ 台账里没有这家店 ⇒ **留空,不写 0**:那是"还没同步过账期",
+        # 与"确实一分钱没回"是两件事,写 0 会让人以为查过了。
+        "total_payout": payouts.get(name),
     }
 
 
@@ -327,6 +327,11 @@ def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
             new_status = statuses.get(row["seller_id"] or "")
             if not (new_name or new_status):
                 continue
+            if new_status:
+                # 影刀回填是 sales_status 的第二条写入路径,状态 diff 也得跟着
+                # (只给这一列,另两列 new 为空会被 diff 跳过;同日去重兜重复)
+                store_events.record_kpi_diff(conn, row["store"], data_date,
+                                             {"sales_status": new_status})
             cur.execute(
                 "UPDATE ops.store_kpi_daily SET"
                 " seller_name = COALESCE(%s, seller_name),"
@@ -341,10 +346,16 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
     win_start, win_end = kpi.sales_window_utc()
     names, statuses = _load_frontend()
     last_names = _last_seller_names()
+    # 累计回款一次查全(台账在 PG,不调沃尔玛);台账空 = settlement_sync
+    # 还没跑过,该列整列留空 —— 不是 0,见 settlements.totals 头注
+    with db.pg_conn() as conn:
+        payouts = settlements.totals(conn, [s["name"] for s in store_list])
     ok, failed, diffs, rows_ok = [], [], [], []
+    alerts: list[str] = []      # high 状态事件的摘要短句(店铺被封/资金冻结)
     with ThreadPoolExecutor(max_workers=min(_STORE_WORKERS, len(store_list))) as pool:
         futs = {pool.submit(_collect_store_kpi, s, data_date, win_start, win_end,
-                            names, statuses, last_names): s["name"] for s in store_list}
+                            names, statuses, last_names, payouts): s["name"]
+                for s in store_list}
         for f in as_completed(futs):
             name = futs[f]
             try:
@@ -352,7 +363,21 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 if row.pop("_orders_diff"):
                     diffs.append(name)
                 with db.pg_conn() as conn:
+                    # 状态 diff 在 upsert **之前**取上一条非空观测(同一事务里
+                    # 顺序其实无所谓:_PREV_SQL 按 data_date < 今天 过滤,
+                    # 今天这行怎么写都进不了"上一条")
+                    landed = store_events.record_kpi_diff(conn, name,
+                                                          data_date, row)
                     conn.execute(_KPI_UPSERT, row)
+                highs = [e for e in landed if e["severity"] == "high"]
+                if highs:
+                    note = ";".join(store_events.brief(e) for e in highs)
+                    # TRO 判据要「店铺当前状态」的真值(所有者 2026-09-01:
+                    # 店被停、钱跟着冻是后果,只有"店还开着钱却被冻住"才反常)
+                    # —— 本轮这一行正在 upsert,值就在手上,零额外查询
+                    if store_events.tro_signature(landed, row["store_status"]):
+                        note += "(店铺仍 ACTIVE 而资金被冻结,**疑似 TRO**)"
+                    alerts.append(note)
                 rows_ok.append(row)
                 ok.append(name)
             except (_client.StoreDeadError, httpx.ProxyError) as e:
@@ -366,6 +391,10 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
                 logger.exception("店铺 %s KPI 采集失败: %s", name, e)
                 failed.append(f"{name}({store_retry.diagnose(e)})")
     line = f"KPI:{len(ok)}/{len(store_list)} 店入库(窗口 {win_start}~{win_end})"
+    if alerts:
+        # 高危状态迁移必须在摘要点名(店铺事件账本 2026-08-30):飞书通知是
+        # 人的第一入口,"写进库等 store_watch 扫"不算第一时间
+        line += "\n🚨 " + " | ".join(sorted(alerts))
     if diffs:
         line += f",订单列对拍差异 {len(diffs)} 店(详见日志):{','.join(diffs)}"
     if failed:
@@ -388,7 +417,7 @@ _BOARD_HEADER = ["店铺", "日期", "卖家名称", "partnerId", "sellerId", "�
                  "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
                  "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
                  "账期销售额($)", "佣金", "退款金额", "期末余额", "迄今备用金($)",
-                 "回款", "回款日", "收款方", "结算周期", "无Hold", "上期回款"]
+                 "回款", "回款日", "收款方", "结算周期", "无Hold", "累计回款"]
 
 
 _DATE_EPOCH = datetime(1899, 12, 30).date()     # 飞书/Excel 日期序列起点
@@ -457,7 +486,7 @@ def _board_formats(n_rows: int) -> list[tuple[str, str]]:
                    "srr_rate", "refund_rate", "negative_rate", "return_rate",
                    "inr_rate", "period_sales", "commission", "refund_amount",
                    "closing_balance", "reserve_to_date", "payout",
-                   "prev_payout"):
+                   "total_payout"):
             items.append((f"{letter}2:{letter}{end}", "#,##0.00"))
     return items
 
@@ -513,19 +542,33 @@ def _phase_push(data_date, do_push: bool) -> str:
             "WHERE first_seen_date=%s GROUP BY store ORDER BY count(*) DESC LIMIT 5",
             (data_date,))
         top_problems = cur.fetchall()
+        # 状态变化改读事件账本(2026-08-30):此前是现拼"严格比昨天"的 JOIN,
+        # 只看 store_status 一列、跨空档(昨天没跑出来)会漏。检测已收口到
+        # services/store_events.record_kpi_diff 一处,这里只是消费当日事件。
+        # ⚠ 只查三个状态码,不是 `CLASS` 全集:账本后续会登记治理/运营类的码
+        # (倍率变更、上架汇总),那些不该出现在"状态迁移"这一节里 ——
+        # 写成全集的话每登记一个新码,日报就悄悄多捞一类事件。
         cur.execute(
-            "SELECT t.store, t.store_status, y.store_status"
-            " FROM ops.store_kpi_daily t JOIN ops.store_kpi_daily y"
-            "   ON y.store = t.store AND y.data_date = t.data_date - 1"
-            " WHERE t.data_date=%s AND t.store_status IS DISTINCT FROM y.store_status",
-            (data_date,))
-        status_changes = cur.fetchall()
+            "SELECT store, event, severity, detail FROM ops.store_events"
+            " WHERE detail->>'data_date' = %s::text"
+            "   AND event = ANY(%s::text[]) ORDER BY severity, store",
+            (str(data_date), [store_events.STORE_STATUS_CHANGED,
+                              store_events.PAYMENT_STATUS_CHANGED,
+                              store_events.SALES_STATUS_CHANGED]))
+        status_changes = [
+            {"store": s, "event": e, "severity": sev, "detail": d}
+            for s, e, sev, d in cur.fetchall()]
 
     lines = [f"📊 沃尔玛店铺日报 {data_date}",
              f"店铺 {n_stores} 家 | 24h 订单 {int(n_orders)} 单 | 销售额 ${float(n_sales):,.2f}"]
-    if status_changes:
-        lines.append("⚠ 店铺状态变化:" + "; ".join(
-            f"{s}: {old or '?'}→{new or '?'}" for s, new, old in status_changes))
+    highs = [e for e in status_changes if e["severity"] == "high"]
+    others = [e for e in status_changes if e["severity"] != "high"]
+    if highs:
+        lines.append("🚨 高危状态迁移:" + "; ".join(
+            store_events.brief(e) for e in highs))
+    if others:
+        lines.append("⚠ 其余状态变化:" + "; ".join(
+            store_events.brief(e) for e in others))
     if top_problems:
         lines.append("🆕 今日新增问题订单 TOP:" + "; ".join(
             f"{s} {c} 条" for s, c in top_problems))

@@ -77,9 +77,12 @@ refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv、ebay_r
 skills/         生成物:调度技能包,skill_export 渲染,不要手改
 docs/           conventions.md(规范全文) plan.md(计划与决策日志)
                 production_cutover.md(生产定稿) api_blueprint.md(端点/配额定稿)
-                ebay_plan.md(eBay 扩展:同仓定稿+待拍板判据+批次计划)
+                ebay_plan.md(eBay 扩展:同仓定稿+判据拍板+批次计划)
                 ebay_api_blueprint.md(eBay 端点/配额/认证定稿,写 eBay 调用前必读)
-                db_schema.md feishu_tables.md feed_closure_audit.md
+                ebay_phase1_design.md(**eBay 一期到上架的实现设计,开工按它**)
+                ebay_phase1_reference.md(eBay 字段/请求体/错误码参考)
+                db_schema.md store_events.md(店铺事件账本:上线三步与排查)
+                feishu_tables.md feed_closure_audit.md
                 legacy_survey.md(旧仓摸底) category_mapping.md
                 multi_node_plan.md allocation_plan.md 等
 ```

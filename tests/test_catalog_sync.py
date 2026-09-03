@@ -177,16 +177,22 @@ def test_summarize_item_variant_group():
 # ── GET /v3/inventories 分页模型 4 ───────────────────────────────────────────
 
 def test_list_inventories_terminates_on_cursor_not_page_length(monkeypatch):
+    seen_paths = []
+
     def handler(request):
-        if request.url.path == "/v3/inventory":
-            return httpx.Response(200, json={"sku": request.url.params["sku"],
-                                             "quantity": {"amount": 9}})
+        seen_paths.append(request.url.path)
+        if request.url.path.startswith("/v3/inventories/"):
+            # 单品兜底:与 bulk 同族端点,响应同样带 nodes(多仓批次 0 改)
+            return httpx.Response(200, json={
+                "sku": request.url.path.rsplit("/", 1)[-1],
+                "nodes": [{"shipNode": "N1", "availToSellQty": {"amount": 9}}]})
         cursor = request.url.params.get("nextCursor")
         if not cursor:
             # 第一页只有 1 条(< limit)但仍有下页——历史 bug 场景
             return httpx.Response(200, json={
                 "elements": {"inventories": [{"sku": "A", "nodes": [
-                    {"availToSellQty": {"amount": 3}}, {"availToSellQty": {"amount": 2}}]}]},
+                    {"shipNode": "N1", "availToSellQty": {"amount": 3}},
+                    {"shipNode": "N2", "availToSellQty": {"amount": 2}}]}]},
                 "meta": {"nextCursor": "PAGE2"}})
         return httpx.Response(200, json={
             "elements": {"inventories": [{"sku": "B", "quantity": {"amount": 7}}]},
@@ -197,6 +203,51 @@ def test_list_inventories_terminates_on_cursor_not_page_length(monkeypatch):
     assert inv["A"] == 5          # 多 node 求和
     assert inv["B"] == 7
     assert inv["C"] == 9          # bulk 漏掉 → 单查兜底
+    # ⚠ 兜底走的是 /v3/inventories/{sku},**不是** legacy /v3/inventory?sku=:
+    # 后者不带 shipNode 时返回"默认节点"而非合计,与 bulk 不同语义,多节点店
+    # 会让 avail_qty 这一列混进两种口径且无从分辨(多仓批次 0 修)
+    assert "/v3/inventories/C" in seen_paths
+    assert "/v3/inventory" not in seen_paths
+
+
+def test_list_inventory_nodes_keeps_node_identity(monkeypatch):
+    """节点身份保留在键上——多仓探测靠它数"这个 SKU 铺在几个仓"。"""
+    def handler(request):
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "A", "nodes": [
+                    {"shipNode": "N1", "availToSellQty": {"amount": 3}},
+                    {"shipNode": "N2", "availToSellQty": 2}]},      # 裸值也收
+                {"sku": "B", "quantity": {"amount": 7}}]},
+            "meta": {"nextCursor": None}})
+
+    _use(monkeypatch, handler)
+    nodes = inv_api.list_inventory_nodes(STORE)
+    assert nodes["A"] == {"N1": 3, "N2": 2}
+    assert nodes["B"] == {"": 7}        # 空串 = 节点身份未知(legacy 扁平响应)
+    # 合计包装与改造前逐字节同口径
+    assert inv_api.list_inventories(STORE) == {"A": 5, "B": 7}
+
+
+def test_unrecognised_inventory_shape_is_none_not_zero(monkeypatch):
+    """⚠ nodes 在而无一带 availToSellQty(官方文档样例给的就是这种 PUT 风格)
+    → 判"读不到"返回 None,**绝不当 0**。
+
+    当 0 的后果:该 SKU 的 avail_qty 被刷成 0 → 维护链认为线上没货 → 把 amz
+    库存整店重推一遍。返回 None 则落不进结果,COALESCE 保留上一轮值。
+    """
+    def handler(request):
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "A", "nodes": [{"shipNode": "N1", "status": "Success"}]},
+                {"sku": "B", "nodes": [{"shipNode": "N1",
+                                        "availToSellQty": {"amount": 0}}]}]},
+            "meta": {"nextCursor": None}})
+
+    _use(monkeypatch, handler)
+    inv = inv_api.list_inventories(STORE)
+    assert "A" not in inv               # 形状认不出 → 不落结果
+    assert inv["B"] == 0                # 真的是 0 → 照落(与上面区分开)
 
 
 # ── services 合并与落库 ───────────────────────────────────────────────────────
@@ -245,7 +296,8 @@ def test_merge_rows_and_upsert():
                   "price": 9.9, "currency": "USD", "published_status": "PUBLISHED",
                   "lifecycle_status": "ACTIVE", "unpublished_reasons": ""},
                  {"sku": None}]     # 无 sku 的丢弃
-    rows = walmart_catalog.merge_rows("T1", summaries, {"A": 4}, "2026-08-05")
+    rows = walmart_catalog.merge_rows("T1", summaries, {"A": {"N1": 4}},
+                                      "2026-08-05")
     assert len(rows) == 1 and rows[0]["avail_qty"] == 4 and rows[0]["store"] == "T1"
 
     conn = _FakeConn()
@@ -457,6 +509,180 @@ def test_zero_stores_completed_is_failure_not_success(monkeypatch):
     assert "0/2 店完成" in str(ei.value)
 
 
+# ── 多仓探测(批次 0)─────────────────────────────────────────────────────────
+
+def test_merge_rows_derives_total_and_node_count_from_one_source():
+    """合计与节点数**同源**:两列都从 {sku:{节点:数量}} 那一份算。
+
+    各算各的就是"一条判据散在多处"的老病 —— 改了其中一处,另外几处不报错、
+    只是悄悄按旧规矩办事。读不到库存的 SKU 两列都是 None(走 COALESCE 保旧值,
+    不刷成 0)。
+    """
+    summaries = [{"sku": "A"}, {"sku": "B"}, {"sku": "C"}]
+    rows = walmart_catalog.merge_rows(
+        "T1", summaries, {"A": {"N1": 3, "N2": 2}, "B": {"": 7}}, "2026-08-24")
+    got = {r["sku"]: (r["avail_qty"], r["node_count"]) for r in rows}
+    assert got["A"] == (5, 2)       # 两个节点 → 合计 5,node_count 2
+    assert got["B"] == (7, 1)
+    assert got["C"] == (None, None)  # 本轮读不到 → 两列都 None
+
+
+def test_upsert_preserves_node_count_when_absent():
+    """本轮没拿到库存时 node_count 保留上一轮值(与 avail_qty 同款 COALESCE)。"""
+    sql = walmart_catalog._UPSERT_SQL
+    assert "node_count = COALESCE(EXCLUDED.node_count," in sql
+    assert "catalog.walmart_items.node_count)" in sql
+
+
+# ── 批次 1:配置 + 分节点落库 ────────────────────────────────────────────────
+
+def test_node_inventory_upsert_keeps_rows_not_seen_this_round():
+    """本轮没扫到的节点行**不删**:沃尔玛分页漏 SKU 是常态,删了下轮又建,
+    中间那一轮维护链会读成"该节点没货"而把库存重推一遍。过期与否看 seen_at。
+    """
+    sql = walmart_catalog._NODE_UPSERT_SQL
+    assert "ON CONFLICT (store, sku, ship_node) DO UPDATE" in sql
+    assert "DELETE" not in sql.upper()
+
+
+def test_node_inventory_payload_flattens_every_node():
+    seen = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def executemany(self, sql, rows): seen.extend(rows)
+
+    class _Conn:
+        def cursor(self): return _Cur()
+
+    n = walmart_catalog.upsert_node_inventory(
+        _Conn(), "T1", {"A": {"N1": 3, "N2": 2}, "B": {"": 7}}, "2026-08-24")
+    assert n == 3
+    assert {(r["sku"], r["ship_node"], r["avail_qty"]) for r in seen} == {
+        ("A", "N1", 3), ("A", "N2", 2), ("B", "", 7)}
+
+
+# ── 分节点写(批次 2)─────────────────────────────────────────────────────────
+
+def test_put_inventory_without_node_stays_on_legacy(monkeypatch):
+    """未配置「维护仓库」的店逐字节维持现状:legacy PUT /v3/inventory。"""
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        return httpx.Response(200, json={"sku": "A"})
+
+    _use(monkeypatch, handler)
+    assert inv_api.put_inventory(STORE, "A", 7) == (True, "")
+    assert seen["path"] == "/v3/inventory"
+
+
+def test_put_inventory_with_node_uses_body_and_input_qty(monkeypatch):
+    """带节点走 PUT /v3/inventories/{sku}:shipNode 在 **body**,数量字段
+    名是 **inputQty**(读侧 availToSellQty / feed 侧 quantity,三套并存)。"""
+    import json as _json
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["body"] = _json.loads(request.content)
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N1", "status": "SUCCESS"}]})
+
+    _use(monkeypatch, handler)
+    assert inv_api.put_inventory(STORE, "A", 7, "N1") == (True, "")
+    assert seen["path"] == "/v3/inventories/A"
+    assert seen["body"] == {"inventories": {"nodes": [
+        {"shipNode": "N1", "inputQty": {"unit": "EACH", "amount": 7}}]}}
+
+
+def test_put_inventory_node_parses_partial_success(monkeypatch):
+    """⚠ **HTTP 200 不代表写进去了**:每个 nodes[] 各带自己的 status。
+
+    只看 HTTP 码的话,写失败会被当成写成功 —— settle 随后判 ineffective、
+    下一轮重发,而"为什么没生效"没有任何线索。
+    """
+    def fail(request):
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N1", "status": "FAILURE",
+             "errors": [{"code": "ERR_X", "description": "node not eligible"}]}]})
+
+    _use(monkeypatch, fail)
+    ok, why = inv_api.put_inventory(STORE, "A", 7, "N1")
+    assert ok is False and "ERR_X" in why
+
+    # 目标节点根本没出现在响应里:同样判失败(宁可多重发一轮)
+    def other(request):
+        return httpx.Response(200, json={"sku": "A", "nodes": [
+            {"shipNode": "N2", "status": "SUCCESS"}]})
+
+    _use(monkeypatch, other)
+    assert inv_api.put_inventory(STORE, "A", 7, "N1")[0] is False
+
+    # 形状认不出(字段改名/文档与实测不符)也判失败,绝不当成功
+    _use(monkeypatch, lambda r: httpx.Response(200, json={"status": "OK"}))
+    assert inv_api.put_inventory(STORE, "A", 7, "N1")[0] is False
+
+
+def test_inventories_cursor_death_restarts_the_whole_sweep(monkeypatch):
+    """翻页中途 400 = 游标作废(2026-08-30 生产实证:断连后重试同游标即 400)。
+
+    与 items 域同款自愈:整轮重来一次,result 从头攒。第二次还 400 就真抛
+    —— 无限重扫比失败更糟(一轮全店翻页不便宜)。
+    """
+    state = {"deaths": 0, "sweeps": 0}
+
+    def handler(request):
+        cur = request.url.params.get("nextCursor")
+        if cur is None:
+            state["sweeps"] += 1
+            return httpx.Response(200, json={
+                "elements": {"inventories": [
+                    {"sku": "A", "nodes": [
+                        {"shipNode": "N1", "availToSellQty": {"amount": 3}}]}]},
+                "meta": {"nextCursor": "C1"}})
+        if state["deaths"] == 0:
+            state["deaths"] += 1
+            return httpx.Response(400, json={"error": "cursor expired"})
+        return httpx.Response(200, json={
+            "elements": {"inventories": [
+                {"sku": "B", "nodes": [
+                    {"shipNode": "N1", "availToSellQty": {"amount": 5}}]}]},
+            "meta": {}})
+
+    _use(monkeypatch, handler)
+    got = inv_api.list_inventory_nodes(STORE)
+    assert got == {"A": {"N1": 3}, "B": {"N1": 5}}      # 重扫后数据完整
+    assert state["sweeps"] == 2                          # 确实整轮重来了一次
+
+    def _reuse(handler):
+        # 连接池按 proxy 缓存 transport,同一用例内换 handler 必须先清池
+        for c in _client._client_pool.values():
+            c.close()
+        _client._client_pool.clear()
+        _use(monkeypatch, handler)
+
+    # 第一页(无游标)就 400 不是游标问题,照旧响亮失败
+    _reuse(lambda r: httpx.Response(400, json={}))
+    with pytest.raises(RuntimeError, match="返回 400"):
+        inv_api.list_inventory_nodes(STORE)
+
+    # 两轮都死:抛 _CursorExpired 会漏出去吗?不 —— 第二轮的异常原样上抛,
+    # 调用方(catalog_sync 单店 try)按同步失败处理,不无限重扫
+    state2 = {"n": 0}
+
+    def always_dead(request):
+        if request.url.params.get("nextCursor") is None:
+            return httpx.Response(200, json={
+                "elements": {"inventories": []}, "meta": {"nextCursor": "C1"}})
+        state2["n"] += 1
+        return httpx.Response(400, json={})
+
+    _reuse(always_dead)
+    with pytest.raises(inv_api._CursorExpired):
+        inv_api.list_inventory_nodes(STORE)
+    assert state2["n"] == 2                              # 恰好两轮,没有第三轮
 def test_failed_store_gets_one_serial_second_pass(monkeypatch):
     """店级重试标准①(所有者定稿 2026-08-26):失败店跑完别人后串行补试一遍,
     救回的照常入账 —— 且补试跑的是**同一个** _sync_one_store(单一落地路径)。"""
@@ -528,9 +754,13 @@ def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
     def fake_inv(store, expected_skus=None):
         seen["called"] = True
         seen["skus"] = expected_skus
-        return {"A": 3}
+        return {"A": {"N1": 3}}
 
-    monkeypatch.setattr(catalog_sync.inv_api, "list_inventories", fake_inv)
+    # 多仓批次 1 后工作流取节点明细版(list_inventory_nodes);
+    # 撤线口径不变:同样不许把扫描集传进去
+    monkeypatch.setattr(catalog_sync.inv_api, "list_inventory_nodes", fake_inv)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_node_inventory",
+                        lambda conn, name, inv, run_at: 0)
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.walmart_catalog, "merge_rows",
@@ -545,3 +775,45 @@ def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
     assert seen["called"] and seen["skus"] is None, \
         "接线又被接回来了:扫描集不许进库存单查(2026-08-28 定稿)"
     assert r["inv"] == 1
+
+
+def test_put_node_never_reads_a_nodeless_echo_as_success(monkeypatch):
+    """⚠ 响应里 node 不带 shipNode ⇒ **判失败**,不许当成目标节点成功。
+
+    2026-08-30 生产实测:写入报 (True,'') 而读回毫无变化 —— 当时 `_node_result`
+    把"没带 shipNode"也算命中(为兼容不回显节点的响应),于是真成功与假成功
+    长得一模一样,无从分辨。宁可多重发一轮。
+    """
+    _use(monkeypatch, lambda r: httpx.Response(200, json={
+        "sku": "A", "nodes": [{"status": "SUCCESS"}]}))          # 无 shipNode
+    ok, why = inv_api.put_inventory(STORE, "A", 7, "N1")
+    assert ok is False and "没有目标节点 N1" in why
+    assert "原始响应" in why          # 形状对不上时要把实物带出来给人看
+
+
+def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
+    """⚠ 多节点告警的措辞按**该店配没配「维护仓库」**分两种(2026-08-31)。
+
+    批次 2 之后配置店的维护链已按受管仓写,再对它喊"仍按单仓写、库存会漂"
+    是**过时告警** —— 它正好出现在搬仓当天的摘要里,读起来像"改造没生效",
+    把人引向反面。未配置店那句必须原样保留:那才是真的会漂。
+    """
+    import contextlib
+    catalog_sync = _stub_stores(monkeypatch, ["谭总12", "没配的店"])
+    monkeypatch.setattr(catalog_sync.store_limits, "maint_nodes",
+                        lambda: {"谭总12": "N_NEW"})
+    monkeypatch.setattr(catalog_sync, "_sync_one_store",
+                        lambda store, *a, **kw: {**_ok_result(store["name"]),
+                                                 "multi_node": 3568})
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda conn: (0, 0))
+    out = catalog_sync.run({"skip_feishu": "1"})
+
+    assert "谭总12=N_NEW" in out and "自动链不碰" in out   # 配置店:已按受管仓维护
+    assert "node_clear" in out                            # 指向旧节点收尾工具
+    assert "没配的店" in out and "会漂" in out             # 未配置店:原样告警
+    # 配置店不许再被扣上"会漂"的帽子
+    warn = [l for l in out.splitlines() if "会漂" in l][0]
+    assert "谭总12" not in warn

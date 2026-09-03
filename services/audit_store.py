@@ -215,6 +215,94 @@ def event_row(outcome: AuditOutcome, run_id: int | None,
             "detail": detail}
 
 
+# ── TRO 品牌命中(2026-08-30 接线;纯函数,零 DB)────────────────────────────
+
+#: L3 只对 R4/R5 命中词的**前 10 个**给判定(services/audit_l3.MAX_BRANDS),
+#: 第 11 个之后的词永远拿不到 is_real_brand —— 那是 unjudged 的第三种成因。
+_L3_BRAND_CAP_NOTE = "L3 未给该词判定(多半在前 10 词截断之外)"
+
+
+def _r4_brands(outcome: AuditOutcome) -> set:
+    """输入:判定结果 → 输出:L2 R4 命中的黑名单词集合(r4 键形,天然 strip+lower)。
+
+    R4 的 `detail.matches[].brand` 装的就是自动机的键(audit_l2
+    `_rule_title_desc_blacklist`:命中值即键),与 ctx.r4_source 同型;
+    这里仍再 strip+lower 一道,免得哪天 detail 形状变了静默漏。
+    """
+    out: set = set()
+    l2 = outcome.l2
+    for h in (l2.hits if l2 is not None else ()):
+        if h.rule_code != "title_desc_blacklist":
+            continue
+        for m in (h.detail or {}).get("matches") or ():
+            b = str((m or {}).get("brand") or "").strip().lower()
+            if b:
+                out.add(b)
+    return out
+
+
+def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
+    """输入:判定结果 + R4 键→来源原文 + TRO 来源前缀 → 输出:
+    `{confirmed, unjudged, sources, reason}`(四步口径,顺序不能反)。
+
+    ① **A = L2 R4 命中词**(黑名单自动机认出来的词,已过词边界与自品牌豁免);
+    ② **B = A ∩ TRO 来源词** —— 黑名单里两万余个 TRO 品牌只是名单,命中了才
+       算事;B 空则整件事到此为止(绝大多数产品走的就是这条);
+    ③ **C = L3 判 `is_real_brand is True` 的词**,strip+lower 归一后
+       **必须与 A 取交集**:L3 回传的 brand 是 LLM 复述的字符串,而且那份
+       verdict 里混着 R5(USPTO 商标)的词 —— 不取交集就会把 R5 的词当成
+       R4 的 TRO 命中报上去。严格 `is True`(与 audit_l3 强制翻拒同一口径,
+       字符串 "true" 不算);
+    ④ confirmed = B∩C(真品牌,可展开波及);unjudged = B **减去拿到过判定的
+       词**(不是 B-C):被 L3 明确判 `is_real_brand=false` 的是通用英文词,
+       那是"判过了、不是品牌",既不报也不展开;剩下的三种情形才叫拿不到判定 ——
+       outcome.l3 is None(L2 就判死了,压根没跑 L3)/ l3.verdict=='pending'
+       (LLM 故障,verdict 列表是空的)/ 命中词落在 L3 前 10 词截断之外。
+       三种分不清时统一算 unjudged,把当轮能确定的那句写进 `reason`。
+
+    ⚠ `blacklist_brand_verdict` 读的是 **L3Result 的属性**,不是 reject hit 的
+    detail:L3 判 pass 时 hits 是空的,而 verdict 列表照样在属性上(见
+    services/audit_l3._coerce → L3Result(blacklist_brand_verdict=...))——
+    "L3 看过这个词、认为它不是真品牌"恰恰是 pass 那一路才有的信息。
+    """
+    a = _r4_brands(outcome)
+    if not a:
+        return {"confirmed": [], "unjudged": [], "sources": {}, "reason": None}
+    b = {k for k in a
+         if str(r4_source.get(k) or "").strip().lower().startswith(tro_prefix)}
+    if not b:
+        return {"confirmed": [], "unjudged": [], "sources": {}, "reason": None}
+
+    l3 = outcome.l3
+    judged: set = set()          # L3 给过判定的词(真伪都算"判过")
+    real: set = set()            # 其中 is_real_brand is True 的
+    for v in (getattr(l3, "blacklist_brand_verdict", None) or ()):
+        if not isinstance(v, dict):
+            continue
+        brand = str(v.get("brand") or "").strip().lower()
+        if not brand or brand not in a:      # ⚠ 与 A 取交集:剔掉 R5 混入的词
+            continue
+        judged.add(brand)
+        if v.get("is_real_brand") is True:
+            real.add(brand)
+
+    unjudged = b - judged
+    if not unjudged:
+        reason = None
+    elif l3 is None:
+        reason = "L2 判死,未跑 L3(无品牌判定)"
+    elif getattr(l3, "verdict", None) == "pending":
+        reason = "L3 LLM 故障(pending),本轮无品牌判定"
+    else:
+        reason = _L3_BRAND_CAP_NOTE
+    return {
+        "confirmed": sorted(b & real),
+        "unjudged": sorted(unjudged),
+        "sources": {k: r4_source.get(k) for k in sorted(b)},
+        "reason": reason,
+    }
+
+
 _LATEST_HITS_SQL = """
 WITH latest AS (
     SELECT DISTINCT ON (asin) asin, run_id, l3_reason_text

@@ -116,6 +116,10 @@ FEED_SPEC_VERSIONS = {
     "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
+    # 分节点批量库存(多仓批次 2 启用)。⚠ **1.5 的 key 小写**
+    # (inventoryHeader/inventory)与 1.4 大写恰好相反 —— 两套模板不能共用,
+    # 混用的表现是整批 ERR_EXT_DATA_0503009 退回(1.4 小写时的同款错误码)
+    "MP_INVENTORY": "1.5",
     "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
     # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
     #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
@@ -153,6 +157,28 @@ WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
 # 审查。O 列写 CONTENT_REJECTED,list_new 不再自动领;文案人工改好后
 # 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
 WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
+
+# ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
+# 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
+# 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
+ERROR_TAXONOMY_VERSION = "t.2026-09-02.1"   # 码表/判据变更时手动递增
+ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
+    "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
+    "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
+    "PRICE": "价格规则", "GATED": "类目需预审批", "INFO": "信息缺失",
+    "EXPIRED": "过期下架", "STAGE": "未上线", "FLAGGED": "内部标记",
+    "RECALL": "安全召回", "SPECIAL": "特殊计划", "SYSTEM": "系统错误",
+    "OTHER": "未识别",
+}
+# 记录级主码序:终局优先,非中性永远压过中性(J 吃 42.9%、A 盖 641 条的病根按性质钉死)
+ERROR_CATEGORY_SEVERITY = (
+    "PROHIBITED_FINAL", "IP", "BRAND", "RECALL", "PT_WRONG", "POLICY",
+    "GATED", "FLAGGED", "CONTENT", "PRICE", "SPECIAL", "INFO",
+    "SYSTEM", "OTHER", "STAGE", "EXPIRED",
+)
+# feed 报错的政策族锚:field 稳定、error_code 一次性(生产实证:Offensive 171 次
+# 散在 35 个互不相同的码上)。QARTH/OFFER/sku 等多义 field 不入此集合。
+WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -441,7 +467,10 @@ _KPI_BOARD_COLUMNS = (
     "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
     "refund_amount", "closing_balance", "reserve_to_date", "payout",
     "payout_date", "payment_processor", "settle_cycle", "no_hold",
-    "prev_payout")
+    # 末列 2026-08-31 由 prev_payout(上期回款)换成 total_payout(累计回款,
+    # 所有者:「我需要累计回款,就沃尔玛总共已经付给我的钱」)。旧列在 PG 里
+    # 保留不删(历史行的值仍是当时的真实观测),只是不再投影到看板
+    "total_payout")
 
 KPI_BOARD_OVERVIEW = Spreadsheet(
     name="KPI看板-总览",
@@ -643,10 +672,35 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-# 2026-08-24 提版:R10 Made in USA 硬规则上线(漏判反哺第一条)。提版即触发
-# mode=stale 版本重审:approved 存量(含历史导入的 1183 个"沃尔玛已下架仍
-# approved")按新判据全链重过,rejected 沿用。
-AUDIT_RULES_VERSION = "c.2026-08-24.1"
+# 2026-09-02 提版:政策表官方同步 v1(见下方 POLICY_LEGACY_NAMES 与
+# docs/policy_sync.md §十.7)。提版即触发 mode=stale 版本重审。
+AUDIT_RULES_VERSION = "c.2026-09-02.1"
+# c.2026-09-02.1  **政策表官方同步 v1 + 官方类别名成为全链唯一键**(所有者
+#                 2026-09-02 定稿 §十.7,三件事同批,判定输入三处一起变):
+#                 ① `policy_sync` 真跑:补武器族 5 行 + 42 页全文刷新 +
+#                    **表内名一律改为官方拼写**(对上但拼写不同的行 UPDATE
+#                    category_en,id 不变;缩写名经 POLICY_LEGACY_NAMES 认领)。
+#                    政策表是 S4 政策块与 S2 候选块的唯一数据源 ⇒ L3 提示词
+#                    逐字节变化,前缀缓存一次性重建属预期成本;
+#                    ⚠ **成本口径说全**(与上面 LLM_CACHE_ANCHOR 那段同一个道理):
+#                    system prompt 进 `llm_cache.cache_key` 的 messages ⇒ 政策表
+#                    一改,`catalog.llm_cache` 里 purpose=audit_l3 的存量**全量
+#                    未命中**(不是"少省一点",是一条都不命中);与本批要求的
+#                    全量重审叠加 = 那批产品**全额重付**(DeepSeek 前缀缓存也
+#                    要重建,只是它按 miss 价另算)。大批重审排北京时间
+#                    18:00–次日 08:00 的谷时段跑,直接省一半(见 LLM_PRICING);
+#                 ② `audit_l3` S1/S3 的「37 条」字面量改为按实时条数渲染
+#                    (旧值早就与实际行数不符,提示词自称的数目与清单对不上);
+#                 ③ `audit_reason` 的 reason_category 归一化改为**随表**
+#                    (`_L3_NORMALIZE` 20 条政策名删除,改用实时 category_en
+#                    集合 casefold 等值回表内原拼写)—— 表改名后旧映射会把
+#                    L3 的答案改写成表里已不存在的缩写名。
+#                 影响面:reject 行的 `audit_reason` 取值随表改名而变(旧结论
+#                 挂的是缩写名)。**全量重审**(政策表 = L3 判定输入):
+#                   python cli.py product_audit -p force_rerun=c.2026-08-24.1
+# c.2026-08-24.1  R10 Made in USA 硬规则上线(漏判反哺第一条)。提版即触发
+#                 mode=stale 版本重审:approved 存量(含历史导入的 1183 个
+#                 "沃尔玛已下架仍 approved")按新判据全链重过,rejected 沿用。
 # c.2026-08-21.1  **R3 收敛成单一判据**(所有者定稿):判类目要不要认证,从此
 #                 **只看飞书类目表的「必需认证」列**。同日下线两条链:
 #                 ① L2 R3 读 `audit.walmart_pt_spec` 的两条分支(硬 has_real_cert /
@@ -697,6 +751,45 @@ AUDIT_RULES_VERSION = "c.2026-08-24.1"
 #                 ⚠ 别拿它跑 force_rerun —— 那是**全量**(库里没有一条是新版本)。
 #                 只重审被摘掉的规则拒过的那批:-p rerule=phase0_forbidden_category
 # c.2026-08-13.1  批次 C:L1 rerank + L3 语义 + L4 视觉接线
+
+
+# ── 政策表旧名 → 官方名(一次性迁移映射,2026-09-02)────────────────────────
+#
+# 定稿 `docs/policy_sync.md` §十.7:**官方政策类别名 = 全链唯一键**。生产表
+# `audit.walmart_prohibited_policy` 的存量行用的是旧仓搬迁时的缩写名,按
+# `policy_sync.norm_category` 的词形归一化(&↔and / 逗号 / 括号后缀 / 单复数)
+# **故意对不上**官方全称 —— 缩写差是**语义合并**,不许在归一化里偷偷做。
+# 这张表就是那一步人工裁决的**落纸**:哪个旧名是哪个官方类别,由所有者认。
+#
+# 用途只有两处,都在过渡期内:
+#   · `policy_sync` 真跑时凭它认领存量行,把 `category_en` 改成官方拼写;
+#   · `services/error_taxonomy.POLICY_ALIASES` 从它**派生**(反向:官方名 →
+#     旧名),让改名落地前的报错文本 join 照旧对得上。
+#
+# ⚠ **仅为一次性迁移用**:生产改名落地后,这张表与 POLICY_ALIASES 一起
+#   随第三步 L3 批**整体删除**(留着 = 一份永远不会再被验证的历史映射)。
+# ⚠ 键是**表内旧名的精确字面量**(不归一化匹配:旧名是历史事实,不是词形);
+#   值必须与 `refdata/policy_pages/en/*.md` 的头注 H1 **逐字一致**(含
+#   Tobacco 那条**没有牛津逗号**、Children’s 的弯撇号 —— 官方怎么写就怎么抄)。
+# ⚠ 前 7 条来自生产存量实证(§十.6);后 4 条来自 2026-09-02 首跑 dry-run 报告的
+#   「官方已不含」清单 —— 3 条由报告「疑似改名对」点名,第 4 条 Biodegradable Plastic
+#   ↔ Product claims 按页面内容判定(官方 Product claims 页正文逐条列出
+#   Biodegradable / Degradable / Compostable 宣称,是同一政策页改名扩写)。
+#   所有者 dry-run 看到「未对上」里还有别的拼写差时,**在这里追加**,不要另起第二张表(双轨禁止)。
+POLICY_LEGACY_NAMES: dict[str, str] = {
+    "Auto & Motor Vehicles":      "Auto and Motor Vehicles",
+    "Textiles & Apparel":         "Textiles and Apparel",
+    "Drugs & Paraphernalia":      "Drugs and Drug Paraphernalia",
+    "Military & Law Enforcement": "Military and Law Enforcement Products",
+    "Electronics & RF":           "Electronics and Radio Frequency Devices",
+    "Ride-Ons & Micromobility":   "Ride-Ons and Micromobility Devices",
+    "Tobacco & Vaping":           "Tobacco, E-Cigarettes and Vaping Products",
+    "Jewelry/Precious Metals":    "Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals (Covered Goods)",
+    "Pet Products":               "Pet Foods, Supplements, Medicines and Other Products",
+    "Restricted/Illegal":         "Restricted/Illegal Products",
+    "Biodegradable Plastic":      "Product claims",
+}
+
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;
 # 未配置的用途回落 DEEPSEEK_MODEL 默认。api/llm.py 批次 C 接线 purpose
@@ -891,6 +984,16 @@ BRAND_BAN_SHEET = Spreadsheet(
     wiki=True,
 )
 
+# TRO 品牌的判据(2026-08-30 建,product_audit 的 TRO 命中接线用)。
+# 上面这张总表的「来源」列是**自由文本**,由所有者手填、risk_sync 原样镜像进
+# catalog.brand_blacklist.source。生产实证取值三种:「TRO品牌」(22,527 行)/
+# 「TRO」/「tro」——所以判据是 `source.strip().lower().startswith(前缀)`,
+# 前缀匹配三种全中,且没有别的来源词以 tro 开头,零误伤。
+# ⚠ 常量登记在此、判定写在 services(services/audit_store.tro_hits 收前缀参数):
+# registry 只登记外部资源的取值口径,不替业务判。改这个前缀 = 改「谁算 TRO」,
+# 改之前先看 product_audit 日志里那行「R4 品牌来源:TRO 前缀 N 词」还非不非零。
+TRO_BRAND_SOURCE_PREFIX = "tro"
+
 
 # UPC 池(L2a,所有者建表 2026-08-07,6 列 A~F):PG(catalog.upc_pool)权威,
 # 此表 = 运营注入口 + 投影。运营填 A=UPC B=放入日期;脚本填 C=状态
@@ -986,6 +1089,14 @@ RETIRE_LIMITS = Bitable(
         #   分配侧拒收(宁可不分也不错分),上架/维护侧放行
         #   (不拿"未知"当"超限"去删/清零)。方向不同是因为动作不同。
         lead_limit="配送时长限制",
+        # 受管发货节点(所有者建列 2026-08-24,多仓改造)。填 Seller Center →
+        # Shipping Profile → Seller Fulfillment 里的 **FC ID**(即官方 shipNode,
+        # 17-18 位数字)。**留空 = 该店走 Virtual Node**,行为与改造前逐字节一致。
+        # 谁在读:上架(list_new 的 fulfillmentCenterID)、维护(库存读写的节点)。
+        # ⚠ 填错不回落:认不出的 FC ID 会让该店**整店跳过并告警**——静默回落
+        # Virtual Node 等于把新仓的货写到旧节点,比不动更坏(见
+        # docs/multi_node_plan.md §3)。
+        maint_node="维护仓库",
     ),
 )
 

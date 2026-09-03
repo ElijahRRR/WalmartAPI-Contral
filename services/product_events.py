@@ -71,9 +71,13 @@ audit_passed / audit_rejected),写入方 product_ingest 与 product_audit 在
 
 入账边界(所有者定稿 2026-08-07):病历只记**产品生死**(删除/停用/反补)
 与观测事实。标题/价格/库存维护(含清库存)一律不进——清库存是店铺维度的
-运营操作,本系统不设店铺维度病历;此类操作的流水在 ops.feed_log/feed_items,
-现状在 catalog.walmart_items 快照,若引发平台下架等后果,由 catalog_sync
-的 status_changed 观测自动入账(动作不记,生死后果必记)。
+运营操作;此类操作的流水在 ops.feed_log/feed_items,现状在
+catalog.walmart_items 快照,若引发平台下架等后果,由 catalog_sync 的
+status_changed 观测自动入账(动作不记,生死后果必记)。
+⚠ 「本系统不设店铺维度病历」这句 2026-08-30 被所有者推翻:店铺维度账本
+已立(ops.store_events,见 services/store_events.py,TRO 封店预警需求)。
+两本账分工不变:本表记产品生死,店铺账本记店铺状态迁移/风险波及/按轮汇总
+的运营动作 —— 逐 SKU 维护流水仍然哪本都不进(在 ops.feed_items)。
 """
 
 import json

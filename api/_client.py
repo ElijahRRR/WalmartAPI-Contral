@@ -228,6 +228,7 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
     "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
     "orders.list": (3000, 60.0),                # GET /v3/orders(官方 5000/min)
+    "orders.get": (3000, 60.0),                 # GET /v3/orders/{po}(官方 5000/min;下单时间定稿的第二来源)
     # feeds 域(蓝图 §3/§6 定稿):GET 全家共享桶;POST 各 feedType 独立桶,
     # 未登记的 feedType 默认拒绝——旧系统 RETIRE_ITEM 零限速就是未知键放行漏的
     "feeds.get": (3000, 60.0),                  # GET /v3/feeds 与 /{feedId}(官方 5000/min 共享)
@@ -240,9 +241,15 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
                                                 # 三处官方一致复核;6/day 只属 feedType=promo,
                                                 # 本仓不用。此前保守 6/天,维护链吞吐被它卡死)
     "feeds.post.inventory": (8, 3600.0),        # 官方 10/hour(旧 50/hr 登记值是错的)
+    "feeds.post.MP_INVENTORY": (40, 3600.0),    # 官方 50/hour(多仓批次 2 启用;与 v1.4 各自独立桶)
     "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
+    "settings.shipnodes": (40, 60.0),           # 官方 50/min(tsv:152),同样 lru 缓存
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
+    # ⚠ 分节点写与 legacy 写**共用官方那 200/min 吗?官方未明**。分桶登记是
+    # 保守解:两条路各 160/min,同店同时用两条路时总量可能超 —— 但本仓一店
+    # 只走其中一条(配置了「维护仓库」走分节点,没配走 legacy),不会叠加
+    "inventory.put_node": (160, 60.0),          # PUT /v3/inventories/{sku} 官方 200/min
 }
 # insights performance 类:官方 1/min/端点,summary 与 report 各自独立端点 → 逐个登记
 for _m in ("otd", "cancellations", "vtr", "srr", "refunds",

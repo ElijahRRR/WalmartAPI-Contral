@@ -35,7 +35,7 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 _SQL_RUNS = """
 SELECT run_id, asin, walmart_product_type, pt_source, pt_confidence,
        score_final, verdict, stage_stopped_at, l3_verdict, l3_reason_text,
-       created_at
+       created_at, l3_reason_category
 FROM audit.audit_runs
 WHERE asin = ANY(%s)
 ORDER BY asin, created_at DESC
@@ -368,11 +368,17 @@ def run(params: dict) -> str:
                        f"R3 认证闸对它静默放行**(与本次判拒无关,是另一个问题;"
                        f"全库面看 `python cli.py audit_why -p missing_meta=1`)")
         for r in runs_by_asin.get(asin, [])[:want_runs]:
-            rid, _a2, rpt, rsrc, rconf, score, verdict, stage, l3v, l3t, ts = r
+            (rid, _a2, rpt, rsrc, rconf, score, verdict, stage, l3v, l3t, ts,
+             l3cat) = r
             out.append(f"  ── 第 {rid} 轮 {ts:%Y-%m-%d %H:%M} → {verdict} "
                        f"(分 {score},停在 {stage},PT={rpt!r}/{rsrc}/{rconf})")
-            if l3t:
-                out.append(f"    L3({l3v}):{l3t}")
+            if l3t or l3cat:
+                # ⚠ **类别也要打**(2026-09-03 补):`--dry-run` 不写
+                # `catalog.products`,所以上面那三行「结论/类别/具体内容」显示的
+                # 是**上一次真跑**的老结论;本轮判的什么只在 runs 行里。少了
+                # 类别这一格,空跑就没法核对"三段输出"到底对不对 —— 而空跑
+                # 正是换喂之后最该核对它的时候(所有者 2026-09-03 实遇)。
+                out.append(f"    L3({l3v})类别 {l3cat!r}:{l3t}")
             hs = hits.get(rid, [])
             if not hs:
                 out.append("    (无命中记录)")

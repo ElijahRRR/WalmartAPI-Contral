@@ -60,7 +60,7 @@ _HAMMER = {
     ],
     "FROM audit.audit_runs": [
         (77, "B00004Z4HQ", "Hammers", "map_direct", "高", 0, "reject",
-         "L2", "skip", None, _AT),
+         "L2", "skip", None, _AT, None),   # 末列 l3_reason_category:没进 L3
     ],
     "FROM audit.audit_hits": [
         (77, "L2", "cat_requires_cert_hard", -100,
@@ -158,7 +158,7 @@ _BLACKLISTED = {
     ],
     "FROM audit.audit_runs": [
         (2395753, "B00004YOG7", "(phase0_blocked)", "skipped", "低", 0,
-         "reject", "L0", "skip", None, _AT),
+         "reject", "L0", "skip", None, _AT, None),   # 同上:L0 就停了
     ],
     "FROM audit.audit_hits": [
         (2395753, "L0", "phase0_lark_blacklist_amazon_cat", -100,
@@ -249,3 +249,26 @@ def test_missing_meta_all_clear(monkeypatch):
     monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn({}))
     assert "PT 全都在 audit.walmart_pt_meta 里" in audit_why.run(
         {"missing_meta": "1"})
+
+
+def test_run_line_shows_the_l3_category_not_just_the_text(monkeypatch):
+    """⚠ 空跑(`--dry-run`)**不写** `catalog.products`,所以上面那三行
+    「结论/类别/具体内容」显示的是上一次真跑的老结论;本轮判的什么只在 runs 行里。
+    runs 行少了类别这一格,空跑就核对不了三段输出 —— 而换喂之后正是最该核对它的
+    时候(所有者 2026-09-03 用 `-p asins=… --dry-run` 验新提示词时实遇)。
+    """
+    data = dict(_HAMMER)
+    data["FROM audit.audit_runs"] = [
+        (88, "B00004Z4HQ", "Hammers", "map_direct", "高", 100, "reject",
+         "L3", "reject", '标题写 "Distillation Apparatus",Alcohol 政策禁蒸馏设备',
+         _AT, "Alcohol"),
+    ]
+    data["FROM audit.audit_hits"] = [
+        (88, "L3", "llm_alcohol", 0, {"policy": "Alcohol"}),
+    ]
+    monkeypatch.setattr(audit_why.db, "pg_conn", lambda: _Conn(data))
+    out = audit_why.run({"asins": "B00004Z4HQ"})
+    assert "L3(reject)类别 'Alcohol'" in out
+    assert "Alcohol 政策禁蒸馏设备" in out
+    # 取数列序与渲染列序必须一致(错位不报错,只是把类别打进别的格)
+    assert "l3_reason_category" in audit_why._SQL_RUNS

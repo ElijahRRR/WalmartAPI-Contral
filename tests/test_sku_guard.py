@@ -179,10 +179,30 @@ _ABANDON_FORBIDDEN: dict[str, str] = {
         "换码重上 = 白烧一个 UPC + 可能的重复 listing",
 }
 
-#: ④ 允许 UPDATE 登记簿的文件(弃码三列只有一个写者)。
+#: ④ 允许 UPDATE 登记簿的文件(**两条写线,各守各的列**)。
+#: ⚠ 这张表放宽到两个文件之后,"谁写哪几列"由
+#: test_the_two_registry_update_lines_do_not_cross 逐条钉死 —— 光有本表就只剩
+#: "允许 UPDATE 这张表",弃码五列被归类那条 UPDATE 顺手带上也不会红。
 _LISTING_SOURCES_UPDATE_OK: dict[str, tuple[str, str]] = {
     "services/sku_codec.py": (
-        "permanent", "abandon 与批次 3 的改码替换是三列唯一的写者"),
+        "permanent", "abandon 与批次 3 的改码替换是弃码/改码五列唯一的写者"),
+    "services/listing_sources.py": (
+        "permanent",
+        "reclassify(所有者 2026-09-03):source_type / source_key 两列的**唯一**"
+        "修改入口。register 的 docstring 从 0a 起就写着「改归类走人工 UPDATE」,"
+        "而全仓一直没有那条 UPDATE —— 存量 unknown 行因此永远出不了自动化盲区"),
+}
+
+#: ④′ 允许调用 `listing_sources.reclassify` 的文件(归类是把商品**交还自动链**:
+#: 改完的行第一次被 amz 快照驱动的改价/清库存/删除管到)。多一个调用方 = 多一条
+#: "谁决定这一行的出身"的路径,而出身错了下游一声不吭(采不到源数据 → 判成
+#: "源头没了" → 清库存/删除)。
+_RECLASSIFY_CALLERS_OK: dict[str, tuple[str, str]] = {
+    "services/listing_sources.py": (
+        "permanent", "定义之家(plan_reclassify 与 reclassify 同一份判据)"),
+    "workflows/sources_reclassify.py": (
+        "permanent",
+        "人工归类导入的唯一入口:`-p file=` 读回人核过的清单,`-p apply=1` 才写"),
 }
 
 #: ⑤ 允许 INSERT 登记簿的文件(登记只有两个出口)。
@@ -329,6 +349,102 @@ def test_the_registry_table_has_exactly_two_insert_sites():
                            _LISTING_SOURCES_INSERT_OK)
     assert not offenders, _fmt(
         offenders, "登记簿的 INSERT 只有 listing_sources.register 与 sku_codec.mint:")
+
+
+#: 一条 `UPDATE catalog.listing_sources … SET <这里> [WHERE …]` 的 SET 段。
+#: 拿它取"这条 UPDATE 到底写了哪几列",而不是全文 grep 列名 —— 列名在头注与
+#: docstring 里到处都是(那正是我们要的文档,与 abandoned_at 那条同一纪律)。
+_UPDATE_SET_RE = re.compile(
+    r'UPDATE\s+catalog\.listing_sources\s+SET\s+(.*?)(?:\bWHERE\b|"""|\Z)',
+    re.S | re.I)
+
+#: 弃码/改码五列(conventions §九④:唯一写者 services/sku_codec)。
+_CODEC_ONLY_COLS = ("abandoned_at", "abandoned_reason", "replaced_by",
+                    "replaces", "replaced_at")
+
+
+def test_the_two_registry_update_lines_do_not_cross():
+    """登记簿今天有**两条** UPDATE 写线,它们写的列不许交叉。
+
+    · 归类两列(source_type / source_key)只准 services/listing_sources 写;
+    · 弃码/改码五列只准 services/sku_codec 写。
+
+    交叉了会这样静默出事:归类那条 UPDATE 顺手把 `abandoned_at` 清成 NULL,
+    一个已经弃掉的码就被重新拉回自动化(沃尔玛侧那条记录我们早已当它不存在),
+    下一轮新码新 UPC 去上同一个 item —— 同店重复 listing,沃尔玛不会替你拦,
+    而且全程零报错。反过来,弃码那条若能改 source_key,身份键会在一次弃码里
+    被悄悄换掉,全部按 ASIN 反查的消费方当场失明。
+    """
+    crossed: list[str] = []
+    for rel, path in _prod_files():
+        for m in _UPDATE_SET_RE.finditer(path.read_text(encoding="utf-8")):
+            sets = m.group(1)
+            hit_class = re.findall(r"\b(source_type|source_key)\b", sets)
+            hit_codec = [c for c in _CODEC_ONLY_COLS if c in sets]
+            if hit_class and rel != "services/listing_sources.py":
+                crossed.append(f"{rel} 改归类列 {sorted(set(hit_class))}")
+            if hit_codec and rel != "services/sku_codec.py":
+                crossed.append(f"{rel} 改弃码/改码列 {hit_codec}")
+    assert not crossed, _fmt(
+        crossed, "登记簿两条 UPDATE 写线交叉了(归类两列 vs 弃码改码五列):")
+
+
+def _calls_reclassify(path: Path) -> bool:
+    """输入:.py 路径 → 输出:**代码里**是否调用/定义了 reclassify(不扫注释文档)。
+
+    射程只能是 AST:工作流名 `sources_reclassify`、schedule 的手动清单、docs
+    指针里到处都是这个词,文本扫会把它们全判成违规(与 _calls_abandon 同款)。
+    ⚠ 只认 `reclassify` 这个名字本身 —— `plan_reclassify`(只读的计划)不在
+    射程内:它不写任何一行,给谁调都无害。
+    """
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == "reclassify":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "reclassify":
+            return True
+        if isinstance(node, ast.Name) and node.id == "reclassify":
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+                a.name == "reclassify" for a in node.names):
+            return True
+    return False
+
+
+def test_reclassify_callers_are_the_import_workflow_only():
+    """归类是**把商品交还自动链**的那一步,调用方只有人工导入工作流一个。
+
+    第二个调用方出现时,"这一行的出身是什么"就有了第二个决定者 —— 而登记簿
+    没有撤销归类的路径,错了只能再人工改回去,期间那批行一直在被自动链管着。
+    """
+    offenders = [rel for rel, path in _prod_files()
+                 if rel not in _RECLASSIFY_CALLERS_OK and _calls_reclassify(path)]
+    assert not offenders, _fmt(
+        offenders, "listing_sources.reclassify 只允许人工归类导入调用:")
+    stale = [rel for rel in _RECLASSIFY_CALLERS_OK
+             if not _calls_reclassify(ROOT / rel)]
+    assert not stale, _fmt(stale, "白名单登记了归类调用点,但那个文件已经不调:")
+
+
+def test_reclassify_gates_the_key_before_writing_it():
+    """写进登记簿的 source_key **必须先过标准 ASIN 形态闸**。
+
+    不过闸会这样静默出事:一个"看起来很像 ASIN、其实不存在"的键进了登记簿,
+    身份反查从此有答案(所以没有任何地方报错),而采集永远采不到 → 被判成
+    「源头没了」→ 清库存 / 删除。灌垃圾键比不归类危险得多。
+    """
+    from services import listing_sources as ls
+    src = (ROOT / "services" / "listing_sources.py").read_text(encoding="utf-8")
+    assert "is_standard_asin" in src, "归类路径丢了形态闸"
+
+    class _Conn:                      # 闸在查库之前:压根不该走到 cursor
+        def cursor(self):
+            raise AssertionError("形态不合格的行不许进到查库这一步")
+
+    todo, skipped = ls.plan_reclassify(
+        _Conn(), [{"store": "T1", "sku": "X-1", "source_key": "1024600187"},
+                  {"store": "T1", "sku": "X-2", "source_key": ""}])
+    assert todo == []
+    assert sum(len(v) for v in skipped.values()) == 2, skipped
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1058,6 +1174,7 @@ _ALL_WHITELISTS = {
     "_REGISTRY_SQL_OK": _REGISTRY_SQL_OK,
     "_ABANDONED_AT_OK": _ABANDONED_AT_OK,
     "_LISTING_SOURCES_UPDATE_OK": _LISTING_SOURCES_UPDATE_OK,
+    "_RECLASSIFY_CALLERS_OK": _RECLASSIFY_CALLERS_OK,
     "_LISTING_SOURCES_INSERT_OK": _LISTING_SOURCES_INSERT_OK,
     "_ABANDON_CALLERS_OK": _ABANDON_CALLERS_OK,
 }

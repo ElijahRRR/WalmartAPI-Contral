@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **77 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **78 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
@@ -273,6 +273,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | `node_backfill` | | 从已存快照回填类目 ID 锚(零重采) |
 | `pt_backfill` | | 历史实证 PT 回填产品主档 |
 | `sources_backfill` | 调 | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
+| `sources_reclassify` | | 来源码人工归类导入(一次性人工件,不进调度):`sources_backfill` 把非 ASIN 形态一律登记成 unknown,这些行按路由铁律进不了任何自动维护;缺省=预览并导出待归类清单 csv(带机器提议,「标准 ASIN+尾巴」只标 guess 不预填),人核过后 `-p file=<清单>` 读回、**`-p apply=1` 才写库**(`-p overwrite=1` 才盖已有键)。归类 = 把商品交还自动链,改完先 `maintenance_scan --dry-run` 看破坏面 |
 | `pt_census` | | 沃尔玛类目(PT)四源对账:哪些 PT 真实存在 |
 | `sku_normalize` | | 事件账本 SKU→ASIN 清洗 |
 | `taxonomy_import` | | 亚马逊类目树入库(ID 主键) |
@@ -332,7 +333,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 37 条政策理由映射。
 | `match_listing` | 危 | 跟卖上架(MP_ITEM_MATCH) |
 | `upc_sync` | | UPC 池注入同步与投影回写(手动体检入口) |
 | `sku_locked_heal` | 危 | `SKU_LOCKED` 自愈链:RETIRE → 冷却 24h → 清列重上新 UPC |
-| `sku_migrate` | 危 | **存量改码**(SKU 改造批次 3,手动、永不进调度):把存量 SKU(裸 ASIN / 三段式)迁到 12 位不透明码。先落库并 **commit**(新码行指回旧码 + 旧行 `replaced_by`)→ 发 `SkuUpdate=Yes` 的 MP_MAINTENANCE feed → **回执成功不定案**,等 `catalog_sync` 观测到「新码在架且旧码缺席」才 confirmed(旧行弃码、UPC 改标、上架表 SKU 列回写、处置迁键、节点库存清行);观测反证或回执失败 ⇒ rolled_back;判不准超期 ⇒ stalled 点名人工。`-p store=` **必填**,节奏硬闸 1 → 10 → 按 limit,`-p settle_only=1` 只定案 |
+| `sku_migrate` | 危 | **存量改码**(SKU 改造批次 3,手动、永不进调度):把存量 SKU(裸 ASIN / 三段式)迁到 12 位不透明码。先落库并 **commit**(新码行指回旧码 + 旧行 `replaced_by`)→ 发 `SkuUpdate=Yes` 的 MP_MAINTENANCE feed → **回执成功不定案**,等 `catalog_sync` 观测到「新码在架且旧码缺席」才 confirmed(旧行弃码、UPC 改标、上架表 SKU 列回写、处置迁键、节点库存清行);观测反证或回执失败 ⇒ rolled_back;判不准超期 ⇒ stalled 点名人工。`-p store=` **必填**,节奏硬闸 1 → 10 → 按 limit,`-p settle_only=1` 只定案;要挑着改用 `-p skus=` / `-p asins=` 点名、`-p exclude_skus=` / `-p exclude_asins=` 排除(可叠加,**排除优先**;点名**不越闸**,落选的逐条给理由) |
 | `variant_probe` | | 变体维度为什么没发?(只读三路诊断) |
 
 **提交结局三态**(UPC 回收只发生在其中一态):`submitted` → 上架表 K=Yes、

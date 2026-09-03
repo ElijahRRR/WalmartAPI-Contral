@@ -259,6 +259,21 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 **五列**只准 `services/sku_codec` 写(`abandon` / `mint_replacement` /
 `settle_replacement`)。行永不 DELETE。
 
+**④′ UPDATE 有两条写线,写的列不许交叉**(所有者 2026-09-03 补):除了 ④ 那五列,
+`source_type` / `source_key` **两列**的唯一修改入口是
+`services/listing_sources.reclassify`(唯一调用方 `workflows/sources_reclassify`,
+`-p apply=1` 才写;写入前 `source_key` 必须过 `sku_asin.is_standard_asin`)。
+交叉了两种后果都静默:归类那条顺手清 `abandoned_at` = 把死码拉回自动化(下一轮
+新码新 UPC 去上同一个 item);弃码那条若能改 `source_key` = 身份键在一次弃码里被
+悄悄换掉,按 ASIN 反查的消费方当场失明。守门
+`test_the_two_registry_update_lines_do_not_cross` 逐条钉死,白名单条目与本节文字
+必须对得上。
+⚠ 归类的语义是**把商品交还自动链**(改完才第一次满足消费方
+`source_type='amz' AND source_key IS NOT NULL` 那条 JOIN),纪律与
+`sources_backfill` 同款:改完先 `maintenance_scan --dry-run` 看破坏面。
+它与 ⑥ 那三个同名异义并列的第四组辨析是:**归类**(改出身,SKU 不变)≠
+**首次登记**(register,补一条不存在的行)≠ **改码**(换沃尔玛侧的 SKU 本身)。
+
 **⑤ 守门只有一份** `tests/test_sku_guard.py`:白名单 dict 在文件顶部,每条写清
 理由与**预期收口批次**,永久豁免显式标 permanent。后续批次只准增删这里的白名单
 条目,**不许再建第二份守门文件**(四份并存正是 §六要禁的形态,而且白名单一定会

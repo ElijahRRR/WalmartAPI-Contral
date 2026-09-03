@@ -171,7 +171,8 @@ CREATE TABLE catalog.listing_sources (
     store text, sku text,            -- PK (store, sku)
     source_type text NOT NULL,       -- amz / match / self / 1688 / unknown
     source_key  text,                -- amz=asin;match=匹配GTIN;1688=offer_id
-    workflow    text,                -- 登记来源(backfill=格式回填)
+    workflow    text,                -- 登记来源(backfill=格式回填;
+                                     -- sources_reclassify=人工归类改写过)
     created_at  timestamptz,
     abandoned_at     timestamptz,    -- 弃码时刻;NULL = 活码(2026-09-02 批次 0a)
     abandoned_reason text,           -- delete_verified/sku_locked/upc_conflict/sku_update
@@ -228,10 +229,22 @@ CREATE TABLE catalog.listing_sources (
 --   视图 catalog.sku_aliases 的条件 ⇒ 该视图里 (store, alias_sku) 至多一行。
 -- 两列都可空无默认,落地时全库为 NULL(写侧接线在批次 3 的 workflows/sku_migrate)。
 --
--- 纪律两条:① abandoned_at / abandoned_reason / replaced_by / replaces /
+-- 纪律三条:① abandoned_at / abandoned_reason / replaced_by / replaces /
 -- replaced_at 五列**只由 services/sku_codec 写**(abandon / mint_replacement /
 -- settle_replacement),其它模块与工作流一律
 -- 不得 UPDATE;行**永不 DELETE**(旧码带着订单/售后回来必须还查得到)。
+-- ①′ **归类的唯一修改入口是 services/listing_sources.reclassify**(所有者
+-- 2026-09-03):source_type / source_key 两列的 UPDATE 全仓只有这一条,唯一
+-- 调用方是人工件 workflows/sources_reclassify(`-p apply=1` 才写)。
+-- 与 ① 的两条写线**不许交叉**(守门 test_the_two_registry_update_lines_do_not_cross):
+-- 归类那条顺手清了 abandoned_at 就等于把一个死码拉回自动化,而弃码那条若能改
+-- source_key,身份键会在一次弃码里被悄悄换掉 —— 两种都零报错。
+-- 写入前 source_key 必须过 sku_asin.is_standard_asin(灌一个"很像 ASIN、其实
+-- 不存在"的键 = 采不到源数据 → 判成源头没了 → 清库存/删除);改完的行
+-- workflow 列记 'sources_reclassify',这是归类在库里唯一的痕迹(product_events
+-- 的事件码全集里没有一个说得清"我们改了对出身的认识",故不入病历)。
+-- ⚠ 归类 = **把商品交还自动链**:改完才第一次满足消费方那条
+-- source_type='amz' AND source_key IS NOT NULL 的 JOIN,盲区变辖区。
 -- ② 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义,
 -- 列名故意用 abandoned 不用 retired。
 -- 存量回填的判型正则(schema.sql 的 INSERT ... SELECT)与

@@ -318,3 +318,36 @@ def test_an_opaque_code_is_invisible_to_extract_asin_but_resolvable():
     assert sku_codec.is_opaque(code) and sa.extract_asin(code) is None
     assert sa.pick_asin(None, code) is None
     assert sa.resolve(_RegConn([("T1", code, "B0ABCDEFGH")]), "T1", code) == "B0ABCDEFGH"
+
+
+# ── 归类导入的机器提议(所有者 2026-09-03 给的两个样本是铁证用例)─────────────
+
+def test_owner_reclassify_samples_propose_the_right_key():
+    """`CMSQ-B0CLCX3Q1Z-169.99` 走既有的三段式规则(提得出);
+    `B0822D9QQKS59` 只能**猜**前 10 位 —— 依据必须标成 guess。"""
+    assert sa.propose_source_key("CMSQ-B0CLCX3Q1Z-169.99") == ("B0CLCX3Q1Z", "wrapped")
+    assert sa.propose_source_key("B0822D9QQKS59") == ("B0822D9QQK", sa.PROPOSE_GUESS)
+    assert sa.propose_source_key("B0ABCDEFGH") == ("B0ABCDEFGH", "asin")
+
+
+def test_propose_never_guesses_when_it_cannot_tell():
+    """提不出就留空,**绝不猜**(与 extract_asin 同一条纪律):纯数字是
+    item id 不是源头码;人工号里没有任何一段是 ASIN。"""
+    assert sa.propose_source_key("102460018738") == (None, "")
+    assert sa.propose_source_key("MANUAL-001") == (None, "")
+    assert sa.propose_source_key("") == (None, "")
+
+
+def test_propose_never_slices_an_opaque_new_code():
+    """12 位不透明新码与「10 位 ASIN + 2 位尾巴」撞脸 —— 不显式挡住,就会给
+    一个 mint 发的码提议出一个**不存在的 ASIN**,而它本来就有正确的 source_key。"""
+    from services import sku_codec
+    code = "AK7QM2X9RT4W"
+    assert sku_codec.is_opaque(code)
+    assert sa.propose_source_key(code) == (None, "")
+
+
+def test_a_guess_still_has_to_be_a_standard_asin():
+    """猜出来的前 10 位也要过形态闸:纯数字前缀(12 位 item id 那种)不许
+    冒充 ASIN 混进提议列。"""
+    assert sa.propose_source_key("1024600187654") == (None, "")

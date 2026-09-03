@@ -266,6 +266,155 @@ def test_zero_cap_asks_the_database_nothing():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  W4 · 点名 / 排除(2026-09-03:存量改码要能挑着做)
+#
+#  钉的是"错了不报错"的两件:① 点名/排除不许长出第二条候选 SQL(两条一漂,点名
+#  跑的就不再是全量跑的那套闸);② 点名了却没出现的**必须有名有姓的理由** ——
+#  静默丢的表现是摘要看起来像"这家店没候选",而所有者以为自己点的名生效了。
+# ══════════════════════════════════════════════════════════════════════════════
+
+_WHY_COLS = ["old_sku", "source_key"] + [f"c{i}" for i in range(len(sm._CONDS))]
+
+
+def _why(old_sku, key=None, bad=()):
+    """一行 `_SQL_WHY` 结果:默认七条判据全真,`bad` 里点名的那几条置假(按短名)。"""
+    return (old_sku, key or old_sku) + tuple(
+        n not in bad for n, _w, _sql in sm._CONDS)
+
+
+def _pick_conn(cand_rows=(), why_rows=(), inflight=()):
+    """点名用的假连接。**理由 SQL 的答案必须排在候选之前**:两条 SQL 共用同一个
+    FROM 片段(它们本来就同源),按片段匹配的假连接只认先来的那条。"""
+    return _Conn([("AS c0", (_WHY_COLS, list(why_rows))),
+                  ("FROM catalog.walmart_items w", (_CAND_COLS, list(cand_rows))),
+                  ("FROM ops.feed_items", (["sku"], [(s,) for s in inflight]))])
+
+
+def _args_of(conn, frag="LIMIT %(limit)s"):
+    return [a for sql, a in conn.sqls if frag in sql][0]
+
+
+def test_pick_and_exclude_are_conditions_on_the_one_candidate_sql():
+    """**单一实现路径**:点名/排除是同一条候选 SQL 的参数化条件,不是第二条 SQL;
+    而且七条判据在"选取"与"解释"两处**逐字同源**(一漂就会出现"摘要说它满足
+    条件,可它就是不在候选面上",谁也不报错)。"""
+    sql = sm._SQL_CANDIDATES
+    assert sql.count("FROM catalog.walmart_items w") == 1
+    assert "%(only_skus)s" in sql and "%(only_keys)s" in sql
+    assert "%(excl_skus)s" in sql and "%(excl_keys)s" in sql
+    # 排除拼在点名**之后**且是 NOT ⇒ 既点名又排除时排除赢
+    assert sql.index("%(only_skus)s") < sql.index("%(excl_skus)s")
+    assert "%(unnamed)s::boolean" in sql            # 没点名 ⇒ 整个 OR 恒真
+    for _n, _w, cond in sm._CONDS:
+        assert cond in sql and cond in sm._SQL_WHY
+    assert "LIMIT" not in sm._SQL_WHY               # 理由面不受本轮上限影响
+    assert "%(excl_skus)s" not in sm._SQL_WHY       # 被排除的也要能说出口
+
+
+def test_naming_a_sku_narrows_the_face_and_says_how_many_hit():
+    conn = _pick_conn([_cand("B0AAA00001")], [_why("B0AAA00001")])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
+    args = _args_of(conn)
+    assert args["only_skus"] == ["B0AAA00001"] and args["unnamed"] is False
+    assert any("点名 1 个" in n and "命中 1 个" in n for n in notes)
+
+
+def test_naming_by_asin_uses_the_registry_source_key():
+    """所有者更习惯按 ASIN 说话:`-p asins=` 打在登记簿 `source_key` 上。"""
+    conn = _pick_conn([_cand("B0AAA00001", key="B0ASIN0001")],
+                      [_why("B0AAA00001", key="B0ASIN0001")])
+    rows, notes = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0001"])
+    assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
+    assert _args_of(conn)["only_keys"] == ["B0ASIN0001"]
+    assert any("命中 1 个" in n for n in notes)
+
+
+def test_a_named_row_that_misses_a_condition_is_named_with_the_reason():
+    """点名了却不满足候选条件 ⇒ **逐条**说为什么,不静默丢。"""
+    conn = _pick_conn([], [_why("B0AAA00002", bad=("活码",))])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00002"])
+    assert rows == []
+    assert any("命中 0 个" in n for n in notes)
+    assert any("B0AAA00002" in n and "码已弃用" in n for n in notes)
+
+
+def test_a_named_asin_that_misses_a_condition_names_both_asin_and_sku():
+    conn = _pick_conn([], [_why("B0AAA00003", key="B0ASIN0003", bad=("在架",))])
+    rows, notes = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0003"])
+    assert rows == []
+    assert any("B0ASIN0003(ASIN→B0AAA00003)" in n and "已缺席" in n for n in notes)
+
+
+def test_a_named_row_the_store_never_heard_of_is_named_too():
+    """拼错一个字母不许表现成"这家店没候选"。"""
+    conn = _pick_conn([], [])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0TYPO0001"],
+                                 only_keys=["B0TYPO0002"])
+    assert rows == []
+    assert any("B0TYPO0001" in n and "查无此 SKU" in n for n in notes)
+    assert any("B0TYPO0002(ASIN)" in n and "查无此 source_key" in n for n in notes)
+
+
+def test_a_named_row_blocked_by_the_inflight_gate_says_which_gate():
+    """点名不放松逐候选的在途闸 —— 但落选要说清是被哪道闸挡的。"""
+    conn = _pick_conn([_cand("B0AAA00001")], [_why("B0AAA00001")],
+                      inflight=["B0AAA00001"])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert rows == []
+    assert any("命中 0 个" in n for n in notes)
+    assert any(n.strip().startswith("· B0AAA00001:") and "在途 feed" in n
+               for n in notes)
+
+
+def test_exclude_beats_the_pick_and_says_so():
+    """排除优先:同一条既被点名又被排除 ⇒ 不改,而且理由是"你自己排除了它"。"""
+    conn = _pick_conn([], [_why("B0AAA00001")])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"],
+                                 exclude_skus=["B0AAA00001"])
+    assert rows == []
+    args = _args_of(conn)
+    assert args["excl_skus"] == ["B0AAA00001"] and args["only_skus"] == \
+        ["B0AAA00001"]
+    assert any("排除优先于点名" in n for n in notes)
+
+
+def test_exclude_alone_keeps_the_rest_of_the_face_and_asks_no_reason_sql():
+    """只给排除、不点名 ⇒ 其余照常按 SKU 升序取,理由 SQL 一条都不发。"""
+    conn = _pick_conn([_cand("B0AAA00002", "0002")])
+    rows, notes = sm._candidates(conn, "T1", 10, exclude_skus=["B0AAA00001"])
+    assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
+    assert _args_of(conn)["unnamed"] is True
+    assert not any("AS c0" in sql for sql, _ in conn.sqls)
+    assert any("排除 -p exclude_skus 1 个" in n for n in notes)
+
+
+def test_named_rows_beyond_the_cap_are_told_they_are_next_round():
+    """点名 3 个、上限 1 个:剩下两个**不是**落选,是"没轮到",下轮还在候选面上。"""
+    conn = _pick_conn([_cand("B0AAA00001")],
+                      [_why("B0AAA00001"), _why("B0AAA00002"),
+                       _why("B0AAA00003")])
+    rows, notes = sm._candidates(conn, "T1", 1,
+                                 only_skus=["B0AAA00001", "B0AAA00002",
+                                            "B0AAA00003"])
+    assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
+    assert _args_of(conn)["limit"] == 1
+    assert any("点名 3 个" in n and "命中 1 个" in n for n in notes)
+    assert any("B0AAA00002、B0AAA00003" in n and "没轮到它" in n for n in notes)
+
+
+def test_parse_names_splits_dedupes_and_keeps_case_and_order():
+    """逗号/空白/换行混排都要认(所有者是复制粘贴的);去重**保序**;
+    大小写**一律不动**(SKU 大小写敏感,口径同 order_lines.norm_sku)。"""
+    assert sm._parse_names("B0A, B0B\nB0C  B0D,,\n") == ["B0A", "B0B", "B0C",
+                                                          "B0D"]
+    assert sm._parse_names("B0A,B0A, B0A") == ["B0A"]
+    assert sm._parse_names("b0a,B0A") == ["b0a", "B0A"]
+    assert sm._parse_names("") == [] and sm._parse_names(None) == []
+    assert sm._parse_names(" , ,, ") == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  W5 · 节奏硬闸
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -721,6 +870,82 @@ def test_a_bad_limit_is_refused_not_guessed():
     assert out.startswith("⛔") and "limit" in out
 
 
+def test_naming_five_still_bows_to_the_stage_cap(monkeypatch):
+    """点名**不越闸**:零 confirmed 的店点名 5 个,本轮照样只放 1 个,
+    其余"没轮到"(不是落选)—— 而且这句话必须出现在**首行**(cli 只取首行)。"""
+    _wire(monkeypatch)
+    _read_conn(monkeypatch, [
+        ("AS c0", (_WHY_COLS, [_why(f"B0AAA0000{i}") for i in range(1, 6)])),
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(0, 0)])),
+        ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
+        ("FROM ops.feed_items", (["sku"], [])),
+    ])
+    out = sm.run({"store": "T1", "execute": False,
+                  "skus": "B0AAA00001, B0AAA00002\nB0AAA00003 B0AAA00004,"
+                          "B0AAA00005"})
+    first = out.splitlines()[0]
+    assert "点名 5 个,命中 1 个" in first
+    assert "节奏闸本轮只放 1 个,其余下轮" in first
+    assert "本轮上限 1" in out                       # 节奏闸自己那行还在
+    assert "没轮到它" in out                         # 其余四个逐条有交代
+
+
+def test_naming_nothing_that_matches_says_so_instead_of_looking_empty(monkeypatch):
+    """点名 2 个、命中 0 个 ⇒ 摘要**明说**,不许看起来像"这家店没候选"。"""
+    _wire(monkeypatch)
+    _read_conn(monkeypatch, [
+        ("AS c0", (_WHY_COLS, [_why("B0AAA00001", bad=("未在改",))])),
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+        ("FROM catalog.walmart_items w", (_CAND_COLS, [])),
+    ])
+    monkeypatch.setattr(sm.feeds, "submit_feed",
+                        lambda *a, **k: pytest.fail("零命中不许提交"))
+    out = sm.run({"store": "T1", "execute": True,
+                  "skus": "B0AAA00001,B0TYPO0001"})
+    assert "点名 2 个,命中 0 个" in out.splitlines()[0]
+    assert "B0AAA00001" in out and "已经指向新码" in out
+    assert "B0TYPO0001" in out and "查无此 SKU" in out
+
+
+def test_naming_never_beats_a_blocked_gate_and_says_it_never_looked(monkeypatch):
+    """闸未过(或 settle_only)⇒ 上限 0 ⇒ **一条候选 SQL 都不发**。
+    这时也必须说清"点了 N 个、一个都没查",否则看起来像点名没生效。"""
+    _wire(monkeypatch, executing=1)
+    read = _read_conn(monkeypatch, [])
+    monkeypatch.setattr(sm.listing_sheet, "read_rows", lambda upto=None: [])
+    monkeypatch.setattr(sm.feeds, "submit_feed",
+                        lambda *a, **k: pytest.fail("前置闸未过不许提交"))
+    out = sm.run({"store": "T1", "execute": True, "skus": "B0AAA00001,B0AAA00002"})
+    first = out.splitlines()[0]
+    assert "点名 2 个,命中 0 个" in first and "本轮上限 0,一个都没发" in first
+    assert "点名不越闸" in out
+    assert not any("FROM catalog.walmart_items w" in sql for sql, _ in read.sqls)
+
+
+def test_exclude_reaches_the_sql_from_run(monkeypatch):
+    """`-p exclude_skus=` / `-p exclude_asins=` 一路传到候选 SQL 的参数上
+    (解析在 run,过滤在 SQL —— 不在 Python 里事后剔,那是第二条选取路径)。"""
+    _wire(monkeypatch)
+    read = _read_conn(monkeypatch, [
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+        ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00002",
+                                                             "0002")])),
+        ("FROM ops.feed_items", (["sku"], [])),
+    ])
+    out = sm.run({"store": "T1", "execute": False,
+                  "exclude_skus": "B0AAA00001, B0AAA00001",
+                  "exclude_asins": "B0ASIN0009"})
+    args = [a for sql, a in read.sqls if "LIMIT %(limit)s" in sql][0]
+    assert args["excl_skus"] == ["B0AAA00001"]          # 去重
+    assert args["excl_keys"] == ["B0ASIN0009"]
+    assert args["unnamed"] is True                      # 只排除、没点名
+    assert "排除 -p exclude_skus 1 个" in out
+    assert "点名" not in out.splitlines()[0]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  沙箱 PG 集成:全部 SQL 与两条状态迁移在**真库**上跑一遍
 #
@@ -808,6 +1033,40 @@ def test_pg_candidates_take_only_legacy_amz_live_rows(pg):
     assert [r["old_sku"] for r in rows] == [_OLD]
     assert rows[0]["product_id"] == "000000000001"
     assert rows[0]["product_id_type"] == "UPC"
+
+
+@needs_pg
+def test_pg_pick_and_exclude_run_through_the_same_candidate_sql(pg):
+    """点名/排除在**真库**上跑一遍:`%(unnamed)s::boolean` 与 `= ANY(...::text[])`
+    的语法、空数组的行为、以及"点名不放松任何一条判据"。假连接测不出这些。"""
+    _seed(pg, _OLD)                                            # ✓ 该迁
+    _seed(pg, "B0PGMIG005", upc="000000000002")                # ✓ 该迁
+    _seed(pg, "B0PGMIG006", source_type="match",
+          source_key="00012345678905", upc="000000000003")     # 跟卖:不迁
+    # 没点名 ⇒ 与改造前逐字等价(两条 amz 活码都在)
+    assert [r["old_sku"] for r in sm._candidates(pg, _STORE, 50)[0]] == \
+        [_OLD, "B0PGMIG005"]
+    # 按旧码点名 / 按 ASIN(source_key)点名
+    assert [r["old_sku"] for r in
+            sm._candidates(pg, _STORE, 50, only_skus=[_OLD])[0]] == [_OLD]
+    assert [r["old_sku"] for r in
+            sm._candidates(pg, _STORE, 50,
+                           only_keys=["B0PGMIG005"])[0]] == ["B0PGMIG005"]
+    # 并集:两个点名参数一起给
+    assert [r["old_sku"] for r in
+            sm._candidates(pg, _STORE, 50, only_skus=[_OLD],
+                           only_keys=["B0PGMIG005"])[0]] == [_OLD, "B0PGMIG005"]
+    # 排除优先(既点名又排除)
+    rows, notes = sm._candidates(pg, _STORE, 50, only_skus=[_OLD],
+                                 exclude_skus=[_OLD])
+    assert rows == [] and any("排除优先于点名" in n for n in notes)
+    # 只排除、不点名:其余照常
+    assert [r["old_sku"] for r in
+            sm._candidates(pg, _STORE, 50,
+                           exclude_skus=[_OLD])[0]] == ["B0PGMIG005"]
+    # 点名一条跟卖 ⇒ 落选**并给理由**(点名不放松判据,也不静默丢)
+    rows, notes = sm._candidates(pg, _STORE, 50, only_skus=["B0PGMIG006"])
+    assert rows == [] and any("B0PGMIG006" in n and "跟卖不迁" in n for n in notes)
 
 
 @needs_pg

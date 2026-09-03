@@ -59,6 +59,53 @@ def is_standard_asin(v) -> bool:
     return bool(_PLAIN.fullmatch(str(v or "").strip().upper()))
 
 
+#: 「标准 ASIN + 尾巴」形态(所有者 2026-09-03 给样:`B0822D9QQKS59` 应为
+#: `B0822D9QQK`)。前 10 位恰好是一个合法裸 ASIN,后面 1~5 位是运营自己贴的尾码。
+#: ⚠ **这条规则只够"猜"**:它与"11~15 位的真源头码"形态完全相同,没有任何本地
+#: 信息能把两者分开(`B0822D9QQKS59` 也可能就是一个 13 位的真码)。所以
+#: `propose_source_key` 把它标成 `guess`,由人逐行认 —— 猜错的后果是往登记簿
+#: 灌一个"看起来很像 ASIN、其实不存在"的键,而键错了下游一声不吭:采不到源
+#: 数据 → 被判成"源头没了" → 清库存/删除。
+_SUFFIXED = re.compile(r"^([A-Z0-9]{10})[A-Z0-9]{1,5}$")
+
+#: `propose_source_key` 的依据取值:'asin'/'wrapped' 是**提取**(规则认得),
+#: PROPOSE_GUESS 是**猜测**(要人认),'' 是提不出。消费方按这个常量分流,
+#: 不写字面量。
+PROPOSE_GUESS = "guess"
+
+
+def propose_source_key(sku) -> tuple[str | None, str]:
+    """输入:沃尔玛侧 sku → 输出:(机器提议的来源码, 提议依据)—— 提不出返 (None, '')。
+
+    只给**人工归类导入**(workflows/sources_reclassify)的预览列用:登记簿里
+    `source_type='unknown'` 的存量行按路由铁律进不了任何自动维护,人要逐行认
+    出"这一串里的源头码是哪一段",本函数是给他打的草稿,**不是判据**。
+
+    三档,别混:
+      · `'wrapped'` / `'asin'` —— 走 `extract_asin` 的既有规则(三段式中段 /
+        裸 ASIN),规则认得,可以直接采用;
+      · `PROPOSE_GUESS` —— 「标准 ASIN + 尾巴」,**只是猜**,调用方必须让人
+        逐行确认,不许自动应用(理由见 `_SUFFIXED` 头注);
+      · `''` —— 提不出(纯数字 item id、跟卖人工号、12 位不透明新码……)。
+        **绝不猜**,留空让人填,与 `extract_asin` 同一条纪律。
+
+    不透明新码显式挡在猜测之外:12 位新码的形态与「10 位 ASIN + 2 位尾巴」
+    撞脸,不挡就会给一个 mint 发的码提议出一个不存在的 ASIN(而它本来就有
+    正确的 source_key,压根不该出现在待归类清单里)。
+    """
+    s = str(sku or "").strip().upper()
+    a = extract_asin(s)
+    if a:
+        return a, classify(s)
+    from services import sku_codec        # 惰性导入:sku_codec → product_events → 本模块
+    if sku_codec.is_opaque(s):
+        return None, ""
+    m = _SUFFIXED.fullmatch(s)
+    if m and is_standard_asin(m.group(1)):
+        return m.group(1), PROPOSE_GUESS
+    return None, ""
+
+
 def classify(sku) -> str:
     """输入:sku → 输出:形态桶 'asin'/'wrapped'/'numeric'/'other'(清洗预览用)。"""
     s = str(sku or "").strip().upper()

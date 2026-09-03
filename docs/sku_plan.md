@@ -601,6 +601,23 @@ feedType 与两个桶都已收录,只补注释与测试)。
 - **节奏硬闸**(`_stage_cap`,把口头节奏变成代码):该店还有 pending/stalled ⇒ 本轮
   上限 0(只定案不提交);零 confirmed ⇒ 1;<10 ⇒ 10;≥10 ⇒ 按 `-p limit`。
   **`-p limit=` 只能收紧**;再叠一层配额留量硬顶 `FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED`。
+- **选谁改:点名 / 排除**(2026-09-03 所有者要求加;在此之前只能"按店 + 按数量",
+  想挑着做只能靠 `ORDER BY w.sku` 的先来后到):
+  `-p skus=<逗号分隔的旧 SKU>` 按旧码点名、`-p asins=<逗号分隔>` 按登记簿 `source_key`
+  (= ASIN)点名,**两个可同时给、取并集**;`-p exclude_skus=` / `-p exclude_asins=`
+  从候选里排除,**排除优先**(既点名又排除 ⇒ 排除)。分隔符逗号/空白/换行都认,
+  去重保序,大小写**不动**(SKU 大小写敏感,口径同 `services/order_lines.norm_sku`)。
+  · 四个参数都是**同一条候选 SQL 的参数化条件**(`_PICK` / `_DROP`),不为点名另开
+    第二条选取路径(§六 双轨禁止:两条一漂,点名跑的就不再是全量跑的那套闸);
+    没点名时 `unnamed=true` ⇒ 与加这个功能之前**逐字等价**。
+  · **点名不越闸**:五道前置闸、逐候选在途闸、节奏硬闸一条都不放松 —— 点了 5 个而
+    本轮只放 1 个是常态,摘要首行会说全("点名 5 个,命中 1 个(节奏闸本轮只放 1 个,
+    其余下轮)")。
+  · 点名了却没进候选面的**逐条给理由**(`_pick_report`:不满足哪一条判据 / 被排除 /
+    在途 feed / Product ID 撞号 / 被节奏闸留到下轮 / 店下查无此行),一个都不省略。
+    静默丢的表现是摘要看起来像"这家店没候选",而所有者以为自己点的名生效了。
+    理由的判据来自 `_SQL_WHY`,与候选 SQL **共用同一份 `_CONDS` 文本**(七条判据只有
+    一个出生地),所以不可能出现"摘要说它满足条件、可它就是不在候选面上"。
 - **五道整店前置闸 + 一道逐候选闸**:在营 / 目录水位新鲜 / 该店 `executing` 处置为 0 /
   `retire_cooldown` 无 pending / 本工作流无在途 feed;逐候选再看旧码上有没有 48h 内的
   在途 feed(不整店拦,跳过并点名)。任一不过**不抛异常**,在摘要里点名"为什么不能改"。
@@ -707,6 +724,20 @@ feedType 与两个桶都已收录,只补注释与测试)。
       【默认 (a) 不加列:E 列 = `catalog.upc_pool.sku` 的投影,批次 2 起显示真码;
       领号复用键仍是 `upc_pool.asin`。烧号新增两个状态文案「删除烧号/锁死烧号」】
 - [x] **四个来源字母**(所有者 2026-09-02):amz=A、跟卖 match=B、1688=C、自建 self=H。
+- [x] **存量 unknown 行的人工归类**(所有者 2026-09-03 提出,**已实现**):
+      `sources_backfill` 把 `CMSQ-B0CLCX3Q1Z-169.99`(应为 `B0CLCX3Q1Z`)、
+      `B0822D9QQKS59`(应为 `B0822D9QQK`)这类非标准形态一律登记成
+      `source_type='unknown'` + `source_key=NULL`,它们按路由铁律**被排除在全部
+      自动维护之外**,也进不了 `sku_migrate` 的候选。新增 `workflows/sources_reclassify`
+      (缺省预览+导出待归类 csv → 人核 → `-p file=` 读回 → `-p apply=1` 才写,
+      `-p overwrite=1` 才盖已有键)与积木 `services/listing_sources.reclassify`
+      (**全仓唯一一条 UPDATE source_type / source_key 的路径**,写入前过
+      `is_standard_asin`)。机器提议只用已有规则:三段式走 `extract_asin`;
+      「标准 ASIN + 尾巴」只标 `guess`、**不预填确认列**(它与"11~15 位的真源头
+      码"形态相同,机器分不开)。⚠ 归类 = 把商品**交还自动链**,真跑后先
+      `maintenance_scan --dry-run` 看破坏面(与 backfill 同款纪律)。
+      **两件仍待所有者**:① 生产上到底有多少行、都是些什么形态(仓内无生产数据,
+      先跑一次缺省预览量一量);② guess 那一档要不要逐行认(默认必须认)。
 - [ ] **黑名单 `or sku` 兜底口径**:订单链是"提不出留 NULL",黑名单链是"原文
       兜底"。切换后原文兜底 = 往黑名单灌随机码;建议统一到"登记簿查不到就
       不入选",但这会改变拦截行为,要你拍板。
@@ -758,7 +789,12 @@ psql "$DSN" -c "SELECT event, count(*) FROM catalog.product_events WHERE store='
 python cli.py db_init && python cli.py db_init          # 连跑两次验幂等
 python cli.py sku_migrate --dry-run -p store=<试点店> -p limit=1
 #   人眼确认:六道闸的结论、候选、载荷 sku 是占位码、productIdentifiers 是该品**现挂**的号、零写库
+#   要**挑着做**(不想按 SKU 升序碰运气)就点名 —— 点名不越闸,该压到 1 还是 1:
+python cli.py sku_migrate --dry-run -p store=<试点店> -p skus=<旧SKU1>,<旧SKU2>
+python cli.py sku_migrate --dry-run -p store=<试点店> -p asins=<ASIN1>,<ASIN2>
+#   人眼确认:摘要首行的「点名 N 个,命中 H 个」,以及落选那几条的**逐条理由**
 python cli.py sku_migrate -p store=<试点店> -p limit=1  # 第一级:1 个品(节奏闸会把任何 limit 压到 1)
+python cli.py sku_migrate -p store=<试点店> -p skus=<旧SKU>   # 第一级也可以点名改哪一个
 python cli.py catalog_sync -p store=<试点店>            # 等一轮完整观测
 python cli.py sku_migrate -p store=<试点店> -p settle_only=1 --dry-run   # 先空跑看判决
 python cli.py sku_migrate -p store=<试点店> -p settle_only=1             # 定案
@@ -770,6 +806,8 @@ python cli.py problem_scan --dry-run
 # 前两级全部 confirmed 之后再往上走
 python cli.py sku_migrate -p store=<试点店> -p limit=10       # 第二级
 python cli.py sku_migrate -p store=<试点店> -p limit=100000   # 第三级:整店
+#   整店时要留几个不动(比如正在做活动的品):-p exclude_skus= / -p exclude_asins=(排除优先)
+python cli.py sku_migrate -p store=<试点店> -p limit=100000 -p exclude_asins=<不改的ASIN>
 ```
 
 **④ 运行纪律**:改码只在 13:00 的 `product_chain` 之外跑(共享 MP_MAINTENANCE 桶);

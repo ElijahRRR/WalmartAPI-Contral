@@ -5,6 +5,22 @@
   python cli.py sku_migrate -p store=<店> -p limit=1           # 第一级:1 个品(节奏闸会自己压到 1)
   python cli.py sku_migrate -p store=<店> -p settle_only=1     # 只定案,不发新的
   python cli.py sku_migrate -p store=<店> -p limit=10          # 第二级(前一级全部 confirmed 之后)
+  python cli.py sku_migrate -p store=<店> -p skus=B0AAA,B0BBB  # 点名:只改这两个旧码
+  python cli.py sku_migrate -p store=<店> -p asins=B0AAA,B0BBB # 点名:按 ASIN 说话
+  python cli.py sku_migrate -p store=<店> -p exclude_skus=B0CC # 排除:从候选里剔掉(排除优先于点名)
+  python cli.py sku_migrate -p store=<店> -p exclude_asins=B0C # 排除:同上,按 ASIN
+
+**点名 / 排除**(2026-09-03 加;所有者要"挑着做",不是"按店按数量批量做"):
+  · `-p skus=` 按旧 SKU 点名,`-p asins=` 按登记簿 `source_key`(= ASIN)点名,
+    两个可同时给,**取并集**;`-p exclude_skus=` / `-p exclude_asins=` 从候选里排除,
+    **排除优先**(同一条既被点名又被排除 ⇒ 排除)。
+  · 四个参数都是同一条候选 SQL 的**参数化条件**(不另开第二条选取路径,§六 双轨禁止),
+    所以点名跑的是与全量跑**逐字相同**的那套判据与闸。
+  · 点名**不越闸**:前置五闸、逐候选在途闸、节奏硬闸(零 confirmed ⇒ 本轮 1 条)
+    一条都不放松 —— 点了 5 个而本轮只放 1 个是常态,摘要会把这句说全。
+  · 点名了却没进候选面的,**逐条点名说明为什么**(不满足哪一条判据 / 被排除 /
+    在途 feed / Product ID 撞号 / 被节奏闸留到下轮 / 店下查无此行)。静默丢的表现是
+    摘要看起来像"这家店没候选",而所有者以为自己点的名生效了。
 
 **三态状态机**(身份权威在 catalog.listing_sources,过程账在 listing.sku_migrations):
 
@@ -62,6 +78,7 @@ synthesis 里「failed/未达/Unknown ⇒ rolled_back」说的是**回执**三�
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from api import feeds
@@ -123,32 +140,77 @@ _STALLED = "stalled"
 #  SQL
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: 改码候选。形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:
-#: 手打就是第二个字母表之家,两份一漂,SQL 与 is_opaque 会对"什么是新码"给出不同
-#: 答案而且全程不报错)。`ls.abandoned_at IS NULL` 是白名单登记的第四处消费方过滤
+#: 改码候选的**七条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
+#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把七条 AND 起来**选行**,
+#: `_SQL_WHY` 把同样这七条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
+#: 文本共用一份,所以不可能"选取用一套、解释用另一套":那种漂移的表现是摘要说
+#: "它满足条件",而它就是不在候选面里,谁也不报错。
+#: 形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:手打就是
+#: 第二个字母表之家,两份一漂,SQL 与 is_opaque 会对"什么是新码"给出不同答案而且
+#: 全程不报错)。`ls.abandoned_at IS NULL` 是白名单登记的第四处消费方过滤
 #: (conventions §九②):候选只取**活码**,已弃码的行沃尔玛侧我们已经当它不存在了。
-_SQL_CANDIDATES_TMPL = """
-SELECT w.store, w.sku AS old_sku, ls.source_type, ls.source_key,
-       coalesce(w.upc, w.gtin) AS product_id,
-       CASE WHEN w.upc IS NOT NULL THEN 'UPC' ELSE 'GTIN' END AS product_id_type
+_CONDS: tuple[tuple[str, str, str], ...] = (
+    ("在架", "已缺席(missing_since 非空):沃尔玛侧已经看不到它,改码也改不动",
+     "w.missing_since IS NULL"),
+    ("活码", "码已弃用(abandoned_at 非空):这条我们已经当它不存在了,"
+             "再改一次码既改不动、也会把一个死码拉回自动化",
+     "ls.abandoned_at IS NULL"),
+    ("未在改", "登记簿里已经指向新码(replaced_by 非空):改码只有一跳",
+     "ls.replaced_by IS NULL"),
+    ("出身可迁", "出身不在 SOURCE_TYPES(跟卖不迁,决策 D)",
+     "ls.source_type = ANY(%(source_types)s::text[])"),
+    ("是旧码", "已经是 12 位不透明码(不用再改)",
+     "NOT " + sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku")),
+    ("有 Product ID", "观测里 upc 与 gtin 都是空:载荷没号可匹配(**不猜**)",
+     "(w.upc IS NOT NULL OR w.gtin IS NOT NULL)"),
+    ("无未了结改码台账",
+     "该 (店, 旧码) 已有 pending/confirmed/stalled 的改码台账(不许开第二条)",
+     """NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
+                  WHERE m.store = w.store AND m.old_sku = w.sku
+                    AND m.status IN ('pending', 'confirmed', 'stalled'))"""),
+)
+
+#: 点名(`-p skus=` / `-p asins=`)与排除(`-p exclude_skus=` / `-p exclude_asins=`):
+#: **同一条候选 SQL 的参数化条件**,不为点名另开第二条选取路径(§六 双轨禁止 ——
+#: 两条选取路径一漂,点名跑的就不再是全量跑的那套闸,而且不报错)。
+#: 没点名时 `unnamed=true` ⇒ 整个 OR 恒真 ⇒ 与加点名之前**逐字等价**;
+#: 排除拼在点名**之后**且是 NOT,所以"既点名又排除"一定是排除赢。
+_PICK = """(%(unnamed)s::boolean
+       OR w.sku = ANY(%(only_skus)s::text[])
+       OR ls.source_key = ANY(%(only_keys)s::text[]))"""
+_DROP = """NOT (w.sku = ANY(%(excl_skus)s::text[])
+           OR ls.source_key = ANY(%(excl_keys)s::text[]))"""
+
+#: 候选面的取数口径(两条 SQL 共用):目录 × 登记簿的**交集**。
+#: 登记簿里没有的行不在这张面上 —— 点名点到它 ⇒ 报"店下查无此行",不是"没候选"。
+_FROM = """
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku
-WHERE w.store = %(store)s
-  AND w.missing_since IS NULL
-  AND ls.abandoned_at IS NULL
-  AND ls.replaced_by IS NULL
-  AND ls.source_type = ANY(%(source_types)s::text[])
-  AND NOT {opaque}
-  AND (w.upc IS NOT NULL OR w.gtin IS NOT NULL)
-  AND NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
-                  WHERE m.store = w.store AND m.old_sku = w.sku
-                    AND m.status IN ('pending', 'confirmed', 'stalled'))
-ORDER BY w.sku
-LIMIT %(limit)s
 """
-_SQL_CANDIDATES = _SQL_CANDIDATES_TMPL.format(
-    opaque=sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku"))
+
+#: 改码候选(单一实现路径:点名/排除只是上面两个参数化条件,不是第二条 SQL)。
+_SQL_CANDIDATES = (
+    "SELECT w.store, w.sku AS old_sku, ls.source_type, ls.source_key,\n"
+    "       coalesce(w.upc, w.gtin) AS product_id,\n"
+    "       CASE WHEN w.upc IS NOT NULL THEN 'UPC' ELSE 'GTIN' END AS product_id_type"
+    + _FROM
+    + "WHERE w.store = %(store)s\n  AND "
+    + "\n  AND ".join([sql for _n, _w, sql in _CONDS] + [_PICK, _DROP])
+    + "\nORDER BY w.sku\nLIMIT %(limit)s\n")
+
+#: 点名落选的理由源:**同一份 `_CONDS`**,逐条选成布尔列 c0…c6(不重写判据)。
+#: 有意**不带** LIMIT、不带排除条件:被 LIMIT 截掉的与被排除的都要能说出口
+#: ("它其实合格,只是本轮节奏闸没轮到"和"你自己排除了它"是两句不同的话)。
+_SQL_WHY = (
+    "SELECT w.sku AS old_sku, ls.source_key AS source_key,\n       "
+    + ",\n       ".join(f"({sql}) AS c{i}"
+                        for i, (_n, _w, sql) in enumerate(_CONDS))
+    + _FROM
+    + "WHERE w.store = %(store)s\n"
+      "  AND (w.sku = ANY(%(only_skus)s::text[])\n"
+      "       OR ls.source_key = ANY(%(only_keys)s::text[]))\n"
+      "ORDER BY w.sku\n")
 
 #: 逐候选的在途 feed 闸(W2 第⑥道)。**有意不分 feed_type**,口径与
 #: workflows/problem_scan 的在途防重同源。
@@ -243,6 +305,32 @@ def _rows(cur) -> list[dict]:
     """输入:执行过的游标 → 输出:[dict](按列名取值,位置解包错一位不报错)。"""
     cols = [d.name for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+#: 点名/排除参数的分隔符:逗号、空白、换行任意混排(所有者是从表格/聊天里
+#: 复制粘贴的,`B0A, B0B\nB0C` 必须与 `B0A,B0B,B0C` 等价)。
+_NAME_SEP = re.compile(r"[,\s]+")
+
+
+def _parse_names(raw) -> list[str]:
+    """输入:`-p skus=` 这类原始值 → 输出:去重保序的名字列表(空串忽略)。
+
+    大小写**一律不动**:SKU 大小写敏感,口径与 `services/order_lines.norm_sku`
+    (只 strip 不 upper)同源 —— 顺手 `.upper()` 会让点名静默命中 0 个,而摘要
+    看起来像"这家店没候选"。ASIN 侧同样不动:登记簿 `source_key` 存的是原样。
+    去重**保序**:摘要里的"点名 N 个"要与所有者敲进去的顺序对得上。
+    """
+    if raw in (None, ""):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in _NAME_SEP.split(str(raw)):
+        name = order_lines.norm_sku(tok)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -599,11 +687,103 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 #  W4 · 候选 / 载荷 / 提交
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _candidates(conn, store_name: str, limit: int) -> tuple[list[dict], list[str]]:
-    """输入:连接 + 店 + 上限 → 输出:(候选行, 逐候选被跳过的点名)。
+def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
+                 kept: list[dict], why_rows: list[dict], inflight: set,
+                 dupe_skus: set, limit: int) -> list[str]:
+    """输入:点名/排除四组名字 + 本轮留下的候选 + `_SQL_WHY` 的逐条判据 + 两道
+    后置闸的落选集 + 本轮上限 → 输出:摘要行(点名 N 个、命中 H 个,落选的**逐条**给理由)。
+
+    「点名了却没出现」必须有名有姓的理由。静默丢的表现是:摘要看起来像"这家店
+    没候选",而所有者以为自己点的名生效了 —— 于是他等一个永远不会来的结果。
+    六类理由,来源各不相同:
+
+      · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
+      · 不满足七条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
+      · 旧码上有在途 feed;· 同批 Product ID 撞号 —— 两道后置闸;
+      · 满足全部条件但**本轮节奏闸没轮到**(按 SKU 升序先来后到,下轮再来);
+      · 店下查无此行(目录 × 登记簿的交集里没有它:拼错 / 不在册 / 从没扫到过)。
+
+    落选名单**一个都不省略**(按理由归并成行,不截断):截断的那几个就是下一次
+    "我明明点了它"的来源。
+    """
+    excl_sku_set, excl_key_set = set(excl_skus), set(excl_keys)
+    hit_skus = {r["old_sku"] for r in kept}
+    hit_keys = {r["source_key"] for r in kept}
+    by_sku: dict[str, list[dict]] = {}
+    by_key: dict[str, list[dict]] = {}
+    for w in why_rows:
+        by_sku.setdefault(w["old_sku"], []).append(w)
+        by_key.setdefault(w["source_key"], []).append(w)
+
+    def _reason(w: dict) -> str:
+        if w["old_sku"] in excl_sku_set or w["source_key"] in excl_key_set:
+            return "被 -p exclude_skus / -p exclude_asins 排除(排除优先于点名)"
+        bad = [_CONDS[i][1] for i in range(len(_CONDS)) if not w.get(f"c{i}")]
+        if bad:
+            return "不满足候选条件 —— " + ";".join(bad)
+        if w["old_sku"] in inflight:
+            return (f"旧码上有 {INFLIGHT_HOURS}h 内的在途 feed(改了码,那条 feed "
+                    f"就打在一个即将不存在的 SKU 上)")
+        if w["old_sku"] in dupe_skus:
+            return ("同一批里 Product ID 撞号(官方不许两个 SKU 挂同一个 "
+                    "Product ID),本轮只留了先到的那条")
+        return (f"**条件全都满足,只是本轮上限 {limit} 个没轮到它**(节奏闸,按 "
+                f"SKU 升序先来后到)—— 下一轮它还在候选面上")
+
+    groups: dict[str, list[str]] = {}
+    n_hit = 0
+    for tok in only_skus:
+        if tok in hit_skus:
+            n_hit += 1
+            continue
+        ws = by_sku.get(tok, [])
+        if not ws:
+            groups.setdefault(
+                f"店 {store_name} 下查无此 SKU(catalog.walmart_items × "
+                f"catalog.listing_sources 的交集里没有它:拼错 / 不在册 / "
+                f"从没被扫到过)", []).append(tok)
+        for w in ws:
+            groups.setdefault(_reason(w), []).append(tok)
+    for tok in only_keys:
+        if tok in hit_keys:
+            n_hit += 1
+            continue
+        ws = by_key.get(tok, [])
+        if not ws:
+            groups.setdefault(
+                f"店 {store_name} 下查无此 source_key(登记簿里没有这个 ASIN:"
+                f"拼错 / 不在册 / 是跟卖出身(source_key 存的是 GTIN))",
+                []).append(f"{tok}(ASIN)")
+        for w in ws:
+            groups.setdefault(_reason(w), []).append(
+                f"{tok}(ASIN→{w['old_sku']})")
+
+    n_named = len(only_skus) + len(only_keys)
+    head = (f"  {'⚠ ' if not n_hit else ''}点名 {n_named} 个"
+            f"(-p skus {len(only_skus)} 个 + -p asins {len(only_keys)} 个),"
+            f"命中 {n_hit} 个")
+    if not groups:
+        return [head]
+    n_miss = sum(len(v) for v in groups.values())
+    out = [head + f";落选 {n_miss} 个,逐条:"]
+    out += [f"    · {'、'.join(names)}:{reason}" for reason, names in groups.items()]
+    return out
+
+
+def _candidates(conn, store_name: str, limit: int, *,
+                only_skus=(), only_keys=(),
+                exclude_skus=(), exclude_keys=()) -> tuple[list[dict], list[str]]:
+    """输入:连接 + 店 + 上限(+ 点名/排除四组名字)→ 输出:(候选行, 逐候选被跳过的点名)。
 
     候选 = 在架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
-    ∧ 观测到的 upc/gtin 至少有一个 ∧ 该 (店, 旧码) 无未了结的改码台账。
+    ∧ 观测到的 upc/gtin 至少有一个 ∧ 该 (店, 旧码) 无未了结的改码台账
+    (七条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
+
+    `only_skus` / `only_keys`(`-p skus=` / `-p asins=`,取并集)与
+    `exclude_skus` / `exclude_keys` 是**同一条候选 SQL 的参数化条件**,
+    不是第二条选取路径;**点名不放松任何一道闸**,落选的逐条给理由
+    (`_pick_report`)。上限 0 时**一条 SQL 都不发**(闸未过 / settle_only /
+    上一批没清):这时点名的说明由 run() 出,别在这里悄悄查库。
 
     Product ID 取 **catalog.walmart_items 观测到的 upc(空则 gtin)**,不取 UPC 池:
     改码按 Product ID 匹配,池里的号若与沃尔玛现挂的不一致(历史换过号),
@@ -614,17 +794,24 @@ def _candidates(conn, store_name: str, limit: int) -> tuple[list[dict], list[str
     """
     if limit <= 0:
         return [], []
+    named = bool(only_skus or only_keys)
+    args = {"store": store_name, "source_types": list(SOURCE_TYPES),
+            "limit": limit, "unnamed": not named,
+            "only_skus": list(only_skus), "only_keys": list(only_keys),
+            "excl_skus": list(exclude_skus), "excl_keys": list(exclude_keys)}
     with conn.cursor() as cur:
-        cur.execute(_SQL_CANDIDATES, {"store": store_name,
-                                      "source_types": list(SOURCE_TYPES),
-                                      "limit": limit})
+        cur.execute(_SQL_CANDIDATES, args)
         rows = _rows(cur)
-        if not rows:
-            return [], []
-        cur.execute(_SQL_INFLIGHT_OLD, {"store": store_name,
-                                        "skus": [r["old_sku"] for r in rows],
-                                        "hours": INFLIGHT_HOURS})
-        inflight = {r[0] for r in cur.fetchall()}
+        inflight: set = set()
+        if rows:
+            cur.execute(_SQL_INFLIGHT_OLD, {"store": store_name,
+                                            "skus": [r["old_sku"] for r in rows],
+                                            "hours": INFLIGHT_HOURS})
+            inflight = {r[0] for r in cur.fetchall()}
+        why: list[dict] = []
+        if named:                      # 点名了就必须能解释,哪怕一条候选都没选出来
+            cur.execute(_SQL_WHY, args)
+            why = _rows(cur)
     notes: list[str] = []
     if inflight:
         notes.append(f"  ⚠ 跳过 {len(inflight)} 个:旧码上有 {INFLIGHT_HOURS}h 内的在途 feed"
@@ -637,16 +824,26 @@ def _candidates(conn, store_name: str, limit: int) -> tuple[list[dict], list[str
     seen: dict[str, str] = {}
     out: list[dict] = []
     dupes: list[str] = []
+    dupe_skus: set = set()
     for r in keep:
         pid = r["product_id"]
         if pid in seen:
             dupes.append(f"{r['old_sku']}(与 {seen[pid]} 同 Product ID {pid})")
+            dupe_skus.add(r["old_sku"])
             continue
         seen[pid] = r["old_sku"]
         out.append(r)
     if dupes:
         notes.append(f"  ⚠ 跳过 {len(dupes)} 个:同一批里 Product ID 撞号"
                      f"(官方不许两个 SKU 挂同一个 Product ID):{dupes[:3]}")
+    if named:
+        notes += _pick_report(store_name, only_skus, only_keys,
+                              exclude_skus, exclude_keys, out, why,
+                              inflight, dupe_skus, limit)
+    elif exclude_skus or exclude_keys:
+        notes.append(f"  排除 -p exclude_skus {len(exclude_skus)} 个 / "
+                     f"-p exclude_asins {len(exclude_keys)} 个"
+                     f"(已在候选 SQL 里剔除,没点名 ⇒ 其余照常按 SKU 升序取)")
     return out, notes
 
 
@@ -764,11 +961,16 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(params: dict) -> str:
-    """输入:params(store 必填 / limit / settle_only / observe_hours / stale_hours)
-    → 输出:定案 + 提交摘要(首行点名四类告警)。
+    """输入:params(store 必填 / limit / settle_only / observe_hours / stale_hours /
+    skus / asins / exclude_skus / exclude_asins)→ 输出:定案 + 提交摘要(首行点名四类告警)。
 
     执行序:读参 → _preflight → _settle(先定案,再考虑发新的)→ _stage_cap →
     _candidates → _migrate → 订单双算体检 → 组摘要。
+
+    **点名(`-p skus=` / `-p asins=`)与排除(`-p exclude_skus=` / `-p exclude_asins=`)
+    只挑范围,不放松任何一道闸**:前置五闸、逐候选在途闸、节奏硬闸照旧,点名 5 个而
+    本轮只放 1 个是常态(零 confirmed ⇒ 上限 1),摘要会把这句说全;点名了却没进
+    候选面的**逐条给理由**(_pick_report),不静默丢。
 
     `store` **必填**:一店一批不是口头节奏,是接口约束。缺省返回 ⛔ 开头的提示
     并且**什么都不做**(cli 认这个前缀,记 refused 而不是 success)。
@@ -788,6 +990,13 @@ def run(params: dict) -> str:
         return f"⛔ -p limit= 必须是整数,收到 {raw_limit!r}"
     observe_h = float(params.get("observe_hours") or OBSERVE_HOURS)
     stale_h = float(params.get("stale_hours") or STALE_HOURS)
+    # 点名与排除:两个点名参数**取并集**(skus 按旧码、asins 按登记簿 source_key),
+    # 排除拼在候选 SQL 的点名条件之后且是 NOT ⇒ **排除优先**。
+    only_skus = _parse_names(params.get("skus"))
+    only_keys = _parse_names(params.get("asins"))
+    excl_skus = _parse_names(params.get("exclude_skus"))
+    excl_keys = _parse_names(params.get("exclude_asins"))
+    n_named = len(only_skus) + len(only_keys)
 
     lines: list[str] = []
     warns: list[str] = []
@@ -809,8 +1018,17 @@ def run(params: dict) -> str:
         if settle_only:
             cap, cap_note = 0, "-p settle_only=1:本轮只定案,不提交新的"
         lines.append(f"  {cap_note}")
-        cands, cand_notes = _candidates(conn, store_name, cap)
+        cands, cand_notes = _candidates(conn, store_name, cap,
+                                        only_skus=only_skus, only_keys=only_keys,
+                                        exclude_skus=excl_skus,
+                                        exclude_keys=excl_keys)
         lines += cand_notes
+        # 上限 0 时 _candidates 一条 SQL 都不发(闸未过 / settle_only / 上一批没清)——
+        # 点名的说明只能在这里出,否则摘要看起来像"这家店没候选"。
+        if n_named and cap <= 0:
+            lines.append(f"  ⚠ 点名 {n_named} 个,但本轮上限 0(理由见上一行):"
+                         f"一条都没查、一条都没发 —— **点名不越闸**,先按上一行"
+                         f"把账清干净,下轮再点同样这几个")
         dupes = order_lines.duplicate_po_lines(conn)
 
     mig_counts: dict = {}
@@ -849,6 +1067,16 @@ def run(params: dict) -> str:
 
     gist = (f"定案 confirmed {n_conf} / rolled_back {n_roll} / stalled {n_stall}"
             f"(仍 pending {n_pend}),本轮提交 {n_sub},跳过 {max(n_skip, 0)}")
+    if n_named:
+        # 首行必须说清"点了几个、中了几个、为什么只中这么几个":cli 的链通知只取
+        # 首行,而"命中 0 个"与"这家店没候选"是两件事(后者不该让人去查参数)。
+        gist += f";点名 {n_named} 个,命中 {len(cands)} 个"
+        if cap <= 0:
+            gist += "(本轮上限 0,一个都没发)"
+        elif cap < n_named:
+            gist += f"(节奏闸本轮只放 {cap} 个,其余下轮;逐条理由见明细)"
+        elif len(cands) < n_named:
+            gist += "(落选的逐条理由见明细)"
     if not ok:
         # ⚠ 这个 ⛔ **有意不放在首行行首**:cli 认行首的 ⛔ 记 refused,而 refused 的
         # 语义是「前提不成立、**什么都没做**」—— 闸不过时定案照跑,可能真定了案,

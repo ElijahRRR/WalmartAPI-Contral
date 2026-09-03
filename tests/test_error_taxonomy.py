@@ -631,13 +631,18 @@ def test_黑名单面_全是真违禁时不报那一段():
     assert "B → POLICY" in txt
 
 
-def test_新归类引擎还没接进任何生产写入路径():
-    """⚠ 这条钉的是**现状**,不是理想态:`services/error_taxonomy` 至今只被
-    报告(error_reclass_report)与评估(audit_replay)消费,判定/落库路径跑的
-    仍是 `problem_products.categorize` 那套 A-L 码。
+def test_新码的消费者就这三个_判定与入选路径仍是旧码():
+    """⚠ 这条钉的是**现状**,不是理想态(2026-09-03 更新:回填工作流已落地)。
 
-    换轨那天要连这条测试一起改 —— 改不动它说明换轨没做完;
-    而它要是被悄悄删掉,"我们已经按新规归类了"就会变成一句没人验证的话。
+    `services/error_taxonomy` 的消费者只有三个,都**不改判定行为**:
+      · `error_reclass_report` —— 新旧并排报账(只落报告文件);
+      · `audit_replay`         —— 回放抽样贴期望类别(只写 replay_results);
+      · `error_reclass`        —— **存量回填**,只写两表的 `taxonomy_*` 新列。
+
+    而**入选黑名单与处置那条路仍吃旧 A-L 码**(`blacklist.PERMANENT` 六个
+    单字母、`problem_scan`/`feed_track` 调 `problem_products.categorize`)。
+    换轨那天要连这条测试一起改 —— 改不动它说明换轨没做完;它要是被悄悄删掉,
+    "我们已经按新规归类了"就会变成一句没人验证的话。
     """
     import pathlib
     hits = set()
@@ -649,7 +654,29 @@ def test_新归类引擎还没接进任何生产写入路径():
     hits -= {"services/error_taxonomy.py", "services/policy_names.py",
              "registry/resources.py"}
     assert hits == {"workflows/error_reclass_report.py",
-                    "workflows/audit_replay.py"}, sorted(hits)
-    # 写黑名单那条路仍吃旧码:PERMANENT 是 A-L 里的六个单字母
+                    "workflows/audit_replay.py",
+                    "workflows/error_reclass.py"}, sorted(hits)
+    # 入选那条路仍吃旧码:PERMANENT 是 A-L 里的六个单字母
     from services import blacklist
     assert blacklist.PERMANENT == {"B", "C", "E", "F", "G", "K"}
+    # 回填工作流**不许**动 category / 不许删行 —— 它只写 taxonomy_* 列
+    src = pathlib.Path("workflows/error_reclass.py").read_text(encoding="utf-8")
+    assert "SET category" not in src and "DELETE FROM" not in src
+    assert "taxonomy_version = %(ver)s" in src
+
+
+def test_不是商品违禁那一集只有一份():
+    """⚠ 双轨禁止:报账的与回填的必须读同一份常量。
+
+    工作流之间不许 import,所以口径住在 `services/error_taxonomy`;
+    哪天有人在某个工作流里又抄一份字面量,这条会红。
+    """
+    from workflows import error_reclass, error_reclass_report
+    assert error_reclass.NOT_A_PRODUCT_BAN is et.NOT_A_PRODUCT_BAN
+    assert error_reclass_report._NOT_A_PRODUCT_BAN is et.NOT_A_PRODUCT_BAN
+    # FLAGGED / OTHER 故意不在里面:不能反过来断言"不是违禁"
+    assert "FLAGGED" not in et.NOT_A_PRODUCT_BAN
+    assert "OTHER" not in et.NOT_A_PRODUCT_BAN
+    # 每个码都得是码表里真有的
+    for code in et.NOT_A_PRODUCT_BAN:
+        assert code in resources.ERROR_CATEGORY_CODES, code

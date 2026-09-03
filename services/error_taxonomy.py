@@ -193,6 +193,18 @@ RULES: tuple[Rule, ...] = (
     Rule(17, "OTHER", "未识别(兜底)", catch_all=True),
 )
 
+#: 新码里**不是「这件商品本身违禁」**的那些(2026-09-03 加,唯一出处)。
+#: 旧 A-L 码把这些一律算永久禁售拉黑,新码认得出病根另在别处。
+#: 逐个理由:PT_WRONG=我方类目选错(沃尔玛明示改 product type)/ GATED=类目要
+#: 预审批(没资质 ≠ 商品违禁)/ CONTENT=文案图片不合标准 / INFO=信息缺失 /
+#: PRICE=价格规则 / SYSTEM=沃尔玛系统错误 / STAGE=未上线(中性)/ EXPIRED=过期。
+#: ⚠ **FLAGGED 与 OTHER 故意不在这一集**:前者沃尔玛不给理由、后者没判据,
+#:   都不能反过来断言"不是违禁"(判不准就不判,与全仓同一条纪律)。
+#: ⚠ 两个消费方(error_reclass_report 报账 / error_reclass 回填)读的是**这一份**:
+#:   工作流之间不许 import,各写一份就是双轨,改一处漏一处不会有任何东西红。
+NOT_A_PRODUCT_BAN = ("PT_WRONG", "GATED", "CONTENT", "INFO",
+                     "PRICE", "SYSTEM", "STAGE", "EXPIRED")
+
 _RULE_UNKNOWN = RULES[-1]
 _RULE_UNLISTED = RULES[-2]
 # feed 政策族只过序 1-15(方案 §3.6 通道 2):序 0 是 AI 通道自己的事,

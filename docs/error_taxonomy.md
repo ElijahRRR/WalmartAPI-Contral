@@ -400,3 +400,61 @@ python cli.py error_reclass_report -p scope=blacklist
 判"不是商品违禁"的新码集合 `_NOT_A_PRODUCT_BAN` = PT_WRONG / GATED / CONTENT /
 INFO / PRICE / SYSTEM / STAGE / EXPIRED。⚠ **`FLAGGED` 与 `OTHER` 故意不进这一集**:
 前者沃尔玛不给理由、后者没判据,都不能反过来断言"不是违禁"。
+
+---
+
+## 十一、存量回填:`error_reclass`(2026-09-03 所有者定稿)
+
+所有者原话:「**报错原文应该是有的,我们要重新对这些记录按新标准进行重新定义
+并归类。先把这一步做了,标准不统一,审核误差很大。**」
+
+§十 报的是账,这一条是**动手**。
+
+### 11.1 写什么、不写什么
+
+只写两张表的**新增列**,老列一个字不动:
+
+| 表 | 新列 | 老列 |
+|---|---|---|
+| `audit.walmart_error_records` | `taxonomy_code` / `taxonomy_policy` / `taxonomy_version` | `error_code char(1)`(旧 A-L)**保留** |
+| `catalog.asin_blacklist` | 同上三列 + `taxonomy_src` | `category`(入选旧码)**保留且不动** |
+
+⚠ **判定行为一点没变**:L0 的 ASIN 闸读的仍是 `category`。
+让新码改变拦截行为是**另一次裁决** —— 黑名单是「一次入选、永久禁止」的
+既定语义,批量放行是破坏性动作,不在这条工作流里顺手做。摘要会把
+「依据在新码下站不住」的行数报出来,但**一条都没放行**。
+
+### 11.2 原文从哪儿来(四级优先,全文优先于样本)
+
+| `taxonomy_src` | 来源 | 说明 |
+|---|---|---|
+| `records` | `audit.walmart_error_records.raw_reason` | **全文**,`NOT NULL`;同 asin 多条取 `report_date` 最新 |
+| `events` | `catalog.product_events.detail->>'reasons'` | 病历,最新一条 |
+| `items` | `catalog.walmart_items.unpublished_reasons` | 当前值,按黑名单行的 `src_sku` **精确对** |
+| `self` | `catalog.asin_blacklist.reason` | ⚠ **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分是**下限** |
+| `none` | —— | 四处都没有 ⇒ `taxonomy_code` 留 **NULL**,**不猜** |
+
+政策名同样**必须 join 得上政策表才写**(与 `audit_l3` 的 `policy` 同一条纪律:
+猜出来的名字会一路进报表与申诉口径,而没有任何东西会红)。
+
+### 11.3 幂等与增量
+
+`taxonomy_version` 是候选谓词:`IS DISTINCT FROM ERROR_TAXONOMY_VERSION` ——
+判过的行盖上版本号即**自动退出候选集**,跑一半中断直接重跑;码表递增后再跑
+就是全量重判。`-p force=1` 无视版本号重判(码表没动但想复算时用)。
+
+```bash
+python cli.py error_reclass --dry-run              # 一行都不写,报第一批会判成什么
+python cli.py error_reclass                        # 真跑,两张表都回填
+python cli.py error_reclass -p scope=blacklist     # 只回填黑名单
+```
+
+⚠ 空跑**不盖版本号** ⇒ 候选集恒定,所以空跑只取一批看形态(取多批也是同一批)。
+
+### 11.4 换轨还没做
+
+回填 ≠ 换轨。入选黑名单与处置那条路**仍吃旧 A-L 码**
+(`blacklist.PERMANENT` 六个单字母、`problem_scan` / `feed_track` 调
+`problem_products.categorize`)。守门测试
+`test_新码的消费者就这三个_判定与入选路径仍是旧码` 钉住这个现状:换轨那天要
+连它一起改;它被悄悄删掉,「我们已经按新规归类了」就会变成一句没人验证的话。

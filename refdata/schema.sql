@@ -318,6 +318,22 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
 -- 2026-08-11:asin 列改存清洗后的标准码(sku_normalize + rebuild_asin 重建),
 -- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
 ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+-- 新码回填四列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **`category` 一个字不动**:它是入选那一刻的旧码,也是「一次入选、永久禁止」
+--   的历史依据;判定链(L0 ASIN 闸)现在读的仍是它 —— 新码**只是账**,
+--   要不要让它改变拦截行为是所有者的另一次裁决(别顺手接上去)。
+-- taxonomy_src 记原文是从哪儿找到的,四级优先(全文优先于样本):
+--   'records'=audit.walmart_error_records.raw_reason(全文,最新一条)
+--   'events' =catalog.product_events.detail->>'reasons'(病历,最新一条)
+--   'items'  =catalog.walmart_items.unpublished_reasons(当前值,按 src_sku 对)
+--   'self'   =本表 reason 列(**截 200 字符的样本**,判据串可能被切掉)
+--   'none'   =四处都没有 ⇒ taxonomy_code 留 NULL,不猜
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_version text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_src text;
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxcode_idx ON catalog.asin_blacklist(taxonomy_code);
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxver_idx  ON catalog.asin_blacklist(taxonomy_version);
 
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
@@ -1511,6 +1527,17 @@ CREATE INDEX IF NOT EXISTS idx_werror_pt     ON audit.walmart_error_records(walm
 CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(report_date);
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
+-- 新码回填三列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **老列 error_code(char(1))原样保留**:它是旧 A-L 码,是拉黑那批行的历史
+--   依据,删了就没法对照"当初按什么拉的黑"。新旧同列并存,查询按需要挑。
+-- taxonomy_version 是**增量谓词**(同 audit_runs.audit_version 的套路):
+--   码表一改就递增 ERROR_TAXONOMY_VERSION,`IS DISTINCT FROM 当前版本` 天然分页,
+--   跑一半中断直接重跑,已盖章的自动退出候选集。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_version text;
+CREATE INDEX IF NOT EXISTS idx_werror_taxcode ON audit.walmart_error_records(taxonomy_code);
+CREATE INDEX IF NOT EXISTS idx_werror_taxver  ON audit.walmart_error_records(taxonomy_version);
 
 -- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
 -- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;

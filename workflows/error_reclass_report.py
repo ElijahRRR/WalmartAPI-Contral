@@ -75,15 +75,9 @@ FROM catalog.asin_blacklist
 GROUP BY 1, 2
 """
 
-#: 新码里**不是「这件商品本身违禁」**的那些:旧码把它们一律算作永久禁售拉黑,
-#: 而新引擎认得出病根另在别处。命中即"这条黑名单行的依据在新码下站不住"。
-#: 逐个理由:PT_WRONG=我方类目选错(沃尔玛明示改 product type)/ GATED=类目要
-#: 预审批(没资质≠商品违禁)/ CONTENT=文案图片不合标准 / INFO=信息缺失 /
-#: PRICE=价格规则 / SYSTEM=沃尔玛系统错误 / STAGE=未上线(中性)/ EXPIRED=过期。
-#: **保守起见 FLAGGED 与 OTHER 不进这一集**(前者沃尔玛不给理由、后者没判据,
-#: 都不能反过来断言"不是违禁")。
-_NOT_A_PRODUCT_BAN = ("PT_WRONG", "GATED", "CONTENT", "INFO",
-                      "PRICE", "SYSTEM", "STAGE", "EXPIRED")
+#: 口径唯一出处在 `services/error_taxonomy`(本报告与回填工作流 error_reclass
+#: 读同一份;工作流之间不许 import,各写一份就是双轨)。
+_NOT_A_PRODUCT_BAN = error_taxonomy.NOT_A_PRODUCT_BAN
 
 _SQL_POLICY = ("SELECT category_en FROM audit.walmart_prohibited_policy "
                "WHERE category_en IS NOT NULL ORDER BY category_en")

@@ -230,7 +230,7 @@ def _check_trademark(product: ProductInfo) -> Phase0Result:
     命中短语同名也照拦(政策语义,不要好心加豁免分支)。
     有任意一个 match 即 block,不设数量阈值。
     另:旧仓 :35-36 的 `if not hay` 是死分支(hay 最小为 "\n\n" 恒真),不迁。
-    hay 与 ProductInfo.searchable_text 不是同一份文本(截断规则不同),勿互换。
+    hay 与品牌黑名单扫描那条(只扫标题)不是同一份文本,勿互换。
     """
     title = product.title or ""
     bullets_txt = " ".join((product.bullet_points or [])[:_TM_BULLET_LIMIT])
@@ -492,12 +492,16 @@ def _is_word_boundary_char(c: str) -> bool:
 def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
     """输入:产品 + ctx(用 ctx.brand_mention_automaton) → 输出:软证据 hit(0 或 1 条)。
 
-    扫 product.searchable_text(title + 全部五点 + 长描述)。自动机为 None
-    → 返回 [](未装 pyahocorasick / 黑名单词表为空,那是"没有词可扫")。
+    **只扫 product.title**(2026-09-03 所有者定稿)。以前扫 title + 全部五点 +
+    长描述,而词表 4.2 万条里混着 corner / life / wooden / better / side / time
+    这类通用词 —— 扫描述等于把送进 L3 的品牌词清单**灌满噪声**,而那份清单
+    `≤10 个`,真正长在品牌位上的那个词反而挤不进去(`B0GYNRCZ9F` 的 `abba` 就是
+    这么丢的)。代价说清:只在描述里出现的品牌从此不进证据 —— 所有者认这笔账。
+    自动机为 None → 返回 [](未装 pyahocorasick / 黑名单词表为空,那是"没有词可扫")。
     AC 不自带词边界,命中后手动检查前后字符;**自品牌豁免是精确等值**
     (brand strip+lower 后与命中词完全相等才跳过);同一个 brand 只报第一次。
-    判定逻辑逐字迁自 audit_l2._rule_title_desc_blacklist(rule_code 与层次变了,
-    判法一个字没变 —— 迁层不是改判据)。
+    判定逻辑迁自 audit_l2._rule_title_desc_blacklist(rule_code 与层次 C 批变过,
+    **扫描面 2026-09-03 收窄到标题**,词边界/自品牌豁免/同品牌只报一次都没变)。
 
     ⚠ **属性直取,不用 `getattr(..., None)` 兜底**(2026-09-03 复核修订):
     `AuditContext` 把这个字段声明成**无默认值**的必填项,所以生产上它一定在;
@@ -505,7 +509,7 @@ def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
     —— 表现是"品牌证据从此一条不出、TRO 命中从此不报警",而判定照样跑完、
     摘要照样漂亮,没有任何东西会红。少一个字段就该当场 AttributeError。
     """
-    hay = product.searchable_text
+    hay = product.title or ""
     if not hay:
         return []
     A = ctx.brand_mention_automaton

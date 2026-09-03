@@ -59,19 +59,12 @@ class ProductInfo:
                                      # L0 类目闸按它判"属不属于某棵禁售子树"
                                      # ——父级不覆盖子级的老毛病靠它根治
 
-    @property
-    def searchable_text(self) -> str:
-        """输入:自身 title/bullets/description → 输出:换行拼接的大文本。
-
-        逐字迁自 pipelines/models.py:29-36:bullets **不截断**、falsy 段过滤、
-        "\\n" 连接。L2 的黑名单/关键词扫描用它;**Phase0 商标规则不用**
-        (那里另拼一份 hay:bullets 只取前 5 条、desc 只取前 1000 字符)。
-        """
-        parts = [self.title or ""]
-        parts.extend(self.bullet_points)
-        if self.long_description:
-            parts.append(self.long_description)
-        return "\n".join(p for p in parts if p)
+    # ⚠ `searchable_text`(title + 全部五点 + 长描述拼一大段)2026-09-03 删除:
+    # 它最后一个消费者是 L0 品牌黑名单扫描,而所有者当天定稿**只扫标题**
+    # (词表 4.2 万条里混着 corner / life / wooden 这类通用词,扫描述等于把
+    # 送进 L3 的品牌词清单(≤10)灌满噪声,真正在品牌位上的那个词反而挤不进去)。
+    # L0 商标符号规则一直是自己另拼 hay(五点前 5 条 + 描述前 1000 字符),不受影响。
+    # 要再加扫描面,先想清楚"多扫的那一段会把什么挤出前 10",别直接把这个属性加回来。
 
 
 @dataclass

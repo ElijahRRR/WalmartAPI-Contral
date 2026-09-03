@@ -506,15 +506,41 @@ def test_brand_mention_chinese_neighbours_are_boundaries():
                              _ctx(ac=_ac(["caf"]))).evidence == []
 
 
-def test_brand_mention_reports_each_brand_once_and_scans_all_bullets():
-    """同一个品牌只报第一次;扫描面 = searchable_text(标题 + 全部五点 + 描述)。"""
-    ctx = _ctx(ac=_ac(["dyson", "bose"]))
+def test_brand_mention_只扫标题_五点与描述一个字都不扫():
+    """⚠ 扫描面 2026-09-03 由「标题 + 全部五点 + 长描述」收窄成**只有标题**
+    (所有者定稿)。
+
+    为什么收窄不是"少查了":词表 4.2 万条里混着 corner / life / wooden /
+    better / side / time 这类通用词,扫描述等于把送进 L3 的品牌词清单灌满噪声
+    —— 而那份清单 **≤10 个**,真正长在品牌位上的那个词反而挤不进去
+    (`B0GYNRCZ9F` 的 `abba` 就是这么丢的)。
+    代价也说清:只在描述/五点里出现的品牌从此不进证据,所有者认这笔账。
+    """
+    ctx = _ctx(ac=_ac(["dyson", "bose", "sony"]))
     r = audit_phase0.check(
         _p(title="Dyson filter for dyson vacuum",
-           bullet_points=["a", "b", "c", "d", "e", "fits Bose speakers"]),
+           bullet_points=["a", "b", "c", "d", "e", "fits Bose speakers"],
+           long_description="compatible with Sony devices"),
         ctx)
     brands = [m["brand"] for m in r.evidence[0].detail["matches"]]
-    assert brands == ["dyson", "bose"] and r.evidence[0].detail["count"] == 2
+    # 标题里的 dyson 出现两次,只报第一次;五点的 bose 与描述的 sony 都不扫
+    assert brands == ["dyson"] and r.evidence[0].detail["count"] == 1
+    # 反证:同样的词搬进标题就报得出来 —— 不是词表或自动机的问题
+    r2 = audit_phase0.check(_p(title="fits Bose speakers"), ctx)
+    assert [m["brand"] for m in r2.evidence[0].detail["matches"]] == ["bose"]
+
+
+def test_品牌扫描与商标符号规则各扫各的():
+    """⚠ 两条 L0 规则的扫描面**故意不同**,别顺手统一:
+
+    品牌黑名单扫描只看标题(词表噪声大);商标符号规则照旧看
+    标题 + 五点前 5 条 + 描述前 1000 字符(® / ™ 是强信号,没有噪声问题)。
+    """
+    r = audit_phase0.check(
+        _p(title="plain doormat", bullet_points=["Nike® official"]),
+        _ctx(ac=_ac(["nike"])))
+    assert r.blocked                              # 商标符号仍从五点里抓得到
+    assert r.hits[0].rule_code == "phase0_trademark_symbol"
 
 
 def test_brand_mention_without_an_automaton_just_skips():

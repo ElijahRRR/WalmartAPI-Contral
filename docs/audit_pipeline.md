@@ -106,7 +106,7 @@
 | 3 | 文案自述专利 | `phase0_patent_claim` | -100 | 正则 | "patented / 专利保护"等;漆皮(patent leather)豁免 |
 | **4** | **Made in USA 声明**(C 批自 L2 R10 迁入) | `phase0_made_in_usa` | **-100** | 正则 | 扫**标题 + 全部五点 + 长描述**;`not made in` 否定式排除;`usa` 必须独立成词 |
 | 5 | 品牌黑名单 | `phase0_brand_blacklist` | -100 | `catalog.brand_blacklist` | `brand` 字段**精确等值**(不是子串) |
-| **软** | **品牌黑名单扫文案**(C 批自 L2 R4 迁入) | `phase0_brand_mention` | **0** | `catalog.brand_blacklist`(Aho-Corasick) | 扫 `title + 全部五点 + 长描述`;命中后手动查词边界;自品牌**精确等值**豁免;同一品牌只报第一次 |
+| **软** | **品牌黑名单扫文案**(C 批自 L2 R4 迁入) | `phase0_brand_mention` | **0** | `catalog.brand_blacklist`(Aho-Corasick) | **只扫 `title`**(2026-09-03 `c.2026-09-03.4` 收窄,原来是 title + 全部五点 + 长描述):词表 4.2 万条里混着 corner / life / wooden 这类通用词,扫描述等于把送进 L3 的品牌词清单(**≤10 个**)灌满噪声,真正长在品牌位上的词反而挤不进去。代价:只在描述/五点里出现的品牌从此不进证据。⚠ 商标符号那条**不动**(照旧 title + 五点前 5 + 描述前 1000 字符),两条规则的扫描面故意不同;命中后手动查词边界;自品牌**精确等值**豁免;同一品牌只报第一次 |
 
 规则 5 与软规则是**同一份数据的两种判法**(所有者定稿 §10:黑名单能力只在
 L0 一处实现、一份数据):`brand` 字段等值 = 硬拒;文案里提到 = 证据,交 L3 判
@@ -402,7 +402,7 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 
 | rule_code | 送什么 |
 |---|---|
-| **`phase0_brand_mention`(L0,现役唯一一条;读的是 `Phase0Result.evidence` 槽)** | 前 10 个命中品牌 + 原文片段 |
+| **`phase0_brand_mention`(L0,现役唯一一条;读的是 `Phase0Result.evidence` 槽)** | 前 10 个命中品牌 + 原文片段(**只出自标题**,见 §2)|
 | **未登记的任何 rule_code** | `* {rule_code}: {detail 摘要}` —— **不丢** |
 | `audit_reason.NOT_A_REASON` 里的(`pt_dict_fallback` / `unmapped_amazon_path` / `l4_images_partial` / `l4_bad_schema`) | **不送** —— 见下 |
 | 存量老码(`title_desc_blacklist` / `cat_requires_cert*` / `trademark_live` / `content_promotional` / `walmart_strict_sensitive`) | 渲染表**保留**:新链不再产生,但 `audit_why` 与回放读老行时还要认得它们 |

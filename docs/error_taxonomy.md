@@ -458,3 +458,45 @@ python cli.py error_reclass -p scope=blacklist     # 只回填黑名单
 `problem_products.categorize`)。守门测试
 `test_新码的消费者就这三个_判定与入选路径仍是旧码` 钉住这个现状:换轨那天要
 连它一起改;它被悄悄删掉,「我们已经按新规归类了」就会变成一句没人验证的话。
+
+### 11.5 首次空跑实测(2026-09-03,各表第一批 10,000)
+
+⚠ **这是按 `id` / `asin` 排序的第一批,不是随机样本** —— 空跑只取一批(见 11.3),
+分布**不能直接外推**到全量(黑名单 73,918 行)。真跑走完才有全量数。
+
+**`audit.walmart_error_records` 10,000 条**:EXPIRED 6,072 / **PT_WRONG 3,311** /
+POLICY 152 / FLAGGED 135 / PRICE 115 / BRAND 101 / IP 48 / …
+旧码去向里最刺眼的一条:**`B → PT_WRONG` 3,285**,而 `B → POLICY` 只有 147。
+
+**`catalog.asin_blacklist` 10,000 条**:原文来源
+`self=4135  records=4085  none=1190  items=555  events=35`;
+新码 **PT_WRONG 7,618** / FLAGGED 592 / POLICY 224 / GATED 123 / BRAND 117 /
+EXPIRED 56 / IP 52 / PROHIBITED_FINAL 20 / …
+**「依据在新码下站不住」7,805 条**,主体是 `B → PT_WRONG` 7,583。
+
+### 11.6 为什么会这样(生产原文实证)
+
+沃尔玛那句话的全文是:
+
+> This item has been unpublished for violating Walmart's Marketplace
+> **Prohibited Product Policy**. **To republish this item please make sure you
+> have the appropriate product type selected.**
+
+旧引擎只看见前半句的 `prohibited product policy` → 判 `B 禁售` → **永久拉黑**;
+而后半句是沃尔玛在告诉我们**怎么修**:把 product type 选对。新码序 1 的
+`PT_WRONG` 压过 `POLICY` 正是为这件事定的(码表 §3 判例)。
+
+### 11.7 三条读数限制(下结论前必看)
+
+1. **不是随机样本**(见 11.5),分布别外推;
+2. **`self` 那一档系统性低估 PT_WRONG**。判据串 `appropriate product type
+   selected` 长在**句尾**,而 `self` 只有 200 字符样本 —— 仓内语料实测 5 条含该串
+   的记录里 **4 条的串落在 200 字符之外**(起始位置 234 / 517 / 544 / 640),
+   截断后分别被判成 POLICY 或 EXPIRED。
+   ⇒ **真实 PT_WRONG 只会比报出来的更多,不会更少。**
+3. **判的是「该 ASIN 最新一条报错原文」,不一定是「当初拉黑它的那一条」**
+   (`DISTINCT ON … ORDER BY report_date DESC`)。这对 PT_WRONG 这类**持久属性**
+   影响不大,但会让少量瞬时码混进来 —— 首批里 EXPIRED/STAGE/SYSTEM 合计
+   约 56 条(占「站不住」不到 1%)。要按"当初那条"判,得另开一个
+   「取 `created_at` 当时或之前最近一条」的口径,**那是另一个问题的答案**
+   (「当初拉黑对不对」),不是「现在这个 ASIN 什么问题」。

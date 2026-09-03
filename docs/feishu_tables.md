@@ -143,8 +143,9 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
     **原样透传**,perf_problems 的日志按 sheet 汇总告警,校准后补进
     `services/perf_reason._BUCKETS`。
   - 词表两个来源:沃尔玛官方 Seller performance standards + **2026-09-03
-    生产报表实测**(M001 全 8 张 + 库内存量,覆盖 34 个真实桶名/原因取值,
-    回归语料见 `tests/test_perf_reason.py` 的 `PRODUCTION`)。
+    生产报表实测**(全店 35 店 929 行 + 库内存量,覆盖 37 个真实桶名/原因取值,
+    回归语料见 `tests/test_perf_reason.py` 的 `PRODUCTION`)。买家原因的
+    `Change_Mind ` 是**前缀族**不是桶名,拆开翻译,后半仍走词表与未收录告警。
 - **对账明细**(跨账期按订单行合并;逐账期原始明细在 PG orders.settlement_lines):
   order_line_id、下单时间、店铺、采购订单号、行号、入账状态(已入账/已冲销/已退款/
   待入账)、结算净额USD/商品销售额USD/实扣佣金USD(跨账期合计)、佣金率/原始佣金USD/

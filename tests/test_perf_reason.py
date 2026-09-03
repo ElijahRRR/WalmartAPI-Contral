@@ -243,8 +243,13 @@ PRODUCTION = [
     ("returns", "Arrived late", "", "到货晚"),
     ("returns", "", "Item arrived damaged", "到货破损"),
     ("returns", "", "Not as described/pictured", "与描述/图片不符"),
-    ("returns", "", "No Longer Wanted", "买家不想要了"),
+    ("returns", "", "No Longer Wanted", "不想要了"),
     ("returns", "", "Bought Somewhere Else", "已在别处买到"),
+    # 全店跑(35 店 929 行)才冒出来的三个,其中第三个是 Change_Mind 前缀族
+    ("returns", "", "Difficult to setup/not compatible", "难安装/不兼容"),
+    ("returns", "", "Lower Price", "别处更便宜"),
+    ("refunds", "", "Change_Mind Difficult to setup/not compatible",
+     "买家改主意:难安装/不兼容"),
     ("itemNotReceived", "Lost", "", "包裹丢失"),
     ("itemNotReceived", "Item Missing", "", "商品缺失"),
     ("itemNotReceived", "", "Lost After Delivery", "妥投后丢失"),
@@ -272,6 +277,24 @@ def test_every_production_bucket_is_translated():
         perf_reason.describe(metric, sheet, row, unknown_seen=seen)
     assert not bad, "生产桶名归类不符:\n" + "\n".join(bad)
     assert seen == {}, f"生产语料里还有未收录桶名:{seen}"
+
+
+def test_change_mind_is_a_prefix_family_not_a_bucket():
+    """「Change_Mind X」的前缀是结构、后半才是原因:拆开翻译,后半照样走词表。
+
+    实测已见三种后半(Lower Price / No Longer Wanted / Difficult to setup…),
+    沃尔玛再加新的后半会自动跟着出中文;后半也不认识时仍原样透传并告警。
+    """
+    assert perf_reason.classify("refunds", "", {
+        "Refund reason": "Change_Mind Lower Price"})[0] == "买家改主意:别处更便宜"
+    # 后半单独出现时也要读得通 —— 所以词表里那几条不许自带「买家」二字
+    assert perf_reason.classify("returns", "", {
+        "Return reason description": "Lower Price"})[0] == "别处更便宜"
+    # 认不出的后半:整串原文进原因 + 计一次未收录,不许静默吞掉前缀了事
+    seen: dict[str, int] = {}
+    got = perf_reason.describe("refunds", "", {"Refund reason": "Change_Mind Foo"},
+                               unknown_seen=seen)
+    assert got == "Change_Mind Foo" and seen == {"Change_Mind Foo": 1}
 
 
 def test_na_and_negative_feedback_sheet_carry_no_reason():

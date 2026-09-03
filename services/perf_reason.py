@@ -125,9 +125,12 @@ _BUCKETS: tuple[tuple[tuple[str, ...], tuple[str, ...], str], ...] = (
     ((), ("item missing", "missing item"), "商品缺失"),
     ((), ("arrived late",), "到货晚"),
     ((), ("seller issued refund",), "卖家已主动退款"),
-    ((), ("no longer wanted",), "买家不想要了"),
-    ((), ("change mind lower price",), "买家改主意:别处更便宜"),
-    ((), ("change mind no longer wanted",), "买家改主意:不想要了"),
+    # ⚠ 下面三条会被 _CHANGE_MIND 前缀族复用(「买家改主意:X」),
+    # 译文必须**独立成句也读得通、加前缀也读得通** —— 别在这里写「买家…」
+    ((), ("no longer wanted",), "不想要了"),
+    ((), ("lower price",), "别处更便宜"),
+    ((), ("difficult to setup not compatible", "difficult to setup"),
+     "难安装/不兼容"),
     ((), ("bought somewhere else",), "已在别处买到"),
     ((), ("miscellaneous",), "其他原因"),   # 见 _LOW_INFO_ZH:不给桶名当括号补语
     # 只表明"算不算卖家责任"、或只重复指标名、不含原因的桶名 —— 空 = 无信息,
@@ -136,6 +139,12 @@ _BUCKETS: tuple[tuple[tuple[str, ...], tuple[str, ...], str], ...] = (
     ((), ("not accountable", "non seller accountable"), ""),
     ((), ("negative feedback",), ""),
 )
+
+# 退款/退货报表的买家原因带 "Change_Mind " 前缀族(2026-09-03 全店实测见过
+# Change_Mind Lower Price / No Longer Wanted / Difficult to setup...):
+# **前缀是结构、后半才是原因**。拆开翻译,后半照样走词表 —— 沃尔玛以后加新的
+# 后半会自动跟着出中文;后半也不认识时仍按未收录原样透传+告警,不吞。
+_CHANGE_MIND = "change mind "
 
 # 明确表示"没填/不适用"的取值:必须**整串相等**才算(子串匹配会误伤,
 # 例如 "n a" 会撞进一堆正常英文里)。命中即当无信息,继续降级
@@ -251,6 +260,10 @@ def _bucket_zh(metric: str, raw: str) -> tuple[str, str]:
     text = _key(raw)
     if not text or text in _NO_INFO_EXACT:
         return "", ""
+    if text.startswith(_CHANGE_MIND):
+        zh, miss = _bucket_zh(metric, text[len(_CHANGE_MIND):])
+        # 后半不认识时把**整串原文**回报未收录:告警要写运营在报表里看到的那个词
+        return (f"买家改主意:{zh}" if zh else ""), (str(raw).strip() if miss else "")
     for scoped in (True, False):
         hits: list[tuple[str, str]] = []
         for metrics, aliases, zh in _BUCKETS:

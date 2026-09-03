@@ -791,3 +791,58 @@ python cli.py blacklist_route --dry-run   # 先看将删/将留,一行不动
 python cli.py blacklist_route             # 真删(自动落整行备份)
 python cli.py blacklist_push              # 删完飞书还是旧的,跑它才同步
 ```
+
+### 13.8 ⚠ 第三个坑:`force` 模式死循环(2026-09-03,已修)
+
+所有者按 §13.7 的顺序跑 `error_reclass -p force=1`,进度打到
+**「报错记录回填进度 55,740,000」** 还没停 —— 而 `audit.walmart_error_records`
+一共只有 **97,002 行**。所有者一眼看出不对:「这是假的吧」。**是假的。**
+
+#### 机制
+
+候选谓词被当成了**分页手段**:
+
+```sql
+WHERE (true OR taxonomy_version IS DISTINCT FROM %(ver)s)   -- force 把它短路了
+  AND coalesce(raw_reason, '') <> ''
+ORDER BY id
+LIMIT %(chunk)s
+```
+
+`force=true` 短路掉唯一的排除条件 ⇒ `UPDATE` 盖了版本号也**排不出候选集**
+⇒ 每轮 `SELECT` 返回的都是**同一批**头 10,000 行 ⇒ 循环永不终止。
+`done` 只是「轮数 × 10,000」:55,740,000 ÷ 10,000 = **同一批行被判了 5,574 遍**。
+
+**比数字难看的是后果**:摘要与进度一直在报"在干活",而
+
+- 第 10,000 行之后的 **87,002 行报错记录一条都没碰**;
+- `_blacklist_pass` 排在 `_records_pass` 之后,**压根没轮到它** ⇒
+  73,918 行黑名单一条都没回填,`taxonomy_term` 仍是 NULL;
+- 若不是所有者 Ctrl-C,`blacklist_route` 会拿这批缺失信息**静默走错**。
+
+两张表的两个循环同款,`_blacklist_pass` 只是没机会暴露。
+
+#### 根因是把两件事当成了一件
+
+| 判据 | 干什么 | `force` 时 |
+|---|---|---|
+| `taxonomy_version IS DISTINCT FROM ver` | **断点续跑**(跑一半中断不重复劳动) | **有意关掉** |
+| 键集游标 `key > after` | **翻页** | **任何模式下都必须在** |
+
+模块文档里原来写的是「候选谓词……**天然分页**」—— 那句话正是这次的误解来源,
+已一并改掉。
+
+#### 修法
+
+两条 PICK 各加一句键集游标(`id::bigint` / `asin::text`,都是主键且已
+`ORDER BY`),两个 `while` 循环收敛成同一个 `_pages()` 生成器
+(双轨禁止:翻页只留一份)。守门测试三条:
+
+- `test_pages_每行只发一次且会终止` —— 并断言游标序列 `[None, 100, 200, 250]`
+  真的在推进(只断言"终止"不够:一个永远返回空的实现也能通过);
+- `test_pages_空跑只取一批_limit真截断`;
+- `test_两条PICK的SQL里都有键集游标` —— 光有 `_pages` 不够,SQL 少那一句
+  游标推进也没用;并禁止两个 pass 再自己写 `while`。
+
+⚠ **重跑前先看一眼**:上一轮 `force` 跑中断在第一批,所以 §13.7 那五步要
+**从 `error_reclass -p force=1` 重新来过**(它是幂等的,重跑不会重复劳动)。

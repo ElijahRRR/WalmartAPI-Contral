@@ -123,3 +123,15 @@ def test_plan_lines分将删与将留():
     assert kept == {"POLICY": 100, "OTHER": 5, "(判不出)": 50}
     text = "\n".join(out)
     assert "**将删** 701 条" in text and "**留下** 155 条" in text
+
+
+def test_缺列时给人话不甩traceback():
+    """⚠ 2026-09-03 实遇:`taxonomy_term` 没建就跑,人看到的是一屏
+    `psycopg.UndefinedColumn`。缺的是**前置步骤**,说清做什么比说清哪一行
+    炸了有用得多 —— 而且必须点出 `-p force=1`(版本号已盖章时 error_reclass
+    会判 0 条,不加 force 回填不了新列)。"""
+    src = inspect.getsource(wf.run)
+    assert "does not exist" in src            # 只认缺列这一类,别的异常照抛
+    assert "db_init" in src
+    assert "error_reclass -p force=1" in src
+    assert "conn.rollback()" in src           # PG 报错后不回滚会连累后续每一查

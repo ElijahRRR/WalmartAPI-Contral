@@ -377,6 +377,15 @@ def run(params: dict) -> str:
         if scope in ("all", "blacklist"):
             body += [""] + _blacklist_pass(conn, ver, chunk, force, limit,
                                            execute, policy_names)
+    # ⚠ 判了 0 条**必须说清为什么**(2026-09-03 实遇):版本号已盖章时增量谓词
+    #   把全部行排除,摘要只剩一行"判了 0 条",看着像"没数据",实际是"已经判过"。
+    #   而这时若刚加了新列(如 taxonomy_term),那一列会**全是 NULL** 而没有
+    #   任何提示 —— 下游按它做判断就会静默走错。
+    if not force and "判了 0 条" in "\n".join(body):
+        body += ["", f"⚠ **判了 0 条 = 已经按当前码表({ver})判过了**,不是没数据:"
+                 f"候选谓词把盖过章的行排除了(那正是它的作用,天然分页)。",
+                 "   要重判(比如**刚加了新列**、或改了判据但没提码表版本):"
+                 "`python cli.py error_reclass -p force=1`"]
     if not execute:
         body += ["", "🧪 --dry-run:**一行都没写**;且空跑不盖版本号 ⇒ "
                  "候选集恒定,上面报的就是真跑第一批会判成什么",

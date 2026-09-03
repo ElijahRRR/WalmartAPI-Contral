@@ -164,10 +164,25 @@ def run(params: dict) -> str:
             "terms": sorted(error_taxonomy.PERMANENT_UNLISTED_TERMS)}
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(_SQL_STALE, {"ver": ver})
-            stale = cur.fetchone()[0]
-            cur.execute(_SQL_PLAN, {"ver": ver})
-            plan = cur.fetchall()
+            try:
+                cur.execute(_SQL_STALE, {"ver": ver})
+                stale = cur.fetchone()[0]
+                cur.execute(_SQL_PLAN, {"ver": ver})
+                plan = cur.fetchall()
+            except Exception as e:                          # noqa: BLE001
+                # ⚠ 缺列不该甩一屏 traceback(2026-09-03 实遇:`taxonomy_term`
+                #   没建就跑,人看到的是 psycopg.UndefinedColumn)。缺的是
+                #   **前置步骤**,说清做什么比说清哪一行炸了有用得多。
+                conn.rollback()
+                if "does not exist" not in str(e):
+                    raise
+                raise RuntimeError(
+                    f"读不到 `catalog.asin_blacklist` 的新码列({e})。"
+                    "前置两步没做完 —— 依次跑:\n"
+                    "  python cli.py db_init                    # 建 taxonomy_* 四列\n"
+                    "  python cli.py error_reclass -p force=1   # 回填(force 是"
+                    "必须的:版本号已盖章时增量谓词会把全部行排除,判 0 条)\n"
+                    "然后再回来跑 blacklist_route。") from None
         out, doomed, _kept = plan_lines(plan, ver, stale)
         if not execute:
             return "\n".join(out + [

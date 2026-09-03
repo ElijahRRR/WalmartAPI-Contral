@@ -139,3 +139,19 @@ def test_只写taxonomy列_不碰category也不删行():
         assert forbidden not in src, forbidden
     # 两条 UPDATE 都必须盖版本号(不盖 = 下次重跑又是全量,永远跑不完)
     assert src.count("taxonomy_version = %(ver)s") == 2
+
+
+def test_判了0条要说清是已经判过而不是没数据():
+    """⚠ 2026-09-03 实遇:版本号已盖章时增量谓词把全部行排除,摘要只剩
+    "判了 0 条",看着像没数据、实际是已经判过。
+
+    而这时若**刚加了新列**(如 taxonomy_term),那一列会全是 NULL 而没有任何
+    提示 —— 下游(blacklist_route)按它做判断就会静默走错。所以必须点名
+    `-p force=1`。
+    """
+    import inspect
+    src = inspect.getsource(wf.run)
+    assert "判了 0 条 = 已经按当前码表" in src
+    assert "刚加了新列" in src
+    assert "error_reclass -p force=1" in src
+    assert "not force" in src                 # 给了 force 还判 0 条就是真没数据

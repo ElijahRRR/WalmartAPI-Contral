@@ -880,5 +880,7 @@ def test_claim_from_sheet_says_unlimited_when_no_limit_given(monkeypatch):
         ("approved", 3), ("rejected", 1), ("pending", 2), ("未审", 4)]))
     head = pa._claim_from_sheet(None)[2]
     body = "\n".join(head)
-    assert "不限量" in body and "6 个待审全判" in body     # pending 2 + 未审 4
+    assert "不限量" in body and "这 6 个待审**全判**" in body   # pending 2 + 未审 4
+    # 账要说全:补采救回来的那些也在这一轮判(_close_gap 跑在判定之前)
+    assert "补采救回来的还会加进来" in body
     assert "只判" not in body

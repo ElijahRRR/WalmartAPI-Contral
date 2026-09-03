@@ -2198,8 +2198,40 @@ def test_stale_active_days_rejects_junk_and_wrong_mode():
 
 def test_stale_summary_first_line_names_the_sales_window():
     """摘要**首行**必须点名圈的是哪一批:带不带 `active_days` 差的是一个
-    数量级的候选量与账单,而摘要其余部分长得一模一样。"""
-    import inspect
-    src = inspect.getsource(product_audit.run)
-    assert "天有动销" in src and "不限动销" in src
-    assert "days_ = _active_days(params)" in src
+    数量级的候选量与账单,而摘要其余部分长得一模一样。
+
+    (2026-09-03:措辞从 run() 的内联分支搬进 `_candidate_what` —— 缺省不限量
+    之后每条通道都要报总量,内联那三条不够用了。断言跟着搬,口径不变。)
+    """
+    what, hint = product_audit._candidate_what({"mode": "stale"})
+    assert "近 90 天有动销" in what                       # active_days 缺省 90
+    assert resources.AUDIT_RULES_VERSION in what
+    assert "没有动销" in hint
+    free, _ = product_audit._candidate_what({"mode": "stale",
+                                             "active_days": 0})
+    assert "不限动销" in free
+
+
+def test_candidate_what_covers_every_pick_where_branch():
+    """⚠ 每条通道都得有自己的一句话:漏一条 = 那条通道的摘要把这批说成
+    另一批(2026-09-03 之前就是这样,只有 rerule/nonpass/stale 三条有)。"""
+    cases = {
+        "asins": ({"asins": "B0A,B0B"}, "点名重审 asins=2 个"),
+        "force_rerun": ({"force_rerun": "c.x"}, "按版本重审"),
+        "repts": ({"repts": "1"}, "飞书类目表"),
+        "rerule": ({"rerule": "phase0_patent_claim"}, "定点重审"),
+        "backfill": ({"mode": "backfill"}, "补刷"),
+        "pending": ({"mode": "pending"}, "待定专刷"),
+        "nonpass": ({"mode": "nonpass"}, "非 pass 全量重判"),
+        "stale": ({"mode": "stale"}, "版本重审"),
+        "pass": ({"mode": "pass"}, "现役 pass 全量重过 L0"),
+        "online": ({"mode": "online"}, "**在架** pass"),
+        "缺省": ({}, "缺省口径"),
+    }
+    for name, (params, want) in cases.items():
+        what, hint = product_audit._candidate_what(params)
+        assert want in what, f"{name}: {what!r}"
+        assert hint, f"{name}: 空集提示不能为空"
+    # 无天然分页的两条要当场劝退 limit(给了就每轮重扫同一批前缀)
+    for mode in ("pass", "online"):
+        assert "别给 limit" in product_audit._candidate_what({"mode": mode})[0]

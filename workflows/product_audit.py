@@ -491,6 +491,63 @@ WHERE p.marketplace = %(marketplace)s AND ({where})
 """
 
 
+def _candidate_what(params: dict) -> tuple[str, str]:
+    """输入:params → 输出:(这批候选是什么, 一个都没有时的提示)。
+
+    只管**措辞**,不管取数 —— 分支与 `_pick_where` 一一对应(那边改了这边要跟着
+    改;对不上的后果是摘要把这批说成另一批,不报错)。
+    2026-09-03 从 run() 里三条分支的内联字面量抽出来:缺省不限量之后每条通道
+    都要报总量,内联写法只覆盖了三条。
+    """
+    rule = str(params.get("rerule", "")).strip()
+    mode = str(params.get("mode", "")).strip()
+    asins = [a for a in str(params.get("asins", "")).split(",") if a.strip()]
+    fr = str(params.get("force_rerun", "")).strip()
+    if asins:
+        return (f"点名重审 asins={len(asins)} 个(无视现有结论)",
+                "点名的 ASIN 一个都不在库(或都没有标题)")
+    if fr:
+        return (f"按版本重审:audit_version 不等于 {fr} 的全部"
+                f"(含已 approved/rejected 的存量)",
+                f"一个都没有:这批已经全部盖着 {fr}")
+    if str(params.get("repts", "")).strip() == "1":
+        return ("按飞书类目表判据变更重审:该 PT 的判据在我判过之后变过的 rejected",
+                "一个都没有:类目表没改过,或改的那些 PT 下没有判拒的行")
+    if rule:
+        return (f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 "
+                f"rejected**、且未按当前规则版本判过的",
+                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了")
+    if mode == "backfill":
+        return ("补刷:只审**还没有结论**的(有历史结论的直接采用)",
+                "一个都没有:库里每一行都有结论了")
+    if mode == "pending":
+        return ("待定专刷:重判 pending(**无 1 天退避**)",
+                "一个都没有:没有 pending 存量")
+    if mode == "nonpass":
+        return ("非 pass 全量重判:rejected + pending + 未审过、"
+                "且未按当前规则版本判过的",
+                "一个都没有:这批已经全部按当前版本判过了")
+    if mode == "stale":
+        # 首行必须点名动销口径(2026-09-02 B2):同一条命令带不带 `active_days`
+        # 差的是一个数量级的候选量与账单,而摘要其余部分长得一模一样
+        days = _active_days(params)
+        scope = (f"、**近 {days} 天有动销**" if days
+                 else "、**不限动销**(active_days=0,全量 approved)")
+        return (f"版本重审:approved 且未按当前规则版本"
+                f"({resources.AUDIT_RULES_VERSION})判过的{scope}"
+                f"(rejected 沿用不重审)",
+                "一个都没有:这批已全部按当前版本判过"
+                + (f",或近 {days} 天没有动销" if days else ""))
+    if mode == "pass":
+        return ("现役 pass 全量重过 L0(黑名单翻案;**无天然分页**,别给 limit)",
+                "一个都没有:库里没有 approved 的行")
+    if mode == "online":
+        return ("**在架** pass 重过 L0(**无天然分页**,别给 limit)",
+                "一个都没有:没有在架且 approved 的行")
+    return ("缺省口径:未审 + pending 过 1 天退避 + approved 但判据版本过期的",
+            "一个都没有:全库都按当前版本判过了")
+
+
 def _batch_head(conn, what: str, where: str, extra: dict,
                 limit: int | None, empty_hint: str) -> list[str]:
     """输入:连接 + 这批是什么 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
@@ -505,6 +562,11 @@ def _batch_head(conn, what: str, where: str, extra: dict,
         cur.execute(_RERULE_COUNT_SQL.format(where=where),
                     {"marketplace": "US", **extra})
         total = int(cur.fetchone()[0])
+    # ⚠ 这一句必须在**开始花钱之前**落进日志:摘要是 run() 末尾才拼的,
+    # 不限量口径下(2026-09-03)它只能当事后账单。日志里这一行才是"来得及
+    # Ctrl-C"的那个信号
+    logger.warning("候选总量:%s,共 %d 个(本轮 %s)", what, total,
+                   "不限量" if limit is None else f"limit={limit}")
     head = [f"{what},共 {total} 个"]
     if limit is None and total:
         # 不限量是缺省口径(2026-09-03),但**这一轮要花多少钱**得说出来:
@@ -571,9 +633,11 @@ def _forced_sheet(params: dict) -> bool:
     `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道
     能重判受影响的存量。这个开关是那种时候的出口。
 
-    ⚠ **贵**:打开之后 E 列为空的每一行都进判定引擎(含库里早有结论的),
-    而 `from_sheet` 又会把 limit 顶到 ASIN 总数、不截断。摘要里必须把
-    "本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    ⚠ **贵**:打开之后 E 列为空的每一行都进判定引擎(含库里早有结论的)。
+    摘要里必须把"本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    ⚠ 量由 `limit` 说了算:**缺省不限量**(2026-09-03 定稿),给了 `-p limit=N`
+    就真截断 —— 此前这里写的是"from_sheet 会把 limit 顶到 ASIN 总数、不截断",
+    那正是被修掉的 bug(摘要说只判 N 个、实际全判),别照着它把那行改回去。
     """
     return str(params.get("force", "")).strip() == "1"
 
@@ -817,8 +881,10 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
             f"E 列已有结论的表行一行都不会被捞回来")
     elif limit is None:
         if todo:
-            head.append(f"  本轮**不限量**(未给 -p limit):这 {todo} 个待审全判"
-                        f" —— 要分批就加 -p limit=N")
+            # 与下面 `todo > limit` 那支同款:日志里这一行才是花钱前看得见的
+            logger.warning("上架表待审 %d 个 ASIN,本轮**不限量**", todo)
+            head.append(f"  本轮**不限量**(未给 -p limit):这 {todo} 个待审"
+                        f"**全判**(补采救回来的还会加进来)—— 要分批加 -p limit=N")
     elif todo > limit:
         logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
@@ -1333,7 +1399,12 @@ def _parse_opts(params: dict) -> Opts:
     raw_limit = str(params.get("limit", "")).strip()
     limit = None
     if raw_limit:
-        limit = int(raw_limit)
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            # 裸 int() 的 "invalid literal for int()" 不提 limit 也不给出路
+            raise ValueError(f"limit 要正整数,给的是 {raw_limit!r};"
+                             f"**不给就是不限量**") from None
         if limit <= 0:
             # 宁炸不吞:limit=0 当"不限量"讲会让人以为限住了,恰好反着
             raise ValueError("limit 必须是正整数;**不给就是不限量**"
@@ -1606,35 +1677,16 @@ def run(params: dict) -> str:
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
             else _RECENT_RUN_GUARD
-        rule_ = str(params.get("rerule", "")).strip()
-        mode_ = str(params.get("mode", "")).strip()
-        if rule_:
-            sheet_head = _batch_head(
-                conn, f"定点重审 rerule={rule_}:命中过该规则且**现结论仍是 "
-                      f"rejected**、且未按当前规则版本判过的",
-                where, extra, limit,
-                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了") \
-                + sheet_head
-        elif mode_ == "nonpass":
-            sheet_head = _batch_head(
-                conn, "非 pass 全量重判:rejected + pending + 未审过、"
-                      "且未按当前规则版本判过的",
-                where, extra, limit,
-                "一个都没有:这批已经全部按当前版本判过了") + sheet_head
-        elif mode_ == "stale":
-            # 首行必须点名动销口径(2026-09-02 B2):同一条命令带不带
-            # `active_days` 差的是一个数量级的候选量与账单,而摘要其余部分
-            # 长得一模一样 —— 看不出这轮圈的是哪一批
-            days_ = _active_days(params)
-            scope_ = (f"、**近 {days_} 天有动销**" if days_
-                      else "、**不限动销**(active_days=0,全量 approved)")
-            sheet_head = _batch_head(
-                conn, f"版本重审:approved 且未按当前规则版本"
-                      f"({resources.AUDIT_RULES_VERSION})判过的{scope_}"
-                      f"(rejected 沿用不重审)",
-                where, extra, limit,
-                "一个都没有:这批已全部按当前版本判过"
-                + (f",或近 {days_} 天没有动销" if days_ else "")) + sheet_head
+        if not params.get("from_sheet"):
+            # ⚠ **每条通道都报**(2026-09-03 补):此前只有 rerule/nonpass/stale
+            # 三条报总量,而缺省不限量之后,恰恰是不报的那几条(缺省口径、
+            # backfill、pending、force_rerun、repts)一轮就能把整个积压判完 ——
+            # 「共 N 个」是花钱前唯一能看见的规模。from_sheet 不走这里:
+            # `_claim_from_sheet` 自己按上架表口径报过了(再报一次是同一件事
+            # 说两遍,而且两个数还不一样)。
+            what_, hint_ = _candidate_what(params)
+            sheet_head = _batch_head(conn, what_, where, extra, limit,
+                                     hint_) + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
         cand_sql = _candidate_sql(where, guard, limit)
@@ -1657,13 +1709,17 @@ def run(params: dict) -> str:
                     known=adopt_known)
                 adopted_n += n
                 cat_unresolved += bad_cat
-            return (f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
+            # ⚠ 前言得带上:否则「点名 600 个但 limit=100」那句提示在这条路上
+            # 被整个吞掉 —— 正是评审 I-6 抱怨的形状("传 600 只审 500 且无提示"),
+            # 只是搬到了零 LLM 这一侧
+            return "\n".join(sheet_head + [
+                    f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
                     f"采用 {adopted_n}"
                     + ("" if execute else "(dry-run:未写库)")
                     + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定"
                     + (f";⚠ 历史结论类别不可解析 {cat_unresolved}"
                        f"(老值是旧语义/旧拼写,类别列留空,具体内容照旧写)"
-                       if cat_unresolved else ""))
+                       if cat_unresolved else "")])
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
         no_title = seller_missing = 0

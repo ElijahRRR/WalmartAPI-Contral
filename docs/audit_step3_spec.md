@@ -500,7 +500,7 @@ python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 9
   现在口径只有一条:**不给就不限量,给了就真截断**。切换那几晚要控成本就显式给
   `-p limit=N`,拿不准规模先 `--dry-run`(摘要报「共 N 个」)。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。
-- `error_reclass_report` 不受影响;`audit_sheet` 的 `limit=500` 在切换周可临时调低控成本。
+- `error_reclass_report` 不受影响;`audit_sheet` **缺省不限量**(2026-09-03),切换周要控成本就在调度表给它显式加 `-p limit=N`。
 
 ## 六、所有者裁决(2026-09-02 定稿,八项全部落定)
 

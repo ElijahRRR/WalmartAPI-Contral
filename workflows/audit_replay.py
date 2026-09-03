@@ -101,6 +101,11 @@ _NEG_CODES = ("POLICY", "IP", "CONTENT", "BRAND", "PROHIBITED_FINAL")
 # ── 成本预估口径(规格 §3.9;真跑用 llm_cost.summarize 实算)────────────────
 # 前缀 token 由**实际渲染出来的 system prompt** 折算,不写死:政策表一改
 # 前缀就变长,写死的数字会悄悄失真(B1 实测 212,556 字符 ≈ 6.1 万 token)。
+#: 「记忆」而非「判据」的类别:L0 黑名单三表(卖家 / ASIN / 类目)自报的那个。
+#: 反例取自沃尔玛拒过的品,而拒了就拉黑是既有流程 ⇒ 反例大量早就躺在黑名单里,
+#: L0 认出 ASIN 就硬拒、判据一步不走。混在召回/类别分母里 = 指标虚高且看不出原因。
+_MEMORY_CATEGORY = resources.AUDIT_CAT_INTERNAL_BLACKLIST
+
 _CHARS_PER_TOKEN = 3.5
 _USER_TOKENS = 2500     # user 段:规格 §3.9 的 1.5–3K,取中位
 _OUT_TOKENS = 1200      # 输出:规格 §3.9 的 ≤1.5K
@@ -770,12 +775,27 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
                     f"(同样不进本集;这一档是**政策表缺口**的信号,"
                     f"清单见 error_reclass_report)")
 
-    # ① 反例召回
+    # ① 反例召回 —— **必须拆成"记得拉黑过"与"判据判出来"两笔**
+    # ⚠ 2026-09-03 首测暴露的读数陷阱:反例取自沃尔玛拒过的品,而**我们拒过的
+    #   品多半当场就进了 catalog 黑名单三表**(拒了就拉黑是既有流程)。于是
+    #   L0 一眼认出 ASIN 就硬拒,类别自报 `内部黑名单`,判据一步都没走 ——
+    #   总召回因此天然虚高,而"政策判得对不对"这个问题一个字都没回答。
+    #   首测实测:总召回 78/114=68.4% 看着不错,拆开看**判据召回 0/36**。
     rec = [r for r in neg if r["got_verdict"] == "reject"]
+    memo = [r for r in rec if r["got_category"] == _MEMORY_CATEGORY]
+    judged_neg = [r for r in neg if r["got_category"] != _MEMORY_CATEGORY]
+    judged_rec = [r for r in judged_neg if r["got_verdict"] == "reject"]
     body += ["", f"▍反例召回(沃尔玛拒了,我们也拒):{_pct(len(rec), len(neg))}",
              f"    其中 pass {sum(1 for r in neg if r['got_verdict'] == 'pass')}"
              f" / pending {sum(1 for r in neg if r['got_verdict'] == 'pending')}"
              f" / 判定失败 {sum(1 for r in neg if r['error'])}"]
+    if memo:
+        body += [f"  ⚠ **拆开看**:其中 {len(memo)} 条是 `{_MEMORY_CATEGORY}` 拦下的"
+                 f" —— 那是「我们记得拉黑过这个 ASIN/卖家/类目」,**不是判据判出来的**"
+                 f"(拒了就拉黑是既有流程,反例天然大量落在黑名单里);",
+                 f"    **判据召回**(扣掉黑名单命中的 {len(judged_neg)} 条反例里判拒):"
+                 f"{_pct(len(judged_rec), len(judged_neg))}"
+                 f" ← **要看判据行不行,只能看这个数**"]
 
     # ② 类别准确率 + 混淆表
     # ⚠ 两个分母都要给:只报端到端(分母 = 全部带类别反例)会把"没判拒"的
@@ -789,6 +809,16 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
                  f"判拒的带类别反例里 {_pct(len(hit), len(rej_lab))};"
                  f"端到端(判拒且类别对 ÷ 全部带类别反例 {len(labelled)} 条)"
                  f"{_pct(len(hit), len(labelled))}"]
+    # ⚠ 同上:`内部黑名单` 是记忆不是类别判定,混在分母里会让这个数恒等于 0
+    #   而看不出原因(首测 67 条判拒里 64 条是黑名单命中)
+    rej_judged = [r for r in rej_lab if r["got_category"] != _MEMORY_CATEGORY]
+    if len(rej_judged) != len(rej_lab):
+        hit_j = [r for r in rej_judged
+                 if category_ok(r["expected_category"], r["got_category"])]
+        body += [f"  ⚠ 其中 {len(rej_lab) - len(rej_judged)} 条得到的是 "
+                 f"`{_MEMORY_CATEGORY}`(L0 记忆,没走到政策判定);"
+                 f"**真正由判据给出类别的** {len(rej_judged)} 条里 "
+                 f"{_pct(len(hit_j), len(rej_judged))}"]
     if rej_lab:
         body += _confusion(rej_lab, limit)
 

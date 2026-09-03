@@ -532,6 +532,42 @@ def test_report_metrics_add_up():
     assert "预估成本 ≈ $0.12" in text
 
 
+def test_report_把内部黑名单命中与判据召回分开报():
+    """⚠ 2026-09-03 首测暴露的读数陷阱,这条钉住它别被"简化"掉。
+
+    反例取自沃尔玛拒过的品,而**拒了就拉黑是既有流程** ⇒ 反例大量早就躺在
+    `catalog` 黑名单三表里,L0 认出 ASIN 当场硬拒、类别自报 `内部黑名单`,
+    判据一步都没走。总召回因此天然虚高(首测 78/114=68.4% 看着不错),
+    而"政策判得对不对"一个字都没回答(拆开看**判据召回 0/36**)。
+
+    所以召回和类别准确率都必须给第二个数:扣掉黑名单命中之后的那个。
+    """
+    memo = resources.AUDIT_CAT_INTERNAL_BLACKLIST
+    rows = [
+        # 三条反例被黑名单拦下(记忆,不是判据)
+        _row(asin="B01", got_category=memo, stage_stopped_at="L0"),
+        _row(asin="B02", got_category=memo, stage_stopped_at="L0"),
+        _row(asin="B03", got_category=memo, stage_stopped_at="L0"),
+        # 一条真的走到判据并判拒且类别对
+        _row(asin="B04"),
+        # 一条走到判据却放行(判据的窟窿)
+        _row(asin="B05", got_verdict="pass", got_category=None),
+    ]
+    text = "\n".join(ar.report(rows, _META)[0])
+    assert "▍反例召回(沃尔玛拒了,我们也拒):4/5" in text     # 总召回:含黑名单
+    assert "**判据召回**" in text
+    assert "1/2" in text                                       # 扣掉黑名单后
+    assert "要看判据行不行,只能看这个数" in text
+    # 类别准确率也要给扣掉之后的第二个数
+    assert "真正由判据给出类别的" in text
+    # 一条黑名单命中都没有时不硬凑这两行(别给读的人加噪声)
+    clean = "\n".join(ar.report([_row(asin="B04"), _row(asin="B05",
+                                 got_verdict="pass", got_category=None)],
+                                _META)[0])
+    assert "**判据召回**" not in clean
+    assert "真正由判据给出类别的" not in clean
+
+
 def test_report_flags_when_the_new_chain_hurts_more_than_the_old_one():
     """所有者定稿 §六.5 的底线:**正例误伤率不高于旧链**。
     不达标必须在报告里说"先修判据再回放,别开 mode=stale"。"""

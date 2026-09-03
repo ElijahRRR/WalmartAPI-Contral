@@ -227,6 +227,29 @@ def _feed_section(rows: list[tuple], policy_names, limit: int,
     return out
 
 
+def _alias_notes(policy_names) -> list[str]:
+    """输入:政策表 category_en 集合 → 输出:别名表健康行(0-2 行)。
+
+    `error_taxonomy.alias_gaps` 的两种读法(其文档已写)在这里分开说:旧名指不到表、
+    但它的官方名已在表里 = 改名落地、别名功成身退,平述不打 ⚠;官方名也不在 = 真失效。
+    2026-09-02 真跑改名后的首份报告把 9 条退役别名印成「静默失效」告警,误导。
+    """
+    gaps = error_taxonomy.alias_gaps(policy_names)
+    retired = [t for t in gaps
+               if error_taxonomy.policy_join(resources.POLICY_LEGACY_NAMES.get(t),
+                                             policy_names)]
+    broken = [t for t in gaps if t not in retired]
+    out = []
+    if retired:
+        out.append(f"别名表 {len(retired)} 条旧名已退役(官方名已在政策表里,直接键命中;"
+                   f"随第三步 L3 批与 registry.resources.POLICY_LEGACY_NAMES 一起删):"
+                   + ", ".join(retired))
+    if broken:
+        out.append(f"⚠ 别名表有 {len(broken)} 个目标值不在政策表里,官方名也不在"
+                   f"(那几条别名等于静默失效,核对政策表命名):" + ", ".join(broken))
+    return out
+
+
 def _load_policy_names(conn) -> list[str]:
     """输入:连接 → 输出:政策表 category_en 列表(读不到给空列表,不阻断)。"""
     with conn.cursor() as cur:
@@ -251,10 +274,7 @@ def run(params: dict) -> str:
             f"旧引擎 = problem_products.categorize 的 A-L 码)",
             f"政策表 audit.walmart_prohibited_policy:{len(policy_names)} 条 "
             f"category_en"]
-    gaps = error_taxonomy.alias_gaps(policy_names)
-    if gaps:
-        head.append(f"⚠ 别名表有 {len(gaps)} 个目标值不在政策表里(那几条别名等于"
-                    f"静默失效,核对政策表命名):{', '.join(gaps)}")
+    head += _alias_notes(policy_names)
     if not policy_names:
         head.append("⚠ 政策表读不到 —— 本轮政策名一律算「缺口」,别据此下结论")
 

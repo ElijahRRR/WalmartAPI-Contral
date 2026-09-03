@@ -153,7 +153,7 @@ def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
     by_row = dict(writes)
     assert set(by_row) == {2, 3, 5}                 # 4 行留空,一格没动
     assert by_row[2] == ["沃标题", "Cups", "pass", "", "2026-08-16"]
-    # F 列要说人话,而不是只甩一个 37 政策类目名(政策留在方括号里)
+    # F 列要说人话,而不是只甩一个政策类目名(政策留在方括号里)
     assert by_row[3][2] == "reject"
     assert by_row[3][3] == "品牌黑名单(命中:Nike) [政策:General-Use Products]"
     assert by_row[5] == by_row[2]

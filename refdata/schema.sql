@@ -842,6 +842,28 @@ ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS asin text;
 CREATE INDEX IF NOT EXISTS order_lines_asin_idx ON orders.order_lines (asin)
     WHERE asin IS NOT NULL;
 
+-- 下单时间定稿状态(2026-09-02 事故后,所有者定稿"下单时间不应该被修改"):
+-- 沃尔玛 GET /v3/orders 的 orderDate **单次读取不可信**(偶发给出别的订单的
+-- 时间、甚至未来日期;本仓从解析到 upsert 全程按名取值,不存在串位通道),
+-- 拉取这一步改为"观测→定稿"两段:首见只写候选,**连续两轮一致才定稿**,定稿后
+-- 锁死不再改。语义唯一出处 services/order_lines._ORDER_DATE_GUARD / _ORDER_DATE_STATE_SQL。
+--   order_date_seen       最近一轮拉取观测到的 orderDate(定稿判据的对照值)
+--   order_date_confirmed  连续两轮观测一致后置 true;此后 order_date 写一次不再动
+--   order_meta            首见时的订单级信封摘要(orderDate 原值 / customerOrderId /
+--                         预计发货送达 / 各行状态时间),事故取证用;只在插入时写
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_seen timestamptz;
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_confirmed boolean NOT NULL DEFAULT false;
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_meta jsonb;
+--   order_date_streak     已定稿后,连续多少轮观测到**同一个**与定稿值不同的值
+--                         (探针 3 实证:沃尔玛每轮约 2% 的订单回错,错值不粘、下轮就变;
+--                         若同一异值连续三轮不变,几乎可断定是定稿值错了)。到 3 即在
+--                         order_sync 摘要首行报「疑错」并给出修复命令;定稿值本身不动
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_streak smallint NOT NULL DEFAULT 0;
+--   order_date_source     定稿依据:'detail' = 详情接口 GET /v3/orders/{po} 给的
+--                         (探针 4 实证可信,定稿即锁死);'list' = 只靠列表连续两轮
+--                         一致定稿(详情当时不可用),之后详情给出不同值可改判为详情值
+ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_source text;
+
 -- 订单双算体检的**唯一判据**(2026-09-02,SKU 改造批次 3 地基)。
 -- orders.order_lines 的主键是 order_line_id = sha256(PO + SKU),唯一约束是
 -- (po_id, sku):改码之后,若沃尔玛对**改码之前的 PO** 返回新码,那一行会被当成
@@ -1815,8 +1837,14 @@ CREATE TABLE IF NOT EXISTS audit.walmart_pt_spec (
     synced_at            timestamptz DEFAULT now()
 );
 
--- 沃尔玛禁售政策(43 类;L3 理由映射与 policy 提示行来源)
+-- 沃尔玛禁售政策(L3 理由映射与 policy 提示行来源;官方实解 42 类)
 -- ⚠ 反推表:列类型待 audit_import dry-run 与生产实表对照
+-- ⚠ 一表两区,维护方不同(定稿 docs/policy_sync.md §二,列注见 docs/db_schema.md):
+--    ① 机器区 category_en / full_policy / official_url / policy_updated_at /
+--      synced_at / raw —— workflows/policy_sync 从 refdata/policy_pages/en 同步;
+--    ② 人工区 category_zh / overall_status / preapproval / zh_seller_risk /
+--      prohibited_items / conditional_items / preapproval_items / legal_refs /
+--      zh_seller_notes —— 运营维护,policy_sync 一律不读不写。
 CREATE TABLE IF NOT EXISTS audit.walmart_prohibited_policy (
     id                integer PRIMARY KEY,
     category_en       text,

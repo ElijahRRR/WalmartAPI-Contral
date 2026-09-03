@@ -10,8 +10,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from registry import paths, resources
 from services import audit_l2, audit_reason
 from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
+
+# 政策表 category_en 的两种形态:改名前(存量缩写名)/ 改名后(官方 42 名)。
+# `_normalize_l3_cat` 的合同是"表里叫什么就回什么",两种形态都要成立。
+_LEGACY_TABLE = tuple(resources.POLICY_LEGACY_NAMES)
+_OFFICIAL_TABLE = tuple(
+    f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
+    for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
 
 
 def _ctx(pt_meta=None, ac=None):
@@ -443,10 +451,141 @@ def test_b7_normalize_l3_cat():
     assert audit_reason._normalize_l3_cat("some new policy") == "Some New Policy"
 
 
+def test_b7_normalize_l3_cat_follows_the_table_not_a_frozen_map():
+    """⚠ 2026-09-02(§十.7):政策名归一化**随表**,不再写死一份缩写映射。
+
+    写死的后果不报错:政策表改名成官方拼写后,L3 答出的官方名会被旧映射改写回
+    一个**表里已经不存在**的缩写名 —— `audit_reason` / 政策表 / L3 的
+    reason_category 白名单三处从此对不上,而三处都不会红。
+    """
+    n = audit_reason._normalize_l3_cat
+    # 改名前:表里是缩写名,就回缩写名
+    assert n("drugs & paraphernalia", _LEGACY_TABLE) == "Drugs & Paraphernalia"
+    assert n("electronics & rf", _LEGACY_TABLE) == "Electronics & RF"
+    # 改名后:表里是官方名,就回官方名(同一个函数、同一份代码)
+    assert n("drugs and drug paraphernalia", _OFFICIAL_TABLE) == \
+        "Drugs and Drug Paraphernalia"
+    assert n("knives and OTHER melee weapons", _OFFICIAL_TABLE) == \
+        "Knives and Other Melee Weapons"
+    # 大小写无关(L3 是 LLM,大小写靠不住)
+    assert n("FOOD PRODUCTS", _OFFICIAL_TABLE) == "Food Products"
+    assert n("  Food Products  ", _OFFICIAL_TABLE) == "Food Products"
+
+
+def test_b7_normalize_l3_cat_keeps_the_non_policy_pseudo_categories():
+    """伪类目不是政策表里的行(brand_misuse 是 L3 提示词维度 4 的固定标签,
+    content standards 一族是旧标签兼容)—— 表怎么改名都影响不到,只能写死。"""
+    n = audit_reason._normalize_l3_cat
+    for cat in ("brand_misuse", "brand misuse"):
+        assert n(cat, _OFFICIAL_TABLE) == "Intellectual Property"
+    for cat in ("content standards", "content_standards", "promotional content",
+                "promotional", "content policy"):
+        assert n(cat, _OFFICIAL_TABLE) == "Content Standards"
+    # 政策名条目**全部**已删:表没传进来时不许再凭一张旧表把缩写名变出来
+    assert "drugs & paraphernalia" not in audit_reason._L3_NORMALIZE
+    assert not [k for k in audit_reason._L3_NORMALIZE
+                if k not in ("brand_misuse", "brand misuse", "content standards",
+                             "content_standards", "promotional content",
+                             "promotional", "content policy")]
+
+
+def test_b7_normalize_l3_cat_still_falls_back_to_title():
+    """认不出来的照旧 `.title()` 回退 —— 保持旧行为,不扩大改动面。
+
+    (它会把 `PFAS Chemicals` 变 `Pfas Chemicals`:那是照迁的已知缺陷,由
+    `known_policies_check` 记日志计数,不改判定。)
+    """
+    n = audit_reason._normalize_l3_cat
+    assert n("some new policy", _OFFICIAL_TABLE) == "Some New Policy"
+    assert n("pfas chemicals") == "Pfas Chemicals"       # 没传表 ⇒ 旧行为
+    assert n("pfas chemicals", _OFFICIAL_TABLE) == "PFAS Chemicals"   # 传了就随表
+
+
+def test_b7_every_official_policy_name_normalizes_back_to_itself():
+    """⚠ 守门:42 个官方名(refdata 头注 H1)必须**逐个**能归一化回自身。
+
+    这是"旧脚本跟随 refdata"的机器可验形式:L3 照着提示词答出表里的类别名,
+    这一层就必须原样交回去。任何一个被 `.title()` 改了形(`PFAS Chemicals` /
+    `Children’s Products` / `Product claims` 那几个大小写特殊的),就是
+    `audit_reason` 与政策表之间的一道静默错位。
+    """
+    assert len(_OFFICIAL_TABLE) == 42
+    bad = [c for c in _OFFICIAL_TABLE
+           if audit_reason._normalize_l3_cat(c, _OFFICIAL_TABLE) != c]
+    assert bad == [], bad
+    # 大小写乱掉的答案也要认回来(LLM 不保证大小写)
+    bad2 = [c for c in _OFFICIAL_TABLE
+            if audit_reason._normalize_l3_cat(c.upper(), _OFFICIAL_TABLE) != c]
+    assert bad2 == [], bad2
+
+
+def test_b7_l3_reason_category_goes_through_the_live_table():
+    """步 2(L3 语义判)必须吃到实时集合 —— 否则改名后 L3 的答案会被改写。"""
+    o = _outcome()
+    o.l3 = SimpleNamespace(verdict="reject", hits=[],
+                           reason_category="drugs and drug paraphernalia")
+    assert audit_reason.compute_final_reason(o, None, _OFFICIAL_TABLE) == \
+        "Drugs and Drug Paraphernalia"
+    # 不传表 = 旧行为(.title() 回退),不炸
+    assert audit_reason.compute_final_reason(o) == "Drugs And Drug Paraphernalia"
+
+
+def test_b7_step15_resolves_the_l2_abbreviations_against_the_live_table():
+    """⚠ `audit_l2._infer_walmart_policy` 返回的是**旧缩写名**(旧仓搬迁那批),
+    它经规则 detail 的 `walmart_policy` 进理由映射,出口只有步 1.5 一个。
+
+    政策表 2026-09-02 改成官方拼写后不解析的后果:每一条 cert 拒的
+    `final_reason_category` 都落在政策表之外 —— 只多几条 warning 计数,判定
+    不变,但 F 列写的政策名沃尔玛那边查无此类(申诉时报错名字)。
+    """
+    seen = set()
+    for _kws, policy in audit_l2._PT_KEYWORD_TO_POLICY:
+        seen.add(policy)
+    for policy in audit_l2._CATEGORY_TO_POLICY.values():
+        seen.add(policy)
+    # 这批常量里确实还写着旧缩写名(本批**不动它们**,只在出口解析)
+    assert seen & set(resources.POLICY_LEGACY_NAMES)
+
+    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
+        o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
+                                   {"walmart_policy": legacy})])
+        assert audit_reason.compute_final_reason(
+            o, None, _OFFICIAL_TABLE) == official, legacy
+        # 改名落地前(表里还是缩写名)照旧回缩写名 —— 同一份代码两种表形态都活
+        assert audit_reason.compute_final_reason(
+            o, None, _LEGACY_TABLE) == legacy, legacy
+        # 不传表 = 旧行为(原样返回),不炸
+        assert audit_reason.compute_final_reason(o) == legacy
+
+
+def test_b7_step15_keeps_a_name_it_cannot_resolve_instead_of_inventing_one():
+    """解析不到的**原样返回**:编一个表里没有的名字,下游一路对不上还不报错。
+
+    落在表外由调用方既有的 `known_policies_check` 记 warning 计数(不改判定)。
+    """
+    o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
+                               {"walmart_policy": "Ghost Policy (old)"})])
+    assert audit_reason.compute_final_reason(o, None, _OFFICIAL_TABLE) == \
+        "Ghost Policy (old)"
+    assert not audit_reason.known_policies_check("Ghost Policy (old)",
+                                                 frozenset(_OFFICIAL_TABLE))
+
+
+def test_b7_the_real_l2_inference_still_returns_the_frozen_constants():
+    """本批**不逐条改** audit_l2 的常量(那是「L3 输出规范化」那一步的事)——
+    这条钉住"没顺手改",免得下次有人看见两处都对表就以为常量已经换了。"""
+    assert audit_l2._infer_walmart_policy("electronics", [], "Widget") == \
+        "Electronics & RF"
+    assert audit_l2._infer_walmart_policy("vehicles", [], "Widget") == \
+        "Auto & Motor Vehicles"
+    assert audit_l2._infer_walmart_policy(None, [], "vape pen") == \
+        "Tobacco & Vaping"
+
+
 # ── 人话理由(所有者 2026-08-16:「General-Use Products 这是什么意思」)──────
 
 def test_human_reason_leads_with_the_rule_not_the_policy():
-    """⚠ `General-Use Products` 是 37 政策映射第 4g 步的**兜底**(以上全不中)。
+    """⚠ `General-Use Products` 是政策理由映射第 4g 步的**兜底**(以上全不中)。
 
     它落在一把锤子、一个土豆压泥器上时,人只会一头雾水 —— 那不是原因,
     是"没能归到具体哪条政策"。真正的原因在命中的规则里,而 hit.detail 里

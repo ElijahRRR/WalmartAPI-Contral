@@ -130,6 +130,25 @@ def audit_seed_file(name: str) -> Path:
     return repo_root / "refdata" / "audit" / name
 
 
+def policy_pages_dir(lang: str = "en") -> Path:
+    """输入:语种(`en` / `zh`)→ 输出:`refdata/policy_pages/<lang>/` 绝对路径。
+
+    沃尔玛官方禁售政策的**逐字转录件**(进 git 的只读参考资料,skill
+    `policy-refresh` 产出;重跑该流程后 git diff 就是政策变更审计记录):
+
+      - `en/` —— 官方英文转录,**权威判据源**:`policy_sync` 入库
+        `audit.walmart_prohibited_policy` 与 L3 提示词的唯一文本来源;
+      - `zh/` —— 人读中文译本,**永不进 LLM 提示词**(语言原则:给 LLM 的是
+        官方英文原文,给人的是中文;定稿 `docs/policy_sync.md` §八.1)。
+
+    路径只准从这里取(铁律 3):工作流不许自己拼 `refdata/…`。
+    """
+    if lang not in ("en", "zh"):
+        raise ValueError(f"policy_pages 只有 en / zh 两个语种,给的是 {lang!r}")
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "policy_pages" / lang
+
+
 def pg_tool(name: str) -> str:
     """输入:PostgreSQL 客户端工具名(pg_dump/pg_restore)→ 输出:可执行路径。
 

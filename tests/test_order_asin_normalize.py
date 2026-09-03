@@ -185,10 +185,13 @@ def test_order_sync_fills_asin_at_write_time():
         }]}})
 
     class _C:
+        # ⚠ 攒下每一条 executemany:upsert_order_lines 之后还有一条下单时间观测
+        # 记账(_record_order_date_observations),只留最后一条会拿到那条的行
+        def __init__(self): self.manys = []
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, args=None): self.rows = []
-        def executemany(self, sql, seq): self.written = list(seq)
+        def executemany(self, sql, seq): self.manys.append((sql, list(seq)))
         def fetchall(self): return []
 
     class _Conn2:
@@ -197,7 +200,8 @@ def test_order_sync_fills_asin_at_write_time():
 
     conn = _Conn2()
     ol.upsert_order_lines(conn, rows)
-    assert conn.cur.written[0]["asin"] == "B0GXX75JN5"
+    written = next(r for sql, r in conn.cur.manys if "ON CONFLICT" in sql)
+    assert written[0]["asin"] == "B0GXX75JN5"
 
 
 def test_resync_never_wipes_an_asin_the_sweeper_resolved():

@@ -1,7 +1,7 @@
 """审核规则引擎门面(批次 B:零 LLM 纯规则层;全案 docs/audit_migration_plan.md)。
 
 组装三块积木:audit_phase0(四件套短路)→ PT 解析(本文件,批次 B 版三级的
-前两级)→ audit_l2(R1/R3-R8)→ audit_reason(37 政策理由映射)。
+前两级)→ audit_l2(R1/R3-R8)→ audit_reason(政策理由映射)。
 
 PT 解析(架构 10.3 的批次 B 裁剪版,批次 C 接 LLM rerank 前只有两级):
   ① 沃尔玛实证:catalog.walmart_items.product_type(sku=asin,跨店唯一才采信)
@@ -42,7 +42,7 @@ class AuditContext:
     uspto: object = None           # psycopg 连接或 None(R5 开关)
     walmart_confirmed: dict = field(default_factory=dict)   # asin → PT(跨店唯一,已 pt_meta 闸)
     catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
-    known_policies: frozenset = frozenset()                  # 37 政策 category_en 集合
+    known_policies: frozenset = frozenset()   # 政策表 category_en 实时集合(全部)
     uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
@@ -404,7 +404,7 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
                       pt_confidence="低", pt_source="skipped"),
             phase0=p0)
         outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product)
+            outcome, product, ctx.known_policies)
         return outcome
 
     l1 = resolve_pt(product, ctx)
@@ -486,12 +486,16 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
             outcome.stage_stopped_at = "L4"
 
     if outcome.verdict == "reject":
+        # ⚠ `ctx.known_policies` 同时喂两处,**必须同源**:这里让 L3 答出的
+        #   政策名按表内原拼写回来(2026-09-02 §十.7 归一化随表),以及下面那道
+        #   校验;`audit_l3.valid_reason_categories` 吃的也是它 —— 三处同一个
+        #   `SELECT category_en`,表改名后一起变,不会有谁掉队。
         outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product)
+            outcome, product, ctx.known_policies)
         if ctx.known_policies and not audit_reason.known_policies_check(
                 outcome.final_reason_category, ctx.known_policies):
-            # 兜底触发必须记日志计数(铁律):落在 37 政策集合外只记不改判
-            logger.warning("理由映射落在 37 政策外:%s(asin=%s)",
+            # 兜底触发必须记日志计数(铁律):落在政策表之外只记不改判
+            logger.warning("理由映射落在政策表之外:%s(asin=%s)",
                            outcome.final_reason_category, product.asin)
     return outcome
 

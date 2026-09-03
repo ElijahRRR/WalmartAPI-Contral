@@ -20,7 +20,7 @@
                                                      ↓ pass 才继续
                                               L4 视觉(LLM,默认关)
                                                      ↓
-                              verdict(pass / reject / pending)+ 37 政策理由
+                              verdict(pass / reject / pending)+ 政策理由
 ```
 
 三条贯穿全链的纪律:
@@ -350,13 +350,49 @@ PT 必定在表里。这两个分支是**防御网**,不是在补一个正在漏
 判定**不动分数**(hit penalty 恒 0),只决定 verdict:
 `reject` → 整品拒(stage=L3);`pending` → 待人工;`pass` → 交 L4(若开)。
 
-**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对所有
-产品**逐字节相同**(政策静态段 + 37 条政策压缩块),进程内只构造一次。
-任何把产品信息拼进 system 的写法都会打散前缀缓存,命中率从 ~95% 掉回 ~63%。
+**prompt 前缀缓存契约**:messages 恒为 `[system, user]`,system prompt 对**同一轮
+的所有产品**逐字节相同(政策静态段 + 政策压缩块 —— 候选块与压缩块都由政策表
+**全部**行实时渲染),进程内只构造一次。任何把产品信息拼进 system 的写法都会
+打散前缀缓存,命中率从 ~95% 掉回 ~63%。
+
+⚠ **2026-09-02 契约退役**(`docs/policy_sync.md` §十.7):"对所有产品逐字节相同"
+的实际含义一直是"同一轮内相同" —— 政策表一改(新增行 / 改名 / 刷新正文),
+提示词就跟着变,这是**设计如此**(政策表就是 L3 的判定输入)。提示词里那句
+硬写的「37 条」同批改为按实时条数渲染(库里早就不是 37 行,自称的数目与紧随
+其后的清单对不上)。政策表变更后前缀缓存一次性重建属预期成本,同批递增
+`AUDIT_RULES_VERSION`。
 
 **失败语义与旧系统相反**:LLM 重试尽 / 坏 JSON / verdict 取值非法,
 **一律 pending**(旧仓是 pass)—— 故障窗口漏审违规商品的代价远大于人工复核。
 pending **不写 llm_cache**。
+
+### 5.0 政策路由:哪几条政策会被点名送进 user 段
+
+`route_policy_hints(walmart_category, walmart_pt, known=…)` 用两张内存表
+(`_CATEGORY_ROUTES` 等值 + `_PT_KEYWORD_ROUTES` 裸子串)挑 ≤5 条最相关政策,
+永远以 `Intellectual Property` + `Offensive Content` 打头(截断也挤不掉)。
+**这只是提示**,不是判据白名单 —— 白名单是全表(`valid_reason_categories`)。
+
+两张路由表里写的是**旧仓搬迁时的缩写名**(`Electronics & RF` 一族),而政策表
+2026-09-02 起用官方拼写。所以每个条目都过一次
+`services/policy_names.resolve(名字, known)` 再返回:精确 → casefold → 词形
+(`&`↔`and` / 逗号 / 括号后缀 / 单复数)→ 旧名映射,**命中回表内原拼写**。
+改名前后同一张路由表都活,不必跟着改名批改字面量。
+
+> ⚠ 旧写法是 `c in known` 直接过滤 —— 改名后会**静默丢掉 7 条**政策提示:
+> 提示词照旧漂亮、判定照旧返回,只是 L3 少看了 7 类政策。没有任何东西会红。
+
+**两条本来就是死的**(不是改名改坏的,官方 42 名里根本没有这两个类别名):
+
+| 路由表写的 | 政策表里的实际情况 |
+|---|---|
+| `Pet Products` | 官方是 `Pet Foods, Supplements, Medicines and Other Products`,归一化打不平 |
+| `Jewelry/Precious Metals` | 旧仓自造的斜杠写法,官方那条是 `Jewelry, Watches, … (Covered Goods)` |
+
+它们每次命中记 **warning + 计数**(同名一轮只警告一次,计数逐次累加),
+进 `product_audit` 摘要的「⚠ L3 政策路由解析不到 N 次」那行 —— 旧写法只记
+debug,等于没人看得见。改法(补映射 / 改路由表 / 枚举化)随
+`docs/policy_sync.md` §十.7 的「L3 输出规范化」一起定。
 
 ### 5.1 L2 证据怎么送进 L3
 
@@ -401,15 +437,16 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 
 ## 7. 理由映射:reject 之后说人话(`services/audit_reason.py`)
 
-`verdict=reject` 时算一个 **Walmart 37 条政策的 `category_en`**,按顺序:
+`verdict=reject` 时算一个 **Walmart 政策表的 `category_en`**(条数随表,
+2026-09-02 起是官方 42 类),按顺序:
 
 | 步 | 判据 | 结果 |
 |---|---|---|
 | 0 | 不是 reject | None |
 | 1 | hit 是 `phase0_forbidden_category` 且 detail 有 `walmart_policy` | 该 policy 原样 |
 | 1.2 | 黑名单中心三码(asin/seller/amazon_cat) | **None**(内部决策,不对应任何沃尔玛政策) |
-| 2 | L3 判 reject 且给了 reason_category | 归一化值 |
-| 1.5 | 其余带 `walmart_policy` 的 hit | 该 policy 原样 |
+| 2 | L3 判 reject 且给了 reason_category | 归一化值(**随表**:`policy_names.resolve` 对实时 `category_en` 集合解析,命中回表内原拼写;2026-09-02 §十.7) |
+| 1.5 | 其余带 `walmart_policy` 的 hit | 该 policy **对表解析后**的表内拼写(解析不到才原样) |
 | 3 | L4 判 reject | 按 issue 文本 → Offensive Content / Intellectual Property |
 | 4a | `publication_pt_forbidden` | Intellectual Property |
 | 4c | PT 关键词十组 | 对应政策 |
@@ -417,7 +454,20 @@ L4 不动分数,所以 L4 reject 的产品落库分数通常仍 ≥60 = "分数�
 | 4e/4f | 商标 / 黑名单品牌 | Intellectual Property |
 | 4g | 全不中 | General-Use Products |
 
-落在 37 条之外时**只记 warning 不改判**(兜底触发必须留痕)。
+步 2 与步 1.5 都走 `services/policy_names.resolve(名字, ctx.known_policies)`
+(仓内唯一一份政策名归一化),命中回**表内原拼写**:
+
+- 步 2 吃的是 L3 答出的 `reason_category`;
+- 步 1.5 是 **`services/audit_l2._infer_walmart_policy` 那批写死的旧缩写名**
+  (`Military & Law Enforcement` / `Electronics & RF` / `Drugs & Paraphernalia`
+  …)进 `final_reason_category` 的**唯一出口** —— 在这一处解析就够了,
+  不逐条改 audit_l2 的常量(那是 §十.7「L3 输出规范化」那一步的事)。
+
+落在政策表之外时**只记 warning 不改判**(兜底触发必须留痕)。已知会落在表外的:
+`Restricted/Illegal` / `Jewelry/Precious Metals` / `.title()` 变形值,以及
+2026-09-02 表改官方拼写之后,**4c/4d 两步**里写死的旧缩写名(`Military & Law
+Enforcement` 一族)—— 那两步是 PT/类目关键词**兜底推断**,输入根本不是政策名,
+对表反而会把"推断"伪装成"表里查到的";改法随 §十.7 的「L3 输出规范化」一起定。
 
 ---
 
@@ -483,3 +533,45 @@ python cli.py audit_why -p asins=B0XXXXXXXX
 只读,输出这个 ASIN 停在哪一层、命中了哪些 rule_code、每条的判据来自
 **哪张表哪一列**。看到不认识的 rule_code 先查 `workflows/audit_why.py`
 里的判据出处表。
+
+---
+
+## 10. 2026-09-02 所有者定稿:审核链瘦身(随第三步 L3 批实施)
+
+背景:L3 换喂官方英文政策全文(`refdata/policy_pages/en`,42 条)之后,L2 里
+"硬代码代 LLM 判语义"的规则失去存在理由;黑名单能力只许有一处实现。定稿:
+
+| 规则 | 处置 | 说明 |
+|---|---|---|
+| R1 类目准入 | **保留,成为 L2 的全部** | 拿 L1 的 PT 查白名单 `access_state` + `zh_can_do`;PT 查不到 → pending(判不了 ≠ 判过了) |
+| R3 类目需证书 | 硬拒分支**降为证据** | 该 PT 的 `requirements` 一行随产品送 L3,由 LLM 判"这个具体产品要不要这张证"(2026-08-21 咖啡桌教训的彻底版);硬闸只留白名单 `zh_can_do` |
+| R4 品牌黑名单扫文案 | **移入 L0,双输出** | 黑名单能力只在 L0 一处实现、一份数据:`brand` 字段精确等值 → 硬拒终止(现规则 4);标题/五点/描述扫到黑名单词 → **0 分证据不终止**,送 L3 由 LLM 判是品牌还是"兼容/提及"(R6 误伤 90% 的教训:提到 ≠ 卖的就是)。词边界 / 中文紧邻即边界 / 自品牌精确豁免 / 同品牌只报一次的逻辑随迁 |
+| R5 USPTO 在效商标 | **删除** | 默认关、覆盖率 2.6 万/1400 万,死重;将来需要按新流程重建 |
+| R7 促销宣称 | **退役,前置条件先满足** | 其判据(#1 / best seller / premium quality / FDA approved)属沃尔玛 **Content Standards**,不在 42 条禁售政策内 —— 先用 policy-refresh 流程把 Content Standards 页转录进 L3 前缀,再删 R7(先补后删,无真空期) |
+| R8 敏感/严格合规词表 | **删除** | Offensive Content 政策全文(第 25 节,8 个子域)+ 武器族已进表,LLM 读原文判 |
+| R10 Made in USA 声明 | **移入 L0** | 确定性正则(含 `not made in` 否定式排除),与"专利自述"同类,命中即硬拒 |
+
+瘦身后的链路:
+
+```
+L0  库黑名单精确拦截(卖家/ASIN/亚马逊类目/品牌)+ 商标符号 + 专利自述 + Made in USA → 硬拒即终止
+    + 品牌黑名单文案扫描 → 0 分证据,不终止
+L1  定 PT(是什么;LLM 只在候选 rerank 出场)
+L2  = R1 白名单准入(能不能;代码查表,确定性)
+L3  产品全文 + 42 条政策英文全文 + Content Standards + 本 PT 的 requirements 行 + L0 品牌证据
+    → 判定结果 / 政策类别(官方 42 名枚举)/ 具体内容
+```
+
+工程要点(执行规格另写):
+
+- L0 契约从「命中即终止」改为「**硬命中终止、软命中带证据前行**」;`audit_hits` 可落多行;
+  `stage_stopped_at` 语义不变(只有硬拒才停);
+- 证据进 L3 的通道泛化为「读取上游**所有阶段**的软 hit」(现 `summarize_l2_for_l3` 只读 L2);
+- 存量 `audit_hits` 的 rule_code(`title_desc_blacklist` / `cat_requires_cert_*` / `content_promotional`
+  / `walmart_strict_sensitive` …)保留兼容渲染,新链不再产生;
+- **顺序:先换喂(L3 读英文全文 + Content Standards),后删 R7/R8**;`AUDIT_RULES_VERSION` 同批递增;
+- 落地后用报错回放评估集(已知沃尔玛裁决的产品 + 通过样本)比对瘦身前后的一致率;
+- **不做**:把整张 PT 表放进 LLM 知识库让它"一次判类目 + 能不能做" —— 查白名单是对
+  LLM 刚选出的 PT 做确定性查表,代码做;"是什么"与"能不能"合判会污染分类
+  (2026-08-20 删 L1 禁售清单的同一理由);知识库是检索不是查表,捞不到会猜,
+  「PT 不在表 → pending」的安全默认值也会丢。给 LLM 的是本 PT 的那一行,不是整张表。

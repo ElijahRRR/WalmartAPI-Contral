@@ -489,6 +489,11 @@ def _is_word_boundary_char(c: str) -> bool:
     return not (c.isalnum() or c == '_')
 
 
+#: 品牌命中带回的上下文半径(字符)。取 40:够装下 `Bob Smith Industries
+#: BSI-151H` 这种"多词品牌 + 型号"的形态,又不至于把整条标题塞进证据行。
+_BRAND_CTX = 40
+
+
 def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
     """输入:产品 + ctx(用 ctx.brand_mention_automaton) → 输出:软证据 hit(0 或 1 条)。
 
@@ -538,7 +543,18 @@ def _scan_brand_mentions(product: ProductInfo, ctx: Any) -> list[RuleHit]:
             continue
         seen.add(brand)
         # 还原原始大小写显示给审核员
-        matches.append({"brand": brand, "matched_phrase": hay[start_idx:end_idx + 1]})
+        # ⚠ **带回上下文,不只带回命中的那个词**(2026-09-03 所有者点破):
+        # 黑名单收的是**单词**,而标题里的品牌往往是**多词的完整名字** ——
+        # `smith` 命中,标题里其实是 `Bob Smith Industries`,那是另一家公司,
+        # 只是碰巧含这个词。只把 `smith` 递给 L3,它没法判"这个词属于哪个
+        # 完整品牌名、和黑名单里那个牌子是不是同一个",于是一律判成真品牌,
+        # 再被确定性后处理翻成知产侵权(实测正例误伤的主因)。
+        lo = max(0, start_idx - _BRAND_CTX)
+        hi = min(n, end_idx + 1 + _BRAND_CTX)
+        matches.append({"brand": brand,
+                        "matched_phrase": hay[start_idx:end_idx + 1],
+                        "context": ("…" if lo else "") + hay[lo:hi]
+                                   + ("…" if hi < n else "")})
 
     if not matches:
         return []

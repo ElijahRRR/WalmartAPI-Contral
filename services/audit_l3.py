@@ -199,9 +199,27 @@ must comply with / requires approval / must be registered / prior authorization
 - 本体是**庭院遮阳伞**,而标题开头就写着 `ABBA PATIO … Umbrella` → 那是
   **这把伞自己**的牌子 → 是真品牌。
 
-「上游证据」里列出的词,**一个都不许跳过**:逐个照这一问判 —— 它在这条
-listing 里到底是**用在别人身上**,还是**当成自己的名字**在卖。判完只把后者
-写进输出,判成 false 的一个都不要写出来。
+**上游给你的是一个「词」,不是一个「品牌」。** 黑名单收的是单词,而标题里的
+品牌名常常是**多个词**。所以每个词都先做这一步:
+
+> 在「上游证据」给的原文里,找出这个词**属于哪个完整的品牌名**;
+> 再问:那个完整品牌名,与命中的这个词**是不是同一个牌子**?
+
+- 命中 `smith`,而原文是 `Bob Smith Industries BSI-151H Insta-Set…` ——
+  完整品牌名是 **Bob Smith Industries**,那是**另一家公司**,只是名字里
+  碰巧含 `smith` → `false`,不进列表;
+- 命中 `milwaukee`,原文就是 `Milwaukee M18 …` —— 完整品牌名就是
+  **Milwaukee** 本身,同一个牌子 → 可以进列表;
+- 命中的词在原文里根本没当名字用(`better` 在 `Better Drying`、`trio` 在
+  `Trio Chamber` 这种描述里)→ `false`。
+
+**不是同一个牌子,就一个字都不要写进输出。** 一个词判错,整件商品会被翻成
+知产侵权 —— 实测正例误伤几乎全出在这一步(`smith` / `southern` / `serene` /
+`Essex` 都是**别人名字里碰巧含这个词**)。
+
+「上游证据」里列出的词,**一个都不许跳过**:逐个先过上面这一问,再问它在这条
+listing 里是**用在别人身上**还是**当成自己的名字**在卖。两问都过了才写进输出,
+判成 false 的一个都不要写出来。
 一个真品牌都没有 → 给 `[]`,那就是"品牌这一维没问题"。
 
 - **用在别人身上 → 不进列表**:`compatible with X` / `fits X` /
@@ -442,11 +460,22 @@ MAX_REQ_CHARS = 500      # 本 PT 的沃尔玛准入要求(walmart_pt_meta.requi
 MAX_EVIDENCE_CHARS = 300  # 未登记 rule_code 的 detail 摘要上限
 
 
+def _brand_pair(m: dict) -> str:
+    """输入:一条品牌命中 → 输出:`词(原文:上下文)`。
+
+    ⚠ **优先给上下文**(2026-09-03):黑名单收的是单词,标题里的品牌常是多词
+    完整名(`smith` vs `Bob Smith Industries`)。只递那个词,L3 判不出"它属于
+    哪个品牌名、与黑名单那个牌子是不是同一个" —— 那是正例误伤的主因。
+    老命中行没有 `context` 键(库里存量),退回 `matched_phrase`,不炸。
+    """
+    return f"{m.get('brand')}(原文:{m.get('context') or m.get('matched_phrase')})"
+
+
 def _line_title_desc_blacklist(h) -> tuple[str, list[str]]:
     """输入:R4 命中 → 输出:(一行文本, 品牌词)。"""
     matches = (h.detail or {}).get("matches", [])[:MAX_BRANDS]
     names = [m.get("brand", "") for m in matches if m.get("brand")]
-    pairs = [f"{m.get('brand')}(原文:{m.get('matched_phrase')})" for m in matches]
+    pairs = [_brand_pair(m) for m in matches]
     n = (h.detail or {}).get("count", len(matches))
     return (f"* 标题/描述命中黑名单(R4, 共{n}个, 前10): {', '.join(pairs)}", names)
 
@@ -501,7 +530,7 @@ def _line_brand_mention(h) -> tuple[str, list[str]]:
     """
     matches = (h.detail or {}).get("matches", [])[:MAX_BRANDS]
     names = [m.get("brand", "") for m in matches if m.get("brand")]
-    pairs = [f"{m.get('brand')}(原文:{m.get('matched_phrase')})" for m in matches]
+    pairs = [_brand_pair(m) for m in matches]
     n = (h.detail or {}).get("count", len(matches))
     return (f"* 文案提到黑名单品牌(共{n}个, 前10): {', '.join(pairs)}", names)
 

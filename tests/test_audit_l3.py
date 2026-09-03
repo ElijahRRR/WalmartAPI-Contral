@@ -350,6 +350,49 @@ def test_S1_人工验收回改的三件事都在():
     assert "# 判定的两类命中" not in s1
 
 
+def test_S1_命中的是词不是品牌_这一问排在最前():
+    """⚠ `c.2026-09-03.5` 修的是实测底线不达标(正例误伤 4.0% > 旧链 2.8%)。
+
+    逐条看全是品牌翻拒,而且多数是**别人名字里碰巧含那个词**:
+    `smith` 命中的其实是 `Bob Smith Industries`、`southern`/`serene`/`Essex`
+    同款。所有者原话:「这样子的词在标题里应该可以看出来它到底是品牌还是不是
+    品牌」—— 所以判据是"词 → 完整品牌名 → 是不是同一个牌子",而且必须排在
+    原有两问**之前**(先认出品牌名,才谈得上它是用在别人身上还是自己身上)。
+    """
+    s1 = audit_l3._S1
+    for must in ("上游给你的是一个「词」,不是一个「品牌」",
+                 "属于哪个完整的品牌名",
+                 "是不是同一个牌子",
+                 "Bob Smith Industries",
+                 "不是同一个牌子,就一个字都不要写进输出"):
+        assert must in s1, must
+    # 顺序:这一问在"用在别人身上/当成自己的名字"之前
+    assert s1.index("属于哪个完整的品牌名") < s1.index("**用在别人身上**")
+    # 本体那一节仍排在整个品牌段之前(`.4` 定的顺序不许被这次改动挤掉)
+    assert s1.index("# 先定") < s1.index("# 品牌证据怎么判")
+
+
+def test_证据行优先渲染上下文_老行退回matched_phrase():
+    """证据行是 L3 唯一看得到原文的地方:只给命中的那个词等于没给判据。
+    ⚠ 库里存量命中行没有 `context` 键 —— 退回 `matched_phrase`,不许炸。"""
+    hit = RuleHit(stage="L0", rule_code="phase0_brand_mention", penalty=0,
+                  detail={"matches": [
+                      {"brand": "smith", "matched_phrase": "Smith",
+                       "context": "Bob Smith Industries BSI-151H"}],
+                      "count": 1})
+    txt, brands = audit_l3.summarize_evidence(
+        Phase0Result(blocked=False, hits=[hit]), None, _l2())
+    assert "smith(原文:Bob Smith Industries BSI-151H)" in txt
+    assert brands == ["smith"]          # 待判清单仍是裸词,输出契约不变
+    old = RuleHit(stage="L0", rule_code="phase0_brand_mention", penalty=0,
+                  detail={"matches": [{"brand": "dyson",
+                                       "matched_phrase": "Dyson V6"}],
+                          "count": 1})
+    txt2, _ = audit_l3.summarize_evidence(
+        Phase0Result(blocked=False, hits=[old]), None, _l2())
+    assert "dyson(原文:Dyson V6)" in txt2
+
+
 def test_S1_输出五段_本体与政策原句进输出_品牌只列真的():
     """⚠ 2026-09-03 所有者要求「输出有明细方便我们排查问题」:
 

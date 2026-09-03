@@ -607,3 +607,31 @@ def test_soft_evidence_travels_in_all_hits_so_it_reaches_the_ledger():
     out = AuditOutcome(asin="B0", verdict="pass", score_final=100,
                        stage_stopped_at=None, l1=L1Info(), phase0=p0)
     assert [h.rule_code for h in out.all_hits] == ["phase0_brand_mention"]
+
+
+def test_brand_mention_带回上下文窗口_不只带那个词():
+    """⚠ 所有者 2026-09-03 点破的那件事:黑名单收的是**单词**,标题里的品牌
+    往往是**多词完整名**。`smith` 命中的其实是 `Bob Smith Industries` ——
+    另一家公司,只是名字里碰巧含这个词。
+
+    只把 `smith` 递给 L3,它没法判"这个词属于哪个完整品牌名、和黑名单那个
+    牌子是不是同一个",于是一律判真品牌,再被确定性后处理翻成知产侵权
+    (实测正例误伤 4.0% > 旧链 2.8% 的主因)。
+    """
+    title = ("Bob Smith Industries BSI-151H Insta-Set Super Glue Accelerator "
+             "2 fl oz - Fast Drying Liquid Activator for Cyanoacrylate Adhesives")
+    r = audit_phase0.check(_p(title=title), _ctx(ac=_ac(["smith"])))
+    (m,) = r.evidence[0].detail["matches"]
+    assert m["brand"] == "smith"
+    assert m["matched_phrase"] == "Smith"          # 命中的那一段,溯源用
+    # 上下文要装得下**完整品牌名**,这才是判据
+    assert "Bob Smith Industries" in m["context"]
+    assert len(m["context"]) <= 2 * audit_phase0._BRAND_CTX + len("Smith") + 2
+
+
+def test_brand_mention_上下文两端截断打省略号():
+    """命中在标题中段时两端都要标出"还有内容",免得看的人以为那就是全部。"""
+    title = "X" * 100 + " Dyson " + "Y" * 100
+    r = audit_phase0.check(_p(title=title), _ctx(ac=_ac(["dyson"])))
+    ctx = r.evidence[0].detail["matches"][0]["context"]
+    assert ctx.startswith("…") and ctx.endswith("…") and "Dyson" in ctx

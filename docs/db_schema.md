@@ -425,7 +425,7 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
 |---|---|---|---|
 | `orders.order_lines` | order_line_id(UNIQUE po+sku) | 销售明细行:商品/状态/金额/物流/收件人 + 审核结论(audit_status/audit_detail);行号存列做展示。**`source`**:NULL=API 完整行,`'历史数据'`=order_history_import 导入的残缺行(只有下单时间/店铺/PO/SKU/品名/数量/金额,状态一律 Delivered),order_center_push 据此不推飞书;order_sync 覆盖同一行时会把它写回 NULL,API 拉到真行后自动回到推送流。**`order_date` 观测→定稿**(所有者定稿 2026-09-02「下单时间不应该被修改」;事故:沃尔玛 GET /v3/orders 的 orderDate 单次读取不可信,偶发给出别的订单的时间甚至未来日期):首见只写候选(`order_date_confirmed=false`;`order_date_seen` 记最近一轮观测值),**连续两轮拉取一致才定稿**,定稿后锁死不再改;未定稿时连续两轮出现同一个不同值则改判(首见就错的自愈通道);未来日期拒写留 NULL,晚于本行状态时间的记存疑;每次不一致(冲突/改判/待定)与拒写/存疑逐条告警并进 order_sync 摘要首行;`order_meta` 存首见信封摘要(orderDate 原值/customerOrderId/预计发货送达/各行状态时间)取证,只在插入时写;`order_date_streak` 记定稿后同一异值连续出现的轮数,到 3 在摘要首行报「疑错」并给修复命令(定稿值不自动动);观测记账不碰 `updated_at`(不触发飞书重推)。**详情接口第二来源**(所有者方案 2026-09-02,探针 4 实证 `GET /v3/orders/{po}` 可信):新单首见以详情值落库并直接定稿(`order_date_source='detail'`);没被详情核对过的存量行(`order_date_source` 为 NULL/`'list'`)每轮查详情直到定稿;详情定稿后列表再不一致只计数、不查不改(同一异值连续三轮才补查一次详情作保险);列表值明显异常时拒写并用详情补正;详情不可用退回两轮机制。语义唯一出处 `services/order_lines._ORDER_DATE_GUARD`/`_ORDER_DATE_STATE_SQL`;修复已定稿错行走 `order_sync -p repair_order_date=<PO 列表>` 显式模式(只改列出的 PO,裸开关报错);**加列后须 `python cli.py db_init`**。**`asin`**(A1.5,2026-08-15):源头 ASIN,由 `order_asin_normalize` 按 `services/sku_asin` 补填,**提不出留 NULL**;分配引擎的产品/品牌销量维度按 `asin IS NOT NULL` 过滤,**不许拿 sku 原文当 asin** | 订单拉取工作流 + order_audit 回写审核 + order_history_import 补历史 + order_asin_normalize 补 asin |
 | `orders.return_lines` | (return_order_id, order_line_id) | 售后单行(一条 returnOrderLine 一行);行级状态实证在 returnOrderLines 内,物流在 returnLineGroups[].labels[].carrierInfoList[] | returns_sync |
-| `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric))(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键,与 schema.sql 注释一致) | `perf_problems`(2026-08-08 从 daily_report 摘出独立成流,已落地;写库经 services/order_lines) |
+| `orders.perf_events` | (po_id, metric, period) | 绩效问题订单,**逐周期累积**——同一违规在多个周期出现即多行,影响范围按 period 查询;历史累计 COUNT(DISTINCT (po_id,metric))(2026-08-26 所有者定稿:一单只属一店、PO 全局唯一,store 不进去重键,与 schema.sql 注释一致) **`sub_category`**(2026-09-03 加列,须 `python cli.py db_init`):报表 sheet 标题 = 沃尔玛的缺陷桶(No carrier scan / Out of stock / Ship window expired…),**原因本身只在这儿**,行里没有;加列前解析完就丢,于是飞书「问题描述」只能把整行拍平 ⇒ 与「明细」一字不差。归因见 `services/perf_reason` | `perf_problems`(2026-08-08 从 daily_report 摘出独立成流,已落地;写库经 services/order_lines) |
 | `ops.store_settlements` | (store, report_date) | **结算账期台账**(2026-08-31):一个账期一行,存该期 PaymentSummary 的 Total Payable。**累计回款 = SUM(total_payable)**。⚠ 不能用 `settlement_lines` 求和代替(它按订单行聚合、过滤掉订单不在库的行、不含账期级费用);也不能按天求和 `store_kpi_daily.payout`(那是"当前待打款"快照,打款前天天出现 ⇒ 同一笔重复计)。另一半价值:沃尔玛的 `availableReconFiles` 只保留有限期,落库之后就永远留着 —— 这份累计随运行时间**越来越完整** | 结算同步 |
 | `orders.settlement_lines` | (order_line_id, period) | 对账明细按行×账期聚合:net/gross/product/commission + 佣金明细。gross=各行绝对值和,用于区分"净 0=全额退款"与"净 0=无金额"(实证:Sale/Refund 同期相消) | 结算同步 |
 
@@ -649,6 +649,11 @@ CREATE TABLE ops.perf_problem_orders (   -- 永久累积,首次发现日期不�
     raw jsonb,                           -- xlsx 原始行,对拍校准用
     UNIQUE (sales_order_no, indicator, sub_category, tracking_no, item)
 );
+-- description = **归因**(「承运商无扫描 · 承运商 FedEx / 单号 …」),2026-09-03 起
+-- 由 services/perf_reason 生成;此前是把整行拍平成 "列名:值; …",与 raw 同义重复。
+-- 原文一个字段都没少,全在 raw 里。缺陷桶名分布(校准词表用):
+--   SELECT indicator, sub_category, count(*) FROM ops.perf_problem_orders
+--   GROUP BY 1,2 ORDER BY 3 DESC;
 -- 写入一律 INSERT ... ON CONFLICT DO NOTHING:天然实现旧系统"永久累积+全局去重+
 -- 保留首次发现日期"语义,消掉旧系统清空飞书全表重写的丢数据风险
 

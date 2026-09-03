@@ -10,6 +10,9 @@
   任何单元格以 '=' 开头的行(Excel SUM 公式)整行跳过;
   sheet 名 == "Not Accountable" → 计入绩效 "⚪ 否",其余 sheet 名作为子分类
 - 指标名带 emoji 前缀是隐式契约(日报的承运商分析按字符串精确匹配)
+- **问题描述是归因,不是拍平**(2026-09-03 改):早先把没映射到列的字段拼成
+  "列名:值; …",与 raw / 飞书「明细」一字不差,人看不出违规原因。现由
+  `services/perf_reason` 生成「原因 · 佐证」,原文照旧整份留在 raw 里
 - 问题订单去重键 = (Sales Order #, 指标, 子分类, 物流单号, 商品) 五字段。
   **本层不实现它** —— 去重由 workflows/perf_problems.py 的
   `ON CONFLICT (sales_order_no, indicator, sub_category, tracking_no, item)`
@@ -25,6 +28,8 @@ import re
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from services import perf_reason
 
 logger = logging.getLogger("services.kpi")
 
@@ -282,8 +287,15 @@ def _short(s: str, n: int = 30) -> str:
     return s[:n]
 
 
-def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
-    """输入:指标名 + report xlsx 字节 → 输出:问题订单行 dict 列表(13 列语义)。"""
+def parse_problem_report(metric: str, blob: bytes,
+                         ctx_by_po: dict | None = None) -> list[dict]:
+    """输入:指标名 + report xlsx 字节(+ 可选 {PO: 订单库补全})→ 输出:问题订单行
+    dict 列表(13 列语义)。
+
+    ctx_by_po 只喂给归因(services/perf_reason ③):report 端点不给取消/退货原因,
+    orders/returns 端点给,同一个 PO 的值拿来补。不传照样能解析,只是问题描述
+    退到「报表未给原因」那一档 —— 本函数不碰数据库,补全由调用方备料。
+    """
     import openpyxl
 
     label = METRIC_LABELS[metric]
@@ -311,6 +323,7 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
         sub_category = "" if accountable == "⚪ 否" else ws.title.strip()
 
         data_rows = kept = 0
+        unknown: dict[str, int] = {}        # 未收录的缺陷桶名 → 行数(整张汇总告警)
         for raw in data[start + 1:]:
             if not any(c.strip() for c in raw):
                 continue
@@ -325,7 +338,6 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
                    "sku": "", "item": "", "carrier": "", "tracking_no": "",
                    "description": "", "note": "",
                    "raw": json.dumps(rec, ensure_ascii=False)[:2000]}
-            desc_parts = []
             for key, val in rec.items():
                 k = key.lower()
                 v = str(val).strip()
@@ -335,12 +347,23 @@ def parse_problem_report(metric: str, blob: bytes) -> list[dict]:
                     if any(n in k for n in needles) and not row[field]:
                         row[field] = _short(v, 60) if field == "item" else v
                         break
-                else:
-                    desc_parts.append(f"{key}:{_short(v)}")
-            row["description"] = "; ".join(desc_parts)[:300]
+            # 问题描述 = 归因(为什么违规),**不是**把整行拍平 —— 拍平版与
+            # 「明细」列一字不差,人看了等于没看(所有者 2026-09-03)。
+            # 原始行整份留在 raw / detail 里,一个字段都没少
+            row["description"] = perf_reason.describe(
+                metric, sub_category, rec, accountable == "✅ 是",
+                ctx=(ctx_by_po or {}).get(row["po_no"]),
+                unknown_seen=unknown) or ""
             if row["sales_order_no"] or row["po_no"] or row["tracking_no"]:
                 rows.append(row)
                 kept += 1
+        if unknown:
+            # 桶名对不上 = 官方改了分类名或版式,原样进了问题描述:
+            # 校准后补进 services/perf_reason._BUCKETS(词表出处见该模块头)
+            logger.warning("报表 %s sheet '%s':缺陷桶名未收录 %s —— 已原样写入"
+                           "问题描述,校准后补进 services/perf_reason._BUCKETS",
+                           metric, ws.title,
+                           sorted(unknown.items(), key=lambda x: -x[1]))
         # 单号列一个都没匹配上 = _HEADER_MAP 关键词与真实表头不符,
         # 打出真实表头供校准——静默丢行就是"解析 0 行"事故的成因
         if data_rows and not kept:

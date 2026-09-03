@@ -134,9 +134,12 @@ def test_parse_problem_report_rules():
     assert r1["sub_category"] == "Late Delivery"
     assert r1["accountable"] == "✅ 是"
     assert r1["carrier"] == "USPS" and r1["tracking_no"] == "TRK1"
+    # 问题描述 = 归因(services/perf_reason),不是把整行拍平
+    assert r1["description"] == "送达晚 · 承运商 USPS / 单号 TRK1"
     r2 = next(r for r in rows if r["sales_order_no"] == "108xxx2")
     assert r2["accountable"] == "⚪ 否" and r2["sub_category"] == ""
     assert r2["item"] == "Great Cup"                       # $$ 只取前半
+    assert r2["description"] == "送达超时但沃尔玛判非卖家责任"
 
 
 # ── api 层 ────────────────────────────────────────────────────────────────────

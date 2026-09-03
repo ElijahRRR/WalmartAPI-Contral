@@ -696,3 +696,30 @@ time 这类通用词,扫描述等于把送进 L3 的品牌词清单**灌满噪�
 ⚠ **L0 商标符号规则不动**(照旧扫标题 + 五点前 5 条 + 描述前 1000 字符):
 ® / ™ 是强信号,没有噪声问题。两条 L0 规则的扫描面**故意不同**,别顺手统一
 —— 有一条守门测试专门拦这件事。
+
+### 8.7 验收通过:`c.2026-09-03.4` 对上 8 / 8(2026-09-03 生产机空跑)
+
+`product_audit(c.2026-09-03.4)`,`L3 system prompt 214888 字符(缺全文 0 篇)`;
+候选 8 / 判定 8(过 4 / 拒 4);L3 判 7(`B0015XDK30` 停在 L0 商标符号硬拒)。
+
+| ASIN | 基准 | 本轮 | 新链给的本体 |
+|---|---|---|---|
+| `B0F21HVDDN` | pass | pass,**真品牌=无** | 带USB口和插座的角落收纳柜(家具) |
+| `B0DFY42VDL` | pass | pass | 白色布艺抽屉柜(家具) |
+| `B0F6YH7ZX4` | pass | pass | 带电源插座和LED灯的九斗柜(家具) |
+| `B0C1V8SVHZ` | pass(8.1 更正) | pass | 印有文字图案的化纤门垫(家居地垫) |
+| `B0FBX3JR3Y` | reject | reject `Children's Products` | 儿童感官吊椅(秋千椅) |
+| `B0DSCQJ698` | reject | reject `Children's Products` | 面向儿童的户外野餐桌(儿童家具) |
+| `B0GYNRCZ9F` | reject | reject `Intellectual Property`,**真品牌=['abba']** | 户外庭院遮阳伞 |
+| `B0015XDK30` | reject | reject(L0 商标符号,未进 L3) | —— |
+
+两条要记住的读数经验:
+
+- **`iPad` 那条确实是顺序问题**。同一个产品,`.2` 判 pass 但旧链翻拒(`ipad` 被
+  当成收纳柜的真品牌);`.4` 把「先定本体再判品牌」写死之后 `真品牌=无` ——
+  本体先定成"收纳柜",`iPad` 自然落到"别人的牌子"那边。
+- **带 `verdict override` 字样的拒,理由不是模型写的**。`B0GYNRCZ9F` 日志里先出
+  `L3 verdict override: pass→reject, is_real_brand=true: ['abba']` —— 模型自己
+  输出的是 pass,是代码按合同(任一 `is_real_brand is True` ⇒ 整品 reject +
+  `Intellectual Property`)翻的确定性后处理。所以那条的 `policy_quote` 恒为空、
+  `detail` 是固定句式「未授权引用品牌名 X」。**看日志时别把它当模型的判断。**

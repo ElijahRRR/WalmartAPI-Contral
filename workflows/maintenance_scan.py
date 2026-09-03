@@ -166,10 +166,18 @@ def run(params: dict) -> str:
         # 2026-08-27 收口);拼进首行的分号由调用方补
         absent, absence_note = store_absence.stale_or_note(conn, only)
         absence_gap = f";{absence_note}" if absence_note else ""
+        # ⚠ `only` 下推进 SQL(2026-09-03):此前是"先全库扫、再在 Python 里
+        # filter",于是 `-p store=X` 与全量的数据库开销一模一样(生产实测
+        # 十几分钟)。链尾缺席店重赛逐店跑,这条路径尤其疼。
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0),
-                                         managed=managed)
+                                         managed=managed, only=only)
     if only:
+        # ⚠ 下推之后这两行**恒真**,但**故意保留**:它们是双保险 —— 万一将来
+        # 哪条按店取行的 SQL 漏了 `only`(加一条 provider 时最容易漏),后果只是
+        # "这一轮还是全库扫"这种慢,而不会变成"别的店的意图漏进单店这一轮"。
+        # 后者会顺着 withdraw_stale 的 store=only 撤销范围造出错误取证,而且
+        # 两边都不报错。删这两行之前先想清楚这个不对称。
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
     n_avoided = sum(1 for i in intents if i["store"] in absent)

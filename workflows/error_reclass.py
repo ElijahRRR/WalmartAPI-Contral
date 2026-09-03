@@ -41,11 +41,17 @@ L0 的 ASIN 闸读的仍是 `category`,新码**只是账**。让新码改变拦�
 
 ## 幂等与增量
 
-`taxonomy_version` 是增量谓词(同 `audit_runs.audit_version` 的套路):
-候选谓词恒为 `taxonomy_version IS DISTINCT FROM <当前 ERROR_TAXONOMY_VERSION>`,
-判过的行盖上版本号即**自动退出候选集** —— 跑一半中断直接重跑,不重复劳动;
-码表递增(`registry.ERROR_TAXONOMY_VERSION`)后再跑就是全量重判。
-`-p force=1` 无视版本号重判全部(码表没动但想复算时用)。
+两条判据**各司其职,缺一不可**(2026-09-03 踩过:把两件事当成一件):
+
+1. **断点续跑** —— `taxonomy_version IS DISTINCT FROM <当前
+   ERROR_TAXONOMY_VERSION>`:判过的行盖上版本号即退出候选集,跑一半中断
+   直接重跑不重复劳动;码表递增后再跑就是全量重判。
+   `-p force=1` **有意关掉这一条**,无视版本号重判全部;
+2. **翻页** —— 键集游标 `key > after`(`_pages`),**任何模式下都必须在**。
+
+⚠ 别把第 1 条当成分页:`force` 时它被 `true OR …` 短路,`ORDER BY key
+LIMIT n` 每轮都返回同一批,盖章也排不掉 —— 循环永不终止(实遇:进度打到
+**5,574 万**,表里只有 97,002 行),而第一批之后的数据一条都没碰。
 """
 
 import logging
@@ -74,6 +80,7 @@ SELECT id, raw_reason, error_code
 FROM audit.walmart_error_records
 WHERE ({force} OR taxonomy_version IS DISTINCT FROM %(ver)s)
   AND coalesce(raw_reason, '') <> ''
+  AND (%(after)s::bigint IS NULL OR id > %(after)s::bigint)
 ORDER BY id
 LIMIT %(chunk)s
 """
@@ -89,6 +96,7 @@ _SQL_BL_PICK = """
 SELECT asin, category, reason, src_sku
 FROM catalog.asin_blacklist
 WHERE ({force} OR taxonomy_version IS DISTINCT FROM %(ver)s)
+  AND (%(after)s::text IS NULL OR asin > %(after)s::text)
 ORDER BY asin
 LIMIT %(chunk)s
 """
@@ -221,6 +229,37 @@ def _sources(conn, asins: list[str], skus: list[str]) -> tuple[dict, dict, dict]
     return out[0], out[1], out[2]
 
 
+def _pages(conn, sql: str, ver: str, chunk: int, limit: int, execute: bool):
+    """输入:带键集游标的 PICK SQL → 逐批产出行(第 0 列必须是主键,且已 ORDER BY 它)。
+
+    ⚠ **翻页只能靠键集游标 `key > after`,不能靠「版本号已盖章」当排除条件。**
+    2026-09-03 实遇:`-p force=1` 时候选谓词被 `true OR …` **短路**掉,
+    `ORDER BY key LIMIT n` 每轮返回的都是**同一批**,UPDATE 盖了章也排不掉 ——
+    循环永不终止,进度打到 **5,574 万**(表里只有 97,002 行),而第一批之后的
+    数据**一条都没碰过**。看着像在干活,其实原地转圈。
+
+    两条判据各司其职,缺一不可:
+      · `taxonomy_version IS DISTINCT FROM ver` —— 断点续跑(跑一半中断不重复劳动),
+        `force` 时被有意关掉;
+      · `key > after` —— **翻页**,任何模式下都必须在,与 `force` 无关。
+    """
+    after, done = None, 0
+    while True:
+        take = chunk if not limit else min(chunk, limit - done)
+        if take <= 0:
+            return
+        with conn.cursor() as cur:
+            cur.execute(sql, {"ver": ver, "chunk": take, "after": after})
+            rows = cur.fetchall()
+        if not rows:
+            return
+        yield rows
+        done += len(rows)
+        after = rows[-1][0]          # 键集游标 = 本批最后一行的主键
+        if not execute:
+            return                   # 空跑不盖版本号 ⇒ 只取一批看形态
+
+
 def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
                   execute: bool, policy_names) -> list[str]:
     """回填 audit.walmart_error_records。返回摘要行。"""
@@ -229,15 +268,7 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     policies: Counter = Counter()      # 政策类别名(与主码正交的第二维)
     done = 0
     sql = _SQL_REC_PICK.format(force="true" if force else "false")
-    while True:
-        take = chunk if not limit else min(chunk, limit - done)
-        if take <= 0:
-            break
-        with conn.cursor() as cur:
-            cur.execute(sql, {"ver": ver, "chunk": take})
-            rows = cur.fetchall()
-        if not rows:
-            break
+    for rows in _pages(conn, sql, ver, chunk, limit, execute):
         ups = []
         for rid, raw, old in rows:
             code, policy, term = classify(raw, policy_names)
@@ -253,8 +284,6 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             conn.commit()
         done += len(rows)
         logger.info("报错记录回填进度 %d(本批 %d)", done, len(rows))
-        if not execute:
-            break        # 空跑不盖版本号 ⇒ 候选集恒定,再取一批就是同一批
     out = [f"▍audit.walmart_error_records:判了 {done} 条"]
     out += [f"    {n:>7}  {code}" for code, n in new_codes.most_common(15)]
     if policies:
@@ -283,15 +312,7 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     suspect: Counter = Counter()
     done = 0
     sql = _SQL_BL_PICK.format(force="true" if force else "false")
-    while True:
-        take = chunk if not limit else min(chunk, limit - done)
-        if take <= 0:
-            break
-        with conn.cursor() as cur:
-            cur.execute(sql, {"ver": ver, "chunk": take})
-            rows = cur.fetchall()
-        if not rows:
-            break
+    for rows in _pages(conn, sql, ver, chunk, limit, execute):
         asins = [r[0] for r in rows]
         skus = [r[3] for r in rows if r[3]]
         rec, ev, it = _sources(conn, asins, skus)
@@ -317,8 +338,6 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             conn.commit()
         done += len(rows)
         logger.info("黑名单回填进度 %d(本批 %d)", done, len(rows))
-        if not execute:
-            break
     out = [f"▍catalog.asin_blacklist:判了 {done} 条",
            "  原文来源(全文优先于样本):"
            + "  ".join(f"{k}={v}" for k, v in src_stat.most_common())]
@@ -361,7 +380,7 @@ def run(params: dict) -> str:
     scope, chunk, force, execute, limit = _parse(params)
     ver = resources.ERROR_TAXONOMY_VERSION
     pred = ("**force:无视版本号,全部重判**" if force else
-            "taxonomy_version IS DISTINCT FROM 当前版本(天然分页)")
+            "taxonomy_version IS DISTINCT FROM 当前版本(断点续跑)")
     head = [f"报错记录按新码重新归类(码表版本 {ver};"
             f"旧码 = problem_products 的 A-L / error_code)",
             f"候选谓词:{pred}"]

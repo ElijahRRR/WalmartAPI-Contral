@@ -155,3 +155,81 @@ def test_判了0条要说清是已经判过而不是没数据():
     assert "刚加了新列" in src
     assert "error_reclass -p force=1" in src
     assert "not force" in src                 # 给了 force 还判 0 条就是真没数据
+
+
+# ── ⑤ 翻页:2026-09-03 实遇的死循环 ─────────────────────────────────────────
+
+class _FakeCur:
+    """只实现一件事:按键集游标 `after` 返回下一批(第 0 列是主键)。
+
+    故意**不看 SQL 文本** —— 它验的是 `_pages` 有没有推进游标。SQL 里那句
+    `key > after` 由下面的静态断言单独钉。
+    """
+
+    def __init__(self, table, log):
+        self.table, self.log = table, log
+        self.rows = []
+
+    def execute(self, _sql, args):
+        after, take = args["after"], args["chunk"]
+        self.log.append(after)
+        rows = [r for r in self.table if after is None or r[0] > after]
+        self.rows = rows[:take]
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, table):
+        self.table, self.log = table, []
+
+    def cursor(self):
+        return _FakeCur(self.table, self.log)
+
+
+def test_pages_每行只发一次且会终止():
+    """⚠ 2026-09-03 实遇:`-p force=1` 时候选谓词被 `true OR …` **短路**,
+    `ORDER BY key LIMIT n` 每轮返回**同一批**,UPDATE 盖了章也排不掉 ——
+    循环永不终止,进度打到 **5,574 万**(表里只有 97,002 行),而第一批之后的
+    数据**一条都没碰过**。看着像在干活,其实原地转圈。
+
+    所以断点续跑(版本号)与翻页(键集游标)是**两件事**,`force` 只许关掉
+    前者。这条测试钉住后者:每行恰好发一次,且循环会自己停。
+    """
+    table = [(i, f"raw-{i}", None) for i in range(1, 251)]
+    conn = _FakeConn(table)
+    got = [r for batch in wf._pages(conn, "sql", "t.x", 100, 0, True)
+           for r in batch]
+    assert [r[0] for r in got] == list(range(1, 251))     # 每行恰好一次、按序
+    assert conn.log == [None, 100, 200, 250]              # 游标真的在推进
+
+
+def test_pages_空跑只取一批_limit真截断():
+    """空跑不盖版本号 ⇒ 再取一批还是同一批,所以只取一批看形态(老行为保留)。"""
+    table = [(i, "", None) for i in range(1, 251)]
+    assert sum(len(b) for b in
+               wf._pages(_FakeConn(table), "s", "v", 100, 0, False)) == 100
+    assert sum(len(b) for b in
+               wf._pages(_FakeConn(table), "s", "v", 100, 120, True)) == 120
+
+
+def test_两条PICK的SQL里都有键集游标():
+    """⚠ 光有 `_pages` 不够:SQL 少了 `key > after` 那一句,游标推进也没用,
+    每轮照样返回同一批。两张表都钉,主键类型也钉(NULL 起点要能比较)。"""
+    assert "%(after)s::bigint IS NULL OR id > %(after)s::bigint" in wf._SQL_REC_PICK
+    assert "%(after)s::text IS NULL OR asin > %(after)s::text" in wf._SQL_BL_PICK
+    for sql in (wf._SQL_REC_PICK, wf._SQL_BL_PICK):
+        assert "ORDER BY" in sql          # 键集分页的前提:按主键定序
+    # 两条 PICK 都不许再自己写 while 翻页(双轨禁止:翻页只有 `_pages` 一份)
+    import inspect
+    for fn in (wf._records_pass, wf._blacklist_pass):
+        src = inspect.getsource(fn)
+        assert "_pages(" in src, fn.__name__
+        assert "while True" not in src, fn.__name__

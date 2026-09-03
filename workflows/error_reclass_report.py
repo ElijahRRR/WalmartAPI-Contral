@@ -3,7 +3,9 @@
 用法:
   python cli.py error_reclass_report              # 全量对照,摘要打印 + 全文落盘
   python cli.py error_reclass_report -p limit=40  # 各清单在摘要里多列几行
-  python cli.py error_reclass_report -p scope=feed # 只跑 feed 侧(items/events/feed)
+  python cli.py error_reclass_report -p scope=feed # 只跑 feed 侧
+  python cli.py error_reclass_report -p scope=blacklist  # 只跑已拉黑的那批 ASIN
+       (scope ∈ all / items / events / feed / blacklist)
 
 为什么要有这条(方案 `docs/error_taxonomy.md` §五):新归类引擎
 `services/error_taxonomy.py` 已经写好,但**生产判定路径一个字都还没动** ——
@@ -59,11 +61,40 @@ LEFT JOIN ops.feed_items fi ON fi.feed_id = e.feed_id AND fi.sku = e.sku
 GROUP BY 1, 2, 3, 4
 """
 
+# ⚠ 第四面:**已经永久拉黑的那批 ASIN**(所有者 2026-09-03 问:「禁售占了 4 万多个
+# 产品,这些产品的具体报错我们重新按新规归类了吗?」)。前三面看的是**报错文本**
+# 会怎么改判,这一面看的是**已经产生后果的那批行**里有多少是按旧码拉黑的。
+# `category` 存的是入选那一刻的旧码(B/C/E/F/G/K 六类永久码,或历史导入的
+# `LEGACY`),`ON CONFLICT DO NOTHING` ⇒ **先到先得、永不回头改**,库里没有
+# 任何"按新码重判过"的痕迹。
+# ⚠ `reason` 是入选时截 200 字符的**样本**,不是全文:截断可能把判据串切掉
+#   (如 `appropriate product type selected` 在 200 字符外)⇒ 本面给的是**下限**。
+_SQL_BLACKLIST = """
+SELECT category, coalesce(reason, '') AS reason, count(*) AS n
+FROM catalog.asin_blacklist
+GROUP BY 1, 2
+"""
+
+#: 新码里**不是「这件商品本身违禁」**的那些:旧码把它们一律算作永久禁售拉黑,
+#: 而新引擎认得出病根另在别处。命中即"这条黑名单行的依据在新码下站不住"。
+#: 逐个理由:PT_WRONG=我方类目选错(沃尔玛明示改 product type)/ GATED=类目要
+#: 预审批(没资质≠商品违禁)/ CONTENT=文案图片不合标准 / INFO=信息缺失 /
+#: PRICE=价格规则 / SYSTEM=沃尔玛系统错误 / STAGE=未上线(中性)/ EXPIRED=过期。
+#: **保守起见 FLAGGED 与 OTHER 不进这一集**(前者沃尔玛不给理由、后者没判据,
+#: 都不能反过来断言"不是违禁")。
+_NOT_A_PRODUCT_BAN = ("PT_WRONG", "GATED", "CONTENT", "INFO",
+                      "PRICE", "SYSTEM", "STAGE", "EXPIRED")
+
 _SQL_POLICY = ("SELECT category_en FROM audit.walmart_prohibited_policy "
                "WHERE category_en IS NOT NULL ORDER BY category_en")
 
 _REPORT_FILE = "error_reclass_report.txt"
 _UNKNOWN_TARGET = 50        # 方案 §七.2 的验收线:unknown 全文清单 <50 条
+
+
+def _pct(a: int, b: int) -> str:
+    """输入:分子 + 分母 → 输出:`a/b = x%`;分母 0 给 `a/0 = —`(不编数)。"""
+    return f"{a}/{b} = {100.0 * a / b:.1f}%" if b else f"{a}/0 = —"
 
 
 def _fetch(cur, sql, args=None) -> list[tuple]:
@@ -234,6 +265,68 @@ def _load_policy_names(conn) -> list[str]:
     return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
 
 
+def blacklist_section(rows, policy_names, limit: int, full: bool) -> list[str]:
+    """输入:(旧码, reason 样本, 条数) 行 → 输出:黑名单面的对照文本行。
+
+    纯拼装 + 归类,零 I/O(拿假数据就能测)。回答的是所有者那一问:
+    **已经永久拉黑的那批 ASIN,按新码还站得住吗?**
+    """
+    total = sum(int(n) for _c, _r, n in rows)
+    no_text = sum(int(n) for _c, r, n in rows if not (r or "").strip())
+    by_cat: Counter = Counter()
+    matrix: Counter = Counter()
+    suspect: Counter = Counter()        # (旧码, 新码) → 条数;新码不是商品违禁
+    judged = 0
+    for cat, reason, n in rows:
+        n = int(n)
+        by_cat[cat or "(空)"] += n
+        text = (reason or "").strip()
+        if not text:
+            continue
+        judged += n
+        res = error_taxonomy.classify_reasons(
+            error_taxonomy.split_reasons(text), policy_names)
+        matrix[(cat, res.code)] += n
+        if res.code in _NOT_A_PRODUCT_BAN:
+            suspect[(cat, res.code)] += n
+
+    out = [f"▍catalog.asin_blacklist(**已经产生后果的那批行**):{total} 条",
+           "  ⚠ 这一面与前三面问的不是同一件事:前三面看**报错文本**会怎么改判,",
+           "     这一面看**已经按旧码永久拉黑**的 ASIN 里,有多少依据在新码下站不住。",
+           f"  入选时的旧码分布(`category`,入选那一刻写死、`ON CONFLICT DO "
+           f"NOTHING` 永不回头改):"]
+    for cat, n in by_cat.most_common(limit):
+        name = problem_products._RULES.get(cat, ("",))[0] if cat in \
+            problem_products._RULES else ("历史导入" if cat == "LEGACY" else "")
+        out.append(f"    {n:>7}  {cat}{(' ' + name) if name else ''}")
+    out += [f"  **没有报错样本、无法重判** {no_text} 条"
+            f"({_pct(no_text, total)};`reason` 为空 —— 历史导入那批本来就不带原文)",
+            f"  可重判(有 `reason` 样本){judged} 条 —— ⚠ 样本**截 200 字符**,"
+            f"判据串可能被切掉 ⇒ 下面的数是**下限**,不是精确值"]
+    if matrix:
+        out.append("  旧码 → 新主码(条数):")
+        for (cat, code), n in matrix.most_common(limit):
+            flag = "  ← 新码认为**不是商品违禁**" if code in _NOT_A_PRODUCT_BAN else ""
+            out.append(f"    {n:>7}  {cat} → {code}{flag}")
+    n_suspect = sum(suspect.values())
+    if n_suspect:
+        out += ["",
+                f"  ⚠ **依据在新码下站不住的黑名单行:{n_suspect} 条**"
+                f"({_pct(n_suspect, judged)} of 可重判)——",
+                "     旧码把它们算作永久禁售,新码认出病根另在别处"
+                "(类目选错 / 要资质 / 文案图片 / 信息缺失 …)。",
+                "     ⚠ **这不是自动翻案的授权**:黑名单是「一次入选、永久禁止」"
+                "的既定语义,",
+                "        改不改、怎么改是所有者的裁决;本报告只把账摆出来。"]
+        for (cat, code), n in suspect.most_common(limit):
+            out.append(f"       {n:>7}  {cat} → {code}")
+    if full and no_text:
+        out.append(f"  (无原文那 {no_text} 条要重判,只能回源头文本:"
+                   f"`catalog.walmart_items.unpublished_reasons` / "
+                   f"`catalog.product_events` —— 已删除的品可能已经没有了)")
+    return out
+
+
 def run(params: dict) -> str:
     limit = int(params.get("limit", 20))
     scope = str(params.get("scope", "all")).strip().lower()
@@ -246,6 +339,8 @@ def run(params: dict) -> str:
             events = (_fetch(cur, _SQL_EVENTS, (product_events.STATUS_CHANGED,))
                       if scope in ("all", "events") else [])
             feed = _fetch(cur, _SQL_FEED) if scope in ("all", "feed") else []
+            blist = (_fetch(cur, _SQL_BLACKLIST)
+                     if scope in ("all", "blacklist") else [])
 
     head = [f"报错归类新旧对照(码表版本 {resources.ERROR_TAXONOMY_VERSION};"
             f"旧引擎 = problem_products.categorize 的 A-L 码)",
@@ -268,8 +363,11 @@ def run(params: dict) -> str:
     if feed:
         summary += [""] + _feed_section(feed, policy_names, limit, False)
         body += [""] + _feed_section(feed, policy_names, limit, True)
-    if not (items or events or feed):
-        return "\n".join(head + ["", "三张表都没有可对照的行(库是空的?先跑 catalog_sync)"])
+    if blist:
+        summary += [""] + blacklist_section(blist, policy_names, limit, False)
+        body += [""] + blacklist_section(blist, policy_names, limit, True)
+    if not (items or events or feed or blist):
+        return "\n".join(head + ["", "四张表都没有可对照的行(库是空的?先跑 catalog_sync)"])
 
     if dry_run:
         summary.append("")

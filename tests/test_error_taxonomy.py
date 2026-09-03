@@ -582,3 +582,74 @@ def test_the_report_no_longer_carries_the_alias_health_line():
     src = inspect.getsource(wf)
     assert "_alias_notes" not in src and "别名表" not in src
     assert "政策表缺口" in src
+
+
+# ── 第四面:已经拉黑的那批 ASIN(所有者 2026-09-03 问的那件事)──────────────
+
+def test_黑名单面_把无原文与站不住的行分开报():
+    """⚠ 所有者原问:「禁售占了 4 万多个产品……这些产品的具体报错我们重新按新规
+    归类了吗?」答案是**没有**(新引擎一个生产写入路径都没接),而这一面把账摆出来。
+
+    三件事必须同时说清,少一件就会被误读成"可以批量翻案了":
+      ① `reason` 为空的行**无法重判** —— 历史导入那批本来就不带原文,
+         它多半是大头,不亮出来会让分母显得很小;
+      ② 有原文的也只是**截 200 字符的样本**,判据串可能被切掉 ⇒ 给的是**下限**;
+      ③ 新码认为"不是商品违禁"的行要单独点名,但**不等于授权翻案** ——
+         黑名单是「一次入选、永久禁止」的既定语义,改不改是所有者的裁决。
+    """
+    from workflows import error_reclass_report as wf
+
+    rows = [
+        ("B", "prohibited product. Walmart's Prohibited Products Policy: Alcohol.", 120),
+        # 旧码算永久禁售,新码认出病根是我方类目选错
+        ("B", "may be a prohibited product. Please make sure the appropriate "
+              "product type selected for this item.", 30),
+        # 旧码 F(限类)也进永久黑名单,新码是 GATED:没资质 ≠ 商品违禁
+        ("F", "This is a restricted category that requires pre-approval.", 9),
+        ("LEGACY", "", 4100),          # 历史导入:无原文,重判不了
+    ]
+    txt = "\n".join(wf.blacklist_section(rows, ["Alcohol"], 20, True))
+    assert "catalog.asin_blacklist" in txt
+    assert "4100 条" in txt and "无法重判" in txt          # ①
+    assert "下限" in txt and "200 字符" in txt              # ②
+    assert "站不住的黑名单行:39 条" in txt                  # ③ = 30 + 9
+    assert "不是自动翻案的授权" in txt
+    assert "B → PT_WRONG" in txt and "F → GATED" in txt
+    # 真·商品违禁那两条不许被点名
+    assert "B → POLICY  ←" not in txt
+
+
+def test_黑名单面_全是真违禁时不报那一段():
+    """一条站不住的都没有 → 不出「站不住」那一段(别给读的人加噪声,
+    也别让人以为报告坏了)。"""
+    from workflows import error_reclass_report as wf
+
+    txt = "\n".join(wf.blacklist_section(
+        [("B", "Prohibited Products Policy: Alcohol.", 5)], ["Alcohol"], 20, True))
+    assert "站不住的黑名单行" not in txt        # 那一段整段不出
+    assert "不是自动翻案的授权" not in txt
+    assert "B → POLICY" in txt
+
+
+def test_新归类引擎还没接进任何生产写入路径():
+    """⚠ 这条钉的是**现状**,不是理想态:`services/error_taxonomy` 至今只被
+    报告(error_reclass_report)与评估(audit_replay)消费,判定/落库路径跑的
+    仍是 `problem_products.categorize` 那套 A-L 码。
+
+    换轨那天要连这条测试一起改 —— 改不动它说明换轨没做完;
+    而它要是被悄悄删掉,"我们已经按新规归类了"就会变成一句没人验证的话。
+    """
+    import pathlib
+    hits = set()
+    for f in pathlib.Path(".").rglob("*.py"):
+        if "__pycache__" in str(f) or f.parts[0] == "tests":
+            continue
+        if "error_taxonomy" in f.read_text(encoding="utf-8"):
+            hits.add(str(f))
+    hits -= {"services/error_taxonomy.py", "services/policy_names.py",
+             "registry/resources.py"}
+    assert hits == {"workflows/error_reclass_report.py",
+                    "workflows/audit_replay.py"}, sorted(hits)
+    # 写黑名单那条路仍吃旧码:PERMANENT 是 A-L 里的六个单字母
+    from services import blacklist
+    assert blacklist.PERMANENT == {"B", "C", "E", "F", "G", "K"}

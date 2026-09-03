@@ -325,3 +325,78 @@ join 全中,在架面 715/729 —— 剩 14 条全是同一个名字被截成
 (⚠ **2026-09-03 C 批**:别名表整体退役,这两行提示随之删除 —— 改名已经落地,
 "别名健康"这个概念不存在了。)
 §十第 1 条(武器族)已由政策表数据补齐,第 2 条(Cosmetics)由 `norm_category` 单复数归一吃掉。
+
+---
+
+## 十、第四面:已经拉黑的那批 ASIN(2026-09-03 所有者问)
+
+所有者原问:「**禁售占了 4 万多个产品,禁售涵盖哪些报错类型?我们重新对后台
+报错进行了归类,这些产品的具体报错我们重新按新规归类了吗?**」
+
+### 10.1 先回答第二问:**没有,一条都没有重判**
+
+新引擎 `services/error_taxonomy` 至今只有**两个消费者**,都不写判定结果:
+
+| 消费者 | 干什么 | 写不写库 |
+|---|---|---|
+| `workflows/error_reclass_report` | 新旧并排对照报告 | 只落报告文件 |
+| `workflows/audit_replay` | 回放抽样时给反例贴期望类别 | 只写 `audit.replay_results` |
+
+**生产写入路径跑的仍是 `services/problem_products.categorize()` 那套 A–L 单字母
+码**(`problem_scan` / `feed_track` → `blacklist.record_asins` →
+`catalog.asin_blacklist`)。而且黑名单是 `ON CONFLICT (asin) DO NOTHING`
+——「一次入选、永久禁止」,`category` 写死在入选那一刻,**库里没有任何按新码
+重判过的痕迹**。守门测试 `test_新归类引擎还没接进任何生产写入路径` 钉住这个现状:
+换轨那天要连它一起改;它要是被悄悄删掉,「我们已经按新规归类了」就会变成一句
+没人验证的话。
+
+### 10.2 再答第一问:旧「禁售」= B 码,它涵盖这些串
+
+`problem_products._RULES["B"]`(只有命中这几串之一才算 B):
+
+`prohibited product policy` / `prohibited due to` + `walmart` /
+`for violating walmart's marketplace` / `reference code biz` / `cpsc recall` /
+`safety warning` / `circumvent walmart`
+
+⚠ B 在 `_SEVERITY_ORDER` 里排**倒数第二**(`C D E F G H I J K L B A`)——
+它是"更具体的都没中才落到我头上"的通用桶。
+
+进永久黑名单的不止 B:`PERMANENT = {B 禁售, C 品牌, E 知产, F 限类, G 药品,
+K 审查}`,另有历史导入的 `LEGACY` 一档(`asin_blacklist_import`,`reason` 为空)。
+
+### 10.3 旧 B 在新码下散成五种(仓内生产语料实测)
+
+`tests/fixtures/reason_corpus.jsonl` 77 条 provenance=prod 的真实串,
+两套引擎并排跑:
+
+| 新码 | 条数 | 是不是"这件商品违禁" |
+|---|---|---|
+| `POLICY` | 23 | 是 |
+| **`PT_WRONG`** | **4** | **否 —— 我方类目选错,沃尔玛明示改 product type** |
+| `RECALL` | 1 | 是 |
+| **`GATED`** | **1** | **否 —— 类目要预审批,没资质 ≠ 商品违禁** |
+| **`CONTENT`** | **1** | **否 —— 文案/图片不合标准,改了就能上** |
+
+⚠ **这是"不同文本形状"的分布,不是按 ASIN 加权的分布** —— 77 条是去重后的
+串型,真实占比要在生产库上按条数算(见 10.4)。反方向也有:旧引擎判不出的
+`Z 其他` 10 条,在新码下有 `PROHIBITED_FINAL` / `BRAND` —— 那是**旧引擎漏拉黑**
+的一面。
+
+### 10.4 怎么拿到真实数字
+
+`error_reclass_report` 加了第四面(2026-09-03):
+
+```bash
+python cli.py error_reclass_report -p scope=blacklist
+```
+
+它报三件事,**缺一件就会被误读成"可以批量翻案了"**:
+
+1. **`reason` 为空、无法重判的条数** —— 历史导入那批本来就不带原文,多半是大头;
+2. 有原文的也只是**截 200 字符的样本**,判据串可能被切掉 ⇒ 给的是**下限**;
+3. 新码认为"不是商品违禁"的行单独点名 —— 但**不等于授权翻案**:黑名单是
+   「一次入选、永久禁止」的既定语义,改不改、怎么改是所有者的裁决,报告只摆账。
+
+判"不是商品违禁"的新码集合 `_NOT_A_PRODUCT_BAN` = PT_WRONG / GATED / CONTENT /
+INFO / PRICE / SYSTEM / STAGE / EXPIRED。⚠ **`FLAGGED` 与 `OTHER` 故意不进这一集**:
+前者沃尔玛不给理由、后者没判据,都不能反过来断言"不是违禁"。

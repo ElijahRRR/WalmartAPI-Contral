@@ -966,3 +966,48 @@ def test_judge_reject写缓存且分数不由L3动(monkeypatch):
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), conn)
     assert r.verdict == "reject" and len(conn.put_log) == 1
     assert all(h.penalty == 0 for h in r.hits)
+
+
+def test_S1_缺证即禁_写在Prohibited列的那一半也要判():
+    """⚠ 2026-09-03 实遇(`B0FH2CYMGW` 儿童床架):`product_is` 认对了
+    「儿童床架(家具)」,却仍判 pass、置信 high。
+
+    根因是**框架缺口,不是这个产品特殊**:C 类的触发面原来只绑在
+    「Allowed with restriction」那一列上,而儿童产品那篇根本没有这一列 ——
+    它把同一件事写在 **Prohibited 列**、拴在「缺 CPC」上
+    (`…any children's product that doesn't have a valid CPC`)。
+    44 篇里有 21 篇只有 Prohibited | Allowed 两列,全靠这第二种写法。
+
+    刹车同样要钉死:政策若把**适用范围**推给末尾原文之外的清单(通用消费品那篇
+    只说 "regulated consumer product",具体哪些要查另一份监管目录),就**判不出
+    → pass** —— 这是「判据只有末尾原文」的直接推论。少了这条刹车,
+    模型会拿"受监管消费品"去连坐整个目录。
+    """
+    s1 = audit_l3._S1
+    for must in (
+            # 第二种写法(漏的就是它)
+            "把禁令拴在「缺这份文件」上",
+            "doesn't have a valid",
+            "只有 Prohibited | Allowed 两列",
+            # 不去 listing 里找"缺失"的证据
+            '不要去 listing 里找"没有证书"的证据',
+            # 刹车:表不在手里就不许猜
+            "推给了末尾原文之外的清单 → 判不出 → pass",
+            "不许猜谁在表上",
+            # 反向护栏:本体定了就要用(B0FH2CYMGW 那条的病)
+            "定了又不用,等于白定"):
+        assert must in s1, must
+    # 两条老护栏不许被这一节吃掉
+    assert "拿不准不拒" in s1 and "按类目名连坐整类" in s1
+    # 顺序:先定本体 → 三类命中(C 类要引用本体的结论)
+    assert s1.index("# 先定") < s1.index("## C. 附条件允许")
+
+
+def test_S1_适用范围两个方向都举了例_不是产品清单():
+    """所有者 2026-09-03 否过一次"专属某些产品的判断"。这一节给的是
+    **怎么读政策的适用范围条款**(判得出 / 判不出各一个方向),不是产品名单 ——
+    钉住"两个方向都在",防止以后只留下会拒的那一半。"""
+    s1 = audit_l3._S1
+    body = s1[s1.index("## C. 附条件允许"):s1.index("# 输出的五段")]
+    assert "落进去了" in body and "→ reject" in body      # 判得出的方向
+    assert "判不出 → pass" in body                        # 判不出的方向

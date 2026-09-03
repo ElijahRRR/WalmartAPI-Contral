@@ -724,7 +724,13 @@ def test_real_run_names_both_knock_on_consequences(monkeypatch):
 
       ① AUDIT_RULES_VERSION:**已由本批递增**,摘要要说清"首跑无需再手动递增",
          否则人会照旧手动再提一版,白白触发第二轮全量重审;
-      ② 新增行人工中文列全 NULL ⇒ S4 渲染出空壳标题(有类别名、没判据)。
+      ② 新增行人工中文列全 NULL ⇒ **判据完整、立刻生效**(B1 起 S4 读
+         `full_policy`,中文列判定链一处都不读);真正要紧的是反面 ——
+         `full_policy` 为空的行会被 S4 整条跳过。
+
+    ⚠ ② 这条 2026-09-03 改过口径:此前写的是「S4 渲染出空壳标题,等运营填中文
+    才有用」,那是 B1 之前 S4 读六个中文列的老口径。所有者真跑内容族两页时照着
+    它读,会以为那两条政策还没生效 —— 而它们当场就在判据里。**旧措辞不许回来**。
 
     原第三条(audit_l3 硬写「37 条」)已随本批动态化 —— 提示词不再有对不上的
     字面量,**这条提醒必须消失**:留着就是叫人去改一个已经不存在的问题。
@@ -734,7 +740,9 @@ def test_real_run_names_both_knock_on_consequences(monkeypatch):
     assert "AUDIT_RULES_VERSION" in out and "L3 输入已变更" in out
     assert "registry/resources.py" in out
     assert resources.AUDIT_RULES_VERSION in out and "首跑无需" in out
-    assert "空壳标题" in out and "人工中文列全是 NULL" in out
+    assert "人工中文列全是 NULL" in out and "判据完整" in out
+    assert "full_policy" in out and "判定链一处都不读" in out
+    assert "空壳标题" not in out          # ← 老口径,回来了就是在骗跑的人
     assert "连带后果两条" in out
     assert "37 条" not in out and "audit_l3.py" not in out
     # ⚠ 成本必须**写在摘要里**:政策表一改,L3 的 system prompt 就变,

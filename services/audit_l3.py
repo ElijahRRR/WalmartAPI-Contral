@@ -128,7 +128,21 @@ _S1 = """你是沃尔玛 Marketplace 合规审核 AI(站在沃尔玛官方立场
 - 原文没写的事**不判违规**:引不出条款就是没有依据。
 - 默认 pass。只有「原文条款」与「产品原文证据」两样都拿得出来时才 reject。
 
-# 判定的两类命中(别把"要证据"误读成"标题必须明示违规用途")
+# 先定"本体":政策判的是这件商品**本身是什么**
+
+判任何一条之前,先在心里用一句话说清:顾客买的这件商品**作为商品**是什么。
+政策适用于**本体**,不适用于它的部件、兼容对象、使用场景、图案装饰:
+
+- 带 USB 口和电源插座的**柜子** → 本体是家具,不是电子设备;那两样是配置,
+  不因此适用电子/射频类政策;
+- 标题写 "for iPad" 的**收纳架** → 本体是收纳架,不是苹果产品;
+- 反过来:标题写 "Kids Picnic Table" 的桌子 → 本体就是**儿童家具** ——
+  面向谁、按谁的尺寸做的,是商品定义的一部分,不是"场景提及"。
+
+一句话:**带某个部件 ≠ 是那类设备;提到某个东西 ≠ 是那个东西;
+而面向谁做的,就是本体的一部分。**
+
+# 判定的三类命中(别把"要证据"误读成"标题必须明示违规用途")
 
 ## A. 品类/设备/物料整体禁售(政策直接禁这个东西本身,不论用途)
 政策条款列出的是**具体产品品类/设备名/物料名** → 产品本质就是这类东西即 reject。
@@ -138,33 +152,67 @@ _S1 = """你是沃尔玛 Marketplace 合规审核 AI(站在沃尔玛官方立场
 必须在产品原文里找到那个特征的证据(如有绳窗帘要 "corded";儿童用品要有
 ≤12 岁使用的证据)。找不到证据 → pass。
 
-# 输出的三段:判定结果 / 类别 / 具体内容
+## C. 附条件允许(政策不禁它,但要求证书 / 预审批 / 注册 / 检测报告)
+官方原文的「Allowed with restriction」那一列,以及正文里 must be certified /
+must comply with / requires approval / must be registered / prior authorization
+这类措辞,说的都是**满足条件才能卖**。而本卖家的条件是固定的(见开头):
+中国搬运模式、无任何证书与认证、无品牌授权、拿不到任何预审批 —— 这类条件
+一概满足不了。所以:
 
+- 政策对**本体**提出了这类要求(先过上面那节的本体判定)→ reject,
+  `policy` 填提出该要求的那篇政策;
+- 要求针对的是本体之外的东西(某个部件、某个可选配件)→ 不适用 → pass;
+- 原文证据不足以判断本体是否落进适用范围 → pass(拿不准不拒)。
+
+⚠ 别把「附条件允许」读成「允许」:那一列的前提是我们办不到的事。
+⚠ 也别反过来连坐:政策没对这个本体提要求的,不许因为"同类目里别的东西要证"
+  就拒(那是按类目名连坐整类,已经吃过亏)。
+
+# 输出的五段:本体 / 判定结果 / 类别 / 政策原句 / 具体内容
+
+判定要能被人复查,所以每一段都要落到纸面:哪一步判错了,看输出就知道。
+
+- `product_is`:一句话说清**本体**(按上面那节的判法),中文,≤40 字。
+  **pass 也要填** —— 判对的留痕,判错的一眼看得出错在哪一步。
+  例:"带 USB 口与插座的实木收纳柜(家具)"、"面向儿童的户外野餐桌(儿童家具)"。
 - `verdict`:`pass` 或 `reject`,只有这两个值。
 - `policy`:**逐字抄**下面「候选类别」清单里的一项 —— 一个字母、一个空格、
   一个逗号都不许改(它是我们跟沃尔玛对话的口径,拼错了申诉时对方查无此类)。
   verdict=pass 时填 `none`;清单里找不到能覆盖它的一项 = 这不是违规 → pass。
+- `policy_quote`:把**触发判定的那一句政策原文逐字抄回来**(末尾原文里的英文
+  原句,不翻译、不转述、不把两句拼一起)。抄不出原句 = 你手里根本没有条款
+  → verdict 应当是 pass。verdict=pass 时留空字符串。
 - `detail`:中文,≤120 字,两样缺一不可 ——
   ① **引用触发判定的原文片段**(标题/五点/描述里的那一句,**保留原语言**,
-     不要翻译、不要转述);② 触犯的条款要点(哪条政策、禁什么)。
-  例:标题写 "Distillation Apparatus for essential oil",Alcohol 政策禁蒸馏设备。
+     不要翻译、不要转述);② 触犯的条款要点(哪条政策、禁什么、属 A/B/C
+     哪一类命中)。
+  例:标题写 "Distillation Apparatus for essential oil",本体是蒸馏设备,
+  Alcohol 政策 A 类整体禁售。
 
-# 品牌证据怎么判(brand_verdicts)
+# 品牌证据怎么判(brand_verdicts:**只列你判定为真品牌的那几个**)
 
-「上游证据」里列出的品牌/商标词,**逐个**给判定:
+「上游证据」里列出的品牌/商标词,**逐个在心里过一遍**;输出里**只留**判成
+真品牌(`is_real_brand: true`)的那几个,判成 false 的一个都不要写出来。
+一个真品牌都没有 → 给 `[]`,那就是"品牌这一维没问题"。
 
 - **提到 ≠ 卖的就是它**:`compatible with X` / `fits X` / `replacement for X` /
   `for X` 这类兼容、适配、对比提及,是在说配件适用范围,**不是**品牌误用,
-  也不是冒充 X —— 除非文案同时自称是 X 的正品 / 授权 / OEM。
+  也不是冒充 X —— 这类词**不进列表**,除非文案同时自称是 X 的正品/授权/OEM。
 - 通用英文词(top / floor / summer / modern / classic 之类)被黑名单收进来是
-  常事,按上下文判 `is_real_brand=false`。
-- 真品牌的信号:品牌名后紧跟型号(如 "Dyson V6")、"100% Authentic <大牌>"、
-  自称 Official / Licensed / Authorized / OEM —— 搬运卖家客观上拿不到大牌授权,
-  任何"授权声明"都按虚假宣称处理。
-- `evidence` 一句话说清依据的是哪段原文。
+  常事,它们**不进列表**。
+- 进列表的信号(有其一才算真品牌):品牌名后紧跟型号(如 "Dyson V6")、
+  "100% Authentic <大牌>"、自称 Official / Licensed / Authorized / OEM ——
+  搬运卖家客观上拿不到大牌授权,任何"授权声明"都按虚假宣称处理。
+- `evidence` 一句话说清**是哪段原文**让你判它是真品牌(引那一句)。
+- ⚠ **`evidence` 与 `is_real_brand` 必须自洽**:evidence 里说的若是兼容 / 适配 /
+  提及 / 使用场景 / 通用词,那它就**不是**真品牌 —— 不许写进列表(硬写进去 =
+  两者打架,一律按 `false` 处理)。列表里每一条的 `is_real_brand` 都必须是
+  `true`。一个词判错,整件商品会被翻成知产侵权,而真正的问题反而没人看见。
 
 # 本 PT 的沃尔玛准入要求怎么判
 
+这一节是**补充信息**,不是 C 类的前提:证书要求本来就写在末尾的政策原文里,
+按 C 类判即可;这一行有就用、没有也不影响判定。
 user 段若出现「本 PT 的沃尔玛准入要求」一行,那是沃尔玛对这个**类目**登记的
 要求(常含证书 / 检测报告 / 注册号)。顺序只有一条:
 
@@ -180,11 +228,13 @@ user 段若出现「本 PT 的沃尔玛准入要求」一行,那是沃尔玛对�
 # 输出规范(严格 JSON,只输出这一个对象)
 
 {
+  "product_is": "<中文 ≤40 字:顾客买的这件商品作为商品是什么;pass 也要填>",
   "verdict": "pass" | "reject",
   "policy": "<候选类别之一,逐字;verdict=pass 时填 'none'>",
-  "detail": "<中文 ≤120 字:原文片段 + 条款要点;pass 时可留空>",
+  "policy_quote": "<触发判定的那一句政策英文原文,逐字;pass 时填 ''>",
+  "detail": "<中文 ≤120 字:产品原文片段 + 条款要点;pass 时可留空>",
   "brand_verdicts": [
-    {"brand": "<上游证据里的词>", "is_real_brand": true|false, "evidence": "<依据>"}
+    {"brand": "<判定为真品牌的词>", "is_real_brand": true, "evidence": "<引原文那一句>"}
   ],
   "confidence": "high" | "medium" | "low"
 }
@@ -193,7 +243,8 @@ user 段若出现「本 PT 的沃尔玛准入要求」一行,那是沃尔玛对�
 
 - 默认 verdict=pass,只有清晰证据才 reject;
 - `policy` 必须逐字取自下面的候选类别清单(pass 时 `none`),不自造类别名;
-- brand_verdicts 只判「上游证据」里列出的词(最多 10 个),不凭空添加品牌;
+- brand_verdicts 只判「上游证据」里列出的词(最多 10 个),不凭空添加品牌,
+  且**只写判成真品牌的那几个**(没有就 `[]`);
 - 不输出 JSON 之外的任何文字。
 
 # 候选类别(verdict=reject 时必选其一)
@@ -572,12 +623,16 @@ Amazon 类目: {product.amazon_category_path or '(空)'}
 
 @dataclass
 class L3Result:
-    """L3 语义审核结果(三段输出:verdict / policy / detail)。
+    """L3 语义审核结果(五段输出:product_is / verdict / policy / policy_quote
+    / detail)。
 
     verdict:'pass' / 'reject' / 'pending';hits 至多一条且 penalty 恒 0
     (L3 不动分数,score_final 始终是 L2 的值)。
     policy 落 `audit_runs.l3_reason_category`(列名不改,语义 = 类别枚举),
     detail 落 `l3_reason_text`(列名不改,语义 = 具体内容)。
+    **product_is(本体)与 policy_quote(政策原句)是排查面**(2026-09-03
+    所有者要求):reject 时随 hit.detail 落 `audit_hits`(`audit_why` 自动摊开),
+    pass 时只进日志 —— 判错时能一眼看出错在"本体认错"还是"条款引错"。
     raw 是 LLM 原始 dict,不落库。
     """
 
@@ -586,6 +641,8 @@ class L3Result:
     detail: str | None = None
     brand_verdicts: list = field(default_factory=list)
     confidence: str = "medium"
+    product_is: str | None = None
+    policy_quote: str | None = None
     raw: dict = field(default_factory=dict)
     hits: list[RuleHit] = field(default_factory=list)
 
@@ -596,6 +653,8 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 NO_POLICY = "none"          # pass 的类别位(不是政策,也不落 audit_reason)
 MAX_DETAIL = 500            # 提示词要求 ≤120 字,落库上限给 500(截断不改判定)
+MAX_PRODUCT_IS = 200        # 本体一句话,提示词要求 ≤40 字(同上,截断不改判定)
+MAX_POLICY_QUOTE = 600      # 政策原句(英文一句),抄长了截断,不改判定
 MAX_RAW_SNIPPET = 300
 MAX_ERROR_SNIPPET = 500
 
@@ -630,11 +689,17 @@ def _pending(detail_text: str | None, rule_code: str, detail: dict,
 
 
 def _reject(policy: str, detail: str | None, brand_verdicts: list,
-            confidence: str, raw: dict) -> L3Result:
-    """输入:类别 + 具体内容 + 品牌判定 + 置信 + 原始 dict → 输出:reject 形态。
+            confidence: str, raw: dict, product_is: str | None = None,
+            policy_quote: str | None = None) -> L3Result:
+    """输入:类别 + 具体内容 + 品牌判定 + 置信 + 原始 dict(+ 本体 + 政策原句)
+    → 输出:reject 形态。
 
     两条 reject 出口(LLM 答的类别对上枚举 / 品牌翻拒)共用**同一份**落库形状:
-    hit 五键定序是落库契约,分两处写就是加一个键漏改一处。
+    hit 七键定序是落库契约,分两处写就是加一个键漏改一处。
+    ⚠ 后两键(`product_is` / `policy_quote`)是 2026-09-03 加的**排查面**:
+    判错时要能分清是"本体认错"还是"条款引错"(`audit_why` 把 detail 原样摊开,
+    加键即可见,不必再改渲染)。品牌翻拒那条出口是确定性后处理,`policy_quote`
+    天然为空 —— 空值 `_fmt_hit` 本来就不打,不占版面。
     """
     return L3Result(
         verdict="reject",
@@ -642,17 +707,21 @@ def _reject(policy: str, detail: str | None, brand_verdicts: list,
         detail=detail,
         brand_verdicts=brand_verdicts,
         confidence=confidence,
+        product_is=product_is,
+        policy_quote=policy_quote,
         raw=raw,
         hits=[RuleHit(
             stage="L3",
             rule_code=f"llm_{_slug_category(policy)}",
             penalty=0,   # L3 不扣分, 直接决定 verdict
-            detail={     # 五键定序是落库契约
+            detail={     # 七键定序是落库契约
                 "policy": policy,
                 "detail": detail,
                 "confidence": confidence,
                 "brand_verdicts": brand_verdicts,
                 "prompt_version": resources.AUDIT_RULES_VERSION,
+                "product_is": product_is,
+                "policy_quote": policy_quote,
             },
         )],
     )
@@ -673,8 +742,12 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
       4. reject → `policy` 经 `policy_names.resolve` 对枚举解析,命中回**表内
          原拼写**;**对不上 → pending `llm_bad_policy`**(不猜、不降级:猜出来
          的类别会一路落库、进飞书、进申诉口径,而没有任何东西会红);
-      5. reject 落 1 条 L3 hit,rule_code = `llm_<policy slug>`,detail 五键定序
-         `{policy, detail, confidence, brand_verdicts, prompt_version}`。
+      5. reject 落 1 条 L3 hit,rule_code = `llm_<policy slug>`,detail 七键定序
+         `{policy, detail, confidence, brand_verdicts, prompt_version,
+         product_is, policy_quote}`。
+
+    `product_is`(本体)与 `policy_quote`(政策原句)不参与任何判定 —— 它们只
+    是排查面(2026-09-03 所有者要求):**取不到就是 None,绝不因此改判**。
     """
     # ⚠ 非 dict 也走这条路(不是防御性编程,是**可达路径**):`llm_cache` 里
     # 若躺着一行坏值(历史脏数据 / 手工改过的 JSON),`cached` 拿回来的可能是
@@ -695,6 +768,12 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
                         raw)
 
     detail = str(raw.get("detail") or "").strip()[:MAX_DETAIL] or None
+
+    # 排查面两段:不参与判定,取不到就是 None(老缓存里没有这两个键,
+    # 命中时照旧解析出结论 —— 缺排查信息不是坏 JSON,不许因此 pending)
+    product_is = str(raw.get("product_is") or "").strip()[:MAX_PRODUCT_IS] or None
+    policy_quote = (str(raw.get("policy_quote") or "").strip()[:MAX_POLICY_QUOTE]
+                    or None)
 
     brand_verdicts = raw.get("brand_verdicts") or []
     if not isinstance(brand_verdicts, list):
@@ -719,11 +798,13 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
         logger.info("L3 verdict override: pass→reject, is_real_brand=true: %s",
                     [v.get("brand") for v in real_brand_hits])
         return _reject(resources.AUDIT_IP_POLICY, f"未授权引用品牌名 {first}",
-                       brand_verdicts, confidence, raw)
+                       brand_verdicts, confidence, raw,
+                       product_is=product_is, policy_quote=policy_quote)
 
     if verdict == "pass":            # pass 没有类别(prompt 也这么要求)
         return L3Result(verdict="pass", policy=NO_POLICY, detail=detail,
                         brand_verdicts=brand_verdicts, confidence=confidence,
+                        product_is=product_is, policy_quote=policy_quote,
                         raw=raw)
 
     hit_policy = policy_names.resolve(policy, allowed)
@@ -734,14 +815,36 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
         logger.warning("L3 policy %r 不在类别枚举里 → pending(不猜类别)", policy)
         return _pending("L3 政策类别对不上枚举, 待人工复核", "llm_bad_policy",
                         {"policy": policy[:MAX_RAW_SNIPPET],
-                         "detail": detail}, raw)
+                         "detail": detail,
+                         "product_is": product_is,
+                         "policy_quote": policy_quote}, raw)
 
-    return _reject(hit_policy, detail, brand_verdicts, confidence, raw)
+    return _reject(hit_policy, detail, brand_verdicts, confidence, raw,
+                   product_is=product_is, policy_quote=policy_quote)
 
 
 # =============================================================
 # 入口
 # =============================================================
+
+
+def _log_result(asin: str, result: L3Result, *, cached: bool) -> L3Result:
+    """输入:asin + L3Result → 输出:原样返回(只多打一行 INFO)。
+
+    为什么每个产品都打一行(2026-09-03 所有者要求「输出有明细方便我们排查」):
+    **pass 不落 hit**,本体与政策原句在库里没有任何落点 —— 而误放行恰恰是靠
+    "它把本体认成了什么"才看得出来的。日志两处都到(屏幕 + `logs/<workflow>.log`,
+    见 cli.py),dry-run 也照打(dry-run 一个字都不写库)。
+    品牌只打**真品牌**那几个词(提示词已要求只输出这几个)。
+    """
+    brands = [v.get("brand") for v in result.brand_verdicts
+              if isinstance(v, dict) and v.get("is_real_brand") is True]
+    logger.info(
+        "L3 %s %s%s 本体=%r 类别=%s 原句=%r 具体=%r 真品牌=%s 置信=%s",
+        asin, result.verdict, "(缓存)" if cached else "",
+        result.product_is, result.policy, result.policy_quote,
+        result.detail, brands or "无", result.confidence)
+    return result
 
 
 def judge_l3(product, l1, l2, ctx, conn, *, phase0=None) -> L3Result:
@@ -777,7 +880,8 @@ def judge_l3(product, l1, l2, ctx, conn, *, phase0=None) -> L3Result:
                               purpose=L3_PURPOSE)
     cached = llm_cache.get(conn, key)
     if cached is not None:
-        return parse_l3_reply(cached, allowed)
+        return _log_result(product.asin, parse_l3_reply(cached, allowed),
+                           cached=True)
 
     try:
         raw = _llm_api.chat_json(messages, temperature=L3_TEMPERATURE,
@@ -798,7 +902,7 @@ def judge_l3(product, l1, l2, ctx, conn, *, phase0=None) -> L3Result:
     result = parse_l3_reply(raw, allowed)
     if result.verdict != "pending":
         llm_cache.put(conn, key, raw, purpose=L3_PURPOSE)
-    return result
+    return _log_result(product.asin, result, cached=False)
 
 
 __all__ = [

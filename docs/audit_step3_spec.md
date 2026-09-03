@@ -132,6 +132,7 @@ pass → `none`;pending → 类别为 NULL(具体内容写待定原因)。**没�
   5. reject 落 1 条 L3 hit,`rule_code = "llm_" + slug(policy)`,detail 五键定序改为
      `{policy, detail, confidence, brand_verdicts, prompt_version}`(`prompt_version` =
      `AUDIT_RULES_VERSION`,给回放与 audit_why 对版本)。
+     **⚠ 2026-09-03 已扩到七键**:末尾追加 `product_is` / `policy_quote`(§八)。
 - `L3Result` 字段随 schema 改名;`raw` 仍不落库;pending 不写 `llm_cache`(不变)。
 
 ### 3.4 三段落库与投影 —— **B1 已落地**
@@ -551,3 +552,81 @@ python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 9
   (`services/product_ingest.py:42-67`,`refdata/schema.sql:60-63`);`sku=asin` 裸等值仍在
   `workflows/product_audit.py:409-411` 与 `refdata/schema.sql:527`,规则唯一出处 `services/sku_asin.py`;
 - 缓存键含整段 messages:`services/llm_cache.py:28-44`;调度:`registry/schedule.py:167-203`。
+
+---
+
+## 八、人工验收回改与验收集(2026-09-03,版本 `c.2026-09-03.2`)
+
+C 批合并后,所有者拿 11 个在架 ASIN 跑 `product_audit -p asins=… --dry-run`,
+**逐个人工看过产品页**给出判断。下面 8 条是那次人工判定的原话归纳,
+**它就是验收集**:提示词以后怎么改,都要拿这 8 条重跑对一遍。
+
+### 8.1 验收集(人工判定 = 基准,不是新链的结论)
+
+| ASIN | 人工判定 | 人工给的理由 |
+|---|---|---|
+| `B0F21HVDDN` | **pass** | 正常柜子;USB 充电端口与 2 个电源插座只是这个柜子的**配置**,不是整机电器 |
+| `B0DFY42VDL` | **pass** | 正常产品 |
+| `B0F6YH7ZX4` | **pass** | 同 `B0F21HVDDN`,正常柜子 |
+| `B0FBX3JR3Y` | **reject** | 明确是儿童产品 |
+| `B0DSCQJ698` | **reject** | 明确是儿童产品 |
+| `B0GYNRCZ9F` | **reject** | 未授权引用品牌名 `abba` |
+| `B0015XDK30` | **reject** | 标题含 ®/™ 商标符号(政策:Intellectual Property) |
+| `B0C1V8SVHZ` | **reject** | 沃尔玛后台显示要儿童证书 |
+
+⚠ **旧链的结论不是基准**。这次人工复核推翻的正是旧链:旧链拿 NRTL/CPC 把
+柜子、斗柜整片拒掉,人工看下来是**误拒**。同理,"内部黑名单命中"也不算新链
+更好 —— 黑名单是死代码、数据在不断补,拿它当分数是自己给自己送分。
+
+### 8.2 这次改了什么(只动 `audit_l3._S1`,规则代码与词表一个字没动)
+
+判错的根子不是"少了某一类产品的特判",是**框架缺了两块**(所有者原话:
+"这样子又变成了专属某一些产品的判断……这些东西在政策中都有写,他应该可以
+直接判定情况")。所以补的是框架,不是产品清单:
+
+1. **先定「本体」** —— 政策判的是这件商品**本身是什么**,不判它的部件 /
+   兼容对象 / 使用场景 / 图案装饰。带 USB 口与插座的柜子本体是家具;
+   "for iPad" 的收纳架本体是收纳架;反过来 "Kids Picnic Table" 本体**就是**
+   儿童家具(面向谁做的是商品定义的一部分,不是"场景提及")。
+   → 修 `B0F21HVDDN` / `B0F6YH7ZX4` 的误拒,同时把 `B0FBX3JR3Y` /
+   `B0DSCQJ698` 拒到位。
+2. **命中从两类扩到三类,新增 C. 附条件允许** —— 官方政策页有三态,提示词
+   原来只写了两态(禁 / 不禁),把中间那列「Allowed with restriction」整块
+   漏了。44 篇里 **23 篇**有这一列。本卖家的条件是固定的(搬运模式、无证书、
+   无授权、拿不到预审批)⇒ 对**本体**提出证书 / 预审批 / 注册 / 检测报告
+   要求的,一概满足不了 → reject;针对部件的 → pass;证据不足 → pass。
+   → 覆盖 `B0C1V8SVHZ`(要儿童证书)这一类。
+   两条护栏照旧写死:别把「附条件允许」读成「允许」;不许按类目名连坐整类。
+3. **品牌段自洽 + 只输出真品牌** —— `evidence` 写"暗示兼容性"却标
+   `is_real_brand: true`,整件商品会被翻成知产侵权;现在列表里**只许**放判成
+   真品牌的词,判 false 的一个都不写(所有者原话:"其他假品牌无需输出")。
+   → 保住 `B0GYNRCZ9F`(真·未授权引用 `abba`)这一类,同时不让兼容词误伤。
+
+### 8.3 输出加了排查面(所有者:"输出有明细方便我们排查问题")
+
+L3 输出**三段 → 五段**,新增两键,**都不参与判定**:
+
+- `product_is`:本体一句话,**pass 也要填**。判错时先看它 —— 本体认错和条款
+  引错是两种病,药也不同;
+- `policy_quote`:触发判定的**那一句政策原文逐字**。类别对了不等于条款对了;
+  抄不出原句 = 手里根本没条款。
+
+落点:
+- **reject** → 随 hit.detail 落 `audit.audit_hits`(七键定序,后两键接在末尾),
+  `workflows/audit_why` 把 detail 原样摊开,不必改渲染;
+- **pass 不落 hit** → 只有 `services.audit_l3` 那一行 INFO(屏幕 +
+  `logs/<workflow>.log`,dry-run 也打)。**误放行只能从这行看出来**;
+- 取不到就是 `None`:老 `llm_cache` 行没有这两个键,**缺排查信息不是坏 JSON**,
+  照旧解析出结论,绝不因此 pending。
+
+### 8.4 验收怎么跑
+
+```bash
+# 提示词逐字节变了 ⇒ purpose=audit_l3 存量缓存全量未命中,这 11 条全额重付
+python cli.py product_audit -p asins=B0F21HVDDN,B0DFY42VDL,B0F6YH7ZX4,\
+B0FBX3JR3Y,B0DSCQJ698,B0GYNRCZ9F,B0015XDK30,B0C1V8SVHZ --dry-run
+```
+
+对照 8.1 那张表逐条看;`--dry-run` 一个字都不写库,结论看摘要与
+`logs/product_audit.log` 里的 `L3 <asin> …` 行(本体 / 类别 / 原句 / 具体内容 /
+真品牌全在那一行)。**对不上的不要靠加特判去凑** —— 那正是这次被否掉的改法。

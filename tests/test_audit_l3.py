@@ -317,6 +317,65 @@ def test_S1_把B1定稿的要点都写进去了():
         assert gone not in s1, gone
 
 
+def test_S1_人工验收回改的三件事都在():
+    """⚠ 这三条是 2026-09-03 所有者**人工看 8 个产品**给出判断后回改的
+    (验收集 `docs/audit_step3_spec.md` §七),掉一条就退回那天的错判:
+
+    ① **本体**:带 USB 口的柜子被当成整机电器拒掉 → 政策只判"这件商品本身
+       是什么",部件/兼容/场景都不算;反过来"面向儿童"是本体的一部分;
+    ② **第三类命中(附条件允许)**:官方的「Allowed with restriction」那一列
+       本卖家一概满足不了 —— 少了这一类,要证书/预审批的产品会被判 pass;
+    ③ **evidence 与 is_real_brand 自洽**:evidence 写"暗示兼容性"却标 true,
+       整件商品会被翻成知产侵权。
+    同时钉住两条护栏,它们是 B1 定稿的底线,不许被 C 类吃掉。
+    """
+    s1 = audit_l3._S1
+    for must in (
+            # ① 本体
+            "# 先定",
+            "**带某个部件 ≠ 是那类设备;提到某个东西 ≠ 是那个东西",
+            "面向谁做的,就是本体的一部分",
+            # ② 第三类命中
+            "# 判定的三类命中",
+            "## C. 附条件允许",
+            "Allowed with restriction",
+            "must be certified",
+            # ③ 品牌自洽
+            "`evidence` 与 `is_real_brand` 必须自洽",
+            # 护栏:拿不准不拒 / 不连坐(B1 定稿的底线,C 类不许吃掉)
+            "拿不准不拒",
+            "按类目名连坐整类"):
+        assert must in s1, must
+    # 两类命中的旧标题不许残留(留着就是自相矛盾的两套说法)
+    assert "# 判定的两类命中" not in s1
+
+
+def test_S1_输出五段_本体与政策原句进输出_品牌只列真的():
+    """⚠ 2026-09-03 所有者要求「输出有明细方便我们排查问题」:
+
+    ① `product_is`(本体)—— **pass 也要填**:误放行是靠"它把本体认成了什么"
+       才看得出来的,pass 不落 hit,不打出来就永远查不到;
+    ② `policy_quote`(政策原句逐字)—— 类别对了不等于条款对了,抄不出原句就是
+       手里没条款;
+    ③ `brand_verdicts` **只列判成真品牌的那几个**(false 的一个都不写)——
+       所有者原话:"其他假品牌无需输出"。
+    """
+    s1 = audit_l3._S1
+    for must in ("# 输出的五段",
+                 "`product_is`",
+                 "**pass 也要填**",
+                 "`policy_quote`",
+                 "**触发判定的那一句政策原文逐字抄回来**",
+                 "**只列你判定为真品牌的那几个**",
+                 "一个真品牌都没有 → 给 `[]`"):
+        assert must in s1, must
+    # JSON 模板里五个键齐,且品牌例子已经是"只出真的"(不再有 true|false)
+    for key in ('"product_is"', '"policy_quote"'):
+        assert key in s1, key
+    assert "true|false" not in s1
+    assert "# 输出的三段" not in s1
+
+
 def test_system_prompt_四段顺序与进程内只查一次库():
     conn = FakeConn()
     p = audit_l3.system_prompt(conn)
@@ -549,22 +608,60 @@ def test_解析_pass强制none且无hit():
     assert r.hits == []
 
 
-def test_解析_reject产一条hit_五键定序_带提示词版本():
+def test_解析_reject产一条hit_七键定序_带提示词版本():
     r = audit_l3.parse_l3_reply(
         {"verdict": "reject", "policy": "children's products",
          "detail": "标题写 for kids 3+,儿童产品政策要求 CPC",
          "confidence": "bogus",
+         "product_is": "面向儿童的户外野餐桌(儿童家具)",
+         "policy_quote": "All children's products must have a CPC.",
          "brand_verdicts": [{"brand": "nike", "is_real_brand": False}]},
         ALLOWED)
     assert r.verdict == "reject"
     assert r.policy == "Children's Products"        # 回**表内原拼写**
     assert r.confidence == "medium"                 # 非法置信度归一
+    assert r.product_is == "面向儿童的户外野餐桌(儿童家具)"
+    assert r.policy_quote == "All children's products must have a CPC."
     (hit,) = r.hits
     assert (hit.stage, hit.rule_code, hit.penalty) == \
         ("L3", "llm_children_s_products", 0)
+    # 排查面两键接在**末尾**:老行少两键,新行多两键,读的人一眼分得清
     assert list(hit.detail) == ["policy", "detail", "confidence",
-                                "brand_verdicts", "prompt_version"]
+                                "brand_verdicts", "prompt_version",
+                                "product_is", "policy_quote"]
     assert hit.detail["prompt_version"] == resources.AUDIT_RULES_VERSION
+    assert hit.detail["product_is"] == "面向儿童的户外野餐桌(儿童家具)"
+    assert hit.detail["policy_quote"] == "All children's products must have a CPC."
+
+
+def test_解析_排查面两键取不到就是None_绝不因此改判():
+    """⚠ 老 `llm_cache` 里没有这两个键(2026-09-03 之前写的行):缺排查信息
+    不是坏 JSON —— 命中老缓存时必须照旧解析出结论,不许降级 pending。"""
+    r = audit_l3.parse_l3_reply(
+        {"verdict": "reject", "policy": "children's products", "detail": "x"},
+        ALLOWED)
+    assert r.verdict == "reject" and r.policy == "Children's Products"
+    assert r.product_is is None and r.policy_quote is None
+    (hit,) = r.hits
+    assert hit.detail["product_is"] is None
+    assert hit.detail["policy_quote"] is None
+    # pass 也一样:本体是排查面,取不到不影响放行
+    r2 = audit_l3.parse_l3_reply({"verdict": "pass", "policy": "none"}, ALLOWED)
+    assert r2.verdict == "pass" and r2.product_is is None
+
+
+def test_解析_pass也带本体_排查误放行靠它():
+    """pass **不落 hit**,本体在库里没有落点 —— 但结果对象要带着它,
+    `judge_l3` 才打得出那行 INFO(误放行是看"本体认成了什么"才看得出来的)。"""
+    r = audit_l3.parse_l3_reply(
+        {"verdict": "pass", "policy": "none",
+         "product_is": "带 USB 口与插座的实木收纳柜(家具)",
+         "policy_quote": ""},
+        ALLOWED)
+    assert r.verdict == "pass" and r.policy == "none"
+    assert r.product_is == "带 USB 口与插座的实木收纳柜(家具)"
+    assert r.policy_quote is None          # pass 要求留空 → 归一成 None
+    assert r.hits == []
 
 
 def test_解析_政策名对不上枚举一律pending_不猜(caplog):
@@ -644,7 +741,8 @@ def test_解析_品牌翻拒不回头解析枚举():
         (hit,) = r.hits
         assert hit.rule_code == "llm_intellectual_property"
         assert list(hit.detail) == ["policy", "detail", "confidence",
-                                    "brand_verdicts", "prompt_version"]
+                                    "brand_verdicts", "prompt_version",
+                                    "product_is", "policy_quote"]
 
 
 @pytest.mark.parametrize("raw", [["not", "a", "dict"], "plain string", 42,
@@ -721,6 +819,25 @@ def test_judge_把L0证据也送进user段(monkeypatch):
     user = calls[0]["messages"][1]["content"]
     assert "* 文案提到黑名单品牌(共1个, 前10): dyson(原文:Dyson V6)" in user
     assert "\n  - dyson\n" in user          # 品牌词清单出自同一通道
+
+
+def test_judge_每个产品打一行排查日志_pass也打(caplog, monkeypatch):
+    """⚠ pass **不落 hit**:本体与政策原句在库里没有落点,只有这一行日志。
+
+    所有者 2026-09-03 要的"明细"落在这里(屏幕 + logs/<workflow>.log,dry-run
+    也照打);品牌只打真品牌那几个词。
+    """
+    _patch_llm(monkeypatch, reply={
+        "verdict": "pass", "policy": "none",
+        "product_is": "带 USB 口与插座的实木收纳柜(家具)",
+        "brand_verdicts": [{"brand": "Dyson", "is_real_brand": False}]})
+    with caplog.at_level("INFO", logger="services.audit_l3"):
+        r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), FakeConn())
+    assert r.verdict == "pass"
+    line = [m for m in caplog.messages if m.startswith("L3 ")][-1]
+    assert "带 USB 口与插座的实木收纳柜(家具)" in line
+    assert "真品牌=无" in line               # is_real_brand=false 的不进这一行
+    assert "Dyson" not in line
 
 
 def test_judge_命中缓存不调LLM(monkeypatch):

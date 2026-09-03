@@ -6,7 +6,7 @@
 > 输出三段化)与 §7(类别自报 + 理由映射查表);**2026-09-03 C 批**改写 §2
 > (L0 双输出)与 §4(L2 = R1),执行规格 `docs/audit_step3_spec.md` §三/§四。
 > 规则集版本以 `registry/resources.py` 的 `AUDIT_RULES_VERSION` 为准
-> (2026-09-03 核对为 `c.2026-09-03.1`)。
+> (2026-09-03 核对为 `c.2026-09-03.2`)。
 >
 > 代码入口:`python cli.py product_audit`(`workflows/product_audit.py`)
 > 判定引擎:`services/audit_rules.audit_one`(门面)→ `audit_phase0` / `audit_l1_llm`
@@ -421,15 +421,28 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 > 没把类目定准"当拒绝理由。判据唯一出处是 `services/audit_reason.NOT_A_REASON`
 > (人话渲染那边用的是同一张表),别在通道里另列一份。
 
-### 5.4 输出三段与解析
+### 5.4 输出五段与解析
 
 ```json
-{"verdict": "pass|reject",
+{"product_is": "<中文 ≤40 字:本体 —— 顾客买的这件商品作为商品是什么;pass 也填>",
+ "verdict": "pass|reject",
  "policy": "<候选类别之一,逐字;pass 时 none>",
- "detail": "<中文 ≤120 字:原文片段 + 条款要点>",
+ "policy_quote": "<触发判定的那一句政策英文原文,逐字;pass 时 ''>",
+ "detail": "<中文 ≤120 字:产品原文片段 + 条款要点>",
  "brand_verdicts": [{"brand": "…", "is_real_brand": true, "evidence": "…"}],
  "confidence": "high|medium|low"}
 ```
+
+> **`product_is` / `policy_quote` 是排查面,不参与判定**(2026-09-03 所有者
+> 要求「输出有明细方便我们排查问题」)。判错时它们把责任分得清:本体认错
+> (柜子被当成整机电器)还是条款引错(类别对了但抄不出原句)。取不到就是
+> `None` —— **缺排查信息不是坏 JSON**,老 `llm_cache` 行照旧解析出结论。
+> `brand_verdicts` 同批收窄为**只列判成真品牌的那几个**(false 的不输出);
+> 翻拒的判据没变,仍是 `is_real_brand is True`。
+> 落点:reject 随 hit.detail 进 `audit_hits`(`audit_why` 原样摊开);
+> **pass 不落 hit**,只有 `services.audit_l3` 那一行 INFO
+> (屏幕 + `logs/<workflow>.log`,dry-run 也打)—— 误放行是靠"它把本体认成
+> 了什么"才看得出来的。
 
 解析顺序(`parse_l3_reply`),**零模糊归一化**:
 
@@ -440,8 +453,10 @@ S2/S4 跟着变 —— 这是**设计如此**(政策表就是 L3 的判定输入
 3. pass → `policy` 强制 `none`(pass 没有类别);
 4. reject → `policy` 经 `services/policy_names.resolve` 对枚举解析,命中回
    **表内原拼写**;**对不上 → pending `llm_bad_policy` + 计数**;
-5. reject 落 1 条 L3 hit:`rule_code = llm_<policy slug>`,detail 五键定序
-   `{policy, detail, confidence, brand_verdicts, prompt_version}`。
+5. reject 落 1 条 L3 hit:`rule_code = llm_<policy slug>`,detail 七键定序
+   `{policy, detail, confidence, brand_verdicts, prompt_version, product_is,
+   policy_quote}`(后两键 2026-09-03 追加在**末尾**:老行少两键、新行多两键,
+   读的人一眼分得清)。
 
 > ⚠ 第 4 步是 B1 最要紧的一处删除。旧版认不出类别就降级猜 `intellectual
 > property` —— 猜出来的类别会一路落库、进飞书 G 列、进申诉口径,而没有任何

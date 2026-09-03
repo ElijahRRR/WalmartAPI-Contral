@@ -48,7 +48,7 @@ DO NOTHING
 
 def _one_store(store: dict, data_date) -> tuple[int, int, int, int, int]:
     """输入:店铺 + 拉取日 → 输出:(解析行, 新增明细, 绩效事件, 无PO, 订单不在库)。"""
-    by_metric: list[tuple[str, list[dict]]] = []
+    blobs: list[tuple[str, bytes]] = []
     for m in insights.METRICS:
         try:
             blob = insights.performance_report(store, m)
@@ -56,16 +56,36 @@ def _one_store(store: dict, data_date) -> tuple[int, int, int, int, int]:
             logger.warning("店铺 %s %s report 拉取失败: %s", store["name"], m, e)
             continue
         if blob:
-            by_metric.append((m, kpi.parse_problem_report(m, blob)))
+            blobs.append((m, blob))
 
     inserted = perf_written = no_po = unlinked = 0
-    rows_all = [r for _, rs in by_metric for r in rs]
-    if rows_all:
+    rows_all: list[dict] = []
+    by_metric: list[tuple[str, list[dict]]] = []
+    if blobs:
         with db.pg_conn() as conn, conn.cursor() as cur:
-            # returns/INR 报表带行号无 SKU(实证):预载 (po,行号)→sku 供反查建键
-            cur.execute("SELECT po_id, line_number, sku FROM orders.order_lines "
-                        "WHERE store = %s", (store["name"],))
-            sku_lookup = {(po, ln): sku for po, ln, sku in cur.fetchall() if sku}
+            # returns/INR 报表带行号无 SKU(实证):预载 (po,行号)→sku 供反查建键;
+            # 同一趟把归因补全要的列取出来(report 端点不给取消原因,orders 给)
+            cur.execute("SELECT po_id, line_number, sku, cancel_reason, carrier, "
+                        "tracking_no FROM orders.order_lines WHERE store = %s",
+                        (store["name"],))
+            sku_lookup: dict[tuple, str] = {}
+            ctx_by_po: dict[str, dict] = {}
+            for po, ln, sku, cancel_reason, carrier, tracking in cur.fetchall():
+                if sku:
+                    sku_lookup[(po, ln)] = sku
+                ctx = ctx_by_po.setdefault(po, {})
+                for k, v in (("cancel_reason", cancel_reason), ("carrier", carrier),
+                             ("tracking_no", tracking)):
+                    if v and not ctx.get(k):
+                        ctx[k] = v          # 多行订单取首个非空,只用于人读的归因
+            cur.execute("SELECT po_id, return_reason FROM orders.return_lines "
+                        "WHERE store = %s AND return_reason <> ''", (store["name"],))
+            for po, reason in cur.fetchall():
+                ctx_by_po.setdefault(po, {}).setdefault("return_reason", reason)
+            # 解析放在拿到 ctx 之后:问题描述要带上订单接口补的原因(services/perf_reason)
+            by_metric = [(m, kpi.parse_problem_report(m, blob, ctx_by_po))
+                         for m, blob in blobs]
+            rows_all = [r for _, rs in by_metric for r in rs]
             for r in rows_all:
                 cur.execute(_PROBLEM_INSERT,
                             {**r, "store": store["name"],

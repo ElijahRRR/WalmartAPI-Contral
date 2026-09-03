@@ -177,13 +177,17 @@ def test_push_perf_shaping(monkeypatch):
         {"store": "T1", "po_id": "PO1", "metric": "otd", "order_line_id": "ol_1",
          "first_period": "2026-08-01", "last_period": "2026-08-06",
          "periods_seen": 3, "ever_accountable": True, "still_active": True,
-         "order_date": None, "detail": {"PO #": "PO1", "Late": "yes"},
-         "status": "违规",
+         "order_date": None, "detail": {"PO #": "PO1", "Days late": "3"},
+         "status": "违规", "sub_category": "Late Delivery",
+         "cancel_reason": None, "return_reason": None,
+         "carrier": "USPS", "tracking_no": "TRK1",
          "last_seen_at": datetime(2026, 8, 6, tzinfo=timezone.utc)},
         {"store": "T1", "po_id": "PO2", "metric": "自创指标", "order_line_id": None,
          "first_period": "2026-07-01", "last_period": "2026-07-01",
          "periods_seen": 1, "ever_accountable": False, "still_active": False,
          "order_date": None, "detail": None, "status": None,
+         "sub_category": None, "cancel_reason": None, "return_reason": None,
+         "carrier": None, "tracking_no": None,
          "last_seen_at": None},
     ]
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: rows)
@@ -195,7 +199,10 @@ def test_push_perf_shaping(monkeypatch):
     assert d1[F_PERF.metric] == "OTD"    # 单选预设无 emoji(v1 init_bitable 实证)
     assert d1[F_PERF.status] == "影响中"
     assert d1[F_PERF.period_span] == "2026-08-01 ~ 2026-08-06(共 3 期)"
-    assert "PO #:PO1" in d1[F_PERF.description]
+    # 问题描述 = 归因 + 佐证,**不是**明细拍平(所有者 2026-09-03):
+    # 缺陷桶名翻中文,承运商/单号从订单库补(报表这行没有这两列)
+    assert d1[F_PERF.description] == "送达晚 · 迟 3 天 / 承运商 USPS / 单号 TRK1"
+    assert "PO #" not in d1[F_PERF.description]      # 拍平版一去不回
     d2 = desired["PO2|自创指标"]
     assert d2[F_PERF.metric] == "自创指标"          # 未知指标原样
     assert d2[F_PERF.status] == "已滚出窗口"

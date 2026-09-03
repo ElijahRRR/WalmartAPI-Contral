@@ -43,7 +43,7 @@ from decimal import Decimal
 
 from api import feishu
 from registry import db, resources
-from services import kpi, order_lines
+from services import kpi, order_lines, perf_reason
 
 logger = logging.getLogger("services.order_center")
 
@@ -85,13 +85,22 @@ WHERE r.return_created >= now() - make_interval(days => %s)
 _PERF_SQL = """
 SELECT s.store, s.po_id, s.metric, s.order_line_id, s.first_period,
        s.last_period, s.periods_seen, s.ever_accountable, s.still_active,
-       l.order_date, le.detail, le.status, le.last_seen_at
+       l.order_date, l.cancel_reason, l.carrier, l.tracking_no,
+       rr.return_reason,
+       le.detail, le.status, le.sub_category, le.last_seen_at
 FROM orders.perf_event_spans s
 LEFT JOIN orders.order_lines l ON l.order_line_id = s.order_line_id
 LEFT JOIN LATERAL (
-    SELECT e.detail, e.status, e.last_seen_at FROM orders.perf_events e
+    SELECT e.detail, e.status, e.sub_category, e.last_seen_at
+    FROM orders.perf_events e
     WHERE e.po_id = s.po_id AND e.metric = s.metric
     ORDER BY e.period DESC LIMIT 1) le ON true
+-- 归因补全(所有者 2026-09-03):report 端点不给原因时,orders 的
+-- cancellationReason / returns 的 returnReason 已经在库里,拿来补(services/perf_reason ③)
+LEFT JOIN LATERAL (
+    SELECT r.return_reason FROM orders.return_lines r
+    WHERE r.order_line_id = s.order_line_id AND r.return_reason <> ''
+    ORDER BY r.return_created DESC NULLS LAST LIMIT 1) rr ON true
 WHERE s.order_line_id IS NOT NULL
 """
 
@@ -341,7 +350,12 @@ def _cell(v):
 
 
 def _detail_desc(detail, limit: int = 300) -> str | None:
-    """输入:perf_events.detail(报表原始行 dict)→ 输出:人读摘要 "k:v; k:v"。"""
+    """输入:perf_events.detail(报表原始行 dict)→ 输出:拍平摘要 "k:v; k:v"。
+
+    ⚠ **只剩未知指标这一个用途**:问题描述一律由 services/perf_reason 归因
+    (2026-09-03),拍平版与「明细」列一字不差,人看了等于没看。
+    指标不在 perf_reason 词表里(自创指标/官方新增)时才回退到这里,免得整列空白。
+    """
     if not isinstance(detail, dict):
         return None
     parts = [f"{k}:{str(v).strip()[:40]}" for k, v in detail.items()
@@ -444,7 +458,15 @@ def push_perf(reconcile: bool = False) -> str:
             f.metric: kpi.METRIC_LABELS.get(r["metric"], r["metric"])
                          .split(" ", 1)[-1],
             f.accountable: r["ever_accountable"],
-            f.description: _detail_desc(r["detail"]),
+            # 问题描述 = 归因(「承运商无扫描」「缺货取消」),不是拍平明细;
+            # 现算不落库:词表校准后老行下一轮自动跟着改口径,不用回填
+            f.description: perf_reason.describe(
+                r["metric"], r["sub_category"], r["detail"],
+                r["ever_accountable"],
+                {"cancel_reason": r["cancel_reason"],
+                 "return_reason": r["return_reason"],
+                 "carrier": r["carrier"], "tracking_no": r["tracking_no"]},
+            ) or _detail_desc(r["detail"]),
             # 仍出现在最近一期报表 = 仍拖当前绩效分;消失 = 滚出官方统计窗口
             f.status: "影响中" if r["still_active"] else "已滚出窗口",
             f.period_span: f"{span}(共 {r['periods_seen']} 期)",

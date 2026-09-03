@@ -284,7 +284,8 @@ def test_returns_sync_all_stores_dead_is_not_success(monkeypatch):
 
 def test_perf_rows_from_problems():
     rows = [
-        {"po_no": "PO1", "sku": "B0X", "accountable": "✅ 是", "raw": "{}"},
+        {"po_no": "PO1", "sku": "B0X", "accountable": "✅ 是", "raw": "{}",
+         "sub_category": "No Carrier Scan"},
         {"po_no": "PO1", "sku": "", "accountable": "⚪ 否", "raw": "{}"},
         {"po_no": "", "sales_order_no": "SO9", "accountable": "✅ 是", "raw": "{}"},
     ]
@@ -295,9 +296,12 @@ def test_perf_rows_from_problems():
                       "period": "2026-08-06", "sku": "B0X", "accountable": True,
                       # v3:带 SKU 的事件写入时直接建键,订单不在库里也成立
                       "order_line_id": ol.make_order_line_id("PO1", "B0X"),
+                      # 缺陷桶名跟着事件走:问题描述的归因主线索(services/perf_reason)
+                      "sub_category": "No Carrier Scan",
                       "status": "违规", "detail": "{}"}
     assert out[1]["accountable"] is False and out[1]["status"] == "不计入"
     assert out[1]["sku"] is None and out[1]["order_line_id"] is None
+    assert out[1]["sub_category"] is None     # 报表没给分类就是 None,不填空串
 
 
 def test_perf_rows_line_no_resolves_sku_via_lookup():

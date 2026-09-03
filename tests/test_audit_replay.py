@@ -919,3 +919,71 @@ def test_limit_per_category_zero_is_an_error_not_the_default():
         ar._parse_params({"limit_per_category": "-3"})
     assert ar._parse_params({}).cap is None                  # 没传 = 现算
     assert ar._parse_params({"limit_per_category": "7"}).cap == 7
+
+
+def test_判据分道按层不按类别名_上游硬拒自报真政策名也不算判据():
+    """⚠ 2026-09-03 第二次修正,这条是**度量失效**的回归钉。
+
+    原来分道靠一次字符串等值 `got_category == '内部黑名单'`。而上游硬拒
+    **自报的就是真政策名**,一律 ≠ `内部黑名单`,于是全都混进了「判据」的
+    分子与分母 —— 而它们没有一条读过那 44 篇原文:
+
+      · 品牌黑名单 / 商标符号 / 专利自述 → `Intellectual Property`
+        (`audit_phase0.py:454 / :270 / :315`);
+      · Made in USA → `Product claims`(`:375`);
+      · 亚马逊类目黑名单**能 join 上政策表时 category 被改写成真政策名**
+        (`:169-176`)—— 同一张表按"有没有填对政策名"分流到两个桶;
+      · L1/L2 → `类目准入`(`audit_l1_llm.py:129`、`audit_l2.py:179/:199`)。
+
+    反方向也漏:`AUDIT_NONPOLICY_CATEGORIES` 进了 L3 自己的候选枚举
+    (`audit_l3.py:368`),**走完全文**却答 `内部黑名单` 的行会被踢出分母。
+    """
+    ip = resources.AUDIT_IP_POLICY
+    # ① 上游硬拒自报真政策名 —— 旧口径会把它当判据(分子分母都进)
+    assert ar.evidence_kind(_row(got_category=ip, stage_stopped_at="L0")) == "rules"
+    assert ar.evidence_kind(_row(got_category="Product claims",
+                                 stage_stopped_at="L0")) == "rules"
+    assert ar.evidence_kind(_row(got_category="Alcohol",
+                                 stage_stopped_at="L0")) == "rules"   # 类目表改写
+    for stage in ("L1", "L2"):
+        assert ar.evidence_kind(_row(got_category=resources.AUDIT_CAT_ACCESS,
+                                     stage_stopped_at=stage)) == "rules", stage
+    # ② 反方向:走完 44 篇全文却答 `内部黑名单` 的,是判据,不许踢出分母
+    assert ar.evidence_kind(_row(got_category=resources.AUDIT_CAT_INTERNAL_BLACKLIST,
+                                 stage_stopped_at="L3")) == "policy"
+    # ③ L3 品牌翻拒是**确定性后处理**,与政策判据同层同类别,只有 detail 能分
+    from services import audit_l3
+    assert ar.evidence_kind(_row(
+        got_category=ip, stage_stopped_at="L3",
+        got_detail=audit_l3.BRAND_OVERRIDE_PREFIX + "abba")) == "brand"
+    # ④ L3 判 pass 时 stage 是 None(不是 'L3')—— 靠 confidence 认"到过判据"
+    assert ar.evidence_kind(_row(got_verdict="pass", got_category=None,
+                                 stage_stopped_at=None)) == "policy"
+    assert ar.evidence_kind(_row(stage_stopped_at=None,
+                                 confidence=None)) == "rules"
+    # ⑤ L4 视觉改判的结论也不是这 44 篇判出来的
+    assert ar.evidence_kind(_row(stage_stopped_at="L4")) == "rules"
+    # ⑥ 没结论的不进任何桶
+    assert ar.evidence_kind(_row(got_verdict=None)) is None
+    assert ar.evidence_kind(_row(error="boom")) is None
+
+
+def test_报告三桶都摊开_不藏任何一桶():
+    """把「结论是谁给的」摊开,是这次修正的全部意义:数字会更难看,
+    但难看的是真的。三桶各自的条数与判拒数都要出现。"""
+    from services import audit_l3
+    ip = resources.AUDIT_IP_POLICY
+    rows = [
+        _row(asin="B01", got_category=ip, stage_stopped_at="L0"),     # 规则
+        _row(asin="B02", got_category=ip, stage_stopped_at="L3",
+             got_detail=audit_l3.BRAND_OVERRIDE_PREFIX + "abba"),     # 品牌翻拒
+        _row(asin="B03"),                                             # 判据判拒
+        _row(asin="B04", got_verdict="pass", got_category=None),      # 判据放行
+    ]
+    text = "\n".join(ar.report(rows, _META)[0])
+    assert "拆开看结论是谁给的" in text
+    assert "L0/L1/L2 规则与记忆:1 条,判拒 1" in text
+    assert "L3 品牌翻拒(确定性后处理):1 条,判拒 1" in text
+    assert "L3 政策判据:2 条,判拒 1" in text
+    assert "没有一条读过那 44 篇原文" in text
+    assert "**判据召回**(只算 L3 政策判据的 2 条反例):1/2" in text

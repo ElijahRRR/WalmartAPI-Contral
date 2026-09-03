@@ -101,10 +101,12 @@ _NEG_CODES = ("POLICY", "IP", "CONTENT", "BRAND", "PROHIBITED_FINAL")
 # ── 成本预估口径(规格 §3.9;真跑用 llm_cost.summarize 实算)────────────────
 # 前缀 token 由**实际渲染出来的 system prompt** 折算,不写死:政策表一改
 # 前缀就变长,写死的数字会悄悄失真(B1 实测 212,556 字符 ≈ 6.1 万 token)。
-#: 「记忆」而非「判据」的类别:L0 黑名单三表(卖家 / ASIN / 类目)自报的那个。
-#: 反例取自沃尔玛拒过的品,而拒了就拉黑是既有流程 ⇒ 反例大量早就躺在黑名单里,
-#: L0 认出 ASIN 就硬拒、判据一步不走。混在召回/类别分母里 = 指标虚高且看不出原因。
-_MEMORY_CATEGORY = resources.AUDIT_CAT_INTERNAL_BLACKLIST
+#: 结论**由判据之外的层给出**的那些 stage(硬拒停在判据之前,或 L4 视觉改判)。
+_NON_JUDGE_STAGES = ("L0", "L1", "L2", "L4")
+
+#: 三个证据桶的中文名(报告用;`evidence_kind` 的返回值 → 这里)。
+_KIND_CN = {"rules": "L0/L1/L2 规则与记忆", "brand": "L3 品牌翻拒(确定性后处理)",
+            "policy": "L3 政策判据"}
 
 _CHARS_PER_TOKEN = 3.5
 _USER_TOKENS = 2500     # user 段:规格 §3.9 的 1.5–3K,取中位
@@ -336,6 +338,46 @@ def category_ok(expected: str | None, got: str | None) -> bool:
     # 差别不该被算成"类别判错"
     fam = {norm_category(n) for n in resources.AUDIT_CONTENT_POLICIES}
     return norm_category(expected) in fam and norm_category(got or "") in fam
+
+
+def evidence_kind(row) -> str | None:
+    """输入:一行结果 → 输出:这条结论**是谁给的**(rules / brand / policy);没结论给 None。
+
+    ⚠ **不许按 `got_category` 的字符串分道** —— 2026-09-03 查出的度量失效:
+    上游硬拒**自报的就是真政策名**,一律 ≠ `内部黑名单`,于是一路混进
+    「判据」的分子与分母,而它们**没有一条读过那 44 篇原文**:
+
+      · `audit_phase0` 品牌黑名单 / 商标符号 / 专利自述 → `Intellectual Property`
+        (`audit_phase0.py:454 / :270 / :315`);
+      · Made in USA → `Product claims`(`:375`);
+      · 亚马逊类目黑名单**能 join 上政策表时,category 被改写成那条真政策名**
+        (`:169-176`)—— 同一张表,一部分行进记忆桶、一部分行进判据桶,
+        分界线竟是"黑名单行里有没有填对政策名";
+      · L1 出版物硬禁与 L2 两条类目准入 → `类目准入`
+        (`audit_l1_llm.py:129`、`audit_l2.py:179/:199`)。
+
+    反方向也漏:`AUDIT_NONPOLICY_CATEGORIES` 被喂进了 L3 自己的候选枚举与
+    白名单(`audit_l3.py:368 / :743`),**走完 44 篇全文**却答 `内部黑名单` 的行
+    会被当成记忆,从分子分母里一起踢掉 ⇒ 分母偏小。
+
+    所以分道只认两样**事实**,都早就落库(`audit.replay_results`):
+      1. `stage_stopped_at` —— 停在判据之前(L0/L1/L2)或之后(L4)的,不是判据;
+      2. `confidence` —— 「没走 L3 为 NULL」(`schema.sql:1811`),它是"到过判据"
+         的唯一可靠标记(L3 判 pass 时 `stage_stopped_at` 是 None,不是 'L3')。
+
+    L3 内部再分一次:**品牌翻拒是确定性后处理,不是模型的政策判断**,两者同为
+    `stage_stopped_at='L3'`、同为 `Intellectual Property`,只有 detail 的固定句式
+    能分 —— 常量出自 `audit_l3.BRAND_OVERRIDE_PREFIX`(那边写明了它是接口)。
+    """
+    if row.get("error") or not row.get("got_verdict"):
+        return None
+    if row.get("stage_stopped_at") in _NON_JUDGE_STAGES:
+        return "rules"
+    if row.get("confidence") is None:
+        return "rules"                      # 判据一步都没走
+    if (row.get("got_detail") or "").startswith(audit_l3.BRAND_OVERRIDE_PREFIX):
+        return "brand"
+    return "policy"
 
 
 # ── 抽样(纯函数,给定 seed 恒定)────────────────────────────────────────────
@@ -775,27 +817,40 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
                     f"(同样不进本集;这一档是**政策表缺口**的信号,"
                     f"清单见 error_reclass_report)")
 
-    # ① 反例召回 —— **必须拆成"记得拉黑过"与"判据判出来"两笔**
+    # ① 反例召回 —— **必须按「结论是谁给的」拆开,不是按类别字符串拆**
     # ⚠ 2026-09-03 首测暴露的读数陷阱:反例取自沃尔玛拒过的品,而**我们拒过的
     #   品多半当场就进了 catalog 黑名单三表**(拒了就拉黑是既有流程)。于是
-    #   L0 一眼认出 ASIN 就硬拒,类别自报 `内部黑名单`,判据一步都没走 ——
-    #   总召回因此天然虚高,而"政策判得对不对"这个问题一个字都没回答。
+    #   L0 一眼认出 ASIN 就硬拒,判据一步都没走 —— 总召回因此天然虚高,
+    #   而"政策判得对不对"这个问题一个字都没回答。
     #   首测实测:总召回 78/114=68.4% 看着不错,拆开看**判据召回 0/36**。
+    # ⚠ 2026-09-03 第二次修正:原来用 `got_category == '内部黑名单'` 分道,
+    #   **两个方向都漏**(见 `evidence_kind` 头注)—— 上游硬拒自报的是真政策名,
+    #   全都混进了判据的分子分母。现在按 `evidence_kind`(层 + 置信 + 品牌覆写
+    #   句式)分道,三桶都摊开报,不藏任何一桶。
     rec = [r for r in neg if r["got_verdict"] == "reject"]
-    memo = [r for r in rec if r["got_category"] == _MEMORY_CATEGORY]
-    judged_neg = [r for r in neg if r["got_category"] != _MEMORY_CATEGORY]
+    kinds = {k: [r for r in neg if evidence_kind(r) == k]
+             for k in ("rules", "brand", "policy")}
+    judged_neg = kinds["policy"]
     judged_rec = [r for r in judged_neg if r["got_verdict"] == "reject"]
     body += ["", f"▍反例召回(沃尔玛拒了,我们也拒):{_pct(len(rec), len(neg))}",
              f"    其中 pass {sum(1 for r in neg if r['got_verdict'] == 'pass')}"
              f" / pending {sum(1 for r in neg if r['got_verdict'] == 'pending')}"
              f" / 判定失败 {sum(1 for r in neg if r['error'])}"]
-    if memo:
-        body += [f"  ⚠ **拆开看**:其中 {len(memo)} 条是 `{_MEMORY_CATEGORY}` 拦下的"
-                 f" —— 那是「我们记得拉黑过这个 ASIN/卖家/类目」,**不是判据判出来的**"
-                 f"(拒了就拉黑是既有流程,反例天然大量落在黑名单里);",
-                 f"    **判据召回**(扣掉黑名单命中的 {len(judged_neg)} 条反例里判拒):"
-                 f"{_pct(len(judged_rec), len(judged_neg))}"
-                 f" ← **要看判据行不行,只能看这个数**"]
+    if kinds["rules"] or kinds["brand"]:
+        body.append("  ⚠ **拆开看结论是谁给的**(按停在哪一层分,不按类别名 ——"
+                    "上游硬拒自报的也是真政策名):")
+        for k in ("rules", "brand", "policy"):
+            grp = kinds[k]
+            if not grp:
+                continue
+            body.append(f"    {_KIND_CN[k]}:{len(grp)} 条,判拒 "
+                        f"{sum(1 for r in grp if r['got_verdict'] == 'reject')}")
+        body.append("    (前两桶**没有一条读过那 44 篇原文**:查表 / 正则 /"
+                    "确定性后处理,算不进「判据」)")
+        # 全都是判据判的时候不出这一行:那时它恒等于上面的总召回,重复 = 噪声
+        body.append(f"  **判据召回**(只算 L3 政策判据的 {len(judged_neg)} 条反例):"
+                    f"{_pct(len(judged_rec), len(judged_neg))}"
+                    f" ← **要看判据行不行,只能看这个数**")
 
     # ② 类别准确率 + 混淆表
     # ⚠ 两个分母都要给:只报端到端(分母 = 全部带类别反例)会把"没判拒"的
@@ -809,14 +864,15 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
                  f"判拒的带类别反例里 {_pct(len(hit), len(rej_lab))};"
                  f"端到端(判拒且类别对 ÷ 全部带类别反例 {len(labelled)} 条)"
                  f"{_pct(len(hit), len(labelled))}"]
-    # ⚠ 同上:`内部黑名单` 是记忆不是类别判定,混在分母里会让这个数恒等于 0
-    #   而看不出原因(首测 67 条判拒里 64 条是黑名单命中)
-    rej_judged = [r for r in rej_lab if r["got_category"] != _MEMORY_CATEGORY]
+    # ⚠ 同上:记忆与规则给的类别不是"判据判出来的类别",混在分母里会让这个数
+    #   恒等于 0 而看不出原因(首测 67 条判拒里 64 条是黑名单命中)。
+    #   同样按 `evidence_kind` 分道,**不按类别字符串**。
+    rej_judged = [r for r in rej_lab if evidence_kind(r) == "policy"]
     if len(rej_judged) != len(rej_lab):
         hit_j = [r for r in rej_judged
                  if category_ok(r["expected_category"], r["got_category"])]
-        body += [f"  ⚠ 其中 {len(rej_lab) - len(rej_judged)} 条得到的是 "
-                 f"`{_MEMORY_CATEGORY}`(L0 记忆,没走到政策判定);"
+        body += [f"  ⚠ 其中 {len(rej_lab) - len(rej_judged)} 条的类别**不是判据给的**"
+                 f"(上游硬拒自报 / L3 品牌翻拒 —— 都没读过那 44 篇原文);"
                  f"**真正由判据给出类别的** {len(rej_judged)} 条里 "
                  f"{_pct(len(hit_j), len(rej_judged))}"]
     if rej_lab:

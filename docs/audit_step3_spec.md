@@ -906,3 +906,92 @@ L3 B0FH2CYMGW pass(缓存) 本体='儿童床架(家具)' 类别=none 原句=None
 **反例**能不能走到判据(黑名单命中挡掉的那一批),几乎不动正例误伤;
 而 `.6` 两头都动。先路由 → 判据召回第一次有统计效力 → 再拿 `.6` 去比,
 才读得出这一改到底加回了多少召回。反过来做,两件事混在一个读数里分不开。
+
+### 8.12 度量失效:`判据召回 15.4%` 分的不是「判据」(2026-09-03)
+
+所有者问「重新思考 LLM 判定不准确的原因」。五路独立复核加一路唱反调,
+结论先说最刺眼的一条:**那个 15.4% 分的根本不是判据。**
+
+#### 分道靠的是一次字符串等值
+
+```python
+_MEMORY_CATEGORY = resources.AUDIT_CAT_INTERNAL_BLACKLIST     # "内部黑名单"
+judged_neg = [r for r in neg if r["got_category"] != _MEMORY_CATEGORY]
+```
+
+而**上游硬拒自报的就是真政策名**,一律 `!= 内部黑名单`,于是全部混进
+「判据」的分子与分母 —— 它们**没有一条读过那 44 篇原文**:
+
+| 出处 | 自报类别 |
+|---|---|
+| `audit_phase0.py:454` 品牌黑名单(生产两万余条 TRO 词) | `Intellectual Property` |
+| `:270` 商标符号 ®/™ | `Intellectual Property` |
+| `:315` 专利自述 | `Intellectual Property` |
+| `:375` Made in USA | `Product claims` |
+| `:169-176` 亚马逊类目黑名单,`walmart_policy` **能 join 上时 category 被改写成那条真政策名** | 真政策名 |
+| `audit_l1_llm.py:129` / `audit_l2.py:179,199` | `类目准入` |
+
+⚠ 类目黑名单那条最刺眼:**同一张表**,一部分行进记忆桶、一部分行进判据桶,
+分界线竟是「黑名单行里有没有填对政策名」。
+
+**反方向也漏**:`AUDIT_NONPOLICY_CATEGORIES` 被喂进了 L3 自己的候选枚举与
+白名单(`audit_l3.py:368 / :743`),**走完 44 篇全文**却答 `内部黑名单` 的行
+会被当成记忆,从分子分母里一起踢掉 ⇒ **分母偏小**。
+
+仓库自己早就写着这件事(`services/audit_rules.py:146-149`):
+「`AUDIT_IP_POLICY` —— 品牌黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的
+品牌翻拒,**四处判同一个 IP**」。
+
+#### 改了什么
+
+新增纯函数 `evidence_kind(row)`,分道只认两样**事实**(都早就落库):
+
+1. `stage_stopped_at` —— 停在 L0/L1/L2(判据之前)或 L4(之后)的,不是判据;
+2. `confidence` —— 「没走 L3 为 NULL」(`schema.sql:1811`),它是"到过判据"的
+   唯一可靠标记。⚠ **L3 判 pass 时 `stage_stopped_at` 是 `None` 不是 `'L3'`**
+   (`audit_rules.py:499-516`),只看 stage 会把判据放行的行整批丢掉。
+
+L3 内部再分一次:**品牌翻拒是确定性后处理,不是模型的政策判断**。两者同为
+`stage_stopped_at='L3'`、同为 `Intellectual Property`,只有 detail 的固定句式
+能分 —— 常量提到 `audit_l3.BRAND_OVERRIDE_PREFIX`,并在那里写明**它是接口
+不是文案**,改串 = 改评估口径。
+
+报告现在把三桶**全摊开**(规则与记忆 / 品牌翻拒 / 政策判据),各报条数与判拒数,
+不藏任何一桶。判据召回只认第三桶。
+
+#### 不用重跑就能看到真数
+
+判定链一个字节没动 ⇒ **误伤在数学上不可能变**;而 `audit.replay_results` 里
+`stage_stopped_at` / `confidence` / `got_detail` 早就落库,**一条 SQL 就能把
+上一轮的 14 拆开**:
+
+```sql
+SELECT CASE WHEN stage_stopped_at IN ('L0','L1','L2','L4') THEN 'L0/L1/L2 规则与记忆'
+            WHEN confidence IS NULL                        THEN 'L0/L1/L2 规则与记忆'
+            WHEN got_detail LIKE '未授权引用品牌名 %'       THEN 'L3 品牌翻拒'
+            ELSE 'L3 政策判据' END AS 结论是谁给的,
+       count(*) AS 反例数,
+       count(*) FILTER (WHERE got_verdict = 'reject') AS 判拒
+FROM audit.replay_results
+WHERE run_tag = '路由后' AND expected_verdict = 'reject' AND got_verdict IS NOT NULL
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+⚠ **预期是数字更难看**,那正是这次修正的价值。
+
+#### 还有四条同向的口径问题(未修,记账)
+
+1. **分母里混着「判据根本没机会跑」的行** —— L1 类目解不出、L2 判不了、
+   pending、判定抛异常。本仓第一条纪律就是「判不了 ≠ 判过了」,这里破了;
+2. **分母里 38%(107/284)不携带可判信息** —— `BRAND` 是账号权限、
+   `PROHIBITED_FINAL` 不给理由,`label()` 对这两类返回期望类别 `None`
+   (只比判定),它们进得了分母却几乎不可能进分子;
+3. **理论上限不是 100%** —— 44 篇按「拿 listing 能不能判」分:约 20 篇白送、
+   6 篇文案类、13 篇需外部数据 ⇒ **上限约 70–75%**;
+4. **样本量不够下结论** —— 91 条的 95% 置信区间是 [9.4%, 24.2%];
+   「类别准确率 2/9」的区间是 **[6.3%, 54.7%]** —— 这个数**不含任何信息**,
+   不该拿来做任何判断。
+
+⚠ 还有一条会自己变的:`blacklist_route` 一跑,91 这个分母就被**整个重定义**
+(那批 ASIN 不再被 L0 拦下,会落到判据上)。所以**路由之后的第一轮回放是新基线**,
+不要拿它跟路由前的 15.4% 比大小。

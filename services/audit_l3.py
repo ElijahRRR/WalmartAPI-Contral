@@ -58,6 +58,13 @@ logger = logging.getLogger("services.audit_l3")
 # 调用参数(旧仓 l3_llm.py:743-756):常规链 max_tokens=1500;温度必须显式传,
 # 新仓 api/llm.py 默认 0.2 ≠ 旧仓 0.1,吃默认即改判定口径。
 L3_TEMPERATURE = 0.1
+
+#: 品牌翻拒(合同 L3-7)那条**确定性后处理**产出的 detail 前缀。
+#: ⚠ 它是「这条 reject 不是模型判的」的唯一可辨认标记 —— 品牌翻拒与政策判定
+#: 同为 `stage_stopped_at='L3'`、同为 `Intellectual Property`,类别与层次都分不开,
+#: 只有这行句式能分。评估侧(`workflows/audit_replay`)按它把两者分账,
+#: 所以**它是接口,不是文案**:改这个串 = 改评估口径,别顺手润色。
+BRAND_OVERRIDE_PREFIX = "未授权引用品牌名 "
 L3_MAX_TOKENS = 1500
 L3_PURPOSE = "audit_l3"          # registry.LLM_PURPOSE_ENV 登记项
 
@@ -870,7 +877,8 @@ def parse_l3_reply(raw: dict, allowed: frozenset | set) -> L3Result:
         first = real_brand_hits[0].get("brand") or "?"
         logger.info("L3 verdict override: pass→reject, is_real_brand=true: %s",
                     [v.get("brand") for v in real_brand_hits])
-        return _reject(resources.AUDIT_IP_POLICY, f"未授权引用品牌名 {first}",
+        return _reject(resources.AUDIT_IP_POLICY,
+                       f"{BRAND_OVERRIDE_PREFIX}{first}",
                        brand_verdicts, confidence, raw,
                        product_is=product_is, policy_quote=policy_quote)
 
@@ -981,6 +989,7 @@ def judge_l3(product, l1, l2, ctx, conn, *, phase0=None) -> L3Result:
 __all__ = [
     "L3Result",
     "L3_TEMPERATURE",
+    "BRAND_OVERRIDE_PREFIX",
     "L3_MAX_TOKENS",
     "L3_PURPOSE",
     "NO_POLICY",

@@ -5,20 +5,30 @@
 JSON。人看到的只有一堆单号和金额,看不出原因。本模块给出原因本身:
 VTR 是「承运商无扫描」还是「追踪号无效」,取消是「缺货」还是「买家主动取消」。
 
-归因优先级(**报表自身 > 官方分类 > 订单库补全 > 指标通用语**,逐级降级):
-  ① 行内原因列:报表若带 reason/defect/issue/exception 一类列,取其值;
-  ② sheet 分类(sub_category):沃尔玛把 report 按缺陷桶分 sheet,桶名即原因;
-  ③ 订单库补全:report 端点不给原因时,同一单的 `cancellationReason`(orders)
+归因优先级(逐级降级,上一级说不出才往下走):
+  ① 报表自身的两处线索,**都用**:
+     - sheet 桶名(sub_category):沃尔玛把这单记在**哪一类缺陷**上,
+       即「为什么算我头上」;
+     - 行内原因列:这单**具体发生了什么**。列名按指标写死(见 `_REASON_COL`),
+       泛化匹配会抓错列 —— 实测 INR 的 `Return reason description` 被别的
+       带 "reason" 的列抢走过。
+     两者都有且不同就一起说:`错发商品(与描述/图片不符)`。
+  ② 订单库补全:report 端点不给原因时,同一单的 `cancellationReason`(orders)
      与 `returnReason`(returns)已经在库里 —— 另一个端点答得上的问题,
      不要留空(所有者 2026-09-03:「如果请求的数据不全,也可以补全一下」);
-  ④ 指标通用语:什么都没有时也要说人话(「追踪未通过校验」),
+  ③ 指标通用语:什么都没有时也要说人话(「追踪未通过校验」),
      **绝不回退成拍平原始行** —— 那正是本模块要消掉的东西。
 
-桶名中文对照 `_BUCKETS` 的词表出处是**沃尔玛官方 Seller performance standards**
-(marketplacelearn 2026-09-03 核对),不是自造;report 的 xlsx 列名/sheet 名
-官方从不公开(developer.walmart.com 只说「下载参与计算的订单」),所以:
-**对不上的桶名原样透传 + 计数告警**,由 perf_problems 摘要点名、人眼校准后
-再进词表 —— 静默归到「其他」就是又一次「解析 0 行」。
+桶名中文对照 `_BUCKETS` 两个来源,都不是自造:
+  - **沃尔玛官方 Seller performance standards**(marketplacelearn 2026-09-03 核对);
+  - **2026-09-03 生产报表实测**(M001 全 8 张 + 库内存量行):官方标准页没列、
+     但报表在用的桶,如 Lost / Incorrect item / Defective / Damaged /
+     Item Missing / Seller Issued Refund / Change_Mind * / Miscellaneous,
+     以及 sheet 写「Address **is** not serviceable」这种与文档不同的措辞。
+report 的 xlsx 列名/sheet 名官方从不公开(developer.walmart.com 只说「下载参与
+计算的订单」),所以:**对不上的桶名原样透传 + 计数告警**,由 kpi 按 sheet 汇总
+点名、人眼校准后再进词表 —— 静默归到「其他」就是又一次「解析 0 行」。
+回归语料在 tests/test_perf_reason.py 的 PRODUCTION,官方改版式先在那里红。
 """
 
 import logging
@@ -35,9 +45,22 @@ def _key(s) -> str:
     return re.sub(r"[\W_]+", " ", str(s or "").lower()).strip()
 
 
-# ── ① 行内原因列的表头关键词 ────────────────────────────────────────────────
-# ⚠ 只收真·原因列:商品类目列("Category")、商品状态列("Item Condition")
-# 都不是原因,收进来会把 "PLUMBING" 当成违规原因写进问题描述。
+# ── ① 行内原因列 ────────────────────────────────────────────────────────────
+# **按指标写死真实列名**(2026-09-03 生产报表实测,M001 全 8 张 + 库内存量):
+# 一张报表可能有多列名字里带 "reason",泛化匹配会撞上错的那列 —— 实测把 INR 的
+# 「Return reason description: Seller Issued Refund」抓成了别的列的 Miscellaneous。
+# 指标专属列在前,泛化关键词只做新版式的兜底。
+# ⚠ 只收真·原因列:商品类目("Category")、商品状态("Item Condition")不是原因,
+# 收进来会把 "PLUMBING" 当成违规原因写进问题描述。
+_REASON_COL = {
+    "otd": ("late delivery reason", "delivery reason"),
+    "returns": ("return reason description", "return reason"),
+    "itemNotReceived": ("return reason description", "return reason"),
+    "refunds": ("refund reason",),
+    "cancellations": ("cancellation reason", "cancel reason"),
+    "negativeFeedback": ("feedback reason", "feedback type"),
+    "srr": ("inquiry type", "contact reason"),
+}
 _REASON_HEADERS = ("reason", "defect", "issue", "exception", "root cause",
                    "cancelled by", "canceled by", "disposition", "violation",
                    "error type", "failure")
@@ -49,8 +72,11 @@ _BUCKETS: tuple[tuple[tuple[str, ...], tuple[str, ...], str], ...] = (
     ((), ("out of stock", "oos", "inventory issue"), "缺货取消"),
     ((), ("pricing error",), "定价错误取消"),
     ((), ("ship window expired", "shipping window expired"), "超发货窗口取消"),
-    ((), ("address not serviceable",), "误标地址不可送达"),
+    # 官方文档写 "address not serviceable",生产报表 sheet 是
+    # "Address is not serviceable" —— 用两边都含的片段匹配
+    ((), ("not serviceable",), "误标地址不可送达"),
     ((), ("customer requested", "customer request"), "买家主动取消"),
+    ((), ("customer cancellation",), "买家取消"),
     ((), ("customer fraud",), "买家欺诈取消"),
     ((), ("seller cancel", "cancelled by seller", "canceled by seller"),
      "卖家取消"),
@@ -85,10 +111,40 @@ _BUCKETS: tuple[tuple[tuple[str, ...], tuple[str, ...], str], ...] = (
     (("srr",), ("returns and refunds", "return refund"), "咨询:退货退款"),
     (("srr",), ("item issue", "product issue"), "咨询:商品问题"),
     (("srr",), ("feedback",), "咨询:评价"),
-    # 只表明"算不算卖家责任"、不含原因的桶名(官方两 sheet 版式)
-    ((), ("seller accountable", "accountable"), ""),   # 空 = 无信息,继续降级
+    # ── 以下为 2026-09-03 生产报表实测桶名(官方标准页没列,报表里真在用)──
+    # 退款率 / 退货率 / 未收到 三张共用一套商品与包裹侧的原因词
+    ((), ("incorrect item", "wrong item"), "错发商品"),
+    ((), ("item arrived damaged",), "到货破损"),
+    ((), ("damaged",), "商品破损"),
+    ((), ("defective",), "商品有瑕疵"),
+    ((), ("not as described pictured",), "与描述/图片不符"),
+    ((), ("item not as described", "not as described"), "与描述不符"),
+    ((), ("item size or comfort",), "尺寸或舒适度不合"),
+    ((), ("lost after delivery",), "妥投后丢失"),
+    ((), ("lost",), "包裹丢失"),
+    ((), ("item missing", "missing item"), "商品缺失"),
+    ((), ("arrived late",), "到货晚"),
+    ((), ("seller issued refund",), "卖家已主动退款"),
+    ((), ("no longer wanted",), "买家不想要了"),
+    ((), ("change mind lower price",), "买家改主意:别处更便宜"),
+    ((), ("change mind no longer wanted",), "买家改主意:不想要了"),
+    ((), ("bought somewhere else",), "已在别处买到"),
+    ((), ("miscellaneous",), "其他原因"),   # 见 _LOW_INFO_ZH:不给桶名当括号补语
+    # 只表明"算不算卖家责任"、或只重复指标名、不含原因的桶名 —— 空 = 无信息,
+    # 继续往下降级(别把「Negative Feedback」当成差评的原因写进问题描述)
+    ((), ("seller accountable", "accountable"), ""),
     ((), ("not accountable", "non seller accountable"), ""),
+    ((), ("negative feedback",), ""),
 )
+
+# 明确表示"没填/不适用"的取值:必须**整串相等**才算(子串匹配会误伤,
+# 例如 "n a" 会撞进一堆正常英文里)。命中即当无信息,继续降级
+_NO_INFO_EXACT = frozenset(("n a", "na", "none", "null", "not applicable",
+                            "unknown", "other", "others"))
+
+# 译出来也等于没说的原因:能当主原因(总比一片空白强),但不许挂在桶名后面
+# 当补语 —— 「错发商品(其他原因)」这个括号一个字的信息量都没有
+_LOW_INFO_ZH = frozenset(("其他原因",))
 
 # ③ 订单库补全:哪个指标查哪个字段(值同样过 _BUCKETS 对照,对不上原样透传)
 _CTX_FIELD = {"cancellations": "cancel_reason", "returns": "return_reason",
@@ -107,34 +163,42 @@ _GENERIC = {
 }
 
 # ── 佐证列:(表头关键词, 模板, 格式)。每指标最多取 3 条,顺序即优先级 ───────
+# 列名按 2026-09-03 生产报表实测写(M001 全 8 张):
+#   OTD  Delivered late by (Days) / Carrier / Shipping speed / Expected delivery
+#        date / Actual delivery timestamp / Tracking number / Late Delivery Reason
+#   取消 GMV loss / Category / Item ID / Item Condition / Order date /
+#        Cancellation timestamp
+#   退款 GMV loss / Category / Item ID / Item Condition / Order date / Refund Date
+#   退货 Quantity returned / Return reason description / Sales Order # / PO # /
+#        Order Line # / GMV loss        未收到 同上,数量列是 Quantity not received
+# ⚠ **不许用会撞上时间列的宽关键词**:`refund` 会命中 `Refund Date`(实测写出
+# 「退款 $2026-09-01」),`delivery date` 是 `Expected delivery date` 的子串
+# (实测「实际送达」抓成了「承诺送达」)。非时间类佐证一律跳过时间列(见 describe)。
 _MONEY, _TS = "money", "ts"
-_EV_CANCEL = ((("gmv loss", "gmv"), "损失 {}", _MONEY),
-              (("cancellation timestamp", "cancel date"), "取消于 {}", _TS))
-_EV_SHIP = ((("carrier",), "承运商 {}", ""),
-            (("tracking",), "单号 {}", ""))
+_EV_GMV = (("gmv loss", "gmv"), "损失 {}", _MONEY)
+_EV_CARRIER = (("carrier",), "承运商 {}", "")
+_EV_TRACK = (("tracking",), "单号 {}", "")
 _EVIDENCE: dict[str, tuple[tuple[tuple[str, ...], str, str], ...]] = {
-    "cancellations": _EV_CANCEL,
-    "vtr": _EV_SHIP + ((("ship date", "shipped"), "发货 {}", _TS),),
-    "otd": ((("days late", "delay days"), "迟 {} 天", ""),
-            (("expected delivery", "promised delivery", "promise date"),
-             "承诺 {}", _TS),
-            (("actual delivery", "delivered date", "delivery date"),
-             "实际 {}", _TS)) + _EV_SHIP,
-    "itemNotReceived": _EV_SHIP + ((("delivery status", "status"), "状态 {}", ""),),
-    "returns": ((("return reason",), "退货原因 {}", ""),
-                (("refund amount", "refund"), "退款 {}", _MONEY),
+    "cancellations": (_EV_GMV,
+                      (("cancellation timestamp", "cancellation date"),
+                       "取消于 {}", _TS)),
+    "vtr": (_EV_CARRIER, _EV_TRACK, (("ship date", "shipped"), "发货 {}", _TS)),
+    "otd": ((("delivered late by", "days late"), "迟 {} 天", ""),
+            _EV_CARRIER, _EV_TRACK),
+    "itemNotReceived": (_EV_GMV, (("quantity not received",), "未收 {} 件", ""),
+                        _EV_CARRIER),
+    "returns": (_EV_GMV, (("quantity returned",), "退 {} 件", ""),
                 (("return date", "return created"), "退货于 {}", _TS)),
-    "refunds": ((("refund amount", "refund"), "退款 {}", _MONEY),
-                (("refund date",), "退款于 {}", _TS)),
+    "refunds": (_EV_GMV, (("refund date",), "退款于 {}", _TS)),
     "negativeFeedback": ((("rating", "star"), "评分 {}", ""),
-                         (("comment", "review", "feedback"), "评论 {}", "")),
+                         (("comment", "review"), "评论 {}", ""), _EV_GMV),
     "srr": ((("response time", "first response"), "响应 {}", ""),
             (("inquiry", "conversation", "topic"), "咨询 {}", "")),
 }
 _EV_LIMIT = 3           # 佐证最多 3 条:问题描述是给人扫一眼的,不是第二份明细
 _EV_VALUE_MAX = 40      # 单条佐证值上限
 
-_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})")
+_TS_RE = re.compile(r"\d{4}-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?")
 
 
 def _fmt(value: str, fmt: str) -> str:
@@ -145,8 +209,12 @@ def _fmt(value: str, fmt: str) -> str:
     if fmt == _TS:
         m = _TS_RE.search(v)
         if m:
-            out = f"{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}"
-            return out + " UTC" if v.rstrip().upper().endswith("UTC") else out
+            out = f"{m.group(1)}-{m.group(2)}"          # 纯日期列只到月日
+            if m.group(3):
+                out += f" {m.group(3)}:{m.group(4)}"
+                if v.rstrip().upper().endswith("UTC"):
+                    out += " UTC"
+            return out
         return v[:_EV_VALUE_MAX]
     return v[:_EV_VALUE_MAX]
 
@@ -181,7 +249,7 @@ def _bucket_zh(metric: str, raw: str) -> tuple[str, str]:
     再按通用词条;命中"只说责任归属"的空词条 = 有桶名但不含原因,当无信息处理。
     """
     text = _key(raw)
-    if not text:
+    if not text or text in _NO_INFO_EXACT:
         return "", ""
     for scoped in (True, False):
         hits: list[tuple[str, str]] = []
@@ -201,14 +269,21 @@ def classify(metric: str, sub_category, detail, accountable=None,
     → 输出:(中文原因, 未归类桶名原文);未归类时原文照样进原因,不吞。
 
     accountable 传 None 表示未知(按计入绩效处理);ctx 见模块头 ③。
+    未归类只在**它真的被写进原因**时才回报 —— 已经翻译出中文的行不该报警。
     """
     cells = _cells(detail)
-    unknown = ""
-    for raw in (_pick(cells, _REASON_HEADERS, skip_time=True), sub_category):
-        zh, miss = _bucket_zh(metric, raw)
-        if zh:
-            return zh, ""
-        unknown = unknown or miss
+    sheet_zh, sheet_miss = _bucket_zh(metric, sub_category)
+    row_zh, row_miss = _bucket_zh(
+        metric, _pick(cells, _REASON_COL.get(metric, ()) + _REASON_HEADERS,
+                      skip_time=True))
+    # sheet 桶名 = 沃尔玛把这单记在哪一类缺陷上(「为什么算我头上」),
+    # 行内原因列 = 这单具体发生了什么(实测两者可以不同:sheet「Incorrect item」
+    # 而买家填「Not as described/pictured」)。都有就都说,别丢掉任何一头
+    if sheet_zh and row_zh and row_zh != sheet_zh and row_zh not in _LOW_INFO_ZH:
+        return f"{sheet_zh}({row_zh})", ""
+    if sheet_zh or row_zh:
+        return sheet_zh or row_zh, ""
+    unknown = sheet_miss or row_miss
     field = _CTX_FIELD.get(metric)
     if field and ctx and str(ctx.get(field) or "").strip():
         zh, miss = _bucket_zh(metric, ctx[field])
@@ -243,7 +318,7 @@ def describe(metric: str, sub_category, detail, accountable=None,
     cells = _cells(detail)
     parts = []
     for needles, tpl, fmt in _EVIDENCE.get(metric, ()):
-        val = _pick(cells, needles)
+        val = _pick(cells, needles, skip_time=(fmt != _TS))
         if not val and "carrier" in needles:
             val = str((ctx or {}).get("carrier") or "")
         if not val and "tracking" in needles:

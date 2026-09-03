@@ -45,10 +45,23 @@ def test_vtr_official_buckets_become_chinese_reasons():
         "承运商无扫描 · 承运商 FedEx / 单号 3928392839283"
 
 
-def test_row_reason_column_beats_sheet_name():
-    """报表自己给了原因列时以它为准(优先级 ① > ②)。"""
+def test_row_reason_fills_in_when_the_sheet_name_says_nothing():
+    """sheet 只写「Seller Accountable」时不含原因,靠行内原因列。"""
     row = {"PO #": "1", "Defect reason": "Invalid tracking ID"}
     assert perf_reason.classify("vtr", "Seller Accountable", row)[0] == "追踪号无效"
+
+
+def test_sheet_bucket_and_row_reason_are_both_kept_when_they_differ():
+    """sheet 桶 = 记在哪一类缺陷上,行内原因 = 具体发生了什么;实测会不同。"""
+    assert perf_reason.classify("returns", "Incorrect item", {
+        "Return reason description": "Not as described/pictured"})[0] == \
+        "错发商品(与描述/图片不符)"
+    # 一样就不重复说
+    assert perf_reason.classify("returns", "Damaged", {
+        "Return reason description": "Damaged"})[0] == "商品破损"
+    # 补语等于没说时也不挂上去
+    assert perf_reason.classify("refunds", "Incorrect item", {
+        "Refund reason": "Miscellaneous"})[0] == "错发商品"
 
 
 def test_product_category_column_is_not_a_reason():
@@ -110,14 +123,34 @@ def test_unknown_metric_returns_none_for_the_caller_to_fall_back():
 
 
 def test_evidence_is_capped_and_formatted():
-    """佐证最多 3 条:问题描述是给人扫一眼的,不是第二份明细。"""
-    row = {"Days late": "3", "Expected delivery date": "2026-08-28 00:00:00 UTC",
-           "Actual delivery date": "2026-08-31 12:00:00 UTC",
-           "Carrier": "USPS", "Tracking Number": "TRK1"}
+    """佐证最多 3 条:问题描述是给人扫一眼的,不是第二份明细。列名用真实的。"""
+    row = {"Delivered late by (Days)": "3", "Carrier": "USPS",
+           "Shipping speed": "STANDARD", "Tracking number": "TRK1",
+           "Expected delivery date": "2026-08-28",
+           "Actual delivery timestamp": "2026-08-31 12:00:00 UTC"}
     desc = perf_reason.describe("otd", "Late Delivery", row)
-    assert desc == ("送达晚 · 迟 3 天 / 承诺 08-28 00:00 UTC / "
-                    "实际 08-31 12:00 UTC")
+    assert desc == "送达晚 · 迟 3 天 / 承运商 USPS / 单号 TRK1"
     assert desc.count(" / ") == 2
+
+
+def test_a_date_column_never_lands_in_a_money_slot():
+    """退款报表没有金额列,只有 GMV loss —— 宽 needle `refund` 会撞上
+    `Refund Date`,实测写出过「退款 $2026-09-01」。"""
+    desc = perf_reason.describe("refunds", "Lost", {
+        "GMV loss": "38.47", "Category": "DISPOSABLE NAPKINS",
+        "Refund Date": "2026-09-01"})
+    assert desc == "包裹丢失 · 损失 $38.47 / 退款于 09-01"
+    assert "$2026" not in desc
+
+
+def test_actual_delivery_is_not_the_expected_one():
+    """`delivery date` 是 `Expected delivery date` 的子串:实测「实际送达」
+    抓成了「承诺送达」,两列打出同一个值。现在 OTD 佐证只用迟到天数+物流。"""
+    desc = perf_reason.describe("otd", "Carrier Delays", {
+        "Expected delivery date": "2026-09-01",
+        "Actual delivery timestamp": "2026-09-03 04:12:00 UTC",
+        "Delivered late by (Days)": "2", "Carrier": "China Post"})
+    assert desc == "承运商延误 · 迟 2 天 / 承运商 China Post"
 
 
 def test_parse_problem_report_writes_the_reason_not_the_flattened_row():
@@ -166,8 +199,85 @@ def test_a_date_column_is_never_mistaken_for_a_reason():
 
 
 def test_evidence_does_not_repeat_the_reason():
-    """原因取自「Return reason」列时,佐证里不再复述同一句。"""
-    desc = perf_reason.describe("returns", "Seller Accountable", {
-        "PO #": "1", "Return reason": "Defective item",
-        "Refund amount": "23.10"})
-    assert desc == "Defective item · 退款 $23.10"
+    """原因原样透传时,值相同的佐证列不再复述同一句。"""
+    desc = perf_reason.describe("negativeFeedback", "Negative Feedback", {
+        "Feedback reason": "Broken on arrival", "Rating": "1",
+        "Comments": "Broken on arrival"})
+    assert desc == "Broken on arrival · 评分 1"
+
+
+def test_row_reason_column_beats_a_reason_shaped_neighbour():
+    """一张报表可能有多列名字里带 reason:必须命中指标专属的那一列。
+    实测 INR 的 Return reason description 被泛化匹配抢走过。"""
+    assert perf_reason.classify("itemNotReceived", "", {
+        "Quantity not received": "1",
+        "Return reason description": "Seller Issued Refund",
+        "Some other reason": "Miscellaneous"})[0] == "卖家已主动退款"
+
+
+# ── 生产语料回归(2026-09-03 M001 全 8 张报表 + 库内存量行实测)───────────────
+# 这一组是真跑一轮拿到的**全部**桶名/原因取值,一条都不许回落成英文原文或
+# 「报表未给原因」。官方改版式先在这里红。
+PRODUCTION = [
+    # (指标, sheet 名, 原因列取值, 期望中文原因)
+    ("otd", "Carrier EDD later than promised", "", "承运商预计送达晚于承诺"),
+    ("otd", "Carrier Delays", "", "承运商延误"),
+    ("otd", "Late Shipment", "", "发货晚"),
+    ("otd", "", "Carrier exception", "承运商异常"),
+    ("cancellations", "Address is not serviceable", "", "误标地址不可送达"),
+    ("cancellations", "Out-of-stock", "", "缺货取消"),
+    ("cancellations", "Pricing errors", "", "定价错误取消"),
+    ("cancellations", "Ship window expired", "", "超发货窗口取消"),
+    ("cancellations", "", "Customer Cancellations", "买家取消"),
+    ("vtr", "Misleading tracking", "", "追踪信息不实"),
+    ("refunds", "Lost", "", "包裹丢失"),
+    ("refunds", "Incorrect item", "", "错发商品"),
+    ("refunds", "Defective", "", "商品有瑕疵"),
+    ("refunds", "Damaged", "", "商品破损"),
+    ("refunds", "", "Miscellaneous", "其他原因"),
+    ("refunds", "", "Change_Mind Lower Price", "买家改主意:别处更便宜"),
+    ("refunds", "", "Change_Mind No Longer Wanted", "买家改主意:不想要了"),
+    ("returns", "Incorrect item", "", "错发商品"),
+    ("returns", "Defective", "", "商品有瑕疵"),
+    ("returns", "Damaged", "", "商品破损"),
+    ("returns", "Arrived late", "", "到货晚"),
+    ("returns", "", "Item arrived damaged", "到货破损"),
+    ("returns", "", "Not as described/pictured", "与描述/图片不符"),
+    ("returns", "", "No Longer Wanted", "买家不想要了"),
+    ("returns", "", "Bought Somewhere Else", "已在别处买到"),
+    ("itemNotReceived", "Lost", "", "包裹丢失"),
+    ("itemNotReceived", "Item Missing", "", "商品缺失"),
+    ("itemNotReceived", "", "Lost After Delivery", "妥投后丢失"),
+    ("itemNotReceived", "", "Seller Issued Refund", "卖家已主动退款"),
+    ("negativeFeedback", "Negative Feedback", "Item size or comfort", "尺寸或舒适度不合"),
+    ("negativeFeedback", "Negative Feedback", "Item not as described", "与描述不符"),
+    ("negativeFeedback", "Negative Feedback", "Missing item", "商品缺失"),
+    ("srr", "Miscellaneous", "", "其他原因"),
+    ("srr", "Track order", "", "咨询:查订单"),
+]
+_REASON_HEADER = {"otd": "Late Delivery Reason", "cancellations": "Cancellation reason",
+                  "refunds": "Refund reason", "returns": "Return reason description",
+                  "itemNotReceived": "Return reason description",
+                  "negativeFeedback": "Feedback reason"}
+
+
+def test_every_production_bucket_is_translated():
+    seen: dict[str, int] = {}
+    bad = []
+    for metric, sheet, reason_val, want in PRODUCTION:
+        row = {_REASON_HEADER[metric]: reason_val} if reason_val else {}
+        got, miss = perf_reason.classify(metric, sheet, row)
+        if got != want or miss:
+            bad.append(f"{metric}/{sheet or '(空)'}/{reason_val or '-'}: {got!r}")
+        perf_reason.describe(metric, sheet, row, unknown_seen=seen)
+    assert not bad, "生产桶名归类不符:\n" + "\n".join(bad)
+    assert seen == {}, f"生产语料里还有未收录桶名:{seen}"
+
+
+def test_na_and_negative_feedback_sheet_carry_no_reason():
+    """「N/A」「Negative Feedback」不是原因:必须继续降级,别写进问题描述。"""
+    assert perf_reason.classify("returns", "", {
+        "Return reason description": "N/A"}, accountable=False)[0] == \
+        "买家退货,沃尔玛判非卖家责任"
+    assert perf_reason.classify("negativeFeedback", "Negative Feedback",
+                                {})[0] == "买家差评"

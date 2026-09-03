@@ -123,12 +123,14 @@ def test_export_prefills_only_what_the_rules_can_extract(conn, reports):
     body = (reports / wf._DEFAULT_FILE).read_text(encoding="utf-8-sig").splitlines()
     assert body[0].split(",") == wf._HEADER
     rows = {ln.split(",")[1]: ln.split(",") for ln in body[1:]}
-    assert rows[_WRAPPED][4:7] == ["B0CLCX3Q1Z", "wrapped", "B0CLCX3Q1Z"]
-    assert rows[_SUFFIXED][4:7] == ["B0822D9QQK", "guess", ""]   # 提议给了,确认留空
-    assert rows[_NUMERIC][4:7] == ["", "", ""]
-    assert rows[_WRAPPED][8] == "PUBLISHED"
-    assert rows[_NUMERIC][8] == "已缺席"
-    assert rows[_OTHER][8] == "在架表无此行"       # 登记簿有行、在架表没有是正常的
+    # 第 8 列 =「确认来源类型」:与来源码**同步预填**,填了码却空着类型就会
+    # 被按默认算成 amz —— 那正是 2026-09-03 要消灭的静默默认
+    assert rows[_WRAPPED][4:8] == ["B0CLCX3Q1Z", "wrapped", "B0CLCX3Q1Z", "amz"]
+    assert rows[_SUFFIXED][4:8] == ["B0822D9QQK", "guess", "", ""]  # 提议给了,确认留空
+    assert rows[_NUMERIC][4:8] == ["", "", "", ""]
+    assert rows[_WRAPPED][9] == "PUBLISHED"
+    assert rows[_NUMERIC][9] == "已缺席"
+    assert rows[_OTHER][9] == "在架表无此行"       # 登记簿有行、在架表没有是正常的
 
 
 def test_export_honours_an_explicit_out_path(conn, tmp_path):
@@ -175,7 +177,8 @@ def test_dry_run_counts_the_visibility_flip_without_writing(conn, tmp_path):
     path = _csv(tmp_path, wf._NEED_COLS, ["T1", _WRAPPED, "B0CLCX3Q1Z"],
                 ["T2", _OTHER, "B0OTHERKEY"])
     out = wf.run({"file": path})
-    assert "将有 2 行" in out and "自动链看不见" in out and "自动链管得到" in out
+    assert "本次将改 2 行" in out and "2 行归成 amz" in out
+    assert "自动链看不见" in out and "自动链管得到" in out
     assert "maintenance_scan --dry-run" in out
     assert conn.wrote == []
 
@@ -205,7 +208,64 @@ def test_a_non_asin_key_is_rejected_and_named(conn, tmp_path):
     path = _csv(tmp_path, wf._NEED_COLS, ["T2", _NUMERIC, "1024600187"])
     out = wf.run({"file": path, "apply": "1"})
     assert "已归类 0 行" in out
-    assert "不是标准 ASIN(拒收)" in out and _NUMERIC in out
+    assert "不合 amz 的形态" in out and "标准 ASIN" in out and _NUMERIC in out
+    assert conn.wrote == []
+
+
+# ── 来源类型(所有者 2026-09-03:"有些并不是 amz 产品,会影响后面的事情吗")──
+
+_TYPED = (wf.COL_STORE, wf.COL_SKU, wf.COL_CONFIRM, wf.COL_CONFIRM_TYPE)
+
+
+def test_non_amz_rows_are_written_with_their_own_type(conn, tmp_path):
+    """归类不等于归成 amz。写死 amz 的后果是:一个 1688/自建的品只要填了个
+    形态合法的 ASIN,价格/标题/库存就跟着那个亚马逊页面走,断货窗口一到还会
+    被建议**永久删除** —— 全程不报错。类型必须逐行透传到 UPDATE。"""
+    path = _csv(tmp_path, _TYPED,
+                ["T1", _WRAPPED, "B0CLCX3Q1Z", "amz"],
+                ["T2", _OTHER, "MWCS26052501", "1688"])
+    out = wf.run({"file": path, "apply": "1"})
+    assert [(w[1], w[2], w[3]) for w in conn.wrote] == [
+        (_WRAPPED, "amz", "B0CLCX3Q1Z"), (_OTHER, "1688", "MWCS26052501")]
+    # 摘要必须把"其中几行归成 amz"单独说清 —— 只有那几行的破坏面被打开
+    assert "已归类 2 行" in out and "1 行归成 amz" in out
+
+
+def test_key_gate_is_per_type_not_one_ruler_for_all():
+    """四种出身的"键"不是同一种东西:amz 是 ASIN、match 是 GTIN、
+    1688/self 是货源侧货号。用 amz 那把尺子量 1688 = 把它整批冤枉拒收。"""
+    ok = ls.source_key_ok
+    assert ok("amz", "B0822D9QQK") and not ok("amz", "MWCS26052501")
+    assert ok("1688", "MWCS26052501") and ok("self", "M0000004")
+    assert ok("match", "0193575043586") and not ok("match", "B0822D9QQK")
+    assert not ok("1688", "") and not ok("self", "有 空格")
+
+
+def test_unknown_type_is_refused_not_written(conn, tmp_path):
+    """归类的定义就是"离开 unknown"。允许写回 unknown = 给自己开一条把已归类
+    行打回盲区的路,而且是从一个人工清单上打回去的。"""
+    path = _csv(tmp_path, _TYPED, ["T1", _WRAPPED, "B0CLCX3Q1Z", "unknown"])
+    out = wf.run({"file": path, "apply": "1"})
+    assert "来源类型不认识" in out and conn.wrote == []
+
+
+def test_missing_type_column_defaults_to_amz_but_says_so(conn, tmp_path):
+    """旧版清单(没有类型列)仍然能用 —— 硬性要求会让所有者已经填好的一份
+    文件整个作废。但默认成 amz 这件事**必须在摘要里喊出来**,不许静默。"""
+    path = _csv(tmp_path, wf._NEED_COLS, ["T1", _WRAPPED, "B0CLCX3Q1Z"])
+    out = wf.run({"file": path, "apply": "1"})
+    assert "全部按 amz 算" in out
+    assert [(w[1], w[2]) for w in conn.wrote] == [(_WRAPPED, "amz")]
+
+
+def test_type_breakdown_is_reported_before_apply(conn, tmp_path):
+    """按下 apply 之前,人要看得见"这一批里有多少行会被交给破坏面"。"""
+    path = _csv(tmp_path, _TYPED,
+                ["T1", _WRAPPED, "B0CLCX3Q1Z", "amz"],
+                ["T2", _OTHER, "MWCS26052501", "1688"])
+    out = wf.run({"file": path})
+    assert "amz 1 行" in out and "1688 1 行" in out
+    assert "1 行归成 amz" in out and "1 行只是拿到身份" in out
     assert conn.wrote == []
 
 

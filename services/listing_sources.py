@@ -26,6 +26,7 @@ source_type 取值 + 对应 provider,管道零改动。
 """
 
 import logging
+import re
 
 from services import sku_asin
 
@@ -94,6 +95,53 @@ def replaced_skus(conn, store: str) -> set[str]:
 #  那条 UPDATE 的**唯一实现**。
 # ══════════════════════════════════════════════════════════════════════════════
 
+#: 归类允许写成的四个来源类型 → (人读名, 键闸)。**闸按类型分**:登记簿的键
+#: 错了下游一声不吭,而四种出身的"键"根本不是同一种东西 ——
+#: amz 的键是 ASIN、match 的键是匹配 GTIN、1688/self 的键是货源侧自己的货号。
+#: 用 amz 那把尺子去量 1688 货号,结果是把它整批拒收;反过来不设闸,则是把
+#: 一个非 amz 的品登记成 amz ⇒ 它的价格/标题/库存从此跟着某个亚马逊页面走,
+#: 断货窗口一到还会被建议**永久删除**(所有者 2026-09-03 当场问出来的口子)。
+#: ⚠ SOURCE_UNKNOWN **不在表内**:归类的定义就是"离开 unknown",允许写回去
+#: 等于给自己开一条把已归类行打回盲区的路。
+RECLASSIFY_TYPES: dict[str, tuple[str, str]] = {
+    SOURCE_AMZ: ("亚马逊搬运", "标准 ASIN(10 位含字母)"),
+    SOURCE_MATCH: ("跟卖", "GTIN 数字串(8~14 位)"),
+    SOURCE_1688: ("1688 货源", "货源侧货号(非空,≤64 字符)"),
+    SOURCE_SELF: ("自建", "自建货号(非空,≤64 字符)"),
+}
+
+#: 默认类型:清单没有「确认来源类型」这一列时按它算(存量绝大多数是搬运品)。
+#: 调用方**必须**在摘要里把这件事喊出来 —— 静默默认正是这条通道原来的毛病。
+RECLASSIFY_DEFAULT_TYPE = SOURCE_AMZ
+
+_GTIN = re.compile(r"^\d{8,14}$")
+
+
+def normalize_source_key(source_type: str, key) -> str:
+    """输入:来源类型 + 人填的键 → 输出:归一后的键(不做合法性判断)。
+
+    ⚠ **只有 amz / match 归一成大写**:ASIN 与 GTIN 都是大写字母数字的约定,
+    大小写不敏感;1688 / 自建的货号是货源侧的原文,大小写可能有意义,
+    动它等于把键改错 —— 而键错了下游一声不吭(§九)。
+    """
+    v = str(key or "").strip()
+    return v.upper() if source_type in (SOURCE_AMZ, SOURCE_MATCH) else v
+
+
+def source_key_ok(source_type: str, key: str) -> bool:
+    """输入:来源类型 + 已归一的键 → 输出:这个键配不配得上这个出身。
+
+    **写入前的最后一道闸**,四类各判各的(闸的语义见 RECLASSIFY_TYPES 头注)。
+    """
+    if source_type == SOURCE_AMZ:
+        return sku_asin.is_standard_asin(key)
+    if source_type == SOURCE_MATCH:
+        return bool(_GTIN.fullmatch(key))
+    if source_type in (SOURCE_1688, SOURCE_SELF):
+        return bool(key) and len(key) <= 64 and not any(c.isspace() for c in key)
+    return False
+
+
 #: 归类改写在 workflow 列留下的记号(登记簿上唯一的一处痕迹,见 reclassify 头注)。
 RECLASSIFY_WORKFLOW = "sources_reclassify"
 
@@ -146,7 +194,8 @@ def pending_reclassify(conn) -> list[dict]:
 
 def plan_reclassify(conn, rows: list[dict],
                     overwrite: bool = False) -> tuple[list[dict], dict]:
-    """输入:连接 + [{store, sku, source_key}] + overwrite → 输出:(可改行, 跳过点名)。
+    """输入:连接 + [{store, sku, source_key, source_type?}] + overwrite
+    → 输出:(可改行, 跳过点名)。
 
     **只读**;`reclassify` 真改之前走的就是本函数,所以预览报的"本次会改多少行"
     与真跑改出来的行数同口径 —— 判据一处出生,不许在工作流里另算一遍
@@ -165,7 +214,8 @@ def plan_reclassify(conn, rows: list[dict],
     want, seen = [], set()
     for r in rows:
         store, sku = str(r.get("store") or "").strip(), str(r.get("sku") or "").strip()
-        key = str(r.get("source_key") or "").strip().upper()
+        stype = str(r.get("source_type") or "").strip() or RECLASSIFY_DEFAULT_TYPE
+        key = normalize_source_key(stype, r.get("source_key"))
         if not store or not sku:
             _skip("店铺或 SKU 为空(拒收)", f"{store or '(空)'}/{sku or '(空)'}")
             continue
@@ -173,12 +223,20 @@ def plan_reclassify(conn, rows: list[dict],
             _skip("清单内重复,只认第一条", f"{store}/{sku}")
             continue
         seen.add((store, sku))
-        # 形态闸在**写入之前**:登记簿的键错了下游一声不吭(采不到源数据 →
-        # 判成"源头没了" → 清库存/删除),灌垃圾键比不归类危险得多
-        if not sku_asin.is_standard_asin(key):
-            _skip("来源码不是标准 ASIN(拒收)", f"{store}/{sku}→{key or '(空)'}")
+        if stype not in RECLASSIFY_TYPES:
+            _skip(f"来源类型不认识(只收 {'/'.join(RECLASSIFY_TYPES)};拒收)",
+                  f"{store}/{sku}→{stype}")
             continue
-        want.append({"store": store, "sku": sku, "source_key": key})
+        # 形态闸在**写入之前**,而且**按类型分**:登记簿的键错了下游一声不吭
+        # (采不到源数据 → 判成"源头没了" → 清库存/删除),灌垃圾键比不归类
+        # 危险得多。四种出身的键不是同一种东西,闸也就不能是同一把尺子。
+        if not source_key_ok(stype, key):
+            _skip(f"来源码不合 {stype} 的形态"
+                  f"({RECLASSIFY_TYPES[stype][1]};拒收)",
+                  f"{store}/{sku}→{key or '(空)'}")
+            continue
+        want.append({"store": store, "sku": sku,
+                     "source_type": stype, "source_key": key})
     if not want:
         return [], skipped
 
@@ -194,7 +252,7 @@ def plan_reclassify(conn, rows: list[dict],
             _skip("登记簿里没有这一行(先 sources_backfill)", f"{w['store']}/{w['sku']}")
             continue
         cur_type, cur_key = cur_state
-        if cur_type == SOURCE_AMZ and cur_key == w["source_key"]:
+        if cur_type == w["source_type"] and cur_key == w["source_key"]:
             _skip("已经是这个值(幂等重跑)", f"{w['store']}/{w['sku']}")
             continue
         if not (cur_type == SOURCE_UNKNOWN or not cur_key) and not overwrite:
@@ -207,16 +265,25 @@ def plan_reclassify(conn, rows: list[dict],
 
 def reclassify(conn, rows: list[dict],
                overwrite: bool = False) -> tuple[int, dict]:
-    """输入:连接 + [{store, sku, source_key}] + overwrite → 输出:(改写行数, 跳过点名)。
+    """输入:连接 + [{store, sku, source_key, source_type?}] + overwrite
+    → 输出:(改写行数, 跳过点名)。
 
     **全仓唯一一条 UPDATE source_type / source_key 的路径**(register 只负责首次
     登记,ON CONFLICT DO NOTHING;弃码/改码五列另有唯一写者 services/sku_codec)。
-    按 (store, sku) 定位,一律写成 `source_type='amz'` + 人给的 `source_key`,
-    并在 workflow 列留下 RECLASSIFY_WORKFLOW 的记号。
+    按 (store, sku) 定位,写成人给的 `source_type` + `source_key`,并在 workflow
+    列留下 RECLASSIFY_WORKFLOW 的记号。类型缺省 `RECLASSIFY_DEFAULT_TYPE`(amz),
+    取值限 `RECLASSIFY_TYPES` 四档,键按类型各过各的闸。
 
-    ⚠ **这一步的后果是把商品交还自动链**:改完的行从此满足消费方那条
+    ⚠ **类型不是摆设**(所有者 2026-09-03 当场问出来的口子):此前本函数写死
+    `amz`,于是一个 1688 或自建的品只要填了个形态合法的 ASIN,就会被登记成
+    搬运品 —— 它的价格/标题/库存从此跟着那个亚马逊页面走,断货窗口一到还会
+    被建议**永久删除**,而且全程不报错。非 amz 的行归类之后照样有身份、
+    照样进不了 amz 那三条 provider,这正是分类型的意义。
+
+    ⚠ **归成 amz 的那一批,后果是把商品交还自动链**:它们从此满足消费方那条
     `source_type='amz' AND source_key IS NOT NULL` 的 JOIN,于是被 amz 快照驱动的
     改价 / 清库存 / **删除**管到 —— 盲区变辖区,破坏面对这批行第一次打开。
+    归成 match / 1688 / self 的行只是拿到身份,没有任何 provider 认领它们。
     调用方必须让人先看清单再放行(纪律与 sources_backfill 同款:改完先
     `maintenance_scan --dry-run` 看意图量,尤其删除段)。
 
@@ -240,7 +307,7 @@ def reclassify(conn, rows: list[dict],
     with conn.cursor() as cur:
         for w in todo:
             cur.execute(_RECLASSIFY_SQL,
-                        (SOURCE_AMZ, w["source_key"], RECLASSIFY_WORKFLOW,
+                        (w["source_type"], w["source_key"], RECLASSIFY_WORKFLOW,
                          w["store"], w["sku"], overwrite, SOURCE_UNKNOWN))
             if cur.rowcount:
                 changed += 1

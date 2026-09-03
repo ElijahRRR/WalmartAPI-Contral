@@ -846,24 +846,29 @@ def upsert_perf_events(conn, rows: list[dict]) -> int:
             r["detail"] = json.dumps(r["detail"], ensure_ascii=False, default=str)
     sql = """
         INSERT INTO orders.perf_events
-            (store, po_id, metric, period, order_line_id, sku, accountable, status, detail)
+            (store, po_id, metric, period, order_line_id, sku, accountable, status,
+             sub_category, detail)
         VALUES (%(store)s, %(po_id)s, %(metric)s, %(period)s, %(order_line_id)s,
-                %(sku)s, %(accountable)s, %(status)s, %(detail)s::jsonb)
+                %(sku)s, %(accountable)s, %(status)s, %(sub_category)s,
+                %(detail)s::jsonb)
         ON CONFLICT (po_id, metric, period) DO UPDATE SET
             order_line_id = COALESCE(EXCLUDED.order_line_id, orders.perf_events.order_line_id),
             sku = COALESCE(EXCLUDED.sku, orders.perf_events.sku),
             accountable = EXCLUDED.accountable, status = EXCLUDED.status,
+            sub_category = COALESCE(EXCLUDED.sub_category, orders.perf_events.sub_category),
             detail = EXCLUDED.detail, last_seen_at = now()
         WHERE (orders.perf_events.order_line_id, orders.perf_events.sku,
                orders.perf_events.accountable, orders.perf_events.status,
-               orders.perf_events.detail)
+               orders.perf_events.sub_category, orders.perf_events.detail)
           IS DISTINCT FROM
               (COALESCE(EXCLUDED.order_line_id, orders.perf_events.order_line_id),
                COALESCE(EXCLUDED.sku, orders.perf_events.sku),
-               EXCLUDED.accountable, EXCLUDED.status, EXCLUDED.detail)
+               EXCLUDED.accountable, EXCLUDED.status,
+               COALESCE(EXCLUDED.sub_category, orders.perf_events.sub_category),
+               EXCLUDED.detail)
     """
     defaults = {"order_line_id": None, "sku": None, "accountable": None,
-                "status": None, "detail": None}
+                "status": None, "sub_category": None, "detail": None}
     with conn.cursor() as cur:
         cur.executemany(sql, [{**defaults, **r} for r in rows])
     return len(rows)
@@ -896,6 +901,8 @@ def perf_rows_from_problems(store_name: str, metric: str, rows: list[dict],
         out.append({"store": store_name, "po_id": po, "metric": metric,
                     "period": str(period),
                     "sku": sku,
+                    # 缺陷桶名(报表 sheet 标题)= 归因主线索,见 services/perf_reason
+                    "sub_category": str(r.get("sub_category") or "") or None,
                     # v3 身份 = PO+SKU:解析到 SKU 即直接建键,订单不在库里也成立
                     "order_line_id": make_order_line_id(po, sku) if sku else None,
                     "accountable": accountable,

@@ -752,6 +752,10 @@ CREATE TABLE IF NOT EXISTS orders.perf_events (   -- 绩效问题订单(逐周�
     last_seen_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (po_id, metric, period)    -- PO 全局唯一,店铺只做归属
 );
+-- 报表 sheet 名 = 沃尔玛的缺陷桶(No carrier scan / Out of stock…),**是原因本身**,
+-- 不在行里、只在 sheet 标题上;2026-09-03 前解析完就丢,于是「问题描述」只能拍平
+-- 整行 ⇒ 与「明细」一字不差。留下来供 services/perf_reason 归因(加列后须 db_init)
+ALTER TABLE orders.perf_events ADD COLUMN IF NOT EXISTS sub_category text;
 CREATE INDEX IF NOT EXISTS perf_events_store_idx ON orders.perf_events (store, metric, period);
 CREATE INDEX IF NOT EXISTS perf_events_line_idx ON orders.perf_events (order_line_id);
 -- 口径:当期状态取 period 最新一行;历史累计 COUNT(DISTINCT (po_id,metric))

@@ -419,7 +419,7 @@ def test_product_rows_have_the_same_shape_as_production_candidates():
     assert audit_rules.PRODUCT_ROW_FROM in ar._PRODUCT_SQL
     from workflows import product_audit
     assert audit_rules.PRODUCT_ROW_COLUMNS in product_audit._candidate_sql(
-        "x", "")
+        "x", "", None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

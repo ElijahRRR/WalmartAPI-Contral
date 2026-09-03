@@ -3,7 +3,7 @@
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh product_audit maintenance_scan problem_scan maintenance problem_product_cleanup -p product_refresh:wait=1 -p product_audit:mode=online -p product_audit:stages=L0 -p product_audit:limit=1000000
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh product_audit maintenance_scan problem_scan maintenance problem_product_cleanup -p product_refresh:wait=1 -p product_audit:mode=online -p product_audit:stages=L0
 ```
 
 这条链跑的是:catalog_sync → sources_backfill → product_refresh → product_audit → maintenance_scan → problem_scan → maintenance → problem_product_cleanup。

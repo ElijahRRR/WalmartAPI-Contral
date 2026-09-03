@@ -778,3 +778,107 @@ def test_repts_takes_candidates_by_judgement_change_not_by_version():
 def test_repts_is_a_named_human_action_so_it_skips_the_24h_guard():
     """与 rerule / force 同类:人点名要审的,点了就得审。"""
     assert pa._is_forced({"repts": "1"}, {}) is True
+
+
+# ── ⑦ limit 到底限住了什么(所有者 2026-09-03 实遇 + 定稿)────────────────
+#
+# 实遇:「日志显示上限是 N 个,但是实际上审核了更多的产品」。病根是三步接力 ——
+# `_claim_from_sheet` 有意不截断 ASIN 列表(已有结论的不进候选,交给谓词过滤),
+# `from_sheet` 又是**借 asins= 这条路**实现的,而 run() 里为点名场景写的
+# 「指定 ASIN 时 limit 不许截断」把 limit 顶成了整张表的待审数。三步各自都讲得通,
+# 合起来 = 上架表这条路的 limit 恒等于没有,而摘要还在说"只判 N 个"。
+#
+# 定稿:**缺省不限量;给了 limit 就真截断**(哪条通道都一样)。
+
+class _LimitProbe:
+    """跑一遍 run() 的取候选那一步,把候选查询真正拿到的 limit 抓出来。"""
+
+    class _Stop(Exception):
+        pass
+
+    class _Cur:
+        def __init__(self, todo):
+            self._todo = todo
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            pass
+
+        def fetchall(self):
+            return [("未审", self._todo)]
+
+    class _Conn:
+        def __init__(self, todo):
+            self._todo = todo
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _LimitProbe._Cur(self._todo)
+
+    def __init__(self, monkeypatch, n_sheet):
+        self.seen = {}
+        rows = [{"rownum": i + 2, "asin": f"B0{i:08d}", "store": "T1"}
+                for i in range(n_sheet)]
+        monkeypatch.setattr(listing_sheet, "audit_targets", lambda: rows)
+        monkeypatch.setattr(pa.db, "pg_conn",
+                            lambda: _LimitProbe._Conn(n_sheet))
+        monkeypatch.setattr(pa, "_close_gap", lambda *a, **k: [])
+        monkeypatch.setattr(pa, "_cap_by_connections", lambda w: (w, ""))
+        monkeypatch.setattr(pa.audit_rules, "load_context",
+                            lambda conn: object())
+        monkeypatch.setattr(pa.audit_l3, "policy_enum", lambda known: ())
+        monkeypatch.setattr(pa, "_iter_candidates", self._grab)
+
+    def _grab(self, sql, query_params, chunk=2000):
+        self.seen = {"limit": query_params.get("limit", "(未绑定)"),
+                     "n_asins": len(query_params.get("asins", ())),
+                     "sql_capped": "LIMIT %(limit)s" in sql}
+        raise _LimitProbe._Stop
+
+    def run(self, params):
+        with pytest.raises(_LimitProbe._Stop):
+            pa.run({"from_sheet": "1", "execute": False, **params})
+        return self.seen
+
+
+def test_from_sheet_limit_actually_caps_the_judging(monkeypatch):
+    """⚠ 给了 limit 就得真截断 —— 这条钉的正是所有者实遇的那个 bug。
+
+    旧行为:limit 被 `max(limit, len(asins))` 顶成 3000,摘要却说"只判 500 个"。
+    """
+    probe = _LimitProbe(monkeypatch, n_sheet=3000)
+    got = probe.run({"limit": 500})
+    assert got["limit"] == 500, "limit 又被顶成 ASIN 总数了(那行不许回来)"
+    assert got["n_asins"] == 3000          # 整批仍交给谓词过滤(不截断领任务)
+    assert got["sql_capped"] is True
+
+
+def test_no_limit_given_means_no_cap_at_all(monkeypatch):
+    """缺省不限量:SQL 里根本没有那一段,也不绑 limit 参数。"""
+    probe = _LimitProbe(monkeypatch, n_sheet=3000)
+    got = probe.run({})
+    assert got["limit"] == "(未绑定)"
+    assert got["sql_capped"] is False
+
+
+def test_claim_from_sheet_says_unlimited_when_no_limit_given(monkeypatch):
+    """不限量也要把"这轮判多少"说出来 —— 人还会按老习惯以为有个 500 挡着。"""
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": i, "asin": f"B0ASIN{i:04d}", "store": "T1"}
+        for i in range(2, 12)])
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn([
+        ("approved", 3), ("rejected", 1), ("pending", 2), ("未审", 4)]))
+    head = pa._claim_from_sheet(None)[2]
+    body = "\n".join(head)
+    assert "不限量" in body and "6 个待审全判" in body     # pending 2 + 未审 4
+    assert "只判" not in body

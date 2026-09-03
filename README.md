@@ -13,7 +13,7 @@ python cli.py <workflow> [-p key=value ...] [--dry-run]
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 12 视图)为唯一权威状态;
-- **2687 个单元测试**(2664 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
+- **2693 个单元测试**(2670 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
 
 ---
 
@@ -163,7 +163,7 @@ MCP 工具,全部走这一条路径。它统一负责七件事:
 
 ```bash
 python cli.py list_new --dry-run              # 空跑
-python cli.py product_audit -p limit=2000     # 传参
+python cli.py product_audit -p limit=2000     # 传参(审核**缺省不限量**,要限量才给)
 python cli.py catalog_sync -p store=A085朱丽霖  # 限单店
 python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向传参
 ```

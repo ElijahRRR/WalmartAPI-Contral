@@ -468,6 +468,7 @@ python cli.py policy_sync
 python cli.py audit_replay --dry-run        # 样本规模 + 预估成本
 python cli.py audit_replay -p neg=600 -p pos=400   # 谷时段;看报告再决定下一步
 python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 90 天有动销的一批,谷时段分晚跑;pending/rejected 走 mode=nonpass
+                                            # ⚠ limit **缺省不限量**(2026-09-03):这里给 N 是为了分晚跑;不给就一轮判完
                                             # ⚠ 带软证据的产品缓存未命中要全价重付(见下条),别按"零成本"排量
 ```
 
@@ -494,6 +495,10 @@ python cli.py product_audit -p mode=stale -p active_days=90 -p limit=N   # 近 9
   R5 / R7 / R8 那几类证据的);**完全没有软证据的产品照旧命中**。
   估算 `mode=stale` 那一晚的账时按这两半分开算 —— 按"提示词没动所以不花钱"
   排量,会在谷时段跑到一半才发现钱不够。
+- **`limit` 缺省不限量**(所有者定稿 2026-09-03,与本批同分支):此前缺省 500,而
+  `from_sheet` 会把它顶成 ASIN 总数 —— 摘要写着「只判 500 个」、实际把待审的全判了。
+  现在口径只有一条:**不给就不限量,给了就真截断**。切换那几晚要控成本就显式给
+  `-p limit=N`,拿不准规模先 `--dry-run`(摘要报「共 N 个」)。
 - 回滚 = `git revert` C/B 两批(A 的转录件无害);已被新版本盖章的行要再付一次重审。
 - `error_reclass_report` 不受影响;`audit_sheet` 的 `limit=500` 在切换周可临时调低控成本。
 

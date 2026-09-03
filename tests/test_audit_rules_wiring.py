@@ -1149,9 +1149,9 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
 
 def test_candidate_sql_recent_guard_shape():
     """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
-    sql = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD)
+    sql = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD, 5)
     assert "NOT EXISTS" in sql and "interval '24 hours'" in sql
-    plain = product_audit._candidate_sql("x", "")
+    plain = product_audit._candidate_sql("x", "", 5)
     assert "NOT EXISTS" not in plain
 
 
@@ -1163,19 +1163,64 @@ def test_candidate_sql_only_formats_its_own_tail(monkeypatch):
     而吃同一份文本的 `audit_replay` 一点事没有 —— 这种耦合两边都看不出来。
     """
     # ① 拼出来的 SQL 与"前缀 + 尾段替换"逐字节相同(改写不许动 SQL 一个字)
-    got = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD)
+    got = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD, 5)
     want = ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
             + audit_rules.PRODUCT_ROW_FROM
             + product_audit._CANDIDATE_TAIL.format(
-                where="x", recent_guard=product_audit._RECENT_RUN_GUARD))
+                where="x", recent_guard=product_audit._RECENT_RUN_GUARD,
+                limit_clause=product_audit._LIMIT_CLAUSE))
     assert got == want
     assert "WHERE p.marketplace = %(marketplace)s AND (x)" in got
     assert "LIMIT %(limit)s" in got
     # ② 共享文本里出现花括号也不炸(这就是改写的全部理由)
     monkeypatch.setattr(audit_rules, "PRODUCT_ROW_COLUMNS",
                         "p.asin, p.slow -> '{a}' AS x")
-    braced = product_audit._candidate_sql("y", "")
+    braced = product_audit._candidate_sql("y", "", 5)
     assert "{a}" in braced and "AND (y)" in braced
+
+
+def test_limit_defaults_to_unlimited_and_rejects_nonsense():
+    """所有者定稿 2026-09-03:「审核这个脚本不应有默认设置的 limit,需要限制的
+    时候才手动带参数」。
+
+    此前缺省 500,而 `from_sheet` 把它顶成 ASIN 总数 —— 限流是假的、摘要那句
+    "只判 500 个"是错的、调度 note 里"存量大时加 -p limit=N"的建议也不生效。
+    """
+    assert product_audit._parse_opts({}).limit is None
+    assert product_audit._parse_opts({"limit": ""}).limit is None      # 空串同缺省
+    assert product_audit._parse_opts({"limit": "  "}).limit is None
+    assert product_audit._parse_opts({"limit": 300}).limit == 300      # int 照收
+    assert product_audit._parse_opts({"limit": "300"}).limit == 300    # cli 传字符串
+    # ⚠ 0 不是"不限量":当它讲会让人以为限住了,恰好反着 —— 宁炸不吞
+    for bad in (0, "0", -1, "-5"):
+        with pytest.raises(ValueError, match="不给就是不限量"):
+            product_audit._parse_opts({"limit": bad})
+
+
+def test_batch_head_names_the_bill_when_unlimited():
+    """不限量时"共 N 个"就是这一轮的账单,必须说破 —— 否则人按老习惯
+    以为后面还有个 500 挡着。"""
+    head = product_audit._batch_head(_CountConn(3200), "版本重审", "w", {},
+                                     None, "hint")
+    assert "共 3200 个" in head[0]
+    assert "不限量" in head[1] and "这 3200 个全判" in head[1]
+    assert "还剩" not in head[1]
+    # 一个都没有时不该冒出"这 0 个全判"
+    assert len(product_audit._batch_head(_CountConn(0), "w", "w", {},
+                                         None, "hint")) == 2
+
+
+def test_candidate_sql_has_no_limit_clause_when_unlimited():
+    """⚠ 缺省不限量(2026-09-03):LIMIT 整段不拼,而不是拼个 `LIMIT NULL`
+    去赌 PG 的语义 —— 读 SQL 的人一眼就该看出这轮有没有上限。"""
+    free = product_audit._candidate_sql("x", "", None)
+    # ⚠ 只能断言**参数化的**那一段没了:共享前缀的买盒卖家 LATERAL 自带
+    # `ORDER BY s.scraped_at DESC LIMIT 1`,写 `"LIMIT" not in free` 会误伤
+    assert "LIMIT %(limit)s" not in free
+    assert free.rstrip("\n").endswith("ORDER BY p.audited_at NULLS FIRST, "
+                                      "p.updated_at")
+    capped = product_audit._candidate_sql("x", "", 500)
+    assert capped == free.rstrip("\n") + product_audit._LIMIT_CLAUSE + "\n"
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────

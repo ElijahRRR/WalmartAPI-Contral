@@ -2,14 +2,16 @@
 
 用法(2026-08-16 起**缺省即真跑**,空跑加 `--dry-run`;`--execute` 是兼容别名):
   python cli.py product_audit                       # 真跑:判定 + 落 runs/hits + 写结论
+                                                    # ⚠ **缺省不限量**:候选谓词圈住多少判多少
   python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 审核六列
-  python cli.py product_audit -p limit=2000
+                                                    # 拿不准规模先跑它,摘要会报"共 N 个"
+  python cli.py product_audit -p limit=2000                # 要限量才给(不给 = 全判)
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
-  python cli.py product_audit -p mode=nonpass -p limit=5000
-                                                    # **非 pass 全量重判**(rejected+pending+
-                                                    # 未审):判定标准改了就整批用新标准重认一次
+  python cli.py product_audit -p mode=nonpass              # **非 pass 全量重判**(rejected+
+                                                    # pending+未审):判定标准改了就整批用
+                                                    # 新标准重认一次;分批加 -p limit=5000
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
   python cli.py product_audit -p repts=1                   # 改了**飞书类目表**之后重审:
@@ -20,10 +22,11 @@
                                                     # 未命中的不落结论不盖版本(不"复活")
   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
                                                     # 零 LLM 翻新黑名单历史行的标准姿势
-  python cli.py product_audit -p mode=pass -p stages=L0 -p limit=1000000
+  python cli.py product_audit -p mode=pass -p stages=L0
                                                     # 现役 pass 全量重过 L0(黑名单翻案);
-                                                    # 未命中不退出候选,**一次大 limit 扫完**
-  python cli.py product_audit -p mode=online -p stages=L0 -p limit=1000000
+                                                    # 未命中不退出候选 ⇒ **别给 limit**
+                                                    # (给了就每轮重扫同一批前缀)
+  python cli.py product_audit -p mode=online -p stages=L0
                                                     # **在架** pass 重过 L0(product_chain
                                                     # 每天 13:00 跑这一条);翻成 rejected 的
                                                     # 由紧随其后的 problem_scan 建删除建议
@@ -34,7 +37,7 @@
                                                     # (库里已有结论的也重判,不是回填);
                                                     # E 列已填结论的表行仍然不领。飞书类目表
                                                     # 改过之后翻存量走这条
-  python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
+  python cli.py product_audit -p from_sheet=1 -p limit=300     # 只判 300 个(缺省全判)
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
   python cli.py product_audit -p from_sheet=1 -p gap_wait=0    # 缺数据只推采集不等(采集侧病了时)
 
@@ -138,13 +141,16 @@ _PERSIST_BATCH = 200
 _CANDIDATE_TAIL = """
 WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
   AND p.title IS NOT NULL AND p.title <> ''
-ORDER BY p.audited_at NULLS FIRST, p.updated_at
-LIMIT %(limit)s
+ORDER BY p.audited_at NULLS FIRST, p.updated_at{limit_clause}
 """
+# ⚠ `LIMIT` 是**可选段**(所有者定稿 2026-09-03:「审核这个脚本不应有默认设置的
+# limit,需要限制的时候才手动带参数」)。不给 `-p limit=N` 时这一段整个不拼,
+# 候选谓词圈住多少就判多少 —— 而不是拼一个 `LIMIT NULL` 让人去猜 PG 的语义。
+_LIMIT_CLAUSE = "\nLIMIT %(limit)s"
 
 
-def _candidate_sql(where: str, recent_guard: str) -> str:
-    """输入:候选谓词 + 复烧护栏 → 输出:完整候选 SQL。
+def _candidate_sql(where: str, recent_guard: str, limit: int | None) -> str:
+    """输入:候选谓词 + 复烧护栏 + 本轮上限(None = 不限量)→ 输出:完整候选 SQL。
 
     ⚠ **只 `format` 尾段**,共享前缀事后拼:`PRODUCT_ROW_COLUMNS/_FROM` 是
     `services/audit_rules` 的文本,哪天那边多一个 `{`(jsonb 字面量、格式串)
@@ -154,7 +160,9 @@ def _candidate_sql(where: str, recent_guard: str) -> str:
     """
     return ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
             + audit_rules.PRODUCT_ROW_FROM
-            + _CANDIDATE_TAIL.format(where=where, recent_guard=recent_guard))
+            + _CANDIDATE_TAIL.format(
+                where=where, recent_guard=recent_guard,
+                limit_clause="" if limit is None else _LIMIT_CLAUSE))
 # ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
 #   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
 #   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,
@@ -295,7 +303,9 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     就再跑一轮接着判剩下的,不会每轮从头扫同一批;而 dry-run 不写版本号
     ⇒ 候选集恒定,可重复抽样验证。
     没有版本闸的分支(mode=pass / mode=online:未命中不落结论、不盖版本、
-    不退出候选)必须**一次给够 limit**,小批多轮只会每轮重扫同一批前缀。
+    不退出候选)**别给 limit**,小批多轮只会每轮重扫同一批前缀。
+    (2026-09-03 起缺省就是不限量,这两条通道不给参数即可;此前要写
+    `-p limit=1000000` 才等价。)
     """
     unknown = set(params) - _KNOWN_PARAMS - _CLI_INJECTED
     if unknown:
@@ -450,8 +460,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 全链重审全部 pass = 重烧全库 LLM,要那么干请 force_rerun=<版本>。
         # ⚠ 本模式**没有天然分页**(机械见 _pick_where 头注):命中翻案
         # (status 变 rejected)会退出候选,但未命中不落结论不盖版本
-        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一次大 limit
-        # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
+        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一轮扫完,
+        # 所以**别给 limit**(缺省就是不限量;L0 纯查库,几十万行也就多几分钟)。
         return "p.audit_status = 'approved'", {}
     if mode == "online":
         # **在架** pass 重过 L0(所有者定稿 2026-08-22:接进 product_chain,
@@ -482,7 +492,7 @@ WHERE p.marketplace = %(marketplace)s AND ({where})
 
 
 def _batch_head(conn, what: str, where: str, extra: dict,
-                limit: int, empty_hint: str) -> list[str]:
+                limit: int | None, empty_hint: str) -> list[str]:
     """输入:连接 + 这批是什么 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
 
     没有这一行的话,摘要只会说"候选 200",而 200 正是 limit ——**看不出是刚好
@@ -496,7 +506,12 @@ def _batch_head(conn, what: str, where: str, extra: dict,
                     {"marketplace": "US", **extra})
         total = int(cur.fetchone()[0])
     head = [f"{what},共 {total} 个"]
-    if total > limit:
+    if limit is None and total:
+        # 不限量是缺省口径(2026-09-03),但**这一轮要花多少钱**得说出来:
+        # 摘要只写"共 N 个"时,人还会按老习惯以为后面有个 500 挡着
+        head.append(f"  本轮**不限量**(未给 -p limit):这 {total} 个全判 —— "
+                    f"要分批就加 -p limit=N")
+    elif limit is not None and total > limit:
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
                     f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
@@ -733,7 +748,7 @@ GROUP BY 1
 """
 
 
-def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
+def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
     """输入:本轮 limit → 输出:(上架表待审行, 交给候选谓词的 ASIN, 摘要前言)。
 
     所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
@@ -800,6 +815,10 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
             f"被这个开关重新打开的)—— **LLM 花费按 {done + todo} 算**。"
             f"⚠ 领任务口径没变:仍然只领 **E 列为空或 pending** 的行,"
             f"E 列已有结论的表行一行都不会被捞回来")
+    elif limit is None:
+        if todo:
+            head.append(f"  本轮**不限量**(未给 -p limit):这 {todo} 个待审全判"
+                        f" —— 要分批就加 -p limit=N")
     elif todo > limit:
         logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
@@ -1289,7 +1308,7 @@ def _tro_hook(conn, outcome, ctx, state: dict) -> None:
 class Opts:
     """一轮 run() 的入参定案(值域与四条互斥校验都在 _parse_opts 里做完)。"""
     execute: bool
-    limit: int
+    limit: int | None          # None = 不限量(缺省);给了才截断
     backfill: bool
     adopt_only: bool
     run_l3: bool
@@ -1306,7 +1325,19 @@ def _parse_opts(params: dict) -> Opts:
     "静默吞参数"(评审 P1-4),与候选谓词同处一地,别顺手挪过来。
     """
     execute = bool(params.get("execute"))
-    limit = int(params.get("limit", 500))
+    # ⚠ **缺省不限量**(所有者定稿 2026-09-03)。此前缺省 500,而 `from_sheet`
+    # 那条路又把它顶成 ASIN 总数(见 run() 里删掉的那行),于是摘要写着
+    # "只判 500 个"、实际把待审的全判了 —— 限流是假的、提示是错的、调度 note
+    # 里"存量大时加 -p limit=N"的建议也不生效。现在口径只有一条:
+    # **不给就不限量,给了就真截断**(哪条通道都一样)。
+    raw_limit = str(params.get("limit", "")).strip()
+    limit = None
+    if raw_limit:
+        limit = int(raw_limit)
+        if limit <= 0:
+            # 宁炸不吞:limit=0 当"不限量"讲会让人以为限住了,恰好反着
+            raise ValueError("limit 必须是正整数;**不给就是不限量**"
+                             "(要空跑看规模用 --dry-run)")
     backfill = str(params.get("mode", "")).strip() == "backfill"
     adopt_only = str(params.get("adopt_only", "")).strip() == "1"
     if adopt_only and not backfill:
@@ -1555,13 +1586,22 @@ def run(params: dict) -> str:
         # (生产实测 2026-08-14:采用率 122k→88k→65k→47k→34k→25k 一路塌,
         #  第 6 轮 20 万候选里 17.5 万是上轮已确认无历史的行)
         where = f"({where}) AND {_HAS_HISTORY_SQL}"
-    if "asins" in extra:
-        # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
-        limit = max(limit, len(extra["asins"]))
+    if (limit is not None and not params.get("from_sheet")
+            and len(extra.get("asins", ())) > limit):
+        # 评审 I-6 当年的病是"传 600 只审 500 **且无提示**"。当时的药是把 limit
+        # 顶成 ASIN 个数,但 `from_sheet` 也走 asins= 这条路(它交的是整张表的
+        # 待审 ASIN,不是人点名的),于是那剂药把上架表这条路的 limit 一并废了。
+        # 缺省不限量之后病根没了:不给 limit 就全判;给了就是人自己要截断 ——
+        # 补回当年缺的那半句"提示"即可,不再偷偷改人给的数。
+        sheet_head.append(
+            f"⚠ 点名 {len(extra['asins'])} 个 ASIN,但 -p limit={limit} "
+            f"只判 {limit} 个(按 audited_at 最旧的先判);要全判就别给 limit")
 
     with db.pg_conn() as conn:
         ctx = audit_rules.load_context(conn)
-        query_params = {"marketplace": "US", "limit": limit, **extra}
+        query_params = {"marketplace": "US", **extra}
+        if limit is not None:
+            query_params["limit"] = limit
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
@@ -1597,7 +1637,7 @@ def run(params: dict) -> str:
                 + (f",或近 {days_} 天没有动销" if days_ else "")) + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
-        cand_sql = _candidate_sql(where, guard)
+        cand_sql = _candidate_sql(where, guard, limit)
         chunks = _iter_candidates(cand_sql, query_params)
         # 采用历史时把老 `l3_reason_category` 对回枚举用的那份集合 ——
         # 与判定链同源(`ctx.known_policies` + 两条非政策类别),不另查一次库

@@ -631,38 +631,42 @@ def test_黑名单面_全是真违禁时不报那一段():
     assert "B → POLICY" in txt
 
 
-def test_新码的消费者就这三个_判定与入选路径仍是旧码():
-    """⚠ 这条钉的是**现状**,不是理想态(2026-09-03 更新:回填工作流已落地)。
+def test_换轨已落地_入选路径吃的是新码():
+    """⚠ 2026-09-03 **换轨**:这条从"钉住现状"翻面成"钉住换轨结果"。
 
-    `services/error_taxonomy` 的消费者只有三个,都**不改判定行为**:
-      · `error_reclass_report` —— 新旧并排报账(只落报告文件);
-      · `audit_replay`         —— 回放抽样贴期望类别(只写 replay_results);
-      · `error_reclass`        —— **存量回填**,只写两表的 `taxonomy_*` 新列。
+    换轨前它钉的是「新引擎只被报告与评估消费,入选路径仍吃 A-L 码」;
+    所有者裁决后,入选那条路(problem_scan / feed_track → blacklist.record_asins)
+    改吃新 16 码,`PERMANENT` 换成他逐码定的七个(裁决表 §十二)。
 
-    而**入选黑名单与处置那条路仍吃旧 A-L 码**(`blacklist.PERMANENT` 六个
-    单字母、`problem_scan`/`feed_track` 调 `problem_products.categorize`)。
-    换轨那天要连这条测试一起改 —— 改不动它说明换轨没做完;它要是被悄悄删掉,
-    "我们已经按新规归类了"就会变成一句没人验证的话。
+    修的是一个具体缺陷:旧 B(禁售)一个桶里混着 PT_WRONG —— 沃尔玛原话是
+    「要重新上架请把 product type 选对」,是修法不是禁令,却被永久拉黑
+    (存量实测 40,825 条)。**PT_WRONG 绝不许再回到 PERMANENT 里。**
     """
-    import pathlib
-    hits = set()
-    for f in pathlib.Path(".").rglob("*.py"):
-        if "__pycache__" in str(f) or f.parts[0] == "tests":
-            continue
-        if "error_taxonomy" in f.read_text(encoding="utf-8"):
-            hits.add(str(f))
-    hits -= {"services/error_taxonomy.py", "services/policy_names.py",
-             "registry/resources.py"}
-    assert hits == {"workflows/error_reclass_report.py",
-                    "workflows/audit_replay.py",
-                    "workflows/error_reclass.py"}, sorted(hits)
-    # 入选那条路仍吃旧码:PERMANENT 是 A-L 里的六个单字母
     from services import blacklist
-    assert blacklist.PERMANENT == {"B", "C", "E", "F", "G", "K"}
-    # 回填工作流**不许**动 category / 不许删行 —— 它只写 taxonomy_* 列
-    src = pathlib.Path("workflows/error_reclass.py").read_text(encoding="utf-8")
-    assert "SET category" not in src and "DELETE FROM" not in src
-    assert "taxonomy_version = %(ver)s" in src
+    assert blacklist.PERMANENT == set(et.PERMANENT_CODES)
+    assert "PT_WRONG" not in blacklist.PERMANENT
+    assert blacklist.BRAND_CATEGORIES == {"BRAND", "IP"}
+    # 旧引擎**留着**:error_reclass_report 拿它做新旧并排对照,不是死代码
+    from services import problem_products
+    assert problem_products.categorize("violates Prohibited Product Policy")[0] == "B"
+
+
+def test_换轨过渡桥_回填两套码都认():
+    """⚠ `catalog.product_events` 的历史事件写的是旧 A-L 码,换轨后的新事件
+    写新码 —— 回填/重建按事件里那个码筛。只认新码的话
+    `rebuild_asin_blacklist` 会清空表后只灌进换轨之后那几行:七万变几十,
+    **而且不报错**,看着像"历史数据本来就没有"。
+
+    所以这一路两套码都认,直到存量事件被重写(百万级行,短期不会)。
+    """
+    from services import blacklist
+    codes = set(blacklist.backfill_codes())
+    assert set(et.PERMANENT_CODES) <= codes            # 新码全在
+    assert {"B", "C", "E", "F", "G", "K"} <= codes     # 旧码也全在
+    assert {"BRAND", "IP", "C", "E"} == set(blacklist.brand_backfill_codes())
+    # 标签表两套码共用,不散落字面量
+    case = blacklist._label_case()
+    assert "WHEN 'B' THEN '禁售'" in case and "WHEN 'POLICY' THEN '禁售'" in case
 
 
 def test_不是商品违禁那一集只有一份():

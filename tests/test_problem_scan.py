@@ -91,7 +91,7 @@ def test_plan_routing_and_dedup():
     assert n["delete"] == 3                  # 双击那条不计在 delete(摘要按行重算)
     # Stage 行照常归类(J 类进病历/摘要),只是不再改变走向
     stage_row = [r for r in plans["T1"]["delete"] if r["sku"] == "S_STAGE"][0]
-    assert stage_row["category"] == "J"
+    assert stage_row["category"] == "STAGE"        # 换轨前是旧码 J(特殊)
 
 
 def test_to_dispositions_splits_double_hit():
@@ -110,9 +110,11 @@ def test_to_dispositions_carries_category_and_reason():
     plans, _ = scan.plan([_item("T1", "S_B", "violates Prohibited Product Policy")],
                          inflight=set(), inactive=set())
     (row,) = scan.to_dispositions(plans)
-    assert (row["action"], row["category"]) == ("delete", "B")
+    assert (row["action"], row["category"]) == ("delete", "POLICY")
     assert "Prohibited" in row["reason"]
-    assert row["detail"]["cat_name"] == "禁售"
+    # cat_name 现在是新码表的中文名(ERROR_CATEGORY_CODES);飞书「来源」列
+    # 那一栏仍走 blacklist.source_label,故意留在旧词表上(禁售/品牌/知产…)
+    assert row["detail"]["cat_name"] == "违反禁售政策"
 
 
 def test_stubborn_sql_binds_to_listing_generation():
@@ -229,7 +231,7 @@ def test_preview_writes_nothing(monkeypatch):
                         lambda conn, since=None, hours=None: [])
     out = scan.run({"preview": "1"})
     assert "preview" in out and "删除 1" in out
-    assert "类别={B:1}" in out and "删除样本=[('S_B', 'B')]" in out
+    assert "类别={POLICY:1}" in out and "删除样本=[('S_B', 'POLICY')]" in out
 
 
 def test_absence_probe_failure_does_not_stop_the_scan(monkeypatch):
@@ -535,13 +537,13 @@ def test_l_system_error_now_deletes_like_everything_else():
     ]
     plans, n = scan.plan(items, inflight=set(), inactive=set())
     assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_L1", "S_L2"}
-    assert all(r["category"] == "L" for r in plans["T1"]["delete"])
+    assert all(r["category"] == "SYSTEM" for r in plans["T1"]["delete"])
     assert n["delete"] == 2
 
 
 def test_k_cluster_note_fires_on_concentration():
     """「内部标记」单条无信息量,聚集才是信号(实测谭总11 一店 45 条)。"""
-    items = [{"store": "T1", "sku": f"S{i}", "category": "K"}
+    items = [{"store": "T1", "sku": f"S{i}", "category": "FLAGGED"}
              for i in range(scan._K_CLUSTER_WARN)]
     note = scan._k_cluster_note(items)
     assert "T1" in note and "风险" in note

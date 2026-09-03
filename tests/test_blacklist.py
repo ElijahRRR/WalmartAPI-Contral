@@ -75,15 +75,20 @@ def _it(sku, cat, store="店A", reasons="some reason"):
 def test_permanent_set_is_exactly_bcefgk():
     """入选集合逐字钉死(旧 blacklist_sync.py:18-21 + 所有者 2026-08-11 拍板:
     只收永久禁止类,13 类词表只是来源列格式)。改集合必须红给人看。"""
-    assert bl.PERMANENT == {"B", "C", "E", "F", "G", "K"}
+    # 换轨后:所有者 2026-09-03 逐码裁决的七个(裁决表 §十二),
+    # 口径唯一出处 services/error_taxonomy.PERMANENT_CODES
+    assert bl.PERMANENT == {"PROHIBITED_FINAL", "POLICY", "IP", "BRAND",
+                            "RECALL", "FLAGGED", "GATED"}
+    # ⚠ PT_WRONG 绝不许回来:那是"把 product type 选对",修法不是禁令
+    assert "PT_WRONG" not in bl.PERMANENT
 
 
 def test_record_asins_only_permanent_classes():
     """A(过期)/D(价格)这类可修复的绝不入选——进了会误杀重上架拦截。"""
     conn = _Conn()
     added = bl.record_asins(conn, [
-        _it("B0PERM", "B"), _it("B0EXPIRE", "A"), _it("B0PRICE", "D"),
-        _it("B0IP", "E"), _it("B0SYS", "L"), _it("B0OTHER", "Z"),
+        _it("B0PERM", "POLICY"), _it("B0EXPIRE", "EXPIRED"), _it("B0PRICE", "PRICE"),
+        _it("B0IP", "IP"), _it("B0SYS", "SYSTEM"), _it("B0OTHER", "OTHER"),
     ])
     assert added == 2
     assert set(conn.asin_rows) == {"B0PERM", "B0IP"}
@@ -93,13 +98,13 @@ def test_record_asins_first_entry_wins():
     """永久禁止 = 一次入选;重复撞见不刷新(DO NOTHING),计数也不虚报。"""
     conn = _Conn()
     conn.asin_rows["B0PERM"] = ("已存在",)
-    assert bl.record_asins(conn, [_it("B0PERM", "B")]) == 0
+    assert bl.record_asins(conn, [_it("B0PERM", "POLICY")]) == 0
 
 
 def test_asin_source_label_format():
     """来源列格式 = 「沃尔玛-〈类名〉」(所有者定的表格约定)。"""
     conn = _Conn()
-    bl.record_asins(conn, [_it("B0A", "K")])
+    bl.record_asins(conn, [_it("B0A", "FLAGGED")])
     assert conn.asin_rows["B0A"][2] == "沃尔玛-审查"
 
 
@@ -107,8 +112,8 @@ def test_biz_cn_is_flagged_independently():
     """BIZ-CN 是独立维度(legacy_survey:2077),不能淹没在 C 品牌类里。"""
     conn = _Conn()
     bl.record_asins(conn, [
-        _it("B0CN", "B", reasons="Prohibited, reference code BIZ-CN"),
-        _it("B0X", "B", reasons="prohibited product policy")])
+        _it("B0CN", "POLICY", reasons="Prohibited, reference code BIZ-CN"),
+        _it("B0X", "POLICY", reasons="prohibited product policy")])
     assert conn.asin_rows["B0CN"][5] is True
     assert conn.asin_rows["B0X"][5] is False
 
@@ -118,7 +123,7 @@ def test_record_asins_key_is_cleaned_asin():
     2026-08-11 实证 sku≠asin(三段式订货号),原文当键 = 同一产品在
     不同店入选多行、重上架拦截按 asin 查全部落空。"""
     conn = _Conn()
-    bl.record_asins(conn, [_it("XKJ-B0GXX75JN5-39.98", "B")])
+    bl.record_asins(conn, [_it("XKJ-B0GXX75JN5-39.98", "POLICY")])
     assert "B0GXX75JN5" in conn.asin_rows
     assert conn.asin_rows["B0GXX75JN5"][6] == "XKJ-B0GXX75JN5-39.98"
 
@@ -129,7 +134,7 @@ def test_collect_brands_only_c_and_e():
     """品牌收集只看 C(品牌)/E(知产)——B 禁售是产品级问题,不牵连品牌。
     落两张表:渠道表(beyKyi 投影源)+ 否决闸(立刻挡重上架)。"""
     conn = _Conn(brands={"B0C": "Nike", "B0B": "Sony"})
-    st = bl.collect_brands(conn, [_it("B0C", "C"), _it("B0B", "B")])
+    st = bl.collect_brands(conn, [_it("B0C", "BRAND"), _it("B0B", "POLICY")])
     assert st["brand_new"] == 1
     assert list(conn.channel_rows) == ["nike"]
     assert list(conn.brand_rows) == ["nike"]
@@ -139,7 +144,7 @@ def test_collect_brands_dedupes_by_brand_not_sku():
     """去重按品牌(所有者澄清 2026-08-11):同品牌第二个 SKU 不重复入选,
     但 ASIN 照样标已处理——它的品牌已经在名单里了。"""
     conn = _Conn(brands={"B0A": "Nike", "B0B": "NIKE"})
-    st = bl.collect_brands(conn, [_it("B0A", "C"), _it("B0B", "C")])
+    st = bl.collect_brands(conn, [_it("B0A", "BRAND"), _it("B0B", "BRAND")])
     assert st["brand_new"] == 1 and st["brand_known"] == 1
     assert sorted(conn.marked) == ["B0A", "B0B"]
     assert conn.channel_rows["nike"][1] in ("Nike", "NIKE")  # casefold 键去重
@@ -148,7 +153,7 @@ def test_collect_brands_dedupes_by_brand_not_sku():
 def test_collect_brands_skips_processed_asins():
     """已处理 ASIN 跳过(历史 2,609 个已导入 ops.dedupe)——否则重复采。"""
     conn = _Conn(processed={"B0OLD"}, brands={"B0OLD": "Nike"})
-    st = bl.collect_brands(conn, [_it("B0OLD", "C")])
+    st = bl.collect_brands(conn, [_it("B0OLD", "BRAND")])
     assert st == {"brand_new": 0, "brand_known": 0, "no_brand": 0, "skipped": 1}
     assert conn.channel_rows == {} and conn.brand_rows == {} and conn.marked == []
 
@@ -157,7 +162,7 @@ def test_collect_brands_missing_brand_stays_unmarked():
     """产品中心缺 brand 的 ASIN **不标已处理**——标了就永远漏了,
     等 product_ingest 补上品牌后下一轮自然重试。"""
     conn = _Conn(brands={})            # 产品中心查无此 ASIN
-    st = bl.collect_brands(conn, [_it("B0NEW", "E")])
+    st = bl.collect_brands(conn, [_it("B0NEW", "IP")])
     assert st["no_brand"] == 1
     assert conn.marked == [] and conn.channel_rows == {}
 
@@ -167,7 +172,7 @@ def test_master_mirror_neither_blocks_channel_nor_gets_overwritten():
     渠道表完整记录沃尔玛渠道的发现,不与总清单去重——第一版挤在一张表里
     按品牌冲突,总表已有的品牌永远进不了渠道)。同时总清单真值不覆盖。"""
     conn = _Conn(brands={"B0A": "Nike"}, brand_rows={"nike": ("镜像行",)})
-    st = bl.collect_brands(conn, [_it("B0A", "C")])
+    st = bl.collect_brands(conn, [_it("B0A", "BRAND")])
     assert st["brand_new"] == 1        # 渠道照记
     assert "nike" in conn.channel_rows
     assert conn.brand_rows["nike"] == ("镜像行",)   # 总清单镜像分毫不动
@@ -179,7 +184,7 @@ def test_collect_brands_looks_up_products_by_cleaned_asin():
     (2026-08-11 生产实证:2,702 个 C/E 候选 0 命中)。溯源列也存
     标准 asin(beyKyi D 列表头就叫 ASIN,所有者 2026-08-11)。"""
     conn = _Conn(brands={"B0GXX75JN5": "Nike"})
-    st = bl.collect_brands(conn, [_it("XKJ-B0GXX75JN5-39.98", "C")])
+    st = bl.collect_brands(conn, [_it("XKJ-B0GXX75JN5-39.98", "BRAND")])
     assert st["brand_new"] == 1
     assert conn.channel_rows["nike"][3] == "B0GXX75JN5"
 
@@ -187,7 +192,7 @@ def test_collect_brands_looks_up_products_by_cleaned_asin():
 def test_channel_known_brand_counts_known():
     """渠道里已有的品牌,第二个 SKU 撞见 → brand_known,不重复入渠道。"""
     conn = _Conn(brands={"B0B": "Nike"}, channel_rows={"nike": ("已在渠道",)})
-    st = bl.collect_brands(conn, [_it("B0B", "C")])
+    st = bl.collect_brands(conn, [_it("B0B", "BRAND")])
     assert st["brand_new"] == 0 and st["brand_known"] == 1
     assert conn.channel_rows["nike"] == ("已在渠道",)
     assert conn.marked == ["B0B"]
@@ -202,7 +207,7 @@ def test_scan_tail_never_breaks_the_main_chain(monkeypatch):
     monkeypatch.setattr(wf.blacklist, "record_asins",
                         lambda conn, cand: (_ for _ in ()).throw(
                             RuntimeError("库炸了")))
-    note = wf._collect_blacklists(object(), [_it("B0A", "B")])
+    note = wf._collect_blacklists(object(), [_it("B0A", "POLICY")])
     assert "黑名单收集失败" in note      # 返回摘要而不是抛异常
 
 

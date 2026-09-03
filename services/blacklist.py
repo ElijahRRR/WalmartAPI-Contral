@@ -2,16 +2,22 @@
 
 旧系统语义逐字保留(legacy_survey:1435 / blacklist_sync.py:18-21):
 
-  ASIN 黑名单只收 **PERMANENT = {B,C,E,F,G,K}**(永久产品级禁止),
-  明确排除 A/D/H/I/J/L/Z(可修复/临时/平台类)——进了会误杀重上架拦截。
-  所有者 2026-08-11 再次拍板:飞书表来源列的 13 类词表只是**格式约定**,
-  不是入选范围。
+  ASIN 黑名单只收 **PERMANENT**(永久产品级禁止),其余(可修复/临时/平台类)
+  明确排除——进了会误杀重上架拦截。所有者 2026-08-11 再次拍板:飞书表来源列的
+  13 类词表只是**格式约定**,不是入选范围。
+
+  ⚠ **2026-09-03 换轨**:入选码从旧 A-L 的 {B,C,E,F,G,K} 换成新 16 码里
+  所有者逐码裁决过的七个 + `OTHER` 的两个显式词条(`services/error_taxonomy.
+  PERMANENT_CODES` / `is_permanent`,裁决表 `docs/error_taxonomy.md` §十二)。
+  修的是一个具体缺陷:旧 B(禁售)桶里混着 `PT_WRONG` —— 沃尔玛原话是
+  「要重新上架请把 product type 选对」,是修法不是禁令,却被永久拉黑
+  (存量实测 40,825 条)。
 
   入选按**当轮类别**判(cleanup 跑的就是今天的问题清单,当轮=最新)。
   历史数据实证类别翻动频繁(48.5 万行折叠出 23.9 万次变迁),
   「曾经命中过 B」不能作数——那会把短暂误判过的商品永久拉黑。
 
-  品牌收集只看 C(品牌)/E(知产)两类;品牌名从 **catalog.products.brand**
+  品牌收集只看 `BRAND`(品牌未授权)/ `IP`(知识产权)两类(换轨前是 C/E);品牌名从 **catalog.products.brand**
   取(所有者定稿 2026-08-11:从采集库读,不再走旧系统的 DMIT 逐个采);
   **去重按品牌**,SKU 只是溯源列。已处理 ASIN 记 ops.dedupe
   ('cleanup:brand_asin',历史 2,609 个已导入)——品牌还没采到的 ASIN
@@ -48,21 +54,33 @@ PG 权威,飞书只是人机界面。
 import json
 import logging
 
+from services import error_taxonomy
 from services.sku_asin import extract_asin
 
 logger = logging.getLogger("services.blacklist")
 
-# 永久产品级禁止(入选集合);排除理由见模块头。改这个集合 = 改业务口径,
-# 必须先过所有者。
-PERMANENT = frozenset({"B", "C", "E", "F", "G", "K"})
+# 永久产品级禁止(入选集合)。**2026-09-03 换轨**:从旧 A-L 的
+# {B,C,E,F,G,K} 换成新 16 码里所有者逐码裁决过的那七个(裁决表
+# `docs/error_taxonomy.md` §十二),口径唯一出处在 `services/error_taxonomy`。
+# 换轨修的是一个具体缺陷:旧 B(禁售)一个桶里混着 `PT_WRONG` —— 沃尔玛原话是
+# 「要重新上架请把 product type 选对」,那是修法不是禁令,却被永久拉黑
+# (存量实测 40,825 条,§11.6)。新码把它摘了出去,真禁售那几种照旧拉黑。
+# 改这个集合 = 改业务口径,必须先过所有者。
+PERMANENT = frozenset(error_taxonomy.PERMANENT_CODES)
 
-# 品牌收集的触发类别:品牌限制 / 知产
-BRAND_CATEGORIES = frozenset({"C", "E"})
+# 品牌收集的触发类别:品牌未授权 / 知识产权(旧 C/E 的新码等价物)
+BRAND_CATEGORIES = frozenset({"BRAND", "IP"})
 
 BRAND_ASIN_SCOPE = "cleanup:brand_asin"     # ops.dedupe:已做过品牌收集的 ASIN
 
-_NAMES = {"B": "禁售", "C": "品牌", "E": "知产",
-          "F": "限类", "G": "药品", "K": "审查"}
+# 新码 → 飞书「来源」列的类名。⚠ **故意沿用旧 A-L 那套中文词**
+# (禁售/品牌/知产/限类/审查):来源列是飞书表的格式约定,运营按这几个词筛,
+# 换轨换的是**底层判据**,不该顺手改掉人眼看的那一列。
+# POLICY / PROHIBITED_FINAL / RECALL 三个新码都从旧 B 拆出来,故同归「禁售」
+# (旧 G 药品也是政策的一类,一并并进去)。
+_NAMES = {"POLICY": "禁售", "PROHIBITED_FINAL": "禁售", "RECALL": "禁售",
+          "BRAND": "品牌", "IP": "知产", "GATED": "限类", "FLAGGED": "审查",
+          "OTHER": "禁售"}
 
 
 def is_biz_cn(reason_text) -> bool:
@@ -94,7 +112,10 @@ def record_asins(conn, items: list[dict]) -> int:
     with conn.cursor() as cur:
         for it in items:
             code = it.get("category")
-            if code not in PERMANENT:
+            # ⚠ 走 `is_permanent` 而不是 `code in PERMANENT`:`OTHER` 是混装桶
+            # (显式杂项 + 兜底),所有者只让 business decision / trust & safety
+            # 两个词条算永久拉黑,判据在引擎里,这儿不重新匹配一遍。
+            if not error_taxonomy.is_permanent(code, it.get("unlisted_term")):
                 continue
             asin = extract_asin(it["sku"]) or it["sku"]
             cur.execute(_ASIN_SQL, (
@@ -221,13 +242,43 @@ SELECT count(*) FILTER (WHERE cat = ANY(%(perm)s)) AS permanent,
 FROM latest
 """
 
+# ⚠ **换轨过渡桥**(2026-09-03,别当历史包袱删掉):`catalog.product_events`
+# 里的历史事件 `detail->>'category'` 写的是**旧 A-L 码**,换轨之后的新事件写
+# 新码 —— 而回填/重建这条路是按事件里的那个码筛的。只认新码的话
+# `rebuild_asin_blacklist` 会**清空表后只灌进换轨之后那几行**:表突然从
+# 七万变几十,而且不报错,看着像"历史数据本来就没有"。
+# 所以这一路**两套码都认**,直到存量事件被重写(短期不会,那是百万级行)。
+_LEGACY_PERMANENT = {"B": "POLICY", "C": "BRAND", "E": "IP",
+                     "F": "GATED", "G": "POLICY", "K": "FLAGGED"}
+_LEGACY_BRAND_CATEGORIES = ("C", "E")
+
+
+def backfill_codes() -> list[str]:
+    """输出:回填/重建按事件筛码时该认的**全部**码(新 + 旧,排序去重)。"""
+    return sorted(PERMANENT | set(_LEGACY_PERMANENT))
+
+
+def brand_backfill_codes() -> list[str]:
+    """输出:品牌收集回填该认的码(新 BRAND/IP + 旧 C/E)。"""
+    return sorted(BRAND_CATEGORIES | set(_LEGACY_BRAND_CATEGORIES))
+
+
+def _label_case() -> str:
+    """输出:`CASE cat WHEN … END` 片段,新旧码共用一张表 —— 字面量不散落。
+
+    值全部来自本模块常量(`_NAMES` + `_LEGACY_PERMANENT`),不拼外部输入。
+    """
+    pairs = {c: _NAMES[c] for c in sorted(PERMANENT) if c in _NAMES}
+    pairs.update({old: _NAMES[new] for old, new in _LEGACY_PERMANENT.items()})
+    whens = " ".join(f"WHEN '{c}' THEN '{zh}'" for c, zh in sorted(pairs.items()))
+    return f"CASE cat {whens} END"
+
+
 _BACKFILL_ASIN_SQL = _LATEST_CTE + """
 INSERT INTO catalog.asin_blacklist
     (asin, category, source, reason, src_store, biz_cn, src_sku, created_at)
 SELECT asin, cat,
-       '沃尔玛-' || CASE cat WHEN 'B' THEN '禁售' WHEN 'C' THEN '品牌'
-                             WHEN 'E' THEN '知产' WHEN 'F' THEN '限类'
-                             WHEN 'G' THEN '药品' WHEN 'K' THEN '审查' END,
+       '沃尔玛-' || """ + _label_case() + """,
        left(reason, 200), store,
        (lower(coalesce(reason, '')) LIKE '%%biz-cn%%'
         OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%'),
@@ -244,7 +295,8 @@ def backfill_counts(conn) -> dict:
     """输入:连接 → 输出:回填预览计数(不写任何东西)。"""
     with conn.cursor() as cur:
         cur.execute(_BACKFILL_COUNT_SQL,
-                    {"perm": sorted(PERMANENT), "brandcats": sorted(BRAND_CATEGORIES)})
+                    {"perm": backfill_codes(),
+                     "brandcats": brand_backfill_codes()})
         permanent, brand_cand, total = cur.fetchone()
     return {"permanent": permanent, "brand_cand": brand_cand, "total": total}
 
@@ -253,7 +305,7 @@ def backfill_from_events(conn) -> dict:
     """输入:连接 → 输出:ASIN 回填统计(集合级 INSERT,万级量逐行太慢)。
     品牌渠道的历史重建走 rebuild_brand_channel(单独命令,含清表重灌)。"""
     with conn.cursor() as cur:
-        cur.execute(_BACKFILL_ASIN_SQL, {"perm": sorted(PERMANENT)})
+        cur.execute(_BACKFILL_ASIN_SQL, {"perm": backfill_codes()})
         return {"asin_new": cur.rowcount or 0}
 
 

@@ -55,10 +55,26 @@ def test_classify_政策名join不上就不写():
     """⚠ 与 audit_l3 的 `policy` 解析同一条纪律:猜出来的政策名会一路进报表
     与申诉口径,而没有任何东西会红。join 不上 → None。"""
     text = "Prohibited Products Policy: Alcohol."
-    code, name = wf.classify(text, ["Alcohol"])
-    assert (code, name) == ("POLICY", "Alcohol")
-    code2, name2 = wf.classify(text, ["Animals"])      # 表里没有 Alcohol
+    code, name, term = wf.classify(text, ["Alcohol"])
+    assert (code, name, term) == ("POLICY", "Alcohol", None)
+    code2, name2, _ = wf.classify(text, ["Animals"])   # 表里没有 Alcohol
     assert code2 == "POLICY" and name2 is None
+
+
+def test_classify_带回OTHER的显式词条_拉黑判据靠它():
+    """⚠ `OTHER` 是混装桶:所有者只让 business decision / trust & safety
+    算永久拉黑,`currently under review` 是自愈态不算 —— 光有主码判不了,
+    必须把**赢下主码那个原子**命中的词条一起带回来(落 `taxonomy_term`)。"""
+    from services import error_taxonomy as et
+    for text, want, permanent in (
+            ("unpublished due to a Walmart business decision.",
+             "business decision", True),
+            ("removed by trust & safety review", "trust & safety", True),
+            ("This item is currently under review.",
+             "currently under review", False)):
+        code, _name, term = wf.classify(text, [])
+        assert code == "OTHER" and term == want, text
+        assert et.is_permanent(code, term) is permanent, text
 
 
 def test_classify_旧B里的那几种真的会分开():

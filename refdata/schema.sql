@@ -334,6 +334,11 @@ ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_version tex
 ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_src text;
 CREATE INDEX IF NOT EXISTS asin_blacklist_taxcode_idx ON catalog.asin_blacklist(taxonomy_code);
 CREATE INDEX IF NOT EXISTS asin_blacklist_taxver_idx  ON catalog.asin_blacklist(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
@@ -1538,6 +1543,11 @@ ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_policy
 ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_version text;
 CREATE INDEX IF NOT EXISTS idx_werror_taxcode ON audit.walmart_error_records(taxonomy_code);
 CREATE INDEX IF NOT EXISTS idx_werror_taxver  ON audit.walmart_error_records(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 -- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
 -- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;

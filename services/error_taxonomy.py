@@ -193,6 +193,21 @@ RULES: tuple[Rule, ...] = (
     Rule(17, "OTHER", "未识别(兜底)", catch_all=True),
 )
 
+#: **够格永久拉黑的新码**(所有者 2026-09-03 逐码裁决,唯一出处;裁决表
+#: `docs/error_taxonomy.md` §十二)。换轨后 `services/blacklist.PERMANENT`
+#: 与存量路由 `workflows/blacklist_route` 读的都是这一份。
+#: 与旧 A-L 的 {B,C,E,F,G,K} 对照:旧 B 这一个桶被拆开,**只有真禁售那几种
+#: 留下**(POLICY / PROHIBITED_FINAL / RECALL),`PT_WRONG` 摘了出去 ——
+#: 那是沃尔玛在说"把 product type 选对",是修法不是禁令(§11.6 生产原文实证)。
+PERMANENT_CODES = ("PROHIBITED_FINAL", "POLICY", "IP", "BRAND",
+                   "RECALL", "FLAGGED", "GATED")
+
+#: `OTHER` 是个混装桶(序 16 显式杂项 + 序 17 兜底),整码拉黑会把"未识别"
+#: 也永久禁掉。所有者裁决:**只有这两个显式词条算永久拉黑**,其余 OTHER 放行。
+#: 判据是 `Rule(16)` 的 `unlisted_term`(命中哪个词条由引擎自报,不在这儿重新匹配)。
+#: ⚠ `currently under review` 不在里面:审查中是**自愈态**(24 小时内自动复架)。
+PERMANENT_UNLISTED_TERMS = ("business decision", "trust & safety")
+
 #: 新码里**不是「这件商品本身违禁」**的那些(2026-09-03 加,唯一出处)。
 #: 旧 A-L 码把这些一律算永久禁售拉黑,新码认得出病根另在别处。
 #: 逐个理由:PT_WRONG=我方类目选错(沃尔玛明示改 product type)/ GATED=类目要
@@ -210,6 +225,24 @@ _RULE_UNLISTED = RULES[-2]
 # feed 政策族只过序 1-15(方案 §3.6 通道 2):序 0 是 AI 通道自己的事,
 # 序 16/17 的 OTHER 不在政策族的语义里。
 _POLICY_CHANNEL_RULES = tuple(r for r in RULES if 1 <= r.order <= 15)
+
+
+def is_permanent(code: str | None, unlisted_term: str | None = None) -> bool:
+    """输入:新主码(+ 序 16 命中的词条)→ 输出:够不够格永久拉黑。
+
+    所有者 2026-09-03 裁决(§十二):七个码直接算;`OTHER` 只有
+    `business decision` / `trust & safety` 两个显式词条算。
+    ⚠ **`code=None` 一律 False**:那是"判不出来",不是"判成了不违禁" ——
+    存量里判不出的行怎么处置由调用方按裁决另行决定(所有者定的是**拉黑**,
+    见 `workflows/blacklist_route`),不在这个纯函数里替它选。
+    """
+    if not code:
+        return False
+    if code in PERMANENT_CODES:
+        return True
+    if code == "OTHER" and unlisted_term:
+        return unlisted_term.strip().casefold() in PERMANENT_UNLISTED_TERMS
+    return False
 
 
 def _hit(rule: Rule, fold: str) -> bool:
@@ -409,6 +442,11 @@ class Result(NamedTuple):
     atom_codes: tuple[tuple[str, str | None], ...]
     unknown: tuple[str, ...]
     unlisted: tuple[tuple[str, int], ...]
+    #: **赢下主码那个原子**命中的显式词条(序 16),没有则 None。
+    #: `unlisted` 是全记录的聚合(报表用),这一个是**记录级判据**——
+    #: `is_permanent` 判 `OTHER` 该不该拉黑读的就是它,拿聚合去判会把
+    #: "另一个原子提到过 business decision" 也算成主码的理由。
+    unlisted_term: str | None = None
 
 
 class FeedResult(NamedTuple):
@@ -474,6 +512,7 @@ def classify_reasons(atoms: Iterable[str] | None,
         unknown=tuple(r.atom for r in results
                       if r.rule_order == _RULE_UNKNOWN.order),
         unlisted=tuple(sorted(unlisted.items())),
+        unlisted_term=win.unlisted_term,
     )
 
 

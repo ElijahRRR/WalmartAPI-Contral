@@ -327,7 +327,8 @@ def test_prohibited_receipt_flows_into_blacklist(monkeypatch):
 
     feed_track.poll_feed(STORE, "F9")
     assert len(got) == 1 and got[0]["sku"] == "B0BAD01"
-    assert got[0]["category"] == "B"
+    assert got[0]["category"] == "POLICY"   # 换轨前是旧码 B(禁售);
+    # 两者都在 PERMANENT 里 ⇒ 拦截行为一字不变,变的只是码名统一到新表
     assert "61020366035308" in got[0]["reasons"]
     assert "General Prohibited" in got[0]["reasons"]
 

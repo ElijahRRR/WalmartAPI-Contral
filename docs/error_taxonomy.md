@@ -631,3 +631,78 @@ EXPIRED 56 / IP 52 / PROHIBITED_FINAL 20 / …
 ⚠ 最后一行单列:那 10,396 条**判不了**。删了就是"因为查不出理由所以放行",
 留着就是"因为查不出理由所以永久禁止" —— 两个方向都得是所有者明说的选择,
 代码不替它选。
+
+---
+
+## 十三、换轨落地(2026-09-03 所有者裁决,已实现)
+
+### 13.1 裁决
+
+**留下(继续永久拉黑)**:`PROHIBITED_FINAL` / `POLICY` / `IP` / `BRAND` /
+`RECALL` / `FLAGGED` / `GATED` 七个码;`OTHER` 里只认
+**`business decision`** 与 **`trust & safety`** 两个显式词条
+(⚠ `currently under review` 不算 —— 审查中是自愈态);
+**`taxonomy_code` 为 NULL 的一律留下**(查不出理由就继续禁,不因查不出而放行)。
+
+**删掉**:其余全部(`PT_WRONG` / `CONTENT` / `INFO` / `PRICE` / `SYSTEM` /
+`STAGE` / `EXPIRED` / `SPECIAL`,以及 `OTHER` 的其他词条)。方式:**直接删行**,
+范围**不分 `taxonomy_src`**(截断只会让 `PT_WRONG` 被低估,判成它的样本行是
+保守命中)。
+
+口径唯一出处:`services/error_taxonomy.PERMANENT_CODES` /
+`PERMANENT_UNLISTED_TERMS` / `is_permanent()`。
+
+### 13.2 换轨改了哪几处(判定路径)
+
+| 处 | 换轨前 | 换轨后 |
+|---|---|---|
+| `services/blacklist.PERMANENT` | `{B,C,E,F,G,K}` | `PERMANENT_CODES` 七个 |
+| `services/blacklist.BRAND_CATEGORIES` | `{C,E}` | `{BRAND, IP}` |
+| `record_asins` 入选判据 | `code in PERMANENT` | `is_permanent(code, term)`(`OTHER` 靠词条) |
+| `workflows/problem_scan` 归类 | `problem_products.categorize` | `error_taxonomy.classify_reasons` |
+| `problem_scan` 的 K 聚集告警 | `category == "K"` | `== "FLAGGED"` |
+| `services/feed_track` 违禁回执 | `category="B"` | `="POLICY"`(两者都在 PERMANENT,**拦截行为一字不变**) |
+
+⚠ **飞书「来源」列故意不动**:`_NAMES` 仍映射到旧词表(禁售/品牌/知产/限类/
+审查)。运营按这几个词筛表,换轨换的是**底层判据**,不该顺手改人眼看的那一列。
+
+⚠ **换轨过渡桥**:`catalog.product_events` 的历史事件写的是旧 A-L 码,新事件
+写新码,而回填/重建(`backfill_from_events` / `rebuild_asin_blacklist`)是按
+事件里那个码筛的。只认新码的话 rebuild 会**清空表后只灌进换轨之后那几行**
+——七万变几十,而且不报错。所以 `blacklist.backfill_codes()` 两套码都认,
+直到存量事件被重写(百万级行,短期不会)。
+
+### 13.3 存量路由:`workflows/blacklist_route`
+
+```bash
+python cli.py error_reclass                    # 先回填(taxonomy_* 四列)
+python cli.py blacklist_route --dry-run        # 报将删/将留,一行不动
+python cli.py blacklist_route                  # 真删(先自动落备份)
+python cli.py blacklist_push                   # ⚠ 不跑它飞书那张表还是旧的
+python cli.py audit_replay -p tag=路由后        # 看正例误伤水位
+```
+
+三道闸:① 只动 `taxonomy_version` = 当前码表的行(没回填的一条不动,只点名);
+② 删前把**整行**写 `<DATA_ROOT>/backups/blacklist_route_<时间戳>.jsonl`
+(所有者选的是"直接删行",备份不改变这一点,只是把溯源留在库外);
+③ `--dry-run` 一行不动。
+
+### 13.4 政策类别名去哪了(所有者:「怎么没有体现?」)
+
+**它一直在,而且已经落库了** —— 只是裁决表 §十二 那张表按**主码**列的,
+没把第二维摆出来。两维是正交的:
+
+- **主码**(16 个)= 这是**哪一类问题**(违禁 / 类目选错 / 品牌 / 内容 …);
+- **政策类别名** = 是**哪一条禁售政策**。沃尔玛原文常写成
+  `Prohibited Products Policy: Alcohol.`,引擎用 `_POLICY_RE` 抽出 `Alcohol`,
+  再经 `policy_join` 对 `audit.walmart_prohibited_policy.category_en` 校验,
+  落 **`taxonomy_policy`** 列(两表都有)。
+
+**这就是与审核对照的那把钥匙**:审核链的 `catalog.products.audit_reason` 装的
+是**同一张枚举**(`audit_l3.policy_enum` 也吃 `category_en`)⇒ 两边可以逐个
+ASIN 直接比。`audit_replay` 的「类别准确率 + 混淆表」就是按这个键算的。
+
+⚠ **只有部分报错带类别名**:通用政策拒就一句"违反禁售政策",没有类别
+(语料 77 条里 23 条抽得出,主要落在 `POLICY` 码上 —— 26 条 `POLICY` 里 20 条
+带名字)。抽不出是常态,不是缺口。`error_reclass` 的摘要现在会报政策名分布
+(抽出且 join 上多少条、多少个类别、前 15 是哪些)。

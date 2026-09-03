@@ -45,7 +45,7 @@ import re
 
 from registry import db
 from services import blacklist, blacklist_sheet, dispositions
-from services import problem_products as pp
+from services import error_taxonomy
 from services import product_events, store_absence
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
@@ -223,8 +223,16 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
             else:
                 n["inflight_listing"] += 1
             continue
-        code, name = pp.categorize(it["reasons"])
-        it["category"], it["cat_name"] = code, name
+        # 2026-09-03 换轨:归类改吃新 16 码(services/error_taxonomy),
+        # 不再是 problem_products 的 A-L 单字母码。入选黑名单的判据随之变成
+        # `blacklist.PERMANENT`(所有者逐码裁决的七个 + OTHER 两个显式词条)。
+        # `unlisted_term` 一并带上:`OTHER` 是混装桶,只有 business decision /
+        # trust & safety 算永久拉黑,判据在引擎里(is_permanent)。
+        res = error_taxonomy.classify_reasons(
+            error_taxonomy.split_reasons(it["reasons"]))
+        it["category"], it["cat_name"] = res.code, res.name
+        it["unlisted_term"] = res.unlisted_term
+        it["policy_name"] = res.policy_name
         bucket = out.setdefault(it["store"], {"delete": [], "retire": []})
         if key in stubborn:
             # 删除未生效的顽固 SKU(所有者定稿):
@@ -382,7 +390,7 @@ def _k_cluster_note(items: list[dict]) -> str:
     """
     by_store: dict[str, int] = {}
     for it in items:
-        if it.get("category") == "K":
+        if it.get("category") == "FLAGGED":      # 换轨前是旧码 K(审查)
             by_store[it["store"]] = by_store.get(it["store"], 0) + 1
     hot = {st: n for st, n in by_store.items() if n >= _K_CLUSTER_WARN}
     if not hot:

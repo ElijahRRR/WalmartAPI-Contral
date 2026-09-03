@@ -80,7 +80,7 @@ LIMIT %(chunk)s
 _SQL_REC_SET = """
 UPDATE audit.walmart_error_records
 SET taxonomy_code = %(code)s, taxonomy_policy = %(policy)s,
-    taxonomy_version = %(ver)s
+    taxonomy_term = %(term)s, taxonomy_version = %(ver)s
 WHERE id = %(id)s
 """
 
@@ -95,7 +95,8 @@ LIMIT %(chunk)s
 _SQL_BL_SET = """
 UPDATE catalog.asin_blacklist
 SET taxonomy_code = %(code)s, taxonomy_policy = %(policy)s,
-    taxonomy_version = %(ver)s, taxonomy_src = %(src)s
+    taxonomy_term = %(term)s, taxonomy_version = %(ver)s,
+    taxonomy_src = %(src)s
 WHERE asin = %(asin)s
 """
 
@@ -147,15 +148,27 @@ def _parse(params: dict) -> tuple[str, int, bool, bool, int]:
     return scope, chunk, bool(params.get("force")), execute, limit
 
 
-def classify(text: str, policy_names) -> tuple[str, str | None]:
-    """输入:报错原文 + 政策表名 → 输出:(新主码, join 上的政策名或 None)。
+def classify(text: str, policy_names) -> tuple[str, str | None, str | None]:
+    """输入:报错原文 + 政策表名 → 输出:(新主码, 政策名或 None, 显式词条或 None)。
+
+    **政策名是与主码正交的第二维**(所有者 2026-09-03 问「沃尔玛的报错是带禁售
+    政策类别的,这里面怎么没有体现」):沃尔玛的原文常写成
+    `Prohibited Products Policy: Alcohol.`,引擎把 `Alcohol` 抽出来,再对
+    `audit.walmart_prohibited_policy.category_en` join —— **那正是审核链
+    `catalog.products.audit_reason` 用的同一张枚举**,所以两边可以直接对照。
+    ⚠ 只有**部分**报错带类别名(通用政策拒就一句"违反禁售政策",没有类别);
+    抽不出来是常态,不是缺口。
 
     政策名**必须 join 得上政策表才写**:猜出来的名字会一路进报表与申诉口径,
     而没有任何东西会红(与 audit_l3 的 `policy` 解析同一条纪律)。
+    第三个返回值是**赢下主码那个原子**命中的显式词条(序 16),`OTHER` 该不该
+    拉黑靠它判(所有者只认 business decision / trust & safety)。
     """
     res = error_taxonomy.classify_reasons(
         error_taxonomy.split_reasons(text), policy_names)
-    return res.code, error_taxonomy.policy_join(res.policy_name, policy_names)
+    return (res.code,
+            error_taxonomy.policy_join(res.policy_name, policy_names),
+            res.unlisted_term)
 
 
 def pick_source(asin: str, own_reason: str | None, src_sku: str | None,
@@ -213,6 +226,7 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     """回填 audit.walmart_error_records。返回摘要行。"""
     matrix: Counter = Counter()
     new_codes: Counter = Counter()
+    policies: Counter = Counter()      # 政策类别名(与主码正交的第二维)
     done = 0
     sql = _SQL_REC_PICK.format(force="true" if force else "false")
     while True:
@@ -226,10 +240,13 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             break
         ups = []
         for rid, raw, old in rows:
-            code, policy = classify(raw, policy_names)
+            code, policy, term = classify(raw, policy_names)
             matrix[(old or "(空)", code)] += 1
             new_codes[code] += 1
-            ups.append({"id": rid, "code": code, "policy": policy, "ver": ver})
+            if policy:
+                policies[policy] += 1
+            ups.append({"id": rid, "code": code, "policy": policy,
+                        "term": term, "ver": ver})
         if execute:
             with conn.cursor() as cur:
                 cur.executemany(_SQL_REC_SET, ups)
@@ -240,6 +257,15 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             break        # 空跑不盖版本号 ⇒ 候选集恒定,再取一批就是同一批
     out = [f"▍audit.walmart_error_records:判了 {done} 条"]
     out += [f"    {n:>7}  {code}" for code, n in new_codes.most_common(15)]
+    if policies:
+        out += ["", f"  **政策类别名**(与主码正交的第二维;沃尔玛原文里写成 "
+                f"`Prohibited Products Policy: <类别>`,已 join 政策表 "
+                f"⇒ 与审核链 `catalog.products.audit_reason` **同一张枚举**,"
+                f"可直接对照):抽出且 join 上 {sum(policies.values())} 条,"
+                f"{len(policies)} 个类别,前 15:"]
+        out += [f"    {n:>7}  {name}" for name, n in policies.most_common(15)]
+        out.append("  ⚠ 只有**部分**报错带类别名(通用政策拒就一句「违反禁售"
+                   "政策」,没有类别)—— 抽不出是常态,不是缺口。")
     if matrix:
         out.append("  旧码(error_code) → 新码,前 15:")
         out += [f"    {n:>7}  {old} → {code}"
@@ -253,6 +279,7 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     src_stat: Counter = Counter()
     matrix: Counter = Counter()
     new_codes: Counter = Counter()
+    policies: Counter = Counter()      # 政策类别名(与主码正交的第二维)
     suspect: Counter = Counter()
     done = 0
     sql = _SQL_BL_PICK.format(force="true" if force else "false")
@@ -273,15 +300,17 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             text, src = pick_source(asin, reason, src_sku, rec, ev, it)
             src_stat[src] += 1
             if text:
-                code, policy = classify(text, policy_names)
+                code, policy, term = classify(text, policy_names)
                 new_codes[code] += 1
                 matrix[(cat or "(空)", code)] += 1
+                if policy:
+                    policies[policy] += 1
                 if code in NOT_A_PRODUCT_BAN:
                     suspect[(cat or "(空)", code)] += 1
             else:
-                code = policy = None        # 找不到原文就不猜
+                code = policy = term = None     # 找不到原文就不猜
             ups.append({"asin": asin, "code": code, "policy": policy,
-                        "ver": ver, "src": src})
+                        "term": term, "ver": ver, "src": src})
         if execute:
             with conn.cursor() as cur:
                 cur.executemany(_SQL_BL_SET, ups)
@@ -300,6 +329,15 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
         out.append(f"  ⚠ {src_stat['none']} 条**四处都没有原文** ——"
                    f"taxonomy_code 留 NULL,不猜")
     out += [f"    {n:>7}  {code}" for code, n in new_codes.most_common(15)]
+    if policies:
+        out += ["", f"  **政策类别名**(与主码正交的第二维;沃尔玛原文里写成 "
+                f"`Prohibited Products Policy: <类别>`,已 join 政策表 "
+                f"⇒ 与审核链 `catalog.products.audit_reason` **同一张枚举**,"
+                f"可直接对照):抽出且 join 上 {sum(policies.values())} 条,"
+                f"{len(policies)} 个类别,前 15:"]
+        out += [f"    {n:>7}  {name}" for name, n in policies.most_common(15)]
+        out.append("  ⚠ 只有**部分**报错带类别名(通用政策拒就一句「违反禁售"
+                   "政策」,没有类别)—— 抽不出是常态,不是缺口。")
     if matrix:
         out.append("  入选旧码(category) → 新码,前 15:")
         out += [f"    {n:>7}  {old} → {code}"

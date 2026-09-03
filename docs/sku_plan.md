@@ -881,3 +881,33 @@ python cli.py sku_migrate -p store=<试点店> -p limit=100000 -p exclude_asins=
   PUBLISHED 且未缺席,正好落进 `problem_scan` 的扫描面被建议 DELETE_ITEM —— 一次成功的
   改码被自己的自动链当场永久删掉。止损全靠第二块那条 `NOT EXISTS`,它**必须先于任何
   一次真跑合并**,并且有反向守门测试钉住。
+
+### 9.5 生产 A/B 验收实测(2026-09-03):「零行为变化」的唯一已知例外
+
+批次 0a 对外承诺的是「身份表达式换成 `coalesce(ls.source_key, w.sku)` 之后逐行
+等价」。生产实跑 `maintenance_scan --dry-run -p preview=1 -p store=谭总11` 做
+main ⇄ 本分支对照,**意图数 343 → 351,多出 8 条**(标题 +3、价格 +3、库存 +2;
+删除两边都是 16)。逐条查清后确认:**多出来的 8 条是收口买到的东西,不是回归。**
+
+- **成因**:main 的 `_SQL_AMZ_JOIN` 是 `p.asin = w.sku` 裸接。存量里有一批
+  `source_type='amz' AND source_key <> sku` 的行(全库 318 条,`workflow=backfill`,
+  成因是旧回填正则缺右锚 + `left(sku,10)`,形如 `B0FYWJH5M4S50` → `B0FYWJH5M4`、
+  `CMSQ-B0CLCX3Q1Z-169.99` → `B0CLCX3Q1Z`)。这些行在 main 上接不到
+  `catalog.products` 任何一行 ⇒ **整行从 JOIN 掉出去,维护链对它们永久失明**
+  (不改价、不改标题、不清零、也不回补)。本分支经登记簿接上了真产品。
+- **算术**:谭总11 有 **3 行**属于这一类(SQL 核实:JOIN 得上 `source_key`、
+  JOIN 不上裸 `sku`)。3 行 × (标题 + 价格) = 6,其中 2 行库存也不一致
+  (0→30、30→23;第 3 行 10→10 一致不产)= 2。合计 **+8**,与 diff 一字不差。
+- **删除为什么不变**:删除走 `_SQL_VARIANT_OFFSET` / `_SQL_LONG_OOS` / 观测核验,
+  判据是多天窗口;这 3 行 `outcome=ok`、`In Stock`,接上了也不到删除档。
+- **顺带的业务收益**:`B0FYWJH5M4S50` 在沃尔玛挂着 0 库存、amz 有 30 件,在 main 上
+  永远回不了血;合并后第一轮维护就会把它顶回去。这 318 行里的同类会自行恢复。
+
+排查中被**证伪**的两条解释,记下来免得复查时重走:
+① 「两次运行之间采集快照变了」—— 同分支间隔 30 秒连跑两次,除时间戳外逐字节相同
+   (`压制 76 条` / `77 行` / `压掉 544 条` 全一致),数据在该窗口内是稳的;
+② 「`only` 下推改变了压制/截断口径」—— `cap_per_store` 按 `(store, kind)` 分组、
+   `doomed` 是 `(store, sku)` 精确对、`drop_recent` 按 `_suppress_key` 逐键匹配,
+   三者都没有跨店依赖,先全量算再 Python 过滤与只算单店同集合。
+   全店计数器(`压掉 12419` → `544`、`title_mismatch 1870` → `76`)的差异是下推的
+   **预期**结果:main 那几行统计的是全库、本分支统计的是本店。

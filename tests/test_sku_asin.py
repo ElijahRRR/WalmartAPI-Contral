@@ -17,6 +17,28 @@ def test_owner_samples_extract_exactly():
     assert sa.extract_asin("A109-B08QF9XLMH-02") == "B08QF9XLMH"
 
 
+def test_double_dash_wrapped_is_extracted_not_guessed():
+    """`CMSQ--B07J2QNQCF-43`(2026-09-03 生产实证,待归类「其他」桶的主力形态):
+    前缀与源头码之间两个横杠。中段两侧都有分隔符 ⇒ 与单横杠三段式同置信度,
+    走**提取**(依据 'wrapped'),不落 propose_source_key 的 guess 分档。"""
+    assert sa.extract_asin("CMSQ--B07J2QNQCF-43") == "B07J2QNQCF"
+    assert sa.extract_asin("CMSQ--B0D5XMC32K-35") == "B0D5XMC32K"
+    assert sa.classify("CMSQ--B0BGG5PSZN-65") == "wrapped"
+    assert sa.propose_source_key("CMSQ--B0BGG5PSZN-65") == ("B0BGG5PSZN",
+                                                            "wrapped")
+
+
+def test_double_dash_widening_stops_at_two():
+    """只放宽**这一个**分隔符:三横杠、缺价格段、中段形态不合的一律照旧
+    提不出 —— 放宽一处不等于把三段式变成"见横杠就切"。"""
+    for weird in ("CMSQ---B07J2QNQCF-43",     # 三个横杠:未见实例,不猜
+                  "CMSQ--B07J2QNQCF-",        # 尾段不是价格
+                  "CMSQ--B07J2QNQCF",         # 缺尾段
+                  "CMSQ--0B7J2QNQCF-43"):     # 中段数字开头,不是源头码形态
+        assert sa.extract_asin(weird) is None, weird
+        assert sa.classify(weird) == "other", weird
+
+
 def test_plain_asin_passes_through():
     assert sa.extract_asin("B0GXX75JN5") == "B0GXX75JN5"
     assert sa.extract_asin(" b0gxx75jn5 ") == "B0GXX75JN5"   # 大小写/空白归一

@@ -23,7 +23,11 @@ A-L 单字母码。于是同一批产品在库里挂着旧码、在报告里是�
     删了就没法对照"当初按什么拉的黑");
   · `catalog.asin_blacklist`:同上三列 + `taxonomy_src`(原文从哪儿找到的)。
 
-⚠ **`catalog.asin_blacklist.category` 一个字不动,判定链的行为一点没变。**
+⚠ **`catalog.asin_blacklist.category` 复核出结论就改写成新码**(2026-09-04
+所有者裁决:「不要做双轨,没有意义,以新规则统一」)。`LEGACY` 与判不出的
+两类不动。**拦截行为仍然一点没变** —— 上架闸拦的判据是「这个 asin 在不在
+表里」,`category` 只进提示文字;飞书「来源」列也不变(`source_label` 经
+`_NAMES` 把新码映射回旧中文标签)。
 L0 的 ASIN 闸读的仍是 `category`,新码**只是账**。让新码改变拦截行为
 (把按 PT_WRONG/GATED 拉黑的行放出来)是**另一次裁决** —— 黑名单的既定语义
 是「一次入选、永久禁止」,批量放行是破坏性动作,不在本工作流里顺手做。
@@ -58,7 +62,8 @@ import logging
 from collections import Counter
 
 from registry import db, resources
-from services import error_source, error_taxonomy, problem_products
+from services import (blacklist, error_source, error_taxonomy,
+                      problem_products)
 
 DANGEROUS = False       # 只写自己库的新增列,不碰沃尔玛接口
 
@@ -104,7 +109,16 @@ _SQL_BL_SET = """
 UPDATE catalog.asin_blacklist
 SET taxonomy_code = %(code)s, taxonomy_policy = %(policy)s,
     taxonomy_term = %(term)s, taxonomy_version = %(ver)s,
-    taxonomy_src = %(src)s
+    taxonomy_src = %(src)s,
+    -- ⚠ 2026-09-04 所有者裁决:「旧 A-L 码入选然后按新码复核过,那么现在库里
+    --   保留的应该就只有新码,没有旧码残留……不要做双轨,没有意义,以新规则统一」。
+    --   所以复核出结论的行,`category` 同步改写成新码。
+    --   两条不动:① `LEGACY`(历史继承,所有者说「保留原样没有问题」);
+    --            ② 判不出的(`code` 为 NULL)—— 没结论就没有可写的东西。
+    category = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL
+                    THEN category ELSE %(code)s END,
+    source   = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL
+                    THEN source ELSE %(source)s END
 WHERE asin = %(asin)s
 """
 
@@ -284,7 +298,10 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
             else:
                 code = policy = term = None     # 找不到原文就不猜
             ups.append({"asin": asin, "code": code, "policy": policy,
-                        "term": term, "ver": ver, "src": src})
+                        "term": term, "ver": ver, "src": src,
+                        # 码名统一了,来源标签跟着走(飞书「来源」列的文字不变:
+                        # `_NAMES` 把新码映射回旧中文标签)
+                        "source": blacklist.source_label(code) if code else None})
         if execute:
             with conn.cursor() as cur:
                 cur.executemany(_SQL_BL_SET, ups)
@@ -321,7 +338,7 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
                 f"旧码算它们永久禁售,新码认出病根另在别处:",
                 *[f"       {n:>7}  {old} → {code}"
                   for (old, code), n in suspect.most_common(15)],
-                "  ⚠ **本工作流没有放行任何一条**:`category` 一个字没动,"
+                "  ⚠ **本工作流没有放行任何一条**:改的只是码名(旧 A-L → 新码),"
                 "L0 的 ASIN 闸读的仍是它。",
                 "     黑名单是「一次入选、永久禁止」的既定语义,批量放行是"
                 "破坏性动作 —— 要不要放、怎么放是所有者的另一次裁决。"]
@@ -364,5 +381,5 @@ def run(params: dict) -> str:
                  "   (空跑只取一批看形态,真跑才会一批批走完)"]
     else:
         body += ["", f"新码已写进两表的 taxonomy_* 列(版本 {ver})。"
-                 "⚠ **老列与判定行为一个字没动** —— 换轨与放行是另一次裁决。"]
+                 "⚠ **判定行为一个字没动**(拦的是「在不在表里」);`category`\n   已按新码统一(LEGACY 与判不出的两类不动),放行仍归 blacklist_route。"]
     return "\n".join(head + body)

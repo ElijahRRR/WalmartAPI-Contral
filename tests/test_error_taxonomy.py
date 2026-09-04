@@ -702,3 +702,47 @@ def test_同一个ASIN两条源判出相反的码_这就是那3037条():
     # 一个该放、一个会被永久拉黑 —— 取错原文的代价就是这个
     assert et.is_permanent("POLICY", None) is True
     assert et.is_permanent("PT_WRONG", None) is False
+
+
+def test_items那一级要按asin也索引一份_否则sku对不上就查不中():
+    """⚠ 2026-09-04 生产实测:回填与路由的 2,261 条冲突里 **2,194 条(97%)**
+    出在这一处 —— 同一个 ASIN 在多店有**多个 sku**,`_judge_events` 拿的是
+    `product_events.sku`、`error_reclass` 拿的是 `asin_blacklist.src_sku`,
+    两个对不上 ⇒ items 那一级查不中 ⇒ 退回残缺的事件 reason ⇒ 判成 POLICY
+    而不是 PT_WRONG,于是把被正确释放的品又加回来。
+
+    ⚠ 开关必须**显式**:它是一次全表扫,分批调用的消费方(`error_reclass` 有
+    精确的 src_sku)不该付这个代价。
+    """
+    import inspect
+    from services import error_source, blacklist
+    from workflows import error_reclass
+    sig = inspect.signature(error_source.fetch)
+    assert sig.parameters["items_by_asin"].default is False   # 缺省不付代价
+    assert "extract_asin" in inspect.getsource(error_source.fetch)
+    # 手上 sku 不可靠的那一方开它;有精确 src_sku 的那一方不开
+    assert "items_by_asin=True" in inspect.getsource(blacklist._judge_events)
+    assert "items_by_asin" not in inspect.getsource(error_reclass._sources)
+    # 不许覆盖按 sku 命中的那份(调用方给的 sku 更精确)
+    assert "a not in items" in inspect.getsource(error_source.fetch)
+
+
+def test_复核出结论就把category改成新码_LEGACY与判不出的不动():
+    """⚠ 所有者 2026-09-04:「旧 A-L 码入选然后按新码复核过,那么现在库里保留的
+    应该就只有新码,没有旧码残留……不要做双轨,没有意义,以新规则统一」。
+
+    两条不动:① `LEGACY`(历史继承,所有者说「保留原样没有问题」);
+             ② 判不出的(code 为 NULL)—— 没结论就没有可写的东西。
+    ⚠ **拦截行为仍然一个字没变**:上架闸拦的是「这个 asin 在不在表里」,
+    `category` 只进提示文字;飞书「来源」列也不变(source_label 经 _NAMES
+    把新码映射回旧中文标签)。
+    """
+    from workflows import error_reclass as wf
+    from services import blacklist
+    sql = wf._SQL_BL_SET
+    assert "category = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL" in sql
+    assert "THEN category ELSE %(code)s END" in sql
+    assert "source   = CASE WHEN category = 'LEGACY'" in sql   # 来源标签跟着走
+    # 飞书那一列的文字确实不变
+    assert blacklist.source_label("POLICY") == "沃尔玛-禁售"
+    assert blacklist.source_label("BRAND") == "沃尔玛-品牌"

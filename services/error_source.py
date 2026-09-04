@@ -26,6 +26,8 @@
 
 import logging
 
+from services.sku_asin import extract_asin
+
 logger = logging.getLogger("services.error_source")
 
 #: 三条外源都取**每个键最新的那一条**:同一 asin 多条报错时拿最近那次的原文
@@ -51,9 +53,26 @@ WHERE sku = ANY(%(skus)s) AND coalesce(unpublished_reasons, '') <> ''
 ORDER BY sku, updated_at DESC
 """
 
+#: ⚠ 同一个 ASIN 在多店有**多个 sku**,调用方手上那个未必是当初入选的那个 ——
+#: 生产实测 2026-09-04:回填与路由的 2,261 条冲突里 **2,194 条(97%)** 出在这里
+#: (`_judge_events` 拿的是 `product_events.sku`,而 `error_reclass` 拿的是
+#: `asin_blacklist.src_sku`,两个对不上 ⇒ items 那一级查不中 ⇒ 退回残缺的事件
+#: reason ⇒ 判成 POLICY 而不是 PT_WRONG)。
+#: 手上没有可靠 sku 的调用方传 `items_by_asin=True`:扫一遍有下架原因的行,
+#: 按 `sku_asin` 规则折成 asin 再索引一份。**是全表扫**,所以要显式开 ——
+#: 分批调用的消费方(`error_reclass` 有精确的 `src_sku`)不该付这个代价。
+SRC_ITEMS_ANY = """
+SELECT sku, unpublished_reasons FROM catalog.walmart_items
+WHERE coalesce(unpublished_reasons, '') <> ''
+"""
 
-def fetch(conn, asins: list[str], skus: list[str]) -> tuple[dict, dict, dict]:
+
+def fetch(conn, asins: list[str], skus: list[str], *,
+          items_by_asin: bool = False) -> tuple[dict, dict, dict]:
     """输入:一批 asin/sku → 输出:(records, events, items) 三张映射。
+
+    `items_by_asin=True` 时 `items` **同时按 asin 索引**(见 `SRC_ITEMS_ANY`
+    头注:手上的 sku 不可靠时唯一查得中的办法;代价是一次全表扫)。
 
     查不到的那一级**只告警不阻断**:少一级原文是判得糙一点,而整条工作流炸掉
     是一条都判不了。
@@ -74,7 +93,23 @@ def fetch(conn, asins: list[str], skus: list[str]) -> tuple[dict, dict, dict]:
                            " ".join(sql.split())[:50], e)
             conn.rollback()
             out.append({})
-    return out[0], out[1], out[2]
+    records, events, items = out
+    if items_by_asin and asins:
+        want = set(asins)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(SRC_ITEMS_ANY)
+                for sku, text in cur.fetchall():
+                    if not text:
+                        continue
+                    a = extract_asin(sku)
+                    # 不覆盖按 sku 命中的那份(调用方给的 sku 更精确)
+                    if a and a in want and a not in items:
+                        items[a] = text
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("按 asin 补 items 那一级失败(跳过):%s", e)
+            conn.rollback()
+    return records, events, items
 
 
 def pick(asin: str, own_reason: str | None, src_sku: str | None,

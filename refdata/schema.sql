@@ -321,9 +321,12 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
 -- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
 ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
 -- 新码回填四列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
--- ⚠ **`category` 一个字不动**:它是入选那一刻的旧码,也是「一次入选、永久禁止」
---   的历史依据;判定链(L0 ASIN 闸)现在读的仍是它 —— 新码**只是账**,
---   要不要让它改变拦截行为是所有者的另一次裁决(别顺手接上去)。
+-- ⚠ **`category` 2026-09-04 起统一到新码**(所有者裁决:「旧 A-L 码入选然后按
+--   新码复核过,那么现在库里保留的应该就只有新码,没有旧码残留……不要做双轨,
+--   没有意义,以新规则统一」)。`error_reclass` 复核出结论就同步改写它。
+--   两条不动:`LEGACY`(历史继承,保留原样)与判不出的(code 为 NULL)。
+--   ⚠ **拦截行为一个字没变**:上架闸拦的是「这个 asin 在不在表里」,`category`
+--   只进提示文字;飞书「来源」列也不变(source_label 经 _NAMES 映射回旧中文标签)。
 -- taxonomy_src 记原文是从哪儿找到的,四级优先(全文优先于样本):
 --   'records'=audit.walmart_error_records.raw_reason(全文,最新一条)
 --   'events' =catalog.product_events.detail->>'reasons'(病历,最新一条)

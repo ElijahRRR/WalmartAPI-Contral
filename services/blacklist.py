@@ -306,7 +306,11 @@ def _judge_events(conn) -> list[dict]:
         rows = cur.fetchall()
     asins = [r[0] for r in rows if r[0]]
     skus = [r[1] for r in rows if r[1]]
-    records, _events, items = error_source.fetch(conn, asins, skus)
+    # ⚠ items_by_asin:事件里那个 sku 未必是当初入选的那个(生产实测 2,194 条
+    #   冲突全出在这里,见 error_source.SRC_ITEMS_ANY 头注)。本函数一次性
+    #   全量跑,付得起那一次全表扫。
+    records, _events, items = error_source.fetch(conn, asins, skus,
+                                                items_by_asin=True)
     out = []
     for asin, sku, store, occurred_at, reason in rows:
         # 事件 reason 就是「events」那一级,手上已有,不再查一遍

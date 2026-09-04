@@ -306,6 +306,20 @@ CREATE TABLE catalog.product_events (
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
+-- ⚠ `problem_categorized` 的 detail 归类四键(2026-09-04,所有者:「产品级的
+-- 记录已经有产品事件在做了」)——**产品级判定的账本就是这里**,下游
+-- (`services/blacklist._judge_events` → 该不该拉黑)只读码、不再拿原文重判:
+--   category / name        新 16 码与中文名(写入方 problem_scan;存量由
+--                          `error_reclass -p scope=events` 回填)
+--   taxonomy_term          OTHER 是混装桶,`is_permanent` 靠这个显式词条
+--   taxonomy_version       增量谓词(同 audit_runs.audit_version 的套路)
+--   taxonomy_src           这一行的码是拿哪一级原文判的:records / items /
+--                          self(事件自己那份)/ keep(**没重判,原样留着**)
+-- ⚠ `detail.reason` 到 2026-09-04 为止被 `[:200]` 截过(判用全文、存留残文),
+--   所以回填**不许**拿它简单重判 —— 那次把 2,595 条判对的 PT_WRONG 改成了
+--   POLICY(可放 → 永久禁)。改法是 `error_source.restore`(候选须以事件自己
+--   那份为前缀,只接回被切掉的那段)+ 一道棘轮(已是新码且还原不了就不动,
+--   落 `taxonomy_src='keep'`)。全文见 docs/error_taxonomy.md §17。
 -- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
 -- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
 --   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
@@ -700,16 +714,21 @@ ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统�
 审核误差很大」):`taxonomy_code` / `taxonomy_policy` / `taxonomy_version` /
 `taxonomy_src`。
 
-- **`category` 一个字不动**,判定链(Phase0 ASIN 闸)读的仍是它 ——
-  新码**只是账**。让新码改变拦截行为(把按 `PT_WRONG`/`GATED` 拉黑的行放出来)
-  是**另一次裁决**:黑名单的既定语义是「一次入选、永久禁止」,批量放行是
-  破坏性动作,不许顺手接上去。
-- `taxonomy_src` 记原文从哪儿找到的,四级优先、**全文优先于样本**:
+- **`category` 已按新码统一**(2026-09-04 所有者裁决:「不要做双轨,没有意义,
+  以新规则统一」):`error_reclass` 复核出结论就把 `category` 改写成新码,
+  `LEGACY`(历史继承)与判不出的两类不动。
+  ⚠ **拦截行为仍然一个字没变**:判定链(Phase0 ASIN 闸)拦的是「这个 asin
+  在不在表里」,`category` 只进提示文字。让新码改变拦截行为(把按
+  `PT_WRONG`/`GATED` 拉黑的行放出来)是**另一次裁决** —— 黑名单的既定语义是
+  「一次入选、永久禁止」,批量放行是破坏性动作,归 `blacklist_route`,
+  不许在回填里顺手接上去。
+- `taxonomy_src` 记原文从哪儿找到的,四级优先、**全文优先于样本**
+  (唯一实现 `services/error_source.pick`):
   `records`(`audit.walmart_error_records.raw_reason`,全文)→ `events`
   (`catalog.product_events` 病历)→ `items`(`catalog.walmart_items` 当前值,
-  按 `src_sku` 精确对)→ `self`(本表 `reason`,**截 200 字符的样本**,判据串
-  可能被切掉 ⇒ 这部分判出来的码是下限)→ `none`(四处都没有 ⇒
-  `taxonomy_code` 留 **NULL**,不猜)。
+  先按 `src_sku` 精确对、再按 asin 兜底)→ `self`(本表 `reason`,
+  **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分判出来的码是下限)→
+  `none`(四处都没有 ⇒ `taxonomy_code` 留 **NULL**,不猜)。
 - `taxonomy_version` 是增量谓词,同 `audit_runs.audit_version` 的套路。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)

@@ -16,12 +16,20 @@
 所以取原文与归类(`services/error_taxonomy`)一样,只准有一处实现。谁要判一条
 报错,先来这里拿原文,别自己 SELECT。
 
-## 四级优先(顺序本身是判据的一部分)
+## 两个取用口,按「调用方有没有自己的原文」分
 
-`records`(全文)→ `events` → `items` → 调用方自己手上那份 → `none`。
-⚠ 最后那一级常是**截断过的样本**,判据串可能被切掉(§14.8:`asin_blacklist.reason`
-曾经截 200,而沃尔玛的判据串恰好在句尾)—— 所以它排最后,且四处都没有时
-**留 NULL 不猜**。
+· `pick` —— 调用方**没有**自己那一刻的原文(黑名单行:`reason` 只是入选时抄的
+  样本,行本身代表「这个 asin 被禁」)。四级优先,顺序本身是判据的一部分:
+  `records`(全文)→ `events` → `items` → 调用方手上那份 → `none`。
+  ⚠ 倒数第二级常是**截断过的样本**,判据串可能被切掉(§14.8:
+  `asin_blacklist.reason` 曾经截 200,而沃尔玛的判据串恰好在句尾)—— 所以它
+  排最后,且四处都没有时**留 NULL 不猜**。
+
+· `restore` —— 调用方**有**自己那一刻的原文(产品事件:时间线上的一格)。
+  这时"换一份更好的原文"是错的,唯一该做的是**把被切掉的那段接回去**:
+  候选必须以自己那份为前缀。2026-09-04 我在这里翻过车(§17):事件回填拿
+  事件自己的 200 字残文重判,把 `problem_scan` 当初用**全文**判对的
+  2,595 条 `PT_WRONG` 改成了 `POLICY` —— 回填把判对的行改错了。
 """
 
 import logging
@@ -149,3 +157,40 @@ def pick(asin: str, own_reason: str | None, src_sku: str | None,
     if own:
         return own, "self"
     return "", "none"
+
+
+#: 两处历史截断都是 `[:200]`:`asin_blacklist.reason` 与 `problem_scan` 写事件的
+#: `detail.reason`(后者到 2026-09-04 才拆掉)。**比它短的那份没被我们切过**,
+#: 所以短于此长度一律不做还原 —— 见 `restore` 头注第二条。
+SAMPLE_LEN = 200
+
+
+def restore(own: str | None, candidates) -> tuple[str, str]:
+    """输入:一段(可能被截断的)原文 + [(标签, 候选全文), …] → 输出:(原文, 来源标签)。
+
+    **只做一件事:把被 `[:200]` 切掉的那一段接回去。** 没接上就原样返回
+    `("…", "self")`。
+
+    与 `pick` 的分工(两者都在这个模块里,是因为「取原文」只准有一处实现):
+      · `pick` 服务**没有自己原文**的调用方(黑名单行:`reason` 只是入选时抄的
+        样本,行本身代表「这个 asin 被禁」)—— 拿这个 asin 最新的全文判是对的;
+      · `restore` 服务**有自己原文**的调用方(产品事件:它是时间线上的一格,
+        自带那一刻的原文)—— 拿别的时间点的文本判它就是**串账**。
+
+    两条判据,缺一不可(2026-09-04 生产事故,见 docs/error_taxonomy.md §17):
+      1. 候选必须**以 own 为前缀**:是前缀 ⇒ 就是同一段文本被切之前的样子;
+         不是前缀 ⇒ 那是**另一次报错**,不是这一条的全文,不能用;
+      2. `own` 必须**够到 `SAMPLE_LEN`**:短于 200 的那份根本没被切过,
+         此时"更长的候选"是另一段更长的文本(比如后来又追加了一条理由),
+         接上去就等于拿后来的状态改写历史那一格。
+
+    纯函数,零 I/O:优先序与前缀判据是判据的一部分,拿假数据就能测。
+    """
+    base = (own or "").rstrip()
+    best, label = own or "", "self"
+    if len(base) < SAMPLE_LEN:
+        return best, label
+    for tag, text in candidates or ():
+        if text and len(text) > len(best) and text.startswith(base):
+            best, label = text, tag
+    return best, label

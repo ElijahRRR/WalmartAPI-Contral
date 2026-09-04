@@ -32,16 +32,26 @@ L0 的 ASIN 闸读的仍是 `category`,新码**只是账**。让新码改变拦�
 (把按 PT_WRONG/GATED 拉黑的行放出来)是**另一次裁决** —— 黑名单的既定语义
 是「一次入选、永久禁止」,批量放行是破坏性动作,不在本工作流里顺手做。
 
-## 原文从哪儿来(四级优先,**全文优先于样本**)
+## 原文从哪儿来(唯一取用口 `services/error_source`,两遍分工不同)
 
-所有者说得对:原文是有的。按这个顺序找,记进 `taxonomy_src`:
-  1. `records` —— `audit.walmart_error_records.raw_reason`(**全文**,NOT NULL;
-     同一 asin 多条取 `report_date` 最新的那条);
-  2. `events`  —— `catalog.product_events.detail->>'reasons'`(病历,最新一条);
-  3. `items`   —— `catalog.walmart_items.unpublished_reasons`(当前值,按
-     黑名单行的 `src_sku` 精确对 —— 那列存的就是沃尔玛侧订货号原文);
-  4. `self`    —— 本表 `reason` 列(⚠ **截 200 字符的样本**,判据串可能被切掉);
-  5. 都没有 → `taxonomy_src='none'`、`taxonomy_code` 留 **NULL**(不猜)。
+所有者说得对:原文是有的。但**取法按「这一行有没有自己那一刻的原文」分两种**:
+
+· **黑名单行 / 报错记录**没有自己那一刻的原文(`reason` 只是入选时抄的样本),
+  走 `error_source.pick`,四级优先记进 `taxonomy_src`:
+    1. `records` —— `audit.walmart_error_records.raw_reason`(**全文**,NOT NULL;
+       同一 asin 多条取 `report_date` 最新的那条);
+    2. `events`  —— `catalog.product_events.detail->>'reasons'`(病历,最新一条);
+    3. `items`   —— `catalog.walmart_items.unpublished_reasons`(当前值,先按
+       `src_sku` 精确对,再按 asin 兜底);
+    4. `self`    —— 本表 `reason` 列(⚠ **截 200 字符的样本**,判据串可能被切掉);
+    5. 都没有 → `taxonomy_src='none'`、`taxonomy_code` 留 **NULL**(不猜)。
+
+· **产品事件**有自己那一刻的原文(它是时间线上的一格),走
+  `error_source.restore`:候选必须**以事件自己那份为前缀**,只把被 `[:200]`
+  切掉的那段接回去,不换成别的时间点的文本。再加一道棘轮:**已经是新码的行,
+  原文还原不了就一个字不动**。⚠ 这两条是 2026-09-04 事故换来的(§17):
+  第一版拿事件的 200 字残文重判,把 `problem_scan` 当初用全文判对的 2,595 条
+  `PT_WRONG` 改成了 `POLICY` —— **回填的风险不是判得糙,是把判对的行改错**。
 
 ## 幂等与增量
 
@@ -286,7 +296,7 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
 # **让账本本身是对的** —— 判定只在 `problem_scan` 发生一次,其余全是查询。
 _SQL_EV_PICK = """
 SELECT id, coalesce(detail->>'reason', detail->>'reasons') AS text,
-       detail->>'category' AS cat
+       detail->>'category' AS cat, sku, coalesce(asin, sku) AS akey
 FROM catalog.product_events
 WHERE event = 'problem_categorized'
   AND coalesce(detail->>'reason', detail->>'reasons', '') <> ''
@@ -295,8 +305,8 @@ WHERE event = 'problem_categorized'
 ORDER BY id
 LIMIT %(chunk)s
 """
-#: 只动 `category`,并盖版本号(断点续跑靠它)。`name` 跟着走 —— 它是给人看的
-#: 中文标签,码变了名不变就成了两套说法。
+#: 改码:`name` 跟着走(它是给人看的中文标签,码变了名不变就成了两套说法),
+#: `taxonomy_src` 记原文是从哪儿**还原**来的,版本号盖章(断点续跑靠它)。
 _SQL_EV_SET = """
 UPDATE catalog.product_events
 SET detail = detail
@@ -304,48 +314,103 @@ SET detail = detail
                           'name', %(name)s::text,
                           -- OTHER 是混装桶,没有词条判不了永久(is_permanent)
                           'taxonomy_term', %(term)s::text,
+                          'taxonomy_src', %(src)s::text,
                           'taxonomy_version', %(ver)s::text)
+WHERE id = %(id)s
+"""
+#: 不改码,只盖章。**这条 SQL 就是那道棘轮**:够不到重判门槛的行走这里,
+#: 于是既不会被改坏,也不会每轮重新排队(见 `_events_pass` 头注)。
+_SQL_EV_KEEP = """
+UPDATE catalog.product_events
+SET detail = detail || jsonb_build_object('taxonomy_src', 'keep',
+                                          'taxonomy_version', %(ver)s::text)
 WHERE id = %(id)s
 """
 
 
 def _events_pass(conn, ver: str, chunk: int, force: bool, limit: int,
-                 execute: bool, policy_names) -> list[str]:
-    """回填 catalog.product_events 的 detail.category。返回摘要行。"""
+                 execute: bool, policy_names, by_asin: dict) -> list[str]:
+    """回填 catalog.product_events 的 detail.category。返回摘要行。
+
+    ## 一条棘轮:**已经是新码的行,只有原文被还原时才重判,否则一个字不动**
+
+    2026-09-04 生产事故(docs/error_taxonomy.md §17):本遍第一版拿事件自己的
+    `detail.reason` 重判,而 `problem_scan` 到当天为止写事件时是
+    `(it["reasons"] or "")[:200]` —— **判用全文、存留残文**。于是回填把 2,595 条
+    当初判对的 `PT_WRONG`(可放)改成了 `POLICY`(永久禁),摘要还显示
+    「码变了 239,313 条」一切正常。**回填的下限不是判得糙,是把判对的行改错。**
+
+    所以这一遍先还原原文(`error_source.restore`:候选必须以事件自己那份为
+    前缀 ⇒ 只接回被切掉的那段,不换成别的时间点的文本),再按这条判:
+      · 还原成功 → 拿全文重判并写(这也正是**修 2,595 条**的路径:
+        当初那段全文就在 `walmart_items.unpublished_reasons` 里);
+      · 没还原、但 `detail.category` **已经是新码** → 不动
+        (`problem_scan` 用的文本只会比我们手上这份更全,重判只会更差);
+      · 没还原、码还是旧 A-L(或空)→ 判残文写进去,这才是真正的"下限"。
+    """
     matrix: Counter = Counter()
     new_codes: Counter = Counter()
-    done = changed = 0
+    src_stat: Counter = Counter()
+    done = changed = kept = 0
     sql = _SQL_EV_PICK.format(force="true" if force else "false")
     for rows in _pages(conn, sql, ver, chunk, limit, execute):
-        ups = []
-        for ev_id, text, cat in rows:
-            code, _policy, term = classify(text, policy_names)
+        akeys = [r[4] for r in rows if r[4]]
+        skus = [r[3] for r in rows if r[3]]
+        # ⚠ events 那一级对本遍**没有意义**:要判的就是事件,拿同一 asin
+        #   **另一条**事件的文本判这一条就是串账 —— 所以丢掉,只用两条外源。
+        rec, _ev, it = _sources(conn, akeys, skus)
+        it = {**by_asin, **it}          # 按 sku 命中的优先
+        sets, keeps = [], []
+        for ev_id, own, cat, sku, akey in rows:
+            full, src = error_source.restore(
+                own, (("records", rec.get(akey)),
+                      ("items", it.get(sku) or it.get(akey))))
+            src_stat[src] += 1
+            if src == "self" and cat in resources.ERROR_CATEGORY_CODES:
+                keeps.append({"id": ev_id, "ver": ver})     # 棘轮:不动
+                kept += 1
+                continue
+            code, _policy, term = classify(full, policy_names)
             new_codes[code] += 1
             if cat != code:
                 matrix[(cat or "(空)", code)] += 1
-            ups.append({"id": ev_id, "code": code, "ver": ver, "term": term,
-                        "name": resources.ERROR_CATEGORY_CODES.get(code, code)})
+                changed += 1
+            sets.append({"id": ev_id, "code": code, "ver": ver, "term": term,
+                         "src": src,
+                         "name": resources.ERROR_CATEGORY_CODES.get(code, code)})
         if execute:
             with conn.cursor() as cur:
-                cur.executemany(_SQL_EV_SET, ups)
+                if sets:
+                    cur.executemany(_SQL_EV_SET, sets)
+                if keeps:
+                    cur.executemany(_SQL_EV_KEEP, keeps)
             conn.commit()
         done += len(rows)
-        changed += sum(1 for u, r in zip(ups, rows) if r[2] != u["code"])
-        logger.info("产品事件回填进度 %d(本批 %d)", done, len(rows))
-    out = [f"▍catalog.product_events(problem_categorized):判了 {done} 条,"
-           f"其中**码变了** {changed} 条"]
+        logger.info("产品事件回填进度 %d(本批 %d:重判 %d / 不动 %d)",
+                    done, len(rows), len(sets), len(keeps))
+    # ⚠ 第一句必须是「判了 N 条」:`run()` 靠这个串认出"判了 0 条 = 已经判过",
+    #   换了措辞那句提示就永远不出现(2026-09-03 那个坑的近亲)。
+    out = [f"▍catalog.product_events(problem_categorized):判了 {done} 条 —— "
+           f"重判 {done - kept} 条(其中**码变了** {changed} 条),"
+           f"**已是新码且原文还原不了、原样不动** {kept} 条"]
+    if src_stat:
+        out.append("  原文还原来源(候选须以事件自己那份为前缀,只接回被 200 "
+                   "截掉的那段):"
+                   + "  ".join(f"{k}={v}" for k, v in src_stat.most_common()))
     out += [f"    {n:>7}  {code}" for code, n in new_codes.most_common(10)]
     if matrix:
         out.append("  码变了的,旧 → 新,前 10:")
         out += [f"    {n:>7}  {old} → {code}"
                 for (old, code), n in matrix.most_common(10)]
-    out.append("  ⚠ 事件是**产品级记录**:改完之后下游(黑名单该不该拉黑)"
-               "直接读这个码,不必再拿原文重判 —— 判定只在 problem_scan 发生一次。")
+    out += ["  ⚠ 事件是**产品级记录**:改完之后下游(黑名单该不该拉黑)"
+            "直接读这个码,不必再拿原文重判 —— 判定只在 problem_scan 发生一次。",
+            "  ⚠ 棘轮(§17):**已经是新码的行,只有原文被还原时才重判**。"
+            "回填的风险不是判得糙,是把判对的行改错。"]
     return out
 
 
 def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
-                    execute: bool, policy_names) -> list[str]:
+                    execute: bool, policy_names, by_asin: dict) -> list[str]:
     """回填 catalog.asin_blacklist。返回摘要行。"""
     src_stat: Counter = Counter()
     matrix: Counter = Counter()
@@ -353,13 +418,6 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     policies: Counter = Counter()      # 政策类别名(与主码正交的第二维)
     suspect: Counter = Counter()
     done = 0
-    # ⚠ 按 asin 索引的 items 那一份**在循环外查一次**(全表扫,每批扫一遍太贵)。
-    #   2026-09-04 实证:上一轮 `self=14,475` 条拿的是 200 字符残文 —— 它们**有**
-    #   `src_sku`,但那个 sku 在 `walmart_items` 里可能已经不在了(下架删除),
-    #   于是 items 那一级查不中、退回残文。我原先判断「error_reclass 有精确的
-    #   src_sku 就不需要按 asin 兜底」是**错的**:有 sku ≠ 那个 sku 还查得到。
-    by_asin = error_source.items_by_asin_map(conn)
-    logger.info("items 按 asin 索引 %d 条(给 src_sku 已失效的行兜底)", len(by_asin))
     sql = _SQL_BL_PICK.format(force="true" if force else "false")
     for rows in _pages(conn, sql, ver, chunk, limit, execute):
         asins = [r[0] for r in rows]
@@ -466,16 +524,27 @@ def run(params: dict) -> str:
         if not policy_names:
             head.append("⚠ 政策表读不到 —— 本轮 taxonomy_policy 一律留空,"
                         "别据此下结论")
+        # ⚠ 按 asin 索引的 items 那一份**全程只查一次**(全表扫,每批扫一遍太贵;
+        #   事件遍与黑名单遍共用同一份)。2026-09-04 实证:上一轮 `self=14,475`
+        #   条拿的是 200 字符残文 —— 它们**有** sku,但那个 sku 在 `walmart_items`
+        #   里可能已经不在了(下架删除),于是 items 那一级查不中、退回残文。
+        #   我原先判断「有精确的 src_sku 就不需要按 asin 兜底」是**错的**:
+        #   有 sku ≠ 那个 sku 还查得到。
+        by_asin: dict = {}
+        if scope in ("all", "events", "blacklist"):
+            by_asin = error_source.items_by_asin_map(conn)
+            logger.info("items 按 asin 索引 %d 条(给 sku 已失效的行兜底)",
+                        len(by_asin))
         if scope in ("all", "records"):
             body += [""] + _records_pass(conn, ver, chunk, force, limit,
                                          execute, policy_names)
         if scope in ("all", "events"):
             # ⚠ 事件先回填:它是**产品级记录**,黑名单那一遍的判定要读它
             body += [""] + _events_pass(conn, ver, chunk, force, limit,
-                                        execute, policy_names)
+                                        execute, policy_names, by_asin)
         if scope in ("all", "blacklist"):
             body += [""] + _blacklist_pass(conn, ver, chunk, force, limit,
-                                           execute, policy_names)
+                                           execute, policy_names, by_asin)
     # ⚠ 判了 0 条**必须说清为什么**(2026-09-03 实遇):版本号已盖章时增量谓词
     #   把全部行排除,摘要只剩一行"判了 0 条",看着像"没数据",实际是"已经判过"。
     #   而这时若刚加了新列(如 taxonomy_term),那一列会**全是 NULL** 而没有

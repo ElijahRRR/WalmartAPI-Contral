@@ -725,11 +725,15 @@ def test_items那一级要按asin也索引一份_否则sku对不上就查不中(
     #   src_sku,但那个 sku 在 walmart_items 里已经不在了(下架删除),照样查不中,
     #   所以要按 asin 兜底。它分批跑,故在**循环外**查一次、跨批复用。
     #   (`_judge_events` 已改成直接读产品历史,不再需要这一档。)
-    bl_src = inspect.getsource(error_reclass._blacklist_pass)
-    assert "error_source.items_by_asin_map(conn)" in bl_src
-    assert bl_src.index("items_by_asin_map") < bl_src.index("for rows in _pages")
-    # 按 sku 命中的优先(调用方给的 sku 更精确)
-    assert "{**by_asin, **it}" in bl_src
+    #   ⚠ 2026-09-04 起这一次全表扫挪到 `run()`:事件遍与黑名单遍**共用同一份**
+    #     (scope=all 时各扫一遍是白付两次代价)。
+    run_src = inspect.getsource(error_reclass.run)
+    assert "error_source.items_by_asin_map(conn)" in run_src
+    for fn in (error_reclass._events_pass, error_reclass._blacklist_pass):
+        pass_src = inspect.getsource(fn)
+        assert "items_by_asin_map" not in pass_src, fn.__name__   # 不许每批扫
+        # 按 sku 命中的优先(调用方给的 sku 更精确)
+        assert "{**by_asin, **it}" in pass_src, fn.__name__
     assert "{**items_by_asin_map(conn), **items}" in inspect.getsource(error_source.fetch)
 
 
@@ -838,3 +842,39 @@ def test_产品事件是产品级记录_下游只读码():
     assert "detail->>'category'" in sql and "detail->>'taxonomy_term'" in sql
     assert "GROUP BY 1" in sql and "coalesce(asin, sku) AS asin" in sql
     assert "DISTINCT ON" not in sql        # 不许退回「只取最新一条」
+
+
+def test_restore只接回被截掉的那段_不换成别的文本():
+    """⚠ `error_source.restore` 的两条判据,2026-09-04 事故换来的(§17):
+
+    ① 候选必须**以 own 为前缀** —— 是前缀就是同一段文本被切之前的样子;不是
+       前缀就是**另一次报错**,拿它判这一格等于串账;
+    ② `own` 必须够到 `SAMPLE_LEN`(200)—— 短于它的那份根本没被我们切过,
+       此时"更长的候选"是另一段更长的文本(比如后来又追加了一条理由),
+       接上去就等于拿后来的状态改写历史那一格。
+    """
+    from services import error_source as es
+    full = ("This item has been unpublished for violating Walmart's Marketplace "
+            "*Prohibited Product Policy*. Please review the policy documentation in "
+            "the Seller Help Center for the complete list of restricted categories. "
+            "To republish this item please make sure you have the appropriate "
+            "product type selected for this item.")
+    sample = full[:es.SAMPLE_LEN]
+    assert len(sample) == 200
+    # ① 是延长 → 接回来,并记下从哪一级还原的
+    assert es.restore(sample, (("records", None), ("items", full))) == (full, "items")
+    assert es.restore(sample, (("records", full), ("items", None))) == (full, "records")
+    # ① 更长但**不是**延长 → 不能用
+    assert es.restore(sample, (("items", "另一次报错" * 200),)) == (sample, "self")
+    # ② own 没够到 200(没被切过)→ 一律不还原
+    short = "Item is prohibited."
+    assert es.restore(short, (("items", short + " Extra reason appended later."),)) \
+        == (short, "self")
+    # 候选与 own 一样长(就是同一份)→ 无事可做
+    assert es.restore(sample, (("items", sample),)) == (sample, "self")
+    # 空 / 缺项都不炸
+    assert es.restore(None, (("items", full),)) == ("", "self")
+    assert es.restore(sample, None) == (sample, "self")
+    # 这就是那次事故的两个结果:全文 PT_WRONG(可放)/ 残文 POLICY(永久禁)
+    assert et.classify_reasons(et.split_reasons(full)).code == "PT_WRONG"
+    assert et.classify_reasons(et.split_reasons(sample)).code == "POLICY"

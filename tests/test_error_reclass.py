@@ -264,3 +264,107 @@ def test_站不住要按会不会被放行分两栏():
     assert "error_taxonomy.is_permanent(c, None)" in src
     # GATED 正是那个两边都在的码 —— 它必须落到"仍留"那一栏
     assert "GATED" in et.NOT_A_PRODUCT_BAN and "GATED" in et.PERMANENT_CODES
+
+
+# ── ⑥ 事件回填的棘轮:2026-09-04「回填把判对的行改错了」那 2,595 条 ──────────
+
+#: 生产原文的形状(判据串在**句尾**),拉长到 200 字符以外 —— 截断后判据串没了。
+_EV_FULL = ("This item has been unpublished for violating Walmart's Marketplace "
+            "*Prohibited Product Policy*. Please review the policy documentation in "
+            "the Seller Help Center for the complete list of restricted categories. "
+            "To republish this item please make sure you have the appropriate "
+            "product type selected for this item.")
+_EV_SAMPLE = _EV_FULL[:200]          # problem_scan 当初写进事件的那一份
+
+
+class _EvCur:
+    """事件遍的假游标:按键集游标发行,并把 executemany 的 (SQL, 参数) 记下来。"""
+
+    def __init__(self, rows, log):
+        self.rows_all, self.log, self.rows = rows, log, []
+
+    def execute(self, _sql, args=None):
+        after, take = args["after"], args["chunk"]
+        self.rows = [r for r in self.rows_all
+                     if after is None or r[0] > after][:take]
+
+    def fetchall(self):
+        return self.rows
+
+    def executemany(self, sql, seq):
+        self.log.append((sql, list(seq)))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _EvConn:
+    def __init__(self, rows):
+        self.rows, self.log = rows, []
+
+    def cursor(self):
+        return _EvCur(self.rows, self.log)
+
+    def commit(self):
+        pass
+
+
+def test_事件回填不许把判对的行改错(monkeypatch):
+    """⚠ 2026-09-04 生产事故(docs/error_taxonomy.md §17)。
+
+    `problem_scan` 到当天为止是**判用全文、存留残文**:归类吃
+    `it["reasons"]` 全文,写事件时却 `(it["reasons"] or "")[:200]`。
+    回填第一版拿事件自己那份残文重判,于是 **2,595 条**当初判对的
+    `PT_WRONG`(可放)被改成 `POLICY`(永久禁),摘要还显示一切正常。
+
+    **回填的风险不是判得糙,是把判对的行改错。** 三种行为各钉一遍。
+    """
+    rows = [
+        # ① 已是新码 + 原文还原得到 → 拿全文重判(**这正是修 2,595 条的路径**)
+        (1, _EV_SAMPLE, "PT_WRONG", "SKU-1", "B0A"),
+        # ② 已是新码 + 还原不了 → **一个字不动**(棘轮)
+        (2, _EV_SAMPLE, "PT_WRONG", "SKU-2", "B0B"),
+        # ③ 还是旧 A-L 码 + 还原不了 → 判残文写进去,这才是真正的"下限"
+        (3, _EV_SAMPLE, "K", "SKU-3", "B0C"),
+    ]
+    conn = _EvConn(rows)
+    monkeypatch.setattr(wf, "_sources",
+                        lambda c, a, s: ({}, {}, {"SKU-1": _EV_FULL}))
+    lines = wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
+
+    sets = {u["id"]: u for sql, ups in conn.log if "'category'" in sql
+            for u in ups}
+    keeps = [u["id"] for sql, ups in conn.log
+             if "'taxonomy_src', 'keep'" in sql for u in ups]
+    assert keeps == [2]                      # 判对的那条没被碰
+    assert 2 not in sets
+    assert sets[1]["code"] == "PT_WRONG" and sets[1]["src"] == "items"
+    assert sets[3]["code"] == "POLICY"       # 只有残文时的下限
+    # 不动的那条也要盖版本号 —— 否则每轮重新排队,永远跑不完
+    assert all(u["ver"] == "t.x" for sql, ups in conn.log for u in ups)
+    assert "原样不动** 1 条" in lines[0]
+
+
+def test_事件遍不许拿别的时间点的文本判这一格(monkeypatch):
+    """⚠ 事件是**时间线上的一格**,自带那一刻的原文。
+
+    所以它走 `restore`(候选须以自己那份为前缀,只接回被切掉的那段),
+    不走 `pick`(那是给「没有自己原文」的黑名单行用的四级优先)。
+    events 那一级对本遍更是没有意义 —— 拿同一 asin **另一条**事件的文本判
+    这一条就是串账。
+    """
+    import inspect
+    src = inspect.getsource(wf._events_pass)
+    assert "error_source.restore(" in src
+    assert "error_source.pick(" not in src and "pick_source(" not in src
+    assert "_ev" in src                       # events 那一级取回来就丢掉
+    # 候选**不是**这一条的延长 → 不能用,判的还是自己那份残文
+    conn = _EvConn([(1, _EV_SAMPLE, "K", "SKU-1", "B0A")])
+    monkeypatch.setattr(wf, "_sources",
+                        lambda c, a, s: ({}, {}, {"SKU-1": "另一次报错的更长的全文" * 30}))
+    wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
+    u = [u for sql, ups in conn.log if "'category'" in sql for u in ups][0]
+    assert u["src"] == "self" and u["code"] == "POLICY"

@@ -357,7 +357,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
 | `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
-| `error_reclass_report` | | 报错归类新旧对照(只读排查,手动跑):现行 `problem_products.categorize()` 的 A-L 码 vs 新引擎 `services.error_taxonomy` 的 16 码,出迁移矩阵 / unknown 全文 / 政策表缺口 / feed 政策族分类。方案 `docs/error_taxonomy.md`,所有者过完这份账才换轨 |
+| `error_reclass_report` | | 报错归类对照(只读排查,手动跑):同一批生产数据在 `services.error_taxonomy` 16 码下的主码分布 / unknown 全文 / 政策表缺口 / feed 政策族分类 / 已产生后果的黑名单行。⚠ 2026-09-04 换轨完成后**退役了「旧码 → 新码迁移矩阵」那一面**,旧引擎 `problem_products.categorize()` 一并删除 |
 | `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |
 | `blacklist_route` | ⚠ | **存量 ASIN 黑名单按新码裁决重新路由**(手动跑,**删行不可逆**;所有者 2026-09-03 逐码裁决,表在 `docs/error_taxonomy.md` §十二)。留下 = 七个永久码(PROHIBITED_FINAL/POLICY/IP/BRAND/RECALL/FLAGGED/GATED)+ `OTHER` 的 business decision / trust & safety 两个词条 + **判不出来的**(查不出理由就继续禁);其余全删,主体是 `PT_WRONG`。三道闸:只动回填过的行、删前整行落 `backups/`、`--dry-run` 一行不动。⚠ 删完要跑 `blacklist_push` 才同步飞书 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |

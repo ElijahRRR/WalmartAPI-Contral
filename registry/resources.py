@@ -394,7 +394,8 @@ ZIP_BLACKLIST_SHEET = Spreadsheet(
 # 黑名单两张收集表(所有者建 2026-08-11,与黑名单邮编同一个 wiki 承载;
 # **PG 权威,这两张是数据库的投影**——写入方向只有 PG → 飞书,人不直接编辑)。
 # ASIN 表来源列格式 = 「沃尔玛-〈13 类之一〉」;但**入选只限永久禁止类**
-# B/C/E/F/G/K(见 services/blacklist.PERMANENT),词表≠入选范围。
+# (`error_taxonomy.PERMANENT_CODES` 七码 + `OTHER` 的两个显式词条,
+# 判据在 `is_permanent`;裁决表 docs/error_taxonomy.md §十二),词表≠入选范围。
 ASIN_BLACKLIST_SHEET = Spreadsheet(
     name="黑名单ASIN",
     token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),

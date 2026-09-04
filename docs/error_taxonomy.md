@@ -888,3 +888,84 @@ blacklist_route_20260904T042421Z.jsonl   后 12,113 条   ← 摘要只报了这
 
 ⚠ **这一轮的两个文件都要留着**:两份加起来才是完整的 42,113 行
 (`wc -l` 两个文件应当合计 42,113)。
+
+## 十四、旧码退役与口径统一(2026-09-04 所有者定稿)
+
+> 「删除旧码,我们已经迁移到新码,旧码不需要留。把口径做统一」
+
+### 14.1 查出来的问题:**「哪些事件该进黑名单」分了两条岔路**
+
+归类**入口**本身是干净的 —— 全仓 7 处调用全部走
+`error_taxonomy.classify_reasons`,没有第二套实现。问题出在下游:
+
+| 路径 | 实际用的码集 | 后果(**都静默**) |
+|---|---|---|
+| `blacklist_push -p backfill=1 -p apply=1` | `backfill_codes()` = 新七码 **∪ 旧 {B,C,E,F,G,K}** | 旧事件写的是 `B` ⇒ 把 `blacklist_route` 刚删的 **~41,600 条灌回来**,摘要显示「历史回填 +41,600」看着像正常干活 |
+| `blacklist_push -p rebuild_asin=1 -p apply=1` | `sorted(PERMANENT)` = **只有新七码** | 历史事件绝大多数是旧码,擦净重灌 **七万变几十**,同样不报错 |
+
+⚠ 第二条正是 §13.x 提交信息里亲口写下要防的事 ——「不加过渡桥
+`rebuild_asin_blacklist` 会把七万行清成几十行,而且不报错」—— 然后**只修了
+`backfill_from_events`,漏掉了 `rebuild_asin_blacklist`**。守门测试也只钉了
+`backfill_codes()` 的**内容**,没钉**哪条路径在用它**,漏改从测试底下溜过去了。
+
+⚠ 调度里那条**是安全的**:`job("blacklist", ["risk_sync", "blacklist_push"],
+hour=15)` 不带参数,只做 PG → 飞书整表投影,不回灌。所以不是每天自动出事,
+是**等着被手动踩**。
+
+### 14.2 根子:过渡桥本身就是错的
+
+`_LEGACY_PERMANENT` 把旧码 `B → POLICY`(永久)。但换轨的全部意义就是 ——
+**`B` 是个混装桶**:生产实测 40,827 条 `PT_WRONG`(沃尔玛原话「要重新上架请把
+product type 选对」,修法不是禁令)混在里面,只有 3,512 条是真 `POLICY`。
+**把整个 `B` 当永久,正是旧引擎犯的那个错。** 补桥不是修,是把旧引擎的错误
+重新接回来。
+
+### 14.3 改法:回填/重建**不信任事件里那个码**,拿原文重判
+
+`_LATEST_CTE` 本来就把 `detail->>'reason'` 取出来了,原文就在手边。
+新增 `_judge_events(conn)`:取最新事件 → `classify_reasons` → `is_permanent`
+定去留。三条路径(实时 `problem_scan` / 存量 `error_reclass` / 回填重建)
+从此**同一个引擎**,双轨消灭,两个方向的雷一起解掉。
+
+- 预览(`backfill_counts`)与真写走**同一条判据** —— 两处各算各的 = 预览说
+  3 万、真写写 7 万,而两边看着都正常;
+- `rebuild_asin_blacklist` **先判再擦**:判炸了不能留下一张空表;
+- 代价:一条集合 INSERT 变成「取行 → 判 → 批量写」。回填是一次性动作不是
+  热路径(`error_reclass` 判 97,002 行只用了几秒)。
+
+### 14.4 删掉的东西
+
+| 删除 | 为什么能删 |
+|---|---|
+| `_LEGACY_PERMANENT` / `_LEGACY_BRAND_CATEGORIES` | 过渡桥,见 14.2 |
+| `backfill_codes()` / `brand_backfill_codes()` | 双词汇表,只服务过渡桥 |
+| `_label_case()` / `_BACKFILL_ASIN_SQL` | 那份 CASE 是来源标签的第二处出生地;现在只有 `source_label()` |
+| `problem_products.categorize()` | 旧 A-L 归类引擎。唯一调用者是 `error_reclass_report` 的迁移矩阵面 |
+| `error_reclass_report` 的「旧码 → 新码迁移矩阵」面 | 使命是「所有者过完这份账才换轨」(README),**换轨已完成** |
+| `test_old_engine_snapshot` 等 3 条 + `test_categorize_rules_and_priority` | 给不存在的函数留测试是自欺 |
+
+**保留 `problem_products._RULES`**:它现在只是一张「旧码 → 中文名」的查表,
+给**读历史数据**的两处用(`cleanup_history` 认旧库的类别值、
+`error_reclass_report` 把黑名单表里入选那一刻的旧码显示成人话)。
+**读历史 ≠ 判据路径。**
+
+⚠ **语料一条没动**:`reason_corpus.jsonl` 仍是 77 行,新引擎的逐行断言
+(`test_reason_corpus_row`)照旧 —— 判据的守门从两处收敛成一处,正是要的。
+
+### 14.5 ⚠ 数据库里的旧码列:**保留,不删**
+
+`catalog.asin_blacklist.category` 与 `audit.walmart_error_records.error_code`
+存的仍是入选/报错那一刻的旧码。**不动它们**,两条理由:
+
+1. `conventions` §五:**DROP 未连库核对一律不执行**;
+2. `asin_blacklist.category` 现在还是**飞书「来源」列的数据源**
+   (`source_label` 经 `_NAMES` 映射回旧中文标签,运营按那几个词筛表)。
+
+判据面已经没有任何东西读它们 —— 它们是**无人读取的历史列**,而不是活的判据。
+真要清理得先连库核对影响面,那是另一次动作。
+
+### 14.6 上架拦截行为**一个字没变**
+
+`load_banned_asins` 返回 `{asin: (category, source)}`,而 `list_new` 的拦截判据
+是**「这个 asin 在不在表里」**,`category` 只进提示文字
+(`f"ASIN黑名单:{bl[1]}({bl[0]}类)"`)。删旧码不动拦截行为。

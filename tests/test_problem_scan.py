@@ -15,15 +15,9 @@ from services import problem_products as pp
 from workflows import problem_scan as scan
 
 
-def test_categorize_rules_and_priority():
-    assert pp.categorize("The End Date has passed for this item") == ("A", "过期")
-    assert pp.categorize("violates Prohibited Product Policy") == ("B", "禁售")
-    # 同文本命中 C 与 A → 严重性顺序 C 先(具体归类优先,A 过期最后)
-    both = "restricts certain brands ... end date has passed"
-    assert pp.categorize(both)[0] == "C"
-    assert pp.categorize("Intellectual Property complaint") == ("E", "知产")
-    assert pp.categorize("完全无关的文本") == ("Z", "其他")
-    assert pp.categorize(None) == ("Z", "其他")
+# ⚠ 2026-09-04:`test_categorize_rules_and_priority` 随 `problem_products.categorize()`
+# 一起删 —— 所有者定「删除旧码」。problem_scan 的归类现在走
+# `error_taxonomy.classify_reasons`(守门在 tests/test_error_taxonomy.py 的语料断言)。
 
 
 def test_relist_machinery_is_retired_for_good():

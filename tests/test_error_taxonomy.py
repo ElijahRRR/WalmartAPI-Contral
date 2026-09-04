@@ -8,7 +8,8 @@
      补收,`provenance:"prod-2026-09-01-report"`,标 `truncated` 的是报告展示
      截断、判据只用可见段),**一行不许跳**。语料是验收标准:引擎迁就语料,
      不是语料迁就引擎。
-  ② 旧行为快照 —— 同一批 reason 语料跑现行 `problem_products.categorize()`,
+  ② ~~旧行为快照~~ —— 2026-09-04 随旧引擎一并删除(所有者:「旧码不需要留」);
+     曾经是:同一批 reason 语料跑 `problem_products.categorize()`,
      把它**现在**的输出冻死在这里。第二步换轨时 diff 一目了然:哪些条从
      A/J/Z 翻成了真问题,是有账可查的,不是"看起来变好了"。
      ⚠ 快照是**现状**不是**期望**:里面 Z 一片、Stage 归"特殊"、
@@ -149,59 +150,12 @@ def test_the_whole_corpus_is_covered_not_a_subset():
 #   · #2/#60/#64/#65/#66/#70 判 J 特殊 —— Stage 与 Preorder 挤在一个码里,
 #     中性码盖住了同记录里的 PROHIBITED_FINAL / POLICY / PT_WRONG;
 #   · #63/#68 判 A 过期 —— 同上,过期盖住了终局禁售与品牌未授权。
-_OLD_SNAPSHOT = {
-    1: ("A", "过期"), 2: ("J", "特殊"), 3: ("B", "禁售"), 4: ("Z", "其他"),
-    5: ("D", "价格"), 6: ("B", "禁售"), 7: ("Z", "其他"), 8: ("B", "禁售"),
-    9: ("Z", "其他"), 10: ("E", "知产"), 11: ("F", "限类"), 12: ("E", "知产"),
-    13: ("H", "信息"), 14: ("B", "禁售"), 15: ("B", "禁售"), 16: ("F", "限类"),
-    17: ("B", "禁售"), 18: ("Z", "其他"), 19: ("B", "禁售"), 20: ("B", "禁售"),
-    21: ("B", "禁售"), 22: ("B", "禁售"), 23: ("Z", "其他"), 24: ("H", "信息"),
-    25: ("B", "禁售"), 26: ("B", "禁售"), 27: ("B", "禁售"), 28: ("E", "知产"),
-    29: ("G", "药品"), 30: ("F", "限类"), 31: ("B", "禁售"), 32: ("B", "禁售"),
-    33: ("B", "禁售"), 34: ("I", "内容"), 35: ("B", "禁售"), 36: ("F", "限类"),
-    37: ("Z", "其他"), 38: ("Z", "其他"), 39: ("B", "禁售"), 40: ("Z", "其他"),
-    41: ("B", "禁售"), 42: ("B", "禁售"), 43: ("B", "禁售"), 44: ("B", "禁售"),
-    45: ("B", "禁售"), 46: ("B", "禁售"), 47: ("K", "审查"), 48: ("L", "系统"),
-    49: ("E", "知产"), 50: ("Z", "其他"), 51: ("Z", "其他"), 52: ("B", "禁售"),
-    53: ("Z", "其他"), 54: ("Z", "其他"), 55: ("B", "禁售"), 56: ("B", "禁售"),
-    57: ("B", "禁售"), 58: ("I", "内容"), 59: ("I", "内容"), 60: ("J", "特殊"),
-    61: ("D", "价格"), 62: ("B", "禁售"), 63: ("A", "过期"), 64: ("J", "特殊"),
-    65: ("J", "特殊"), 66: ("J", "特殊"), 67: ("D", "价格"), 68: ("A", "过期"),
-    69: ("B", "禁售"), 70: ("J", "特殊"),
-    # #71-#77:2026-09-01 首轮对照报告补收的 7 种文本(轮次二)。这一批的看点
-    # 与前 70 行相反 —— **旧引擎判得出、新引擎当时漏了**(在架面 unknown 316 条
-    # 就是它们),补完判据后新旧同指一处;只有 #77 两边都落杂项(旧 Z / 新
-    # OTHER 显式清单)。⚠ #77 旧码是 **Z 其他**不是 K:旧 K 的判据是
-    # `flagged by our internal team`(problem_products._RULES),与"审查中"无关。
-    71: ("I", "内容"), 72: ("C", "品牌"), 73: ("I", "内容"), 74: ("C", "品牌"),
-    75: ("I", "内容"), 76: ("H", "信息"), 77: ("Z", "其他"),
-}
-
-
-@pytest.mark.parametrize("lineno", sorted(_OLD_SNAPSHOT),
-                         ids=[f"L{i}" for i in sorted(_OLD_SNAPSHOT)])
-def test_old_engine_snapshot(lineno):
-    """现行生产归类器的输出快照 —— 第一步不改它,变了就是有人动了生产判定。"""
-    text = REASONS[lineno - 1]["text"]
-    assert problem_products.categorize(text) == _OLD_SNAPSHOT[lineno]
-
-
-def test_snapshot_covers_every_corpus_line():
-    assert sorted(_OLD_SNAPSHOT) == list(range(1, len(REASONS) + 1))
-
-
-def test_the_two_engines_really_do_disagree():
-    """快照的意义在于差异:新引擎不是把旧码改了个名字。
-
-    钉住方案要所有者看见的那一类:中性码(过期/未上线)盖住的真问题必须翻出来。
-    """
-    flipped = 0
-    for i, row in enumerate(REASONS, 1):
-        old = _OLD_SNAPSHOT[i][0]
-        new = et.classify_reasons(et.split_reasons(row["text"])).code
-        if old in ("A", "J", "Z") and new not in ("EXPIRED", "STAGE", "OTHER"):
-            flipped += 1
-    assert flipped >= 10, f"只翻出 {flipped} 条,对照报告就没什么可看的了"
+# ⚠ 2026-09-04:「旧引擎输出快照」那 77 条参数化断言,连同
+# `test_snapshot_covers_every_corpus_line` / `test_the_two_engines_really_do_disagree`
+# **一并删除** —— 所有者定「删除旧码,我们已经迁移到新码,旧码不需要留」,
+# `problem_products.categorize()` 已删,给不存在的函数留测试是自欺。
+# 语料本身**一条没动**(77 行仍在 `reason_corpus.jsonl`),新引擎的逐行断言
+# 在上面的 `test_reason_corpus_row` —— 判据的守门只剩这一处,正是要的。
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -646,27 +600,42 @@ def test_换轨已落地_入选路径吃的是新码():
     assert blacklist.PERMANENT == set(et.PERMANENT_CODES)
     assert "PT_WRONG" not in blacklist.PERMANENT
     assert blacklist.BRAND_CATEGORIES == {"BRAND", "IP"}
-    # 旧引擎**留着**:error_reclass_report 拿它做新旧并排对照,不是死代码
+    # 旧引擎**已删**(2026-09-04 所有者定「旧码不需要留」):全仓归类只有
+    # `error_taxonomy.classify_reasons` 一条路。`_RULES` 保留但只是「旧码 →
+    # 中文名」的查表,给读历史数据的两处用 —— 读历史 ≠ 判据路径。
     from services import problem_products
-    assert problem_products.categorize("violates Prohibited Product Policy")[0] == "B"
+    assert not hasattr(problem_products, "categorize")
+    assert problem_products._RULES["B"][0] == "禁售"      # 查表还在
 
 
-def test_换轨过渡桥_回填两套码都认():
-    """⚠ `catalog.product_events` 的历史事件写的是旧 A-L 码,换轨后的新事件
-    写新码 —— 回填/重建按事件里那个码筛。只认新码的话
-    `rebuild_asin_blacklist` 会清空表后只灌进换轨之后那几行:七万变几十,
-    **而且不报错**,看着像"历史数据本来就没有"。
+def test_回填不看事件里那个码_拿原文重判():
+    """⚠ 所有者 2026-09-04:「删除旧码,我们已经迁移到新码,旧码不需要留。
+    把口径做统一」。过渡桥(旧 A-L 码也算永久)已删 —— 它本身就是**把旧引擎
+    的错重新引进来的通道**:旧码 `B` 是混装桶,生产实测 40,827 条 `PT_WRONG`
+    混在里面,只有 3,512 条是真 `POLICY`。
 
-    所以这一路两套码都认,直到存量事件被重写(百万级行,短期不会)。
+    2026-09-04 查出的两条岔路(方向相反,都静默):
+      · `backfill_from_events` 认新旧两套 ⇒ 把 blacklist_route 刚删的
+        ~41,600 条灌回来,摘要显示「历史回填 +41,600」看着像正常干活;
+      · `rebuild_asin_blacklist` 只认新码 ⇒ 擦净重灌**七万变几十**,同样不报错。
+    现在两条都拿事件原文过 `classify_reasons`,`is_permanent` 定去留。
     """
+    import inspect
     from services import blacklist
-    codes = set(blacklist.backfill_codes())
-    assert set(et.PERMANENT_CODES) <= codes            # 新码全在
-    assert {"B", "C", "E", "F", "G", "K"} <= codes     # 旧码也全在
-    assert {"BRAND", "IP", "C", "E"} == set(blacklist.brand_backfill_codes())
-    # 标签表两套码共用,不散落字面量
-    case = blacklist._label_case()
-    assert "WHEN 'B' THEN '禁售'" in case and "WHEN 'POLICY' THEN '禁售'" in case
+    # 旧码通道整个删干净
+    for gone in ("backfill_codes", "brand_backfill_codes",
+                 "_LEGACY_PERMANENT", "_LEGACY_BRAND_CATEGORIES",
+                 "_label_case", "_BACKFILL_ASIN_SQL"):
+        assert not hasattr(blacklist, gone), gone
+    src = inspect.getsource(blacklist)
+    assert '"B": "POLICY"' not in src        # 旧码字面量不许再出现
+    # 两条路径必须都走同一个判据
+    for fn in (blacklist.backfill_from_events, blacklist.rebuild_asin_blacklist,
+               blacklist.backfill_counts):
+        assert "_judge_events" in inspect.getsource(fn), fn.__name__
+    judge = inspect.getsource(blacklist._judge_events)
+    assert "classify_reasons" in judge and "is_permanent" in judge
+    assert "先判再擦" in inspect.getsource(blacklist.rebuild_asin_blacklist)
 
 
 def test_不是商品违禁那一集只有一份():

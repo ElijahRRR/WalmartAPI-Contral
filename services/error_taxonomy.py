@@ -7,7 +7,8 @@
 
 第一步只做「解析→归类」,不接处置:本模块的唯一消费者是对照报告工作流
 `workflows/error_reclass_report.py`;生产归类路径仍是
-`services/problem_products.categorize()`(A-L 单字母码),换轨在第二步,
+`services/problem_products.categorize()`(A-L 单字母码);**换轨已于 2026-09-03
+完成、旧引擎已于 2026-09-04 删除**,本模块现在是全仓唯一的归类引擎。原文:
 门 = 所有者过完对照报告。**这不是双轨**,是 NRTL 先例的"先补后删"。
 
 纯函数纪律(方案 §四):不 import db/api/workflows,不读环境变量,零副作用;

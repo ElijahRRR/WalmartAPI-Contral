@@ -1239,7 +1239,8 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 continue
             bl = st.banned.get(r["asin"])
             if bl:
-                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
+                # 黑名单是永久产品级禁止,**命中即拦**(拦的判据是
+                # 「这个 asin 在表里」,不看 category —— 那一列只进提示文字)。
                 # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
                 # 2026-08-12:因产品问题删过的修好重上是正常经营)
                 counts["blacklist"] += 1

@@ -147,23 +147,24 @@ def test_brand_projection_reads_channel_table_only():
 
 # ── 历史回填 ──────────────────────────────────────────────────────────────────
 
-def test_backfill_case_labels_match_source_label():
-    """回填 SQL 的 CASE 标签必须与 source_label 逐码一致——两处各写一份
-    迟早漂,漂了 = 同一类别历史行和实时行在飞书来源列长得不一样。"""
+def test_回填的来源标签只有一处出生():
+    """来源标签由 `source_label()` 一处产出(原来回填 SQL 里另写了一份 CASE)。
+    两处各写一份迟早漂,漂了 = 同一类别的历史行和实时行在飞书来源列长得不一样。"""
+    import inspect
     from services import blacklist as bl
-    for code in sorted(bl.PERMANENT):
-        assert f"WHEN '{code}' THEN '{bl.source_label(code)[len('沃尔玛-'):]}'"             in bl._BACKFILL_ASIN_SQL, code
+    assert "source_label(res.code)" in inspect.getsource(bl._judge_events)
+    assert not hasattr(bl, "_label_case")      # 那份 CASE 已随过渡桥删掉
 
 
 def test_backfill_selects_latest_category_only():
-    """入选按**最新**类别(DISTINCT ON + occurred_at DESC)——历史里类别
+    """入选按**最新**事件(DISTINCT ON + occurred_at DESC)——历史里类别
     翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。身份 =
     coalesce(asin, sku):清洗出的标准码优先、订货号原文兜底(2026-08-11
     实证 sku≠asin,多店订货号须归并到产品级)。SQL 文本钉死。"""
     from services import blacklist as bl
     assert "DISTINCT ON (coalesce(asin, sku))" in bl._LATEST_CTE
     assert "ORDER BY coalesce(asin, sku), occurred_at DESC" in bl._LATEST_CTE
-    assert "ON CONFLICT (asin) DO NOTHING" in bl._BACKFILL_ASIN_SQL
+    assert "ON CONFLICT (asin) DO NOTHING" in bl._INSERT_ASIN_SQL
 
 
 def test_rebuild_asin_apply_overwrites_and_marks_all(wired, monkeypatch):
@@ -198,7 +199,13 @@ def test_rebuild_asin_preview_does_not_write(wired, monkeypatch):
 
 
 def test_backfill_preview_does_not_write(wired, monkeypatch):
-    from services import blacklist as bl
+    """⚠ 预览的「永久禁止 N 个」必须与真写**同一条判据**(都走 `_judge_events`)。
+    两处各算各的 = 预览说 3 万、真写写 7 万,而两边看着都正常。
+
+    这里同时钉住新口径:事件里那个 `category` **不看**,拿原文重判 ——
+    两条事件文本,一条真禁售、一条是「把 product type 选对」(旧码同为 B),
+    预览只能报 1 个。
+    """
     wrote = []
 
     class _Cur:
@@ -207,8 +214,18 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def execute(self, sql, args=None):
             if "INSERT" in sql:
                 wrote.append(sql)
-        def fetchone(self): return (10, 3, 20)
-        def fetchall(self): return []
+        def executemany(self, sql, rows):
+            wrote.append(sql)
+        def fetchone(self): return (3, 20)   # (brand_cand, total)
+        def fetchall(self):
+            return [
+                ("B0AAA", "SKU-A", "s1", None,
+                 "This item is a prohibited product. "
+                 "Prohibited Products Policy: Alcohol."),
+                ("B0BBB", "SKU-B", "s1", None,
+                 "may be a prohibited product. Please make sure the "
+                 "appropriate product type selected for this item."),
+            ]
 
     class _Conn:
         def __enter__(self): return self
@@ -216,7 +233,7 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def cursor(self): return _Cur()
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
-    assert "永久禁止 10 个" in out and "apply=1" in out
+    assert "永久禁止 1 个" in out and "apply=1" in out      # PT_WRONG 那条不算
     assert wrote == []
 
 

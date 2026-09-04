@@ -7,12 +7,16 @@
   python cli.py error_reclass_report -p scope=blacklist  # 只跑已拉黑的那批 ASIN
        (scope ∈ all / items / events / feed / blacklist)
 
-为什么要有这条(方案 `docs/error_taxonomy.md` §五):新归类引擎
-`services/error_taxonomy.py` 已经写好,但**生产判定路径一个字都还没动** ——
-现在跑的仍是 `services/problem_products.categorize()` 那套 A-L 单字母码。
-换轨之前所有者要看见的是同一批生产数据在新旧两套下的**并排结果**:
-旧码怎么迁到新码、多少条从中性码(过期/未上线)里翻出真问题、unknown 还剩
-多少条没判据、抽出来的政策名有多少 join 不上政策表。
+为什么要有这条:看同一批**生产数据**在现行归类引擎
+(`services/error_taxonomy.py`)下判成什么 —— 主码怎么分布、unknown 还剩多少条
+没判据、抽出来的政策名有多少 join 不上政策表、已经产生后果的黑名单行按新码
+站不站得住。
+
+⚠ 2026-09-04 换轨完成后**退役了「旧码 → 新码迁移矩阵」那一面**:它的使命是
+「所有者过完这份账才换轨」,换轨已经做完(存量按新码回填 97,002 + 73,918 条,
+`blacklist_route` 按裁决删了 42,113 条),旧引擎 `problem_products.categorize()`
+随之一起删。旧码从此只在**读历史数据**时出现(黑名单表 `category` 列存的是
+入选那一刻的码),不再有任何判据读它。
 
 本工作流只 SELECT,不改任何行为;跑完给所有者一份可核对的账,过了才开第二步
 (处置接线与换轨)。**手动跑,不进调度**。
@@ -117,10 +121,7 @@ class _Tally:
         self.label = label
         self.rows = 0                       # 不同文本数
         self.records = 0                    # 加权条数
-        self.matrix: Counter = Counter()    # (旧码, 新主码) → 条数
         self.new_codes: Counter = Counter()
-        self.old_codes: Counter = Counter()
-        self.old_names: dict[str, str] = {}     # 旧码 → 旧中文名(categorize 给的)
         self.unknown: Counter = Counter()   # 原子原文 → 条数
         self.unlisted: Counter = Counter()
         self.policy_hit: Counter = Counter()    # 政策名 → 条数(join 得上的)
@@ -130,13 +131,9 @@ class _Tally:
     def add(self, text: str, n: int, policy_names) -> None:
         atoms = error_taxonomy.split_reasons(text)
         res = error_taxonomy.classify_reasons(atoms, policy_names)
-        old_code, old_name = problem_products.categorize(text)
         self.rows += 1
         self.records += n
-        self.matrix[(old_code, res.code)] += n
         self.new_codes[res.code] += n
-        self.old_codes[old_code] += n
-        self.old_names[old_code] = old_name
         for atom in res.unknown:
             self.unknown[atom] += n
         for term, hits in res.unlisted:
@@ -153,16 +150,17 @@ class _Tally:
                 self.policy_gap[name] += n
 
 
-def _fmt_matrix(t: _Tally, limit: int) -> list[str]:
-    """输入:对照账 → 输出:迁移矩阵文本行(旧码逐个摊开去向)。"""
+def _fmt_codes(t: _Tally, limit: int) -> list[str]:
+    """输入:对照账 → 输出:主码分布文本行。
+
+    ⚠ 2026-09-04 退役了「旧码 → 新码迁移矩阵」这一面:它的使命是「所有者过完
+    这份账才换轨」(README),**换轨已经完成**,唯一的消费者
+    `problem_products.categorize()` 随之一起删。旧码从此只在**读历史数据**时
+    出现(`_RULES` 的码→中文名,给 `cleanup_history` 与下面的黑名单面用),
+    不再有任何判据读它。
+    """
     out = [f"▍{t.label}:{t.records} 条(不同文本 {t.rows} 种)",
-           "  旧码 → 新主码(条数;旧码按量降序):"]
-    for old, n_old in t.old_codes.most_common():
-        dests = sorted(((new, n) for (o, new), n in t.matrix.items() if o == old),
-                       key=lambda kv: -kv[1])
-        head = f"    {old} {t.old_names.get(old, ''):<4} {n_old:>7} →  "
-        out.append(head + "  ".join(f"{new}×{n}" for new, n in dests[:limit]))
-    out.append("  新主码分布:")
+           "  主码分布:"]
     for code, n in t.new_codes.most_common():
         out.append(f"    {code:<17} {resources.ERROR_CATEGORY_CODES[code]:<8}"
                    f" {n:>7}")
@@ -336,8 +334,7 @@ def run(params: dict) -> str:
             blist = (_fetch(cur, _SQL_BLACKLIST)
                      if scope in ("all", "blacklist") else [])
 
-    head = [f"报错归类新旧对照(码表版本 {resources.ERROR_TAXONOMY_VERSION};"
-            f"旧引擎 = problem_products.categorize 的 A-L 码)",
+    head = [f"报错归类对照(码表版本 {resources.ERROR_TAXONOMY_VERSION})",
             f"政策表 audit.walmart_prohibited_policy:{len(policy_names)} 条 "
             f"category_en"]
     if not policy_names:
@@ -352,8 +349,8 @@ def run(params: dict) -> str:
         tally = _Tally(label)
         for text, n in rows:
             tally.add(text, int(n), policy_names)
-        summary += [""] + _fmt_matrix(tally, limit) + _fmt_lists(tally, limit, False)
-        body += [""] + _fmt_matrix(tally, limit) + _fmt_lists(tally, limit, True)
+        summary += [""] + _fmt_codes(tally, limit) + _fmt_lists(tally, limit, False)
+        body += [""] + _fmt_codes(tally, limit) + _fmt_lists(tally, limit, True)
     if feed:
         summary += [""] + _feed_section(feed, policy_names, limit, False)
         body += [""] + _feed_section(feed, policy_names, limit, True)

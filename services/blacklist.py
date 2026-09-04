@@ -236,54 +236,65 @@ WITH latest AS (
 """
 
 _BACKFILL_COUNT_SQL = _LATEST_CTE + """
-SELECT count(*) FILTER (WHERE cat = ANY(%(perm)s)) AS permanent,
-       count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
+SELECT count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
        count(*) AS total
 FROM latest
 """
 
-# ⚠ **换轨过渡桥**(2026-09-03,别当历史包袱删掉):`catalog.product_events`
-# 里的历史事件 `detail->>'category'` 写的是**旧 A-L 码**,换轨之后的新事件写
-# 新码 —— 而回填/重建这条路是按事件里的那个码筛的。只认新码的话
-# `rebuild_asin_blacklist` 会**清空表后只灌进换轨之后那几行**:表突然从
-# 七万变几十,而且不报错,看着像"历史数据本来就没有"。
-# 所以这一路**两套码都认**,直到存量事件被重写(短期不会,那是百万级行)。
-_LEGACY_PERMANENT = {"B": "POLICY", "C": "BRAND", "E": "IP",
-                     "F": "GATED", "G": "POLICY", "K": "FLAGGED"}
-_LEGACY_BRAND_CATEGORIES = ("C", "E")
+# ⚠ **回填/重建不信任事件里那个 `category`。**(所有者 2026-09-04:「删除旧码,
+# 我们已经迁移到新码,旧码不需要留。把口径做统一」)
+#
+# `catalog.product_events` 的历史事件 `detail->>'category'` 写的是**旧 A-L 码**,
+# 而旧码 `B` 是个**混装桶** —— 生产实测 40,827 条 `PT_WRONG`(沃尔玛原话是
+# 「要重新上架请把 product type 选对」,那是修法不是禁令)混在里面,只有 3,512
+# 条是真 `POLICY`。**按旧码筛就是把旧引擎的错重新引进来**,而那正是换轨要修的。
+#
+# 2026-09-04 查出的两条岔路(方向相反,而且都静默):
+#   · `backfill_from_events` 认「新七码 ∪ 旧 {B,C,E,F,G,K}」⇒ 把 blacklist_route
+#     刚删掉的 ~41,600 条**灌回来**,摘要显示「历史回填 +41,600」看着像正常干活;
+#   · `rebuild_asin_blacklist` 只认新七码 ⇒ 历史事件绝大多数是旧码,擦净重灌
+#     **七万变几十**,同样不报错。
+#
+# 所以两条路径都改成:**拿事件里的原文重新过 `classify_reasons`,`is_permanent`
+# 定去留** —— 与实时链路(`problem_scan`)、存量回填(`error_reclass`)**同一个
+# 引擎**。事件里那个码从此没人读,旧码在判据面上彻底退场。
+# 代价:一条集合 INSERT 变成「取行 → 判 → 批量写」。回填是一次性动作不是热路径
+# (`error_reclass` 判 97,002 行只用了几秒),换来的是判据只有一条。
+
+_LATEST_ROWS_SQL = _LATEST_CTE + """
+SELECT asin, sku, store, occurred_at, reason FROM latest
+WHERE coalesce(reason, '') <> ''
+"""
 
 
-def backfill_codes() -> list[str]:
-    """输出:回填/重建按事件筛码时该认的**全部**码(新 + 旧,排序去重)。"""
-    return sorted(PERMANENT | set(_LEGACY_PERMANENT))
+def _judge_events(conn) -> list[dict]:
+    """输入:连接 → 输出:按原文重判后**够格永久拉黑**的行(已带新码与来源标签)。
 
-
-def brand_backfill_codes() -> list[str]:
-    """输出:品牌收集回填该认的码(新 BRAND/IP + 旧 C/E)。"""
-    return sorted(BRAND_CATEGORIES | set(_LEGACY_BRAND_CATEGORIES))
-
-
-def _label_case() -> str:
-    """输出:`CASE cat WHEN … END` 片段,新旧码共用一张表 —— 字面量不散落。
-
-    值全部来自本模块常量(`_NAMES` + `_LEGACY_PERMANENT`),不拼外部输入。
+    纯读;`classify_reasons` 是全仓唯一的归类引擎(`services/error_taxonomy`)。
     """
-    pairs = {c: _NAMES[c] for c in sorted(PERMANENT) if c in _NAMES}
-    pairs.update({old: _NAMES[new] for old, new in _LEGACY_PERMANENT.items()})
-    whens = " ".join(f"WHEN '{c}' THEN '{zh}'" for c, zh in sorted(pairs.items()))
-    return f"CASE cat {whens} END"
+    with conn.cursor() as cur:
+        cur.execute(_LATEST_ROWS_SQL)
+        rows = cur.fetchall()
+    out = []
+    for asin, sku, store, occurred_at, reason in rows:
+        res = error_taxonomy.classify_reasons(
+            error_taxonomy.split_reasons(reason))
+        if not error_taxonomy.is_permanent(res.code, res.unlisted_term):
+            continue
+        low = (reason or "").lower()
+        out.append({
+            "asin": asin, "cat": res.code, "sku": sku, "store": store,
+            "source": source_label(res.code),
+            "reason": (reason or "")[:200], "created_at": occurred_at,
+            "biz_cn": ("biz-cn" in low or "reference code biz" in low)})
+    return out
 
 
-_BACKFILL_ASIN_SQL = _LATEST_CTE + """
+_INSERT_ASIN_SQL = """
 INSERT INTO catalog.asin_blacklist
     (asin, category, source, reason, src_store, biz_cn, src_sku, created_at)
-SELECT asin, cat,
-       '沃尔玛-' || """ + _label_case() + """,
-       left(reason, 200), store,
-       (lower(coalesce(reason, '')) LIKE '%%biz-cn%%'
-        OR lower(coalesce(reason, '')) LIKE '%%reference code biz%%'),
-       sku, occurred_at
-FROM latest WHERE cat = ANY(%(perm)s)
+VALUES (%(asin)s, %(cat)s, %(source)s, %(reason)s, %(store)s, %(biz_cn)s,
+        %(sku)s, %(created_at)s)
 ON CONFLICT (asin) DO NOTHING
 """
 
@@ -292,31 +303,39 @@ ON CONFLICT (asin) DO NOTHING
 _ASIN_WIPE_SQL = "DELETE FROM catalog.asin_blacklist"
 
 def backfill_counts(conn) -> dict:
-    """输入:连接 → 输出:回填预览计数(不写任何东西)。"""
+    """输入:连接 → 输出:回填预览计数(不写任何东西)。
+
+    ⚠ 预览与真写**必须同一条判据**(都走 `_judge_events`)—— 两处各算各的,
+    预览说 3 万、真写写 7 万,而两边看着都正常。
+    """
     with conn.cursor() as cur:
-        cur.execute(_BACKFILL_COUNT_SQL,
-                    {"perm": backfill_codes(),
-                     "brandcats": brand_backfill_codes()})
-        permanent, brand_cand, total = cur.fetchone()
-    return {"permanent": permanent, "brand_cand": brand_cand, "total": total}
+        cur.execute(_BACKFILL_COUNT_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
+        brand_cand, total = cur.fetchone()
+    keep = _judge_events(conn)
+    return {"permanent": len(keep), "brand_cand": brand_cand, "total": total}
 
 
 def backfill_from_events(conn) -> dict:
-    """输入:连接 → 输出:ASIN 回填统计(集合级 INSERT,万级量逐行太慢)。
+    """输入:连接 → 输出:ASIN 回填统计。
     品牌渠道的历史重建走 rebuild_brand_channel(单独命令,含清表重灌)。"""
+    rows = _judge_events(conn)
+    if not rows:
+        return {"asin_new": 0}
     with conn.cursor() as cur:
-        cur.execute(_BACKFILL_ASIN_SQL, {"perm": backfill_codes()})
+        cur.executemany(_INSERT_ASIN_SQL, rows)
         return {"asin_new": cur.rowcount or 0}
 
 
 def rebuild_asin_blacklist(conn) -> dict:
     """输入:连接 → 输出:{wiped, inserted}。擦净按标准 asin 重灌
     (黑名单是时间线的投影,投影可以重投——与品牌渠道重建同一权衡)。"""
+    rows = _judge_events(conn)          # ⚠ 先判再擦:判炸了不能留下空表
     with conn.cursor() as cur:
         cur.execute(_ASIN_WIPE_SQL)
         wiped = cur.rowcount or 0
-        cur.execute(_BACKFILL_ASIN_SQL, {"perm": sorted(PERMANENT)})
-        return {"wiped": wiped, "inserted": cur.rowcount or 0}
+        if rows:
+            cur.executemany(_INSERT_ASIN_SQL, rows)
+        return {"wiped": wiped, "inserted": len(rows)}
 
 
 # ── 品牌渠道重建(blacklist_push -p rebuild_brand=1,一次性)───────────────────

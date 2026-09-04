@@ -350,7 +350,9 @@ def _collect_blacklists(conn, items: list[dict]) -> str:
     """输入:当轮已归类 item → 输出:黑名单收集摘要(一行)。
 
     归因收集尾段(plan.md「品牌限制/侵权类问题产品 → 品牌黑名单」的落地):
-    当轮 B/C/E/F/G/K 入 ASIN 黑名单,C/E 的品牌从 catalog.products.brand 取、
+    当轮**够格永久拉黑的**(`error_taxonomy.is_permanent`:七个永久码 +
+    `OTHER` 的两个显式词条)入 ASIN 黑名单,BRAND/IP 的品牌从
+    catalog.products.brand 取、
     按品牌去重入 brand_blacklist。
     **任何失败只告警不阻断**——黑名单是扫描的副产品,收集炸了不该把建议
     产出拖下水;漏一轮下一轮照样补(入选条件不变)。

@@ -455,3 +455,30 @@ def test_shrink_is_isolated_per_table(monkeypatch):
     assert len(seen) == 2                      # 第一张停手,第二张照写
     assert lines[0].startswith("⛔")
     assert "整表重写 7 行" in lines[1]
+
+
+def test_reason_存全文_不许再截200():
+    """⚠ 所有者 2026-09-04 问「为什么要截断字符样本?」—— 考古结论是**没有理由**:
+    全仓找不到任何依据,最合理的解释是这一列当初只用来「人看一眼知道为什么被
+    拉黑」,对显示来说 200 字符够,那时它不是判据。
+
+    换轨后它成了 `error_reclass` 四级优先里**最大的一档**证据源(36,868 条),
+    而沃尔玛的判据串恰好在**句尾**(「…To republish this item please make sure
+    you have the appropriate product type selected.」)—— 200 字符精确砍掉它,
+    于是那批品被判成永久拉黑,真相是 PT_WRONG。**40,827 是低估的。**
+
+    不截的依据:列是 `text` 无限制;飞书那侧自己有 20,000/40,000 两道闸
+    (官方上限 50,000),跟 200 差两个数量级。**截断属于展示层,不属于存储层。**
+    """
+    import inspect
+    from services import blacklist as bl, cleanup_history
+    # 只查**写入侧**的函数体(模块头注里会引用 `[:200]` 讲这段考古,那是文档)
+    for fn in (bl.record_asins, bl._judge_events, cleanup_history.timeline):
+        src = inspect.getsource(fn)
+        assert "[:200]" not in src, fn.__name__
+        assert "left(reason, 200)" not in src, fn.__name__
+    # 头注要留着考古结论,不然下一个人又会"顺手截一下"
+    assert "截断属于展示层,不属于存储层" in inspect.getsource(bl)
+    # 展示侧那道闸还在(它才是该管长度的地方)
+    from api import feishu
+    assert feishu._SHEET_CELL_MAX_CHARS >= 20000

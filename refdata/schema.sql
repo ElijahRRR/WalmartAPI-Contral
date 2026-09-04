@@ -308,7 +308,9 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
     asin        text PRIMARY KEY,
     category    text NOT NULL,       -- 入选时的类别码(B/C/E/F/G/K)
     source      text NOT NULL,       -- 「沃尔玛-<类名>」,与飞书来源列同款
-    reason      text,                -- 命中原因样本(截 200)
+    reason      text,                -- 命中原因**全文**(2026-09-04 起不截;
+                                     -- 原来截 200 而判据串常在句尾,
+                                     -- 见 services/blacklist 头注)
     src_store   text,                -- 溯源:在哪个店铺撞的
     biz_cn      boolean NOT NULL DEFAULT false,  -- BIZ-CN 独立维度(中国卖家
                                      -- 专属禁售,legacy_survey:2077 要求单列)

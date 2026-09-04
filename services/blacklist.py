@@ -67,6 +67,25 @@ logger = logging.getLogger("services.blacklist")
 # 「要重新上架请把 product type 选对」,那是修法不是禁令,却被永久拉黑
 # (存量实测 40,825 条,§11.6)。新码把它摘了出去,真禁售那几种照旧拉黑。
 # 改这个集合 = 改业务口径,必须先过所有者。
+#: ⚠ **`reason` 存全文,不许截断**(2026-09-04 所有者问「为什么要截断字符样本?」
+#: 之后考古的结论)。原来三处写入都做 `[:200]`,而**全仓找不到任何依据** ——
+#: 最合理的解释是:这一列当初的用途是「人看一眼知道为什么被拉黑」,对**显示**
+#: 来说 200 字符足够,那时它不是判据。
+#:
+#: 它变成问题是因为换轨之后 `error_reclass` 的四级优先把它当成了证据源,而且是
+#: **最大的一档**(36,868 条只有它)。而沃尔玛那句判据串恰好在**句尾** ——
+#: 「…violating Prohibited Product Policy. **To republish this item please make
+#: sure you have the appropriate product type selected.**」—— 200 字符精确地
+#: 砍掉它,于是那批品被判成 `POLICY` 永久拉黑,而真相是 `PT_WRONG`(修法不是禁令)。
+#: **40,827 这个数是低估的。**
+#:
+#: 不截的依据:① 列是 `text`,无长度限制;② 飞书那侧**已经有自己的截断**
+#: (`api/feishu._scrub` 20,000 字符脏数据闸 + 40,000 硬闸,官方上限 50,000),
+#: 跟 200 差两个数量级。**截断属于展示层,不属于存储层** —— 存储侧截了,
+#: 展示侧那道就白设了,而判据侧永久失去证据。
+#: ⚠ 存量**救不回来**(截掉的字没了),只能从 `audit.walmart_error_records.raw_reason`
+#: 重新取 —— 那正是 §14.7 说的「原文来源统一」。
+
 PERMANENT = frozenset(error_taxonomy.PERMANENT_CODES)
 
 # 品牌收集的触发类别:品牌未授权 / 知识产权(旧 C/E 的新码等价物)
@@ -121,7 +140,7 @@ def record_asins(conn, items: list[dict]) -> int:
             asin = extract_asin(it["sku"]) or it["sku"]
             cur.execute(_ASIN_SQL, (
                 asin, code, source_label(code),
-                (it.get("reasons") or "")[:200] or None,
+                (it.get("reasons") or "") or None,      # 全文,别截(见头注)
                 it.get("store"), is_biz_cn(it.get("reasons")), it["sku"]))
             added += cur.rowcount or 0
     return added
@@ -286,7 +305,7 @@ def _judge_events(conn) -> list[dict]:
         out.append({
             "asin": asin, "cat": res.code, "sku": sku, "store": store,
             "source": source_label(res.code),
-            "reason": (reason or "")[:200], "created_at": occurred_at,
+            "reason": reason, "created_at": occurred_at,      # 全文,别截
             "biz_cn": ("biz-cn" in low or "reference code biz" in low)})
     return out
 

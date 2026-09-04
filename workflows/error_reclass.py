@@ -115,10 +115,16 @@ SET taxonomy_code = %(code)s, taxonomy_policy = %(policy)s,
     --   所以复核出结论的行,`category` 同步改写成新码。
     --   两条不动:① `LEGACY`(历史继承,所有者说「保留原样没有问题」);
     --            ② 判不出的(`code` 为 NULL)—— 没结论就没有可写的东西。
-    category = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL
-                    THEN category ELSE %(code)s END,
-    source   = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL
-                    THEN source ELSE %(source)s END
+    -- ⚠ `%(code)s::text` 的转型不能省:psycopg 把每个 `%(code)s` 展开成**独立
+    --   占位符**,`$1 IS NULL` 那个没有列可以推类型,PG 直接
+    --   `AmbiguousParameter: could not determine data type of parameter $1`
+    --   (2026-09-04 实遇)。赋值位那几个由列推得出来,`IS NULL` 位推不出来。
+    -- ⚠ CASE 里读到的 `category` 是**更新前**的值(PG 的 UPDATE 语义:所有 SET
+    --   表达式都看旧行)—— 正是要的:拿旧码判豁免,写新码。
+    category = CASE WHEN category = 'LEGACY' OR %(code)s::text IS NULL
+                    THEN category ELSE %(code)s::text END,
+    source   = CASE WHEN category = 'LEGACY' OR %(code)s::text IS NULL
+                    THEN source ELSE %(source)s::text END
 WHERE asin = %(asin)s
 """
 

@@ -740,9 +740,17 @@ def test_复核出结论就把category改成新码_LEGACY与判不出的不动()
     from workflows import error_reclass as wf
     from services import blacklist
     sql = wf._SQL_BL_SET
-    assert "category = CASE WHEN category = 'LEGACY' OR %(code)s IS NULL" in sql
-    assert "THEN category ELSE %(code)s END" in sql
+    assert "category = CASE WHEN category = 'LEGACY' OR %(code)s::text IS NULL" in sql
+    assert "THEN category ELSE %(code)s::text END" in sql
     assert "source   = CASE WHEN category = 'LEGACY'" in sql   # 来源标签跟着走
+    # ⚠ 2026-09-04 实遇:`IS NULL` 位的转型不能省 —— psycopg 把每个 %(code)s
+    #   展开成独立占位符,那个位置没有列可以推类型,PG 报
+    #   AmbiguousParameter: could not determine data type of parameter $1。
+    #   赋值位由列推得出来,判断位推不出来。
+    for frag in ("%(code)s::text IS NULL", "ELSE %(code)s::text",
+                 "ELSE %(source)s::text"):
+        assert frag in sql, frag
+    assert "%(code)s IS NULL" not in sql        # 不许有裸的(会炸)
     # 飞书那一列的文字确实不变
     assert blacklist.source_label("POLICY") == "沃尔玛-禁售"
     assert blacklist.source_label("BRAND") == "沃尔玛-品牌"

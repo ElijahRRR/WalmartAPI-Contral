@@ -970,3 +970,25 @@ MP_MAINTENANCE **不可改 COO** ⇒ 该 `required` 对 MP_MAINTENANCE 不生效
 "$SPECS/MP_MAINTENANCE/"` 天然返回空,**测法本身无效**,不能据它判形态 B。
 ⚠ 这仍是 schema 层面的推断:真正的实测是 `sku_migrate` 发一个真 MP_MAINTENANCE feed
 并由观测定案 —— 即「六件实测第 1、2 件」与「批次 3 第一级投放」是**同一件事**。
+
+### 9.7 候选面补第八条判据「已上架」(2026-09-04,所有者提)
+
+所有者问「到时候我更新 sku,只对 publish 的产品发就可以了吧」—— 对,而且原来的
+七条判据里**没有**这一条:`w.missing_since IS NULL` 只说"目录里还看得见",
+UNPUBLISHED / RETIRED / STAGE 全都满足它,于是它们本来都会进候选面。
+
+**为什么必须加**(两条,都不是理论风险):
+① §4 六件实测的第 5 件正是「对 `lifecycle=RETIRED` 的 item 是否可用 SkuUpdate」——
+   官方零文档、本仓零实证。改不动的话那条行卡到 `STALE_HOURS=72` 才落 stalled,
+   期间一直占着 `_stage_cap` 的名额(零 confirmed ⇒ 上限 1,一条卡住 = 整店停摆)。
+② 更贵的一条(§9.4「最贵的」那条的变体):改码生效有 15 分钟~4 小时窗口,窗口内
+   旧码「非 PUBLISHED 且未缺席」,正好落进 `problem_scan` 的扫描面被建议
+   DELETE_ITEM —— 一次改码把商品永久删掉。PUBLISHED 的行不在那条扫描面上。
+
+第八条判据(`_CONDS` 单一出处,选取与解释两处同源):
+`("已上架", …, "w.published_status = 'PUBLISHED'")`。
+
+⚠ **不加参数开关放开它**:那样就是两条口径,而"哪些状态能改码"是判据不是偏好
+(§六 双轨禁止)。要迁非 PUBLISHED 的行,先做第 5 件实测,再改这一条判据本身。
+两条守门测试钉住:判据在两条 SQL 里逐字同源;点名一个非 PUBLISHED 的旧码时
+**逐条说得出人话**,不许静默消失。

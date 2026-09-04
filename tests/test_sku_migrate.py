@@ -294,6 +294,38 @@ def _args_of(conn, frag="LIMIT %(limit)s"):
     return [a for sql, a in conn.sqls if frag in sql][0]
 
 
+def test_only_published_rows_are_candidates():
+    """⚠ 所有者 2026-09-04 提的那条,而且是**必须**的一条:`missing_since IS NULL`
+    只说"目录里还看得见",UNPUBLISHED / RETIRED / STAGE 全都满足它。
+
+    为什么不能放它们进来:§4 六件实测的第 5 件正是「对 lifecycle=RETIRED 的 item
+    是否可用 SkuUpdate」——官方零文档、本仓零实证。放进候选面 ⇒ ① 改不动就卡到
+    72 小时 stalled、占着节奏闸名额;② 中间窗口里旧码"非 PUBLISHED 且未缺席",
+    正好落进 problem_scan 的扫描面被建议 DELETE_ITEM —— 一次改码把商品永久删掉。
+
+    ⚠ **不许加参数开关放开它**:那样就是两条口径,而"哪些状态能改码"是判据不是
+    偏好(§六 双轨禁止)。要迁非 PUBLISHED 的行,先做第 5 件实测再改这条判据。
+    """
+    names = [n for n, _w, _sql in sm._CONDS]
+    assert "已上架" in names
+    cond = next(sql for n, _w, sql in sm._CONDS if n == "已上架")
+    assert cond == "w.published_status = 'PUBLISHED'"
+    # 选取与解释两处同源(与其余判据同一条纪律)
+    assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY
+    # 落选点名说得出人话,而且点名了 RETIRED 那类要能看见理由
+    why = next(w for n, w, _sql in sm._CONDS if n == "已上架")
+    assert "PUBLISHED" in why and "实测" in why
+
+
+def test_a_named_but_unpublished_row_is_reported_not_silently_dropped():
+    """点名了一个非 PUBLISHED 的旧码:不许静默消失,要逐条说"不满足 已上架"。"""
+    conn = _pick_conn([], [_why("B0AAA00001", bad=("已上架",))])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert rows == []
+    # 点名用短名、落选点名用**人话**(摘要是给人读的,短名只在代码里)
+    assert any("B0AAA00001" in n and "非 PUBLISHED" in n for n in notes), notes
+
+
 def test_pick_and_exclude_are_conditions_on_the_one_candidate_sql():
     """**单一实现路径**:点名/排除是同一条候选 SQL 的参数化条件,不是第二条 SQL;
     而且七条判据在"选取"与"解释"两处**逐字同源**(一漂就会出现"摘要说它满足

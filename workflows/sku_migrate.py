@@ -152,6 +152,19 @@ _STALLED = "stalled"
 _CONDS: tuple[tuple[str, str, str], ...] = (
     ("在架", "已缺席(missing_since 非空):沃尔玛侧已经看不到它,改码也改不动",
      "w.missing_since IS NULL"),
+    # ⚠ 所有者 2026-09-04:「只对 publish 的产品发就可以了吧」—— 对,而且这是
+    # **必须**的一条。`missing_since IS NULL` 只说"目录里还看得见",UNPUBLISHED /
+    # RETIRED / STAGE 都满足它。而 §4 六件实测的第 5 件正是「对 lifecycle=RETIRED
+    # 的 item 是否可用 SkuUpdate」——官方零文档、本仓零实证。放进候选面的后果:
+    #   ① 改不动 ⇒ 那条行卡到 72 小时 stalled,占着节奏闸的名额;
+    #   ② 中间窗口里旧码"非 PUBLISHED 且未缺席",正好落进 problem_scan 的扫描面
+    #      被建议 DELETE_ITEM —— 一次改码把商品永久删掉(§9.4 最贵的那条)。
+    # 想迁非 PUBLISHED 的行,先做第 5 件实测再回来放开这一条(**不加参数开关**:
+    # 加了就是两条口径,而"哪些状态能改码"是判据不是偏好,§六 双轨禁止)。
+    ("已上架", "非 PUBLISHED(unpublished/retired/stage):SkuUpdate 对这些状态"
+               "能不能用官方零文档、本仓零实证(§4 六件实测第 5 件),"
+               "改不动会卡 stalled,中间窗口还可能被 problem_scan 判删",
+     "w.published_status = 'PUBLISHED'"),
     ("活码", "码已弃用(abandoned_at 非空):这条我们已经当它不存在了,"
              "再改一次码既改不动、也会把一个死码拉回自动化",
      "ls.abandoned_at IS NULL"),

@@ -152,7 +152,7 @@ def test_回填的来源标签只有一处出生():
     两处各写一份迟早漂,漂了 = 同一类别的历史行和实时行在飞书来源列长得不一样。"""
     import inspect
     from services import blacklist as bl
-    assert "source_label(res.code)" in inspect.getsource(bl._judge_events)
+    assert "source_label(code)" in inspect.getsource(bl._judge_events)
     assert not hasattr(bl, "_label_case")      # 那份 CASE 已随过渡桥删掉
 
 
@@ -221,23 +221,17 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def fetchall(self):
             if "FROM catalog.asin_blacklist" in self._q:
                 return [("B0DDD",)]                 # 已在表里 ⇒ 不算新增
-            assert "GROUP BY 1" in self._q, self._q[:80]   # 产品历史那条
+            assert "GROUP BY 1" in self._q, self._q[:80]   # 产品事件那条
+            # (asin, [[code, term], …], sku, store, reason, latest)
             return [
-                # ⚠ B0AAA 的**最新**记录是「过期」,而历史上有一条真禁售 ——
+                # ⚠ B0AAA 的**最新**事件是「过期」,而历史上有一条真禁售 ——
                 #    旧口径(取最新)会漏掉它,新口径必须拉黑。
-                ("B0AAA", ["The End Date has passed for this item",
-                           "This item is a prohibited product. "
-                           "Prohibited Products Policy: Alcohol."],
-                 "SKU-A", "s1", None),
-                ("B0CCC", ["Intellectual Property complaint received."],
-                 "SKU-C", "s1", None),
+                ("B0AAA", [["EXPIRED", None], ["POLICY", None]],
+                 "SKU-A", "s1", "prohibited product policy", None),
+                ("B0CCC", [["IP", None]], "SKU-C", "s1", "IP complaint", None),
                 # 全部不够格 ⇒ 不拉黑(其余报错只作记录)
-                ("B0BBB", ["may be a prohibited product. Please make sure the "
-                           "appropriate product type selected for this item."],
-                 "SKU-B", "s1", None),
-                ("B0DDD", ["This item is a prohibited product. "
-                           "Prohibited Products Policy: Alcohol."],
-                 "SKU-D", "s1", None),
+                ("B0BBB", [["PT_WRONG", None]], "SKU-B", "s1", "pt wrong", None),
+                ("B0DDD", [["POLICY", None]], "SKU-D", "s1", "policy", None),
             ]
 
     class _Conn:

@@ -45,7 +45,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from registry import db, paths, resources
-from services import error_taxonomy
+from services import blacklist, error_taxonomy
 
 DANGEROUS = True        # 删行,不可逆;`--dry-run` 由 cli 接管
 
@@ -54,10 +54,18 @@ logger = logging.getLogger("workflows.blacklist_route")
 _KNOWN_PARAMS = {"limit", "chunk"}
 _CLI_INJECTED = {"execute", "dry_run", "store"}
 
-#: 「留下」谓词 —— 与 `error_taxonomy.is_permanent` 同一份裁决,只是搬进 SQL
-#: (十万行逐行往返太慢)。三段依次是:七个永久码 / `OTHER` 的两个显式词条 /
+#: 「行级留下」谓词 —— 与 `error_taxonomy.is_permanent` 同一份裁决,只是搬进
+#: SQL(十万行逐行往返太慢)。三段依次是:七个永久码 / `OTHER` 的两个显式词条 /
 #: 判不出来的行(所有者定:查不出理由就继续禁)。
 #: ⚠ 改这三段 = 改业务口径,必须先过所有者,并同步 `is_permanent`。
+#:
+#: ⚠⚠ **这只是「行级记录」,不是判定**(所有者 2026-09-04:「其中被拉黑的那个
+#: 作为最高优先级,其他的都是作为记录」)。`taxonomy_code` 只是**那一行入选时
+#: 那条原文**的归类;该不该拉黑要看这个 asin 的**全部历史**。
+#: 生产实证:上一轮按行级码删的 42,113 条里,**3,201 条按产品级判定该留**
+#: (POLICY 2,703 / FLAGGED 429 / GATED 45 / IP 9 / PROHIBITED_FINAL 9 /
+#: BRAND 6)—— 那些品历史上被真禁售拒过,只是入选那一行记的是可修复类。
+#: 所以下面再加一道:**产品级说该拉黑的,一律不删**。
 _KEEP = """(
     taxonomy_code = ANY(%(perm)s)
     OR (taxonomy_code = 'OTHER'
@@ -71,10 +79,11 @@ SELECT count(*) FROM catalog.asin_blacklist
 WHERE taxonomy_version IS DISTINCT FROM %(ver)s
 """
 _SQL_PLAN = """
-SELECT taxonomy_code, taxonomy_term, count(*) AS n
+SELECT taxonomy_code, taxonomy_term, (asin = ANY(%(spare)s)) AS spared,
+       count(*) AS n
 FROM catalog.asin_blacklist
 WHERE taxonomy_version = %(ver)s
-GROUP BY 1, 2
+GROUP BY 1, 2, 3
 """
 _SQL_DOOMED = """
 SELECT asin, category, source, reason, src_store, biz_cn, src_sku,
@@ -82,6 +91,11 @@ SELECT asin, category, source, reason, src_store, biz_cn, src_sku,
        taxonomy_src, taxonomy_version
 FROM catalog.asin_blacklist
 WHERE taxonomy_version = %(ver)s AND NOT """ + _KEEP + """
+  -- ⚠ 产品级判定说该拉黑的一律不删(所有者:被拉黑的那个最高优先级)。
+  --   ⚠ 这一条**必须放进 SQL**,不能取出来再在 Python 里过滤:循环是
+  --     「取一批 → 删一批 → 再取」,过滤掉不删的行会被**反复取到**,
+  --     那就是 §13.8 那个死循环的同款陷阱。
+  AND asin <> ALL(%(spare)s)
 ORDER BY asin
 LIMIT %(chunk)s
 """
@@ -89,6 +103,18 @@ _SQL_DELETE = """
 DELETE FROM catalog.asin_blacklist
 WHERE asin = ANY(%(asins)s)
 """
+
+
+def product_level_keep(conn) -> set:
+    """输入:连接 → 输出:按**产品历史**判定该永久拉黑的 asin 集合(这些一律不删)。
+
+    ⚠ 判据与回填**同一份**(`blacklist._judge_events`)。而那一份**不做判定,
+    只做查询** —— 判定在 `problem_scan` 写事件那一刻就发生过,历史事件由
+    `error_reclass -p scope=events` 回填成新码(所有者 2026-09-04:
+    「产品级的记录已经有产品事件在做了」)。这里唯一的规则是取哪一条:
+    **够格拉黑的那条最高优先级**。
+    """
+    return {r["asin"] for r in blacklist._judge_events(conn)}
 
 
 def _parse(params: dict) -> tuple[int, int, bool]:
@@ -118,14 +144,33 @@ def keeps(code: str | None, term: str | None) -> bool:
 
 
 def plan_lines(rows, ver: str, stale: int) -> tuple[list[str], Counter, Counter]:
-    """输入:(code, term, n) 行 → 输出:(摘要行, 将删分布, 将留分布)。纯拼装。"""
+    """输入:(code, term, spared, n) 行 → 输出:(摘要行, 将删分布, 将留分布)。纯拼装。
+
+    三分,不是两分:
+      · **行级就永久** → 留;
+      · 行级不永久,但**产品级判定说该拉黑**(`spared`)→ 留 ——
+        所有者 2026-09-04:「被拉黑的那个作为最高优先级,其他的都是作为记录」;
+      · 两个都不永久 → 删。
+    """
     doomed: Counter = Counter()
     kept: Counter = Counter()
-    for code, term, n in rows:
-        (kept if keeps(code, term) else doomed)[code or "(判不出)"] += int(n)
+    spared_c: Counter = Counter()
+    for code, term, spared, n in rows:
+        key = code or "(判不出)"
+        if keeps(code, term):
+            kept[key] += int(n)
+        elif spared:
+            spared_c[key] += int(n)        # 行级说删、产品级救回来
+        else:
+            doomed[key] += int(n)
     out = [f"存量黑名单按新码路由(码表 {ver};裁决表 docs/error_taxonomy.md §十二)",
            f"  **将删** {sum(doomed.values()):,} 条 / "
-           f"**留下** {sum(kept.values()):,} 条"]
+           f"**留下** {sum(kept.values()) + sum(spared_c.values()):,} 条"]
+    if spared_c:
+        out += [f"  ⚠ 其中 **{sum(spared_c.values()):,} 条是产品级判定救下的** ——"
+                f"行级记录说可修复,但这个 asin 的**历史里有够格拉黑的那条**"
+                f"(所有者:被拉黑的那个最高优先级):",
+                *[f"    {n:>7}  行级 {c}" for c, n in spared_c.most_common(8)]]
     if doomed:
         out.append("  将删,按新码:")
         out += [f"    {n:>7}  {c}" for c, n in doomed.most_common()]
@@ -175,11 +220,15 @@ def run(params: dict) -> str:
     args = {"ver": ver, "perm": sorted(error_taxonomy.PERMANENT_CODES),
             "terms": sorted(error_taxonomy.PERMANENT_UNLISTED_TERMS)}
     with db.pg_conn() as conn:
+        # ⚠ 产品级判定**先算**,计划与实删共用这一份 —— 两处各算各的 =
+        #   计划说删 3 万、实际删 4 万,而两边看着都正常。
+        args["spare"] = sorted(product_level_keep(conn))
+        logger.info("产品级判定该拉黑 %d 个 asin(这些一律不删)", len(args["spare"]))
         with conn.cursor() as cur:
             try:
                 cur.execute(_SQL_STALE, {"ver": ver})
                 stale = cur.fetchone()[0]
-                cur.execute(_SQL_PLAN, {"ver": ver})
+                cur.execute(_SQL_PLAN, {"ver": ver, "spare": args["spare"]})
                 plan = cur.fetchall()
             except Exception as e:                          # noqa: BLE001
                 # ⚠ 缺列不该甩一屏 traceback(2026-09-03 实遇:`taxonomy_term`

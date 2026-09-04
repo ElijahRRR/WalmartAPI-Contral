@@ -277,17 +277,21 @@ WITH latest AS (
 
 _HISTORY_SQL = """
 SELECT coalesce(asin, sku) AS asin,
-       array_agg(DISTINCT coalesce(detail->>'reason', detail->>'reasons'))
-           AS texts,
+       array_agg(DISTINCT ARRAY[detail->>'category',
+                                detail->>'taxonomy_term']) AS codes,
        (array_agg(sku   ORDER BY occurred_at DESC))[1] AS sku,
        (array_agg(store ORDER BY occurred_at DESC))[1] AS store,
+       (array_agg(coalesce(detail->>'reason', detail->>'reasons')
+                  ORDER BY occurred_at DESC))[1] AS reason,
        max(occurred_at) AS latest
 FROM catalog.product_events
 WHERE event = 'problem_categorized'
-  AND coalesce(detail->>'reason', detail->>'reasons', '') <> ''
+  AND coalesce(detail->>'category', '') <> ''
 GROUP BY 1
 """
 
+
+#: 预览用的两个数:品牌渠道候选 + 时间线总量(去留由 `_judge_events` 算)。
 _BACKFILL_COUNT_SQL = """
 SELECT count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
        count(*) AS total
@@ -298,69 +302,47 @@ FROM (SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku),
       ORDER BY coalesce(asin, sku), occurred_at DESC) t
 """
 
-# ⚠ **回填/重建不信任事件里那个 `category`。**(所有者 2026-09-04:「删除旧码,
-# 我们已经迁移到新码,旧码不需要留。把口径做统一」)
-#
-# `catalog.product_events` 的历史事件 `detail->>'category'` 写的是**旧 A-L 码**,
-# 而旧码 `B` 是个**混装桶** —— 生产实测 40,827 条 `PT_WRONG`(沃尔玛原话是
-# 「要重新上架请把 product type 选对」,那是修法不是禁令)混在里面,只有 3,512
-# 条是真 `POLICY`。**按旧码筛就是把旧引擎的错重新引进来**,而那正是换轨要修的。
-#
-# 2026-09-04 查出的两条岔路(方向相反,而且都静默):
-#   · `backfill_from_events` 认「新七码 ∪ 旧 {B,C,E,F,G,K}」⇒ 把 blacklist_route
-#     刚删掉的 ~41,600 条**灌回来**,摘要显示「历史回填 +41,600」看着像正常干活;
-#   · `rebuild_asin_blacklist` 只认新七码 ⇒ 历史事件绝大多数是旧码,擦净重灌
-#     **七万变几十**,同样不报错。
-#
-# 所以两条路径都改成:**拿事件里的原文重新过 `classify_reasons`,`is_permanent`
-# 定去留** —— 与实时链路(`problem_scan`)、存量回填(`error_reclass`)**同一个
-# 引擎**。事件里那个码从此没人读,旧码在判据面上彻底退场。
-# 代价:一条集合 INSERT 变成「取行 → 判 → 批量写」。回填是一次性动作不是热路径
-# (`error_reclass` 判 97,002 行只用了几秒),换来的是判据只有一条。
 
-def worst_verdict(texts):
-    """输入:一个 asin 的**全部历史报错原文** → 输出:(归类结果, 那条原文);
-    一条都判不出给 None。
+def worst_verdict(codes):
+    """输入:一个 asin 的**全部事件码** `[[code, term], …]` → 输出:够格永久拉黑的
+    那个 `(code, term)`;一个都不够格给 None。
 
-    ⚠ **够格永久拉黑的那条最高优先级**(所有者 2026-09-04),其余只是记录。
-    纯函数,拿假数据就能测 —— 优先级本身是判据。
+    ⚠ **够格拉黑的那条最高优先级**(所有者 2026-09-04),其余只是记录。
+    ⚠ 只**读码**,不重判原文 —— 判定在 `problem_scan` 写事件时发生过一次,
+      历史事件由 `error_reclass -p scope=events` 回填成新码。
+      所有者原话:「产品级的记录已经有产品事件在做了」。
+    纯函数,拿假数据就能测。
     """
-    fallback = None
-    for t in texts:
-        if not t or not t.strip():
-            continue
-        res = error_taxonomy.classify_reasons(error_taxonomy.split_reasons(t))
-        if error_taxonomy.is_permanent(res.code, res.unlisted_term):
-            return res, t                  # 拉黑的那条说了算,不看时间
-        if fallback is None:
-            fallback = (res, t)
-    return fallback
+    for pair in codes or []:
+        code = pair[0] if pair else None
+        term = pair[1] if pair and len(pair) > 1 else None
+        if error_taxonomy.is_permanent(code, term):
+            return code, term
+    return None
 
 
 def _judge_events(conn) -> list[dict]:
-    """输入:连接 → 输出:按**产品历史**判定后够格永久拉黑的行。
+    """输入:连接 → 输出:按**产品事件**判定该永久拉黑的行。
 
-    三条纪律各由一处把关,这里一条都不自己实现:
-      · **身份** 是 asin(`_HISTORY_SQL` 按 `coalesce(asin, sku)` 分组);
-      · **归类** 走 `services/error_taxonomy`;
-      · **多条取哪条** 走上面的 `worst_verdict`(够格拉黑的优先)。
+    ⚠ 这里**不做判定,只做查询** —— 判定在 `problem_scan` 写事件那一刻发生过
+    (历史事件由 `error_reclass -p scope=events` 回填成新码)。
+    所有者 2026-09-04:「产品级的记录已经有产品事件在做了」。
+    唯一的规则是取哪一条:**够格拉黑的那条最高优先级**(`worst_verdict`)。
     """
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL)
         rows = cur.fetchall()
     out = []
-    for asin, texts, sku, store, latest in rows:
-        got = worst_verdict(texts or [])
+    for asin, codes, sku, store, reason, latest in rows:
+        got = worst_verdict(codes)
         if got is None:
             continue
-        res, text = got
-        if not error_taxonomy.is_permanent(res.code, res.unlisted_term):
-            continue
-        low = text.lower()
+        code, _term = got
+        low = (reason or "").lower()
         out.append({
-            "asin": asin, "cat": res.code, "sku": sku, "store": store,
-            "source": source_label(res.code),
-            "reason": text, "created_at": latest,      # 全文,别截
+            "asin": asin, "cat": code, "sku": sku, "store": store,
+            "source": source_label(code),
+            "reason": reason, "created_at": latest,      # 全文,别截
             "biz_cn": ("biz-cn" in low or "reference code biz" in low)})
     return out
 

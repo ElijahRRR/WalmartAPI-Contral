@@ -72,7 +72,7 @@ def test_没回填过的行一条都不动():
     src = inspect.getsource(wf)
     assert "taxonomy_version = %(ver)s" in wf._SQL_DOOMED
     assert "taxonomy_version = %(ver)s" in wf._SQL_PLAN
-    out, _d, _k = wf.plan_lines([("POLICY", None, 3)], "t.x", stale=42)
+    out, _d, _k = wf.plan_lines([("POLICY", None, False, 3)], "t.x", stale=42)
     assert "另有 42 条还没按当前码表回填" in "\n".join(out)
     assert "本轮**一条都不动**" in "\n".join(out)
     assert "error_reclass" in src
@@ -114,15 +114,27 @@ def test_参数宁炸不吞_且limit缺省不限量():
     assert wf._parse({"limit": "500"})[0] == 500
 
 
-def test_plan_lines分将删与将留():
-    rows = [("POLICY", None, 100), ("PT_WRONG", None, 700),
-            ("OTHER", "business decision", 3), ("OTHER", "trust & safety", 2),
-            ("OTHER", "currently under review", 1), (None, None, 50)]
+def test_plan_lines三分_产品级判定能把行级说删的救回来():
+    """⚠ 所有者 2026-09-04:「一个产品的报错可能存在多次,**其中被拉黑的那个
+    作为最高优先级**,其他的都是作为记录」。
+
+    所以三分,不是两分:行级就永久 → 留;行级说删但**产品级判定说该拉黑** → 留;
+    两个都不永久 → 删。生产实证:上一轮按行级码删的 42,113 条里,
+    **3,201 条按产品级判定该留**(主体 2,703 条 POLICY)。
+    """
+    rows = [("POLICY", None, False, 100), ("PT_WRONG", None, False, 700),
+            ("PT_WRONG", None, True, 40),          # ← 产品级救下的
+            ("OTHER", "business decision", False, 3),
+            ("OTHER", "trust & safety", False, 2),
+            ("OTHER", "currently under review", False, 1),
+            (None, None, False, 50)]
     out, doomed, kept = wf.plan_lines(rows, "t.x", stale=0)
-    assert doomed == {"PT_WRONG": 700, "OTHER": 1}
+    assert doomed == {"PT_WRONG": 700, "OTHER": 1}          # 救下的不在将删里
     assert kept == {"POLICY": 100, "OTHER": 5, "(判不出)": 50}
     text = "\n".join(out)
-    assert "**将删** 701 条" in text and "**留下** 155 条" in text
+    assert "**将删** 701 条" in text and "**留下** 195 条" in text   # 155 + 40
+    assert "40 条是产品级判定救下的" in text.replace("**", "")
+    assert "行级 PT_WRONG" in text
 
 
 def test_缺列时给人话不甩traceback():
@@ -155,3 +167,24 @@ def test_一轮只落一个备份文件():
     assert "strftime" in inspect.getsource(wf._backup_path)
     # 追加模式:同一轮多批要落进同一个文件,不是互相覆盖
     assert '"a"' in inspect.getsource(wf._dump)
+
+
+def test_产品级判定与回填同一份_且必须放进SQL():
+    """⚠ 两件事各钉一条:
+
+    ① **同一份判据**:删行的产品级闸与回填走的是同一个 `_judge_events`
+       (够格拉黑的那条最高优先级)。两处各写一份就是双轨,而这条是删行的闸。
+    ② **必须放进 SQL**:循环是「取一批 → 删一批 → 再取」,若把不删的行取出来
+       再在 Python 里过滤,那些行会被**反复取到** —— 那正是 §13.8 那个死循环
+       的同款陷阱(进度打到 5,574 万而表里只有 97,002 行)。
+    """
+    import inspect
+    src = inspect.getsource(wf)
+    assert "blacklist._judge_events(conn)" in inspect.getsource(wf.product_level_keep)
+    assert "asin <> ALL(%(spare)s)" in wf._SQL_DOOMED
+    assert "反复取到" in src                      # 陷阱写在注释里,别被"简化"掉
+    # 计划与实删共用同一份 spare(两处各算各的 = 计划说删 3 万、实际删 4 万)
+    run_src = inspect.getsource(wf.run)
+    assert 'args["spare"] = sorted(product_level_keep(conn))' in run_src
+    assert run_src.index('args["spare"]') < run_src.index("_SQL_PLAN")
+    assert '"spare": args["spare"]' in run_src

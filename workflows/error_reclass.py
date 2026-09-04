@@ -143,8 +143,9 @@ def _parse(params: dict) -> tuple[str, int, bool, bool, int]:
     if unknown:
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
     scope = str(params.get("scope", "all")).strip().lower()
-    if scope not in ("all", "records", "blacklist"):
-        raise ValueError(f"scope 只能是 all / records / blacklist,给的是 {scope!r}")
+    if scope not in ("all", "records", "blacklist", "events"):
+        raise ValueError(
+            f"scope 只能是 all / records / blacklist / events,给的是 {scope!r}")
     chunk = int(params.get("chunk", 10_000))
     if chunk <= 0:
         raise ValueError(f"chunk 要正整数,给的是 {chunk}")
@@ -275,6 +276,74 @@ def _records_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     return out
 
 
+# ── 产品事件(catalog.product_events)────────────────────────────────────────
+#
+# ⚠ 所有者 2026-09-04:「产品级的记录已经有产品事件在做了。我们改了新归类,
+#   **产品事件跟随更新了吗?**」—— 没有。换轨(2026-09-03)只改了写入侧,
+#   `problem_scan` 从此写新码,而**历史事件的 `detail.category` 还是旧 A-L 码**。
+#
+# 这才是问题的根:此前我在**读的时候**一遍遍重判原文来绕开旧码,而正确的做法是
+# **让账本本身是对的** —— 判定只在 `problem_scan` 发生一次,其余全是查询。
+_SQL_EV_PICK = """
+SELECT id, coalesce(detail->>'reason', detail->>'reasons') AS text,
+       detail->>'category' AS cat
+FROM catalog.product_events
+WHERE event = 'problem_categorized'
+  AND coalesce(detail->>'reason', detail->>'reasons', '') <> ''
+  AND ({force} OR detail->>'taxonomy_version' IS DISTINCT FROM %(ver)s)
+  AND (%(after)s::bigint IS NULL OR id > %(after)s::bigint)
+ORDER BY id
+LIMIT %(chunk)s
+"""
+#: 只动 `category`,并盖版本号(断点续跑靠它)。`name` 跟着走 —— 它是给人看的
+#: 中文标签,码变了名不变就成了两套说法。
+_SQL_EV_SET = """
+UPDATE catalog.product_events
+SET detail = detail
+    || jsonb_build_object('category', %(code)s::text,
+                          'name', %(name)s::text,
+                          -- OTHER 是混装桶,没有词条判不了永久(is_permanent)
+                          'taxonomy_term', %(term)s::text,
+                          'taxonomy_version', %(ver)s::text)
+WHERE id = %(id)s
+"""
+
+
+def _events_pass(conn, ver: str, chunk: int, force: bool, limit: int,
+                 execute: bool, policy_names) -> list[str]:
+    """回填 catalog.product_events 的 detail.category。返回摘要行。"""
+    matrix: Counter = Counter()
+    new_codes: Counter = Counter()
+    done = changed = 0
+    sql = _SQL_EV_PICK.format(force="true" if force else "false")
+    for rows in _pages(conn, sql, ver, chunk, limit, execute):
+        ups = []
+        for ev_id, text, cat in rows:
+            code, _policy, term = classify(text, policy_names)
+            new_codes[code] += 1
+            if cat != code:
+                matrix[(cat or "(空)", code)] += 1
+            ups.append({"id": ev_id, "code": code, "ver": ver, "term": term,
+                        "name": resources.ERROR_CATEGORY_CODES.get(code, code)})
+        if execute:
+            with conn.cursor() as cur:
+                cur.executemany(_SQL_EV_SET, ups)
+            conn.commit()
+        done += len(rows)
+        changed += sum(1 for u, r in zip(ups, rows) if r[2] != u["code"])
+        logger.info("产品事件回填进度 %d(本批 %d)", done, len(rows))
+    out = [f"▍catalog.product_events(problem_categorized):判了 {done} 条,"
+           f"其中**码变了** {changed} 条"]
+    out += [f"    {n:>7}  {code}" for code, n in new_codes.most_common(10)]
+    if matrix:
+        out.append("  码变了的,旧 → 新,前 10:")
+        out += [f"    {n:>7}  {old} → {code}"
+                for (old, code), n in matrix.most_common(10)]
+    out.append("  ⚠ 事件是**产品级记录**:改完之后下游(黑名单该不该拉黑)"
+               "直接读这个码,不必再拿原文重判 —— 判定只在 problem_scan 发生一次。")
+    return out
+
+
 def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
                     execute: bool, policy_names) -> list[str]:
     """回填 catalog.asin_blacklist。返回摘要行。"""
@@ -400,6 +469,10 @@ def run(params: dict) -> str:
         if scope in ("all", "records"):
             body += [""] + _records_pass(conn, ver, chunk, force, limit,
                                          execute, policy_names)
+        if scope in ("all", "events"):
+            # ⚠ 事件先回填:它是**产品级记录**,黑名单那一遍的判定要读它
+            body += [""] + _events_pass(conn, ver, chunk, force, limit,
+                                        execute, policy_names)
         if scope in ("all", "blacklist"):
             body += [""] + _blacklist_pass(conn, ver, chunk, force, limit,
                                            execute, policy_names)

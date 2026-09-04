@@ -634,7 +634,7 @@ def test_回填不看事件里那个码_拿原文重判():
                blacklist.backfill_counts):
         assert "_judge_events" in inspect.getsource(fn), fn.__name__
     judge = inspect.getsource(blacklist._judge_events)
-    assert "worst_verdict" in judge and "is_permanent" in judge
+    assert "worst_verdict" in judge
     assert "先判再擦" in inspect.getsource(blacklist.rebuild_asin_blacklist)
 
 
@@ -733,48 +733,34 @@ def test_items那一级要按asin也索引一份_否则sku对不上就查不中(
     assert "{**items_by_asin_map(conn), **items}" in inspect.getsource(error_source.fetch)
 
 
-def test_多条报错取够格拉黑的那条_不是取最新():
+def test_多条事件取够格拉黑的那条_不是取最新():
     """⚠ 所有者 2026-09-04 定稿:「一个产品的报错可能存在多次,**其中被拉黑的
     那个作为最高优先级**,其他的都是作为记录」。
 
     这**推翻了**此前那条「最新类别命中才算,『曾命中过』不作数」——
     旧写法 `DISTINCT ON (asin) … ORDER BY occurred_at DESC` 只看最新一条,
     于是一个品上个月被判 POLICY(该永久拉黑)、这个月记录是 EXPIRED(过期),
-    就**把历史上那条禁令忘了**,与黑名单「一次入选、永久禁止」的语义相反。
+    就**把历史上那条禁令忘了**,与「一次入选、永久禁止」的语义相反。
+
+    ⚠ 且**只读码,不重判原文**(所有者:「产品级的记录已经有产品事件在做了」)——
+    判定在 problem_scan 写事件那一刻发生过一次。
     """
     from services import blacklist
-    POLICY = "This item is a prohibited product. Prohibited Products Policy: Alcohol."
-    EXPIRED = "The End Date has passed for this item"
-    PT = ("may be a prohibited product. Please make sure the appropriate "
-          "product type selected for this item.")
     # 够格拉黑的那条说了算 —— **不管它在不在最后**
-    res, text = blacklist.worst_verdict([EXPIRED, POLICY, PT])
-    assert res.code == "POLICY" and text == POLICY
-    res, text = blacklist.worst_verdict([POLICY, EXPIRED])
-    assert res.code == "POLICY"
-    # 一条都不够格 → 退回第一条作记录(调用方据此不拉黑)
-    res, _ = blacklist.worst_verdict([EXPIRED, PT])
-    assert res.code == "EXPIRED"
-    # 空/全空白 → None
+    assert blacklist.worst_verdict(
+        [["EXPIRED", None], ["POLICY", None], ["PT_WRONG", None]]) == ("POLICY", None)
+    assert blacklist.worst_verdict(
+        [["POLICY", None], ["EXPIRED", None]]) == ("POLICY", None)
+    # 一条都不够格 → None(调用方据此不拉黑)
+    assert blacklist.worst_verdict([["EXPIRED", None], ["PT_WRONG", None]]) is None
+    # OTHER 是混装桶:只有两个显式词条算永久 —— 所以事件里必须存 term
+    assert blacklist.worst_verdict([["OTHER", "business decision"]]) \
+        == ("OTHER", "business decision")
+    assert blacklist.worst_verdict([["OTHER", "currently under review"]]) is None
+    # 空 / 缺项都不炸
     assert blacklist.worst_verdict([]) is None
-    assert blacklist.worst_verdict(["", "   ", None]) is None
-
-
-def test_产品历史按asin分组_且两个键名都认():
-    """⚠ 身份是 **asin**(所有者第 4 点:「如果只跟着 sku 走,sku 又是由我们系统
-    生成的,后面会追不到问题产品的来源码」)。
-
-    ⚠ 键名两个都要认:写入方(problem_scan / cleanup_history)写的是
-    `detail->>'reason'`(**单数**),而库里历史上还有一批是 `reasons`(复数)。
-    2026-09-04 查出读写不一致 —— events 那一级大面积空转。
-    """
-    from services import blacklist
-    sql = blacklist._HISTORY_SQL
-    assert "coalesce(asin, sku) AS asin" in sql and "GROUP BY 1" in sql
-    assert "array_agg(DISTINCT coalesce(detail->>'reason', detail->>'reasons'))" in sql
-    assert "coalesce(detail->>'reason', detail->>'reasons', '') <> ''" in sql
-    # 不许再退回「只取最新一条」
-    assert "DISTINCT ON" not in sql
+    assert blacklist.worst_verdict(None) is None
+    assert blacklist.worst_verdict([["POLICY"]]) == ("POLICY", None)
 
 
 def test_pick的items那一级_sku与asin两个都要试():
@@ -825,3 +811,30 @@ def test_复核出结论就把category改成新码_LEGACY与判不出的不动()
     # 飞书那一列的文字确实不变
     assert blacklist.source_label("POLICY") == "沃尔玛-禁售"
     assert blacklist.source_label("BRAND") == "沃尔玛-品牌"
+
+
+def test_产品事件是产品级记录_下游只读码():
+    """⚠ 所有者 2026-09-04:「产品级的记录已经有产品事件在做了。我们改了新归类,
+    **产品事件跟随更新了吗?**」—— 换轨(2026-09-03)只改了写入侧,历史事件的
+    `detail.category` 还是旧 A-L 码,全仓没有任何改它的代码。
+
+    这才是根:此前是在**读的时候**一遍遍重判原文来绕开旧码,而正确的做法是
+    **让账本本身是对的** —— 判定只在 `problem_scan` 发生一次,其余全是查询。
+    """
+    import inspect
+    from services import blacklist
+    from workflows import error_reclass
+    # ① 有一条回填事件码的路(scope=events),且盖版本号能断点续跑
+    assert "problem_categorized" in error_reclass._SQL_EV_PICK
+    assert "detail->>'taxonomy_version' IS DISTINCT FROM %(ver)s" in \
+        error_reclass._SQL_EV_PICK
+    assert "jsonb_build_object('category'" in error_reclass._SQL_EV_SET
+    assert "'taxonomy_term'" in error_reclass._SQL_EV_SET   # OTHER 判永久要它
+    assert error_reclass._parse({"scope": "events"})[0] == "events"
+    # ② 下游只读码,不再重判原文
+    judge = inspect.getsource(blacklist._judge_events)
+    assert "classify_reasons" not in judge and "worst_verdict" in judge
+    sql = blacklist._HISTORY_SQL
+    assert "detail->>'category'" in sql and "detail->>'taxonomy_term'" in sql
+    assert "GROUP BY 1" in sql and "coalesce(asin, sku) AS asin" in sql
+    assert "DISTINCT ON" not in sql        # 不许退回「只取最新一条」

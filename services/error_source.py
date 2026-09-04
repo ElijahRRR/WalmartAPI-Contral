@@ -80,6 +80,10 @@ WHERE coalesce(unpublished_reasons, '') <> ''
 #: 全文副本。生产实测:确认救不回来的 349 条里 **335 条(96%)** 在这里能对上。
 #: ⚠ 一个 sku 可能有多条建议(delete/retire 双击、多轮),**全都作为候选给出去**,
 #:   由 `restore` 的前缀判据挑 —— 只取最新一条会漏掉正好匹配的那条。
+#: ⚠ **先按文本去重再设上限**(2026-09-04 实遇):同一个下架原因会被反复建议,
+#:   `ORDER BY length DESC` 让最长那条的多份副本把名额全占满,真正对得上前缀的
+#:   那条被挤掉 —— 349 条里只救回 87 条,而不是能对上的 335 条。
+#:   这跟本次事故的病根是同一类:**为了省事设的上限,把判据那份切没了**。
 #: ⚠ 只进 `restore`,**不进 `pick`**:黑名单那条路的口径 2026-09-04 已验收,
 #:   往四级优先里插一级会把已定案的行重新洗一遍,那是另一次改动。
 SRC_DISPOSITIONS = """
@@ -126,21 +130,36 @@ def dispositions_map(conn, skus: list[str]) -> dict:
 
     ⚠ 候选是**列表**不是单值:同一个 sku 会有多条建议(delete/retire 双击、
     多轮扫描),哪一条是这一格事件的全文由 `restore` 的前缀判据决定,
-    在这里先挑就等于替它做判断。上限 5 条,防一个 sku 拖出几百条建议。
+    在这里先挑就等于替它做判断。
+
+    ⚠ **先去重再设上限**,顺序不能反:同一个下架原因会被反复建议,不去重的话
+    最长那条的多份副本把名额全占满,真正对得上前缀的那条被挤掉(2026-09-04
+    实遇:349 条只救回 87)。撞到上限时**记日志计数**,不许再静默丢。
     查不到就返回空:少一级原文是判得糙一点,炸掉是一条都判不了。
     """
     out: dict = {}
     if not skus:
         return out
+    capped = 0
     try:
         with conn.cursor() as cur:
             cur.execute(SRC_DISPOSITIONS, {"skus": skus})
             for sku, text in cur.fetchall():
-                if text and len(out.setdefault(sku, [])) < 5:
-                    out[sku].append(text)
+                if not text:
+                    continue
+                cand = out.setdefault(sku, [])
+                if text in cand:                    # 先去重
+                    continue
+                if len(cand) >= MAX_CANDIDATES:     # 再设上限,且不静默
+                    capped += 1
+                    continue
+                cand.append(text)
     except Exception as e:                                      # noqa: BLE001
         logger.warning("建议表读不到(本级跳过):%s", e)
         conn.rollback()
+    if capped:
+        logger.warning("建议表候选撞上限(每 sku %d 条),丢弃 %d 条 —— "
+                       "还原不到的行可能出在这儿", MAX_CANDIDATES, capped)
     return out
 
 
@@ -201,6 +220,10 @@ def pick(asin: str, own_reason: str | None, src_sku: str | None,
 #: 所以短于此长度一律不做还原 —— 见 `restore` 头注第二条。
 SAMPLE_LEN = 200
 
+#: 每个 sku 最多留几条**去重后**的候选全文(防一个 sku 拖出几百条建议撑爆内存)。
+#: ⚠ 去重之后典型只有 1-2 条,所以这个数留得宽;撞上限会打警告,不静默丢。
+MAX_CANDIDATES = 20
+
 
 def restore(own: str | None, candidates) -> tuple[str, str]:
     """输入:一段(可能被截断的)原文 + [(标签, 候选全文), …] → 输出:(原文, 来源标签)。
@@ -221,11 +244,17 @@ def restore(own: str | None, candidates) -> tuple[str, str]:
          此时"更长的候选"是另一段更长的文本(比如后来又追加了一条理由),
          接上去就等于拿后来的状态改写历史那一格。
 
+    ⚠ 门槛量的是**原始长度**,不是 rstrip 之后的(2026-09-04 实遇):`[:200]`
+      切在空格上时 `rstrip()` 剩 199,门槛当场把这一行判成"没被切过"、连试都
+      不试。前缀比对用 rstrip 版(尾部空格可能在别处被吃掉),**门槛用原文长度**
+      —— 两者是两件事,混用就漏。
+
     纯函数,零 I/O:优先序与前缀判据是判据的一部分,拿假数据就能测。
     """
-    base = (own or "").rstrip()
-    best, label = own or "", "self"
-    if len(base) < SAMPLE_LEN:
+    raw = own or ""
+    base = raw.rstrip()
+    best, label = raw, "self"
+    if len(raw) < SAMPLE_LEN:
         return best, label
     for tag, text in candidates or ():
         if text and len(text) > len(best) and text.startswith(base):

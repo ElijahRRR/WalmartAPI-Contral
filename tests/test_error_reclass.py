@@ -395,3 +395,39 @@ def test_建议表是最后一份全文副本(monkeypatch):
     wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
     u = [u for sql, ups in conn.log if "'category'" in sql for u in ups][0]
     assert u["src"] == "dispositions" and u["code"] == "PT_WRONG"
+
+
+def test_建议表候选先去重再设上限(monkeypatch):
+    """⚠ 2026-09-04 实遇:上限 5 条 + `ORDER BY length DESC`,同一个下架原因被
+    反复建议时,最长那条的**多份副本**把名额全占满,真正对得上前缀的那条被挤掉
+    —— 349 条只救回 87,而能对上的有 335。
+
+    **这跟本次事故的病根是同一类:为了省事设的上限,把判据那份切没了。**
+    所以顺序只能是「先去重、再设上限」。
+    """
+    from services import error_source as es
+    wrong = "另一次报错的更长的原文" * 40          # 比对的那条长,会排在前面
+    disp = [("SKU-1", wrong)] * 30 + [("SKU-1", _EV_FULL)]
+    conn = _EvConn([(1, _EV_SAMPLE, "PT_WRONG", "SKU-1", "B0A")], disp=disp)
+    monkeypatch.setattr(wf, "_sources", lambda c, a, s: ({}, {}, {}))
+    wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
+    u = [u for sql, ups in conn.log if "'category'" in sql for u in ups][0]
+    assert u["src"] == "dispositions" and u["code"] == "PT_WRONG"
+    # 去重之后只剩 2 条,离上限还远
+    assert len(es.dispositions_map(_EvConn([], disp=disp), ["SKU-1"])["SKU-1"]) == 2
+
+
+def test_还原门槛量原始长度_不是rstrip之后的():
+    """⚠ 2026-09-04 实遇:`[:200]` 正好切在空格上时,`rstrip()` 剩 199,
+    门槛把这一行判成"没被切过"、连试都不试 —— 那 248 条救不回来就有这一份。
+
+    前缀比对用 rstrip 版(尾部空格可能在别处被吃掉),**门槛用原文长度** ——
+    两者是两件事,混用就漏。
+    """
+    from services import error_source as es
+    own = "x" * (es.SAMPLE_LEN - 1) + " "          # 库里 length()=200
+    assert len(own) == es.SAMPLE_LEN and len(own.rstrip()) == es.SAMPLE_LEN - 1
+    assert es.restore(own, [("d", own + "TAIL")]) == (own + "TAIL", "d")
+    # 真的没够到 200 的,照旧一律不还原
+    short = "x" * (es.SAMPLE_LEN - 1)
+    assert es.restore(short, [("d", short + "TAIL")]) == (short, "self")

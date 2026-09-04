@@ -24,7 +24,7 @@
 | 1 | 台湾时间 | ✅ **不用换算**:台北与上海同为 UTC+8 且都无夏令时,代码里的 `CN_TZ`(Asia/Shanghai)与机器本地时间**日界一致**。时间表原样可用 |
 | 2 | 不关机 | ✅ 睡眠补跑那条坑作废;`StartCalendarInterval` 直接可用 |
 | 3 | 虚拟环境跑 | ⚠ 仍需要**那个 venv 的 python 绝对路径**(见第六节) |
-| 4 | `product_audit` / `brand_scrape` 不进调度 | ⚠ **仅 brand_scrape 仍成立**:`product_audit` 已于 2026-08-17 定稿进调度两处 —— `audit_sheet` 18:10(`-p from_sheet=1`)与 `product_chain` 13:00 里的 L0 一步(`mode=online`/`stages=L0`/`limit=1000000`) |
+| 4 | `product_audit` / `brand_scrape` 不进调度 | ⚠ **仅 brand_scrape 仍成立**:`product_audit` 已于 2026-08-17 定稿进调度两处 —— `audit_sheet` 18:10(`-p from_sheet=1`)与 `product_chain` 13:00 里的 L0 一步(`mode=online`/`stages=L0`;**不给 limit**——2026-09-03 起缺省不限量,此前那个 `limit=1000000` 魔数已删) |
 | 5 | 「等待会占锁吗?什么锁」 | 见第五节(会,`<DATA_ROOT>/locks/order_audit.lock`);结论:**保持默认 `wait=1`**,不写 `wait=0` |
 | 6 | 采集器 3000/分钟扛得住 | ✅ **改变了 v1 的结论**:全量重推约 50 分钟采完,产品线**能一次性做完**(见第一节) |
 | 7 | 没有 hermes,现在是 GPT 调度;每小时订单/审核是 cron;feed 轮询也照此 | ~~✅ 全部走 launchd/cron,一律不接 GPT~~ **2026-08-16 所有者改口径**:高频链(`feed_poll` + 订单链)进 launchd,**其余七条用 skill 形式给智能体注册成定时任务**(见 §9.1)。⚠ `legacy_schedules.md` A 表写的"hermes 平台"已过时,停旧取证时按 GPT 侧的实际注册表核对 |
@@ -66,7 +66,7 @@ catalog_sync → product_refresh → (等采完) → product_ingest
 python cli.py catalog_sync sources_backfill product_refresh product_audit \
               maintenance_scan problem_scan maintenance problem_product_cleanup \
               -p product_refresh:wait=1 -p product_audit:mode=online \
-              -p product_audit:stages=L0 -p product_audit:limit=1000000
+              -p product_audit:stages=L0
 ```
 
 | 步 | 干什么 | 预估时长 |

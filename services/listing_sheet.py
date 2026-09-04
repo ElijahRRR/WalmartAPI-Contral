@@ -6,33 +6,50 @@
 本文件所有读写的 range 都由它算出来,**源码里一个写死的列字母都没有**
 (守门:tests/test_sku_guard.py::test_listing_sheet_has_no_hardcoded_column_letters)。
 表头缺失/重复 = fail-closed 直接抛错拒绝读写(宁可不跑,也不写错列);
-表头行里多出登记之外的列只告警(所有者随时会加自己的列)。
+表头行里多出登记之外的列只告警(所有者随时会加自己的列);比对忽略大小写与
+空白(表头里多敲个空格不该停掉一整轮)。核验入口
+`verify_header()`(读写前自动跑一次,想强制重读先 `reset_layout_cache()`)。
 
-列契约(21 列,所有者表头重排 2026-09-02;字母是**今天的**位置,不是契约):
+⚠ 这套定位是 **2026-09-02 事故**换来的:所有者改了表头(C 插 SKU、审核理由
+拆两列),硬编码字母那版按旧字母写了半天 —— 读出来的字段整体错位、结论落在
+别人的列上,而且全程不报错。
+
+列契约(21 列,所有者建表 2026-08-07、2026-09-02 重排表头;
+字母是**今天的**位置,不是契约):
   A=店铺 B=ASIN C=SKU D=walmart上架标题 E=walmart_product_type F=审核结果
   G=类别 H=具体内容 I=审核日期 J=amz价格 K=库存 L=walmart价格 M=是否上架
   N=上架feedid O=上架日期 P=未上架理由 Q=上架结果 R=报错 S=feed查询日期
   T=登记日期 U=查询编码
 
-⚠ **T 登记日期 / U 查询编码是人工填写列,本模块永不写**(读全宽时顺带读到,
-没有任何判定消费它们)。⚠ **G 类别列本模块也不写**:审核链的「类别」由
-另一条 PR 接线,本文件只写「具体内容」(audit_reason)。
+⚠ 表头动过两次,都只改 registry:**A/B 于 2026-08-16 被所有者对调**
+(原 A=ASIN B=店铺,现 A=店铺 B=ASIN);**2026-09-02 第二次重排**(审核链
+第三步的输出规范化):C 插入 SKU、「审核理由」拆成 类别 + 具体内容、尾部
+真实标题/真实PT/真实UPC/UPC是否一致 四列换成 登记日期/查询编码。
+
+⚠ **登记日期 / 查询编码是运营手填列,本模块永不写**(读全宽时顺带读到,
+没有任何判定消费它们)。
 
 列权责(旧系统纪律,跨界写就是 bug):**店铺/ASIN 人工域**(运营填);
 **标题/PT/审核结果/类别/具体内容/审核日期 审核域**(`product_audit -p from_sheet=1`
 写,2026-08-16 所有者定稿「审核直接读取上架表的 ASIN 与审核结果两列(结果为空
-就审核),然后回填标题、PT、审核结果、理由、审核日期」;**具体内容还有一条单列
-通道** `write_audit_notes` —— 审不了的行(库里没数据)在审核结果留空的前提下
-只写具体内容说明原因,见那个函数的头注);
+就审核),然后回填标题、PT、审核结果、理由、审核日期」;2026-09-02 第三步把
+那条「理由」拆成 **类别 + 具体内容**,两列由 `write_audit_cols` 同一次写出;
+**具体内容还有一条单列通道** `write_audit_notes` —— 审不了的行(库里没数据)
+在审核结果留空的前提下只写具体内容说明原因,见那个函数的头注);
 list_new 写 标题/amz价/库存/walmart价(数据回显)与 是否上架/feedid/上架日期/
-未上架理由(提交结果),提交时**同一次**把 SKU 写进 C 列;回执反哺器只写
-上架结果/报错/feed查询日期。**唯一例外**:heal_unknown 自愈反哺器对
+未上架理由(提交结果),提交时**同一次**把 SKU 写进 SKU 列;回执反哺器只写
+上架结果/报错/feed查询日期;登记日期/查询编码 运营域,脚本不写。
+**唯一例外**:heal_unknown 自愈反哺器对
 是否上架=Unknown 的行可写 是否上架~feed查询日期(所有者批复 2026-08-12——
 Unknown 是 list_new 自己写的中间态,自愈是同一职责的收尾,不算跨界)。
 是否上架 三态语义:Yes(已提交)/Unknown(结局不确定,也算已上架不重复提交)/
 空或 No(待上架);上架结果=SKU_LOCKED 由 sku_locked_heal
 自愈链处理(RETIRE→24h→清列重上新 UPC;所有者纠正 2026-08-12:不是
 永久跳过——但旧实证不先退役直接换 UPC 重发也失败,legacy_survey.md:1667)。
+
+⚠ **SKU 列是机器域,不是人工域**:审核链第三步的头注把 C 记作「运营填 SKU」,
+那是 SKU 改造(批次 1)未通电时的描述 —— 码由 `sku_codec` 铸、list_new 提交时
+与 是否上架/feedid 同一次写进表(见 `row_sku` / `write_sku_col`),运营不填。
 
 回执分类(旧 reconcile 实证,"四集合+优先级"):
   优先级 SKU_LOCKED > 真SUCCESS(无码) > ASYNC(审核中假错误,绝不当失败
@@ -55,6 +72,35 @@ PENDING_O = ("", "处理中", "ASYNC_PENDING")   # 上架结果列这些值反�
 #: 多出的列不算错(所有者随时会加自己的列),但要说出来,免得下一个人
 #: 以为程序看得见它。
 _HEADER_SCAN_SLACK = 5
+
+#: 中文表头文字(字段名 → 表头原文)**只在 registry 出生**:
+#: `resources.LISTING_SHEET.headers`。审核链第三步曾把这张对照表抄一份放在
+#: 本文件(`_HEADER_NAMES` 字面量),那样它就有了第二个出生地 —— 表头一改要
+#: 改两处,漏一处就是「registry 说 21 列、代码认 20 列」的静默错位。
+#: 铁律三:一切表 ID/字段名先登记 registry;要那份表头文字就 `_header()` 派生。
+
+
+def _header() -> tuple:
+    """输入:无 → 输出:与 registry 列序一一对应的中文表头(**派生,不是第二份**)。
+
+    只给"人要看一眼表头长什么样"的场合(单测拿它铺一行表头、排查时打印对照)。
+    ⚠ 它按 `columns` 的登记顺序排,而**列定位不看这个顺序** —— 认列一律靠
+    `layout()` 在真表头行里按名字找(所有者随时会调列序)。拿它当列序契约用,
+    就退回了 2026-09-02 那次全体错位。
+    """
+    sheet = resources.LISTING_SHEET
+    return tuple(sheet.headers[c] for c in sheet.columns)
+
+
+class HeaderMismatch(LookupError, ValueError):
+    """表头行与 registry 登记对不上 —— 本轮拒绝一切读写。
+
+    **两个基类都要**(合并 2026-09-04):SKU 改造这一侧的调用方按
+    `LookupError` 捕(与 `Spreadsheet.require()` 的"表没登记"同一类失败,
+    heal_unknown / sync_from_ledger 的 except 就是这么写的);审核链第三步
+    的表头核验按 `ValueError` 捕。谁的 except 都不该在合并里被静默改掉。
+    """
+
 
 #: 进程内列布局缓存:字段名 → **1-based 列号**。None = 还没读过表头行。
 #: 每进程读一次(表头不会在一轮跑里被改);测试与"表头刚改完"用
@@ -82,13 +128,26 @@ def _read_header_row() -> list[str]:
     return [(str(c).strip() if c is not None else "") for c in raw]
 
 
+def _norm_head(s) -> str:
+    """输入:表头单元格 → 输出:比对用的规范形(去掉全部空白 + casefold)。
+
+    审核链第三步定的宽容口径,合并时原样保住:运营在表头里多敲一个空格、
+    把 walmart 写成 Walmart 都是常事,**为这个 fail-closed 停掉一整轮不值**;
+    真正要拦的是"少一列/多一列/两列重名"这种会让值写进别人列的漂移。
+    ⚠ 只在比对时规范化,报错与告警一律回显**表上的原文**,不然人对着
+    规范化过的字符串找不到自己那一格。
+    """
+    return "".join(str(s or "").split()).casefold()
+
+
 def _index_map() -> dict[str, int]:
     """输入:无 → 输出:{字段名: 1-based 列号}(每进程读一次表头行认列)。
 
     **fail-closed**:registry 登记的表头只要缺一个、或在表头行里出现两次,
-    直接抛 LookupError 拒绝一切读写 —— 宁可这一轮不跑,也不能把标题写进
+    直接抛 `HeaderMismatch` 拒绝一切读写 —— 宁可这一轮不跑,也不能把标题写进
     SKU 列(2026-09-02 重排之前那套硬编码字母,插一列就是全体静默错位)。
     表头行里多出登记之外的列**只告警**:所有者随时会加自己的列,那不是错。
+    比对忽略大小写与空白(`_norm_head`):那种差别不会让值写错列。
     """
     global _LAYOUT
     if _LAYOUT is not None:
@@ -98,23 +157,33 @@ def _index_map() -> dict[str, int]:
         raise LookupError("上架表未登记 headers(字段名→中文表头):"
                           "按表头名定位列是本模块的前提,先补 registry")
     cells = _read_header_row()
-    seen: dict[str, list[int]] = {}
+    seen: dict[str, list[int]] = {}       # 规范形 → 1-based 列号们
+    raw_of: dict[str, str] = {}           # 规范形 → 表上原文(报错时回显)
     for i, text in enumerate(cells, 1):
-        if text:
-            seen.setdefault(text, []).append(i)
-    missing = [h for h in want.values() if h not in seen]
-    dupes = [h for h in want.values() if len(seen.get(h, ())) > 1]
-    extra = [t for t in seen if t not in set(want.values())]
+        key = _norm_head(text)
+        if key:
+            seen.setdefault(key, []).append(i)
+            raw_of.setdefault(key, text)
+    known = {_norm_head(h) for h in want.values()}
+    missing = [h for h in want.values() if _norm_head(h) not in seen]
+    dupes = [h for h in want.values() if len(seen.get(_norm_head(h), ())) > 1]
+    extra = [raw_of[k] for k in seen if k not in known]
     if extra:
         logger.warning("上架表表头有登记之外的列 %s —— 程序看不见它们"
                        "(要接线先登记 registry.LISTING_SHEET.headers)", extra)
     if missing or dupes:
         logger.warning("上架表表头对不上登记:缺失 %s;重复 %s", missing, dupes)
-        raise LookupError(
-            f"上架表表头与 registry 登记对不上(缺失 {missing};重复 {dupes})——"
-            f"本轮**拒绝一切读写**:列认不准就会把值写进别人的列,而且不报错。"
+        # 点名到列:缺的那几个说不出位置(压根没有),重复的把撞在一起的
+        # 列字母一并报出来 —— 光说"重复"人得自己一列列数过去。
+        where = {h: "/".join(feishu._col_letter(i)
+                             for i in seen[_norm_head(h)])
+                 for h in dupes}
+        raise HeaderMismatch(
+            f"上架表表头与 registry 登记对不上(缺失 {missing};"
+            f"重复 {where or dupes})——本轮**拒绝一切读写**:列认不准就会把值"
+            f"写进别人的列,而且不报错。表头行实际读到的是 {cells};"
             f"请核对飞书表头行或 registry.LISTING_SHEET.headers")
-    _LAYOUT = {f: seen[h][0] for f, h in want.items()}
+    _LAYOUT = {f: seen[_norm_head(h)][0] for f, h in want.items()}
     return _LAYOUT
 
 
@@ -123,8 +192,28 @@ def layout() -> dict[str, str]:
 
     **本文件全部 range 的唯一来源**。所有者再挪列顺序,代码一行不改;
     表头缺失/重复则抛错拒绝读写(见 `_index_map` 的 fail-closed 口径)。
+
+    ⚠ 审核链第三步曾另有一对私有助手按 **registry 列序的下标**推字母
+    (`_col(字段)` / `_rng(首字段, 末字段, 行号)`)。合并 2026-09-04 时并进
+    这里:一个字段的列字母取 `layout()[字段]`,一段 range 取 `_ranges()`
+    (它还会按真实列号粘/拆段)。留两套推字母的路子就是双轨 —— 而且那套认的
+    是登记顺序,不是表上真实位置,所有者一挪列两套就会给出不同答案。
     """
     return {f: feishu._col_letter(i) for f, i in _index_map().items()}
+
+
+def verify_header() -> None:
+    """输入:无 → 输出:无;表头与 registry 登记对不上就抛 `HeaderMismatch`。
+
+    审核链第三步留下的公开核验入口(「读写之前先对一遍第 1 行,对不上就停,
+    而不是错位着跑完还不报错」)。**它不是第二条实现路径**:核验就是
+    `_index_map()` 认列那一次,本文件每个读写函数进门都会走到,所以单独调它
+    只是想**提前**在跑批前失败(例如工作流开头先探一次,别等写到一半才炸)。
+
+    ⚠ 表头一进程只读一次(`_LAYOUT` 缓存)。所有者刚改完表头、要让长驻进程
+    重认一次列,先 `reset_layout_cache()` 再调本函数。
+    """
+    _index_map()
 
 
 def _ranges(row_from: int, fields: list[str],
@@ -182,7 +271,7 @@ def read_rows(upto: str | None = None) -> list[dict]:
     total = feishu.sheet_row_count(sheet)
     if total < 2:
         return []
-    idx = _index_map()
+    idx = _index_map()          # 表头一动就停(fail-closed),不错位着跑
     width = idx[upto] if upto else max(idx.values())
     by_pos = {i: f for f, i in idx.items() if i <= width}
     pairs = feishu.sheet_values_rows(sheet, "A", feishu._col_letter(width),
@@ -378,11 +467,13 @@ def audit_targets() -> list[dict]:
     pending 是**中间态不是结论**,所以它跟空一样要被反复领回来,直到落定。
     `list_new` 的闸判 `== "pass"`,重新领取不会有误上架风险。
 
-    ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16),
-    再调一次也只改 `resources.LISTING_SHEET.columns` 那一条元组。
+    ⚠ 按**字段名**取,不按列字母 —— A/B 已经被对调过一次(2026-08-16)、
+    整排表头又动过一次(2026-09-02),两次都只改 registry 那两条登记
+    (`LISTING_SHEET.columns` 与 `.headers`),本函数一个字没动。
     """
-    # 只读 A..E 五列(store/asin/标题/PT/审核结果):领任务用不着 F 之后的
-    # 理由/回显长文本,少读 3/4 的字节,离 10MB 上限远得多
+    # 只读到「审核结果」那一列(今天是 店铺/ASIN/SKU/标题/PT/审核结果 六列):
+    # 领任务用不着后面的 类别/具体内容/回显长文本,少读 3/4 的字节,离 10MB
+    # 上限远得多。读到第几列由 layout() 按表头名算,不写字母
     return [{"rownum": r["rownum"], "asin": r["asin"], "store": r.get("store")}
             for r in read_rows(upto="audit_result")
             if r.get("asin")
@@ -390,16 +481,39 @@ def audit_targets() -> list[dict]:
             in ("", "pending")]
 
 
-def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
-    """输入:[(行号, [标题, PT, 审核结果, 具体内容, 审核日期])] → 输出:写入行数。
+#: 审核域一行六值的字段序(**值的顺序是调用方契约,不是列序**;落到哪几列
+#: 由 layout 按表头名算)。2026-09-02 审核链第三步把原来的一列「理由」拆成
+#: **类别**(政策类目枚举,pass/pending 为空)+ **具体内容**(人话),
+#: 两列必须**同一次**写出:分两次写,中间崩掉就留下"有类别没内容"或反过来的
+#: 半截结论,而表面上这行"审过了"。
+_AUDIT_FIELDS = ["list_title", "product_type", "audit_result",
+                 "audit_category", "audit_detail", "audit_date"]
 
-    ⚠ 只动这五列。**中间隔着「类别」列,本函数不写它** —— 类别(37 政策类目)
-    由另一条 PR 接线,所以 `_row_ranges` 会自动拆成两段(今天是 D:F 与 H:I),
-    夹在中间的类别一格都不碰。是否拆段、拆几段全由 `layout()` 说了算。
-    再往后是 list_new 与反哺器的域,跨界写就是 bug(见模块头注的列权责)。
+
+def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> int:
+    """输入:[(行号, [标题, PT, 审核结果, 类别, 具体内容, 审核日期])] → 输出:写入行数。
+
+    ⚠ 只动审核这六列(`_AUDIT_FIELDS`)。今天这六个字段的列相邻,`_row_ranges`
+    粘成一段(D:I);所有者往中间插一列,同一批写入自动拆成多段,值一个都不会
+    落到隔壁列 —— 是否拆段、拆几段全由 `layout()` 说了算,本函数不认字母。
+    前面是人工域(店铺/ASIN)与 SKU 列,后面是 list_new 与反哺器的域,
+    跨界写就是 bug(见模块头注的列权责)。
+
+    ⚠ 历史:SKU 改造批次 1 落地时「类别」还归审核链第三步那条 PR,本函数
+    当时只写五值、特意跳过中间那一格(拆成 D:F + H:I);第三步合进来之后
+    类别与具体内容由本函数一次写全 —— **两处都写就是互相覆盖**,所以
+    第三步的投影 (`product_audit._project_to_sheet`) 也只走这一个出口。
+    值的个数对不上直接抛错:少给一个值,后面的值会整体前移一格填进
+    别人的列(2026-09-02 那次错位就是这么发生的,而且不报错)。
     """
     if not updates:
         return 0
+    bad = [r for r, vals in updates if len(vals) != len(_AUDIT_FIELDS)]
+    if bad:
+        raise ValueError(
+            f"write_audit_cols 要 {len(_AUDIT_FIELDS)} 个值"
+            f"(标题/PT/审核结果/类别/具体内容/审核日期),这些行给的个数不对:"
+            f"{bad[:10]} —— 个数不对会让值整体错位写进别人的列")
     if not execute:
         for rownum, vals in updates[:20]:
             logger.info("[DRY-RUN] 将回写 第%d行 审核列=%s", rownum, vals)
@@ -409,8 +523,7 @@ def write_audit_cols(updates: list[tuple[int, list]], execute: bool = True) -> i
     feishu.sheet_write_ranges(resources.LISTING_SHEET, _row_ranges(
         [(r, [("" if v is None else str(v)) for v in vals])
          for r, vals in updates],
-        ["list_title", "product_type", "audit_result", "audit_reason",
-         "audit_date"]))
+        _AUDIT_FIELDS))
     return len(updates)
 
 
@@ -427,8 +540,10 @@ def write_audit_notes(updates: list[tuple[int, str]],
     退出审核通道**:采集回来了也不会有人再审它,而表面上"表里写着原因呢"。
     审核结果留空 + 具体内容写原因 = 运营看得见为什么卡着,下一轮照样重新领取。
 
-    也不碰 标题/PT/类别/审核日期:那几列是有结论时 `write_audit_cols`(与类别
-    那条 PR)的域,没结论时本来就空,顺手写进去(哪怕写空串)就是跨界写。
+    也不碰 标题/PT/**类别**/审核日期:那四列是有结论时 `write_audit_cols` 的域
+    (类别自 2026-09-02 审核链第三步起也由它写),没结论时本来就空,顺手写进去
+    (哪怕写空串)就是跨界写 —— 尤其类别:这里写空串会把第三步刚落的政策类目
+    擦掉,而"具体内容有话、类别空着"看起来只像是判定没给类目。
     """
     if not updates:
         return 0
@@ -439,7 +554,7 @@ def write_audit_notes(updates: list[tuple[int, str]],
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
     feishu.sheet_write_ranges(resources.LISTING_SHEET, _row_ranges(
-        [(r, [note]) for r, note in updates], ["audit_reason"]))
+        [(r, [note]) for r, note in updates], ["audit_detail"]))
     return len(updates)
 
 
@@ -492,7 +607,10 @@ def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
 
 
 def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
-    """输入:feed_items 的 (status, error_code) → 输出:(O 上架结果, P 失败理由)。
+    """输入:feed_items 的 (status, error_code) → 输出:(上架结果, 报错)。
+
+    两个返回值分别落「上架结果」与「报错」两列(后者 2026-09-02 表头重排前
+    叫「上架失败理由」,只是改了表头名,语义没变)。
 
     四集合+优先级(旧 reconcile 实证):SKU_LOCKED > 真SUCCESS > ASYNC >
     失败;SUCCESS 可以同时带 ingestionErrors——必须先看码再看状态。
@@ -503,12 +621,12 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     if code in resources.WALMART_ERR_ASYNC_REVIEW:
         return "ASYNC_PENDING", ""          # 审核中假错误,绝不当失败重发
     if code in resources.WALMART_ERR_PROHIBITED:
-        # 政策违禁(旧 O 列第五类,2026-08-12 抢救接线):永远不能上架,
+        # 政策违禁(旧系统 O 列的第五类,2026-08-12 抢救接线):永远不能上架,
         # 不进 FAILED 重试通道——重发也永远是拒,白烧 UPC 与配额
         return "PROHIBITED", code
     if code in resources.WALMART_ERR_CONTENT:
         # 内容标准拒(2026-08-19):文案图片取自亚马逊原文,原样重发必然
-        # 同拒,还触发/延长 QARTH 审查。不自动重试;人工改文案后清 O 列
+        # 同拒,还触发/延长 QARTH 审查。不自动重试;人工改文案后清「上架结果」列
         # 可重回通道(语义与 PROHIBITED 的"永不"有别)
         return "CONTENT_REJECTED", code
     if status == "success":
@@ -603,7 +721,7 @@ def _mark_upc_conflicts(pairs: list[tuple[str, str]],
 #     product_events 的 list_submitted→item_appeared 时间线与之同源)
 # 三层防误写(2026-06-09 全表误写事故语义,按新形态映射):
 #   · 目录读空 → 源② 整体停用本轮(等价旧"空索引硬中止")
-#   · **"查无"永不产生负向写**——K=No 只允许来自源① 的 feed 终态 FAILED,
+#   · **"查无"永不产生负向写**——是否上架=No 只允许来自源① 的 feed 终态 FAILED,
 #     目录里查不到只保持 Unknown(旧"单店 80% 熔断"与"48h 审核窗豁免"
 #     防的就是负向误写,新形态下负向写根本不走目录源,天然满足)
 _SQL_HEAL_RECEIPT = """

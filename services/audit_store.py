@@ -1,4 +1,4 @@
-"""审核结论落库积木(audit_runs/audit_hits 明细 + catalog.products 五列 + 事件行)。
+"""审核结论落库积木(audit_runs/audit_hits 明细 + catalog.products 六列 + 事件行)。
 
 列映射逐字对齐旧仓 orchestrator._persist_run(spec_shortcut §4):
   score_start 硬编码 100;无 L3/L4 时 l3_verdict/l4_verdict 写字符串 'skip'
@@ -8,12 +8,24 @@ verdict → audit_status 两套词表必须显式映射:pass→approved / reject
 pending→pending(catalog.products.audit_status 值域,schema.sql:22)。
 final_reason_category 无 runs 列(旧仓同,动态算的)——落点是
 catalog.products.audit_reason。
+
+**三段输出的落点**(2026-09-02 B1,`docs/audit_step3_spec.md` §3.4):
+
+| 段 | audit_runs | catalog.products | product_events |
+|---|---|---|---|
+| 判定结果 | `verdict` / `l3_verdict` | `audit_status` | 事件码 |
+| 类别 | `l3_reason_category`(列名不改,语义 = 类别枚举) | `audit_reason` | `detail.reason` |
+| 具体内容 | `l3_reason_text`(列名不改,语义 = 具体内容) | **新列 `audit_detail`** | `detail.detail` |
+
+两条列名不改是有意的:`audit_runs` 有百万级存量行,改名要连历史一起迁,
+而语义收窄(类别只装枚举)在**新写入**的行上就成立;老行仍是旧语义,
+`audit_why` / 报表按 `audit_version` 分辨(留档口径见 docs/db_schema.md)。
 """
 
 import json
 
 from registry import resources
-from services import product_events
+from services import audit_reason, product_events
 from services.audit_models import AuditOutcome
 
 _VERDICT_TO_STATUS = {"pass": "approved", "reject": "rejected",
@@ -26,12 +38,18 @@ _PENDING_REASON_L3 = "LLM 全链路故障, 待人工复核"   # 旧仓字面量(
 # 这种要等 walmart_pt_meta 补行(pt_spec_sync),重刷一百遍也不会自己好。
 _PENDING_REASON_L2 = "PT 不在类目准入明细,判不了(待补 walmart_pt_meta)"
 
+# ⚠ `audit_version` 是 2026-09-02 B2 补的列(`refdata/schema.sql`):这张表原本
+# 没有任何"这一行是哪一版判据判的"的痕迹,于是**回放评估分不清新旧链** ——
+# `mode=stale` 一跑,每个 asin 的"最近一次 run"就变成了新链自己的结论,
+# 再拿它当"旧链基线"就是自己跟自己比,而且数字看着完全正常。
+# 存量 204 万行这一列是 NULL = 旧链(回放按 `IS DISTINCT FROM 当前版本` 取基线)。
 _RUN_SQL = """
 INSERT INTO audit.audit_runs
   (asin, walmart_product_type, pt_confidence, pt_source,
    score_start, score_final, verdict, stage_stopped_at,
-   l3_verdict, l3_reason_category, l3_reason_text, l4_verdict, l4_issues)
-VALUES (%s, %s, %s, %s, 100, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+   l3_verdict, l3_reason_category, l3_reason_text, l4_verdict, l4_issues,
+   audit_version)
+VALUES (%s, %s, %s, %s, 100, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
 RETURNING run_id
 """
 
@@ -44,6 +62,7 @@ _PRODUCT_SQL = """
 UPDATE catalog.products
 SET audit_status  = %(status)s,
     audit_reason  = %(reason)s,
+    audit_detail  = %(detail)s,
     -- 实证行不许被推断覆盖(与 product_audit._ADOPT_SQL 同一条不变量)
     walmart_pt    = CASE WHEN pt_source = 'walmart_confirmed'
                               AND %(pt_source)s <> 'walmart_confirmed'
@@ -77,11 +96,12 @@ def _run_params(outcome: AuditOutcome) -> tuple:
         outcome.verdict,
         outcome.stage_stopped_at,
         l3.verdict if l3 else "skip",
-        l3.reason_category if l3 else None,
-        l3.reason_text if l3 else None,
+        l3.policy if l3 else None,          # 列名不改,语义 = 类别枚举
+        l3.detail if l3 else None,          # 列名不改,语义 = 具体内容
         l4.verdict if l4 else "skip",
         json.dumps(l4.image_issues, ensure_ascii=False, default=str)
         if l4 else "[]",
+        resources.AUDIT_RULES_VERSION,   # 这一行是哪一版判据判的(回放分新旧链靠它)
     )
 
 
@@ -169,24 +189,62 @@ def real_pt(outcome: AuditOutcome) -> str | None:
     return pt
 
 
+def conclusion_detail(outcome: AuditOutcome) -> str | None:
+    """输入:判定结果 → 输出:`catalog.products.audit_detail` 那一格(具体内容)。
+
+    三段输出的第三段(规格 §3.4),来源**确定**、按 verdict 分道:
+
+      · reject + L3 判的  → `l3.detail`(LLM 给的中文一句:原文片段 + 条款要点);
+        **LLM 没给 detail 时不留空**,退成一句确定的话
+        `违反「<类别>」(LLM 未引用原文片段)` —— 空着的后果是飞书 H 列走
+        老行兜底渲染,把 `llm_alcohol` 这种规则码原样打给运营看(`_RULE_CN`
+        里没有 llm_* 条目,也不该有:那是随政策名生成的);
+      · reject + 规则判的 → 判死那条 hit 的 `explain_hit`(它本来就是"具体内容"
+        形态,如 `商标符号(命中:XYZ®)`)。取的是 all_hits 里**第一条扣分的**
+        —— 硬拒是短路的,那一条就是判死它的那条;
+      · pending           → 三句固定句之一(**按停在哪一层分**,重试口径不同:
+        L1 类目解不出隔天重试有意义 / L2 要等 walmart_pt_meta 补行,重刷无用 /
+        L3 LLM 故障重试有意义)。此时类别列是 NULL —— 待定不是结论;
+      · pass              → None(两列都空)。
+    """
+    if outcome.verdict == "pending":
+        return {"L3": _PENDING_REASON_L3,
+                "L2": _PENDING_REASON_L2}.get(outcome.stage_stopped_at,
+                                              _PENDING_REASON)
+    if outcome.verdict != "reject":
+        return None
+    l3 = outcome.l3
+    if l3 is not None and getattr(l3, "verdict", None) == "reject":
+        detail = (getattr(l3, "detail", None) or "").strip()
+        if detail:
+            return detail
+        # 判拒必须说得出一句话:LLM 漏了 detail(或只回了空白)时,
+        # 用它自己给的类别拼一句确定的 —— 不许把这一格留空
+        policy = (getattr(l3, "policy", None) or "").strip()
+        return (f"违反「{policy}」(LLM 未引用原文片段)" if policy
+                else "L3 判拒但未给出具体内容(待人工复核)")
+    for h in outcome.all_hits:
+        if h.penalty < 0:
+            return audit_reason.explain_hit(h.rule_code, h.detail)
+    return None
+
+
 def write_conclusion(conn, outcome: AuditOutcome,
                      marketplace: str = "US") -> None:
-    """输入:连接 + 判定结果 → 输出:无(写 catalog.products 五列)。"""
+    """输入:连接 + 判定结果 → 输出:无(写 catalog.products 审核六列)。
+
+    三段分列(2026-09-02 B1,规格 §3.4):`audit_status` 判定结果 /
+    `audit_reason` **类别**(reject 才有,pass 与 pending 一律 NULL)/
+    新列 `audit_detail` 具体内容。⚠ pending 的那三句固定句从 `audit_reason`
+    挪到了 `audit_detail` —— 类别列从此只装类别枚举,不再混着中文句子。
+    """
     status = _VERDICT_TO_STATUS[outcome.verdict]
-    if outcome.verdict == "reject":
-        reason = outcome.final_reason_category
-    elif outcome.verdict == "pending":
-        # 三种 pending 来源分开留痕(重试口径不同):
-        #   L1 = 类目根本解不出(候选/rerank 无解)—— 隔天重试有意义
-        #   L2 = PT 解出来了但不在准入明细 —— 要等明细补行,重刷无用
-        #   L3 = LLM 故障 —— 重试有意义
-        reason = {"L3": _PENDING_REASON_L3,
-                  "L2": _PENDING_REASON_L2}.get(outcome.stage_stopped_at,
-                                                _PENDING_REASON)
-    else:
-        reason = None
+    # 类别只有 reject 才有:pass 没有类别,pending 是"这一轮判不了"(判不了
+    # 不是判过了,给它挂一个类别等于替它把话说死)
+    reason = outcome.final_reason_category if outcome.verdict == "reject" else None
     conn.execute(_PRODUCT_SQL, {
-        "status": status, "reason": reason, "walmart_pt": real_pt(outcome),
+        "status": status, "reason": reason,
+        "detail": conclusion_detail(outcome), "walmart_pt": real_pt(outcome),
         "pt_source": pt_provenance(outcome),
         "version": resources.AUDIT_RULES_VERSION,
         "marketplace": marketplace, "asin": outcome.asin,
@@ -203,7 +261,10 @@ def event_row(outcome: AuditOutcome, run_id: int | None,
                   "run_id": run_id}
     elif outcome.verdict == "reject":
         code = product_events.AUDIT_REJECTED
+        # ⚠ 键名 `reason` **不改**:audit_history_fold 与存量 204 万行事件
+        # 都按它读(语义 = 类别)。具体内容是 2026-09-02 B1 新加的 `detail` 键
         detail = {"reason": outcome.final_reason_category,
+                  "detail": conclusion_detail(outcome),
                   "rule_codes": sorted({h.rule_code for h in outcome.all_hits
                                         if h.penalty < 0}) or
                                 sorted({h.rule_code for h in outcome.all_hits}),
@@ -217,22 +278,28 @@ def event_row(outcome: AuditOutcome, run_id: int | None,
 
 # ── TRO 品牌命中(2026-08-30 接线;纯函数,零 DB)────────────────────────────
 
-#: L3 只对 R4/R5 命中词的**前 10 个**给判定(services/audit_l3.MAX_BRANDS),
+#: L3 只对品牌命中词的**前 10 个**给判定(services/audit_l3.MAX_BRANDS),
 #: 第 11 个之后的词永远拿不到 is_real_brand —— 那是 unjudged 的第三种成因。
 _L3_BRAND_CAP_NOTE = "L3 未给该词判定(多半在前 10 词截断之外)"
 
+#: 品牌文案扫描的 rule_code。2026-09-03 C 批**判定从 L2 R4 迁到 L0**
+#: (`title_desc_blacklist` → `phase0_brand_mention`),TRO 这条链吃的就是它的
+#: 命中词 —— 迁层时忘了改这里的后果不报错:TRO 命中从此恒空,而摘要照样漂亮。
+_BRAND_MENTION_CODE = "phase0_brand_mention"
 
-def _r4_brands(outcome: AuditOutcome) -> set:
-    """输入:判定结果 → 输出:L2 R4 命中的黑名单词集合(r4 键形,天然 strip+lower)。
 
-    R4 的 `detail.matches[].brand` 装的就是自动机的键(audit_l2
-    `_rule_title_desc_blacklist`:命中值即键),与 ctx.r4_source 同型;
+def _mentioned_brands(outcome: AuditOutcome) -> set:
+    """输入:判定结果 → 输出:文案扫描命中的黑名单词集合(键形,天然 strip+lower)。
+
+    `detail.matches[].brand` 装的就是自动机的键(audit_phase0
+    `_scan_brand_mentions`:命中值即键),与 ctx.r4_source 同型;
     这里仍再 strip+lower 一道,免得哪天 detail 形状变了静默漏。
+    **按 rule_code 认、不按层认**(读 `all_hits`):软证据现在住在
+    `phase0.evidence` 里,写死"从 outcome.l2 取"就是把这条链焊在旧位置上。
     """
     out: set = set()
-    l2 = outcome.l2
-    for h in (l2.hits if l2 is not None else ()):
-        if h.rule_code != "title_desc_blacklist":
+    for h in outcome.all_hits:
+        if h.rule_code != _BRAND_MENTION_CODE:
             continue
         for m in (h.detail or {}).get("matches") or ():
             b = str((m or {}).get("brand") or "").strip().lower()
@@ -242,17 +309,18 @@ def _r4_brands(outcome: AuditOutcome) -> set:
 
 
 def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
-    """输入:判定结果 + R4 键→来源原文 + TRO 来源前缀 → 输出:
+    """输入:判定结果 + 品牌键→来源原文 + TRO 来源前缀 → 输出:
     `{confirmed, unjudged, sources, reason}`(四步口径,顺序不能反)。
 
-    ① **A = L2 R4 命中词**(黑名单自动机认出来的词,已过词边界与自品牌豁免);
+    ① **A = 品牌文案扫描命中词**(黑名单自动机认出来的词,已过词边界与自品牌
+       豁免;2026-09-03 C 批前这条规则在 L2 叫 R4,现在是 L0 的软证据);
     ② **B = A ∩ TRO 来源词** —— 黑名单里两万余个 TRO 品牌只是名单,命中了才
        算事;B 空则整件事到此为止(绝大多数产品走的就是这条);
     ③ **C = L3 判 `is_real_brand is True` 的词**,strip+lower 归一后
-       **必须与 A 取交集**:L3 回传的 brand 是 LLM 复述的字符串,而且那份
-       verdict 里混着 R5(USPTO 商标)的词 —— 不取交集就会把 R5 的词当成
-       R4 的 TRO 命中报上去。严格 `is True`(与 audit_l3 强制翻拒同一口径,
-       字符串 "true" 不算);
+       **必须与 A 取交集**:L3 回传的 brand 是 LLM 复述的字符串,与命中集
+       未必一一对应(历史上那份 verdict 里还混着已删的 R5 商标词)——
+       不取交集就会把别处的词当成 TRO 命中报上去。严格 `is True`
+       (与 audit_l3 强制翻拒同一口径,字符串 "true" 不算);
     ④ confirmed = B∩C(真品牌,可展开波及);unjudged = B **减去拿到过判定的
        词**(不是 B-C):被 L3 明确判 `is_real_brand=false` 的是通用英文词,
        那是"判过了、不是品牌",既不报也不展开;剩下的三种情形才叫拿不到判定 ——
@@ -260,12 +328,14 @@ def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
        (LLM 故障,verdict 列表是空的)/ 命中词落在 L3 前 10 词截断之外。
        三种分不清时统一算 unjudged,把当轮能确定的那句写进 `reason`。
 
-    ⚠ `blacklist_brand_verdict` 读的是 **L3Result 的属性**,不是 reject hit 的
-    detail:L3 判 pass 时 hits 是空的,而 verdict 列表照样在属性上(见
-    services/audit_l3._coerce → L3Result(blacklist_brand_verdict=...))——
+    ⚠ `brand_verdicts` 读的是 **L3Result 的属性**,不是 reject hit 的 detail:
+    L3 判 pass 时 hits 是空的,而品牌判定列表照样在属性上(见
+    services/audit_l3.parse_l3_reply → L3Result(brand_verdicts=...))——
     "L3 看过这个词、认为它不是真品牌"恰恰是 pass 那一路才有的信息。
+    (2026-09-02 B1 字段随输出三段化改名 `blacklist_brand_verdict` → `brand_verdicts`,
+    口径一字未变。)
     """
-    a = _r4_brands(outcome)
+    a = _mentioned_brands(outcome)
     if not a:
         return {"confirmed": [], "unjudged": [], "sources": {}, "reason": None}
     b = {k for k in a
@@ -276,7 +346,7 @@ def tro_hits(outcome: AuditOutcome, r4_source: dict, tro_prefix: str) -> dict:
     l3 = outcome.l3
     judged: set = set()          # L3 给过判定的词(真伪都算"判过")
     real: set = set()            # 其中 is_real_brand is True 的
-    for v in (getattr(l3, "blacklist_brand_verdict", None) or ()):
+    for v in (getattr(l3, "brand_verdicts", None) or ()):
         if not isinstance(v, dict):
             continue
         brand = str(v.get("brand") or "").strip().lower()

@@ -228,13 +228,14 @@ def build_l4_user_prompt(product, l1, l3=None) -> str:
 
     逐字迁自旧仓 l4_vision.py:172-200:bullets 取**前 3 条**、每条前缀两空格 +
     "- ",空时整块 `  (无)`;标题截 200 字符;brand/类目空 → `(空)`,PT 空 →
-    `(unknown)`;L3 提示块仅当 reason_text 非空时出现且截 150 字符。
+    `(unknown)`;L3 提示块仅当 L3 的「具体内容」非空时出现且截 150 字符
+    (2026-09-02 B1:字段 `reason_text` 随三段化改名 `detail`,语义不变)。
     `{img_count}` 是字面占位符,由 judge_l4 用**下载成功数**替换(不是候选数)。
     """
     bullets_txt = "\n".join(f"  - {b}" for b in product.bullet_points[:3]) or "  (无)"
     l3_hint = ""
-    if l3 and l3.reason_text:
-        l3_hint = f"\n# L3 文本审已标注\nL3 reason: {l3.reason_text[:150]}"
+    if l3 and l3.detail:
+        l3_hint = f"\n# L3 文本审已标注\nL3 reason: {l3.detail[:150]}"
 
     return f"""# 产品上下文 (辅助判图)
 

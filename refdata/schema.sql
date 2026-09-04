@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
     audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
+    audit_reason    text,        -- **类别**(官方政策名 / 内部黑名单 / 类目准入)
+    audit_detail    text,        -- **具体内容**(原文片段 + 条款要点 / 规则人话)
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
     --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
@@ -204,6 +205,17 @@ CREATE INDEX IF NOT EXISTS products_browse_node_idx
 -- 存量无从区分的一律留 NULL,由下一轮审核按新口径补写(NULL 视同推断,
 -- 保守:不把来历不明的 PT 当实证喂给挖掘)。
 ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
+
+-- 审核三段输出分列(2026-09-02 第三步 B1 批,docs/audit_step3_spec.md §3.4):
+-- 判定结果 audit_status / **类别** audit_reason / **具体内容** audit_detail。
+-- 此前两样东西挤在 audit_reason 一列里(拒绝时是政策名、待定时是一句中文),
+-- 于是"按类别统计被拒原因"这件事永远做不了,飞书上架表也只能塞一格人话。
+-- audit_reason 从此只装类别枚举(官方政策名 / 内部黑名单 / 类目准入),
+-- pass 与 pending 一律 NULL;audit_detail 装那一句具体内容(L3 给的原文片段
+-- + 条款要点,或规则命中翻成的人话,或待定原因)。
+-- ⚠ 存量行不迁移:老行的 audit_reason 里还混着中文句子/旧政策名,被重审前
+--   原样留着(飞书投影按"有 audit_detail 用新格式,没有就用老格式"渲染)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS audit_detail text;
 
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
@@ -397,7 +409,9 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
     asin        text PRIMARY KEY,
     category    text NOT NULL,       -- 入选时的类别码(B/C/E/F/G/K)
     source      text NOT NULL,       -- 「沃尔玛-<类名>」,与飞书来源列同款
-    reason      text,                -- 命中原因样本(截 200)
+    reason      text,                -- 命中原因**全文**(2026-09-04 起不截;
+                                     -- 原来截 200 而判据串常在句尾,
+                                     -- 见 services/blacklist 头注)
     src_store   text,                -- 溯源:在哪个店铺撞的
     biz_cn      boolean NOT NULL DEFAULT false,  -- BIZ-CN 独立维度(中国卖家
                                      -- 专属禁售,legacy_survey:2077 要求单列)
@@ -407,6 +421,30 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
 -- 2026-08-11:asin 列改存清洗后的标准码(sku_normalize + rebuild_asin 重建),
 -- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
 ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+-- 新码回填四列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **`category` 2026-09-04 起统一到新码**(所有者裁决:「旧 A-L 码入选然后按
+--   新码复核过,那么现在库里保留的应该就只有新码,没有旧码残留……不要做双轨,
+--   没有意义,以新规则统一」)。`error_reclass` 复核出结论就同步改写它。
+--   两条不动:`LEGACY`(历史继承,保留原样)与判不出的(code 为 NULL)。
+--   ⚠ **拦截行为一个字没变**:上架闸拦的是「这个 asin 在不在表里」,`category`
+--   只进提示文字;飞书「来源」列也不变(source_label 经 _NAMES 映射回旧中文标签)。
+-- taxonomy_src 记原文是从哪儿找到的,四级优先(全文优先于样本):
+--   'records'=audit.walmart_error_records.raw_reason(全文,最新一条)
+--   'events' =catalog.product_events.detail->>'reasons'(病历,最新一条)
+--   'items'  =catalog.walmart_items.unpublished_reasons(当前值,按 src_sku 对)
+--   'self'   =本表 reason 列(**截 200 字符的样本**,判据串可能被切掉)
+--   'none'   =四处都没有 ⇒ taxonomy_code 留 NULL,不猜
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_version text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_src text;
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxcode_idx ON catalog.asin_blacklist(taxonomy_code);
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxver_idx  ON catalog.asin_blacklist(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
@@ -1674,6 +1712,22 @@ CREATE INDEX IF NOT EXISTS idx_werror_pt     ON audit.walmart_error_records(walm
 CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(report_date);
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
+-- 新码回填三列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **老列 error_code(char(1))原样保留**:它是旧 A-L 码,是拉黑那批行的历史
+--   依据,删了就没法对照"当初按什么拉的黑"。新旧同列并存,查询按需要挑。
+-- taxonomy_version 是**增量谓词**(同 audit_runs.audit_version 的套路):
+--   码表一改就递增 ERROR_TAXONOMY_VERSION,`IS DISTINCT FROM 当前版本` 天然分页,
+--   跑一半中断直接重跑,已盖章的自动退出候选集。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_version text;
+CREATE INDEX IF NOT EXISTS idx_werror_taxcode ON audit.walmart_error_records(taxonomy_code);
+CREATE INDEX IF NOT EXISTS idx_werror_taxver  ON audit.walmart_error_records(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 -- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
 -- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
@@ -1891,6 +1945,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_asin    ON audit.audit_runs(asin);
 CREATE INDEX IF NOT EXISTS idx_audit_verdict ON audit.audit_runs(verdict);
 CREATE INDEX IF NOT EXISTS idx_audit_stage   ON audit.audit_runs(stage_stopped_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit.audit_runs(created_at);
+-- 判据版本(2026-09-02 B2 补列):这一行是哪一版规则判的。
+-- 存在的理由是**回放评估分不清新旧链**:这张表原本没有任何版本痕迹,
+-- `product_audit -p mode=stale` 一跑,每个 asin 的"最近一次 run"就变成新链
+-- 自己的结论,再拿它当"旧链基线"就是自己跟自己比,而且数字看着完全正常。
+-- 存量 204 万行为 NULL = 旧链;`workflows/audit_replay` 取基线的谓词是
+-- `audit_version IS DISTINCT FROM <当前 AUDIT_RULES_VERSION>`(NULL 也算旧)。
+-- 写入方唯一出处 services/audit_store._RUN_SQL。
+ALTER TABLE audit.audit_runs ADD COLUMN IF NOT EXISTS audit_version text;
 
 -- 逐条规则命中明细(理由码账本)
 CREATE TABLE IF NOT EXISTS audit.audit_hits (
@@ -1905,3 +1967,28 @@ CREATE TABLE IF NOT EXISTS audit.audit_hits (
 CREATE INDEX IF NOT EXISTS idx_hits_run   ON audit.audit_hits(run_id);
 CREATE INDEX IF NOT EXISTS idx_hits_rule  ON audit.audit_hits(rule_code);
 CREATE INDEX IF NOT EXISTS idx_hits_stage ON audit.audit_hits(stage);
+
+-- 回放评估结果(2026-09-02 第三步 B2,规格 docs/audit_step3_spec.md §3.8)。
+-- `workflows/audit_replay` 拿沃尔玛已裁决的下架品(反例)与在架在售品(正例)
+-- 重跑**当前生产链**(services.audit_rules.audit_one),与沃尔玛裁决、旧链
+-- 最近一次 audit_runs 三方对照。**这张表是回放工作流唯一写的表** ——
+-- 结论权威仍在 catalog.products / audit_runs,回放一个字都不碰它们。
+-- 一次回放 = 一个 run_tag(缺省 <日期>-<AUDIT_RULES_VERSION>);同 tag 重跑
+-- 按 (run_tag, asin) 覆盖,便于"改完提示词再回放一次"对同一批样本比。
+-- expected_category 为 NULL = 只比判定不比类别(BRAND / PROHIBITED_FINAL:
+-- 沃尔玛没给出可对表的政策名);内容族两名互认见 registry.AUDIT_CONTENT_POLICIES。
+CREATE TABLE IF NOT EXISTS audit.replay_results (
+    run_tag           text NOT NULL,   -- 一次回放的标签(同 tag 重跑覆盖)
+    asin              text NOT NULL,
+    expected_verdict  text,            -- 沃尔玛裁决推出的期望:reject / pass
+    expected_category text,            -- 期望类别(政策表原拼写);NULL=只比判定
+    got_verdict       text,            -- 本次新链判定:pass / reject / pending
+    got_category      text,            -- 本次类别(audit_reason.compute_final_reason)
+    got_detail        text,            -- 本次具体内容(audit_store.conclusion_detail)
+    stage_stopped_at  text,            -- 停在哪一层(L0/L1/L2/L3)
+    old_verdict       text,            -- 旧链最近一次 audit_runs 的判定(历史,不重跑)
+    old_category      text,            -- 同上的 l3_reason_category(只有 L3 判过的行才有)
+    confidence        text,            -- L3 自报置信 high/medium/low(没走 L3 为 NULL)
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_tag, asin)
+);

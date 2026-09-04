@@ -820,7 +820,8 @@ def test_heal_unknown_three_paths(monkeypatch):
     assert w["M2:S2"][2] == "2026-08-10"          # 原上架日期不被覆盖
     assert w["M3:S3"][0] == "No" and w["M3:S3"][4] == "FAILED"
     assert "ERR_X | 字段坏了" in w["M3:S3"][5]     # 报错列码+人话
-    assert w["M4:P4"][0] == "Yes"                 # 目录在线只写提交结果四列
+    # 目录在线只写提交结果四列(是否上架~未上架理由),不碰回执三列
+    assert w["M4:P4"][0] == "Yes"
     assert "M5:S5" not in w and "M5:P5" not in w  # 无依据绝不负向写
     assert "M6:S6" not in w and "M6:P6" not in w  # 非 Unknown 不碰
     assert used == [("0011", a2)] and released == ["0022"]

@@ -871,7 +871,12 @@ def test_only_cleaner_workflows_call_resolve_pairs():
     违反了会这样静默出事:它比 resolve_many 多一跳查 walmart_items 的倒查,
     在实时链路上逐行调等于每行两条 SQL —— 功能对、账单和延迟悄悄翻倍。
     """
-    allowed = {"workflows/sku_normalize.py", "workflows/order_asin_normalize.py"}
+    # ⚠ `audit_replay` 是第三个(2026-09-04):它是**离线评估件**,三处调用
+    #   各是一次批量反查(不是逐行),而且它继承的老入口 `resolve_skus` 本来
+    #   就带纯数字 item id 那一跳 —— 换成 resolve_many 会静默丢掉那条腿。
+    #   本名单挡的是"实时链路里逐行调",不是"批量用一次"。
+    allowed = {"workflows/sku_normalize.py", "workflows/order_asin_normalize.py",
+               "workflows/audit_replay.py"}
     offenders = [rel for rel, path in _prod_files()
                  if rel.startswith("workflows/") and rel not in allowed
                  and "resolve_pairs" in _body(path)]
@@ -1006,8 +1011,12 @@ _HEADERS = ["店铺", "ASIN", "SKU", "walmart上架标题", "walmart_product_typ
             "walmart价格", "是否上架", "上架feedid", "上架日期", "未上架理由",
             "上架结果", "报错", "feed查询日期", "登记日期", "查询编码"]
 
-#: 程序永不写的三列:「类别」归另一条 PR,「登记日期」「查询编码」人工填。
-_NEVER_WRITTEN = ("audit_category", "registered_date", "query_code")
+#: 程序永不写的两列:「登记日期」「查询编码」由人工填。
+#: ⚠ 「类别」(`audit_category`)2026-09-04 起**移出本名单** —— 审核链第三步
+#: (PR #109)合入后它由 `product_audit` 与 标题/PT/审核结果/具体内容/审核日期
+#: 同一次写出(`write_audit_cols` 六值)。批次 1 落地时它还归"另一条 PR",
+#: 那句注释是当时的事实,不是永久口径。
+_NEVER_WRITTEN = ("register_date", "query_code")
 
 
 def _wire_header(monkeypatch, header_row):
@@ -1045,7 +1054,7 @@ def _all_writes(monkeypatch) -> list[tuple[str, list]]:
                                "A0X1Y2Z3W4V5"])])
     ls.write_sku_col([(4, "A0X1Y2Z3W4V5")])
     ls.write_data_cols([(5, ["标题", "9.9", 3, "19.9"])])
-    ls.write_audit_cols([(6, ["标题", "Cups", "pass", "", "2026-09-02"])])
+    ls.write_audit_cols([(6, ["标题", "Cups", "pass", "", "", "2026-09-02"])])
     ls.write_audit_notes([(7, "未采集")])
     ls.write_reasons([(8, "价格不合适")])
     ls.clear_for_relist([9])

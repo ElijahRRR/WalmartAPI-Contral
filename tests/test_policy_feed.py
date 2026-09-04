@@ -247,3 +247,26 @@ def test_module_has_no_third_party_imports():
     src = pathlib.Path(pf.__file__).read_text(encoding="utf-8")
     imports = set(re.findall(r"^(?:import|from)\s+([a-zA-Z_][\w.]*)", src, re.M))
     assert imports <= {"re"}, imports
+
+
+
+# ── 内容族两页(43/44,2026-09-02 A 批)带来的两条新形态 ───────────────────
+
+def test_images_are_dropped_entirely():
+    """`![alt](url)` 整个删:alt 只是文件名,留下就是一行噪声(44 号页示意图)。"""
+    line = "The table below lists requirements. ![2505_product-detail-page-Color.svg](https://x/y.svg) tail"
+    assert pf._strip_links(line) == "The table below lists requirements.  tail"
+    out = _feed("44-product-details-policy.md")
+    assert ".svg" not in out and "https://" not in out
+    assert "Making any promotional claims" in out          # 表格判据一条不少
+
+
+def test_trailing_empty_table_row_does_not_block_the_list_transform():
+    """44 号页「Product title」表末尾有一整行空单元格:不算数据行,表照样转清单。"""
+    out = _feed("44-product-details-policy.md")
+    assert "Writing brief titles not exceeding 150 characters." in out
+    assert "|  |  |" not in out
+    assert "| **Allowed** | **Prohibited** |" not in out   # 四张表全转成了清单
+    lines = out.splitlines()
+    i = lines.index("Prohibited:", lines.index("### Product title"))
+    assert lines[i + 1].startswith("Writing in all caps")

@@ -7,7 +7,7 @@
 >    上架feedid / 上架日期 / 未上架理由 / 上架结果 / 报错 / feed查询日期 / **登记日期** / **查询编码**。
 >    对应元组:store, asin, **sku**, list_title, product_type, audit_result, **audit_category**,
 >    **audit_reason**, audit_date, amz_price, stock, walmart_price, listed, feed_id, list_date,
->    not_listed_reason, list_result, list_fail_reason, feed_check_date, **registered_date**,
+>    not_listed_reason, list_result, list_fail_reason, feed_check_date, **register_date**,
 >    **query_code**(旧尾部 real_title / real_pt / real_upc / upc_match 四列已被所有者删除)。
 >    与旧布局的差异:① SKU 插在 C ⇒ 旧 C~E 右移一列(标题 D、PT E、审核结果 F);② 旧 F「理由」
 >    拆成 G「类别」+ H「具体内容」⇒ 旧 G 之后全部右移两列(审核日期 I、amz价格 J、库存 K、

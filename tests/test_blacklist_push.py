@@ -4,6 +4,7 @@
 水位每块落(崩了重推不丢行)。
 """
 
+from collections import Counter
 from datetime import date
 
 import pytest
@@ -147,16 +148,17 @@ def test_brand_projection_reads_channel_table_only():
 
 # ── 历史回填 ──────────────────────────────────────────────────────────────────
 
-def test_backfill_case_labels_match_source_label():
-    """回填 SQL 的 CASE 标签必须与 source_label 逐码一致——两处各写一份
-    迟早漂,漂了 = 同一类别历史行和实时行在飞书来源列长得不一样。"""
+def test_回填的来源标签只有一处出生():
+    """来源标签由 `source_label()` 一处产出(原来回填 SQL 里另写了一份 CASE)。
+    两处各写一份迟早漂,漂了 = 同一类别的历史行和实时行在飞书来源列长得不一样。"""
+    import inspect
     from services import blacklist as bl
-    for code in sorted(bl.PERMANENT):
-        assert f"WHEN '{code}' THEN '{bl.source_label(code)[len('沃尔玛-'):]}'"             in bl._BACKFILL_ASIN_SQL, code
+    assert "source_label(code)" in inspect.getsource(bl._judge_events)
+    assert not hasattr(bl, "_label_case")      # 那份 CASE 已随过渡桥删掉
 
 
 def test_backfill_selects_latest_category_only():
-    """入选按**最新**类别(DISTINCT ON + occurred_at DESC)——历史里类别
+    """入选按**最新**事件(DISTINCT ON + occurred_at DESC)——历史里类别
     翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。身份 =
     coalesce(登记簿 source_key, asin, sku):登记簿是切码后的唯一通路,其次是
     record_many 清洗出的标准码,再不行才用订货号原文(2026-08-11 实证 sku≠asin,
@@ -164,22 +166,40 @@ def test_backfill_selects_latest_category_only():
     from services import blacklist as bl
     assert "DISTINCT ON (ident) ident AS asin" in bl._LATEST_CTE
     assert "ORDER BY ident, occurred_at DESC" in bl._LATEST_CTE
-    assert "ON CONFLICT (asin) DO NOTHING" in bl._BACKFILL_ASIN_SQL
+    assert "ON CONFLICT (asin) DO NOTHING" in bl._INSERT_ASIN_SQL
+    # ⚠ 身份表达式只有**一处出生**(_EV_CTE),两条链共用:品牌渠道那条
+    #   (_LATEST_CTE)与黑名单入选那条(_HISTORY_SQL)。谁另抄一份就会漂。
+    assert "coalesce(ls.source_key, e.asin, e.sku) AS ident" in bl._EV_CTE
+    for sql in (bl._LATEST_CTE, bl._HISTORY_SQL, bl._BACKFILL_COUNT_SQL):
+        assert sql.startswith(bl._EV_CTE), sql[:60]
+    # ⚠ 黑名单入选按 ident 分组,**不许**退回裸 coalesce(asin, sku):
+    #   切码后 sku 是我们自己生成的码,拿它分组 = 同一产品历史被拆散。
+    assert "SELECT ident AS asin" in bl._HISTORY_SQL
+    assert "coalesce(asin, sku)" not in bl._HISTORY_SQL
 
 
 def test_backfill_preview_is_byte_identical_when_no_opaque_keys(wired, monkeypatch):
-    """opaque=0 时预览文案里不许出现 ⚠ —— 这一档是**新加的只读告警**,
-    生产库今天不该有不透明码,摘要必须与加它之前逐字相同。"""
-    monkeypatch.setattr(wf.blacklist, "backfill_counts",
-                        lambda conn: {"total": 20, "permanent": 10,
-                                      "brand_cand": 3, "opaque": 0})
-    out = wf.run({"backfill": "1"})
-    assert "⚠" not in out and "永久禁止 10 个" in out
+    """opaque=0 时预览文案里不许出现这一档 —— 它是**新加的只读告警**,
+    生产库今天不该有不透明码,摘要必须与加它之前逐字相同。
 
-    monkeypatch.setattr(wf.blacklist, "backfill_counts",
-                        lambda conn: {"total": 20, "permanent": 10,
-                                      "brand_cand": 3, "opaque": 7})
-    assert "⚠ 其中 7 个键形如不透明码" in wf.run({"backfill": "1"})
+    ⚠ 不能写成「文案里没有 ⚠」:换轨后的预览本身就带好几处 ⚠(产品级判定 ≠
+    行级记录那两条)。逐字相同用**减法**钉:opaque≠0 的文案去掉这一档,
+    应当还原成 opaque=0 的文案。
+    """
+    def _counts(opaque):
+        return lambda conn: {"total": 20, "permanent": 10, "brand_cand": 3,
+                             "in_table": 4, "fresh": 6,
+                             "fresh_codes": Counter({"POLICY": 6}),
+                             "opaque": opaque}
+
+    monkeypatch.setattr(wf.blacklist, "backfill_counts", _counts(0))
+    base = wf.run({"backfill": "1"})
+    assert "不透明码" not in base and "该永久拉黑 10 个" in base
+
+    monkeypatch.setattr(wf.blacklist, "backfill_counts", _counts(7))
+    out = wf.run({"backfill": "1"})
+    assert "⚠ 其中 7 个键形如不透明码" in out
+    assert out.replace(wf._opaque_note({"opaque": 7}), "") == base
 
 
 def test_rebuild_asin_apply_overwrites_and_marks_all(wired, monkeypatch):
@@ -214,17 +234,41 @@ def test_rebuild_asin_preview_does_not_write(wired, monkeypatch):
 
 
 def test_backfill_preview_does_not_write(wired, monkeypatch):
-    from services import blacklist as bl
+    """⚠ 预览的「够格永久拉黑 N 个」必须与真写**同一条判据**(都走
+    `_judge_events`)。两处各算各的 = 预览说 3 万、真写写 7 万,而两边看着都正常。
+
+    同时钉住所有者 2026-09-04 定的判据:**一个 asin 的多条历史报错里,
+    够格拉黑的那条最高优先级**,不是取最新。
+    """
     wrote = []
 
     class _Cur:
+        def __init__(self): self._q = ""
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, args=None):
+            self._q = sql
             if "INSERT" in sql:
                 wrote.append(sql)
-        def fetchone(self): return (10, 3, 20, 0)   # 末位 = opaque 告警计数
-        def fetchall(self): return []
+        def executemany(self, sql, rows):
+            wrote.append(sql)
+        # (brand_cand, total, opaque);末位 = D-0b-1 那档不透明码键告警计数
+        def fetchone(self): return (3, 20, 0)
+        def fetchall(self):
+            if "FROM catalog.asin_blacklist" in self._q:
+                return [("B0DDD",)]                 # 已在表里 ⇒ 不算新增
+            assert "GROUP BY 1" in self._q, self._q[:80]   # 产品事件那条
+            # (asin, [[code, term], …], sku, store, reason, latest)
+            return [
+                # ⚠ B0AAA 的**最新**事件是「过期」,而历史上有一条真禁售 ——
+                #    旧口径(取最新)会漏掉它,新口径必须拉黑。
+                ("B0AAA", [["EXPIRED", None], ["POLICY", None]],
+                 "SKU-A", "s1", "prohibited product policy", None),
+                ("B0CCC", [["IP", None]], "SKU-C", "s1", "IP complaint", None),
+                # 全部不够格 ⇒ 不拉黑(其余报错只作记录)
+                ("B0BBB", [["PT_WRONG", None]], "SKU-B", "s1", "pt wrong", None),
+                ("B0DDD", [["POLICY", None]], "SKU-D", "s1", "policy", None),
+            ]
 
     class _Conn:
         def __enter__(self): return self
@@ -232,7 +276,14 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def cursor(self): return _Cur()
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
-    assert "永久禁止 10 个" in out and "apply=1" in out
+    # B0AAA(历史里那条禁售)+ B0CCC + B0DDD = 3;B0BBB 的 PT_WRONG 判出去
+    assert "该永久拉黑 3 个" in out
+    # B0DDD 已在表里 ⇒ 真跑只新增 2 条
+    assert "真跑只会新增 2 条" in out and "回填只加不减" in out
+    assert "apply=1" in out
+    # ⚠ 摘要必须点明「产品级判定 ≠ 行级记录」,以及 blacklist_route 判据没跟上
+    assert "产品级判定" in out and "行级记录" in out
+    assert "blacklist_route" in out and "判据没跟上" in out
     assert wrote == []
 
 
@@ -444,3 +495,30 @@ def test_shrink_is_isolated_per_table(monkeypatch):
     assert len(seen) == 2                      # 第一张停手,第二张照写
     assert lines[0].startswith("⛔")
     assert "整表重写 7 行" in lines[1]
+
+
+def test_reason_存全文_不许再截200():
+    """⚠ 所有者 2026-09-04 问「为什么要截断字符样本?」—— 考古结论是**没有理由**:
+    全仓找不到任何依据,最合理的解释是这一列当初只用来「人看一眼知道为什么被
+    拉黑」,对显示来说 200 字符够,那时它不是判据。
+
+    换轨后它成了 `error_reclass` 四级优先里**最大的一档**证据源(36,868 条),
+    而沃尔玛的判据串恰好在**句尾**(「…To republish this item please make sure
+    you have the appropriate product type selected.」)—— 200 字符精确砍掉它,
+    于是那批品被判成永久拉黑,真相是 PT_WRONG。**40,827 是低估的。**
+
+    不截的依据:列是 `text` 无限制;飞书那侧自己有 20,000/40,000 两道闸
+    (官方上限 50,000),跟 200 差两个数量级。**截断属于展示层,不属于存储层。**
+    """
+    import inspect
+    from services import blacklist as bl, cleanup_history
+    # 只查**写入侧**的函数体(模块头注里会引用 `[:200]` 讲这段考古,那是文档)
+    for fn in (bl.record_asins, bl._judge_events, cleanup_history.timeline):
+        src = inspect.getsource(fn)
+        assert "[:200]" not in src, fn.__name__
+        assert "left(reason, 200)" not in src, fn.__name__
+    # 头注要留着考古结论,不然下一个人又会"顺手截一下"
+    assert "截断属于展示层,不属于存储层" in inspect.getsource(bl)
+    # 展示侧那道闸还在(它才是该管长度的地方)
+    from api import feishu
+    assert feishu._SHEET_CELL_MAX_CHARS >= 20000

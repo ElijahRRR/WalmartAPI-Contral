@@ -27,6 +27,12 @@ description: 沃尔玛官方禁售政策全量刷新流程:总览页核对 → �
    Weapons 嵌套子项摊平收录。
 2. 与 `refdata/policy_pages/en/` 现有清单 diff:新增/消失/改名类别、各页 Last Updated 变化。
 3. 全部无变化 → 到此为止;有变化 → 只对变化页走第 1-4 步(全量重跑仅在所有者要求时)。
+4. **内容族第二来源**(不在禁售总览页上,2026-09-02 起收录,同样进 diff):
+   `guides/Item setup/Item content, imagery, and media/Content-standards:-Overview`(登录墙,
+   所有者粘贴)与 `…/Product-Detail-Page:-overview`(公开)。它们是「violates Walmart's
+   content policy」/「unverified authenticity claims」两类下架原因所指页面。Overview 页链接的
+   21 个分类风格指南(每页再按产品类型挂 View Content Standards 深链)**不收**(所有者定稿
+   2026-09-02:体量与层级不适合喂 LLM,是写内容的规范不是判违规的判据)。
 
 ## 第 1 步 · 逐页转录(workflow 派子代理,每代理 ≤3 页)
 
@@ -38,6 +44,13 @@ description: 沃尔玛官方禁售政策全量刷新流程:总览页核对 → �
 - 结构镜像:标题层级、列表条数与嵌套、表格行列、单元格内 `<br>`/`&nbsp;` 原样;
 - 只收正文:chrome(Reading time / Bookmark / Tell us what you think / Related guides / 导航页脚)不收;
 - 每文件头部固定四行:`# 类别名` / `> 来源: URL` / `> 官方 Last Updated: …` / `> 抓取(UTC): 日期`;
+- **抓取方法**(2026-09-02 实证):页面是 SSR 的 SPA,正文在最大的一段 `<script>` JSON 里 ——
+  `pageData.data.all_copy_of_article_tutorial.items[0]`,字段 `title` / `overview.json` /
+  `body_new[]`(`body` 与 `notes` 交替)/ `table_of_contents.json` / `frequently_asked_questions_new[]`
+  / `reading_time_and_date.publishing_date`,富文本是节点树(p/h2/h3/ul/li/table/a/reference),
+  逐节点渲染比抓 HTML 稳;登录门禁页的特征是 `pageDataErrorCode=204` 且 `pageData` 为空;
+- **所有者粘贴件的两个盲区**:页面 H1 不在粘贴里(按 URL 路径段写,头注注明待核);FAQ 是折叠
+  面板,整页复制带不出来 —— 请所有者逐条展开后另贴;
 - **拿不到正文不编造不占位**(登录门禁页,如 General-Use Products):记录证据链
   (无 UA / 带 UA 逐字节对比、WebFetch 对照、同域兄弟页对照、URL 从总览页反查),
   请所有者在已登录卖家会话复制正文,按同一纪律补录并在头注写明"所有者粘贴"来源。
@@ -73,7 +86,7 @@ python cli.py policy_sync --dry-run     # 先跑这个,报告落 <DATA_ROOT>/rep
 python cli.py policy_sync               # 人眼确认后才跑真的(缺省即真跑)
 ```
 
-- `refdata/policy_pages/en/*.md` → `audit.walmart_prohibited_policy`,
+- `refdata/policy_pages/en/*.md`(44 份 = 42 禁售 + 2 内容族)→ `audit.walmart_prohibited_policy`,
   upsert 口径见 `docs/policy_sync.md` §二/§十.7:**表内名一律改为官方拼写**(官方政策类别名是
   全链唯一键)、人工中文列一律不碰、缺席页不刷新、官方已不含的行不删只报告;
 - **首跑 dry-run 必须人眼核对两处**(报告打了标记,但没人看 = 白打):

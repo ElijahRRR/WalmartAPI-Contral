@@ -16,12 +16,12 @@
 services/listing_sheet.layout,列顺序随所有者调整,代码不跟着改):领任务条件
 审核结果=pass 且 是否上架 空/No 且 无 feedid;是否上架∈{Yes,Unknown} 跳过(Unknown 也算
 已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
-O=FAILED 走重试通道(≤3 次);O=SKU_LOCKED 本工作流不碰——由
+上架结果=FAILED 走重试通道(≤3 次);上架结果=SKU_LOCKED 本工作流不碰——由
 sku_locked_heal 自愈链处理(RETIRE→24h 冷却→清列,行变新行后回到
 本链领**新 UPC** 重上)。旧实证:SKU 已绑死旧 UPC,不先退役直接换
 UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
-闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
+闸门链(顺序即执行序,每道命中写「未上架理由」列或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
   ② 日配额**在全部过滤之后切**(所有者批复 2026-08-12:配额以成功提交为准,
     淘汰放切片前——先切片再过滤会让被淘汰行白占名额,淘汰率 40% 时实际
@@ -75,15 +75,16 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)。
 
 提交结局(旧三态生死语义,UPC 回收仅三类):
-  submitted → K=Yes L=feedid M=日期,UPC 标已用,事件 list_submitted
-              (登记簿在预备期抽码时就已登记,不在这里补);SKU 列与 K/L/M 同
-              一次写回;O/P/Q 由 feed_poll 反哺器按回执四集合回填
-  failed(4xx 拒)→ N=提交被拒,UPC 回收(rejected)
-  unknown → K=Unknown(不重复提交),UPC **不回收**
-  内容标准拒(回执 O=CONTENT_REJECTED)不入 FAILED 通道,**也不自动重试**
+  submitted → 是否上架=Yes 上架feedid=feedid 上架日期=当天,UPC 标已用,
+              事件 list_submitted(登记簿在预备期抽码时就已登记,不在这里
+              补);SKU 列与这三列同一次写回;上架结果/报错/feed查询日期
+              由 feed_poll 反哺器按回执四集合回填
+  failed(4xx 拒)→ 未上架理由=提交被拒,UPC 回收(rejected)
+  unknown → 是否上架=Unknown(不重复提交),UPC **不回收**
+  内容标准拒(回执写 上架结果=CONTENT_REJECTED)不入 FAILED 通道,**也不自动重试**
   (所有者定稿 2026-08-23 撤除捞回通道):文案图片取自亚马逊原文,原样重发
-  必然同拒,还会触发/延长 QARTH 合规审查。这类行停在 O 列等人 —— 人工改好
-  文案、清掉 O 列即可重回普通通道(与 PROHIBITED 的"永不"语义有别)。
+  必然同拒,还会触发/延长 QARTH 合规审查。这类行停在「上架结果」列等人 ——
+  人工改好文案、清掉该列即可重回普通通道(与 PROHIBITED 的"永不"语义有别)。
   ⚠ 撤除的只是**自动重上**;`WALMART_ERR_CONTENT` 的归类照旧留着,否则它会
   掉进 FAILED 通道被重试三次,纯烧 UPC 与配额
 """
@@ -399,7 +400,7 @@ def _with_pt(row: dict, verdicts: dict) -> dict:
     """输入:上架表一行 + 审核字典 → 输出:类目以库为准的同一行。
 
     「以数据库的数据为准」是同一条口径的两半:结论读库,**类目也读库**。
-    只读结论不读类目的话,表 D 列被手改成另一个 PT,上架会按手改的那个走
+    只读结论不读类目的话,表 E 列被手改成另一个 PT,上架会按手改的那个走
     ——而审核是按库里那个 PT 过的,等于绕过审核换了类目。
     库里没有 PT(老数据/未审)才退回表里的值。
     """
@@ -1416,7 +1417,8 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 continue
             bl = st.banned.get(r["asin"])
             if bl:
-                # 黑名单是永久产品级禁止(PERMANENT 六类),命中即拦。
+                # 黑名单是永久产品级禁止,**命中即拦**(拦的判据是
+                # 「这个 asin 在表里」,不看 category —— 那一列只进提示文字)。
                 # 这就是防呆的全部:按拉黑类别拦,不按删除史拦(所有者口径
                 # 2026-08-12:因产品问题删过的修好重上是正常经营)
                 counts["blacklist"] += 1
@@ -1572,7 +1574,7 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
             reasons.append((r["rownum"], gap))
             continue
         qty = int(stock)
-        echo[3] = w_price               # 算出定价的行回显 J 列
+        echo[3] = w_price               # 算出定价的行回显 L 列
         if not ((p.get("attrs") or {}).get("weight")):
             counts["no_weight"] += 1    # ShippingWeight 将按 1.0 磅兜底,亮出来
         survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
@@ -1602,14 +1604,14 @@ def run(params: dict) -> str:
     verdicts = load_verdicts([r["asin"] for r in rows if r.get("asin")])
     open_rows = [r for r in rows
                  if r["listed"].lower() in ("", "no") and not r["feed_id"]
-                 # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 O 列
+                 # SKU_LOCKED 归自愈链;PROHIBITED 政策违禁永不重试(旧 Q 列
                  # 第五类,2026-08-12 接线——重发也永远是拒,白烧 UPC 与配额);
                  # CONTENT_REJECTED 内容标准拒(2026-08-19):文案是亚马逊
-                 # 原文,原样重发必然同拒——人工改文案清 O 列后才重回通道
+                 # 原文,原样重发必然同拒——人工改文案清 Q 列后才重回通道
                  and r["list_result"] not in ("SKU_LOCKED", "PROHIBITED",
                                               "CONTENT_REJECTED")]
     fresh, n_unaudited, n_rejected = [], 0, 0
-    # 审核闸逐行写 N 列理由(所有者定稿 2026-08-28:除「配额排队」外的静默桶
+    # 审核闸逐行写 P 列理由(所有者定稿 2026-08-28:除「配额排队」外的静默桶
     # 都要写明原因——配额不写是因为那是"计划上架"还在队里,写了反而像终态)。
     # 只写理由**不写终态**:审核翻案/补审后下一轮自动续上,与闸门链同语义
     audit_reasons: list[tuple[int, str]] = []
@@ -1669,7 +1671,7 @@ def run(params: dict) -> str:
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
     reasons: list[tuple[int, str]] = []      # (rownum, N 理由)
-    reasons.extend(audit_reasons)            # 审核闸的理由同渠道落 N 列
+    reasons.extend(audit_reasons)            # 审核闸的理由同渠道落 P 列
 
     sg = _gate_by_store(pending, ctx)
     candidates, allow_by_store = sg.survivors, sg.allow_by_store
@@ -1867,8 +1869,8 @@ def run(params: dict) -> str:
         by_store2.setdefault(r["store"], []).append(r)
     gate = _AdaptiveGate(stores_svc.STORE_WORKERS)
     # 店级失败时 _one_store 交出来的**半成品**(product_clear 同款):领号阶段
-    # 已经攒好的 no_upc 计数、N 列理由、已被 defer 的片子都是这一轮真发生过的
-    # 事,不能随异常一起蒸发 —— 补试仍失败时调用方照原样并进摘要与 N 列。
+    # 已经攒好的 no_upc 计数、P 列理由、已被 defer 的片子都是这一轮真发生过的
+    # 事,不能随异常一起蒸发 —— 补试仍失败时调用方照原样并进摘要与 P 列。
     partial: dict[str, tuple] = {}
 
     def _one_store(store_name: str, srows: list[dict]) -> tuple:
@@ -1892,7 +1894,7 @@ def run(params: dict) -> str:
         互不阻塞且绝不双领」),每店各开各的 pg 连接,不共享游标。
 
         飞书回写 write_submit_cols **留在本函数内**、不挪到合并之后:UPC 已
-        mark_used、product_events 已落库,而表上 K 列还是空 —— 下一轮读表看到
+        mark_used、product_events 已落库,而表上 M 列还是空 —— 下一轮读表看到
         「listed=No 且无 feed_id」就会重发一遍。让每个店的表写紧跟自己的提交,
         别的店炸了也带不走它。(并发下的写节流由 api.feishu 的 _sheet_locks 兜。)
         """
@@ -1960,7 +1962,7 @@ def run(params: dict) -> str:
                 _apply_submit_result(store_name, res, batch, updates, today)
             if updates:
                 listing_sheet.write_submit_cols(updates)
-            # K 列三态就是这一轮的三个结局(Yes=提交 / No=被拒 / Unknown=不确定)
+            # M 列三态就是这一轮的三个结局(Yes=提交 / No=被拒 / Unknown=不确定)
             for _rn, v in updates:
                 cnt[{"Yes": "submitted", "No": "failed"}.get(v[4], "unknown")] += 1
             n_defer = sum(len(b) for _, _, b in deferred_s)

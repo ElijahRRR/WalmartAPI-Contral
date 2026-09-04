@@ -6,13 +6,14 @@ ASIN 历史导入解析、行适配。
 """
 
 import json
+import pathlib
 from types import SimpleNamespace
 
 import pytest
 
-from registry import resources
-from services import audit_l2, audit_rules, audit_store
-from services.audit_models import AuditOutcome, L1Info, ProductInfo
+from registry import paths, resources
+from services import audit_l2, audit_l3, audit_rules, audit_store
+from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
 from workflows import product_audit
 from workflows.asin_blacklist_import import parse_asin_lines
 from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
@@ -21,8 +22,7 @@ from workflows.risk_sync import _sync_amzcat_blacklist, _sync_column_blacklist
 def _ctx(**kw):
     base = dict(phase0_sellers=frozenset(), phase0_asins=frozenset(),
                 brand_blacklist={},
-                pt_meta={}, ac_automaton=None, nice_mapping={},
-                nice_default=[], uspto=None)
+                pt_meta={}, brand_mention_automaton=None)
     base.update(kw)
     return audit_rules.AuditContext(**base)
 
@@ -126,6 +126,111 @@ def test_write_conclusion_status_words(monkeypatch):
     assert captured["status"] == "approved"       # 两套词表显式映射
     assert captured["walmart_pt"] == "GoodPT"
     assert captured["reason"] is None
+    assert captured["detail"] is None             # pass 两列都空
+
+
+# ── 三段落库(2026-09-02 B1,规格 §3.4)────────────────────────────────────────
+
+def _cap_conclusion(outcome):
+    captured = {}
+
+    class _Conn:
+        def execute(self, sql, params):
+            captured.update(params)
+    audit_store.write_conclusion(_Conn(), outcome)
+    return captured
+
+
+def test_三段落库_类别与具体内容分列():
+    """类别列只装枚举,具体内容列装那一句话 —— 两样东西不再挤在一列里。
+
+    L3 判的拒用 `l3.detail`(原文片段 + 条款要点);规则判的拒用**判死那条
+    hit** 的 `explain_hit`(它本来就是"具体内容"形态)。
+    """
+    from services.audit_l3 import L3Result
+    from services.audit_models import Phase0Result
+    # ① L3 拒
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                     stage_stopped_at="L3",
+                     l1=L1Info(walmart_product_type="GoodPT"))
+    o.l3 = L3Result(verdict="reject", policy="Alcohol",
+                    detail='标题写 "Distillation Apparatus",Alcohol 政策禁蒸馏设备')
+    o.final_reason_category = "Alcohol"
+    got = _cap_conclusion(o)
+    assert got["reason"] == "Alcohol"
+    assert got["detail"].startswith('标题写 "Distillation Apparatus"')
+    # ② 规则拒:取第一条扣分 hit 的人话
+    o2 = AuditOutcome(asin="B0", verdict="reject", score_final=0,
+                      stage_stopped_at="L0",
+                      l1=L1Info(walmart_product_type="(phase0_blocked)"),
+                      phase0=Phase0Result(blocked=True, hits=[
+                          RuleHit("L0", "phase0_trademark_symbol", -100,
+                                  {"category": "Intellectual Property",
+                                   "matched_brand": "XYZ"})]))
+    o2.final_reason_category = "Intellectual Property"
+    got2 = _cap_conclusion(o2)
+    assert got2["reason"] == "Intellectual Property"
+    assert got2["detail"] == "标题含 ®/™ 商标符号(命中:XYZ)"
+
+
+def test_三段落库_L3没给具体内容时也不留空():
+    """⚠ 判拒必须说得出一句话。留空的后果不是"少一格":飞书 H 列会走
+    老行兜底渲染,把 `llm_alcohol` 这种**规则码**原样打给运营看
+    (`_RULE_CN` 里没有 llm_* 条目,也不该有 —— 它是随政策名生成的)。"""
+    from services.audit_l3 import L3Result
+    for empty in (None, "", "   "):
+        o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                         stage_stopped_at="L3",
+                         l1=L1Info(walmart_product_type="GoodPT"))
+        o.l3 = L3Result(verdict="reject", policy="Alcohol", detail=empty)
+        o.final_reason_category = "Alcohol"
+        assert audit_store.conclusion_detail(o) == \
+            "违反「Alcohol」(LLM 未引用原文片段)", empty
+        assert _cap_conclusion(o)["detail"].startswith("违反「Alcohol」")
+
+
+def test_三段落库_两条写库路径都带上了新列():
+    """`write_conclusion` 与 `product_audit._ADOPT_SQL` 是**同一组列**的两条
+    写库路径:一条漏改 = 采用历史的行永远没有具体内容,而且不会报错。"""
+    for sql in (audit_store._PRODUCT_SQL, product_audit._ADOPT_SQL):
+        assert "audit_detail" in sql and "audit_reason" in sql
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    assert ("ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS "
+            "audit_detail text") in ddl
+
+
+def test_事件行_reason键不改_并加具体内容():
+    """`detail.reason` 是**存量 204 万行事件与 audit_history_fold 都按它读**的
+    键名,语义 = 类别,不许改名;具体内容是新加的 `detail.detail`。"""
+    from services.audit_l3 import L3Result
+    o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
+                     stage_stopped_at="L3",
+                     l1=L1Info(walmart_product_type="GoodPT"))
+    o.l3 = L3Result(verdict="reject", policy="Alcohol", detail="禁蒸馏设备")
+    o.final_reason_category = "Alcohol"
+    row = audit_store.event_row(o, 7)
+    assert row["event"] == "audit_rejected"
+    assert row["detail"]["reason"] == "Alcohol"
+    assert row["detail"]["detail"] == "禁蒸馏设备"
+
+
+def test_规则写死的政策名装配时对表_对不上启动即炸():
+    """§二:`Intellectual Property` 是规则代码里唯一写死的政策名 ——
+    品牌黑名单 / 商标符号 / 专利自述 / L3 品牌翻拒四处判它,一路落库进飞书。
+
+    政策表改名而代码没跟上时的正确表现是**启动即 RuntimeError**:静默的话
+    那几条硬拒会一直往库里写一个表里没有的类别名,而没有任何东西会红。
+    """
+    official = frozenset(
+        f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
+        for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
+    assert resources.AUDIT_IP_POLICY in official
+    audit_rules.check_rule_policies(official)          # 官方 44 名:不炸
+    audit_rules.check_rule_policies(frozenset())       # 没表可对:跳过
+    with pytest.raises(RuntimeError, match="解析不到"):
+        audit_rules.check_rule_policies(frozenset({"Alcohol"}))
+    with pytest.raises(RuntimeError, match="表内拼写"):
+        audit_rules.check_rule_policies(frozenset({"Intellectual property"}))
 
 
 # ── _pick_where 四态与参数白名单(评审 P1-4/I-6)──────────────────────────────
@@ -502,7 +607,9 @@ def test_resolve_pt_publication_ban_covers_direct_levels():
     assert any(h.rule_code == "publication_pt_forbidden" for h in l1.hits)
     out = audit_rules.audit_one(p, ctx)
     assert out.verdict == "reject"
-    assert out.final_reason_category == "Intellectual Property"
+    # 规则自报类别(2026-09-02 B1 §二):出版物硬禁按**性质**归 `类目准入`
+    # —— 旧理由映射步 4a 猜成 Intellectual Property,那是关键词推断,已删
+    assert out.final_reason_category == resources.AUDIT_CAT_ACCESS
 
 
 def _l3_result(verdict, **kw):
@@ -518,18 +625,19 @@ def test_audit_one_l3_flow(monkeypatch):
     p = ProductInfo(asin="B0A", title="widget")
     calls = []
 
-    def fake_judge(product, l1, l2, c, conn):
-        calls.append(product.asin)
-        return _l3_result("reject", reason_category="offensive content")
+    def fake_judge(product, l1, l2, c, conn, *, phase0=None):
+        # phase0 也进来了:上游证据通道读 L0/L1/L2 三层(2026-09-02 B1)
+        calls.append((product.asin, phase0 is not None))
+        return _l3_result("reject", policy="Offensive Content")
     monkeypatch.setattr(audit_l3, "judge_l3", fake_judge)
     out = audit_rules.audit_one(p, ctx, conn=object())
-    assert calls == ["B0A"]
+    assert calls == [("B0A", True)]
     assert out.verdict == "reject" and out.stage_stopped_at == "L3"
     assert out.score_final == 100          # L3 不动分:reject 而分数保持
     assert out.l3.verdict == "reject"
 
     monkeypatch.setattr(audit_l3, "judge_l3",
-                        lambda *a: _l3_result("pending"))
+                        lambda *a, **k: _l3_result("pending"))
     out2 = audit_rules.audit_one(p, ctx, conn=object())
     assert out2.verdict == "pending" and out2.stage_stopped_at == "L3"
     assert out2.score_final == 100         # 合同 L3-8:L3 pending 保留 L2 分
@@ -544,7 +652,7 @@ def test_audit_one_l3_flow(monkeypatch):
 def test_audit_one_l2_reject_skips_l3(monkeypatch):
     from services import audit_l3
     monkeypatch.setattr(audit_l3, "judge_l3",
-                        lambda *a: pytest.fail("L2 reject 不得进 L3"))
+                        lambda *a, **k: pytest.fail("L2 reject 不得进 L3"))
     ctx = _ctx(pt_meta=_META_C, walmart_confirmed={"B0P": "Books"})
     out = audit_rules.audit_one(ProductInfo(asin="B0P", title="n"), ctx,
                                 conn=object())
@@ -557,7 +665,8 @@ def test_audit_one_l4_flow(monkeypatch):
     from services.audit_l4 import L4Result
     ctx = _ctx(pt_meta=META, walmart_confirmed={"B0A": "GoodPT"})
     p = ProductInfo(asin="B0A", title="widget")
-    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("pass"))
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a, **k: _l3_result("pass"))
     monkeypatch.setattr(audit_l4, "judge_l4",
                         lambda *a, **k: L4Result(verdict="reject"))
     out = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
@@ -566,7 +675,8 @@ def test_audit_one_l4_flow(monkeypatch):
     out2 = audit_rules.audit_one(p, ctx, conn=object())
     assert out2.l4 is None and out2.verdict == "pass"
     # L3 已拒 → L4 不跑
-    monkeypatch.setattr(audit_l3, "judge_l3", lambda *a: _l3_result("reject"))
+    monkeypatch.setattr(audit_l3, "judge_l3",
+                        lambda *a, **k: _l3_result("reject"))
     monkeypatch.setattr(audit_l4, "judge_l4",
                         lambda *a, **k: pytest.fail("非 pass 不得进 L4"))
     out3 = audit_rules.audit_one(p, ctx, conn=object(), run_l4=True)
@@ -670,18 +780,30 @@ def test_persist_run_l3_l4_columns():
                 stage_stopped_at=None,
                 l1=L1Info(walmart_product_type="GoodPT"))
     audit_store.persist_run(_Conn(), AuditOutcome(**base))
-    assert captured[0][7:] == ("skip", None, None, "skip", "[]")
+    # 末列是 audit_version(2026-09-02 B2):没有它,回放的"旧链基线"会在
+    # mode=stale 跑过之后变成新链自己的结论 —— 自己跟自己比,数字还看着正常
+    assert captured[0][7:] == ("skip", None, None, "skip", "[]",
+                               resources.AUDIT_RULES_VERSION)
     o = AuditOutcome(**{**base, "verdict": "reject", "stage_stopped_at": "L3"})
-    o.l3 = _l3_result("reject", reason_category="offensive content",
-                      reason_text="bad")
+    o.l3 = _l3_result("reject", policy="Offensive Content", detail="bad")
     o.l4 = L4Result(verdict="pass", image_issues=[{"image_index": 1}])
     audit_store.persist_run(_Conn(), o)
-    assert captured[1][7:11] == ("reject", "offensive content", "bad", "pass")
+    # 两列列名不改,语义 = 类别 / 具体内容(2026-09-02 B1)
+    assert captured[1][7:11] == ("reject", "Offensive Content", "bad", "pass")
     assert json.loads(captured[1][11]) == [{"image_index": 1}]
+    assert captured[1][12] == resources.AUDIT_RULES_VERSION
+    # 列数与 SQL 占位符数必须对得上(元组长度对不上时 psycopg 才会报错,
+    # 而"少写一列"在这里表现为静默写错列)
+    assert audit_store._RUN_SQL.count("%s") == len(captured[1])
 
 
 def test_write_conclusion_pending_reason_by_stage():
-    """两种 pending 来源 reason 分开:L1=类目解不出,L3=LLM 故障(旧仓字面量)。"""
+    """三种 pending 来源分开留痕(重试口径不同),**落在具体内容列**。
+
+    ⚠ 2026-09-02 B1:类别列(audit_reason)从此只装类别枚举 —— pending 是
+    "这一轮判不了",不是结论,给它挂类别等于替它把话说死。那三句固定句
+    改落 `audit_detail`。
+    """
     captured = {}
 
     class _Conn:
@@ -690,12 +812,19 @@ def test_write_conclusion_pending_reason_by_stage():
     o = AuditOutcome(asin="B0", verdict="pending", score_final=None,
                      stage_stopped_at="L1", l1=L1Info())
     audit_store.write_conclusion(_Conn(), o)
-    assert "待类目判定" in captured["reason"]
+    assert captured["reason"] is None
+    assert "待类目判定" in captured["detail"]
     o2 = AuditOutcome(asin="B0", verdict="pending", score_final=100,
                       stage_stopped_at="L3",
                       l1=L1Info(walmart_product_type="GoodPT"))
     audit_store.write_conclusion(_Conn(), o2)
-    assert captured["reason"] == "LLM 全链路故障, 待人工复核"
+    assert captured["reason"] is None
+    assert captured["detail"] == "LLM 全链路故障, 待人工复核"
+    o3 = AuditOutcome(asin="B0", verdict="pending", score_final=100,
+                      stage_stopped_at="L2",
+                      l1=L1Info(walmart_product_type="GoodPT"))
+    audit_store.write_conclusion(_Conn(), o3)
+    assert "walmart_pt_meta" in captured["detail"]
 
 
 def test_real_pt_excludes_unknown():
@@ -757,20 +886,25 @@ def test_rerank_exit_pt_meta_gate(monkeypatch):
     assert out.verdict == "pending" and out.stage_stopped_at == "L1"
 
 
-def test_reason_mapper_l4_medium_falls_to_general_use():
-    """已知缺陷照迁钉住(评审 P2-4):reason 步(3)只认 confidence=='high',
-    aggressive 模式下仅由 offensive medium 触发的 L4 reject 落不到 L4 分支,
-    一路兜到 General-Use Products。改它=行为变更,须双跑出数据后由所有者批。"""
+def test_reason_mapper_l4_reject_has_no_category_and_says_so():
+    """L4 判拒**不猜类别**(2026-09-02 B1 删掉旧步 3 的 issue 关键词推断)。
+
+    旧行为:issue 文本含 offensive → `Offensive Content`,否则
+    `Intellectual Property`;medium 置信的还会一路兜到 `General-Use Products`。
+    那是从一句自由文本里猜政策 —— 猜出来的类别会落库、进飞书、进申诉口径。
+    现在:类别 NULL + `reason_missing` 计数 + warning(L4 默认关,面很小)。
+    """
+    from services import audit_reason
     from services.audit_l4 import L4Result
+    audit_reason.reset_stats()
     o = AuditOutcome(asin="B0", verdict="reject", score_final=100,
                      stage_stopped_at="L4",
                      l1=L1Info(walmart_product_type="GoodPT"))
     o.l4 = L4Result(verdict="reject", image_issues=[
         {"image_index": 0, "issue": "offensive gesture",
          "confidence": "medium"}])
-    from services.audit_reason import compute_final_reason
-    assert compute_final_reason(o, ProductInfo(asin="B0", title="t")) \
-        == "General-Use Products"
+    assert audit_reason.compute_final_reason(o) is None
+    assert audit_reason.STATS["reason_missing"] == 1
 
 
 def test_resolve_pt_browse_node_first():
@@ -1035,11 +1169,78 @@ def test_is_forced_exempts_rerule_but_not_from_sheet():
 
 def test_candidate_sql_recent_guard_shape():
     """评审 P1:dry-run 复烧护栏——同批候选 24h 内有 runs 即让位(仅 dry-run)。"""
-    sql = product_audit._CANDIDATE_SQL.format(
-        where="x", recent_guard=product_audit._RECENT_RUN_GUARD)
+    sql = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD, 5)
     assert "NOT EXISTS" in sql and "interval '24 hours'" in sql
-    plain = product_audit._CANDIDATE_SQL.format(where="x", recent_guard="")
+    plain = product_audit._candidate_sql("x", "", 5)
     assert "NOT EXISTS" not in plain
+
+
+def test_candidate_sql_only_formats_its_own_tail(monkeypatch):
+    """⚠ `format` 面必须收窄到本文件的尾段。
+
+    列清单与 LATERAL 是 `services/audit_rules` 的文本;哪天那边多一个 `{`
+    (jsonb 字面量、格式串),`.format()` 整段就会 KeyError 炸在 product_audit,
+    而吃同一份文本的 `audit_replay` 一点事没有 —— 这种耦合两边都看不出来。
+    """
+    # ① 拼出来的 SQL 与"前缀 + 尾段替换"逐字节相同(改写不许动 SQL 一个字)
+    got = product_audit._candidate_sql("x", product_audit._RECENT_RUN_GUARD, 5)
+    want = ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
+            + audit_rules.PRODUCT_ROW_FROM
+            + product_audit._CANDIDATE_TAIL.format(
+                where="x", recent_guard=product_audit._RECENT_RUN_GUARD,
+                limit_clause=product_audit._LIMIT_CLAUSE))
+    assert got == want
+    assert "WHERE p.marketplace = %(marketplace)s AND (x)" in got
+    assert "LIMIT %(limit)s" in got
+    # ② 共享文本里出现花括号也不炸(这就是改写的全部理由)
+    monkeypatch.setattr(audit_rules, "PRODUCT_ROW_COLUMNS",
+                        "p.asin, p.slow -> '{a}' AS x")
+    braced = product_audit._candidate_sql("y", "", 5)
+    assert "{a}" in braced and "AND (y)" in braced
+
+
+def test_limit_defaults_to_unlimited_and_rejects_nonsense():
+    """所有者定稿 2026-09-03:「审核这个脚本不应有默认设置的 limit,需要限制的
+    时候才手动带参数」。
+
+    此前缺省 500,而 `from_sheet` 把它顶成 ASIN 总数 —— 限流是假的、摘要那句
+    "只判 500 个"是错的、调度 note 里"存量大时加 -p limit=N"的建议也不生效。
+    """
+    assert product_audit._parse_opts({}).limit is None
+    assert product_audit._parse_opts({"limit": ""}).limit is None      # 空串同缺省
+    assert product_audit._parse_opts({"limit": "  "}).limit is None
+    assert product_audit._parse_opts({"limit": 300}).limit == 300      # int 照收
+    assert product_audit._parse_opts({"limit": "300"}).limit == 300    # cli 传字符串
+    # ⚠ 0 不是"不限量":当它讲会让人以为限住了,恰好反着 —— 宁炸不吞
+    for bad in (0, "0", -1, "-5"):
+        with pytest.raises(ValueError, match="不给就是不限量"):
+            product_audit._parse_opts({"limit": bad})
+
+
+def test_batch_head_names_the_bill_when_unlimited():
+    """不限量时"共 N 个"就是这一轮的账单,必须说破 —— 否则人按老习惯
+    以为后面还有个 500 挡着。"""
+    head = product_audit._batch_head(_CountConn(3200), "版本重审", "w", {},
+                                     None, "hint")
+    assert "共 3200 个" in head[0]
+    assert "不限量" in head[1] and "这 3200 个全判" in head[1]
+    assert "还剩" not in head[1]
+    # 一个都没有时不该冒出"这 0 个全判"
+    assert len(product_audit._batch_head(_CountConn(0), "w", "w", {},
+                                         None, "hint")) == 2
+
+
+def test_candidate_sql_has_no_limit_clause_when_unlimited():
+    """⚠ 缺省不限量(2026-09-03):LIMIT 整段不拼,而不是拼个 `LIMIT NULL`
+    去赌 PG 的语义 —— 读 SQL 的人一眼就该看出这轮有没有上限。"""
+    free = product_audit._candidate_sql("x", "", None)
+    # ⚠ 只能断言**参数化的**那一段没了:共享前缀的买盒卖家 LATERAL 自带
+    # `ORDER BY s.scraped_at DESC LIMIT 1`,写 `"LIMIT" not in free` 会误伤
+    assert "LIMIT %(limit)s" not in free
+    assert free.rstrip("\n").endswith("ORDER BY p.audited_at NULLS FIRST, "
+                                      "p.updated_at")
+    capped = product_audit._candidate_sql("x", "", 500)
+    assert capped == free.rstrip("\n") + product_audit._LIMIT_CLAUSE + "\n"
 
 
 # ── 行适配 ───────────────────────────────────────────────────────────────────
@@ -1403,46 +1604,64 @@ def test_the_clamp_note_reaches_the_summary():
     assert src.index("_cap_by_connections") < src.index("db.pg_conn(autocommit=True)")
 
 
-def test_the_l3_route_gap_counter_is_reset_and_reaches_the_summary():
+def test_the_l3_gap_counters_are_reset_and_reach_the_summary():
     """⚠ 计数只加不看 = 看不见(README「测试钉的是哪些接缝」第三条)。
 
-    L3 路由的政策名在政策表里解析不到 → 那一条政策提示本轮没给。判定不受影响、
-    不报错,所以它**只能**靠摘要被人看见;而每轮必须清零,否则跨轮累加的数字
-    读起来像"这一轮坏了这么多"。
+    2026-09-02 B1 的三个"不报错但判据变了"的信号,只能靠摘要被人看见:
+    政策缺全文(S2 有名字、S4 没原文)、LLM 类别对不上枚举(转 pending)、
+    判拒却没有类别(规则忘了自报 `category`)。每轮必须清零,否则跨轮累加的
+    数字读起来像"这一轮坏了这么多"。
     """
     import inspect
-    from services import audit_l3
+    from services import audit_reason
     src = inspect.getsource(product_audit.run)
-    assert "_audit_l3.reset_stats()" in src                  # 每轮清零
-    assert 'stage_stats["L3_route_unresolved"]' in src       # 走既有通道
+    assert "audit_l3.reset_stats()" in src                   # 每轮清零
+    assert "audit_reason.reset_stats()" in src
+    assert 'stage_stats["L3_policy_no_full_text"]' in src    # 走既有通道
+    assert 'stage_stats["L3_bad_policy"]' in src
+    assert 'stage_stats["reason_missing"]' in src
+    # ⚠ 缺全文读的是**构建期状态**,不是每轮清零的 STATS(读计数的话第二轮
+    #   起永远报 0,而缺失一直都在)
+    assert "audit_l3.missing_full_text()" in src
+    assert "policy_no_full_text" not in dict(audit_l3.STATS)
 
     stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
              "L4_ran": 0, "L4_reject": 0}
     opts = product_audit.Opts(execute=True, limit=1, backfill=False,
-                              adopt_only=False, r5_on=False, run_l3=True,
+                              adopt_only=False, run_l3=True,
                               run_l4=False, only_l0=False, workers=1,
                               conn_note="")
     counts = product_audit.Counts(
         verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
         l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
-        policy_unknown=0, row_errors=0, asked_asins=0, uspto_failures=0,
-        uspto_off=True)
-    # 零 = 一个字都不打印(notify_fmt 规矩 2:例外计数为 0 是噪声)
-    assert not [ln for ln in product_audit._summary(opts, counts, stage, {}, {},
-                                                    0, [])
-                if "政策路由" in ln]
-    stage["L3_route_unresolved"] = 4
-    stage["L3_route_unresolved_names"] = ["Pet Products"]
-    line = [ln for ln in product_audit._summary(opts, counts, stage, {}, {},
-                                                0, [])
-            if "政策路由" in ln]
-    assert len(line) == 1
-    assert "4 次" in line[0] and "Pet Products" in line[0]
-    assert "只记不改判" in line[0]
+        row_errors=0, asked_asins=0)
+    def _lines(st):
+        return product_audit._summary(opts, counts, st, {}, {}, 0, [])
 
-    # STATS 的形状:总计 + 逐名字(摘要点名靠它)
+    # 零 = 一个字都不打印(notify_fmt 规矩 2:例外计数为 0 是噪声)
+    assert not [ln for ln in _lines(stage)
+                if "政策全文缺失" in ln or "对不上枚举" in ln
+                or "没有类别" in ln]
+    stage["L3_policy_no_full_text"] = 2
+    stage["L3_policy_no_full_text_names"] = ["Art"]
+    stage["L3_bad_policy"] = 3
+    stage["reason_missing"] = 5
+    stage["adopt_cat_unresolved"] = 7
+    lines = _lines(stage)
+    adopt = [ln for ln in lines if "历史结论类别不可解析" in ln]
+    assert len(adopt) == 1 and "7 条" in adopt[0] and "留空" in adopt[0]
+    gap = [ln for ln in lines if "政策全文缺失" in ln]
+    assert len(gap) == 1 and "2 篇" in gap[0] and "Art" in gap[0]
+    bad = [ln for ln in lines if "对不上枚举" in ln]
+    assert len(bad) == 1 and "3 条" in bad[0] and "pending" in bad[0]
+    miss = [ln for ln in lines if "判拒但没有类别" in ln]
+    assert len(miss) == 1 and "5 条" in miss[0] and "NULL" in miss[0]
+
+    # STATS 只剩"每个产品都可能发生"的那一件事;缺全文是构建期事实,不在这里
     audit_l3.reset_stats()
-    assert dict(audit_l3.STATS) == {"route_unresolved": 0}
+    assert dict(audit_l3.STATS) == {"llm_bad_policy": 0}
+    audit_reason.reset_stats()
+    assert dict(audit_reason.STATS) == {"reason_missing": 0}
 
 
 def test_audit_one_only_l0_hits_reject_and_misses_return_none():
@@ -1504,13 +1723,86 @@ def test_adopt_history_says_the_old_reason_from_hits():
     conn = _Conn()
     import unittest.mock as m
     with m.patch.object(product_audit.product_events, "record_many"):
-        n, adopted = product_audit._adopt_history(
+        n, adopted, bad_cat = product_audit._adopt_history(
             conn, ["B0AAAAAAA1", "B0AAAAAAA2"], execute=True)
     assert n == 2 and adopted == {"B0AAAAAAA1", "B0AAAAAAA2"}
+    assert bad_cat == 0                    # 这两行的老类别本来就是 NULL
+    # 三段分列(2026-09-02 B1):类别列写 runs 行留档的 l3_reason_category
+    # (这两行老结论都是 NULL),"历史结论(阶段 X):…"那句进**具体内容**列
+    by = {r["asin"]: r for r in conn.adopted}
+    assert by["B0AAAAAAA1"]["reason"] is None
+    assert "品牌黑名单" in by["B0AAAAAAA1"]["detail"]        # 旧命中翻成人话
+    assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]["detail"]
+    assert "理由未留存" in by["B0AAAAAAA2"]["detail"]        # 连 hits 都没有
+
+
+def test_adopt_history_resolves_the_legacy_category_or_leaves_it_null():
+    """⚠ 存量 `audit_runs.l3_reason_category` 装的是**旧语义**:`'none'`、
+    小写旧缩写名、`.title()` 变形值都有。三段分列后 `products.audit_reason`
+    只装类别枚举 —— 原样搬进去就是把旧世界的脏值洗进新列,而且不报错。
+
+    对得上就回**表内原拼写**;对不上(含 `'none'`)就是没有类别(None),
+    并计数进摘要 —— 采用历史本来就不重判,编一个更糟。
+    """
+    # 四种存量形态:pass 的占位 / **小写官方名**(旧解析层就是这么存的) /
+    # 表里没有的自由值 / 非政策类别
+    rows = [("B0A1", 11, "reject", 0, None, "none", "L3", None, None),
+            ("B0A2", 12, "reject", 0, None, "offensive content", "L3",
+             None, None),
+            ("B0A3", 13, "reject", 0, None, "Ghost Policy", "L3", None, None),
+            ("B0A4", 14, "reject", 0, None, "内部黑名单", "L0", None, None)]
+
+    class _Cur:
+        def __init__(self, conn):
+            self.conn = conn
+            self._rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            self._rows = [] if "audit_hits" in sql else rows
+
+        def executemany(self, sql, r):
+            self.conn.adopted = list(r)
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        adopted = []
+
+        def cursor(self):
+            return _Cur(self)
+
+    conn = _Conn()
+    known = audit_l3.policy_enum(frozenset({"Offensive Content"}))
+    import unittest.mock as m
+    with m.patch.object(product_audit.product_events, "record_many"):
+        n, _adopted, bad_cat = product_audit._adopt_history(
+            conn, ["B0A1", "B0A2", "B0A3", "B0A4"], execute=True, known=known)
     by = {r["asin"]: r["reason"] for r in conn.adopted}
-    assert "品牌黑名单" in by["B0AAAAAAA1"]        # 旧命中翻成人话
-    assert "历史结论(阶段 L0)" in by["B0AAAAAAA1"]
-    assert "理由未留存" in by["B0AAAAAAA2"]        # 连 hits 都没有才落这句
+    assert n == 4
+    assert by["B0A1"] is None                       # 'none' 不是类别
+    assert by["B0A2"] == "Offensive Content"        # 小写 → **表内原拼写**
+    assert by["B0A3"] is None                       # 表里没有 ⇒ 不编一个
+    assert by["B0A4"] == "内部黑名单"                # 非政策类别也在枚举里
+    assert bad_cat == 2                             # 'none' 与 Ghost 各一条
+    # 具体内容照旧写(类别空 ≠ 什么都不说)
+    assert all(r["detail"] for r in conn.adopted)
+    # ⚠ 2026-09-03 C 批:旧缩写名**不再被认领**(`policy_names` 的第 4 级与
+    # `POLICY_LEGACY_NAMES` 一起退役)。老 run 里那些缩写名从此落 None + 计数
+    # —— 采用历史本来就不重判,类别留空等这条产品被重审时按新链写,比拿一张
+    # 已经没人维护的历史映射猜一个强。纯词形差(&↔and)照旧认得出。
+    legacy_table = audit_l3.policy_enum(
+        frozenset({"Drugs and Drug Paraphernalia", "Plants and Seeds"}))
+    assert product_audit._adopt_category("Drugs & Paraphernalia",
+                                         legacy_table) is None
+    assert product_audit._adopt_category("plants & seeds", legacy_table) == \
+        "Plants and Seeds"
 
 
 def test_shrink_guard_message_says_what_you_are_installing():
@@ -1706,13 +1998,16 @@ def test_run_submits_futures_per_chunk_not_all_at_once():
     每个 future 吊着入参(ProductInfo 带标题/五点/长描述),完成后还吊着
     AuditOutcome —— 全量提交等于把整批数据再复制两份留在内存里。
     分块提交只限制"在飞的量",线程池与连接池仍整轮共用一套,吞吐不受影响。
+
+    ⚠ 2026-09-02 B2:提交改走 `audit_pool.submit_chunk`(首条串行预热),
+    钉的仍是同一件事 —— **提交在分块循环内**。
     """
     import inspect
 
     src = inspect.getsource(product_audit.run)
     chunk_loop = src.index("for chunk in chunks:")
-    submit = src.index("ex.submit(_judge, p)")
-    assert chunk_loop < submit, "ex.submit 必须在分块循环**内**"
+    submit = src.index("audit_pool.submit_chunk(")
+    assert chunk_loop < submit, "提交必须在分块循环**内**"
     # 候选取数不许再回到 fetchall
     assert "_iter_candidates(" in src
     assert "cur.fetchall()" not in src, "候选一旦 fetchall,分块就白做了"
@@ -1803,9 +2098,12 @@ class _PtConn:
 
 
 def _pt_ctx(monkeypatch, items):
-    """输入:walmart_items 的 (source_key, sku, product_type) 行 → 输出:装配好的 ctx。"""
-    monkeypatch.setattr(audit_rules.audit_l2, "load_nice_mapping",
-                        lambda: ({}, []))
+    """输入:walmart_items 的 (source_key, sku, product_type) 行 → 输出:装配好的 ctx。
+
+    ⚠ 2026-09-03 C 批瘦身把 `audit_l2.load_nice_mapping` 与
+    `refdata/audit/pt_nice_class.yaml` 整条删了(R5 退役),所以这里不再打它的桩;
+    政策表这条路由留空 ⇒ `check_rule_policies` 按"没有表可对"跳过(见它的头注)。
+    """
     monkeypatch.setattr(audit_rules.category_blacklist, "load",
                         lambda conn: SimpleNamespace())
     routes = {
@@ -1852,3 +2150,203 @@ def test_confirmed_pt_still_drops_cross_store_disagreements(monkeypatch):
     ])
     assert "B0CCCC0003" not in ctx.walmart_confirmed
     assert ctx.walmart_confirmed["B0AAAA0001"] == "Socks"
+
+
+# ── 首条串行预热(2026-09-02 B2,规格 §3.9)────────────────────────────────
+
+class _FakeEx:
+    """记录 submit 顺序的假线程池(不起线程:预热要验的是**调用次序**)。"""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, fn, arg):
+        self.submitted.append(arg)
+        from concurrent.futures import Future
+        f = Future()
+        f.set_result(("pooled", arg))
+        return f
+
+
+def test_warmup_judges_the_first_item_before_the_pool_gets_anything():
+    """L3 开且候选 >1 时,第一条**同步**判完再开池(规格 §3.9)。
+
+    为什么要有它:128 并发起跑,前一批会**同时**看到"这段 6 万 token 的前缀
+    还没被缓存过",一批全按未命中价付 —— 单条未命中约是命中价的十几倍。
+    先串行送一条进去,后面的才有前缀缓存可命中。
+
+    钉两件事:① 池子只拿到 n-1 条;② 第一条在**任何** submit 之前就判完了
+    (顺序反了的话预热等于没做,而且成本差异只体现在账单上,不会报错)。
+    """
+    from services import audit_pool
+
+    ex = _FakeEx()
+    order = []
+
+    def judge(arg):
+        order.append(("judged", arg, len(ex.submitted)))
+        return ("warm", arg)
+
+    todo = [(f"B0{i}", f"p{i}") for i in range(5)]
+    futs, warmed = audit_pool.submit_chunk(ex, todo, judge, warm=True)
+
+    assert warmed == 1
+    assert ex.submitted == ["p1", "p2", "p3", "p4"]      # 池子只拿到 n-1 条
+    assert order == [("judged", "p0", 0)]                # 判完时池子还是空的
+    assert len(futs) == 5                                # 预热那条也进 futs
+    assert sorted(futs.values()) == ["B00", "B01", "B02", "B03", "B04"]
+    assert [f.result() for f in futs if futs[f] == "B00"] == [("warm", "p0")]
+
+
+def test_warmup_is_skipped_when_off_or_single_item():
+    """`warm=False`(L3 关 / 已经预热过)与"本块只有一条"都不预热 ——
+    一条产品谈不上"省一批 miss":它自己就是那一次未命中。"""
+    from services import audit_pool
+
+    ex = _FakeEx()
+    calls = []
+    futs, warmed = audit_pool.submit_chunk(
+        ex, [("A", 1), ("B", 2)], lambda a: calls.append(a), warm=False)
+    assert warmed == 0 and calls == [] and ex.submitted == [1, 2]
+    assert len(futs) == 2
+
+    ex2 = _FakeEx()
+    futs2, warmed2 = audit_pool.submit_chunk(
+        ex2, [("A", 1)], lambda a: calls.append(a), warm=True)
+    assert warmed2 == 0 and calls == [] and ex2.submitted == [1]
+    assert len(futs2) == 1
+
+
+def test_warmup_failure_travels_in_the_future_not_as_a_raise():
+    """预热那条判炸了,异常必须**装进 future** —— 调用方的单行隔离
+    (savepoint / 连续失败计数)才管得着它。就地抛的话整轮直接崩,
+    而其余候选一条都还没提交。"""
+    from services import audit_pool
+
+    ex = _FakeEx()
+
+    def boom(arg):
+        raise RuntimeError("判定炸了")
+
+    futs, warmed = audit_pool.submit_chunk(
+        ex, [("A", 1), ("B", 2), ("C", 3)], boom, warm=True)
+    assert warmed == 1 and ex.submitted == [2, 3]        # 其余照常提交
+    first = [f for f, k in futs.items() if k == "A"][0]
+    with pytest.raises(RuntimeError, match="判定炸了"):
+        first.result()
+
+
+def test_run_wires_the_warmup_once_per_round_and_says_so():
+    """接线三条(改动很小,漏一条就静默失效):
+
+    ① 走的是 `audit_pool.submit_chunk`(预热规则只有一份实现,回放工作流吃同一份);
+    ② `warm=` 带 `not warmup_n` —— 整轮只预热一次,不是每块一次;
+    ③ 条数进摘要 —— 预热是**省钱动作**,不亮出来没人知道它有没有真发生。
+    """
+    import inspect
+    src = inspect.getsource(product_audit.run)
+    assert "audit_pool.submit_chunk(" in src
+    assert "warm=(not warmup_n) and run_l3 and not only_l0" in src
+    assert "warmup_n += warmed" in src
+    assert "ex.submit(_judge, p)" not in src, "提交只准走 submit_chunk 一条路"
+    assert "前缀预热" in inspect.getsource(product_audit._summary)
+    # L0 只跑 Phase0(零 LLM),预热在那条路上纯属白判一条
+    assert "not only_l0" in src
+
+
+# ── mode=stale 的近 N 天动销闸(2026-09-02 B2,所有者定稿 §六.8)────────────
+
+def test_stale_filters_by_recent_sales_with_the_one_sanctioned_predicate():
+    """「`mode=stale` 只跑近 90 天有动销的一批,不再全量重付」(§六.8)。
+
+    口径必须与 `services/alloc_survey._SQL_SALES` 逐条同源(全仓动销只有
+    那一份口径):窗口打 `order_date`、只排 `Cancelled`、用 **`asin` 列**。
+    ⚠ 拿 `sku` 当 asin 是这条链上最容易犯又最不会报错的错:三段式订货号与
+    纯数字 item id 直接等值永远查空,表现是"这批产品全都没动销过"。
+    """
+    from services import alloc_survey
+
+    w, e = product_audit._pick_where({"mode": "stale"})
+    assert e["active_days"] == 90                      # 缺省 90 天
+    assert "orders.order_lines" in w and "o.asin = p.asin" in w
+    assert "make_interval(days => %(active_days)s)" in w
+    assert "coalesce(o.sale_status, '') <> 'Cancelled'" in w
+    assert "o.sku" not in w, "动销只认 asin 列(order_asin_normalize 补填)"
+    # 与唯一口径同源:三个要件在 alloc_survey 那条 SQL 里长一个样
+    sales = alloc_survey._SQL_SALES
+    assert "order_date >=" in sales and "make_interval(days =>" in sales
+    # ⚠ 列名带不带表别名不算口径差异:alloc_survey 那条 SQL 因为要 LEFT JOIN
+    # catalog.sku_aliases(SKU 改造),列一律写成 `o.xxx`;这里比的是**判据**
+    # ——窗口打 order_date、只排 Cancelled、按 asin 匹配
+    assert "sale_status, '') <> 'Cancelled'" in sales
+    # 版本闸(天然分页)一个字都没丢
+    assert "p.audit_status = 'approved'" in w
+    assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w
+
+
+def test_stale_active_days_zero_turns_the_gate_off_explicitly():
+    """`0` = 显式不过滤(要跑全量得自己写出来),谓词与绑定参数一起消失。"""
+    w, e = product_audit._pick_where({"mode": "stale", "active_days": "0"})
+    assert "orders.order_lines" not in w
+    assert "active_days" not in e and "%(active_days)s" not in w
+    assert "p.audit_status = 'approved'" in w
+
+
+def test_stale_active_days_rejects_junk_and_wrong_mode():
+    """宁炸不吞:这条参数决定一轮要花多少钱。
+
+    · 非整数 / 负数 → 抛(错误信息要说得出"这个参数是干什么的");
+    · 配错 mode → 抛。静默忽略的后果是人以为只判了有动销的,实际把
+      approved 存量整批重付了一遍,而摘要长得一模一样(同 `force` 那条)。
+    """
+    with pytest.raises(ValueError, match="active_days"):
+        product_audit._pick_where({"mode": "stale", "active_days": "90天"})
+    with pytest.raises(ValueError, match="不能为负"):
+        product_audit._pick_where({"mode": "stale", "active_days": "-1"})
+    with pytest.raises(ValueError, match="mode=stale"):
+        product_audit._pick_where({"mode": "nonpass", "active_days": "90"})
+    with pytest.raises(ValueError, match="mode=stale"):
+        product_audit._pick_where({"active_days": "90"})     # 缺省通道也不行
+    # 参数白名单登记了才不会被"未识别参数"那道闸拦掉
+    assert "active_days" in product_audit._KNOWN_PARAMS
+
+
+def test_stale_summary_first_line_names_the_sales_window():
+    """摘要**首行**必须点名圈的是哪一批:带不带 `active_days` 差的是一个
+    数量级的候选量与账单,而摘要其余部分长得一模一样。
+
+    (2026-09-03:措辞从 run() 的内联分支搬进 `_candidate_what` —— 缺省不限量
+    之后每条通道都要报总量,内联那三条不够用了。断言跟着搬,口径不变。)
+    """
+    what, hint = product_audit._candidate_what({"mode": "stale"})
+    assert "近 90 天有动销" in what                       # active_days 缺省 90
+    assert resources.AUDIT_RULES_VERSION in what
+    assert "没有动销" in hint
+    free, _ = product_audit._candidate_what({"mode": "stale",
+                                             "active_days": 0})
+    assert "不限动销" in free
+
+
+def test_candidate_what_covers_every_pick_where_branch():
+    """⚠ 每条通道都得有自己的一句话:漏一条 = 那条通道的摘要把这批说成
+    另一批(2026-09-03 之前就是这样,只有 rerule/nonpass/stale 三条有)。"""
+    cases = {
+        "asins": ({"asins": "B0A,B0B"}, "点名重审 asins=2 个"),
+        "force_rerun": ({"force_rerun": "c.x"}, "按版本重审"),
+        "repts": ({"repts": "1"}, "飞书类目表"),
+        "rerule": ({"rerule": "phase0_patent_claim"}, "定点重审"),
+        "backfill": ({"mode": "backfill"}, "补刷"),
+        "pending": ({"mode": "pending"}, "待定专刷"),
+        "nonpass": ({"mode": "nonpass"}, "非 pass 全量重判"),
+        "stale": ({"mode": "stale"}, "版本重审"),
+        "pass": ({"mode": "pass"}, "现役 pass 全量重过 L0"),
+        "online": ({"mode": "online"}, "**在架** pass"),
+        "缺省": ({}, "缺省口径"),
+    }
+    for name, (params, want) in cases.items():
+        what, hint = product_audit._candidate_what(params)
+        assert want in what, f"{name}: {what!r}"
+        assert hint, f"{name}: 空集提示不能为空"
+    # 无天然分页的两条要当场劝退 limit(给了就每轮重扫同一批前缀)
+    for mode in ("pass", "online"):
+        assert "别给 limit" in product_audit._candidate_what({"mode": mode})[0]

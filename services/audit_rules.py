@@ -1,7 +1,7 @@
 """审核规则引擎门面(批次 B:零 LLM 纯规则层;全案 docs/audit_migration_plan.md)。
 
-组装三块积木:audit_phase0(四件套短路)→ PT 解析(本文件,批次 B 版三级的
-前两级)→ audit_l2(R1/R3-R8)→ audit_reason(政策理由映射)。
+组装三块积木:audit_phase0(五硬一软的双输出)→ PT 解析(本文件,批次 B 版
+三级的前两级)→ audit_l2(只剩 R1 类目准入)→ audit_reason(类别映射)。
 
 PT 解析(架构 10.3 的批次 B 裁剪版,批次 C 接 LLM rerank 前只有两级):
   ① 沃尔玛实证:catalog.walmart_items.product_type(sku=asin,跨店唯一才采信)
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 from registry import paths, resources
 from services import (audit_l1_llm, audit_l2, audit_phase0, audit_reason,
-                      category_blacklist)
+                      category_blacklist, policy_names)
 from services.audit_models import AuditOutcome, L1Info, RuleHit
 from services.audit_stopwords import is_stopword
 
@@ -36,34 +36,34 @@ class AuditContext:
     phase0_asins: frozenset
     brand_blacklist: dict          # 规整小写 → 原文(黑名单中心,first-wins)
     pt_meta: dict                  # PT → row dict
-    ac_automaton: object           # ahocorasick.Automaton 或 None(R4)
-    nice_mapping: dict
-    nice_default: list
-    uspto: object = None           # psycopg 连接或 None(R5 开关)
+    brand_mention_automaton: object   # ahocorasick.Automaton 或 None
+                                   # (L0 品牌文案扫描;2026-09-03 C 批随 R4
+                                   #  迁入 L0 从 ac_automaton 改名)
     walmart_confirmed: dict = field(default_factory=dict)   # asin → PT(跨店唯一,已 pt_meta 闸)
     catmap: dict = field(default_factory=dict)               # amazon_category → PT(高置信唯一,已 pt_meta 闸)
     known_policies: frozenset = frozenset()   # 政策表 category_en 实时集合(全部)
-    uspto_failures: int = 0        # R5 连续失败计数(audit_l2 递增,≥5 自动关停)
     unmapped_paths: frozenset = frozenset()                  # 哨兵'无对应Walmart PT'的 amazon 路径(Layer 0)
     path_alias: dict = field(default_factory=dict)            # 产品侧路径 → 映射表等价路径(catmap_align 产出)
     node_map: dict = field(default_factory=dict)              # browse_node_id → PT(高置信唯一,已 pt_meta 闸)
     # 类目黑名单(2026-08-20:代码里的类目常量搬进 DB)。三种匹配一次装配:
     # 子树 node_id / 顶级名 / 完整路径等值,判定见 services.category_blacklist.check
     cat_rules: object = None
-    # R4 键 → 黑名单来源原文(2026-08-30,TRO 命中接线)。**带默认值**:
+    # 品牌黑名单键 → 来源原文(2026-08-30,TRO 命中接线;键形同文案扫描词集,
+    # 字段名沿用 `r4_source` —— 存量接线与事件账本按它认)。**带默认值**:
     # 测试里手搓的 ctx 不给它也照跑,TRO 那一路自然退化成"一个都不命中"。
     r4_source: dict = field(default_factory=dict)
 
 
 def _brand_map(conn) -> tuple[dict, set, dict]:
-    """输入:连接 → 输出:(Phase0 品牌 dict, R4 词集, R4 键→来源原文)——同源三套口径。
+    """输入:连接 → 输出:(品牌等值 dict, 文案扫描词集, 词→来源原文)——同源三套口径。
 
     源 = **catalog.brand_blacklist**(黑名单中心品牌总表镜像;所有者定稿
     2026-08-13:黑名单只维护一份,不再读 audit.blacklist_brands 快照,也不再
     合并 compat yaml 的 34 个手补牌子——要补进飞书品牌总表,单源)。
-    Phase0 dict(规整小写→原文):strip → lower → 空白压单空格。
-    R4 词集:只 strip+lower(保留词内空白,旧 l2 加载器口径)。
-    R4 来源 dict:**键与 R4 词集同型**(strip+lower),值是 `source` 列原文 ——
+    等值 dict(规整小写→原文):strip → lower → 空白压单空格(L0 规则 4 查它)。
+    文案扫描词集:只 strip+lower(保留词内空白,旧 l2 加载器口径;
+    2026-09-03 C 批前叫「R4 词集」,判定随规则迁进 L0,取数口径一字未改)。
+    来源 dict(`r4_source`,名字沿用存量接线):**键与词集同型**(strip+lower),值是 `source` 列原文 ——
     TRO 命中接线按它认「这个黑名单词是不是 TRO 品牌」(判据在
     services/audit_store.tro_hits,前缀常量在 registry)。
     ⚠ 同一个键多行时 **setdefault 先到先得**:总表按 brand_key 主键去重,同键
@@ -88,7 +88,7 @@ def _brand_map(conn) -> tuple[dict, set, dict]:
             norm = " ".join(key.split())
             if norm and norm not in phase0:
                 phase0[norm] = raw
-    logger.info("品牌黑名单加载(黑名单中心):Phase0 %d 键 / R4 %d 键",
+    logger.info("品牌黑名单加载(黑名单中心):等值 %d 键 / 文案扫描 %d 键",
                 len(phase0), len(r4))
     return phase0, r4, r4_source
 
@@ -120,9 +120,11 @@ def _rows_dict(conn, sql: str, key: str) -> dict:
 
 
 def _build_automaton(brand_keys) -> object:
-    """输入:规整小写品牌键 → 输出:Aho-Corasick 自动机(R4;逐字迁 spec_l2 §5.3)。
+    """输入:规整小写品牌键 → 输出:Aho-Corasick 自动机(逐字迁 spec_l2 §5.3)。
 
     过滤:len<2 跳过、is_stopword 剔除(min_len=4 默认)——42,726 → 有效词数记日志。
+    消费方是 L0 的品牌文案扫描(`audit_phase0._scan_brand_mentions`,2026-09-03
+    C 批前是 L2 R4);**只在这里构建一次**,ctx 装配期。
     """
     import ahocorasick
     a = ahocorasick.Automaton()
@@ -133,21 +135,63 @@ def _build_automaton(brand_keys) -> object:
         a.add_word(b, b)
         kept += 1
     a.make_automaton()
-    logger.info("R4 品牌自动机:%d/%d 词(停用词过滤后)", kept, len(brand_keys))
+    logger.info("L0 品牌文案自动机:%d/%d 词(停用词过滤后)", kept, len(brand_keys))
     return a
 
 
 _UNMAPPED_SENTINEL = audit_l1_llm.UNMAPPED_SENTINEL   # 单一出处
 
+#: 代码里**写死的政策类别名** → 它出生的那个 registry 常量名(报错要指得出改哪儿)。
+#: 三族(`docs/audit_step3_spec.md` §二 表 + §3.8 + §4.1):
+#:   · `AUDIT_IP_POLICY` —— 品牌黑名单 / 商标符号 / 专利自述三条硬拒 + L3 的
+#:     品牌翻拒,四处判同一个 IP。不经政策表查询就写进 `hit.detail["category"]`
+#:     并一路落库、进飞书 G 列、进申诉口径;
+#:   · `AUDIT_PRODUCT_CLAIMS_POLICY` —— L0 的 Made in USA 硬拒(2026-09-03 C 批
+#:     自 L2 R10 迁入)自报的类别,同样直接落库进飞书;
+#:   · `AUDIT_CONTENT_POLICIES` —— 内容族两页(2026-09-02 B2 补进本闸):回放
+#:     评估拿它当 CONTENT 反例的期望类别。**同样是写死的拼写**,漂了的表现是
+#:     "内容族那一类的类别准确率一夜归零",而没有任何东西会红。
+#: 所以拼写必须**就是**表内那一行 —— 装配时一次性对表,对不上启动即炸。
+RULE_POLICIES = ((resources.AUDIT_IP_POLICY, "AUDIT_IP_POLICY"),
+                 (resources.AUDIT_PRODUCT_CLAIMS_POLICY,
+                  "AUDIT_PRODUCT_CLAIMS_POLICY"),
+                 *((n, "AUDIT_CONTENT_POLICIES")
+                   for n in resources.AUDIT_CONTENT_POLICIES))
 
-def load_context(conn, *, uspto=None) -> AuditContext:
-    """输入:中心库连接(+可选 uspto 只读连接)→ 输出:装配完成的 AuditContext。
+
+def check_rule_policies(known_policies) -> None:
+    """输入:政策表 category_en 实时集合 → 输出:无(对不上直接 RuntimeError)。
+
+    装配时**只查一次**。政策表改名而代码没跟上时的正确表现是**启动即炸**:
+    静默的话,那几条硬拒会一直往 `audit_reason` 里写一个表里已经不存在的
+    类别名,飞书 G 列、申诉口径、报错 join 三处一起对不上,而没有任何东西会红。
+    空集合(测试/离线路径没给政策表)跳过检查 —— 那是"没有表可对",不是"对不上"。
+    """
+    if not known_policies:
+        return
+    for name, const in RULE_POLICIES:
+        hit = policy_names.resolve(name, known_policies)
+        if hit is None:
+            raise RuntimeError(
+                f"代码写死的政策类别 {name!r} 在 audit.walmart_prohibited_policy "
+                f"里解析不到 —— 政策表改名了而代码没跟上。改 "
+                f"registry.resources.{const}(别让代码往库里写、或拿去对表一个"
+                f"表里没有的类别名)")
+        if hit != name:
+            raise RuntimeError(
+                f"代码写死的政策类别 {name!r} 与表内拼写 {hit!r} 不一致 —— "
+                f"落库与对表的类别必须是表内原拼写。改 "
+                f"registry.resources.{const} 为 {hit!r}")
+
+
+def load_context(conn) -> AuditContext:
+    """输入:中心库连接 → 输出:装配完成的 AuditContext。
 
     实证/映射两级 PT 源在装配期就过 pt_meta 闸(评审 P0-1:废弃 PT——如
     'Office Chairs' 已改名 'Desk Chairs'——直出会让 R0/R1/R2/R3 四闸集体失明
     产出假 pass;旧仓 l1_category.py:605-620 用 INNER JOIN pt_meta 防的正是它)。
     """
-    brand, r4_keys, r4_source = _brand_map(conn)
+    brand, brand_keys, r4_source = _brand_map(conn)
     # TRO 口径守夜(2026-08-30):source 是**自由文本**,而且由飞书同步整列覆盖
     # (risk_sync)。所有者哪天把「TRO品牌」改成别的写法,这里会静默变成 0,
     # 而 TRO 接线的表现是"从此再也不报警"——最难发现的那种坏法。恒 0 就是
@@ -155,14 +199,13 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     tro_n = sum(1 for s in r4_source.values()
                 if str(s).strip().lower().startswith(
                     resources.TRO_BRAND_SOURCE_PREFIX))
-    logger.info("R4 品牌来源:带来源 %d 词,其中 TRO 前缀 %d 词",
+    logger.info("品牌黑名单来源:带来源 %d 词,其中 TRO 前缀 %d 词",
                 len(r4_source), tro_n)
     if not tro_n:
-        logger.warning("R4 品牌来源里 **TRO 前缀 0 词** —— 生产实证应有两万余条,"
+        logger.warning("品牌黑名单来源里 **TRO 前缀 0 词** —— 生产实证应有两万余条,"
                        "多半是黑名单总表「来源」列改了写法(前缀常量:"
                        "registry.resources.TRO_BRAND_SOURCE_PREFIX);"
                        "在此之前 TRO 命中接线整条不会报警")
-    nice_mapping, nice_default = audit_l2.load_nice_mapping()
     pt_meta = _rows_dict(conn, "SELECT walmart_product_type, walmart_category, "
                                "walmart_ptg, access_state, zh_can_do, requirements, "
                                "notes FROM audit.walmart_pt_meta",
@@ -246,6 +289,10 @@ def load_context(conn, *, uspto=None) -> AuditContext:
     # 无法区分,必须让数字见人)
     logger.info("黑名单中心加载:卖家 %d / ASIN %d / 类目 %d",
                 len(p0_sellers), len(p0_asins), len(p0_cats))
+    known_policies = _frozen(conn, "SELECT category_en FROM "
+                                   "audit.walmart_prohibited_policy "
+                                   "WHERE category_en IS NOT NULL")
+    check_rule_policies(known_policies)
     return AuditContext(
         phase0_sellers=p0_sellers,
         phase0_asins=p0_asins,
@@ -256,15 +303,11 @@ def load_context(conn, *, uspto=None) -> AuditContext:
         # requirements"(所有者定稿),那张表是批次 A 搬来的死快照,而"整机 vs
         # 小件"这类推断已移交 L3 判定维度 6。表本身不删(pt_spec_sync 仍写它、
         # audit_why / pt_census 仍查它做诊断),只是审核链不再拿它当判据。
-        ac_automaton=_build_automaton(r4_keys),
+        brand_mention_automaton=_build_automaton(brand_keys),
         r4_source=r4_source,
-        nice_mapping=nice_mapping, nice_default=nice_default,
-        uspto=uspto,
         walmart_confirmed=confirmed,
         catmap=catmap,
-        known_policies=_frozen(conn, "SELECT category_en FROM "
-                                     "audit.walmart_prohibited_policy "
-                                     "WHERE category_en IS NOT NULL"),
+        known_policies=known_policies,
         # 批次 C:Layer 0 哨兵路径集(①b 历史实证改读产品行 walmart_pt,
         # 经 pt_backfill 回填,不再装配证据 map——所有者定稿 2026-08-13)
         # btrim 与 catmap 的 cat.strip() 对称(评审 P2:带尾空白的哨兵行漏拦,
@@ -392,6 +435,10 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
         # 未命中 ⇒ 返回 None = **不落结论**:不写 runs、不动 products、
         # 不盖规则版本 —— 截断的链没资格发 pass/pending(不完整审核
         # 绝不当通过,与「任一道给不出确定答案一律待人工」同一条纪律)。
+        # ⚠ "未命中"看的是**硬拒**(`blocked`):C 批的软证据(品牌文案扫描)
+        # 命中了也照样返回 None —— 它是给 L3 备的料,这一路根本不走 L3,
+        # 落库也没有去处。代价是那次扫描白跑(µs 级),换来的是 stages=L0
+        # 的契约只有一条:**只有硬拒才落结论**。
         # 用途:配合 rerule 零 LLM 翻新黑名单历史行 —— 仍命中的重判
         # (拿到新版本的理由映射),不再命中的保持原判、不被"复活"。
         return None
@@ -403,8 +450,7 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
             l1=L1Info(walmart_product_type="(phase0_blocked)",
                       pt_confidence="低", pt_source="skipped"),
             phase0=p0)
-        outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product, ctx.known_policies)
+        outcome.final_reason_category = audit_reason.compute_final_reason(outcome)
         return outcome
 
     l1 = resolve_pt(product, ctx)
@@ -466,7 +512,10 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
     # reject/pending 改判 + stage='L3',分数保留 L2 值(L3 不动分)
     if verdict == "pass" and run_l3 and conn is not None:
         from services import audit_l3
-        l3 = audit_l3.judge_l3(product, l1, l2, ctx, conn)
+        # phase0 一并传进去:上游证据通道(summarize_evidence)读 L0/L1/L2
+        # 三层的软 hit —— C 批把品牌文案扫描迁进 L0 后,证据源就在 p0 里,
+        # 这条接线现在给上,迁层那天不用再改判定链(规格 §3.6)
+        l3 = audit_l3.judge_l3(product, l1, l2, ctx, conn, phase0=p0)
         outcome.l3 = l3
         if l3.verdict == "reject":
             outcome.verdict = "reject"
@@ -486,18 +535,46 @@ def audit_one(product, ctx: AuditContext, conn=None, *,
             outcome.stage_stopped_at = "L4"
 
     if outcome.verdict == "reject":
-        # ⚠ `ctx.known_policies` 同时喂两处,**必须同源**:这里让 L3 答出的
-        #   政策名按表内原拼写回来(2026-09-02 §十.7 归一化随表),以及下面那道
-        #   校验;`audit_l3.valid_reason_categories` 吃的也是它 —— 三处同一个
-        #   `SELECT category_en`,表改名后一起变,不会有谁掉队。
-        outcome.final_reason_category = audit_reason.compute_final_reason(
-            outcome, product, ctx.known_policies)
-        if ctx.known_policies and not audit_reason.known_policies_check(
-                outcome.final_reason_category, ctx.known_policies):
-            # 兜底触发必须记日志计数(铁律):落在政策表之外只记不改判
-            logger.warning("理由映射落在政策表之外:%s(asin=%s)",
-                           outcome.final_reason_category, product.asin)
+        # 类别 = **查表**(2026-09-02 B1,规格 §3.5):硬拒规则在 detail 里自报,
+        # L3 在结构化输出里给,两者都在产出的那一刻就对过政策表了 ——
+        # 这里不再传 `known_policies`,也不再有第二道"落表外"校验:
+        # 归一化只有一条实现路径(`policy_names.resolve`),不在这儿再来一遍。
+        # 查不到 = None + `audit_reason.STATS['reason_missing']` + warning。
+        outcome.final_reason_category = audit_reason.compute_final_reason(outcome)
     return outcome
+
+
+#: **审核输入行的形状**(唯一出处,2026-09-02 B2 从 product_audit 抽出)。
+#: `SELECT {PRODUCT_ROW_COLUMNS} {PRODUCT_ROW_FROM} WHERE …` 取出来的一行,
+#: 恰好是下面 `product_info_from_row` 认的那一行。
+#: 两个消费方:`workflows/product_audit`(生产候选)与 `workflows/audit_replay`
+#: (回放取数)。**各写一份的后果不报错** —— 回放喂进同一条链的产品正文与生产
+#: 不是同一份(少一个 `seller_id` 就等于卖家闸在回放里恒不命中),而两边的结论
+#: 看着都正常,回放报告于是变成"评估了另一条链"。
+#: WHERE / ORDER BY / LIMIT 各自拼:那才是两条链真正的差异。
+PRODUCT_ROW_COLUMNS = """p.asin,
+       p.title,
+       p.brand,
+       p.walmart_pt,
+       p.pt_source,
+       p.browse_node_id,
+       p.browse_node_chain,
+       p.amazon_category AS amazon_category_path,
+       p.slow -> 'bullet_points' AS bullet_points,
+       coalesce(p.slow ->> 'description',
+                p.slow ->> 'long_description',
+                p.slow ->> 'product_description') AS long_description,
+       sn.buybox ->> 'buybox_seller_id' AS seller_id,
+       sn.buybox ->> 'buybox_seller'    AS seller_name"""
+
+#: 同上的 FROM 段:买盒卖家取**最近一次成功采集**的快照(卖家黑名单闸的入参)。
+PRODUCT_ROW_FROM = """FROM catalog.products p
+LEFT JOIN LATERAL (
+    SELECT s.buybox FROM catalog.snapshots s
+    WHERE s.marketplace = p.marketplace AND s.asin = p.asin
+      AND s.outcome = 'ok'
+    ORDER BY s.scraped_at DESC LIMIT 1
+) sn ON true"""
 
 
 def product_info_from_row(row: dict):

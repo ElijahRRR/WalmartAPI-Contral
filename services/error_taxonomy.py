@@ -7,7 +7,8 @@
 
 第一步只做「解析→归类」,不接处置:本模块的唯一消费者是对照报告工作流
 `workflows/error_reclass_report.py`;生产归类路径仍是
-`services/problem_products.categorize()`(A-L 单字母码),换轨在第二步,
+`services/problem_products.categorize()`(A-L 单字母码);**换轨已于 2026-09-03
+完成、旧引擎已于 2026-09-04 删除**,本模块现在是全仓唯一的归类引擎。原文:
 门 = 所有者过完对照报告。**这不是双轨**,是 NRTL 先例的"先补后删"。
 
 纯函数纪律(方案 §四):不 import db/api/workflows,不读环境变量,零副作用;
@@ -15,7 +16,8 @@
 
 公开面:`split_reasons / normalize_atom / extract_policy / classify_atom /
 classify_reasons / classify_feed_error / RULES`;另有报告侧消费的
-`POLICY_ALIASES / policy_join / alias_gaps`(只做政策表 join,不参与判定)。
+`policy_join`(只做政策表 join,不参与判定;2026-09-03 C 批随改名落地删掉了
+它背后的旧名别名表 —— 词形对不上就是缺口,不做语义合并)。
 """
 
 from __future__ import annotations
@@ -27,8 +29,8 @@ from typing import Iterable, NamedTuple
 from registry import resources
 # ⚠ 政策名归一化只有一份实现(`services/policy_names`);这里 import 的是**那一份**,
 #   不是抄一份进来 —— 两份归一化各自漂移不会报错,只会让同一个名字在报告侧与
-#   同步侧对到不同的行(见 `_norm_key`)。`policy_join` / `alias_gaps` 的形参
-#   恰好也叫 policy_names,故只引入函数本身,不引入模块名,免得同名两义。
+#   同步侧对到不同的行(见 `_norm_key`)。`policy_join` 的形参恰好也叫
+#   policy_names,故只引入函数本身,不引入模块名,免得同名两义。
 from services.policy_names import norm_category
 
 # 主码序 → 名次(记录级取"名次最小"的原子码,方案 §3.5)
@@ -146,8 +148,17 @@ RULES: tuple[Rule, ...] = (
     # 那两条正文都是"要预审批/限特定卖家",病根是没资质不是商品违禁)。
     # ⚠ requires? —— 生产原文两种人称都有:"category that **requires**
     # pre-approval" 与 "these categories **require** pre-approval"(语料 #32)。
+    # ⚠ `get approved to sell` 是 2026-09-04 全量对照查出的**唯一**未识别原文
+    #   ("This item belongs to a restricted category. Get approved to sell these
+    #   items in your Account hub"):97,002 条全文语料里就这 1 条判不出。
+    #   所有者当时问的是「是不是本来就不规范、要不要干脆不入库」—— **不是**,
+    #   它是标准文案,病根是我们判据缺一条,补上即可(不入库会把真·资质门丢掉)。
+    # ⚠ 取的是 `get approved to sell` 而**不是** `restricted category`:后者与
+    #   政策族的 `Restricted/Illegal Products` 只差一个词,而序 7 压过序 15 的
+    #   政策 —— 一旦误命中就是拿资质门吃掉真禁售,方向是往松里错。
     Rule(7, "GATED", "类目需预审批/资质",
          ("restricted to certain sellers", "request approval to sell",
+          "get approved to sell",
           "enhanced vetting program", "health & compliance page"),
          pattern=re.compile(r"requires?\s+pre-approval")),
     Rule(8, "PRICE", "价格规则", ("pricing rule", "price gouging",
@@ -192,11 +203,56 @@ RULES: tuple[Rule, ...] = (
     Rule(17, "OTHER", "未识别(兜底)", catch_all=True),
 )
 
+#: **够格永久拉黑的新码**(所有者 2026-09-03 逐码裁决,唯一出处;裁决表
+#: `docs/error_taxonomy.md` §十二)。换轨后 `services/blacklist.PERMANENT`
+#: 与存量路由 `workflows/blacklist_route` 读的都是这一份。
+#: 与旧 A-L 的 {B,C,E,F,G,K} 对照:旧 B 这一个桶被拆开,**只有真禁售那几种
+#: 留下**(POLICY / PROHIBITED_FINAL / RECALL),`PT_WRONG` 摘了出去 ——
+#: 那是沃尔玛在说"把 product type 选对",是修法不是禁令(§11.6 生产原文实证)。
+PERMANENT_CODES = ("PROHIBITED_FINAL", "POLICY", "IP", "BRAND",
+                   "RECALL", "FLAGGED", "GATED")
+
+#: `OTHER` 是个混装桶(序 16 显式杂项 + 序 17 兜底),整码拉黑会把"未识别"
+#: 也永久禁掉。所有者裁决:**只有这两个显式词条算永久拉黑**,其余 OTHER 放行。
+#: 判据是 `Rule(16)` 的 `unlisted_term`(命中哪个词条由引擎自报,不在这儿重新匹配)。
+#: ⚠ `currently under review` 不在里面:审查中是**自愈态**(24 小时内自动复架)。
+PERMANENT_UNLISTED_TERMS = ("business decision", "trust & safety")
+
+#: 新码里**不是「这件商品本身违禁」**的那些(2026-09-03 加,唯一出处)。
+#: 旧 A-L 码把这些一律算永久禁售拉黑,新码认得出病根另在别处。
+#: 逐个理由:PT_WRONG=我方类目选错(沃尔玛明示改 product type)/ GATED=类目要
+#: 预审批(没资质 ≠ 商品违禁)/ CONTENT=文案图片不合标准 / INFO=信息缺失 /
+#: PRICE=价格规则 / SYSTEM=沃尔玛系统错误 / STAGE=未上线(中性)/ EXPIRED=过期。
+#: ⚠ **FLAGGED 与 OTHER 故意不在这一集**:前者沃尔玛不给理由、后者没判据,
+#:   都不能反过来断言"不是违禁"(判不准就不判,与全仓同一条纪律)。
+#: ⚠ 两个消费方(error_reclass_report 报账 / error_reclass 回填)读的是**这一份**:
+#:   工作流之间不许 import,各写一份就是双轨,改一处漏一处不会有任何东西红。
+NOT_A_PRODUCT_BAN = ("PT_WRONG", "GATED", "CONTENT", "INFO",
+                     "PRICE", "SYSTEM", "STAGE", "EXPIRED")
+
 _RULE_UNKNOWN = RULES[-1]
 _RULE_UNLISTED = RULES[-2]
 # feed 政策族只过序 1-15(方案 §3.6 通道 2):序 0 是 AI 通道自己的事,
 # 序 16/17 的 OTHER 不在政策族的语义里。
 _POLICY_CHANNEL_RULES = tuple(r for r in RULES if 1 <= r.order <= 15)
+
+
+def is_permanent(code: str | None, unlisted_term: str | None = None) -> bool:
+    """输入:新主码(+ 序 16 命中的词条)→ 输出:够不够格永久拉黑。
+
+    所有者 2026-09-03 裁决(§十二):七个码直接算;`OTHER` 只有
+    `business decision` / `trust & safety` 两个显式词条算。
+    ⚠ **`code=None` 一律 False**:那是"判不出来",不是"判成了不违禁" ——
+    存量里判不出的行怎么处置由调用方按裁决另行决定(所有者定的是**拉黑**,
+    见 `workflows/blacklist_route`),不在这个纯函数里替它选。
+    """
+    if not code:
+        return False
+    if code in PERMANENT_CODES:
+        return True
+    if code == "OTHER" and unlisted_term:
+        return unlisted_term.strip().casefold() in PERMANENT_UNLISTED_TERMS
+    return False
 
 
 def _hit(rule: Rule, fold: str) -> bool:
@@ -343,29 +399,20 @@ def extract_policy(atom_raw: str | None) -> PolicyName:
 
 # ── 政策表 join(报告侧消费;**不参与判定**,policy_name 一律保留原文)──────
 #
-# **过渡期产物,生产改名落地后随第三步 L3 批删除**(定稿 §十.7:官方政策类别名
-# = 全链唯一键)。它存在的唯一理由是:报错正文里的政策名一直是**官方全称**,
-# 而政策表存量行用的是旧仓搬迁时的缩写名 —— 两边对不上,报告会把一堆真实存在的
-# 政策算成"政策表缺口"。`policy_sync` 把表内名改成官方拼写之后,直接键就命中了,
-# 这张表连同 `registry.resources.POLICY_LEGACY_NAMES` 一起退役。
-#
-# ⚠ **不手写**:从 `registry.resources.POLICY_LEGACY_NAMES`(仓内唯一一份旧名↔官方名映射,
-#   铁律 3)反向派生 —— {归一化(官方名): 表内旧名}。手抄第二份的后果不报错:
-#   所有者往映射表里追加一条,这边不知道,那条别名就静默不存在。
-# ⚠ 派生键跟着**官方拼写**走(旧手写表抄的是报错正文里的写法,例如 Tobacco 那条
-#   多一个牛津逗号)。2026-09-02 `_norm_key` 归并到 `norm_category` 之后,逗号与
-#   `&`↔`and` 本来就被归一化吃掉了,这个差别不再有影响 —— 但键仍以官方为准:
-#   别名指向的是政策表,而政策表以官方拼写为准。
-# ⚠ 别名只收「词形差」(and↔&、Radio Frequency↔RF 这类),**不做语义合并**:
-#   `Knives and other Melee Weapons`、`Firearm Accessories` 这种表里没有对应行的,
-#   该进"政策表缺口"清单让人看见,不许在这儿偷偷归到别的政策上。
-POLICY_ALIASES = {_norm_key(official): legacy
-                  for legacy, official in resources.POLICY_LEGACY_NAMES.items()}
-
-
+# ⚠ **别名表 `POLICY_ALIASES` / `alias_gaps` 已于 2026-09-03 C 批退役**
+#   (连同 `registry.resources.POLICY_LEGACY_NAMES` 与 `policy_names.to_official`)。
+#   它是改名过渡期的桥:报错正文里的政策名一直是**官方全称**,而政策表存量行
+#   用的是旧仓搬迁时的缩写名,两边对不上会把一堆真实存在的政策算成"政策表缺口"。
+#   2026-09-02 `policy_sync` 真跑把表内名全部改成官方拼写之后,**直接键就命中**,
+#   这座桥的两头连的是同一个地方 —— 留着 = 一份永远不会再被验证的历史映射。
+#   今后报错正文里出现表里没有的政策名,它就该进「政策表缺口」清单让人看见
+#   (那正是这张表原本明令禁止用来做语义合并的那一类)。
 def policy_join(candidate: str | None,
                 policy_names: Iterable[str] | None) -> str | None:
     """输入:政策名候选 + 政策表 category_en 集合 → 输出:命中的 category_en(不中给 None)。
+
+    只走词形归一(`policy_names.norm_category`)—— 缩写差这类**语义合并**不做:
+    对不上就是对不上,进「政策表缺口」清单等人裁决。
 
     ⚠ 表按**名字序**构造:入参常是 set,而归一化后两行撞同一个键时"谁赢"由
     迭代序决定 —— 不定序会让同一份报错语料在两次进程里 join 到不同的行,
@@ -374,31 +421,7 @@ def policy_join(candidate: str | None,
     if not candidate or not policy_names:
         return None
     table = {_norm_key(n): n for n in sorted(policy_names) if n}
-    key = _norm_key(candidate)
-    if key in table:
-        return table[key]
-    target = POLICY_ALIASES.get(key)
-    if target and _norm_key(target) in table:
-        return table[_norm_key(target)]
-    return None
-
-
-def alias_gaps(policy_names: Iterable[str] | None) -> tuple[str, ...]:
-    """输入:政策表 category_en 集合 → 输出:别名表里指不到表的目标值。
-
-    方案 §3.4.5 的运行时校验:别名的目标值(= 表内旧名)必须在注入字典里 ——
-    指不到 = 别名写错或政策表改名,那条别名等于静默失效。
-
-    ⚠ 2026-09-02 起这个信号**有两种读法**,别看见非空就当故障:改名落地前指不到
-    = 映射表写错了;`policy_sync` 把表内名改成官方拼写之后,7 个旧名里的 **5 个**
-    会指不到 —— 那不是失效,是这张别名表**功成身退**的信号(此时直接键已命中),
-    该做的是随第三步 L3 批把它与 `registry.resources.POLICY_LEGACY_NAMES` 一起删掉。
-    (另 2 个 —— `Auto & Motor Vehicles` / `Textiles & Apparel` —— 与官方名只差
-    `&`↔`and`,归一化后同键,所以"指得到";它们的别名同样已经多余。)
-    """
-    table = {_norm_key(n) for n in (policy_names or ()) if n}
-    return tuple(sorted({t for t in POLICY_ALIASES.values()
-                         if _norm_key(t) not in table}))
+    return table.get(_norm_key(candidate))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -429,6 +452,11 @@ class Result(NamedTuple):
     atom_codes: tuple[tuple[str, str | None], ...]
     unknown: tuple[str, ...]
     unlisted: tuple[tuple[str, int], ...]
+    #: **赢下主码那个原子**命中的显式词条(序 16),没有则 None。
+    #: `unlisted` 是全记录的聚合(报表用),这一个是**记录级判据**——
+    #: `is_permanent` 判 `OTHER` 该不该拉黑读的就是它,拿聚合去判会把
+    #: "另一个原子提到过 business decision" 也算成主码的理由。
+    unlisted_term: str | None = None
 
 
 class FeedResult(NamedTuple):
@@ -494,6 +522,7 @@ def classify_reasons(atoms: Iterable[str] | None,
         unknown=tuple(r.atom for r in results
                       if r.rule_order == _RULE_UNKNOWN.order),
         unlisted=tuple(sorted(unlisted.items())),
+        unlisted_term=win.unlisted_term,
     )
 
 

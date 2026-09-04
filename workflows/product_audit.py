@@ -2,14 +2,16 @@
 
 用法(2026-08-16 起**缺省即真跑**,空跑加 `--dry-run`;`--execute` 是兼容别名):
   python cli.py product_audit                       # 真跑:判定 + 落 runs/hits + 写结论
-  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 五列
-  python cli.py product_audit -p limit=2000
+                                                    # ⚠ **缺省不限量**:候选谓词圈住多少判多少
+  python cli.py product_audit --dry-run             # 空跑:判定照跑,不写 products 审核六列
+                                                    # 拿不准规模先跑它,摘要会报"共 N 个"
+  python cli.py product_audit -p limit=2000                # 要限量才给(不给 = 全判)
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
-  python cli.py product_audit -p mode=nonpass -p limit=5000
-                                                    # **非 pass 全量重判**(rejected+pending+
-                                                    # 未审):判定标准改了就整批用新标准重认一次
+  python cli.py product_audit -p mode=nonpass              # **非 pass 全量重判**(rejected+
+                                                    # pending+未审):判定标准改了就整批用
+                                                    # 新标准重认一次;分批加 -p limit=5000
   python cli.py product_audit -p rerule=phase0_forbidden_category
                                                     # 改了某条规则后**定点**重审被它拒过的
   python cli.py product_audit -p repts=1                   # 改了**飞书类目表**之后重审:
@@ -20,40 +22,42 @@
                                                     # 未命中的不落结论不盖版本(不"复活")
   python cli.py product_audit -p rerule=phase0_lark_blacklist_seller -p stages=L0
                                                     # 零 LLM 翻新黑名单历史行的标准姿势
-  python cli.py product_audit -p mode=pass -p stages=L0 -p limit=1000000
+  python cli.py product_audit -p mode=pass -p stages=L0
                                                     # 现役 pass 全量重过 L0(黑名单翻案);
-                                                    # 未命中不退出候选,**一次大 limit 扫完**
-  python cli.py product_audit -p mode=online -p stages=L0 -p limit=1000000
+                                                    # 未命中不退出候选 ⇒ **别给 limit**
+                                                    # (给了就每轮重扫同一批前缀)
+  python cli.py product_audit -p mode=online -p stages=L0
                                                     # **在架** pass 重过 L0(product_chain
                                                     # 每天 13:00 跑这一条);翻成 rejected 的
                                                     # 由紧随其后的 problem_scan 建删除建议
-  python cli.py product_audit -p r5=on                     # 开 USPTO 商标反查(默认关)
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
-  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填审核五列
+  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填审核六列
   python cli.py product_audit -p from_sheet=1 -p force=1   # 同上,但审核结果为空的**一律重判**
                                                     # (库里已有结论的也重判,不是回填);
                                                     # 已填结论的表行仍然不领。飞书类目表
                                                     # 改过之后翻存量走这条
-  python cli.py product_audit -p from_sheet=1 -p limit=3000   # 存量大时加大一轮的量
+  python cli.py product_audit -p from_sheet=1 -p limit=300     # 只判 300 个(缺省全判)
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
   python cli.py product_audit -p from_sheet=1 -p gap_wait=0    # 缺数据只推采集不等(采集侧病了时)
 
-链路(批次 C 全链):领 catalog.products 待审行 → Phase0 四件套 →
-L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2 硬规则 → [L3 语义 →
-L4 视觉] → 政策理由映射 → 落 audit.audit_runs/audit_hits;真跑才写
-products.audit_* 五列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
-L2 R4 扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
+链路(2026-09-03 C 批瘦身后):领 catalog.products 待审行 → L0(五条硬拒
+短路 + 一条 0 分软证据「品牌黑名单扫文案」,软的不终止)→
+L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2(只剩 R1 类目准入)→
+[L3 语义 → L4 视觉] → 类别映射 → 落 audit.audit_runs/audit_hits;真跑才写
+products.audit_* 六列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
+L0 品牌文案扫描扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
 (源头一条 + 波及逐店,展开走 services/risk_trace),dry-run 一条不写。**`-p from_sheet=1` 时另把结论投影回上架表
-审核五列**(标题/PT/审核结果/具体内容/审核日期;2026-08-16 开闸,
-并跑期"只落库不投影"的纪律到此结束。「类别」列归另一条 PR,本工作流不写)。
+审核六列**(标题/PT/审核结果/类别/具体内容/审核日期;2026-08-16 开闸,
+并跑期"只落库不投影"的纪律到此结束;「类别」列 2026-09-02 三段分列后由本工作流
+一并写,列位置一律由表头名定位,源码里没有写死的列字母)。
 
 ⚠ `from_sheet` **缺省不是强审**(要强审加 `-p force=1`,见下):
 表里审核结果为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
-领取口径含 **E=pending**(2026-08-17):pending 是中间态不是结论,写进 E 之后
-若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
+领取口径含 **「审核结果」=pending**(2026-08-17):pending 是中间态不是结论,
+写进那一格之后若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
 
 **缺数据同轮补采闭环**(所有者定稿 2026-08-17:「产品审核不能等下一次,要轮询
 等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
@@ -69,13 +73,13 @@ L2 R4 扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.
 是要写到沃尔玛的真金白银)。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
-五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
+审核六列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
 (L1 rerank / L3;L4 需显式 l4=on)——验收抽样时用 limit 控制成本。
 
 补刷(mode=backfill,批复 #5"只补刷"):候选限 audit_status IS NULL;先查
 audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
 'SHORTCUT'——204 万存量里有短路影子行;排序键 (verdict='reject') DESC
-实现旧 reject 粘性),有历史者**直接采用**写五列+事件(detail 带
+实现旧 reject 粘性),有历史者**直接采用**写审核六列+事件(detail 带
 referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者进正常判定。
 
 pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
@@ -87,8 +91,6 @@ L3=LLM 故障(10.2 单链:重试尽→pending 绝不默认放行)。均按每日
 seller 闸依赖 snapshots.buybox->>'buybox_seller_id'(契约外字段,可能恒缺)
 ——缺失计数在摘要亮出,恒缺说明卖家闸未生效,需向采集侧提契约扩展。
 
-R5(USPTO)默认关:spec_l2 §5.6f——brand_nice_class 覆盖率仅 ~2.6 万/1400 万,
-先离线抽样出数据再决定常开;开时全程复用一个只读连接。
 """
 
 import json
@@ -100,10 +102,10 @@ from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_reason, audit_rules, audit_store, db_guard, \
-    kpi, \
-    listing_sheet, product_events, product_ingest, risk_trace, scrape_batches, \
-    store_events, stores
+from services import audit_l3, audit_pool, audit_reason, audit_rules, \
+    audit_store, db_guard, kpi, \
+    listing_sheet, policy_names, product_events, product_ingest, risk_trace, \
+    scrape_batches, store_events, stores
 
 DANGEROUS = True
 
@@ -125,41 +127,45 @@ _PROGRESS_MIN_SEC = 5.0
 # 默认 128(所有者定稿 2026-08-17:「审核默认设置为 128,之前已经实测调大
 # 并发是有效果的」)。此前默认 4 而上限 64 —— 不显式传 -p workers= 就只跑 4,
 # "上限 64"看着高其实从没生效过。
-_DEFAULT_WORKERS = 128
-_MAX_WORKERS = 256
+# ⚠ 数字的出处在 registry(2026-09-02 B2):`audit_replay` 吃同一个并发口径,
+# 各写一份的话调大一处不调另一处,而两边都不会报错。这里只是本模块别名。
+_DEFAULT_WORKERS = resources.AUDIT_WORKERS_DEFAULT
+_MAX_WORKERS = resources.AUDIT_WORKERS_MAX
 
 # 落库批大小:并发调到 128 之后,主线程"逐行 savepoint + 逐行 INSERT"成了
 # 新瓶颈,改成攒一批 executemany(见 audit_store.persist_runs)。
 # 批太大则一次失败要退回逐行的代价也大,200 是速度与隔离代价的折中。
 _PERSIST_BATCH = 200
 
-_CANDIDATE_SQL = """
-SELECT p.asin,
-       p.title,
-       p.brand,
-       p.walmart_pt,
-       p.pt_source,
-       p.browse_node_id,
-       p.browse_node_chain,
-       p.amazon_category AS amazon_category_path,
-       p.slow -> 'bullet_points' AS bullet_points,
-       coalesce(p.slow ->> 'description',
-                p.slow ->> 'long_description',
-                p.slow ->> 'product_description') AS long_description,
-       sn.buybox ->> 'buybox_seller_id' AS seller_id,
-       sn.buybox ->> 'buybox_seller'    AS seller_name
-FROM catalog.products p
-LEFT JOIN LATERAL (
-    SELECT s.buybox FROM catalog.snapshots s
-    WHERE s.marketplace = p.marketplace AND s.asin = p.asin
-      AND s.outcome = 'ok'
-    ORDER BY s.scraped_at DESC LIMIT 1
-) sn ON true
+# ⚠ 行的**形状**(SELECT 列表 + 买盒卖家 LATERAL)在
+# `services/audit_rules.PRODUCT_ROW_COLUMNS/_FROM` —— 回放工作流
+# `audit_replay` 吃同一份(2026-09-02 B2)。这里只拼本链特有的
+# WHERE / ORDER BY / LIMIT。
+_CANDIDATE_TAIL = """
 WHERE p.marketplace = %(marketplace)s AND ({where}){recent_guard}
   AND p.title IS NOT NULL AND p.title <> ''
-ORDER BY p.audited_at NULLS FIRST, p.updated_at
-LIMIT %(limit)s
+ORDER BY p.audited_at NULLS FIRST, p.updated_at{limit_clause}
 """
+# ⚠ `LIMIT` 是**可选段**(所有者定稿 2026-09-03:「审核这个脚本不应有默认设置的
+# limit,需要限制的时候才手动带参数」)。不给 `-p limit=N` 时这一段整个不拼,
+# 候选谓词圈住多少就判多少 —— 而不是拼一个 `LIMIT NULL` 让人去猜 PG 的语义。
+_LIMIT_CLAUSE = "\nLIMIT %(limit)s"
+
+
+def _candidate_sql(where: str, recent_guard: str, limit: int | None) -> str:
+    """输入:候选谓词 + 复烧护栏 + 本轮上限(None = 不限量)→ 输出:完整候选 SQL。
+
+    ⚠ **只 `format` 尾段**,共享前缀事后拼:`PRODUCT_ROW_COLUMNS/_FROM` 是
+    `services/audit_rules` 的文本,哪天那边多一个 `{`(jsonb 字面量、格式串)
+    就会把本工作流炸在 `KeyError`,而吃同一份文本的 `audit_replay` 一点事没有
+    —— 这种耦合从两边的代码上都看不出来。format 面收窄到本文件自己的尾段,
+    共享文本走纯拼接,谁也炸不到谁。
+    """
+    return ("SELECT " + audit_rules.PRODUCT_ROW_COLUMNS + "\n"
+            + audit_rules.PRODUCT_ROW_FROM
+            + _CANDIDATE_TAIL.format(
+                where=where, recent_guard=recent_guard,
+                limit_clause="" if limit is None else _LIMIT_CLAUSE))
 # ↑ title 过滤挡两类:采集降级空标题行,以及 pt_backfill 的占位行(只有
 #   asin+walmart_pt)。占位行若进候选,循环级跳过会让同一批空壳行每轮
 #   霸占 LIMIT 名额 → 真候选饿死。注:asins= 点名的空壳行也被过滤,
@@ -203,6 +209,7 @@ _HAS_HISTORY_SQL = """EXISTS (
 _ADOPT_SQL = """
 UPDATE catalog.products
 SET audit_status = %(status)s, audit_reason = %(reason)s,
+    audit_detail = %(detail)s,
     walmart_pt = CASE WHEN pt_source = 'walmart_confirmed' THEN walmart_pt
                       ELSE COALESCE(%(pt)s, walmart_pt) END,
     pt_source = CASE WHEN pt_source = 'walmart_confirmed' THEN pt_source
@@ -213,9 +220,9 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 """
 
 
-_KNOWN_PARAMS = {"asins", "limit", "mode", "r5", "force_rerun", "rerule",
+_KNOWN_PARAMS = {"asins", "limit", "mode", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
-                 "gap_wait", "force", "repts"}
+                 "gap_wait", "force", "repts", "active_days"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
@@ -244,6 +251,52 @@ _DEFAULT_CANDIDATE = (
     " AND p.audit_version IS DISTINCT FROM %(cand_ver)s))")
 
 
+# 近 N 天有动销(2026-09-02 B2,所有者定稿 §六.8:「`mode=stale` 只跑近 90 天
+# 有动销的一批」)。**口径与 `services/alloc_survey._SQL_SALES` 逐条对齐**,
+# 那是全仓"动销"的唯一口径,不许在这里另立一套:
+#   · 窗口打在 `order_date` 上(不是 status_date:那是状态变更时刻,退款/发货
+#     都会把它推到今天,拿它算动销 = 把老单算成新单);
+#   · 只排 `Cancelled`(取消的不算卖过),其余状态一律算 —— 未发货也是真需求;
+#   · 用 **`asin` 列**,由 `order_asin_normalize` 按 `services/sku_asin` 规则补填。
+#     `asin IS NULL` 的行自然不算动销(提不出源头码的少量残行),**绝不拿
+#     `sku` 当 asin**:三段式订货号与纯数字 item id 直接等值永远查空,
+#     表现是"这批产品全都没动销过",而且不报错(schema.sql:694-699 的原话)。
+_ACTIVE_SALES = """
+ AND EXISTS (SELECT 1 FROM orders.order_lines o
+             WHERE o.asin = p.asin
+               AND o.order_date >= now() - make_interval(days => %(active_days)s)
+               AND coalesce(o.sale_status, '') <> 'Cancelled')"""
+
+_ACTIVE_DAYS_DEFAULT = 90       # 所有者定稿 §六.8
+
+
+def _active_days(params: dict) -> int:
+    """输入:params → 输出:动销窗口天数(0 = 显式不过滤);非法值直接抛。
+
+    只对 `mode=stale` 有意义(唯一的批量重审通道)。给别的 mode 传它一律炸
+    —— 静默忽略的话人以为"这轮只判了有动销的",实际把 approved 存量整批
+    重付了一遍 LLM,而摘要长得一模一样(与 `force` 那条同款纪律)。
+
+    `0` 是**显式**的"不过滤":缺省 90 天,想跑全量得自己写出来。
+    非整数 / 负数一律抛 —— `int("90天")` 抛的是 ValueError 没错,但错误信息
+    说不出"这个参数是干什么的",而这条参数决定的是一轮要花多少钱。
+    """
+    raw = params.get("active_days")
+    if raw is None or str(raw).strip() == "":
+        return _ACTIVE_DAYS_DEFAULT
+    if str(params.get("mode", "")).strip() != "stale":
+        raise ValueError("-p active_days=N 只与 -p mode=stale 连用"
+                         "(它筛的是版本重审的候选;别的通道各有自己的候选谓词)")
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"active_days 要整数天数(收到 {raw!r});"
+                         f"0 = 不按动销过滤") from None
+    if days < 0:
+        raise ValueError(f"active_days 不能为负(收到 {days});0 = 不按动销过滤")
+    return days
+
+
 def _pick_where(params: dict) -> tuple[str, dict]:
     """输入:params → 输出:(候选谓词 SQL, 绑定参数)。
 
@@ -253,12 +306,18 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     就再跑一轮接着判剩下的,不会每轮从头扫同一批;而 dry-run 不写版本号
     ⇒ 候选集恒定,可重复抽样验证。
     没有版本闸的分支(mode=pass / mode=online:未命中不落结论、不盖版本、
-    不退出候选)必须**一次给够 limit**,小批多轮只会每轮重扫同一批前缀。
+    不退出候选)**别给 limit**,小批多轮只会每轮重扫同一批前缀。
+    (2026-09-03 起缺省就是不限量,这两条通道不给参数即可;此前要写
+    `-p limit=1000000` 才等价。)
     """
     unknown = set(params) - _KNOWN_PARAMS - _CLI_INJECTED
     if unknown:
         # 静默吞参数 = "全量重审跑完了"的假象(评审 P1-4),宁炸不吞
         raise ValueError(f"未识别参数 {sorted(unknown)}(可用:{sorted(_KNOWN_PARAMS)})")
+    # 取值/搭配校验前置(与下面 `force` 那条同款纪律):`active_days` 只对
+    # mode=stale 有意义,而它**不在** stale 分支里校验就等于"传错了静默忽略"
+    # —— 人以为这轮只判了有动销的,实际把 approved 存量整批重付了一遍
+    _active_days(params)
     if _forced_sheet(params) and not params.get("from_sheet"):
         # 宁炸不吞:`force` 只对 from_sheet 那条路有意义(别的通道要么本就强审、
         # 要么有自己的候选谓词)。静默忽略的话,人以为强审了、实际按缺省口径跑,
@@ -320,7 +379,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 首版就是锚最近一轮(verdict='reject' 且该轮有这条 hit),所有者第一次
         # dry-run 当场炸出问题:**dry-run 也落 runs/hits**,于是那 500 条的
         # "最近一轮"变成了本次 dry-run 的结果 —— 被救回来的 45 条新一轮判 pass、
-        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 五列,
+        # 也不再带这条 hit,直接**掉出候选集**;而 dry-run 不写 products 审核六列,
         # 它们的 audit_status 还是 rejected。净效果:45 条产品被"验证"了一次就
         # 永久搁浅,任何通道都不会再捞它们,而且全程不报错。
         #
@@ -383,9 +442,20 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         #
         # **有天然分页**(机械见 _pick_where 头注)。历史导入行版本旧/空,
         # `IS DISTINCT FROM` 全兜住,首次提版自然扫进。
-        return ("p.audit_status = 'approved'"
-                " AND p.audit_version IS DISTINCT FROM %(stale_ver)s",
-                {"stale_ver": resources.AUDIT_RULES_VERSION})
+        #
+        # **近 N 天有动销**(2026-09-02 B2,所有者定稿 §六.8:「`mode=stale`
+        # 只跑近 90 天有动销的一批,不再全量重付」)。全库 approved 几十万行
+        # 全链重审 = 一笔谁也不想付两次的账;真正要紧的是**还在卖的那批**
+        # 判据别过期。`active_days=0` 显式关掉这道闸(要跑全量得自己写出来)。
+        # 口径见 `_ACTIVE_SALES`(与 alloc_survey 的动销口径同一条)。
+        days = _active_days(params)
+        where = ("p.audit_status = 'approved'"
+                 " AND p.audit_version IS DISTINCT FROM %(stale_ver)s")
+        extra = {"stale_ver": resources.AUDIT_RULES_VERSION}
+        if days:
+            where += _ACTIVE_SALES
+            extra["active_days"] = days
+        return where, extra
     if mode == "pass":
         # 现役 pass 全量重过 L0(所有者 2026-08-19:「对仓库里所有 pass 的
         # 产品重跑L0」)——黑名单是活的,拉黑常发生在放行**之后**,放行过的
@@ -393,8 +463,8 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 全链重审全部 pass = 重烧全库 LLM,要那么干请 force_rerun=<版本>。
         # ⚠ 本模式**没有天然分页**(机械见 _pick_where 头注):命中翻案
         # (status 变 rejected)会退出候选,但未命中不落结论不盖版本
-        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一次大 limit
-        # 扫完(L0 纯查库,几十万行也就是多花几分钟)。
+        # (截断链没资格,#49 语义)、**不退出候选** —— 必须一轮扫完,
+        # 所以**别给 limit**(缺省就是不限量;L0 纯查库,几十万行也就多几分钟)。
         return "p.audit_status = 'approved'", {}
     if mode == "online":
         # **在架** pass 重过 L0(所有者定稿 2026-08-22:接进 product_chain,
@@ -406,8 +476,9 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 口径是 `missing_since IS NULL`(还在目录里),**不加**
         # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
         # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
-        # 所以调度里必须给一次能扫完的 limit,小 limit 会让每天都从头扫
-        # 同一批前缀,尾巴永远轮不到而且不报错。
+        # 所以必须一轮扫完:**别给 limit**(2026-09-03 起缺省就是不限量;
+        # 此前调度里写的是 `-p limit=1000000`)。给个小 limit 会让每天都从头
+        # 扫同一批前缀,尾巴永远轮不到而且不报错。
         # 身份两条腿 OR,**不写成 coalesce**(conventions §九对本处的例外,
         # 理由是索引):这是对 products 每一行做的相关子查询,写成
         # coalesce(ls.source_key, w.sku) = p.asin 就用不上 walmart_items_sku_idx,
@@ -428,7 +499,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
 
 
-# 批量重审的"还剩多少"计数(与 _CANDIDATE_SQL 同一 where,去掉 JOIN 与 LIMIT)
+# 批量重审的"还剩多少"计数(与 _candidate_sql 同一 where,去掉 JOIN 与 LIMIT)
 _RERULE_COUNT_SQL = """
 SELECT count(*) FROM catalog.products p
 WHERE p.marketplace = %(marketplace)s AND ({where})
@@ -436,8 +507,65 @@ WHERE p.marketplace = %(marketplace)s AND ({where})
 """
 
 
+def _candidate_what(params: dict) -> tuple[str, str]:
+    """输入:params → 输出:(这批候选是什么, 一个都没有时的提示)。
+
+    只管**措辞**,不管取数 —— 分支与 `_pick_where` 一一对应(那边改了这边要跟着
+    改;对不上的后果是摘要把这批说成另一批,不报错)。
+    2026-09-03 从 run() 里三条分支的内联字面量抽出来:缺省不限量之后每条通道
+    都要报总量,内联写法只覆盖了三条。
+    """
+    rule = str(params.get("rerule", "")).strip()
+    mode = str(params.get("mode", "")).strip()
+    asins = [a for a in str(params.get("asins", "")).split(",") if a.strip()]
+    fr = str(params.get("force_rerun", "")).strip()
+    if asins:
+        return (f"点名重审 asins={len(asins)} 个(无视现有结论)",
+                "点名的 ASIN 一个都不在库(或都没有标题)")
+    if fr:
+        return (f"按版本重审:audit_version 不等于 {fr} 的全部"
+                f"(含已 approved/rejected 的存量)",
+                f"一个都没有:这批已经全部盖着 {fr}")
+    if str(params.get("repts", "")).strip() == "1":
+        return ("按飞书类目表判据变更重审:该 PT 的判据在我判过之后变过的 rejected",
+                "一个都没有:类目表没改过,或改的那些 PT 下没有判拒的行")
+    if rule:
+        return (f"定点重审 rerule={rule}:命中过该规则且**现结论仍是 "
+                f"rejected**、且未按当前规则版本判过的",
+                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了")
+    if mode == "backfill":
+        return ("补刷:只审**还没有结论**的(有历史结论的直接采用)",
+                "一个都没有:库里每一行都有结论了")
+    if mode == "pending":
+        return ("待定专刷:重判 pending(**无 1 天退避**)",
+                "一个都没有:没有 pending 存量")
+    if mode == "nonpass":
+        return ("非 pass 全量重判:rejected + pending + 未审过、"
+                "且未按当前规则版本判过的",
+                "一个都没有:这批已经全部按当前版本判过了")
+    if mode == "stale":
+        # 首行必须点名动销口径(2026-09-02 B2):同一条命令带不带 `active_days`
+        # 差的是一个数量级的候选量与账单,而摘要其余部分长得一模一样
+        days = _active_days(params)
+        scope = (f"、**近 {days} 天有动销**" if days
+                 else "、**不限动销**(active_days=0,全量 approved)")
+        return (f"版本重审:approved 且未按当前规则版本"
+                f"({resources.AUDIT_RULES_VERSION})判过的{scope}"
+                f"(rejected 沿用不重审)",
+                "一个都没有:这批已全部按当前版本判过"
+                + (f",或近 {days} 天没有动销" if days else ""))
+    if mode == "pass":
+        return ("现役 pass 全量重过 L0(黑名单翻案;**无天然分页**,别给 limit)",
+                "一个都没有:库里没有 approved 的行")
+    if mode == "online":
+        return ("**在架** pass 重过 L0(**无天然分页**,别给 limit)",
+                "一个都没有:没有在架且 approved 的行")
+    return ("缺省口径:未审 + pending 过 1 天退避 + approved 但判据版本过期的",
+            "一个都没有:全库都按当前版本判过了")
+
+
 def _batch_head(conn, what: str, where: str, extra: dict,
-                limit: int, empty_hint: str) -> list[str]:
+                limit: int | None, empty_hint: str) -> list[str]:
     """输入:连接 + 这批是什么 + 候选谓词 → 输出:摘要前言(总量/本轮/还剩)。
 
     没有这一行的话,摘要只会说"候选 200",而 200 正是 limit ——**看不出是刚好
@@ -450,8 +578,18 @@ def _batch_head(conn, what: str, where: str, extra: dict,
         cur.execute(_RERULE_COUNT_SQL.format(where=where),
                     {"marketplace": "US", **extra})
         total = int(cur.fetchone()[0])
+    # ⚠ 这一句必须在**开始花钱之前**落进日志:摘要是 run() 末尾才拼的,
+    # 不限量口径下(2026-09-03)它只能当事后账单。日志里这一行才是"来得及
+    # Ctrl-C"的那个信号
+    logger.warning("候选总量:%s,共 %d 个(本轮 %s)", what, total,
+                   "不限量" if limit is None else f"limit={limit}")
     head = [f"{what},共 {total} 个"]
-    if total > limit:
+    if limit is None and total:
+        # 不限量是缺省口径(2026-09-03),但**这一轮要花多少钱**得说出来:
+        # 摘要只写"共 N 个"时,人还会按老习惯以为后面有个 500 挡着
+        head.append(f"  本轮**不限量**(未给 -p limit):这 {total} 个全判 —— "
+                    f"要分批就加 -p limit=N")
+    elif limit is not None and total > limit:
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
                     f"{total - limit} 个** —— 真跑一轮会给判过的盖上 "
                     f"{resources.AUDIT_RULES_VERSION},它们自动退出候选集,"
@@ -511,9 +649,11 @@ def _forced_sheet(params: dict) -> bool:
     `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道
     能重判受影响的存量。这个开关是那种时候的出口。
 
-    ⚠ **贵**:打开之后审核结果为空的每一行都进判定引擎(含库里早有结论的),
-    而 `from_sheet` 又会把 limit 顶到 ASIN 总数、不截断。摘要里必须把
-    "本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    ⚠ **贵**:打开之后审核结果为空的每一行都进判定引擎(含库里早有结论的)。
+    摘要里必须把"本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
+    ⚠ 量由 `limit` 说了算:**缺省不限量**(2026-09-03 定稿),给了 `-p limit=N`
+    就真截断 —— 此前这里写的是"from_sheet 会把 limit 顶到 ASIN 总数、不截断",
+    那正是被修掉的 bug(摘要说只判 N 个、实际全判),别照着它把那行改回去。
     """
     return str(params.get("force", "")).strip() == "1"
 
@@ -575,24 +715,47 @@ def _hits_of_runs(conn, run_ids: list) -> dict:
     return out
 
 
-def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
-    """输入:候选 ASIN 列表 → 输出:(采用数, 已采用 ASIN 集)。
+def _adopt_category(reason_cat, known) -> str | None:
+    """输入:老 run 的 `l3_reason_category` + 类别枚举 → 输出:类别或 None。
 
-    方案 A(spec_shortcut §1.6,待所有者追认):历史结论直接写五列+事件,
+    ⚠ 存量 `audit_runs` 里那一列装的是**旧语义**:`'none'`、小写的旧缩写名、
+    `.title()` 变过形的自由值都有。三段分列后 `products.audit_reason` 只装
+    类别枚举 —— 原样搬进去等于把旧世界的脏值洗进新列,而且不会报错。
+    对不上就是**没有类别**(None):采用历史本来就不重判,编一个更糟。
+    ⚠ 2026-09-03 C 批之后连**旧缩写名**也对不上了(`policy_names` 的旧名认领
+    那一级随 `POLICY_LEGACY_NAMES` 退役):那批老行的类别留空 + 计数进摘要,
+    等它们被重审时按新链写 —— 拿一张已经没人维护的历史映射猜一个更糟。
+    """
+    if not reason_cat:
+        return None
+    s = str(reason_cat).strip()
+    if not s or s.lower() == "none":
+        return None
+    return policy_names.resolve(s, known)
+
+
+def _adopt_history(conn, asins: list[str], execute: bool,
+                   known=frozenset()) -> tuple[int, set, int]:
+    """输入:候选 ASIN 列表(+ 类别枚举)→ 输出:(采用数, 已采用 ASIN 集,
+    类别解析不到的条数)。
+
+    方案 A(spec_shortcut §1.6,待所有者追认):历史结论直接写审核六列+事件,
     不写新 run。读库失败让异常冒泡整轮停——静默按"无历史"重审会把
     rejected 产品翻出来(spec_shortcut §6.1)。
     """
     if not asins:
-        return 0, set()
+        return 0, set(), 0
     with conn.cursor() as cur:
         cur.execute(_HISTORY_SQL, (asins,))
         rows = cur.fetchall()
-    # reject 且 runs 行没留理由的,去 hits 反查旧命中(只查需要的那批)
-    need_hits = [r[1] for r in rows if r[2] == "reject" and not r[5]]
+    # 判拒的行都去 hits 反查旧命中:三段分列后**具体内容**那一列要它
+    # (2026-09-02 B1 之前只在 runs 行没留理由时才查,那时两样东西挤一列)
+    need_hits = [r[1] for r in rows if r[2] == "reject"]
     old_hits = _hits_of_runs(conn, need_hits) if need_hits else {}
     adopted = set()
     events = []
     adopt_rows = []
+    cat_unresolved = 0
     for (asin, run_id, verdict, _score, pt, reason_cat, stage, created,
          src) in rows:
         adopted.add(asin)
@@ -600,22 +763,26 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             continue
         status = "approved" if verdict == "pass" else "rejected"
         if verdict == "reject":
-            # 存量大头是 L0/L2 拒,l3_reason_category 本就 NULL——先拿
-            # runs 行的理由;没有就反查 hits 把旧结论说出来;连 hits 都
-            # 没有(极老的孤儿 run)才落"理由未留存"
-            reason = reason_cat
-            if not reason:
-                hit = old_hits.get(run_id)
-                if hit:
-                    reason = (f"历史结论(阶段 {stage or '未知'}):"
-                              f"{audit_reason.explain_hit(hit[0], hit[1])}")
-                else:
-                    reason = f"历史结论(阶段 {stage or '未知'},理由未留存)"
+            # 三段分列(2026-09-02 B1):类别取 runs 行留档的
+            # `l3_reason_category`(老行可能是旧拼写甚至 NULL —— 历史就是
+            # 这样,采用不改写历史);具体内容反查 hits 把旧结论说出来,
+            # 连 hits 都没有(极老的孤儿 run)才落"理由未留存"。
+            # ⚠ 别把"历史结论(阶段 X)…"那句写进类别列:那一列从此只装枚举
+            reason = _adopt_category(reason_cat, known)
+            if reason_cat and reason is None:
+                cat_unresolved += 1      # 老值对不上枚举 ⇒ 类别留空(见摘要)
+            hit = old_hits.get(run_id)
+            if hit:
+                detail = (f"历史结论(阶段 {stage or '未知'}):"
+                          f"{audit_reason.explain_hit(hit[0], hit[1])}")
+            else:
+                detail = f"历史结论(阶段 {stage or '未知'},理由未留存)"
         else:
-            reason = None
+            reason = detail = None
         adopt_rows.append({
             "status": status,
             "reason": reason,
+            "detail": detail,
             "pt": (pt if pt and not pt.startswith("(") else None),
             # 旧结论的 PT 来源照搬 runs 记录;非实证一律记 audit_llm
             # (来历不明的 PT 不当实证——它会被 catmap_mine 投票放大)
@@ -640,11 +807,12 @@ def _adopt_history(conn, asins: list[str], execute: bool) -> tuple[int, set]:
             cur.executemany(_ADOPT_SQL, adopt_rows)
     if execute and events:
         product_events.record_many(conn, events)
-    return len(adopted), adopted
+    return len(adopted), adopted, cat_unresolved
 
 
 _SQL_VERDICT = """
-SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at
+SELECT asin, title, walmart_pt, audit_status, audit_reason, audited_at,
+       audit_detail
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 """
@@ -660,7 +828,7 @@ GROUP BY 1
 """
 
 
-def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
+def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict], list[str], list[str]]:
     """输入:本轮 limit → 输出:(上架表待审行, 交给候选谓词的 ASIN, 摘要前言)。
 
     所有者定稿 2026-08-16:「审核直接读取上架表的 ASIN 与审核结果两列
@@ -727,6 +895,12 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
             f"被这个开关重新打开的)—— **LLM 花费按 {done + todo} 算**。"
             f"⚠ 领任务口径没变:仍然只领 **审核结果为空或 pending** 的行,"
             f"已有结论的表行一行都不会被捞回来")
+    elif limit is None:
+        if todo:
+            # 与下面 `todo > limit` 那支同款:日志里这一行才是花钱前看得见的
+            logger.warning("上架表待审 %d 个 ASIN,本轮**不限量**", todo)
+            head.append(f"  本轮**不限量**(未给 -p limit):这 {todo} 个待审"
+                        f"**全判**(补采救回来的还会加进来)—— 要分批加 -p limit=N")
     elif todo > limit:
         logger.warning("上架表待审 %d 个 ASIN,本轮 limit=%d", todo, limit)
         head.append(f"  ⚠ 本轮 limit={limit},**只判 {limit} 个,还剩 "
@@ -736,19 +910,20 @@ def _claim_from_sheet(limit: int, force: bool = False) -> tuple[list[dict], list
 
 
 def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
-    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 C/D/E/F/G。
+    """输入:本轮领的上架表行 → 输出:回填摘要一行。写审核六列
+    (标题/PT/审核结果/类别/具体内容/审核日期;列由表头名定位,不认字母)。
 
     所有者定稿 2026-08-16。⚠ 三条:
 
     · **「审核结果」写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
       `audit_result.lower() == "pass"`。写别的那行永远上不去,而且不报错。
       映射收在 `listing_sheet.AUDIT_RESULT_CN`。
-    · **库里没有的 ASIN 一行都不写**(留 E 空)。写个 pending 会让人以为审过了;
+    · **库里没有的 ASIN 一行都不写**(「审核结果」留空)。写个 pending 会让人以为审过了;
       留空则下轮自动重领,而且 `list_new` 只认 pass,留空绝不会误上架。
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
 
-    回填失败只告警不失败:结论已经落 PG 了(products 五列 + audit_runs),
+    回填失败只告警不失败:结论已经落 PG 了(products 审核六列 + audit_runs),
     飞书只是人机界面 —— 与订单中心那条同款纪律。
     """
     try:
@@ -757,10 +932,18 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
                 got = {r[0]: r for r in cur.fetchall()}
-            # 「具体内容」写**人话**:`products.audit_reason` 存的是沃尔玛政策表的
-            # 类目名,而其中 `General-Use Products` 是"以上全不中"的兜底 ——
-            # 落在一把锤子、一个土豆压泥器上时人只会一头雾水(所有者
-            # 2026-08-16)。真正的原因在命中的规则里,翻出来放前面
+            # 三段输出分列(2026-09-02 B1 落地):「审核结果」= 判定结果、
+            # 「类别」= `products.audit_reason`(**政策类别**枚举,
+            # pass/pending 为空)、「具体内容」= `products.audit_detail`。
+            # ⚠ 「具体内容」的**老行兜底**:B1 之前的结论没有 audit_detail 列值,
+            #   照旧按命中规则渲染成人话(`explain_hits`,不带「[政策:X]」
+            #   尾巴)。不兜底的话,存量几十万行在表上会一夜变成空白 ——
+            #   看起来像"审核把理由弄丢了"。老行被重审时自然写上新格式。
+            # ⚠ 「具体内容」为什么非要**人话**(2026-08-16 定稿的老账,分列后
+            #   仍然成立):`products.audit_reason` 装的是沃尔玛政策表的类目名,
+            #   而其中 `General-Use Products` 是"以上全不中"的兜底 —— 单把它
+            #   摆在一把锤子、一个土豆压泥器上时人只会一头雾水。真正的原因在
+            #   命中的规则里,所以类别归类别列,人话归「具体内容」。
             reasons = audit_store.reject_reasons(conn, asins)
         updates, absent = [], 0
         for r in sheet_rows:
@@ -768,12 +951,16 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
                 absent += 1
                 continue
-            _, title, pt, status, reason, at = row
-            why = (audit_reason.human_reason(reasons.get(r["asin"], []), reason)
-                   if status == "rejected" else (reason or ""))
+            _, title, pt, status, reason, at, detail = row
+            why = detail or ""
+            if not why and status == "rejected":     # 老行:按命中规则渲染
+                why = audit_reason.explain_hits(reasons.get(r["asin"], []))
+            elif not why and status == "pending":    # 老行:待定原因在类别列里
+                why = reason or ""
             updates.append((r["rownum"], [
                 title or "", pt or "",
                 listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                (reason or "") if status == "rejected" else "",
                 why[:500],
                 at.strftime("%Y-%m-%d") if at else ""]))
         listing_sheet.write_audit_cols(updates, execute)
@@ -781,8 +968,9 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
         # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
         # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
         # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
-        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行审核列"
-               f"(整表已有结论的都投影,不只本轮判的那些)"
+        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行审核六列"
+               f"(标题/PT/审核结果/类别/具体内容/审核日期;"
+               f"整表已有结论的都投影,不只本轮判的那些)"
                f"{'' if execute else ';dry-run 一格未写'}")
         if absent:
             out += (f";⚠ {absent} 行库里没有结论,**「审核结果」留空**"
@@ -1046,7 +1234,8 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
               out: list[str]) -> None:
     """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写「具体内容」列,摘要进 out)。
 
-    ⚠ **只写「具体内容」,「审核结果」一个字不动**。它一有值这行就不再被 `audit_targets` 领走,
+    ⚠ **只写「具体内容」,「审核结果」一个字不动**。「审核结果」一有值这行就不再被
+    `audit_targets` 领走,
     往里写个"未采集"就等于这行从此退出审核通道 —— 采回来了也没人再审它,
     而表面上"表里写着原因呢"。
     """
@@ -1117,7 +1306,9 @@ def _tro_claim(conn, scope: str, key: str, meta: dict) -> bool:
 
 def _tro_l3_evidence(outcome, brand: str) -> str | None:
     """输入:判定结果 + r4 键 → 输出:L3 对该词的简短理由(没有则 None)。"""
-    for v in (getattr(outcome.l3, "blacklist_brand_verdict", None) or ()):
+    # 字段名随 L3 输出三段化改名(2026-09-02 B1):blacklist_brand_verdict
+    # → brand_verdicts;口径不变(与 audit_store.tro_hits 读的是同一个属性)
+    for v in (getattr(outcome.l3, "brand_verdicts", None) or ()):
         if isinstance(v, dict) and \
                 str(v.get("brand") or "").strip().lower() == brand:
             ev = str(v.get("evidence") or "").strip()
@@ -1207,10 +1398,9 @@ def _tro_hook(conn, outcome, ctx, state: dict) -> None:
 class Opts:
     """一轮 run() 的入参定案(值域与四条互斥校验都在 _parse_opts 里做完)。"""
     execute: bool
-    limit: int
+    limit: int | None          # None = 不限量(缺省);给了才截断
     backfill: bool
     adopt_only: bool
-    r5_on: bool
     run_l3: bool
     run_l4: bool
     only_l0: bool
@@ -1225,13 +1415,29 @@ def _parse_opts(params: dict) -> Opts:
     "静默吞参数"(评审 P1-4),与候选谓词同处一地,别顺手挪过来。
     """
     execute = bool(params.get("execute"))
-    limit = int(params.get("limit", 500))
+    # ⚠ **缺省不限量**(所有者定稿 2026-09-03)。此前缺省 500,而 `from_sheet`
+    # 那条路又把它顶成 ASIN 总数(见 run() 里删掉的那行),于是摘要写着
+    # "只判 500 个"、实际把待审的全判了 —— 限流是假的、提示是错的、调度 note
+    # 里"存量大时加 -p limit=N"的建议也不生效。现在口径只有一条:
+    # **不给就不限量,给了就真截断**(哪条通道都一样)。
+    raw_limit = str(params.get("limit", "")).strip()
+    limit = None
+    if raw_limit:
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            # 裸 int() 的 "invalid literal for int()" 不提 limit 也不给出路
+            raise ValueError(f"limit 要正整数,给的是 {raw_limit!r};"
+                             f"**不给就是不限量**") from None
+        if limit <= 0:
+            # 宁炸不吞:limit=0 当"不限量"讲会让人以为限住了,恰好反着
+            raise ValueError("limit 必须是正整数;**不给就是不限量**"
+                             "(要空跑看规模用 --dry-run)")
     backfill = str(params.get("mode", "")).strip() == "backfill"
     adopt_only = str(params.get("adopt_only", "")).strip() == "1"
     if adopt_only and not backfill:
         raise ValueError("adopt_only=1 只在 mode=backfill 下有意义"
                          "(它采用的是 audit_runs 里的历史结论)")
-    r5_on = str(params.get("r5", "")).strip().lower() == "on"
     # L3 默认开(旧仓 run_l3 默认 True);L4 默认关(批复 #2,显式 l4=on)
     run_l3 = str(params.get("l3", "")).strip().lower() != "off"
     run_l4 = str(params.get("l4", "")).strip().lower() == "on"
@@ -1256,8 +1462,7 @@ def _parse_opts(params: dict) -> Opts:
         raise ValueError("mode=stale 不与 stages=L0 连用:版本重审必须全链,"
                          "否则未命中的行不盖版本号,候选集永不收敛")
     # 判定并发(旧仓 10 worker 常驻先例):worker 只做判定(LLM+只读+幂等
-    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义
-    # 不变)。r5=on 强制 1(uspto 单连接不可跨线程)
+    # 缓存写,各自 autocommit 连接),落库仍归主线程单连接(savepoint 语义不变)
     want_workers = max(1, int(params.get("workers", _DEFAULT_WORKERS)))
     workers = min(want_workers, _MAX_WORKERS)
     if workers != want_workers:
@@ -1265,10 +1470,8 @@ def _parse_opts(params: dict) -> Opts:
         # workers=32 测吞吐,实际跑的是 16 而输出只字未提)
         logger.warning("workers=%d 超上限,实际用 %d(I/O 密集,上限由 LLM "
                        "侧承受力定,不是本机核数)", want_workers, workers)
-    if r5_on:
-        workers = 1
     return Opts(execute=execute, limit=limit, backfill=backfill,
-                adopt_only=adopt_only, r5_on=r5_on, run_l3=run_l3,
+                adopt_only=adopt_only, run_l3=run_l3,
                 run_l4=run_l4, only_l0=only_l0, workers=workers)
 
 
@@ -1282,11 +1485,9 @@ class Counts:
     adopted_n: int
     no_title: int
     seller_missing: int
-    policy_unknown: int
     row_errors: int
     asked_asins: int        # -p asins= 点名的个数(0 = 没点名)
-    uspto_failures: int     # ctx.uspto_failures:R5 查询失败次数
-    uspto_off: bool         # ctx.uspto is None:R5 已被自动关停(≥5 次)
+    warmup_n: int = 0       # 首条串行预热的条数(0/1;规格 §3.9,见 audit_pool)
     # TRO 命中(2026-08-30;dry-run 恒 0 —— 那一路根本不跑,见 _tro_hook 调用点)
     tro_n: int = 0          # 本轮命中的 TRO 品牌数(含早就报过的)
     tro_new: int = 0        # 其中**首报**的(dedupe rowcount==1),真落了源头事件
@@ -1307,7 +1508,6 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
     lines = list(sheet_head)        # 上架表领任务的口径放最前(含"还剩多少没审")
     lines += [f"product_audit({resources.AUDIT_RULES_VERSION}"
               f"{',补刷' if opts.backfill else ''}"
-              f"{',R5开' if opts.r5_on else ''}"
               f"{',只跑L0' if opts.only_l0 else ''}"
               f"{',L3关' if not opts.run_l3 and not opts.only_l0 else ''}"
               f"{',L4开' if opts.run_l4 else ''}):"
@@ -1364,6 +1564,12 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
     else:
         tail = ",LLM 零退避(未撞限流,可继续加并发)"
     lines.append(f"并发 {opts.workers}{tail}")
+    if counts.warmup_n:
+        # 预热是**省钱动作**,不亮出来就没人知道它有没有真的发生(它唯一的
+        # 表现是"这一轮的缓存命中率高一点",而那个数本身就在波动)
+        lines.append(f"前缀预热 {counts.warmup_n} 条(第一条串行判完再开池:"
+                     f"并发起跑会让前一批同时未命中 DeepSeek 前缀缓存,"
+                     f"单条未命中约是命中价的十几倍)")
     if opts.conn_note:
         # 钳制/查不到余量都必须进摘要 —— 只写日志的话表现是"并发调了没效果"
         lines.append(opts.conn_note)
@@ -1375,15 +1581,30 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         lines.append(f"L3 语义:判 {stage_stats['L3_ran']}"
                      f"(拒 {stage_stats['L3_reject']}/"
                      f"LLM 故障待定 {stage_stats['L3_pending']})")
-    # 路由表写的政策名在政策表里对不上 = L3 少拿到一条政策提示。判定不受影响、
-    # 不报错,只会让判据悄悄变窄(2026-09-02 改名后尤其要看得见,§十.7)
-    if stage_stats.get("L3_route_unresolved"):
-        names = stage_stats.get("L3_route_unresolved_names") or []
-        lines.append(f"⚠ L3 政策路由解析不到 {stage_stats['L3_route_unresolved']} 次"
+    # 政策表里有这一行、却没有可喂的全文 ⇒ S4 里没有它的原文,而 S2 候选里有
+    # 它的名字:LLM 选得到一个引不出条款的类别。不报错、不红,只有这个数看得见
+    if stage_stats.get("L3_policy_no_full_text"):
+        names = stage_stats.get("L3_policy_no_full_text_names") or []
+        lines.append(f"⚠ L3 政策全文缺失 {stage_stats['L3_policy_no_full_text']} 篇"
                      + (f"(条目:{'、'.join(names)})" if names else "")
-                     + " —— 路由表的政策名在政策表里找不到,那几条提示本轮没给"
-                       "(只记不改判;补进 registry.resources.POLICY_LEGACY_NAMES "
-                       "或修路由表)")
+                     + " —— 这几类在 S2 候选里有名字、S4 里没有原文,"
+                       "LLM 选得到却引不出条款(补 full_policy:policy_sync)")
+    # LLM 答出的类别名对不上枚举 ⇒ 整条转 pending(不猜类别)。零星几条是
+    # 模型抽风,成批出现 = 提示词/政策表出了问题,不是单品的事
+    if stage_stats.get("L3_bad_policy"):
+        lines.append(f"⚠ L3 类别对不上枚举 {stage_stats['L3_bad_policy']} 条 → "
+                     f"pending 待人工(不降级猜类别;详见日志)")
+    # 采用历史时老结论的类别对不上枚举 ⇒ 类别列留空(具体内容照旧写)。
+    # 存量老值是旧语义(`none` / 小写旧缩写名 / `.title()` 变形),原样搬进
+    # 收窄后的类别列 = 把旧世界的脏值洗进新列,而且不会报错
+    if stage_stats.get("adopt_cat_unresolved"):
+        lines.append(f"⚠ 历史结论类别不可解析 {stage_stats['adopt_cat_unresolved']} 条"
+                     f" —— 类别列留空(老值是旧语义/旧拼写;重审时自然写上新值)")
+    # 判拒却没有类别 = 代码 bug 信号(硬拒规则没自报 `category`,或 L3 那条
+    # 路没走到)。**不兜底**:落 NULL + 计数,别编一个政策名出来
+    if stage_stats.get("reason_missing"):
+        lines.append(f"⚠ 判拒但没有类别 {stage_stats['reason_missing']} 条 "
+                     f"—— 类别列写 NULL(规则没自报 category?详见日志 warning)")
     # TRO:非零才打印(notify_fmt 规矩 2 —— 例外计数为 0 是噪声)。
     # 这三个数不是同一件事:命中 = 本轮认出几个 TRO 品牌;首报 = 其中几个是
     # 头一回见(真落了源头事件);波及 = 展开出几家店(一个品牌能扇出好几家)
@@ -1421,27 +1642,20 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
         # 这一列量的是"卖家闸对多大面积失效",那是**候选面**的属性。
         lines.append(f"⚠ 卖家字段缺失 {counts.seller_missing}/{counts.todo_n}"
                      f"(buybox_seller_id 契约外字段;恒缺=卖家闸未生效,需契约扩展)")
-    if counts.policy_unknown:
-        lines.append(f"⚠ 理由映射落政策表之外 {counts.policy_unknown} 条"
-                     "(详见日志,只记不改判)")
-    if opts.r5_on and counts.uspto_failures:
-        lines.append(f"⚠ R5 查询失败 {counts.uspto_failures} 次"
-                     f"{'(≥5 已自动关停本轮 R5)' if counts.uspto_off else ''}")
     lines.append(f"全库 pending 存量 {pending_total}")
     return lines
 
 
 def run(params: dict) -> str:
-    """输入:params(asins/limit/mode/r5/execute/from_sheet)→ 输出:判定统计摘要。"""
+    """输入:params(asins/limit/mode/execute/from_sheet)→ 输出:判定统计摘要。"""
     opts = _parse_opts(params)
     opts.workers, opts.conn_note = _cap_by_connections(opts.workers)
     # 中段判定主体与 _to_todo/_judge/_flush 三层闭包沿用这些名字:本次拆解只
     # 搬走两头(参数解析进 _parse_opts、摘要拼装进 _summary),主体一字未动
     execute, limit, backfill, adopt_only = (opts.execute, opts.limit,
                                             opts.backfill, opts.adopt_only)
-    r5_on, run_l3, run_l4, only_l0, workers = (opts.r5_on, opts.run_l3,
-                                               opts.run_l4, opts.only_l0,
-                                               opts.workers)
+    run_l3, run_l4, only_l0, workers = (opts.run_l3, opts.run_l4,
+                                        opts.only_l0, opts.workers)
     # ── 上架表驱动(所有者定稿 2026-08-16;领任务在 _claim_from_sheet)──────
     sheet_rows: list[dict] = []
     sheet_head: list[str] = []
@@ -1467,45 +1681,43 @@ def run(params: dict) -> str:
         # (生产实测 2026-08-14:采用率 122k→88k→65k→47k→34k→25k 一路塌,
         #  第 6 轮 20 万候选里 17.5 万是上轮已确认无历史的行)
         where = f"({where}) AND {_HAS_HISTORY_SQL}"
-    if "asins" in extra:
-        # 指定 ASIN 时 limit 不许截断(评审 I-6:传 600 只审 500 且无提示)
-        limit = max(limit, len(extra["asins"]))
+    if (limit is not None and not params.get("from_sheet")
+            and len(extra.get("asins", ())) > limit):
+        # 评审 I-6 当年的病是"传 600 只审 500 **且无提示**"。当时的药是把 limit
+        # 顶成 ASIN 个数,但 `from_sheet` 也走 asins= 这条路(它交的是整张表的
+        # 待审 ASIN,不是人点名的),于是那剂药把上架表这条路的 limit 一并废了。
+        # 缺省不限量之后病根没了:不给 limit 就全判;给了就是人自己要截断 ——
+        # 补回当年缺的那半句"提示"即可,不再偷偷改人给的数。
+        sheet_head.append(
+            f"⚠ 点名 {len(extra['asins'])} 个 ASIN,但 -p limit={limit} "
+            f"只判 {limit} 个(按 audited_at 最旧的先判);要全判就别给 limit")
 
-    import contextlib
-    uspto_cm = db.uspto_conn() if r5_on else contextlib.nullcontext()
-    with db.pg_conn() as conn, uspto_cm as uspto:
-        ctx = audit_rules.load_context(conn, uspto=uspto)
-        query_params = {"marketplace": "US", "limit": limit, **extra}
+    with db.pg_conn() as conn:
+        ctx = audit_rules.load_context(conn)
+        query_params = {"marketplace": "US", **extra}
+        if limit is not None:
+            query_params["limit"] = limit
         # 复烧护栏只在 dry-run 生效:execute 写 audited_at 天然推进;
         # dry-run 后紧跟的 --execute 也不能被自己刚落的 runs 拦掉
         guard = "" if (execute or _is_forced(params, extra)) \
             else _RECENT_RUN_GUARD
-        rule_ = str(params.get("rerule", "")).strip()
-        mode_ = str(params.get("mode", "")).strip()
-        if rule_:
-            sheet_head = _batch_head(
-                conn, f"定点重审 rerule={rule_}:命中过该规则且**现结论仍是 "
-                      f"rejected**、且未按当前规则版本判过的",
-                where, extra, limit,
-                "一个都没有:规则码拼错?或这批已经全部按当前版本判过了") \
-                + sheet_head
-        elif mode_ == "nonpass":
-            sheet_head = _batch_head(
-                conn, "非 pass 全量重判:rejected + pending + 未审过、"
-                      "且未按当前规则版本判过的",
-                where, extra, limit,
-                "一个都没有:这批已经全部按当前版本判过了") + sheet_head
-        elif mode_ == "stale":
-            sheet_head = _batch_head(
-                conn, f"版本重审:approved 且未按当前规则版本"
-                      f"({resources.AUDIT_RULES_VERSION})判过的"
-                      f"(rejected 沿用不重审)",
-                where, extra, limit,
-                "一个都没有:approved 存量已全部按当前版本判过") + sheet_head
+        if not params.get("from_sheet"):
+            # ⚠ **每条通道都报**(2026-09-03 补):此前只有 rerule/nonpass/stale
+            # 三条报总量,而缺省不限量之后,恰恰是不报的那几条(缺省口径、
+            # backfill、pending、force_rerun、repts)一轮就能把整个积压判完 ——
+            # 「共 N 个」是花钱前唯一能看见的规模。from_sheet 不走这里:
+            # `_claim_from_sheet` 自己按上架表口径报过了(再报一次是同一件事
+            # 说两遍,而且两个数还不一样)。
+            what_, hint_ = _candidate_what(params)
+            sheet_head = _batch_head(conn, what_, where, extra, limit,
+                                     hint_) + sheet_head
         # 候选**流式取**,不再 fetchall(2026-08-21 生产 OOM 后改;见
         # `_iter_candidates` 头注)。行只在自己那一块的判定期间驻留内存。
-        cand_sql = _CANDIDATE_SQL.format(where=where, recent_guard=guard)
+        cand_sql = _candidate_sql(where, guard, limit)
         chunks = _iter_candidates(cand_sql, query_params)
+        # 采用历史时把老 `l3_reason_category` 对回枚举用的那份集合 ——
+        # 与判定链同源(`ctx.known_policies` + 两条非政策类别),不另查一次库
+        adopt_known = audit_l3.policy_enum(ctx.known_policies)
 
         if adopt_only:
             # 只采用不判定(所有者 2026-08-14:先零成本把有历史结论的扫完,
@@ -1513,24 +1725,34 @@ def run(params: dict) -> str:
             # 一起跑等于为了采用而顺带付 33 万次 LLM
             # ⚠ 逐块采用:`_adopt_history` 是按 asin 独立的,分块与整批等价,
             #   而整批意味着把 86 万个 asin 塞进一个 `= ANY(%s)`(又一处 OOM)
-            cand_n = adopted_n = 0
+            cand_n = adopted_n = cat_unresolved = 0
             for chunk in chunks:
                 cand_n += len(chunk)
-                n, _ = _adopt_history(conn, [r["asin"] for r in chunk], execute)
+                n, _, bad_cat = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute,
+                    known=adopt_known)
                 adopted_n += n
-            return (f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
+                cat_unresolved += bad_cat
+            # ⚠ 前言得带上:否则「点名 600 个但 limit=100」那句提示在这条路上
+            # 被整个吞掉 —— 正是评审 I-6 抱怨的形状("传 600 只审 500 且无提示"),
+            # 只是搬到了零 LLM 这一侧
+            return "\n".join(sheet_head + [
+                    f"product_audit(仅采用历史,零 LLM):候选 {cand_n} → "
                     f"采用 {adopted_n}"
                     + ("" if execute else "(dry-run:未写库)")
-                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定")
+                    + f";其余 {cand_n - adopted_n} 条无历史,需另跑判定"
+                    + (f";⚠ 历史结论类别不可解析 {cat_unresolved}"
+                       f"(老值是旧语义/旧拼写,类别列留空,具体内容照旧写)"
+                       if cat_unresolved else "")])
 
         counts = {"pass": 0, "reject": 0, "pending": 0}
-        no_title = seller_missing = policy_unknown = 0
+        no_title = seller_missing = 0
         stage_stats = {"L3_ran": 0, "L3_reject": 0, "L3_pending": 0,
-                       "L4_ran": 0, "L4_reject": 0}
+                       "L4_ran": 0, "L4_reject": 0, "adopt_cat_unresolved": 0}
         l4_fail: dict = {}           # rule_code → 次数(评审 P1-2:层死≠层净)
         audit_rules.audit_l1_llm.reset_stats()   # 本轮 rerank 计数从零起
-        from services import audit_l3 as _audit_l3
-        _audit_l3.reset_stats()                  # L3 政策路由解析不到的计数同样
+        audit_l3.reset_stats()                   # L3 坏类别的计数同样
+        audit_reason.reset_stats()               # 判拒无类别的计数同样
         from api import llm as _llm
         _llm.reset_retry_stats()                 # 退避计数同样每轮从零
         _llm.reset_usage_stats()                 # token 记账同样每轮从零
@@ -1541,6 +1763,7 @@ def run(params: dict) -> str:
                "new": 0, "expo": 0, "errors": 0}
         row_errors, consec_errors = 0, 0
         l0_untouched = 0
+        warmup_n = 0                 # 首条串行预热(整轮最多一次,见 audit_pool)
         done_n = 0
         cand_n = 0                   # 累计取到的候选行数(摘要报它,取代 len(rows))
         todo_n = 0                   # 累计**进了判定**的行数(≠ 落结论数,见下)
@@ -1558,9 +1781,11 @@ def run(params: dict) -> str:
             out = []
             adopted: set = set()
             if backfill:
-                n, adopted = _adopt_history(
-                    conn, [r["asin"] for r in chunk], execute)
+                n, adopted, bad_cat = _adopt_history(
+                    conn, [r["asin"] for r in chunk], execute,
+                    known=adopt_known)
                 adopted_n += n
+                stage_stats["adopt_cat_unresolved"] += bad_cat
             for row in chunk:
                 if row["asin"] in adopted:
                     continue
@@ -1651,7 +1876,14 @@ def run(params: dict) -> str:
                     #   线程池与连接池仍是整轮共用一套 —— 分块的是"在飞的量",
                     #   不是并发度,吞吐不受影响。
                     todo_n += len(todo)
-                    futs = {ex.submit(_judge, p): asin for asin, p in todo}
+                    # 首条串行预热(2026-09-02 B2,规格 §3.9):L3 开且候选 >1
+                    # 时,第一条**同步**判完再开池 —— 128 并发起跑会让前一批
+                    # 同时未命中 DeepSeek 的前缀缓存,一批全按未命中价付。
+                    # 整轮只预热一次(`warmup_n` 非零之后不再预热)。
+                    futs, warmed = audit_pool.submit_chunk(
+                        ex, todo, _judge,
+                        warm=(not warmup_n) and run_l3 and not only_l0)
+                    warmup_n += warmed
                     for fut in as_completed(futs):
                         asin = futs[fut]
                         try:
@@ -1716,11 +1948,6 @@ def run(params: dict) -> str:
                                     l4_fail[h.rule_code] = \
                                         l4_fail.get(h.rule_code, 0) + 1
                         counts[outcome.verdict] += 1
-                        if (outcome.verdict == "reject" and ctx.known_policies
-                                and not audit_reason.known_policies_check(
-                                    outcome.final_reason_category,
-                                    ctx.known_policies)):
-                            policy_unknown += 1
                     # 一块判完报一次进度。三个数各说各的,别混:
                     #   已取   = 从候选流里拉了多少行(进度)
                     #   落结论 = 其中多少条真写了结论(stages=L0 只有命中的算)
@@ -1751,16 +1978,21 @@ def run(params: dict) -> str:
             (pending_total,) = cur.fetchone()
 
     l1s = audit_rules.audit_l1_llm.STATS
-    # L3 政策路由解析不到的条目走 stage_stats 这条既有通道(L3 的数都在里面)
-    stage_stats["L3_route_unresolved"] = _audit_l3.STATS.get("route_unresolved", 0)
-    stage_stats["L3_route_unresolved_names"] = _audit_l3.unresolved_route_names()
+    # L3 侧两个"判据悄悄变窄"的计数走 stage_stats 这条既有通道(L3 的数都在
+    # 里面);判拒无类别的计数在 audit_reason(理由映射零兜底的 bug 信号)
+    # ⚠ 缺全文读的是**构建期状态**不是 STATS:提示词一个进程只构造一次,而
+    #   STATS 每轮清零 —— 读计数的话第二轮起永远报 0,而缺失一直都在
+    missing = audit_l3.missing_full_text()
+    stage_stats["L3_policy_no_full_text"] = len(missing)
+    stage_stats["L3_policy_no_full_text_names"] = list(missing)
+    stage_stats["L3_bad_policy"] = audit_l3.STATS.get("llm_bad_policy", 0)
+    stage_stats["reason_missing"] = audit_reason.STATS.get("reason_missing", 0)
     tally = Counts(verdicts=counts, cand_n=cand_n, todo_n=todo_n,
                    l0_untouched=l0_untouched, adopted_n=adopted_n,
+                   warmup_n=warmup_n,
                    no_title=no_title, seller_missing=seller_missing,
-                   policy_unknown=policy_unknown, row_errors=row_errors,
+                   row_errors=row_errors,
                    asked_asins=len(extra.get("asins", ())),
-                   uspto_failures=getattr(ctx, "uspto_failures", 0),
-                   uspto_off=getattr(ctx, "uspto", None) is None,
                    tro_n=len(tro["brands"]), tro_new=tro["new"],
                    tro_expo=tro["expo"],
                    tro_unjudged=len(tro["unjudged_brands"]),
@@ -1772,6 +2004,6 @@ def run(params: dict) -> str:
         # 这一轮刚补采回来、刚判出结论的那些行还写不进表格)
         lines.append(_project_to_sheet(sheet_rows, execute))
     if not execute:
-        lines.append("(dry-run:runs/hits 已落,products 五列与事件"
+        lines.append("(dry-run:runs/hits 已落,products 审核六列与事件"
                      "(含 TRO 品牌命中)未写)")
     return "\n".join(lines)

@@ -173,13 +173,16 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             and product_events.receipt_in_ledger(
                 product_events.feed_kind(meta[sku][1]), meta[sku][0])])
         # 违禁回执自动进 ASIN 黑名单(所有者 2026-08-12:上架失败事件要能
-        # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁,归既有
-        # B=禁售类(PERMANENT,DO NOTHING 幂等)——list_new/match_listing
-        # 的黑名单闸下次自动拦,同一产品不再烧 UPC 与配额。
-        # 只收 kind=list(MP_ITEM)。黑名单键由 blacklist.record_asins 经登记簿
-        # 按 (店,sku) 反查 —— 本函数只负责把 store + sku 原样递过去,
-        # **不许在这里自己解 ASIN**(那就是第二份规则,conventions §六)。
-        # 跟卖走 MP_ITEM_MATCH ⇒ kind=match ⇒ 天然不进这个桶,
+        # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁
+        # (Military/Law Enforcement、Firearm Accessories、General Prohibited),
+        # 2026-09-03 换轨后归新码 **POLICY**(旧码是 B=禁售;两者都在
+        # PERMANENT 里,拦截行为一字不变,变的只是码名统一到新表)。
+        # DO NOTHING 幂等 —— list_new/match_listing 的黑名单闸下次自动拦,
+        # 同一产品不再烧 UPC 与配额。
+        # 只收 kind=list(MP_ITEM)。⚠ **「sku=asin 约定」已随切码作废**:黑名单键
+        # 由 blacklist.record_asins 经登记簿按 (店,sku) 反查 —— 本函数只负责把
+        # store + sku 原样递过去,**不许在这里自己解 ASIN**(那就是第二份规则,
+        # conventions §六)。跟卖走 MP_ITEM_MATCH ⇒ kind=match ⇒ 天然不进这个桶,
         # 其行内终态由跟卖表 F/J 列承担。
         # ⚠ **改码失败不是政策违禁,不得反哺黑名单**(SKU 改造批次 3,O8):
         # 形态 B 下 sku_migrate 走 MP_ITEM ⇒ kind=list ⇒ 正好命中这段反哺。
@@ -188,7 +191,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         # 下一轮就开始拦,而没有任何摘要会说是改码干的。既有工作流名一个都不
         # 叫 sku_migrate ⇒ 改码前逐字节零行为变化。meta[sku][0] 是提交来源工作流。
         prohibited = [
-            {"store": store["name"], "sku": sku, "category": "B",
+            {"store": store["name"], "sku": sku, "category": "POLICY",
              "reasons": f"上架回执违禁 {(code or '').strip()}|"
                         f"{(descs.get(sku) or '')[:150]}"}
             for sku, (o, code) in results.items()
@@ -199,7 +202,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         if prohibited:
             n_bl = blacklist.record_asins(conn, prohibited)
             logger.warning("上架回执命中政策违禁 %d 个,新入 ASIN 黑名单 %d 个"
-                           "(B=禁售,上架前拦截自此生效):%s",
+                           "(POLICY=违反禁售政策,上架前拦截自此生效):%s",
                            len(prohibited), n_bl,
                            ",".join(p["sku"] for p in prohibited[:10]))
     if n_missing:

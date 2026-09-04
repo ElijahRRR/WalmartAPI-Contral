@@ -860,6 +860,30 @@ UPDATE ops.dispositions
 """
 
 
+_STRANDED_SQL = """
+SELECT DISTINCT action FROM ops.dispositions
+WHERE store = %(store)s::text AND sku = %(sku)s::text
+  AND settled_at IS NULL AND status = 'executing'
+ORDER BY action
+"""
+
+
+def executing_actions_on(conn, store: str, sku: str) -> list[str]:
+    """输入:连接 + (店, SKU) → 输出:该行名下**未落定的 executing** 动作列表。
+
+    只读。给改码定案时的**点名**用:`rekey_suggested` 故意不搬 executing 行
+    (搬键 = 把判决对象换掉),于是改码之后这些行滞留在旧码上,等
+    `expire_executing` 把它们判成 ineffective 收尾 —— 自愈,不是事故。
+    但**不许静默**:滞留几条、是哪些动作,要进摘要让人看见。
+    ⚠ 破坏组(delete/retire)不该出现在这里 —— 改码候选判据「无未了结破坏建议」
+    在挑选时就把它们剔掉了。真出现了说明中间窗口里长出了新的破坏建议
+    (problem_scan 的 `_SQL_ITEMS` 那条 NOT EXISTS 本该挡住),要当异常看。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_STRANDED_SQL, {"store": store, "sku": sku})
+        return [r[0] for r in cur.fetchall()]
+
+
 def rekey_suggested(conn, store: str, old_sku: str, new_sku: str,
                     asin: str | None = None) -> tuple[int, list[str]]:
     """输入:连接 + 店 + 新旧码(+ 出身 ASIN)→ 输出:(迁走的建议行数,
@@ -871,8 +895,15 @@ def rekey_suggested(conn, store: str, old_sku: str, new_sku: str,
 
     三条边界,每条都有理由:
       ① **executing 行本函数不碰**:它已经提交了 feed、正等观测判决,搬键
-         等于把判决对象换掉。改码的前置闸(open_executing_count)保证这一刻
-         该店没有 executing 行,所以这里不需要分支,只需要不碰。
+         等于把判决对象换掉。
+         ⚠ 2026-09-04 起这里的前提变了:原来靠 `open_executing_count` 那条
+         **整店**前置闸保证"这一刻该店没有 executing 行",所有者复议后那条闸
+         只报数不拦(13:00 三条链齐发,整店 executing 是常态,拦它等于改码永远
+         开不了工)。现在的保证是**逐候选**的:改码候选判据「无未了结破坏建议」
+         剔掉了旧码名下有未落定 delete/retire 的行,所以本函数遇不到破坏组的
+         executing。**维护组(title/price/inventory)的 executing 行则可能存在**,
+         照旧不碰 —— 它们滞留在旧码上,由 `expire_executing` 判成 ineffective
+         收尾(自愈)。调用方用 `executing_actions_on` 把它们点名进摘要,不静默。
       ② **动作撞车不迁、不删、不合并**,返回 action 列表让调用方点名人工:
          新码名下已有同动作的未落定行时,两条同动作的建议合成一条会让其中
          一个的落定结果覆盖另一个(schema.sql 的索引注释明写这条设计)。

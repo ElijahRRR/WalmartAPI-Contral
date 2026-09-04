@@ -205,16 +205,37 @@ def test_executing_dispositions_report_but_do_not_block_the_store(monkeypatch):
 
 
 def test_the_real_guard_moved_to_a_per_candidate_condition():
-    """危害搬家了就要在新家钉住:逐候选判据必须同时拦 suggested 与 executing,
-    并且**只看已落定与否**(settled_at),不看别的 SKU。"""
-    cond = next(sql for n, _w, sql in sm._CONDS if n == "无未了结处置")
+    """危害搬家了就要在新家钉住。三条:
+    ① 逐 (店,SKU),不看别的 SKU;
+    ② **只拦破坏组**(delete/retire)—— 维护组 title/price/inventory 不拦,
+       所有者 2026-09-04:13:00 三条链齐发是常态,拦它等于改码永远开不了工;
+    ③ 破坏组连 suggested 一起拦(它马上会被 claim 成一条打在旧码上的 DELETE)。
+    """
+    cond = next(sql for n, _w, sql in sm._CONDS if n == "无未了结破坏建议")
     assert "FROM ops.dispositions d" in cond
-    assert "d.store = w.store" in cond and "d.sku = w.sku" in cond   # 逐 (店,SKU)
-    assert "'suggested'" in cond and "'executing'" in cond
+    assert "d.store = w.store" in cond and "d.sku = w.sku" in cond   # ①
     assert "d.settled_at IS NULL" in cond
+    assert "'suggested'" in cond and "'executing'" in cond           # ③
+    # ② 动作集从 dispositions 的常量派生,不在这儿手打第二份名单
+    for a in sm.dispositions.DESTRUCTIVE_ACTIONS:
+        assert f"'{a}'" in cond
+    for a in sm.dispositions.MAINT_ACTIONS:
+        assert f"'{a}'" not in cond, a
     assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY        # 两处同源
-    why = next(w for n, w, _sql in sm._CONDS if n == "无未了结处置")
+    why = next(w for n, w, _sql in sm._CONDS if n == "无未了结破坏建议")
     assert "删除成功" in why and "假确认" in why    # 最狠的那条后果要写在人话里
+
+
+def test_stranded_executing_maintenance_rows_are_named_not_silent():
+    """维护组的 executing 行改码后滞留在旧码上(rekey 故意不碰),由
+    expire_executing 判成 ineffective 收尾 —— 自愈,但**不许静默**:
+    滞留几条、哪些动作要进摘要。破坏组若出现在这里是异常,要额外喊。"""
+    import inspect
+    src = inspect.getsource(sm._confirm)
+    assert "executing_actions_on" in src
+    # 先读后改:rekey 之后 suggested 已经搬走,再读就读不到了
+    assert src.index("executing_actions_on") < src.index("rekey_suggested")
+    assert "DESTRUCTIVE_ACTIONS" in src and "请人工核" in src
 
 
 def test_open_retire_cooldown_blocks_the_store(monkeypatch):

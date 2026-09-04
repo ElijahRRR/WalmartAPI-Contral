@@ -177,22 +177,31 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
     ("有 Product ID", "观测里 upc 与 gtin 都是空:载荷没号可匹配(**不猜**)",
      "(w.upc IS NOT NULL OR w.gtin IS NOT NULL)"),
     # ⚠ 这一条替下了原来那个整店闸(所有者 2026-09-04 复议,见 `_preflight` 闸③)。
-    # 两种危害都只发生在**同一个 SKU** 上:
-    #   ① executing 的建议等的是 (店, 旧码) 的观测判决 —— 改码后旧码从目录里消失,
-    #      而一条等着判决的 **DELETE** 建议会把"这个 SKU 不见了"读成
-    #      `delete_verified` = **删除成功**。那是一次假确认,而且不报错;
-    #   ② suggested 的建议马上会被 claim 成一条打在**旧码**上的 feed,
-    #      而那时旧码可能已经不存在了。
-    # 所以 `suggested` 与 `executing` 一起拦 —— 比原来的整店闸更严,但只严在
-    # 该严的那一个品上。已落定的行(settled_at 非空)不算数:账已经清了。
-    ("无未了结处置",
-     "该 (店, 旧码) 还有未落定的处置建议(suggested/executing):executing 那条"
-     "等的是旧码的观测判决,改码后旧码消失会被读成「删除成功」的假确认;"
-     "suggested 那条马上会变成一条打在旧码上的 feed。等它落定再改",
-     """NOT EXISTS (SELECT 1 FROM ops.dispositions d
-                  WHERE d.store = w.store AND d.sku = w.sku
-                    AND d.settled_at IS NULL
-                    AND d.status IN ('suggested', 'executing'))"""),
+    # 危害只发生在**同一个 SKU**、而且**只发生在破坏组**(delete/retire)上:
+    #   ① executing 的 DELETE 拿的是旧码去删,而 `dispositions.settle` 的判据是
+    #      catalog_sync 落的 `delete_verified`(= 这个 SKU 不见了)。改码后旧码
+    #      正好消失 ⇒ **假确认**:商品还好好挂在沃尔玛上,账本记着"已确认删除",
+    #      全程不报错;
+    #   ② suggested 的 DELETE 马上会被 claim 成一条打在**旧码**上的 feed。
+    # **维护组(title/price/inventory)不拦**(所有者 2026-09-04:13:00 三条链
+    # 齐发是常态,拦它等于改码永远开不了工)。它们各有出路:
+    #   · suggested → 定案时 `dispositions.rekey_suggested` 把键从旧码搬到新码;
+    #   · executing → rekey **故意不碰**(搬键等于把判决对象换掉),于是滞留,
+    #     由 `expire_executing` 判成 ineffective 收尾 —— 自愈,不是事故。
+    #     但**不许静默**:`_confirm` 会把滞留的动作点名进摘要。
+    # 已落定的行(settled_at 非空)不算数:账已经清了。
+    ("无未了结破坏建议",
+     "该 (店, 旧码) 还有未落定的**破坏性**建议(delete/retire):executing 那条"
+     "拿的是旧码去删,而它的定案判据是「这个 SKU 不见了」—— 改码后旧码正好"
+     "消失,会被读成 `delete_verified`「删除成功」的**假确认**,账本从此与"
+     "沃尔玛说的不是一回事且不报错;suggested 那条马上会被 claim 成一条打在"
+     "旧码上的 DELETE feed。等它落定再改",
+     "NOT EXISTS (SELECT 1 FROM ops.dispositions d\n"
+     "                  WHERE d.store = w.store AND d.sku = w.sku\n"
+     "                    AND d.settled_at IS NULL\n"
+     "                    AND d.status IN ('suggested', 'executing')\n"
+     "                    AND d.action IN ("
+     + ", ".join(f"'{a}'" for a in dispositions.DESTRUCTIVE_ACTIONS) + "))"),
     ("无未了结改码台账",
      "该 (店, 旧码) 已有 pending/confirmed/stalled 的改码台账(不许开第二条)",
      """NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
@@ -418,14 +427,14 @@ def _preflight(conn, store_name: str) -> tuple[bool, list[str]]:
     # 齐发,任何一家店在那之后都有几百条 executing;按整店拦 = 改码永远开不了工。
     # 而改 A 商品的码,不会影响 B 商品那条改价建议的判决 —— 判据里没有任何跨 SKU
     # 依赖(settle / settle_maintenance / expire_executing 全部逐 (店,SKU) 判)。
-    # **真正的危害搬到了 `_CONDS` 的「无未了结处置」逐候选判据上**,而且比整店闸
-    # 更严:那里连 `suggested` 一起拦(它马上就会变成一条打在旧码上的 feed)。
+    # **真正的危害搬到了 `_CONDS` 的「无未了结破坏建议」逐候选判据上**:那里只拦
+    # 破坏组(delete/retire),但连 `suggested` 一起拦(理由见那条判据的头注)。
     # 这一行留着是因为它是有用的**上下文**:改码期间这家店有多少条在等判决,
     # 人看摘要时该知道。
     n_exec = dispositions.open_executing_count(conn, store_name)
     lines.append(f"  ✓ 闸③处置:{store_name} 有 {n_exec} 条 executing 在途"
-                 f"(**不拦整店** —— 危害逐 (店,SKU),由候选判据「无未了结处置」"
-                 f"逐个剔;那条连 suggested 一起拦)"
+                 f"(**不拦整店** —— 危害逐 (店,SKU),由候选判据「无未了结破坏建议」"
+                 f"逐个剔;维护组不拦,破坏组连 suggested 一起拦)"
                  if n_exec else "  ✓ 闸③无在途处置(executing = 0)")
 
     with conn.cursor() as cur:
@@ -513,6 +522,10 @@ def _confirm(store_name: str, row: dict) -> list[str]:
                                      "观测确认(新码在架、旧码缺席)")
         if row["source_type"] == listing_sources.SOURCE_AMZ and row["source_key"]:
             upc_pool.retag_sku(tx, [(store_name, row["source_key"], new)])
+        # ⚠ 先读后改:rekey 之后旧码名下的 suggested 已经搬走,再读就读不到了。
+        # executing 行 rekey 故意不碰(搬键 = 换判决对象),它们滞留在旧码上,
+        # 由 expire_executing 判成 ineffective 收尾 —— 自愈,但**不许静默**。
+        stranded = dispositions.executing_actions_on(tx, store_name, old)
         _moved, taken = dispositions.rekey_suggested(
             tx, store_name, old, new, asin=row["source_key"])
         walmart_catalog.drop_node_rows(tx, store_name, old)
@@ -521,6 +534,14 @@ def _confirm(store_name: str, row: dict) -> list[str]:
     if taken:
         warns.append(f"  ⚠ {old}→{new}:新码名下已有未落定建议 {','.join(taken)},"
                      f"这些动作的旧码建议**不迁不删**,请人工处置")
+    if stranded:
+        bad = [a for a in stranded if a in dispositions.DESTRUCTIVE_ACTIONS]
+        warns.append(
+            f"  ⚠ {old}→{new}:旧码名下还有 executing 的 {','.join(stranded)},"
+            f"**不迁**(搬键等于换判决对象)—— 它们滞留在旧码上,由 "
+            f"expire_executing 判成 ineffective 收尾,不用管"
+            + (f";⛔ 其中 {','.join(bad)} 是**破坏组**,候选判据本该把这行剔掉"
+               f"(多半是中间窗口里新长出来的建议),**请人工核**" if bad else ""))
     return warns
 
 

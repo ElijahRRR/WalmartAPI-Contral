@@ -131,7 +131,7 @@ def test_feed_error_corpus_row(row):
 
 def test_the_whole_corpus_is_covered_not_a_subset():
     """夹具是验收标准 —— 行数少了说明有人删了语料(只许读不许改)。"""
-    assert len(REASONS) == 77 and len(FEED_ERRORS) == 20
+    assert len(REASONS) == 78 and len(FEED_ERRORS) == 20
 
 
 # ══════════════════════════════════════════════════════════════════════════════

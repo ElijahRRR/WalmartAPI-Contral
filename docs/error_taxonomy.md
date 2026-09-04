@@ -1651,3 +1651,71 @@ GROUP BY 1 ORDER BY 2 DESC;
 
 理论下限是 **14 条**(349 − 335,四处外源都没有全文的那些),到不了就说明还有
 第三个 bug,别默认"就这样了"。
+
+
+---
+
+## 十八、全量对照:判不出的只有 1 条,而它不是"不规范"(2026-09-04)
+
+所有者:「如果还有没有被归类的,你看一下没归类到的报错原文更准确,**如果它
+本来就是不规范的那种,那就不入库也可以**」。
+
+按这句话去查,前提是那张清单里**只有真的原文** —— 所以先补了对照报告的三个
+缺口(见 `error_reclass_report` 头注):① `audit.walmart_error_records.raw_reason`
+这份最大的全文语料**完全不在报告里**;② 事件面读 `'reasons'` 复数而写入方写
+`'reason'` 单数,长期近乎空转;③ `asin_blacklist.reason` 的 200 字残片混在
+"未识别"清单里,会被当成"沃尔玛写得不规范"。
+
+补完之后的账:
+
+| 语料面 | 条数 | 未识别(OTHER 兜底) |
+|---|---:|---|
+| `catalog.walmart_items`(下架且有原因) | 37,088 | **0 种 / 0 条** |
+| `audit.walmart_error_records`(全文) | 97,002 | **1 种 / 1 条** |
+| `catalog.product_events`(status_changed) | 22,059 | **0 种 / 0 条** |
+
+三面的政策名 join 率都是 **100%**。主码分布里那几条 `OTHER` 全是**显式杂项**
+(`business decision` / `trust & safety` / `currently under review`),按序 16
+进 unlisted,不算判不出。
+
+**唯一那条判不出的原文:**
+
+```
+This item belongs to a restricted category. Get approved to sell these items
+in your ||Account hub@@@https://seller.walmart.com/gated-categories||
+```
+
+**它不是"不规范"的那种** —— 是沃尔玛的标准资质门文案,病根在我们判据缺一串。
+所以**不能按"不入库"处理**:那样会把真·资质门(`GATED`)丢掉。改法是给序 7
+补 `get approved to sell`(与已有的 `request approval to sell` 同族)。
+
+⚠ 取的是 `get approved to sell` 而**不是** `restricted category`:后者与政策族的
+`Restricted/Illegal Products` 只差一个词,而序 7 **压过**序 15 的政策 —— 一旦
+误命中就是拿资质门吃掉真禁售,往松里错。反例已钉进测试:
+`Prohibited Products Policy: Restricted/Illegal Products.` 必须仍判 `POLICY`。
+
+生产原文进语料(77 → 78 行),码表版本递增 `t.2026-09-02.1` → **`t.2026-09-04.1`**。
+
+### 18.1 版本递增之后要重跑(**不用 force**)
+
+版本号就是增量谓词:改了就等于全量重判,这正是它的设计用途。
+
+```bash
+python cli.py error_reclass --dry-run     # 先看形态
+python cli.py error_reclass               # 三面一起(records / events / blacklist)
+python cli.py blacklist_push -p backfill=1
+```
+
+### 18.2 存量修复到底了:残留 12 条
+
+三轮跑完,`taxonomy_src='keep'` + 原文正好 200 字 + 换轨后的残留:
+**`PROHIBITED_FINAL` 9 + `EXPIRED` 3 = 12 条**,比 §17.4 估的下限 14 还低
+(`dispositions_map` 不带 `store` 条件,比当初那条 EXISTS 查得更宽)。
+
+这 12 条四处外源都没有全文,救不回来,停在残文判出的码上。已知、已定量、不再追。
+
+| | 第一轮 | 第二轮 | 第三轮 |
+|---|---:|---:|---:|
+| 重判 / 原样不动 | 57,444 / 193,704 | 58,661 / 192,487 | 76,855 / **174,293** |
+| 码变了 | 11,031 | 214 | **5** |
+| 换轨后真损失 | 349 | 262 | **12** |

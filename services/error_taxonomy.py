@@ -148,8 +148,17 @@ RULES: tuple[Rule, ...] = (
     # 那两条正文都是"要预审批/限特定卖家",病根是没资质不是商品违禁)。
     # ⚠ requires? —— 生产原文两种人称都有:"category that **requires**
     # pre-approval" 与 "these categories **require** pre-approval"(语料 #32)。
+    # ⚠ `get approved to sell` 是 2026-09-04 全量对照查出的**唯一**未识别原文
+    #   ("This item belongs to a restricted category. Get approved to sell these
+    #   items in your Account hub"):97,002 条全文语料里就这 1 条判不出。
+    #   所有者当时问的是「是不是本来就不规范、要不要干脆不入库」—— **不是**,
+    #   它是标准文案,病根是我们判据缺一条,补上即可(不入库会把真·资质门丢掉)。
+    # ⚠ 取的是 `get approved to sell` 而**不是** `restricted category`:后者与
+    #   政策族的 `Restricted/Illegal Products` 只差一个词,而序 7 压过序 15 的
+    #   政策 —— 一旦误命中就是拿资质门吃掉真禁售,方向是往松里错。
     Rule(7, "GATED", "类目需预审批/资质",
          ("restricted to certain sellers", "request approval to sell",
+          "get approved to sell",
           "enhanced vetting program", "health & compliance page"),
          pattern=re.compile(r"requires?\s+pre-approval")),
     Rule(8, "PRICE", "价格规则", ("pricing rule", "price gouging",

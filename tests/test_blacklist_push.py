@@ -247,10 +247,13 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
     # B0AAA(历史里那条禁售)+ B0CCC + B0DDD = 3;B0BBB 的 PT_WRONG 判出去
-    assert "够格永久拉黑 3 个" in out
+    assert "该永久拉黑 3 个" in out
     # B0DDD 已在表里 ⇒ 真跑只新增 2 条
     assert "真跑只会新增 2 条" in out and "回填只加不减" in out
     assert "apply=1" in out
+    # ⚠ 摘要必须点明「产品级判定 ≠ 行级记录」,以及 blacklist_route 判据没跟上
+    assert "产品级判定" in out and "行级记录" in out
+    assert "blacklist_route" in out and "判据没跟上" in out
     assert wrote == []
 
 

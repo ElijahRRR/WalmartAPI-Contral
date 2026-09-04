@@ -156,16 +156,20 @@ def run(params: dict) -> str:
                 top = "  ".join(
                     f"{k}×{n}" for k, n in c["fresh_codes"].most_common(8))
                 return "\n".join([
-                    f"历史回填预览:事件时间线共 {c['total']:,} 个 ASIN,"
-                    f"按**最新事件原文重判**后够格永久拉黑 {c['permanent']:,} 个",
+                    f"历史回填预览:产品历史共 {c['total']:,} 个 ASIN,"
+                    f"按**全部历史报错、够格拉黑的那条优先**判定后,"
+                    f"该永久拉黑 {c['permanent']:,} 个",
                     f"  表里现有 {c['in_table']:,} 行 ⇒ **真跑只会新增 "
                     f"{c['fresh']:,} 条**(ON CONFLICT DO NOTHING,已在表里的不动;"
                     f"**回填只加不减**)",
                     f"  将新增,按新码:{top}" if top else "  没有要新增的行",
-                    "  ⚠ 新增里若出现 blacklist_route 刚删过的品,说明**两个判据源"
-                    "给出的原文不一样**(事件里的 reason vs error_reclass 的四级"
-                    "优先原文,后者有 36,868 条只拿到 200 字符样本)—— 那不是回填的"
-                    "错,是原文来源要统一,别急着 apply",
+                    "  ⚠ **这里是产品级判定,而 `asin_blacklist.taxonomy_code` 是"
+                    "行级记录** —— 前者看该 asin 的全部历史(所有者 2026-09-04:"
+                    "「被拉黑的那个作为最高优先级,其他的都是作为记录」),"
+                    "后者只是那一行入选时那条原文的归类。两者**本来就会不一样**,"
+                    "不一样时**以产品级为准**。",
+                    "  ⚠ 而 `blacklist_route` 删行用的是**行级**码 —— 判据没跟上,"
+                    "在它改过来之前别拿这里的新增去对路由的结果。",
                     "  品牌渠道的历史重建走 -p rebuild_brand=1;加 -p apply=1 真写并顺路投影",
                 ])
             st = blacklist.backfill_from_events(conn)

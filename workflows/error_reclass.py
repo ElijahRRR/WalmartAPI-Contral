@@ -342,20 +342,43 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
         out.append("  ⚠ 只有**部分**报错带类别名(通用政策拒就一句「违反禁售"
                    "政策」,没有类别)—— 抽不出是常态,不是缺口。")
     if matrix:
-        out.append("  入选旧码(category) → 新码,前 15:")
-        out += [f"    {n:>7}  {old} → {code}"
-                for (old, code), n in matrix.most_common(15)]
-    n_sus = sum(suspect.values())
-    if n_sus:
-        out += ["",
-                f"  ⚠ **依据在新码下站不住的黑名单行:{n_sus} 条** ——"
-                f"旧码算它们永久禁售,新码认出病根另在别处:",
-                *[f"       {n:>7}  {old} → {code}"
-                  for (old, code), n in suspect.most_common(15)],
-                "  ⚠ **本工作流没有放行任何一条**:改的只是码名(旧 A-L → 新码),"
-                "L0 的 ASIN 闸读的仍是它。",
-                "     黑名单是「一次入选、永久禁止」的既定语义,批量放行是"
-                "破坏性动作 —— 要不要放、怎么放是所有者的另一次裁决。"]
+        # ⚠ `category` 统一到新码之后(2026-09-04),这张矩阵**大部分是对角线**
+        #   (`FLAGGED → FLAGGED`),信息量归零 —— 只报**真的换了码**的那些,
+        #   剩下的报个总数。留着全量对角线只会让人以为"还在迁移中"。
+        moved = Counter({k: v for k, v in matrix.items() if k[0] != k[1]})
+        same = sum(v for k, v in matrix.items() if k[0] == k[1])
+        if moved:
+            out.append(f"  入选码**变了**的(其余 {same:,} 条码没变):")
+            out += [f"    {n:>7}  {old} → {code}"
+                    for (old, code), n in moved.most_common(15)]
+        else:
+            out.append(f"  入选码**全部没变**({same:,} 条)—— 已统一到新码")
+    # ⚠ 「站不住」= 新码属于 `NOT_A_PRODUCT_BAN`(病根不是产品本身违禁)。
+    #   它与**去留**是两个正交的问题:去留看 `is_permanent`(所有者裁决的七码
+    #   + OTHER 两词条)。两张表都含 `GATED` —— 品类准入拿不到,产品本身不违禁
+    #   (所以"站不住"),但我们照样卖不了(所以裁决"继续禁")。
+    #   ⚠ 2026-09-04 实遇:统一之前这一段写「旧码算它们永久禁售,新码认出病根
+    #     另在别处」,统一之后左右同码(`GATED → GATED`),那句话自相矛盾;
+    #     而 2,006 条 GATED 被叫"站不住"更是误导 —— 它们是**留下**的。
+    #   所以现在按**会不会被 blacklist_route 删**分两栏报,那才是人要的答案。
+    doomed = Counter({c: n for (_o, c), n in suspect.items()
+                      if not error_taxonomy.is_permanent(c, None)})
+    kept_sus = Counter({c: n for (_o, c), n in suspect.items()
+                        if error_taxonomy.is_permanent(c, None)})
+    if doomed or kept_sus:
+        out.append("")
+        if doomed:
+            out += [f"  ⚠ **病根不是产品违禁、且按裁决会被放行的:"
+                    f"{sum(doomed.values()):,} 条**(下次 blacklist_route 会删):",
+                    *[f"       {n:>7}  {c}" for c, n in doomed.most_common(10)]]
+        if kept_sus:
+            out += [f"  病根不是产品违禁、但**按裁决仍留**的:"
+                    f"{sum(kept_sus.values()):,} 条 —— "
+                    + "  ".join(f"{c}×{n}" for c, n in kept_sus.most_common(5)),
+                    "     (如 GATED:品类准入拿不到,产品本身不违禁,但我们照样卖不了)"]
+        out += ["  ⚠ **本工作流没有放行任何一条**:只写码与来源标签,"
+                "L0 的 ASIN 闸拦的是「这个 asin 在不在表里」。",
+                "     放行是破坏性动作,归 blacklist_route(所有者另一次裁决)。"]
     return out
 
 

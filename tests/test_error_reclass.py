@@ -233,3 +233,34 @@ def test_两条PICK的SQL里都有键集游标():
         src = inspect.getsource(fn)
         assert "_pages(" in src, fn.__name__
         assert "while True" not in src, fn.__name__
+
+
+def test_统一之后不许再报对角线矩阵():
+    """⚠ 2026-09-04:`category` 统一到新码之后,「入选旧码 → 新码」大部分是
+    对角线(`FLAGGED → FLAGGED`),信息量归零 —— 留着全量对角线只会让人以为
+    "还在迁移中"。只报**真的换了码**的,其余给个总数。"""
+    import inspect
+    src = inspect.getsource(wf._blacklist_pass)
+    assert "k[0] != k[1]" in src                    # 只留换了码的
+    assert "入选码**全部没变**" in src               # 全对角线时说清楚
+
+
+def test_站不住要按会不会被放行分两栏():
+    """⚠ 「站不住」(`NOT_A_PRODUCT_BAN`:病根不是产品本身违禁)与**去留**
+    (`is_permanent`:所有者裁决的七码)是两个正交问题,**两张表都含 `GATED`** ——
+    品类准入拿不到,产品本身不违禁(所以"站不住"),但我们照样卖不了
+    (所以裁决"继续禁")。
+
+    统一之前那段写「旧码算它们永久禁售,新码认出病根另在别处」,统一之后左右
+    同码(`GATED → GATED`)那句话自相矛盾;而 2,006 条 GATED 被叫"站不住"更是
+    误导 —— **它们是留下的**。所以按「会不会被 blacklist_route 删」分两栏报。
+    """
+    import inspect
+    from services import error_taxonomy as et
+    src = inspect.getsource(wf._blacklist_pass)
+    assert "会被放行的" in src and "按裁决仍留" in src
+    assert "下次 blacklist_route 会删" in src
+    # 判据取自引擎,不在这儿重新写一份
+    assert "error_taxonomy.is_permanent(c, None)" in src
+    # GATED 正是那个两边都在的码 —— 它必须落到"仍留"那一栏
+    assert "GATED" in et.NOT_A_PRODUCT_BAN and "GATED" in et.PERMANENT_CODES

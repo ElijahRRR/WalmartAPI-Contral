@@ -117,17 +117,24 @@ def _rebuild_asin(do_apply: bool) -> str:
     with db.pg_conn() as conn:
         c = blacklist.backfill_counts(conn)
         if not do_apply:
-            filled = sheets.next_empty(sheet) - 2
+            # ⚠ 报 **PG** 的数,不报飞书表格行数(原先取的是
+            #   `sheets.next_empty(sheet) - 2`,而删的是 PG —— 报的不是要删的
+            #   那个数,人核对不了)。
             return (f"ASIN 黑名单重建预览:时间线按标准 asin 归并后共 "
                     f"{c['total']} 个,永久禁止 {c['permanent']} 个;"
-                    f"ASIN 表现有 {filled} 行将被整表重写为 {c['permanent']} 行"
-                    f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行")
+                    f"PG 表现有 {c['in_table']} 行 ⇒ **有事件背书的 "
+                    f"{c['in_table'] - c['untouched']} 行会被重灌成 "
+                    f"{c['permanent']} 行**,"
+                    f"另外 **{c['untouched']} 行没有产品事件背书,一条都不碰**"
+                    f"(历史导入,重灌不出来 —— 所有者 2026-09-04 定「需要保留」);"
+                    f"键=清洗后 asin,日期=报错发生日;加 -p apply=1 执行")
         st = blacklist.rebuild_asin_blacklist(conn)
     n = sheets.rewrite_sheet(sheet, sheets.ASIN_ALL,
                              sheets.ASIN_MARK_ALL,
                              allow_shrink=True)   # 擦净重灌,缩是预期
-    return (f"ASIN 黑名单重建:擦净 {st['wiped']} 行 → 按标准 asin 重灌 "
-            f"{st['inserted']} 行;ASIN 表整表重写 {n} 行")
+    return (f"ASIN 黑名单重建:删掉有事件背书的 {st['wiped']} 行 → 按标准 asin "
+            f"重灌 {st['inserted']} 行;**没有事件背书的 {st['untouched']} 行"
+            f"原样保留**;ASIN 表整表重写 {n} 行")
 
 
 def run(params: dict) -> str:
@@ -136,7 +143,9 @@ def run(params: dict) -> str:
 
     -p backfill=1:ASIN 历史回填(预览计数;加 -p apply=1 真写后顺路投影)。
     -p rebuild_asin=1 / rebuild_brand=1:两侧重建(见各自函数)。
-    都是一次性动作,重复跑无害(DO NOTHING/擦净重灌都幂等)。
+    ⚠ `backfill` 重复跑无害(ON CONFLICT DO NOTHING);两个 `rebuild` 是
+      **先删后灌**,只有「删得掉的等于灌得回的」才谈得上无害 —— `rebuild_asin`
+      因此只删有产品事件背书的行(2026-09-04,见 `blacklist._ASIN_WIPE_SQL`)。
     """
     if str(params.get("probe", "")).lower() in {"1", "true", "yes"}:
         return _probe()

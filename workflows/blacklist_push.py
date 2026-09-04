@@ -153,10 +153,21 @@ def run(params: dict) -> str:
         with db.pg_conn() as conn:
             c = blacklist.backfill_counts(conn)
             if not do_apply:
-                return (f"历史回填预览:时间线共 {c['total']} 个 ASIN,"
-                        f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单);"
-                        f"品牌渠道的历史重建走 -p rebuild_brand=1;"
-                        f"加 -p apply=1 真写并顺路投影")
+                top = "  ".join(
+                    f"{k}×{n}" for k, n in c["fresh_codes"].most_common(8))
+                return "\n".join([
+                    f"历史回填预览:事件时间线共 {c['total']:,} 个 ASIN,"
+                    f"按**最新事件原文重判**后够格永久拉黑 {c['permanent']:,} 个",
+                    f"  表里现有 {c['in_table']:,} 行 ⇒ **真跑只会新增 "
+                    f"{c['fresh']:,} 条**(ON CONFLICT DO NOTHING,已在表里的不动;"
+                    f"**回填只加不减**)",
+                    f"  将新增,按新码:{top}" if top else "  没有要新增的行",
+                    "  ⚠ 新增里若出现 blacklist_route 刚删过的品,说明**两个判据源"
+                    "给出的原文不一样**(事件里的 reason vs error_reclass 的四级"
+                    "优先原文,后者有 36,868 条只拿到 200 字符样本)—— 那不是回填的"
+                    "错,是原文来源要统一,别急着 apply",
+                    "  品牌渠道的历史重建走 -p rebuild_brand=1;加 -p apply=1 真写并顺路投影",
+                ])
             st = blacklist.backfill_from_events(conn)
         lines.append(f"历史回填:ASIN +{st['asin_new']}")
 

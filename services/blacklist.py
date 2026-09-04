@@ -53,6 +53,7 @@ PG 权威,飞书只是人机界面。
 
 import json
 import logging
+from collections import Counter
 
 from services import error_taxonomy
 from services.sku_asin import extract_asin
@@ -312,7 +313,17 @@ def backfill_counts(conn) -> dict:
         cur.execute(_BACKFILL_COUNT_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
         brand_cand, total = cur.fetchone()
     keep = _judge_events(conn)
-    return {"permanent": len(keep), "brand_cand": brand_cand, "total": total}
+    # ⚠ 「够格永久」≠「真跑会加多少」:INSERT 是 ON CONFLICT DO NOTHING,
+    #   已经在表里的一条都不动。预览只报前者,人会以为要写 2.6 万行,
+    #   而实际可能只新增几百 —— 或者反过来,把 blacklist_route 刚删的品加回来
+    #   却看不出来。**apply 之前真正要看的是「新增」这个数。**
+    with conn.cursor() as cur:
+        cur.execute("SELECT asin FROM catalog.asin_blacklist")
+        have = {a for (a,) in cur.fetchall()}
+    fresh = [r for r in keep if r["asin"] not in have]
+    return {"permanent": len(keep), "brand_cand": brand_cand, "total": total,
+            "in_table": len(have), "fresh": len(fresh),
+            "fresh_codes": Counter(r["cat"] for r in fresh)}
 
 
 def backfill_from_events(conn) -> dict:

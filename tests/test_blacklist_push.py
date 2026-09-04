@@ -211,17 +211,23 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     class _Cur:
         def __enter__(self): return self
         def __exit__(self, *a): return False
+        def __init__(self): self._q = ""
         def execute(self, sql, args=None):
+            self._q = sql
             if "INSERT" in sql:
                 wrote.append(sql)
         def executemany(self, sql, rows):
             wrote.append(sql)
         def fetchone(self): return (3, 20)   # (brand_cand, total)
         def fetchall(self):
+            if "FROM catalog.asin_blacklist" in self._q:
+                return [("B0AAA",)]          # 这条已经在表里 ⇒ 不算新增
             return [
                 ("B0AAA", "SKU-A", "s1", None,
                  "This item is a prohibited product. "
                  "Prohibited Products Policy: Alcohol."),
+                ("B0CCC", "SKU-C", "s1", None,
+                 "Intellectual Property complaint received."),
                 ("B0BBB", "SKU-B", "s1", None,
                  "may be a prohibited product. Please make sure the "
                  "appropriate product type selected for this item."),
@@ -233,7 +239,11 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def cursor(self): return _Cur()
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
-    assert "永久禁止 1 个" in out and "apply=1" in out      # PT_WRONG 那条不算
+    # 三条事件:真禁售 / 知产 / PT_WRONG ⇒ 够格 2 个(PT_WRONG 判出去)
+    assert "够格永久拉黑 2 个" in out
+    # 其中 B0AAA 已在表里 ⇒ **真跑只新增 1 条**,这才是 apply 前要看的数
+    assert "真跑只会新增 1 条" in out and "回填只加不减" in out
+    assert "apply=1" in out
     assert wrote == []
 
 

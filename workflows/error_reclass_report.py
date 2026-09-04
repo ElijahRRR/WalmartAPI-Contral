@@ -5,7 +5,7 @@
   python cli.py error_reclass_report -p limit=40  # 各清单在摘要里多列几行
   python cli.py error_reclass_report -p scope=feed # 只跑 feed 侧
   python cli.py error_reclass_report -p scope=blacklist  # 只跑已拉黑的那批 ASIN
-       (scope ∈ all / items / events / feed / blacklist)
+       (scope ∈ all / items / records / events / feed / blacklist)
 
 为什么要有这条:看同一批**生产数据**在现行归类引擎
 (`services/error_taxonomy.py`)下判成什么 —— 主码怎么分布、unknown 还剩多少条
@@ -26,7 +26,8 @@ import logging
 from collections import Counter
 
 from registry import db, paths, resources
-from services import error_taxonomy, problem_products, product_events
+from services import (error_source, error_taxonomy, problem_products,
+                      product_events)
 
 DANGEROUS = False       # 纯 SELECT(唯一的写是报告文件落盘)
 
@@ -46,10 +47,14 @@ GROUP BY 1
 # 含 missing_since 非空的行(方案 §五.1):缺席行的原因是历史病历,
 # 正是"被中性码盖住的真问题"最集中的地方,不能按在架口径滤掉。
 
+# ⚠ 键名两种都要读:写入方 `problem_scan` / `cleanup_history` 写的是
+# `detail->>'reason'`(**单数**),这里原先只读 `'reasons'`(复数)—— 于是这一面
+# 长期近乎空转,而摘要照样显示正常(2026-09-04 查出)。
 _SQL_EVENTS = """
-SELECT detail->>'reasons' AS reasons, count(*) AS n
+SELECT coalesce(detail->>'reasons', detail->>'reason') AS reasons, count(*) AS n
 FROM catalog.product_events
-WHERE event = %s AND coalesce(detail->>'reasons', '') <> ''
+WHERE event = %s
+  AND coalesce(detail->>'reasons', detail->>'reason', '') <> ''
 GROUP BY 1
 """
 
@@ -58,6 +63,19 @@ GROUP BY 1
 # 「status=='failed' 才认 field 锚」的硬闸靠这个 JOIN 供数。
 # 关联不上的(老行/明细先到台账后到)status 给 NULL,按非 failed 处理:
 # 判不准就不判成政策拒,与"带警告的成功"同一方向的保守。
+# ⚠ **全文语料**(2026-09-04 补):`raw_reason` 是 NOT NULL 的全文,所有者
+# 2026-09-03 说的"报错原文是有的"就是这一列。此前这一面**完全不在报告里** ——
+# 而事件回填第三轮实测它是最大的一份还原来源(47,956 条)。
+# 要回答「哪些原文归不出类」,该看的正是这种没被截过的语料:
+# `asin_blacklist.reason` 是 200 字样本,归不出类可能只是**我们自己切坏的**,
+# 不是沃尔玛写得不规范。
+_SQL_RECORDS = """
+SELECT raw_reason AS reasons, count(*) AS n
+FROM audit.walmart_error_records
+WHERE coalesce(raw_reason, '') <> ''
+GROUP BY 1
+"""
+
 _SQL_FEED = """
 SELECT e.code, e.field, e.description, fi.status, count(*) AS n
 FROM ops.feed_item_errors e
@@ -122,7 +140,12 @@ class _Tally:
         self.rows = 0                       # 不同文本数
         self.records = 0                    # 加权条数
         self.new_codes: Counter = Counter()
-        self.unknown: Counter = Counter()   # 原子原文 → 条数
+        self.unknown: Counter = Counter()   # 原子原文 → 条数(**全文**里归不出的)
+        #: 源文本正好 SAMPLE_LEN 字符 ⇒ 是**我们自己 `[:200]` 切出来的残片**,
+        #: 归不出类不能算"沃尔玛写得不规范"。所有者 2026-09-04:「没归类到的报错
+        #: 原文……如果它本来就是不规范的那种,那就不入库也可以」—— 要照这句话做
+        #: 判断,前提是清单里**只有真的原文**,残片必须分出去。
+        self.unknown_cut: Counter = Counter()
         self.unlisted: Counter = Counter()
         self.policy_hit: Counter = Counter()    # 政策名 → 条数(join 得上的)
         self.policy_gap: Counter = Counter()    # 政策名 → 条数(join 不上的)
@@ -134,8 +157,10 @@ class _Tally:
         self.rows += 1
         self.records += n
         self.new_codes[res.code] += n
+        bucket = (self.unknown_cut if len(text or "") == error_source.SAMPLE_LEN
+                  else self.unknown)
         for atom in res.unknown:
-            self.unknown[atom] += n
+            bucket[atom] += n
         for term, hits in res.unlisted:
             self.unlisted[term] += n * hits
         if res.via_ai:
@@ -180,6 +205,16 @@ def _fmt_lists(t: _Tally, limit: int, full: bool) -> list[str]:
     take = t.unknown.most_common() if full else t.unknown.most_common(limit)
     for atom, n in take:
         out.append(f"    {n:>6}  {atom if full else atom[:150]}")
+    if t.unknown_cut:
+        out.append(f"  ⚠ 另有 {len(t.unknown_cut)} 种 / "
+                   f"{sum(t.unknown_cut.values())} 条来自**正好 "
+                   f"{error_source.SAMPLE_LEN} 字符的残片**(我们自己 `[:200]` "
+                   f"切的,不是沃尔玛写得不规范)—— **不列进上面那张清单**,"
+                   f"判「要不要补判据 / 要不要入库」时不能拿它当据。")
+        take = (t.unknown_cut.most_common() if full
+                else t.unknown_cut.most_common(min(limit, 5)))
+        for atom, n in take:
+            out.append(f"    (残){n:>4}  {atom if full else atom[:150]}")
     if t.unlisted:
         out.append("  显式杂项清单(不算 unknown):"
                    + "  ".join(f"{k}×{v}" for k, v in t.unlisted.most_common()))
@@ -328,6 +363,8 @@ def run(params: dict) -> str:
         policy_names = _load_policy_names(conn)
         with conn.cursor() as cur:
             items = _fetch(cur, _SQL_ITEMS) if scope in ("all", "items") else []
+            recs = (_fetch(cur, _SQL_RECORDS)
+                    if scope in ("all", "records") else [])
             events = (_fetch(cur, _SQL_EVENTS, (product_events.STATUS_CHANGED,))
                       if scope in ("all", "events") else [])
             feed = _fetch(cur, _SQL_FEED) if scope in ("all", "feed") else []
@@ -343,6 +380,7 @@ def run(params: dict) -> str:
     body: list[str] = []
     summary: list[str] = list(head)
     for label, rows in (("catalog.walmart_items(下架且有原因)", items),
+                        ("audit.walmart_error_records(raw_reason 全文)", recs),
                         ("catalog.product_events(status_changed)", events)):
         if not rows:
             continue
@@ -357,8 +395,8 @@ def run(params: dict) -> str:
     if blist:
         summary += [""] + blacklist_section(blist, policy_names, limit, False)
         body += [""] + blacklist_section(blist, policy_names, limit, True)
-    if not (items or events or feed or blist):
-        return "\n".join(head + ["", "四张表都没有可对照的行(库是空的?先跑 catalog_sync)"])
+    if not (items or recs or events or feed or blist):
+        return "\n".join(head + ["", "五张表都没有可对照的行(库是空的?先跑 catalog_sync)"])
 
     if dry_run:
         summary.append("")

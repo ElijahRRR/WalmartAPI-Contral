@@ -878,3 +878,39 @@ def test_restore只接回被截掉的那段_不换成别的文本():
     # 这就是那次事故的两个结果:全文 PT_WRONG(可放)/ 残文 POLICY(永久禁)
     assert et.classify_reasons(et.split_reasons(full)).code == "PT_WRONG"
     assert et.classify_reasons(et.split_reasons(sample)).code == "POLICY"
+
+
+def test_对照报告要覆盖全文语料_且把残片分出去():
+    """⚠ 所有者 2026-09-04:「没归类到的报错原文……如果它本来就是不规范的那种,
+    那就不入库也可以」。要照这句话做判断,清单里就**只能有真的原文**。
+
+    三个缺口(都在这次补上):
+      ① `audit.walmart_error_records.raw_reason` 是 NOT NULL 的**全文**,却
+         完全不在报告里 —— 而事件回填第三轮实测它是最大的还原来源(47,956 条);
+      ② 事件那一面只读 `detail->>'reasons'`(复数),而写入方写的是
+         `'reason'`(单数)⇒ 这一面长期近乎空转,摘要照样显示正常;
+      ③ `asin_blacklist.reason` 是 200 字样本,它归不出类可能只是**我们自己
+         切坏的**,混进"未识别"清单会让人误判成"沃尔玛写得不规范"。
+    """
+    import inspect
+    from workflows import error_reclass_report as wf
+    from services import error_source
+    # ① 全文语料这一面在
+    assert "audit.walmart_error_records" in wf._SQL_RECORDS
+    assert "raw_reason" in wf._SQL_RECORDS
+    src = inspect.getsource(wf.run)
+    assert '"all", "records"' in src
+    assert "walmart_error_records(raw_reason 全文)" in src
+    # ② 键名两种都读
+    assert "coalesce(detail->>'reasons', detail->>'reason')" in wf._SQL_EVENTS
+    # ③ 残片单独一栏,不进"未识别"清单
+    t = wf._Tally("t")
+    cut = "x" * error_source.SAMPLE_LEN            # 正好 200 = 我们切的
+    t.add(cut, 3, ())
+    assert t.unknown == {} and sum(t.unknown_cut.values()) == 3
+    t2 = wf._Tally("t2")
+    t2.add("x" * (error_source.SAMPLE_LEN + 1), 5, ())   # 201 字 = 真原文
+    assert sum(t2.unknown.values()) == 5 and t2.unknown_cut == {}
+    # 报告文本里要把这层区别说清楚,不能只在代码里
+    lines = "\n".join(wf._fmt_lists(t, 20, True))
+    assert "残片" in lines and "不是沃尔玛写得不规范" in lines

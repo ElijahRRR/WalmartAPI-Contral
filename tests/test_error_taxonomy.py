@@ -653,3 +653,52 @@ def test_不是商品违禁那一集只有一份():
     # 每个码都得是码表里真有的
     for code in et.NOT_A_PRODUCT_BAN:
         assert code in resources.ERROR_CATEGORY_CODES, code
+
+
+def test_取原文只有一处实现_四级优先():
+    """⚠ 2026-09-04 生产实证:**判据统一 ≠ 口径统一**。同一段文本判成什么是
+    确定的,但不同路径拿到的「那段文本」不一样,于是同一个 ASIN 判出相反的码:
+
+      · walmart_items 全文,带句尾「To republish this item please make sure you
+        have the appropriate product type selected.」→ PT_WRONG(修法不是禁令)
+      · product_events 的 reason,句尾那句**不在**(`||…@@@…` 格式)→ POLICY
+
+    后果:**3,037 个品**被 blacklist_route 正确删掉、又要被回填错误加回来,
+    而两边摘要都显示正常。所以取原文与归类一样,只准有一处实现。
+    """
+    import inspect
+    from services import error_source, blacklist
+    from workflows import error_reclass
+    # 两个消费方都转调 services/error_source,自己不再实现
+    assert "error_source.pick" in inspect.getsource(error_reclass.pick_source)
+    assert "error_source.fetch" in inspect.getsource(error_reclass._sources)
+    for name in ("error_source.fetch", "error_source.pick"):
+        assert name in inspect.getsource(blacklist._judge_events), name
+    # SQL 只在 services 里出生
+    src = inspect.getsource(error_reclass)
+    for gone in ("_SQL_SRC_RECORDS", "_SQL_SRC_ITEMS", "raw_reason\nFROM"):
+        assert gone not in src, gone
+    # 优先序本身是判据:全文压过样本,四处都没有 → 不猜
+    assert error_source.pick("A", "样本", "S", {"A": "全文"}, {"A": "事"},
+                             {"S": "件"}) == ("全文", "records")
+    assert error_source.pick("A", "样本", "S", {}, {"A": "事"},
+                             {"S": "件"}) == ("事", "events")
+    assert error_source.pick("A", "样本", "S", {}, {}, {"S": "件"}) == ("件", "items")
+    assert error_source.pick("A", "样本", None, {}, {}, {}) == ("样本", "self")
+    assert error_source.pick("A", "  ", None, {}, {}, {}) == ("", "none")
+
+
+def test_同一个ASIN两条源判出相反的码_这就是那3037条():
+    """把生产实测的两段原文钉成回归用例 —— 它们是 `services/error_source`
+    存在的全部理由。以后谁把取原文那一步简化掉,这条会红。"""
+    full = ("This item has been unpublished for violating Walmart's Marketplace "
+            "*Prohibited Product Policy*.  To republish this item please make "
+            "sure you have the appropriate product type selected for this item.")
+    partial = ("This item has been unpublished for violating Walmart's Marketplace "
+               "||Prohibited Product Policy@@@https://marketplacelearn.walmart.com"
+               "/guides/Prohibited-products")
+    assert et.classify_reasons(et.split_reasons(full)).code == "PT_WRONG"
+    assert et.classify_reasons(et.split_reasons(partial)).code == "POLICY"
+    # 一个该放、一个会被永久拉黑 —— 取错原文的代价就是这个
+    assert et.is_permanent("POLICY", None) is True
+    assert et.is_permanent("PT_WRONG", None) is False

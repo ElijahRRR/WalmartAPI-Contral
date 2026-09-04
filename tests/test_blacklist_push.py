@@ -221,16 +221,30 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def fetchone(self): return (3, 20)   # (brand_cand, total)
         def fetchall(self):
             if "FROM catalog.asin_blacklist" in self._q:
-                return [("B0AAA",)]          # 这条已经在表里 ⇒ 不算新增
+                return [("B0DDD",)]          # 这条已经在表里 ⇒ 不算新增
+            if "walmart_error_records" in self._q:
+                # ⚠ 四级优先:records 全文压过事件里那条残文。B0AAA 的事件只说
+                #   「违反禁售政策」(→POLICY),而全文带着句尾判据串(→PT_WRONG)
+                #   —— 这正是生产里那 3,037 个品的形状。
+                return [("B0AAA",
+                         "This item has been unpublished for violating "
+                         "Walmart's Marketplace Prohibited Product Policy. "
+                         "To republish this item please make sure you have "
+                         "the appropriate product type selected for this item.")]
+            if "AS reasons" in self._q or "unpublished_reasons" in self._q:
+                return []                    # SRC_EVENTS / SRC_ITEMS 两级空
+            # 主查询(_LATEST_ROWS_SQL,`FROM latest`)—— ⚠ 它也含
+            # `product_events`,分派别按表名,按这个独有的标记
+            assert "FROM latest" in self._q, self._q[:80]
             return [
                 ("B0AAA", "SKU-A", "s1", None,
-                 "This item is a prohibited product. "
-                 "Prohibited Products Policy: Alcohol."),
+                 "This item has been unpublished for violating Walmart's "
+                 "Marketplace ||Prohibited Product Policy@@@https://x"),
                 ("B0CCC", "SKU-C", "s1", None,
                  "Intellectual Property complaint received."),
-                ("B0BBB", "SKU-B", "s1", None,
-                 "may be a prohibited product. Please make sure the "
-                 "appropriate product type selected for this item."),
+                ("B0DDD", "SKU-D", "s1", None,
+                 "This item is a prohibited product. "
+                 "Prohibited Products Policy: Alcohol."),
             ]
 
     class _Conn:
@@ -239,9 +253,11 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def cursor(self): return _Cur()
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
-    # 三条事件:真禁售 / 知产 / PT_WRONG ⇒ 够格 2 个(PT_WRONG 判出去)
+    # 三条事件,但判据取的是**四级优先后的原文**:
+    #   B0AAA 事件说「违反禁售政策」→ 看着像 POLICY,而 records 全文带句尾
+    #         判据串 → PT_WRONG,**判出去**(这条是 3,037 那一类的回归钉);
+    #   B0CCC 知产 → 够格;B0DDD 真禁售 → 够格但已在表里。
     assert "够格永久拉黑 2 个" in out
-    # 其中 B0AAA 已在表里 ⇒ **真跑只新增 1 条**,这才是 apply 前要看的数
     assert "真跑只会新增 1 条" in out and "回填只加不减" in out
     assert "apply=1" in out
     assert wrote == []

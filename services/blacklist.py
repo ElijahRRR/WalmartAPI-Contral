@@ -55,7 +55,7 @@ import json
 import logging
 from collections import Counter
 
-from services import error_taxonomy
+from services import error_source, error_taxonomy
 from services.sku_asin import extract_asin
 
 logger = logging.getLogger("services.blacklist")
@@ -290,22 +290,38 @@ WHERE coalesce(reason, '') <> ''
 def _judge_events(conn) -> list[dict]:
     """输入:连接 → 输出:按原文重判后**够格永久拉黑**的行(已带新码与来源标签)。
 
-    纯读;`classify_reasons` 是全仓唯一的归类引擎(`services/error_taxonomy`)。
+    两条纪律各由一个模块把关,这里一条都不自己实现:
+      · **取原文** 走 `services/error_source`(四级优先,全文优先于样本);
+      · **归类**   走 `services/error_taxonomy`(唯一的归类引擎)。
+
+    ⚠ 2026-09-04 生产实证:这个函数原来**只用事件里那条 reason**,而事件 reason
+    是残缺源 —— 同一个 ASIN,`walmart_items` 全文带句尾的「To republish this item
+    please make sure you have the appropriate product type selected.」判 `PT_WRONG`,
+    而事件里那份(`||Prohibited Product Policy@@@https://…`)句尾不在,判 `POLICY`。
+    于是 **3,037 个品**被 `blacklist_route` 正确删掉、又要被回填错误加回来,
+    **两边摘要都显示正常**。判据统一了不等于口径统一 —— 数据源决定判定结果。
     """
     with conn.cursor() as cur:
         cur.execute(_LATEST_ROWS_SQL)
         rows = cur.fetchall()
+    asins = [r[0] for r in rows if r[0]]
+    skus = [r[1] for r in rows if r[1]]
+    records, _events, items = error_source.fetch(conn, asins, skus)
     out = []
     for asin, sku, store, occurred_at, reason in rows:
-        res = error_taxonomy.classify_reasons(
-            error_taxonomy.split_reasons(reason))
+        # 事件 reason 就是「events」那一级,手上已有,不再查一遍
+        text, _src = error_source.pick(asin, None, sku,
+                                       records, {asin: reason}, items)
+        if not text:
+            continue
+        res = error_taxonomy.classify_reasons(error_taxonomy.split_reasons(text))
         if not error_taxonomy.is_permanent(res.code, res.unlisted_term):
             continue
-        low = (reason or "").lower()
+        low = text.lower()
         out.append({
             "asin": asin, "cat": res.code, "sku": sku, "store": store,
             "source": source_label(res.code),
-            "reason": reason, "created_at": occurred_at,      # 全文,别截
+            "reason": text, "created_at": occurred_at,        # 全文,别截
             "biz_cn": ("biz-cn" in low or "reference code biz" in low)})
     return out
 

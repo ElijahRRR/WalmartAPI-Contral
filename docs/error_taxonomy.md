@@ -1027,10 +1027,10 @@ product type 选对」,修法不是禁令)混在里面,只有 3,512 条是真 `P
 - `_judge_events` 走事件里的 `reason`;
 - 实时 `problem_scan` 走当轮 `unpublished_reasons`。
 
-**"口径统一"到这里只做完了一半:判据统一了,原文来源没有。** 真要做完,得让
-三条路都优先取 `audit.walmart_error_records.raw_reason` 的全文。这不在本次范围,
-记在这里 —— 在那之前,**`-p backfill=1 -p apply=1` 别跑**,先看新增清单里有没有
-刚被路由删掉的品。
+**"口径统一"到这里只做完了一半:判据统一了,原文来源没有。**
+⚠ **这句话说轻了,已在 §14.9 更正**:实测之后发现它不是「留给下一步的
+改进」,而是我这次改动引入路径里的**直接缺陷** —— `_judge_events` 只用
+事件 reason(残缺源),会把 3,037 个被正确释放的品加回来。已修。
 
 ### 14.8 200 字符截断:考古结论是**没有理由**(2026-09-04 所有者问)
 
@@ -1069,3 +1069,48 @@ product type 选对」,修法不是禁令)混在里面,只有 3,512 条是真 `P
 `audit.walmart_error_records.raw_reason`(那张表存的是全文)重新取,
 那正是 §14.7 说的「原文来源统一」。这一条现在有了更硬的理由:
 **不是"三条路取的原文不一样"这么中性,而是其中一条路取的是被砍掉判据串的残文。**
+
+### 14.9 ⚠ 判据统一 ≠ 口径统一:**数据源决定判定结果**(2026-09-04 实测)
+
+所有者按预览的提示实查,结果**推翻了我的推断**:
+
+```
+将新增 4,182 条,其中**刚被路由删过的 3,037 条**(72.6%)
+  冲突按新码: POLICY 2676 / FLAGGED 313 / GATED 32 / IP 8 / BRAND 5 / PROHIBITED_FINAL 3
+```
+
+逐条原文对照(⚠ 我给的对照脚本打印的「路由判的原文」其实是
+`asin_blacklist.reason` 那份**残文**,不是 `error_reclass` 判定时真正用的原文
+—— `taxonomy_src=items` 才是真相。**脚本本身有误导**,别照抄):
+
+| 源 | 原文 | 判 |
+|---|---|---|
+| `walmart_items` 全文 | 「…violating Walmart's Marketplace \*Prohibited Product Policy\*.  **To republish this item please make sure you have the appropriate product type selected for this item.**」 | **`PT_WRONG`** |
+| `product_events` 的 reason | 「…violating Walmart's Marketplace `\|\|`Prohibited Product Policy`@@@`https://…」(**句尾那句不在**) | **`POLICY`** |
+
+离线实测两段文本确认:**同一个引擎、同样的参数,判出相反的码** ——
+差别只在原文。(顺带排除了参数因素:传不传 `policy_names` 不影响主码。)
+
+#### 这不是「留给下一步」,是我这次改动的直接缺陷
+
+`_judge_events` 把集合 SQL 改成 Python 判时,**沿用了同一个数据源(事件 reason),
+没把 `error_reclass` 那套四级优先带过来**。§14.7 把它写成「口径问题,记在这里」
+——**说轻了**:它让 `backfill` 这条路有毒,3,037 条(新增的 72.6%)是被正确释放、
+又要被错误加回来的品,而**两边摘要都显示正常**。
+
+#### 已修:取原文提到 `services/error_source`
+
+取原文与归类(`services/error_taxonomy`)一样,**只准有一处实现**:
+
+- 新模块 `services/error_source`:三条外源 SQL + `fetch()` + `pick()`
+  (四级优先 `records` → `events` → `items` → 调用方手上那份 → `none`);
+- `workflows/error_reclass` 的 `pick_source` / `_sources` 变成转调(自己那份删掉);
+- `services/blacklist._judge_events` 改走它 —— 事件 reason 现在只是「events」
+  那一级,`records` 全文压过它。
+
+守门测试三条:两个消费方都必须转调、SQL 只在 services 里出生、优先序四档逐个钉;
+另加一条**把生产实测的那两段原文钉成回归用例** —— 它们是这个模块存在的全部理由,
+以后谁把取原文那一步简化掉,那条会红。
+
+⚠ 修完之后 `backfill` 的「新增」会变 —— **重跑预览再看冲突数**,那才是能不能
+`apply` 的闸门。

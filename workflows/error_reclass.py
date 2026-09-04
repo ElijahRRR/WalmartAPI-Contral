@@ -58,7 +58,7 @@ import logging
 from collections import Counter
 
 from registry import db, resources
-from services import error_taxonomy, problem_products
+from services import error_source, error_taxonomy, problem_products
 
 DANGEROUS = False       # 只写自己库的新增列,不碰沃尔玛接口
 
@@ -111,26 +111,6 @@ WHERE asin = %(asin)s
 # 原文三级外源。⚠ 都是 DISTINCT ON 取**最新一条**:同一 asin 多条报错时,
 # 拿最近那次的原文判 —— 与黑名单"当轮类别"的口径一致(旧类别翻动频繁,
 # 「曾经命中过」不作数,见 services/blacklist 头注)。
-_SQL_SRC_RECORDS = """
-SELECT DISTINCT ON (asin) asin, raw_reason
-FROM audit.walmart_error_records
-WHERE asin = ANY(%(asins)s) AND coalesce(raw_reason, '') <> ''
-ORDER BY asin, report_date DESC NULLS LAST, id DESC
-"""
-_SQL_SRC_EVENTS = """
-SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku) AS k,
-       detail->>'reasons' AS reasons
-FROM catalog.product_events
-WHERE coalesce(asin, sku) = ANY(%(asins)s)
-  AND coalesce(detail->>'reasons', '') <> ''
-ORDER BY coalesce(asin, sku), occurred_at DESC
-"""
-_SQL_SRC_ITEMS = """
-SELECT DISTINCT ON (sku) sku, unpublished_reasons
-FROM catalog.walmart_items
-WHERE sku = ANY(%(skus)s) AND coalesce(unpublished_reasons, '') <> ''
-ORDER BY sku, updated_at DESC
-"""
 
 
 def _parse(params: dict) -> tuple[str, int, bool, bool, int]:
@@ -183,23 +163,12 @@ def pick_source(asin: str, own_reason: str | None, src_sku: str | None,
                 records: dict, events: dict, items: dict) -> tuple[str, str]:
     """输入:一行黑名单 + 三张外源表的映射 → 输出:(原文, 来源标签)。
 
-    四级优先,**全文优先于样本**(见模块头);都没有给 `("", "none")`。
-    纯函数,零 I/O —— 优先序是判据的一部分,拿假数据就能测。
+    ⚠ 2026-09-04 起实现搬到 `services/error_source.pick` —— 取原文与归类
+    (`services/error_taxonomy`)一样,只准有一处实现。这里只留个转调:
+    `blacklist` 的回填走的是同一份,不然同一个品在两条路上判出相反的码
+    (实测 3,037 个,见该模块头注)。
     """
-    text = records.get(asin)
-    if text:
-        return text, "records"
-    text = events.get(asin)
-    if text:
-        return text, "events"
-    if src_sku:
-        text = items.get(src_sku)
-        if text:
-            return text, "items"
-    own = (own_reason or "").strip()
-    if own:
-        return own, "self"
-    return "", "none"
+    return error_source.pick(asin, own_reason, src_sku, records, events, items)
 
 
 def _load_policy_names(conn) -> list[str]:
@@ -209,24 +178,8 @@ def _load_policy_names(conn) -> list[str]:
 
 
 def _sources(conn, asins: list[str], skus: list[str]) -> tuple[dict, dict, dict]:
-    """输入:一批 asin/sku → 输出:三张外源映射(查不到的表只告警不阻断)。"""
-    out: list[dict] = []
-    for sql, args, key in ((_SQL_SRC_RECORDS, {"asins": asins}, "asins"),
-                           (_SQL_SRC_EVENTS, {"asins": asins}, "asins"),
-                           (_SQL_SRC_ITEMS, {"skus": skus}, "skus")):
-        if not args[key]:
-            out.append({})
-            continue
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, args)
-                out.append({k: v for k, v in cur.fetchall() if v})
-        except Exception as e:                                  # noqa: BLE001
-            logger.warning("外源读不到(本级跳过):%s… / %s",
-                           " ".join(sql.split())[:50], e)
-            conn.rollback()
-            out.append({})
-    return out[0], out[1], out[2]
+    """输入:一批 asin/sku → 输出:三张外源映射(唯一实现在 services/error_source)。"""
+    return error_source.fetch(conn, asins, skus)
 
 
 def _pages(conn, sql: str, ver: str, chunk: int, limit: int, execute: bool):

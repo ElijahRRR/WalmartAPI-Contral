@@ -284,11 +284,19 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     policies: Counter = Counter()      # 政策类别名(与主码正交的第二维)
     suspect: Counter = Counter()
     done = 0
+    # ⚠ 按 asin 索引的 items 那一份**在循环外查一次**(全表扫,每批扫一遍太贵)。
+    #   2026-09-04 实证:上一轮 `self=14,475` 条拿的是 200 字符残文 —— 它们**有**
+    #   `src_sku`,但那个 sku 在 `walmart_items` 里可能已经不在了(下架删除),
+    #   于是 items 那一级查不中、退回残文。我原先判断「error_reclass 有精确的
+    #   src_sku 就不需要按 asin 兜底」是**错的**:有 sku ≠ 那个 sku 还查得到。
+    by_asin = error_source.items_by_asin_map(conn)
+    logger.info("items 按 asin 索引 %d 条(给 src_sku 已失效的行兜底)", len(by_asin))
     sql = _SQL_BL_PICK.format(force="true" if force else "false")
     for rows in _pages(conn, sql, ver, chunk, limit, execute):
         asins = [r[0] for r in rows]
         skus = [r[3] for r in rows if r[3]]
         rec, ev, it = _sources(conn, asins, skus)
+        it = {**by_asin, **it}          # 按 sku 命中的优先
         ups = []
         for asin, cat, reason, src_sku in rows:
             text, src = pick_source(asin, reason, src_sku, rec, ev, it)

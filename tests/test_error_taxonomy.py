@@ -719,12 +719,39 @@ def test_items那一级要按asin也索引一份_否则sku对不上就查不中(
     from workflows import error_reclass
     sig = inspect.signature(error_source.fetch)
     assert sig.parameters["items_by_asin"].default is False   # 缺省不付代价
-    assert "extract_asin" in inspect.getsource(error_source.fetch)
-    # 手上 sku 不可靠的那一方开它;有精确 src_sku 的那一方不开
+    assert "extract_asin" in inspect.getsource(error_source.items_by_asin_map)
     assert "items_by_asin=True" in inspect.getsource(blacklist._judge_events)
-    assert "items_by_asin" not in inspect.getsource(error_reclass._sources)
-    # 不许覆盖按 sku 命中的那份(调用方给的 sku 更精确)
-    assert "a not in items" in inspect.getsource(error_source.fetch)
+    # ⚠ `error_reclass` 也要用 —— 我原先判断「它有精确的 src_sku 就不需要按 asin
+    #   兜底」是**错的**:那 14,475 条 self(残文)**有** src_sku,但那个 sku 在
+    #   walmart_items 里已经不在了(下架删除),照样查不中。
+    #   它分批跑,所以在**循环外**查一次、跨批复用。
+    bl_src = inspect.getsource(error_reclass._blacklist_pass)
+    assert "error_source.items_by_asin_map(conn)" in bl_src
+    assert bl_src.index("items_by_asin_map") < bl_src.index("for rows in _pages")
+    # 按 sku 命中的优先(调用方给的 sku 更精确)
+    assert "{**by_asin, **it}" in bl_src
+    assert "{**items_by_asin_map(conn), **items}" in inspect.getsource(error_source.fetch)
+
+
+def test_pick的items那一级_sku与asin两个都要试():
+    """⚠ 2026-09-04 实遇的**第二个** bug:`fetch(items_by_asin=True)` 按 asin
+    补了索引,而 `pick` 只查 `items.get(src_sku)` —— **索引加了、查法没改**,
+    补进来的 asin 键永远查不到,冲突数纹丝不动(2,261 → 2,263)。
+
+    sku 更精确排前面;sku 失效(下架删除)或对不上时按 asin 兜底。
+    """
+    from services import error_source as es
+    # sku 命中 → 用 sku 那份
+    assert es.pick("B0X", None, "S-1", {}, {}, {"S-1": "按sku", "B0X": "按asin"}) \
+        == ("按sku", "items")
+    # sku 查不中 → 退到 asin,**而不是**掉到 self
+    assert es.pick("B0X", "残文", "S-9", {}, {}, {"B0X": "按asin"}) \
+        == ("按asin", "items")
+    # 手上压根没有 sku 时也要试 asin
+    assert es.pick("B0X", "残文", None, {}, {}, {"B0X": "按asin"}) \
+        == ("按asin", "items")
+    # 两个都没有才轮到自己那份残文
+    assert es.pick("B0X", "残文", "S-9", {}, {}, {}) == ("残文", "self")
 
 
 def test_复核出结论就把category改成新码_LEGACY与判不出的不动():

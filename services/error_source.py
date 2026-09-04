@@ -95,21 +95,30 @@ def fetch(conn, asins: list[str], skus: list[str], *,
             out.append({})
     records, events, items = out
     if items_by_asin and asins:
-        want = set(asins)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(SRC_ITEMS_ANY)
-                for sku, text in cur.fetchall():
-                    if not text:
-                        continue
-                    a = extract_asin(sku)
-                    # 不覆盖按 sku 命中的那份(调用方给的 sku 更精确)
-                    if a and a in want and a not in items:
-                        items[a] = text
-        except Exception as e:                                  # noqa: BLE001
-            logger.warning("按 asin 补 items 那一级失败(跳过):%s", e)
-            conn.rollback()
+        items = {**items_by_asin_map(conn), **items}   # 按 sku 命中的优先
     return records, events, items
+
+
+def items_by_asin_map(conn) -> dict:
+    """输入:连接 → 输出:{asin: 下架原因}(扫一遍有下架原因的行,按 sku_asin 折)。
+
+    ⚠ **是全表扫**,分批跑的调用方要在循环外调一次、跨批复用,别每批扫一遍。
+    查不到就返回空:少一级原文是判得糙一点,炸掉是一条都判不了。
+    """
+    out: dict = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SRC_ITEMS_ANY)
+            for sku, text in cur.fetchall():
+                if not text:
+                    continue
+                a = extract_asin(sku)
+                if a and a not in out:
+                    out[a] = text
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("按 asin 扫 items 失败(本级跳过):%s", e)
+        conn.rollback()
+    return out
 
 
 def pick(asin: str, own_reason: str | None, src_sku: str | None,
@@ -125,10 +134,17 @@ def pick(asin: str, own_reason: str | None, src_sku: str | None,
     text = events.get(asin)
     if text:
         return text, "events"
+    # ⚠ 先 sku 后 asin,**两个都要试**(2026-09-04 实遇:只按 src_sku 查时,
+    #   `fetch(items_by_asin=True)` 补进来的 asin 键**永远查不到** —— 索引加了、
+    #   查法没改,冲突数纹丝不动 2,261 → 2,263)。
+    #   sku 更精确所以排前面;sku 失效(下架删除)或对不上时按 asin 兜底。
     if src_sku:
         text = items.get(src_sku)
         if text:
             return text, "items"
+    text = items.get(asin)
+    if text:
+        return text, "items"
     own = (own_reason or "").strip()
     if own:
         return own, "self"

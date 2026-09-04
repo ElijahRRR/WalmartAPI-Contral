@@ -256,8 +256,16 @@ class _Cur:
             self._rows = list(c.tag_rows)          # 同 tag 既有样本
         elif sql.lstrip().startswith("SELECT DISTINCT sku FROM catalog"):
             self._rows = [(k,) for k in c.rejected]   # 曾被拒的 sku(asin 级判据)
+        elif sql.lstrip().startswith("SELECT DISTINCT asin FROM audit.walmart_error"):
+            self._rows = [(a,) for a in c.ever_flagged]   # 历史报错账本
+        elif sql.lstrip().startswith("SELECT count(*)"):
+            # 去掉天数闸的干净在架总量(只用来报"天数闸砍掉了多少")
+            self._rows = [(c.clean_total if c.clean_total is not None
+                           else len(c.pos),)]
         elif "published_status = 'PUBLISHED'" in sql:
-            self._rows = list(c.pos)        # ⚠ 先判:正例 SQL 的 NOT EXISTS
+            # 正例行现在是 (sku, age_days);老夹具只给 sku,补一个够大的天数
+            self._rows = [(p[0], p[1] if len(p) > 1 else 999) for p in c.pos]
+            #                             ⚠ 先判:正例 SQL 的 NOT EXISTS
         elif "unpublished_reasons, '') <> ''" in sql and "md5" in sql:
             self._rows = list(c.neg)        #    里同样带着下架原因那一句
         elif sql.strip().startswith("SELECT asin FROM catalog.products"):
@@ -292,12 +300,14 @@ class _Cur:
 
 class _Conn:
     def __init__(self, neg=(), pos=(), products=None, old=None, item_ids=None,
-                 tag_rows=(), rejected=()):
+                 tag_rows=(), rejected=(), ever_flagged=(), clean_total=None):
         self.neg, self.pos = list(neg), list(pos)
         self.products = products or {}
         self.old = old or {}
         self.item_ids = item_ids or {}
         self.tag_rows = list(tag_rows)
+        self.ever_flagged = list(ever_flagged)
+        self.clean_total = clean_total
         self.rejected = list(rejected)
         self.sql: list = []
         self.written: list = []
@@ -987,3 +997,51 @@ def test_报告三桶都摊开_不藏任何一桶():
     assert "L3 政策判据:2 条,判拒 1" in text
     assert "没有一条读过那 44 篇原文" in text
     assert "**判据召回**(只算 L3 政策判据的 2 条反例):1/2" in text
+
+
+def test_正例要在线够久_新上架的不算证据():
+    """⚠ 所有者 2026-09-04 定的口径:「拿一些在线时间长、且从未被沃尔玛报错的
+    产品当作正例,这个算比较有说服力的」。
+
+    为什么这是判据不是口味:正例这一侧**沃尔玛没留下任何证据**,它只是"没拒过"。
+    而对一条昨天才上架的 listing,"没拒过"几乎不含信息 —— 沃尔玛根本还没看过它。
+    **曝光时长才是把沉默变成证据的那个量。**
+    """
+    assert "min_days" in ar._POS_SQL and "min(w.created_at)" in ar._POS_SQL
+    assert "HAVING" in ar._POS_SQL
+    # 缺省 180 天,且能用 -p pos_days=N 调(不许默默放宽)
+    assert ar._DEFAULT_POS_DAYS == 180
+    assert ar._parse_params({}).pos_days == 180
+    assert ar._parse_params({"pos_days": "365"}).pos_days == 365
+    with pytest.raises(ValueError, match="未识别参数"):
+        ar._parse_params({"pos_day": 365})
+    # 跨店取 min:同一 sku 多店有行,要的是"最早那条还活着的"
+    assert "GROUP BY w.sku" in ar._POS_SQL
+
+
+def test_从未被报错要查历史账本_不能只看当前值():
+    """⚠ `walmart_items.unpublished_reasons` 是**就地覆盖的当前值** ——
+    半年前被拒、后来改好的品在那一列上看着干干净净。所有者要的是
+    「**从未**被沃尔玛报错」,只查当前值会把这批品当成正例,
+    而它们恰恰是最该被拒的那类。"""
+    assert "audit.walmart_error_records" in ar._EVER_FLAGGED_SQL
+    conn = _Conn(pos=[("SKU-OLD",)], rejected=[], ever_flagged=["B0EVER"])
+    assert "B0EVER" in ar.rejected_asins(conn)      # 历史账本并进了判据面
+
+
+def test_天数闸砍到只剩零头要吼一声():
+    """⚠ `created_at` 是**我们第一次同步到这行**的时间。整表重建过的话,
+    所有行的 created_at 会挤在重建那天 —— 那么"在线 N 天"是假的,
+    而误伤率会看着很好看。够天数的不到干净在架的 2% 就点名。"""
+    meta = dict(_META)
+    meta["pos_stats"] = {"scanned": 10, "pool_cap": 100, "min_days": 180,
+                         "clean_total": 5000, "age_med": 181, "age_max": 190,
+                         "no_asin": 0, "no_product": 0}
+    text = "\n".join(ar.report([_row(asin="B01")], meta)[0])
+    assert "**正例口径**:在线 ≥ 180 天" in text
+    assert "够天数的不到干净在架的 2%" in text
+    # 量足够时不吼(别给读的人加噪声)
+    meta["pos_stats"]["scanned"] = 3000
+    ok = "\n".join(ar.report([_row(asin="B01")], meta)[0])
+    assert "够天数的不到干净在架的 2%" not in ok
+    assert "在线**中位 181 天 / 最长 190 天**" in ok

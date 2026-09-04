@@ -73,13 +73,17 @@ DANGEROUS = False       # 只写自己的表与报告文件(判定链另写 llm_
 logger = logging.getLogger("workflows.audit_replay")
 
 # ── 参数 ─────────────────────────────────────────────────────────────────────
-_KNOWN_PARAMS = {"neg", "pos", "seed", "tag", "workers", "limit_per_category"}
+_KNOWN_PARAMS = {"neg", "pos", "seed", "tag", "workers", "limit_per_category",
+                 "pos_days"}
 # cli 自己塞的键(与 product_audit 同款白名单:每加一个 cli 级开关都会重演
 # 2026-08-16 那次「--dry-run 让工作流起不来」)
 _CLI_INJECTED = {"execute", "dry_run"}
 
 _DEFAULT_NEG = 600      # 所有者定稿 §六.5
 _DEFAULT_POS = 400
+#: 正例最少在线天数(所有者 2026-09-04):沃尔玛的沉默要够久才算证据。
+#: 180 天 ≈ 趟过两轮季度巡检;拿不到量就 `-p pos_days=N` 调,别默默放宽。
+_DEFAULT_POS_DAYS = 180
 _DEFAULT_SEED = 20260902    # 固定缺省 —— 同 seed 恒同一批样本,改判据前后可比
 _MIN_CAP = 10           # 每类封顶的下限(类别多的时候别把稀有类别切成 1 条)
 
@@ -130,11 +134,25 @@ ORDER BY md5(t.sku || %(seed)s)
 LIMIT %(pool)s
 """
 
-# 正例 = 在架在售且**任何一家店都没给过下架原因**。NOT EXISTS 那一条是必须的:
-# 同一个 sku 在 A 店在架、在 B 店被拒是常态,只看本行会把反例算成正例。
+# 正例 = **在线够久**、在架在售、且**从来没被沃尔玛报错过**。
+#
+# ⚠ 所有者 2026-09-04 定的口径:「拿一些在线时间长、且从未被沃尔玛报错的产品
+#   当作正例,这个算比较有说服力的」。为什么这一条是判据而不是口味:
+#   正例这一侧**沃尔玛没有留下任何证据** —— 它只是"没拒过"。而对一条昨天才
+#   上架的 listing,"没拒过"几乎不含信息(沃尔玛根本还没看过它)。
+#   **曝光时长才是把沉默变成证据的那个量**:一个品在架 N 天没被摘,说明它
+#   真的趟过了沃尔玛的巡检。天数由 `-p pos_days=N` 给,缺省 180。
+#
+# ⚠ `created_at` 是**我们第一次同步到这行**的时间,不是沃尔玛的上架时间 ——
+#   它是在线时长的**下界**(新接的店会让老 listing 看着"年轻")。下界正是
+#   我们要的:宁可把老品当新品排掉,不可把新品当老品放进来。
+#   跨店取 `min`:同一个 sku 在多店有行,取最早那条还活着的。
+# NOT EXISTS 那一条照旧必须:同一个 sku 在 A 店在架、在 B 店被拒是常态,
+# 只看本行会把反例算成正例。
 _POS_SQL = """
-SELECT sku FROM (
-    SELECT DISTINCT ON (w.sku) w.sku AS sku
+SELECT sku, age_days FROM (
+    SELECT w.sku AS sku,
+           (extract(epoch FROM now() - min(w.created_at)) / 86400)::int AS age_days
     FROM catalog.walmart_items w
     WHERE w.published_status = 'PUBLISHED'
       AND w.missing_since IS NULL
@@ -142,10 +160,29 @@ SELECT sku FROM (
       AND NOT EXISTS (SELECT 1 FROM catalog.walmart_items x
                       WHERE x.sku = w.sku
                         AND coalesce(x.unpublished_reasons, '') <> '')
-    ORDER BY w.sku, w.store
+    GROUP BY w.sku
+    HAVING (extract(epoch FROM now() - min(w.created_at)) / 86400)::int
+           >= %(min_days)s
 ) t
 ORDER BY md5(t.sku || %(seed)s)
 LIMIT %(pool)s
+"""
+
+#: 同一口径**去掉天数闸**的总量 —— 只报数,用来看天数闸砍掉了多少。
+#: 砍得只剩零头 = `created_at` 多半不是真的上架时间(如整表重建过),
+#: 这时那个"在线 N 天"是假的,报告要能一眼看出来。
+_POS_POOL_TOTAL_SQL = """
+SELECT count(*) FROM (
+    SELECT w.sku
+    FROM catalog.walmart_items w
+    WHERE w.published_status = 'PUBLISHED'
+      AND w.missing_since IS NULL
+      AND coalesce(w.unpublished_reasons, '') = ''
+      AND NOT EXISTS (SELECT 1 FROM catalog.walmart_items x
+                      WHERE x.sku = w.sku
+                        AND coalesce(x.unpublished_reasons, '') <> '')
+    GROUP BY w.sku
+) t
 """
 
 # 库里有产品行且有标题的才进样本(无标题 = 采集降级,不够格判定 ——
@@ -197,6 +234,14 @@ SELECT DISTINCT sku FROM catalog.walmart_items
 WHERE coalesce(unpublished_reasons, '') <> ''
 """
 
+#: **历史**报错账本(`walmart_items.unpublished_reasons` 是就地覆盖的当前值,
+#: 半年前被拒、后来改好的品在那一列上看着是干净的 —— 而它显然不该当正例)。
+#: 这张表天生带 asin,不用过 sku_asin。
+_EVER_FLAGGED_SQL = """
+SELECT DISTINCT asin FROM audit.walmart_error_records
+WHERE coalesce(asin, '') <> ''
+"""
+
 _INSERT_SQL = """
 INSERT INTO audit.replay_results
   (run_tag, asin, expected_verdict, expected_category, got_verdict,
@@ -230,6 +275,7 @@ class Opts:
     tag: str
     workers: int
     cap: int | None             # 每类封顶;None = 按 neg / 类别数 现算
+    pos_days: int               # 正例最少在线天数(沃尔玛的沉默要够久才算证据)
     dry_run: bool
     conn_note: str = ""         # 连接余量钳制说明(db_guard 回填)
 
@@ -283,6 +329,7 @@ def _parse_params(params: dict) -> Opts:
         f"{datetime.now().strftime('%Y%m%d')}-{resources.AUDIT_RULES_VERSION}")
     return Opts(neg=neg, pos=pos, seed=_int("seed", _DEFAULT_SEED), tag=tag,
                 workers=workers, cap=cap,
+                pos_days=_int("pos_days", _DEFAULT_POS_DAYS),
                 dry_run=bool(params.get("dry_run")))
 
 
@@ -512,11 +559,19 @@ def rejected_asins(conn) -> set:
     全量折成 asin。只取 `sku` 一列(不带下架原因长文本),生产是几万行的量级。
     ⚠ **不设上限,也不许设**:抽样面可以封顶(抽不到就是没抽到),判据面封顶
     等于随机漏掉几个"其实被拒过"的品,而且不会报错。
+
+    ⚠ 并上 `audit.walmart_error_records` 的**历史**账本(2026-09-04):
+    `unpublished_reasons` 是**就地覆盖的当前值**,半年前被拒、后来改好的品在
+    那一列上看着干干净净 —— 而所有者要的是「**从未**被沃尔玛报错」。
+    只查当前值就会把这批品当成正例,而它们恰恰是最该被拒的那类。
+    ⚠ 已知缺口:`catalog.product_events` 里的历史下架事件还没并进来
+    (那张表的键是 sku/asin 混装,要过一次 sku_asin;暂不做,记在这里)。
     """
     rows = _rows(conn, _REJECTED_SKU_SQL, {})
     skus = [r[0] for r in rows if r[0]]
     mapping, _ = sku_asin.resolve_skus(conn, skus)
-    return set(mapping.values())
+    ever = {r[0] for r in _rows(conn, _EVER_FLAGGED_SQL, {}) if r[0]}
+    return set(mapping.values()) | ever
 
 
 def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, dict]:
@@ -525,14 +580,28 @@ def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, d
     两道排除各记各的账(合成一个数就看不出哪一道在起作用):
       · `neg_asins` = **整个反例池**(不只是抽中的那 600 条)—— 同一个 asin
         既当正例又当反例是自相矛盾的样本;
-      · `rejected` = 任何一家店给过下架原因的 asin(见 `rejected_asins`)。
+      · `rejected` = 任何一家店给过下架原因、**或历史报错账本里出现过**的
+        asin(见 `rejected_asins`)。
+
+    ⚠ 另有一道在 SQL 里(`_POS_SQL`):**在线不足 `pos_days` 天的不进正例**。
+    正例这一侧沃尔玛没留下任何证据,"没拒过"对一条新 listing 几乎不含信息 ——
+    曝光时长才是把沉默变成证据的那个量(所有者 2026-09-04 定)。
+    漏斗把「干净在架总数」与「够天数的」都报出来:后者只剩零头就说明
+    `created_at` 不是真的上架时间(整表重建过之类),那个"在线 N 天"是假的。
     """
     pool = _pool_size(opts.pos, _POS_POOL_FACTOR)
-    raw = _rows(conn, _POS_SQL, {"seed": str(opts.seed), "pool": pool})
+    raw = _rows(conn, _POS_SQL,
+                {"seed": str(opts.seed), "pool": pool,
+                 "min_days": opts.pos_days})
+    total = _rows(conn, _POS_POOL_TOTAL_SQL, {})[0][0]
     skus = [r[0] for r in raw]
+    ages = [r[1] for r in raw if r[1] is not None]
     mapping, _ = sku_asin.resolve_skus(conn, skus)
     cand = set(mapping.values())
     st = {"scanned": len(raw), "pool_cap": pool,
+          "min_days": opts.pos_days, "clean_total": total,
+          "age_med": sorted(ages)[len(ages) // 2] if ages else 0,
+          "age_max": max(ages) if ages else 0,
           "no_asin": len(skus) - len(mapping),
           "dup_neg": len(cand & neg_asins)}
     cand -= neg_asins
@@ -801,13 +870,26 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
     for name, st in (("反例", meta.get("neg_stats") or {}),
                      ("正例", meta.get("pos_stats") or {})):
         if st:
+            if name == "正例" and st.get("min_days"):
+                body.append(
+                    f"  **正例口径**:在线 ≥ {st['min_days']} 天 且**从未**被沃尔玛"
+                    f"报错(含历史账本)—— 干净在架 {st.get('clean_total', 0):,} 个"
+                    f"里够天数的进池;入选品在线**中位 {st.get('age_med', 0)} 天 / "
+                    f"最长 {st.get('age_max', 0)} 天**")
+                if st.get("clean_total") and st["scanned"] < st["clean_total"] * 0.02:
+                    body.append(
+                        "    ⚠ **够天数的不到干净在架的 2%** —— 多半是 "
+                        "`walmart_items.created_at` 不是真的上架时间(整表重建过?),"
+                        "那么「在线 N 天」这个判据是假的,别拿这一轮的误伤下结论")
             body.append(f"  {name}漏斗:扫描 {st.get('scanned', 0)}"
                         f"(池上限 {st.get('pool_cap', 0)})"
                         + (f" → 主码在本集 {st['coded']}" if "coded" in st else "")
                         + f" → sku 提不出 asin {st.get('no_asin', 0)}"
                         + f" / 库里无产品行或无标题 {st.get('no_product', 0)}"
                         + (f" / 已被反例占用 {st['dup_neg']}"
-                           if st.get("dup_neg") else ""))
+                           if st.get("dup_neg") else "")
+                        + (f" / **曾被沃尔玛报错过** {st['ever_rejected']}"
+                           if st.get("ever_rejected") else ""))
     ns = meta.get("neg_stats") or {}
     if ns.get("policy_noname"):
         body.append(f"  通用政策拒**抽不出类别名** {ns['policy_noname']} 条不进本集"

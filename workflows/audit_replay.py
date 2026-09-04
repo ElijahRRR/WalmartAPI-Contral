@@ -168,12 +168,13 @@ ORDER BY md5(t.sku || %(seed)s)
 LIMIT %(pool)s
 """
 
-#: 同一口径**去掉天数闸**的总量 —— 只报数,用来看天数闸砍掉了多少。
-#: 砍得只剩零头 = `created_at` 多半不是真的上架时间(如整表重建过),
-#: 这时那个"在线 N 天"是假的,报告要能一眼看出来。
+#: 同一口径**去掉天数闸**的总量 + **全库最老的是多少天**。
+#: 天数闸砍到零时,光说"砍光了"没用 —— 要能直接读出"你要 180 天,而全库最老的
+#: 才 N 天",人才知道是把闸调小还是这个判据根本不成立。
 _POS_POOL_TOTAL_SQL = """
-SELECT count(*) FROM (
-    SELECT w.sku
+SELECT count(*), coalesce(max(age_days), 0) FROM (
+    SELECT w.sku,
+           (extract(epoch FROM now() - min(w.created_at)) / 86400)::int AS age_days
     FROM catalog.walmart_items w
     WHERE w.published_status = 'PUBLISHED'
       AND w.missing_since IS NULL
@@ -184,6 +185,7 @@ SELECT count(*) FROM (
     GROUP BY w.sku
 ) t
 """
+
 
 # 库里有产品行且有标题的才进样本(无标题 = 采集降级,不够格判定 ——
 # 与 product_audit 的候选口径同一条)
@@ -593,15 +595,18 @@ def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, d
     raw = _rows(conn, _POS_SQL,
                 {"seed": str(opts.seed), "pool": pool,
                  "min_days": opts.pos_days})
-    total = _rows(conn, _POS_POOL_TOTAL_SQL, {})[0][0]
+    total, oldest = _rows(conn, _POS_POOL_TOTAL_SQL, {})[0]
     skus = [r[0] for r in raw]
     ages = [r[1] for r in raw if r[1] is not None]
     mapping, _ = sku_asin.resolve_skus(conn, skus)
     cand = set(mapping.values())
     st = {"scanned": len(raw), "pool_cap": pool,
           "min_days": opts.pos_days, "clean_total": total,
-          "age_med": sorted(ages)[len(ages) // 2] if ages else 0,
-          "age_max": max(ages) if ages else 0,
+          "pool_oldest": oldest,          # 全库最老的(不受天数闸影响)
+          # ⚠ 空集给 None 不给 0:0 会在报告上显示成"中位 0 天",
+          #   看着像"入选品都是当天上架的",而实际是**一条都没入选**
+          "age_med": sorted(ages)[len(ages) // 2] if ages else None,
+          "age_max": max(ages) if ages else None,
           "no_asin": len(skus) - len(mapping),
           "dup_neg": len(cand & neg_asins)}
     cand -= neg_asins
@@ -860,6 +865,13 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
         f"新链自己跟自己比,而数字看着完全正常)",
         *_LIMITS,
     ]
+    # ⚠ 要了正例却一条都没抽到:**底线指标整个缺席**,而下面每一节都照常打印,
+    #   一眼扫过去像是"跑完了"。这种缺席必须顶到首行(与 store_absence
+    #   「摘要首行点名」同一条纪律)。
+    if meta.get("pos_wanted") and not pos:
+        head.insert(1, f"⚠ **要了 {meta['pos_wanted']} 条正例,实际一条都没抽到**"
+                       f" —— 正例误伤(所有者的底线)这一轮**没有数**,"
+                       f"下面的反例读数照常看,底线那一栏当缺席处理")
 
     body: list = ["", "▍样本构成(反例按期望类别,前 %d)" % limit]
     strata = Counter(r["stratum"] for r in neg)
@@ -873,14 +885,29 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
             if name == "正例" and st.get("min_days"):
                 body.append(
                     f"  **正例口径**:在线 ≥ {st['min_days']} 天 且**从未**被沃尔玛"
-                    f"报错(含历史账本)—— 干净在架 {st.get('clean_total', 0):,} 个"
-                    f"里够天数的进池;入选品在线**中位 {st.get('age_med', 0)} 天 / "
-                    f"最长 {st.get('age_max', 0)} 天**")
-                if st.get("clean_total") and st["scanned"] < st["clean_total"] * 0.02:
+                    f"报错(含历史账本)—— 干净在架 {st.get('clean_total', 0):,} 个,"
+                    f"其中**最老的 {st.get('pool_oldest', 0)} 天**")
+                if st["scanned"]:
                     body.append(
-                        "    ⚠ **够天数的不到干净在架的 2%** —— 多半是 "
-                        "`walmart_items.created_at` 不是真的上架时间(整表重建过?),"
-                        "那么「在线 N 天」这个判据是假的,别拿这一轮的误伤下结论")
+                        f"    入选品在线**中位 {st['age_med']} 天 / "
+                        f"最长 {st['age_max']} 天**")
+                # ⚠ 分两档说,因为下一步完全不同:
+                #   一条都没过 = 闸比全库最老的还大,调闸就行;
+                #   过了但只剩零头 = 数据本身可疑,调闸也救不回可信度。
+                if not st["scanned"]:
+                    body.append(
+                        f"    ⚠ **一条正例都没入选**:天数闸 {st['min_days']} 天 > "
+                        f"全库最老的 {st.get('pool_oldest', 0)} 天。"
+                        f"`created_at` 是**我们第一次同步到这行**的时间,不是沃尔玛"
+                        f"的上架时间 —— 表本身没那么老时,它就到不了 180 天。"
+                        f"先查真实分布再定闸:`-p pos_days=N`(N 要 ≤ "
+                        f"{st.get('pool_oldest', 0)})")
+                elif (st.get("clean_total")
+                      and st["scanned"] < st["clean_total"] * 0.02):
+                    body.append(
+                        "    ⚠ **够天数的不到干净在架的 2%** —— `created_at` 多半"
+                        "挤在整表重建那天,那么「在线 N 天」这个判据是假的,"
+                        "别拿这一轮的误伤下结论")
             body.append(f"  {name}漏斗:扫描 {st.get('scanned', 0)}"
                         f"(池上限 {st.get('pool_cap', 0)})"
                         + (f" → 主码在本集 {st['coded']}" if "coded" in st else "")
@@ -1172,7 +1199,8 @@ def run(params: dict) -> str:
                                                  items=len(rows))]
     meta = {"tag": opts.tag, "seed": opts.seed, "cap": cap,
             "elapsed": elapsed, "neg_stats": neg_stats, "pos_stats": pos_stats,
-            "cost_lines": cost_lines, "reused": bool(stored)}
+            "cost_lines": cost_lines, "reused": bool(stored),
+            "pos_wanted": opts.pos}          # 要了却没抽到 → 首行点名
     summary, full = report(rows, meta)
     paths.reports_dir().mkdir(parents=True, exist_ok=True)
     path = paths.audit_replay_report()

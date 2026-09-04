@@ -259,9 +259,10 @@ class _Cur:
         elif sql.lstrip().startswith("SELECT DISTINCT asin FROM audit.walmart_error"):
             self._rows = [(a,) for a in c.ever_flagged]   # 历史报错账本
         elif sql.lstrip().startswith("SELECT count(*)"):
-            # 去掉天数闸的干净在架总量(只用来报"天数闸砍掉了多少")
+            # 去掉天数闸的干净在架总量 + 全库最老多少天
+            # (报告靠这两个数分辨"闸调大了"和"数据本身可疑")
             self._rows = [(c.clean_total if c.clean_total is not None
-                           else len(c.pos),)]
+                           else len(c.pos), c.pool_oldest)]
         elif "published_status = 'PUBLISHED'" in sql:
             # 正例行现在是 (sku, age_days);老夹具只给 sku,补一个够大的天数
             self._rows = [(p[0], p[1] if len(p) > 1 else 999) for p in c.pos]
@@ -300,7 +301,8 @@ class _Cur:
 
 class _Conn:
     def __init__(self, neg=(), pos=(), products=None, old=None, item_ids=None,
-                 tag_rows=(), rejected=(), ever_flagged=(), clean_total=None):
+                 tag_rows=(), rejected=(), ever_flagged=(), clean_total=None,
+                 pool_oldest=999):
         self.neg, self.pos = list(neg), list(pos)
         self.products = products or {}
         self.old = old or {}
@@ -308,6 +310,7 @@ class _Conn:
         self.tag_rows = list(tag_rows)
         self.ever_flagged = list(ever_flagged)
         self.clean_total = clean_total
+        self.pool_oldest = pool_oldest
         self.rejected = list(rejected)
         self.sql: list = []
         self.written: list = []
@@ -1045,3 +1048,41 @@ def test_天数闸砍到只剩零头要吼一声():
     ok = "\n".join(ar.report([_row(asin="B01")], meta)[0])
     assert "够天数的不到干净在架的 2%" not in ok
     assert "在线**中位 181 天 / 最长 190 天**" in ok
+
+
+def test_要了正例却一条没抽到_必须顶到首行():
+    """⚠ 2026-09-04 实遇:180 天闸把正例全滤光,报告照常打印每一节,
+    「正例误伤」那栏显示 `0/0 = —`,一眼扫过去像是跑完了 —— 而**所有者的
+    底线指标整个缺席**。缺席要顶到首行(与 store_absence 同一条纪律)。"""
+    meta = dict(_META)
+    meta["pos_wanted"] = 400
+    text = "\n".join(ar.report([_row(asin="B01")], meta)[0])
+    assert "要了 400 条正例,实际一条都没抽到" in text
+    assert text.index("一条都没抽到") < text.index("▍样本构成")   # 在首行区
+    # 有正例时不吼
+    ok = "\n".join(ar.report(
+        [_row(asin="B01"),
+         _row(asin="B02", source="pos", stratum="正例",
+              expected_verdict="pass", expected_category=None)], meta)[0])
+    assert "一条都没抽到" not in ok
+
+
+def test_正例空集不许显示成在线0天():
+    """⚠ 空集的 age 给 0,报告就写"中位 0 天 / 最长 0 天" —— 看着像"入选品
+    都是当天上架的",实际是**一条都没入选**。两种情况的下一步完全不同:
+    闸比全库最老的还大 → 调闸;过了但只剩零头 → 数据本身可疑,调闸也没用。"""
+    meta = dict(_META)
+    meta["pos_stats"] = {"scanned": 0, "pool_cap": 2000, "min_days": 180,
+                         "clean_total": 68947, "pool_oldest": 43,
+                         "age_med": None, "age_max": None,
+                         "no_asin": 0, "no_product": 0}
+    text = "\n".join(ar.report([_row(asin="B01")], meta)[0])
+    assert "**一条正例都没入选**" in text
+    assert "天数闸 180 天 > 全库最老的 43 天" in text
+    assert "N 要 ≤ 43" in text
+    assert "中位 0 天" not in text and "中位 None" not in text
+    # 有量时照常报年龄,且不吼"一条都没入选"
+    meta["pos_stats"].update({"scanned": 3000, "age_med": 210, "age_max": 400})
+    ok = "\n".join(ar.report([_row(asin="B01")], meta)[0])
+    assert "入选品在线**中位 210 天 / 最长 400 天**" in ok
+    assert "一条正例都没入选" not in ok

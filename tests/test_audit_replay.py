@@ -1086,3 +1086,28 @@ def test_正例空集不许显示成在线0天():
     ok = "\n".join(ar.report([_row(asin="B01")], meta)[0])
     assert "入选品在线**中位 210 天 / 最长 400 天**" in ok
     assert "一条正例都没入选" not in ok
+
+
+def test_正例口径诊断_dry_run里也要有():
+    """⚠ 2026-09-04 实遇:诊断只写在 `report()` 里,而 `--dry-run` 有自己的短摘要
+    —— 于是「样本 0 条、为什么 0 条」这个问题,在**最先会跑、且不花钱的那条
+    命令**里恰恰看不到。所有者照我给的命令跑了一遍,什么都没看到。
+
+    两处必须共用同一份(各写一份就是双轨,改一处漏一处)。
+    """
+    import inspect
+    src = inspect.getsource(ar.run)
+    assert "pos_scope_lines(pos_stats)" in src            # dry-run 打
+    assert "pos_scope_lines(st)" in inspect.getsource(ar.report)   # 正式报告也打
+    # 纯函数本身:空集给上界,有量给年龄
+    empty = ar.pos_scope_lines({"min_days": 180, "clean_total": 68947,
+                                "pool_oldest": 43, "scanned": 0})
+    assert "一条正例都没入选" in "\n".join(empty)
+    assert "N 要 ≤ 43" in "\n".join(empty)
+    full = ar.pos_scope_lines({"min_days": 90, "clean_total": 68947,
+                               "pool_oldest": 200, "scanned": 3000,
+                               "age_med": 120, "age_max": 200})
+    assert "中位 120 天 / 最长 200 天" in "\n".join(full)
+    assert "一条正例都没入选" not in "\n".join(full)
+    # 没开天数闸(老 tag 重放)时整段不出,别加噪声
+    assert ar.pos_scope_lines({"scanned": 5}) == []

@@ -845,6 +845,40 @@ def _confusion(rows: list, limit: int) -> list:
     return out
 
 
+
+def pos_scope_lines(st: dict) -> list[str]:
+    """输入:正例漏斗计数 → 输出:「正例口径」那几行(纯拼装)。
+
+    ⚠ `report()` 与 `--dry-run` **共用这一份**。2026-09-04 实遇:诊断只写在
+    `report()` 里,而 `--dry-run` 有自己的短摘要 —— 于是"样本 0 条、为什么 0 条"
+    这个问题,在**最先会跑、且不花钱的那条命令**里恰恰看不到。
+
+    两档分开说,因为下一步完全不同:
+      · 一条都没过 → 闸比全库最老的还大,调闸就行(直接给出上界);
+      · 过了但只剩零头 → `created_at` 挤在某一天,**调闸也救不回可信度**。
+    """
+    if not st.get("min_days"):
+        return []
+    out = [f"  **正例口径**:在线 ≥ {st['min_days']} 天 且**从未**被沃尔玛报错"
+           f"(含历史账本)—— 干净在架 {st.get('clean_total', 0):,} 个,"
+           f"其中**最老的 {st.get('pool_oldest', 0)} 天**"]
+    if st.get("scanned"):
+        out.append(f"    入选品在线**中位 {st['age_med']} 天 / "
+                   f"最长 {st['age_max']} 天**")
+        if st.get("clean_total") and st["scanned"] < st["clean_total"] * 0.02:
+            out.append("    ⚠ **够天数的不到干净在架的 2%** —— `created_at` 多半"
+                       "挤在整表重建那天,那么「在线 N 天」这个判据是假的,"
+                       "别拿这一轮的误伤下结论")
+    else:
+        oldest = st.get("pool_oldest", 0)
+        out.append(f"    ⚠ **一条正例都没入选**:天数闸 {st['min_days']} 天 > "
+                   f"全库最老的 {oldest} 天。`created_at` 是**我们第一次同步到"
+                   f"这行**的时间,不是沃尔玛的上架时间 —— 表本身没那么老时,"
+                   f"它就到不了 {st['min_days']} 天。先按真实分布定闸:"
+                   f"`-p pos_days=N`(N 要 ≤ {oldest})")
+    return out
+
+
 def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
     """输入:结果行 + 本轮元信息 → 输出:(摘要行, 全文行);纯拼装,零 I/O。"""
     neg = [r for r in rows if r["source"] == "neg"]
@@ -882,32 +916,8 @@ def report(rows: list, meta: dict, limit: int = 15) -> tuple[list, list]:
     for name, st in (("反例", meta.get("neg_stats") or {}),
                      ("正例", meta.get("pos_stats") or {})):
         if st:
-            if name == "正例" and st.get("min_days"):
-                body.append(
-                    f"  **正例口径**:在线 ≥ {st['min_days']} 天 且**从未**被沃尔玛"
-                    f"报错(含历史账本)—— 干净在架 {st.get('clean_total', 0):,} 个,"
-                    f"其中**最老的 {st.get('pool_oldest', 0)} 天**")
-                if st["scanned"]:
-                    body.append(
-                        f"    入选品在线**中位 {st['age_med']} 天 / "
-                        f"最长 {st['age_max']} 天**")
-                # ⚠ 分两档说,因为下一步完全不同:
-                #   一条都没过 = 闸比全库最老的还大,调闸就行;
-                #   过了但只剩零头 = 数据本身可疑,调闸也救不回可信度。
-                if not st["scanned"]:
-                    body.append(
-                        f"    ⚠ **一条正例都没入选**:天数闸 {st['min_days']} 天 > "
-                        f"全库最老的 {st.get('pool_oldest', 0)} 天。"
-                        f"`created_at` 是**我们第一次同步到这行**的时间,不是沃尔玛"
-                        f"的上架时间 —— 表本身没那么老时,它就到不了 180 天。"
-                        f"先查真实分布再定闸:`-p pos_days=N`(N 要 ≤ "
-                        f"{st.get('pool_oldest', 0)})")
-                elif (st.get("clean_total")
-                      and st["scanned"] < st["clean_total"] * 0.02):
-                    body.append(
-                        "    ⚠ **够天数的不到干净在架的 2%** —— `created_at` 多半"
-                        "挤在整表重建那天,那么「在线 N 天」这个判据是假的,"
-                        "别拿这一轮的误伤下结论")
+            if name == "正例":
+                body += pos_scope_lines(st)
             body.append(f"  {name}漏斗:扫描 {st.get('scanned', 0)}"
                         f"(池上限 {st.get('pool_cap', 0)})"
                         + (f" → 主码在本集 {st['coded']}" if "coded" in st else "")
@@ -1168,6 +1178,7 @@ def run(params: dict) -> str:
                 how,
                 cost_head,
             ]
+            lines += pos_scope_lines(pos_stats)      # 与 report() 同一份
             if opts.conn_note:
                 lines.append(opts.conn_note)
             by = Counter(s.stratum for s in picked)

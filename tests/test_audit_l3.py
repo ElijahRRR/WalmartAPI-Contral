@@ -1,38 +1,52 @@
-"""L3 语义审核测试(services/audit_l3.py;批次 C 移植钉住测试)。
+"""L3 语义审核测试(services/audit_l3.py;2026-09-02 B1:换喂官方全文 + 三段化)。
 
-离线:不打网,chat_json 一律 monkeypatch;DB 走 FakeConn 假游标。
+离线:不打网,chat_json 一律 monkeypatch;DB 走 FakeConn 假游标;S4 的断言打在
+**真实转录件**(`refdata/policy_pages/en/*.md`)上,不编造夹具 —— 提示词是判定面,
+拿假数据钉不出"喂进去的是不是官方原文"。
 
-重点钉住三类东西:
-  1. **提示词字节稳定** —— S1/S3 字面量 sha256、system prompt 两次构造相同、
-     两个不同产品的 messages[0] 相同(前缀缓存命中率的生死线);
-  2. **已知缺陷照迁** —— R7/R8 不进 prompt、cert requirements 键名 bug 套话、
-     原产国行恒 (空)、is_real_brand 严格 `is True` 强制翻拒;
-  3. **失败四路 → pending 且不写 llm_cache**。
+重点钉住四类东西:
+  1. **喂的是什么** —— S4 = 44 篇官方英文全文、按 id 序、无 URL、同轮逐字节稳定;
+     S2 = 库序类别 + 两条非政策类别 + none(没有 brand_misuse);
+  2. **user 段的形状** —— 上游三层证据、本 PT 准入要求、描述 3000 字符;
+     **没有**路由提示行、**没有**恒空的原产国行;
+  3. **解析零猜测** —— 政策名对不上枚举 → pending(不降级猜 IP);pass 强制 none;
+     品牌翻拒严格 `is True`;
+  4. **失败四路 → pending 且不写 llm_cache**。
 """
-
-import hashlib
 
 import pytest
 
 from registry import paths, resources
 from services import audit_l3
-from services.audit_models import L1Info, L2Result, ProductInfo, RuleHit
+from services.audit_models import (L1Info, L2Result, Phase0Result, ProductInfo,
+                                   RuleHit)
+from workflows import policy_sync as _ps
 
 # ---------------------------------------------------------------- 假件
 
 POLICY_ROWS = [
-    (1, "Alcohol", "酒精", "禁售", "蒸馏设备•酒类", "红色高风险", "别碰"),
-    (2, "Animals", "动物", "", "活体动物", "黄色", "备注不该出现"),
-    (3, "Intellectual Property", "知识产权", "限制", "仿冒品", "红线", "IP 备注"),
-    (4, "Offensive Content", "冒犯内容", "禁售", "", "绿色", "无禁品字段"),
+    (1, "Alcohol", "Prohibited:\n- Distillation apparatus\n- Wine kits"),
+    (2, "Animals", "Prohibited:\n- Live animals"),
+    (3, "Intellectual Property", "Prohibited:\n- Counterfeit goods"),
+    (4, "Offensive Content", "Prohibited:\n- Hate symbols"),
 ]
-POLICY_COLS = ["id", "category_en", "category_zh", "overall_status",
-               "prohibited_items", "zh_seller_risk", "zh_seller_notes"]
+POLICY_COLS = ["id", "category_en", "full_policy"]
 # 库序(ORDER BY category_en 由 PG 给出),故意不是 Python sorted 序
 CATEGORY_ROWS = [("Alcohol",), ("Animals",), ("Pet Products",),
                  ("PFAS Chemicals",), ("Intellectual Property",),
                  ("Offensive Content",), ("Children's Products",)]
 KNOWN = frozenset(c for (c,) in CATEGORY_ROWS)
+
+# 真实转录件(44 篇官方英文)——S4 接线的断言打在它们上面
+_EN_FILES = sorted(paths.policy_pages_dir("en").glob("*.md"))
+_OFFICIAL = [_ps.parse_policy_file(f) for f in _EN_FILES]
+_OFFICIAL_NAMES = [r["category_en"] for r in _OFFICIAL]
+
+
+def _official_rows() -> list[dict]:
+    """输入:无 → 输出:与 `load_policy_rows` 同形的 44 行(id 按文件序)。"""
+    return [{"id": i + 1, "category_en": r["category_en"],
+             "full_policy": r["full_policy"]} for i, r in enumerate(_OFFICIAL)]
 
 
 class FakeCursor:
@@ -51,6 +65,7 @@ class FakeCursor:
     def execute(self, sql, params=None):
         self.conn.sql_log.append(sql)
         if "ORDER BY id" in sql:
+            assert "full_policy IS NOT NULL" in sql   # 空壳行不进 S4
             self.description = [(c,) for c in POLICY_COLS]
             self._rows = list(POLICY_ROWS)
         elif "ORDER BY category_en" in sql:
@@ -109,449 +124,709 @@ def _l2(hits=None):
 @pytest.fixture(autouse=True)
 def _reset_prompt_cache():
     audit_l3.reset_prompt_cache()
+    audit_l3.reset_stats()
     yield
     audit_l3.reset_prompt_cache()
+    audit_l3.reset_stats()
 
 
-# ---------------------------------------------------------------- 提示词字节稳定
+# ---------------------------------------------------------------- S4:官方全文
 
 
-def test_s1_s3_literals_byte_pinned():
-    """S1/S3 字节钉死 —— 提示词是判定面,不许无声漂移。
+def test_S4_喂的是44篇官方英文全文而不是中文人工列():
+    """⚠ B1 的核心换喂:S4 = 官方原文,不是六个中文人工列的二手转述。
 
-    S3 仍逐字节等于旧仓 l3_llm.py:432-438(除计数占位符)。
-    S1 原本也是逐字节移植(旧仓 :295-431,sha256 859aced1…,5233 字符),
-    此后**有意改过两次**,两次都是所有者定的:
-
-      · 2026-08-21:补入判定维度 6「整机电器 / NRTL 认证」—— L2 里按 PT 名猜
-        整机/小件的分类器同日下线,而"这个产品是不是整机电器"必须有人接,
-        不能留真空期(见 test_audit_l2_reason 里
-        `test_the_whole_appliance_call_moved_to_the_l3_prompt`);
-      · 2026-09-02(§十.7):S1/S3 各一处硬写的「37 条」换成 `{N}` 占位符,
-        由 `build_system_prompt` 按实时政策条数渲染。**除这一个 token 外
-        两段一个字节都没动** —— 下一条测试拿"填回 37"逐字节证明。
+    44 篇一篇不少(42 类禁售 + 内容族两页),每篇一个 `## 类别名` 标题;
+    判据句子要真的在里面(抽三条互不相干的验)。
     """
-    assert hashlib.sha256(audit_l3._S1.encode()).hexdigest() == (
-        "05a955e4331012ee564fd2ffd96c38f35813b560b536eaf19fcca26043e98412")
-    assert hashlib.sha256(audit_l3._S3.encode()).hexdigest() == (
-        "52edf07f5c85262fe03e827f9e6d4fcabdbf8fe622fa648e90d674ec69551d68")
-    assert len(audit_l3._S1) == 6028
-    assert audit_l3._S1.endswith("# 候选 reason_category (verdict=reject 时必选其一)\n")
-    assert audit_l3._S3.startswith("\n\n# 沃尔玛 {N} 条 Prohibited Products Policy 全清单")
+    rows = _official_rows()
+    parts, missing = audit_l3.policy_parts(rows)
+    block = audit_l3.format_policy_block(rows)
+    assert missing == []                          # 44 篇全有原文
+    assert len(_OFFICIAL_NAMES) == 44
+    for name in _OFFICIAL_NAMES:
+        assert f"## {name}\n" in block, name
+    assert len(parts) == 44                       # 篇数按渲染出的段数,不数 "## "
+    # ⚠ 官方正文自己带 `## Overview` 之类小标题:数 "\n## " 会得到 251 而不是
+    #   44 —— 提示词自称的篇数会瞬间变成一个假数(这条守门就为这个)
+    assert block.count("\n## ") > 200
+    assert "Distiller/distillation equipment and kits" in block   # 01 Alcohol
+    assert "CPC" in block                                         # 08 儿童产品
+    assert "## Content standards: Overview" in block              # 43 内容族
+    assert "## Product details policy" in block                   # 44 内容族
 
 
-def test_only_the_policy_count_token_moved_in_2026_09_02():
-    """⚠ 动态化只许动**计数 token**:把 `{N}` 填回 `37`,两段必须逐字节回到旧值。
+def test_S4_两条SQL的形状是契约():
+    """`ORDER BY id` / `ORDER BY category_en` 都不可省 —— 顺序即前缀缓存命中率;
+    `full_policy IS NOT NULL` 是"空壳不进 S4"的第一道闸(第二道在渲染层)。"""
+    assert audit_l3.POLICY_ROWS_SQL == (
+        "SELECT id, category_en, full_policy "
+        "FROM audit.walmart_prohibited_policy "
+        "WHERE full_policy IS NOT NULL ORDER BY id")
+    assert audit_l3.REASON_CATEGORIES_SQL.endswith("ORDER BY category_en")
+    # 中文人工列一列都不读了(B1 换喂:判据以官方英文原文为准)
+    for col in ("category_zh", "overall_status", "prohibited_items",
+                "zh_seller_risk", "zh_seller_notes"):
+        assert col not in audit_l3.POLICY_ROWS_SQL, col
 
-    这条测试是那次改动的边界证明 —— 提示词是判定面,"顺手改一句措辞"不会报错,
-    只会让判定悄悄漂;有了它,任何夹带都会在这里露出来。
-    """
-    assert audit_l3._COUNT_SLOT == "{N}"
-    assert hashlib.sha256(
-        audit_l3._fill_count(audit_l3._S1, 37).encode()).hexdigest() == (
-        "8248ff0c2c2ac2960625a6a14348a578e00efbc89410d390f45f4cee156dc1a3")
-    assert hashlib.sha256(
-        audit_l3._fill_count(audit_l3._S3, 37).encode()).hexdigest() == (
-        "1564f179581b34ad5785caba6daa1b461e0624129c55cbec19e47c5025d2d409")
+
+def test_S4_剥掉URL并按id序拼接():
+    """喂入版由 policy_feed 渲染:URL 一条不留(对判定零贡献、徒耗 token),
+    顺序 = 入参顺序(SQL 是 ORDER BY id)—— 顺序即前缀缓存命中率。"""
+    rows = _official_rows()
+    parts, _ = audit_l3.policy_parts(rows)
+    block = audit_l3.format_policy_block(rows)
+    assert "https://" not in block and "http://" not in block
+    # 每段的**首行**就是这一篇的类别名(篇内小标题不算)
+    assert [p.split("\n", 1)[0] for p in parts] == \
+        [f"## {r['category_en']}" for r in rows]
+    # 打乱入参 ⇒ 输出跟着乱(证明这里不自作主张排序,顺序由 SQL 保证)
+    shuffled = list(reversed(rows))
+    assert [p.split("\n", 1)[0] for p in audit_l3.policy_parts(shuffled)[0]] == \
+        [f"## {r['category_en']}" for r in shuffled]
 
 
-def test_the_policy_count_follows_the_table_not_a_literal():
-    """⚠ 提示词自称的条数 = 紧随其后的 S4 全清单行数,不是写死的「37 条」。
-
-    写死的后果不报错:政策表补了武器族之后,提示词还在说"沃尔玛 37 条全清单",
-    而下面列着 42 条 —— LLM 拿那个数当"我应该看到多少条"的锚。
-    """
+def test_S4_同一轮内逐字节稳定():
+    """前缀缓存的硬前提:同一批政策行渲染两次必须一模一样(含空行位置)。"""
+    rows = _official_rows()
+    assert audit_l3.format_policy_block(rows) == audit_l3.format_policy_block(rows)
     cats = [c for (c,) in CATEGORY_ROWS]
-    rows = [dict(zip(POLICY_COLS, r)) for r in POLICY_ROWS]
-    p = audit_l3.build_system_prompt(cats, rows)
-    assert f"沃尔玛 {len(rows)} 条 Prohibited Products Policy 全清单" in p
-    assert p.count(f"沃尔玛 {len(rows)} 条") == 2       # S1 一处 + S3 一处
-    assert "{N}" not in p and "沃尔玛 37 条" not in p
-    # 多一行政策,两处数字一起跟着走
-    more = rows + [dict(zip(POLICY_COLS,
-                            (99, "Firearms", "枪支", "禁售", "枪", "红", "")))]
-    assert f"沃尔玛 {len(more)} 条" in audit_l3.build_system_prompt(cats, more)
+    assert audit_l3.build_system_prompt(cats, rows) == \
+        audit_l3.build_system_prompt(cats, rows)
 
 
-def test_system_prompt_二次构造字节相同且进程内只查一次库():
-    cats = [c for (c,) in CATEGORY_ROWS]
-    rows = [dict(zip(POLICY_COLS, r)) for r in POLICY_ROWS]
-    a = audit_l3.build_system_prompt(cats, rows)
-    b = audit_l3.build_system_prompt(cats, rows)
-    assert a == b and hash(a) == hash(b)
+def test_S4_没有全文的行整条跳过并记进构建期状态(caplog):
+    """空壳标题给 LLM 等于没给,却会让它以为"这一类我看过了"。
 
+    ⚠ **这件事记在构建期状态里,不记在每轮清零的 STATS 里**(2026-09-02 复核):
+    提示词一个进程只构造一次,而 `reset_stats()` 每轮开头调 —— 记在 STATS 里
+    的净效果是"第一轮报了、后面每一轮都报 0",而缺失一直都在。
+    """
+    rows = [{"id": 1, "category_en": "Alcohol", "full_policy": "Prohibited: x"},
+            {"id": 2, "category_en": "Animals", "full_policy": None},
+            {"id": 3, "category_en": "Art", "full_policy": "   \n\n"}]
+    with caplog.at_level("WARNING", logger="services.audit_l3"):
+        block = audit_l3.format_policy_block(rows)
+    assert "## Alcohol" in block
+    assert "Animals" not in block and "Art" not in block
+    assert len([r for r in caplog.records if "Animals" in r.getMessage()]) == 1
+    # 构建才记账(纯渲染函数不写模块状态)
+    audit_l3.build_system_prompt(["Alcohol"], rows)
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    # 每轮清零的 STATS **不再**装这件事 —— 换个说法:清零抹不掉它
+    audit_l3.reset_stats()
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    assert "policy_no_full_text" not in audit_l3.STATS
+    # 连续两次构建报同一份清单(不累加、不漂移)
+    audit_l3.build_system_prompt(["Alcohol"], rows)
+    assert audit_l3.missing_full_text() == ("Animals", "Art")
+    audit_l3.reset_prompt_cache()
+    assert audit_l3.missing_full_text() == ()      # 重置连它一起清
+
+
+def test_system_prompt_并发只构建一次():
+    """⚠ `product_audit` 并发 128 起跑,第一批线程会同时看到缓存为空 ——
+    不加锁就是每个线程各渲染一遍 44 篇全文,还把缺全文清单反复覆写,
+    而且没有任何东西会红。"""
+    import threading
     conn = FakeConn()
-    p1 = audit_l3.system_prompt(conn)
-    p2 = audit_l3.system_prompt(conn)
-    assert p1 is p2 and p1 == a
-    assert len([s for s in conn.sql_log if "walmart_prohibited_policy" in s]) == 2
+    out, errs = [], []
+    barrier = threading.Barrier(8)
+
+    def _go():
+        try:
+            barrier.wait()
+            out.append(audit_l3.system_prompt(conn))
+        except Exception as e:                      # noqa: BLE001
+            errs.append(e)
+
+    threads = [threading.Thread(target=_go) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errs and len(out) == 8
+    assert all(x is out[0] for x in out)            # 同一个对象 = 只建了一次
+    # 只查了一次库(类别 + 政策各一条 SQL)
+    assert len([q for q in conn.sql_log
+                if "walmart_prohibited_policy" in q]) == 2
 
 
-def test_system_prompt_四段顺序():
-    p = audit_l3.system_prompt(FakeConn())
-    i1 = p.index("你是沃尔玛 Marketplace 合规审核 AI")
-    i2 = p.index("  - Alcohol\n")
-    i3 = p.index(f"# 沃尔玛 {len(POLICY_ROWS)} 条 Prohibited Products Policy 全清单")
-    i4 = p.index("## 1. Alcohol (酒精)")
-    assert i1 < i2 < i3 < i4
+# ---------------------------------------------------------------- S1/S2/S3
 
 
-def test_S2_保库序并固定两项收尾():
-    """ORDER BY category_en 的库序不可用 Python sorted 覆盖(PFAS/Pet 两序相反)。"""
+def test_S2_库序_两条非政策类别_none_且没有brand_misuse():
+    """枚举 = 政策表库序 + `内部黑名单` / `类目准入` + `none`。
+
+    ⚠ `brand_misuse` 删了(B1):它只在提示词里存在、政策表里没有,品牌误用
+    归 `Intellectual Property`(解析层的翻拒规则落地)。多一个假类别 =
+    多一处对不上的口径。
+    """
     block = audit_l3.format_reason_categories([c for (c,) in CATEGORY_ROWS])
     lines = block.split("\n")
     assert lines == [f"  - {c}" for (c,) in CATEGORY_ROWS] + \
-        ["  - brand_misuse", "  - none"]
-    assert lines != sorted(lines)
+        ["  - 内部黑名单", "  - 类目准入", "  - none"]
+    assert lines != sorted(lines)                  # 库序不被 Python sorted 覆盖
+    assert "brand_misuse" not in block
+    assert list(resources.AUDIT_NONPOLICY_CATEGORIES) == ["内部黑名单", "类目准入"]
 
 
-def test_S4_截断常量_50_30_240_80_与备注红闸():
-    rows = [{"id": 9, "category_en": "X", "category_zh": "叉",
-             "overall_status": "S" * 80, "zh_seller_risk": "红" + "R" * 80,
-             "prohibited_items": "P" * 300, "zh_seller_notes": "N" * 200}]
-    out = audit_l3.format_full_policy_block(rows)
-    assert "状态: " + "S" * 50 + " | 中国卖家:" + "红" + "R" * 29 in out
-    assert "禁: " + "P" * 240 + "\n" in out
-    assert out.split("备注: ")[1] == "N" * 80
-    # 风险非红 → 备注整行不出;空字段整行不出;条目之间空行分隔
-    rows2 = [{"id": 1, "category_en": "A", "category_zh": "a",
-              "overall_status": "", "zh_seller_risk": "绿",
-              "prohibited_items": "", "zh_seller_notes": "N"},
-             {"id": 2, "category_en": "B", "category_zh": "b",
-              "overall_status": "ok", "zh_seller_risk": "",
-              "prohibited_items": "x•y\nz", "zh_seller_notes": ""}]
-    out2 = audit_l3.format_full_policy_block(rows2)
-    assert out2 == "## 1. A (a)\n\n## 2. B (b)\n状态: ok\n禁: x/y z"
+def test_篇数占位符按实时渲染篇数填而不是政策表行数():
+    """提示词自称的篇数 = **S4 真正渲染出来的**篇数。
 
-
-# ---------------------------------------------------------------- 政策路由
-
-
-def test_路由_always_include_恒在最前且截断挤不掉():
-    cats = audit_l3.route_policy_hints("Baby", "Baby Bodysuit")
-    assert cats[:2] == ["Intellectual Property", "Offensive Content"]
-    assert len(cats) == 5
-    # category 路由(等值)+ PT 子串路由都在,去重保序
-    assert cats == ["Intellectual Property", "Offensive Content",
-                    "Baby Products", "Children's Products", "PFAS Chemicals"]
-
-
-def test_路由_等值查表不是子串_而PT是裸子串():
-    assert audit_l3.route_policy_hints("Home Improvement Tools", None) == \
-        ["Intellectual Property", "Offensive Content"]
-    assert audit_l3.route_policy_hints("home improvement", None) == \
-        ["Intellectual Property", "Offensive Content", "Home Goods",
-         "Hazardous Items"]
-    # PT 子串:'blade' 在 'Bladeless Fans' 里也算命中(裸子串,照迁)
-    assert "Military & Law Enforcement" in \
-        audit_l3.route_policy_hints(None, "Bladeless Fans")
-    # 多组同时命中,按表顺序追加
-    assert audit_l3.route_policy_hints(None, "baby knife toddler") == \
-        ["Intellectual Property", "Offensive Content",
-         "Military & Law Enforcement", "Baby Products", "Children's Products"]
-
-
-def test_路由_先截断后按库内政策过滤():
-    got = audit_l3.route_policy_hints("baby", None, known=KNOWN)
-    # 截断到 5 条后,库里没有的 Recalled Products 本就在第 6 位;
-    # PFAS Chemicals 在库里 → 保留
-    assert got == ["Intellectual Property", "Offensive Content",
-                   "Children's Products", "PFAS Chemicals"]
-    assert audit_l3.route_policy_hints("toys", None, known=frozenset()) == []
-
-
-def _route_names() -> set[str]:
-    """路由两张表里出现过的全部政策名(去重)。"""
-    names = set(audit_l3._ALWAYS_INCLUDE)
-    for v in audit_l3._CATEGORY_ROUTES.values():
-        names.update(v)
-    for _kws, v in audit_l3._PT_KEYWORD_ROUTES:
-        names.update(v)
-    return names
-
-
-# 政策表的两种形态:改名后(官方 42 名)/ 改名前那 7 行(存量缩写名)
-_OFFICIAL = frozenset(
-    f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
-    for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
-_LEGACY = frozenset(resources.POLICY_LEGACY_NAMES)
-
-# 路由表里**本来就对不上政策表**的两条(2026-09-02 实测):官方没有这两个类别名,
-# 归一化也打不平 —— `Pet Products` 官方叫 `Pet Foods, Supplements, Medicines and
-# Other Products`,`Jewelry/Precious Metals` 是旧仓自造的斜杠写法。它们记 warning
-# 计数,改法随「L3 输出规范化」一起定(docs/audit_pipeline.md §6 点名)。
-# 2026-09-02 首跑 dry-run 后这两条也进了 POLICY_LEGACY_NAMES(官方名各是一长串),
-# 路由表里**不再有**对不上的条目 —— 空元组是有意的,别删这个守门。
-_DEAD_ROUTES: tuple[str, ...] = ()
-
-
-def test_路由表的政策名改名前后都对得上政策表():
-    """⚠ 路由表写死的是**旧缩写名**(`Electronics & RF` 一族),政策表 2026-09-02
-    改成官方拼写。旧写法 `c in known` 会**静默丢掉 7 条**:提示词照旧漂亮,
-    L3 少拿到 7 类政策提示,判据悄悄变窄,而没有任何东西会红。
-
-    现在两级都走 `policy_names.resolve`,同一份路由表在两种表形态下都活。
+    写死或按行数算都会撒谎:没有全文的行不进 S4,说 44 篇却只给 42 篇,
+    LLM 会拿那个数当"我应该看到多少篇"的锚。
     """
-    from services import policy_names
-    names = _route_names()
-    assert len(names) == 29
-    dead = sorted(n for n in names if policy_names.resolve(n, _OFFICIAL) is None)
-    assert dead == list(_DEAD_ROUTES)          # 映射表补齐后一条不剩
-    # 那 7 个旧缩写名:改名后解析到官方名,改名前(表里还是旧名)解析到旧名
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        if legacy not in names:
-            continue
-        assert policy_names.resolve(legacy, _OFFICIAL) == official, legacy
-        assert policy_names.resolve(legacy, _LEGACY) == legacy, legacy
-    assert len({n for n in names} & set(resources.POLICY_LEGACY_NAMES)) == 9
+    assert audit_l3._COUNT_SLOT == "{N}"
+    cats = [c for (c,) in CATEGORY_ROWS]
+    rows = [dict(zip(POLICY_COLS, r)) for r in POLICY_ROWS]
+    p = audit_l3.build_system_prompt(cats, rows)
+    assert "{N}" not in p
+    assert p.count(f"{len(rows)} 篇沃尔玛政策全文"
+                   "(Prohibited Products Policy 各类别 + 内容标准两页)") == 2
+    # 少一篇全文 ⇒ 两处数字一起跟着走
+    rows2 = rows + [{"id": 9, "category_en": "Art", "full_policy": None}]
+    p2 = audit_l3.build_system_prompt(cats, rows2)
+    assert f"{len(rows)} 篇沃尔玛政策全文" in p2       # 仍是 4,不是 5
+    assert "  - Art" not in p2                        # S2 也没多一条(它读的是 cats)
 
 
-def test_路由_返回表内原拼写而不是路由表写的名字():
-    """命中回**表里那一个串** —— 下游(user prompt 的 routed_cats)与 S2 候选块
-    必须是同一套拼写,否则 LLM 看到的候选与提示对不上。"""
-    got = audit_l3.route_policy_hints("electronics", None, known=_OFFICIAL)
-    assert got == ["Intellectual Property", "Offensive Content",
-                   "Electronics and Radio Frequency Devices",
-                   "Hazardous Items", "Digital Goods"]
-    # 改名落地前(表里还是缩写名)照样命中,回的是缩写名
-    old_table = _LEGACY | {"Intellectual Property", "Offensive Content",
-                           "Hazardous Items", "Digital Goods"}
-    assert audit_l3.route_policy_hints("electronics", None, known=old_table) == \
-        ["Intellectual Property", "Offensive Content", "Electronics & RF",
-         "Hazardous Items", "Digital Goods"]
+def test_S1_把B1定稿的要点都写进去了():
+    """⚠ 提示词是判定面:少一句话不会报错,只会让判定悄悄漂。
+
+    这条钉的是 §3.1 逐条定稿的**指令要点**,不是措辞:判据只认末尾原文 /
+    policy 逐字抄 / detail 引原文片段且 ≤120 字 / 提到 ≠ 卖的就是 /
+    准入要求先判"这个产品要不要" / 严格 JSON。
+    """
+    s1 = audit_l3._S1
+    for must in ("训练记忆里的沃尔玛政策**一律作废**",
+                 "**逐字抄**下面「候选类别」清单里的一项",
+                 "≤120 字",
+                 "**引用触发判定的原文片段**",
+                 "**提到 ≠ 卖的就是它**",
+                 "先判**这个具体产品**要不要这张证",
+                 "`类目准入`",
+                 "只输出严格 JSON"):
+        assert must in s1, must
+    # 输出示例里是新五键,旧键一个都不许留
+    for key in ('"verdict"', '"policy"', '"detail"', '"brand_verdicts"',
+                '"confidence"'):
+        assert key in s1, key
+    for gone in ("reason_category", "reason_text", "blacklist_brand_verdict",
+                 "llm_confidence", "signals", "brand_misuse"):
+        assert gone not in s1, gone
 
 
-def test_路由_解析不到的条目记warning与计数(caplog):
-    """⚠ 兜底三要件:解析不到 = 少给一条政策提示,**必须记日志计数**
-    (debug 不算 —— 没人看得见的信号等于不存在)。同一个名字一轮只警告一次,
-    78 万行不该被刷屏,但计数照旧逐次累加。"""
-    audit_l3.reset_stats()
-    assert audit_l3.STATS["route_unresolved"] == 0
-    with caplog.at_level("WARNING", logger="services.audit_l3"):
-        # 表里缺 Pet 那一行(模拟官方删类/表未同步)⇒ 路由条目解析不到
-        table = _OFFICIAL - {"Pet Foods, Supplements, Medicines and Other Products"}
-        for _ in range(3):
-            got = audit_l3.route_policy_hints("animals", "pet food",
-                                              known=table)
-    assert "Pet Products" not in got and "Animals" in got
-    assert audit_l3.STATS["route_unresolved"] == 3          # 逐次计数
-    assert audit_l3.STATS["route_unresolved:Pet Products"] == 3
-    assert audit_l3.unresolved_route_names() == ["Pet Products"]
-    hits = [r for r in caplog.records if "Pet Products" in r.getMessage()]
-    assert len(hits) == 1                                   # 只警告一次
-    audit_l3.reset_stats()
-    assert audit_l3.unresolved_route_names() == []
+def test_S1_人工验收回改的三件事都在():
+    """⚠ 这三条是 2026-09-03 所有者**人工看 8 个产品**给出判断后回改的
+    (验收集 `docs/audit_step3_spec.md` §七),掉一条就退回那天的错判:
+
+    ① **本体**:带 USB 口的柜子被当成整机电器拒掉 → 政策只判"这件商品本身
+       是什么",部件/兼容/场景都不算;反过来"面向儿童"是本体的一部分;
+    ② **第三类命中(附条件允许)**:官方的「Allowed with restriction」那一列
+       本卖家一概满足不了 —— 少了这一类,要证书/预审批的产品会被判 pass;
+    ③ **evidence 与 is_real_brand 自洽**:evidence 写"暗示兼容性"却标 true,
+       整件商品会被翻成知产侵权。
+    同时钉住两条护栏,它们是 B1 定稿的底线,不许被 C 类吃掉。
+    """
+    s1 = audit_l3._S1
+    for must in (
+            # ① 本体
+            "# 先定",
+            "**带某个部件 ≠ 是那类设备;提到某个东西 ≠ 是那个东西",
+            "面向谁做的,就是本体的一部分",
+            # ② 第三类命中
+            "# 判定的三类命中",
+            "## C. 附条件允许",
+            "Allowed with restriction",
+            "must be certified",
+            # ③ 品牌自洽
+            "`evidence` 与 `is_real_brand` 必须自洽",
+            # 护栏:拿不准不拒 / 不连坐(B1 定稿的底线,C 类不许吃掉)
+            "拿不准不拒",
+            "按类目名连坐整类"):
+        assert must in s1, must
+    # 两类命中的旧标题不许残留(留着就是自相矛盾的两套说法)
+    assert "# 判定的两类命中" not in s1
 
 
-# ---------------------------------------------------------------- L2 软证据
+def test_S1_命中的是词不是品牌_这一问排在最前():
+    """⚠ `c.2026-09-03.5` 修的是实测底线不达标(正例误伤 4.0% > 旧链 2.8%)。
+
+    逐条看全是品牌翻拒,而且多数是**别人名字里碰巧含那个词**:
+    `smith` 命中的其实是 `Bob Smith Industries`、`southern`/`serene`/`Essex`
+    同款。所有者原话:「这样子的词在标题里应该可以看出来它到底是品牌还是不是
+    品牌」—— 所以判据是"词 → 完整品牌名 → 是不是同一个牌子",而且必须排在
+    原有两问**之前**(先认出品牌名,才谈得上它是用在别人身上还是自己身上)。
+    """
+    s1 = audit_l3._S1
+    for must in ("上游给你的是一个「词」,不是一个「品牌」",
+                 "属于哪个完整的品牌名",
+                 "是不是同一个牌子",
+                 "Bob Smith Industries",
+                 "不是同一个牌子,就一个字都不要写进输出"):
+        assert must in s1, must
+    # 顺序:这一问在"用在别人身上/当成自己的名字"之前
+    assert s1.index("属于哪个完整的品牌名") < s1.index("**用在别人身上**")
+    # 本体那一节仍排在整个品牌段之前(`.4` 定的顺序不许被这次改动挤掉)
+    assert s1.index("# 先定") < s1.index("# 品牌证据怎么判")
 
 
-def _r4_hit(n=12):
-    return RuleHit(stage="L2", rule_code="title_desc_blacklist", penalty=0,
+def test_证据行优先渲染上下文_老行退回matched_phrase():
+    """证据行是 L3 唯一看得到原文的地方:只给命中的那个词等于没给判据。
+    ⚠ 库里存量命中行没有 `context` 键 —— 退回 `matched_phrase`,不许炸。"""
+    hit = RuleHit(stage="L0", rule_code="phase0_brand_mention", penalty=0,
+                  detail={"matches": [
+                      {"brand": "smith", "matched_phrase": "Smith",
+                       "context": "Bob Smith Industries BSI-151H"}],
+                      "count": 1})
+    txt, brands = audit_l3.summarize_evidence(
+        Phase0Result(blocked=False, hits=[hit]), None, _l2())
+    assert "smith(原文:Bob Smith Industries BSI-151H)" in txt
+    assert brands == ["smith"]          # 待判清单仍是裸词,输出契约不变
+    old = RuleHit(stage="L0", rule_code="phase0_brand_mention", penalty=0,
+                  detail={"matches": [{"brand": "dyson",
+                                       "matched_phrase": "Dyson V6"}],
+                          "count": 1})
+    txt2, _ = audit_l3.summarize_evidence(
+        Phase0Result(blocked=False, hits=[old]), None, _l2())
+    assert "dyson(原文:Dyson V6)" in txt2
+
+
+def test_S1_输出五段_本体与政策原句进输出_品牌只列真的():
+    """⚠ 2026-09-03 所有者要求「输出有明细方便我们排查问题」:
+
+    ① `product_is`(本体)—— **pass 也要填**:误放行是靠"它把本体认成了什么"
+       才看得出来的,pass 不落 hit,不打出来就永远查不到;
+    ② `policy_quote`(政策原句逐字)—— 类别对了不等于条款对了,抄不出原句就是
+       手里没条款;
+    ③ `brand_verdicts` **只列判成真品牌的那几个**(false 的一个都不写)——
+       所有者原话:"其他假品牌无需输出"。
+    """
+    s1 = audit_l3._S1
+    for must in ("# 输出的五段",
+                 "`product_is`",
+                 "**pass 也要填**",
+                 "`policy_quote`",
+                 "**触发判定的那一句政策原文逐字抄回来**",
+                 "**只列你判定为真品牌的那几个**",
+                 "一个真品牌都没有 → 给 `[]`"):
+        assert must in s1, must
+
+
+def test_S1_品牌位这一维_只输出真品牌不等于不逐个判():
+    """⚠ 这条钉的是 `c.2026-09-03.2` 亲手做出来的一次回归(验收跑实测):
+
+    所有者要的是「假品牌无需**输出**」,`.2` 顺手写成了「无需逐个**判**」
+    (`逐个给判定` → `逐个在心里过一遍`),判定动作一松,模型整段跳过 ——
+    `B0GYNRCZ9F` 的 `abba` 在 `.1` 还翻拒,到 `.2` 就 pass 了。
+    而当时列的三条真品牌信号(型号 / 100% Authentic / 自称授权)**都不覆盖
+    最常见的那一种**:品牌名直接当自己的商品名写在标题开头。
+
+    所以这里钉三样:逐词判不许省、品牌位这一维在、两个方向的错都点名。
+    """
+    s1 = audit_l3._S1
+    for must in ("**顺序是死的:先定本体,再判品牌。**",     # 所有者 2026-09-03 提的顺序
+                 "它是不是「这件商品本身」的牌子",
+                 "**一个都不许跳过**",
+                 "**用在别人身上**",
+                 "**当成自己的名字**",
+                 "**品牌位**",
+                 "**判 false 只有一种情形**",
+                 "**两个方向都会错,别只防一边**"):
+        assert must in s1, must
+    # `.2` 那句只防一边的话不许回来(它是回归的助推)
+    assert "而真正的问题反而没人看见" not in s1
+    # ⚠ 顺序本身是判据的一部分:本体那一节必须排在品牌那一节**前面**
+    #   (`iPad` 被判成收纳柜的真品牌,就是因为没先把本体定下来)
+    assert s1.index("# 先定") < s1.index("# 品牌证据怎么判")
+    # JSON 模板里五个键齐,且品牌例子已经是"只出真的"(不再有 true|false)
+    for key in ('"product_is"', '"policy_quote"'):
+        assert key in s1, key
+    assert "true|false" not in s1
+    assert "# 输出的三段" not in s1
+
+
+def test_system_prompt_四段顺序与进程内只查一次库():
+    conn = FakeConn()
+    p = audit_l3.system_prompt(conn)
+    i1 = p.index("你是沃尔玛 Marketplace 合规审核 AI")
+    i2 = p.index("  - Alcohol\n")
+    i3 = p.index("\n# 4 篇沃尔玛政策全文")          # S3 分隔段的标题行
+    i4 = p.index("## Alcohol\n\nProhibited:")
+    assert i1 < i2 < i3 < i4
+
+    # 进程级缓存:第二次调用一条 SQL 都不再发(两条 = 类别 + 政策各一次)
+    assert audit_l3.system_prompt(conn) is p
+    assert len([s for s in conn.sql_log if "walmart_prohibited_policy" in s]) == 2
+
+
+def test_路由提示整体删除():
+    """§3.7:两张手工「类目 → 政策」映射表连同 hint 行一起退役 ——
+    换全文后 LLM 面前有全部政策,提示只会把注意力锁在 ≤5 篇上。
+    这条守门防的是"有人照着旧文档把它写回来"。"""
+    for gone in ("route_policy_hints", "_CATEGORY_ROUTES", "_PT_KEYWORD_ROUTES",
+                 "_ALWAYS_INCLUDE", "ROUTE_MAX_POLICIES",
+                 "unresolved_route_names", "summarize_l2_for_l3",
+                 "format_full_policy_block", "valid_reason_categories"):
+        assert not hasattr(audit_l3, gone), gone
+    assert "route_unresolved" not in audit_l3.STATS
+
+
+# ---------------------------------------------------------------- 上游证据通道
+
+
+def _r4_hit(n=12, code="title_desc_blacklist"):
+    return RuleHit(stage="L2", rule_code=code, penalty=0,
                    detail={"matches": [{"brand": f"nike{i}",
                                         "matched_phrase": f"Nike{i}"}
                                        for i in range(n)], "count": n})
 
 
-def test_L2摘要_R4前10去重保序_R5小写():
+def test_证据通道_跨三层且按rule_code渲染():
+    """⚠ B1 的通道泛化:读 L0/L1/L2 三层的软 hit,按 rule_code 查渲染表 ——
+    与它出自哪一层无关(C 批把品牌扫描迁进 L0 时不用再改这里)。
+
+    ⚠ **L0 的软证据在 `evidence` 槽里**(C 批双输出),不在 `hits`:通道每层
+    读两个槽 —— 只读 `hits` 的话品牌命中一条都送不到 L3,而提示词照样漂亮。
+    """
+    p0 = Phase0Result(blocked=False, evidence=[
+        _r4_hit(2, code="phase0_brand_mention")])
+    l1 = L1Info(hits=[RuleHit(stage="L1", rule_code="some_new_soft_rule",
+                              penalty=0, detail={"reason": "将来某条软规则"})])
+    l2 = _l2([RuleHit(stage="L2", rule_code="walmart_strict_sensitive",
+                      penalty=0,
+                      detail={"subtypes": ["adult"], "matched_phrases": ["sexy"]})])
+    txt, brands = audit_l3.summarize_evidence(p0, l1, l2)
+    lines = txt.split("\n")
+    assert lines[0].startswith("* 文案提到黑名单品牌(共2个, 前10): nike0")
+    assert lines[1] == "* some_new_soft_rule: reason=将来某条软规则"   # 未登记也不丢
+    assert lines[2] == "* 敏感/严格合规(R8, adult): sexy"
+    assert brands == ["nike0", "nike1"]
+    # 三层都空 ⇒ 明说没有证据(别让 LLM 以为这一段丢了)
+    assert audit_l3.summarize_evidence() == ("(上游无证据)", [])
+
+
+def test_证据通道_L0双输出端到端_软证据真的送到了():
+    """⚠ 端到端接线钉子(2026-09-03 C 批):`audit_phase0.check` 产出的软证据
+    要**真的**出现在 L3 的 user 段里。
+
+    这条用真规则跑一遍(不手搓 hit):品牌文案扫描的命中落在
+    `Phase0Result.evidence`,通道读它、渲染成一行、品牌词进「待评估的品牌/
+    商标词」段。漏接的表现不是报错,是提示词里那两段变成"(上游无证据)"——
+    R7/R8 曾经整整两个月一个字都没进提示词,就是这么发生的。
+    """
+    from types import SimpleNamespace
+
+    import ahocorasick
+
+    from services import audit_phase0
+    from services.audit_models import ProductInfo
+
+    ac = ahocorasick.Automaton()
+    ac.add_word("ninja foodi", "ninja foodi")
+    ac.make_automaton()
+    ctx = SimpleNamespace(phase0_sellers=frozenset(), phase0_asins=frozenset(),
+                          brand_blacklist={}, brand_mention_automaton=ac)
+    p0 = audit_phase0.check(
+        ProductInfo(asin="B0EV", title="Ninja Foodi 兼容配件"), ctx)
+    assert p0.blocked is False and p0.hits == []          # 软证据不终止
+    assert [h.rule_code for h in p0.evidence] == ["phase0_brand_mention"]
+
+    txt, brands = audit_l3.summarize_evidence(p0, None, None)
+    assert txt.startswith("* 文案提到黑名单品牌(共1个, 前10): ninja foodi")
+    assert brands == ["ninja foodi"]
+    out = audit_l3.build_user_prompt(_product(title="Ninja Foodi 兼容配件"),
+                                     _l1(), _l2(), phase0=p0)
+    assert "文案提到黑名单品牌" in out
+    assert "ninja foodi" in out.split("# 待评估的品牌/商标词")[1]
+
+
+def test_证据通道_过程留痕不当证据():
+    """⚠ `pt_dict_fallback`(类目靠字典回落)与 `unmapped_amazon_path`
+    (映射表曾标注无对应 PT)记的是**我们自己链路里发生了什么**,与产品违不
+    违规无关。送进去只会诱导 LLM 拿"内部没把类目定准"当拒绝理由。
+
+    判据唯一出处 = `audit_reason.NOT_A_REASON`(人话渲染那边用的是同一张表),
+    别在证据通道里另列一份。
+    """
+    from services import audit_reason
+    assert {"pt_dict_fallback", "unmapped_amazon_path"} <= audit_reason.NOT_A_REASON
+    l1 = L1Info(hits=[
+        RuleHit(stage="L1", rule_code="pt_dict_fallback", penalty=0,
+                detail={"reason": "LLM 输出 PT 不在字典, 回落候选首条"}),
+        RuleHit(stage="L1", rule_code="unmapped_amazon_path", penalty=0,
+                detail={"reason": "映射表曾标注 '无对应Walmart PT'"})])
+    assert audit_l3.summarize_evidence(None, l1, None) == ("(上游无证据)", [])
+    # 还在的那条软证据照旧出行(不是把 L1 整层丢掉)
+    l1.hits.append(RuleHit(stage="L1", rule_code="future_soft_rule", penalty=0,
+                           detail={"note": "x"}))
+    txt, _ = audit_l3.summarize_evidence(None, l1, None)
+    assert txt == "* future_soft_rule: note=x"
+
+
+def test_证据通道_cert四个键都没有时不打字面量None():
+    """`{what}` 直接插 None 的话,提示词里会出现「类目需证书(…): None」——
+    LLM 会拿它当"要求就是 None"这条事实读。"""
+    hit = RuleHit(stage="L2", rule_code="cat_requires_cert_hard", penalty=0,
+                  detail={"walmart_pt": "Widgets"})      # 四个键一个都没有
+    txt, _ = audit_l3.summarize_evidence(None, None, _l2([hit]))
+    assert txt == "* 类目需证书(cat_requires_cert_hard): (无要求文本)"
+    assert "None" not in txt
+
+
+def test_证据通道_只收软hit_硬拒不进():
+    """扣了分的是硬拒 —— 那种产品根本进不了 L3,出现在证据里就是接线错了。"""
+    l2 = _l2([RuleHit(stage="L2", rule_code="cat_access_blocked", penalty=-100,
+                      detail={"category": "类目准入"}),
+              RuleHit(stage="L2", rule_code="content_promotional", penalty=0,
+                      detail={"strong_phrases": ["best seller"],
+                              "allcaps_runs": [], "soft_only": False})])
+    txt, _ = audit_l3.summarize_evidence(None, None, l2)
+    assert txt == "* 促销宣称(R7, 含无据宣称/全大写滥用): best seller"
+
+
+def test_证据通道_R4前10去重保序_R5小写():
     l2 = _l2([_r4_hit(),
               RuleHit(stage="L2", rule_code="trademark_live", penalty=0,
                       detail={"matched_marks": ["ACME", "acme", "ZETA"]})])
-    txt, brands = audit_l3.summarize_l2_for_l3(l2)
+    txt, brands = audit_l3.summarize_evidence(None, None, l2)
     assert "共12个, 前10" in txt and "nike0(原文:Nike0)" in txt
     assert "nike10" not in txt                      # matches[:10]
     assert "* USPTO LIVE 商标(R5, 前10): ACME, acme, ZETA" in txt
     assert brands == [f"nike{i}" for i in range(10)]  # 品牌总数也截 10
-    # R5 单独出现时小写入表
-    _, b2 = audit_l3.summarize_l2_for_l3(_l2([
-        RuleHit(stage="L2", rule_code="trademark_live", penalty=0,
-                detail={"matched_marks": ["ACME", "acme"]})]))
-    assert b2 == ["acme"]
 
 
-def test_L2摘要_R7R8证据现在真的进prompt了():
-    """2026-08-20 修(原 L3-1 缺陷):R7/R8 此前没有分支,L2 在 detail 里写着
-    "L3 LLM 需判断宣称词是否有事实依据",而 L3 一个字都收不到 ——
-    承诺了没送到,比不承诺更糟(L3 只能自己从原文重看一遍)。"""
-    l2 = _l2([
-        RuleHit(stage="L2", rule_code="content_promotional", penalty=0,
-                detail={"strong_phrases": ["best seller"], "allcaps_runs": [],
-                        "soft_phrases": [], "soft_only": False}),
-        RuleHit(stage="L2", rule_code="walmart_strict_sensitive", penalty=0,
-                detail={"subtypes": ["adult"], "matched_phrases": ["sexy"]}),
-    ])
-    txt, _ = audit_l3.summarize_l2_for_l3(l2)
-    assert "促销宣称(R7, 含无据宣称/全大写滥用): best seller" in txt
-    assert "敏感/严格合规(R8, adult): sexy" in txt
-
-
-def test_L2摘要_R7只命中软词时标明份量():
-    """软证据也要送到,但要让 LLM 看出它只是空洞形容词,不是无据宣称。"""
-    l2 = _l2([RuleHit(stage="L2", rule_code="content_promotional", penalty=0,
-                      detail={"strong_phrases": [], "allcaps_runs": [],
-                              "soft_phrases": ["high quality"],
-                              "soft_only": True})])
-    txt, _ = audit_l3.summarize_l2_for_l3(l2)
-    assert "促销宣称(R7, 仅空洞形容词): high quality" in txt
-
-
-def test_L2摘要_cert分支取真实键名():
-    """2026-08-20 修(原 L3-2 缺陷):分支取的是 detail['requirements'],
-    而这个键在三种 cert hit 里**一个都不存在**(真实键是 meta_requirements /
-    hard_cert_fields / soft_cert_fields),前两档永远退化成一句固定套话。"""
+def test_证据通道_cert分支取真实键名():
+    """键名照**规则真实写进 detail 的那些**取(meta_requirements /
+    hard_cert_fields / soft_cert_fields);取 `requirements` 那个键三种 cert
+    hit 里一个都没有,前两档会永远退化成一句固定套话。"""
     small = RuleHit(stage="L2", rule_code="cat_requires_cert_small_part",
-                    penalty=0, detail={"hard_cert_fields": ["UL"],
-                                       "note": "电气小件/配件, 部分可填 No 上架, 需下游人工审核"})
+                    penalty=0, detail={"hard_cert_fields": ["UL"], "note": "n"})
     soft_meta = RuleHit(stage="L2", rule_code="cat_requires_cert_soft", penalty=0,
                         detail={"meta_requirements": "ASTM F963 测试报告",
-                                "matched_soft_kws": ["astm"],
-                                "note": "软合规 (SDS/ASTM/ISO/RoHS/Prop65/警告标签/测试报告), 可提供资料或填披露"})
-    soft_spec = RuleHit(stage="L2", rule_code="cat_requires_cert_soft", penalty=0,
-                        detail={"soft_cert_fields": ["prop65Warning"], "note": "n"})
-    txt, _ = audit_l3.summarize_l2_for_l3(_l2([small, soft_meta, soft_spec]))
+                                "note": "软合规"})
+    txt, _ = audit_l3.summarize_evidence(None, None, _l2([small, soft_meta]))
     lines = txt.split("\n")
     assert lines[0] == "* 类目需证书(cat_requires_cert_small_part): ['UL']"
-    assert "ASTM F963 测试报告" in txt          # meta_requirements 现在送得到
-    assert lines[2] == "* 类目需证书(cat_requires_cert_soft): ['prop65Warning']"
-
-
-def test_L2摘要_三条死分支不迁():
-    l2 = _l2([RuleHit(stage="L2", rule_code="brand_blacklist", penalty=-100,
-                      detail={"brand": "nike"}),
-              RuleHit(stage="L2", rule_code="forbidden_mega_cat", penalty=-100,
-                      detail={"cat": "x"}),
-              RuleHit(stage="L2", rule_code="cat_zh_blocked", penalty=-100,
-                      detail={"pt": "x"})])
-    assert audit_l3.summarize_l2_for_l3(l2) == ("(L2 无命中)", [])
+    assert lines[1] == "* 类目需证书(cat_requires_cert_soft): ASTM F963 测试报告"
 
 
 # ---------------------------------------------------------------- user prompt
 
 
-def test_user_prompt_截断_bullets5_desc600_notes200():
-    p = _product(bullet_points=[f"b{i}" for i in range(9)],
-                 long_description=" " + "x" * 700)
-    out = audit_l3.build_user_prompt(p, _l1(), _l2(), pt_notes="N" * 250,
-                                     routed_cats=[])
-    assert "  - b4\n" in out and "  - b5" not in out
-    assert "x" * 600 + "...(已截断)" in out and "x" * 601 not in out
+def test_user_prompt_截断_bullets10_desc3000_notes200():
+    p = _product(bullet_points=[f"b{i}" for i in range(14)],
+                 long_description=" " + "x" * 3200)
+    out = audit_l3.build_user_prompt(p, _l1(), _l2(), pt_notes="N" * 250)
+    assert "  - b9\n" in out and "  - b10" not in out       # MAX_BULLETS=10
+    assert "x" * 3000 + "...(已截断)" in out and "x" * 3001 not in out
     assert "飞书人工标注 (pt_meta.notes): " + "N" * 200 + "\n" in out
     assert "N" * 201 not in out
+    assert (audit_l3.MAX_DESC_CHARS, audit_l3.MAX_BULLETS) == (3000, 10)
 
 
-def test_user_prompt_已知缺陷_原产国行恒空():
-    """已知缺陷照迁(spec §3.4 / 合同 L3-9):行保留,值恒 (空)。"""
+def test_user_prompt_删了原产国与路由提示_段名改上游证据():
+    """恒空的原产国字段会诱导 LLM 把"原产国未知"当证据;路由行已退役。"""
     out = audit_l3.build_user_prompt(_product(), _l1(), _l2())
-    assert "\n原产国: (空)\n" in out
+    assert out.startswith("# 产品信息\n")
+    assert "原产国" not in out
+    assert "政策路由提示" not in out
+    assert "# L2 规则引擎命中" not in out
+    assert "# 上游证据" in out
+    assert "(上游无证据)" in out
+    assert "  (上游无品牌命中, 跳过品牌真伪判定)" in out
 
 
-def test_user_prompt_空态与hint行():
+def test_user_prompt_带本PT准入要求_截500_没有就整段不出():
+    """R3 硬拒的替身(§3.2):类目要什么证是事实,这个产品要不要是判断。"""
+    out = audit_l3.build_user_prompt(_product(), _l1(), _l2(),
+                                     pt_requirements="CPC 证书 " + "R" * 600)
+    assert "\n# 本 PT 的沃尔玛准入要求\n\nCPC 证书 " + "R" * 493 + "\n" in out
+    assert "R" * 494 not in out
+    assert audit_l3.MAX_REQ_CHARS == 500
+    assert "本 PT 的沃尔玛准入要求" not in audit_l3.build_user_prompt(
+        _product(), _l1(), _l2(), pt_requirements="")
+
+
+def test_user_prompt_空态():
     out = audit_l3.build_user_prompt(
         _product(bullet_points=[], long_description="", brand=""),
         _l1(walmart_product_type=None, pt_confidence=None, pt_source=None,
             walmart_category=None), _l2())
-    assert out.startswith("# 产品信息\n")            # hint_line 为空则整行不出
     assert "五点描述:\n  (无)\n" in out
     assert "长描述:\n(空)\n" in out
     assert "品牌字段(商家填报): (空)" in out
     assert "沃尔玛 PT: (空) (置信 None, 源 None)" in out
-    assert "(L2 无命中)" in out
-    assert "  (无 R4/R5 命中, 跳过品牌真伪判定)" in out
-    out2 = audit_l3.build_user_prompt(_product(), _l1(), _l2(),
-                                      routed_cats=["A", "B", "C", "D", "E", "F"])
-    assert out2.startswith("# 政策路由提示 (本产品 PT/category 最相关的政策, "
-                           "优先核对): A, B, C, D, E\n\n# 产品信息")
 
 
 # ---------------------------------------------------------------- 解析
 
 
-ALLOWED = audit_l3.valid_reason_categories(KNOWN)
+ALLOWED = audit_l3.policy_enum(KNOWN)
 
 
-def test_白名单是全集与路由无关():
-    assert "children's products" in ALLOWED and "brand_misuse" in ALLOWED \
-        and "none" in ALLOWED
-    assert "intellectual property" in ALLOWED
+def test_枚举是全集加两条非政策类别_none不在里面():
+    assert "Children's Products" in ALLOWED and "Intellectual Property" in ALLOWED
+    assert "内部黑名单" in ALLOWED and "类目准入" in ALLOWED
+    assert "none" not in ALLOWED and "brand_misuse" not in ALLOWED
 
 
-def test_解析_pass归一无hit():
-    r = audit_l3.parse_l3_reply({"verdict": "PASS ", "reason_category": "Alcohol",
-                                 "reason_text": "x", "llm_confidence": "HIGH"},
-                                ALLOWED)
-    assert (r.verdict, r.reason_category, r.llm_confidence) == \
-        ("pass", "none", "high")
+def test_解析_pass强制none且无hit():
+    r = audit_l3.parse_l3_reply({"verdict": "PASS ", "policy": "Alcohol",
+                                 "detail": "x", "confidence": "HIGH"}, ALLOWED)
+    assert (r.verdict, r.policy, r.confidence) == ("pass", "none", "high")
     assert r.hits == []
 
 
-def test_解析_reject产一条hit_五键定序_penalty0():
+def test_解析_reject产一条hit_七键定序_带提示词版本():
     r = audit_l3.parse_l3_reply(
-        {"verdict": "reject", "reason_category": "Children's Products",
-         "reason_text": "儿童用品需 CPC", "llm_confidence": "bogus",
-         "signals": {"has_trademark_symbol": True},
-         "blacklist_brand_verdict": [{"brand": "nike", "is_real_brand": False}]},
+        {"verdict": "reject", "policy": "children's products",
+         "detail": "标题写 for kids 3+,儿童产品政策要求 CPC",
+         "confidence": "bogus",
+         "product_is": "面向儿童的户外野餐桌(儿童家具)",
+         "policy_quote": "All children's products must have a CPC.",
+         "brand_verdicts": [{"brand": "nike", "is_real_brand": False}]},
         ALLOWED)
-    assert r.verdict == "reject" and r.reason_category == "children's products"
-    assert r.llm_confidence == "medium"
+    assert r.verdict == "reject"
+    assert r.policy == "Children's Products"        # 回**表内原拼写**
+    assert r.confidence == "medium"                 # 非法置信度归一
+    assert r.product_is == "面向儿童的户外野餐桌(儿童家具)"
+    assert r.policy_quote == "All children's products must have a CPC."
     (hit,) = r.hits
     assert (hit.stage, hit.rule_code, hit.penalty) == \
         ("L3", "llm_children_s_products", 0)
-    assert list(hit.detail) == ["reason_category", "reason_text",
-                                "llm_confidence", "signals",
-                                "blacklist_brand_verdict"]
+    # 排查面两键接在**末尾**:老行少两键,新行多两键,读的人一眼分得清
+    assert list(hit.detail) == ["policy", "detail", "confidence",
+                                "brand_verdicts", "prompt_version",
+                                "product_is", "policy_quote"]
+    assert hit.detail["prompt_version"] == resources.AUDIT_RULES_VERSION
+    assert hit.detail["product_is"] == "面向儿童的户外野餐桌(儿童家具)"
+    assert hit.detail["policy_quote"] == "All children's products must have a CPC."
 
 
-def test_解析_none类目走llm_reject_与legacy映射():
-    r = audit_l3.parse_l3_reply({"verdict": "reject", "reason_category": "none"},
-                                ALLOWED)
-    assert r.hits[0].rule_code == "llm_reject"
-    r2 = audit_l3.parse_l3_reply({"verdict": "reject",
-                                  "reason_category": "ip_infringement"}, ALLOWED)
-    assert r2.reason_category == "intellectual property"
-    assert r2.hits[0].rule_code == "llm_intellectual_property"
-    r3 = audit_l3.parse_l3_reply({"verdict": "reject",
-                                  "reason_category": "needs_cert"}, ALLOWED)
-    assert r3.reason_category == "none" and r3.hits[0].rule_code == "llm_reject"
-    # 不在白名单也不在 legacy → reject 时降级 IP,pass 时降级 none
-    r4 = audit_l3.parse_l3_reply({"verdict": "reject",
-                                  "reason_category": "怪东西"}, ALLOWED)
-    assert r4.reason_category == "intellectual property"
-    r5 = audit_l3.parse_l3_reply({"verdict": "pass",
-                                  "reason_category": "怪东西"}, ALLOWED)
-    assert r5.reason_category == "none"
+def test_解析_排查面两键取不到就是None_绝不因此改判():
+    """⚠ 老 `llm_cache` 里没有这两个键(2026-09-03 之前写的行):缺排查信息
+    不是坏 JSON —— 命中老缓存时必须照旧解析出结论,不许降级 pending。"""
+    r = audit_l3.parse_l3_reply(
+        {"verdict": "reject", "policy": "children's products", "detail": "x"},
+        ALLOWED)
+    assert r.verdict == "reject" and r.policy == "Children's Products"
+    assert r.product_is is None and r.policy_quote is None
+    (hit,) = r.hits
+    assert hit.detail["product_is"] is None
+    assert hit.detail["policy_quote"] is None
+    # pass 也一样:本体是排查面,取不到不影响放行
+    r2 = audit_l3.parse_l3_reply({"verdict": "pass", "policy": "none"}, ALLOWED)
+    assert r2.verdict == "pass" and r2.product_is is None
 
 
-def test_解析_reason_text截断500():
-    r = audit_l3.parse_l3_reply({"verdict": "reject", "reason_category": "none",
-                                 "reason_text": " " + "字" * 700}, ALLOWED)
-    assert len(r.reason_text) == 500
-    r2 = audit_l3.parse_l3_reply({"verdict": "reject", "reason_category": "none",
-                                  "reason_text": "   "}, ALLOWED)
-    assert r2.reason_text is None
+def test_解析_pass也带本体_排查误放行靠它():
+    """pass **不落 hit**,本体在库里没有落点 —— 但结果对象要带着它,
+    `judge_l3` 才打得出那行 INFO(误放行是看"本体认成了什么"才看得出来的)。"""
+    r = audit_l3.parse_l3_reply(
+        {"verdict": "pass", "policy": "none",
+         "product_is": "带 USB 口与插座的实木收纳柜(家具)",
+         "policy_quote": ""},
+        ALLOWED)
+    assert r.verdict == "pass" and r.policy == "none"
+    assert r.product_is == "带 USB 口与插座的实木收纳柜(家具)"
+    assert r.policy_quote is None          # pass 要求留空 → 归一成 None
+    assert r.hits == []
+
+
+def test_解析_政策名对不上枚举一律pending_不猜(caplog):
+    """⚠ B1 删掉的降级:旧版把认不出的类别猜成 `intellectual property`。
+
+    猜出来的类别会一路落库、进飞书 G 列、进申诉口径,而没有任何东西会红。
+    现在:pending + `llm_bad_policy` 计数(成批出现 = 提示词/政策表出了问题)。
+    """
+    with caplog.at_level("WARNING", logger="services.audit_l3"):
+        for policy in ("怪东西", "none", "", "brand_misuse"):
+            r = audit_l3.parse_l3_reply({"verdict": "reject", "policy": policy,
+                                         "detail": "x"}, ALLOWED)
+            assert r.verdict == "pending", policy
+            assert r.policy == "none" and r.confidence == "low"
+            (hit,) = r.hits
+            assert hit.rule_code == "llm_bad_policy" and hit.penalty == 0
+            assert hit.detail["detail"] == "x"      # 原话留档,便于复盘
+    assert audit_l3.STATS["llm_bad_policy"] == 4
+    assert "intellectual property" not in \
+        audit_l3.parse_l3_reply({"verdict": "reject", "policy": "怪东西"},
+                                ALLOWED).policy
+
+
+def test_解析_政策名容错到表内拼写_两条非政策类别也认():
+    """大小写/词形靠 policy_names.resolve(仓内唯一一份归一化),不在这儿再写一份。"""
+    for given, want in (("ALCOHOL", "Alcohol"),
+                        ("  Offensive Content  ", "Offensive Content"),
+                        ("childrens products", "Children's Products"),
+                        ("类目准入", "类目准入"),
+                        ("内部黑名单", "内部黑名单")):
+        r = audit_l3.parse_l3_reply({"verdict": "reject", "policy": given},
+                                    ALLOWED)
+        assert (r.verdict, r.policy) == ("reject", want), given
+
+
+def test_解析_detail截断500():
+    r = audit_l3.parse_l3_reply({"verdict": "reject", "policy": "Alcohol",
+                                 "detail": " " + "字" * 700}, ALLOWED)
+    assert len(r.detail) == 500
+    r2 = audit_l3.parse_l3_reply({"verdict": "reject", "policy": "Alcohol",
+                                  "detail": "   "}, ALLOWED)
+    assert r2.detail is None
 
 
 def test_解析_is_real_brand强制翻拒_严格is_True():
-    """合同 L3-7 照迁:LLM 自述 pass 也翻 reject;字符串 'true' 不算(已知缺陷)。"""
+    """确定性后处理:LLM 自述 pass 也翻 reject;字符串 'true' 不算(照迁口径)。"""
     r = audit_l3.parse_l3_reply(
-        {"verdict": "pass", "reason_category": "none",
-         "blacklist_brand_verdict": [{"brand": "top", "is_real_brand": False},
-                                     {"brand": "Dyson", "is_real_brand": True}]},
+        {"verdict": "pass", "policy": "none",
+         "brand_verdicts": [{"brand": "top", "is_real_brand": False},
+                            {"brand": "Dyson", "is_real_brand": True}]},
         ALLOWED)
     assert r.verdict == "reject"
-    assert r.reason_category == "intellectual property"
-    assert r.reason_text == "[Trademark] 未授权引用品牌名 Dyson"
+    assert r.policy == "Intellectual Property" == resources.AUDIT_IP_POLICY
+    assert r.detail == "未授权引用品牌名 Dyson"
     assert r.hits[0].rule_code == "llm_intellectual_property"
-    # 严格 is True:字符串 "true" / 1 都不翻
     for v in ("true", 1, "True"):
         r2 = audit_l3.parse_l3_reply(
-            {"verdict": "pass", "reason_category": "none",
-             "blacklist_brand_verdict": [{"brand": "x", "is_real_brand": v}]},
-            ALLOWED)
+            {"verdict": "pass", "policy": "none",
+             "brand_verdicts": [{"brand": "x", "is_real_brand": v}]}, ALLOWED)
         assert r2.verdict == "pass", v
-    # 非 list 的 blacklist_brand_verdict 归一成 []
-    r3 = audit_l3.parse_l3_reply({"verdict": "pass",
-                                  "blacklist_brand_verdict": "nope"}, ALLOWED)
-    assert r3.blacklist_brand_verdict == [] and r3.verdict == "pass"
+    r3 = audit_l3.parse_l3_reply({"verdict": "pass", "brand_verdicts": "nope"},
+                                 ALLOWED)
+    assert r3.brand_verdicts == [] and r3.verdict == "pass"
+
+
+def test_解析_品牌翻拒不回头解析枚举():
+    """⚠ 翻拒是**确定性后处理**,不是 LLM 的答案:再对一次枚举的话,枚举取
+    不到(政策表读空 / 离线路径)就会把"确认是真品牌"降级成 pending,
+    而合同写的是 reject + Intellectual Property。"""
+    raw = {"verdict": "pass", "policy": "none",
+           "brand_verdicts": [{"brand": "Dyson", "is_real_brand": True}]}
+    for allowed in (audit_l3.policy_enum(frozenset()), frozenset(), ALLOWED):
+        r = audit_l3.parse_l3_reply(raw, allowed)
+        assert r.verdict == "reject", allowed
+        assert r.policy == resources.AUDIT_IP_POLICY
+        assert r.detail == "未授权引用品牌名 Dyson"
+        (hit,) = r.hits
+        assert hit.rule_code == "llm_intellectual_property"
+        assert list(hit.detail) == ["policy", "detail", "confidence",
+                                    "brand_verdicts", "prompt_version",
+                                    "product_is", "policy_quote"]
+
+
+@pytest.mark.parametrize("raw", [["not", "a", "dict"], "plain string", 42,
+                                 None, ("t",)])
+def test_解析_非dict输入按坏JSON处置(raw):
+    """⚠ 可达路径,不是防御性编程:`llm_cache` 里躺着一行坏值(历史脏数据 /
+    手工改过的 JSON)时,`cached` 拿回来的就可能是 list/str —— 旧写法在
+    `raw.get(...)` 上抛 AttributeError,把"一行坏缓存"变成整轮崩。"""
+    r = audit_l3.parse_l3_reply(raw, ALLOWED)
+    assert r.verdict == "pending" and r.policy == "none"
+    (hit,) = r.hits
+    assert hit.rule_code == "llm_bad_json"
+    assert r.raw == {}                       # 非 dict 不往下游传
 
 
 def test_解析_非法verdict与坏JSON全部pending():
@@ -559,11 +834,9 @@ def test_解析_非法verdict与坏JSON全部pending():
                 {"verdict": "pending"}):
         r = audit_l3.parse_l3_reply(raw, ALLOWED)
         assert r.verdict == "pending", raw
-        assert r.reason_category == "none" and r.llm_confidence == "low"
+        assert r.policy == "none" and r.confidence == "low"
         (hit,) = r.hits
         assert hit.rule_code == "llm_bad_json" and hit.penalty == 0
-    assert audit_l3.parse_l3_reply({"_raw": "x" * 999}, ALLOWED).hits[0] \
-        .detail["raw"][:4] == "{'_r"
     assert len(audit_l3.parse_l3_reply({"_raw": "x" * 999}, ALLOWED)
                .hits[0].detail["raw"]) == 300
 
@@ -586,7 +859,8 @@ def _patch_llm(monkeypatch, reply=None, exc=None, calls=None):
 def test_judge_调用参数与两产品system一致(monkeypatch):
     calls = _patch_llm(monkeypatch, reply={"verdict": "pass"}, calls=[])
     conn = FakeConn()
-    ctx = _ctx(pt_meta={"Sneakers": {"notes": "⚠️T&S抽查48h内"}})
+    ctx = _ctx(pt_meta={"Sneakers": {"notes": "⚠️T&S抽查48h内",
+                                     "requirements": "CPC + ASTM F963"}})
     r1 = audit_l3.judge_l3(_product(), _l1(), _l2(), ctx, conn)
     r2 = audit_l3.judge_l3(_product(asin="B0OTHER", title="Baby Bib"),
                            _l1(walmart_category="Baby"), _l2(), ctx, conn)
@@ -598,9 +872,43 @@ def test_judge_调用参数与两产品system一致(monkeypatch):
     # 前缀缓存生死线:两个产品的 system 段逐字节相同,user 段不同
     assert calls[0]["messages"][0] == calls[1]["messages"][0]
     assert calls[0]["messages"][1] != calls[1]["messages"][1]
-    assert "飞书人工标注 (pt_meta.notes): ⚠️T&S抽查48h内" in \
-        calls[0]["messages"][1]["content"]
-    assert "# 政策路由提示" in calls[1]["messages"][1]["content"]
+    user0 = calls[0]["messages"][1]["content"]
+    assert "飞书人工标注 (pt_meta.notes): ⚠️T&S抽查48h内" in user0
+    # 本 PT 的准入要求从 ctx.pt_meta 带进来(judge 不查库)
+    assert "# 本 PT 的沃尔玛准入要求\n\nCPC + ASTM F963" in user0
+
+
+def test_judge_把L0证据也送进user段(monkeypatch):
+    """接线钉子:phase0 的软 hit 必须到得了提示词(C 批品牌扫描迁 L0 的前提)。"""
+    calls = _patch_llm(monkeypatch, reply={"verdict": "pass"}, calls=[])
+    p0 = Phase0Result(blocked=False, hits=[
+        RuleHit(stage="L0", rule_code="phase0_brand_mention", penalty=0,
+                detail={"matches": [{"brand": "dyson",
+                                     "matched_phrase": "Dyson V6"}],
+                        "count": 1})])
+    audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), FakeConn(), phase0=p0)
+    user = calls[0]["messages"][1]["content"]
+    assert "* 文案提到黑名单品牌(共1个, 前10): dyson(原文:Dyson V6)" in user
+    assert "\n  - dyson\n" in user          # 品牌词清单出自同一通道
+
+
+def test_judge_每个产品打一行排查日志_pass也打(caplog, monkeypatch):
+    """⚠ pass **不落 hit**:本体与政策原句在库里没有落点,只有这一行日志。
+
+    所有者 2026-09-03 要的"明细"落在这里(屏幕 + logs/<workflow>.log,dry-run
+    也照打);品牌只打真品牌那几个词。
+    """
+    _patch_llm(monkeypatch, reply={
+        "verdict": "pass", "policy": "none",
+        "product_is": "带 USB 口与插座的实木收纳柜(家具)",
+        "brand_verdicts": [{"brand": "Dyson", "is_real_brand": False}]})
+    with caplog.at_level("INFO", logger="services.audit_l3"):
+        r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), FakeConn())
+    assert r.verdict == "pass"
+    line = [m for m in caplog.messages if m.startswith("L3 ")][-1]
+    assert "带 USB 口与插座的实木收纳柜(家具)" in line
+    assert "真品牌=无" in line               # is_real_brand=false 的不进这一行
+    assert "Dyson" not in line
 
 
 def test_judge_命中缓存不调LLM(monkeypatch):
@@ -610,10 +918,10 @@ def test_judge_命中缓存不调LLM(monkeypatch):
     audit_l3.judge_l3(_product(), _l1(), _l2(), ctx, conn)
     assert len(calls) == 1 and len(conn.put_log) == 1
     conn2 = FakeConn(cache={conn.put_log[0]: {"verdict": "reject",
-                                              "reason_category": "Alcohol"}})
+                                              "policy": "Alcohol"}})
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), ctx, conn2)
     assert len(calls) == 1                      # 未再调 LLM
-    assert r.verdict == "reject" and r.reason_category == "alcohol"
+    assert r.verdict == "reject" and r.policy == "Alcohol"
     assert conn2.put_log == []                  # 命中不重复写
 
 
@@ -625,7 +933,7 @@ def test_judge_失败_pending_且不写缓存(monkeypatch, exc, rule_code):
     _patch_llm(monkeypatch, exc=exc)
     conn = FakeConn()
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), conn)
-    assert r.verdict == "pending" and r.llm_confidence == "low"
+    assert r.verdict == "pending" and r.confidence == "low"
     (hit,) = r.hits
     assert (hit.stage, hit.rule_code, hit.penalty) == ("L3", rule_code, 0)
     assert hit.detail["error"] == str(exc)[:500]
@@ -637,24 +945,69 @@ def test_judge_错误摘要截断500(monkeypatch):
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), FakeConn())
     assert len(r.hits[0].detail["error"]) == 500
     assert len(r.raw["error"]) == 500
-    assert r.reason_text == "LLM 全链路故障, 待人工复核"
+    assert r.detail == "LLM 全链路故障, 待人工复核"
 
 
-@pytest.mark.parametrize("reply", [{}, {"_raw": "??"}, {"verdict": "maybe"}])
+@pytest.mark.parametrize("reply", [{}, {"_raw": "??"}, {"verdict": "maybe"},
+                                   {"verdict": "reject", "policy": "怪东西"}])
 def test_judge_坏输出_pending_且不写缓存(monkeypatch, reply):
     _patch_llm(monkeypatch, reply=reply)
     conn = FakeConn()
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), conn)
     assert r.verdict == "pending"
-    assert r.hits[0].rule_code == "llm_bad_json"
     assert conn.put_log == []                   # pending 绝不写缓存
 
 
 def test_judge_reject写缓存且分数不由L3动(monkeypatch):
     _patch_llm(monkeypatch, reply={"verdict": "reject",
-                                   "reason_category": "Offensive Content",
-                                   "reason_text": "冒犯图案"})
+                                   "policy": "Offensive Content",
+                                   "detail": "冒犯图案"})
     conn = FakeConn()
     r = audit_l3.judge_l3(_product(), _l1(), _l2(), _ctx(), conn)
     assert r.verdict == "reject" and len(conn.put_log) == 1
     assert all(h.penalty == 0 for h in r.hits)
+
+
+def test_S1_缺证即禁_写在Prohibited列的那一半也要判():
+    """⚠ 2026-09-03 实遇(`B0FH2CYMGW` 儿童床架):`product_is` 认对了
+    「儿童床架(家具)」,却仍判 pass、置信 high。
+
+    根因是**框架缺口,不是这个产品特殊**:C 类的触发面原来只绑在
+    「Allowed with restriction」那一列上,而儿童产品那篇根本没有这一列 ——
+    它把同一件事写在 **Prohibited 列**、拴在「缺 CPC」上
+    (`…any children's product that doesn't have a valid CPC`)。
+    44 篇里有 21 篇只有 Prohibited | Allowed 两列,全靠这第二种写法。
+
+    刹车同样要钉死:政策若把**适用范围**推给末尾原文之外的清单(通用消费品那篇
+    只说 "regulated consumer product",具体哪些要查另一份监管目录),就**判不出
+    → pass** —— 这是「判据只有末尾原文」的直接推论。少了这条刹车,
+    模型会拿"受监管消费品"去连坐整个目录。
+    """
+    s1 = audit_l3._S1
+    for must in (
+            # 第二种写法(漏的就是它)
+            "把禁令拴在「缺这份文件」上",
+            "doesn't have a valid",
+            "只有 Prohibited | Allowed 两列",
+            # 不去 listing 里找"缺失"的证据
+            '不要去 listing 里找"没有证书"的证据',
+            # 刹车:表不在手里就不许猜
+            "推给了末尾原文之外的清单 → 判不出 → pass",
+            "不许猜谁在表上",
+            # 反向护栏:本体定了就要用(B0FH2CYMGW 那条的病)
+            "定了又不用,等于白定"):
+        assert must in s1, must
+    # 两条老护栏不许被这一节吃掉
+    assert "拿不准不拒" in s1 and "按类目名连坐整类" in s1
+    # 顺序:先定本体 → 三类命中(C 类要引用本体的结论)
+    assert s1.index("# 先定") < s1.index("## C. 附条件允许")
+
+
+def test_S1_适用范围两个方向都举了例_不是产品清单():
+    """所有者 2026-09-03 否过一次"专属某些产品的判断"。这一节给的是
+    **怎么读政策的适用范围条款**(判得出 / 判不出各一个方向),不是产品名单 ——
+    钉住"两个方向都在",防止以后只留下会拒的那一半。"""
+    s1 = audit_l3._S1
+    body = s1[s1.index("## C. 附条件允许"):s1.index("# 输出的五段")]
+    assert "落进去了" in body and "→ reject" in body      # 判得出的方向
+    assert "判不出 → pass" in body                        # 判不出的方向

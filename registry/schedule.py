@@ -158,19 +158,20 @@ JOBS = (
     #   的破坏类建议判,与写入先后无关。顺序改了结果也不变 —— 这是有意的,
     #   本仓吃过"顺序即语义"的亏,不再让调度表承载判据。
     #   product_audit 跟着 problem_scan 一起前移,紧邻关系不变。
-    # ⚠ 三个参数一个都不能少:
+    # ⚠ 两个参数一个都不能少:
     #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
     #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
-    #   limit 要一次扫得完 —— 这条**没有天然分页**(未命中不落结论不盖版本、
-    #   不退出候选),小 limit 会让每天都从头扫同一批前缀,尾巴永远轮不到
-    #   而且不报错
+    # ⚠ 而 limit **一个都不许给**:这条**没有天然分页**(未命中不落结论不盖
+    #   版本、不退出候选),给了小 limit 就每天从头扫同一批前缀,尾巴永远轮不到
+    #   而且不报错。2026-09-03 起缺省即不限量(此前这里写 `limit=1000000`
+    #   凑效果,那个魔数已随缺省口径删掉)
     job("product_chain",
         ["catalog_sync", "sources_backfill", "product_refresh",
          "product_audit", "maintenance_scan", "problem_scan",
          "maintenance", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
         params=["product_refresh:wait=1", "product_audit:mode=online",
-                "product_audit:stages=L0", "product_audit:limit=1000000"],
+                "product_audit:stages=L0"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
              "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
              "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"
@@ -194,8 +195,8 @@ JOBS = (
         runner="gpt", params=["from_sheet=1"],
         note="审上架表里 E 列为空(或 E=pending)的行 + 把库里已有结论投影回 "
              "C~G。⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,"
-             "只有未审/pending 过退避的才真判;缺省 limit=500,"
-             "存量大时改调度表加 -p limit=N,别在提示词里手改。"
+             "只有未审/pending 过退避的才真判;**缺省不限量**(2026-09-03 定稿:"
+             "要限量才手动带参数),要分批就改调度表加 -p limit=N,别在提示词里手改。"
              "库里没数据的行走**同轮补采闭环**:推采集 audit_gap_<日界>(插队)"
              "→ 轮询等采完(缺省 20 分钟)→ 就地摄取 → 采回来的这一轮就判掉;"
              "仍缺的把采集侧真实 error_type 写进 F 列(E 留空 ⇒ 下轮重领)。"

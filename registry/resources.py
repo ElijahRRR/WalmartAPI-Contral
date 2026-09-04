@@ -161,7 +161,7 @@ WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 # ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
 # 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
 # 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
-ERROR_TAXONOMY_VERSION = "t.2026-09-02.1"   # 码表/判据变更时手动递增
+ERROR_TAXONOMY_VERSION = "t.2026-09-04.1"   # 码表/判据变更时手动递增
 ERROR_CATEGORY_CODES = {                     # 码 → 中文名(全大写码,与旧 A-L 单字母码同列可辨)
     "PROHIBITED_FINAL": "禁售不可申诉", "IP": "知识产权", "BRAND": "品牌未授权",
     "POLICY": "违反禁售政策", "PT_WRONG": "类目选错", "CONTENT": "内容问题",
@@ -394,7 +394,8 @@ ZIP_BLACKLIST_SHEET = Spreadsheet(
 # 黑名单两张收集表(所有者建 2026-08-11,与黑名单邮编同一个 wiki 承载;
 # **PG 权威,这两张是数据库的投影**——写入方向只有 PG → 飞书,人不直接编辑)。
 # ASIN 表来源列格式 = 「沃尔玛-〈13 类之一〉」;但**入选只限永久禁止类**
-# B/C/E/F/G/K(见 services/blacklist.PERMANENT),词表≠入选范围。
+# (`error_taxonomy.PERMANENT_CODES` 七码 + `OTHER` 的两个显式词条,
+# 判据在 `is_permanent`;裁决表 docs/error_taxonomy.md §十二),词表≠入选范围。
 ASIN_BLACKLIST_SHEET = Spreadsheet(
     name="黑名单ASIN",
     token=os.environ.get("FEISHU_BLACKLIST_WIKI_TOKEN", ""),
@@ -509,18 +510,21 @@ RETIRE_SHEET = Spreadsheet(
 # (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
 # ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
 # `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
-# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里。
-# 写入侧一律用显式 range(C:G / O:Q / …),不受本次对调影响。
+# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里 **+ services/listing_sheet
+# 里的显式 range 字母**(写入侧按字母写,表头一动它们也得跟着挪)。
+# ⚠ **2026-09-02 所有者再改表头**(第三步输出规范化):C 插入 SKU;「审核理由」
+# 拆成 G=类别 + H=具体内容;尾部四列 真实标题/真实PT/真实UPC/UPC匹配 换成
+# T=登记日期 U=查询编码(运营域,脚本不写)。仍 21 列 A~U。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
     sheet_id=os.environ.get("FEISHU_LISTING_SHEET_ID", ""),
-    columns=("store", "asin", "list_title", "product_type", "audit_result",
-             "audit_reason", "audit_date", "amz_price", "stock",
-             "walmart_price", "listed", "feed_id", "list_date",
-             "not_listed_reason", "list_result", "list_fail_reason",
-             "feed_check_date", "real_title", "real_pt", "real_upc",
-             "upc_match"),
+    columns=("store", "asin", "sku", "list_title", "product_type",
+             "audit_result", "audit_category", "audit_detail", "audit_date",
+             "amz_price", "stock", "walmart_price", "listed", "feed_id",
+             "list_date", "not_listed_reason", "list_result",
+             "list_fail_reason", "feed_check_date", "register_date",
+             "query_code"),
 )
 
 # 跟卖表(match_listing 驱动表,替代旧 xlsx 输入,所有者定稿 2026-08-07
@@ -672,9 +676,172 @@ def llm_price_tier(dt) -> str:
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,
 # 写入 catalog.products.audit_version;按版本批量重审走
 # product_audit -p force_rerun=版本号(乱定一次 = 全量重审成本事故,勿自动化)。
-# 2026-09-02 提版:政策表官方同步 v1(见下方 POLICY_LEGACY_NAMES 与
-# docs/policy_sync.md §十.7)。提版即触发 mode=stale 版本重审。
-AUDIT_RULES_VERSION = "c.2026-09-02.1"
+# 2026-09-02 提版两次(政策表官方同步 v1 + 第三步 B1 批),2026-09-03 第三步
+# C 批 + 人工验收回改提示词各提一次,验收跑完补修品牌段、再按所有者反馈
+# 调品牌判定顺序与 L0 扫描面,各提一次。提版即触发 mode=stale 版本重审。
+AUDIT_RULES_VERSION = "c.2026-09-03.6"
+# c.2026-09-03.5  **修品牌误伤:命中的是「词」,不是「品牌」**(所有者点破,
+#                 规格 §八.9)。`.4` 之后回放实测**正例误伤 4.0% > 旧链 2.8%**,
+#                 底线不达标;逐条看全是品牌翻拒,而且多数是**别人名字里碰巧
+#                 含那个词**:`smith` 命中的其实是 `Bob Smith Industries`、
+#                 `southern` / `serene` / `Essex` 同款。所有者原话:「这样子的词
+#                 在标题里应该可以看出来它到底是品牌还是不是品牌」。两处改:
+#                 ① **L0 命中带回上下文窗口**(`audit_phase0._BRAND_CTX=40`):
+#                    `matches[].context` 存命中词前后 40 字符的标题原文,证据行
+#                    优先渲染它 —— 只递 `smith` 这个词,L3 根本没法判"它属于哪个
+#                    完整品牌名";老命中行没有这个键,退回 `matched_phrase` 不炸;
+#                 ② **S1 加「词 → 完整品牌名 → 是不是同一个牌子」这一问**,
+#                    排在原有两问之前:先在原文里找出这个词属于哪个完整品牌名,
+#                    再判那是不是黑名单里那个牌子。三条对照写死
+#                    (Bob Smith Industries ≠ smith / Milwaukee M18 = milwaukee /
+#                    Better Drying 里的 better 压根没当名字用)。
+#                 ⚠ 提示词与 user 段的证据行都变了 ⇒ purpose=audit_l3 存量缓存
+#                 **全量未命中**。验收:同 tag 重放 `audit_replay -p tag=路由后`,
+#                 底线是**正例误伤降到旧链 2.8% 或以下**才算修好。
+# c.2026-09-03.4  **品牌这一维两处收口**(所有者 2026-09-03 反馈,规格 §八.6):
+#                 ① **判定顺序写死:先定本体,再判品牌**(`_S1`)。原来品牌段
+#                    自成一节、不引用本体,于是「USB 口可给 iPad 充电」里的
+#                    `iPad` 被当成那只**收纳柜**的真品牌,整件商品翻成知产侵权。
+#                    现在每个词只问一句:**它是不是「这件商品本身」的牌子?**
+#                    并给两条对照(收纳柜 × iPad → 别人的牌子;遮阳伞 ×
+#                    `ABBA PATIO … Umbrella` → 自己的牌子)。测试连**节的先后**
+#                    一起钉(顺序本身是判据的一部分);
+#                 ② **L0 品牌黑名单扫描收窄成只扫标题**
+#                    (`audit_phase0._scan_brand_mentions`,`ProductInfo.
+#                    searchable_text` 随之删除 —— 它最后一个消费者就是这里)。
+#                    收窄不是"少查了":词表 4.2 万条里混着 corner / life /
+#                    wooden / better / side / time 这类通用词,扫描述等于把送进
+#                    L3 的品牌词清单灌满噪声,而那份清单**≤10 个**,真正长在
+#                    品牌位上的词反而挤不进去。代价说清:只在描述/五点里出现的
+#                    品牌从此不进证据 —— 所有者认这笔账。
+#                    ⚠ L0 商标符号规则**不动**(照旧扫标题 + 五点前 5 + 描述前
+#                    1000 字符):® / ™ 是强信号,没有噪声问题,两条规则的扫描面
+#                    故意不同,别顺手统一(守门测试拦这件事)。
+#                 判定面变化:带 `for X` / `compatible with X` 的产品不再因兼容
+#                 提及被翻成知产侵权;只在描述里提到的品牌不再产生证据行。
+#                 ⚠ 提示词逐字节变 + user 段的品牌清单也变 ⇒ purpose=audit_l3
+#                 存量缓存**全量未命中**。
+# c.2026-09-03.3  **验收跑完的补修:品牌段补「品牌位」这一维**(只动 `_S1`)。
+#                 `.2` 拿所有者那 8 条人工判定跑完,6 条对上,**其中一条是 `.2`
+#                 自己弄出来的回归**:`B0GYNRCZ9F`(遮阳伞,人工判「未授权引用
+#                 品牌名 abba」)在 `.1` 被翻拒,到 `.2` 变成 pass、真品牌=无。
+#                 根因是 `.2` 把所有者的「假品牌无需**输出**」顺手写成了
+#                 「无需逐个**判**」(原句 `逐个给判定` → `逐个在心里过一遍`),
+#                 判定动作一松,模型整段跳过;而当时列的三条真品牌信号(型号 /
+#                 100% Authentic / 自称授权)**恰好都不覆盖最常见的那一种** ——
+#                 品牌名直接当自己的商品名写在标题开头。补的是这一维,不是某个词:
+#                 ① 逐词判「**用在别人身上**(compatible with / for X → 不进列表)
+#                    还是**当成自己的名字**(品牌位:标题开头、品牌字段、by X、
+#                    官方/旗舰 → 进列表)」,输出仍只留真品牌(所有者口径不变);
+#                 ② 判 false 收窄成一种情形:那个词在这条 listing 里压根没当品牌用
+#                    (普通英文词做形容词/部件名)—— 这才是黑名单误收;
+#                 ③ 明写**两个方向都会错**:冤枉兼容提及 = 整件商品判成侵权;
+#                    放过品牌位上的真品牌 = 未授权卖别人的牌子一路上架。
+#                 (`.2` 那句"一个词判错就翻成知产侵权"只防一边,是回归的助推。)
+#                 ⚠ 仍是提示词逐字节变化 ⇒ purpose=audit_l3 存量缓存全量未命中。
+# c.2026-09-03.2  **S1 提示词按人工验收回改:补「本体」判定 + 第三类命中**
+#                 (所有者 2026-09-03 人工看 8 个产品给的判断结果,验收集记在
+#                 `docs/audit_step3_spec.md` §七)。改的只有 `audit_l3._S1`,
+#                 规则代码、词表、政策表都没动:
+#                 ① 新增「先定**本体**」一节:政策判的是这件商品**本身是什么**,
+#                    不适用于它的部件 / 兼容对象 / 使用场景 —— 带 USB 口与插座的
+#                    柜子本体是家具不是电子设备;"for iPad" 的收纳架本体是收纳架;
+#                    反过来 "Kids Picnic Table" 本体**就是**儿童家具(面向谁做的
+#                    是商品定义的一部分,不是"场景提及");
+#                 ② 命中类别由两类扩到**三类**,新增 **C. 附条件允许**:官方原文
+#                    的「Allowed with restriction」列与 must be certified /
+#                    requires approval / must be registered 这类措辞,前提是本
+#                    卖家固定办不到的事(搬运模式、无证书、无授权、无预审批)
+#                    ⇒ 对**本体**提出这类要求即 reject;针对部件的 → pass;
+#                    证据不足以判本体是否落进适用范围 → pass(拿不准不拒);
+#                    并写死两条护栏:别把「附条件允许」读成「允许」、不许按类目名
+#                    连坐整类。「本 PT 的沃尔玛准入要求」那节随之降级为**补充信息**
+#                    (证书要求本来就在末尾政策原文里,不是 C 类的前提);
+#                 ③ 品牌段加自洽约束 + **只输出真品牌**:`evidence` 说的若是
+#                    兼容 / 适配 / 提及 / 场景 / 通用词,那它就不是真品牌、不进
+#                    列表(硬写进去按 false 处理);判成 false 的一个都不输出
+#                    (所有者原话:"其他假品牌无需输出")。翻拒判据没变,
+#                    仍是 `brand_verdicts[].is_real_brand is True`;
+#                 ④ **输出三段 → 五段**(所有者:"输出有明细方便我们排查问题"):
+#                    新增 `product_is`(本体一句话,**pass 也要填**)与
+#                    `policy_quote`(触发判定的那一句政策原文逐字)。两者
+#                    **不参与判定**,取不到就是 None —— 老 `llm_cache` 行没有
+#                    这两个键,**缺排查信息不是坏 JSON**,照旧解析出结论。
+#                    落点:reject 随 hit.detail 进 `audit_hits`(五键定序扩为
+#                    **七键**,两键接在末尾;`audit_why` 原样摊开,不改渲染);
+#                    **pass 不落 hit** ⇒ 只有 `services.audit_l3` 那一行 INFO
+#                    (屏幕 + `logs/<workflow>.log`,dry-run 也打)——
+#                    误放行只能从"它把本体认成了什么"看出来。
+#                 判定面变化(方向,不是保证):电器部件类家具应从误拒转为 pass;
+#                 儿童属性明写、以及本体需证书 / 预审批的产品应被拒到对应政策名。
+#                 验收集 = 所有者那 8 条人工判定(规格 §八.1),改提示词都要拿它
+#                 重跑对一遍;**对不上不许靠加特判去凑**(那正是这次被否的改法)。
+#                 ⚠ **缓存**:system prompt 逐字节变化 ⇒ `catalog.llm_cache` 里
+#                 purpose=audit_l3 的存量**全量未命中**(与 B1 那次同口径,不是
+#                 C 批的部分未命中),重审全额重付;大批走谷时段(见 LLM_PRICING)。
+# c.2026-09-03.1  **第三步 C 批:审核链瘦身 + 旧名一族清理**
+#                 (规格 `docs/audit_step3_spec.md` §四,链路定稿
+#                 `docs/audit_pipeline.md` §10):
+#                 ① **L0 双输出**:硬拒(黑名单三表 → 商标符号 → 专利自述 →
+#                    **Made in USA** → 品牌等值)命中即终止不变;全未中则跑软规则
+#                    **品牌黑名单扫文案**(`phase0_brand_mention`,penalty 0)进
+#                    `Phase0Result.evidence`,**不终止**判定、随产品进 L3。
+#                    一次 run 的 L0 行数因此可能 >1(硬 1 或软 n);
+#                 ② **R4 / R10 迁入 L0**(判定逐字随迁,rule_code 换成
+#                    `phase0_brand_mention` / `phase0_made_in_usa`);Made in USA
+#                    的类别改自报 **`Product claims`**(官方第 29 节专段;旧
+#                    `Made in USA claims` 是自造名,政策表里没有那一行);
+#                 ③ **L2 = R1**:删 R3(类目需证书,替身是 B1 已落地的
+#                    「本 PT requirements 进 L3」)、R5(USPTO 商标,连同
+#                    `pt_nice_class.yaml` 与 ctx 的 uspto/nice 字段)、R7(促销
+#                    宣称)、R8(敏感合规)与 `_infer_walmart_policy` 四张字面量表;
+#                    `product_audit -p r5=on` 随之下线;
+#                 ④ **旧名一族退役**:`POLICY_LEGACY_NAMES` / `policy_names.
+#                    to_official`(resolve 第 4 级)/ `error_taxonomy.
+#                    POLICY_ALIASES` / `alias_gaps` / policy_sync 的「经旧名认领」
+#                    —— 改名 2026-09-02 已真跑落地,表内就是官方拼写;今后改名
+#                    走人工入口(policy_sync 报告的「疑似改名对」);
+#                 ⑤ 类别缺口从三条降到**一条**(只剩 L4 `l4_vision_violation`
+#                    等所有者裁决)⇒ **L4 关闭时 `reason_missing` 应恒为 0**。
+#                 判定面变化:曾被 R3 硬拒(该类目要认证)与 R10 拒掉的产品会
+#                 分别翻案/改由 L0 拒;R4/R5/R7/R8 的软 hit 不再产生(证据面
+#                 只剩 L0 品牌命中 + 官方全文)。**按需重审为主**
+#                 (`audit_sheet` 走 from_sheet),批量走 `mode=stale`
+#                 (近 90 天有动销的那批;定点翻案:
+#                   python cli.py product_audit -p rerule=cat_requires_cert_hard
+#                   python cli.py product_audit -p rerule=made_in_usa_claim)。
+#                 ⚠ **缓存口径说清**(别照抄"提示词没动所以不影响"):system
+#                 prompt 确实一字未动,但 `llm_cache.cache_key` 哈希的是**整段
+#                 messages**(system + user),而本批**改了 user 段** ——
+#                 「上游证据」那一段的品牌行换了措辞(`标题/描述命中黑名单(R4…)`
+#                 → `文案提到黑名单品牌(…)`),R3 软/R5/R7/R8 三类证据行整体消失
+#                 (原来有它们的产品现在多半塌成一行「(上游无证据)」)。所以:
+#                   · **本来就没有任何软证据的产品** → user 段逐字节不变,照旧命中;
+#                   · **有品牌命中、或曾有 R3 软/R5/R7/R8 证据的产品** → 未命中,
+#                     按 L3 全价重付(谷时段减半,见 LLM_PRICING)。
+#                 与 B1 那次"全库全量未命中"不同:这次是**按产品分的部分未命中**。
+# c.2026-09-02.2  **第三步 B1 批:L3 换喂 + 输出规范化 + 理由映射去猜测**
+#                 (规格 `docs/audit_step3_spec.md` §三,所有者八项定稿 §六):
+#                 ① S4 政策块改喂**官方英文全文**(`full_policy` 经
+#                    `policy_feed.render_feed_text` 渲染,ORDER BY id),六个中文
+#                    人工列与 50/30/240/80 截断整体删除;S1 重写为"只认下面的
+#                    官方英文原文";S2 枚举追加两条非政策类别、删 brand_misuse;
+#                 ② L3 输出三段化:`verdict` / `policy`(枚举逐字)/ `detail`
+#                    (中文 ≤120 字,引原文片段),外加 brand_verdicts 与
+#                    confidence;政策名解析不到 → **pending**(旧版降级猜 IP,删);
+#                 ③ 类别**由规则自报**(hit.detail 的 `category` 键),
+#                    `compute_final_reason` 收敛为查表:查不到 = None + 计数 +
+#                    warning,**没有 `General-Use Products` 兜底**;
+#                 ④ `catalog.products` 新增 `audit_detail` 列(类别与具体内容
+#                    分列,飞书上架表 G/H 两列同口径);
+#                 ⑤ 证据通道泛化(读 L0/L1/L2 三层软 hit)、政策路由提示整体删除。
+#                 ⚠ 提示词与政策表一起决定 `llm_cache` 键 ⇒ purpose=audit_l3 的
+#                 存量缓存**全量未命中**,重审全额重付(谷时段减半,见 LLM_PRICING)。
+#                 ⚠ **B 与 C 只切换一次**(规格 §一):生产机等 C 批合并后再 pull
+#                 —— C 批 2026-09-03 已合并,切换手册见规格 §五。
+#                 影响面:reject 行的 `audit_reason` 改为类别枚举、`audit_detail`
+#                 新列写具体内容。**按需重审为主**(`audit_sheet` 走 from_sheet),
+#                 批量走 `mode=stale`(近 90 天有动销的那批,B2 批加 active_days)。
 # c.2026-09-02.1  **政策表官方同步 v1 + 官方类别名成为全链唯一键**(所有者
 #                 2026-09-02 定稿 §十.7,三件事同批,判定输入三处一起变):
 #                 ① `policy_sync` 真跑:补武器族 5 行 + 42 页全文刷新 +
@@ -753,42 +920,65 @@ AUDIT_RULES_VERSION = "c.2026-09-02.1"
 # c.2026-08-13.1  批次 C:L1 rerank + L3 语义 + L4 视觉接线
 
 
-# ── 政策表旧名 → 官方名(一次性迁移映射,2026-09-02)────────────────────────
+# ── 政策表旧名 → 官方名:**已退役**(2026-09-03 C 批)────────────────────
 #
-# 定稿 `docs/policy_sync.md` §十.7:**官方政策类别名 = 全链唯一键**。生产表
-# `audit.walmart_prohibited_policy` 的存量行用的是旧仓搬迁时的缩写名,按
-# `policy_sync.norm_category` 的词形归一化(&↔and / 逗号 / 括号后缀 / 单复数)
-# **故意对不上**官方全称 —— 缩写差是**语义合并**,不许在归一化里偷偷做。
-# 这张表就是那一步人工裁决的**落纸**:哪个旧名是哪个官方类别,由所有者认。
+# `POLICY_LEGACY_NAMES`(11 条旧缩写名 → 官方名)是 2026-09-02 那一次改名的
+# **一次性迁移映射**:`policy_sync` 凭它认领存量行把 `category_en` 改成官方
+# 拼写,`error_taxonomy.POLICY_ALIASES` 从它反向派生让改名落地前的报错 join
+# 照旧对得上。真跑当天两件事都做完了 —— 表内从此就是官方拼写,这张表指向的
+# 是**表里已经不存在的旧名**,留着 = 一份永远不会再被验证的历史映射,还多给
+# 了一条"归一化认不出就翻译一下再试"的暗道(`policy_names.to_official`)。
 #
-# 用途只有两处,都在过渡期内:
-#   · `policy_sync` 真跑时凭它认领存量行,把 `category_en` 改成官方拼写;
-#   · `services/error_taxonomy.POLICY_ALIASES` 从它**派生**(反向:官方名 →
-#     旧名),让改名落地前的报错文本 join 照旧对得上。
+# 同批退役的三处:`policy_names.to_official` 与 `resolve` 的第 4 级、
+# `error_taxonomy.POLICY_ALIASES` / `alias_gaps`、`policy_sync` 对行的
+# 「经旧名认领」那一级。**改名从此是人工入口**:`policy_sync` 报告的
+# 「疑似改名对」把「未对上」与「官方已不含」里同概念的两条并排点名,由人裁决
+# 改名还是新增(代码不许偷偷做语义合并 —— 合错了是把 A 政策的正文写进 B 行)。
+
+
+# ── 审核类别词表:非政策类别与代码写死的政策名(2026-09-02 §二 定稿)───────
 #
-# ⚠ **仅为一次性迁移用**:生产改名落地后,这张表与 POLICY_ALIASES 一起
-#   随第三步 L3 批**整体删除**(留着 = 一份永远不会再被验证的历史映射)。
-# ⚠ 键是**表内旧名的精确字面量**(不归一化匹配:旧名是历史事实,不是词形);
-#   值必须与 `refdata/policy_pages/en/*.md` 的头注 H1 **逐字一致**(含
-#   Tobacco 那条**没有牛津逗号**、Children’s 的弯撇号 —— 官方怎么写就怎么抄)。
-# ⚠ 前 7 条来自生产存量实证(§十.6);后 4 条来自 2026-09-02 首跑 dry-run 报告的
-#   「官方已不含」清单 —— 3 条由报告「疑似改名对」点名,第 4 条 Biodegradable Plastic
-#   ↔ Product claims 按页面内容判定(官方 Product claims 页正文逐条列出
-#   Biodegradable / Degradable / Compostable 宣称,是同一政策页改名扩写)。
-#   所有者 dry-run 看到「未对上」里还有别的拼写差时,**在这里追加**,不要另起第二张表(双轨禁止)。
-POLICY_LEGACY_NAMES: dict[str, str] = {
-    "Auto & Motor Vehicles":      "Auto and Motor Vehicles",
-    "Textiles & Apparel":         "Textiles and Apparel",
-    "Drugs & Paraphernalia":      "Drugs and Drug Paraphernalia",
-    "Military & Law Enforcement": "Military and Law Enforcement Products",
-    "Electronics & RF":           "Electronics and Radio Frequency Devices",
-    "Ride-Ons & Micromobility":   "Ride-Ons and Micromobility Devices",
-    "Tobacco & Vaping":           "Tobacco, E-Cigarettes and Vaping Products",
-    "Jewelry/Precious Metals":    "Jewelry, Watches, Precious Gemstones, Currency, Coins and Precious Metals (Covered Goods)",
-    "Pet Products":               "Pet Foods, Supplements, Medicines and Other Products",
-    "Restricted/Illegal":         "Restricted/Illegal Products",
-    "Biodegradable Plastic":      "Product claims",
-}
+# 「类别」= 判定落在哪一类,**只许两种来源、零推断**(`docs/audit_step3_spec.md` §二):
+#   ① 官方政策类别名 —— `audit.walmart_prohibited_policy.category_en` 实时集合
+#      (44 条:42 类禁售 + 内容族两页),不在本文件里写死;
+#   ② 下面这两条**非政策类别** —— 它们不对应任何一条沃尔玛政策,政策表怎么改
+#      都影响不到,所以只能是常量。别再往这个元组里加第三条:每加一条就是给
+#      "判不清就新造一个类别"开一道门(旧链的 `General-Use Products` 兜底
+#      就是这么长出来的,所有者 2026-08-16 实遇「这是什么意思」)。
+AUDIT_CAT_INTERNAL_BLACKLIST = "内部黑名单"   # 卖家/ASIN/亚马逊类目黑名单命中(内部决策)
+AUDIT_CAT_ACCESS = "类目准入"                 # 类目白名单拦下 / 出版物硬禁 / 需证而无
+AUDIT_NONPOLICY_CATEGORIES = (AUDIT_CAT_INTERNAL_BLACKLIST, AUDIT_CAT_ACCESS)
+
+# 规则代码里**唯一写死的政策类别名**:品牌黑名单 / 商标符号 / 专利自述三条硬拒
+# 与 L3 的品牌翻拒都判它(§二 表「现状不变」那三行)。它是政策表里的一行,
+# 拼写必须与表内一致 —— `services/audit_rules.load_context` 装配时对表解析一次,
+# 解析不到或拼写不同**启动即 RuntimeError**(表改名了而代码没跟上,不许静默)。
+AUDIT_IP_POLICY = "Intellectual Property"
+
+# Made in USA 声明硬拒(2026-09-03 C 批从 L2 R10 迁进 L0)判的政策类别。
+# 官方第 29 节「Product claims」页里专段写 Made in the USA(转录件
+# `refdata/policy_pages/en/29-product-claims.md`)—— 旧 R10 在 detail 里写死的
+# `Made in USA claims` 是**自造名**,政策表里没有这一行,拿它当类别落库就是
+# 全链唯一键上多出一个谁也 join 不上的串。同 AUDIT_IP_POLICY 一道装配期对表。
+AUDIT_PRODUCT_CLAIMS_POLICY = "Product claims"
+
+# 内容族两页(2026-09-02 A 批随政策表进库,id 43/44)。沃尔玛下架原因里的
+# CONTENT 码(`content policy` / `authenticity claims` / 图片不合标准)指的
+# 就是这两页,而**不是**某一类禁售商品:43 是索引页、44 是四张允许/禁止表。
+# 回放评估(`workflows/audit_replay`)拿 CONTENT 反例对表时**两名互认** ——
+# 报错正文只说"内容不合规",不说是索引页还是明细页,判在哪一页都算对。
+# ⚠ 拼写必须与政策表内一致(同 AUDIT_IP_POLICY 的理由);它们同样是
+# `audit_l3.policy_enum` 的合法取值,只是不由规则代码写死进 hit。
+AUDIT_CONTENT_POLICIES = ("Content standards: Overview",
+                          "Product details policy")
+
+# 判定并发的缺省与上限(2026-08-17 所有者定稿 128;上限 256)。放 registry 是
+# 因为**两条工作流吃同一个数**:`product_audit`(生产判定)与 `audit_replay`
+# (回放评估)—— 各写一份的话调大一处不调另一处,而两边都不会报错。
+# 线程等的是 LLM 的 HTTP 不是 CPU,所以远超核数是正常的;真正的天花板在
+# LLM 侧,实际值还要过 `services/db_guard.cap_workers` 的连接余量钳制。
+AUDIT_WORKERS_DEFAULT = 128
+AUDIT_WORKERS_MAX = 256
 
 
 # LLM 用途→模型 env 映射(批复 #1,2026-08-13:DeepSeek 分用途选模型;

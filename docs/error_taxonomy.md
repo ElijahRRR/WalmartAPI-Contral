@@ -235,13 +235,15 @@ classify_feed_error / RULES`(RULES = 可枚举判据表,供守门测试断言全
   全链唯一键):测试 `KNOWN_POLICIES` = `refdata/policy_pages/en/*.md` 头注 H1 的
   **官方 42 名**,并加守门测试证明二者逐字一致(`policy_sync` 真跑后生产表就长这样)。
   join 不上的候选进"政策表缺口"清单由报告显示,不判错。
-- ⚠ **`POLICY_ALIASES` 不再手写**(2026-09-02):从 `registry.resources.POLICY_LEGACY_NAMES`
-  (仓内唯一一份「表内旧名 ↔ 官方名」映射)**反向派生** —— `{归一化(官方名): 旧名}`。
+- ⚠ **`POLICY_ALIASES` / `alias_gaps` 已于 2026-09-03 C 批删除**(连同
+  `registry.resources.POLICY_LEGACY_NAMES` 与 `policy_names.to_official`)。
   它是**过渡期产物**:报错正文里的政策名一直是官方全称,而政策表存量行是旧仓搬迁时的
-  缩写名,两边对不上会把一堆真实存在的政策算成"政策表缺口"。`policy_sync` 把表内名改成
-  官方拼写之后,直接键就命中了,这张表连同 `POLICY_LEGACY_NAMES` 一起随第三步 L3 批删除。
-  ⚠ 那时 `alias_gaps()` 会一次性报出全部 7 个旧名"指不到表" —— 那**不是失效告警**,
-  是别名功成身退的信号(报告头部那句提示要按这个读)。
+  缩写名,两边对不上会把一堆真实存在的政策算成"政策表缺口"。2026-09-02 `policy_sync`
+  真跑把表内名改成官方拼写之后,**直接键就命中**,桥的两头连的是同一个地方 ——
+  留着 = 一份永远不会再被验证的历史映射,还多给一条"对不上就翻译一下再试"的暗道。
+  ⇒ `policy_join` 现在只走词形归一;语义缩写对不上就是对不上,**进「政策表缺口」
+  清单让人看见**(那正是这张表原本明令禁止拿来做语义合并的那一类)。
+  报告头的「别名表健康」两行随之删除(`workflows/error_reclass_report._alias_notes`)。
 - ⚠ **`_norm_key` 已归并**(2026-09-02 补批,原「三种写法仍 join 不上」的条款作废):
   它现在**就是** `services/policy_names.norm_category`(仓内唯一一份政策名归一化),
   于是 `&`↔`and`、去逗号、削 `(Covered Goods)` 括号后缀、词尾单复数四条一并生效,
@@ -250,9 +252,11 @@ classify_feed_error / RULES`(RULES = 可枚举判据表,供守门测试断言全
   旧手写实现是 15/19 与 16/19 —— 测试钉住"两种表形态下都只许升不许降"。
   放宽的代价评估过:`policy_join` **只喂报告、不参与判定**(`policy_name` 一律保留原文),
   而 42 个官方名两两归一化不碰撞由测试钉死,"合错两条政策"的前提本就不成立。
-- ⚠ 连带:目标态下 `alias_gaps()` 报的是 **5 条**不是 7 条 —— `Auto & Motor Vehicles`
-  与 `Textiles & Apparel` 两条旧名与官方名只差 `&`↔`and`,归一化后同键,别名本身已多余;
-  剩下 5 条是真正的语义缩写(`Electronics & RF` 那种),归一化永远打不平。
+- ⚠ 连带(**已成为历史**,2026-09-03 别名表整体退役):目标态下曾预计
+  `alias_gaps()` 报 5 条而不是 7 条 —— `Auto & Motor Vehicles` 与
+  `Textiles & Apparel` 两条旧名与官方名只差 `&`↔`and`,归一化后同键,别名本身已多余;
+  剩下的才是真正的语义缩写(`Electronics & RF` 那种),归一化永远打不平。
+  今天这类缩写一律 join 不上,进「政策表缺口」清单。
 
 ## 七、验收(第一步完成的定义)
 
@@ -285,7 +289,7 @@ feed status 走 feed_items JOIN(§3.6)—— **四处全部核准**,以语料与
 1. 政策名正则**维持大小写敏感**(方案字面)。生产存在小写 "Prohibited Product
    policy" 写法,但当前无"小写+冒号+类别名"实例;首跑报告若见再议 IGNORECASE。
 2. `classify_reasons` 的 `policy_names` 参数本步只服务 join(`policy_join`/
-   `alias_gaps` 供报告);第二步若要把"join 上/没上"带进病历,`Result` 需扩字段。
+   `policy_join` 供报告);第二步若要把"join 上/没上"带进病历,`Result` 需扩字段。
 3. feed 政策族正文全不命中 → 落 `OTHER`,报告单列"政策族判不出码"一节提醒补判据。
 4. 别名表只收词形差,不做语义合并;政策表缺口由首跑报告自证,不预判。
 5. README §11 文档索引本就非全集,不动。
@@ -318,4 +322,1421 @@ join 全中,在架面 715/729 —— 剩 14 条全是同一个名字被截成
 
 同批把报告头的别名表告警分成两种读法(`alias_gaps` 文档早写了,报告没照做):旧名指不到
 表但官方名已在表里 = 改名落地、别名退役(平述,不打 ⚠);官方名也不在才是真失效。
+(⚠ **2026-09-03 C 批**:别名表整体退役,这两行提示随之删除 —— 改名已经落地,
+"别名健康"这个概念不存在了。)
 §十第 1 条(武器族)已由政策表数据补齐,第 2 条(Cosmetics)由 `norm_category` 单复数归一吃掉。
+
+---
+
+## 十、第四面:已经拉黑的那批 ASIN(2026-09-03 所有者问)
+
+所有者原问:「**禁售占了 4 万多个产品,禁售涵盖哪些报错类型?我们重新对后台
+报错进行了归类,这些产品的具体报错我们重新按新规归类了吗?**」
+
+### 10.1 先回答第二问:**没有,一条都没有重判**
+
+新引擎 `services/error_taxonomy` 至今只有**两个消费者**,都不写判定结果:
+
+| 消费者 | 干什么 | 写不写库 |
+|---|---|---|
+| `workflows/error_reclass_report` | 新旧并排对照报告 | 只落报告文件 |
+| `workflows/audit_replay` | 回放抽样时给反例贴期望类别 | 只写 `audit.replay_results` |
+
+**生产写入路径跑的仍是 `services/problem_products.categorize()` 那套 A–L 单字母
+码**(`problem_scan` / `feed_track` → `blacklist.record_asins` →
+`catalog.asin_blacklist`)。而且黑名单是 `ON CONFLICT (asin) DO NOTHING`
+——「一次入选、永久禁止」,`category` 写死在入选那一刻,**库里没有任何按新码
+重判过的痕迹**。守门测试 `test_新归类引擎还没接进任何生产写入路径` 钉住这个现状:
+换轨那天要连它一起改;它要是被悄悄删掉,「我们已经按新规归类了」就会变成一句
+没人验证的话。
+
+### 10.2 再答第一问:旧「禁售」= B 码,它涵盖这些串
+
+`problem_products._RULES["B"]`(只有命中这几串之一才算 B):
+
+`prohibited product policy` / `prohibited due to` + `walmart` /
+`for violating walmart's marketplace` / `reference code biz` / `cpsc recall` /
+`safety warning` / `circumvent walmart`
+
+⚠ B 在 `_SEVERITY_ORDER` 里排**倒数第二**(`C D E F G H I J K L B A`)——
+它是"更具体的都没中才落到我头上"的通用桶。
+
+进永久黑名单的不止 B:`PERMANENT = {B 禁售, C 品牌, E 知产, F 限类, G 药品,
+K 审查}`,另有历史导入的 `LEGACY` 一档(`asin_blacklist_import`,`reason` 为空)。
+
+### 10.3 旧 B 在新码下散成五种(仓内生产语料实测)
+
+`tests/fixtures/reason_corpus.jsonl` 77 条 provenance=prod 的真实串,
+两套引擎并排跑:
+
+| 新码 | 条数 | 是不是"这件商品违禁" |
+|---|---|---|
+| `POLICY` | 23 | 是 |
+| **`PT_WRONG`** | **4** | **否 —— 我方类目选错,沃尔玛明示改 product type** |
+| `RECALL` | 1 | 是 |
+| **`GATED`** | **1** | **否 —— 类目要预审批,没资质 ≠ 商品违禁** |
+| **`CONTENT`** | **1** | **否 —— 文案/图片不合标准,改了就能上** |
+
+⚠ **这是"不同文本形状"的分布,不是按 ASIN 加权的分布** —— 77 条是去重后的
+串型,真实占比要在生产库上按条数算(见 10.4)。反方向也有:旧引擎判不出的
+`Z 其他` 10 条,在新码下有 `PROHIBITED_FINAL` / `BRAND` —— 那是**旧引擎漏拉黑**
+的一面。
+
+### 10.4 怎么拿到真实数字
+
+`error_reclass_report` 加了第四面(2026-09-03):
+
+```bash
+python cli.py error_reclass_report -p scope=blacklist
+```
+
+它报三件事,**缺一件就会被误读成"可以批量翻案了"**:
+
+1. **`reason` 为空、无法重判的条数** —— 历史导入那批本来就不带原文,多半是大头;
+2. 有原文的也只是**截 200 字符的样本**,判据串可能被切掉 ⇒ 给的是**下限**;
+3. 新码认为"不是商品违禁"的行单独点名 —— 但**不等于授权翻案**:黑名单是
+   「一次入选、永久禁止」的既定语义,改不改、怎么改是所有者的裁决,报告只摆账。
+
+判"不是商品违禁"的新码集合 `_NOT_A_PRODUCT_BAN` = PT_WRONG / GATED / CONTENT /
+INFO / PRICE / SYSTEM / STAGE / EXPIRED。⚠ **`FLAGGED` 与 `OTHER` 故意不进这一集**:
+前者沃尔玛不给理由、后者没判据,都不能反过来断言"不是违禁"。
+
+---
+
+## 十一、存量回填:`error_reclass`(2026-09-03 所有者定稿)
+
+所有者原话:「**报错原文应该是有的,我们要重新对这些记录按新标准进行重新定义
+并归类。先把这一步做了,标准不统一,审核误差很大。**」
+
+§十 报的是账,这一条是**动手**。
+
+### 11.1 写什么、不写什么
+
+只写两张表的**新增列**,老列一个字不动:
+
+| 表 | 新列 | 老列 |
+|---|---|---|
+| `audit.walmart_error_records` | `taxonomy_code` / `taxonomy_policy` / `taxonomy_version` | `error_code char(1)`(旧 A-L)**保留** |
+| `catalog.asin_blacklist` | 同上三列 + `taxonomy_src` | `category`(入选旧码)**保留且不动** |
+
+⚠ **判定行为一点没变**:L0 的 ASIN 闸读的仍是 `category`。
+让新码改变拦截行为是**另一次裁决** —— 黑名单是「一次入选、永久禁止」的
+既定语义,批量放行是破坏性动作,不在这条工作流里顺手做。摘要会把
+「依据在新码下站不住」的行数报出来,但**一条都没放行**。
+
+### 11.2 原文从哪儿来(四级优先,全文优先于样本)
+
+| `taxonomy_src` | 来源 | 说明 |
+|---|---|---|
+| `records` | `audit.walmart_error_records.raw_reason` | **全文**,`NOT NULL`;同 asin 多条取 `report_date` 最新 |
+| `events` | `catalog.product_events.detail->>'reasons'` | 病历,最新一条 |
+| `items` | `catalog.walmart_items.unpublished_reasons` | 当前值,按黑名单行的 `src_sku` **精确对** |
+| `self` | `catalog.asin_blacklist.reason` | ⚠ **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分是**下限** |
+| `none` | —— | 四处都没有 ⇒ `taxonomy_code` 留 **NULL**,**不猜** |
+
+政策名同样**必须 join 得上政策表才写**(与 `audit_l3` 的 `policy` 同一条纪律:
+猜出来的名字会一路进报表与申诉口径,而没有任何东西会红)。
+
+### 11.3 幂等与增量
+
+`taxonomy_version` 是候选谓词:`IS DISTINCT FROM ERROR_TAXONOMY_VERSION` ——
+判过的行盖上版本号即**自动退出候选集**,跑一半中断直接重跑;码表递增后再跑
+就是全量重判。`-p force=1` 无视版本号重判(码表没动但想复算时用)。
+
+```bash
+python cli.py error_reclass --dry-run              # 一行都不写,报第一批会判成什么
+python cli.py error_reclass                        # 真跑,两张表都回填
+python cli.py error_reclass -p scope=blacklist     # 只回填黑名单
+```
+
+⚠ 空跑**不盖版本号** ⇒ 候选集恒定,所以空跑只取一批看形态(取多批也是同一批)。
+
+### 11.4 换轨还没做
+
+回填 ≠ 换轨。入选黑名单与处置那条路**仍吃旧 A-L 码**
+(`blacklist.PERMANENT` 六个单字母、`problem_scan` / `feed_track` 调
+`problem_products.categorize`)。守门测试
+`test_新码的消费者就这三个_判定与入选路径仍是旧码` 钉住这个现状:换轨那天要
+连它一起改;它被悄悄删掉,「我们已经按新规归类了」就会变成一句没人验证的话。
+
+### 11.5 首次空跑实测(2026-09-03,各表第一批 10,000)
+
+⚠ **这是按 `id` / `asin` 排序的第一批,不是随机样本** —— 空跑只取一批(见 11.3),
+分布**不能直接外推**到全量(黑名单 73,918 行)。真跑走完才有全量数。
+
+**`audit.walmart_error_records` 10,000 条**:EXPIRED 6,072 / **PT_WRONG 3,311** /
+POLICY 152 / FLAGGED 135 / PRICE 115 / BRAND 101 / IP 48 / …
+旧码去向里最刺眼的一条:**`B → PT_WRONG` 3,285**,而 `B → POLICY` 只有 147。
+
+**`catalog.asin_blacklist` 10,000 条**:原文来源
+`self=4135  records=4085  none=1190  items=555  events=35`;
+新码 **PT_WRONG 7,618** / FLAGGED 592 / POLICY 224 / GATED 123 / BRAND 117 /
+EXPIRED 56 / IP 52 / PROHIBITED_FINAL 20 / …
+**「依据在新码下站不住」7,805 条**,主体是 `B → PT_WRONG` 7,583。
+
+### 11.6 为什么会这样(生产原文实证)
+
+沃尔玛那句话的全文是:
+
+> This item has been unpublished for violating Walmart's Marketplace
+> **Prohibited Product Policy**. **To republish this item please make sure you
+> have the appropriate product type selected.**
+
+旧引擎只看见前半句的 `prohibited product policy` → 判 `B 禁售` → **永久拉黑**;
+而后半句是沃尔玛在告诉我们**怎么修**:把 product type 选对。新码序 1 的
+`PT_WRONG` 压过 `POLICY` 正是为这件事定的(码表 §3 判例)。
+
+### 11.7 三条读数限制(下结论前必看)
+
+1. **不是随机样本**(见 11.5),分布别外推;
+2. **`self` 那一档系统性低估 PT_WRONG**。判据串 `appropriate product type
+   selected` 长在**句尾**,而 `self` 只有 200 字符样本 —— 仓内语料实测 5 条含该串
+   的记录里 **4 条的串落在 200 字符之外**(起始位置 234 / 517 / 544 / 640),
+   截断后分别被判成 POLICY 或 EXPIRED。
+   ⇒ **真实 PT_WRONG 只会比报出来的更多,不会更少。**
+3. **判的是「该 ASIN 最新一条报错原文」,不一定是「当初拉黑它的那一条」**
+   (`DISTINCT ON … ORDER BY report_date DESC`)。这对 PT_WRONG 这类**持久属性**
+   影响不大,但会让少量瞬时码混进来 —— 首批里 EXPIRED/STAGE/SYSTEM 合计
+   约 56 条(占「站不住」不到 1%)。要按"当初那条"判,得另开一个
+   「取 `created_at` 当时或之前最近一条」的口径,**那是另一个问题的答案**
+   (「当初拉黑对不对」),不是「现在这个 ASIN 什么问题」。
+
+---
+
+## 十二、换轨裁决表(2026-09-03 所有者:「你把新标准全部列出来……我再来定哪些拉黑」)
+
+所有者已定两条(**待「拉黑集合」定下来才动手**):
+1. **要换轨** —— 入选那条路改吃新码;
+2. **存量按新规则路由**,方式 **直接删行**(`DELETE FROM catalog.asin_blacklist`),
+   范围 **全部释放、不分 `taxonomy_src`**(截断只会让 PT_WRONG 被**低估**,
+   所以判成 PT_WRONG 的样本行是保守命中,可信 —— 见 §11.7.2)。
+
+**还没定的就一件事:16 个码里,哪些够格永久拉黑。** 下面是全表。
+
+### 12.1 全量实测(2026-09-03 真跑,已落 `taxonomy_*` 列)
+
+- `audit.walmart_error_records`:判了 **97,002** 条;
+- `catalog.asin_blacklist`:判了 **73,918** 条,其中**找不到原文** 10,396 条
+  (`taxonomy_code` 留 NULL,不猜)⇒ **可判 63,522**。
+  原文来源:`self=36,868  records=18,740  none=10,396  items=5,614  events=2,300`。
+
+| 序 | 新码 | 中文 | 旧码怎么吃它 | 判据串(命中即算) | 记录表 97,002 | 黑名单 63,522 |
+|---|---|---|---|---|---:|---:|
+| 0 | `CONTENT` | 内容问题 | I 内容 | `generated by ai` | 252 | 22 |
+| 1 | `PT_WRONG` | 类目选错 | B 禁售(**永久拉黑**) | `appropriate product type selected` | 49,469 | 40,825 |
+| 2 | `PROHIBITED_FINAL` | 禁售不可申诉 | B/K(**永久拉黑**) | `not eligible for appeal` | 0 | 339 |
+| 3 | `RECALL` | 安全召回 | B 禁售(**永久拉黑**) | `cpsc recall` / `safety warning` | 15 | 22 |
+| 4 | `FLAGGED` | 内部标记 | K 审查(**永久拉黑**) | `flagged by our internal team` | 2,278 | 12,782 |
+| 5 | `IP` | 知识产权 | E 知产(**永久拉黑**) | `intellectual property` / `copyright`<br>正则 `\bip\b\s+(?:policy|claim|related)` | 547 | 781 |
+| 6 | `BRAND` | 品牌未授权 | C 品牌(**永久拉黑**) | `brand restrictions` / `not authorized to list this brand` / `partnered with select brands` / `biz-cn` | 1,762 | 1,861 |
+| 7 | `GATED` | 类目需预审批 | F 限类(**永久拉黑**) | `restricted to certain sellers` / `request approval to sell` / `enhanced vetting program` / `health & compliance page`<br>正则 `requires?\s+pre-approval` | 293 | 2,008 |
+| 8 | `PRICE` | 价格规则 | D 价格 | `pricing rule` / `price gouging` / `unintended price` | 1,036 | 29 |
+| 9 | `CONTENT` | 内容问题 | I 内容 | `content issues` / `does not meet our content standards` / `content quality standards` / `image guidelines` / `placeholder images` / `content policy` / `missing a primary image` / `main image url` / `authenticity claims` |  |  |
+| 10 | `SPECIAL` | 特殊计划 | J 特殊 | `resold program` / `preorder program` / `pre-owned` / `restored program` | 118 | 4 |
+| 11 | `INFO` | 信息缺失 | H 信息 | `no price was found` / `shipping information was not added` / `active distribution center` / `missing required logistics` / `tax code` | 60 | ≤1 |
+| 12 | `SYSTEM` | 系统错误 | L 系统 | `internal error occurred` / `glitch` | 130 | 18 |
+| 13 | `STAGE` | 未上线 | J 特殊 | `stage status until you go live` | 0 | 233 |
+| 14 | `EXPIRED` | 过期下架 | A 过期 | `end date has passed` | 38,799 | 975 |
+| 15 | `POLICY` | 违反禁售政策 | B 禁售(**永久拉黑**) | **同时含** `prohibited product` + `policy` | 2,242 | 3,617 |
+| 16 | `OTHER` | 未识别 | Z 其他(不拉黑) | `business decision` / `trust & safety` / `currently under review` | 1 | 5 |
+| 17 | `OTHER` | 未识别 | Z 其他(不拉黑) | **兜底** |  |  |
+
+### 每个码的生产原文(语料实抽,已折行)
+
+**`PROHIBITED_FINAL` 禁售不可申诉**  
+> This item is prohibited and not eligible for appeal.
+
+**`IP` 知识产权**  
+> This item has been unpublished due to violation of ||Walmart Marketplace’s Intellectual Property policy@@@https://marketplacelearn.walmart.com/guides/Prohibited-products-policy:-intellectual-property- )
+
+**`BRAND` 品牌未授权**  
+> This item was unpublished due to brand restrictions. At this time, you’re not authorized to list this brand's products. To learn more about how brand privileges work and how to manage them, see this ||guide@@@https://marketplacele…
+
+**`POLICY` 违反禁售政策**  
+> This item has been unpublished for violating Walmart's Marketplace ||Prohibited Product Policy@@@https://marketplacelearn.walmart.com/guides/Prohibited-products-policy:-overview||. If you believe this was done in error, submit an …
+
+**`PT_WRONG` 类目选错**  
+> This item has been unpublished for violating Walmart's Marketplace ||Prohibited Product Policy@@@https://marketplacelearn.walmart.com/guides/Prohibited-products-policy:-overview||. To republish this item please make sure you have …
+
+**`CONTENT` 内容问题**  
+> This item has been unpublished due to content issues that violate the ||Prohibited Products Policy@@@https://marketplacelearn.walmart.com/guides/Item%20setup/Item%20content||. If you believe this item was unpublished in error, ple…
+
+**`PRICE` 价格规则**  
+> This item is unpublished because it violates ||Walmart Marketplace's Pricing Rule@@@https://marketplacelearn.walmart.com/guides/Catalog%20management/Price%20management/Pricing-rules||, which prevents price gouging, or other unfair…
+
+**`GATED` 类目需预审批**  
+> This item is unpublished because it falls under a restricted category that requires pre-approval. ||Request approval to sell this item@@@https://seller.walmart.com/gated-category||.
+
+**`INFO` 信息缺失**  
+> No price was found for this listing.
+
+**`EXPIRED` 过期下架**  
+> This item is unpublished because the End Date has passed. Update the item's 'Site End Date' field to a future date to publish the item. Learn more about ||item reactivation@@@https://marketplacelearn.walmart.com/guides/Catalog%20m…
+
+**`STAGE` 未上线**  
+> Your item is in Stage status until you go live. Once you go live, your item will be published.
+
+**`FLAGGED` 内部标记**  
+> Your item has been flagged by our internal team. To find out why, file a case in Case Management.
+
+**`RECALL` 安全召回**  
+> This item has been identified as subject to a CPSC Recall or Safety Warning. Please review [www.cpsc.gov/recalls](https://www.cpsc.gov/recalls) for more information. If you believe this was done in error, submit an appeal in the S…
+
+**`SPECIAL` 特殊计划**  
+> This item has been unpublished due to Resold Program item setup issues/restrictions. Please refer to ||Resold program: Item setup@@@https://marketplacelearn.walmart.com/guides/Item%20setup/Resold/resold-program-overview|| for furt…
+
+**`SYSTEM` 系统错误**  
+> An internal error occurred while publishing this item. Resubmit the item.
+
+**`OTHER` 未识别**  
+> This item has been unpublished due to a Walmart business decision. If you believe this was done in error, submit an appeal in the Seller Center Unpublished Items page.
+
+
+
+### 12.2 三处要单独看的
+
+- **`PT_WRONG` 40,825 条**是黑名单里最大的一块,且**是低估**(§11.7.2:判据串
+  长在句尾,`self` 那 36,868 条的 200 字符样本常把它切掉,切掉后退成
+  `POLICY`/`EXPIRED`)。沃尔玛原话是"**要重新上架请把 product type 选对**" ——
+  那是修法,不是禁令。
+- **`FLAGGED` 12,782 条**是第二大块,原文是"已被我们内部团队标记,**去
+  Case Management 开工单问原因**"。沃尔玛没说为什么 —— 既不能当"商品违禁"
+  的实证,也不能反过来断言"不是违禁"。**这一条最需要所有者拍。**
+- **`EXPIRED` 975 + `STAGE` 233** 多半是 §11.7.3 那个口径造成的:我们判的是
+  该 ASIN **最新一条**报错,而不是当初拉黑它的那一条。数量小(占「站不住」
+  不到 3%),但放行前值得单独看一眼。
+
+### 12.3 待所有者填的那一栏
+
+| 新码 | 中文 | 黑名单现有 | 够格永久拉黑? |
+|---|---|---:|---|
+| `PROHIBITED_FINAL` | 禁售不可申诉 | 339 | ☐ |
+| `POLICY` | 违反禁售政策 | 3,617 | ☐ |
+| `IP` | 知识产权 | 781 | ☐ |
+| `BRAND` | 品牌未授权 | 1,861 | ☐ |
+| `RECALL` | 安全召回 | 22 | ☐ |
+| `FLAGGED` | 内部标记(沃尔玛不给理由) | 12,782 | ☐ |
+| `GATED` | 类目需预审批 | 2,008 | ☐ |
+| `PT_WRONG` | 类目选错 | 40,825 | ☐ |
+| `CONTENT` | 内容问题 | 22 | ☐ |
+| `PRICE` | 价格规则 | 29 | ☐ |
+| `INFO` | 信息缺失 | ≤1 | ☐ |
+| `SYSTEM` | 系统错误 | 18 | ☐ |
+| `STAGE` | 未上线 | 233 | ☐ |
+| `EXPIRED` | 过期下架 | 975 | ☐ |
+| `SPECIAL` | 特殊计划 | 4 | ☐ |
+| `OTHER` | 未识别 | 5 | ☐ |
+| (无原文,`taxonomy_code` 为 NULL) | —— | 10,396 | ☐ 留着 / ☐ 删 |
+
+⚠ 最后一行单列:那 10,396 条**判不了**。删了就是"因为查不出理由所以放行",
+留着就是"因为查不出理由所以永久禁止" —— 两个方向都得是所有者明说的选择,
+代码不替它选。
+
+---
+
+## 十三、换轨落地(2026-09-03 所有者裁决,已实现)
+
+### 13.1 裁决
+
+**留下(继续永久拉黑)**:`PROHIBITED_FINAL` / `POLICY` / `IP` / `BRAND` /
+`RECALL` / `FLAGGED` / `GATED` 七个码;`OTHER` 里只认
+**`business decision`** 与 **`trust & safety`** 两个显式词条
+(⚠ `currently under review` 不算 —— 审查中是自愈态);
+**`taxonomy_code` 为 NULL 的一律留下**(查不出理由就继续禁,不因查不出而放行)。
+
+**删掉**:其余全部(`PT_WRONG` / `CONTENT` / `INFO` / `PRICE` / `SYSTEM` /
+`STAGE` / `EXPIRED` / `SPECIAL`,以及 `OTHER` 的其他词条)。方式:**直接删行**,
+范围**不分 `taxonomy_src`**(截断只会让 `PT_WRONG` 被低估,判成它的样本行是
+保守命中)。
+
+口径唯一出处:`services/error_taxonomy.PERMANENT_CODES` /
+`PERMANENT_UNLISTED_TERMS` / `is_permanent()`。
+
+### 13.2 换轨改了哪几处(判定路径)
+
+| 处 | 换轨前 | 换轨后 |
+|---|---|---|
+| `services/blacklist.PERMANENT` | `{B,C,E,F,G,K}` | `PERMANENT_CODES` 七个 |
+| `services/blacklist.BRAND_CATEGORIES` | `{C,E}` | `{BRAND, IP}` |
+| `record_asins` 入选判据 | `code in PERMANENT` | `is_permanent(code, term)`(`OTHER` 靠词条) |
+| `workflows/problem_scan` 归类 | `problem_products.categorize` | `error_taxonomy.classify_reasons` |
+| `problem_scan` 的 K 聚集告警 | `category == "K"` | `== "FLAGGED"` |
+| `services/feed_track` 违禁回执 | `category="B"` | `="POLICY"`(两者都在 PERMANENT,**拦截行为一字不变**) |
+
+⚠ **飞书「来源」列故意不动**:`_NAMES` 仍映射到旧词表(禁售/品牌/知产/限类/
+审查)。运营按这几个词筛表,换轨换的是**底层判据**,不该顺手改人眼看的那一列。
+
+⚠ **换轨过渡桥**:`catalog.product_events` 的历史事件写的是旧 A-L 码,新事件
+写新码,而回填/重建(`backfill_from_events` / `rebuild_asin_blacklist`)是按
+事件里那个码筛的。只认新码的话 rebuild 会**清空表后只灌进换轨之后那几行**
+——七万变几十,而且不报错。所以 `blacklist.backfill_codes()` 两套码都认,
+直到存量事件被重写(百万级行,短期不会)。
+
+### 13.3 存量路由:`workflows/blacklist_route`
+
+```bash
+python cli.py error_reclass                    # 先回填(taxonomy_* 四列)
+python cli.py blacklist_route --dry-run        # 报将删/将留,一行不动
+python cli.py blacklist_route                  # 真删(先自动落备份)
+python cli.py blacklist_push                   # ⚠ 不跑它飞书那张表还是旧的
+python cli.py audit_replay -p tag=路由后        # 看正例误伤水位
+```
+
+三道闸:① 只动 `taxonomy_version` = 当前码表的行(没回填的一条不动,只点名);
+② 删前把**整行**写 `<DATA_ROOT>/backups/blacklist_route_<时间戳>.jsonl`
+(所有者选的是"直接删行",备份不改变这一点,只是把溯源留在库外);
+③ `--dry-run` 一行不动。
+
+### 13.4 政策类别名去哪了(所有者:「怎么没有体现?」)
+
+**它一直在,而且已经落库了** —— 只是裁决表 §十二 那张表按**主码**列的,
+没把第二维摆出来。两维是正交的:
+
+- **主码**(16 个)= 这是**哪一类问题**(违禁 / 类目选错 / 品牌 / 内容 …);
+- **政策类别名** = 是**哪一条禁售政策**。沃尔玛原文常写成
+  `Prohibited Products Policy: Alcohol.`,引擎用 `_POLICY_RE` 抽出 `Alcohol`,
+  再经 `policy_join` 对 `audit.walmart_prohibited_policy.category_en` 校验,
+  落 **`taxonomy_policy`** 列(两表都有)。
+
+**这就是与审核对照的那把钥匙**:审核链的 `catalog.products.audit_reason` 装的
+是**同一张枚举**(`audit_l3.policy_enum` 也吃 `category_en`)⇒ 两边可以逐个
+ASIN 直接比。`audit_replay` 的「类别准确率 + 混淆表」就是按这个键算的。
+
+⚠ **只有部分报错带类别名**:通用政策拒就一句"违反禁售政策",没有类别
+(语料 77 条里 23 条抽得出,主要落在 `POLICY` 码上 —— 26 条 `POLICY` 里 20 条
+带名字)。抽不出是常态,不是缺口。`error_reclass` 的摘要现在会报政策名分布
+(抽出且 join 上多少条、多少个类别、前 15 是哪些)。
+
+### 13.5 首次执行踩的两个坑(2026-09-03,已加护栏)
+
+所有者按顺序跑 `error_reclass` → `blacklist_route` → `blacklist_push` →
+`audit_replay`,**前两步都没成**,而第三、四步照跑了:
+
+1. **`error_reclass` 判了 0 条**,不是没数据 —— 上一轮已经盖过
+   `taxonomy_version`,增量谓词把全部行排除了(那正是它的作用)。而这一批
+   **刚加了 `taxonomy_term` 列**,于是那一列**全是 NULL**,没有任何提示。
+   → 加了护栏:判 0 条且没给 `force` 时,摘要点名"这是已经判过,不是没数据",
+     并给出 `-p force=1`(**刚加新列时必须给**)。
+2. **`blacklist_route` 甩了一屏 `psycopg.UndefinedColumn`** —— `db_init` 没跑,
+   `taxonomy_term` 列还不存在。
+   → 加了护栏:只认 `does not exist` 这一类,翻成人话并给出前置两步
+     (`db_init` → `error_reclass -p force=1`),别的异常照抛。
+
+⚠ **一条都没删**:两次 `blacklist_route`(空跑与真跑)都停在读计划那一步,
+`blacklist_push` 随后把**未改动的** 73,918 行整表重写回飞书 —— 状态没坏。
+
+### 13.6 ⚠ 底线不达标:正例误伤 4.0% > 旧链 2.8%
+
+同一轮里 `audit_replay -p tag=路由后` 跑出来的(**注意:那时什么都没路由**,
+tag 名有误导,它测的是 `c.2026-09-03.4` 当前判据):
+
+| | 新链 | 旧链 |
+|---|---|---|
+| 正例误伤(共同子集 398 条) | **16/398 = 4.0%** | 11/398 = 2.8% |
+
+**所有者定稿 §六.5 的底线是「正例误伤率不高于旧链」—— 不达标。**
+
+原因在日志里看得见,**全是品牌翻拒**,而且多数是**通用词**被判成真品牌:
+
+`better` + `trio`(三腔皂液分配器)/ `smith`(胶水加速剂)/ `southern`(橱柜拉手)
+/ `serene`(水槽格栅)/ `Essex`(圣经索引标签)/ `velcro`(遮阳篷顶布)
+/ `milwaukee`(LED 工作灯)
+
+前五个是通用英文词,被 4.2 万条品牌词表收进来,LLM 判 `is_real_brand=true`,
+再由确定性后处理翻成 `Intellectual Property`。
+
+⚠ **`c.2026-09-03.4` 那批改动可能是助推**:L0 扫描收窄到**只扫标题**
+(品牌名住的地方),同时 S1 写了「品牌位上的词先按品牌看 —— 上游把它扫出来,
+正是因为它在品牌库里」。两件事叠加,通用词更容易被当成真品牌。
+(`v4首测` 100 条正例时误伤 3/100 与旧链持平,`路由后` 400 条正例时 4.0% >
+2.8%;样本不同不能直接比,但方向一致。)
+
+**⇒ 结论:先修品牌误伤,再路由。** 按所有者自己的纪律,底线不达标就先修判据。
+而且此刻往下走风险更大:把 40,825 个 `PT_WRONG` 放出来,而判据正在**过度**
+拒绝,等于让一批本来该放行的品换个地方再被拒一次。(⚠ 原文写的是"等于拿
+真金白银去试",**说重了**:路由本身不触发审核、不触发上架,一分钱不花;
+真要重审这 4 万条也是 $28 上下的闲时价。**要拦的是结论错,不是钱。**)
+两条修法(都不是特判):
+① **词表清理** —— 通用英文词本来就不该在品牌黑名单里(数据问题,治本);
+② **提示词收一点** —— 品牌位上若是常见英文词且没有型号 / 授权声明,仍判 false。
+
+### 13.7 底线达标,闸解除(2026-09-03,`c.2026-09-03.5`)
+
+§13.6 猜的两条修法(词表清理 / 提示词收紧)**都不是根因**。所有者点破的是
+第三件事:「**这样子的词在标题里应该可以看出来它到底是品牌还是不是品牌**」
+—— 命中的 `smith` 属于标题里的 **Bob Smith Industries**,那是**另一家公司**,
+只是名字里碰巧含这个词。黑名单收**单词**,标题里的品牌是**多词完整名**,
+我们把片段当品牌递给 L3,问的就是错问题。修法两处(详见
+`docs/audit_step3_spec.md` §8.9):L0 命中带回 ±40 字符标题上下文;S1 加
+「词 → 完整品牌名 → 是不是同一个牌子」这一问,排在原有两问之前。
+
+同 tag 重放实测:
+
+| | 新链 | 旧链 | |
+|---|---|---|---|
+| 正例误伤(共同子集 398) | **11/398 = 2.8%** | 11/398 = 2.8% | ✅ 达标 |
+
+`better` / `trio` / `smith` / `southern` / `serene` / `Essex` 六个通用词的翻拒
+**全部消失**;剩下 `milwaukee` / `velcro` 两条,都像真品牌。
+⚠ 代价记在 `docs/audit_step3_spec.md` §8.10:判据召回 16.5% → 15.4%,
+`B0FH2CYMGW`(儿童床架)从 reject 翻成 pass。
+
+**⇒ §13.6 的闸解除,存量路由按 §十二 裁决执行。** 顺序(前两步是 §13.5 那两个
+坑的前置,一步都不能少):
+
+```bash
+python cli.py db_init                     # 建 taxonomy_* 四列(缺了 route 会炸)
+python cli.py error_reclass -p force=1    # ⚠ force 必须给,否则又判 0 条
+python cli.py blacklist_route --dry-run   # 先看将删/将留,一行不动
+python cli.py blacklist_route             # 真删(自动落整行备份)
+python cli.py blacklist_push              # 删完飞书还是旧的,跑它才同步
+```
+
+### 13.8 ⚠ 第三个坑:`force` 模式死循环(2026-09-03,已修)
+
+所有者按 §13.7 的顺序跑 `error_reclass -p force=1`,进度打到
+**「报错记录回填进度 55,740,000」** 还没停 —— 而 `audit.walmart_error_records`
+一共只有 **97,002 行**。所有者一眼看出不对:「这是假的吧」。**是假的。**
+
+#### 机制
+
+候选谓词被当成了**分页手段**:
+
+```sql
+WHERE (true OR taxonomy_version IS DISTINCT FROM %(ver)s)   -- force 把它短路了
+  AND coalesce(raw_reason, '') <> ''
+ORDER BY id
+LIMIT %(chunk)s
+```
+
+`force=true` 短路掉唯一的排除条件 ⇒ `UPDATE` 盖了版本号也**排不出候选集**
+⇒ 每轮 `SELECT` 返回的都是**同一批**头 10,000 行 ⇒ 循环永不终止。
+`done` 只是「轮数 × 10,000」:55,740,000 ÷ 10,000 = **同一批行被判了 5,574 遍**。
+
+**比数字难看的是后果**:摘要与进度一直在报"在干活",而
+
+- 第 10,000 行之后的 **87,002 行报错记录一条都没碰**;
+- `_blacklist_pass` 排在 `_records_pass` 之后,**压根没轮到它** ⇒
+  73,918 行黑名单一条都没回填,`taxonomy_term` 仍是 NULL;
+- 若不是所有者 Ctrl-C,`blacklist_route` 会拿这批缺失信息**静默走错**。
+
+两张表的两个循环同款,`_blacklist_pass` 只是没机会暴露。
+
+#### 根因是把两件事当成了一件
+
+| 判据 | 干什么 | `force` 时 |
+|---|---|---|
+| `taxonomy_version IS DISTINCT FROM ver` | **断点续跑**(跑一半中断不重复劳动) | **有意关掉** |
+| 键集游标 `key > after` | **翻页** | **任何模式下都必须在** |
+
+模块文档里原来写的是「候选谓词……**天然分页**」—— 那句话正是这次的误解来源,
+已一并改掉。
+
+#### 修法
+
+两条 PICK 各加一句键集游标(`id::bigint` / `asin::text`,都是主键且已
+`ORDER BY`),两个 `while` 循环收敛成同一个 `_pages()` 生成器
+(双轨禁止:翻页只留一份)。守门测试三条:
+
+- `test_pages_每行只发一次且会终止` —— 并断言游标序列 `[None, 100, 200, 250]`
+  真的在推进(只断言"终止"不够:一个永远返回空的实现也能通过);
+- `test_pages_空跑只取一批_limit真截断`;
+- `test_两条PICK的SQL里都有键集游标` —— 光有 `_pages` 不够,SQL 少那一句
+  游标推进也没用;并禁止两个 pass 再自己写 `while`。
+
+⚠ **重跑前先看一眼**:上一轮 `force` 跑中断在第一批,所以 §13.7 那五步要
+**从 `error_reclass -p force=1` 重新来过**(它是幂等的,重跑不会重复劳动)。
+
+### 13.9 路由实跑完成(2026-09-04)与一个备份裂文件的坑
+
+`error_reclass -p force=1` 一次跑完:`walmart_error_records` **97,002** 条、
+`asin_blacklist` **73,918** 条,进度都停在表的行数上 —— §13.8 那个死循环确认修好。
+
+`blacklist_route` 实删 **42,113 条 / 留下 31,805 条**(预估 42,106 / 31,812,
+差 7 条);`blacklist_push` 随后整表重写飞书 **31,805 行**,与库对上。
+
+| 留下(按裁决) | 条数 | | 删掉 | 条数 |
+|---|---|---|---|---|
+| FLAGGED | 12,775 | | **PT_WRONG** | **40,827** |
+| (判不出,NULL) | 10,396 | | EXPIRED | 971 |
+| POLICY | 3,617 | | STAGE | 239 |
+| GATED | 2,008 | | PRICE / CONTENT / SYSTEM | 66 |
+| BRAND | 1,862 | | OTHER / SPECIAL / INFO | 10 |
+| IP | 781 | | | |
+| PROHIBITED_FINAL | 344 | | | |
+| RECALL | 22 | | | |
+
+**PT_WRONG 40,827 就是那批被误拉黑的**(沃尔玛原话是「把 product type 选对」),
+占删除量的 96.9%,与 §十二 裁决表的实测数(40,825)只差 2 条。
+
+#### ⚠ 坑:备份裂成了两个文件,而摘要只报最后一个
+
+42,113 条分 9 批、**1 秒多**跑完,而备份文件名的时间戳**戳到秒、且在 `_dump`
+里逐批算** —— 于是:
+
+```
+blacklist_route_20260904T042420Z.jsonl   前 30,000 条
+blacklist_route_20260904T042421Z.jsonl   后 12,113 条   ← 摘要只报了这个
+```
+
+真要回滚的人照摘要去找,会**少掉三万行而且不会发现**。删数万行不可逆,
+备份是唯一的网。
+
+**已修**:时间戳提到 `_backup_path()`,**整轮只算一次**,路径在批循环之外定死;
+`_dump` 只负责往这一个文件追加。守门测试 `test_一轮只落一个备份文件` 钉住三件事
+—— 路径在循环外算、`_dump` 里不许再有 `strftime`、追加模式。
+
+⚠ **这一轮的两个文件都要留着**:两份加起来才是完整的 42,113 行
+(`wc -l` 两个文件应当合计 42,113)。
+
+## 十四、旧码退役与口径统一(2026-09-04 所有者定稿)
+
+> 「删除旧码,我们已经迁移到新码,旧码不需要留。把口径做统一」
+
+### 14.1 查出来的问题:**「哪些事件该进黑名单」分了两条岔路**
+
+归类**入口**本身是干净的 —— 全仓 7 处调用全部走
+`error_taxonomy.classify_reasons`,没有第二套实现。问题出在下游:
+
+| 路径 | 实际用的码集 | 后果(**都静默**) |
+|---|---|---|
+| `blacklist_push -p backfill=1 -p apply=1` | `backfill_codes()` = 新七码 **∪ 旧 {B,C,E,F,G,K}** | 旧事件写的是 `B` ⇒ 把 `blacklist_route` 刚删的 **~41,600 条灌回来**,摘要显示「历史回填 +41,600」看着像正常干活 |
+| `blacklist_push -p rebuild_asin=1 -p apply=1` | `sorted(PERMANENT)` = **只有新七码** | 历史事件绝大多数是旧码,擦净重灌 **七万变几十**,同样不报错 |
+
+⚠ 第二条正是 §13.x 提交信息里亲口写下要防的事 ——「不加过渡桥
+`rebuild_asin_blacklist` 会把七万行清成几十行,而且不报错」—— 然后**只修了
+`backfill_from_events`,漏掉了 `rebuild_asin_blacklist`**。守门测试也只钉了
+`backfill_codes()` 的**内容**,没钉**哪条路径在用它**,漏改从测试底下溜过去了。
+
+⚠ 调度里那条**是安全的**:`job("blacklist", ["risk_sync", "blacklist_push"],
+hour=15)` 不带参数,只做 PG → 飞书整表投影,不回灌。所以不是每天自动出事,
+是**等着被手动踩**。
+
+### 14.2 根子:过渡桥本身就是错的
+
+`_LEGACY_PERMANENT` 把旧码 `B → POLICY`(永久)。但换轨的全部意义就是 ——
+**`B` 是个混装桶**:生产实测 40,827 条 `PT_WRONG`(沃尔玛原话「要重新上架请把
+product type 选对」,修法不是禁令)混在里面,只有 3,512 条是真 `POLICY`。
+**把整个 `B` 当永久,正是旧引擎犯的那个错。** 补桥不是修,是把旧引擎的错误
+重新接回来。
+
+### 14.3 改法:回填/重建**不信任事件里那个码**,拿原文重判
+
+`_LATEST_CTE` 本来就把 `detail->>'reason'` 取出来了,原文就在手边。
+新增 `_judge_events(conn)`:取最新事件 → `classify_reasons` → `is_permanent`
+定去留。三条路径(实时 `problem_scan` / 存量 `error_reclass` / 回填重建)
+从此**同一个引擎**,双轨消灭,两个方向的雷一起解掉。
+
+- 预览(`backfill_counts`)与真写走**同一条判据** —— 两处各算各的 = 预览说
+  3 万、真写写 7 万,而两边看着都正常;
+- `rebuild_asin_blacklist` **先判再擦**:判炸了不能留下一张空表;
+- 代价:一条集合 INSERT 变成「取行 → 判 → 批量写」。回填是一次性动作不是
+  热路径(`error_reclass` 判 97,002 行只用了几秒)。
+
+### 14.4 删掉的东西
+
+| 删除 | 为什么能删 |
+|---|---|
+| `_LEGACY_PERMANENT` / `_LEGACY_BRAND_CATEGORIES` | 过渡桥,见 14.2 |
+| `backfill_codes()` / `brand_backfill_codes()` | 双词汇表,只服务过渡桥 |
+| `_label_case()` / `_BACKFILL_ASIN_SQL` | 那份 CASE 是来源标签的第二处出生地;现在只有 `source_label()` |
+| `problem_products.categorize()` | 旧 A-L 归类引擎。唯一调用者是 `error_reclass_report` 的迁移矩阵面 |
+| `error_reclass_report` 的「旧码 → 新码迁移矩阵」面 | 使命是「所有者过完这份账才换轨」(README),**换轨已完成** |
+| `test_old_engine_snapshot` 等 3 条 + `test_categorize_rules_and_priority` | 给不存在的函数留测试是自欺 |
+
+**保留 `problem_products._RULES`**:它现在只是一张「旧码 → 中文名」的查表,
+给**读历史数据**的两处用(`cleanup_history` 认旧库的类别值、
+`error_reclass_report` 把黑名单表里入选那一刻的旧码显示成人话)。
+**读历史 ≠ 判据路径。**
+
+⚠ **语料一条没动**:`reason_corpus.jsonl` 仍是 77 行,新引擎的逐行断言
+(`test_reason_corpus_row`)照旧 —— 判据的守门从两处收敛成一处,正是要的。
+
+### 14.5 ⚠ 数据库里的旧码列:**保留,不删**
+
+`catalog.asin_blacklist.category` 与 `audit.walmart_error_records.error_code`
+存的仍是入选/报错那一刻的旧码。**不动它们**,两条理由:
+
+1. `conventions` §五:**DROP 未连库核对一律不执行**;
+2. `asin_blacklist.category` 现在还是**飞书「来源」列的数据源**
+   (`source_label` 经 `_NAMES` 映射回旧中文标签,运营按那几个词筛表)。
+
+判据面已经没有任何东西读它们 —— 它们是**无人读取的历史列**,而不是活的判据。
+真要清理得先连库核对影响面,那是另一次动作。
+
+### 14.6 上架拦截行为**一个字没变**
+
+`load_banned_asins` 返回 `{asin: (category, source)}`,而 `list_new` 的拦截判据
+是**「这个 asin 在不在表里」**,`category` 只进提示文字
+(`f"ASIN黑名单:{bl[1]}({bl[0]}类)"`)。删旧码不动拦截行为。
+
+### 14.7 首次验收:26,018 / 229,953,以及预览缺陷
+
+`blacklist_push -p backfill=1` 实跑:
+
+```
+事件时间线共 229,953 个 ASIN,按最新事件原文重判后够格永久拉黑 26,018 个(11.3%)
+```
+
+**重判确实生效了** —— 换成旧口径(认新旧两套码)时,旧码 `B` 一档就会把
+绝大多数拉进来;现在 88.7% 被判出去,主体正是 `PT_WRONG`。
+
+#### ⚠ 但 26,018 **不能**直接跟库里的 31,805 比
+
+两个数的**来源不同**,不是一回事:
+
+| | 数据源 | 判据 |
+|---|---|---|
+| 库里 **31,805** | `asin_blacklist` 现存行 | `error_reclass` 用**四级优先原文**(records 全文 → events → items → 本表 200 字符样本)判的 `taxonomy_code` |
+| 预览 **26,018** | `product_events` 的**最新** `problem_categorized` 事件 | 事件里那条 `reason` |
+
+差异来自三处:① 事件时间线只覆盖走过归类事件的 ASIN,黑名单表里还有
+`asin_blacklist_import` 的 `LEGACY` 历史继承行等别的来源;② **原文来源不同** ——
+`error_reclass` 有 36,868 条只拿到本表的 **200 字符样本**(判据串常被切在句尾,
+`PT_WRONG` 因此是**下限**),而事件里的 `reason` 可能是完整的;③ 时间线取
+**最新**事件,黑名单行记的是**入选那一刻**。
+
+#### 预览缺陷:报的不是真跑会发生的事(已修)
+
+原文案说「永久禁止 26,018 个(**将入** ASIN 黑名单)」。但 INSERT 是
+`ON CONFLICT (asin) DO NOTHING` —— 已经在表里的一条都不动。所以真跑
+**只会新增「26,018 − 已在表里的」**,可能只有几百条。
+
+更要命的是反过来:**新增里若混着 `blacklist_route` 刚删掉的品,预览完全看不出来**
+—— 而那正是最该被拦下的情况。
+
+**已改**:预览现在报三件事 ——
+
+```
+事件时间线共 N 个 ASIN,按**最新事件原文重判**后够格永久拉黑 M 个
+  表里现有 K 行 ⇒ **真跑只会新增 F 条**(ON CONFLICT DO NOTHING;**回填只加不减**)
+  将新增,按新码:POLICY×… IP×… BRAND×…
+  ⚠ 新增里若出现 blacklist_route 刚删过的品,说明**两个判据源给出的原文不一样**
+    —— 那不是回填的错,是原文来源要统一,别急着 apply
+```
+
+守门测试钉住「够格 ≠ 新增」:三条事件里两条够格、其中一条已在表里 ⇒
+预览必须报「够格 2 个 / 真跑只会新增 1 条」。
+
+#### ⚠ 留给下一步的口径问题(判据已统一,**原文来源还没有**)
+
+判据现在只有一条(`classify_reasons` + `is_permanent`)✓。但**同一个 ASIN 在
+不同路径上拿到的原文可能不同**,于是判出不同的码:
+
+- `error_reclass` 走四级优先,最大一档(36,868 条)是**截断到 200 字符的样本**;
+- `_judge_events` 走事件里的 `reason`;
+- 实时 `problem_scan` 走当轮 `unpublished_reasons`。
+
+**"口径统一"到这里只做完了一半:判据统一了,原文来源没有。**
+⚠ **这句话说轻了,已在 §14.9 更正**:实测之后发现它不是「留给下一步的
+改进」,而是我这次改动引入路径里的**直接缺陷** —— `_judge_events` 只用
+事件 reason(残缺源),会把 3,037 个被正确释放的品加回来。已修。
+
+### 14.8 200 字符截断:考古结论是**没有理由**(2026-09-04 所有者问)
+
+> 「为什么要截断字符样本?」
+
+查遍全仓,**找不到任何依据**。而这个仓库对每个决定都写出处(隔壁 `biz_cn`
+那一行都注明了 `legacy_survey:2077 要求单列`)。
+
+**最合理的解释**:`catalog.asin_blacklist.reason` 这一列当初的用途是
+「人看一眼知道为什么被拉黑」—— 对**显示**来说 200 字符足够。**那时它不是判据。**
+
+它变成问题,是因为换轨之后 `error_reclass` 的四级优先把它当成了证据源,
+而且是**最大的一档**(36,868 条只找得到它)。而沃尔玛的判据串恰好在**句尾**:
+
+> "…violating Prohibited Product Policy. **To republish this item please make
+> sure you have the appropriate product type selected.**"
+
+200 字符**精确地砍掉它** ⇒ 那批品被判成 `POLICY`(永久拉黑),而真相是
+`PT_WRONG`(修法不是禁令)。**所以 40,827 这个数是低估的。**
+
+#### 不该留,依据两条
+
+| | |
+|---|---|
+| 列类型 | `text`,**无长度限制** |
+| 飞书那侧 | **已经有自己的截断**:`api/feishu._scrub` 20,000 字符脏数据闸 + `_check_shape` 40,000 硬闸(官方上限 50,000) |
+
+跟 200 差**两个数量级**。**截断属于展示层,不属于存储层** —— 存储侧截了,
+展示侧那道就白设了,而判据侧永久失去证据。
+
+**已改**:三处写入侧(`record_asins` / `_judge_events` / `cleanup_history`)
+一律存全文;`schema.sql` 的列注释同步;守门测试钉住写入函数体里不许再出现
+`[:200]`,并要求头注保留这段考古(不然下一个人又会"顺手截一下")。
+
+⚠ **存量救不回来** —— 已经截掉的字没了。要恢复只能从
+`audit.walmart_error_records.raw_reason`(那张表存的是全文)重新取,
+那正是 §14.7 说的「原文来源统一」。这一条现在有了更硬的理由:
+**不是"三条路取的原文不一样"这么中性,而是其中一条路取的是被砍掉判据串的残文。**
+
+### 14.9 ⚠ 判据统一 ≠ 口径统一:**数据源决定判定结果**(2026-09-04 实测)
+
+所有者按预览的提示实查,结果**推翻了我的推断**:
+
+```
+将新增 4,182 条,其中**刚被路由删过的 3,037 条**(72.6%)
+  冲突按新码: POLICY 2676 / FLAGGED 313 / GATED 32 / IP 8 / BRAND 5 / PROHIBITED_FINAL 3
+```
+
+逐条原文对照(⚠ 我给的对照脚本打印的「路由判的原文」其实是
+`asin_blacklist.reason` 那份**残文**,不是 `error_reclass` 判定时真正用的原文
+—— `taxonomy_src=items` 才是真相。**脚本本身有误导**,别照抄):
+
+| 源 | 原文 | 判 |
+|---|---|---|
+| `walmart_items` 全文 | 「…violating Walmart's Marketplace \*Prohibited Product Policy\*.  **To republish this item please make sure you have the appropriate product type selected for this item.**」 | **`PT_WRONG`** |
+| `product_events` 的 reason | 「…violating Walmart's Marketplace `\|\|`Prohibited Product Policy`@@@`https://…」(**句尾那句不在**) | **`POLICY`** |
+
+离线实测两段文本确认:**同一个引擎、同样的参数,判出相反的码** ——
+差别只在原文。(顺带排除了参数因素:传不传 `policy_names` 不影响主码。)
+
+#### 这不是「留给下一步」,是我这次改动的直接缺陷
+
+`_judge_events` 把集合 SQL 改成 Python 判时,**沿用了同一个数据源(事件 reason),
+没把 `error_reclass` 那套四级优先带过来**。§14.7 把它写成「口径问题,记在这里」
+——**说轻了**:它让 `backfill` 这条路有毒,3,037 条(新增的 72.6%)是被正确释放、
+又要被错误加回来的品,而**两边摘要都显示正常**。
+
+#### 已修:取原文提到 `services/error_source`
+
+取原文与归类(`services/error_taxonomy`)一样,**只准有一处实现**:
+
+- 新模块 `services/error_source`:三条外源 SQL + `fetch()` + `pick()`
+  (四级优先 `records` → `events` → `items` → 调用方手上那份 → `none`);
+- `workflows/error_reclass` 的 `pick_source` / `_sources` 变成转调(自己那份删掉);
+- `services/blacklist._judge_events` 改走它 —— 事件 reason 现在只是「events」
+  那一级,`records` 全文压过它。
+
+守门测试三条:两个消费方都必须转调、SQL 只在 services 里出生、优先序四档逐个钉;
+另加一条**把生产实测的那两段原文钉成回归用例** —— 它们是这个模块存在的全部理由,
+以后谁把取原文那一步简化掉,那条会红。
+
+⚠ 修完之后 `backfill` 的「新增」会变 —— **重跑预览再看冲突数**,那才是能不能
+`apply` 的闸门。
+
+### 14.10 现状实测与「以新规则统一」(2026-09-04 所有者裁决)
+
+#### 黑名单 32,716 行的真实构成
+
+| 原文来源 | 行数 | 说明 |
+|---|---|---|
+| `self` | **14,475** | 拿 **200 字符残文**判的(§14.8)—— 判据可疑 |
+| `none` | 10,396 | **全是 `LEGACY`**,判不出留 NULL |
+| `records` | 2,976 | 全文 ✓ |
+| `events` | 2,214 | ✓ |
+| `items` | 1,744 | ✓ |
+| `(没复核过)` | 911 | 换轨后 `problem_scan` 新入的,没走过 `error_reclass` |
+
+⚠ **能从 `walmart_error_records` 拿到全文重判的只有 3,002 行** —— 那 14,475 条
+残文判的品,绝大多数**救不回来**。
+
+所以「现在的黑名单 ASIN 全部都是按新标准入库的吗」的诚实答案是**不是**:
+绝大多数是**旧标准入库 + 新标准复核**,而复核的可信度受制于原文残缺;
+只有换轨后新入的那批是真正新标准入的;还有一批 `LEGACY` 是无判据继承。
+
+#### 裁决:`category` 统一到新码
+
+> 「历史继承保留原样没有问题,但是旧 A–L 码入选然后按新码复核过,那么现在库里
+> 保留的应该就只有新码,没有旧码残留了吧,**不要做双轨,没有意义,以新规则统一**」
+
+原来 `category` 存旧码、`taxonomy_code` 存新码 —— **那就是双轨**。
+(此前特意没动它:`error_reclass` 头注写着「一个字不动……要不要让它改变拦截行为
+是所有者的另一次裁决」。**现在裁决了。**)
+
+**已改**:`error_reclass` 复核出结论就把 `category` 同步改写成新码,
+`source` 标签跟着走。两条不动 —— `LEGACY`(所有者:保留原样)与判不出的
+(`code` 为 NULL,没结论就没有可写的东西)。
+
+⚠ **拦截行为一个字没变**:上架闸拦的是「这个 asin 在不在表里」,`category`
+只进提示文字;**飞书「来源」列的文字也不变**(`source_label` 经 `_NAMES` 把新码
+映射回旧中文标签,实测 `POLICY → 沃尔玛-禁售`)。
+
+#### 冲突 3,037 → 2,261,而 **97% 出在同一处**
+
+```
+按路由当时的原文来源:items 2,194 / events 64 / self 3
+```
+
+根因:同一个 ASIN 在多店有**多个 sku**。`_judge_events` 拿的是
+`product_events.sku`,`error_reclass` 拿的是 `asin_blacklist.src_sku`,两个对不上
+⇒ `items` 那一级查不中 ⇒ 退回残缺的事件 reason ⇒ 判成 `POLICY` 而不是 `PT_WRONG`。
+
+**已改**:`error_source.fetch(..., items_by_asin=True)` —— 扫一遍有下架原因的行,
+按 `sku_asin` 规则折成 asin 再索引一份。⚠ 开关**显式**:它是一次全表扫,
+分批调用且有精确 `src_sku` 的 `error_reclass` 不该付这个代价;
+且**不覆盖**按 sku 命中的那份(调用方给的 sku 更精确)。
+
+#### 「全部按新标准」还差什么
+
+1. **三条入库路径同源** —— `problem_scan` 取原文用的仍是当轮
+   `unpublished_reasons`,**还没走 `error_source`**(第三条岔路);
+2. **每一行都有全文判据** —— `self`(14,475)与 `none`(10,396)都不算,
+   而全文只够得着 3,002 行;
+3. **`LEGACY` 那批**要么补判据、要么承认是无判据继承(所有者已定:**保留原样**)。
+
+第 3 条已定。第 1 条与本次改动是同一件事,**建议本 PR 内做完**;第 2 条受制于
+原文本身没了,留待下个 PR 评估(可能要从沃尔玛侧重新拉报错)。
+
+### 14.11 两个自造的 bug:索引加了查法没改,以及「有 sku ≠ sku 还查得到」
+
+`items_by_asin` 上线后冲突**纹丝不动**(2,261 → 2,263,`items` 那一档
+2,194 → 2,196)。查下来是我连着犯了两个错。
+
+#### bug ①:`fetch` 按 asin 补了索引,`pick` 却只按 sku 查
+
+```python
+if src_sku:
+    text = items.get(src_sku)      # ← 只有这一句
+    if text:
+        return text, "items"
+```
+
+补进 `items` 的 asin 键**永远不会被查到**。索引加了、查法没改 —— 改动看着生效
+(日志、测试、摘要全正常),而实际一条都没多命中。
+
+**已改**:sku 更精确排前面,**sku 失效或对不上时按 asin 兜底**;守门测试把四种
+情形逐个钉(sku 命中 / sku 查不中退 asin / 手上没 sku 也试 asin / 两个都没有
+才轮到残文)。
+
+#### bug ②:「`error_reclass` 有精确的 `src_sku` 就不需要按 asin 兜底」——错的
+
+我据此**只给 `_judge_events` 开了 `items_by_asin`**。而实测那 **14,475 条 `self`**
+(拿 200 字符残文判的)**是有 `src_sku` 的** —— 只是那个 sku 在 `walmart_items`
+里已经不在了(下架即删除),于是 items 那一级查不中、退回残文。
+
+**有 sku ≠ 那个 sku 还查得到。**
+
+**已改**:`error_reclass._blacklist_pass` 也用 `items_by_asin_map()`,
+且**在批循环外查一次**跨批复用(全表扫,每批扫一遍太贵)。按 asin 那一份拆成
+独立函数正是为此。
+
+#### 本轮其余读数
+
+**`category` 统一已生效** —— 「入选旧码 → 新码」表左侧开始出现新码
+(`552 PROHIBITED_FINAL → PROHIBITED_FINAL` / `215 BRAND → BRAND` /
+`96 POLICY → POLICY`,合计约 900),正是那 911 条换轨后新入的;
+旧 A-L 码那批这一轮才第一次被改写。
+
+原文来源分布变化(+911 全部落在有全文的三档,`self` / `none` 一条没减):
+
+| | 上轮 | 本轮 |
+|---|---|---|
+| `records` | 2,976 | 3,002 |
+| `items` | 1,744 | 2,466 |
+| `events` | 2,214 | 2,377 |
+| `self`(残文) | 14,475 | **14,475** |
+| `none` | 10,396 | 10,396 |
+
+`self` 一条没减,正是 bug ② 的直接证据 —— 修完这一轮才会动。
+
+### 14.12 收口:统一做到了哪一步,以及救不回来的那 14,474 条
+
+#### ✓ `category` 里的旧码清干净了
+
+```
+12,778 FLAGGED → FLAGGED    3,707 POLICY → POLICY    2,076 BRAND → BRAND
+ 2,006 GATED   → GATED        895 PROHIBITED_FINAL     777 IP → IP
+   302 LEGACY  → PT_WRONG（LEGACY 按裁决保留原样,只写 taxonomy_code）
+```
+
+左侧**全是新码**。旧 A-L 码在判据面与主列上都不再存在。
+
+#### items 按 asin 兜底:`none` 少了 376,`self` 只少了 1
+
+| | 上轮 | 本轮 |
+|---|---|---|
+| `items` | 2,466 | **2,843**(+377) |
+| `none`(四处无原文) | 10,396 | **10,020**(−376) |
+| `self`(200 字符残文) | 14,475 | **14,474**(−1) |
+
+`none` 的下降说明按 asin 兜底**确实生效**。而 `self` 纹丝不动的含义是:
+**那 14,474 条的 ASIN 在 `walmart_items` 里已经没有任何带下架原因的行了**
+(`items_by_asin` 一共才索引到 35,724 条)—— 品早就下架删除,只剩黑名单表自己
+那份截断残文。
+
+**这批救不回来**,与 §14.8 的结论一致:截掉的字没了,而外源也没有了。
+它们是**历史损伤**,不是当前口径问题 —— 现在起写入的是全文,新账不会再欠。
+
+#### 报告两段话在统一之后变得自相矛盾(已修)
+
+1. **「入选旧码 → 新码」矩阵**大部分成了对角线(`FLAGGED → FLAGGED`),
+   信息量归零,还让人以为"还在迁移中"。改成**只报真的换了码的**,其余给总数;
+   全对角线时直说「入选码全部没变 —— 已统一到新码」。
+2. **「依据站不住 2,389 条」**里 2,006 条是 `GATED` —— 而 `GATED` 在所有者裁决的
+   七个永久码里,**它是留下的**。「站不住」用的是 `NOT_A_PRODUCT_BAN`
+   (病根是不是产品本身违禁),**与去留正交**,两张表都含 `GATED`:
+   品类准入拿不到,产品本身不违禁(所以站不住),但我们照样卖不了(所以继续禁)。
+   改成按**会不会被 `blacklist_route` 删**分两栏,那才是人要的答案。
+
+#### 仍未统一的最后一处:`backfill` 的数据源
+
+`blacklist_push -p backfill=1` 的冲突停在 **~2,263 条**,再修 `items` 也没动。
+根因不是判据,是**数据源天生更弱**:它从 `product_events` 时间线重建,而
+`asin_blacklist` 那边有四级优先 + 精确 `src_sku`,拿得到的原文更全。
+
+⚠ 结论:**`backfill` 是低质量的第二判据源**。它是一次性手动动作,调度不带参数、
+不会自动跑 —— **不跑它就没有风险**。真要用,应当改成读 `asin_blacklist` 已判好的
+`taxonomy_code`,而不是从事件重判。列为下个 PR 的候选,不在本次范围。
+
+#### 「全部按新标准入库」的现状
+
+| 条件 | 状态 |
+|---|---|
+| 判据只有一条(`classify_reasons` + `is_permanent`) | ✅ |
+| 原文来源只有一条(`error_source` 四级优先) | ✅ 两条路已同源;`problem_scan` 仍走当轮 `unpublished_reasons`(第三条) |
+| `category` 只有新码 | ✅ |
+| 每一行都有全文判据 | ❌ `self` 14,474 + `none` 10,020 = 24,494 条够不着全文,**救不回来** |
+| `LEGACY` 保留原样 | ✅ 所有者裁决 |
+
+## 十五、简化:回到所有者说的那个模型(2026-09-04)
+
+> 「对于报错产品的处理逻辑你是不是做复杂了。
+>  1.拿到报错产品,报错产品有详细报错原因。
+>  2.按报错原因归类,一个产品的报错可能存在多次,**其中被拉黑的那个作为最高
+>    优先级**,其他的都是作为记录。
+>  3.我们已经按新规则对报错分类,那么该拉黑的拉黑即可。**以前的拿不到后台的
+>    报错具体信息,就不用救了**。
+>  4.product_events 是跟着来源码走的……**如果只跟着 sku 走,sku 又是由我们系统
+>    生成的,后面会追不到问题产品的来源码(asin)**」
+
+确实做复杂了,而且**第 2 点是判据错了,不是复杂度问题**。
+
+### 15.1 判据推翻:「最新一条」→「够格拉黑的那条」
+
+此前全仓一律 `DISTINCT ON (asin) … ORDER BY occurred_at DESC` **只看最新一条**,
+依据是那条旧裁决:
+
+> 「入选按**最新**类别 …… 历史里类别翻动频繁,『曾命中过』作数会把短暂误判的
+> 商品永久拉黑」
+
+**所有者 2026-09-04 推翻了它。** 旧口径的后果:一个品上个月被判 `POLICY`
+(该永久拉黑)、这个月的记录是 `EXPIRED`(过期),就**把历史上那条禁令忘了**
+—— 与黑名单「一次入选、永久禁止」的语义正好相反。
+
+**已改**:`_HISTORY_SQL` 按 asin 分组取**全部**历史报错原文(`array_agg(DISTINCT …)`
+去掉每天同步造成的重复),新增纯函数 `worst_verdict(texts)` ——
+**只要有一条够格永久拉黑就以它为准**,一条都不够格才算它不该拉黑。
+⚠ `_LATEST_CTE` 保留但**只给品牌渠道用**(`brand_err_hits` 的语义确实是
+「当前这个品牌还在不在问题里」),两者别混。
+
+### 15.2 又两个更根本的 bug(都是这次才查出来的)
+
+#### ① 键名读写不一致 ⇒ `events` 那一级大面积空转
+
+| | 键名 |
+|---|---|
+| **写**(`problem_scan:343`、`cleanup_history:81`) | `detail->>'reason'`(**单数**) |
+| **读**(`error_source:43,46`、`error_reclass_report:50,52`) | `detail->>'reasons'`(**复数**) |
+
+**已改**:读方一律 `coalesce(detail->>'reason', detail->>'reasons')`,两个都认
+(库里历史上两种都有)。
+
+#### ② 事件账本里的原文**天生就是残文**
+
+```python
+"reason": (it["reasons"] or "")[:200]      # problem_scan.py:343
+```
+
+**又一处 200 截断,而且这一处在产品历史账本里。** 这才是「事件 reason 判
+`POLICY`、`walmart_items` 全文判 `PT_WRONG`」的真正原因 —— 不是 `||`/`@@@`
+格式问题,**就是被砍了**。而所有者刚定「以产品历史为准」,那本账正是残的。
+
+**已改**:`problem_scan` 写事件存全文(与 §14.8 同一条纪律:截断属于展示层,
+不属于账本)。⚠ **存量事件救不回来**,与 §14.8 一致 —— 所有者已定「不用救」。
+
+### 15.3 身份是 asin,不是 sku
+
+所有者第 4 点:「如果只跟着 sku 走,sku 又是由我们系统生成的,后面会追不到
+问题产品的来源码」。`_HISTORY_SQL` 按 `coalesce(asin, sku)` 分组,sku 只是
+**提不出 asin 时的兜底键**,不是身份。
+
+### 15.4 「不用救」省掉了什么
+
+所有者第 3 点直接了结了我纠结几轮的事:那 `self` 14,474 + `none` 10,020 =
+**24,494 条够不着全文的,不救**。相应地:
+
+- 不必再为它们扩四级优先的覆盖面(`items_by_asin` 保留,但只服务 `error_reclass`
+  的存量复核,不再是"救残文"的补丁);
+- `backfill` 那 ~2,263 条冲突的根因随 15.1 + 15.2 一起消失:两边现在同判据
+  (够格拉黑优先)、同身份(asin)、同全文(新写入不再截断)。
+
+⚠ **重跑才知道实际影响**:15.1 会让拉黑量**上升**(历史上被拒过的品不再被
+「最新是过期」洗掉),而 15.2① 会让 `events` 那一级第一次真的命中。
+两者方向相反,净效果要看数据。
+
+### 15.5 实测 +995,以及它暴露的一个推论:`blacklist_route` 的判据没跟上
+
+改判据后重跑:
+
+| | 上一轮 | 本轮 |
+|---|---|---|
+| 该永久拉黑 | 25,435 | **26,430**(+995) |
+| 真跑会新增 | 3,457 | **4,465**(+1,008) |
+
+上升正是「够格拉黑的那条优先」的效果 —— 历史上被拒过、而最新记录是「过期」的品
+不再被洗掉。方向对。
+(键名修复对本轮增量有限:`_judge_events` 已改成直接读产品历史并 `coalesce`
+两个键;而**存全文**只对新写入生效,存量事件仍是残的。)
+
+#### ⚠ 推论:黑名单现在有**两层判定**,而它们的权威性不同
+
+| | 是什么 | 判据 |
+|---|---|---|
+| **产品级判定** | 这个 asin **该不该拉黑** | 该 asin 的**全部历史**,`worst_verdict`(够格拉黑的优先) |
+| **行级记录** | `asin_blacklist.taxonomy_code`:**这一行入选时那条原文**归成什么 | `error_reclass` 的四级优先取**一条**原文,判**一次** |
+
+所有者 2026-09-04 的原话把权威性说死了:
+「**其中被拉黑的那个作为最高优先级,其他的都是作为记录**」——
+**产品级是判定,行级是记录**。
+
+⚠ 而 **`blacklist_route` 删行用的是行级码**(`taxonomy_code` 不在
+`PERMANENT_CODES` 就删)。按新判据,它应当问的是「这个 asin 的**全部历史**里
+有没有够格拉黑的那条」。**判据没跟上。**
+
+后果:一个品的行级记录是 `PT_WRONG`(那一行入选时那条原文确实是"选错 product
+type"),但它历史上另有一条真禁售 —— **路由会把它删掉,而产品级判定说该留**。
+这正好解释了「新增里出现路由刚删过的品」那一批:**不是原文不一样,是取法不一样**
+(我之前把它归因成"原文来源要统一",说窄了)。
+
+⚠ **已跑过的那次路由(删 42,113 条)就是按行级码做的。** 要不要按产品级重判一遍
+是所有者的裁决 —— 数据还在(备份 jsonl + `product_events` 全部历史),重判得出来。
+本次先把摘要里那句过时的归因改掉,并点明「产品级是判定、行级是记录」,
+以及 `blacklist_route` 判据没跟上,别拿回填的新增去对路由的结果。
+
+## 十六、产品事件才是产品级记录(所有者 2026-09-04)
+
+> 「这只是一个简单的,错误码归类怎么做的这么复杂了。**产品级的记录已经有产品
+>  事件在做了。我们改了新归类,产品事件跟随更新了吗?**」
+
+**答案:没有。** 换轨(2026-09-03)只改了写入侧 —— `problem_scan` 从此写新码,
+而**历史事件的 `detail.category` 还是旧 A-L 码**,全仓没有任何改它的代码
+(§十四写的「事件里那个码从此没人读」是**回避**,不是解决)。
+
+### 16.1 复杂是从哪来的
+
+因为账本里是旧码,所以每个读它的地方都在**读的时候重判原文**来绕开:
+四级优先取原文 → 归类 → `is_permanent`。于是同一件事在三处各判一遍,
+而三处拿到的原文还不一样(§14.9 / §15.2),判出相反的码。
+
+**正确的做法是让账本本身是对的**:判定只在 `problem_scan` 写事件那一刻发生
+**一次**,其余全是查询。
+
+### 16.2 改法
+
+**① 回填事件码**(`error_reclass -p scope=events`,新增第三个 pass):
+拿事件里的原文重判一次,写回 `detail.category` / `name` / `taxonomy_term`,
+并盖 `taxonomy_version`(断点续跑靠它)。⚠ `taxonomy_term` 必须存 ——
+`OTHER` 是混装桶,没有词条判不了 `is_permanent`。
+
+**② 下游只读码,不再重判**:
+- `blacklist._HISTORY_SQL` 从 `array_agg(原文)` 换成
+  `array_agg(DISTINCT ARRAY[category, taxonomy_term])`;
+- `worst_verdict(codes)` 从「逐条重判原文」变成「逐个看码」——
+  **够格拉黑的那条最高优先级**,这条规则不变,变的是不必再跑归类引擎;
+- `_judge_events` 头注写死「**不做判定,只做查询**」。
+
+### 16.3 这样简化掉了什么
+
+| 原来 | 现在 |
+|---|---|
+| 三处各自取原文、各自归类 | 判定一次(写事件时),其余读码 |
+| 四级优先要覆盖所有消费方 | 只服务 `error_reclass` 的**行级**复核 |
+| 原文来源不一致 ⇒ 判出相反的码 | 码只有一份,在账本里 |
+| `blacklist_route` 要另算一遍产品级 | 读同一份 `_judge_events` |
+
+⚠ **仍然要跑一次回填**:历史事件的码还是旧的,不回填的话下游读到的仍是
+旧 A-L 码(`is_permanent("B")` 恒为 False ⇒ 一个都不拉黑)。
+
+```bash
+python cli.py error_reclass -p scope=events -p force=1 --dry-run   # 先看形态
+python cli.py error_reclass -p scope=events -p force=1             # 真跑
+python cli.py blacklist_push -p backfill=1                          # 再看预览
+```
+
+⚠ 事件里的原文是**残文**(§15.2②:`problem_scan` 写事件时截了 200 字符,
+现已改成存全文)。我当时把这句写成「所以回填出来的码对存量事件是**下限**」——
+**这句话是错的,而且错得很危险**:下限的意思是"判得糙一点",而实际发生的是
+**回填把已经判对的行改错了**。详见 §十七。
+
+
+---
+
+## 十七、⚠ 事故:回填把判对的行改错了(2026-09-04,已修)
+
+所有者跑完 §十六的事件回填后问「你看一下有没有问题」。有问题,**而且是这次
+改动造成的**。摘要里那一行:
+
+```
+2,595  PT_WRONG → POLICY
+```
+
+**左边已经是新码了。** 这 2,595 条不是"历史遗留的旧 A-L 码终于换成新码",
+而是换轨(2026-09-03)之后由 `problem_scan` 写的、**当初就判对了**的行 ——
+`PT_WRONG` 是"类目选错",可放;`POLICY` 是"违反禁售政策",永久禁。
+回填把它们从"该放"改成了"该永久拉黑"。
+
+### 17.1 病根:判用全文、存留残文
+
+`problem_scan` 到 2026-09-04 为止是这么写的:
+
+```python
+res = error_taxonomy.classify_reasons(         # 判:吃 walmart_items 的**全文**
+    error_taxonomy.split_reasons(it["reasons"]))
+...
+"detail": {"category": it["category"], "name": it["cat_name"],
+           "reason": (it["reasons"] or "")[:200]}}   # 存:**只留 200 字符**
+```
+
+于是事件行里 `category` 是全文判的(对),`reason` 是残文(判据串常在句尾,
+被切掉)。我的回填第一版**只拿事件自己的 `reason` 重判**,当然判成 `POLICY`。
+
+同一段生产原文,两种判法(已钉成回归用例
+`test_restore只接回被截掉的那段_不换成别的文本`):
+
+| 文本 | 码 | `is_permanent` |
+|---|---|---|
+| 全文(句尾有 `To republish this item … product type …`)| `PT_WRONG` | False(可放) |
+| `[:200]` 残文(句尾那句被切掉)| `POLICY` | **True(永久禁)** |
+
+### 17.2 我写的那句话本身也是错的
+
+§16.3 结尾我写「回填出来的码对存量事件是**下限**」。**下限 = 判得糙一点**,
+而真实行为是**覆盖更可信的结论**。同一次改动里,`_events_pass` 既能把旧
+A-L 码升级成新码(好),也能把全文判出的新码降级成残文判的新码(坏)——
+我只描述了前一半。**回填的风险从来不是判得糙,是把判对的行改错。**
+
+### 17.3 改法:一道棘轮 + 只接回被切掉的那段
+
+**① `services/error_source.restore(own, candidates)`** —— 与 `pick` 并列的
+第二个取用口,按「调用方有没有自己那一刻的原文」分工:
+
+- `pick`:黑名单行**没有**自己的原文(`reason` 只是入选时抄的样本,行本身
+  代表"这个 asin 被禁")⇒ 四级优先,拿这个 asin 最新的全文判是对的;
+- `restore`:产品事件**有**自己的原文(时间线上的一格)⇒ 这时"换一份更好的
+  原文"是错的,唯一该做的是**把被 `[:200]` 切掉的那段接回去**。
+
+两条判据,缺一不可:
+
+1. **候选必须以 `own` 为前缀** —— 是前缀就是同一段文本被切之前的样子;不是
+   前缀就是**另一次报错**,拿它判这一格等于串账;
+2. **`own` 必须够到 `SAMPLE_LEN`(200)** —— 短于它的那份根本没被我们切过,
+   此时"更长的候选"是另一段更长的文本(比如后来又追加了一条理由),接上去
+   就等于拿后来的状态改写历史那一格。
+
+**② `_events_pass` 的棘轮:已经是新码的行,只有原文被还原时才重判。**
+
+| 情形 | 动作 |
+|---|---|
+| 还原成功 | 拿**全文**重判并写(**这正是修那 2,595 条的路径**) |
+| 没还原 + `detail.category` 已是新码 | **一个字不动**,只盖版本号(`_SQL_EV_KEEP`) |
+| 没还原 + 还是旧 A-L 码(或空) | 判残文写进去 —— 这才是真正的"下限" |
+
+第二行的道理:`problem_scan` 判的时候手上的文本**只会比我们现在这份更全**,
+重判只可能更差。不动就是最优解。
+
+⚠ 不改码的行**也要盖版本号**,否则每轮重新排队,永远跑不完(§13.8 的近亲:
+那次是没推游标,这次是候选集不收敛)。
+
+**③ `by_asin` 全表扫挪到 `run()`** —— 事件遍与黑名单遍共用一份,`scope=all`
+时不再各扫一遍。
+
+### 17.4 修存量:两轮,以及最后 14 条
+
+**血量 = 全表。** 第一版回填的指纹是「盖了 `taxonomy_version` 但**没有**
+`taxonomy_src`」,数出来 251,148 —— 它碰过每一行,不是只碰了 2,595 条。
+
+```sql
+-- 数血量(只读)。⚠ 判据两半都要:光写 `NOT (detail ? 'taxonomy_src')` 会
+--   把**从来没进过候选集**的行(reason 为空的 26,574 条)一起算进来。
+SELECT count(*) FILTER (WHERE detail->>'taxonomy_version' IS NOT NULL
+                          AND NOT (detail ? 'taxonomy_src')) AS 第一版残留,
+       count(*) AS 总行数
+FROM catalog.product_events WHERE event = 'problem_categorized';
+```
+
+**第一轮**(棘轮 + `restore`,`records` / `items` 两条外源):
+
+```bash
+python cli.py error_reclass -p scope=events -p force=1 --dry-run
+python cli.py error_reclass -p scope=events -p force=1
+python cli.py blacklist_push -p backfill=1
+```
+
+判 251,148 → 重判 57,444(码变了 11,031),**原样不动 193,704**。
+其中 **`4,167  POLICY → PT_WRONG`** 就是修回来的那批(≥ 当初报的 2,595,多出来的
+是同一个 bug 打在旧码行上的部分)。下游跟着回来:
+
+| | 事故后 | 修复后 |
+|---|---:|---:|
+| 产品级该永久拉黑 | 26,430 | **24,167**(−2,263) |
+| `blacklist_push -p backfill=1` 将新增 | 4,465 | **1,792**(−2,673) |
+
+**「原样不动」的 193,704 条要拆三堆看,大部分不是损失:**
+
+| | 条数 | 是不是损失 |
+|---|---:|---|
+| 原文不满 200 字(没被截过) | 61,832 | **零损失** —— 判的就是完整文本 |
+| 满 200 字、换轨(2026-09-03)**前** | 131,523 | **不是损失** —— 原值本来就是旧 A-L 码,残文是唯一拿得到的,这才是真正的"下限" |
+| 满 200 字、换轨**后** | **349** | 真损失:全文判过一次,被残文覆盖,又还原不回来 |
+
+那 349 条的影响面(精确算,两个方向都要报,不能只报保守那一边):
+涉及 316 个产品,**可能被冤枉永久拉黑 5 个**、**可能该拉黑却漏了 300 个**。
+
+**第二轮**:`ops.dispositions.reason` 存的是 `problem_scan` 当轮的**全文**
+(`to_dispositions` 没截断),而 `error_reclass` 从来没碰过那张表 —— 它是那批
+被残文覆盖的事件**最后一份全文副本**。实测 349 条里 **335 条(96%)** 能对上,
+于是把它加成 `restore` 的第四条候选源(⚠ 一个 sku 有多条建议时**全部**作为
+候选给出去,由前缀判据挑;只取最新一条会漏掉正好匹配的那条)。
+
+⚠ 只加进 `restore`,**不加进 `pick`**:黑名单那条路的口径 2026-09-04 已验收,
+往四级优先里插一级会把已定案的行重新洗一遍 —— 那是另一次改动,不在这次事故里
+顺手做。
+
+实测收获比预估大得多:`dispositions=1,312` —— 那 335 只是「换轨后」的真损失,
+另外约 977 条是**换轨前一直停在"下限"的老行**,顺带把全文也找回来了。
+
+| | 第一轮后 | 第二轮后 |
+|---|---:|---:|
+| 重判 / 原样不动 | 57,444 / 193,704 | 58,661 / **192,487** |
+| 码变了 | 11,031 | 214 |
+| 产品级该永久拉黑 | 24,167 | **24,161** |
+| `backfill=1` 将新增 | 1,792 | **1,782** |
+
+那 214 条**两个方向都在纠错**,这是截断之害不是单向的实据:过判被纠正
+(`PROHIBITED_FINAL→FLAGGED` 23、`POLICY→PT_WRONG` 18、`PROHIBITED_FINAL→STAGE` 4)
+与漏判被纠正(`EXPIRED→POLICY` 17、`EXPIRED→PROHIBITED_FINAL` 8、`EXPIRED→IP` 5)
+同时存在 —— 因为 `[:200]` 切在**句子中间**,残片命中的规则和完整句子命中的
+可能根本是两条。
+
+**收敛已证明**:同样的命令再跑一次,报 `码变了 **0** 条`,各批计数逐字节相同。
+
+### 17.5 ⚠ 又两个自造的 bug:上限与门槛(2026-09-04,已修)
+
+第二轮跑完残留只从 349 掉到 **262**,而能对上的有 335 —— **少救了 248 条**。
+两处都在我新写的代码里,而且都是同一类毛病:**为了省事设的边界,把判据那份切没了**。
+
+**① 候选上限没去重就先截。** `dispositions_map` 取每 sku 最长的 5 条,而同一个
+下架原因会被反复建议 —— 最长那条的**多份副本**把 5 个名额全占满,真正对得上
+前缀的那条被挤掉。改:**先按文本去重、再设上限**(上限放宽到 20),
+撞上限**记日志计数**,不许再静默丢。
+
+**② 还原门槛量错了长度。** `restore` 拿 `own.rstrip()` 的长度跟 `SAMPLE_LEN`
+比,而 `[:200]` 正好切在空格上时 rstrip 剩 199 —— 门槛当场把这一行判成
+"没被切过",连试都不试。改:**前缀比对用 rstrip 版**(尾部空格可能在别处被
+吃掉),**门槛用原文长度** —— 两者是两件事,混用就漏。
+
+⚠ 这两条与 §17.1 的病根是同一个形状:`[:200]`、`< 5`、`rstrip()` 都是"顺手加的
+边界",而判据串恰好落在被切掉的那一侧。**凡是给文本设长度/条数上限的地方,
+都要问一句:被切掉的那部分会不会正是判据。**
+
+第三轮(修完这两个 bug)照旧:
+
+```bash
+python cli.py error_reclass -p scope=events -p force=1
+python cli.py blacklist_push -p backfill=1
+```
+
+残留复核(只读):
+
+```sql
+SELECT detail->>'category', count(*)
+FROM catalog.product_events
+WHERE event = 'problem_categorized'
+  AND detail->>'taxonomy_src' = 'keep'
+  AND length(detail->>'reason') = 200
+  AND occurred_at >= '2026-09-03'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+理论下限是 **14 条**(349 − 335,四处外源都没有全文的那些),到不了就说明还有
+第三个 bug,别默认"就这样了"。
+
+
+---
+
+## 十八、全量对照:判不出的只有 1 条,而它不是"不规范"(2026-09-04)
+
+所有者:「如果还有没有被归类的,你看一下没归类到的报错原文更准确,**如果它
+本来就是不规范的那种,那就不入库也可以**」。
+
+按这句话去查,前提是那张清单里**只有真的原文** —— 所以先补了对照报告的三个
+缺口(见 `error_reclass_report` 头注):① `audit.walmart_error_records.raw_reason`
+这份最大的全文语料**完全不在报告里**;② 事件面读 `'reasons'` 复数而写入方写
+`'reason'` 单数,长期近乎空转;③ `asin_blacklist.reason` 的 200 字残片混在
+"未识别"清单里,会被当成"沃尔玛写得不规范"。
+
+补完之后的账:
+
+| 语料面 | 条数 | 未识别(OTHER 兜底) |
+|---|---:|---|
+| `catalog.walmart_items`(下架且有原因) | 37,088 | **0 种 / 0 条** |
+| `audit.walmart_error_records`(全文) | 97,002 | **1 种 / 1 条** |
+| `catalog.product_events`(status_changed) | 22,059 | **0 种 / 0 条** |
+
+三面的政策名 join 率都是 **100%**。主码分布里那几条 `OTHER` 全是**显式杂项**
+(`business decision` / `trust & safety` / `currently under review`),按序 16
+进 unlisted,不算判不出。
+
+**唯一那条判不出的原文:**
+
+```
+This item belongs to a restricted category. Get approved to sell these items
+in your ||Account hub@@@https://seller.walmart.com/gated-categories||
+```
+
+**它不是"不规范"的那种** —— 是沃尔玛的标准资质门文案,病根在我们判据缺一串。
+所以**不能按"不入库"处理**:那样会把真·资质门(`GATED`)丢掉。改法是给序 7
+补 `get approved to sell`(与已有的 `request approval to sell` 同族)。
+
+⚠ 取的是 `get approved to sell` 而**不是** `restricted category`:后者与政策族的
+`Restricted/Illegal Products` 只差一个词,而序 7 **压过**序 15 的政策 —— 一旦
+误命中就是拿资质门吃掉真禁售,往松里错。反例已钉进测试:
+`Prohibited Products Policy: Restricted/Illegal Products.` 必须仍判 `POLICY`。
+
+生产原文进语料(77 → 78 行),码表版本递增 `t.2026-09-02.1` → **`t.2026-09-04.1`**。
+
+### 18.1 版本递增之后要重跑(**不用 force**)
+
+版本号就是增量谓词:改了就等于全量重判,这正是它的设计用途。
+
+```bash
+python cli.py error_reclass --dry-run     # 先看形态
+python cli.py error_reclass               # 三面一起(records / events / blacklist)
+python cli.py blacklist_push -p backfill=1
+```
+
+### 18.2 存量修复到底了:残留 12 条
+
+三轮跑完,`taxonomy_src='keep'` + 原文正好 200 字 + 换轨后的残留:
+**`PROHIBITED_FINAL` 9 + `EXPIRED` 3 = 12 条**,比 §17.4 估的下限 14 还低
+(`dispositions_map` 不带 `store` 条件,比当初那条 EXISTS 查得更宽)。
+
+这 12 条四处外源都没有全文,救不回来,停在残文判出的码上。已知、已定量、不再追。
+
+| | 第一轮 | 第二轮 | 第三轮 |
+|---|---:|---:|---:|
+| 重判 / 原样不动 | 57,444 / 193,704 | 58,661 / 192,487 | 76,855 / **174,293** |
+| 码变了 | 11,031 | 214 | **5** |
+| 换轨后真损失 | 349 | 262 | **12** |
+
+
+### 18.3 收官这一轮的账(版本 `t.2026-09-04.1`)
+
+| 面 | 判了 | 结果 |
+|---|---:|---|
+| `audit.walmart_error_records` | 97,002 | `OTHER` **归零**(`GATED` 293 → 294,正是补的那一条);政策名 join 1,609 条 / 27 类 |
+| `catalog.product_events` | 251,148 | 重判 76,855,**码变了 0**;还原来源 records 47,956 / items 27,372 / dispositions 1,527 |
+| `catalog.asin_blacklist` | 32,716 | 入选码**全部没变**(22,302);`LEGACY` 394 条判出新码但按裁决**不改写** `category` |
+
+⚠ 那 394 条 `LEGACY` 一度被摘要算进「入选码变了」—— 而 `_SQL_BL_SET` 明确不改写
+`LEGACY` 的 `category`,**摘要说变了、库里没变**。已单列成一栏说清楚。
+
+**还没对齐的一件**:`blacklist_route` 删行读的是**行级**码
+`asin_blacklist.taxonomy_code`,而产品级判定已经统一到事件账本
+(`blacklist._judge_events`)。`product_level_keep` 已实现但**从未真跑过** ——
+跑它之前先看 `-p apply=0` 的三路计划。
+
+**黑名单那 14,474 条 `self`(200 字样本)** 仍是下限:`pick` 走的是四级优先,
+没有接 `restore` + `dispositions`(§17.3 决定不在事故修复里顺手改口径)。
+这是下一个 PR 可以做的一件事,预期能把其中一部分提到全文。

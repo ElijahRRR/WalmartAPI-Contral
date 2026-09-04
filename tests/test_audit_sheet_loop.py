@@ -4,7 +4,7 @@
   ① 审核「直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」;
   ② 上架「以数据库的数据为准 —— 要上架就肯定要过审核,读取速度也更快」。
 
-这两句话合起来是一条**单向环**:表 A 列进审核 → 结论落 PG → 投影回表 C~G(给人看)
+这两句话合起来是一条**单向环**:表 B 列进审核 → 结论落 PG → 投影回表 D~I(给人看)
 → 上架读 **PG**(不读投影)。本文件钉住的是这条环上"错了也不报错"的接缝:
 
   · E 列写的值必须是 `list_new` 之外的人能看懂的中文态,而 **PG 里是英文态** ——
@@ -49,8 +49,15 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
     assert got[0]["asin"] and got[0]["store"] == "T1"
 
 
-def test_audit_targets_reads_only_first_five_columns(monkeypatch):
-    """领任务只读 A..E(store/asin/标题/PT/审核结果),不拉 F 之后的理由/
+@pytest.fixture(autouse=True)
+def _header_matches_registry(monkeypatch):
+    """表头核验默认通过 —— 漂移的场景由 test_header_drift_stops_every_read 单独钉。"""
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
+                        lambda s, r: [list(listing_sheet._header())])
+
+
+def test_audit_targets_reads_only_first_six_columns(monkeypatch):
+    """领任务只读 A..F(store/asin/SKU/标题/PT/审核结果),不拉 G 之后的类别/
     回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应 10MB 上限
     (90221),audit_sheet 整链失败。行方向分块归 api 层。"""
     asked = []
@@ -59,10 +66,10 @@ def test_audit_targets_reads_only_first_five_columns(monkeypatch):
         listing_sheet.feishu, "sheet_values_rows",
         lambda s, c1, c2, rf, rt, **kw: (
             asked.append((c1, c2, rf, rt)),
-            [(2, ["T1", "B0AAAAAAA1", "t", "pt", ""]),
-             (3, ["T1", "B0AAAAAAA2", "t", "pt", "pass"])])[1])
+            [(2, ["T1", "B0AAAAAAA1", "sku", "t", "pt", ""]),
+             (3, ["T1", "B0AAAAAAA2", "sku", "t", "pt", "pass"])])[1])
     got = listing_sheet.audit_targets()
-    assert asked == [("A", "E", 2, 3)]        # 只读前五列,行区间对
+    assert asked == [("A", "F", 2, 3)]        # 只读 A~F 六列(到审核结果为止),行区间对
     assert [r["asin"] for r in got] == ["B0AAAAAAA1"]
 
 
@@ -133,11 +140,25 @@ class _Conn:
         return _Cur(self._rows, self._hits)
 
 
-def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
+def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
+    """三段输出分列(2026-09-02 B1):F 判定结果 / G 类别 / H 具体内容。
+
+    H 取 `products.audit_detail`;**老行(还没有这一列值的)按命中规则渲染**
+    —— 不兜底的话,存量几十万行在表上会一夜变成空白,看起来像"审核把理由
+    弄丢了"。老行被重审时自然写上新格式。
+    """
     at = dt.datetime(2026, 8, 16, 9, 30)
     monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn(
-        [("B0OK", "沃标题", "Cups", "approved", "", at),
-         ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at)],
+        [("B0OK", "沃标题", "Cups", "approved", "", at, None),
+         # 新行:类别是枚举,具体内容来自 audit_detail
+         ("B0NEW", "沃标题3", "Pans", "rejected", "Intellectual Property", at,
+          "标题写 \"Nike Air\",IP 政策禁未授权引用品牌"),
+         # 老行:没有 audit_detail ⇒ 按命中规则渲染
+         ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at,
+          None),
+         # 老行 pending:待定原因当年写在 audit_reason 里,H 照旧显示它
+         ("B0PEND", "沃标题4", "Pots", "pending", "待类目判定(候选/rerank 均解不出)",
+          at, None)],
         # B0NONE 在库里查不到 → 不出现在结果集
         [("B0NO", None, "phase0_brand_blacklist", {"brand": "Nike"}, -100)]))
     writes = []
@@ -148,16 +169,21 @@ def test_project_to_sheet_writes_cg_and_leaves_absent_blank(monkeypatch):
         {"rownum": 3, "asin": "B0NO"},
         {"rownum": 4, "asin": "B0NONE"},
         {"rownum": 5, "asin": "B0OK"},        # 同 ASIN 多行(不同店铺)都要写
+        {"rownum": 6, "asin": "B0NEW"},
+        {"rownum": 7, "asin": "B0PEND"},
     ], True)
     by_row = dict(writes)
-    assert set(by_row) == {2, 3, 5}                 # 4 行留空,一格没动
-    assert by_row[2] == ["沃标题", "Cups", "pass", "", "2026-08-16"]
-    # F 列要说人话,而不是只甩一个政策类目名(政策留在方括号里)
-    assert by_row[3][2] == "reject"
-    assert by_row[3][3] == "品牌黑名单(命中:Nike) [政策:General-Use Products]"
+    assert set(by_row) == {2, 3, 5, 6, 7}          # 第 4 行留空,一格没动
+    assert by_row[2] == ["沃标题", "Cups", "pass", "", "", "2026-08-16"]
+    assert by_row[6] == ["沃标题3", "Pans", "reject", "Intellectual Property",
+                         "标题写 \"Nike Air\",IP 政策禁未授权引用品牌",
+                         "2026-08-16"]
+    assert by_row[3][2:5] == ["reject", "General-Use Products",
+                              "品牌黑名单(命中:Nike)"]     # 老行兜底渲染
+    assert by_row[7][2:5] == ["pending", "", "待类目判定(候选/rerank 均解不出)"]
     assert by_row[5] == by_row[2]
-    assert "回填 3 行" in out
-    assert "1 行库里没有结论" in out and "E 列留空" in out
+    assert "回填 5 行" in out
+    assert "1 行库里没有结论" in out and "F 列留空" in out
 
 
 def test_project_failure_only_warns(monkeypatch):
@@ -170,17 +196,18 @@ def test_project_failure_only_warns(monkeypatch):
     assert "from_sheet=1" in out            # 告诉人怎么补写
 
 
-def test_write_audit_cols_stays_inside_cg(monkeypatch):
-    """⚠ 只准动 C~G。越界写会覆盖 list_new 的 H~N 与反哺器的 O~Q。"""
+def test_write_audit_cols_stays_inside_di(monkeypatch):
+    """⚠ 只准动 D~I(2026-09-02 表头:D 标题 E PT F 结果 G 类别 H 具体内容 I 日期)。
+    越界写会覆盖 A~C 人工域、list_new 的 J~P 与反哺器的 Q~S。"""
     sent = []
     monkeypatch.setattr(listing_sheet.feishu, "sheet_write_ranges",
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
-    n = listing_sheet.write_audit_cols([(7, ["T", "Cups", "pass", "", "d"])])
-    assert n == 1 and sent[0][0] == "C7:G7"
-    assert sent[0][1] == [["T", "Cups", "pass", "", "d"]]
+    n = listing_sheet.write_audit_cols([(7, ["T", "Cups", "reject", "Alcohol", "含酒精", "d"])])
+    assert n == 1 and sent[0][0] == "D7:I7"
+    assert sent[0][1] == [["T", "Cups", "reject", "Alcohol", "含酒精", "d"]]
     # dry-run 一格不写
     sent.clear()
-    assert listing_sheet.write_audit_cols([(7, ["T"] * 5)], execute=False) == 0
+    assert listing_sheet.write_audit_cols([(7, ["T"] * 6)], execute=False) == 0
     assert sent == []
 
 
@@ -399,15 +426,35 @@ def test_columns_contract():
     """列序的唯一出处是这条元组 —— 错一位,整套回填静默写到隔壁列去。
 
     A/B 已经被所有者对调过一次(2026-08-16:原 A=ASIN B=店铺 → 现 A=店铺 B=ASIN)。
-    读取全程按字段名,所以那次对调只动了这条元组;**但写入用的是字母 range**,
-    所以 C~G 这一段一旦位移,`write_audit_cols` 会把审核结论写进别人的列里
-    —— 而且不报错。
+    读取全程按字段名;写入的字母也从这条元组推导(2026-09-02 起,与 maint_sheet
+    同路),所以这条元组错一位 = 读写一起错位,而且不报错。2026-09-02 所有者改
+    表头:C 插 SKU,「审核理由」拆成 G 类别 + H 具体内容,尾四列换 登记日期/查询编码。
     """
     cols = resources.LISTING_SHEET.columns
-    assert cols[0] == "store" and cols[1] == "asin"      # A/B 对调后的现状
-    assert cols[2:7] == ("list_title", "product_type", "audit_result",
-                         "audit_reason", "audit_date")   # C~G 审核域
-    assert len(cols) == 21                               # A~U
+    assert cols[:3] == ("store", "asin", "sku")           # A/B/C 人工域
+    assert cols[3:9] == ("list_title", "product_type", "audit_result",
+                         "audit_category", "audit_detail", "audit_date")  # D~I 审核域
+    assert cols[-2:] == ("register_date", "query_code")   # T/U 运营域
+    assert len(cols) == 21                                # A~U
+    assert listing_sheet._col("audit_result") == "F"
+    assert listing_sheet._rng("list_title", "audit_date", 7) == "D7:I7"
+    assert len(listing_sheet._header()) == 21             # _HEADER_NAMES 与列序同增同减
+
+
+def test_header_drift_stops_every_read(monkeypatch):
+    """表头与 registry 对不上 → read_rows 之前就 ValueError 并点名列(2026-09-02 事故:
+    所有者改了表头,代码按旧列序错位读写了半天,全程不报错)。"""
+    good = list(listing_sheet._header())
+    drifted = good[:2] + good[3:] + ["UPC匹配"]           # 少了 SKU、尾巴多一列
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
+                        lambda s, r: [drifted])
+    with pytest.raises(ValueError, match="C 应为「SKU」"):
+        listing_sheet.read_rows()
+    # 大小写与空白差不算漂移
+    loose = [h.upper() + " " for h in good]
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
+                        lambda s, r: [loose])
+    listing_sheet.verify_header()
 
 
 
@@ -538,7 +585,7 @@ def test_still_missing_gets_the_real_scraper_error_in_the_sheet(monkeypatch):
     assert set(by_row) == {3, 5}              # 补上的第 4 行不写;同 ASIN 两行都写
     assert "captcha" in by_row[3] and "验证码" in by_row[3]
     assert by_row[5] == by_row[3]
-    assert "E 列留空" in out
+    assert "F 列留空" in out
 
 
 def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):
@@ -678,7 +725,7 @@ def test_gap_closure_runs_before_the_candidate_query(monkeypatch):
     src = inspect.getsource(pa.run)
     assert "sheet_head += _close_gap(sheet_want, sheet_rows, execute" in src
     # 必须早于候选查询那一行
-    assert src.index("_close_gap(") < src.index("_CANDIDATE_SQL.format")
+    assert src.index("_close_gap(") < src.index("_candidate_sql(")
     # 交的是整批 sheet_want,不是被 limit 截过的候选 —— 交候选的话超出 limit 的
     # 缺数据行永远排不上,也就永远不会被推去采集
     assert "_close_gap(rows" not in src and "_close_gap(todo" not in src
@@ -731,3 +778,109 @@ def test_repts_takes_candidates_by_judgement_change_not_by_version():
 def test_repts_is_a_named_human_action_so_it_skips_the_24h_guard():
     """与 rerule / force 同类:人点名要审的,点了就得审。"""
     assert pa._is_forced({"repts": "1"}, {}) is True
+
+
+# ── ⑦ limit 到底限住了什么(所有者 2026-09-03 实遇 + 定稿)────────────────
+#
+# 实遇:「日志显示上限是 N 个,但是实际上审核了更多的产品」。病根是三步接力 ——
+# `_claim_from_sheet` 有意不截断 ASIN 列表(已有结论的不进候选,交给谓词过滤),
+# `from_sheet` 又是**借 asins= 这条路**实现的,而 run() 里为点名场景写的
+# 「指定 ASIN 时 limit 不许截断」把 limit 顶成了整张表的待审数。三步各自都讲得通,
+# 合起来 = 上架表这条路的 limit 恒等于没有,而摘要还在说"只判 N 个"。
+#
+# 定稿:**缺省不限量;给了 limit 就真截断**(哪条通道都一样)。
+
+class _LimitProbe:
+    """跑一遍 run() 的取候选那一步,把候选查询真正拿到的 limit 抓出来。"""
+
+    class _Stop(Exception):
+        pass
+
+    class _Cur:
+        def __init__(self, todo):
+            self._todo = todo
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            pass
+
+        def fetchall(self):
+            return [("未审", self._todo)]
+
+    class _Conn:
+        def __init__(self, todo):
+            self._todo = todo
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _LimitProbe._Cur(self._todo)
+
+    def __init__(self, monkeypatch, n_sheet):
+        self.seen = {}
+        rows = [{"rownum": i + 2, "asin": f"B0{i:08d}", "store": "T1"}
+                for i in range(n_sheet)]
+        monkeypatch.setattr(listing_sheet, "audit_targets", lambda: rows)
+        monkeypatch.setattr(pa.db, "pg_conn",
+                            lambda: _LimitProbe._Conn(n_sheet))
+        monkeypatch.setattr(pa, "_close_gap", lambda *a, **k: [])
+        monkeypatch.setattr(pa, "_cap_by_connections", lambda w: (w, ""))
+        monkeypatch.setattr(pa.audit_rules, "load_context",
+                            lambda conn: object())
+        monkeypatch.setattr(pa.audit_l3, "policy_enum", lambda known: ())
+        monkeypatch.setattr(pa, "_iter_candidates", self._grab)
+
+    def _grab(self, sql, query_params, chunk=2000):
+        self.seen = {"limit": query_params.get("limit", "(未绑定)"),
+                     "n_asins": len(query_params.get("asins", ())),
+                     "sql_capped": "LIMIT %(limit)s" in sql}
+        raise _LimitProbe._Stop
+
+    def run(self, params):
+        with pytest.raises(_LimitProbe._Stop):
+            pa.run({"from_sheet": "1", "execute": False, **params})
+        return self.seen
+
+
+def test_from_sheet_limit_actually_caps_the_judging(monkeypatch):
+    """⚠ 给了 limit 就得真截断 —— 这条钉的正是所有者实遇的那个 bug。
+
+    旧行为:limit 被 `max(limit, len(asins))` 顶成 3000,摘要却说"只判 500 个"。
+    """
+    probe = _LimitProbe(monkeypatch, n_sheet=3000)
+    got = probe.run({"limit": 500})
+    assert got["limit"] == 500, "limit 又被顶成 ASIN 总数了(那行不许回来)"
+    assert got["n_asins"] == 3000          # 整批仍交给谓词过滤(不截断领任务)
+    assert got["sql_capped"] is True
+
+
+def test_no_limit_given_means_no_cap_at_all(monkeypatch):
+    """缺省不限量:SQL 里根本没有那一段,也不绑 limit 参数。"""
+    probe = _LimitProbe(monkeypatch, n_sheet=3000)
+    got = probe.run({})
+    assert got["limit"] == "(未绑定)"
+    assert got["sql_capped"] is False
+
+
+def test_claim_from_sheet_says_unlimited_when_no_limit_given(monkeypatch):
+    """不限量也要把"这轮判多少"说出来 —— 人还会按老习惯以为有个 500 挡着。"""
+    monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [
+        {"rownum": i, "asin": f"B0ASIN{i:04d}", "store": "T1"}
+        for i in range(2, 12)])
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn([
+        ("approved", 3), ("rejected", 1), ("pending", 2), ("未审", 4)]))
+    head = pa._claim_from_sheet(None)[2]
+    body = "\n".join(head)
+    assert "不限量" in body and "这 6 个待审**全判**" in body   # pending 2 + 未审 4
+    # 账要说全:补采救回来的那些也在这一轮判(_close_gap 跑在判定之前)
+    assert "补采救回来的还会加进来" in body
+    assert "只判" not in body

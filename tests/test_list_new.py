@@ -64,8 +64,8 @@ def test_listing_reflector_writes_opq(monkeypatch):
     monkeypatch.setattr(feed_track, "item_codes", lambda fid: {})
     out = listing_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
-    assert w["O2:Q2"][0] == "SUCCESS"
-    assert w["O3:Q3"][0] == "SUCCESS"        # ASYNC 转正
+    assert w["Q2:S2"][0] == "SUCCESS"
+    assert w["Q3:S3"][0] == "SUCCESS"        # ASYNC 转正
     assert "回填 2 行" in out
 
 
@@ -588,13 +588,13 @@ def test_heal_unknown_three_paths(monkeypatch):
 
     out = listing_sheet.heal_unknown()
     w = {rng: vals[0] for rng, vals in writes}
-    assert w["K2:Q2"][0] == "Yes" and w["K2:Q2"][1] == "F1"
-    assert w["K2:Q2"][2] == "2026-08-10"          # 原上架日期不被覆盖
-    assert w["K3:Q3"][0] == "No" and w["K3:Q3"][4] == "FAILED"
-    assert "ERR_X | 字段坏了" in w["K3:Q3"][5]     # P 列码+人话
-    assert w["K4:N4"][0] == "Yes"                 # 目录在线只写 K~N,不碰 O/P/Q
-    assert "K5:Q5" not in w and "K5:N5" not in w  # 无依据绝不负向写
-    assert "K6:Q6" not in w and "K6:N6" not in w  # 非 Unknown 不碰
+    assert w["M2:S2"][0] == "Yes" and w["M2:S2"][1] == "F1"
+    assert w["M2:S2"][2] == "2026-08-10"          # 原上架日期不被覆盖
+    assert w["M3:S3"][0] == "No" and w["M3:S3"][4] == "FAILED"
+    assert "ERR_X | 字段坏了" in w["M3:S3"][5]     # P 列码+人话
+    assert w["M4:P4"][0] == "Yes"                 # 目录在线只写 K~N,不碰 O/P/Q
+    assert "M5:S5" not in w and "M5:P5" not in w  # 无依据绝不负向写
+    assert "M6:S6" not in w and "M6:P6" not in w  # 非 Unknown 不碰
     assert used == [("0011", a2)] and released == ["0022"]
     assert "确认在线 2" in out and "确认失败重排 1" in out and "继续观察 1" in out
 
@@ -1286,7 +1286,7 @@ def test_write_reasons_is_one_batched_call(monkeypatch):
                         lambda t, ranges: (calls.append(ranges), len(ranges))[1])
     n = ls.write_reasons([(2, "理由A"), (5, "理由B"), (9, "理由C")])
     assert n == 3 and len(calls) == 1               # 三行一次请求
-    assert calls[0][0] == ("N2:N2", [["理由A"]])
+    assert calls[0][0] == ("P2:P2", [["理由A"]])
     assert ls.write_reasons([], True) == 0 and len(calls) == 1
     assert ls.write_reasons([(3, "x")], execute=False) == 0   # dry-run 不写
     assert len(calls) == 1

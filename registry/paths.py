@@ -69,6 +69,17 @@ def reports_dir() -> Path:
     return data_root() / "reports"
 
 
+def audit_replay_report() -> Path:
+    """输入:无 → 输出:回放评估报告全文路径(<DATA_ROOT>/reports/audit_replay.txt)。
+
+    `workflows/audit_replay` 的**唯一文件写出口**(另一个写是
+    `audit.replay_results` 表)。文件名登记在这里而不是工作流里:切换手册
+    (`docs/audit_step3_spec.md` §五)与所有者都按这个路径找报告,
+    改名得只有一处(铁律 3:路径只准从 registry 取)。
+    """
+    return reports_dir() / "audit_replay.txt"
+
+
 def frontend_scrape_file() -> Path:
     """输入:无 → 输出:影刀 RPA 抓取结果 latest.json 路径。
 
@@ -115,16 +126,18 @@ def yingdao_app() -> Path:
 
 
 def audit_seed_file(name: str) -> Path:
-    """输入:审核规则种子文件名(如 'nrtl_small_parts.yaml')
-    → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。
+    """输入:审核规则种子文件名 → 输出:refdata/audit/ 下的绝对路径
+    (进 git 的只读参考资料,批次 A 迁入)。
 
-    现存消费方(nrtl_small_parts.yaml 2026-08-21 随 R3 收敛删除):
-    pt_nice_class.yaml(L2 R5 的 Nice Class 过滤)。
-    forbidden_categories_zh_seller.yaml 已于 2026-08-20 删除 —— 它装的
-    13 条 L1 excluded + 18 条 R2 禁售大类,和 L2 R1 的类目准入白名单
-    讲同一件事,白名单补齐后整份下线。
+    ⚠ **当前零消费方**(2026-09-03 C 批起):三份种子 yaml 随各自的规则依次
+    下线 —— forbidden_categories_zh_seller.yaml(2026-08-20,13 条 L1
+    excluded + 18 条 R2 禁售大类,与 R1 类目准入白名单讲同一件事)、
+    nrtl_small_parts.yaml(2026-08-21 随 R3 收敛)、pt_nice_class.yaml
+    (2026-09-03 随 R5 USPTO 商标整条删除)。目录里只剩
+    `l3_keywords.yaml`,它是**参考资料**、代码从不加载(见该文件头注)。
 
-    审核规则代码取 yaml 一律经此函数(铁律 3:路径不散落在 services)。
+    函数保留:审核规则代码取 refdata/audit 下的文件一律经此函数
+    (铁律 3:路径不散落在 services),下一份种子文件照走这里。
     """
     repo_root = Path(__file__).resolve().parent.parent
     return repo_root / "refdata" / "audit" / name

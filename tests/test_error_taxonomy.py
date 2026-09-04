@@ -8,7 +8,8 @@
      补收,`provenance:"prod-2026-09-01-report"`,标 `truncated` 的是报告展示
      截断、判据只用可见段),**一行不许跳**。语料是验收标准:引擎迁就语料,
      不是语料迁就引擎。
-  ② 旧行为快照 —— 同一批 reason 语料跑现行 `problem_products.categorize()`,
+  ② ~~旧行为快照~~ —— 2026-09-04 随旧引擎一并删除(所有者:「旧码不需要留」);
+     曾经是:同一批 reason 语料跑 `problem_products.categorize()`,
      把它**现在**的输出冻死在这里。第二步换轨时 diff 一目了然:哪些条从
      A/J/Z 翻成了真问题,是有账可查的,不是"看起来变好了"。
      ⚠ 快照是**现状**不是**期望**:里面 Z 一片、Stage 归"特殊"、
@@ -41,7 +42,7 @@ REASONS = _load("reason_corpus.jsonl")
 FEED_ERRORS = _load("feed_error_corpus.jsonl")
 
 # 政策表 category_en 对照清单 —— **目标态**(2026-09-02 定稿 §十.7:官方政策
-# 类别名 = 全链唯一键)。`policy_sync` 真跑后生产表就长这样:官方 42 名,
+# 类别名 = 全链唯一键)。`policy_sync` 真跑后生产表就长这样:官方 44 名(42 禁售 + 2 内容族),
 # 逐字取自 `refdata/policy_pages/en/*.md` 的头注 H1(下面 `test_known_policies_
 # are_verbatim_official_names` 守门,漂了当场红)。
 #
@@ -70,11 +71,16 @@ KNOWN_POLICIES = (
     "Air Powered Guns, BB Guns, Toy Guns and Imitation Firearms", "Firearms",
     "Firearm Accessories", "Firearm Ammunition",
     "Knives and Other Melee Weapons",
+    # 内容族两页(2026-09-02,A 批):不是禁售类别,是「content policy」/
+    # 「authenticity claims」两类下架原因所指页面;同表同枚举
+    "Content standards: Overview", "Product details policy",
 )
 
-# 过渡态:`policy_sync` 改名落地**之前**的生产表长这样(存量缩写名那一族)。
-# 只用于证明"改名前后 join 都不断"—— 别拿它当真值。
-LEGACY_POLICIES = tuple(resources.POLICY_LEGACY_NAMES)
+# 2026-09-02 改名落地**之前**生产表里那一族旧缩写名(历史事实,不是当前状态)。
+# 只用于证明"这类语义缩写今天 join 不上、该进政策表缺口清单"—— 别拿它当真值。
+LEGACY_ABBREVIATIONS = ("Drugs & Paraphernalia", "Electronics & RF",
+                        "Military & Law Enforcement", "Pet Products",
+                        "Restricted/Illegal", "Ride-Ons & Micromobility")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,7 +131,7 @@ def test_feed_error_corpus_row(row):
 
 def test_the_whole_corpus_is_covered_not_a_subset():
     """夹具是验收标准 —— 行数少了说明有人删了语料(只许读不许改)。"""
-    assert len(REASONS) == 77 and len(FEED_ERRORS) == 20
+    assert len(REASONS) == 78 and len(FEED_ERRORS) == 20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,59 +150,12 @@ def test_the_whole_corpus_is_covered_not_a_subset():
 #   · #2/#60/#64/#65/#66/#70 判 J 特殊 —— Stage 与 Preorder 挤在一个码里,
 #     中性码盖住了同记录里的 PROHIBITED_FINAL / POLICY / PT_WRONG;
 #   · #63/#68 判 A 过期 —— 同上,过期盖住了终局禁售与品牌未授权。
-_OLD_SNAPSHOT = {
-    1: ("A", "过期"), 2: ("J", "特殊"), 3: ("B", "禁售"), 4: ("Z", "其他"),
-    5: ("D", "价格"), 6: ("B", "禁售"), 7: ("Z", "其他"), 8: ("B", "禁售"),
-    9: ("Z", "其他"), 10: ("E", "知产"), 11: ("F", "限类"), 12: ("E", "知产"),
-    13: ("H", "信息"), 14: ("B", "禁售"), 15: ("B", "禁售"), 16: ("F", "限类"),
-    17: ("B", "禁售"), 18: ("Z", "其他"), 19: ("B", "禁售"), 20: ("B", "禁售"),
-    21: ("B", "禁售"), 22: ("B", "禁售"), 23: ("Z", "其他"), 24: ("H", "信息"),
-    25: ("B", "禁售"), 26: ("B", "禁售"), 27: ("B", "禁售"), 28: ("E", "知产"),
-    29: ("G", "药品"), 30: ("F", "限类"), 31: ("B", "禁售"), 32: ("B", "禁售"),
-    33: ("B", "禁售"), 34: ("I", "内容"), 35: ("B", "禁售"), 36: ("F", "限类"),
-    37: ("Z", "其他"), 38: ("Z", "其他"), 39: ("B", "禁售"), 40: ("Z", "其他"),
-    41: ("B", "禁售"), 42: ("B", "禁售"), 43: ("B", "禁售"), 44: ("B", "禁售"),
-    45: ("B", "禁售"), 46: ("B", "禁售"), 47: ("K", "审查"), 48: ("L", "系统"),
-    49: ("E", "知产"), 50: ("Z", "其他"), 51: ("Z", "其他"), 52: ("B", "禁售"),
-    53: ("Z", "其他"), 54: ("Z", "其他"), 55: ("B", "禁售"), 56: ("B", "禁售"),
-    57: ("B", "禁售"), 58: ("I", "内容"), 59: ("I", "内容"), 60: ("J", "特殊"),
-    61: ("D", "价格"), 62: ("B", "禁售"), 63: ("A", "过期"), 64: ("J", "特殊"),
-    65: ("J", "特殊"), 66: ("J", "特殊"), 67: ("D", "价格"), 68: ("A", "过期"),
-    69: ("B", "禁售"), 70: ("J", "特殊"),
-    # #71-#77:2026-09-01 首轮对照报告补收的 7 种文本(轮次二)。这一批的看点
-    # 与前 70 行相反 —— **旧引擎判得出、新引擎当时漏了**(在架面 unknown 316 条
-    # 就是它们),补完判据后新旧同指一处;只有 #77 两边都落杂项(旧 Z / 新
-    # OTHER 显式清单)。⚠ #77 旧码是 **Z 其他**不是 K:旧 K 的判据是
-    # `flagged by our internal team`(problem_products._RULES),与"审查中"无关。
-    71: ("I", "内容"), 72: ("C", "品牌"), 73: ("I", "内容"), 74: ("C", "品牌"),
-    75: ("I", "内容"), 76: ("H", "信息"), 77: ("Z", "其他"),
-}
-
-
-@pytest.mark.parametrize("lineno", sorted(_OLD_SNAPSHOT),
-                         ids=[f"L{i}" for i in sorted(_OLD_SNAPSHOT)])
-def test_old_engine_snapshot(lineno):
-    """现行生产归类器的输出快照 —— 第一步不改它,变了就是有人动了生产判定。"""
-    text = REASONS[lineno - 1]["text"]
-    assert problem_products.categorize(text) == _OLD_SNAPSHOT[lineno]
-
-
-def test_snapshot_covers_every_corpus_line():
-    assert sorted(_OLD_SNAPSHOT) == list(range(1, len(REASONS) + 1))
-
-
-def test_the_two_engines_really_do_disagree():
-    """快照的意义在于差异:新引擎不是把旧码改了个名字。
-
-    钉住方案要所有者看见的那一类:中性码(过期/未上线)盖住的真问题必须翻出来。
-    """
-    flipped = 0
-    for i, row in enumerate(REASONS, 1):
-        old = _OLD_SNAPSHOT[i][0]
-        new = et.classify_reasons(et.split_reasons(row["text"])).code
-        if old in ("A", "J", "Z") and new not in ("EXPIRED", "STAGE", "OTHER"):
-            flipped += 1
-    assert flipped >= 10, f"只翻出 {flipped} 条,对照报告就没什么可看的了"
+# ⚠ 2026-09-04:「旧引擎输出快照」那 77 条参数化断言,连同
+# `test_snapshot_covers_every_corpus_line` / `test_the_two_engines_really_do_disagree`
+# **一并删除** —— 所有者定「删除旧码,我们已经迁移到新码,旧码不需要留」,
+# `problem_products.categorize()` 已删,给不存在的函数留测试是自欺。
+# 语料本身**一条没动**(77 行仍在 `reason_corpus.jsonl`),新引擎的逐行断言
+# 在上面的 `test_reason_corpus_row` —— 判据的守门只剩这一处,正是要的。
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,54 +191,45 @@ def test_known_policies_are_verbatim_official_names():
     下面所有 join 断言就都在拿一个官方并不存在的拼写当标准答案。"""
     heads = tuple(f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
                   for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
-    assert len(heads) == 42
+    assert len(heads) == 44
     assert set(KNOWN_POLICIES) == set(heads)
-    assert len(set(KNOWN_POLICIES)) == 42
+    assert len(set(KNOWN_POLICIES)) == 44
 
 
-def test_the_alias_table_is_derived_not_hand_written():
-    """⚠ 别名表是从 `registry.resources.POLICY_LEGACY_NAMES` **派生**的(仓内唯一一份
-    旧名↔官方名映射)。手抄第二份的后果不报错:所有者往映射表里追加一条,
-    这边不知道,那条别名就静默不存在。"""
-    assert et.POLICY_ALIASES, "别名表空了说明有人删光了词形差映射"
-    assert set(et.POLICY_ALIASES.values()) == set(resources.POLICY_LEGACY_NAMES)
-    # 键过的是**归一化那一份实现**(services/policy_names),不是这里手抄的公式 ——
-    # 抄一份进测试,归一化改了测试还绿,那就等于没守门
-    assert et.POLICY_ALIASES == {policy_names.norm_category(v): k
-                                 for k, v in resources.POLICY_LEGACY_NAMES.items()}
-    assert len(et.POLICY_ALIASES) == len(resources.POLICY_LEGACY_NAMES)  # 键不撞
+def test_the_legacy_alias_table_is_retired():
+    """⚠ 2026-09-03 C 批:`POLICY_ALIASES` / `alias_gaps` 连同
+    `registry.resources.POLICY_LEGACY_NAMES` 一起删除。
 
-
-def test_alias_gaps_go_from_empty_to_mostly_gone_when_the_rename_lands():
-    """别名的目标值(表内旧名)指不到表 = 那条别名失效 —— 但**有两种读法**。
-
-    改名前(过渡态)11 条必须条条指得到,指不到就是映射表写错了;
-    改名后(目标态)大部分指不到 —— 那不是故障,是这张别名表功成身退的信号
-    (此时直接键已命中),该做的是随第三步 L3 批把它整体删掉。
-
-    ⚠ 改名后**不是 11 条全指不到,是 9 条**:`Auto & Motor Vehicles` 与
-    `Textiles & Apparel` 两条旧名与官方名只差 `&`↔`and`,而 `_norm_key`
-    2026-09-02 起就是 `policy_names.norm_category`(那四条词形规则里正好有它)
-    —— 归一化后旧名与官方名同键,于是"指得到表",别名本身也已多余。
-    剩下 9 条是**真的语义缩写**(`Electronics & RF` ↔ `Electronics and Radio
-    Frequency Devices` 那种;2026-09-02 首跑又补了 Jewelry/Pet/Restricted/
-    Biodegradable 四条),归一化永远打不平,只能靠映射表。
+    它是改名过渡期的桥:报错正文里的政策名一直是官方全称,而政策表存量行是
+    旧仓搬迁时的缩写名。2026-09-02 `policy_sync` 真跑把表内名全改成官方拼写
+    之后,**直接键就命中**,桥的两头连的是同一个地方。
+    留着的代价不是多几行代码,是多一条"对不上就翻译一下再试"的暗道 ——
+    而报错正文里出现表里没有的政策名,本来就该进「政策表缺口」让人看见。
     """
-    assert et.alias_gaps(LEGACY_POLICIES) == ()
-    assert et.alias_gaps(KNOWN_POLICIES) == (
-        "Biodegradable Plastic", "Drugs & Paraphernalia", "Electronics & RF",
-        "Jewelry/Precious Metals", "Military & Law Enforcement", "Pet Products",
-        "Restricted/Illegal", "Ride-Ons & Micromobility", "Tobacco & Vaping")
-    # 掉出清单的那两条是"归一化已经够用",不是别名丢了
-    still_mapped = set(resources.POLICY_LEGACY_NAMES) - set(
-        et.alias_gaps(KNOWN_POLICIES))
-    assert still_mapped == {"Auto & Motor Vehicles", "Textiles & Apparel"}
-    for legacy in still_mapped:
-        official = resources.POLICY_LEGACY_NAMES[legacy]
-        assert et.policy_join(official, KNOWN_POLICIES) == official
+    for gone in ("POLICY_ALIASES", "alias_gaps"):
+        assert not hasattr(et, gone), gone
+    assert not hasattr(resources, "POLICY_LEGACY_NAMES")
+    from workflows import error_reclass_report as wf
+    assert not hasattr(wf, "_alias_notes")
 
 
-def test_policy_join_uses_aliases_but_never_rewrites_the_extracted_name():
+def test_semantic_abbreviations_now_land_in_the_policy_gap_list():
+    """⚠ 别名退役后,语义缩写 join 不上 —— **那是正确答案**。
+
+    这些串今天只会出现在两种地方:改名前的历史报告,或政策表被人改回旧拼写。
+    前者与今天无关,后者正该在「政策表缺口」清单上显形,而不是被一张历史
+    映射表悄悄接住(归一化打得平的纯词形差 `&`↔`and` 不在此列,见下)。
+    """
+    for legacy in LEGACY_ABBREVIATIONS:
+        assert et.policy_join(legacy, KNOWN_POLICIES) is None, legacy
+    # 纯词形差照旧打得平(那一级没动)
+    assert et.policy_join("Auto & Motor Vehicles", KNOWN_POLICIES) == \
+        "Auto and Motor Vehicles"
+    assert et.policy_join("Textiles & Apparel", KNOWN_POLICIES) == \
+        "Textiles and Apparel"
+
+
+def test_policy_join_never_rewrites_the_extracted_name():
     """join 归 join,policy_name 归 policy_name:抽出什么保留什么(语料 #26 钉死)。"""
     assert et.policy_join("Auto and Motor Vehicles", KNOWN_POLICIES) == \
         "Auto and Motor Vehicles"
@@ -298,33 +248,9 @@ def test_policy_join_uses_aliases_but_never_rewrites_the_extracted_name():
     assert res.policy_name == "Auto and Motor Vehicles"
 
 
-def test_the_derived_alias_still_joins_while_the_table_is_still_abbreviated():
-    """⚠ 过渡态守门:生产表**还没改名**时(存量缩写名),报错正文里的官方全称
-    经派生别名照旧对得上 —— 别名表要活到改名落地那一刻,不是提前退休。"""
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        assert et.policy_join(official, LEGACY_POLICIES) == legacy, official
-
-
-# 改名**落地之前**的生产表(37 行)在仓内的唯一近似:`services/audit_l3` 政策
-# 路由表 + 旧 `audit_reason._L3_NORMALIZE` 的目标值,30 条,逐字取自本文件
-# 2026-09-01 版的 KNOWN_POLICIES。留着它是为了证明"放宽归一化不是拿今天换明天"
-# —— 两种形态下 join 都不能比旧手写实现差。**不是真值**,别拿它做别的断言。
-_TODAY_TABLE = (
-    "Alcohol", "Animals", "Art", "Auto & Motor Vehicles", "Baby Products",
-    "Children's Products", "Content Standards", "Cosmetic Products",
-    "Dietary Supplements", "Digital Goods", "Drugs & Paraphernalia",
-    "Electronics & RF", "Food Products", "General-Use Products",
-    "Hazardous Items", "Home Goods", "Intellectual Property",
-    "Jewelry/Precious Metals", "Medical Devices", "Medical Foods",
-    "Military & Law Enforcement", "Offensive Content", "PFAS Chemicals",
-    "Pet Products", "Plants & Seeds", "Recalled Products",
-    "Ride-Ons & Micromobility", "Software", "Textiles & Apparel",
-    "Tobacco & Vaping",
-)
-
 # 旧手写 `_norm_key`(折叠空白 + casefold + 弯引号归直)在语料上的实测命中数,
 # 2026-09-02 归并前跑出来的。新实现**只许升不许降**:归一化放宽的理由就是它。
-_BASELINE_JOINS = {"today": 15, "official": 16}
+_BASELINE_OFFICIAL_JOINS = 16
 
 
 def test_widening_the_join_key_never_loses_ground_on_the_corpus():
@@ -332,40 +258,33 @@ def test_widening_the_join_key_never_loses_ground_on_the_corpus():
 
     放宽是判定面之外的事(`policy_join` 只喂报告,`policy_name` 一律保留原文),
     但"放宽"这种改动天然可疑:它可能在补上一处缺口的同时悄悄丢掉另一处。
-    所以这条守门量的是**两种表形态下的命中数**,与旧手写实现的实测值比:
-
-      · 「今天的表」= 改名落地前的 30 行近似(仓内唯一的那份);
-      · 「官方 42 名」= `policy_sync` 真跑后的目标态。
-
-    旧实现 15/19 与 16/19;新实现两边都必须 ≥,且改名后应当**一条不剩**——
+    所以这条守门量的是**语料里 19 个政策名在官方表上的命中数**,与旧手写实现
+    的实测值(16/19)比:只许升不许降,且改名落地后应当**一条不剩** ——
     `Plants & Seeds`(& vs and)、牛津逗号 Tobacco、不带 `(Covered Goods)` 的
     Jewelry 这三种报错写法,正是归并前白白进"政策表缺口"清单的那些。
+
+    ⚠ 2026-09-03 C 批删掉了这条用例的另一半(改名落地**前**那张 30 行近似表
+    上的命中数):那一半量的是旧名别名表这座桥,而桥与它的两头
+    (`POLICY_ALIASES` / `POLICY_LEGACY_NAMES`)已经拆了。今天的生产表就是
+    官方拼写,再钉一个"改名前也能对上"只会把退役的东西又焊回来。
     """
     wanted = sorted({r["expect_policy"] for r in REASONS if r.get("expect_policy")})
     assert len(wanted) == 19
-    today = [v for v in wanted if et.policy_join(v, _TODAY_TABLE)]
     official = [v for v in wanted if et.policy_join(v, KNOWN_POLICIES)]
-    assert len(today) >= _BASELINE_JOINS["today"], sorted(set(wanted) - set(today))
-    assert len(official) >= _BASELINE_JOINS["official"]
+    assert len(official) >= _BASELINE_OFFICIAL_JOINS
     # 改名落地后一条都不该剩(剩下的会进对照报告的「政策表缺口」清单)
     assert sorted(set(wanted) - set(official)) == []
-    # 改名前仍差两条 —— 武器族**表里真的没有**,是政策表的缺口,不是 join 的锅;
-    # 改名批补齐武器族之后自动消失(Jewelry 那条 2026-09-02 进映射表后已能 join)
-    assert sorted(set(wanted) - set(today)) == [
-        "Firearm Accessories",
-        "Knives and other Melee Weapons",
-    ]
 
 
 def test_the_join_key_still_refuses_to_merge_two_different_policies():
-    """⚠ 放宽的边界:词形可以削,语义不许合 —— 42 个官方名两两不撞
+    """⚠ 放宽的边界:词形可以削,语义不许合 —— 44 个官方名两两不撞
     (`policy_names` 那份实现自带守门,这里从**报告侧**再证一次:
     任意两个官方名之间不许 join 到对方)。"""
     keys = {et._norm_key(n) for n in KNOWN_POLICIES}
     assert len(keys) == len(KNOWN_POLICIES)
     for name in KNOWN_POLICIES:
         assert et.policy_join(name, KNOWN_POLICIES) == name
-    # 缩写差照旧不许自己合并(那是 POLICY_LEGACY_NAMES 的活)
+    # 缩写差照旧不许自己合并(那要人裁决,见 policy_sync 的「疑似改名对」)
     assert et._norm_key("Electronics & RF") != \
         et._norm_key("Electronics and Radio Frequency Devices")
 
@@ -603,13 +522,395 @@ def test_extract_policy_keeps_the_longest_official_name_whole():
         ("Alcohol", None)                            # synthetic
 
 
-def test_report_alias_notes_tell_retired_from_broken():
-    """真跑改名后别名指不到表是退役信号,不是故障;官方名也不在才告警(§十一)。"""
+def test_the_report_no_longer_carries_the_alias_health_line():
+    """报告头的「别名表健康」两行随别名表一起退役(2026-09-03 C 批)。
+
+    2026-09-02 真跑改名后的首份报告曾把 9 条已退役别名印成「静默失效」告警,
+    误导读数的人去核对政策表命名 —— 现在那张表没了,那两行也就没有了。
+    政策名对不上照旧在「政策表缺口」清单里显形,那才是它该待的地方。
+    """
+    import inspect
+
     from workflows import error_reclass_report as wf
 
-    official = set(resources.POLICY_LEGACY_NAMES.values()) | {"Alcohol"}
-    notes = wf._alias_notes(official)
-    assert len(notes) == 1 and "退役" in notes[0] and "⚠" not in notes[0]
-    assert wf._alias_notes(set(resources.POLICY_LEGACY_NAMES) | {"Alcohol"}) == []
-    notes = wf._alias_notes({"Alcohol"})
-    assert len(notes) == 1 and notes[0].startswith("⚠") and "静默失效" in notes[0]
+    src = inspect.getsource(wf)
+    assert "_alias_notes" not in src and "别名表" not in src
+    assert "政策表缺口" in src
+
+
+# ── 第四面:已经拉黑的那批 ASIN(所有者 2026-09-03 问的那件事)──────────────
+
+def test_黑名单面_把无原文与站不住的行分开报():
+    """⚠ 所有者原问:「禁售占了 4 万多个产品……这些产品的具体报错我们重新按新规
+    归类了吗?」答案是**没有**(新引擎一个生产写入路径都没接),而这一面把账摆出来。
+
+    三件事必须同时说清,少一件就会被误读成"可以批量翻案了":
+      ① `reason` 为空的行**无法重判** —— 历史导入那批本来就不带原文,
+         它多半是大头,不亮出来会让分母显得很小;
+      ② 有原文的也只是**截 200 字符的样本**,判据串可能被切掉 ⇒ 给的是**下限**;
+      ③ 新码认为"不是商品违禁"的行要单独点名,但**不等于授权翻案** ——
+         黑名单是「一次入选、永久禁止」的既定语义,改不改是所有者的裁决。
+    """
+    from workflows import error_reclass_report as wf
+
+    rows = [
+        ("B", "prohibited product. Walmart's Prohibited Products Policy: Alcohol.", 120),
+        # 旧码算永久禁售,新码认出病根是我方类目选错
+        ("B", "may be a prohibited product. Please make sure the appropriate "
+              "product type selected for this item.", 30),
+        # 旧码 F(限类)也进永久黑名单,新码是 GATED:没资质 ≠ 商品违禁
+        ("F", "This is a restricted category that requires pre-approval.", 9),
+        ("LEGACY", "", 4100),          # 历史导入:无原文,重判不了
+    ]
+    txt = "\n".join(wf.blacklist_section(rows, ["Alcohol"], 20, True))
+    assert "catalog.asin_blacklist" in txt
+    assert "4100 条" in txt and "无法重判" in txt          # ①
+    assert "下限" in txt and "200 字符" in txt              # ②
+    assert "站不住的黑名单行:39 条" in txt                  # ③ = 30 + 9
+    assert "不是自动翻案的授权" in txt
+    assert "B → PT_WRONG" in txt and "F → GATED" in txt
+    # 真·商品违禁那两条不许被点名
+    assert "B → POLICY  ←" not in txt
+
+
+def test_黑名单面_全是真违禁时不报那一段():
+    """一条站不住的都没有 → 不出「站不住」那一段(别给读的人加噪声,
+    也别让人以为报告坏了)。"""
+    from workflows import error_reclass_report as wf
+
+    txt = "\n".join(wf.blacklist_section(
+        [("B", "Prohibited Products Policy: Alcohol.", 5)], ["Alcohol"], 20, True))
+    assert "站不住的黑名单行" not in txt        # 那一段整段不出
+    assert "不是自动翻案的授权" not in txt
+    assert "B → POLICY" in txt
+
+
+def test_换轨已落地_入选路径吃的是新码():
+    """⚠ 2026-09-03 **换轨**:这条从"钉住现状"翻面成"钉住换轨结果"。
+
+    换轨前它钉的是「新引擎只被报告与评估消费,入选路径仍吃 A-L 码」;
+    所有者裁决后,入选那条路(problem_scan / feed_track → blacklist.record_asins)
+    改吃新 16 码,`PERMANENT` 换成他逐码定的七个(裁决表 §十二)。
+
+    修的是一个具体缺陷:旧 B(禁售)一个桶里混着 PT_WRONG —— 沃尔玛原话是
+    「要重新上架请把 product type 选对」,是修法不是禁令,却被永久拉黑
+    (存量实测 40,825 条)。**PT_WRONG 绝不许再回到 PERMANENT 里。**
+    """
+    from services import blacklist
+    assert blacklist.PERMANENT == set(et.PERMANENT_CODES)
+    assert "PT_WRONG" not in blacklist.PERMANENT
+    assert blacklist.BRAND_CATEGORIES == {"BRAND", "IP"}
+    # 旧引擎**已删**(2026-09-04 所有者定「旧码不需要留」):全仓归类只有
+    # `error_taxonomy.classify_reasons` 一条路。`_RULES` 保留但只是「旧码 →
+    # 中文名」的查表,给读历史数据的两处用 —— 读历史 ≠ 判据路径。
+    from services import problem_products
+    assert not hasattr(problem_products, "categorize")
+    assert problem_products._RULES["B"][0] == "禁售"      # 查表还在
+
+
+def test_回填不看事件里那个码_拿原文重判():
+    """⚠ 所有者 2026-09-04:「删除旧码,我们已经迁移到新码,旧码不需要留。
+    把口径做统一」。过渡桥(旧 A-L 码也算永久)已删 —— 它本身就是**把旧引擎
+    的错重新引进来的通道**:旧码 `B` 是混装桶,生产实测 40,827 条 `PT_WRONG`
+    混在里面,只有 3,512 条是真 `POLICY`。
+
+    2026-09-04 查出的两条岔路(方向相反,都静默):
+      · `backfill_from_events` 认新旧两套 ⇒ 把 blacklist_route 刚删的
+        ~41,600 条灌回来,摘要显示「历史回填 +41,600」看着像正常干活;
+      · `rebuild_asin_blacklist` 只认新码 ⇒ 擦净重灌**七万变几十**,同样不报错。
+    现在两条都拿事件原文过 `classify_reasons`,`is_permanent` 定去留。
+    """
+    import inspect
+    from services import blacklist
+    # 旧码通道整个删干净
+    for gone in ("backfill_codes", "brand_backfill_codes",
+                 "_LEGACY_PERMANENT", "_LEGACY_BRAND_CATEGORIES",
+                 "_label_case", "_BACKFILL_ASIN_SQL"):
+        assert not hasattr(blacklist, gone), gone
+    src = inspect.getsource(blacklist)
+    assert '"B": "POLICY"' not in src        # 旧码字面量不许再出现
+    # 两条路径必须都走同一个判据
+    for fn in (blacklist.backfill_from_events, blacklist.rebuild_asin_blacklist,
+               blacklist.backfill_counts):
+        assert "_judge_events" in inspect.getsource(fn), fn.__name__
+    judge = inspect.getsource(blacklist._judge_events)
+    assert "worst_verdict" in judge
+    assert "先判再擦" in inspect.getsource(blacklist.rebuild_asin_blacklist)
+
+
+def test_不是商品违禁那一集只有一份():
+    """⚠ 双轨禁止:报账的与回填的必须读同一份常量。
+
+    工作流之间不许 import,所以口径住在 `services/error_taxonomy`;
+    哪天有人在某个工作流里又抄一份字面量,这条会红。
+    """
+    from workflows import error_reclass, error_reclass_report
+    assert error_reclass.NOT_A_PRODUCT_BAN is et.NOT_A_PRODUCT_BAN
+    assert error_reclass_report._NOT_A_PRODUCT_BAN is et.NOT_A_PRODUCT_BAN
+    # FLAGGED / OTHER 故意不在里面:不能反过来断言"不是违禁"
+    assert "FLAGGED" not in et.NOT_A_PRODUCT_BAN
+    assert "OTHER" not in et.NOT_A_PRODUCT_BAN
+    # 每个码都得是码表里真有的
+    for code in et.NOT_A_PRODUCT_BAN:
+        assert code in resources.ERROR_CATEGORY_CODES, code
+
+
+def test_取原文只有一处实现_四级优先():
+    """⚠ 2026-09-04 生产实证:**判据统一 ≠ 口径统一**。同一段文本判成什么是
+    确定的,但不同路径拿到的「那段文本」不一样,于是同一个 ASIN 判出相反的码:
+
+      · walmart_items 全文,带句尾「To republish this item please make sure you
+        have the appropriate product type selected.」→ PT_WRONG(修法不是禁令)
+      · product_events 的 reason,句尾那句**不在**(`||…@@@…` 格式)→ POLICY
+
+    后果:**3,037 个品**被 blacklist_route 正确删掉、又要被回填错误加回来,
+    而两边摘要都显示正常。所以取原文与归类一样,只准有一处实现。
+    """
+    import inspect
+    from services import error_source, blacklist
+    from workflows import error_reclass
+    # 两个消费方都转调 services/error_source,自己不再实现
+    assert "error_source.pick" in inspect.getsource(error_reclass.pick_source)
+    assert "error_source.fetch" in inspect.getsource(error_reclass._sources)
+    # ⚠ `_judge_events` 2026-09-04 起**不走 error_source** —— 所有者定的判据是
+    #   「看产品历史,够格拉黑的那条最高优先级」,原文直接从 product_events 取全部,
+    #   不再是「取一条再四级补全」。四级优先仍服务 error_reclass 的存量复核。
+    # SQL 只在 services 里出生
+    src = inspect.getsource(error_reclass)
+    for gone in ("_SQL_SRC_RECORDS", "_SQL_SRC_ITEMS", "raw_reason\nFROM"):
+        assert gone not in src, gone
+    # 优先序本身是判据:全文压过样本,四处都没有 → 不猜
+    assert error_source.pick("A", "样本", "S", {"A": "全文"}, {"A": "事"},
+                             {"S": "件"}) == ("全文", "records")
+    assert error_source.pick("A", "样本", "S", {}, {"A": "事"},
+                             {"S": "件"}) == ("事", "events")
+    assert error_source.pick("A", "样本", "S", {}, {}, {"S": "件"}) == ("件", "items")
+    assert error_source.pick("A", "样本", None, {}, {}, {}) == ("样本", "self")
+    assert error_source.pick("A", "  ", None, {}, {}, {}) == ("", "none")
+
+
+def test_同一个ASIN两条源判出相反的码_这就是那3037条():
+    """把生产实测的两段原文钉成回归用例 —— 它们是 `services/error_source`
+    存在的全部理由。以后谁把取原文那一步简化掉,这条会红。"""
+    full = ("This item has been unpublished for violating Walmart's Marketplace "
+            "*Prohibited Product Policy*.  To republish this item please make "
+            "sure you have the appropriate product type selected for this item.")
+    partial = ("This item has been unpublished for violating Walmart's Marketplace "
+               "||Prohibited Product Policy@@@https://marketplacelearn.walmart.com"
+               "/guides/Prohibited-products")
+    assert et.classify_reasons(et.split_reasons(full)).code == "PT_WRONG"
+    assert et.classify_reasons(et.split_reasons(partial)).code == "POLICY"
+    # 一个该放、一个会被永久拉黑 —— 取错原文的代价就是这个
+    assert et.is_permanent("POLICY", None) is True
+    assert et.is_permanent("PT_WRONG", None) is False
+
+
+def test_items那一级要按asin也索引一份_否则sku对不上就查不中():
+    """⚠ 2026-09-04 生产实测:回填与路由的 2,261 条冲突里 **2,194 条(97%)**
+    出在这一处 —— 同一个 ASIN 在多店有**多个 sku**,`_judge_events` 拿的是
+    `product_events.sku`、`error_reclass` 拿的是 `asin_blacklist.src_sku`,
+    两个对不上 ⇒ items 那一级查不中 ⇒ 退回残缺的事件 reason ⇒ 判成 POLICY
+    而不是 PT_WRONG,于是把被正确释放的品又加回来。
+
+    ⚠ 开关必须**显式**:它是一次全表扫,分批调用的消费方(`error_reclass` 有
+    精确的 src_sku)不该付这个代价。
+    """
+    import inspect
+    from services import error_source, blacklist
+    from workflows import error_reclass
+    sig = inspect.signature(error_source.fetch)
+    assert sig.parameters["items_by_asin"].default is False   # 缺省不付代价
+    assert "extract_asin" in inspect.getsource(error_source.items_by_asin_map)
+    # ⚠ 消费方只剩 `error_reclass`(存量复核):那 14,474 条 self(残文)**有**
+    #   src_sku,但那个 sku 在 walmart_items 里已经不在了(下架删除),照样查不中,
+    #   所以要按 asin 兜底。它分批跑,故在**循环外**查一次、跨批复用。
+    #   (`_judge_events` 已改成直接读产品历史,不再需要这一档。)
+    #   ⚠ 2026-09-04 起这一次全表扫挪到 `run()`:事件遍与黑名单遍**共用同一份**
+    #     (scope=all 时各扫一遍是白付两次代价)。
+    run_src = inspect.getsource(error_reclass.run)
+    assert "error_source.items_by_asin_map(conn)" in run_src
+    for fn in (error_reclass._events_pass, error_reclass._blacklist_pass):
+        pass_src = inspect.getsource(fn)
+        assert "items_by_asin_map" not in pass_src, fn.__name__   # 不许每批扫
+        # 按 sku 命中的优先(调用方给的 sku 更精确)
+        assert "{**by_asin, **it}" in pass_src, fn.__name__
+    assert "{**items_by_asin_map(conn), **items}" in inspect.getsource(error_source.fetch)
+
+
+def test_多条事件取够格拉黑的那条_不是取最新():
+    """⚠ 所有者 2026-09-04 定稿:「一个产品的报错可能存在多次,**其中被拉黑的
+    那个作为最高优先级**,其他的都是作为记录」。
+
+    这**推翻了**此前那条「最新类别命中才算,『曾命中过』不作数」——
+    旧写法 `DISTINCT ON (asin) … ORDER BY occurred_at DESC` 只看最新一条,
+    于是一个品上个月被判 POLICY(该永久拉黑)、这个月记录是 EXPIRED(过期),
+    就**把历史上那条禁令忘了**,与「一次入选、永久禁止」的语义相反。
+
+    ⚠ 且**只读码,不重判原文**(所有者:「产品级的记录已经有产品事件在做了」)——
+    判定在 problem_scan 写事件那一刻发生过一次。
+    """
+    from services import blacklist
+    # 够格拉黑的那条说了算 —— **不管它在不在最后**
+    assert blacklist.worst_verdict(
+        [["EXPIRED", None], ["POLICY", None], ["PT_WRONG", None]]) == ("POLICY", None)
+    assert blacklist.worst_verdict(
+        [["POLICY", None], ["EXPIRED", None]]) == ("POLICY", None)
+    # 一条都不够格 → None(调用方据此不拉黑)
+    assert blacklist.worst_verdict([["EXPIRED", None], ["PT_WRONG", None]]) is None
+    # OTHER 是混装桶:只有两个显式词条算永久 —— 所以事件里必须存 term
+    assert blacklist.worst_verdict([["OTHER", "business decision"]]) \
+        == ("OTHER", "business decision")
+    assert blacklist.worst_verdict([["OTHER", "currently under review"]]) is None
+    # 空 / 缺项都不炸
+    assert blacklist.worst_verdict([]) is None
+    assert blacklist.worst_verdict(None) is None
+    assert blacklist.worst_verdict([["POLICY"]]) == ("POLICY", None)
+
+
+def test_pick的items那一级_sku与asin两个都要试():
+    """⚠ 2026-09-04 实遇的**第二个** bug:`fetch(items_by_asin=True)` 按 asin
+    补了索引,而 `pick` 只查 `items.get(src_sku)` —— **索引加了、查法没改**,
+    补进来的 asin 键永远查不到,冲突数纹丝不动(2,261 → 2,263)。
+
+    sku 更精确排前面;sku 失效(下架删除)或对不上时按 asin 兜底。
+    """
+    from services import error_source as es
+    # sku 命中 → 用 sku 那份
+    assert es.pick("B0X", None, "S-1", {}, {}, {"S-1": "按sku", "B0X": "按asin"}) \
+        == ("按sku", "items")
+    # sku 查不中 → 退到 asin,**而不是**掉到 self
+    assert es.pick("B0X", "残文", "S-9", {}, {}, {"B0X": "按asin"}) \
+        == ("按asin", "items")
+    # 手上压根没有 sku 时也要试 asin
+    assert es.pick("B0X", "残文", None, {}, {}, {"B0X": "按asin"}) \
+        == ("按asin", "items")
+    # 两个都没有才轮到自己那份残文
+    assert es.pick("B0X", "残文", "S-9", {}, {}, {}) == ("残文", "self")
+
+
+def test_复核出结论就把category改成新码_LEGACY与判不出的不动():
+    """⚠ 所有者 2026-09-04:「旧 A-L 码入选然后按新码复核过,那么现在库里保留的
+    应该就只有新码,没有旧码残留……不要做双轨,没有意义,以新规则统一」。
+
+    两条不动:① `LEGACY`(历史继承,所有者说「保留原样没有问题」);
+             ② 判不出的(code 为 NULL)—— 没结论就没有可写的东西。
+    ⚠ **拦截行为仍然一个字没变**:上架闸拦的是「这个 asin 在不在表里」,
+    `category` 只进提示文字;飞书「来源」列也不变(source_label 经 _NAMES
+    把新码映射回旧中文标签)。
+    """
+    from workflows import error_reclass as wf
+    from services import blacklist
+    sql = wf._SQL_BL_SET
+    assert "category = CASE WHEN category = 'LEGACY' OR %(code)s::text IS NULL" in sql
+    assert "THEN category ELSE %(code)s::text END" in sql
+    assert "source   = CASE WHEN category = 'LEGACY'" in sql   # 来源标签跟着走
+    # ⚠ 2026-09-04 实遇:`IS NULL` 位的转型不能省 —— psycopg 把每个 %(code)s
+    #   展开成独立占位符,那个位置没有列可以推类型,PG 报
+    #   AmbiguousParameter: could not determine data type of parameter $1。
+    #   赋值位由列推得出来,判断位推不出来。
+    for frag in ("%(code)s::text IS NULL", "ELSE %(code)s::text",
+                 "ELSE %(source)s::text"):
+        assert frag in sql, frag
+    assert "%(code)s IS NULL" not in sql        # 不许有裸的(会炸)
+    # 飞书那一列的文字确实不变
+    assert blacklist.source_label("POLICY") == "沃尔玛-禁售"
+    assert blacklist.source_label("BRAND") == "沃尔玛-品牌"
+
+
+def test_产品事件是产品级记录_下游只读码():
+    """⚠ 所有者 2026-09-04:「产品级的记录已经有产品事件在做了。我们改了新归类,
+    **产品事件跟随更新了吗?**」—— 换轨(2026-09-03)只改了写入侧,历史事件的
+    `detail.category` 还是旧 A-L 码,全仓没有任何改它的代码。
+
+    这才是根:此前是在**读的时候**一遍遍重判原文来绕开旧码,而正确的做法是
+    **让账本本身是对的** —— 判定只在 `problem_scan` 发生一次,其余全是查询。
+    """
+    import inspect
+    from services import blacklist
+    from workflows import error_reclass
+    # ① 有一条回填事件码的路(scope=events),且盖版本号能断点续跑
+    assert "problem_categorized" in error_reclass._SQL_EV_PICK
+    assert "detail->>'taxonomy_version' IS DISTINCT FROM %(ver)s" in \
+        error_reclass._SQL_EV_PICK
+    assert "jsonb_build_object('category'" in error_reclass._SQL_EV_SET
+    assert "'taxonomy_term'" in error_reclass._SQL_EV_SET   # OTHER 判永久要它
+    assert error_reclass._parse({"scope": "events"})[0] == "events"
+    # ② 下游只读码,不再重判原文
+    judge = inspect.getsource(blacklist._judge_events)
+    assert "classify_reasons" not in judge and "worst_verdict" in judge
+    sql = blacklist._HISTORY_SQL
+    assert "detail->>'category'" in sql and "detail->>'taxonomy_term'" in sql
+    assert "GROUP BY 1" in sql and "coalesce(asin, sku) AS asin" in sql
+    assert "DISTINCT ON" not in sql        # 不许退回「只取最新一条」
+
+
+def test_restore只接回被截掉的那段_不换成别的文本():
+    """⚠ `error_source.restore` 的两条判据,2026-09-04 事故换来的(§17):
+
+    ① 候选必须**以 own 为前缀** —— 是前缀就是同一段文本被切之前的样子;不是
+       前缀就是**另一次报错**,拿它判这一格等于串账;
+    ② `own` 必须够到 `SAMPLE_LEN`(200)—— 短于它的那份根本没被我们切过,
+       此时"更长的候选"是另一段更长的文本(比如后来又追加了一条理由),
+       接上去就等于拿后来的状态改写历史那一格。
+    """
+    from services import error_source as es
+    full = ("This item has been unpublished for violating Walmart's Marketplace "
+            "*Prohibited Product Policy*. Please review the policy documentation in "
+            "the Seller Help Center for the complete list of restricted categories. "
+            "To republish this item please make sure you have the appropriate "
+            "product type selected for this item.")
+    sample = full[:es.SAMPLE_LEN]
+    assert len(sample) == 200
+    # ① 是延长 → 接回来,并记下从哪一级还原的
+    assert es.restore(sample, (("records", None), ("items", full))) == (full, "items")
+    assert es.restore(sample, (("records", full), ("items", None))) == (full, "records")
+    # ① 更长但**不是**延长 → 不能用
+    assert es.restore(sample, (("items", "另一次报错" * 200),)) == (sample, "self")
+    # ② own 没够到 200(没被切过)→ 一律不还原
+    short = "Item is prohibited."
+    assert es.restore(short, (("items", short + " Extra reason appended later."),)) \
+        == (short, "self")
+    # 候选与 own 一样长(就是同一份)→ 无事可做
+    assert es.restore(sample, (("items", sample),)) == (sample, "self")
+    # 空 / 缺项都不炸
+    assert es.restore(None, (("items", full),)) == ("", "self")
+    assert es.restore(sample, None) == (sample, "self")
+    # 这就是那次事故的两个结果:全文 PT_WRONG(可放)/ 残文 POLICY(永久禁)
+    assert et.classify_reasons(et.split_reasons(full)).code == "PT_WRONG"
+    assert et.classify_reasons(et.split_reasons(sample)).code == "POLICY"
+
+
+def test_对照报告要覆盖全文语料_且把残片分出去():
+    """⚠ 所有者 2026-09-04:「没归类到的报错原文……如果它本来就是不规范的那种,
+    那就不入库也可以」。要照这句话做判断,清单里就**只能有真的原文**。
+
+    三个缺口(都在这次补上):
+      ① `audit.walmart_error_records.raw_reason` 是 NOT NULL 的**全文**,却
+         完全不在报告里 —— 而事件回填第三轮实测它是最大的还原来源(47,956 条);
+      ② 事件那一面只读 `detail->>'reasons'`(复数),而写入方写的是
+         `'reason'`(单数)⇒ 这一面长期近乎空转,摘要照样显示正常;
+      ③ `asin_blacklist.reason` 是 200 字样本,它归不出类可能只是**我们自己
+         切坏的**,混进"未识别"清单会让人误判成"沃尔玛写得不规范"。
+    """
+    import inspect
+    from workflows import error_reclass_report as wf
+    from services import error_source
+    # ① 全文语料这一面在
+    assert "audit.walmart_error_records" in wf._SQL_RECORDS
+    assert "raw_reason" in wf._SQL_RECORDS
+    src = inspect.getsource(wf.run)
+    assert '"all", "records"' in src
+    assert "walmart_error_records(raw_reason 全文)" in src
+    # ② 键名两种都读
+    assert "coalesce(detail->>'reasons', detail->>'reason')" in wf._SQL_EVENTS
+    # ③ 残片单独一栏,不进"未识别"清单
+    t = wf._Tally("t")
+    cut = "x" * error_source.SAMPLE_LEN            # 正好 200 = 我们切的
+    t.add(cut, 3, ())
+    assert t.unknown == {} and sum(t.unknown_cut.values()) == 3
+    t2 = wf._Tally("t2")
+    t2.add("x" * (error_source.SAMPLE_LEN + 1), 5, ())   # 201 字 = 真原文
+    assert sum(t2.unknown.values()) == 5 and t2.unknown_cut == {}
+    # 报告文本里要把这层区别说清楚,不能只在代码里
+    lines = "\n".join(wf._fmt_lists(t, 20, True))
+    assert "残片" in lines and "不是沃尔玛写得不规范" in lines

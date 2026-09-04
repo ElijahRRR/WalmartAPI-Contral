@@ -38,9 +38,19 @@ CREATE TABLE catalog.products (
     amazon_category text,
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
-    -- 审核结论(由审核服务产出)
-    audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
+    -- 审核结论(由审核服务产出;2026-09-02 第三步 B1 起**三段分列**)
+    audit_status    text,        -- 判定结果:pending / approved / rejected
+    audit_reason    text,        -- **类别**:官方政策类别名(表内原拼写)/
+                                 -- 内部黑名单 / 类目准入。pass 与 pending 一律
+                                 -- NULL;**没有兜底类别**(判拒而无类别 = 代码
+                                 -- bug,落 NULL + 计数,见 audit_reason.STATS)
+    audit_detail    text,        -- **具体内容**(B1 新列):L3 拒 = 原文片段 +
+                                 -- 条款要点(中文 ≤120 字);规则拒 = 命中规则
+                                 -- 翻成的人话;pending = 待定原因;pass = NULL。
+                                 -- ⚠ 存量行不迁移:老结论的 audit_reason 里还混
+                                 -- 着中文句子/旧政策名,被重审前原样留着,飞书
+                                 -- 投影按"有 audit_detail 用新格式,没有就用老
+                                 -- 格式"渲染(workflows/product_audit._project_to_sheet)
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     pt_source       text,        -- PT 来历(2026-08-14 定稿):walmart_confirmed=沃尔玛
                                  -- 真接受过 / audit_llm=审核链 LLM 推断。catmap_mine 只数
@@ -296,6 +306,20 @@ CREATE TABLE catalog.product_events (
     source text NOT NULL, error_code text, detail jsonb,
     occurred_at timestamptz NOT NULL DEFAULT now()
 );
+-- ⚠ `problem_categorized` 的 detail 归类四键(2026-09-04,所有者:「产品级的
+-- 记录已经有产品事件在做了」)——**产品级判定的账本就是这里**,下游
+-- (`services/blacklist._judge_events` → 该不该拉黑)只读码、不再拿原文重判:
+--   category / name        新 16 码与中文名(写入方 problem_scan;存量由
+--                          `error_reclass -p scope=events` 回填)
+--   taxonomy_term          OTHER 是混装桶,`is_permanent` 靠这个显式词条
+--   taxonomy_version       增量谓词(同 audit_runs.audit_version 的套路)
+--   taxonomy_src           这一行的码是拿哪一级原文判的:records / items /
+--                          self(事件自己那份)/ keep(**没重判,原样留着**)
+-- ⚠ `detail.reason` 到 2026-09-04 为止被 `[:200]` 截过(判用全文、存留残文),
+--   所以回填**不许**拿它简单重判 —— 那次把 2,595 条判对的 PT_WRONG 改成了
+--   POLICY(可放 → 永久禁)。改法是 `error_source.restore`(候选须以事件自己
+--   那份为前缀,只接回被切掉的那段)+ 一道棘轮(已是新码且还原不了就不动,
+--   落 `taxonomy_src='keep'`)。全文见 docs/error_taxonomy.md §17。
 -- 读侧视图 ×4(2026-08-11 补齐消费面;身份键一律 coalesce(asin, sku)——
 -- 按订货号原文聚合时,三段式 sku 名下的删除史拦不住同 ASIN 换号重上):
 --   product_risk        全局风险档案(上架/提交/删除/停用/缺席/未生效计数,
@@ -686,6 +710,27 @@ ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统�
 写入方 problem_scan 尾段(2026-08-14 批次 E 前是 problem_product_cleanup) + asin_blacklist_import(一次性);
 消费方:上架拦截 + 审核 Phase0 ASIN 闸(全表,不分类别)。
 
+⚠ **新码四列**(2026-09-03,工作流 `error_reclass` 回填;所有者「标准不统一,
+审核误差很大」):`taxonomy_code` / `taxonomy_policy` / `taxonomy_version` /
+`taxonomy_src`。
+
+- **`category` 已按新码统一**(2026-09-04 所有者裁决:「不要做双轨,没有意义,
+  以新规则统一」):`error_reclass` 复核出结论就把 `category` 改写成新码,
+  `LEGACY`(历史继承)与判不出的两类不动。
+  ⚠ **拦截行为仍然一个字没变**:判定链(Phase0 ASIN 闸)拦的是「这个 asin
+  在不在表里」,`category` 只进提示文字。让新码改变拦截行为(把按
+  `PT_WRONG`/`GATED` 拉黑的行放出来)是**另一次裁决** —— 黑名单的既定语义是
+  「一次入选、永久禁止」,批量放行是破坏性动作,归 `blacklist_route`,
+  不许在回填里顺手接上去。
+- `taxonomy_src` 记原文从哪儿找到的,四级优先、**全文优先于样本**
+  (唯一实现 `services/error_source.pick`):
+  `records`(`audit.walmart_error_records.raw_reason`,全文)→ `events`
+  (`catalog.product_events` 病历)→ `items`(`catalog.walmart_items` 当前值,
+  先按 `src_sku` 精确对、再按 asin 兜底)→ `self`(本表 `reason`,
+  **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分判出来的码是下限)→
+  `none`(四处都没有 ⇒ `taxonomy_code` 留 **NULL**,不猜)。
+- `taxonomy_version` 是增量谓词,同 `audit_runs.audit_version` 的套路。
+
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
 
 旧 `seen_sku_categories.json`(20.1 万对)的落点,「错误统计」报表累计数的
@@ -746,8 +791,10 @@ ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.
 | `violation_groundtruth` | 打标真值(批次 B 双跑校准黄金集) | audit_import 搬入 |
 | `walmart_error_records` | 错误商品日报 97k 行(precision 证据 + 实证类目反哺源) | audit_import 搬入;增量同步链批次 B 定 |
 | `walmart_pt_meta` / `walmart_pt_spec` | PT 元数据 7033 / 官方 spec 摘要 6942 | ⚠ 反推表(旧仓无 DDL):列类型按 sync 脚本推定,audit_import dry-run 与生产实表对照后才准导入。⚠ **`walmart_pt_meta` 已不是死快照**:risk_sync 每次同步 TRUNCATE + 全量重灌(services/risk_gate.sync_pt_meta,空读拒绝重灌 + 骤缩护栏),它是 R1 准入闸 / R3 认证闸唯一查的表,改前先看下面 `pt_meta_change_log` 那行;`walmart_pt_spec` 由 pt_spec_sync 重建,2026-08-21 起 R3 已不再读它 |
-| `walmart_prohibited_policy` | 沃尔玛禁售政策(L3 的 S4 政策块 `ORDER BY id` 全表渲染;S2 候选块与 L3 的 reason_category 白名单也出自它;归类报告的政策名 join 也查它)。旧仓一次性搬入 37 行,**整个武器族缺失** —— 2026-09-01 起由 `policy_sync` 按官方 42 类同步 | ⚠ 反推表(旧仓无 DDL),且**一表两区,维护方不同**(定稿 `docs/policy_sync.md` §二/§八.1):<br>**① policy_sync 同步列(机器区,程序写,人别手改)**:`category_en`(**= 全链唯一键**,2026-09-02 §十.7 定稿:**表内名一律改为官方拼写** —— 对上但拼写不同的行由独立一条 `_RENAME_SQL` 改名,**id 不变**;存量缩写名(`Drugs & Paraphernalia`、`Electronics & RF` 一族)靠 `registry.resources.POLICY_LEGACY_NAMES` 认领;新增行同样用官方拼写,`id = max(id)+1` 起。⚠ 旧口径「存量行不改名」已作废)、`full_policy`(官方英文全文,来源 `refdata/policy_pages/en/*.md` 转录件)、`official_url`、`policy_updated_at`(官方页 Last Updated;抽不到置 NULL,原文留 `raw.last_updated_raw`,**不拿抓取日顶替**)、`synced_at`、`raw`(jsonb:source/file/content_sha256/chars/last_updated_raw/header_fetched_at)。<br>**② 人工列(中文/运营区,policy_sync 一律不读不写)**:`category_zh`、`overall_status`、`preapproval`、`zh_seller_risk`、`prohibited_items`、`conditional_items`、`preapproval_items`、`legal_refs`、`zh_seller_notes` —— 英文要点句填进去会中英混列,新增行留 NULL 等人工。<br>⚠ **表里有、官方没有的行不删**(只进报告)。<br>⚠ **改名的下游**:`category_en` 是 L3 的 reason_category 白名单(`audit_l3.valid_reason_categories`)、`audit_reason._normalize_l3_cat(known=…)` 与报错文本 join(`error_taxonomy.policy_join`)的同一个来源 —— 三处都吃 `ctx.known_policies`(`SELECT category_en FROM audit.walmart_prohibited_policy`),表改名后一起变,不会掉队。存量 reject 行的 `catalog.products.audit_reason` 仍挂着旧缩写名,按 `AUDIT_RULES_VERSION = c.2026-09-02.1` 全量重审刷新。<br>⚠ **dry-run 必须人眼核对两处**:①「将改名」清单;②「未对上」清单(只是拼写差就补进 `POLICY_LEGACY_NAMES` 再重跑,报告的「疑似改名对」提示是入口)。<br>⚠ **真跑连带后果两条**(摘要逐条提醒,都不会自己发生):①**内容变了 = L3 判定输入变了**,`AUDIT_RULES_VERSION` **已随本批递增**,首跑无需再手动提版(⇒ L3 的 system prompt 逐字节变化,`catalog.llm_cache` 那一批**全量未命中**;与全量重审叠加 = **全额重付**,见 `docs/policy_sync.md` §十.7 成本口径);②新增行人工中文列全 NULL,S4 现渲染为**空壳标题**(只有 `category_en`)待运营补中文。<br>喂 LLM 的"机器喂入版"**不落库**,由 `services/policy_feed.render_feed_text` 从 `full_policy` 渲染时派生(渲染件**已落地进测试**,**S4 接线随第三步 L3 批**;当前 S4 仍读中文人工列)|
-| `audit_runs` / `audit_hits` | 逐次审核结论 + 逐条规则命中(reject 永久短路的依据) | audit_import 搬历史;product_audit 批次 B 起追加 |
+| `walmart_prohibited_policy` | 沃尔玛禁售政策(L3 的 S4 政策块 `ORDER BY id` 渲染**官方英文全文**;S2 候选块与 L3 的类别枚举也出自它;归类报告的政策名 join 也查它)。旧仓一次性搬入 37 行,**整个武器族缺失** —— 2026-09-01 起由 `policy_sync` 按官方类别同步(2026-09-02 起 44 篇:42 类禁售 + 内容族两页) | ⚠ 反推表(旧仓无 DDL),且**一表两区,维护方不同**(定稿 `docs/policy_sync.md` §二/§八.1):<br>**① policy_sync 同步列(机器区,程序写,人别手改)**:`category_en`(**= 全链唯一键**,2026-09-02 §十.7 定稿:**表内名一律改为官方拼写** —— 对上但拼写不同的行由独立一条 `_RENAME_SQL` 改名,**id 不变**;存量缩写名(`Drugs & Paraphernalia`、`Electronics & RF` 一族)2026-09-02 真跑时靠 `registry.resources.POLICY_LEGACY_NAMES` 认领改名,**该映射与那一级对行 2026-09-03 C 批已退役** —— 今后对行只认词形,改名走报告的「疑似改名对」人工裁决;新增行同样用官方拼写,`id = max(id)+1` 起。⚠ 旧口径「存量行不改名」已作废)、`full_policy`(官方英文全文,来源 `refdata/policy_pages/en/*.md` 转录件)、`official_url`、`policy_updated_at`(官方页 Last Updated;抽不到置 NULL,原文留 `raw.last_updated_raw`,**不拿抓取日顶替**)、`synced_at`、`raw`(jsonb:source/file/content_sha256/chars/last_updated_raw/header_fetched_at)。<br>**② 人工列(中文/运营区,policy_sync 一律不读不写)**:`category_zh`、`overall_status`、`preapproval`、`zh_seller_risk`、`prohibited_items`、`conditional_items`、`preapproval_items`、`legal_refs`、`zh_seller_notes` —— 英文要点句填进去会中英混列,新增行留 NULL 等人工。<br>⚠ **表里有、官方没有的行不删**(只进报告)。<br>⚠ **改名的下游**:`category_en` 是 L3 的类别枚举(`audit_l3.policy_enum`,= 表内全部 + 两条非政策类别)、规则自报类别的装配期守门(`audit_rules.check_rule_policies`)与报错文本 join(`error_taxonomy.policy_join`)的同一个来源 —— 三处都吃 `ctx.known_policies`(`SELECT category_en FROM audit.walmart_prohibited_policy`),表改名后一起变,不会掉队。存量 reject 行的 `catalog.products.audit_reason` 仍挂着旧缩写名,按 `AUDIT_RULES_VERSION = c.2026-09-03.2` 重审刷新(所有者定稿 §六.8:以 `audit_sheet` 按需重审为主,批量走 `mode=stale`)。<br>⚠ **dry-run 必须人眼核对两处**:①「将改名」清单;②「未对上」清单(先看报告的「疑似改名对」有没有点到它 —— 那是改名的人工入口)。<br>⚠ **真跑连带后果两条**(摘要逐条提醒,都不会自己发生):①**内容变了 = L3 判定输入变了**,`AUDIT_RULES_VERSION` **已随本批递增**,首跑无需再手动提版(⇒ L3 的 system prompt 逐字节变化,`catalog.llm_cache` 那一批**全量未命中**;与全量重审叠加 = **全额重付**,见 `docs/policy_sync.md` §十.7 成本口径);②新增行若 `full_policy` 为空,**S4 整条跳过并计数**(2026-09-02 B1:空壳标题给 LLM 等于没给,却会让它以为"这一类看过了";它仍在 S2 候选里,那正是要人去补全文的信号,计数进 `product_audit` 摘要)。<br>喂 LLM 的"机器喂入版"**不落库**,由 `services/policy_feed.render_feed_text` 从 `full_policy` 渲染时派生 —— **2026-09-02 第三步 B1 已接线 S4**(人工中文列不再进提示词)|
+| `walmart_error_records` | 沃尔玛后台报错记录(飞书报表同步进来的历史账本,`raw_reason` **NOT NULL**——所有者 2026-09-03 说的"报错原文是有的"就是这一列)。⚠ **新列 `taxonomy_code` / `taxonomy_policy` / `taxonomy_version`**(2026-09-03,工作流 `error_reclass` 回填):老列 `error_code char(1)` 是旧 A-L 码,**保留不删**——它是拉黑那批行的历史依据,删了就没法对照"当初按什么拉的黑"。`taxonomy_version` 是**增量谓词**(同 `audit_runs.audit_version` 的套路):`IS DISTINCT FROM 当前 ERROR_TAXONOMY_VERSION` 天然分页,跑一半中断直接重跑 | 飞书报表同步;`error_reclass` 回填新码 |
+| `audit_runs` / `audit_hits` | 逐次审核结论 + 逐条规则命中(reject 永久短路的依据)。⚠ **两列语义 2026-09-02 B1 收窄、列名不改**:`l3_reason_category` = **类别**枚举、`l3_reason_text` = **具体内容**(改名要连百万级存量行一起迁,不值;新写入的行按新语义,老行按 `audit_version` 分辨)。硬拒规则的类别在 `audit_hits.detail` 的 `category` 键里自报;**L3 的 reject 行 detail 是七键定序**(2026-09-03 `c.2026-09-03.2` 把 `product_is` / `policy_quote` 追加在末尾 —— 前者是「本体」、后者是触发判定的那句政策原文逐字,**都不参与判定,只为排查**:判错时分得清是本体认错还是条款引错;老行少这两键,取不到即 `None`。⚠ **pass 不落 hit**,本体在库里没有落点,只在 `logs/<workflow>.log` 的 `L3 <asin> …` 那行 INFO 里)。⚠ **新列 `audit_version`**(2026-09-02 B2):这一行是哪一版判据判的,由 `services/audit_store._RUN_SQL` 写入 `AUDIT_RULES_VERSION`。存在的理由是**回放评估分不清新旧链** —— 表里原本没有版本痕迹,`mode=stale` 一跑,每个 asin 的「最近一次 run」就变成新链自己的结论,拿它当旧链基线就是自己跟自己比而且数字看着正常;存量行为 NULL = 旧链(`audit_replay` 的基线谓词是 `audit_version IS DISTINCT FROM <当前版本>`)| audit_import 搬历史;product_audit 批次 B 起追加 |
+| `replay_results` | **回放评估结果**(2026-09-02 B2,规格 `docs/audit_step3_spec.md` §3.8):反例=沃尔玛已裁决的下架品、正例=在架在售品,重跑**当前生产链**并与沃尔玛裁决 / 旧链最近一次 `audit_runs` 三方对照。主键 `(run_tag, asin)`,同 tag 重跑覆盖(改完提示词再回放一次,对同一批样本比)。`expected_category` 为 NULL = 只比判定不比类别(BRAND / PROHIBITED_FINAL 那两类沃尔玛没给可对表的政策名);内容族两名互认(`registry.resources.AUDIT_CONTENT_POLICIES`)。⚠ **这是 `audit_replay` 唯一写的表** —— 结论权威仍在 `catalog.products` / `audit_runs`,回放一个字都不碰它们 | audit_replay(手动跑,不进调度)|
 | `amazon_taxonomy` / `amazon_node_paths` | 亚马逊类目树:节点级属性按 node_id 一行 / **路径级**关系按 (node, parent, full_path) 三元组 —— browse tree 是 DAG,同一 node 可挂多个父,按 ID 去重会静默丢掉多路径 | taxonomy_import(文件段)+ taxonomy_derive(中间层反推,source=derived_products) |
 | `category_path_alias` | 类目路径别名(叶子相等 + 顶级相等 + 段集重叠 ≥0.5):映射精确匹配未命中时折到 canonical 再查 | catmap_align |
 | `category_map_suggestions` | 类目映射缺口建议 —— **纯建议、零消费**,人工确认后升级进 walmart_category_map 才生效 | catmap_suggest / catmap_mine |

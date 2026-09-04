@@ -532,7 +532,7 @@ dry-run 核对;④ `--execute` 跑一轮;⑤ 次日 catalog_sync 之后再跑一
 6. **挂新调度**(**接线以 `registry/schedule.py` 为准**;2026-08-26 现状与本条原
    计划已不同:product_ingest 是独立长驻 launchd 每小时 :50、不是 5 分钟级;
    product_audit 不是每小时,而是 product_chain 13:00 跑
-   `mode=online stages=L0 limit=1000000` + audit_sheet 18:10 跑 `from_sheet=1`),
+   `mode=online stages=L0`(2026-09-03 起不给 limit)+ audit_sheet 18:10 跑 `from_sheet=1`),
    顺序约束 catalog_sync → sources_backfill → product_refresh → product_audit
    → maintenance_scan → problem_scan → maintenance
    → problem_product_cleanup --execute → list_new(20:00);

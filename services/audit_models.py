@@ -59,19 +59,12 @@ class ProductInfo:
                                      # L0 类目闸按它判"属不属于某棵禁售子树"
                                      # ——父级不覆盖子级的老毛病靠它根治
 
-    @property
-    def searchable_text(self) -> str:
-        """输入:自身 title/bullets/description → 输出:换行拼接的大文本。
-
-        逐字迁自 pipelines/models.py:29-36:bullets **不截断**、falsy 段过滤、
-        "\\n" 连接。L2 的黑名单/关键词扫描用它;**Phase0 商标规则不用**
-        (那里另拼一份 hay:bullets 只取前 5 条、desc 只取前 1000 字符)。
-        """
-        parts = [self.title or ""]
-        parts.extend(self.bullet_points)
-        if self.long_description:
-            parts.append(self.long_description)
-        return "\n".join(p for p in parts if p)
+    # ⚠ `searchable_text`(title + 全部五点 + 长描述拼一大段)2026-09-03 删除:
+    # 它最后一个消费者是 L0 品牌黑名单扫描,而所有者当天定稿**只扫标题**
+    # (词表 4.2 万条里混着 corner / life / wooden 这类通用词,扫描述等于把
+    # 送进 L3 的品牌词清单(≤10)灌满噪声,真正在品牌位上的那个词反而挤不进去)。
+    # L0 商标符号规则一直是自己另拼 hay(五点前 5 条 + 描述前 1000 字符),不受影响。
+    # 要再加扫描面,先想清楚"多扫的那一段会把什么挤出前 10",别直接把这个属性加回来。
 
 
 @dataclass
@@ -89,16 +82,24 @@ class RuleHit:
 
 @dataclass
 class Phase0Result:
-    """Phase 0 精准前置过滤结果(飞书黑名单 / 类目禁售 / 商标符号 / 品牌黑名单)。
+    """Phase 0 前置过滤结果(黑名单三表 / 商标符号 / 专利自述 / Made in USA / 品牌)。
 
-    blocked=True 时整个流程直接终止,不进 L1/L2。
-    四条规则串行短路,所以 hits 最多只有 1 条。
+    **双输出**(2026-09-03 C 批,规格 §4.1):
+      · `hits`   —— 硬拒(penalty -100)。任一命中即 blocked=True、整条流水线终止,
+        串行短路所以最多 1 条;
+      · `evidence` —— 软证据(penalty 0)。**只在全部硬规则未命中时**才跑出来,
+        blocked=False,判定继续往 L1 走,证据随产品进 L3(`summarize_evidence`)。
+
+    所以 `blocked=True` 的结果里 `evidence` 恒空(硬拒当场返回,软规则没跑),
+    `audit_hits` 一次 run 可以落多条 L0 行(硬 1 条,或软 n 条),
+    但 `stage_stopped_at='L0'` 的语义不变 —— **只有硬拒才停**。
     """
 
     blocked: bool = False
     matched_brand: str | None = None      # 品牌/商标短语命中
     matched_category: str | None = None   # Amazon 类目命中(飞书表或 8 大类)
     hits: list[RuleHit] = field(default_factory=list)
+    evidence: list[RuleHit] = field(default_factory=list)   # 软证据(penalty 0)
 
 
 @dataclass
@@ -178,6 +179,9 @@ class AuditOutcome:
         bag: list[RuleHit] = []
         if self.phase0 is not None:
             bag.extend(self.phase0.hits)
+            # L0 软证据(C 批双输出):硬拒 hits 在前、软证据在后 —— 两者互斥
+            # (硬命中当场返回,软规则不跑),这个顺序只是把落库序写死
+            bag.extend(self.phase0.evidence)
         if self.l1 is not None:
             bag.extend(self.l1.hits)
         for r in (self.l2, self.l3, self.l4):

@@ -15,15 +15,9 @@ from services import problem_products as pp
 from workflows import problem_scan as scan
 
 
-def test_categorize_rules_and_priority():
-    assert pp.categorize("The End Date has passed for this item") == ("A", "过期")
-    assert pp.categorize("violates Prohibited Product Policy") == ("B", "禁售")
-    # 同文本命中 C 与 A → 严重性顺序 C 先(具体归类优先,A 过期最后)
-    both = "restricts certain brands ... end date has passed"
-    assert pp.categorize(both)[0] == "C"
-    assert pp.categorize("Intellectual Property complaint") == ("E", "知产")
-    assert pp.categorize("完全无关的文本") == ("Z", "其他")
-    assert pp.categorize(None) == ("Z", "其他")
+# ⚠ 2026-09-04:`test_categorize_rules_and_priority` 随 `problem_products.categorize()`
+# 一起删 —— 所有者定「删除旧码」。problem_scan 的归类现在走
+# `error_taxonomy.classify_reasons`(守门在 tests/test_error_taxonomy.py 的语料断言)。
 
 
 def test_relist_machinery_is_retired_for_good():
@@ -91,7 +85,7 @@ def test_plan_routing_and_dedup():
     assert n["delete"] == 3                  # 双击那条不计在 delete(摘要按行重算)
     # Stage 行照常归类(J 类进病历/摘要),只是不再改变走向
     stage_row = [r for r in plans["T1"]["delete"] if r["sku"] == "S_STAGE"][0]
-    assert stage_row["category"] == "J"
+    assert stage_row["category"] == "STAGE"        # 换轨前是旧码 J(特殊)
 
 
 def test_to_dispositions_splits_double_hit():
@@ -110,9 +104,11 @@ def test_to_dispositions_carries_category_and_reason():
     plans, _ = scan.plan([_item("T1", "S_B", "violates Prohibited Product Policy")],
                          inflight=set(), inactive=set())
     (row,) = scan.to_dispositions(plans)
-    assert (row["action"], row["category"]) == ("delete", "B")
+    assert (row["action"], row["category"]) == ("delete", "POLICY")
     assert "Prohibited" in row["reason"]
-    assert row["detail"]["cat_name"] == "禁售"
+    # cat_name 现在是新码表的中文名(ERROR_CATEGORY_CODES);飞书「来源」列
+    # 那一栏仍走 blacklist.source_label,故意留在旧词表上(禁售/品牌/知产…)
+    assert row["detail"]["cat_name"] == "违反禁售政策"
 
 
 def test_stubborn_sql_binds_to_listing_generation():
@@ -229,7 +225,7 @@ def test_preview_writes_nothing(monkeypatch):
                         lambda conn, since=None, hours=None: [])
     out = scan.run({"preview": "1"})
     assert "preview" in out and "删除 1" in out
-    assert "类别={B:1}" in out and "删除样本=[('S_B', 'B')]" in out
+    assert "类别={POLICY:1}" in out and "删除样本=[('S_B', 'POLICY')]" in out
 
 
 def test_absence_probe_failure_does_not_stop_the_scan(monkeypatch):
@@ -535,13 +531,13 @@ def test_l_system_error_now_deletes_like_everything_else():
     ]
     plans, n = scan.plan(items, inflight=set(), inactive=set())
     assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_L1", "S_L2"}
-    assert all(r["category"] == "L" for r in plans["T1"]["delete"])
+    assert all(r["category"] == "SYSTEM" for r in plans["T1"]["delete"])
     assert n["delete"] == 2
 
 
 def test_k_cluster_note_fires_on_concentration():
     """「内部标记」单条无信息量,聚集才是信号(实测谭总11 一店 45 条)。"""
-    items = [{"store": "T1", "sku": f"S{i}", "category": "K"}
+    items = [{"store": "T1", "sku": f"S{i}", "category": "FLAGGED"}
              for i in range(scan._K_CLUSTER_WARN)]
     note = scan._k_cluster_note(items)
     assert "T1" in note and "风险" in note
@@ -631,3 +627,19 @@ def test_wfs_blocked_sql_reads_only_the_latest_attempt():
     assert "ORDER BY store, sku, submitted_at DESC" in q
     assert "feed_type = 'DELETE_ITEM'" in q
     assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"
+
+
+def test_归类事件存全文_不许再截200():
+    """⚠ 2026-09-04:这本账是**产品历史**,而所有者定的判据是「看产品历史,
+    够格拉黑的那条最高优先级」—— 截到 200 字符正好把沃尔玛写在**句尾**的判据串
+    砍掉(「…To republish this item please make sure you have the appropriate
+    product type selected.」),于是 PT_WRONG 被判成 POLICY、**可修复的品被
+    永久拉黑**。生产实证:事件里的原文判 POLICY,而 walmart_items 全文判 PT_WRONG。
+
+    截断属于展示层,不属于账本。
+    """
+    import inspect
+    from workflows import problem_scan
+    src = inspect.getsource(problem_scan)
+    assert '(it["reasons"] or "")[:200]' not in src
+    assert '"reason": it["reasons"] or None' in src

@@ -934,3 +934,39 @@ main ⇄ 本分支对照,**意图数 343 → 351,多出 8 条**(标题 +3、价�
    三者都没有跨店依赖,先全量算再 Python 过滤与只算单店同集合。
    全店计数器(`压掉 12419` → `544`、`title_mismatch 1870` → `76`)的差异是下推的
    **预期**结果:main 那几行统计的是全库、本分支统计的是本店。
+
+### 9.6 生产试点实录(2026-09-04):第一个不透明码上线
+
+**批次 2 的新码上架试点通过**,`python cli.py list_new -p store=谭总12 -p limit=1`。
+本仓第一个真上生产的不透明 SKU:**`AACSVCEH397R`**(ASIN `B0BWMVQHVJ`,
+feed `18D215093E3B5EE8B5028024A6ED9780@AXkBBgA`)。
+
+四处落地逐条核过,**三张表对同一个品说同一件事**:
+
+| 落点 | 值 | 要看的点 |
+|---|---|---|
+| `catalog.listing_sources` | `sku=AACSVCEH397R` `source_type=amz` `source_key=B0BWMVQHVJ` `workflow=list_new`,`abandoned_at`/`replaced_by` 均空 | **`source_key` 是 ASIN 不是新码** —— 新码上线后唯一能反查回亚马逊的地方,而它只在我们库里 |
+| 上架表 | C=`AACSVCEH397R`,M=Yes,N=feedId,O=2026-09-04(**同一次落地**) | 没出现「已提交但无码」;T 登记日期 / U 查询编码 仍空 ⇒ 程序确实不碰人工列 |
+| `ops.feed_log` / `ops.feed_items` | `MP_ITEM` / `submitted`;SKU 级台账记的是新码 | 台账里不再有 ASIN |
+| `catalog.upc_pool` | `sku=AACSVCEH397R` `upc=600819136176` `status=used` `asin=B0BWMVQHVJ` | **复用键仍是 `asin`,`sku` 列已是真码** —— 决策 E 默认 (a) 口径的生产实证 |
+
+码形态合规:12 位、首位 `A`(amz)、其余 11 位全在 `23456789ABCDEFGHJKMNPQRSTVWXYZ` 内,
+无 0/O、1/I/L、U。**沃尔玛侧已无法从 SKU 反查货源** —— 立项目标在这一行上达成。
+
+同轮闭环一并验过:5 候选推采集 → 0 分钟落定 → 按批摄取 5 → 身份更新 5 →
+预备期 1/1 通过 → 提交 1 条;LLM 零调用(二级复用旧出参)。
+
+**顺带纠正 §5.4 的一条记录**:所有者 2026-09-04 上传的 US 官方 Item spec
+(`specs/MP_ITEM/5.0.20260608-18_15_07-api/_orderable.json`)**含 `SkuUpdate` 字段**,
+描述原文「allows the replacement of a previously submitted SKU associated with a
+standardized unique identifier (i.e. GTIN, ISBN, UPC, EAN)」——此前蓝图记的是
+「US 侧未点名 SkuUpdate」,现已有 US 官方 schema 出处。按蓝图既定判据
+(§遗留问题 6:「以 Get Spec 拉回的 schema 是否含相应字段为准」)**形态 A 的依据成立**。
+两条旁证:① `required` 里含 `country_of_origin_substantial_transformation`,而官方明写
+MP_MAINTENANCE **不可改 COO** ⇒ 该 `required` 对 MP_MAINTENANCE 不生效,partial update
+复用同一份 schema、放宽必填;② 本仓只下载 MP_ITEM 一份 spec bundle
+(`registry/paths.mp_item_spec_dir()`、`workflows/spec_split`),**不存在
+`specs/MP_MAINTENANCE/` 目录** —— 原验收清单里那条 `grep -rl SkuUpdate
+"$SPECS/MP_MAINTENANCE/"` 天然返回空,**测法本身无效**,不能据它判形态 B。
+⚠ 这仍是 schema 层面的推断:真正的实测是 `sku_migrate` 发一个真 MP_MAINTENANCE feed
+并由观测定案 —— 即「六件实测第 1、2 件」与「批次 3 第一级投放」是**同一件事**。

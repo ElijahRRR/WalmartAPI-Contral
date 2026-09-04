@@ -243,6 +243,11 @@ def test_统一之后不许再报对角线矩阵():
     src = inspect.getsource(wf._blacklist_pass)
     assert "k[0] != k[1]" in src                    # 只留换了码的
     assert "入选码**全部没变**" in src               # 全对角线时说清楚
+    # ⚠ LEGACY 判得出新码但 `category` **有意不改写** —— 混进"变了"那一栏就是
+    #   摘要说变了、库里没变(2026-09-04 实遇:394 条 LEGACY→X 全被算成变了)
+    assert 'k[0] != "LEGACY"' in src
+    assert "按裁决保持 " in src and "不算「码变了」" in src
+    assert "category = CASE WHEN category = 'LEGACY'" in wf._SQL_BL_SET
 
 
 def test_站不住要按会不会被放行分两栏():

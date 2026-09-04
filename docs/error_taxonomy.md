@@ -1719,3 +1719,24 @@ python cli.py blacklist_push -p backfill=1
 | 重判 / 原样不动 | 57,444 / 193,704 | 58,661 / 192,487 | 76,855 / **174,293** |
 | 码变了 | 11,031 | 214 | **5** |
 | 换轨后真损失 | 349 | 262 | **12** |
+
+
+### 18.3 收官这一轮的账(版本 `t.2026-09-04.1`)
+
+| 面 | 判了 | 结果 |
+|---|---:|---|
+| `audit.walmart_error_records` | 97,002 | `OTHER` **归零**(`GATED` 293 → 294,正是补的那一条);政策名 join 1,609 条 / 27 类 |
+| `catalog.product_events` | 251,148 | 重判 76,855,**码变了 0**;还原来源 records 47,956 / items 27,372 / dispositions 1,527 |
+| `catalog.asin_blacklist` | 32,716 | 入选码**全部没变**(22,302);`LEGACY` 394 条判出新码但按裁决**不改写** `category` |
+
+⚠ 那 394 条 `LEGACY` 一度被摘要算进「入选码变了」—— 而 `_SQL_BL_SET` 明确不改写
+`LEGACY` 的 `category`,**摘要说变了、库里没变**。已单列成一栏说清楚。
+
+**还没对齐的一件**:`blacklist_route` 删行读的是**行级**码
+`asin_blacklist.taxonomy_code`,而产品级判定已经统一到事件账本
+(`blacklist._judge_events`)。`product_level_keep` 已实现但**从未真跑过** ——
+跑它之前先看 `-p apply=0` 的三路计划。
+
+**黑名单那 14,474 条 `self`(200 字样本)** 仍是下限:`pick` 走的是四级优先,
+没有接 `restore` + `dispositions`(§17.3 决定不在事故修复里顺手改口径)。
+这是下一个 PR 可以做的一件事,预期能把其中一部分提到全文。

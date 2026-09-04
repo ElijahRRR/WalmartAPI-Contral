@@ -478,7 +478,12 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
         # ⚠ `category` 统一到新码之后(2026-09-04),这张矩阵**大部分是对角线**
         #   (`FLAGGED → FLAGGED`),信息量归零 —— 只报**真的换了码**的那些,
         #   剩下的报个总数。留着全量对角线只会让人以为"还在迁移中"。
-        moved = Counter({k: v for k, v in matrix.items() if k[0] != k[1]})
+        # ⚠ `LEGACY` 要单列:它判得出新码,但 `_SQL_BL_SET` **有意不改写**它的
+        #   `category`(所有者:「历史继承保留原样没有问题」)。混进"变了"那一栏
+        #   就是**摘要说变了、库里没变** —— 这条工作流最不该出的那种错。
+        legacy = Counter({k[1]: v for k, v in matrix.items() if k[0] == "LEGACY"})
+        moved = Counter({k: v for k, v in matrix.items()
+                         if k[0] != k[1] and k[0] != "LEGACY"})
         same = sum(v for k, v in matrix.items() if k[0] == k[1])
         if moved:
             out.append(f"  入选码**变了**的(其余 {same:,} 条码没变):")
@@ -486,6 +491,12 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
                     for (old, code), n in moved.most_common(15)]
         else:
             out.append(f"  入选码**全部没变**({same:,} 条)—— 已统一到新码")
+        if legacy:
+            out += [f"  `LEGACY` 历史继承 {sum(legacy.values()):,} 条:判出了新码"
+                    f"(写进 `taxonomy_code` 列),但 **`category` 按裁决保持 "
+                    f"`LEGACY` 不改写** —— 所以这些**不算「码变了」**:",
+                    "    " + "  ".join(f"{c}×{n}"
+                                       for c, n in legacy.most_common(10))]
     # ⚠ 「站不住」= 新码属于 `NOT_A_PRODUCT_BAN`(病根不是产品本身违禁)。
     #   它与**去留**是两个正交的问题:去留看 `is_permanent`(所有者裁决的七码
     #   + OTHER 两词条)。两张表都含 `GATED` —— 品类准入拿不到,产品本身不违禁

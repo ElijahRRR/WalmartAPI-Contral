@@ -187,10 +187,34 @@ def test_absence_probe_failure_blocks_the_store(monkeypatch):
     assert not ok and any("闸②水位" in ln for ln in lines)
 
 
-def test_executing_disposition_blocks_the_store(monkeypatch):
+def test_executing_dispositions_report_but_do_not_block_the_store(monkeypatch):
+    """⚠ 所有者 2026-09-04 复议:闸③**只报数,不拦整店**。
+
+    改前是"整店 executing 非零即拦",而 `open_executing_count` 自己的头注说的是
+    「改码会把**它等的那个 (店, SKU)** 键换掉」—— 危害逐 (店,SKU),按整店计数拦
+    是粗放的过近似。生产事实:每天 13:00 价格/库存/标题三条链齐发,之后任何一家店
+    都有几百条 executing ⇒ 按整店拦 = 改码永远开不了工。判据里也没有任何跨 SKU
+    依赖(settle / settle_maintenance / expire_executing 全部逐 (店,SKU) 判)。
+
+    真正的危害搬到了候选判据「无未了结处置」上,而且**更严**(连 suggested 一起拦)。
+    """
     ok, lines = _preflight_out(monkeypatch, executing=3)
-    assert not ok
-    assert any("闸③处置" in ln and "3 条 executing" in ln for ln in lines)
+    assert ok, lines
+    ln = next(ln for ln in lines if "闸③" in ln)
+    assert "3 条 executing" in ln and "不拦整店" in ln     # 上下文要给人看见
+
+
+def test_the_real_guard_moved_to_a_per_candidate_condition():
+    """危害搬家了就要在新家钉住:逐候选判据必须同时拦 suggested 与 executing,
+    并且**只看已落定与否**(settled_at),不看别的 SKU。"""
+    cond = next(sql for n, _w, sql in sm._CONDS if n == "无未了结处置")
+    assert "FROM ops.dispositions d" in cond
+    assert "d.store = w.store" in cond and "d.sku = w.sku" in cond   # 逐 (店,SKU)
+    assert "'suggested'" in cond and "'executing'" in cond
+    assert "d.settled_at IS NULL" in cond
+    assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY        # 两处同源
+    why = next(w for n, w, _sql in sm._CONDS if n == "无未了结处置")
+    assert "删除成功" in why and "假确认" in why    # 最狠的那条后果要写在人话里
 
 
 def test_open_retire_cooldown_blocks_the_store(monkeypatch):
@@ -871,13 +895,14 @@ def test_a_blocked_preflight_still_settles_but_never_submits(monkeypatch):
     反过来写会死锁:一条不相干的 executing 处置就能让整店的 pending 永远定不了案,
     而那些旧码正被缺席抑制着 —— 没有任何东西会报。
     """
-    _wire(monkeypatch, executing=1)
-    read = _read_conn(monkeypatch, [])
+    # 闸③改成只报数之后,这里换用仍然会拦的闸④(自愈链在途退役)
+    _wire(monkeypatch)
+    read = _read_conn(monkeypatch, [], cooldown=1)
     monkeypatch.setattr(sm.feeds, "submit_feed",
                         lambda *a, **k: pytest.fail("前置闸未过不许提交"))
     monkeypatch.setattr(sm.listing_sheet, "read_rows", lambda upto=None: [])
     out = sm.run({"store": "T1", "execute": True})
-    assert "前置闸未过" in out and "闸③处置" in out
+    assert "前置闸未过" in out and "闸④自愈链" in out
     assert "本轮提交 0" in out
     # 定案面照查(账要清),候选面一条都不查(上限被压到 0)
     assert any("FROM listing.sku_migrations m" in sql for sql, _ in read.sqls)
@@ -944,8 +969,8 @@ def test_naming_nothing_that_matches_says_so_instead_of_looking_empty(monkeypatc
 def test_naming_never_beats_a_blocked_gate_and_says_it_never_looked(monkeypatch):
     """闸未过(或 settle_only)⇒ 上限 0 ⇒ **一条候选 SQL 都不发**。
     这时也必须说清"点了 N 个、一个都没查",否则看起来像点名没生效。"""
-    _wire(monkeypatch, executing=1)
-    read = _read_conn(monkeypatch, [])
+    _wire(monkeypatch)
+    read = _read_conn(monkeypatch, [], cooldown=1)
     monkeypatch.setattr(sm.listing_sheet, "read_rows", lambda upto=None: [])
     monkeypatch.setattr(sm.feeds, "submit_feed",
                         lambda *a, **k: pytest.fail("前置闸未过不许提交"))

@@ -140,9 +140,9 @@ _STALLED = "stalled"
 #  SQL
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: 改码候选的**七条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
-#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把七条 AND 起来**选行**,
-#: `_SQL_WHY` 把同样这七条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
+#: 改码候选的**九条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
+#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把九条 AND 起来**选行**,
+#: `_SQL_WHY` 把同样这九条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
 #: 文本共用一份,所以不可能"选取用一套、解释用另一套":那种漂移的表现是摘要说
 #: "它满足条件",而它就是不在候选面里,谁也不报错。
 #: 形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:手打就是
@@ -176,6 +176,23 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
      "NOT " + sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku")),
     ("有 Product ID", "观测里 upc 与 gtin 都是空:载荷没号可匹配(**不猜**)",
      "(w.upc IS NOT NULL OR w.gtin IS NOT NULL)"),
+    # ⚠ 这一条替下了原来那个整店闸(所有者 2026-09-04 复议,见 `_preflight` 闸③)。
+    # 两种危害都只发生在**同一个 SKU** 上:
+    #   ① executing 的建议等的是 (店, 旧码) 的观测判决 —— 改码后旧码从目录里消失,
+    #      而一条等着判决的 **DELETE** 建议会把"这个 SKU 不见了"读成
+    #      `delete_verified` = **删除成功**。那是一次假确认,而且不报错;
+    #   ② suggested 的建议马上会被 claim 成一条打在**旧码**上的 feed,
+    #      而那时旧码可能已经不存在了。
+    # 所以 `suggested` 与 `executing` 一起拦 —— 比原来的整店闸更严,但只严在
+    # 该严的那一个品上。已落定的行(settled_at 非空)不算数:账已经清了。
+    ("无未了结处置",
+     "该 (店, 旧码) 还有未落定的处置建议(suggested/executing):executing 那条"
+     "等的是旧码的观测判决,改码后旧码消失会被读成「删除成功」的假确认;"
+     "suggested 那条马上会变成一条打在旧码上的 feed。等它落定再改",
+     """NOT EXISTS (SELECT 1 FROM ops.dispositions d
+                  WHERE d.store = w.store AND d.sku = w.sku
+                    AND d.settled_at IS NULL
+                    AND d.status IN ('suggested', 'executing'))"""),
     ("无未了结改码台账",
      "该 (店, 旧码) 已有 pending/confirmed/stalled 的改码台账(不许开第二条)",
      """NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
@@ -394,15 +411,22 @@ def _preflight(conn, store_name: str) -> tuple[bool, list[str]]:
     else:
         lines.append("  ✓ 闸②目录水位新鲜")
 
+    # ⚠ **闸③只报数,不拦**(所有者 2026-09-04 复议,改前是整店 executing 非零即拦)。
+    # 改前的理由写在 dispositions.open_executing_count 头注里,而那段话自己说的是
+    # 「改码会把**它等的那个 (店, SKU)** 键换掉」—— 危害是逐 (店,SKU) 的,按整店
+    # 计数拦是粗放的过近似。所有者的生产事实:每天 13:00 价格/库存/标题三条链
+    # 齐发,任何一家店在那之后都有几百条 executing;按整店拦 = 改码永远开不了工。
+    # 而改 A 商品的码,不会影响 B 商品那条改价建议的判决 —— 判据里没有任何跨 SKU
+    # 依赖(settle / settle_maintenance / expire_executing 全部逐 (店,SKU) 判)。
+    # **真正的危害搬到了 `_CONDS` 的「无未了结处置」逐候选判据上**,而且比整店闸
+    # 更严:那里连 `suggested` 一起拦(它马上就会变成一条打在旧码上的 feed)。
+    # 这一行留着是因为它是有用的**上下文**:改码期间这家店有多少条在等判决,
+    # 人看摘要时该知道。
     n_exec = dispositions.open_executing_count(conn, store_name)
-    if n_exec:
-        ok = False
-        lines.append(f"  ⛔ 闸③处置:{store_name} 有 {n_exec} 条 executing 处置在途"
-                     f"(DELETE/RETIRE feed 已提交、正等观测判决,指着的是**旧码**)。"
-                     f"改码会让它永远等不到判决,并把同 (店,SKU,动作) 的新建议堵死;"
-                     f"等 problem_product_cleanup 那批落定再来")
-    else:
-        lines.append("  ✓ 闸③无在途处置(executing = 0)")
+    lines.append(f"  ✓ 闸③处置:{store_name} 有 {n_exec} 条 executing 在途"
+                 f"(**不拦整店** —— 危害逐 (店,SKU),由候选判据「无未了结处置」"
+                 f"逐个剔;那条连 suggested 一起拦)"
+                 if n_exec else "  ✓ 闸③无在途处置(executing = 0)")
 
     with conn.cursor() as cur:
         cur.execute(_SQL_COOLDOWN_OPEN, {"store": store_name})
@@ -711,7 +735,7 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
     六类理由,来源各不相同:
 
       · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
-      · 不满足七条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
+      · 不满足九条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
       · 旧码上有在途 feed;· 同批 Product ID 撞号 —— 两道后置闸;
       · 满足全部条件但**本轮节奏闸没轮到**(按 SKU 升序先来后到,下轮再来);
       · 店下查无此行(目录 × 登记簿的交集里没有它:拼错 / 不在册 / 从没扫到过)。
@@ -790,7 +814,7 @@ def _candidates(conn, store_name: str, limit: int, *,
 
     候选 = 在架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
     ∧ 观测到的 upc/gtin 至少有一个 ∧ 该 (店, 旧码) 无未了结的改码台账
-    (七条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
+    (九条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
 
     `only_skus` / `only_keys`(`-p skus=` / `-p asins=`,取并集)与
     `exclude_skus` / `exclude_keys` 是**同一条候选 SQL 的参数化条件**,

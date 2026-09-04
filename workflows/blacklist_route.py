@@ -40,6 +40,7 @@ EXPIRED / SPECIAL,以及 `OTHER` 的其他词条)。主体是 **PT_WRONG** —�
 
 import json
 import logging
+import pathlib
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -138,11 +139,22 @@ def plan_lines(rows, ver: str, stale: int) -> tuple[list[str], Counter, Counter]
     return out, doomed, kept
 
 
-def _dump(rows, cols) -> str:
-    """输入:待删行 → 输出:备份文件路径(jsonl,一行一条)。"""
+def _backup_path():
+    """输出:本轮备份文件路径。**整轮只算一次**(2026-09-04 实遇的坑)。
+
+    ⚠ 原来时间戳是在 `_dump` 里算的,而 `_dump` 每批调一次、戳到秒 ——
+    42,113 条分 9 批跑完只花了 1 秒多,于是备份**裂成了两个文件**
+    (…042420Z 装前 30,000 条,…042421Z 装后 12,113 条),而摘要只报最后
+    那一个。真要回滚的人照摘要去找,会少掉三万行**而且不会发现**。
+    删数万行不可逆,备份是唯一的网 —— 一轮一个文件,路径在 run() 里定死。
+    """
     paths.backups_dir().mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = paths.backups_dir() / f"blacklist_route_{stamp}.jsonl"
+    return paths.backups_dir() / f"blacklist_route_{stamp}.jsonl"
+
+
+def _dump(rows, cols, path) -> str:
+    """输入:待删行 + 本轮备份路径 → 输出:该路径(jsonl,一行一条,追加)。"""
     with path.open("a", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(dict(zip(cols, (
@@ -191,7 +203,7 @@ def run(params: dict) -> str:
             return "\n".join(out + ["", "没有要删的行,库已经与新标准对齐。"])
 
         deleted = 0
-        backup = ""
+        backup = str(_backup_path())      # 整轮一个文件,不是每批一个
         while True:
             take = chunk if not limit else min(chunk, limit - deleted)
             if take <= 0:
@@ -201,7 +213,7 @@ def run(params: dict) -> str:
                 rows = cur.fetchall()
             if not rows:
                 break
-            backup = _dump(rows, _COLS)          # 闸 2:删前先落备份
+            _dump(rows, _COLS, pathlib.Path(backup))   # 闸 2:删前先落备份
             with conn.cursor() as cur:
                 cur.execute(_SQL_DELETE, {"asins": [r[0] for r in rows]})
             conn.commit()

@@ -89,7 +89,7 @@ def test_删前必须落备份():
     """所有者选的是"直接删行",备份不改变这一点,只是把溯源留在库外 ——
     数万行的不可逆操作,值这一个文件。⚠ 顺序也钉:**先 dump 再 DELETE**。"""
     src = inspect.getsource(wf.run)
-    assert "_dump(rows, _COLS)" in src
+    assert "_dump(rows, _COLS" in src
     i_dump, i_del = src.index("_dump(rows"), src.index("_SQL_DELETE")
     assert i_dump < i_del, "备份必须写在 DELETE 之前"
     # 备份要带全行(含新码四列),只存 asin 等于没存
@@ -135,3 +135,23 @@ def test_缺列时给人话不甩traceback():
     assert "db_init" in src
     assert "error_reclass -p force=1" in src
     assert "conn.rollback()" in src           # PG 报错后不回滚会连累后续每一查
+
+
+def test_一轮只落一个备份文件():
+    """⚠ 2026-09-04 生产实遇:42,113 条分 9 批、1 秒多跑完,而时间戳戳到秒
+    且在 `_dump` 里逐批算 —— 备份**裂成两个文件**(前 30,000 条一个、后
+    12,113 条一个),摘要只报最后那一个。真要回滚的人照摘要去找,会少掉
+    三万行**而且不会发现**。
+
+    删数万行不可逆,备份是唯一的网:路径必须整轮算一次。
+    """
+    src = inspect.getsource(wf.run)
+    # 路径在进循环之前定死,循环里只往同一个文件追加
+    assert "backup = str(_backup_path())" in src
+    i_path, i_loop = src.index("_backup_path()"), src.index("while True:")
+    assert i_path < i_loop, "备份路径必须在批循环之外算"
+    # `_dump` 自己不许再算时间戳(算了就又每批一个文件)
+    assert "strftime" not in inspect.getsource(wf._dump)
+    assert "strftime" in inspect.getsource(wf._backup_path)
+    # 追加模式:同一轮多批要落进同一个文件,不是互相覆盖
+    assert '"a"' in inspect.getsource(wf._dump)

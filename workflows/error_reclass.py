@@ -342,8 +342,9 @@ def _events_pass(conn, ver: str, chunk: int, force: bool, limit: int,
 
     所以这一遍先还原原文(`error_source.restore`:候选必须以事件自己那份为
     前缀 ⇒ 只接回被切掉的那段,不换成别的时间点的文本),再按这条判:
-      · 还原成功 → 拿全文重判并写(这也正是**修 2,595 条**的路径:
-        当初那段全文就在 `walmart_items.unpublished_reasons` 里);
+      · 还原成功 → 拿全文重判并写(这也正是**修那批行**的路径:当初那段全文
+        还在 `walmart_error_records` / `walmart_items` / `ops.dispositions`
+        三处之一 —— 最后那条是 `problem_scan` 当轮写的全文副本,回填从没碰过);
       · 没还原、但 `detail.category` **已经是新码** → 不动
         (`problem_scan` 用的文本只会比我们手上这份更全,重判只会更差);
       · 没还原、码还是旧 A-L(或空)→ 判残文写进去,这才是真正的"下限"。
@@ -360,11 +361,16 @@ def _events_pass(conn, ver: str, chunk: int, force: bool, limit: int,
         #   **另一条**事件的文本判这一条就是串账 —— 所以丢掉,只用两条外源。
         rec, _ev, it = _sources(conn, akeys, skus)
         it = {**by_asin, **it}          # 按 sku 命中的优先
+        # 第四条外源:`ops.dispositions.reason` 是 problem_scan 当轮的**全文**,
+        # 而回填从没碰过那张表 —— 被残文覆盖的事件,全文只剩这一份副本了
+        # (生产实测:确认救不回来的 349 条里 335 条在这儿对得上)。
+        disp = error_source.dispositions_map(conn, skus)
         sets, keeps = [], []
         for ev_id, own, cat, sku, akey in rows:
-            full, src = error_source.restore(
-                own, (("records", rec.get(akey)),
-                      ("items", it.get(sku) or it.get(akey))))
+            cands = [("records", rec.get(akey)),
+                     ("items", it.get(sku) or it.get(akey))]
+            cands += [("dispositions", t) for t in disp.get(sku, ())]
+            full, src = error_source.restore(own, cands)
             src_stat[src] += 1
             if src == "self" and cat in resources.ERROR_CATEGORY_CODES:
                 keeps.append({"id": ev_id, "ver": ver})     # 棘轮:不动

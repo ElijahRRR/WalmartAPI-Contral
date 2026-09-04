@@ -1541,35 +1541,74 @@ A-L 码升级成新码(好),也能把全文判出的新码降级成残文判的�
 **③ `by_asin` 全表扫挪到 `run()`** —— 事件遍与黑名单遍共用一份,`scope=all`
 时不再各扫一遍。
 
-### 17.4 怎么修存量,以及救不回来的那部分
+### 17.4 修存量:两轮,以及最后 14 条
 
-被改坏的行有**精确指纹**:回填第一版**不写** `taxonomy_src`,而它盖了
-`taxonomy_version`。所以
+**血量 = 全表。** 第一版回填的指纹是「盖了 `taxonomy_version` 但**没有**
+`taxonomy_src`」,数出来 251,148 —— 它碰过每一行,不是只碰了 2,595 条。
 
 ```sql
--- 第一版回填碰过的行(数一下血量,不改任何东西)
-SELECT detail->>'category' AS now_code, count(*)
-FROM catalog.product_events
-WHERE event = 'problem_categorized'
-  AND detail->>'taxonomy_version' IS NOT NULL
-  AND NOT (detail ? 'taxonomy_src')
-GROUP BY 1 ORDER BY 2 DESC;
+-- 数血量(只读)。⚠ 判据两半都要:光写 `NOT (detail ? 'taxonomy_src')` 会
+--   把**从来没进过候选集**的行(reason 为空的 26,574 条)一起算进来。
+SELECT count(*) FILTER (WHERE detail->>'taxonomy_version' IS NOT NULL
+                          AND NOT (detail ? 'taxonomy_src')) AS 第一版残留,
+       count(*) AS 总行数
+FROM catalog.product_events WHERE event = 'problem_categorized';
 ```
 
-修:**必须带 `force=1`**(那些行已经盖了版本号,增量谓词会把它们排除):
+**第一轮**(棘轮 + `restore`,`records` / `items` 两条外源):
 
 ```bash
-python cli.py error_reclass -p scope=events -p force=1 --dry-run   # 先看形态
-python cli.py error_reclass -p scope=events -p force=1             # 真跑
-python cli.py blacklist_push -p backfill=1                          # 再看预览
+python cli.py error_reclass -p scope=events -p force=1 --dry-run
+python cli.py error_reclass -p scope=events -p force=1
+python cli.py blacklist_push -p backfill=1
 ```
 
-⚠ **救不回来的那部分**:原值被 `jsonb ||` 覆盖了,只能靠外源重新判出来。
-外源 = `walmart_error_records.raw_reason`(按 asin)与
-`walmart_items.unpublished_reasons`(按 sku,再按 asin 兜底)。
-品已被删除、`unpublished_reasons` 已清空、且报错记录里也没有的那些,
-**还原不了 ⇒ 落在棘轮的第二行 ⇒ 停在残文判出的码上**。
-摘要里 `原样不动 N 条` 就是这个数,跑完照着报。
+判 251,148 → 重判 57,444(码变了 11,031),**原样不动 193,704**。
+其中 **`4,167  POLICY → PT_WRONG`** 就是修回来的那批(≥ 当初报的 2,595,多出来的
+是同一个 bug 打在旧码行上的部分)。下游跟着回来:
 
-方向上它是**保守的**(该放的没放出来,不是不该上的上了),但这不是理由 ——
-它仍然是"回填把判对的行改错了"的残留。
+| | 事故后 | 修复后 |
+|---|---:|---:|
+| 产品级该永久拉黑 | 26,430 | **24,167**(−2,263) |
+| `blacklist_push -p backfill=1` 将新增 | 4,465 | **1,792**(−2,673) |
+
+**「原样不动」的 193,704 条要拆三堆看,大部分不是损失:**
+
+| | 条数 | 是不是损失 |
+|---|---:|---|
+| 原文不满 200 字(没被截过) | 61,832 | **零损失** —— 判的就是完整文本 |
+| 满 200 字、换轨(2026-09-03)**前** | 131,523 | **不是损失** —— 原值本来就是旧 A-L 码,残文是唯一拿得到的,这才是真正的"下限" |
+| 满 200 字、换轨**后** | **349** | 真损失:全文判过一次,被残文覆盖,又还原不回来 |
+
+那 349 条的影响面(精确算,两个方向都要报,不能只报保守那一边):
+涉及 316 个产品,**可能被冤枉永久拉黑 5 个**、**可能该拉黑却漏了 300 个**。
+
+**第二轮**:`ops.dispositions.reason` 存的是 `problem_scan` 当轮的**全文**
+(`to_dispositions` 没截断),而 `error_reclass` 从来没碰过那张表 —— 它是那批
+被残文覆盖的事件**最后一份全文副本**。实测 349 条里 **335 条(96%)** 能对上,
+于是把它加成 `restore` 的第四条候选源(⚠ 一个 sku 有多条建议时**全部**作为
+候选给出去,由前缀判据挑;只取最新一条会漏掉正好匹配的那条)。
+
+```bash
+python cli.py error_reclass -p scope=events -p force=1 --dry-run
+python cli.py error_reclass -p scope=events -p force=1
+python cli.py blacklist_push -p backfill=1
+```
+
+⚠ 只加进 `restore`,**不加进 `pick`**:黑名单那条路的口径 2026-09-04 已验收,
+往四级优先里插一级会把已定案的行重新洗一遍 —— 那是另一次改动,不在这次事故里
+顺手做。
+
+**剩下的 14 条**(349 − 335)原值被 `jsonb ||` 覆盖、四处外源都没有全文,
+**救不回来**,停在残文判出的码上。已知、已定量、不再追。
+
+```sql
+-- 残留复核(只读):换轨后 + 还原不了 + 原文正好 200 字
+SELECT detail->>'category', count(*)
+FROM catalog.product_events
+WHERE event = 'problem_categorized'
+  AND detail->>'taxonomy_src' = 'keep'
+  AND length(detail->>'reason') = 200
+  AND occurred_at >= '2026-09-03'
+GROUP BY 1 ORDER BY 2 DESC;
+```

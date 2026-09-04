@@ -74,6 +74,20 @@ SELECT sku, unpublished_reasons FROM catalog.walmart_items
 WHERE coalesce(unpublished_reasons, '') <> ''
 """
 
+#: 第四条外源,**只给 `restore` 用**(2026-09-04 加):`ops.dispositions.reason`
+#: 存的是 `problem_scan` 当轮的**全文**(`to_dispositions` 没截断),而
+#: `error_reclass` 从来没碰过这张表 —— 于是它是那批被残文覆盖的事件唯一还剩下的
+#: 全文副本。生产实测:确认救不回来的 349 条里 **335 条(96%)** 在这里能对上。
+#: ⚠ 一个 sku 可能有多条建议(delete/retire 双击、多轮),**全都作为候选给出去**,
+#:   由 `restore` 的前缀判据挑 —— 只取最新一条会漏掉正好匹配的那条。
+#: ⚠ 只进 `restore`,**不进 `pick`**:黑名单那条路的口径 2026-09-04 已验收,
+#:   往四级优先里插一级会把已定案的行重新洗一遍,那是另一次改动。
+SRC_DISPOSITIONS = """
+SELECT sku, reason FROM ops.dispositions
+WHERE sku = ANY(%(skus)s) AND coalesce(reason, '') <> ''
+ORDER BY sku, length(reason) DESC
+"""
+
 
 def fetch(conn, asins: list[str], skus: list[str], *,
           items_by_asin: bool = False) -> tuple[dict, dict, dict]:
@@ -105,6 +119,29 @@ def fetch(conn, asins: list[str], skus: list[str], *,
     if items_by_asin and asins:
         items = {**items_by_asin_map(conn), **items}   # 按 sku 命中的优先
     return records, events, items
+
+
+def dispositions_map(conn, skus: list[str]) -> dict:
+    """输入:一批 sku → 输出:{sku: [全文, …]}(长的在前,同一 sku 的全给出去)。
+
+    ⚠ 候选是**列表**不是单值:同一个 sku 会有多条建议(delete/retire 双击、
+    多轮扫描),哪一条是这一格事件的全文由 `restore` 的前缀判据决定,
+    在这里先挑就等于替它做判断。上限 5 条,防一个 sku 拖出几百条建议。
+    查不到就返回空:少一级原文是判得糙一点,炸掉是一条都判不了。
+    """
+    out: dict = {}
+    if not skus:
+        return out
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SRC_DISPOSITIONS, {"skus": skus})
+            for sku, text in cur.fetchall():
+                if text and len(out.setdefault(sku, [])) < 5:
+                    out[sku].append(text)
+    except Exception as e:                                      # noqa: BLE001
+        logger.warning("建议表读不到(本级跳过):%s", e)
+        conn.rollback()
+    return out
 
 
 def items_by_asin_map(conn) -> dict:

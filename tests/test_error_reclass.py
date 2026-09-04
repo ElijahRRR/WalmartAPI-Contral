@@ -278,12 +278,19 @@ _EV_SAMPLE = _EV_FULL[:200]          # problem_scan 当初写进事件的那一�
 
 
 class _EvCur:
-    """事件遍的假游标:按键集游标发行,并把 executemany 的 (SQL, 参数) 记下来。"""
+    """事件遍的假游标:按键集游标发行,并把 executemany 的 (SQL, 参数) 记下来。
 
-    def __init__(self, rows, log):
-        self.rows_all, self.log, self.rows = rows, log, []
+    也认第四条外源 `ops.dispositions`(建议表)—— 它是 `problem_scan` 当轮
+    全文的副本,回填从没碰过,所以是那批被残文覆盖的事件最后的还原来源。
+    """
 
-    def execute(self, _sql, args=None):
+    def __init__(self, rows, disp, log):
+        self.rows_all, self.disp, self.log, self.rows = rows, disp, log, []
+
+    def execute(self, sql, args=None):
+        if "ops.dispositions" in sql:
+            self.rows = list(self.disp)
+            return
         after, take = args["after"], args["chunk"]
         self.rows = [r for r in self.rows_all
                      if after is None or r[0] > after][:take]
@@ -302,13 +309,16 @@ class _EvCur:
 
 
 class _EvConn:
-    def __init__(self, rows):
-        self.rows, self.log = rows, []
+    def __init__(self, rows, disp=()):
+        self.rows, self.disp, self.log = rows, disp, []
 
     def cursor(self):
-        return _EvCur(self.rows, self.log)
+        return _EvCur(self.rows, self.disp, self.log)
 
     def commit(self):
+        pass
+
+    def rollback(self):
         pass
 
 
@@ -368,3 +378,20 @@ def test_事件遍不许拿别的时间点的文本判这一格(monkeypatch):
     wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
     u = [u for sql, ups in conn.log if "'category'" in sql for u in ups][0]
     assert u["src"] == "self" and u["code"] == "POLICY"
+
+
+def test_建议表是最后一份全文副本(monkeypatch):
+    """⚠ 2026-09-04 实测:确认救不回来的 349 条里 **335 条(96%)** 在
+    `ops.dispositions.reason` 里对得上 —— `to_dispositions` 存的是当轮**全文**,
+    而回填从来没碰过那张表,所以它是那批被残文覆盖的事件最后的全文副本。
+
+    ⚠ 同一个 sku 会有多条建议(delete/retire 双击、多轮扫描),**全都作为候选
+    给出去**,由前缀判据挑;只取最新一条会漏掉正好匹配的那条。
+    """
+    conn = _EvConn([(1, _EV_SAMPLE, "PT_WRONG", "SKU-1", "B0A")],
+                   disp=[("SKU-1", "另一条建议的原文,和这一格无关" * 20),
+                         ("SKU-1", _EV_FULL)])          # 最长的那条不是对的那条
+    monkeypatch.setattr(wf, "_sources", lambda c, a, s: ({}, {}, {}))
+    wf._events_pass(conn, "t.x", 100, True, 0, True, [], {})
+    u = [u for sql, ups in conn.log if "'category'" in sql for u in ups][0]
+    assert u["src"] == "dispositions" and u["code"] == "PT_WRONG"

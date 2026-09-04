@@ -238,27 +238,64 @@ def load_banned_asins(conn) -> dict:
 
 # ── 历史回填(blacklist_push -p backfill=1 / rebuild_brand=1 用,一次性)────────
 #
-# 从 product_events 的归类时间线按「每个 ASIN 的**最新**类别」推导入选——
-# 与实时链路同一条原则(最新类别命中才算,"曾命中过"不作数)。跨店取全局
-# 最新:同一 ASIN 在 A 店旧类别 B、B 店新类别 A(过期)⇒ 最新是可修复类,
-# 不入选。来源标签的 CASE 必须与 source_label 同表(有测试钉住,别漂)。
+# ⚠ **判据(所有者 2026-09-04 定稿)**:
+#   「一个产品的报错可能存在多次,**其中被拉黑的那个作为最高优先级**,
+#    其他的都是作为记录」。
+#
+# 这**推翻了**此前那条「最新类别命中才算,『曾命中过』不作数」——
+# 旧写法 `DISTINCT ON (asin) … ORDER BY occurred_at DESC` 只看最新一条,于是
+# 一个品上个月被判 `POLICY`(该永久拉黑)、这个月的记录是 `EXPIRED`(过期),
+# 就**把历史上那条禁令忘了**。那与黑名单「一次入选、永久禁止」的语义相反。
+#
+# 现在:拿这个 asin 的**全部历史报错原文**逐条归类,**只要有一条够格永久拉黑
+# 就以它为准**;一条都不够格才算它不该拉黑(其余报错只是记录)。
+#
+# ⚠ 身份是 **asin**(所有者第 4 点):「产品报错 → 通过 sku 找到来源码(asin)
+#   → 对相关 asin 归类处理。如果只跟着 sku 走,sku 又是由我们系统生成的,
+#   后面会追不到问题产品的来源码」。所以 `coalesce(asin, sku)` 分组,
+#   sku 只是提不出 asin 时的兜底键。
+#
+# ⚠ 键名两个都认:写入方(`problem_scan` / `cleanup_history`)写的是
+#   `detail->>'reason'`(**单数**),而库里历史上还有一批写的是 `reasons`
+#   (复数)。2026-09-04 查出读写不一致导致 events 那一级大面积空转 ——
+#   这里 `coalesce` 两个都取,别再各写一半。
 
-# 身份 = coalesce(asin, sku):清洗出的标准码优先,提不出用订货号原文兜底。
-# 多个订货号(不同店同一产品)归并到同一 asin,最新类别看**产品级**全局最新。
+#: 「每个 asin 的最新一条」—— **只给品牌渠道用**(brand_err_hits 的语义就是
+#: 「当前这个品牌还在不在问题里」)。⚠ **黑名单那条路已经不用它了**:
+#: 黑名单是「一次入选、永久禁止」,判据是下面的 `_HISTORY_SQL`(全部历史里
+#: 够格拉黑的那条优先),两者别混。
 _LATEST_CTE = """
 WITH latest AS (
     SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku) AS asin,
            sku, store, occurred_at,
-           detail->>'category' AS cat, detail->>'reason' AS reason
+           detail->>'category' AS cat,
+           coalesce(detail->>'reason', detail->>'reasons') AS reason
     FROM catalog.product_events
     WHERE event = 'problem_categorized'
     ORDER BY coalesce(asin, sku), occurred_at DESC)
 """
 
-_BACKFILL_COUNT_SQL = _LATEST_CTE + """
+_HISTORY_SQL = """
+SELECT coalesce(asin, sku) AS asin,
+       array_agg(DISTINCT coalesce(detail->>'reason', detail->>'reasons'))
+           AS texts,
+       (array_agg(sku   ORDER BY occurred_at DESC))[1] AS sku,
+       (array_agg(store ORDER BY occurred_at DESC))[1] AS store,
+       max(occurred_at) AS latest
+FROM catalog.product_events
+WHERE event = 'problem_categorized'
+  AND coalesce(detail->>'reason', detail->>'reasons', '') <> ''
+GROUP BY 1
+"""
+
+_BACKFILL_COUNT_SQL = """
 SELECT count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
        count(*) AS total
-FROM latest
+FROM (SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku),
+             detail->>'category' AS cat
+      FROM catalog.product_events
+      WHERE event = 'problem_categorized'
+      ORDER BY coalesce(asin, sku), occurred_at DESC) t
 """
 
 # ⚠ **回填/重建不信任事件里那个 `category`。**(所有者 2026-09-04:「删除旧码,
@@ -281,51 +318,49 @@ FROM latest
 # 代价:一条集合 INSERT 变成「取行 → 判 → 批量写」。回填是一次性动作不是热路径
 # (`error_reclass` 判 97,002 行只用了几秒),换来的是判据只有一条。
 
-_LATEST_ROWS_SQL = _LATEST_CTE + """
-SELECT asin, sku, store, occurred_at, reason FROM latest
-WHERE coalesce(reason, '') <> ''
-"""
+def worst_verdict(texts):
+    """输入:一个 asin 的**全部历史报错原文** → 输出:(归类结果, 那条原文);
+    一条都判不出给 None。
+
+    ⚠ **够格永久拉黑的那条最高优先级**(所有者 2026-09-04),其余只是记录。
+    纯函数,拿假数据就能测 —— 优先级本身是判据。
+    """
+    fallback = None
+    for t in texts:
+        if not t or not t.strip():
+            continue
+        res = error_taxonomy.classify_reasons(error_taxonomy.split_reasons(t))
+        if error_taxonomy.is_permanent(res.code, res.unlisted_term):
+            return res, t                  # 拉黑的那条说了算,不看时间
+        if fallback is None:
+            fallback = (res, t)
+    return fallback
 
 
 def _judge_events(conn) -> list[dict]:
-    """输入:连接 → 输出:按原文重判后**够格永久拉黑**的行(已带新码与来源标签)。
+    """输入:连接 → 输出:按**产品历史**判定后够格永久拉黑的行。
 
-    两条纪律各由一个模块把关,这里一条都不自己实现:
-      · **取原文** 走 `services/error_source`(四级优先,全文优先于样本);
-      · **归类**   走 `services/error_taxonomy`(唯一的归类引擎)。
-
-    ⚠ 2026-09-04 生产实证:这个函数原来**只用事件里那条 reason**,而事件 reason
-    是残缺源 —— 同一个 ASIN,`walmart_items` 全文带句尾的「To republish this item
-    please make sure you have the appropriate product type selected.」判 `PT_WRONG`,
-    而事件里那份(`||Prohibited Product Policy@@@https://…`)句尾不在,判 `POLICY`。
-    于是 **3,037 个品**被 `blacklist_route` 正确删掉、又要被回填错误加回来,
-    **两边摘要都显示正常**。判据统一了不等于口径统一 —— 数据源决定判定结果。
+    三条纪律各由一处把关,这里一条都不自己实现:
+      · **身份** 是 asin(`_HISTORY_SQL` 按 `coalesce(asin, sku)` 分组);
+      · **归类** 走 `services/error_taxonomy`;
+      · **多条取哪条** 走上面的 `worst_verdict`(够格拉黑的优先)。
     """
     with conn.cursor() as cur:
-        cur.execute(_LATEST_ROWS_SQL)
+        cur.execute(_HISTORY_SQL)
         rows = cur.fetchall()
-    asins = [r[0] for r in rows if r[0]]
-    skus = [r[1] for r in rows if r[1]]
-    # ⚠ items_by_asin:事件里那个 sku 未必是当初入选的那个(生产实测 2,194 条
-    #   冲突全出在这里,见 error_source.SRC_ITEMS_ANY 头注)。本函数一次性
-    #   全量跑,付得起那一次全表扫。
-    records, _events, items = error_source.fetch(conn, asins, skus,
-                                                items_by_asin=True)
     out = []
-    for asin, sku, store, occurred_at, reason in rows:
-        # 事件 reason 就是「events」那一级,手上已有,不再查一遍
-        text, _src = error_source.pick(asin, None, sku,
-                                       records, {asin: reason}, items)
-        if not text:
+    for asin, texts, sku, store, latest in rows:
+        got = worst_verdict(texts or [])
+        if got is None:
             continue
-        res = error_taxonomy.classify_reasons(error_taxonomy.split_reasons(text))
+        res, text = got
         if not error_taxonomy.is_permanent(res.code, res.unlisted_term):
             continue
         low = text.lower()
         out.append({
             "asin": asin, "cat": res.code, "sku": sku, "store": store,
             "source": source_label(res.code),
-            "reason": text, "created_at": occurred_at,        # 全文,别截
+            "reason": text, "created_at": latest,      # 全文,别截
             "biz_cn": ("biz-cn" in low or "reference code biz" in low)})
     return out
 

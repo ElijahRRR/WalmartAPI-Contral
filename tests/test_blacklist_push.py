@@ -199,52 +199,45 @@ def test_rebuild_asin_preview_does_not_write(wired, monkeypatch):
 
 
 def test_backfill_preview_does_not_write(wired, monkeypatch):
-    """⚠ 预览的「永久禁止 N 个」必须与真写**同一条判据**(都走 `_judge_events`)。
-    两处各算各的 = 预览说 3 万、真写写 7 万,而两边看着都正常。
+    """⚠ 预览的「够格永久拉黑 N 个」必须与真写**同一条判据**(都走
+    `_judge_events`)。两处各算各的 = 预览说 3 万、真写写 7 万,而两边看着都正常。
 
-    这里同时钉住新口径:事件里那个 `category` **不看**,拿原文重判 ——
-    两条事件文本,一条真禁售、一条是「把 product type 选对」(旧码同为 B),
-    预览只能报 1 个。
+    同时钉住所有者 2026-09-04 定的判据:**一个 asin 的多条历史报错里,
+    够格拉黑的那条最高优先级**,不是取最新。
     """
     wrote = []
 
     class _Cur:
+        def __init__(self): self._q = ""
         def __enter__(self): return self
         def __exit__(self, *a): return False
-        def __init__(self): self._q = ""
         def execute(self, sql, args=None):
             self._q = sql
             if "INSERT" in sql:
                 wrote.append(sql)
         def executemany(self, sql, rows):
             wrote.append(sql)
-        def fetchone(self): return (3, 20)   # (brand_cand, total)
+        def fetchone(self): return (3, 20)          # (brand_cand, total)
         def fetchall(self):
             if "FROM catalog.asin_blacklist" in self._q:
-                return [("B0DDD",)]          # 这条已经在表里 ⇒ 不算新增
-            if "walmart_error_records" in self._q:
-                # ⚠ 四级优先:records 全文压过事件里那条残文。B0AAA 的事件只说
-                #   「违反禁售政策」(→POLICY),而全文带着句尾判据串(→PT_WRONG)
-                #   —— 这正是生产里那 3,037 个品的形状。
-                return [("B0AAA",
-                         "This item has been unpublished for violating "
-                         "Walmart's Marketplace Prohibited Product Policy. "
-                         "To republish this item please make sure you have "
-                         "the appropriate product type selected for this item.")]
-            if "AS reasons" in self._q or "unpublished_reasons" in self._q:
-                return []                    # SRC_EVENTS / SRC_ITEMS 两级空
-            # 主查询(_LATEST_ROWS_SQL,`FROM latest`)—— ⚠ 它也含
-            # `product_events`,分派别按表名,按这个独有的标记
-            assert "FROM latest" in self._q, self._q[:80]
+                return [("B0DDD",)]                 # 已在表里 ⇒ 不算新增
+            assert "GROUP BY 1" in self._q, self._q[:80]   # 产品历史那条
             return [
-                ("B0AAA", "SKU-A", "s1", None,
-                 "This item has been unpublished for violating Walmart's "
-                 "Marketplace ||Prohibited Product Policy@@@https://x"),
-                ("B0CCC", "SKU-C", "s1", None,
-                 "Intellectual Property complaint received."),
-                ("B0DDD", "SKU-D", "s1", None,
-                 "This item is a prohibited product. "
-                 "Prohibited Products Policy: Alcohol."),
+                # ⚠ B0AAA 的**最新**记录是「过期」,而历史上有一条真禁售 ——
+                #    旧口径(取最新)会漏掉它,新口径必须拉黑。
+                ("B0AAA", ["The End Date has passed for this item",
+                           "This item is a prohibited product. "
+                           "Prohibited Products Policy: Alcohol."],
+                 "SKU-A", "s1", None),
+                ("B0CCC", ["Intellectual Property complaint received."],
+                 "SKU-C", "s1", None),
+                # 全部不够格 ⇒ 不拉黑(其余报错只作记录)
+                ("B0BBB", ["may be a prohibited product. Please make sure the "
+                           "appropriate product type selected for this item."],
+                 "SKU-B", "s1", None),
+                ("B0DDD", ["This item is a prohibited product. "
+                           "Prohibited Products Policy: Alcohol."],
+                 "SKU-D", "s1", None),
             ]
 
     class _Conn:
@@ -253,12 +246,10 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
         def cursor(self): return _Cur()
     monkeypatch.setattr(wf.db, "pg_conn", lambda: _Conn())
     out = wf.run({"backfill": "1"})
-    # 三条事件,但判据取的是**四级优先后的原文**:
-    #   B0AAA 事件说「违反禁售政策」→ 看着像 POLICY,而 records 全文带句尾
-    #         判据串 → PT_WRONG,**判出去**(这条是 3,037 那一类的回归钉);
-    #   B0CCC 知产 → 够格;B0DDD 真禁售 → 够格但已在表里。
-    assert "够格永久拉黑 2 个" in out
-    assert "真跑只会新增 1 条" in out and "回填只加不减" in out
+    # B0AAA(历史里那条禁售)+ B0CCC + B0DDD = 3;B0BBB 的 PT_WRONG 判出去
+    assert "够格永久拉黑 3 个" in out
+    # B0DDD 已在表里 ⇒ 真跑只新增 2 条
+    assert "真跑只会新增 2 条" in out and "回填只加不减" in out
     assert "apply=1" in out
     assert wrote == []
 

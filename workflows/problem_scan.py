@@ -340,8 +340,14 @@ def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
         {"sku": it["sku"], "store": it["store"],
          "event": product_events.PROBLEM_CATEGORIZED,
          "source": "problem_scan",
+         # ⚠ 全文,别截(2026-09-04):这本账是**产品历史**,而所有者定的判据是
+         #   「看产品历史,够格拉黑的那条最高优先级」—— 截到 200 字符正好把
+         #   沃尔玛写在**句尾**的判据串砍掉(「…To republish this item please
+         #   make sure you have the appropriate product type selected.」),
+         #   于是 PT_WRONG 被判成 POLICY、可修复的品被永久拉黑。
+         #   截断属于展示层,不属于账本(同 services/blacklist 头注的考古结论)。
          "detail": {"category": it["category"], "name": it["cat_name"],
-                    "reason": (it["reasons"] or "")[:200]}}
+                    "reason": it["reasons"] or None}}
         for it in fresh])
     return len(fresh)
 

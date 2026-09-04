@@ -627,3 +627,19 @@ def test_wfs_blocked_sql_reads_only_the_latest_attempt():
     assert "ORDER BY store, sku, submitted_at DESC" in q
     assert "feed_type = 'DELETE_ITEM'" in q
     assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"
+
+
+def test_归类事件存全文_不许再截200():
+    """⚠ 2026-09-04:这本账是**产品历史**,而所有者定的判据是「看产品历史,
+    够格拉黑的那条最高优先级」—— 截到 200 字符正好把沃尔玛写在**句尾**的判据串
+    砍掉(「…To republish this item please make sure you have the appropriate
+    product type selected.」),于是 PT_WRONG 被判成 POLICY、**可修复的品被
+    永久拉黑**。生产实证:事件里的原文判 POLICY,而 walmart_items 全文判 PT_WRONG。
+
+    截断属于展示层,不属于账本。
+    """
+    import inspect
+    from workflows import problem_scan
+    src = inspect.getsource(problem_scan)
+    assert '(it["reasons"] or "")[:200]' not in src
+    assert '"reason": it["reasons"] or None' in src

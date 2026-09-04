@@ -634,7 +634,7 @@ def test_回填不看事件里那个码_拿原文重判():
                blacklist.backfill_counts):
         assert "_judge_events" in inspect.getsource(fn), fn.__name__
     judge = inspect.getsource(blacklist._judge_events)
-    assert "classify_reasons" in judge and "is_permanent" in judge
+    assert "worst_verdict" in judge and "is_permanent" in judge
     assert "先判再擦" in inspect.getsource(blacklist.rebuild_asin_blacklist)
 
 
@@ -672,8 +672,9 @@ def test_取原文只有一处实现_四级优先():
     # 两个消费方都转调 services/error_source,自己不再实现
     assert "error_source.pick" in inspect.getsource(error_reclass.pick_source)
     assert "error_source.fetch" in inspect.getsource(error_reclass._sources)
-    for name in ("error_source.fetch", "error_source.pick"):
-        assert name in inspect.getsource(blacklist._judge_events), name
+    # ⚠ `_judge_events` 2026-09-04 起**不走 error_source** —— 所有者定的判据是
+    #   「看产品历史,够格拉黑的那条最高优先级」,原文直接从 product_events 取全部,
+    #   不再是「取一条再四级补全」。四级优先仍服务 error_reclass 的存量复核。
     # SQL 只在 services 里出生
     src = inspect.getsource(error_reclass)
     for gone in ("_SQL_SRC_RECORDS", "_SQL_SRC_ITEMS", "raw_reason\nFROM"):
@@ -720,17 +721,60 @@ def test_items那一级要按asin也索引一份_否则sku对不上就查不中(
     sig = inspect.signature(error_source.fetch)
     assert sig.parameters["items_by_asin"].default is False   # 缺省不付代价
     assert "extract_asin" in inspect.getsource(error_source.items_by_asin_map)
-    assert "items_by_asin=True" in inspect.getsource(blacklist._judge_events)
-    # ⚠ `error_reclass` 也要用 —— 我原先判断「它有精确的 src_sku 就不需要按 asin
-    #   兜底」是**错的**:那 14,475 条 self(残文)**有** src_sku,但那个 sku 在
-    #   walmart_items 里已经不在了(下架删除),照样查不中。
-    #   它分批跑,所以在**循环外**查一次、跨批复用。
+    # ⚠ 消费方只剩 `error_reclass`(存量复核):那 14,474 条 self(残文)**有**
+    #   src_sku,但那个 sku 在 walmart_items 里已经不在了(下架删除),照样查不中,
+    #   所以要按 asin 兜底。它分批跑,故在**循环外**查一次、跨批复用。
+    #   (`_judge_events` 已改成直接读产品历史,不再需要这一档。)
     bl_src = inspect.getsource(error_reclass._blacklist_pass)
     assert "error_source.items_by_asin_map(conn)" in bl_src
     assert bl_src.index("items_by_asin_map") < bl_src.index("for rows in _pages")
     # 按 sku 命中的优先(调用方给的 sku 更精确)
     assert "{**by_asin, **it}" in bl_src
     assert "{**items_by_asin_map(conn), **items}" in inspect.getsource(error_source.fetch)
+
+
+def test_多条报错取够格拉黑的那条_不是取最新():
+    """⚠ 所有者 2026-09-04 定稿:「一个产品的报错可能存在多次,**其中被拉黑的
+    那个作为最高优先级**,其他的都是作为记录」。
+
+    这**推翻了**此前那条「最新类别命中才算,『曾命中过』不作数」——
+    旧写法 `DISTINCT ON (asin) … ORDER BY occurred_at DESC` 只看最新一条,
+    于是一个品上个月被判 POLICY(该永久拉黑)、这个月记录是 EXPIRED(过期),
+    就**把历史上那条禁令忘了**,与黑名单「一次入选、永久禁止」的语义相反。
+    """
+    from services import blacklist
+    POLICY = "This item is a prohibited product. Prohibited Products Policy: Alcohol."
+    EXPIRED = "The End Date has passed for this item"
+    PT = ("may be a prohibited product. Please make sure the appropriate "
+          "product type selected for this item.")
+    # 够格拉黑的那条说了算 —— **不管它在不在最后**
+    res, text = blacklist.worst_verdict([EXPIRED, POLICY, PT])
+    assert res.code == "POLICY" and text == POLICY
+    res, text = blacklist.worst_verdict([POLICY, EXPIRED])
+    assert res.code == "POLICY"
+    # 一条都不够格 → 退回第一条作记录(调用方据此不拉黑)
+    res, _ = blacklist.worst_verdict([EXPIRED, PT])
+    assert res.code == "EXPIRED"
+    # 空/全空白 → None
+    assert blacklist.worst_verdict([]) is None
+    assert blacklist.worst_verdict(["", "   ", None]) is None
+
+
+def test_产品历史按asin分组_且两个键名都认():
+    """⚠ 身份是 **asin**(所有者第 4 点:「如果只跟着 sku 走,sku 又是由我们系统
+    生成的,后面会追不到问题产品的来源码」)。
+
+    ⚠ 键名两个都要认:写入方(problem_scan / cleanup_history)写的是
+    `detail->>'reason'`(**单数**),而库里历史上还有一批是 `reasons`(复数)。
+    2026-09-04 查出读写不一致 —— events 那一级大面积空转。
+    """
+    from services import blacklist
+    sql = blacklist._HISTORY_SQL
+    assert "coalesce(asin, sku) AS asin" in sql and "GROUP BY 1" in sql
+    assert "array_agg(DISTINCT coalesce(detail->>'reason', detail->>'reasons'))" in sql
+    assert "coalesce(detail->>'reason', detail->>'reasons', '') <> ''" in sql
+    # 不许再退回「只取最新一条」
+    assert "DISTINCT ON" not in sql
 
 
 def test_pick的items那一级_sku与asin两个都要试():

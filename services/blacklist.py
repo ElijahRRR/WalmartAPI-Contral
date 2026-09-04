@@ -55,6 +55,7 @@ import json
 import logging
 from collections import Counter
 
+from registry import resources
 from services import error_source, error_taxonomy
 from services.sku_asin import extract_asin
 
@@ -303,22 +304,37 @@ FROM (SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku),
 """
 
 
+#: 够格拉黑的码之间谁当标签 —— 序在 registry(铁律 3),这儿只查表。
+_LABEL_RANK = {c: i for i, c in enumerate(resources.BLACKLIST_LABEL_ORDER)}
+
+
 def worst_verdict(codes):
     """输入:一个 asin 的**全部事件码** `[[code, term], …]` → 输出:够格永久拉黑的
     那个 `(code, term)`;一个都不够格给 None。
 
     ⚠ **够格拉黑的那条最高优先级**(所有者 2026-09-04),其余只是记录。
+    ⚠ 多条都够格时按 `resources.BLACKLIST_LABEL_ORDER` 取(所有者 2026-09-04:
+      「严重程度按这个:品牌 → 知产 → 禁售 → 不可申诉 → 召回 → …」)。
+      **原先是「取第一个够格的」,而那个数组来自 `array_agg(DISTINCT …)`**——
+      PG 的 DISTINCT 聚合会排序,所以取到的是**字典序**最靠前的那个
+      (`BRAND` < `FLAGGED` < … < `RECALL`),不是最严重的。
+      ⚠ 只影响写进 `category` 与飞书「来源」列的**标签**,拉不拉黑不受影响
+      (任一够格即拉黑)。
     ⚠ 只**读码**,不重判原文 —— 判定在 `problem_scan` 写事件时发生过一次,
       历史事件由 `error_reclass -p scope=events` 回填成新码。
       所有者原话:「产品级的记录已经有产品事件在做了」。
     纯函数,拿假数据就能测。
     """
+    hits = []
     for pair in codes or []:
         code = pair[0] if pair else None
         term = pair[1] if pair and len(pair) > 1 else None
         if error_taxonomy.is_permanent(code, term):
-            return code, term
-    return None
+            hits.append((code, term))
+    if not hits:
+        return None
+    # 没登记的码排最后(判不准就别让它当标签),同名次按出现序稳定
+    return min(hits, key=lambda p: _LABEL_RANK.get(p[0], len(_LABEL_RANK)))
 
 
 def _judge_events(conn) -> list[dict]:

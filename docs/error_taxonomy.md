@@ -1770,14 +1770,12 @@ norm_category` 走 `problem_products._RULES`)。而下游只读码不重判原�
 
 **② `rebuild_asin` 是净删除 → 已修**(见下节)。
 
-**③ `worst_verdict` 取的不是最严重的码。** `_HISTORY_SQL` 用
-`array_agg(DISTINCT …)`,PG 的 `DISTINCT` 聚合会**排序**,所以数组是**字典序**;
+**③ `worst_verdict` 取的不是最严重的码 → 已修**(见 §19.3)。`_HISTORY_SQL`
+用 `array_agg(DISTINCT …)`,PG 的 `DISTINCT` 聚合会**排序**,所以数组是**字典序**;
 `worst_verdict` 返回第一个够格的 = 字典序最靠前的那个
-(`BRAND` < `FLAGGED` < `GATED` < `IP` < `POLICY` < `PROHIBITED_FINAL` < `RECALL`),
-而不是 `ERROR_CATEGORY_SEVERITY` 定的严重度序。
+(`BRAND` < `FLAGGED` < `GATED` < `IP` < `POLICY` < `PROHIBITED_FINAL` < `RECALL`)。
 **拉不拉黑不受影响**(任一够格即拉黑),受影响的只是写进 `category` 与飞书
-「来源」列的**标签**:一个既 `BRAND` 又 `PROHIBITED_FINAL` 的品会被标成「品牌」。
-只有被报错过多次、且多次都够格拉黑的产品才会撞上。
+「来源」列的**标签**。
 
 ### 19.2 `rebuild_asin` 只删得掉重灌得回的行(2026-09-04 所有者定)
 
@@ -1799,3 +1797,44 @@ norm_category` 走 `problem_products._RULES`)。而下游只读码不重判原�
 顺带修了预览报错数:原先那句「ASIN 表现有 N 行将被整表重写」的 N 取的是
 **飞书表格行数**(`sheets.next_empty()`),而删的是 PG —— 报的不是要删的那个数。
 现在报 PG 的 `in_table` / 会被重灌的 / **一条都不碰的**三个数。
+
+
+### 19.3 黑名单标签序:所有者定的,与主码序**故意不一样**
+
+所有者 2026-09-04:「严重程度按这个:**品牌 → 知产 → 禁售 → 不可申诉 → 召回 → …**」。
+
+落成 `registry.resources.BLACKLIST_LABEL_ORDER`,`worst_verdict` 查表取名次最小者:
+
+```python
+BLACKLIST_LABEL_ORDER = (
+    "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者给定
+    "FLAGGED", "GATED", "OTHER",                             # 接的,待确认
+)
+```
+
+⚠ 所有者只给到「召回 → …」,后三个是按 `PERMANENT_CODES` 既有次序接的,**待确认**;
+改它不影响任何拦截行为。
+
+**为什么不是复用 `ERROR_CATEGORY_SEVERITY`(这不是双轨)** —— 两个序回答的是
+两个问题:
+
+| | 问的是 | 成员 |
+|---|---|---|
+| `ERROR_CATEGORY_SEVERITY` | **一条报错原文**里同时写了几个问题,主码取哪个 | 全部 16 码 |
+| `BLACKLIST_LABEL_ORDER` | **一个产品的多条历史报错**都够格拉黑,标签取哪个 | 只有够格永久拉黑的(7 永久码 + `OTHER`) |
+
+`PT_WRONG` 之类根本不参与后者。**实测**:把所有者给黑名单的这个序套到主码序上,
+78 条语料里会变 **1 条** —— 正是语料 #69:
+
+```
+①「…violating Prohibited Product Policy… submit an appeal」          → POLICY
+②「…violating Prohibited Product Policy. To republish this item please
+    make sure you have the appropriate product type selected…」       → PT_WRONG
+
+现在 PT_WRONG 排在 POLICY 前面 ⇒ 主码 PT_WRONG(可放)
+若照黑名单序 ⇒ 主码 POLICY(永久禁)
+```
+
+那正是 **4 万条误拉黑**的病根(§十二:「类目选错是修法不是禁令」)。所以
+`ERROR_CATEGORY_SEVERITY` **一个字不动**,并加了守门测试把
+`PT_WRONG < POLICY` 这一条钉死 —— 谁想「统一两个序」,那条会红。

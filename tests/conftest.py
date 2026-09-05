@@ -21,6 +21,16 @@ def _rate_buckets_in_memory(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _title_sync_on_for_legacy_tests(monkeypatch):
+    """标题维护整路停闸(所有者 2026-09-05,`maintenance_intents.TITLE_SYNC=False`)
+    之前写的用例都活在"标题链开着"的世界里;它们钉的是标题判据本身,不是停闸。
+    统一在这里把开关打开;停闸那一档另有 tests/test_title_sync_switch.py 钉
+    (缺省必须是 False、生成侧不产、执行件不领、摘要要见人)。"""
+    from services import maintenance_intents as mi
+    monkeypatch.setattr(mi, "TITLE_SYNC", True)
+
+
+@pytest.fixture(autouse=True)
 def _reports_never_touch_the_real_data_root(monkeypatch, tmp_path):
     """报告 csv 一律落临时目录 —— **绝不允许写进真实 <DATA_ROOT>/reports/**。
 

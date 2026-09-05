@@ -475,6 +475,19 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
         return [_merge_view(dict(zip(cols, r))) for r in cur.fetchall()]
 
 
+def count_open_action(conn, action: str, status: str = "suggested") -> int:
+    """输入:连接 + 动作(+状态)→ 输出:库里该动作、该状态的建议行条数。只读。
+
+    给"某个动作整路停闸"时的摘要用(2026-09-05 标题停闸首用):执行件不领这个
+    动作,但库里已有的 suggested 行**留着不撤**(恢复后还在),人得知道留了多少。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ops.dispositions "
+                    "WHERE status = %(st)s::text AND action = %(a)s::text",
+                    {"st": status, "a": action})
+        return int((cur.fetchone() or [0])[0])
+
+
 def count_suppressed(conn, actions: tuple | None = None) -> int:
     """输入:连接 + 动作集 → 输出:因同 SKU 挂着破坏类建议而被压制的条数。
 

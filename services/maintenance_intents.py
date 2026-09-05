@@ -390,6 +390,29 @@ TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标
 # title_intents 单独计数并 warning,不许它混进"标题 N 条"里无声发生。
 TITLE_MISMATCH_DELETE = False
 
+# ── 标题维护整路停闸(所有者 2026-09-05)──────────────────────────────────────
+# 根因不在 feed 在沃尔玛的内容规则(Seller Center 截图实证,L001贾林红/B0FVDR7XJL):
+# 编辑页把「商品名称」(卖家提交值)与「在 Walmart.com 上生效的值」分开显示 ——
+# 我们 MP_MAINTENANCE 发的新标题**进了提交值**(所以回执 SUCCESS、再发报 stale
+# 0101198),但**没过内容质量闸、没成为生效值**。闸没过的理由沃尔玛写在旁边:
+#   · Too Long:Product Name 不得超过 **150** 字符(我们按 spec 上限截到 199);
+#   · Title Formula Violation ×2:必须按 Walmart Style Guide 的公式含指定属性、
+#     且顺序正确(我们抄的是亚马逊标题);
+#   · Not Capitalized Properly。
+# 无「More sellers」、无锁 ⇒ 不是内容归属问题,是内容质量问题。旧仓一年多来
+# 同样的载荷同样"多数不变、少数会变"(偶尔生成的标题恰好短、恰好合公式)。
+# 这条链现在是负收益:发 → SUCCESS 但生效值不变 → settle_maintenance 拿
+# GET /v3/items(返回生效值)判「未生效」→ 20h 后重算同样差异 → 重发 → stale。
+# **每天烧 MP_MAINTENANCE 配额、零效果**,所以整路停:生成侧不产标题意图,
+# 执行侧不领存量 title 建议(两处都从这一个开关读,别各写一份)。
+# 恢复条件(两件都做完再翻 True):
+#   ① 标题生成改按沃尔玛口径 —— ≤150 字符(最好 ≤90,超过伤 SEO)、Style Guide
+#      公式、规范大小写;上架链 mp_mapper 与本模块 processed_title 用同一份规则;
+#   ② 「沃尔玛未采纳」要记账:回执 SUCCESS 而生效值不变的 (店, SKU, 标题) 落
+#      台账,同一标题不再重发,内容变了才再试(drop_recent 只压 20h,不够)。
+# 改价 / 改库存**照常**:它们是 offer 级,永远归卖家,生产一直正常。
+TITLE_SYNC = False
+
 def processed_title(slow) -> str:
     """输入:products.slow → 输出:过完上架文案处理的标题(去品牌/去符号/截 199)。
 
@@ -930,6 +953,11 @@ def title_intents(rows: list[dict]) -> list[dict]:
       · `TITLE_MISMATCH_DELETE=False` → 照改并计数告警
     """
     out = []
+    if not TITLE_SYNC:
+        # 停闸必须见人:静默返回空列表读起来像"今天没有标题差异"
+        logger.warning("标题维护已整路停闸(所有者 2026-09-05,TITLE_SYNC=False):"
+                       "本轮不产标题意图;原因与恢复条件见 TITLE_SYNC 头注")
+        return out
     skipped_incomplete = skipped_mismatch = paused_mismatch = 0
     for r in rows:
         store, sku = r["store"], r["sku"]

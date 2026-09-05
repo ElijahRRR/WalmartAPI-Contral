@@ -214,6 +214,12 @@ def run(params: dict) -> str:
     if node_note:
         lines.append("  " + node_note)
 
+    if not mi.TITLE_SYNC:
+        lines.append("  ⛔ 标题维护已整路停闸(所有者 2026-09-05):沃尔玛对已上架商品的"
+                     "标题更新有内容质量闸,我们的标题过不了(>150 字符 / 不合 Style "
+                     "Guide 公式),回执 SUCCESS 但生效值不变;本轮不产标题意图、执行件"
+                     "不领存量 title 建议。改价/改库存照常。恢复条件见 "
+                     "services/maintenance_intents.TITLE_SYNC 头注")
     if not mi.TITLE_MISMATCH_DELETE:
         # 停闸必须天天见人(本仓口诀:静默关闭 = 没人记得它关着)。
         # 生成侧停了之后,存量 suggested 行会被下面的 withdraw_stale 顺带撤掉

@@ -86,6 +86,38 @@
 | 标题相似度 **< 70%** | **删除**(⚠ **已停闸**,见下) | `title_mismatch` |
 | 标题相似度 **≥ 70%** 且有差异 | 改标题 | (title_intents) |
 
+### 5.0 改标题**整路停闸**(2026-09-05 起,所有者「停掉标题维护」)
+
+开关:`services.maintenance_intents.TITLE_SYNC`(当前 `False`,唯一出处;生成侧
+`title_intents` 与执行件 `maintenance` 的领取集**都从它读**)。改价 / 改库存**照常**。
+
+**根因不在 feed,在沃尔玛的内容规则**(Seller Center 编辑页截图实证,
+`L001贾林红 / B0FVDR7XJL`,2026-09-05):编辑页把「商品名称」(卖家提交值)与
+「**在 Walmart.com 上生效的值**」分开显示 —— 我们 MP_MAINTENANCE 发的新标题**进了
+提交值**(所以回执 SUCCESS、再发同一条报 `ERR_EXT_DATA_0101198` stale),但**没过
+内容质量闸、没成为生效值**,页面照旧是旧标题。闸没过的理由沃尔玛写在旁边:
+「Too Long:不得超过 **150** 字符」(我们按 spec 上限截到 199)、「Title Formula
+Violation ×2:须按 Walmart Style Guide 公式含指定属性且顺序正确」(我们抄的是亚马逊
+标题)、「Not Capitalized Properly」。无「More sellers」、无锁 ⇒ 不是内容归属问题。
+旧仓一年多来同一载荷同一症状("多数不变、少数会变" = 偶尔生成的标题恰好短、恰好合
+公式)。**载荷与 header 本身是对的**(官方 spec 原件核过,见 docs/sku_plan.md §9.10)。
+
+停闸前这条链是负收益:发 → SUCCESS 但生效值不变 → `settle_maintenance` 拿
+`GET /v3/items`(返回的是生效值)判「未生效」→ 20h 后重算出同样差异 → 重发 → stale。
+每天烧 MP_MAINTENANCE 配额、零效果。
+
+**停闸两处、见人两处**:生成侧不产标题意图(warning 一条),执行件不领存量 `title`
+建议(它们留在 `suggested` 不撤,恢复后还在;摘要报"库里 N 条 title 建议留着")。
+只停一处等于只停一半 —— 库里已有的 suggested 行下一轮照样会被领走提交。
+
+**恢复条件**(两件都做完再翻 `True`):
+① 标题生成改按沃尔玛口径 —— ≤150 字符(最好 ≤90,超过伤 SEO)、Style Guide 公式、
+   规范大小写;上架链 `mp_mapper` 与维护链 `processed_title` 用**同一份**规则;
+② 「沃尔玛未采纳」要记账:回执 SUCCESS 而生效值不变的 (店, SKU, 标题) 落台账,
+   同一标题不再重发,内容变了才再试(`drop_recent` 只压 20h,不够)。
+顺带已知的生成器 bug:`title_mismatch_sync` 那路曾产出「X | X」同句重复两遍的标题
+(2026-09-05 生产实见 `B0G5WWVT2S`),修 ① 时一并处理。
+
 ### 5.1 `删除(title_mismatch)` 停闸中(2026-08-19 起)与停闸期口径(2026-08-20)
 
 开关:`services.maintenance_intents.TITLE_MISMATCH_DELETE`(当前 `False`)。

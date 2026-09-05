@@ -189,11 +189,12 @@ ERROR_CATEGORY_SEVERITY = (
 #   会变 1 条 —— 正是 `PT_WRONG → POLICY` 那条,等于推翻「类目选错是修法不是
 #   禁令」的裁决(那 4 万条误拉黑的病根)。所以两处各归各的,谁也别拿去套谁。
 #
-# ⚠ 所有者只给到「召回 → …」,后面三个(FLAGGED / GATED / OTHER)是按
-#   `PERMANENT_CODES` 的既有次序接的 —— **待所有者确认**,改这里不影响拦截行为。
+# 所有者 2026-09-04 给到「召回 → …」,后面三个(FLAGGED / GATED / OTHER)按
+#   `PERMANENT_CODES` 的既有次序接上,**所有者 2026-09-05 认可**。改这里不影响
+#   拦截行为(任一够格即拉黑),只影响写进 `category` 与飞书「来源」列的标签。
 BLACKLIST_LABEL_ORDER = (
-    "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者给定
-    "FLAGGED", "GATED", "OTHER",                             # 接的,待确认
+    "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者 2026-09-04 给定
+    "FLAGGED", "GATED", "OTHER",                             # 所有者 2026-09-05 认可
 )
 
 # feed 报错的政策族锚:field 稳定、error_code 一次性(生产实证:Offensive 171 次

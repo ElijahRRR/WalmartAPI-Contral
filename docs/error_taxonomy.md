@@ -1808,12 +1808,12 @@ norm_category` 走 `problem_products._RULES`)。而下游只读码不重判原�
 ```python
 BLACKLIST_LABEL_ORDER = (
     "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者给定
-    "FLAGGED", "GATED", "OTHER",                             # 接的,待确认
+    "FLAGGED", "GATED", "OTHER",                             # 所有者 2026-09-05 认可
 )
 ```
 
-⚠ 所有者只给到「召回 → …」,后三个是按 `PERMANENT_CODES` 既有次序接的,**待确认**;
-改它不影响任何拦截行为。
+所有者 2026-09-04 只给到「召回 → …」,后三个按 `PERMANENT_CODES` 既有次序接上,
+**所有者 2026-09-05 认可**(「认可这个排法」)。改它不影响任何拦截行为。
 
 **为什么不是复用 `ERROR_CATEGORY_SEVERITY`(这不是双轨)** —— 两个序回答的是
 两个问题:

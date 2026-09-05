@@ -413,8 +413,25 @@ def test_list_new_lookup_is_store_scoped_and_failure_tolerant():
 
     from workflows import list_new
     sql = list_new._FAMILY_LISTED_SQL
-    assert "store = %(store)s" in sql and "missing_since IS NULL" in sql
+    assert "w.store = %(store)s" in sql and "missing_since IS NULL" in sql
     body = inspect.getsource(list_new._variant_plan)
     assert "except Exception" in body and "按本店无同族处理" in body
     # 查同族时把自己排掉:自己还没上架,查出来只会是噪声
     assert 'a != r["asin"]' in body
+
+
+def test_family_lookup_matches_through_the_registry():
+    """同族已在架按**身份键**匹配(0a-26);参数名也从 skus 正过来叫 asins。
+
+    传进去的一直是同族 **ASIN**(variant_group.parse_family 的产物),叫 skus
+    是历史笔误;切码之后这个名字会直接误导下一个人拿 SKU 去填。
+    ⚠ 本处**有意不加 abandoned_at 谓词**:同族查的是「这家店此刻还挂着哪些
+    同族成员」这个在架事实,与码是否已弃用无关(abandoned_at 只出现在 mint、
+    list_new 去重闸、alloc_push._SQL_ONLINE 三处 —— 消费方契约)。
+    """
+    from workflows import list_new
+    sql = list_new._FAMILY_LISTED_SQL
+    assert "coalesce(ls.source_key, w.sku) = ANY(%(asins)s::text[])" in sql
+    assert "ls.source_type = 'amz'" in sql
+    assert "%(skus)s" not in sql
+    assert "abandoned_at" not in sql

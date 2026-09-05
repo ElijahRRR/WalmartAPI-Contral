@@ -79,6 +79,137 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
+
+**立项**(所有者 2026-09-02):沃尔玛 SKU 从今天的「就是 ASIN / 三段式含 ASIN」
+改成 **12 位不透明码**(来源字母 + 11 位随机段),让沃尔玛侧的订货号不再泄露
+亚马逊货源。设计与决策 `docs/sku_plan.md`;逐批次执行工作包
+`docs/sku_workplan.md` + `docs/sku_workplan/`;身份口径规范
+`docs/conventions.md` §九。分五批合:**0a → 0b → 1 → 2 → 3**,只有批次 2
+(写侧切换)是有行为变化的那一批。
+
+**为什么先做读侧**:全仓**没有一处会抛异常** —— 「拿 SKU 当 ASIN 用」的地方
+切码后一律是"不报错、摘要看起来正常、功能悄悄没了"(维护链不改价不清零、
+去重闸失效导致同店重复上架烧配额、已在架的品被重新派工、订单判定全走人工)。
+所以读侧收口必须走在写侧切换前面,而且**整块一起合**:拆开会出现「一半按
+登记簿、一半按裸 sku」的中间态,那是最难发现的一类。
+
+**批次 0a 落地**(零行为变化,两个 PR):
+
+- **PR-0a-1「积木 + schema + 守门」**(commit `4e27789`):`services/sku_codec.py`
+  新建(mint / abandon / is_opaque / source_of;**12 位码编码规则的唯一之家**,
+  本批只建不接线,接线在批次 2)、`sku_asin.pick_asin/resolve/resolve_many`、
+  `catalog.listing_sources` 加弃码三列 + **三条一次建到位的索引**
+  (`listing_sources_opaque_sku_uidx` / `live_uidx`(含 `replaced_by IS NULL`)/
+  `live_key_idx`;名字与局部条件由 0a 定死,批次 2/3 与横切包一律引用**不许
+  重建** —— 原稿里三个包三个名字,批次 3 的 `DROP INDEX IF EXISTS` 会打空、
+  接着裸建的无条件唯一索引会让 db_init 整份回滚)、`audit_listing_conflicts`
+  视图身份键经登记簿、**db_init 存量回填正则右锚**(`^B0[A-Z0-9]{8}$` 并去掉
+  `left(sku,10)`,与生产在跑的 `sources_backfill._ASIN_RE` 同口径 —— 不修的话
+  0a 验收跑 db_init 当场就会把 `source_key ≠ sku` 的行造出来,那批行会第一次
+  进入维护链的删除意图产出面)、`upc_pool` 两个烧号状态值、事件码
+  `sku_abandoned` / `sku_replaced`、`registry.SKU_SOURCE_LETTERS`
+  (`{amz: A, match: B, 1688: C, self: H}`,所有者定稿)。
+- **PR-0a-2「十五处读侧收口」**:身份表达式统一成 **SQL 侧
+  `coalesce(ls.source_key, w.sku)`**(ls = `source_type='amz'` 的 JOIN)、
+  **Python 侧 `sku_asin.pick_asin(source_key, sku)`**,覆盖维护链四处、
+  `product_audit` mode=online 候选、`risk_trace` ①号证据源、`product_refresh`
+  采集目标、`audit_rules` 实证 PT、分配四件(`alloc_survey` / `alloc_push` /
+  `alloc_plan` / `alloc_products`)、`list_new` 的去重闸 / 重试上限 / 变体同族。
+  存量 amz 行 `source_key = sku`、未登记行回落裸 sku ⇒ 结果集逐行相同。
+
+**本批定死的四条规矩**(后续批次只准引用,不许各写一份):
+
+1. **身份表达式只有两条可复制字面量**(SQL / Python 各一条),写在 conventions §九。
+2. **`abandoned_at IS NULL` 是危险谓词**:写进 resolve / 维护链 JOIN / 事件归并 /
+   订单反查,就会让旧码带回来的订单查不到产品。只准出现在三处 —— `sku_codec.mint`
+   的复用查询、`list_new` 去重闸、`alloc_push._SQL_ONLINE`(批次 3 起加
+   `sku_migrate` 候选选取为第四处;schema.sql 的部分索引条件是 DDL,不计入)。
+3. **编码规则的唯一之家是 `services/sku_codec.py`**,registry 只登记
+   `SKU_SOURCE_LETTERS`(所有者要拍的取值才算外部配置,12 位码的字母表是内部
+   编码规则)。schema.sql 两条唯一索引的字符类与它逐字对齐,守门测试钉住。
+4. **守门只有一份 `tests/test_sku_guard.py`**(与既有 `test_feishu_guard.py`
+   同族:白名单 dict + `test_the_whitelists_do_not_rot`)。0b/1/2/3 与横切包
+   只准增删这里的白名单条目 —— 原稿四个包各建一份,同一张白名单重复三处、
+   数目三种口径、字母表断言两条互斥,守门测试自己犯了它要守的规矩。
+
+**两处有意保留(不是遗漏,各有守门反向钉着)**:
+`product_audit` mode=online 的第一条腿保留 `w.sku = p.asin`(相关子查询,
+写成 coalesce 就用不上 `walmart_items_sku_idx`,几十万行退化成全表扫);
+`alloc_survey._SQL_ONLINE` 的 lifecycle 条件**不动**(它管占用与冲突口径,
+不是派工口径,2026-08-15「退市行不算活货位」仍成立),`alloc_push` 的口径
+对齐是真行为变化,随批次 2 上(决策 C 第二步)。
+
+**合并前的两条硬闸**(需要连生产 PG):`listing_sources` 里
+`source_type='amz' AND source_key <> sku` 的行数必须为 0(非 0 = 存在被旧回填
+截断的行,收口后会扩大自动删除面);`ops.feed_items` 里同 (店, 身份键) 挂着
+多个不同 sku 的组数必须为 0(否则重试计数会归并、原本还能重试的行提前触顶)。
+
+### 2026-09-02 SKU 改造批次 3:存量改码(SkuUpdate 三态状态机 + 新工作流)
+
+**做了什么**(三块,见 `docs/sku_plan.md` §7 批次 3 与 `docs/sku_workplan/batch_3.md`):
+第一块地基(commit `cc08210`:schema 两列 / 过程账 `listing.sku_migrations` /
+别名视图 `catalog.sku_aliases` / 订单双算体检视图 / `mint_replacement` +
+`settle_replacement` + `OPAQUE_SQL_PREDICATE` / `retag_sku` / SkuUpdate 载荷);
+第二块观测侧抑制与继承(commit `5565691`:改码期间不记假代际、旧码不记缺席、
+四段历史判据经别名链继承一跳、销量归属继承、回执不入病历);
+第三块**工作流** `workflows/sku_migrate.py`(本次)。
+
+**决策日志在 `docs/sku_plan.md` §9**(plan.md 本身没有决策日志段,它的记录方式是
+Phase 小节里的 `[x] + 日期`)。那里记着:三处与工作包/synthesis 的**有意出入**
+(POST `outcome=unknown` 不回滚 / `cleanup_seen_categories` 不迁 / 活码唯一索引由
+0a 一次建到位而非批次 3 收紧)、九个决策点 A~I 的默认取值与拍板留白、本次评审
+**驳回或转出**的五条意见、以及四条已知缺口(其中「confirmed 之后没有撤销弃码的
+代码路径」是所有者要知道的那一条)。
+
+**上线注意**:`sku_migrate` **永不进调度**(`registry/schedule.py` 头注的手动清单
+里点了名,守门测试钉住),`-p store=` 必填,节奏硬闸 1 → 10 → 一店 → 全店。
+**六件单品实测(sku_plan §4)全部通过之前只许 `--dry-run`**;它与 13:00 的
+`product_chain` 抢同一个 MP_MAINTENANCE 桶,不许并跑。本批**不跑就对生产零影响**。
+
+### 2026-09-02 SKU 改造批次 2:写侧切换(唯一有行为变化的批次)
+
+**做了什么**(两块,见 `docs/sku_plan.md` §7 批次 2 与 `docs/sku_workplan/batch_2.md`):
+第一块 `list_new` 预备期 mint 真码 + 退役冷却 / 代际上限两道闸 + `-p limit=N`
+试点闸(commit `50a76a4`);第二块 **四个弃码点接线 + 跟卖侧换 mint + 决策 C/D
+落地 + feed_poll 认 --dry-run**。
+
+**所有者决策的最终取值**:
+
+- **A|停用(RETIRE)不弃码** —— 取默认。守门反向钉死 `product_clear` 不得调
+  `abandon`;problem_scan 的豁免仍未拍板,`product_clear` 头注已写明「可恢复窗口
+  ≈ 到下一轮 problem_scan 为止」,届时走弃码点 1 正常收尾。
+- **B|UPC 撞库 0101119 时码与 UPC 一起换** —— 取默认「换」。
+  `listing_sheet._mark_upc_conflicts` 一次 `abandon(reason=upc_conflict)`,拆掉
+  「撞库 → 同 SKU 换 UPC → 0101211 SKU_LOCKED → 自愈链」这个死循环;代价最坏
+  只是多耗一个免费的码(码空间 30^11),不换的代价是重演死循环 —— 代价不对称。
+- **C|派工闸对齐去重闸** —— 取默认「对齐」,但**只改 `alloc_push`**
+  (去掉 lifecycle 条件),`alloc_survey` 一个字不改(它答的是"有没有活货位",
+  2026-08-15 定稿仍成立)。两处都有反向守门,防的是"顺手统一"。
+- **D|烧号状态值与函数签名** —— 一次做完:`upc_pool.burn_for_retire` 与
+  `mark_conflict` 删除,烧号唯一函数 `burn(conn, pairs, status)`,状态只由
+  `sku_codec._BURN_STATUS` 给(delete_verified→`burned_delete`、
+  sku_locked→`burned_lock`、upc_conflict→`conflict`)。
+
+**顺手修掉的既有破口(定级最高的一条)**:`cli.py feed_poll --dry-run`
+**此前会真的烧号**。链路:`feed_poll` 的 `DANGEROUS=False` ⇒ cli 恒传
+`execute=True`;它另行透传的 `params["dry_run"]` 从来没人读;五个反哺器也没有
+`execute` 形参。而本批还要往这条路上加**不可逆的弃码**。现在 `feed_poll` 自己读
+`dry_run`,五个反哺器统一收 `execute` 关键字,空跑一行飞书、一行 PG 都不写
+(守门 `test_every_reflector_takes_an_execute_flag` 拦"新增反哺器忘了加")。
+
+**跟卖侧的两个结构改动**:① `match_listing` 分两趟 —— 第一趟逐行 SPEC 预检
+(纯网络,**不开事务**),第二趟短事务里发码与登记、commit 早于 `submit_feed`
+(原工作包要求把整个循环包进一个事务,那会把几百次沃尔玛往返吊在一个 PG 事务上,
+mint 的行锁到整轮结束才释放);② B 列人工号**在提交前**登记 —— 提交成功才登记
+会让被拒的人工号成为维护链眼里的孤儿(落进 unknown,而 unknown 不参与任何自动
+动作 = 这批货永久退出自动化)。旧的 `PHUMWMT + 日期 + 序号` 生成器已删。
+
+**上线注意**:本批**改变生产行为**,试点按 `sku_plan.md` §7 批次 2 的七步走
+(先 `--dry-run` 人眼确认载荷,再 `list_new -p store=<店> -p limit=1` 真跑一个品);
+`feed_poll --dry-run` 也要先跑一次确认输出全带 `[DRY-RUN]`、PG 与飞书零写。
+新 DDL 一条:`listing_sources_abandoned_idx`(代际上限闸的 GROUP BY 用,幂等)。
+
 ## 1. 阶段划分
 
 ### Phase 0 — 地基(一次性)

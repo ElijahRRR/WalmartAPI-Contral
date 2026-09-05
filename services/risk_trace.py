@@ -5,7 +5,8 @@ TRO / 钓鱼订单的第一件事是**波及展开** —— 一家店中招,同�
 删干净的只剩占用台账的 released 行。所以本模块**四证据源取并集**,
 宁可多追出一家店让人去看,也不能漏掉一家还在挂货的店:
 
-  ① catalog.walmart_items    在架/曾在架的截面(唯一能判"还在架"的源)
+  ① catalog.walmart_items    在架/曾在架的截面(唯一能判"还在架"的源);
+                             身份按登记簿 amz 键与裸 sku 取**并集**
   ② catalog.listing_sources  上架时登记的出身(source_type='amz' 时 key=ASIN)
   ③ catalog.product_events   一生的病历(提交上架/下架/删除都留痕,行删了也在)
   ④ catalog.claims           占用台账,**含 released 行** —— 货和记录都清干净之后,
@@ -16,7 +17,10 @@ TRO / 钓鱼订单的第一件事是**波及展开** —— 一家店中招,同�
   a. `missing_since IS NULL`         —— 最近一轮全量扫描仍见到它;
   b. `coalesce(upper(lifecycle_status),'ACTIVE') = 'ACTIVE'` —— ⚠ **退市品的
      missing_since 也是 NULL**(catalog_sync 显式扫一轮 RETIRED,它没缺席,
-     只是退市了;services/alloc_survey._SQL_ONLINE 同款判法与教训);
+     只是退市了;services/alloc_survey._SQL_ONLINE 同款判法与教训。
+     ⚠ workflows/alloc_push._SQL_ONLINE 自 2026-09-02(SKU 改造批次 2)起
+     **改按「码是否弃用」判、不再筛 lifecycle**,与本处口径不同:那条答的是
+     "该不该派新活",本处答的是"它还在不在架上";别拿它当先例改这里);
   c. **店还在册** —— 已从凭证表删掉的死店,它的 walmart_items 行永久冻结为
      "在架"(docs/allocation_plan.md §9.4)。这一条本模块**不自己查**:
      在册集合要调飞书凭证表,services 层不该每次追溯都去敲外部接口。
@@ -120,16 +124,30 @@ def asins_of_brand(conn, brand_raw) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
-# ① 在架表:命中 walmart_items_sku_idx。still_listed 的 a+b 两条件在 SQL 里
-# 逐店 bool_or —— 同一店可能既有在架的又有已缺席的,只要还有一件在架就是在架。
+# ① 在架表:两条腿取**并集**再逐店聚合 —— 裸 sku 命中 walmart_items_sku_idx,
+# 经登记簿那条命中 listing_sources_key_idx。⚠ 写成一条 OR 两个索引都用不上
+# (与 ③ 号源同一条教训);UNION 而不是 UNION ALL,是因为同一行可能两边都命中。
+# 存量下第二条腿是第一条腿的子集(amz 行 source_key = sku),并集不变。
+# still_listed 的 a+b 两条件在 SQL 里逐店 bool_or —— 同一店可能既有在架的
+# 又有已缺席的,只要还有一件在架就是在架。
 _ITEMS_SQL = """
+WITH hit AS (
+    SELECT store, sku, missing_since, lifecycle_status, created_at, last_seen_at
+    FROM catalog.walmart_items
+    WHERE sku = ANY(%(asins)s::text[])
+    UNION
+    SELECT w.store, w.sku, w.missing_since, w.lifecycle_status,
+           w.created_at, w.last_seen_at
+    FROM catalog.listing_sources ls
+    JOIN catalog.walmart_items w ON w.store = ls.store AND w.sku = ls.sku
+    WHERE ls.source_type = 'amz' AND ls.source_key = ANY(%(asins)s::text[])
+)
 SELECT store,
        bool_or(missing_since IS NULL
                AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'),
        array_agg(DISTINCT sku),
        min(created_at), max(last_seen_at)
-FROM catalog.walmart_items
-WHERE sku = ANY(%(asins)s::text[])
+FROM hit
 GROUP BY store
 """
 

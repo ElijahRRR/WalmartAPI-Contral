@@ -4,21 +4,24 @@
   python cli.py list_new --dry-run           # 空跑:闸门链判定+逐行去向,不提交
   python cli.py list_new                     # 真跑(LLM 出参/领 UPC/提交 feed)
   python cli.py list_new -p store=A085朱丽霖
+  python cli.py list_new -p limit=1 -p store=X   # 试点:本轮只做前 1 行
+                                             # (缺省不截断;闸门与过滤之后才切)
   python cli.py list_new -p gap_wait=0       # 缺数据只推采集不等(默认等 20 分钟)
   python cli.py list_new -p workers=64       # 预备期 LLM 并发(默认 128,
                                              # 实际还会按 PG 连接余量钳制)
   python cli.py list_new -p submit_jitter_ms=0  # 提交期起跑抖动(毫秒,默认 800;
                                              # 0=关。去同步,不降并发)
 
-驱动表 = 上架表(registry.LISTING_SHEET,21 列):领任务条件 F 审核结果=pass
-且 K 是否上架 空/No 且 L 无 feedid;K∈{Yes,Unknown} 跳过(Unknown 也算
+驱动表 = 上架表(registry.LISTING_SHEET,21 列;**列按表头名定位**,见
+services/listing_sheet.layout,列顺序随所有者调整,代码不跟着改):领任务条件
+审核结果=pass 且 是否上架 空/No 且 无 feedid;是否上架∈{Yes,Unknown} 跳过(Unknown 也算
 已上架——沃尔玛可能已收单,重复提交 = 双上架,旧生死规则)。
-O=FAILED 走重试通道(≤3 次);O=SKU_LOCKED 本工作流不碰——由
+上架结果=FAILED 走重试通道(≤3 次);上架结果=SKU_LOCKED 本工作流不碰——由
 sku_locked_heal 自愈链处理(RETIRE→24h 冷却→清列,行变新行后回到
 本链领**新 UPC** 重上)。旧实证:SKU 已绑死旧 UPC,不先退役直接换
 UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 
-闸门链(顺序即执行序,每道命中写 N=未上架理由或摘要计数):
+闸门链(顺序即执行序,每道命中写「未上架理由」列或摘要计数):
   ① 店铺状态(ops.store_kpi_daily 非 ACTIVE 整店跳过,无记录视为 ACTIVE)
   ② 日配额**在全部过滤之后切**(所有者批复 2026-08-12:配额以成功提交为准,
     淘汰放切片前——先切片再过滤会让被淘汰行白占名额,淘汰率 40% 时实际
@@ -72,14 +75,16 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
 upc_sync 工作流);失败只告警不阻断,dry-run 不注入(注入是写库)。
 
 提交结局(旧三态生死语义,UPC 回收仅三类):
-  submitted → K=Yes L=feedid M=日期,UPC 标已用,listing_sources 登记(amz),
-              事件 list_submitted;O/P/Q 由 feed_poll 反哺器按回执四集合回填
-  failed(4xx 拒)→ N=提交被拒,UPC 回收(rejected)
-  unknown → K=Unknown(不重复提交),UPC **不回收**
-  内容标准拒(回执 O=CONTENT_REJECTED)不入 FAILED 通道,**也不自动重试**
+  submitted → 是否上架=Yes 上架feedid=feedid 上架日期=当天,UPC 标已用,
+              事件 list_submitted(登记簿在预备期抽码时就已登记,不在这里
+              补);SKU 列与这三列同一次写回;上架结果/报错/feed查询日期
+              由 feed_poll 反哺器按回执四集合回填
+  failed(4xx 拒)→ 未上架理由=提交被拒,UPC 回收(rejected)
+  unknown → 是否上架=Unknown(不重复提交),UPC **不回收**
+  内容标准拒(回执写 上架结果=CONTENT_REJECTED)不入 FAILED 通道,**也不自动重试**
   (所有者定稿 2026-08-23 撤除捞回通道):文案图片取自亚马逊原文,原样重发
-  必然同拒,还会触发/延长 QARTH 合规审查。这类行停在 Q 列等人 —— 人工改好
-  文案、清掉 Q 列即可重回普通通道(与 PROHIBITED 的"永不"语义有别)。
+  必然同拒,还会触发/延长 QARTH 合规审查。这类行停在「上架结果」列等人 ——
+  人工改好文案、清掉该列即可重回普通通道(与 PROHIBITED 的"永不"语义有别)。
   ⚠ 撤除的只是**自动重上**;`WALMART_ERR_CONTENT` 的归类照旧留着,否则它会
   掉进 FAILED 通道被重试三次,纯烧 UPC 与配额
 """
@@ -98,8 +103,9 @@ from registry import db, paths, resources
 from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
     db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
     mp_mapper, notify_fmt as nf, pricing, product_events, product_ingest, \
-    pt_spec, risk_gate, scrape_batches, store_limits, store_targets, \
-    stores as stores_svc, upc_pool, variant_group, variant_remap, variant_title
+    pt_spec, risk_gate, scrape_batches, sku_codec, store_limits, \
+    store_targets, stores as stores_svc, upc_pool, variant_group, \
+    variant_remap, variant_title
 from services import store_events, store_retry
 
 DANGEROUS = True
@@ -251,38 +257,48 @@ def _apply_submit_result(store_name: str, res: dict, batch: list,
     """输入:一片的提交结果 + 该片的 (行, UPC) → 输出:无(落库并攒表更新)。
 
     **两轮共用一条落地路径**(第一轮直接提交、第二轮延后结算)。分开写的话,
-    延后结算那条迟早漏掉 mark_used 或 listing_sources.register —— 漏了不报错,
-    只是那批货在维护链眼里成了"来源不明"的孤儿(sources_backfill 才捞得回来)。
+    延后结算那条迟早漏掉 mark_used 或事件 —— 漏了不报错,只是那批货在维护链
+    眼里成了"来源不明"的孤儿(sources_backfill 才捞得回来)。
+
+    ⚠ **这里不再调 listing_sources.register**(批次 2):登记已经在预备期
+    `_prep_rows` 抽码那一刻由 `sku_codec.mint` 在同一事务里做完(抽码即登记,
+    单一实现)。留着 register 是同一能力两条路径,而且语义已经不同 ——
+    register 是「首次登记 ON CONFLICT DO NOTHING」,对 mint 出来的行永远是空
+    操作,留着只会让下一个人以为登记发生在提交之后,进而把 mint 挪到提交后去
+    (挪过去 = 串行补试二次抽码 = 双上架,见 `_prep_rows` 头注)。
     """
     with db.pg_conn() as conn:
         if res["outcome"] == "submitted" and res["feed_id"]:
-            upc_pool.mark_used(conn, [(u, r["asin"]) for r, u in batch])
-            listing_sources.register(conn, [
-                {"store": store_name, "sku": r["asin"],
-                 "source_type": listing_sources.SOURCE_AMZ,
-                 "source_key": r["asin"], "workflow": "list_new"}
-                for r, _ in batch])
+            # 写进 upc_pool.sku 的是**这一轮真发出去的那个码**(预备期 mint 挂
+            # 在 r["_sku"] 上)——列名叫 sku 就该存 sku。
+            # upc_pool.asin 列(claim 时写)仍是 ASIN,不动:(store, asin) 是
+            # 原号复用的契约键,动它等于每次重试白烧一个号
+            upc_pool.mark_used(conn, [(u, r["_sku"]) for r, u in batch])
             product_events.record_many(conn, [
-                {"sku": r["asin"], "store": store_name,
+                {"sku": r["_sku"], "store": store_name,
                  "event": product_events.LIST_SUBMITTED, "source": "list_new",
-                 "detail": {"feed_id": res["feed_id"], "price": r["_price"]}}
+                 # detail 显式带 asin:不透明码在 product_events.asin 列里提不
+                 # 出来,而这里 ASIN 本来就在手边,是最省的一份补充证据
+                 "detail": {"feed_id": res["feed_id"], "price": r["_price"],
+                            "asin": r["asin"]}}
                 for r, _ in batch])
             for r, u in batch:
                 updates.append((r["rownum"], [
                     (r["_p"].get("title") or "")[:190],
                     r["_p"].get("price") or "",
                     r["_qty"],      # 实际提交的库存(0 也照写)
-                    r["_price"], "Yes", res["feed_id"], today, ""]))
+                    r["_price"], "Yes", res["feed_id"], today, "",
+                    r["_sku"]]))
         elif res["outcome"] == "failed":
             upc_pool.release(conn, [u for _, u in batch], "rejected")
             for r, _ in batch:
                 updates.append((r["rownum"], [
-                    "", "", "", "", "No", "", "", "提交被拒"]))
+                    "", "", "", "", "No", "", "", "提交被拒", r["_sku"]]))
         else:   # unknown:UPC 不回收,K=Unknown 防重复提交
             for r, _ in batch:
                 updates.append((r["rownum"], [
                     "", "", "", "", "Unknown", "", today,
-                    "提交结局不确定,待对账"]))
+                    "提交结局不确定,待对账", r["_sku"]]))
 
 
 
@@ -299,10 +315,28 @@ WHERE feed_type = 'MP_ITEM'
       AT TIME ZONE 'Asia/Shanghai'
 GROUP BY store
 """
-# 本店去重的数据面:(店铺, SKU) 对。只拦"同一家店重复上同一 ASIN",
-# 跨店不互拦(2026-08-28 取消全局去重,见文件头 ④)
+# 本店去重的数据面:(店铺, **身份键**) 对。只拦"同一家店重复上同一 ASIN",
+# 跨店不互拦(2026-08-28 取消全局去重,见文件头 ④)。
+# ① 第二列是**身份键**(coalesce(ls.source_key, w.sku)),不是 SKU 串:切码后
+#    拿裸 SKU 去比闸就恒不命中 ⇒ 同店同 ASIN 反复上架,烧 UPC 烧 MP_ITEM 配额,
+#    而且不报错。
+# ② 本闸**只按 amz 身份键去重**(LEFT JOIN 带 source_type='amz'):match 行的
+#    码寿命由 match_listing 自己的通道管。这是与 synthesis 规则 4 字面写法
+#    (不带 source_type)的一处**有意偏差** —— 后果是「已弃码的 match 僵尸行
+#    仍会挡新码」,对只处理 amz 行的 list_new 无实害(正向测试钉住)。
+# ③ **必须 LEFT JOIN**:未登记的在架行也要拦,否则两次回填之间新出现的行会
+#    静默漏闸。
+# ④ **不加 lifecycle 条件**(别照抄 alloc_push 的排 RETIRED):RETIRED 行只要
+#    码未弃就拦,退市档案不由 list_new 复活(2026-08-28 定稿;plan.md 的
+#    7,342 行批量复活事故)。
+# ⑤ `ls.abandoned_at IS NULL` 在批次 2 之前恒真(全库该列 NULL + LEFT JOIN),
+#    提前落地是为了让写侧切换只改一处。
 _SQL_LISTED_ASINS = """
-SELECT DISTINCT store, sku FROM catalog.walmart_items WHERE missing_since IS NULL
+SELECT DISTINCT w.store, coalesce(ls.source_key, w.sku)
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.missing_since IS NULL AND ls.abandoned_at IS NULL
 """
 _SQL_UNEXPLAINED = """
 SELECT asin FROM catalog.product_risk WHERE unexplained_missing
@@ -315,6 +349,38 @@ _SQL_VERDICT = """
 SELECT asin, audit_status, walmart_pt
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
+"""
+
+# 退役冷却的数据面:最近 RETIRE_COOLDOWN_HOURS 小时内**退役回执成功**过的
+# (店, ASIN)。
+# ① 键是 (店, **ASIN**) 不是 (店, SKU):退役发生在旧码上、重上用的可能是新码,
+#    按 SKU 建键会在换码那一刻静默失效(闸还在,永不命中)。
+# ② **LEFT JOIN 且带 source_type='amz'**:未登记的存量行也要能算出身份键
+#    (coalesce 回落 e.sku,存量 sku=asin 时结果相同);不带 source_type 的话
+#    跟卖行的 source_key 是 GTIN,冷却键按 GTIN 建、与闸判用的 r["asin"] 永远
+#    对不上 ⇒ 跟卖品的冷却恒不生效且不报错。身份表达式与 _SQL_LISTED_ASINS /
+#    _SQL_ATTEMPTS 逐字同款。
+# ③ 事件码走 product_events 常量,**不写字面量**:回执码是 {kind}_feed_{status}
+#    派生的,_FEED_KIND 一改取值,写字面量的这条 SQL 会静默返回空集。
+_SQL_RETIRE_COOLDOWN = """
+SELECT e.store, coalesce(ls.source_key, e.sku) AS asin, max(e.occurred_at)
+FROM catalog.product_events e
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = e.store AND ls.sku = e.sku AND ls.source_type = 'amz'
+WHERE e.event = %(event)s AND e.store IS NOT NULL
+  AND e.occurred_at >= now() - make_interval(hours => %(hours)s)
+GROUP BY 1, 2
+"""
+# 代际上限的数据面:同 (店, 来源, 源头键) 已弃码行数达 MAX_SKU_GENERATIONS 的品。
+# 数的是**已弃码行数**(一个产品换过几代码),所以按 source_key 分组而不是 sku
+# —— 按 sku 分组每行恒 1,闸永不命中。
+_SQL_ABANDONED_GEN = """
+SELECT store, source_key, count(*)
+FROM catalog.listing_sources
+WHERE abandoned_at IS NOT NULL AND source_type = %(source_type)s
+  AND source_key IS NOT NULL
+GROUP BY 1, 2
+HAVING count(*) >= %(cap)s
 """
 
 
@@ -347,16 +413,20 @@ class _GateState(NamedTuple):
     中间插一个字段就会让后面全部错位 —— 而错位不报错(集合/字典长得都一样)。"""
     inactive: set               # ops.store_kpi_daily 里非 ACTIVE 的店名
     today_used: dict            # 店 → 今日已提交 MP_ITEM 条数(北京日界)
-    listed_pairs: set           # 在架 (店铺, SKU) 对(本店去重,2026-08-28 起)
+    listed_pairs: set           # 在架 (店铺, **身份键**) 对(本店去重,2026-08-28 起)
     banned: dict                # ASIN → (拉黑类别, 说明)
     unexplained: set            # 有"不明原因消失"史的 ASIN(只报警不拦)
     gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
     owned_asin: dict            # ASIN → 持有店(占用台账 A1)
     owned_brand: dict           # 品牌键 → 持有店(占用台账 A1)
+    # ⚠ 下面两个是**追加在末尾**的(批次 2):本类按位置构造,往中间插字段会
+    # 让后面全部错位,而错位不报错(集合与字典长得都一样,见类头注)
+    cooling: dict               # (店, ASIN) → 最近一次退役回执成功时刻
+    over_gen: set               # (店, ASIN) 已弃码代数达 MAX_SKU_GENERATIONS
 
 
 def _load_gate_state() -> _GateState:
-    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的八份库侧快照。"""
+    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的十份库侧快照。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_INACTIVE)
         inactive = {s for s, st in cur.fetchall()
@@ -367,8 +437,10 @@ def _load_gate_state() -> _GateState:
         # 全部店都进(含规划外店):去重改成**本店**语义(2026-08-28 取消全局
         # 去重)后,这个集合只回答"这家店自己有没有这个 ASIN"——自己拦自己
         # 防重复上架,与 2026-08-15「规划外店既不占用、也不拦别人」不冲突
-        # (那条定稿针对的是跨店互拦,现在跨店根本不拦了)
-        listed_pairs = {(store, sku) for store, sku in cur.fetchall()}
+        # (那条定稿针对的是跨店互拦,现在跨店根本不拦了)。
+        # 第二列是**身份键**(见 _SQL_LISTED_ASINS 头注),闸判那头拿的是
+        # r["asin"],两边同一个口径。
+        listed_pairs = {(store, key) for store, key in cur.fetchall()}
         cur.execute(_SQL_UNEXPLAINED)
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
@@ -385,8 +457,18 @@ def _load_gate_state() -> _GateState:
         owned_brand = {b: s for b, s in
                        claims.load_active(conn, claims.BRAND).items()
                        if not alloc_survey.is_excluded(s)}
+        # 两道码闸的数据面(批次 2)与上面八份**同一次读完**:逐行查库会在几百
+        # 行的轮次里打出几百条 SQL,而 _load_gate_state 是闸门链唯一的库侧取数点
+        cur.execute(_SQL_RETIRE_COOLDOWN,
+                    {"event": product_events.RETIRE_FEED_SUCCESS,
+                     "hours": sku_codec.RETIRE_COOLDOWN_HOURS})
+        cooling = {(store, key): at for store, key, at in cur.fetchall()}
+        cur.execute(_SQL_ABANDONED_GEN,
+                    {"source_type": listing_sources.SOURCE_AMZ,
+                     "cap": sku_codec.MAX_SKU_GENERATIONS})
+        over_gen = {(store, key) for store, key, _n in cur.fetchall()}
     return _GateState(inactive, today_used, listed_pairs, banned, unexplained,
-                      gate, owned_asin, owned_brand)
+                      gate, owned_asin, owned_brand, cooling, over_gen)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -586,6 +668,22 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
 
     备好行挂 `_visible` / `_orderable`(占位号在里面),提交期领到真号后
     只回填 productIdentifiers,不重算。
+
+    **抽码也在这里**(批次 2):每行一次 `sku_codec.mint`,结果挂 `r["_sku"]`,
+    载荷里的 SKU 从此是它。三条硬理由,一条都不许绕:
+      ① **绝不许挪进 `_one_store`**:店级失败时 `store_retry.serial_second_pass`
+         重跑的就是 `_one_store`,抽码若在里面,补试会抽出新码 ⇒ 载荷不再一字
+         不差 ⇒ `api/feeds.payload_key` 的指纹变了 ⇒ 在途防重不命中 ⇒ 首轮已
+         发出去的那片被真的再发一次 = **双上架,而且全程不报错**。
+      ② **单事务顺序做一遍**,不放进 128 路 worker:worker 用的是 autocommit
+         连接,并发抢同一个 (店, 来源, 源头键) 的部分唯一索引会制造大量唯一
+         冲突重试;顺序几百次单行 INSERT,相对 LLM 那段墙钟可以忽略。
+      ③ **排在任何外部调用之前**(防重状态先落库再调接口):这段随 with 退出
+         就 commit,进程半路死掉重跑拿到的是同一个码。
+    dry-run 走不到这里(`run()` 的 `if not execute:` 早已 return),所以本函数
+    里没有、也不许有 dry-run 分支;空跑要看码走 `sku_codec.DRYRUN_PLACEHOLDER`。
+    **`r["_sku"]` 不许有任何 `or r["asin"]` 兜底** —— 那正是"静默把 ASIN 当
+    SKU 发出去"的制造机;缺了就该 KeyError 炸在测试里。
     """
     import queue as _queue
     from concurrent.futures import ThreadPoolExecutor
@@ -593,19 +691,39 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
 
     llm_stats: dict = {}     # cache/reuse/reuse_miss/llm 四类取数计数
 
+    # 抽码 + 登记(同一事务,随 with 退出 commit),然后才开并发做 LLM
+    with db.pg_conn() as conn:
+        for r in sorted(ready, key=lambda x: x["rownum"]):
+            r["_sku"] = sku_codec.mint(conn, r["store"],
+                                       listing_sources.SOURCE_AMZ, r["asin"],
+                                       workflow="list_new")
+    n_codes = len({r["_sku"] for r in ready})
+    if n_codes < len(ready):
+        # 同 (店, ASIN) 贴重了两行 ⇒ mint 复用同一个码。两个随机码相同不像两个
+        # ASIN 相同那样扎眼,不数出来没人看得见
+        logger.info("本轮 %d 行只用了 %d 个码:同 (店,ASIN) 在上架表贴重了",
+                    len(ready), n_codes)
+
     def _one(conn, r: dict) -> tuple:
         spec = pt_spec.load_pt(r["product_type"])
         visible, llm_o = _map_llm(conn, r["product_type"], spec, r["_p"],
                                   stats=llm_stats)
         if len(visible.get("productName") or "") < 10:
             return ("title_short", r, "标题不足10字符", None)
+        # 两处都用 r["_sku"]:第一参进 Orderable.sku(发给沃尔玛的 SKU),
+        # conform 的 sku= 会被 mp_conform 当作单品占位 variantGroupId 写进
+        # Visible —— 只改一处会出现「Orderable.sku 是新码、variantGroupId 还是
+        # ASIN」的半身像,而 variantGroupId 也是发出去的,等于把 ASIN 从后门递
+        # 出去。⚠ 这只修好**单品**口径:变体品的 variantGroupId 仍由
+        # services/variant_group 从 parent ASIN 派生(sku_plan §8 待决项)。
+        # 下面 logger / _dump_llm_debug 仍打 r["asin"]:那是给人看的定位键
         orderable = mp_mapper.build_orderable(
-            r["asin"], _UPC_PLACEHOLDER, r["_price"], r["_qty"],
+            r["_sku"], _UPC_PLACEHOLDER, r["_price"], r["_qty"],
             partners[r["store"]], pt=r["product_type"], product=r["_p"],
             llm_fields=llm_o)
         visible, orderable, notes, missing = mp_conform.conform(
             spec, pt_spec.orderable_spec(), visible, orderable,
-            sku=r["asin"], variant=r.get("_vplan"))
+            sku=r["_sku"], variant=r.get("_vplan"))
         if notes:
             logger.info("%s spec 一致化 %d 处:%s", r["asin"],
                         len(notes), "; ".join(notes[:6]))
@@ -656,16 +774,36 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
     return ok, reasons, cnt
 
 
-MAX_LIST_ATTEMPTS = 3       # 同 (店铺,SKU) 自动重上次数上限(旧 retry_state 阈值淘汰)
+MAX_LIST_ATTEMPTS = 3       # 同 (店铺,身份键) 自动重上次数上限(旧 retry_state 阈值淘汰)
 
-# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对
+# psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对。
+# 计数键是 (店铺, **身份键**):切码后按裸 SKU 数每次新码 count 恒 0 ⇒ FAILED
+# 无限重试(烧 UPC、烧 MP_ITEM 配额,不报错)。
+# **代际口径**(LATERAL 那段):
+#   · 无弃码事件 ⇒ g.since IS NULL ⇒ 谓词恒真 ⇒ 退化成今天的**跨码累计**;
+#   · 有弃码事件 ⇒ 只数最近一次弃码之后的提交(换了码就重新给三次)。
+# 认弃码事件读的是 abandon 自己写进 detail 的 source_key,**不是
+# product_events.asin 列**(那一列要到批次 0b 才经登记簿反查,在「0a 已合、
+# 0b 未合」的窗口里恒为 NULL ⇒ 代际过滤永不命中)。
+# 代际**上限**(同 (store, source_type, source_key) 弃码行数 ≥ 阈值即拦)属批次 2。
+# ⚠ 参数全部具名:psycopg3 不许位置占位符与具名占位符混用。
 _SQL_ATTEMPTS = """
-SELECT f.store, f.sku, count(*)
+SELECT t.store, t.asin, count(*)
 FROM ops.feed_items f
-JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
-  ON f.store = t.store AND f.sku = t.sku
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = f.store AND ls.sku = f.sku AND ls.source_type = 'amz'
+JOIN unnest(%(stores)s::text[], %(asins)s::text[]) AS t(store, asin)
+  ON f.store = t.store AND coalesce(ls.source_key, f.sku) = t.asin
+LEFT JOIN LATERAL (
+    SELECT max(occurred_at) AS since
+    FROM catalog.product_events e
+    WHERE e.store = t.store
+      AND e.event = %(abandoned)s
+      AND e.detail ->> 'source_key' = t.asin
+) g ON true
 WHERE f.feed_type = 'MP_ITEM'
-GROUP BY f.store, f.sku
+  AND (g.since IS NULL OR f.submitted_at > g.since)
+GROUP BY t.store, t.asin
 """
 
 
@@ -675,8 +813,9 @@ def _retry_rows(rows: list[dict], verdicts: dict
 
     O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
     字段问题改完 mapper 即可),旧系统靠 main 看 N=DATA_ERROR 接回重试。
-    但不能无限重试——按 ops.feed_items 里同 (店铺,SKU) 的 MP_ITEM 提交次数
-    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物)。
+    但不能无限重试——按 ops.feed_items 里同 (店铺,身份键) 的 MP_ITEM 提交次数
+    卡 MAX_LIST_ATTEMPTS(旧 retry_state 永久淘汰名单的等价物);换过码的品
+    只数最近一次弃码之后的提交(代际口径见 _SQL_ATTEMPTS 头注)。
 
     ⚠ SKU_LOCKED 不进本通道:不先 RETIRE 换 UPC 重发也会失败(旧实证),
     走 sku_locked_heal 自愈链;ASYNC_PENDING 不是失败。
@@ -687,8 +826,10 @@ def _retry_rows(rows: list[dict], verdicts: dict
     if not cand:
         return [], []
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_ATTEMPTS, ([r["store"] for r in cand],
-                                    [r["asin"] for r in cand]))
+        cur.execute(_SQL_ATTEMPTS,
+                    {"stores": [r["store"] for r in cand],
+                     "asins": [r["asin"] for r in cand],
+                     "abandoned": product_events.SKU_ABANDONED})
         tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
     retry, exhausted = [], []
     for r in cand:
@@ -701,12 +842,19 @@ def _retry_rows(rows: list[dict], verdicts: dict
     return retry, exhausted
 
 
+# 同族已在架成员(按**身份键**匹配,传进来的一直是同族 ASIN)。
+# ⚠ 本条**有意不加 abandoned_at 谓词**:变体同族查的是「这家店此刻还挂着哪些
+# 同族成员」这个在架事实,与码是否已弃用无关。abandoned_at 只出现在 mint 的
+# 复用查询、list_new 去重闸、alloc_push._SQL_ONLINE 三处(消费方契约,
+# conventions §九)。
 _FAMILY_LISTED_SQL = """
-SELECT sku, variant_group_id,
-       coalesce(variant_group_info->>'isPrimary', '') AS is_primary
-FROM catalog.walmart_items
-WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
-  AND missing_since IS NULL
+SELECT w.sku, w.variant_group_id,
+       coalesce(w.variant_group_info->>'isPrimary', '') AS is_primary
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.store = %(store)s AND w.missing_since IS NULL
+  AND coalesce(ls.source_key, w.sku) = ANY(%(asins)s::text[])
 """
 
 
@@ -727,8 +875,8 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
         try:
             with conn.cursor() as cur:
                 cur.execute(_FAMILY_LISTED_SQL,
-                            {"store": store, "skus": [a for a in fam
-                                                      if a != r["asin"]]})
+                            {"store": store, "asins": [a for a in fam
+                                                       if a != r["asin"]]})
                 for _sku, g, prim in cur.fetchall():
                     gid = gid or (str(g) if g else "")
                     has_primary = has_primary or str(prim).lower() in ("yes", "true")
@@ -1037,8 +1185,15 @@ def _spec_precheck(ready: list[dict]) -> str:
 
     dry-run 里就能看到"哪些行会因为哪些必填过不了",不必靠回执试错烧 UPC。
     LLM 走缓存,同一批重复预检不重复计费。
+
+    SKU 用 `sku_codec.DRYRUN_PLACEHOLDER` 而不是 mint:本函数只在 dry-run 分支
+    被调到,而空跑绝不许写库(mint 是写库函数,同事务登记)。占位码含 `0`,
+    不在字母表里 ⇒ `is_opaque` 恒 False,形态上就不可能被当成真码。
+    抬头行说破"这是占位的",免得它看起来像真发出去的那个串。
     """
-    lines = ["  spec 预检(不领 UPC/不提交):"]
+    ph = sku_codec.DRYRUN_PLACEHOLDER
+    lines = [f"  spec 预检(不领 UPC/不提交;sku 用占位码 {ph},"
+             f"真跑时由登记簿给真码):"]
     ok = 0
     with db.pg_conn() as conn:
         for r in ready[:20]:
@@ -1050,11 +1205,11 @@ def _spec_precheck(ready: list[dict]) -> str:
                 lines.append(f"    {r['asin']}:LLM 映射失败 {e}")
                 continue
             orderable = mp_mapper.build_orderable(
-                r["asin"], _UPC_PLACEHOLDER, r["_price"], r["_qty"], "0",
+                ph, _UPC_PLACEHOLDER, r["_price"], r["_qty"], "0",
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
-                sku=r["asin"],
+                sku=ph,
                 variant=_variant_plan(conn, r.get("store") or "", r, spec))
             if missing:
                 lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
@@ -1230,6 +1385,29 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 counts["dedup"] += 1
                 reasons.append((r["rownum"], "本店已在架:同店重复上架拦截"))
                 continue
+            # ── 两道码闸(批次 2):位置就是语义 ────────────────────────────
+            # 在去重闸**之后**:已在架的行压根不是"再上架",不该走到这儿;
+            # 在占用/黑名单闸**之前**:那两道问"这个产品该不该由这家店上",
+            # 这两道问"这个 (店, 产品) 现在能不能上"——后者是更硬的时序事实。
+            # 两道之间:代际上限在前,它是要人介入的终局判断,冷却只是等一等;
+            # 一行同时命中两者时,N 列该显示要人做的那条。
+            # 命中只写 N 理由**不写终态**(与既有闸门同语义:冷却期满/人工处置
+            # 之后下一轮自动续上)。
+            if (store_name, r["asin"]) in st.over_gen:
+                # 判据:同 (店, amz, ASIN) 已弃码行数 ≥ sku_codec
+                # .MAX_SKU_GENERATIONS(数据面 _SQL_ABANDONED_GEN)。堵的是
+                # 「弃码→新码→再弃码」的循环,每转一圈白烧一个 UPC 与一个
+                # MP_ITEM 配额名额,而且三条护栏跟着码重新计数
+                counts["gen_cap"] += 1
+                reasons.append((r["rownum"], "换码次数达上限,待人工"))
+                continue
+            if st.cooling.get((store_name, r["asin"])):
+                # 判据:该 (店, ASIN) 在 sku_codec.RETIRE_COOLDOWN_HOURS 小时内
+                # 退役回执成功过(数据面 _SQL_RETIRE_COOLDOWN)。旧实证:退役
+                # 后不等冷却就重上,沃尔玛侧那条记录还在,必然再失败一次
+                counts["cooldown"] += 1
+                reasons.append((r["rownum"], "退役冷却中"))
+                continue
             holder = None if unplanned else st.owned_asin.get(r["asin"])
             if holder and holder != store_name:
                 # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
@@ -1404,8 +1582,13 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store/check_spec)→ 输出:闸门链与提交摘要。"""
+    """输入:params(execute/store/check_spec/limit)→ 输出:闸门链与提交摘要。"""
     execute = bool(params.get("execute"))
+    # 人工上限(试点闸,所有者节奏「一店一品 → 10 个 → 全店」):缺省 None =
+    # 与今天逐字一致,只有显式传值才截断。缺省即真跑、一跑就是全店 ready 行
+    # 全部抽码 + 提交 MP_ITEM,码已发、UPC 已 used,不可逆 —— 纪律没有默认值
+    # 替你挡,所以把节奏做成代码闸而不是口头约定(形态照 alloc_push 的既有写法)
+    limit = int(params.get("limit", 0)) or None
     # 同轮闭环等待窗(分钟,0=只推不等)与预备期 LLM 并发(所有者定稿
     # 2026-08-18:「过闸后默认128并发打deepseek」;实际并发还要过
     # db_guard.cap_workers 按 PG 连接余量钳一道)
@@ -1416,7 +1599,7 @@ def run(params: dict) -> str:
     rows = listing_sheet.read_rows()
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
-    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里 F 列是投影,
+    # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里「审核结果」是投影,
     # 可能被人手改、可能滞后;PG 是权威,而且快。
     verdicts = load_verdicts([r["asin"] for r in rows if r.get("asin")])
     open_rows = [r for r in rows
@@ -1449,10 +1632,10 @@ def run(params: dict) -> str:
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
              + (f"(其中重试 {len(retry)})" if retry else "")]
     if n_unaudited or n_rejected:
-        # ⚠ 必须点名:审核闸从"读表 E 列"改成"读库"之后,**没审过的行会静默
+        # ⚠ 必须点名:审核闸从"读表「审核结果」"改成"读库"之后,**没审过的行会静默
         # 消失在待上架里**。不说的话表现是"表里明明有几百行却一行也不上"
         lines.append(
-            f"  审核闸(读 catalog.products,不读表 F 列):"
+            f"  审核闸(读 catalog.products,不读表「审核结果」):"
             + (f"**未审核 {n_unaudited} 行**"
                f"(先跑 `python cli.py product_audit -p from_sheet=1`)"
                if n_unaudited else "")
@@ -1480,6 +1663,7 @@ def run(params: dict) -> str:
         stores_by_name={s["name"]: s for s in stores_svc.load_stores()})
     stores_by_name = ctx.stores_by_name
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
+         "gen_cap": 0, "cooldown": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
          "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0}
@@ -1533,6 +1717,15 @@ def run(params: dict) -> str:
         ready.extend(srows[:allow])
         n["quota"] += max(0, len(srows) - allow)
 
+    # 人工上限**必须在全部闸门与数据过滤之后**切(与配额切片同一条纪律:
+    # 被淘汰行不占名额,否则 -p limit=1 可能一行都上不了,人会以为功能坏了)。
+    # 不写 N 理由、不写终态:没轮到的行下一轮照常续上,不是"被拦"
+    if limit and len(ready) > limit:
+        n_held = len(ready) - limit
+        ready = ready[:limit]
+        lines.append(f"  ⚠ 人工上限 -p limit={limit}:本轮只做前 {limit} 行,"
+                     f"其余 {n_held} 行留到下一轮(试点闸,不写 N 理由不写终态)")
+
     # ── 变体决策提前到这里算(2026-08-17 修两个问题)────────────────────────
     # ① **摘要里的"变体"一栏从来没出现过**:n_var 原来在下面的提交循环里才填,
     #    而 gate_line 是**字符串**、在那之前就拼好了 —— 后填的计数永远进不去。
@@ -1554,7 +1747,8 @@ def run(params: dict) -> str:
     blocked = [(label, n[key]) for key, label in (
         ("inactive", "非 ACTIVE 店"), ("quota", "超配额"),
         ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
-        ("dedup", "本店已在架"), ("blacklist", "黑名单"),
+        ("dedup", "本店已在架"), ("gen_cap", "换码达上限"),
+        ("cooldown", "退役冷却中"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
         ("lead_days", "配送超时"), ("no_material", "素材不足"),
         ("channel", "渠道不符本店"), ("custom", "定制品")) if n[key]]

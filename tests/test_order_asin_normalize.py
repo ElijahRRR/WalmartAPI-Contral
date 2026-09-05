@@ -13,13 +13,15 @@ class _Cur:
         self._rows: list = []
 
     def execute(self, sql, args=None):
-        if "SELECT DISTINCT sku FROM orders.order_lines" in sql:
-            self._rows = [(s,) for s in self.skus]
+        if "SELECT DISTINCT store, sku FROM orders.order_lines" in sql:
+            self._rows = [(None, s) for s in self.skus]
+        elif "catalog.listing_sources" in sql:
+            self._rows = []                  # 未登记 ⇒ 回落形态提取
         elif "FROM catalog.walmart_items" in sql:
             self._rows = [(k, v) for k, v in self.item_ids.items()
-                          if k in set(args[0])]
+                          if k in set(args[-1])]
         elif sql.strip().startswith("UPDATE orders.order_lines"):
-            self.fills.append((list(args[0]), list(args[1])))
+            self.fills.append((list(args[0]), list(args[1]), list(args[2])))
             self.rowcount = len(args[0])
         elif "count(*) FILTER" in sql:
             self._rows = [(100, 90)]
@@ -62,13 +64,13 @@ def test_resolves_the_four_sku_forms(monkeypatch):
               "102460018738",                # 纯数字 → 倒查
               "随便什么"],                    # 其他形态
         item_ids={"102460018738": "JTZW-B08M4D1GMT-38"}))
-    mapping, buckets = oan.sku_asin.resolve_skus(_Conn(cur),
-                                                 [s for s in cur.skus])
-    assert mapping == {"B0ABCDEFGH": "B0ABCDEFGH",
-                       "XKJ-B0GXX75JN5-39.98": "B0GXX75JN5",
-                       "102460018738": "B08M4D1GMT"}
+    pairs = [(None, s) for s in cur.skus]
+    mapping, buckets = oan.sku_asin.resolve_pairs(_Conn(cur), pairs)
+    assert mapping == {(None, "B0ABCDEFGH"): "B0ABCDEFGH",
+                       (None, "XKJ-B0GXX75JN5-39.98"): "B0GXX75JN5",
+                       (None, "102460018738"): "B08M4D1GMT"}
     assert buckets["numeric_resolved"] == 1
-    assert "随便什么" not in mapping          # 提不出的不进映射
+    assert (None, "随便什么") not in mapping   # 提不出的不进映射
 
 
 def test_unresolvable_stays_null_and_is_never_backfilled_with_raw_sku(monkeypatch):
@@ -89,7 +91,7 @@ def test_preview_writes_nothing(monkeypatch):
     cur = _wire(monkeypatch, _Cur(skus=["B0ABCDEFGH", "坏的"]))
     out = oan.run({})
     assert cur.fills == [] and "预览" in out
-    assert "可解析 1 个(50.0%)" in out
+    assert "可解析 1 个 sku、1 个组合(50.0%)" in out
     assert "-p apply=1" in out
 
 
@@ -97,7 +99,8 @@ def test_apply_fills_only_resolved(monkeypatch):
     cur = _wire(monkeypatch, _Cur(skus=["B0ABCDEFGH", "XKJ-B0GXX75JN5-39.98",
                                         "坏的"]))
     out = oan.run({"apply": "1"})
-    skus, asins = cur.fills[0]
+    stores, skus, asins = cur.fills[0]
+    assert len(stores) == len(skus) == len(asins)     # 三数组逐位对齐
     assert dict(zip(skus, asins)) == {"B0ABCDEFGH": "B0ABCDEFGH",
                                       "XKJ-B0GXX75JN5-39.98": "B0GXX75JN5"}
     assert "全表覆盖率 90/100(90.0%)" in out
@@ -109,6 +112,10 @@ def test_sql_only_touches_null_rows():
     assert "o.asin IS NULL" in oan._FILL_SQL
     # 空 sku 不进待洗集合(否则会拿空串去 classify,白占一个 other 桶)
     assert "btrim(sku) <> ''" in oan._DISTINCT_SQL
+    # 带 store 定位(2026-09-02):同一串 sku 在两家店切码后指向不同产品;
+    # IS NOT DISTINCT FROM 与事件账本那份逐字同写法(两条清洗器有对拍测试)
+    assert "DISTINCT store, sku" in oan._DISTINCT_SQL
+    assert "IS NOT DISTINCT FROM" in oan._FILL_SQL
 
 
 def test_rules_are_not_reimplemented_here():
@@ -118,11 +125,19 @@ def test_rules_are_not_reimplemented_here():
     规则扩充时漏改没人调的那份不会报错,只会制造"我改了规则"的错觉。
     """
     src = open(oan.__file__, encoding="utf-8").read()
+    # 射程是**代码**不是模块 docstring:docstring 里写清"这一跳查的是
+    # catalog.listing_sources"正是我们要的文档(与 test_sku_guard 的
+    # abandoned_at 那条同一条纪律),扫那个词本身没有意义
+    body = src.split('"""', 2)[2]
     assert "re.compile" not in src and "import re" not in src
     # 连倒查那一跳(item_id → 订货号)与形态样本也在 services(2026-08-27 收编):
     # 本工作流只剩 _DISTINCT_SQL / _FILL_SQL 这两条"打哪张表"的真差异
-    assert "sku_asin.resolve_skus" in src and "sku_asin.samples" in src
+    assert "sku_asin.resolve_pairs" in src and "sku_asin.samples" in src
     assert "_ITEMID_SQL" not in src        # 倒查那一跳的 SQL 也不许再有第二份
+    # 登记簿那一跳(2026-09-02 新加的规则)同样只准住在 services:
+    # 在这里写一条 JOIN listing_sources 就是第二份规则,漏改一份不报错
+    assert "listing_sources" not in body
+    assert "resolve_many" not in body      # 工作流只准用批量入口 resolve_pairs
 
 
 def test_normalize_agrees_with_the_event_ledger_cleaner():
@@ -135,13 +150,14 @@ def test_normalize_agrees_with_the_event_ledger_cleaner():
     skus = ["B0ABCDEFGH", "XKJ-B0GXX75JN5-39.98", "A109-B08QF9XLMH-02",
             "102460018738", "随便什么"]
     ids = {"102460018738": "JTZW-B08M4D1GMT-38"}
-    mine, _ = oan.sku_asin.resolve_skus(_Conn(_Cur(skus, ids)), skus)
-    theirs, _ = sn.sku_asin.resolve_skus(_Conn(_Cur(skus, ids)), skus)
+    pairs = [(None, s) for s in skus]
+    mine, _ = oan.sku_asin.resolve_pairs(_Conn(_Cur(skus, ids)), pairs)
+    theirs, _ = sn.sku_asin.resolve_pairs(_Conn(_Cur(skus, ids)), pairs)
     assert mine == theirs
-    assert mine["A109-B08QF9XLMH-02"] == "B08QF9XLMH"   # 曾被过严规则冤枉的那 208 个
+    assert mine[(None, "A109-B08QF9XLMH-02")] == "B08QF9XLMH"   # 曾被冤枉的 208 个
     # 两个工作流走的是**同一个函数对象**(2026-08-27 起连倒查那一跳也在
     # services):这才是"不会飘"的根据,各写一份再比对只能比中当天那一次
-    assert oan.sku_asin.resolve_skus is sn.sku_asin.resolve_skus
+    assert oan.sku_asin.resolve_pairs is sn.sku_asin.resolve_pairs
     # 两个工作流都只经由 sku_asin,没有各自的规则副本
     assert "re.compile" not in open(sn.__file__, encoding="utf-8").read()
 
@@ -153,6 +169,8 @@ def test_order_sync_fills_asin_at_write_time():
 
     否则每次 order_sync 之后,最新的订单——也就是最有价值的选品信号——
     在产品/品牌销量维度里全是空的,直到有人想起来重跑扫尾工作流。
+    ⚠ 2026-09-02 起这一跳挪到了**唯一写入口** upsert_order_lines(它要查
+    登记簿,得有连接);extract_order_lines 仍是纯函数,守的语义没变。
     """
     from services import order_lines as ol
     assert "asin" in ol._ORDER_LINE_COLS
@@ -165,7 +183,25 @@ def test_order_sync_fills_asin_at_write_time():
             "orderLineQuantity": {"amount": "1"},
             "orderLineStatuses": {"orderLineStatus": [{"status": "Shipped"}]},
         }]}})
-    assert rows[0]["asin"] == "B0GXX75JN5"
+
+    class _C:
+        # ⚠ 攒下每一条 executemany:upsert_order_lines 之后还有一条下单时间观测
+        # 记账(_record_order_date_observations),只留最后一条会拿到那条的行
+        def __init__(self): self.manys = []
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, args=None): self.rows = []
+        def executemany(self, sql, seq): self.manys.append((sql, list(seq)))
+        def fetchall(self): return []
+
+    class _Conn2:
+        def __init__(self): self.cur = _C()
+        def cursor(self): return self.cur
+
+    conn = _Conn2()
+    ol.upsert_order_lines(conn, rows)
+    written = next(r for sql, r in conn.cur.manys if "ON CONFLICT" in sql)
+    assert written[0]["asin"] == "B0GXX75JN5"
 
 
 def test_resync_never_wipes_an_asin_the_sweeper_resolved():
@@ -198,7 +234,7 @@ def test_missing_column_says_run_db_init_not_a_traceback(monkeypatch):
     """
     class _Boom(_Cur):
         def execute(self, sql, args=None):
-            if "SELECT DISTINCT sku" in sql:
+            if "SELECT DISTINCT store, sku" in sql:
                 raise RuntimeError('column "asin" does not exist\nLINE 3: ...')
             super().execute(sql, args)
 

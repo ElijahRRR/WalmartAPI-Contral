@@ -475,6 +475,19 @@ def claim(conn, actions: tuple | None = None) -> list[dict]:
         return [_merge_view(dict(zip(cols, r))) for r in cur.fetchall()]
 
 
+def count_open_action(conn, action: str, status: str = "suggested") -> int:
+    """输入:连接 + 动作(+状态)→ 输出:库里该动作、该状态的建议行条数。只读。
+
+    给"某个动作整路停闸"时的摘要用(2026-09-05 标题停闸首用):执行件不领这个
+    动作,但库里已有的 suggested 行**留着不撤**(恢复后还在),人得知道留了多少。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM ops.dispositions "
+                    "WHERE status = %(st)s::text AND action = %(a)s::text",
+                    {"st": status, "a": action})
+        return int((cur.fetchone() or [0])[0])
+
+
 def count_suppressed(conn, actions: tuple | None = None) -> int:
     """输入:连接 + 动作集 → 输出:因同 SKU 挂着破坏类建议而被压制的条数。
 
@@ -813,3 +826,114 @@ def stuck_note(rows: list[dict], days: int = EXPIRE_DAYS) -> str:
             f"成因多为该店没被 catalog_sync 扫到(凭证坏了?)⇒ 观测永远不来。"
             f"查:SELECT * FROM ops.dispositions WHERE status='executing' "
             f"AND executed_at < now() - interval '{days} days'")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  改码(SKU 改造批次 3)要的两个积木:前置闸的读、迁键的写
+#  —— 处置状态机的判据与写入必须出生在**所有权模块**里。工作流里现写一句
+#  `UPDATE ops.dispositions SET sku = …` 就是第二条处置写路径:它绕过状态机、
+#  撞得上 dispositions_open_uidx、还漏掉 asin 列,而 08-19 那次「谁也说不清是
+#  哪条链干的」正是这么来的(refdata/schema.sql 的表头注释记着)。
+# ══════════════════════════════════════════════════════════════════════════════
+
+_OPEN_EXECUTING_SQL = """
+SELECT count(*) FROM ops.dispositions
+WHERE store = %(store)s::text AND status = 'executing'
+"""
+
+
+def open_executing_count(conn, store: str) -> int:
+    """输入:连接 + 店 → 输出:该店 status='executing' 的处置行数(改码前置闸用)。
+
+    只读。改码前该店必须**没有**在途处置:executing 意味着某条 DELETE/RETIRE/
+    维护 feed 已经提交、正等观测判决,而改码会把它等的那个 (店, SKU) 键换掉
+    —— 判决从此永远等不到,行卡在 executing 里堵住同 (店,SKU,动作) 的一切新
+    建议(部分唯一索引 dispositions_open_uidx 挡着,见 stuck_executing 头注)。
+    用计数不取行:闸只问 0 还是非 0;要看是哪些行卡着,那是 stuck_executing 的活。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_OPEN_EXECUTING_SQL, {"store": store})
+        return int((cur.fetchone() or [0])[0])
+
+
+#: 迁键前先看新码名下**已占**了哪些动作:部分唯一索引 dispositions_open_uidx
+#: 约束 (store, sku, action) WHERE status IN ('suggested','executing'),撞上就抛。
+_REKEY_TAKEN_SQL = """
+SELECT action FROM ops.dispositions
+WHERE store = %(store)s::text AND sku = %(new_sku)s::text
+  AND status IN ('suggested', 'executing')
+"""
+
+_REKEY_SQL = """
+UPDATE ops.dispositions
+   SET sku = %(new_sku)s::text, asin = coalesce(asin, %(asin)s::text)
+ WHERE store = %(store)s::text AND sku = %(old_sku)s::text
+   AND status = 'suggested'
+   AND action <> ALL(%(taken)s::text[])
+"""
+
+
+_STRANDED_SQL = """
+SELECT DISTINCT action FROM ops.dispositions
+WHERE store = %(store)s::text AND sku = %(sku)s::text
+  AND settled_at IS NULL AND status = 'executing'
+ORDER BY action
+"""
+
+
+def executing_actions_on(conn, store: str, sku: str) -> list[str]:
+    """输入:连接 + (店, SKU) → 输出:该行名下**未落定的 executing** 动作列表。
+
+    只读。给改码定案时的**点名**用:`rekey_suggested` 故意不搬 executing 行
+    (搬键 = 把判决对象换掉),于是改码之后这些行滞留在旧码上,等
+    `expire_executing` 把它们判成 ineffective 收尾 —— 自愈,不是事故。
+    但**不许静默**:滞留几条、是哪些动作,要进摘要让人看见。
+    ⚠ 破坏组(delete/retire)不该出现在这里 —— 改码候选判据「无未了结破坏建议」
+    在挑选时就把它们剔掉了。真出现了说明中间窗口里长出了新的破坏建议
+    (problem_scan 的 `_SQL_ITEMS` 那条 NOT EXISTS 本该挡住),要当异常看。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_STRANDED_SQL, {"store": store, "sku": sku})
+        return [r[0] for r in cur.fetchall()]
+
+
+def rekey_suggested(conn, store: str, old_sku: str, new_sku: str,
+                    asin: str | None = None) -> tuple[int, list[str]]:
+    """输入:连接 + 店 + 新旧码(+ 出身 ASIN)→ 输出:(迁走的建议行数,
+    因唯一索引冲突未迁的 action 列表)。
+
+    改码定案时把**未落定的建议**(status='suggested')从旧码搬到新码:建议是
+    "这个 item 该怎么处置",item 没变、只是身份列换了,不搬的话下一轮扫描件
+    对新码重新建一遍(旧码那条则永远撤不掉,因为它已经不在扫描面里)。
+
+    三条边界,每条都有理由:
+      ① **executing 行本函数不碰**:它已经提交了 feed、正等观测判决,搬键
+         等于把判决对象换掉。
+         ⚠ 2026-09-04 起这里的前提变了:原来靠 `open_executing_count` 那条
+         **整店**前置闸保证"这一刻该店没有 executing 行",所有者复议后那条闸
+         只报数不拦(13:00 三条链齐发,整店 executing 是常态,拦它等于改码永远
+         开不了工)。现在的保证是**逐候选**的:改码候选判据「无未了结破坏建议」
+         剔掉了旧码名下有未落定 delete/retire 的行,所以本函数遇不到破坏组的
+         executing。**维护组(title/price/inventory)的 executing 行则可能存在**,
+         照旧不碰 —— 它们滞留在旧码上,由 `expire_executing` 判成 ineffective
+         收尾(自愈)。调用方用 `executing_actions_on` 把它们点名进摘要,不静默。
+      ② **动作撞车不迁、不删、不合并**,返回 action 列表让调用方点名人工:
+         新码名下已有同动作的未落定行时,两条同动作的建议合成一条会让其中
+         一个的落定结果覆盖另一个(schema.sql 的索引注释明写这条设计)。
+         判不准就判活(conventions §五)。
+      ③ asin 列跟着补(coalesce,只填不覆盖):不透明码在 sku 列里提不出 ASIN,
+         这一列是它与产品中心/黑名单对齐的唯一线索。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_REKEY_TAKEN_SQL, {"store": store, "new_sku": new_sku})
+        taken = sorted({r[0] for r in cur.fetchall()})
+        cur.execute(_REKEY_SQL, {"store": store, "old_sku": old_sku,
+                                 "new_sku": new_sku, "asin": asin,
+                                 "taken": taken})
+        moved = cur.rowcount
+    if taken:
+        logger.warning(
+            "改码迁键 %s/%s→%s:新码名下已有未落定建议 %s,这些动作的旧码建议"
+            "**不迁不删**,请人工处置(合并会让一条的落定盖掉另一条)",
+            store, old_sku, new_sku, ",".join(taken))
+    return moved, taken

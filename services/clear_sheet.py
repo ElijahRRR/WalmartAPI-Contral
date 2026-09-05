@@ -72,11 +72,15 @@ def writeback(updates: list[tuple[int, str, str, str, str]],
          for r, fid, dt, res, err in updates])
 
 
-def sync_from_ledger() -> str | None:
-    """输入:无 → 输出:回写摘要一行;表未配置或无在途行返回 None。
+def sync_from_ledger(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:回写摘要一行;表未配置或无在途行返回 None。
 
     feed_poll 用:在途行(E 有 feedid、G 空/处理中)按 ops.feed_items 台账
     落 G/H——台账已由全局轮询落定,这里纯读库,不调沃尔玛。
+
+    `execute=False`(`cli.py feed_poll --dry-run`)只报数,不发写请求 ——
+    五个反哺器统一带这个关键字参数,_one_chain 才能用同一种调用形态
+    (否则要靠 inspect 判断谁认 execute,那是新的隐式约定)。
     """
     try:
         resources.RETIRE_SHEET.require()
@@ -107,5 +111,8 @@ def sync_from_ledger() -> str | None:
             updates.append((r["rownum"], fid, r["op_date"], result, code))
     if not updates:
         return f"停用/删除表:在途 {len(pollable)} 行,台账尚无新终态"
+    if not execute:
+        return (f"[DRY-RUN] 停用/删除表:将回写 {len(updates)} 行"
+                f"(在途 {len(pollable)})")
     n = writeback(updates)
     return f"停用/删除表回写 {n} 行(在途 {len(pollable)})"

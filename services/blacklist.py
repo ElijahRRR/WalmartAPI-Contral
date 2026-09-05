@@ -55,9 +55,12 @@ import json
 import logging
 from collections import Counter
 
+# ⚠ 形态提取那个函数**不再直接 import**:身份只从登记簿那条路取
+#   (`sku_asin.pick_asin` / `resolve_many` 内部才回落形态腿),这儿留个裸入口
+#   就会有人又写第二份规则。守门的文本轨连注释里的函数名一起拦,所以这段
+#   只说"形态腿"不写它的名字 —— 拦的正是"先在注释里写好再抄进代码"那一步。
 from registry import resources
-from services import error_source, error_taxonomy
-from services.sku_asin import extract_asin
+from services import error_source, error_taxonomy, sku_asin, sku_codec
 
 logger = logging.getLogger("services.blacklist")
 
@@ -90,7 +93,13 @@ logger = logging.getLogger("services.blacklist")
 PERMANENT = frozenset(error_taxonomy.PERMANENT_CODES)
 
 # 品牌收集的触发类别:品牌未授权 / 知识产权(旧 C/E 的新码等价物)
-BRAND_CATEGORIES = frozenset({"BRAND", "IP"})
+#: ⚠ **码 → 渠道来源中文** 的唯一出处(2026-09-04 补)。原先 SQL 里写死
+#: `CASE l.cat WHEN 'C' … WHEN 'E' …`,2026-09-03 换轨把 cat 换成新码之后
+#: 那两个 WHEN 一个都不命中 ⇒ `'沃尔玛-' || NULL` = **NULL**,渠道重建出来的
+#: 每一行 source 都是空 —— 而且不报错,SQL 照常 INSERT。键与文案分两处写
+#: 就是这么坏的:改了一处,另一处静默失配。
+BRAND_CATEGORIES_CN = {"BRAND": "品牌", "IP": "知产"}
+BRAND_CATEGORIES = frozenset(BRAND_CATEGORIES_CN)
 
 BRAND_ASIN_SCOPE = "cleanup:brand_asin"     # ops.dedupe:已做过品牌收集的 ASIN
 
@@ -127,8 +136,17 @@ def record_asins(conn, items: list[dict]) -> int:
     """输入:连接 + 当轮已归类 item(store/sku/category/reasons)
     → 输出:新入选数。永久禁止 = 一次入选,已在名单的不更新(DO NOTHING)。
 
-    黑名单键 = 清洗后的标准 asin(sku_asin 规则;提不出用订货号原文兜底,
-    宁可键不标准也不丢行),订货号原文存 src_sku 溯源。"""
+    黑名单键 = 登记簿反查出的 source_key(切码后唯一通路),查不到回落形态提取,
+    再不行用订货号原文兜底并**告警计数**,宁可键不标准也不丢行(口径见 D-0b-1);
+    订货号原文永远存 src_sku 溯源。"""
+    # ⚠ 预取的入选判据必须与下面那一行**逐字同一个** —— 用 `in PERMANENT` 预取、
+    #   用 `is_permanent` 落库,`OTHER` + 显式词条那批就不在预取名单里,登记簿
+    #   一次都没查就直接落进「原文兜底」,计数虚高而键还是错的。
+    asin_of = sku_asin.resolve_many(
+        conn, [(it.get("store"), it["sku"]) for it in items
+               if error_taxonomy.is_permanent(it.get("category"),
+                                              it.get("unlisted_term"))])
+    fell_back: list[str] = []
     added = 0
     with conn.cursor() as cur:
         for it in items:
@@ -138,12 +156,19 @@ def record_asins(conn, items: list[dict]) -> int:
             # 两个词条算永久拉黑,判据在引擎里,这儿不重新匹配一遍。
             if not error_taxonomy.is_permanent(code, it.get("unlisted_term")):
                 continue
-            asin = extract_asin(it["sku"]) or it["sku"]
+            asin = asin_of.get((it.get("store"), it["sku"]))
+            if not asin:
+                asin = it["sku"]
+                fell_back.append(it["sku"])
             cur.execute(_ASIN_SQL, (
                 asin, code, source_label(code),
                 (it.get("reasons") or "") or None,      # 全文,别截(见头注)
                 it.get("store"), is_biz_cn(it.get("reasons")), it["sku"]))
             added += cur.rowcount or 0
+    if fell_back:
+        logger.warning("ASIN 黑名单:%d 个 sku 登记簿与形态都解不出,按订货号原文"
+                       "入键(键不标准,按 ASIN 的重上架拦截对它们不生效):%s",
+                       len(fell_back), fell_back[:5])
     return added
 
 
@@ -183,6 +208,11 @@ def collect_brands(conn, items: list[dict]) -> dict:
     等 product_ingest 补上后下一轮自然重试,标了就永远漏了。
     """
     stats = {"brand_new": 0, "brand_known": 0, "no_brand": 0, "skipped": 0}
+    # 去重键是 sku 不是 asin:切码后 sku 全局唯一 ⇒ 同一 ASIN 在两家店各收一次
+    # 品牌(渠道表/闸门表都 DO NOTHING 幂等,只多一次查库);改成 asin 会改变
+    # 存量三段式行的去重粒度,不在本批次范围(见 D-0b-3)。
+    # ⚠ 折叠后的 it["store"] 只是**任意一家**(同 sku 多店时后写覆盖先写),
+    #   只准用于溯源列,**不得当查询键** —— 下面按「该 sku 出现过的全部店」反查。
     cands = {it["sku"]: it for it in items
              if it.get("category") in BRAND_CATEGORIES}
     if not cands:
@@ -194,9 +224,21 @@ def collect_brands(conn, items: list[dict]) -> dict:
         todo = {a: it for a, it in cands.items() if a not in done}
         if not todo:
             return stats
-        # 采集库按**清洗后的标准 asin** 查(订货号原文直接查必然全空——
-        # 2026-08-11 生产实证:2,702 个 C/E 品牌 0 命中,教训在此)
-        asin_of = {sku: (extract_asin(sku) or sku) for sku in todo}
+        # 登记簿反查是主路,形态提取只是存量兜底;采集库按**清洗后的标准 asin**
+        # 查(订货号原文直接查必然全空——2026-08-11 生产实证:2,702 个 C/E 品牌
+        # 0 命中,教训在此)
+        stores_of: dict[str, list] = {}
+        for it in items:
+            if it.get("category") in BRAND_CATEGORIES:
+                stores_of.setdefault(it["sku"], []).append(it.get("store"))
+        for sku in stores_of:                      # 定序:与 items 顺序无关
+            stores_of[sku] = sorted(set(stores_of[sku]),
+                                    key=lambda s: (s is None, s or ""))
+        resolved = sku_asin.resolve_many(
+            conn, [(st, sku) for sku in todo for st in stores_of.get(sku, [])])
+        asin_of = {sku: next((resolved[(st, sku)] for st in stores_of.get(sku, [])
+                              if (st, sku) in resolved), None) or sku
+                   for sku in todo}
         cur.execute(_BRAND_OF_SQL, (list(set(asin_of.values())),))
         brand_of = {a: b for a, b in cur.fetchall()}
         for sku, it in todo.items():
@@ -261,23 +303,51 @@ def load_banned_asins(conn) -> dict:
 #   (复数)。2026-09-04 查出读写不一致导致 events 那一级大面积空转 ——
 #   这里 `coalesce` 两个都取,别再各写一半。
 
+#: 身份(ident)= coalesce(登记簿 source_key, asin, sku)：登记簿是切码后的
+#: 唯一通路,其次是 record_many 清洗出的标准码,再不行才用订货号原文兜底
+#: (口径与 record_asins 一致,见 D-0b-1)。多个订货号(不同店同一产品)归并到
+#: 同一 asin,看**产品级**全局。
+#: ⚠ LEFT JOIN 且限 source_type='amz'：非 amz 行的 source_key 是 GTIN/offer_id,
+#:   拿它当 ASIN 黑名单键是错的类型(与 0a 全部收口点的身份表达式同形)。
+#: ⚠ 身份表达式**只在这一处出生**(`ev` 这个 CTE)：下面的 `latest`(品牌渠道)
+#:   与 `_HISTORY_SQL`(黑名单)都建在它上面。两边各写一份 `coalesce(...)`,
+#:   漂了就是同一个产品在两条链里是两个身份。
+_EV_CTE = """
+WITH ev AS (
+    SELECT e.*, coalesce(ls.source_key, e.asin, e.sku) AS ident
+    FROM catalog.product_events e
+    LEFT JOIN catalog.listing_sources ls
+           ON ls.store = e.store AND ls.sku = e.sku AND ls.source_type = 'amz'
+    WHERE e.event = 'problem_categorized')"""
+
 #: 「每个 asin 的最新一条」—— **只给品牌渠道用**(brand_err_hits 的语义就是
-#: 「当前这个品牌还在不在问题里」)。⚠ **黑名单那条路已经不用它了**:
+#: 「当前这个品牌还在不在问题里」)。⚠ **黑名单入选那条路已经不用它了**：
 #: 黑名单是「一次入选、永久禁止」,判据是下面的 `_HISTORY_SQL`(全部历史里
-#: 够格拉黑的那条优先),两者别混。
-_LATEST_CTE = """
-WITH latest AS (
-    SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku) AS asin,
+#: 够格拉黑的那条优先),两者别混。(回填预览的 brand_cand/total/opaque
+#: 三个只读计数仍然是「最新一条」语义,故也建在它上面。)
+_LATEST_CTE = _EV_CTE + """,
+latest AS (
+    SELECT DISTINCT ON (ident) ident AS asin,
            sku, store, occurred_at,
            detail->>'category' AS cat,
            coalesce(detail->>'reason', detail->>'reasons') AS reason
-    FROM catalog.product_events
-    WHERE event = 'problem_categorized'
-    ORDER BY coalesce(asin, sku), occurred_at DESC)
+    FROM ev
+    ORDER BY ident, occurred_at DESC)
 """
 
-_HISTORY_SQL = """
-SELECT coalesce(asin, sku) AS asin,
+#: 黑名单入选那条判据:一个 asin 的**全部历史报错码**聚一行(去留由
+#: `worst_verdict` 算,「够格拉黑的那条最高优先级」)。
+#: ⚠ 分组键是 `ident`(登记簿 source_key 优先),**不是裸 `coalesce(asin, sku)`**:
+#:   切码后 sku 是我们自己生成的 12 位不透明码,拿它分组 = 同一个产品的历史被
+#:   拆成一码一份,「历史里那条禁售」永远聚不到一起(所有者第 4 点:
+#:   「如果只跟着 sku 走,sku 又是由我们系统生成的,后面会追不到问题产品的来源码」)。
+#:   `_judge_events` 出来的 asin 就是 `blacklist_route` 的保留集,身份错 = 它删错行。
+#: ⚠ 键名两个都认:写入方(`problem_scan` / `cleanup_history`)写的是
+#:   `detail->>'reason'`(**单数**),库里历史上还有一批写的是 `reasons`(复数)。
+#:   2026-09-04 查出读写不一致导致 events 那一级大面积空转 —— 这里 `coalesce`
+#:   两个都取,别再各写一半。
+_HISTORY_SQL = _EV_CTE + """
+SELECT ident AS asin,
        array_agg(DISTINCT ARRAY[detail->>'category',
                                 detail->>'taxonomy_term']) AS codes,
        (array_agg(sku   ORDER BY occurred_at DESC))[1] AS sku,
@@ -285,22 +355,26 @@ SELECT coalesce(asin, sku) AS asin,
        (array_agg(coalesce(detail->>'reason', detail->>'reasons')
                   ORDER BY occurred_at DESC))[1] AS reason,
        max(occurred_at) AS latest
-FROM catalog.product_events
-WHERE event = 'problem_categorized'
-  AND coalesce(detail->>'category', '') <> ''
+FROM ev
+WHERE coalesce(detail->>'category', '') <> ''
 GROUP BY 1
 """
 
 
-#: 预览用的两个数:品牌渠道候选 + 时间线总量(去留由 `_judge_events` 算)。
-_BACKFILL_COUNT_SQL = """
+#: 预览用的三个只读数:品牌渠道候选 + 时间线总量 + 不透明码键告警
+#: (该永久拉黑多少个由 `_judge_events` 算,不在这条 SQL 里)。
+#: ⚠ 建在 `_LATEST_CTE` 上而不是另抄一份 `DISTINCT ON (coalesce(asin, sku))`:
+#:   预览与实时链必须是同一个身份表达式,抄第二份就会漂。
+# `opaque` 是**只读告警计数**:键形如 12 位不透明码 = 登记簿查不到那批,拦不住
+# 任何东西(它匹配不到任何真 ASIN,也不误伤)。只计数不过滤 —— 过滤会丢行,
+# 那是 D-0b-1 要拍板的口径,不混进零行为变化批次。字符类**不许手写字面量**:
+# 从 services.sku_codec 的字母表常量拼进来(字母表唯一之家)。
+_BACKFILL_COUNT_SQL = _LATEST_CTE + f"""
 SELECT count(*) FILTER (WHERE cat = ANY(%(brandcats)s)) AS brand_cand,
-       count(*) AS total
-FROM (SELECT DISTINCT ON (coalesce(asin, sku)) coalesce(asin, sku),
-             detail->>'category' AS cat
-      FROM catalog.product_events
-      WHERE event = 'problem_categorized'
-      ORDER BY coalesce(asin, sku), occurred_at DESC) t
+       count(*) AS total,
+       count(*) FILTER (WHERE asin ~ '^[{sku_codec._ALPHABET}]{{{sku_codec._LEN}}}$'
+                          AND asin ~ '[A-Z]') AS opaque
+FROM latest
 """
 
 
@@ -411,7 +485,7 @@ def backfill_counts(conn) -> dict:
     """
     with conn.cursor() as cur:
         cur.execute(_BACKFILL_COUNT_SQL, {"brandcats": sorted(BRAND_CATEGORIES)})
-        brand_cand, total = cur.fetchone()
+        brand_cand, total, opaque = cur.fetchone()
     keep = _judge_events(conn)
     # ⚠ 「够格永久」≠「真跑会加多少」:INSERT 是 ON CONFLICT DO NOTHING,
     #   已经在表里的一条都不动。预览只报前者,人会以为要写 2.6 万行,
@@ -424,7 +498,9 @@ def backfill_counts(conn) -> dict:
     with conn.cursor() as cur:
         cur.execute(_ASIN_KEEP_COUNT_SQL)
         untouched = cur.fetchone()[0]
+    # `opaque` 是 D-0b-1 那一档只读告警,原样透出(零时摘要逐字不变)。
     return {"permanent": len(keep), "brand_cand": brand_cand, "total": total,
+            "opaque": opaque,
             "in_table": len(have), "fresh": len(fresh),
             # 重建碰不到的行(没有事件背书,重灌不出来 ⇒ 保留)
             "untouched": untouched, "fresh_codes": Counter(r["cat"] for r in fresh)}
@@ -497,12 +573,18 @@ LEFT JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = l.asin
 WHERE l.cat = ANY(%(brandcats)s)
 """
 
+#: `_CHANNEL_REBUILD_SQL` 里那段 CASE 由 `BRAND_CATEGORIES_CN` 派生 —— 手写
+#: 第二份就是 2026-09-03 换轨漏改的那个坑(SQL 里还是旧码 C/E,source 全 NULL)。
+#: 码是常量里的字面量、不来自外部输入,拼进 SQL 安全。
+_BRAND_CN_CASE = "".join(f" WHEN '{c}' THEN '{cn}'"
+                         for c, cn in sorted(BRAND_CATEGORIES_CN.items()))
+
 _CHANNEL_REBUILD_SQL = _LATEST_CTE + """
 INSERT INTO catalog.brand_err_hits
     (brand_key, brand, source, added_date, src_sku, src_store, biz_cn)
 SELECT DISTINCT ON (lower(btrim(p.brand)))
        lower(btrim(p.brand)), btrim(p.brand),
-       '沃尔玛-' || CASE l.cat WHEN 'C' THEN '品牌' WHEN 'E' THEN '知产' END,
+       '沃尔玛-' || CASE l.cat""" + _BRAND_CN_CASE + """ END,
        l.occurred_at::date::text, l.asin, l.store,
        (lower(coalesce(l.reason, '')) LIKE '%%biz-cn%%'
         OR lower(coalesce(l.reason, '')) LIKE '%%reference code biz%%')

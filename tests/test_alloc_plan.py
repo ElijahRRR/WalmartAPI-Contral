@@ -129,7 +129,7 @@ def test_pending_delist_is_deduped_across_the_two_gates(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, *a, **k): pass
-        def fetchall(self): return []
+        def fetchall(self): return []       # (store, sku, source_key) 三元组
 
     class _Conn:
         def cursor(self): return _Cur()
@@ -517,21 +517,38 @@ def test_a_claim_never_shrinks_the_stores_room():
     assert q["A"]["room"] == 800 and q["A"]["room_now"] == 800
 
 
-def test_pool_excludes_listed_not_claimed():
-    """候选池排除的是**已在架**的;规划外店(谭总系)的在架行不算。"""
+def _listed_conn(rows):
+    """输入:(store, sku, source_key) 行 → 输出:只会 fetchall 这些行的假连接。"""
     class _C:
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, *a, **k): pass
-        def fetchall(self):
-            return [("A085", "B0AAAA0001"),      # 规划内、在架 → 排除
-                    ("谭总3", "B0BBBB0002"),      # 规划外 → 不排除
-                    ("没在册", "B0CCCC0003")]     # 不在册 → 不排除
+        def fetchall(self): return rows
 
     class _Conn:
         def cursor(self): return _C()
 
-    assert wf._listed_asins(_Conn(), {"A085", "谭总3"}) == {"B0AAAA0001"}
+    return _Conn()
+
+
+def test_pool_excludes_listed_not_claimed():
+    """候选池排除的是**已在架**的;规划外店(谭总系)的在架行不算。"""
+    rows = [("A085", "B0AAAA0001", "B0AAAA0001"),   # 规划内、在架 → 排除
+            ("谭总3", "B0BBBB0002", "B0BBBB0002"),   # 规划外 → 不排除
+            ("没在册", "B0CCCC0003", "B0CCCC0003")]  # 不在册 → 不排除
+    assert wf._listed_asins(_listed_conn(rows), {"A085", "谭总3"}) == {"B0AAAA0001"}
+
+
+def test_listed_asins_read_the_registry_key():
+    """「已在架」按**身份键**算:登记簿优先,模式提取只兜存量(0a-22)。
+
+    裸提取在切码后会让这个集合恒空 ⇒ 方案表把已上架的品当候选重排一遍。
+    """
+    rows = [("A085", "AZZZZ234567", "B0AAAA0001"),   # 不透明码:只有登记簿认得
+            ("A085", "B0BBBB0002", None),            # 未登记存量:回落模式提取
+            ("A085", "998877665544", None)]          # 两条腿都解不出:不进集合
+    got = wf._listed_asins(_listed_conn(rows), {"A085"})
+    assert got == {"B0AAAA0001", "B0BBBB0002"}
 
 
 def test_out_of_band_stores_get_their_layer_histogram_printed(monkeypatch, tmp_path):

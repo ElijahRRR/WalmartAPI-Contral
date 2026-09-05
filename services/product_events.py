@@ -83,7 +83,7 @@ status_changed 观测自动入账(动作不记,生死后果必记)。
 import json
 import logging
 
-from services.sku_asin import extract_asin
+from services import sku_asin
 
 logger = logging.getLogger("services.product_events")
 
@@ -107,6 +107,23 @@ DELETE_NOT_EFFECTIVE = "delete_not_effective"
 PRODUCT_INGESTED = "product_ingested"
 AUDIT_PASSED = "audit_passed"
 AUDIT_REJECTED = "audit_rejected"
+# 码级事件(SKU 改造批次 0a 登记;写入点是 services/sku_codec.abandon,批次 2 接线)。
+# 提前登记零副作用:EVENTS 只是 record_many 的入参校验白名单,不登记就会在批次 2
+# 当场抛 ValueError。detail 结构约定(**必须带 source_key** —— 不透明码在 asin
+# 列里提不出来,list_new 的代际过滤读的是 detail->>'source_key'):
+#   sku_abandoned:{old_sku, reason, source_type, source_key, burned_upcs}
+#   sku_replaced :{old_sku, new_sku, reason, source_type, source_key, burned_upcs}
+SKU_ABANDONED = "sku_abandoned"
+SKU_REPLACED = "sku_replaced"
+# 回执码具名常量:回执事件码由 `{kind}_feed_{status}` 派生(见下面 EVENTS 的
+# 推导式),本身没有名字 —— SQL 里需要它时引用本常量,**不写字面量**:
+# _FEED_KIND 一改取值,写字面量的那条 SQL 会静默返回空集(闸门形同虚设,
+# 而且不报错)。RETIRE:list_new 的退役冷却闸 + sku_locked_heal;
+# DELETE:本模块 _VERIFY_SQL 的删除核验起点(批次 3 还要再用一次)。
+# 守门 tests/test_sku_guard.py 扫 services/ 与 workflows/ 下的 `_feed_success`
+# 字面量,白名单只有本文件。
+RETIRE_FEED_SUCCESS = f"{_FEED_KIND['RETIRE_ITEM']}_feed_success"
+DELETE_FEED_SUCCESS = f"{_FEED_KIND['DELETE_ITEM']}_feed_success"
 
 # 合法事件码全集:上面的显式码 + 五类 feed 的 {kind}_feed_{success|failed} 回执。
 # record_many 只认这个集合——宁可提交时炸,不要账本里静默多出一支没人查的分叉。
@@ -116,6 +133,7 @@ EVENTS = frozenset({
     MATCH_SUBMITTED, LIST_SUBMITTED, PROBLEM_CATEGORIZED,
     DELETE_VERIFIED, DELETE_NOT_EFFECTIVE,
     PRODUCT_INGESTED, AUDIT_PASSED, AUDIT_REJECTED,
+    SKU_ABANDONED, SKU_REPLACED,
 } | {f"{k}_feed_{st}" for k in _FEED_KIND.values()
      for st in ("success", "failed")})
 
@@ -130,13 +148,32 @@ def feed_kind(feed_type: str) -> str:
     return _FEED_KIND.get(feed_type, feed_type.lower())
 
 
+#: 回执**永不**入账的提交来源(与 kind 无关的整条工作流级例外)。
+#: sku_migrate(SKU 改造批次 3):改码的**事实**由观测定案(sku_replaced /
+#: sku_abandoned 两条码级事件,services/sku_codec 记),不是沃尔玛回执。
+#: 形态 A 走 MP_MAINTENANCE(kind=maintenance)本就不入账,形态 B 走 MP_ITEM
+#: (kind=list)却是恒入账的 —— 不在这里挡,一换形态病历就多出一串
+#: list_feed_success,把「上架」这条时间线与 product_risk.submit_times 一起
+#: 灌水,而且**静默**。挡在 receipt_in_ledger 这个唯一收口点(唯一调用方
+#: services/feed_track)两种形态就都覆盖了。
+#: ⚠ 它不是 _MAINT_LEDGER_WORKFLOWS 的反面:那张表是"maintenance 里谁**要**
+#: 入账"的登记制白名单,这张是"谁一律不入账",两张表的取值不许重叠。
+_NEVER_LEDGER_WORKFLOWS = {"sku_migrate"}
+
+
 def receipt_in_ledger(kind: str, workflow: str | None) -> bool:
     """输入:feed 业务类别 + 提交来源工作流 → 输出:该回执是否进病历。
 
     维护事件入账定稿(所有者 2026-08-07):改价/改库存/改标题/清库存的
     回执不进 product_events(流水已在 ops.feed_items);delete/retire 恒进;
     maintenance 仅反补来源进(反补计数依赖其提交/回执链)。
+
+    工作流级例外(SKU 改造批次 3,O7):`_NEVER_LEDGER_WORKFLOWS` 里的来源
+    **两种 feed 形态都不入账** —— 改码不是上架也不是维护,它的事实由观测定案。
+    既有工作流名一个都不命中这张表 ⇒ 改码前逐字节零行为变化。
     """
+    if (workflow or "") in _NEVER_LEDGER_WORKFLOWS:
+        return False
     if kind in _RECEIPT_KINDS:
         return True
     return kind == "maintenance" and (workflow or "") in _MAINT_LEDGER_WORKFLOWS
@@ -157,14 +194,26 @@ def record_many(conn, rows: list[dict]) -> int:
     if bad:
         raise ValueError(f"未登记的事件码 {bad}:先在 services/product_events.py "
                          f"的常量与 EVENTS 登记,再使用(唯一出处纪律)")
+    # asin 两条路:带 store 的走登记簿(切码后唯一通路);store 为空的**平台级
+    # 事件**没有店维度可查(登记簿主键是 (store, sku)),保持形态提取 —— 它们的
+    # sku 本来就是 asin,extract_asin 恒等返回。平台级来源共四处:
+    #   services/product_ingest.py(product_ingested)
+    #   services/audit_store.py event_row(audit_passed/rejected)
+    #   workflows/product_audit.py(audit_backfill 补采)
+    #   workflows/audit_history_fold.py(**直插 SQL,绕过本函数**,asin 列直填)
+    # ⚠ cleanup_history_import **带 store**(services/cleanup_history.py),
+    #   走登记簿腿,不在平台级之列。两条路都提不出存 NULL,消费方 coalesce(asin, sku)。
+    asin_of = sku_asin.resolve_many(
+        conn, [(r["store"], r["sku"]) for r in rows if r.get("store")])
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO catalog.product_events "
             "(sku, asin, store, event, source, error_code, detail, occurred_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, coalesce(%s, now()))",
-            # asin 由 sku 清洗得出(services/sku_asin 唯一规则出处);提不出
-            # 存 NULL——消费方用 coalesce(asin, sku),等规则扩了跑 sku_normalize 补
-            [(r["sku"], extract_asin(r["sku"]), r.get("store"), r["event"],
+            [(r["sku"],
+              (asin_of.get((r["store"], r["sku"])) if r.get("store")
+               else sku_asin.extract_asin(r["sku"])),
+              r.get("store"), r["event"],
               r["source"], r.get("error_code"),
               json.dumps(r["detail"], ensure_ascii=False, default=str)
               if r.get("detail") is not None else None,
@@ -174,16 +223,36 @@ def record_many(conn, rows: list[dict]) -> int:
 
 
 def diff_catalog(old: dict, new_rows: list[dict], store: str,
-                 source: str = "catalog_sync") -> list[dict]:
+                 source: str = "catalog_sync",
+                 replaced: dict | None = None) -> list[dict]:
     """输入:旧状态 {sku: (published_status, missing_since)} + 本轮行 + 店铺
-    → 输出:状态迁移事件列表(纯函数,便于测试)。
+    (+ 在途改码的 {新码: 旧码})→ 输出:状态迁移事件列表(纯函数,便于测试)。
 
     - 旧表没有 → item_appeared
     - 旧表标缺席又出现 → item_reappeared
     - published_status 变化 → status_changed(detail 含官方 unpublished 原因,
       这就是"平台把它下架了、为什么"的观测记录)
+
+    ⚠ **改码的新码第一次被观测到时不记 item_appeared**(SKU 改造批次 3,O1)。
+    `replaced` 由调用方从登记簿取(services/listing_sources.replacement_map,
+    纯函数自己不查库);缺省 None ⇒ 与改码前逐字节相同的行为。
+    为什么必须抑制:新码在这张表里是新行,而 `prev is None` 的字面含义是"这个店
+    多了一个品" —— 记下去就是**一次没有重上架事实的假代际**,而
+    workflows/problem_scan._SQL_STUBBORN 正是拿"最新事件是不是 item_appeared/
+    item_reappeared"决定要不要清掉上一代的 delete_not_effective:假代际一记,
+    已实证「删除未生效」的顽固件就静默丢掉双 feed 加压,回到每天删一次删不掉的
+    循环;catalog.product_risk.listed_times 同时被灌水。
+    为什么**只抑制、不在这里补记 sku_replaced**:改码的身份事件由
+    services/sku_codec 一处出生 —— 一次改码固定留**两条** sku_replaced(旧码
+    一条,abandon 记;新码一条,settle_replacement 记),而 settle 的定案证据
+    正是"新码在架且旧码缺席",必然发生在本函数观测到新码**之后**。在这里再记
+    一条只会变成同一次改码的第三条事件(product_risk.sku_replaced_times 的
+    口径当场作废),且回滚时它还是条假事件。分工因此写死:
+    **观测侧只做抑制,身份事件归 sku_codec**(mark_missing 的 item_missing
+    抑制是同一条纪律的另一半)。
     """
     events = []
+    replaced = replaced or {}
     for r in new_rows:
         sku = r.get("sku")
         if not sku:
@@ -191,6 +260,11 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
         prev = old.get(sku)
         new_st = r.get("published_status")
         if prev is None:
+            if sku in replaced:
+                logger.info("改码新码 %s/%s 首次被观测到(替换 %s):不记 "
+                            "item_appeared —— 身份事件由 sku_codec 记",
+                            store, sku, replaced[sku])
+                continue
             events.append({"sku": sku, "store": store, "event": ITEM_APPEARED,
                            "source": source,
                            "detail": {"published_status": new_st}})
@@ -211,18 +285,20 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
     return events
 
 
-_VERIFY_SQL = """
+#: 事件码一律由常量拼进来(B2-32):写字面量的话 _FEED_KIND 一改取值,
+#: 这条 SQL 会静默返回空集 —— 删除核验从此不产出任何判定,而且不报错。
+_VERIFY_SQL = f"""
 WITH last_ok AS (
     SELECT DISTINCT ON (store, sku) store, sku, occurred_at
     FROM catalog.product_events
-    WHERE event = 'delete_feed_success'
+    WHERE event = '{DELETE_FEED_SUCCESS}'
     ORDER BY store, sku, occurred_at DESC),
 open_ok AS (
     SELECT l.* FROM last_ok l
     WHERE NOT EXISTS (
         SELECT 1 FROM catalog.product_events v
         WHERE v.store = l.store AND v.sku = l.sku
-          AND v.event IN ('delete_verified', 'delete_not_effective')
+          AND v.event IN ('{DELETE_VERIFIED}', '{DELETE_NOT_EFFECTIVE}')
           AND v.occurred_at >= l.occurred_at))
 SELECT o.store, o.sku,
        CASE WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
@@ -235,23 +311,33 @@ LEFT JOIN catalog.walmart_items w ON w.store = o.store AND w.sku = o.sku
 """
 
 
-def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
-    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数)。
+def verify_deletions(conn, grace_hours: int = 48
+                     ) -> tuple[int, int, list[tuple[str, str]]]:
+    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数, 生效的 (店, SKU) 列表)。
 
     删除核验(不信回执,信观测):delete_feed_success 之后,
     - 商品从目录消失/标缺席/RETIRED → delete_verified;
     - 宽限期后 catalog_sync 仍扫到它在架 → delete_not_effective + 告警
       (回执说成了但后台没删,所有者实证的真实故障模式);
     - 还没等到下一轮扫描 → 保持待核验,不落判。
+
+    第三元 = 本次判定为 gone 的 (店, SKU),与写进账本的 delete_verified 行
+    **一一对应**,交给调用方(workflows/catalog_sync)去弃码(弃码点 1)。
+    ⚠ 本模块**不 import sku_codec**:sku_codec 要写产品事件(sku_abandoned),
+    反过来再 import 就是循环;而且账本的职责是记录事实,弃码是决策,决策由
+    workflow 层组合(铁律 1 的方向 workflows → services)。返名单而不是让
+    catalog_sync 另写一条同样的 SQL 去捞 —— 那是第二份判据,迟早与这份漂开。
     """
     with conn.cursor() as cur:
         cur.execute(_VERIFY_SQL, (grace_hours,))
         rows = cur.fetchall()
     events = []
+    gone_pairs: list[tuple[str, str]] = []
     gone = still = 0
     for store, sku, verdict in rows:
         if verdict == "gone":
             gone += 1
+            gone_pairs.append((store, sku))
             events.append({"sku": sku, "store": store, "event": DELETE_VERIFIED,
                            "source": "catalog_sync"})
         elif verdict == "still":
@@ -264,4 +350,4 @@ def verify_deletions(conn, grace_hours: int = 48) -> tuple[int, int]:
                        "样本=%s,请人工处置",
                        still, [(s, k) for s, k, v in rows if v == "still"][:5])
     record_many(conn, events)
-    return gone, still
+    return gone, still, gone_pairs

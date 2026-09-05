@@ -15,14 +15,25 @@ exports/ 且文件名带时间戳,形状不同,别硬套(2026-08-27 审计明确
 """
 
 import csv
+from pathlib import Path
 
 from registry import paths
 
 
 def write(name: str, header: list, rows: list) -> str:
     """输入:文件名 + 表头 + 行 → 输出:落盘路径(报告目录,每次覆盖)。"""
-    paths.reports_dir().mkdir(parents=True, exist_ok=True)
-    p = paths.reports_dir() / name
+    return write_to(paths.reports_dir() / name, header, rows)
+
+
+def write_to(path, header: list, rows: list) -> str:
+    """输入:落盘路径(绝对/相对) + 表头 + 行 → 输出:落盘路径(父目录自动建,每次覆盖)。
+
+    给"路径由所有者当场指定"的人工件用(`-p out=…`),**不是第二条落盘实现** ——
+    `write` 就是它加一句"文件名解释成报告目录里的同名文件"。BOM 与 newline
+    两个参数的理由见模块头,两条路都必须吃到,所以只能有一份写文件的代码。
+    """
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", newline="", encoding="utf-8-sig") as fh:   # BOM:Excel 直开不乱码
         w = csv.writer(fh)
         w.writerow(header)

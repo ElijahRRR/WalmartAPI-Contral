@@ -83,11 +83,14 @@ def row_vals(r: dict) -> list:
             r["check_time"]]
 
 
-def sync_from_ledger() -> str | None:
-    """输入:无 → 输出:回写摘要一行;表未配置或无在途行返回 None。
+def sync_from_ledger(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:回写摘要一行;表未配置或无在途行返回 None。
 
     feed_poll 反哺器:I 有 feedId 且 J 空/处理中的行,按 ops.feed_items
     台账落 J(成功/失败:码/未查到)与 K(查询时间)。纯读库零沃尔玛调用。
+
+    `execute=False`(`cli.py feed_poll --dry-run`)只报数,不发写请求
+    (五个反哺器统一带这个关键字参数,_one_chain 用同一种调用形态)。
     """
     try:
         resources.MATCH_SHEET.require()
@@ -119,5 +122,7 @@ def sync_from_ledger() -> str | None:
         updates.append((r["rownum"], row_vals(r)))
     if not updates:
         return f"跟卖表:在途 {len(pollable)} 行,台账尚无新终态"
+    if not execute:
+        return f"[DRY-RUN] 跟卖表:将回填 {len(updates)} 行(在途 {len(pollable)})"
     n = write_rows(updates)
     return f"跟卖表回填 {n} 行(在途 {len(pollable)})"

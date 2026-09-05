@@ -266,6 +266,11 @@ class _FakeCursor:
             self.rows = [("S1",), ("S2",)]
         elif "SELECT sku, published_status" in sql:
             self.rows = []
+        elif "catalog.listing_sources" in sql and "catalog.walmart_items w" not in sql:
+            # record_many 的登记簿反查(批次 0b):这个夹具里没有登记行,
+            # 不清空的话上一条 RETURNING 的行会被当成登记簿结果喂回去。
+            # ⚠ 排除投影 SQL —— 它也 JOIN 登记簿,但要的是构造函数给的夹具行
+            self.rows = []
 
     def executemany(self, sql, seq):
         batch = list(seq)
@@ -311,12 +316,19 @@ def test_projection_rows_cell_conversion():
     from decimal import Decimal
     conn = _FakeConn(rows=[("T1", "A", None, "00123", None, "P", None, None,
                             Decimal("9.90"), "USD", 4, "PUBLISHED", "ACTIVE", "",
-                            datetime(2026, 8, 5, 1, 2, 3), None)])
+                            datetime(2026, 8, 5, 1, 2, 3), None, "B0AAAAAAA1")])
     rows = walmart_catalog.projection_rows(conn)
     assert rows[0][3] == "00123"                      # 前导零保住
     assert rows[0][8] == pytest.approx(9.9)           # Decimal → float
     assert rows[0][14] == "2026-08-05 01:02:03"       # 时间格式化
     assert rows[0][2] == "" and rows[0][15] == ""     # None → 空串
+    assert rows[0][16] == "B0AAAAAAA1"                # 末列 source_key(来源码)
+
+    # 未登记的在架行:LEFT JOIN 取空,_cell 转空串(不是漏行、也不是 None)
+    conn2 = _FakeConn(rows=[("T1", "A", None, None, None, None, None, None,
+                             None, None, None, None, None, None, None, None,
+                             None)])
+    assert walmart_catalog.projection_rows(conn2)[0][16] == ""
 
 
 def test_item_id_backfill_helpers():
@@ -369,7 +381,28 @@ def test_mark_missing_clears_status_columns():
 
 def test_projection_excludes_missing_rows():
     # 飞书「在线产品总表」只写在架商品,缺席行不进表
-    assert "WHERE missing_since IS NULL" in walmart_catalog._PROJECTION_SQL
+    assert "WHERE w.missing_since IS NULL" in walmart_catalog._PROJECTION_SQL
+
+
+def test_projection_left_joins_the_registry():
+    """钉的是:末列 source_key 走 LEFT JOIN 登记簿,且不带 abandoned_at 条件。
+
+    改成 INNER JOIN,未登记的在架行会静默从飞书表里消失(表变短不报错);
+    加 abandoned_at 条件,已弃码却还在架的僵尸行会看不见 —— 那正是要看的行。
+    """
+    sql = walmart_catalog._PROJECTION_SQL
+    assert "LEFT JOIN catalog.listing_sources ls" in sql
+    assert "ls.store = w.store AND ls.sku = w.sku" in sql
+    assert "abandoned_at" not in sql
+    # 不限 source_type:amz=ASIN、match=匹配 GTIN,展示都要
+    assert "source_type" not in sql
+
+
+def test_online_sheet_last_column_is_source_key():
+    """钉的是:来源码只准**追加在末尾**(电子表格按 range 坐标写,插中间全体错位)。"""
+    from registry import resources
+    assert resources.ONLINE_PRODUCTS_SHEET.columns[-1] == "source_key"
+    assert len(resources.ONLINE_PRODUCTS_SHEET.columns) == 17     # A~Q
 
 
 def test_projection_columns_match_registry():
@@ -482,7 +515,7 @@ def test_partial_dead_store_still_succeeds(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
 
     summary = catalog_sync.run({"skip_feishu": "1"})      # 不碰飞书
     assert "1/2 店完成" in summary
@@ -700,7 +733,7 @@ def test_failed_store_gets_one_serial_second_pass(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     summary = catalog_sync.run({"skip_feishu": "1"})
     assert "2/2 店完成" in summary
     assert "⚠ 缺席" not in summary       # 救回了就不点名(「缺席标记 N 行」是另一回事)
@@ -724,7 +757,7 @@ def test_still_failed_store_is_absent_in_first_line_not_a_raise(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     summary = catalog_sync.run({"skip_feishu": "1"})     # 不抛 = 不炸链
     first = summary.splitlines()[0]
     assert "1/2 店完成" in first
@@ -808,7 +841,7 @@ def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(object()))
     monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
-                        lambda conn: (0, 0))
+                        lambda conn: (0, 0, []))
     out = catalog_sync.run({"skip_feishu": "1"})
 
     assert "谭总12=N_NEW" in out and "自动链不碰" in out   # 配置店:已按受管仓维护
@@ -817,3 +850,190 @@ def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
     # 配置店不许再被扣上"会漂"的帽子
     warn = [l for l in out.splitlines() if "会漂" in l][0]
     assert "谭总12" not in warn
+
+
+# ── 在途改码的两个反向指针(SKU 改造批次 3 地基,只读积木)────────────────────
+
+class _RowsConn:
+    """只回放一组行的假连接(本节两条都是纯查询,不写库)。"""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.sqls = []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sqls.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_replacement_map_only_returns_rows_with_replaces():
+    """{新码: 旧码} —— catalog_sync 用它回答「本轮新出现的这个 sku 是不是某个
+    旧码的替身」。SQL 必须带 `replaces IS NOT NULL`:不带就是把全店登记行都拉回来,
+    而且每一行的值都是 None(改码前那一列全库为 NULL)。"""
+    from services import listing_sources
+    conn = _RowsConn([("AN3WC0DE2345", "B0ABCDEFGH")])
+    assert listing_sources.replacement_map(conn, "T1") == {
+        "AN3WC0DE2345": "B0ABCDEFGH"}
+    sql, args = conn.sqls[0]
+    assert "replaces IS NOT NULL" in sql and args == ("T1",)
+    assert listing_sources.replacement_map(_RowsConn([]), "T1") == {}   # 改码前空
+
+
+def test_replaced_skus_only_returns_rows_with_replaced_by():
+    """{正在被替换的旧码} —— 本轮缺席的这个 sku 若在集合里,缺席是我们自己造成的,
+    不该记 item_missing、不该产删除建议。改码前恒为空集(零行为变化)。"""
+    from services import listing_sources
+    conn = _RowsConn([("B0ABCDEFGH",)])
+    assert listing_sources.replaced_skus(conn, "T1") == {"B0ABCDEFGH"}
+    sql, args = conn.sqls[0]
+    assert "replaced_by IS NOT NULL" in sql and args == ("T1",)
+    assert listing_sources.replaced_skus(_RowsConn([]), "T1") == set()
+
+
+# ── 观测侧对在途改码的抑制(SKU 改造批次 3,O1/O2/O3/O11)────────────────────
+#
+# 分工写死在两处 docstring 里,这一节是它的回归:
+#   观测侧(diff_catalog / mark_missing)**只做抑制**——不记 item_appeared、
+#   不记 item_missing;改码的身份事件(一次改码固定两条 sku_replaced:旧码
+#   一条由 abandon 记、新码一条由 settle_replacement 记)归 services/sku_codec。
+# 在这里补记第三条,product_risk.sku_replaced_times 的口径当场作废,而且回滚
+# 的改码还会留下一条假事件。
+
+def test_diff_catalog_without_replaced_map_is_unchanged():
+    """不传 replaced(= 改码前的全部调用)时逐字节与今天相同。"""
+    from services import product_events as pe
+    rows = [{"sku": "NEW1", "published_status": "PUBLISHED"}]
+    assert pe.diff_catalog({}, rows, "T1") == pe.diff_catalog(
+        {}, rows, "T1", replaced=None) == pe.diff_catalog(
+        {}, rows, "T1", replaced={})
+    assert [e["event"] for e in pe.diff_catalog({}, rows, "T1")] == \
+        [pe.ITEM_APPEARED]
+
+
+def test_new_code_first_seen_records_no_item_appeared():
+    """改码新码第一次被观测到 ⇒ **不记 item_appeared**。
+
+    记了就是一次没有重上架事实的**假代际**:problem_scan._SQL_STUBBORN 拿
+    "最新事件是不是 item_appeared/item_reappeared"决定要不要清掉上一代的
+    delete_not_effective —— 假代际一记,已实证「删除未生效」的顽固件就静默
+    丢掉双 feed 加压;product_risk.listed_times 同时被灌水。
+    """
+    from services import product_events as pe
+    rows = [{"sku": "AN3WC0DE2345", "published_status": "PUBLISHED"},
+            {"sku": "B0REALNEW01", "published_status": "PUBLISHED"}]
+    evs = pe.diff_catalog({}, rows, "T1",
+                          replaced={"AN3WC0DE2345": "B0OLDCODE01"})
+    # 新码一条都不记;同一轮里真正的新品照记 item_appeared(抑制不是关掉整段)
+    assert [(e["sku"], e["event"]) for e in evs] == \
+        [("B0REALNEW01", pe.ITEM_APPEARED)]
+
+
+def test_diff_catalog_never_adds_a_third_sku_replaced():
+    """观测侧**不补记** sku_replaced —— 一次改码固定两条,这里再记就是第三条。
+
+    settle_replacement 的定案证据正是"新码在架且旧码缺席",必然发生在
+    diff_catalog 观测到新码**之后**;在这里补一条只会与它重复,而且改码回滚时
+    它还是条假事件(新码那时会被 abandon 掉)。
+    """
+    from services import product_events as pe
+    evs = pe.diff_catalog(
+        {}, [{"sku": "AN3WC0DE2345", "published_status": "PUBLISHED"}], "T1",
+        replaced={"AN3WC0DE2345": "B0OLDCODE01"})
+    assert evs == []
+    # 后续轮次(旧状态里已有该码)照常按 status_changed 走,不受抑制影响
+    evs2 = pe.diff_catalog(
+        {"AN3WC0DE2345": ("PUBLISHED", None)},
+        [{"sku": "AN3WC0DE2345", "published_status": "UNPUBLISHED"}], "T1",
+        replaced={"AN3WC0DE2345": "B0OLDCODE01"})
+    assert [e["event"] for e in evs2] == [pe.STATUS_CHANGED]
+
+
+def test_upsert_items_feeds_the_replacement_map_into_diff_catalog(monkeypatch):
+    """diff_catalog 是纯函数、自己不查库 ⇒ 替换关系只能由 upsert_items 喂进去。
+
+    喂的还必须是**同一轮观测**取的那一份(与旧状态同事务),否则"新码第一次
+    出现"与"事件落账"用的是两份可能已经不同的替换关系。
+    """
+    seen = {}
+    monkeypatch.setattr(walmart_catalog.listing_sources, "replacement_map",
+                        lambda conn, store: {"AN3WC0DE2345": "B0OLDCODE01"})
+    monkeypatch.setattr(walmart_catalog.product_events, "diff_catalog",
+                        lambda old, rows, store, **kw: seen.update(kw) or [])
+    monkeypatch.setattr(walmart_catalog.product_events, "record_many",
+                        lambda conn, rows: len(rows))
+    walmart_catalog.upsert_items(
+        _FakeConn(), [{"store": "T1", "sku": "AN3WC0DE2345"}])
+    assert seen == {"replaced": {"AN3WC0DE2345": "B0OLDCODE01"}}
+
+
+def _mark_missing_events(monkeypatch, replaced):
+    """输入:被替换的旧码集合 → 输出:(返回值, 落账事件, 执行过的 SQL)。"""
+    written = []
+    monkeypatch.setattr(walmart_catalog.listing_sources, "replaced_skus",
+                        lambda conn, store: set(replaced))
+    monkeypatch.setattr(walmart_catalog.product_events, "record_many",
+                        lambda conn, rows: written.extend(rows) or len(rows))
+    conn = _FakeConn()
+    n = walmart_catalog.mark_missing(conn, "T1", "2026-09-02")
+    return n, written, conn.cur.executed
+
+
+def test_mark_missing_still_sets_missing_since_for_replaced_rows(monkeypatch):
+    """**抑制的是事件不是观测**:missing_since 必须照标。
+
+    sku_migrate 判 confirmed 的"旧码缺席"证据就取自这一列 —— 抑制掉标记会让
+    定案永远等不到(pending 堆到 stalled),而且没有任何地方会报错。
+    """
+    n, written, executed = _mark_missing_events(monkeypatch, {"S1", "S2"})
+    assert walmart_catalog._MARK_MISSING_SQL in [sql for sql, _ in executed]
+    assert n == 2                       # 返回值仍是被标缺席的**总**行数(契约不变)
+    assert written == []                # 两行都在途改码 ⇒ 一条事件都不记
+
+
+def test_mark_missing_writes_no_item_missing_event_for_replaced_rows(monkeypatch):
+    """旧码的消失是**我们自己造成的**,不是平台下架,不进病历。
+
+    照记的话 product_risk.unexplained_missing(没提交过删/停 + 消失过)会对
+    每一个被改码的品置真,list_new 每轮对着一大批行报"疑似平台强制下架";
+    missing_times 同时灌水。
+    """
+    n, written, _ = _mark_missing_events(monkeypatch, {"S1"})
+    assert n == 2
+    assert [(e["sku"], e["event"]) for e in written] == \
+        [("S2", walmart_catalog.product_events.ITEM_MISSING)]
+
+
+def test_mark_missing_return_value_and_behaviour_unchanged_for_ordinary_rows(
+        monkeypatch):
+    """改码前(replaced_skus 恒空集)逐字节与今天相同。"""
+    n, written, _ = _mark_missing_events(monkeypatch, set())
+    assert n == 2
+    assert [(e["sku"], e["event"], e["source"]) for e in written] == [
+        ("S1", walmart_catalog.product_events.ITEM_MISSING, "catalog_sync"),
+        ("S2", walmart_catalog.product_events.ITEM_MISSING, "catalog_sync")]
+
+
+def test_drop_node_rows_removes_only_that_store_and_sku():
+    """分节点库存的**唯一删除出口**(改码定案专用)。
+
+    与 upsert_node_inventory 头注的「本轮没扫到的行不删」不冲突:那条讲分页
+    漏 SKU,这里讲"我们自己把这个 SKU 改没了"——留着就是一条永不更新的幽灵
+    节点库存,而维护链的受管仓判据照读不误。
+    """
+    conn = _FakeConn()
+    walmart_catalog.drop_node_rows(conn, "T1", "B0OLDCODE01")
+    sql, params = conn.cur.executed[-1]
+    assert "DELETE FROM catalog.item_node_inventory" in sql
+    assert "store = %(store)s AND sku = %(sku)s" in sql   # 两个键都在,少一个就是清全店
+    assert params == {"store": "T1", "sku": "B0OLDCODE01"}

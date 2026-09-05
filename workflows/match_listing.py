@@ -7,7 +7,10 @@
 
 驱动表(registry.MATCH_SHEET「跟卖表」,所有者定稿 2026-08-07 单路飞书读,
 替代旧 xlsx 输入):运营填 A=UPC C=售价 D=重量 E=店铺;B=SKU 人工优先
-(旧系统习惯:人工编号),留空则按同款格式自动生成;脚本填其余。
+(旧系统习惯:人工编号),**留空则由 services/sku_codec.mint 抽 12 位不透明码**
+(2026-09-02 批次 2;旧的 PHUMWMT+日期+序号生成器已删,SKU 里不再带上架日期);
+脚本填其余。发码与人工号登记都在**提交前**的短事务里做完(先落库再调接口),
+提交成功后不再登记。
 
 流程:读表 → 待处理行 SPEC 预检(api/items.search_walmart_spec,按位数
 生成 upc/gtin 候选依次试)→ 三路:
@@ -37,8 +40,8 @@
 全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,
 ⚠ 跟卖商品无 amz 侧身份,sku≠asin 是账本约定的已登记例外)。
 
-⚠ 真跑前置(对拍未完成前只许 --dry-run):Item 字段形态与 SKU 生成
-规则待旧 feed 备份对拍(services/match_feed.py 标注两处)。
+⚠ 真跑前置(对拍未完成前只许 --dry-run):Item 字段形态待旧 feed 备份对拍
+(services/match_feed.py 标注)。SKU 形态已定稿为不透明码,不再对拍旧编号。
 """
 
 import logging
@@ -47,8 +50,8 @@ from datetime import datetime
 from api import feeds, items as items_api
 from registry import db
 from services import blacklist, kpi, listing_sources, match_feed, \
-    match_sheet, notify_fmt as nf, product_events, risk_gate, store_events, \
-    store_retry, stores as stores_svc
+    match_sheet, notify_fmt as nf, product_events, risk_gate, sku_codec, \
+    store_events, store_retry, stores as stores_svc
 
 DANGEROUS = True
 
@@ -130,11 +133,8 @@ def run(params: dict) -> str:
     spec_cache: dict = {}
     by_store: dict[str, list[tuple[dict, dict]]] = {}   # 店铺 → [(行, item)]
 
-    # SKU 自动编号起点(B 列留空的行用;人工填了 B 的行不占号)
-    # + 两道闸数据每轮加载一次,逐行零查询(与 list_new 同款)
-    date_str = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
+    # 两道闸数据每轮加载一次,逐行零查询(与 list_new 同款)
     with db.pg_conn() as conn:
-        serial = match_feed.next_serial_start(conn, date_str)
         gate = risk_gate.load_gate(conn)
         banned = blacklist.load_banned_asins(conn)
 
@@ -146,6 +146,12 @@ def run(params: dict) -> str:
                        "与代理三件套非空)", len(unknown_stores),
                        unknown_stores[:5], sorted(stores_by_name)[:5])
 
+    # ── 第一趟:逐行 SPEC 预检 + 两道闸。**这一趟绝不开 PG 事务** ──────────
+    # 每行 `_precheck` 都是一次沃尔玛 SPEC 接口调用(固定出口代理 + 速率桶 +
+    # 退避)。几百行就是几百次网络往返;把它们吊在一个事务里,mint 在登记簿上
+    # 留的行锁要到整轮结束才释放,与 list_new 的 mint 互相等锁 —— PG 上典型的
+    # 长事务坏味道。
+    ready: list[dict] = []
     for r in todo:
         store = stores_by_name.get(r["store"])
         if store is None:
@@ -166,9 +172,40 @@ def run(params: dict) -> str:
             lines.append(f"  第{r['rownum']}行 {r['upc']}:{why}")
             continue
         r["gtin"] = spec["product_id"] or ""
-        if not r["sku"]:        # B 列人工优先,留空自动按旧格式续号
-            r["sku"] = match_feed.make_sku(date_str, serial)
-            serial += 1
+        r["_spec"] = spec
+        ready.append(r)
+
+    # ── 第二趟:**短事务**里发码与登记(纯数据库操作,零网络),退出即 commit,
+    #    仍在 submit_feed 之前 ⇒「防重状态先落库再调接口」成立 ────────────────
+    # B 列人工号优先(旧系统习惯)。人工号在**这里**就 register 进登记簿,而不
+    # 是等提交成功:登记是「这个串归谁」的事实,与提交成不成功无关;提交成功
+    # 才登记会让被拒的人工号成为维护链眼里的孤儿(source_type 路由不到,落进
+    # unknown,而 unknown 不参与任何自动动作 = 这批货永久退出自动化)。
+    # B 列留空 → sku_codec.mint 抽不透明码(旧 make_sku 是「日期 + 当日序号」,
+    # 把上架日期写进 SKU,与货源隐匿目标直接冲突;而且每轮重发取新序号 ⇒ 载荷
+    # 漂 ⇒ payload_key 防重失效。mint 对同 (店, 来源, GTIN) 复用活码,失败行
+    # 下一轮拿到的正是同一个码 —— 这条护栏跟卖侧此前根本没有)。
+    if ready and execute:
+        with db.pg_conn() as conn:
+            for r in ready:
+                key = r["gtin"] or r["upc"]
+                if r["sku"]:
+                    listing_sources.register(conn, [
+                        {"store": r["store"], "sku": r["sku"],
+                         "source_type": listing_sources.SOURCE_MATCH,
+                         "source_key": key, "workflow": "match_listing"}])
+                else:
+                    r["sku"] = sku_codec.mint(
+                        conn, r["store"], listing_sources.SOURCE_MATCH, key,
+                        workflow="match_listing")
+    elif ready:
+        # 空跑:不发码不登记(mint 是写库函数,没有"这次不写"模式),
+        # 载荷里放占位码 —— 12 位但含 0,is_opaque 恒 False,永远不会被当成真码
+        for r in ready:
+            r["sku"] = r["sku"] or sku_codec.DRYRUN_PLACEHOLDER
+
+    for r in ready:
+        spec = r["_spec"]
         try:
             item = match_feed.build_match_item(
                 spec["raw"], r["sku"], r["price"], r["weight"],
@@ -229,6 +266,8 @@ def run(params: dict) -> str:
                     r["feed_result"] = "处理中"
                     updates.append((r["rownum"], match_sheet.row_vals(r)))
                 if res["outcome"] == "submitted":
+                    # 只记「提交这件事」;**来源登记已在提交前那一趟做完**
+                    # (登记只有一个时点、一条实现路径,见上面第二趟的头注)
                     with db.pg_conn() as conn:
                         product_events.record_many(conn, [
                             {"sku": r["sku"], "store": store_name,
@@ -237,14 +276,6 @@ def run(params: dict) -> str:
                              "detail": {"feed_id": res["feed_id"],
                                         "upc": r["upc"],
                                         "price": r["price"]}}
-                            for r, _ in batch])
-                        # 来源登记簿(所有者定稿):跟卖品 sku≠asin,
-                        # 登记出身后 amz 驱动的自动流程不会误伤它们
-                        listing_sources.register(conn, [
-                            {"store": store_name, "sku": r["sku"],
-                             "source_type": listing_sources.SOURCE_MATCH,
-                             "source_key": r["gtin"] or r["upc"],
-                             "workflow": "match_listing"}
                             for r, _ in batch])
             elif res["outcome"] == "failed":
                 for r, _ in batch:

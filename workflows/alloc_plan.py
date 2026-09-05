@@ -102,9 +102,14 @@ def _pending_delist(conn, cfg, registered) -> dict:
     return dict(out)
 
 
+# published_status 那一条是本工作流自己的口径(不同于 alloc_push 的排 RETIRED)。
+# 身份键经登记簿 amz 行,存量下 source_key = sku,集合逐个相同。
 _SQL_ONLINE_SKU = """
-SELECT store, sku FROM catalog.walmart_items
-WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
+SELECT w.store, w.sku, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.missing_since IS NULL AND w.published_status = 'PUBLISHED'
 """
 
 
@@ -122,9 +127,9 @@ def _listed_asins(conn, registered) -> set:
     with conn.cursor() as cur:
         cur.execute(_SQL_ONLINE_SKU)
         rows = cur.fetchall()
-    return {a for store, sku in rows
+    return {a for store, sku, k in rows
             if store in registered and not sv.is_excluded(store)
-            and (a := sku_asin.extract_asin(sku))}
+            and (a := sku_asin.pick_asin(k, sku))}
 
 
 def _quota(qq: dict, m: dict, target) -> tuple[int, str]:

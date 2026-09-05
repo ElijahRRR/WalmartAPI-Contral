@@ -903,6 +903,49 @@ def test_snapshots_picks_newest_when_params_differ(wired, monkeypatch):
         assert snaps[("B0TEST0001", "10001")]["amz_price"] == 99
 
 
+def test_snapshots_keyed_by_line_asin(wired, monkeypatch):
+    """快照按 catalog.latest_snapshot.asin 存 —— 拿不透明码去查恒空 ⇒ 每一行
+    都「无快照」⇒ 全判待人工 + 每轮为它们烧一次采集配额。必须与 judge 用
+    同一个 line_asin,否则 snaps 的键与判定算出的 asin 对不上(静默错位)。"""
+    wf, _ = wired
+    cols = ["asin", "price", "stock_count", "delivery_days", "shipping",
+            "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
+            "scraped_at", "title"]
+    row = ("B0TEST0001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001"},
+           {"is_fba": "FBA"}, "ok",
+           datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc), "T")
+    conn = FakeConn({"FROM catalog.latest_snapshot": (cols, [row])})
+    line = {"sku": "AK7QM2X9RT4W", "asin": "B0TEST0001"}
+    snaps = wf._snapshots(conn, [line])
+    assert snaps[("B0TEST0001", "10001")]["amz_price"] == 10
+    assert conn.executed[0][1]["asins"] == ["B0TEST0001"]   # 推的是真 ASIN
+
+
+def test_scrape_fails_keyed_by_line_asin(wired):
+    """ops.audit_scrape 的键是 (asin, zip):拿不透明码查恒空 ⇒ scrape_fail
+    永远是 None ⇒「重采也没用」那类失败拿不到终局结论,行永远挂待采集。"""
+    wf, _ = wired
+    conn = FakeConn({"FROM ops.audit_scrape": (["asin", "zip5", "error_type"],
+                                               [("B0TEST0001", "10001",
+                                                 "variant_offset")])})
+    fails = wf._scrape_fails(conn, [{"sku": "AK7QM2X9RT4W",
+                                     "asin": "B0TEST0001",
+                                     "postal_code": "10001"}])
+    assert fails == {("B0TEST0001", "10001"): "variant_offset"}
+
+
+def test_want_list_carries_real_asins(wired, monkeypatch):
+    """三处取数必须同源:want 清单里混进不透明码的话,_push_scrape 推过去
+    采集器直接丢弃,而摘要里的待采数照报 —— 静默卡死的典型形状。"""
+    wf, _ = wired
+    monkeypatch.setattr(wf, "_snapshots", lambda conn, lines: {})
+    monkeypatch.setattr(wf, "_scrape_fails", lambda conn, lines: {})
+    line = dict(LINE, sku="AK7QM2X9RT4W", asin="B0TEST0001",
+                postal_code="10001")
+    _, want = wf._judge_all(None, [line], SUPPLIERS, set())
+    assert want == [("B0TEST0001", "10001")]
+
+
 def test_sql_selects_every_column_the_rules_read():
     """守卫:判定用到的列,取数 SQL 必须真的选出来。
 
@@ -1332,11 +1375,33 @@ def test_judge_unusable_zip_is_not_called_pending_scrape():
 
 
 def test_judge_non_asin_sku_is_not_called_pending_scrape():
-    """SKU 不是 ASIN 形态 ⇒ 采集侧建任务时就丢弃,推了也白推。"""
+    """解不出 ASIN ⇒ 采集侧建任务时就丢弃,推了也白推。
+
+    措辞 2026-09-02 改口:切码后运营看到的是 12 位随机串,说"不是 ASIN 形态"
+    等于没说 —— 得告诉他登记簿里没这条。
+    """
     res = rules.judge(dict(LINE, sku="OLD-CUSTOM-001"), None, SUPPLIERS, set())
     assert res.status == rules.MANUAL
     assert res.rescrape is False
-    assert "ASIN 形态" in res.note and "待采集" not in res.note
+    assert "解不出 ASIN" in res.note and "待采集" not in res.note
+
+
+def test_line_asin_prefers_the_column_then_falls_back_to_shape():
+    """订单链取 ASIN 的**唯一**入口:以 orders.order_lines.asin 列为准
+    (登记簿那一跳发生在写入侧),NULL 的存量行才回落形态提取。"""
+    assert rules.line_asin({"asin": " b0abcdefgh ", "sku": "AK7QM2X9RT4W"}) \
+        == "B0ABCDEFGH"
+    assert rules.line_asin({"sku": "XKJ-B0GXX75JN5-39.98"}) == "B0GXX75JN5"
+    assert rules.line_asin({"asin": None, "sku": "裸订货号"}) == ""
+    assert rules.line_asin({}) == ""
+
+
+def test_judge_uses_the_asin_column_when_sku_is_opaque():
+    """切码后 sku 永远不像 ASIN —— 判定侧读 asin 列,这批行才不会每一单
+    都判"待人工"(D-0b-2:本批次唯一的判定口径变化)。"""
+    res = rules.judge(dict(LINE, sku="AK7QM2X9RT4W", asin="B0TEST0001"),
+                      None, SUPPLIERS, set())
+    assert "解不出 ASIN" not in res.note
 
 
 def test_judge_every_branch_returns_a_verdict():

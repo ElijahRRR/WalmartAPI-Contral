@@ -4,6 +4,8 @@
 白名单判渠道、未归类不参与类目计数。
 """
 
+import os
+import socket
 from collections import Counter
 from pathlib import Path
 
@@ -280,9 +282,46 @@ def test_pt_meta_column_name_in_sql():
 
 
 def test_online_query_is_ordered_and_carries_published():
-    """固定 ORDER BY:样例截断要可复现;带 published_status:下架判定只看已发布。"""
-    assert "ORDER BY store, sku" in sv._SQL_ONLINE
+    """固定 ORDER BY:样例截断要可复现;带 published_status:下架判定只看已发布。
+
+    JOIN 登记簿之后 store / sku 两列有歧义,ORDER BY 必须限定(0a-20)。
+    """
+    assert "ORDER BY w.store, w.sku" in sv._SQL_ONLINE
     assert "published_status" in sv._SQL_ONLINE
+
+
+def test_online_query_carries_the_registry_key():
+    """身份键那一列在 SQL 里 LEFT JOIN 拿(全表级取数不许回头 unnest 反查)。
+
+    少了它,enrich 只能拿裸 SKU 去做模式提取 —— 切码后全落 no_asin,冲突判定、
+    品牌占用、类目建议整片失明,而且一个字的报错都没有。
+    """
+    assert "ls.source_key" in sv._SQL_ONLINE
+    assert "ls.source_type = 'amz'" in sv._SQL_ONLINE
+    assert "LEFT JOIN catalog.listing_sources" in sv._SQL_ONLINE
+
+
+def test_enrich_prefers_the_registry_key_over_the_pattern():
+    """5 元组带 source_key 时,身份键**以登记簿为准**;模式提取只兜存量。
+
+    防的是切码后的静默失明:不透明码经 extract_asin 必返 None,而登记簿里
+    明明记着它的来源 ASIN。
+    """
+    items = [("A085", "AZZZZ234567", "Socks", "PUBLISHED", "B0AAAA0001")]
+    rows, st = sv.enrich(items, META, {"Socks": "Fashion"})
+    assert rows[0]["asin"] == "B0AAAA0001"
+    assert rows[0]["sku"] == "AZZZZ234567"          # 输出的仍是真 SKU
+    assert st["no_asin"] == 0
+
+
+def test_enrich_still_accepts_four_tuples_without_a_registry_key():
+    """4 元组(无 source_key)必须补位成 None 并回落模式提取 —— 逐字等于收口前。
+
+    补位写法是这条锁:删了它,老调用方喂 4 元组会当场 ValueError。
+    """
+    rows, _ = sv.enrich([("A085", "A109-B0BBBB0002-02", "Hats", "PUBLISHED")],
+                        META, {})
+    assert rows[0]["asin"] == "B0BBBB0002"
 
 
 def test_pool_query_gates_on_category_lookup():
@@ -1152,3 +1191,124 @@ def test_loading_and_csv_both_go_through_the_shared_blocks():
     assert "sv.load_rows(" in src and "sv._SQL_" not in src
     assert "report_csv.write(" in src
     assert "csv.writer" not in src and "def _write_csv" not in src
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  改码后的历史销量归属(SKU 改造批次 3,O12,决策 H)
+#
+#  定案之后 catalog.walmart_items.sku 是新码,而 orders.order_lines 的历史行仍是
+#  旧码 —— 不映射的话迁过码的品销量/GMV **恒 0**,而且不报错:店铺产出、
+#  resolve_conflicts 按销量选冲突赢家、alloc_audit 明细三处一起对这些品失真。
+#  (工作包把这两条放在 tests/test_alloc_engine.py,但 _SQL_SALES 的既有用例都在
+#   本文件 —— 判据的测试跟着判据走,不跟着工作包的文件名走。)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_sales_sql_maps_the_old_code_through_sku_aliases():
+    """别名只准经 catalog.sku_aliases 取(代际继承的唯一出处,与 problem_scan
+    四段判据同源),且必须是 LEFT JOIN:INNER 会把**没改过码**的行全丢掉。"""
+    q = sv._SQL_SALES
+    assert "LEFT JOIN catalog.sku_aliases a" in q
+    assert "a.alias_sku = o.sku" in q
+    assert "coalesce(a.sku, o.sku) AS sku" in q
+    assert "listing_sources" not in q          # 不许现写第二份指针 JOIN
+    # 既有两条口径一字未动
+    assert "sale_status" in q and "Cancelled" in q
+    assert "统计状态" not in q
+
+
+def test_sales_key_shape_is_unchanged():
+    """**返回键的形状不变**((store, sku)):三个消费点(:店铺产出 / 冲突裁决 /
+    审计明细)与 :790-791 的 `sales = {(s, k): …}` 一字不改。
+
+    改成按 order_lines.asin 聚合口径更根本(services/product_pool.py 已是那个
+    写法),但要连带改三个消费点的键形状 —— 那是行为变化,另立批次(决策 H)。
+    """
+    import re
+    head = sv._SQL_SALES.strip().splitlines()[0]
+    assert head.startswith("SELECT o.store AS store, coalesce(a.sku, o.sku) AS sku")
+    src = Path("services/alloc_survey.py").read_text(encoding="utf-8")
+    assert "sales = {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()}" \
+        in src
+    assert len(re.findall(r"%\((\w+)\)s", sv._SQL_SALES)) == 3   # 窗口参数没多没少
+
+
+# ── 沙箱 PG 集成 ─────────────────────────────────────────────────────────────
+#
+# ⚠ 地址是**测试夹具**,不是生产资源(生产走 registry/db.pg_dsn());固定在非
+# 标准端口 55432 上正是为了不可能连到生产库,造的数据全在最后回滚的事务里。
+# 文本断言证明不了"LEFT JOIN 空视图 ⇒ 结果集逐行不变",只有真库能。
+_PG_HOST, _PG_PORT = "127.0.0.1", 55432
+_DSN = os.environ.get(
+    "WALMART_TEST_PG_DSN",
+    f"host={_PG_HOST} port={_PG_PORT} user=postgres dbname=walmart_data")
+
+
+def _pg_up() -> bool:
+    try:
+        with socket.create_connection((_PG_HOST, _PG_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+needs_pg = pytest.mark.skipif(not _pg_up(),
+                              reason=f"沙箱 PG {_PG_HOST}:{_PG_PORT} 未启动")
+
+_SSTORE, _SOLD, _SNEW = "ALLOC_T1", "B0ALLOCOLD1", "AALLOC234567"
+
+
+@pytest.fixture
+def pg(monkeypatch):
+    """输入:无 → 输出:沙箱 PG 连接(整场事务**最后一律回滚**)。"""
+    monkeypatch.setenv("WALMART_PG_DSN", _DSN)
+    from registry import db
+    with db.pg_conn() as conn:
+        try:
+            yield conn
+        finally:
+            conn.rollback()
+
+
+def _seed_sales(conn, *, replaced: bool):
+    """输入:连接 + 是否已建立改码指针 → 输出:无。历史订单全挂在旧码名下。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO catalog.listing_sources (store, sku, source_type,"
+            " source_key, workflow, replaces) VALUES (%s, %s, 'amz', %s,"
+            " 'test', %s)",
+            (_SSTORE, _SNEW, _SOLD, _SOLD if replaced else None))
+        cur.execute(
+            "INSERT INTO orders.order_lines (order_line_id, store, po_id,"
+            " line_number, sku, order_date, sale_status, product_amount) VALUES "
+            "('OL_A1', %s, 'PO1', 1, %s, now() - interval '3 days', 'Delivered', 10),"
+            "('OL_A2', %s, 'PO2', 1, %s, now() - interval '4 days', 'Delivered', 15),"
+            "('OL_A3', %s, 'PO3', 1, %s, now() - interval '5 days', 'Cancelled', 99)",
+            (_SSTORE, _SOLD, _SSTORE, _SOLD, _SSTORE, _SOLD))
+
+
+def _sales(conn):
+    """输入:连接 → 输出:{(店, sku): (单数, GMV)}(与执行点一字相同的解包)。"""
+    with conn.cursor() as cur:
+        cur.execute(sv._SQL_SALES, sv.sales_window("", 30))
+        return {(s, k): (int(o), float(g)) for s, k, o, g in cur.fetchall()
+                if s == _SSTORE}
+
+
+@needs_pg
+def test_sales_of_a_migrated_sku_follow_the_replacement_chain(pg):
+    """旧码名下的历史销量归到新码 —— 不归的话迁过码的品销量恒 0 且不报错。"""
+    _seed_sales(pg, replaced=True)
+    got = _sales(pg)
+    assert got == {(_SSTORE, _SNEW): (2, 25.0)}    # Cancelled 那单照旧不算
+    assert (_SSTORE, _SOLD) not in got             # 不双算:旧码键不再出现
+
+
+@needs_pg
+def test_sales_sql_is_unchanged_when_sku_aliases_is_empty(pg):
+    """**零行为变化的正面证据**:视图空集时 LEFT JOIN 全落 NULL,
+    coalesce 取回 o.sku,结果集与改码前逐行相同。"""
+    _seed_sales(pg, replaced=False)
+    with pg.cursor() as cur:
+        cur.execute("SELECT count(*) FROM catalog.sku_aliases")
+        assert cur.fetchone()[0] == 0
+    assert _sales(pg) == {(_SSTORE, _SOLD): (2, 25.0)}

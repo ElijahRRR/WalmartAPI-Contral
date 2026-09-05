@@ -11,6 +11,9 @@
 重跑(WHERE asin IS NULL,天然幂等)。
 
 清洗路径(规则唯一出处 services/sku_asin,这里不重复实现):
+  ⓪ 登记簿 catalog.listing_sources 按 (店, sku) 反查 source_key(切码后唯一
+    通路);②的倒查分两级:先 (店, item_id),查不到再按 item_id 全局查一次
+    (**后者是既有行为,保住跨店补齐的覆盖面**);
   ① 裸 ASIN / 三段式 → 模式提取;
   ② 纯数字 = walmart item id → 倒查 catalog.walmart_items(item_id → 订货号
     → 再走 ①);查不到保持 NULL;
@@ -31,13 +34,18 @@ DANGEROUS = False
 logger = logging.getLogger("workflows.sku_normalize")
 
 _DISTINCT_SQL = """
-SELECT DISTINCT sku FROM catalog.product_events WHERE asin IS NULL
+SELECT DISTINCT store, sku FROM catalog.product_events WHERE asin IS NULL
 """
 
+# ⚠ `IS NOT DISTINCT FROM` 不许写成 `=`:平台级事件(product_ingest /
+# audit_store.event_row / product_audit 补采)的 store 是 NULL,`=` 会把这批行
+# 全部漏掉**而且不报错**。带 store 只改「怎么定位行」不改「填什么值」——待洗集合
+# 由 SELECT DISTINCT store, sku 枚举了每一个组合,更新到的行集合与按裸 sku 相同。
 _FILL_SQL = """
 UPDATE catalog.product_events e SET asin = m.asin
-FROM (SELECT unnest(%s::text[]) AS sku, unnest(%s::text[]) AS asin) m
-WHERE e.sku = m.sku AND e.asin IS NULL
+FROM (SELECT unnest(%s::text[]) AS store, unnest(%s::text[]) AS sku,
+             unnest(%s::text[]) AS asin) m
+WHERE e.sku = m.sku AND e.store IS NOT DISTINCT FROM m.store AND e.asin IS NULL
 """
 
 
@@ -47,31 +55,40 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_DISTINCT_SQL)
-            skus = [r[0] for r in cur.fetchall()]
-        if not skus:
+            pairs = [(s, k) for s, k in cur.fetchall()]
+        if not pairs:
             return "SKU 清洗:事件账本无待洗行(asin 全已填)"
-        mapping, buckets = sku_asin.resolve_skus(conn, skus)
+        mapping, buckets = sku_asin.resolve_pairs(conn, pairs)
 
-        samples = sku_asin.samples(skus, buckets)
+        samples = sku_asin.samples(pairs, buckets)
         shape = ",".join(f"{k}×{v}" for k, v in sorted(buckets.items()))
+        # 摘要里的「个 sku」一律用 sku 级数字(与改前逐字可比);(店,sku) 组合数
+        # 另起一格并列报出,别把两种单位混进同一个数
+        n_sku = len({k for _s, k in pairs})
+        n_sku_ok = len({k for _s, k in mapping})
         if not apply:
-            return (f"SKU 清洗预览:待洗 {len(skus)} 个不同 sku,形态 {shape};"
-                    f"可解析 {len(mapping)} 个"
+            return (f"SKU 清洗预览:待洗 {n_sku} 个不同 sku / {len(pairs)} 个 "
+                    f"(店,sku) 组合,形态 {shape};"
+                    f"可解析 {n_sku_ok} 个 sku、{len(mapping)} 个组合"
                     + "".join(f";{k} 样本 {v}" for k, v in samples.items())
                     + ";加 -p apply=1 补填 product_events.asin,"
                       "完事后按模块头两条 rebuild 命令重建黑名单")
 
         n = 0
         if mapping:
+            # 三个平行数组一旦错位,填进去的就是别人的 asin,而且不报错:先把
+            # keys 固定下来再摊(store 可能是 None,排序键必须自己给 or "")
+            keys = sorted(mapping, key=lambda p: (p[0] or "", p[1]))
             with conn.cursor() as cur:
-                cur.execute(_FILL_SQL,
-                            (list(mapping), [mapping[s] for s in mapping]))
+                cur.execute(_FILL_SQL, ([s for s, _ in keys],
+                                        [k for _, k in keys],
+                                        [mapping[p] for p in keys]))
                 n = cur.rowcount or 0
-        unresolved = len(skus) - len(mapping)
+        unresolved = n_sku - n_sku_ok
         if unresolved:
             logger.warning("SKU 清洗:%d 个 sku 解析不了(形态 %s,样本 %s),"
                            "保持 NULL 等规则扩充", unresolved, shape, samples)
-        return (f"SKU 清洗:{len(mapping)}/{len(skus)} 个 sku 解析成功,"
+        return (f"SKU 清洗:{n_sku_ok}/{n_sku} 个 sku 解析成功,"
                 f"补填事件 {n} 行;解析不了 {unresolved} 个(保持原文兜底)"
                 + "".join(f";{k} 样本 {v}" for k, v in samples.items())
                 + ";接着跑 rebuild_asin / rebuild_brand 重建黑名单")

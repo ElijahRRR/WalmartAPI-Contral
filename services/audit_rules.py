@@ -214,13 +214,22 @@ def load_context(conn) -> AuditContext:
         # 实证 PT:SKU 先归一成 ASIN(所有者 2026-08-11 推翻 sku=asin 全局约定,
         # 生产 SKU 形如 XKJ-B0XXX-39.98,唯一规则出处 services/sku_asin)——
         # 直接拿 sku 当键会让实证级对三段式 SKU 全部失明(评审 I-1);
-        # 归一后仍保持"同一 ASIN 跨店多 PT 不采信"
-        from services.sku_asin import extract_asin
-        cur.execute("SELECT sku, product_type FROM catalog.walmart_items "
-                    "WHERE product_type IS NOT NULL AND product_type <> ''")
+        # 归一后仍保持"同一 ASIN 跨店多 PT 不采信"。
+        # **登记簿优先、模式提取兜存量**,规则与优先级的唯一出处仍是
+        # services/sku_asin(pick_asin)。⚠ 这里必须走 Python 侧的 pick_asin
+        # 而不是纯 SQL coalesce:三段式 SKU 的 ASIN 是靠模式提取取中段的,
+        # 纯 SQL 换成 coalesce 会把这批行的键换成三段式原文 —— 那是真正的
+        # 行为变化,正是评审 I-1 修掉的那个洞。
+        from services.sku_asin import pick_asin
+        cur.execute("SELECT ls.source_key, w.sku, w.product_type "
+                    "FROM catalog.walmart_items w "
+                    "LEFT JOIN catalog.listing_sources ls "
+                    "ON ls.store = w.store AND ls.sku = w.sku "
+                    "AND ls.source_type = 'amz' "
+                    "WHERE w.product_type IS NOT NULL AND w.product_type <> ''")
         by_asin: dict = {}
-        for sku, pt in cur.fetchall():
-            asin = extract_asin(sku) or sku
+        for key, sku, pt in cur.fetchall():
+            asin = pick_asin(key, sku) or sku
             by_asin.setdefault(asin, set()).add(pt)
         # ⚠ 这里**故意**保持"先数 DISTINCT 再过闸",与下面映射表那两处相反:
         # 实证的歧义是"两家店对同一 ASIN 报了不同 PT",那是真分歧,与字典无关;

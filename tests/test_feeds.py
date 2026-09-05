@@ -614,3 +614,29 @@ def test_backoff_follows_the_official_ladder_with_jitter():
         assert len(vals) > 1, f"第 {i} 档没有抖动:{vals}"
     # 超出阶梯长度取最后一档,不越界
     assert 16 <= feeds._backoff(99) <= 32
+
+
+# ── 改码载荷经过 api 层时的两条隐含契约(SKU 改造批次 3 地基,M4)─────────────
+
+def test_chunk_skus_takes_the_new_code_from_a_sku_update_payload():
+    """改码载荷的 Orderable.sku 是**新码**,台账因此按新码落账 —— sku_migrate 的
+    回执反查与 feed_poll 的反哺都按新码找行,**这是有意的**。
+
+    有人把 _chunk_skus 改成取旧码的话,回执永远查不到那一行,而且不报错。
+    """
+    from services import mp_mapper
+    item = mp_mapper.build_sku_update_item("AN3WC0DE2345", "012345678905")
+    assert feeds._chunk_skus("MP_MAINTENANCE", [item]) == ["AN3WC0DE2345"]
+    assert feeds._chunk_skus("MP_ITEM", [item]) == ["AN3WC0DE2345"]
+
+
+def test_maintenance_payload_wraps_sku_update_items_unchanged():
+    """api 层只包信封不碰内容(铁律 2):改码 MPItem 原样进 MPItemFeed。"""
+    from services import mp_mapper
+    item = mp_mapper.build_sku_update_item("AN3WC0DE2345", "012345678905")
+    p = feeds.build_payload("MP_MAINTENANCE", [item])
+    assert p["MPItem"] == [item]
+    assert p["MPItem"][0]["Orderable"]["SkuUpdate"] == "Yes"
+    # 切片限额已登记,本批不新增 feedType
+    assert feeds._SLICE_LIMITS["MP_MAINTENANCE"] == (1000, 24_000_000)
+    assert feeds._SLICE_LIMITS["MP_ITEM"] == (2000, 24_000_000)

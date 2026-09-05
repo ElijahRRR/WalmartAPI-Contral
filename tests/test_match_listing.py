@@ -42,33 +42,6 @@ def test_build_match_item_five_fields_per_verified_sample():
     assert bare["productIdentifiers"]["productId"] == "00012345678905"
 
 
-def test_sku_autogen_format_and_serial_resume():
-    assert match_feed.make_sku("20260807", 1) == "PHUMWMT202608070001"
-    assert match_feed.make_sku("20260807", 123) == "PHUMWMT202608070123"
-
-    class _Conn:
-        def __init__(self, val):
-            self.val = val
-
-        def cursor(self):
-            return self
-
-        def execute(self, sql, args=None):
-            assert "MP_ITEM_MATCH" in sql
-
-        def fetchone(self):
-            return (self.val,)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    assert match_feed.next_serial_start(_Conn("0007"), "20260807") == 8
-    assert match_feed.next_serial_start(_Conn(None), "20260807") == 1
-
-
 def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
     calls = {"feeds": [], "writes": [], "events": []}
     monkeypatch.setattr(match_sheet, "read_rows", lambda: [dict(r) for r in sheet_rows])
@@ -85,8 +58,16 @@ def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):
                                             len(rows))[1])
     monkeypatch.setattr(items_api, "search_walmart_spec",
                         lambda store, **kw: spec_results[next(iter(kw.values()))])
-    monkeypatch.setattr(ml.match_feed, "next_serial_start",
-                        lambda conn, d: 1)
+    # 发码桩:同 (店, GTIN) 复用同一个码(mint 的活码复用语义)
+    calls["mint"] = []
+    minted: dict = {}
+
+    def fake_mint(conn, store, source_type, source_key, *, workflow=""):
+        calls["mint"].append((store, source_type, source_key, workflow))
+        return minted.setdefault((store, source_key),
+                                 f"B{len(minted):011d}".replace("0", "2"))
+
+    monkeypatch.setattr(ml.sku_codec, "mint", fake_mint)
     # 两道闸数据(2026-08-12 接入):默认全空=全放行,gate 专测单独喂
     monkeypatch.setattr(ml.risk_gate, "load_gate",
                         lambda conn: {"banned_pts": set(), "brands": set()})
@@ -123,11 +104,19 @@ _SPEC_BUILD = {"feed_type": "MP_ITEM", "product_id": None,
 
 
 def test_dry_run_prechecks_but_submits_nothing(monkeypatch):
+    """空跑:预检照跑(只读),**mint 与 register 零调用**,载荷里放占位码。
+
+    mint 是写库函数,没有"这次不写"模式(conventions §六);空跑用
+    sku_codec.DRYRUN_PLACEHOLDER 表达 —— 12 位但含 0,is_opaque 恒 False,
+    永远不会被当成真码,也落不进那两条部分唯一索引。
+    """
     calls = _wire(monkeypatch, [_row(2, "012345678905")],
                   {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
     out = ml.run({"execute": False})
     assert calls["feeds"] == [] and calls["writes"] == []
+    assert calls["mint"] == [] and calls["sources"] == []
     assert "可跟卖 1 行" in out and "Item 载荷(对拍用)" in out
+    assert ml.sku_codec.DRYRUN_PLACEHOLDER in out
 
 
 def test_execute_routes_and_terminal_states(monkeypatch):
@@ -143,8 +132,9 @@ def test_execute_routes_and_terminal_states(monkeypatch):
     assert calls["feeds"] == [("T1", "MP_ITEM_MATCH", 1)]
     by_row = {r: vals for r, vals in calls["writes"]}
     assert by_row[2][7] == "F_M" and by_row[2][8] == "处理中"   # I=feedId J=处理中
-    # B 列留空 → 自动按旧格式续号(PHUMWMT+YYYYMMDD+0001)
-    assert by_row[2][0].startswith("PHUMWMT") and by_row[2][0].endswith("0001")
+    # B 列留空 → sku_codec.mint 抽的不透明码(旧 PHUMWMT+日期+序号已删)
+    assert by_row[2][0] == "B22222222222"
+    assert calls["mint"] == [("T1", "match", "00012345678905", "match_listing")]
     assert by_row[3][4] == "码无效"
     assert by_row[4][4] == "需完整建品"
     assert by_row[5][4] == "店铺不识别"
@@ -152,10 +142,94 @@ def test_execute_routes_and_terminal_states(monkeypatch):
     ev = [e for e in calls["events"] if e["event"] == "match_submitted"]
     assert len(ev) == 1 and ev[0]["detail"]["feed_id"] == "F_M"
     assert "跟卖提交 1" in out
-    # 来源登记簿:跟卖品登记出身(amz 驱动的自动流程按此路由,不误伤)
-    assert calls["sources"] == [{
-        "store": "T1", "sku": by_row[2][0], "source_type": "match",
-        "source_key": "00012345678905", "workflow": "match_listing"}]
+    # 来源登记簿:自动号由 mint **抽码即登记**(同一函数同一事务),
+    # 所以这里零 register —— register 只给 B 列人工号(见下一条用例)
+    assert calls["sources"] == []
+
+
+def test_auto_sku_comes_from_mint_and_is_registered_before_submit(monkeypatch):
+    """B 列留空的行:SKU = mint 抽的码,而且 **mint 早于 submit_feed**。
+
+    「防重状态先落库再调接口」在跟卖侧的落法:发码与登记在提交前的短事务里
+    commit,提交失败的行下一轮由 mint 的活码复用拿回同一个码,载荷一字不差 ⇒
+    api/feeds 的 payload_key 在途防重仍然有效(旧的日期+序号生成器每轮取新号,
+    这条护栏根本立不起来)。
+    """
+    seq: list[str] = []
+    calls = _wire(monkeypatch, [_row(2, "012345678905")],
+                  {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
+    real_mint = ml.sku_codec.mint
+
+    def spy_mint(*a, **kw):
+        seq.append("mint")
+        return real_mint(*a, **kw)
+    monkeypatch.setattr(ml.sku_codec, "mint", spy_mint)
+    real_submit = feeds.submit_feed
+
+    def spy_submit(*a, **kw):
+        seq.append("submit")
+        return real_submit(*a, **kw)
+    monkeypatch.setattr(feeds, "submit_feed", spy_submit)
+
+    ml.run({"execute": True})
+    assert seq == ["mint", "submit"]
+    by_row = {r: vals for r, vals in calls["writes"]}
+    assert by_row[2][0] == "B22222222222"
+
+
+def test_mint_transaction_does_not_span_precheck_calls(monkeypatch):
+    """发码那个事务里**不许有沃尔玛调用**:_precheck 是逐行 SPEC 接口往返
+    (固定出口代理 + 速率桶 + 退避)。
+
+    几百行吊在一个事务里,mint 在登记簿上留的行锁要到整轮结束才释放,与
+    list_new 的 mint 互相等锁 —— PG 上典型的长事务坏味道。所以分两趟:
+    第一趟纯网络零事务,第二趟纯数据库零网络。
+    """
+    import contextlib as _c
+    seq: list[str] = []
+    calls = _wire(monkeypatch, [_row(2, "012345678905"),
+                                _row(3, "012345678912")], _SPECS_TWO)
+
+    @_c.contextmanager
+    def spy_conn():
+        seq.append("tx-in")
+        try:
+            yield None
+        finally:
+            seq.append("tx-out")
+
+    from registry import db as _db
+    monkeypatch.setattr(_db, "pg_conn", spy_conn)
+    monkeypatch.setattr(items_api, "search_walmart_spec",
+                        lambda store, **kw: (seq.append("spec"),
+                                             _SPECS_TWO[next(iter(kw.values()))])[1])
+    monkeypatch.setattr(ml.sku_codec, "mint",
+                        lambda conn, st, so, key, *, workflow="": (
+                            seq.append("mint"), "B22222222222")[1])
+    ml.run({"execute": True})
+    # 闸门加载那个事务(第一个 tx-in/out)之后才有 spec;发码事务里零 spec
+    mint_tx = seq.index("mint")
+    lo = max(i for i, v in enumerate(seq[:mint_tx]) if v == "tx-in")
+    hi = min(i for i, v in enumerate(seq) if i > mint_tx and v == "tx-out")
+    assert "spec" not in seq[lo:hi]
+    assert seq.count("spec") == 2 and seq.index("spec") < lo
+    assert calls["feeds"] == [("T1", "MP_ITEM_MATCH", 2)]
+
+
+def test_failed_match_row_reuses_the_same_code_next_round(monkeypatch):
+    """同 (店, GTIN) 连跑两轮拿到**同一个码**(mint 的活码复用)。
+
+    跟卖侧此前缺的正是这条护栏:旧生成器每轮给新序号 ⇒ 载荷漂 ⇒ 在途防重
+    失效 ⇒ 同一个品被重复提交,而且每次都换一个 SKU。
+    """
+    calls = _wire(monkeypatch, [_row(2, "012345678905")],
+                  {"012345678905": _SPEC_OK, "00012345678905": _SPEC_OK})
+    ml.run({"execute": True})
+    first = calls["writes"][0][1][0]
+    calls["writes"].clear()
+    ml.run({"execute": True})                    # 第二轮:表上那行仍是留空的
+    assert calls["writes"][0][1][0] == first     # 复用活码,不是新码
+    assert [c[2] for c in calls["mint"]] == ["00012345678905"] * 2
 
 
 def test_listing_sources_register_first_wins():
@@ -189,7 +263,13 @@ def test_listing_sources_register_first_wins():
 
 
 def test_manual_sku_takes_priority(monkeypatch):
-    # B 列人工填号优先(旧系统习惯),不占自动序号
+    """B 列人工填号优先(旧系统习惯):**不 mint**,但要 register 进登记簿。
+
+    人工号在提交**前**登记,而不是等提交成功:登记是「这个串归谁」的事实,
+    与提交成不成功无关。提交成功才登记会让被拒的人工号成为维护链眼里的孤儿
+    —— source_type 路由不到,落进 unknown,而 unknown 不参与任何自动动作,
+    这批货就永久退出自动化了。
+    """
     row_manual = _row(2, "012345678905")
     row_manual["sku"] = "MY-OWN-001"
     row_auto = _row(3, "012345678912")
@@ -200,7 +280,11 @@ def test_manual_sku_takes_priority(monkeypatch):
     ml.run({"execute": True})
     by_row = {r: vals for r, vals in calls["writes"]}
     assert by_row[2][0] == "MY-OWN-001"
-    assert by_row[3][0].endswith("0001")            # 自动号从 1 起,人工行不占号
+    assert by_row[3][0] == "B22222222222"           # 只有留空的那行发码
+    assert calls["mint"] == [("T1", "match", "00012345678912", "match_listing")]
+    assert calls["sources"] == [{
+        "store": "T1", "sku": "MY-OWN-001", "source_type": "match",
+        "source_key": "00012345678905", "workflow": "match_listing"}]
 
 
 def test_gate_reason_two_gates():
@@ -240,7 +324,8 @@ def test_gated_row_terminal_not_submitted(monkeypatch):
     by_row = {r: vals for r, vals in calls["writes"]}
     assert by_row[3][4].startswith("ASIN黑名单:沃尔玛-知产")   # F 列终态
     assert by_row[3][7] == ""                                  # 无 feedid
-    assert by_row[2][0].endswith("0001")       # 被拦的行不占自动序号
+    assert calls["mint"] == [("T1", "match", "00012345678905", "match_listing")]
+    assert by_row[2][0] == "B22222222222"      # 被拦的行不发码
     assert "ASIN黑名单" in out and "跟卖提交 1" in out
 
 

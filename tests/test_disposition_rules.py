@@ -128,9 +128,8 @@ def test_inventory_provider_carries_the_reason_code(monkeypatch):
             _row(sku="B0NOBB", stock_status="No Featured Offer"),
             _row(sku="B0OOS", stock_state="out_of_stock"),
             _row(sku="B0SLOW", delivery_days=30)]
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: rows)
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
-    out = {i["sku"]: (i["code"], i["new"]) for i in mi.inventory_intents(None, [])}
+    out = {i["sku"]: (i["code"], i["new"]) for i in mi.inventory_intents(rows)}
     assert out["B0UNAVAIL"] == ("unavailable", 0)
     assert out["B0NOBB"] == ("no_buybox", 0)
     assert out["B0OOS"] == ("out_of_stock", 0)
@@ -148,20 +147,19 @@ def test_inventory_provider_yields_to_delete(monkeypatch, delete_on):
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
     for kw in ({"outcome": "not_found"},
                {"product_name": "完全不相干的商品名"}):     # 相似度 < 70%
-        monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None, k=kw: [
-            _row(sku="B0DEAD", stock_state="out_of_stock", **k)])
-        assert mi.inventory_intents(None, []) == [], kw
-        assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}}, []) == [], kw
+        rows = [_row(sku="B0DEAD", stock_state="out_of_stock", **kw)]
+        assert mi.inventory_intents(rows) == [], kw
+        assert mi.price_intents(rows, {"T1": {"fbm_range1": "200%"}}) == [], kw
 
 
 def test_title_provider_gates_at_70_percent(monkeypatch, delete_on):
     """< 70% 不改标题(**交得出去的时候**:删除开着);≥ 70% 照改。"""
     from services import maintenance_intents as mi
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [
+    rows = [
         _row(sku="B0OK", product_name="Steel Cup 500ml"),        # 82% → 改
         _row(sku="B0BAD", product_name="完全不同的东西"),          # 低 → 不改
-    ])
-    out = mi.title_intents(None, [])
+    ]
+    out = mi.title_intents(rows)
     assert [i["sku"] for i in out] == ["B0OK"]
     assert out[0]["code"] == "title_sync" and "%" in out[0]["reason"]
 
@@ -195,13 +193,13 @@ def test_paused_mismatch_rows_are_maintained_not_frozen(monkeypatch):
     monkeypatch.setattr(mi.store_limits, "lead_day_caps", lambda: {})
     row = _row(sku="B0MISMATCH", product_name="完全不相干的商品名",
                wm_price=20.0, amz_price=20.0, avail_qty=10, stock_count=7)
-    monkeypatch.setattr(mi, "_rows", lambda conn, sz, mn=None: [row])
+    rows = [row]
 
-    assert mi.delete_intents(_Conn()) == []                  # ① 不删
-    assert mi.price_intents(None, {"T1": {"fbm_range1": "200%"}},
-                            [])[0]["new"] == 40.0            # ② 照常改价
-    assert mi.inventory_intents(None, [])[0]["new"] == 7     # ③ 照常改库存
-    t = mi.title_intents(None, [])[0]                        # ④ 照常改标题
+    assert mi.delete_intents(_Conn(), rows) == []             # ① 不删
+    assert mi.price_intents(
+        rows, {"T1": {"fbm_range1": "200%"}})[0]["new"] == 40.0   # ② 照常改价
+    assert mi.inventory_intents(rows)[0]["new"] == 7          # ③ 照常改库存
+    t = mi.title_intents(rows)[0]                             # ④ 照常改标题
     assert t["new"] == "Steel Cup" and t["product_id"] == "012345678905"
     # 原因码分得清:飞书「原因」列要能单独数出停闸期照改了多少行
     assert t["code"] == "title_mismatch_sync" and "停闸" in t["reason"]

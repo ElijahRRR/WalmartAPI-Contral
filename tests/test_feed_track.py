@@ -395,7 +395,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
     lock = threading.Lock()
 
     def _mk(label, first=False):
-        def _f():
+        def _f(execute=True):                    # 五个反哺器统一收 execute
             if first:                            # 每条链的头一个反哺器上会合
                 gate.wait()
             with lock:
@@ -403,7 +403,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
             return f"{label}:回写 1 行"
         return _f
 
-    def _boom():
+    def _boom(execute=True):
         gate.wait()          # 也要会合:秒退的话剩下三条永远凑不齐四个
         raise RuntimeError("飞书 90227")
 
@@ -448,3 +448,68 @@ def test_same_sheet_reflectors_registered_in_one_chain():
     listing = [c for c in feed_poll._REFLECTOR_CHAINS
                if any(f.__module__.endswith("listing_sheet") for _, f in c)]
     assert len(listing) == 1 and len(listing[0]) == 2
+
+
+def test_sku_migrate_failure_never_blacklists_the_asin(monkeypatch):
+    """改码被拒**不得反哺 ASIN 黑名单**(SKU 改造批次 3,O8)。
+
+    形态 B 下改码走 MP_ITEM ⇒ kind=list ⇒ 正好命中这段反哺。一次改码被拒若碰巧
+    带上违禁码,会把一个**正在正常销售**的 ASIN 永久拉黑(record_asins 是
+    PERMANENT),list_new/match_listing 的黑名单闸下一轮就开始拦 —— 后果永久,
+    且没有任何摘要会说是改码干的。改码失败是我们的载荷/时序问题,不是政策违禁。
+    """
+    class _C(_Conn):
+        def fetchall(self):
+            if "FROM ops.feed_items" in self._last:
+                return [("B0MIG001", "sku_migrate", "MP_ITEM", "submitted"),
+                        ("B0BAD02", "list_new", "MP_ITEM", "submitted")]
+            return []
+
+    conn = _C()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": sku, "ingestionStatus": "DATA_ERROR",
+         "ingestionErrors": {"ingestionError": [
+             {"code": "EXT_DATA_ERROR_61020366035308",
+              "description": "General Prohibited Product"}]}}
+        for sku in ("B0MIG001", "B0BAD02")]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
+    got = []
+    monkeypatch.setattr(feed_track.blacklist, "record_asins",
+                        lambda c, items: (got.extend(items), len(items))[1])
+
+    feed_track.poll_feed(STORE, "F10")
+    # 同一份回执里:改码那行被放过,上架那行照常反哺(挡的是来源,不是整段)
+    assert [g["sku"] for g in got] == ["B0BAD02"]
+
+
+def test_sku_migrate_receipt_writes_no_product_event(monkeypatch):
+    """改码回执一条病历都不写(O7 的收口点在 feed_track 这一侧的回归)。
+
+    与 O8 是两件事:O8 管黑名单反哺,这条管 product_events —— 形态 B 的
+    kind=list 恒入账,不挡就是一串 list_feed_success 灌进「上架」时间线。
+    """
+    class _C(_Conn):
+        def fetchall(self):
+            if "FROM ops.feed_items" in self._last:
+                return [("B0MIG002", "sku_migrate", "MP_ITEM", "submitted"),
+                        ("B0LIST01", "list_new", "MP_ITEM", "submitted")]
+            return []
+
+    conn = _C()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "B0MIG002", "ingestionStatus": "SUCCESS"},
+        {"sku": "B0LIST01", "ingestionStatus": "SUCCESS"}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
+    written = []
+    monkeypatch.setattr(feed_track.product_events, "record_many",
+                        lambda c, rows: written.extend(rows) or len(rows))
+
+    feed_track.poll_feed(STORE, "F11")
+    assert [(r["sku"], r["event"]) for r in written] == \
+        [("B0LIST01", "list_feed_success")]

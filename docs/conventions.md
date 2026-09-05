@@ -125,6 +125,19 @@ DROP TABLE/COLUMN/VIEW 不可回滚,**未连库核对 `pg_stat_user_tables` /
 - **写操作永不自动兜底**:失败只走 ops.feed_log 反查三态 → 确认未达 → 同一方法
   补交。换方法重试 = 重复提交制造机。
 
+- **POST 的 `outcome=unknown` 一律保持 pending**(SKU 改造批次 3 补,2026-09-02):
+  不回滚、也不补交,留给 `api/feeds` 的启动对账与下一轮的观测定案。unknown 的语义
+  是「不知道到没到」——「写操作永不自动兜底」管的是**不许换姿势重发**,这一条管的
+  是**不许把不确定当成失败去撤销自己这边的状态**:沃尔玛若其实已经受理,回滚就造出
+  一条我们这边没有记录的孤儿状态,而且全程不报错。**人不在环时宁停不重。**
+  (与"确认未达"要分清:4xx 与 token/代理阶段失败是 `api/feeds` 已经判定的确认未达,
+  那种可以安全回滚;`_PRE_FAIL` 与 4xx 都落 `outcome='failed'`,unknown 是第三态。)
+- **`abandoned_at IS NULL` 的允许出现处**:规则正文在 §九②(消费方 .py 四处:
+  `sku_codec.mint` / `list_new` 去重闸 / `alloc_push._SQL_ONLINE` / 批次 3 起的
+  `sku_migrate._SQL_CANDIDATES`;`refdata/schema.sql` 的部分索引条件是 DDL 不计入)。
+  **规则的家只有一个** —— 这里只留指针,守门白名单(`tests/test_sku_guard.py`)的条目
+  与 §九② 的文字必须逐字对得上,否则就是"三种口径互相判红"。
+
 口诀:兜底是补偿外部世界的缺陷,不是补偿自己的不确定。
 
 **通知排版标准件的定位**(所有者定稿 2026-08-27):`services/notify_fmt`
@@ -198,3 +211,141 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 | 99991403 | **月度 API 配额耗尽**,不是频控 | **不可重试**:自然月 1 号才刷新,退避/换 token 都不会好,继续重试只是把剩下的额度也烧掉 —— 直接抛并提示升级版本或等下月 |
 
 ⚠ 90204 实证 2026-08-05:增/删行列超量时飞书报的是 90204,不是超限码。
+
+## 九、SKU 身份口径(SKU 改造批次 0a 建立,2026-09-02;后续批次只补条目)
+
+背景:SKU 从「就是 ASIN」变成 12 位不透明码之后,「这条 walmart_items 记录对应
+哪个源头产品」不再能从 SKU 本身看出来,身份必须过登记簿
+`catalog.listing_sources`。收口只值钱一次,**守不守得住**才决定它三个月后还在不在
+(守门 `tests/test_sku_guard.py`,与 `tests/test_feishu_guard.py` 同族同形态)。
+
+**① 身份表达式只有两条可复制的字面量**(别再发明第三种写法):
+
+- SQL 侧:`coalesce(ls.source_key, w.sku)`,其中 ls 是
+  `... JOIN catalog.listing_sources ls ON ls.store = w.store AND ls.sku = w.sku
+  AND ls.source_type = 'amz'`(按取数语义选 LEFT / INNER)。
+  - `source_type = 'amz'` **不许省**:match 行的 source_key 是匹配 GTIN,拿它去撞
+    `products.asin` 语义上就是错的(存量下结论碰巧相同,不构成等价性论证)。
+  - 用 `coalesce` 不用裸 `ls.source_key`:register 允许 source_key 缺省,NULL 键的
+    amz 行今天靠 `p.asin = w.sku` 命中,裸取会把它们静默丢掉。
+  - **相关子查询里不要写 coalesce**:对 products 每行做的 EXISTS 用不上
+    `walmart_items_sku_idx`,几十万行候选会退化成逐行全表扫(2026-08-14 视图挂死
+    同一类事故)。那种位置改写成两条腿的 OR,各走各的索引。
+- Python 侧:`sku_asin.pick_asin(source_key, sku)`。**两条腿同口径**:登记簿键也要
+  先 strip+upper 再过裸 ASIN 形态闸,不过就落回 `extract_asin(sku)` ——
+  「登记簿只是优先级,不是免检通道」。全表级取数一律在 SQL 里 JOIN 取键,别拿
+  十万对 (store, sku) 去 `unnest`。
+
+**② `abandoned_at IS NULL` 的权威白名单**:消费方 .py **只有三处** ——
+`sku_codec.mint` 的复用查询、`list_new` 的本店去重闸、`alloc_push._SQL_ONLINE`
+(批次 3 起增 `sku_migrate` 的候选选取为第四处)。`refdata/schema.sql` 里那几条
+部分索引条件是 DDL,不计入这张白名单。**resolve / 维护链 JOIN / 事件归并 /
+订单反查一律不按它过滤** —— 旧码带着订单、售后回来时必须还查得到。
+
+**③ 不透明码编码规则的唯一之家是 `services/sku_codec.py`**:字母表 / 长度 /
+随机段长 / 重抽上限 / 占位码 / `is_opaque` 判据都在那里出生;registry 只登记
+`SKU_SOURCE_LETTERS`(所有者要拍的取值,属外部配置)。schema.sql 两条部分唯一
+索引的字符类与该模块常量由守门测试逐字对齐。理由:铁律 3 管的是路径 / token /
+表 ID / 服务器地址这类**外部资源**,12 位码的字母表是**内部编码规则**。
+
+**③′ SQL 侧的形态判据也只有一处** `sku_codec.OPAQUE_SQL_PREDICATE`(由字母表与
+长度**派生**,消费方 `.format(col="w.sku")` 拼进自己的 SQL)。任何 `.py` 里再手打
+一份 12 位字符集正则即违规(守门 `test_no_second_opaque_regex_in_the_repo`);
+`refdata/schema.sql` 的两条部分索引条件是同源的另一半,由守门逐字对齐。
+
+**④ 登记簿的写入出口**:INSERT 只有 `listing_sources.register` 与
+`sku_codec.mint` 家族两个(批次 3 起 mint 家族含 `mint_replacement`);
+`abandoned_at` / `abandoned_reason` / `replaced_by` / `replaces` / `replaced_at`
+**五列**只准 `services/sku_codec` 写(`abandon` / `mint_replacement` /
+`settle_replacement`)。行永不 DELETE。
+
+**④′ UPDATE 有两条写线,写的列不许交叉**(所有者 2026-09-03 补):除了 ④ 那五列,
+`source_type` / `source_key` **两列**的唯一修改入口是
+`services/listing_sources.reclassify`(唯一调用方 `workflows/sources_reclassify`,
+`-p apply=1` 才写;写入前 `source_key` 必须过 `sku_asin.is_standard_asin`)。
+交叉了两种后果都静默:归类那条顺手清 `abandoned_at` = 把死码拉回自动化(下一轮
+新码新 UPC 去上同一个 item);弃码那条若能改 `source_key` = 身份键在一次弃码里被
+悄悄换掉,按 ASIN 反查的消费方当场失明。守门
+`test_the_two_registry_update_lines_do_not_cross` 逐条钉死,白名单条目与本节文字
+必须对得上。
+⚠ 归类的语义是**把商品交还自动链**(改完才第一次满足消费方
+`source_type='amz' AND source_key IS NOT NULL` 那条 JOIN),纪律与
+`sources_backfill` 同款:改完先 `maintenance_scan --dry-run` 看破坏面。
+它与 ⑥ 那三个同名异义并列的第四组辨析是:**归类**(改出身,SKU 不变)≠
+**首次登记**(register,补一条不存在的行)≠ **改码**(换沃尔玛侧的 SKU 本身)。
+
+**⑤ 守门只有一份** `tests/test_sku_guard.py`:白名单 dict 在文件顶部,每条写清
+理由与**预期收口批次**,永久豁免显式标 permanent。后续批次只准增删这里的白名单
+条目,**不许再建第二份守门文件**(四份并存正是 §六要禁的形态,而且白名单一定会
+互相打架)。
+
+**⑥ 三个同名异义,别混**:「码弃用(abandoned)」≠「沃尔玛 lifecycle RETIRED」
+≠「product_clear 停用」。登记簿列名故意用 abandoned 不用 retired。
+
+**⑦ 码的寿命与四个弃码点**(批次 2 接线,2026-09-02):
+
+- **码的寿命** = 沃尔玛侧那条 (店, SKU) 记录对我们还有用的寿命,**不是上架/下架
+  次数**。登记簿的行**永不 DELETE**;`abandoned_at IS NULL` 的行叫**活码**。
+- **弃码只有一个实现**:`services/sku_codec.abandon(conn, store, sku, reason)`。
+  它在同一事务里做三件事:标登记簿三列 → 按分派表烧号 → 记码级事件
+  (`sku_abandoned` / `sku_replaced`,detail 必带 `source_key`)。
+- **弃码点只有四个**(守门 `_ABANDON_CALLERS_OK` 逐条登记,多一个即红):
+
+  | # | 在哪 | 触发 | 烧号状态 |
+  |---|---|---|---|
+  | 1 | `workflows/catalog_sync.py` | DELETE 经**观测核验** `delete_verified` | `burned_delete` |
+  | 2 | `workflows/sku_locked_heal.py` | SKU_LOCKED 自愈 RETIRE **回执成功 + 冷却期满** | `burned_lock` |
+  | 3 | `services/listing_sheet.py` | UPC 撞库 `ERR_EXT_DATA_0101119`(决策 B:码与 UPC 一起换) | `conflict` |
+  | 4 | 批次 3 `workflows/sku_migrate.py` | 改码 SkuUpdate 经观测确认 | **不烧**(item 还在、UPC 还绑着) |
+
+  第 1 点**不按回执弃**:「回执成功但后台没删」是所有者实证过的故障模式;
+  第 2 点是四点中唯一绑回执的一个(锁死的 SKU 可能从未进过 walmart_items,
+  没有观测可等)。烧号唯一写入函数 `upc_pool.burn(conn, pairs, status)`,
+  状态只由 `sku_codec._BURN_STATUS` 给(决策 D)。
+- **其余一切「下架」都不弃码**(五项,守门 `_ABANDON_FORBIDDEN` 反向钉死):
+  `product_clear` 停用(RETIRE)、库存归零、缺席 `missing_since`、被沃尔玛
+  unpublish、提交失败/被拒/Unknown/PROHIBITED —— 沃尔玛侧记录仍在、仍绑着我们的
+  UPC,抽新码 = 同店两条同内容记录 + 白烧一个 UPC。
+- **mint 的复用语义**:同 (店, 来源, 源头键) 有活码就复用它(依据是沃尔玛
+  「一个 Product ID 只能挂一个 SKU」),所以失败行下一轮拿到的是同一个码,载荷
+  一字不差 ⇒ `api/feeds` 的 payload_key 在途防重仍然有效。
+- **三条护栏跟码走**:重试上限、在途防重、UPC 原号复用都按当前活码计数 ——
+  每换一次码,三条全部重新开始。这正是**代际上限闸**(同 (店, 来源, 源头键)
+  已弃码行数 ≥ `MAX_SKU_GENERATIONS`)与**退役冷却闸**
+  (`RETIRE_COOLDOWN_HOURS`)要堵的闭环;两个常量的唯一之家是
+  `services/sku_codec.py`(守门 `test_cooldown_and_generation_constants_have_one_home`)。
+- **跨店永不复用码**:同一个码串在两家店合法,但那正是"两家店有关联"的信号,
+  而关联就是封号线(schema.sql 的 `listing_sources_opaque_sku_uidx` 拦它)。
+- **改码(批次 3 地基,2026-09-02)三个函数、两条指针、三态**:
+  `mint_replacement`(先落库:新码行 `replaces`=旧码 + 旧行 `replaced_by`=新码,
+  同一事务,**commit 归调用方**;幂等 —— 崩溃重入拿回同一个码,换码 = 载荷变了 =
+  payload_key 防重不命中 = 同一个 item 被改两次)、`settle_replacement('confirmed')`
+  (旧行走 `abandon(reason='sku_update')`,**不烧 UPC**,并给新码记一条出生事件)、
+  `settle_replacement('rolled_back')`(清旧行指针 + 新码 `abandon('sku_update_failed')`)。
+  `sku_update_failed` 是词表里的**第五个原因但不是第五个弃码点** —— 它弃的是我们
+  自己刚抽、从未上过沃尔玛的新码。回滚作废的新码行**保留 `replaces` 当病历**,但
+  不再占旧码的认领位(索引与视图 `catalog.sku_aliases` 的条件都带 `abandoned_at
+  IS NULL`);不这样的话同一个旧码这辈子只能改一次码,而失败会被误诊成"随机撞码"。
+- **代际继承只有一处出生**:视图 `catalog.sku_aliases`(新码 → 它继承的旧码,
+  **只继承一跳**)。五处按 (店, SKU) 读历史的判据一律经它取别名,不许各自现写
+  `replaces` 的 JOIN(守门 `test_only_sku_aliases_expresses_the_replacement_chain`)。
+- **发码只有一条路**:`sku_codec.mint`。跟卖侧旧的 `PHUMWMT + 日期 + 序号`
+  生成器已于批次 2 删除(守门 `test_no_second_sku_generator_survives`),
+  跟卖表 B 列人工号仍然优先,人工号走 `listing_sources.register` 在**提交前**登记。
+
+**⑧ 回执事件码不写字面量**:`{kind}_feed_{status}` 是推导出来的,具名常量在
+`services/product_events.py`(`RETIRE_FEED_SUCCESS` / `DELETE_FEED_SUCCESS`)。
+`_FEED_KIND` 一改取值,写字面量的那条 SQL 会**静默返回空集** —— 闸门形同虚设
+而且不报错。守门 `test_no_receipt_code_literals_in_business_sql` 扫 services/ 与
+workflows/。
+
+**⑨ 派工闸与去重闸同口径,占用口径故意不同**(决策 C,2026-09-02):
+`workflows/alloc_push._SQL_ONLINE` 与 `list_new` 的去重闸都判「没缺席 + 码还
+活着」,**不筛 lifecycle**;`services/alloc_survey._SQL_ONLINE` 保持筛 RETIRED
+不变(它答的是"有没有活货位")。两处都有反向守门,**不要顺手统一**。
+
+**⑩ 不可逆的写必须认 `--dry-run`**:弃码与烧号都没有撤销路径。`feed_poll` 的
+`DANGEROUS=False`(不调沃尔玛写接口)⇒ cli 恒传 `execute=True`,所以它**自己读
+`params["dry_run"]`** 并把 `execute` 透传给五个反哺器;五个反哺器一律带
+`execute: bool = True` 关键字(守门 `test_every_reflector_takes_an_execute_flag`),
+`execute=False` 时一行飞书、一行 PG 都不写。

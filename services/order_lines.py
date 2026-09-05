@@ -197,10 +197,8 @@ def extract_order_lines(store_name: str, order: dict) -> list[dict]:
             "store": store_name, "po_id": po, "line_number": norm_line(line_no),
             "customer_order_id": str(order.get("customerOrderId") or ""),
             "sku": sku,
-            # A1.5:落库当场清洗,不留给后台补(2026-08-15)。规则唯一出处
-            # services/sku_asin;纯数字 item_id 形态这里提不出(要查库),
-            # 由 order_asin_normalize 扫尾——所以下面的 upsert 用 COALESCE 守着
-            "asin": sku_asin.extract_asin(sku),
+            # asin 不在这里算 —— 它要查登记簿(要连接),统一由
+            # upsert_order_lines 落库当场补(唯一实现路径,见 _fill_asins)
             "product_name": str((ol.get("item") or {}).get("productName") or ""),
             "qty": int(_num((ol.get("orderLineQuantity") or {}).get("amount"), 1) or 1),
             "sale_status": st.get("status", ""),
@@ -442,7 +440,9 @@ def settle_status(net: float, gross: float) -> str:
 # **全 0 不覆盖已有的真电话**——旧系统的「电话全 0 保护」,legacy_survey 明列为
 # 必须照搬的防线,此前漏了。覆盖掉就找不回来:raw 也是每次一起被覆盖的。
 # 反向不设防:真电话覆盖全 0 是正常修复。
-# 算不出就别覆盖:order_sync 拿纯数字 sku 提不出 asin,而扫尾工作流查库能填出来
+# 算不出就别覆盖:order_sync 对**纯数字 item_id 形态**仍提不出 asin(那一跳要按
+# (店, item_id) 查 walmart_items,写入路径上做不了),由 order_asin_normalize
+# 扫尾 —— 登记簿接上以后这条守卫**照样不能拆**
 _ASIN_GUARD = "COALESCE(EXCLUDED.asin, t.asin)"
 
 _PHONE_GUARD = ("CASE WHEN coalesce(EXCLUDED.phone, '') ~ '^0*$' "
@@ -575,6 +575,24 @@ _SETTLEMENT_COLS = [
     "order_line_id", "period", "store", "po_id", "line_number", "net_amount",
     "gross_amount", "product_amount", "commission_amount", "commission_rate",
     "original_commission", "commission_saving", "incentive", "settle_date", "raw"]
+
+
+def _fill_asins(conn, rows: list[dict]) -> int:
+    """输入:连接 + order_lines 行 → 输出:补出 asin 的行数(规则唯一出处 services/sku_asin)。
+
+    一批一条 SELECT(order_sync 是每店一批),**不许退化成逐行往返**。
+    解不出写 None:订单链的口径是「提不出留 NULL」,拿 sku 原文兜底会让三段式/
+    纯数字形态在采集库里永远查空,看起来像"这个产品一单没卖过"(静默错信号)。
+    """
+    if not rows:
+        return 0
+    m = sku_asin.resolve_many(
+        conn, [(r.get("store"), r.get("sku")) for r in rows if r.get("sku")])
+    n = 0
+    for r in rows:
+        r["asin"] = m.get((r.get("store"), r.get("sku")))
+        n += 1 if r["asin"] else 0
+    return n
 
 
 _ORDER_DATE_EXISTING_SQL = ("SELECT order_line_id, po_id, sku, order_date,"
@@ -735,11 +753,19 @@ def upsert_order_lines(conn, rows: list[dict], *,
                        repair_order_date: bool = False) -> int:
     """输入:连接 + extract_order_lines 产出 → 输出:写入行数。审核列不在此覆盖。
 
-    order_date 走观测→定稿两段(_ORDER_DATE_GUARD + _ORDER_DATE_STATE_SQL,同一
-    事务):首见写入不定稿,连续两轮一致才定稿,定稿后锁死。repair_order_date=True
-    是显式修复模式,本次调用允许 API 值直接覆盖库值(调用方须先看清冲突清单)。
+    这里做两件**互不相干**的事,读起来别串:
+      · **asin 补填**(身份):extract_order_lines 算不出——那一跳要查登记簿、
+        要连接,所以统一在落库当场经 `_fill_asins` 一批一条 SELECT 补齐,这是
+        订单链补 asin 的**唯一写入路径**;纯数字 item_id 形态照旧由
+        order_asin_normalize 扫尾,`_ASIN_GUARD` 守着不许把扫尾填好的值冲回 NULL。
+      · **order_date 观测→定稿**(时间):走两段(_ORDER_DATE_GUARD +
+        _ORDER_DATE_STATE_SQL,同一事务),首见写入不定稿,连续两轮一致才定稿,
+        定稿后锁死;screen_order_dates 已用详情接口定稿的行在这里直接落
+        confirmed/source=detail。repair_order_date=True 是显式修复模式,本次调用
+        允许 API 值直接覆盖库值(调用方须先看清冲突清单)。
     """
     rows = _dedupe_order_lines(rows)
+    _fill_asins(conn, rows)          # 身份补填,与下面的 order_date 定稿无关
     for r in rows:
         if isinstance(r.get("raw"), (dict, list)):
             r["raw"] = json.dumps(r["raw"], ensure_ascii=False, default=str)
@@ -1011,3 +1037,27 @@ def backfill_perf_line_ids(conn) -> int:
               AND p.po_id = l.po_id
         """)
         return by_sku + cur.rowcount
+
+
+def duplicate_po_lines(conn, days: int | None = 120) -> list[dict]:
+    """输入:连接(+回看天数,None=不限)→ 输出:同 (store, po_id, line_number)
+    出现多个 order_line_id 的行组。
+
+    **判据在视图里**(`orders.v_order_line_dupes`,refdata/schema.sql):本函数只是
+    加窗口与排序的薄壳,**不许在这里重写 GROUP BY/HAVING** —— 同一条体检两份实现、
+    口径还不同的话,两边数字对不上时没有判据说该信哪个,而这正是「改码后销量双算」
+    唯一能被发现的手段(order_line_id = sha256(PO + SKU):沃尔玛若对改码之前的 PO
+    返回新码,那一行会被当成新行插入而旧行不删,同一笔销售算两次且不报错)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT store, po_id, line_number, n, skus
+            FROM orders.v_order_line_dupes
+            WHERE %(days)s IS NULL
+               OR first_order_date > now() - make_interval(days => %(days)s)
+            ORDER BY n DESC, store, po_id
+            LIMIT 200
+        """, {"days": days})
+        return [{"store": s, "po_id": p, "line_number": ln,
+                 "n": int(n), "skus": list(skus or [])}
+                for s, p, ln, n, skus in cur.fetchall()]

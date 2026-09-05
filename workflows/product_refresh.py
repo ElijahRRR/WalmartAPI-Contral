@@ -55,28 +55,39 @@ TIMEOUT_HOURS = 1           # 推上去后多久没采完算超时(所有者定�
 BATCH_PREFIX = "wm-refresh-"
 
 # 合法 ASIN 形态(与采集侧 common/core/idents.ASIN_RE 同口径):B + 9 位大写字母数字
+# ⚠ 这条正则是**采集侧的合法 ASIN 形态闸**(与 idents.ASIN_RE、
+# workflows/sources_backfill._ASIN_RE 同口径),**不是 SKU→ASIN 规则**:
+# 两者不是同一个能力(推一个非标准码去采集只会永远采不到),
+# 守门测试也因此不扫它(tests/test_sku_guard.py 的 ② 号断言注释)。
+# SKU→ASIN 那一跳由下面 _SQL_TARGETS 的身份键表达式在 SQL 里做完。
 _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
 # 在线且店铺 ACTIVE 的 ASIN。同一 ASIN 多店只推一次(采集结果按 ASIN 共享)。
 # 店铺状态取 ops.store_kpi_daily 每店最新一行;无 KPI 记录的店视为 ACTIVE
 # (与 list_new 闸门同口径,fail-open)。
+# 取的是**身份键** coalesce(ls.source_key, w.sku)(conventions §九),不是裸
+# SKU:切码之后裸 SKU 全过不了下面的形态闸,推采集目标会**静默归零** ——
+# 不报错,只是维护链新鲜度的源头断掉。存量 amz 行 source_key = sku,推的集合
+# 逐个相同。
 _SQL_TARGETS = """
 WITH latest_status AS (
     SELECT DISTINCT ON (store) store, store_status
     FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 )
-SELECT DISTINCT w.sku
+SELECT DISTINCT coalesce(ls.source_key, w.sku) AS asin
 FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 LEFT JOIN latest_status s ON s.store = w.store
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
   AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
-ORDER BY w.sku
+ORDER BY 1
 """
 
 
 def _targets() -> tuple[list[str], int]:
-    """输入:无 → 输出:(合法 ASIN 形态的在线 SKU, 被过滤掉的行数)。
+    """输入:无 → 输出:(合法 ASIN 形态的在线身份键, 被过滤掉的行数)。
 
     历史遗留:一部分在线 SKU 根本不是 ASIN 形态(旧系统留下的自定义编码)。
     采集侧建任务时就把它们丢掉(2026-08-09 实证:推 27722,采集侧只建了

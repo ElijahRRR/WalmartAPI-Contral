@@ -8,7 +8,7 @@
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -101,6 +101,20 @@ def feishu_notify_to() -> str | None:
 # `is_customized` 共 1,225,423 行,值形态 Yes/No(_is_custom 的小写 truthy
 # 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
 AMZ_CUSTOM_FLAG_KEY = "is_customized"
+
+# SKU 身份|来源字母登记(所有者定稿 2026-09-02;sku_plan §2)。
+# ① 这里登记的是**所有者要拍的取值**(source_type → 12 位不透明码的首位字母),
+#    属外部配置,按铁律 3 收在 registry;工作流按自己的 source_type 查表,没人手填。
+# ② **编码规则本身不在 registry**:字母表 / 长度 / 随机段长 / 重抽次数 / 占位码 /
+#    is_opaque 判据的唯一之家是 services/sku_codec.py(批次 0a 决策 E:铁律 3 管的是
+#    路径/token/表 ID/服务器地址这类外部资源,12 位码的字母表是内部编码规则)。
+#    registry 不许再抄一份 —— 抄一份就配出两条互斥的守门断言
+#    (tests/test_sku_guard.py::test_the_opaque_alphabet_is_born_only_in_sku_codec 会红)。
+# ③ 字母必须来自 sku_codec._ALPHABET、互不相同、**不助记**(码不许把货源写在脸上;
+#    分隔符同理不用)。跟卖的 B 与 ASIN 的 `B0`+10 位形态不冲突:新码恒 12 位。
+SKU_SOURCE_LETTERS: dict[str, str] = {
+    "amz": "A", "match": "B", "1688": "C", "self": "H",
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
@@ -261,6 +275,13 @@ class Spreadsheet:
     columns: tuple[str, ...]
     wiki: bool = False      # True=token 是知识库节点 token(wiki/ 链接),
                             # api/feishu 会先解析成真实 spreadsheet_token
+    #: 字段名 → **表头行里的中文列名**(所有者在飞书里看到的那一格文字)。
+    #: 登记了 headers 的表,读写一律**按表头名定位列**(见
+    #: services/listing_sheet.layout):所有者再调列顺序也能写对列,
+    #: 而 columns 只剩「有哪些字段」这一层含义。飞书字段名只在这里出生
+    #: (CLAUDE.md 铁律 3 / conventions §八),业务代码不许写中文表头字面量。
+    #: 空 = 这张表还是老规矩(columns 的顺序**就是**列序,写入按字母硬编码)。
+    headers: dict[str, str] = field(default_factory=dict)
 
     def require(self) -> "Spreadsheet":
         if not self.token or not self.sheet_id:
@@ -274,6 +295,9 @@ class Spreadsheet:
 # 在线产品总表(新):catalog_sync 写,PG 权威、此表是人看的投影,可随时整表重建。
 # 行数约 13 万,超 bitable 5 万行套餐上限,故用电子表格。
 # 列序 = catalog.walmart_items 的字段序,改列序必须两处同步。
+# 2026-09-02 起末尾多一个投影列 source_key(catalog.listing_sources.source_key,
+# LEFT JOIN 取,未登记行空),它不是 walmart_items 的字段;人读名「来源码」。
+# 追加在末尾是硬要求 —— 电子表格按 range 坐标写,插中间全体错位。
 ONLINE_PRODUCTS_SHEET = Spreadsheet(
     name="在线产品总表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
@@ -283,7 +307,8 @@ ONLINE_PRODUCTS_SHEET = Spreadsheet(
     columns=("store", "sku", "itemId", "upc", "gtin", "productName", "shelf",
              "productType", "variantGroupId", "variantGroupInfo",
              "price", "currency", "availToSellQty",
-             "publishedStatus", "lifecycleStatus", "unpublishedReasons"),
+             "publishedStatus", "lifecycleStatus", "unpublishedReasons",
+             "source_key"),
 )
 
 
@@ -319,6 +344,10 @@ ORDER_SALES = Bitable(
     fields=_fields(
         key="order_line_id", order_date="下单时间", store="店铺",
         po_id="采购订单号", line_number="行号", sku="SKU",
+        # source_key=源头标准码(飞书列名「来源码」),orders.order_lines.asin 投影
+        # (登记簿反查后新旧码都有值);列由所有者建(2026-09-02 已建),
+        # 建列前本条目不许进载荷(见 sku_workplan batch_0b D-0b-4)
+        source_key="来源码",
         product_name="商品名称", qty="数量", sale_status="销售状态",
         audit_status="审核状态", status_date="状态更新时间",
         est_ship_date="预计发货时间", est_delivery_date="预计送达时间",
@@ -358,6 +387,10 @@ ORDER_RETURNS = Bitable(
         key="唯一键", order_line_id="order_line_id", order_date="下单时间",
         store="店铺", rma="RMA号", customer_order_id="客户订单ID",
         po_id="采购订单号", line_number="行号", sku="SKU",
+        # source_key=源头标准码(飞书列名「来源码」),从 orders.order_lines 借
+        # (return_lines 没这一列;登记簿反查后新旧码都有值);列由所有者建
+        # (2026-09-02 已建),建列前本条目不许进载荷(见 batch_0b D-0b-4/D-0b-6)
+        source_key="来源码",
         return_status="售后状态", refund_status="退款状态",
         return_method="退货方式", refund_mode="退款方式",
         refund_total="总退款金额", return_reason="退货原因",
@@ -522,20 +555,28 @@ RETIRE_SHEET = Spreadsheet(
 
 # 上下架限额表(多维表格,**按店铺分行**,2026-08-06 所有者更正列名;
 # product_clear 读「下架限制」,listing 链读「上架限制」等)
-# 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,21 列 A~U,
-# 较旧 26 列砍掉 状态跟踪/最近跟踪日期——产品事件账本已承接该职责):
-# A=店铺 B=ASIN C=walmart上架标题 D=walmart_product_type E=审核结果 F=理由
-# G=审核日期 H=amz价格 I=库存 J=walmart价格 K=是否上架 L=上架feedid
-# M=上架日期 N=未上架理由 O=上架结果 P=上架失败理由 Q=feed查询日期
-# R=真实walmart标题 S=真实walmart_product_type T=真实UPC U=UPC是否一致
-# (U 语义=核验的 UPC 一致性,按代码实际行为登记,所有者定稿 2026-08-07)
-# ⚠ **A/B 于 2026-08-16 被所有者对调**(原 A=ASIN B=店铺)。全仓只有
-# `listing_sheet.read_rows()` 按位置取值(zip(columns, 单元格)),所以这条
-# 元组的顺序**就是**表里的列序 —— 表头再动一次,只改这里 **+ services/listing_sheet
-# 里的显式 range 字母**(写入侧按字母写,表头一动它们也得跟着挪)。
-# ⚠ **2026-09-02 所有者再改表头**(第三步输出规范化):C 插入 SKU;「审核理由」
-# 拆成 G=类别 + H=具体内容;尾部四列 真实标题/真实PT/真实UPC/UPC匹配 换成
-# T=登记日期 U=查询编码(运营域,脚本不写)。仍 21 列 A~U。
+# 上架表(listing 主驱动表,L2 用;所有者建 2026-08-07,**表头 2026-09-02
+# 第二次重排**(审核链第三步输出规范化):仍 21 列 A~U —— C 插入 SKU;旧
+# 「审核理由」一列拆成 G=类别 + H=具体内容;尾部四列 真实标题/真实PT/真实UPC/
+# UPC是否一致 被所有者删除,换成 T=登记日期 U=查询编码(运营域,脚本不写)。
+# A=店铺 B=ASIN C=SKU D=walmart上架标题 E=walmart_product_type F=审核结果
+# G=类别 H=具体内容 I=审核日期 J=amz价格 K=库存 L=walmart价格 M=是否上架
+# N=上架feedid O=上架日期 P=未上架理由 Q=上架结果 R=报错 S=feed查询日期
+# T=登记日期 U=查询编码
+# (前一版沿革留档:21 列 A~U 较更旧的 26 列砍掉 状态跟踪/最近跟踪日期 ——
+#  产品事件账本已承接该职责;末列 U 当时语义=核验的 UPC 一致性,按代码实际
+#  行为登记,所有者定稿 2026-08-07;**A/B 于 2026-08-16 被所有者对调**,
+#  原 A=ASIN B=店铺。)
+# ⚠ **列字母只是「今天长这样」,不是契约**:读写一律**按表头名定位**
+# (services/listing_sheet.layout 每进程读一次表头行,按下面的 headers 建
+# 字段→列字母的映射)。所以所有者再挪一次列顺序,**代码一行都不用改** ——
+# 只在挪动同时改了表头文字时才需要动 headers。这是 2026-09 重排的最大教训:
+# 此前读侧按位置取值(`read_rows()` 拿 zip(columns, 单元格))、写侧按硬编码
+# 字母(显式 range C:G / O:Q / …),表头一动两侧都得手工跟着挪;2026-09-02
+# 实际发生的是没跟上 —— 读出来的字段整体错位、结论落在别人的列上,而且**全程
+# 不报错**(A/B 对调那次同款)。
+# ⚠ **T「登记日期」/ U「查询编码」是人工填写列,程序永不读写**(语义待所有者
+# 说明),只在 columns 里占位,免得被当成"没人要的列"顺手清掉。
 LISTING_SHEET = Spreadsheet(
     name="上架表",
     token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
@@ -546,6 +587,29 @@ LISTING_SHEET = Spreadsheet(
              "list_date", "not_listed_reason", "list_result",
              "list_fail_reason", "feed_check_date", "register_date",
              "query_code"),
+    headers={
+        "store": "店铺",
+        "asin": "ASIN",
+        "sku": "SKU",
+        "list_title": "walmart上架标题",
+        "product_type": "walmart_product_type",
+        "audit_result": "审核结果",
+        "audit_category": "类别",
+        "audit_detail": "具体内容",
+        "audit_date": "审核日期",
+        "amz_price": "amz价格",
+        "stock": "库存",
+        "walmart_price": "walmart价格",
+        "listed": "是否上架",
+        "feed_id": "上架feedid",
+        "list_date": "上架日期",
+        "not_listed_reason": "未上架理由",
+        "list_result": "上架结果",
+        "list_fail_reason": "报错",
+        "feed_check_date": "feed查询日期",
+        "register_date": "登记日期",
+        "query_code": "查询编码",
+    },
 )
 
 # 跟卖表(match_listing 驱动表,替代旧 xlsx 输入,所有者定稿 2026-08-07

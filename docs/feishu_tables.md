@@ -58,10 +58,10 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 | 店铺日报 KPI(看板) | 每日 KPI 展示 | Postgres 权威,飞书展示(整表重写,可随时重建) | 看板两页(总览=每店最新一行/历史=全店合一近 N 天),registry KPI_BOARD_OVERVIEW/HISTORY;建表+首刷已完成(2026-08-13)。**列序 2026-08-15 调整:首列店铺、次列日期**(原为 日期,店铺),两页均按店铺排序、历史页店内按日期降序。⚠ 与下方旧「店铺KPI」的列序**故意不同**,严禁互相照抄 |
 | 订单审核结果 | 审核结论展示与人工复核 | Postgres 权威,飞书展示+人工改判回收 | **已由订单中心销售订单表的审核列承接**(ORDER_SALES_AUDIT,只更新不新建行;2026-08-10 生产回写 151 行) |
 | 店铺KPI(旧 workbook) | **只剩一个用途**:每店分页=KPI 历史导入源(kpi_history_import 只读)。原「总览页=影刀输入投影」已于 2026-08-15 删除,影刀改读本地 input.json | Postgres 权威;此表仅为历史迁移保留,导入跑完即可归档 | **电子表格**(存量);registry KPI_SHEET(columns 已置空——本仓无按列位写入路径);.env FEISHU_KPI_SHEET_TOKEN / FEISHU_KPI_OVERVIEW_SHEET_ID。⚠ **别再往这里加写入**:老影刀应用可能仍在读它,新旧两个应用同时被喂数据 = 双 spawn 互抢 |
-| 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);**已接通**(catalog_sync 47 店全量验证;token/sheet_id 在 .env);列序登记在 registry ONLINE_PRODUCTS_SHEET;**只写在架行**(缺席商品不进表,2026-08-07 定稿),last_seen_at/missing_since 两列不投影(追踪在 PG + 事件账本) |
+| 在线产品总表(新) | 沃尔玛在线商品投影(约 13 万行) | Postgres(catalog.walmart_items)权威,程序整表重写 | **电子表格**(非 bitable:超 5 万行套餐上限);**已接通**(catalog_sync 47 店全量验证;token/sheet_id 在 .env);列序登记在 registry ONLINE_PRODUCTS_SHEET;**只写在架行**(缺席商品不进表,2026-08-07 定稿),last_seen_at/missing_since 两列不投影(追踪在 PG + 事件账本)。**2026-09-02 加第 17 列(Q)`source_key`**(表头即此英文串,与既有 16 列同风格;人读名叫「来源码」= `catalog.listing_sources.source_key`,amz=ASIN、match=匹配 GTIN,LEFT JOIN 取、未登记行空)。⚠ 程序**不扩列**(sheet_overwrite 只 ensure_rows),所有者须先把该工作表列数扩到 ≥17 再放行 catalog_sync,否则撞 90204 并拖累 product_chain 整链。 |
 | 订单中心六表(订单中心V1 应用) | 主订单/销售/采购/售后/绩效/对账 | Postgres(orders schema)权威,**2026-08-16 起四条业务链各自跑完就写自己那张**(order_sync→销售 + 主订单/采购补键;returns_sync→售后;perf_problems→绩效;settlement_sync→对账),投影逻辑住在 services/order_center(BY_WORKFLOW);order_center_push 退化成手动补推 / `-p reconcile=1` 全量对账入口,**不进调度**。主订单表/采购信息为人工域,程序只补键 | 代码已对齐用户既有表头(2026-08-06);**app_token/table_id 已在 .env 生效**(2026-08-10 审核列生产回写 151 行为证);遗留待办:售后表补「唯一键」字段 |
-| 上架表(新) | listing 主驱动表(L2) | 运营只填 **A=店铺 B=ASIN**(2026-08-16 所有者对调了这两列;此前 A=ASIN B=店铺),运营还填 **C=SKU**;**D~I 归审核链**(`product_audit -p from_sheet=1` 投影:D 标题 E PT F 审核结果 G 类别 H 具体内容 I 日期;2026-09-02 B1 起 G = `products.audit_reason` 的**类别枚举**(pass/pending 留空)、H = 新列 `products.audit_detail`,**没有 audit_detail 的存量老行**按命中规则渲染成人话 —— 不兜底的话老行会一夜变空白),J~S 机器列由 list_new/反哺器写,**T=登记日期 U=查询编码 运营域脚本不写**;21 列 A~U(2026-09-02 所有者改表头:C 插入 SKU、「审核理由」拆成 类别/具体内容、尾部四列 真实标题/PT/UPC/UPC匹配 换成 登记日期/查询编码;此前较旧 26 列砍 状态跟踪/最近跟踪日期)。⚠ 列序唯一出处 = `registry.resources.LISTING_SHEET.columns`,读取按字段名不按字母 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_LISTING_SHEET_ID |
-| 跟卖表(新) | match_listing 驱动表(替代旧 xlsx 输入,单路飞书读) | 运营填 A=UPC C=售价 D=重量 E=店铺;脚本填 B=SKU F=跟卖状态 G=匹配GTIN H=上架时间 I=feedId;J/K 由 feed_poll 反哺器回填 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_MATCH_SHEET_ID |
+| 上架表(新) | listing 主驱动表(L2) | **表头 2026-09-02 由所有者第二次重排**,现 21 列 A~U:店铺 / ASIN / **SKU** / walmart上架标题 / walmart_product_type / 审核结果 / **类别** / **具体内容** / 审核日期 / amz价格 / 库存 / walmart价格 / 是否上架 / 上架feedid / 上架日期 / 未上架理由 / 上架结果 / 报错 / feed查询日期 / **登记日期** / **查询编码**(旧尾部 真实标题/真实PT/真实UPC/UPC是否一致 四列已删)。运营填 店铺/ASIN;**审核五列归审核链**(`product_audit -p from_sheet=1` 投影 标题/PT/审核结果/具体内容/审核日期):2026-09-02 B1 起「类别」= `products.audit_reason` 的**类别枚举**(pass/pending 留空)、「具体内容」= 新列 `products.audit_detail`,**没有 audit_detail 的存量老行**按命中规则渲染成人话 —— 不兜底的话老行会一夜变空白;其余机器列由 list_new/反哺器写;**「登记日期」「查询编码」是人工列,程序永不读写**;**SKU 列**(2026-09 SKU 改造)存量行为空 ⇒ 全链回落 ASIN;**批次 2 起由 list_new 提交时强制回写 12 位不透明真码**(submitted / failed / unknown 三种结局都写,与 是否上架/feedid 同一次落地 —— 分两次写、中间崩掉就留下「已提交但无码」的行,而回执反哺器正是靠 SKU 找行)。清列重上(sku_locked_heal)**不清 SKU 列**:码的寿命由登记簿 `abandoned_at` 说了算,清列不是弃码点。⚠ **读写一律按表头名定位列**(`services.listing_sheet.layout()` 每进程读一次表头行,对着 `registry.resources.LISTING_SHEET.headers` 认列)—— 所有者以后再挪列顺序,代码一行都不用改;表头缺列/重名则 fail-closed 抛错拒绝读写(宁可不跑也不写错列),多出的列只告警 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_LISTING_SHEET_ID |
+| 跟卖表(新) | match_listing 驱动表(替代旧 xlsx 输入,单路飞书读) | 运营填 A=UPC C=售价 D=重量 E=店铺;脚本填 B=SKU(**2026-09-02 起:B 列人工号仍优先,留空的行由 `sku_codec.mint` 抽 12 位不透明码;旧的 PHUMWMT+日期+序号已停用**)F=跟卖状态 G=匹配GTIN H=上架时间 I=feedId;J/K 由 feed_poll 反哺器回填 | **电子表格**:「在线产品总表」内工作表(所有者建 2026-08-07);sheet_id 填 .env FEISHU_MATCH_SHEET_ID |
 | 沃尔玛类目表 | 风控·类目准入(禁售/中国卖家可做) | risk_sync 每日镜像入 PG(catalog.risk_product_types,只增改不删);上架否决闸读库不读表;**表格随时会停用**(所有者 2026-08-07),停用后 PG 唯一权威 | **wiki 承载电子表格**(api/feishu 自动解析节点 token);.env FEISHU_RISK_PT_WIKI_TOKEN / FEISHU_RISK_PT_SHEET_ID;10 列 A~J |
 | 黑名单品牌总表 | 风控·品牌黑名单**总清单**(各渠道由所有者人工归拢;2026-08-11 换新表,旧「禁止品牌收集」退役) | **飞书→PG**:risk_sync 镜像入 catalog.brand_blacklist(casefold 键,upsert 不碰 pushed_at);否决闸读库不读表 | **wiki 承载电子表格**;.env FEISHU_BRAND_WIKI_TOKEN / FEISHU_BRAND_SHEET_ID;列 品牌名/来源/入库日期(/SKU 可选) |
 | 黑名单ASIN | 永久禁止类 ASIN(B/C/E/F/G/K)投影 | **PG→飞书**:blacklist_push **整表重写**(2026-08-17 所有者定稿「这个映射是从数据库映射上去的,不许管飞书里面的内容,直接清空覆盖」;骤缩超 2% 停手,确认要缩加 `-p allow_shrink=1`)。库(catalog.asin_blacklist)是权威,`pushed_at` 只表示「这行投影过了」 | **wiki 承载电子表格**(所有者建 2026-08-11);.env FEISHU_BLACKLIST_WIKI_TOKEN / FEISHU_ASIN_BLACKLIST_SHEET_ID;3 列 黑名单ASIN/来源/日期 |
@@ -95,6 +95,8 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 4. **类型要求**(与现有列核对):日期类字段(下单时间/状态更新时间/预计发货/
    预计送达/退货创建/退货截止/结算日期/拉取时间)须为**日期**类型;金额/数量/
    佣金率为**数字**;keep-it单、计入绩效为**复选框**;其余文本。类型不符会写入报错。
+   新增的**「来源码」列(销售/售后两表)为文本**类型。建列前用 `list_fields` 确认
+   表里没有同名人工列——有的话程序一登记就开始覆盖它。
 5. **首跑前清空旧数据行**:v1 草稿留下的旧行键格式不同(含店铺哈希),
    程序不删行,旧行会变成永远不更新的死行——复制/沿用旧表请先清空数据。
 
@@ -102,11 +104,18 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
 
 - **主订单表 / 采购信息**:只有 `order_line_id`(缺行补建,只写这一列;
   既有行永不更新/删除)。
-- **销售订单**:order_line_id、下单时间、店铺、采购订单号、行号、SKU、商品名称、
+- **销售订单**:order_line_id、下单时间、店铺、采购订单号、行号、SKU、来源码、商品名称、
   数量、销售状态、审核状态、状态更新时间、预计发货时间、预计送达时间、商品金额、
   运费金额、取消原因、行内退款金额、退款备注、承运商、物流单号、物流链接、
   收件人姓名、电话、地址1、地址2、城市、州、邮编、国家、拉取时间(=order_sync
   最后写库时间)。**不碰**:采购数量、币种、主订单表、父记录。
+  - **「来源码」是 2026-09-02 加的**(值 = `orders.order_lines.asin`,登记簿反查后
+    新旧码都有值):程序载荷与 registry 常量在所有者建完列**之后**才合
+    (sku_workplan batch_0b D-0b-4),所以不存在「表里没列、程序每轮刷 WARNING」的
+    窗口期。合并后**第一次 push 会把 90 天窗口全量重推一遍**(行指纹含全部程序列,
+    加列 ⇒ 指纹全变),这是**预告不是故障**,第二次跑就回到「跳过 N」。建议挑非高峰
+    时段建列 —— push 挂在 order_sync 链尾,那一轮会明显变慢(但不会失败,
+    push_after 永不抛错)。
 - **销售订单(审核列)**:同一张表的第二个登记条目 `ORDER_SALES_AUDIT`,
   由 **order_audit** 独占写:脚本审核、亚马逊单价、库存数量、配送方式、配送时长、
   卖家店铺名、产品截图、采购方、限价、**标题相似度**。**不碰**:建议采购日期
@@ -125,9 +134,12 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
     「审核状态」若是**单选**字段,选项须含「✓ 通过 / 建议拒绝 / 待人工」三值,
     否则写入报错(见 services/order_audit.py 的结论常量)。
 - **售后订单**:唯一键、order_line_id、下单时间、店铺、RMA号、客户订单ID、
-  采购订单号、行号、SKU、售后状态、退款状态、退货方式、退款方式、总退款金额、
+  采购订单号、行号、SKU、来源码、售后状态、退款状态、退货方式、退款方式、总退款金额、
   退货原因、退货描述、退货截止日期、退货创建时间、状态更新时间、客户姓名、
   客户邮箱、数量、已退款数量、承运商、物流单号、keep-it单。**不碰**:主订单表、主订单表 2。
+  - **「来源码」从 order_lines 借**(`return_lines` 无此列,SQL 已 LEFT JOIN 订单行,
+    顺手 `SELECT l.asin`;2026-09-02 加):订单行滚出窗口或孤儿退货行为空 ——
+    与该表 `下单时间` 同一口径。首次合并后同样会全量重推一遍 90 天窗口(同上)。
 - **绩效订单**:perf_key、order_line_id(多行订单无法定位时为空)、下单时间、店铺、
   采购订单号、指标类型(emoji 展示名,日报同契约)、计入绩效、**问题描述**、
   绩效状态(影响中=仍出现在最近一期报表/已滚出窗口)、统计周期

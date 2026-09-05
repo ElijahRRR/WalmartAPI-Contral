@@ -74,12 +74,24 @@ logger = logging.getLogger("workflows.problem_scan")
 #     『stage status until you go live』一般只在店铺非 ACTIVE 时出现(那时
 #     全店皆然),而店铺闸(_SQL_STATUS 非 ACTIVE 整店跳过)已经挡住那种店;
 #     ACTIVE 店里的 Stage 行 = 翻出来的老档(2026-08-28 事件实证),照删。
+#   · **在途改码的旧码不进扫描面**(SKU 改造批次 3,O4):SkuUpdate 生效有
+#     15 分钟到 4 小时的窗口(官方),窗口内旧码可能被观测成非 PUBLISHED 且
+#     missing_since 仍为 NULL —— 正好落进上面这三条,当轮就被建议 DELETE_ITEM,
+#     而 DELETE 不可逆:一次**成功**的改码会被自己的自动链当场删掉。改码期间
+#     的非 PUBLISHED 是过程态不是问题商品,判不准就判活。这道闸必须钉在扫描面
+#     这一层,不许靠"先跑谁后跑谁"(conventions §三:调度顺序不许承载判据)。
+#     登记簿那一跳走 NOT EXISTS 而不是 JOIN:扫描面的行数不许被它改变。
+#     改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,结果集逐行不变。
+#   ⚠ 三列的**位置顺序不许动**(_load_state 按位置解包成 store/sku/reasons)。
 _SQL_ITEMS = """
-SELECT store, sku, unpublished_reasons
-FROM catalog.walmart_items
-WHERE published_status IS NOT NULL
-  AND published_status <> 'PUBLISHED'
-  AND missing_since IS NULL
+SELECT w.store, w.sku, w.unpublished_reasons
+FROM catalog.walmart_items w
+WHERE w.published_status IS NOT NULL
+  AND w.published_status <> 'PUBLISHED'
+  AND w.missing_since IS NULL
+  AND NOT EXISTS (SELECT 1 FROM catalog.listing_sources ls
+                  WHERE ls.store = w.store AND ls.sku = w.sku
+                    AND ls.replaced_by IS NOT NULL)
 """
 # 防重口径(所有者拍板 2026-08-11,替代旧系统的"同一自然日"——那是一天
 # 跑 4 次的产物,现按日执行):
@@ -98,16 +110,33 @@ WHERE published_status IS NOT NULL
 # 里面有多少是等复审的新品(生产实遇 B018BDZQUQ 排查半天)。
 # MP_MAINTENANCE 不再列处置类(2026-08-28 反补退役):本链不再发它,在途的
 # MP_MAINTENANCE 都是维护链的标题/字段操作,按「上架/维护在途」分档报
+# ⚠ 改码后新码继承旧码的在途 feed(SKU 改造批次 3,O6):旧码上还没落定的
+# 上架/维护/处置 feed 指着的是**同一个 item**,新码在 ops.feed_items 里没有
+# 任何历史,不继承就成了"从没提交过任何东西"⇒ 在途防重对它整个失效
+# (而本 SQL 的在途口径**有意不分 feed 类型**,见上)。别名一律经
+# catalog.sku_aliases(代际继承的唯一出处),只继承一跳;视图在改码前是空集,
+# UNION ALL 加空集 ⇒ 结果集逐行不变。
 _DISPOSAL_FEEDS = ("DELETE_ITEM", "RETIRE_ITEM")
 _SQL_INFLIGHT = """
-SELECT f.store, f.sku,
-       bool_or(f.feed_type = ANY(%(disposal)s::text[])) AS disposal
-FROM ops.feed_items f
-JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
-WHERE (f.status = 'submitted'
-       AND f.submitted_at > now() - interval '48 hours')
-   OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
-GROUP BY f.store, f.sku
+SELECT store, sku, bool_or(disposal) AS disposal FROM (
+    SELECT f.store, f.sku,
+           (f.feed_type = ANY(%(disposal)s::text[])) AS disposal
+    FROM ops.feed_items f
+    JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
+    WHERE (f.status = 'submitted'
+           AND f.submitted_at > now() - interval '48 hours')
+       OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
+    UNION ALL
+    SELECT a.store, a.sku,
+           (f.feed_type = ANY(%(disposal)s::text[])) AS disposal
+    FROM catalog.sku_aliases a
+    JOIN ops.feed_items f ON f.store = a.store AND f.sku = a.alias_sku
+    JOIN catalog.walmart_items w ON w.store = a.store AND w.sku = a.sku
+    WHERE (f.status = 'submitted'
+           AND f.submitted_at > now() - interval '48 hours')
+       OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
+) t
+GROUP BY store, sku
 """
 # WFS 件删不掉(2026-08-24,多仓批次 0)。沃尔玛回执原话:
 # "The item you are trying to delete is WFS eligible. At this time, you can not
@@ -120,25 +149,57 @@ GROUP BY f.store, f.sku
 # ⚠ **拦掉不等于改判 retire**:RETIRE_ITEM 对 WFS 件行不行官方没有明文
 # (docs/multi_node_plan.md §2.4 的同款空白),按本仓纪律不许按推断编码 ——
 # 这里只跳过并**响亮报数**,把"要不要转出 WFS"交回给人。
+# ⚠ 下面三段判据 + 上面的在途防重,都是按 (store, sku) 读历史的 —— 改码之后
+# 新码在 product_events / ops.feed_items 里**一条历史都没有**,四段会同时失明。
+# 四段一律经 catalog.sku_aliases 沿改码链继承**一跳**(前提:旧码改码后
+# 立即弃码、永不再改码;要连改两次得把视图改成递归 CTE,见 schema.sql 的视图注释)。
+# 为什么不在这里各写一遍登记簿指针的 JOIN:"这个新码继承那个
+# 旧码的历史"是**一条判据**,判据只能有一处出生(conventions §六),写四遍就是
+# 四份会各自漂移的实现,而漂了不报错、只是某一处从此看不见历史。
+# ⚠ 占位符改成命名式:UNION 之后同一个值要用两次,`%s` 位置参数给不了两遍。
 _WFS_BLOCKED_CODE = "ERR_EXT_DATA_0101218"
 _SQL_WFS_BLOCKED = """
 SELECT store, sku FROM (
-    SELECT DISTINCT ON (store, sku) store, sku, error_code
-    FROM ops.feed_items
-    WHERE feed_type = 'DELETE_ITEM' AND status IN ('failed', 'missing')
-    ORDER BY store, sku, submitted_at DESC
-) t WHERE error_code = %s
+    SELECT DISTINCT ON (store, sku) store, sku, error_code FROM (
+        SELECT f.store, f.sku, f.error_code, f.submitted_at
+        FROM ops.feed_items f
+        WHERE f.feed_type = 'DELETE_ITEM' AND f.status IN ('failed', 'missing')
+        UNION ALL
+        SELECT a.store, a.sku, f.error_code, f.submitted_at
+        FROM catalog.sku_aliases a
+        JOIN ops.feed_items f
+          ON f.store = a.store AND f.sku = a.alias_sku
+        WHERE f.feed_type = 'DELETE_ITEM' AND f.status IN ('failed', 'missing')
+    ) u ORDER BY store, sku, submitted_at DESC
+) t WHERE error_code = %(code)s::text
 """
 _SQL_LAST_CAT = """
-SELECT DISTINCT ON (store, sku) store, sku, detail->>'category'
-FROM catalog.product_events WHERE event = %s
+SELECT DISTINCT ON (store, sku) store, sku, cat FROM (
+    SELECT e.store, e.sku, e.detail->>'category' AS cat, e.occurred_at
+    FROM catalog.product_events e WHERE e.event = %(ev)s::text
+    UNION ALL
+    SELECT a.store, a.sku, e.detail->>'category', e.occurred_at
+    FROM catalog.sku_aliases a
+    JOIN catalog.product_events e
+      ON e.store = a.store AND e.sku = a.alias_sku
+    WHERE e.event = %(ev)s::text
+) t
 ORDER BY store, sku, occurred_at DESC
 """
 _SQL_STUBBORN = """
-SELECT DISTINCT ON (store, sku) store, sku, event
-FROM catalog.product_events
-WHERE event IN ('delete_verified', 'delete_not_effective',
-                'item_appeared', 'item_reappeared')
+SELECT DISTINCT ON (store, sku) store, sku, event FROM (
+    SELECT e.store, e.sku, e.event, e.occurred_at
+    FROM catalog.product_events e
+    WHERE e.event IN ('delete_verified', 'delete_not_effective',
+                      'item_appeared', 'item_reappeared')
+    UNION ALL
+    SELECT a.store, a.sku, e.event, e.occurred_at
+    FROM catalog.sku_aliases a
+    JOIN catalog.product_events e
+      ON e.store = a.store AND e.sku = a.alias_sku
+    WHERE e.event IN ('delete_verified', 'delete_not_effective',
+                      'item_appeared', 'item_reappeared')
+) t
 ORDER BY store, sku, occurred_at DESC
 """
 # 顽固标记绑定当前上架代际(2026-08-07 审查修正):最新事件若是
@@ -178,7 +239,7 @@ def _load_state():
         rows_if = cur.fetchall()
         inflight = {(st, sk) for st, sk, _ in rows_if}
         inflight_disposal = {(st, sk) for st, sk, d in rows_if if d}
-        cur.execute(_SQL_LAST_CAT, (product_events.PROBLEM_CATEGORIZED,))
+        cur.execute(_SQL_LAST_CAT, {"ev": product_events.PROBLEM_CATEGORIZED})
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
         cur.execute(_SQL_STUBBORN)
         stubborn = {(st, k) for st, k, ev in cur.fetchall()
@@ -186,7 +247,7 @@ def _load_state():
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
-        cur.execute(_SQL_WFS_BLOCKED, (_WFS_BLOCKED_CODE,))
+        cur.execute(_SQL_WFS_BLOCKED, {"code": _WFS_BLOCKED_CODE})
         wfs_blocked = {(st, k) for st, k in cur.fetchall()}
     return (items, inflight, inflight_disposal, last_cat,
             inactive, stubborn, wfs_blocked)

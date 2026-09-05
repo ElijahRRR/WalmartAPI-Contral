@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 
 from api import _client, feishu, inventory as inv_api, items, reports
 from registry import db, resources
-from services import notify_fmt as nf, product_events, store_limits, \
-    store_retry, stores as stores_svc, walmart_catalog
+from services import notify_fmt as nf, product_events, sku_codec, \
+    store_limits, store_retry, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -226,10 +226,22 @@ def run(params: dict) -> str:
 
     if results:
         # 删除核验(事件账本):回执成功的删除,以本轮观测定生效/未生效
+        # ⚠ **弃码点 1 就在这里,只在 delete_verified 落地,不在删除回执成功
+        #   那一刻**:「回执成功但后台没删」是所有者实证过的故障模式
+        #   (delete_not_effective),按回执弃码 = 下一轮拿新码新 UPC 去上一个
+        #   还活着的 item = 同店重复 listing,沃尔玛不会替你拦。
+        # ⚠ 弃码与 delete_verified 事件**同一个连接同一事务**:分两个事务会留下
+        #   "事件记了、码没弃"的半截状态,而 verify_deletions 的 open_ok CTE 正是
+        #   靠 delete_verified 事件封口 —— 下一轮不会再产出这一对,那个码就永远
+        #   弃不掉了。
         with db.pg_conn() as conn:
-            verified, not_eff = product_events.verify_deletions(conn)
+            verified, not_eff, gone_pairs = product_events.verify_deletions(conn)
+            n_ab = sum(sku_codec.abandon(conn, s, k,
+                                         sku_codec.ABANDON_DELETE_VERIFIED)
+                       for s, k in gone_pairs)
         if verified or not_eff:
             lines.append(f"删除核验:生效 {verified}"
+                         + (f",弃码 {n_ab}" if n_ab else "")
                          + (f",⚠ 未生效 {not_eff}(回执成功但仍在架,查日志)"
                             if not_eff else ""))
 

@@ -351,7 +351,10 @@ def test_sku_is_mapped_through_sku_asin_never_by_bare_equality():
     assert st["coded"] == 3 and st["no_asin"] == 0
     # 规则出处只有一处:SQL 里没有任何 sku↔asin 的裸等值
     src = _source()
-    assert "sku_asin.resolve_skus(" in src
+    # 0a 之后身份反查唯一入口是 resolve_pairs(登记簿优先、形态兜底);
+    # 这里没有店铺,传 (None, sku) 走形态腿 —— 缺口见调用点的 ⚠ 注
+    assert "sku_asin.resolve_pairs(" in src
+    assert "resolve_skus" not in src          # 退役的老入口不许复活
     assert "w.sku = p.asin" not in src and "sku = asin" not in src
 
 

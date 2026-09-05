@@ -527,7 +527,15 @@ def _negatives(conn, opts: Opts, policy_names: list) -> tuple[list, dict]:
             continue
         st["coded"] += 1
         keep.append((sku, lab, res.code, (text or "")[:200]))
-    mapping, _ = sku_asin.resolve_skus(conn, [k[0] for k in keep])
+    # ⚠ 身份反查在 0a 之后换成了 `resolve_pairs`(登记簿优先、形态兜底),
+    #   入参是 **(店铺, sku) 对**;这三处取数按 asin 级聚合、SQL 里没带店铺,
+    #   故传 `(None, sku)` —— 登记簿主键是 (store, sku),store 为空查不到,
+    #   这批对直接走形态腿,**与 0a 之前逐行同结果**。
+    #   已知缺口(记在案):新码是 12 位不透明码,形态腿提不出 ⇒ 一旦存量改码
+    #   落地,这里会漏掉那批行(反例池少了它们 ⇒ 它们可能被当成正例抽中)。
+    #   补法是让 `_REJECTED_SKU_SQL` / `_POS_SQL` 一并带出 store 再走登记簿腿。
+    mapping, _ = sku_asin.resolve_pairs(conn, [(None, k[0]) for k in keep])
+    mapping = {sku: a for (_st, sku), a in mapping.items()}
     st["no_asin"] = sum(1 for k in keep if k[0] not in mapping)
     have = _with_product(conn, [mapping[k[0]] for k in keep if k[0] in mapping])
     out: list = []
@@ -571,7 +579,8 @@ def rejected_asins(conn) -> set:
     """
     rows = _rows(conn, _REJECTED_SKU_SQL, {})
     skus = [r[0] for r in rows if r[0]]
-    mapping, _ = sku_asin.resolve_skus(conn, skus)
+    mapping, _ = sku_asin.resolve_pairs(conn, [(None, s) for s in skus])
+    mapping = {sku: a for (_st, sku), a in mapping.items()}   # 缺口见 _pairs 注
     ever = {r[0] for r in _rows(conn, _EVER_FLAGGED_SQL, {}) if r[0]}
     return set(mapping.values()) | ever
 
@@ -598,7 +607,8 @@ def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, d
     total, oldest = _rows(conn, _POS_POOL_TOTAL_SQL, {})[0]
     skus = [r[0] for r in raw]
     ages = [r[1] for r in raw if r[1] is not None]
-    mapping, _ = sku_asin.resolve_skus(conn, skus)
+    mapping, _ = sku_asin.resolve_pairs(conn, [(None, s) for s in skus])
+    mapping = {sku: a for (_st, sku), a in mapping.items()}   # 缺口见 _pairs 注
     cand = set(mapping.values())
     st = {"scanned": len(raw), "pool_cap": pool,
           "min_days": opts.pos_days, "clean_total": total,

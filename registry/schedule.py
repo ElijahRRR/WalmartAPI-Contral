@@ -23,8 +23,22 @@ runner = 谁来按这个点触发(所有者定稿 2026-08-16,**推翻了 v5 的"
 
 不在表里的一律**手动**:跟卖(match_listing)、分配链
 (alloc_* / claim_audit / alloc_backfill)、补采(scrape_missing / brand_scrape)、
-自愈(sku_locked_heal)、一次性迁移与体检
+自愈(sku_locked_heal)、**存量改码(sku_migrate)**、
+**来源码人工归类(sources_reclassify)**、一次性迁移与体检
 (各 *_import / catmap_* / catalog_health / variant_probe / audit_why / …)。
+⚠ `sources_reclassify`(所有者 2026-09-03)**永不进调度**:它导出清单等人逐行
+认出"这一串里的源头码是哪一段"再读回,机器提议里「标准 ASIN + 尾巴」那一档
+只够猜(guess),没有人认就没有输入。而它写下的每一行都把一个商品**交还自动
+链**(此后被改价/清库存/删除管到)—— 这种判断不许由秒表触发。
+与它同源的 `sources_backfill`(纯格式回填,判得准的那一半)常驻 product_chain,
+两者分工:回填补的是"有没有登记行",归类补的是"登记行认不认得出出身"。
+⚠ `sku_migrate`(SKU 改造批次 3)**永不进调度**,两条理由各自独立成立:
+  ① 它是 DANGEROUS 的一次性迁移,按批发、按观测定案,每一批之间要人看摘要
+     (节奏 1 → 10 → 一店 → 全店,闸在 `workflows/sku_migrate._stage_cap`);
+     排进调度 = 每天自动改一批码,而"同店双挂"这类后果只有人能收。
+  ② 它与 13:00 的 `product_chain` 抢**同一个 MP_MAINTENANCE 桶**(8/hour,
+     维护链的反补也吃它)—— 两边并跑的表现是当天维护/反补发不出去,而摘要
+     只会说"配额不足",看不出是谁吃的。手动跑请避开 13:00 那一轮。
 ⚠ **审核与上架 2026-08-17 起进表**(所有者定稿):`audit_sheet` 18:10、
 `list_new` 20:00。此前它们在这份"手动"清单里,是因为上架域还没做生产验收;
 验收通过(变体组三条真发上去了)之后排进调度。`match_listing`(跟卖)仍手动

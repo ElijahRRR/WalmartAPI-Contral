@@ -42,7 +42,8 @@ class _Cur:
         elif "refunded_qty" in sql:
             self._r = [("B0AAAA0001", 100, 12)]
         elif "FROM catalog.walmart_items" in sql:
-            self._r = [("A085", "B0AAAA0001")]
+            # (store, sku, source_key):第三列是登记簿 amz 身份键(0a-23)
+            self._r = [("A085", "B0AAAA0001", "B0AAAA0001")]
         elif "FROM catalog.claims" in sql:
             self._r = [("B0AAAA0001", "A085")]
         elif "product_risk" in sql:
@@ -185,6 +186,39 @@ def test_csv_carries_price_sales_revenue_and_both_owner_columns(monkeypatch, tmp
     assert val[f"近{w}天销售额(毛额)"] == "1080.0"
     assert val["历史总销量(件)"] == "900" and val["历史总销售额(毛额)"] == "8100.0"
     assert val["占用店"] == "A085" and val["在线店"] == "A085"
+
+
+def test_online_stores_read_the_registry_key(monkeypatch, tmp_path):
+    """「在线店」按**身份键**归集:登记簿优先,模式提取兜存量(0a-23)。
+
+    裸提取在切码后会让这一列恒空 —— 「占用在 A、货在 B」这类信息全被抹掉,
+    而报告照样出得来,一个字的报错都没有。
+    """
+    cur = _Cur()
+    real_execute = cur.execute
+
+    def _execute(sql, args=None):
+        real_execute(sql, args)
+        if "FROM catalog.walmart_items" in sql:
+            # 不透明码 + 登记簿键 ⇒ 仍归到 B0AAAA0001 这个 ASIN 上
+            cur._r = [("A107", "AZZZZ234567", "B0AAAA0001")]
+
+    cur.execute = _execute
+    _wire(monkeypatch, tmp_path, cur=cur)
+    wf.run({})
+    txt = (tmp_path / "alloc_产品分.csv").read_text(encoding="utf-8-sig")
+    head, *body = txt.splitlines()
+    val = dict(zip(head.split(","),
+                   next(ln for ln in body
+                        if ln.startswith("B0AAAA0001")).split(",")))
+    assert val["在线店"] == "A107"
+
+
+def test_online_sql_reads_the_registry_key():
+    """SQL 文本钉住身份键那一跳:LEFT JOIN 登记簿 amz 行、取 source_key。"""
+    assert "ls.source_key" in wf._SQL_ONLINE_SKU
+    assert "ls.source_type = 'amz'" in wf._SQL_ONLINE_SKU
+    assert "LEFT JOIN catalog.listing_sources" in wf._SQL_ONLINE_SKU
 
 
 def test_landed_price_is_price_plus_shipping(monkeypatch, tmp_path):

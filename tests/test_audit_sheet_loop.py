@@ -4,21 +4,27 @@
   ① 审核「直接读取上架表的 A、E 列(为空就审核),然后回填 C、D、E、F、G」;
   ② 上架「以数据库的数据为准 —— 要上架就肯定要过审核,读取速度也更快」。
 
-这两句话合起来是一条**单向环**:表 B 列进审核 → 结论落 PG → 投影回表 D~I(给人看)
+⚠ ①里的字母是**说这句话那天(2026-08-16)的位置**,不是契约:所有者
+2026-09-02 重排过表头(C 插 SKU、审核理由拆成「类别」+「具体内容」),
+列一律按**表头名**定位(`listing_sheet.layout()`),所以下面一律写列名。
+
+这两句话合起来是一条**单向环**:表「ASIN」列进审核 → 结论落 PG → 投影回表
+审核六列(标题/PT/审核结果/类别/具体内容/审核日期,给人看)
 → 上架读 **PG**(不读投影)。本文件钉住的是这条环上"错了也不报错"的接缝:
 
-  · E 列写的值必须是 `list_new` 之外的人能看懂的中文态,而 **PG 里是英文态** ——
-    两套词表错配的表现是"审过了但一行也上不去",没有任何报错;
-  · 库里没结论的行 **E 列必须留空**(不是写 pending)—— 写了人就以为审过了,
-    而且它下一轮不会被重领;
-  · 上架的审核闸读 PG:表 E 列被人手改成 pass **不该**让它上架;
-  · 类目同样以库为准:表 D 列被手改成另一个 PT,不该按手改的那个上架
+  · 「审核结果」写的值必须是 `list_new` 之外的人能看懂的中文态,而 **PG 里是
+    英文态** —— 两套词表错配的表现是"审过了但一行也上不去",没有任何报错;
+  · 库里没结论的行 **「审核结果」必须留空**(不是写 pending)—— 写了人就以为
+    审过了,而且它下一轮不会被重领;
+  · 上架的审核闸读 PG:表「审核结果」被人手改成 pass **不该**让它上架;
+  · 类目同样以库为准:表「PT」列被手改成另一个 PT,不该按手改的那个上架
     (那等于绕过审核换类目)。
 
 2026-08-17 补两条,都是同一种病(**这行从此没人再管,而且不报错**):
-  · **E=pending 也要被重新领取** —— pending 是中间态,写进 E 就退出通道了;
-  · **库里没数据的行要推去采集、原因写 F 而不是 E** —— 原先摘要只说
-    "先跑 product_ingest",而那是死路(ingest 只摄采回来的东西)。
+  · **「审核结果」=pending 也要被重新领取** —— pending 是中间态,写进那一格
+    就退出通道了;
+  · **库里没数据的行要推去采集、原因写「具体内容」而不是「审核结果」** ——
+    原先摘要只说"先跑 product_ingest",而那是死路(ingest 只摄采回来的东西)。
 """
 
 import datetime as dt
@@ -34,7 +40,7 @@ from tests.test_list_new import _sheet_row
 
 # ── ① 领任务:A 有值且 E 为空 ─────────────────────────────────────────────
 
-def test_audit_targets_takes_blank_e_only(monkeypatch):
+def test_audit_targets_takes_blank_audit_result_only(monkeypatch):
     rows = [
         _sheet_row(2, audit_result=""),            # 待审
         _sheet_row(3, audit_result="   "),         # 空白也算空(表格里常见)
@@ -49,17 +55,18 @@ def test_audit_targets_takes_blank_e_only(monkeypatch):
     assert got[0]["asin"] and got[0]["store"] == "T1"
 
 
-@pytest.fixture(autouse=True)
-def _header_matches_registry(monkeypatch):
-    """表头核验默认通过 —— 漂移的场景由 test_header_drift_stops_every_read 单独钉。"""
-    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
-                        lambda s, r: [list(listing_sheet._header())])
+# ⚠ 表头核验默认通过,不需要本文件自己打桩:conftest 的 autouse
+# `_listing_sheet_layout_matches_the_registry` 已经把进程内列布局塞成
+# 「表头顺序 = registry 登记顺序」。表头漂移的场景由
+# `test_header_drift_stops_every_read` 自己清缓存重打桩。
 
 
-def test_audit_targets_reads_only_first_six_columns(monkeypatch):
-    """领任务只读 A..F(store/asin/SKU/标题/PT/审核结果),不拉 G 之后的类别/
-    回显长文本——2026-08-19 生产实证:21 列全量读撞飞书单响应 10MB 上限
-    (90221),audit_sheet 整链失败。行方向分块归 api 层。"""
+def test_audit_targets_reads_only_up_to_the_audit_result_column(monkeypatch):
+    """领任务只读到「审核结果」那一列(店铺/ASIN/SKU/标题/PT/审核结果),
+    不拉后面的类别/具体内容/回显长文本——2026-08-19 生产实证:21 列全量读撞
+    飞书单响应 10MB 上限(90221),audit_sheet 整链失败。行方向分块归 api 层。
+    末列字母由 layout() 按表头名算(今天是 F),所有者挪列后这个断言会跟着动,
+    值不会串。"""
     asked = []
     monkeypatch.setattr(listing_sheet.feishu, "sheet_row_count", lambda s: 3)
     monkeypatch.setattr(
@@ -69,7 +76,9 @@ def test_audit_targets_reads_only_first_six_columns(monkeypatch):
             [(2, ["T1", "B0AAAAAAA1", "sku", "t", "pt", ""]),
              (3, ["T1", "B0AAAAAAA2", "sku", "t", "pt", "pass"])])[1])
     got = listing_sheet.audit_targets()
-    assert asked == [("A", "F", 2, 3)]        # 只读 A~F 六列(到审核结果为止),行区间对
+    # 六列(店铺/ASIN/SKU/标题/PT/审核结果),末列由表头名算出来的今天位置
+    assert asked == [("A", listing_sheet.layout()["audit_result"], 2, 3)]
+    assert asked == [("A", "F", 2, 3)]        # 只读到「审核结果」列,行区间对
     assert [r["asin"] for r in got] == ["B0AAAAAAA1"]
 
 
@@ -94,7 +103,7 @@ def test_pending_in_e_keeps_getting_reclaimed(monkeypatch):
 
 
 def test_audit_result_cn_matches_what_list_new_reads():
-    """E 列词表与 PG 词表是两套 —— 这条钉住它们的对应关系。
+    """「审核结果」词表与 PG 词表是两套 —— 这条钉住它们的对应关系。
 
     `AUDIT_RESULT_CN` 把 PG 的 audit_status 翻成表里的写法;
     `list_new.AUDIT_OK` 判的是 **PG 的写法**。两边一起改才对。
@@ -140,10 +149,11 @@ class _Conn:
         return _Cur(self._rows, self._hits)
 
 
-def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
-    """三段输出分列(2026-09-02 B1):F 判定结果 / G 类别 / H 具体内容。
+def test_project_to_sheet_writes_the_audit_columns_and_leaves_absent_blank(
+        monkeypatch):
+    """三段输出分列(2026-09-02 B1):「审核结果」判定结果 /「类别」/「具体内容」。
 
-    H 取 `products.audit_detail`;**老行(还没有这一列值的)按命中规则渲染**
+    「具体内容」取 `products.audit_detail`;**老行(还没有这一列值的)按命中规则渲染**
     —— 不兜底的话,存量几十万行在表上会一夜变成空白,看起来像"审核把理由
     弄丢了"。老行被重审时自然写上新格式。
     """
@@ -156,7 +166,7 @@ def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
          # 老行:没有 audit_detail ⇒ 按命中规则渲染
          ("B0NO", "沃标题2", "Mugs", "rejected", "General-Use Products", at,
           None),
-         # 老行 pending:待定原因当年写在 audit_reason 里,H 照旧显示它
+         # 老行 pending:待定原因当年写在 audit_reason 里,「具体内容」照旧显示它
          ("B0PEND", "沃标题4", "Pots", "pending", "待类目判定(候选/rerank 均解不出)",
           at, None)],
         # B0NONE 在库里查不到 → 不出现在结果集
@@ -183,7 +193,7 @@ def test_project_to_sheet_writes_di_and_leaves_absent_blank(monkeypatch):
     assert by_row[7][2:5] == ["pending", "", "待类目判定(候选/rerank 均解不出)"]
     assert by_row[5] == by_row[2]
     assert "回填 5 行" in out
-    assert "1 行库里没有结论" in out and "F 列留空" in out
+    assert "1 行库里没有结论" in out and "「审核结果」留空" in out
 
 
 def test_project_failure_only_warns(monkeypatch):
@@ -196,15 +206,28 @@ def test_project_failure_only_warns(monkeypatch):
     assert "from_sheet=1" in out            # 告诉人怎么补写
 
 
-def test_write_audit_cols_stays_inside_di(monkeypatch):
-    """⚠ 只准动 D~I(2026-09-02 表头:D 标题 E PT F 结果 G 类别 H 具体内容 I 日期)。
-    越界写会覆盖 A~C 人工域、list_new 的 J~P 与反哺器的 Q~S。"""
+def test_write_audit_cols_stays_inside_the_audit_columns(monkeypatch):
+    """⚠ 只准动审核六列(标题/PT/审核结果/类别/具体内容/审核日期)。越界写会
+    盖掉 店铺/ASIN/SKU 人工域、list_new 的提交列与反哺器的回执列。
+
+    2026-09-02 三段分列之后「类别」也归本工作流写(此前它归另一条 PR,
+    这六个值那时会拆成两段、中间那格不许碰)—— 今天六列连成一段,
+    一行一个 range。⚠ **字母不是契约**:range 由 `layout()` 按表头名算出来,
+    所有者再挪列,下面那个 D7:I7 会跟着变而值绝不会串到隔壁列;真被人在中间
+    插一列时 `_row_ranges` 自动拆段,段数跟着变,值仍旧各归各位。
+    """
     sent = []
     monkeypatch.setattr(listing_sheet.feishu, "sheet_write_ranges",
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
-    n = listing_sheet.write_audit_cols([(7, ["T", "Cups", "reject", "Alcohol", "含酒精", "d"])])
-    assert n == 1 and sent[0][0] == "D7:I7"
-    assert sent[0][1] == [["T", "Cups", "reject", "Alcohol", "含酒精", "d"]]
+    n = listing_sheet.write_audit_cols(
+        [(7, ["T", "Cups", "reject", "Alcohol", "含酒精", "d"])])
+    lay = listing_sheet.layout()
+    assert n == 1
+    # 段的两头由表头名定位(今天连着 ⇒ 一段);值按顺序落在这一段里
+    assert [r for r, _ in sent] == [f"{lay['list_title']}7:{lay['audit_date']}7"]
+    assert sent[0][0] == "D7:I7"            # 今天的位置(表头没被挪过)
+    assert [v for _, m in sent for v in m[0]] == [
+        "T", "Cups", "reject", "Alcohol", "含酒精", "d"]
     # dry-run 一格不写
     sent.clear()
     assert listing_sheet.write_audit_cols([(7, ["T"] * 6)], execute=False) == 0
@@ -225,7 +248,7 @@ def test_column_shuffle_is_caught_before_anything_runs(monkeypatch):
 
 
 def test_already_audited_asins_are_not_re_judged(monkeypatch):
-    """⚠ E 列为空 ≠ 库里没结论 —— 已有结论的**直接回填,不重审**。
+    """⚠ 「审核结果」为空 ≠ 库里没结论 —— 已有结论的**直接回填,不重审**。
 
     所有者纠正 2026-08-16:「按我们的运行逻辑,不是应该直接从库里读取结果吗」。
     当成强审的后果:每轮把已审过的几万个 ASIN 重判一遍,钱白花、慢得离谱,
@@ -255,7 +278,7 @@ def test_backlog_breakdown_reaches_the_summary_not_just_the_log(monkeypatch):
     rows, asins, head = pa._claim_from_sheet(3)
     # ⚠ 不截断:整批交给候选谓词,LIMIT 只限制**真要判的**那部分
     assert len(rows) == 10 and len(asins) == 10
-    assert "E 列为空 10 个 ASIN" in head[0]
+    assert "审核结果为空 10 个 ASIN" in head[0]
     assert "已有结论 4" in head[1] and "不重审" in head[1]
     assert "待审 4" in head[1]
     assert "不在库 2" in head[1]                      # 10 - (3+1+2+2)
@@ -273,7 +296,7 @@ def test_from_sheet_reuses_the_asins_path(monkeypatch):
     ])
     where, extra = pa._pick_where({"asins": "B0A,B0B"})
     assert extra["asins"] == ["B0A", "B0B"]
-    # 一行待审都没有时直说,而且说明重审入口(清空 E 列)
+    # 一行待审都没有时直说,而且说明重审入口(清空「审核结果」)
     monkeypatch.setattr(listing_sheet, "audit_targets", lambda: [])
     out = pa.run({"from_sheet": "1"})
     assert "没有待审行" in out and "清空" in out
@@ -284,7 +307,7 @@ def test_force_drops_the_db_side_predicate_but_not_the_claim_scope(monkeypatch):
 
     所有者 2026-08-21 的原话:「对飞书上架表中需要审核的产品进行强制重审,
     不是对表格中所有的强制重审,而是**其中还没填写审核结果的**重审」。
-    所以 E 列已填结论的表行一行都不许被捞回来 —— 那是 `audit_targets()` 的事,
+    所以已填结论的表行一行都不许被捞回来 —— 那是 `audit_targets()` 的事,
     这个开关碰不到它。
     """
     plain, _ = pa._pick_where({"asins": "B0A,B0B", "from_sheet": "1"})
@@ -295,7 +318,7 @@ def test_force_drops_the_db_side_predicate_but_not_the_claim_scope(monkeypatch):
     assert "audit_status IS NULL" in plain
     assert "audit_status" not in forced
     assert forced == "p.asin = ANY(%(asins)s)"
-    # 领任务口径由 audit_targets 决定,与 force 无关 —— 它只认 E 列
+    # 领任务口径由 audit_targets 决定,与 force 无关 —— 它只认「审核结果」
     import inspect
     src = inspect.getsource(pa._claim_from_sheet)
     assert "listing_sheet.audit_targets()" in src
@@ -353,7 +376,7 @@ def test_force_summary_states_what_it_will_cost(monkeypatch):
     assert "缺省口径只判 1 个" in body
     assert "一起重判" in body and "直接回填" not in body
     # 领任务口径没变这句必须在 —— 那是所有者唯一关心的边界
-    assert "E 列已有结论的表行一行都不会被捞回来" in body
+    assert "已有结论的表行一行都不会被捞回来" in body
     # 缺省口径下则是老话术
     _, _, plain = pa._claim_from_sheet(500)
     assert "**直接回填,不重审**" in "\n".join(plain)
@@ -365,7 +388,8 @@ def _stub_gates(monkeypatch, rows):
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {}))
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set()))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
@@ -373,8 +397,8 @@ def _stub_gates(monkeypatch, rows):
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
 
 
-def test_sheet_e_column_cannot_smuggle_a_row_past_the_audit_gate(monkeypatch):
-    """表 E 列写着 pass、库里没结论 ⇒ **不上架**,而且必须在摘要里点名。
+def test_sheet_audit_result_cannot_smuggle_a_row_past_the_audit_gate(monkeypatch):
+    """表「审核结果」写着 pass、库里没结论 ⇒ **不上架**,而且必须在摘要里点名。
 
     这是改成读库之后最危险的一种沉默:表里明明几百行,一行也不上,
     却没有任何一处说"因为没审核"。
@@ -399,7 +423,7 @@ def test_sheet_e_column_cannot_smuggle_a_row_past_the_audit_gate(monkeypatch):
 
 
 def test_product_type_also_comes_from_pg(monkeypatch):
-    """D 列被手改成别的 PT 也没用:按库里那个走(否则等于绕过审核换类目)。"""
+    """表里的「PT」被手改成别的也没用:按库里那个走(否则等于绕过审核换类目)。"""
     rows = [_sheet_row(2, asin="B0PT", product_type="手改的PT")]
     _stub_gates(monkeypatch, rows)
     monkeypatch.setattr(ln, "load_verdicts",
@@ -425,36 +449,59 @@ def test_pt_falls_back_to_sheet_when_pg_has_none():
 def test_columns_contract():
     """列序的唯一出处是这条元组 —— 错一位,整套回填静默写到隔壁列去。
 
-    A/B 已经被所有者对调过一次(2026-08-16:原 A=ASIN B=店铺 → 现 A=店铺 B=ASIN)。
-    读取全程按字段名;写入的字母也从这条元组推导(2026-09-02 起,与 maint_sheet
-    同路),所以这条元组错一位 = 读写一起错位,而且不报错。2026-09-02 所有者改
-    表头:C 插 SKU,「审核理由」拆成 G 类别 + H 具体内容,尾四列换 登记日期/查询编码。
+    A/B 已经被所有者对调过一次(2026-08-16:原 A=ASIN B=店铺 → 现 A=店铺 B=ASIN);
+    2026-09-02 所有者第二次改表头:C 插 SKU,「审核理由」拆成 类别 + 具体内容,
+    尾四列(真实标题/真实PT/真实UPC/UPC匹配)换成 登记日期 + 查询编码。
+
+    读取全程按字段名;**列字母从此不再是契约**(2026-09-02):写入 range 由
+    `services/listing_sheet.layout()` 按表头名算,所以这里钉的是「有哪些字段、
+    谁排在谁前面、表头名一一对应且不重名」—— 元组错一位仍然是读写一起错位、
+    而且不报错,字母那半交给 layout() 与守门测试(tests/test_sku_guard.py)。
     """
     cols = resources.LISTING_SHEET.columns
-    assert cols[:3] == ("store", "asin", "sku")           # A/B/C 人工域
+    heads = resources.LISTING_SHEET.headers
+    assert cols[:3] == ("store", "asin", "sku")           # 人工域(A/B 对调后)
     assert cols[3:9] == ("list_title", "product_type", "audit_result",
-                         "audit_category", "audit_detail", "audit_date")  # D~I 审核域
-    assert cols[-2:] == ("register_date", "query_code")   # T/U 运营域
-    assert len(cols) == 21                                # A~U
-    assert listing_sheet._col("audit_result") == "F"
-    assert listing_sheet._rng("list_title", "audit_date", 7) == "D7:I7"
-    assert len(listing_sheet._header()) == 21             # _HEADER_NAMES 与列序同增同减
+                         "audit_category", "audit_detail",
+                         "audit_date")                    # 审核域(六列一起写)
+    assert cols[-2:] == ("register_date", "query_code")   # 运营手填,程序不写
+    assert len(cols) == 21
+    # 表头名是列定位的唯一依据:每个字段都要有,且中文名互不重复
+    assert tuple(heads) == cols
+    assert len(set(heads.values())) == len(cols)
+    # 今天的位置(表头没被挪过时 layout() 算出来的)—— 字母变了不算坏,
+    # 值串到隔壁列才算坏,那由上面的字段序与 test_sku_guard 的行为面钉住
+    lay = listing_sheet.layout()
+    assert lay["audit_result"] == "F"
+    assert (lay["list_title"], lay["audit_date"]) == ("D", "I")
 
 
 def test_header_drift_stops_every_read(monkeypatch):
-    """表头与 registry 对不上 → read_rows 之前就 ValueError 并点名列(2026-09-02 事故:
-    所有者改了表头,代码按旧列序错位读写了半天,全程不报错)。"""
-    good = list(listing_sheet._header())
-    drifted = good[:2] + good[3:] + ["UPC匹配"]           # 少了 SKU、尾巴多一列
-    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
-                        lambda s, r: [drifted])
-    with pytest.raises(ValueError, match="C 应为「SKU」"):
+    """表头与 registry 对不上 → **读之前**就抛错并点名列(2026-09-02 事故:
+    所有者改了表头,代码按旧列序错位读写了半天,全程不报错)。
+
+    fail-closed 判在 `listing_sheet._index_map()`:登记的表头名缺一个、或在
+    表头行里出现两次,就拒绝一切读写。⚠ 这条要自己**清掉 conftest 预置的
+    列布局**再打桩表头行,否则读到的是那份"表头没被动过"的缓存。
+    """
+    heads = list(resources.LISTING_SHEET.headers.values())
+    drifted = heads[:2] + heads[3:] + ["UPC匹配"]         # 少了 SKU、尾巴多一列
+    monkeypatch.setattr(listing_sheet, "_LAYOUT", None)
+    # 打在 `_read_header_row` 上而不是 feishu:单测环境没登记表 token,
+    # 真走到 `LISTING_SHEET.require()` 会先炸在"尚未登记"上,把要验的
+    # fail-closed 盖掉(登记本身另有守门测试)
+    monkeypatch.setattr(listing_sheet, "_read_header_row", lambda: drifted)
+    monkeypatch.setattr(listing_sheet.feishu, "sheet_row_count", lambda s: 3)
+    monkeypatch.setattr(
+        listing_sheet.feishu, "sheet_values_rows",
+        lambda *a, **k: pytest.fail("表头漂移了还敢读数据行"))
+    with pytest.raises(LookupError, match="SKU"):
         listing_sheet.read_rows()
-    # 大小写与空白差不算漂移
-    loose = [h.upper() + " " for h in good]
-    monkeypatch.setattr(listing_sheet.feishu, "sheet_values_small",
-                        lambda s, r: [loose])
-    listing_sheet.verify_header()
+    # ⚠ 遗留一处待所有者/listing_sheet 合并者拍板:main 侧的 `verify_header`
+    #   对表头名的**大小写与前后空白**是宽容的(`_norm_head`),HEAD 侧的
+    #   `_index_map` 只 strip、不折大小写 —— 表头名大小写被人改过时这边会
+    #   fail-closed 抛错而不是放行。两者都拦得住"真漂移",只差宽容度;
+    #   宽容度真搬过来之后,在这里补一条「loose 表头照样能读」的断言。
 
 
 
@@ -469,7 +516,7 @@ def test_header_drift_stops_every_read(monkeypatch):
 #   · 整段必须跑在**候选查询之前**(跑在后面 = 采回来的这一轮判不到,退化成跨轮);
 #   · 等完必须**就地摄取**(批次 completed ≠ 库里有数据,中间隔着增量导出);
 #   · 摄取后必须**重查库**再写理由(拿推送前那份写 = 刚采回来的被误报成未采集);
-#   · E 列一个字不许动(动了这行就退出审核通道);
+#   · 「审核结果」一个字不许动(动了这行就退出审核通道);
 #   · 每一种失败都要出现在摘要里。
 
 
@@ -568,7 +615,7 @@ def test_gap_is_pushed_waited_ingested_then_audited_this_round(monkeypatch):
     assert pushed[0][1] == ["B0GONE0001", "B0THIN0001"]   # 有数据的那个不重采
     assert "审不了 2 个 ASIN" in out
     assert "补采回来 2 个" in out and "本轮就审" in out
-    assert notes == []                       # 一个都不缺了,F 列不写
+    assert notes == []                       # 一个都不缺了,「具体内容」不写
     assert "仍缺" not in out
 
 
@@ -585,7 +632,7 @@ def test_still_missing_gets_the_real_scraper_error_in_the_sheet(monkeypatch):
     assert set(by_row) == {3, 5}              # 补上的第 4 行不写;同 ASIN 两行都写
     assert "captcha" in by_row[3] and "验证码" in by_row[3]
     assert by_row[5] == by_row[3]
-    assert "F 列留空" in out
+    assert "「审核结果」留空" in out
 
 
 def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):

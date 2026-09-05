@@ -179,8 +179,17 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         # PERMANENT 里,拦截行为一字不变,变的只是码名统一到新表)。
         # DO NOTHING 幂等 —— list_new/match_listing 的黑名单闸下次自动拦,
         # 同一产品不再烧 UPC 与配额。
-        # 只收 kind=list(sku=asin 约定);跟卖 sku 是自编号提不出 ASIN,
-        # 其行内终态由跟卖表 F/J 列承担
+        # 只收 kind=list(MP_ITEM)。⚠ **「sku=asin 约定」已随切码作废**:黑名单键
+        # 由 blacklist.record_asins 经登记簿按 (店,sku) 反查 —— 本函数只负责把
+        # store + sku 原样递过去,**不许在这里自己解 ASIN**(那就是第二份规则,
+        # conventions §六)。跟卖走 MP_ITEM_MATCH ⇒ kind=match ⇒ 天然不进这个桶,
+        # 其行内终态由跟卖表 F/J 列承担。
+        # ⚠ **改码失败不是政策违禁,不得反哺黑名单**(SKU 改造批次 3,O8):
+        # 形态 B 下 sku_migrate 走 MP_ITEM ⇒ kind=list ⇒ 正好命中这段反哺。
+        # 一次改码被拒若碰巧带上违禁码,会把一个**正在正常销售**的 ASIN 永久
+        # 拉黑(record_asins 是 PERMANENT),list_new/match_listing 的黑名单闸
+        # 下一轮就开始拦,而没有任何摘要会说是改码干的。既有工作流名一个都不
+        # 叫 sku_migrate ⇒ 改码前逐字节零行为变化。meta[sku][0] 是提交来源工作流。
         prohibited = [
             {"store": store["name"], "sku": sku, "category": "POLICY",
              "reasons": f"上架回执违禁 {(code or '').strip()}|"
@@ -188,6 +197,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             for sku, (o, code) in results.items()
             if o == "failed" and sku in meta
             and product_events.feed_kind(meta[sku][1]) == "list"
+            and meta[sku][0] != "sku_migrate"
             and (code or "").strip() in resources.WALMART_ERR_PROHIBITED]
         if prohibited:
             n_bl = blacklist.record_asins(conn, prohibited)

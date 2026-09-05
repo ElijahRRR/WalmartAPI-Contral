@@ -1740,3 +1740,101 @@ python cli.py blacklist_push -p backfill=1
 **黑名单那 14,474 条 `self`(200 字样本)** 仍是下限:`pick` 走的是四级优先,
 没有接 `restore` + `dispositions`(§17.3 决定不在事故修复里顺手改口径)。
 这是下一个 PR 可以做的一件事,预期能把其中一部分提到全文。
+
+
+---
+
+## 十九、合并后的链路影响盘点(2026-09-04)
+
+所有者问:「上一个 PR 对 `problem_scan`、产品事件、事件路由器有什么影响,链路
+是否已经可以以新规则流畅运行」。逐环查过一遍:**日常四条链可以直接跑,不用改
+任何东西** —— 因为分流的判据从来不看类别码。
+
+| 环节 | 读什么 | 影响 |
+|---|---|---|
+| `problem_scan` 归类 | `walmart_items.unpublished_reasons` 全文 → `error_taxonomy` | 已换轨,写新 16 码;事件存全文 |
+| 产品事件账本 | `detail.category` = 新码 | 存量 251,148 条已回填,`码变了 0` |
+| **事件路由器** `dispositions.claim()` | **只看 `action`** | **零影响** —— `category` 只是随行标签 |
+| `problem_product_cleanup` | 按 `action` 领活 | 零影响(摘要里的码从 `B/K` 变成 `POLICY/FLAGGED`) |
+| 入黑名单 `record_asins` | `is_permanent(code, term)` | 已换轨 |
+| **L0 上架闸** | `SELECT asin FROM asin_blacklist` —— 命中即拦,不看类别 | 零影响 |
+| 飞书投影 | 推 `source` 列(`source_label` 映射回旧中文标签) | 表格文字不变 |
+| 调度 | `error_reclass` / `blacklist_route` 都不在调度里 | 无需改 |
+
+### 19.1 查出来的三处「重跑会出事」
+
+**① `cleanup_history_import` 仍写旧 A-L 码进产品事件**(`cleanup_history.
+norm_category` 走 `problem_products._RULES`)。而下游只读码不重判原文,
+`is_permanent("B")` 恒 False ⇒ 重跑会让那批产品从黑名单候选集里静默消失。
+**所有者裁决:不管** —— 「项目初期的一次性使用产品」。记在这儿备查。
+
+**② `rebuild_asin` 是净删除 → 已修**(见下节)。
+
+**③ `worst_verdict` 取的不是最严重的码 → 已修**(见 §19.3)。`_HISTORY_SQL`
+用 `array_agg(DISTINCT …)`,PG 的 `DISTINCT` 聚合会**排序**,所以数组是**字典序**;
+`worst_verdict` 返回第一个够格的 = 字典序最靠前的那个
+(`BRAND` < `FLAGGED` < `GATED` < `IP` < `POLICY` < `PROHIBITED_FINAL` < `RECALL`)。
+**拉不拉黑不受影响**(任一够格即拉黑),受影响的只是写进 `category` 与飞书
+「来源」列的**标签**。
+
+### 19.2 `rebuild_asin` 只删得掉重灌得回的行(2026-09-04 所有者定)
+
+重建的数据源只有产品事件时间线,**时间线里没有的行删了再也回不来**。实测:
+
+```
+表里现有 32,716   →   _judge_events 判出 24,163(其中 22,381 已在表里)
+                       ⇒ 裸删会丢 10,335 行(asin_blacklist_import 的历史导入)
+```
+
+所有者:「那 10,335 行没有产品事件背书的历史导入**需要保留**」。所以
+`_ASIN_WIPE_SQL` 从裸 `DELETE FROM catalog.asin_blacklist` 改成带
+`WHERE EXISTS(…product_events…)`,两条腿都要:
+
+- `coalesce(e.asin, e.sku) = b.asin` —— 已经按标准 asin 落键的行;
+- `e.sku = b.src_sku` —— 键还是订货号原文的行(**重建正是为了给它们换键**,
+  只按第一条会漏掉它们,于是换键失败还不报错)。
+
+顺带修了预览报错数:原先那句「ASIN 表现有 N 行将被整表重写」的 N 取的是
+**飞书表格行数**(`sheets.next_empty()`),而删的是 PG —— 报的不是要删的那个数。
+现在报 PG 的 `in_table` / 会被重灌的 / **一条都不碰的**三个数。
+
+
+### 19.3 黑名单标签序:所有者定的,与主码序**故意不一样**
+
+所有者 2026-09-04:「严重程度按这个:**品牌 → 知产 → 禁售 → 不可申诉 → 召回 → …**」。
+
+落成 `registry.resources.BLACKLIST_LABEL_ORDER`,`worst_verdict` 查表取名次最小者:
+
+```python
+BLACKLIST_LABEL_ORDER = (
+    "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者给定
+    "FLAGGED", "GATED", "OTHER",                             # 所有者 2026-09-05 认可
+)
+```
+
+所有者 2026-09-04 只给到「召回 → …」,后三个按 `PERMANENT_CODES` 既有次序接上,
+**所有者 2026-09-05 认可**(「认可这个排法」)。改它不影响任何拦截行为。
+
+**为什么不是复用 `ERROR_CATEGORY_SEVERITY`(这不是双轨)** —— 两个序回答的是
+两个问题:
+
+| | 问的是 | 成员 |
+|---|---|---|
+| `ERROR_CATEGORY_SEVERITY` | **一条报错原文**里同时写了几个问题,主码取哪个 | 全部 16 码 |
+| `BLACKLIST_LABEL_ORDER` | **一个产品的多条历史报错**都够格拉黑,标签取哪个 | 只有够格永久拉黑的(7 永久码 + `OTHER`) |
+
+`PT_WRONG` 之类根本不参与后者。**实测**:把所有者给黑名单的这个序套到主码序上,
+78 条语料里会变 **1 条** —— 正是语料 #69:
+
+```
+①「…violating Prohibited Product Policy… submit an appeal」          → POLICY
+②「…violating Prohibited Product Policy. To republish this item please
+    make sure you have the appropriate product type selected…」       → PT_WRONG
+
+现在 PT_WRONG 排在 POLICY 前面 ⇒ 主码 PT_WRONG(可放)
+若照黑名单序 ⇒ 主码 POLICY(永久禁)
+```
+
+那正是 **4 万条误拉黑**的病根(§十二:「类目选错是修法不是禁令」)。所以
+`ERROR_CATEGORY_SEVERITY` **一个字不动**,并加了守门测试把
+`PT_WRONG < POLICY` 这一条钉死 —— 谁想「统一两个序」,那条会红。

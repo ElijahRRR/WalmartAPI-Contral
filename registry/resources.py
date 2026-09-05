@@ -190,6 +190,27 @@ ERROR_CATEGORY_SEVERITY = (
     "GATED", "FLAGGED", "CONTENT", "PRICE", "SPECIAL", "INFO",
     "SYSTEM", "OTHER", "STAGE", "EXPIRED",
 )
+# 黑名单**行标签序**(所有者 2026-09-04:「严重程度按这个:品牌 → 知产 → 禁售
+# → 不可申诉 → 召回 → …」)。一个 ASIN 被报错多次、多次都够格永久拉黑时,
+# 黑名单那一行只写得下一个理由、飞书「来源」列也只显示一个词 —— 按这个序取。
+# 判据在 `services/blacklist.worst_verdict`。
+#
+# ⚠ **与上面的 `ERROR_CATEGORY_SEVERITY` 是两个问题,故意不一样,不是双轨**:
+#   · `ERROR_CATEGORY_SEVERITY` —— **一条报错原文**里同时写了几个问题,主码取哪个;
+#   · `BLACKLIST_LABEL_ORDER`   —— **一个产品的多条历史报错**都够格拉黑,标签取哪个。
+#   前者的成员是全部 16 码,后者只有**够格永久拉黑**的那些(`PT_WRONG` 之类
+#   根本不参与)。2026-09-04 实测:把所有者这个序套到前者身上,78 条语料里
+#   会变 1 条 —— 正是 `PT_WRONG → POLICY` 那条,等于推翻「类目选错是修法不是
+#   禁令」的裁决(那 4 万条误拉黑的病根)。所以两处各归各的,谁也别拿去套谁。
+#
+# 所有者 2026-09-04 给到「召回 → …」,后面三个(FLAGGED / GATED / OTHER)按
+#   `PERMANENT_CODES` 的既有次序接上,**所有者 2026-09-05 认可**。改这里不影响
+#   拦截行为(任一够格即拉黑),只影响写进 `category` 与飞书「来源」列的标签。
+BLACKLIST_LABEL_ORDER = (
+    "BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL",   # 所有者 2026-09-04 给定
+    "FLAGGED", "GATED", "OTHER",                             # 所有者 2026-09-05 认可
+)
+
 # feed 报错的政策族锚:field 稳定、error_code 一次性(生产实证:Offensive 171 次
 # 散在 35 个互不相同的码上)。QARTH/OFFER/sku 等多义 field 不入此集合。
 WALMART_ERR_FIELD_POLICY = frozenset({"Defects Platform", "RNA"})

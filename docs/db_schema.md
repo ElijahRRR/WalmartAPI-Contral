@@ -900,6 +900,12 @@ ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统�
   **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分判出来的码是下限)→
   `none`(四处都没有 ⇒ `taxonomy_code` 留 **NULL**,不猜)。
 - `taxonomy_version` 是增量谓词,同 `audit_runs.audit_version` 的套路。
+- ⚠ **`blacklist_push -p rebuild_asin=1` 只重灌有产品事件背书的行**(2026-09-04
+  所有者定:「那 10,335 行没有产品事件背书的历史导入**需要保留**」)。重建的
+  数据源只有 `product_events` 时间线,时间线里没有的行删了**再也回不来** ——
+  `asin_blacklist_import` 那批一次性导入的历史 ASIN 压根没有事件。实测 32,716
+  行里只有 22,381 行有事件背书;原先那句裸 `DELETE FROM catalog.asin_blacklist`
+  会静默丢 10,335 行,而摘要只说「擦净 32,716 行 → 重灌 24,163 行」,看着像正常。
 
 ### ops.cleanup_seen_categories(问题商品历史:(sku, 类别) 唯一对)
 

@@ -157,15 +157,29 @@ def test_回填的来源标签只有一处出生():
     assert not hasattr(bl, "_label_case")      # 那份 CASE 已随过渡桥删掉
 
 
-def test_backfill_selects_latest_category_only():
-    """入选按**最新**事件(DISTINCT ON + occurred_at DESC)——历史里类别
-    翻动频繁,"曾命中过"作数会把短暂误判的商品永久拉黑。身份 =
-    coalesce(登记簿 source_key, asin, sku):登记簿是切码后的唯一通路,其次是
-    record_many 清洗出的标准码,再不行才用订货号原文(2026-08-11 实证 sku≠asin,
-    多店订货号须归并到产品级)。SQL 文本钉死。"""
+def test_两条路的取事件口径不一样_别混():
+    """⚠ 这条 2026-09-04 改过判据,名字与说明一并改了(原名
+    `test_backfill_selects_latest_category_only`,说的是「入选按最新事件、
+    曾命中过不作数」——**那条规则已被所有者推翻**)。
+
+    现在两条路各用各的:
+      · **品牌渠道** `_LATEST_CTE` —— 取最新一条,因为 brand_err_hits 的语义
+        就是「这个品牌**当前**还在不在问题里」;
+      · **黑名单入选** `_HISTORY_SQL` —— 取**全部历史**,所有者:「一个产品的
+        报错可能存在多次,**其中被拉黑的那个作为最高优先级**」。黑名单是
+        「一次入选、永久禁止」,拿最新一条会把上个月那条禁令忘掉。
+
+    身份键两边一样,而且**经登记簿**:`_EV_CTE` 的
+    `ident = coalesce(ls.source_key, e.asin, e.sku)`(切码后的唯一通路 → 清洗出的
+    标准码 → 订货号原文),两条路都建在它上面,不许各写一份。
+    """
     from services import blacklist as bl
     assert "DISTINCT ON (ident) ident AS asin" in bl._LATEST_CTE
     assert "ORDER BY ident, occurred_at DESC" in bl._LATEST_CTE
+    assert bl._LATEST_CTE.startswith(bl._EV_CTE) and bl._HISTORY_SQL.startswith(bl._EV_CTE)
+    # 入选那条**不许**再有 DISTINCT ON / occurred_at DESC 的取最新写法
+    assert "DISTINCT ON" not in bl._HISTORY_SQL
+    assert "GROUP BY 1" in bl._HISTORY_SQL and "array_agg" in bl._HISTORY_SQL
     assert "ON CONFLICT (asin) DO NOTHING" in bl._INSERT_ASIN_SQL
     # ⚠ 身份表达式只有**一处出生**(_EV_CTE),两条链共用:品牌渠道那条
     #   (_LATEST_CTE)与黑名单入选那条(_HISTORY_SQL)。谁另抄一份就会漂。
@@ -202,20 +216,53 @@ def test_backfill_preview_is_byte_identical_when_no_opaque_keys(wired, monkeypat
     assert out.replace(wf._opaque_note({"opaque": 7}), "") == base
 
 
+def test_重建只删得掉重灌得回的行():
+    """⚠ 所有者 2026-09-04:「那 10,335 行没有产品事件背书的历史导入**需要保留**」。
+
+    `rebuild_asin` 的数据源只有产品事件时间线,**时间线里没有的行删了就再也
+    回不来** —— `asin_blacklist_import` 那批一次性导入的历史 ASIN(`LEGACY`)
+    压根没有事件。原先是裸 `DELETE FROM catalog.asin_blacklist`:实测 32,716 行
+    里只有 22,381 行有事件背书,裸删静默丢 10,335 行,而摘要只说
+    「擦净 32,716 行 → 重灌 24,163 行」,看着像正常。
+
+    两条腿都要(与 `_judge_events` 的身份键口径一致):按标准 asin 落键的行
+    走 `coalesce(e.asin, e.sku) = b.asin`;键还是订货号原文的行走
+    `e.sku = b.src_sku` —— 重建正是为了给它们换键,只按第一条会漏掉它们,
+    于是换键失败还不报错。
+    """
+    from services import blacklist as bl
+    sql = " ".join(bl._ASIN_WIPE_SQL.split())
+    assert sql != "DELETE FROM catalog.asin_blacklist"      # 裸删已退役
+    assert "WHERE EXISTS" in sql and "problem_categorized" in sql
+    assert "coalesce(e.asin, e.sku) = b.asin" in sql        # 已换键的
+    assert "e.sku = b.src_sku" in sql                       # 还没换键的
+    # 预览要能报出"碰不到的有多少",且判据与删除那条**互补**
+    keep = " ".join(bl._ASIN_KEEP_COUNT_SQL.split())
+    assert "NOT EXISTS" in keep
+    assert keep.split("NOT EXISTS", 1)[1] == sql.split("WHERE EXISTS", 1)[1]
+
+
 def test_rebuild_asin_apply_overwrites_and_marks_all(wired, monkeypatch):
-    """rebuild_asin:擦净按标准 asin 重灌 → ASIN 表整表重写 → 全表打水位。"""
+    """rebuild_asin:重灌有事件背书的行 → ASIN 表整表重写 → 全表打水位。
+
+    ⚠ 摘要必须点名**没碰的那批**(所有者 2026-09-04:「那 10,335 行没有产品
+    事件背书的历史导入需要保留」)—— 只报"擦净 N 行"会让人以为整表被重写了。
+    """
     calls, _ = wired
     overwritten = []
     monkeypatch.setattr(wf.blacklist, "backfill_counts",
-                        lambda conn: {"total": 3, "permanent": 2, "brand_cand": 1})
+                        lambda conn: {"total": 3, "permanent": 2, "brand_cand": 1,
+                                      "in_table": 5, "untouched": 3})
     monkeypatch.setattr(wf.blacklist, "rebuild_asin_blacklist",
-                        lambda conn: {"wiped": 56821, "inserted": 2})
+                        lambda conn: {"wiped": 56821, "inserted": 2,
+                                      "untouched": 10335})
     monkeypatch.setattr(wf.feishu, "sheet_overwrite",
                         lambda s, rows: overwritten.append(rows) or len(rows))
     calls["asin_all"] = [("B0GXX75JN5", "沃尔玛-知产", "2026-04-20"),
                         ("D01027HVK3W", "沃尔玛-禁售", "2026-05-01")]
     out = wf.run({"rebuild_asin": "1", "apply": "1"})
     assert "重灌 2 行" in out and "整表重写 2 行" in out
+    assert "10335 行原样保留" in out.replace(",", "")   # 没碰的那批要点名
     rows = overwritten[0]
     assert len(rows) == 3               # 表头 + 2 数据行
     assert rows[1] == ["B0GXX75JN5", "沃尔玛-知产", "2026-04-20"]
@@ -227,9 +274,16 @@ def test_rebuild_asin_preview_does_not_write(wired, monkeypatch):
     cells["asin"] = ["x"] * 4
     monkeypatch.setattr(wf.blacklist, "backfill_counts",
                         lambda conn: {"total": 50000, "permanent": 48000,
-                                      "brand_cand": 2702})
+                                      "brand_cand": 2702,
+                                      "in_table": 32716, "untouched": 10335})
     out = wf.run({"rebuild_asin": "1"})
-    assert "现有 4 行" in out and "整表重写为 48000 行" in out and "apply=1" in out
+    # ⚠ 报的必须是 **PG** 的数:原先取 `sheets.next_empty(sheet) - 2`(飞书表格
+    #   行数 = 这里的 4),而删的是 PG —— 报的不是要删的那个数,人核对不了。
+    assert "4 行" not in out
+    assert "PG 表现有 32716 行" in out
+    assert "22381 行会被重灌成 48000 行" in out         # 32716 − 10335
+    assert "10335 行没有产品事件背书,一条都不碰" in out
+    assert "apply=1" in out
     assert calls["writes"] == [] and calls["marked"] == []
 
 

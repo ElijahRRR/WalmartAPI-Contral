@@ -59,6 +59,7 @@ from collections import Counter
 #   (`sku_asin.pick_asin` / `resolve_many` 内部才回落形态腿),这儿留个裸入口
 #   就会有人又写第二份规则。守门的文本轨连注释里的函数名一起拦,所以这段
 #   只说"形态腿"不写它的名字 —— 拦的正是"先在注释里写好再抄进代码"那一步。
+from registry import resources
 from services import error_source, error_taxonomy, sku_asin, sku_codec
 
 logger = logging.getLogger("services.blacklist")
@@ -377,22 +378,37 @@ FROM latest
 """
 
 
+#: 够格拉黑的码之间谁当标签 —— 序在 registry(铁律 3),这儿只查表。
+_LABEL_RANK = {c: i for i, c in enumerate(resources.BLACKLIST_LABEL_ORDER)}
+
+
 def worst_verdict(codes):
     """输入:一个 asin 的**全部事件码** `[[code, term], …]` → 输出:够格永久拉黑的
     那个 `(code, term)`;一个都不够格给 None。
 
     ⚠ **够格拉黑的那条最高优先级**(所有者 2026-09-04),其余只是记录。
+    ⚠ 多条都够格时按 `resources.BLACKLIST_LABEL_ORDER` 取(所有者 2026-09-04:
+      「严重程度按这个:品牌 → 知产 → 禁售 → 不可申诉 → 召回 → …」)。
+      **原先是「取第一个够格的」,而那个数组来自 `array_agg(DISTINCT …)`**——
+      PG 的 DISTINCT 聚合会排序,所以取到的是**字典序**最靠前的那个
+      (`BRAND` < `FLAGGED` < … < `RECALL`),不是最严重的。
+      ⚠ 只影响写进 `category` 与飞书「来源」列的**标签**,拉不拉黑不受影响
+      (任一够格即拉黑)。
     ⚠ 只**读码**,不重判原文 —— 判定在 `problem_scan` 写事件时发生过一次,
       历史事件由 `error_reclass -p scope=events` 回填成新码。
       所有者原话:「产品级的记录已经有产品事件在做了」。
     纯函数,拿假数据就能测。
     """
+    hits = []
     for pair in codes or []:
         code = pair[0] if pair else None
         term = pair[1] if pair and len(pair) > 1 else None
         if error_taxonomy.is_permanent(code, term):
-            return code, term
-    return None
+            hits.append((code, term))
+    if not hits:
+        return None
+    # 没登记的码排最后(判不准就别让它当标签),同名次按出现序稳定
+    return min(hits, key=lambda p: _LABEL_RANK.get(p[0], len(_LABEL_RANK)))
 
 
 def _judge_events(conn) -> list[dict]:
@@ -430,8 +446,36 @@ ON CONFLICT (asin) DO NOTHING
 """
 
 # ASIN 黑名单重建(rebuild_asin):SKU 清洗后表内键还是订货号原文/多店重复,
-# 擦净按标准 asin 重灌(created_at=报错发生时刻,表格日期列因此有意义)。
-_ASIN_WIPE_SQL = "DELETE FROM catalog.asin_blacklist"
+# 按标准 asin 重灌(created_at=报错发生时刻,表格日期列因此有意义)。
+#
+# ⚠ **只删得掉重灌的那些行**(所有者 2026-09-04:「那 10,335 行没有产品事件
+#   背书的历史导入需要保留」)。原先是裸 `DELETE FROM catalog.asin_blacklist`
+#   —— 而重灌的数据源只有产品事件时间线,**时间线里没有的行删了就再也回不来**:
+#   `asin_blacklist_import` 那批一次性导入的历史 ASIN(`LEGACY`)压根没有事件。
+#   实测 32,716 行里只有 22,381 行有事件背书,裸删会静默丢掉 10,335 行,
+#   而摘要只会说「擦净 32,716 行 → 重灌 24,163 行」,看着像正常。
+#
+# 判据两条腿都要(与 `_judge_events` 的身份键口径一致):
+#   · `coalesce(e.asin, e.sku) = b.asin`  —— 已经按标准 asin 落键的行;
+#   · `e.sku = b.src_sku`                 —— 键还是订货号原文的行(重建正是
+#     为了给它们换键,只按第一条会漏掉它们、于是换键失败还不报错)。
+_ASIN_WIPE_SQL = """
+DELETE FROM catalog.asin_blacklist b
+WHERE EXISTS (SELECT 1 FROM catalog.product_events e
+              WHERE e.event = 'problem_categorized'
+                AND (coalesce(e.asin, e.sku) = b.asin
+                     OR (b.src_sku IS NOT NULL AND e.sku = b.src_sku)))
+"""
+
+#: 重建**碰不到**的行数(没有产品事件背书 ⇒ 重灌不出来 ⇒ 一律保留)。
+#: 预览要报这个数:原先报的是**飞书表格行数**,而删的是 PG —— 报的不是要删的那个。
+_ASIN_KEEP_COUNT_SQL = """
+SELECT count(*) FROM catalog.asin_blacklist b
+WHERE NOT EXISTS (SELECT 1 FROM catalog.product_events e
+                  WHERE e.event = 'problem_categorized'
+                    AND (coalesce(e.asin, e.sku) = b.asin
+                         OR (b.src_sku IS NOT NULL AND e.sku = b.src_sku)))
+"""
 
 def backfill_counts(conn) -> dict:
     """输入:连接 → 输出:回填预览计数(不写任何东西)。
@@ -451,11 +495,15 @@ def backfill_counts(conn) -> dict:
         cur.execute("SELECT asin FROM catalog.asin_blacklist")
         have = {a for (a,) in cur.fetchall()}
     fresh = [r for r in keep if r["asin"] not in have]
+    with conn.cursor() as cur:
+        cur.execute(_ASIN_KEEP_COUNT_SQL)
+        untouched = cur.fetchone()[0]
     # `opaque` 是 D-0b-1 那一档只读告警,原样透出(零时摘要逐字不变)。
     return {"permanent": len(keep), "brand_cand": brand_cand, "total": total,
             "opaque": opaque,
             "in_table": len(have), "fresh": len(fresh),
-            "fresh_codes": Counter(r["cat"] for r in fresh)}
+            # 重建碰不到的行(没有事件背书,重灌不出来 ⇒ 保留)
+            "untouched": untouched, "fresh_codes": Counter(r["cat"] for r in fresh)}
 
 
 def backfill_from_events(conn) -> dict:
@@ -470,15 +518,21 @@ def backfill_from_events(conn) -> dict:
 
 
 def rebuild_asin_blacklist(conn) -> dict:
-    """输入:连接 → 输出:{wiped, inserted}。擦净按标准 asin 重灌
-    (黑名单是时间线的投影,投影可以重投——与品牌渠道重建同一权衡)。"""
+    """输入:连接 → 输出:{wiped, inserted, untouched}。按标准 asin 重灌。
+
+    黑名单是时间线的投影,投影可以重投 —— 但**只重投得出来的那一部分**:
+    没有产品事件背书的行(`asin_blacklist_import` 那批历史导入)重灌不出来,
+    所以一条都不碰(所有者 2026-09-04 定:「需要保留」)。见 `_ASIN_WIPE_SQL`。
+    """
     rows = _judge_events(conn)          # ⚠ 先判再擦:判炸了不能留下空表
     with conn.cursor() as cur:
+        cur.execute(_ASIN_KEEP_COUNT_SQL)
+        untouched = cur.fetchone()[0]
         cur.execute(_ASIN_WIPE_SQL)
         wiped = cur.rowcount or 0
         if rows:
             cur.executemany(_INSERT_ASIN_SQL, rows)
-        return {"wiped": wiped, "inserted": len(rows)}
+        return {"wiped": wiped, "inserted": len(rows), "untouched": untouched}
 
 
 # ── 品牌渠道重建(blacklist_push -p rebuild_brand=1,一次性)───────────────────

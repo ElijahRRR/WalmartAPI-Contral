@@ -92,6 +92,12 @@ class _Conn:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _open_submit_channel(monkeypatch):
+    """既有用例默认在"提交通道可用"的世界里跑;通道停用那条闸另有专门用例钉。"""
+    monkeypatch.setattr(sm, "SUBMIT_DISABLED", "")
+
+
 def _wire(monkeypatch, *, enabled=("T1",), absent=(), note="", executing=0,
           cooldown=0, pending_feeds=(), dupes=()):
     """把 _preflight 的五道闸与订单体检全部打成"通过",逐条按需覆盖。"""
@@ -1380,3 +1386,23 @@ def test_candidates_beyond_the_quota_headroom_are_not_minted(monkeypatch):
     minted = [c for c in calls if isinstance(c, tuple) and c[0] == "mint"]
     assert len(minted) == sm.FEEDS_PER_STORE_PER_RUN     # 只 mint 发得出去的那些
     assert any("超配额留量" in ln and "一个字都没落库" in ln for ln in lines)
+
+
+def test_submit_channel_is_disabled_by_default_until_rewired(monkeypatch):
+    """⛔ 2026-09-05:官方 spec 原件核实 MP_MAINTENANCE 无 SkuUpdate,形态 A 作废。
+    在通道切换定案之前,缺省必须是"只定案不提交",而且 dry-run 也不列候选
+    (列了就是"将改码 N 个"的误导)。定案要留着:两条 pending 靠观测走 rolled_back。"""
+    import importlib
+    fresh = importlib.reload(sm)
+    assert fresh.SUBMIT_DISABLED, "默认值被清空了 —— 通道切换定案了吗?"
+    monkeypatch.setattr(sm, "SUBMIT_DISABLED", "测试:通道停用")
+    _wire(monkeypatch)
+    read = _read_conn(monkeypatch, [])
+    monkeypatch.setattr(sm.feeds, "submit_feed",
+                        lambda *a, **k: pytest.fail("通道停用不许提交"))
+    monkeypatch.setattr(sm.listing_sheet, "read_rows", lambda upto=None: [])
+    for execute in (True, False):
+        out = sm.run({"store": "T1", "execute": execute, "skus": "B0AAA00001"})
+        assert "提交通道停用" in out and "本轮提交 0" in out
+        assert not any("FROM catalog.walmart_items w" in sql for sql, _ in read.sqls)
+    assert any("FROM listing.sku_migrations m" in sql for sql, _ in read.sqls)   # 定案面照查

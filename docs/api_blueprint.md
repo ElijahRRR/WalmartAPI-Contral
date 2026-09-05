@@ -202,6 +202,7 @@ version 字符串全部进 registry(不准散落硬编码),且**必须定期核�
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。
 MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN,其余可选(partial update)。
 **SkuUpdate(改 SKU)的官方出处**(2026-09-02 查证,SKU 改造批次 3 登记):CA 侧 [Manage items](https://developer.walmart.com/ca-marketplace/docs/manage-items) 明写「look for the SkuUpdate attribute in the payload and set it to Yes … provide the new SKU」;匹配键是 **Product ID 不是 SKU**([CA Update an item's SKU](https://marketplacelearn.walmart.com/ca/guides/Catalog%20management/Item%20management/update-an-item-s-sku):「Enter the correct SKU for that Product ID」「You are not allowed to submit two SKUs with the same Product Identifier」),生效 15 分钟~4 小时,WFS 的 item 不能改 SKU。US 侧 [Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items) 只讲 MP_MAINTENANCE 做部分更新(「requires only the SKU and GTIN attributes」),**未点名 SkuUpdate** ——所以「US 的 MP_MAINTENANCE 最小载荷能否改码」列为**待单品实测**(docs/sku_plan.md §4 六件之 1、2);实测前 `sku_migrate` 只许 --dry-run。
+**2026-09-05 定案(官方 spec 原件 + 生产实测)**:US MP_MAINTENANCE 5.0(20260501/0608/0703 三版)的 Orderable **没有 `SkuUpdate`**(20 个属性,additionalProperties=false),`SkuUpdate`/`ProductIdUpdate` 只在 **MP_ITEM** 的 Orderable 里;MP_MAINTENANCE 与 MP_ITEM 是**两份独立 spec、布局不同**(仓内只下载 MP_ITEM 一份,看不出差别)。带 SkuUpdate 的维护 feed 回执 SUCCESS 但被静默丢弃(2026-09-04 两条生产实证)。**改码必须走 setup 类 feed**(MP_ITEM 全量 + SkuUpdate=Yes,或 Seller Center「Match items」底层的 MP_ITEM_MATCH),见 docs/sku_plan.md §9.10。
 
 ### 5.2 提交防重(三层,缺一不可)
 

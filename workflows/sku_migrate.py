@@ -105,6 +105,22 @@ logger = logging.getLogger("workflows.sku_migrate")
 #: 切形态 B 的条件:所有者实测第 1 件判定最小载荷改不动码。切的时候改这一处 +
 #: _build_items 的分支,并先做 mp_conform 的 SkuUpdate 放行(否则每一行都双挂)。
 FEED_TYPE = "MP_MAINTENANCE"
+#: ⛔ **提交通道停用**(2026-09-05,官方 spec 原件核实):US 站 MP_MAINTENANCE
+#: 5.0.20260608-18_15_07-api(我们 header 里写的正是这一版)的 Orderable **没有
+#: SkuUpdate 字段**(20 个属性、required=[sku, productIdentifiers]、
+#: additionalProperties=false;三个版本 20260501/0608/0703 一致);`SkuUpdate`
+#: 只存在于 **MP_ITEM** 的 Orderable(23 个属性)。生产实证与之吻合:两条改码
+#: feed(谭总12 / A085朱丽霖,2026-09-04)回执 SUCCESS 而线上 SKU 纹丝不动 ——
+#: 维护通道把 SkuUpdate 当未知字段静默丢弃,整条 feed 是一次"空维护"。
+#: 形态 A 由此**作废**(§9.6 那条 schema 推断错了:它看的是 MP_ITEM 的 Orderable,
+#: 不是 MP_MAINTENANCE 的)。所有者在 Seller Center 用「Match items」模板上传改码
+#: **成功**,说明可行通道是 setup 类 feed(MP_ITEM 全量 + SkuUpdate=Yes,或
+#: MP_ITEM_MATCH);具体走哪条,等所有者机器上 GET /v3/feeds 看那条 Seller Center
+#: feed 的 feedType 再定,**定了再改这里与 _build_items**。
+#: 在那之前非空 ⇒ 本工作流只定案不提交(dry-run 也不列候选,免得预览误导);
+#: 定案要留着:已发出去的两条 pending 要靠观测反证走 rolled_back 把旧码复活。
+SUBMIT_DISABLED = ("MP_MAINTENANCE 不支持 SkuUpdate(官方 spec 原件 2026-09-05 核实),"
+                   "改码通道待切换到 setup 类 feed;见 FEED_TYPE 头注与 docs/sku_plan.md §9.10")
 #: 只迁 amz 出身的存量码(决策 D 默认:**跟卖不迁**)。PHUMWMT 串本就不含 ASIN,
 #: 货源隐匿收益为零;而 match 行的 source_key 是匹配 GTIN,改码后 upc_pool 的
 #: (店, ASIN) 键无从对上(跟卖不用 UPC 池),实测面直接翻倍。
@@ -1075,6 +1091,9 @@ def run(params: dict) -> str:
             else _stage_cap(conn, store_name, asked)
         if settle_only:
             cap, cap_note = 0, "-p settle_only=1:本轮只定案,不提交新的"
+        if SUBMIT_DISABLED:
+            # 硬闸,不看 execute:dry-run 列出"将改码 N 个"同样是误导
+            cap, cap_note = 0, f"⛔ 提交通道停用(本轮只定案):{SUBMIT_DISABLED}"
         lines.append(f"  {cap_note}")
         cands, cand_notes = _candidates(conn, store_name, cap,
                                         only_skus=only_skus, only_keys=only_keys,

@@ -1054,3 +1054,60 @@ A085朱丽霖 899 条 executing,而这是 13:00 三条链齐发之后的常态)�
 动作写进摘要;若滞留里出现破坏组,额外喊「候选判据本该把这行剔掉,多半是中间
 窗口里新长出来的建议,请人工核」——`problem_scan._SQL_ITEMS` 的那条 `NOT EXISTS`
 (在途改码的旧码不进扫描面)本该挡住它,挡不住就是那条闸出了问题。
+
+### 9.10 决策 E 翻转:形态 A 作废(2026-09-05,官方 spec 原件核实)
+
+**事实**(代理从开发者门户「Item spec: versioning and diff reporting」页直链下载的
+官方 spec 原件,本机解析,不是摘要):
+
+| spec | 版本 | `MPItemFeedHeader` | Orderable | `SkuUpdate` |
+|---|---|---|---|---|
+| **MP_MAINTENANCE** | 5.0.20260608-18_15_07-api(**我们 header 里的那一版**) | required=[businessUnit, locale, version],additionalProperties=false | **20 个属性**,required=[sku, productIdentifiers],additionalProperties=false | **0 次** |
+| MP_MAINTENANCE | 5.0.20260501 / 5.0.20260703 | 同上 | 同上 | 0 次 |
+| MP_ITEM | 5.0.20260703-18_22_27-api | 同上 | 23 个属性,required 含 price/ShippingWeight/COO | **1 次**(还有 `ProductIdUpdate`) |
+
+三条结论:
+① **MP_MAINTENANCE 与 MP_ITEM 是两份独立 spec,Orderable 布局不同**。§9.6 那条
+   「schema 含 SkuUpdate ⇒ 形态 A 依据成立」的推断错了 —— 它看的是所有者上传的
+   `specs/MP_ITEM/…/_orderable.json`,是 **MP_ITEM** 的 Orderable,不是 MP_MAINTENANCE 的。
+   本仓从来只下载 MP_ITEM 一份 bundle(`registry/paths.mp_item_spec_dir()`),
+   所以仓内没有任何东西能看出这两份不一样。
+② **header 是对的**:三字段封闭校验,与我们发的一字不差;旧仓实证多传 subset 被
+   60670554076755 拒收、漏 businessUnit 被 72600149546850 拒收。H8(header 缺
+   processMode/sellingChannel)由此排除。
+③ 生产实证与 ① 吻合:两条改码 feed(谭总12 `B008LUW4CI→AVZX97DTMTDN`、
+   A085朱丽霖 `B0000C8W8W→AG28GAD7MF75`,2026-09-04 21:52)回执 SUCCESS,线上 SKU
+   纹丝不动 —— 维护通道把 `SkuUpdate` 当未知字段**静默丢弃**,整条 feed 是一次
+   "空维护"。官方 Seller Center 指引(US「Update SKU IDs in bulk」、CA「Update an
+   item's SKU」)也一致:改 SKU 用**全量 Item Setup 模板**,「SKU Update」列填 Yes;
+   GeekSeller 明言「You will need to provide all required data … not sufficient to
+   provide just the data you wish to adjust」。
+
+**所有者的成功路径**:在 Seller Center 用「Match items」按 GTIN 匹配、下载模板、改
+SKU 后上传,SKU 变了、UPC 没动。这条路底层是 setup 类 feed(MP_ITEM_MATCH 或
+MP_ITEM),具体哪一种由 `GET /v3/feeds` 列出那条 Seller Center feed 的 `feedType`
+定案 —— **定了再改 `sku_migrate.FEED_TYPE` 与 `_build_items`**。
+
+**已做的止损**:`workflows/sku_migrate.SUBMIT_DISABLED` 非空 ⇒ 本工作流只定案不提交,
+dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两条 pending 靠
+`_verdict` 的观测反证(新码不在架 ∧ 旧码在架,超 OBSERVE_HOURS=24)走 `rolled_back`
+把旧码复活、新码弃掉。守门测试钉住"缺省停用"。
+
+**对抗验证顺带排除的**(三名反驳者各自独立驳倒,免得再走弯路):
+· H3「我们把回执 SUCCESS 当生效」—— 官方 item 级 ingestionError 只有
+  DATA_ERROR/SYSTEM_ERROR/TIMEOUT_ERROR 三型,没有 WARNING/INFO 分级;而且两条链
+  本来就不按回执定案(`sku_migrate._verdict` 只信观测,`dispositions.settle_maintenance`
+  按线上现值比对并在摘要报「未生效 N」)。
+· H4「productIdentifiers 对不上」—— 对不上时沃尔玛是显式拒收(Zentail 引用原文
+  "This SKU is already set up with a different Product ID");08-09 首跑 89 条
+  0101198 stale update 证明沃尔玛按 SKU+productIdentifiers 找到了 item 并比对了字段。
+· H5「Visible 的 PT 键不对」—— 改码载荷根本没有 Visible 段却同样失败;PT 键错的
+  结局是整批 DATA_ERROR(60670554076755 同款),不可能 SUCCESS。
+· H6/H7(回执解析 / httpx 字节形态)—— 前者只会让 feed 永远停在 submitted,
+  后者对纯 ASCII 载荷零解释力且价格 feed 走同一路径正常。
+
+**标题那件事另有原因**:我们的标题载荷与旧仓生产在用的**逐字相同**
+(`services/maintenance_intents.build_title_item` ↔ `docs/legacy_survey.md:1089`,
+唯一差异是 header version),旧仓同样"SUCCESS 但多数不变、少数会变"。所以它**不是
+本次改造引入的回归**,而是一条长期存在的沃尔玛侧行为;根因待所有者机器上的
+实例(我们发的标题 / 回执原文 / `GET /v3/items/{sku}` 现在的 productName)定。

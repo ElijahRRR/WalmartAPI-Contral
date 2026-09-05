@@ -914,3 +914,62 @@ def test_对照报告要覆盖全文语料_且把残片分出去():
     # 报告文本里要把这层区别说清楚,不能只在代码里
     lines = "\n".join(wf._fmt_lists(t, 20, True))
     assert "残片" in lines and "不是沃尔玛写得不规范" in lines
+
+
+def test_黑名单标签序按所有者给的_不是字典序():
+    """⚠ 所有者 2026-09-04:「严重程度按这个:品牌 → 知产 → 禁售 → 不可申诉
+    → 召回 → …」。
+
+    一个 ASIN 被报错多次、多次都够格永久拉黑时,黑名单那一行只写得下一个理由、
+    飞书「来源」列也只显示一个词。**原先取的是"第一个够格的"** —— 而那个数组
+    来自 `array_agg(DISTINCT …)`,PG 的 DISTINCT 聚合会**排序**,于是取到的是
+    **字典序**最靠前的(`BRAND` < `FLAGGED` < `GATED` < `IP` < `POLICY` <
+    `PROHIBITED_FINAL` < `RECALL`),不是最严重的。
+
+    ⚠ 只影响标签,**拉不拉黑不受影响**(任一够格即拉黑)。
+    """
+    from registry import resources
+    from services import blacklist as bl
+    order = resources.BLACKLIST_LABEL_ORDER
+    # 所有者给定的头五个,逐字钉住
+    assert order[:5] == ("BRAND", "IP", "POLICY", "PROHIBITED_FINAL", "RECALL")
+    # 覆盖面 = 够格永久拉黑的全部(七个永久码 + OTHER 的显式词条),不多不少
+    assert set(order) == set(et.PERMANENT_CODES) | {"OTHER"}
+    assert len(order) == len(set(order))
+    # 序真的起作用:字典序会选 BRAND/FLAGGED,严重度序选所有者要的那个
+    assert bl.worst_verdict([["PROHIBITED_FINAL", None], ["BRAND", None]]) \
+        == ("BRAND", None)                       # 所有者:品牌排第一
+    assert bl.worst_verdict([["RECALL", None], ["IP", None], ["POLICY", None]]) \
+        == ("IP", None)                          # 知产 > 禁售 > 召回
+    assert bl.worst_verdict([["FLAGGED", None], ["POLICY", None]]) \
+        == ("POLICY", None)                      # 字典序会选 FLAGGED,这里不许
+    # OTHER 排最后:混装桶不该盖过有名有姓的码
+    assert bl.worst_verdict([["OTHER", "business decision"], ["GATED", None]]) \
+        == ("GATED", None)
+    # 一个都不够格 → None(不拉黑),与序无关
+    assert bl.worst_verdict([["EXPIRED", None], ["PT_WRONG", None]]) is None
+
+
+def test_两个序是两个问题_不许互相套():
+    """⚠ `BLACKLIST_LABEL_ORDER` 与 `ERROR_CATEGORY_SEVERITY` **故意不一样**,
+    这不是双轨 —— 它们回答的是两个问题:
+
+      · `ERROR_CATEGORY_SEVERITY` —— **一条报错原文**里同时写了几个问题,主码取哪个;
+      · `BLACKLIST_LABEL_ORDER`   —— **一个产品的多条历史报错**都够格拉黑,标签取哪个。
+
+    2026-09-04 实测:把所有者给黑名单的那个序套到主码序上,78 条语料里会变
+    **1 条** —— 正是语料 #69 的 `PT_WRONG → POLICY`,等于推翻「类目选错是修法
+    不是禁令」的裁决(那 4 万条误拉黑的病根)。这条测试把那一行钉死。
+    """
+    from registry import resources
+    # 主码序里 PT_WRONG **必须**排在 POLICY 前面 —— 这一条就是那 4 万条的护栏
+    sev = resources.ERROR_CATEGORY_SEVERITY
+    assert sev.index("PT_WRONG") < sev.index("POLICY")
+    # 两个序不是同一个对象、成员也不同(后者只收够格永久拉黑的)
+    assert set(resources.BLACKLIST_LABEL_ORDER) < set(sev)
+    # 语料 #69 那条两句话的原文,主码必须仍是 PT_WRONG(可放)
+    row = REASONS[68]
+    assert "appropriate product type selected" in row["text"]
+    assert row["expect_code"] == "PT_WRONG"
+    assert et.classify_reasons(et.split_reasons(row["text"])).code == "PT_WRONG"
+    assert et.is_permanent("PT_WRONG", None) is False

@@ -530,6 +530,16 @@ def test_first_batch_is_capped_at_one():
     assert cap == 1 and "第一级" in note
 
 
+def test_stage_counts_confirmed_fleet_wide_but_open_rows_per_store():
+    """所有者 2026-09-07 定稿:1 → 10 验的是通道(店无关),confirmed 按全船队数;
+    pending/stalled 仍按店数(该店账没清就不发)。钉住 SQL 的两个作用域。"""
+    q = sm._SQL_STAGE
+    assert "(SELECT count(*) FROM listing.sku_migrations" in q
+    assert "WHERE status = 'confirmed')" in q
+    assert q.strip().endswith("WHERE store = %(store)s")
+    assert "全船队" in _cap(12, 0, 100)[1]
+
+
 def test_second_stage_is_capped_at_ten():
     cap, note = _cap(3, 0, 100)
     assert cap == 10 and "第二级" in note

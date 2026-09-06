@@ -55,7 +55,7 @@
      所有者实证过的故障模式,见 sku_codec 模块头注②)。
   ③ **写操作永不自动兜底**:提交失败当场回滚(换个码下轮重来),不补交、不换姿势;
      POST outcome=unknown **保持 pending**(见下「与 sku_plan 的有意出入」)。
-  ④ **一店一批的硬闸在代码里**(_stage_cap):零 confirmed ⇒ 上限 1;<10 ⇒ 上限 10;
+  ④ **一店一批的硬闸在代码里**(_stage_cap):全船队零 confirmed ⇒ 上限 1;<10 ⇒ 上限 10;
      还有 pending/stalled 未清 ⇒ 本轮只定案不提交。纪律没有默认值替你挡。
   ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案;
      配额上它吃 `feeds.post.MP_ITEM_MATCH` 桶(15/h),与**跟卖链 match_listing
@@ -384,8 +384,14 @@ WHERE store = %(store)s AND status = 'pending' AND submitted_at IS NULL
 ORDER BY id
 """
 
+#: 节奏闸的两个数:`open` 按**店**数(该店账没清就不发下一批),`confirmed` 按
+#: **全船队**数 —— 1 → 10 这两级验的是"通道能不能原地换码"这件店无关的事
+#: (2026-09-06 A085朱丽霖 已实证),所有者 2026-09-07 定稿:后面的店不必每家
+#: 重走 1 → 10。店相关的风险另有闸:凭证/在营(闸①)、受管仓节点判不出不回写
+#: (_restore_inventory fail-closed)。
 _SQL_STAGE = """
-SELECT count(*) FILTER (WHERE status = 'confirmed')             AS confirmed,
+SELECT (SELECT count(*) FROM listing.sku_migrations
+         WHERE status = 'confirmed')                            AS confirmed,
        count(*) FILTER (WHERE status IN ('pending', 'stalled')) AS open
 FROM listing.sku_migrations WHERE store = %(store)s
 """
@@ -914,9 +920,11 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 
       · 该店还有 pending/stalled 未定案 ⇒ 本轮上限 **0**(只定案,不提交):
         账没清就发下一批,一旦形态选错就是成批的双挂,而双挂只能人工一条条收;
-      · 零 confirmed ⇒ 1(第一级:先拿一个品把六件实测在生产上走通);
+      · **全船队**零 confirmed ⇒ 1(第一级:先拿一个品把通道在生产上走通);
       · 0 < confirmed < 10 ⇒ 10(第二级);
       · ≥10 ⇒ 不再压,按 asked_limit。
+    confirmed 按全船队数而不是按店数(所有者 2026-09-07 定稿):前两级验的是
+    通道,店无关;每家店重走 1 → 10 只是多两轮人工等待,不多一分安全。
 
     **`-p limit=` 只能收紧**:生效上限 = min(asked, 闸)。另外再叠一层
     FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED 的配额留量硬顶。
@@ -930,11 +938,11 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
         return 0, (f"节奏闸:该店还有 {n_open} 条改码未定案(pending/stalled),"
                    f"本轮**只定案不提交** —— 先把上一批的账清干净")
     if n_conf == 0:
-        stage, why = 1, "该店零 confirmed(第一级:一次只许 1 个品)"
+        stage, why = 1, "全船队零 confirmed(第一级:一次只许 1 个品)"
     elif n_conf < 10:
-        stage, why = 10, f"该店已 confirmed {n_conf} 个(第二级:上限 10)"
+        stage, why = 10, f"全船队已 confirmed {n_conf} 个(第二级:上限 10)"
     else:
-        stage, why = asked_limit, f"该店已 confirmed {n_conf} 个(节奏闸放行,按 -p limit)"
+        stage, why = asked_limit, f"全船队已 confirmed {n_conf} 个(通道已实证,节奏闸放行,按 -p limit)"
     eff = max(min(asked_limit, stage, quota_cap), 0)
     return eff, (f"节奏闸:本轮上限 {eff}(请求 {asked_limit};{why};"
                  f"配额留量硬顶 {quota_cap} = {FEEDS_PER_STORE_PER_RUN} 个 feed × "

@@ -168,6 +168,24 @@ def test_feed_type_constant_is_the_only_place_that_names_a_feedtype():
     assert len(hits) == 1 and hits[0].startswith("FEED_TYPE ="), hits
 
 
+def test_no_self_imposed_feed_or_item_ceiling_lives_in_this_workflow():
+    """源码守门:**可执行行**里不许再出现 `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED`。
+
+    只看可执行行(`#` 注释与模块 docstring 剔除):头注里要能把「它们是形态 A 时代
+    为 MP_MAINTENANCE 桶留量自设的、官方限的是 20 feed/h + 25MB、两道限都在 api 层」
+    讲清楚,那是文档不是第二道闸。加回来的表现不会报错 —— 整店真跑只发前 N 条就停,
+    而摘要读起来像官方配额(2026-09-06 A085朱丽霖:3371 个在线品只发了 1000 条)。
+    """
+    src = (_ROOT / "workflows" / "sku_migrate.py").read_text(encoding="utf-8")
+    body = src.replace(ast.get_docstring(ast.parse(src)) or "", "", 1)
+    hits = [ln for ln in body.splitlines()
+            if not ln.lstrip().startswith("#")
+            and any(t in ln for t in ("FEEDS_PER_STORE_PER_RUN", "ITEMS_PER_FEED"))]
+    assert not hits, f"改码又自设每轮上限了(2026-09-07 所有者纠正:不设):{hits}"
+    assert not hasattr(sm, "FEEDS_PER_STORE_PER_RUN")
+    assert not hasattr(sm, "ITEMS_PER_FEED")
+
+
 def test_sku_migrate_is_never_scheduled_but_is_named_in_the_manual_list():
     """永不进调度(R1):它是一次性、按批、人盯定案的破坏动作,而且与 13:00 的
     product_chain 抢同一个 MP_MAINTENANCE 桶。头注那份"手动清单"必须点它的名,
@@ -551,11 +569,20 @@ def test_limit_can_only_tighten_never_loosen():
     assert _cap(0, 0, 999)[0] == 1            # 第一级:limit 大也压到 1
 
 
-def test_quota_headroom_is_a_hard_ceiling():
-    """节奏闸放行之后仍有配额留量硬顶:一次最多 FEEDS_PER_STORE_PER_RUN 个 feed。"""
+def test_no_self_imposed_per_run_item_ceiling_survives():
+    """节奏闸放行之后**不再叠**「每轮 1000 条」的自设硬顶(2026-09-07 所有者纠正)。
+
+    那一层(2 个 feed × 500 条)是批次 3 还走 MP_MAINTENANCE(8/h,与 13:00 维护链
+    共享)时**为维护链留桶**自设的,**不是官方限制**:官方对 MP_ITEM_MATCH 是
+    20 feed/hour、单 feed 25MB,仓内两道限都已在 **api 层**(桶 15/h、切片
+    1000 条/24MB)。留着的表现是整店真跑 3371 个在线品只发了 1000 条就停,
+    而摘要说得像官方配额(2026-09-06 A085朱丽霖 实见)。
+    """
     cap, note = _cap(999, 0, 10 ** 6)
-    assert cap == sm.FEEDS_PER_STORE_PER_RUN * sm.ITEMS_PER_FEED
-    assert "配额留量硬顶" in note
+    assert cap == 10 ** 6                      # 放行档只按 -p limit,不再截
+    assert "配额留量硬顶" not in note
+    assert not hasattr(sm, "FEEDS_PER_STORE_PER_RUN")
+    assert not hasattr(sm, "ITEMS_PER_FEED")
 
 
 def test_no_new_submissions_while_pending_or_stalled_rows_exist():
@@ -1030,13 +1057,53 @@ def test_slice_results_line_up_with_their_own_rows(monkeypatch):
     assert rolled == ["B0AAA00002", "B0AAA00003"]      # 第一条才是 submitted
 
 
-def test_feeds_per_run_cap_is_enforced(monkeypatch):
-    """单店单轮最多 FEEDS_PER_STORE_PER_RUN 次提交:MP_MAINTENANCE 桶与维护链共享。"""
-    monkeypatch.setattr(sm, "ITEMS_PER_FEED", 1)
-    calls, _ = _migrate_wired(monkeypatch)
-    sm._migrate({"name": "T1"}, _rows_for(5), True)
-    assert len([c for c in calls if isinstance(c, tuple) and c[0] == "submit"]) \
-        == sm.FEEDS_PER_STORE_PER_RUN
+def test_the_whole_batch_goes_out_in_one_submit_call_and_lands_per_slice(monkeypatch):
+    """候选 2300 条 = **一次** `submit_feed` 调用,切片交给 api 层,台账逐片对位。
+
+    2026-09-07 所有者纠正:本层不再自设「每轮 2 个 feed × 500 条」——「一个 feed 提
+    1000 个,直到全部提交完」。切片是 api 层的事(`_SLICE_LIMITS["MP_ITEM_MATCH"]`
+    = 1000 条 / 24MB),这里用**真** `_slices` 切,钉三件:
+      · submit_feed 只被调一次(不是自己分批调 N 次);
+      · 回来 3 片 ⇒ 3 个**各不相同**的 feed_id;
+      · `iter_result_slices` 的对位没错位 —— 第 k 片的台账 id 正是 rows 里第 k 段
+        那几行(错一位 = 整片结局落到别人行上,而且不报错)。
+    """
+    from api import feeds as feeds_api
+
+    ids = iter(range(1000, 1000 + 2300))
+    conns: list = []
+
+    class _IdConn(_Conn):
+        def answer(self, sql):
+            return (["id"], [(next(ids),)]) if "RETURNING id" in sql else ([], [])
+
+    def _pg(*a, **k):
+        c = _IdConn(tag=f"tx{len(conns)}")
+        conns.append(c)
+        return c
+
+    monkeypatch.setattr(sm.db, "pg_conn", _pg)
+    monkeypatch.setattr(sm.sku_codec, "mint_replacement",
+                        lambda c, s, old, st, key, workflow="": "A" + old[2:])
+    submits: list = []
+
+    def _submit(store, ft, items, workflow=""):
+        submits.append((ft, workflow, len(items)))
+        return [{"outcome": "submitted", "feed_id": f"F{i}", "count": len(sl)}
+                for i, sl in enumerate(feeds_api._slices(ft, items), start=1)]
+
+    monkeypatch.setattr(sm.feeds, "submit_feed", _submit)
+
+    counts, _lines = sm._migrate({"name": "T1"}, _rows_for(2300), True)
+
+    assert submits == [("MP_ITEM_MATCH", "sku_migrate", 2300)]   # 一次,整批
+    assert counts == {"submitted": 2300, "unknown": 0, "rolled_back": 0}
+    landed = [(args["feed_id"], args["ids"])
+              for c in conns for sql, args in c.sqls
+              if "feed_id = %(feed_id)s" in sql]
+    assert [f for f, _ in landed] == ["F1", "F2", "F3"]          # feed_id 各不相同
+    assert [len(i) for _, i in landed] == [1000, 1000, 300]
+    assert [i[0] for _, i in landed] == [1000, 2000, 3000]       # 逐片对位不错行
 
 
 def test_dry_run_mints_nothing_and_posts_nothing(monkeypatch):
@@ -1564,15 +1631,18 @@ def test_rows_that_never_left_the_building_are_named_never_auto_settled(monkeypa
     assert any("落库未提交" in ln and "不自动定案" in ln for ln in lines)
 
 
-def test_candidates_beyond_the_quota_headroom_are_not_minted(monkeypatch):
-    """配额留量的截断在 **mint 之前**:先 mint 再截会造出"落库了但永远没发出去"
-    的孤儿,而那批行会让节奏闸永远看见 pending,整店从此发不出下一批。"""
-    monkeypatch.setattr(sm, "ITEMS_PER_FEED", 1)
+def test_every_candidate_is_minted_and_submitted_no_silent_truncation(monkeypatch):
+    """**本轮候选面有几条就 mint 几条、发几条**,没有第二道截断(2026-09-07)。
+
+    删掉的那道「超配额留量就只发前 N 个」是形态 A 时代自设的。留着的表现:整店
+    真跑 3371 个在线品只发 1000 条就停,摘要却说得像官方配额 —— 而所有者以为
+    整店发完了。候选面的唯一决定者是 `_stage_cap` × `-p limit`。
+    """
     calls, _ = _migrate_wired(monkeypatch)
     counts, lines = sm._migrate({"name": "T1"}, _rows_for(5), True)
-    minted = [c for c in calls if isinstance(c, tuple) and c[0] == "mint"]
-    assert len(minted) == sm.FEEDS_PER_STORE_PER_RUN     # 只 mint 发得出去的那些
-    assert any("超配额留量" in ln and "一个字都没落库" in ln for ln in lines)
+    assert len([c for c in calls if isinstance(c, tuple) and c[0] == "mint"]) == 5
+    assert counts["submitted"] == 5
+    assert not any("超配额留量" in ln for ln in lines)
 
 
 def test_submit_channel_is_open_by_default_after_the_2026_09_06_rewire(monkeypatch):

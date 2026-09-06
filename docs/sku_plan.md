@@ -610,7 +610,10 @@ feedType 与两个桶都已收录,只补注释与测试)。
 
 - **节奏硬闸**(`_stage_cap`,把口头节奏变成代码):该店还有 pending/stalled ⇒ 本轮
   上限 0(只定案不提交);零 confirmed ⇒ 1;<10 ⇒ 10;≥10 ⇒ 按 `-p limit`。
-  **`-p limit=` 只能收紧**;再叠一层配额留量硬顶 `FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED`。
+  **`-p limit=` 只能收紧**;~~再叠一层配额留量硬顶 `FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED`~~
+  **2026-09-07 删除**(所有者纠正,见 §9.12「去掉每轮 1000 条自设上限」):那是形态 A
+  时代为 MP_MAINTENANCE 桶自设的,不是官方限制。整店一轮发完,上限只有**速率桶**
+  (api 层 15/h)与**切片**(api 层 1000 条/24MB)。
 - **选谁改:点名 / 排除**(2026-09-03 所有者要求加;在此之前只能"按店 + 按数量",
   想挑着做只能靠 `ORDER BY w.sku` 的先来后到):
   `-p skus=<逗号分隔的旧 SKU>` 按旧码点名、`-p asins=<逗号分隔>` 按登记簿 `source_key`
@@ -871,12 +874,16 @@ python cli.py alloc_survey --dry-run
 python cli.py problem_scan --dry-run
 # 前两级全部 confirmed 之后再往上走
 python cli.py sku_migrate -p store=<试点店> -p limit=10       # 第二级
-python cli.py sku_migrate -p store=<试点店> -p limit=100000   # 第三级:整店
+python cli.py sku_migrate -p store=<试点店> -p limit=100000   # 第三级:整店(**一轮发完**)
+#   3371 个品 = 4 个 feed(1000+1000+1000+371),15/h 桶内一轮发完;**没有**每轮 1000 条
+#   的自设上限(2026-09-07 所有者纠正,§9.12),跨过速率桶时会在 api 层等
 #   整店时要留几个不动(比如正在做活动的品):-p exclude_skus= / -p exclude_asins=(排除优先)
 python cli.py sku_migrate -p store=<试点店> -p limit=100000 -p exclude_asins=<不改的ASIN>
 ```
 
-**④ 运行纪律**:改码只在 13:00 的 `product_chain` 之外跑(共享 MP_MAINTENANCE 桶);
+**④ 运行纪律**:改码吃 `feeds.post.MP_ITEM_MATCH` 桶(15/h),**与跟卖链
+`match_listing` 共享**(2026-09-06 通道定案后不再与 13:00 的维护链抢 MP_MAINTENANCE)
+—— 跟卖真跑那天别并跑;
 改码期间该店不得有人在 Seller Center 手工改同一批 item 的 SKU/Product ID;
 **旧仓 `product_clear` / `daily_cleanup` / `auto_listing` 调度必须已停**
 (`crontab -l | grep -Ei 'auto_listing|retire_and_relist|product_clear|daily_cleanup'` 输出为空)。
@@ -1216,7 +1223,7 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 | ③ | 删 `mp_mapper.build_sku_update_item`、`mp_mapper.build_orderable(sku_update=)`、`mp_conform.ORDERABLE_SYSTEM_SWITCHES` 的放行分支(形态 A/B 残留 = 双轨) | services |
 | ④ | 候选行带出**现挂价**(`w.price`)与 **Product ID 优先 GTIN**(`coalesce(w.gtin, w.upc)`),重量经登记簿 `source_key` LEFT JOIN `catalog.products.slow`,由 `mp_mapper.shipping_weight_ex` 解析(`_weight_of` 是改码侧的唯一出口) | `_SQL_CANDIDATES` / `_FROM` |
 | ⑤ | `_CONDS` 加一条判据:**有现挂价格**(`w.price IS NOT NULL AND w.price > 0`)。~~**有采集重量**(`(p.slow -> 'weight') IS NOT NULL`)+ Python 侧第二层剔除~~ **当天晚些时候整段删除**(见本节末「改码顺便把重量统一到准确值」):重量不再是判据,一律按新口径重写 | 同上 |
-| ⑥ | 配额口径改口:桶是 `feeds.post.MP_ITEM_MATCH` **15/h**(`api/_client.py:238`),与跟卖链共享,**不再与维护链抢** | `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 头注 |
+| ⑥ | 配额口径改口:桶是 `feeds.post.MP_ITEM_MATCH` **15/h**(`api/_client.py:238`),与跟卖链共享,**不再与维护链抢**。⚠ 当时只改了头注、**数字没跟着改**,两个常量已于 2026-09-07 整体删除(见本节末「去掉每轮 1000 条自设上限」) | ~~`FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 头注~~(已删) |
 | ⑦ | 反哺器防串扰:`match_sheet.sync_from_ledger` 与 `listing_sheet._SQL_HEAL_RECEIPT` 各加 **workflow 正向过滤**(改码与跟卖共用 feedType 之后,feed_type 已分不开两条链) | services |
 | ⑧ | ~~缺口 **G-4**:`_sync_sheet` 改为「先按 (店, 旧码) 的 SKU 列定位 → 旧行 SKU 列为空才退回 (店, ASIN) → **多行命中不写并点名**」~~ **当天晚些时候整段作废**:改码不回写上架表(见本节末「改码不回写上架表」) | `workflows/sku_migrate.py` |
 | ⑨ | 守门与文档:`test_feed_type_constant_is_the_only_place_that_names_a_feedtype` 只看可执行行;§8 决策 E/I 收口;`docs/api_blueprint.md` §5.1 与 `docs/db_schema.md` 的 `feed_type` 说明改口 | tests / docs |
@@ -1385,5 +1392,46 @@ ounce/oz、gram/g、kilogram/kg、milligram/mg、hundredths pound),数字后紧�
 10 个才能做剩下的吗?」—— 不需要。1 → 10 两级验的是「通道能否原地换码」,店无关,
 A085朱丽霖 已实证;`_stage_cap` 的 confirmed 改数全船队,pending/stalled 仍按店数
 (该店账没清就不发下一批)。店相关风险另有闸:闸①凭证/在营、受管仓节点判不出不回写库存。
-每轮仍有配额留量硬顶 1000 条(2 个 feed × 500),整店按轮走,每轮之间 catalog_sync +
-settle_only + feed_poll。
+~~每轮仍有配额留量硬顶 1000 条(2 个 feed × 500)~~ **当天作废**,见下一条;整店按轮走,
+每轮之间 catalog_sync + settle_only + feed_poll。
+
+#### 去掉每轮 1000 条自设上限(2026-09-07,所有者纠正)
+
+**现象**:整店真跑 A085朱丽霖(3371 个在线品)只发了 1000 条就停,摘要写着
+「配额留量硬顶 1000 = 2 个 feed × 500 条」。所有者:「这个限制不对吧,是一个 feed
+提 1000 个,直到全部提交完,而不是总共 1000 个吧?并且这个数量限制你是否查看了
+官方 api 的限制……我们之前也定过关于提交 feed 时的相关规则。」
+
+**来历**(核实结论):`FEEDS_PER_STORE_PER_RUN=2 × ITEMS_PER_FEED=500` 是批次 3
+**还走 MP_MAINTENANCE**(桶 8/h,与 13:00 维护链共享)时,为了**给维护链留桶**
+自设的一层,**不是官方限制**。2026-09-06 通道切到 MP_ITEM_MATCH(桶 15/h,与跟卖链
+共享,不再与维护链抢)之后,只改了这两个常量的**头注口径**(本节切换清单第 ⑥ 行),
+数字没跟着改 —— 于是一层"为已经不存在的冲突留的量"继续硬顶着整店改码,
+而摘要把它说得像官方配额。
+
+**官方限制出处**:MP_ITEM_MATCH = **20 feed/hour、单 feed 25MB**
+(`refdata/walmart_rate_limits.tsv:194`;`docs/api_blueprint.md` §3 表同一行)。
+仓内两道限**都已在 api 层**,不需要工作流再设第三道:
+
+| 限 | 官方 | 仓内 | 出生地 |
+|---|---|---|---|
+| feed 频率 | 20/hour | **15/hour**(95% 留量) | `api/_client.py:238` `feeds.post.MP_ITEM_MATCH` |
+| 单 feed 大小 | 25MB | **1000 条 / 24MB** | `api/feeds._SLICE_LIMITS["MP_ITEM_MATCH"]` |
+
+**既定规则**(不是这次新定的):`docs/plan.md` 工作流 6(maintenance)「意图上限
+按店化(所有者定稿 2026-08-26)……**新鲜度优先,单店整量当轮连发,如 15000 条 =
+8000+7000 两个 feed 连续提交**」。改码照同一条规则走。
+
+**改动**(`workflows/sku_migrate.py`,api 层**零改动**):
+
+| # | 改动 |
+|---|---|
+| ① | 删 `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 两个常量及其头注;常量区留一段注释写清来历与官方出处(守门测试钉住:可执行行里不许再出现这两个名字) |
+| ② | `_stage_cap` 去掉 `quota_cap` 那层,只剩 open→0 / 全船队 confirmed 的 1 → 10 → 按 `-p limit` |
+| ③ | `_migrate` 去掉「候选超配额留量」截断与自己分批的循环:**一次** `feeds.submit_feed(store, FEED_TYPE, _build_items(rows), workflow="sku_migrate")` 把整批交给 api 层切片,再用 `feeds.iter_result_slices(results, rows)` 逐片对位落账(submitted/dedup/failed/unknown 四档逻辑一字未改) |
+| ④ | 摘要/头注里「配额留量硬顶」全部改口:上限只有**速率桶(api 层)+ 切片(api 层)+ 节奏闸(1 → 10 → limit)** |
+
+**吞吐**:3371 个品 = 4 个 feed(1000+1000+1000+371),15/h 桶内一轮发完;真跨过桶时
+`api/_client.rate_acquire` 会抱锁等下一枚令牌 —— 这是**既有行为**,不在工作流层
+另写一道闸(§六:一个能力一条实现路径)。节奏闸仍在:该店有 pending/stalled 就
+本轮只定案不提交,全船队 confirmed < 10 时仍压到 1 / 10。

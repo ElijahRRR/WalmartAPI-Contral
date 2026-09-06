@@ -57,9 +57,13 @@
      POST outcome=unknown **保持 pending**(见下「与 sku_plan 的有意出入」)。
   ④ **一店一批的硬闸在代码里**(_stage_cap):全船队零 confirmed ⇒ 上限 1;<10 ⇒ 上限 10;
      还有 pending/stalled 未清 ⇒ 本轮只定案不提交。纪律没有默认值替你挡。
-  ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案;
-     配额上它吃 `feeds.post.MP_ITEM_MATCH` 桶(15/h),与**跟卖链 match_listing
-     共享** —— 不再与 13:00 的维护链抢 MP_MAINTENANCE,但跟卖真跑那天别并跑。
+  ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案。
+     **一轮发整店**:上限只有速率桶(api 层 `feeds.post.MP_ITEM_MATCH` 15/h,
+     api/_client.py:238)与切片(api 层 `_SLICE_LIMITS["MP_ITEM_MATCH"]` = 1000 条 /
+     24MB)+ 节奏闸(1 → 10 → 按 `-p limit`),**不再自设每轮条数**
+     (2026-09-07 所有者纠正,见 docs/sku_plan.md §9.12「去掉每轮 1000 条自设上限」;
+     既定规则见 docs/plan.md 工作流 6「新鲜度优先,单店整量当轮连发」)。
+     桶与**跟卖链 match_listing 共享** —— 跟卖真跑那天别并跑。
   ⑥ **dry-run 下 _settle 与 _migrate 都零写**:不 mint、不定案、不提交、
      不改处置、不删节点库存、不回写库存 —— 一行库、一条 feed 都不写
      (飞书本工作流**只读不写**:库存回写要读「维护仓库」判受管仓,见头注
@@ -176,15 +180,21 @@ OBSERVE_HOURS = 24
 #: 超期线:超过它仍判不出 ⇒ 落 stalled 点名人工,**不自动定案**(判不准就判活:
 #: 回滚一个其实已经生效的改码,会让登记簿说旧码、沃尔玛说新码,而且不报错)。
 STALE_HOURS = 72
-#: 单店单轮最多发几个 feed。桶是 `feeds.post.MP_ITEM_MATCH` **15/hour**
-#: (api/_client.py:238,官方 20/h 的 95% 留量),与**跟卖链 match_listing 共享** ——
-#: 改码不再与 13:00 的维护链抢 MP_MAINTENANCE 桶(那是形态 A 时代的事)。
-#: 吃光的表现是跟卖当轮发不出去,而摘要只会说"配额不足"看不出是谁吃的。
-FEEDS_PER_STORE_PER_RUN = 2
-#: 一个 feed 装几条。远低于 MP_ITEM_MATCH 的官方切片上限(1000 条 / 24MB,
-#: api/feeds._SLICE_LIMITS),这样「一次 submit_feed = 一个 feed」成立,
-#: FEEDS_PER_STORE_PER_RUN 才是**真闸**而不是估算。
-ITEMS_PER_FEED = 500
+# ⚠ **本工作流不再有「每轮最多几个 feed / 一个 feed 装几条」的自设常量**
+#   (2026-09-07 所有者纠正,见 docs/sku_plan.md §9.12)。删掉的那两个
+#   (每轮硬顶 2 个 feed × 500 条 = 1000 条)是批次 3 还走 MP_MAINTENANCE
+#   (8/h,与 13:00 维护链共享)时**为维护链留桶**自设的,**不是官方限制** ——
+#   通道切到 MP_ITEM_MATCH 之后它没有跟着改口,表现是整店真跑 3371 个在线品
+#   只发了 1000 条就停,而摘要说得像官方配额(2026-09-06 A085朱丽霖 实见)。
+#   官方对 MP_ITEM_MATCH 是 **20 feed/hour、单 feed 25MB**
+#   (refdata/walmart_rate_limits.tsv:194,docs/api_blueprint.md §3),仓内两道限
+#   **都已在 api 层**:速率桶 `feeds.post.MP_ITEM_MATCH` 15/h(api/_client.py:238)
+#   + 切片 `_SLICE_LIMITS["MP_ITEM_MATCH"]` = 1000 条 / 24MB(api/feeds.py)。
+#   既定规则见 docs/plan.md 工作流 6「意图上限按店化(所有者定稿 2026-08-26)…
+#   新鲜度优先,单店整量当轮连发,如 15000 条 = 8000+7000 两个 feed 连续提交」。
+#   所以 `_migrate` **一次 `submit_feed` 把整批交给 api 层切片**:3371 个品 =
+#   4 个 feed,15/h 桶内一轮发完;跨过桶时会在 api 层等(`_client.rate_acquire`
+#   吃光就抱锁等下一枚令牌,这是既有行为,不在本层另写一道闸)。
 #: -p limit 的缺省值(节奏闸只会把它压得更小,压不大)。
 DEFAULT_LIMIT = 10
 #: 逐候选的在途 feed 闸回看窗口。与 problem_scan._SQL_INFLIGHT 的 48h 同源:
@@ -926,14 +936,15 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
     confirmed 按全船队数而不是按店数(所有者 2026-09-07 定稿):前两级验的是
     通道,店无关;每家店重走 1 → 10 只是多两轮人工等待,不多一分安全。
 
-    **`-p limit=` 只能收紧**:生效上限 = min(asked, 闸)。另外再叠一层
-    FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED 的配额留量硬顶。
+    **`-p limit=` 只能收紧**:生效上限 = min(asked, 闸)。**本函数不再叠配额留量
+    硬顶**(2026-09-07 所有者纠正):每轮 1000 条那一层是形态 A 时代为维护链留
+    MP_MAINTENANCE 桶自设的,不是官方限制;发多少个 feed 由 api 层的速率桶与切片
+    天然限住(见常量区那段头注与 docs/sku_plan.md §9.12)。
     """
     with conn.cursor() as cur:
         cur.execute(_SQL_STAGE, {"store": store_name})
         row = cur.fetchone() or (0, 0)
     n_conf, n_open = int(row[0] or 0), int(row[1] or 0)
-    quota_cap = FEEDS_PER_STORE_PER_RUN * ITEMS_PER_FEED
     if n_open:
         return 0, (f"节奏闸:该店还有 {n_open} 条改码未定案(pending/stalled),"
                    f"本轮**只定案不提交** —— 先把上一批的账清干净")
@@ -943,10 +954,10 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
         stage, why = 10, f"全船队已 confirmed {n_conf} 个(第二级:上限 10)"
     else:
         stage, why = asked_limit, f"全船队已 confirmed {n_conf} 个(通道已实证,节奏闸放行,按 -p limit)"
-    eff = max(min(asked_limit, stage, quota_cap), 0)
+    eff = max(min(asked_limit, stage), 0)
     return eff, (f"节奏闸:本轮上限 {eff}(请求 {asked_limit};{why};"
-                 f"配额留量硬顶 {quota_cap} = {FEEDS_PER_STORE_PER_RUN} 个 feed × "
-                 f"{ITEMS_PER_FEED} 条)")
+                 f"**不再自设每轮条数** —— 整批一次交给 api 层,由速率桶 15/h 与"
+                 f"切片 1000 条/24MB 天然限住)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1227,8 +1238,10 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
          照"一个大事务包到底"写的话,进程死在 POST 之后、with 退出之前,
          新码行与 pending 台账全部 rollback,而沃尔玛已经受理 —— 新码成了
          一条没有出身的孤儿行,而且不报错。
-      ② 组载荷、③ 提交(每批 ≤ ITEMS_PER_FEED 条 = 一个 feed,最多
-         FEEDS_PER_STORE_PER_RUN 批)、④ 另开短事务按 outcome 落账:
+      ② 组载荷、③ 提交(**整批一次 `feeds.submit_feed`**,切片交给 api 层:
+         `api/feeds._SLICE_LIMITS` 的改码那一档 = 1000 条 / 24MB,回来几片就按
+         `feeds.iter_result_slices` 逐片对位落账 —— 本层**不再自设**每轮几个
+         feed、一个 feed 几条,见常量区头注)、④ 另开短事务按 outcome 落账:
            submitted/dedup 且有 feed_id ⇒ 落 feed_id + submitted_at(等观测定案);
            failed(4xx 或 token/代理阶段失败,api/feeds 已判**确认未达**)⇒ 当场回滚;
            unknown ⇒ **保持 pending 不回滚**(见模块头注「有意出入」)。
@@ -1241,15 +1254,9 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
         return counts, _preview(rows)
 
     store_name = store["name"]
-    # 配额留量的截断必须在 **mint 之前**:先 mint 再截,多出来的行就成了
-    # "落库了但永远没发出去"的孤儿 —— 它们不进 _SQL_OBSERVE(submitted_at 为空),
-    # 却让节奏闸永远看见 pending,整店从此发不出下一批。
-    # 正常路径上 _stage_cap 已经压过一次,这里是同一条闸的第二道保险。
-    cap = FEEDS_PER_STORE_PER_RUN * ITEMS_PER_FEED
-    if len(rows) > cap:
-        lines.append(f"  ⚠ 候选 {len(rows)} 个超配额留量 {cap},本轮只发前 {cap} 个"
-                     f"(其余**一个字都没落库**,下轮再来)")
-        rows = rows[:cap]
+    # ⚠ 这里**没有**"超配额留量就截断"那一层了(2026-09-07 所有者纠正,
+    #   docs/sku_plan.md §9.12):本轮候选面由 `_stage_cap` 与 `-p limit` 定,
+    #   多少条就发多少条 —— 整批交给 api 层切片,发几个 feed 是切片的机械后果。
     tally = _weight_tally(rows)
     if tally:                       # 真跑同样报兜底行数(dry-run 才有的数 = 没数)
         lines.append(tally.lstrip())
@@ -1278,34 +1285,34 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
     logger.info("改码台账已落库并提交:%s %d 条 pending(此刻才允许调接口)",
                 store_name, len(rows))
 
-    # ②③④ 分批提交,逐片对位落账
-    batches = [rows[i:i + ITEMS_PER_FEED]
-               for i in range(0, len(rows), ITEMS_PER_FEED)]
-    for batch in batches:
-        results = feeds.submit_feed(store, FEED_TYPE, _build_items(batch),
-                                    workflow="sku_migrate")
-        for res, slice_rows in feeds.iter_result_slices(results, batch):
-            if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
-                with db.pg_conn() as tx:
-                    tx.execute(_SQL_LEDGER_SUBMITTED,
-                               {"feed_id": res["feed_id"],
-                                "ids": [r["id"] for r in slice_rows]})
-                counts["submitted"] += len(slice_rows)
-                lines.append(f"  提交 {len(slice_rows)} 条(feed={res['feed_id']},"
-                             f"{res['outcome']}) —— **回执成功不定案**,等观测")
-            elif res["outcome"] == "failed":
-                why = "POST 被拒或确认未达(api/feeds 判定 failed)"
-                for r in slice_rows:
-                    _roll_back(store_name, r, why)
-                counts["rolled_back"] += len(slice_rows)
-                lines.append(f"  ⚠ 提交失败 {len(slice_rows)} 条,已**当场回滚**"
-                             f"(旧码复活、新码弃用);**不自动补交** —— "
-                             f"人核对原因后下一轮重来,会抽新码")
-            else:                              # unknown / deferred
-                counts["unknown"] += len(slice_rows)
-                lines.append(f"  ⚠ 提交结局不确定 {len(slice_rows)} 条,"
-                             f"**保持 pending 不回滚**(不知道到没到;回滚会造出"
-                             f"没有出身的孤儿码),留给启动对账与下一轮定案")
+    # ②③④ **整批一次提交**(切片在 api 层),逐片对位落账。
+    # `iter_result_slices` 的契约:submit_feed 的每个结果带 `count`,按
+    # `rows[i:i+count]` 顺次切 —— 与提交时同序等长即可对上,所以第 k 片的
+    # slice_rows 与第 k 个 feed_id 一一对应(错一位就是整片结局落到别人行上)。
+    results = feeds.submit_feed(store, FEED_TYPE, _build_items(rows),
+                                workflow="sku_migrate")
+    for res, slice_rows in feeds.iter_result_slices(results, rows):
+        if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:
+            with db.pg_conn() as tx:
+                tx.execute(_SQL_LEDGER_SUBMITTED,
+                           {"feed_id": res["feed_id"],
+                            "ids": [r["id"] for r in slice_rows]})
+            counts["submitted"] += len(slice_rows)
+            lines.append(f"  提交 {len(slice_rows)} 条(feed={res['feed_id']},"
+                         f"{res['outcome']}) —— **回执成功不定案**,等观测")
+        elif res["outcome"] == "failed":
+            why = "POST 被拒或确认未达(api/feeds 判定 failed)"
+            for r in slice_rows:
+                _roll_back(store_name, r, why)
+            counts["rolled_back"] += len(slice_rows)
+            lines.append(f"  ⚠ 提交失败 {len(slice_rows)} 条,已**当场回滚**"
+                         f"(旧码复活、新码弃用);**不自动补交** —— "
+                         f"人核对原因后下一轮重来,会抽新码")
+        else:                              # unknown / deferred
+            counts["unknown"] += len(slice_rows)
+            lines.append(f"  ⚠ 提交结局不确定 {len(slice_rows)} 条,"
+                         f"**保持 pending 不回滚**(不知道到没到;回滚会造出"
+                         f"没有出身的孤儿码),留给启动对账与下一轮定案")
     return counts, lines
 
 

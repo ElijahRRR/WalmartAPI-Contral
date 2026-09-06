@@ -136,10 +136,10 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | feedType / 端点 | 官方配额 | 官方大小/条数上限 | vs 旧认知 | 定稿 |
 |---|---|---|---|---|
 | MP_ITEM | 10/hour | 25MB;≤10000 条 | 一致(大小旧记 10MB 过时) | 8/hour |
-| MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour(**桶与维护链共享**:`maintenance` 的改标题/endDate、`problem_product_cleanup` 的反补、`sku_migrate` 的改码走同一个 `feeds.post.MP_MAINTENANCE`。sku_migrate 单店单轮硬顶 2 个 feed(`FEEDS_PER_STORE_PER_RUN`),运行纪律:改码只在 13:00 的 product_chain 之外跑) |
+| MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour(**桶与维护链共享**:`maintenance` 的改标题/endDate、`problem_product_cleanup` 的反补走同一个 `feeds.post.MP_MAINTENANCE`。~~`sku_migrate` 的改码 + 单店单轮硬顶 2 个 feed(`FEEDS_PER_STORE_PER_RUN`)~~ **已作废**:改码 2026-09-06 起走 MP_ITEM_MATCH,那两个自设常量 2026-09-07 删除,见 docs/sku_plan.md §9.12) |
 | DELETE_ITEM | 10/hour("代码零依据"的 10/hour 现已获官方背书) | **0.4MB(400KB)**;条数未单列(按 ≤10000 推定) | 旧 100KB 字节上限过于保守但方向对 | 6/hour;单 feed ≤350KB 且 ≤2500 条 |
 | RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | **6/hour**(实际落地值:按 DELETE_ITEM 同档保守;原定稿 10/day 未进代码)+ **迁移前实测是否仍被接受** |
-| MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour |
+| MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour(**桶与跟卖链共享**:`match_listing` 的跟卖、`sku_migrate` 的改码同一个 `feeds.post.MP_ITEM_MATCH`;两条链都**整批一次 submit_feed**,条数由切片 1000 条/24MB 定,工作流层不再自设每轮上限 —— 2026-09-07,见 docs/sku_plan.md §9.12) |
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | 硬限 10000 条;建议 1000 条/<10MB(413 口径官方标 Not applicable) | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | **8/hour**(2026-08-26 三源复核:三处官方一致 10/hour;6/day 确证只挂 feedType=promo 行且本仓无该路径;promo 行内矛盾官方未修,与三件套无关) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB;硬限 10000 条(1000 条/<10MB 是官方 "we recommend" 建议值,2026-08-26 核) | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
 | inventory | 10/hour | 10MB(旧记 ≤10000 item/ship node 无美区官方出处——属 DSV 文档,2026-08-26 降级为自设批次上限) | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |

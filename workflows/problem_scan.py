@@ -20,7 +20,9 @@
   scan   catalog.walmart_items 里 publishedStatus 非 PUBLISHED 且未缺席的行
          —— **一律建议删除**(所有者定稿 2026-08-28:「不再修改 End Date 救
          商品」,反补机制整体退役);归类(services/problem_products)保留,
-         但只进病历/黑名单/摘要,不再决定走向
+         但只进病历/黑名单/摘要,不再决定走向。
+         **lifecycle=RETIRED 全豁免**(所有者定稿 2026-09-06):实证删不掉、
+         后台一般不显示,见 _SQL_ITEMS 头注
   audit  审核链判 reject 但**还在架**的产品 —— 审核说不该卖、沃尔玛后台还挂着,
          这个缺口原来没有任何工作流盯着(批复 #8 要求补上)
 
@@ -83,12 +85,22 @@ logger = logging.getLogger("workflows.problem_scan")
 #     登记簿那一跳走 NOT EXISTS 而不是 JOIN:扫描面的行数不许被它改变。
 #     改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,结果集逐行不变。
 #   ⚠ 三列的**位置顺序不许动**(_load_state 按位置解包成 store/sku/reasons)。
+# RETIRED 全豁免(所有者定稿 2026-09-06)。依据三条:
+#   ① 实证无法清理:RETIRED 行(2026-09-06 库内 10,191 行)发 DELETE_ITEM 反复
+#      回 "deleted/retired" 类失败,删不掉,只烧 MP_MAINTENANCE 配额;
+#   ② 来路是沃尔玛列表接口的可见性变更(2026-08-28 起 GET /v3/items 列表把
+#      已删/已退役的死档也吐回来,单条 GET 404),不是我们主动退役的品——
+#      docs/plan.md 2026-08-28 条与 docs/sku_plan.md §8 决策 A 有记;
+#   ③ 后台一般也不显示,运营看不到、不会误以为在卖。
+# lifecycle 为 NULL 的行**不豁免**:NULL = 没采到,不知道是不是 RETIRED,
+# 按"判不准就判活"照扫(扫的结果是"建议删除",由下游处置件消费)。
 _SQL_ITEMS = """
 SELECT w.store, w.sku, w.unpublished_reasons
 FROM catalog.walmart_items w
 WHERE w.published_status IS NOT NULL
   AND w.published_status <> 'PUBLISHED'
   AND w.missing_since IS NULL
+  AND (w.lifecycle_status IS NULL OR w.lifecycle_status <> 'RETIRED')
   AND NOT EXISTS (SELECT 1 FROM catalog.listing_sources ls
                   WHERE ls.store = w.store AND ls.sku = w.sku
                     AND ls.replaced_by IS NOT NULL)

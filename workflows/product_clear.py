@@ -19,13 +19,14 @@
 
 动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复窗口,见下);
 删除或 **C 列留空 → DELETE_ITEM**(永久,仅自发货)。提交走 api/feeds 唯一通道
-⚠「可恢复」在本系统里目前只是一个**窗口 ≈ 到下一轮 problem_scan 为止**
-(2026-09-02 记):problem_scan._SQL_ITEMS(workflows/problem_scan.py:77-83)按
-published_status 非 PUBLISHED 且 missing_since IS NULL 扫、**无 lifecycle 豁免**,
-在途只挡 48h,而退市档案的观测形态正是 UNPUBLISHED + end date has passed ⇒ 停用的品
-一到两轮就会被自动链建议 DELETE;届时走弃码点 1(DELETE 经观测核验)正常收尾。
-要让停用真正长期可恢复,须给 problem_scan 加豁免(SKU 改造决策 A,尚未拍板;
-默认值 = 豁免另议)。
+「可恢复」自 2026-09-06 起是真的:problem_scan._SQL_ITEMS 对 lifecycle=RETIRED
+**全豁免**(所有者定稿,SKU 改造决策 A 收口;依据是 RETIRED 行实证删不掉、后台一般
+不显示,见 workflows/problem_scan.py 头注)。停用的品不再被自动链建议 DELETE,
+一直留到运营主动删除或恢复。此前(2026-09-02 记)它只是一个"窗口 ≈ 到下一轮
+problem_scan 为止",那段历史留在 docs/sku_plan.md §5。
+⚠ 豁免只看沃尔玛观测到的 lifecycle;RETIRE_ITEM 回执成功但 catalog_sync 尚未观测到
+RETIRED 之前的一轮,行仍在扫描面里 —— 靠在途/待观测 48h 预筛护住,与新品发布过渡态
+同一机制。
 ⚠ **RETIRE 本身不弃码**(决策 A 默认,conventions §九):码与 UPC 都还活着,
 登记簿 abandoned_at 保持 NULL —— 沃尔玛侧那条记录仍在、仍绑着我们的 UPC,
 抽新码去重上 = 同店两条同内容记录 + 白烧一个 UPC。守门测试反向钉死本工作流

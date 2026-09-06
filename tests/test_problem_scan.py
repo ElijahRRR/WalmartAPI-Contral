@@ -49,6 +49,10 @@ def test_scan_sql_covers_everything_not_published():
     assert "published_status <> 'PUBLISHED'" in scan._SQL_ITEMS
     assert "missing_since IS NULL" in scan._SQL_ITEMS
     assert "IN ('UNPUBLISHED'" not in scan._SQL_ITEMS   # 旧白名单口径不许回来
+    # RETIRED 全豁免(所有者定稿 2026-09-06):实证无法清理、后台一般不显示;
+    # NULL lifecycle 不豁免 —— 判不准就判活,但"活"在这里是"照扫",别把未知当 RETIRED。
+    assert "lifecycle_status <> 'RETIRED'" in scan._SQL_ITEMS
+    assert "lifecycle_status IS NULL OR" in scan._SQL_ITEMS
     import inspect
     assert "is_stage_pending" not in inspect.getsource(scan.plan)
 

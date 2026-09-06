@@ -362,10 +362,11 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
   口径一致,但意味着 24h 冷却闸只能依赖 `retire_feed_success`(kind=retire 恒记),
   不能依赖维护类回执。
 
-`problem_scan` 的扫描面是"一切非 PUBLISHED 且未缺席",没有 lifecycle 豁免;退役
+`problem_scan` 的扫描面曾是"一切非 PUBLISHED 且未缺席",没有 lifecycle 豁免;退役
 item 的观测形态正是 UNPUBLISHED +「end date has passed」。所以 product_clear
 停用一个品,**一到两轮后它就会被自动链当问题商品 DELETE 掉**,"停用可恢复"在本
-系统里只是个窗口(**决策 A**)。同理,若 0 库存真会触发 UNPUBLISHED(reason=
+系统里只是个窗口(**决策 A**;**2026-09-06 已定稿 RETIRED 全豁免**,见 §8 与 §9.11,
+本段留作定稿前的事实记录)。同理,若 0 库存真会触发 UNPUBLISHED(reason=
 Inventory,仅代码注释无生产记录),可逆清零也会被升级成永久删除。
 
 ## 6. 身份积木
@@ -675,12 +676,16 @@ feedType 与两个桶都已收录,只补注释与测试)。
       须同时改 `upc_pool.claim` 复用语义与 `_SQL_ATTEMPTS`。
 - [x] **存量产品**:迁到新码(2026-09-02 拍板),走 §7 批次 3 —— **三块全部实现**
       (工作流 `workflows/sku_migrate.py`);**生产投放尚未开始**,等六件单品实测。
-- [ ] **决策 A|停用要不要成为真正可恢复态**(批次 2 按默认实现:**RETIRE 不弃码**,
-      守门反向钉死 `product_clear` 不得调 abandon;problem_scan 豁免仍未拍板,
-      `workflows/product_clear.py` 头注已写明「可恢复窗口 ≈ 到下一轮 problem_scan」):给 problem_scan 加「lifecycle=RETIRED
-      且本仓提交过 retire_submitted」豁免(推翻 08-28「非 PUBLISHED 一律删除」的一
-      部分)+ RETIRE 不弃码(推荐);或不豁免、改采「停用回执成功即弃码」简化版
-      (永久失去可恢复,每次停用烧一个 UPC,且违背"不信回执信观测")。
+- [x] **决策 A|停用要不要成为真正可恢复态**(批次 2 按默认实现:**RETIRE 不弃码**,
+      守门反向钉死 `product_clear` 不得调 abandon)—— **2026-09-06 所有者定稿:
+      problem_scan 对 lifecycle=RETIRED 全豁免**(比原提案的「且本仓提交过
+      retire_submitted」更宽:不看谁退的,RETIRED 就不扫;NULL 不豁免)。落地
+      `workflows/problem_scan._SQL_ITEMS`,守门测试钉住。定稿依据不是"可恢复",
+      而是**实证删不掉**:08-28 可见性变更翻回来的 10,191 行 RETIRED 死档,DELETE_ITEM
+      反复回 deleted/retired 类失败,只烧 MP_MAINTENANCE 配额;后台一般也不显示。
+      副作用即原提案想要的:product_clear 停用的品从此不再被下一轮 problem_scan 建议
+      删除,「可恢复窗口」不再只是一轮 —— `workflows/product_clear.py` 头注措辞待同步
+      (见 §9.11 转出)。
 - [x] **决策 B|撞库 0101119 时码与 UPC 一起换**(取默认「换」,**批次 2 已落地**):
       `listing_sheet._mark_upc_conflicts` 一次 `abandon(reason=upc_conflict)`,
       号仍烧成 `conflict`(那个值的语义就是"号被别人占了")。改变 08-09「撞库只是
@@ -1111,3 +1116,27 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 唯一差异是 header version),旧仓同样"SUCCESS 但多数不变、少数会变"。所以它**不是
 本次改造引入的回归**,而是一条长期存在的沃尔玛侧行为;根因待所有者机器上的
 实例(我们发的标题 / 回执原文 / `GET /v3/items/{sku}` 现在的 productName)定。
+
+### 9.11 决策 A 收口:RETIRED 全豁免(2026-09-06,所有者定稿)
+
+**起因**:2026-09-05 维护链失败画像里最大三组(MP_MAINTENANCE deleted/retired 873、
+价格 1259、库存 789 条 not found)全部来自同一批行 —— 08-28 沃尔玛列表接口可见性变更
+翻回来的死档(`item_appeared` 按日统计当天尖峰,plan.md 工作流 8 行有记)。所有者
+最初记忆"以前拉取时没有这些行、某天突然进库",与记录吻合:不是我们修了什么导致
+进库,是沃尔玛那边把已删/已退役的档案重新吐进 `GET /v3/items` 列表(单条 GET 404)。
+
+**两个决定**(所有者原话:「RETIRED 全豁免,僵尸列表无法修,因为你能请求到,且后台
+确实可以查到这个产品,暂时不管这个」):
+① **problem_scan 对 `lifecycle_status = 'RETIRED'` 全豁免**。库内当日 RETIRED 10,191
+   行、非 PUBLISHED 23,318 行、PUBLISHED 70,879 行。落地 `_SQL_ITEMS` 一行条件 +
+   守门测试;NULL 不豁免(没采到 ≠ RETIRED,照扫)。这比 §8 决策 A 原提案「RETIRED 且
+   本仓提交过 retire_submitted」更宽 —— 定稿理由从"可恢复"换成了"实证删不掉":对这
+   批行发 DELETE_ITEM 只会反复回 deleted/retired 类失败,烧配额零效果。
+② **僵尸列表暂不处理**:列表接口对已删品仍返回 PUBLISHED/ACTIVE 而单条 GET 404 的
+   那批行(六个样本实证),不改 catalog_sync 的缺席判定。它们继续被维护链当在架品
+   发价格/库存 feed 并收 not found —— 已知代价,所有者接受;将来要修就在
+   catalog_sync 加"列表在、单条 404 ⇒ 标缺席"的二次核验(不是本役)。
+
+**联动改动**:`workflows/product_clear.py` 头注「可恢复窗口」措辞同步(§8 决策 A
+转出项收口);plan.md 工作流 8 行、production_cutover §5 各记一句。
+`services/problem_products` 归类不动 —— RETIRED 行本来就不再进扫描面,归类无从发生。

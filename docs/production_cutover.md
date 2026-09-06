@@ -160,6 +160,15 @@ warning 计数 —— 它不许混进"标题 N 条"里无声发生。
 那是采集问题;拿它当删除依据 = 采集抖动一次就删一批在架商品,而且不报错。
 `0.0` 才是明确的不像。
 
+### 5.2 problem_scan 对 RETIRED 全豁免(2026-09-06 起,所有者定稿)
+
+`workflows/problem_scan._SQL_ITEMS` 扫描面 = 非 PUBLISHED ∧ 未缺席 ∧ **lifecycle ≠ RETIRED**
+(NULL 照扫)。依据:08-28 可见性变更翻回来的 RETIRED 死档(10,191 行)对 DELETE_ITEM
+**实证删不掉**、后台一般不显示,建议删除只烧 MP_MAINTENANCE 配额。副作用:product_clear
+停用(RETIRE_ITEM)的品从此长期可恢复,不再被下一轮 problem_scan 建议删除。
+「僵尸列表」(列表接口仍返回已删品为 PUBLISHED/ACTIVE、单条 GET 404)所有者定为
+**暂不处理**。全文见 docs/sku_plan.md §9.11。
+
 ## 六、维护记录表 11 列(已落地)
 
 所有者 2026-08-16 在飞书加了两列,现为:

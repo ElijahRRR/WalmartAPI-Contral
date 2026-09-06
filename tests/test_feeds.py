@@ -138,6 +138,13 @@ def test_price_inventory_chunk_skus_and_slices():
     assert len(feeds._slices("inventory", entries)) == 2       # 4000/片
     assert feeds._chunk_skus("price", [{"sku": "X", "price": 1}]) == ["X"]
     assert feeds._chunk_skus("inventory", [{"sku": "Y", "qty": 0}]) == ["Y"]
+    # 2026-09-07 生产实见(谭总12):MP_INVENTORY 漏在 dict 类型表外 ⇒ 台账 sku 列
+    # 落的是 str(dict),维护记录反哺永远「台账查无」。每种 dict 条目的 feedType 都要在表里。
+    assert feeds._chunk_skus("MP_INVENTORY",
+                             [{"sku": "Z", "qty": 3, "ship_node": "N1"}]) == ["Z"]
+    for ft in ("price", "inventory", "MP_INVENTORY", "MP_MAINTENANCE",
+               "MP_ITEM", "MP_ITEM_MATCH"):
+        assert not feeds._chunk_skus(ft, [{"sku": "Q"}])[0].startswith("{"), ft
 
 
 def test_put_price_and_put_inventory(monkeypatch):

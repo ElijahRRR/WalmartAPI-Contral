@@ -260,7 +260,10 @@ def mark_feed_done(feed_id: str, ok: bool) -> None:
 
 
 def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
-    if feed_type in ("MP_MAINTENANCE", "price", "inventory",
+    # ⚠ MP_INVENTORY(受管仓分节点库存,条目 {sku, qty, ship_node})此前漏在这张表外
+    #   (2026-09-07 生产实见,谭总12):漏了就走下面的 str(dict),台账 sku 列存的是
+    #   整个 dict 的字符串,回执反哺永远「台账查无」、行永远「处理中」,而且不报错。
+    if feed_type in ("MP_MAINTENANCE", "price", "inventory", "MP_INVENTORY",
                      "MP_ITEM_MATCH", "MP_ITEM"):
         # dict 条目:sku 在顶层或嵌在 Orderable 里(反补载荷是后者)
         # ⚠ 改码载荷的 Orderable.sku 是**新码**,故 ops.feed_items 台账按新码落账

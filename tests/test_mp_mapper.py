@@ -475,3 +475,27 @@ def test_orderable_ships_the_parsed_pounds_and_falls_back_otherwise():
     o2 = m.build_orderable("B0X", "0123", 10, 1, "P1", pt="Cups",
                            product={"attrs": {"weight": {"package": "12 pounds"}}})
     assert o2["ShippingWeight"] == m.DEFAULT_SHIPPING_WEIGHT
+
+
+# ── 2026-09-06 全库单位直方图(所有者 SQL)对照:长尾里有定义的两个记号 + 双词/夹杂形态 ──
+def test_histogram_long_tail_units_with_a_definition_are_converted():
+    """milligrams(197 行)与 "hundredths pound"(94 行,亚马逊百分之一磅)有官方定义,
+    进表;foot_ounces / tons / gravity 之类没有重量定义的记号仍判 unknown_unit。"""
+    from services import mp_mapper as m
+    lbs, why = m._parse_weight_value("197 milligrams")
+    assert why == "parsed" and abs(lbs - 197 / 1000 / m.GRAMS_PER_POUND) < 1e-9
+    assert m._parse_weight_value("0.5 hundredths pound") == (0.005, "parsed")
+    assert m._parse_weight_value("1 foot_ounces") == (None, "unknown_unit")
+    assert m._parse_weight_value("3 tons") == (None, "unknown_unit")
+
+
+def test_unit_word_is_read_even_when_followed_by_punctuation_or_a_second_measure():
+    """直方图里的 "ounces(181.44 g)" / "kg/6.8lbs" / "600g / 1.3lb" 这类:取数字后紧跟的
+    字母词当单位;非字母记号("克")仍是 unknown_unit,而不是 no_unit。"""
+    from services import mp_mapper as m
+    assert m._parse_weight_value("6.4 ounces(181.44 g)") == (0.4, "parsed")
+    lbs, why = m._parse_weight_value("3.1 kg/6.8lbs")
+    assert why == "parsed" and abs(lbs - 3.1 * m.POUNDS_PER_KILOGRAM) < 1e-9
+    assert m._parse_weight_value("item weight: 600g / 1.3lb")[1] == "parsed"
+    assert m._parse_weight_value("5 克") == (None, "unknown_unit")
+    assert m._parse_weight_value("300") == (None, "no_unit")

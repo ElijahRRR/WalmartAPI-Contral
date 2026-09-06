@@ -649,6 +649,13 @@ _UNIT_TO_LBS: dict[str, float] = {
     "g": 1.0 / GRAMS_PER_POUND,
     "kilogram": POUNDS_PER_KILOGRAM, "kilograms": POUNDS_PER_KILOGRAM,
     "kg": POUNDS_PER_KILOGRAM,
+    # 2026-09-06 全库 item 侧单位直方图(所有者 SQL)长尾里两个**有定义**的记号:
+    # milligrams 197 行(1 mg = 1/1000 g)、"hundredths pound" 94 行(亚马逊的
+    # 百分之一磅单位)。其余长尾(foot_ounces / tons / gravity / 整段文案)不认。
+    "milligram": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "milligrams": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "mg": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "hundredths pound": 0.01, "hundredths pounds": 0.01,
 }
 
 #: "3.5 pounds" / "12.8 ounces" / "860grams" —— 数字 + 紧随其后的单位记号。
@@ -656,6 +663,9 @@ _UNIT_TO_LBS: dict[str, float] = {
 #: 而不是 no_unit —— 两档都写 1 磅,但摘要里"单位不认识"与"根本没有单位"是
 #: 两件事,采集契约要靠这个区分去核实。
 _NUM_UNIT = re.compile(r"(-?\d+(?:\.\d+)?)\s*([^\s\d]+)?")
+#: 数字后面紧跟的**字母词**(最多两个,给 "hundredths pound" 这种双词单位):
+#: "ounces(181.44 g)" 取 "ounces","kg/6.8lbs" 取 "kg","600g / 1.3lb" 取 "g"。
+_UNIT_WORDS = re.compile(r"\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)")
 
 #: dict 形态 {value|measure|amount, unit|units|unitOfMeasure} 的取值键序。
 _WEIGHT_VALUE_KEYS = ("value", "measure", "amount")
@@ -692,13 +702,21 @@ def _parse_weight_value(v) -> tuple[float | None, str]:
         if not m:
             return None, "no_weight"             # "N/A" / 空串:根本没有数字
         num = float(m.group(1))
-        unit = unit or (m.group(2) or "")
+        if not unit:
+            tail = v[m.end(1):]
+            mw = _UNIT_WORDS.match(tail)
+            if mw:
+                unit = mw.group(1)
+            elif m.group(2):
+                unit = m.group(2)               # 有记号但不是字母(如 "克"):unknown_unit
     else:
         return None, "no_weight"
-    key = unit.strip().strip(".,;:()[]").lower()
+    key = " ".join(unit.strip().strip(".,;:()[]").lower().split())
     if not key:
         return None, "no_unit"
     mult = _UNIT_TO_LBS.get(key)
+    if mult is None and " " in key:              # 双词没命中,退回首词("lbs foo" → lbs)
+        mult = _UNIT_TO_LBS.get(key.split()[0])
     if mult is None:
         return None, "unknown_unit"
     return num * mult, "parsed"

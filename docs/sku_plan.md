@@ -1367,3 +1367,16 @@ IS NULL`)、摘要首行的「⚠ 上架表 SKU 列未同步 N 行」与明细�
 `_sync_sheet`)+ `test_confirmed_never_touches_the_listing_sheet`(定案不碰上架表、
 不写那一列)。缺口 G-4 的三条用例(按旧码定位 / 空 SKU 列退回 ASIN / 重复 ASIN 不猜)
 随实现一起删除。
+
+**重量解析器与全库单位直方图对照(2026-09-06,所有者 SQL)**:采集 weight 的值在
+`item` 侧(`package` 1,243,098 行为空),形态是「数字 + 单位词」串。单位词分布:
+pounds 275,426 / ounces 181,891 / kg 139,226 / g 67,726 / milligrams 197 /
+hundredths pound 94 / lbs 86 / lb 32 / oz 18 / foot_ounces 16 / 空 16 / lbs. 4 / pound 4,
+其余是整段文案或 tons、gravity 之类无重量定义的记号。解析器只认表内记号(pound/lb、
+ounce/oz、gram/g、kilogram/kg、milligram/mg、hundredths pound),数字后紧跟的字母词当
+单位(所以 "ounces(181.44 g)" / "kg/6.8lbs" 也能读),表外一律 unknown_unit 走 1 磅。
+全库两侧皆空 587,615 / 1,252,457 行 —— 这些品上架与改码都写 1 磅(所有者定稿),
+**不用大模型补重量**:重量不可由文案推出,且 ShippingWeight 是禁止 LLM 填写的系统字段;
+要提高覆盖只能改采集侧(亚马逊详情页 Item Weight / Package Dimensions)。
+第二级投放里发成 300 / 860「磅」的两个品真实重量是 0.66 / 1.9 磅(300 g / 860 g),
+所有者手工纠正;此后改码统一按解析器写重量。

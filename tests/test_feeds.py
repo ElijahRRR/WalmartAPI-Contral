@@ -647,13 +647,20 @@ def test_chunk_skus_takes_the_new_code_from_a_migrate_payload():
 def test_match_payload_wraps_migrate_items_unchanged():
     """api 层只包信封不碰内容(铁律 2):改码 Item 原样进 MPItem[{Item:…}]。
 
-    MP_ITEM_MATCH 的 header 是 sellingChannel 制的 v4.2,`processMode=REPLACE`
-    —— 改码正是靠 REPLACE 在同一个 item 上原地换码(2026-09-06 所有者实测)。
+    **2026-09-07 升 v5**(v4.2 同日退役):header 换成与 MP_ITEM 同款的
+    businessUnit 制**三字段封闭**,依据是官方规范原件 refdata/specs/ 那一份
+    (`MPItemFeedHeader` required 三个 + additionalProperties=false)。v4.2 的
+    `{processMode: REPLACE, subset, sellingChannel}` 在 v5 里是三个未知字段 ——
+    REPLACE 语义没变(同 GTIN + 新 SKU 原地换码,2026-09-06 所有者实测),它只是
+    不再由 header 里的一个开关表达。逐字对规范的守门在 tests/test_match_spec_v5.py。
     """
     item = _migrate_item()
     p = feeds.build_payload("MP_ITEM_MATCH", [item])
     assert p["MPItem"] == [{"Item": item}]
-    assert p["MPItemFeedHeader"]["processMode"] == "REPLACE"
+    assert p["MPItemFeedHeader"] == {
+        "businessUnit": "WALMART_US", "locale": "en",
+        "version": resources.FEED_SPEC_VERSIONS["MP_ITEM_MATCH"]}
+    assert "processMode" not in json.dumps(p)   # v4.2 的 header 三件套已退役
     assert p["MPItem"][0]["Item"]["productIdentifiers"] == {
         "productIdType": "GTIN", "productId": "00121678236703"}
     assert "SkuUpdate" not in json.dumps(p)     # 通道不需要这个开关字段

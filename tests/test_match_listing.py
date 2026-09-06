@@ -40,6 +40,13 @@ def test_build_match_item_five_fields_per_verified_sample():
                                        product_id="00012345678905",
                                        product_id_type="GTIN")
     assert bare["productIdentifiers"]["productId"] == "00012345678905"
+    # 2026-09-07 通道升 v5:Item 多了可选 `inventory`,**跟卖链不给就一个字节都不多发**
+    # (跟卖新 offer 的库存由维护链正式出口写,与 v4.2 时代逐字一致);
+    # 给了才带,形状是官方原件那个两字段闭集(守门在 tests/test_match_spec_v5.py)
+    assert "inventory" not in item and "inventory" not in bare
+    with_inv = match_feed.build_match_item(None, "S", 1, 1, product_id="1",
+                                           inventory=(30, "N1"))
+    assert with_inv["inventory"] == [{"quantity": 30, "fulfillmentCenterID": "N1"}]
 
 
 def _wire(monkeypatch, sheet_rows, spec_results, stores=(STORE,)):

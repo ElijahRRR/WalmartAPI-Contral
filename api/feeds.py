@@ -133,13 +133,20 @@ def build_payload(feed_type: str, entries: list) -> dict:
                                      "locale": "en", "version": ver},
                 "MPItem": [_sanitize(e) for e in entries]}
     if feed_type == "MP_ITEM_MATCH":
-        # 跟卖 v4.2(蓝图 §5.4 定稿):sellingChannel 制 header,与 v5 的
-        # businessUnit 制不同套;processMode 只有 REPLACE(同 sku 覆盖,幂等);
-        # 条目为完整 Item dict(SPEC 预填模板 + 我方字段,services 层构造)
-        return {"MPItemFeedHeader": {"processMode": "REPLACE",
-                                     "subset": "EXTERNAL", "locale": "en",
-                                     "sellingChannel": "mpsetupbymatch",
-                                     "version": ver},
+        # 跟卖 + 改码 v5(2026-09-07 升版,v4.2 同日退役)。header 与 MP_ITEM 同款
+        # **businessUnit 制三字段**,依据是官方规范原件
+        # refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json:
+        # `MPItemFeedHeader` required = [businessUnit, locale, version] 且
+        # additionalProperties=false ⇒ **多一个字段就是未知字段**。
+        # ⚠ v4.2 那套 {processMode: REPLACE, subset: EXTERNAL,
+        # sellingChannel: mpsetupbymatch} 在 v5 规范里**根本不存在**,已整段作废
+        # —— REPLACE 语义仍在(同 GTIN + 新 SKU 原地换码、载荷给什么线上就是什么),
+        # 只是它不再是 header 里的一个开关,而是这条 feedType 的固有行为。
+        # 条目仍是 `{"Item": {...}}` 包装(v5 的 MPItem[] 每项 required=['Item'],
+        # **不是** MP_ITEM 的 Orderable/Visible 分段),内容为完整 Item dict
+        # (SPEC 预填模板 + 我方字段,services 层构造;api 层只包信封,铁律 2)
+        return {"MPItemFeedHeader": {"businessUnit": "WALMART_US",
+                                     "locale": "en", "version": ver},
                 "MPItem": [{"Item": _sanitize(e)} for e in entries]}
     if feed_type == "inventory":
         # InventoryFeed v1.4:Inventory 首字母**必须大写**(小写 →

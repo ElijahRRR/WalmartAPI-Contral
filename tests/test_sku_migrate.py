@@ -296,7 +296,8 @@ def test_another_workflows_pending_feed_does_not_block(monkeypatch):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _CAND_COLS = ["store", "old_sku", "source_type", "source_key",
-              "product_id", "product_id_type", "price", "product_slow"]
+              "product_id", "product_id_type", "price", "avail_qty",
+              "product_slow"]
 
 #: 候选行的采集 slow 段。这个形状与 catalog.products.slow / amz_source 的
 #: `attrs` 逐字同源(`mp_mapper.shipping_weight_ex` 的输入)。
@@ -305,9 +306,12 @@ _CAND_COLS = ["store", "old_sku", "source_type", "source_key",
 _SLOW = {"weight": {"package": "0.82 lbs"}}
 
 
-def _cand(old_sku, pid="0001", src="amz", key=None, price=29.99, slow=_SLOW):
+def _cand(old_sku, pid="0001", src="amz", key=None, price=29.99, slow=_SLOW,
+          qty=None):
+    """候选行元组。`qty` = 旧码行最后观测的 `avail_qty`(2026-09-07 随通道升 v5
+    带出):**缺省 None = 从没观测到**,那样的行载荷不带库存(不猜 0)。"""
     return ("T1", old_sku, src, key or "B0" + old_sku[-8:], pid, "GTIN",
-            price, slow)
+            price, qty, slow)
 
 
 def test_opaque_and_match_rows_are_excluded_by_the_candidate_sql():
@@ -999,6 +1003,100 @@ def test_payload_uses_the_new_code_and_the_observed_product_id(monkeypatch):
     assert item["price"] == 29.99 and item["ShippingWeight"] == 0.82
     assert item["condition"] == "New"
     assert "SkuUpdate" not in item          # 通道不需要这个开关字段(形态 A/B 已废)
+    # 这几行没观测到库存(`_rows_for` 缺省不给 avail_qty)⇒ 载荷不带 inventory,
+    # 而且**一次飞书都不读**(见下面那条守门)
+    assert "inventory" not in item
+
+
+# ── 库存随改码 feed 一起发(2026-09-07 通道升 v5;安全约束⑦)────────────────
+#  v4.2 时代载荷里没有库存字段,REPLACE 把「没带」当 0 写 —— 第一级投放把旧码
+#  最后观测的 30 件写成了 0(§9.12)。v5 的 Item 有可选 inventory[],于是库存
+#  跟着载荷走,定案回写只剩兜底。下面四条钉的是"错了不报错"的那几件:
+#  qty 从哪一列来、FC 从哪个入口来、判不出时**不猜**、以及不该读飞书时不读。
+
+def _nodes(monkeypatch, ok=None, skipped=None):
+    """把受管仓入口打桩,并记录 `managed_nodes` 被调了几次(一轮只许一次)。"""
+    seen: list = []
+
+    def _mn(stores=None):
+        seen.append(stores)
+        return dict(ok or {}), dict(skipped or {})
+
+    monkeypatch.setattr(sm.store_limits, "managed_nodes", _mn)
+    return seen
+
+
+def test_payload_carries_the_last_observed_inventory_with_the_listing_fc(monkeypatch):
+    """qty = 旧码行最后观测的 `avail_qty`,FC = 上架链同一个入口 `listing_fc`。
+
+    这两件错了都不报错:qty 拿错列 ⇒ 改码顺手改了库存;FC 自己拼一个 ⇒ 货
+    写到别的节点(正是 `store_limits.resolve_node` 拼命避免的那件事)。
+    """
+    calls, _ = _migrate_wired(monkeypatch)
+    seen = _nodes(monkeypatch, ok={"T1": "N1"})
+    rows = _rows_for(2)
+    for r, q in zip(rows, (30, 0)):
+        r["avail_qty"] = q
+    _counts, lines = sm._migrate({"name": "T1"}, rows, True)
+    items = [c for c in calls if isinstance(c, tuple) and c[0] == "submit"][0][4]
+    assert items[0]["inventory"] == [{"quantity": 30, "fulfillmentCenterID": "N1"}]
+    assert items[1]["inventory"] == [{"quantity": 0, "fulfillmentCenterID": "N1"}]
+    assert len(seen) == 1                      # 飞书受管仓表**一轮只读一次**
+    assert any("载荷带库存 2/2" in ln for ln in lines)
+
+
+def test_a_row_that_was_never_observed_carries_no_inventory(monkeypatch):
+    """`avail_qty` 为 NULL ⇒ **不带** inventory(不猜 0:REPLACE 会照写 0)。"""
+    calls, _ = _migrate_wired(monkeypatch)
+    _nodes(monkeypatch, ok={"T1": "N1"})
+    rows = _rows_for(2)
+    rows[0]["avail_qty"] = 7                   # 一行有观测,另一行没有
+    _counts, lines = sm._migrate({"name": "T1"}, rows, True)
+    items = [c for c in calls if isinstance(c, tuple) and c[0] == "submit"][0][4]
+    assert items[0]["inventory"] == [{"quantity": 7, "fulfillmentCenterID": "N1"}]
+    assert "inventory" not in items[1]
+    assert any("载荷带库存 1/2" in ln for ln in lines)
+
+
+def test_a_store_whose_managed_node_fails_validation_sends_no_inventory(monkeypatch):
+    """受管仓校验失败 ⇒ **不带库存、不回落 Partner ID**,摘要点名(fail-closed)。
+
+    回落 Partner ID 才是最坏的那条:货被写到旧节点,而且全程不报错。
+    """
+    calls, _ = _migrate_wired(monkeypatch)
+    _nodes(monkeypatch, skipped={"T1": "「维护仓库」填的 N9 不在该店发货节点列表里"})
+    monkeypatch.setattr(sm.store_limits, "listing_fc",
+                        lambda *a, **k: pytest.fail("校验失败的店不许回落 Partner ID"))
+    rows = _rows_for(1)
+    rows[0]["avail_qty"] = 30
+    _counts, lines = sm._migrate({"name": "T1"}, rows, True)
+    items = [c for c in calls if isinstance(c, tuple) and c[0] == "submit"][0][4]
+    assert "inventory" not in items[0]         # 改码照发,只是不带库存
+    assert any("受管仓校验失败" in ln and "T1" in ln for ln in lines)
+    assert any("载荷带库存 0/1" in ln for ln in lines)
+
+
+def test_no_observed_qty_means_the_feishu_table_is_not_even_read(monkeypatch):
+    """本轮没有一行观测到库存 ⇒ **一次飞书、一次沃尔玛都不调**(零成本零行为变化)。"""
+    _migrate_wired(monkeypatch)
+    monkeypatch.setattr(sm.store_limits, "managed_nodes",
+                        lambda stores=None: pytest.fail("没有库存可带就不该读受管仓表"))
+    counts, _lines = sm._migrate({"name": "T1"}, _rows_for(2), True)
+    assert counts["submitted"] == 2
+
+
+def test_the_preview_names_the_inventory_of_every_line():
+    """dry-run 逐行标「库存 N → FC xxx」/「不带库存(未观测)」。
+
+    预览与真发共用 `_item_of` 的同一条判据,所以纸面上的那句就是发出去的那件事。
+    """
+    rows = _rows_for(2)
+    rows[0]["avail_qty"] = 30
+    lines = sm._preview(rows, "N1")
+    body = "\n".join(lines)
+    assert "库存 30 → FC N1" in body
+    assert "不带库存(未观测)" in body
+    assert "库存:1/2 条随载荷带库存" in body
 
 
 def test_submitted_slices_land_the_feed_id_and_stay_pending(monkeypatch):
@@ -1716,6 +1814,10 @@ def test_the_candidate_sql_still_carries_the_slow_blob_for_the_parser():
         assert "p.asin = ls.source_key" in sql
         assert "p.marketplace = %(marketplace)s" in sql
     assert "p.slow AS product_slow" in sm._SQL_CANDIDATES
+    # 旧码行最后观测的库存也在候选面上(2026-09-07 升 v5:载荷自己带库存)。
+    # 它**不是判据** —— 没观测到的行照样改码,只是不带 inventory
+    assert "w.avail_qty AS avail_qty" in sm._SQL_CANDIDATES
+    assert "avail_qty" not in " ".join(sql for _n, _w, sql in sm._CONDS)
     conn = _Conn([("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
                   ("FROM ops.feed_items", (["sku"], []))])
     sm._candidates(conn, "T1", 10)

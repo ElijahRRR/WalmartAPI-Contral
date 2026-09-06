@@ -1435,3 +1435,61 @@ A085朱丽霖 已实证;`_stage_cap` 的 confirmed 改数全船队,pending/stall
 `api/_client.rate_acquire` 会抱锁等下一枚令牌 —— 这是**既有行为**,不在工作流层
 另写一道闸(§六:一个能力一条实现路径)。节奏闸仍在:该店有 pending/stalled 就
 本轮只定案不提交,全船队 confirmed < 10 时仍压到 1 / 10。
+
+#### MP_ITEM_MATCH 升 v5、改码带库存(2026-09-07)
+
+**依据是官方规范原件**,不是文档推断也不是模板反推:所有者从开发者门户下载的
+`refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json`(draft-07,40KB)已进仓,
+守门测试 `tests/test_match_spec_v5.py` **现读它**校载荷(不写第二份字段清单)。
+原件说的四件事:
+
+| 位置 | 原件事实 |
+|---|---|
+| `MPItemFeedHeader` | required = [businessUnit, locale, version],`additionalProperties:false`;businessUnit enum 含 WALMART_US;locale enum ['en'];version enum **只有 `5.0.20260607-22_38_54-api`** |
+| `MPItem[]` | 每项 required=['Item']、`additionalProperties:false` ⇒ **仍是 `{Item:{…}}` 包装**,不是 MP_ITEM 的 Orderable/Visible 分段 |
+| `Item` | required = [productIdentifiers, sku, condition, ShippingWeight, price],`additionalProperties:false`;可选 **inventory** / productName / mainImageUrl / externalProductIdentifier / stateRestrictions / productSecondaryImageURL / restoredProductIdentifier。productIdType enum [EAN,GTIN,ISBN,ISSN,UPC];sku maxLength 50;price multipleOf 0.01;ShippingWeight multipleOf 0.001 |
+| `Item.inventory` | array,minItems 1,每项 required=[quantity(integer ≥0), fulfillmentCenterID(string)],`additionalProperties:false` |
+
+⇒ **v4.2 那套 `{processMode, subset, sellingChannel}` header 在 v5 里不存在**,发过去
+就是三个未知字段(而 `additionalProperties:false` 的东西发错了是整批退回,本地看不出
+任何异常)。REPLACE 语义**没变**——同 GTIN + 新 SKU 原地换码仍然成立,它只是不再由
+header 里的一个开关表达,而是这条 feedType 的固有行为。
+
+**v4.2 同日退役,跟卖链与改码链一起升**(一个 feedType 一条实现路径,§六:留一条
+v4.2 兼容路径就是双轨,而两条路径的副作用完全不同)。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | `FEED_SPEC_VERSIONS["MP_ITEM_MATCH"] = "5.0.20260607-22_38_54-api"`(注释写明出处 = refdata/specs 那份原件 + v4.2 退役日期) | `registry/resources.py` |
+| ② | `build_payload` 的 MP_ITEM_MATCH 分支:header → `{businessUnit: WALMART_US, locale: en, version: ver}`;条目仍包成 `{"Item": _sanitize(e)}`。api 层只改信封、不加业务判断(铁律 2) | `api/feeds.py` |
+| ③ | `build_match_item(..., inventory: tuple[int, str] \| None = None)` ⇒ `base["inventory"] = [{"quantity": int(q), "fulfillmentCenterID": str(fc)}]`;**不给就不带**(跟卖链现状,行为逐字不变)。小数位按原件 multipleOf:price 2 位、ShippingWeight 3 位(api 的 `_sanitize` 仍统一收到 2 位,2 位也是 0.001 的整数倍,两处不冲突) | `services/match_feed.py` |
+| ④ | 候选 SQL 带出 `w.avail_qty`(**不是判据**:没观测到照样改码,只是不带库存);`_item_of(row, sku, fc)` 在 avail_qty 非空且 ≥0 时带 inventory;FC 走 `store_limits.listing_fc(store, managed_nodes()[0])`(**上架链同一入口**,`managed_nodes()` 一轮只读一次,收在 `_fc_of`);受管仓校验失败的店**不带库存 + 摘要点名 + 不回落 Partner ID**;dry-run 逐行标「库存 N → FC xxx」/「不带库存(未观测)」 | `workflows/sku_migrate.py` |
+| ⑤ | 规范守门:读原件断言 header 键集合 == required 且不多、Item 键都在 properties 里、inventory 项键 == {quantity, fulfillmentCenterID}、`FEED_SPEC_VERSIONS` 的值在 version enum 里、productIdType 在 enum 里;`_item_of` 的真实产物也过同一把尺子 | `tests/test_match_spec_v5.py`(新增) |
+
+**载荷样例**(改码链一条,带库存):
+
+```
+{"MPItemFeedHeader": {"businessUnit": "WALMART_US", "locale": "en",
+                      "version": "5.0.20260607-22_38_54-api"},
+ "MPItem": [{"Item": {"sku": "AN3WC0DE2345", "price": 29.99, "ShippingWeight": 0.82,
+                      "condition": "New",
+                      "productIdentifiers": {"productIdType": "GTIN",
+                                             "productId": "00121678236703"},
+                      "inventory": [{"quantity": 30,
+                                     "fulfillmentCenterID": "<listing_fc>"}]}}]}
+```
+
+**库存口径改口(安全约束⑦)**:**v5 起库存随改码 feed 一起写,定案回写只是兜底**。
+qty 仍是 `catalog.walmart_items` **旧码行**的 `avail_qty`(与 `_restore_inventory` 同一列
+同一口径,只是时点一个在发之前、一个在定案之后),所以带过库存之后 `_restore_inventory`
+应当恒判「新码现值已等于旧码」而一条都不写 —— 它留着只为三种带不了库存的情况:
+提交时还没观测到 avail_qty、该店受管仓校验失败、以及 v5 之前发出去还压在 pending 上的
+存量行。**没带库存的那几条,提交到定案之间仍是停售的**,运维口径不变(尽快
+`catalog_sync` + `settle_only=1`)。
+
+**版本串为什么用 0607 而不是所有者上传成功的那个**:所有者 2026-09-06 用 Seller Center
+模板成功上传过,模板头写的是 `5.0.20260703-18_22_27`;但**可下载的 API 规范原件是 0607
+版**,而它的 version enum 只有 `5.0.20260607-22_38_54-api` 这一个值(与 MP_ITEM 一样带
+`-api` 后缀 —— Seller Center 模板串与 API feed 串本来就不同源)。⇒ **以原件 enum 为准**,
+试点(节奏闸的 limit=1 那一条)若被拒再议;那时该改的是原件 + registry 一处,不是在
+代码里并排放两个版本串。

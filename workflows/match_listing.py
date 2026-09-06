@@ -31,10 +31,14 @@
 修好重上是正常经营;曾按 product_risk 删除史/GTIN 删除史一刀切拦过,
 当日拆除)。
 结果:J/K 由 feed_poll 反哺器按 ops.feed_items 回填;跟卖新 offer 默认
-0 库存是正常现象(v4.2 spec 无库存字段),不当失败——库存由 maintenance
+0 库存是正常现象,不当失败——库存由 maintenance
 的 match_inventory provider 铺(offer 进目录后自动补到保守值;所有者批复
 2026-08-12,补"建成即 0 库存永远没人补"的结构洞,旧 inventory_push
-因 --no-poll 从未真跑)。
+因 --no-poll 从未真跑)。**2026-09-07 通道升 v5 之后仍然如此**:v5 的 Item
+多了可选 `inventory[]`,但**跟卖链有意不带**(`match_feed.build_match_item`
+不给 inventory= 就一个字节都不多发)—— 新 offer 的库存出口只有维护链一个,
+在这里也发一份就是第二条实现路径(§六)。改码链(sku_migrate)才带,理由是
+REPLACE 会把载荷没带的库存写空(docs/sku_plan.md §9.12)。
 
 与地基的融合:提交走 api/feeds 唯一通道(三层防重/切片/限速);轮询走
 全局 feed_poll;match_submitted + 回执进产品事件账本(上架类=生死事件,

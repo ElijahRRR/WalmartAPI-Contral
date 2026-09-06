@@ -59,7 +59,7 @@
       的列名分歧**)、UPC 池、定价/配额表(倍率是'275%'格式化值,解析积木
       同步移植)、店铺状态表、类目映射「沃尔玛类目」、「禁止品牌收集」
 - [ ] api/feeds 收录 MP_ITEM(v5 header 只 3 字段、version 完整时间戳)与
-      MP_ITEM_MATCH(v4.2);MP_ITEM 同店打包单 feed(10/hour 硬限);
+      MP_ITEM_MATCH(~~v4.2~~ **v5,2026-09-07 升版**);MP_ITEM 同店打包单 feed(10/hour 硬限);
       速率桶登记(旧系统 RETIRE_ITEM 零限速的教训:未登记默认拒绝已内置)
 - [ ] UPC 池**只读导入** PG 并与飞书对拍(权威仍在飞书,切换点在 L3;
       标记字符串'已领|已用|冲突'三态格式是隐式协议,解析积木先建)
@@ -351,8 +351,11 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 - [x] registry:LISTING_SHEET(21 列 + `headers` 表头名,2026-09-02 重排)/
       MATCH_SHEET(11 列;**本次不动** —— 它的 B 列本来就是 SKU 列,
       services/match_sheet.py 按 `r["sku"]` 找行,不走上架表的 row_sku)
-- [x] api/feeds:MP_ITEM_MATCH v4.2(sellingChannel 制 header,REPLACE 幂等,
-      15/hour 桶);SPEC 预检复用 api/items.search_walmart_spec
+- [x] api/feeds:MP_ITEM_MATCH ~~v4.2(sellingChannel 制 header)~~ **2026-09-07 升
+      v5**(`5.0.20260607-22_38_54-api`,businessUnit 制三字段封闭,v4.2 同日退役;
+      REPLACE 幂等不变,15/hour 桶不变;跟卖链载荷**逐字不变** —— v5 新增的可选
+      `inventory[]` 只有改码链在带,见 docs/sku_plan.md §9.12);
+      SPEC 预检复用 api/items.search_walmart_spec
 - [x] workflow match_listing:行状态机(待处理/可跟卖重排队/终态清 F 重试)
       + SPEC 候选(位数路由+zfill+退化码拒查)+ 按店打包 + 单店隔离
       + match_submitted/回执进事件账本(sku≠asin 登记例外 —— 批次 2 之后

@@ -77,7 +77,8 @@ api/            外部接口适配:_client, items, prices, inventory, orders,
                 returns, feeds, reports, insights, feishu, scraper
 services/       跨 workflow 复用积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
-refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv 等)
+refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv 等);
+                specs/ 官方 feed 规范原件(守门测试读它校载荷,别照记忆改字段)
 skills/         生成物:调度技能包,skill_export 渲染,不要手改
 docs/           conventions.md(规范全文) plan.md(计划与决策日志)
                 production_cutover.md(生产定稿) api_blueprint.md(端点/配额定稿)

@@ -134,7 +134,17 @@ FEED_SPEC_VERSIONS = {
     # (inventoryHeader/inventory)与 1.4 大写恰好相反 —— 两套模板不能共用,
     # 混用的表现是整批 ERR_EXT_DATA_0503009 退回(1.4 小写时的同款错误码)
     "MP_INVENTORY": "1.5",
-    "MP_ITEM_MATCH": "4.2",  # 跟卖(按匹配上架);spec enum 锁死 4.2/REPLACE
+    # 跟卖(按匹配上架)+ 改码(sku_migrate 共用同一个 feedType)。
+    # **2026-09-07 升 v5,v4.2 同日退役**(两条链一起升,不留双轨)。版本串的
+    # 唯一出处是官方规范原件 `refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json`
+    # (所有者从开发者门户下载)—— 它的 `MPItemFeedHeader.version` enum 只有这
+    # 一个值,与 MP_ITEM 一样带 `-api` 后缀。⚠ v5 的 header 是 businessUnit 制
+    # **三字段封闭**(businessUnit/locale/version,additionalProperties=false);
+    # v4.2 的 {processMode, subset, sellingChannel} 在 v5 规范里**不存在**,
+    # 发过去就是未知字段。所有者 2026-09-06 用 Seller Center 模板
+    # (版本串 5.0.20260703-18_22_27)上传成功过,但可下载的 API 规范原件是
+    # 0607 版 —— **以原件 enum 为准**,试点若被拒再议。
+    "MP_ITEM_MATCH": "5.0.20260607-22_38_54-api",
     # 上架主链(L2)。⚠ 这一个字符串同时决定**两件事**:
     #   ① feed header 的 version;② `paths.mp_item_spec_dir()` 读哪份 spec。
     # 改一处两边一起变 —— 两边错开就是拿一个版本的数据去过另一个版本的校验。

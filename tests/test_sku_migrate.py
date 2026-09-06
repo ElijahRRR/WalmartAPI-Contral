@@ -280,10 +280,11 @@ def test_another_workflows_pending_feed_does_not_block(monkeypatch):
 _CAND_COLS = ["store", "old_sku", "source_type", "source_key",
               "product_id", "product_id_type", "price", "product_slow"]
 
-#: 候选行的采集 slow 段:重量解析得出来才进候选(REPLACE 会覆盖线上重量,
-#: 兜底 1.0 磅不许发出去)。这个形状与 catalog.products.slow / amz_source 的
-#: `attrs` 逐字同源(mp_mapper.shipping_weight 的输入)。
-_SLOW = {"weight": {"package": 0.82}}
+#: 候选行的采集 slow 段。这个形状与 catalog.products.slow / amz_source 的
+#: `attrs` 逐字同源(`mp_mapper.shipping_weight_ex` 的输入)。
+#: ⚠ **必须带显式单位**:2026-09-06 起裸数字算"解析不出"(不假设是磅),
+#: 写成 `0.82` 的话这条夹具行会落到兜底 1.0 磅 —— 那是另一档用例的事。
+_SLOW = {"weight": {"package": "0.82 lbs"}}
 
 
 def _cand(old_sku, pid="0001", src="amz", key=None, price=29.99, slow=_SLOW):
@@ -923,10 +924,12 @@ def _migrate_wired(monkeypatch, outcome="submitted", feed_id="F9"):
     return calls, conns
 
 
-def _rows_for(n=2):
+def _rows_for(n=2, slow=_SLOW):
+    """候选行(`_candidates` 的输出形状)。重量**不是**一列现成的数:
+    载荷、预览、台账三处都从 `product_slow` 现解析(`_weight_of`)。"""
     return [{"store": "T1", "old_sku": f"B0AAA0000{i}", "source_type": "amz",
              "source_key": f"B0AAA0000{i}", "product_id": f"00{i}",
-             "product_id_type": "GTIN", "price": 29.99, "weight": 0.82}
+             "product_id_type": "GTIN", "price": 29.99, "product_slow": slow}
             for i in range(1, n + 1)]
 
 
@@ -1600,32 +1603,39 @@ def test_a_non_empty_submit_disabled_forces_cap_zero(monkeypatch):
 #  摘要正常、没有任何东西会报。
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_replace_conditions_require_a_live_price_and_a_collected_weight():
-    """两条新判据在 `_CONDS` 里出生一次,**选取与解释两处逐字同源**。"""
+def test_only_the_live_price_is_a_replace_condition_now():
+    """REPLACE 覆盖语义下**只有价格**是"原样发回去"的判据(`_CONDS` 单一出处)。
+
+    重量那条(「有采集重量」`(p.slow -> 'weight') IS NOT NULL`)**已删**
+    —— 2026-09-06 晚所有者定稿:改码时重量一律按新口径重写,解析不出或
+    > 11 磅写 1 磅。留着它等于"新口径管不到存量行",而它拦下的恰恰是最该被
+    改正的那批(线上重量正是老实现按错单位发上去的)。
+    """
     names = [n for n, _w, _sql in sm._CONDS]
-    assert "有现挂价格" in names and "有采集重量" in names
+    assert "有现挂价格" in names
+    assert "有采集重量" not in names                 # 删了,别加回来
+    assert len(sm._CONDS) == 10                      # 十条判据(原十一条)
     price = next(sql for n, _w, sql in sm._CONDS if n == "有现挂价格")
-    weight = next(sql for n, _w, sql in sm._CONDS if n == "有采集重量")
     assert price == "(w.price IS NOT NULL AND w.price > 0)"
-    assert weight == "(p.slow -> 'weight') IS NOT NULL"
-    for cond in (price, weight):
-        assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY
-    # 落选人话要说得出"为什么不能兜一个默认值"
+    assert price in sm._SQL_CANDIDATES and price in sm._SQL_WHY
     assert "REPLACE" in next(w for n, w, _s in sm._CONDS if n == "有现挂价格")
-    assert "1.0 磅" in next(w for n, w, _s in sm._CONDS if n == "有采集重量")
+    # 判据没了,SQL 里也不许再有那个粗判据的残句
+    for sql in (sm._SQL_CANDIDATES, sm._SQL_WHY):
+        assert "(p.slow -> 'weight') IS NOT NULL" not in sql
 
 
-def test_the_candidate_sql_reaches_products_through_the_registry_key():
-    """重量的来源与上架链同一条:`catalog.products` 按**登记簿 source_key**(=ASIN)
-    关联,不从 SKU 里反解 ASIN(码不再等于 ASIN)。
+def test_the_candidate_sql_still_carries_the_slow_blob_for_the_parser():
+    """`catalog.products` 的 LEFT JOIN **保留**:它不再是判据来源,而是重量的
+    **输入**(slow 段 → `mp_mapper.shipping_weight_ex`)。
 
-    ⚠ 必须是 **LEFT** JOIN:没采过的行要能进 `_SQL_WHY` 说出"重量采不到";
-    INNER 会让它整行消失,摘要就变成"店下查无此行"这句错话。
+    关联键是**登记簿 source_key**(= ASIN),与上架链同一把钥匙;必须是 LEFT:
+    没采过的行现在照样能改码(重量写 1 磅),INNER 会让它整行消失。
     """
     for sql in (sm._SQL_CANDIDATES, sm._SQL_WHY):
         assert "LEFT JOIN catalog.products p" in sql
         assert "p.asin = ls.source_key" in sql
         assert "p.marketplace = %(marketplace)s" in sql
+    assert "p.slow AS product_slow" in sm._SQL_CANDIDATES
     conn = _Conn([("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
                   ("FROM ops.feed_items", (["sku"], []))])
     sm._candidates(conn, "T1", 10)
@@ -1633,43 +1643,81 @@ def test_the_candidate_sql_reaches_products_through_the_registry_key():
     assert args["marketplace"] == sm.amz_source.MARKETPLACE   # 口径唯一出处
 
 
-def test_a_row_whose_weight_cannot_be_parsed_is_skipped_and_named():
-    """第二层(Python 侧):SQL 只能问"attrs 里有没有 weight 这个键",
-    `weight={"package": "N/A"}` 照样进得来 —— 真去解析的是 mp_mapper.shipping_weight,
-    它落到兜底 1.0 磅就说明**这一行没有真重量**,不许发。
+def test_a_row_whose_weight_cannot_be_parsed_is_no_longer_dropped():
+    """`weight={"package": "N/A"}` / 没采过 / 裸数字:**照样进候选**,重量写 1 磅。
 
-    静默丢是不行的:摘要看起来像"这家店就这么点候选",而所有者不知道少了谁。
+    2026-09-06 晚改口之前这三种都被 Python 侧第二层剔掉并点名。现在它们是
+    正常候选 —— 兜底不静默:预览逐行标出、摘要给兜底行数(见下面两条)。
     """
     conn = _Conn([("FROM catalog.walmart_items w",
                    (_CAND_COLS, [_cand("B0AAA00001", slow={"weight": {"package": "N/A"}}),
-                                 _cand("B0AAA00002", "0002")])),
+                                 _cand("B0AAA00002", "0002", slow={}),
+                                 _cand("B0AAA00003", "0003",
+                                       slow={"weight": {"package": 300}}),
+                                 _cand("B0AAA00004", "0004")])),
                   ("FROM ops.feed_items", (["sku"], []))])
     rows, notes = sm._candidates(conn, "T1", 10)
-    assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
-    assert rows[0]["weight"] == 0.82                     # 留下的那条带着真重量
-    assert any("B0AAA00001" in n and "覆盖" in n for n in notes), notes
+    assert [r["old_sku"] for r in rows] == ["B0AAA00001", "B0AAA00002",
+                                            "B0AAA00003", "B0AAA00004"]
+    assert not any("跳过" in n and "重量" in n for n in notes), notes
+    assert sm._weight_of(rows[0]) == (1.0, "no_weight")
+    assert sm._weight_of(rows[1]) == (1.0, "no_weight")
+    assert sm._weight_of(rows[2]) == (1.0, "no_unit")     # 裸数字不当磅(事故形态)
+    assert sm._weight_of(rows[3]) == (0.82, "parsed")
 
 
-def test_a_weight_that_is_exactly_the_fallback_is_skipped_on_purpose():
-    """真重量**恰好 1.0 磅**的行也会被剔:`shipping_weight` 的返回值分不出
-    "解析出 1.0" 与 "兜底 1.0"。宁可少改一个码,也不拿一次改码顺手改运费 ——
-    而且被剔的那个有名有姓,人看得见、可以人工确认后单独处理。"""
-    conn = _Conn([("FROM catalog.walmart_items w",
-                   (_CAND_COLS, [_cand("B0AAA00001",
-                                       slow={"weight": {"package": 1.0}})])),
-                  ("FROM ops.feed_items", (["sku"], []))])
-    rows, notes = sm._candidates(conn, "T1", 10)
-    assert rows == []
-    assert any("恰好 1.0 磅" in n for n in notes), notes
+def test_a_parsed_weight_is_sent_as_is(monkeypatch):
+    """解析得出来的重量**原样进载荷**(磅):REPLACE 把线上那格覆盖成它。"""
+    calls, _ = _migrate_wired(monkeypatch)
+    rows = _rows_for(1, slow={"weight": {"package": "12.8 ounces"}})
+    sm._migrate({"name": "T1"}, rows, True)
+    item = [c for c in calls if isinstance(c, tuple) and c[0] == "submit"][0][4][0]
+    assert item["ShippingWeight"] == 0.8          # 12.8 oz = 0.8 lb(官方换算)
 
 
-def test_a_named_row_without_a_parsable_weight_says_which_gate():
-    """点名了它却没出现 ⇒ 逐条给理由(不是"条件全都满足只是没轮到")。"""
+def test_an_over_cap_weight_is_written_as_one_pound_and_named_in_the_preview():
+    """> 11 磅 ⇒ 写 1 磅(所有者 2026-09-06 定稿),而且**在预览里点名**。
+
+    这条钉的是"分得清":预览只打一个 `1.0` 的话,"真 1 磅"与"兜底 1 磅"在纸面
+    上一模一样,人眼确认就确认了个寂寞。
+    """
+    rows = [_rows_for(1, slow={"weight": {"package": "20 lbs"}})[0],
+            _rows_for(1, slow={"weight": {"package": "3.5 pounds"}})[0]]
+    rows[1]["old_sku"] = "B0AAA00002"
+    lines = sm._preview(rows)
+    body = "\n".join(lines)
+    assert "重量 1.0 磅(兜底:超 11 磅)" in body
+    assert "重量 3.5 磅(parsed)" in body
+    assert "其中 1 行重量按 1.0 磅兜底(超 11 磅 1)" in body
+    assert "有意为之" in body                    # 覆盖是有意的,不是"不得已"
+    # 载荷样例与真发出去的那条同一份代码
+    assert "'ShippingWeight': 1.0" in body or '"ShippingWeight": 1.0' in body
+
+
+def test_the_ledger_detail_records_the_weight_reason(monkeypatch):
+    """台账 `detail` 里 weight 旁边记 reason:光看 `weight=1.0` 复盘时分不出
+    "真 1 磅"与"兜底 1 磅",而这两件的处置完全不同。"""
+    import json as _json
+    calls, conns = _migrate_wired(monkeypatch)
+    sm._migrate({"name": "T1"}, _rows_for(1, slow={"weight": {"package": "N/A"}}), True)
+    args = [a for c in conns for sql, a in c.sqls if "RETURNING id" in sql][0]
+    detail = _json.loads(args["detail"])
+    assert detail["weight"] == 1.0 and detail["weight_reason"] == "no_weight"
+    assert detail["price"] == 29.99                      # 价格仍是现值原样发回
+    ok = [a for c in conns for sql, a in c.sqls if "RETURNING id" in sql]
+    good = _json.loads(ok[0]["detail"])
+    assert set(good) >= {"product_id", "product_id_type", "price", "weight",
+                         "weight_reason"}
+
+
+def test_a_named_row_without_a_parsable_weight_is_a_hit_now():
+    """点名一个采不到重量的旧码:它**命中**(不再落选),重量按 1 磅发。"""
     conn = _pick_conn([_cand("B0AAA00001", slow={"weight": {}})],
                       [_why("B0AAA00001")])
     rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
-    assert rows == []
-    assert any("B0AAA00001" in n and "shipping_weight" in n for n in notes), notes
+    assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
+    assert any("命中 1 个" in n for n in notes), notes
+    assert not any("shipping_weight" in n for n in notes), notes
 
 
 # ══════════════════════════════════════════════════════════════════════════════

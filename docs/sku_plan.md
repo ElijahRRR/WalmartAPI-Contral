@@ -647,8 +647,10 @@ feedType 与两个桶都已收录,只补注释与测试)。
   (2026-09-06 §9.12),载荷由 `_item_of` → `match_feed.build_match_item` 组:
   同 GTIN + 新 SKU + `processMode=REPLACE` 在同一 item 上原地换码,**没有 SkuUpdate**。
   换通道只改 `FEED_TYPE` 与 `_build_items`/`_item_of` 两处;**不提供参数覆盖**(双轨禁止)。
-  ⚠ REPLACE 会覆盖载荷里给到的每个字段 ⇒ `price` / `ShippingWeight` 必须发**现值**,
-  采不到现值的行由 `_CONDS` 的「有现挂价格」「有采集重量」两条判据剔掉。
+  ⚠ REPLACE 会覆盖载荷里给到的每个字段 ⇒ `price` 必须发**现挂价**(= 不改价),
+  采不到现价的行由 `_CONDS` 的「有现挂价格」剔掉;`ShippingWeight` 则**有意重写**
+  (2026-09-06 晚定稿,见 §9.12「改码顺便把重量统一到准确值」):按
+  `mp_mapper.shipping_weight_ex` 的新口径解析,解析不出或 > 11 磅写 1 磅。
 
 **受牵连的 (store, sku) 键表 —— 逐条结论**(2026-09-02 复核,结论与依据都留下,
 免得下一轮盘点又把它们当待办):
@@ -1212,21 +1214,38 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 | ① | `FEED_TYPE = "MP_ITEM_MATCH"`;`SUBMIT_DISABLED = ""`(**机制保留**:非空即停闸,守门钉「缺省为空」+「非空时 cap=0」) | `workflows/sku_migrate.py` |
 | ② | `_build_items` / `_preview` 共用新构造点 `_item_of`,复用 `services/match_feed.build_match_item(None, sku, price, weight, product_id=…, product_id_type=…)`;SPEC 预填传 **None**(改码不做 SPEC 预检:匹配键取自我们自己的观测);信封 `{"Item": …}` 由 `api/feeds.build_payload` 包 | 同上 |
 | ③ | 删 `mp_mapper.build_sku_update_item`、`mp_mapper.build_orderable(sku_update=)`、`mp_conform.ORDERABLE_SYSTEM_SWITCHES` 的放行分支(形态 A/B 残留 = 双轨) | services |
-| ④ | 候选行带出**现挂价**(`w.price`)与 **Product ID 优先 GTIN**(`coalesce(w.gtin, w.upc)`),重量经登记簿 `source_key` LEFT JOIN `catalog.products.slow`,由 `mp_mapper.shipping_weight` 解析 | `_SQL_CANDIDATES` / `_FROM` |
-| ⑤ | `_CONDS` 加两条判据:**有现挂价格**(`w.price IS NOT NULL AND w.price > 0`)、**有采集重量**(`(p.slow -> 'weight') IS NOT NULL`);重量再加一层 Python 判据(`shipping_weight` 落到 `DEFAULT_SHIPPING_WEIGHT` ⇒ 剔除并点名) | 同上 |
+| ④ | 候选行带出**现挂价**(`w.price`)与 **Product ID 优先 GTIN**(`coalesce(w.gtin, w.upc)`),重量经登记簿 `source_key` LEFT JOIN `catalog.products.slow`,由 `mp_mapper.shipping_weight_ex` 解析(`_weight_of` 是改码侧的唯一出口) | `_SQL_CANDIDATES` / `_FROM` |
+| ⑤ | `_CONDS` 加一条判据:**有现挂价格**(`w.price IS NOT NULL AND w.price > 0`)。~~**有采集重量**(`(p.slow -> 'weight') IS NOT NULL`)+ Python 侧第二层剔除~~ **当天晚些时候整段删除**(见本节末「改码顺便把重量统一到准确值」):重量不再是判据,一律按新口径重写 | 同上 |
 | ⑥ | 配额口径改口:桶是 `feeds.post.MP_ITEM_MATCH` **15/h**(`api/_client.py:238`),与跟卖链共享,**不再与维护链抢** | `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 头注 |
 | ⑦ | 反哺器防串扰:`match_sheet.sync_from_ledger` 与 `listing_sheet._SQL_HEAL_RECEIPT` 各加 **workflow 正向过滤**(改码与跟卖共用 feedType 之后,feed_type 已分不开两条链) | services |
 | ⑧ | ~~缺口 **G-4**:`_sync_sheet` 改为「先按 (店, 旧码) 的 SKU 列定位 → 旧行 SKU 列为空才退回 (店, ASIN) → **多行命中不写并点名**」~~ **当天晚些时候整段作废**:改码不回写上架表(见本节末「改码不回写上架表」) | `workflows/sku_migrate.py` |
 | ⑨ | 守门与文档:`test_feed_type_constant_is_the_only_place_that_names_a_feedtype` 只看可执行行;§8 决策 E/I 收口;`docs/api_blueprint.md` §5.1 与 `docs/db_schema.md` 的 `feed_type` 说明改口 | tests / docs |
 
-**为什么价格与重量必须原样发回去**(这一条比通道本身更容易出事):REPLACE 的语义
-是"载荷给了什么,线上就变成什么"。所以采不到现值的行**一律不许发**——
-`match_feed.build_match_item` 在重量留空时兜底 1.0 磅(那是跟卖链的合理默认),
-用它改码就是把线上真实重量悄悄改成 1 磅,运费从此算错,**回执全绿、摘要正常**。
-两层判据(SQL 粗判 + Python 解析)缺一不可:只有 SQL 那层,`weight={"package":"N/A"}`
-照样进候选;只有 Python 那层,`_SQL_WHY` 说不出它为什么不在候选面上。
-⚠ 真重量**恰好 1.0 磅**的行会被误剔(返回值分不出"解析出 1.0"与"兜底 1.0")——
-宁可少改一个码,被剔的那个在摘要里有名有姓。
+**为什么价格必须原样发回去**(这一条比通道本身更容易出事):REPLACE 的语义
+是"载荷给了什么,线上就变成什么"。所以采不到现挂价的行**一律不许发**——
+猜一个价 = 一次改码顺手改了售价,而且**回执全绿、摘要正常**。判据是 `_CONDS`
+的「有现挂价格」,选取与解释两处同源。
+
+**改码顺便把重量统一到准确值**(2026-09-06 晚所有者定稿,当天早些时候的
+「两层重量判据」整段作废):当天第二级投放实测发现 `mp_mapper.shipping_weight`
+**只抓字符串里第一个数字、完全不看单位**,把两个品的 "300 grams" / "860 grams"
+当成 300.0 / 860.0「磅」经 REPLACE 发进了沃尔玛(那一栏是 **Shipping Weight (lbs)**)。
+所有者原话:「请勿猜测单位,一切以官方事实为主……如果解析不出重量或者重量大于
+11 磅,则把重量都写为 1 磅。」于是:
+
+- 解析器重写为 `mp_mapper.shipping_weight_ex(product) -> (磅, 归因)`,**单位从数据
+  里读、不猜**:只认 pound/lb、ounce/oz、gram/g、kilogram/kg 四族显式记号,按官方
+  常量(1 lb = 16 oz = 453.59237 g)折成磅;**没有单位记号的裸数字 = 解析不出**;
+  解析不出 / ≤0 / > `MAX_SHIPPING_WEIGHT_LBS = 11` ⇒ `DEFAULT_SHIPPING_WEIGHT = 1.0`。
+  归因六档(parsed / no_weight / no_unit / unknown_unit / over_cap / nonpositive)
+  就是为了让调用方分得清"真 1.0"与"兜底 1.0";`shipping_weight()` 只是薄封装。
+- 改码时**所有候选统一按这一口径重写重量**,覆盖是**有意为之**:存量行线上那个
+  重量本来就是老实现按错单位发上去的。所以那条 SQL 粗判据与 Python 侧第二层剔除
+  **一起删了**(留着等于"新口径管不到最该改的那批行"),候选面回到十条判据。
+- 兜底不静默:dry-run 逐行标 `重量 3.5 磅(parsed)` / `重量 1.0 磅(兜底:超 11 磅)`,
+  摘要给兜底行数,台账 `listing.sku_migrations.detail.weight_reason` 留档;
+  上架链 `workflows/list_new` 的摘要把兜底行数**按归因分桶**(无采集重量 / 无单位
+  记号 / 单位不认识 / 超 11 磅 / 非正数),上架行为不变(兜底值照发)。
 
 **待第一级投放实测(不阻塞切换)**:仓里的 MP_ITEM_MATCH 通道是 **v4.2**
 (`sellingChannel` 制 header,跟卖链生产在用),所有者上传的模板是 **v5.0**。

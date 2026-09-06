@@ -75,6 +75,18 @@
          `catalog_sync -p store=X`,再 `sku_migrate -p store=X -p settle_only=1`;
        · 回写失败只点名,**不自动重试、不换方法**(写操作永不自动兜底)。
 
+**改码顺便把重量统一到准确值**(2026-09-06 晚所有者定稿,与 sku_plan §9.12 同步改口):
+MP_ITEM_MATCH 是 REPLACE,载荷里的 `ShippingWeight` 会**覆盖**线上重量 —— 这一次是
+**有意为之**。存量行的线上重量多半是老实现(只抓字符串里第一个数字、**完全不看单位**)
+按错单位发上去的:第二级投放实测有两个品被当作 300.0 与 860.0「磅」发了出去,而采集侧
+给的是 "300 grams" / "860 grams"。所以改码时**所有候选一律按
+`mp_mapper.shipping_weight_ex` 的新口径重写重量**:单位从数据里读、不猜,解析不出或
+折算后 > 11 磅一律写 1 磅(所有者原话:「请勿猜测单位,一切以官方事实为主……如果解析
+不出重量或者重量大于 11 磅,则把重量都写为 1 磅」)。此前那条「有采集重量」SQL 判据与
+Python 侧的第二层剔除**已删** —— 它们拦下的正是最该被改正的那批行。兜底不静默:
+dry-run 逐行标 `(parsed)` / `(兜底:…)`、摘要给兜底行数,台账 `detail.weight_reason`
+留档。⚠ **价格仍然是原样发回去**(不改价):那一条判据「有现挂价格」原样保留。
+
 **前置清单**(全部满足才允许真跑):
   · SKU 改造批次 0a / 0b / 1 / 2 已合并,且新码已在生产跑过至少一轮;
   · 所有者机器的**六件单品实测**通过(docs/sku_plan.md §4);实测前只许 --dry-run;
@@ -192,9 +204,9 @@ _STALLED = "stalled"
 #  SQL
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: 改码候选的**十一条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
-#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把十一条 AND 起来**选行**,
-#: `_SQL_WHY` 把同样这十一条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
+#: 改码候选的**十条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
+#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把十条 AND 起来**选行**,
+#: `_SQL_WHY` 把同样这十条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
 #: 文本共用一份,所以不可能"选取用一套、解释用另一套":那种漂移的表现是摘要说
 #: "它满足条件",而它就是不在候选面里,谁也不报错。
 #: 形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:手打就是
@@ -228,20 +240,18 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
      "NOT " + sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku")),
     ("有 Product ID", "观测里 upc 与 gtin 都是空:载荷没号可匹配(**不猜**)",
      "(w.upc IS NOT NULL OR w.gtin IS NOT NULL)"),
-    # ↓ 两条「REPLACE 会覆盖线上现值」判据(2026-09-06 随通道切到 MP_ITEM_MATCH 加)。
+    # ↓「REPLACE 会覆盖线上现价」判据(2026-09-06 随通道切到 MP_ITEM_MATCH 加)。
     # MP_ITEM_MATCH 的 processMode 是 **REPLACE**:载荷里给了什么,线上那条 item 的
-    # 对应字段就变成什么。所以价格与重量**必须把现值原样发回去**(= 不改),
-    # 采不到现值的行**不许兜一个默认值发出去** —— 那是拿一次改码顺手改了售价/运费,
-    # 而且回执全绿、没有任何东西会告诉你。判不准就不做(判不准就判活的同款纪律)。
+    # 对应字段就变成什么。**价格**必须把现值原样发回去(= 不改价),采不到现价的行
+    # 不许兜一个默认值发出去 —— 那是拿一次改码顺手改了售价,回执还全绿。
+    # ⚠ **重量不在这里拦**(2026-09-06 晚所有者定稿改口):改码时重量一律按
+    # `mp_mapper.shipping_weight_ex` 的新口径重写(解析不出或 > 11 磅写 1 磅),
+    # 覆盖是**有意为之**——顺便把线上那个按老实现发错单位的重量统一到准确值。
+    # 原来那条「有采集重量」判据(`(p.slow -> 'weight') IS NOT NULL`)与它在
+    # Python 侧的第二层剔除**一起删了**:再留着就是"新口径管不到存量行"。
     ("有现挂价格", "观测里 price 为空或 ≤0:REPLACE 要把**现挂的那个价**原样发回去"
                    "(= 不改价);没价可发就只能猜,而猜错一个价 = 直接改动线上售价",
      "(w.price IS NOT NULL AND w.price > 0)"),
-    ("有采集重量", "登记簿指的那条 catalog.products 采集里没有 attrs.weight —— "
-                   "REPLACE 会用载荷的 ShippingWeight **覆盖**线上重量,而采不到时 "
-                   "mp_mapper.shipping_weight 兜底 1.0 磅:用兜底值改码 = 把线上真实"
-                   "重量悄悄改成 1 磅(运费从此算错且不报错)。这是**粗判据**,"
-                   "解析得出来的那一层在 Python 侧再拦一道(见 _candidates)",
-     "(p.slow -> 'weight') IS NOT NULL"),
     # ⚠ 这一条替下了原来那个整店闸(所有者 2026-09-04 复议,见 `_preflight` 闸③)。
     # 危害只发生在**同一个 SKU**、而且**只发生在破坏组**(delete/retire)上:
     #   ① executing 的 DELETE 拿的是旧码去删,而 `dispositions.settle` 的判据是
@@ -288,8 +298,10 @@ _DROP = """NOT (w.sku = ANY(%(excl_skus)s::text[])
 
 #: 候选面的取数口径(两条 SQL 共用):目录 × 登记簿的**交集**,再 LEFT JOIN 采集身份层。
 #: 登记簿里没有的行不在这张面上 —— 点名点到它 ⇒ 报"店下查无此行",不是"没候选"。
-#: `catalog.products` 走 **LEFT** JOIN(不是 INNER):没采过的行要能进 `_SQL_WHY` 说出
-#: "重量采不到",INNER 会让它整行消失,摘要就变成"店下查无此行"这句错话。
+#: `catalog.products` **保留**(LEFT JOIN,不是 INNER):它只为把 slow 段带出来供
+#: `mp_mapper.shipping_weight_ex` 解析重量 —— 采集里没有重量**不再是落选理由**
+#: (2026-09-06 晚定稿:解析不出就写 1 磅),所以更要用 LEFT:INNER 会让"从没采过"
+#: 的行整行消失,摘要就变成"店下查无此行"这句错话。
 #: 关联键是**登记簿的 source_key**(amz 出身 = ASIN),与上架链
 #: `services/amz_source.fetch_products` 同一把钥匙 —— 不从 SKU 里反解 ASIN(码不再等于 ASIN)。
 _FROM = """
@@ -306,7 +318,8 @@ LEFT JOIN catalog.products p
 #: 没有 gtin 才退 upc(12 位,UPC)。取的是**观测到的现挂号**,不取 UPC 池
 #: (池里的号若与现挂不一致,载荷会匹配到别的 item 或被拒)。
 #: `price` 是**现挂价**(REPLACE 发同一个价 = 不改价),`product_slow` 是采集身份层的
-#: slow 段(mp_mapper.shipping_weight 的入参形状 `{"attrs": …}` 里的 attrs)。
+#: slow 段(`mp_mapper.shipping_weight_ex` 的入参形状 `{"attrs": …}` 里的 attrs)——
+#: 重量**不是**判据,是每条候选都要按新口径重算的一个值(见 `_weight_of`)。
 _SQL_CANDIDATES = (
     "SELECT w.store, w.sku AS old_sku, ls.source_type, ls.source_key,\n"
     "       coalesce(w.gtin, w.upc) AS product_id,\n"
@@ -317,7 +330,7 @@ _SQL_CANDIDATES = (
     + "\n  AND ".join([sql for _n, _w, sql in _CONDS] + [_PICK, _DROP])
     + "\nORDER BY w.sku\nLIMIT %(limit)s\n")
 
-#: 点名落选的理由源:**同一份 `_CONDS`**,逐条选成布尔列 c0…c6(不重写判据)。
+#: 点名落选的理由源:**同一份 `_CONDS`**,逐条选成布尔列 c0…c9(不重写判据)。
 #: 有意**不带** LIMIT、不带排除条件:被 LIMIT 截掉的与被排除的都要能说出口
 #: ("它其实合格,只是本轮节奏闸没轮到"和"你自己排除了它"是两句不同的话)。
 _SQL_WHY = (
@@ -934,8 +947,7 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 
 def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
                  kept: list[dict], why_rows: list[dict], inflight: set,
-                 dupe_skus: set, limit: int, *,
-                 noweight: set = frozenset()) -> list[str]:
+                 dupe_skus: set, limit: int) -> list[str]:
     """输入:点名/排除四组名字 + 本轮留下的候选 + `_SQL_WHY` 的逐条判据 + 两道
     后置闸的落选集 + 本轮上限 → 输出:摘要行(点名 N 个、命中 H 个,落选的**逐条**给理由)。
 
@@ -944,9 +956,10 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
     六类理由,来源各不相同:
 
       · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
-      · 不满足十一条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
-      · 旧码上有在途 feed;· 采集重量解析不出正数;· 同批 Product ID 撞号
-        —— 三道后置闸;
+      · 不满足十条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
+      · 旧码上有在途 feed;· 同批 Product ID 撞号 —— 两道后置闸;
+      (**重量不再是落选理由**:2026-09-06 晚所有者定稿,解析不出或 > 11 磅
+       一律写 1 磅照发,兜底行在预览与摘要里点名,不再剔候选)
       · 满足全部条件但**本轮节奏闸没轮到**(按 SKU 升序先来后到,下轮再来);
       · 店下查无此行(目录 × 登记簿的交集里没有它:拼错 / 不在册 / 从没扫到过)。
 
@@ -971,11 +984,6 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
         if w["old_sku"] in inflight:
             return (f"旧码上有 {INFLIGHT_HOURS}h 内的在途 feed(改了码,那条 feed "
                     f"就打在一个即将不存在的 SKU 上)")
-        if w["old_sku"] in noweight:
-            return (f"采集重量解析不出正数(shipping_weight 落到兜底 "
-                    f"{mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅):REPLACE 会用载荷里的 "
-                    f"ShippingWeight 覆盖线上重量,发兜底值 = 把真实重量悄悄改成 1 磅"
-                    f"(**真重量恰好 1.0 磅的行也落在这里**,宁可少改一个码)")
         if w["old_sku"] in dupe_skus:
             return ("同一批里 Product ID 撞号(官方不许两个 SKU 挂同一个 "
                     "Product ID),本轮只留了先到的那条")
@@ -1028,9 +1036,9 @@ def _candidates(conn, store_name: str, limit: int, *,
     """输入:连接 + 店 + 上限(+ 点名/排除四组名字)→ 输出:(候选行, 逐候选被跳过的点名)。
 
     候选 = 在架 ∧ 已上架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
-    ∧ 观测到的 gtin/upc 至少有一个 ∧ **有现挂价格** ∧ **有采集重量** ∧ 该 (店, 旧码)
+    ∧ 观测到的 gtin/upc 至少有一个 ∧ **有现挂价格** ∧ 该 (店, 旧码)
     无未了结的破坏建议、无未了结的改码台账
-    (十一条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
+    (十条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
 
     `only_skus` / `only_keys`(`-p skus=` / `-p asins=`,取并集)与
     `exclude_skus` / `exclude_keys` 是**同一条候选 SQL 的参数化条件**,
@@ -1042,14 +1050,12 @@ def _candidates(conn, store_name: str, limit: int, *,
     改码按 Product ID 匹配,池里的号若与沃尔玛现挂的不一致(历史换过号),
     载荷会匹配到别的 item 或直接被拒。两列都空的行 SQL 里就排掉了(不猜)。
 
-    **重量是两层判据**(REPLACE 会覆盖线上重量,兜底值不许发出去):
-    第一层是 SQL 粗判据「attrs 里有 weight」(`_CONDS` 的「有采集重量」),
-    第二层在这里 —— `mp_mapper.shipping_weight` 真去解析那段 JSON,解析不出
-    (返回 `DEFAULT_SHIPPING_WEIGHT`)的**逐个剔掉并点名**。两层缺一不可:
-    只有 SQL 那层,`weight={"package": "N/A"}` 这种行照样进候选、照样发 1.0 磅;
-    只有 Python 那层,`_SQL_WHY` 就说不出"它为什么不在候选面上"(理由 SQL 只
-    认 `_CONDS`)。⚠ 真重量**恰好是 1.0 磅**的行会被这一层误剔 —— 宁可少改一个
-    码,也不拿一次改码顺手改运费(误剔的行摘要里点名,人看得见)。
+    **重量不再是判据**(2026-09-06 晚所有者定稿改口):改码时所有候选一律按
+    `mp_mapper.shipping_weight_ex` 的新口径写重量,解析不出或 > 11 磅写 1 磅。
+    原来那条 SQL 粗判据「有采集重量」与这里的 Python 侧第二层剔除**一起删了** ——
+    留着它们等于"新口径管不到存量行":那两道闸拦下的正是最该被改正的那批(线上
+    重量本来就是老实现按错单位发上去的)。兜底行不静默:预览逐行标出、摘要给
+    兜底行数(见 `_preview` / `_weight_of`)。
 
     再过 W2 第⑥道闸:旧码上有在途 feed 的**逐个跳过并点名**(不整店拦)——
     一条刚发出去的 feed 在途时改码,会让它打在一个即将不存在的 SKU 上。
@@ -1082,29 +1088,6 @@ def _candidates(conn, store_name: str, limit: int, *,
                      f"{sorted(inflight)[:5]}")
     keep = [r for r in rows if r["old_sku"] not in inflight]
 
-    # 重量第二层:SQL 只能问"attrs 里有没有 weight 这个键",能不能**解析出一个正数**
-    # 只有 mp_mapper.shipping_weight 知道(它是上架链的同一个函数,不在这里重写一份
-    # 解析逻辑)。解析不出 ⇒ 它返回 DEFAULT_SHIPPING_WEIGHT ⇒ 这一行**不许发**:
-    # MP_ITEM_MATCH 是 REPLACE,发 1.0 磅就是把线上真实重量改成 1 磅,回执还全绿。
-    noweight: list[str] = []
-    weighed: list[dict] = []
-    for r in keep:
-        w = mp_mapper.shipping_weight({"attrs": r.get("product_slow")})
-        if w == mp_mapper.DEFAULT_SHIPPING_WEIGHT:
-            noweight.append(r["old_sku"])
-            continue
-        r["weight"] = w
-        weighed.append(r)
-    if noweight:
-        notes.append(
-            f"  ⚠ 跳过 {len(noweight)} 个:采集重量解析不出正数(shipping_weight 落到"
-            f"兜底 {mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅)—— REPLACE 会用载荷里的"
-            f"ShippingWeight **覆盖**线上重量,发兜底值 = 把真实重量悄悄改成 1 磅,"
-            f"运费从此算错且回执全绿。**恰好 1.0 磅的真重量也会落在这里**(宁可少改"
-            f"一个码):{sorted(noweight)[:5]}")
-    noweight_skus = set(noweight)
-    keep = weighed
-
     # 一个 Product ID 只允许挂一个 SKU(官方:"You are not allowed to submit two
     # SKUs with the same Product Identifier")—— 同一批里撞号的只留第一条
     seen: dict[str, str] = {}
@@ -1125,13 +1108,49 @@ def _candidates(conn, store_name: str, limit: int, *,
     if named:
         notes += _pick_report(store_name, only_skus, only_keys,
                               exclude_skus, exclude_keys, out, why,
-                              inflight, dupe_skus, limit,
-                              noweight=noweight_skus)
+                              inflight, dupe_skus, limit)
     elif exclude_skus or exclude_keys:
         notes.append(f"  排除 -p exclude_skus {len(exclude_skus)} 个 / "
                      f"-p exclude_asins {len(exclude_keys)} 个"
                      f"(已在候选 SQL 里剔除,没点名 ⇒ 其余照常按 SKU 升序取)")
     return out, notes
+
+
+#: 兜底归因 → 预览里那句人话(键 = `mp_mapper.WEIGHT_REASONS`,
+#: **除 parsed 外每一档都要有**:少一档就会打出一个 KeyError 或一句空话)。
+_WEIGHT_NOTE = {
+    "no_weight": "无采集重量",
+    "no_unit": "无单位记号(裸数字不当磅)",
+    "unknown_unit": "单位不认识",
+    "over_cap": f"超 {mp_mapper.MAX_SHIPPING_WEIGHT_LBS:g} 磅",
+    "nonpositive": "重量非正数",
+}
+
+
+def _weight_of(row: dict) -> tuple[float, str]:
+    """输入:候选行 → 输出:(发货重量磅, 归因)。**改码侧取重量的唯一出口**。
+
+    解析口径的唯一实现是 `mp_mapper.shipping_weight_ex`(上架链同一个函数,
+    这里不重写一份):单位从数据里读,解析不出 / ≤0 / > 11 磅 一律 1.0 磅。
+    载荷、预览、台账 detail 三处都调它,所以"预览说的"与"发出去的"不可能漂。
+    """
+    return mp_mapper.shipping_weight_ex({"attrs": row.get("product_slow")})
+
+
+def _weight_tally(rows: list[dict]) -> str | None:
+    """输入:候选行 → 输出:兜底行数那一句(全都解析出来就 None,不打空行)。"""
+    buckets: dict[str, int] = {}
+    for r in rows:
+        _lbs, why = _weight_of(r)
+        if why != "parsed":
+            buckets[why] = buckets.get(why, 0) + 1
+    if not buckets:
+        return None
+    detail = "、".join(f"{_WEIGHT_NOTE[k]} {v}" for k, v in sorted(buckets.items()))
+    return (f"    其中 {sum(buckets.values())} 行重量按 "
+            f"{mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅兜底({detail})—— "
+            f"REPLACE 会把线上重量覆盖成它,这是**有意为之**(所有者 2026-09-06 定稿:"
+            f"解析不出或超 {mp_mapper.MAX_SHIPPING_WEIGHT_LBS:g} 磅一律写 1 磅)")
 
 
 def _item_of(row: dict, sku: str) -> dict:
@@ -1145,29 +1164,45 @@ def _item_of(row: dict, sku: str) -> dict:
         (GTIN)是从**我们自己的观测**(catalog.walmart_items)取的现挂号,而
         SPEC 预填是"沃尔玛目录里这个号长什么样"的模板,对原地换码没有输入;
         少一次 SPEC 调用也少一份配额。productIdentifiers 由兜底路径填。
-      · price / weight 是**现值原样发回去**(REPLACE 覆盖语义,见 `_CONDS` 那两条)。
+      · price 是**现挂价原样发回去**(REPLACE 覆盖语义,见 `_CONDS` 的「有现挂价格」)。
+      · weight 走 `_weight_of` → `mp_mapper.shipping_weight_ex`:**不是**把线上
+        那个值原样发回去,而是按新口径重算(2026-09-06 晚所有者定稿)。REPLACE
+        覆盖重量在这里是**有意为之** —— 存量行的线上重量多半是老实现按错单位
+        发上去的(把 "860 grams" 当 860 磅),改码顺便把它统一到准确值;
+        解析不出或 > 11 磅写 1 磅。
       · condition 由积木补 "New"(与跟卖链逐字同源)。
     信封由 api/feeds.build_payload 包成 `{"Item": …}`(铁律 2:api 层只包信封)。
     """
+    lbs, _why = _weight_of(row)
     return match_feed.build_match_item(
-        None, sku, row["price"], row["weight"],
+        None, sku, row["price"], lbs,
         product_id=row["product_id"], product_id_type=row["product_id_type"])
 
 
 def _build_items(rows: list[dict]) -> list[dict]:
-    """输入:候选行(带 new_sku / product_id / product_id_type / price / weight)
+    """输入:候选行(带 new_sku / product_id / product_id_type / price / product_slow)
     → 输出:MP_ITEM_MATCH 的 Item 列表(**通道的唯一分叉点**,见 `_item_of`)。"""
     return [_item_of(r, r["new_sku"]) for r in rows]
 
 
 def _preview(rows: list[dict]) -> list[str]:
-    """输入:候选行 → 输出:dry-run 的样例行(占位码,**不 mint**)。"""
+    """输入:候选行 → 输出:dry-run 的样例行(占位码,**不 mint**)。
+
+    重量**逐行标出解析归因**:`重量 3.5 磅(parsed)` 是从采集数据里按显式单位
+    解析出来的真值;`重量 1.0 磅(兜底:…)` 是所有者定稿的那个 1 磅。人眼确认
+    看的就是这一列 —— 只打一个数字的话,"真 1 磅"与"兜底 1 磅"在纸面上一模一样。
+    """
     lines = [f"  [DRY-RUN] 将改码 {len(rows)} 个(前 {min(len(rows), PREVIEW_ROWS)} 个):"]
     for r in rows[:PREVIEW_ROWS]:
+        lbs, why = _weight_of(r)
+        wnote = "parsed" if why == "parsed" else f"兜底:{_WEIGHT_NOTE[why]}"
         lines.append(f"    · {r['old_sku']} → <新码>(出身 {r['source_type']}/"
                      f"{r['source_key']},Product ID {r['product_id_type']}="
-                     f"{r['product_id']},现挂价 {r['price']},发货重量 {r['weight']} 磅"
-                     f" —— 后两个是**原样发回去**,REPLACE 不改它们)")
+                     f"{r['product_id']},现挂价 {r['price']} —— **原样发回去**,"
+                     f"REPLACE 不改它;重量 {lbs} 磅({wnote})—— 按新口径**重写**)")
+    tally = _weight_tally(rows)
+    if tally:
+        lines.append(tally)
     sample = _item_of(rows[0], sku_codec.DRYRUN_PLACEHOLDER)
     lines.append(f"    载荷样例({FEED_TYPE};sku 位置真跑时是抽出来的 12 位码,"
                  f"这里是占位码):{sample}")
@@ -1207,6 +1242,9 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
         lines.append(f"  ⚠ 候选 {len(rows)} 个超配额留量 {cap},本轮只发前 {cap} 个"
                      f"(其余**一个字都没落库**,下轮再来)")
         rows = rows[:cap]
+    tally = _weight_tally(rows)
+    if tally:                       # 真跑同样报兜底行数(dry-run 才有的数 = 没数)
+        lines.append(tally.lstrip())
     # ① 先落库并 commit(防重状态先落库再调接口)
     with db.pg_conn() as conn:
         for r in rows:
@@ -1224,7 +1262,10 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
                     "detail": json.dumps({"product_id": r["product_id"],
                                           "product_id_type": r["product_id_type"],
                                           "price": float(r["price"]),
-                                          "weight": float(r["weight"])})})
+                                          "weight": float(_weight_of(r)[0]),
+                                          # 光看 weight=1.0 分不出"真 1 磅"与
+                                          # "兜底 1 磅",复盘时这一格就是答案
+                                          "weight_reason": _weight_of(r)[1]})})
                 r["id"] = cur.fetchone()[0]
     logger.info("改码台账已落库并提交:%s %d 条 pending(此刻才允许调接口)",
                 store_name, len(rows))

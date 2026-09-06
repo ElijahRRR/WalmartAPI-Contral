@@ -2377,3 +2377,53 @@ def test_limit_absent_means_no_truncation(monkeypatch):
     # -p limit=0 与不传等价(`or None`):0 不是"一行都不做"的开关
     out0 = ln.run({"execute": False, "limit": 0})
     assert "[DRY-RUN] 共 2 行将进入" in out0 and "人工上限" not in out0
+
+
+def test_weight_fallbacks_are_bucketed_by_reason_in_the_summary(monkeypatch):
+    """重量兜底**按归因分桶**报进摘要(2026-09-06 事故后改口)。
+
+    此前只数一桶「没有 attrs.weight」—— 而真正把 "300 grams" 当 300 磅发出去的
+    那类行(有 weight、有数字、没单位)当时**一桶都不占**,摘要看着干干净净。
+    现在四类兜底各自见人:无采集重量 / 无单位记号 / 单位不认识 / 超 11 磅。
+
+    ⚠ **上架行为不变**:兜底值(1.0 磅)照发,四行全部进得去 —— 重量不达标
+    从来不是上架链的拦截项,这里只负责"亮出来"。
+    """
+    rows = [_sheet_row(rownum=2, store="T1", asin="B0GOODWT"),
+            _sheet_row(rownum=3, store="T1", asin="B0BAREWT"),
+            _sheet_row(rownum=4, store="T1", asin="B0HEAVYWT"),
+            _sheet_row(rownum=5, store="T1", asin="B0NOWT")]
+    base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
+            "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
+    products = {
+        # 显式单位 ⇒ parsed,不进任何桶
+        "B0GOODWT": {**base, "asin": "B0GOODWT",
+                     "attrs": {"weight": {"package": "3.5 pounds"}}},
+        # 裸数字 ⇒ no_unit(**事故形态**:老实现会把它当 300 磅发出去)
+        "B0BAREWT": {**base, "asin": "B0BAREWT",
+                     "attrs": {"weight": {"package": "300"}}},
+        # 超所有者定的 11 磅上限 ⇒ over_cap
+        "B0HEAVYWT": {**base, "asin": "B0HEAVYWT",
+                      "attrs": {"weight": {"package": "12 pounds"}}},
+        # 采集侧压根没给 ⇒ no_weight
+        "B0NOWT": {**base, "asin": "B0NOWT", "attrs": {}},
+    }
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
+                        lambda: {"T1": {"fbm_range1": "200%"}})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": "T1"}])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert "重量按 1.0 磅兜底 3 行" in out
+    assert "无采集重量 1" in out and "无单位记号 1" in out and "超 11 磅 1" in out
+    assert "单位不认识" not in out          # 零值那一桶不打印(排版规范规矩 2)
+    assert "共 4 行将进入" in out           # 兜底不拦上架,四行全进

@@ -1558,8 +1558,14 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
             continue
         qty = int(stock)
         echo[3] = w_price               # 算出定价的行回显 L 列
-        if not ((p.get("attrs") or {}).get("weight")):
-            counts["no_weight"] += 1    # ShippingWeight 将按 1.0 磅兜底,亮出来
+        # 发货重量:**解析器说了算**,不是"有没有 attrs.weight 这个键"
+        # (2026-09-06 事故后改口)。`shipping_weight_ex` 的归因分桶报进摘要 ——
+        # 光看 ShippingWeight=1.0 分不出"真 1 磅"与"兜底 1 磅",而"无单位"
+        # 与"超 11 磅"这两桶持续出现说明**采集侧的 weight 形态需要核实**。
+        # ⚠ 上架行为不变:兜底值照发(上架链既有语义,重量不达标不拦上架)。
+        _wt_reason = mp_mapper.shipping_weight_ex(p)[1]
+        if _wt_reason != "parsed":
+            counts["wt_" + _wt_reason] += 1
         survivors.append({**r, "_p": p, "_price": w_price, "_qty": qty})
     return _RowGate(survivors, reasons, dict(counts), data_echo)
 
@@ -1648,8 +1654,11 @@ def run(params: dict) -> str:
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "cooldown": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
-         "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
-         "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0}
+         "no_upc": 0, "stock_assumed": 0, "invalid": 0,
+         "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0,
+         # 重量兜底按**归因**分桶(键 = "wt_" + mp_mapper 的归因词);
+         # 只报非零的那几桶,口径见 gate_line 里的重量段
+         **{f"wt_{r}": 0 for r in mp_mapper.WEIGHT_REASONS if r != "parsed"}}
     # 变体口径分布(所有者定稿 2026-08-15):键 = 'variant' 或退回单品的原因首词。
     # 四类退回必须逐类见人 —— 静默降级 = 变体功能悄悄没生效而没人知道。
     n_var: dict[str, int] = collections.defaultdict(int)
@@ -1744,10 +1753,18 @@ def run(params: dict) -> str:
     if n_var:
         gate_line += (";变体:" + ",".join(f"{k} {v}" for k, v in
                                           sorted(n_var.items())))
-    if n["no_weight"]:
-        # 采集侧没给 attrs.weight → ShippingWeight 兜 1.0 磅。持续大面积
-        # 出现 = 采集契约的 weight 形态可能对不上(backlog P1 核实项)
-        gate_line += f";无重量数据按 1.0 磅 {n['no_weight']} 行"
+    # 重量兜底**按归因分桶**(2026-09-06 事故后改口:此前只数"没有 attrs.weight"
+    # 一桶,而真正把 300 克当 300 磅发出去的那类行,当时一桶都不占)。
+    # 持续出现"无单位记号"或"超 11 磅" = 采集契约的 weight 形态对不上,凭这行核实。
+    wt_buckets = [(lab, n[key]) for key, lab in (
+        ("wt_no_weight", "无采集重量"), ("wt_no_unit", "无单位记号"),
+        ("wt_unknown_unit", "单位不认识"),
+        ("wt_over_cap", f"超 {mp_mapper.MAX_SHIPPING_WEIGHT_LBS:g} 磅"),
+        ("wt_nonpositive", "重量非正数")) if n[key]]
+    if wt_buckets:
+        gate_line += (f";重量按 {mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅兜底 "
+                      f"{sum(v for _lab, v in wt_buckets)} 行("
+                      + "、".join(f"{lab} {v}" for lab, v in wt_buckets) + ")")
     lines.append(gate_line)
     if scrape_note:
         lines.append(scrape_note)

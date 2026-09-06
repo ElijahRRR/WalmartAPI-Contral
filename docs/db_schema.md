@@ -514,7 +514,7 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
     feed_id text,                       -- 提交成功后落;NULL = 还没发出去
     status text DEFAULT 'pending',      -- pending / confirmed / rolled_back / stalled
     submitted_at / settled_at timestamptz,
-    sheet_synced_at timestamptz,        -- 上架表 SKU 列已回写新码的时刻;NULL = 待补写
+    sheet_synced_at timestamptz,        -- 2026-09-06 起**不再使用**,恒 NULL(见下)
     error text, detail jsonb DEFAULT '{}', created_at timestamptz DEFAULT now()
 );
 -- 索引:sku_migrations_open_uidx UNIQUE (store, old_sku) WHERE status='pending'
@@ -528,10 +528,13 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- retire_cooldown 之于 catalog.upc_pool 同款分工)。
 -- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
 -- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
--- sheet_synced_at 的由来:一次飞书写失败(频控 99991400 / 行号找不到)之后该行已
--- confirmed、不再进定案集,上架表 SKU 列就永远停在旧码,而回执找行与退役从此对不上
--- **且不报错**(conventions §八「当轮写完,攒到下一轮 = 悄悄少写」)。写侧接线在
--- 批次 3 的 workflows/sku_migrate.py;地基这一块只建表,零写入。
+-- sheet_synced_at:**2026-09-06 起不再使用**(所有者定稿:改码不回写上架表 ——
+-- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
+-- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。
+-- 身份映射的出口是 catalog.listing_sources(权威)+ 在线产品总表「来源码」列(人看的
+-- 那份);上架表 SKU 列只由上架链(list_new)写。sku_migrate 的 `_sync_sheet` 与每轮
+-- 补写查询已整段删除,**列保留只为不动存量库**(不 DROP、不 ALTER),新行恒 NULL;
+-- 旧行留着的时间戳是历史事实记录,不回填改写。
 
 -- (listing.tasks 与 listing.upc_pool 已于 2026-08-12 退役删除:全仓零代码
 --  引用——上架状态权威 = 飞书上架表 + catalog.upc_pool + retire_cooldown,

@@ -601,7 +601,7 @@ feedType 与两个桶都已收录,只补注释与测试)。
 
   | 判词 | 证据组合 | 后果 |
   |---|---|---|
-  | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + 上架表 SKU 列回写 + `dispositions.rekey_suggested` + `drop_node_rows` + 台账 confirmed |
+  | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + `dispositions.rekey_suggested` + `drop_node_rows` + 台账 confirmed |
   | `rolled_back` | 回执 `failed`;或**观测新鲜**且新码超 `OBSERVE_HOURS`(24h)仍未出现;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
   | `stalled` | 超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错) |
   | (不定案) | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:只告警不处置,摘要**首行**点名。节奏闸是它的主要防线 |
@@ -635,11 +635,13 @@ feedType 与两个桶都已收录,只补注释与测试)。
   **之后**才组载荷、才 POST。在未提交事务里 POST = 进程一死就是"沃尔玛已受理、我们
   这边零记录"的孤儿码。
 - **dry-run 三纪律**:`_settle` 与 `_migrate` **都**零写(不 mint、不定案、不提交、
-  不写飞书、不改处置、不删节点库存),摘要用占位码打印将改的前 N 行与载荷样例;
+  不改处置、不删节点库存、不回写库存),摘要用占位码打印将改的前 N 行与载荷样例;
   `🧪 [DRY-RUN]` 前缀拼在**首行行首**(cli 的链通知只取首行)。
-- **上架表 SKU 列回写在事务之外**,写成功才盖 `sheet_synced_at`;每轮开头先补写
-  `status='confirmed' AND sheet_synced_at IS NULL` 的行(一次写失败之后该行已是
-  confirmed、不再进 pending 判决面,没有补写路径它就永远停在旧码而且不报错)。
+- ~~**上架表 SKU 列回写在事务之外**,写成功才盖 `sheet_synced_at`;每轮开头先补写
+  `status='confirmed' AND sheet_synced_at IS NULL` 的行~~ **已整段删除**
+  (2026-09-06 所有者定稿,见 §9.12「改码不回写上架表」):身份映射的出口是登记簿
+  `catalog.listing_sources` + 在线产品总表「来源码」列,上架表 SKU 列只由上架链写。
+  台账列 `sheet_synced_at` **保留但不再写**(恒 NULL,只为不动存量库)。
 - ~~**形态 A**(决策 E 默认):`FEED_TYPE = "MP_MAINTENANCE"` + `build_sku_update_item`~~
   **已作废(2026-09-05 §9.10)**。**现行通道:`FEED_TYPE = "MP_ITEM_MATCH"`**
   (2026-09-06 §9.12),载荷由 `_item_of` → `match_feed.build_match_item` 组:
@@ -833,8 +835,11 @@ psql "$DSN" -c "SELECT count(*) FROM catalog.sku_aliases;"
 psql "$DSN" -c "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname='catalog' AND tablename='listing_sources';"
 # 过程账三态分布(每一级投放之后看)
 psql "$DSN" -c "SELECT status, count(*) FROM listing.sku_migrations WHERE store='<试点店>' GROUP BY 1;"
-# 已定案的行必须都回写过上架表 SKU 列(非空);为空的下一轮会自动补写
-psql "$DSN" -c "SELECT id, new_sku, sheet_synced_at FROM listing.sku_migrations WHERE store='<试点店>' AND status='confirmed';"
+# ~~已定案的行必须都回写过上架表 SKU 列(非空);为空的下一轮会自动补写~~
+# ⛔ **本条作废**(2026-09-06 所有者定稿:改码不回写上架表,见 §9.12)——
+#    sheet_synced_at 现在**恒 NULL**,非空只可能是 2026-09-06 之前的历史行。
+#    要核"新码与来源码的对应关系",看登记簿与在线产品总表「来源码」列:
+psql "$DSN" -c "SELECT sku, source_type, source_key, replaced_by FROM catalog.listing_sources WHERE store='<试点店>' AND sku='<新码>';"
 # 定案后的身份两端 + UPC(号不动、只换挂在它名下的 SKU)
 psql "$DSN" -c "SELECT sku, replaced_by, replaced_at, abandoned_at, abandoned_reason FROM catalog.listing_sources WHERE store='<试点店>' AND sku='<旧码>';"
 psql "$DSN" -c "SELECT sku, status, asin, used_at FROM catalog.upc_pool WHERE store='<试点店>' AND asin='<试点 ASIN>';"
@@ -1211,7 +1216,7 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 | ⑤ | `_CONDS` 加两条判据:**有现挂价格**(`w.price IS NOT NULL AND w.price > 0`)、**有采集重量**(`(p.slow -> 'weight') IS NOT NULL`);重量再加一层 Python 判据(`shipping_weight` 落到 `DEFAULT_SHIPPING_WEIGHT` ⇒ 剔除并点名) | 同上 |
 | ⑥ | 配额口径改口:桶是 `feeds.post.MP_ITEM_MATCH` **15/h**(`api/_client.py:238`),与跟卖链共享,**不再与维护链抢** | `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 头注 |
 | ⑦ | 反哺器防串扰:`match_sheet.sync_from_ledger` 与 `listing_sheet._SQL_HEAL_RECEIPT` 各加 **workflow 正向过滤**(改码与跟卖共用 feedType 之后,feed_type 已分不开两条链) | services |
-| ⑧ | 缺口 **G-4**:`_sync_sheet` 改为「先按 (店, 旧码) 的 SKU 列定位 → 旧行 SKU 列为空才退回 (店, ASIN) → **多行命中不写并点名**」 | `workflows/sku_migrate.py` |
+| ⑧ | ~~缺口 **G-4**:`_sync_sheet` 改为「先按 (店, 旧码) 的 SKU 列定位 → 旧行 SKU 列为空才退回 (店, ASIN) → **多行命中不写并点名**」~~ **当天晚些时候整段作废**:改码不回写上架表(见本节末「改码不回写上架表」) | `workflows/sku_migrate.py` |
 | ⑨ | 守门与文档:`test_feed_type_constant_is_the_only_place_that_names_a_feedtype` 只看可执行行;§8 决策 E/I 收口;`docs/api_blueprint.md` §5.1 与 `docs/db_schema.md` 的 `feed_type` 说明改口 | tests / docs |
 
 **为什么价格与重量必须原样发回去**(这一条比通道本身更容易出事):REPLACE 的语义
@@ -1281,7 +1286,7 @@ ship_node=None)` → `(True, '')`,库存已补回。
 
 | 项 | 定稿 |
 |---|---|
-| 时点 | `_settle` 里 **confirmed 之后、`_sync_sheet` 之前**(定案的后果之一,不是善后) |
+| 时点 | `_settle` 里 **confirmed 之后**(定案的后果之一,不是善后;`_sync_sheet` 当天晚些时候已整段删除) |
 | qty | `catalog.walmart_items.avail_qty`,按 **(店, 旧码)** 读;一轮一条 SQL(新旧码一起问) |
 | 不写的三种情况 | qty 为 NULL / 0;新码 `avail_qty` 已等于 qty(通道将来自己保住库存时这段空转);受管仓判不出(**fail-closed**,不回落 legacy 单仓) |
 | 通道 | `api.inventory.put_inventory(store, new_sku, qty, ship_node=node)`;`node = store_limits.resolve_node(store, store_limits.maint_nodes())` —— **维护链同一个入口**,`maint_nodes()` 一轮只读一次 |
@@ -1293,7 +1298,7 @@ ship_node=None)` → `(True, '')`,库存已补回。
 (线上库存 0)。所以第一级投放之后要**尽快**跑 `catalog_sync -p store=X`,
 再 `sku_migrate -p store=X -p settle_only=1`,别隔夜。
 
-**顺带降噪**:`_sync_sheet` 的「上架表找不到行」由 ⚠ 改成不带标记的计数行
+**顺带降噪(已被下一条定稿取代:整段回写都删了)**:`_sync_sheet` 的「上架表找不到行」由 ⚠ 改成不带标记的计数行
 (「上架表无对应行 N + 样本 3 个」)—— 旧系统上架的存量品本来就不在上架表里,
 整店改码时是成百上千条的常态,带 ⚠ 会把真告警(重复 ASIN / 同店双挂 / 超期)
 淹掉。**「重复 ASIN 无法定位,人工」那条 ⚠ 保持原样**:它是真要人动手的。
@@ -1308,3 +1313,38 @@ catalog_sync 采到了过渡态,**不是 REPLACE 必然清零**;回写逻辑作�
 差异时写)。3 个旧码名下滞留 executing 的 inventory 处置按设计不迁,由 expire_executing
 收尾。上架表无对应行 9 条(旧系统上架的存量品),计数不告警;首行「未同步 N 行」的
 终态口径待所有者定。
+
+#### 改码不回写上架表(2026-09-06 所有者定稿)
+
+**所有者原话**:「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,
+我们的 sku 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写
+即可。」
+
+**定稿**:`sku_migrate` 的上架表 SKU 列回写**整段删除** —— `_sync_sheet`、
+`_SQL_LEDGER_SHEET_OK`、每轮的补写候选查询(`status='confirmed' AND sheet_synced_at
+IS NULL`)、摘要首行的「⚠ 上架表 SKU 列未同步 N 行」与明细里的三行(将回写 / 补写
+候选 / 上架表无对应行)一并去掉;`counts` 里的 `sheet` / `sheet_lag` 字段删除;
+`services/listing_sheet` 不再被本工作流 import。
+
+**理由**(这也是上一条「首行未同步 N 行的终态口径待所有者定」的答案):
+
+- 身份映射已经有两处出口 —— 权威在登记簿 `catalog.listing_sources`,人看的那份在
+  **在线产品总表的「来源码」列**(catalog_sync 的投影)。上架表 SKU 列是第三处,
+  而它**会被所有者定期清理**:拿一张随时会被清空的工作表当身份映射就是双轨(§六),
+  而且清空之后没有任何东西会报错。
+- 上架表 SKU 列的**唯一写侧**回到上架链(`list_new` 落地时填),口径干净:一列一个
+  写方。改码链不再为一张会被清理的表长出「写失败 → 盖时间戳 → 下一轮补写」这条
+  补偿路径,`_settle` 少一处外部 IO。
+- 实测背景:第二级投放(limit=10)那一轮里「上架表无对应行」9 条 —— 旧系统上架的
+  存量品本来就不在上架表里,整店改码时是成百上千条的常态。那条计数行连同它上面的
+  降噪讨论一起消失了。
+
+**列不动**:`listing.sku_migrations.sheet_synced_at` **保留**(不 DROP、不 ALTER),
+只为不动存量库;新行**恒 NULL**,旧行留着的时间戳是历史事实记录,不回填改写。
+`refdata/schema.sql` 与 `docs/db_schema.md` 的该列注释已改口。
+
+**守门**:`tests/test_sku_migrate.py::test_sku_migrate_never_writes_the_listing_sheet_sku_column`
+(源码可执行行里不许再出现 `listing_sheet` / `write_sku_col` / `sheet_synced_at` /
+`_sync_sheet`)+ `test_confirmed_never_touches_the_listing_sheet`(定案不碰上架表、
+不写那一列)。缺口 G-4 的三条用例(按旧码定位 / 空 SKU 列退回 ASIN / 重复 ASIN 不猜)
+随实现一起删除。

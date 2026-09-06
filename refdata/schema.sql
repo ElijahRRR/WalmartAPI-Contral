@@ -731,10 +731,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
 -- catalog.upc_pool 同款分工,见上面那张表)。
 -- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
 -- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
--- sheet_synced_at:上架表 SKU 列已回写新码的时刻;NULL = 待补写。没有这一列,
--- 一次飞书写失败(频控 99991400 / 行号找不到)之后该行已 confirmed、不再进定案集,
--- SKU 列永远停在旧码,而回执找行与退役从此对不上且不报错
--- (conventions §八「当轮写完,攒到下一轮 = 悄悄少写」)。
+-- sheet_synced_at:**2026-09-06 起不再使用**——改码不回写上架表(所有者定稿:
+-- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
+-- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。
+-- 身份映射的出口是 catalog.listing_sources + 在线产品总表「来源码」列;上架表 SKU 列
+-- 只由上架链写。列**保留只为不动存量库**(不 DROP、不 ALTER),新行**恒 NULL**。
 CREATE TABLE IF NOT EXISTS listing.sku_migrations (
     id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     store          text NOT NULL,
@@ -747,7 +748,7 @@ CREATE TABLE IF NOT EXISTS listing.sku_migrations (
     status         text NOT NULL DEFAULT 'pending',  -- pending/confirmed/rolled_back/stalled
     submitted_at   timestamptz,
     settled_at     timestamptz,
-    sheet_synced_at timestamptz,     -- 上架表 SKU 列已回写新码的时刻;NULL = 待补写
+    sheet_synced_at timestamptz,     -- 2026-09-06 起不再使用,恒 NULL(见上面头注)
     error          text,
     detail         jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at     timestamptz NOT NULL DEFAULT now()

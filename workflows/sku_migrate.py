@@ -30,12 +30,23 @@
     pending ──(新码在架 ∧ 旧码缺席 ∧ 观测新鲜)──────────────▶ confirmed
       │                                                        (旧行弃码 sku_update,
       │                                                         不烧 UPC;UPC 改标、
-      │                                                         上架表 SKU 列、处置迁键、
+      │                                                         处置迁键、库存回写、
       │                                                         节点库存清行)
       ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
       │                                                        (旧行复活,新码弃掉)
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
       └──(新码在架 ∧ 旧码**也**在架)──▶ 留 pending + ⚠ 同店双挂(只告警,不自动处置)
+
+**身份映射写在哪(2026-09-06 所有者定稿:改码不回写上架表)**:
+新码与它的来源码这份对应关系,权威在登记簿 `catalog.listing_sources`,人看的那份
+在**在线产品总表的「来源码」列**(catalog_sync 的投影)—— 两处都已经有了。
+**上架表的 SKU 列只由上架链写**(list_new 落地时填),改码**一格都不碰**。
+所有者原话:「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,
+我们的 sku 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的
+填写即可。」在此之前本工作流有一条 `_sync_sheet`(按旧码/ASIN 定位行 + 写 SKU 列
++ 盖 `sheet_synced_at` + 每轮补写),**已整段删除**:上架表是会被清理的工作表,
+不是身份账,拿它当第二处身份映射就是双轨(§六)。台账列
+`listing.sku_migrations.sheet_synced_at` **保留但不再写**(恒 NULL,只为不动存量库)。
 
 **七条安全约束**(每条都不是可选项):
   ① **先落库并 commit 再调接口**:mint + pending 台账的事务必须在组载荷之前退出;
@@ -49,8 +60,10 @@
   ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案;
      配额上它吃 `feeds.post.MP_ITEM_MATCH` 桶(15/h),与**跟卖链 match_listing
      共享** —— 不再与 13:00 的维护链抢 MP_MAINTENANCE,但跟卖真跑那天别并跑。
-  ⑥ **dry-run 下 _settle 与 _migrate 都零写**:不 mint、不定案、不提交、不写飞书、
-     不改处置、不删节点库存、不回写库存 —— 一行库、一行飞书、一条 feed 都不写。
+  ⑥ **dry-run 下 _settle 与 _migrate 都零写**:不 mint、不定案、不提交、
+     不改处置、不删节点库存、不回写库存 —— 一行库、一条 feed 都不写
+     (飞书本工作流**只读不写**:库存回写要读「维护仓库」判受管仓,见头注
+      「身份映射写在哪」—— 上架表一格都不碰)。
   ⑦ **REPLACE 会把库存清成 0,定案必须把库存回写新码**(2026-09-06 第一级投放
      实证,见 docs/sku_plan.md §9.12):v4.2 的载荷里没有库存字段,沃尔玛把
      「没带」当 0 写 —— A085朱丽霖 `B0000C8W8W → AVW476VD6W3H` 换码成功
@@ -94,7 +107,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import feeds, inventory as inv_api
 from registry import db
-from services import amz_source, dispositions, feed_track, listing_sheet, \
+from services import amz_source, dispositions, feed_track, \
     listing_sources, match_feed, mp_mapper, notify_fmt as nf, order_lines, \
     sku_codec, store_absence, store_limits, stores as stores_svc, upc_pool, \
     walmart_catalog
@@ -349,15 +362,6 @@ WHERE m.store = %(store)s AND m.status = 'pending' AND m.submitted_at IS NOT NUL
 ORDER BY m.id
 """
 
-#: 飞书 SKU 列的补写集合(每轮开头先补:一次写失败之后该行已是 confirmed、
-#: 不再进 pending 判决面,没有这条路径它的 SKU 列就永远停在旧码而且不报错)。
-_SQL_UNSYNCED = """
-SELECT id, old_sku, new_sku, source_type, source_key
-FROM listing.sku_migrations
-WHERE store = %(store)s AND status = 'confirmed' AND sheet_synced_at IS NULL
-ORDER BY id
-"""
-
 #: 落库了但没发出去的行(submitted_at 仍空):进程死在 POST 前后、或提交当场抛异常。
 #: **不自动定案** —— 死在 POST 之前是"确定没发",死在 POST 之后是"不知道到没到",
 #: 从这张表上分不出来(判不准就判活)。点名让人去看 ops.feed_log 与沃尔玛后台。
@@ -409,11 +413,6 @@ _SQL_LEDGER_STALLED = """
 UPDATE listing.sku_migrations
    SET status = 'stalled', error = %(error)s
  WHERE id = %(id)s
-"""
-
-_SQL_LEDGER_SHEET_OK = """
-UPDATE listing.sku_migrations SET sheet_synced_at = now()
- WHERE id = ANY(%(ids)s::bigint[])
 """
 
 #: 定案回写库存的取数(**一轮一条 SQL**,新旧码一起问)。
@@ -609,9 +608,11 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
 def _confirm(store_name: str, row: dict) -> list[str]:
     """输入:店 + 一条台账行 → 输出:告警行(无告警返回 [])。
 
-    一个事务里把 confirmed 的全部后果做完(飞书回写在事务外,见 _sync_sheet):
+    一个事务里把 confirmed 的全部后果做完:
     身份定案 → UPC 改标 → 处置迁键 → 节点库存清行 → 过程账落 confirmed。
-    外部 IO 不进数据库事务:飞书失败下一轮补写,登记簿不会因此回滚。
+    **上架表不在这张清单里**:改码不回写上架表 SKU 列(2026-09-06 所有者定稿,
+    见模块头注「身份映射写在哪」)。库存回写是事务**之后**的外部 IO(_settle 里做),
+    它失败不让已经定案的身份回滚。
     """
     warns: list[str] = []
     old, new = row["old_sku"], row["new_sku"]
@@ -767,106 +768,29 @@ def _restore_inventory(conn, store_name: str, rows: list[dict], execute: bool,
     return counts, lines
 
 
-def _sync_sheet(store_name: str, rows: list[dict], execute: bool) -> tuple[int, list[str]]:
-    """输入:店 + 待同步的已定案行 + 是否真写 → 输出:(写入行数, 告警行)。
-
-    上架表 SKU 列回写:**先按 (店, 旧码) 用行上的 SKU 列定位**,SKU 列为空的
-    存量行(批次 1 之前建的)才退回 (店, ASIN),而且**只在唯一命中时写**。
-    写成功才盖 sheet_synced_at —— 盖不上的行下一轮再来(「当轮写完,攒到下一轮 =
-    悄悄少写」,conventions §八)。**在数据库事务之外**:飞书是外部 IO,
-    它失败不该让已经定案的身份回滚。
-
-    ⚠ **缺口 G-4(2026-09-06 修)**:此前只按 (店, ASIN) 反查,而 `by_key` 是个
-    dict —— 同店同一个 ASIN 有多行(补货重上、拆变体、运营复制粘贴,上架表里很
-    常见)时 **后写的行号覆盖前面的**,于是新码被写到"最后那一行"上。表现是:
-    另一行的 SKU 列还停在旧码、这一行的 SKU 列被改成了一个不属于它的码,回执找行
-    (`listing_sheet.row_sku`)、退役载荷、冷却键从此全部指错行,**而且没有任何东西
-    会报错**。三条路的分工:
-      ① 行上 SKU 列 == 旧码 ⇒ 唯一定位(批次 1 之后的行都有 SKU 列,这是主路);
-      ② SKU 列为空 ∧ (店, ASIN) **唯一**命中 ⇒ 按 ASIN 写(存量行的兼容路);
-      ③ SKU 列为空 ∧ (店, ASIN) **多行**命中 ⇒ **不写**,点名「重复 ASIN 无法
-         定位,人工」—— 猜一行写下去比不写坏得多(见上)。
-    口径与 `listing_sheet.row_sku` 同源:那个函数就是"SKU 列非空取 SKU,否则回落
-    ASIN",这里只是把这两半分开当两把钥匙用,**不自己再写一份 `sku or asin`**。
-    """
-    if not rows:
-        return 0, []
-    if not execute:
-        return 0, []
-    sheet = listing_sheet.read_rows(upto="sku")
-    by_sku: dict[tuple[str, str], list[int]] = {}     # 行上 SKU 列非空的行
-    by_asin: dict[tuple[str, str], list[int]] = {}    # 行上 SKU 列**为空**的行
-    for r in sheet:
-        if str(r.get("sku") or "").strip():
-            by_sku.setdefault((r["store"], listing_sheet.row_sku(r)),
-                              []).append(r["rownum"])
-        else:
-            by_asin.setdefault((r["store"], r["asin"]), []).append(r["rownum"])
-    updates, done_ids, missing, ambiguous = [], [], [], []
-    for r in rows:
-        hits = by_sku.get((store_name, r["old_sku"]))
-        how = "SKU 列"
-        if not hits:
-            hits = by_asin.get((store_name, r["source_key"]))
-            how = "ASIN(旧行 SKU 列为空)"
-        if not hits:
-            missing.append(f"{r['old_sku']}→{r['new_sku']}")
-            continue
-        if len(hits) > 1:
-            ambiguous.append(f"{r['old_sku']}→{r['new_sku']}"
-                             f"(按 {how} 命中第 {sorted(hits)} 行)")
-            continue
-        updates.append((hits[0], r["new_sku"]))
-        done_ids.append(r["id"])
-    warns: list[str] = []
-    n = 0
-    if updates:
-        n = listing_sheet.write_sku_col(updates, execute=True)
-        with db.pg_conn() as tx:
-            tx.execute(_SQL_LEDGER_SHEET_OK, {"ids": done_ids})
-    if missing:
-        # ⚠ **不带 ⚠**(2026-09-06 降噪):**旧系统上架的存量品本来就不在上架表里**
-        # ——整店改码时这是成百上千条的常态,不是异常。带 ⚠ 的后果不是"多提醒
-        # 一句",而是把首行那几条真告警(重复 ASIN / 双挂 / 超期)淹掉,人从此
-        # 不看告警。真正需要人动手的那条(**同一个 ASIN 在表里有多行**,猜一行
-        # 写下去会把新码写到别人那行上)仍保持 ⚠,见下。
-        warns.append(f"  上架表无对应行 {len(missing)} 条(旧系统上架的存量品,"
-                     f"上架表里本来就没有它们的行,**无表可回写**;这些行的 SKU 列"
-                     f"不存在,回执找行与退役走登记簿那条腿,不受影响):"
-                     f"样本 {missing[:3]}")
-    if ambiguous:
-        warns.append(f"  ⚠ **重复 ASIN 无法定位,人工**:{len(ambiguous)} 个新码在"
-                     f"上架表里命中多行,**一格都没写**(猜一行写下去 = 把新码写到"
-                     f"别人那行上,回执找行与退役从此指错且不报错):{ambiguous[:5]}"
-                     f" —— 请在上架表上人工把这几行的 SKU 列填成各自的真码,"
-                     f"下一轮自动按 SKU 列唯一定位")
-    return n, warns
-
-
 def _settle(conn, store_name: str, execute: bool, *, store_of,
             observe_hours: float = OBSERVE_HOURS,
             stale_hours: float = STALE_HOURS) -> tuple[dict, list[str]]:
     """输入:只读连接 + 店 + 是否真写 + 店铺凭证取处 → 输出:(判决计数, 摘要行)。
 
     每次调用**最先**跑这一段(-p settle_only=1 时只跑它)。判据见 _verdict;
-    execute=False 时七处写全部跳过(定案 / UPC 改标 / 处置迁键 / 节点库存 /
-    过程账 / **库存回写** / 飞书),只算判决并报"将定案多少条、将回写库存多少条"。
+    execute=False 时六处写全部跳过(定案 / UPC 改标 / 处置迁键 / 节点库存 /
+    过程账 / **库存回写**),只算判决并报"将定案多少条、将回写库存多少条"。
+    **上架表一格都不写**(2026-09-06 所有者定稿,见模块头注「身份映射写在哪」)。
 
     `store_of` 是本轮**店铺凭证的取处**(懒加载,一轮最多读一次):库存回写
     要拿凭证与代理去调沃尔玛,而这一段跑在闸不过、settle_only 的路径上也照跑。
 
     ⚠ 写不走入参的 `conn`:那是本轮的**只读**连接,而定案必须是自己的短事务
-    (每条各自成败,一条撞车不拖垮整轮),飞书回写又必须在事务提交**之后**。
+    (每条各自成败,一条撞车不拖垮整轮)。
     """
     counts = {_CONFIRMED: 0, _ROLLED_BACK: 0, _STALLED: 0, _PENDING: 0,
-              "double": 0, "sheet": 0, "inventory": 0, "inventory_failed": 0}
+              "double": 0, "inventory": 0, "inventory_failed": 0}
     lines: list[str] = []
     warns: list[str] = []
     now = datetime.now(timezone.utc)
 
     with conn.cursor() as cur:
-        cur.execute(_SQL_UNSYNCED, {"store": store_name})
-        backlog = _rows(cur)
         cur.execute(_SQL_OBSERVE, {"store": store_name})
         pend = _rows(cur)
         cur.execute(_SQL_UNSENT, {"store": store_name})
@@ -905,8 +829,8 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
             continue
         if not execute:
             lines.append(f"  [DRY-RUN] 将定案 {tag} = {verdict}({why})")
-            # 空跑也把"将 confirmed"的行收进来:库存回写与上架表回写的"将做多少"
-            # 都从这张表算(真跑与空跑同一条路径,报出来的数才是真跑会做的数)
+            # 空跑也把"将 confirmed"的行收进来:库存回写的"将做多少"就从这张表
+            # 算(真跑与空跑同一条路径,报出来的数才是真跑会做的数)
             if verdict == _CONFIRMED:
                 confirmed_rows.append(row)
             continue
@@ -936,9 +860,9 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
                          f"{e.__class__.__name__}: {e} —— 该行事务已回滚,状态没变,"
                          f"下一轮会重新判;连续失败请人工看日志")
 
-    # 库存回写:**confirmed 之后、上架表回写之前**(安全约束⑦:REPLACE 把库存
-    # 清成 0,定案回写是流程的一部分,不是可选的善后)。整段失败不让这一轮报
-    # 失败、更不让已经定案的身份回滚 —— 沃尔玛是外部 IO,点名即可,**不自动重试**
+    # 库存回写:**confirmed 之后**(安全约束⑦:REPLACE 把库存清成 0,定案回写是
+    # 流程的一部分,不是可选的善后)。整段失败不让这一轮报失败、更不让已经定案的
+    # 身份回滚 —— 沃尔玛是外部 IO,点名即可,**不自动重试**
     try:
         inv_counts, inv_lines = _restore_inventory(
             conn, store_name, confirmed_rows, execute, store_of=store_of)
@@ -953,30 +877,14 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
     counts["inventory_todo"] = inv_counts.get("todo", 0)
     lines += inv_lines
 
-    todo = backlog + confirmed_rows
-    if todo and not execute:
-        lines.append(f"  [DRY-RUN] 将回写上架表 SKU 列 {len(todo)} 行(含补写 "
-                     f"{len(backlog)} 行),本次一格都没写")
-    try:
-        n_sheet, sheet_warns = _sync_sheet(store_name, todo, execute)
-    except Exception as e:                     # noqa: BLE001 —— 飞书是外部 IO:
-        # 它失败不该让已经定案的身份回滚,也不该让这一轮报失败;sheet_synced_at
-        # 这一列存在的意义就是"下一轮再来"(conventions §八:当轮写完不了就点名)
-        logger.exception("上架表 SKU 列回写失败(下一轮补写)")
-        n_sheet, sheet_warns = 0, [
-            f"  ⚠ 上架表 SKU 列回写失败({e.__class__.__name__}: {e}):"
-            f"{len(todo)} 行仍停在旧码,已留 sheet_synced_at=NULL 待下一轮补写"]
-    counts["sheet"] = n_sheet
-    warns += sheet_warns
-    if backlog:
-        lines.append(f"  上架表 SKU 列补写候选 {len(backlog)} 行"
-                     f"(上一轮写失败的,本轮重来)")
+    # ⚠ 这里**没有**上架表回写(2026-09-06 所有者定稿删掉了 `_sync_sheet`):
+    # 身份映射在登记簿 + 在线产品总表「来源码」列,上架表 SKU 列只由上架链写。
+    # 见模块头注「身份映射写在哪」——**不要把它加回来**(上架表会被清理,拿它
+    # 当第二处身份映射就是双轨,§六)。
     lines.append(f"  定案:confirmed {counts[_CONFIRMED]}、"
                  f"rolled_back {counts[_ROLLED_BACK]}、stalled {counts[_STALLED]},"
                  f"仍 pending {counts[_PENDING]},本轮回写库存 "
-                 f"{counts['inventory']} 条、回写上架表 {n_sheet} 行")
-    n_lag = len(todo) - n_sheet if execute else len(todo)
-    counts["sheet_lag"] = max(n_lag, 0)
+                 f"{counts['inventory']} 条")
     return counts, lines + warns
 
 
@@ -1465,7 +1373,6 @@ def run(params: dict) -> str:
     n_stall = settle_counts.get(_STALLED, 0)
     n_pend = settle_counts.get(_PENDING, 0)
     n_double = settle_counts.get("double", 0)
-    n_lag = settle_counts.get("sheet_lag", 0)
     n_unsent = settle_counts.get("unsent", 0)
     n_failed = settle_counts.get("failed", 0)
     n_inv = settle_counts.get("inventory", 0)
@@ -1502,8 +1409,6 @@ def run(params: dict) -> str:
         gist += f";⚠ 超期未定案 {n_stall}"
     if dupes:
         gist += f";⚠ 订单双行 {len(dupes)} 组"
-    if n_lag:
-        gist += f";⚠ 上架表 SKU 列未同步 {n_lag} 行"
     if n_unk:
         gist += f";⚠ 提交结局不确定 {n_unk}(保持 pending)"
     if n_unsent:

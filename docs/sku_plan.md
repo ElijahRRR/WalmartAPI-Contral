@@ -136,7 +136,7 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
 | `workflows/alloc_push.py:72`、`alloc_plan.py:127`、`alloc_products.py:101` | **"已在架"集合恒空 ⇒ 已上架的品被重新派工、重复上架** | 同上 |
 | `services/feed_track.py:179-190` | 违禁回执反哺黑名单写错键 | 传 source_key(键的推导在 blacklist 侧)【0b 已闭合】|
 | `workflows/product_refresh.py:58/89` `_ASIN_RE` | **推采集目标静默归零 ⇒ 维护链新鲜度源头断** | 改查登记簿 amz 行的 source_key |
-| `workflows/sources_backfill.py:46/66/90` | 新 SKU 全判 unknown;"非零即报警"语义作废 | 摘要分三桶:amz / 旧格式存量 / 新码漏登记(后者才报警,不透明码判据调 `sku_codec.is_opaque`)【0b 已闭合】|
+| `workflows/sources_backfill.py:46/66/90` | 新 SKU 全判 unknown;"非零即报警"语义作废 | ~~摘要分三桶(amz / 旧格式存量 / 新码漏登记)~~ →**2026-09-06 所有者定稿:改成「只登记不猜」**,判型正则与三桶全删,未登记行一律登 `unknown`+`source_key=NULL`,摘要每轮报「本轮新增 N|累计 unknown 待归类 M」,人工归类走 `sources_reclassify`【已闭合】|
 | `workflows/sku_normalize.py` / `order_asin_normalize.py` | 变空转,"可解析 0 个"只增不减 | 两条共用 `sku_asin.resolve_pairs`(带 store,倒查两级);`_DISTINCT_SQL`/`_FILL_SQL` 加 store 维度【0b 已闭合】|
 
 不改的(语义是"过滤非标准码",新码天然不是 ASIN,行为恰好正确):
@@ -328,10 +328,17 @@ AK7QM2X9RT4W                 A = amz(映射只在 registry)
   派工去重键是**全表 ASIN 单列、不带店铺**(`append_assignments`),是既有口径差,
   另记。
 - **护栏跟码走**:`_SQL_ATTEMPTS` 改按 (店, ASIN) 经登记簿 JOIN、按代际计(只数
-  最近一次弃码之后的提交;无弃码事件则跨码累计);**代际上限**:同 (store,
-  source_type, source_key) 弃码行数 ≥ 3 ⇒ list_new 写 N「换码次数达上限,待人工」;
-  24h 冷却从 sku_locked_heal 自管泛化为 list_new 闸门(常量单一出处,官方无明文
-  按旧实证保留)。
+  最近一次弃码之后的提交;无弃码事件则跨码累计);24h 冷却从 sku_locked_heal
+  自管泛化为 list_new 闸门(常量单一出处,官方无明文按旧实证保留)。
+  ⚠ **代际上限**(同 (store, source_type, source_key) 弃码行数 ≥ 3 ⇒ list_new
+  写 N「换码次数达上限,待人工」)—— **已删除**(所有者 2026-09-06:上架失败
+  以 feed 报错为准优化上架方法,不设代数上限;代价是反复 SKU_LOCKED 的品每个
+  冷却期烧一个 UPC)。`MAX_SKU_GENERATIONS`、`_SQL_ABANDONED_GEN`、`over_gen`
+  字段、`listing_sources_abandoned_idx` 全部删净(§7 批次 2 那几行是**当时**
+  的交付记录,不是现状);存量库里的索引由所有者手动 DROP,见
+  `docs/db_schema.md`。守门 `test_generation_cap_is_gone_root_and_branch`。
+  ⚠ 别与另外三个带"代际"的东西混:`_SQL_ATTEMPTS` 的**代际口径**、退役冷却闸、
+  视图 `catalog.sku_aliases` 的**代际继承** —— 三个都在,与上限无关。
 - **消费方契约**:resolve / 维护链 JOIN / 事件归并 / 订单反查对 (store, sku)
   一律不按 abandoned_at 过滤;全仓 SQL 里 `abandoned_at IS NULL` 只允许出现在
   `sku_codec.mint`、list_new 去重闸、`alloc_push._SQL_ONLINE` 三处(守门测试)。
@@ -573,8 +580,10 @@ product_clear / daily_cleanup / auto_listing 调度已停**(安全红线「新�
 索引、过程账 `listing.sku_migrations`、别名视图 `catalog.sku_aliases`、体检视图
 `orders.v_order_line_dupes`、`product_risk` 加改码两列;`sku_codec.mint_replacement` /
 `settle_replacement` / `OPAQUE_SQL_PREDICATE`;`listing_sources.replacement_map` /
-`replaced_skus`;`upc_pool.retag_sku`;`mp_mapper.build_sku_update_item`(形态 A 最小载荷)
-与 `ORDERABLE_SYSTEM_FIELDS` 登记 SkuUpdate;`mp_conform` 放行系统开关(决策 I);
+`replaced_skus`;`upc_pool.retag_sku`;~~`mp_mapper.build_sku_update_item`~~ 与
+~~`mp_conform` 放行系统开关(决策 I)~~ **2026-09-06 随通道定案删除**(§9.12),
+改码载荷改走 `match_feed.build_match_item`;`ORDERABLE_SYSTEM_FIELDS` 仍登记
+SkuUpdate(只为挡住 LLM);
 `order_lines.duplicate_po_lines` 退化成读视图的薄壳。**api/feeds 零代码改动**(两个
 feedType 与两个桶都已收录,只补注释与测试)。
 
@@ -631,10 +640,13 @@ feedType 与两个桶都已收录,只补注释与测试)。
 - **上架表 SKU 列回写在事务之外**,写成功才盖 `sheet_synced_at`;每轮开头先补写
   `status='confirmed' AND sheet_synced_at IS NULL` 的行(一次写失败之后该行已是
   confirmed、不再进 pending 判决面,没有补写路径它就永远停在旧码而且不报错)。
-- **形态 A**(决策 E 默认):`FEED_TYPE = "MP_MAINTENANCE"` + `build_sku_update_item`
-  最小载荷,**不重发内容**;切形态 B 只改 `FEED_TYPE` 与 `_build_items` 两处,但
-  **必须先**确认 `mp_conform` 放行 SkuUpdate(被剔掉 ⇒ 每一行都退化成普通上架 =
-  每一行都双挂,而且回执一片成功)。**不提供参数覆盖**(双轨禁止)。
+- ~~**形态 A**(决策 E 默认):`FEED_TYPE = "MP_MAINTENANCE"` + `build_sku_update_item`~~
+  **已作废(2026-09-05 §9.10)**。**现行通道:`FEED_TYPE = "MP_ITEM_MATCH"`**
+  (2026-09-06 §9.12),载荷由 `_item_of` → `match_feed.build_match_item` 组:
+  同 GTIN + 新 SKU + `processMode=REPLACE` 在同一 item 上原地换码,**没有 SkuUpdate**。
+  换通道只改 `FEED_TYPE` 与 `_build_items`/`_item_of` 两处;**不提供参数覆盖**(双轨禁止)。
+  ⚠ REPLACE 会覆盖载荷里给到的每个字段 ⇒ `price` / `ShippingWeight` 必须发**现值**,
+  采不到现值的行由 `_CONDS` 的「有现挂价格」「有采集重量」两条判据剔掉。
 
 **受牵连的 (store, sku) 键表 —— 逐条结论**(2026-09-02 复核,结论与依据都留下,
 免得下一轮盘点又把它们当待办):
@@ -710,17 +722,31 @@ feedType 与两个桶都已收录,只补注释与测试)。
       source_key 是匹配 GTIN,改码后 `upc_pool` 的 (店, ASIN) 键无从对上。要迁需追加
       一轮单品实测(MP_ITEM_MATCH v4.2 是否也认 SkuUpdate,官方零文档)+ 一个
       `_build_items` 分支,**状态机不用改**】
-- [ ] **决策 E|SkuUpdate 的 feed 形态**:A(MP_MAINTENANCE 最小载荷)还是
-      B(MP_ITEM 全量)。【批次 3 按默认实现 **A**,常量 `sku_migrate.FEED_TYPE`;
-      由六件实测第 1、2 件裁定。**形态 B 有一个所有者必须先接受的副作用**:改码 =
-      重发全部内容,标题与属性会被我们再生成的内容覆盖;而且它吃 list_new 的
-      MP_ITEM 桶。若实测判定只有 B 可行,建议**回到计划层让所有者拍板**再动手】
+- [x] **决策 E|改码走哪条 feed 通道** —— **2026-09-06 定案:`MP_ITEM_MATCH`**
+      (`sku_migrate.FEED_TYPE`,依据 §9.12 所有者 Seller Center 实测)。
+      原提的两个形态**都作废**:A(MP_MAINTENANCE 最小载荷 + SkuUpdate)被官方
+      spec 原件证伪(§9.10),B(MP_ITEM 全量 + SkuUpdate)从未有过实证、而且要
+      重发全部内容(标题/属性被覆盖)、还吃 list_new 的 MP_ITEM 桶。定案的通道
+      不用 SkuUpdate:MP_ITEM_MATCH 按「**同 GTIN + 新 SKU + REPLACE**」在同一个
+      item 上**原地换码**(wpid 不变、库存跟着过来、价格不变),换码是 REPLACE 的
+      机械后果,不是一个开关。配额吃 `feeds.post.MP_ITEM_MATCH`(15/h,与跟卖链
+      共享),不再与 13:00 的维护链抢 MP_MAINTENANCE。
+      **未决(不阻塞)**:仓里的 MP_ITEM_MATCH 是 v4.2(sellingChannel header),
+      所有者用的模板是 v5.0;v4.2 能否同样换码由第一级投放(limit=1)实测定,
+      **不另写探针、不加参数开关**。
 - [ ] **决策 H|改码后的历史销量归属**:经 `catalog.sku_aliases` 映射(已实现),
       还是把聚合键整体改成 ASIN(更根本,但要改三个消费点的键形状,属另一个批次)。
-- [ ] **决策 I|形态 B 下 SkuUpdate 如何穿过 `mp_conform.strip_unknown`**:
-      【按默认实现:`ORDERABLE_SYSTEM_SWITCHES` 显式登记 + 放行。形态 A 用不到它,
-      但**仍必须先做** —— 决策 E 一旦翻到 B,没有它就是每一行都双挂而且回执全绿】
-- [ ] **沃尔玛 SKU 规格**:本地 spec Orderable.sku 的长度上限、字符集。
+- [x] **决策 I|形态 B 下 SkuUpdate 如何穿过 `mp_conform.strip_unknown`** ——
+      **2026-09-06 作废**(决策 E 定案 MP_ITEM_MATCH,载荷里根本没有 SkuUpdate)。
+      落地:`mp_conform.ORDERABLE_SYSTEM_SWITCHES` 那条放行分支、
+      `mp_mapper.build_sku_update_item`、`mp_mapper.build_orderable(sku_update=)`
+      **三处一并删除** —— 留着就是第二条改码路径(§六 双轨禁止),而且删了放行
+      分支之后它还是**不报错**的那一条(传了会被 strip 掉 ⇒ 改码退化成普通上架 ⇒
+      同店双挂,回执全绿)。`SkuUpdate` 仍留在 `mp_mapper.ORDERABLE_SYSTEM_FIELDS`
+      里,职责只剩挡住 LLM 往 Orderable 塞它;反向守门在
+      `tests/test_mp_conform.py::test_sku_update_is_stripped_like_any_other_unknown_field`。
+- [x] **沃尔玛 SKU 规格** —— 2026-09-06 由「Match items」模板给出:
+      **Alphanumeric, 50 characters**(12 位不透明码远在限内,字符集也在内)。
 - [x] **飞书建列**(所有者 2026-09-02 已建):上架表 R「SKU」;销售订单「来源码」;
       售后订单「来源码」;在线产品总表 Q「来源码」。统一叫「来源码」。
       【0b:代码分第二个 PR,建完列再合 —— 建列前程序载荷里没有这一列,
@@ -730,6 +756,11 @@ feedType 与两个桶都已收录,只补注释与测试)。
       领号复用键仍是 `upc_pool.asin`。烧号新增两个状态文案「删除烧号/锁死烧号」】
 - [x] **四个来源字母**(所有者 2026-09-02):amz=A、跟卖 match=B、1688=C、自建 self=H。
 - [x] **存量 unknown 行的人工归类**(所有者 2026-09-03 提出,**已实现**):
+      **⚠ 2026-09-06 起这不再是"存量清尾",而是常规路径**:所有者定稿
+      `sources_backfill` **只登记不猜**(判型正则与三桶全删,schema.sql 的存量
+      回填 INSERT 同日删除),于是**每一条新出现的未登记在架行都落在 unknown**,
+      唯一出路就是人工经 `sources_reclassify` 归类;backfill 摘要每轮都报
+      「累计 unknown 待归类 M 行」,就是为了让这条队列不会没人看。
       `sources_backfill` 把 `CMSQ-B0CLCX3Q1Z-169.99`(应为 `B0CLCX3Q1Z`)、
       `B0822D9QQKS59`(应为 `B0822D9QQK`)这类非标准形态一律登记成
       `source_type='unknown'` + `source_key=NULL`,它们按路由铁律**被排除在全部
@@ -866,11 +897,11 @@ python cli.py sku_migrate -p store=<试点店> -p limit=100000 -p exclude_asins=
 | B|UPC 撞库 0101119 时码与 UPC 是否一起换 | **一起换**(批次 2 已落地)。改码 confirmed 的 `abandon(reason='sku_update')` 必须**不烧号**,与撞库那支走不同分支,分支由 reason 决定 | ☐ |
 | C|`alloc_push` 派工口径是否对齐去重闸 | **对齐**(批次 2 已落地)。pending 期间旧码行 `abandoned_at IS NULL` 且在架,按对齐后的口径仍算「已在架」⇒ 不会被重新派工,**不需要**在 `_SQL_ONLINE` 里额外加 `replaced_by` 条件(别好心补一条冗余条件) | ☐ |
 | D|跟卖存量是否也迁 | **不迁**(`SOURCE_TYPES = ('amz',)`) | ☐ |
-| E|feed 形态 A 还是 B | **A**(`FEED_TYPE = "MP_MAINTENANCE"`),由六件实测第 1、2 件裁定 | ☐ |
+| E|改码走哪条 feed 通道 | ~~A(MP_MAINTENANCE 最小载荷)~~ 与 ~~B(MP_ITEM 全量)~~ **两个形态都作废**;**2026-09-06 定案 `FEED_TYPE = "MP_ITEM_MATCH"`**(所有者 Seller Center 实测,同 GTIN + 新 SKU + REPLACE 原地换码,载荷无 SkuUpdate;§9.12) | ☑ |
 | F|POST `outcome=unknown` 是否回滚 | **不回滚,保持 pending**(见 9.1-1) | ☐ |
 | G|`cleanup_seen_categories` / `ops.dedupe` / `catalog.claims` 是否随改码迁 | **三者都不迁**(逐条依据见 §7 批次 3 的键表) | ☐ |
 | H|改码后历史销量归属 | **经 `catalog.sku_aliases` 映射**,返回键形状不变、三个消费点一字不改 | ☐ |
-| I|形态 B 下 SkuUpdate 如何穿过 `strip_unknown` | **显式登记 `ORDERABLE_SYSTEM_SWITCHES` 并放行**(名单穷举、触发记日志、条件明确,满足 §六 真兜底三要件);形态 A 用不到但仍先做 | ☐ |
+| I|形态 B 下 SkuUpdate 如何穿过 `strip_unknown` | **2026-09-06 作废**(决策 E 定案 MP_ITEM_MATCH,载荷里没有 SkuUpdate)。`ORDERABLE_SYSTEM_SWITCHES` 放行分支与 `build_sku_update_item` / `build_orderable(sku_update=)` **三处一并删除**,反向守门钉住「没有开关字段放行名单」;§9.12 | ☑ |
 
 ### 9.3 本次评审驳回或转出的意见(不静默丢弃)
 
@@ -1140,3 +1171,75 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 **联动改动**:`workflows/product_clear.py` 头注「可恢复窗口」措辞同步(§8 决策 A
 转出项收口);plan.md 工作流 8 行、production_cutover §5 各记一句。
 `services/problem_products` 归类不动 —— RETIRED 行本来就不再进扫描面,归类无从发生。
+
+### 9.12 改码通道定案:MP_ITEM_MATCH(2026-09-06,所有者 Seller Center 实测)
+
+**事实**(所有者在 Seller Center 亲手做的一次改码,不是文档推断,以此为准):
+用「Match items」模板把 A085朱丽霖 的 `B0CRKFQZWF` 改成 `Test851`,feed
+`18D2A25BB3895D7096CF1357C17C2A36@AYYBBwA`。
+
+| 项 | 值 |
+|---|---|
+| 模板头部 | `Version=5.0.20260703-18_22_27,MP_ITEM_MATCH,mp_item_setup_by_match` |
+| 行内字段 | specProductType / productId(**GTIN 14 位 `00121678236703`**)/ productIdType=GTIN / productName / sku / condition=New / mainImageUrl / ShippingWeight=**0.82** / price=**29.99** |
+| **SkuUpdate** | **没有这个字段** |
+| SKU 规格(模板给的) | Alphanumeric, 50 characters |
+
+**探针结果**(改完之后逐条看的):
+
+| 探针 | 结果 | 说明 |
+|---|---|---|
+| wpid | 新旧码**同为 `5FK5P1SAT7OM`** | 同一个 item,不是新建了一条 |
+| 库存 | 5 → 5 跟着过来 | 模板库存列**是空的**,库存却没丢 ⇒ 不是重建 |
+| 价格 | 不变 | 模板里发的就是现价 29.99 |
+| 旧码 | `GET /v3/items/{旧码}` **404** | 且**不是**所有者手动删的 |
+| feed | 1 条 SUCCESS | |
+
+**结论**:MP_ITEM_MATCH 按「**同 GTIN + 新 SKU + REPLACE**」在**同一个 item 上原地
+换码**。载荷不需要 `SkuUpdate` —— 换码是 `processMode=REPLACE` 的机械后果,不是一个
+开关。这同时把 §9.10 留下的那个岔口("setup 类 feed 是 MP_ITEM 还是 MP_ITEM_MATCH")
+关掉了:是 MP_ITEM_MATCH,而且**仓里早就有这条通道**(跟卖链 match_listing 生产在用)。
+
+**切换清单**(2026-09-06 一次改完,不分批):
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | `FEED_TYPE = "MP_ITEM_MATCH"`;`SUBMIT_DISABLED = ""`(**机制保留**:非空即停闸,守门钉「缺省为空」+「非空时 cap=0」) | `workflows/sku_migrate.py` |
+| ② | `_build_items` / `_preview` 共用新构造点 `_item_of`,复用 `services/match_feed.build_match_item(None, sku, price, weight, product_id=…, product_id_type=…)`;SPEC 预填传 **None**(改码不做 SPEC 预检:匹配键取自我们自己的观测);信封 `{"Item": …}` 由 `api/feeds.build_payload` 包 | 同上 |
+| ③ | 删 `mp_mapper.build_sku_update_item`、`mp_mapper.build_orderable(sku_update=)`、`mp_conform.ORDERABLE_SYSTEM_SWITCHES` 的放行分支(形态 A/B 残留 = 双轨) | services |
+| ④ | 候选行带出**现挂价**(`w.price`)与 **Product ID 优先 GTIN**(`coalesce(w.gtin, w.upc)`),重量经登记簿 `source_key` LEFT JOIN `catalog.products.slow`,由 `mp_mapper.shipping_weight` 解析 | `_SQL_CANDIDATES` / `_FROM` |
+| ⑤ | `_CONDS` 加两条判据:**有现挂价格**(`w.price IS NOT NULL AND w.price > 0`)、**有采集重量**(`(p.slow -> 'weight') IS NOT NULL`);重量再加一层 Python 判据(`shipping_weight` 落到 `DEFAULT_SHIPPING_WEIGHT` ⇒ 剔除并点名) | 同上 |
+| ⑥ | 配额口径改口:桶是 `feeds.post.MP_ITEM_MATCH` **15/h**(`api/_client.py:238`),与跟卖链共享,**不再与维护链抢** | `FEEDS_PER_STORE_PER_RUN` / `ITEMS_PER_FEED` 头注 |
+| ⑦ | 反哺器防串扰:`match_sheet.sync_from_ledger` 与 `listing_sheet._SQL_HEAL_RECEIPT` 各加 **workflow 正向过滤**(改码与跟卖共用 feedType 之后,feed_type 已分不开两条链) | services |
+| ⑧ | 缺口 **G-4**:`_sync_sheet` 改为「先按 (店, 旧码) 的 SKU 列定位 → 旧行 SKU 列为空才退回 (店, ASIN) → **多行命中不写并点名**」 | `workflows/sku_migrate.py` |
+| ⑨ | 守门与文档:`test_feed_type_constant_is_the_only_place_that_names_a_feedtype` 只看可执行行;§8 决策 E/I 收口;`docs/api_blueprint.md` §5.1 与 `docs/db_schema.md` 的 `feed_type` 说明改口 | tests / docs |
+
+**为什么价格与重量必须原样发回去**(这一条比通道本身更容易出事):REPLACE 的语义
+是"载荷给了什么,线上就变成什么"。所以采不到现值的行**一律不许发**——
+`match_feed.build_match_item` 在重量留空时兜底 1.0 磅(那是跟卖链的合理默认),
+用它改码就是把线上真实重量悄悄改成 1 磅,运费从此算错,**回执全绿、摘要正常**。
+两层判据(SQL 粗判 + Python 解析)缺一不可:只有 SQL 那层,`weight={"package":"N/A"}`
+照样进候选;只有 Python 那层,`_SQL_WHY` 说不出它为什么不在候选面上。
+⚠ 真重量**恰好 1.0 磅**的行会被误剔(返回值分不出"解析出 1.0"与"兜底 1.0")——
+宁可少改一个码,被剔的那个在摘要里有名有姓。
+
+**待第一级投放实测(不阻塞切换)**:仓里的 MP_ITEM_MATCH 通道是 **v4.2**
+(`sellingChannel` 制 header,跟卖链生产在用),所有者上传的模板是 **v5.0**。
+v4.2 能否同样原地换码,由第一级投放(节奏闸自动压到 `limit=1`)的那一个品定 ——
+**不另写探针、不加 v5 header、不加参数开关**(一个能力一条实现路径)。
+第一级投放的预期形状(dry-run 已核):
+
+```
+{"MPItemFeedHeader": {"processMode": "REPLACE", "subset": "EXTERNAL", "locale": "en",
+                      "sellingChannel": "mpsetupbymatch", "version": "4.2"},
+ "MPItem": [{"Item": {"sku": "<12 位不透明码>", "price": 29.99, "ShippingWeight": 0.82,
+                      "condition": "New",
+                      "productIdentifiers": {"productIdType": "GTIN",
+                                             "productId": "00121678236703"}}}]}
+```
+
+**Test851 遗留数据的手工修法**(所有者手改的那一条不在任何台账里,程序看它是
+"凭空多出来的一个新码"):`sources_reclassify` 把 `Test851` 归 `amz` / 源头码
+`B0CRKFQZWF`,再
+`sku_codec.abandon(conn, 'A085朱丽霖', 'B0CRKFQZWF', ABANDON_SKU_UPDATE, replaced_by='Test851')`
+把旧码标成"已被替换"。**所有者已执行**,此处只留做法备查。

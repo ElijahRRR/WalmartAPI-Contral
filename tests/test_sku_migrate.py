@@ -131,7 +131,7 @@ def test_module_flags_are_dangerous_and_store_scoped():
     """DANGEROUS 写错 = 调度里空转还报成功;两个开关都是 cli 的契约面。"""
     assert sm.DANGEROUS is True
     assert sm.SUPPORTS_STORE is True
-    assert sm.FEED_TYPE == "MP_MAINTENANCE"
+    assert sm.FEED_TYPE == "MP_ITEM_MATCH"          # 2026-09-06 通道定案(§9.12)
     assert sm.SOURCE_TYPES == (sm.listing_sources.SOURCE_AMZ,)
 
 
@@ -149,12 +149,20 @@ def test_workflow_imports_no_other_workflow():
 
 
 def test_feed_type_constant_is_the_only_place_that_names_a_feedtype():
-    """feedType 只有 FEED_TYPE 一个出生地:形态 A→B 的切换必须只有一个改动点。"""
+    """feedType 只有 FEED_TYPE 一个出生地:换通道必须只有一个改动点。
+
+    ⚠ 只看**可执行的行**(`#` 注释与模块 docstring 剔除):头注里要能把
+    「MP_MAINTENANCE 为什么作废、MP_ITEM_MATCH 为什么是它」讲清楚,那是文档不是
+    第二个出生地。真正的漂移长成 `feeds.submit_feed(store, "MP_ITEM_MATCH", …)`
+    这种字面量 —— 那一行改不到,换回通道时就会一半新一半旧,而且不报错。
+    """
     src = (_ROOT / "workflows" / "sku_migrate.py").read_text(encoding="utf-8")
     body = src.replace(ast.get_docstring(ast.parse(src)) or "", "", 1)
     hits = [ln for ln in body.splitlines()
-            if ('"MP_MAINTENANCE"' in ln or "'MP_MAINTENANCE'" in ln
-                or '"MP_ITEM"' in ln)]
+            if not ln.lstrip().startswith("#")
+            and any(t in ln for t in ('"MP_MAINTENANCE"', "'MP_MAINTENANCE'",
+                                      '"MP_ITEM_MATCH"', "'MP_ITEM_MATCH'",
+                                      '"MP_ITEM"', "'MP_ITEM'"))]
     assert len(hits) == 1 and hits[0].startswith("FEED_TYPE ="), hits
 
 
@@ -268,11 +276,17 @@ def test_another_workflows_pending_feed_does_not_block(monkeypatch):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _CAND_COLS = ["store", "old_sku", "source_type", "source_key",
-              "product_id", "product_id_type"]
+              "product_id", "product_id_type", "price", "product_slow"]
+
+#: 候选行的采集 slow 段:重量解析得出来才进候选(REPLACE 会覆盖线上重量,
+#: 兜底 1.0 磅不许发出去)。这个形状与 catalog.products.slow / amz_source 的
+#: `attrs` 逐字同源(mp_mapper.shipping_weight 的输入)。
+_SLOW = {"weight": {"package": 0.82}}
 
 
-def _cand(old_sku, pid="0001", src="amz", key=None):
-    return ("T1", old_sku, src, key or "B0" + old_sku[-8:], pid, "UPC")
+def _cand(old_sku, pid="0001", src="amz", key=None, price=29.99, slow=_SLOW):
+    return ("T1", old_sku, src, key or "B0" + old_sku[-8:], pid, "GTIN",
+            price, slow)
 
 
 def test_opaque_and_match_rows_are_excluded_by_the_candidate_sql():
@@ -285,8 +299,9 @@ def test_opaque_and_match_rows_are_excluded_by_the_candidate_sql():
     assert sm.sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku") in sql
     # 未了结的改码台账挡住重复发起(崩溃重入不会开第二条 pending)
     assert "m.status IN ('pending', 'confirmed', 'stalled')" in sql
-    # Product ID 取观测值,不取 UPC 池
-    assert "coalesce(w.upc, w.gtin)" in sql and "upc_pool" not in sql
+    # Product ID 取观测值,不取 UPC 池;**优先 GTIN**(所有者实测的模板就是 GTIN 14 位)
+    assert "coalesce(w.gtin, w.upc)" in sql and "upc_pool" not in sql
+    assert "WHEN w.gtin IS NOT NULL THEN 'GTIN'" in sql
 
 
 def test_candidate_with_an_inflight_feed_is_skipped_and_named():
@@ -328,7 +343,7 @@ _WHY_COLS = ["old_sku", "source_key"] + [f"c{i}" for i in range(len(sm._CONDS))]
 
 
 def _why(old_sku, key=None, bad=()):
-    """一行 `_SQL_WHY` 结果:默认七条判据全真,`bad` 里点名的那几条置假(按短名)。"""
+    """一行 `_SQL_WHY` 结果:默认十一条判据全真,`bad` 里点名的那几条置假(按短名)。"""
     return (old_sku, key or old_sku) + tuple(
         n not in bad for n, _w, _sql in sm._CONDS)
 
@@ -379,7 +394,7 @@ def test_a_named_but_unpublished_row_is_reported_not_silently_dropped():
 
 def test_pick_and_exclude_are_conditions_on_the_one_candidate_sql():
     """**单一实现路径**:点名/排除是同一条候选 SQL 的参数化条件,不是第二条 SQL;
-    而且七条判据在"选取"与"解释"两处**逐字同源**(一漂就会出现"摘要说它满足
+    而且十一条判据在"选取"与"解释"两处**逐字同源**(一漂就会出现"摘要说它满足
     条件,可它就是不在候选面上",谁也不报错)。"""
     sql = sm._SQL_CANDIDATES
     assert sql.count("FROM catalog.walmart_items w") == 1
@@ -745,7 +760,8 @@ def _migrate_wired(monkeypatch, outcome="submitted", feed_id="F9"):
 def _rows_for(n=2):
     return [{"store": "T1", "old_sku": f"B0AAA0000{i}", "source_type": "amz",
              "source_key": f"B0AAA0000{i}", "product_id": f"00{i}",
-             "product_id_type": "UPC"} for i in range(1, n + 1)]
+             "product_id_type": "GTIN", "price": 29.99, "weight": 0.82}
+            for i in range(1, n + 1)]
 
 
 def test_registry_rows_are_committed_before_submit_feed_is_called(monkeypatch):
@@ -767,12 +783,16 @@ def test_payload_uses_the_new_code_and_the_observed_product_id(monkeypatch):
     rows = _rows_for(1)
     sm._migrate({"name": "T1"}, rows, True)
     submit = [c for c in calls if isinstance(c, tuple) and c[0] == "submit"][0]
-    assert submit[1] == "MP_MAINTENANCE" and submit[2] == "sku_migrate"
-    item = submit[4][0]["Orderable"]
+    assert submit[1] == "MP_ITEM_MATCH" and submit[2] == "sku_migrate"
+    item = submit[4][0]
     assert item["sku"] == rows[0]["new_sku"] != rows[0]["old_sku"]
-    assert item["SkuUpdate"] == "Yes"
     assert item["productIdentifiers"] == {"productId": "001",
-                                          "productIdType": "UPC"}
+                                          "productIdType": "GTIN"}
+    # 现挂价与发货重量**原样发回去**(MP_ITEM_MATCH 是 REPLACE:载荷给什么线上就
+    # 变成什么;发默认值 = 一次改码顺手改了售价/运费,而且回执全绿)
+    assert item["price"] == 29.99 and item["ShippingWeight"] == 0.82
+    assert item["condition"] == "New"
+    assert "SkuUpdate" not in item          # 通道不需要这个开关字段(形态 A/B 已废)
 
 
 def test_submitted_slices_land_the_feed_id_and_stay_pending(monkeypatch):
@@ -1388,13 +1408,23 @@ def test_candidates_beyond_the_quota_headroom_are_not_minted(monkeypatch):
     assert any("超配额留量" in ln and "一个字都没落库" in ln for ln in lines)
 
 
-def test_submit_channel_is_disabled_by_default_until_rewired(monkeypatch):
-    """⛔ 2026-09-05:官方 spec 原件核实 MP_MAINTENANCE 无 SkuUpdate,形态 A 作废。
-    在通道切换定案之前,缺省必须是"只定案不提交",而且 dry-run 也不列候选
-    (列了就是"将改码 N 个"的误导)。定案要留着:两条 pending 靠观测走 rolled_back。"""
+def test_submit_channel_is_open_by_default_after_the_2026_09_06_rewire(monkeypatch):
+    """缺省**为空 = 不停闸**(2026-09-06 通道定案 MP_ITEM_MATCH 之后)。
+
+    此前它非空,因为形态 A(MP_MAINTENANCE + SkuUpdate)被官方 spec 原件证伪。
+    钉住缺省值本身:留一个忘了清的停闸串在里面,表现是每一轮都"只定案不提交"
+    而摘要看起来完全正常 —— 所有者会以为改码在跑。
+    """
     import importlib
     fresh = importlib.reload(sm)
-    assert fresh.SUBMIT_DISABLED, "默认值被清空了 —— 通道切换定案了吗?"
+    assert fresh.SUBMIT_DISABLED == "", \
+        f"提交通道被停闸了:{fresh.SUBMIT_DISABLED}(定案了吗?)"
+
+
+def test_a_non_empty_submit_disabled_forces_cap_zero(monkeypatch):
+    """停闸**机制保留**:非空 ⇒ 本轮 cap=0(只定案不提交),而且 dry-run 也不列
+    候选(列了就是"将改码 N 个"的误导)。定案要留着:已发出去的 pending 靠观测
+    反证走 rolled_back 把旧码复活,停闸期没人替它们收尾就是一批孤儿。"""
     monkeypatch.setattr(sm, "SUBMIT_DISABLED", "测试:通道停用")
     _wire(monkeypatch)
     read = _read_conn(monkeypatch, [])
@@ -1406,3 +1436,191 @@ def test_submit_channel_is_disabled_by_default_until_rewired(monkeypatch):
         assert "提交通道停用" in out and "本轮提交 0" in out
         assert not any("FROM catalog.walmart_items w" in sql for sql, _ in read.sqls)
     assert any("FROM listing.sku_migrations m" in sql for sql, _ in read.sqls)   # 定案面照查
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  W4 · REPLACE 会覆盖线上现值:价格与重量两条判据(2026-09-06 通道切 MP_ITEM_MATCH)
+#
+#  MP_ITEM_MATCH 的 processMode 是 **REPLACE**:载荷里给了什么,线上那条 item 的
+#  对应字段就变成什么。所以价格与重量必须把**现值原样发回去**,采不到现值的行
+#  一律不许发 —— 发一个默认值就是拿一次改码顺手改了售价/运费,而且回执全绿、
+#  摘要正常、没有任何东西会报。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_replace_conditions_require_a_live_price_and_a_collected_weight():
+    """两条新判据在 `_CONDS` 里出生一次,**选取与解释两处逐字同源**。"""
+    names = [n for n, _w, _sql in sm._CONDS]
+    assert "有现挂价格" in names and "有采集重量" in names
+    price = next(sql for n, _w, sql in sm._CONDS if n == "有现挂价格")
+    weight = next(sql for n, _w, sql in sm._CONDS if n == "有采集重量")
+    assert price == "(w.price IS NOT NULL AND w.price > 0)"
+    assert weight == "(p.slow -> 'weight') IS NOT NULL"
+    for cond in (price, weight):
+        assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY
+    # 落选人话要说得出"为什么不能兜一个默认值"
+    assert "REPLACE" in next(w for n, w, _s in sm._CONDS if n == "有现挂价格")
+    assert "1.0 磅" in next(w for n, w, _s in sm._CONDS if n == "有采集重量")
+
+
+def test_the_candidate_sql_reaches_products_through_the_registry_key():
+    """重量的来源与上架链同一条:`catalog.products` 按**登记簿 source_key**(=ASIN)
+    关联,不从 SKU 里反解 ASIN(码不再等于 ASIN)。
+
+    ⚠ 必须是 **LEFT** JOIN:没采过的行要能进 `_SQL_WHY` 说出"重量采不到";
+    INNER 会让它整行消失,摘要就变成"店下查无此行"这句错话。
+    """
+    for sql in (sm._SQL_CANDIDATES, sm._SQL_WHY):
+        assert "LEFT JOIN catalog.products p" in sql
+        assert "p.asin = ls.source_key" in sql
+        assert "p.marketplace = %(marketplace)s" in sql
+    conn = _Conn([("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
+                  ("FROM ops.feed_items", (["sku"], []))])
+    sm._candidates(conn, "T1", 10)
+    args = [a for sql, a in conn.sqls if "LIMIT %(limit)s" in sql][0]
+    assert args["marketplace"] == sm.amz_source.MARKETPLACE   # 口径唯一出处
+
+
+def test_a_row_whose_weight_cannot_be_parsed_is_skipped_and_named():
+    """第二层(Python 侧):SQL 只能问"attrs 里有没有 weight 这个键",
+    `weight={"package": "N/A"}` 照样进得来 —— 真去解析的是 mp_mapper.shipping_weight,
+    它落到兜底 1.0 磅就说明**这一行没有真重量**,不许发。
+
+    静默丢是不行的:摘要看起来像"这家店就这么点候选",而所有者不知道少了谁。
+    """
+    conn = _Conn([("FROM catalog.walmart_items w",
+                   (_CAND_COLS, [_cand("B0AAA00001", slow={"weight": {"package": "N/A"}}),
+                                 _cand("B0AAA00002", "0002")])),
+                  ("FROM ops.feed_items", (["sku"], []))])
+    rows, notes = sm._candidates(conn, "T1", 10)
+    assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
+    assert rows[0]["weight"] == 0.82                     # 留下的那条带着真重量
+    assert any("B0AAA00001" in n and "覆盖" in n for n in notes), notes
+
+
+def test_a_weight_that_is_exactly_the_fallback_is_skipped_on_purpose():
+    """真重量**恰好 1.0 磅**的行也会被剔:`shipping_weight` 的返回值分不出
+    "解析出 1.0" 与 "兜底 1.0"。宁可少改一个码,也不拿一次改码顺手改运费 ——
+    而且被剔的那个有名有姓,人看得见、可以人工确认后单独处理。"""
+    conn = _Conn([("FROM catalog.walmart_items w",
+                   (_CAND_COLS, [_cand("B0AAA00001",
+                                       slow={"weight": {"package": 1.0}})])),
+                  ("FROM ops.feed_items", (["sku"], []))])
+    rows, notes = sm._candidates(conn, "T1", 10)
+    assert rows == []
+    assert any("恰好 1.0 磅" in n for n in notes), notes
+
+
+def test_a_named_row_without_a_parsable_weight_says_which_gate():
+    """点名了它却没出现 ⇒ 逐条给理由(不是"条件全都满足只是没轮到")。"""
+    conn = _pick_conn([_cand("B0AAA00001", slow={"weight": {}})],
+                      [_why("B0AAA00001")])
+    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert rows == []
+    assert any("B0AAA00001" in n and "shipping_weight" in n for n in notes), notes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  W3 · 缺口 G-4:上架表回写按 (店, 旧码) 定位,不按 (店, ASIN) 猜
+#
+#  旧实现按 (店, ASIN) 建 dict —— 同店同 ASIN 多行时**后写的行号覆盖前面的**,
+#  新码被写到"最后那一行"上:另一行的 SKU 列还停着旧码、这一行被改成一个不属于
+#  它的码,回执找行 / 退役载荷 / 冷却键从此全部指错行,**而且不报错**。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sheet_wired(monkeypatch, sheet_rows):
+    calls: list = []
+    monkeypatch.setattr(sm.db, "pg_conn",
+                        lambda *a, **k: _Conn(log=calls, tag="tx"))
+    monkeypatch.setattr(sm.listing_sheet, "read_rows",
+                        lambda upto=None: list(sheet_rows))
+    monkeypatch.setattr(sm.listing_sheet, "write_sku_col",
+                        lambda ups, execute=True: (
+                            calls.append(("sheet", list(ups))), len(ups))[1])
+    return calls
+
+
+_MIG_ROW = {"id": 9, "old_sku": "CMSQ-B0OLD00001-43", "new_sku": "AAAAAAAAAAAA",
+            "source_type": "amz", "source_key": "B0OLD00001"}
+
+
+def test_sheet_row_is_located_by_the_old_code_not_the_asin(monkeypatch):
+    """主路:行上 SKU 列 == 旧码 ⇒ 唯一定位。**同店同 ASIN 有三行也不会写错行**
+    (旧实现在这里会写到最后一行 12 上)。"""
+    calls = _sheet_wired(monkeypatch, [
+        {"store": "T1", "asin": "B0OLD00001", "sku": "OTHER-1", "rownum": 5},
+        {"store": "T1", "asin": "B0OLD00001", "sku": "CMSQ-B0OLD00001-43",
+         "rownum": 9},
+        {"store": "T1", "asin": "B0OLD00001", "sku": "OTHER-2", "rownum": 12}])
+    n, warns = sm._sync_sheet("T1", [_MIG_ROW], True)
+    assert n == 1 and warns == []
+    assert ("sheet", [(9, "AAAAAAAAAAAA")]) in calls
+
+
+def test_legacy_rows_without_a_sku_column_fall_back_to_the_asin(monkeypatch):
+    """兼容路:批次 1 之前建的行 SKU 列为空 ⇒ 退回 (店, ASIN),**唯一命中才写**。"""
+    calls = _sheet_wired(monkeypatch, [
+        {"store": "T1", "asin": "B0OTHER999", "sku": "", "rownum": 4},
+        {"store": "T1", "asin": "B0OLD00001", "sku": "", "rownum": 8}])
+    n, warns = sm._sync_sheet("T1", [_MIG_ROW], True)
+    assert n == 1 and warns == []
+    assert ("sheet", [(8, "AAAAAAAAAAAA")]) in calls
+
+
+def test_duplicate_asin_rows_are_never_guessed_and_are_named(monkeypatch):
+    """⛔ 多行命中 ⇒ **一格都不写**,点名「重复 ASIN 无法定位,人工」。
+
+    猜一行写下去比不写坏得多:新码落到别人那行上,而两行的 SKU 列从此都是错的,
+    回执找行与退役全部指错且不报错。不写的代价只是 sheet_synced_at 仍为 NULL、
+    下一轮再来(人把 SKU 列填对之后自动按主路唯一定位)。
+    """
+    calls = _sheet_wired(monkeypatch, [
+        {"store": "T1", "asin": "B0OLD00001", "sku": "", "rownum": 6},
+        {"store": "T1", "asin": "B0OLD00001", "sku": "", "rownum": 11}])
+    n, warns = sm._sync_sheet("T1", [_MIG_ROW], True)
+    assert n == 0
+    assert not [c for c in calls if isinstance(c, tuple) and c[0] == "sheet"]
+    assert any("重复 ASIN 无法定位,人工" in w for w in warns), warns
+    assert not any("sheet_synced_at" in str(c) for c in calls)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  反哺器防串扰:改码与跟卖共用 MP_ITEM_MATCH 之后,回执不许串表
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_match_sheet_reflector_only_reads_its_own_workflows_receipts(monkeypatch):
+    """跟卖表反哺器按 **workflow 正向过滤** ops.feed_items。
+
+    2026-09-06 起改码(sku_migrate)与跟卖(match_listing)**共用 MP_ITEM_MATCH**,
+    feed_type 已经分不开两条链。不过滤的表现是一条改码回执被写进跟卖表的
+    「feed 结果」列(行还是跟卖那一行,结论是别人的),而且不报错。
+    """
+    import inspect
+
+    from services import feed_track, match_sheet
+    assert match_sheet.WORKFLOW == "match_listing"
+    for fn in (feed_track.item_results, feed_track.item_errors):
+        assert inspect.signature(fn).parameters["workflow"].default is None
+    src = inspect.getsource(match_sheet.sync_from_ledger)
+    assert src.count("workflow=WORKFLOW") == 2      # item_results + item_errors
+    # 过滤真的进了 SQL(而不是收下参数就扔)
+    conn = _Conn()
+    monkeypatch.setattr(feed_track.db, "pg_conn", lambda *a, **k: conn)
+    feed_track.item_results("F1", workflow="match_listing")
+    sql, args = conn.sqls[0]
+    assert "AND workflow = %s" in sql and args == ("F1", "match_listing")
+    conn.sqls.clear()
+    feed_track.item_results("F1")                   # 不给就不过滤(逐字节旧行为)
+    assert "workflow" not in conn.sqls[0][0] and conn.sqls[0][1] == ("F1",)
+
+
+def test_listing_sheet_heal_only_reads_list_new_receipts():
+    """上架表 Unknown 自愈同理加正向过滤 `f.workflow = 'list_new'`。
+
+    只按 `feed_type='MP_ITEM'` 认的话,任何将来往 MP_ITEM 里发东西的链都会被读成
+    本行的上架回执 —— 一条别人的 failed 会把「是否上架」写成 No 并把行推进限次
+    重试通道,而**负向误写正是这段代码最防的那件事**(2026-06-09 事故语义)。
+    """
+    from services import listing_sheet
+    sql = listing_sheet._SQL_HEAL_RECEIPT
+    assert "f.feed_type = 'MP_ITEM'" in sql
+    assert "f.workflow = 'list_new'" in sql

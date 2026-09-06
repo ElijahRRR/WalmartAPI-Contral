@@ -318,23 +318,22 @@ def test_clamp_max_length_local_gate():
 
 # ── SkuUpdate 必须活着穿过 strip_unknown(SKU 改造批次 3 地基,M5)────────────
 
-def test_sku_update_survives_strip_unknown_when_absent_from_the_spec(caplog):
-    """SkuUpdate 不在 Orderable spec 里(版本决定)也**必须放行**。
+def test_sku_update_is_stripped_like_any_other_unknown_field():
+    """反向钉死(2026-09-06):`strip_unknown` **没有开关字段放行名单**。
 
-    被剔掉的后果不是被拒,而是静默改语义:发出去的是一条普通 MP_ITEM,沃尔玛按新
-    sku **建一条新 listing**,旧 listing 原样活着 —— 每一行都双挂,不是偶发。
-    名单穷举、触发记日志、条件明确(conventions §六 真兜底三要件),不是 catch-all。
+    此前有一条 `ORDERABLE_SYSTEM_SWITCHES = ("SkuUpdate",)` 的放行分支,给
+    「形态 B = MP_ITEM 全量 + SkuUpdate 改码」当地基。改码通道定案 MP_ITEM_MATCH
+    (同 GTIN + 新 SKU + REPLACE 原地换码,载荷里没有 SkuUpdate)之后,那条分支
+    连同 `mp_mapper.build_sku_update_item` / `build_orderable(sku_update=)` 一起
+    删了 —— 留着就是第二条改码路径(conventions §六 双轨禁止)。
     """
-    import logging
+    assert not hasattr(mc, "ORDERABLE_SYSTEM_SWITCHES")
     assert "SkuUpdate" not in _OSPEC["properties"]        # spec 里确实没有它
-    assert mc.ORDERABLE_SYSTEM_SWITCHES == ("SkuUpdate",)
-    with caplog.at_level(logging.INFO, logger="services.mp_conform"):
-        _v, o, dropped = mc.strip_unknown(
-            _SPEC, _OSPEC, {"productName": "T"},
-            {"sku": "S1", "price": 1.0, "SkuUpdate": "Yes"})
-    assert o["SkuUpdate"] == "Yes"
-    assert not any("SkuUpdate" in d for d in dropped)
-    assert any("SkuUpdate" in msg for msg in caplog.messages)   # 放行必须留痕
+    _v, o, dropped = mc.strip_unknown(
+        _SPEC, _OSPEC, {"productName": "T"},
+        {"sku": "S1", "price": 1.0, "SkuUpdate": "Yes"})
+    assert "SkuUpdate" not in o
+    assert "orderable.SkuUpdate" in dropped
 
 
 def test_strip_unknown_is_byte_identical_for_payloads_without_sku_update():

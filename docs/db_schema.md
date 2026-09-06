@@ -216,12 +216,14 @@ CREATE TABLE catalog.listing_sources (
 --   给 sku_codec.mint 的复用查询用(要看得见**存量活行**,故不限形态);
 --   局部条件与 mint 的 WHERE 逐字对齐,不对齐 = 用不上索引。
 -- listing_sources_abandoned_idx (store, source_type, source_key)
---   WHERE abandoned_at IS NOT NULL(2026-09-02,SKU 改造批次 2 唯一新增的索引)
---   给 list_new 的**代际上限闸**用:每轮一次 GROUP BY 数同 (店, 来源, 源头键)
---   的已弃码行数,达 sku_codec.MAX_SKU_GENERATIONS 就转人工。不带它就是每轮
---   全表扫;局部条件取 IS NOT NULL 是因为活码行是绝大多数,装进这个索引没有
---   任何查询会用到。与守门那条「abandoned_at IS NULL 只许出现在三处 .py」不
---   冲突:DDL 的局部条件不计入那张白名单。
+--   WHERE abandoned_at IS NOT NULL —— **已从 schema 移除**(2026-09-06)。
+--   它只为 list_new 的换码**代际上限闸**的每轮 GROUP BY 而建;所有者当日删掉
+--   了那道闸(上架表在不断更新,不设代数上限;上不去就拿 feed 返回的具体原因
+--   去优化上架方法),索引再无消费方。
+--   ⚠ **schema.sql 里不下 DROP INDEX**(仓规:DROP 未连库核对一律不执行):
+--   存量库里那条索引仍然在,可由所有者手动
+--   `DROP INDEX IF EXISTS catalog.listing_sources_abandoned_idx;`
+--   —— 留着也只是多占一点写入开销,不影响任何查询。
 --
 --
 -- 改码两列 + 两条反查索引(2026-09-02,SKU 改造批次 3 地基;**名字与条件同样一处
@@ -239,7 +241,7 @@ CREATE TABLE catalog.listing_sources (
 --   视图 catalog.sku_aliases 的条件 ⇒ 该视图里 (store, alias_sku) 至多一行。
 -- 两列都可空无默认,落地时全库为 NULL(写侧接线在批次 3 的 workflows/sku_migrate)。
 --
--- 纪律三条:① abandoned_at / abandoned_reason / replaced_by / replaces /
+-- 纪律四条:① abandoned_at / abandoned_reason / replaced_by / replaces /
 -- replaced_at 五列**只由 services/sku_codec 写**(abandon / mint_replacement /
 -- settle_replacement),其它模块与工作流一律
 -- 不得 UPDATE;行**永不 DELETE**(旧码带着订单/售后回来必须还查得到)。
@@ -257,10 +259,14 @@ CREATE TABLE catalog.listing_sources (
 -- source_type='amz' AND source_key IS NOT NULL 的 JOIN,盲区变辖区。
 -- ② 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义,
 -- 列名故意用 abandoned 不用 retired。
--- 存量回填的判型正则(schema.sql 的 INSERT ... SELECT)与
--- workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串匹配、右锚),
--- 改一处必须同步另一处;缺右锚会把 B0XXXXXXXX-2 这类 SKU 判成 amz 并把
--- source_key 截成前 10 位,那批行会因此第一次进入删除意图产出面(2026-09-02 修)。
+-- ③ **db_init 不再写任何业务行**:schema.sql 里那条按 SKU 格式猜的存量回填
+-- INSERT(`^B0[A-Z0-9]{8}$` → amz,其余 unknown)**已于 2026-09-06 删除**
+-- (所有者定稿:一次性回填早已做完;留着只会把尚未登记的新码抢先登成 unknown,
+-- 让「有新行没归类」的信号永久沉默)。新出现的未登记在架行由
+-- `workflows/sources_backfill` **只登记不猜**地登成 source_type='unknown' +
+-- source_key=NULL(不参与任何自动破坏动作),人工经
+-- `workflows/sources_reclassify` 归类(导出 CSV → 填两列 → -p apply=1)。
+-- 守门 tests/test_sku_guard.py::test_db_init_writes_no_business_rows_into_the_registry。
 ```
 
 ```sql
@@ -498,7 +504,13 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
     id bigint IDENTITY PRIMARY KEY,
     store text NOT NULL, old_sku text NOT NULL, new_sku text NOT NULL,
     source_type text NOT NULL, source_key text,
-    feed_type text NOT NULL,            -- MP_MAINTENANCE(形态 A)/ MP_ITEM(形态 B)
+    feed_type text NOT NULL,            -- 发这一条改码时用的 feedType,存的就是
+                                        -- workflows/sku_migrate.FEED_TYPE 的当时值。
+                                        -- 2026-09-06 起 = MP_ITEM_MATCH(通道定案,
+                                        -- 同 GTIN + 新 SKU + REPLACE 原地换码,
+                                        -- docs/sku_plan.md §9.12);此前的历史行写着
+                                        -- MP_MAINTENANCE(已作废的形态 A)——
+                                        -- 那是**事实记录,不回填改写**
     feed_id text,                       -- 提交成功后落;NULL = 还没发出去
     status text DEFAULT 'pending',      -- pending / confirmed / rolled_back / stalled
     submitted_at / settled_at timestamptz,

@@ -269,8 +269,11 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
 `test_the_two_registry_update_lines_do_not_cross` 逐条钉死,白名单条目与本节文字
 必须对得上。
 ⚠ 归类的语义是**把商品交还自动链**(改完才第一次满足消费方
-`source_type='amz' AND source_key IS NOT NULL` 那条 JOIN),纪律与
-`sources_backfill` 同款:改完先 `maintenance_scan --dry-run` 看破坏面。
+`source_type='amz' AND source_key IS NOT NULL` 那条 JOIN):改完先
+`maintenance_scan --dry-run` 看破坏面。⚠ **2026-09-06 起这是唯一一道闸**:
+所有者定稿 `sources_backfill` **只登记不猜**(未登记的在架行一律登 `unknown` +
+`source_key=NULL`,判型正则与 schema.sql 的存量回填 INSERT 同日删除),
+破坏面从此**只在归类这一步打开**,登记那一步再也开不了。
 它与 ⑥ 那三个同名异义并列的第四组辨析是:**归类**(改出身,SKU 不变)≠
 **首次登记**(register,补一条不存在的行)≠ **改码**(换沃尔玛侧的 SKU 本身)。
 
@@ -310,10 +313,14 @@ query 参数 60/分钟。响应头 `x-current-token-count` 与
   「一个 Product ID 只能挂一个 SKU」),所以失败行下一轮拿到的是同一个码,载荷
   一字不差 ⇒ `api/feeds` 的 payload_key 在途防重仍然有效。
 - **三条护栏跟码走**:重试上限、在途防重、UPC 原号复用都按当前活码计数 ——
-  每换一次码,三条全部重新开始。这正是**代际上限闸**(同 (店, 来源, 源头键)
-  已弃码行数 ≥ `MAX_SKU_GENERATIONS`)与**退役冷却闸**
-  (`RETIRE_COOLDOWN_HOURS`)要堵的闭环;两个常量的唯一之家是
-  `services/sku_codec.py`(守门 `test_cooldown_and_generation_constants_have_one_home`)。
+  每换一次码,三条全部重新开始。堵这个闭环的现在只剩**退役冷却闸**
+  (`RETIRE_COOLDOWN_HOURS`,唯一之家 `services/sku_codec.py`,守门
+  `test_cooldown_constant_has_one_home`)。
+  ⚠ 这里曾还有一道**代际上限闸**(同 (店, 来源, 源头键) 已弃码行数 ≥
+  `MAX_SKU_GENERATIONS` = 3 就转人工)—— **已删除**(所有者 2026-09-06:
+  上架失败以 feed 报错为准优化上架方法,不设代数上限;代价是反复 SKU_LOCKED
+  的品每个冷却期烧一个 UPC)。常量、数据面 SQL、闸门、专用索引一并删净,
+  守门 `test_generation_cap_is_gone_root_and_branch` 反向钉死,别加回来。
 - **跨店永不复用码**:同一个码串在两家店合法,但那正是"两家店有关联"的信号,
   而关联就是封号线(schema.sql 的 `listing_sources_opaque_sku_uidx` 拦它)。
 - **改码(批次 3 地基,2026-09-02)三个函数、两条指针、三态**:

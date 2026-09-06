@@ -57,6 +57,11 @@
 
 ### 2.1 会改坏数据或违反纪律的(建议本 PR 内修)
 
+> **2026-09-06 处置结果**:G-1 / G-2 / G-4 已修;G-3 与 G-6 按所有者决定**整体删除**
+> 那两处判型代码(db_init 回填 INSERT 删除,sources_backfill 改成只登记不猜,人工归类走
+> sources_reclassify);G-5 按所有者决定**删掉代际上限**(不筛原因,而是整道闸不要);
+> G-7 变体组 ID 留待变体分组那一批。全量测试 3048 passed / 48 skipped。
+
 | # | 位置 | 事实 | 后果 | 修法(工作量) |
 |---|---|---|---|---|
 | G-1 | workflows/catalog_sync.py:35/:237-241 | DANGEROUS=False 且全文不读 dry_run;弃码点 1(abandon + 烧号)在 `--dry-run` 下照样执行 | 空跑会真弃码真烧号,不可逆,横幅也不打 | abandon 段读 params["dry_run"],空跑只报数(小) |
@@ -112,6 +117,11 @@
   `services/sku_codec.py`(settle_replacement);refdata/schema.sql:356 upc_pool 注释仍是未来时。
 
 ## 3. 存量改码链:停用原因与今日定案的通道
+
+> **2026-09-06 已切换**:`FEED_TYPE = "MP_ITEM_MATCH"`,`SUBMIT_DISABLED` 清空,载荷走
+> `match_feed.build_match_item`(GTIN 优先、现挂价与采集重量原样发回、重量兜底值不许发),
+> 反哺器加 workflow 过滤,形态 A 残留(build_sku_update_item / SkuUpdate 放行)已删。
+> 全文见 docs/sku_plan.md §9.12;下文保留切换前的记录。
 
 - **现状**:`workflows/sku_migrate.SUBMIT_DISABLED`(:122)非空 ⇒ run() 把 cap 硬置 0,dry-run 与真跑都
   不列候选、不 mint、不发 feed;`_settle` 照跑。技术原因:US MP_MAINTENANCE 5.0.20260608 的

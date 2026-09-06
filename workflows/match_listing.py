@@ -256,8 +256,11 @@ def run(params: dict) -> str:
         # 后果,收在 api/feeds.iter_result_slices(错一位 = 整批结局落到别人
         # 行上,而且不报错)
         for res, batch in feeds.iter_result_slices(
+                # workflow 名走 match_sheet.WORKFLOW 同一个常量:反哺器
+                # (match_sheet.sync_from_ledger)按它**正向过滤** ops.feed_items,
+                # 两处各写一个字面量一旦漂了,回填就是 0 行且不报错
                 feeds.submit_feed(store, "MP_ITEM_MATCH", entries,
-                                  workflow="match_listing"), pairs):
+                                  workflow=match_sheet.WORKFLOW), pairs):
             n[res["outcome"]] = n.get(res["outcome"], 0) + len(batch)
             bucket[res["outcome"]] = bucket.get(res["outcome"], 0) + len(batch)
             if res["outcome"] in ("submitted", "dedup") and res["feed_id"]:

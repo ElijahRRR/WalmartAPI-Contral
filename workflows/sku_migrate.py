@@ -47,7 +47,8 @@
   ④ **一店一批的硬闸在代码里**(_stage_cap):零 confirmed ⇒ 上限 1;<10 ⇒ 上限 10;
      还有 pending/stalled 未清 ⇒ 本轮只定案不提交。纪律没有默认值替你挡。
   ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案;
-     且它与 13:00 的 product_chain 抢同一个 MP_MAINTENANCE 桶,不许并跑。
+     配额上它吃 `feeds.post.MP_ITEM_MATCH` 桶(15/h),与**跟卖链 match_listing
+     共享** —— 不再与 13:00 的维护链抢 MP_MAINTENANCE,但跟卖真跑那天别并跑。
   ⑥ **dry-run 下 _settle 与 _migrate 都零写**:不 mint、不定案、不提交、不写飞书、
      不改处置、不删节点库存 —— 一行库、一行飞书、一条 feed 都不写。
 
@@ -71,8 +72,8 @@ POST 的 outcome=unknown **不回滚、保持 pending**,留给下一轮 _settle 
 synthesis 里「failed/未达/Unknown ⇒ rolled_back」说的是**回执**三态(_settle 的输入),
 与 POST 的 outcome 是两件事。
 
-**收益上限(所有者必须知道的真相)**:改码是**止血**不是清创 —— SkuUpdate feed 本身
-就是「旧串 → 新码」的显式映射,沃尔玛已经掌握的旧 SKU=ASIN 关联(以及历史订单、
+**收益上限(所有者必须知道的真相)**:改码是**止血**不是清创 —— 改码 feed 本身
+就是「旧 item → 新码」的显式动作,沃尔玛已经掌握的旧 SKU=ASIN 关联(以及历史订单、
 历史 feed 记录里的关联)收不回来。它只让**切换之后**的记录干净。
 """
 
@@ -83,9 +84,9 @@ from datetime import datetime, timedelta, timezone
 
 from api import feeds
 from registry import db
-from services import dispositions, feed_track, listing_sheet, listing_sources, \
-    mp_mapper, notify_fmt as nf, order_lines, sku_codec, store_absence, \
-    stores as stores_svc, upc_pool, walmart_catalog
+from services import amz_source, dispositions, feed_track, listing_sheet, \
+    listing_sources, match_feed, mp_mapper, notify_fmt as nf, order_lines, \
+    sku_codec, store_absence, stores as stores_svc, upc_pool, walmart_catalog
 
 DANGEROUS = True
 #: 接受 `-p store=X`(**必填**)。cli 的链尾缺席店重赛(cli.py:_replay_absent)
@@ -96,31 +97,40 @@ SUPPORTS_STORE = True
 
 logger = logging.getLogger("workflows.sku_migrate")
 
-# ── 常量(**每个只有这一个出生地**;形态 A→B 的切换只改 FEED_TYPE + _build_items)──
-#: 载荷形态 **A**:MP_MAINTENANCE 最小载荷 {新码, 现挂 Product ID, SkuUpdate:Yes}。
-#: 依据:US 官方 Update my existing items 明写 MP_MAINTENANCE「requires only the SKU
-#: and GTIN attributes」(docs/api_blueprint.md §5.4),CA manage-items 明写 SkuUpdate
-#: 属性。**不提供参数覆盖**:给它一个 `-p feed_type=` 就是两条实现路径(§六 双轨禁止),
-#: 而两种形态的副作用完全不同(形态 B = 重发全部内容,标题/属性会被我们再生成的覆盖)。
-#: 切形态 B 的条件:所有者实测第 1 件判定最小载荷改不动码。切的时候改这一处 +
-#: _build_items 的分支,并先做 mp_conform 的 SkuUpdate 放行(否则每一行都双挂)。
-FEED_TYPE = "MP_MAINTENANCE"
-#: ⛔ **提交通道停用**(2026-09-05,官方 spec 原件核实):US 站 MP_MAINTENANCE
-#: 5.0.20260608-18_15_07-api(我们 header 里写的正是这一版)的 Orderable **没有
-#: SkuUpdate 字段**(20 个属性、required=[sku, productIdentifiers]、
-#: additionalProperties=false;三个版本 20260501/0608/0703 一致);`SkuUpdate`
-#: 只存在于 **MP_ITEM** 的 Orderable(23 个属性)。生产实证与之吻合:两条改码
-#: feed(谭总12 / A085朱丽霖,2026-09-04)回执 SUCCESS 而线上 SKU 纹丝不动 ——
-#: 维护通道把 SkuUpdate 当未知字段静默丢弃,整条 feed 是一次"空维护"。
-#: 形态 A 由此**作废**(§9.6 那条 schema 推断错了:它看的是 MP_ITEM 的 Orderable,
-#: 不是 MP_MAINTENANCE 的)。所有者在 Seller Center 用「Match items」模板上传改码
-#: **成功**,说明可行通道是 setup 类 feed(MP_ITEM 全量 + SkuUpdate=Yes,或
-#: MP_ITEM_MATCH);具体走哪条,等所有者机器上 GET /v3/feeds 看那条 Seller Center
-#: feed 的 feedType 再定,**定了再改这里与 _build_items**。
-#: 在那之前非空 ⇒ 本工作流只定案不提交(dry-run 也不列候选,免得预览误导);
-#: 定案要留着:已发出去的两条 pending 要靠观测反证走 rolled_back 把旧码复活。
-SUBMIT_DISABLED = ("MP_MAINTENANCE 不支持 SkuUpdate(官方 spec 原件 2026-09-05 核实),"
-                   "改码通道待切换到 setup 类 feed;见 FEED_TYPE 头注与 docs/sku_plan.md §9.10")
+# ── 常量(**每个只有这一个出生地**;换通道只改 FEED_TYPE + _build_items)────────
+#: 改码通道 = **MP_ITEM_MATCH**(2026-09-06 定案,依据 docs/sku_plan.md §9.12)。
+#:
+#: 事实来源是所有者当天在 Seller Center 的**实测**(不是文档推断):用「Match items」
+#: 模板把 A085朱丽霖 的 `B0CRKFQZWF` 改成 `Test851`,feed
+#: `18D2A25BB3895D7096CF1357C17C2A36@AYYBBwA`。模板头部
+#: `Version=5.0.20260703-18_22_27,MP_ITEM_MATCH,mp_item_setup_by_match`;行内字段只有
+#: specProductType / productId(GTIN 14 位 00121678236703)/ productIdType=GTIN /
+#: productName / sku / condition=New / mainImageUrl / ShippingWeight=0.82 / price=29.99,
+#: **没有 SkuUpdate 字段**。探针:新旧码 **wpid 相同**(5FK5P1SAT7OM)、库存 5→5 跟着
+#: 过来(模板库存列为空)、价格不变、旧码 GET 404、feed 1 条 SUCCESS,旧码不是手动删的。
+#: ⇒ MP_ITEM_MATCH 按「**同 GTIN + 新 SKU + REPLACE**」在**同一 item 上原地换码**,
+#: 不是"新建一条再删旧的"。这也解释了为什么载荷里不需要 SkuUpdate:换码是 REPLACE
+#: 的机械后果,不是一个开关。
+#:
+#: 形态 A(MP_MAINTENANCE + SkuUpdate)与形态 B(MP_ITEM 全量 + SkuUpdate)**两条都已
+#: 作废**:官方 spec 原件核实 MP_MAINTENANCE 的 Orderable 根本没有 SkuUpdate 字段
+#: (§9.10),2026-09-04 两条生产 feed 回执 SUCCESS 而线上 SKU 纹丝不动就是它被静默
+#: 丢弃的证据。残留的 `mp_mapper.build_sku_update_item` 与 `mp_conform` 的 SkuUpdate
+#: 放行分支已随本次切换**删除**(留着就是双轨,§六)。
+#:
+#: ⚠ **待第一级投放实测**:仓里的 MP_ITEM_MATCH 通道是 **v4.2**(sellingChannel 制
+#: header,跟卖链 match_listing 生产在用),而所有者上传的模板是 **v5.0**。v4.2 能否
+#: 同样原地换码,由第一级投放(节奏闸自动压到 limit=1)的那一个品实测定 ——
+#: **本处不加 v5 header、不加参数开关**(一个能力一条实现路径,§六)。
+#: **不提供 `-p feed_type=`**:两条通道的副作用完全不同,给一个参数就是两条实现路径。
+FEED_TYPE = "MP_ITEM_MATCH"
+#: 提交通道停闸(**机制保留,缺省为空 = 不停闸**)。非空 ⇒ run() 把本轮 cap 硬置 0:
+#: 只定案不提交,**dry-run 也不列候选**(列了就是"将改码 N 个"的误导)。
+#: 2026-09-05 因形态 A 作废用过它一次(那次的值写着 MP_MAINTENANCE 不支持 SkuUpdate);
+#: 2026-09-06 通道定案 MP_ITEM_MATCH 后**清空**。下次再发现通道不可用,填一句人话进来
+#: 就地停闸即可 —— 停闸要保留的理由是:定案(_settle)必须继续跑,已发出去的 pending
+#: 要靠观测反证走 rolled_back 把旧码复活,一停整条工作流就没人替那些 pending 收尾。
+SUBMIT_DISABLED = ""
 #: 只迁 amz 出身的存量码(决策 D 默认:**跟卖不迁**)。PHUMWMT 串本就不含 ASIN,
 #: 货源隐匿收益为零;而 match 行的 source_key 是匹配 GTIN,改码后 upc_pool 的
 #: (店, ASIN) 键无从对上(跟卖不用 UPC 池),实测面直接翻倍。
@@ -130,10 +140,12 @@ OBSERVE_HOURS = 24
 #: 超期线:超过它仍判不出 ⇒ 落 stalled 点名人工,**不自动定案**(判不准就判活:
 #: 回滚一个其实已经生效的改码,会让登记簿说旧码、沃尔玛说新码,而且不报错)。
 STALE_HOURS = 72
-#: 单店单轮最多发几个 feed。MP_MAINTENANCE 桶 8/hour(api/_client.py),与维护链
-#: **共享** —— 吃光的表现是当晚维护链发不出去,而摘要只会说"配额不足"看不出是谁吃的。
+#: 单店单轮最多发几个 feed。桶是 `feeds.post.MP_ITEM_MATCH` **15/hour**
+#: (api/_client.py:238,官方 20/h 的 95% 留量),与**跟卖链 match_listing 共享** ——
+#: 改码不再与 13:00 的维护链抢 MP_MAINTENANCE 桶(那是形态 A 时代的事)。
+#: 吃光的表现是跟卖当轮发不出去,而摘要只会说"配额不足"看不出是谁吃的。
 FEEDS_PER_STORE_PER_RUN = 2
-#: 一个 feed 装几条。远低于 MP_MAINTENANCE 的官方切片上限(1000 条 / 24MB,
+#: 一个 feed 装几条。远低于 MP_ITEM_MATCH 的官方切片上限(1000 条 / 24MB,
 #: api/feeds._SLICE_LIMITS),这样「一次 submit_feed = 一个 feed」成立,
 #: FEEDS_PER_STORE_PER_RUN 才是**真闸**而不是估算。
 ITEMS_PER_FEED = 500
@@ -156,9 +168,9 @@ _STALLED = "stalled"
 #  SQL
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: 改码候选的**九条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
-#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把九条 AND 起来**选行**,
-#: `_SQL_WHY` 把同样这九条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
+#: 改码候选的**十一条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
+#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把十一条 AND 起来**选行**,
+#: `_SQL_WHY` 把同样这十一条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
 #: 文本共用一份,所以不可能"选取用一套、解释用另一套":那种漂移的表现是摘要说
 #: "它满足条件",而它就是不在候选面里,谁也不报错。
 #: 形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:手打就是
@@ -192,6 +204,20 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
      "NOT " + sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku")),
     ("有 Product ID", "观测里 upc 与 gtin 都是空:载荷没号可匹配(**不猜**)",
      "(w.upc IS NOT NULL OR w.gtin IS NOT NULL)"),
+    # ↓ 两条「REPLACE 会覆盖线上现值」判据(2026-09-06 随通道切到 MP_ITEM_MATCH 加)。
+    # MP_ITEM_MATCH 的 processMode 是 **REPLACE**:载荷里给了什么,线上那条 item 的
+    # 对应字段就变成什么。所以价格与重量**必须把现值原样发回去**(= 不改),
+    # 采不到现值的行**不许兜一个默认值发出去** —— 那是拿一次改码顺手改了售价/运费,
+    # 而且回执全绿、没有任何东西会告诉你。判不准就不做(判不准就判活的同款纪律)。
+    ("有现挂价格", "观测里 price 为空或 ≤0:REPLACE 要把**现挂的那个价**原样发回去"
+                   "(= 不改价);没价可发就只能猜,而猜错一个价 = 直接改动线上售价",
+     "(w.price IS NOT NULL AND w.price > 0)"),
+    ("有采集重量", "登记簿指的那条 catalog.products 采集里没有 attrs.weight —— "
+                   "REPLACE 会用载荷的 ShippingWeight **覆盖**线上重量,而采不到时 "
+                   "mp_mapper.shipping_weight 兜底 1.0 磅:用兜底值改码 = 把线上真实"
+                   "重量悄悄改成 1 磅(运费从此算错且不报错)。这是**粗判据**,"
+                   "解析得出来的那一层在 Python 侧再拦一道(见 _candidates)",
+     "(p.slow -> 'weight') IS NOT NULL"),
     # ⚠ 这一条替下了原来那个整店闸(所有者 2026-09-04 复议,见 `_preflight` 闸③)。
     # 危害只发生在**同一个 SKU**、而且**只发生在破坏组**(delete/retire)上:
     #   ① executing 的 DELETE 拿的是旧码去删,而 `dispositions.settle` 的判据是
@@ -236,19 +262,32 @@ _PICK = """(%(unnamed)s::boolean
 _DROP = """NOT (w.sku = ANY(%(excl_skus)s::text[])
            OR ls.source_key = ANY(%(excl_keys)s::text[]))"""
 
-#: 候选面的取数口径(两条 SQL 共用):目录 × 登记簿的**交集**。
+#: 候选面的取数口径(两条 SQL 共用):目录 × 登记簿的**交集**,再 LEFT JOIN 采集身份层。
 #: 登记簿里没有的行不在这张面上 —— 点名点到它 ⇒ 报"店下查无此行",不是"没候选"。
+#: `catalog.products` 走 **LEFT** JOIN(不是 INNER):没采过的行要能进 `_SQL_WHY` 说出
+#: "重量采不到",INNER 会让它整行消失,摘要就变成"店下查无此行"这句错话。
+#: 关联键是**登记簿的 source_key**(amz 出身 = ASIN),与上架链
+#: `services/amz_source.fetch_products` 同一把钥匙 —— 不从 SKU 里反解 ASIN(码不再等于 ASIN)。
 _FROM = """
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku
+LEFT JOIN catalog.products p
+  ON p.marketplace = %(marketplace)s AND p.asin = ls.source_key
 """
 
 #: 改码候选(单一实现路径:点名/排除只是上面两个参数化条件,不是第二条 SQL)。
+#: Product ID **优先 gtin**(14 位,productIdType=GTIN):所有者 2026-09-06 实测走通的
+#: 那条「Match items」模板给的就是 GTIN 14 位,MP_ITEM_MATCH 的匹配键也是 GTIN;
+#: 没有 gtin 才退 upc(12 位,UPC)。取的是**观测到的现挂号**,不取 UPC 池
+#: (池里的号若与现挂不一致,载荷会匹配到别的 item 或被拒)。
+#: `price` 是**现挂价**(REPLACE 发同一个价 = 不改价),`product_slow` 是采集身份层的
+#: slow 段(mp_mapper.shipping_weight 的入参形状 `{"attrs": …}` 里的 attrs)。
 _SQL_CANDIDATES = (
     "SELECT w.store, w.sku AS old_sku, ls.source_type, ls.source_key,\n"
-    "       coalesce(w.upc, w.gtin) AS product_id,\n"
-    "       CASE WHEN w.upc IS NOT NULL THEN 'UPC' ELSE 'GTIN' END AS product_id_type"
+    "       coalesce(w.gtin, w.upc) AS product_id,\n"
+    "       CASE WHEN w.gtin IS NOT NULL THEN 'GTIN' ELSE 'UPC' END AS product_id_type,\n"
+    "       w.price AS price, p.slow AS product_slow"
     + _FROM
     + "WHERE w.store = %(store)s\n  AND "
     + "\n  AND ".join([sql for _n, _w, sql in _CONDS] + [_PICK, _DROP])
@@ -323,6 +362,17 @@ SELECT count(*) FILTER (WHERE status = 'confirmed')             AS confirmed,
 FROM listing.sku_migrations WHERE store = %(store)s
 """
 
+#: 过程账落行。`feed_type` 存的就是 `FEED_TYPE` 这一个常量的值(2026-09-06 起
+#: 是 MP_ITEM_MATCH,此前的历史行仍写着 MP_MAINTENANCE —— 那是**事实记录**,
+#: 不回填改写)。⚠ 换 feedType 对下游三条路径**是透明的**,2026-09-06 逐条核对过:
+#:   · `_stage_cap` 只数 listing.sku_migrations 的 status,不看 feed_type;
+#:   · `_settle` 读回执走 `feed_track.item_results(feed_id)`,按 **feed_id** 查
+#:     ops.feed_items,与类型无关;feed_poll / feed_track 落终态同样按 feed_id;
+#:   · api/feeds 的 `_chunk_skus` 已收录 MP_ITEM_MATCH(dict 条目取顶层 sku),
+#:     `_SLICE_LIMITS["MP_ITEM_MATCH"] = (1000, 24MB)` 已登记,
+#:     `product_events.receipt_in_ledger` 有整条工作流级例外(sku_migrate 的回执
+#:     两种形态都不入病历,O7)—— 所以 MP_ITEM_MATCH 的改码回执**不会**被记成
+#:     跟卖那一族的回执事件(事件码由 `_FEED_KIND` 推导,见 product_events)。
 _SQL_LEDGER_NEW = """
 INSERT INTO listing.sku_migrations
     (store, old_sku, new_sku, source_type, source_key, feed_type, status, detail)
@@ -573,24 +623,53 @@ def _roll_back(store_name: str, row: dict, why: str) -> None:
 def _sync_sheet(store_name: str, rows: list[dict], execute: bool) -> tuple[int, list[str]]:
     """输入:店 + 待同步的已定案行 + 是否真写 → 输出:(写入行数, 告警行)。
 
-    上架表 SKU 列回写:按 **(店, ASIN)** 找行(source_key 就是 ASIN),写新码。
+    上架表 SKU 列回写:**先按 (店, 旧码) 用行上的 SKU 列定位**,SKU 列为空的
+    存量行(批次 1 之前建的)才退回 (店, ASIN),而且**只在唯一命中时写**。
     写成功才盖 sheet_synced_at —— 盖不上的行下一轮再来(「当轮写完,攒到下一轮 =
     悄悄少写」,conventions §八)。**在数据库事务之外**:飞书是外部 IO,
     它失败不该让已经定案的身份回滚。
+
+    ⚠ **缺口 G-4(2026-09-06 修)**:此前只按 (店, ASIN) 反查,而 `by_key` 是个
+    dict —— 同店同一个 ASIN 有多行(补货重上、拆变体、运营复制粘贴,上架表里很
+    常见)时 **后写的行号覆盖前面的**,于是新码被写到"最后那一行"上。表现是:
+    另一行的 SKU 列还停在旧码、这一行的 SKU 列被改成了一个不属于它的码,回执找行
+    (`listing_sheet.row_sku`)、退役载荷、冷却键从此全部指错行,**而且没有任何东西
+    会报错**。三条路的分工:
+      ① 行上 SKU 列 == 旧码 ⇒ 唯一定位(批次 1 之后的行都有 SKU 列,这是主路);
+      ② SKU 列为空 ∧ (店, ASIN) **唯一**命中 ⇒ 按 ASIN 写(存量行的兼容路);
+      ③ SKU 列为空 ∧ (店, ASIN) **多行**命中 ⇒ **不写**,点名「重复 ASIN 无法
+         定位,人工」—— 猜一行写下去比不写坏得多(见上)。
+    口径与 `listing_sheet.row_sku` 同源:那个函数就是"SKU 列非空取 SKU,否则回落
+    ASIN",这里只是把这两半分开当两把钥匙用,**不自己再写一份 `sku or asin`**。
     """
     if not rows:
         return 0, []
     if not execute:
         return 0, []
     sheet = listing_sheet.read_rows(upto="sku")
-    by_key = {(r["store"], r["asin"]): r["rownum"] for r in sheet}
-    updates, done_ids, missing = [], [], []
+    by_sku: dict[tuple[str, str], list[int]] = {}     # 行上 SKU 列非空的行
+    by_asin: dict[tuple[str, str], list[int]] = {}    # 行上 SKU 列**为空**的行
+    for r in sheet:
+        if str(r.get("sku") or "").strip():
+            by_sku.setdefault((r["store"], listing_sheet.row_sku(r)),
+                              []).append(r["rownum"])
+        else:
+            by_asin.setdefault((r["store"], r["asin"]), []).append(r["rownum"])
+    updates, done_ids, missing, ambiguous = [], [], [], []
     for r in rows:
-        rownum = by_key.get((store_name, r["source_key"]))
-        if rownum is None:
-            missing.append(r["new_sku"])
+        hits = by_sku.get((store_name, r["old_sku"]))
+        how = "SKU 列"
+        if not hits:
+            hits = by_asin.get((store_name, r["source_key"]))
+            how = "ASIN(旧行 SKU 列为空)"
+        if not hits:
+            missing.append(f"{r['old_sku']}→{r['new_sku']}")
             continue
-        updates.append((rownum, r["new_sku"]))
+        if len(hits) > 1:
+            ambiguous.append(f"{r['old_sku']}→{r['new_sku']}"
+                             f"(按 {how} 命中第 {sorted(hits)} 行)")
+            continue
+        updates.append((hits[0], r["new_sku"]))
         done_ids.append(r["id"])
     warns: list[str] = []
     n = 0
@@ -599,9 +678,16 @@ def _sync_sheet(store_name: str, rows: list[dict], execute: bool) -> tuple[int, 
         with db.pg_conn() as tx:
             tx.execute(_SQL_LEDGER_SHEET_OK, {"ids": done_ids})
     if missing:
-        warns.append(f"  ⚠ 上架表找不到行的 {len(missing)} 个新码(按 (店, ASIN) 反查):"
+        warns.append(f"  ⚠ 上架表找不到行的 {len(missing)} 个新码"
+                     f"(先按 (店, 旧码) 的 SKU 列、再按 (店, ASIN) 都没命中):"
                      f"{missing[:5]} —— SKU 列停在旧码,回执找行与退役都会对不上;"
                      f"补一行或人工填 SKU 列,下一轮自动补写")
+    if ambiguous:
+        warns.append(f"  ⚠ **重复 ASIN 无法定位,人工**:{len(ambiguous)} 个新码在"
+                     f"上架表里命中多行,**一格都没写**(猜一行写下去 = 把新码写到"
+                     f"别人那行上,回执找行与退役从此指错且不报错):{ambiguous[:5]}"
+                     f" —— 请在上架表上人工把这几行的 SKU 列填成各自的真码,"
+                     f"下一轮自动按 SKU 列唯一定位")
     return n, warns
 
 
@@ -763,7 +849,8 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 
 def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
                  kept: list[dict], why_rows: list[dict], inflight: set,
-                 dupe_skus: set, limit: int) -> list[str]:
+                 dupe_skus: set, limit: int, *,
+                 noweight: set = frozenset()) -> list[str]:
     """输入:点名/排除四组名字 + 本轮留下的候选 + `_SQL_WHY` 的逐条判据 + 两道
     后置闸的落选集 + 本轮上限 → 输出:摘要行(点名 N 个、命中 H 个,落选的**逐条**给理由)。
 
@@ -772,8 +859,9 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
     六类理由,来源各不相同:
 
       · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
-      · 不满足九条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
-      · 旧码上有在途 feed;· 同批 Product ID 撞号 —— 两道后置闸;
+      · 不满足十一条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
+      · 旧码上有在途 feed;· 采集重量解析不出正数;· 同批 Product ID 撞号
+        —— 三道后置闸;
       · 满足全部条件但**本轮节奏闸没轮到**(按 SKU 升序先来后到,下轮再来);
       · 店下查无此行(目录 × 登记簿的交集里没有它:拼错 / 不在册 / 从没扫到过)。
 
@@ -798,6 +886,11 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
         if w["old_sku"] in inflight:
             return (f"旧码上有 {INFLIGHT_HOURS}h 内的在途 feed(改了码,那条 feed "
                     f"就打在一个即将不存在的 SKU 上)")
+        if w["old_sku"] in noweight:
+            return (f"采集重量解析不出正数(shipping_weight 落到兜底 "
+                    f"{mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅):REPLACE 会用载荷里的 "
+                    f"ShippingWeight 覆盖线上重量,发兜底值 = 把真实重量悄悄改成 1 磅"
+                    f"(**真重量恰好 1.0 磅的行也落在这里**,宁可少改一个码)")
         if w["old_sku"] in dupe_skus:
             return ("同一批里 Product ID 撞号(官方不许两个 SKU 挂同一个 "
                     "Product ID),本轮只留了先到的那条")
@@ -849,9 +942,10 @@ def _candidates(conn, store_name: str, limit: int, *,
                 exclude_skus=(), exclude_keys=()) -> tuple[list[dict], list[str]]:
     """输入:连接 + 店 + 上限(+ 点名/排除四组名字)→ 输出:(候选行, 逐候选被跳过的点名)。
 
-    候选 = 在架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
-    ∧ 观测到的 upc/gtin 至少有一个 ∧ 该 (店, 旧码) 无未了结的改码台账
-    (九条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
+    候选 = 在架 ∧ 已上架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
+    ∧ 观测到的 gtin/upc 至少有一个 ∧ **有现挂价格** ∧ **有采集重量** ∧ 该 (店, 旧码)
+    无未了结的破坏建议、无未了结的改码台账
+    (十一条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
 
     `only_skus` / `only_keys`(`-p skus=` / `-p asins=`,取并集)与
     `exclude_skus` / `exclude_keys` 是**同一条候选 SQL 的参数化条件**,
@@ -859,9 +953,18 @@ def _candidates(conn, store_name: str, limit: int, *,
     (`_pick_report`)。上限 0 时**一条 SQL 都不发**(闸未过 / settle_only /
     上一批没清):这时点名的说明由 run() 出,别在这里悄悄查库。
 
-    Product ID 取 **catalog.walmart_items 观测到的 upc(空则 gtin)**,不取 UPC 池:
+    Product ID 取 **catalog.walmart_items 观测到的 gtin(空则 upc)**,不取 UPC 池:
     改码按 Product ID 匹配,池里的号若与沃尔玛现挂的不一致(历史换过号),
     载荷会匹配到别的 item 或直接被拒。两列都空的行 SQL 里就排掉了(不猜)。
+
+    **重量是两层判据**(REPLACE 会覆盖线上重量,兜底值不许发出去):
+    第一层是 SQL 粗判据「attrs 里有 weight」(`_CONDS` 的「有采集重量」),
+    第二层在这里 —— `mp_mapper.shipping_weight` 真去解析那段 JSON,解析不出
+    (返回 `DEFAULT_SHIPPING_WEIGHT`)的**逐个剔掉并点名**。两层缺一不可:
+    只有 SQL 那层,`weight={"package": "N/A"}` 这种行照样进候选、照样发 1.0 磅;
+    只有 Python 那层,`_SQL_WHY` 就说不出"它为什么不在候选面上"(理由 SQL 只
+    认 `_CONDS`)。⚠ 真重量**恰好是 1.0 磅**的行会被这一层误剔 —— 宁可少改一个
+    码,也不拿一次改码顺手改运费(误剔的行摘要里点名,人看得见)。
 
     再过 W2 第⑥道闸:旧码上有在途 feed 的**逐个跳过并点名**(不整店拦)——
     一条刚发出去的 feed 在途时改码,会让它打在一个即将不存在的 SKU 上。
@@ -871,6 +974,7 @@ def _candidates(conn, store_name: str, limit: int, *,
     named = bool(only_skus or only_keys)
     args = {"store": store_name, "source_types": list(SOURCE_TYPES),
             "limit": limit, "unnamed": not named,
+            "marketplace": amz_source.MARKETPLACE,
             "only_skus": list(only_skus), "only_keys": list(only_keys),
             "excl_skus": list(exclude_skus), "excl_keys": list(exclude_keys)}
     with conn.cursor() as cur:
@@ -893,6 +997,29 @@ def _candidates(conn, store_name: str, limit: int, *,
                      f"{sorted(inflight)[:5]}")
     keep = [r for r in rows if r["old_sku"] not in inflight]
 
+    # 重量第二层:SQL 只能问"attrs 里有没有 weight 这个键",能不能**解析出一个正数**
+    # 只有 mp_mapper.shipping_weight 知道(它是上架链的同一个函数,不在这里重写一份
+    # 解析逻辑)。解析不出 ⇒ 它返回 DEFAULT_SHIPPING_WEIGHT ⇒ 这一行**不许发**:
+    # MP_ITEM_MATCH 是 REPLACE,发 1.0 磅就是把线上真实重量改成 1 磅,回执还全绿。
+    noweight: list[str] = []
+    weighed: list[dict] = []
+    for r in keep:
+        w = mp_mapper.shipping_weight({"attrs": r.get("product_slow")})
+        if w == mp_mapper.DEFAULT_SHIPPING_WEIGHT:
+            noweight.append(r["old_sku"])
+            continue
+        r["weight"] = w
+        weighed.append(r)
+    if noweight:
+        notes.append(
+            f"  ⚠ 跳过 {len(noweight)} 个:采集重量解析不出正数(shipping_weight 落到"
+            f"兜底 {mp_mapper.DEFAULT_SHIPPING_WEIGHT} 磅)—— REPLACE 会用载荷里的"
+            f"ShippingWeight **覆盖**线上重量,发兜底值 = 把真实重量悄悄改成 1 磅,"
+            f"运费从此算错且回执全绿。**恰好 1.0 磅的真重量也会落在这里**(宁可少改"
+            f"一个码):{sorted(noweight)[:5]}")
+    noweight_skus = set(noweight)
+    keep = weighed
+
     # 一个 Product ID 只允许挂一个 SKU(官方:"You are not allowed to submit two
     # SKUs with the same Product Identifier")—— 同一批里撞号的只留第一条
     seen: dict[str, str] = {}
@@ -913,7 +1040,8 @@ def _candidates(conn, store_name: str, limit: int, *,
     if named:
         notes += _pick_report(store_name, only_skus, only_keys,
                               exclude_skus, exclude_keys, out, why,
-                              inflight, dupe_skus, limit)
+                              inflight, dupe_skus, limit,
+                              noweight=noweight_skus)
     elif exclude_skus or exclude_keys:
         notes.append(f"  排除 -p exclude_skus {len(exclude_skus)} 个 / "
                      f"-p exclude_asins {len(exclude_keys)} 个"
@@ -921,17 +1049,30 @@ def _candidates(conn, store_name: str, limit: int, *,
     return out, notes
 
 
-def _build_items(rows: list[dict]) -> list[dict]:
-    """输入:候选行(带 new_sku / product_id / product_id_type)→ 输出:MPItem 列表。
+def _item_of(row: dict, sku: str) -> dict:
+    """输入:候选行 + 要发的 SKU → 输出:一条 MP_ITEM_MATCH 的 Item(**唯一构造点**)。
 
-    **形态 A/B 的唯一分叉点**。今天走形态 A:mp_mapper.build_sku_update_item 的
-    最小载荷(新码 + 现挂 Product ID + SkuUpdate=Yes),不重发内容 ⇒ 标题与属性
-    不会被我们再生成的文案覆盖。形态 B(MP_ITEM 全量)要改的就是这一个函数
-    + FEED_TYPE 常量,别处一行不动。
+    真跑与 dry-run 共用这一个函数:预览打印的载荷与真发出去的那一条**同一份代码**,
+    否则"预览看着对、发出去的不是那个"是一类不会报错的故障。
+
+    构造走跟卖链的同一块积木 `services/match_feed.build_match_item`:
+      · 第一个参数(SPEC 预填模板)传 **None** —— 改码不做 SPEC 预检:匹配键
+        (GTIN)是从**我们自己的观测**(catalog.walmart_items)取的现挂号,而
+        SPEC 预填是"沃尔玛目录里这个号长什么样"的模板,对原地换码没有输入;
+        少一次 SPEC 调用也少一份配额。productIdentifiers 由兜底路径填。
+      · price / weight 是**现值原样发回去**(REPLACE 覆盖语义,见 `_CONDS` 那两条)。
+      · condition 由积木补 "New"(与跟卖链逐字同源)。
+    信封由 api/feeds.build_payload 包成 `{"Item": …}`(铁律 2:api 层只包信封)。
     """
-    return [mp_mapper.build_sku_update_item(r["new_sku"], r["product_id"],
-                                            r["product_id_type"])
-            for r in rows]
+    return match_feed.build_match_item(
+        None, sku, row["price"], row["weight"],
+        product_id=row["product_id"], product_id_type=row["product_id_type"])
+
+
+def _build_items(rows: list[dict]) -> list[dict]:
+    """输入:候选行(带 new_sku / product_id / product_id_type / price / weight)
+    → 输出:MP_ITEM_MATCH 的 Item 列表(**通道的唯一分叉点**,见 `_item_of`)。"""
+    return [_item_of(r, r["new_sku"]) for r in rows]
 
 
 def _preview(rows: list[dict]) -> list[str]:
@@ -940,10 +1081,9 @@ def _preview(rows: list[dict]) -> list[str]:
     for r in rows[:PREVIEW_ROWS]:
         lines.append(f"    · {r['old_sku']} → <新码>(出身 {r['source_type']}/"
                      f"{r['source_key']},Product ID {r['product_id_type']}="
-                     f"{r['product_id']})")
-    sample = mp_mapper.build_sku_update_item(
-        sku_codec.DRYRUN_PLACEHOLDER, rows[0]["product_id"],
-        rows[0]["product_id_type"])
+                     f"{r['product_id']},现挂价 {r['price']},发货重量 {r['weight']} 磅"
+                     f" —— 后两个是**原样发回去**,REPLACE 不改它们)")
+    sample = _item_of(rows[0], sku_codec.DRYRUN_PLACEHOLDER)
     lines.append(f"    载荷样例({FEED_TYPE};sku 位置真跑时是抽出来的 12 位码,"
                  f"这里是占位码):{sample}")
     return lines
@@ -993,8 +1133,13 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
                     "store": store_name, "old_sku": r["old_sku"],
                     "new_sku": r["new_sku"], "source_type": r["source_type"],
                     "source_key": r["source_key"], "feed_type": FEED_TYPE,
+                    # 载荷里那四个"原样发回去"的值一并留档:出了事要能回答
+                    # 「我们当时发的是哪个号、哪个价、哪个重量」。price 是 numeric
+                    # (Decimal)⇒ 先转 float,不然 json.dumps 当场抛
                     "detail": json.dumps({"product_id": r["product_id"],
-                                          "product_id_type": r["product_id_type"]})})
+                                          "product_id_type": r["product_id_type"],
+                                          "price": float(r["price"]),
+                                          "weight": float(r["weight"])})})
                 r["id"] = cur.fetchone()[0]
     logger.info("改码台账已落库并提交:%s %d 条 pending(此刻才允许调接口)",
                 store_name, len(rows))

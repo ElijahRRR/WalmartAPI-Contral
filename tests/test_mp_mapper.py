@@ -1,5 +1,7 @@
 """listing L2d 回归:mapper 实证约束逐条验证(每条都有旧错误码背书)。"""
 
+import pytest
+
 from services import mp_mapper as m
 
 
@@ -316,44 +318,29 @@ def test_sku_update_is_a_system_field_and_never_reaches_the_llm():
 
 
 def test_llm_supplied_sku_update_is_stripped_from_orderable():
-    """LLM 填的 SkuUpdate 一律被剔掉(系统专属字段由 sku_update 形参给,不由 LLM)。"""
+    """LLM 填的 SkuUpdate 一律被剔掉。
+
+    2026-09-06 起这是它**唯一**的职责:改码走 MP_ITEM_MATCH 的原地换码,本仓
+    没有任何路径写 SkuUpdate,所以"LLM 塞进来的"就是唯一可能的来源。
+    """
     o = m.build_orderable("B0X", "012345678905", 10, 3, "P1",
                           llm_fields={"SkuUpdate": "Yes"})
     assert "SkuUpdate" not in o
 
 
-def test_build_orderable_without_sku_update_is_byte_identical_to_before():
-    """默认 False:三个存量调用点的载荷**逐字节不变**(零行为变化的落脚点)。"""
+def test_build_orderable_can_no_longer_be_turned_into_a_sku_update():
+    """改码不再有第二条路(2026-09-06,§六 双轨禁止)。
+
+    `sku_update=` 形参与 `build_sku_update_item` 一起删了:通道定案 MP_ITEM_MATCH
+    (同 GTIN + 新 SKU + REPLACE 原地换码),载荷里根本没有 SkuUpdate。留着那个
+    形参更坏 —— `mp_conform.strip_unknown` 的放行分支也删了,传了会被裁掉,
+    一次改码退化成一次普通上架(同店双挂),回执还全绿。
+    """
     import inspect
     import json
-    a = m.build_orderable("B0X", "012345678905", 10, 3, "P1")
-    b = m.build_orderable("B0X", "012345678905", 10, 3, "P1", sku_update=False)
-    assert "SkuUpdate" not in json.dumps(a)
-    assert set(a) == set(b)
-    p = inspect.signature(m.build_orderable).parameters["sku_update"]
-    assert p.default is False and p.kind is inspect.Parameter.KEYWORD_ONLY
-
-
-def test_build_orderable_with_sku_update_emits_yes():
-    """形态 B(MP_ITEM 全量重发)靠这一个字段把"上架"变成"改码";值只有 'Yes'。"""
-    o = m.build_orderable("AN3WC0DE2345", "012345678905", 10, 3, "P1",
-                          sku_update=True)
-    assert o["SkuUpdate"] == "Yes"
-    assert o["sku"] == "AN3WC0DE2345"          # 改成的新码就写在 Orderable.sku
-
-
-def test_build_sku_update_item_shape_matches_the_minimal_maintenance_payload():
-    """形态 A 最小载荷:SKU + Product ID + SkuUpdate,**没有 Visible 段**。
-
-    最小载荷 = 不重发内容 = 标题/属性不会被我们再生成的文案覆盖。匹配键是
-    Product ID 不是 SKU(官方:Enter the correct SKU for that Product ID)。
-    """
-    item = m.build_sku_update_item("AN3WC0DE2345", "012345678905")
-    assert item == {"Orderable": {
-        "sku": "AN3WC0DE2345",
-        "productIdentifiers": {"productId": "012345678905",
-                               "productIdType": "UPC"},
-        "SkuUpdate": "Yes"}}
-    assert "Visible" not in item
-    gtin = m.build_sku_update_item("AN3WC0DE2345", "00012345678905", "GTIN")
-    assert gtin["Orderable"]["productIdentifiers"]["productIdType"] == "GTIN"
+    assert "sku_update" not in inspect.signature(m.build_orderable).parameters
+    assert not hasattr(m, "build_sku_update_item")
+    with pytest.raises(TypeError):
+        m.build_orderable("B0X", "012345678905", 10, 3, "P1", sku_update=True)
+    assert "SkuUpdate" not in json.dumps(
+        m.build_orderable("B0X", "012345678905", 10, 3, "P1"))

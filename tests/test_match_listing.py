@@ -486,8 +486,12 @@ def test_match_sheet_sync_from_ledger(monkeypatch):
                         lambda s, ups: (writes.extend(ups), len(ups))[1])
     ledger = {"F1": {"SKU_A": ("success", ""), "SKU_B": ("failed", "ERR_M")},
               "F2": {"SKU_C": ("submitted", "")}}
-    monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
-    monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
+    seen_wf = []
+    monkeypatch.setattr(feed_track, "item_results",
+                        lambda fid, workflow=None: (seen_wf.append(workflow),
+                                                    ledger[fid])[1])
+    monkeypatch.setattr(feed_track, "item_errors",
+                        lambda fid, workflow=None: {})
 
     out = match_sheet.sync_from_ledger()
     w = {rng: vals[0] for rng, vals in writes}
@@ -495,6 +499,9 @@ def test_match_sheet_sync_from_ledger(monkeypatch):
     assert w["B3:K3"][8] == "失败:ERR_M"
     assert "B4:K4" not in w                                     # F2 未落定不动
     assert "回填 2 行" in out
+    # 反哺器只认自己那条链发的回执:改码(sku_migrate)也走 MP_ITEM_MATCH,
+    # 不按 workflow 正向过滤就会把别人的回执写进跟卖表(见 sync_from_ledger 头注)
+    assert set(seen_wf) == {match_sheet.WORKFLOW} == {"match_listing"}
 
 
 def test_match_weight_defaults_to_one_pound():

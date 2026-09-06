@@ -523,23 +523,27 @@ def test_sku_update_never_burns_a_upc():
         sku_codec.ABANDON_UPC_CONFLICT}
 
 
-def test_cooldown_and_generation_constants_have_one_home():
-    """退役冷却小时数与代际上限**各只有一个出生地**(services/sku_codec.py)。
+def test_cooldown_constant_has_one_home():
+    """退役冷却小时数**只有一个出生地**(services/sku_codec.py)。
 
     两个消费方各写一个 24,一漂就没人说得清冷却到底几小时(而闸门看起来
     照常工作)。此前 24 长在 sku_locked_heal 的 params 默认值里,list_new 的
     退役冷却闸是第二个消费方 —— 泛化的那一刻必须收口。
+
+    ⚠ 本用例此前还钉 `MAX_SKU_GENERATIONS`(换码代际上限)。所有者 2026-09-06
+    删掉了那道闸,常量随之删除,本用例只剩冷却这一条;下面那条反向断言防止
+    它被顺手加回来。
     """
     home = "services/sku_codec.py"
     assert sku_codec.RETIRE_COOLDOWN_HOURS == 24
-    assert sku_codec.MAX_SKU_GENERATIONS == 3
-    born = re.compile(r"^\s*(RETIRE_COOLDOWN_HOURS|MAX_SKU_GENERATIONS)\s*=")
+    assert not hasattr(sku_codec, "MAX_SKU_GENERATIONS")
+    born = re.compile(r"^\s*RETIRE_COOLDOWN_HOURS\s*=")
     offenders = [f"{rel}:{n} {line.strip()}" for rel, path in _prod_files()
                  if rel != home
                  for n, line in enumerate(
                      path.read_text(encoding="utf-8").splitlines(), 1)
                  if born.search(line)]
-    assert not offenders, _fmt(offenders, f"这两个常量只准在 {home} 出生:")
+    assert not offenders, _fmt(offenders, f"这个常量只准在 {home} 出生:")
     heal = (ROOT / "workflows" / "sku_locked_heal.py").read_text(encoding="utf-8")
     assert 'params.get("cooldown_hours",\n' in heal or \
         'params.get("cooldown_hours", sku_codec.RETIRE_COOLDOWN_HOURS)' in heal
@@ -793,40 +797,53 @@ def test_batch3_ground_objects_are_idempotent_and_named_once():
         assert f"WHERE {cond}" in stmt[:stmt.index(";")], name
 
 
-def test_generation_index_exists_in_schema():
-    """代际上限闸的索引必须在 schema.sql 里(批次 2 唯一新增的一条)。
+def test_generation_cap_is_gone_root_and_branch():
+    """换码**代际上限闸整道删除**(所有者 2026-09-06)。
 
-    list_new 每轮按 (店, 来源, 源头键) 数已弃码行数;没有它就是每轮全表扫
-    listing_sources。局部条件取 IS NOT NULL 而不是全表索引:活码行是绝大多数,
-    把它们装进这个索引没有任何查询会用到。
+    原话:「上架表是不断在更新的,没必要设置这个上限;上不去的根源是上架方法
+    的问题,拿上架失败的案例以及 feed 返回的具体原因去优化上架才是标准做法,
+    只防止无限上架治标不治本。」代价记在案:反复 SKU_LOCKED 的品每个冷却期
+    烧一个 UPC。
+
+    钉三件事,防止它被一半一半地长回来(半截状态才是最贵的):
+    ① 常量与数据面 SQL 在生产代码里一个字都不剩;
+    ② 唯一为它建的索引已从 schema.sql 移除,且 **schema.sql 里不许出现
+       DROP INDEX**(仓规:DROP 未连库核对一律不执行;存量库由所有者手动删);
+    ③ 闸门链的 _GateState 里没有 over_gen 字段。
     """
-    name = "listing_sources_abandoned_idx"
-    assert _SCHEMA.count(name) == 1, "新索引名在 schema.sql 里出现了不止一次"
-    stmt = _SCHEMA[_SCHEMA.index(f"CREATE INDEX IF NOT EXISTS {name}"):]
-    stmt = stmt[:stmt.index(";")]
-    assert "(store, source_type, source_key)" in stmt   # 与 GROUP BY 同键
-    assert "WHERE abandoned_at IS NOT NULL" in stmt
-    # 与守门③不冲突:DDL 的局部条件不计入 `abandoned_at IS NULL` 那张白名单
-    assert "abandoned_at IS NULL" not in stmt
+    import io
+    import tokenize
+
+    from workflows import list_new
+
+    def code_only(path):
+        """源码去注释(注释里正该写清"这东西为什么删了、别加回来")。"""
+        src = path.read_text(encoding="utf-8")
+        return "".join(
+            "" if t.type == tokenize.COMMENT else t.string
+            for t in tokenize.generate_tokens(io.StringIO(src).readline))
+
+    banned = ("MAX_SKU_GENERATIONS", "_SQL_ABANDONED_GEN", "over_gen",
+              "gen_cap", "listing_sources_abandoned_idx")
+    offenders = [f"{rel}:{w}" for rel, path in _prod_files()
+                 for w in banned if w in code_only(path)]
+    assert not offenders, _fmt(offenders, "代际上限闸已整道删除,不许残留:")
+    assert "over_gen" not in list_new._GateState._fields
+    # 索引:CREATE 已删(注释里的说明留着),而且**不许**补 DROP INDEX
+    assert "CREATE INDEX IF NOT EXISTS listing_sources_abandoned_idx" not in _SCHEMA
+    assert "DROP INDEX" not in _SCHEMA.upper()
 
 
-def test_backfill_regex_agrees_with_sources_backfill():
-    """db_init 的存量回填与生产在跑的 sources_backfill 是**同一条口径**。
+def test_db_init_writes_no_business_rows_into_the_registry():
+    """db_init 不许再往登记簿写任何业务行(2026-09-06 所有者定稿)。
 
-    缺右锚会把 B0XXXXXXXX-2 这类「重上后缀」SKU 判成 amz 并把 source_key 截成
-    前 10 位,身份键与 SKU 从此不等 —— 而那批行会因此第一次进入维护链的删除
-    意图产出面。这不是理论缺口:0a 的验收本身就要跑 db_init。
+    原来那条按 SKU 格式猜的存量回填 INSERT 已整段删除:一次性回填早做完了,
+    留着只会把尚未登记的新码抢先登成 unknown ——「有新行没归类」的信号登记
+    一次之后就永久沉默。新出现的未登记在架行由 sources_backfill 登成 unknown
+    (只登记不猜),人工经 sources_reclassify 归类。
     """
-    from workflows import sources_backfill
-    block = _SCHEMA[_SCHEMA.index("INSERT INTO catalog.listing_sources"):]
-    block = block[:block.index(";")]
-    shapes = re.findall(r"sku ~ '([^']+)'", block)
-    assert shapes and len(set(shapes)) == 1, f"回填的两处判型必须同一条正则:{shapes}"
-    assert shapes[0].startswith("^") and shapes[0].endswith("$"), shapes[0]
-    assert "left(sku" not in block, "amz 分支必须整串入 source_key,不许截断"
-    assert "THEN sku END" in block
-    pat = sources_backfill._ASIN_RE.pattern
-    assert pat.startswith("^") and pat.endswith("$"), pat
+    assert "INSERT INTO catalog.listing_sources" not in _SCHEMA, (
+        "schema.sql 里又出现了往登记簿写行的 INSERT —— 回填 INSERT 不许复活")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

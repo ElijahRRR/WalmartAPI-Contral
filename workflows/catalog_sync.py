@@ -20,6 +20,14 @@
 **新建的飞书电子表格**「在线产品总表」(非多维表格——13 万行超 bitable 5 万行套餐上限;
 新表与旧系统写的旧 spreadsheet 互不干扰,可并跑对拍)。PG 是权威,飞书表可随时整表重建。
 -p skip_feishu=1 跳过回写;表格未在 .env 登记时跳过并在摘要中提示。
+
+`--dry-run` 的边界(2026-09-06 补,审计缺口 G-1):本工作流 DANGEROUS=False,
+cli 恒给 `execute=True`,但 `dry_run` 单独透传进 params。**目录同步本身照常**
+(扫店、合并库存、upsert catalog.walmart_items、标缺席、飞书投影 —— 它们是可
+重放的快照写入,空跑关掉反而看不出同步结果);空跑只挡住**不可逆的那一段**:
+弃码点 1(`sku_codec.abandon` 弃码 + 烧 UPC)以及给它封口的删除核验事件
+(`delete_verified` / `delete_not_effective`,写下去下一轮就不再产出这一对)。
+空跑时该段只报数,摘要第二行打「🧪 [DRY-RUN] 弃码点跳过:将弃码 N 个」。
 """
 
 import logging
@@ -234,13 +242,28 @@ def run(params: dict) -> str:
         #   "事件记了、码没弃"的半截状态,而 verify_deletions 的 open_ok CTE 正是
         #   靠 delete_verified 事件封口 —— 下一轮不会再产出这一对,那个码就永远
         #   弃不掉了。
+        # ⚠ `--dry-run` 只挡这一段(模块头注「dry-run 的边界」):cli 对
+        #   DANGEROUS=False 恒给 execute=True,不读 dry_run 的话空跑会真弃码真烧号,
+        #   而且横幅都不打(cli 的 [DRY-RUN] 横幅只对 DANGEROUS 打)。
+        #   空跑连 verify_deletions 自己记的 delete_verified / delete_not_effective
+        #   也要一起挡:那两条事件写下去,open_ok CTE 就封了口,下一轮不再产出
+        #   这一对 —— 事件留下了、码没弃,那个码这辈子弃不掉了。所以走
+        #   **同一份判据 + rollback**,不另写一条只读 SQL(第二份判据迟早漂开)。
+        dry_run = bool(params.get("dry_run"))
         with db.pg_conn() as conn:
             verified, not_eff, gone_pairs = product_events.verify_deletions(conn)
-            n_ab = sum(sku_codec.abandon(conn, s, k,
-                                         sku_codec.ABANDON_DELETE_VERIFIED)
-                       for s, k in gone_pairs)
+            if dry_run:
+                conn.rollback()     # 事件不落库;abandon 一次都不调
+                n_ab = 0
+            else:
+                n_ab = sum(sku_codec.abandon(conn, s, k,
+                                             sku_codec.ABANDON_DELETE_VERIFIED)
+                           for s, k in gone_pairs)
+        if dry_run:
+            lines.insert(1, f"🧪 [DRY-RUN] 弃码点跳过:将弃码 {len(gone_pairs)} 个")
         if verified or not_eff:
-            lines.append(f"删除核验:生效 {verified}"
+            lines.append(("删除核验(空跑未落库):将生效 " if dry_run
+                          else "删除核验:生效 ") + str(verified)
                          + (f",弃码 {n_ab}" if n_ab else "")
                          + (f",⚠ 未生效 {not_eff}(回执成功但仍在架,查日志)"
                             if not_eff else ""))

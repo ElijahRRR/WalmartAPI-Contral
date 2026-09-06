@@ -724,13 +724,20 @@ def _mark_upc_conflicts(pairs: list[tuple[str, str]],
 #   · **"查无"永不产生负向写**——是否上架=No 只允许来自源① 的 feed 终态 FAILED,
 #     目录里查不到只保持 Unknown(旧"单店 80% 熔断"与"48h 审核窗豁免"
 #     防的就是负向误写,新形态下负向写根本不走目录源,天然满足)
+#   ⚠ **两道过滤缺一不可**(workflow 那道 2026-09-06 补):`feed_type='MP_ITEM'`
+#     说的是"这是一条上架 feed",`workflow='list_new'` 说的是"是上架链发的"。
+#     只有前者时,任何将来往 MP_ITEM 里发东西的链(改码曾经的候选形态 B 就是)
+#     都会被读成本行的上架回执 —— 一条别人的 failed 会把「是否上架」写成 No、
+#     把行推进 list_new 的限次重试通道,而**负向写正是这段代码最防的那件事**
+#     (2026-06-09 全表误写事故语义)。写成**正向**(只认自己发的)而不是
+#     `<> 'sku_migrate'`:黑名单要人记得去加,白名单不用。
 _SQL_HEAL_RECEIPT = """
 SELECT DISTINCT ON (f.store, f.sku) f.store, f.sku, f.feed_id, f.status,
        f.error_code, f.error_desc
 FROM ops.feed_items f
 JOIN unnest(%s::text[], %s::text[]) AS t(store, sku)
   ON f.store = t.store AND f.sku = t.sku
-WHERE f.feed_type = 'MP_ITEM'
+WHERE f.feed_type = 'MP_ITEM' AND f.workflow = 'list_new'
 ORDER BY f.store, f.sku, f.submitted_at DESC
 """
 _SQL_HEAL_ONLINE = """

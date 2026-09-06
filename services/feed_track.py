@@ -324,11 +324,24 @@ def poll_all(stores_by_name: dict) -> str:
     return "\n".join([line] + detail_lines)
 
 
-def item_results(feed_id: str) -> dict[str, tuple[str, str]]:
-    """输入:feed_id → 输出:{sku: (status, error_code)}(读 ops.feed_items 台账)。"""
+def item_results(feed_id: str, workflow: str | None = None
+                 ) -> dict[str, tuple[str, str]]:
+    """输入:feed_id(+ 可选提交来源工作流)→ 输出:{sku: (status, error_code)}
+    (读 ops.feed_items 台账)。
+
+    `workflow` 给了就**只认那条工作流提交的行**(正向过滤,不是黑名单)。给它的
+    是**回写方**:一张飞书表的反哺器只该回写自己那条链发出去的回执。2026-09-06
+    起改码(sku_migrate)与跟卖(match_listing)**共用 MP_ITEM_MATCH 这个 feedType**,
+    单靠 feed_type 已经分不开两条链 —— 不过滤的表现是一条改码回执被写进跟卖表的
+    「feed 结果」列(行还是跟卖那一行),而且不报错。
+    """
+    sql = "SELECT sku, status, error_code FROM ops.feed_items WHERE feed_id = %s"
+    args: tuple = (feed_id,)
+    if workflow:
+        sql += " AND workflow = %s"
+        args += (workflow,)
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT sku, status, error_code FROM ops.feed_items "
-                    "WHERE feed_id = %s", (feed_id,))
+        cur.execute(sql, args)
         return {sku: (status, code or "") for sku, status, code in cur.fetchall()}
 
 
@@ -360,9 +373,15 @@ def item_codes(feed_id: str) -> dict[str, set[str]]:
     return out
 
 
-def item_errors(feed_id: str) -> dict[str, str]:
-    """输入:feed_id → 输出:{sku: 人话报错描述}(空描述的 SKU 不出现)。"""
+def item_errors(feed_id: str, workflow: str | None = None) -> dict[str, str]:
+    """输入:feed_id(+ 可选提交来源工作流)→ 输出:{sku: 人话报错描述}
+    (空描述的 SKU 不出现)。`workflow` 的语义与 `item_results` 逐字相同。"""
+    sql = ("SELECT sku, error_desc FROM ops.feed_items "
+           "WHERE feed_id = %s AND error_desc IS NOT NULL")
+    args: tuple = (feed_id,)
+    if workflow:
+        sql += " AND workflow = %s"
+        args += (workflow,)
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT sku, error_desc FROM ops.feed_items "
-                    "WHERE feed_id = %s AND error_desc IS NOT NULL", (feed_id,))
+        cur.execute(sql, args)
         return {sku: desc for sku, desc in cur.fetchall()}

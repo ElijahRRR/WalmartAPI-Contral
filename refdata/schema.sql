@@ -279,14 +279,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_live_uidx
 CREATE INDEX IF NOT EXISTS listing_sources_live_key_idx
     ON catalog.listing_sources (store, source_type, source_key)
     WHERE abandoned_at IS NULL AND replaced_by IS NULL;
--- 代际上限闸用(SKU 改造批次 2):list_new 每轮按 (店, 来源, 源头键) 数**已弃码
--- 行数**,达 sku_codec.MAX_SKU_GENERATIONS 就不再自动换码重上、交人工。不带索引
--- 就是每轮全表扫 listing_sources。局部条件写 IS NOT NULL 而不是全表索引:活码行
--- 是绝大多数,把它们装进这个索引没有任何查询会用到。幂等(与上面三条索引一样,
--- 名字与条件一处定死,后续批次一律引用、不许 DROP/CREATE)。
-CREATE INDEX IF NOT EXISTS listing_sources_abandoned_idx
-    ON catalog.listing_sources (store, source_type, source_key)
-    WHERE abandoned_at IS NOT NULL;
+-- ⚠ 这里曾有 `listing_sources_abandoned_idx`(部分索引,(store, source_type,
+-- source_key) WHERE abandoned_at IS NOT NULL),**只为 list_new 的换码代际上限闸
+-- 的每轮 GROUP BY 计数而建**。所有者 2026-09-06 删掉了那道闸(上架表在不断更新,
+-- 不设代数上限;上不去就拿 feed 返回的具体原因去优化上架方法),索引随之失去
+-- 唯一消费方,从本 schema 移除。
+-- **本文件不写任何 DROP 语句**(仓规:DROP 未连库核对一律不执行;守门测试也
+-- 逐字拦):存量库里那条索引还在,由所有者手动删 —— 手续记在 docs/db_schema.md。
 -- 改码两个反查索引(SKU 改造批次 3 地基)。两条都是**局部**索引:改码前
 -- replaced_by / replaces 全库为 NULL,零行为命中,建索引不会被存量脏数据卡住
 -- (db_init 一次 execute 整份 schema.sql,一条失败整份回滚)。
@@ -308,20 +307,13 @@ CREATE INDEX IF NOT EXISTS listing_sources_replaced_by_idx
 CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_replaces_uidx
     ON catalog.listing_sources (store, replaces)
     WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
--- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
--- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
--- ⚠ 本处判型与 workflows/sources_backfill.py 的 _ASIN_RE 是**同一条口径**(整串
--- 匹配的裸 ASIN 形态),改一处必须同步另一处(conventions §六:一个能力一条实现路径)。
--- ⚠ 右锚是硬要求:缺右锚会把 B0XXXXXXXX-2 这类「重上后缀」SKU 判成 amz 并把
--- source_key 截成前 10 位,身份键与 SKU 从此不等 —— 而这批行会因此第一次进入
--- 维护链/审核链的**删除意图产出面**(2026-09-02 批次 0a 修的存量双轨)。
-INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workflow)
-SELECT store, sku,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}$' THEN 'amz' ELSE 'unknown' END,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}$' THEN sku END,
-       'backfill'
-FROM catalog.walmart_items
-ON CONFLICT (store, sku) DO NOTHING;
+-- ⚠ 这里曾有一条随 db_init 每轮执行的**存量按 SKU 格式回填** INSERT
+-- (`CASE WHEN sku ~ '^B0…$' THEN 'amz' ELSE 'unknown'`),**2026-09-06 所有者
+-- 定稿整段删除**:一次性回填早就做完了,留着只会把尚未登记的新码抢先登成
+-- unknown ——「有新行没归类」的信号登记一次之后就永久沉默。db_init 从此
+-- 不写任何业务行。新出现的未登记在架行由 workflows/sources_backfill 登成
+-- unknown(只登记不猜,不参与任何自动破坏动作),人工经
+-- workflows/sources_reclassify 归类。**不要复活这条 INSERT。**
 
 -- 代际继承的**唯一出处**(2026-09-02,SKU 改造批次 3 地基):
 -- 「这个新码继承那个旧码的历史」只在这里定义。改码之后新码在 product_events /

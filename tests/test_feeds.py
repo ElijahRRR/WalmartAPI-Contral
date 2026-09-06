@@ -616,27 +616,40 @@ def test_backoff_follows_the_official_ladder_with_jitter():
     assert 16 <= feeds._backoff(99) <= 32
 
 
-# ── 改码载荷经过 api 层时的两条隐含契约(SKU 改造批次 3 地基,M4)─────────────
+# ── 改码载荷经过 api 层时的两条隐含契约(通道 MP_ITEM_MATCH,2026-09-06 定案)──
 
-def test_chunk_skus_takes_the_new_code_from_a_sku_update_payload():
-    """改码载荷的 Orderable.sku 是**新码**,台账因此按新码落账 —— sku_migrate 的
-    回执反查与 feed_poll 的反哺都按新码找行,**这是有意的**。
+def _migrate_item():
+    """改码载荷 = 跟卖链的同一块积木(services/match_feed.build_match_item)。"""
+    from services import match_feed
+    return match_feed.build_match_item(
+        None, "AN3WC0DE2345", 29.99, 0.82,
+        product_id="00121678236703", product_id_type="GTIN")
+
+
+def test_chunk_skus_takes_the_new_code_from_a_migrate_payload():
+    """改码载荷的 sku 是**新码**,台账因此按新码落账 —— sku_migrate 的回执反查与
+    feed_poll 的反哺都按新码找行,**这是有意的**。
 
     有人把 _chunk_skus 改成取旧码的话,回执永远查不到那一行,而且不报错。
     """
-    from services import mp_mapper
-    item = mp_mapper.build_sku_update_item("AN3WC0DE2345", "012345678905")
+    item = _migrate_item()
+    assert feeds._chunk_skus("MP_ITEM_MATCH", [item]) == ["AN3WC0DE2345"]
     assert feeds._chunk_skus("MP_MAINTENANCE", [item]) == ["AN3WC0DE2345"]
-    assert feeds._chunk_skus("MP_ITEM", [item]) == ["AN3WC0DE2345"]
 
 
-def test_maintenance_payload_wraps_sku_update_items_unchanged():
-    """api 层只包信封不碰内容(铁律 2):改码 MPItem 原样进 MPItemFeed。"""
-    from services import mp_mapper
-    item = mp_mapper.build_sku_update_item("AN3WC0DE2345", "012345678905")
-    p = feeds.build_payload("MP_MAINTENANCE", [item])
-    assert p["MPItem"] == [item]
-    assert p["MPItem"][0]["Orderable"]["SkuUpdate"] == "Yes"
+def test_match_payload_wraps_migrate_items_unchanged():
+    """api 层只包信封不碰内容(铁律 2):改码 Item 原样进 MPItem[{Item:…}]。
+
+    MP_ITEM_MATCH 的 header 是 sellingChannel 制的 v4.2,`processMode=REPLACE`
+    —— 改码正是靠 REPLACE 在同一个 item 上原地换码(2026-09-06 所有者实测)。
+    """
+    item = _migrate_item()
+    p = feeds.build_payload("MP_ITEM_MATCH", [item])
+    assert p["MPItem"] == [{"Item": item}]
+    assert p["MPItemFeedHeader"]["processMode"] == "REPLACE"
+    assert p["MPItem"][0]["Item"]["productIdentifiers"] == {
+        "productIdType": "GTIN", "productId": "00121678236703"}
+    assert "SkuUpdate" not in json.dumps(p)     # 通道不需要这个开关字段
     # 切片限额已登记,本批不新增 feedType
+    assert feeds._SLICE_LIMITS["MP_ITEM_MATCH"] == (1000, 24_000_000)
     assert feeds._SLICE_LIMITS["MP_MAINTENANCE"] == (1000, 24_000_000)
-    assert feeds._SLICE_LIMITS["MP_ITEM"] == (2000, 24_000_000)

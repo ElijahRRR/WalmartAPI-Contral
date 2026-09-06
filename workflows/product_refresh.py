@@ -55,8 +55,10 @@ TIMEOUT_HOURS = 1           # 推上去后多久没采完算超时(所有者定�
 BATCH_PREFIX = "wm-refresh-"
 
 # 合法 ASIN 形态(与采集侧 common/core/idents.ASIN_RE 同口径):B + 9 位大写字母数字
-# ⚠ 这条正则是**采集侧的合法 ASIN 形态闸**(与 idents.ASIN_RE、
-# workflows/sources_backfill._ASIN_RE 同口径),**不是 SKU→ASIN 规则**:
+# ⚠ 这条正则是**采集侧的合法 ASIN 形态闸**(与采集侧 idents.ASIN_RE 同口径),
+# **不是 SKU→ASIN 规则**:
+# (2026-09-06:原来这里还写着「与 workflows/sources_backfill._ASIN_RE 同口径」
+#  —— 那条已随 sources_backfill 改成「只登记不猜」删除,不再有第三处口径)
 # 两者不是同一个能力(推一个非标准码去采集只会永远采不到),
 # 守门测试也因此不扫它(tests/test_sku_guard.py 的 ② 号断言注释)。
 # SKU→ASIN 那一跳由下面 _SQL_TARGETS 的身份键表达式在 SQL 里做完。

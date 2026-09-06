@@ -852,6 +852,67 @@ def test_multi_node_warning_splits_configured_from_unconfigured(monkeypatch):
     assert "谭总12" not in warn
 
 
+# ── 弃码点 1 的真跑 / 空跑两条腿(审计缺口 G-1,2026-09-06)────────────────────
+
+class _AbandonConn:
+    """假连接:只记 rollback 有没有被调过(弃码段是本工作流唯一的写事务)。"""
+
+    def __init__(self):
+        self.rolled_back = False
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def _stub_verify(monkeypatch, catalog_sync, gone_pairs, conn):
+    import contextlib
+    monkeypatch.setattr(catalog_sync, "_sync_one_store",
+                        lambda store, *a, **kw: _ok_result(store["name"]))
+    monkeypatch.setattr(catalog_sync.db, "pg_conn",
+                        lambda *a, **kw: contextlib.nullcontext(conn))
+    monkeypatch.setattr(catalog_sync.product_events, "verify_deletions",
+                        lambda c: (len(gone_pairs), 0, list(gone_pairs)))
+    calls = []
+    monkeypatch.setattr(catalog_sync.sku_codec, "abandon",
+                        lambda c, s, k, reason: calls.append((c, s, k, reason)) or 1)
+    return calls
+
+
+def test_delete_verified_abandons_pair_by_pair_on_a_real_run(monkeypatch):
+    """真跑:gone_pairs 逐对调 abandon,reason 恒为 ABANDON_DELETE_VERIFIED,
+    且**与 verify_deletions 同一个 conn**(分两个事务会留下"事件记了、码没弃"
+    的半截状态,而 open_ok CTE 已经封了口 —— 那个码就永远弃不掉了)。"""
+    catalog_sync = _stub_stores(monkeypatch, ["T1"])
+    conn = _AbandonConn()
+    pairs = [("T1", "AN3WC0DE2345"), ("T1", "B0ABCDEFGH")]
+    calls = _stub_verify(monkeypatch, catalog_sync, pairs, conn)
+
+    out = catalog_sync.run({"skip_feishu": "1"})
+    assert [(c[1], c[2]) for c in calls] == pairs          # 逐对,不合并不跳过
+    assert all(c[0] is conn for c in calls)                # 同一个连接同一事务
+    assert all(c[3] is catalog_sync.sku_codec.ABANDON_DELETE_VERIFIED for c in calls)
+    assert conn.rolled_back is False
+    assert "弃码 2" in out and "[DRY-RUN]" not in out
+
+
+def test_dry_run_skips_the_abandon_point_and_reports_the_count(monkeypatch):
+    """空跑(审计缺口 G-1):abandon **零调用**,verify_deletions 记的事件一并
+    rollback,摘要紧随首行报数。DANGEROUS=False ⇒ cli 恒给 execute=True 且不打
+    横幅,不读 dry_run 的话 `--dry-run` 会真弃码真烧号,不可逆。"""
+    catalog_sync = _stub_stores(monkeypatch, ["T1"])
+    conn = _AbandonConn()
+    pairs = [("T1", "AN3WC0DE2345"), ("T1", "B0ABCDEFGH"), ("T1", "B0IJKLMNOP")]
+    calls = _stub_verify(monkeypatch, catalog_sync, pairs, conn)
+
+    out = catalog_sync.run({"skip_feishu": "1", "dry_run": True})
+    assert calls == []                                     # 一次都没弃
+    assert conn.rolled_back is True                        # 核验事件也没落库
+    assert out.splitlines()[1] == "🧪 [DRY-RUN] 弃码点跳过:将弃码 3 个"
+    assert "空跑未落库" in out
+    # 目录同步本身照常(非危险工作流的既有语义,只挡不可逆的那一段)
+    assert "1/1 店完成" in out.splitlines()[0] and "入库 10 行" in out
+
+
 # ── 在途改码的两个反向指针(SKU 改造批次 3 地基,只读积木)────────────────────
 
 class _RowsConn:

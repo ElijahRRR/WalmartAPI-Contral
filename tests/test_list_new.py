@@ -241,7 +241,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()},
         {}, {},                        # 占用台账为空 = 占用闸恒放行
-        {}, set()))                    # 冷却/代际两道码闸也恒放行
+        {}))                           # 退役冷却闸也恒放行
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
@@ -458,7 +458,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -491,7 +491,7 @@ def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T_A": {"fbm_range1": "200%"},
@@ -536,7 +536,7 @@ def test_store_channel_gate(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {
         "T_FBA": {"fba_range1": "300%", "fbm_range1": "200%"},
@@ -572,7 +572,7 @@ def test_silent_buckets_now_write_reasons(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         {"T_OFF"}, {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.store_targets, "store_channels", lambda: {})
@@ -605,7 +605,7 @@ def test_custom_product_gate(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -634,7 +634,7 @@ def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, {("A109", "B0FREE0001"), ("A102", "B0FREE0001")},
         {}, set(), {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -668,7 +668,7 @@ def test_quota_slices_after_filters(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -717,7 +717,7 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
@@ -952,7 +952,7 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores",
@@ -982,7 +982,7 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
         {"banned_pts": set(), "brands": set()},
         {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
         {"acme": "OTHER"},                                  # 品牌占用
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
@@ -1307,7 +1307,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
@@ -1407,7 +1407,7 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
@@ -1799,7 +1799,7 @@ def test_out_of_scope_store_skips_claim_gates(monkeypatch):
         {"banned_pts": set(), "brands": set()},
         {"B0AAAAAOK1": "A085"},
         {ln.brand_key.brand_key("SomeBrand", None): "A085"},
-        {}, set()))
+        {}))
     monkeypatch.setattr(ln.stores_svc, "load_stores",
                         lambda names=None: [{"name": "谭总4"}, {"name": "T1"}])
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -2006,10 +2006,12 @@ def test_dry_run_records_no_round_event(monkeypatch):
 #   ① 码在**预备期**抽、每行一次、挂 r["_sku"](挪进 _one_store = 双上架);
 #   ② 载荷 / mark_used / 事件 / 上架表 SKU 列写的都是那个码,不是 ASIN;
 #   ③ dry-run 一次都不抽码(写库函数不设 dry_run 开关,靠调用方分路);
-#   ④ 两道新闸(代际上限 / 退役冷却)与试点 limit 的命中、放行与顺序。
+#   ④ 退役冷却闸与试点 limit 的命中、放行与顺序。
+#      (此处曾还有一道**代际上限闸**,所有者 2026-09-06 删除 —— 上架表在不断
+#       更新,不设代数上限;上不去就拿 feed 返回的具体原因去优化上架方法。)
 
 
-def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None, over_gen=()):
+def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None):
     """dry-run 路径的标准桩:闸门数据面可注入,**mint 一被调到就当场炸**。
 
     "空跑不写库"这条红线在 list_new 里靠位置保证(`if not execute:` 早于
@@ -2023,7 +2025,7 @@ def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None, over_gen=()):
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(listed), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
-        dict(cooling or {}), set(over_gen)))
+        dict(cooling or {})))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {s: {"fbm_range1": "200%"} for s in stores})
@@ -2247,14 +2249,15 @@ def test_spec_precheck_payload_uses_the_placeholder_code(monkeypatch):
 
 
 def test_gate_state_fields_are_appended_not_inserted():
-    """两个新字段**追加在末尾**:_GateState 是按位置构造的,插中间全部错位,
+    """新字段**追加在末尾**:_GateState 是按位置构造的,插中间全部错位,
 
-    而错位不报错(集合与字典长得都一样)。
+    而错位不报错(集合与字典长得都一样)。末尾曾还有一个 `over_gen`
+    (代际上限闸),所有者 2026-09-06 连闸删除,末尾只剩 cooling。
     """
     assert ln._GateState._fields[:8] == (
         "inactive", "today_used", "listed_pairs", "banned", "unexplained",
         "gate", "owned_asin", "owned_brand")
-    assert ln._GateState._fields[8:] == ("cooling", "over_gen")
+    assert ln._GateState._fields[8:] == ("cooling",)
 
 
 def test_cooldown_sql_scopes_the_registry_join_to_amz():
@@ -2272,35 +2275,31 @@ def test_cooldown_sql_scopes_the_registry_join_to_amz():
     assert "'retire_feed_success'" not in q and "%(event)s" in q
     assert ln.product_events.RETIRE_FEED_SUCCESS == "retire_feed_success"
     assert ln.product_events.RETIRE_FEED_SUCCESS in ln.product_events.EVENTS
-    # 代际计数按 source_key 分组:按 sku 分组每行恒 1,闸永不命中
-    g = ln._SQL_ABANDONED_GEN
-    assert "GROUP BY 1, 2" in g and "HAVING count(*) >= %(cap)s" in g
-    assert "abandoned_at IS NOT NULL" in g
 
 
-def test_cooldown_and_generation_thresholds_come_from_sku_codec():
-    """两个阈值的唯一出处是 services/sku_codec,list_new 只引用常量名。"""
+def test_cooldown_threshold_comes_from_sku_codec():
+    """阈值的唯一出处是 services/sku_codec,list_new 只引用常量名。"""
     assert ln.sku_codec.RETIRE_COOLDOWN_HOURS == 24
-    assert ln.sku_codec.MAX_SKU_GENERATIONS == 3
     import inspect
     src = inspect.getsource(ln._load_gate_state)
     assert "sku_codec.RETIRE_COOLDOWN_HOURS" in src
-    assert "sku_codec.MAX_SKU_GENERATIONS" in src
 
 
-def test_generation_cap_stops_the_code_churn_loop(monkeypatch):
-    """★ 换码次数达上限的 (店, ASIN) 不再自动重上,写 N 理由点名待人工。
+def test_the_generation_cap_gate_is_gone(monkeypatch):
+    """★ 换码**代际上限闸整道删除**(所有者 2026-09-06)。
 
-    堵的是「弃码 → 新码 → 再弃码」这个闭环:每转一圈白烧一个 UPC 与一个
-    MP_ITEM 配额名额,而且重试上限/在途防重/原号复用三条护栏跟着码重新计数。
+    原话:「上架表是不断在更新的,没必要设置这个上限;上不去的根源是上架
+    方法的问题,拿上架失败的案例以及 feed 返回的具体原因去优化上架才是标准
+    做法,只防止无限上架治标不治本。」代价:反复 SKU_LOCKED 的品每个冷却期
+    烧一个 UPC。这条用例钉住"换过很多代码的品照常放行",防止闸被悄悄加回来
+    (加回来的表现是这行又被拦,而摘要看着一切正常)。
     """
     rows = [_sheet_row(2, store="T1", asin="B0CHURN001"),
             _sheet_row(3, store="T1", asin="B0AAAAAOK1")]
-    _wire_dry_env(monkeypatch, rows, over_gen={("T1", "B0CHURN001")})
+    _wire_dry_env(monkeypatch, rows)
     out = ln.run({"execute": False})
-    assert "第2行:换码次数达上限,待人工" in out
-    assert "换码达上限 1" in out
-    assert "[DRY-RUN] 共 1 行将进入" in out      # 另一行照常放行
+    assert "换码次数达上限" not in out and "换码达上限" not in out
+    assert "[DRY-RUN] 共 2 行将进入" in out      # 两行都放行
 
 
 def test_retire_cooldown_gate_holds_the_row_and_names_it(monkeypatch):
@@ -2322,26 +2321,23 @@ def test_retire_cooldown_gate_holds_the_row_and_names_it(monkeypatch):
     assert "[DRY-RUN] 共 1 行将进入" in out2
 
 
-def test_new_gates_sit_between_dedup_and_claims(monkeypatch):
-    """顺序即语义:一行同时命中在架/代际/冷却,N 列写的是「本店已在架」。
+def test_cooldown_gate_sits_between_dedup_and_claims(monkeypatch):
+    """顺序即语义:一行同时命中在架/冷却,N 列写的是「本店已在架」。
 
-    已在架的行压根不是"再上架",不该走到这两道闸;两道之间代际在前,因为它
-    是要人介入的终局判断,冷却只是等一等。
+    已在架的行压根不是"再上架",不该走到冷却闸。
     """
     rows = [_sheet_row(2, store="T1", asin="B0ALL3HIT1")]
     from datetime import datetime
     _wire_dry_env(monkeypatch, rows, listed={("T1", "B0ALL3HIT1")},
-                  over_gen={("T1", "B0ALL3HIT1")},
                   cooling={("T1", "B0ALL3HIT1"): datetime(2026, 9, 2)})
     out = ln.run({"execute": False})
     assert "第2行:本店已在架:同店重复上架拦截" in out
-    assert "换码次数达上限" not in out and "退役冷却中" not in out
-    # 去掉在架事实之后,先命中的是代际(要人做的那条),不是冷却
-    _wire_dry_env(monkeypatch, rows, over_gen={("T1", "B0ALL3HIT1")},
+    assert "退役冷却中" not in out
+    # 去掉在架事实之后,冷却闸接手
+    _wire_dry_env(monkeypatch, rows,
                   cooling={("T1", "B0ALL3HIT1"): datetime(2026, 9, 2)})
     out2 = ln.run({"execute": False})
-    assert "第2行:换码次数达上限,待人工" in out2
-    assert "退役冷却中" not in out2
+    assert "第2行:退役冷却中" in out2
 
 
 def test_limit_truncates_after_the_gates_not_before(monkeypatch):

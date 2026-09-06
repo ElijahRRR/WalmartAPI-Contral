@@ -266,9 +266,9 @@ def test_all_reflectors_write_code_plus_desc(monkeypatch):
                            columns=sheet.columns)
 
     monkeypatch.setattr(feed_track, "item_results",
-                        lambda fid: {"SKU1": ("failed", "EXT_ERR_1")})
+                        lambda fid, workflow=None: {"SKU1": ("failed", "EXT_ERR_1")})
     monkeypatch.setattr(feed_track, "item_errors",
-                        lambda fid: {"SKU1": "[color] required"})
+                        lambda fid, workflow=None: {"SKU1": "[color] required"})
     want = "EXT_ERR_1 | [color] required"
 
     # 停用/删除表:H 报错列

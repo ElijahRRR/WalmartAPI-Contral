@@ -254,8 +254,14 @@ class _Cur:
         c = self.conn
         if sql.lstrip().startswith("SELECT asin, expected_verdict"):
             self._rows = list(c.tag_rows)          # 同 tag 既有样本
-        elif sql.lstrip().startswith("SELECT DISTINCT sku FROM catalog"):
-            self._rows = [(k,) for k in c.rejected]   # 曾被拒的 sku(asin 级判据)
+        elif sql.lstrip().startswith("SELECT store, sku, source_key"):
+            # 登记簿反查(sku_asin._REG_SQL):(店, 码) 对带店之后这条腿才活
+            c.reg_probe.append(list(zip(args[0], args[1])))
+            self._rows = [(st, sk, key)
+                          for (st, sk), key in sorted(c.registry.items())
+                          if (st, sk) in set(zip(args[0], args[1]))]
+        elif sql.lstrip().startswith("SELECT DISTINCT store, sku FROM catalog"):
+            self._rows = [_pair(k, c) for k in c.rejected]  # 曾被拒(asin 级判据)
         elif sql.lstrip().startswith("SELECT DISTINCT asin FROM audit.walmart_error"):
             self._rows = [(a,) for a in c.ever_flagged]   # 历史报错账本
         elif sql.lstrip().startswith("SELECT count(*)"):
@@ -264,14 +270,22 @@ class _Cur:
             self._rows = [(c.clean_total if c.clean_total is not None
                            else len(c.pos), c.pool_oldest)]
         elif "published_status = 'PUBLISHED'" in sql:
-            # 正例行现在是 (sku, age_days);老夹具只给 sku,补一个够大的天数
-            self._rows = [(p[0], p[1] if len(p) > 1 else 999) for p in c.pos]
+            # 正例行现在是 (sku, store, age_days);老夹具只给 sku,
+            # 补默认店与一个够大的天数
+            self._rows = [(p[0], c.store, p[1] if len(p) > 1 else 999)
+                          for p in c.pos]
             #                             ⚠ 先判:正例 SQL 的 NOT EXISTS
         elif "unpublished_reasons, '') <> ''" in sql and "md5" in sql:
-            self._rows = list(c.neg)        #    里同样带着下架原因那一句
+            # 反例行现在是 (sku, store, reasons);夹具给 (sku, reasons)
+            self._rows = [(n[0], c.store, n[1]) for n in c.neg]
         elif sql.strip().startswith("SELECT asin FROM catalog.products"):
             want = set(args["asins"])
             self._rows = [(a,) for a in sorted(want & set(c.products))]
+        elif "SELECT DISTINCT store, item_id, sku" in sql:
+            # 带店那一级的 item_id 倒查(对子带店之后才会走到这里)
+            want = set(zip(args[0], args[1]))
+            self._rows = [(st, iid, c.item_ids[iid])
+                          for st, iid in sorted(want) if iid in c.item_ids]
         elif "SELECT DISTINCT item_id, sku" in sql:
             self._rows = [(k, v) for k, v in sorted(c.item_ids.items())]
         elif sql.lstrip().startswith("SELECT p.asin"):
@@ -299,10 +313,18 @@ class _Cur:
         return self._rows
 
 
+def _pair(k, c):
+    """夹具里的一条「曾被拒」条目 → (店, sku):写成裸 sku 的补默认店。"""
+    return tuple(k) if isinstance(k, (tuple, list)) else (c.store, k)
+
+
 class _Conn:
     def __init__(self, neg=(), pos=(), products=None, old=None, item_ids=None,
                  tag_rows=(), rejected=(), ever_flagged=(), clean_total=None,
-                 pool_oldest=999):
+                 pool_oldest=999, store="T1", registry=None):
+        self.store = store
+        self.registry = dict(registry or {})   # {(店, sku): source_key}
+        self.reg_probe: list = []              # 登记簿反查实际收到的对子
         self.neg, self.pos = list(neg), list(pos)
         self.products = products or {}
         self.old = old or {}
@@ -352,7 +374,7 @@ def test_sku_is_mapped_through_sku_asin_never_by_bare_equality():
     # 规则出处只有一处:SQL 里没有任何 sku↔asin 的裸等值
     src = _source()
     # 0a 之后身份反查唯一入口是 resolve_pairs(登记簿优先、形态兜底);
-    # 这里没有店铺,传 (None, sku) 走形态腿 —— 缺口见调用点的 ⚠ 注
+    # 2026-09-06 起三处都传真 (店, sku) 对,登记簿腿才活(见下面两条用例)
     assert "sku_asin.resolve_pairs(" in src
     assert "resolve_skus" not in src          # 退役的老入口不许复活
     assert "w.sku = p.asin" not in src and "sku = asin" not in src
@@ -417,6 +439,52 @@ def test_a_positive_sku_whose_asin_was_rejected_in_another_store_is_dropped():
     assert got == ["B0CLEAN0001"] and st["ever_rejected"] == 1
     # 判据面不许封顶(抽样面才可以):漏一行就是把被拒的品当成好品去算误伤率
     assert "LIMIT" not in ar._REJECTED_SKU_SQL
+
+
+def test_all_three_identity_sqls_carry_the_store_column():
+    """⚠ 三条取数 SQL 都必须 SELECT 出 store(审计缺口 G-2,2026-09-06)。
+
+    `resolve_pairs` → `resolve_many` 对 store 为 None 的对**显式跳过登记簿**
+    (sku_asin 头注),只剩形态腿;12 位不透明码形态腿必返 None。于是新码被拒
+    过的品会从反例池与"曾被拒"名单里静默消失,转头以干净身份被抽进正例 ——
+    所有者唯一的底线指标(误伤率)当场被污染,而且两边都不报错。
+    """
+    for name, sql in (("_NEG_SQL", ar._NEG_SQL), ("_POS_SQL", ar._POS_SQL),
+                      ("_REJECTED_SKU_SQL", ar._REJECTED_SKU_SQL)):
+        assert "store" in sql, name
+    # 反例面「一个 sku 只取一行」的语义不许因为带店而变成一 sku 多行
+    assert "DISTINCT ON (w.sku)" in ar._NEG_SQL
+    assert "w.store AS store" in ar._NEG_SQL
+
+
+def test_identity_lookup_receives_real_store_sku_pairs_never_none():
+    """三处 `resolve_pairs` 收到的对子 store 必须非 None —— 登记簿主键是
+    (store, sku),传 None 那条腿一次都不会执行(缺口 G-2 的本体)。
+
+    这里用一个**只有登记簿认得**的 12 位不透明码钉死:形态腿提不出它,
+    只有 (店, 码) 命中登记簿才解得出 ASIN。
+    """
+    opaque = "AN3WC0DE2345"
+    reg = {("T1", opaque): "B0OPAQUE01"}
+    # ① 反例面
+    conn = _Conn(neg=[(opaque, _REASON_IP)], products={"B0OPAQUE01": "t"},
+                 registry=reg)
+    rows, st = ar._negatives(conn, ar._parse_params({"neg": "10"}), POLICIES)
+    assert [s.asin for s in rows] == ["B0OPAQUE01"] and st["no_asin"] == 0
+    assert conn.reg_probe and all(s is not None
+                                 for probe in conn.reg_probe for s, _k in probe)
+    assert ("T1", opaque) in conn.reg_probe[0]
+
+    # ② 「曾被拒」判据面
+    conn = _Conn(rejected=[opaque], registry=reg)
+    assert ar.rejected_asins(conn) == {"B0OPAQUE01"}
+    assert ("T1", opaque) in conn.reg_probe[0]
+
+    # ③ 正例面
+    conn = _Conn(pos=[(opaque,)], products={"B0OPAQUE01": "t"}, registry=reg)
+    got, st = ar._positives(conn, ar._parse_params({"pos": "10"}), set(), set())
+    assert got == ["B0OPAQUE01"] and st["no_asin"] == 0
+    assert ("T1", opaque) in conn.reg_probe[0]
 
 
 def test_the_sampling_sql_is_seeded_in_the_database_not_in_python():

@@ -371,17 +371,11 @@ WHERE e.event = %(event)s AND e.store IS NOT NULL
   AND e.occurred_at >= now() - make_interval(hours => %(hours)s)
 GROUP BY 1, 2
 """
-# 代际上限的数据面:同 (店, 来源, 源头键) 已弃码行数达 MAX_SKU_GENERATIONS 的品。
-# 数的是**已弃码行数**(一个产品换过几代码),所以按 source_key 分组而不是 sku
-# —— 按 sku 分组每行恒 1,闸永不命中。
-_SQL_ABANDONED_GEN = """
-SELECT store, source_key, count(*)
-FROM catalog.listing_sources
-WHERE abandoned_at IS NOT NULL AND source_type = %(source_type)s
-  AND source_key IS NOT NULL
-GROUP BY 1, 2
-HAVING count(*) >= %(cap)s
-"""
+# ⚠ 这里曾有 `_SQL_ABANDONED_GEN`(换码代际上限闸的数据面)。**所有者
+# 2026-09-06 决定删除**整道闸:上架表在不断更新,不该按代数封顶;上不去的
+# 根源是上架方法,拿失败案例与 feed 返回的具体原因去优化上架才是标准做法。
+# 代价记在案:反复 SKU_LOCKED 的品每个冷却期烧一个 UPC。限速只剩退役冷却闸。
+# 别再按代数加闸 —— 要限的是失败原因(见 services/sku_codec 常量区的同款说明)。
 
 
 def load_verdicts(asins: list[str]) -> dict[str, tuple]:
@@ -419,14 +413,14 @@ class _GateState(NamedTuple):
     gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
     owned_asin: dict            # ASIN → 持有店(占用台账 A1)
     owned_brand: dict           # 品牌键 → 持有店(占用台账 A1)
-    # ⚠ 下面两个是**追加在末尾**的(批次 2):本类按位置构造,往中间插字段会
-    # 让后面全部错位,而错位不报错(集合与字典长得都一样,见类头注)
+    # ⚠ 下面这个是**追加在末尾**的(批次 2):本类按位置构造,往中间插字段会
+    # 让后面全部错位,而错位不报错(集合与字典长得都一样,见类头注)。
+    # 末尾曾还有一个 `over_gen`(代际上限闸),所有者 2026-09-06 连闸删除。
     cooling: dict               # (店, ASIN) → 最近一次退役回执成功时刻
-    over_gen: set               # (店, ASIN) 已弃码代数达 MAX_SKU_GENERATIONS
 
 
 def _load_gate_state() -> _GateState:
-    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的十份库侧快照。"""
+    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的九份库侧快照。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_INACTIVE)
         inactive = {s for s, st in cur.fetchall()
@@ -457,18 +451,14 @@ def _load_gate_state() -> _GateState:
         owned_brand = {b: s for b, s in
                        claims.load_active(conn, claims.BRAND).items()
                        if not alloc_survey.is_excluded(s)}
-        # 两道码闸的数据面(批次 2)与上面八份**同一次读完**:逐行查库会在几百
+        # 退役冷却闸的数据面(批次 2)与上面八份**同一次读完**:逐行查库会在几百
         # 行的轮次里打出几百条 SQL,而 _load_gate_state 是闸门链唯一的库侧取数点
         cur.execute(_SQL_RETIRE_COOLDOWN,
                     {"event": product_events.RETIRE_FEED_SUCCESS,
                      "hours": sku_codec.RETIRE_COOLDOWN_HOURS})
         cooling = {(store, key): at for store, key, at in cur.fetchall()}
-        cur.execute(_SQL_ABANDONED_GEN,
-                    {"source_type": listing_sources.SOURCE_AMZ,
-                     "cap": sku_codec.MAX_SKU_GENERATIONS})
-        over_gen = {(store, key) for store, key, _n in cur.fetchall()}
     return _GateState(inactive, today_used, listed_pairs, banned, unexplained,
-                      gate, owned_asin, owned_brand, cooling, over_gen)
+                      gate, owned_asin, owned_brand, cooling)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -1385,22 +1375,15 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 counts["dedup"] += 1
                 reasons.append((r["rownum"], "本店已在架:同店重复上架拦截"))
                 continue
-            # ── 两道码闸(批次 2):位置就是语义 ────────────────────────────
+            # ── 退役冷却闸(批次 2):位置就是语义 ──────────────────────────
             # 在去重闸**之后**:已在架的行压根不是"再上架",不该走到这儿;
             # 在占用/黑名单闸**之前**:那两道问"这个产品该不该由这家店上",
-            # 这两道问"这个 (店, 产品) 现在能不能上"——后者是更硬的时序事实。
-            # 两道之间:代际上限在前,它是要人介入的终局判断,冷却只是等一等;
-            # 一行同时命中两者时,N 列该显示要人做的那条。
-            # 命中只写 N 理由**不写终态**(与既有闸门同语义:冷却期满/人工处置
+            # 这一道问"这个 (店, 产品) 现在能不能上"——后者是更硬的时序事实。
+            # 命中只写 N 理由**不写终态**(与既有闸门同语义:冷却期满
             # 之后下一轮自动续上)。
-            if (store_name, r["asin"]) in st.over_gen:
-                # 判据:同 (店, amz, ASIN) 已弃码行数 ≥ sku_codec
-                # .MAX_SKU_GENERATIONS(数据面 _SQL_ABANDONED_GEN)。堵的是
-                # 「弃码→新码→再弃码」的循环,每转一圈白烧一个 UPC 与一个
-                # MP_ITEM 配额名额,而且三条护栏跟着码重新计数
-                counts["gen_cap"] += 1
-                reasons.append((r["rownum"], "换码次数达上限,待人工"))
-                continue
+            # ⚠ 这道闸前面曾还有一道**代际上限闸**(over_gen / gen_cap),
+            #   所有者 2026-09-06 删除:上架表在不断更新,不设代数上限;
+            #   上不去就拿 feed 返回的具体原因去优化上架方法。
             if st.cooling.get((store_name, r["asin"])):
                 # 判据:该 (店, ASIN) 在 sku_codec.RETIRE_COOLDOWN_HOURS 小时内
                 # 退役回执成功过(数据面 _SQL_RETIRE_COOLDOWN)。旧实证:退役
@@ -1663,7 +1646,7 @@ def run(params: dict) -> str:
         stores_by_name={s["name"]: s for s in stores_svc.load_stores()})
     stores_by_name = ctx.stores_by_name
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
-         "gen_cap": 0, "cooldown": 0,
+         "cooldown": 0,
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0, "no_weight": 0,
          "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0}
@@ -1747,7 +1730,7 @@ def run(params: dict) -> str:
     blocked = [(label, n[key]) for key, label in (
         ("inactive", "非 ACTIVE 店"), ("quota", "超配额"),
         ("no_spec", "PT 无 spec"), ("risk", "风控拦截"),
-        ("dedup", "本店已在架"), ("gen_cap", "换码达上限"),
+        ("dedup", "本店已在架"),
         ("cooldown", "退役冷却中"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
         ("lead_days", "配送超时"), ("no_material", "素材不足"),

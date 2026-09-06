@@ -121,7 +121,9 @@
 > **2026-09-06 已切换**:`FEED_TYPE = "MP_ITEM_MATCH"`,`SUBMIT_DISABLED` 清空,载荷走
 > `match_feed.build_match_item`(GTIN 优先、现挂价与采集重量原样发回、重量兜底值不许发),
 > 反哺器加 workflow 过滤,形态 A 残留(build_sku_update_item / SkuUpdate 放行)已删。
-> 全文见 docs/sku_plan.md §9.12;下文保留切换前的记录。
+> **2026-09-06 第一级投放又补一条:REPLACE 会把库存清成 0,所以定案时用旧码最后观测的
+> 库存(`catalog.walmart_items.avail_qty`)回写新码**(`_restore_inventory`,节点走维护链
+> 同一个入口,失败只告警不重试)。全文见 docs/sku_plan.md §9.12;下文保留切换前的记录。
 
 - **现状**:`workflows/sku_migrate.SUBMIT_DISABLED`(:122)非空 ⇒ run() 把 cap 硬置 0,dry-run 与真跑都
   不列候选、不 mint、不发 feed;`_settle` 照跑。技术原因:US MP_MAINTENANCE 5.0.20260608 的

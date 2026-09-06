@@ -1243,3 +1243,57 @@ v4.2 能否同样原地换码,由第一级投放(节奏闸自动压到 `limit=1`
 `B0CRKFQZWF`,再
 `sku_codec.abandon(conn, 'A085朱丽霖', 'B0CRKFQZWF', ABANDON_SKU_UPDATE, replaced_by='Test851')`
 把旧码标成"已被替换"。**所有者已执行**,此处只留做法备查。
+
+#### 第一级投放实录(2026-09-06 20:19,A085朱丽霖 `B0000C8W8W → AVW476VD6W3H`)
+
+**通道实测结论:v4.2 能原地换码,但会把库存清成 0。**
+
+| 探针 | 结果 |
+|---|---|
+| wpid | 新旧码同为 `3JLHQP1Z1JPX` ⇒ **同一个 item 原地换码**(v4.2 与所有者手测的 v5.0 一致) |
+| 价格 | 不变(载荷发的就是现挂价) |
+| 旧码 | `GET /v3/items/{旧码}` 404 |
+| feed | 1 条 SUCCESS |
+| **库存** | 旧码最后观测 `avail_qty=30`,**新码 0** |
+
+**库存归零的诊断链**(为什么断定是沃尔玛干的,不是我们):
+
+1. 改码前后我们**没有对这两个码发过任何库存动作** —— `ops.feed_items` 里该店该
+   时段没有 inventory/MP_INVENTORY 记录,`ops.dispositions` 没有 inventory 类
+   executing,维护链当轮也没产这两个码的意图;
+2. 新码是这次改码**当场出生**的,它此前不存在,不可能被谁写过 0;
+3. 载荷里根本没有库存字段(MP_ITEM_MATCH v4.2 的 Item 只有 sku / price /
+   ShippingWeight / condition / productIdentifiers);
+4. ⇒ 唯一解释:`processMode=REPLACE` 把「载荷没带的库存」当 0 写了。这与「价格
+   与重量必须原样发回去」是**同一条语义**的另一面 —— 只是库存没法在载荷里发
+   (v4.2 的 SPEC 预填模板只有 productIdentifiers + productCategory,加一个
+   不可验证的字段进去,错了也没人会知道),所以只能在定案时补写。
+
+**所有者当场的手工修复**:`api.inventory.put_inventory(store, 'AVW476VD6W3H', 30,
+ship_node=None)` → `(True, '')`,库存已补回。
+
+**所有者定稿**:「**库存直接使用在数据库中读取到的库存就可以了,不需要记库存**」
+—— 即**不在提交前另抓一次现值另存一份**,定案时直接用 `catalog.walmart_items`
+**旧码行**的 `avail_qty`(旧码消失后 catalog_sync 只给它盖 `missing_since`,
+这一列保留最后一次观测值;上例正是 30)。
+
+**修法**(`workflows/sku_migrate._restore_inventory`,一条实现路径):
+
+| 项 | 定稿 |
+|---|---|
+| 时点 | `_settle` 里 **confirmed 之后、`_sync_sheet` 之前**(定案的后果之一,不是善后) |
+| qty | `catalog.walmart_items.avail_qty`,按 **(店, 旧码)** 读;一轮一条 SQL(新旧码一起问) |
+| 不写的三种情况 | qty 为 NULL / 0;新码 `avail_qty` 已等于 qty(通道将来自己保住库存时这段空转);受管仓判不出(**fail-closed**,不回落 legacy 单仓) |
+| 通道 | `api.inventory.put_inventory(store, new_sku, qty, ship_node=node)`;`node = store_limits.resolve_node(store, store_limits.maint_nodes())` —— **维护链同一个入口**,`maint_nodes()` 一轮只读一次 |
+| 失败 | **只告警点名,不自动重试、不换方法**(安全红线);摘要说明维护链下一轮会按 amz 库存重算,人可先手工补 |
+| 留档 | `listing.sku_migrations.detail` 加 `inventory_restored: qty`(jsonb `\|\|` 合并,不冲掉提交时的 product_id/price/weight) |
+| 摘要 | 首行定案段「库存回写 N」,失败另加 ⚠;明细逐条列 (旧码→新码, qty);dry-run 只报「将回写库存 N 条(qty 来自旧码最后观测)」 |
+
+**运维含义(写进了工作流头注的安全约束⑦)**:**提交到定案之间该品是停售的**
+(线上库存 0)。所以第一级投放之后要**尽快**跑 `catalog_sync -p store=X`,
+再 `sku_migrate -p store=X -p settle_only=1`,别隔夜。
+
+**顺带降噪**:`_sync_sheet` 的「上架表找不到行」由 ⚠ 改成不带标记的计数行
+(「上架表无对应行 N + 样本 3 个」)—— 旧系统上架的存量品本来就不在上架表里,
+整店改码时是成百上千条的常态,带 ⚠ 会把真告警(重复 ASIN / 同店双挂 / 超期)
+淹掉。**「重复 ASIN 无法定位,人工」那条 ⚠ 保持原样**:它是真要人动手的。

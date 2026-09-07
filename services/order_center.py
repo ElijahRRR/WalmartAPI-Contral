@@ -227,17 +227,23 @@ def _adapt_rows(table, desired: dict[str, dict]) -> dict[str, dict]:
 # 前提纪律(所有者承诺):六表不删行、不复制行、键列不手改。
 
 
-def _load_state(table) -> dict[str, tuple[str, str | None]]:
-    """输入:表 → 输出:{键: (record_id, 上次写入指纹)}。"""
+def _load_state_by_id(table_id: str) -> dict[str, tuple[str, str | None]]:
+    """输入:状态键(飞书 table_id,或带 #audit 后缀的派生键)→ 输出:{键: (record_id, 指纹)}。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT row_key, record_id, pushed_hash "
                     "FROM ops.feishu_sync_state WHERE table_id = %s",
-                    (table.table_id,))
+                    (table_id,))
         return {k: (rid, h) for k, rid, h in cur.fetchall()}
 
 
-def _save_state(table, entries: list[tuple[str, str, str | None]]) -> None:
-    """输入:表 + [(键, record_id, 指纹)] → 输出:无(upsert)。"""
+def _load_state(table) -> dict[str, tuple[str, str | None]]:
+    """输入:表 → 输出:{键: (record_id, 上次写入指纹)}。"""
+    return _load_state_by_id(table.table_id)
+
+
+def _save_state_by_id(table_id: str,
+                      entries: list[tuple[str, str, str | None]]) -> None:
+    """输入:状态键 + [(键, record_id, 指纹)] → 输出:无(upsert)。"""
     if not entries:
         return
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -247,7 +253,12 @@ def _save_state(table, entries: list[tuple[str, str, str | None]]) -> None:
             "ON CONFLICT (table_id, row_key) DO UPDATE SET "
             "record_id = EXCLUDED.record_id, pushed_hash = EXCLUDED.pushed_hash, "
             "updated_at = now()",
-            [(table.table_id, k, rid, h) for k, rid, h in entries])
+            [(table_id, k, rid, h) for k, rid, h in entries])
+
+
+def _save_state(table, entries: list[tuple[str, str, str | None]]) -> None:
+    """输入:表 + [(键, record_id, 指纹)] → 输出:无(upsert)。"""
+    _save_state_by_id(table.table_id, entries)
 
 
 def _drop_state(table) -> None:
@@ -329,6 +340,69 @@ def _sync_stateful(t, desired: dict[str, dict],
     logger.info("表「%s」同步:新建 %d,更新 %d,指纹一致跳过 %d",
                 t.name, len(creates), len(updates), skipped)
     return len(creates), len(updates), skipped
+
+
+# ── 审核列定向更新(order_audit 每轮回写;2026-09-07 接进本地状态)──────────────
+# 审核列与销售投影是**同一张飞书表**(registry 两个条目共用 table_id),所以
+# 键 → record_id 的映射直接复用销售表的状态,不再每轮把整张表的键列拉回来。
+# 此前走已删除的 feishu.update_by_key:万行级表每小时拉几十页只为换 record_id,
+# 然后把 3 天窗口内全部已判定行**不比指纹**全量重写 —— 那正是本文件头注里
+# 销售表治理掉的写放大,从审核侧又漏了回来。
+# 指纹**另存一份**:两套载荷各有各的指纹,存在同一行会互相冲掉。状态键 =
+# 销售表 table_id + "#audit"(ops.feishu_sync_state.table_id 是 text,不建新表);
+# 审核指纹没有飞书侧的「同步指纹」列可对账,首轮为空 ⇒ 全写一遍,此后按指纹。
+_AUDIT_STATE_SUFFIX = "#audit"
+
+
+def update_audit_columns(desired: dict[str, dict], *, force: bool = False
+                         ) -> tuple[int, list[str], int]:
+    """输入:{order_line_id: 审核列载荷}(+force 无视指纹全写)→ 输出:(更新行数, 表中尚无的键, 指纹一致跳过数)。
+
+    **只更新,不新建、不删除**:建行是销售投影(push_sales)的职责,这里若也
+    建行会造出只有审核列、没有订单本体的半截行。键不在映射里不是错误 ——
+    销售投影跑在本链前一步(order_sync 链尾),下一轮自然补上;返回缺键清单
+    供调用方计数与告警。映射是本地状态,人工在飞书手建的行不在其中(六表纪律
+    本来就不许手建键);`order_center_push -p reconcile=1` 全量对账可收回。
+    只覆盖载荷里给出的列(省略的列保留飞书旧值),人工列绝不会被碰。
+
+    写失败按 _sync_stateful 同款自愈:清**销售表**状态(映射可能已漂,如行被
+    手删)并上抛,下轮 push_sales 全量拉表重建;审核指纹不清 —— 它只决定
+    "写不写",映射重建后照样能比。
+    """
+    sales = resources.ORDER_SALES
+    audit = resources.ORDER_SALES_AUDIT.require()
+    ids = _load_state(sales) or _bootstrap_state(sales)
+    audit_id = sales.table_id + _AUDIT_STATE_SUFFIX
+    hashes = ({} if force else
+              {k: h for k, (_rid, h) in _load_state_by_id(audit_id).items()})
+    updates: list[dict] = []
+    entries: list[tuple[str, str, str | None]] = []
+    missing: list[str] = []
+    skipped = 0
+    for k, fields in desired.items():
+        if k not in ids:
+            missing.append(k)
+            continue
+        h = feishu._row_hash(fields, _HASH_FIELD)
+        if hashes.get(k) == h:
+            skipped += 1
+            continue
+        rid = ids[k][0]
+        updates.append({"record_id": rid, "fields": fields})
+        entries.append((k, rid, h))
+    if updates:
+        try:
+            feishu.batch_update(audit, updates)
+        except feishu.FeishuError:
+            _drop_state(sales)
+            logger.warning("表「%s」审核列写入失败,已清销售表同步状态,"
+                           "下轮自动全量对账重建映射", audit.name)
+            raise
+        _save_state_by_id(audit_id, entries)
+    logger.info("表「%s」审核列定向更新:%d 行,指纹一致跳过 %d%s", audit.name,
+                len(updates), skipped,
+                f",{len(missing)} 个键不在映射中(待建行方补齐)" if missing else "")
+    return len(updates), sorted(missing), skipped
 
 
 def _cell(v):

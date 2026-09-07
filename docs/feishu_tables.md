@@ -125,9 +125,13 @@ app_token/table_id 走 `<DATA_ROOT>/.env` 登记(键名在 registry 声明,值�
     order_center_push 的载荷没有审核列 → 拉单冲不掉审核结论,反之亦然。
   - 「审核状态」是两条工作流都会写的**唯一一列**,但两边取的都是
     `orders.order_lines.audit_status` 同一个值,不会打架。
-  - order_audit **只更新不新建行**(`feishu.update_by_key`):建行是
-    order_center_push 的职责,否则会造出只有审核列、没有订单本体的半截行。
-    尚未建出的行不报错,下一轮自然补上。
+  - order_audit **只更新不新建行**(`services/order_center.update_audit_columns`):
+    建行是 order_center_push 的职责,否则会造出只有审核列、没有订单本体的半截行。
+    尚未建出的行不报错,下一轮自然补上。**2026-09-07 起按指纹只写变化行、日常零拉表**:
+    键 → record_id 复用销售投影的本地状态(同一张表),审核载荷的指纹另存
+    `ops.feishu_sync_state`(状态键 = 销售表 table_id + `#audit`)。此前每小时把整张表
+    的键列拉回来换 record_id,再把 3 天窗口内全部已判定行不比指纹全量重写。
+    人工把程序列改坏了要刷回程序值:`python cli.py order_audit -p repush=1`。
   - **类型要求**:亚马逊单价/库存数量/配送时长/限价/标题相似度为**数字**
     (标题相似度是 0~1 的小数,建议设 4 位小数),
     产品截图为**附件**(值 `[{"file_token": ...}]`,token 由

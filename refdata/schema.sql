@@ -1040,7 +1040,8 @@ CREATE INDEX IF NOT EXISTS rate_events_key_idx
 CREATE TABLE IF NOT EXISTS ops.feishu_sync_state (
     -- 飞书投影同步状态:键 → record_id + 上次写入指纹(order_center_push)
     -- 日常同步零拉表:本地比指纹定位要写的行;状态缺失/写失败时全量拉表重建
-    table_id    text NOT NULL,          -- 飞书 table_id
+    table_id    text NOT NULL,          -- 飞书 table_id;审核列指纹用派生键 <table_id>#audit
+                                        -- (order_center.update_audit_columns,2026-09-07)
     row_key     text NOT NULL,          -- 行去重键(order_line_id / 唯一键 / perf_key)
     record_id   text NOT NULL,          -- 飞书行内部编号(更新按它定位)
     pushed_hash text,                   -- 上次写入飞书时的载荷指纹

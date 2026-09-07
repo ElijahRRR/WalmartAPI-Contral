@@ -772,7 +772,7 @@ CREATE TABLE ops.rate_events (           -- 跨进程限速事件(api/_client �
     bucket     text NOT NULL,            -- 桶名(唯一出处 _client._RATE_BUCKETS)
     called_at  timestamptz NOT NULL DEFAULT now()
 );  -- 判据 window≥600s 或 limit≤10 的桶才落库(feeds.post.*/prices.put/
-    -- reports.request/insights/SPEC 日额度);插入顺手清 2 天前旧行;
+    -- reports.create/status/download/insights/SPEC 日额度);插入顺手清 2 天前旧行;
     -- PG 不可达稀缺桶 fail hard(所有者拍板 2026-08-12,写操作永不自动兜底)
 
 CREATE TABLE ops.store_kpi_daily (
@@ -1019,7 +1019,42 @@ CREATE TABLE ops.dedupe (           -- 通用防重记录(替代旧 cache/*.json
 前缀各圈各的)、`ops.scrape_failures`(批次落定时拉 `/api/batches/{id}/failures`
 的逐 ASIN 真失败,与 `snapshots.outcome` 互补)、`ops.feed_item_errors`(一条
 ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.v_feed_error_stats`
-与 `ops.v_scrape_failure_stats`(**零程序读者是设计如此**,留给人与 AI 排障)。
+与 `ops.v_scrape_failure_stats`(**零程序读者是设计如此**,留给人与 AI 排障)、
+`ops.report_requests`(On-request 报表请求台账,见下一小节)。
+
+### ops.report_requests(On-request 报表请求台账,2026-09-07)
+
+`item_id_sync` 用沃尔玛 ITEM 报表补 `catalog.walmart_items.item_id` 的「先落台账再调
+接口」记录:每店每次 POST `/v3/reports/reportRequests` 一行。存在的理由是创建报表
+**每店每类型每小时只能一次**(墨西哥站/1P 页原话;美国站未列;2026-08-05 测试期 429
+实证),而报表要等 15–45 分钟 —— requestId 不落库的话一次崩溃/超时就丢掉一份 30 天内
+本可复用的报表,下一轮又吃一次创建额度。
+
+```sql
+CREATE TABLE ops.report_requests (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store            text NOT NULL,
+    report_type      text NOT NULL,      -- ITEM(别的报表类型将来也走这张表)
+    report_version   text NOT NULL,      -- v6
+    request_id       text,               -- 沃尔玛 requestId(POST 成功后回填)
+    status           text NOT NULL,      -- pending / submitted / ready / applied / error
+    workflow         text NOT NULL,      -- item_id_sync
+    submitted_at timestamptz, ready_at timestamptz, downloaded_at timestamptz, applied_at timestamptz,
+    rows_total integer, rows_matched integer, rows_filled integer,
+    rows_overwritten integer,            -- 已有值 ≠ 报表 → 报表为准(所有者定稿 2026-09-07)
+    rows_unmatched integer,              -- 在架但报表里没有
+    rows_no_id integer,                  -- 报表里 Item ID 为空(未 published 的新品)
+    note text, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now()
+);
+CREATE INDEX report_requests_open_idx ON ops.report_requests (store, report_type, status, created_at DESC);
+```
+
+状态机 `pending → submitted → ready → applied | error`。崩溃恢复:下一轮先取本店最近
+一条未终态行接着等 / 接着下载,不重建;`pending` 无 requestId 超 15 分钟判 orphan、
+未终态超 30 天判 expired(都转 error,note 记原因)。**只记本仓自己 POST 的请求**:
+不复用后台(Seller Center)或 Scheduler 生成的报表(所有者定稿 2026-09-07)。
+读写只在 `services/item_reports.py`;`docs` 之外的判据(表头守门 / 两列互校 / 报表为准)
+也在那里。
 
 ### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
 

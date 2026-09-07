@@ -1072,7 +1072,7 @@ CREATE OR REPLACE VIEW orders.settlement_by_line AS
 -- ── ops:运行域(状态与业务同库,可同事务修改)────────────────────────────
 
 -- 跨进程限速事件(api/_client 稀缺桶专用,2026-08-12;判据 window≥600s 或
--- limit≤10:feeds.post.* / prices.put / reports.request / insights 等)。
+-- limit≤10:feeds.post.* / prices.put / reports.create/status/download / insights 等)。
 -- 事件表=真滑动窗口(与进程内 deque 同构);插入时顺手清 2 天前旧行,自清理。
 -- 高频大配额桶不落库(进程内窗口 + 429 退避足够)。PG 不可达时稀缺桶
 -- fail hard 不降级(所有者拍板 2026-08-12,写操作永不自动兜底)。
@@ -1326,6 +1326,41 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
 );
+
+-- ── On-request 报表请求台账(2026-09-07,item_id_sync)────────────────────────
+-- 「先落台账再调接口」:POST /v3/reports/reportRequests 每店每种报表**每小时一次**
+-- (墨西哥站/1P 页原话;美国站未列;08-05 测试期 429 实证),requestId 不落库的话
+-- 一次崩溃/超时就丢掉一份 30 天内本可复用的报表,下次又吃一次创建配额。
+-- 状态:pending(行已写、POST 未确认)→ submitted(拿到 requestId,等生成)→
+-- ready(沃尔玛 READY)→ applied(item_id 已写库,终态)| error(终态,note 记原因)。
+-- 崩溃恢复:下一轮先取本店最近一条未终态行接着等/接着下载,不重建;
+-- pending 无 requestId 超 15 分钟判 orphan、submitted 超 30 天判 expired(都转 error)。
+-- ⚠ 不复用后台(Seller Center)或 Scheduler 生成的报表(所有者定稿 2026-09-07):
+-- 台账里只有本仓自己 POST 出去的请求。
+CREATE TABLE IF NOT EXISTS ops.report_requests (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store            text NOT NULL,
+    report_type      text NOT NULL,          -- ITEM(将来别的报表类型也走这张表)
+    report_version   text NOT NULL,          -- v6
+    request_id       text,                   -- 沃尔玛 requestId(POST 成功后回填)
+    status           text NOT NULL,          -- pending / submitted / ready / applied / error
+    workflow         text NOT NULL,          -- 谁发起的(item_id_sync)
+    submitted_at     timestamptz,
+    ready_at         timestamptz,
+    downloaded_at    timestamptz,
+    applied_at       timestamptz,
+    rows_total       integer,                -- 报表行数
+    rows_matched     integer,                -- 报表 ∩ 本店在架行
+    rows_filled      integer,                -- NULL → 值
+    rows_overwritten integer,                -- 已有值且与报表不同 → 报表为准(所有者定稿)
+    rows_unmatched   integer,                -- 在架但报表里没有
+    rows_no_id       integer,                -- 报表里 Item ID 为空(未 published 的新品)
+    note             text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS report_requests_open_idx
+    ON ops.report_requests (store, report_type, status, created_at DESC);
 
 -- ── 店铺事件账本(2026-08-30 所有者需求:店铺维度病历,TRO 封店预警)────────
 -- 与 catalog.product_events 同构不同表:三条纪律照搬(只追加永不改、事件码

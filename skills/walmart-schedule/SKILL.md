@@ -18,6 +18,7 @@ description: 沃尔玛业务链的定时任务执行手册(每日/每周那部�
 | 任务 | 时间(台北) | cron(台北) | cron(UTC) | 跑什么 |
 |---|---|---|---|---|
 | `backup` | 每天 02:00 | `0 2 * * *` | `0 18 * * *` | backup |
+| `item_id_sync` | 每天 05:00 | `0 5 * * *` | `0 21 * * *` | item_id_sync |
 | `daily_report` | 每天 06:40 | `40 6 * * *` | `40 22 * * *` | catalog_sync → daily_report |
 | `order_daily` | 每天 07:30 | `30 7 * * *` | `30 23 * * *` | perf_problems → order_asin_normalize |
 | `product_chain` | 每天 13:00 | `0 13 * * *` | `0 5 * * *` | catalog_sync → sources_backfill → product_refresh → product_audit → maintenance_scan → problem_scan → maintenance → problem_product_cleanup |

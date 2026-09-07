@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **82 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **83 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
@@ -264,6 +264,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | 工作流 | | 做什么 |
 |---|---|---|
 | `catalog_sync` | 调 | 全店扫沃尔玛在架商品 + 库存 → `catalog.walmart_items`。**它是几乎所有判据的现值来源**,链里必须排第一 |
+| `item_id_sync` | 调 | 用沃尔玛 On-request **ITEM 报表**补 `walmart_items.item_id`(数字 itemId 只有报表批量给)。每天只为有缺口的店各拿一份报表(创建每店每小时一次、生成 15–45 分钟),先落台账 `ops.report_requests` 再调接口,超时/限流下轮接着;写库**报表为准**;首轮 `-p all=1`,探针 `-p store=X -p probe=1`。飞书 itemId 列仍由 catalog_sync 投影 |
 | `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头)。`-p wait=1` 阻塞等采完 |
 | `product_ingest` | 调 | 采集服务增量 → `catalog.products` / `snapshots`。**全项目唯一从采集器取数的工作流**;游标在 `ops.cursors`,空页不推进 |
 | `scrape_missing` | 危 | 给库里缺亚马逊数据的产品补采(分类分档 + 冷却期) |
@@ -472,7 +473,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `store_watch` | 每小时 :45 | `store_watch`(店铺高危事件扫描 → 飞书 → 标已推;顺带比对治理配置快照。**首次上线先手动 `-p seed=1`**) |
 | `product_ingest` | 每小时 :50 | `product_ingest`(全局增量泵:本地产品中心 ↔ 采集器对齐;各链已按批自取,这条管其余一切增量) |
 
-### 智能体定时任务(每日/每周,9 条)
+### 智能体定时任务(每日/每周,10 条)
 
 改时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、
 能当场判断要不要重跑的东西**在旁边。提示词由 `cli.py skill_export` 从调度表渲染到
@@ -481,6 +482,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | 任务 | 时间(台北) | 跑什么 |
 |---|---|---|
 | `backup` | 每天 02:00 | `backup` |
+| `item_id_sync` | 每天 05:00 | `item_id_sync`(有缺口的店各拿一份 ITEM 报表补 item_id;首轮手动 `-p all=1`) |
 | `daily_report` | 每天 06:40 | `catalog_sync` → `daily_report`(产品三列取今早现状,不再差一天) |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
 | `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |

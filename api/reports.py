@@ -2,8 +2,8 @@
 
 On-request Reports(一端点一函数;轮询/等待/落台账是业务节奏,归 services/item_reports):
   create_report_request(store, type, version, body=None)  POST /v3/reports/reportRequests(1/hour/类型;body 缺省 {})
-  list_report_requests(store, type, status=, since=)      GET  /v3/reports/reportRequests(200/min,轮询走它)
-  get_report_request(store, request_id)                   GET  /v3/reports/reportRequests/{id}(20/hour,兜底)
+  iter_report_requests(store, type, status=, since=)      GET  /v3/reports/reportRequests(逐页生成器,轮询走它)
+  get_report_request(store, request_id)                   GET  /v3/reports/reportRequests/{id}(兜底;与列表共用 18/hour 桶)
   get_download_url(store, request_id)                     GET  /v3/reports/downloadReport(20/hour)
   download_report(url, proxy)                             预签名地址 → 字节(经店铺固定代理)
   parse_report_csv / extract_item_id / report_row_sku     解析(zip 内 CSV 或裸 CSV)
@@ -69,6 +69,21 @@ def _fail(status, store: dict, what: str, data) -> None:
     raise ReportRequestError(f"{what} 返回 {status}(店铺 {store['name']}): {data}", status)
 
 
+def _quota_log(what: str, store: dict, status, headers: dict) -> None:
+    """输入:接口名 + 店铺 + 状态码 + 响应头 → 输出:无;把沃尔玛限速头写进日志。
+
+    官方 Rate limiting 页:x-current-token-count = 当前可用令牌数(即该接口的额度),
+    x-next-replenishment-time = 下一次加令牌的时刻。报表族的真实桶只有这两个头能证明
+    (2026-09-07 生产实见列表接口连打 4 次即 429、下枚令牌 142 秒后,与官方表「200/min」
+    对不上;桶到底多大、与单查是否同一个桶,靠每次调用记下来的头回答)。
+    """
+    tokens = (headers or {}).get("x-current-token-count")
+    nxt = (headers or {}).get("x-next-replenishment-time")
+    if tokens is not None or nxt is not None:
+        logger.info("%s %s 限速头:令牌 %s,下枚 %s(店铺 %s)",
+                    what, status, tokens, nxt, store["name"])
+
+
 def create_report_request(store: dict, report_type: str, report_version: str,
                           body: dict | None = None) -> dict:
     """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns)
@@ -88,12 +103,13 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     if not _client.rate_try_acquire("reports.create", cid):
         raise ReportQuotaError(f"{store['name']} {report_type} 报表本小时已创建过一次"
                                f"(本地限速桶),本轮不再创建")
-    status, _, data = _client.safe_post_ex(
+    status, hdr, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/reports/reportRequests",
         _token(store), cid, store["proxy"],
         json_body=body if body is not None else {},
         params={"reportType": report_type, "reportVersion": report_version},
         max_retries=0)
+    _quota_log("reportRequests 创建", store, status, hdr)
     if status == 429:
         raise ReportQuotaError(f"{store['name']} {report_type} 报表创建被限流(429):"
                                f"该类型每小时只能创建一次")
@@ -106,49 +122,72 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     return data
 
 
-def list_report_requests(store: dict, report_type: str, *,
+def iter_report_requests(store: dict, report_type: str, *,
                          status: str | None = None, since: str | None = None,
-                         max_pages: int = 5) -> list[dict]:
-    """输入:店铺 + reportType(+ 状态 / 提交起始时间 ISO 8601)→ 输出:请求列表(dict)。
+                         max_pages: int = 5):
+    """输入:店铺 + reportType(+ 状态 / 提交起始时间 ISO 8601)→ 输出:请求 dict 生成器,逐页产出。
 
-    官方 GET /v3/reports/reportRequests,**200/min** —— 轮询报表状态走这条,
-    不走 20/hour 的单查。只能查最近 30 天的请求;`since` 用
-    requestSubmissionStartDate 收窄,免得翻页。响应 requests[] 每项含
-    requestId / requestStatus / src(SC / API / Scheduler)/ requestSubmissionDate。
-    分页:响应带 nextCursor 时原样回传,最多 max_pages 页(护栏,不是常态)。
+    官方 GET /v3/reports/reportRequests,缺省 10 条一页,只能查最近 30 天;响应
+    requests[] 每项含 requestId / requestStatus / src(SC / API / Scheduler)/
+    requestSubmissionDate。
+    分页是 **orders 型**(蓝图 §4 模型 2):nextCursor 是完整 query 串
+    (`reportType=ITEM&page=2&limit=10`,不带 `?`),官方参考页原话「use nextCursor
+    value instead of query params」—— 必须**直接拼在 URL 上**重发;当成 `nextCursor=`
+    参数传,服务端忽略未知参数、原样返回第一页(2026-09-07 生产实见:同一 cursor
+    连回三次,第四次 429)。同 cursor 重复 = 服务端未推进,立即停;空页即止;
+    max_pages 是护栏不是常态。
+    生成器:调用方找到自己那条就 break,后面的页不再请求 —— 轮询一次通常只花一枚令牌。
+    限速:官方表写 200/min,生产实见 4 次即 429、下枚令牌 142 秒后 ⇒ 小时级桶,
+    与单查共用 `reports.query`(18/hour 持久);真实桶大小看 _quota_log 记的头。
     """
     params: dict = {"reportType": report_type}
     if status:
         params["requestStatus"] = status
     if since:
         params["requestSubmissionStartDate"] = since
-    out: list[dict] = []
-    for _ in range(max_pages):
-        _client.rate_acquire("reports.list", store["client_id"])
-        st, _, data = _client.safe_get_ex(
-            f"{_client.base_url()}/v3/reports/reportRequests",
-            _token(store), store["client_id"], store["proxy"],
-            params=params, max_retries=3)
+    url = f"{_client.base_url()}/v3/reports/reportRequests"
+    cursor: str | None = None
+    seen: set[str] = set()
+    for page in range(1, max_pages + 1):
+        _client.rate_acquire("reports.query", store["client_id"])
+        if cursor:
+            # 分页模型 2:nextCursor 就是完整 query 串,直接拼 URL,不再带 params
+            st, hdr, data = _client.safe_get_ex(
+                url + ("" if cursor.startswith("?") else "?") + cursor,
+                _token(store), store["client_id"], store["proxy"], max_retries=3)
+        else:
+            st, hdr, data = _client.safe_get_ex(
+                url, _token(store), store["client_id"], store["proxy"],
+                params=params, max_retries=3)
+        _quota_log("reportRequests 列表", store, st, hdr)
         if st != 200 or data is None:
             _fail(st, store, "reportRequests 列表", data)
-        out.extend(data.get("requests") or [])
+        rows = data.get("requests") or []
+        yield from rows
         cursor = data.get("nextCursor")
-        if not cursor:
-            break
-        params = dict(params, nextCursor=cursor)
-    return out
+        if not cursor or not rows:
+            return
+        if cursor in seen:
+            logger.warning("reportRequests 列表 nextCursor 重复,停止翻页(店铺 %s 第 %d 页)",
+                           store["name"], page)
+            return
+        seen.add(cursor)
+    logger.warning("reportRequests 列表触达翻页上限 %d 页,可能未看全(店铺 %s)",
+                   max_pages, store["name"])
 
 
 def get_report_request(store: dict, request_id: str) -> dict:
     """输入:店铺 + requestId → 输出:该请求的状态 dict(requestStatus 等)。
 
     官方 GET /v3/reports/reportRequests/{requestId},**20/hour** —— 只作
-    列表接口找不到该 requestId 时的兜底,不用来高频轮询。
+    列表接口找不到该 requestId 时的兜底,不用来高频轮询。与列表共用 `reports.query`
+    桶(同路径前缀;2026-09-07 实证列表也是小时级桶,分开记会两边相加打超)。
     """
-    _client.rate_acquire("reports.status", store["client_id"])
-    st, _, data = _client.safe_get_ex(
+    _client.rate_acquire("reports.query", store["client_id"])
+    st, hdr, data = _client.safe_get_ex(
         f"{_client.base_url()}/v3/reports/reportRequests/{request_id}",
         _token(store), store["client_id"], store["proxy"], max_retries=3)
+    _quota_log("报表状态查询", store, st, hdr)
     if st != 200 or not data:
         _fail(st, store, "报表状态查询", data)
     return data
@@ -161,10 +200,11 @@ def get_download_url(store: dict, request_id: str) -> tuple[str, str | None]:
     拿到就该立刻下载(时效长度官方未公布,只给 expirationTime 字段)。
     """
     _client.rate_acquire("reports.download", store["client_id"])
-    st, _, data = _client.safe_get_ex(
+    st, hdr, data = _client.safe_get_ex(
         f"{_client.base_url()}/v3/reports/downloadReport",
         _token(store), store["client_id"], store["proxy"],
         params={"requestId": request_id}, max_retries=3)
+    _quota_log("downloadReport", store, st, hdr)
     if st != 200 or not data:
         _fail(st, store, "downloadReport", data)
     url = data.get("downloadURL") or (data.get("downloadURLS") or [None])[0]

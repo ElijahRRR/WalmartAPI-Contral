@@ -97,7 +97,7 @@ def _clock():
 
 
 def test_wait_ready_sleeps_first_and_polls_the_list_endpoint():
-    """先睡后查;只用 200/min 的列表接口找自己的 requestId,不动 20/hour 的单查。"""
+    """先睡后查;只用列表接口找自己的 requestId,不动单查兜底(两者同桶,单查纯属多花令牌)。"""
     t, sleep = _clock()
     seen = {"list": 0, "status": 0}
 
@@ -350,8 +350,9 @@ def test_probe_requires_store_and_real_run():
 def test_report_buckets_follow_the_official_rate_page():
     b = _client._RATE_BUCKETS
     assert b["reports.create"] == (1, 3600.0)       # 每类型每小时一次(MX/1P 页;08-05 实测 429)
-    assert b["reports.list"] == (180, 60.0)         # 官方 200/min
-    assert b["reports.status"] == (18, 3600.0)      # 官方 20/hour
+    assert "reports.list" not in b and "reports.status" not in b
+    # 列表+单查共用:官方表列表 200/min,生产不是(2026-09-07 连打 4 次即 429、下枚令牌 142s ⇒ 小时级桶)
+    assert b["reports.query"] == (18, 3600.0)
     assert b["reports.download"] == (18, 3600.0)    # 官方 20/hour
     assert "reports.poll" not in b and "reports.request" not in b
 
@@ -461,7 +462,7 @@ def test_one_store_5xx_still_goes_to_serial_retry(monkeypatch):
 
 # ── 2026-09-07 探针第二轮:列表接口带 requestSubmissionStartDate 回 400 ────────────
 
-def test_list_report_requests_sends_only_report_type_by_default(monkeypatch):
+def test_iter_report_requests_sends_only_report_type_by_default(monkeypatch):
     """按官方参考页格式传 requestSubmissionStartDate 也回 400:缺省只传 reportType。"""
     seen = {}
     monkeypatch.setattr(_client, "rate_acquire", lambda b, c: 0.0)
@@ -471,7 +472,7 @@ def test_list_report_requests_sends_only_report_type_by_default(monkeypatch):
         seen["params"] = dict(params)
         return 200, {}, {"requests": [{"requestId": "R1", "requestStatus": "READY"}]}
     monkeypatch.setattr(_client, "safe_get_ex", get)
-    rows = reports.list_report_requests(STORE, "ITEM")
+    rows = list(reports.iter_report_requests(STORE, "ITEM"))
     assert rows[0]["requestId"] == "R1"
     assert seen["params"] == {"reportType": "ITEM"}
 
@@ -487,3 +488,74 @@ def test_wait_ready_is_called_without_since(monkeypatch):
     wf._one_store(STORE, 60, 120, probe=False)
     assert "since" not in seen and log["written"] == {"A": "11"}
     assert not hasattr(ir, "since_iso")
+
+
+# ── 2026-09-07 探针第三轮:翻页把 nextCursor 当参数传 ⇒ 原样回第一页、连打到 429 ────
+
+def _list_wire(monkeypatch, pages):
+    """pages:按顺序返回的响应 dict;记录每次 rate_acquire 的桶与每次 GET 的 url/params。"""
+    calls = []
+    monkeypatch.setattr(_client, "rate_acquire", lambda b, c: calls.append(("acquire", b)) or 0.0)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+    it = iter(pages)
+
+    def get(url, token, cid, proxy, params=None, timeout=30, max_retries=0):
+        calls.append(("get", url, dict(params or {})))
+        return 200, {"x-current-token-count": "5", "x-next-replenishment-time": "t"}, next(it)
+    monkeypatch.setattr(_client, "safe_get_ex", get)
+    return calls
+
+
+def test_iter_report_requests_appends_cursor_to_url_not_as_param(monkeypatch):
+    """官方参考页:nextCursor 是完整 query 串,「use nextCursor value instead of query params」
+    —— 直接拼 URL;当参数传会被忽略、原样回第一页(2026-09-07 生产实见)。"""
+    calls = _list_wire(monkeypatch, [
+        {"requests": [{"requestId": "R1"}], "nextCursor": "reportType=ITEM&page=2&limit=10"},
+        {"requests": [{"requestId": "R2"}]},
+    ])
+    rows = list(reports.iter_report_requests(STORE, "ITEM"))
+    assert [r["requestId"] for r in rows] == ["R1", "R2"]
+    gets = [c for c in calls if c[0] == "get"]
+    assert gets[0][2] == {"reportType": "ITEM"}
+    assert gets[1][1].endswith("/v3/reports/reportRequests?reportType=ITEM&page=2&limit=10")
+    assert gets[1][2] == {}                                   # 第二页不再带 params
+    assert [c[1] for c in calls if c[0] == "acquire"] == ["reports.query"] * 2
+
+
+def test_iter_report_requests_stops_on_repeated_cursor(monkeypatch):
+    """同 cursor 重复 = 服务端未推进(实见连回三次第四次 429):立即停,不打满 max_pages。"""
+    same = {"requests": [{"requestId": "R1"}], "nextCursor": "reportType=ITEM&page=2&limit=10"}
+    calls = _list_wire(monkeypatch, [same] * 5)
+    rows = list(reports.iter_report_requests(STORE, "ITEM", max_pages=5))
+    assert len([c for c in calls if c[0] == "get"]) == 2
+    assert len(rows) == 2
+
+
+def test_wait_ready_stops_paging_once_request_found(monkeypatch):
+    """生成器:找到自己那条就 break,后面的页不再请求(一次轮询通常只花一枚令牌)。"""
+    calls = _list_wire(monkeypatch, [
+        {"requests": [{"requestId": "R1", "requestStatus": "READY"}],
+         "nextCursor": "reportType=ITEM&page=2&limit=10"},
+        {"requests": [{"requestId": "R0", "requestStatus": "READY"}]},
+    ])
+    t, sleep = _clock()
+    st, polls = ir.wait_ready(STORE, "R1", wait_min=60, poll_secs=300,
+                              status_fn=lambda *a: {}, sleep=sleep, clock=lambda: t[0])
+    assert (st, polls) == ("READY", 1)
+    assert len([c for c in calls if c[0] == "get"]) == 1
+
+
+def test_polling_budget_fits_the_shared_hourly_bucket():
+    """60 分钟 / 5 分钟 = 12 次列表 + 每第 5 次的兜底单查 ≤ 2 次,同一 18/hour 桶装得下。"""
+    limit, window = _client._RATE_BUCKETS["reports.query"]
+    polls = ir.DEFAULT_WAIT_MIN * 60 // ir.DEFAULT_POLL_SECS
+    assert window == 3600.0 and ir.DEFAULT_POLL_SECS == 300
+    assert polls + polls // ir.STATUS_FALLBACK_EVERY <= limit
+
+
+def test_reports_calls_log_walmart_quota_headers(monkeypatch, caplog):
+    """报表族每次响应的 x-current-token-count / x-next-replenishment-time 进日志:真实桶只有它能证明。"""
+    _list_wire(monkeypatch, [{"requests": []}])
+    with caplog.at_level("INFO", logger="api.reports"):
+        list(reports.iter_report_requests(STORE, "ITEM"))
+    assert any("令牌 5" in r.getMessage() and "下枚 t" in r.getMessage() for r in caplog.records)

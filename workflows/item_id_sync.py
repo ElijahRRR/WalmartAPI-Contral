@@ -6,7 +6,7 @@
   python cli.py item_id_sync -p all=1                  # 全部能调 API 的店都拿(首轮 / 对账)
   python cli.py item_id_sync -p store=A085朱丽霖         # 单店
   python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本,**不写 item_id**
-  python cli.py item_id_sync -p wait_min=60 -p poll_secs=120   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
+  python cli.py item_id_sync -p wait_min=60 -p poll_secs=300   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
 
 为什么单独一条工作流(所有者定稿 2026-09-07):数字 itemId 只有 On-request ITEM
 报表能批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 实证);报表要等
@@ -19,9 +19,10 @@
   ① 台账 ops.report_requests 取本店最近一条未落定行 → 有 requestId 就接着等/接着下载,
      **不重建**;没有才「先落 pending 再 POST」创建(POST 不自动重试;429 = 这小时
      额度没了,本店本轮放弃、明天再来,不补试)。
-  ② 轮询:先睡后查,只用 200/min 的列表接口(不带日期参数,带了回 400,2026-09-07
-     实证)按 requestId 找自己那一份;上限 wait_min,超时把 requestId 留在台账下轮接着等
-     (官方保留 30 天)。
+  ② 轮询:先睡后查,用列表接口按 requestId 找自己那一份、找到即停(不带日期参数,
+     带了回 400;nextCursor 是完整 query 串直接拼 URL;官方表 200/min 但生产实见是小时级
+     桶,与单查共用 18/hour —— 均 2026-09-07 实证);五分钟一问,上限 wait_min,超时把
+     requestId 留在台账下轮接着等(官方保留 30 天)。
   ③ READY → 取下载 URL(20/hour)→ 下载 → 解析(zip 内 CSV 或裸 CSV)→ 表头守门
      (SKU / Item ID / Item Page URL 缺一即拦,其余列增减只报不拦)。
   ④ 「Item ID」列与 URL 尾段互校 → 与本店在架行比对 → 写库:NULL 填、已有值且不同

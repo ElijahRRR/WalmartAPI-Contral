@@ -104,7 +104,7 @@ Notifications Management	Delete Subscription	10/min	DELETE	/v3/webhooks/subscrip
 Notifications Management	Update Subscription	5/min	PATCH	/v3/webhooks/subscriptions/{subscriptionId}
 Notifications Management	Event Types	5/min	GET	/v3/webhooks/eventTypes
 On-Request Report Management	Create Report Request	官方 US 页未列;MX/1P 页「每种报表每小时一次」;2026-08-05 测试期 429 实证(代码按 1/hour 配置)	POST	/v3/reports/reportRequests
-On-Request Report Management	Get All Report Requests	200/min	GET	/v3/reports/reportRequests
+On-Request Report Management	Get All Report Requests	官方表 200/min;2026-09-07 生产实见连打 4 次即 429、X-Next-Replenishment-Time 142 秒后 ⇒ 小时级桶(代码与单查共用 18/hour,真实桶看响应头 x-current-token-count)	GET	/v3/reports/reportRequests
 On-Request Report Management	Report Request Status	20/hour	GET	/v3/reports/reportRequests/{requestId}
 On-Request Report Management	Download Report URL	20/hour	GET	/v3/reports/downloadReport
 On-Request Report Management	Create Report Schedule	60/min	POST	/v3/reports/schedules

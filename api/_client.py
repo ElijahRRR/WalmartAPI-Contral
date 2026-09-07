@@ -223,13 +223,17 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
     "returns.list": (46, 60.0),                 # GET /v3/returns(官方 50/min,沿用旧 1.3s 节奏)
-    # On-request Reports 四端点各一桶(2026-09-07 按官方 Rate limiting 页逐条登记,
+    # On-request Reports 三桶(2026-09-07 按官方 Rate limiting 页登记、同日按生产实见改配;
     # 此前 status/download 共用一个 55/min 的桶 —— 官方各 20/hour,20 秒轮询一次
     # 必然 429,这就是 08-05「报表配额极低」实证的真相;创建报表的限额官方
     # 美国站未列,墨西哥站/1P 页写「每种报表每小时一次」,08-05 测试期 429 实证)
     "reports.create": (1, 3600.0),              # POST /v3/reports/reportRequests(每类型每小时一次)
-    "reports.list": (180, 60.0),                # GET /v3/reports/reportRequests(官方 200/min)—— 轮询走这条
-    "reports.status": (18, 3600.0),             # GET /v3/reports/reportRequests/{id}(官方 20/hour)
+    # ⚠ 列表 GET /v3/reports/reportRequests 官方表写 200/min,生产不是(2026-09-07 21:48
+    # C021:连打 4 次第 4 次 429,X-Next-Replenishment-Time 在 142 秒后 —— 官方 Rate
+    # limiting 页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是
+    # 小时级桶,与同路径前缀的单查 20/hour 一致)。列表与单查共用一桶按 20/hour 留余量;
+    # 真实桶大小看 api/reports._quota_log 记的响应头,拿到实证再改这里
+    "reports.query": (18, 3600.0),              # GET /v3/reports/reportRequests(列表,轮询走它)+ /{id}(单查兜底)
     "reports.download": (18, 3600.0),           # GET /v3/reports/downloadReport(官方 20/hour)
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
     "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
@@ -715,7 +719,9 @@ def _request_ex(method, url, token, client_id, proxy, *,
         if attempt < max_retries:
             if status == 429:
                 wait = _parse_retry_after(headers)
-                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)")
+                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次;"
+                     f"令牌 {headers.get('x-current-token-count', '?')},"
+                     f"下枚 {headers.get('x-next-replenishment-time', '?')})")
                 time.sleep(wait)
                 attempt += 1
                 continue

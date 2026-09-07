@@ -48,8 +48,8 @@
 | 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
 | 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
 | 34 | POST /v3/reports/reportRequests | reports | On-request 报表创建(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 实证;reportType/reportVersion 走 query,不传 body=整个目录;**每店每类型每小时一次**,POST 不自动重试) | safe_post_ex(max_retries=0) | item_id_sync |
-| 35 | GET /v3/reports/reportRequests | reports | 报表请求列表(**轮询走这条**,200/min;requestStatus / src / requestSubmissionStartDate 过滤;只能查 30 天) | safe_get_ex | item_id_sync |
-| 36 | GET /v3/reports/reportRequests/{requestId} | reports | 单个请求状态(20/hour,只作列表找不到时的兜底) | safe_get_ex | item_id_sync |
+| 35 | GET /v3/reports/reportRequests | reports | 报表请求列表(**轮询走这条**;官方表 200/min 但生产实见小时级桶,与单查共用 18/hour;nextCursor 是完整 query 串**直接拼 URL**;requestStatus / src 过滤;只能查 30 天) | safe_get_ex(逐页生成器,找到即停) | item_id_sync |
+| 36 | GET /v3/reports/reportRequests/{requestId} | reports | 单个请求状态(20/hour,与列表共用 reports.query 桶,只作列表找不到时的兜底) | safe_get_ex | item_id_sync |
 | 37 | GET /v3/reports/downloadReport | reports | 预签名下载地址 + 时效(20/hour) | safe_get_ex + download_bytes | item_id_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
@@ -126,8 +126,8 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
 | POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天;**body 必须是 JSON 对象**(不带 body 回 415,2026-09-07 实证,缺省发 `{}`) | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),令牌走 `rate_try_acquire` 不睡等;POST 不自动重试;429 / 本地桶已满 = 本轮放弃该店;请求形状被拒的 4xx 还令牌 |
-| GET /v3/reports/reportRequests(列表) | 200/min | 新登记(2026-09-07) | 180/min(reports.list);**轮询用它**,按 requestId 匹配 |
-| GET /v3/reports/reportRequests/{id}(单查) | **20/hour** | 旧代码与 downloadReport 共用 55/min 桶、20 秒轮询一次 ⇒ 必 429 | 18/hour 持久桶(reports.status),只作兜底 |
+| GET /v3/reports/reportRequests(列表) | 官方表 200/min;**生产实见不是**(2026-09-07 21:48 C021:连打 4 次第 4 次 429,X-Next-Replenishment-Time 在 142 秒后 —— 官方 Rate limiting 页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是小时级桶,与同路径前缀的单查 20/hour 一致);缺省 10 条一页,**nextCursor 是完整 query 串**(`reportType=ITEM&page=2&limit=10`,官方参考页「use nextCursor value instead of query params」)| 新登记(2026-09-07);同日按实证改配 | **与单查共用 `reports.query` 18/hour 持久桶**;**轮询用它**,按 requestId 匹配、找到即停(生成器,通常一枚令牌);cursor **直接拼 URL**(当 `nextCursor=` 参数传会被忽略、原样回第一页,实见同 cursor 连回三次),同 cursor 重复立即停;每次响应的 x-current-token-count / x-next-replenishment-time 进日志,真实桶大小以它为准 |
+| GET /v3/reports/reportRequests/{id}(单查) | **20/hour** | 旧代码与 downloadReport 共用 55/min 桶、20 秒轮询一次 ⇒ 必 429 | 与列表共用 `reports.query` 18/hour 持久桶,只作兜底 |
 | GET /v3/reports/downloadReport | **20/hour**;响应 downloadURL + downloadURLExpirationTime(时效长度未公布) | 同上 | 18/hour 持久桶(reports.download) |
 | reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min;**明细只准走 CSV 端点 reconFile**(ZIP 包,Accept: application/octet-stream,text/csv 406)——reconFileJson 每账期硬截断 1000 行且 offset 只收 0,nextOffset 是字节偏移,超千行账期必丢数据(订单中心v1 2026-08-04 实证) |
 | insights performance summary/report | **1/min/端点**;unpublished items/counts **100/min**;listingQuality score 10/hour | CLAUDE.md"Insights 全部 1/分钟"**不准确** | 按端点分档登记 |
@@ -175,6 +175,9 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
    逐状态 5 轮降级为对拍/回退用(api/items.py _SWEEP_MODES)。
 2. **orders 型(cursor 即 URL 后缀)**:meta.nextCursor 返回带 `?` 的完整 query 串,
    直接拼在 /v3/orders 后;单店内**必须串行**翻页。
+   **reports 列表同款**(2026-09-07 实证):顶层 nextCursor 形如
+   `reportType=ITEM&page=2&limit=10`(不带 `?`,拼时补上),官方参考页「use nextCursor
+   value instead of query params」;当参数传被忽略、原样回第一页,同 cursor 重复立即停。
 3. **returns 型(与 orders 同款,2026-08-06 实证修正)**:meta.nextCursor 形如
    `?sellerId=...&limit=200&offset=200`,**直接拼 URL 重发**(parse_qs 拆参重发
    会被服务端忽略未知参数、原样返回第一页——订单中心v1 实证,原"需解析"描述作废);
@@ -328,7 +331,7 @@ api/returns.py
       # `iter_returns(store)  # 无时间过滤,全量`,照抄直接 TypeError。
 api/reports.py
   create_report_request(store, report_type, report_version, body=None)   # #34;429 → ReportQuotaError
-  list_report_requests(store, report_type, *, status=None, since=None)   # #35;轮询走它
+  iter_report_requests(store, report_type, *, status=None, since=None)   # #35;逐页生成器,轮询走它、找到即停
   get_report_request(store, request_id)                                  # #36;兜底
   get_download_url(store, request_id) -> (url, expiration)               # #37
   download_report(url, proxy) -> bytes                                   # 预签名地址(经店铺代理)

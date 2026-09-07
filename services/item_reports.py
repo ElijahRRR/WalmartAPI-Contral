@@ -6,7 +6,7 @@
   map_item_ids(rows)                报表行 → ({sku: item_id}, 计数):Item ID 列与 URL 尾段互校
   plan_updates(current, mapping)    在架现值 × 报表映射 → ({sku: 要写的 item_id}, 计数)
   coverage_note(counters)           计数 → 「疑似不全」提示或空串
-  wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表接口 200/min)
+  wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表生成器找到即停)
   台账 ops.report_requests:open_request / expire_stale / record_pending / mark_*
 
 三条纪律(所有者定稿 2026-09-07):
@@ -17,10 +17,11 @@
     「拿全没有」用报表 SKU 集合 × catalog_sync 扫回来的在架集合来证明(两边独立);
     覆盖率低于阈值在首行点名「疑似不全」,当轮照填已匹配的行,明天再拿一份。
 
-轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;Get All Report Requests
-200/min,单查 20/hour):先睡 poll_secs 再查,只用**列表接口**找自己的 requestId
-(不带日期参数,见 wait_ready);列表里找不到时每第 STATUS_FALLBACK_EVERY 次才
-动用一次 20/hour 的单查兜底。
+轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;单查 20/hour;列表官方表
+写 200/min 但生产实见是小时级桶 —— 2026-09-07 连打 4 次即 429、下枚令牌 142 秒后,
+代码与单查共用 18/hour 的 reports.query 桶):先睡 poll_secs(5 分钟)再查,用**列表
+生成器**找自己的 requestId、找到即停(不带日期参数,见 wait_ready);列表里找不到时
+每第 STATUS_FALLBACK_EVERY 次才动用一次单查兜底。60 分钟 12 次 + 兜底 ≤2 次 < 18。
 """
 
 import logging
@@ -36,7 +37,7 @@ REPORT_VERSION = "v6"          # 所有者贴的后台导出含 Product Conditio
 REQUIRED_COLUMNS = ("SKU", "Item ID", "Item Page URL")
 
 DEFAULT_WAIT_MIN = 60          # 官方典型 15–45 分钟;超过就把 requestId 留在台账下轮接着等
-DEFAULT_POLL_SECS = 120        # 列表接口 200/min,两分钟一问 ≤30 次/小时,远够
+DEFAULT_POLL_SECS = 300        # 列表与单查共用 18/hour 桶:五分钟一问,60 分钟 12 次 + 兜底 ≤2 次 < 18
 STATUS_FALLBACK_EVERY = 5      # 列表找不到 requestId 时,每第 N 次轮询才用一次 20/hour 单查
 
 COVERAGE_WARN_RATIO = 0.95     # 报表匹配到的在架行 / 在架行 低于它 ⇒ 首行点名「疑似不全」
@@ -171,28 +172,32 @@ def wait_ready(store: dict, request_id: str, *, wait_min: int = DEFAULT_WAIT_MIN
                clock=time.monotonic) -> tuple[str, int]:
     """输入:店铺 + requestId(+ 等待上限/间隔)→ 输出:("READY"|"ERROR"|"TIMEOUT", 轮询次数)。
 
-    先睡后查(报表至少要几分钟);每轮用列表接口按 requestId 找自己那一份;
+    先睡后查(报表至少要几分钟);每轮用列表**生成器**按 requestId 找自己那一份,
+    找到即 break、后面的页不再请求(列表与单查共用 18/hour 桶,一次轮询通常一枚令牌);
     列表里找不到(分页/索引滞后)时每第 STATUS_FALLBACK_EVERY 轮用一次单查兜底。
     超时不是失败:requestId 还在台账,下轮接着等(官方保留 30 天)。
     ⚠ `since` 缺省 **不传**(2026-09-07 生产实见:按官方参考页格式
     `YYYY-MM-DDTHH:mm:ssZ` 传 requestSubmissionStartDate 也回 400;列表只有 30 天、
     每店每天一份,不筛也就几十条,按 requestId 匹配足够)。
     """
-    list_fn = list_fn or reports.list_report_requests
+    list_fn = list_fn or reports.iter_report_requests
     status_fn = status_fn or reports.get_report_request
     deadline = clock() + wait_min * 60
     polls = 0
     while True:
         sleep(poll_secs)
         polls += 1
-        found = None
+        found, scanned = None, 0
         for r in list_fn(store, REPORT_TYPE, since=since):
+            scanned += 1
             if str(r.get("requestId") or "") == request_id:
                 found = r
-                break
+                break                           # 生成器:后面的页不再请求
         if found is None and polls % STATUS_FALLBACK_EVERY == 0:
             found = status_fn(store, request_id)
         state = str((found or {}).get("requestStatus") or "").upper()
+        logger.info("店铺 %s 轮询 #%d:requestId %s %s(列表扫了 %d 条)",
+                    store.get("name"), polls, request_id, state or "未见", scanned)
         if state in reports.REPORT_STATUS_TERMINAL:
             return state, polls
         if clock() >= deadline:

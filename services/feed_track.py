@@ -54,6 +54,21 @@ def text_of(status: str, err: str = "") -> str:
     return RESULT_TEXT.get(status, "处理中")
 
 
+def ingestion_errors(node: dict) -> list[dict]:
+    """输入:feed 汇总 head **或**逐条明细 item → 输出:ingestionError 列表。
+
+    两种形态都认:`{"ingestionErrors": {"ingestionError": [...]}}` 与**裸 list**
+    ——旧仓两种都实见过(docs/legacy_survey.md「ingestionErrors 有两种形态」,
+    `poll_yesterday._first_error` 专门兼容过),按 dict 一种形态硬取的表现是
+    裸 list 那一份**静默读成空**:报错原文丢了,而回执照样落定、没有任何告警。
+    feed 级(head)与 SKU 级(item)共用这一份解析,不写第二份。
+    """
+    node = (node or {}).get("ingestionErrors")
+    if isinstance(node, dict):
+        return node.get("ingestionError") or []
+    return list(node or [])
+
+
 def error_text(errs: list[dict]) -> str:
     """输入:ingestionError 列表 → 输出:人话描述串(带字段名,多条以 ; 连接)。
 
@@ -116,6 +131,9 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
     未终态:结果为 None(head 自带 itemsReceived/Succeeded/Failed 进度计数,
     不翻明细);终态:ops.feed_items 逐 SKU 落 success/failed(+错误码),
     台账里有而明细里查无的 SKU 落 missing;feed_log 落 done/failed。
+
+    **例外:feed 级拒收(终态 ERROR + 一条明细都没有)⇒ 台账逐 SKU 落 failed**,
+    回执用 head 里 feed 级 `ingestionErrors` 的第一条(见下面那段注释)。
     """
     head = feeds.get_feed_status(store, feed_id)
     if head.get("feedStatus") not in feeds.FEED_TERMINAL:
@@ -128,7 +146,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         sku = str(item.get("sku") or "")
         if not sku:
             continue
-        errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
+        errs = ingestion_errors(item)
         code = str(errs[0].get("code") or errs[0].get("type") or "") if errs else ""
         descs[sku] = error_text(errs)
         all_errs[sku] = errs
@@ -144,6 +162,36 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         cur.execute("SELECT sku, workflow, feed_type, status FROM ops.feed_items "
                     "WHERE feed_id = %s", (feed_id,))
         meta = {sku: (wf, ft, st) for sku, wf, ft, st in cur.fetchall()}
+        # ── feed 级拒收:终态 ERROR 而**一条明细都没有**(itemsReceived=0)────
+        # 沃尔玛这时把整个 feed 退回,报错只挂在 feed 级 `ingestionErrors` 上,
+        # `iter_feed_items` 一条都翻不出来。按"明细里查无 ⇒ missing"办的后果:
+        #   · sku_migrate 的 `_verdict` 只认 failed 才当场回滚,missing 要等 24h
+        #     观测反证 —— 整店 2740 条改码全卡在 pending;
+        #   · 上架链/维护链同样把"整 feed 被拒"读成"查无",没有任何东西会说
+        #     这批货压根没进沃尔玛。
+        # 2026-09-07 A131吕灿荣 整店改码实证:三条 MP_ITEM_MATCH feed 全部
+        # feedStatus=ERROR、itemsReceived=0,feed 级 ingestionError
+        # `EXT_DATA_ERROR_50575703577001`「You have exceeded your item setup
+        # limit of 5000…」(店内现有 item 数 + 本 feed 条数 超该店上限 ⇒ 整 feed 拒收)。
+        # 旧仓本来就有这条路径(docs/legacy_survey.md「feed 整体 ERROR 且
+        # itemDetails 为空 ⇒ 回查预写的 SKU 列表逐个打 FEED_ERROR」),重写时丢了。
+        # **有逐条明细的 ERROR feed 行为一字不变**:那种 feed 的真相在明细里。
+        # 台账行**全部**落 failed(不挑 status):整 feed 被退回 = 里面没有一条到达。
+        if not results and head.get("feedStatus") == "ERROR" and meta:
+            head_errs = ingestion_errors(head)
+            head_code = str(head_errs[0].get("code")
+                            or head_errs[0].get("type") or "") if head_errs else ""
+            head_desc = error_text(head_errs) or (
+                "feed 级 ERROR,沃尔玛未给逐条明细(itemsReceived="
+                f"{head.get('itemsReceived') or 0})")
+            for sku in meta:
+                results[sku] = ("failed", head_code)
+                descs[sku] = head_desc
+                all_errs[sku] = head_errs
+            logger.warning("feed %s 整条被拒(feedStatus=ERROR,itemsReceived=%s,"
+                           "零明细):台账 %d 个 SKU 全部落 failed,回执 %s | %s",
+                           feed_id, head.get("itemsReceived") or 0, len(meta),
+                           head_code or "(无码)", head_desc)
         cur.executemany(
             "UPDATE ops.feed_items SET status = %s, error_code = %s, "
             "error_desc = %s, resolved_at = now() "

@@ -238,6 +238,18 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
 SKU_LOCKED=ERR_EXT_DATA_0101211(解法:RETIRE→24h→新 UPC 重上)、
 UPC 冲突=ERR_EXT_DATA_0101119、异步审核、可重试类、PROHIBITED 类——集中进 registry 常量。
 
+**feed 级错误码**(挂在 head 的 `ingestionErrors` 上,**没有任何逐条明细**;
+与上面那些 SKU 级的码不是一回事——整个 feed 被退回,`itemsReceived=0`):
+
+| 码 | 原文 | 含义与处置 |
+|---|---|---|
+| `EXT_DATA_ERROR_50575703577001` | "You have exceeded your item setup limit of 5000. … Please resubmit your file to ensure that the total number of items in your catalog is below your designated limit." | 每店 **item setup limit**:沃尔玛按「店内现有 item 数 + 本 feed 条数」判,超了**整 feed 拒收**(MP_ITEM_MATCH 的改码在它眼里先算新增)。2026-09-07 A131吕灿荣 整店改码 2740 条实证(三个 feed 全中)。上限缺省 `resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT`=5000、逐店可在限额表「商品上限」列覆盖;闸在 `sku_migrate._stage_cap`(余量 = 上限 − 现观测在架 item 数),详见 `docs/sku_plan.md` §9.12 |
+
+⚠ **零明细的终态 ERROR 不是"查无"**:`services/feed_track.poll_feed` 对这种 feed
+把 feed 级第一条 ingestionError 当作**每个台账 SKU 的 failed 回执**落账
+(旧仓同款路径,重写时丢过一次);落成 `missing` 会让改码等满 24h 观测期、
+上架/维护链把"整批没进去"读成"查无"。
+
 ## 6. 横切能力(api/_client.py 增强,Phase 1 落地)
 
 Phase 0 已移植:token 缓存/每店代理/401 自愈/429 退避/连接池。还缺四块,

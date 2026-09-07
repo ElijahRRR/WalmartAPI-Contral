@@ -48,7 +48,7 @@
 不是身份账,拿它当第二处身份映射就是双轨(§六)。台账列
 `listing.sku_migrations.sheet_synced_at` **保留但不再写**(恒 NULL,只为不动存量库)。
 
-**七条安全约束**(每条都不是可选项):
+**八条安全约束**(每条都不是可选项):
   ① **先落库并 commit 再调接口**:mint + pending 台账的事务必须在组载荷之前退出;
      在未提交事务里 POST,进程一死就是"沃尔玛已受理、我们这边零记录"的孤儿码。
   ② **回执成功不定案**,定案只信 catalog_sync 的观测(「回执成功但后台没删」是
@@ -83,6 +83,19 @@
        · **没带库存的那几条,提交到定案之间仍是停售的** —— 之后要尽快跑
          `catalog_sync -p store=X`,再 `sku_migrate -p store=X -p settle_only=1`;
        · 回写失败只点名,**不自动重试、不换方法**(写操作永不自动兜底)。
+  ⑧ **上架上限闸**(2026-09-07 A131吕灿荣 整店被拒实证,见 docs/sku_plan.md §9.12):
+     沃尔玛按「**店内现有 item 数 + 本 feed 条数**」对每店的 item setup limit 做
+     **整 feed 拒收** —— MP_ITEM_MATCH 的改码在它眼里**先算新增**。A131 整店 2740 条
+     三个 feed 全部 `feedStatus=ERROR`、`itemsReceived=0`,feed 级
+     `EXT_DATA_ERROR_50575703577001`「You have exceeded your item setup limit of 5000」;
+     零逐条明细 ⇒ 台账那 2740 条一条回执都没有(此前会被读成 missing,现由
+     `services/feed_track` 落 failed)。于是 `_stage_cap` 的生效上限再 min 一层
+     **余量** = 该店上限(限额表「商品上限」列,未填走
+     `resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT` = 5000)− **现观测在架 item 数**
+     (`catalog.walmart_items` 该店 `missing_since IS NULL` 的行数)。余量 ≤ 0 ⇒
+     本轮上限 0 并点名「先清理死档再改码」。**这道闸拦不住的只有一种情况**:
+     上限填错/沃尔玛的口径与我们数的不一样 —— 那时仍会整 feed 被拒,但回执现在
+     是 failed,当场回滚、不再卡 24 小时。
 
 **改码顺便把重量统一到准确值**(2026-09-06 晚所有者定稿,与 sku_plan §9.12 同步改口):
 MP_ITEM_MATCH 是 REPLACE,载荷里的 `ShippingWeight` 会**覆盖**线上重量 —— 这一次是
@@ -127,7 +140,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from api import feeds, inventory as inv_api
-from registry import db
+from registry import db, resources
 from services import amz_source, dispositions, feed_track, \
     listing_sources, match_feed, mp_mapper, notify_fmt as nf, order_lines, \
     sku_codec, store_absence, store_limits, stores as stores_svc, upc_pool, \
@@ -417,6 +430,19 @@ SELECT (SELECT count(*) FROM listing.sku_migrations
          WHERE status = 'confirmed')                            AS confirmed,
        count(*) FILTER (WHERE status IN ('pending', 'stalled')) AS open
 FROM listing.sku_migrations WHERE store = %(store)s
+"""
+
+#: 上架上限闸的分母:该店**现观测在架 item 数**(安全约束⑧)。
+#: **保守口径**:`missing_since IS NULL` 的行**全数**,含 RETIRED / UNPUBLISHED ——
+#: 沃尔玛怎么数它自己的 item setup limit **没有原文**(报错只说 "the total number of
+#: items in your catalog"),而两个方向的代价不对称:数多了只是本轮批次变小(下一轮
+#: 接着改),数少了就是整个 feed 被拒、2740 条一条都进不去。
+#: ⚠ **待所有者按 A131 / A085 的数据校准**:A131吕灿荣 撞上限(上限 5000),
+#: A085朱丽霖 在架 3371 + 一批 1000 没撞上 —— 两点之间还容得下好几种口径
+#: (是否含非 PUBLISHED、是否含已缺席但沃尔玛侧还留着的行)。校准之前按保守的这一种。
+_SQL_ONLINE_ITEMS = """
+SELECT count(*) FROM catalog.walmart_items
+WHERE store = %(store)s AND missing_since IS NULL
 """
 
 #: 过程账落行。`feed_type` 存的就是 `FEED_TYPE` 这一个常量的值(2026-09-06 起
@@ -936,6 +962,24 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
 #  W5 · 节奏硬闸
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _headroom(conn, store_name: str) -> tuple[int, int, int, str]:
+    """输入:连接 + 店 → 输出:(余量, 该店上架上限 L, 现观测在架 item 数 N, 上限出处)。
+
+    余量 = L − N(安全约束⑧)。L 取限额表「商品上限」列(`store_limits.setup_limits`,
+    services 层读飞书,**不在工作流里读表**),该店未填/整列读不到 ⇒ 缺省
+    `resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT`(=5000,出处见 registry 那处注释)。
+    N 的口径见 `_SQL_ONLINE_ITEMS` 头注(保守:含 RETIRED/UNPUBLISHED 一起数)。
+    """
+    caps = store_limits.setup_limits()
+    limit = store_limits.cap_for(caps, store_name,
+                                 resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT)
+    src = "限额表「商品上限」" if store_name in caps else "缺省,该店未填「商品上限」"
+    with conn.cursor() as cur:
+        cur.execute(_SQL_ONLINE_ITEMS, {"store": store_name})
+        online = int((cur.fetchone() or [0])[0] or 0)
+    return limit - online, limit, online, src
+
+
 def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
     """输入:连接 + 店 + 请求上限 → 输出:(本轮生效上限, 一句人话)。
 
@@ -951,7 +995,14 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
     confirmed 按全船队数而不是按店数(所有者 2026-09-07 定稿):前两级验的是
     通道,店无关;每家店重走 1 → 10 只是多两轮人工等待,不多一分安全。
 
-    **`-p limit=` 只能收紧**:生效上限 = min(asked, 闸)。**本函数不再叠配额留量
+    **再 min 一层「上架上限」余量**(安全约束⑧,2026-09-07 A131吕灿荣 实证):
+    沃尔玛按「店内现有 item 数 + 本 feed 条数」对每店 item setup limit **整 feed
+    拒收**,改码在它眼里先算新增。余量 = `_headroom()`;**余量 ≤ 0 ⇒ 上限 0** 并
+    点名"先清理死档再改码"。⚠ 这一层与上面那层删掉的「每轮 1000 条」**不是一回事**,
+    别当双轨删掉:那一层是我们自己为维护链留桶拍的数,这一层是沃尔玛的硬限
+    ——超了不是慢一点,是整个 feed 被拒、一条都进不去。
+
+    **`-p limit=` 只能收紧**:生效上限 = min(asked, 闸, 余量)。**本函数不再叠配额留量
     硬顶**(2026-09-07 所有者纠正):每轮 1000 条那一层是形态 A 时代为维护链留
     MP_MAINTENANCE 桶自设的,不是官方限制;发多少个 feed 由 api 层的速率桶与切片
     天然限住(见常量区那段头注与 docs/sku_plan.md §9.12)。
@@ -960,19 +1011,28 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
         cur.execute(_SQL_STAGE, {"store": store_name})
         row = cur.fetchone() or (0, 0)
     n_conf, n_open = int(row[0] or 0), int(row[1] or 0)
+    room, room_limit, online, room_src = _headroom(conn, store_name)
+    room_note = (
+        f"上架上限闸:上限 {room_limit}({room_src}),在架 {online},"
+        f"本轮最多 {room}" if room > 0 else
+        f"⛔ 上架上限闸:店内 item 数 {online} 已达上架上限 {room_limit}"
+        f"({room_src}),先清理死档再改码 —— 本轮上限 0"
+        f"(超限沃尔玛会**整个 feed 拒收**,itemsReceived=0,一条都进不去)")
     if n_open:
         return 0, (f"节奏闸:该店还有 {n_open} 条改码未定案(pending/stalled),"
-                   f"本轮**只定案不提交** —— 先把上一批的账清干净")
+                   f"本轮**只定案不提交** —— 先把上一批的账清干净"
+                   f"\n  {room_note}")
     if n_conf == 0:
         stage, why = 1, "全船队零 confirmed(第一级:一次只许 1 个品)"
     elif n_conf < 10:
         stage, why = 10, f"全船队已 confirmed {n_conf} 个(第二级:上限 10)"
     else:
         stage, why = asked_limit, f"全船队已 confirmed {n_conf} 个(通道已实证,节奏闸放行,按 -p limit)"
-    eff = max(min(asked_limit, stage), 0)
+    eff = max(min(asked_limit, stage, max(room, 0)), 0)
     return eff, (f"节奏闸:本轮上限 {eff}(请求 {asked_limit};{why};"
                  f"**不再自设每轮条数** —— 整批一次交给 api 层,由速率桶 15/h 与"
-                 f"切片 1000 条/24MB 天然限住)")
+                 f"切片 1000 条/24MB 天然限住)"
+                 f"\n  {room_note}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1480,10 +1540,15 @@ def run(params: dict) -> str:
             conn, store_name, execute, store_of=_store_of,
             observe_hours=observe_h, stale_hours=stale_h)
         lines += settle_lines
-        cap, cap_note = (0, "前置闸未过,本轮不提交") if not ok \
-            else _stage_cap(conn, store_name, asked)
+        # 顺序即语义:`-p settle_only=1` 与"闸未过"都把上限压到 0,而**只定案的那
+        # 一轮根本不该去问上限** —— `_stage_cap` 会读飞书限额表(上架上限闸),
+        # 一次飞书抖动不该把"清账"这件事炸掉(与"闸拦的是发新的、不是定案"同一条)。
         if settle_only:
             cap, cap_note = 0, "-p settle_only=1:本轮只定案,不提交新的"
+        elif not ok:
+            cap, cap_note = 0, "前置闸未过,本轮不提交"
+        else:
+            cap, cap_note = _stage_cap(conn, store_name, asked)
         if SUBMIT_DISABLED:
             # 硬闸,不看 execute:dry-run 列出"将改码 N 个"同样是误导
             cap, cap_note = 0, f"⛔ 提交通道停用(本轮只定案):{SUBMIT_DISABLED}"

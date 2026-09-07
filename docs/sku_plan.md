@@ -1493,3 +1493,69 @@ qty 仍是 `catalog.walmart_items` **旧码行**的 `avail_qty`(与 `_restore_in
 `-api` 后缀 —— Seller Center 模板串与 API feed 串本来就不同源)。⇒ **以原件 enum 为准**,
 试点(节奏闸的 limit=1 那一条)若被拒再议;那时该改的是原件 + registry 一处,不是在
 代码里并排放两个版本串。
+
+#### A131 整店被拒:item setup limit(2026-09-07)
+
+**生产事实**(2026-09-07 10:10,A131吕灿荣 整店改码 2740 条,三个 MP_ITEM_MATCH feed):
+三条 feed **全部** `feedStatus=ERROR`、`itemsReceived=0`,报错挂在 **feed 级**
+`ingestionErrors` 上(**没有任何逐条明细**):
+
+```
+EXT_DATA_ERROR_50575703577001
+You have exceeded your item setup limit of 5000. … Please resubmit your file to
+ensure that the total number of items in your catalog is below your designated limit.
+```
+
+**机制**:沃尔玛按「**店内现有 item 数 + 本 feed 条数**」对每店的 item setup limit
+判定,超了就**整个 feed 拒收**——不是拒掉超出的那几条,是一条都不收。
+**MP_ITEM_MATCH 的改码在它眼里先算新增**(REPLACE 是"匹配到同一个 item 之后"的事,
+配额闸在那之前)。A085朱丽霖(在架 3371 + 一批 1000 = 4371)没撞上,A131 撞上了。
+
+**两处改动**(2026-09-07):
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | **feed 级 ERROR + 零明细 ⇒ 台账逐 SKU 落 `failed`**(不再落 `missing`):回执取 head 里 `ingestionErrors.ingestionError[0]` 的 code/description,`error_code` / `error_desc` 都落(走既有 `error_text`),`feed_log` 落 failed;**有逐条明细的 ERROR feed 行为一字不变**。`ingestion_errors()` 同时兼容官方两种形态(裸 list / `{"ingestionError": […]}`)。这条路径旧仓本来就有(`docs/legacy_survey.md`「feed 整体 ERROR 且 itemDetails 为空 ⇒ 回查预写的 SKU 列表逐个打 FEED_ERROR」),重写时丢了 | `services/feed_track.poll_feed` |
+| ② | **上架上限闸**(安全约束⑧):`_stage_cap` 的生效上限再 min 一层**余量** = 该店上限 − 现观测在架 item 数;余量 ≤ 0 ⇒ 上限 0 并点名"先清理死档再改码" | `workflows/sku_migrate` |
+
+**为什么①要紧**:`missing` 的语义是"沃尔玛没说这条的下落",而这里它说得很清楚
+——**一条都没收**。读成 missing 之后:`_verdict` 只认 `failed` 才当场回滚,
+2740 条要挂满 24h 观测期才可能被反证;上架链/维护链同样把"整批被拒"读成"查无"。
+落 failed 之后,同一轮 `settle_only` 就把这 2740 条 `rolled_back`(旧码复活、新码弃掉),
+而且摘要里带着沃尔玛的原话。
+
+**上限从哪来**:上下架限额表(飞书)新增一列 **「商品上限」**
+(`registry.resources.RETIRE_LIMITS.fields.item_setup_limit`,**所有者稍后建列**;
+可在 Seller Center 查各店真实上限填进去)。读列走 `services/store_limits.setup_limits()`
+(与「配送时长限制」同一个 `_int_map` 口径,**工作流不读飞书**);读不到该列 / 该店未填
+⇒ 缺省 `registry.resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT = 5000`
+(出处就是上面那句报错原文 + A131 实证)。
+
+**在架数怎么数**:`catalog.walmart_items` 该店 `missing_since IS NULL` 的行数,
+**保守口径:含 RETIRED / UNPUBLISHED 一起数**。沃尔玛怎么数它自己的 limit 没有原文
+(只说 "the total number of items in your catalog"),而两个方向的代价不对称 ——
+数多了只是本轮批次变小(下一轮接着改),数少了是整个 feed 被拒、一条都进不去。
+⚠ **待所有者按 A131 / A085 的数据校准**:A131 撞线、A085(4371)没撞线,两点之间
+还容得下好几种口径(是否含非 PUBLISHED、是否含已缺席但沃尔玛侧还留着的行)。
+
+**摘要样例**(dry-run 与真跑同样报,在「本轮明细」段紧跟节奏闸那一行):
+
+```
+  节奏闸:本轮上限 100(请求 1000000;全船队已 confirmed 999 个…)
+  上架上限闸:上限 5000(缺省,该店未填「商品上限」),在架 4900,本轮最多 100
+```
+
+余量 ≤ 0 时:
+
+```
+  ⛔ 上架上限闸:店内 item 数 5000 已达上架上限 5000(缺省,该店未填「商品上限」),
+     先清理死档再改码 —— 本轮上限 0(超限沃尔玛会**整个 feed 拒收**,itemsReceived=0,
+     一条都进不去)
+```
+
+**这道闸拦不住的只有一种情况**:上限填错、或沃尔玛的口径与我们数的不一样。那时仍会
+整 feed 被拒 —— 但有了改动①,回执是 failed,当场回滚,不再卡 24 小时。
+
+**A131 的善后**(所有者动作):那 2740 条台账行现在会被下一轮 `feed_poll` /
+`sku_migrate -p store=A131吕灿荣 -p settle_only=1` 判成 `rolled_back`(旧码复活、
+新码弃掉,旧码在沃尔玛侧从没变过);要继续改这家店,先把死档清到上限以下。

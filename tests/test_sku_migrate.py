@@ -95,6 +95,17 @@ class _Conn:
 
 
 @pytest.fixture(autouse=True)
+def _setup_limit_column_unset(monkeypatch):
+    """「商品上限」列默认**读不到**(= 所有者还没建列)⇒ 上架上限走缺省 5000。
+
+    钉住的是"单测一律不发飞书请求":不打这个桩时 `_headroom` 会真去调
+    `store_limits.setup_limits()`,靠"表未登记抛 LookupError"侥幸得到空字典 ——
+    哪天 token 进了环境变量,整个文件就开始打飞书。要钉列值的用例自己再打一次桩。
+    """
+    monkeypatch.setattr(sm.store_limits, "setup_limits", lambda: {})
+
+
+@pytest.fixture(autouse=True)
 def _open_submit_channel(monkeypatch):
     """既有用例默认在"提交通道可用"的世界里跑;通道停用那条闸另有专门用例钉。"""
     monkeypatch.setattr(sm, "SUBMIT_DISABLED", "")
@@ -541,9 +552,11 @@ def test_parse_names_splits_dedupes_and_keeps_case_and_order():
 #  W5 · 节奏硬闸
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _cap(confirmed, open_rows, asked):
+def _cap(confirmed, open_rows, asked, online=0):
     conn = _Conn([("FROM listing.sku_migrations",
-                   (["confirmed", "open"], [(confirmed, open_rows)]))])
+                   (["confirmed", "open"], [(confirmed, open_rows)])),
+                  ("count(*) FROM catalog.walmart_items",
+                   (["n"], [(online,)]))])
     return sm._stage_cap(conn, "T1", asked)
 
 
@@ -573,7 +586,7 @@ def test_limit_can_only_tighten_never_loosen():
     assert _cap(0, 0, 999)[0] == 1            # 第一级:limit 大也压到 1
 
 
-def test_no_self_imposed_per_run_item_ceiling_survives():
+def test_no_self_imposed_per_run_item_ceiling_survives(monkeypatch):
     """节奏闸放行之后**不再叠**「每轮 1000 条」的自设硬顶(2026-09-07 所有者纠正)。
 
     那一层(2 个 feed × 500 条)是批次 3 还走 MP_MAINTENANCE(8/h,与 13:00 维护链
@@ -581,7 +594,11 @@ def test_no_self_imposed_per_run_item_ceiling_survives():
     20 feed/hour、单 feed 25MB,仓内两道限都已在 **api 层**(桶 15/h、切片
     1000 条/24MB)。留着的表现是整店真跑 3371 个在线品只发了 1000 条就停,
     而摘要说得像官方配额(2026-09-06 A085朱丽霖 实见)。
+
+    ⚠ 这里把「商品上限」放到极大,是为了**把沃尔玛那道硬限(安全约束⑧)让开**——
+    它与本条钉的自设硬顶不是一回事:那是我们拍的数,这是沃尔玛的整 feed 拒收线。
     """
+    monkeypatch.setattr(sm.store_limits, "setup_limits", lambda: {"T1": 10 ** 7})
     cap, note = _cap(999, 0, 10 ** 6)
     assert cap == 10 ** 6                      # 放行档只按 -p limit,不再截
     assert "配额留量硬顶" not in note
@@ -592,6 +609,64 @@ def test_no_self_imposed_per_run_item_ceiling_survives():
 def test_no_new_submissions_while_pending_or_stalled_rows_exist():
     cap, note = _cap(20, 1, 10)
     assert cap == 0 and "只定案不提交" in note
+    # 账没清那一档也要报余量:人看摘要时该知道这家店还剩多少位置
+    assert "上架上限闸" in note
+
+
+# ── 上架上限闸(安全约束⑧;2026-09-07 A131吕灿荣 整店被拒实证)────────────────
+
+def test_headroom_defaults_to_the_walmart_item_setup_limit(monkeypatch):
+    """该店没填「商品上限」⇒ 走缺省 5000(常量出生地只有 registry 一处)。
+
+    余量 = 上限 − 现观测在架 item 数;摘要必须把三个数都报出来,否则
+    "本轮只发了 100 个"看起来像节奏闸,而真实原因是这家店快满了。
+    """
+    from registry import resources
+    assert resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT == 5000
+    cap, note = _cap(999, 0, 10 ** 6, online=4900)
+    assert cap == 100                                   # 5000 − 4900
+    assert "上架上限闸:上限 5000(缺省,该店未填「商品上限」),在架 4900," \
+           "本轮最多 100" in note
+
+
+def test_a_filled_column_overrides_the_default_limit(monkeypatch):
+    """限额表填了就以列为准(所有者可在 Seller Center 查各店真实上限)。"""
+    monkeypatch.setattr(sm.store_limits, "setup_limits", lambda: {"T1": 8000})
+    cap, note = _cap(999, 0, 10 ** 6, online=4900)
+    assert cap == 3100                                  # 8000 − 4900
+    assert "上限 8000(限额表「商品上限」)" in note
+    # 别的店填了不影响本店(按店读列,不是全船队一个数)
+    monkeypatch.setattr(sm.store_limits, "setup_limits", lambda: {"T9": 8000})
+    assert _cap(999, 0, 10 ** 6, online=4900)[0] == 100
+
+
+def test_a_full_store_is_capped_at_zero_and_told_to_clean_up_first():
+    """余量 ≤ 0 ⇒ 上限 0。
+
+    不拦的后果就是 2026-09-07 A131吕灿荣 那一轮:2740 条分三个 feed 全部
+    `feedStatus=ERROR`、`itemsReceived=0`,一条都没进沃尔玛,而摘要说"已提交 2740"。
+    """
+    cap, note = _cap(999, 0, 10 ** 6, online=5000)
+    assert cap == 0
+    assert "店内 item 数 5000 已达上架上限 5000" in note
+    assert "先清理死档再改码" in note
+    assert _cap(999, 0, 10 ** 6, online=5200)[0] == 0   # 超了也不给负数
+
+
+def test_headroom_stacks_with_the_stage_gate_and_the_asked_limit():
+    """三层取 min,谁小听谁的(节奏闸 / -p limit / 上架上限余量)。"""
+    assert _cap(0, 0, 10 ** 6, online=0)[0] == 1        # 第一级 1 < 余量 5000
+    assert _cap(3, 0, 10 ** 6, online=4995)[0] == 5     # 余量 5 < 第二级 10
+    assert _cap(999, 0, 3, online=4000)[0] == 3         # -p limit 3 最小
+    assert _cap(999, 0, 10 ** 6, online=4999)[0] == 1   # 余量 1 最小
+
+
+def test_the_workflow_never_reads_feishu_itself(monkeypatch):
+    """读限额表只走 services(`store_limits.setup_limits`),不在工作流里读飞书。"""
+    import inspect
+    src = inspect.getsource(sm)
+    assert "store_limits.setup_limits" in src
+    assert "feishu" not in src
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1276,6 +1351,37 @@ def test_dry_run_prefix_stays_at_the_head_of_the_first_line(monkeypatch):
     assert "订单双行" in first                     # 告警仍在首行,只是排在前缀之后
 
 
+def test_the_summary_reports_the_headroom_in_dry_run_too(monkeypatch):
+    """上架上限闸在**空跑**里也要报:dry-run 是人眼确认那一步,
+    "这家店只剩 2 个位置"必须在真跑之前就看得见(安全约束⑧)。"""
+    _wire(monkeypatch)
+    _read_conn(monkeypatch, [
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+        ("count(*) FROM catalog.walmart_items", (["n"], [(4998,)])),
+        ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
+        ("FROM ops.feed_items", (["sku"], [])),
+    ])
+    out = sm.run({"store": "T1", "execute": False})
+    assert "上架上限闸:上限 5000(缺省,该店未填「商品上限」),在架 4998," \
+           "本轮最多 2" in out
+
+
+def test_a_full_store_submits_nothing_and_says_why(monkeypatch):
+    """余量 ≤ 0:候选一条都不查(上限 0),摘要点名先清理死档。"""
+    _wire(monkeypatch)
+    read = _read_conn(monkeypatch, [
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+        ("count(*) FROM catalog.walmart_items", (["n"], [(5000,)])),
+    ])
+    monkeypatch.setattr(sm.feeds, "submit_feed",
+                        lambda *a, **k: pytest.fail("店满了不许提交"))
+    out = sm.run({"store": "T1", "execute": True})
+    assert "店内 item 数 5000 已达上架上限 5000" in out and "本轮提交 0" in out
+    assert not any("FROM catalog.walmart_items w" in sql for sql, _ in read.sqls)
+
+
 def test_a_blocked_preflight_still_settles_but_never_submits(monkeypatch):
     """闸拦的是"发新的",**不是"定案"**。
 
@@ -1304,6 +1410,10 @@ def test_settle_only_settles_and_never_submits(monkeypatch):
     ])
     monkeypatch.setattr(sm.feeds, "submit_feed",
                         lambda *a, **k: pytest.fail("settle_only 不许提交"))
+    # 只定案的那一轮**不问上限**:上架上限闸要读飞书限额表,一次飞书抖动
+    # 不该把"清账"炸掉(与"闸拦的是发新的、不是定案"同一条)
+    monkeypatch.setattr(sm.store_limits, "setup_limits",
+                        lambda: pytest.fail("settle_only 不该读限额表"))
     out = sm.run({"store": "T1", "execute": True, "settle_only": "1"})
     assert "settle_only" in out and "本轮提交 0" in out
 

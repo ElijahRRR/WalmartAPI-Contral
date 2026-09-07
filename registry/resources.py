@@ -182,6 +182,18 @@ WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
 # 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
 WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 
+# 每店 **item setup limit** 的缺省值(沃尔玛按「店内现有 item 数 + 本 feed 条数」
+# 对每店的上限做**整 feed 拒收**,报错挂在 feed 级 ingestionError 上,零逐条明细)。
+# 出处:沃尔玛 **EXT_DATA_ERROR_50575703577001** 原文「You have exceeded your item
+# setup limit of 5000. … Please resubmit your file to ensure that the total number
+# of items in your catalog is below your designated limit.」
+# —— 2026-09-07 A131吕灿荣 整店改码 2740 条实证:三条 MP_ITEM_MATCH feed 全部
+# feedStatus=ERROR、itemsReceived=0(A085朱丽霖 在架 3371 + 一批 1000 没撞上)。
+# ⚠ 这**只是缺省值**:各店真实上限不同,所有者可在 Seller Center 查到,填进
+# 上下架限额表的「商品上限」列(`RETIRE_LIMITS.fields.item_setup_limit`),
+# 填了以列为准(读列走 `services/store_limits.setup_limits`)。
+WALMART_ITEM_SETUP_LIMIT_DEFAULT = 5000
+
 # ── 报错归类(第一步:引擎与对照报告用;换轨接线在第二步)────────────
 # 方案定稿 docs/error_taxonomy.md(2026-09-01),判据与优先序的完整依据在那儿。
 # 消费方:services/error_taxonomy.py(引擎)+ workflows/error_reclass_report.py。
@@ -1382,6 +1394,16 @@ RETIRE_LIMITS = Bitable(
         # Virtual Node 等于把新仓的货写到旧节点,比不动更坏(见
         # docs/multi_node_plan.md §3)。
         maint_node="维护仓库",
+        # 每店的**沃尔玛 item setup limit**(所有者建列 2026-09-07;建列前该列
+        # 读不到,全船队走缺省 `WALMART_ITEM_SETUP_LIMIT_DEFAULT` = 5000)。
+        # 填 Seller Center 查到的该店真实上限;**留空 = 走缺省**。
+        # ⚠ **与 `max_online`「单店最大在线数」是两回事,别合并**:
+        #   · `max_online` 是**我们自己**给店定的经营容量目标(分配引擎消费);
+        #   · 本列是**沃尔玛的硬限**——超了它整个 feed 被拒收(itemsReceived=0,
+        #     feed 级 EXT_DATA_ERROR_50575703577001),一条也进不去。
+        # 谁在读:改码 `sku_migrate._stage_cap` 的上架上限闸(余量 = 本列 −
+        # 该店现观测在架 item 数),取数唯一口 `services/store_limits.setup_limits`。
+        item_setup_limit="商品上限",
     ),
 )
 

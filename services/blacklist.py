@@ -126,19 +126,28 @@ def source_label(code: str) -> str:
 
 _ASIN_SQL = """
 INSERT INTO catalog.asin_blacklist
-    (asin, category, source, reason, src_store, biz_cn, src_sku)
-VALUES (%s, %s, %s, %s, %s, %s, %s)
+    (asin, category, source, reason, src_store, biz_cn, src_sku,
+     taxonomy_code, taxonomy_term, taxonomy_version, taxonomy_src)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (asin) DO NOTHING
 """
 
 
-def record_asins(conn, items: list[dict]) -> int:
+def record_asins(conn, items: list[dict], *, src: str = "scan") -> int:
     """输入:连接 + 当轮已归类 item(store/sku/category/reasons)
     → 输出:新入选数。永久禁止 = 一次入选,已在名单的不更新(DO NOTHING)。
 
     黑名单键 = 登记簿反查出的 source_key(切码后唯一通路),查不到回落形态提取,
     再不行用订货号原文兜底并**告警计数**,宁可键不标准也不丢行(口径见 D-0b-1);
-    订货号原文永远存 src_sku 溯源。"""
+    订货号原文永远存 src_sku 溯源。
+
+    ⚠ **日常进口也盖新码章**(2026-09-07):`taxonomy_code/term/version/src`
+    随行写入。这里的码是当轮**全文**判出来的,与 `error_reclass` 回填同等可信
+    —— 不盖章的话 `blacklist_route` 每天都把前一天新进的行报成「N 条还没回填」
+    (2026-09-06 实见 348 条),`error_reclass` 增量也会白重判一遍。
+    `src` 记进口:`scan`(problem_scan 下架报错)/ `feed`(上架回执违禁)。
+    `taxonomy_policy` 留 NULL(政策名 join 要读政策表,日常进口不付这个代价;
+    路由与上架闸都不读它)。"""
     # ⚠ 预取的入选判据必须与下面那一行**逐字同一个** —— 用 `in PERMANENT` 预取、
     #   用 `is_permanent` 落库,`OTHER` + 显式词条那批就不在预取名单里,登记簿
     #   一次都没查就直接落进「原文兜底」,计数虚高而键还是错的。
@@ -163,7 +172,9 @@ def record_asins(conn, items: list[dict]) -> int:
             cur.execute(_ASIN_SQL, (
                 asin, code, source_label(code),
                 (it.get("reasons") or "") or None,      # 全文,别截(见头注)
-                it.get("store"), is_biz_cn(it.get("reasons")), it["sku"]))
+                it.get("store"), is_biz_cn(it.get("reasons")), it["sku"],
+                code, it.get("unlisted_term"),
+                resources.ERROR_TAXONOMY_VERSION, src))
             added += cur.rowcount or 0
     if fell_back:
         logger.warning("ASIN 黑名单:%d 个 sku 登记簿与形态都解不出,按订货号原文"

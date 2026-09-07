@@ -426,12 +426,14 @@ def test_prohibited_receipt_flows_into_blacklist(monkeypatch):
              {"code": "EXT_DATA_ERROR_61020366035308"}]}},
     ]))
     monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
-    got = []
+    got, srcs = [], []
     monkeypatch.setattr(feed_track.blacklist, "record_asins",
-                        lambda c, items: (got.extend(items), len(items))[1])
+                        lambda c, items, src="scan":
+                            (got.extend(items), srcs.append(src), len(items))[2])
 
     feed_track.poll_feed(STORE, "F9")
     assert len(got) == 1 and got[0]["sku"] == "B0BAD01"
+    assert srcs == ["feed"]                 # 上架回执进口要自报身份(taxonomy_src)
     assert got[0]["category"] == "POLICY"   # 换轨前是旧码 B(禁售);
     # 两者都在 PERMANENT 里 ⇒ 拦截行为一字不变,变的只是码名统一到新表
     assert "61020366035308" in got[0]["reasons"]
@@ -583,7 +585,7 @@ def test_sku_migrate_failure_never_blacklists_the_asin(monkeypatch):
     monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
     got = []
     monkeypatch.setattr(feed_track.blacklist, "record_asins",
-                        lambda c, items: (got.extend(items), len(items))[1])
+                        lambda c, items, src="scan": (got.extend(items), len(items))[1])
 
     feed_track.poll_feed(STORE, "F10")
     # 同一份回执里:改码那行被放过,上架那行照常反哺(挡的是来源,不是整段)

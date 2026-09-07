@@ -415,6 +415,21 @@ def _events_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     return out
 
 
+def _split_suspect(suspect: Counter) -> tuple[Counter, Counter]:
+    """输入:{(旧类别, 新码): n} → 输出:(会被放行的, 按裁决仍留的),按新码**相加**。
+
+    ⚠ 2026-09-06 实遇:原先写成字典推导 `{c: n for (_o, c), n in …}`,同一个新码
+    来自**不同旧类别**时后者把前者**盖掉**而不是加上 —— 302 条 `LEGACY→PT_WRONG`
+    被 8 条 `FLAGGED→PT_WRONG` 盖掉,摘要报「会被放行 37 条」,`blacklist_route`
+    实算 **347**。报错的数被人拿去做判断,比不报还坏。
+    """
+    doomed: Counter = Counter()
+    kept: Counter = Counter()
+    for (_old, code), n in suspect.items():
+        (kept if error_taxonomy.is_permanent(code, None) else doomed)[code] += n
+    return doomed, kept
+
+
 def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
                     execute: bool, policy_names, by_asin: dict) -> list[str]:
     """回填 catalog.asin_blacklist。返回摘要行。"""
@@ -505,10 +520,7 @@ def _blacklist_pass(conn, ver: str, chunk: int, force: bool, limit: int,
     #     另在别处」,统一之后左右同码(`GATED → GATED`),那句话自相矛盾;
     #     而 2,006 条 GATED 被叫"站不住"更是误导 —— 它们是**留下**的。
     #   所以现在按**会不会被 blacklist_route 删**分两栏报,那才是人要的答案。
-    doomed = Counter({c: n for (_o, c), n in suspect.items()
-                      if not error_taxonomy.is_permanent(c, None)})
-    kept_sus = Counter({c: n for (_o, c), n in suspect.items()
-                        if error_taxonomy.is_permanent(c, None)})
+    doomed, kept_sus = _split_suspect(suspect)
     if doomed or kept_sus:
         out.append("")
         if doomed:

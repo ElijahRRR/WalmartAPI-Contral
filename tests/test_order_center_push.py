@@ -3,6 +3,7 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+import dataclasses
 import pytest
 
 from api import feishu
@@ -496,3 +497,85 @@ def test_keys_branch_passes_both_sql_params(monkeypatch):
     ocp.push_tables(("keys",), days=30)
     assert len(seen) == 1 and len(seen[0]) == 2 and seen[0][0] == 30
     assert ocp._SALES_SQL.count("%s") == 2
+
+
+# ── 审核列定向更新:复用销售表映射 + 自己的指纹(2026-09-07)────────────────────
+
+
+def _audit_env(monkeypatch, sales_state: dict, audit_hashes: dict):
+    """搭 update_audit_columns 的假环境:销售表映射 + 审核指纹 + 捕获写调用。"""
+    sales = dataclasses.replace(resources.ORDER_SALES, app_token="app",
+                                table_id="tblS")
+    audit = dataclasses.replace(resources.ORDER_SALES_AUDIT, app_token="app",
+                                table_id="tblS")
+    monkeypatch.setattr(resources, "ORDER_SALES", sales)
+    monkeypatch.setattr(resources, "ORDER_SALES_AUDIT", audit)
+    states = {"tblS": dict(sales_state),
+              "tblS#audit": {k: ("r?", h) for k, h in audit_hashes.items()}}
+    calls = {"update": None, "saved": [], "dropped": []}
+    monkeypatch.setattr(ocp, "_load_state_by_id", lambda tid: dict(states.get(tid, {})))
+    monkeypatch.setattr(ocp, "_save_state_by_id",
+                        lambda tid, entries: calls["saved"].append((tid, entries)))
+    monkeypatch.setattr(ocp, "_drop_state", lambda t: calls["dropped"].append(t.name))
+    monkeypatch.setattr(feishu, "batch_update",
+                        lambda t, ups: (calls.__setitem__("update", ups), len(ups))[1])
+    # 日常路径绝不许拉表 —— 这正是从 feishu.update_by_key 换过来的全部理由
+    monkeypatch.setattr(feishu, "list_records",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("审核回写不应拉飞书表")))
+    return calls
+
+
+def test_update_audit_columns_uses_sales_map_and_own_fingerprint(monkeypatch):
+    same = {"审核状态": "✓ 通过", "限价": 75.0}
+    h_same = feishu._row_hash(same, ocp._HASH_FIELD)
+    calls = _audit_env(monkeypatch,
+                       {"k1": ("r1", "sales-hash"), "k2": ("r2", "sales-hash"),
+                        "k3": ("r3", None)},
+                       {"k1": h_same, "k2": "stale"})
+    n, missing, skipped = ocp.update_audit_columns({
+        "k1": dict(same),                       # 指纹一致 → 跳过
+        "k2": {"审核状态": "建议拒绝"},           # 指纹不同 → 按销售表 record_id 更新
+        "k3": {"审核状态": "待人工"},             # 从没推过 → 写
+        "k9": {"审核状态": "待人工"},             # 映射里没有 → 尚未建出
+    })
+    assert (n, skipped, missing) == (2, 1, ["k9"])
+    assert {u["record_id"] for u in calls["update"]} == {"r2", "r3"}
+    # 指纹回存到派生键,不碰销售表自己的指纹
+    tid, entries = calls["saved"][0]
+    assert tid == "tblS#audit"
+    assert {e[0] for e in entries} == {"k2", "k3"}
+    assert calls["dropped"] == []
+
+
+def test_update_audit_columns_force_ignores_fingerprints(monkeypatch):
+    same = {"审核状态": "✓ 通过"}
+    calls = _audit_env(monkeypatch, {"k1": ("r1", None)},
+                       {"k1": feishu._row_hash(same, ocp._HASH_FIELD)})
+    n, _m, skipped = ocp.update_audit_columns({"k1": dict(same)}, force=True)
+    assert (n, skipped) == (1, 0)
+    assert calls["update"][0]["record_id"] == "r1"
+
+
+def test_update_audit_columns_bootstraps_sales_map_when_empty(monkeypatch):
+    """销售表状态为空(首轮/被清)→ 沿用销售表的全量重建,而不是自己另拉一份。"""
+    calls = _audit_env(monkeypatch, {}, {})
+    seen = {}
+    monkeypatch.setattr(ocp, "_bootstrap_state",
+                        lambda t, **kw: seen.setdefault("table", t.name) and
+                        {"k1": ("rB", None)})
+    n, _m, _s = ocp.update_audit_columns({"k1": {"审核状态": "✓ 通过"}})
+    assert seen["table"] == resources.ORDER_SALES.name and n == 1
+    assert calls["update"][0]["record_id"] == "rB"
+
+
+def test_update_audit_columns_write_failure_drops_sales_state(monkeypatch):
+    calls = _audit_env(monkeypatch, {"k1": ("r1", None)}, {})
+
+    def boom(*a, **k):
+        raise feishu.FeishuError(500, "down")
+    monkeypatch.setattr(feishu, "batch_update", boom)
+    with pytest.raises(feishu.FeishuError):
+        ocp.update_audit_columns({"k1": {"审核状态": "✓ 通过"}})
+    assert calls["dropped"] == [resources.ORDER_SALES.name]   # 映射下轮重建
+    assert calls["saved"] == []                               # 没写成不记指纹

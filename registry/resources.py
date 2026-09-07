@@ -403,7 +403,9 @@ ORDER_SALES_AUDIT = Bitable(
         key="order_line_id", audit_status="审核状态", script_audit="脚本审核",
         amz_price="亚马逊单价", stock_qty="库存数量", ship_method="配送方式",
         ship_days="配送时长", seller="卖家店铺名", screenshot="产品截图",
-        supplier="采购方", price_cap="限价", title_similarity="标题相似度",
+        # 「建议采购方」(所有者 2026-09-07 改列):脚本判出的采购方是**建议**,
+        # 原「采购方」列交还人工填实际采购方;程序从此不再碰那一列
+        supplier="建议采购方", price_cap="限价", title_similarity="标题相似度",
     ),
 )
 

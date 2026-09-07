@@ -704,7 +704,12 @@ CREATE VIEW catalog.audit_listing_conflicts AS
              ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
       JOIN catalog.products p ON p.asin = coalesce(ls.source_key, w.sku)
                             AND p.marketplace = 'US'
-      WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
+      WHERE w.missing_since IS NULL            -- 目录里还见得到(最近一轮全量扫描)
+        AND w.published_status = 'PUBLISHED'   -- 且真的在卖。2026-09-07 所有者定:
+                                               --   已被沃尔玛下架的不算「仍在架」——
+                                               --   那是问题扫描链的事(一律删除),审核链
+                                               --   再建议一次只会拼出「审核:… | 问题:…」
+                                               --   两条互相矛盾的理由(实见 B0FHPSYT8N)
         AND p.audit_status = 'rejected'
   )
   SELECT lr.store, lr.sku, lr.asin,
@@ -1072,7 +1077,8 @@ CREATE INDEX IF NOT EXISTS rate_events_key_idx
 CREATE TABLE IF NOT EXISTS ops.feishu_sync_state (
     -- 飞书投影同步状态:键 → record_id + 上次写入指纹(order_center_push)
     -- 日常同步零拉表:本地比指纹定位要写的行;状态缺失/写失败时全量拉表重建
-    table_id    text NOT NULL,          -- 飞书 table_id
+    table_id    text NOT NULL,          -- 飞书 table_id;审核列指纹用派生键 <table_id>#audit
+                                        -- (order_center.update_audit_columns,2026-09-07)
     row_key     text NOT NULL,          -- 行去重键(order_line_id / 唯一键 / perf_key)
     record_id   text NOT NULL,          -- 飞书行内部编号(更新按它定位)
     pushed_hash text,                   -- 上次写入飞书时的载荷指纹

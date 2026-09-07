@@ -741,7 +741,10 @@ def _request_ex(method, url, token, client_id, proxy, *,
             # 500 截取,不是 200(2026-08-19):Akamai 错误页的 Reference #
             # 在 HTML 后半段,200 字符正好截在它前面——持续 5xx 要开沃尔玛
             # 工单,工单要的就是这个号
-            body_snip = resp.text[:500] if method in ("POST", "PUT") else ""
+            # GET 的 400 也截正文(2026-09-07 实见:reportRequests 列表带日期参数回 400,
+            # 日志里只有一个状态码,沃尔玛嫌弃的是什么完全看不见);404 不截 ——
+            # 单查补漏一轮几千个 404 是常态,截了就是日志灌水
+            body_snip = resp.text[:500] if (method in ("POST", "PUT") or status == 400) else ""
             msg = f"✗ {method} {status} {url}"
             if body_snip:
                 msg += f": {body_snip}"

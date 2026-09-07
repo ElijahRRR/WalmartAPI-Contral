@@ -110,6 +110,9 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   Content-Type: application/json),创建缺省发 `{}`;② 创建失败进串行补试后在一小时
   一枚的创建桶里睡了 3595 秒 —— 创建改走 `rate_try_acquire`(有就占、没有立刻当
   quota 结局),请求形状被拒的 4xx 把令牌还回去,5xx / 网络未达才交补试。
+- **探针第二轮(21:16)**:创建通了(200,拿到 requestId);列表接口按官方参考页格式
+  `YYYY-MM-DDTHH:mm:ssZ` 带 requestSubmissionStartDate 回 400 —— 轮询改为不带日期
+  参数(每店 30 天内只有几十条,按 requestId 匹配);GET 的 400 正文从此进日志。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

@@ -1535,8 +1535,10 @@ ensure that the total number of items in your catalog is below your designated l
 **保守口径:含 RETIRED / UNPUBLISHED 一起数**。沃尔玛怎么数它自己的 limit 没有原文
 (只说 "the total number of items in your catalog"),而两个方向的代价不对称 ——
 数多了只是本轮批次变小(下一轮接着改),数少了是整个 feed 被拒、一条都进不去。
-⚠ **待所有者按 A131 / A085 的数据校准**:A131 撞线、A085(4371)没撞线,两点之间
-还容得下好几种口径(是否含非 PUBLISHED、是否含已缺席但沃尔玛侧还留着的行)。
+✅ **口径已校准(所有者 2026-09-07)**:Seller Center 显示 A131「目录中有 4463 个商品,
+最多 5000 个」,与 `_SQL_ONLINE_ITEMS`(在架行含 RETIRED)逐字相等。各店上限不同
+(A085 在架 4316 + 1000 没撞线 ⇒ 它的上限高于 5000),真实上限填限额表「商品上限」列
+(所有者已建列);所有者定:人工观察余量、手动 `-p limit`,本闸只是护栏。
 
 **摘要样例**(dry-run 与真跑同样报,在「本轮明细」段紧跟节奏闸那一行):
 

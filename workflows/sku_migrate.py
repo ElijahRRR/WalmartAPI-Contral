@@ -437,9 +437,10 @@ FROM listing.sku_migrations WHERE store = %(store)s
 #: 沃尔玛怎么数它自己的 item setup limit **没有原文**(报错只说 "the total number of
 #: items in your catalog"),而两个方向的代价不对称:数多了只是本轮批次变小(下一轮
 #: 接着改),数少了就是整个 feed 被拒、2740 条一条都进不去。
-#: ⚠ **待所有者按 A131 / A085 的数据校准**:A131吕灿荣 撞上限(上限 5000),
-#: A085朱丽霖 在架 3371 + 一批 1000 没撞上 —— 两点之间还容得下好几种口径
-#: (是否含非 PUBLISHED、是否含已缺席但沃尔玛侧还留着的行)。校准之前按保守的这一种。
+#: ✅ **口径已校准(所有者 2026-09-07)**:Seller Center 显示 A131吕灿荣「目录中有 4463 个
+#: 商品,最多 5000 个」,与本 SQL(在架行含 RETIRED)逐字相等 —— 这就是沃尔玛的数法。
+#: 各店上限不同(A085朱丽霖 在架 4316 + 一批 1000 没撞线,说明它的上限不是 5000),
+#: 真实上限填限额表「商品上限」列;所有者按余量人工设 -p limit,本闸只是护栏。
 _SQL_ONLINE_ITEMS = """
 SELECT count(*) FROM catalog.walmart_items
 WHERE store = %(store)s AND missing_since IS NULL

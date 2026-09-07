@@ -5,7 +5,7 @@
   python cli.py item_id_sync                           # 有缺口的店各拿一份报表补齐(每天 05:00 调度)
   python cli.py item_id_sync -p all=1                  # 全部能调 API 的店都拿(首轮 / 对账)
   python cli.py item_id_sync -p store=A085朱丽霖         # 单店
-  python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本,**不写 item_id**
+  python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本 + 原件留存与体检,**不写 item_id**
   python cli.py item_id_sync -p wait_min=60 -p poll_secs=300   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
 
 为什么单独一条工作流(所有者定稿 2026-09-07):数字 itemId 只有 On-request ITEM
@@ -55,7 +55,7 @@ import time
 from collections import Counter
 
 from api import reports
-from registry import db
+from registry import db, paths
 from services import item_reports as ir, notify_fmt as nf, store_retry, \
     stores as stores_svc, walmart_catalog
 from services.params import flag
@@ -141,7 +141,18 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
             ir.mark_ready(conn, row_id)
 
     url, _exp = reports.get_download_url(store, request_id)
-    rows = reports.parse_report_csv(reports.download_report(url, store["proxy"]))
+    blob = reports.download_report(url, store["proxy"])
+    blob_info = None
+    if probe:
+        # 探针原件留存 + 体检:「报表只有 1 行」要拿原件才分得清是沃尔玛只给了 1 行
+        # 还是解析吞了(2026-09-07 C021:55 列对上、在架 1490 行却只解析出 1 行)
+        dump = paths.item_report_dump_file(name, request_id,
+                                           ".zip" if blob[:2] == b"PK" else ".csv")
+        dump.parent.mkdir(parents=True, exist_ok=True)
+        dump.write_bytes(blob)
+        blob_info = {**reports.report_blob_info(blob), "dump": str(dump)}
+        logger.info("探针 %s 报表原件已存 %s(%d 字节)", name, dump, len(blob))
+    rows = reports.parse_report_csv(blob)
     header = list(rows[0].keys()) if rows else []
     if not rows:
         with db.pg_conn() as conn:
@@ -169,6 +180,7 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
     res = _result(name, outcome, counters=counters, note=drift,
                   elapsed_min=(time.monotonic() - t0) / 60, request_id=request_id)
     if probe:
+        res["blob"] = blob_info
         res["header"] = header
         res["sample"] = [(reports.report_row_sku(r), reports.item_id_from_column(r),
                           reports.item_id_from_url(r)) for r in rows[:_PROBE_SAMPLE]]
@@ -202,6 +214,16 @@ def _probe_lines(r: dict) -> list[str]:
     out.append(f"  Publish Status 分布:{r['publish']}")
     out.append(f"  Lifecycle Status 分布:{r['lifecycle']}")
     out.append(f"  样本(SKU, Item ID 列, URL 尾段):{r['sample']}")
+    b = r.get("blob") or {}
+    if b:
+        out.append(f"  原件 {b['bytes']} 字节,zip 成员 {b['members'] or '无(裸 CSV)'},取 {b['member']};"
+                   f"CSV {b['csv_bytes']} 字节 / {b['lines']} 个换行,解析 {b['rows']} 行,"
+                   f"首行最长字段 {b['longest_field']} 字符;原件已存 {b['dump']}")
+        if b["rows"] <= 1 and b["lines"] > b["rows"] + 1:
+            out.append(f"  ⚠ 换行 {b['lines']} 个却只解析出 {b['rows']} 行:多半是某个字段引号没闭合"
+                       f"把后面全吞了(看首行最长字段),不是沃尔玛只给了 {b['rows']} 行")
+        if len(b["members"]) > 1:
+            out.append(f"  ⚠ zip 里有 {len(b['members'])} 个成员,只解析了 {b['member']}:可能是分片")
     out.append(_store_line({**r, "note": ""}).replace("  ", "  将写:", 1)
                + "(探针未写 item_id;台账停在 ready,去掉 probe 重跑直接下载)")
     return out

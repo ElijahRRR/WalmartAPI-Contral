@@ -8,6 +8,9 @@
 
 import contextlib
 import inspect
+import io
+import pathlib
+import zipfile
 
 import pytest
 
@@ -262,6 +265,10 @@ def test_probe_downloads_but_never_writes(monkeypatch):
     assert log["written"] == {} and log["applied"] == []
     assert r["sample"][0] == ("A", "11", "11") and r["publish"] and "header" in r
     assert log["downloaded"] == [(7, 3)]                 # 台账停在 ready + 已下载
+    # 原件留存(conftest 已把 reports_dir 指到临时目录)+ 体检 dict
+    assert r["blob"]["bytes"] == 4 and r["blob"]["member"] is None
+    assert pathlib.Path(r["blob"]["dump"]).read_bytes() == b"blob"
+    assert any("原件 4 字节" in ln for ln in wf._probe_lines(r))
 
 
 def test_create_failure_marks_ledger_and_raises_for_serial_retry(monkeypatch):
@@ -559,3 +566,33 @@ def test_reports_calls_log_walmart_quota_headers(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="api.reports"):
         list(reports.iter_report_requests(STORE, "ITEM"))
     assert any("令牌 5" in r.getMessage() and "下枚 t" in r.getMessage() for r in caplog.records)
+
+
+# ── 2026-09-07 探针第四轮:55 列对上、在架 1490 行却只解析出 1 行 ────────────────────
+
+def _zip_csv(text: str, name: str = "ItemReport.csv") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_report_blob_info_distinguishes_short_file_from_swallowed_rows():
+    """体检要能分清「沃尔玛只给了 1 行」和「引号没闭合把后面全吞进一个字段」。"""
+    good = _zip_csv("SKU,Item ID,Item Page URL\nA,1,u\nB,2,u\nC,3,u\n")
+    info = reports.report_blob_info(good)
+    assert (info["rows"], info["lines"], info["member"]) == (3, 4, "ItemReport.csv")
+    assert info["members"] == [("ItemReport.csv", info["csv_bytes"])]
+    assert reports.parse_report_csv(good)[2]["SKU"] == "C"
+
+    swallowed = _zip_csv("SKU,Item ID,Name\nA,1,\"oops\nB,2,x\nC,3,y\n")
+    info = reports.report_blob_info(swallowed)
+    assert info["rows"] == 1 and info["lines"] == 4          # 换行 4 个却只 1 行
+    assert info["longest_field"] > len("oops")                # 吞进去的都在这个字段里
+    lines = wf._probe_lines({"store": "S", "request_id": "R", "header": ["SKU"], "note": "",
+                             "publish": {}, "lifecycle": {}, "sample": [], "counters": {},
+                             "blob": {**info, "dump": "/tmp/x.zip"}})
+    assert any("引号没闭合" in ln for ln in lines)
+
+    raw = b"SKU,Item ID\nA,1\n"                                 # 裸 CSV 也走同一条路
+    assert reports.report_blob_info(raw)["members"] == [] and reports.parse_report_csv(raw)[0]["SKU"] == "A"

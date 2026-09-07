@@ -124,6 +124,12 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   `reports.status` 撤销);轮询间隔 2 → 5 分钟(60 分钟 12 次 + 兜底单查 ≤2 次 < 18);
   报表族每次响应的 x-current-token-count / x-next-replenishment-time 进日志,真实桶
   大小以它为准、拿到实证再改登记。
+- **探针第四轮(22:05)**:下载通了(downloadReport 限速头:令牌 19 ⇒ 20/hour 桶属实),
+  55 列与 specs 原件一致,但**只解析出 1 行**(在架 1490 行,覆盖率 0%)。分不清是
+  沃尔玛只给了 1 行还是解析吞了:探针改为把原件留存到
+  `<DATA_ROOT>/reports/item_report_<店>_<requestId>.zip`,并打印体检行(zip 成员 /
+  CSV 换行数 / 解析行数 / 首行最长字段),换行数远大于行数即引号没闭合把文件吞进了
+  一个字段。待原件核对后再定。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

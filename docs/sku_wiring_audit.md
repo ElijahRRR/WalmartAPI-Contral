@@ -61,6 +61,13 @@
 > 那两处判型代码(db_init 回填 INSERT 删除,sources_backfill 改成只登记不猜,人工归类走
 > sources_reclassify);G-5 按所有者决定**删掉代际上限**(不筛原因,而是整道闸不要);
 > G-7 变体组 ID 留待变体分组那一批。全量测试 3048 passed / 48 skipped。
+>
+> **2026-09-07 更新:G-7 已修**(所有者定稿三条,落地与验收步骤见
+> `docs/sku_plan.md` §9.13)。变体组 ID 改成不透明组号,身份过新登记表
+> `catalog.variant_groups`((店, 家族键) → 组号,唯一发号出口
+> `services/sku_codec.mint_group_code`);存量 `vg_…` 组不回改、原样登记沿用;
+> `variant_group.group_id` 改名 `family_key` 并去掉 `vg_` 前缀,**家族键只当查表键、
+> 永不发给沃尔玛**。守门:变体组表的 INSERT 单一出口 + 代码里 `vg_` 字面量绝迹。
 
 | # | 位置 | 事实 | 后果 | 修法(工作量) |
 |---|---|---|---|---|
@@ -70,7 +77,7 @@
 | G-4 | workflows/sku_migrate.py:586 | `_sync_sheet` 按 (店, ASIN) 反查上架表行,同店同 ASIN 多行只留最后一行 | 新码写到另一行,原行 SKU 列停在旧码,两边不报错 | 改按 (店, 旧码) 用 row_sku 定位(小) |
 | G-5 | workflows/list_new.py:377-383 | 代际上限 `_SQL_ABANDONED_GEN` 不筛 abandoned_reason | sku_migrate 一次成功 + 两次回滚就让该 (店, ASIN) 永久「换码次数达上限」 | 只数烧号类原因(小;先请所有者确认语义) |
 | G-6 | refdata/schema.sql:320 vs workflows/sources_backfill.py:50 | 注释说「同一条口径」,实际 `^B0[A-Z0-9]{8}$` 与 `^B[0-9A-Z]{9}$` 不等;守门只钉锚点 | 两处对同一批旧串判型不同 | 统一成一条,守门钉逐字相等(小) |
-| G-7 | services/variant_group.py:150-156 + services/mp_conform.py:587 | 变体家族的 variantGroupId 仍是 `vg_<parent ASIN>` 明文发给沃尔玛;单品口径已换新码 | **目标级漏洞**:变体品仍能从沃尔玛侧看出 ASIN(sku_plan §8 已列为转出项) | 组 ID 改由 mint 出的家族码派生;变体分组本身是后置项,与所有者定时点 |
+| G-7 ✅ | services/variant_group.py:150-156 + services/mp_conform.py:587 | 变体家族的 variantGroupId 仍是 `vg_<parent ASIN>` 明文发给沃尔玛;单品口径已换新码 | **目标级漏洞**:变体品仍能从沃尔玛侧看出 ASIN(sku_plan §8 已列为转出项) | **2026-09-07 已修**:组号由 `catalog.variant_groups` 发号(不是从 ASIN 派生、也不是哈希),家族键只当查表键 —— 见 sku_plan §9.13 |
 
 ### 2.2 可观测性与语义(下一批)
 

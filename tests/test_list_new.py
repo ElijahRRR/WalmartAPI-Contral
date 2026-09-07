@@ -2,6 +2,8 @@
 
 import contextlib
 
+import pytest
+
 from api import feishu
 from registry import resources
 from registry.resources import Spreadsheet
@@ -2040,6 +2042,9 @@ def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None):
     def _no(*a, **k):
         raise AssertionError("dry-run 不许写库/不许提交")
     monkeypatch.setattr(ln.sku_codec, "mint", _no)
+    # 变体组发号同样是写库(catalog.variant_groups 的唯一 INSERT 出口),
+    # 空跑一次都不许调 —— 位置保证靠这条断言,不靠"我记得它在 _prep_rows 里"
+    monkeypatch.setattr(ln.sku_codec, "mint_group_code", _no)
     monkeypatch.setattr(ln.upc_pool, "claim", _no)
     monkeypatch.setattr(ln.listing_sources, "register", _no)
     monkeypatch.setattr(ln.feeds, "submit_feed", _no)
@@ -2103,6 +2108,196 @@ def test_code_is_committed_before_any_feed_call(monkeypatch):
     ln.run({"execute": True})
     assert trace.count("mint") == 2 and trace.count("submit") == 2
     assert trace[:2] == ["mint", "mint"], trace   # 抽码全在提交之前
+
+
+# ── 变体组号改不透明码(2026-09-07 所有者定稿三条,sku_plan §9.13)──────────
+#
+# 组号从 `vg_<父 ASIN>` 改成登记表发的不透明码之后,发号点与抽码点同处一室:
+# `_prep_rows` 的那个抽码事务。三条硬理由与 SKU mint 逐条相同(不进 _one_store /
+# 单事务顺序 / 排在任何外部调用之前),下面三条用例分别钉发号、空跑、分组键。
+
+
+class _VarConn:
+    """`_prep_rows` 那个抽码事务的假连接(mint 与 mint_group_code 都被桩掉,
+    这里只要能当上下文管理器用)。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sql = sql
+
+    def fetchall(self):
+        return []
+
+
+def _variant_row(rownum, asin, color, store="T1", fkey="B0PARENT01"):
+    """一行**已决策为变体**的待提交行(组号此刻恒空:发号在 _prep_rows)。"""
+    return {**_sheet_row(rownum, store=store, asin=asin),
+            "_p": {**_PRODUCT_OK, "asin": asin},
+            "_price": 20.0, "_qty": 5,
+            "_vplan": {"mode": "variant", "code": "variant", "reason": "",
+                       "group_id": "", "family_key": fkey,
+                       "attr_pairs": [("color", color)], "unmapped_dims": [],
+                       "family_size": 3, "is_primary": rownum == 2}}
+
+
+def test_group_code_is_minted_once_per_family_in_the_prep_transaction(monkeypatch):
+    """★ 同一家族本轮几行**只发一次号**,结果写回**每一行**。
+
+    每行各发一次也能得到同一个号((store, family_key) 是主键),但那会白跑几次
+    INSERT,而且掩盖"一族一号"这条语义;更要紧的是:发号必须在 `_prep_rows` 的
+    抽码事务里,与 SKU mint 同处一室 —— 挪进 `_one_store` 的话,店级失败的串行
+    补试会重发一次号,载荷不再一字不差 ⇒ payload_key 在途防重不命中 ⇒ 双上架。
+    """
+    rows = [_variant_row(2, "B0VARIANT1", "Black"),
+            _variant_row(3, "B0VARIANT2", "Navy"),
+            _variant_row(4, "B0OTHERFAM", "Red", fkey="B0PARENT02")]
+    seen = []
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([_VarConn()])))
+    monkeypatch.setattr(ln.sku_codec, "mint",
+                        lambda conn, store, st_, key, *, workflow:
+                            "A" + key[-6:].upper().rjust(11, "X"))
+
+    def fake_group(conn, store, family_key, *, workflow, existing=""):
+        seen.append((store, family_key, workflow, existing))
+        return "G" + str(len(seen)).rjust(11, "X")
+    monkeypatch.setattr(ln.sku_codec, "mint_group_code", fake_group)
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln, "_map_llm",
+                        lambda c, pt, spec, p, stats=None:
+                            ({"productName": p["title"]}, {}))
+    monkeypatch.setattr(ln.mp_mapper, "build_orderable", lambda *a, **k: {})
+    plans = []
+    monkeypatch.setattr(ln.mp_conform, "conform",
+                        lambda *a, **k: (plans.append(k.get("variant")),
+                                         (a[2], a[3], [], []))[1])
+
+    ok, reasons, _cnt = ln._prep_rows(rows, {"T1": "P"}, 2)
+
+    # 一族一次,workflow 与 existing 都按契约传
+    assert seen == [("T1", "B0PARENT01", "list_new", ""),
+                    ("T1", "B0PARENT02", "list_new", "")]
+    assert [r["_vplan"]["group_id"] for r in rows] == ["GXXXXXXXXXX1",
+                                                       "GXXXXXXXXXX1",
+                                                       "GXXXXXXXXXX2"]
+    assert len(ok) == 3 and not reasons
+    # 一致化拿到的就是发号之后那份决策(不是发号前的空号)
+    assert all(p and p["group_id"] for p in plans), plans
+    # 组号里不许出现 ASIN / 家族键(目标级断言)
+    assert all("B0PARENT" not in r["_vplan"]["group_id"] for r in rows)
+
+
+def test_an_existing_listed_group_is_passed_through_to_the_mint(monkeypatch):
+    """存量组**不回改**:本店同族在架成员的组号由 `_variant_plan` 查回来,
+    `_prep_rows` 原样交给 mint_group_code 的 `existing=` 去登记(定稿第 2 条)。
+
+    不传的话,已经在架的那一族会被发一个新号,新成员进新组、老成员留老组 ——
+    沃尔玛侧看起来就是两个变体组,而且没有任何报错。
+    """
+    rows = [_variant_row(2, "B0VARIANT1", "Black")]
+    rows[0]["_vplan"]["group_id"] = "vg_B0PARENT01"      # 在架兄弟的存量号
+    seen = []
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([_VarConn()])))
+    monkeypatch.setattr(ln.sku_codec, "mint",
+                        lambda conn, store, st_, key, *, workflow: "A" + "X" * 11)
+
+    def fake_group(conn, store, family_key, *, workflow, existing=""):
+        seen.append(existing)
+        return existing or "GX7QM2X9RT4W"
+    monkeypatch.setattr(ln.sku_codec, "mint_group_code", fake_group)
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.pt_spec, "orderable_spec", lambda: {})
+    monkeypatch.setattr(ln, "_map_llm",
+                        lambda c, pt, spec, p, stats=None:
+                            ({"productName": p["title"]}, {}))
+    monkeypatch.setattr(ln.mp_mapper, "build_orderable", lambda *a, **k: {})
+    monkeypatch.setattr(ln.mp_conform, "conform",
+                        lambda *a, **k: (a[2], a[3], [], []))
+    ln._prep_rows(rows, {"T1": "P"}, 1)
+    assert seen == ["vg_B0PARENT01"]
+    assert rows[0]["_vplan"]["group_id"] == "vg_B0PARENT01"
+
+
+def test_a_variant_row_without_a_group_code_stops_the_round(monkeypatch):
+    """★ 发号后仍没有组号 ⇒ **当场炸**,不许静默退单品。
+
+    静默退单品的后果是分裂的:一族里先上的几个进了组、后上的几个各自单品,
+    而且全程不报错。载荷层(mp_conform)另有一道同样的拦截,两道都要在 ——
+    这一道拦"我们自己漏发了",那一道拦"上游给了半份决策"。
+    """
+    rows = [_variant_row(2, "B0VARIANT1", "Black")]
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([_VarConn()])))
+    monkeypatch.setattr(ln.sku_codec, "mint",
+                        lambda conn, store, st_, key, *, workflow: "A" + "X" * 11)
+    monkeypatch.setattr(ln.sku_codec, "mint_group_code",
+                        lambda conn, store, fkey, *, workflow, existing="": "")
+    with pytest.raises(RuntimeError, match="变体行发号后仍无组号"):
+        ln._prep_rows(rows, {"T1": "P"}, 1)
+
+
+def test_the_three_group_functions_key_on_the_family_not_the_code(monkeypatch):
+    """★ 三个分组函数按**家族键**分组:组号此刻还没发,恒空。
+
+    按组号分组的话,本轮所有变体行会并进 (店, '') 一桶 —— 于是"组内取值全同"
+    成了跨家族的比较(把不同家族的维度剔光、整批退单品),而"同组只留一个主
+    变体"会跨家族只留一个。两种都不报错。
+    """
+    rows = [_variant_row(2, "B0VARIANT1", "Black"),
+            _variant_row(3, "B0VARIANT2", "Black"),          # 同族,颜色全同
+            _variant_row(4, "B0OTHERFAM", "Red", fkey="B0PARENT02")]
+    ln._drop_degenerate_dims(rows)
+    # 同族两条取值全同 ⇒ 退单品;另一族的独苗**不受牵连**(跨族比较就会被误伤)
+    assert [r["_vplan"]["mode"] for r in rows] == ["single", "single", "variant"]
+    assert rows[0]["_vplan"]["code"] == "no_diff_dim"
+    # 主变体去重同样按家族键:两族各留各的
+    rows2 = [_variant_row(2, "B0VARIANT1", "Black"),
+             _variant_row(3, "B0VARIANT2", "Navy"),
+             _variant_row(4, "B0OTHERFAM", "Red", fkey="B0PARENT02")]
+    for r in rows2:
+        r["_vplan"]["is_primary"] = True
+    ln._dedupe_primary(rows2)
+    prim = {r["asin"] for r in rows2 if r["_vplan"]["is_primary"]}
+    assert prim == {"B0VARIANT1", "B0OTHERFAM"}
+
+
+def test_dry_run_echoes_the_pending_group_code_with_the_family_key(monkeypatch):
+    """空跑逐行回显"组号待发(家族键 …)":所有者的验收问题是"这两个会不会成
+    一组"(2026-08-17),组号还没发的时候,能回答这个问题的只有家族键。
+
+    ⚠ 家族键**只在这里给人看**,一个字都不进载荷(它就是父 ASIN)。
+    dry-run 不写库这条由 `_wire_dry_env` 把 mint_group_code 桩成抛断言钉住。
+    """
+    rows = [_sheet_row(2, store="T1", asin="B0VARIANT1"),
+            _sheet_row(3, store="T1", asin="B0VARIANT2")]
+    products = _wire_dry_env(monkeypatch, rows)
+    for r, color in zip(rows, ("Black", "Navy")):
+        products[r["asin"]].update(
+            variant_attributes=f"color_name={color}",
+            variation_asins=",".join(x["asin"] for x in rows),
+            parent_asin="B0PARENT01")
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {
+        "variantAttributeNames": {"type": "array", "items": {"enum": ["color"]}},
+        "color": {"type": "string"}}})
+    monkeypatch.setattr(ln.db, "pg_conn",
+                        contextlib.contextmanager(
+                            lambda **kw: iter([_VarConn()])))
+    out = ln.run({"execute": False})
+    assert "组号待发(家族键 B0PARENT01)" in out, out
+    assert "vg_" not in out                    # 派生组号那条路已经拆了
 
 
 def test_duplicate_rows_reusing_one_code_are_counted_out_loud(

@@ -670,8 +670,16 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
          冲突重试;顺序几百次单行 INSERT,相对 LLM 那段墙钟可以忽略。
       ③ **排在任何外部调用之前**(防重状态先落库再调接口):这段随 with 退出
          就 commit,进程半路死掉重跑拿到的是同一个码。
+    **变体组号也在这里发**(2026-09-07 所有者定稿三条,sku_plan §9.13):同一个
+    抽码事务里,按 (店, 家族键) 去重、每族一次 `sku_codec.mint_group_code`。
+    三条硬理由与 SKU mint **逐条相同**:① 不进 `_one_store`(补试重发号 ⇒ 载荷
+    漂 ⇒ payload_key 防重不命中 ⇒ 双上架);② 单事务顺序做一遍(worker 是
+    autocommit 连接,并发抢同一个 (store, family_key) 主键只会制造唯一冲突重试);
+    ③ 排在任何外部调用之前(防重状态先落库再调接口,重跑拿回同一个组号)。
+
     dry-run 走不到这里(`run()` 的 `if not execute:` 早已 return),所以本函数
-    里没有、也不许有 dry-run 分支;空跑要看码走 `sku_codec.DRYRUN_PLACEHOLDER`。
+    里没有、也不许有 dry-run 分支;空跑要看码走 `sku_codec.DRYRUN_PLACEHOLDER`,
+    看组号走逐行回显的"组号待发(家族键 …)"。
     **`r["_sku"]` 不许有任何 `or r["asin"]` 兜底** —— 那正是"静默把 ASIN 当
     SKU 发出去"的制造机;缺了就该 KeyError 炸在测试里。
     """
@@ -687,6 +695,32 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
             r["_sku"] = sku_codec.mint(conn, r["store"],
                                        listing_sources.SOURCE_AMZ, r["asin"],
                                        workflow="list_new")
+        # 变体组发号:同一事务、同样排在外部调用之前(理由见本函数头注三条)。
+        # 按 (店, 家族键) 去重 —— 同族本轮几行只发一次号,再写回每一行:
+        # 每行各发一次的话,(store, family_key) 主键会让后来的行拿到第一行那个号
+        # (结果正确),但白跑几次 INSERT,而且掩盖"一族一号"这条语义
+        fams: dict[tuple[str, str], list[dict]] = {}
+        for r in sorted(ready, key=lambda x: x["rownum"]):
+            vp = r.get("_vplan")
+            if vp and vp.get("mode") == "variant" and vp.get("family_key"):
+                fams.setdefault((r["store"], vp["family_key"]), []).append(r)
+        for (store, fkey), rows_ in sorted(fams.items()):
+            # existing = 本店同族**在架成员**现有的组号(_variant_plan 查来的,
+            # 含存量 vg_…):有它就原样登记、不回改(所有者定稿第 2 条)
+            existing = next((str(r["_vplan"].get("group_id") or "")
+                             for r in rows_ if r["_vplan"].get("group_id")), "")
+            code = sku_codec.mint_group_code(conn, store, fkey,
+                                             workflow="list_new",
+                                             existing=existing)
+            for r in rows_:
+                r["_vplan"] = {**r["_vplan"], "group_id": code}
+    # 发号后仍为空 = 上游漏发,**不许静默退单品**:那会让一族里先上的几个进了组、
+    # 后上的几个各自单品,而且没有任何报错(mp_conform 那侧另有一道同样的拦截)
+    bad = [r["asin"] for r in ready
+           if (r.get("_vplan") or {}).get("mode") == "variant"
+           and not (r["_vplan"].get("group_id") or "").strip()]
+    if bad:
+        raise RuntimeError(f"变体行发号后仍无组号:{bad[:5]}(共 {len(bad)} 行)")
     n_codes = len({r["_sku"] for r in ready})
     if n_codes < len(ready):
         # 同 (店, ASIN) 贴重了两行 ⇒ mint 复用同一个码。两个随机码相同不像两个
@@ -704,8 +738,9 @@ def _prep_rows(ready: list[dict], partners: dict[str, str], workers: int
         # conform 的 sku= 会被 mp_conform 当作单品占位 variantGroupId 写进
         # Visible —— 只改一处会出现「Orderable.sku 是新码、variantGroupId 还是
         # ASIN」的半身像,而 variantGroupId 也是发出去的,等于把 ASIN 从后门递
-        # 出去。⚠ 这只修好**单品**口径:变体品的 variantGroupId 仍由
-        # services/variant_group 从 parent ASIN 派生(sku_plan §8 待决项)。
+        # 出去。⚠ **变体品的 variantGroupId 2026-09-07 也换成了不透明组号**
+        # (sku_plan §9.13):它在上面那个抽码事务里由
+        # sku_codec.mint_group_code 按家族键发/查,ASIN 不再从这条线外递。
         # 下面 logger / _dump_llm_debug 仍打 r["asin"]:那是给人看的定位键
         orderable = mp_mapper.build_orderable(
             r["_sku"], _UPC_PLACEHOLDER, r["_price"], r["_qty"],
@@ -855,8 +890,11 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
     ② 分配侧保证「一组变体只分配一个店」⇒ **只查本店**,不做跨店重定向。
 
     ⚠ 查库失败不许把整行拖下水:变体只是锦上添花,拿不到在架信息就按"本店还没有
-    同族"处理 —— 派生 ID 照样能让以后的兄弟归到一起(group_id 由 parent_asin
-    决定,不依赖这次查询)。
+    同族"处理 —— 家族键由 parent_asin 决定、不依赖这次查询,发号那一步照样会去
+    `catalog.variant_groups` 查表,以后的兄弟仍归得到一起(2026-09-07 起自动合并
+    靠登记表,不靠派生同一个串)。**代价**:本店确实有在架同族、而这次没查到时,
+    登记表里也没有行的话会给这一族发一个新号 —— 与改造前"派生 ID 照样对得上"
+    相比,这是唯一变差的一格,由 `_FAMILY_LISTED_SQL` 的可靠性兜住。
     """
     p = r.get("_p") or {}
     fam = variant_group.parse_family(p.get("variation_asins"), r["asin"])
@@ -950,11 +988,14 @@ def _drop_degenerate_dims(ready: list[dict]) -> None:
     for r in ready:
         vp = r.get("_vplan")
         if vp and vp.get("mode") == "variant" and vp.get("attr_pairs"):
-            by_group.setdefault((r.get("store"), vp.get("group_id")),
+            # ⚠ 分组键是**家族键**不是组号(2026-09-07):组号此刻多半还没发
+            # (发号在 _prep_rows 的抽码事务里),按空组号分组会把不同家族的行
+            # 全并进一桶,然后"组内取值全同"就成了跨家族的比较
+            by_group.setdefault((r.get("store"), vp.get("family_key")),
                                 []).append(r)
-    for (store, gid), rows in sorted(by_group.items(),
-                                     key=lambda kv: (str(kv[0][0]),
-                                                     str(kv[0][1]))):
+    for (store, fkey), rows in sorted(by_group.items(),
+                                      key=lambda kv: (str(kv[0][0]),
+                                                      str(kv[0][1]))):
         if len(rows) < 2:
             continue                     # 一条判不出组内差异,不动
         names = [n for n, _ in rows[0]["_vplan"]["attr_pairs"]]
@@ -963,9 +1004,9 @@ def _drop_degenerate_dims(ready: list[dict]) -> None:
                     for r in rows if name in dict(r["_vplan"]["attr_pairs"])}
             if len(vals) > 1:
                 continue
-            logger.warning("变体组 %s(%s)的维度 %s 在本轮 %d 个成员上取值全同"
+            logger.warning("变体家族 %s(%s)的维度 %s 在本轮 %d 个成员上取值全同"
                            "(%s),剔掉 —— 声明了没有差异的维度等于没声明",
-                           gid, store, name, len(rows), vals)
+                           fkey, store, name, len(rows), vals)
             for r in rows:
                 vp = r["_vplan"]
                 r["_vplan"] = {**vp, "attr_pairs": [
@@ -1016,15 +1057,16 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
         if not vp or not vp.get("unmapped_dims"):
             continue
         if vp.get("mode") == "variant" or vp.get("code") == "no_dim":
-            groups.setdefault((r.get("store"), vp.get("group_id")),
+            # 分组键同 _drop_degenerate_dims:家族键(组号此刻还没发)
+            groups.setdefault((r.get("store"), vp.get("family_key")),
                               []).append(r)
     if not groups:
         return
     with contextlib.ExitStack() as stack:
         conn = None
-        for (store, gid), rows in sorted(groups.items(),
-                                         key=lambda kv: (str(kv[0][0]),
-                                                         str(kv[0][1]))):
+        for (store, fkey), rows in sorted(groups.items(),
+                                          key=lambda kv: (str(kv[0][0]),
+                                                          str(kv[0][1]))):
             pt = rows[0].get("product_type") or ""
             spec = pt_spec.load_pt(pt) or {}
             enum = mp_conform.variant_attr_enum(spec.get("properties") or {})
@@ -1039,7 +1081,7 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
                     continue            # 有成员没这个维度,不是整组的共同维度
                 if len(rows) > 1 and len({str(v) for v in values.values()}) < 2:
                     _mark(rows, "degenerate_dims", dim)
-                    logger.info("变体组 %s 的 %s 取值全同,不送重映射", gid, dim)
+                    logger.info("变体家族 %s 的 %s 取值全同,不送重映射", fkey, dim)
                     continue
                 # 先试内置表(零成本、确定性),表不中且本轮看得见 ≥2 个成员
                 # 才开连接问 LLM —— 连接**在表命中时一次都不开**。
@@ -1057,8 +1099,8 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
                 name, vals = got
                 if name in used:
                     # 已被别的维度占了:两个维度写同一个属性名 = 载荷自相矛盾
-                    logger.info("变体组 %s 的 %s 重映到 %s,但该属性已被占用,跳过",
-                                gid, dim, name)
+                    logger.info("变体家族 %s 的 %s 重映到 %s,但该属性已被占用,跳过",
+                                fkey, dim, name)
                     continue
                 used.add(name)
                 for r in rows:
@@ -1130,19 +1172,20 @@ def _dedupe_primary(ready: list[dict]) -> None:
     for r in ready:
         vp = r.get("_vplan")
         if vp and vp.get("mode") == "variant" and vp.get("is_primary"):
-            by_group.setdefault((r.get("store"), vp.get("group_id")),
+            # 分组键同上:家族键(组号在 _prep_rows 才发,这里恒空)
+            by_group.setdefault((r.get("store"), vp.get("family_key")),
                                 []).append(r)
-    for (store, gid), rows in sorted(by_group.items(),
-                                     key=lambda kv: (str(kv[0][0]),
-                                                     str(kv[0][1]))):
+    for (store, fkey), rows in sorted(by_group.items(),
+                                      key=lambda kv: (str(kv[0][0]),
+                                                      str(kv[0][1]))):
         if len(rows) < 2:
             continue
         keep = min(rows, key=lambda x: x["asin"])
         for r in rows:
             if r is not keep:
                 r["_vplan"] = {**r["_vplan"], "is_primary": False}
-        logger.info("变体组 %s(%s)本轮 %d 个新成员都判了主变体,"
-                    "保留 %s 一个", gid, store, len(rows), keep["asin"])
+        logger.info("变体家族 %s(%s)本轮 %d 个新成员都判了主变体,"
+                    "保留 %s 一个", fkey, store, len(rows), keep["asin"])
 
 
 def _variant_echo(vp: dict | None) -> str:
@@ -1157,7 +1200,11 @@ def _variant_echo(vp: dict | None) -> str:
     if vp.get("mode") != "variant":
         return f" |单品口径({vp.get('reason') or vp.get('code')})"
     pairs = ",".join(f"{n}={v}" for n, v in (vp.get("attr_pairs") or ()))
-    out = (f" |变体组 {vp.get('group_id')} 按 {pairs}"
+    # 组号在预备期的抽码事务里才发(dry-run 根本走不到那里),空跑时这里恒空 ——
+    # 回显家族键让所有者仍能一眼看出"这几行会不会成一组",但**发出去的绝不是它**
+    gid = (str(vp.get("group_id") or "").strip()
+           or f"组号待发(家族键 {vp.get('family_key')})")
+    out = (f" |变体组 {gid} 按 {pairs}"
            f",家族 {vp.get('family_size')} 个"
            f",{'主' if vp.get('is_primary') else '非主'}变体")
     if vp.get("unmapped_dims"):
@@ -1180,6 +1227,8 @@ def _spec_precheck(ready: list[dict]) -> str:
     被调到,而空跑绝不许写库(mint 是写库函数,同事务登记)。占位码含 `0`,
     不在字母表里 ⇒ `is_opaque` 恒 False,形态上就不可能被当成真码。
     抬头行说破"这是占位的",免得它看起来像真发出去的那个串。
+    变体组号同理走 `sku_codec.DRYRUN_GROUP_PLACEHOLDER`(mint_group_code 也是写库
+    函数,空跑不调);逐行回显那边报的是"组号待发(家族键 …)"。
     """
     ph = sku_codec.DRYRUN_PLACEHOLDER
     lines = [f"  spec 预检(不领 UPC/不提交;sku 用占位码 {ph},"
@@ -1197,10 +1246,16 @@ def _spec_precheck(ready: list[dict]) -> str:
             orderable = mp_mapper.build_orderable(
                 ph, _UPC_PLACEHOLDER, r["_price"], r["_qty"], "0",
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
+            vp = _variant_plan(conn, r.get("store") or "", r, spec)
+            if vp and vp.get("mode") == "variant" and not vp.get("group_id"):
+                # 组号真跑时才发(mint_group_code 是写库函数,空跑不许调),这里
+                # 只给载荷一个形态合法的占位串走完一致化。**只填副本**,
+                # r["_vplan"] 一个字都不动 —— 动了,逐行回显就会把占位串当成
+                # 真发出去的组号报给所有者
+                vp = {**vp, "group_id": sku_codec.DRYRUN_GROUP_PLACEHOLDER}
             _v, _o, notes, missing = mp_conform.conform(
                 spec, pt_spec.orderable_spec(), visible, orderable,
-                sku=ph,
-                variant=_variant_plan(conn, r.get("store") or "", r, spec))
+                sku=ph, variant=vp)
             if missing:
                 lines.append(f"    ✗ {r['asin']} 必填缺失 {len(missing)}:"
                              f"{','.join(missing[:8])}")

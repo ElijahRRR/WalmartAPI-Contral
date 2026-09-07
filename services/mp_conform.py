@@ -555,7 +555,17 @@ def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
     ③ 取值要过该属性的 enum / 类型(string enum、integer、number)。
     剔到一个不剩才整套退单品 —— 只发 variantAttributeNames 而没有对应的差异值,
     等于告诉沃尔玛"我们按颜色分组"却不说自己是什么颜色。
+
+    ⚠ **组号为空一律不发**(2026-09-07,组号改不透明码之后补的一道):组号从
+    `catalog.variant_groups` 发号而来(list_new 的抽码事务里,唯一出口
+    `sku_codec.mint_group_code`),上游漏发时 `plan["group_id"]` 是空串 ——
+    照发就是一个空 variantGroupId,沃尔玛侧要么整条被拒、要么把它当成一个"空号
+    组"把不相干的品并进去。这里整套按单品口径处理并点名,不猜也不派生。
     """
+    if not str(plan.get("group_id") or "").strip():
+        for k in in_spec:
+            visible.pop(k, None)
+        return None, ["变体组号缺失(上游未发号),退单品口径"]
     enum = variant_attr_enum(props)
     allowed = {str(e) for e in enum} if enum else None
     kept: list[tuple[str, object]] = []

@@ -59,6 +59,10 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
   **弃码唯一实现 `services/sku_codec.abandon`,弃码点只有四个**(删除经观测核验 /
   SKU_LOCKED 退役 + 冷却 / UPC 撞库 / 改码),其余一切下架都不弃码;
   发码只有 `sku_codec.mint`,冷却与代际两个常量也只在那里出生(展开见 §九)。
+- **变体组号同理**(2026-09-07):唯一出生地 `sku_codec.mint_group_code`,
+  `catalog.variant_groups` 的 INSERT 只有它一个出口、行永不 DELETE;家族键
+  (`variant_group.family_key`)只当查表键**永不外发**,不许拼 `vg_`、不许拿 ASIN
+  取哈希;存量 `vg_` 组原样登记不回改(展开见 §九⑩′、sku_plan §9.13)。
 - **每个能力只有一条实现路径**(双轨禁止);真兜底三要件:同函数内、触发记
   日志计数、条件明确非 catch-all(§六)。
 - **services 新增积木前先通读现有函数查重**;docstring 首行写"输入→输出"。

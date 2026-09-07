@@ -49,9 +49,12 @@ class _Conn:
     """脚本化的假连接:按 SQL 形状路由,每种查询的返回值由构造参数排队给出。"""
 
     def __init__(self, live=None, minted=None, abandon_row=None, rowcount=1,
-                 old_row=None, pending=None, marked=True, cleared=True):
+                 old_row=None, pending=None, marked=True, cleared=True,
+                 groups=None, group_minted=None):
         self.live = list(live or [])          # 每次复用查询的返回值(元组或 None)
         self.minted = list(minted or [])      # 每次 INSERT 是否拿到行(bool)
+        self.groups = list(groups or [])      # 变体组:每次查表的返回值(元组或 None)
+        self.group_minted = list(group_minted or [])   # 变体组:每次 INSERT 是否拿到行
         self.abandon_row = abandon_row        # UPDATE ... RETURNING 的那一行
         self.old_row = old_row                # 改码:旧行现状(replaced_by, abandoned_at, 来源, 源头键)
         self.pending = list(pending or [])    # 改码:在途新码查询的返回值(元组或 None)
@@ -70,7 +73,12 @@ class _Conn:
 
     def route(self, sql, args):
         s = sql.strip()
-        if s.startswith("SELECT sku FROM catalog.listing_sources"):
+        if s.startswith("SELECT group_code FROM catalog.variant_groups"):
+            self.next_row = self.groups.pop(0) if self.groups else None
+        elif "INSERT INTO catalog.variant_groups" in s:
+            ok = self.group_minted.pop(0) if self.group_minted else True
+            self.next_row = (args[2],) if ok else None      # RETURNING group_code
+        elif s.startswith("SELECT sku FROM catalog.listing_sources"):
             self.next_row = self.live.pop(0) if self.live else None
         elif s.startswith("SELECT replaced_by"):
             self.next_row = self.old_row
@@ -91,6 +99,10 @@ class _Conn:
     def inserts(self):
         return [args for sql, args in self.calls
                 if isinstance(sql, str) and "INSERT INTO catalog.listing_sources" in sql]
+
+    def group_inserts(self):
+        return [args for sql, args in self.calls
+                if isinstance(sql, str) and "INSERT INTO catalog.variant_groups" in sql]
 
     def updates(self, needle: str):
         return [args for sql, args in self.calls
@@ -247,6 +259,95 @@ def test_mint_refuses_an_unmapped_source_type():
     出去,码的首位从此对不上来源,而且不报错。"""
     with pytest.raises(ValueError, match="SKU_SOURCE_LETTERS"):
         sku_codec.mint(_Conn(), "T1", "unknown", "X", workflow="list_new")
+
+
+# ── mint_group_code(变体组号,2026-09-07 所有者定稿三条)────────────────────
+
+def test_mint_group_code_returns_the_registered_code_without_drawing():
+    """① 登记表是权威:同 (店, 家族键) 已有行就返回它,一次号都不抽。
+
+    这条就是"分批上架的兄弟并进同一个组"的全部机制 —— 组号不透明之后,不能
+    再靠同族各自派生出同一个串(那个串是父 ASIN,等于把 ASIN 递给沃尔玛)。
+    """
+    conn = _Conn(groups=[("GX7QM2X9RT4W",)])
+    got = sku_codec.mint_group_code(conn, "T1", "B0FAMILY001",
+                                    workflow="list_new")
+    assert got == "GX7QM2X9RT4W"
+    assert conn.group_inserts() == []                 # 一次都没抽
+    assert conn.calls[0][1] == ("T1", "B0FAMILY001")  # 查的是 (店, 家族键)
+
+
+def test_mint_group_code_registers_an_existing_legacy_group_as_is():
+    """② 存量组**不回改**(所有者定稿第 2 条):在架成员现有的 `vg_…` 原样登记。
+
+    登记之后这一族的延续不再依赖那个成员是否还在架 —— 不登记的话,那个成员
+    哪天被删/缺席,下一个兄弟就会拿到一个新号,同一族被劈成两个变体组。
+    """
+    conn = _Conn(groups=[None])
+    got = sku_codec.mint_group_code(conn, "T1", "B0FAMILY002",
+                                    workflow="list_new",
+                                    existing="vg_B000AMXQVI")
+    assert got == "vg_B000AMXQVI"                     # 原样,不抽新号
+    assert conn.group_inserts() == [("T1", "B0FAMILY002", "vg_B000AMXQVI",
+                                     "list_new")]
+
+
+def test_mint_group_code_draws_a_new_opaque_code_for_a_new_family():
+    """③ 都没有 ⇒ 抽新号:首字母是 registry 登记的组号字母,后接 11 位随机段。
+
+    抽号与登记同一函数同一事务(与 mint 同纪律):"抽了没登记"这种中间态一旦
+    存在,同一族下一轮会再抽一个号,而两个号都已经发给沃尔玛了。
+    """
+    conn = _Conn(groups=[None])
+    code = sku_codec.mint_group_code(conn, "T1", "B0FAMILY003",
+                                     workflow="list_new")
+    assert sku_codec.is_opaque(code)
+    assert code[0] == resources.VARIANT_GROUP_LETTER
+    assert "B0FAMILY003" not in code                  # 家族键不进组号
+    assert conn.group_inserts() == [("T1", "B0FAMILY003", code, "list_new")]
+    assert "ON CONFLICT DO NOTHING" in conn.calls[1][0]
+    assert conn.commits == 0            # 积木不自己 commit(事务边界归调用方)
+
+
+def test_mint_group_code_returns_the_other_process_code_on_a_conflict(caplog):
+    """并发双发号:INSERT 落空后重查登记表,查到就返回**对方那个号**。
+
+    与 mint 同款的两分支处置(不做 catch-all):合成一条会把并发诊断成随机源
+    故障 —— 那时会连撞 `_MAX_DRAWS` 次(对方那行一直在)最后报"查随机源"。
+    """
+    import logging
+    before = sku_codec._concurrent_group_mint
+    conn = _Conn(groups=[None, ("GOTHER234567",)], group_minted=[False])
+    with caplog.at_level(logging.WARNING, logger="services.sku_codec"):
+        got = sku_codec.mint_group_code(conn, "T1", "B0FAMILY004",
+                                        workflow="list_new")
+    assert got == "GOTHER234567"
+    assert len(conn.group_inserts()) == 1             # 抽一次就认输复用
+    assert sku_codec._concurrent_group_mint == before + 1
+    assert any("并发变体组发号" in m for m in caplog.messages)
+
+
+def test_mint_group_code_redraws_on_a_random_collision_then_raises_loudly():
+    """真·随机撞号(重查登记表仍没有本族的行)才重抽;抽满上限还撞就抛错。
+
+    静默兜底会让一个坏掉的随机源持续发出重复组号,而重复组号 = 两个家族被
+    并进沃尔玛侧同一个变体组。
+    """
+    before = sku_codec._group_redraws
+    conn = _Conn(group_minted=[False] * sku_codec._MAX_DRAWS)
+    with pytest.raises(RuntimeError, match="撞号"):
+        sku_codec.mint_group_code(conn, "T1", "B0FAMILY005",
+                                  workflow="list_new")
+    assert len(conn.group_inserts()) == sku_codec._MAX_DRAWS
+    assert sku_codec._group_redraws == before + sku_codec._MAX_DRAWS
+
+
+def test_mint_group_code_refuses_an_empty_key():
+    """键凑不出就该退单品口径,**不猜**:组号是按 (店, 家族键) 登记的,
+    空键会让所有"凑不出家族"的行共用一个登记行,进而共用一个组号。"""
+    for store, fkey in (("", "B0FAMILY006"), ("T1", ""), ("T1", "   ")):
+        with pytest.raises(ValueError, match="变体组发号缺键"):
+            sku_codec.mint_group_code(_Conn(), store, fkey, workflow="list_new")
 
 
 # ── abandon ──────────────────────────────────────────────────────────────────

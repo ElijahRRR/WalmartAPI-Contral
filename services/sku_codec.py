@@ -48,7 +48,13 @@ match_listing 的预备期,abandon 在四个弃码点)。conventions §五说得
    replaced_at 五列**只准本模块写**(abandon / mint_replacement /
    settle_replacement 三个函数,别处一律不得 UPDATE 登记簿)。
 
-⑥ **改码(批次 3)的三个动作各有一个函数,状态只有三态**:
+⑥ **变体组号也只在本模块出生**(所有者定稿 2026-09-07,sku_plan §9.13):
+   `mint_group_code` 是 `catalog.variant_groups` 的**唯一 INSERT 出口**,该表的行
+   同样**永不 DELETE**。组号与 SKU 是两种身份、两张表,但编码规则同一套(字母表 /
+   随机段长 / 重抽上限都复用上面那几个常量)—— 所以它住在这里,而不是 variant_group。
+   家族键(services/variant_group.family_key 的产出)**只进库当查表键,永不外发**。
+
+⑦ **改码(批次 3)的三个动作各有一个函数,状态只有三态**:
      mint_replacement    —— 先落库:新码行 replaces=旧码 + 旧行 replaced_by=新码
                             (pending;同一事务,commit 归调用方)
      settle_replacement('confirmed')   —— 观测确认:旧行 abandon('sku_update'),
@@ -78,6 +84,10 @@ _MAX_DRAWS = 5                  # 撞码重抽上限:仍撞 = 随机源坏了,�
 #: 空跑占位码:12 位但含 `0`(不在字母表里)⇒ is_opaque 恒 False,永远不会被
 #: 当成真码,也永远落不进那两条部分唯一索引。与 list_new 的 UPC 占位同纪律。
 DRYRUN_PLACEHOLDER = "DRYRUN000000"
+#: 空跑用的**变体组号**占位串:同样 12 位、同样含 `0`(还含 O/U)⇒ is_opaque 恒 False。
+#: 只给 dry-run 的载荷预检用 —— 空跑不调 mint_group_code(写库函数没有空跑模式),
+#: 逐行回显那边报的是"组号待发",这里只是让 conform 有个形态合法的串可以走完。
+DRYRUN_GROUP_PLACEHOLDER = "DRYRUN0GROUP"
 #: `is_opaque()` 在 SQL 侧的**等价表达,唯一出处**(批次 3 地基)。
 #: 由 `_ALPHABET` 与 `_LEN` **派生**,不是手打的第二份正则 —— 手打就是第二个
 #: 字母表之家,而两份一漂,索引/SQL 判据与 Python 判据会对「什么是新码」给出
@@ -141,6 +151,9 @@ _BURN_STATUS = {
 # 模块级计数(排障用:两个分支各记各的,合成一条就分不清并发与随机源故障)
 _concurrent_mint = 0            # 撞的是别的进程刚发的活码键 ⇒ 复用对方的码
 _sku_redraws = 0                # 撞的是主键/全局唯一 ⇒ 真·随机撞码,重抽
+_concurrent_group_mint = 0      # 变体组:另一个进程刚给同一家族发了号 ⇒ 复用对方的
+_group_redraws = 0              # 变体组:撞的是 (店, 组号) 唯一索引 ⇒ 真·随机撞号
+_group_code_shared = 0          # 变体组:存量号已登给别的家族键 ⇒ 沿用不登记
 
 #: 复用查询:同 (店, 来源, 源头键) 已有活码就复用它。**不按形态过滤** ——
 #: 存量 sku=asin 的活行照样复用;条件与 listing_sources_live_uidx /
@@ -167,6 +180,23 @@ INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workfl
 VALUES (%s, %s, %s, %s, %s)
 ON CONFLICT DO NOTHING
 RETURNING sku
+"""
+
+#: 变体组登记簿的查表(权威在表里,不在任何派生规则里)。键是 (店, 家族键) ——
+#: 家族键只进不出,发给沃尔玛的永远是 group_code 这一列。
+_SQL_GROUP_LIVE = """
+SELECT group_code FROM catalog.variant_groups
+WHERE store = %s AND family_key = %s
+"""
+
+#: 变体组发号:与 mint 的 INSERT 同纪律(抽号与登记同一函数同一事务)。
+#: ON CONFLICT 不带 target 同样是故意的:要一次兜住主键 (store, family_key)
+#: 与 (store, group_code) 唯一索引两种冲突,而 target 只能指一个。
+_SQL_MINT_GROUP = """
+INSERT INTO catalog.variant_groups (store, family_key, group_code, workflow)
+VALUES (%s, %s, %s, %s)
+ON CONFLICT DO NOTHING
+RETURNING group_code
 """
 
 #: 改码抽码:与 mint 的 INSERT 同款(ON CONFLICT 不带 target 兜住主键与全局唯一
@@ -307,6 +337,101 @@ def mint(conn, store: str, source_type: str, source_key, *, workflow: str) -> st
             logger.info("随机撞码重抽(%s 已被占用,累计 %d 次)", code, _sku_redraws)
     raise RuntimeError(
         f"连抽 {_MAX_DRAWS} 次都撞码({store}/{source_type}/{source_key}):"
+        f"30^{_RANDOM_LEN} 的空间下这不是运气问题,查随机源")
+
+
+def _group_code(cur, store: str, family_key: str) -> str | None:
+    """输入:游标 + (店, 家族键) → 输出:该家族已登记的组号(没有返 None)。"""
+    cur.execute(_SQL_GROUP_LIVE, (store, family_key))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def mint_group_code(conn, store: str, family_key: str, *, workflow: str,
+                    existing: str = "") -> str:
+    """输入:连接 + 店铺 + 家族键(+ 在架同族的现有组号)→ 输出:发给沃尔玛的组号。
+
+    变体组号从 `vg_<父 ASIN>` 改成不透明码之后,「同族分批上架的兄弟怎么进同一个
+    组」不再能靠各自派生同一个串 —— **必须查表**,这张表就是权威(所有者定稿
+    2026-09-07 第 1 条)。三个分支,按优先级:
+
+    ① `catalog.variant_groups` 已有 (店, 家族键) ⇒ 返回登记的 group_code。
+    ② 没行且 `existing` 非空(调用方从本店同族**在架成员**的
+       `walmart_items.variant_group_id` 拿到的现有组 ID,含存量 `vg_…`)⇒ 把它
+       **原样登记**为该家族的组号并返回(所有者定稿第 2 条:存量组不回改)。
+       登记之后,这一族的延续不再依赖那个成员是否还在架 —— 它哪天被删/缺席,
+       下一个兄弟照样从 ① 拿到同一个号。
+    ③ 都没有 ⇒ 抽新号:`registry.VARIANT_GROUP_LETTER` + 11 位随机段(字母表、
+       随机段长、重抽上限全部复用 SKU 的常量,编码规则只有一份)。
+
+    ③ 的 INSERT 落空同样分两个明确分支(与 mint 同款,不做 catch-all):
+    重跑 ① 查到 ⇒ 另一个进程刚给同一个家族发了号,返回对方那个;仍查不到 ⇒
+    撞的是 (store, group_code) 唯一索引 = 真·随机撞号,重抽,至多 `_MAX_DRAWS` 次。
+
+    ② 的 INSERT 落空只有一种可能:这个 `existing` 在本店**已经登给另一个家族键**了
+    (同一族的家族键随 parent_asin 补全而变过一次,是实见形态)。那时**照样返回
+    `existing`** —— 它就是这批兄弟在沃尔玛侧真实所在的组,换个号发出去反而把一族
+    劈成两组;只是本家族这一行登不进去,下一批还得靠在架成员再带一次。触发记
+    warning + 计数(真兜底三要件),不静默。
+
+    与 mint 同纪律:**没有 dry_run 形参**(写库函数不设"这次不写"模式);抽号与
+    登记同一事务;**commit 归调用方**。空跑由调用方决定不调本函数,用
+    `DRYRUN_GROUP_PLACEHOLDER` 或"组号待发"表达。
+    """
+    global _concurrent_group_mint, _group_redraws, _group_code_shared
+    store = str(store or "").strip()
+    fkey = str(family_key or "").strip()
+    if not store or not fkey:
+        raise ValueError(
+            f"变体组发号缺键(store={store!r}, family_key={fkey!r}):"
+            f"组号是按 (店, 家族键) 登记的,凑不出键就该退单品口径,不猜")
+    letter = resources.VARIANT_GROUP_LETTER
+    with conn.cursor() as cur:
+        have = _group_code(cur, store, fkey)
+        if have:
+            return have
+        ex = str(existing or "").strip()
+        if ex:
+            cur.execute(_SQL_MINT_GROUP, (store, fkey, ex, workflow))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            other = _group_code(cur, store, fkey)
+            if other:
+                _concurrent_group_mint += 1
+                logger.warning(
+                    "并发变体组登记:%s/%s 已被另一进程登记为 %s,复用之(累计 %d 次)",
+                    store, fkey, other, _concurrent_group_mint)
+                return other
+            _group_code_shared += 1
+            logger.warning(
+                "变体组号 %s 在 %s 已登给别的家族键,本家族(%s)登记不进去,"
+                "仍按在架事实沿用该号(累计 %d 次)",
+                ex, store, fkey, _group_code_shared)
+            return ex
+        if letter not in _ALPHABET or not letter.isalpha():
+            raise ValueError(
+                f"变体组首字母 {letter!r} 不合法:必须取自 "
+                f"services.sku_codec._ALPHABET 里的字母(registry 登记的取值)")
+        for _ in range(_MAX_DRAWS):
+            code = letter + "".join(secrets.choice(_ALPHABET)
+                                    for _ in range(_RANDOM_LEN))
+            cur.execute(_SQL_MINT_GROUP, (store, fkey, code, workflow))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            other = _group_code(cur, store, fkey)
+            if other:
+                _concurrent_group_mint += 1
+                logger.warning(
+                    "并发变体组发号:%s/%s 已被另一进程发号 %s,复用之(累计 %d 次)",
+                    store, fkey, other, _concurrent_group_mint)
+                return other
+            _group_redraws += 1
+            logger.info("变体组随机撞号重抽(%s 已被占用,累计 %d 次)",
+                        code, _group_redraws)
+    raise RuntimeError(
+        f"连抽 {_MAX_DRAWS} 次都撞号({store}/{fkey} 的变体组号):"
         f"30^{_RANDOM_LEN} 的空间下这不是运气问题,查随机源")
 
 

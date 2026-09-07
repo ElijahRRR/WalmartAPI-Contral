@@ -1,9 +1,14 @@
-"""L2 硬规则/软证据 + 理由映射向量(spec_vectors B6/B7;旧仓零测试)。
+"""L2 规则(**只剩 R1**)+ 理由映射向量(spec_vectors B6/B7;旧仓零测试)。
 
-ctx 用 SimpleNamespace 鸭子拼装;nice 走真实 refdata yaml(loader 即被测面之一);
-R5 恒关(ctx.uspto=None)。
-⚠ 2026-08-21 起 R3 只看飞书 requirements —— `pt_spec` / `nrtl_*` 三个 ctx 字段
-连同 NRTL 整机/小件分类器一起下线,所以 `_ctx` 不再接 `pt_spec`。
+ctx 用 SimpleNamespace 鸭子拼装 —— C 批之后 L2 的数据依赖只有 `pt_meta` 一个。
+⚠ 2026-09-03 C 批:R3/R5/R7/R8 整条删除、R4/R10 迁进 L0(向量随规则搬到
+`tests/test_audit_phase0.py`),`_infer_walmart_policy` 的四张字面量表随之消失
+—— 政策名是全链唯一键,不许由类目/PT 名/认证关键词推断出来(规格 §二 零推断)。
+⚠ 2026-08-21 起 R3 只看飞书 requirements(`pt_spec` / NRTL 分类器那条链下线),
+"这个产品是不是整机电器"由 L3 看产品本身判 —— C 批把 R3 剩下的那半也交了出去。
+⚠ 2026-09-02 B1:理由映射收敛为**查表**(规则自报 `category` / L3 的 policy),
+归一化那一族(`_normalize_l3_cat` / `_L3_NORMALIZE` / `_pt_to_policy`)整体退役
+—— 政策名归一化只剩 `services/policy_names` 一处实现,测试见 test_policy_names。
 """
 
 from types import SimpleNamespace
@@ -11,22 +16,14 @@ from types import SimpleNamespace
 import pytest
 
 from registry import paths, resources
-from services import audit_l2, audit_reason
-from services.audit_models import AuditOutcome, L1Info, ProductInfo, RuleHit
-
-# 政策表 category_en 的两种形态:改名前(存量缩写名)/ 改名后(官方 42 名)。
-# `_normalize_l3_cat` 的合同是"表里叫什么就回什么",两种形态都要成立。
-_LEGACY_TABLE = tuple(resources.POLICY_LEGACY_NAMES)
-_OFFICIAL_TABLE = tuple(
-    f.read_text(encoding="utf-8").split("\n", 1)[0][2:].strip()
-    for f in sorted(paths.policy_pages_dir("en").glob("*.md")))
+from services import audit_l2, audit_reason, audit_rules
+from services.audit_models import (AuditOutcome, L1Info, Phase0Result,
+                                   ProductInfo, RuleHit)
 
 
-def _ctx(pt_meta=None, ac=None):
-    mapping, default = audit_l2.load_nice_mapping()
-    return SimpleNamespace(
-        pt_meta=pt_meta or {}, ac_automaton=ac,
-        nice_mapping=mapping, nice_default=default, uspto=None)
+def _ctx(pt_meta=None):
+    """R1 的唯一判据源就是 pt_meta —— C 批之后 L2 再没有第二个数据依赖。"""
+    return SimpleNamespace(pt_meta=pt_meta or {})
 
 
 def _p(**kw):
@@ -51,12 +48,6 @@ def _ok_meta(pt="Widgets", cat=None):
                  "requirements": "", "notes": ""}}
 
 
-def _soft(title="", **kw):
-    """跑一遍 evaluate,PT 走白名单直通 —— 只留软规则的命中。"""
-    return audit_l2.evaluate(_p(title=title, **kw), _l1(pt="Widgets"),
-                             _ctx(pt_meta=_ok_meta()))
-
-
 def _codes(res):
     return [h.rule_code for h in res.hits]
 
@@ -74,7 +65,11 @@ def test_r1_access_blocked():
                             _ctx(pt_meta=_meta("需Walmart审批", "是")))
     h = [x for x in res.hits if x.rule_code == "cat_access_blocked"][0]
     assert h.penalty == -100
-    assert h.detail["walmart_policy"] == "Restricted/Illegal"
+    # 规则自报类别(2026-09-02 B1 §二):白名单拦下 = **类目准入**。
+    # ⚠ 原先写死的 `walmart_policy="Restricted/Illegal"` 是猜的(白名单拦下
+    #   与那条禁售政策没有关系),B1 整个删掉 —— 别再写回来
+    assert h.detail["category"] == resources.AUDIT_CAT_ACCESS
+    assert "walmart_policy" not in h.detail
     assert h.detail["rule"] == "access_state 不在白名单 {普通商品, 附条件允许}"
 
 
@@ -83,6 +78,9 @@ def test_r1_zh_blocked_and_prefix_pass():
         _p(), _l1(pt="Widgets"),
         _ctx(pt_meta=_meta("普通商品", "否（上架记录回测,BIZ-CN触发X次）")))
     assert "cat_zh_blocked" in _codes(res)
+    h = [x for x in res.hits if x.rule_code == "cat_zh_blocked"][0]
+    assert h.detail["category"] == resources.AUDIT_CAT_ACCESS   # §二,同上
+    assert "walmart_policy" not in h.detail
     res2 = audit_l2.evaluate(
         _p(), _l1(pt="Widgets"),
         _ctx(pt_meta=_meta("附条件允许", "需评估 (要合规投入)")))
@@ -131,30 +129,7 @@ def test_r1_pending_never_downgrades_a_real_reject():
     assert res.pending_reason is None and res.verdict == "reject"
 
 
-# ── R3 认证四分支 ────────────────────────────────────────────────────────────
-
-def test_r3a_hard_keyword():
-    res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=_meta("普通商品", "是")))
-    assert "cat_requires_cert_hard" not in _codes(res)
-    meta = _meta("普通商品", "是")
-    meta["Widgets"]["requirements"] = "需 UL 认证与测试报告"
-    res2 = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                             _ctx(pt_meta=meta))
-    h = [x for x in res2.hits if x.rule_code == "cat_requires_cert_hard"][0]
-    assert h.penalty == -100
-    assert "UL 认证" in h.detail["matched_hard_kws"]
-    assert h.detail["source"] == "walmart_pt_meta.requirements"
-
-
-def test_r3c_soft_only_zero_penalty():
-    meta = _meta("普通商品", "是")
-    meta["Widgets"]["requirements"] = "ISO 9001 质量体系"
-    res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=meta))
-    h = [x for x in res.hits if x.rule_code == "cat_requires_cert_soft"][0]
-    assert h.penalty == 0 and res.verdict == "pass"
-
+# ── R3 的两段收敛史(2026-08-21 只留飞书源 → 2026-09-03 整条交给 L3)────────
 
 def test_r3_no_longer_reads_the_spec_snapshot_at_all():
     """⚠ 2026-08-21 收敛:R3 **只看飞书 requirements**,spec 那条链整条下线。
@@ -190,182 +165,49 @@ def test_the_whole_appliance_call_moved_to_the_l3_prompt():
     再删黑名单,中间不能有真空期」。
     """
     from services import audit_l3
-    assert "整机电器" in audit_l3._S1 and "NRTL" in audit_l3._S1
-    assert "只能看产品本身" in audit_l3._S1
-    assert "拿不准一律 pass" in audit_l3._S1      # 默认放行,不许再连坐整类
-
-
-def test_r3_hard_keywords_need_word_boundaries():
-    """2026-08-20 P0:关键词曾是裸子串,`"ul" in "fda regulation"` 为真 ——
-    任何 requirements 里写了 regulation 的类目都被打成「UL 认证」并 -100 硬拒。
-    拒得理直气壮,理由却是从别的词里抠出来的两个字母。"""
-    trap = _meta("普通商品", "是")
-    trap["Widgets"]["requirements"] = "遵守 FDA regulation 的一般标签要求"
-    res = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                            _ctx(pt_meta=trap))
-    codes = _codes(res)
-    assert "cat_requires_cert_hard" in codes          # fda 本身是真命中
-    h = [x for x in res.hits if x.rule_code == "cat_requires_cert_hard"][0]
-    assert "UL 认证" not in h.detail["matched_hard_kws"]   # 但 UL 不是
-    # 其余三个同款陷阱:整条 requirements 不该产生任何硬认证
-    for req in ("poison control 信息", "platform 使用说明", "idea 阶段无要求"):
-        m = _meta("普通商品", "是")
-        m["Widgets"]["requirements"] = req
-        r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                              _ctx(pt_meta=m))
-        assert "cat_requires_cert_hard" not in _codes(r), req
-    # 真写了这些认证,照样拦
-    for req, label in (("需 UL 认证", "UL 认证"), ("ISO/DEA 管控物质", "DEA 管控"),
-                       ("需 ATF 许可", "ATF 管控")):
-        m = _meta("普通商品", "是")
-        m["Widgets"]["requirements"] = req
-        r = audit_l2.evaluate(_p(), _l1(pt="Widgets"),
-                              _ctx(pt_meta=m))
-        hh = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
-        assert label in hh.detail["matched_hard_kws"], req
-
-
-def test_r3_chinese_keywords_still_substring():
-    """中文没有词边界,`\\b` 夹在两个汉字之间永不成立 —— 混排关键词维持子串。"""
-    m = _meta("普通商品", "是")
-    m["Widgets"]["requirements"] = "须完成 FDA 食品设施注册并指定美国代理人"
-    r = audit_l2.evaluate(_p(), _l1(pt="Widgets"), _ctx(pt_meta=m))
-    h = [x for x in r.hits if x.rule_code == "cat_requires_cert_hard"][0]
-    assert "FDA 食品设施" in h.detail["matched_hard_kws"]
-
-
-def test_infer_policy_medical_no_longer_lands_on_cosmetics():
-    """2026-08-20 P1:第 9 步在**中文 label 拼接串**上找拉丁 'medical',
-    永不成立 —— 医疗器械类目一律错落成 Cosmetic Products。"""
-    assert audit_l2._infer_walmart_policy("", ["FDA 510(k)"], "Widgets") \
-        == "Medical Devices"
-    # 同一支里本来就靠中文命中的两条不受影响
-    assert audit_l2._infer_walmart_policy("", ["FDA 食品设施"], "W") == "Food Products"
-    assert audit_l2._infer_walmart_policy("", ["FDA 药品"], "W") \
-        == "Drugs & Paraphernalia"
-
-
-def test_soft_evidence_also_comes_only_from_feishu_now():
-    """软合规同理:spec 那条软分支一并下线,软证据只从飞书「必需认证」出。"""
-    res = audit_l2.evaluate(
-        _p(), _l1(pt="Widgets"),
-        _ctx(pt_meta=_meta("普通商品", "是", req="ASTM 测试报告")))
-    h = [x for x in res.hits if x.rule_code == "cat_requires_cert_soft"][0]
-    assert h.detail["source"] == "walmart_pt_meta.requirements (软合规)"
-    assert h.penalty == 0
-
-
-# ── R4 品牌黑名单扫描(小自动机)──────────────────────────────────────────────
-
-def _ac(words):
-    import ahocorasick
-    a = ahocorasick.Automaton()
-    for w in words:
-        a.add_word(w, w)
-    a.make_automaton()
-    return a
-
-
-def test_r4_hit_and_boundary_and_own_brand():
-    ac = _ac(["fender", "ninja foodi"])
-    res = audit_l2.evaluate(_p(title="Ninja Foodi grill basket"),
-                            _l1(pt=None), _ctx(ac=ac))
-    h = [x for x in res.hits if x.rule_code == "title_desc_blacklist"][0]
-    assert h.penalty == 0
-    assert h.detail["matches"][0]["brand"] == "ninja foodi"
-    assert h.detail["matches"][0]["matched_phrase"] == "Ninja Foodi"
-    # 词边界:Fenderish 不命中
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Fenderish style"), _l1(), _ctx(ac=ac)))
-    # 自品牌豁免
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Fender strap", brand="Fender"),
-                          _l1(), _ctx(ac=ac)))
-
-
-def test_r4_chinese_neighbours_are_boundaries():
-    """2026-08-20:`c.isalnum()` 对汉字返回 True,于是「耐克运动鞋」里的
-    黑名单词「耐克」左右都被判成词内字符 —— **中文品牌一个都拦不住**,
-    而且不报错。中日韩不写分词空格,紧邻即边界。"""
-    ac = _ac(["耐克", "小米"])
-    res = audit_l2.evaluate(_p(title="耐克运动鞋 男款"), _l1(pt="Widgets"),
-                            _ctx(pt_meta=_ok_meta(), ac=ac))
-    h = [x for x in res.hits if x.rule_code == "title_desc_blacklist"][0]
-    assert h.detail["matches"][0]["brand"] == "耐克"
-    # 拉丁词边界不受影响(带音标字母仍算词内字符,不切出假前缀)
-    ac2 = _ac(["caf"])
-    assert "title_desc_blacklist" not in _codes(
-        audit_l2.evaluate(_p(title="Café table"), _l1(pt="Widgets"),
-                          _ctx(pt_meta=_ok_meta(), ac=ac2)))
-
-
-def test_r4_none_automaton_skips():
-    res = audit_l2.evaluate(_p(title="Fender strap"), _l1(), _ctx(ac=None))
-    assert "title_desc_blacklist" not in _codes(res)
-
-
-# ── R7 促销宣称 ──────────────────────────────────────────────────────────────
-
-def test_r7_strong_and_softonly_and_allcaps():
-    res = _soft(title="The #1 Best Seller Steel Frame")
-    h = [x for x in res.hits if x.rule_code == "content_promotional"][0]
-    assert h.penalty == 0 and h.detail["walmart_policy"] == "Content Standards"
-    assert h.detail["soft_only"] is False
-    # B6-33 全大写连跑;B6-34 噪声 token 不凑数
-    assert "content_promotional" in _codes(_soft(title="HEAVY DUTY STEEL FRAME"))
-    assert "content_promotional" not in _codes(_soft(title="USB LED HDMI"))
-
-
-def test_r7_soft_only_now_keeps_the_evidence():
-    """2026-08-20 修:只命中空洞形容词时,此前整条 hit 丢掉 ——
-    detail 里写着"L3 LLM 需判断",而 L3 根本收不到。现在照样落账,
-    penalty 仍是 0(不影响任何判定),用 soft_only 标出份量。"""
-    res = _soft(title="high quality bolt")
-    h = [x for x in res.hits if x.rule_code == "content_promotional"][0]
-    assert h.penalty == 0 and h.detail["soft_only"] is True
-    assert h.detail["soft_phrases"] and not h.detail["strong_phrases"]
-    assert res.verdict == "pass"        # 证据留痕,不改结论
-
-
-def test_r7_noise_tokens_are_case_normalized():
-    """噪声表里的 "RoHS" 此前永远匹配不上(比较用 t.upper()),等于没写。"""
-    assert "ROHS" in audit_l2._ALLCAPS_NOISE_TOKENS
-    assert "content_promotional" not in _codes(_soft(title="ROHS USB LED"))
-
-
-# ── R8 敏感内容 ──────────────────────────────────────────────────────────────
-
-def test_r8_subtypes():
-    res = _soft(title="Juneteenth party banner")
-    h = [x for x in res.hits if x.rule_code == "walmart_strict_sensitive"][0]
-    assert "cultural_day" in h.detail["subtypes"]
-    assert h.detail["walmart_policy"] == "Offensive Content"
-    res2 = _soft(title="Mickey Mouse sticker set")
-    h2 = [x for x in res2.hits if x.rule_code == "walmart_strict_sensitive"][0]
-    assert "cartoon_ip_character" in h2.detail["subtypes"]
-    assert h2.penalty == 0
+    # 2026-09-02 B1 重写 S1 后,这一维住在「本 PT 的沃尔玛准入要求怎么判」那节:
+    # 先判这个**具体产品**要不要那张证(NRTL 挂牌是它的典型形态),拿不准 pass
+    assert "NRTL" in audit_l3._S1
+    assert "先判**这个具体产品**要不要这张证" in audit_l3._S1
+    assert "拿不准不拒" in audit_l3._S1           # 默认放行,不许再连坐整类
+    assert "按类目名连坐整类" in audit_l3._S1
 
 
 # ── evaluate 打分/阈值/下界 ──────────────────────────────────────────────────
 
-def test_evaluate_soft_only_passes_with_hits():
-    """B6-40:全 0 分软证据 → score 100 pass,但 hits 落账。"""
-    res = _soft(title="Juneteenth HEAVY DUTY STEEL FRAME #1 best")
-    assert res.score_final == 100 and res.verdict == "pass"
-    assert len(res.hits) >= 2
+def test_evaluate_no_longer_produces_soft_evidence_of_its_own():
+    """⚠ C 批之后 L2 **一条软 hit 都不出**:证据账本在 L0(品牌文案扫描)与
+    L3(官方全文自己判)。曾经这里堆着 R4/R5/R7/R8 四条 0 分证据。
+
+    分数体系不变:软证据本来就不参与累积,拿掉它们不影响任何一条结论。
+    """
+    res = audit_l2.evaluate(
+        _p(title="Juneteenth HEAVY DUTY STEEL FRAME #1 best seller"),
+        _l1(pt="Widgets"), _ctx(pt_meta=_ok_meta()))
+    assert res.score_final == 100 and res.verdict == "pass" and res.hits == []
 
 
 def test_evaluate_stacking_and_floor():
-    """B6-41:硬规则叠加 -100 不去重;R0/R2 删除后只剩 R1+R3 两条会扣分。"""
+    """B6-41:硬规则扣分累加不去重。C 批之后 L2 自己只有 R1 会扣分,
+    另一半来自 L1(出版物硬禁那类),两者叠加 -200。"""
+    l1 = _l1(pt="Widgets", cat="Electronics", dead=True)   # L1 已判死 -100
     res = audit_l2.evaluate(
+        _p(), l1,
+        _ctx(pt_meta={"Widgets": {"walmart_category": "Electronics",
+                                  "walmart_ptg": None, "access_state": "禁售",
+                                  "zh_can_do": "否",
+                                  "requirements": "需 UL 认证", "notes": ""}}))
+    # ⚠ 上游已判死时 R1 整条不参与(既不重复扣分,也不把确定的拒降级成 pending)
+    assert res.score_final == 0 and res.verdict == "reject" and res.hits == []
+    # 上游没判死:R1 自己那 -100 照扣,requirements 里的认证词一条 hit 都不出
+    res2 = audit_l2.evaluate(
         _p(), _l1(pt="Widgets", cat="Electronics"),
         _ctx(pt_meta={"Widgets": {"walmart_category": "Electronics",
                                   "walmart_ptg": None, "access_state": "禁售",
                                   "zh_can_do": "否",
                                   "requirements": "需 UL 认证", "notes": ""}}))
-    assert res.score_final == -100      # 100 - 100(R1) - 100(R3a)
-    assert res.verdict == "reject"
-    assert _codes(res) == ["cat_access_blocked", "cat_requires_cert_hard"]
+    assert res2.score_final == 0 and res2.verdict == "reject"
+    assert _codes(res2) == ["cat_access_blocked"]
 
 
 def test_evaluate_l1_hits_only_add_score():
@@ -378,7 +220,7 @@ def test_evaluate_l1_hits_only_add_score():
     assert "publication_pt_forbidden" not in _codes(res)
 
 
-# ── B7 理由映射 ──────────────────────────────────────────────────────────────
+# ── B1 理由映射:查表,零兜底(2026-09-02,规格 §3.5)───────────────────────
 
 def _outcome(verdict="reject", hits=(), l1=None):
     o = AuditOutcome(asin="B0", verdict=verdict, score_final=0,
@@ -387,235 +229,166 @@ def _outcome(verdict="reject", hits=(), l1=None):
     return o
 
 
-def test_b7_pass_returns_none():
+def test_reason_非reject恒None():
     assert audit_reason.compute_final_reason(_outcome(verdict="pass")) is None
+    assert audit_reason.compute_final_reason(_outcome(verdict="pending")) is None
+    assert audit_reason.compute_final_reason(None) is None
 
 
-def test_b7_hard_rule_first():
-    hits = [RuleHit("L0", "phase0_forbidden_category", -100,
-                    {"walmart_policy": "Intellectual Property"})]
-    o = _outcome(hits=hits)
-    assert audit_reason.compute_final_reason(o) == "Intellectual Property"
+def test_reason_取第一条自报category的hit():
+    """顺序 = all_hits 的 phase0 → l1 → l2(首个命中即出)。"""
+    o = _outcome(hits=[RuleHit("L2", "cat_access_blocked", -100,
+                               {"category": "类目准入"})])
+    assert audit_reason.compute_final_reason(o) == "类目准入"
+    # 多条自报时按 all_hits 顺序取第一条(L0 在 L2 之前)
+    o2 = _outcome(hits=[RuleHit("L2", "cat_access_blocked", -100,
+                                {"category": "类目准入"})])
+    o2.phase0 = Phase0Result(blocked=True, hits=[
+        RuleHit("L0", "phase0_brand_blacklist", -100,
+                {"category": "Intellectual Property"})])
+    assert audit_reason.compute_final_reason(o2) == "Intellectual Property"
 
 
-def test_b7_brand_blacklist_step10():
-    o = _outcome(hits=[RuleHit("L0", "phase0_brand_blacklist", -100, {})])
-    assert audit_reason.compute_final_reason(o) == "Intellectual Property"
+def test_reason_软证据带category也不当判据():
+    """⚠ 2026-09-03 C 批复核修订:类别只能来自**判死它的那条规则**。
 
-
-def test_b7_cert_with_category_buckets():
-    # pt 必须避开 _pt_to_policy 十组关键词(如 "Cribs" 会先被第 8 步 baby 组
-    # 吃掉返回 Baby Products,轮不到第 9 步 cert 分桶)——顺序即语义
-    o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100, {})],
-                 l1=_l1(pt="Playmats", cat="Baby"))
-    assert audit_reason.compute_final_reason(o) == "Children's Products"
-    o2 = _outcome(hits=[RuleHit("L2", "cat_requires_cert_soft", 0, {})],
-                  l1=_l1(pt="W", cat="Home"))
-    assert audit_reason.compute_final_reason(o2) == "General-Use Products"
-
-
-def test_b7_pt_to_policy_step8():
-    o = _outcome(hits=[RuleHit("L2", "cat_zh_blocked", -100, {})],
-                 l1=_l1(pt="Pepper Spray Holsters"))
-    # cat_zh_blocked 的 walmart_policy="Restricted/Illegal" 走步 1.5 先返回
-    # ——detail 为空时才轮到 _pt_to_policy;这里 detail 空,验证第 8 步
-    assert audit_reason.compute_final_reason(o) == "Military & Law Enforcement"
-
-
-def test_b7_internal_blacklist_maps_to_none_not_general_use():
-    """⚠ 2026-08-18 所有者实遇:B0F2ZS3M31(床头柜)命中 ASIN 黑名单被拒,
-    F 列却写「ASIN 在黑名单中心 [政策:General-Use Products]」—— 黑名单中心
-    是内部决策,不对应任何 Walmart 政策,此前无分支一路漏到 4g 兜底。
-    三码(ASIN / 卖家 / 亚马逊类目)都必须映 None;品牌黑名单仍归 IP 不动。"""
-    for code in ("phase0_lark_blacklist_asin", "phase0_lark_blacklist_seller",
-                 "phase0_lark_blacklist_amazon_cat"):
-        o = _outcome(hits=[RuleHit("L0", code, -100,
-                                   {"asin": "B0F2ZS3M31",
-                                    "source": "blacklist_center"})])
-        assert audit_reason.compute_final_reason(o) is None, code
-    # 政策 None ⇒ F 列只剩人话,没有 [政策:…] 尾巴
-    h = audit_reason.human_reason(
-        [("phase0_lark_blacklist_asin", {"asin": "B0F2ZS3M31"})], None)
-    assert "[政策:" not in h
-    assert "黑名单中心" in h
-
-
-def test_b7_fallback_general_use():
-    o = _outcome(hits=[RuleHit("L2", "cat_zh_blocked", -100, {})])
-    assert audit_reason.compute_final_reason(o) == "General-Use Products"
-
-
-def test_b7_normalize_l3_cat():
-    assert audit_reason._normalize_l3_cat("brand_misuse") == "Intellectual Property"
-    assert audit_reason._normalize_l3_cat("None") is None
-    assert audit_reason._normalize_l3_cat("some new policy") == "Some New Policy"
-
-
-def test_b7_normalize_l3_cat_follows_the_table_not_a_frozen_map():
-    """⚠ 2026-09-02(§十.7):政策名归一化**随表**,不再写死一份缩写映射。
-
-    写死的后果不报错:政策表改名成官方拼写后,L3 答出的官方名会被旧映射改写回
-    一个**表里已经不存在**的缩写名 —— `audit_reason` / 政策表 / L3 的
-    reason_category 白名单三处从此对不上,而三处都不会红。
+    C 批的 L0 双输出让 penalty=0 的证据行排在 `all_hits` **最前面**。原实现
+    "第一条 detail 带 category 的就用它"没有扣分闸 —— 哪天有人给某条软证据的
+    detail 顺手加个 `category`(读起来只是"这条证据关于哪类"),整条产品的类别
+    就会被一条**没判死任何东西**的证据劫走:判定结果一个字不变、落库成功、
+    飞书 G 列照样有值,没有任何东西会红。
     """
-    n = audit_reason._normalize_l3_cat
-    # 改名前:表里是缩写名,就回缩写名
-    assert n("drugs & paraphernalia", _LEGACY_TABLE) == "Drugs & Paraphernalia"
-    assert n("electronics & rf", _LEGACY_TABLE) == "Electronics & RF"
-    # 改名后:表里是官方名,就回官方名(同一个函数、同一份代码)
-    assert n("drugs and drug paraphernalia", _OFFICIAL_TABLE) == \
-        "Drugs and Drug Paraphernalia"
-    assert n("knives and OTHER melee weapons", _OFFICIAL_TABLE) == \
-        "Knives and Other Melee Weapons"
-    # 大小写无关(L3 是 LLM,大小写靠不住)
-    assert n("FOOD PRODUCTS", _OFFICIAL_TABLE) == "Food Products"
-    assert n("  Food Products  ", _OFFICIAL_TABLE) == "Food Products"
+    audit_reason.reset_stats()
+    o = _outcome(hits=[RuleHit("L2", "cat_access_blocked", -100,
+                               {"category": "类目准入"})])
+    o.phase0 = Phase0Result(blocked=False, evidence=[
+        RuleHit("L0", "phase0_brand_mention", 0,
+                {"category": "Intellectual Property",   # 软证据不该带,但挡得住
+                 "matches": [{"brand": "nike", "matched_phrase": "Nike"}]})])
+    assert audit_reason.compute_final_reason(o) == "类目准入"
+    # 只有软证据带 category、没有任何硬拒 ⇒ 没有类别(不兜底),计数 + warning
+    o2 = _outcome(hits=[])
+    o2.phase0 = o.phase0
+    assert audit_reason.compute_final_reason(o2) is None
+    assert audit_reason.STATS["reason_missing"] == 1
+    # L3 判拒不受这道闸影响(它的 hit penalty 恒 0,类别在结构化输出里)
+    o3 = _outcome(hits=[])
+    o3.phase0 = o.phase0
+    o3.l3 = SimpleNamespace(verdict="reject", hits=[], policy="Alcohol")
+    assert audit_reason.compute_final_reason(o3) == "Alcohol"
 
 
-def test_b7_normalize_l3_cat_keeps_the_non_policy_pseudo_categories():
-    """伪类目不是政策表里的行(brand_misuse 是 L3 提示词维度 4 的固定标签,
-    content standards 一族是旧标签兼容)—— 表怎么改名都影响不到,只能写死。"""
-    n = audit_reason._normalize_l3_cat
-    for cat in ("brand_misuse", "brand misuse"):
-        assert n(cat, _OFFICIAL_TABLE) == "Intellectual Property"
-    for cat in ("content standards", "content_standards", "promotional content",
-                "promotional", "content policy"):
-        assert n(cat, _OFFICIAL_TABLE) == "Content Standards"
-    # 政策名条目**全部**已删:表没传进来时不许再凭一张旧表把缩写名变出来
-    assert "drugs & paraphernalia" not in audit_reason._L3_NORMALIZE
-    assert not [k for k in audit_reason._L3_NORMALIZE
-                if k not in ("brand_misuse", "brand misuse", "content standards",
-                             "content_standards", "promotional content",
-                             "promotional", "content policy")]
-
-
-def test_b7_normalize_l3_cat_still_falls_back_to_title():
-    """认不出来的照旧 `.title()` 回退 —— 保持旧行为,不扩大改动面。
-
-    (它会把 `PFAS Chemicals` 变 `Pfas Chemicals`:那是照迁的已知缺陷,由
-    `known_policies_check` 记日志计数,不改判定。)
-    """
-    n = audit_reason._normalize_l3_cat
-    assert n("some new policy", _OFFICIAL_TABLE) == "Some New Policy"
-    assert n("pfas chemicals") == "Pfas Chemicals"       # 没传表 ⇒ 旧行为
-    assert n("pfas chemicals", _OFFICIAL_TABLE) == "PFAS Chemicals"   # 传了就随表
-
-
-def test_b7_every_official_policy_name_normalizes_back_to_itself():
-    """⚠ 守门:42 个官方名(refdata 头注 H1)必须**逐个**能归一化回自身。
-
-    这是"旧脚本跟随 refdata"的机器可验形式:L3 照着提示词答出表里的类别名,
-    这一层就必须原样交回去。任何一个被 `.title()` 改了形(`PFAS Chemicals` /
-    `Children’s Products` / `Product claims` 那几个大小写特殊的),就是
-    `audit_reason` 与政策表之间的一道静默错位。
-    """
-    assert len(_OFFICIAL_TABLE) == 42
-    bad = [c for c in _OFFICIAL_TABLE
-           if audit_reason._normalize_l3_cat(c, _OFFICIAL_TABLE) != c]
-    assert bad == [], bad
-    # 大小写乱掉的答案也要认回来(LLM 不保证大小写)
-    bad2 = [c for c in _OFFICIAL_TABLE
-            if audit_reason._normalize_l3_cat(c.upper(), _OFFICIAL_TABLE) != c]
-    assert bad2 == [], bad2
-
-
-def test_b7_l3_reason_category_goes_through_the_live_table():
-    """步 2(L3 语义判)必须吃到实时集合 —— 否则改名后 L3 的答案会被改写。"""
-    o = _outcome()
+def test_reason_规则没自报就轮到L3的policy():
+    o = _outcome(hits=[RuleHit("L2", "some_soft_hit", 0, {})])
     o.l3 = SimpleNamespace(verdict="reject", hits=[],
-                           reason_category="drugs and drug paraphernalia")
-    assert audit_reason.compute_final_reason(o, None, _OFFICIAL_TABLE) == \
-        "Drugs and Drug Paraphernalia"
-    # 不传表 = 旧行为(.title() 回退),不炸
-    assert audit_reason.compute_final_reason(o) == "Drugs And Drug Paraphernalia"
+                           policy="Drugs and Drug Paraphernalia")
+    assert audit_reason.compute_final_reason(o) == "Drugs and Drug Paraphernalia"
+    # L3 判 pass/pending 时它的 policy 不算数(pass 的 policy 恒 'none')
+    o.l3 = SimpleNamespace(verdict="pass", hits=[], policy="none")
+    audit_reason.reset_stats()
+    assert audit_reason.compute_final_reason(o) is None
 
 
-def test_b7_step15_resolves_the_l2_abbreviations_against_the_live_table():
-    """⚠ `audit_l2._infer_walmart_policy` 返回的是**旧缩写名**(旧仓搬迁那批),
-    它经规则 detail 的 `walmart_policy` 进理由映射,出口只有步 1.5 一个。
+def test_reason_查不到不兜底_落None加计数加warning(caplog):
+    """⚠ B1 删掉的九步兜底在这里立碑:曾经"以上全不中"会返回
+    `General-Use Products` —— 一把螺丝刀、一个土豆压泥器都挂着它,人只会
+    一头雾水(所有者 2026-08-16 实遇)。现在:None + 计数 + warning。
 
-    政策表 2026-09-02 改成官方拼写后不解析的后果:每一条 cert 拒的
-    `final_reason_category` 都落在政策表之外 —— 只多几条 warning 计数,判定
-    不变,但 F 列写的政策名沃尔玛那边查无此类(申诉时报错名字)。
+    ⚠ 2026-09-03 C 批之后这条计数是**纯 bug 信号**(L4 关闭时应恒为 0):
+    曾经占着它的两条已知缺口都消化了 —— R3 硬拒整条删除(本 PT 的
+    requirements 随产品进 L3),R10 迁进 L0 并自报 `Product claims`。
+    用例里那个 `cat_requires_cert_hard` 现在只是"某条忘了自报的硬拒规则"的
+    替身(存量 hits 里还有这个码)。
     """
-    seen = set()
-    for _kws, policy in audit_l2._PT_KEYWORD_TO_POLICY:
-        seen.add(policy)
-    for policy in audit_l2._CATEGORY_TO_POLICY.values():
-        seen.add(policy)
-    # 这批常量里确实还写着旧缩写名(本批**不动它们**,只在出口解析)
-    assert seen & set(resources.POLICY_LEGACY_NAMES)
-
-    for legacy, official in resources.POLICY_LEGACY_NAMES.items():
-        o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
-                                   {"walmart_policy": legacy})])
-        assert audit_reason.compute_final_reason(
-            o, None, _OFFICIAL_TABLE) == official, legacy
-        # 改名落地前(表里还是缩写名)照旧回缩写名 —— 同一份代码两种表形态都活
-        assert audit_reason.compute_final_reason(
-            o, None, _LEGACY_TABLE) == legacy, legacy
-        # 不传表 = 旧行为(原样返回),不炸
-        assert audit_reason.compute_final_reason(o) == legacy
-
-
-def test_b7_step15_keeps_a_name_it_cannot_resolve_instead_of_inventing_one():
-    """解析不到的**原样返回**:编一个表里没有的名字,下游一路对不上还不报错。
-
-    落在表外由调用方既有的 `known_policies_check` 记 warning 计数(不改判定)。
-    """
+    audit_reason.reset_stats()
     o = _outcome(hits=[RuleHit("L2", "cat_requires_cert_hard", -100,
-                               {"walmart_policy": "Ghost Policy (old)"})])
-    assert audit_reason.compute_final_reason(o, None, _OFFICIAL_TABLE) == \
-        "Ghost Policy (old)"
-    assert not audit_reason.known_policies_check("Ghost Policy (old)",
-                                                 frozenset(_OFFICIAL_TABLE))
+                               {"walmart_policy": "Electronics & RF"})])
+    with caplog.at_level("WARNING", logger="services.audit_reason"):
+        for _ in range(3):                 # 同一组规则码来三次
+            assert audit_reason.compute_final_reason(o) is None
+    assert audit_reason.STATS["reason_missing"] == 3          # 计数逐次累加
+    # ⚠ 但 warning **一轮只打一次**:已知缺口每轮能拒成千上万条,逐条打会把
+    #   日志淹掉,而信息量只有第一条(与 audit_l3 那两个计数同款口径)
+    assert len([r for r in caplog.records
+                if "判拒但没有类别" in r.getMessage()]) == 1
+    assert audit_reason.STATS["reason_missing:cat_requires_cert_hard"] == 3
+    # ⚠ 旧的 `walmart_policy` 键**不再被读**:类别只认自报的 `category`
+    assert audit_reason.compute_final_reason(
+        _outcome(hits=[RuleHit("L0", "phase0_forbidden_category", -100,
+                               {"walmart_policy": "Intellectual Property"})])) is None
 
 
-def test_b7_the_real_l2_inference_still_returns_the_frozen_constants():
-    """本批**不逐条改** audit_l2 的常量(那是「L3 输出规范化」那一步的事)——
-    这条钉住"没顺手改",免得下次有人看见两处都对表就以为常量已经换了。"""
-    assert audit_l2._infer_walmart_policy("electronics", [], "Widget") == \
-        "Electronics & RF"
-    assert audit_l2._infer_walmart_policy("vehicles", [], "Widget") == \
-        "Auto & Motor Vehicles"
-    assert audit_l2._infer_walmart_policy(None, [], "vape pen") == \
-        "Tobacco & Vaping"
+def test_reason_九步推断全部退役():
+    """守门:别照着旧文档把 PT 关键词猜测 / cert 分桶 / 归一化写回来。"""
+    for gone in ("_pt_to_policy", "_L3_NORMALIZE", "_normalize_l3_cat",
+                 "known_policies_check", "human_reason"):
+        assert not hasattr(audit_reason, gone), gone
+    # 类别键是唯一入口
+    assert audit_reason.CATEGORY_KEY == "category"
 
 
-# ── 人话理由(所有者 2026-08-16:「General-Use Products 这是什么意思」)──────
+def test_reason_L4判拒也不猜类别():
+    """旧步 3 按 issue 文本猜 Offensive/IP —— 那是关键词推断,B1 删。
 
-def test_human_reason_leads_with_the_rule_not_the_policy():
-    """⚠ `General-Use Products` 是政策理由映射第 4g 步的**兜底**(以上全不中)。
-
-    它落在一把锤子、一个土豆压泥器上时,人只会一头雾水 —— 那不是原因,
-    是"没能归到具体哪条政策"。真正的原因在命中的规则里,而 hit.detail 里
-    本来就写着中文 note,此前一个字都没露给人看。
+    L4 默认关;它判拒而没有类别时走"零兜底"那一路(计数 + NULL)。
     """
-    h = audit_reason.human_reason(
-        [("cat_requires_cert_hard",
-          {"walmart_pt": "Hammers",
-           "note": "飞书维护的合规要求 (含实验室证书/官方注册号), 搬运模式做不了",
-           "matched_hard_kws": ["ASTM F2413", "CPC"]})],
-        "General-Use Products")
+    from services.audit_l4 import L4Result
+    audit_reason.reset_stats()
+    o = _outcome()
+    o.l4 = L4Result(verdict="reject", image_issues=[
+        {"image_index": 0, "issue": "offensive gesture", "confidence": "high"}])
+    assert audit_reason.compute_final_reason(o) is None
+    assert audit_reason.STATS["reason_missing"] == 1
+
+
+def test_reason_计数线程安全且可清零():
+    audit_reason.reset_stats()
+    assert audit_reason.STATS["reason_missing"] == 0
+    audit_reason.bump("reason_missing")
+    assert audit_reason.STATS["reason_missing"] == 1
+    audit_reason.reset_stats()
+    assert audit_reason.STATS["reason_missing"] == 0
+
+
+# ── 人话理由(给人看的那一面)────────────────────────────────────────────────
+
+def test_explain_hit_leads_with_the_rule_and_the_cell_it_read():
+    """真正的原因在命中的规则里,而 hit.detail 里本来就写着中文 note。"""
+    h = audit_reason.explain_hit(
+        "cat_requires_cert_hard",
+        {"walmart_pt": "Hammers",
+         "note": "飞书维护的合规要求 (含实验室证书/官方注册号), 搬运模式做不了",
+         "matched_hard_kws": ["ASTM F2413", "CPC"]})
     assert h.startswith("**该类目要求认证**")     # 人话在最前
     assert "搬运模式做不了" in h                  # 规则作者当场写下的"为什么"
     assert "ASTM F2413" in h                      # 命中的是哪条要求
-    assert h.endswith("[政策:General-Use Products]")   # 平台口径留着,但不占头
 
 
-def test_human_reason_keeps_the_policy_even_with_no_hits():
-    """一条规则都没记到时也不能只留一个政策名 —— 要明说是"没记录"。"""
-    assert audit_reason.human_reason([], "Intellectual Property") \
-        == "未记录命中规则[政策:Intellectual Property]"
-    assert audit_reason.human_reason([], None) == "未记录命中规则"
+def test_explain_hit_不再把自报类别当命中值():
+    """⚠ `category` 现在是**规则自报的类别**(§二),不是"命中的那个值"。
+
+    留在 hit_val 键表里的后果:专利自述那条会渲染成
+    「文案自述专利保护(…;命中:Intellectual Property)」—— 把类别名说成
+    命中的原文,人照着去搜根本搜不到。
+    """
+    out = audit_reason.explain_hit("phase0_patent_claim",
+                                   {"category": "Intellectual Property",
+                                    "note": "文案自述专利保护"})
+    assert out == "文案自述专利保护(文案自述专利保护)"
+    assert "命中:" not in out
 
 
-def test_human_reason_drops_process_only_hits():
-    """`pt_dict_fallback` 之流是过程留痕不是拒绝原因,单独出现时不当理由显示。"""
-    out = audit_reason.human_reason(
-        [("pt_dict_fallback", {}), ("phase0_brand_blacklist", {"brand": "Nike"})],
-        "Intellectual Property")
-    assert "字典回落" not in out and "品牌黑名单(命中:Nike)" in out
+def test_explain_hits_取代human_reason_不带政策尾巴():
+    """类别已单列(products.audit_reason / 上架表 G 列),这一句只说规则。"""
+    out = audit_reason.explain_hits(
+        [("pt_dict_fallback", {}), ("phase0_brand_blacklist", {"brand": "Nike"})])
+    assert out == "品牌黑名单(命中:Nike)"        # 过程留痕不当理由
+    assert "[政策:" not in out
+    assert audit_reason.explain_hits([]) == "未记录命中规则"
+    # 最多三条,顺序即入参顺序
+    many = audit_reason.explain_hits(
+        [("phase0_brand_blacklist", {"brand": f"B{i}"}) for i in range(5)])
+    assert many.count(";") == 2
 
 
 def test_explain_hit_falls_back_to_the_rule_code_it_does_not_know():
@@ -623,6 +396,7 @@ def test_explain_hit_falls_back_to_the_rule_code_it_does_not_know():
     assert audit_reason.explain_hit("brand_new_rule", {}) == "brand_new_rule"
     assert audit_reason.explain_hit("brand_new_rule", {"note": "因为 X"}) \
         == "brand_new_rule(因为 X)"
+
 
 
 def _meta_for(pt):
@@ -652,48 +426,83 @@ def test_r0_and_r2_are_gone_whitelist_is_the_only_category_judge():
         assert _codes(res) == [], pt
 
 
-# ── R10 Made in USA 声明(2026-08-24,漏判反哺第一条硬规则)──────────────────
+# ── C 批:L2 = R1(被删的五条规则在这里立碑)────────────────────────────────
 
-def _p10(title="", bullets=None, desc=""):
-    from services.audit_models import ProductInfo
-    return ProductInfo(asin="B0T", title=title,
-                       bullet_points=bullets or [], long_description=desc)
+def test_l2_is_only_r1_now():
+    """⚠ 2026-09-03 所有者定稿:L2 只剩类目准入白名单一条规则。
 
-
-def test_r10_made_in_usa_claim_hard_rejects():
-    """字面声明即铁证:FTC 要求卖家实证,搬运文案永远实证不了。
-
-    生产实证下架原因 "Prohibited Product Policy on Made in USA claims"。
-    与"儿童品不进 L2"方向相反且都对:声明在文本里就是证据,儿童品要靠理解。
+    这条钉的是"**别把删掉的规则写回来**":R3(类目需证书)/ R5(USPTO 在效
+    商标)/ R7(促销宣称)/ R8(敏感合规)整条删除,R4(品牌扫文案)与
+    R10(Made in USA)迁进 L0。它们的共同点是**拿硬代码替 LLM 判语义**,
+    而 L3 面前现在就是 44 篇官方英文全文 —— 同一件事判两遍,两处口径谁也不会红。
     """
-    from services import audit_l2
-
-    hits = audit_l2._rule_made_in_usa(_p10("Steel Bracket Made in USA"))
-    assert len(hits) == 1 and hits[0].penalty == -100
-    assert hits[0].rule_code == "made_in_usa_claim"
-    # 长描述里的声明也要拦(R7/R8 只扫前 3 条五点,这条是硬拒,全文都扫)
-    assert audit_l2._rule_made_in_usa(
-        _p10("Table", desc="Proudly manufactured in the United States"))
-    assert audit_l2._rule_made_in_usa(_p10("USA-Made leather belt"))
-    assert audit_l2._rule_made_in_usa(_p10("American made blanket"))
-
-
-def test_r10_word_boundary_and_negation_do_not_fire():
-    """词边界防误伤 + 否定式排除 + 非声明语境不命中。"""
-    from services import audit_l2
-
-    assert not audit_l2._rule_made_in_usa(
-        _p10("Jerusalem artichoke, thousand pieces"))
-    assert not audit_l2._rule_made_in_usa(
-        _p10("Made in China, not made in USA"))
-    assert not audit_l2._rule_made_in_usa(_p10("Trip to USA travel guide"))
-    assert not audit_l2._rule_made_in_usa(_p10(""))
-
-
-def test_r10_is_wired_into_evaluate():
-    """规则必须真挂进 evaluate 的规则列表 —— 单测函数绿而没接线是静默漏判。"""
     import inspect
 
-    from services import audit_l2
+    src = inspect.getsource(audit_l2.evaluate)
+    assert "_rule_category_gate" in src
+    for gone in ("_rule_cat_requires_cert", "_rule_trademark_live",
+                 "_rule_content_promotional", "_rule_walmart_strict_sensitive",
+                 "_rule_title_desc_blacklist", "_rule_made_in_usa",
+                 "_infer_walmart_policy", "load_nice_mapping", "_classes_for",
+                 "_R5_SQL", "_R8_SENSITIVE_PATTERNS", "_PROMO_PHRASES_STRONG",
+                 "_ALLCAPS_NOISE_TOKENS", "_CATEGORY_TO_POLICY",
+                 "_GENERAL_USE_CATEGORIES", "_kw_re", "_kw_hit"):
+        assert not hasattr(audit_l2, gone), gone
+    # 数据依赖跟着规则走:R5 的 Nice Class 种子文件与 ctx 的 uspto 连接
+    assert not paths.audit_seed_file("pt_nice_class.yaml").exists()
+    for gone in ("uspto", "uspto_failures", "nice_mapping", "nice_default"):
+        assert gone not in audit_rules.AuditContext.__dataclass_fields__, gone
 
-    assert "_rule_made_in_usa" in inspect.getsource(audit_l2.evaluate)
+
+def test_a_certified_category_is_no_longer_judged_by_code():
+    """⚠ **先补后删,无真空期**:R3 的替身 B1 批已经在跑 —— 本 PT 的
+    `requirements` 一行随产品进 L3(user 段),由 LLM 判"这个**具体产品**要不要
+    这张证"。所以这里 requirements 写满硬认证词,L2 也一条 hit 都不出。
+
+    (2026-08-21 那张实木咖啡桌被判「整机电器,必须 NRTL 认证」的彻底版:
+    代码从类目猜物理事实,猜错了还拒得理直气壮。)
+    """
+    import inspect
+
+    from services import audit_l3
+    meta = _meta("普通商品", "是", req="需 UL 认证与 FDA 食品设施注册,附测试报告")
+    res = audit_l2.evaluate(_p(), _l1(pt="Widgets"), _ctx(pt_meta=meta))
+    assert res.hits == [] and res.score_final == 100 and res.verdict == "pass"
+    # 替身在 L3 的 user 段(B1 落地),不是没人管了
+    assert "本 PT 的沃尔玛准入要求" in inspect.getsource(
+        audit_l3.build_user_prompt)
+
+
+def test_promotional_and_sensitive_words_are_judged_by_the_official_text_now():
+    """R7/R8 的判据(#1 / best seller / premium quality / 冒犯性内容)属沃尔玛
+    **Content Standards** 与 **Offensive Content**,官方全文 2026-09-02 已整段
+    进 L3 前缀 —— 代码里那两份手工词表是第二份判据,C 批删。
+
+    先补后删的顺序不能反(§10:先换喂,后删 R7/R8)。
+    """
+    res = audit_l2.evaluate(
+        _p(title="The #1 Best Seller Juneteenth HEAVY DUTY Premium Quality"),
+        _l1(pt="Widgets"), _ctx(pt_meta=_ok_meta()))
+    assert res.hits == [] and res.verdict == "pass"
+    assert set(resources.AUDIT_CONTENT_POLICIES) == {
+        "Content standards: Overview", "Product details policy"}
+
+
+def test_the_policy_name_is_never_inferred_from_a_category_or_a_keyword():
+    """⚠ `_infer_walmart_policy` 的四张字面量表(walmart_category → 政策、
+    通用类目集、电子 PT 词、cert 关键词分桶)整体删除。
+
+    政策类别名是**全链唯一键**(规格 §二):只许两种来源 —— 规则在
+    `detail["category"]` 里自报(拼写装配期对表),或 L3 结构化输出的 `policy`
+    (解析层对枚举校验)。从类目名/PT 名/认证词推一个政策标签出来是第三种
+    来源,而且推错了不会红(2026-08-20 实见:医疗器械类目一律错落成
+    Cosmetic Products,因为在中文 label 串上找拉丁 'medical')。
+    """
+    blocked = audit_l2.evaluate(
+        _p(), _l1(pt="Widgets", cat="Electronics"),
+        _ctx(pt_meta=_meta("禁售", "否", cat="Electronics", req="需 UL 认证")))
+    h = blocked.hits[0]
+    assert h.rule_code == "cat_access_blocked"
+    # 自报的是**非政策类别**「类目准入」,不是猜出来的政策名
+    assert h.detail["category"] == resources.AUDIT_CAT_ACCESS
+    assert "walmart_policy" not in h.detail

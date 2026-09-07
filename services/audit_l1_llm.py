@@ -26,6 +26,7 @@ import threading
 from collections import Counter
 from typing import Any
 
+from registry import resources
 from services.audit_models import L1Info, ProductInfo, RuleHit
 
 logger = logging.getLogger("services.audit_l1_llm")
@@ -123,6 +124,9 @@ def check_publication_ban(pt: str | None) -> RuleHit | None:
             "reason": PUBLICATION_BAN_REASON,
             "basis": "walmart_error_records 9 天数据: Books 96.7% / Manuals 100% "
                      "/ Comics 100% / Sheet Music 100% / Autographed 100%",
+            # 规则自报类别(§二):按**性质**归类 —— 这是"这个类目我们做不了",
+            # 不是知产侵权(旧理由映射步 4a 猜成 Intellectual Property,已删)
+            "category": resources.AUDIT_CAT_ACCESS,
         },
     )
 

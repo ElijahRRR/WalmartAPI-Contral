@@ -129,8 +129,12 @@ def _strip_links(line: str) -> str:
             i = m.end()
             continue
         head = m.start()
-        if head > 0 and line[head - 1] == "!":      # 图片 `![alt](url)`
-            head -= 1
+        if head > 0 and line[head - 1] == "!":      # 图片 `![alt](url)`:整个删
+            # 图片没有判据文字,alt 只是文件名(44 号页的示意图
+            # `2505_product-detail-page-Color.svg`);留下来就是一行噪声
+            out.append(line[i:head - 1])
+            i = close + 1
+            continue
         out.append(line[i:head])
         out.append(m.group(1))
         i = close + 1
@@ -285,11 +289,15 @@ def _transform_tables(lines: list[str]) -> list[str]:
             j += 1
         block = lines[i:j]
         i = j
+        # 官方源码偶有整行空单元格的尾行(44 号页「Product title」表):
+        # 不承载任何语义,判"几行数据"时不算,原样保留时也不留
+        data = [row for row in block[2:] if any(_split_row(row))]
         # 不是"表头 + 分隔 + 恰好一行数据"的,一律原样(多行表按行承载语义)
-        if len(block) != 3 or not _TABLE_SEP_RE.match(block[1].strip()):
+        if len(data) != 1 or len(block) < 3 \
+                or not _TABLE_SEP_RE.match(block[1].strip()):
             out += block
             continue
-        heads, cells = _split_row(block[0]), _split_row(block[2])
+        heads, cells = _split_row(block[0]), _split_row(data[0])
         rendered: list[str] = []
         for n, head in enumerate(heads):
             items = _cell_items(cells[n]) if n < len(cells) else []

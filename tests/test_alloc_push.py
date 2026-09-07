@@ -70,10 +70,79 @@ def test_products_already_online_are_not_pushed(monkeypatch):
     _wire(monkeypatch,
           held={"B0ONLINE01": "A085", "B0TODO0001": "A085"},
           live={"A085"},
-          # 真实 SKU 形态:前缀-ASIN-序号(services/sku_asin._WRAPPED)
-          online=[("A085", "WM-B0ONLINE01-1")])
+          # 真实 SKU 形态:前缀-ASIN-序号(services/sku_asin._WRAPPED);
+          # 第三列是登记簿 amz 键(未登记 ⇒ None ⇒ 回落模式提取)
+          online=[("A085", "WM-B0ONLINE01-1", None)])
     out = wf.run({"execute": False})
     assert "将追加 1 行" in out and "已在架 1" in out
+
+
+def test_online_set_reads_the_registry_key(monkeypatch):
+    """「已在架」按**身份键**算:登记簿优先,模式提取只兜存量(0a-21)。
+
+    不透明码经模式提取必返 None ⇒ 集合恒空 ⇒ **已在架的品被重新派工**,而本
+    工作流 DANGEROUS=True、直接写运营天天看的上架表。
+    """
+    _wire(monkeypatch,
+          held={"B0ONLINE01": "A085", "B0TODO0001": "A085"},
+          live={"A085"},
+          online=[("A085", "AZZZZ234567", "B0ONLINE01")])
+    out = wf.run({"execute": False})
+    assert "将追加 1 行" in out and "已在架 1" in out
+
+
+def test_online_set_matches_the_dedup_gate_wording():
+    """决策 C 落地(批次 2):派工闸与 list_new 去重闸**同一句判据** ——
+    没缺席 + 码还活着,**不筛 lifecycle**。
+
+    两处不同口径的后果:退市但未弃码的 ASIN 被分配链每天派一次、被上架链
+    每天拦一次,运营看到一堆永远上不去的行。反向的坑更贵:排 RETIRED +
+    mint 复用旧码 + 载荷自带 2028 endDate = 对退市档案批量走官方 unretire
+    通道(plan.md:166 事故重演)。
+    """
+    from workflows import list_new as ln
+    assert "lifecycle" not in wf._SQL_ONLINE            # 判据从派工侧拿掉
+    for cond in ("missing_since IS NULL", "abandoned_at IS NULL"):
+        assert cond in wf._SQL_ONLINE and cond in ln._SQL_LISTED_ASINS, cond
+
+
+def test_alloc_survey_keeps_its_lifecycle_condition():
+    """反向钉死:alloc_survey **不跟着改**(所有者决策 C 拍死,两个口径故意不同)。
+
+    它答的是"占用/冲突里这家店有没有活货位",退市行不是活货位
+    (2026-08-15 所有者质疑与查证结论);顺手统一会让占用组与冲突组凭空多
+    出一批。
+    """
+    from services import alloc_survey as sv
+    assert "coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'" \
+        in sv._SQL_ONLINE
+
+
+def test_retired_but_unabandoned_asin_is_dispatched(monkeypatch):
+    """退市未弃码的行**照常算"已在架"**(不再因 lifecycle 被排掉)。
+
+    数据面用 online 桩表达:_SQL_ONLINE 现在会把这行选出来,于是它不进待派工。
+    """
+    _wire(monkeypatch,
+          held={"B0RETIRED1": "A085", "B0TODO0001": "A085"},
+          live={"A085"},
+          online=[("A085", "AZZZZ234567", "B0RETIRED1")])   # 退市但码还活着
+    out = wf.run({"execute": False})
+    assert "已在架 1" in out and "将追加 1 行" in out
+
+
+def test_abandoned_predicate_is_inert_while_no_code_is_abandoned(monkeypatch):
+    """`ls.abandoned_at IS NULL` 在批次 2 之前恒真:全库该列 NULL + LEFT JOIN。
+
+    提前落地是为了让写侧切换只改一处;它现在**不筛掉任何一行**。
+    """
+    assert "ls.abandoned_at IS NULL" in wf._SQL_ONLINE
+    _wire(monkeypatch,
+          held={"B0ONLINE01": "A085"},
+          live={"A085"},
+          online=[("A085", "B0ONLINE01", "B0ONLINE01")])   # abandoned_at 为 NULL
+    out = wf.run({"execute": False})
+    assert "已在架 1" in out
 
 
 def test_disabled_stores_get_no_work(monkeypatch):

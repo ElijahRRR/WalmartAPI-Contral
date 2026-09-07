@@ -19,7 +19,8 @@ import pytest
 from registry import resources
 from services import audit_store, store_events as se
 from services.audit_l3 import L3Result
-from services.audit_models import AuditOutcome, L1Info, L2Result, RuleHit
+from services.audit_models import (AuditOutcome, L1Info, L2Result,
+                                   Phase0Result, RuleHit)
 from workflows import product_audit as pa
 
 _PREFIX = resources.TRO_BRAND_SOURCE_PREFIX
@@ -30,22 +31,30 @@ _SRC = {"dyson": "TRO品牌", "nike": "TRO", "bose": "tro",
         "hammer": "产品清理报错扫描"}  # 非 TRO 来源:不该被这条链碰
 
 
-def _outcome(r4_brands, l3=None, asin="B0TRO00001", verdict="pass"):
-    """输入:R4 命中词 + 可选 L3 结果 → 输出:一条 AuditOutcome。"""
-    hits = []
-    if r4_brands:
-        hits.append(RuleHit(
-            stage="L2", rule_code="title_desc_blacklist", penalty=0,
+def _outcome(brands, l3=None, asin="B0TRO00001", verdict="pass"):
+    """输入:品牌文案扫描命中词 + 可选 L3 结果 → 输出:一条 AuditOutcome。
+
+    ⚠ 2026-09-03 C 批:这条软证据从 L2 R4(`title_desc_blacklist`)迁到
+    L0(`phase0_brand_mention`,落 `Phase0Result.evidence`)。TRO 这条链
+    按 **rule_code** 认命中词、读 `all_hits` —— 焊在"从 outcome.l2 取"上的话,
+    迁层当天 TRO 命中会静默归零而摘要照样漂亮。
+    """
+    ev = []
+    if brands:
+        ev.append(RuleHit(
+            stage="L0", rule_code="phase0_brand_mention", penalty=0,
             detail={"matches": [{"brand": b, "matched_phrase": b}
-                                for b in r4_brands],
-                    "count": len(r4_brands)}))
+                                for b in brands],
+                    "count": len(brands)}))
     return AuditOutcome(asin=asin, verdict=verdict, score_final=100,
                         stage_stopped_at=None, l1=L1Info(),
-                        l2=L2Result(score_final=100, hits=hits), l3=l3)
+                        phase0=Phase0Result(blocked=False, evidence=ev),
+                        l2=L2Result(score_final=100, hits=[]), l3=l3)
 
 
 def _l3(verdict="pass", brands=()):
-    return L3Result(verdict=verdict, blacklist_brand_verdict=list(brands))
+    # 2026-09-02 B1:字段随输出三段化改名 blacklist_brand_verdict → brand_verdicts
+    return L3Result(verdict=verdict, brand_verdicts=list(brands))
 
 
 def _hits(outcome):
@@ -86,7 +95,7 @@ def test_l3_brand_is_an_llm_string_so_case_is_normalized():
 
 
 def test_r5_words_in_the_verdict_are_cut_by_intersecting_with_r4():
-    """⚠ blacklist_brand_verdict 里**混着 R5(USPTO 商标)的词**。
+    """⚠ brand_verdicts 里**混着 R5(USPTO 商标)的词**。
 
     不与 R4 命中集取交集的话,一个只在 R5 出现、恰好也在黑名单里标着 TRO 的词
     会被当成"本产品命中了 TRO 品牌"报上去 —— 而 R4 根本没在标题里见到它。
@@ -118,6 +127,19 @@ def test_explicitly_judged_generic_word_is_dropped_not_unjudged():
         {"brand": "top", "is_real_brand": False, "evidence": "常见形容词"}])))
     assert res["confirmed"] == [] and res["unjudged"] == []
     assert res["reason"] is None
+
+
+def test_l3_evidence_reads_the_same_attribute_as_tro_hits():
+    """⚠ 源头事件里的 `l3_evidence` 与 `tro_hits` 读的**必须是同一个属性**。
+
+    2026-09-02 B1 把 L3Result 的 `blacklist_brand_verdict` 改名成
+    `brand_verdicts`;`_tro_l3_evidence` 用的是 `getattr(..., None) or ()`,
+    漏改一处不会报错 —— 只会让每一条 TRO 源头事件的证据栏永远是空的。
+    """
+    o = _outcome(["dyson"], _l3(brands=[
+        {"brand": "DYSON", "is_real_brand": True, "evidence": "真空吸尘器品牌"}]))
+    assert pa._tro_l3_evidence(o, "dyson") == "真空吸尘器品牌"
+    assert pa._tro_l3_evidence(o, "nike") is None
 
 
 # ── unjudged 的三种成因 ─────────────────────────────────────────────────────
@@ -170,8 +192,6 @@ def test_zero_tro_prefix_words_raises_a_warning(monkeypatch, caplog):
     monkeypatch.setattr(audit_rules, "_frozen", lambda conn, sql: frozenset())
     monkeypatch.setattr(audit_rules, "_pairs", lambda conn, sql: {})
     monkeypatch.setattr(audit_rules, "_build_automaton", lambda w: None)
-    monkeypatch.setattr(audit_rules.audit_l2, "load_nice_mapping",
-                        lambda *a, **k: ({}, []))
     monkeypatch.setattr(audit_rules.category_blacklist, "load",
                         lambda conn: None)
 
@@ -203,8 +223,7 @@ def test_context_default_keeps_hand_built_ctx_working():
     from services import audit_rules
     ctx = audit_rules.AuditContext(
         phase0_sellers=frozenset(), phase0_asins=frozenset(),
-        brand_blacklist={}, pt_meta={}, ac_automaton=None,
-        nice_mapping={}, nice_default=[])
+        brand_blacklist={}, pt_meta={}, brand_mention_automaton=None)
     assert ctx.r4_source == {}
     assert audit_store.tro_hits(_outcome(["dyson"]), ctx.r4_source,
                                 _PREFIX)["confirmed"] == []
@@ -330,10 +349,9 @@ def _summary_lines(**kw):
     counts = pa.Counts(
         verdicts={"pass": 1, "reject": 0, "pending": 0}, cand_n=1, todo_n=1,
         l0_untouched=0, adopted_n=0, no_title=0, seller_missing=0,
-        policy_unknown=0, row_errors=0, asked_asins=0, uspto_failures=0,
-        uspto_off=True, **kw)
+        row_errors=0, asked_asins=0, **kw)
     opts = pa.Opts(execute=True, limit=1, backfill=False, adopt_only=False,
-                   r5_on=False, run_l3=True, run_l4=False, only_l0=False,
+                   run_l3=True, run_l4=False, only_l0=False,
                    workers=1, conn_note="")
     stage = {"L3_ran": 1, "L3_reject": 0, "L3_pending": 0,
              "L4_ran": 0, "L4_reject": 0}

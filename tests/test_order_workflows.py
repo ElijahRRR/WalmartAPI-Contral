@@ -131,8 +131,10 @@ def test_order_sync_end_to_end(monkeypatch):
     assert "下单时间冲突" not in out       # 库里没有 = 首见,不是冲突
     assert len(detail_calls) == 1 and "replacementInfo=true" in detail_calls[0]
     assert ";详情复核 1 次" in out.splitlines()[0]
+    # calls 里最前面那条是 upsert_order_lines 落库前的登记簿反查(SKU 批次 0b 起
+    # asin 在写入侧补),真正的写在第一条 executemany 上
     kind, sql, rows = next(c for c in calls if c[0] == "many")
-    assert "orders.order_lines" in sql
+    assert kind == "many" and "orders.order_lines" in sql
     assert {r["sku"] for r in rows} == {"A", "B"}
     assert all(r["order_date_confirmed"] and r["order_date_source"] == "detail" for r in rows)
     # 审核列绝不在 upsert 列内(重拉不得冲掉审核结论)

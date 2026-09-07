@@ -1,0 +1,543 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "type": "object",
+  "title": "MPItemFeed",
+  "properties": {
+    "MPItemFeedHeader": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "type": "object",
+      "title": "MPItemFeedHeader",
+      "properties": {
+        "businessUnit": {
+          "type": "string",
+          "title": "Business Unit",
+          "enum": [
+            "SAMSCLUB",
+            "WALMART_CA",
+            "WALMART_US",
+            "ASDA_GM"
+          ]
+        },
+        "locale": {
+          "type": "string",
+          "title": "Locale",
+          "enum": [
+            "en"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "title": "Spec Version",
+          "enum": [
+            "5.0.20260607-22_38_54-api"
+          ]
+        }
+      },
+      "required": [
+        "businessUnit",
+        "locale",
+        "version"
+      ]
+    },
+    "MPItem": {
+      "minItems": 1,
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "array",
+      "title": "MPItem",
+      "items": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "type": "object",
+        "properties": {
+          "Item": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "allOf": [
+              {
+                "if": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "condition": {
+                          "type": "string",
+                          "enum": [
+                            "New with defects",
+                            "Pre-Owned: Fair",
+                            "Pre-Owned: Good",
+                            "Pre-Owned: Like New",
+                            "Remanufactured"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "condition"
+                      ]
+                    }
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "mainImageUrl"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "condition": {
+                          "type": "string",
+                          "enum": [
+                            "Restored: Fair",
+                            "Restored: Good",
+                            "Restored: Like New",
+                            "Restored: Premium"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "condition"
+                      ]
+                    }
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "restoredProductIdentifier"
+                  ]
+                }
+              }
+            ],
+            "properties": {
+              "productIdentifiers": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Product Identifiers",
+                "type": "object",
+                "description": "Specify at least one Product ID and its ID Type.",
+                "comments": "@group=Headers",
+                "properties": {
+                  "productId": {
+                    "title": "Product ID",
+                    "type": "string",
+                    "description": "Alphanumeric, 14 characters - Provide the GTIN that identifies the product's consumable (selling) unit. Expand the GTIN to 14 digits by adding preceding zeroes and check digit. A GTIN (Global Trade Item Number) is used to identify an item at any point in the Supply Chain. A GTIN refers to the data structure (not symbology) used to identify the scannable item, case, inner pack (i.e., break pack) or pallet that make up the hierarchy. Example: 00123456781011",
+                    "examples": [
+                      "00123456781011"
+                    ],
+                    "minLength": 1,
+                    "maxLength": 14
+                  },
+                  "productIdType": {
+                    "title": "Product ID Type",
+                    "type": "string",
+                    "description": "Closed List - Unique numbers used to tell items apart.\n\nUPC (Universal Product Code): 12-digit code.\nEAN (European Article Number): 13-digit code.\nGTIN (Global Trade Item Number): 14 digits code.\nISBN (International Standard Book Number): Code is used specifically for books (either 10 or 13 digits).",
+                    "enum": [
+                      "EAN",
+                      "GTIN",
+                      "ISBN",
+                      "ISSN",
+                      "UPC"
+                    ]
+                  }
+                },
+                "required": [
+                  "productId",
+                  "productIdType"
+                ],
+                "additionalProperties": false
+              },
+              "productName": {
+                "title": "Product Name",
+                "type": "string",
+                "description": "Alphanumeric, 199 characters - Title of the product to be displayed on the Item Page. Your title should ideally be under 90 Characters, Maximum 100 Characters.  Anything over 90 characters will negatively impact your Search Engine Optimization (SEO). Example: Atkins Protein Rich Keto Friendly Meal Replacement Bar, Chocolate Peanut Butter, 12 Count;Equate Meal Replacement Shake, Creamy Milk Chocolate, 11 fl oz, 6 Count;SlimFast Keto Meal Replacement Shake Powder, Vanilla Cake Batter, 12.2 oz Canister, 10 Servings;Verizon iPhone 12 64GB Black",
+                "examples": [
+                  "Atkins Protein Rich Keto Friendly Meal Replacement Bar, Chocolate Peanut Butter, 12 Count",
+                  "Equate Meal Replacement Shake, Creamy Milk Chocolate, 11 fl oz, 6 Count",
+                  "SlimFast Keto Meal Replacement Shake Powder, Vanilla Cake Batter, 12.2 oz Canister, 10 Servings",
+                  "Verizon iPhone 12 64GB Black"
+                ],
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minLength": 10,
+                "maxLength": 199
+              },
+              "sku": {
+                "title": "SKU",
+                "type": "string",
+                "description": "Alphanumeric, 50 characters - The letters and/or numbers a partner uses to identify an item. Walmart includes this value in all communications regarding item information such as orders. Example: TRVAL28726",
+                "examples": [
+                  "TRVAL28726"
+                ],
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minLength": 1,
+                "maxLength": 50
+              },
+              "condition": {
+                "title": "Condition",
+                "type": "string",
+                "description": "Closed List - The state of an item, indicating its level of wear, prior use (if any), appearance and overall quality. Some conditions may not be available depending on item, category or seller eligibility. ",
+                "enum": [
+                  "New",
+                  "Open Box",
+                  "New with defects",
+                  "New without box",
+                  "New without tags",
+                  "Pre-Owned: Fair",
+                  "Pre-Owned: Good",
+                  "Pre-Owned: Like New",
+                  "Remanufactured",
+                  "Restored: Fair",
+                  "Restored: Good",
+                  "Restored: Like New",
+                  "Restored: Premium"
+                ],
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "mainImageUrl": {
+                "title": "Main Image URL",
+                "type": "string",
+                "description": "URL, 2500 characters - Web address that points to the primary image used to represent an item",
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minLength": 1,
+                "maxLength": 2500,
+                "format": "uri"
+              },
+              "restoredProductIdentifier": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Restored Product Identifier",
+                "type": "object",
+                "description": "Specify one Restored Product ID and its ID Type.",
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "properties": {
+                  "restoredProductIdType": {
+                    "title": "Restored Product ID Type",
+                    "type": "string",
+                    "description": "Closed List - To identify the type of identifier for restored products",
+                    "enum": [
+                      "GTIN",
+                      "UPC"
+                    ]
+                  },
+                  "restoredProductId": {
+                    "title": "Restored Product ID",
+                    "type": "string",
+                    "description": "Alphanumeric, 14 characters - This code is to identify Restored Products Example: 12345678905",
+                    "examples": [
+                      "12345678905"
+                    ],
+                    "minLength": 1,
+                    "maxLength": 14
+                  }
+                },
+                "required": [
+                  "restoredProductIdType",
+                  "restoredProductId"
+                ],
+                "additionalProperties": false
+              },
+              "ShippingWeight": {
+                "title": "Shipping Weight",
+                "type": "number",
+                "description": "Decimal, Value range: 0 to 99999999999999 - The weight  including all of its packaging materials. Example: 5",
+                "examples": [
+                  "5"
+                ],
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minimum": 0,
+                "maximum": 99999999999999,
+                "multipleOf": 0.001
+              },
+              "price": {
+                "title": "Selling Price",
+                "type": "number",
+                "description": "Decimal, Value range: 0 to 99999999999999 - The price a customer pays for the item. Do not use commas or currency symbols Example: 100.33",
+                "examples": [
+                  "100.33"
+                ],
+                "comments": "@group=Item and Offer Details (Required/Conditionally Required)",
+                "minimum": 0,
+                "maximum": 99999999999999,
+                "multipleOf": 0.01
+              },
+              "inventory": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Inventory",
+                "type": "array",
+                "description": "Inventory details for item to be transactable on Walmart",
+                "comments": "@group=Inventory",
+                "items": {
+                  "$schema": "http://json-schema.org/draft-07/schema#",
+                  "title": "Inventory",
+                  "type": "object",
+                  "description": "Inventory details for item to be transactable on Walmart",
+                  "properties": {
+                    "quantity": {
+                      "title": "Inventory Quantity",
+                      "type": "integer",
+                      "description": "Number, Value range: 0 to 99999999999999 - What is the inventory count? (e.g. 10)",
+                      "minimum": 0,
+                      "maximum": 99999999999999
+                    },
+                    "fulfillmentCenterID": {
+                      "title": "Fulfillment Center ID",
+                      "type": "string",
+                      "description": "Alphanumeric, 100 characters - The Fulfillment Center where the SKU is physically located. If you have not defined any Fulfillment Center & operate via Default Node (Virtual) then use Virtual Node ID (which is same as your Partner ID). Example: 83746529874858434 View your fulfillment center Ids https://seller.walmart.com/settings/shipping-profile/seller-fulfillment",
+                      "minLength": 1,
+                      "maxLength": 100
+                    }
+                  },
+                  "required": [
+                    "quantity",
+                    "fulfillmentCenterID"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1
+              },
+              "productSecondaryImageURL": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Additional Image URL",
+                "type": "array",
+                "description": "URL, 2500 characters - Secondary images of the item. File Format: JPEG (.jpg). Recommended Pixel Dimensions: 2200px x 2200px. Minimum Pixel Dimensions for Zoom 1500px x 1500px. Resolution: 300 ppi. Maximum file size: 5MB. Aspect Ratio: 1:1 (Square). Recommended File Naming: GTIN-14 digit\nImage URLs should end in an image file type (.jpg) to follow best practices. They must link to a public image file that loads as an image",
+                "comments": "@group=Additional Information (Optional)",
+                "items": {
+                  "title": "Additional Image URL",
+                  "type": "string",
+                  "description": "URL, 2500 characters - Secondary images of the item. File Format: JPEG (.jpg). Recommended Pixel Dimensions: 2200px x 2200px. Minimum Pixel Dimensions for Zoom 1500px x 1500px. Resolution: 300 ppi. Maximum file size: 5MB. Aspect Ratio: 1:1 (Square). Recommended File Naming: GTIN-14 digit\nImage URLs should end in an image file type (.jpg) to follow best practices. They must link to a public image file that loads as an image",
+                  "minLength": 1,
+                  "maxLength": 2500,
+                  "format": "uri"
+                },
+                "minItems": 1
+              },
+              "externalProductIdentifier": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "External Product Identifier",
+                "type": "array",
+                "description": "Closed List - Optional. Specify External Product Identifier and its ID Type if available.",
+                "comments": "@group=Additional Information (Optional)",
+                "items": {
+                  "$schema": "http://json-schema.org/draft-07/schema#",
+                  "title": "External Product Identifier",
+                  "type": "object",
+                  "description": "Closed List - Optional. Specify External Product Identifier and its ID Type if available.",
+                  "properties": {
+                    "externalProductIdType": {
+                      "title": "External Product ID Type",
+                      "type": "string",
+                      "description": "Closed List - ASIN is the Amazon Standard Identification Number. It's a unique 10-digit sequence of letters and/or numbers.",
+                      "enum": [
+                        "ASIN"
+                      ]
+                    },
+                    "externalProductId": {
+                      "title": "External Product ID",
+                      "type": "string",
+                      "description": "Alphanumeric, 10 characters - ASIN for your item Example: B002Z36VJE",
+                      "examples": [
+                        "B002Z36VJE"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 10
+                    }
+                  },
+                  "required": [
+                    "externalProductIdType",
+                    "externalProductId"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1
+              },
+              "stateRestrictions": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "Sale Restrictions",
+                "type": "array",
+                "description": "Group of attributes to capture information when there are restrictions (legal or supplier discretion) prohibiting an item's sale.",
+                "comments": "@group=Additional Information (Optional)",
+                "items": {
+                  "$schema": "http://json-schema.org/draft-07/schema#",
+                  "title": "Sale Restrictions",
+                  "type": "object",
+                  "description": "Group of attributes to capture information when there are restrictions (legal or supplier discretion) prohibiting an item's sale.",
+                  "properties": {
+                    "stateRestrictionsText": {
+                      "title": "State Restrictions Text (SPEC)",
+                      "type": "string",
+                      "description": "Closed List - The reason an item is restricted or prohibited from being sold in one or more states or zip codes. If your item doesn't have any restrictions, select \"None.\"",
+                      "enum": [
+                        "Commercial",
+                        "Illegal for Sale",
+                        "None"
+                      ]
+                    },
+                    "zipCodes": {
+                      "title": "ZIP Codes",
+                      "type": "string",
+                      "description": "Alphanumeric, 100000 characters - The postal codes in which an item is restricted or prohibited from being sold. This may also include zip codes where you prefer not to sell the item. It's your obligation to research the all laws (Federal, State, Local) that impact your product and to indicate to Walmart the required state postal code sale restrictions. If the full state is restricted, please use the States attribute. Example: 94085, 94086, 94087, 72712, 72716",
+                      "examples": [
+                        "94085, 94086, 94087, 72712, 72716"
+                      ],
+                      "minLength": 1,
+                      "maxLength": 100000
+                    },
+                    "states": {
+                      "title": "U.S. State",
+                      "type": "string",
+                      "description": "Closed List - The full list of states in which the item is restricted or prohibited from being sold. This may also include states where you prefer not to sell the item. It's your obligation to research all laws (Federal, State, Local) that impact your product and to indicate to Walmart the required state sale restrictions.",
+                      "enum": [
+                        "AK - Alaska",
+                        "AL - Alabama",
+                        "Alabama",
+                        "Alaska",
+                        "American Samoa",
+                        "AR - Arkansas",
+                        "Arizona",
+                        "Arkansas",
+                        "AS - American Samoa",
+                        "AZ - Arizona",
+                        "CA - California",
+                        "California",
+                        "CO - Colorado",
+                        "Colorado",
+                        "Commonwealth of the Northern Mariana Islands",
+                        "Connecticut",
+                        "CT - Connecticut",
+                        "DC - District of Columbia",
+                        "DE - Delaware",
+                        "Delaware",
+                        "District of Columbia",
+                        "Federated States of Micronesia",
+                        "FL - Florida",
+                        "Florida",
+                        "FM - Federated States of Micronesia",
+                        "GA - Georgia",
+                        "Georgia",
+                        "GU - Guam",
+                        "Guam",
+                        "Hawaii",
+                        "HI - Hawaii",
+                        "IA - Iowa",
+                        "ID - Idaho",
+                        "Idaho",
+                        "IL - Illinois",
+                        "Illinois",
+                        "IN - Indiana",
+                        "Indiana",
+                        "Iowa",
+                        "Kansas",
+                        "Kentucky",
+                        "KS - Kansas",
+                        "KY - Kentucky",
+                        "LA - Louisiana",
+                        "Louisiana",
+                        "MA - Massachusetts",
+                        "Maine",
+                        "Marshall Islands",
+                        "Maryland",
+                        "Massachusetts",
+                        "MD - Maryland",
+                        "ME - Maine",
+                        "MH - Marshall Islands",
+                        "MI - Michigan",
+                        "Michigan",
+                        "Minnesota",
+                        "Mississippi",
+                        "Missouri",
+                        "MN - Minnesota",
+                        "MO - Missouri",
+                        "Montana",
+                        "MP - Commonwealth of the Northern Mariana Islands",
+                        "MS - Mississippi",
+                        "MT - Montana",
+                        "NC - North Carolina",
+                        "ND - North Dakota",
+                        "NE - Nebraska",
+                        "Nebraska",
+                        "Nevada",
+                        "New Hampshire",
+                        "New Jersey",
+                        "New Mexico",
+                        "New York",
+                        "NH - New Hampshire",
+                        "NJ - New Jersey",
+                        "NM - New Mexico",
+                        "North Carolina",
+                        "North Dakota",
+                        "NV - Nevada",
+                        "NY - New York",
+                        "OH - Ohio",
+                        "Ohio",
+                        "OK - Oklahoma",
+                        "Oklahoma",
+                        "OR - Oregon",
+                        "Oregon",
+                        "PA - Pennsylvania",
+                        "Palau",
+                        "Pennsylvania",
+                        "PR - Puerto Rico",
+                        "Puerto Rico",
+                        "PW - Palau",
+                        "Rhode Island",
+                        "RI - Rhode Island",
+                        "SC - South Carolina",
+                        "SD - South Dakota",
+                        "South Carolina",
+                        "South Dakota",
+                        "Tennessee",
+                        "Texas",
+                        "TN - Tennessee",
+                        "TX - Texas",
+                        "U.S. Minor Outlying Islands",
+                        "U.S. Virgin Islands",
+                        "UM - U.S. Minor Outlying Islands",
+                        "UT - Utah",
+                        "Utah",
+                        "VA - Virginia",
+                        "Vermont",
+                        "VI - U.S. Virgin Islands",
+                        "Virginia",
+                        "VT - Vermont",
+                        "WA - Washington",
+                        "Washington",
+                        "West Virginia",
+                        "WI - Wisconsin",
+                        "Wisconsin",
+                        "WV - West Virginia",
+                        "WY - Wyoming",
+                        "Wyoming"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "stateRestrictionsText"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "productIdentifiers",
+              "sku",
+              "condition",
+              "ShippingWeight",
+              "price"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "Item"
+        ]
+      }
+    }
+  },
+  "required": [
+    "MPItemFeedHeader",
+    "MPItem"
+  ]
+}

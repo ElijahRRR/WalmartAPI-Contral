@@ -76,6 +76,25 @@ def retire_caps() -> dict[str, int]:
     return caps
 
 
+def setup_limits() -> dict[str, int]:
+    """输入:无 → 输出:{店铺: 沃尔玛 item setup limit}(限额表「商品上限」列)。
+
+    未填/读不到的店**不在字典里**,调用方回落
+    `registry.resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT`(=5000,出处见那处注释:
+    沃尔玛 EXT_DATA_ERROR_50575703577001 原文 + 2026-09-07 A131吕灿荣 实证)——
+    与「配送时长限制」同款治理:人在飞书填、程序直读、没填就是缺省。
+
+    ⚠ 这不是我们自己定的经营容量(那是「单店最大在线数」`max_online`,分配引擎读),
+    而是**沃尔玛的硬限**:店内现有 item 数 + 本 feed 条数 超了它,整个 feed 被拒收
+    (itemsReceived=0、零逐条明细),一条也进不去。
+    """
+    caps = _int_map(resources.RETIRE_LIMITS.fields.item_setup_limit)
+    if not caps:
+        logger.info("限额表「商品上限」读到 0 店,全店回落缺省 item setup limit"
+                    "(表未登记/该列未建/该列为空都会走到这里)")
+    return caps
+
+
 def stockzero_stores() -> list[str]:
     """输入:无 → 输出:整店清零的店名单(限额表「库存特殊要求」= 0 的店)。
 

@@ -20,6 +20,14 @@
 **新建的飞书电子表格**「在线产品总表」(非多维表格——13 万行超 bitable 5 万行套餐上限;
 新表与旧系统写的旧 spreadsheet 互不干扰,可并跑对拍)。PG 是权威,飞书表可随时整表重建。
 -p skip_feishu=1 跳过回写;表格未在 .env 登记时跳过并在摘要中提示。
+
+`--dry-run` 的边界(2026-09-06 补,审计缺口 G-1):本工作流 DANGEROUS=False,
+cli 恒给 `execute=True`,但 `dry_run` 单独透传进 params。**目录同步本身照常**
+(扫店、合并库存、upsert catalog.walmart_items、标缺席、飞书投影 —— 它们是可
+重放的快照写入,空跑关掉反而看不出同步结果);空跑只挡住**不可逆的那一段**:
+弃码点 1(`sku_codec.abandon` 弃码 + 烧 UPC)以及给它封口的删除核验事件
+(`delete_verified` / `delete_not_effective`,写下去下一轮就不再产出这一对)。
+空跑时该段只报数,摘要第二行打「🧪 [DRY-RUN] 弃码点跳过:将弃码 N 个」。
 """
 
 import logging
@@ -27,10 +35,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 
-from api import _client, feishu, inventory as inv_api, items, reports
+from api import _client, feishu, inventory as inv_api, items
 from registry import db, resources
-from services import notify_fmt as nf, product_events, store_limits, \
-    store_retry, stores as stores_svc, walmart_catalog
+from services import notify_fmt as nf, product_events, sku_codec, \
+    store_limits, store_retry, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -40,8 +48,7 @@ logger = logging.getLogger("workflows.catalog_sync")
 _FILL_WORKERS = 8   # 补漏单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
 
 
-def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
-                    backfill_ids: bool) -> dict:
+def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
     """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
     name = store["name"]
     stats: dict = {}
@@ -101,55 +108,13 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
         walmart_catalog.upsert_node_inventory(conn, name, inventory, run_at)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
-    backfilled = _backfill_item_ids(store) if backfill_ids else 0
     # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。谭总12 自建中山仓
     # 之后它不再是 0 —— 摘要按"该店配没配「维护仓库」"分两种措辞(见 run())
     multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
             "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
-            "item_ids": backfilled, "multi_node": multi}
-
-
-def _backfill_item_ids(store: dict) -> int:
-    """输入:店铺 → 输出:本次回填的 item_id 数量。
-
-    来源 = On-request ITEM 报表(一店一份,覆盖全部商品):从 Item ID 列或
-    Item Page URL 提取数字 itemId。其余候选路径全部实证排除——GET /v3/items
-    与 catalog/search 响应无此字段,全站搜索按 gtin/upc 召回率 3/131。
-    itemId 平时不变,只有新品和"缺席后复现"(upsert 已重置 NULL)的行触发报表拉取;
-    报表失败只记警告,下轮重试,不影响店铺同步结果。
-    """
-    name = store["name"]
-    with db.pg_conn() as conn:
-        todo = walmart_catalog.skus_missing_item_id(conn, name)
-    if not todo:
-        return 0
-    try:
-        rows = reports.fetch_item_report(store)
-    except Exception as e:
-        logger.warning("店铺 %s ITEM 报表拉取失败,item_id 本轮不回填: %s", name, e)
-        return 0
-
-    found: dict[str, str] = {}
-    no_id = 0
-    for row in rows:
-        sku = reports.report_row_sku(row)
-        if not sku or sku not in todo:
-            continue
-        iid = reports.extract_item_id(row)
-        if iid:
-            found[sku] = iid
-        else:
-            no_id += 1
-    if no_id and not found:     # 一个都提不出来 = 列名/URL 格式假设错了,打样本诊断
-        logger.warning("店铺 %s 报表 %d 行均提取不到 itemId,首行字段:%s",
-                       name, len(rows), sorted(rows[0].keys()) if rows else [])
-    with db.pg_conn() as conn:
-        updated = walmart_catalog.set_item_ids(conn, name, found)
-    logger.info("店铺 %s item_id 报表回填:待补 %d / 报表行 %d / 提取成功 %d / 入库 %d",
-                name, len(todo), len(rows), len(found), updated)
-    return updated
+            "multi_node": multi}
 
 
 def run(params: dict) -> str:
@@ -163,9 +128,8 @@ def run(params: dict) -> str:
     mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):
         return f"rounds 参数只接受 full/fast,收到:{mode}"
-    # item_id 报表回填默认关闭(2026-08-05 决策:报表请求配额极低,单店当日个位数,
-    # 测试期即打到 429;功能保留,-p item_ids=1 显式开启,后续迭代再转正)
-    backfill_ids = str(params.get("item_ids", "")) in ("1", "true", "yes")
+    # item_id 不在这里回填(2026-09-07 归 item_id_sync 独立工作流:报表要等
+    # 15–45 分钟、创建每小时一次,挂在每店同步里会把本步拖长一倍;双轨禁止)
     run_at = datetime.now(timezone.utc)
 
     # 标准①②(所有者定稿 2026-08-26):跨店并发 → 凭证死跳全店不补试 → 其余
@@ -175,18 +139,16 @@ def run(params: dict) -> str:
     # 这里的同一个 _sync_one_store(单一落地路径,不另写简化版)。
     results, dead, absent, gate_note = store_retry.fan_out(
         store_list,
-        lambda s: _sync_one_store(s, run_at, skip_inventory, mode, backfill_ids),
+        lambda s: _sync_one_store(s, run_at, skip_inventory, mode),
         workers, log_label="同步")
 
     total_written = sum(r["written"] for r in results)
     total_missing = sum(r["missing"] for r in results)
-    total_item_ids = sum(r.get("item_ids", 0) for r in results)
     truncated = [r["store"] for r in results if r["truncated"]]
     # ⚠ 首行 = 结论 + 最要紧的数,且链通知(product_chain)对成功步骤**只发
     # 首行**(cli first_line_of)—— 缺席店必须写在这一行,放后面等于只写日志
     lines = [f"catalog_sync:{len(results)}/{len(store_list)} 店完成,"
-             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行,"
-             f"回填 item_id {total_item_ids} 个"
+             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行"
              + nf.absent_tail(absent, gate_note,
                               tail="下游按水位避让,链尾重赛")]
     if gate_note:
@@ -226,10 +188,37 @@ def run(params: dict) -> str:
 
     if results:
         # 删除核验(事件账本):回执成功的删除,以本轮观测定生效/未生效
+        # ⚠ **弃码点 1 就在这里,只在 delete_verified 落地,不在删除回执成功
+        #   那一刻**:「回执成功但后台没删」是所有者实证过的故障模式
+        #   (delete_not_effective),按回执弃码 = 下一轮拿新码新 UPC 去上一个
+        #   还活着的 item = 同店重复 listing,沃尔玛不会替你拦。
+        # ⚠ 弃码与 delete_verified 事件**同一个连接同一事务**:分两个事务会留下
+        #   "事件记了、码没弃"的半截状态,而 verify_deletions 的 open_ok CTE 正是
+        #   靠 delete_verified 事件封口 —— 下一轮不会再产出这一对,那个码就永远
+        #   弃不掉了。
+        # ⚠ `--dry-run` 只挡这一段(模块头注「dry-run 的边界」):cli 对
+        #   DANGEROUS=False 恒给 execute=True,不读 dry_run 的话空跑会真弃码真烧号,
+        #   而且横幅都不打(cli 的 [DRY-RUN] 横幅只对 DANGEROUS 打)。
+        #   空跑连 verify_deletions 自己记的 delete_verified / delete_not_effective
+        #   也要一起挡:那两条事件写下去,open_ok CTE 就封了口,下一轮不再产出
+        #   这一对 —— 事件留下了、码没弃,那个码这辈子弃不掉了。所以走
+        #   **同一份判据 + rollback**,不另写一条只读 SQL(第二份判据迟早漂开)。
+        dry_run = bool(params.get("dry_run"))
         with db.pg_conn() as conn:
-            verified, not_eff = product_events.verify_deletions(conn)
+            verified, not_eff, gone_pairs = product_events.verify_deletions(conn)
+            if dry_run:
+                conn.rollback()     # 事件不落库;abandon 一次都不调
+                n_ab = 0
+            else:
+                n_ab = sum(sku_codec.abandon(conn, s, k,
+                                             sku_codec.ABANDON_DELETE_VERIFIED)
+                           for s, k in gone_pairs)
+        if dry_run:
+            lines.insert(1, f"🧪 [DRY-RUN] 弃码点跳过:将弃码 {len(gone_pairs)} 个")
         if verified or not_eff:
-            lines.append(f"删除核验:生效 {verified}"
+            lines.append(("删除核验(空跑未落库):将生效 " if dry_run
+                          else "删除核验:生效 ") + str(verified)
+                         + (f",弃码 {n_ab}" if n_ab else "")
                          + (f",⚠ 未生效 {not_eff}(回执成功但仍在架,查日志)"
                             if not_eff else ""))
 

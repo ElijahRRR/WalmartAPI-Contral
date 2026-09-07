@@ -311,6 +311,7 @@ def run(params: dict) -> str:
                  f"黑名单品牌 {len(gate['brands'])} 个,"
                  f"ASIN 黑名单 {len(banned_asins)} 个")
     # ASIN 黑名单**不由本工作流同步**(所有者问询 2026-08-12 补可见性):
-    # 它是自产回路——问题产品清理每日归类(B/C/E/F/G/K 六类)+ 上架违禁
+    # 它是自产回路——问题产品清理每日归类(2026-09-04 起为 error_taxonomy
+    # 的新 16 码,入选看 is_permanent)+ 上架违禁
     # 回执自动入库;PG 权威,blacklist_push 反向推飞书投影。此处只报数
     return "\n".join(lines)

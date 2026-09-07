@@ -19,11 +19,16 @@
 两条本模块自己的推论(所有者可推翻):
 - **组大小按亚马逊真实家族算**(`variation_asins` 长度 + 1),不按库里采到几个。
   库里只有 3 个而家族真有 500 个的,今天当变体上了、明天采到更多就爆表。
-- **单品也带 groupId**(由 parent_asin 派生,稳定可复现)。于是以后的兄弟各自
-  独立算也得到同一个 ID,**"合并"自动发生**,不必回头给已在架的补发维护 feed
-  ——那要多一次写、多一份配额,还多一个"补发失败就永远合不上"的失败态。
-  依据是沃尔玛报错原文:"If you only have 1 item in a variant group, select
-  'Yes' in Is Primary Variant" —— 它明确支持 1 个成员的变体组。
+- **单品也带 groupId**:依据是沃尔玛报错原文 "If you only have 1 item in a
+  variant group, select 'Yes' in Is Primary Variant" —— 它明确支持 1 个成员的
+  变体组,于是第一个上架的兄弟就先占住组,以后的成员并进来即可,不必回头给
+  已在架的补发维护 feed(那要多一次写、多一份配额,还多一个"补发失败就永远
+  合不上"的失败态)。
+  ⚠ **"合并自动发生"的机制 2026-09-07 换了一套**:此前靠"组 ID 由 parent_asin
+  派生、各自独立算得到同一个串",而那等于把亚马逊 ASIN 从后门递给沃尔玛
+  (sku_plan §9.13 所有者定稿三条)。现在组号是**不透明码**,自动合并改由登记簿
+  `catalog.variant_groups` 查表实现(唯一发号出口 services/sku_codec.mint_group_code);
+  本模块只出**家族键** `family_key` —— 它是那张表的查表键,**永不发给沃尔玛**。
 """
 
 import logging
@@ -32,7 +37,6 @@ import re
 logger = logging.getLogger("services.variant_group")
 
 MAX_FAMILY = 20         # 所有者定稿:超过按单品上架
-_GROUP_PREFIX = "vg_"
 
 # 亚马逊维度名 → 沃尔玛属性名候选(按优先级)。沃尔玛各 PT 的
 # variantAttributeNames 枚举不同,调用方拿本 PT 的枚举与这里求交集取第一个。
@@ -122,24 +126,31 @@ def parse_family(raw, self_asin: str = "") -> list[str]:
     return seen
 
 
-def group_id(parent_asin, self_asin: str = "", family=()) -> str | None:
-    """输入:parent_asin(+ 本 ASIN 兜底 + 完整家族)→ 输出:变体组 ID;都空则 None。
+def family_key(parent_asin, self_asin: str = "", family=()) -> str | None:
+    """输入:parent_asin(+ 本 ASIN 兜底 + 完整家族)→ 输出:家族键;都空则 None。
 
-    由 parent_asin 派生 ⇒ 同族成员各自独立计算得到同一个 ID,不必互相查
-    ——这是"增量归组自动发生"的全部机制。
+    同族成员各自独立计算得到**同一个键** —— 这是"增量归组自动发生"的前半段:
+    后半段是拿这个键去 `catalog.variant_groups` 查/发不透明组号
+    (services/sku_codec.mint_group_code,组号的唯一之家)。
+
+    ⚠ **家族键是查表键,永不发给沃尔玛**(所有者定稿 2026-09-07 第 3 条):
+    它就是父 ASIN(或 min(家族)),发出去等于把亚马逊 ASIN 从后门递过去;
+    同理也不许拿它取哈希当组号 —— ASIN 空间公开可枚举,哈希等于没藏。
+    2026-09-07 之前本函数叫 `group_id` 且带 `vg_` 前缀,产出直接进载荷,那正是
+    被改掉的形态(docs/sku_wiring_audit.md G-7)。
 
     ⚠ **parent_asin 落在家族内时改用 min(家族)**(2026-08-17 照旧仓补,
     当日审查又收紧了一次)。旧仓设计文档 `variant_groups_design.md` §3.3 记着
     这个坑:它的采集侧(DMIT)每行的 parent_asin **就是该行自己的 ASIN**,拿它
-    当组 ID 会把同一组 N 个兄弟切成 N 个组,而且不报错 —— 所以旧仓一律用
+    当家族键会把同一组 N 个兄弟切成 N 个组,而且不报错 —— 所以旧仓一律用
     `min(full_set)`。
 
     判据是 **`p in 家族`,不是 `p == 自己`**。写成后者时"部分行 parent 填自己、
     部分行 parent 填某个兄弟"的**混合形态**会裂:填自己的那行走 min(家族),
-    填兄弟的那行走 parent,两个不同的 ID(审查实测:同一家族三行算出两个组)。
+    填兄弟的那行走 parent,两个不同的键(审查实测:同一家族三行算出两个组)。
     落在家族内一律 min(家族) 后,三种形态都稳:
-      · parent 是真族主(不在家族里,我们采集侧的生产实见形态)→ 按 parent 派生,
-        ID 更好认,且每个成员算出的都是同一个;
+      · parent 是真族主(不在家族里,我们采集侧的生产实见形态)→ 按 parent 取键,
+        键更好认,且每个成员算出的都是同一个;
       · parent 全填自己(旧仓 DMIT 形态)→ min(家族);
       · 混合 → min(家族)。
     min(家族) 的稳定性来自:同族每个成员算出的家族集合相同(自己 ∪
@@ -153,7 +164,7 @@ def group_id(parent_asin, self_asin: str = "", family=()) -> str | None:
     if fam and len(fam) > 1 and (not p or p in set(fam)):
         p = min(fam)
     p = p or me
-    return f"{_GROUP_PREFIX}{p}" if p else None
+    return p or None            # 裸键,**不带任何前缀**(前缀那版会被直接发出去)
 
 
 def pick_walmart_dims(amazon_dims, enum) -> list[tuple[str, str]]:
@@ -211,7 +222,13 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
                 no_dim / no_group_id。**别拿 reason 分词当键**——reason 是给人
                 看的中文长句,改一个字计数就散了
       reason    走 single 的原因(mode='variant' 时为 '')
-      group_id  变体组 ID
+      family_key 家族键(catalog.variant_groups 的查表键,**永不发出去**;
+                凑不出时 None ⇒ 退单品口径 no_group_id)
+      group_id  发给沃尔玛的变体组号:**只可能是**调用方从本店同族在架成员那里
+                拿到的现有组号(`existing_group_id`,含存量 vg_…),否则空串。
+                ⚠ 本模块**不再派生组号**(2026-09-07 所有者定稿三条):为空时由
+                接线侧在抽码事务里调 `sku_codec.mint_group_code` 按家族键发号
+                (workflows/list_new._prep_rows),那才是组号的唯一出生地
       attr_pairs [(沃尔玛属性名, 本 ASIN 的取值)] —— **可能多个**(color+size)。
                 属性名进 variantAttributeNames,取值各写进同名属性,
                 否则组内无差异
@@ -220,13 +237,16 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
       is_primary 是否本组主变体
 
     退回单品的四种情形,**每种都给出具体 reason**(静默降级 = 变体功能悄悄
-    没生效而没人知道):没有维度取值 / 家族超上限 / PT 枚举映不上 / 无组 ID。
+    没生效而没人知道):没有维度取值 / 家族超上限 / PT 枚举映不上 / 凑不出家族键。
+    ⚠ 最后那一档的 code 仍叫 `no_group_id`(摘要计数键不动),但判据从"派生不出
+    组 ID"变成了"凑不出家族键" —— 键凑不出就查不了表,也就没法发号。
     """
     attrs = parse_attrs(raw_attrs)
     family = parse_family(raw_family, asin)
-    gid = str(existing_group_id or "").strip() \
-        or group_id(parent_asin, asin, family)
+    fkey = family_key(parent_asin, asin, family)
+    gid = str(existing_group_id or "").strip()      # 在架同族的号,没有就空着
     out = {"mode": "single", "code": "", "reason": "", "group_id": gid,
+           "family_key": fkey,
            "attr_pairs": [], "unmapped_dims": [],
            # 存下来给接线侧用:`no_dim` 被错位重映射救回来时要重算 is_primary,
            # 那时已经拿不到这个入参了(2026-08-17 审查发现)
@@ -250,8 +270,8 @@ def plan(asin: str, raw_attrs, raw_family, parent_asin, enum,
         out.update(code="no_dim", unmapped_dims=sorted(attrs),
                    reason=f"PT 枚举映不上亚马逊维度 {sorted(attrs)}")
         return out
-    if not gid:
-        out.update(code="no_group_id", reason="无 parent_asin,凑不出稳定组 ID")
+    if not fkey:
+        out.update(code="no_group_id", reason="无 parent_asin,凑不出家族键")
         return out
     # 交集全体(旧仓 mapper.py:1374 同款口径),每对 = (沃尔玛属性名, 取值)。
     # 值的类型/enum 合法性由载荷层按本 PT spec 逐个校验(mp_conform)——

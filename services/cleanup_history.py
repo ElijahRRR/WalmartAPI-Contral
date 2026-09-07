@@ -76,7 +76,9 @@ class Folder:
             "occurred_at": r.get("run_ts"),
             "detail": {"category": code,
                        "name": CODE_TO_NAME.get(code, "未识别"),
-                       "reason": (str(r.get("reason") or "")[:200]) or None,
+                       # 全文,别截(2026-09-04:截断属于展示层,见
+                       # services/blacklist 头注的考古结论)
+                       "reason": str(r.get("reason") or "") or None,
                        "raw_category": (raw or None) if code is None else None},
         }
 

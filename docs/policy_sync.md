@@ -222,11 +222,16 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
    - **执行侧落地记录(2026-09-02,本批已实现)**:
      · `registry/resources.POLICY_LEGACY_NAMES` = 仓内**唯一一份**「表内旧名 → 官方名」
        映射(先收 §十.6 那 7 条;所有者 dry-run 发现新拼写差时在这里追加,**不许另起第二张表**);
-       仅供过渡期,生产改名落地后随第三步 L3 批与 `POLICY_ALIASES` 一起删;
-     · `policy_sync` 两级对行(`norm_category` 词形 + 旧名精确等值)+ 「将改名」清单 +
+       仅供过渡期 —— ⚠ **2026-09-03 C 批已连同 `POLICY_ALIASES` / `to_official` /
+       policy_sync 的旧名对行一级整体删除**(改名 2026-09-02 真跑落地,表内就是官方
+       拼写,映射表指向的是表里已不存在的旧名)。今后的改名走**人工入口**:报告的
+       「疑似改名对」把「未对上」与「官方已不含」里同概念的两条并排点名,由人裁决;
+     · `policy_sync` 两级对行(`norm_category` 词形 + 旧名精确等值;**旧名那一级
+       2026-09-03 C 批删除,只剩词形**)+ 「将改名」清单 +
        独立 `_RENAME_SQL`(同一事务、机器列 upsert **之前**、只 SET `category_en`、id 不变)+
        「改名冲突」扣留(目标名已被另一行占用 → 不改名也不刷新);摘要首行加「改名 R」;
-       「疑似改名对」保留 —— 它现在提示的是**还没进映射表**的拼写差,是追加映射的入口;
+       「疑似改名对」保留 —— C 批之后它是**改名的唯一人工入口**(此前提示的是
+       "还没进映射表的拼写差");
        ⚠ **两级不是 if/else**(2026-09-02 补批修正):旧名那一级必须照查,哪怕词形已经
        命中了别的行 —— 否则"旧名认领成功、但目标官方名已被表内另一行占用"(表里同时
        有 `Drugs & Paraphernalia` 与 `Drugs and Drug Paraphernalia`)那一行谁也没点到,
@@ -234,7 +239,14 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
        (判反的方向:人会去动库删行)。现在它落「改名冲突」、计入 touched、零写库;
        「两行登记同一旧名」同样归「改名冲突」,且那张官方页**不新增**(在一对待合并的
        行旁边再添第三行是把问题变三倍)。报告小节标题相应改为「未对上/不敢动」;
-     · `error_taxonomy.POLICY_ALIASES` 改为从 `POLICY_LEGACY_NAMES` 反向派生(不再手写);
+       ⚠ **2026-09-03 C 批**:旧名那一级退役后,这两种冲突场景不再可能发生
+       (词形命中天然同键,表里真有两行撞键走的是「不敢动」)。留下的差别一条:
+       表里同时留着「旧缩写名 + 官方名」两行时,旧行只进「官方已不含」(不删行、
+       零写),不再带「该名已被 id N 占用」那句提示 —— 代价是报告少一句话,
+       换掉的是一张永远不会再被验证的历史映射表;
+     · `error_taxonomy.POLICY_ALIASES` 改为从 `POLICY_LEGACY_NAMES` 反向派生(不再手写)
+       —— ⚠ 2026-09-03 C 批连同 `alias_gaps` 与报告头的「别名表健康」两行删除,
+       `policy_join` 只走词形归一(语义缩写对不上 = 进「政策表缺口」清单);
      · `audit_reason._L3_NORMALIZE` 删掉 20 条政策名(只留 brand_misuse / content standards
        两族**非政策伪类目**),`_normalize_l3_cat(cat, known=())` 改为对实时 `category_en`
        集合解析、命中回**表内原拼写**(解析规则走 `policy_names.resolve`,不在本文件
@@ -257,23 +269,58 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
        词形键 → 旧名翻译后重试,命中回**表内原拼写**,认不出给 None)。
        改名前后同一份代码都活,**写死旧缩写名的地方不必跟着改名批改字面量**;
        只 import `re` 与 `registry`(铁律 1:services 不许 import workflows);
+       ⚠ **2026-09-03 C 批**:`to_official` 与 `resolve` 的第 4 级删除,只剩
+       1–3 级(精确 / casefold / 词形键),模块从此只 import `re`。语义缩写
+       **解析不到就是解析不到** —— 那是正确答案,它要人裁决是改名还是新增;
      · 跟着改走它的四处:`policy_sync`(import 而非自带一份)、
        `audit_l3.route_policy_hints`(两张路由表的 29 个政策名逐个 resolve ——
        旧写法 `c in known` 改名后**静默丢 7 条**政策提示)、
        `audit_reason._normalize_l3_cat` 与**步 1.5**(`audit_l2._infer_walmart_policy`
        那批旧缩写名的唯一出口)、`error_taxonomy._norm_key`;
-     · 遗留(本批不动,已在代码里标注):
+       ⚠ 前三处**已随 2026-09-02 第三步 B1 批退役**(路由表整删、理由映射收敛为
+       查表),`resolve` 现在的消费方是 `audit_l3.parse_l3_reply`(L3 答出的类别
+       对枚举)、`audit_phase0`(黑名单行的 `walmart_policy` 对表)、
+       `audit_rules.check_rule_policies`(装配期守门)与 `error_taxonomy`;
+     · 遗留(改名批不动,已在代码里标注;**①②已随 B1 消化**,见下条):
        ① `audit_reason._pt_to_policy`(步 4c)与 4d cert 分桶里写死的旧缩写名 ——
           那两步是 PT/类目关键词**兜底推断**,输入不是政策名,对表反而会把"推断"
           伪装成"表里查到的";改名后它们落在表外(只多几条 warning 计数,判定不变),
-          改法随「L3 输出规范化」一起定;
+          改法随「L3 输出规范化」一起定 → **B1 整段删除**(理由映射收敛为查表);
        ② `audit_l3` 路由表里 `Pet Products` 与 `Jewelry/Precious Metals` 两条 ——
           官方 42 名里根本没有这两个类别名(官方是 `Pet Foods, Supplements,
           Medicines and Other Products`;Jewelry 那条是旧仓自造的斜杠写法),
-          归一化也打不平。**改名前就是死的**,不是本批改坏的;现在每次命中记
-          warning + 计数并进 run 摘要(旧写法只记 debug,等于没人看得见);
-       ③ `audit_l2._infer_walmart_policy` 的常量仍是旧缩写名 —— **不逐条改**,
-          由步 1.5 单一出口解析(常量的枚举化随「L3 输出规范化」一起定)。
+          归一化也打不平。**改名前就是死的**,不是改名批改坏的 → **B1 整张路由表
+          删除**(政策类别 ≠ 类目,换全文后提示只会把注意力锁在 ≤5 篇上);
+       ③ `audit_l2._infer_walmart_policy` 的常量仍是旧缩写名 —— **不逐条改**;
+          B1 后理由映射不再读 `walmart_policy` → **C 批(2026-09-03)随 R3/R5/R7/R8
+          整条删除**,四张字面量表一起走(政策名不许由类目/PT 名/认证词推断)。
+
+     · **「L3 输出规范化」落地口径(2026-09-02 第三步 B1 批,规格
+       `docs/audit_step3_spec.md` §二/§3.3/§3.4/§3.5)** —— §十.7 第四条
+       「审核输出与最终结果统一为三段」的落纸:
+
+       · **类别词表**:官方 `category_en` 实时集合(44)+ registry 常量
+         `AUDIT_NONPOLICY_CATEGORIES`(`内部黑名单` / `类目准入`)+ pass 的
+         `none`。**零兜底**:判拒而没有类别 = 代码 bug,落 NULL + 计数 +
+         warning,不许再有 `General-Use Products` 那样的兜底值;
+       · **来源只有两处**:硬拒规则在 `hit.detail["category"]` 里**自报**
+         (§二 表),L3 在结构化输出的 `policy` 里给。规则代码里写死的政策名
+         只剩一个(`resources.AUDIT_IP_POLICY`),`audit_rules.load_context`
+         装配时对表解析一次 —— 解析不到或拼写不同**启动即 RuntimeError**;
+       · **解析层对表**:`parse_l3_reply` 用 `policy_names.resolve(policy,
+         枚举)` 回表内原拼写;**对不上 → pending `llm_bad_policy` + 计数**
+         (旧版降级猜 `intellectual property`,已删)。于是下游一层归一化都
+         不需要:`audit_reason._normalize_l3_cat` / `_L3_NORMALIZE` /
+         `known_policies_check` 随之退役;
+       · **落库三段**:`catalog.products` 新增 `audit_detail`;`audit_reason`
+         专放类别(pass 与 pending 为 NULL);`audit_runs.l3_reason_category`
+         / `l3_reason_text` **列名不改、语义 = 类别 / 具体内容**;
+         `product_events.audit_rejected` 的 `detail.reason` 键名不改,新增
+         `detail.detail`;飞书上架表 F/G/H 三列对齐同一口径(老行按有没有
+         `audit_detail` 决定用新格式还是老格式渲染);
+       · **提示词侧**:S4 改喂 `full_policy` 的 `render_feed_text` 渲染件
+         (人工中文列不再进提示词);全文为空的行整条跳过并计数;S2 枚举
+         删 `brand_misuse`(品牌误用归 IP,由确定性翻拒规则落地)。
      · **已解决(与上一版记录相反,勿照旧引用)**:`error_taxonomy._norm_key` 已归并为
        `policy_names.norm_category`(不再是"只折叠空白 + casefold"),于是
        `Plants & Seeds` / 牛津逗号 Tobacco / 无 `(Covered Goods)` 的 Jewelry 三种报错
@@ -281,3 +328,13 @@ v1(官方→PG 英文区)不依赖 v2,先行落地 —— L3 换喂英文全文�
        改名后 19/19;旧手写实现是 15/19 与 16/19,测试钉住"只许升不许降")。
        连带:`alias_gaps()` 在目标态报的是 **5 条**不是 7 条 —— `Auto & Motor Vehicles`
        与 `Textiles & Apparel` 只差 `&`↔`and`,归一化已经够用,别名本身多余。
+
+8. **内容族两页入表(2026-09-02,A 批)**:`refdata/policy_pages/en/` 从 42 份增至 44 份 ——
+   43 `Content standards: Overview`(登录墙,所有者粘贴;H1 已确认,FAQ 段待补录)与 44
+   `Product details policy`(公开页,页面结构化数据渲染 + 粘贴交叉核对)。它们不是
+   Prohibited Products Policy 类别,是沃尔玛「violates Walmart's content policy」/「unverified
+   authenticity claims」两类下架原因所指页面;进同一张表、同一条 S4 块、同一个类别枚举
+   (理由与 L3 用法见 `docs/audit_step3_spec.md` §一 / §二)。**入库动作推迟到第三步 B/C 批
+   切换时一起跑**(现在跑一次 = L3 缓存白白再失效一次)。喂入层随之补两条机械规则:
+   `![alt](url)` 图片整行删(alt 只是文件名)、表尾整行空单元格不算数据行。
+

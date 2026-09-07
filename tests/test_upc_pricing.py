@@ -97,15 +97,90 @@ def test_claim_reuses_prior_upc_for_same_store_asin():
     assert upd_rows == [("T1", "B0NEW", "000000000024")]     # 复用行不再 UPDATE
 
 
-def test_burn_for_retire_marks_conflict():
-    """RETIRE 成功后旧号永久弃用(标 conflict):不烧的话 claim 的复用逻辑
-    会把旧号还给同 (店,ASIN),"清列重上领新号"就成了空话。"""
+def test_burn_writes_the_status_it_is_given_and_refuses_anything_else():
+    """烧号**只有 `burn(conn, pairs, status)` 一条实现路径**(批次 2 决策 D:
+    旧 burn_for_retire 与按单号写 conflict 的 mark_conflict 都已删)。
+
+    状态由 sku_codec 的弃码原因分派表给,本函数不猜;传个没登记的字样进来
+    直接抛 —— 池表投影与 pool_stats 里多出一支没人认识的状态是静默的。
+    不烧的后果:claim 的原号复用把旧号还给同 (店,ASIN),"清列重上领新号"
+    就成了空话。
+    """
+    import pytest as _pytest
     conn = _Conn()
-    assert upc_pool.burn_for_retire(conn, [("T1", "B0X")]) == 1
-    sql, _ = conn.sqls[0]
-    assert "status = 'conflict'" in sql
+    assert upc_pool.burn(conn, [("T1", "B0X")], upc_pool.BURN_LOCK) == 1
+    sql, args = conn.sqls[0]
+    assert "SET status = %s" in sql                       # 状态是参数,不写死
+    assert args[0] == upc_pool.BURN_LOCK
     assert "status IN ('claimed', 'used')" in sql
-    assert upc_pool.burn_for_retire(conn, []) == 0
+    assert upc_pool.burn(conn, [], upc_pool.BURN_DELETE) == 0
+    with _pytest.raises(ValueError):
+        upc_pool.burn(conn, [("T1", "B0X")], "used")      # 非法状态 fail loud
+    assert not hasattr(upc_pool, "burn_for_retire")       # 单一路径:旧名已删
+    assert not hasattr(upc_pool, "mark_conflict")
+
+
+def test_burn_statuses_are_registered_in_schema_and_labels():
+    """主动烧号有**独立状态值**,不复用语义为「撞库」的 conflict。
+
+    复用的话,UPC 池表投影与 pool_stats 里永远分不清"这号是撞库废的"还是
+    "我们弃码时主动烧的" —— 两者的处置完全不同(前者要查是谁先占了号)。
+    三处口径必须齐:常量 / 表格文案 / schema.sql 的状态机注释。
+    """
+    import pathlib as _p
+    assert upc_pool.BURN_DELETE == "burned_delete"
+    assert upc_pool.BURN_LOCK == "burned_lock"
+    assert upc_pool.STATUS_CN[upc_pool.BURN_DELETE] == "删除烧号"
+    assert upc_pool.STATUS_CN[upc_pool.BURN_LOCK] == "锁死烧号"
+    assert upc_pool.STATUS_CN[upc_pool.CONFLICT] == "冲突"   # 撞库的语义没被挪用
+    schema = _p.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    pool = schema[schema.index("CREATE TABLE IF NOT EXISTS catalog.upc_pool"):]
+    assert "burned_delete/burned_lock" in pool.splitlines()[2]   # status 行内注释
+    for v in ("burned_delete", "burned_lock"):
+        assert v in schema
+
+
+def test_retag_sku_moves_the_code_without_touching_asin_status_or_used_at():
+    """改码后号还是那个号,只是它现在挂在新 SKU 名下(SKU 改造批次 3 地基)。
+
+    `sku` 列的语义是"这个号现在被哪个沃尔玛 SKU 占着"。不改它,列里存的就是一个
+    已经不存在于沃尔玛的串,而撞库标记与池表投影都按它反查 —— 反查不到就是标不上、
+    归属显示错,**而且不报错**。
+    """
+    conn = _Conn()
+    assert upc_pool.retag_sku(conn, [("T1", "B0X", "AN3WC0DE2345")]) == 1
+    sql, args = conn.sqls[0]
+    assert "SET sku = t.new_sku" in sql
+    assert "status =" not in sql and "used_at" not in sql   # 不是新消耗,时间戳不动
+    assert "asin = t.a" in sql and "SET asin" not in sql    # asin 是领号复用键,不动
+    assert args == (["T1"], ["B0X"], ["AN3WC0DE2345"])
+    assert upc_pool.retag_sku(conn, []) == 0
+
+
+def test_retag_sku_skips_rows_that_are_not_claimed_or_used():
+    """状态条件与 `burn` **逐字一致**:两个改池表的出口口径不一致本身就是漂移源。
+
+    未用('')/撞库/烧掉的号不该被改标 —— 它们根本没挂在任何在架 SKU 名下。
+    """
+    conn = _Conn()
+    upc_pool.retag_sku(conn, [("T1", "B0X", "AN3WC0DE2345")])
+    assert "status IN ('claimed', 'used')" in conn.sqls[0][0]
+    burn_conn = _Conn()
+    upc_pool.burn(burn_conn, [("T1", "B0X")], upc_pool.BURN_LOCK)
+    cond = "status IN ('claimed', 'used')"
+    assert cond in burn_conn.sqls[0][0] and cond in conn.sqls[0][0]
+
+
+def test_claim_reuse_ignores_burned_rows():
+    """领号的原号复用是**白名单** status IN ('claimed','used') —— 烧掉的号
+    天然被排除,不需要为新状态值再补一条排除条件(补了就是第二处口径)。"""
+    conn = _Conn(fetch=[("000000000024",)])
+    upc_pool.claim(conn, [{"store": "T1", "asin": "B0X"}])
+    reuse_sql = conn.sqls[0][0]
+    assert "status IN ('claimed', 'used')" in reuse_sql
+    for burned in (upc_pool.BURN_DELETE, upc_pool.BURN_LOCK):
+        assert burned not in reuse_sql
+    assert "status = ''" in conn.sqls[1][0]                  # 新号只从未用态里领
 
 
 def test_release_only_three_reasons():

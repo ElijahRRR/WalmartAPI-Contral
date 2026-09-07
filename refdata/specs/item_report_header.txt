@@ -1,0 +1,55 @@
+SKU
+Item ID
+Product Name
+Lifecycle Status
+Publish Status
+Status Change Reason
+Product Category
+Product Type
+Price
+Currency
+Price Type
+Promo Start Date
+Promo End Date
+Comparison Price
+Comparison Price Type
+Buy Box Item Price
+Buy Box Shipping Price
+Buy Box Eligible
+MSRP
+Product Tax Code
+Ship Methods
+Shipping Weight
+Shipping Weight Unit
+Fulfillment Lag Time
+Fulfillment Type
+WFS Sales Restriction
+WPID
+GTIN
+UPC
+Item Page URL
+Primary Image URL
+Shelf Name
+Primary Category Path
+Brand
+Offer Start Date
+Offer End Date
+Item Creation Date
+Item Last Updated
+Reviews Count
+Average Rating
+Searchable?
+Variant Group Id
+Primary Variant?
+Variant Grouping Attributes
+Variant Grouping Values
+Competitor URL
+Competitor Price
+Competitor Ship Price
+Competitor Last Date Fetched
+Repricer Strategy
+Minimum Seller Allowed Price
+Maximum Seller Allowed Price
+Repricer Status
+Product Condition
+Lagtime Category

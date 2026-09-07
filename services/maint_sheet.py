@@ -281,8 +281,8 @@ def resync_from_ledger() -> str:
             f"旧值/新值两列补不回来,PG 里没存)")
 
 
-def sync_from_ledger() -> str | None:
-    """输入:无 → 输出:回写摘要一行(无待回填区间才返 None)。
+def sync_from_ledger(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:回写摘要一行(无待回填区间才返 None)。
 
     ⚠ 只有 append_records 写过行、水位推进过,这里才有区间可扫。
     maintenance 走 PUT 路由的行 H="sync"、J 当场落定,不参与回填。
@@ -355,12 +355,15 @@ def sync_from_ledger() -> str | None:
                         [[text, err]]))
         if prefix_done:
             new_lo = rownum + 1
+    tail = f",其中超 {STALE_DAYS} 天判未查到 {n_stale} 行" if n_stale else ""
+    if not execute:
+        return (f"[DRY-RUN] 维护记录:将回填 {len(updates)} 行(扫描区间 "
+                f"{lo}~{hi - 1}),水位将推到 {new_lo}{tail}")
     n = feishu.sheet_write_ranges(resources.MAINT_SHEET, updates) if updates else 0
     if new_lo != lo:
         cur_state["unresolved_from"] = new_lo
         with db.pg_conn() as conn:
             _save_cursor(conn, cur_state)
-    tail = f",其中超 {STALE_DAYS} 天判未查到 {n_stale} 行" if n_stale else ""
     if not updates:
         return f"维护记录:未落定 {hi - lo} 行,台账尚无新终态" if hi > lo else None
     return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1}){tail}"

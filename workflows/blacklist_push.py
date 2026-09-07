@@ -110,6 +110,17 @@ def _rebuild_brand(do_apply: bool) -> str:
             f" + 时间线推导 {st['derived']} 个;beyKyi 整表重写 {n} 行")
 
 
+def _opaque_note(c: dict) -> str:
+    """输入:backfill_counts 结果 → 输出:不透明码键告警(零时返空串)。
+
+    零时返空串是硬要求:摘要要与加这一档之前逐字相同(生产库里今天不该有
+    不透明码)。非零 = 那批键登记簿查不到,拦不住任何东西(见 D-0b-1)。
+    """
+    n = c.get("opaque") or 0
+    return (f";⚠ 其中 {n} 个键形如不透明码(登记簿查不到 ⇒ 拦不住任何东西),"
+            f"见 D-0b-1") if n else ""
+
+
 def _rebuild_asin(do_apply: bool) -> str:
     """输入:是否 apply → 输出:ASIN 黑名单重建摘要。先跑 sku_normalize
     清洗事件账本,再来重建——否则重灌出来的键还是订货号原文。"""
@@ -117,17 +128,25 @@ def _rebuild_asin(do_apply: bool) -> str:
     with db.pg_conn() as conn:
         c = blacklist.backfill_counts(conn)
         if not do_apply:
-            filled = sheets.next_empty(sheet) - 2
+            # ⚠ 报 **PG** 的数,不报飞书表格行数(原先取的是
+            #   `sheets.next_empty(sheet) - 2`,而删的是 PG —— 报的不是要删的
+            #   那个数,人核对不了)。
             return (f"ASIN 黑名单重建预览:时间线按标准 asin 归并后共 "
                     f"{c['total']} 个,永久禁止 {c['permanent']} 个;"
-                    f"ASIN 表现有 {filled} 行将被整表重写为 {c['permanent']} 行"
-                    f"(键=清洗后 asin,日期=报错发生日);加 -p apply=1 执行")
+                    f"PG 表现有 {c['in_table']} 行 ⇒ **有事件背书的 "
+                    f"{c['in_table'] - c['untouched']} 行会被重灌成 "
+                    f"{c['permanent']} 行**,"
+                    f"另外 **{c['untouched']} 行没有产品事件背书,一条都不碰**"
+                    f"(历史导入,重灌不出来 —— 所有者 2026-09-04 定「需要保留」);"
+                    f"键=清洗后 asin,日期=报错发生日;加 -p apply=1 执行"
+                    + _opaque_note(c))
         st = blacklist.rebuild_asin_blacklist(conn)
     n = sheets.rewrite_sheet(sheet, sheets.ASIN_ALL,
                              sheets.ASIN_MARK_ALL,
                              allow_shrink=True)   # 擦净重灌,缩是预期
-    return (f"ASIN 黑名单重建:擦净 {st['wiped']} 行 → 按标准 asin 重灌 "
-            f"{st['inserted']} 行;ASIN 表整表重写 {n} 行")
+    return (f"ASIN 黑名单重建:删掉有事件背书的 {st['wiped']} 行 → 按标准 asin "
+            f"重灌 {st['inserted']} 行;**没有事件背书的 {st['untouched']} 行"
+            f"原样保留**;ASIN 表整表重写 {n} 行")
 
 
 def run(params: dict) -> str:
@@ -136,7 +155,9 @@ def run(params: dict) -> str:
 
     -p backfill=1:ASIN 历史回填(预览计数;加 -p apply=1 真写后顺路投影)。
     -p rebuild_asin=1 / rebuild_brand=1:两侧重建(见各自函数)。
-    都是一次性动作,重复跑无害(DO NOTHING/擦净重灌都幂等)。
+    ⚠ `backfill` 重复跑无害(ON CONFLICT DO NOTHING);两个 `rebuild` 是
+      **先删后灌**,只有「删得掉的等于灌得回的」才谈得上无害 —— `rebuild_asin`
+      因此只删有产品事件背书的行(2026-09-04,见 `blacklist._ASIN_WIPE_SQL`)。
     """
     if str(params.get("probe", "")).lower() in {"1", "true", "yes"}:
         return _probe()
@@ -153,10 +174,24 @@ def run(params: dict) -> str:
         with db.pg_conn() as conn:
             c = blacklist.backfill_counts(conn)
             if not do_apply:
-                return (f"历史回填预览:时间线共 {c['total']} 个 ASIN,"
-                        f"最新类别属永久禁止 {c['permanent']} 个(将入 ASIN 黑名单);"
-                        f"品牌渠道的历史重建走 -p rebuild_brand=1;"
-                        f"加 -p apply=1 真写并顺路投影")
+                top = "  ".join(
+                    f"{k}×{n}" for k, n in c["fresh_codes"].most_common(8))
+                return "\n".join([
+                    f"历史回填预览:产品历史共 {c['total']:,} 个 ASIN,"
+                    f"按**全部历史报错、够格拉黑的那条优先**判定后,"
+                    f"该永久拉黑 {c['permanent']:,} 个" + _opaque_note(c),
+                    f"  表里现有 {c['in_table']:,} 行 ⇒ **真跑只会新增 "
+                    f"{c['fresh']:,} 条**(ON CONFLICT DO NOTHING,已在表里的不动;"
+                    f"**回填只加不减**)",
+                    f"  将新增,按新码:{top}" if top else "  没有要新增的行",
+                    "  ⚠ **这里是产品级判定,而 `asin_blacklist.taxonomy_code` 是"
+                    "行级记录** —— 前者看该 asin 的全部历史(所有者 2026-09-04:"
+                    "「被拉黑的那个作为最高优先级,其他的都是作为记录」),"
+                    "后者只是那一行入选时那条原文的归类。两者**本来就会不一样**,"
+                    "不一样时**以产品级为准**(`blacklist_route` 删行前也按"
+                    "产品级判定救一遍,两边同一份判据)。",
+                    "  品牌渠道的历史重建走 -p rebuild_brand=1;加 -p apply=1 真写并顺路投影",
+                ])
             st = blacklist.backfill_from_events(conn)
         lines.append(f"历史回填:ASIN +{st['asin_new']}")
 

@@ -5,7 +5,8 @@ feishu_sync.py/relisting.py,2026-08-06 从 erpAPI@d5237fb 提取)。
 
 ⚠ **反补机制 2026-08-28 所有者定稿退役**:「publishedStatus 不是 PUBLISHED 的
 都进行删除,不再修改 End Date 救商品」。归类不再决定处置走向(一律删除),
-只服务三件事:病历(problem_categorized 事件)、黑名单收集(B/C/E/F/G/K)、
+只服务三件事:病历(problem_categorized 事件)、黑名单收集(2026-09-04 换轨后
+改吃 `error_taxonomy.PERMANENT_CODES`,本模块不再参与入选判据)、
 摘要按类计数。反补构造器(build_relist_item/pick_product_id/NEW_END_DATE)
 与计数常量(MAX_ATTEMPTS/ATTEMPT_RESET_DAYS)、Stage 豁免(is_stage_pending)
 随之删除 —— 需要考古看 git;A 类反补当年的语病也一并留档:「end date has
@@ -45,14 +46,12 @@ _RULES = {
 _SEVERITY_ORDER = ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "B", "A"]
 
 
-def categorize(reason_text: str | None) -> tuple[str, str]:
-    """输入:错误原因文本 → 输出:(类别码, 中文名);无命中 ('Z', '其他')。"""
-    t = (reason_text or "").lower()
-    for code in _SEVERITY_ORDER:
-        name, pred = _RULES[code]
-        if pred(t):
-            return code, name
-    return "Z", "其他"
+# ⚠ `categorize()`(旧 A-L 单字母归类引擎)已于 2026-09-04 删除。
+# 所有者:「删除旧码,我们已经迁移到新码,旧码不需要留。把口径做统一」。
+# 全仓归类只有一条路:`services/error_taxonomy.classify_reasons`。
+# **`_RULES` 保留**,但它现在只是一张「旧码 → 中文名」的查表,给**读历史数据**
+# 的两处用(`services/cleanup_history` 认旧库的类别值、`error_reclass_report`
+# 把黑名单表里入选那一刻的旧码显示成人话)—— 读历史 ≠ 判据路径。
 
 
 # (反补构造器与 Stage 豁免原在此处,2026-08-28 退役删除 —— 见模块头注)

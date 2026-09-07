@@ -27,20 +27,38 @@ def test_parse_family_adds_self():
     assert vg.parse_family(None, "") == []
 
 
-def test_group_id_is_derived_not_looked_up():
-    """同族成员各自独立算得到同一个 ID —— 这是"增量归组自动发生"的全部机制。
+def test_family_key_is_derived_not_looked_up():
+    """同族成员各自独立算得到同一个**家族键** —— 这是"增量归组"的前半段,
+    后半段是拿这个键去 `catalog.variant_groups` 查/发不透明组号。
 
-    不由 ID 相等来保证的话,就得回头给已在架的成员补发 MP_MAINTENANCE,
-    多一次写、多一份配额,还多一个"补发失败就永远合不上"的失败态。
+    键不相等的话,同一族会被查成两族、发两个组号,于是兄弟们分散在两个变体组里
+    (要合回来只能补发 MP_MAINTENANCE:多一次写、多一份配额,还多一个"补发失败
+    就永远合不上"的失败态)。
     """
-    a = vg.group_id("B000AMXQVI", "B0009GGJ9G")
-    b = vg.group_id("b000amxqvi", "B0009GGJDW")      # 不同成员、大小写不同
-    assert a == b == "vg_B000AMXQVI"
-    assert vg.group_id("", "B0X") == "vg_B0X"        # 无父体退回自身
-    assert vg.group_id(None, "") is None
+    a = vg.family_key("B000AMXQVI", "B0009GGJ9G")
+    b = vg.family_key("b000amxqvi", "B0009GGJDW")    # 不同成员、大小写不同
+    assert a == b == "B000AMXQVI"                    # **裸键,无 vg_ 前缀**
+    assert vg.family_key("", "B0X") == "B0X"         # 无父体退回自身
+    assert vg.family_key(None, "") is None
 
 
-def test_group_id_self_parent_falls_back_to_min_family():
+def test_family_key_never_carries_a_prefix():
+    """⚠ 家族键是**查表键,永不发给沃尔玛**(所有者定稿 2026-09-07 第 3 条)。
+
+    带前缀的那一版(`vg_<父 ASIN>`)是直接写进载荷 variantGroupId 的,等于把
+    亚马逊 ASIN 从后门递过去(docs/sku_wiring_audit.md G-7)。前缀没了,拼回去
+    也没有第二处能拼 —— 守门 tests/test_sku_guard.py 钉住全仓代码里不许再出现
+    `vg_` 字面量。
+    """
+    assert not hasattr(vg, "_GROUP_PREFIX")
+    assert not hasattr(vg, "group_id")               # 改名不留兼容壳(双轨禁止)
+    for k in (vg.family_key("B000AMXQVI", "B0009GGJ9G"),
+              vg.family_key("", "B0X"),
+              vg.family_key("", "B0000000A1", ["B0000000A1", "B0000000A2"])):
+        assert k and not k.startswith("vg"), k
+
+
+def test_family_key_self_parent_falls_back_to_min_family():
     """⚠ parent_asin **等于自己**时拿它当组 ID,会把同组 N 个兄弟切成 N 组。
 
     旧仓 `variant_groups_design.md` §3.3 记着这个坑:它的采集侧(DMIT)每行的
@@ -48,13 +66,13 @@ def test_group_id_self_parent_falls_back_to_min_family():
     给真族主,但它哪天改回"填自己",这里得能自愈 —— 而且不报错的分裂最难查。
     """
     fam = ["B0000000A1", "B0000000A2", "B0000000A3"]
-    ids = {vg.group_id(a, a, fam) for a in fam}      # parent 全填自己
-    assert ids == {"vg_B0000000A1"}                  # 三个兄弟同一个 ID
-    # 真族主(生产实见形态)照旧按 parent 派生,ID 更好认
-    assert vg.group_id("B000AMXQVI", "B0009GGJ9G",
-                       ["B0009GGJ9G", "B0009GGJCI"]) == "vg_B000AMXQVI"
+    keys = {vg.family_key(a, a, fam) for a in fam}   # parent 全填自己
+    assert keys == {"B0000000A1"}                    # 三个兄弟同一个键
+    # 真族主(生产实见形态)照旧按 parent 取键
+    assert vg.family_key("B000AMXQVI", "B0009GGJ9G",
+                         ["B0009GGJ9G", "B0009GGJCI"]) == "B000AMXQVI"
     # 孤品(家族只有自己)不受影响
-    assert vg.group_id("", "B0000000A1", ["B0000000A1"]) == "vg_B0000000A1"
+    assert vg.family_key("", "B0000000A1", ["B0000000A1"]) == "B0000000A1"
 
 
 def test_pick_walmart_dim_never_guesses():
@@ -73,7 +91,8 @@ def test_plan_variant_happy_path():
     p = vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI,B0009GGJDW",
                 "B000AMXQVI", _ENUM)
     assert p["mode"] == "variant" and p["reason"] == ""
-    assert p["group_id"] == "vg_B000AMXQVI"
+    assert p["family_key"] == "B000AMXQVI"      # 查表键
+    assert p["group_id"] == ""                  # 组号待发(_prep_rows 的抽码事务)
     assert p["attr_pairs"] == [("color", "Black")]
     assert p["family_size"] == 3 and p["is_primary"] is True
 
@@ -143,7 +162,7 @@ def test_every_single_fallback_states_a_reason():
         (vg.plan("A1", "color_name=X", ",".join(f"B{i}" for i in range(25)),
                  "P1", _ENUM), "超上限"),
         (vg.plan("A1", "flavor_name=X", "A2", "P1", _ENUM), "映不上"),
-        (vg.plan("", "color_name=X", "", "", _ENUM), "凑不出稳定组 ID"),
+        (vg.plan("", "color_name=X", "", "", _ENUM), "凑不出家族键"),
     ]
     for got, needle in cases:
         assert got["mode"] == "single" and needle in got["reason"], got
@@ -157,6 +176,17 @@ def test_boundary_exactly_at_limit_is_still_variant():
 
 
 # ── mp_conform 接线回归 ──────────────────────────────────────────────────────
+
+#: 一个**已发号**的决策:2026-09-07 起 `plan()` 只出家族键,组号由
+#: `sku_codec.mint_group_code` 在 list_new 的抽码事务里发号后写回 `_vplan`。
+#: 载荷层的用例要的是发号**之后**的形态,所以统一经这个小工具补上。
+_CODE = "GX7QM2X9RT4W"          # G + 11 位:与真发出来的组号同形态
+
+
+def _minted(p: dict, code: str = _CODE) -> dict:
+    """输入:plan 的产出 → 输出:补上组号的副本(模拟 _prep_rows 发号后的写回)。"""
+    return {**p, "group_id": code}
+
 
 # ⚠ 照抄 tests/test_mp_conform._VSPEC 的真实形态:variantAttributeNames 必须带
 # "type": "array" —— 少了它 _type_of 默认 "string",_enum_of 就取不到 items.enum,
@@ -172,14 +202,31 @@ _VSPEC = {"properties": {
 def test_conform_writes_full_bag_and_the_differentiating_value():
     """三件套 + **维度取值**都要落盘:组内没有差异值,沃尔玛看不出这几个有何不同。"""
     from services import mp_conform as mc
-    p = vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI,B0009GGJDW",
-                "B000AMXQVI", ["color", "size"])
+    p = _minted(vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI,B0009GGJDW",
+                        "B000AMXQVI", ["color", "size"]))
     v, notes = mc.ensure_variant_bag(_VSPEC, {}, "SKU1", plan=p)
-    assert v["variantGroupId"] == "vg_B000AMXQVI"
+    assert v["variantGroupId"] == _CODE
+    assert "B000AMXQVI" not in str(v)                 # ASIN 一个字都不外递
     assert v["variantAttributeNames"] == ["color"]
     assert v["isPrimaryVariant"] == "Yes"
     assert v["color"] == "Black"                      # 差异值
-    assert any("变体组 vg_B000AMXQVI" in n for n in notes)
+    assert any(f"变体组 {_CODE}" in n for n in notes)
+
+
+def test_conform_never_sends_an_empty_group_id():
+    """⚠ 组号为空(上游漏发号)**一律不发**:照发就是一个空 variantGroupId ——
+    要么整条被拒,要么沃尔玛把不相干的品并进同一个"空号组"。
+
+    这是 2026-09-07 组号改不透明码之后补的最后一道:组号从此不是派生出来的,
+    而是 `sku_codec.mint_group_code` 发的,漏发是一种真实可能的上游故障。
+    """
+    from services import mp_conform as mc
+    p = vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI", "B000AMXQVI",
+                ["color", "size"])
+    assert p["mode"] == "variant" and p["group_id"] == ""
+    v, notes = mc.ensure_variant_bag(_VSPEC, {}, "SKU1", plan=p)
+    assert not any(k in v for k in mc._VARIANT_BAG)   # 三件套一个不留
+    assert any("变体组号缺失" in n for n in notes), notes
 
 
 def test_conform_rechecks_enum_and_falls_back_rather_than_guessing():
@@ -188,7 +235,7 @@ def test_conform_rechecks_enum_and_falls_back_rather_than_guessing():
     不复核就会发出 PT 不认的属性名,整条被拒(additionalProperties=false)。
     """
     from services import mp_conform as mc
-    p = dict(vg.plan("A1", "color_name=Black", "A2", "P1", ["color"]))
+    p = _minted(vg.plan("A1", "color_name=Black", "A2", "P1", ["color"]))
     spec = {"properties": {
         "variantGroupId": {"type": "string"}, "isPrimaryVariant": {"type": "string"},
         "variantAttributeNames": {"type": "array", "items": {"enum": ["size"]}}}}
@@ -218,7 +265,7 @@ def test_conform_only_writes_fields_the_spec_registered():
     这是我们比旧仓严的一处,不是迁漏。)
     """
     from services import mp_conform as mc
-    p = vg.plan("A1", "color_name=Black", "A2", "P1", ["color"])
+    p = _minted(vg.plan("A1", "color_name=Black", "A2", "P1", ["color"]))
     spec = {"properties": {
         "variantGroupId": {"type": "string"},
         "variantAttributeNames": {"type": "array", "items": {"enum": ["color"]}}}}
@@ -239,8 +286,8 @@ def test_conform_drops_one_bad_value_without_killing_the_group():
                                   "items": {"enum": ["color", "size"]}},
         "color": {"type": "string", "enum": ["Black", "Navy"]},
         "size": {"type": "string"}}}
-    p = vg.plan("A1", "color_name=Chartreuse; size_name=L", "A2", "P1",
-                ["color", "size"])
+    p = _minted(vg.plan("A1", "color_name=Chartreuse; size_name=L", "A2", "P1",
+                        ["color", "size"]))
     v, notes = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
     assert v["variantAttributeNames"] == ["size"] and v["size"] == "L"
     assert "color" not in v
@@ -254,7 +301,7 @@ def test_conform_coerces_integer_variant_values():
         "variantGroupId": {"type": "string"},
         "variantAttributeNames": {"type": "array", "items": {"enum": ["count"]}},
         "count": {"type": "integer"}}}
-    p = vg.plan("A1", "number_of_items=6", "A2", "P1", ["count"])
+    p = _minted(vg.plan("A1", "number_of_items=6", "A2", "P1", ["count"]))
     v, _ = mc.ensure_variant_bag(spec, {}, "SKU1", plan=p)
     assert v["count"] == 6 and isinstance(v["count"], int)
 
@@ -267,6 +314,33 @@ def test_code_is_stable_for_counting():
                    "P1", _ENUM)["code"] == "oversize"
     assert vg.plan("A1", "flavor_name=B", "A2", "P1", _ENUM)["code"] == "no_dim"
     assert vg.plan("", "color_name=B", "", "", _ENUM)["code"] == "no_group_id"
+
+
+def test_plan_never_puts_an_asin_or_a_vg_prefix_into_the_group_id():
+    """⚠ 目标级断言(所有者定稿 2026-09-07 第 3 条):**决策里的组号绝不含 ASIN**。
+
+    改造前 `group_id` 由 parent ASIN 派生并加 `vg_` 前缀,直接进载荷的
+    variantGroupId —— SKU 那条线的 ASIN 摘干净了,组号这条线还在往外递
+    (docs/sku_wiring_audit.md G-7)。现在 plan 只可能给出两种值:空串(待发号)
+    或调用方从**在架成员**取回的现有组号。哈希 ASIN 那条路同样禁止:ASIN 空间
+    公开可枚举,哈希等于没藏。
+    """
+    cases = [
+        vg.plan("B0009GGJ9G", "color_name=Black", "B0009GGJCI,B0009GGJDW",
+                "B000AMXQVI", _ENUM),                       # 有父体
+        vg.plan("B0009GGJ9G", "color_name=Black", "", "", _ENUM),   # 无父体
+        vg.plan("B0000000A1", "color_name=Black", "B0000000A2",
+                "B0000000A1", _ENUM),                       # parent 填自己
+    ]
+    for p in cases:
+        assert p["group_id"] == "", p
+        assert "vg" not in p["group_id"]
+        for asin in ("B0009GGJ9G", "B000AMXQVI", "B0000000A1", "B0000000A2"):
+            assert asin not in p["group_id"]
+    # 在架同族的号照旧原样透传(存量 vg_ 不回改,所有者定稿第 2 条)
+    got = vg.plan("B0009GGJCI", "color_name=Navy", "B0009GGJ9G", "B000AMXQVI",
+                  _ENUM, existing_group_id="vg_B000AMXQVI")
+    assert got["group_id"] == "vg_B000AMXQVI"
 
 
 def test_list_new_counts_by_code_not_by_reason_words():
@@ -301,9 +375,13 @@ def test_variant_counts_are_computed_before_the_summary_line():
     assert "_variant_plan(" not in prep_src
 
 
-def _vrow(asin, pairs, gid="vg_G", store="M001"):
+def _vrow(asin, pairs, fkey="P0FAMILY01", store="M001"):
+    """本轮的一行变体决策。⚠ 组号(group_id)此刻**恒空**:发号在
+    `_prep_rows` 的抽码事务里,而这三个分组函数跑在它之前 —— 所以它们的分组键
+    只能是**家族键**(2026-09-07)。按组号分组会把所有家族并进 (店, '') 一桶。"""
     return {"asin": asin, "store": store,
-            "_vplan": {"mode": "variant", "group_id": gid, "code": "variant",
+            "_vplan": {"mode": "variant", "group_id": "", "family_key": fkey,
+                       "code": "variant",
                        "is_primary": True, "attr_pairs": list(pairs),
                        "family_size": 3}}
 
@@ -354,8 +432,8 @@ def test_single_visible_member_is_never_judged_degenerate():
     assert rows[0]["_vplan"]["mode"] == "variant"
     assert rows[0]["_vplan"]["attr_pairs"] == [("size", "X")]
     # 不同组的两条也各算各的,不许跨组比
-    rows2 = [_vrow("A1", [("size", "X")], gid="vg_1"),
-             _vrow("A2", [("size", "X")], gid="vg_2")]
+    rows2 = [_vrow("A1", [("size", "X")], fkey="P0FAM00001"),
+             _vrow("A2", [("size", "X")], fkey="P0FAM00002")]
     ln._drop_degenerate_dims(rows2)
     assert all(r["_vplan"]["mode"] == "variant" for r in rows2)
 
@@ -373,14 +451,15 @@ def test_same_round_siblings_do_not_both_claim_primary():
     """
     from workflows import list_new as ln
 
-    def _row(asin, gid, primary=True):
+    def _row(asin, fkey, primary=True):
+        # 组号恒空:_dedupe_primary 跑在发号之前,分组键是家族键
         return {"asin": asin, "store": "M001",
-                "_vplan": {"mode": "variant", "group_id": gid,
+                "_vplan": {"mode": "variant", "group_id": "", "family_key": fkey,
                            "is_primary": primary, "attr_pairs": [("color", "X")],
                            "code": "variant"}}
 
-    rows = [_row("B0BWMV956C", "vg_P1"), _row("B0BWMVQHVJ", "vg_P1"),
-            _row("B078R8W927", "vg_P2")]
+    rows = [_row("B0BWMV956C", "P0FAM1"), _row("B0BWMVQHVJ", "P0FAM1"),
+            _row("B078R8W927", "P0FAM2")]
     ln._dedupe_primary(rows)
     prim = {r["asin"] for r in rows if r["_vplan"]["is_primary"]}
     # 同组只剩字母序第一个;另一组的独苗不受影响
@@ -394,10 +473,12 @@ def test_dedupe_primary_respects_a_listed_primary():
     """本店同族已有在架主变体时,_variant_plan 已把新成员判成非主 —— 这里不许翻回。"""
     from workflows import list_new as ln
     rows = [{"asin": "B1", "store": "M001",
-             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+             "_vplan": {"mode": "variant", "group_id": "LEGACY_GID",
+                        "family_key": "P0FAM1",
                         "is_primary": False, "code": "variant"}},
             {"asin": "B2", "store": "M001",
-             "_vplan": {"mode": "variant", "group_id": "vg_P1",
+             "_vplan": {"mode": "variant", "group_id": "LEGACY_GID",
+                        "family_key": "P0FAM1",
                         "is_primary": False, "code": "variant"}}]
     ln._dedupe_primary(rows)
     assert not any(r["_vplan"]["is_primary"] for r in rows)
@@ -413,8 +494,29 @@ def test_list_new_lookup_is_store_scoped_and_failure_tolerant():
 
     from workflows import list_new
     sql = list_new._FAMILY_LISTED_SQL
-    assert "store = %(store)s" in sql and "missing_since IS NULL" in sql
+    assert "w.store = %(store)s" in sql and "missing_since IS NULL" in sql
     body = inspect.getsource(list_new._variant_plan)
     assert "except Exception" in body and "按本店无同族处理" in body
     # 查同族时把自己排掉:自己还没上架,查出来只会是噪声
     assert 'a != r["asin"]' in body
+
+
+def test_family_lookup_matches_through_the_registry():
+    """同族已在架按**身份键**匹配(0a-26);参数名也从 skus 正过来叫 asins。
+
+    传进去的一直是同族 **ASIN**(variant_group.parse_family 的产物),叫 skus
+    是历史笔误;切码之后这个名字会直接误导下一个人拿 SKU 去填。
+    ⚠ 本处**有意不加 abandoned_at 谓词**:同族查的是「这家店此刻还挂着哪些
+    同族成员」这个在架事实,与码是否已弃用无关(abandoned_at 只出现在 mint、
+    list_new 去重闸、alloc_push._SQL_ONLINE 三处 —— 消费方契约)。
+
+    2026-09-07 起这条查询多了一层意义:它取回的 `variant_group_id` 是**存量组的
+    唯一来源**(存量 vg_… 不回改),由 `sku_codec.mint_group_code(existing=…)`
+    原样登记进 `catalog.variant_groups`。
+    """
+    from workflows import list_new
+    sql = list_new._FAMILY_LISTED_SQL
+    assert "coalesce(ls.source_key, w.sku) = ANY(%(asins)s::text[])" in sql
+    assert "ls.source_type = 'amz'" in sql
+    assert "%(skus)s" not in sql
+    assert "abandoned_at" not in sql

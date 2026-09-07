@@ -124,6 +124,27 @@ LEFT JOIN LATERAL (
 """
 
 
+# ── 单店范围下推(`-p store=X`)────────────────────────────────────────────────
+# **五条"按店取在架行"的 SQL 共用这一段**:_SQL_ZERO / _SQL_AMZ_JOIN /
+# _SQL_VARIANT_OFFSET / _SQL_LONG_OOS / _SQL_MATCH_INV。
+#
+# 为什么必须下推到 SQL(2026-09-03 所有者生产实测):`maintenance_scan -p store=X`
+# 从前是**先全库扫、再在 Python 里 filter**,单店与全量的数据库开销一模一样 ——
+# 谭总11 一家店的 _SQL_AMZ_JOIN 是 3218 次 LATERAL(冷缓存 3.4 秒),而全库约
+# 14 万行在架,于是"只看一家店"要陪着扫完整个船队。链尾缺席店重赛是**逐店**跑的,
+# 这条路径尤其疼。
+#
+# ⚠ 写法固定成"具名参数 + IS NULL 短路",**不许为单店另写一条 SQL**(§六 单一
+# 实现路径:两条 SQL 迟早飘成"全量按 A 判、单店按 B 判",而且两边都不报错):
+#   · only=None → `NULL::text IS NULL` 恒真 ⇒ 整段等价于不存在,与下推前逐行同集合;
+#   · only='X'  → 走 catalog.walmart_items 主键 (store, sku) 的前缀。
+# ⚠ psycopg3 **不许位置与具名参数混用**;这五条 SQL 本来就全是具名参数
+#   (%(stores)s / %(days)s / %(mn_stores)s …),照旧只传一个 dict,别改成 tuple。
+# ⚠ 表别名固定 `w`:五条 SQL 里在架行都是 `catalog.walmart_items w`
+#   (_SQL_LONG_OOS 是在它的 live CTE 里)。
+_ONLY_STORE = "  AND (%(only)s::text IS NULL OR w.store = %(only)s)\n"
+
+
 def managed_params(managed: dict[str, str] | None) -> dict:
     """输入:{店铺: 受管仓} → 输出:_MANAGED_NODE_JOIN 要的两个平行数组参数。"""
     m = managed or {}
@@ -163,7 +184,7 @@ SELECT w.store, w.sku, w.avail_qty, nq.avail_qty AS node_qty
 FROM catalog.walmart_items w
 """ + _MANAGED_NODE_JOIN + """
 WHERE w.store = ANY(%(stores)s::text[]) AND w.missing_since IS NULL
-"""
+""" + _ONLY_STORE
 # ⚠ 「> 0」的判定**从 SQL 挪到 Python**(多仓批次 2):配置店要看的是受管仓
 # 那个数,而它可能为 NULL(明细没扫到)——写在 SQL 里就得在 WHERE 里区分
 # 「配置店 NULL = 跳过」与「未配置店 NULL = 未知不动」,两条 NULL 语义相反,
@@ -177,6 +198,11 @@ WHERE w.store = ANY(%(stores)s::text[]) AND w.missing_since IS NULL
 #   · 只取在架行(missing_since IS NULL)
 #   · zip_verify='mismatch' 的观测不参与(请求邮编未生效,价格不属于该分组)
 #   · stockzero 店整店排除(它们归 zero_intents,不能被自动同步顶回去)
+#   · **身份键经登记簿**:products / latest_snapshot 两处都按
+#     coalesce(ls.source_key, w.sku) 接(conventions §九的唯一写法)。SKU 不再
+#     是 ASIN 之后,把 p.asin 直接跟裸 w.sku 比会**静默**匹配不上任何一行:
+#     不报错,只是维护链对新码永久失明(不改价、不清零)。存量 amz 行
+#     source_key = sku,结果逐行相同。
 _SQL_AMZ_JOIN = """
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        w.price AS wm_price, w.avail_qty, nq.avail_qty AS node_qty,
@@ -189,7 +215,8 @@ SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
-JOIN catalog.products p ON p.marketplace = 'US' AND p.asin = w.sku
+JOIN catalog.products p
+  ON p.marketplace = 'US' AND p.asin = coalesce(ls.source_key, w.sku)
 LEFT JOIN LATERAL (
     -- 配送方式(FBA/FBM)决定用哪套定价区间。采集契约的 fast 段没把它列成
     -- 一等字段,但 raw 是"裁剪后的原样载荷",is_fba 就在里面(采集侧
@@ -199,7 +226,7 @@ LEFT JOIN LATERAL (
            -- 亚马逊在架状态原文(采集侧存 raw,契约未列为一等字段)
            raw ->> 'stock_status' AS stock_status
     FROM catalog.latest_snapshot l
-    WHERE l.marketplace = 'US' AND l.asin = w.sku
+    WHERE l.marketplace = 'US' AND l.asin = coalesce(ls.source_key, w.sku)
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
     ORDER BY l.scraped_at DESC LIMIT 1
 ) s ON true
@@ -207,7 +234,7 @@ LEFT JOIN LATERAL (
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
   AND NOT (w.store = ANY(%(stores)s::text[]))
-"""
+""" + _ONLY_STORE
 
 
 # 采集永久偏移(variant_offset)的在线行 → 删除意图。
@@ -215,6 +242,9 @@ WHERE w.missing_since IS NULL
 # · 店铺 ACTIVE 才删(无 KPI 记录 fail-open,与其他闸同口径)
 # · snapshots.outcome 在补列之前的历史行是 NULL,那些都是成功采集,按 ok 处理
 #   ——否则老 SKU 会因为"查不到 ok 快照"被误判该删
+# · 驱动表是 walmart_items(不是 vo):要让 ls 先就位,才接得上身份键
+#   coalesce(ls.source_key, w.sku)。ls 本来就是 INNER JOIN(未登记行今天已被
+#   排除),存量 amz 行 source_key = sku ⇒ 与旧写法(裸 w.sku 接 vo.asin)同集合
 _SQL_VARIANT_OFFSET = """
 WITH vo AS (
     SELECT asin,
@@ -229,10 +259,10 @@ WITH vo AS (
     FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 )
 SELECT w.store, w.sku, vo.batches, vo.first_seen, vo.last_seen
-FROM vo
-JOIN catalog.walmart_items w ON w.sku = vo.asin
+FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+JOIN vo ON vo.asin = coalesce(ls.source_key, w.sku)
 LEFT JOIN latest_status s ON s.store = w.store
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
@@ -243,7 +273,7 @@ WHERE w.missing_since IS NULL
         WHERE sn.asin = vo.asin
           AND COALESCE(sn.outcome, 'ok') = 'ok'
           AND sn.scraped_at > vo.last_seen)
-ORDER BY w.store, w.sku
+""" + _ONLY_STORE + """ORDER BY w.store, w.sku
 """
 
 
@@ -277,7 +307,11 @@ WITH req AS (
     SELECT store, upper(btrim(want)) AS want
     FROM unnest(%(ch_stores)s::text[], %(ch_wants)s::text[]) AS t(store, want)
 ), live AS (
-    SELECT w.store, w.sku, coalesce(req.want, '') AS want
+    -- catalog.snapshots 按 ASIN 存,live 必须把身份键带出来才接得上 obs
+    -- (conventions §九);存量 amz 行 source_key = sku,窗口逐行不变。
+    -- 输出的仍是真 SKU:意图行照旧按 (store, sku) 走。
+    SELECT w.store, w.sku, coalesce(ls.source_key, w.sku) AS asin,
+           coalesce(req.want, '') AS want
     FROM catalog.walmart_items w
     JOIN catalog.listing_sources ls
       ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
@@ -288,7 +322,7 @@ WITH req AS (
     WHERE w.missing_since IS NULL
       AND w.published_status = 'PUBLISHED'
       AND (st.store_status IS NULL OR upper(st.store_status) = 'ACTIVE')
-), obs AS (
+""" + _ONLY_STORE + """), obs AS (
     -- ⚠ 三个派生值全部 coalesce 成**二值**:三值逻辑下 `NOT (… AND NULL)` 是
     -- NULL,而 FILTER 把 NULL 当不命中 —— 渠道采不到的那批观测会因此从
     -- "挡住删除"翻成"不挡",方向正好反了,且一个字的报错都没有
@@ -319,8 +353,8 @@ WITH req AS (
                WHERE o.has_stock AND live.want <> ''
                  AND o.channel IN ('FBA', 'FBM')
                  AND o.channel <> live.want) AS wrong_ch_obs
-    FROM live JOIN obs o ON o.asin = live.sku
-    GROUP BY live.store, live.sku, live.want
+    FROM live JOIN obs o ON o.asin = live.asin
+    GROUP BY live.store, live.sku, live.asin, live.want
 )
 SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want
 FROM win
@@ -355,6 +389,29 @@ TITLE_SIM_FLOOR = 0.70      # 相似度低于此 → 删除;不低于 → 改标
 # 这是所有者知情后的取舍(标题改错可再改回,删除不可逆),但**必须见人**:
 # title_intents 单独计数并 warning,不许它混进"标题 N 条"里无声发生。
 TITLE_MISMATCH_DELETE = False
+
+# ── 标题维护整路停闸(所有者 2026-09-05)──────────────────────────────────────
+# 根因不在 feed 在沃尔玛的内容规则(Seller Center 截图实证,L001贾林红/B0FVDR7XJL):
+# 编辑页把「商品名称」(卖家提交值)与「在 Walmart.com 上生效的值」分开显示 ——
+# 我们 MP_MAINTENANCE 发的新标题**进了提交值**(所以回执 SUCCESS、再发报 stale
+# 0101198),但**没过内容质量闸、没成为生效值**。闸没过的理由沃尔玛写在旁边:
+#   · Too Long:Product Name 不得超过 **150** 字符(我们按 spec 上限截到 199);
+#   · Title Formula Violation ×2:必须按 Walmart Style Guide 的公式含指定属性、
+#     且顺序正确(我们抄的是亚马逊标题);
+#   · Not Capitalized Properly。
+# 无「More sellers」、无锁 ⇒ 不是内容归属问题,是内容质量问题。旧仓一年多来
+# 同样的载荷同样"多数不变、少数会变"(偶尔生成的标题恰好短、恰好合公式)。
+# 这条链现在是负收益:发 → SUCCESS 但生效值不变 → settle_maintenance 拿
+# GET /v3/items(返回生效值)判「未生效」→ 20h 后重算同样差异 → 重发 → stale。
+# **每天烧 MP_MAINTENANCE 配额、零效果**,所以整路停:生成侧不产标题意图,
+# 执行侧不领存量 title 建议(两处都从这一个开关读,别各写一份)。
+# 恢复条件(两件都做完再翻 True):
+#   ① 标题生成改按沃尔玛口径 —— ≤150 字符(最好 ≤90,超过伤 SEO)、Style Guide
+#      公式、规范大小写;上架链 mp_mapper 与本模块 processed_title 用同一份规则;
+#   ② 「沃尔玛未采纳」要记账:回执 SUCCESS 而生效值不变的 (店, SKU, 标题) 落
+#      台账,同一标题不再重发,内容变了才再试(drop_recent 只压 20h,不够)。
+# 改价 / 改库存**照常**:它们是 offer 级,永远归卖家,生产一直正常。
+TITLE_SYNC = False
 
 def processed_title(slow) -> str:
     """输入:products.slow → 输出:过完上架文案处理的标题(去品牌/去符号/截 199)。
@@ -489,8 +546,29 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
 
 
 def _rows(conn, stockzero_stores: list[str],
-          managed: dict[str, str] | None = None) -> list[dict]:
-    """输入:连接 + stockzero 名单 → 输出:在线商品行(**dict,不是元组**)。
+          managed: dict[str, str] | None = None,
+          only: str | None = None) -> list[dict]:
+    """输入:连接 + stockzero 名单(+受管仓表 +单店范围)→ 输出:在线商品行(**dict**)。
+
+    ⚠ **一轮只查一次,由 `collect_all` 统一取数、分发给四个 provider。**
+    2026-09-03 生产实测:四个 provider 各查一次,其中三次参数完全相同
+    (managed=None),`pg_stat_activity` 实见三条一模一样的查询并发跑 2 分半 ——
+    这是 maintenance_scan "十几分钟"的头号成本。**provider 不许自己调它**
+    (§六 单一实现路径:两条取数路径迟早飘成"改价按 A 行、删除按 B 行")。
+    共享一份行是安全的,两条前提各有测试钉住:
+      ① 带 managed 与不带 managed 的**行集合完全相同** —— `_MANAGED_NODE_JOIN`
+         是 `LEFT JOIN LATERAL (… LIMIT 1) ON true`,每条外层行恒配一行,
+         managed 为空时只是 `node_qty` 全 NULL。所以带 managed 的那份是超集,
+         三个不管仓库的 provider 忽略 `node_qty` 即可;
+      ② 四个 provider **只读行 dict,不就地修改**(没有 `r[...] =` / `r.pop` /
+         `r.update`),所以不必发副本。谁将来想改行,先看这条:共享可变对象
+         是静默错误的经典来源。
+
+    ⚠ **产出的"行序"从来不是契约**(_TRUNC_PRIORITY 头注早就写了这件事):本条
+    SQL 没有 ORDER BY,PG 16 实测同一连接连查两次的行序就不一样(并行 seq scan)
+    —— 也就是说改造前四个 provider 各看到一个不同的序。共享一份行反而把这点
+    统一了。**别据此新增依赖顺序的逻辑**:截断名单靠 _TRUNC_PRIORITY 的全序键
+    保持跨轮可预期,不靠这里。
 
     ⚠ 2026-08-16 从元组改成 dict:SQL 加了 outcome/stock_status/stock_state 三列,
     四个 provider 的位置解包**全部要改**,漏一处轻则 ValueError、重则静默取错
@@ -499,6 +577,7 @@ def _rows(conn, stockzero_stores: list[str],
     with conn.cursor() as cur:
         cur.execute(_SQL_AMZ_JOIN,
                     {"stores": list(stockzero_stores or []),
+                     "only": only or None,
                      **managed_params(managed)})
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -602,8 +681,9 @@ def cap_per_store(intents: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def zero_intents(conn, stockzero_stores: list[str],
-                 managed: dict[str, str] | None = None) -> list[dict]:
-    """输入:连接 + stockzero 店名单(+受管仓表)→ 输出:整店清零意图(→ 0)。
+                 managed: dict[str, str] | None = None,
+                 only: str | None = None) -> list[dict]:
+    """输入:连接 + stockzero 店名单(+受管仓表 +单店范围)→ 输出:整店清零意图(→ 0)。
 
     ⚠ 多仓下清的是**受管仓**(所有者定稿:自动链只管自建自发货仓)。按合计选
     行、只清一个节点的话,合计永远 > 0 ⇒ 每轮重选重清,而"这家店停售"从未真
@@ -613,6 +693,7 @@ def zero_intents(conn, stockzero_stores: list[str],
         return []
     with conn.cursor() as cur:
         cur.execute(_SQL_ZERO, {"stores": list(stockzero_stores),
+                                "only": only or None,
                                 **managed_params(managed)})
         rows = cur.fetchall()
     out = []
@@ -653,15 +734,16 @@ JOIN catalog.listing_sources ls
 WHERE w.missing_since IS NULL
   AND coalesce(upper(w.lifecycle_status), 'ACTIVE') = 'ACTIVE'
   AND NOT (w.store = ANY(%(stores)s::text[]))
-"""
+""" + _ONLY_STORE
 # ⚠ 「库存为 0/未知」的判定同样挪到 Python(理由见 _SQL_ZERO 那处注释)。
 # 多仓下这条尤其要紧:受管仓为 0 而别的节点有货时,合计非 0 会让**该铺的行
 # 选不出来、永远不铺**,且完全静默。
 
 
 def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
-                            managed: dict[str, str] | None = None) -> list[dict]:
-    """输入:连接 + stockzero 名单 → 输出:跟卖品铺货意图(0/未知 → 保守值)。
+                            managed: dict[str, str] | None = None,
+                            only: str | None = None) -> list[dict]:
+    """输入:连接 + stockzero 名单(+受管仓表 +单店范围)→ 输出:跟卖品铺货意图(0/未知 → 保守值)。
 
     补结构洞(所有者批复 2026-08-12):跟卖 offer 建成即 0 库存不可售,
     而 amz 驱动的 inventory_intents 按路由铁律永远排除 source_type='match'
@@ -673,6 +755,7 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
     """
     with conn.cursor() as cur:
         cur.execute(_SQL_MATCH_INV, {"stores": list(stockzero_stores or []),
+                                     "only": only or None,
                                      **managed_params(managed)})
         rows = cur.fetchall()
     out = []
@@ -691,9 +774,11 @@ def match_inventory_intents(conn, stockzero_stores: list[str] | None = None,
     return out
 
 
-def price_intents(conn, multipliers: dict[str, dict],
-                  stockzero_stores: list[str] | None = None) -> list[dict]:
-    """输入:连接 + {店铺: 限额表倍率行} + stockzero 名单 → 输出:改价意图。
+def price_intents(rows: list[dict], multipliers: dict[str, dict]) -> list[dict]:
+    """输入:在线商品行(`_rows` 的产出)+ {店铺: 限额表倍率行} → 输出:改价意图。
+
+    ⚠ **行由 `collect_all` 一次取好传进来**,本函数不自己查库(理由与"只读不
+    就地改行"两条前提见 `_rows` 头注)。
 
     新价 = services.pricing.walmart_price(**落地价(amz 现价 + 运费)** × 该店
     对应区间倍率),
@@ -707,7 +792,7 @@ def price_intents(conn, multipliers: dict[str, dict],
     """
     out = []
     skipped_no_rule = skipped_no_channel = skipped_no_shipping = 0
-    for r in _rows(conn, stockzero_stores):
+    for r in rows:
         store, sku = r["store"], r["sku"]
         wm_price, amz_price = r["wm_price"], r["amz_price"]
         fulfillment, shipping = r["fulfillment"], r["shipping"]
@@ -759,11 +844,14 @@ def price_intents(conn, multipliers: dict[str, dict],
     return out
 
 
-def inventory_intents(conn, stockzero_stores: list[str] | None = None,
+def inventory_intents(rows: list[dict],
                       managed: dict[str, str] | None = None,
                       store_channels: dict[str, str] | None = None
                       ) -> list[dict]:
-    """输入:连接 + stockzero 名单(+ {店铺: 限定渠道})→ 输出:改库存意图。
+    """输入:在线商品行(`_rows` 的产出)(+受管仓表 + {店铺: 限定渠道})→ 输出:改库存意图。
+
+    ⚠ **行由 `collect_all` 一次取好传进来**,本函数不自己查库(见 `_rows` 头注)。
+    唯一用得上 `node_qty` 那一列的 provider 就是它(比对基准 = 受管仓现值)。
 
     `store_channels` = 限额表「配送限制」标了 fba/fbm 的店(唯一取数口
     `store_targets.store_channels()`,由 `collect_all` 取一次分发)。
@@ -791,7 +879,7 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
     chans = store_channels or {}
     out = []
     n_channel = n_zeroed = 0
-    for r in _rows(conn, stockzero_stores, managed):
+    for r in rows:
         store, sku = r["store"], r["sku"]
         # 比对基准 = 受管仓现值(配置店)/ 全店合计(未配置店),唯一出处
         avail_qty = current_qty(store, r["avail_qty"], r.get("node_qty"), managed)
@@ -848,9 +936,10 @@ def inventory_intents(conn, stockzero_stores: list[str] | None = None,
     return out
 
 
-def title_intents(conn, stockzero_stores: list[str] | None = None
-                  ) -> list[dict]:
-    """输入:连接 + stockzero 名单 → 输出:标题维护意图。
+def title_intents(rows: list[dict]) -> list[dict]:
+    """输入:在线商品行(`_rows` 的产出)→ 输出:标题维护意图。
+
+    ⚠ **行由 `collect_all` 一次取好传进来**,本函数不自己查库(见 `_rows` 头注)。
 
     新标题 = 亚马逊标题过**与上架同一套文案处理**(force_amazon_copy:
     去品牌名、去项目符号、折叠空白、截 199)——两处口径必须一致,
@@ -864,8 +953,13 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
       · `TITLE_MISMATCH_DELETE=False` → 照改并计数告警
     """
     out = []
+    if not TITLE_SYNC:
+        # 停闸必须见人:静默返回空列表读起来像"今天没有标题差异"
+        logger.warning("标题维护已整路停闸(所有者 2026-09-05,TITLE_SYNC=False):"
+                       "本轮不产标题意图;原因与恢复条件见 TITLE_SYNC 头注")
+        return out
     skipped_incomplete = skipped_mismatch = paused_mismatch = 0
-    for r in _rows(conn, stockzero_stores):
+    for r in rows:
         store, sku = r["store"], r["sku"]
         product_name, product_type, upc = r["product_name"], r["product_type"], r["upc"]
         slow = r["slow"]
@@ -926,11 +1020,18 @@ def title_intents(conn, stockzero_stores: list[str] | None = None
     return out
 
 
-def delete_intents(conn, stockzero_stores: list[str] | None = None,
+def delete_intents(conn, rows: list[dict],
                    min_batches: int = MIN_OFFSET_BATCHES,
                    oos_days: int = LONG_OOS_DAYS,
-                   store_channels: dict[str, str] | None = None) -> list[dict]:
-    """输入:连接(+批次数门槛/无货天数/{店铺: 限定渠道})→ 输出:删除意图(kind='delete')。
+                   store_channels: dict[str, str] | None = None,
+                   only: str | None = None) -> list[dict]:
+    """输入:连接 + 在线商品行(+批次数门槛/无货天数/{店铺: 限定渠道}/单店范围)
+    → 输出:删除意图(kind='delete')。
+
+    ⚠ 在架行由 `collect_all` 一次取好传进来(见 `_rows` 头注);`conn` 还留着,
+    是因为偏移件与「连续无货/渠道不符」两条 SQL 是本 provider 独有的取数
+    (它们不从在架行派生)。`only` 要往那两条 SQL 里传 —— 漏传的表现是单店
+    重跑照样全库扫,而且完全静默。
 
     三个原因(所有者定稿 2026-08-09),都是"这个产品已经不值得留在架上了":
 
@@ -979,14 +1080,15 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
                     "label": f"删除({code})", **(extra or {})})
 
     with conn.cursor() as cur:
-        cur.execute(_SQL_VARIANT_OFFSET, {"min_batches": int(min_batches)})
+        cur.execute(_SQL_VARIANT_OFFSET, {"min_batches": int(min_batches),
+                                          "only": only or None})
         for store, sku, batches, first_seen, last_seen in cur.fetchall():
             _take(store, sku, "variant_offset",
                   "采集永久偏移(拿不到新数据)",
                   {"batches": batches, "first_seen": first_seen,
                    "last_seen": last_seen})
 
-    for r in _rows(conn, stockzero_stores):
+    for r in rows:
         store, sku = r["store"], r["sku"]
         slow = r["slow"]
         title = ((slow or {}).get("title") if isinstance(slow, dict) else None)
@@ -1011,6 +1113,7 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
     with conn.cursor() as cur:
         cur.execute(_SQL_LONG_OOS,
                     {"days": int(oos_days),
+                     "only": only or None,
                      "ch_stores": list(chans.keys()),
                      "ch_wants": [chans[k] for k in chans]})
         rows = cur.fetchall()
@@ -1047,10 +1150,16 @@ def delete_intents(conn, stockzero_stores: list[str] | None = None,
 
 
 def collect_all(conn, stockzero: list[str], oos_days: int = 0,
-                managed: dict[str, str] | None = None
+                managed: dict[str, str] | None = None,
+                only: str | None = None
                 ) -> tuple[list[dict], list[dict]]:
-    """输入:连接 + stockzero 名单(+无货天数 +受管仓表)→ 输出:
+    """输入:连接 + stockzero 名单(+无货天数 +受管仓表 +单店范围)→ 输出:
     (本轮全部维护意图, 截断报告)。
+
+    **本轮取数的唯一入口**:在架行 `_rows` 只查一次,分发给四个 provider
+    (2026-09-03 性能定案,前因与两条安全前提见 `_rows` 头注)。
+    `only`(`-p store=X`)下推进每一条按店取行的 SQL —— 下推之前单店与全量的
+    数据库开销一模一样(先全库扫、再在 Python 里 filter)。
 
     单店单轮上限(cap_per_store)在**最后**施加 —— 在 doomed 剔除与 drop_recent
     之后,名额不浪费在注定不发的意图上(截在 provider 里的话,先截再被防重
@@ -1074,22 +1183,26 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0,
     """
     mults = store_limits.price_multipliers()
     chans = store_targets.store_channels()
-    deletes = delete_intents(conn, stockzero,
+    # ⚠ 一轮**只查一次**在架行,四个 provider 共享这一份(managed 那份是超集:
+    # 只多 node_qty 一列的值,行集合与不带 managed 的完全相同)。
+    rows = _rows(conn, stockzero, managed, only=only)
+    deletes = delete_intents(conn, rows,
                              oos_days=oos_days or LONG_OOS_DAYS,
-                             store_channels=chans)
+                             store_channels=chans, only=only)
     doomed = {(d["store"], d["sku"]) for d in deletes}
     intents = list(deletes)
     # ⚠ 三个**库存** provider 都要收 managed:比对基准是受管仓现值。
     # 漏传一个的表现不是报错,而是那一路照旧拿全店合计比单仓目标 ⇒ 每轮重发。
     # 标题/价格与仓库无关,不传(传了也没有用武之地,别加无意义的参数)。
-    for it in (title_intents(conn, stockzero)
-               + price_intents(conn, mults, stockzero)
-               + inventory_intents(conn, stockzero, managed,
-                                   store_channels=chans)
+    for it in (title_intents(rows)
+               + price_intents(rows, mults)
+               + inventory_intents(rows, managed, store_channels=chans)
                # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
-               # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责
-               + match_inventory_intents(conn, stockzero, managed)
-               + zero_intents(conn, stockzero, managed)):
+               # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责。
+               # 它与 zero_intents 各有自己的取数(match 出身 / stockzero 整店),
+               # 不在共享的 rows 里 —— 但 only 一样要传下去
+               + match_inventory_intents(conn, stockzero, managed, only=only)
+               + zero_intents(conn, stockzero, managed, only=only)):
         # 将被删除的行不再改价/改库存/改标题:它们的 amz 数据本来就是陈旧的
         # (采不到才要删),再跟一轮既烧配额又是拿错数据改线上
         if (it["store"], it["sku"]) not in doomed:

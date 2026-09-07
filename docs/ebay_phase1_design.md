@@ -11,8 +11,14 @@
 > **2026-09-03 对齐 main #85/#99/#100~#110**(一店多仓、店铺事件账本+风险
 > 追溯、报错归类、下单时间、绩效归因):新增 §4.4(risk_trace 四证据源平台
 > 谓词,blocker)、§2.1 事件桥跳过 eBay、§6.1 多仓与报错归类两条边界;
-> claims/load_active 调用面已现场重核。⚠ 本文引用的仓库行号以 **2026-09-03
-> 的 main** 为快照,批次实施时现场重定位。
+> claims/load_active 调用面已现场重核。
+> **2026-09-07 对齐 main(71 个提交,含 SKU 改造 PR #104 全批次落地)**:🔴
+> **§3.3 的 SKU 策略被推翻重写**——沃尔玛侧已全面切 12 位不透明码
+> (`sku_codec`)、`catalog.listing_sources` 成为 SKU 身份唯一登记簿,eBay 一期
+> 因此改为**复用 `sku_codec.mint`** 而非原稿的"SKU=ASIN 原文"(四条理由与
+> 用法见 §3.3);连带改 §4.1 登记簿行、§4.3 asin 反解理由、§6.4 与 §6.9
+> (变体组号走 `mint_group_code`)。⚠ 本文引用的仓库行号以 **2026-09-07 的
+> main** 为快照,批次实施时现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
 
@@ -216,7 +222,31 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   `docs/feishu_tables.md`。一期**不新增任何限额常量**。
 - SKU 正则 **`^[A-Za-z0-9]{1,50}$`**(官方 Inventory 侧 25707 原文:
   "Invalid sku. sku has to be alphanumeric with upto 50 characters in
-  length"——引这句,勿引 Trading 侧同义句);**一期 SKU=ASIN 原文**。
+  length"——引这句,勿引 Trading 侧同义句)。
+- 🔴 **SKU 定稿改为复用 `services/sku_codec.mint`(2026-09-07 推翻原稿的
+  "SKU=ASIN 原文")**:main 已把沃尔玛侧全面切到 **12 位不透明码**
+  (`<来源字母><11 位随机>`,如 `AK7QM2X9RT4W`;批次 0a~3 全部实现、
+  `list_new._prep_rows` 抽码即登记),`catalog.listing_sources` 因此成为
+  **SKU 身份的唯一登记簿**(新增 `abandoned_at/abandoned_reason/replaced_by/
+  replaces/replaced_at` 五列,活码 = `abandoned_at IS NULL`)。四条理由:
+  ① 两平台共用同一张登记簿(PK `(store, sku)`),eBay 另走 ASIN 原文就是
+  **同一张表两套码制 = 双轨**,直接违反"每个能力只有一条实现路径";
+  ② 12 位码是纯字母数字,**天然满足上面那条 25707 白名单**,原稿担心的
+  分隔符问题一并消失;③ 发码键是 `(store, source_type, source_key)`,
+  `store` 传 eBay 账号名即天然按账号隔离(账号名互斥硬约束 §2.1 已保证
+  键空间不撞);④ 无货源模式下 **ASIN 做 SKU 等于把亚马逊货源写在明面上**
+  给 eBay 与竞品反查。
+  用法:`sku_codec.mint(conn, account, source_type='amz', source_key=asin,
+  workflow='ebay_list_new')`——⚠ **来源字母是货源类型不是销售平台**
+  (`SKU_SOURCE_LETTERS = {amz:A, match:B, 1688:C, self:H}`),eBay 搬运品
+  的货源仍是 amz、字母仍是 A,**不许为 eBay 新增字母**;空跑用
+  `DRYRUN_PLACEHOLDER`,不写 dry-run 分支。
+- **一期不弃码**:`sku_codec.abandon` 的四个弃码点(DELETE 经观测核验 /
+  SKU_LOCKED 退役 + 冷却 / UPC 撞库 / 改码)全是沃尔玛语义,而一期只到上架、
+  没有删除与自愈链。二期 eBay 若要弃码,新原因**必须进 `ABANDON_REASONS`**
+  (那是唯一出处),不许在 eBay 侧另立一套。⚠ 与 §2.2 的交集:`ABANDON_
+  UPC_CONFLICT` 与 UPC 池的 `mark_conflict` 是同一件事的两侧,eBay 侧撞库
+  一期只置池位、不弃码(码还活着,下轮换号重上)。
 - 错误码常量(语义见 reference §1):25707/25729/25713/25702/25710/25025/
   25002(多义禁单判)/25014/25015/25501/25086。⚠ **190204 是 Trading 侧码,
   Inventory 侧图片错是 2501x/25501**。
@@ -267,7 +297,7 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 | `ops.feed_log` | + `platform`;`feed_log_dedupe_uidx` → `feed_log_dedupe_v2_uidx (platform, feed_type, store, payload_key)` 原地替换 |
 | `ops.feed_items` / `feed_item_errors` | + `platform` 标注列(主键不动——**该论证只覆盖 offer/publish 两阶段**:eBay 台账 `feed_items` 只落这两阶段的行,`feed_id` 分别存 offerId/listingId,`(feed_id, sku)` 不撞;**ebay_item 阶段不落 feed_items**,由 `feed_log` pending/submitted 承接——PUT 幂等可重放、204 无 id 可记,硬造 feed_id=sku 会在换账号重上时撞主键静默丢行) |
 | `catalog.product_events` | + `platform` + 5 视图 DROP 重建(`audit_listing_conflicts` 的 EXPLAIN 必须仍走 `product_events_identity_idx`);**按事件码过滤的非视图消费方(blacklist/_LATEST_CTE、problem_scan 三条、sku_normalize、audit_history_fold、cleanup_history_import、dispositions._SETTLE_DELETE_SQL)一期不改,依据=eBay 事件码与沃尔玛零重合(逐条列名进实现注释);二期给沃尔玛加任何同名事件码前必须先补谓词**。🔴 **例外:`services/risk_trace` 不按事件码过滤,必须补平台谓词——见 §4.4** |
-| `catalog.listing_sources` | + `platform` 标注列;schema.sql 存量回填 INSERT 显式补 walmart。⚠ 原稿"三处消费方都锚在 walmart_items 上,JOIN 即天然谓词"**已被 #99 推翻**:`risk_trace` 按 `source_key` 反查、不 JOIN 任何平台表(`listing_sources_key_idx` 就是为它建的)——见 §4.4 |
+| `catalog.listing_sources` | + `platform` 标注列(**不进 PK**:`sku_codec.mint` 发的 12 位随机码全局唯一,`(store, sku)` 天然不撞);schema.sql 存量回填 INSERT 显式补 walmart。⚠ 两条已被 main 推翻的原稿表述:① "三处消费方都锚在 walmart_items 上,JOIN 即天然谓词"被 #99 推翻(`risk_trace` 按 `source_key` 反查、不 JOIN 任何平台表——见 §4.4);② 本表在 2026-09-07 后**已是 SKU 身份的唯一登记簿**(+`abandoned_at/abandoned_reason/replaced_by/replaces/replaced_at` 五列),eBay 行由 `mint` 在抽码同一事务里登记(§3.3),**不许另建 eBay 专用登记表** |
 | `catalog.ebay_items` | 新表(一期空表;状态列 **text 不加 CHECK**——沙箱 C3 卡的是 submit_poll 的 withdraw 后判据与状态字面量首次落 SQL,**不卡建表**) |
 | `catalog.ebay_accounts` | 新表:account, marketplace_id, 三 policyId, merchant_location_key, opted_in_at, privileges_json, sampled_at,PK (account, marketplace_id) |
 | `ops.ebay_tokens` | 新表(§3.4,含 REVOKE 守卫) |
@@ -292,8 +322,9 @@ CHAINS`),同表串行纪律照抄。
 
 `record_many` 加显式 `asin` 入参,eBay 行由调用方给(理由写死:**平台身份
 键由调用方显式给出,不靠 SKU 形态猜**——`extract_asin` 是沃尔玛订货号形态
-专属规则,eBay SKU 口径将来会变;一期 SKU=ASIN 时两种写法碰巧同值,不许
-以此当依据)。eBay 事件码同批进 `EVENTS` 与 `_FEED_KIND`。
+专属规则;**SKU 改走不透明码后 `extract_asin` 对 eBay SKU 一律提不出、
+只会误命中或返回 NULL**,原稿"一期 SKU=ASIN 时碰巧同值"的说法随 §3.3
+改稿一并作废)。eBay 事件码同批进 `EVENTS` 与 `_FEED_KIND`。
 
 ### 4.4 🔴 风险追溯四证据源的平台谓词(P1-2 同批,blocker 级)
 
@@ -441,7 +472,8 @@ SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 
 ### 6.4 三步链字段要点(全量字段表与错误码表:`docs/ebay_phase1_reference.md` §1)
 
-- **PUT /inventory_item/{sku}**:SKU=ASIN;header `Content-Language: en-US`
+- **PUT /inventory_item/{sku}**:SKU = `sku_codec.mint` 发的 12 位不透明码
+  (§3.3);header `Content-Language: en-US`
   (body 里 locale 是 `en_US` 下划线——两形态别混);aspects=
   `dict[str, list[str]]`;product.description ≤4000 只放短摘要;图片全
   https、≥1 ≤24;成功码 200/201/204 且 **204+空体=正常成功**(`if not
@@ -490,7 +522,10 @@ SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 沃尔玛侧该段约 1040 行占对位体量 22%、"不报错的错"高发(08-17 后连修五
 处);eBay 侧:inventoryItemGroupKey 不可改、publish 全或无(与"单行失败
 不拖垮整批"正面冲突)、增量归组不成立(显式对象全量重放)、250/5/30 上限、
-§8.3#11 未核验。**从第一天落 `catalog.ebay_items.variant_group_id` 列**,
+§8.3#11 未核验。**从第一天落 `catalog.ebay_items.variant_group_id` 列**
+(⚠ 二期真做变体时,组号**必须走 `sku_codec.mint_group_code`**——main 已把
+沃尔玛变体组号也改成不透明码 `G+11 位`、登记进 `catalog.variant_groups`,
+且守门测试断言组号字母不与来源字母重合;eBay 侧不许自造组号格式),
 api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文 §2.2 已解)
 ②沙箱 #11 变体组约束实测 ③PBSE 类目逐变体 GTIN 供给 ④publish 全或无的
 失败账设计。
@@ -524,7 +559,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
 | P1-2 | 全部 DDL+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑+六格对拍+读 SQL count·md5 对拍/沃尔玛上架与分配链 --dry-run 摘要逐字一致(9+2 处调用点改动预期红清单)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
-| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
+| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |
 
 合计 **≈37 人日 + 2 周试点观察**。P1-3 的 taxonomy 半批**编码**可与 P1-2

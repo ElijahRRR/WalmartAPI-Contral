@@ -54,6 +54,21 @@ def text_of(status: str, err: str = "") -> str:
     return RESULT_TEXT.get(status, "处理中")
 
 
+def ingestion_errors(node: dict) -> list[dict]:
+    """输入:feed 汇总 head **或**逐条明细 item → 输出:ingestionError 列表。
+
+    两种形态都认:`{"ingestionErrors": {"ingestionError": [...]}}` 与**裸 list**
+    ——旧仓两种都实见过(docs/legacy_survey.md「ingestionErrors 有两种形态」,
+    `poll_yesterday._first_error` 专门兼容过),按 dict 一种形态硬取的表现是
+    裸 list 那一份**静默读成空**:报错原文丢了,而回执照样落定、没有任何告警。
+    feed 级(head)与 SKU 级(item)共用这一份解析,不写第二份。
+    """
+    node = (node or {}).get("ingestionErrors")
+    if isinstance(node, dict):
+        return node.get("ingestionError") or []
+    return list(node or [])
+
+
 def error_text(errs: list[dict]) -> str:
     """输入:ingestionError 列表 → 输出:人话描述串(带字段名,多条以 ; 连接)。
 
@@ -116,6 +131,9 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
     未终态:结果为 None(head 自带 itemsReceived/Succeeded/Failed 进度计数,
     不翻明细);终态:ops.feed_items 逐 SKU 落 success/failed(+错误码),
     台账里有而明细里查无的 SKU 落 missing;feed_log 落 done/failed。
+
+    **例外:feed 级拒收(终态 ERROR + 一条明细都没有)⇒ 台账逐 SKU 落 failed**,
+    回执用 head 里 feed 级 `ingestionErrors` 的第一条(见下面那段注释)。
     """
     head = feeds.get_feed_status(store, feed_id)
     if head.get("feedStatus") not in feeds.FEED_TERMINAL:
@@ -128,7 +146,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         sku = str(item.get("sku") or "")
         if not sku:
             continue
-        errs = (item.get("ingestionErrors") or {}).get("ingestionError") or []
+        errs = ingestion_errors(item)
         code = str(errs[0].get("code") or errs[0].get("type") or "") if errs else ""
         descs[sku] = error_text(errs)
         all_errs[sku] = errs
@@ -144,6 +162,36 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         cur.execute("SELECT sku, workflow, feed_type, status FROM ops.feed_items "
                     "WHERE feed_id = %s", (feed_id,))
         meta = {sku: (wf, ft, st) for sku, wf, ft, st in cur.fetchall()}
+        # ── feed 级拒收:终态 ERROR 而**一条明细都没有**(itemsReceived=0)────
+        # 沃尔玛这时把整个 feed 退回,报错只挂在 feed 级 `ingestionErrors` 上,
+        # `iter_feed_items` 一条都翻不出来。按"明细里查无 ⇒ missing"办的后果:
+        #   · sku_migrate 的 `_verdict` 只认 failed 才当场回滚,missing 要等 24h
+        #     观测反证 —— 整店 2740 条改码全卡在 pending;
+        #   · 上架链/维护链同样把"整 feed 被拒"读成"查无",没有任何东西会说
+        #     这批货压根没进沃尔玛。
+        # 2026-09-07 A131吕灿荣 整店改码实证:三条 MP_ITEM_MATCH feed 全部
+        # feedStatus=ERROR、itemsReceived=0,feed 级 ingestionError
+        # `EXT_DATA_ERROR_50575703577001`「You have exceeded your item setup
+        # limit of 5000…」(店内现有 item 数 + 本 feed 条数 超该店上限 ⇒ 整 feed 拒收)。
+        # 旧仓本来就有这条路径(docs/legacy_survey.md「feed 整体 ERROR 且
+        # itemDetails 为空 ⇒ 回查预写的 SKU 列表逐个打 FEED_ERROR」),重写时丢了。
+        # **有逐条明细的 ERROR feed 行为一字不变**:那种 feed 的真相在明细里。
+        # 台账行**全部**落 failed(不挑 status):整 feed 被退回 = 里面没有一条到达。
+        if not results and head.get("feedStatus") == "ERROR" and meta:
+            head_errs = ingestion_errors(head)
+            head_code = str(head_errs[0].get("code")
+                            or head_errs[0].get("type") or "") if head_errs else ""
+            head_desc = error_text(head_errs) or (
+                "feed 级 ERROR,沃尔玛未给逐条明细(itemsReceived="
+                f"{head.get('itemsReceived') or 0})")
+            for sku in meta:
+                results[sku] = ("failed", head_code)
+                descs[sku] = head_desc
+                all_errs[sku] = head_errs
+            logger.warning("feed %s 整条被拒(feedStatus=ERROR,itemsReceived=%s,"
+                           "零明细):台账 %d 个 SKU 全部落 failed,回执 %s | %s",
+                           feed_id, head.get("itemsReceived") or 0, len(meta),
+                           head_code or "(无码)", head_desc)
         cur.executemany(
             "UPDATE ops.feed_items SET status = %s, error_code = %s, "
             "error_desc = %s, resolved_at = now() "
@@ -173,23 +221,36 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             and product_events.receipt_in_ledger(
                 product_events.feed_kind(meta[sku][1]), meta[sku][0])])
         # 违禁回执自动进 ASIN 黑名单(所有者 2026-08-12:上架失败事件要能
-        # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁,归既有
-        # B=禁售类(PERMANENT,DO NOTHING 幂等)——list_new/match_listing
-        # 的黑名单闸下次自动拦,同一产品不再烧 UPC 与配额。
-        # 只收 kind=list(sku=asin 约定);跟卖 sku 是自编号提不出 ASIN,
-        # 其行内终态由跟卖表 F/J 列承担
+        # 反哺"上架前拦截")。三违禁码 = 沃尔玛官方判定的政策违禁
+        # (Military/Law Enforcement、Firearm Accessories、General Prohibited),
+        # 2026-09-03 换轨后归新码 **POLICY**(旧码是 B=禁售;两者都在
+        # PERMANENT 里,拦截行为一字不变,变的只是码名统一到新表)。
+        # DO NOTHING 幂等 —— list_new/match_listing 的黑名单闸下次自动拦,
+        # 同一产品不再烧 UPC 与配额。
+        # 只收 kind=list(MP_ITEM)。⚠ **「sku=asin 约定」已随切码作废**:黑名单键
+        # 由 blacklist.record_asins 经登记簿按 (店,sku) 反查 —— 本函数只负责把
+        # store + sku 原样递过去,**不许在这里自己解 ASIN**(那就是第二份规则,
+        # conventions §六)。跟卖走 MP_ITEM_MATCH ⇒ kind=match ⇒ 天然不进这个桶,
+        # 其行内终态由跟卖表 F/J 列承担。
+        # ⚠ **改码失败不是政策违禁,不得反哺黑名单**(SKU 改造批次 3,O8):
+        # 形态 B 下 sku_migrate 走 MP_ITEM ⇒ kind=list ⇒ 正好命中这段反哺。
+        # 一次改码被拒若碰巧带上违禁码,会把一个**正在正常销售**的 ASIN 永久
+        # 拉黑(record_asins 是 PERMANENT),list_new/match_listing 的黑名单闸
+        # 下一轮就开始拦,而没有任何摘要会说是改码干的。既有工作流名一个都不
+        # 叫 sku_migrate ⇒ 改码前逐字节零行为变化。meta[sku][0] 是提交来源工作流。
         prohibited = [
-            {"store": store["name"], "sku": sku, "category": "B",
+            {"store": store["name"], "sku": sku, "category": "POLICY",
              "reasons": f"上架回执违禁 {(code or '').strip()}|"
                         f"{(descs.get(sku) or '')[:150]}"}
             for sku, (o, code) in results.items()
             if o == "failed" and sku in meta
             and product_events.feed_kind(meta[sku][1]) == "list"
+            and meta[sku][0] != "sku_migrate"
             and (code or "").strip() in resources.WALMART_ERR_PROHIBITED]
         if prohibited:
-            n_bl = blacklist.record_asins(conn, prohibited)
+            n_bl = blacklist.record_asins(conn, prohibited, src="feed")
             logger.warning("上架回执命中政策违禁 %d 个,新入 ASIN 黑名单 %d 个"
-                           "(B=禁售,上架前拦截自此生效):%s",
+                           "(POLICY=违反禁售政策,上架前拦截自此生效):%s",
                            len(prohibited), n_bl,
                            ",".join(p["sku"] for p in prohibited[:10]))
     if n_missing:
@@ -311,11 +372,40 @@ def poll_all(stores_by_name: dict) -> str:
     return "\n".join([line] + detail_lines)
 
 
-def item_results(feed_id: str) -> dict[str, tuple[str, str]]:
-    """输入:feed_id → 输出:{sku: (status, error_code)}(读 ops.feed_items 台账)。"""
+def feed_statuses(feed_ids) -> dict[str, str]:
+    """输入:feed_id 列表 → 输出:{feed_id: ops.feed_log.status}(pending/submitted/done/failed)。
+
+    给回执消费方分辨「整 feed 被拒」用:feed 级 ERROR 且沃尔玛不给逐条明细时,台账
+    行历史上落的是 missing(2026-09-07 之前的轮询;之后落 failed),消费方看到 missing +
+    feed_log failed 就该按 failed 处理,而不是等 24h 观测反证。
+    """
+    ids = [f for f in dict.fromkeys(feed_ids) if f]
+    if not ids:
+        return {}
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT sku, status, error_code FROM ops.feed_items "
-                    "WHERE feed_id = %s", (feed_id,))
+        cur.execute("SELECT feed_id, status FROM ops.feed_log WHERE feed_id = ANY(%s)",
+                    (ids,))
+        return {fid: st for fid, st in cur.fetchall()}
+
+
+def item_results(feed_id: str, workflow: str | None = None
+                 ) -> dict[str, tuple[str, str]]:
+    """输入:feed_id(+ 可选提交来源工作流)→ 输出:{sku: (status, error_code)}
+    (读 ops.feed_items 台账)。
+
+    `workflow` 给了就**只认那条工作流提交的行**(正向过滤,不是黑名单)。给它的
+    是**回写方**:一张飞书表的反哺器只该回写自己那条链发出去的回执。2026-09-06
+    起改码(sku_migrate)与跟卖(match_listing)**共用 MP_ITEM_MATCH 这个 feedType**,
+    单靠 feed_type 已经分不开两条链 —— 不过滤的表现是一条改码回执被写进跟卖表的
+    「feed 结果」列(行还是跟卖那一行),而且不报错。
+    """
+    sql = "SELECT sku, status, error_code FROM ops.feed_items WHERE feed_id = %s"
+    args: tuple = (feed_id,)
+    if workflow:
+        sql += " AND workflow = %s"
+        args += (workflow,)
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, args)
         return {sku: (status, code or "") for sku, status, code in cur.fetchall()}
 
 
@@ -347,9 +437,15 @@ def item_codes(feed_id: str) -> dict[str, set[str]]:
     return out
 
 
-def item_errors(feed_id: str) -> dict[str, str]:
-    """输入:feed_id → 输出:{sku: 人话报错描述}(空描述的 SKU 不出现)。"""
+def item_errors(feed_id: str, workflow: str | None = None) -> dict[str, str]:
+    """输入:feed_id(+ 可选提交来源工作流)→ 输出:{sku: 人话报错描述}
+    (空描述的 SKU 不出现)。`workflow` 的语义与 `item_results` 逐字相同。"""
+    sql = ("SELECT sku, error_desc FROM ops.feed_items "
+           "WHERE feed_id = %s AND error_desc IS NOT NULL")
+    args: tuple = (feed_id,)
+    if workflow:
+        sql += " AND workflow = %s"
+        args += (workflow,)
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT sku, error_desc FROM ops.feed_items "
-                    "WHERE feed_id = %s AND error_desc IS NOT NULL", (feed_id,))
+        cur.execute(sql, args)
         return {sku: desc for sku, desc in cur.fetchall()}

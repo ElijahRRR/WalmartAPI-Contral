@@ -75,8 +75,9 @@ def test_family_lookup_actually_runs_its_query(monkeypatch):
     SELECT 每行抛 "connection is closed",被 `_variant_plan` 自己的 except
     吞成一行 warning,`family_has_primary` 一并失效,全程不报错。
 
-    这条用例真调 `_plan_variants`,断言那条查询**发出去了**、且拿到的组 ID
-    是库里在架兄弟的那个(不是派生的)。
+    这条用例真调 `_plan_variants`,断言那条查询**发出去了**、且拿到的组号
+    是库里在架兄弟的那个(2026-09-07 起本模块只可能给出这一个来源的组号:
+    派生那条路已删,新家族的号在 `_prep_rows` 的抽码事务里发)。
     """
     conn = _Conn(rows=[("B0SIB", "LEGACY_GID", "Yes")])
     monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(conn))
@@ -88,7 +89,8 @@ def test_family_lookup_actually_runs_its_query(monkeypatch):
     ln._plan_variants(ready, collections.defaultdict(int))
     assert conn.queries, "同族在架查询压根没发出去(连接是关闭的?)"
     vp = ready[0]["_vplan"]
-    assert vp["group_id"] == "LEGACY_GID"      # 沿用在架的,不是 vg_ 派生
+    assert vp["group_id"] == "LEGACY_GID"      # 沿用在架的存量组号,不回改
+    assert vp["family_key"] == "P0"            # 查表键留在决策里,但不发出去
     assert vp["is_primary"] is False           # 在架兄弟已是主变体
 
 
@@ -136,22 +138,24 @@ def test_remap_llm_path_does_not_blow_up_the_whole_run(monkeypatch):
 
 # ── M2 同一家族被切成两个组 ─────────────────────────────────────────────────
 
-def test_group_id_is_stable_when_parent_column_is_mixed():
+def test_family_key_is_stable_when_parent_column_is_mixed():
     """⚠ 判据必须是 `parent in 家族`,不是 `parent == 自己`。
 
     混合形态(部分行 parent 填自己、部分行填某个兄弟)下,写成后者会让
-    填自己的那行走 min(家族)、填兄弟的那行走 parent,**同一家族两个组 ID**,
-    而且不报错。旧仓正因这个坑无条件用 min(full_set)。
+    填自己的那行走 min(家族)、填兄弟的那行走 parent,**同一家族两个键**,
+    而且不报错 —— 键裂了就是查表查成两族、发两个组号,后果与旧的"两个组 ID"
+    一模一样。旧仓正因这个坑无条件用 min(full_set)。
     """
     fam = ["B0009GGJ9G", "B0009GGJCI", "B0009GGJDW"]
-    mixed = {vg.group_id("B0009GGJDW", "B0009GGJDW", fam),   # parent 填自己
-             vg.group_id("B0009GGJDW", "B0009GGJ9G", fam),   # parent 填兄弟
-             vg.group_id("B0009GGJCI", "B0009GGJDW", fam)}
-    assert mixed == {"vg_B0009GGJ9G"}, mixed
-    # 真族主(不在家族里)照旧按 parent 派生 —— 生产实见形态,ID 更好认,
-    # 且**不改动已经发出去的组 ID**
-    assert {vg.group_id("B0C9WGHMZS", a, fam) for a in fam} == \
-        {"vg_B0C9WGHMZS"}
+    mixed = {vg.family_key("B0009GGJDW", "B0009GGJDW", fam),   # parent 填自己
+             vg.family_key("B0009GGJDW", "B0009GGJ9G", fam),   # parent 填兄弟
+             vg.family_key("B0009GGJCI", "B0009GGJDW", fam)}
+    assert mixed == {"B0009GGJ9G"}, mixed
+    # 真族主(不在家族里)照旧按 parent 取键 —— 生产实见形态
+    assert {vg.family_key("B0C9WGHMZS", a, fam) for a in fam} == \
+        {"B0C9WGHMZS"}
+    # 裸键:**一个前缀都不许带**(带前缀那版是直接发出去的,正是被改掉的形态)
+    assert not any(k.startswith("vg") for k in mixed)
 
 
 # ── M3 重映射链对它的主场景不可达 ───────────────────────────────────────────

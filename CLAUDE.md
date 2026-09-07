@@ -55,6 +55,14 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
   点名 → 下游按水位避让(`store_absence`,缺席 ≠ 停用)→ 链尾逐店重赛一次
   即止。**失败归类词唯一出处 `store_retry.diagnose`**(六档:凭证失效/代理
   无效/代理波动/沃尔玛NNN/网络未达/其他)。
+- **SKU 身份唯一出处是登记簿 `catalog.listing_sources`**(码不再等于 ASIN);
+  **弃码唯一实现 `services/sku_codec.abandon`,弃码点只有四个**(删除经观测核验 /
+  SKU_LOCKED 退役 + 冷却 / UPC 撞库 / 改码),其余一切下架都不弃码;
+  发码只有 `sku_codec.mint`,冷却与代际两个常量也只在那里出生(展开见 §九)。
+- **变体组号同理**(2026-09-07):唯一出生地 `sku_codec.mint_group_code`,
+  `catalog.variant_groups` 的 INSERT 只有它一个出口、行永不 DELETE;家族键
+  (`variant_group.family_key`)只当查表键**永不外发**,不许拼 `vg_`、不许拿 ASIN
+  取哈希;存量 `vg_` 组原样登记不回改(展开见 §九⑩′、sku_plan §9.13)。
 - **每个能力只有一条实现路径**(双轨禁止);真兜底三要件:同函数内、触发记
   日志计数、条件明确非 catch-all(§六)。
 - **services 新增积木前先通读现有函数查重**;docstring 首行写"输入→输出"。
@@ -73,7 +81,8 @@ api/            外部接口适配:_client, items, prices, inventory, orders,
                 returns, feeds, reports, insights, feishu, scraper
 services/       跨 workflow 复用积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
-refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv、ebay_rate_limits.tsv 等)
+refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv、ebay_rate_limits.tsv 等);
+                specs/ 官方 feed 规范原件(守门测试读它校载荷,别照记忆改字段)
 skills/         生成物:调度技能包,skill_export 渲染,不要手改
 docs/           conventions.md(规范全文) plan.md(计划与决策日志)
                 production_cutover.md(生产定稿) api_blueprint.md(端点/配额定稿)

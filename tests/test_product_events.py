@@ -35,12 +35,48 @@ def test_record_many_serializes_detail():
         {"sku": "S2", "event": "item_missing", "source": "catalog_sync"},
     ])
     assert n == 2
-    sql, rows = conn.sqls[0]
+    # 第一行带 store=T1 ⇒ INSERT 之前多一条登记簿 SELECT(批次 0b)
+    sql, rows = conn.sqls[-1]
     assert "INSERT INTO catalog.product_events" in sql
     assert rows[0][0] == "S1" and '"feed_id"' in rows[0][6]
     assert rows[0][1] is None          # 'S1' 提不出标准码 → asin 存 NULL
     assert rows[1][1] is None and rows[1][5] is None      # store/detail 可空
     assert pe.record_many(conn, []) == 0                  # 空集不发 SQL
+
+
+def test_record_many_resolves_asin_via_registry_when_store_present():
+    """带 store 的行走登记簿:切码后 sku 是 12 位随机码,形态提取恒返 None ⇒
+    事件账本的身份退化成按码分叉,product_risk 四个视图的 coalesce(asin, sku)
+    全部失效,时间线断成一段一段(而且不报错)。"""
+    conn = _Conn(fetch=[("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    pe.record_many(conn, [{"sku": "AK7QM2X9RT4W", "store": "T1",
+                           "event": "item_missing", "source": "catalog_sync"}])
+    reg_sql, _ = conn.sqls[0]
+    assert "catalog.listing_sources" in reg_sql
+    _, rows = conn.sqls[-1]
+    assert rows[0][1] == "B0ABCDEFGH"
+
+
+def test_record_many_falls_back_to_shape_for_platform_events():
+    """store 为空的**平台级事件**没有店维度可查(登记簿主键是 (store, sku)),
+    保持形态提取 —— 它们的 sku 本来就是 asin,extract_asin 恒等返回。
+    这批行**一条 SELECT 都不该发**。"""
+    conn = _Conn()
+    pe.record_many(conn, [{"sku": "XKJ-B0GXX75JN5-39.98",
+                           "event": "item_missing", "source": "catalog_sync"}])
+    assert len(conn.sqls) == 1                      # 只有那条 INSERT
+    _, rows = conn.sqls[-1]
+    assert rows[0][1] == "B0GXX75JN5"
+
+
+def test_record_many_issues_one_lookup_per_call():
+    """一次调用一条批量 SELECT:最坏调用方 cleanup_history_import 每批 1 万行
+    且**带 store**,逐行往返会把历史导入拖成天级。"""
+    conn = _Conn()
+    pe.record_many(conn, [{"sku": f"B0AAAAAA{i:02d}", "store": "T1",
+                           "event": "item_missing", "source": "catalog_sync"}
+                          for i in range(200)])
+    assert len(conn.sqls) == 2                      # 一条 SELECT + 一条 INSERT
 
 
 def test_receipt_in_ledger_whitelist():
@@ -84,11 +120,63 @@ def test_verify_deletions_verdicts(caplog):
                         ("T1", "S_STILL", "still"),
                         ("T1", "S_WAIT", "wait")])
     with caplog.at_level(_logging.WARNING, logger="services.product_events"):
-        gone, still = pe.verify_deletions(conn)
+        gone, still, gone_pairs = pe.verify_deletions(conn)
     assert (gone, still) == (1, 1)
+    # 第三元 = 判定为 gone 的 (店, SKU),与写进账本的 delete_verified 行一一
+    # 对应 —— catalog_sync 拿它去弃码(弃码点 1)。still 与 wait 都不在里面。
+    assert gone_pairs == [("T1", "S_GONE")]
     ins_sql, rows = conn.sqls[-1]
     events = {(r[0], r[3]) for r in rows}
     assert ("S_GONE", "delete_verified") in events
     assert ("S_STILL", "delete_not_effective") in events
     assert not any(r[0] == "S_WAIT" for r in rows)        # 未到期不落判
     assert any("仍在架" in m for m in caplog.messages)
+
+
+def test_product_risk_view_exposes_sku_replaced_columns():
+    """改码维度进 product_risk(SKU 改造批次 3 地基,S4)。
+
+    所有者要能答"这个 ASIN 在这家店用过哪些码、为什么换"。不加这两列,
+    sku_replaced 就是写了没人看 —— 与 2026-08-14 audit_passed/audit_rejected
+    「零读者」是同一个坑。身份键仍是 coalesce(asin, sku)(新旧码经登记簿都解析到
+    同一个 ASIN),所以改码天然落在同一条时间线上,不必改身份键。
+    """
+    import pathlib
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    view = ddl.split("CREATE VIEW catalog.product_risk AS")[1]
+    view = view.split(";")[0]
+    assert "count(*) FILTER (WHERE event = 'sku_replaced')" in view
+    assert "AS sku_replaced_times" in view
+    assert "max(occurred_at) FILTER (WHERE event = 'sku_replaced')" in view
+    assert "AS last_sku_replaced_at" in view
+    assert "coalesce(asin, sku) AS asin" in view       # 身份键没被动过
+    assert "sku_replaced" in pe.EVENTS                 # 事件码早已登记(批次 2)
+
+
+def test_sku_migrate_receipts_never_enter_the_ledger_in_either_feed_form():
+    """改码回执**两种形态都不进病历**(SKU 改造批次 3,O7)。
+
+    改码的事实由观测定案(sku_replaced / sku_abandoned 两条码级事件),不是
+    沃尔玛回执。形态 A 走 MP_MAINTENANCE(kind=maintenance)本就不入账;形态 B
+    走 MP_ITEM(kind=list)却是**恒入账**的 —— 不在这个唯一收口点挡住,形态一
+    切换病历就多出一串 list_feed_success,把「上架」时间线与 product_risk 的
+    submit_times 一起灌水,而且静默。
+    """
+    for kind in ("list", "maintenance", "delete", "retire", "match"):
+        assert pe.receipt_in_ledger(kind, "sku_migrate") is False
+    # 反向:既有来源一个都不受影响(改码前逐字节零行为变化)
+    assert pe.receipt_in_ledger("list", "list_new") is True
+    assert pe.receipt_in_ledger("delete", "problem_product_cleanup") is True
+    assert pe.receipt_in_ledger("maintenance", "problem_product_cleanup") is True
+    assert pe.receipt_in_ledger("maintenance", "maintenance") is False
+    assert pe.receipt_in_ledger("maintenance", None) is False
+
+
+def test_the_two_ledger_workflow_tables_never_overlap():
+    """两张表问的是相反的问题,取值重叠就说明有人把"不入账"写成了"要入账"。
+
+    _MAINT_LEDGER_WORKFLOWS = maintenance 里**谁要**入账(登记制白名单);
+    _NEVER_LEDGER_WORKFLOWS = 谁**一律不**入账(工作流级例外)。
+    """
+    assert not (pe._MAINT_LEDGER_WORKFLOWS & pe._NEVER_LEDGER_WORKFLOWS)
+    assert pe._NEVER_LEDGER_WORKFLOWS == {"sku_migrate"}

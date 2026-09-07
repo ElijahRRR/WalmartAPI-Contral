@@ -3,7 +3,7 @@
 在 `/Users/nextderboy/Projects/WalmartAPI-Contral` 下执行这一行,**原样执行,不要改任何参数**:
 
 ```bash
-/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh product_audit maintenance_scan problem_scan maintenance problem_product_cleanup -p product_refresh:wait=1 -p product_audit:mode=online -p product_audit:stages=L0 -p product_audit:limit=1000000
+/Users/nextderboy/Projects/WalmartAPI-Contral/.venv/bin/python3 /Users/nextderboy/Projects/WalmartAPI-Contral/cli.py catalog_sync sources_backfill product_refresh product_audit maintenance_scan problem_scan maintenance problem_product_cleanup -p product_refresh:wait=1 -p product_audit:mode=online -p product_audit:stages=L0
 ```
 
 这条链跑的是:catalog_sync → sources_backfill → product_refresh → product_audit → maintenance_scan → problem_scan → maintenance → problem_product_cleanup。
@@ -13,7 +13,7 @@
 | 步 | 工作流 | 这一步干什么 |
 |---|---|---|
 | 1 | `catalog_sync` | 沃尔玛在线商品全量同步(替代旧 tools/sync_online_products.py 的沃尔玛侧)。 |
-| 2 | `sources_backfill` | 在架商品来源登记簿补齐(格式回填;幂等可重跑)。 |
+| 2 | `sources_backfill` | 在架商品来源登记簿补齐(**只登记不猜**;幂等可重跑)。 |
 | 3 | `product_refresh` | 在线产品全量重推采集(维护链的数据新鲜度源头)。 |
 | 4 | `product_audit` | 产品审核主流程(批次 C:全链含 LLM 层;危险,缺省即真跑)。 |
 | 5 | `maintenance_scan` | 商品维护扫描定性(批次四;只读,**不发任何 feed**)。 |
@@ -23,7 +23,7 @@
 
 **顺序是硬约束**:前一步不成功就不跑后面的,整条链只发一条飞书通知。
 
-备注:整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,当轮就能被维护;零缺口时零成本,摘要非零 = 有人绕过登记上架
+备注:整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync(所有者定稿 2026-08-19;2026-09-06 改成只登记不猜):把在架却未登记的行登记为 unknown 并报累计待归类数,不猜出身;归类是人工件 sources_reclassify,不进调度
 
 ## 跑完怎么判
 

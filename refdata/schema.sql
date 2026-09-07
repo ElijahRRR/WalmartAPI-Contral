@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS catalog.products (
     image_url       text,
     slow_hash       text,        -- 慢变字段哈希:变了才需要重审
     audit_status    text,        -- pending / approved / rejected
-    audit_reason    text,
+    audit_reason    text,        -- **类别**(官方政策名 / 内部黑名单 / 类目准入)
+    audit_detail    text,        -- **具体内容**(原文片段 + 条款要点 / 规则人话)
     walmart_pt      text,        -- 映射的沃尔玛 Product Type
     -- PT 的来源(所有者定稿 2026-08-14):这一列原来混装两种东西——
     --   walmart_confirmed = 沃尔玛真接受过(在架/报错回执/删除历史回填)
@@ -205,11 +206,28 @@ CREATE INDEX IF NOT EXISTS products_browse_node_idx
 -- 保守:不把来历不明的 PT 当实证喂给挖掘)。
 ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS pt_source text;
 
+-- 审核三段输出分列(2026-09-02 第三步 B1 批,docs/audit_step3_spec.md §3.4):
+-- 判定结果 audit_status / **类别** audit_reason / **具体内容** audit_detail。
+-- 此前两样东西挤在 audit_reason 一列里(拒绝时是政策名、待定时是一句中文),
+-- 于是"按类别统计被拒原因"这件事永远做不了,飞书上架表也只能塞一格人话。
+-- audit_reason 从此只装类别枚举(官方政策名 / 内部黑名单 / 类目准入),
+-- pass 与 pending 一律 NULL;audit_detail 装那一句具体内容(L3 给的原文片段
+-- + 条款要点,或规则命中翻成的人话,或待定原因)。
+-- ⚠ 存量行不迁移:老行的 audit_reason 里还混着中文句子/旧政策名,被重审前
+--   原样留着(飞书投影按"有 audit_detail 用新格式,没有就用老格式"渲染)。
+ALTER TABLE catalog.products ADD COLUMN IF NOT EXISTS audit_detail text;
+
 -- ── 产品来源登记簿(2026-08-07 所有者定稿)─────────────────────────────────
 -- 每个上架产品登记"出身":sku=asin 约定只对 amz 搬运品成立,跟卖/自建/1688
 -- 各有身份。谁上架谁登记;自动化按出身路由(路由铁律:由"源数据缺失"驱动的
 -- 自动破坏动作必须限定 source_type 匹配,unknown 一律不自动动),
 -- 手动通道(product_clear 表等)不受限全格式通吃。调整=UPDATE 一行数据。
+-- 弃码三列(2026-09-02,SKU 改造批次 0a):列名故意用 abandoned 不用 retired ——
+-- 「码弃用 ≠ 沃尔玛 lifecycle RETIRED ≠ product_clear 停用」是三个同名异义。
+-- 行**永不 DELETE**(旧码带着订单/售后回来必须还查得到);abandoned_at /
+-- abandoned_reason / replaced_by 三列只准由 services/sku_codec 写(abandon;
+-- 批次 3 的 mint_replacement),本表的 INSERT 只有 services/listing_sources.register
+-- 与 services/sku_codec.mint 两个合法出口(守门 tests/test_sku_guard.py)。
 CREATE TABLE IF NOT EXISTS catalog.listing_sources (
     store       text NOT NULL,
     sku         text NOT NULL,
@@ -225,15 +243,129 @@ CREATE TABLE IF NOT EXISTS catalog.listing_sources (
 -- 局部条件 source_key IS NOT NULL 是因为 self/自建行这一列本来就空(索引更小)。
 CREATE INDEX IF NOT EXISTS listing_sources_key_idx
     ON catalog.listing_sources (source_key) WHERE source_key IS NOT NULL;
--- 存量一次性回填(幂等;首次注册前的行按 SKU 格式猜:ASIN 形 → amz,
--- 其余 → unknown 待人工归类。此后新上架由各工作流显式登记,不再靠格式猜)
-INSERT INTO catalog.listing_sources (store, sku, source_type, source_key, workflow)
-SELECT store, sku,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN 'amz' ELSE 'unknown' END,
-       CASE WHEN sku ~ '^B0[A-Z0-9]{8}' THEN left(sku, 10) END,
-       'backfill'
-FROM catalog.walmart_items
-ON CONFLICT (store, sku) DO NOTHING;
+-- 弃码三列(SKU 改造批次 0a):全部可空无默认;写侧接线在批次 2,落地时全库为 NULL。
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_at     timestamptz;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS abandoned_reason text;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaced_by      text;
+-- 改码两列(2026-09-02,SKU 改造批次 3 地基):同样可空无默认,落地时全库为 NULL
+-- (写侧唯一入口是 services/sku_codec.mint_replacement / settle_replacement,
+--  接线在批次 3 的 workflows/sku_migrate.py;地基这一块零调用 ⇒ 零行为变化)。
+--   replaces    —— **新码行**指回被它替换的旧码,与旧行的 replaced_by 互为反向指针;
+--   replaced_at —— **旧行**进入在途改码(pending)的时刻,定案超时判据的唯一时间源。
+-- 三列的读法(全仓唯一口径):replaced_by 非空 = 该行正在被替换(在途 pending);
+-- abandoned_at 非空且 abandoned_reason='sku_update' = 改码已定案(旧行退休)。
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaces         text;
+ALTER TABLE catalog.listing_sources ADD COLUMN IF NOT EXISTS replaced_at      timestamptz;
+-- 全局 sku 唯一:**只对不透明新码生效**。存量 sku=asin 跨店重复是既成事实,
+-- 无条件唯一在存量上一定建不起来,而 db_init 是把整份 schema.sql 一次 execute
+-- (workflows/db_init.py),一条索引建失败整份回滚 ⇒ 生产建库直接停摆。
+-- 字符类必须与 services.sku_codec._ALPHABET 逐字一致(守门测试钉住);末尾
+-- sku ~ '[A-Z]' 与 sku_codec.is_opaque 的「至少一个字母」同口径,防 12 位纯数字
+-- 沃尔玛 item id 混进「新码」索引。⚠ 名字与条件由批次 0a 定死,后续批次一律引用、
+-- 不许 DROP/CREATE。
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_opaque_sku_uidx
+    ON catalog.listing_sources (sku)
+    WHERE sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]';
+-- 活码键唯一:拦并发双 mint。同样只对新码生效 —— 存量 match 行同一 GTIN 可能挂过
+-- 多个人工号,存量 amz 行也可能因旧回填截断撞键;mint 只 INSERT 不透明码,限定形态
+-- 后对 mint 的保护是完整的。**replaced_by IS NULL 本批就带上**(该列全库 NULL,
+-- 谓词恒真,零行为变化),这样批次 3 一条索引都不必重建,只核验 indexdef。
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_live_uidx
+    ON catalog.listing_sources (store, source_type, source_key)
+    WHERE abandoned_at IS NULL AND replaced_by IS NULL AND source_key IS NOT NULL
+      AND sku ~ '^[23456789ABCDEFGHJKMNPQRSTVWXYZ]{12}$' AND sku ~ '[A-Z]';
+-- mint 的复用查询用(要能看见**存量活行**,故不限形态);局部条件与
+-- services/sku_codec.mint 的 WHERE 逐字对齐,不对齐 = 用不上索引。
+CREATE INDEX IF NOT EXISTS listing_sources_live_key_idx
+    ON catalog.listing_sources (store, source_type, source_key)
+    WHERE abandoned_at IS NULL AND replaced_by IS NULL;
+-- ⚠ 这里曾有 `listing_sources_abandoned_idx`(部分索引,(store, source_type,
+-- source_key) WHERE abandoned_at IS NOT NULL),**只为 list_new 的换码代际上限闸
+-- 的每轮 GROUP BY 计数而建**。所有者 2026-09-06 删掉了那道闸(上架表在不断更新,
+-- 不设代数上限;上不去就拿 feed 返回的具体原因去优化上架方法),索引随之失去
+-- 唯一消费方,从本 schema 移除。
+-- **本文件不写任何 DROP 语句**(仓规:DROP 未连库核对一律不执行;守门测试也
+-- 逐字拦):存量库里那条索引还在,由所有者手动删 —— 手续记在 docs/db_schema.md。
+-- 改码两个反查索引(SKU 改造批次 3 地基)。两条都是**局部**索引:改码前
+-- replaced_by / replaces 全库为 NULL,零行为命中,建索引不会被存量脏数据卡住
+-- (db_init 一次 execute 整份 schema.sql,一条失败整份回滚)。
+-- ⚠ 本批**不动**上面那条活码部分唯一索引:它由批次 0a 一次建成最终条件
+-- (已含 replaced_by IS NULL),这里只核验 indexdef、不 DROP 不重建
+-- (索引名与条件全文只出生一次,守门测试按"名字只出现一次"钉住)。
+-- 第一条(replaced_by 反查):mark_missing / diff_catalog / problem_scan 每轮都要问
+--   「这行是不是在途被替换」,没有它就是每轮全表扫登记簿。
+-- 第二条(replaces 唯一):**唯一**堵住「两个**活着的**新码抢同一个旧码」——
+--   这种脏状态只在并发重跑里出现,出现之后无法自动分辨哪个码才是真的。
+--   ⚠ 条件必须带 `abandoned_at IS NULL`:改码回滚(sku_update_failed)之后,那个
+--   作废的新码行**保留 replaces 作为病历**(行永不 DELETE),但它不该再占着旧码的
+--   认领位 —— 不带这一条,同一个旧码这辈子只能改一次码,回滚之后再改必然撞唯一
+--   索引,而 mint_replacement 会把它误诊成"随机撞码"连抽 5 次后报错
+--   (2026-09-02 沙箱 PG 实测到,已修)。
+-- 两条的名字与条件同样**一处定死**,后续批次一律引用、不许 DROP/CREATE。
+CREATE INDEX IF NOT EXISTS listing_sources_replaced_by_idx
+    ON catalog.listing_sources (store, replaced_by) WHERE replaced_by IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS listing_sources_replaces_uidx
+    ON catalog.listing_sources (store, replaces)
+    WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
+-- ⚠ 这里曾有一条随 db_init 每轮执行的**存量按 SKU 格式回填** INSERT
+-- (`CASE WHEN sku ~ '^B0…$' THEN 'amz' ELSE 'unknown'`),**2026-09-06 所有者
+-- 定稿整段删除**:一次性回填早就做完了,留着只会把尚未登记的新码抢先登成
+-- unknown ——「有新行没归类」的信号登记一次之后就永久沉默。db_init 从此
+-- 不写任何业务行。新出现的未登记在架行由 workflows/sources_backfill 登成
+-- unknown(只登记不猜,不参与任何自动破坏动作),人工经
+-- workflows/sources_reclassify 归类。**不要复活这条 INSERT。**
+
+-- 代际继承的**唯一出处**(2026-09-02,SKU 改造批次 3 地基):
+-- 「这个新码继承那个旧码的历史」只在这里定义。改码之后新码在 product_events /
+-- ops.feed_items / orders.order_lines 里一条历史都没有,五处按 (store, sku) 读历史
+-- 的判据会同时失明(顽固件代际、问题归类最近类别、WFS 删除拦截、在途防重、
+-- 分配链销量归属)。消费方一律经本视图取别名,**不许各自现写 replaces 的 JOIN**
+-- (conventions §六:判据只能有一处出生;守门 tests/test_sku_guard.py 钉住)。
+-- ⚠ 只继承**一跳**,前提是「旧码改码后立即弃码、永不再改码」。若将来允许对同一个
+--   品连续改两次码,本视图必须改成递归 CTE,否则第二跳静默断链。
+-- ⚠ 它是视图不是表:改码前恒为空集,所有消费方的 UNION ALL / LEFT JOIN 在改码前
+--   都是「加一个空集」⇒ 结果集逐行不变(批次 3 零行为变化论证的地基)。
+-- ⚠ 只出**活着的**认领(abandoned_at IS NULL):改码回滚作废的新码行保留 replaces
+--   当病历,但它没有历史可继承。不排除它,同一个旧码会在本视图里出现多行,
+--   而消费方的 LEFT JOIN 会因此把同一笔历史**算两次**(alloc_survey 的销量归属
+--   首当其冲,且不报错)。条件与上面那条「replaces 认领唯一索引」同源 ⇒ 本视图里
+--   (store, alias_sku) 至多一行,这是消费方可以放心 LEFT JOIN 的前提。
+CREATE OR REPLACE VIEW catalog.sku_aliases AS
+  SELECT store, sku, replaces AS alias_sku
+  FROM catalog.listing_sources
+  WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
+
+-- ── 变体组登记簿(2026-09-07 所有者定稿三条,docs/sku_plan.md §9.13)───────────
+-- 为什么要有这张表:变体组 ID 从 `vg_<父 ASIN>` 改成不透明组号之后,「同族分批
+-- 上架的兄弟怎么进同一个组」不再能靠各自派生同一个串 —— **必须查表**。
+-- (不用「ASIN 取哈希」当组号:ASIN 空间公开可枚举,哈希等于没藏。)
+-- family_key 是 services/variant_group.family_key 的产出(父 ASIN,或父落在家族内时
+-- 取 min(家族)),**只进库当查表键,永不发给沃尔玛**;发出去的只有 group_code。
+-- 三条纪律:
+--   ① 本表的 INSERT **只有 services/sku_codec.mint_group_code 一个出口**
+--      (守门 tests/test_sku_guard.py),组号与 SKU 同一套编码规则、同一个之家;
+--   ② 行**永不 DELETE**:组号发出去就挂在沃尔玛侧那一族上,删行 = 下一个兄弟
+--      重新发号 = 同一族被劈成两组,而且不报错;
+--   ③ 存量家族**不回改**:已在架成员现有的 `vg_…` 由 mint_group_code 原样登记进
+--      group_code 列(所有者定稿第 2 条),登记之后这一族的延续不再依赖那个成员
+--      是否还在架。
+-- 唯一索引是 **(store, group_code) 而不是全局**:存量 `vg_<ASIN>` 号在两家店可能
+-- 重复(同一个 ASIN 被两家店上过),全局唯一在存量登记那一刻就会建不起来/插不进;
+-- 而"一个组号在一家店只能属于一族"才是我们真正要防的(两族共号 = 沃尔玛侧两族并成
+-- 一组)。⚠ **本表故意不加 12 位字符集条件**:存量沿用的 `vg_…` 根本不是 12 位码,
+-- 加了条件它们一条都进不来;而那个正则在本文件里只准出现两次(listing_sources 的
+-- 两条部分唯一索引),守门 test_no_second_opaque_regex_in_the_repo 逐字钉住。
+CREATE TABLE IF NOT EXISTS catalog.variant_groups (
+    store       text NOT NULL,
+    family_key  text NOT NULL,   -- 家族键:variant_group.family_key 的产出,只进不出
+    group_code  text NOT NULL,   -- 发给沃尔玛的 variantGroupId:新家族 = G+11 位
+                                 -- 不透明码;存量家族 = 沿用在架成员的 vg_… 原样登记
+    workflow    text,            -- 发号来源工作流(今天只有 list_new)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, family_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variant_groups_code_uidx
+    ON catalog.variant_groups (store, group_code);
 
 -- ── UPC 池(L2a,2026-08-07 所有者定稿:PG 权威,飞书表=注入口+投影)────
 -- 领号并发安全靠单事务 FOR UPDATE SKIP LOCKED(旧系统文件锁/本地声明簿/
@@ -241,9 +373,14 @@ ON CONFLICT (store, sku) DO NOTHING;
 --   ''(未用)→ claimed(已领:分配未提交)→ used(已用:feed 已提交,永久消耗)
 --   回收仅三类(提交前失败/双确认未达/4xx 被拒)claimed→'';Unknown 永不回收
 --   conflict(全站已存在)/bad_prefix(首位非 016789 白名单)永久弃用
+--   burned_delete(DELETE 经观测核验后弃码同时烧号)/ burned_lock(SKU_LOCKED
+--   自愈退役后烧号)—— 2026-09-02 SKU 改造批次 0a 登记。与 conflict 的分工:
+--   **conflict 只表示「全站已存在该 UPC」(撞库)**,主动烧号不再复用这个语义,
+--   否则池表投影与 pool_stats 里永远分不清「这号是撞库废的」还是「我们烧的」。
+--   写入点在批次 2 随 sku_codec.abandon 接线一起改(0a 只登记取值,不改写入)。
 CREATE TABLE IF NOT EXISTS catalog.upc_pool (
     upc         text PRIMARY KEY,           -- 规范化 12 位(zfill 补前导零)
-    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix
+    status      text NOT NULL DEFAULT '',   -- ''/claimed/used/conflict/bad_prefix/burned_delete/burned_lock
     asin        text,                       -- 领用归属
     store       text,
     sku         text,                       -- 已用时的沃尔玛 SKU
@@ -296,7 +433,9 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
     asin        text PRIMARY KEY,
     category    text NOT NULL,       -- 入选时的类别码(B/C/E/F/G/K)
     source      text NOT NULL,       -- 「沃尔玛-<类名>」,与飞书来源列同款
-    reason      text,                -- 命中原因样本(截 200)
+    reason      text,                -- 命中原因**全文**(2026-09-04 起不截;
+                                     -- 原来截 200 而判据串常在句尾,
+                                     -- 见 services/blacklist 头注)
     src_store   text,                -- 溯源:在哪个店铺撞的
     biz_cn      boolean NOT NULL DEFAULT false,  -- BIZ-CN 独立维度(中国卖家
                                      -- 专属禁售,legacy_survey:2077 要求单列)
@@ -306,6 +445,30 @@ CREATE TABLE IF NOT EXISTS catalog.asin_blacklist (
 -- 2026-08-11:asin 列改存清洗后的标准码(sku_normalize + rebuild_asin 重建),
 -- src_sku 保留沃尔玛侧订货号原文溯源;提不出源头码的行 asin=原文。
 ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS src_sku text;
+-- 新码回填四列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **`category` 2026-09-04 起统一到新码**(所有者裁决:「旧 A-L 码入选然后按
+--   新码复核过,那么现在库里保留的应该就只有新码,没有旧码残留……不要做双轨,
+--   没有意义,以新规则统一」)。`error_reclass` 复核出结论就同步改写它。
+--   两条不动:`LEGACY`(历史继承,保留原样)与判不出的(code 为 NULL)。
+--   ⚠ **拦截行为一个字没变**:上架闸拦的是「这个 asin 在不在表里」,`category`
+--   只进提示文字;飞书「来源」列也不变(source_label 经 _NAMES 映射回旧中文标签)。
+-- taxonomy_src 记原文是从哪儿找到的,四级优先(全文优先于样本):
+--   'records'=audit.walmart_error_records.raw_reason(全文,最新一条)
+--   'events' =catalog.product_events.detail->>'reasons'(病历,最新一条)
+--   'items'  =catalog.walmart_items.unpublished_reasons(当前值,按 src_sku 对)
+--   'self'   =本表 reason 列(**截 200 字符的样本**,判据串可能被切掉)
+--   'none'   =四处都没有 ⇒ taxonomy_code 留 NULL,不猜
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_version text;
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_src text;
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxcode_idx ON catalog.asin_blacklist(taxonomy_code);
+CREATE INDEX IF NOT EXISTS asin_blacklist_taxver_idx  ON catalog.asin_blacklist(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE catalog.asin_blacklist ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 CREATE TABLE IF NOT EXISTS catalog.brand_blacklist (
     brand_key text PRIMARY KEY,      -- casefold 匹配键
@@ -448,6 +611,15 @@ CREATE VIEW catalog.product_risk AS
               ('delete_submitted', 'retire_submitted')) = 0) AS unexplained_missing,
          max(occurred_at) FILTER (WHERE event IN
              ('delete_submitted', 'retire_submitted', 'item_missing')) AS last_removed_at,
+         -- 改码维度(2026-09-02,SKU 改造批次 3 地基):所有者要能答"这个 ASIN 在
+         -- 这家店用过哪些码、为什么换"。身份键已是 coalesce(asin, sku),新旧码经
+         -- 登记簿都解析到同一个 ASIN,所以改码天然落在同一条时间线上。不加这两列,
+         -- sku_replaced 就是"写了没人看"——与 2026-08-14 audit_passed/audit_rejected
+         -- 零读者是同一个坑(教训写在下面那段注释里)。
+         -- ⚠ 一次改码在同一 ASIN 上留**两条** sku_replaced:旧码一条(sku_codec.abandon
+         --   带 replaced_by 时记)、新码一条(settle_replacement 给新码的出生事件)。
+         count(*) FILTER (WHERE event = 'sku_replaced')          AS sku_replaced_times,
+         max(occurred_at) FILTER (WHERE event = 'sku_replaced')  AS last_sku_replaced_at,
          -- 审核维度(2026-08-14 接消费端):在此之前 audit_passed/audit_rejected
          -- **零读者** —— 全库 119 万条事件写了没人看,而"审核拒了但还在架"
          -- 这类跨域问题却要靠 JOIN 两张表现拼。病历的价值本就是把审核结论、
@@ -524,8 +696,20 @@ CREATE VIEW catalog.audit_listing_conflicts AS
       SELECT w.store, w.sku, w.published_status, w.last_seen_at,
              p.asin, p.audit_status, p.audit_reason, p.audited_at, p.audit_version
       FROM catalog.walmart_items w
-      JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
-      WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
+      -- 身份键收口(2026-09-02 批次 0a):SKU 不再恒等 ASIN,amz 行的身份在登记簿。
+      -- 保留 source_type='amz':match 行的 source_key 是 GTIN,拿它去撞 products.asin
+      -- 是语义更弱的写法。存量下 amz 行 source_key = sku、未登记/非 amz 行回落
+      -- w.sku ⇒ 逐行同集合。
+      LEFT JOIN catalog.listing_sources ls
+             ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+      JOIN catalog.products p ON p.asin = coalesce(ls.source_key, w.sku)
+                            AND p.marketplace = 'US'
+      WHERE w.missing_since IS NULL            -- 目录里还见得到(最近一轮全量扫描)
+        AND w.published_status = 'PUBLISHED'   -- 且真的在卖。2026-09-07 所有者定:
+                                               --   已被沃尔玛下架的不算「仍在架」——
+                                               --   那是问题扫描链的事(一律删除),审核链
+                                               --   再建议一次只会拼出「审核:… | 问题:…」
+                                               --   两条互相矛盾的理由(实见 B0FHPSYT8N)
         AND p.audit_status = 'rejected'
   )
   SELECT lr.store, lr.sku, lr.asin,
@@ -575,6 +759,55 @@ CREATE TABLE IF NOT EXISTS listing.retire_cooldown (
 -- 同 (店铺,SKU) 只允许一条在途冷却,防重复退役
 CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
     ON listing.retire_cooldown (store, sku) WHERE status = 'pending';
+
+-- 改码过程台账(2026-09-02,SKU 改造批次 3;写侧是 workflows/sku_migrate.py)。
+-- **分工写死**:身份权威在 catalog.listing_sources(replaces / replaced_by /
+-- abandoned_at),本表只是 sku_migrate 的**过程账** —— feed_id、提交时刻、失败原因、
+-- 重跑幂等键、飞书同步态,这四样都不属于一张被十几个消费方 JOIN 的身份表。
+-- 两者的状态迁移必须在**同一事务**里完成(与 listing.retire_cooldown 之于
+-- catalog.upc_pool 同款分工,见上面那张表)。
+-- 状态(2026-09-07 起五个):pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
+-- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)/
+-- double(**同店双挂**:新码与旧码同时在架。2026-09-07 所有者定稿,原话「双挂的就让
+-- 他继续挂着,等到我其他的处理完了,我再回头处理他,中途不重复提交这种双挂的就可以」——
+-- 它**不进节奏闸的 open**(后续改码照发)、**不许再开第二条台账**,但每轮仍参与定案:
+-- 所有者回头把旧码删掉、catalog_sync 记了缺席,下一轮自动转 confirmed。**不是终态**,
+-- 不写 settled_at;身份层 catalog.listing_sources 一个字不动。见 docs/sku_plan.md §9.14)。
+-- sheet_synced_at:**2026-09-06 起不再使用**——改码不回写上架表(所有者定稿:
+-- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
+-- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。
+-- 身份映射的出口是 catalog.listing_sources + 在线产品总表「来源码」列;上架表 SKU 列
+-- 只由上架链写。列**保留只为不动存量库**(不 DROP、不 ALTER),新行**恒 NULL**。
+CREATE TABLE IF NOT EXISTS listing.sku_migrations (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store          text NOT NULL,
+    old_sku        text NOT NULL,
+    new_sku        text NOT NULL,
+    source_type    text NOT NULL,
+    source_key     text,
+    feed_type      text NOT NULL,    -- MP_MAINTENANCE(形态 A)/ MP_ITEM(形态 B)
+    feed_id        text,             -- 提交成功后落;NULL = 还没发出去
+    status         text NOT NULL DEFAULT 'pending',  -- pending/confirmed/rolled_back/
+                                     -- stalled/double(double = 同店双挂,2026-09-07
+                                     -- 所有者定稿,见下面的状态说明与 sku_plan §9.14)
+    submitted_at   timestamptz,
+    settled_at     timestamptz,
+    sheet_synced_at timestamptz,     -- 2026-09-06 起不再使用,恒 NULL(见上面头注)
+    error          text,
+    detail         jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at     timestamptz NOT NULL DEFAULT now()
+);
+-- 同 (店, 旧码) 只允许一条在途改码:崩溃重入的防重键(先落库再调接口)。
+-- ⚠ 2026-09-07 起本索引**不再覆盖 double 行**(它们的 status 已不是 pending):
+-- 双挂行的"不许开第二条台账"改由候选判据「无未了结改码台账」(含 'double')把关,
+-- 见 workflows/sku_migrate._CONDS 与 docs/sku_plan.md §9.14。
+CREATE UNIQUE INDEX IF NOT EXISTS sku_migrations_open_uidx
+    ON listing.sku_migrations (store, old_sku) WHERE status = 'pending';
+-- 新码全表唯一:一个不透明码这辈子只允许被用来替换一次
+CREATE UNIQUE INDEX IF NOT EXISTS sku_migrations_new_uidx
+    ON listing.sku_migrations (new_sku);
+CREATE INDEX IF NOT EXISTS sku_migrations_status_idx
+    ON listing.sku_migrations (status, created_at);
 
 -- ── 退役清理(2026-08-12 所有者批准:确认无用即清;证据=全仓零代码引用)──
 -- listing.tasks:上架状态权威在飞书上架表 + catalog.upc_pool + retire_cooldown,
@@ -709,6 +942,26 @@ ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_streak smalli
 --                         一致定稿(详情当时不可用),之后详情给出不同值可改判为详情值
 ALTER TABLE orders.order_lines ADD COLUMN IF NOT EXISTS order_date_source text;
 
+-- 订单双算体检的**唯一判据**(2026-09-02,SKU 改造批次 3 地基)。
+-- orders.order_lines 的主键是 order_line_id = sha256(PO + SKU),唯一约束是
+-- (po_id, sku):改码之后,若沃尔玛对**改码之前的 PO** 返回新码,那一行会被当成
+-- 新行插入而旧行不删 ⇒ 同一笔销售算两次(销量、产品分、日报、对账全受影响),
+-- **而且不报错**。官方没有一个字说改码后旧 PO 会返回哪个码,所以只能用体检兜住。
+-- 口径取 count(DISTINCT order_line_id) 而不是 count(*):要问的正是"同一个 PO 行
+-- 底下有几个不同的行 id"。
+-- **谁都不许再写一遍这段 GROUP BY/HAVING**:services/order_lines.duplicate_po_lines、
+-- catalog_health、手工 psql 全部读本视图(判据只有一处出生)。窗口不在这里 ——
+-- 由消费方自己加 `WHERE first_order_date > …`。
+CREATE OR REPLACE VIEW orders.v_order_line_dupes AS
+  SELECT store, po_id, line_number,
+         count(DISTINCT order_line_id)   AS n,
+         array_agg(sku ORDER BY sku)     AS skus,
+         min(order_date)                 AS first_order_date
+  FROM orders.order_lines
+  WHERE line_number IS NOT NULL
+  GROUP BY store, po_id, line_number
+  HAVING count(DISTINCT order_line_id) > 1;
+
 CREATE TABLE IF NOT EXISTS orders.return_lines (  -- 售后单行(一条 returnOrderLine 一行)
     return_order_id text NOT NULL,     -- RMA 号
     order_line_id   text NOT NULL,
@@ -819,7 +1072,7 @@ CREATE OR REPLACE VIEW orders.settlement_by_line AS
 -- ── ops:运行域(状态与业务同库,可同事务修改)────────────────────────────
 
 -- 跨进程限速事件(api/_client 稀缺桶专用,2026-08-12;判据 window≥600s 或
--- limit≤10:feeds.post.* / prices.put / reports.request / insights 等)。
+-- limit≤10:feeds.post.* / prices.put / reports.create/status/download / insights 等)。
 -- 事件表=真滑动窗口(与进程内 deque 同构);插入时顺手清 2 天前旧行,自清理。
 -- 高频大配额桶不落库(进程内窗口 + 429 退避足够)。PG 不可达时稀缺桶
 -- fail hard 不降级(所有者拍板 2026-08-12,写操作永不自动兜底)。
@@ -834,7 +1087,8 @@ CREATE INDEX IF NOT EXISTS rate_events_key_idx
 CREATE TABLE IF NOT EXISTS ops.feishu_sync_state (
     -- 飞书投影同步状态:键 → record_id + 上次写入指纹(order_center_push)
     -- 日常同步零拉表:本地比指纹定位要写的行;状态缺失/写失败时全量拉表重建
-    table_id    text NOT NULL,          -- 飞书 table_id
+    table_id    text NOT NULL,          -- 飞书 table_id;审核列指纹用派生键 <table_id>#audit
+                                        -- (order_center.update_audit_columns,2026-09-07)
     row_key     text NOT NULL,          -- 行去重键(order_line_id / 唯一键 / perf_key)
     record_id   text NOT NULL,          -- 飞书行内部编号(更新按它定位)
     pushed_hash text,                   -- 上次写入飞书时的载荷指纹
@@ -1072,6 +1326,41 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
 );
+
+-- ── On-request 报表请求台账(2026-09-07,item_id_sync)────────────────────────
+-- 「先落台账再调接口」:POST /v3/reports/reportRequests 每店每种报表**每小时一次**
+-- (墨西哥站/1P 页原话;美国站未列;08-05 测试期 429 实证),requestId 不落库的话
+-- 一次崩溃/超时就丢掉一份 30 天内本可复用的报表,下次又吃一次创建配额。
+-- 状态:pending(行已写、POST 未确认)→ submitted(拿到 requestId,等生成)→
+-- ready(沃尔玛 READY)→ applied(item_id 已写库,终态)| error(终态,note 记原因)。
+-- 崩溃恢复:下一轮先取本店最近一条未终态行接着等/接着下载,不重建;
+-- pending 无 requestId 超 15 分钟判 orphan、submitted 超 30 天判 expired(都转 error)。
+-- ⚠ 不复用后台(Seller Center)或 Scheduler 生成的报表(所有者定稿 2026-09-07):
+-- 台账里只有本仓自己 POST 出去的请求。
+CREATE TABLE IF NOT EXISTS ops.report_requests (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store            text NOT NULL,
+    report_type      text NOT NULL,          -- ITEM(将来别的报表类型也走这张表)
+    report_version   text NOT NULL,          -- v6
+    request_id       text,                   -- 沃尔玛 requestId(POST 成功后回填)
+    status           text NOT NULL,          -- pending / submitted / ready / applied / error
+    workflow         text NOT NULL,          -- 谁发起的(item_id_sync)
+    submitted_at     timestamptz,
+    ready_at         timestamptz,
+    downloaded_at    timestamptz,
+    applied_at       timestamptz,
+    rows_total       integer,                -- 报表行数
+    rows_matched     integer,                -- 报表 ∩ 本店在架行
+    rows_filled      integer,                -- NULL → 值
+    rows_overwritten integer,                -- 已有值且与报表不同 → 报表为准(所有者定稿)
+    rows_unmatched   integer,                -- 在架但报表里没有
+    rows_no_id       integer,                -- 报表里 Item ID 为空(未 published 的新品)
+    note             text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS report_requests_open_idx
+    ON ops.report_requests (store, report_type, status, created_at DESC);
 
 -- ── 店铺事件账本(2026-08-30 所有者需求:店铺维度病历,TRO 封店预警)────────
 -- 与 catalog.product_events 同构不同表:三条纪律照搬(只追加永不改、事件码
@@ -1499,6 +1788,22 @@ CREATE INDEX IF NOT EXISTS idx_werror_pt     ON audit.walmart_error_records(walm
 CREATE INDEX IF NOT EXISTS idx_werror_date   ON audit.walmart_error_records(report_date);
 CREATE INDEX IF NOT EXISTS idx_werror_src    ON audit.walmart_error_records(source_sheet);
 CREATE INDEX IF NOT EXISTS idx_werror_status ON audit.walmart_error_records(status);
+-- 新码回填三列(2026-09-03,所有者定稿「重新按新标准归类」;工作流 error_reclass)。
+-- ⚠ **老列 error_code(char(1))原样保留**:它是旧 A-L 码,是拉黑那批行的历史
+--   依据,删了就没法对照"当初按什么拉的黑"。新旧同列并存,查询按需要挑。
+-- taxonomy_version 是**增量谓词**(同 audit_runs.audit_version 的套路):
+--   码表一改就递增 ERROR_TAXONOMY_VERSION,`IS DISTINCT FROM 当前版本` 天然分页,
+--   跑一半中断直接重跑,已盖章的自动退出候选集。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_code text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_policy text;
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_version text;
+CREATE INDEX IF NOT EXISTS idx_werror_taxcode ON audit.walmart_error_records(taxonomy_code);
+CREATE INDEX IF NOT EXISTS idx_werror_taxver  ON audit.walmart_error_records(taxonomy_version);
+-- 2026-09-03 换轨:`OTHER` 是混装桶(显式杂项 + 兜底),所有者只让
+-- `business decision` / `trust & safety` 两个词条算永久拉黑 ⇒ 光有主码
+-- 判不了,得把**赢下主码那个原子命中的词条**一起存下来。存的是事实
+-- (哪个词条),不是结论(该不该拉黑)—— 裁决改了重跑路由即可,不用重判。
+ALTER TABLE audit.walmart_error_records ADD COLUMN IF NOT EXISTS taxonomy_term text;
 
 -- 类目映射缺口建议(catmap_suggest 产出,2026-08-13:映射表缺口 7,512 路径
 -- 覆盖 55 万产品)。**纯建议,零消费**——审核链只读 walmart_category_map;
@@ -1716,6 +2021,14 @@ CREATE INDEX IF NOT EXISTS idx_audit_asin    ON audit.audit_runs(asin);
 CREATE INDEX IF NOT EXISTS idx_audit_verdict ON audit.audit_runs(verdict);
 CREATE INDEX IF NOT EXISTS idx_audit_stage   ON audit.audit_runs(stage_stopped_at);
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit.audit_runs(created_at);
+-- 判据版本(2026-09-02 B2 补列):这一行是哪一版规则判的。
+-- 存在的理由是**回放评估分不清新旧链**:这张表原本没有任何版本痕迹,
+-- `product_audit -p mode=stale` 一跑,每个 asin 的"最近一次 run"就变成新链
+-- 自己的结论,再拿它当"旧链基线"就是自己跟自己比,而且数字看着完全正常。
+-- 存量 204 万行为 NULL = 旧链;`workflows/audit_replay` 取基线的谓词是
+-- `audit_version IS DISTINCT FROM <当前 AUDIT_RULES_VERSION>`(NULL 也算旧)。
+-- 写入方唯一出处 services/audit_store._RUN_SQL。
+ALTER TABLE audit.audit_runs ADD COLUMN IF NOT EXISTS audit_version text;
 
 -- 逐条规则命中明细(理由码账本)
 CREATE TABLE IF NOT EXISTS audit.audit_hits (
@@ -1730,3 +2043,28 @@ CREATE TABLE IF NOT EXISTS audit.audit_hits (
 CREATE INDEX IF NOT EXISTS idx_hits_run   ON audit.audit_hits(run_id);
 CREATE INDEX IF NOT EXISTS idx_hits_rule  ON audit.audit_hits(rule_code);
 CREATE INDEX IF NOT EXISTS idx_hits_stage ON audit.audit_hits(stage);
+
+-- 回放评估结果(2026-09-02 第三步 B2,规格 docs/audit_step3_spec.md §3.8)。
+-- `workflows/audit_replay` 拿沃尔玛已裁决的下架品(反例)与在架在售品(正例)
+-- 重跑**当前生产链**(services.audit_rules.audit_one),与沃尔玛裁决、旧链
+-- 最近一次 audit_runs 三方对照。**这张表是回放工作流唯一写的表** ——
+-- 结论权威仍在 catalog.products / audit_runs,回放一个字都不碰它们。
+-- 一次回放 = 一个 run_tag(缺省 <日期>-<AUDIT_RULES_VERSION>);同 tag 重跑
+-- 按 (run_tag, asin) 覆盖,便于"改完提示词再回放一次"对同一批样本比。
+-- expected_category 为 NULL = 只比判定不比类别(BRAND / PROHIBITED_FINAL:
+-- 沃尔玛没给出可对表的政策名);内容族两名互认见 registry.AUDIT_CONTENT_POLICIES。
+CREATE TABLE IF NOT EXISTS audit.replay_results (
+    run_tag           text NOT NULL,   -- 一次回放的标签(同 tag 重跑覆盖)
+    asin              text NOT NULL,
+    expected_verdict  text,            -- 沃尔玛裁决推出的期望:reject / pass
+    expected_category text,            -- 期望类别(政策表原拼写);NULL=只比判定
+    got_verdict       text,            -- 本次新链判定:pass / reject / pending
+    got_category      text,            -- 本次类别(audit_reason.compute_final_reason)
+    got_detail        text,            -- 本次具体内容(audit_store.conclusion_detail)
+    stage_stopped_at  text,            -- 停在哪一层(L0/L1/L2/L3)
+    old_verdict       text,            -- 旧链最近一次 audit_runs 的判定(历史,不重跑)
+    old_category      text,            -- 同上的 l3_reason_category(只有 L3 判过的行才有)
+    confidence        text,            -- L3 自报置信 high/medium/low(没走 L3 为 NULL)
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_tag, asin)
+);

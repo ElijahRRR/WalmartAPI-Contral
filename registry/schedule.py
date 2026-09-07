@@ -23,8 +23,25 @@ runner = 谁来按这个点触发(所有者定稿 2026-08-16,**推翻了 v5 的"
 
 不在表里的一律**手动**:跟卖(match_listing)、分配链
 (alloc_* / claim_audit / alloc_backfill)、补采(scrape_missing / brand_scrape)、
-自愈(sku_locked_heal)、一次性迁移与体检
+自愈(sku_locked_heal)、**存量改码(sku_migrate)**、
+**来源码人工归类(sources_reclassify)**、一次性迁移与体检
 (各 *_import / catmap_* / catalog_health / variant_probe / audit_why / …)。
+⚠ `sources_reclassify`(所有者 2026-09-03)**永不进调度**:它导出清单等人逐行
+认出"这一串里的源头码是哪一段"再读回,机器提议里「标准 ASIN + 尾巴」那一档
+只够猜(guess),没有人认就没有输入。而它写下的每一行都把一个商品**交还自动
+链**(此后被改价/清库存/删除管到)—— 这种判断不许由秒表触发。
+与它同源的 `sources_backfill` 常驻 product_chain,两者分工:登记补的是"有没有
+登记行",归类补的是"登记行认不认得出出身"。⚠ 2026-09-06 所有者定稿
+`sources_backfill` **只登记不猜**(一律登 `unknown`,判型正则已删),
+所以"认出身"这件事**全部**落在人工件 `sources_reclassify` 上。
+⚠ `sku_migrate`(SKU 改造批次 3)**永不进调度**,两条理由各自独立成立:
+  ① 它是 DANGEROUS 的一次性迁移,按批发、按观测定案,每一批之间要人看摘要
+     (节奏 1 → 10 → 一店 → 全店,闸在 `workflows/sku_migrate._stage_cap`);
+     排进调度 = 每天自动改一批码,而"同店双挂"这类后果只有人能收。
+  ② 它吃 `feeds.post.MP_ITEM_MATCH` 桶(15/hour,2026-09-06 起通道定案为
+     MP_ITEM_MATCH),与**跟卖链 `match_listing` 共享** —— 两边并跑的表现是
+     当天跟卖发不出去,而摘要只会说"配额不足",看不出是谁吃的。手动跑请
+     避开跟卖真跑的那一段;它已不再与 13:00 的维护链抢 MP_MAINTENANCE。
 ⚠ **审核与上架 2026-08-17 起进表**(所有者定稿):`audit_sheet` 18:10、
 `list_new` 20:00。此前它们在这份"手动"清单里,是因为上架域还没做生产验收;
 验收通过(变体组三条真发上去了)之后排进调度。`match_listing`(跟卖)仍手动
@@ -97,6 +114,16 @@ JOBS = (
              "消息是几个月的历史高危(真正今天那条埋在里面);缺省窗口 48h、"
              "单轮上限 50 条,超出的下一轮接着推"),
 
+    # itemId 补齐(所有者定稿 2026-09-07):每天一轮,只为「在架行 item_id 为空」的店各拿
+    # 一份 On-request ITEM 报表(创建每店每小时一次、生成 15–45 分钟、状态/下载各
+    # 20/hour —— 桶登记见 api/_client)。05:00 在 02:00 备份之后、06:40 日报之前:
+    # 日报链的 catalog_sync 一跑,飞书「在线产品总表」的 itemId 列当天早上就带上。
+    # 首轮全量手动跑 `-p all=1`;不复用后台/Scheduler 生成的报表;冲突以报表为准。
+    job("item_id_sync", ["item_id_sync"], batch=1, hour=5, minute=0, runner="gpt",
+        note="每天 05:00;有缺口的店各拿一份 ITEM 报表补 item_id(等 ≤60 分钟,"
+             "限流/超时不是失败,下轮再来);首轮手动 `-p all=1`;飞书 itemId 列由 "
+             "06:40 的 catalog_sync 投影"),
+
     # ── 批二:订单 + 日报 ────────────────────────────────────────────────
     # ⚠ 只挂这一条,**不要**再单挂一个 06:20:两个 plist 撞在同一分钟会各拿
     # 各的锁,后到的整链退出码 3 空跑一轮。日报依赖的那次就是每小时的 06:20 那次。
@@ -158,23 +185,25 @@ JOBS = (
     #   的破坏类建议判,与写入先后无关。顺序改了结果也不变 —— 这是有意的,
     #   本仓吃过"顺序即语义"的亏,不再让调度表承载判据。
     #   product_audit 跟着 problem_scan 一起前移,紧邻关系不变。
-    # ⚠ 三个参数一个都不能少:
+    # ⚠ 两个参数一个都不能少:
     #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
     #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
-    #   limit 要一次扫得完 —— 这条**没有天然分页**(未命中不落结论不盖版本、
-    #   不退出候选),小 limit 会让每天都从头扫同一批前缀,尾巴永远轮不到
-    #   而且不报错
+    # ⚠ 而 limit **一个都不许给**:这条**没有天然分页**(未命中不落结论不盖
+    #   版本、不退出候选),给了小 limit 就每天从头扫同一批前缀,尾巴永远轮不到
+    #   而且不报错。2026-09-03 起缺省即不限量(此前这里写 `limit=1000000`
+    #   凑效果,那个魔数已随缺省口径删掉)
     job("product_chain",
         ["catalog_sync", "sources_backfill", "product_refresh",
          "product_audit", "maintenance_scan", "problem_scan",
          "maintenance", "problem_product_cleanup"],
         batch=3, hour=13, minute=0, runner="gpt",
         params=["product_refresh:wait=1", "product_audit:mode=online",
-                "product_audit:stages=L0", "product_audit:limit=1000000"],
+                "product_audit:stages=L0"],
         note="整条 ~2 小时(13:00 起,约 15:00 收);前一步不成功就不跑后面的"
              "(拿隔夜现值当判据会误伤)。sources_backfill 紧跟 catalog_sync"
-             "(所有者定稿 2026-08-19):新发现的在架商品当轮补来源关联,"
-             "当轮就能被维护;零缺口时零成本,摘要非零 = 有人绕过登记上架"),
+             "(所有者定稿 2026-08-19;2026-09-06 改成只登记不猜):把在架却未"
+             "登记的行登记为 unknown 并报累计待归类数,不猜出身;"
+             "归类是人工件 sources_reclassify,不进调度"),
     job("product_clear", ["product_clear"], batch=3, hour=15, minute=0,
         runner="gpt",
         note="消费运营填的「停用/删除表」;不定时跑 = 填了没人执行"),
@@ -194,8 +223,8 @@ JOBS = (
         runner="gpt", params=["from_sheet=1"],
         note="审上架表里 E 列为空(或 E=pending)的行 + 把库里已有结论投影回 "
              "C~G。⚠ from_sheet **不是强审**:已有结论的零 LLM 直接投影,"
-             "只有未审/pending 过退避的才真判;缺省 limit=500,"
-             "存量大时改调度表加 -p limit=N,别在提示词里手改。"
+             "只有未审/pending 过退避的才真判;**缺省不限量**(2026-09-03 定稿:"
+             "要限量才手动带参数),要分批就改调度表加 -p limit=N,别在提示词里手改。"
              "库里没数据的行走**同轮补采闭环**:推采集 audit_gap_<日界>(插队)"
              "→ 轮询等采完(缺省 20 分钟)→ 就地摄取 → 采回来的这一轮就判掉;"
              "仍缺的把采集侧真实 error_type 写进 F 列(E 留空 ⇒ 下轮重领)。"

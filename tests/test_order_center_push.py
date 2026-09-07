@@ -3,6 +3,7 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
+import dataclasses
 import pytest
 
 from api import feishu
@@ -11,6 +12,7 @@ from services import order_center as ocp
 from workflows import order_center_push as ocw
 
 F_SALES = resources.ORDER_SALES.fields
+F_RETURNS = resources.ORDER_RETURNS.fields
 F_PERF = resources.ORDER_PERF.fields
 F_SETTLE = resources.ORDER_SETTLE.fields
 
@@ -48,7 +50,8 @@ def _capture_sync(monkeypatch):
 
 _SALES_ROW = {
     "order_line_id": "ol_abc", "store": "T1", "po_id": "PO1",
-    "line_number": "1", "sku": "SKU1", "product_name": "商品", "qty": 2,
+    "line_number": "1", "sku": "SKU1", "asin": "B0AAAAAAA1",
+    "product_name": "商品", "qty": 2,
     "sale_status": "Shipped", "audit_status": None,
     "status_date": datetime(2026, 8, 1, 3, 0, tzinfo=timezone.utc),
     "order_date": datetime(2026, 8, 1, 3, 0, tzinfo=timezone.utc),
@@ -75,6 +78,8 @@ def test_push_sales_row_shape_and_no_delete(monkeypatch):
     assert d[F_SALES.order_date] == int(_SALES_ROW["order_date"].timestamp() * 1000)
     assert d[F_SALES.product_amount] == 19.99
     assert d[F_SALES.pulled_at] == int(_SALES_ROW["updated_at"].timestamp() * 1000)
+    # 来源码列(0b-24/25/26):值 = order_lines.asin,列名从 registry 取
+    assert d[F_SALES.source_key] == "B0AAAAAAA1"
     # None 字段必须保留在载荷里(省略=飞书保留旧值,送 null 才是清空)
     assert F_SALES.cancel_reason in d and d[F_SALES.cancel_reason] is None
     # 人工/采集列(脚本审核、亚马逊单价、主订单表…)绝不出现在载荷里
@@ -88,7 +93,8 @@ def test_push_returns_key_is_rma_plus_line(monkeypatch):
         "refund_status", "return_method", "refund_mode", "is_keep_it",
         "refund_total", "return_reason", "return_comment", "return_by",
         "return_created", "last_modified", "customer_name", "customer_email",
-        "qty", "refunded_qty", "carrier", "tracking_no", "order_date")}
+        "qty", "refunded_qty", "carrier", "tracking_no", "order_date",
+        "asin")}
     row.update({"return_order_id": "RMA1", "order_line_id": "ol_x",
                 "store": "T1", "po_id": "PO1"})
     monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
@@ -98,6 +104,72 @@ def test_push_returns_key_is_rma_plus_line(monkeypatch):
     assert cap["key_field"] == "唯一键"
     assert set(cap["desired"]) == {"RMA1|ol_x"}
     assert cap["desired"]["RMA1|ol_x"]["order_line_id"] == "ol_x"
+    # 借来的 asin 为 NULL 时也必须留在载荷里(省略=飞书保留旧值)
+    assert F_RETURNS.source_key in cap["desired"]["RMA1|ol_x"]
+    assert cap["desired"]["RMA1|ol_x"][F_RETURNS.source_key] is None
+
+
+def test_sales_registry_has_asin_field():
+    """钉的是:销售订单的来源码列名只在 registry 出生(飞书列名「来源码」)。"""
+    assert F_SALES.source_key == "来源码"
+
+
+def test_returns_registry_has_asin_field():
+    """钉的是:售后订单同一列同一个名字 —— 两表列名漂了,运营对不上账。"""
+    assert F_RETURNS.source_key == "来源码"
+
+
+def test_sales_sql_selects_asin():
+    # 载荷里的来源码来自 order_lines.asin(不在 SQL 里取 = 载荷永远 KeyError)
+    assert "line_number, sku, asin, product_name" in ocp._SALES_SQL
+
+
+def test_returns_sql_borrows_asin_from_order_lines():
+    """钉的是:售后表的 asin 从 order_lines 借,且那一跳必须是 LEFT JOIN。
+
+    改成 INNER JOIN 会静默丢掉「订单行滚出窗口/孤儿退货」的售后行 ——
+    行数变少不报错,飞书那边只是"这几单不见了"。
+    """
+    assert "l.order_date, l.asin" in ocp._RETURNS_SQL
+    assert "LEFT JOIN orders.order_lines l USING (order_line_id)" in ocp._RETURNS_SQL
+    # return_lines 自己不加 asin 列(D-0b-6:两份真值会飘)
+    assert "r.asin" not in ocp._RETURNS_SQL
+
+
+def test_asin_is_sent_even_when_null(monkeypatch):
+    """钉的是:asin 为 NULL 时那一格也要送 null(清空),不是省略。
+
+    省略 = 飞书保留旧值 ⇒ 订单行滚出窗口后,售后行会永远留着一个过时的来源码。
+    """
+    captured = _capture_sync(monkeypatch)
+    row = dict(_SALES_ROW, asin=None)
+    monkeypatch.setattr(ocp, "_fetch", lambda sql, args: [row])
+
+    ocp.push_sales(90)
+    d = captured["订单中心-销售订单"]["desired"]["ol_abc"]
+    assert F_SALES.source_key in d and d[F_SALES.source_key] is None
+
+
+def test_missing_asin_column_is_skipped_not_written(monkeypatch):
+    """钉的是:飞书表里没有「来源码」列时整列跳过、指纹与不含它时一致。
+
+    这是"建列前零重推"的机器证明:_adapt_rows 丢掉表里没有的列,
+    而指纹是在 _adapt_rows **之后**算的 ⇒ 没建列的表一行都不会被重推。
+    """
+    monkeypatch.setattr(feishu, "create_field", lambda table, name, ftype=1: None)
+    monkeypatch.setattr(feishu, "list_fields", lambda table: [
+        {"field_name": F_SALES.key, "type": 1},
+        {"field_name": F_SALES.sku, "type": 1},
+        {"field_name": ocp._HASH_FIELD, "type": 1},
+    ])
+    with_asin = {"k1": {F_SALES.key: "k1", F_SALES.sku: "SKU1",
+                        F_SALES.source_key: "B0AAAAAAA1"}}
+    without = {"k1": {F_SALES.key: "k1", F_SALES.sku: "SKU1"}}
+    a = ocp._adapt_rows(resources.ORDER_SALES, with_asin)["k1"]
+    b = ocp._adapt_rows(resources.ORDER_SALES, without)["k1"]
+    assert F_SALES.source_key not in a and a == b
+    assert feishu._row_hash(a, ocp._HASH_FIELD) == \
+        feishu._row_hash(b, ocp._HASH_FIELD)
 
 
 def test_push_perf_shaping(monkeypatch):
@@ -425,3 +497,85 @@ def test_keys_branch_passes_both_sql_params(monkeypatch):
     ocp.push_tables(("keys",), days=30)
     assert len(seen) == 1 and len(seen[0]) == 2 and seen[0][0] == 30
     assert ocp._SALES_SQL.count("%s") == 2
+
+
+# ── 审核列定向更新:复用销售表映射 + 自己的指纹(2026-09-07)────────────────────
+
+
+def _audit_env(monkeypatch, sales_state: dict, audit_hashes: dict):
+    """搭 update_audit_columns 的假环境:销售表映射 + 审核指纹 + 捕获写调用。"""
+    sales = dataclasses.replace(resources.ORDER_SALES, app_token="app",
+                                table_id="tblS")
+    audit = dataclasses.replace(resources.ORDER_SALES_AUDIT, app_token="app",
+                                table_id="tblS")
+    monkeypatch.setattr(resources, "ORDER_SALES", sales)
+    monkeypatch.setattr(resources, "ORDER_SALES_AUDIT", audit)
+    states = {"tblS": dict(sales_state),
+              "tblS#audit": {k: ("r?", h) for k, h in audit_hashes.items()}}
+    calls = {"update": None, "saved": [], "dropped": []}
+    monkeypatch.setattr(ocp, "_load_state_by_id", lambda tid: dict(states.get(tid, {})))
+    monkeypatch.setattr(ocp, "_save_state_by_id",
+                        lambda tid, entries: calls["saved"].append((tid, entries)))
+    monkeypatch.setattr(ocp, "_drop_state", lambda t: calls["dropped"].append(t.name))
+    monkeypatch.setattr(feishu, "batch_update",
+                        lambda t, ups: (calls.__setitem__("update", ups), len(ups))[1])
+    # 日常路径绝不许拉表 —— 这正是从 feishu.update_by_key 换过来的全部理由
+    monkeypatch.setattr(feishu, "list_records",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("审核回写不应拉飞书表")))
+    return calls
+
+
+def test_update_audit_columns_uses_sales_map_and_own_fingerprint(monkeypatch):
+    same = {"审核状态": "✓ 通过", "限价": 75.0}
+    h_same = feishu._row_hash(same, ocp._HASH_FIELD)
+    calls = _audit_env(monkeypatch,
+                       {"k1": ("r1", "sales-hash"), "k2": ("r2", "sales-hash"),
+                        "k3": ("r3", None)},
+                       {"k1": h_same, "k2": "stale"})
+    n, missing, skipped = ocp.update_audit_columns({
+        "k1": dict(same),                       # 指纹一致 → 跳过
+        "k2": {"审核状态": "建议拒绝"},           # 指纹不同 → 按销售表 record_id 更新
+        "k3": {"审核状态": "待人工"},             # 从没推过 → 写
+        "k9": {"审核状态": "待人工"},             # 映射里没有 → 尚未建出
+    })
+    assert (n, skipped, missing) == (2, 1, ["k9"])
+    assert {u["record_id"] for u in calls["update"]} == {"r2", "r3"}
+    # 指纹回存到派生键,不碰销售表自己的指纹
+    tid, entries = calls["saved"][0]
+    assert tid == "tblS#audit"
+    assert {e[0] for e in entries} == {"k2", "k3"}
+    assert calls["dropped"] == []
+
+
+def test_update_audit_columns_force_ignores_fingerprints(monkeypatch):
+    same = {"审核状态": "✓ 通过"}
+    calls = _audit_env(monkeypatch, {"k1": ("r1", None)},
+                       {"k1": feishu._row_hash(same, ocp._HASH_FIELD)})
+    n, _m, skipped = ocp.update_audit_columns({"k1": dict(same)}, force=True)
+    assert (n, skipped) == (1, 0)
+    assert calls["update"][0]["record_id"] == "r1"
+
+
+def test_update_audit_columns_bootstraps_sales_map_when_empty(monkeypatch):
+    """销售表状态为空(首轮/被清)→ 沿用销售表的全量重建,而不是自己另拉一份。"""
+    calls = _audit_env(monkeypatch, {}, {})
+    seen = {}
+    monkeypatch.setattr(ocp, "_bootstrap_state",
+                        lambda t, **kw: seen.setdefault("table", t.name) and
+                        {"k1": ("rB", None)})
+    n, _m, _s = ocp.update_audit_columns({"k1": {"审核状态": "✓ 通过"}})
+    assert seen["table"] == resources.ORDER_SALES.name and n == 1
+    assert calls["update"][0]["record_id"] == "rB"
+
+
+def test_update_audit_columns_write_failure_drops_sales_state(monkeypatch):
+    calls = _audit_env(monkeypatch, {"k1": ("r1", None)}, {})
+
+    def boom(*a, **k):
+        raise feishu.FeishuError(500, "down")
+    monkeypatch.setattr(feishu, "batch_update", boom)
+    with pytest.raises(feishu.FeishuError):
+        ocp.update_audit_columns({"k1": {"审核状态": "✓ 通过"}})
+    assert calls["dropped"] == [resources.ORDER_SALES.name]   # 映射下轮重建
+    assert calls["saved"] == []                               # 没写成不记指纹

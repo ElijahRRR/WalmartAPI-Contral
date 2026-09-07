@@ -9,11 +9,11 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **77 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **83 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
-- **PostgreSQL 17** 单库五 schema(55 表 / 12 视图)为唯一权威状态;
-- **2626 个单元测试**(2603 跑 + 23 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
+- **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
+- **3081 个单元测试**(3033 跑 + 48 跳过;`python -m pytest -q` 的实数,**随批次手工同步、没有守门测试** —— 漂了不会红,改动后请重跑一遍再改这个数)。
 
 ---
 
@@ -163,7 +163,7 @@ MCP 工具,全部走这一条路径。它统一负责七件事:
 
 ```bash
 python cli.py list_new --dry-run              # 空跑
-python cli.py product_audit -p limit=2000     # 传参
+python cli.py product_audit -p limit=2000     # 传参(审核**缺省不限量**,要限量才给)
 python cli.py catalog_sync -p store=A085朱丽霖  # 限单店
 python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向传参
 ```
@@ -232,7 +232,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 **全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
 `"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
 | **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
-| **USPTO 商标库** | 审核 R5 商标反查 | 跨库只读,默认关 |
+| **USPTO 商标库** | **本仓当前无消费方**(2026-09-03 C 批删了 L2 R5 商标反查;连接登记 `registry/db.uspto_conn` 保留待重建) | 跨库只读 |
 
 ---
 
@@ -264,6 +264,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | 工作流 | | 做什么 |
 |---|---|---|
 | `catalog_sync` | 调 | 全店扫沃尔玛在架商品 + 库存 → `catalog.walmart_items`。**它是几乎所有判据的现值来源**,链里必须排第一 |
+| `item_id_sync` | 调 | 用沃尔玛 On-request **ITEM 报表**补 `walmart_items.item_id`(数字 itemId 只有报表批量给)。每天只为有缺口的店各拿一份报表(创建每店每小时一次、生成 15–45 分钟),先落台账 `ops.report_requests` 再调接口,超时/限流下轮接着;写库**报表为准**;首轮 `-p all=1`,探针 `-p store=X -p probe=1`。飞书 itemId 列仍由 catalog_sync 投影 |
 | `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头)。`-p wait=1` 阻塞等采完 |
 | `product_ingest` | 调 | 采集服务增量 → `catalog.products` / `snapshots`。**全项目唯一从采集器取数的工作流**;游标在 `ops.cursors`,空页不推进 |
 | `scrape_missing` | 危 | 给库里缺亚马逊数据的产品补采(分类分档 + 冷却期) |
@@ -273,6 +274,7 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 | `node_backfill` | | 从已存快照回填类目 ID 锚(零重采) |
 | `pt_backfill` | | 历史实证 PT 回填产品主档 |
 | `sources_backfill` | 调 | 在架商品来源登记簿补齐(格式回填,幂等):维护链只维护 `listing_sources` 里 source_type=amz 的行,旧系统上的存量没登记就是维护盲区;dry-run=盲区统计,真跑按 SKU 格式回填(像 ASIN→amz,其余→unknown 不自动维护)。回填后先 `maintenance_scan --dry-run` 看破坏面 |
+| `sources_reclassify` | | 来源码人工归类导入(一次性人工件,不进调度):`sources_backfill` 把非 ASIN 形态一律登记成 unknown,这些行按路由铁律进不了任何自动维护;缺省=预览并导出待归类清单 csv(带机器提议,「标准 ASIN+尾巴」只标 guess 不预填),人核过后 `-p file=<清单>` 读回、**`-p apply=1` 才写库**(`-p overwrite=1` 才盖已有键)。归类 = 把商品交还自动链,改完先 `maintenance_scan --dry-run` 看破坏面 |
 | `pt_census` | | 沃尔玛类目(PT)四源对账:哪些 PT 真实存在 |
 | `sku_normalize` | | 事件账本 SKU→ASIN 清洗 |
 | `taxonomy_import` | | 亚马逊类目树入库(ID 主键) |
@@ -280,9 +282,16 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 
 ### 6.3 审核域
 
-判"这个产品能不能上"。分层:L0 精准拦截 → L1 类目 → L2 规则 →
-L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 政策理由映射(政策类别名以
-`audit.walmart_prohibited_policy` 为准,2026-09-02 起是官方 42 类)。
+判"这个产品能不能上"。分层:L0 前置拦截 → L1 类目 → L2 类目准入 →
+L3 语义(LLM,读 **44 篇沃尔玛官方英文政策全文**)→ L4 视觉(LLM,默认关)。
+**2026-09-03 C 批瘦身后**:L0 = 库黑名单等值 + 商标符号 + 专利自述 +
+Made in USA 五条硬拒,外加一条 0 分软证据(品牌黑名单扫文案,**不终止**判定,
+随产品进 L3);L2 **只剩 R1 类目准入白名单**(R3/R5/R7/R8 删除,判据交给
+官方政策全文与本 PT 的 requirements 行)。
+结论是**三段**(2026-09-02 第三步 B1 定稿):判定结果 / **类别** / **具体内容**
+—— 类别只有两种来源(`audit.walmart_prohibited_policy.category_en` 实时集合,
+或 registry 的两条非政策类别 `内部黑名单` / `类目准入`),**零兜底**:判拒而
+没有类别 = 代码 bug,落 NULL + 计数,不许编一个政策名出来。
 **逐层怎么判、每条规则做什么、判不了怎么办,见 `docs/audit_pipeline.md`。**
 
 ⚠ **一个类目能不能做,只有一处判据**(2026-08-20 定稿):
@@ -300,15 +309,16 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 政策理由映射(政策类别名
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 C~G;缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 E 列为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
+| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
+| `audit_replay` | | **回放评估**(手动跑,不进调度):拿沃尔玛自己的裁决考现在这条链。反例 = `walmart_items.unpublished_reasons` 归类主码 ∈ POLICY/IP/CONTENT/BRAND/PROHIBITED_FINAL 的下架品(期望 reject,期望类别按 `error_taxonomy` 抽出的政策名 join 政策表;PT_WRONG/GATED 不进集),正例 = 在架在售且从没给过下架原因的品(期望 pass);`sku→asin` 走 `services/sku_asin`。每个样本调**与生产同一条** `audit_rules.audit_one`,与沃尔玛裁决 / 旧链最近一次 `audit_runs` 三方对照,出召回、类别准确率 + 混淆表、**正例误伤新旧并排**(所有者底线:新链不高于旧链)、新旧一致率、按置信分层错误率、pending 分层、成本与耗时。⚠ **只写** `audit.replay_results` 与 `<DATA_ROOT>/reports/audit_replay.txt`(判定链自己会写 `llm_cache`,那是缓存);`catalog.products`/`audit_runs`/`audit_hits`/事件/飞书**一个字都不碰**。`--dry-run` = 抽样 + 规模 + 预估成本,零 LLM。参数 `neg`(600)/`pos`(400)/`seed`/`tag`/`workers`/`limit_per_category`。⚠ **样本身份是 `run_tag` 不是 `seed`**:该 tag 已有行就**重放那一批 asin**(候选面 `walmart_items` 天天被 catalog_sync 重写,同 seed 隔天已不是同一批);**旧链基线**取每个 asin 最近一次 `audit_version` 不是当前版本的 `audit_runs` 行(那一列 2026-09-02 B2 补,否则 `mode=stale` 跑过之后就是新链自己跟自己比)|
 | `audit_calibrate` | | 双跑校准报告 |
 | `audit_import` | 危 一 | 旧审核库 13 表一次性搬迁 |
 | `audit_history_fold` | 一 | 历史审核结论折叠进产品事件账本 |
 | `spec_split` | | 把官方 **450MB 单文件** MP_ITEM spec 流式拆成按 PT 的目录(`_pt_index`/`_orderable`/`_header`/`{PT}.json`)。mmap + 括号配对,**整份 JSON 从不变成 Python 对象**(旧仓 json.load 膨胀 1.3GB 触发 OOM);与在用版**并排放**不覆盖,`-p diff=1` 出换版差集(新增顶层必填 × 影响 PT 数);已拆好的目录用 `-p out=<目录> -p diff=1` 只对账不重拆 |
 | `pt_spec_sync` | | 用**本地官方 spec**(`<DATA_ROOT>/specs/MP_ITEM/<版本>/`,上架链同一份)重建类目准入明细:由 spec 必填字段推「要什么认证」→「中国搬运能不能做」(是/需评估/否),落 `audit.walmart_pt_spec`,导出**飞书粘贴表(10 列整齐)+ 差异复核表(带判据溯源)**;顺带对账「spec 有、准入明细没有」的类目,并与现表逐条比出收紧/放松。`-p pt=<名字>` 单点看证据链;`-p explain=<PT>` 对表字段读法;`-p sheet=<现表CSV>` 逐 PT 逐字段比现表与 spec 的差异(双向);`-p spec_dir=<新版目录>` 换版对账(不动 registry)。**不调接口** |
 | `audit_reason_backfill` | 一 | 存量「理由未留存」批量刷成旧 run 真实命中,顺带产出规则码分布(挑误伤类型的输入) |
-| `policy_sync` | 危 | 官方禁售政策转录件 → `audit.walmart_prohibited_policy`(手动跑,不进调度)。来源是 **`refdata/policy_pages/en/*.md`**(skill `policy-refresh` 派子代理逐页忠实转录进仓,**不是爬虫**;git diff 即政策变更审计记录)。只动机器列(`full_policy`/`official_url`/`policy_updated_at`/`synced_at`/`raw`),**中文人工列一律不读不写**;官方有表无 → 新增(id 从 max+1 连续),表有官方无 → **不删行**只报告,对不上的**不猜**、进「未对上清单」等所有者裁决。逐类别 diff 落 `<DATA_ROOT>/reports/policy_sync.txt`。⚠ **2026-09-02 起表内名一律改为官方拼写**(定稿 `docs/policy_sync.md` §十.7:官方政策类别名 = 全链唯一键,旧脚本跟随新流程):对上但拼写不同的行进「将改名」清单,真跑在同一事务里由独立一条 `_RENAME_SQL` 先改名再刷新,**id 不变**;存量 7 行缩写名(`Drugs & Paraphernalia`、`Electronics & RF` 一族)靠 `registry.resources.POLICY_LEGACY_NAMES`(仓内唯一一份旧名↔官方名映射,过渡期用完即删)认领,不再逐条裁决;目标官方名已被另一行占用的**不改名也不刷新**,进「改名冲突」等人裁决。⚠ **dry-run 必须人眼核对两处**:①「将改名」清单逐条确认确实是同一政策类别;②「未对上」清单裁决新增/忽略(只是拼写差就补进 `POLICY_LEGACY_NAMES` 再重跑,报告的「疑似改名对」提示就是这个入口)。⚠ 真跑连带后果两条(摘要会逐条提醒):①`AUDIT_RULES_VERSION` **已随本批递增至 `c.2026-09-02.1`,首跑无需再手动递增**(合并后又改判据则另计);⇒ **成本**:L3 的 system prompt 随政策表逐字节变化,`catalog.llm_cache` 里 L3 那一批全量未命中,与全量重审叠加 = 那批产品**全额重付**(大批重审排北京时间 18:00–次日 08:00 谷时段,单价减半);②新增行人工中文列全 NULL,S4 现渲染为**空壳标题**待运营补中文。(原第三条「audit_l3 提示词硬写 37 条」已随本批动态化 —— S1/S3 按实时政策条数渲染,不再有对不上的字面量)|
+| `policy_sync` | 危 | 官方禁售政策转录件 → `audit.walmart_prohibited_policy`(手动跑,不进调度)。来源是 **`refdata/policy_pages/en/*.md`**(skill `policy-refresh` 派子代理逐页忠实转录进仓,**不是爬虫**;git diff 即政策变更审计记录)。只动机器列(`full_policy`/`official_url`/`policy_updated_at`/`synced_at`/`raw`),**中文人工列一律不读不写**;官方有表无 → 新增(id 从 max+1 连续),表有官方无 → **不删行**只报告,对不上的**不猜**、进「未对上清单」等所有者裁决。逐类别 diff 落 `<DATA_ROOT>/reports/policy_sync.txt`。⚠ **2026-09-02 起表内名一律改为官方拼写**(定稿 `docs/policy_sync.md` §十.7:官方政策类别名 = 全链唯一键,旧脚本跟随新流程):对上但拼写不同的行进「将改名」清单,真跑在同一事务里由独立一条 `_RENAME_SQL` 先改名再刷新,**id 不变**;⚠ **2026-09-03 C 批起对行只认词形**(`norm_category`:&↔and / 逗号 / 括号后缀 / 撇号 / 单复数):存量缩写名靠 `POLICY_LEGACY_NAMES` 自动认领的那一级已随改名落地退役,**改名的人工入口 = 报告的「疑似改名对」**(把「未对上」与「官方已不含」里同概念的两条并排点名,由人裁决改名还是新增);目标官方名已被另一行占用的**不改名也不刷新**,进「改名冲突」等人裁决。⚠ **dry-run 必须人眼核对两处**:①「将改名」清单逐条确认确实是同一政策类别;②「未对上」清单裁决新增/忽略(先看「疑似改名对」有没有点到它 —— 官方改了名却按新增裁决,写出来的是同概念双行)。⚠ 真跑连带后果两条(摘要会逐条提醒):①`AUDIT_RULES_VERSION` **已随判据批次递增,首跑无需再手动递增**(摘要按实时版本号渲染,这里不写死;合并后又改判据则另计);⇒ **成本**:L3 的 system prompt 随政策表逐字节变化,`catalog.llm_cache` 里 L3 那一批全量未命中,与全量重审叠加 = 那批产品**全额重付**(大批重审排北京时间 18:00–次日 08:00 谷时段,单价减半);②新增行人工中文列全 NULL,S4 现渲染为**空壳标题**待运营补中文。(原第三条「audit_l3 提示词硬写 37 条」已随本批动态化 —— S1/S3 按实时政策条数渲染,不再有对不上的字面量)|
 
 **重审政策**(唯一出处 `product_audit._DEFAULT_CANDIDATE`):没结论的审;
 `pending` 隔天重试;`approved`/`rejected` **不自动重审**。要整批重审只有显式通道:
@@ -321,6 +331,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 政策理由映射(政策类别名
 | `-p rerule=<规则码>` | 历史命中过某条规则、现仍 rejected | 只改了一条规则,定点翻案 |
 | `-p force_rerun=<旧版本>` | `audit_version` ≠ 该值的**全部**(含 pass) | 全链全库重审,最贵 |
 | `-p mode=pending` | 只重刷 pending,无退避 | LLM 故障恢复后排空待定存量 |
+| `-p mode=stale -p active_days=90` | `approved` 且版本落后、**且近 N 天有动销** | 判据提版后消化存量;`active_days` 缺省 90,`=0` 显式不按动销过滤(全量 approved,最贵)。动销口径 = `orders.order_lines` 上按 `asin` 列、窗口打 `order_date`、只排 `Cancelled`(与 `alloc_survey` 同一条口径)|
 
 `mode=nonpass` / `mode=pass` / `mode=pending` / `rerule` 都带**版本闸做天然分页**
 (`mode=pass` 除外,它未命中不盖版本,须一次大 limit 扫完):真跑判过的自动
@@ -334,6 +345,7 @@ L3 语义(LLM)→ L4 视觉(LLM,默认关)→ 政策理由映射(政策类别名
 | `match_listing` | 危 | 跟卖上架(MP_ITEM_MATCH) |
 | `upc_sync` | | UPC 池注入同步与投影回写(手动体检入口) |
 | `sku_locked_heal` | 危 | `SKU_LOCKED` 自愈链:RETIRE → 冷却 24h → 清列重上新 UPC |
+| `sku_migrate` | 危 | **存量改码**(SKU 改造批次 3,手动、永不进调度):把存量 SKU(裸 ASIN / 三段式)迁到 12 位不透明码。先落库并 **commit**(新码行指回旧码 + 旧行 `replaced_by`)→ 发 `SkuUpdate=Yes` 的 MP_MAINTENANCE feed → **回执成功不定案**,等 `catalog_sync` 观测到「新码在架且旧码缺席」才 confirmed(旧行弃码、UPC 改标、上架表 SKU 列回写、处置迁键、节点库存清行);观测反证或回执失败 ⇒ rolled_back;判不准超期 ⇒ stalled 点名人工。`-p store=` **必填**,节奏硬闸 1 → 10 → 按 limit,`-p settle_only=1` 只定案;要挑着改用 `-p skus=` / `-p asins=` 点名、`-p exclude_skus=` / `-p exclude_asins=` 排除(可叠加,**排除优先**;点名**不越闸**,落选的逐条给理由) |
 | `variant_probe` | | 变体维度为什么没发?(只读三路诊断) |
 
 **提交结局三态**(UPC 回收只发生在其中一态):`submitted` → 上架表 K=Yes、
@@ -348,7 +360,9 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
 | `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
-| `error_reclass_report` | | 报错归类新旧对照(只读排查,手动跑):现行 `problem_products.categorize()` 的 A-L 码 vs 新引擎 `services.error_taxonomy` 的 16 码,出迁移矩阵 / unknown 全文 / 政策表缺口 / feed 政策族分类。方案 `docs/error_taxonomy.md`,所有者过完这份账才换轨 |
+| `error_reclass_report` | | 报错归类对照(只读排查,手动跑):同一批生产数据在 `services.error_taxonomy` 16 码下的主码分布 / unknown 全文 / 政策表缺口 / feed 政策族分类 / 已产生后果的黑名单行。⚠ 2026-09-04 换轨完成后**退役了「旧码 → 新码迁移矩阵」那一面**,旧引擎 `problem_products.categorize()` 一并删除 |
+| `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |
+| `blacklist_route` | ⚠ | **存量 ASIN 黑名单按新码裁决重新路由**(手动跑,**删行不可逆**;所有者 2026-09-03 逐码裁决,表在 `docs/error_taxonomy.md` §十二)。留下 = 七个永久码(PROHIBITED_FINAL/POLICY/IP/BRAND/RECALL/FLAGGED/GATED)+ `OTHER` 的 business decision / trust & safety 两个词条 + **判不出来的**(查不出理由就继续禁);其余全删,主体是 `PT_WRONG`。三道闸:只动回填过的行、删前整行落 `backups/`、`--dry-run` 一行不动。⚠ 删完要跑 `blacklist_push` 才同步飞书 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
 | `node_clear` | 危 调 | 把**指定发货节点**的库存整节点清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。**拒绝清受管仓**(自动链正在维护它,清了下轮写回来);写 0 幂等,失败重跑即补 |
 | `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |
@@ -459,7 +473,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `store_watch` | 每小时 :45 | `store_watch`(店铺高危事件扫描 → 飞书 → 标已推;顺带比对治理配置快照。**首次上线先手动 `-p seed=1`**) |
 | `product_ingest` | 每小时 :50 | `product_ingest`(全局增量泵:本地产品中心 ↔ 采集器对齐;各链已按批自取,这条管其余一切增量) |
 
-### 智能体定时任务(每日/每周,9 条)
+### 智能体定时任务(每日/每周,10 条)
 
 改时间不用改代码、不用 `launchctl unload/load`,而且每次执行有个**能读日志、
 能当场判断要不要重跑的东西**在旁边。提示词由 `cli.py skill_export` 从调度表渲染到
@@ -468,6 +482,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | 任务 | 时间(台北) | 跑什么 |
 |---|---|---|
 | `backup` | 每天 02:00 | `backup` |
+| `item_id_sync` | 每天 05:00 | `item_id_sync`(有缺口的店各拿一份 ITEM 报表补 item_id;首轮手动 `-p all=1`) |
 | `daily_report` | 每天 06:40 | `catalog_sync` → `daily_report`(产品三列取今早现状,不再差一天) |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
 | `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
@@ -557,7 +572,7 @@ tail -n 60 "$(python -c 'from registry import paths; print(paths.logs_dir())')/<
 | 某个 ASIN 为什么被拒 | `python cli.py audit_why -p asins=B0XXXXXXXX` |
 | 变体没成组 / 维度没发出去 | `python cli.py variant_probe -p asins=…` |
 | feed 提交了没结果 | `ops.feed_log` 找 `submitted` 行 → `ops.feed_items` 看 SKU 级结果 → `ops.feed_item_errors` 看报错码 |
-| 上架表某行一直空着 | F 列的原因 → `ops.dispositions` / `catalog.products.audit_status` |
+| 上架表某行一直空着 | H 列(具体内容)的原因 → `ops.dispositions` / `catalog.products.audit_status` |
 | 某商品当初为什么被删 | `catalog.product_events` 按 SKU 查时间线 |
 | 采集为什么没数据 | `ops.scrape_batches`(批次状态)+ `ops.scrape_failures`(逐 ASIN 真实 `error_type`) |
 | 黑名单表格没更新 | 闸门读 PG 已经生效了;表格投影跑 `cli.py blacklist_push -p probe=1` 体检 |

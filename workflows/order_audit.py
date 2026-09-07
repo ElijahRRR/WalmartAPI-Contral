@@ -10,6 +10,8 @@
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
   python cli.py order_audit -p wait=0          # 不等采集(推完就回写,结论滞后一轮)
   python cli.py order_audit -p refill_shots=1  # 为台账无批次记录的行重采一次(只为补图)
+  python cli.py order_audit -p repush=1        # 无视指纹把窗口内已判定行全部重写飞书
+                                               #(人工改坏了程序列、或怀疑指纹漂了时用)
 
 **轮询默认开**(所有者定稿 2026-08-10)——一条命令出真结论:
 推采集 → 轮询批次到落定(20 分钟兜底)→ 就地按批摄取 → 重新对账重判 →
@@ -27,14 +29,19 @@ product_refresh 那条链(维护/上架用的快照)还是靠它摄。
 
 设计(PG 权威,飞书是人机界面):
 - 判定与推送**两段解耦**:判定只挑"这轮该判的行",推送则把窗口内**所有已判定行**
-  推一遍。这样销售订单表里还没建出的行(order_center_push 尚未推到),
+  过一遍。这样销售订单表里还没建出的行(order_center_push 尚未推到),
   下一轮会自然补上飞书侧,不会因为 PG 已有结论就永远漏掉。
-  代价是每轮重写窗口内已判定行——**窗口(days,默认 3)就是写放大的上限**,
-  调大 days 前先想清楚这一点。
+  **过一遍 ≠ 写一遍**(2026-09-07):回写走 services/order_center.update_audit_columns,
+  复用销售投影的本地映射(同一张表)并按载荷指纹只写变化行,日常零拉表;
+  此前每小时拉整张表换 record_id 再把窗口内全部行不比指纹重写。
 - 结论落 orders.order_lines 的 audit_status/audit_detail/audited_at
   (order_sync 的 upsert 只覆盖自己给出的列,拉单冲不掉审核结论)。
+  **结论与明细都没变的行不写**(2026-09-07):待人工行每小时重判,原先无条件
+  UPDATE 连 updated_at 一起刷,销售投影拿 updated_at 当「拉取时间」进指纹,
+  这些行就每小时被重推一遍 —— 与 08-10 在 order_sync 侧治掉的写放大同款。
+  于是 audited_at 的语义是「结论最后一次变化」而不是「最后一次被判」。
 - 飞书侧只写 registry ORDER_SALES_AUDIT 登记的审核列,且**只更新不新建行**
-  (feishu.update_by_key)——建行是 order_center_push 的职责。
+  ——建行是 order_center_push 的职责。
   「建议采购日期」属人工域,不登记不写。「审核状态」是两条工作流都会写的
   唯一一列,但两边取的都是 order_lines.audit_status 同一个值,不会打架。
 - **钓鱼行不可覆盖**(旧系统语义):结论含「钓鱼」二字的行,后续轮次一律跳过,
@@ -137,9 +144,9 @@ import httpx
 
 from api import feishu, scraper
 from registry import db, resources
-from services import (brand_key, kpi, order_audit as rules,
+from services import (brand_key, kpi, order_audit as rules, order_center,
                       product_ingest as ingest, risk_trace,
-                      scrape_batches as batches, sku_asin, store_events,
+                      scrape_batches as batches, store_events,
                       stores as stores_svc)
 # ⚠ `stores as stores_svc` 是同一个坑的预防:run() 里的局部 `stores` 是店铺
 # 过滤参数,同名导入迟早被谁在 run() 内引用一次然后当场 AttributeError。
@@ -420,7 +427,7 @@ def _snapshots(conn, lines: list[dict]) -> dict[tuple[str, str], dict]:
       引擎就是另一组,各留各的最新。所以这里必须按 scraped_at **取最新那条**,
       不能让字典后写覆盖先写(那等于随机挑一条,时好时坏且无法复现)。
     """
-    asins = sorted({(r["sku"] or "").strip().upper() for r in lines if r.get("sku")})
+    asins = sorted({a for a in (rules.line_asin(r) for r in lines) if a})
     if not asins:
         return {}
     with conn.cursor() as cur:
@@ -458,8 +465,8 @@ def _scrape_fails(conn, lines: list[dict]) -> dict[tuple, str]:
     判定链要按 error_type 分流:重采也没用的那类(variant_offset 等)该给
     终局结论,而不是永远挂"待采集"等一个不会来的快照。
     """
-    pairs = {((r.get("sku") or "").strip().upper(),
-              rules.norm_zip(r.get("postal_code"))) for r in lines}
+    pairs = {(rules.line_asin(r), rules.norm_zip(r.get("postal_code")))
+             for r in lines}
     pairs = {(a, z) for a, z in pairs if a and z}
     if not pairs:
         return {}
@@ -476,7 +483,7 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     results: list = []
     want: list = []
     for line in lines:
-        asin = (line.get("sku") or "").strip().upper()
+        asin = rules.line_asin(line)
         zip5 = rules.norm_zip(line.get("postal_code"))
         snap = snaps.get((asin, zip5)) if zip5 else None
         res = rules.judge(line, snap, suppliers, blacklist,
@@ -852,23 +859,34 @@ def _ingest_batches(names: list[str]) -> str:
     return note
 
 
+# 结论与明细都没变就不写(2026-09-07)。jsonb 比较是语义相等:键序、
+# 25.99 与 25.990 之类的数字形态都不算变;快照换了(scraped_at 变)才算变。
+# ⚠ updated_at 只能在这里跟着真变化走:销售投影把它当「拉取时间」进指纹,
+# 无条件刷新 = 窗口内每个待人工行每小时重推一遍飞书。
+_SAVE_SQL = """
+UPDATE orders.order_lines
+SET audit_status = %(status)s, audit_detail = %(detail)s::jsonb,
+    audited_at = now(), updated_at = now()
+WHERE order_line_id = %(id)s
+  AND (audit_status IS DISTINCT FROM %(status)s
+       OR audit_detail IS DISTINCT FROM %(detail)s::jsonb)
+"""
+
+
 def _save(conn, results: list) -> int:
-    """输入:连接 + [(行, 结论)] → 输出:落库行数(audit_status/detail/audited_at)。"""
+    """输入:连接 + [(行, 结论)] → 输出:真写入的行数(结论与明细都没变的行不写)。"""
     if not results:
         return 0
-    payload = [(res.status, json.dumps({**res.detail, "note": res.note},
-                                       ensure_ascii=False,
-                                       default=_json_default),
-                line["order_line_id"])
+    payload = [{"status": res.status,
+                "detail": json.dumps({**res.detail, "note": res.note},
+                                     ensure_ascii=False, default=_json_default),
+                "id": line["order_line_id"]}
                for line, res in results]
     with conn.cursor() as cur:
-        cur.executemany(
-            "UPDATE orders.order_lines "
-            "SET audit_status = %s, audit_detail = %s::jsonb, audited_at = now(), "
-            "    updated_at = now() "
-            "WHERE order_line_id = %s", payload)
+        cur.executemany(_SAVE_SQL, payload)
+        n = cur.rowcount            # psycopg3:executemany 累计受影响行数
     conn.commit()
-    return len(payload)
+    return n if isinstance(n, int) and n >= 0 else len(payload)
 
 
 # 截图终态:这张图不会再有了,记墓碑别再问。**其余状态一律当"还没好"**
@@ -1234,10 +1252,7 @@ def _phish_record(conn, cands: list[dict], source: str) -> tuple[list[dict], int
     """
     if not cands:
         return [], 0
-    asin_of = {c["order_line_id"]:
-               (str(c.get("asin") or "").strip().upper()
-                or sku_asin.extract_asin(c.get("sku") or "") or "")
-               for c in cands}
+    asin_of = {c["order_line_id"]: rules.line_asin(c) for c in cands}
     brands = _phish_brands(conn, [a for a in asin_of.values() if a])
     reg: dict = {}
     order_rows: list[dict] = []
@@ -1332,6 +1347,7 @@ def run(params: dict) -> str:
     # 挂调度那天在 plist 里显式写 -p wait=0 是很自然的一步(参数本来就要逐条写)。
     do_wait = flag(params, "wait", default=True)
     refill_shots = _yes(params.get("refill_shots", ""))
+    repush = _yes(params.get("repush", ""))
 
     blacklist, suppliers = _load_config()
     store_filter = "AND store = ANY(%(stores)s)" if stores else ""
@@ -1422,8 +1438,9 @@ def run(params: dict) -> str:
                          e.__class__.__name__, e)
             phish_note = f"⚠ 钓鱼入账失败({e.__class__.__name__}),下轮补记"
 
-        # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈
-        pushed = missing = 0
+        # ④ 推送:窗口内所有已判定行(不止本轮新判的),漏推的行下轮自愈;
+        #    按指纹只写变化行(order_center.update_audit_columns)
+        pushed = missing = push_skipped = 0
         shot_tally: dict[str, int] = {}
         if do_push:
             push_sql = _PUSH_SQL.format(store_filter=store_filter)
@@ -1438,12 +1455,13 @@ def run(params: dict) -> str:
                 done = [dict(zip(cols, r)) for r in cur.fetchall()]
             if done:
                 fields_by_key, shot_tally = _payload(conn, done)
-                pushed, miss_keys = feishu.update_by_key(
-                    resources.ORDER_SALES_AUDIT,
-                    resources.ORDER_SALES_AUDIT.fields.key, fields_by_key)
+                pushed, miss_keys, push_skipped = order_center.update_audit_columns(
+                    fields_by_key, force=repush)
                 missing = len(miss_keys)
 
-    parts = [f"{audit_note}待审 {len(lines)} 行,落库 {saved}"]
+    unchanged = len(lines) - saved
+    parts = [f"{audit_note}待审 {len(lines)} 行,落库 {saved}"
+             + (f"(结论未变 {unchanged} 行不重写)" if unchanged > 0 else "")]
     # 钓鱼是这条链里唯一"要人当场看一眼"的东西,所以短标记**并进首行**:
     # 链通知只把成功步骤折成摘要的第一行(notify_fmt 规矩 1 / cli._fold_success),
     # 明细行排在 parts 尾部时,前面任何一段带换行的 note 都会把它挡在飞书之外。
@@ -1464,6 +1482,7 @@ def run(params: dict) -> str:
     parts.extend(n for n in wait_notes if n)
     if do_push:
         parts.append(f"飞书回写 {pushed} 行"
+                     + (f",指纹一致跳过 {push_skipped}" if push_skipped else "")
                      + (f",{missing} 行尚未建出(等 order_center_push)" if missing else ""))
         if shot_tally:
             bits = [f"已贴 {shot_tally['ok']}"]

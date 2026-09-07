@@ -27,7 +27,7 @@ logger = logging.getLogger("workflows.audit_why")
 
 _SQL_PRODUCT = """
 SELECT asin, title, brand, walmart_pt, pt_source,
-       audit_status, audit_reason, audited_at, audit_version
+       audit_status, audit_reason, audited_at, audit_version, audit_detail
 FROM catalog.products
 WHERE marketplace = 'US' AND asin = ANY(%s)
 """
@@ -35,7 +35,7 @@ WHERE marketplace = 'US' AND asin = ANY(%s)
 _SQL_RUNS = """
 SELECT run_id, asin, walmart_product_type, pt_source, pt_confidence,
        score_final, verdict, stage_stopped_at, l3_verdict, l3_reason_text,
-       created_at
+       created_at, l3_reason_category
 FROM audit.audit_runs
 WHERE asin = ANY(%s)
 ORDER BY asin, created_at DESC
@@ -163,9 +163,15 @@ _RULE_SOURCE = {
     # 是被命中的子树根)、path_exact 归一化完整路径等值(飞书镜像历史行)
     "phase0_lark_blacklist_amazon_cat": "catalog.amazon_cat_blacklist "
                                     "match_type='node_subtree'/'path_exact'",
-    "title_desc_blacklist":         "catalog.brand_blacklist(扫标题/描述)",
-    "trademark_live":               "uspto 商标库",
+    "phase0_brand_mention":         "catalog.brand_blacklist(扫标题/五点/描述,"
+                                    "0 分软证据 → 送 L3 判)",
+    "phase0_made_in_usa":           "正则扫标题/全部五点/描述(声明即硬拒)",
     "phase0_trademark_symbol":      "正则扫标题/bullets/描述",
+    # 存量老行的判据出处(规则本身已下线,2026-09-03 C 批;渲染保留兼容)
+    "title_desc_blacklist":         "catalog.brand_blacklist(扫标题/描述;"
+                                    "旧 L2 R4,已迁 L0 phase0_brand_mention)",
+    "made_in_usa_claim":            "正则(旧 L2 R10,已迁 L0 phase0_made_in_usa)",
+    "trademark_live":               "uspto 商标库(旧 L2 R5,已删除)",
 }
 
 
@@ -340,10 +346,14 @@ def run(params: dict) -> str:
             out.append("  ⚠ 不在 catalog.products —— 采集还没摄进来,"
                        "既审不了也回填不了(先跑 product_ingest)")
             continue
-        _a, title, brand, wpt, psrc, status, reason, at, ver = p
+        _a, title, brand, wpt, psrc, status, reason, at, ver, adetail = p
+        # 三段分列(2026-09-02 B1):判定结果 / 类别 / 具体内容。老行没有
+        # audit_detail(那时两样东西挤在 audit_reason 一列里),打出来是 None
+        # —— 那正是"这一行还没被新链重审过"的样子,不是查询坏了
         out += [f"  标题 {(title or '')[:70]}",
                 f"  品牌 {brand!r}",
-                f"  结论 {status}  理由 {reason!r}",
+                f"  结论 {status}  类别 {reason!r}",
+                f"  具体内容 {adetail!r}",
                 f"  类目 {wpt!r}(来源 {psrc},审于 {at} 规则版本 {ver})"]
         m = meta.get(wpt)
         if m:
@@ -358,11 +368,17 @@ def run(params: dict) -> str:
                        f"R3 认证闸对它静默放行**(与本次判拒无关,是另一个问题;"
                        f"全库面看 `python cli.py audit_why -p missing_meta=1`)")
         for r in runs_by_asin.get(asin, [])[:want_runs]:
-            rid, _a2, rpt, rsrc, rconf, score, verdict, stage, l3v, l3t, ts = r
+            (rid, _a2, rpt, rsrc, rconf, score, verdict, stage, l3v, l3t, ts,
+             l3cat) = r
             out.append(f"  ── 第 {rid} 轮 {ts:%Y-%m-%d %H:%M} → {verdict} "
                        f"(分 {score},停在 {stage},PT={rpt!r}/{rsrc}/{rconf})")
-            if l3t:
-                out.append(f"    L3({l3v}):{l3t}")
+            if l3t or l3cat:
+                # ⚠ **类别也要打**(2026-09-03 补):`--dry-run` 不写
+                # `catalog.products`,所以上面那三行「结论/类别/具体内容」显示的
+                # 是**上一次真跑**的老结论;本轮判的什么只在 runs 行里。少了
+                # 类别这一格,空跑就没法核对"三段输出"到底对不对 —— 而空跑
+                # 正是换喂之后最该核对它的时候(所有者 2026-09-03 实遇)。
+                out.append(f"    L3({l3v})类别 {l3cat!r}:{l3t}")
             hs = hits.get(rid, [])
             if not hs:
                 out.append("    (无命中记录)")

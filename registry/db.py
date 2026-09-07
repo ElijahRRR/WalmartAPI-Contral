@@ -97,8 +97,11 @@ def legacy_audit_conn():
 def uspto_dsn() -> str:
     """输入:无 → 输出:USPTO 商标库 DSN(env USPTO_DSN 覆盖,默认本机 uspto 库)。
 
-    批复 #3(2026-08-13):R5 商标反查继续跨库连它;灌库链路在外部仓,
-    本仓永远只读。
+    批复 #3(2026-08-13):R5 商标反查跨库连它;灌库链路在外部仓,本仓永远只读。
+    ⚠ **2026-09-03 C 批起本仓无消费方**:L2 R5 整条删除(默认关、
+    `brand_nice_class` 覆盖率 2.6 万/1400 万)。库与外部灌库链路都还在,
+    登记保留在这里等"按新流程重建"(所有者定稿 `docs/audit_pipeline.md` §10);
+    在那之前**没有任何代码调它**。
     """
     return os.environ.get("USPTO_DSN", "dbname=uspto")
 
@@ -110,6 +113,7 @@ def uspto_conn():
     autocommit 是批量消费的关键:整批共用一个连接,若开事务,第一条报错后
     事务进 aborted 态,后续每条查询都 InFailedSqlTransaction——"fail-soft"
     变成整轮静默失效(审核 R5 评审实证 2026-08-13)。只读查询无需事务语义。
+    ⚠ 同 `uspto_dsn`:2026-09-03 C 批之后本仓无消费方。
     """
     import psycopg
 

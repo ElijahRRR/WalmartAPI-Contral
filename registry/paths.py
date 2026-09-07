@@ -69,6 +69,17 @@ def reports_dir() -> Path:
     return data_root() / "reports"
 
 
+def audit_replay_report() -> Path:
+    """输入:无 → 输出:回放评估报告全文路径(<DATA_ROOT>/reports/audit_replay.txt)。
+
+    `workflows/audit_replay` 的**唯一文件写出口**(另一个写是
+    `audit.replay_results` 表)。文件名登记在这里而不是工作流里:切换手册
+    (`docs/audit_step3_spec.md` §五)与所有者都按这个路径找报告,
+    改名得只有一处(铁律 3:路径只准从 registry 取)。
+    """
+    return reports_dir() / "audit_replay.txt"
+
+
 def frontend_scrape_file() -> Path:
     """输入:无 → 输出:影刀 RPA 抓取结果 latest.json 路径。
 
@@ -115,16 +126,18 @@ def yingdao_app() -> Path:
 
 
 def audit_seed_file(name: str) -> Path:
-    """输入:审核规则种子文件名(如 'nrtl_small_parts.yaml')
-    → 输出:refdata/audit/ 下的绝对路径(进 git 的只读参考资料,批次 A 迁入)。
+    """输入:审核规则种子文件名 → 输出:refdata/audit/ 下的绝对路径
+    (进 git 的只读参考资料,批次 A 迁入)。
 
-    现存消费方(nrtl_small_parts.yaml 2026-08-21 随 R3 收敛删除):
-    pt_nice_class.yaml(L2 R5 的 Nice Class 过滤)。
-    forbidden_categories_zh_seller.yaml 已于 2026-08-20 删除 —— 它装的
-    13 条 L1 excluded + 18 条 R2 禁售大类,和 L2 R1 的类目准入白名单
-    讲同一件事,白名单补齐后整份下线。
+    ⚠ **当前零消费方**(2026-09-03 C 批起):三份种子 yaml 随各自的规则依次
+    下线 —— forbidden_categories_zh_seller.yaml(2026-08-20,13 条 L1
+    excluded + 18 条 R2 禁售大类,与 R1 类目准入白名单讲同一件事)、
+    nrtl_small_parts.yaml(2026-08-21 随 R3 收敛)、pt_nice_class.yaml
+    (2026-09-03 随 R5 USPTO 商标整条删除)。目录里只剩
+    `l3_keywords.yaml`,它是**参考资料**、代码从不加载(见该文件头注)。
 
-    审核规则代码取 yaml 一律经此函数(铁律 3:路径不散落在 services)。
+    函数保留:审核规则代码取 refdata/audit 下的文件一律经此函数
+    (铁律 3:路径不散落在 services),下一份种子文件照走这里。
     """
     repo_root = Path(__file__).resolve().parent.parent
     return repo_root / "refdata" / "audit" / name
@@ -176,3 +189,38 @@ def ensure_data_root() -> list[str]:
             p.mkdir(parents=True, exist_ok=True)
             created.append(name)
     return created
+
+
+def match_spec_file() -> Path:
+    """输入:无 → 输出:MP_ITEM_MATCH 官方 feed 规范原件的绝对路径(refdata/specs/)。
+
+    所有者 2026-09-07 从开发者门户下载的 `MP_ITEM_MATCH_Consolidated_Schema.zip`
+    里的那份 JSON,版本 5.0.20260607-22_38_54-api。消费方两个:
+    services/match_feed(按原件 Item.properties 过滤 SPEC 预填模板里规范外的键)与
+    tests/test_match_spec_v5.py(守门:header/Item/inventory 形状逐项对原件)。
+    换版把文件换掉、这里改名,别处不动(铁律 3:路径只从 registry 取)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "specs" / "MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json"
+
+
+def item_report_dump_file(store: str, request_id: str, suffix: str) -> Path:
+    """输入:店名 + requestId + 扩展名(.zip/.csv)→ 输出:探针留存的报表原件路径。
+
+    <DATA_ROOT>/reports/item_report_<店>_<requestId><suffix>:探针每次下载都原样留一份,
+    「报表只有 1 行」这类问题要拿原件才分得清是沃尔玛只给了 1 行还是解析吞了
+    (2026-09-07 C021 探针:55 列对上、在架 1490 行却只解析出 1 行)。
+    """
+    return reports_dir() / f"item_report_{store}_{request_id}{suffix}"
+
+
+def item_report_header_file() -> Path:
+    """输入:无 → 输出:沃尔玛 ITEM 报表(On-request Reports)实测表头原件的绝对路径。
+
+    所有者 2026-09-07 从 Seller Center 导出的 `ItemReport_10002762917_2026-08-31…csv`
+    首行,55 列,一列一行。消费方两个:services/item_reports(守门:SKU / Item ID /
+    Item Page URL 三列必须在;整表漂移只报不拦)与 tests/test_item_id_sync.py。
+    沃尔玛改版把文件换掉、这里不动(铁律 3:路径只从 registry 取)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "specs" / "item_report_header.txt"

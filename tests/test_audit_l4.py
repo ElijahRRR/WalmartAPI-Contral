@@ -17,7 +17,8 @@ from services.audit_models import L1Info, ProductInfo
 
 @dataclass
 class FakeL3:
-    reason_text: str | None = None
+    # 2026-09-02 B1:L3 输出三段化,`reason_text` 改名 `detail`(语义不变)
+    detail: str | None = None
 
 
 def _product(**kw) -> ProductInfo:

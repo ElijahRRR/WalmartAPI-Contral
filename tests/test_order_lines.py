@@ -270,14 +270,20 @@ def test_aggregate_settlement_sku_lookup_fallback_and_skip():
 # ── upsert SQL 形态 ──────────────────────────────────────────────────────────
 
 class _FakeCursor:
-    def __init__(self):
+    def __init__(self, reg=()):
         self.calls, self.rowcount = [], 3
+        self.reg = list(reg)
 
     def executemany(self, sql, rows):
         self.calls.append((sql, list(rows)))
 
     def execute(self, sql, args=None):
         self.calls.append((sql, args))
+
+    def fetchall(self):
+        # 批次 0b:upsert_order_lines 落库前先查一次登记簿(_fill_asins)。
+        # 没有这个方法的话新增的那条 SELECT 会当场 AttributeError
+        return list(self.reg)
 
     def __enter__(self):
         return self
@@ -287,18 +293,26 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    def __init__(self):
-        self.cur = _FakeCursor()
+    def __init__(self, reg=()):
+        self.cur = _FakeCursor(reg)
 
     def cursor(self):
         return self.cur
+
+    def _many(self, i: int = 0):
+        """输入:序号 → 输出:第 i 条 executemany 的 (sql, rows)(跳过登记簿 SELECT)。
+
+        ⚠ 不要退回 `cur.calls[i]`:upsert_order_lines 落库前先查一次登记簿补 asin
+        (_fill_asins),那条 execute 排在最前面,按裸下标取会取到它。
+        """
+        return [c for c in self.cur.calls if isinstance(c[1], list)][i]
 
 
 def test_upserts_build_conflict_sql():
     conn = _FakeConn()
     n = ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
     assert n == 1
-    sql, rows = conn.cur.calls[0]
+    sql, rows = conn._many()
     assert "ON CONFLICT (order_line_id)" in sql and "updated_at = now()" in sql
     assert rows[0]["po_id"] == "108000000001"
 
@@ -312,6 +326,59 @@ def test_upserts_build_conflict_sql():
     assert isinstance(rows2[0]["detail"], str)                 # dict 已序列化
 
 
+def test_extract_order_lines_no_longer_computes_asin():
+    """asin 不在纯函数里算 —— 它要查登记簿(要连接),统一由唯一写入口
+    upsert_order_lines 落库当场补。留一份 extract 时点的算法 = 两条实现路径。"""
+    rows = ol.extract_order_lines("T1", _ORDER)
+    assert rows and "asin" not in rows[0]
+
+
+def test_upsert_fills_asin_from_the_registry():
+    """登记簿有 amz 行 ⇒ 键取 source_key(切码后这是唯一通路:不透明码对
+    形态提取恒返 None,不接这一跳 order_lines.asin 就恒 NULL,产品分的
+    销量/退货率维度整个退出,而且不报错)。"""
+    rows = ol.extract_order_lines("T1", _ORDER)
+    sku = rows[0]["sku"]
+    conn = _FakeConn(reg=[("T1", sku, "B0REGISTER")])
+    ol.upsert_order_lines(conn, rows)
+    _, written = conn._many()
+    assert written[0]["asin"] == "B0REGISTER"
+
+
+def test_upsert_leaves_asin_null_when_unresolvable():
+    """两条腿都提不出就留 None,**绝不写 sku 原文**:订单链的口径是
+    「提不出留 NULL」(所有者 2026-08-15),原文兜底在采集库永远查空,
+    看起来像"这个产品一单没卖过"——一个静默的错误信号。"""
+    conn = _FakeConn()
+    rows = [{"order_line_id": "L1", "store": "T1", "sku": "102460018738"}]
+    ol.upsert_order_lines(conn, rows)
+    _, written = conn._many()
+    assert written[0]["asin"] is None
+
+
+def test_upsert_asin_guard_still_coalesces():
+    """纯数字 item_id 形态是本批次唯一没被登记簿补掉的口子(那一跳要查
+    walmart_items),由 order_asin_normalize 扫尾 —— 这条守卫**不能拆**,
+    拆了每轮同步都会把扫尾填好的值冲回 NULL。"""
+    assert ol._ASIN_GUARD == "COALESCE(EXCLUDED.asin, t.asin)"
+    conn = _FakeConn()
+    ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
+    sql, _ = conn._many()
+    assert "asin = COALESCE(EXCLUDED.asin, t.asin)" in sql
+
+
+def test_fill_asins_is_one_query_per_batch():
+    """一批一条 SELECT(order_sync 是每店一批):退化成逐行往返的话,
+    cleanup/同步这类万级批量会把连接打满,而功能看起来完全正常。"""
+    conn = _FakeConn()
+    rows = [{"order_line_id": f"L{i}", "store": "T1", "sku": f"B0ABCDEF{i:02d}"}
+            for i in range(50)]
+    assert ol._fill_asins(conn, rows) == 50
+    assert len(conn.cur.calls) == 1
+    assert ol._fill_asins(conn, []) == 0        # 空批不开游标
+    assert len(conn.cur.calls) == 1
+
+
 def test_upsert_skips_write_when_nothing_changed():
     """内容没变就整行不写——updated_at 才能表示"这行什么时候变的"。
 
@@ -322,7 +389,7 @@ def test_upsert_skips_write_when_nothing_changed():
     """
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
-    sql, _ = conn.cur.calls[0]
+    sql, _ = conn._many()
     body = sql.split("DO UPDATE")[1]
     assert "IS DISTINCT FROM" in body, "没有变更检测 = 每轮全窗口重写"
     # 变更检测比的是**生效后的值**,不是 EXCLUDED——否则被 guard 挡下的
@@ -339,7 +406,7 @@ def test_upsert_phone_all_zero_never_overwrites_real_number():
     """
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER))
-    sql, _ = conn.cur.calls[0]
+    sql, _ = conn._many()
     guard = [seg for seg in sql.split(",") if "phone =" in seg]
     assert guard, "phone 列必须走保护表达式而不是裸 EXCLUDED"
     assert "^0*$" in sql and "THEN t.phone" in sql
@@ -420,6 +487,73 @@ def test_perf_last_seen_at_has_no_judgement_reader():
     assert "last_seen_at" not in span, "still_active 开始依赖 last_seen_at 了"
 
 
+# ── 订单双算体检(SKU 改造批次 3 地基,X1;判据在 orders.v_order_line_dupes)──
+
+class _ViewConn:
+    """只回放视图行的假连接(体检函数是纯只读薄壳)。"""
+
+    def __init__(self, rows):
+        self.rows, self.sqls = rows, []
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.sqls.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_duplicate_po_lines_flags_two_skus_under_one_po_line():
+    """同 (store, po_id, line_number) 出现两个 order_line_id = 同一笔销售算两次。
+
+    order_line_id = sha256(PO + SKU):改码后若沃尔玛对改码之前的 PO 返回新码,
+    那一行会被当成新行插入而旧行不删 —— 销量、产品分、日报、对账全受影响,
+    **而且不报错**。官方对"改码后旧 PO 返回哪个码"一个字都没有,只能靠体检。
+    """
+    conn = _ViewConn([("T1", "PO1", "1", 2, ["AN3WC0DE2345", "B0ABCDEFGH"])])
+    got = ol.duplicate_po_lines(conn)
+    assert got == [{"store": "T1", "po_id": "PO1", "line_number": "1", "n": 2,
+                    "skus": ["AN3WC0DE2345", "B0ABCDEFGH"]}]
+    assert conn.sqls[0][1] == {"days": 120}          # 默认回看窗口
+    assert ol.duplicate_po_lines(_ViewConn([]), days=None)[:] == []
+    assert conn.sqls[0][1] != {"days": None}
+
+
+def test_duplicate_po_lines_is_empty_on_healthy_data():
+    """健康数据下必须是空列表:这是改码前要存档的基线,改码后必须一致。"""
+    assert ol.duplicate_po_lines(_ViewConn([])) == []
+
+
+def test_duplicate_po_lines_reads_the_view_not_a_local_group_by():
+    """判据只有一处出生(refdata/schema.sql 的 orders.v_order_line_dupes)。
+
+    在这里重写一遍 GROUP BY/HAVING 就是同一条体检两份实现、口径还可能不同 ——
+    两边数字对不上时没有判据说该信哪个,而这条体检正是发现"改码后销量双算"的
+    唯一手段。窗口(days)是消费方的事,判据不是。
+    """
+    import pathlib
+    conn = _ViewConn([])
+    ol.duplicate_po_lines(conn)
+    sql = conn.sqls[0][0]
+    assert "orders.v_order_line_dupes" in sql
+    assert "GROUP BY" not in sql.upper() and "HAVING" not in sql.upper()
+    ddl = pathlib.Path("refdata/schema.sql").read_text(encoding="utf-8")
+    view = ddl.split("CREATE OR REPLACE VIEW orders.v_order_line_dupes")[1]
+    view = view.split(";")[0]
+    assert "count(DISTINCT order_line_id)" in view      # 不是 count(*)
+    assert "HAVING count(DISTINCT order_line_id) > 1" in view
+    assert "orders.order_lines" not in sql              # 薄壳只读视图,不碰明细表
+    assert "first_order_date" in sql                    # 窗口用视图给的那一列
+
+
 # ── 下单时间写一次(所有者定稿 2026-09-02)──────────────────────────────────────
 
 class _ConflictCur:
@@ -459,7 +593,7 @@ def test_order_date_observe_then_confirm_guard_and_repair_mode():
     conn = _FakeConn()
     rows = ol.extract_order_lines("T1", _ORDER)
     ol.upsert_order_lines(conn, rows)
-    sql, sent = conn.cur.calls[0]
+    sql, sent = conn._many(0)
     assert "WHEN t.order_date_confirmed THEN t.order_date" in sql
     assert "WHEN EXCLUDED.order_date = t.order_date_seen THEN EXCLUDED.order_date" in sql
     assert "order_date_seen = EXCLUDED" not in sql and "order_date_confirmed = EXCLUDED" not in sql
@@ -470,7 +604,7 @@ def test_order_date_observe_then_confirm_guard_and_repair_mode():
     assert meta["orderDate"] == _ORDER["orderDate"]
     assert meta["lines"][0]["sku"] == rows[0]["sku"] and "seenAt" in meta
     assert "_envelope" not in sent[0]
-    state_sql, state_rows = conn.cur.calls[1]
+    state_sql, state_rows = conn._many(1)
     assert state_sql.startswith("UPDATE orders.order_lines t SET order_date_confirmed")
     assert "updated_at" not in state_sql             # 观测记账不许触发飞书重推
     assert "t.order_date_seen = %(observed)s::timestamptz THEN true" in state_sql
@@ -478,7 +612,7 @@ def test_order_date_observe_then_confirm_guard_and_repair_mode():
     conn = _FakeConn()
     ol.upsert_order_lines(conn, ol.extract_order_lines("T1", _ORDER),
                           repair_order_date=True)
-    sql, _ = conn.cur.calls[0]
+    sql, _ = conn._many(0)
     assert "order_date = EXCLUDED.order_date" in sql and "t.order_date_confirmed" not in sql
 
 
@@ -697,6 +831,6 @@ def test_duplicate_order_line_id_in_one_batch_first_wins_and_warns(caplog):
     with caplog.at_level("WARNING"):
         n = ol.upsert_order_lines(conn, [a, b])
     assert n == 1
-    _sql, rows = conn.cur.calls[0]
+    _sql, rows = conn._many(0)
     assert len(rows) == 1 and rows[0]["customer_order_id"] == "200000001"
     assert "出现两个订单对象" in caplog.text

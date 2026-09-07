@@ -17,8 +17,20 @@
   G=失败/未查到 的行    → **不自动重试**(高危写操作;运营核对原因后清空 E 列
                           即重新排队——feeds 层 failed 记录允许同载荷重占)
 
-动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复);
+动作映射(2026-08-06 所有者定稿):停用/下架 → RETIRE_ITEM(可恢复窗口,见下);
 删除或 **C 列留空 → DELETE_ITEM**(永久,仅自发货)。提交走 api/feeds 唯一通道
+「可恢复」自 2026-09-06 起是真的:problem_scan._SQL_ITEMS 对 lifecycle=RETIRED
+**全豁免**(所有者定稿,SKU 改造决策 A 收口;依据是 RETIRED 行实证删不掉、后台一般
+不显示,见 workflows/problem_scan.py 头注)。停用的品不再被自动链建议 DELETE,
+一直留到运营主动删除或恢复。此前(2026-09-02 记)它只是一个"窗口 ≈ 到下一轮
+problem_scan 为止",那段历史留在 docs/sku_plan.md §5。
+⚠ 豁免只看沃尔玛观测到的 lifecycle;RETIRE_ITEM 回执成功但 catalog_sync 尚未观测到
+RETIRED 之前的一轮,行仍在扫描面里 —— 靠在途/待观测 48h 预筛护住,与新品发布过渡态
+同一机制。
+⚠ **RETIRE 本身不弃码**(决策 A 默认,conventions §九):码与 UPC 都还活着,
+登记簿 abandoned_at 保持 NULL —— 沃尔玛侧那条记录仍在、仍绑着我们的 UPC,
+抽新码去重上 = 同店两条同内容记录 + 白烧一个 UPC。守门测试反向钉死本工作流
+**不得**调 services/sku_codec.abandon(弃码点只有四个,这里不是其中之一)。
 
 单店单日上限:优先读上下架限额表(registry.RETIRE_LIMITS,按店铺分行,
 「下架限制」列);店铺不在表内退 -p limit 默认值并**告警**(旧系统静默兜底

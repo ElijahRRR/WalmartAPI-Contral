@@ -26,7 +26,11 @@ def test_persistent_partition_snapshot():
     posts = {b for b in _client._RATE_BUCKETS if b.startswith("feeds.post.")}
     assert posts and posts <= persistent
     assert "prices.put" in persistent            # 80/hour
-    assert "reports.request" in persistent       # 2/hour
+    # On-request Reports 三个小时级桶跨进程共享(创建 1/hour;列表+单查共用、下载各 20/hour;
+    # 列表官方表 200/min 但生产实见小时级桶,2026-09-07 改与单查共用 reports.query)
+    for b in ("reports.create", "reports.query", "reports.download"):
+        assert b in persistent, b
+    assert "reports.list" not in _client._RATE_BUCKETS
     assert "items.walmart_search_spec" in persistent   # 1000/day 日额度
     ins = {b for b in _client._RATE_BUCKETS if b.startswith("insights.")}
     assert ins and ins <= persistent             # 1/min
@@ -90,7 +94,7 @@ def test_pg_full_window_sleeps_then_acquires(monkeypatch):
         _Conn(_Cur(rows=[(0, None, now)])),                            # 滑出
     ]
     monkeypatch.setattr(db, "pg_conn", lambda: conns.pop(0))
-    waited = _REAL_ACQUIRE_PG("reports.request", "cidA", 1, 0.1)
+    waited = _REAL_ACQUIRE_PG("reports.create", "cidA", 1, 0.1)
     assert waited > 0                    # 真等过(0.1s 窗口,睡 ~0.09s)
     assert not conns                     # 两轮都用掉了
 
@@ -111,3 +115,21 @@ def test_pg_down_fails_hard(monkeypatch):
 def test_unregistered_bucket_still_rejected():
     with pytest.raises(KeyError):
         _client.rate_acquire("feeds.post.NOT_REGISTERED", "cidA")
+
+
+def test_sku_migrate_uses_the_already_registered_feed_buckets():
+    """改码**不新增桶**(2026-09-06 通道定案 MP_ITEM_MATCH 后同样成立)。
+
+    它吃 `feeds.post.MP_ITEM_MATCH`(15/h,与跟卖链 match_listing 共享),不再吃
+    MP_MAINTENANCE(那是已作废的形态 A)。两个桶早已登记且都是跨进程桶。
+
+    再登记一遍就是双轨:同一个配额被两个名字各算一次,等于配额翻倍(而沃尔玛
+    那一侧不会翻倍,只会开始 429)。
+    """
+    from workflows import sku_migrate
+    assert _client._RATE_BUCKETS[f"feeds.post.{sku_migrate.FEED_TYPE}"] \
+        == (15, 3600.0)
+    assert _client._is_persistent(f"feeds.post.{sku_migrate.FEED_TYPE}")
+    assert _client._RATE_BUCKETS["feeds.post.MP_MAINTENANCE"] == (8, 3600.0)
+    assert not [b for b in _client._RATE_BUCKETS if "SkuUpdate" in b or
+                "sku_update" in b or "sku_migrate" in b]

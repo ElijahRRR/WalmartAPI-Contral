@@ -138,6 +138,13 @@ def test_price_inventory_chunk_skus_and_slices():
     assert len(feeds._slices("inventory", entries)) == 2       # 4000/片
     assert feeds._chunk_skus("price", [{"sku": "X", "price": 1}]) == ["X"]
     assert feeds._chunk_skus("inventory", [{"sku": "Y", "qty": 0}]) == ["Y"]
+    # 2026-09-07 生产实见(谭总12):MP_INVENTORY 漏在 dict 类型表外 ⇒ 台账 sku 列
+    # 落的是 str(dict),维护记录反哺永远「台账查无」。每种 dict 条目的 feedType 都要在表里。
+    assert feeds._chunk_skus("MP_INVENTORY",
+                             [{"sku": "Z", "qty": 3, "ship_node": "N1"}]) == ["Z"]
+    for ft in ("price", "inventory", "MP_INVENTORY", "MP_MAINTENANCE",
+               "MP_ITEM", "MP_ITEM_MATCH"):
+        assert not feeds._chunk_skus(ft, [{"sku": "Q"}])[0].startswith("{"), ft
 
 
 def test_put_price_and_put_inventory(monkeypatch):
@@ -614,3 +621,49 @@ def test_backoff_follows_the_official_ladder_with_jitter():
         assert len(vals) > 1, f"第 {i} 档没有抖动:{vals}"
     # 超出阶梯长度取最后一档,不越界
     assert 16 <= feeds._backoff(99) <= 32
+
+
+# ── 改码载荷经过 api 层时的两条隐含契约(通道 MP_ITEM_MATCH,2026-09-06 定案)──
+
+def _migrate_item():
+    """改码载荷 = 跟卖链的同一块积木(services/match_feed.build_match_item)。"""
+    from services import match_feed
+    return match_feed.build_match_item(
+        None, "AN3WC0DE2345", 29.99, 0.82,
+        product_id="00121678236703", product_id_type="GTIN")
+
+
+def test_chunk_skus_takes_the_new_code_from_a_migrate_payload():
+    """改码载荷的 sku 是**新码**,台账因此按新码落账 —— sku_migrate 的回执反查与
+    feed_poll 的反哺都按新码找行,**这是有意的**。
+
+    有人把 _chunk_skus 改成取旧码的话,回执永远查不到那一行,而且不报错。
+    """
+    item = _migrate_item()
+    assert feeds._chunk_skus("MP_ITEM_MATCH", [item]) == ["AN3WC0DE2345"]
+    assert feeds._chunk_skus("MP_MAINTENANCE", [item]) == ["AN3WC0DE2345"]
+
+
+def test_match_payload_wraps_migrate_items_unchanged():
+    """api 层只包信封不碰内容(铁律 2):改码 Item 原样进 MPItem[{Item:…}]。
+
+    **2026-09-07 升 v5**(v4.2 同日退役):header 换成与 MP_ITEM 同款的
+    businessUnit 制**三字段封闭**,依据是官方规范原件 refdata/specs/ 那一份
+    (`MPItemFeedHeader` required 三个 + additionalProperties=false)。v4.2 的
+    `{processMode: REPLACE, subset, sellingChannel}` 在 v5 里是三个未知字段 ——
+    REPLACE 语义没变(同 GTIN + 新 SKU 原地换码,2026-09-06 所有者实测),它只是
+    不再由 header 里的一个开关表达。逐字对规范的守门在 tests/test_match_spec_v5.py。
+    """
+    item = _migrate_item()
+    p = feeds.build_payload("MP_ITEM_MATCH", [item])
+    assert p["MPItem"] == [{"Item": item}]
+    assert p["MPItemFeedHeader"] == {
+        "businessUnit": "WALMART_US", "locale": "en",
+        "version": resources.FEED_SPEC_VERSIONS["MP_ITEM_MATCH"]}
+    assert "processMode" not in json.dumps(p)   # v4.2 的 header 三件套已退役
+    assert p["MPItem"][0]["Item"]["productIdentifiers"] == {
+        "productIdType": "GTIN", "productId": "00121678236703"}
+    assert "SkuUpdate" not in json.dumps(p)     # 通道不需要这个开关字段
+    # 切片限额已登记,本批不新增 feedType
+    assert feeds._SLICE_LIMITS["MP_ITEM_MATCH"] == (1000, 24_000_000)
+    assert feeds._SLICE_LIMITS["MP_MAINTENANCE"] == (1000, 24_000_000)

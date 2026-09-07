@@ -470,7 +470,9 @@ class FakeCursor:
         self._rows = []
 
     def executemany(self, sql, seq):
-        self.conn.executed.append((sql, list(seq)))
+        seq = list(seq)
+        self.conn.executed.append((sql, seq))
+        self._rows = seq            # rowcount = 全部受影响(psycopg3 累计语义的假)
 
     @property
     def rowcount(self):
@@ -514,10 +516,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(wf.feishu, "list_records",
                         lambda t: [_rec(name="甲", m="FBA", lo=0, hi=1000, rate=1.0)])
 
-    def fake_update(table, key, desired):
+    def fake_update(desired, *, force=False):
         calls["updates"] = desired
-        return len(desired), []
-    monkeypatch.setattr(wf.feishu, "update_by_key", fake_update)
+        calls["force"] = force
+        return len(desired), [], 0
+    monkeypatch.setattr(wf.order_center, "update_audit_columns", fake_update)
 
     # 采集器一律不真连:记录每次提交的 (批次名, [(asin, 邮编)], 是否要截图)
     calls["batches"] = []
@@ -598,6 +601,37 @@ def test_run_end_to_end_pass(wired, monkeypatch):
     assert payload[f.price_cap] == 75.0
     # 「建议采购日期」属人工域,载荷里绝不能出现
     assert "建议采购日期" not in payload
+
+
+def test_run_repush_forces_full_rewrite(wired, monkeypatch):
+    """-p repush=1 ⇒ 回写无视指纹(人工改坏了程序列时把程序值刷回去)。"""
+    wf, calls = wired
+    conn = FakeConn({
+        "audit_status IS NOT NULL": (
+            ["order_line_id", "audit_status", "audit_detail"],
+            [("PO1|SKU1", rules.PASS, {"note": "ok"})]),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    wf.run({"repush": "1"})
+    assert calls["force"] is True
+    wf.run({})
+    assert calls["force"] is False
+
+
+def test_run_summary_reports_fingerprint_skips(wired, monkeypatch):
+    """指纹一致跳过的行数要进摘要:这是"写放大治理在起作用"的唯一可见证据。"""
+    wf, calls = wired
+    conn = FakeConn({
+        "audit_status IS NOT NULL": (
+            ["order_line_id", "audit_status", "audit_detail"],
+            [("PO1|SKU1", rules.PASS, {"note": "ok"}),
+             ("PO2|SKU1", rules.PASS, {"note": "ok"})]),
+    })
+    monkeypatch.setattr(wf.db, "pg_conn", lambda: conn)
+    monkeypatch.setattr(wf.order_center, "update_audit_columns",
+                        lambda desired, *, force=False: (1, [], 1))
+    summary = wf.run({})
+    assert "飞书回写 1 行,指纹一致跳过 1" in summary
 
 
 def test_run_skips_phishing_marked_rows(wired, monkeypatch):
@@ -901,6 +935,49 @@ def test_snapshots_picks_newest_when_params_differ(wired, monkeypatch):
         conn = FakeConn({"FROM catalog.latest_snapshot": (cols, order)})
         snaps = wf._snapshots(conn, [{"sku": "B0TEST0001"}])
         assert snaps[("B0TEST0001", "10001")]["amz_price"] == 99
+
+
+def test_snapshots_keyed_by_line_asin(wired, monkeypatch):
+    """快照按 catalog.latest_snapshot.asin 存 —— 拿不透明码去查恒空 ⇒ 每一行
+    都「无快照」⇒ 全判待人工 + 每轮为它们烧一次采集配额。必须与 judge 用
+    同一个 line_asin,否则 snaps 的键与判定算出的 asin 对不上(静默错位)。"""
+    wf, _ = wired
+    cols = ["asin", "price", "stock_count", "delivery_days", "shipping",
+            "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
+            "scraped_at", "title"]
+    row = ("B0TEST0001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001"},
+           {"is_fba": "FBA"}, "ok",
+           datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc), "T")
+    conn = FakeConn({"FROM catalog.latest_snapshot": (cols, [row])})
+    line = {"sku": "AK7QM2X9RT4W", "asin": "B0TEST0001"}
+    snaps = wf._snapshots(conn, [line])
+    assert snaps[("B0TEST0001", "10001")]["amz_price"] == 10
+    assert conn.executed[0][1]["asins"] == ["B0TEST0001"]   # 推的是真 ASIN
+
+
+def test_scrape_fails_keyed_by_line_asin(wired):
+    """ops.audit_scrape 的键是 (asin, zip):拿不透明码查恒空 ⇒ scrape_fail
+    永远是 None ⇒「重采也没用」那类失败拿不到终局结论,行永远挂待采集。"""
+    wf, _ = wired
+    conn = FakeConn({"FROM ops.audit_scrape": (["asin", "zip5", "error_type"],
+                                               [("B0TEST0001", "10001",
+                                                 "variant_offset")])})
+    fails = wf._scrape_fails(conn, [{"sku": "AK7QM2X9RT4W",
+                                     "asin": "B0TEST0001",
+                                     "postal_code": "10001"}])
+    assert fails == {("B0TEST0001", "10001"): "variant_offset"}
+
+
+def test_want_list_carries_real_asins(wired, monkeypatch):
+    """三处取数必须同源:want 清单里混进不透明码的话,_push_scrape 推过去
+    采集器直接丢弃,而摘要里的待采数照报 —— 静默卡死的典型形状。"""
+    wf, _ = wired
+    monkeypatch.setattr(wf, "_snapshots", lambda conn, lines: {})
+    monkeypatch.setattr(wf, "_scrape_fails", lambda conn, lines: {})
+    line = dict(LINE, sku="AK7QM2X9RT4W", asin="B0TEST0001",
+                postal_code="10001")
+    _, want = wf._judge_all(None, [line], SUPPLIERS, set())
+    assert want == [("B0TEST0001", "10001")]
 
 
 def test_sql_selects_every_column_the_rules_read():
@@ -1309,9 +1386,37 @@ def test_save_writes_detail_json(wired, monkeypatch):
     assert wf._save(conn, [(LINE, res)]) == 1
     sql, payload = conn.executed[-1]
     assert "UPDATE orders.order_lines" in sql
-    status, detail_json, key = payload[0]
-    assert status == rules.PASS and key == "PO1|SKU1"
-    assert json.loads(detail_json)["note"] == res.note
+    row = payload[0]
+    assert row["status"] == rules.PASS and row["id"] == "PO1|SKU1"
+    assert json.loads(row["detail"])["note"] == res.note
+
+
+def test_save_skips_rows_whose_verdict_did_not_change():
+    """结论与明细都没变的行不写(2026-09-07)。
+
+    待人工行每小时重判,原先无条件 UPDATE 连 updated_at 一起刷;销售投影拿
+    updated_at 当「拉取时间」进指纹 ⇒ 这些行每小时都被重推一遍飞书。
+    守卫必须**两列都比**:只比 status 的话,同为待人工但原因变了的行会漏写。
+    """
+    from workflows import order_audit as wf
+    sql = wf._SAVE_SQL
+    assert "audit_status IS DISTINCT FROM %(status)s" in sql
+    assert "audit_detail IS DISTINCT FROM %(detail)s::jsonb" in sql
+    assert "updated_at = now()" in sql        # 真变了才刷,这是投影指纹的依据
+
+
+def test_save_reports_only_rows_actually_written(wired):
+    """返回值是真写入的行数(rowcount),不是判了多少行。"""
+    wf, _ = wired
+    conn = FakeConn({})
+    res = rules.judge(LINE, _snap(), SUPPLIERS, set())
+
+    class ZeroCursor(FakeCursor):
+        @property
+        def rowcount(self):
+            return 0
+    conn.cursor = lambda: ZeroCursor(conn)
+    assert wf._save(conn, [(LINE, res)]) == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1332,11 +1437,33 @@ def test_judge_unusable_zip_is_not_called_pending_scrape():
 
 
 def test_judge_non_asin_sku_is_not_called_pending_scrape():
-    """SKU 不是 ASIN 形态 ⇒ 采集侧建任务时就丢弃,推了也白推。"""
+    """解不出 ASIN ⇒ 采集侧建任务时就丢弃,推了也白推。
+
+    措辞 2026-09-02 改口:切码后运营看到的是 12 位随机串,说"不是 ASIN 形态"
+    等于没说 —— 得告诉他登记簿里没这条。
+    """
     res = rules.judge(dict(LINE, sku="OLD-CUSTOM-001"), None, SUPPLIERS, set())
     assert res.status == rules.MANUAL
     assert res.rescrape is False
-    assert "ASIN 形态" in res.note and "待采集" not in res.note
+    assert "解不出 ASIN" in res.note and "待采集" not in res.note
+
+
+def test_line_asin_prefers_the_column_then_falls_back_to_shape():
+    """订单链取 ASIN 的**唯一**入口:以 orders.order_lines.asin 列为准
+    (登记簿那一跳发生在写入侧),NULL 的存量行才回落形态提取。"""
+    assert rules.line_asin({"asin": " b0abcdefgh ", "sku": "AK7QM2X9RT4W"}) \
+        == "B0ABCDEFGH"
+    assert rules.line_asin({"sku": "XKJ-B0GXX75JN5-39.98"}) == "B0GXX75JN5"
+    assert rules.line_asin({"asin": None, "sku": "裸订货号"}) == ""
+    assert rules.line_asin({}) == ""
+
+
+def test_judge_uses_the_asin_column_when_sku_is_opaque():
+    """切码后 sku 永远不像 ASIN —— 判定侧读 asin 列,这批行才不会每一单
+    都判"待人工"(D-0b-2:本批次唯一的判定口径变化)。"""
+    res = rules.judge(dict(LINE, sku="AK7QM2X9RT4W", asin="B0TEST0001"),
+                      None, SUPPLIERS, set())
+    assert "解不出 ASIN" not in res.note
 
 
 def test_judge_every_branch_returns_a_verdict():
@@ -1382,7 +1509,8 @@ def test_detail_keeps_numbers_as_numbers(wired):
                                   "scraped_at": datetime(2026, 8, 10,
                                                          tzinfo=timezone.utc)})
     wf._save(conn, [({"order_line_id": "PO1|SKU1"}, res)])
-    stored = json.loads([a for s_, a in conn.executed if s_.startswith("UPDATE")][0][0][1])
+    stored = json.loads([a for s_, a in conn.executed
+                         if s_.lstrip().startswith("UPDATE")][0][0]["detail"])
     assert stored["amz_price"] == 25.99
     assert isinstance(stored["amz_price"], float)      # 不是 "25.99"
     assert isinstance(stored["scraped_at"], str)       # datetime 仍转字符串

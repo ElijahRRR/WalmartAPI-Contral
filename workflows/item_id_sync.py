@@ -98,13 +98,23 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
         try:
             data = reports.create_report_request(store, ir.REPORT_TYPE, ir.REPORT_VERSION)
         except reports.ReportQuotaError as e:
+            # 沃尔玛 429,或本地桶已记过这小时那一枚:本轮结局,不抛、不补试
+            # (2026-09-07 生产实见:抛出去进串行补试,在创建桶里睡 3595 秒)
             with db.pg_conn() as conn:
                 ir.mark_error(conn, row_id, f"quota: {e}")
             return _result(name, "quota", note=str(e))
+        except reports.ReportRequestError as e:
+            with db.pg_conn() as conn:
+                ir.mark_error(conn, row_id, f"create: {e.status}: {e}")
+            if e.status is not None and 400 <= e.status < 500:
+                # 请求形状被拒(415/400…):确定性错误,重试只会再被拒一次
+                return _result(name, "error",
+                               note=f"创建被沃尔玛拒绝({e.status},请求形状问题,重试无用):{e}")
+            raise                       # 5xx / 网络未达:交串行补试
         except Exception as e:
-            # 网络类异常上抛给串行补试;台账那行留 pending,补试进来若 POST 其实
-            # 已到沃尔玛(响应丢了),requestId 我们不知道 —— 15 分钟后判 orphan,
-            # 下一小时重建一份;报表本身不改商品,重复一份无实害
+            # 网络类异常上抛给串行补试;补试进来若 POST 其实已到沃尔玛(响应丢了),
+            # requestId 我们不知道 —— 本地桶已记一枚,补试会得到 quota 结局;
+            # 台账那行转 error,下一小时(或明天)重建一份
             with db.pg_conn() as conn:
                 ir.mark_error(conn, row_id, f"create: {e.__class__.__name__}: {e}")
             raise

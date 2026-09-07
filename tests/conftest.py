@@ -18,6 +18,8 @@ def _rate_buckets_in_memory(monkeypatch):
     """
     from api import _client
     monkeypatch.setattr(_client, "_acquire_pg", _client._acquire_mem)
+    monkeypatch.setattr(_client, "_try_pg", _client._try_mem)
+    monkeypatch.setattr(_client, "_release_pg", _client._release_mem)
 
 
 @pytest.fixture(autouse=True)

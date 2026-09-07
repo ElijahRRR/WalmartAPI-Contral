@@ -125,7 +125,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/orders/{purchaseOrderId} | 5000/min(tsv:119「An order」) | 新登记(2026-09-02) | 3000/min,与列表分桶(orders.get);探针 4:并发 8、550 次/69s 无 429 |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
-| POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天 | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),POST 不自动重试,429 = 本轮放弃该店 |
+| POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天;**body 必须是 JSON 对象**(不带 body 回 415,2026-09-07 实证,缺省发 `{}`) | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),令牌走 `rate_try_acquire` 不睡等;POST 不自动重试;429 / 本地桶已满 = 本轮放弃该店;请求形状被拒的 4xx 还令牌 |
 | GET /v3/reports/reportRequests(列表) | 200/min | 新登记(2026-09-07) | 180/min(reports.list);**轮询用它**,按 requestId 匹配 |
 | GET /v3/reports/reportRequests/{id}(单查) | **20/hour** | 旧代码与 downloadReport 共用 55/min 桶、20 秒轮询一次 ⇒ 必 429 | 18/hour 持久桶(reports.status),只作兜底 |
 | GET /v3/reports/downloadReport | **20/hour**;响应 downloadURL + downloadURLExpirationTime(时效长度未公布) | 同上 | 18/hour 持久桶(reports.download) |

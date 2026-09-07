@@ -597,19 +597,20 @@ feedType 与两个桶都已收录,只补注释与测试)。
 第三块(本次)**工作流** `workflows/sku_migrate.py`(DANGEROUS=True、SUPPORTS_STORE=True、
 `-p store=` **必填**、**永不进调度**):
 
-- **三态判据表**(定案只信观测,回执成功单独不定案):
+- **判据表**(定案只信观测,回执成功单独不定案;2026-09-07 起 `double` 也是一个持久状态):
 
   | 判词 | 证据组合 | 后果 |
   |---|---|---|
   | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + `dispositions.rekey_suggested` + `drop_node_rows` + 台账 confirmed |
   | `rolled_back` | 回执 `failed`;或**观测新鲜**且新码超 `OBSERVE_HOURS`(24h)仍未出现;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
   | `stalled` | 超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错) |
-  | (不定案) | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:只告警不处置,摘要**首行**点名。节奏闸是它的主要防线 |
+  | `double` | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:台账落持久状态 `double`(2026-09-07 所有者定稿,见 §9.14;此前是「留 pending 只告警」),摘要逐条 + **首行**点名,**不自动处置**。它**不进节奏闸的 open**(后续改码照发)、**不许再开第二条台账**(候选判据含 `'double'`),但每轮仍参与定案 —— 旧码哪天缺席就自动转 `confirmed`。身份层不动 |
   | (不定案) | POST `outcome=unknown` | **保持 pending 不回滚**(决策 F) |
   | (不定案) | pending 但 `submitted_at` 为空(**落库未提交**) | 进程死在 POST 前后、或提交当场抛异常。**只点名不自动定案**:从台账上分不出「确定没发」与「不知道到没到」。人工核:先 `feed_poll` 让 `ops.feed_log` 那条落定,再去后台看这个 Product ID 现在挂的是哪个 SKU |
 
 - **节奏硬闸**(`_stage_cap`,把口头节奏变成代码):该店还有 pending/stalled ⇒ 本轮
-  上限 0(只定案不提交);零 confirmed ⇒ 1;<10 ⇒ 10;≥10 ⇒ 按 `-p limit`。
+  上限 0(只定案不提交;**double 不计** —— 2026-09-07 所有者定稿,见 §9.14);
+  零 confirmed ⇒ 1;<10 ⇒ 10;≥10 ⇒ 按 `-p limit`。
   **`-p limit=` 只能收紧**;~~再叠一层配额留量硬顶 `FEEDS_PER_STORE_PER_RUN × ITEMS_PER_FEED`~~
   **2026-09-07 删除**(所有者纠正,见 §9.12「去掉每轮 1000 条自设上限」):那是形态 A
   时代为 MP_MAINTENANCE 桶自设的,不是官方限制。整店一轮发完,上限只有**速率桶**
@@ -1695,3 +1696,85 @@ SELECT w.store, w.sku, w.variant_group_id, g.family_key
   且 `catalog.variant_groups` 里这一族**只有一行**。
 - **存量家族不回改**:挑一个已在架的 `vg_…` 家族补上一个新成员,新成员发出去的仍是
   那个 `vg_…`,登记表里这一族的 `group_code` 也是它(不是新抽的 G 号)。
+
+### 9.14 同店双挂不拦节奏闸(2026-09-07,所有者决定)
+
+**所有者原话**:
+
+> 不行,它就是存在于后台,删除也删除不掉,严重耽误的项目推进速度。逻辑改一下,
+> 如果双挂,不应该影响我们后续的修改计划,双挂的就让他继续挂着,等到我其他的
+> 处理完了,我再回头处理他,中途不重复提交这种双挂的就可以。
+
+**现场**:A131吕灿荣 有 2 条改码被判成「同店双挂」(新码与旧码**同时在架**:
+`B078G54MD6→AVCR7Y3X2JFZ`、`B07BFQNMNG→AJSSQRJBRSN6`)。改前双挂只告警、台账行
+**留 pending**,于是 `_stage_cap` 的节奏闸把它们数成"该店还有 2 条改码未定案",
+整店上限压成 **0** —— 后面 500 条一条都发不出去。而所有者在 Seller Center 后台
+**删旧码也删不掉**(僵尸列表:列表接口把已删档案照旧吐回,单条 GET 404 而列表
+PUBLISHED,见 `docs/backlog.md` §十三,本次**不碰**)。两件事叠起来,那 2 条删不掉
+的行等于把整店改码永久停摆。
+
+**为什么改**:节奏闸的原意是「上一批的账没清就别发下一批」—— 账没清指的是
+"我们还不知道结果"(pending)或"判不出、要人看"(stalled)。双挂**不是不知道**:
+我们知道得很清楚(新码上去了、旧码没下来),只是**处置只能人工**(写操作永不
+自动兜底,本工作流不许自动去删那条旧 listing)。拿一条已经知道结论、而且暂时
+删不掉的行去拦住其余全部改码,是把"要人回头处理一条"放大成"整店停工"。
+
+**改了什么**(四点,都在 `workflows/sku_migrate.py`):
+
+1. **台账新增持久状态 `double`**(常量 `_DOUBLE`)。`_settle` 判词为 double 且真跑时,
+   走新 SQL `_SQL_LEDGER_DOUBLE` 把该行 status 写成 `double` 并留 error 文案(仿
+   `_SQL_LEDGER_STALLED`);**幂等**(`WHERE id = … AND status <> 'double'`,配合
+   `_SQL_OBSERVE` 选出的当前 status,已是 double 的行连 UPDATE 都不发)。
+   `--dry-run` 只报 `[DRY-RUN] 将记 double …`,一行库都不写。
+   **不写 settled_at**:double 不是终态,是"挂在那儿等人回头处置"的过程态。
+2. **double 行继续参与每轮定案**:`_SQL_OBSERVE` 的面从 `status = 'pending'` 改成
+   `status IN ('pending', 'double')`,并把 `m.status` 选出来供幂等判断。
+   `_verdict` 的**六条规则与顺序一字未改** —— 所有者哪天在后台把旧码删掉、
+   catalog_sync 记了缺席,下一轮自然落到规则 (a)「新码在架 ∧ 旧码缺席」给
+   confirmed,弃旧码 / UPC 改标 / 处置迁键 / 节点库存清行全走现有定案路径,
+   **不需要任何新逻辑**;仍是双挂就仍判 double(不再写库,只计数)。
+3. **节奏闸不数 double**:`_SQL_STAGE` 的 `open` 仍是
+   `count(*) FILTER (WHERE status IN ('pending', 'stalled'))` —— 不含 double。
+   这一条本来就成立,现在把"这是所有者的决定"写进了 SQL 注释与 `_stage_cap`
+   的 docstring,并加了守门用例钉住 `'double'` 不在那个 FILTER 里。
+   **`stalled` 继续拦**(所有者没说放它:超期判不出是"我们不知道发生了什么")。
+4. **double 的旧码永不重复提交**:候选判据「无未了结改码台账」的
+   `m.status IN ('pending', 'confirmed', 'stalled')` 加上 `'double'`。
+   ⚠ 部分唯一索引 `sku_migrations_open_uidx`(`WHERE status='pending'`)从此
+   **不再覆盖 double 行**,这是**可接受的取舍**:防第二条台账靠的就是这条候选
+   判据(索引只保「同一 (店,旧码) 不许有两条 pending」那一半),已写进
+   `refdata/schema.sql` 与 `docs/db_schema.md` 的注释。
+
+**摘要文案**:逐条告警改成「⚠ 同店双挂 {旧码→新码}:新码与旧码同时在架 —— 已记
+double,**不拦后续提交、不会重复提交**,回头人工处置」;首行的「⚠ 同店双挂 N」
+**保留** —— 所有者要回头处理它们,首行那个数就是待办清单。`_stage_cap` 那句
+「该店还有 N 条改码未定案(pending/stalled)」不变。
+
+**执行序为什么当轮就生效**:`run()` 里 `_settle` 先跑、`_stage_cap` 后读,而
+`_settle` 的每一次写都走**自己的短事务**(`db.pg_conn()` 另开连接,退出即 commit),
+与本轮那条只读连接不是同一个事务;PG 默认 READ COMMITTED,所以后面那条
+`_SQL_STAGE` 看得见刚 commit 的 double。⇒ A131 那 2 条会在**同一次运行**里走完
+「记 double → open 少 2 条 → 节奏闸放开 → 当轮提交后面那批」,不必多等一轮。
+
+**不变的是什么**(别顺手改掉):
+
+- **身份层一个字不动**:`catalog.listing_sources` 的旧行仍是 `replaced_by=新码` 的
+  在途态、新码仍是活码 —— 换的只是过程账的状态,不是身份的结论。不弃码、不复活。
+- **`_verdict` 的六条规则与优先级不动**(顺序即语义)。
+- **stalled 仍拦节奏闸**。
+- **不加任何自动处置双挂的动作**:不自动删旧 listing、不自动补交、不换方法重试
+  (写操作永不自动兜底;换方法重试 = 重复提交制造机)。
+
+**回头处置的操作**(所有者那天有空时):
+
+```bash
+# ① 在 Seller Center 后台把旧码那条 listing 删掉(僵尸列表问题另议,backlog §十三)
+python cli.py catalog_sync -p store=A131吕灿荣            # ② 让观测记下旧码缺席
+python cli.py sku_migrate -p store=A131吕灿荣 -p settle_only=1   # ③ 自动转 confirmed
+```
+
+```sql
+-- 现在还有哪些双挂等着回头处置
+SELECT store, old_sku, new_sku, feed_id, error
+  FROM listing.sku_migrations WHERE status = 'double';
+```

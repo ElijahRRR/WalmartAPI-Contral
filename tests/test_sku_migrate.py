@@ -333,11 +333,31 @@ def test_opaque_and_match_rows_are_excluded_by_the_candidate_sql():
     assert sm.SOURCE_TYPES == ("amz",)                    # match 天然不在候选面
     assert "AND NOT (" in sql and "w.sku ~ " in sql       # 形态判据来自 codec 常量
     assert sm.sku_codec.OPAQUE_SQL_PREDICATE.format(col="w.sku") in sql
-    # 未了结的改码台账挡住重复发起(崩溃重入不会开第二条 pending)
-    assert "m.status IN ('pending', 'confirmed', 'stalled')" in sql
+    # 未了结的改码台账挡住重复发起(崩溃重入不会开第二条 pending)。
+    # ⚠ `'double'` 是 2026-09-07 加的(所有者定稿 §9.14):双挂行**不再拦节奏闸**,
+    # 于是这条判据成了它挡重复提交的**唯一**一道 —— 少了它,同一个旧码下一轮又会
+    # 被选进候选面、又 mint 一个新码、又发一条 MP_ITEM_MATCH,一条双挂变三挂,
+    # 而且回执全绿、摘要正常。部分唯一索引 sku_migrations_open_uidx 只管 pending,
+    # 从此不覆盖 double 行,指望不上。
+    assert "m.status IN ('pending', 'confirmed', 'stalled', 'double')" in sql
     # Product ID 取观测值,不取 UPC 池;**优先 GTIN**(所有者实测的模板就是 GTIN 14 位)
     assert "coalesce(w.gtin, w.upc)" in sql and "upc_pool" not in sql
     assert "WHEN w.gtin IS NOT NULL THEN 'GTIN'" in sql
+
+
+def test_a_double_row_never_becomes_a_candidate_again():
+    """双挂的旧码**永不重复提交**:候选判据「无未了结改码台账」含 'double'。
+
+    所有者 2026-09-07:「中途不重复提交这种双挂的就可以。」double 行不占节奏闸,
+    部分唯一索引 sku_migrations_open_uidx(WHERE status='pending')也不覆盖它 ——
+    台账侧就靠这一条(登记簿侧另有「未在改」:双挂行的旧行仍 replaced_by=新码)。
+    选取与解释两处同源(与其余判据同一条纪律)。
+    """
+    cond = next(sql for n, _w, sql in sm._CONDS if n == "无未了结改码台账")
+    assert "'double'" in cond
+    assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY
+    why = next(w for n, w, _sql in sm._CONDS if n == "无未了结改码台账")
+    assert "double" in why and "不许开第二条" in why      # 落选要说得出人话
 
 
 def test_candidate_with_an_inflight_feed_is_skipped_and_named():
@@ -727,12 +747,16 @@ def test_observe_and_stale_hours_are_overridable_per_run():
 #  W3 · 定案的后果(五处写)
 # ══════════════════════════════════════════════════════════════════════════════
 
+#: `_SQL_OBSERVE` 的列(顺序与 SQL 逐字对齐)。`status` 是 2026-09-07 加的:
+#: 观测面从 pending 扩成 **pending ∪ double**(§9.14),`_settle` 要靠它分辨
+#: "这轮刚判成双挂"与"上轮已经是 double"(后者一条 UPDATE 都不该发)。
+_OBS_COLS = ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
+             "submitted_at", "status", "new_present", "old_gone", "fresh"]
+
+
 def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
     calls = calls if calls is not None else []
-    read = _Conn([("FROM listing.sku_migrations m", (
-                      ["id", "old_sku", "new_sku", "source_type", "source_key",
-                       "feed_id", "submitted_at", "new_present", "old_gone",
-                       "fresh"], obs_rows))])
+    read = _Conn([("FROM listing.sku_migrations m", (_OBS_COLS, obs_rows))])
     tx = _Conn(log=calls, tag="tx")
     monkeypatch.setattr(sm.db, "pg_conn", lambda *a, **k: tx)
     monkeypatch.setattr(sm.feed_track, "item_results",
@@ -753,7 +777,7 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
 
 
 _OBS_COLS_CONFIRM = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
-                     "F1", NOW - timedelta(hours=2), True, True, True)
+                     "F1", NOW - timedelta(hours=2), "pending", True, True, True)
 
 
 def test_confirmed_retags_upc_rekeys_dispositions_and_drops_node_rows(monkeypatch):
@@ -784,7 +808,7 @@ def test_confirmed_never_touches_the_listing_sheet(monkeypatch):
 
 def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), False, True, True)
+           NOW - timedelta(hours=2), "pending", False, True, True)
     read, calls, _tx = _settle_wired(
         monkeypatch, [row], receipts={"AAAAAAAAAAAA": ("failed", "ERR_9")})
     monkeypatch.setattr(sm.feeds, "submit_feed",
@@ -795,14 +819,101 @@ def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
     assert any("未自动补交" in ln for ln in lines)
 
 
+#: 一条"新码在架、旧码也在架"的观测行(同店双挂)。`status` 是它当前的台账状态。
+def _double_row(status="pending", rid=1):
+    return (rid, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+            NOW - timedelta(hours=2), status, True, False, True)
+
+
 def test_double_listing_warns_and_settles_nothing(monkeypatch):
-    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), True, False, True)
-    read, calls, _tx = _settle_wired(monkeypatch, [row])
+    """同店双挂:落**持久状态 double**,但**不定案**(2026-09-07 所有者定稿,§9.14)。
+
+    所有者原话:「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,
+    中途不重复提交这种双挂的就可以。」所以这一条钉三件:
+      ① 台账写 double(新 SQL `_SQL_LEDGER_DOUBLE`,带 error 文案,不写 settled_at);
+      ② **身份层一个字不动** —— 不 confirm、不 rollback,`settle_replacement` 一次
+         都不调(旧行仍 replaced_by=新码的在途态,新码仍是活码);
+      ③ 摘要那句要把"不拦后续、不会重复提交"说给人听(否则所有者看见 ⚠ 会以为
+         又卡住了,而这次它恰恰不卡)。
+    """
+    read, calls, tx = _settle_wired(monkeypatch, [_double_row()])
     counts, lines = _settle_at(sm, read, True)
     assert counts["double"] == 1 and counts["confirmed"] == 0
+    # ② 身份层没被碰过
     assert not [c for c in calls if isinstance(c, tuple) and c[0] == "settle"]
+    # ① 过程账写了 double,而且**不写 settled_at**(double 不是终态)
+    wrote = [(sql, args) for sql, args in tx.sqls if "status = 'double'" in sql]
+    assert len(wrote) == 1, tx.sqls
+    assert "settled_at" not in wrote[0][0]
+    assert wrote[0][1]["id"] == 1 and wrote[0][1]["error"]
+    assert "status <> 'double'" in wrote[0][0]          # 幂等半句在 SQL 里
+    # ③ 人话
+    ln = next(ln for ln in lines if "同店双挂" in ln)
+    assert "已记 double" in ln
+    assert "不拦后续提交" in ln and "不会重复提交" in ln
+
+
+def test_a_row_that_is_already_double_is_not_written_again(monkeypatch):
+    """上一轮已经记成 double 的行,这一轮仍判 double ⇒ **一条 UPDATE 都不发**。
+
+    双挂要等所有者回头处置,期间每天每轮都会重判一次;不挡住就是每轮一条无谓的
+    写(白写 WAL、把 error 刷成新时间的同一句话),而且看不出来。计数照旧要有 ——
+    首行的「⚠ 同店双挂 N」是所有者的待办清单,不许因为"没写库"就漏报。
+    """
+    read, calls, tx = _settle_wired(monkeypatch, [_double_row(status="double")])
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["double"] == 1                       # 计数照旧
+    assert not tx.sqls and "open:tx" not in calls      # 连写事务都没开
     assert any("同店双挂" in ln for ln in lines)
+
+
+def test_double_in_dry_run_writes_nothing(monkeypatch):
+    """dry-run:只报「将记 double」,一行库都不写(与 _settle 其余四处写同纪律)。"""
+    read, calls, tx = _settle_wired(monkeypatch, [_double_row()])
+    counts, lines = _settle_at(sm, read, False)
+    assert counts["double"] == 1
+    assert not tx.sqls and "open:tx" not in calls
+    assert any("[DRY-RUN] 将记 double" in ln for ln in lines)
+    assert not any("已记 double" in ln for ln in lines)
+
+
+def test_a_double_row_turns_into_confirmed_once_the_old_code_is_gone(monkeypatch):
+    """所有者回头把旧码删掉之后:**不需要新逻辑**,下一轮自动走 confirmed。
+
+    这条是 §9.14 整个设计的收口 —— double 行仍在 `_SQL_OBSERVE` 的面上(pending ∪
+    double),`_verdict` 的六条规则一字未改,旧码一缺席就落到规则 (a)。漏了它的
+    表现是:所有者手工清完了,而台账永远停在 double,旧码永不弃用、UPC 永不释放,
+    **而且没有任何东西会报**。
+    """
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+           NOW - timedelta(hours=2), "double", True, True, True)   # 旧码已缺席
+    read, calls, _tx = _settle_wired(monkeypatch, [row])
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1 and counts["double"] == 0
+    assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "confirmed") in calls
+
+
+def test_the_observe_face_covers_double_rows_too():
+    """`_SQL_OBSERVE` 取 **pending ∪ double**,并把 status 选出来供幂等判断。"""
+    assert "m.status IN ('pending', 'double')" in sm._SQL_OBSERVE
+    assert "m.status = 'pending'" not in sm._SQL_OBSERVE
+    assert "m.status," in sm._SQL_OBSERVE
+    assert sm._DOUBLE == "double"
+
+
+def test_double_rows_are_not_counted_by_the_stage_gate():
+    """守门:节奏闸的 `open` **不含 double**(2026-09-07 所有者决定,§9.14)。
+
+    双挂的旧码在沃尔玛后台删不掉(僵尸列表,backlog §十三),数进 open 就是拿一条
+    删不掉的行把整店改码永久停摆(A131吕灿荣:2 条压着 500 条一条都发不出去)。
+    加回来不会报错 —— 表现是每轮摘要都说"该店还有 N 条改码未定案",而所有者以为
+    是自己没清账。**stalled 仍在里面**(所有者没说放它)。
+    """
+    q = sm._SQL_STAGE
+    filt = q[q.index("FILTER"):q.index("AS open")]
+    assert "'pending'" in filt and "'stalled'" in filt
+    assert "'double'" not in filt, filt
+    assert "§9.14" in q                       # 是所有者的决定,写在 SQL 注释里
 
 
 def test_settle_in_dry_run_writes_nothing(monkeypatch):
@@ -871,10 +982,7 @@ def test_the_first_line_no_longer_carries_an_inventory_restore(monkeypatch):
     「⚠ 库存回写失败」;整轮定案一次受管仓表、一次沃尔玛写接口都不碰。"""
     _wire(monkeypatch)
     _read_conn(monkeypatch, [
-        ("FROM listing.sku_migrations m", (
-            ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
-             "submitted_at", "new_present", "old_gone", "fresh"],
-            [_OBS_COLS_CONFIRM])),
+        ("FROM listing.sku_migrations m", (_OBS_COLS, [_OBS_COLS_CONFIRM])),
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(50, 0)])),
         ("FROM catalog.walmart_items w", (_CAND_COLS, [])),
@@ -1202,14 +1310,12 @@ def test_first_line_carries_the_four_warnings(monkeypatch):
     _wire(monkeypatch, dupes=[{"store": "T1", "po_id": "PO1", "line_number": 1,
                                "n": 2, "skus": []}])
     read = _read_conn(monkeypatch, [
-        ("FROM listing.sku_migrations m", (
-            ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
-             "submitted_at", "new_present", "old_gone", "fresh"],
+        ("FROM listing.sku_migrations m", (_OBS_COLS,
             [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-              NOW - timedelta(hours=200), True, False, True),
+              NOW - timedelta(hours=200), "pending", True, False, True),
              (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
-              datetime.now(timezone.utc) - timedelta(hours=200), False, False,
-              False)])),
+              datetime.now(timezone.utc) - timedelta(hours=200), "pending",
+              False, False, False)])),
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(0, 2)])),
     ])
@@ -1291,9 +1397,7 @@ def test_a_blocked_preflight_still_settles_but_never_submits(monkeypatch):
 def test_settle_only_settles_and_never_submits(monkeypatch):
     _wire(monkeypatch)
     _read_conn(monkeypatch, [
-        ("FROM listing.sku_migrations m", (
-            ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
-             "submitted_at", "new_present", "old_gone", "fresh"], [])),
+        ("FROM listing.sku_migrations m", (_OBS_COLS, [])),
     ])
     monkeypatch.setattr(sm.feeds, "submit_feed",
                         lambda *a, **k: pytest.fail("settle_only 不许提交"))
@@ -1663,6 +1767,62 @@ def test_pg_stage_cap_and_observe_read_the_real_ledger(pg, monkeypatch):
     assert counts["pending"] == 1                          # 观测还没跑,不定案
 
 
+@needs_pg
+def test_pg_a_double_row_frees_the_gate_but_never_resubmits(pg, monkeypatch):
+    """同店双挂在真库上走一遍(2026-09-07 所有者定稿,§9.14)。四件:
+
+      ① 记 double(不是终态:settled_at 仍空;身份层旧行仍 replaced_by=新码);
+      ② 节奏闸**放开**(open 只数 pending/stalled)—— 这就是 A131吕灿荣 那 2 条
+         压着 500 条的解法;
+      ③ 这一条旧码**不再入候选**(不重复提交);
+      ④ 所有者回头把旧码删掉、观测记了缺席 ⇒ 下一轮**自动 confirmed**,不需要
+         任何新逻辑(`_verdict` 六条规则一字未改)。
+    """
+    _seed(pg, _OLD)
+    monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
+                        [{"outcome": "submitted", "feed_id": "FPG5",
+                          "count": len(items)}])
+    rows, _ = sm._candidates(pg, _STORE, 10)
+    sm._migrate({"name": _STORE}, rows, True)
+    new_sku = rows[0]["new_sku"]
+    # 观测:新码在架,而旧码**也**还在架(后台删不掉的那种)
+    with pg.cursor() as cur:
+        cur.execute("INSERT INTO catalog.walmart_items "
+                    "(store, sku, upc, published_status, last_seen_at) "
+                    "VALUES (%s, %s, '000000000002', 'PUBLISHED', now())",
+                    (_STORE, new_sku))
+        cur.execute("UPDATE listing.sku_migrations SET submitted_at = "
+                    "now() - interval '2 hours' WHERE store=%s", (_STORE,))
+    monkeypatch.setattr(sm.feed_track, "item_results", lambda fid: {})
+    assert sm._stage_cap(pg, _STORE, 100)[0] == 0          # 记 double 之前:pending 挡着
+    counts, _lines = sm._settle(pg, _STORE, True)
+    assert counts["double"] == 1 and counts["confirmed"] == 0
+    with pg.cursor() as cur:                                # ①
+        cur.execute("SELECT status, settled_at IS NULL, error IS NOT NULL "
+                    "FROM listing.sku_migrations WHERE store=%s", (_STORE,))
+        assert cur.fetchone() == ("double", True, True)
+        cur.execute("SELECT replaced_by, abandoned_at FROM catalog.listing_sources "
+                    "WHERE store=%s AND sku=%s", (_STORE, _OLD))
+        assert cur.fetchone() == (new_sku, None)           # 身份层一个字没动
+    assert sm._stage_cap(pg, _STORE, 100)[0] > 0           # ② 闸放开了
+    assert sm._candidates(pg, _STORE, 10)[0] == []         # ③ 不重复提交
+    # 再判一次仍是 double,而且**不重复写库**(幂等)
+    assert sm._settle(pg, _STORE, True)[0]["double"] == 1
+    # ④ 所有者回头把旧码删掉,catalog_sync 记了缺席 ⇒ 下一轮自动 confirmed
+    with pg.cursor() as cur:
+        cur.execute("UPDATE catalog.walmart_items SET missing_since = now() "
+                    "WHERE store=%s AND sku=%s", (_STORE, _OLD))
+    counts2, _lines2 = sm._settle(pg, _STORE, True)
+    assert counts2["confirmed"] == 1
+    with pg.cursor() as cur:
+        cur.execute("SELECT status, settled_at IS NOT NULL "
+                    "FROM listing.sku_migrations WHERE store=%s", (_STORE,))
+        assert cur.fetchone() == ("confirmed", True)
+        cur.execute("SELECT abandoned_reason FROM catalog.listing_sources "
+                    "WHERE store=%s AND sku=%s", (_STORE, _OLD))
+        assert cur.fetchone() == ("sku_update",)           # 弃旧码走现成路径
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  隔离与降级(一条坏行不许拖垮整轮;飞书抖动不许让身份回滚)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1674,9 +1834,9 @@ def test_one_bad_row_does_not_stop_the_others(monkeypatch):
     正被缺席抑制着,没人会报。
     """
     rows = [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-             NOW - timedelta(hours=2), True, True, True),
+             NOW - timedelta(hours=2), "pending", True, True, True),
             (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
-             NOW - timedelta(hours=2), True, True, True)]
+             NOW - timedelta(hours=2), "pending", True, True, True)]
     read, calls, _tx = _settle_wired(monkeypatch, rows)
     boom = {"n": 0}
 
@@ -1975,8 +2135,9 @@ def test_a_missing_receipt_on_a_rejected_feed_rolls_back_at_once(monkeypatch):
     """2026-09-07 A131:整 feed 被拒(feed 级 ERROR、itemsReceived=0),当时的轮询把台账
     落成 missing 而不是 failed ⇒ 旧判据要等 24h 观测反证。feed_log 已 failed 就是确凿的
     「一条都没发出去」,按 failed 当场回滚。"""
-    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
-           "F1", datetime.now(timezone.utc) - timedelta(hours=1), False, False, True)
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+           datetime.now(timezone.utc) - timedelta(hours=1), "pending",
+           False, False, True)
     _settle_wired.feed_st = {"F1": "failed"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],
@@ -1992,8 +2153,9 @@ def test_a_missing_receipt_on_a_rejected_feed_rolls_back_at_once(monkeypatch):
 def test_a_missing_receipt_on_a_processed_feed_still_waits(monkeypatch):
     """feed 正常 PROCESSED 但明细里查无这个 SKU:仍是 missing,不许当 failed 回滚。
     (_settle 用真时钟判观测期,所以夹具的 submitted_at 也按真时钟给:1 小时前。)"""
-    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
-           "F1", datetime.now(timezone.utc) - timedelta(hours=1), False, False, True)
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+           datetime.now(timezone.utc) - timedelta(hours=1), "pending",
+           False, False, True)
     _settle_wired.feed_st = {"F1": "done"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],

@@ -766,8 +766,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS retire_cooldown_open_uk
 -- 重跑幂等键、飞书同步态,这四样都不属于一张被十几个消费方 JOIN 的身份表。
 -- 两者的状态迁移必须在**同一事务**里完成(与 listing.retire_cooldown 之于
 -- catalog.upc_pool 同款分工,见上面那张表)。
--- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
--- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
+-- 状态(2026-09-07 起五个):pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
+-- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)/
+-- double(**同店双挂**:新码与旧码同时在架。2026-09-07 所有者定稿,原话「双挂的就让
+-- 他继续挂着,等到我其他的处理完了,我再回头处理他,中途不重复提交这种双挂的就可以」——
+-- 它**不进节奏闸的 open**(后续改码照发)、**不许再开第二条台账**,但每轮仍参与定案:
+-- 所有者回头把旧码删掉、catalog_sync 记了缺席,下一轮自动转 confirmed。**不是终态**,
+-- 不写 settled_at;身份层 catalog.listing_sources 一个字不动。见 docs/sku_plan.md §9.14)。
 -- sheet_synced_at:**2026-09-06 起不再使用**——改码不回写上架表(所有者定稿:
 -- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
 -- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。
@@ -782,7 +787,9 @@ CREATE TABLE IF NOT EXISTS listing.sku_migrations (
     source_key     text,
     feed_type      text NOT NULL,    -- MP_MAINTENANCE(形态 A)/ MP_ITEM(形态 B)
     feed_id        text,             -- 提交成功后落;NULL = 还没发出去
-    status         text NOT NULL DEFAULT 'pending',  -- pending/confirmed/rolled_back/stalled
+    status         text NOT NULL DEFAULT 'pending',  -- pending/confirmed/rolled_back/
+                                     -- stalled/double(double = 同店双挂,2026-09-07
+                                     -- 所有者定稿,见下面的状态说明与 sku_plan §9.14)
     submitted_at   timestamptz,
     settled_at     timestamptz,
     sheet_synced_at timestamptz,     -- 2026-09-06 起不再使用,恒 NULL(见上面头注)
@@ -790,7 +797,10 @@ CREATE TABLE IF NOT EXISTS listing.sku_migrations (
     detail         jsonb NOT NULL DEFAULT '{}'::jsonb,
     created_at     timestamptz NOT NULL DEFAULT now()
 );
--- 同 (店, 旧码) 只允许一条在途改码:崩溃重入的防重键(先落库再调接口)
+-- 同 (店, 旧码) 只允许一条在途改码:崩溃重入的防重键(先落库再调接口)。
+-- ⚠ 2026-09-07 起本索引**不再覆盖 double 行**(它们的 status 已不是 pending):
+-- 双挂行的"不许开第二条台账"改由候选判据「无未了结改码台账」(含 'double')把关,
+-- 见 workflows/sku_migrate._CONDS 与 docs/sku_plan.md §9.14。
 CREATE UNIQUE INDEX IF NOT EXISTS sku_migrations_open_uidx
     ON listing.sku_migrations (store, old_sku) WHERE status = 'pending';
 -- 新码全表唯一:一个不透明码这辈子只允许被用来替换一次

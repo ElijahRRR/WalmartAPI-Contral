@@ -35,7 +35,8 @@
       ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
       │                                                        (旧行复活,新码弃掉)
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
-      └──(新码在架 ∧ 旧码**也**在架)──▶ 留 pending + ⚠ 同店双挂(只告警,不自动处置)
+      └──(新码在架 ∧ 旧码也在架)──▶ double(记台账;不拦节奏闸、不重复提交;
+                                            旧码缺席后自动转 confirmed;人工回头处置)
 
 **身份映射写在哪(2026-09-06 所有者定稿:改码不回写上架表)**:
 新码与它的来源码这份对应关系,权威在登记簿 `catalog.listing_sources`,人看的那份
@@ -56,7 +57,9 @@
   ③ **写操作永不自动兜底**:提交失败当场回滚(换个码下轮重来),不补交、不换姿势;
      POST outcome=unknown **保持 pending**(见下「与 sku_plan 的有意出入」)。
   ④ **一店一批的硬闸在代码里**(_stage_cap):全船队零 confirmed ⇒ 上限 1;<10 ⇒ 上限 10;
-     还有 pending/stalled 未清 ⇒ 本轮只定案不提交。纪律没有默认值替你挡。
+     还有 pending/stalled 未清 ⇒ 本轮只定案不提交(**double 不计** —— 所有者
+     2026-09-07 定稿:双挂就让它挂着,不许拦住后续的改码,见 docs/sku_plan.md §9.14)。
+     纪律没有默认值替你挡。
   ⑤ **永不进调度**(registry/schedule.py 的手动清单里点名):改码按批、要人盯定案。
      **一轮发整店**:上限只有速率桶(api 层 `feeds.post.MP_ITEM_MATCH` 15/h,
      api/_client.py:238)与切片(api 层 `_SLICE_LIMITS["MP_ITEM_MATCH"]` = 1000 条 /
@@ -233,6 +236,17 @@ _PENDING = "pending"
 _CONFIRMED = "confirmed"
 _ROLLED_BACK = "rolled_back"
 _STALLED = "stalled"
+#: 同店双挂的**持久状态**(2026-09-07 所有者定稿,docs/sku_plan.md §9.14)。
+#: 所有者原话:「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,
+#: 中途不重复提交这种双挂的就可以。」在此之前双挂只告警、行留 pending,于是
+#: 被 `_stage_cap` 的节奏闸数成"未定案",整店上限压成 0 —— A131吕灿荣 那 2 条
+#: 双挂把后面 500 条改码全堵死了(旧码在沃尔玛后台删不掉,僵尸列表 backlog §十三)。
+#: 现在它是一个**过程账状态**:不进节奏闸的 open、不许再开第二条台账,但**仍每轮
+#: 参与定案**(`_SQL_OBSERVE` 取 pending ∪ double)—— 所有者哪天把旧码删掉、
+#: catalog_sync 记了缺席,下一轮 `_verdict` 自然给 confirmed,走现有定案路径。
+#: ⚠ 身份层(`catalog.listing_sources`)**一个字不动**:旧行仍 replaced_by=新码
+#: 的在途态,新码仍是活码 —— 换的只是过程账的状态,不是身份的结论。
+_DOUBLE = "double"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -313,11 +327,21 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
      "                    AND d.status IN ('suggested', 'executing')\n"
      "                    AND d.action IN ("
      + ", ".join(f"'{a}'" for a in dispositions.DESTRUCTIVE_ACTIONS) + "))"),
+    # ⚠ `'double'` 是 2026-09-07 加的(所有者定稿,§9.14 —— 「中途不重复提交这种
+    # 双挂的就可以」)。双挂行**不再拦节奏闸**,所以"这一条旧码不许再发一次"必须
+    # 由判据面自己保证:少了它,同一个旧码下一轮又会被选进候选面、又 mint 一个新码、
+    # 又发一条 MP_ITEM_MATCH,一条双挂变三挂,而且回执全绿、摘要正常。
+    # ⚠ 部分唯一索引 `sku_migrations_open_uidx`(WHERE status='pending')**不再覆盖
+    # double 行**(行的 status 已经不是 pending),这是**可接受的**:台账侧防第二条
+    # 从此就靠这条判据(索引只保「同一 (店,旧码) 不许有两条 pending」那一半);
+    # 登记簿侧还有上面那条「未在改」(双挂行的旧行仍是 replaced_by=新码 的在途态)
+    # 一起兜着 —— 两条判据同时成立才是这次改动没有留口子的原因。
     ("无未了结改码台账",
-     "该 (店, 旧码) 已有 pending/confirmed/stalled 的改码台账(不许开第二条)",
+     "该 (店, 旧码) 已有 pending/confirmed/stalled/double 的改码台账"
+     "(不许开第二条;double = 同店双挂,等人工回头处置)",
      """NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
                   WHERE m.store = w.store AND m.old_sku = w.sku
-                    AND m.status IN ('pending', 'confirmed', 'stalled'))"""),
+                    AND m.status IN ('pending', 'confirmed', 'stalled', 'double'))"""),
 )
 
 #: 点名(`-p skus=` / `-p asins=`)与排除(`-p exclude_skus=` / `-p exclude_asins=`):
@@ -400,9 +424,17 @@ WHERE store = %(store)s AND status = 'pending'
 #: 定案证据。三个布尔都由**观测**给,回执只在 _verdict 里当第二判据。
 #: fresh = 提交之后至少有一轮 catalog_sync 扫完过这家店(没有它,"旧码缺席"
 #: 可能只是我们还没去看)。
+#: ⚠ 取的是 **pending ∪ double**(2026-09-07 所有者定稿,§9.14):双挂行虽然不再
+#: 拦节奏闸,但**每轮仍要参与定案** —— 所有者在沃尔玛后台把旧码删掉之后,
+#: catalog_sync 下一轮记它缺席,这里就变成"新码在架 ∧ 旧码缺席",`_verdict`
+#: 按现有第一条规则给 confirmed,弃旧码等后果全走现成路径,**不需要新逻辑**。
+#: 漏掉 double 的表现是:所有者手工清完了,而台账永远停在 double,旧码永不弃用、
+#: UPC 永不释放,而且没有任何东西会报。
+#: `m.status` 选出来是为了 `_settle` 能分辨"这轮刚判成双挂"与"上轮已经是 double"
+#: (已是 double 的行不再重复 UPDATE)。
 _SQL_OBSERVE = """
 SELECT m.id, m.old_sku, m.new_sku, m.source_type, m.source_key, m.feed_id,
-       m.submitted_at,
+       m.submitted_at, m.status,
        (nw.sku IS NOT NULL AND nw.missing_since IS NULL)          AS new_present,
        (ow.sku IS NULL OR ow.missing_since IS NOT NULL)           AS old_gone,
        EXISTS (SELECT 1 FROM catalog.walmart_items s
@@ -410,7 +442,8 @@ SELECT m.id, m.old_sku, m.new_sku, m.source_type, m.source_key, m.feed_id,
 FROM listing.sku_migrations m
 LEFT JOIN catalog.walmart_items nw ON nw.store = m.store AND nw.sku = m.new_sku
 LEFT JOIN catalog.walmart_items ow ON ow.store = m.store AND ow.sku = m.old_sku
-WHERE m.store = %(store)s AND m.status = 'pending' AND m.submitted_at IS NOT NULL
+WHERE m.store = %(store)s AND m.status IN ('pending', 'double')
+  AND m.submitted_at IS NOT NULL
 ORDER BY m.id
 """
 
@@ -428,9 +461,19 @@ ORDER BY id
 #: (2026-09-06 A085朱丽霖 已实证),所有者 2026-09-07 定稿:后面的店不必每家
 #: 重走 1 → 10。店相关的风险另有闸:凭证/在营(闸①)、受管仓节点判不出则载荷
 #: **不带库存**(`_fc_of` fail-closed,绝不回落 Partner ID)。
+#: ⚠ **`open` 只数 pending / stalled,不数 double**(2026-09-07 所有者定稿,§9.14)。
+#: 所有者原话:「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,
+#: 中途不重复提交这种双挂的就可以。」双挂的旧码卡在沃尔玛后台删不掉(僵尸列表,
+#: backlog §十三),把它数进 open 就是拿一条删不掉的行把整店的改码永久停摆
+#: (A131吕灿荣:2 条双挂压着 500 条发不出去)。**stalled 仍拦**(所有者没说放它:
+#: 超期判不出是"我们不知道发生了什么",与双挂"我们知道、只是要人回头处置"不同)。
+#: 双挂不重复提交靠的是候选判据「无未了结改码台账」里的 `'double'`,不是这道闸。
 _SQL_STAGE = """
 SELECT (SELECT count(*) FROM listing.sku_migrations
          WHERE status = 'confirmed')                            AS confirmed,
+       -- ⚠ open **有意不含 'double'**(所有者 2026-09-07 定稿,docs/sku_plan.md
+       --   §9.14):双挂的旧码在沃尔玛后台删不掉,数进来就是拿一条删不掉的行把
+       --   整店改码永久停摆;'stalled' 仍在里面(所有者没说放它)。
        count(*) FILTER (WHERE status IN ('pending', 'stalled')) AS open
 FROM listing.sku_migrations WHERE store = %(store)s
 """
@@ -485,6 +528,18 @@ _SQL_LEDGER_STALLED = """
 UPDATE listing.sku_migrations
    SET status = 'stalled', error = %(error)s
  WHERE id = %(id)s
+"""
+
+#: 同店双挂落 double(2026-09-07 所有者定稿,§9.14;仿 _SQL_LEDGER_STALLED)。
+#: **不写 settled_at**:double 不是终态,是"挂在那儿等人回头处置"的过程态 ——
+#: 它每轮仍进 `_SQL_OBSERVE` 参与定案,旧码哪天缺席就自然转 confirmed。
+#: **幂等**:`AND status <> 'double'` —— 同一条双挂会被每一轮重判一次,没有这半句
+#: 就是每轮一条无谓的 UPDATE(白写 WAL、把 error 里的时间戳类文案刷掉);并发两轮
+#: 同时跑时它也保证只有一次真写。
+_SQL_LEDGER_DOUBLE = """
+UPDATE listing.sku_migrations
+   SET status = 'double', error = %(error)s
+ WHERE id = %(id)s AND status <> 'double'
 """
 
 
@@ -619,13 +674,16 @@ def _preflight(conn, store_name: str) -> tuple[bool, list[str]]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]:
-    """输入:一条 pending 台账 + 该新码的回执 + 当前时刻 → 输出:(判词, 人话理由)。
+    """输入:一条 pending / double 台账 + 该新码的回执 + 当前时刻 → 输出:(判词, 人话理由)。
 
     判词 ∈ pending / confirmed / rolled_back / stalled / double。**纯函数**,
-    优先级固定(顺序即判据,改顺序就是改语义):
+    优先级固定(顺序即判据,改顺序就是改语义)。**六条规则与顺序 2026-09-07
+    一字未改**:double 从"留 pending 只告警"改成一个持久状态(§9.14),改的是
+    `_settle` 拿这个判词去做什么,不是判词本身怎么判 —— 也正因为规则没变,
+    已是 double 的行下一轮旧码一缺席就落到 (a),自动转 confirmed。
 
       (a) 新码在架 ∧ 旧码缺席                    ⇒ confirmed
-      (b) 新码在架 ∧ 旧码**也**在架              ⇒ double(不定案,只告警)
+      (b) 新码在架 ∧ 旧码**也**在架              ⇒ double(记台账,不定案)
       (c) 新码未现 ∧ 回执 failed                 ⇒ rolled_back(确认没成)
       (d) 新码未现 ∧ 观测新鲜 ∧ 超 OBSERVE_HOURS ⇒ rolled_back(观测反证)
       (e) 超 STALE_HOURS 仍判不出                ⇒ stalled(点名人工)
@@ -640,8 +698,8 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
     if row["new_present"] and row["old_gone"]:
         return _CONFIRMED, "新码在架且旧码已缺席(观测确认)"
     if row["new_present"] and not row["old_gone"]:
-        return "double", ("新码与旧码**同时在架** —— 这不是改码而是多了一条 listing,"
-                          "本工作流不自动处置,请人工核对沃尔玛后台")
+        return _DOUBLE, ("新码与旧码**同时在架** —— 这不是改码而是多了一条 listing,"
+                         "本工作流不自动处置,请人工核对沃尔玛后台")
     status = (receipt or ("", ""))[0]
     code = (receipt or ("", ""))[1]
     if status == "failed":
@@ -712,7 +770,14 @@ def _settle(conn, store_name: str, execute: bool, *,
     每次调用**最先**跑这一段(-p settle_only=1 时只跑它)。判据见 _verdict;
     execute=False 时五处写全部跳过(定案 / UPC 改标 / 处置迁键 / 节点库存 /
     过程账),只算判决并报"将定案多少条"。
+
     **上架表一格都不写**(2026-09-06 所有者定稿,见模块头注「身份映射写在哪」)。
+
+    面是 **pending ∪ double**(2026-09-07,§9.14):双挂行落 double 之后仍每轮重判,
+    旧码一缺席就自动转 confirmed;仍是双挂就仍判 double,**不再重复写库**(幂等)。
+    **跑在 `_stage_cap` 之前**(见 run() 的执行序):写各自短事务、当场 commit,
+    所以本轮刚落的 double 立刻从节奏闸的 open 里消失 —— A131吕灿荣 那 2 条会在
+    **同一轮**里先记成 double、闸随即放开、当轮就能提交后面那批。
 
     **本段不调任何沃尔玛写接口**,所以也不需要店铺凭证:库存随改码 feed 一起
     写完了,**定案不再回写库存**(所有者 2026-09-07 定稿,安全约束⑦)。
@@ -721,7 +786,7 @@ def _settle(conn, store_name: str, execute: bool, *,
     (每条各自成败,一条撞车不拖垮整轮)。
     """
     counts = {_CONFIRMED: 0, _ROLLED_BACK: 0, _STALLED: 0, _PENDING: 0,
-              "double": 0}
+              _DOUBLE: 0}
     lines: list[str] = []
     warns: list[str] = []
     now = datetime.now(timezone.utc)
@@ -771,8 +836,33 @@ def _settle(conn, store_name: str, execute: bool, *,
         verdict, why = _verdict(row, receipt, now)
         counts[verdict] = counts.get(verdict, 0) + 1
         tag = f"{row['old_sku']}→{row['new_sku']}"
-        if verdict == "double":
-            warns.append(f"  ⚠ 同店双挂 {tag}:{why}")
+        if verdict == _DOUBLE:
+            # 双挂**不再留 pending**(2026-09-07 所有者定稿,docs/sku_plan.md §9.14)。
+            # 落一个持久的 double:它不进节奏闸的 open(`_SQL_STAGE`)⇒ 后面那 500 条
+            # 照发;也不许再开第二条台账(候选判据「无未了结改码台账」含 'double')
+            # ⇒ 这一条旧码永不重复提交。但它**每轮仍参与定案**(`_SQL_OBSERVE` 取
+            # pending ∪ double):所有者回头把旧码从后台删掉、catalog_sync 记了缺席,
+            # 下一轮 `_verdict` 就落到 (a) 自动转 confirmed,弃旧码等后果全走现成路径。
+            # **身份层一个字不动**:旧行仍 replaced_by=新码的在途态,新码仍是活码 ——
+            # 换的只是过程账的状态。**不自动处置双挂**(写操作永不自动兜底)。
+            done = "已记" if execute else "将记"
+            if not execute:
+                lines.append(f"  [DRY-RUN] 将记 double {tag}({why})")
+            elif row.get("status") != _DOUBLE:   # 幂等:上轮已记的不重复写
+                try:
+                    with db.pg_conn() as tx:
+                        tx.execute(_SQL_LEDGER_DOUBLE,
+                                   {"error": why[:900], "id": row["id"]})
+                except Exception as e:           # noqa: BLE001 —— 隔离不是吞
+                    counts[_DOUBLE] -= 1
+                    counts["failed"] = counts.get("failed", 0) + 1
+                    logger.exception("改码记 double 失败 %s %s", store_name, tag)
+                    warns.append(f"  ⚠ 记 double 失败 {tag}:{e.__class__.__name__}: {e}"
+                                 f" —— 该行仍是 pending(会继续占着节奏闸),下一轮重判")
+                    continue
+                logger.info("改码同店双挂记 double %s %s:%s", store_name, tag, why)
+            warns.append(f"  ⚠ 同店双挂 {tag}:新码与旧码同时在架 —— {done} double,"
+                         f"**不拦后续提交、不会重复提交**,回头人工处置")
             continue
         if verdict == _PENDING:
             continue
@@ -852,6 +942,12 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 
       · 该店还有 pending/stalled 未定案 ⇒ 本轮上限 **0**(只定案,不提交):
         账没清就发下一批,一旦形态选错就是成批的双挂,而双挂只能人工一条条收;
+        ⚠ **double 不计**(2026-09-07 所有者定稿,docs/sku_plan.md §9.14;原话
+        「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,中途不
+        重复提交这种双挂的就可以」):双挂的旧码在沃尔玛后台删不掉(僵尸列表,
+        docs/backlog.md §十三),数进 open 就是拿一条删不掉的行把整店改码永久
+        停摆(A131吕灿荣:2 条双挂压着 500 条一条都发不出去)。双挂**不重复提交**
+        另有一道:候选判据「无未了结改码台账」含 'double'。**stalled 仍拦**;
       · **全船队**零 confirmed ⇒ 1(第一级:先拿一个品把通道在生产上走通);
       · 0 < confirmed < 10 ⇒ 10(第二级);
       · ≥10 ⇒ 不再压,按 asked_limit。
@@ -1406,6 +1502,14 @@ def run(params: dict) -> str:
             conn, store_name, execute,
             observe_hours=observe_h, stale_hours=stale_h)
         lines += settle_lines
+        # ⚠ **顺序是语义,不是风格**:`_settle` 在前、`_stage_cap` 在后,而且
+        # `_settle` 的每一次写都走**自己的短事务**(`db.pg_conn()` 另开一条连接,
+        # 退出即 commit,见 registry/db.pg_conn),与这里这条只读连接不是同一个
+        # 事务。PG 默认 READ COMMITTED ⇒ 下面 `_stage_cap` 那条 SELECT 看得见本轮
+        # 刚 commit 的状态。所以同店双挂在**同一轮**里就走完「记 double → 节奏闸
+        # 的 open 少一条 → 当轮放行提交」(2026-09-07 §9.14 的整个收益就在这里;
+        # 把定案挪到闸后面、或者把写塞进这条只读连接的事务里,A131 那 2 条就要
+        # 多等一轮才不挡路)。
         # 顺序即语义:`-p settle_only=1` 与"闸未过"都把上限压到 0,而**只定案的那
         # 一轮根本不该去问上限** —— `_stage_cap` 会读飞书限额表(上架上限闸),
         # 一次飞书抖动不该把"清账"这件事炸掉(与"闸拦的是发新的、不是定案"同一条)。
@@ -1454,7 +1558,7 @@ def run(params: dict) -> str:
     n_roll = settle_counts.get(_ROLLED_BACK, 0) + mig_counts.get("rolled_back", 0)
     n_stall = settle_counts.get(_STALLED, 0)
     n_pend = settle_counts.get(_PENDING, 0)
-    n_double = settle_counts.get("double", 0)
+    n_double = settle_counts.get(_DOUBLE, 0)
     n_unsent = settle_counts.get("unsent", 0)
     n_failed = settle_counts.get("failed", 0)
     n_sub = mig_counts.get("submitted", 0)

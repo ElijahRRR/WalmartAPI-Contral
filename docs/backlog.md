@@ -379,6 +379,13 @@ ACTIVE),problem_scan 每天建议删/停,cleanup 每天发、每天失败;删除
 代价:每天烧 DELETE/RETIRE 配额发注定失败的 feed;这些 SKU 的码永远弃不掉、UPC 永不释放
 (弃码点 1 靠观测触发);登记簿仍是活码 ⇒ list_new 本店去重闸判「同 ASIN 已在架」,
 该 ASIN 在该店再也上不了;改码与维护对它们的排除本身无害(确实死了)。
+
+⚠ **与改码链的接口(2026-09-07,所有者决定)**:僵尸列表让「同店双挂」的旧码在后台
+删不掉,而双挂行原先留 pending、被改码的节奏闸数成"未定案",整店改码停摆(A131吕灿荣:
+2 条压着 500 条)。已改成:双挂落持久状态 `double`,**不拦节奏闸、也不重复提交**,等本条
+根治后由所有者回头处置(删旧码 → catalog_sync → `settle_only=1` 自动 confirmed)。
+详见 `docs/sku_plan.md` §9.14 —— 本条(§十三)的范围**不变**,仍是另议。
+
 建议修法(待所有者点头):对 executing 的破坏类处置、回执 failed 或 QARTH「No matching
 record」的 (店, SKU) 逐条单查(api/items.get_item),404 ⇒ 标 missing_since 当观测缺席,
 定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮限额几天清完;查到 200 的

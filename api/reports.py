@@ -89,7 +89,7 @@ def create_report_request(store: dict, report_type: str, report_version: str,
                           body: dict | None = None, *, data_start: str | None = None,
                           data_end: str | None = None) -> dict:
     """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns;
-    + 可选数据范围 dataStartTime/dataEndTime,ISO 8601 `YYYY-MM-DDTHH:mm:ssZ`)
+    + 可选数据范围 dataStartTime/dataEndTime,`YYYY-MM-DDTHH:mm:ss.000Z`,不带毫秒回 400)
     → 输出:响应 dict(含 requestId / requestStatus / requestSubmissionDate)。
 
     官方 POST /v3/reports/reportRequests。reportType/reportVersion **必须走 query**
@@ -102,8 +102,9 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     ⚠ **max_retries=0**:POST 创建不是幂等的,5xx 后自动重试会重复建报表、
     重复吃每小时一次的创建额度(写操作永不自动兜底)。
     令牌走 **rate_try_acquire**(有就占、没有立刻抛 ReportQuotaError),不睡:
-    创建桶一小时一枚,睡等 = 补试在桶里躺一小时。请求形状被拒的 4xx(非 429)
-    把令牌还回去(沃尔玛那侧什么都没发生),429 / 5xx / 网络未达不还。
+    创建桶一小时一枚,睡等 = 补试在桶里躺一小时。**任何结局都不还令牌**:被拒的
+    4xx 沃尔玛照样计数(2026-09-07 22:52 实证:日期格式 400 之后限速头
+    x-current-token-count=0,桶容量就是 1),本地还了就是比沃尔玛宽,下一枚必 429。
     """
     cid = store["client_id"]
     payload = dict(body or {})
@@ -124,8 +125,6 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     if status == 429:
         raise ReportQuotaError(f"{store['name']} {report_type} 报表创建被限流(429):"
                                f"该类型每小时只能创建一次")
-    if status is not None and 400 <= status < 500 and status not in (401, 403):
-        _client.rate_release("reports.create", cid)      # 请求没被受理,令牌还回去
     if status != 200 or not data:
         _fail(status, store, "reportRequests 创建", data)
     if not data.get("requestId"):

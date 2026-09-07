@@ -415,24 +415,24 @@ def test_create_does_not_sleep_on_a_full_bucket(monkeypatch):
         reports.create_report_request(STORE, "ITEM", "v6")
 
 
-@pytest.mark.parametrize("status,released,exc", [
-    (415, True, reports.ReportRequestError),    # 请求形状被拒:令牌还回去
-    (400, True, reports.ReportRequestError),
-    (429, False, reports.ReportQuotaError),     # 沃尔玛计了数:不还
-    (503, False, reports.ReportRequestError),   # 不知道有没有处理:不还
-    (None, False, reports.ReportRequestError),  # 网络未达:不还
+@pytest.mark.parametrize("status,exc", [
+    (415, reports.ReportRequestError),    # 请求形状被拒:沃尔玛照样计数(22:52 实证 400 后令牌 0)
+    (400, reports.ReportRequestError),
+    (429, reports.ReportQuotaError),      # 沃尔玛计了数
+    (503, reports.ReportRequestError),    # 不知道有没有处理
+    (None, reports.ReportRequestError),   # 网络未达
 ])
-def test_create_releases_token_only_for_deterministic_4xx(monkeypatch, status, released, exc):
-    calls = {"release": 0}
-    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: True)
-    monkeypatch.setattr(_client, "rate_release", lambda b, c: calls.__setitem__("release", calls["release"] + 1))
+def test_create_never_gives_the_token_back(monkeypatch, status, exc):
+    """任何结局都不还令牌:本地比沃尔玛宽,下一枚必 429(rate_release 连同前提一起撤销)。"""
+    _client._rate_state.pop((STORE["client_id"], "reports.create"), None)
     monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
     monkeypatch.setattr(_client, "safe_post_ex", lambda *a, **k: (status, {}, None))
     with pytest.raises(exc) as ei:
         reports.create_report_request(STORE, "ITEM", "v6")
-    assert calls["release"] == (1 if released else 0)
     if exc is reports.ReportRequestError:
         assert ei.value.status == status
+    assert _client.rate_try_acquire("reports.create", STORE["client_id"]) is False
+    assert not hasattr(_client, "rate_release")
 
 
 def test_create_401_is_store_dead(monkeypatch):
@@ -443,13 +443,11 @@ def test_create_401_is_store_dead(monkeypatch):
         reports.create_report_request(STORE, "ITEM", "v6")
 
 
-def test_try_acquire_and_release_in_memory_bucket():
-    """有就占、没有立刻 False(不睡);release 把最近一枚还回去。"""
+def test_try_acquire_in_memory_bucket():
+    """有就占、没有立刻 False(不睡)。"""
     _client._rate_state.pop(("cidT", "reports.create"), None)
     assert _client.rate_try_acquire("reports.create", "cidT") is True
     assert _client.rate_try_acquire("reports.create", "cidT") is False   # 1/hour,第二枚没有
-    _client.rate_release("reports.create", "cidT")
-    assert _client.rate_try_acquire("reports.create", "cidT") is True
     with pytest.raises(KeyError):
         _client.rate_try_acquire("reports.NOT_REGISTERED", "cidT")
 
@@ -605,8 +603,9 @@ def test_report_blob_info_distinguishes_short_file_from_swallowed_rows():
 def test_data_window_is_official_format_and_capped_at_730_days():
     from datetime import datetime, timezone
     now = datetime(2026, 9, 7, 14, 5, 7, 123456, tzinfo=timezone.utc)
-    assert ir.data_window(365, now) == ("2025-09-07T14:05:07Z", "2026-09-07T14:05:07Z")
-    assert ir.data_window(9999, now)[0] == "2024-09-07T14:05:07Z"     # 夹到 730
+    # 带毫秒:不带毫秒沃尔玛回 400「could not be parsed at index 19」(22:52 实证)
+    assert ir.data_window(365, now) == ("2025-09-07T14:05:07.000Z", "2026-09-07T14:05:07.000Z")
+    assert ir.data_window(9999, now)[0] == "2024-09-07T14:05:07.000Z"     # 夹到 730
     assert ir.DATA_RANGE_DAYS == 365
 
 
@@ -620,10 +619,10 @@ def test_create_puts_data_window_in_json_body(monkeypatch):
         seen.update(json_body=json_body, params=params)
         return 200, {}, {"requestId": "R-1", "requestStatus": "RECEIVED"}
     monkeypatch.setattr(_client, "safe_post_ex", post)
-    reports.create_report_request(STORE, "ITEM", "v6", data_start="2025-09-07T00:00:00Z",
-                                  data_end="2026-09-07T00:00:00Z")
-    assert seen["json_body"] == {"dataStartTime": "2025-09-07T00:00:00Z",
-                                 "dataEndTime": "2026-09-07T00:00:00Z"}
+    reports.create_report_request(STORE, "ITEM", "v6", data_start="2025-09-07T00:00:00.000Z",
+                                  data_end="2026-09-07T00:00:00.000Z")
+    assert seen["json_body"] == {"dataStartTime": "2025-09-07T00:00:00.000Z",
+                                 "dataEndTime": "2026-09-07T00:00:00.000Z"}
     assert seen["params"] == {"reportType": "ITEM", "reportVersion": "v6"}
     reports.create_report_request(STORE, "ITEM", "v6")
     assert seen["json_body"] == {}                        # 不给日期仍是 {},不是 None

@@ -551,13 +551,15 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
                                         -- MP_MAINTENANCE(已作废的形态 A)——
                                         -- 那是**事实记录,不回填改写**
     feed_id text,                       -- 提交成功后落;NULL = 还没发出去
-    status text DEFAULT 'pending',      -- pending / confirmed / rolled_back / stalled
+    status text DEFAULT 'pending',      -- pending / confirmed / rolled_back / stalled /
+                                        -- double(同店双挂,2026-09-07,见下面状态段)
     submitted_at / settled_at timestamptz,
     sheet_synced_at timestamptz,        -- 2026-09-06 起**不再使用**,恒 NULL(见下)
     error text, detail jsonb DEFAULT '{}', created_at timestamptz DEFAULT now()
 );
 -- 索引:sku_migrations_open_uidx UNIQUE (store, old_sku) WHERE status='pending'
---       (同 (店,旧码) 只允许一条在途改码 = 崩溃重入的防重键)、
+--       (同 (店,旧码) 只允许一条在途改码 = 崩溃重入的防重键;**不含 double 行**,
+--        见下面状态段的最后一句)、
 --       sku_migrations_new_uidx UNIQUE (new_sku)(一个码一辈子只替换一次)、
 --       sku_migrations_status_idx (status, created_at)。
 -- **分工写死**:身份权威在 catalog.listing_sources(replaces / replaced_by /
@@ -565,8 +567,17 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- 飞书同步态)—— 把这四样塞进身份表,会让一张被十几个消费方 JOIN 的表长出五个
 -- 只有一个工作流看的过程列。两者的状态迁移必须**同一事务**完成(与
 -- retire_cooldown 之于 catalog.upc_pool 同款分工)。
--- 三态:pending(已落库,可能已发 feed)→ confirmed(catalog_sync 观测到"新码在架
--- 且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,点名人工)。
+-- 状态(2026-09-07 起五个):pending(已落库,可能已发 feed)→ confirmed(catalog_sync
+-- 观测到"新码在架且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,
+-- 点名人工)/ **double**(同店双挂:新码与旧码同时在架 —— 2026-09-07 所有者定稿,原话
+-- 「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,中途不重复提交这种双挂
+-- 的就可以」)。double **不是终态**(不写 settled_at):它不进节奏闸的 open(`_SQL_STAGE`
+-- 只数 pending/stalled)⇒ 后续改码照发;不许再开第二条台账(候选判据「无未了结改码台账」
+-- 含 double)⇒ 旧码永不重复提交;但每轮仍进 `_SQL_OBSERVE`(pending ∪ double)参与定案,
+-- 所有者回头把旧码从沃尔玛后台删掉、catalog_sync 记了缺席,下一轮自动转 confirmed。
+-- 身份层 catalog.listing_sources **一个字不动**(旧行仍 replaced_by=新码,新码仍是活码)。
+-- ⚠ 部分唯一索引 sku_migrations_open_uidx(WHERE status='pending')**不覆盖 double 行**,
+-- 这是有意的取舍:防第二条台账靠上面那条候选判据。展开见 docs/sku_plan.md §9.14。
 -- sheet_synced_at:**2026-09-06 起不再使用**(所有者定稿:改码不回写上架表 ——
 -- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
 -- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。

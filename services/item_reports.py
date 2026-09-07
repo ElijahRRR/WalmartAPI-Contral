@@ -18,13 +18,13 @@
     覆盖率低于阈值在首行点名「疑似不全」,当轮照填已匹配的行,明天再拿一份。
 
 轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;Get All Report Requests
-200/min,单查 20/hour):先睡 poll_secs 再查,只用**列表接口**找自己的 requestId;
-列表里找不到时每第 STATUS_FALLBACK_EVERY 次才动用一次 20/hour 的单查兜底。
+200/min,单查 20/hour):先睡 poll_secs 再查,只用**列表接口**找自己的 requestId
+(不带日期参数,见 wait_ready);列表里找不到时每第 STATUS_FALLBACK_EVERY 次才
+动用一次 20/hour 的单查兜底。
 """
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
 
 from api import reports
 from registry import paths
@@ -165,19 +165,6 @@ def coverage_note(counters: dict) -> str:
 
 # ── 等报表就绪 ───────────────────────────────────────────────────────────────
 
-def since_iso(submitted_at) -> str:
-    """输入:台账 submitted_at(可 None)→ 输出:列表接口 requestSubmissionStartDate 用的 ISO 8601。
-
-    往前留 1 小时余量(沃尔玛记的提交时刻与本地时钟不必一致);没有提交时刻
-    (刚建的行)按 25 小时前 —— 只是收窄列表,不是判据。
-    """
-    base = submitted_at or datetime.now(timezone.utc)
-    if base.tzinfo is None:
-        base = base.replace(tzinfo=timezone.utc)
-    back = timedelta(hours=1) if submitted_at else timedelta(hours=25)
-    return (base - back).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def wait_ready(store: dict, request_id: str, *, wait_min: int = DEFAULT_WAIT_MIN,
                poll_secs: int = DEFAULT_POLL_SECS, since: str | None = None,
                list_fn=None, status_fn=None, sleep=time.sleep,
@@ -187,6 +174,9 @@ def wait_ready(store: dict, request_id: str, *, wait_min: int = DEFAULT_WAIT_MIN
     先睡后查(报表至少要几分钟);每轮用列表接口按 requestId 找自己那一份;
     列表里找不到(分页/索引滞后)时每第 STATUS_FALLBACK_EVERY 轮用一次单查兜底。
     超时不是失败:requestId 还在台账,下轮接着等(官方保留 30 天)。
+    ⚠ `since` 缺省 **不传**(2026-09-07 生产实见:按官方参考页格式
+    `YYYY-MM-DDTHH:mm:ssZ` 传 requestSubmissionStartDate 也回 400;列表只有 30 天、
+    每店每天一份,不筛也就几十条,按 requestId 匹配足够)。
     """
     list_fn = list_fn or reports.list_report_requests
     status_fn = status_fn or reports.get_report_request

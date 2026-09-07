@@ -457,3 +457,33 @@ def test_one_store_5xx_still_goes_to_serial_retry(monkeypatch):
     with pytest.raises(reports.ReportRequestError):
         wf._one_store(STORE, 60, 120, probe=False)
     assert log["error"][0][1].startswith("create: 503")
+
+
+# ── 2026-09-07 探针第二轮:列表接口带 requestSubmissionStartDate 回 400 ────────────
+
+def test_list_report_requests_sends_only_report_type_by_default(monkeypatch):
+    """按官方参考页格式传 requestSubmissionStartDate 也回 400:缺省只传 reportType。"""
+    seen = {}
+    monkeypatch.setattr(_client, "rate_acquire", lambda b, c: 0.0)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+
+    def get(url, token, cid, proxy, params=None, timeout=30, max_retries=0):
+        seen["params"] = dict(params)
+        return 200, {}, {"requests": [{"requestId": "R1", "requestStatus": "READY"}]}
+    monkeypatch.setattr(_client, "safe_get_ex", get)
+    rows = reports.list_report_requests(STORE, "ITEM")
+    assert rows[0]["requestId"] == "R1"
+    assert seen["params"] == {"reportType": "ITEM"}
+
+
+def test_wait_ready_is_called_without_since(monkeypatch):
+    seen = {}
+    log = _wire(monkeypatch, rows=_ROWS, current={"A": None})
+
+    def wait(store, rid, **kw):
+        seen.update(kw)
+        return "READY", 1
+    monkeypatch.setattr(ir, "wait_ready", wait)
+    wf._one_store(STORE, 60, 120, probe=False)
+    assert "since" not in seen and log["written"] == {"A": "11"}
+    assert not hasattr(ir, "since_iso")

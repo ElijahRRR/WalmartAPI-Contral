@@ -111,3 +111,21 @@ def test_pg_down_fails_hard(monkeypatch):
 def test_unregistered_bucket_still_rejected():
     with pytest.raises(KeyError):
         _client.rate_acquire("feeds.post.NOT_REGISTERED", "cidA")
+
+
+def test_sku_migrate_uses_the_already_registered_feed_buckets():
+    """改码**不新增桶**(2026-09-06 通道定案 MP_ITEM_MATCH 后同样成立)。
+
+    它吃 `feeds.post.MP_ITEM_MATCH`(15/h,与跟卖链 match_listing 共享),不再吃
+    MP_MAINTENANCE(那是已作废的形态 A)。两个桶早已登记且都是跨进程桶。
+
+    再登记一遍就是双轨:同一个配额被两个名字各算一次,等于配额翻倍(而沃尔玛
+    那一侧不会翻倍,只会开始 429)。
+    """
+    from workflows import sku_migrate
+    assert _client._RATE_BUCKETS[f"feeds.post.{sku_migrate.FEED_TYPE}"] \
+        == (15, 3600.0)
+    assert _client._is_persistent(f"feeds.post.{sku_migrate.FEED_TYPE}")
+    assert _client._RATE_BUCKETS["feeds.post.MP_MAINTENANCE"] == (8, 3600.0)
+    assert not [b for b in _client._RATE_BUCKETS if "SkuUpdate" in b or
+                "sku_update" in b or "sku_migrate" in b]

@@ -4,6 +4,7 @@
 水位每块落(崩了重推不丢行)。
 """
 
+from collections import Counter
 from datetime import date
 
 import pytest
@@ -168,15 +169,51 @@ def test_两条路的取事件口径不一样_别混():
         报错可能存在多次,**其中被拉黑的那个作为最高优先级**」。黑名单是
         「一次入选、永久禁止」,拿最新一条会把上个月那条禁令忘掉。
 
-    身份键两边一样:`coalesce(asin, sku)`(标准码优先、订货号原文兜底)。
+    身份键两边一样,而且**经登记簿**:`_EV_CTE` 的
+    `ident = coalesce(ls.source_key, e.asin, e.sku)`(切码后的唯一通路 → 清洗出的
+    标准码 → 订货号原文),两条路都建在它上面,不许各写一份。
     """
     from services import blacklist as bl
-    assert "DISTINCT ON (coalesce(asin, sku))" in bl._LATEST_CTE
-    assert "ORDER BY coalesce(asin, sku), occurred_at DESC" in bl._LATEST_CTE
+    assert "DISTINCT ON (ident) ident AS asin" in bl._LATEST_CTE
+    assert "ORDER BY ident, occurred_at DESC" in bl._LATEST_CTE
+    assert bl._LATEST_CTE.startswith(bl._EV_CTE) and bl._HISTORY_SQL.startswith(bl._EV_CTE)
     # 入选那条**不许**再有 DISTINCT ON / occurred_at DESC 的取最新写法
     assert "DISTINCT ON" not in bl._HISTORY_SQL
     assert "GROUP BY 1" in bl._HISTORY_SQL and "array_agg" in bl._HISTORY_SQL
     assert "ON CONFLICT (asin) DO NOTHING" in bl._INSERT_ASIN_SQL
+    # ⚠ 身份表达式只有**一处出生**(_EV_CTE),两条链共用:品牌渠道那条
+    #   (_LATEST_CTE)与黑名单入选那条(_HISTORY_SQL)。谁另抄一份就会漂。
+    assert "coalesce(ls.source_key, e.asin, e.sku) AS ident" in bl._EV_CTE
+    for sql in (bl._LATEST_CTE, bl._HISTORY_SQL, bl._BACKFILL_COUNT_SQL):
+        assert sql.startswith(bl._EV_CTE), sql[:60]
+    # ⚠ 黑名单入选按 ident 分组,**不许**退回裸 coalesce(asin, sku):
+    #   切码后 sku 是我们自己生成的码,拿它分组 = 同一产品历史被拆散。
+    assert "SELECT ident AS asin" in bl._HISTORY_SQL
+    assert "coalesce(asin, sku)" not in bl._HISTORY_SQL
+
+
+def test_backfill_preview_is_byte_identical_when_no_opaque_keys(wired, monkeypatch):
+    """opaque=0 时预览文案里不许出现这一档 —— 它是**新加的只读告警**,
+    生产库今天不该有不透明码,摘要必须与加它之前逐字相同。
+
+    ⚠ 不能写成「文案里没有 ⚠」:换轨后的预览本身就带好几处 ⚠(产品级判定 ≠
+    行级记录那两条)。逐字相同用**减法**钉:opaque≠0 的文案去掉这一档,
+    应当还原成 opaque=0 的文案。
+    """
+    def _counts(opaque):
+        return lambda conn: {"total": 20, "permanent": 10, "brand_cand": 3,
+                             "in_table": 4, "fresh": 6,
+                             "fresh_codes": Counter({"POLICY": 6}),
+                             "opaque": opaque}
+
+    monkeypatch.setattr(wf.blacklist, "backfill_counts", _counts(0))
+    base = wf.run({"backfill": "1"})
+    assert "不透明码" not in base and "该永久拉黑 10 个" in base
+
+    monkeypatch.setattr(wf.blacklist, "backfill_counts", _counts(7))
+    out = wf.run({"backfill": "1"})
+    assert "⚠ 其中 7 个键形如不透明码" in out
+    assert out.replace(wf._opaque_note({"opaque": 7}), "") == base
 
 
 def test_重建只删得掉重灌得回的行():
@@ -269,7 +306,8 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
                 wrote.append(sql)
         def executemany(self, sql, rows):
             wrote.append(sql)
-        def fetchone(self): return (3, 20)          # (brand_cand, total)
+        # (brand_cand, total, opaque);末位 = D-0b-1 那档不透明码键告警计数
+        def fetchone(self): return (3, 20, 0)
         def fetchall(self):
             if "FROM catalog.asin_blacklist" in self._q:
                 return [("B0DDD",)]                 # 已在表里 ⇒ 不算新增

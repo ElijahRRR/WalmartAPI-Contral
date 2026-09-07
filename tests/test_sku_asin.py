@@ -17,6 +17,28 @@ def test_owner_samples_extract_exactly():
     assert sa.extract_asin("A109-B08QF9XLMH-02") == "B08QF9XLMH"
 
 
+def test_double_dash_wrapped_is_extracted_not_guessed():
+    """`CMSQ--B07J2QNQCF-43`(2026-09-03 生产实证,待归类「其他」桶的主力形态):
+    前缀与源头码之间两个横杠。中段两侧都有分隔符 ⇒ 与单横杠三段式同置信度,
+    走**提取**(依据 'wrapped'),不落 propose_source_key 的 guess 分档。"""
+    assert sa.extract_asin("CMSQ--B07J2QNQCF-43") == "B07J2QNQCF"
+    assert sa.extract_asin("CMSQ--B0D5XMC32K-35") == "B0D5XMC32K"
+    assert sa.classify("CMSQ--B0BGG5PSZN-65") == "wrapped"
+    assert sa.propose_source_key("CMSQ--B0BGG5PSZN-65") == ("B0BGG5PSZN",
+                                                            "wrapped")
+
+
+def test_double_dash_widening_stops_at_two():
+    """只放宽**这一个**分隔符:三横杠、缺价格段、中段形态不合的一律照旧
+    提不出 —— 放宽一处不等于把三段式变成"见横杠就切"。"""
+    for weird in ("CMSQ---B07J2QNQCF-43",     # 三个横杠:未见实例,不猜
+                  "CMSQ--B07J2QNQCF-",        # 尾段不是价格
+                  "CMSQ--B07J2QNQCF",         # 缺尾段
+                  "CMSQ--0B7J2QNQCF-43"):     # 中段数字开头,不是源头码形态
+        assert sa.extract_asin(weird) is None, weird
+        assert sa.classify(weird) == "other", weird
+
+
 def test_plain_asin_passes_through():
     assert sa.extract_asin("B0GXX75JN5") == "B0GXX75JN5"
     assert sa.extract_asin(" b0gxx75jn5 ") == "B0GXX75JN5"   # 大小写/空白归一
@@ -70,65 +92,284 @@ def test_record_many_autofills_asin_column():
     assert conn.rows[1][1] is None              # item id → NULL 等倒查
 
 
-# ── 批量清洗两跳(2026-08-27 从两个清洗工作流收编)──────────────────────
+# ── 批量清洗三跳(2026-08-27 从两个清洗工作流收编;2026-09-02 倒查拆两级)──
 
 class _Cur:
-    def __init__(self, hits):
-        self.hits, self.sql, self.args = hits, None, None
+    """按 (店, item_id) / item_id 两级倒查的夹具。
+
+    `hits` 喂全局那级(item_id → 订货号),`store_hits` 喂店内那级
+    ((店, item_id) → 订货号);登记簿那条 SELECT 一律返空行(未登记 ⇒ 回落形态)。
+    """
+
+    def __init__(self, hits, store_hits=None, reg=()):
+        self.hits, self.store_hits = hits, store_hits or {}
+        self.reg = list(reg)
+        self.sql, self.args, self.rows, self.n = None, None, [], 0
 
     def __enter__(self): return self
 
     def __exit__(self, *a): return False
 
     def execute(self, sql, args=None):
-        self.sql, self.args = sql, args
+        self.sql, self.args, self.n = sql, args, self.n + 1
+        if "catalog.listing_sources" in sql:
+            self.rows = list(self.reg)
+        elif "store = ANY" in sql:
+            stores, ids = set(args[0]), set(args[1])
+            self.rows = [(st, i, v) for (st, i), v in self.store_hits.items()
+                         if st in stores and i in ids]
+        else:
+            self.rows = [(k, v) for k, v in self.hits.items()
+                         if k in set(args[0])]
 
     def fetchall(self):
-        return list(self.hits.items())
+        return list(self.rows)
 
 
 class _Conn:
-    def __init__(self, hits=None):
-        self.cur = _Cur(hits or {})
+    def __init__(self, hits=None, store_hits=None, reg=()):
+        self.cur = _Cur(hits or {}, store_hits, reg)
 
     def cursor(self):
         return self.cur
 
 
-def test_resolve_skus_two_hops_and_leaves_the_rest_alone():
-    """模式提取 + 纯数字倒查 item id 两跳;**解析不了的不进映射**(留 NULL)。"""
+def test_resolve_pairs_two_hops_and_leaves_the_rest_alone():
+    """模式提取 + 纯数字倒查两跳;**解析不了的不进映射**(留 NULL)。"""
     conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"})
     skus = ["B0GXX75JN5", "JTZW-D01027HVK3W-38", "102460018738",
             "998877665544", "怪东西"]
-    mapping, buckets = sa.resolve_skus(conn, skus)
-    assert mapping == {"B0GXX75JN5": "B0GXX75JN5",
-                       "JTZW-D01027HVK3W-38": "D01027HVK3W",
-                       "102460018738": "B0GXX75JN5"}      # 倒查救回来的
+    pairs = [(None, s) for s in skus]
+    mapping, buckets = sa.resolve_pairs(conn, pairs)
+    assert mapping == {(None, "B0GXX75JN5"): "B0GXX75JN5",
+                       (None, "JTZW-D01027HVK3W-38"): "D01027HVK3W",
+                       (None, "102460018738"): "B0GXX75JN5"}   # 倒查救回来的
     # 倒查不到的那个纯数字不进映射(绝不猜),其余照原形态计数
-    assert "998877665544" not in mapping
+    assert (None, "998877665544") not in mapping
     assert buckets == {"asin": 1, "wrapped": 1, "numeric": 2, "other": 1,
-                       "numeric_resolved": 1}
-    # 倒查只对纯数字发一次,且只发那两个
+                       "pairs": 5, "registry_differs": 0,
+                       "numeric_resolved": 1, "numeric_cross_store": 1}
+    # 第二级仍是那条**一字未改**的全局 SQL,且对全部剩余对都跑 —— 这行断言
+    # 就是「今天补得上的行改后一行不少」的字面凭据
     assert "catalog.walmart_items" in conn.cur.sql
     assert conn.cur.args == (["102460018738", "998877665544"],)
 
 
-def test_resolve_skus_skips_the_lookup_when_nothing_is_numeric():
+def test_resolve_pairs_skips_the_lookup_when_nothing_is_numeric():
     conn = _Conn()
-    mapping, buckets = sa.resolve_skus(conn, ["B0GXX75JN5"])
-    assert mapping == {"B0GXX75JN5": "B0GXX75JN5"}
+    mapping, buckets = sa.resolve_pairs(conn, [(None, "B0GXX75JN5")])
+    assert mapping == {(None, "B0GXX75JN5"): "B0GXX75JN5"}
     assert conn.cur.sql is None          # 一条 SQL 都不该发
-    assert buckets == {"asin": 1}
+    assert buckets == {"asin": 1, "pairs": 1, "registry_differs": 0}
+
+
+def test_numeric_itemid_hop_prefers_the_store_scoped_row():
+    """两家店同一个 item_id 各自反查出自己那行 —— 切码后同一串数字在两家店
+    指向不同产品,不带 store 就会串味(而且不报错)。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"},
+                 store_hits={("T1", "102460018738"): "XKJ-B0GXX75JN5-39.98",
+                             ("T2", "102460018738"): "YP-B09TDMGVRW-188.88"})
+    mapping, buckets = sa.resolve_pairs(
+        conn, [("T1", "102460018738"), ("T2", "102460018738")])
+    assert mapping == {("T1", "102460018738"): "B0GXX75JN5",
+                       ("T2", "102460018738"): "B09TDMGVRW"}
+    assert buckets["numeric_resolved"] == 1        # 按 distinct sku 计
+    assert "numeric_cross_store" not in buckets    # 全在第一级解出
+
+
+def test_numeric_itemid_hop_falls_back_to_the_global_lookup():
+    """订单行落在 T2、item_id 只在 T1 的 walmart_items 里有行 —— 今天靠全局
+    那条 SQL 补得上,改后必须**一行不少**;差额单列 numeric_cross_store。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"},
+                 store_hits={("T1", "102460018738"): "XKJ-B0GXX75JN5-39.98"})
+    mapping, buckets = sa.resolve_pairs(conn, [("T2", "102460018738")])
+    assert mapping == {("T2", "102460018738"): "B0GXX75JN5"}
+    assert buckets["numeric_cross_store"] == 1
+
+
+def test_numeric_itemid_hop_still_runs_for_store_null_pairs():
+    """store 为 None 的平台级事件行**不许整条跳过** —— 跳过就是少补,
+    而且是让 asin 变空的那个方向(静默)。"""
+    conn = _Conn({"102460018738": "XKJ-B0GXX75JN5-39.98"})
+    mapping, _ = sa.resolve_pairs(conn, [(None, "102460018738")])
+    assert mapping == {(None, "102460018738"): "B0GXX75JN5"}
+
+
+def test_numeric_itemid_hop_goes_through_the_registry_again():
+    """第一级反查出的订货号本身就可能是不透明码 —— 必须再过一次登记簿,
+    直接 extract_asin 的话纯数字这条路在切码后永远解不出来。"""
+    code = "AK7QM2X9RT4W"
+    conn = _Conn({}, store_hits={("T1", "102460018738"): code},
+                 reg=[("T1", code, "B0ABCDEFGH")])
+    mapping, _ = sa.resolve_pairs(conn, [("T1", "102460018738")])
+    assert mapping == {("T1", "102460018738"): "B0ABCDEFGH"}
+
+
+def test_bucket_units_are_documented_and_stable():
+    """五档形态计数按 **distinct sku** 计(与改前逐字同口径),组合数另起三档 ——
+    混单位的话摘要里的「可解析率」会随店数漂,而没人看得出来。"""
+    one = [(None, "102460018738"), (None, "怪东西")]
+    many = [(s, k) for s in ("T1", "T2", "T3") for _, k in one]
+    _, b1 = sa.resolve_pairs(_Conn(), one)
+    _, b3 = sa.resolve_pairs(_Conn(), many)
+    for k in ("asin", "wrapped", "numeric", "other"):
+        assert b1.get(k) == b3.get(k), k
+    assert b1["pairs"] == 2 and b3["pairs"] == 6
+    # docstring 必须写死单位,否则下一个人一定读串
+    assert "distinct sku" in sa.resolve_pairs.__doc__
 
 
 def test_samples_only_reports_the_buckets_a_human_has_to_look_at():
     """只报 numeric/other:asin/wrapped 是提得出的,不需要人认。
     新形态先进「其他」桶带样本报出来,人认了再扩规则。"""
     skus = [f"{i:012d}" for i in range(7)] + ["怪A", "怪B"]
-    _, buckets = sa.resolve_skus(_Conn(), skus)
-    got = sa.samples(skus, buckets)
+    pairs = [(None, s) for s in skus]
+    _, buckets = sa.resolve_pairs(_Conn(), pairs)
+    got = sa.samples(pairs, buckets)
     assert set(got) == {"numeric", "other"}
     assert len(got["numeric"]) == 5          # 每桶前 5 个
     assert got["other"] == ["怪A", "怪B"]
     # 桶为空就不出现(摘要里不印一行空样本)
-    assert sa.samples(["B0GXX75JN5"], {"asin": 1}) == {}
+    assert sa.samples([(None, "B0GXX75JN5")], {"asin": 1}) == {}
+
+
+def test_samples_dedupes_a_sku_that_spans_stores():
+    """样本先按 sku 去重:同一个 numeric sku 在 3 家店会把 5 个样本位占掉 3 个,
+    而样本的全部作用就是让人认**新形态**。"""
+    pairs = [(s, k) for k in ("102460018738", "998877665544")
+             for s in ("T1", "T2", "T3")]
+    got = sa.samples(pairs, {"numeric": 6})
+    assert got["numeric"] == ["102460018738", "998877665544"]
+
+
+# ── 登记簿那一跳(SKU 改造批次 0a)────────────────────────────────────────────
+#
+# 身份从此有两条腿:登记簿 amz 行的 source_key 是权威键,模式提取只兜存量。
+# 两条腿**必须同口径** —— 一条归一一条不归一,下游集合里就会同时存在
+# 'B0ABCDEFGH' 与 'b0abcdefgh' 两个键,而"已在架"的判定正是按键取交集的。
+
+class _RegCur:
+    def __init__(self, rows):
+        self.rows, self.sql, self.args, self.n = rows, None, None, 0
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, args=None):
+        self.sql, self.args, self.n = sql, args, self.n + 1
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _RegConn:
+    def __init__(self, rows=()):
+        self.cur = _RegCur(rows)
+
+    def cursor(self):
+        return self.cur
+
+
+def test_resolve_agrees_with_extract_asin_on_every_legacy_shape():
+    """未登记的存量行,resolve 必须与 extract_asin 逐个同值 —— 收口那天全仓
+    十几处读侧一起换口径,只要这条不成立就是一次静默的全量行为变化。"""
+    for sku in ("B0GXX75JN5", "XKJ-B0GXX75JN5-39.98", "A109-B08QF9XLMH-02",
+                "102460018738", "怪东西", ""):
+        assert sa.pick_asin(None, sku) == sa.extract_asin(sku), sku
+        assert sa.resolve(_RegConn(), "T1", sku) == sa.extract_asin(sku), sku
+
+
+def test_registry_key_wins_over_the_pattern():
+    """登记簿优先:跟卖/自建/未来的不透明码,模式提不出的靠它;两者都在时
+    以登记簿为准(它是上架时写下的事实,模式只是猜)。"""
+    assert sa.pick_asin("B0REGISTER", "XKJ-B0GXX75JN5-39.98") == "B0REGISTER"
+
+
+def test_a_lowercase_registry_key_is_normalized_like_the_pattern_does():
+    """source_key 是运营在上架表里手填、原样落库的(读表只 strip 不 upper)。
+    裸取会让一个小写 ASIN 变成下游集合里的垃圾键 —— 而真 ASIN 仍然缺席,
+    于是"已在架"被判成"不在架",已上架的品被重新派工写回上架表。"""
+    assert sa.pick_asin(" b0abcdefgh ", "SOMESKU") == "B0ABCDEFGH"
+    assert sa.pick_asin("b0abcdefgh", "B0ABCDEFGH") == sa.extract_asin("B0ABCDEFGH")
+
+
+def test_a_malformed_registry_key_falls_back_to_the_pattern():
+    """**登记簿只是优先级,不是免检通道**:形态不对的键一律不当身份用。"""
+    for bad in ("B0XXXXXXXX-2", "   ", "00842565531441", "1024600187", None, ""):
+        assert sa.pick_asin(bad, "XKJ-B0GXX75JN5-39.98") == "B0GXX75JN5", bad
+    assert sa.pick_asin("B0XXXXXXXX-2", "怪东西") is None      # 都提不出就是提不出
+
+
+def test_unregistered_and_non_amz_rows_fall_back_to_the_pattern():
+    """只认 source_type='amz':match 行的 source_key 是匹配 GTIN,拿它当 ASIN
+    用会把一个 GTIN 灌进按 ASIN 建的所有集合里。"""
+    conn = _RegConn()                       # 一行都查不到 = 未登记 / 非 amz
+    got = sa.resolve_many(conn, [("T1", "B0GXX75JN5"), ("T1", "怪东西")])
+    assert got == {("T1", "B0GXX75JN5"): "B0GXX75JN5"}      # 提不出的不进映射
+    assert "source_type = 'amz'" in conn.cur.sql
+
+
+def test_resolve_still_answers_for_an_abandoned_row():
+    """**不按 abandoned_at 过滤**(消费方契约):旧码带着订单、售后回来时
+    必须还查得到,查不到 = 那笔订单永远归不到产品上。"""
+    assert "abandoned_at" not in sa._REG_SQL
+    conn = _RegConn([("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    assert sa.resolve(conn, "T1", "AK7QM2X9RT4W") == "B0ABCDEFGH"
+
+
+def test_resolve_many_is_one_query_for_many_pairs():
+    """有界批量反查发**一条** SQL;十万对那种全表级取数不走这里(走 SQL 里的
+    LEFT JOIN),不然就是把一次 JOIN 换成一次巨型数组传参。"""
+    conn = _RegConn([("T1", "AK7QM2X9RT4W", "B0ABCDEFGH")])
+    pairs = [("T1", "AK7QM2X9RT4W"), ("T1", "B0GXX75JN5"), ("T2", "怪东西")]
+    got = sa.resolve_many(conn, pairs)
+    assert got == {("T1", "AK7QM2X9RT4W"): "B0ABCDEFGH",
+                   ("T1", "B0GXX75JN5"): "B0GXX75JN5"}
+    assert conn.cur.n == 1
+    assert conn.cur.args == (["T1", "T1", "T2"],
+                             ["AK7QM2X9RT4W", "B0GXX75JN5", "怪东西"])
+    assert sa.resolve_many(_RegConn(), []) == {}             # 空入参一条都不发
+
+
+def test_an_opaque_code_is_invisible_to_extract_asin_but_resolvable():
+    """12 位不透明码对模式提取必返 None —— **形态本身就是分流器**:提不出
+    就说明该走登记簿了,不会有"猜出一个假 ASIN"的中间态。"""
+    from services import sku_codec
+    code = "AK7QM2X9RT4W"
+    assert sku_codec.is_opaque(code) and sa.extract_asin(code) is None
+    assert sa.pick_asin(None, code) is None
+    assert sa.resolve(_RegConn([("T1", code, "B0ABCDEFGH")]), "T1", code) == "B0ABCDEFGH"
+
+
+# ── 归类导入的机器提议(所有者 2026-09-03 给的两个样本是铁证用例)─────────────
+
+def test_owner_reclassify_samples_propose_the_right_key():
+    """`CMSQ-B0CLCX3Q1Z-169.99` 走既有的三段式规则(提得出);
+    `B0822D9QQKS59` 只能**猜**前 10 位 —— 依据必须标成 guess。"""
+    assert sa.propose_source_key("CMSQ-B0CLCX3Q1Z-169.99") == ("B0CLCX3Q1Z", "wrapped")
+    assert sa.propose_source_key("B0822D9QQKS59") == ("B0822D9QQK", sa.PROPOSE_GUESS)
+    assert sa.propose_source_key("B0ABCDEFGH") == ("B0ABCDEFGH", "asin")
+
+
+def test_propose_never_guesses_when_it_cannot_tell():
+    """提不出就留空,**绝不猜**(与 extract_asin 同一条纪律):纯数字是
+    item id 不是源头码;人工号里没有任何一段是 ASIN。"""
+    assert sa.propose_source_key("102460018738") == (None, "")
+    assert sa.propose_source_key("MANUAL-001") == (None, "")
+    assert sa.propose_source_key("") == (None, "")
+
+
+def test_propose_never_slices_an_opaque_new_code():
+    """12 位不透明新码与「10 位 ASIN + 2 位尾巴」撞脸 —— 不显式挡住,就会给
+    一个 mint 发的码提议出一个**不存在的 ASIN**,而它本来就有正确的 source_key。"""
+    from services import sku_codec
+    code = "AK7QM2X9RT4W"
+    assert sku_codec.is_opaque(code)
+    assert sa.propose_source_key(code) == (None, "")
+
+
+def test_a_guess_still_has_to_be_a_standard_asin():
+    """猜出来的前 10 位也要过形态闸:纯数字前缀(12 位 item id 那种)不许
+    冒充 ASIN 混进提议列。"""
+    assert sa.propose_source_key("1024600187654") == (None, "")

@@ -79,6 +79,137 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
+
+**立项**(所有者 2026-09-02):沃尔玛 SKU 从今天的「就是 ASIN / 三段式含 ASIN」
+改成 **12 位不透明码**(来源字母 + 11 位随机段),让沃尔玛侧的订货号不再泄露
+亚马逊货源。设计与决策 `docs/sku_plan.md`;逐批次执行工作包
+`docs/sku_workplan.md` + `docs/sku_workplan/`;身份口径规范
+`docs/conventions.md` §九。分五批合:**0a → 0b → 1 → 2 → 3**,只有批次 2
+(写侧切换)是有行为变化的那一批。
+
+**为什么先做读侧**:全仓**没有一处会抛异常** —— 「拿 SKU 当 ASIN 用」的地方
+切码后一律是"不报错、摘要看起来正常、功能悄悄没了"(维护链不改价不清零、
+去重闸失效导致同店重复上架烧配额、已在架的品被重新派工、订单判定全走人工)。
+所以读侧收口必须走在写侧切换前面,而且**整块一起合**:拆开会出现「一半按
+登记簿、一半按裸 sku」的中间态,那是最难发现的一类。
+
+**批次 0a 落地**(零行为变化,两个 PR):
+
+- **PR-0a-1「积木 + schema + 守门」**(commit `4e27789`):`services/sku_codec.py`
+  新建(mint / abandon / is_opaque / source_of;**12 位码编码规则的唯一之家**,
+  本批只建不接线,接线在批次 2)、`sku_asin.pick_asin/resolve/resolve_many`、
+  `catalog.listing_sources` 加弃码三列 + **三条一次建到位的索引**
+  (`listing_sources_opaque_sku_uidx` / `live_uidx`(含 `replaced_by IS NULL`)/
+  `live_key_idx`;名字与局部条件由 0a 定死,批次 2/3 与横切包一律引用**不许
+  重建** —— 原稿里三个包三个名字,批次 3 的 `DROP INDEX IF EXISTS` 会打空、
+  接着裸建的无条件唯一索引会让 db_init 整份回滚)、`audit_listing_conflicts`
+  视图身份键经登记簿、**db_init 存量回填正则右锚**(`^B0[A-Z0-9]{8}$` 并去掉
+  `left(sku,10)`,与生产在跑的 `sources_backfill._ASIN_RE` 同口径 —— 不修的话
+  0a 验收跑 db_init 当场就会把 `source_key ≠ sku` 的行造出来,那批行会第一次
+  进入维护链的删除意图产出面)、`upc_pool` 两个烧号状态值、事件码
+  `sku_abandoned` / `sku_replaced`、`registry.SKU_SOURCE_LETTERS`
+  (`{amz: A, match: B, 1688: C, self: H}`,所有者定稿)。
+- **PR-0a-2「十五处读侧收口」**:身份表达式统一成 **SQL 侧
+  `coalesce(ls.source_key, w.sku)`**(ls = `source_type='amz'` 的 JOIN)、
+  **Python 侧 `sku_asin.pick_asin(source_key, sku)`**,覆盖维护链四处、
+  `product_audit` mode=online 候选、`risk_trace` ①号证据源、`product_refresh`
+  采集目标、`audit_rules` 实证 PT、分配四件(`alloc_survey` / `alloc_push` /
+  `alloc_plan` / `alloc_products`)、`list_new` 的去重闸 / 重试上限 / 变体同族。
+  存量 amz 行 `source_key = sku`、未登记行回落裸 sku ⇒ 结果集逐行相同。
+
+**本批定死的四条规矩**(后续批次只准引用,不许各写一份):
+
+1. **身份表达式只有两条可复制字面量**(SQL / Python 各一条),写在 conventions §九。
+2. **`abandoned_at IS NULL` 是危险谓词**:写进 resolve / 维护链 JOIN / 事件归并 /
+   订单反查,就会让旧码带回来的订单查不到产品。只准出现在三处 —— `sku_codec.mint`
+   的复用查询、`list_new` 去重闸、`alloc_push._SQL_ONLINE`(批次 3 起加
+   `sku_migrate` 候选选取为第四处;schema.sql 的部分索引条件是 DDL,不计入)。
+3. **编码规则的唯一之家是 `services/sku_codec.py`**,registry 只登记
+   `SKU_SOURCE_LETTERS`(所有者要拍的取值才算外部配置,12 位码的字母表是内部
+   编码规则)。schema.sql 两条唯一索引的字符类与它逐字对齐,守门测试钉住。
+4. **守门只有一份 `tests/test_sku_guard.py`**(与既有 `test_feishu_guard.py`
+   同族:白名单 dict + `test_the_whitelists_do_not_rot`)。0b/1/2/3 与横切包
+   只准增删这里的白名单条目 —— 原稿四个包各建一份,同一张白名单重复三处、
+   数目三种口径、字母表断言两条互斥,守门测试自己犯了它要守的规矩。
+
+**两处有意保留(不是遗漏,各有守门反向钉着)**:
+`product_audit` mode=online 的第一条腿保留 `w.sku = p.asin`(相关子查询,
+写成 coalesce 就用不上 `walmart_items_sku_idx`,几十万行退化成全表扫);
+`alloc_survey._SQL_ONLINE` 的 lifecycle 条件**不动**(它管占用与冲突口径,
+不是派工口径,2026-08-15「退市行不算活货位」仍成立),`alloc_push` 的口径
+对齐是真行为变化,随批次 2 上(决策 C 第二步)。
+
+**合并前的两条硬闸**(需要连生产 PG):`listing_sources` 里
+`source_type='amz' AND source_key <> sku` 的行数必须为 0(非 0 = 存在被旧回填
+截断的行,收口后会扩大自动删除面);`ops.feed_items` 里同 (店, 身份键) 挂着
+多个不同 sku 的组数必须为 0(否则重试计数会归并、原本还能重试的行提前触顶)。
+
+### 2026-09-02 SKU 改造批次 3:存量改码(SkuUpdate 三态状态机 + 新工作流)
+
+**做了什么**(三块,见 `docs/sku_plan.md` §7 批次 3 与 `docs/sku_workplan/batch_3.md`):
+第一块地基(commit `cc08210`:schema 两列 / 过程账 `listing.sku_migrations` /
+别名视图 `catalog.sku_aliases` / 订单双算体检视图 / `mint_replacement` +
+`settle_replacement` + `OPAQUE_SQL_PREDICATE` / `retag_sku` / SkuUpdate 载荷);
+第二块观测侧抑制与继承(commit `5565691`:改码期间不记假代际、旧码不记缺席、
+四段历史判据经别名链继承一跳、销量归属继承、回执不入病历);
+第三块**工作流** `workflows/sku_migrate.py`(本次)。
+
+**决策日志在 `docs/sku_plan.md` §9**(plan.md 本身没有决策日志段,它的记录方式是
+Phase 小节里的 `[x] + 日期`)。那里记着:三处与工作包/synthesis 的**有意出入**
+(POST `outcome=unknown` 不回滚 / `cleanup_seen_categories` 不迁 / 活码唯一索引由
+0a 一次建到位而非批次 3 收紧)、九个决策点 A~I 的默认取值与拍板留白、本次评审
+**驳回或转出**的五条意见、以及四条已知缺口(其中「confirmed 之后没有撤销弃码的
+代码路径」是所有者要知道的那一条)。
+
+**上线注意**:`sku_migrate` **永不进调度**(`registry/schedule.py` 头注的手动清单
+里点了名,守门测试钉住),`-p store=` 必填,节奏硬闸 1 → 10 → 一店 → 全店。
+**六件单品实测(sku_plan §4)全部通过之前只许 `--dry-run`**;它与 13:00 的
+`product_chain` 抢同一个 MP_MAINTENANCE 桶,不许并跑。本批**不跑就对生产零影响**。
+
+### 2026-09-02 SKU 改造批次 2:写侧切换(唯一有行为变化的批次)
+
+**做了什么**(两块,见 `docs/sku_plan.md` §7 批次 2 与 `docs/sku_workplan/batch_2.md`):
+第一块 `list_new` 预备期 mint 真码 + 退役冷却 / 代际上限两道闸 + `-p limit=N`
+试点闸(commit `50a76a4`);第二块 **四个弃码点接线 + 跟卖侧换 mint + 决策 C/D
+落地 + feed_poll 认 --dry-run**。
+
+**所有者决策的最终取值**:
+
+- **A|停用(RETIRE)不弃码** —— 取默认。守门反向钉死 `product_clear` 不得调
+  `abandon`;problem_scan 的豁免仍未拍板,`product_clear` 头注已写明「可恢复窗口
+  ≈ 到下一轮 problem_scan 为止」,届时走弃码点 1 正常收尾。
+- **B|UPC 撞库 0101119 时码与 UPC 一起换** —— 取默认「换」。
+  `listing_sheet._mark_upc_conflicts` 一次 `abandon(reason=upc_conflict)`,拆掉
+  「撞库 → 同 SKU 换 UPC → 0101211 SKU_LOCKED → 自愈链」这个死循环;代价最坏
+  只是多耗一个免费的码(码空间 30^11),不换的代价是重演死循环 —— 代价不对称。
+- **C|派工闸对齐去重闸** —— 取默认「对齐」,但**只改 `alloc_push`**
+  (去掉 lifecycle 条件),`alloc_survey` 一个字不改(它答的是"有没有活货位",
+  2026-08-15 定稿仍成立)。两处都有反向守门,防的是"顺手统一"。
+- **D|烧号状态值与函数签名** —— 一次做完:`upc_pool.burn_for_retire` 与
+  `mark_conflict` 删除,烧号唯一函数 `burn(conn, pairs, status)`,状态只由
+  `sku_codec._BURN_STATUS` 给(delete_verified→`burned_delete`、
+  sku_locked→`burned_lock`、upc_conflict→`conflict`)。
+
+**顺手修掉的既有破口(定级最高的一条)**:`cli.py feed_poll --dry-run`
+**此前会真的烧号**。链路:`feed_poll` 的 `DANGEROUS=False` ⇒ cli 恒传
+`execute=True`;它另行透传的 `params["dry_run"]` 从来没人读;五个反哺器也没有
+`execute` 形参。而本批还要往这条路上加**不可逆的弃码**。现在 `feed_poll` 自己读
+`dry_run`,五个反哺器统一收 `execute` 关键字,空跑一行飞书、一行 PG 都不写
+(守门 `test_every_reflector_takes_an_execute_flag` 拦"新增反哺器忘了加")。
+
+**跟卖侧的两个结构改动**:① `match_listing` 分两趟 —— 第一趟逐行 SPEC 预检
+(纯网络,**不开事务**),第二趟短事务里发码与登记、commit 早于 `submit_feed`
+(原工作包要求把整个循环包进一个事务,那会把几百次沃尔玛往返吊在一个 PG 事务上,
+mint 的行锁到整轮结束才释放);② B 列人工号**在提交前**登记 —— 提交成功才登记
+会让被拒的人工号成为维护链眼里的孤儿(落进 unknown,而 unknown 不参与任何自动
+动作 = 这批货永久退出自动化)。旧的 `PHUMWMT + 日期 + 序号` 生成器已删。
+
+**上线注意**:本批**改变生产行为**,试点按 `sku_plan.md` §7 批次 2 的七步走
+(先 `--dry-run` 人眼确认载荷,再 `list_new -p store=<店> -p limit=1` 真跑一个品);
+`feed_poll --dry-run` 也要先跑一次确认输出全带 `[DRY-RUN]`、PG 与飞书零写。
+新 DDL 一条:`listing_sources_abandoned_idx`(代际上限闸的 GROUP BY 用,幂等)。
+
 ## 1. 阶段划分
 
 ### Phase 0 — 地基(一次性)
@@ -163,7 +294,7 @@ maintenance/list_new)→ 按域停旧切换。
 | 5 | upc_generator | 沃尔玛UPC生成器 | 否 | **[x] 不迁移**(所有者定稿 2026-08-07):旧版未上生产,不做迁移;新系统以后若需要此功能,按新架构新建脚本(UPC 池状态届时入 ops) |
 | 6 | maintenance | 沃尔玛商品维护 | **是** | **[~] 管道就绪,清零链路做实**(2026-08-07):单一 workflow(旧三段式的 sync/poll 分别被 PG 数据源与 feed_poll 反哺器替代);意图 provider 可插拔——清零(限额表「库存特殊要求」=0 整店清零,不设二次确认,所有者定稿)已做实,**改价/改库存/改标题三 provider 已做实**(2026-08-09,采集接入后):从产品中心自动算(amz 现价×区间倍率 / stock_count / 处理后 amz 标题 vs 沃尔玛现值),**驱动方式与旧系统不同**——旧的读飞书运营决策列,新表是程序投影没有那些列;路由铁律只作用 source_type='amz' 且整店排除 stockzero;改价按**配送方式**选区间(FBA/FBM 两套边界),**定价输入是落地价 =(亚马逊单价 + 运费)× 倍率**(所有者指出 2026-08-10:此前漏了运费——旧系统读的是采集侧导出的虚拟列「总价」本就含运费,新链路改吃增量导出 fast 段后漏掉;区间也按落地价选,两处同一个数才自洽),**运费没采到(采集侧 N/A → NULL)一律不改价/不上架**,与「配送方式未知不定价」同口径(当 0 定出来的价偏低、越贵的运费亏得越多,而两侧都不报错);存量快照已从 `raw.buybox_shipping` 就地回填(否则上线当天全线停改价),配送方式取 latest_snapshot 的 `raw->>'is_fba'`(采集侧 parser 读 buybox 的 Ships from 行;契约 fast 段未列为一等字段,但 raw 未裁剪它)——**未知则不改价/不上架**(所有者定稿 2026-08-09:「这个是必须要获取的信息」,猜错一档 = 拿错倍率);改价阈值 ≥1分且≥1%,**价格出界按 300% 兜底定价**(所有者定稿 2026-08-09,此前是淘汰;只有区间内倍率未配置才不动),**库存 NULL 也写 0**(所有者定稿 2026-08-09:采不到就不卖;库里 NULL/0 仍分得清,只在决策层折叠),**货期闸 >8 天清零**(同日从旧值 12 收紧,list_new 共用),标题复用上架文案处理;路由 改价≤5/改库存≤10 走单品 PUT 否则 feed(标题恒 feed);维护记录=在线产品总表内「维护记录」工作表(只追加,反哺器回填);**飞书只留近 7 天**(所有者定稿 2026-08-09:一天几千行,旧系统靠一天一个表格绕开;`-p prune_sheet=1` 手动裁,每轮提交后自动裁,删的只是展示面板——流水永久在 ops.feed_items),配套**超 3 天未落定判「未查到」并推进水位**(免得一行悬着把水位钉死、每轮重读整段)。**维护事件入账定稿**(所有者 2026-08-07):标题/价格/库存维护(含清库存)一律**不进** catalog.product_events——清库存是店铺维度运营操作,系统不设店铺维度病历;流水在 ops.feed_log/feed_items,状态后果由 status_changed 观测入账(配套闸:receipt_in_ledger 白名单 + 反补计数 source 过滤)。**删除类并入本工作流**(所有者定稿 2026-08-09:「variant_offset_cleanup 的功能也应该放进 maintenance,这属于一个工作流」):kind='delete' 第四类 provider——`variant_offset`(亚马逊把 /dp/<ASIN> 返回成兄弟变体页,parser 拒绝写入,采集侧列为不自动重试)⇒ 价格/库存永远拿不到新数据,留着只会被前三个 provider 拿陈旧快照一轮轮跟。三个原因:variant_offset(门槛 min_batches=1,所有者:偏移了就不会恢复,不设观察期)+ **商品不存在**(amz 标题占位符,旧系统只跳过标题维护,所有者 2026-08-09 改为删除)+ **连续无货 15 天**(`-p oos_days=N` 可调;三道判据:窗口内无任何有货观测 + 至少一条明确缺货观测(防全 unknown 误判)+ 窗口两端都有观测(防中间断采);⚠ 采集接线于 2026-08-08,历史攒够 15 天前这条恒空);唯一防呆:最后一次偏移后若有 outcome=ok 快照则移出名单;守路由铁律只删 source_type='amz';单店单轮上限取限额表「下架限制」列(与 product_clear 同一口径,缺该店退 300 并告警);dry-run 单独列名单;**删除名单从其余三类里剔除**(将死的行不值得再烧配额);删除是维护事件不入病历的**唯一例外**(生死类恒记 delete_submitted)。**重复提交抑制**(2026-08-09 生产实证):首轮真跑后 feed 报错排行里最大两组是 `ERR_EXT_DATA_0101198` stale update(删除 119 + 标题 89)——provider 比的是 amz 值 vs walmart_items 上次扫店快照,提交后本地快照不变 ⇒ 下轮重算出同样的意图重发同样的载荷。已加 ops.dedupe 抑制(店铺|SKU|类型|新值,20 小时窗口,值变了照样提交)。另 38 条改库存 + 30 条改价报 SKU not found ⇒ **调度顺序硬约束:catalog_sync → product_refresh → product_ingest → maintenance**。**意图上限按店化**(所有者定稿 2026-08-26):全局 5000/类闸废除 —— 08-25 倍率调整日它把 12,766 条合法改价截成 5,000(无 ORDER BY 物理序随机截、截断只进日志不进摘要、链一天一轮"下轮"="明天"),谭总 7 家店拖了三天。改为 `MAX_INTENTS_PER_STORE`(单店单轮,数字=按店速率桶×单 feed 切片:price (8−1)/时×8000 条/feed=56000(桶:官方 10/hour 三件套共享,四代理三源复核后从 6/天上调,6/day 确证只属本仓不用的 feedType=promo;切片:官方硬限 10000 条留两成,1000 条只是建议值——所有者定稿新鲜度优先,单店整量当轮连发,如 15000 条=8000+7000 两个 feed 连续提交)、inventory 7×4000=28000、title 7×1000=7000;**−1 是补交余量**(feeds 的"双确认未达→补交一次"每次多烧一个桶名额,吃满桶时一次补交就抱锁睡一小时),三个数均远超单店目录、纯属失控护栏,三处连同窗口一致有测试钉住);delete 不设扫描期闸(执行件 cap_destructive 是唯一闸,08-24 归一)。截断按店进飞书摘要,超限组内按优先级截(价格保大偏差、库存保清零)。⚠ 代价(两侧都记):整店清零不再被数量闸挡(单店目录 < 单店上限);改价侧同理,倍率误填/区间事故会一轮全量出闸(此前全局 5000 至少封住错价面,涨跌幅闸仍在下方待办)。防线=扫描摘要**首行**的「清零 N」与「⚠ 截断」(链通知只发成功步骤首行,2026-08-26 对抗校验实证后压进首行)+ dry-run 纪律;被截断顺延的落榜行留在 withdraw keep 里不撤(撤了会被记成「商品自己恢复正常了」)。待:清零链路生产验证、涨跌幅闸(价格 provider 做实时;上量前重议)。~~maintenance.db 历史并入~~(2026-08-12 所有者拍板历史迁移整批关闭,不迁)。⚠切换前停旧 12:00 walmart-maintenance-all-stores 并先收干净旧在途 feed |
 | 7 | product_clear | 沃尔玛批量下架(旧 daily_retire) | **是** | **[~] 生产验收通过**(2026-08-06,所有者确认:A107 首测 5+放量 1221 个 DELETE_ITEM,识别/限额/防重/轮询/台账/事件账本全链路);待:切旧 15:00 cron、挂调度、停用(RETIRE_ITEM)动作实测。命名原则(所有者 2026-08-06):新工作流按功能命名,不继承旧系统名 |
-| 8 | problem_product_cleanup | 沃尔玛问题商品清理(旧 daily_cleanup) | **是** | **[~] 生产验收通过,PR #9 已合并**(2026-08-07,所有者确认):759 行首次全量真跑(21 店,27 反补 + 231 删除;dry-run 账目自洽对拍通过)。验收期修复:20 代理对抗审查 6 项(dedup 幽灵事件/防重只拦在途/反查排除已占用 feedId/顽固绑代际/轮询卡死/摘要分列)+ 单店隔离 + 网络波动二轮重试 + 在途/待观测拦截(均生产实证)。待:次日 catalog_sync 删除核验观测、停旧 0/6/12/18 点 cron、挂调度(catalog_sync 先行)。**归因收集尾段**(所有者定稿 2026-08-08):品牌限制/侵权类问题产品 → 品牌写 catalog.brand_blacklist + 飞书「禁止品牌收集」(旧链路 C/E 类语义;B/C/E/F/G/K 六类 ASIN 黑名单旧表消费方待确认);**品牌名取自亚马逊产品库**——随产品中心库接入后实施(新系统内部重上架已由 product_risk 防呆闸免疫)。**反补退役,一律删除**(所有者定稿 2026-08-28:「publishedStatus 不是 PUBLISHED 的,都进行删除,不再修改 End Date 救商品」——当日沃尔玛把全账号退市档案翻回 items 响应集(可见性变化,官方零公告),盘点发现 7,342 行 UNPUBLISHED 退市行 100% 带「end date has passed」,而那正是退市标记本身(官方批量退市 = Site End Date 设为过去):A/L 类反补对这批行 = 走官方复活通道批量救活死档案。扫描面同步扩到**一切非 PUBLISHED**(NULL 不进:判不准就判活;新品发布过渡态靠既有在途 48h 预筛护住);Stage 按行豁免废除(所有者:Stage 一般只在店铺非 ACTIVE 时出现,店铺闸已挡那种店,ACTIVE 店里的 Stage = 翻出来的老档,照删);顽固双击保留;存量 relist 建议由 withdraw_stale/settle 自然收尾)。**单店「下架限制」暂停**(所有者定稿 2026-08-28「暂时关闭这个限制」,同日第二稿):清理波积压按日限额要削几十天,`RETIRE_CAP_PAUSED=True` 期间不读限额表/不按日记账/不截断,摘要首行点名;缺席避让 fail-closed、在途防重、DELETE_ITEM 速率桶(6/hour,单 feed ≤2500 条)不受影响——出闸节奏仍被速率桶天然限住;恢复改回 False(title_mismatch 停闸同款先例,用例钉住现状) |
+| 8 | problem_product_cleanup | 沃尔玛问题商品清理(旧 daily_cleanup) | **是** | **[~] 生产验收通过,PR #9 已合并**(2026-08-07,所有者确认):759 行首次全量真跑(21 店,27 反补 + 231 删除;dry-run 账目自洽对拍通过)。验收期修复:20 代理对抗审查 6 项(dedup 幽灵事件/防重只拦在途/反查排除已占用 feedId/顽固绑代际/轮询卡死/摘要分列)+ 单店隔离 + 网络波动二轮重试 + 在途/待观测拦截(均生产实证)。待:次日 catalog_sync 删除核验观测、停旧 0/6/12/18 点 cron、挂调度(catalog_sync 先行)。**归因收集尾段**(所有者定稿 2026-08-08):品牌限制/侵权类问题产品 → 品牌写 catalog.brand_blacklist + 飞书「禁止品牌收集」(旧链路 C/E 类语义;B/C/E/F/G/K 六类 ASIN 黑名单旧表消费方待确认);**品牌名取自亚马逊产品库**——随产品中心库接入后实施(新系统内部重上架已由 product_risk 防呆闸免疫)。**反补退役,一律删除**(所有者定稿 2026-08-28:「publishedStatus 不是 PUBLISHED 的,都进行删除,不再修改 End Date 救商品」——当日沃尔玛把全账号退市档案翻回 items 响应集(可见性变化,官方零公告),盘点发现 7,342 行 UNPUBLISHED 退市行 100% 带「end date has passed」,而那正是退市标记本身(官方批量退市 = Site End Date 设为过去):A/L 类反补对这批行 = 走官方复活通道批量救活死档案。扫描面同步扩到**一切非 PUBLISHED**(NULL 不进:判不准就判活;新品发布过渡态靠既有在途 48h 预筛护住);Stage 按行豁免废除(所有者:Stage 一般只在店铺非 ACTIVE 时出现,店铺闸已挡那种店,ACTIVE 店里的 Stage = 翻出来的老档,照删);顽固双击保留;存量 relist 建议由 withdraw_stale/settle 自然收尾)。**单店「下架限制」暂停**(所有者定稿 2026-08-28「暂时关闭这个限制」,同日第二稿):清理波积压按日限额要削几十天,`RETIRE_CAP_PAUSED=True` 期间不读限额表/不按日记账/不截断,摘要首行点名;缺席避让 fail-closed、在途防重、DELETE_ITEM 速率桶(6/hour,单 feed ≤2500 条)不受影响——出闸节奏仍被速率桶天然限住;恢复改回 False(title_mismatch 停闸同款先例,用例钉住现状)。**RETIRED 全豁免**(所有者定稿 2026-09-06):problem_scan 扫描面加 `lifecycle_status <> 'RETIRED'`(NULL 不豁免:判不准就判活=照扫)。依据:08-28 可见性变更翻回来的死档里 lifecycle=RETIRED 的 10,191 行**实证删不掉**(DELETE_ITEM 反复回 deleted/retired 类失败,当日维护失败画像 873 条即此来源,只烧配额)、后台一般也不显示;列表接口对已删品仍返回 PUBLISHED/ACTIVE(单条 GET 404)的「僵尸列表」问题所有者定为**暂不处理**(你能请求到、后台也查得到) |
 | 9 | catalog_sync | tools/sync_online_products | 否 | 改为写 PG catalog + 回写飞书;与采集服务改造联动。**[~] 沃尔玛侧已上线**(PR #4,47 店全量验证);待每日并跑对拍+挂调度;item_id 报表回填封存(-p item_ids=1)。**采集侧增量已接线**(2026-08-08,见 product_ingest 行) |
 | — | product_ingest | (新增) | 否 | 采集服务(amazon-scraper-v4)增量 → 产品中心 catalog.products/snapshots。**全项目唯一从采集器取数的工作流**(漏斗铁律;2026-08-09 措辞校正:推送侧另有 product_refresh 全量重推与 order_audit 按邮编推,**取回只有这一条路**——数据入库口径唯一才是漏斗的本意);契约 v1 + §5.1 补遗(409 硬停/三值 stock_state/slow_hash 不透明/空值不覆盖/404 非空数据);游标 ops.cursors,空页不推进。**[~] 本机接线验收通过**(2026-08-09):88 条→44 ASIN 两层落库(标题/品牌/类目/哈希 44/44 全覆盖)、二次拉取 0 条游标不动(幂等实证)、补采 4 条后 list_new「待数据源」归零;IN_STOCK_QTY 已拍板终值 10(所有者 2026-08-12)。**生产已实跑**(所有者确认 2026-08-13:首跑为游标 0 起的一次性存量回填,此后按游标增量)。待:采集服务上 VPS 后两侧配 EXPORT_TOKEN、挂调度 |
 | 10 | listing | auto_listing + match_listing | **是** | **[~] L1 跟卖验收通过 + L2 上架主链代码全就绪**(2026-08-07,PR #11/#12):L2a UPC 池 PG 化+定价、L2b 风控入库(禁售 825/黑名单 42064)、L2c spec/LLM/feed 外部件(PT 6951 全覆盖)均生产验证;L2d 主链七道闸门链 dry-run 实战通过(去重/防呆实拦),**端到端验收待采集服务**;变体分组后置。L3 自愈链**暂缓**。**L2d 攻坚暂停**(所有者定稿 2026-08-09):四轮真跑把载荷问题从 30 个错收敛到只剩 UPC 撞库(运气问题,重试自愈);代码全保留不回退,四轮错误账与续做指引见子计划「L2d 攻坚暂停」节。**2026-08-12 攻坚续做,代码迁移收官**(PR #24/#25):旧仓三路全量对照 → 六点批复当日落地(K=Unknown 自愈/跟卖库存 provider/配额切片后置/缺数据推采集闭环/manufacturer 双字段)+ 载荷漏迁补齐(LLM 提示词富元数据、Orderable 交还 LLM、零认证第四档、per-PT keyFeatures minItems、图片保序)+ 第 5 轮日期字段闸 + 接线批次三(PROHIBITED 回执分类/淘汰行回显/LLM 落盘/跟卖两处回归)+ **违禁回执自动入 ASIN 黑名单**(失败反哺上架前拦截闭环)。**当前状态:端到端验收通过(2026-08-13,3/3 SUCCESS,所有者确认)——上架功能迁移完成**;余项=三件生产验证(L1 试点/L2a/L2b 核对)+ 调度挂载 + 切换清单(旧两条调度链必须同停)+ 后置(变体分组/L4 收尾)。攻坚期沉淀的通用设施已惠及全部 feed 类型(ops.feed_item_errors 报错明细 + 排行视图 + 提交前 spec 预检 + FAILED 行重试上限)。**前端不迁移**;价格/库存同步归 maintenance provider。子计划 docs/listing_plan.md。**取消全局去重 + 定制品闸**(所有者定稿 2026-08-28):去重闸改**本店**语义((店铺,SKU) 对,含规划外店——自己拦自己防重复上架),跨店分布完全交给分配链 + 占用闸;起因 = 同日沃尔玛档案可见性事件,任何一家店的退市死档案行都会把该 ASIN 对全船队封死。同批新增**定制品不上架**闸(is_custom 进 amz_source 产品契约;判据键唯一出处 registry.AMZ_CUSTOM_FLAG_KEY = `is_customized`,所有者生产探针核实 2026-08-28:122 万快照行带该键、值 Yes/No;明确真值才拦、未采到放行,错键=恒放行) |

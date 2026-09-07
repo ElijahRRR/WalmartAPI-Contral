@@ -145,6 +145,111 @@ def test_poll_feed_repoll_does_not_duplicate_events(monkeypatch):
     assert [e["sku"] for e in recorded] == ["B"]
 
 
+# ── feed 级拒收:终态 ERROR + 零明细(2026-09-07 A131吕灿荣 整店改码实证)──────
+
+#: 沃尔玛原文(feed 级 ingestionError,itemsReceived=0)。整店 2740 条改码分三个
+#: MP_ITEM_MATCH feed,三条全是这一份 —— 按「明细里查无 ⇒ missing」办的话,
+#: sku_migrate 的 `_verdict` 不会当场回滚(它只认 failed),2740 条卡满 24h 观测期。
+_A131_ERR = {
+    "type": "DATA_ERROR",
+    "code": "EXT_DATA_ERROR_50575703577001",
+    "description": ("You have exceeded your item setup limit of 5000. "
+                    "Please resubmit your file to ensure that the total number "
+                    "of items in your catalog is below your designated limit."),
+}
+_A131_HEAD = {"feedStatus": "ERROR", "itemsReceived": 0, "itemsSucceeded": 0,
+              "itemsFailed": 0,
+              "ingestionErrors": {"ingestionError": [_A131_ERR]}}
+
+
+class _LedgerConn(_Conn):
+    """台账里预写了三条 SKU(提交时落的),终态明细里一条都查不到。"""
+
+    def fetchall(self):
+        if "SELECT sku, workflow, feed_type, status" in self._last:
+            return [(s, "sku_migrate", "MP_ITEM_MATCH", "submitted")
+                    for s in ("S1", "S2", "S3")]
+        return []
+
+
+def test_feed_level_error_without_details_fails_every_ledger_sku(monkeypatch):
+    """整 feed 被拒 ⇒ 台账逐 SKU 落 **failed**(带 feed 级码与原文),不落 missing。
+
+    missing 的语义是"沃尔玛没说这条的下落",而这里它说得很清楚:一条都没收。
+    读成 missing 的后果是改码等 24h 观测反证、上架/维护链把"整批没进去"看成"查无"。
+    """
+    conn = _LedgerConn()
+    _fake_db(monkeypatch, conn)
+    done = []
+    monkeypatch.setattr(feeds, "get_feed_status", lambda s, f: dict(_A131_HEAD))
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([]))
+    monkeypatch.setattr(feeds, "mark_feed_done",
+                        lambda fid, ok: done.append((fid, ok)))
+
+    head, out = feed_track.poll_feed(STORE, "F1")
+    assert head["feedStatus"] == "ERROR"
+    assert out == {s: ("failed", "EXT_DATA_ERROR_50575703577001")
+                   for s in ("S1", "S2", "S3")}
+
+    def _find(frag):
+        return next(x for x in conn.sqls if frag in x[0])
+
+    _sql, rows = _find("SET status = %s")
+    assert len(rows) == 3
+    for status, code, desc, fid, _sku in rows:
+        assert (status, code, fid) == ("failed",
+                                       "EXT_DATA_ERROR_50575703577001", "F1")
+        assert "item setup limit of 5000" in desc      # 码本身不含任何信息
+    # 台账里一条都不许落 missing:三个 SKU 都在"已落定"的名单里
+    _sql, args = _find("'missing'")
+    assert sorted(args[1]) == ["S1", "S2", "S3"]
+    # feed_log 落 failed(ok=False),不是 done
+    assert done == [("F1", False)]
+    # 报错明细照落(聚合看 ops.v_feed_error_stats),一 SKU 一行
+    _sql, err_rows = _find("INSERT INTO ops.feed_item_errors")
+    assert len(err_rows) == 3
+    assert {r[4] for r in err_rows} == {"EXT_DATA_ERROR_50575703577001"}
+
+
+def test_feed_level_error_without_ledger_rows_changes_nothing(monkeypatch):
+    """台账里一条都没有(提交时没预写)⇒ 没有可回执的对象,行为与从前一样。"""
+    conn = _Conn()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status", lambda s, f: dict(_A131_HEAD))
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
+    assert feed_track.poll_feed(STORE, "F1")[1] == {}
+
+
+def test_an_error_feed_that_does_carry_details_is_unchanged(monkeypatch):
+    """**有**逐条明细的 ERROR feed 一字不变:真相在明细里,台账里多出来的
+    那条(明细没提到)照旧落 missing。"""
+    conn = _LedgerConn()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status", lambda s, f: dict(
+        _A131_HEAD, itemsReceived=2))
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "S1", "ingestionStatus": "SUCCESS"},
+        {"sku": "S2", "ingestionStatus": "DATA_ERROR",
+         "ingestionErrors": {"ingestionError": [{"code": "ERR_9"}]}}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda fid, ok: None)
+    _head, out = feed_track.poll_feed(STORE, "F1")
+    assert out == {"S1": ("success", ""), "S2": ("failed", "ERR_9")}
+    _sql, args = next(x for x in conn.sqls if "'missing'" in x[0])
+    assert sorted(args[1]) == ["S1", "S2"]            # S3 落 missing,不被顶掉
+
+
+def test_ingestion_errors_accepts_both_official_shapes():
+    """裸 list 与 {"ingestionError": [...]} 两种形态都实见过(旧仓 _first_error
+    专门兼容)。只认 dict 那一种的表现是报错原文静默读空、还不报错。"""
+    assert feed_track.ingestion_errors(
+        {"ingestionErrors": {"ingestionError": [_A131_ERR]}}) == [_A131_ERR]
+    assert feed_track.ingestion_errors(
+        {"ingestionErrors": [_A131_ERR]}) == [_A131_ERR]
+    assert feed_track.ingestion_errors({}) == []
+    assert feed_track.ingestion_errors({"ingestionErrors": None}) == []
+
+
 def test_poll_feed_not_terminal_returns_head_and_none(monkeypatch):
     monkeypatch.setattr(feeds, "get_feed_status", lambda store, fid: {
         "feedStatus": "INPROGRESS", "itemsReceived": 10, "itemsSucceeded": 3,
@@ -266,9 +371,9 @@ def test_all_reflectors_write_code_plus_desc(monkeypatch):
                            columns=sheet.columns)
 
     monkeypatch.setattr(feed_track, "item_results",
-                        lambda fid: {"SKU1": ("failed", "EXT_ERR_1")})
+                        lambda fid, workflow=None: {"SKU1": ("failed", "EXT_ERR_1")})
     monkeypatch.setattr(feed_track, "item_errors",
-                        lambda fid: {"SKU1": "[color] required"})
+                        lambda fid, workflow=None: {"SKU1": "[color] required"})
     want = "EXT_ERR_1 | [color] required"
 
     # 停用/删除表:H 报错列
@@ -395,7 +500,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
     lock = threading.Lock()
 
     def _mk(label, first=False):
-        def _f():
+        def _f(execute=True):                    # 五个反哺器统一收 execute
             if first:                            # 每条链的头一个反哺器上会合
                 gate.wait()
             with lock:
@@ -403,7 +508,7 @@ def test_reflectors_run_concurrently_but_same_sheet_stays_serial(monkeypatch):
             return f"{label}:回写 1 行"
         return _f
 
-    def _boom():
+    def _boom(execute=True):
         gate.wait()          # 也要会合:秒退的话剩下三条永远凑不齐四个
         raise RuntimeError("飞书 90227")
 
@@ -448,3 +553,68 @@ def test_same_sheet_reflectors_registered_in_one_chain():
     listing = [c for c in feed_poll._REFLECTOR_CHAINS
                if any(f.__module__.endswith("listing_sheet") for _, f in c)]
     assert len(listing) == 1 and len(listing[0]) == 2
+
+
+def test_sku_migrate_failure_never_blacklists_the_asin(monkeypatch):
+    """改码被拒**不得反哺 ASIN 黑名单**(SKU 改造批次 3,O8)。
+
+    形态 B 下改码走 MP_ITEM ⇒ kind=list ⇒ 正好命中这段反哺。一次改码被拒若碰巧
+    带上违禁码,会把一个**正在正常销售**的 ASIN 永久拉黑(record_asins 是
+    PERMANENT),list_new/match_listing 的黑名单闸下一轮就开始拦 —— 后果永久,
+    且没有任何摘要会说是改码干的。改码失败是我们的载荷/时序问题,不是政策违禁。
+    """
+    class _C(_Conn):
+        def fetchall(self):
+            if "FROM ops.feed_items" in self._last:
+                return [("B0MIG001", "sku_migrate", "MP_ITEM", "submitted"),
+                        ("B0BAD02", "list_new", "MP_ITEM", "submitted")]
+            return []
+
+    conn = _C()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": sku, "ingestionStatus": "DATA_ERROR",
+         "ingestionErrors": {"ingestionError": [
+             {"code": "EXT_DATA_ERROR_61020366035308",
+              "description": "General Prohibited Product"}]}}
+        for sku in ("B0MIG001", "B0BAD02")]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
+    got = []
+    monkeypatch.setattr(feed_track.blacklist, "record_asins",
+                        lambda c, items: (got.extend(items), len(items))[1])
+
+    feed_track.poll_feed(STORE, "F10")
+    # 同一份回执里:改码那行被放过,上架那行照常反哺(挡的是来源,不是整段)
+    assert [g["sku"] for g in got] == ["B0BAD02"]
+
+
+def test_sku_migrate_receipt_writes_no_product_event(monkeypatch):
+    """改码回执一条病历都不写(O7 的收口点在 feed_track 这一侧的回归)。
+
+    与 O8 是两件事:O8 管黑名单反哺,这条管 product_events —— 形态 B 的
+    kind=list 恒入账,不挡就是一串 list_feed_success 灌进「上架」时间线。
+    """
+    class _C(_Conn):
+        def fetchall(self):
+            if "FROM ops.feed_items" in self._last:
+                return [("B0MIG002", "sku_migrate", "MP_ITEM", "submitted"),
+                        ("B0LIST01", "list_new", "MP_ITEM", "submitted")]
+            return []
+
+    conn = _C()
+    _fake_db(monkeypatch, conn)
+    monkeypatch.setattr(feeds, "get_feed_status",
+                        lambda s, f: {"feedStatus": "PROCESSED"})
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter([
+        {"sku": "B0MIG002", "ingestionStatus": "SUCCESS"},
+        {"sku": "B0LIST01", "ingestionStatus": "SUCCESS"}]))
+    monkeypatch.setattr(feeds, "mark_feed_done", lambda f, ok: None)
+    written = []
+    monkeypatch.setattr(feed_track.product_events, "record_many",
+                        lambda c, rows: written.extend(rows) or len(rows))
+
+    feed_track.poll_feed(STORE, "F11")
+    assert [(r["sku"], r["event"]) for r in written] == \
+        [("B0LIST01", "list_feed_success")]

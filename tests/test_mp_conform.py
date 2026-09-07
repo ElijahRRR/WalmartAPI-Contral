@@ -314,3 +314,41 @@ def test_clamp_max_length_local_gate():
     assert any("tags" in n for n in notes)          # 截断必须见 notes
     out2, notes2 = mc.clamp_max_length(spec, {"envelopeSize": "small"})
     assert out2["envelopeSize"] == "small" and notes2 == []
+
+
+# ── SkuUpdate 必须活着穿过 strip_unknown(SKU 改造批次 3 地基,M5)────────────
+
+def test_sku_update_is_stripped_like_any_other_unknown_field():
+    """反向钉死(2026-09-06):`strip_unknown` **没有开关字段放行名单**。
+
+    此前有一条 `ORDERABLE_SYSTEM_SWITCHES = ("SkuUpdate",)` 的放行分支,给
+    「形态 B = MP_ITEM 全量 + SkuUpdate 改码」当地基。改码通道定案 MP_ITEM_MATCH
+    (同 GTIN + 新 SKU + REPLACE 原地换码,载荷里没有 SkuUpdate)之后,那条分支
+    连同 `mp_mapper.build_sku_update_item` / `build_orderable(sku_update=)` 一起
+    删了 —— 留着就是第二条改码路径(conventions §六 双轨禁止)。
+    """
+    assert not hasattr(mc, "ORDERABLE_SYSTEM_SWITCHES")
+    assert "SkuUpdate" not in _OSPEC["properties"]        # spec 里确实没有它
+    _v, o, dropped = mc.strip_unknown(
+        _SPEC, _OSPEC, {"productName": "T"},
+        {"sku": "S1", "price": 1.0, "SkuUpdate": "Yes"})
+    assert "SkuUpdate" not in o
+    assert "orderable.SkuUpdate" in dropped
+
+
+def test_strip_unknown_is_byte_identical_for_payloads_without_sku_update():
+    """不带 SkuUpdate 的普通上架载荷逐字节不变(零行为变化的落脚点)。"""
+    args = (_SPEC, _OSPEC, {"productName": "T", "bogusField": 1},
+            {"sku": "S1", "price": 1.0, "productName": "T"})
+    v, o, dropped = mc.strip_unknown(*args)
+    assert o == {"sku": "S1", "price": 1.0}
+    assert v == {"productName": "T"}
+    assert dropped == ["visible.bogusField", "orderable.productName"]
+
+
+def test_no_other_unknown_orderable_field_survives():
+    """反向:随便塞一个 spec 外字段仍被剔 —— 放行名单是穷举的一元组,不是开闸。"""
+    _v, o, dropped = mc.strip_unknown(
+        _SPEC, _OSPEC, {}, {"sku": "S1", "SkuUpdateNow": "Yes", "whatever": 1})
+    assert "SkuUpdateNow" not in o and "whatever" not in o
+    assert set(dropped) == {"orderable.SkuUpdateNow", "orderable.whatever"}

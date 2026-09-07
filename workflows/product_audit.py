@@ -32,10 +32,10 @@
                                                     # 由紧随其后的 problem_scan 建删除建议
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
-  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填 C~G
-  python cli.py product_audit -p from_sheet=1 -p force=1   # 同上,但 E 列为空的**一律重判**
+  python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填审核六列
+  python cli.py product_audit -p from_sheet=1 -p force=1   # 同上,但审核结果为空的**一律重判**
                                                     # (库里已有结论的也重判,不是回填);
-                                                    # E 列已填结论的表行仍然不领。飞书类目表
+                                                    # 已填结论的表行仍然不领。飞书类目表
                                                     # 改过之后翻存量走这条
   python cli.py product_audit -p from_sheet=1 -p limit=300     # 只判 300 个(缺省全判)
   python cli.py product_audit -p from_sheet=1 -p gap_wait=45   # 缺数据等采集最多 45 分钟
@@ -48,21 +48,24 @@ L1(实证→报错实证→哨兵→映射表→候选+rerank)→ L2(只剩 R1 �
 products.audit_* 六列与审核事件(空跑用 --dry-run)。**TRO 品牌命中**同边:
 L0 品牌文案扫描扫到的黑名单词里,来源标着 TRO 的那些在真跑时记进 ops.store_events
 (源头一条 + 波及逐店,展开走 services/risk_trace),dry-run 一条不写。**`-p from_sheet=1` 时另把结论投影回上架表
-C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结束)。
+审核六列**(标题/PT/审核结果/类别/具体内容/审核日期;2026-08-16 开闸,
+并跑期"只落库不投影"的纪律到此结束;「类别」列 2026-09-02 三段分列后由本工作流
+一并写,列位置一律由表头名定位,源码里没有写死的列字母)。
 
 ⚠ `from_sheet` **缺省不是强审**(要强审加 `-p force=1`,见下):
-表 E 列为空只说明表里没有结论,库里可能早就有。
+表里审核结果为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
-领取口径含 **E=pending**(2026-08-17):pending 是中间态不是结论,写进 E 之后
-若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
+领取口径含 **「审核结果」=pending**(2026-08-17):pending 是中间态不是结论,
+写进那一格之后若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
 
 **缺数据同轮补采闭环**(所有者定稿 2026-08-17:「产品审核不能等下一次,要轮询
 等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
 表里轮到审、但库里压根没有(或有行无标题=采集降级)的 ASIN → 推采集批次
 `audit_gap_<日界>` → **轮询等它采完**(缺省 20 分钟,`-p gap_wait=N` 调,0=只推
 不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的**这一轮就判掉**。
-仍缺的把采集侧真实 `error_type` 写进表格 **F 列、E 列留空**(留空才会被下轮重领)。
+仍缺的把采集侧真实 `error_type` 写进表格 **「具体内容」列、「审核结果」留空**
+(留空才会被下轮重领)。
 整段跑在候选查询**之前**,所以不需要第二遍判定循环。见 `_close_gap`。
 ⚠ **在库的待审行不做"先刷新再审"**(所有者复议定稿 2026-08-19):审核判的是
 "这个产品卖的是什么",第一次就定性了,改标题/描述不改变它是什么——
@@ -70,13 +73,13 @@ C~G 五列**(2026-08-16 开闸,并跑期"只落库不投影"的纪律到此结�
 是要写到沃尔玛的真金白银)。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
-五列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
+审核六列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
 (L1 rerank / L3;L4 需显式 l4=on)——验收抽样时用 limit 控制成本。
 
 补刷(mode=backfill,批复 #5"只补刷"):候选限 audit_status IS NULL;先查
 audit.audit_runs 历史结论(谓词必须 stage_stopped_at IS DISTINCT FROM
 'SHORTCUT'——204 万存量里有短路影子行;排序键 (verdict='reject') DESC
-实现旧 reject 粘性),有历史者**直接采用**写五列+事件(detail 带
+实现旧 reject 粘性),有历史者**直接采用**写审核六列+事件(detail 带
 referenced_run_id,不写新 run——方案 A,不制造影子行),无历史者进正常判定。
 
 pending 两来源(reason 区分):L1=类目解不出(候选/rerank 均无解);
@@ -327,7 +330,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
     if asins:
         if params.get("from_sheet") and not _forced_sheet(params):
             # ⚠ 上架表驱动**缺省不是强审**(所有者纠正 2026-08-16:「按我们的运行
-            # 逻辑,不是应该直接从库里读取结果吗」)。E 列为空只说明**表里**
+            # 逻辑,不是应该直接从库里读取结果吗」)。审核结果为空只说明**表里**
             # 没有结论,不说明库里没有 —— 库里已有结论的直接投影回表(零 LLM),
             # 只有真待审的才进判定引擎。缺省当成强审的后果是每轮把已审过的几万个
             # ASIN 重判一遍:钱白花、慢得离谱,而且看不出哪里不对。
@@ -473,11 +476,24 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 口径是 `missing_since IS NULL`(还在目录里),**不加**
         # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
         # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
-        # 所以调度里必须给一次能扫完的 limit,小 limit 会让每天都从头扫
-        # 同一批前缀,尾巴永远轮不到而且不报错。
-        return ("p.audit_status = 'approved' AND EXISTS ("
+        # 所以必须一轮扫完:**别给 limit**(2026-09-03 起缺省就是不限量;
+        # 此前调度里写的是 `-p limit=1000000`)。给个小 limit 会让每天都从头
+        # 扫同一批前缀,尾巴永远轮不到而且不报错。
+        # 身份两条腿 OR,**不写成 coalesce**(conventions §九对本处的例外,
+        # 理由是索引):这是对 products 每一行做的相关子查询,写成
+        # coalesce(ls.source_key, w.sku) = p.asin 就用不上 walmart_items_sku_idx,
+        # 几十万行候选退化成逐行全表扫(2026-08-14 视图挂死同一类事故)。
+        # 第一条腿逐字保留今天的语义(走 walmart_items_sku_idx),第二条腿经
+        # 登记簿(走 listing_sources_key_idx)**只覆盖新码** —— 存量 amz 行
+        # source_key = sku,是第一条腿的子集,切换后才开始起作用。
+        return ("p.audit_status = 'approved' AND (EXISTS ("
                 "SELECT 1 FROM catalog.walmart_items w "
-                "WHERE w.sku = p.asin AND w.missing_since IS NULL)", {})
+                "WHERE w.sku = p.asin AND w.missing_since IS NULL) OR EXISTS ("
+                "SELECT 1 FROM catalog.listing_sources ls "
+                "JOIN catalog.walmart_items w "
+                "ON w.store = ls.store AND w.sku = ls.sku "
+                "WHERE ls.source_type = 'amz' AND ls.source_key = p.asin "
+                "AND w.missing_since IS NULL))", {})
     # 默认:新品 + pending 重试(退避 1 天:批次 B 的 pending 多为 PT 解不出,
     # 每小时重判只会无界追加 audit_runs,评审 P1-3)
     return _DEFAULT_CANDIDATE, {"cand_ver": resources.AUDIT_RULES_VERSION}
@@ -623,7 +639,7 @@ def _forced_sheet(params: dict) -> bool:
 
     所以强审只改**库侧**的候选谓词(丢掉 `_DEFAULT_CANDIDATE`),**领任务的
     口径一个字不动** —— 仍然是 `listing_sheet.audit_targets()` 的「ASIN 有值
-    且审核结果为空(或 pending)」。E 列已经填了结论的行**不会**被这个开关捞回来。
+    且审核结果为空(或 pending)」。已经填了结论的行**不会**被这个开关捞回来。
 
     为什么需要它:`rerule` / `mode=nonpass` 的候选谓词都带
     `audit_version IS DISTINCT FROM <当前版本>`(天然分页)。全量扫过一遍之后
@@ -633,7 +649,7 @@ def _forced_sheet(params: dict) -> bool:
     `-p rerule=cat_requires_cert_hard` 报「共 0 个」,没有任何一条现成通道
     能重判受影响的存量。这个开关是那种时候的出口。
 
-    ⚠ **贵**:打开之后 E 列为空的每一行都进判定引擎(含库里早有结论的)。
+    ⚠ **贵**:打开之后审核结果为空的每一行都进判定引擎(含库里早有结论的)。
     摘要里必须把"本来只判 N 条、现在判 N+M 条"写出来,别让人以为跟平时一样。
     ⚠ 量由 `limit` 说了算:**缺省不限量**(2026-09-03 定稿),给了 `-p limit=N`
     就真截断 —— 此前这里写的是"from_sheet 会把 limit 顶到 ASIN 总数、不截断",
@@ -649,7 +665,7 @@ def _is_forced(params: dict, extra: dict) -> bool:
     要审的,点了就得审,哪怕 24 小时内刚审过。三种:
 
     · `asins=` 点名 —— 但 **`from_sheet` 不算**:它也往 extra 塞 asins,走的却是
-      默认候选谓词(E 列为空 ≠ 库里没结论),该吃护栏。
+      默认候选谓词(审核结果为空 ≠ 库里没结论),该吃护栏。
     · `rerule=` 定点重审 —— 它翻的正是**刚刚被拒**的那批(改规则当天就要验),
       全在 24 小时内。吃了护栏的话 dry-run 稳定报"0 候选",紧跟着真跑翻出几千
       条,又是一次"dry-run 说没事、真跑吓一跳"(所有者 2026-08-16 被 from_sheet
@@ -821,7 +837,7 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
     那种"决策与执行分家"同理)。
 
     ⚠ **ASIN 列表不在这里截断**(所有者纠正 2026-08-16:「不是应该直接从库里
-    读取结果吗」)。E 列为空 ≠ 库里没结论:整批交给 `_DEFAULT_CANDIDATE` 谓词,
+    读取结果吗」)。审核结果为空 ≠ 库里没结论:整批交给 `_DEFAULT_CANDIDATE` 谓词,
     已有结论的**根本不进候选**(零 LLM,靠 `_project_to_sheet` 把库里的结论
     投影回表),`LIMIT` 只限制**真要判的**那部分。
     先截断的话已审过的会占满名额,每轮都在重判老货,新品永远排不上。
@@ -833,7 +849,7 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
     if not want:
         return [], [], [
             "上架表:没有待审行(ASIN 有值且审核结果为空的一行都没有)。"
-            "⚠ **清空 E 列不是重审入口**:清空只是让这行重新被领,而结论以库为准,"
+            "⚠ **清空「审核结果」不是重审入口**:清空只是让这行重新被领,而结论以库为准,"
             "库里已有结论的会被原样投影回来(见下方 from_sheet 非强审那条注释)。"
             "真要重审走 `-p asins=<逗号分隔>`(点名强审)或 "
             "`-p rerule=<规则码>`(改了某条规则后定点翻案)"]
@@ -847,7 +863,7 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
             f"上架表取到的 ASIN 不像 ASIN(样例 {bad});"
             f"多半是表头列序变了而 registry.resources.LISTING_SHEET.columns "
             f"没跟着改(现登记:{resources.LISTING_SHEET.columns[:3]}…)")
-    head = [f"上架表 E 列为空 {len(want)} 个 ASIN"
+    head = [f"上架表审核结果为空 {len(want)} 个 ASIN"
             f"({len(rows)} 行,同 ASIN 多店铺算多行)"]
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_SHEET_STATE,
@@ -877,8 +893,8 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
             f"  ⚡ **强审(-p force=1)**:本轮进判定引擎 {done + todo} 个 ASIN"
             f"(缺省口径只判 {todo} 个,多出的 {done} 个是库里已有结论、"
             f"被这个开关重新打开的)—— **LLM 花费按 {done + todo} 算**。"
-            f"⚠ 领任务口径没变:仍然只领 **E 列为空或 pending** 的行,"
-            f"E 列已有结论的表行一行都不会被捞回来")
+            f"⚠ 领任务口径没变:仍然只领 **审核结果为空或 pending** 的行,"
+            f"已有结论的表行一行都不会被捞回来")
     elif limit is None:
         if todo:
             # 与下面 `todo > limit` 那支同款:日志里这一行才是花钱前看得见的
@@ -894,14 +910,15 @@ def _claim_from_sheet(limit: int | None, force: bool = False) -> tuple[list[dict
 
 
 def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
-    """输入:本轮领的上架表行 → 输出:回填摘要一行。写 D~I(标题/PT/结果/类别/具体内容/日期)。
+    """输入:本轮领的上架表行 → 输出:回填摘要一行。写审核六列
+    (标题/PT/审核结果/类别/具体内容/审核日期;列由表头名定位,不认字母)。
 
     所有者定稿 2026-08-16。⚠ 三条:
 
-    · **F 列写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
+    · **「审核结果」写 "pass" 不是 "approved"** —— `list_new` 的领任务闸判的是
       `audit_result.lower() == "pass"`。写别的那行永远上不去,而且不报错。
       映射收在 `listing_sheet.AUDIT_RESULT_CN`。
-    · **库里没有的 ASIN 一行都不写**(留 F 空)。写个 pending 会让人以为审过了;
+    · **库里没有的 ASIN 一行都不写**(「审核结果」留空)。写个 pending 会让人以为审过了;
       留空则下轮自动重领,而且 `list_new` 只认 pass,留空绝不会误上架。
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
@@ -915,13 +932,18 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
                 got = {r[0]: r for r in cur.fetchall()}
-            # 三段输出分列(2026-09-02 B1 落地):F = 判定结果、
-            # G = `products.audit_reason`(**类别**枚举,pass/pending 为空)、
-            # H = `products.audit_detail`(**具体内容**)。
-            # ⚠ H 的**老行兜底**:B1 之前的结论没有 audit_detail 列值,
+            # 三段输出分列(2026-09-02 B1 落地):「审核结果」= 判定结果、
+            # 「类别」= `products.audit_reason`(**政策类别**枚举,
+            # pass/pending 为空)、「具体内容」= `products.audit_detail`。
+            # ⚠ 「具体内容」的**老行兜底**:B1 之前的结论没有 audit_detail 列值,
             #   照旧按命中规则渲染成人话(`explain_hits`,不带「[政策:X]」
             #   尾巴)。不兜底的话,存量几十万行在表上会一夜变成空白 ——
             #   看起来像"审核把理由弄丢了"。老行被重审时自然写上新格式。
+            # ⚠ 「具体内容」为什么非要**人话**(2026-08-16 定稿的老账,分列后
+            #   仍然成立):`products.audit_reason` 装的是沃尔玛政策表的类目名,
+            #   而其中 `General-Use Products` 是"以上全不中"的兜底 —— 单把它
+            #   摆在一把锤子、一个土豆压泥器上时人只会一头雾水。真正的原因在
+            #   命中的规则里,所以类别归类别列,人话归「具体内容」。
             reasons = audit_store.reject_reasons(conn, asins)
         updates, absent = [], 0
         for r in sheet_rows:
@@ -946,11 +968,12 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
         # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
         # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
         # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
-        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行 D~I"
-               f"(整表已有结论的都投影,不只本轮判的那些)"
+        out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行审核六列"
+               f"(标题/PT/审核结果/类别/具体内容/审核日期;"
+               f"整表已有结论的都投影,不只本轮判的那些)"
                f"{'' if execute else ';dry-run 一格未写'}")
         if absent:
-            out += (f";⚠ {absent} 行库里没有结论,**F 列留空**"
+            out += (f";⚠ {absent} 行库里没有结论,**「审核结果」留空**"
                     f"(下轮自动重领;没数据的那些见下方补采段,已推采集)")
         return out
     except Exception as e:                                      # noqa: BLE001
@@ -1097,8 +1120,8 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
       ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
          批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
-      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格 H 列(具体内容)
-         (`_gap_reasons`);E 列一个字不动(`write_audit_notes` 头注说了为什么)。
+      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格「具体内容」列
+         (`_gap_reasons`);「审核结果」一个字不动(`write_audit_notes` 头注说了为什么)。
       ⑤ **落定台账**(`check_open`)。
 
     ⚠ ⑤ 为什么在最后、而不是开头报"上一批"(所有者 2026-08-17 质疑:「我都已经
@@ -1171,7 +1194,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
     if not execute:
         out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
                    f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
-                   f"**采回来的这一轮就审掉**;仍缺的把理由写进表格 H 列"
+                   f"**采回来的这一轮就审掉**;仍缺的把理由写进表格「具体内容」列"
                    f"(dry-run 一格未写)")
         _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
         return
@@ -1201,7 +1224,7 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
     if rescued:
         out.append(f"  ✅ 补采回来 {rescued} 个,**本轮就审**(已进候选)")
     if still:
-        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格 H 列,下轮重试")
+        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格「具体内容」列,下轮重试")
     _note_gap(sheet_rows, still, set(still_absent),
               _gap_reasons(sent) if still else {}, day, True, out)
 
@@ -1209,9 +1232,10 @@ def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
 def _note_gap(sheet_rows: list[dict], still: set, absent: set,
               reasons: dict[str, str], day: str, execute: bool,
               out: list[str]) -> None:
-    """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写表格 H 列「具体内容」,摘要进 out)。
+    """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写「具体内容」列,摘要进 out)。
 
-    ⚠ **只写 H,F 列一个字不动**。F 一有值这行就不再被 `audit_targets` 领走,
+    ⚠ **只写「具体内容」,「审核结果」一个字不动**。「审核结果」一有值这行就不再被
+    `audit_targets` 领走,
     往里写个"未采集"就等于这行从此退出审核通道 —— 采回来了也没人再审它,
     而表面上"表里写着原因呢"。
     """
@@ -1229,9 +1253,9 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
                       else f"{why},已推采集但本轮没等到,下轮重试({day})"))
     try:
         n = listing_sheet.write_audit_notes(notes, execute)
-        out.append(f"  表格 H 列{'已写' if execute else '**将**写'} "
+        out.append(f"  表格「具体内容」列{'已写' if execute else '**将**写'} "
                    f"{n if execute else len(notes)} 行原因"
-                   f"(**F 列留空**,下轮照样重新领取)")
+                   f"(**「审核结果」留空**,下轮照样重新领取)")
     except Exception as e:                                      # noqa: BLE001
         logger.warning("缺数据原因回写失败(不影响本轮): %s", e)
         out.append(f"  ⚠ 原因回写飞书失败:{e}(采集已推,下轮重试回写)")

@@ -608,28 +608,173 @@ def split_llm_output(raw: dict) -> tuple[dict, dict]:
     return dict(raw), {}
 
 
-DEFAULT_SHIPPING_WEIGHT = 1.0   # 采不到重量时的保守值(单位磅,旧 test_pipeline 同值)
+# ══════════════════════════════════════════════════════════════════════════════
+#  发货重量(ShippingWeight,单位**磅**)
+#
+#  ⚠ 2026-09-06 生产事故:第二级投放的两个品把 `300.0` 与 `860.0` 当"磅"发进了
+#  MP_ITEM_MATCH 的 REPLACE 载荷。原因是此前的实现**只抓字符串里第一个数字、
+#  完全不看单位** —— 采集侧给的是 "300 grams" / "860 grams" 这类带单位的串。
+#  沃尔玛后台那一栏是 **Shipping Weight (lbs)**,MP_ITEM / MP_ITEM_MATCH 载荷的
+#  `ShippingWeight` 单位是磅(所有者观测),所以"不看单位"= 直接把克当磅发。
+#
+#  所有者定稿(2026-09-06 原话):「请勿猜测单位,一切以官方事实为主……如果解析
+#  不出重量或者重量大于 11 磅,则把重量都写为 1 磅。」于是本模块的口径是:
+#  **单位从数据里读,不猜** —— 只认显式单位记号,没有单位记号的裸数字算"解析
+#  不出"(不假设它是磅),解析不出 / ≤0 / 折算后 > 11 磅 一律写 1 磅。
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: 采不到 / 解析不出 / 超上限时写的那个值(单位磅,旧 test_pipeline 同值)。
+DEFAULT_SHIPPING_WEIGHT = 1.0
+#: 重量上限(磅)。**所有者 2026-09-06 定稿**:「如果解析不出重量或者重量大于
+#: 11 磅,则把重量都写为 1 磅。」超过它不是"发大重量",是**判为不可信** ——
+#: 我们搬运的品几乎不可能有 11 磅以上,而一次单位读错就是这个量级的错。
+MAX_SHIPPING_WEIGHT_LBS = 11.0
+#: 官方换算常量(**每个只在这里出生一次**,别在别处再写一遍数字):
+#:   · 1 lb = 16 oz —— 常衡(avoirdupois)定义;
+#:   · 1 lb = 453.59237 g —— 1959 年国际码磅协定(International Yard and Pound
+#:     Agreement)给的**精确定义值**,不是近似;
+#:   · 1 kg = 1000 / 453.59237 = 2.20462 lb(由上一条推出,不另写一个数)。
+OUNCES_PER_POUND = 16.0
+GRAMS_PER_POUND = 453.59237
+POUNDS_PER_KILOGRAM = 1000.0 / GRAMS_PER_POUND
+
+#: 认得的单位记号 → 折成磅的乘数。**只认这张表**:表外的记号(kgs / lb. 之外的
+#: 缩写 / 中文"克"/ 空)一律判 unknown_unit 走兜底,不猜。比对前统一小写、去
+#: 首尾空白与标点("Lbs." → "lbs")。
+_UNIT_TO_LBS: dict[str, float] = {
+    "pound": 1.0, "pounds": 1.0, "lb": 1.0, "lbs": 1.0,
+    "ounce": 1.0 / OUNCES_PER_POUND, "ounces": 1.0 / OUNCES_PER_POUND,
+    "oz": 1.0 / OUNCES_PER_POUND,
+    "gram": 1.0 / GRAMS_PER_POUND, "grams": 1.0 / GRAMS_PER_POUND,
+    "g": 1.0 / GRAMS_PER_POUND,
+    "kilogram": POUNDS_PER_KILOGRAM, "kilograms": POUNDS_PER_KILOGRAM,
+    "kg": POUNDS_PER_KILOGRAM,
+    # 2026-09-06 全库 item 侧单位直方图(所有者 SQL)长尾里两个**有定义**的记号:
+    # milligrams 197 行(1 mg = 1/1000 g)、"hundredths pound" 94 行(亚马逊的
+    # 百分之一磅单位)。其余长尾(foot_ounces / tons / gravity / 整段文案)不认。
+    "milligram": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "milligrams": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "mg": 1.0 / GRAMS_PER_POUND / 1000.0,
+    "hundredths pound": 0.01, "hundredths pounds": 0.01,
+}
+
+#: "3.5 pounds" / "12.8 ounces" / "860grams" —— 数字 + 紧随其后的单位记号。
+#: 记号段有意收得宽(**任何非数字非空白的一串**):"5 克" 要落进 unknown_unit
+#: 而不是 no_unit —— 两档都写 1 磅,但摘要里"单位不认识"与"根本没有单位"是
+#: 两件事,采集契约要靠这个区分去核实。
+_NUM_UNIT = re.compile(r"(-?\d+(?:\.\d+)?)\s*([^\s\d]+)?")
+#: 数字后面紧跟的**字母词**(最多两个,给 "hundredths pound" 这种双词单位):
+#: "ounces(181.44 g)" 取 "ounces","kg/6.8lbs" 取 "kg","600g / 1.3lb" 取 "g"。
+_UNIT_WORDS = re.compile(r"\s*([A-Za-z]+(?:\s+[A-Za-z]+)?)")
+
+#: dict 形态 {value|measure|amount, unit|units|unitOfMeasure} 的取值键序。
+_WEIGHT_VALUE_KEYS = ("value", "measure", "amount")
+_WEIGHT_UNIT_KEYS = ("unit", "units", "unitOfMeasure")
+
+#: 兜底归因(`shipping_weight_ex` 的第二个返回值)。调用方按它分桶报数 ——
+#: 光看一个 1.0 分不出"真 1 磅"与"兜底 1 磅",而这两件的处置完全不同。
+WEIGHT_REASONS = ("parsed", "no_weight", "no_unit", "unknown_unit",
+                  "over_cap", "nonpositive")
+
+
+def _parse_weight_value(v) -> tuple[float | None, str]:
+    """输入:一个重量值(数字 / 带单位串 / {value,unit})→ 输出:(磅, 归因)。
+
+    解析出来给 `(磅, "parsed")`,解析不出给 `(None, 原因)`。
+    **裸数字(没有单位记号)= 解析不出**,不假设它是磅:2026-09-06 的事故
+    就是"抓到数字就当磅发"。单位只从数据里读(dict 的 unit 键,或串里数字
+    后面紧跟的那个字母记号),表外记号判 unknown_unit。
+    """
+    unit = ""
+    if isinstance(v, dict):
+        raw = next((v[k] for k in _WEIGHT_VALUE_KEYS
+                    if v.get(k) not in (None, "")), None)
+        if raw is None:
+            return None, "no_weight"
+        unit = next((str(v[k]) for k in _WEIGHT_UNIT_KEYS if v.get(k)), "")
+        v = raw
+    if isinstance(v, bool):                      # True/False 不是重量
+        return None, "no_weight"
+    if isinstance(v, (int, float)):
+        num = float(v)
+    elif isinstance(v, str):
+        m = _NUM_UNIT.search(v)
+        if not m:
+            return None, "no_weight"             # "N/A" / 空串:根本没有数字
+        num = float(m.group(1))
+        if not unit:
+            tail = v[m.end(1):]
+            mw = _UNIT_WORDS.match(tail)
+            if mw:
+                unit = mw.group(1)
+            elif m.group(2):
+                unit = m.group(2)               # 有记号但不是字母(如 "克"):unknown_unit
+    else:
+        return None, "no_weight"
+    key = " ".join(unit.strip().strip(".,;:()[]").lower().split())
+    if not key:
+        return None, "no_unit"
+    mult = _UNIT_TO_LBS.get(key)
+    if mult is None and " " in key:              # 双词没命中,退回首词("lbs foo" → lbs)
+        mult = _UNIT_TO_LBS.get(key.split()[0])
+    if mult is None:
+        return None, "unknown_unit"
+    return num * mult, "parsed"
+
+
+def shipping_weight_ex(product: dict | None) -> tuple[float, str]:
+    """输入:产品数据 → 输出:(发货重量**磅**, 归因)。归因见 WEIGHT_REASONS。
+
+    采集契约:slow.weight = {package, item}(包装重与本体重,不合并)——
+    发货重量取**包装重优先、本体重次之**(既有顺序)。形态不定(数字 /
+    {value,unit} / 带单位串),单位一律**从数据里读**:
+      · parsed      —— 读到显式单位、折算后是 (0, 11] 磅的正数,按它发;
+      · no_weight   —— 两个键都没值 / 值里根本没有数字("N/A");
+      · no_unit     —— 有数字但**没有单位记号**(裸数字不假设是磅);
+      · unknown_unit—— 有单位记号但不在 `_UNIT_TO_LBS` 里(不猜);
+      · over_cap    —— 折算后 > MAX_SHIPPING_WEIGHT_LBS(所有者定稿的不可信线);
+      · nonpositive —— 折算后 ≤ 0。
+    后五档一律返回 DEFAULT_SHIPPING_WEIGHT(= 1.0 磅,所有者定稿)。
+
+    ⚠ 兜底值与"真的 1.0 磅"在数值上分不开,所以**要分清就读第二个返回值**;
+    `shipping_weight()` 是本函数的薄封装(一条实现路径,不另写解析)。
+    """
+    weight = ((product or {}).get("attrs") or {}).get("weight")
+    first = ""
+    for key in ("package", "item"):
+        v = weight.get(key) if isinstance(weight, dict) else None
+        if v in (None, ""):
+            continue
+        lbs, why = _parse_weight_value(v)
+        if lbs is None:
+            first = first or why                 # 包装重读不出,再看本体重
+            continue
+        lbs = round(lbs, 2)
+        if lbs <= 0:
+            first = first or "nonpositive"
+            continue
+        if lbs > MAX_SHIPPING_WEIGHT_LBS:
+            # 超上限**就地判定**,不再退到本体重:退过去等于拿另一个数替它猜。
+            logger.debug("发货重量 %.2f 磅超上限 %s,按 %s 磅发(%r)",
+                         lbs, MAX_SHIPPING_WEIGHT_LBS,
+                         DEFAULT_SHIPPING_WEIGHT, weight)
+            return DEFAULT_SHIPPING_WEIGHT, "over_cap"
+        return lbs, "parsed"
+    reason = first or "no_weight"
+    # 逐行只落 debug(上架链一轮几百行,info 会把摘要淹了);**计数在调用方的
+    # 摘要里按归因分桶**(workflows/list_new 的重量桶、sku_migrate 的兜底行数)。
+    logger.debug("发货重量落兜底 %s 磅(%s):weight=%r",
+                 DEFAULT_SHIPPING_WEIGHT, reason, weight)
+    return DEFAULT_SHIPPING_WEIGHT, reason
 
 
 def shipping_weight(product: dict | None) -> float:
-    """输入:产品数据 → 输出:发货重量(磅);采不到按 DEFAULT_SHIPPING_WEIGHT。
+    """输入:产品数据 → 输出:发货重量(磅)。`shipping_weight_ex` 的薄封装。
 
-    采集契约:slow.weight = {package, item}(包装重与本体重,不合并)——
-    发货重量取包装重,退而取本体重。形态不定(数字 / {value,unit} / 带单位串),
-    这里只负责取出一个正数。
+    只要重量,不关心是"真值"还是"兜底"时用它;要分清就用
+    `shipping_weight_ex`(解析逻辑只有那一份,这里不许再写第二份)。
     """
-    weight = ((product or {}).get("attrs") or {}).get("weight")
-    for key in ("package", "item"):
-        v = weight.get(key) if isinstance(weight, dict) else None
-        if isinstance(v, dict):
-            v = v.get("value") or v.get("measure") or v.get("amount")
-        if isinstance(v, (int, float)) and v > 0:
-            return round(float(v), 2)
-        if isinstance(v, str):
-            m = re.search(r"\d+(?:\.\d+)?", v)
-            if m and float(m.group()) > 0:
-                return round(float(m.group()), 2)
-    return DEFAULT_SHIPPING_WEIGHT
+    return shipping_weight_ex(product)[0]
 
 
 # Orderable 段的**系统专属字段**(旧 mapper 的 10 项 force_overrides +
@@ -638,11 +783,17 @@ def shipping_weight(product: dict | None) -> float:
 # 它得继续挡住 LLM 往 Orderable 里塞这个字段(spec 外字段会让整条被拒,
 # EXT_DATA_ERROR_60670554076755),也继续不进 LLM 提示词。
 # 这些字段也不进 LLM 提示词(旧 _orderable_fields_for_llm 同款剔除)。
+# `SkuUpdate` 是沃尔玛的**系统专属开关字段**(不是内容字段):**本仓没有任何
+# 工作流写它**(2026-09-06:改码通道定案 MP_ITEM_MATCH,靠「同 GTIN + 新 SKU +
+# REPLACE」原地换码,载荷里根本没有这个字段;形态 A/B 两条 SkuUpdate 路线连同
+# `build_sku_update_item` 与 `build_orderable(sku_update=)` 一起删了)。
+# 它**留在这张表里**是为了继续挡住 LLM:LLM 填了它,后果不是报错,而是
+# **沃尔玛把一次普通上架当成改码请求**,这是本仓能想到的最贵的静默失效。
 ORDERABLE_SYSTEM_FIELDS = (
     "sku", "productIdentifiers", "price", "inventory", "startDate", "endDate",
     "MustShipAlone", "fulfillmentLagTime",
     "country_of_origin_substantial_transformation", "specProductType",
-    "ShippingWeight", "brand", "productName",
+    "ShippingWeight", "brand", "productName", "SkuUpdate",
 )
 
 
@@ -677,6 +828,15 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
       · **不发 brand / countryOfOriginAssembly**(2026-08-12 旧仓对照删除:
         旧金样从未发过这两个字段,Orderable 多发字段与 productName 同一血统
         EXT_DATA_ERROR_60670554076755)
+
+    ⚠ 本函数**永远不写 `SkuUpdate`**(2026-09-06 删除了 `sku_update=` 形参):
+    改码通道定案为 MP_ITEM_MATCH,靠「同 GTIN + 新 SKU + REPLACE」原地换码
+    (workflows/sku_migrate + services/match_feed.build_match_item),载荷里没有
+    这个字段。留着那个形参就是第二条改码路径(§六 双轨禁止),而且它现在还是
+    **会静默失效**的那一条 —— `mp_conform.strip_unknown` 的 SkuUpdate 放行分支
+    已随之删除,spec 里没有它 ⇒ 传了会被裁掉 ⇒ 一次改码退化成一次普通上架
+    (同店双挂),回执还全绿。`SkuUpdate` 仍留在 ORDERABLE_SYSTEM_FIELDS 里,
+    职责只剩一个:挡住 LLM 往 Orderable 里塞它。
     """
     end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
     o = {k: v for k, v in (llm_fields or {}).items()

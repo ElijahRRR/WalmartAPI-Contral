@@ -139,7 +139,7 @@ from api import feishu, scraper
 from registry import db, resources
 from services import (brand_key, kpi, order_audit as rules,
                       product_ingest as ingest, risk_trace,
-                      scrape_batches as batches, sku_asin, store_events,
+                      scrape_batches as batches, store_events,
                       stores as stores_svc)
 # ⚠ `stores as stores_svc` 是同一个坑的预防:run() 里的局部 `stores` 是店铺
 # 过滤参数,同名导入迟早被谁在 run() 内引用一次然后当场 AttributeError。
@@ -420,7 +420,7 @@ def _snapshots(conn, lines: list[dict]) -> dict[tuple[str, str], dict]:
       引擎就是另一组,各留各的最新。所以这里必须按 scraped_at **取最新那条**,
       不能让字典后写覆盖先写(那等于随机挑一条,时好时坏且无法复现)。
     """
-    asins = sorted({(r["sku"] or "").strip().upper() for r in lines if r.get("sku")})
+    asins = sorted({a for a in (rules.line_asin(r) for r in lines) if a})
     if not asins:
         return {}
     with conn.cursor() as cur:
@@ -458,8 +458,8 @@ def _scrape_fails(conn, lines: list[dict]) -> dict[tuple, str]:
     判定链要按 error_type 分流:重采也没用的那类(variant_offset 等)该给
     终局结论,而不是永远挂"待采集"等一个不会来的快照。
     """
-    pairs = {((r.get("sku") or "").strip().upper(),
-              rules.norm_zip(r.get("postal_code"))) for r in lines}
+    pairs = {(rules.line_asin(r), rules.norm_zip(r.get("postal_code")))
+             for r in lines}
     pairs = {(a, z) for a, z in pairs if a and z}
     if not pairs:
         return {}
@@ -476,7 +476,7 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     results: list = []
     want: list = []
     for line in lines:
-        asin = (line.get("sku") or "").strip().upper()
+        asin = rules.line_asin(line)
         zip5 = rules.norm_zip(line.get("postal_code"))
         snap = snaps.get((asin, zip5)) if zip5 else None
         res = rules.judge(line, snap, suppliers, blacklist,
@@ -1234,10 +1234,7 @@ def _phish_record(conn, cands: list[dict], source: str) -> tuple[list[dict], int
     """
     if not cands:
         return [], 0
-    asin_of = {c["order_line_id"]:
-               (str(c.get("asin") or "").strip().upper()
-                or sku_asin.extract_asin(c.get("sku") or "") or "")
-               for c in cands}
+    asin_of = {c["order_line_id"]: rules.line_asin(c) for c in cands}
     brands = _phish_brands(conn, [a for a in asin_of.values() if a])
     reg: dict = {}
     order_rows: list[dict] = []

@@ -29,6 +29,10 @@ logger = logging.getLogger("services.match_sheet")
 
 PENDING = ("", "处理中")
 _WRITE_COLS = 11    # A~K
+#: 本表的**提交方**工作流名(唯一出处):`workflows/match_listing` 提交 feed 时传的
+#: `workflow=` 就是它,反哺器按它正向过滤台账。写成常量而不是两处各写一个字面量,
+#: 是因为两处一漂就是"回填 0 行"而且不报错(表现像"台账尚无新终态")。
+WORKFLOW = "match_listing"
 
 
 def read_rows() -> list[dict]:
@@ -83,11 +87,22 @@ def row_vals(r: dict) -> list:
             r["check_time"]]
 
 
-def sync_from_ledger() -> str | None:
-    """输入:无 → 输出:回写摘要一行;表未配置或无在途行返回 None。
+def sync_from_ledger(execute: bool = True) -> str | None:
+    """输入:是否真跑(feed_poll 透传) → 输出:回写摘要一行;表未配置或无在途行返回 None。
 
     feed_poll 反哺器:I 有 feedId 且 J 空/处理中的行,按 ops.feed_items
     台账落 J(成功/失败:码/未查到)与 K(查询时间)。纯读库零沃尔玛调用。
+
+    ⚠ 台账**按 workflow='match_listing' 正向过滤**(2026-09-06 加):存量改码
+    `workflows/sku_migrate` 的通道从 MP_MAINTENANCE 切到了 **MP_ITEM_MATCH**,
+    与跟卖链**共用同一个 feedType**。不过滤时,只要一条改码回执的 SKU 与本表某行
+    的 B 列撞上(改码发的是 12 位不透明码,跟卖 B 列人工号也可能是任意串),
+    那条改码的成败就会被写进跟卖表的「feed 结果」列 —— 行是跟卖那一行,结论是
+    别人的,而且不报错。过滤写成**正向**(= 只认自己发的)而不是 `<> 'sku_migrate'`:
+    将来再多一条共用 MP_ITEM_MATCH 的链,黑名单要人记得去加,白名单不用。
+
+    `execute=False`(`cli.py feed_poll --dry-run`)只报数,不发写请求
+    (五个反哺器统一带这个关键字参数,_one_chain 用同一种调用形态)。
     """
     try:
         resources.MATCH_SHEET.require()
@@ -104,8 +119,8 @@ def sync_from_ledger() -> str | None:
     for r in pollable:
         fid = r["feed_id"]
         if fid not in cache:
-            cache[fid] = feed_track.item_results(fid)
-            descs[fid] = feed_track.item_errors(fid)
+            cache[fid] = feed_track.item_results(fid, workflow=WORKFLOW)
+            descs[fid] = feed_track.item_errors(fid, workflow=WORKFLOW)
         st = cache[fid].get(r["sku"])
         if st is None or st[0] == "submitted":
             continue
@@ -119,5 +134,7 @@ def sync_from_ledger() -> str | None:
         updates.append((r["rownum"], row_vals(r)))
     if not updates:
         return f"跟卖表:在途 {len(pollable)} 行,台账尚无新终态"
+    if not execute:
+        return f"[DRY-RUN] 跟卖表:将回填 {len(updates)} 行(在途 {len(pollable)})"
     n = write_rows(updates)
     return f"跟卖表回填 {n} 行(在途 {len(pollable)})"

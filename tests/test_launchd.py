@@ -97,7 +97,7 @@ def test_manual_only_workflows_are_not_scheduled():
     不是因为"跟卖不该自动化"。
     """
     scheduled = {w for j in schedule.JOBS for w in j["workflows"]}
-    for name in ("match_listing", "sku_locked_heal",
+    for name in ("match_listing", "sku_locked_heal", "sku_migrate",
                  "scrape_missing", "brand_scrape",
                  "alloc_plan", "alloc_backfill", "order_center_push"):
         assert name not in scheduled, name

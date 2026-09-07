@@ -123,9 +123,15 @@ _WRITE_BATCH = 500
 # ⚠ 反例面**不按在架/缺席过滤**:被沃尔玛下架的品多数已经缺席(missing_since
 # 非空),按在架口径滤掉的话本集会只剩刚被拒还没消失的那一小撮。
 # 一个 sku 可能在多家店都有行,`DISTINCT ON` 取一行(店铺不参与身份)。
+# ⚠ 但**那一行的 store 要带出来**(2026-09-06 补,审计缺口 G-2):身份反查
+#   `resolve_pairs` 的登记簿主键是 (store, sku),不带店就只剩形态腿,12 位
+#   不透明码必返 None —— 新码被拒过的品会从反例池里静默消失,转头以"干净"
+#   身份被抽进正例。DISTINCT ON (w.sku) 的「一个 sku 只取一行」语义不变,
+#   只是那一行现在多带一列。
 _NEG_SQL = """
-SELECT sku, reasons FROM (
-    SELECT DISTINCT ON (w.sku) w.sku AS sku, w.unpublished_reasons AS reasons
+SELECT sku, store, reasons FROM (
+    SELECT DISTINCT ON (w.sku) w.sku AS sku, w.store AS store,
+           w.unpublished_reasons AS reasons
     FROM catalog.walmart_items w
     WHERE coalesce(w.unpublished_reasons, '') <> ''
     ORDER BY w.sku, w.store
@@ -149,9 +155,14 @@ LIMIT %(pool)s
 #   跨店取 `min`:同一个 sku 在多店有行,取最早那条还活着的。
 # NOT EXISTS 那一条照旧必须:同一个 sku 在 A 店在架、在 B 店被拒是常态,
 # 只看本行会把反例算成正例。
+# ⚠ `store` 一并带出(2026-09-06,审计缺口 G-2):身份反查要 (store, sku) 对。
+#   同一个 sku 跨店有行只可能是旧的 ASIN 式订货号(不透明码由
+#   `listing_sources_opaque_sku_uidx` 禁止跨店复用),任取一家即可 ——
+#   新码那一批 min(store) 取到的就是它唯一那家;旧码取错店查不到登记簿行,
+#   落回形态腿,与 0a 之前逐字同结果。
 _POS_SQL = """
-SELECT sku, age_days FROM (
-    SELECT w.sku AS sku,
+SELECT sku, store, age_days FROM (
+    SELECT w.sku AS sku, min(w.store) AS store,
            (extract(epoch FROM now() - min(w.created_at)) / 86400)::int AS age_days
     FROM catalog.walmart_items w
     WHERE w.published_status = 'PUBLISHED'
@@ -227,12 +238,16 @@ WHERE run_tag = %(tag)s
 ORDER BY asin
 """
 
-# **任何一家店给过下架原因**的 sku(只取 sku 一列,不带长文本)。
+# **任何一家店给过下架原因**的 (店, sku)(只取两列短文本,不带下架原因正文)。
 # ⚠ 这里**不设上限**,而且不许设:它是正例的"干净"判据,漏一行就是把一个
 # 沃尔玛拒过的品当成在架好品去算误伤率 —— 抽样面可以封顶(抽不到就是没抽到),
-# 判据面不行。只取一列 text,生产是几万行的量级,内存与拉全表带正文不是一回事。
+# 判据面不行。只取两列 text,生产是几万行的量级,内存与拉全表带正文不是一回事。
+# ⚠ store 是 2026-09-06 补的(审计缺口 G-2):不带店,`resolve_pairs` 的登记簿
+#   腿永不执行,12 位新码必返 None ⇒ 被拒过的新码品从"曾被拒"名单里消失,
+#   正好以正例身份进底线样本。DISTINCT 从 sku 级变 (店, sku) 级,行数变多,
+#   下游本来就按 asin 折叠成集合,判据一字不变。
 _REJECTED_SKU_SQL = """
-SELECT DISTINCT sku FROM catalog.walmart_items
+SELECT DISTINCT store, sku FROM catalog.walmart_items
 WHERE coalesce(unpublished_reasons, '') <> ''
 """
 
@@ -509,7 +524,7 @@ def _negatives(conn, opts: Opts, policy_names: list) -> tuple[list, dict]:
           "policy_unjoined": 0, "policy_noname": 0, "off_set": 0,
           "no_asin": 0, "no_product": 0}
     keep: list = []
-    for sku, text in raw:
+    for sku, store, text in raw:
         res = error_taxonomy.classify_reasons(
             error_taxonomy.split_reasons(text), policy_names)
         lab = label(res, policy_names)
@@ -526,13 +541,20 @@ def _negatives(conn, opts: Opts, policy_names: list) -> tuple[list, dict]:
                 st["off_set"] += 1
             continue
         st["coded"] += 1
-        keep.append((sku, lab, res.code, (text or "")[:200]))
-    mapping, _ = sku_asin.resolve_skus(conn, [k[0] for k in keep])
+        keep.append((sku, store, lab, res.code, (text or "")[:200]))
+    # ⚠ 身份反查用 `resolve_pairs`(登记簿优先、形态兜底),入参是
+    #   **(店铺, sku) 对**。本工作流三处取数都按 asin 级聚合,2026-09-06 之前
+    #   SQL 里不带店、一律传 `(None, sku)` —— 登记簿主键是 (store, sku),
+    #   store 为空时那一跳被显式跳过,只剩形态腿,12 位不透明码
+    #   必返 None ⇒ 新码被拒过的品从反例池静默消失,转头以"干净"身份被抽进
+    #   正例、污染所有者唯一的底线指标。现在三条 SQL 都带出 store,传真对子。
+    mapping, _ = sku_asin.resolve_pairs(conn, [(k[1], k[0]) for k in keep])
+    mapping = {sku: a for (_st, sku), a in mapping.items()}
     st["no_asin"] = sum(1 for k in keep if k[0] not in mapping)
     have = _with_product(conn, [mapping[k[0]] for k in keep if k[0] in mapping])
     out: list = []
     seen: set = set()
-    for sku, (cat, stratum), _code, snippet in keep:
+    for sku, _store, (cat, stratum), _code, snippet in keep:
         asin = mapping.get(sku)
         if not asin:
             continue
@@ -558,7 +580,9 @@ def rejected_asins(conn) -> set:
     以正例身份进样本,新链判拒它反而被算成"误伤",直接污染所有者唯一的底线指标。
 
     所以在 Python 里按**唯一那份规则**(`services/sku_asin`)把下架侧的 sku
-    全量折成 asin。只取 `sku` 一列(不带下架原因长文本),生产是几万行的量级。
+    全量折成 asin,反查传的是 **(店, sku) 对**(2026-09-06 补,见 SQL 头注:
+    不带店就只剩形态腿,新码必返 None)。只取 `store`/`sku` 两列(不带下架原因
+    长文本),生产是几万行的量级。
     ⚠ **不设上限,也不许设**:抽样面可以封顶(抽不到就是没抽到),判据面封顶
     等于随机漏掉几个"其实被拒过"的品,而且不会报错。
 
@@ -570,8 +594,9 @@ def rejected_asins(conn) -> set:
     (那张表的键是 sku/asin 混装,要过一次 sku_asin;暂不做,记在这里)。
     """
     rows = _rows(conn, _REJECTED_SKU_SQL, {})
-    skus = [r[0] for r in rows if r[0]]
-    mapping, _ = sku_asin.resolve_skus(conn, skus)
+    pairs = [(r[0], r[1]) for r in rows if r[1]]      # (店, sku),店见 SQL 头注
+    mapping, _ = sku_asin.resolve_pairs(conn, pairs)
+    mapping = {sku: a for (_st, sku), a in mapping.items()}
     ever = {r[0] for r in _rows(conn, _EVER_FLAGGED_SQL, {}) if r[0]}
     return set(mapping.values()) | ever
 
@@ -597,8 +622,9 @@ def _positives(conn, opts: Opts, neg_asins: set, rejected: set) -> tuple[list, d
                  "min_days": opts.pos_days})
     total, oldest = _rows(conn, _POS_POOL_TOTAL_SQL, {})[0]
     skus = [r[0] for r in raw]
-    ages = [r[1] for r in raw if r[1] is not None]
-    mapping, _ = sku_asin.resolve_skus(conn, skus)
+    ages = [r[2] for r in raw if r[2] is not None]
+    mapping, _ = sku_asin.resolve_pairs(conn, [(r[1], r[0]) for r in raw])
+    mapping = {sku: a for (_st, sku), a in mapping.items()}   # 带店见 _POS_SQL 头注
     cand = set(mapping.values())
     st = {"scanned": len(raw), "pool_cap": pool,
           "min_days": opts.pos_days, "clean_total": total,

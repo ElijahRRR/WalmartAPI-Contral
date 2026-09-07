@@ -720,7 +720,14 @@ def test_items那一级要按asin也索引一份_否则sku对不上就查不中(
     from workflows import error_reclass
     sig = inspect.signature(error_source.fetch)
     assert sig.parameters["items_by_asin"].default is False   # 缺省不付代价
-    assert "extract_asin" in inspect.getsource(error_source.items_by_asin_map)
+    # ⚠ 身份走**登记簿**不是裸形态提取(SKU 改造收口,所有者 2026-09-04 拍板):
+    #   新码是 12 位不透明随机码,`extract_asin` 对它一律返回 None ⇒ 新码那批行
+    #   永远进不了 items 这一级,而且不报错(表现只是"判得糙一点")。
+    #   `resolve_many` 是登记簿优先、形态兜底的那块积木,旧码逐行结果不变。
+    _src = inspect.getsource(error_source.items_by_asin_map)
+    assert "resolve_many" in _src
+    assert "extract_asin" not in _src.replace("`extract_asin(sku)`", "")   # 只许出现在注释里
+    assert "SELECT store, sku" in error_source.SRC_ITEMS_ANY   # 登记簿主键要店铺
     # ⚠ 消费方只剩 `error_reclass`(存量复核):那 14,474 条 self(残文)**有**
     #   src_sku,但那个 sku 在 walmart_items 里已经不在了(下架删除),照样查不中,
     #   所以要按 asin 兜底。它分批跑,故在**循环外**查一次、跨批复用。
@@ -840,8 +847,17 @@ def test_产品事件是产品级记录_下游只读码():
     assert "classify_reasons" not in judge and "worst_verdict" in judge
     sql = blacklist._HISTORY_SQL
     assert "detail->>'category'" in sql and "detail->>'taxonomy_term'" in sql
-    assert "GROUP BY 1" in sql and "coalesce(asin, sku) AS asin" in sql
+    assert "GROUP BY 1" in sql
     assert "DISTINCT ON" not in sql        # 不许退回「只取最新一条」
+    # ⚠ 身份表达式经**登记簿**(SKU 改造收口):main 原写的是裸
+    #   `coalesce(asin, sku)`,新码上线后那批行的 sku 是 12 位不透明码、
+    #   `product_events.asin` 可能为空 ⇒ 身份落到随机码上,同一个产品在
+    #   事件链与黑名单链里成了两个身份。唯一出处是 `_EV_CTE` 的 `ident`,
+    #   两条链(_LATEST_CTE / _HISTORY_SQL)都建在它上面,不许各写一份。
+    assert "coalesce(ls.source_key, e.asin, e.sku) AS ident" in blacklist._EV_CTE
+    assert sql.startswith(blacklist._EV_CTE)
+    assert blacklist._LATEST_CTE.startswith(blacklist._EV_CTE)
+    assert "ident AS asin" in sql
 
 
 def test_restore只接回被截掉的那段_不换成别的文本():

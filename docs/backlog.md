@@ -356,3 +356,23 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   的代价是每轮多敲几张飞书表(那正是治理快照最贵的一段)。采购方表则是
   **真缺口**,只是它属于订单审核域 —— 哪天做,照 `store_config` 的形状抄一份
   (整表原文快照 + 逐格 diff + `ops.cursors` 存最近一版)即可,别新造口径。
+
+## 十三、僵尸列表与破坏类处置卡死(2026-09-07 生产诊断,所有者定:**不在 PR #104 做,另议**)
+
+现象(A085朱丽霖):ops.dispositions 里 delete 655 / retire 592 条自 08-17/08-24 起停在
+executing。回执分布:611 条删除回执 success 但带 `EXT_DATA_ERROR_60745664660159`
+「[QARTH] No matching record found for the SKU」;592 条停用全部 `ERR_PDI_0004` 通用异常
+(全船队近 30 天 RETIRE_ITEM 三万余条几乎 100% 同款);真在架却删不掉的只有 9 条
+(WFS 不许删 0101218 / 已停用 60706056565050 / Reingestion 69730864580258 × 7)。
+根因:08-28 沃尔玛列表接口可见性变更把已删档案照旧吐回(单条 GET 404 而列表 PUBLISHED/
+ACTIVE),problem_scan 每天建议删/停,cleanup 每天发、每天失败;删除核验
+(product_events.verify_deletions)只对 delete_feed_success 事件等"从列表消失",失败回执
+没有任何路径收掉处置。
+代价:每天烧 DELETE/RETIRE 配额发注定失败的 feed;这些 SKU 的码永远弃不掉、UPC 永不释放
+(弃码点 1 靠观测触发);登记簿仍是活码 ⇒ list_new 本店去重闸判「同 ASIN 已在架」,
+该 ASIN 在该店再也上不了;改码与维护对它们的排除本身无害(确实死了)。
+建议修法(待所有者点头):对 executing 的破坏类处置、回执 failed 或 QARTH「No matching
+record」的 (店, SKU) 逐条单查(api/items.get_item),404 ⇒ 标 missing_since 当观测缺席,
+定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮限额几天清完;查到 200 的
+(WFS 等)处置落 failed 终态放行维护,是否再建议按错误码定规则;problem_scan 对
+「已判 No matching record」的行是否停止再建议一并定。

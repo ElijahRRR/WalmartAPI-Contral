@@ -183,6 +183,10 @@ def _wire(monkeypatch, *, open_row=None, rows=None, current=None,
     monkeypatch.setattr(wf.reports, "download_report", lambda url, proxy: b"blob")
     monkeypatch.setattr(wf.reports, "parse_report_csv", lambda blob: list(rows or []))
     monkeypatch.setattr(wf.walmart_catalog, "item_id_map", lambda conn, s: dict(current or {}))
+    monkeypatch.setattr(wf.walmart_catalog, "in_catalog_profile",
+                        lambda conn, s: [{"sku": k, "item_id": v, "lifecycle_status": "ACTIVE",
+                                          "published_status": "PUBLISHED", "first_seen": None}
+                                         for k, v in (current or {}).items()])
     monkeypatch.setattr(wf.walmart_catalog, "set_item_ids",
                         lambda conn, s, m: log["written"].update(m) or len(m))
     return log
@@ -674,3 +678,34 @@ def test_probe_prints_date_spans(monkeypatch):
     lines = wf._probe_lines(r)
     assert any(ln.startswith("  Item Creation Date:最早 2025-11-01") for ln in lines)
     assert any(ln.startswith("  Item Last Updated:最早 2026-09-01") for ln in lines)
+
+
+# ── 所有者 2026-09-07:覆盖率缺口不猜,拿报表 SKU × catalog_sync 名单对账 ───────────
+
+def test_reconcile_breakdown_groups_both_sides():
+    from datetime import datetime
+    catalog = [
+        {"sku": "A", "lifecycle_status": "ACTIVE", "published_status": "PUBLISHED", "first_seen": datetime(2024, 5, 1)},
+        {"sku": "B", "lifecycle_status": "RETIRED", "published_status": "UNPUBLISHED", "first_seen": datetime(2023, 1, 1)},
+        {"sku": "C", "lifecycle_status": "RETIRED", "published_status": "UNPUBLISHED", "first_seen": None},
+        {"sku": "D", "lifecycle_status": None, "published_status": "PUBLISHED", "first_seen": datetime(2026, 2, 2)},
+    ]
+    report = [_row(SKU="A", **{"Lifecycle Status": "ACTIVE", "Publish Status": "PUBLISHED"}),
+              _row(SKU="Z", **{"Lifecycle Status": "ACTIVE", "Publish Status": "UNPUBLISHED"}),
+              _row(SKU="Z", **{"Lifecycle Status": "ACTIVE", "Publish Status": "UNPUBLISHED"}),   # 重复 SKU 只算一次
+              _row(**{"Item ID": "9"})]                                                          # 无 SKU 忽略
+    rc = ir.reconcile_breakdown(catalog, report)
+    assert rc["unmatched"] == 3 and rc["unmatched_sample"] == ["B", "C", "D"]
+    assert rc["unmatched_by_status"] == {"RETIRED/UNPUBLISHED": 2, "?/PUBLISHED": 1}
+    assert rc["unmatched_by_year"] == {2023: 1, 2026: 1, "?": 1}
+    assert rc["extra"] == 1 and rc["extra_by_status"] == {"ACTIVE/UNPUBLISHED": 1} and rc["extra_sample"] == ["Z"]
+
+
+def test_probe_prints_reconciliation(monkeypatch):
+    _wire(monkeypatch, rows=_ROWS, current={"A": None, "B": None, "X": None})
+    r = wf._one_store(STORE, 60, 300, probe=True)
+    assert r["recon"]["unmatched"] == 1 and r["recon"]["unmatched_sample"] == ["X"]
+    assert r["recon"]["extra"] == 1 and r["recon"]["extra_sample"] == ["C"]
+    lines = wf._probe_lines(r)
+    assert any("对账·在架不在报表 1 行" in ln and "ACTIVE/PUBLISHED" in ln for ln in lines)
+    assert any("对账·报表有但在架名单没有 1 行" in ln for ln in lines)

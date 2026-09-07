@@ -7,6 +7,7 @@
   plan_updates(current, mapping)    在架现值 × 报表映射 → ({sku: 要写的 item_id}, 计数)
   coverage_note(counters)           计数 → 「疑似不全」提示或空串
   date_span(rows, column)           报表行 + 日期列名 → 最早/最晚/按年计数(探针判断数据范围按哪列筛)
+  reconcile_breakdown(catalog, rows) 在架行画像 + 报表行 → 两边差集按状态/入库年分组(探针对账,不猜)
   wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表生成器找到即停)
   台账 ops.report_requests:open_request / expire_stale / record_pending / mark_*
 
@@ -32,6 +33,7 @@
 
 import logging
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from api import reports
@@ -120,6 +122,49 @@ def date_span(rows: list[dict], column: str) -> dict:
         out["min"], out["max"] = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
         out["by_year"] = dict(sorted(out["by_year"].items()))
     return out
+
+
+# ── 对账明细(探针)──────────────────────────────────────────────────────────
+
+_RECON_SAMPLE = 8
+
+
+def reconcile_breakdown(catalog_rows: list[dict], report_rows: list[dict]) -> dict:
+    """输入:在架行画像(walmart_catalog.in_catalog_profile)+ 报表行 → 输出:对账明细 dict。
+
+    unmatched_by_status {"lifecycle/published": n}、unmatched_by_year {首次入库年: n}、
+    unmatched_sample [sku…]:在架却不在报表里的行是什么;
+    extra_by_status {"报表 Lifecycle/Publish": n}、extra_sample:报表有、在架名单没有的行。
+    所有者 2026-09-07:覆盖率缺口是老品掉出数据范围、还是 catalog_sync 名单里的僵尸 /
+    RETIRED 存档(08-28 起 GET /v3/items 会把删除后的存档也列出来),拿两边名单对一下
+    就知道,不猜 —— 这一步就是「全量靠对账不靠参数」的对账本身。
+    """
+    report_by_sku: dict[str, dict] = {}
+    for r in report_rows:
+        sku = reports.report_row_sku(r)
+        if sku:
+            report_by_sku.setdefault(sku, r)
+    catalog_skus = {r["sku"] for r in catalog_rows}
+    unmatched = [r for r in catalog_rows if r["sku"] not in report_by_sku]
+    extra = [r for sku, r in report_by_sku.items() if sku not in catalog_skus]
+
+    def year(v):
+        return getattr(v, "year", None) or "?"
+
+    return {
+        "unmatched": len(unmatched),
+        "unmatched_by_status": dict(Counter(
+            f"{r.get('lifecycle_status') or '?'}/{r.get('published_status') or '?'}" for r in unmatched
+        ).most_common()),
+        "unmatched_by_year": dict(sorted(Counter(year(r.get("first_seen")) for r in unmatched).items(),
+                                         key=lambda kv: str(kv[0]))),
+        "unmatched_sample": [r["sku"] for r in unmatched[:_RECON_SAMPLE]],
+        "extra": len(extra),
+        "extra_by_status": dict(Counter(
+            f"{r.get('Lifecycle Status') or '?'}/{r.get('Publish Status') or '?'}" for r in extra
+        ).most_common()),
+        "extra_sample": [reports.report_row_sku(r) for r in extra[:_RECON_SAMPLE]],
+    }
 
 
 # ── 表头守门 ────────────────────────────────────────────────────────────────

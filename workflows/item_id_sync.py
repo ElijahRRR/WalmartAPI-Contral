@@ -192,6 +192,7 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
         if probe:
             # 探针不写 item_id;台账停在 ready,紧接着的真跑直接下载不重建
             outcome = "probe"
+            recon = ir.reconcile_breakdown(walmart_catalog.in_catalog_profile(conn, name), rows)
         else:
             walmart_catalog.set_item_ids(conn, name, updates)
             ir.mark_applied(conn, row_id, counters, note=drift)
@@ -206,6 +207,7 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
                           reports.item_id_from_url(r)) for r in rows[:_PROBE_SAMPLE]]
         res["publish"] = dict(Counter(str(r.get("Publish Status") or "") for r in rows))
         res["dates"] = {c: ir.date_span(rows, c) for c in ir.DATE_COLUMNS}
+        res["recon"] = recon
         res["lifecycle"] = dict(Counter(str(r.get("Lifecycle Status") or "") for r in rows))
     return res
 
@@ -241,6 +243,13 @@ def _probe_lines(r: dict) -> list[str]:
     out.append(f"  Publish Status 分布:{r['publish']}")
     out.append(f"  Lifecycle Status 分布:{r['lifecycle']}")
     out.append(f"  样本(SKU, Item ID 列, URL 尾段):{r['sample']}")
+    rc = r.get("recon")
+    if rc:
+        # 对账:覆盖率缺口是什么,拿两边名单分组看,不猜(所有者 2026-09-07)
+        out.append(f"  对账·在架不在报表 {rc['unmatched']} 行:按库里 lifecycle/published {rc['unmatched_by_status']};"
+                   f"按首次入库年 {rc['unmatched_by_year']};样本 {rc['unmatched_sample']}")
+        out.append(f"  对账·报表有但在架名单没有 {rc['extra']} 行:按报表 Lifecycle/Publish {rc['extra_by_status']};"
+                   f"样本 {rc['extra_sample']}")
     b = r.get("blob") or {}
     if b:
         out.append(f"  原件 {b['bytes']} 字节,zip 成员 {b['members'] or '无(裸 CSV)'},取 {b['member']};"

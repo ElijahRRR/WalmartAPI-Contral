@@ -13,9 +13,13 @@
   · **不复用**后台(Seller Center)或 Scheduler 生成的报表 —— 台账只认本仓自己
     POST 出去的 requestId;崩溃/超时后接着等的是自己那一份。
   · **报表为准**:库里已有 item_id 与报表不同,按报表改(计入 overwritten,摘要点名)。
-  · **全量靠对账不靠参数**:请求体不传过滤器(官方 ITEM 报表不传即整个目录),
-    「拿全没有」用报表 SKU 集合 × catalog_sync 扫回来的在架集合来证明(两边独立);
-    覆盖率低于阈值在首行点名「疑似不全」,当轮照填已匹配的行,明天再拿一份。
+  · **全量靠对账不靠参数**:请求体不传行过滤器,「拿全没有」用报表 SKU 集合 ×
+    catalog_sync 扫回来的在架集合来证明(两边独立);覆盖率低于阈值在首行点名
+    「疑似不全」,当轮照填已匹配的行,明天再拿一份。
+  · **数据范围带近 DATA_RANGE_DAYS 天**(所有者 2026-09-07 22:xx 决定):不带日期的
+    ITEM 报表只回 1 行(C021 探针,在架 1490 行;后台不设时间同样只显示很少),
+    官方参数 dataStartTime/dataEndTime 放 body,上限 730 天。范围按哪个日期列筛
+    官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 730。
 
 轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;单查 20/hour;列表官方表
 写 200/min 但生产实见是小时级桶 —— 2026-09-07 连打 4 次即 429、下枚令牌 142 秒后,
@@ -26,6 +30,7 @@
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 
 from api import reports
 from registry import paths
@@ -40,12 +45,28 @@ DEFAULT_WAIT_MIN = 60          # 官方典型 15–45 分钟;超过就把 reques
 DEFAULT_POLL_SECS = 300        # 列表与单查共用 18/hour 桶:五分钟一问,60 分钟 12 次 + 兜底 ≤2 次 < 18
 STATUS_FALLBACK_EVERY = 5      # 列表找不到 requestId 时,每第 N 次轮询才用一次 20/hour 单查
 
+DATA_RANGE_DAYS = 365          # 报表数据范围:近一年(所有者定;官方上限 730 天;-p data_days= 可覆盖)
+
 COVERAGE_WARN_RATIO = 0.95     # 报表匹配到的在架行 / 在架行 低于它 ⇒ 首行点名「疑似不全」
 COVERAGE_MIN_ROWS = 20         # 在架行太少时比例没意义,不报
 
 IN_FLIGHT_STATUSES = ("pending", "submitted", "ready")
 RETENTION_DAYS = 30            # 官方:请求与报表保留 30 天
 ORPHAN_PENDING_MIN = 15        # pending 无 requestId 超过它 = POST 前后崩溃留下的孤行
+
+
+# ── 数据范围 ────────────────────────────────────────────────────────────────
+
+def data_window(days: int = DATA_RANGE_DAYS, now: datetime | None = None) -> tuple[str, str]:
+    """输入:天数(+ 可注入的当前时刻)→ 输出:(dataStartTime, dataEndTime),官方格式 `YYYY-MM-DDTHH:mm:ssZ`(UTC)。
+
+    结束 = 现在,开始 = 现在 - days;days 夹在 1..730(官方上限两年)。
+    """
+    days = max(1, min(int(days), 730))
+    end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
+    start = end - timedelta(days=days)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return start.strftime(fmt), end.strftime(fmt)
 
 
 # ── 表头守门 ────────────────────────────────────────────────────────────────
@@ -250,13 +271,14 @@ def expire_stale(conn, store: str, report_type: str = REPORT_TYPE) -> int:
 
 
 def record_pending(conn, store: str, report_type: str, report_version: str,
-                   workflow: str) -> int:
-    """输入:连接 + 店铺 + 报表类型/版本 + 发起工作流 → 输出:新台账行 id(status=pending)。"""
+                   workflow: str, note: str = "") -> int:
+    """输入:连接 + 店铺 + 报表类型/版本 + 发起工作流(+ 备注:请求形状,如数据范围)
+    → 输出:新台账行 id(status=pending)。"""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO ops.report_requests (store, report_type, report_version, "
-            "status, workflow) VALUES (%s, %s, %s, 'pending', %s) RETURNING id",
-            (store, report_type, report_version, workflow))
+            "status, workflow, note) VALUES (%s, %s, %s, 'pending', %s, %s) RETURNING id",
+            (store, report_type, report_version, workflow, note[:500] or None))
         return cur.fetchone()[0]
 
 
@@ -285,11 +307,12 @@ def mark_applied(conn, row_id: int, counters: dict, note: str = "") -> None:
         cur.execute(
             "UPDATE ops.report_requests SET status = 'applied', applied_at = now(), "
             "rows_matched = %s, rows_filled = %s, rows_overwritten = %s, "
-            "rows_unmatched = %s, rows_no_id = %s, note = %s, updated_at = now() "
+            "rows_unmatched = %s, rows_no_id = %s, "
+            "note = concat_ws('; ', nullif(note, ''), nullif(%s, '')), updated_at = now() "
             "WHERE id = %s",
             (counters.get("matched", 0), counters.get("filled", 0),
              counters.get("overwritten", 0), counters.get("unmatched", 0),
-             counters.get("no_id", 0), note or None, row_id))
+             counters.get("no_id", 0), note or "", row_id))
 
 
 def mark_error(conn, row_id: int, note: str) -> None:

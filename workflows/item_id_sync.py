@@ -7,6 +7,8 @@
   python cli.py item_id_sync -p store=A085朱丽霖         # 单店
   python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本 + 原件留存与体检,**不写 item_id**
   python cli.py item_id_sync -p wait_min=60 -p poll_secs=300   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
+  python cli.py item_id_sync -p store=X -p data_days=730       # 报表数据范围天数(缺省 365,官方上限 730)
+  python cli.py item_id_sync -p store=X -p renew=1             # 台账在途行作废,重新创建(改了请求形状时用)
 
 为什么单独一条工作流(所有者定稿 2026-09-07):数字 itemId 只有 On-request ITEM
 报表能批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 实证);报表要等
@@ -17,8 +19,11 @@
 
 每店一轮(services/item_reports 是判据与台账的唯一出处):
   ① 台账 ops.report_requests 取本店最近一条未落定行 → 有 requestId 就接着等/接着下载,
-     **不重建**;没有才「先落 pending 再 POST」创建(POST 不自动重试;429 = 这小时
-     额度没了,本店本轮放弃、明天再来,不补试)。
+     **不重建**(`renew=1` 例外:在途行记 error 作废,重新创建 —— 改了请求形状时用);
+     没有才「先落 pending 再 POST」创建(POST 不自动重试;429 = 这小时额度没了,本店
+     本轮放弃、明天再来,不补试)。请求体带 dataStartTime/dataEndTime = 近 data_days 天
+     (缺省 365):不带日期的 ITEM 报表只回 1 行(2026-09-07 22:05 C021 探针实证,后台
+     不设时间同样只显示很少);范围记进台账 note。
   ② 轮询:先睡后查,用列表接口按 requestId 找自己那一份、找到即停(不带日期参数,
      带了回 400;nextCursor 是完整 query 串直接拼 URL;官方表 200/min 但生产实见是小时级
      桶,与单查共用 18/hour —— 均 2026-09-07 实证);五分钟一问,上限 wait_min,超时把
@@ -36,8 +41,9 @@
 06:40 日报链的 catalog_sync 一跑就带上了。
 
 **不复用**后台(Seller Center)/ Scheduler 生成的报表(所有者定稿 2026-09-07):只认自己
-POST 的 requestId。全量靠对账不靠参数:请求体不传过滤器(官方 ITEM 报表不传即整个目录,
-不按日期筛),「拿全没有」用报表 SKU 集合 × catalog_sync 扫回来的在架集合来证明。
+POST 的 requestId。全量靠对账不靠参数:请求体不传行过滤器,「拿全没有」用报表 SKU 集合 ×
+catalog_sync 扫回来的在架集合来证明;数据范围按哪个日期列筛官方没写,老品掉出窗口会
+体现为「疑似不全」,那时把 data_days 放到官方上限 730。
 
 失败处理走店级重试标准(conventions §四):跨店并发 → 凭证失效跳店 → 其余失败店跑完
 别人后串行补试一次(补试进来先查台账,已建的报表接着等,不会二次创建)→ 仍失败按
@@ -75,19 +81,30 @@ def _result(name: str, outcome: str, **kw) -> dict:
     return out
 
 
-def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
-    """输入:店铺 + 等待参数 + 是否探针 → 输出:该店结果 dict(outcome ∈ applied/probe/quota/timeout/error)。
+def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
+               data_days: int = ir.DATA_RANGE_DAYS, renew: bool = False) -> dict:
+    """输入:店铺 + 等待参数 + 是否探针(+ 数据范围天数 + 是否作废在途行重建)
+    → 输出:该店结果 dict(outcome ∈ applied/probe/quota/timeout/error)。
 
     网络类异常**抛出**交店级补试;补试进来先查台账,已建的报表接着等,不二次创建。
     """
     name = store["name"]
     t0 = time.monotonic()
+    window = None
     with db.pg_conn() as conn:
         ir.expire_stale(conn, name)
         row = ir.open_request(conn, name)
+        if row is not None and renew:
+            # 改了请求形状(如数据范围),在途的那份报表已没用:作废重建,不接着等
+            ir.mark_error(conn, row["id"], f"superseded: renew=1,原 requestId={row['request_id']}")
+            logger.info("店铺 %s 台账在途报表 %s(%s)按 renew=1 作废,重新创建",
+                        name, row["request_id"], row["status"])
+            row = None
         if row is None:
+            window = ir.data_window(data_days)
             row_id = ir.record_pending(conn, name, ir.REPORT_TYPE, ir.REPORT_VERSION,
-                                       WORKFLOW)
+                                       WORKFLOW, note=f"dataStartTime={window[0]} "
+                                                      f"dataEndTime={window[1]}")
             request_id, status, submitted_at = None, "pending", None
         else:
             row_id, request_id = row["id"], row["request_id"]
@@ -98,7 +115,8 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
     if not request_id:
         # 先落 pending 再调接口(CLAUDE.md 安全红线);POST 不自动重试
         try:
-            data = reports.create_report_request(store, ir.REPORT_TYPE, ir.REPORT_VERSION)
+            data = reports.create_report_request(store, ir.REPORT_TYPE, ir.REPORT_VERSION,
+                                                 data_start=window[0], data_end=window[1])
         except reports.ReportQuotaError as e:
             # 沃尔玛 429,或本地桶已记过这小时那一枚:本轮结局,不抛、不补试
             # (2026-09-07 生产实见:抛出去进串行补试,在创建桶里睡 3595 秒)
@@ -124,7 +142,8 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
         with db.pg_conn() as conn:
             ir.mark_submitted(conn, row_id, request_id)
         status, submitted_at = "submitted", None
-        logger.info("店铺 %s ITEM 报表已提交 requestId=%s", name, request_id)
+        logger.info("店铺 %s ITEM 报表已提交 requestId=%s(数据范围 %s ~ %s)",
+                    name, request_id, window[0], window[1])
 
     if status in ("pending", "submitted"):
         state, polls = ir.wait_ready(store, request_id, wait_min=wait_min,
@@ -178,7 +197,8 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool) -> dict:
             ir.mark_applied(conn, row_id, counters, note=drift)
             outcome = "applied"
     res = _result(name, outcome, counters=counters, note=drift,
-                  elapsed_min=(time.monotonic() - t0) / 60, request_id=request_id)
+                  elapsed_min=(time.monotonic() - t0) / 60, request_id=request_id,
+                  window=window)
     if probe:
         res["blob"] = blob_info
         res["header"] = header
@@ -211,6 +231,8 @@ def _store_line(r: dict) -> str:
 def _probe_lines(r: dict) -> list[str]:
     out = [f"探针 {r['store']}(requestId={r.get('request_id')}):表头 {len(r['header'])} 列"
            + ("(与 specs 原件一致)" if not r.get("note") else f";{r['note']}")]
+    if r.get("window"):
+        out.append(f"  本轮新建,数据范围 {r['window'][0]} ~ {r['window'][1]}")
     out.append(f"  Publish Status 分布:{r['publish']}")
     out.append(f"  Lifecycle Status 分布:{r['lifecycle']}")
     out.append(f"  样本(SKU, Item ID 列, URL 尾段):{r['sample']}")
@@ -230,13 +252,15 @@ def _probe_lines(r: dict) -> list[str]:
 
 
 def run(params: dict) -> str:
-    """输入:params(store/all/probe/wait_min/poll_secs;cli 注入 dry_run)→ 输出:补齐摘要。"""
+    """输入:params(store/all/probe/wait_min/poll_secs/data_days/renew;cli 注入 dry_run)→ 输出:补齐摘要。"""
     dry_run = bool(params.get("dry_run"))
     want_all = flag(params, "all")
     probe = flag(params, "probe")
+    renew = flag(params, "renew")
     only = params.get("store")
     wait_min = int(params.get("wait_min", 0) or ir.DEFAULT_WAIT_MIN)
     poll_secs = int(params.get("poll_secs", 0) or ir.DEFAULT_POLL_SECS)
+    data_days = int(params.get("data_days", 0) or ir.DATA_RANGE_DAYS)
     if probe and not only:
         return "⛔ probe=1 必须带 store=X(探针是单店的:一份报表、一次人眼核对)"
     if probe and dry_run:
@@ -258,8 +282,9 @@ def run(params: dict) -> str:
 
     if dry_run:
         lines = [f"🧪 [DRY-RUN] item_id_sync:候选 {len(cands)}/{len(store_list)} 店"
-                 f"(缺口 {n_gap_rows} 行),真跑将各创建一份 ITEM 报表(v{ir.REPORT_VERSION[1:]})"
-                 f"、等 ≤{wait_min} 分钟、只填/改这些店的 item_id;不建报表不写库"]
+                 f"(缺口 {n_gap_rows} 行),真跑将各创建一份 ITEM 报表(v{ir.REPORT_VERSION[1:]},"
+                 f"数据范围近 {data_days} 天)、等 ≤{wait_min} 分钟、只填/改这些店的 item_id;"
+                 f"不建报表不写库" + (";renew=1:在途行作废重建" if renew else "")]
         for s in cands:
             n = s["name"]
             fl = inflight.get(n)
@@ -276,7 +301,7 @@ def run(params: dict) -> str:
 
     workers = min(stores_svc.STORE_WORKERS, len(cands))
     results, dead, absent, gate_note = store_retry.fan_out(
-        cands, lambda s: _one_store(s, wait_min, poll_secs, probe), workers,
+        cands, lambda s: _one_store(s, wait_min, poll_secs, probe, data_days, renew), workers,
         log_label="报表补 item_id")
 
     by = {k: [r for r in results if r["outcome"] == k]

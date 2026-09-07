@@ -86,14 +86,19 @@ def _quota_log(what: str, store: dict, status, headers: dict) -> None:
 
 
 def create_report_request(store: dict, report_type: str, report_version: str,
-                          body: dict | None = None) -> dict:
-    """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns)
+                          body: dict | None = None, *, data_start: str | None = None,
+                          data_end: str | None = None) -> dict:
+    """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns;
+    + 可选数据范围 dataStartTime/dataEndTime,ISO 8601 `YYYY-MM-DDTHH:mm:ssZ`)
     → 输出:响应 dict(含 requestId / requestStatus / requestSubmissionDate)。
 
     官方 POST /v3/reports/reportRequests。reportType/reportVersion **必须走 query**
-    (放 body 会 400,2026-08-05 实证);body 只装过滤器,不传过滤器 = 整个目录,
-    但 **body 必须是 JSON 对象**:不带 body 沃尔玛回 415 "Supported formats
-    [Content-Type:application/json]"(2026-09-07 生产实证)—— 所以缺省发 `{}`。
+    (放 body 会 400,2026-08-05 实证);body 装过滤器与数据范围(官方 Get All 响应里
+    的 payload 回显字段就是 rowFilters / excludeColumns / dataStartTime / dataEndTime,
+    ITEM_PERFORMANCE 指南的示例也把日期放 body),但 **body 必须是 JSON 对象**:不带
+    body 沃尔玛回 415 "Supported formats [Content-Type:application/json]"(2026-09-07
+    生产实证)—— 所以缺省发 `{}`。⚠ ITEM 报表不带日期**只回 1 行**(2026-09-07 22:05
+    C021 探针,在架 1490 行;后台不设时间同样只显示很少),日期由业务层决定传多长。
     ⚠ **max_retries=0**:POST 创建不是幂等的,5xx 后自动重试会重复建报表、
     重复吃每小时一次的创建额度(写操作永不自动兜底)。
     令牌走 **rate_try_acquire**(有就占、没有立刻抛 ReportQuotaError),不睡:
@@ -101,13 +106,18 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     把令牌还回去(沃尔玛那侧什么都没发生),429 / 5xx / 网络未达不还。
     """
     cid = store["client_id"]
+    payload = dict(body or {})
+    if data_start:
+        payload["dataStartTime"] = data_start
+    if data_end:
+        payload["dataEndTime"] = data_end
     if not _client.rate_try_acquire("reports.create", cid):
         raise ReportQuotaError(f"{store['name']} {report_type} 报表本小时已创建过一次"
                                f"(本地限速桶),本轮不再创建")
     status, hdr, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/reports/reportRequests",
         _token(store), cid, store["proxy"],
-        json_body=body if body is not None else {},
+        json_body=payload,
         params={"reportType": report_type, "reportVersion": report_version},
         max_retries=0)
     _quota_log("reportRequests 创建", store, status, hdr)

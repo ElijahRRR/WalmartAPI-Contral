@@ -223,8 +223,14 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
     "returns.list": (46, 60.0),                 # GET /v3/returns(官方 50/min,沿用旧 1.3s 节奏)
-    "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
-    "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
+    # On-request Reports 四端点各一桶(2026-09-07 按官方 Rate limiting 页逐条登记,
+    # 此前 status/download 共用一个 55/min 的桶 —— 官方各 20/hour,20 秒轮询一次
+    # 必然 429,这就是 08-05「报表配额极低」实证的真相;创建报表的限额官方
+    # 美国站未列,墨西哥站/1P 页写「每种报表每小时一次」,08-05 测试期 429 实证)
+    "reports.create": (1, 3600.0),              # POST /v3/reports/reportRequests(每类型每小时一次)
+    "reports.list": (180, 60.0),                # GET /v3/reports/reportRequests(官方 200/min)—— 轮询走这条
+    "reports.status": (18, 3600.0),             # GET /v3/reports/reportRequests/{id}(官方 20/hour)
+    "reports.download": (18, 3600.0),           # GET /v3/reports/downloadReport(官方 20/hour)
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
     "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
     "orders.list": (3000, 60.0),                # GET /v3/orders(官方 5000/min)
@@ -265,7 +271,7 @@ def _is_persistent(bucket: str) -> bool:
     """输入:bucket 名 → 输出:是否"稀缺桶"(限速状态落 PG 跨进程共享)。
 
     判据(2026-08-12 定稿):窗口 ≥ 600s 或上限 ≤ 10。命中的是全部
-    feeds.post.*、prices.put、reports.request、insights 全家、SPEC 日额度
+    feeds.post.*、prices.put、reports.create/status/download、insights 全家、SPEC 日额度
     ——它们是小时/天级窗口或个位数配额,进程内计数在"多 workflow 并发 +
     进程退出即失忆"下形同虚设(cli 的 flock 只锁同名 workflow,不同
     workflow 是不同进程;DELETE_ITEM 就有三个提交来源)。高频大配额桶

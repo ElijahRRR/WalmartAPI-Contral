@@ -103,6 +103,7 @@ Notifications Management	Create Subscription	200/min	POST	/v3/webhooks/subscript
 Notifications Management	Delete Subscription	10/min	DELETE	/v3/webhooks/subscriptions/{subscriptionId}
 Notifications Management	Update Subscription	5/min	PATCH	/v3/webhooks/subscriptions/{subscriptionId}
 Notifications Management	Event Types	5/min	GET	/v3/webhooks/eventTypes
+On-Request Report Management	Create Report Request	官方 US 页未列;MX/1P 页「每种报表每小时一次」;2026-08-05 测试期 429 实证(代码按 1/hour 配置)	POST	/v3/reports/reportRequests
 On-Request Report Management	Get All Report Requests	200/min	GET	/v3/reports/reportRequests
 On-Request Report Management	Report Request Status	20/hour	GET	/v3/reports/reportRequests/{requestId}
 On-Request Report Management	Download Report URL	20/hour	GET	/v3/reports/downloadReport

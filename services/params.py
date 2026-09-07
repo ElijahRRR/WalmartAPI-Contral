@@ -27,7 +27,7 @@ def flag(params: dict, key: str, default: bool = False) -> bool:
     ⚠ 迁移时只迁**本来就带 `.lower()`** 的站点。不带 `.lower()` 的那一处
     黑名单写法(daily_report 的 `push`)迁过来会从大小写敏感变成不敏感 ——
     那是行为变更,得单独定夺,不许顺手一起改。同样不带 `.lower()` 的
-    catalog_sync(`skip_inventory`/`item_ids`/`skip_feishu`/`strict`)、
+    catalog_sync(`skip_inventory`/`skip_feishu`/`strict`)、
     order_history_import / kpi_history_import 的 `apply`、
     order_center_push 的 `reconcile`、list_new 的 `check_spec` 都是**白名单**
     形态,本函数根本不该碰。

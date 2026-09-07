@@ -804,7 +804,7 @@ def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
                         lambda conn, name, run_at: 0)
 
     r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc),
-                                     False, "fast", False)
+                                     False, "fast")
     assert seen["called"] and seen["skus"] is None, \
         "接线又被接回来了:扫描集不许进库存单查(2026-08-28 定稿)"
     assert r["inv"] == 1

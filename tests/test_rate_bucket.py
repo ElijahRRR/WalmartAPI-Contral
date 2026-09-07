@@ -26,7 +26,11 @@ def test_persistent_partition_snapshot():
     posts = {b for b in _client._RATE_BUCKETS if b.startswith("feeds.post.")}
     assert posts and posts <= persistent
     assert "prices.put" in persistent            # 80/hour
-    assert "reports.request" in persistent       # 2/hour
+    # On-request Reports 三个小时级桶跨进程共享(创建 1/hour、状态与下载 20/hour);
+    # 列表接口 200/min 留在进程内(2026-09-07 按官方 Rate limiting 页登记)
+    for b in ("reports.create", "reports.status", "reports.download"):
+        assert b in persistent, b
+    assert "reports.list" not in persistent
     assert "items.walmart_search_spec" in persistent   # 1000/day 日额度
     ins = {b for b in _client._RATE_BUCKETS if b.startswith("insights.")}
     assert ins and ins <= persistent             # 1/min
@@ -90,7 +94,7 @@ def test_pg_full_window_sleeps_then_acquires(monkeypatch):
         _Conn(_Cur(rows=[(0, None, now)])),                            # 滑出
     ]
     monkeypatch.setattr(db, "pg_conn", lambda: conns.pop(0))
-    waited = _REAL_ACQUIRE_PG("reports.request", "cidA", 1, 0.1)
+    waited = _REAL_ACQUIRE_PG("reports.create", "cidA", 1, 0.1)
     assert waited > 0                    # 真等过(0.1s 窗口,睡 ~0.09s)
     assert not conns                     # 两轮都用掉了
 

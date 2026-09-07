@@ -79,6 +79,34 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-07 itemId 补齐:独立工作流 item_id_sync(所有者定稿)
+
+**需求**:`catalog.walmart_items.item_id` 一直是空的;数字 itemId 只有沃尔玛 On-request
+ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 实证)。第一次
+全店全量,之后上架了新品只需再拉报表补齐。
+
+**调研结论**(官方 developer.walmart.com,逐页核对,来源列在 skills 外的方案页):创建
+`POST /v3/reports/reportRequests?reportType=ITEM&reportVersion=v1…v6`,不传 body 即整个
+目录(日期范围参数只对 ITEM_PERFORMANCE 生效);状态 RECEIVED → INPROGRESS → READY | ERROR;
+生成典型 15–45 分钟,保留 30 天;限额 seller 级:Get All 200/min、单查 20/hour、下载
+20/hour;创建限额美国站未列,墨西哥站/1P 页「每种报表每小时一次」。仓里 08-05 那次
+「报表配额极低」的真相:轮询桶配成 55/min、20 秒轮询一次打 20/hour 的单查。
+
+**决定**:
+- 独立工作流 `item_id_sync`(DANGEROUS=False,SUPPORTS_STORE),每天 **05:00** gpt 调度,
+  缺省只为「在架行 item_id 为空」的店各拿一份报表;首轮手动 `-p all=1`;探针
+  `-p store=X -p probe=1`。catalog_sync 的 `-p item_ids=1` 接线摘掉(双轨禁止)。
+- **不复用**后台(Seller Center)/ Scheduler 生成的报表:台账 `ops.report_requests`
+  只记本仓自己 POST 的 requestId,先落 pending 再调接口,崩溃/超时接着等不重建。
+- **冲突以报表为准**:库里已有 item_id 与报表不同,按报表改并计数点名。
+- 轮询只用 200/min 的列表接口找自己的 requestId(先睡 2 分钟再查,上限 60 分钟);
+  桶按官方页登记 `reports.create` 1/hour、`reports.list` 180/min、`reports.status` 与
+  `reports.download` 18/hour。
+- 全量靠对账不靠参数:报表 SKU 集合 × catalog_sync 扫回的在架集合,覆盖率 < 95% 在
+  首行点名「疑似不全」,当轮照填已匹配的;表头守门以所有者贴的 55 列后台导出为原件
+  (`refdata/specs/item_report_header.txt`),SKU / Item ID / Item Page URL 缺一即拦。
+- 飞书「在线产品总表」的 itemId 列仍由 catalog_sync 投影(06:40 日报链那次就带上)。
+
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 
 **立项**(所有者 2026-09-02):沃尔玛 SKU 从今天的「就是 ASIN / 三段式含 ASIN」

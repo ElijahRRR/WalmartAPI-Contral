@@ -47,7 +47,10 @@
 | 31 | GET /v3/orders/{purchaseOrderId} | orders | 单单详情:**下单时间的真相来源**(新单首见查;没被详情核对过的存量行每轮查直到定稿;定稿后不再查。2026-09-02 新增,旧系统未用;探针 4 实证 550 单详情全对) | safe_get_ex | order_sync |
 | 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
 | 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
-| 31 | POST /v3/reports/reportRequests + GET .../{id} + GET downloadReport | reports | On-request 报表(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 新增实证;旧系统未用) | safe_post_ex/safe_get_ex + download_bytes | catalog_sync |
+| 34 | POST /v3/reports/reportRequests | reports | On-request 报表创建(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 实证;reportType/reportVersion 走 query,不传 body=整个目录;**每店每类型每小时一次**,POST 不自动重试) | safe_post_ex(max_retries=0) | item_id_sync |
+| 35 | GET /v3/reports/reportRequests | reports | 报表请求列表(**轮询走这条**,200/min;requestStatus / src / requestSubmissionStartDate 过滤;只能查 30 天) | safe_get_ex | item_id_sync |
+| 36 | GET /v3/reports/reportRequests/{requestId} | reports | 单个请求状态(20/hour,只作列表找不到时的兜底) | safe_get_ex | item_id_sync |
+| 37 | GET /v3/reports/downloadReport | reports | 预签名下载地址 + 时效(20/hour) | safe_get_ex + download_bytes | item_id_sync |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
 POST /v3/settings/shipping/shipnodes(**建仓**,人工 runbook,不自动化)、
@@ -93,7 +96,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 6 maintenance | 10, 14, 15, 19, 20, 17, (32, 33) | 同步/feed 双路由是 services 层职责;配了「维护仓库」的店走 32 + MP_INVENTORY feed(多仓批次 2) |
 | 7 product_clear | 11, 12, 17 | 消费飞书「停用/删除表」:停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM;防重走 ops.feed_log |
 | 8 problem_product_cleanup | 10, 11, 12, 17 | 反补(MP_MAINTENANCE)+删除+停用;定性决策拆在 problem_scan(零沃尔玛调用),删除是否生效靠 catalog_sync 的 2 观测,本工作流不调 2/25 |
-| 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
+| 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22 | sync_online_products 的接口面;itemId 回填 2026-09-07 归 item_id_sync(#34–#37) |
 | 10 list_new | 8, 30, 16, (33) | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);上架仓 FC ID 走 33 校验(未配置店仍用 30,多仓批次 3);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
 | 11 sku_migrate | 10(形态 A;形态 B 是 8);16 由 api/feeds 内部反查三态时用 | **存量改码**(SKU 改造批次 3,手动、永不进调度):载荷 `{Orderable:{sku 新码, productIdentifiers, SkuUpdate:'Yes'}}`,feedType 的唯一出生地是 `workflows/sku_migrate.FEED_TYPE`。**本工作流自己不调 17**:回执由 `feed_poll` 统一轮询落 `ops.feed_items`,改码只读那张台账(而且回执**不入病历、不反哺黑名单**);定案靠 2(catalog_sync)的观测,回执成功单独不定案。形态若改判为 B(MP_ITEM 全量),须先让 `mp_conform` 放行 SkuUpdate(否则被静默剔掉 ⇒ 每一行都双挂),且吃的是 list_new 的 MP_ITEM 桶 |
 | backup | 无沃尔玛调用 | — |
@@ -122,6 +125,10 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/orders/{purchaseOrderId} | 5000/min(tsv:119「An order」) | 新登记(2026-09-02) | 3000/min,与列表分桶(orders.get);探针 4:并发 8、550 次/69s 无 429 |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
+| POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天 | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),POST 不自动重试,429 = 本轮放弃该店 |
+| GET /v3/reports/reportRequests(列表) | 200/min | 新登记(2026-09-07) | 180/min(reports.list);**轮询用它**,按 requestId 匹配 |
+| GET /v3/reports/reportRequests/{id}(单查) | **20/hour** | 旧代码与 downloadReport 共用 55/min 桶、20 秒轮询一次 ⇒ 必 429 | 18/hour 持久桶(reports.status),只作兜底 |
+| GET /v3/reports/downloadReport | **20/hour**;响应 downloadURL + downloadURLExpirationTime(时效长度未公布) | 同上 | 18/hour 持久桶(reports.download) |
 | reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min;**明细只准走 CSV 端点 reconFile**(ZIP 包,Accept: application/octet-stream,text/csv 406)——reconFileJson 每账期硬截断 1000 行且 offset 只收 0,nextOffset 是字节偏移,超千行账期必丢数据(订单中心v1 2026-08-04 实证) |
 | insights performance summary/report | **1/min/端点**;unpublished items/counts **100/min**;listingQuality score 10/hour | CLAUDE.md"Insights 全部 1/分钟"**不准确** | 按端点分档登记 |
 | GET /v3/settings/partnerprofile | 50/min | 一致 | 40/min + lru_cache |
@@ -320,6 +327,12 @@ api/returns.py
       # (只传 start 返 400,见 §4.3 实证)。本行 2026-08-14 勘误:原写
       # `iter_returns(store)  # 无时间过滤,全量`,照抄直接 TypeError。
 api/reports.py
+  create_report_request(store, report_type, report_version, body=None)   # #34;429 → ReportQuotaError
+  list_report_requests(store, report_type, *, status=None, since=None)   # #35;轮询走它
+  get_report_request(store, request_id)                                  # #36;兜底
+  get_download_url(store, request_id) -> (url, expiration)               # #37
+  download_report(url, proxy) -> bytes                                   # 预签名地址(经店铺代理)
+  parse_report_csv(blob) / item_id_from_column(row) / item_id_from_url(row) / report_row_sku(row)
   payment_statement(store)                                # 含 sellerId 提取 helper
   available_recon_dates(store)
   iter_recon_records(store, report_date)
